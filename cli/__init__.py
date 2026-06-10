@@ -17,12 +17,74 @@ console = Console()
 
 DEFAULT_API_URL = os.environ.get("SWARM_API_URL", "http://127.0.0.1:8420")
 
+# CLI token 缓存路径（swarm login 写入，各命令自动读取）
+_TOKEN_CACHE = os.path.expanduser("~/.swarm/cli_token")
+
+
+def _load_token() -> str:
+    """读取 CLI token：环境变量 SWARM_TOKEN 优先，回退 ~/.swarm/cli_token 缓存。"""
+    tok = os.environ.get("SWARM_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        with open(_TOKEN_CACHE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _auth_headers(extra: dict | None = None) -> dict:
+    """构造带 Bearer token 的请求头（rbac_enabled=true 时必需）。"""
+    headers = dict(extra or {})
+    tok = _load_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    return headers
+
 
 @click.group()
 @click.version_option(version="0.1.0", prog_name="swarm")
 def main():
     """🐝 Swarm — 蜂群 AI 编程智能体系统"""
     pass
+
+
+@main.command()
+@click.option("--username", "-u", default="admin", show_default=True, help="用户名")
+@click.option("--password", "-P", default=None, help="密码（留空则交互输入）")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def login(username: str, password: str | None, api_url: str):
+    """登录并缓存 token 到 ~/.swarm/cli_token（rbac 开启时各命令依赖）"""
+    api_url = api_url.rstrip("/")
+    if not password:
+        password = click.prompt("密码", hide_input=True, default="", show_default=False)
+    try:
+        resp = httpx.post(
+            f"{api_url}/api/auth/login",
+            json={"username": username, "password": password},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("token", "")
+        if not token:
+            console.print("[red]登录响应无 token[/]")
+            sys.exit(1)
+        os.makedirs(os.path.dirname(_TOKEN_CACHE), exist_ok=True)
+        with open(_TOKEN_CACHE, "w", encoding="utf-8") as f:
+            f.write(token)
+        os.chmod(_TOKEN_CACHE, 0o600)
+        user = data.get("user", {})
+        console.print(
+            f"[green]✅ 已登录 {user.get('username', username)} "
+            f"({user.get('global_role', '?')}) — token 已缓存[/]"
+        )
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]登录失败: {exc.response.text}[/]")
+        sys.exit(1)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API ({api_url}): {exc}[/]")
+        sys.exit(1)
 
 
 @main.command()
@@ -600,6 +662,258 @@ def patterns_list(project: str, api_url: str):
                 (s.get("pattern_name") or "")[:40],
                 (s.get("description") or "")[:50],
                 str(s.get("reuse_count", 0)),
+            )
+        console.print(table)
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@main.group()
+def sandbox():
+    """远程沙箱管理（E2B/CubeSandbox）"""
+    pass
+
+
+@sandbox.command("list")
+@click.option("--project", "-p", default=None, help="按项目 ID 过滤")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def sandbox_list(project: str | None, api_url: str):
+    """列出活跃沙箱"""
+    api_url = api_url.rstrip("/")
+    params = {"project_id": project} if project else {}
+    try:
+        resp = httpx.get(f"{api_url}/api/sandbox/status", params=params, headers=_auth_headers(), timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+        sandboxes = data.get("sandboxes") or []
+        table = Table(title=f"活跃沙箱 — {data.get('active_count', len(sandboxes))} 个")
+        table.add_column("ID", style="cyan")
+        table.add_column("状态", style="green")
+        table.add_column("模板")
+        table.add_column("CPU/内存")
+        table.add_column("项目")
+        table.add_column("来源", style="dim")
+        for sb in sandboxes:
+            cpu = sb.get("cpu_count")
+            mem = sb.get("memory_mb")
+            res = f"{cpu or '?'}C/{mem or '?'}M" if (cpu or mem) else "-"
+            table.add_row(
+                str(sb.get("id", ""))[:24],
+                str(sb.get("status", "?")),
+                str(sb.get("template_id", "-"))[:20],
+                res,
+                str(sb.get("project_id") or "-")[:16],
+                str(sb.get("source") or "-"),
+            )
+        console.print(table)
+        cfg = data.get("config") or {}
+        if cfg:
+            console.print(
+                f"[dim]server={cfg.get('api_url', '-')} | template={cfg.get('default_template', '-')} | "
+                f"worker启用={cfg.get('use_for_worker')}[/]"
+            )
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API ({api_url}): {exc}[/]")
+        sys.exit(1)
+
+
+@sandbox.command("create")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--template", "-t", default=None, help="模板 ID（留空用默认）")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def sandbox_create(project: str, template: str | None, api_url: str):
+    """创建新沙箱"""
+    api_url = api_url.rstrip("/")
+    payload: dict = {"project_id": project}
+    if template:
+        payload["template_id"] = template
+    try:
+        resp = httpx.post(f"{api_url}/api/sandbox/create", json=payload, headers=_auth_headers(), timeout=60.0)
+        resp.raise_for_status()
+        data = resp.json()
+        console.print(f"[green]✅ 沙箱已创建: {data.get('sandbox_id') or data.get('id') or data}[/]")
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@sandbox.command("destroy")
+@click.argument("sandbox_id")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def sandbox_destroy(sandbox_id: str, api_url: str):
+    """销毁指定沙箱"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.delete(f"{api_url}/api/sandbox/{sandbox_id}", headers=_auth_headers(), timeout=30.0)
+        resp.raise_for_status()
+        console.print(f"[green]✅ 沙箱 {sandbox_id} 已销毁[/]")
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@main.group()
+def config():
+    """配置与模型路由"""
+    pass
+
+
+@config.command("show")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def config_show(api_url: str):
+    """查看当前配置（API Key 已脱敏）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{api_url}/api/config", headers=_auth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        console.print_json(json.dumps(data.get("flat") or data.get("config") or data, indent=2, ensure_ascii=False))
+        ls = data.get("langsmith") or {}
+        if ls:
+            console.print(f"[dim]LangSmith: {ls}[/]")
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API ({api_url}): {exc}[/]")
+        sys.exit(1)
+
+
+@config.command("models")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def config_models(api_url: str):
+    """列出可用模型（SiliconFlow + 本地）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{api_url}/api/models", headers=_auth_headers(), timeout=30.0)
+        resp.raise_for_status()
+        data = resp.json()
+        for provider in ("siliconflow", "local"):
+            models = data.get(provider) or []
+            err = data.get(f"{provider}_error")
+            table = Table(title=f"{provider} — {len(models)} 个模型")
+            table.add_column("模型 ID", style="cyan")
+            for m in models:
+                table.add_row(str(m))
+            console.print(table)
+            if err:
+                console.print(f"[yellow]{provider} 拉取错误: {err}[/]")
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@config.command("routing")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def config_routing(api_url: str):
+    """查看 Worker 子任务模型路由表（trivial/medium/complex/multimodal）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{api_url}/api/routing", headers=_auth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        routing = data.get("routing") or data
+        table = Table(title="Worker 模型路由")
+        table.add_column("难度档", style="cyan")
+        table.add_column("模型")
+        if isinstance(routing, dict):
+            for tier, model in routing.items():
+                table.add_row(str(tier), str(model))
+        console.print(table)
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@main.group()
+def kb():
+    """知识库（Knowledge Base）"""
+    pass
+
+
+@kb.command("overview")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def kb_overview(project: str, api_url: str):
+    """项目知识库概览（预处理结果 + 索引统计）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{api_url}/api/projects/{project}/knowledge/overview", headers=_auth_headers(), timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+        table = Table(title=f"知识库概览 — {project}")
+        table.add_column("指标", style="cyan")
+        table.add_column("值", style="green")
+        table.add_row("状态", str(data.get("status", "-")))
+        table.add_row("图谱状态", str(data.get("graph_status", "-")))
+        table.add_row("文件数", str(data.get("file_count", 0)))
+        table.add_row("符号数", str(data.get("symbol_count", data.get("project_symbol_count", 0))))
+        table.add_row("规范数 (norms)", str(data.get("norms_count", 0)))
+        console.print(table)
+        desc = data.get("description")
+        if desc:
+            console.print(Panel(desc[:500], title="项目摘要", border_style="dim"))
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API ({api_url}): {exc}[/]")
+        sys.exit(1)
+
+
+@kb.command("norms")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def kb_norms(project: str, api_url: str):
+    """列出项目规范（Layer C norms）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{api_url}/api/projects/{project}/knowledge/norms", headers=_auth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        norms = resp.json().get("norms") or []
+        table = Table(title=f"项目规范 — {project}")
+        table.add_column("ID", style="dim")
+        table.add_column("类别")
+        table.add_column("内容")
+        for nm in norms[:40]:
+            table.add_row(
+                str(nm.get("id", "")),
+                str(nm.get("category", nm.get("norm_type", ""))),
+                (nm.get("content") or nm.get("rule") or "")[:70],
+            )
+        console.print(table)
+    except httpx.HTTPStatusError as exc:
+        console.print(f"[red]失败: {exc.response.text}[/]")
+        sys.exit(1)
+
+
+@kb.command("symbols")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--query", "-q", default="", help="符号名模糊查询")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def kb_symbols(project: str, query: str, api_url: str):
+    """查询代码符号索引（Layer A）"""
+    api_url = api_url.rstrip("/")
+    params = {"q": query} if query else {}
+    try:
+        resp = httpx.get(
+            f"{api_url}/api/projects/{project}/knowledge/symbols", params=params, headers=_auth_headers(), timeout=15.0
+        )
+        resp.raise_for_status()
+        symbols = resp.json().get("symbols") or []
+        table = Table(title=f"符号索引 — {project} ({len(symbols)} 个)")
+        table.add_column("符号", style="cyan")
+        table.add_column("类型")
+        table.add_column("文件", style="dim")
+        for s in symbols[:40]:
+            table.add_row(
+                str(s.get("name", "")),
+                str(s.get("kind", s.get("type", ""))),
+                str(s.get("file", s.get("path", "")))[:50],
             )
         console.print(table)
     except httpx.HTTPStatusError as exc:
