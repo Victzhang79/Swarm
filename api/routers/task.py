@@ -354,7 +354,9 @@ async def approve_task(task_id: str, req: ApproveTaskRequest | None = None):
     if apply_result:
         out["apply_diff"] = apply_result
 
-    # TODO: 在 Brain runner 任务真正完成时调用 notify（此处仅审批节点）
+    # NOTE(tech-debt): 此处发出的是"审批事件"通知（task_approved），语义正确。
+    # 待办：未来应在 Brain runner 任务真正执行完成时，额外发一条"完成事件"通知
+    # （需在 brain/runner.py 任务生命周期回调挂钩）。当前两类事件未区分，属已知缺口。
     from swarm.api.notify import notify
     await notify("task_approved", task_id, f"任务 {task_id} 已审核通过，Brain 继续执行")
 
@@ -426,7 +428,8 @@ async def revise_task(task_id: str, req: TaskReviseRequest):
         None,
         lambda: _app.store.update_task(task_id, human_decision="REVISE"),
     )
-    # TODO: 在 Brain runner 任务真正完成时调用 notify（此处仅审批节点）
+    # NOTE(tech-debt): 发出的是"审批事件"通知（task_revised），语义正确。
+    # 待办：完成事件通知应在 brain/runner.py 任务生命周期回调中补充（见 accept 同款注释）。
     from swarm.api.notify import notify
     await notify("task_revised", task_id, f"任务 {task_id} 已提交修订，Brain 重新调度")
     return {"status": "ok", "task": updated, "message": "已提交修订，Brain 重新调度"}
@@ -449,7 +452,8 @@ async def reject_task(task_id: str):
         None,
         lambda: _app.store.update_task(task_id, human_decision="REJECT"),
     )
-    # TODO: 在 Brain runner 任务真正完成时调用 notify（此处仅审批节点）
+    # NOTE(tech-debt): 发出的是"审批事件"通知（task_rejected），语义正确。
+    # 待办：完成事件通知应在 brain/runner.py 任务生命周期回调中补充（见 accept 同款注释）。
     from swarm.api.notify import notify
     await notify("task_rejected", task_id, f"任务 {task_id} 已拒绝，Brain 进入学习失败流程")
     return {"status": "ok", "task": updated, "message": "已拒绝，Brain 进入学习失败流程"}

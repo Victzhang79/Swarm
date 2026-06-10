@@ -281,8 +281,8 @@ def _python_merge3(base: str, ours: str, theirs: str) -> tuple[str, bool]:
         b_op = b_edits[bi] if bi < len(b_edits) else None
 
         if a_op and b_op:
-            a_start = a_op[1]
-            b_start = b_op[1]
+            # 双方均有编辑：交由下方统一解包与冲突处理逻辑（见 line 297+）
+            pass
         elif a_op:
             tag, i1, i2, j1, j2 = a_op
             merged.extend(base_lines[i1:i2] if tag == "equal" else a_lines[j1:j2])

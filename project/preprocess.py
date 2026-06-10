@@ -13,7 +13,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -107,8 +106,8 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
     """
     # 延迟导入避免循环引用
     from swarm.project.store import (
-        upsert_progress,
         update_project,
+        upsert_progress,
     )
 
     logger.info("Starting preprocessing for project %s at %s", project_id, project_path)
@@ -165,7 +164,9 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         embed_result = await _phase_embed(project_id, project_path, index_result)
 
         # ── Phase 4: ANALYZE ──
-        analysis_result = await _phase_analyze(project_id, project_path, scan_result)
+        # _phase_analyze 内部已持久化摘要(_save_analysis_summary)与进度，返回的
+        # 统计信息当前无需在此使用，故不接收返回值（避免 F841 死变量）。
+        await _phase_analyze(project_id, project_path, scan_result)
 
         # ── 完成 ──
         await asyncio.to_thread(
@@ -278,7 +279,7 @@ def _scan_sync(project_path: str) -> dict[str, Any]:
 
 async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
     """Phase 1: 扫描文件结构"""
-    from swarm.project.store import upsert_progress, update_project
+    from swarm.project.store import update_project, upsert_progress
 
     await asyncio.to_thread(
         upsert_progress,
@@ -346,7 +347,7 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
 
 async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     """Phase 2: CodeGraph 索引"""
-    from swarm.project.store import upsert_progress, update_project
+    from swarm.project.store import update_project, upsert_progress
 
     await asyncio.to_thread(
         upsert_progress,
@@ -572,8 +573,8 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
             return
 
         # 写入 NormsStore — 先删旧 auto 规范再插（幂等）
-        from swarm.knowledge.norms_store import NormsStore
         from swarm.config.settings import DatabaseConfig
+        from swarm.knowledge.norms_store import NormsStore
 
         store = NormsStore(DatabaseConfig())
         await store.connect()
@@ -702,10 +703,9 @@ def _run_codegraph(project_path: str):
 def _save_file_index(project_id: str, files: list[dict[str, Any]]) -> None:
     """将扫描结果写入 kb_file_index"""
     try:
-        from swarm.knowledge.structure_index import StructureIndexer, FileInfo
-        indexer = StructureIndexer()
         # 使用同步 psycopg 直接写
         import psycopg
+
         from swarm.config.settings import DatabaseConfig
         cfg = DatabaseConfig()
         conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
@@ -738,6 +738,7 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
     """将 codegraph 符号写入 kb_symbol_index"""
     try:
         import psycopg
+
         from swarm.config.settings import DatabaseConfig
         cfg = DatabaseConfig()
         conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
@@ -779,6 +780,7 @@ def _save_dependency_graph(project_id: str, edges: list) -> None:
     """将 codegraph 依赖写入 kb_dependency_graph"""
     try:
         import psycopg
+
         from swarm.config.settings import DatabaseConfig
         cfg = DatabaseConfig()
         conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
@@ -804,6 +806,7 @@ def _read_symbols_for_embed(project_id: str) -> list[dict[str, Any]]:
     """从 kb_symbol_index 读取符号（用于嵌入）"""
     try:
         import psycopg
+
         from swarm.config.settings import DatabaseConfig
         cfg = DatabaseConfig()
         conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
@@ -950,7 +953,7 @@ def _store_vectors_qdrant(
         )
 
     # 清除该项目旧向量
-    from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+    from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
     client.delete(
         collection_name=collection_name,
         points_selector=FilterSelector(

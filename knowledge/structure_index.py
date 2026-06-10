@@ -360,7 +360,6 @@ class StructureIndexer:
         """查询依赖关系(outgoing: 文件依赖谁; incoming: 谁依赖此文件)"""
         conn = self._conn_or_raise()
         column = "source_file" if direction == "incoming" else "target_file"
-        param_col = "target_file" if direction == "incoming" else "source_file"
         async with conn.cursor() as cur:
             await cur.execute(
                 sql.SQL(

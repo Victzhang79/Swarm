@@ -26,8 +26,15 @@ from pathlib import Path
 from typing import Any
 
 from swarm.config.settings import get_config
-from swarm.types import Confidence, FileScope, KnowledgeContext, SubTask, SubTaskDifficulty, WorkerOutput
 from swarm.tools.scope_guard import clear_scope
+from swarm.types import (
+    Confidence,
+    FileScope,
+    KnowledgeContext,
+    SubTask,
+    SubTaskDifficulty,
+    WorkerOutput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -682,6 +689,7 @@ if _r.stderr:
             l1_passed=l1_passed,
             l1_details=l1_details,
             execution_log="\n".join(self.execution_log),
+            notes=notes,
         )
 
     def _make_output(

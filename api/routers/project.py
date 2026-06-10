@@ -12,6 +12,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm, _require_user

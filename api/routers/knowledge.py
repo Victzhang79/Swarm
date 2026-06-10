@@ -41,6 +41,8 @@ async def knowledge_overview(project_id: str):
     """项目知识库概览：预处理结果 + 索引统计"""
     import httpx
 
+    from swarm.config.settings import get_config
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 

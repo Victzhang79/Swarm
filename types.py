@@ -181,6 +181,7 @@ class WorkerOutput(BaseModel):
     l1_passed: bool = False
     l1_details: dict[str, Any] = Field(default_factory=dict)
     execution_log: str = ""
+    notes: str = Field(default="", description="需人工审查的部分（Worker 自报，供审批/学习节点参考）")
 
 
 # ──────────────────────────────────────────────
