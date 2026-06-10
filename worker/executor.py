@@ -207,10 +207,27 @@ class WorkerExecutor:
                     self._build_verify_prompt(),
                     step=f"verify-{fix_round}",
                 )
-                l1_passed, l1_details = self._parse_l1_result(verify_result)
+                llm_passed, l1_details = self._parse_l1_result(verify_result)
+
+                # 确定性闸门优先：用真实 compile/lint/scope 结果覆盖 LLM 自报。
+                # 借鉴 ECC —— 确定性断言驱动修复循环，杜绝 LLM 幻觉 PASS 提前 break。
+                det_ok, det_details = self._deterministic_l1_gate()
+                l1_details = {**l1_details, **det_details}
+                if det_ok is None:
+                    # 无 diff 可检，回退到 LLM 自报信号
+                    l1_passed = llm_passed
+                    l1_details["l1_decision_source"] = "llm_self_report"
+                else:
+                    l1_passed = det_ok
+                    l1_details["l1_decision_source"] = "deterministic"
+                    if det_ok and not llm_passed:
+                        self._log("确定性闸门通过但 LLM 自报失败，以确定性结果为准")
+                    elif not det_ok and llm_passed:
+                        self._log("LLM 自报通过但确定性闸门失败，以确定性结果为准（拦截幻觉 PASS）")
+
                 self._log(
                     f"L1 验证结果: {'通过 ✅' if l1_passed else '未通过 ❌'} "
-                    f"| 详情: {l1_details}"
+                    f"| 来源: {l1_details.get('l1_decision_source')} | 详情: {l1_details}"
                 )
 
                 if l1_passed:
@@ -569,15 +586,66 @@ if _r.stderr:
         )
 
     def _parse_l1_result(self, verify_result: str) -> tuple[bool, dict]:
-        """解析 L1 验证结果"""
-        passed = "L1_RESULT: PASS" in verify_result
-        # 简单提取关键信息
+        """解析 LLM 自报的 L1 验证结果（弱信号，仅作辅助）。
+
+        注意：LLM 自报易误判（幻觉 PASS / 中文措辞歧义），真正的权威是
+        Phase 3 循环内的确定性 pipeline（见 _deterministic_l1_gate）。
+        此处仅用更鲁棒的方式提取 LLM 的自报信号。
+        """
+        import re
+
+        text = verify_result or ""
+        # 显式标记优先：L1_RESULT: PASS / FAIL（容忍大小写与空格）
+        m = re.search(r"L1_RESULT\s*:?\s*(PASS|FAIL)", text, re.IGNORECASE)
+        if m:
+            passed = m.group(1).upper() == "PASS"
+        else:
+            # 无显式标记时保守判定：出现明确失败信号即视为未通过
+            low = text.lower()
+            has_fail = any(
+                kw in low
+                for kw in ("fail", "失败", "未通过", "error", "错误", "❌")
+            )
+            has_pass = any(
+                kw in low for kw in ("pass", "通过", "成功", "✅")
+            )
+            passed = has_pass and not has_fail
+
         details: dict = {
-            "raw_result": verify_result[:500],
-            "compile_passed": "编译" in verify_result and "通过" in verify_result,
-            "tests_passed": "测试" in verify_result and "通过" in verify_result,
+            "raw_result": text[:500],
+            "llm_self_report": "pass" if passed else "fail",
+            "compile_passed": bool(re.search(r"编译.*通过|compile.*ok|compiled", text, re.IGNORECASE)),
+            "tests_passed": bool(re.search(r"测试.*通过|tests?.*pass", text, re.IGNORECASE)),
         }
         return passed, details
+
+    def _deterministic_l1_gate(self) -> tuple[bool | None, dict]:
+        """循环内确定性 L1 闸门：用真实 compile/lint/scope 结果驱动修复轮次。
+
+        借鉴 ECC 的"确定性断言驱动控制循环"经验 —— 不依赖 LLM 自报 PASS，
+        而是对当前 git diff 跑确定性 pipeline。返回:
+            (None, {...}) 表示无 diff 可检（跳过，交给 LLM 信号）
+            (bool, details) 表示确定性结论。
+        """
+        if not self.project_path:
+            return None, {"deterministic_gate": "skipped: no project_path"}
+        try:
+            diff = self._get_git_diff()
+        except Exception as exc:  # noqa: BLE001
+            return None, {"deterministic_gate": f"skipped: diff error {exc}"}
+        if not diff or diff in ("(无变更)", "(无法获取 git diff)"):
+            return None, {"deterministic_gate": "skipped: empty diff"}
+        try:
+            from swarm.worker.l1_pipeline import run_l1_pipeline
+
+            ok, details = run_l1_pipeline(
+                self.project_path, self.subtask, diff, llm=None
+            )
+            details["deterministic_gate"] = "pass" if ok else "fail"
+            return ok, details
+        except Exception as exc:  # noqa: BLE001
+            return None, {"deterministic_gate": f"skipped: pipeline error {exc}"}
+
 
     def _parse_produce_result(
         self,

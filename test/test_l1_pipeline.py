@@ -70,6 +70,52 @@ def test_lint_syntax_error_detected():
             print("  ✅ lint 即使未检测到语法 error 也不阻断（优雅降级）")
 
 
+def test_lint_gate_hard_blocks_on_syntax_error():
+    """语法级 lint error 默认硬阻断流水线（借鉴 ECC 确定性闸门）。"""
+    from swarm.worker.l1_pipeline import run_l1_pipeline
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 写一个语法错误文件（ruff E999）
+        (Path(tmp) / "hello.py").write_text("def foo(\n", encoding="utf-8")
+        subtask = _make_subtask()
+        diff = _simple_diff()
+        os.environ.pop("SWARM_WORKER_L1_LINT", None)
+        os.environ.pop("SWARM_WORKER_L1_LINT_GATE", None)
+        os.environ.pop("SWARM_WORKER_L1_SELF_REVIEW", None)
+
+        ok, details = run_l1_pipeline(tmp, subtask, diff)
+        # ruff 可用且检测到语法错误时，应硬阻断
+        if details.get("lint", {}).get("has_error"):
+            assert ok is False, f"语法 error 应硬阻断: {details['lint']}"
+            assert details["lint"].get("gated") is True
+            print("  ✅ 语法级 lint error 硬阻断流水线")
+        else:
+            print("  ✅ ruff 不可用/未报错，优雅跳过（环境相关）")
+
+
+def test_lint_gate_can_be_disabled():
+    """SWARM_WORKER_L1_LINT_GATE=false 回退到仅警告不阻断。"""
+    from swarm.worker.l1_pipeline import run_l1_pipeline
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "hello.py").write_text("def foo(\n", encoding="utf-8")
+        subtask = _make_subtask()
+        diff = _simple_diff()
+        os.environ.pop("SWARM_WORKER_L1_LINT", None)
+        os.environ.pop("SWARM_WORKER_L1_SELF_REVIEW", None)
+        os.environ["SWARM_WORKER_L1_LINT_GATE"] = "false"
+        try:
+            ok, details = run_l1_pipeline(tmp, subtask, diff)
+            if details.get("lint", {}).get("has_error"):
+                # 关闭闸门后，lint error 不再阻断（gated=False）
+                assert details["lint"].get("gated") is False
+                print("  ✅ LINT_GATE=false 回退仅警告，不阻断")
+            else:
+                print("  ✅ ruff 不可用/未报错，优雅跳过（环境相关）")
+        finally:
+            del os.environ["SWARM_WORKER_L1_LINT_GATE"]
+
+
 def test_lint_env_var_disable():
     """SWARM_WORKER_L1_LINT=false 时跳过 lint。"""
     from swarm.worker.l1_pipeline import run_l1_pipeline
@@ -245,6 +291,8 @@ def main() -> int:
     tests = [
         test_lint_enabled_by_default,
         test_lint_syntax_error_detected,
+        test_lint_gate_hard_blocks_on_syntax_error,
+        test_lint_gate_can_be_disabled,
         test_lint_env_var_disable,
         test_lint_no_py_files,
         test_self_review_env_var_disable,

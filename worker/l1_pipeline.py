@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
 
 from swarm.project.diff_apply import files_from_unified_diff
 from swarm.types import FileScope, SubTask
+from swarm.worker.output_compress import compress_tool_output
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -345,8 +346,21 @@ def run_l1_pipeline(
             "has_error": lint_has_error,
         }
         if lint_has_error:
-            # lint error 不硬阻断，记为警告
-            details["lint"]["note"] = "lint error 仅作警告，不阻断流水线"
+            # 语法级 lint error（ruff E9xx/F4xx、eslint error）是确定性真错误，
+            # 默认硬阻断流水线（确定性断言优于事后告警）。
+            # SWARM_WORKER_L1_LINT_GATE=false 可回退到旧的"仅警告不阻断"行为。
+            gate_enabled = os.environ.get(
+                "SWARM_WORKER_L1_LINT_GATE", "true"
+            ).lower() not in ("false", "0", "no")
+            error_issues = [i for i in lint_issues if i.get("severity") == "error"]
+            details["lint"]["error_issues"] = error_issues
+            if gate_enabled:
+                details["lint"]["note"] = "lint 语法级 error 硬阻断流水线"
+                details["lint"]["gated"] = True
+                return False, details
+            else:
+                details["lint"]["note"] = "lint error 仅作警告（SWARM_WORKER_L1_LINT_GATE=false）"
+                details["lint"]["gated"] = False
     else:
         details["lint"] = {"status": "disabled", "reason": "SWARM_WORKER_L1_LINT=false"}
 
@@ -368,7 +382,11 @@ def run_l1_pipeline(
             )
             test_ok = proc.returncode == 0
             details["l1_3_test_ok"] = test_ok
-            details["test_output"] = (proc.stdout or proc.stderr or "")[:1500]
+            # 智能压缩：提取关键失败信号行（FAILED/Error/Traceback/assert），
+            # 替代盲目硬截断 —— 避免丢失位于输出末尾的 pytest 失败摘要。
+            details["test_output"] = compress_tool_output(
+                proc.stdout or proc.stderr or "", max_chars=1500
+            )
             if not test_ok:
                 return False, details
         except subprocess.TimeoutExpired:
