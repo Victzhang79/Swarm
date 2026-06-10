@@ -113,6 +113,53 @@ function startWorkerSSE(runId) {
   };
 }
 
+// 置信度 → pill 配色
+function confidencePill(conf) {
+  const map = { high: ['pill-green', '高 high'], medium: ['pill-amber', '中 medium'], low: ['pill-red', '低 low'] };
+  const [cls, label] = map[String(conf || '').toLowerCase()] || ['pill-gray', String(conf || 'unknown')];
+  return `<span class="pill ${cls}" title="Worker 自评置信度">置信度 ${label}</span>`;
+}
+
+// L1 确定性闸门详情 → 结构化展示（lint 闸门 / 决策来源 / scoped 测试）
+function renderL1Details(details) {
+  if (!details || typeof details !== 'object' || !Object.keys(details).length) return '';
+  const parts = [];
+  // 决策来源：deterministic（确定性断言）优于 llm_self_report（LLM 自报）
+  const src = details.l1_decision_source;
+  if (src) {
+    const isDet = src === 'deterministic';
+    parts.push(`<span class="pill ${isDet ? 'pill-purple' : 'pill-gray'}" title="L1 通过/失败由谁裁定">判定来源 ${isDet ? '确定性闸门' : 'LLM 自报'}</span>`);
+  }
+  // lint 确定性闸门
+  const lint = details.lint;
+  if (lint && typeof lint === 'object') {
+    const lintErr = lint.has_error || lint.status === 'error';
+    let lintPill = `<span class="pill ${lintErr ? 'pill-red' : 'pill-green'}">lint ${lintErr ? 'error' : 'ok'}</span>`;
+    if (lint.gated === true) lintPill += '<span class="pill pill-red" title="lint error 硬阻断了流水线">已阻断 gated</span>';
+    else if (lintErr && lint.gated === false) lintPill += '<span class="pill pill-amber" title="lint error 仅告警，未阻断">仅告警</span>';
+    parts.push(lintPill);
+    const issues = Array.isArray(lint.issues) ? lint.issues : [];
+    const errCount = issues.filter(i => i && i.severity === 'error').length;
+    if (errCount) parts.push(`<span class="pill pill-gray">${errCount} 个 lint error</span>`);
+  }
+  // scoped 测试
+  if ('l1_3_test_ok' in details) {
+    const tOk = details.l1_3_test_ok;
+    if (details.test_skipped) parts.push('<span class="pill pill-gray" title="未检测到测试命令">测试 skipped</span>');
+    else parts.push(`<span class="pill ${tOk ? 'pill-green' : 'pill-red'}">scoped 测试 ${tOk ? 'pass' : 'fail'}</span>`);
+  }
+  if ('deterministic_l1' in details) {
+    parts.push(`<span class="pill ${details.deterministic_l1 ? 'pill-green' : 'pill-red'}" title="确定性 L1 闸门最终结论">确定性 L1 ${details.deterministic_l1 ? '✓' : '✗'}</span>`);
+  }
+  let html = parts.length ? `<div class="l1-gate-pills" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0">${parts.join('')}</div>` : '';
+  // test_output 折叠展示（失败时尤其有用）
+  const testOut = details.test_output;
+  if (testOut && String(testOut).trim()) {
+    html += `<details style="margin:8px 0 0"><summary style="cursor:pointer;color:var(--text-muted,#888)">测试/闸门输出</summary><pre style="white-space:pre-wrap;font-size:12px;margin:6px 0 0;max-height:240px;overflow:auto">${escapeHtml(String(testOut))}</pre></details>`;
+  }
+  return html;
+}
+
 function renderWorkerResult(result) {
   const block = $('worker-result-block');
   const summary = $('worker-result-summary');
@@ -122,10 +169,17 @@ function renderWorkerResult(result) {
   const diff = result.diff || result.merged_diff || '';
   workerLastDiff = diff;
   const success = result.l1_passed !== false;
+  // notes：Worker 自报的"需人工审查项"，审批前必看
+  const notesHtml = (result.notes && String(result.notes).trim())
+    ? `<div class="worker-notes" style="margin:8px 0 0;padding:8px 10px;border-left:3px solid var(--amber,#d99);background:rgba(217,153,153,0.08);border-radius:4px"><strong>⚠ 需人工审查：</strong>${escapeHtml(String(result.notes))}</div>`
+    : '';
   summary.innerHTML = `
     <span class="pill ${success ? 'pill-green' : 'pill-red'}">${success ? '成功' : '失败'}</span>
     <span class="pill pill-gray">${escapeHtml(result.phase || 'done')}</span>
-    ${result.summary ? '<p style="margin:8px 0 0">' + escapeHtml(result.summary) + '</p>' : ''}`;
+    ${confidencePill(result.confidence)}
+    ${result.summary ? '<p style="margin:8px 0 0">' + escapeHtml(result.summary) + '</p>' : ''}
+    ${renderL1Details(result.l1_details)}
+    ${notesHtml}`;
   if (diff && diff.trim()) {
     const lines = diff.split('\n');
     diffEl.innerHTML = lines.map(line => {
