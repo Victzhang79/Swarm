@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: swarm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # 测试默认关 RBAC（与 test/conftest.py 一致），连 CI 的 PG
+      SWARM_RBAC_ENABLED: "false"
+      SWARM_DB_POSTGRES_URI: "postgresql://postgres:postgres@localhost:5432/swarm"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[dev]"
+
+      - name: Initialize database schema
+        run: python scripts/init_db.py
+
+      - name: Lint (ruff — 仅致命错误阻断)
+        run: |
+          # 全量 ruff 仅作信息展示，E9/F 致命错误才让 CI 失败
+          ruff check . --exclude .venv || true
+          ruff check . --exclude .venv --select E9,F63,F7,F82
+
+      - name: Run tests
+        run: pytest test/ -p no:warnings -q

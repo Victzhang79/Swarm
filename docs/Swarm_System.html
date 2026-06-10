@@ -1,0 +1,1785 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta name="x-poe-datastore-behavior" content="local_only"><meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://code.jquery.com https://unpkg.com https://d3js.org https://threejs.org https://cdn.plot.ly https://stackpath.bootstrapcdn.com https://maps.googleapis.com https://cdn.tailwindcss.com https://ajax.googleapis.com https://kit.fontawesome.com https://cdn.datatables.net https://maxcdn.bootstrapcdn.com https://code.highcharts.com https://tako-static-assets-production.s3.amazonaws.com https://www.youtube.com https://fonts.googleapis.com https://fonts.gstatic.com https://pfst.cf2.poecdn.net https://puc.poecdn.net https://i.imgur.com https://wikimedia.org https://*.icons8.com https://*.giphy.com https://picsum.photos https://images.unsplash.com; frame-src 'self' https://www.youtube.com https://trytako.com; child-src 'self'; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests; block-all-mixed-content;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>蜂群 (Swarm) - 完整项目架构评估文档 V2</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Noto+Sans+SC:wght@300;400;500;700;900&amp;display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a2e;
+            --bg-card: #16162a;
+            --bg-hover: #1e1e3a;
+            --text-primary: #e8e8f0;
+            --text-secondary: #a0a0b8;
+            --text-muted: #6a6a80;
+            --accent-blue: #4a9eff;
+            --accent-purple: #8b5cf6;
+            --accent-green: #10b981;
+            --accent-orange: #f59e0b;
+            --accent-red: #ef4444;
+            --accent-cyan: #06b6d4;
+            --accent-pink: #ec4899;
+            --border-color: #2a2a4a;
+            --border-active: #4a4a7a;
+            --gradient-1: linear-gradient(135deg, #4a9eff 0%, #8b5cf6 100%);
+            --gradient-2: linear-gradient(135deg, #10b981 0%, #06b6d4 100%);
+            --shadow-glow: 0 0 40px rgba(74,158,255,0.1);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Noto Sans SC', 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.7;
+            overflow-x: hidden;
+        }
+        .nav-sidebar {
+            position: fixed; left: 0; top: 0; width: 280px; height: 100vh;
+            background: var(--bg-secondary); border-right: 1px solid var(--border-color);
+            overflow-y: auto; z-index: 1000; padding: 20px 0;
+        }
+        .nav-logo { padding: 20px 24px; border-bottom: 1px solid var(--border-color); margin-bottom: 16px; }
+        .nav-logo h1 { font-size: 22px; font-weight: 800; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .nav-logo p { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+        .nav-section { padding: 0 16px; margin-bottom: 4px; }
+        .nav-section-title { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; padding: 10px 8px 4px; }
+        .nav-link { display: block; padding: 6px 12px; color: var(--text-secondary); text-decoration: none; font-size: 12px; border-radius: 6px; transition: all 0.2s; margin: 1px 0; }
+        .nav-link:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .nav-link.active { background: rgba(74,158,255,0.1); color: var(--accent-blue); font-weight: 500; }
+        .main-content { margin-left: 280px; padding: 40px 60px; max-width: 1200px; }
+        .page-header { text-align: center; padding: 50px 0 70px; position: relative; }
+        .page-header::after { content:''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 100px; height: 2px; background: var(--gradient-1); }
+        .page-header h1 { font-size: 44px; font-weight: 900; background: var(--gradient-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 12px; }
+        .page-header .subtitle { font-size: 18px; color: var(--text-secondary); font-weight: 300; }
+        .page-header .meta { margin-top: 20px; display: flex; justify-content: center; gap: 20px; font-size: 12px; color: var(--text-muted); }
+        .section { margin-bottom: 70px; scroll-margin-top: 30px; }
+        .section-title { font-size: 28px; font-weight: 800; margin-bottom: 10px; letter-spacing: -0.5px; }
+        .section-subtitle { font-size: 14px; color: var(--text-secondary); margin-bottom: 32px; max-width: 700px; }
+        .card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 28px; margin-bottom: 20px; transition: all 0.3s; }
+        .card:hover { border-color: var(--border-active); box-shadow: var(--shadow-glow); }
+        .card-title { font-size: 16px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
+        .subsection { margin-bottom: 40px; }
+        .subsection-title { font-size: 20px; font-weight: 700; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); }
+        .subsection-desc { color: var(--text-secondary); margin-bottom: 20px; font-size: 13px; line-height: 1.8; }
+        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+        .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+        .tech-tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 16px; font-size: 11px; font-weight: 500; background: rgba(74,158,255,0.1); color: var(--accent-blue); border: 1px solid rgba(74,158,255,0.2); margin: 3px; }
+        .tech-tag.green { background: rgba(16,185,129,0.1); color: var(--accent-green); border-color: rgba(16,185,129,0.2); }
+        .tech-tag.purple { background: rgba(139,92,246,0.1); color: var(--accent-purple); border-color: rgba(139,92,246,0.2); }
+        .tech-tag.orange { background: rgba(245,158,11,0.1); color: var(--accent-orange); border-color: rgba(245,158,11,0.2); }
+        .tech-tag.red { background: rgba(239,68,68,0.1); color: var(--accent-red); border-color: rgba(239,68,68,0.2); }
+        .tech-tag.cyan { background: rgba(6,182,212,0.1); color: var(--accent-cyan); border-color: rgba(6,182,212,0.2); }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 16px 0; }
+        .data-table th { text-align: left; padding: 10px 14px; background: var(--bg-tertiary); color: var(--text-secondary); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border-color); }
+        .data-table td { padding: 10px 14px; border-bottom: 1px solid var(--border-color); color: var(--text-primary); }
+        .data-table tr:hover td { background: var(--bg-hover); }
+        .code-block { background: #0d1117; border: 1px solid var(--border-color); border-radius: 8px; padding: 18px; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.7; overflow-x: auto; margin: 14px 0; color: #c9d1d9; white-space: pre-wrap; word-break: break-all; }
+        .code-block .comment { color: #8b949e; }
+        .code-block .keyword { color: #ff7b72; }
+        .code-block .string { color: #a5d6ff; }
+        .highlight-box { background: rgba(74,158,255,0.05); border: 1px solid rgba(74,158,255,0.2); border-left: 3px solid var(--accent-blue); border-radius: 8px; padding: 18px 22px; margin: 18px 0; }
+        .highlight-box.warning { background: rgba(245,158,11,0.05); border-color: rgba(245,158,11,0.2); border-left-color: var(--accent-orange); }
+        .highlight-box.success { background: rgba(16,185,129,0.05); border-color: rgba(16,185,129,0.2); border-left-color: var(--accent-green); }
+        .highlight-box.danger { background: rgba(239,68,68,0.05); border-color: rgba(239,68,68,0.2); border-left-color: var(--accent-red); }
+        .highlight-box h4 { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+        .highlight-box p { font-size: 12px; color: var(--text-secondary); line-height: 1.8; }
+        .metric-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px; text-align: center; }
+        .metric-value { font-size: 32px; font-weight: 800; margin-bottom: 4px; }
+        .metric-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .layer-stack { display: flex; flex-direction: column; gap: 3px; margin: 20px 0; }
+        .layer-item { display: flex; align-items: center; padding: 14px 20px; border-radius: 8px; border: 1px solid var(--border-color); transition: all 0.2s; }
+        .layer-item:hover { transform: translateX(4px); border-color: var(--border-active); }
+        .layer-item .layer-label { font-size: 11px; font-weight: 700; width: 50px; flex-shrink: 0; }
+        .layer-item .layer-name { font-size: 13px; font-weight: 600; flex: 1; min-width: 120px; }
+        .layer-item .layer-desc { font-size: 11px; color: var(--text-secondary); flex: 2; }
+        .layer-item .layer-tech { font-size: 10px; color: var(--text-muted); min-width: 100px; text-align: right; }
+        .arch-diagram { background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 12px; padding: 30px; margin: 24px 0; overflow-x: auto; }
+        .arch-diagram svg { width: 100%; height: auto; display: block; }
+        .ascii-box { background: #0d1117; border: 1px solid var(--border-color); border-radius: 8px; padding: 20px; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.5; overflow-x: auto; margin: 16px 0; color: #c9d1d9; white-space: pre; }
+        .status-badge { display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+        .status-badge.critical { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+        .status-badge.important { background: rgba(245,158,11,0.15); color: var(--accent-orange); }
+        .status-badge.normal { background: rgba(16,185,129,0.15); color: var(--accent-green); }
+        .risk-item { display: flex; align-items: flex-start; gap: 12px; padding: 14px; border: 1px solid var(--border-color); border-radius: 8px; margin-bottom: 10px; }
+        .risk-level { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
+        .risk-level.high { background: var(--accent-red); }
+        .risk-level.medium { background: var(--accent-orange); }
+        .risk-level.low { background: var(--accent-green); }
+        .sequence-container { background: var(--bg-tertiary); border-radius: 10px; padding: 24px; margin: 20px 0; overflow-x: auto; }
+        .seq-row { display: flex; align-items: center; margin: 6px 0; font-size: 11px; font-family: 'JetBrains Mono', monospace; }
+        .seq-actor { width: 90px; text-align: right; padding-right: 10px; color: var(--accent-blue); font-weight: 600; flex-shrink: 0; }
+        .seq-arrow { flex: 0 0 30px; text-align: center; color: var(--text-muted); }
+        .seq-message { flex: 1; padding-left: 10px; color: var(--text-secondary); }
+        .gradient-border { position: relative; border-radius: 12px; padding: 2px; background: var(--gradient-1); }
+        .gradient-border-inner { background: var(--bg-card); border-radius: 10px; padding: 28px; }
+        .tree-item { padding-left: 20px; border-left: 2px solid var(--border-color); margin: 6px 0; padding-top: 4px; padding-bottom: 4px; }
+        .tree-item.l1 { border-left-color: var(--accent-blue); }
+        .tree-item.l2 { border-left-color: var(--accent-green); margin-left: 20px; }
+        .tree-item.l3 { border-left-color: var(--accent-orange); margin-left: 40px; }
+        .tree-label { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+        .tree-desc { font-size: 11px; color: var(--text-secondary); }
+        .timeline-item { display: flex; gap: 16px; margin: 12px 0; padding: 12px; border-radius: 8px; background: var(--bg-card); border: 1px solid var(--border-color); }
+        .timeline-time { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--accent-cyan); min-width: 50px; font-weight: 600; }
+        .timeline-content { font-size: 12px; color: var(--text-secondary); }
+        @media (max-width: 1024px) {
+            .nav-sidebar { transform: translateX(-100%); }
+            .main-content { margin-left: 0; padding: 20px; }
+            .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+        }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-primary); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--border-active); }
+        .divider { border: none; border-top: 1px solid var(--border-color); margin: 40px 0; }
+    </style>
+</head>
+<body>
+
+<nav class="nav-sidebar">
+    <div class="nav-logo">
+        <h1>🐝 蜂群 Swarm</h1>
+        <p>AI编程智能体系统 · 完整架构评估 V2</p>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">总览</div>
+        <a href="#overview" class="nav-link active">项目概述</a>
+        <a href="#dataflow" class="nav-link">完整数据流</a>
+        <a href="#metrics" class="nav-link">核心指标</a>
+        <a href="#models" class="nav-link">模型选择策略</a>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">分层架构</div>
+        <a href="#layer-interaction" class="nav-link">开发者交互层</a>
+        <a href="#layer-api" class="nav-link">平台API层</a>
+        <a href="#layer-brain" class="nav-link">Brain编排层</a>
+        <a href="#layer-worker" class="nav-link">Worker执行层</a>
+        <a href="#layer-output" class="nav-link">产出与反馈层</a>
+        <a href="#layer-evolution" class="nav-link">知识进化层</a>
+        <a href="#layer-infra" class="nav-link">基础设施层</a>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">Brain 详细设计</div>
+        <a href="#brain-statemachine" class="nav-link">LangGraph状态机</a>
+        <a href="#brain-memory" class="nav-link">记忆系统 L0-L6</a>
+        <a href="#brain-tasksplit" class="nav-link">任务拆解策略</a>
+        <a href="#brain-coordination" class="nav-link">跨文件协调机制</a>
+        <a href="#brain-conflict" class="nav-link">合并冲突处理</a>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">知识库详细设计</div>
+        <a href="#kb-overview" class="nav-link">4层知识表示</a>
+        <a href="#kb-retrieval" class="nav-link">检索流程示例</a>
+        <a href="#kb-rerank" class="nav-link">Rerank优化</a>
+        <a href="#kb-update" class="nav-link">增量更新系统</a>
+        <a href="#kb-interaction" class="nav-link">知识库与Brain交互</a>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">Worker &amp; 验证</div>
+        <a href="#worker-container" class="nav-link">容器镜像分层</a>
+        <a href="#worker-execution" class="nav-link">执行引擎详细</a>
+        <a href="#verify-l1" class="nav-link">L1 Worker内验证</a>
+        <a href="#verify-l2" class="nav-link">L2 集成验证</a>
+        <a href="#verify-l3" class="nav-link">L3 环境验证</a>
+        <a href="#verify-failure" class="nav-link">验证失败处理树</a>
+    </div>
+    <div class="nav-section">
+        <div class="nav-section-title">评估</div>
+        <a href="#timeline" class="nav-link">典型任务时间线</a>
+        <a href="#growth" class="nav-link">预期成长曲线</a>
+        <a href="#performance" class="nav-link">性能与成本</a>
+        <a href="#risks" class="nav-link">风险评估</a>
+        <a href="#roadmap" class="nav-link">实施路线</a>
+    </div>
+</nav>
+
+<div class="main-content">
+
+<header class="page-header" id="overview">
+    <h1>蜂群 Swarm System</h1>
+    <p class="subtitle">企业级 AI 编程智能体系统 · 完整架构评估文档</p>
+    <div class="meta">
+        <span>📅 2026年5月20日</span>
+        <span>📐 V2.0 完整设计</span>
+        <span>🎯 内部项目评估</span>
+    </div>
+</header>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 完整数据流 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="dataflow">
+    <h2 class="section-title">完整数据流</h2>
+    <p class="section-subtitle">从任务提交到知识进化的完整闭环</p>
+    
+    <div class="card">
+        <div class="code-block">1. 开发者通过CLI/WebUI提交任务
+       ↓
+2. API层校验 → 入队（Redis Queue）→ 检查互斥锁
+       ↓
+3. Brain拿到任务 → 读取L1/L2/L4/L5/L6 → 判断复杂度 → 拆解DAG
+       ↓
+4. Brain按DAG调度Worker → 并行/串行执行
+       ↓
+5. Worker在Docker容器中：拉代码→编码(内循环)→验证→产出diff
+       ↓
+6. Brain收集所有Worker产出 → 合并 → 整体审查 → 生成变更摘要
+       ↓
+7. 推送通知给开发者 → 开发者审查
+       ↓
+8a. 接受 → 创建MR → 写入L6成功集 → 写入L2摘要
+8b. 修改 → 反馈回Brain → 重新调度Worker修改 → 回到步骤6
+8c. 拒绝 → 写入L5错题集 → 写入L2摘要 → 任务关闭
+       ↓
+9. 知识进化层异步处理：更新知识库、衰减旧模式、计算质量指标</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 核心指标 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="metrics">
+    <h2 class="section-title">核心设计指标</h2>
+    <div class="grid-4">
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-blue);">&lt; 5min</div><div class="metric-label">简单任务端到端</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-green);">&lt; 15min</div><div class="metric-label">中等任务端到端</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-purple);">4-5</div><div class="metric-label">Worker最大并发</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-orange);">&lt; 30s</div><div class="metric-label">知识库增量更新</div></div>
+    </div>
+    <div class="grid-4" style="margin-top:14px;">
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-cyan);">7层</div><div class="metric-label">记忆层深度 L0-L6</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-pink);">4层</div><div class="metric-label">知识库维度 A-D</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-green);">3级</div><div class="metric-label">验证深度 L1/L2/L3</div></div>
+        <div class="metric-card"><div class="metric-value" style="color:var(--accent-red);">10个</div><div class="metric-label">支持项目数</div></div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 模型选择策略 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="models">
+    <h2 class="section-title">模型选择策略</h2>
+    
+    <div class="grid-2">
+        <div class="card" style="border-left: 3px solid var(--accent-blue);">
+            <div class="card-title">🧠 Brain层模型</div>
+            <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">需要强推理能力，负责需求理解、任务拆解、验证判断</p>
+            <table class="data-table">
+                <tbody><tr><td style="font-weight:600;">主选</td><td>GLM5.1（复杂推理强）</td></tr>
+                <tr><td style="font-weight:600;">备选</td><td>KIMI-2.6（Sonnet限流/超时时切换）</td></tr>
+            </tbody></table>
+        </div>
+        <div class="card" style="border-left: 3px solid var(--accent-green);">
+            <div class="card-title">🐝 Worker层模型</div>
+            <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">需要代码生成能力，性价比优先</p>
+            <table class="data-table">
+                <tbody><tr><td style="font-weight:600;">优先</td><td>MINIMAX-2.7（性价比最高）</td></tr>
+                <tr><td style="font-weight:600;">本地</td><td>Qwen3.6-27B（隐私敏感/离线场景）</td></tr>
+                <tr><td style="font-weight:600;">兜底</td><td>Qwen3.5（V3不可用时）</td></tr>
+            </tbody></table>
+        </div>
+    </div>
+    
+    <div class="highlight-box warning">
+        <h4>⚡ 触发模型切换的条件</h4>
+        <p>
+            • API超时 &gt; 30秒<br>
+            • 收到429限流响应<br>
+            • 连续2次产出质量不达标（编译失败）
+        </p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 开发者交互层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-interaction">
+    <h2 class="section-title">开发者交互层</h2>
+    <p class="section-subtitle">CLI / WebUI / 未来IDE插件，通过WebSocket + REST与平台通信</p>
+    
+    <div class="grid-3">
+        <div class="card">
+            <div class="card-title">🖥️ CLI Tool</div>
+            <p style="font-size:12px;color:var(--text-secondary);">Python Click实现，终端开发者的首选交互方式</p>
+            <div class="code-block"><span class="comment"># 提交任务</span>
+swarm task create "给用户列表加排序" \
+  --project user-service
+
+<span class="comment"># 实时跟踪</span>
+swarm task watch &lt;task-id&gt;
+
+<span class="comment"># 审查产出</span>
+swarm task review &lt;task-id&gt; --accept
+swarm task review &lt;task-id&gt; --revise "修改意见"
+
+<span class="comment"># 知识库管理</span>
+swarm kb status --project user-service
+swarm kb rebuild --project user-service</div>
+        </div>
+        <div class="card">
+            <div class="card-title">🌐 Web UI</div>
+            <p style="font-size:12px;color:var(--text-secondary);">React + Tailwind，可视化任务管理与审查</p>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:12px;">
+                <p style="margin-bottom:6px;">📋 任务看板 — 列表、状态筛选、实时进度</p>
+                <p style="margin-bottom:6px;">🔍 任务详情 — 状态机可视化、DAG图、Worker日志</p>
+                <p style="margin-bottom:6px;">📝 Diff审查 — 代码对比、行级注释、一键操作</p>
+                <p style="margin-bottom:6px;">📊 统计面板 — 成功率、耗时、模型消耗</p>
+                <p style="margin-bottom:6px;">📚 知识库管理 — 状态、一致性报告</p>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">🔌 (未来) IDE插件</div>
+            <p style="font-size:12px;color:var(--text-secondary);">VSCode / IntelliJ IDEA 插件</p>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:12px;">
+                <p style="margin-bottom:6px;">• 在IDE中直接提交任务</p>
+                <p style="margin-bottom:6px;">• 内嵌Diff展示</p>
+                <p style="margin-bottom:6px;">• 一键Accept/Reject</p>
+                <p style="margin-bottom:6px;">• 进度通知集成</p>
+                <p style="color:var(--text-muted);font-style:italic;">Phase 5+ 实现</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="highlight-box">
+        <h4>🔌 通信协议</h4>
+        <p>WebSocket — 实时进度推送（状态变更、Worker进度、验证结果）<br>
+           REST API — 任务提交、状态查询、反馈操作、知识库管理</p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 平台API层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-api">
+    <h2 class="section-title">平台 API 层</h2>
+    <p class="section-subtitle">FastAPI服务，统一入口，任务管理、用户管理、项目配置、通知服务</p>
+    
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-title">📋 任务管理</div>
+            <p style="font-size:12px;color:var(--text-secondary);">提交/状态/取消/重试/反馈/接受</p>
+        </div>
+        <div class="card">
+            <div class="card-title">👤 用户管理</div>
+            <p style="font-size:12px;color:var(--text-secondary);">档案卡CRUD / 权限校验 / 偏好同步</p>
+        </div>
+        <div class="card">
+            <div class="card-title">⚙️ 项目配置</div>
+            <p style="font-size:12px;color:var(--text-secondary);">10个项目 / 知识库配置 / 模型路由配置</p>
+        </div>
+        <div class="card">
+            <div class="card-title">🔔 通知服务</div>
+            <p style="font-size:12px;color:var(--text-secondary);">WebSocket推送 / 飞书钉钉 / 邮件通知</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">📮 任务队列 (Redis Queue)</div>
+        <div class="code-block"><span class="comment">优先级队列：</span>
+  urgent &gt; normal &gt; background
+
+<span class="comment">并发控制：</span>
+  同项目同模块互斥锁（Redis分布式锁）
+  避免两个任务同时修改同一模块导致冲突</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Brain编排层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-brain">
+    <h2 class="section-title">Brain 编排层</h2>
+    <p class="section-subtitle">LangGraph状态机，系统的大脑，不写代码只做决策</p>
+    
+    <div class="subsection">
+        <h3 class="subsection-title">Brain 核心流程</h3>
+        
+        <div class="card">
+            <div class="card-title">1️⃣ 需求理解</div>
+            <div style="font-size:13px;color:var(--text-secondary);">
+                <p style="margin-bottom:8px;">• 解析开发者意图</p>
+                <p style="margin-bottom:8px;">• 补充项目上下文（从L4知识库检索）</p>
+                <p style="margin-bottom:8px;">• 判断任务复杂度 → 路由策略：</p>
+            </div>
+            <table class="data-table">
+                <tbody><tr><td style="font-weight:600;">简单（改配置/加字段）</td><td>→ 单Worker直接执行</td></tr>
+                <tr><td style="font-weight:600;">中等（单模块功能）</td><td>→ 2-3 Worker串行</td></tr>
+                <tr><td style="font-weight:600;">复杂（跨模块Feature）</td><td>→ 多Worker并行+合并</td></tr>
+                <tr><td style="font-weight:600;">超复杂（架构变更）</td><td>→ 先出方案让人确认</td></tr>
+            </tbody></table>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">2️⃣ 任务拆解</div>
+            <div style="font-size:13px;color:var(--text-secondary);">
+                <p style="margin-bottom:6px;">• 生成子任务DAG（带依赖关系）</p>
+                <p style="margin-bottom:6px;">• 为每个子任务指定：范围、约束、验收标准</p>
+                <p style="margin-bottom:6px;">• 检索L5错题集 → 注入"不要犯的错"</p>
+                <p>• 检索L6成功集 → 注入"可参考的范例"</p>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">3️⃣ 执行调度</div>
+            <div style="font-size:13px;color:var(--text-secondary);">
+                <p style="margin-bottom:6px;">• 按DAG拓扑序调度Worker</p>
+                <p style="margin-bottom:6px;">• 无依赖的子任务并行执行</p>
+                <p style="margin-bottom:6px;">• 有依赖的等上游完成后启动</p>
+                <p>• Worker失败 → 重试(最多2次) → 换模型重试 → 上报人工</p>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">4️⃣ 产出审查</div>
+            <div style="font-size:13px;color:var(--text-secondary);">
+                <p style="margin-bottom:6px;">• 合并所有Worker产出</p>
+                <p style="margin-bottom:6px;">• 冲突检测与解决</p>
+                <p style="margin-bottom:6px;">• 整体一致性检查（接口对齐、import完整等）</p>
+                <p style="margin-bottom:6px;">• 自动跑Lint + 编译验证</p>
+                <p>• 生成变更摘要给开发者</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Brain状态机 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="brain-statemachine">
+    <h2 class="section-title">LangGraph 状态机详细设计</h2>
+    <p class="section-subtitle">完整的任务生命周期状态流转</p>
+    
+    <div class="card">
+        <div class="card-title">任务生命周期状态机</div>
+        <div class="code-block">SUBMITTED → ANALYZING → PLANNING → EXECUTING → REVIEWING → DONE
+                             │                       │
+                             ▼                       ▼
+                        BLOCKED              REVISION_NEEDED
+                       (等人工确认)           (需要修改)</div>
+    </div>
+
+    <div class="arch-diagram">
+        <svg viewBox="0 0 900 650" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <marker id="arr" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#6a6a80"></polygon>
+                </marker>
+                <marker id="arr-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#4a9eff"></polygon>
+                </marker>
+                <marker id="arr-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#10b981"></polygon>
+                </marker>
+                <marker id="arr-red" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#ef4444"></polygon>
+                </marker>
+            </defs>
+            
+            <!-- Row 1 -->
+            <rect x="30" y="30" width="110" height="44" rx="6" fill="rgba(139,92,246,0.15)" stroke="#8b5cf6" stroke-width="1.5"></rect>
+            <text x="85" y="56" fill="#8b5cf6" font-size="11" text-anchor="middle" font-weight="600">RECEIVED</text>
+            <line x1="140" y1="52" x2="170" y2="52" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="180" y="30" width="110" height="44" rx="6" fill="rgba(74,158,255,0.15)" stroke="#4a9eff" stroke-width="1.5"></rect>
+            <text x="235" y="56" fill="#4a9eff" font-size="11" text-anchor="middle" font-weight="600">ANALYZE</text>
+            <line x1="290" y1="52" x2="320" y2="52" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="330" y="30" width="100" height="44" rx="6" fill="rgba(74,158,255,0.15)" stroke="#4a9eff" stroke-width="1.5"></rect>
+            <text x="380" y="56" fill="#4a9eff" font-size="11" text-anchor="middle" font-weight="600">PLAN</text>
+            <line x1="430" y1="52" x2="460" y2="52" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="470" y="30" width="130" height="44" rx="6" fill="rgba(245,158,11,0.15)" stroke="#f59e0b" stroke-width="1.5"></rect>
+            <text x="535" y="56" fill="#f59e0b" font-size="11" text-anchor="middle" font-weight="600">VALIDATE_PLAN</text>
+
+            <!-- Branches from VALIDATE -->
+            <line x1="535" y1="74" x2="535" y2="100" stroke="#6a6a80" stroke-width="1"></line>
+            
+            <!-- Pass → EXECUTE -->
+            <path d="M 600 52 L 680 52 L 680 140" stroke="#10b981" stroke-width="1.5" fill="none" marker-end="url(#arr-green)"></path>
+            <text x="650" y="45" fill="#10b981" font-size="9">通过</text>
+
+            <!-- Retry -->
+            <rect x="470" y="110" width="120" height="38" rx="6" fill="rgba(245,158,11,0.1)" stroke="#f59e0b" stroke-width="1"></rect>
+            <text x="530" y="133" fill="#f59e0b" font-size="10" text-anchor="middle">PLAN_RETRY</text>
+            <path d="M 530 100 L 530 110" stroke="#f59e0b" stroke-width="1" marker-end="url(#arr)"></path>
+            <path d="M 470 129 Q 410 129 410 74" stroke="#f59e0b" stroke-width="1" fill="none" stroke-dasharray="3" marker-end="url(#arr)"></path>
+            <text x="440" y="105" fill="#f59e0b" font-size="8">重试</text>
+
+            <!-- Confirm -->
+            <rect x="310" y="110" width="120" height="38" rx="6" fill="rgba(139,92,246,0.15)" stroke="#8b5cf6" stroke-width="1.5"></rect>
+            <text x="370" y="128" fill="#8b5cf6" font-size="10" text-anchor="middle">CONFIRM</text>
+            <text x="370" y="141" fill="#a0a0b8" font-size="8" text-anchor="middle">⏸ interrupt</text>
+            <path d="M 490 100 L 430 118" stroke="#8b5cf6" stroke-width="1" fill="none" marker-end="url(#arr)"></path>
+            <text x="450" y="100" fill="#8b5cf6" font-size="8">需确认</text>
+            <path d="M 370 148 Q 370 165 400 165 L 650 165 L 680 150" stroke="#6a6a80" stroke-width="1" fill="none" stroke-dasharray="3" marker-end="url(#arr)"></path>
+
+            <!-- EXECUTE/DISPATCH Row -->
+            <rect x="630" y="145" width="110" height="44" rx="6" fill="rgba(16,185,129,0.15)" stroke="#10b981" stroke-width="2"></rect>
+            <text x="685" y="171" fill="#10b981" font-size="11" text-anchor="middle" font-weight="600">DISPATCH</text>
+            <line x1="685" y1="189" x2="685" y2="215" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="630" y="220" width="110" height="44" rx="6" fill="rgba(16,185,129,0.15)" stroke="#10b981" stroke-width="1.5"></rect>
+            <text x="685" y="246" fill="#10b981" font-size="11" text-anchor="middle" font-weight="600">MONITOR</text>
+
+            <!-- Monitor → more dispatch -->
+            <path d="M 740 242 Q 790 242 790 170 Q 790 158 740 167" stroke="#10b981" stroke-width="1" fill="none" stroke-dasharray="3" marker-end="url(#arr-green)"></path>
+            <text x="800" y="200" fill="#10b981" font-size="8">还有下游</text>
+
+            <!-- Monitor → Failure -->
+            <path d="M 630 250 L 530 280" stroke="#ef4444" stroke-width="1.5" fill="none" marker-end="url(#arr-red)"></path>
+            <text x="565" y="258" fill="#ef4444" font-size="8">有失败</text>
+
+            <rect x="450" y="280" width="140" height="44" rx="6" fill="rgba(239,68,68,0.15)" stroke="#ef4444" stroke-width="1.5"></rect>
+            <text x="520" y="300" fill="#ef4444" font-size="10" text-anchor="middle" font-weight="600">HANDLE_FAILURE</text>
+            <text x="520" y="315" fill="#a0a0b8" font-size="8" text-anchor="middle">重试/换模型/重拆</text>
+            <path d="M 520 280 Q 520 200 630 167" stroke="#ef4444" stroke-width="1" fill="none" stroke-dasharray="3" marker-end="url(#arr)"></path>
+            <text x="540" y="230" fill="#ef4444" font-size="8">回到DISPATCH或PLAN</text>
+
+            <!-- Monitor → Merge -->
+            <line x1="685" y1="264" x2="685" y2="290" stroke="#10b981" stroke-width="1.5" marker-end="url(#arr-green)"></line>
+            <text x="700" y="282" fill="#10b981" font-size="8">全成功</text>
+
+            <rect x="630" y="295" width="110" height="44" rx="6" fill="rgba(6,182,212,0.15)" stroke="#06b6d4" stroke-width="1.5"></rect>
+            <text x="685" y="321" fill="#06b6d4" font-size="11" text-anchor="middle" font-weight="600">MERGE</text>
+            <line x1="685" y1="339" x2="685" y2="360" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="630" y="365" width="110" height="44" rx="6" fill="rgba(245,158,11,0.15)" stroke="#f59e0b" stroke-width="1.5"></rect>
+            <text x="685" y="391" fill="#f59e0b" font-size="11" text-anchor="middle" font-weight="600">VERIFY (L2)</text>
+            <line x1="685" y1="409" x2="685" y2="435" stroke="#6a6a80" stroke-width="1.5" marker-end="url(#arr)"></line>
+
+            <rect x="630" y="440" width="110" height="44" rx="6" fill="rgba(139,92,246,0.15)" stroke="#8b5cf6" stroke-width="2"></rect>
+            <text x="685" y="460" fill="#8b5cf6" font-size="11" text-anchor="middle" font-weight="600">DELIVER</text>
+            <text x="685" y="476" fill="#a0a0b8" font-size="8" text-anchor="middle">⏸ interrupt</text>
+
+            <!-- Deliver branches -->
+            <path d="M 630 462 L 520 500" stroke="#10b981" stroke-width="1.5" fill="none" marker-end="url(#arr-green)"></path>
+            <text x="555" y="478" fill="#10b981" font-size="8">Accept</text>
+            
+            <path d="M 685 484 L 685 510" stroke="#f59e0b" stroke-width="1.5" fill="none" marker-end="url(#arr)"></path>
+            <text x="700" y="502" fill="#f59e0b" font-size="8">Revise</text>
+
+            <path d="M 740 462 L 820 500" stroke="#ef4444" stroke-width="1.5" fill="none" marker-end="url(#arr-red)"></path>
+            <text x="790" y="478" fill="#ef4444" font-size="8">Reject</text>
+
+            <!-- ACCEPTED -->
+            <rect x="440" y="500" width="120" height="38" rx="6" fill="rgba(16,185,129,0.15)" stroke="#10b981" stroke-width="1.5"></rect>
+            <text x="500" y="523" fill="#10b981" font-size="10" text-anchor="middle" font-weight="600">ACCEPTED</text>
+
+            <!-- REVISION -->
+            <rect x="630" y="515" width="110" height="38" rx="6" fill="rgba(245,158,11,0.15)" stroke="#f59e0b" stroke-width="1.5"></rect>
+            <text x="685" y="538" fill="#f59e0b" font-size="10" text-anchor="middle" font-weight="600">REVISION</text>
+            <path d="M 685 553 Q 685 570 200 570 L 200 175 L 630 167" stroke="#f59e0b" stroke-width="1" fill="none" stroke-dasharray="3" marker-end="url(#arr)"></path>
+            <text x="400" y="565" fill="#f59e0b" font-size="8">回到DISPATCH(带反馈)</text>
+
+            <!-- REJECTED -->
+            <rect x="770" y="500" width="110" height="38" rx="6" fill="rgba(239,68,68,0.15)" stroke="#ef4444" stroke-width="1.5"></rect>
+            <text x="825" y="523" fill="#ef4444" font-size="10" text-anchor="middle" font-weight="600">REJECTED</text>
+
+            <!-- Learn nodes -->
+            <path d="M 500 538 L 500 570" stroke="#6a6a80" stroke-width="1" marker-end="url(#arr)"></path>
+            <rect x="440" y="575" width="120" height="35" rx="6" fill="rgba(16,185,129,0.1)" stroke="#10b981" stroke-width="1"></rect>
+            <text x="500" y="597" fill="#10b981" font-size="9" text-anchor="middle">LEARN_SUCCESS</text>
+
+            <path d="M 825 538 L 825 570" stroke="#6a6a80" stroke-width="1" marker-end="url(#arr)"></path>
+            <rect x="765" y="575" width="120" height="35" rx="6" fill="rgba(239,68,68,0.1)" stroke="#ef4444" stroke-width="1"></rect>
+            <text x="825" y="597" fill="#ef4444" font-size="9" text-anchor="middle">LEARN_FAILURE</text>
+
+            <!-- DONE -->
+            <path d="M 500 610 L 650 630" stroke="#6a6a80" stroke-width="1" fill="none" marker-end="url(#arr)"></path>
+            <path d="M 825 610 L 710 630" stroke="#6a6a80" stroke-width="1" fill="none" marker-end="url(#arr)"></path>
+            <rect x="640" y="625" width="80" height="30" rx="15" fill="rgba(74,158,255,0.2)" stroke="#4a9eff" stroke-width="1.5"></rect>
+            <text x="680" y="644" fill="#4a9eff" font-size="10" text-anchor="middle" font-weight="700">DONE</text>
+        </svg>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Brain 记忆系统 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="brain-memory">
+    <h2 class="section-title">Brain 记忆系统 L0-L6</h2>
+    
+    <div class="layer-stack">
+        <div class="layer-item" style="background:rgba(100,100,100,0.05);">
+            <span class="layer-label" style="color:var(--text-muted);">L0</span>
+            <span class="layer-name">会话元数据</span>
+            <span class="layer-desc">内存，用完即弃</span>
+            <span class="layer-tech">内存</span>
+        </div>
+        <div class="layer-item" style="background:rgba(74,158,255,0.05);">
+            <span class="layer-label" style="color:var(--accent-blue);">L1</span>
+            <span class="layer-name">用户档案卡</span>
+            <span class="layer-desc">PostgreSQL，精确KV，覆盖更新。每个开发者的偏好、风格、常用模块</span>
+            <span class="layer-tech">PostgreSQL JSON</span>
+        </div>
+        <div class="layer-item" style="background:rgba(16,185,129,0.05);">
+            <span class="layer-label" style="color:var(--accent-green);">L2</span>
+            <span class="layer-name">近期任务摘要</span>
+            <span class="layer-desc">PostgreSQL，滚动50条，只存摘要。避免重复工作、发现关联</span>
+            <span class="layer-tech">PostgreSQL</span>
+        </div>
+        <div class="layer-item" style="background:rgba(139,92,246,0.05);">
+            <span class="layer-label" style="color:var(--accent-purple);">L3</span>
+            <span class="layer-name">滑动窗口</span>
+            <span class="layer-desc">内存，当前任务上下文，超限自动压缩旧消息</span>
+            <span class="layer-tech">LangGraph State</span>
+        </div>
+        <div class="layer-item" style="background:rgba(6,182,212,0.05);">
+            <span class="layer-label" style="color:var(--accent-cyan);">L4</span>
+            <span class="layer-name">长期知识库</span>
+            <span class="layer-desc">Qdrant + 原文，代码结构/文档/接口定义。详见知识库4层设计</span>
+            <span class="layer-tech">Qdrant + PG</span>
+        </div>
+        <div class="layer-item" style="background:rgba(239,68,68,0.05);">
+            <span class="layer-label" style="color:var(--accent-red);">L5</span>
+            <span class="layer-name">错题集</span>
+            <span class="layer-desc">PG + 向量索引，错误模式+教训，带衰减。被拒绝时提取</span>
+            <span class="layer-tech">PG + 向量</span>
+        </div>
+        <div class="layer-item" style="background:rgba(245,158,11,0.05);">
+            <span class="layer-label" style="color:var(--accent-orange);">L6</span>
+            <span class="layer-name">成功模式集</span>
+            <span class="layer-desc">PG + 向量索引，最佳实践+范例代码。被接受时提取</span>
+            <span class="layer-tech">PG + 向量</span>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 任务拆解策略 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="brain-tasksplit">
+    <h2 class="section-title">任务拆解策略</h2>
+    <p class="section-subtitle">4大拆解原则 + 共享契约机制</p>
+    
+    <div class="card">
+        <div class="card-title">原则1：每个子任务的文件范围必须明确且最小化</div>
+        <div class="code-block"><span class="keyword">❌ 错误拆法：</span>"实现用户列表排序功能"（太模糊，Worker不知道动哪个文件）
+
+<span class="keyword">✅ 正确拆法：</span>
+  子任务1："在UserQueryDTO.java中新增sortField和sortOrder字段"
+  子任务2："在UserMapper.xml的selectPage中加动态排序SQL"
+  子任务3："在UserController.getUserList中接收并传递排序参数"</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">原则2：子任务之间的边界不能有歧义</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            每个子任务产出的"接口契约"要在拆解时就定好。Brain承担"架构师"角色，所有共享接口由Brain统一定义，Worker不做设计决策只做实现。
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">原则3：独立可验证</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            每个子任务完成后必须能独立验证对错。例如：子任务1验证DTO编译通过、子任务2验证XML语法正确、子任务3验证Controller编译通过。
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">原则4：宁可多拆不要少拆</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            一个子任务只改1-3个文件，超过3个文件的子任务大概率要继续拆。原因：Worker上下文有限，塞太多文件容易顾此失彼。
+        </p>
+    </div>
+
+    <hr class="divider">
+    
+    <div class="subsection">
+        <h3 class="subsection-title">拆解示例 + 共享契约</h3>
+        <div class="highlight-box success">
+            <h4>需求："给用户列表加排序功能"</h4>
+            <p>Brain拆解并定义契约：</p>
+        </div>
+        
+        <div class="code-block"><span class="comment">// 共享契约（由Brain统一定义，写入所有相关子任务的context）</span>
+{
+  "new_dto_fields": [
+    {"name": "sortField", "type": "String", "default": "createTime"},
+    {"name": "sortOrder", "type": "String", "default": "DESC"}
+  ],
+  "validation_rule": "sortField只允许: createTime, username, email",
+  "mapper_param_style": "#{sortField} #{sortOrder}",
+  "controller_param_style": "@RequestParam(required=false)"
+}
+
+<span class="comment">// 子任务A（可并行）：修改 UserQueryDTO.java</span>
+scope.writable: [UserQueryDTO.java]
+context: 按契约添加两个字段，加@Schema注解
+验证：编译通过
+
+<span class="comment">// 子任务B（可并行）：修改 UserMapper.xml</span>
+scope.writable: [UserMapper.xml]
+scope.readable: [UserQueryDTO.java]  ← 知道字段名即可
+context: 按契约在selectPage的SQL末尾加动态ORDER BY
+验证：XML语法校验通过
+
+<span class="comment">// 子任务C（依赖A）：修改 UserController.java + UserService.java</span>
+scope.writable: [UserController.java, UserService.java]
+scope.readable: [UserQueryDTO.java]
+context: 按契约在Controller接收参数，set到DTO中透传
+验证：编译通过
+
+<span class="comment">// 执行顺序：</span>
+A ─────┐
+       ├──→ C（C依赖A的DTO定义完成）
+B ─────┘     （B和A/C并行，因为B只需要知道字段名，不需要真实文件）</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 跨文件协调 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="brain-coordination">
+    <h2 class="section-title">跨文件协调三层保障</h2>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-blue);">
+        <div class="card-title">第一层：拆解时预防（Brain负责）</div>
+        <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">
+            Brain在拆解时就把"接口契约"定死。所有共享接口由Brain统一定义，Worker只管按规定写。
+        </p>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            关键：Brain承担"架构师"角色，所有共享接口由Brain统一定义，Worker不做设计决策，只做实现。
+        </p>
+    </div>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-green);">
+        <div class="card-title">第二层：执行时约束（Worker隔离）</div>
+        <div class="code-block"><span class="comment">文件锁定规则：</span>
+scope.writable: ["UserMapper.xml"]     → 可以修改
+scope.readable: ["UserQueryDTO.java"]  → 只能读，参考结构
+其他文件：不可见
+
+<span class="comment">如果Worker发现需要修改scope外的文件 → 不能擅自改</span>
+→ 上报Brain → Brain决定是否扩展scope或新开子任务</div>
+    </div>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-orange);">
+        <div class="card-title">第三层：合并时验证（Brain审查）</div>
+        <p style="font-size:12px;color:var(--text-secondary);">所有Worker完成后，Brain做"集成审查"：</p>
+        <table class="data-table">
+            <tbody><tr><td>import一致性</td><td>Worker-A新增的类，Worker-B是否正确import了</td></tr>
+            <tr><td>类型一致性</td><td>字段类型在所有文件中是否一致</td></tr>
+            <tr><td>命名一致性</td><td>同一概念在不同文件中是否用了同一个名字</td></tr>
+            <tr><td>调用匹配</td><td>方法签名和调用处参数是否匹配</td></tr>
+            <tr><td>编译验证</td><td>合并后整体编译是否通过</td></tr>
+        </tbody></table>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:10px;">如果发现不一致 → Brain自动生成修复子任务 → 单独Worker执行修复</p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 合并冲突处理 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="brain-conflict">
+    <h2 class="section-title">合并冲突处理</h2>
+    
+    <div class="card">
+        <div class="card-title">三种冲突场景</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">场景1：Worker之间的冲突（内部冲突）</td><td>Brain拆解有问题，应在拆解阶段就避免（PlanValidator检查）</td></tr>
+            <tr><td style="font-weight:600;">场景2：蜂群产出和主分支的冲突（外部冲突）</td><td>Worker在t0拉了代码，t1完成时主分支已有新提交 — 最常见场景</td></tr>
+            <tr><td style="font-weight:600;">场景3：多个蜂群任务之间的冲突</td><td>两个任务同时修改同一模块 — 通过任务队列的互斥锁避免</td></tr>
+        </tbody></table>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">冲突处理流程</div>
+        <div class="code-block">Worker产出diff
+     │
+     ▼
+Step 1: 尝试合并 (git apply --check)
+     │
+  ┌──┴──┐
+成功✅  失败❌
+  │      │
+  ▼      ▼
+直接   Step 2: 分析冲突类型
+应用      │
+       ┌──┼──┐
+       ▼  ▼  ▼
+    无关变更  相邻变更  同区域变更
+    (不同区域) (上下文偏移) (真冲突)
+       │      │         │
+       ▼      ▼         ▼
+    3-way   重新基于   Brain分析 →
+    merge   最新代码   选择策略：
+    自动解决 让Worker   a. 自动合并（语义不冲突时）
+            重新生成   b. 重新执行子任务（基于最新代码）
+                      c. 上报开发者决定</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">冲突预防措施</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">缩短执行时间</td><td>Worker并行执行，任务越快完成diverge越少</td></tr>
+            <tr><td style="font-weight:600;">执行前rebase</td><td>Worker开始前先拉最新代码</td></tr>
+            <tr><td style="font-weight:600;">最小化修改范围</td><td>Worker只修改必要的行，不做格式化、不动无关代码</td></tr>
+            <tr><td style="font-weight:600;">同模块互斥</td><td>同一模块同一时间只有一个蜂群任务在执行（Redis分布式锁）</td></tr>
+            <tr><td style="font-weight:600;">快速失败</td><td>合并前检查主分支是否有新提交，变更文件被改了就直接重跑</td></tr>
+        </tbody></table>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Worker执行层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-worker">
+    <h2 class="section-title">Worker 执行层</h2>
+    <p class="section-subtitle">Docker容器池 + 任务执行引擎</p>
+    
+    <div class="card">
+        <div class="card-title">容器编排</div>
+        <div class="code-block"><span class="comment">预热容器池（按项目预装依赖镜像）</span>
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│Worker-1  │ │Worker-2  │ │Worker-3  │ │Worker-N  │
+│Java环境  │ │Java环境  │ │Node环境  │ │Python环境│
+│user-svc  │ │pay-svc   │ │frontend  │ │data-svc  │
+└──────────┘ └──────────┘ └──────────┘ └──────────┘</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">Worker 执行循环</div>
+        <div class="code-block">┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│ 1.准备  │ →  │ 2.编码  │ →  │ 3.验证  │ →  │ 4.产出  │
+│         │    │         │    │         │    │         │
+│拉取代码 │    │生成修改 │    │编译测试 │    │输出diff │
+│读取上下文│    │多轮修正 │    │lint检查 │    │变更说明 │
+│定位文件 │    │(内循环) │    │自检一致性│    │置信度   │
+└─────────┘    └────┬────┘    └─────────┘    └─────────┘
+                    │
+                    ▼
+             编码内循环（最多3轮）
+             生成代码 → 编译 → 失败 → 读错误 → 修复 → 再编译
+                                                        ↓
+                                                 测试失败 → 修复 → 再跑
+                                                        ↓
+                                                 全部通过 → 产出</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">Worker 工具箱</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">文件操作</td><td>read_file / write_file / patch_file / search_in_file</td></tr>
+            <tr><td style="font-weight:600;">Git操作</td><td>checkout / diff / log / blame</td></tr>
+            <tr><td style="font-weight:600;">构建工具</td><td>mvn compile / npm build / pytest</td></tr>
+            <tr><td style="font-weight:600;">代码分析</td><td>tree-sitter解析 / grep符号 / 依赖分析</td></tr>
+            <tr><td style="font-weight:600;">检索工具</td><td>查知识库 / 查错题集 / 查接口定义</td></tr>
+        </tbody></table>
+    </div>
+    
+    <div class="highlight-box warning">
+        <h4>⚠️ 资源限制</h4>
+        <p>单Worker最大执行时间10min，内存2GB，磁盘5GB</p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 容器镜像分层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="worker-container">
+    <h2 class="section-title">容器镜像分层策略</h2>
+    
+    <div class="card">
+        <div class="code-block"><span class="keyword">Base Layer（月更）</span>
+  OS + JDK/Node/Python + 基础工具 (git, tree-sitter, linter)
+        │
+        ▼
+<span class="keyword">Project Layer（周更/代码变更时）</span>
+  项目依赖已下载 (mvn dependency已缓存 / node_modules)
+  项目最新代码已clone
+        │
+        ▼
+<span class="keyword">Task Layer（每次任务时）</span>
+  checkout到最新commit
+  创建工作分支
+  注入任务上下文文件</div>
+        
+        <div style="margin-top:16px;">
+            <p style="font-size:13px;font-weight:600;margin-bottom:8px;">效果：</p>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• Worker启动不需要从头clone + 下载依赖</p>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 从拿到子任务到开始编码：&lt;10秒（只需git pull + checkout）</p>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">• 全量编译耗时大幅减少（增量编译）</p>
+            <p style="font-size:13px;font-weight:600;margin-bottom:8px;">预热策略：</p>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 10个项目各保持1个预热容器待命</p>
+            <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 任务来了直接fork一份使用</p>
+            <p style="font-size:12px;color:var(--text-secondary);">• 空闲时定时git pull保持代码最新</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">容器池管理器 (Container Pool Manager)</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">预热容器</td><td>每个项目1个standby容器（代码+依赖已ready）</td></tr>
+            <tr><td style="font-weight:600;">弹性扩展</td><td>并发任务多时临时创建（启动稍慢但可接受）</td></tr>
+            <tr><td style="font-weight:600;">资源回收</td><td>任务完成后容器保留5分钟（复用），超时销毁</td></tr>
+            <tr><td style="font-weight:600;">最大并发</td><td>根据服务器资源限制（如8核32G → 最多4个Worker并行）</td></tr>
+        </tbody></table>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Worker执行引擎详细 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="worker-execution">
+    <h2 class="section-title">Worker 执行引擎详细</h2>
+    
+    <div class="card">
+        <div class="card-title">输入</div>
+        <div style="font-size:12px;color:var(--text-secondary);">
+            <p style="margin-bottom:4px;">• 子任务定义（目标、约束、验收标准）</p>
+            <p style="margin-bottom:4px;">• 文件scope（可读/可写）</p>
+            <p style="margin-bottom:4px;">• 契约信息（共享接口定义）</p>
+            <p style="margin-bottom:4px;">• 上下文代码片段（相关文件内容）</p>
+            <p>• 错题警告 + 成功范例</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">执行阶段</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">Phase 1: 定位（&lt;5秒）</td><td>读取scope内文件 → 理解当前代码结构 → 确定修改点</td></tr>
+            <tr><td style="font-weight:600;">Phase 2: 编码（10-60秒）</td><td>生成代码修改 → 写入文件</td></tr>
+            <tr><td style="font-weight:600;">Phase 3: L1验证（10-120秒）</td><td>编译 → lint → 相关单测 → 自检。失败回到Phase 2（最多3轮）</td></tr>
+            <tr><td style="font-weight:600;">Phase 4: 产出</td><td>生成diff → 附带变更说明 → 置信度评分 → 上报Brain</td></tr>
+        </tbody></table>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">输出</div>
+        <div style="font-size:12px;color:var(--text-secondary);">
+            <p style="margin-bottom:4px;">• patch文件（git diff格式）</p>
+            <p style="margin-bottom:4px;">• 变更说明（改了什么、为什么这么改）</p>
+            <p style="margin-bottom:4px;">• 置信度（high/medium/low）</p>
+            <p style="margin-bottom:4px;">• 验证结果（L1各项是否通过）</p>
+            <p>• 执行日志（用于debug）</p>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 产出与反馈层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-output">
+    <h2 class="section-title">产出与反馈层</h2>
+    
+    <div class="card">
+        <div class="card-title">产出处理流水线</div>
+        <div class="code-block">Worker产出 → Brain合并审查 → 生成统一diff → 生成变更摘要
+                                   │
+                                   ▼
+                         ┌──────────────────┐
+                         │  开发者审查环节   │
+                         └────────┬─────────┘
+                                  │
+                 ┌────────────────┼────────────────┐
+                 ▼                ▼                ▼
+           ┌──────────┐    ┌──────────┐    ┌──────────┐
+           │  接受    │    │  修改    │    │  拒绝    │
+           │          │    │          │    │          │
+           │→创建MR   │    │→反馈给   │    │→记录错题 │
+           │→记录成功集│    │  Brain   │    │→分析原因 │
+           │→更新摘要 │    │→进入修改 │    │→更新摘要 │
+           │          │    │  循环    │    │          │
+           └──────────┘    └──────────┘    └──────────┘</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">🦊 GitLab 集成</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            创建临时分支 → push产出代码 → 创建MR(草稿) → 关联原始任务ID<br><br>
+            MR描述自动填充：变更摘要 + 涉及模块 + 测试情况 + 蜂群任务链接
+        </p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 知识进化层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-evolution">
+    <h2 class="section-title">知识进化层</h2>
+    <p class="section-subtitle">持续学习与自我优化</p>
+    
+    <div class="card">
+        <div class="card-title">知识更新触发器</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">Git Push事件</td><td>→ 增量更新L4代码知识库（tree-sitter重新解析变更文件）</td></tr>
+            <tr><td style="font-weight:600;">任务被接受</td><td>→ 提取成功模式写入L6</td></tr>
+            <tr><td style="font-weight:600;">任务被拒绝</td><td>→ 提取错误模式写入L5</td></tr>
+            <tr><td style="font-weight:600;">开发者反馈</td><td>→ 更新L1档案卡 / 补充L5详情</td></tr>
+            <tr><td style="font-weight:600;">MR评论</td><td>→ 自动提取代码审查意见，丰富L5/L6</td></tr>
+            <tr><td style="font-weight:600;">定时任务</td><td>→ L5/L6衰减清理 / 知识库一致性校验</td></tr>
+        </tbody></table>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">质量度量与自我评估</div>
+        <div class="grid-2" style="margin-top:12px;">
+            <div>
+                <p style="font-size:12px;font-weight:600;margin-bottom:10px;">核心指标：</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 首次接受率（产出直接被接受，无需修改的比例）</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 平均修改轮数（反馈几轮后被接受）</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 任务完成时间（从提交到最终接受）</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 错题复发率（同类错误是否再次出现）</p>
+                <p style="font-size:12px;color:var(--text-secondary);">• 模型成本/任务（token消耗趋势）</p>
+            </div>
+            <div>
+                <p style="font-size:12px;font-weight:600;margin-bottom:10px;">自动优化：</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 某类任务首次接受率低 → 自动加强该类的错题检索权重</p>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">• 某模型某类任务表现差 → 自动调整模型路由策略</p>
+                <p style="font-size:12px;color:var(--text-secondary);">• 某项目错题集膨胀 → 提示管理员review项目规范文档是否缺失</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 基础设施层 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="layer-infra">
+    <h2 class="section-title">基础设施层</h2>
+    
+    <div class="card">
+        <table class="data-table">
+            <thead><tr><th>组件</th><th>用途</th></tr></thead>
+            <tbody>
+                <tr><td style="font-weight:600;">PostgreSQL</td><td>任务、用户、档案卡、错题/成功集</td></tr>
+                <tr><td style="font-weight:600;">Redis</td><td>任务队列、互斥锁、缓存、会话</td></tr>
+                <tr><td style="font-weight:600;">Qdrant</td><td>向量检索（代码知识库、模式匹配）</td></tr>
+                <tr><td style="font-weight:600;">Docker Engine</td><td>Worker容器池</td></tr>
+                <tr><td style="font-weight:600;">GitLab</td><td>代码仓库、MR、Webhook</td></tr>
+                <tr><td style="font-weight:600;">MinIO/S3(可选)</td><td>大文件存储（完整diff、日志归档）</td></tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-title">外部API</div>
+            <div style="font-size:12px;color:var(--text-secondary);">
+                <p>Claude API / DeepSeek API / 本地Ollama(Qwen3)</p>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">监控</div>
+            <div style="font-size:12px;color:var(--text-secondary);">
+                <p style="margin-bottom:4px;">LangSmith/Langfuse → LLM调用链追踪</p>
+                <p>Prometheus+Grafana → 系统指标</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 知识库4层设计 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="kb-overview">
+    <h2 class="section-title">项目知识库 — 4层知识表示</h2>
+    <p class="section-subtitle">每个项目独立，从精确结构到模糊语义的完整知识体系</p>
+    
+    <div class="card" style="border-top: 3px solid var(--accent-blue);">
+        <div class="card-title">Layer A：结构索引层（精确定位，不用向量）</div>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">数据来源：tree-sitter解析 + Git分析 | 存储：PostgreSQL</p>
+        
+        <div class="code-block"><span class="keyword">文件表 file_index</span>
+  path: "src/main/java/com/xx/controller/UserCtrl.java"
+  module: "user-service"
+  layer: "controller"
+  last_modified: "2026-05-18"
+  line_count: 156
+  imports: ["UserService", "PageResult", "UserDTO"]
+
+<span class="keyword">符号表 symbol_index</span>
+  name: "getUserList"
+  type: "method"
+  class: "UserController"
+  file: "UserCtrl.java"
+  line_start: 45, line_end: 72
+  params: ["PageRequest req"]
+  return_type: "PageResult&lt;UserDTO&gt;"
+  annotations: ["@GetMapping", "@RequireAuth"]
+  calls: ["userService.queryPage", "UserConverter.toDTO"]
+  called_by: ["UserControllerTest.testGetUserList"]
+
+<span class="keyword">依赖图 dependency_graph</span>
+  UserController → UserService → UserMapper → DB
+  UserController → UserConverter
+  UserDTO ← UserController, UserService</div>
+        
+        <p style="font-size:12px;color:var(--text-secondary);margin-top:12px;">
+            <strong>用途：</strong>Brain拆任务时精确知道"改这个接口要动哪些文件"<br>
+            <strong>更新：</strong>Git push webhook → 只重新解析变更的文件（增量）
+        </p>
+    </div>
+    
+    <div class="card" style="border-top: 3px solid var(--accent-green);">
+        <div class="card-title">Layer B：语义检索层（模糊匹配，用向量）</div>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">数据来源：代码文件 + 注释 + 文档 | 存储：Qdrant | Embedding：bge-m3</p>
+        
+        <div class="code-block"><span class="keyword">索引粒度（关键决策）：</span>
+  ❌ 不按文件整体索引（太粗，噪音大）
+  ❌ 不按单行索引（太细，丢失上下文）
+  
+  ✅ 按"语义单元"索引：
+    - 一个完整方法/函数
+    - 一个类的签名 + 所有方法签名（不含方法体）
+    - 一段连续注释/文档块
+    - 一个配置文件段落
+
+  每个chunk附带元数据：
+    file_path, module, layer, class_name, method_name</div>
+        
+        <p style="font-size:12px;color:var(--text-secondary);margin-top:12px;">
+            <strong>用途：</strong>开发者说"类似订单导出的功能"，能找到相关代码
+        </p>
+    </div>
+    
+    <div class="card" style="border-top: 3px solid var(--accent-orange);">
+        <div class="card-title">Layer C：项目规范层（人工维护 + 自动提取）</div>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">存储：PostgreSQL + Markdown原文</p>
+        
+        <div style="font-size:12px;color:var(--text-secondary);">
+            <p style="margin-bottom:4px;">• 架构分层规范（Controller/Service/Mapper各层职责）</p>
+            <p style="margin-bottom:4px;">• 命名约定（URL风格、类名后缀、变量命名）</p>
+            <p style="margin-bottom:4px;">• 异常处理规范（全局异常 vs 业务异常）</p>
+            <p style="margin-bottom:4px;">• 数据库规范（字段命名、索引策略、分页方式）</p>
+            <p style="margin-bottom:4px;">• Git规范（分支命名、commit message格式）</p>
+            <p style="margin-bottom:12px;">• 从.editorconfig/.eslintrc/pom.xml自动提取的约束</p>
+            <p><strong>注入方式：</strong>每次Brain拆任务时，相关规范作为system prompt的一部分。不需要检索，直接按项目ID全量注入（规范文档通常不大）</p>
+        </div>
+    </div>
+    
+    <div class="card" style="border-top: 3px solid var(--accent-purple);">
+        <div class="card-title">Layer D：历史行为层（自动积累）</div>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">存储：PostgreSQL</p>
+        
+        <div style="font-size:12px;color:var(--text-secondary);">
+            <p style="margin-bottom:4px;">• 最近100条MR的摘要（谁改了什么，为什么）</p>
+            <p style="margin-bottom:4px;">• 高频修改文件排名（哪些文件经常一起被改）</p>
+            <p style="margin-bottom:12px;">• 模块间调用热度（哪些模块经常联动）</p>
+            <p><strong>用途：</strong>Brain判断"改这个接口，是不是下游也得跟着改"，预测潜在影响范围</p>
+        </div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 知识检索流程示例 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="kb-retrieval">
+    <h2 class="section-title">知识检索流程示例</h2>
+    <p class="section-subtitle">以"给用户列表接口加按注册时间排序"为例，展示4层知识如何配合</p>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-blue);">
+        <div class="card-title">第一步：精确定位（Layer A 结构索引）</div>
+        <div class="code-block"><span class="comment">关键词提取："用户列表接口" → 搜索symbol_index</span>
+命中：UserController.getUserList()
+     UserService.queryPage()
+     UserMapper.selectPage()
+
+<span class="comment">沿依赖图扩展：</span>
+  getUserList → 调用了 userService.queryPage
+  queryPage → 调用了 userMapper.selectPage
+  selectPage → 关联 UserMapper.xml 中的SQL
+
+<span class="keyword">产出：确定需要查看/修改的文件列表（精确）</span></div>
+    </div>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-green);">
+        <div class="card-title">第二步：语义扩展（Layer B 向量检索）</div>
+        <div class="code-block"><span class="comment">Query: "列表接口排序功能实现"</span>
+检索结果：
+  - OrderController.getOrderList()  → 里面有排序实现（参考范例）
+  - ProductService.queryWithSort()  → 另一个排序实现
+
+<span class="keyword">用途：给Worker提供"项目里类似功能是怎么做的"参考</span></div>
+    </div>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-orange);">
+        <div class="card-title">第三步：规范注入（Layer C 直接读取）</div>
+        <div class="code-block"><span class="comment">项目: user-service</span>
+注入规范：
+  - "排序字段必须有数据库索引"
+  - "分页接口统一使用PageResult包装"
+  - "新增查询参数需要在DTO中加字段，不允许用Map接收"</div>
+    </div>
+    
+    <div class="card" style="border-left: 3px solid var(--accent-red);">
+        <div class="card-title">第四步：历史参考（Layer D + L5/L6）</div>
+        <div class="code-block"><span class="keyword">错题集命中：</span>
+  "上次给订单列表加排序时，忘了在Mapper.xml中加动态SQL判断，
+   导致sortField为空时SQL报错"
+
+<span class="keyword">成功模式命中：</span>
+  "商品列表排序的标准写法：Controller接收排序参数 → Service透传 →
+   Mapper用&lt;if&gt;动态拼接ORDER BY"
+
+<span class="keyword">历史行为：</span>
+  "UserMapper.xml 和 UserMapper.java 最近3次MR都一起改的"
+  → 确认这两个文件需要同时修改</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- Rerank优化 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="kb-rerank">
+    <h2 class="section-title">向量检索 Rerank 优化</h2>
+    
+    <div class="highlight-box warning">
+        <h4>问题：向量检索经常召回不相关的内容怎么办？</h4>
+        <p>解决方案：检索后rerank</p>
+    </div>
+    
+    <div class="card">
+        <div class="code-block">原始检索 top_20 → Reranker模型精排 → 取top_5
+
+<span class="keyword">Reranker选择：</span>
+  - bge-reranker-v2-m3（本地部署，延迟低）
+  - 或用LLM做：把20条结果让Brain评估哪些真正相关
+
+<span class="keyword">额外优化：</span>
+  - 元数据过滤：只搜同项目、同模块（如果能确定模块的话）
+  - 时间权重：最近修改的文件权重更高
+  - 共现过滤：参考Layer D的"经常一起修改的文件"</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 知识库增量更新 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="kb-update">
+    <h2 class="section-title">知识库增量更新系统</h2>
+    
+    <div class="card">
+        <div class="card-title">触发源 → 事件队列 → 更新调度器 → 各Layer更新</div>
+        <div class="code-block"><span class="keyword">触发源（Event Sources）</span>
+  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+  │ GitLab     │  │ 蜂群任务   │  │ 定时任务   │  │ 手动触发   │
+  │ Webhook    │  │ 完成事件   │  │ (Cron)     │  │ (管理员)   │
+  │ push/merge │  │ accept     │  │ 每日凌晨   │  │ 强制重建   │
+  │ MR comment │  │ reject     │  │ 每周全量   │  │ 单项目     │
+  └────────────┘  └────────────┘  └────────────┘  └────────────┘
+         │               │               │               │
+         └───────────────┴───────────────┴───────────────┘
+                                 │
+                                 ▼
+<span class="keyword">事件队列（Redis Stream）</span>
+  优先级：P0 手动强制重建 &gt; P1 GitLab push &gt; P2 蜂群任务完成 &gt; P3 定时维护
+                                 │
+                                 ▼
+<span class="keyword">更新调度器（Update Scheduler）</span>
+  - 消费事件队列
+  - 去重（同一文件短时间内多次push只处理最后一次）
+  - 批量合并（5秒内同一项目的多个文件变更合为一批处理）
+  - 分发给对应的更新Worker
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ Layer A更新  │    │ Layer B更新  │    │ Layer D更新  │
+  │ 结构索引     │    │ 向量索引     │    │ 行为层       │
+  └──────────────┘    └──────────────┘    └──────────────┘</div>
+    </div>
+    
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-title">性能目标</div>
+            <table class="data-table">
+                <tbody><tr><td>Git push → 索引更新完成</td><td style="font-weight:600;color:var(--accent-green);">&lt; 30秒</td></tr>
+                <tr><td>单文件 tree-sitter解析</td><td style="font-weight:600;color:var(--accent-green);">&lt; 100ms</td></tr>
+                <tr><td>符号提取+写入PG</td><td style="font-weight:600;color:var(--accent-green);">&lt; 200ms</td></tr>
+                <tr><td>chunk切分+embedding</td><td style="font-weight:600;color:var(--accent-orange);">&lt; 2s</td></tr>
+                <tr><td>向量写入Qdrant</td><td style="font-weight:600;color:var(--accent-green);">&lt; 100ms</td></tr>
+                <tr><td>全量重建(1000文件) Layer A</td><td style="font-weight:600;">~30秒</td></tr>
+                <tr><td>全量重建(1000文件) Layer B</td><td style="font-weight:600;color:var(--accent-orange);">~5分钟</td></tr>
+                <tr><td>全量重建总计</td><td style="font-weight:600;">&lt; 10分钟</td></tr>
+            </tbody></table>
+        </div>
+        <div class="card">
+            <div class="card-title">存储占用（单项目1000文件）</div>
+            <table class="data-table">
+                <tbody><tr><td>PostgreSQL（结构索引+依赖图+行为层）</td><td style="font-weight:600;">~50MB</td></tr>
+                <tr><td>Qdrant（向量+payload）</td><td style="font-weight:600;">~200MB</td></tr>
+                <tr><td>总计10个项目</td><td style="font-weight:600;">~2.5GB</td></tr>
+            </tbody></table>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">容错策略</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">单文件解析失败</td><td>→ 跳过该文件，不影响其他文件。记录到error log，下次全量重建修复</td></tr>
+            <tr><td style="font-weight:600;">Embedding服务不可用</td><td>→ Layer B更新延迟。Layer A照常更新（不依赖embedding）。待embedding文件暂存队列，服务恢复后补处理</td></tr>
+            <tr><td style="font-weight:600;">Qdrant不可用</td><td>→ 退化为仅使用Layer A精确检索。Brain提示词中标注"语义检索暂不可用"</td></tr>
+            <tr><td style="font-weight:600;">GitLab Webhook丢失</td><td>→ 每天凌晨ConsistencyChecker自动补齐</td></tr>
+            <tr><td style="font-weight:600;">大量文件同时变更</td><td>→ 并发限制：单项目同时最多处理20个文件的更新，超出排队</td></tr>
+        </tbody></table>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 知识库与Brain交互 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="kb-interaction">
+    <h2 class="section-title">知识库与Brain状态机的交互</h2>
+    
+    <div class="card">
+        <div class="card-title">Brain执行任务时</div>
+        <div class="code-block"><span class="comment">ANALYZE阶段 → 读取知识库（Layer A/B/C/D + L5/L6）</span>
+<span class="comment">此时知识库必须是最新的</span>
+
+<span class="keyword">保障措施：ANALYZE开始前先检查：</span>
+  last_push_time = await git_service.get_last_push_time(project)
+  last_index_time = await kb_service.get_last_update_time(project)
+  if last_push_time &gt; last_index_time:
+      await kb_service.wait_for_update(project, timeout=60)</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">任务完成时 — 闭环</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            LEARN_SUCCESS → 写入L6 → 产出被merge到主分支 → 触发Git push webhook → 知识库自动增量更新 → 下次任务时能看到最新代码<br><br>
+            <strong>闭环：做任务 → 产出代码 → merge → 知识库更新 → 下次任务更准</strong>
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">Worker执行时也可能需要检索知识库</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            Worker在容器内执行时，如果需要查"某个接口的定义在哪" → 通过工具调用Brain提供的检索API → 不是Worker直接访问知识库，而是通过统一的检索服务<br><br>
+            <strong>原因：</strong>Worker容器是隔离的，不应直接访问数据库。统一检索服务可以做缓存、权限控制、日志。Brain可以在检索结果上追加上下文。
+        </p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- L1 验证 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="verify-l1">
+    <h2 class="section-title">L1 验证 — Worker内验证</h2>
+    <p class="section-subtitle">单文件/单子任务级别 | 执行环境：Worker的Docker容器内 | 耗时：几秒到几十秒</p>
+    
+    <div class="card">
+        <div class="card-title">L1.1 语法验证</div>
+        <table class="data-table">
+            <tbody><tr><td style="font-weight:600;">Java</td><td>javac 编译单文件（或 mvn compile -pl 单模块）</td></tr>
+            <tr><td style="font-weight:600;">JS/TS</td><td>tsc --noEmit</td></tr>
+            <tr><td style="font-weight:600;">Python</td><td>python -m py_compile</td></tr>
+            <tr><td style="font-weight:600;">XML</td><td>xmllint --schema</td></tr>
+        </tbody></table>
+        <p style="font-size:11px;color:var(--text-muted);margin-top:8px;">通过条件：零编译错误 | 失败处理：读取错误信息 → 让Worker修复 → 重新验证（最多3轮）</p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L1.2 静态检查</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            Lint: checkstyle / eslint / pylint（只检查修改的文件）<br>
+            规范：import是否多余、命名是否符合规范<br><br>
+            <strong>通过条件：</strong>无error级别问题（warning可忽略）
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L1.3 单元测试（如果有相关测试）</div>
+        <div class="code-block"><span class="keyword">策略：只跑和修改文件相关的测试用例，不跑全量</span>
+
+定位方法：
+  修改了 UserService.java → 找到 UserServiceTest.java → 只跑 UserServiceTest
+
+通过条件：相关测试全部绿色
+
+失败处理：
+  - 新增功能导致旧测试断言失败 → Worker分析是否需要更新测试
+  - 逻辑错误 → Worker修复代码
+  - 测试本身不合理 → 标记为需要人工确认</div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L1.4 自我审查（LLM自检）</div>
+        <div class="code-block"><span class="comment">Worker完成编码后，用一个独立prompt自检：</span>
+"检查你的修改是否满足以下条件：
+ 1. 是否完整实现了子任务目标？
+ 2. 是否有遗漏的边界情况？
+ 3. 是否违反了约束条件？
+ 4. 修改的代码风格是否和周围代码一致？"
+
+如果自检发现问题 → 自行修复后再次自检</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- L2 验证 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="verify-l2">
+    <h2 class="section-title">L2 验证 — 集成验证</h2>
+    <p class="section-subtitle">合并后的完整项目级别 | 独立Docker容器 | 耗时：1-5分钟 | 触发：所有Worker产出合并后</p>
+    
+    <div class="card">
+        <div class="card-title">L2.1 全量编译</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            Java: mvn compile -DskipTests（整个项目编译）| 前端: npm run build<br>
+            <strong>目的：</strong>验证跨文件的import、类型引用、接口调用是否一致。这一步能发现Worker之间"对不上"的问题。
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L2.2 相关模块测试</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            跑涉及修改的模块的全部测试（不是全项目，而是受影响模块）<br>
+            mvn test -pl user-service<br>
+            如果项目有测试速度问题：只跑被修改类的直接测试+一跳关联测试
+        </p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L2.3 接口一致性校验</div>
+        <p style="font-size:12px;color:var(--text-secondary);">
+            如果修改了API接口：检查Swagger/OpenAPI文档是否同步更新、检查上下游调用方的参数是否匹配、如果是微服务间接口 → 检查Feign Client定义是否一致
+        </p>
+    </div>
+    
+    <div class="highlight-box danger">
+        <h4>失败处理</h4>
+        <p>• 编译失败 → Brain分析错误 → 指派修复子任务给Worker<br>
+           • 测试失败 → Brain判断是代码bug还是测试需要更新<br>
+           • 2轮修复后仍然失败 → 标记为需要人工介入</p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L2 集成验证容器流程</div>
+        <div class="code-block">1. 基于最新主分支创建验证分支
+2. 依次apply所有Worker的patch
+3. 全量编译
+4. 运行受影响模块的测试
+5. 通过 → 产出最终合并diff
+   失败 → 回到Brain分析</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- L3 验证 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="verify-l3">
+    <h2 class="section-title">L3 验证 — 测试环境部署验证</h2>
+    <p class="section-subtitle">利用团队已有的CI/CD | 耗时：5-15分钟 | 可选执行</p>
+    
+    <div class="grid-2">
+        <div class="card" style="border-left:3px solid var(--accent-green);">
+            <div class="card-title">✅ 需要L3</div>
+            <div style="font-size:12px;color:var(--text-secondary);">
+                <p style="margin-bottom:4px;">• 修改了数据库Schema（要验证migration能跑通）</p>
+                <p style="margin-bottom:4px;">• 修改了外部集成（支付、短信等）</p>
+                <p style="margin-bottom:4px;">• 修改了中间件配置（Redis、MQ的连接方式）</p>
+                <p>• 涉及多服务联调的功能</p>
+            </div>
+        </div>
+        <div class="card" style="border-left:3px solid var(--accent-red);">
+            <div class="card-title">❌ 跳过L3</div>
+            <div style="font-size:12px;color:var(--text-secondary);">
+                <p style="margin-bottom:4px;">• 纯逻辑变更（L2测试已覆盖）</p>
+                <p style="margin-bottom:4px;">• 前端UI修改（不涉及后端联调）</p>
+                <p>• 配置项修改（改个超时时间）</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">L3验证方式</div>
+        <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">
+            不在蜂群自己的容器里做，而是利用团队已有的CI/CD
+        </p>
+        <div class="code-block"><span class="keyword">蜂群要做的：</span>
+  - push代码到临时分支
+  - 通过GitLab API监听pipeline状态
+  - pipeline结果回流到任务状态
+  - 失败日志提取 → Brain分析
+
+<span class="keyword">L3验证流程：</span>
+  1. 将蜂群产出的分支部署到测试环境（通过CI/CD pipeline触发）
+  2. 跑集成测试/E2E测试（项目已有的 or 蜂群生成的smoke test）
+  3. 健康检查（服务启动、数据库连接、依赖服务调用）
+  4. 回滚（验证完毕后自动回滚测试环境到之前的版本）</div>
+    </div>
+    
+    <div class="highlight-box">
+        <h4>⚠️ 重要约束</h4>
+        <p>• 测试环境验证是非阻塞的：开发者可以不等L3就先看diff<br>
+           • L3结果作为MR的附加信息展示："测试环境验证通过/失败"<br>
+           • 不自动merge，最终决定权仍在开发者</p>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">验证流水线总览</div>
+        <div class="code-block">Worker-1完成 ──┐
+Worker-2完成 ──┼──→ Brain合并 ──→ L2集成验证 ──→ 推送给开发者
+Worker-3完成 ──┘        │              │                │
+     │                  │              │                │
+  各自L1验证         冲突检测       编译+测试      （可选）触发L3
+  通过才产出         自动解决       通过才推送      测试环境验证
+                    或上报                          结果异步通知</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 验证失败处理树 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="verify-failure">
+    <h2 class="section-title">验证失败处理树</h2>
+    
+    <div class="card">
+        <div class="code-block">验证失败
+    │
+    ├─── L1 编译失败
+    │       │
+    │       ├─── 语法错误（缺少分号、括号不匹配）
+    │       │       → Worker自行修复，通常1轮就好
+    │       │
+    │       ├─── 类型错误（类不存在、方法签名不匹配）
+    │       │       → 可能是跨文件协调问题
+    │       │       → Worker检查契约信息，确认引用是否正确
+    │       │       → 2轮修不好 → 上报Brain
+    │       │
+    │       └─── 依赖缺失（import的包不存在）
+    │               → Worker检查pom.xml/package.json
+    │               → 如果需要新增依赖 → 上报Brain确认（不能擅自加依赖）
+    │
+    ├─── L1 测试失败
+    │       │
+    │       ├─── 新功能导致旧测试断言失败
+    │       │       → 分析：是测试需要更新还是代码有bug
+    │       │       → 如果是测试需要更新 → Worker同时修改测试
+    │       │       → 如果不确定 → 标记low confidence，让开发者判断
+    │       │
+    │       └─── 逻辑错误导致测试失败
+    │               → Worker读取测试的期望值，修复代码逻辑
+    │
+    ├─── L2 集成编译失败
+    │       │
+    │       ├─── Worker之间接口不匹配
+    │       │       → Brain分析哪个Worker偏离了契约
+    │       │       → 派修复任务给偏离的那个Worker
+    │       │
+    │       └─── 与主分支新代码冲突
+    │               → 重新基于最新代码执行受影响的子任务
+    │
+    ├─── L2 集成测试失败
+    │       │
+    │       ├─── 失败测试和本次修改直接相关
+    │       │       → Brain分析 → 派修复任务
+    │       │
+    │       └─── 失败测试和本次修改无关（flaky test / 环境问题）
+    │               → 标记为"疑似环境问题"，不阻塞
+    │               → 在产出中告知开发者
+    │
+    └─── L3 环境验证失败
+            │
+            ├─── 部署失败（容器启动失败、端口冲突）
+            │       → 大概率是配置问题，Brain分析deploy日志
+            │       → 如果是新增了配置项忘了加 → 修复
+            │
+            ├─── 运行时错误（NullPointer、连接超时）
+            │       → 需要分析完整stack trace
+            │       → 可能是数据库migration没跑、依赖服务未mock
+            │       → 复杂度高 → 大概率需要上报开发者
+            │
+            └─── 集成测试失败
+                    → 分析失败用例 → 尝试修复
+                    → 如果涉及外部依赖mock → 上报</div>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 典型任务时间线 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="timeline">
+    <h2 class="section-title">典型任务时间线</h2>
+    <p class="section-subtitle">一个中等复杂度任务的典型执行过程</p>
+    
+    <div class="timeline-item"><span class="timeline-time">00:00</span><span class="timeline-content">开发者提交任务</span></div>
+    <div class="timeline-item"><span class="timeline-time">00:05</span><span class="timeline-content">Brain完成需求理解+知识检索</span></div>
+    <div class="timeline-item"><span class="timeline-time">00:15</span><span class="timeline-content">Brain完成任务拆解+计划校验</span></div>
+    <div class="timeline-item"><span class="timeline-time">00:20</span><span class="timeline-content">Worker-1,2,3 并行启动（容器已预热）</span></div>
+    <div class="timeline-item"><span class="timeline-time">00:25</span><span class="timeline-content">Worker-1 完成Phase1定位</span></div>
+    <div class="timeline-item"><span class="timeline-time">00:45</span><span class="timeline-content">Worker-1 完成Phase2编码</span></div>
+    <div class="timeline-item"><span class="timeline-time">01:00</span><span class="timeline-content">Worker-1 完成L1验证，产出diff（1分钟）</span></div>
+    <div class="timeline-item"><span class="timeline-time">01:30</span><span class="timeline-content">Worker-2 完成（稍复杂）</span></div>
+    <div class="timeline-item"><span class="timeline-time">02:00</span><span class="timeline-content">Worker-3 完成</span></div>
+    <div class="timeline-item"><span class="timeline-time">02:10</span><span class="timeline-content">Brain开始合并审查</span></div>
+    <div class="timeline-item"><span class="timeline-time">02:30</span><span class="timeline-content">L2集成验证开始（全量编译）</span></div>
+    <div class="timeline-item"><span class="timeline-time">04:00</span><span class="timeline-content">L2集成验证通过</span></div>
+    <div class="timeline-item"><span class="timeline-time">04:10</span><span class="timeline-content">生成变更摘要，推送通知给开发者 — <strong style="color:var(--accent-green);">全自动，总耗时约4分钟</strong></span></div>
+    
+    <div class="highlight-box" style="margin-top:20px;">
+        <h4>开发者审查阶段（人工时间）</h4>
+        <p>
+            04:10 开发者收到通知（可能5分钟后看，也可能1小时后看）<br>
+            xx:xx 开发者审查diff<br>
+            → 接受 → 创建MR → 可选触发L3（额外5-10分钟）<br>
+            → 修改 → 反馈 → 再来一轮（额外3-5分钟）
+        </p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 预期成长曲线 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="growth">
+    <h2 class="section-title">预期成长曲线</h2>
+    
+    <div class="card">
+        <div class="card-title">📈 首次接受率预期提升</div>
+        <table class="data-table">
+            <thead><tr><th>时间</th><th>首次接受率</th><th>原因</th></tr></thead>
+            <tbody>
+                <tr><td style="font-weight:600;">第1周</td><td style="color:var(--accent-red);font-weight:600;">40%</td><td>蜂群刚启动，还不了解团队习惯</td></tr>
+                <tr><td style="font-weight:600;">第4周</td><td style="color:var(--accent-orange);font-weight:600;">65%</td><td>错题集积累了30条，避开了常见坑</td></tr>
+                <tr><td style="font-weight:600;">第8周</td><td style="color:var(--accent-green);font-weight:600;">80%</td><td>成功模式丰富，基本摸透了团队风格</td></tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="highlight-box success">
+        <h4>💡 学习闭环的威力</h4>
+        <p>
+            系统越用越准的核心机制：每次任务的结果（接受/拒绝/修改意见）都会回流到L5/L6记忆层，
+            下次遇到类似任务时自动检索相关的错题和成功模式注入Brain/Worker的prompt中，
+            形成"做 → 反馈 → 学 → 做得更好"的正循环。
+        </p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 性能与成本 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="performance">
+    <h2 class="section-title">性能与成本预估</h2>
+    
+    <div class="card">
+        <div class="card-title">端到端延时分解</div>
+        <table class="data-table">
+            <thead><tr><th>阶段</th><th>简单任务</th><th>中等任务</th><th>复杂任务</th></tr></thead>
+            <tbody>
+                <tr><td>ANALYZE（知识检索）</td><td>3-5s</td><td>5-8s</td><td>8-12s</td></tr>
+                <tr><td>PLAN（任务拆解）</td><td>5-10s</td><td>10-20s</td><td>15-30s</td></tr>
+                <tr><td>VALIDATE_PLAN</td><td>1-2s</td><td>2-5s</td><td>3-8s</td></tr>
+                <tr><td>Worker执行 (per subtask)</td><td>30-60s</td><td>60-120s</td><td>120-300s</td></tr>
+                <tr><td>MERGE</td><td>2-5s</td><td>5-10s</td><td>10-20s</td></tr>
+                <tr><td>L2 VERIFY</td><td>30-60s</td><td>60-120s</td><td>60-120s</td></tr>
+                <tr style="font-weight:700;background:rgba(74,158,255,0.05);"><td>总计</td><td>1.5-3 min</td><td>4-8 min</td><td>8-20 min</td></tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="card">
+        <div class="card-title">服务器资源需求</div>
+        <table class="data-table">
+            <thead><tr><th>服务</th><th>CPU</th><th>内存</th><th>磁盘</th></tr></thead>
+            <tbody>
+                <tr><td>brain-api</td><td>2 cores</td><td>2 GB</td><td>1 GB</td></tr>
+                <tr><td>worker-pool管理</td><td>2 cores</td><td>2 GB</td><td>1 GB</td></tr>
+                <tr><td>worker容器(×4)</td><td>1 core/个</td><td>2 GB/个</td><td>5 GB/个</td></tr>
+                <tr><td>kb-updater</td><td>1 core</td><td>1 GB</td><td>0.5 GB</td></tr>
+                <tr><td>PostgreSQL</td><td>2 cores</td><td>4 GB</td><td>50 GB</td></tr>
+                <tr><td>Qdrant</td><td>2 cores</td><td>4 GB</td><td>20 GB</td></tr>
+                <tr><td>Redis</td><td>1 core</td><td>1 GB</td><td>1 GB</td></tr>
+                <tr style="font-weight:700;background:rgba(74,158,255,0.05);"><td>总计</td><td>~14 cores</td><td>~24 GB</td><td>~95 GB</td></tr>
+            </tbody>
+        </table>
+        <p style="font-size:11px;color:var(--text-muted);margin-top:10px;">适合单台16C/32G服务器 或 轻量级K8s集群</p>
+    </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 风险评估 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="risks">
+    <h2 class="section-title">风险评估</h2>
+    
+    <div class="risk-item"><span class="risk-level high"></span><div><strong style="color:var(--accent-red);">LLM幻觉导致错误代码</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">L1/L2验证无法覆盖所有逻辑缺陷。<br><strong>缓解：</strong>L5错题集持续积累、L2验证覆盖核心路径、最终必须开发者审查、高风险任务强制confirm。</p></div></div>
+    <div class="risk-item"><span class="risk-level high"></span><div><strong style="color:var(--accent-red);">任务拆解质量不稳定</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">LLM对复杂需求拆解可能不合理。<br><strong>缓解：</strong>VALIDATE_PLAN自动校验 + 最多2次重试 + 超复杂人工确认 + L6成功模式参考。</p></div></div>
+    <div class="risk-item"><span class="risk-level high"></span><div><strong style="color:var(--accent-red);">开发复杂度高，MVP周期长</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">涉及LangGraph、Docker管理、多数据库、实时通信等众多技术栈。<br><strong>缓解：</strong>分阶段交付，Phase0先验证单Worker核心链路。</p></div></div>
+    <div class="risk-item"><span class="risk-level medium"></span><div><strong style="color:var(--accent-orange);">LLM API成本可能超预期</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">重试、多轮修复可能导致单任务token消耗远超预估。<br><strong>缓解：</strong>设置单任务token上限、Worker最大轮次限制、监控预警。</p></div></div>
+    <div class="risk-item"><span class="risk-level medium"></span><div><strong style="color:var(--accent-orange);">知识库增量更新不一致</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">Webhook丢失、解析异常等导致索引和实际代码不一致。<br><strong>缓解：</strong>每日ConsistencyChecker + 每周全量重建 + ANALYZE前检查时间戳。</p></div></div>
+    <div class="risk-item"><span class="risk-level medium"></span><div><strong style="color:var(--accent-orange);">Worker容器安全风险</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">Worker在容器内执行任意命令，LLM可能生成恶意操作。<br><strong>缓解：</strong>Scope Guard限制文件访问 + 网络隔离 + 只读挂载 + 命令白名单。</p></div></div>
+    <div class="risk-item"><span class="risk-level medium"></span><div><strong style="color:var(--accent-orange);">用户接受度不确定</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">开发者可能不信任AI产出，或觉得审查成本和自己写差不多。<br><strong>缓解：</strong>初期聚焦简单重复任务(CRUD)证明价值 + 高质量Diff展示 + 逐步建立信任。</p></div></div>
+    <div class="risk-item"><span class="risk-level low"></span><div><strong style="color:var(--accent-green);">向量检索召回率不足</strong><p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">语义检索可能漏掉关键代码。<br><strong>缓解：</strong>Layer A精确 + Layer B语义双通道 + Layer D共现分析 + reranker精排。</p></div></div>
+</section>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- 实施路线 -->
+<!-- ═══════════════════════════════════════════ -->
+<section class="section" id="roadmap">
+    <h2 class="section-title">建议实施路线</h2>
+    
+    <div class="card">
+        <table class="data-table">
+            <thead><tr><th>阶段</th><th>目标</th><th>交付物</th><th>周期</th></tr></thead>
+            <tbody>
+                <tr><td><span class="status-badge critical">Phase 0</span></td><td>基础验证</td><td>单Worker + 无拆解 + 无知识库 — 验证"LLM能否在scope约束下正确修改代码"</td><td>2-3周</td></tr>
+                <tr><td><span class="status-badge important">Phase 1</span></td><td>核心链路</td><td>Brain(简化状态机) + Worker + L1验证 + CLI — 跑通单任务从下发到产出</td><td>4-6周</td></tr>
+                <tr><td><span class="status-badge important">Phase 2</span></td><td>知识增强</td><td>Layer A/B知识库 + 增量更新 + Brain检索增强 — 产出质量显著提升</td><td>3-4周</td></tr>
+                <tr><td><span class="status-badge normal">Phase 3</span></td><td>多Worker并行</td><td>完整状态机 + 任务拆解 + 多Worker并行 + L2验证 + 合并引擎</td><td>4-6周</td></tr>
+                <tr><td><span class="status-badge normal">Phase 4</span></td><td>记忆与学习</td><td>L5错题集 + L6成功模式 + L1用户档案 + 学习闭环 + Layer D</td><td>2-3周</td></tr>
+                <tr><td><span class="status-badge normal">Phase 5</span></td><td>产品化</td><td>WebUI + 统计面板 + 通知 + L3验证 + 文档 + 团队试用</td><td>3-4周</td></tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="highlight-box success">
+        <h4>💡 关键里程碑判断标准</h4>
+        <p>
+            <strong>Phase 0 → Phase 1 前提：</strong>单Worker在3个测试项目上，简单CRUD任务Accept率 &gt; 60%<br>
+            <strong>Phase 2 完成标志：</strong>知识库加持后，同样任务Accept率提升到 &gt; 75%<br>
+            <strong>Phase 3 完成标志：</strong>中等复杂度任务（跨3个文件）Accept率 &gt; 60%<br>
+            <strong>Phase 4 完成标志：</strong>同一类型任务重复执行时，错误率逐次下降（学习闭环生效）
+        </p>
+    </div>
+    
+    <div class="highlight-box warning">
+        <h4>⏱️ 总预估周期</h4>
+        <p>Phase 0-5 合计约 18-26 周（4.5-6.5个月）达到团队可用的产品化状态。<br>
+           如果只到Phase 2（单Worker + 知识库），约 9-13 周即可开始内部试用验证价值。</p>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer style="margin-top:80px;padding:40px 0;border-top:1px solid var(--border-color);text-align:center;">
+    <p style="color:var(--text-muted);font-size:12px;">
+        蜂群 (Swarm) · AI编程智能体系统 · 完整架构评估文档 V2<br>
+        生成于 2026年5月20日 · 包含全部上下文讨论的技术细节
+    </p>
+</footer>
+
+</div>
+
+<script>
+document.querySelectorAll('.nav-link').forEach(link => {
+    link.addEventListener('click', (e) => {
+        const href = link.getAttribute('href');
+        if (href && href.startsWith('#')) {
+            e.preventDefault();
+            const target = document.querySelector(href);
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            link.classList.add('active');
+        }
+    });
+});
+const sections = document.querySelectorAll('.section');
+const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            const id = entry.target.id;
+            document.querySelectorAll('.nav-link').forEach(link => {
+                link.classList.remove('active');
+                if (link.getAttribute('href') === '#' + id) link.classList.add('active');
+            });
+        }
+    });
+}, { rootMargin: '-20% 0px -80% 0px' });
+sections.forEach(s => { if (s.id) observer.observe(s); });
+</script>
+
+
+</body></html>

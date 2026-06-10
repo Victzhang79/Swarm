@@ -1,0 +1,34 @@
+# ─── Python ───────────────────────────────
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.python-version
+
+# ─── 虚拟环境 ─────────────────────────────
+.venv/
+
+# ─── 密钥 / 环境（绝不入库）─────────────────
+.env
+.env.local
+*.key
+*.pem
+
+# ─── 工具缓存 ─────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.hermes/
+
+# ─── 运行时产物 / 数据 ────────────────────
+.codegraph/
+.qdrant-initialized
+qdrant.log
+swarm.log
+*.log
+snapshots/
+workspace/
+
+# ─── OS ───────────────────────────────────
+.DS_Store

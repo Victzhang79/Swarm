@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Swarm — AI 编程智能体</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">🐝</div>
+        <div>
+          <div class="brand-title">Swarm <span>蜂群</span></div>
+          <div class="brand-sub">AI 编程智能体系统</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="pill pill-gray" id="user-badge" title="当前用户">未登录</span>
+        <button class="btn btn-ghost btn-sm" id="btn-login" onclick="showLoginModal()">登录</button>
+        <button class="btn btn-ghost btn-sm hidden" id="btn-logout" onclick="logoutUser()">退出</button>
+        <span class="pill pill-gray" id="version-badge">v0.3.0</span>
+        <span class="health-dot loading" id="health-dot"></span>
+        <span class="pill pill-gray" id="health-text">检测中</span>
+        <button class="btn btn-ghost btn-icon" onclick="toggleSettings()" title="系统设置">⚙️</button>
+      </div>
+    </header>
+
+    <div class="app-body">
+      <!-- Project Sidebar -->
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <h2>项目</h2>
+          <button class="btn btn-ghost btn-sm" onclick="showAddProjectModal()" title="添加项目">+</button>
+        </div>
+        <div class="project-list" id="project-list">
+          <div class="empty-state" style="padding:24px"><p>加载中…</p></div>
+        </div>
+        <div class="sidebar-foot">
+          <button class="btn btn-secondary" style="width:100%" onclick="toggleSettings()">系统设置</button>
+        </div>
+      </aside>
+
+      <!-- Main -->
+      <main class="main-area">
+        <!-- No project -->
+        <div id="no-project-view" class="empty-state">
+          <div class="empty-state-icon">📂</div>
+          <h3>选择或创建项目</h3>
+          <p>从左侧选择项目，或点击 + 添加本地代码仓库路径开始</p>
+          <button class="btn btn-primary" style="margin-top:16px" onclick="showAddProjectModal()">添加项目</button>
+        </div>
+
+        <!-- Project view -->
+        <div id="project-view" class="hidden" style="flex:1;min-height:0;flex-direction:column;overflow:hidden">
+          <div class="project-bar">
+            <div class="project-bar-inner">
+              <div>
+                <h1 class="project-title" id="project-name"></h1>
+                <div class="project-path" id="project-path"></div>
+                <div class="project-stats" id="project-stats"></div>
+              </div>
+              <div class="project-actions">
+                <button class="btn btn-secondary btn-sm" onclick="preprocessProject()" id="btn-preprocess">预处理</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteProject()">删除</button>
+              </div>
+            </div>
+          </div>
+
+          <nav class="nav-tabs">
+            <button class="nav-tab active" data-tab="tasks" onclick="switchTab('tasks')">任务</button>
+            <button class="nav-tab" data-tab="worker" onclick="switchTab('worker')">Worker</button>
+            <button class="nav-tab" data-tab="knowledge" onclick="switchTab('knowledge')">知识库</button>
+            <button class="nav-tab" data-tab="memory" onclick="switchTab('memory')">记忆</button>
+            <button class="nav-tab" data-tab="preprocess" onclick="switchTab('preprocess')">预处理</button>
+            <button class="nav-tab" data-tab="system" onclick="switchTab('system')">系统</button>
+          </nav>
+
+          <!-- Tasks Tab -->
+          <div id="tab-tasks" class="tab-panel active">
+            <div class="task-workspace">
+              <!-- Task list -->
+              <div class="task-list-panel">
+                <div class="task-list-head">
+                  <div class="task-compose">
+                    <textarea id="new-task-input" placeholder="描述任务，例如：给 parser.py 添加 TOML 注释支持…" rows="3"></textarea>
+                    <div class="task-compose-actions">
+                      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
+                        <input type="checkbox" id="task-auto-accept"> 自动通过审核（E2E）
+                      </label>
+                      <div id="task-readiness-hint" class="hidden" style="font-size:11px;color:var(--orange);flex:1;min-width:200px"></div>
+                      <button class="btn btn-primary btn-sm" id="btn-create-task" onclick="createTask()">创建任务</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="task-list-scroll" id="task-list"></div>
+              </div>
+
+              <!-- Task detail -->
+              <div class="task-detail" id="task-detail">
+                <div id="task-detail-empty" class="empty-state">
+                  <div class="empty-state-icon">⚡</div>
+                  <h3>选择任务或创建新任务</h3>
+                  <p>Brain 将分析、拆解、派发 Worker 执行，完成后等待你审核 Diff</p>
+                </div>
+
+                <div id="task-detail-content" class="hidden" style="display:none;flex-direction:column;flex:1;min-height:0">
+                  <div class="task-detail-head">
+                    <p class="task-detail-title" id="detail-description"></p>
+                    <div class="task-detail-meta">
+                      <span class="pill pill-gray" id="detail-id"></span>
+                      <span id="detail-status"></span>
+                      <span class="pill pill-purple hidden" id="detail-complexity"></span>
+                    </div>
+                    <div class="task-detail-actions" id="detail-actions" style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"></div>
+                  </div>
+
+                  <!-- Pipeline -->
+                  <div class="pipeline" id="pipeline">
+                    <div class="pipeline-step pending" data-node="analyze"><div class="pipeline-dot">1</div><span class="pipeline-label">分析</span></div>
+                    <div class="pipeline-step pending" data-node="plan"><div class="pipeline-dot">2</div><span class="pipeline-label">拆解</span></div>
+                    <div class="pipeline-step pending" data-node="dispatch"><div class="pipeline-dot">3</div><span class="pipeline-label">派发</span></div>
+                    <div class="pipeline-step pending" data-node="merge"><div class="pipeline-dot">4</div><span class="pipeline-label">合并</span></div>
+                    <div class="pipeline-step pending" data-node="verify"><div class="pipeline-dot">5</div><span class="pipeline-label">验证</span></div>
+                    <div class="pipeline-step pending" data-node="deliver"><div class="pipeline-dot">6</div><span class="pipeline-label">交付</span></div>
+                    <div class="pipeline-step pending" data-node="learn"><div class="pipeline-dot">7</div><span class="pipeline-label">学习</span></div>
+                  </div>
+
+                  <!-- Knowledge banner -->
+                  <div class="knowledge-banner hidden" id="knowledge-banner"></div>
+
+                  <!-- Review bar -->
+                  <div class="review-bar hidden" id="review-bar">
+                    <p id="review-message">等待人工审核</p>
+                    <div class="review-actions">
+                      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer;margin-right:4px">
+                        <input type="checkbox" id="approve-apply-diff"> 通过时 git apply
+                      </label>
+                      <button class="btn btn-success btn-sm" onclick="approveCurrentTask()">通过</button>
+                      <button class="btn btn-secondary btn-sm" onclick="reviseCurrentTask()">修订</button>
+                      <button class="btn btn-danger btn-sm" onclick="rejectCurrentTask()">拒绝</button>
+                    </div>
+                  </div>
+
+                  <!-- Learn notice -->
+                  <div id="learn-notice" class="hidden" style="padding:0 20px;padding-top:12px"></div>
+
+                  <!-- Detail sub-tabs -->
+                  <nav class="detail-tabs">
+                    <button class="detail-tab active" data-detail="overview" onclick="switchDetailTab('overview')">概览</button>
+                    <button class="detail-tab" data-detail="diff" onclick="switchDetailTab('diff')">Diff</button>
+                    <button class="detail-tab" data-detail="plan" onclick="switchDetailTab('plan')">计划</button>
+                    <button class="detail-tab" data-detail="logs" onclick="switchDetailTab('logs')">日志</button>
+                  </nav>
+
+                  <div class="detail-content">
+                    <div id="detail-overview" class="detail-pane">
+                      <div id="overview-subtasks" class="subtask-list"></div>
+                      <div id="overview-result" class="card hidden" style="margin-top:12px"></div>
+                    </div>
+                    <div id="detail-diff" class="detail-pane hidden">
+                      <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:space-between;flex-wrap:wrap;align-items:center">
+                        <div class="diff-view-toggle" role="group" aria-label="Diff 视图">
+                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn active" data-diff-mode="unified" onclick="setDiffViewMode('unified')">统一视图</button>
+                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn" data-diff-mode="split" onclick="setDiffViewMode('split')">分栏视图</button>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap">
+                          <button class="btn btn-secondary btn-sm" data-action="check-diff" onclick="checkApplyDiff()">校验 Diff</button>
+                          <button class="btn btn-primary btn-sm" data-action="apply-diff" onclick="applyTaskDiff()">应用 Diff 到工作区</button>
+                        </div>
+                      </div>
+                      <div class="diff-view" id="diff-content"><div class="diff-empty">暂无 Diff — 任务执行后将在此显示合并后的代码变更</div></div>
+                    </div>
+                    <div id="detail-plan" class="detail-pane hidden">
+                      <div id="plan-content" class="subtask-list"></div>
+                    </div>
+                    <div id="detail-logs" class="detail-pane hidden">
+                      <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+                        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">清空</button>
+                      </div>
+                      <div class="log-view" id="log-panel"><div class="log-line info">等待执行…</div></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Worker Tab (Phase 0) -->
+          <div id="tab-worker" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="knowledge-layout">
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>单 Worker 直跑</h3>
+                    <span class="hint">不经 Brain 拆解，验证 scope + L1 + diff（Phase 0）</span>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">子任务描述</label>
+                    <textarea id="worker-description" class="form-textarea" rows="4" placeholder="例如：在 parser.py 中添加对 # 注释行的跳过逻辑"></textarea>
+                  </div>
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label class="form-label">难度</label>
+                      <select id="worker-difficulty" class="form-select">
+                        <option value="trivial">trivial</option>
+                        <option value="medium" selected>medium</option>
+                        <option value="complex">complex</option>
+                      </select>
+                    </div>
+                  </div>
+                  <details class="worker-scope-details" style="margin-bottom:12px">
+                    <summary class="form-label" style="cursor:pointer;margin-bottom:8px">Scope 限制（可选）</summary>
+                    <p class="hint" style="margin:0 0 8px">留空表示全项目可读写；每行一个路径，相对项目根目录</p>
+                    <div class="form-row">
+                      <div class="form-group">
+                        <label class="form-label">可写路径 writable</label>
+                        <textarea id="worker-writable" class="form-textarea" rows="2" placeholder="例如：src/parser.py&#10;tests/"></textarea>
+                      </div>
+                      <div class="form-group">
+                        <label class="form-label">可读路径 readable</label>
+                        <textarea id="worker-readable" class="form-textarea" rows="2" placeholder="例如：src/&#10;README.md"></textarea>
+                      </div>
+                    </div>
+                  </details>
+                  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <button class="btn btn-primary btn-sm" id="btn-worker-run" onclick="startWorkerRun()">启动 Worker</button>
+                    <button class="btn btn-ghost btn-sm" onclick="clearWorkerLogs()">清空日志</button>
+                    <span id="worker-run-status" style="font-size:11px;color:var(--text-muted)"></span>
+                  </div>
+                </div>
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>执行日志</h3>
+                  </div>
+                  <div class="log-view" id="worker-log-panel">
+                    <div class="log-line info">选择项目后输入描述并启动…</div>
+                  </div>
+                </div>
+                <div class="knowledge-block hidden" id="worker-result-block">
+                  <div class="knowledge-block-head">
+                    <h3>Worker 输出</h3>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                      <button class="btn btn-secondary btn-sm" onclick="checkWorkerDiff()">校验 Diff</button>
+                      <button class="btn btn-primary btn-sm" onclick="applyWorkerDiff()">应用 Diff 到工作区</button>
+                    </div>
+                  </div>
+                  <div id="worker-result-summary" style="font-size:12px;margin-bottom:10px"></div>
+                  <div class="diff-view" id="worker-diff-content"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Knowledge Tab -->
+          <div id="tab-knowledge" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="knowledge-layout">
+                <div class="knowledge-row-2">
+                  <div class="knowledge-block">
+                    <div class="knowledge-block-head">
+                      <h3>编排检索实验</h3>
+                      <span class="hint">模拟 Brain 按任务检索</span>
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label">任务描述</label>
+                      <textarea id="retrieve-query" class="form-textarea" rows="3" placeholder="例如：修复 dotenv load 函数的环境变量加载逻辑"></textarea>
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="runRetrieveExperiment()">运行检索</button>
+                    <div id="retrieve-result" style="margin-top:14px"></div>
+                  </div>
+                  <div class="knowledge-block">
+                    <div class="knowledge-block-head">
+                      <h3>项目知识概览</h3>
+                      <button class="btn btn-ghost btn-sm" onclick="loadKnowledgeOverview(selectedProjectId)">刷新</button>
+                    </div>
+                    <div id="knowledge-overview">
+                      <p style="font-size:12px;color:var(--text-muted);margin:0">选择项目后加载…</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>符号检索 (Layer A)</h3>
+                    <span class="hint">按名称搜索 kb_symbol_index</span>
+                  </div>
+                  <div class="form-row" style="align-items:flex-end">
+                    <div class="form-group" style="flex:1;margin:0">
+                      <label class="form-label">符号名</label>
+                      <input id="symbol-search-q" class="form-input" placeholder="例如：load_dotenv">
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="searchSymbols()">搜索</button>
+                  </div>
+                  <div id="symbol-search-results" style="margin-top:12px"></div>
+                </div>
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>语义检索 (Layer B)</h3>
+                    <span class="hint">Qdrant 向量 chunk 搜索</span>
+                  </div>
+                  <div class="form-row" style="align-items:flex-end">
+                    <div class="form-group" style="flex:1;margin:0">
+                      <label class="form-label">自然语言 query</label>
+                      <input id="semantic-search-q" class="form-input" placeholder="例如：如何加载 .env 环境变量">
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="searchSemantic()">检索</button>
+                  </div>
+                  <div id="semantic-search-results" style="margin-top:12px"></div>
+                </div>
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>行为热点 (Layer D)</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="loadBehaviorHotspots(selectedProjectId)">刷新</button>
+                  </div>
+                  <p class="hint" style="margin:0 0 10px">基于修改日志的高频文件排行</p>
+                  <div id="behavior-hotspot-list"></div>
+                </div>
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>Harness 工程</h3>
+                    <div style="display:flex;gap:8px">
+                      <button class="btn btn-primary btn-sm" onclick="toggleAddNormForm()">添加规则</button>
+                      <button class="btn btn-ghost btn-sm" onclick="loadNorms(selectedProjectId)">刷新</button>
+                    </div>
+                  </div>
+                  <div id="add-norm-form" class="card hidden" style="margin-bottom:14px;padding:14px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm)">
+                    <h4 style="margin:0 0 12px;font-size:14px">添加 Harness 规则</h4>
+                    <div class="form-group"><label class="form-label">标题</label><input id="norm-title" class="form-input" placeholder="标题"></div>
+                    <div class="form-group"><label class="form-label">内容</label><textarea id="norm-content" class="form-textarea" rows="3"></textarea></div>
+                    <div class="form-row">
+                      <div class="form-group"><label class="form-label">标签</label>
+                        <select id="norm-tag" class="form-select"><option value="harness">harness</option><option value="convention">convention</option><option value="heuristic">heuristic</option><option value="preference">preference</option></select>
+                      </div>
+                      <div class="form-group"><label class="form-label">优先级</label><input id="norm-priority" type="number" min="1" max="10" value="5" class="form-input"></div>
+                    </div>
+                    <div style="display:flex;justify-content:flex-end;gap:8px">
+                      <button class="btn btn-ghost btn-sm" onclick="toggleAddNormForm()">取消</button>
+                      <button class="btn btn-primary btn-sm" onclick="submitAddNorm()">提交</button>
+                    </div>
+                  </div>
+                  <div id="norm-list"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Memory Tab -->
+          <div id="tab-memory" class="tab-panel">
+            <div class="section-head">
+              <h3>记忆管理</h3>
+              <button class="btn btn-ghost btn-sm" onclick="loadAllMemories(selectedProjectId)">刷新</button>
+            </div>
+            <div class="scroll-panel">
+              <div class="profile-panel" style="margin-bottom:20px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+                  <h4 style="margin:0;font-size:13px;color:var(--blue)">用户画像 (L1)</h4>
+                  <div style="display:flex;gap:8px;align-items:center">
+                    <label class="profile-advanced-toggle" style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
+                      <input type="checkbox" id="profile-advanced-toggle" onchange="toggleProfileAdvanced()"> Advanced JSON
+                    </label>
+                    <button class="btn btn-primary btn-sm" onclick="saveProfile()">保存</button>
+                  </div>
+                </div>
+                <div id="profile-form-structured">
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">身份</h5>
+                    <div class="form-row">
+                      <div class="form-group"><label class="form-label">显示名称</label><input id="profile-identity-name" class="form-input" placeholder="例如：张三"></div>
+                      <div class="form-group"><label class="form-label">角色</label><input id="profile-identity-role" class="form-input" placeholder="例如：tech_lead"></div>
+                    </div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">职责与工作流</h5>
+                    <div class="form-group"><label class="form-label">职责说明</label><textarea id="profile-responsibilities" class="form-textarea" rows="2" placeholder="你在项目中的主要职责…"></textarea></div>
+                    <div class="form-row">
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-wf-review"> 应用前人工审核</label></div>
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-wf-incremental"> 偏好增量改动</label></div>
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-wf-parallel"> 允许并行子任务</label></div>
+                    </div>
+                    <div class="form-group"><label class="form-label">合并冲突策略</label><input id="profile-wf-merge-conflict" class="form-input" placeholder="例如：先 3-way 自动消解，失败则标记人工处理"></div>
+                    <div class="form-group"><label class="form-label">测试失败策略</label><input id="profile-wf-test-failure" class="form-input" placeholder="例如：定位根因后小步修复，最多 3 轮"></div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">代码风格与偏好</h5>
+                    <div class="form-row">
+                      <div class="form-group"><label class="form-label">界面语言</label><input id="profile-pref-language" class="form-input" placeholder="zh-CN"></div>
+                      <div class="form-group"><label class="form-label">测试框架</label><input id="profile-pref-test-fw" class="form-input" placeholder="pytest"></div>
+                    </div>
+                    <div class="form-group"><label class="form-label">编码风格</label><input id="profile-pref-coding-style" class="form-input" placeholder="简洁、可维护、与仓库现有风格一致"></div>
+                    <div class="form-group"><label class="form-label">Diff 范围</label><input id="profile-pref-diff-scope" class="form-input" placeholder="最小必要改动"></div>
+                    <div class="form-group"><label class="form-label">Commit 风格</label><input id="profile-pref-commit-style" class="form-input" placeholder="conventional commits"></div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">沟通方式</h5>
+                    <div class="form-group"><label class="form-label">回复语言</label><input id="profile-comm-response-lang" class="form-input" placeholder="中文说明 + 英文代码"></div>
+                    <div class="form-group"><label class="form-label">注释密度</label>
+                      <select id="profile-comm-comment-density" class="form-select">
+                        <option value="minimal">minimal</option>
+                        <option value="moderate">moderate</option>
+                        <option value="verbose">verbose</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">质量门槛</h5>
+                    <div class="form-row">
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-qb-tests"> 逻辑变更需测试</label></div>
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-qb-lint"> 提交前 lint</label></div>
+                      <div class="form-group profile-check"><label><input type="checkbox" id="profile-qb-secrets"> 禁止密钥入库</label></div>
+                    </div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">技术栈</h5>
+                    <div class="form-row">
+                      <div class="form-group"><label class="form-label">Backend</label><input id="profile-tech-backend" class="form-input" placeholder="Python 3.11+, FastAPI"></div>
+                      <div class="form-group"><label class="form-label">Frontend</label><input id="profile-tech-frontend" class="form-input" placeholder="Vanilla JS, SSE"></div>
+                    </div>
+                    <div class="form-row">
+                      <div class="form-group"><label class="form-label">Database</label><input id="profile-tech-database" class="form-input" placeholder="PostgreSQL, pgvector"></div>
+                      <div class="form-group"><label class="form-label">Infra</label><input id="profile-tech-infra" class="form-input" placeholder="Docker Compose"></div>
+                    </div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">Brain 编排指令</h5>
+                    <div class="form-group"><textarea id="profile-instructions-brain" class="form-textarea" rows="4" placeholder="每行一条编排指令…"></textarea></div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">Worker 实现指令</h5>
+                    <div class="form-group"><textarea id="profile-instructions-worker" class="form-textarea" rows="4" placeholder="每行一条实现指令…"></textarea></div>
+                  </div>
+                  <div class="profile-section">
+                    <h5 class="profile-section-title">备注</h5>
+                    <div class="form-group"><textarea id="profile-notes" class="form-textarea" rows="2" placeholder="其他补充说明…"></textarea></div>
+                  </div>
+                </div>
+                <div id="profile-form-advanced" class="hidden">
+                  <textarea id="profile-json" class="form-textarea" rows="12" placeholder='{"preferences": {}, "notes": ""}' style="font-family:var(--font-mono);font-size:12px"></textarea>
+                </div>
+                <p style="font-size:11px;color:var(--text-muted);margin:6px 0 0" id="profile-user-hint">注入 Brain/Worker 编排 LLM 的用户偏好；未保存时使用全局默认</p>
+              </div>
+              <div style="margin-bottom:20px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                  <h4 style="margin:0;font-size:13px;color:var(--red)">错题集</h4>
+                  <button class="btn btn-ghost btn-sm" onclick="toggleAddMistakeForm()">+ 添加</button>
+                </div>
+                <div id="add-mistake-form" class="card hidden" style="margin-bottom:8px">
+                  <div class="form-group"><label class="form-label">错误类型</label><input id="mistake-error-type" class="form-input"></div>
+                  <div class="form-group"><label class="form-label">描述</label><textarea id="mistake-description" class="form-textarea" rows="2"></textarea></div>
+                  <div class="form-group"><label class="form-label">上下文</label><textarea id="mistake-context" class="form-textarea" rows="2"></textarea></div>
+                  <div class="form-group"><label class="form-label">修复方案</label><textarea id="mistake-fix" class="form-textarea" rows="2"></textarea></div>
+                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" onclick="toggleAddMistakeForm()">取消</button><button class="btn btn-primary btn-sm" onclick="submitAddMistake()">提交</button></div>
+                </div>
+                <div id="mistake-list"></div>
+              </div>
+              <div style="margin-bottom:20px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                  <h4 style="margin:0;font-size:13px;color:var(--green)">成功模式</h4>
+                  <button class="btn btn-ghost btn-sm" onclick="toggleAddSuccessForm()">+ 添加</button>
+                </div>
+                <div id="add-success-form" class="card hidden" style="margin-bottom:8px">
+                  <div class="form-group"><label class="form-label">模式名称</label><input id="success-pattern-name" class="form-input"></div>
+                  <div class="form-group"><label class="form-label">描述</label><textarea id="success-description" class="form-textarea" rows="2"></textarea></div>
+                  <div class="form-group"><label class="form-label">方法</label><textarea id="success-approach" class="form-textarea" rows="2"></textarea></div>
+                  <div class="form-group"><label class="form-label">适用场景</label><textarea id="success-applicable" class="form-textarea" rows="2"></textarea></div>
+                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" onclick="toggleAddSuccessForm()">取消</button><button class="btn btn-primary btn-sm" onclick="submitAddSuccess()">提交</button></div>
+                </div>
+                <div id="success-list"></div>
+              </div>
+              <div>
+                <h4 style="margin:0 0 8px;font-size:13px;color:var(--purple)">任务摘要 <span style="font-weight:400;color:var(--text-muted);font-size:11px">系统自动生成</span></h4>
+                <div id="summary-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Preprocess Tab -->
+          <div id="tab-preprocess" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="knowledge-block knowledge-block-wide">
+                <div class="knowledge-block-head">
+                  <h3>预处理进度</h3>
+                  <div style="display:flex;gap:8px">
+                    <button class="btn btn-primary btn-sm" onclick="preprocessProject()">运行预处理</button>
+                    <button class="btn btn-ghost btn-sm" onclick="loadPreprocessStatus(selectedProjectId)">刷新</button>
+                  </div>
+                </div>
+                <div class="preprocess-pipeline" id="preprocess-pipeline">
+                  <div class="preprocess-step" data-phase="scanning"><div class="label">Phase 1</div><div class="name">扫描</div></div>
+                  <div class="preprocess-step" data-phase="indexing"><div class="label">Phase 2</div><div class="name">索引</div></div>
+                  <div class="preprocess-step" data-phase="embedding"><div class="label">Phase 3</div><div class="name">向量</div></div>
+                  <div class="preprocess-step" data-phase="analyzing"><div class="label">Phase 4</div><div class="name">分析</div></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                  <span class="pill pill-blue" id="preprocess-phase">IDLE</span>
+                  <span id="preprocess-percent" style="font-size:13px;color:var(--text-muted)">0%</span>
+                </div>
+                <div class="progress-track" style="height:8px;margin-bottom:10px"><div id="preprocess-bar" class="progress-fill" style="width:0%;background:var(--blue)"></div></div>
+                <p id="preprocess-message" style="margin:0;font-size:13px;color:var(--text-secondary)">等待预处理…</p>
+                <div id="preprocess-error" class="hidden" style="margin-top:10px;padding:10px;background:rgba(248,113,113,0.1);border-radius:6px;color:var(--red);font-size:12px"></div>
+                <div id="preprocess-stats" class="preprocess-stats-grid"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- System Tab -->
+          <div id="tab-system" class="tab-panel">
+            <div class="system-layout">
+              <section class="system-section system-section-compact">
+                <div class="system-section-head">
+                  <h3>任务统计</h3>
+                  <span class="hint" id="stats-refresh-hint">每 30s 刷新</span>
+                </div>
+                <div id="stats-banner" class="stats-banner hidden"></div>
+                <div class="stats-grid" id="stats-grid">
+                  <div class="stats-card"><span class="stats-label">总任务</span><span class="stats-value" id="stat-total">—</span></div>
+                  <div class="stats-card"><span class="stats-label">已完成</span><span class="stats-value" id="stat-completed">—</span></div>
+                  <div class="stats-card"><span class="stats-label">失败</span><span class="stats-value stats-value-red" id="stat-failed">—</span></div>
+                  <div class="stats-card"><span class="stats-label">Accept 率</span><span class="stats-value" id="stat-accept-rate">—</span></div>
+                  <div class="stats-card"><span class="stats-label">平均耗时</span><span class="stats-value" id="stat-avg-duration">—</span></div>
+                  <div class="stats-card"><span class="stats-label">Token 合计 <span class="hint">(估算)</span></span><span class="stats-value" id="stat-total-tokens">—</span></div>
+                  <div class="stats-card"><span class="stats-label">平均 Token <span class="hint">(估算)</span></span><span class="stats-value" id="stat-avg-tokens">—</span></div>
+                  <div class="stats-card stats-card-learning"><span class="stats-label">学习趋势</span><span class="stats-value" id="stat-learning-trend"><span class="pill pill-gray">—</span></span></div>
+                </div>
+              </section>
+              <section class="system-section system-section-compact">
+                <div class="system-section-head">
+                  <h3>通知</h3>
+                  <button class="btn btn-ghost btn-sm" onclick="loadNotifications()">刷新</button>
+                </div>
+                <div id="notifications-list" class="notifications-list">
+                  <p class="hint" style="padding:8px 0;margin:0">暂无通知</p>
+                </div>
+              </section>
+              <section class="system-section system-section-compact">
+                <div class="system-section-head">
+                  <h3>系统组件</h3>
+                  <span class="hint">每 5s 刷新</span>
+                </div>
+                <div class="component-grid" id="components-grid"></div>
+              </section>
+              <section class="system-section system-section-grow">
+                <div class="system-section-head">
+                  <h3>CubeSandbox</h3>
+                  <div class="system-section-actions">
+                    <button class="btn btn-primary btn-sm" onclick="createSandbox()">创建</button>
+                    <button class="btn btn-danger btn-sm" onclick="destroyAllSandboxes()">全部销毁</button>
+                    <button class="btn btn-ghost btn-sm" onclick="refreshSandboxes()">刷新</button>
+                  </div>
+                </div>
+                <div id="sandbox-config" class="sandbox-config"></div>
+                <div class="sandbox-workspace">
+                  <div class="sandbox-list-col">
+                    <p class="sandbox-col-label">活跃沙箱</p>
+                    <div id="sandbox-list" class="sandbox-list-scroll"></div>
+                  </div>
+                  <div class="sandbox-detail-col">
+                    <div id="sandbox-detail-empty" class="sandbox-detail-empty">
+                      <p>选择沙箱查看 /workspace 产物与执行日志</p>
+                      <p class="hint">点击文件可预览内容；目录可进入</p>
+                    </div>
+                    <div id="sandbox-detail-panel" class="sandbox-detail-panel hidden">
+                      <div class="sandbox-detail-head">
+                        <span class="sandbox-id" id="sandbox-detail-id"></span>
+                        <span id="sandbox-detail-meta" class="sandbox-meta"></span>
+                      </div>
+                      <div class="sandbox-detail-split">
+                        <div class="sandbox-pane">
+                          <div class="sandbox-pane-head">
+                            <span>Workspace 产物</span>
+                            <div class="sandbox-breadcrumb" id="sandbox-breadcrumb"></div>
+                            <button class="btn btn-ghost btn-sm" onclick="reloadSandboxWorkspace()">刷新</button>
+                          </div>
+                          <div class="sandbox-file-list" id="sandbox-file-list"></div>
+                          <div class="sandbox-file-preview" id="sandbox-file-preview">
+                            <p class="hint">点击文件预览内容（文本）；二进制以 base64 提示</p>
+                          </div>
+                        </div>
+                        <div class="sandbox-pane">
+                          <div class="sandbox-pane-head">
+                            <span>执行日志</span>
+                            <button class="btn btn-ghost btn-sm" onclick="loadSandboxLogs(selectedSandboxId)">刷新</button>
+                          </div>
+                          <div class="log-view sandbox-log-view" id="sandbox-log-panel"></div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- Settings Drawer -->
+  <div class="overlay" id="settings-overlay" onclick="toggleSettings()"></div>
+  <div class="drawer" id="settings-drawer">
+    <div class="drawer-head">
+      <h2>系统设置</h2>
+      <button class="btn btn-ghost btn-icon" onclick="toggleSettings()">✕</button>
+    </div>
+    <div class="drawer-body">
+      <div class="form-group"><label class="form-label">SiliconFlow API Key</label>
+        <div style="position:relative"><input id="cfg-sf-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-sf-api-key')">👁</button></div>
+      </div>
+      <div class="form-group"><label class="form-label">SiliconFlow Base URL</label><input id="cfg-sf-base-url" class="form-input" placeholder="https://api.siliconflow.cn/v1"></div>
+      <div class="form-group"><label class="form-label">本地模型 API Key</label>
+        <div style="position:relative"><input id="cfg-local-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-local-api-key')">👁</button></div>
+      </div>
+      <div class="form-group"><label class="form-label">本地模型 Base URL</label><input id="cfg-local-base-url" class="form-input" placeholder="http://localhost:11434/v1"></div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Brain 主模型（云端编排）</label><div id="cfg-brain-model-wrapper"><select id="cfg-brain-model" class="form-select"><option value="">配置 API Key</option></select></div></div>
+        <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
+      </div>
+      <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" onclick="fetchModels()" id="btn-refresh-models">刷新模型列表</button>
+      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
+      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
+      <div class="form-group">
+        <label class="form-label"><input type="checkbox" id="cfg-langsmith-tracing" style="margin-right:8px">启用 LangSmith Tracing</label>
+      </div>
+      <div class="form-group"><label class="form-label">LangSmith API Key</label>
+        <div style="position:relative"><input id="cfg-langsmith-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-langsmith-api-key')">👁</button></div>
+      </div>
+      <div class="form-group"><label class="form-label">LangSmith Project</label><input id="cfg-langsmith-project" class="form-input" placeholder="swarm-dev"></div>
+      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">Worker 子任务路由</h3>
+      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">Brain 拆解子任务后，按难度选择模型：trivial/medium 走本地，complex 走云端，multimodal 看图任务。</p>
+      <div id="routing-table"></div>
+      <button class="btn btn-secondary" style="width:100%;margin:12px 0" onclick="testConfig()" id="btn-test-config">测试模型连接</button>
+      <div id="config-test-result" style="font-size:12px;color:var(--text-muted);margin-bottom:12px"></div>
+      <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
+    </div>
+  </div>
+
+  <!-- Add Project Modal -->
+  <div class="overlay" id="add-project-overlay" onclick="hideAddProjectModal()"></div>
+  <div class="modal" id="add-project-modal">
+    <div class="modal-head"><h3>添加项目</h3></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label">项目路径（绝对路径）</label><input id="add-project-path" class="form-input" placeholder="/path/to/your/project"></div>
+      <div class="form-group"><label class="form-label">项目名称</label><input id="add-project-name" class="form-input" placeholder="自动从路径推断"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="hideAddProjectModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitAddProjectFromModal()">添加</button>
+    </div>
+  </div>
+
+  <!-- Revise Modal -->
+  <div class="overlay" id="revise-overlay" onclick="hideReviseModal()"></div>
+  <div class="modal" id="revise-modal">
+    <div class="modal-head"><h3>提交修订反馈</h3></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label">反馈内容</label><textarea id="revise-feedback" class="form-textarea" rows="4" placeholder="描述需要修改的内容…"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="hideReviseModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitReviseFromModal()">提交修订</button>
+    </div>
+  </div>
+
+  <!-- Login Modal -->
+  <div class="overlay" id="login-overlay" onclick="hideLoginModal()"></div>
+  <div class="modal" id="login-modal">
+    <div class="modal-head"><h3>登录 Swarm</h3></div>
+    <div class="modal-body">
+      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">默认账号 admin / swarm（首次启动自动创建）</p>
+      <div class="form-group">
+        <label class="form-label" for="login-username">用户名</label>
+        <input id="login-username" class="form-input" value="admin" placeholder="admin" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="login-password">密码</label>
+        <input id="login-password" class="form-input" type="password" placeholder="swarm" autocomplete="current-password">
+      </div>
+      <p id="login-error" style="font-size:12px;color:var(--red);margin:8px 0 0;display:none"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="hideLoginModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitLogin()">登录</button>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

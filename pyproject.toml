@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm"
+version = "0.1.0"
+description = "蜂群 AI 编程智能体系统"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+readme = "README.md"
+
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sse-starlette>=1.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "langchain>=0.2",
+    "langchain-openai>=0.1",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-postgres>=2.0",
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.0",
+    "qdrant-client>=1.7",
+    "fastembed>=0.7",
+    "e2b-code-interpreter>=2.0",
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+]
+
+[project.scripts]
+swarm = "swarm.cli:main"
+swarm-web = "swarm.api.app:app"
+
+[tool.setuptools]
+packages = [
+    "swarm",
+    "swarm.api",
+    "swarm.auth",
+    "swarm.brain",
+    "swarm.cli",
+    "swarm.config",
+    "swarm.infra",
+    "swarm.knowledge",
+    "swarm.memory",
+    "swarm.models",
+    "swarm.project",
+    "swarm.tools",
+    "swarm.worker",
+]
+
+[tool.setuptools.package-dir]
+"swarm" = "."
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+norecursedirs = ["legacy", "sandbox", ".venv", "__pycache__"]
+addopts = "-q --import-mode=importlib"
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pyright]
+# 宽松模式：项目大量使用运行时动态导入（swarm.* 包通过 editable install 解析），
+# 静态分析的 missing-import 多为误报。仅作开发期辅助，不阻断 CI。
+include = ["swarm", "api", "auth", "brain", "cli", "config", "infra", "knowledge", "memory", "models", "project", "tools", "worker"]
+exclude = ["**/__pycache__", ".venv", "test/legacy", "test/sandbox"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportAttributeAccessIssue = "warning"
