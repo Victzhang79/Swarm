@@ -256,7 +256,7 @@ async def _check_component(name: str) -> dict[str, Any]:
                             return [col.name for col in cols.collections]
                         coll_names = await asyncio.to_thread(_check_local_qdrant_kb)
                         details.append(f"qdrant local file, {len(coll_names)} collections")
-                        qdrant_ok = True
+                        qdrant_ok = True  # noqa: F841
                     else:
                         details.append(f"qdrant unreachable: {type(e).__name__}")
                 except Exception:
@@ -265,14 +265,14 @@ async def _check_component(name: str) -> dict[str, Any]:
             # 2) 检查 embedding 模型可用性
             embed_ok = False
             try:
-                from fastembed import TextEmbedding
+                from fastembed import TextEmbedding  # noqa: F401
                 details.append(f"embedding: {cfg.knowledge.embedding_model} (fastembed)")
                 embed_ok = True
             except ImportError:
                 pass
             if not embed_ok:
                 try:
-                    from sentence_transformers import SentenceTransformer
+                    from sentence_transformers import SentenceTransformer  # noqa: F401
                     details.append(f"embedding: {cfg.knowledge.embedding_model} (sentence-transformers)")
                     embed_ok = True
                 except ImportError:
@@ -355,7 +355,7 @@ async def _check_component(name: str) -> dict[str, Any]:
                 """同步检测远程沙箱（在线程中执行）"""
                 result: dict[str, Any] = {}
                 try:
-                    from e2b_code_interpreter import Sandbox
+                    from e2b_code_interpreter import Sandbox  # noqa: F401
 
                     # 设置必要环境变量
                     from swarm.config.settings import get_config as _get_cfg
@@ -2532,7 +2532,7 @@ async def reject_task(task_id: str):
 # 知识库 & 记忆 CRUD API 端点
 # ═══════════════════════════════════════════════════
 
-import psycopg as _psycopg
+import psycopg as _psycopg  # noqa: E402
 
 # ─── Pydantic Request Models ─────────────────────
 
