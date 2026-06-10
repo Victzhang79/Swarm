@@ -6,8 +6,6 @@
   PUT  /api/config                    — 更新配置（写入 .env 并重载）
   GET  /api/routing                   — 获取当前模型路由表
   PUT  /api/routing                   — 更新模型路由表配置
-  POST /api/demo                      — 触发 swarm demo 任务（后台执行，返回 run_id）
-  GET  /api/demo/stream?run_id=xxx    — SSE 流式订阅 demo 执行进度（需 run_id，不自动触发任务）
   GET  /api/sandbox/status            — 活跃沙箱列表（含详情）
   POST /api/sandbox/create            — 创建新沙箱
   DELETE /api/sandbox/{sid}           — 销毁沙箱
@@ -65,37 +63,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
 import time
-import traceback
-import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.encoders import jsonable_encoder
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
 
 from swarm.api._shared import (
-    ApplyDiffRequest,
-    _flatten_model_config,
-    _mask_config_dict,
     _parse_since_param,
-    _require_perm,
-    _require_user,
-    _resolve_key,
 )
 from swarm.config.settings import (
     get_config,
-    reload_config,
 )
-from swarm.project import preprocess, store
+from swarm.project import store
 from swarm.tracing import configure_langsmith
 
 
@@ -533,20 +519,6 @@ class ConfigUpdateRequest(BaseModel):
 
 
 
-class DemoRequest(BaseModel):
-    """Demo 任务请求"""
-    task: str = Field(
-        default="计算斐波那契数列前 10 项并输出结果",
-        description="要在沙箱中执行的任务描述",
-    )
-    code: str | None = Field(
-        default=None,
-        description="自定义 Python 代码，不提供则自动生成",
-    )
-    project_id: str | None = Field(
-        default=None,
-        description="关联的项目ID，用于设置 Worker 的工作目录",
-    )
 
 
 
@@ -571,35 +543,6 @@ class DemoRequest(BaseModel):
 def _get_sandbox_manager() -> Any:
     from swarm.worker.sandbox import get_sandbox_manager
     return get_sandbox_manager()
-
-
-# ═══════════════════════════════════════════════════
-# Demo 运行注册表（SSE 订阅用）
-# ═══════════════════════════════════════════════════
-# POST /api/demo 触发任务后生成 run_id 并注册，
-# GET /api/demo/stream?run_id=xxx 只订阅已有任务的进度，
-# 不再自动触发新任务（修复 GPU 无限占用 bug）
-
-_demo_runs: dict[str, asyncio.Queue] = {}  # run_id → asyncio.Queue[dict]
-
-
-def _new_demo_run() -> tuple[str, asyncio.Queue]:
-    """创建新的 demo 运行注册，返回 (run_id, queue)"""
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
-    queue: asyncio.Queue[dict] = asyncio.Queue()
-    _demo_runs[run_id] = queue
-    # 限制注册表大小：清理超过 30 分钟的旧 run
-    _cleanup_old_runs()
-    return run_id, queue
-
-
-def _cleanup_old_runs() -> None:
-    """清理注册表中超过 100 条的旧记录"""
-    if len(_demo_runs) > 100:
-        # 简单策略：删除最早的条目
-        to_del = list(_demo_runs.keys())[:len(_demo_runs) - 50]
-        for k in to_del:
-            _demo_runs.pop(k, None)
 
 
 # ═══════════════════════════════════════════════════
@@ -846,255 +789,6 @@ async def get_status():
 
 
 
-# ─── 5. POST /api/demo ─────────────────────────────
-@app.post("/api/demo", tags=["Demo"])
-async def run_demo(req: DemoRequest):
-    """触发 swarm demo 任务（后台执行，返回 run_id 用于 SSE 订阅）
-
-    优先走 Brain 编排链路（analyze → plan → dispatch → worker → sandbox），
-    如果 Brain 不可用则降级为沙箱直接执行。
-
-    返回 {"run_id": "run-xxxx", "status": "started"}，
-    前端通过 GET /api/demo/stream?run_id=run-xxxx 订阅进度。
-    """
-    task = req.task or "计算斐波那契数列前10项"
-    project_id = getattr(req, "project_id", None) or None
-
-    run_id, queue = _new_demo_run()
-
-    async def _run_in_background() -> None:
-        """后台执行 Brain 编排，将进度推入 queue"""
-        sandbox: Any | None = None
-        loop = asyncio.get_running_loop()
-
-        # 如果指定了 project_id，设置 workspace root 到项目路径
-        if project_id:
-            try:
-                project = store.get_project(project_id)
-                if project and project.get("path"):
-                    os.environ["SWARM_WORKSPACE_ROOT"] = project["path"]
-                    logger.info(f"[Demo] workspace root → {project['path']}")
-            except Exception as e:
-                logger.warning(f"[Demo] 设置 workspace root 失败: {e}")
-
-        # ── 尝试 Brain 编排流 ──
-        try:
-            from swarm.brain.graph import compile_brain_graph
-
-            await queue.put({"step": "brain_init", "status": "running",
-                             "message": "🧠 Brain 编排模式启动…", "mode": "brain", "progress": 5})
-
-            compiled = compile_brain_graph()
-            thread_id = f"demo-{run_id}"
-
-            from swarm.tracing import brain_graph_config
-
-            graph_config = brain_graph_config(
-                task_id=run_id,
-                project_id=project_id or "",
-                thread_id=thread_id,
-                resume=False,
-                description=task[:200],
-            )
-
-            await queue.put({"step": "brain_compile", "status": "done",
-                             "message": "Brain graph 已编译", "mode": "brain", "progress": 10})
-
-            await queue.put({"step": "brain_invoke", "status": "running",
-                             "message": f"Brain 正在编排任务 (thread={thread_id})…",
-                             "mode": "brain", "progress": 20})
-
-            invoke_input = {"task": task, "task_description": task, "auto_accept": True}
-            if project_id:
-                invoke_input["project_id"] = project_id
-
-            final_state = None
-            progress_val = 20
-            async for event in compiled.astream_events(
-                invoke_input,
-                config=graph_config,
-                version="v2",
-            ):
-                kind = event.get("event", "")
-                if kind == "on_chain_start":
-                    name = event.get("name", "")
-                    if name and name not in ("LangGraph", "ChannelWrite"):
-                        progress_val = min(progress_val + 5, 85)
-                        await queue.put({"step": "brain_node", "status": "running",
-                                         "message": f"🧠 Brain 节点: {name}",
-                                         "mode": "brain", "node": name, "progress": progress_val})
-                elif kind == "on_chain_end":
-                    name = event.get("name", "")
-                    output = event.get("data", {}).get("output")
-                    if name == "LangGraph" and output is not None:
-                        final_state = output
-
-            await queue.put({"step": "brain_done", "status": "done",
-                             "message": "🧠 Brain 编排完成", "mode": "brain", "progress": 95})
-
-            # 提取输出
-            output_parts = {}
-            if isinstance(final_state, dict):
-                for k, v in final_state.items():
-                    if k in ("merged_diff", "l2_passed", "learn_summary",
-                             "complexity", "plan", "subtask_results") and v:
-                        if hasattr(v, "model_dump"):
-                            output_parts[k] = v.model_dump(mode="json")
-                        elif isinstance(v, dict):
-                            output_parts[k] = v
-                        else:
-                            output_parts[k] = str(v)
-            if not output_parts and final_state is not None:
-                output_parts = {"raw": str(final_state)[:2000]}
-
-            await queue.put({"step": "complete", "status": "done",
-                             "message": "Demo 执行完成", "mode": "brain", "progress": 100})
-            await queue.put({"step": "result", "mode": "brain", "result": output_parts})
-            return  # Brain 成功
-
-        except Exception as brain_err:
-            logger.warning(f"Brain failed, falling back to sandbox: {brain_err}")
-            await queue.put({"step": "brain_fallback", "status": "warning",
-                             "message": "⚠️ Brain 不可用，降级为沙箱直接执行",
-                             "mode": "sandbox_fallback", "progress": 15})
-
-        # ── 降级：沙箱直接执行 ──
-        manager = _get_sandbox_manager()
-        try:
-            await queue.put({"step": "create_sandbox", "status": "running",
-                             "message": "正在创建远程 CubeSandbox…",
-                             "mode": "sandbox_fallback", "progress": 20})
-
-            sandbox = await loop.run_in_executor(
-                None, lambda: manager.create(
-                    template_id="tpl-8fa882f5d775429cad1530c9", timeout=120,
-                )
-            )
-            sandbox_id = sandbox.sandbox_id
-
-            await queue.put({"step": "create_sandbox", "status": "done",
-                             "message": f"沙箱已创建: {sandbox_id}",
-                             "mode": "sandbox_fallback", "progress": 40,
-                             "sandbox_id": sandbox_id})
-
-            code = req.code or '''
-import json
-def fibonacci(n):
-    a, b = 0, 1
-    result = []
-    for _ in range(n):
-        result.append(a)
-        a, b = b, a + b
-    return result
-result = fibonacci(10)
-print(f"Fibonacci sequence: {result}")
-print(f"Sum: {sum(result)}")
-'''
-
-            await queue.put({"step": "execute_code", "status": "running",
-                             "message": "正在沙箱中执行代码…",
-                             "mode": "sandbox_fallback", "progress": 60})
-
-            result = await loop.run_in_executor(
-                None, lambda: manager.run_code(sandbox, code, timeout=60)
-            )
-
-            await queue.put({"step": "execute_code", "status": "done",
-                             "message": "代码执行完成", "mode": "sandbox_fallback",
-                             "progress": 80, "output": {
-                                 "stdout": result.stdout, "stderr": result.stderr,
-                                 "text": result.text, "error": result.error,
-                                 "success": result.success,
-                             }})
-
-            # 销毁沙箱
-            await queue.put({"step": "destroy_sandbox", "status": "running",
-                             "message": f"正在销毁沙箱 {sandbox_id}…",
-                             "mode": "sandbox_fallback", "progress": 90})
-
-            await loop.run_in_executor(None, lambda: manager.kill(sandbox_id))
-            sandbox = None
-
-            await queue.put({"step": "complete", "status": "done",
-                             "message": "Demo 执行完成",
-                             "mode": "sandbox_fallback", "progress": 100})
-            await queue.put({"step": "result", "mode": "sandbox_fallback",
-                             "success": result.success, "stdout": result.stdout,
-                             "stderr": result.stderr, "text": result.text,
-                             "error": result.error})
-
-        except Exception as e:
-            logger.error(f"Demo failed: {e}\n{traceback.format_exc()}")
-            await queue.put({"step": "error", "status": "error",
-                             "message": f"执行失败: {str(e)}", "progress": -1})
-        finally:
-            if sandbox is not None:
-                try:
-                    manager.kill(sandbox.sandbox_id)
-                except Exception:
-                    pass
-
-    # 在后台启动执行，立即返回 run_id
-    asyncio.create_task(_run_in_background())
-
-    return {"run_id": run_id, "status": "started", "task": task}
-
-
-# ─── 6. GET /api/demo/stream ───────────────────────
-@app.get("/api/demo/stream", tags=["Demo"])
-async def stream_demo(run_id: str = ""):
-    """SSE 流式推送 demo 执行进度（纯订阅，不触发任务）
-
-    必须提供 run_id 参数（由 POST /api/demo 返回），
-    否则返回 400 错误。这修复了之前 SSE 连接自动触发 Brain 任务
-    导致 GPU 无限占用的 bug。
-    """
-    if not run_id or run_id not in _demo_runs:
-        raise HTTPException(
-            status_code=400,
-            detail="无效或缺失 run_id。请先 POST /api/demo 获取 run_id，"
-                   "再通过 ?run_id=xxx 订阅进度。",
-        )
-
-    queue = _demo_runs[run_id]
-
-    async def event_generator():
-        """从 queue 中读取进度事件并推送"""
-        try:
-            while True:
-                try:
-                    # 等待新事件，超时 30s 发心跳
-                    event_data = await asyncio.wait_for(queue.get(), timeout=30)
-                except asyncio.TimeoutError:
-                    # 心跳：防止连接超时断开
-                    yield {"event": "heartbeat", "data": ""}
-                    continue
-
-                step = event_data.get("step", "")
-                event_type = "progress"
-
-                if step == "result":
-                    event_type = "result"
-                elif step == "error":
-                    event_type = "error"
-
-                yield {
-                    "event": event_type,
-                    "data": json.dumps(event_data, ensure_ascii=False),
-                }
-
-                # 终止事件：complete 或 error
-                if step in ("complete", "error"):
-                    # 完成后清理注册
-                    _demo_runs.pop(run_id, None)
-                    break
-        except asyncio.CancelledError:
-            # 客户端断开连接
-            pass
-
-    return EventSourceResponse(event_generator())
-
-
 # ─── 辅助: 从 CubeSandbox 服务端拉取沙箱列表 ────────
 def _fetch_sandbox_list_from_server() -> list[dict]:
     """调用 Sandbox.list() 获取服务端权威沙箱列表
@@ -1287,8 +981,6 @@ async def index():
     <div class="endpoint"><span class="method get">GET</span><code>/api/status</code> — 系统组件状态</div>
     <div class="endpoint"><span class="method get">GET</span><code>/api/config</code> — 获取配置（脱敏）</div>
     <div class="endpoint"><span class="method put">PUT</span><code>/api/config</code> — 更新配置</div>
-    <div class="endpoint"><span class="method post">POST</span><code>/api/demo</code> — 运行 Demo</div>
-    <div class="endpoint"><span class="method get">GET</span><code>/api/demo/stream</code> — SSE Demo 进度流</div>
     <div class="endpoint"><span class="method get">GET</span><code>/api/sandbox/status</code> — 活跃沙箱列表</div>
     <div class="endpoint"><span class="method post">POST</span><code>/api/sandbox/create</code> — 创建沙箱</div>
     <div class="endpoint"><span class="method delete">DELETE</span><code>/api/sandbox/{id}</code> — 销毁沙箱</div>
