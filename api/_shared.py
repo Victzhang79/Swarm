@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException, Request
+from pydantic import BaseModel, Field
 
 from swarm.config.settings import AppConfig
 
@@ -150,3 +151,10 @@ def _parse_since_param(since: str | None) -> datetime | None:
         return datetime.fromisoformat(text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid since timestamp: {since}") from exc
+
+
+# ─── 跨域共享 Pydantic 模型 ───────────────────────
+class ApplyDiffRequest(BaseModel):
+    """将 merged_diff 应用到项目工作区"""
+    diff: str | None = Field(default=None, description="可选覆盖 task.merged_diff")
+    check_only: bool = Field(default=False, description="仅 git apply --check")

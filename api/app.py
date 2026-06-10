@@ -83,11 +83,10 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from swarm.api._shared import (
-    _EMBEDDING_ZERO,
+    ApplyDiffRequest,
     _flatten_model_config,
     _mask_config_dict,
     _parse_since_param,
-    _profile_storage_key,
     _require_perm,
     _require_user,
     _resolve_key,
@@ -582,18 +581,8 @@ class TaskRetryRequest(BaseModel):
     auto_accept: bool | None = Field(default=None, description="自动通过审核（默认沿用环境变量）")
 
 
-class WorkerRunRequest(BaseModel):
-    """Phase 0 — 单 Worker 直跑（不经 Brain）"""
-    description: str = Field(description="子任务描述")
-    difficulty: str = Field(default="medium", description="trivial | medium | complex")
-    writable: list[str] | None = Field(default=None, description="可写路径，默认全项目")
-    readable: list[str] | None = Field(default=None, description="可读路径，默认全项目")
 
 
-class ApplyDiffRequest(BaseModel):
-    """将 merged_diff 应用到项目工作区"""
-    diff: str | None = Field(default=None, description="可选覆盖 task.merged_diff")
-    check_only: bool = Field(default=False, description="仅 git apply --check")
 
 
 class ApproveTaskRequest(BaseModel):
@@ -2102,87 +2091,6 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
     return {"status": "ok", "task": task}
 
 
-# ─── Phase 0: POST /api/projects/{project_id}/worker/run ───
-@app.post("/api/projects/{project_id}/worker/run", tags=["Worker"])
-async def start_worker_run(project_id: str, req: WorkerRunRequest):
-    """单 Worker 直跑（不经 Brain），用于 Phase 0 验证 scope + L1 + diff"""
-    loop = asyncio.get_running_loop()
-    project = await loop.run_in_executor(None, store.get_project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-
-    run_id = str(uuid.uuid4())
-    from swarm.worker.runner import start_standalone_worker_background
-
-    start_standalone_worker_background(
-        run_id,
-        project_id,
-        req.description,
-        difficulty=req.difficulty,
-        writable=req.writable,
-        readable=req.readable,
-    )
-    return {"status": "ok", "run_id": run_id, "project_id": project_id}
-
-
-# ─── Phase 0: GET /api/worker/{run_id}/stream ───
-@app.get("/api/worker/{run_id}/stream", tags=["Worker"])
-async def stream_worker_run(run_id: str):
-    """SSE 订阅 Standalone Worker 进度"""
-    from swarm.worker.runner import get_worker_queue, register_worker_queue
-
-    queue = get_worker_queue(run_id) or register_worker_queue(run_id)
-
-    async def event_generator():
-        try:
-            while True:
-                try:
-                    event_data = await asyncio.wait_for(queue.get(), timeout=30)
-                except asyncio.TimeoutError:
-                    yield {"event": "heartbeat", "data": ""}
-                    continue
-
-                step = event_data.get("step", "")
-                event_type = "progress"
-                if step == "result":
-                    event_type = "result"
-                elif step == "error":
-                    event_type = "error"
-
-                yield {
-                    "event": event_type,
-                    "data": json.dumps(event_data, ensure_ascii=False, default=str),
-                }
-                if step in ("complete", "error"):
-                    break
-        except asyncio.CancelledError:
-            pass
-
-    return EventSourceResponse(event_generator())
-
-
-@app.post("/api/projects/{project_id}/apply-diff", tags=["Worker"])
-async def apply_project_diff(project_id: str, req: ApplyDiffRequest):
-    """Phase 0/1 — 将 diff 应用到项目 git 工作区（Worker 直跑或手动 patch）"""
-    if not req or not (req.diff or "").strip():
-        raise HTTPException(status_code=400, detail="请求体须包含 diff 字段")
-    loop = asyncio.get_running_loop()
-    project = await loop.run_in_executor(None, store.get_project, project_id)
-    if not project or not project.get("path"):
-        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-
-    from swarm.project.diff_apply import apply_git_diff
-
-    result = await loop.run_in_executor(
-        None,
-        lambda: apply_git_diff(project["path"], req.diff or "", check_only=req.check_only),
-    )
-    if not result.get("ok"):
-        raise HTTPException(
-            status_code=422,
-            detail=result.get("stderr") or result.get("stdout") or "git apply 失败",
-        )
-    return {"status": "ok", **result}
 
 
 # ─── 9. GET /api/tasks/{task_id}/stream — SSE 任务进度 ─
@@ -2532,7 +2440,6 @@ async def reject_task(task_id: str):
 # 知识库 & 记忆 CRUD API 端点
 # ═══════════════════════════════════════════════════
 
-import psycopg as _psycopg  # noqa: E402
 
 # ─── Pydantic Request Models ─────────────────────
 
@@ -2679,8 +2586,10 @@ async def index():
 # ─── 路由模块注册 (Phase2 域拆分) ─────────────────
 # 注意: 放在文件末尾, 确保 app 实例与共享 helper 均已定义,
 # router 模块通过 `import swarm.api.app as _app` 反向引用时 sys.modules 已就绪。
-from swarm.api.routers import memory as _memory_router  # noqa: E402
 from swarm.api.routers import knowledge as _knowledge_router  # noqa: E402
+from swarm.api.routers import memory as _memory_router  # noqa: E402
+from swarm.api.routers import worker as _worker_router  # noqa: E402
 
 app.include_router(_memory_router.router)
 app.include_router(_knowledge_router.router)
+app.include_router(_worker_router.router)
