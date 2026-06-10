@@ -1,0 +1,1 @@
+"""api/routers — 按业务域拆分的 FastAPI 路由模块。"""
