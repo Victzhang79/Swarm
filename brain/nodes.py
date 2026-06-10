@@ -17,10 +17,10 @@ import re
 import time
 from pathlib import Path
 
-from swarm.audit import audit
-
 from langgraph.types import interrupt
 
+from swarm.audit import audit
+from swarm.brain.context_log import init_task_context, sliding_context_prompt, touch_context
 from swarm.brain.prompts import (
     ANALYZE_SYSTEM,
     ANALYZE_USER,
@@ -41,13 +41,13 @@ from swarm.brain.prompts import (
     VERIFY_L3_SYSTEM,
     VERIFY_L3_USER,
 )
-from swarm.brain.context_log import init_task_context, sliding_context_prompt, touch_context
 from swarm.brain.state import BrainState
-from swarm.memory.sliding_window import PRIORITY_WORKER
 from swarm.config.settings import get_config
+from swarm.memory.sliding_window import PRIORITY_WORKER
 from swarm.models.router import ModelRouter
 from swarm.types import (
     Complexity,
+    Confidence,
     FileScope,
     HumanDecision,
     KnowledgeContext,
@@ -56,7 +56,6 @@ from swarm.types import (
     SubTaskModality,
     TaskPlan,
     WorkerOutput,
-    Confidence,
 )
 
 logger = logging.getLogger(__name__)
@@ -505,7 +504,7 @@ def confirm_plan(state: BrainState) -> dict:
     使用 langgraph.types.interrupt 实现挂起等待人工输入。
     输入: plan, task_description, complexity
     输出: human_decision
-    
+
     在 auto_accept 模式下（API 调用），跳过 interrupt 直接接受。
     """
     logger.info("[CONFIRM] 等待人工确认 (ultra 复杂度)")
@@ -1535,7 +1534,7 @@ def deliver(state: BrainState) -> dict:
     使用 langgraph.types.interrupt 实现挂起等待人工决策。
     输入: merged_diff, l2_passed
     输出: human_decision
-    
+
     在 auto_accept 模式下（API 调用），跳过 interrupt 直接接受。
     """
     logger.info("[DELIVER] 等待人工决策")

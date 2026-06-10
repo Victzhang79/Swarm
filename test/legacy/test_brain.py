@@ -2,7 +2,7 @@
 """Quick smoke test for Brain state machine"""
 
 from swarm.brain.state import BrainState
-from swarm.types import Complexity, HumanDecision
+from swarm.types import Complexity
 
 # Test BrainState
 state: BrainState = {

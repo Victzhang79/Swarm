@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 
 os.environ["E2B_API_URL"] = "http://192.168.60.106:3000"
@@ -11,8 +12,10 @@ os.environ.pop("E2B_DOMAIN", None)
 TEMPLATE_ID = "tpl-6f9b38b4584a46b0a9c99ae9"
 
 from dev_sidecar import setup_dev_sidecar
+
 setup_dev_sidecar()
 from e2b_code_interpreter import Sandbox
+
 
 def main() -> None:
     sbx = Sandbox.create(template=TEMPLATE_ID)

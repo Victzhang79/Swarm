@@ -3,25 +3,21 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from unittest.mock import patch
-
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-from swarm.brain.contract_utils import enrich_plan_with_shared_contract, contract_symbols
+from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 from swarm.brain.graph import after_verify_l3
 from swarm.brain.integration_review import check_contract_in_diff
-from swarm.brain.plan_validator import validate_plan_structure
+from swarm.infra.redis_client import ModuleLock, TaskQueue, check_project_limit
 from swarm.knowledge.retriever import SwarmRetriever
-from swarm.infra.redis_client import ModuleLock, TaskQueue, redis_enabled, check_project_limit
-from swarm.types import Complexity, FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
+from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
 
 
 def test_shared_contract_enrich():

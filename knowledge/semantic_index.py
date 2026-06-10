@@ -369,6 +369,7 @@ class SemanticIndexer:
         )
 
         import asyncio
+
         from swarm.knowledge.reranker import rerank_documents
 
         return await asyncio.to_thread(

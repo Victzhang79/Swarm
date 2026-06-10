@@ -16,7 +16,6 @@ from aiohttp import (
     web,
 )
 
-
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -487,7 +486,9 @@ def setup_dev_sidecar() -> None:
             CodeInterpreterSandbox = None
             JUPYTER_PORT = None
         try:
-            from e2b_code_interpreter.code_interpreter_async import AsyncSandbox as AsyncCodeInterpreterSandbox
+            from e2b_code_interpreter.code_interpreter_async import (
+                AsyncSandbox as AsyncCodeInterpreterSandbox,
+            )
         except ImportError:
             AsyncCodeInterpreterSandbox = None
 

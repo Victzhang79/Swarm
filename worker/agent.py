@@ -5,19 +5,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
-from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
 
-from swarm.config.settings import get_config
 from swarm.models.router import ModelRouter
-from swarm.tools.scope_guard import ScopeGuard, set_scope, clear_scope
-from swarm.tools.file_tools import read_file, write_file, patch_file, search_in_file
-from swarm.tools.git_tools import git_checkout, git_diff, git_log, git_blame
 from swarm.tools.build_tools import run_command, run_compile, run_tests
+from swarm.tools.file_tools import patch_file, read_file, search_in_file, write_file
+from swarm.tools.git_tools import git_blame, git_checkout, git_diff, git_log
 from swarm.tools.knowledge_tools import query_knowledge_base
+from swarm.tools.scope_guard import set_scope
 from swarm.types import FileScope, KnowledgeContext, SubTask
 from swarm.worker.prompts import build_worker_prompt
 

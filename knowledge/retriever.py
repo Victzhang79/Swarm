@@ -268,6 +268,7 @@ class SwarmRetriever:
 
         def _query() -> dict[str, Any]:
             import psycopg
+
             from swarm.config.settings import DatabaseConfig
             cfg = DatabaseConfig()
             conn = psycopg.connect(cfg.postgres_uri, autocommit=True)

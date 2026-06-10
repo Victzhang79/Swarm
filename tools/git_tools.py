@@ -22,7 +22,7 @@ def _workspace_root() -> Path:
 
 def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
     """执行 git 命令，返回 (returncode, stdout+stderr)"""
-    from swarm.tools.build_tools import get_sandbox_context, _run_in_sandbox
+    from swarm.tools.build_tools import _run_in_sandbox, get_sandbox_context
 
     sandbox, _ = get_sandbox_context()
     if sandbox is not None:

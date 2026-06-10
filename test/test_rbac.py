@@ -3,11 +3,8 @@
 
 from __future__ import annotations
 
-import sys
-import uuid
-from pathlib import Path
-
 import importlib.util
+import uuid
 from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"

@@ -10,7 +10,6 @@ from typing import Optional
 
 from swarm.types import FileScope
 
-
 # ──────────────────────────────────────────────
 # 全局 Context Variable — 每个 Worker 协程独立
 # ──────────────────────────────────────────────

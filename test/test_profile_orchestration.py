@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
@@ -13,15 +12,15 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 from swarm.auth.default_profile import DEFAULT_ADMIN_PROFILE
-from swarm.brain.prompts import ANALYZE_USER, PLAN_USER
+from swarm.brain.prompts import ANALYZE_USER
 from swarm.memory.profile import (
     format_user_profile_for_brain,
     format_user_profile_for_worker,
     load_profile_prompts,
     resolve_user_profile,
 )
-from swarm.worker.prompts import build_worker_prompt
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
+from swarm.worker.prompts import build_worker_prompt
 
 
 def test_default_profile_has_llm_instructions():

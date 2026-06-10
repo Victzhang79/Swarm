@@ -10,13 +10,13 @@
 - Prompt 模板: 各节点 LLM prompt (prompts.py)
 """
 
-from swarm.brain.state import BrainState
 from swarm.brain.graph import (
     build_brain_graph,
     compile_brain_graph,
     compile_brain_graph_with_postgres,
     get_compiled_brain_graph,
 )
+from swarm.brain.state import BrainState
 
 __all__ = [
     "BrainState",

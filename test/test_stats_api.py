@@ -3,12 +3,9 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from unittest.mock import patch
-
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -73,7 +70,6 @@ EXPECTED_STATS_KEYS = {
 
 def test_stats_endpoint_returns_expected_keys():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -95,7 +91,6 @@ def test_stats_endpoint_returns_expected_keys():
 
 def test_stats_scoped_to_project():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     project = {"id": "p1", "name": "Demo"}
@@ -117,7 +112,6 @@ def test_stats_scoped_to_project():
 
 def test_stats_unknown_project_404():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -130,7 +124,6 @@ def test_stats_unknown_project_404():
 
 def test_notifications_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -148,7 +141,6 @@ def test_notifications_endpoint():
 
 def test_notifications_invalid_since():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     client = TestClient(app)

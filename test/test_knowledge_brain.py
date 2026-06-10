@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -32,8 +30,8 @@ def test_format_layer_items():
 
 
 def test_knowledge_tool_without_project():
-    from swarm.tools.knowledge_tools import query_knowledge_base
     from swarm.knowledge.service import set_worker_context
+    from swarm.tools.knowledge_tools import query_knowledge_base
 
     set_worker_context(None)
     out = query_knowledge_base.invoke({"query": "test", "top_k": 3})
@@ -42,8 +40,8 @@ def test_knowledge_tool_without_project():
 
 
 def test_knowledge_tool_with_mock_retriever():
-    from swarm.tools.knowledge_tools import query_knowledge_base
     from swarm.knowledge.service import set_worker_context
+    from swarm.tools.knowledge_tools import query_knowledge_base
 
     mock_context = {
         "struct": [{"symbol_name": "parse", "file_path": "parser.py", "signature": "def parse"}],
@@ -99,8 +97,12 @@ async def _test_analyze_retrieval_async():
 
 
 async def _test_learn_persist_async():
-    from swarm.brain.learn_store import persist_learn_success, persist_learn_failure, merge_persist_meta
-    from swarm.brain.nodes import learn_success, learn_failure
+    from swarm.brain.learn_store import (
+        merge_persist_meta,
+        persist_learn_failure,
+        persist_learn_success,
+    )
+    from swarm.brain.nodes import learn_success
 
     mock_store = AsyncMock()
     mock_store.connect = AsyncMock()

@@ -501,7 +501,7 @@ async def _check_component(name: str) -> dict[str, Any]:
 
 class ConfigUpdateRequest(BaseModel):
     """配置更新请求
-    
+
     支持两种键名格式：
     1. 环境变量名：SWARM_MODEL_SILICONFLOW_API_KEY
     2. 短名：siliconflow_api_key（自动添加 SWARM_MODEL_ 前缀）
@@ -792,7 +792,7 @@ async def get_status():
 # ─── 辅助: 从 CubeSandbox 服务端拉取沙箱列表 ────────
 def _fetch_sandbox_list_from_server() -> list[dict]:
     """调用 Sandbox.list() 获取服务端权威沙箱列表
-    
+
     返回包含 id/state/started_at/template_id/cpu/memory 的字典列表。
     started_at 从 UTC 转换为本地时区显示。
     """

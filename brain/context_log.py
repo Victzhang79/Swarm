@@ -9,7 +9,6 @@ from swarm.config.settings import get_config
 from swarm.memory.sliding_window import (
     PRIORITY_PROCESS,
     PRIORITY_USER,
-    PRIORITY_WORKER,
     append_context_event,
     compress_context_log,
     format_sliding_context_for_prompt,

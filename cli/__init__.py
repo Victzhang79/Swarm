@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import sys
-from pathlib import Path
 
 import click
 import httpx
@@ -71,7 +70,7 @@ async def _submit_via_api(
 
         console.print(f"[green]✅ 任务已创建[/] id={task_id}")
         if not watch:
-            console.print(f"[dim]使用 --watch 跟踪进度，或打开 Web UI 查看[/dim]")
+            console.print("[dim]使用 --watch 跟踪进度，或打开 Web UI 查看[/dim]")
             return
 
         console.print("[dim]订阅 SSE 进度流…[/dim]")
@@ -195,7 +194,7 @@ async def _worker_run_via_api(
             sys.exit(1)
         console.print(f"[green]✅ Worker 已启动[/] run_id={run_id}")
         if not watch:
-            console.print(f"[dim]使用 --watch 跟踪进度[/dim]")
+            console.print("[dim]使用 --watch 跟踪进度[/dim]")
             return
 
         stream_url = f"{api_url}/api/worker/{run_id}/stream"

@@ -1,5 +1,4 @@
 """Quick sanity check for all modified components"""
-import json
 
 # 1. Test _parse_json_from_llm with both str and list content
 from swarm.brain.nodes import _parse_json_from_llm
@@ -23,6 +22,7 @@ print(f"  list of strings result: {result}")
 
 # 2. Verify get_worker_llm mapping
 from swarm.models.router import ModelRouter
+
 r = ModelRouter()
 for strategy in ["cost_optimized", "quality", "complex"]:
     llm = r.get_worker_llm(strategy=strategy)
@@ -30,14 +30,17 @@ for strategy in ["cost_optimized", "quality", "complex"]:
 
 # 3. Verify dispatch and _dispatch_to_worker are async
 import inspect
-from swarm.brain.nodes import dispatch, _dispatch_to_worker
+
+from swarm.brain.nodes import _dispatch_to_worker, dispatch
+
 assert inspect.iscoroutinefunction(dispatch), "dispatch should be async"
 assert inspect.iscoroutinefunction(_dispatch_to_worker), "_dispatch_to_worker should be async"
 print("✅ dispatch and _dispatch_to_worker are async")
 
 # 4. Verify WorkerExecutor.project_path
+from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 from swarm.worker.executor import WorkerExecutor
-from swarm.types import SubTask, SubTaskDifficulty, SubTaskModality, FileScope
+
 st = SubTask(
     id="test-1", description="test",
     difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
@@ -50,6 +53,7 @@ print("✅ WorkerExecutor.project_path works")
 
 # 5. Verify graph compiles with async dispatch
 from swarm.brain.graph import compile_brain_graph
+
 compiled = compile_brain_graph()
 assert 'dispatch' in compiled.nodes
 print("✅ Graph compiles with async dispatch node")

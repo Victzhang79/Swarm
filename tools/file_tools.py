@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Optional
 
 from langchain_core.tools import tool
 
@@ -201,7 +200,7 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
         count = text.count(old_string)
 
         if count == 0:
-            return f"❌ 未找到匹配文本，请检查 old_string 是否精确（包括缩进）"
+            return "❌ 未找到匹配文本，请检查 old_string 是否精确（包括缩进）"
         if count > 1 and not replace_all:
             return (
                 f"❌ 找到 {count} 处匹配，请补充更多上下文使其唯一，"

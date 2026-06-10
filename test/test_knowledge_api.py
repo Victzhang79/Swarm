@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import importlib.util
-from pathlib import Path
+from unittest.mock import patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -18,7 +16,6 @@ _spec.loader.exec_module(_mod)
 
 def test_symbols_search_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     mock_rows = [
@@ -51,7 +48,6 @@ def test_symbols_search_endpoint():
 
 def test_preprocess_status_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:

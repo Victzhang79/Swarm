@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """验证中文关键词提取"""
-from swarm.knowledge.retriever import _extract_keywords, _apply_time_decay
+from swarm.knowledge.retriever import _apply_time_decay, _extract_keywords
 
 # 问题1: 中文关键词
 print("=== 中文关键词提取 ===")

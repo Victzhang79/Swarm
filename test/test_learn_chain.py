@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -20,7 +18,6 @@ _spec.loader.exec_module(_mod)
 
 def test_approve_resumes_brain_accept():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {

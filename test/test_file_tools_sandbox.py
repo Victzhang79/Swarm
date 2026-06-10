@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """file_tools sandbox-first 路由单元测试（mock 沙箱，无需真实 CubeSandbox）"""
 
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -57,10 +55,11 @@ class _Entry:
 
 
 def _setup_mock_sandbox(tmp_path: Path):
-    from swarm.tools.build_tools import set_sandbox_context, clear_sandbox_context
-    from swarm.tools.scope_guard import ScopeGuard, set_scope
-    from swarm.types import FileScope
     import os
+
+    from swarm.tools.build_tools import clear_sandbox_context, set_sandbox_context
+    from swarm.tools.scope_guard import set_scope
+    from swarm.types import FileScope
 
     os.environ["SWARM_WORKSPACE_ROOT"] = str(tmp_path)
 
@@ -104,7 +103,7 @@ def test_write_and_patch_file_sandbox():
     tmp.mkdir(exist_ok=True)
     sandbox, manager, files, clear = _setup_mock_sandbox(tmp)
     try:
-        from swarm.tools.file_tools import write_file, patch_file
+        from swarm.tools.file_tools import patch_file, write_file
 
         w = write_file.invoke({"path": "hello.py", "content": "alpha\nbeta\n"})
         assert "✅" in w
@@ -141,8 +140,9 @@ def test_search_in_file_sandbox():
 def test_local_fallback_without_sandbox():
     import os
     import tempfile
+
     from swarm.tools.build_tools import clear_sandbox_context
-    from swarm.tools.scope_guard import ScopeGuard, set_scope, clear_scope
+    from swarm.tools.scope_guard import clear_scope, set_scope
     from swarm.types import FileScope
 
     clear_sandbox_context()

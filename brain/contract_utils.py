@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from swarm.types import SubTask, TaskPlan
+from swarm.types import TaskPlan
 
 
 def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:

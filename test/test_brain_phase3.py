@@ -4,21 +4,18 @@
 from __future__ import annotations
 
 import asyncio
-import sys
+import importlib.util
 import time
 from pathlib import Path
 from unittest.mock import patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
+from swarm.brain.graph import after_handle_failure, after_merge
 from swarm.brain.merge_engine import merge_diffs
-from swarm.brain.graph import after_merge, after_handle_failure
 from swarm.brain.nodes import dispatch, handle_failure, merge, verify_l2, verify_l3
 from swarm.brain.state import BrainState
 from swarm.types import (

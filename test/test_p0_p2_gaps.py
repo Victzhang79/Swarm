@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import sys
+import importlib.util
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -81,7 +78,6 @@ def test_save_milestone_report_mock():
 
 def test_apply_diff_blocked_on_merge_conflicts():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     client = TestClient(app)

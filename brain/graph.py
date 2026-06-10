@@ -26,10 +26,9 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.graph import END, StateGraph
 
-from swarm.brain.state import BrainState
 from swarm.brain.nodes import (
     analyze,
     confirm_plan,
@@ -46,6 +45,7 @@ from swarm.brain.nodes import (
     verify_l2,
     verify_l3,
 )
+from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.types import Complexity, HumanDecision
 

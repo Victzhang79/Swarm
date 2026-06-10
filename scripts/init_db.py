@@ -95,7 +95,6 @@ async def _ensure_async_tables() -> None:
     # kb_update_events（增量更新队列）— DDL 常量在 updater 模块，
     # 直接执行以避免 KnowledgeUpdater.connect() 拉起 Qdrant 依赖。
     import psycopg
-
     from swarm.knowledge.updater import EVENT_QUEUE_DDL
 
     async with await psycopg.AsyncConnection.connect(

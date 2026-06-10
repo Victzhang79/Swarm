@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"

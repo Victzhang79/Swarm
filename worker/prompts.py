@@ -11,10 +11,8 @@
 from __future__ import annotations
 
 import json
-from typing import Optional
 
 from swarm.types import FileScope, KnowledgeContext, SubTask
-
 
 SYSTEM_PROMPT_TEMPLATE = """\
 你是 Swarm Worker Agent — 一个专业的代码实现智能体。

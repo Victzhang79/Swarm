@@ -6,12 +6,12 @@
     python run_web.py 9000     # 自定义端口
 """
 
-import os
 import sys
 from pathlib import Path
 
 # 加载 .env
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).parent / '.env')
 
 if __name__ == '__main__':

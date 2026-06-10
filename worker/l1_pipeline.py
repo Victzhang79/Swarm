@@ -8,7 +8,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from swarm.project.diff_apply import files_from_unified_diff
 from swarm.types import FileScope, SubTask

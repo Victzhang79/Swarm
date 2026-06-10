@@ -16,10 +16,10 @@ from swarm.knowledge.updater import (
     ChangeType,
     FileChange,
     UpdateEvent,
+    _merge_project_events,
     dedupe_changes,
     dedupe_event,
     hydrate_event_changes,
-    _merge_project_events,
 )
 
 

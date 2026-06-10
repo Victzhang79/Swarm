@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import importlib.util
-from pathlib import Path
+from unittest.mock import patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -68,7 +66,6 @@ def test_apply_git_diff_in_repo():
 
 def test_worker_run_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     mock_project = {"id": "proj-1", "path": "/tmp/proj", "name": "test"}
@@ -94,7 +91,6 @@ def test_worker_run_endpoint():
 
 def test_worker_run_scope_payload():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     mock_project = {"id": "proj-1", "path": "/tmp/proj", "name": "test"}
@@ -132,7 +128,6 @@ def test_parse_scope_csv():
 
 def test_worker_run_404():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -148,7 +143,6 @@ def test_worker_run_404():
 
 def test_apply_diff_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {
@@ -179,7 +173,6 @@ def test_apply_diff_endpoint():
 
 def test_apply_diff_no_merged_diff():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -193,7 +186,6 @@ def test_apply_diff_no_merged_diff():
 
 def test_project_apply_diff():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     project = {"id": "proj-1", "path": "/tmp/p"}
@@ -215,7 +207,6 @@ def test_project_apply_diff():
 
 def test_approve_with_apply_diff():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {

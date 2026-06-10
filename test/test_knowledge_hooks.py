@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -18,7 +16,6 @@ _spec.loader.exec_module(_mod)
 
 def test_approve_schedules_incremental_update():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {
@@ -50,7 +47,6 @@ def test_approve_schedules_incremental_update():
 
 def test_approve_skips_hook_without_diff():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {"id": "t1", "project_id": "p1", "merged_diff": "", "status": "DELIVERING"}

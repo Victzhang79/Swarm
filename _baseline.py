@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from swarm.api.app import app
+
 print(f"Route count: {len(app.routes)}")
 for r in app.routes:
     if hasattr(r, 'methods'):

@@ -3,16 +3,12 @@
 
 from __future__ import annotations
 
-import json
+import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import importlib.util
-from pathlib import Path
+from unittest.mock import MagicMock
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -254,7 +250,6 @@ def test_pipeline_full_success():
     from swarm.worker.l1_pipeline import run_l1_pipeline
 
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
         _setup_project(tmp)
 
         subtask = _make_subtask()

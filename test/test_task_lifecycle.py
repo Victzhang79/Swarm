@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -18,7 +16,6 @@ _spec.loader.exec_module(_mod)
 
 def test_cancel_running_task():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {"id": "task-1", "project_id": "p1", "status": "DISPATCHING"}
@@ -37,7 +34,6 @@ def test_cancel_running_task():
 
 def test_cancel_not_cancellable():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {"id": "task-1", "status": "DELIVERING"}
@@ -54,7 +50,6 @@ def test_cancel_not_cancellable():
 
 def test_retry_failed_task():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     task = {"id": "task-1", "project_id": "p1", "status": "FAILED"}
@@ -76,7 +71,6 @@ def test_retry_failed_task():
 
 def test_retry_not_allowed():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
@@ -90,7 +84,6 @@ def test_retry_not_allowed():
 
 def test_create_task_rejects_unpreprocessed():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     project = {"id": "p1", "status": "NEW", "graph_status": "NONE"}
@@ -110,7 +103,6 @@ def test_create_task_rejects_unpreprocessed():
 
 def test_create_task_allows_ready_project():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     project = {"id": "p1", "status": "READY", "graph_status": "INDEXED"}
@@ -138,7 +130,6 @@ def test_create_task_allows_ready_project():
 
 def test_create_task_allows_partial_ready():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     project = {"id": "p1", "status": "READY", "graph_status": "INDEXED"}

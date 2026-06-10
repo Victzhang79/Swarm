@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 
 # === 配置:必须在 import dev_sidecar / Sandbox 之前设好 ===
@@ -14,6 +15,7 @@ TEMPLATE_ID = "tpl-8fa882f5d775429cad1530c9"
 
 # === 启动本地 sidecar 并给 SDK 打补丁(必须在导入 Sandbox 之前)===
 from dev_sidecar import setup_dev_sidecar
+
 setup_dev_sidecar()
 
 # === 打补丁之后再导入 Sandbox ===

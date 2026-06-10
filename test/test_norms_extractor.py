@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import textwrap
 from pathlib import Path
-
-import importlib.util
 
 # 加载 bootstrap，使 `from swarm.xxx` 可用
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"

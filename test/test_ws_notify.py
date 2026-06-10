@@ -4,13 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
@@ -23,7 +22,6 @@ def test_login_modal_html():
 
 def test_login_api_admin_swarm():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     client = TestClient(app)

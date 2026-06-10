@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import sys
+import importlib.util
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import importlib.util
-from pathlib import Path
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -43,7 +40,6 @@ def _disable_rbac():
 
 def test_get_profile_empty():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     cm, _ = _mock_pg_conn([None, None, None])
@@ -63,7 +59,6 @@ def test_get_profile_empty():
 
 def test_get_profile_existing():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     profile = {"preferences": {"style": "concise"}, "notes": "test"}
@@ -81,7 +76,6 @@ def test_get_profile_existing():
 
 def test_put_profile_upsert():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     new_profile = {"language": "python", "framework": "fastapi"}
@@ -106,7 +100,6 @@ def test_put_profile_upsert():
 
 def test_behavior_hotspots_endpoint():
     from fastapi.testclient import TestClient
-
     from swarm.api.app import app
 
     rows = [

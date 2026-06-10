@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
-
-import psycopg
 
 from swarm.auth.default_profile import DEFAULT_ADMIN_PROFILE, GLOBAL_PROFILE_SUFFIX
 from swarm.auth.store import profile_key
