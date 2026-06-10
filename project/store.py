@@ -384,15 +384,10 @@ def create_task(
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 INSERT INTO task_records (id, project_id, description, created_by_user_id)
                 VALUES (%s, %s, %s, %s)
-                RETURNING id, project_id, description, status, complexity,
-                          plan, subtask_count, completed_subtasks,
-                          human_decision, merged_diff, thread_id,
-                          token_usage, duration_seconds,
-                          merge_conflicts, l3_result, created_by_user_id,
-                          created_at, updated_at
+                RETURNING {_TASK_SELECT}
                 """,
                 (task_id, project_id, description, created_by_user_id),
             )
@@ -502,11 +497,7 @@ def update_task(
                 f"""
                 UPDATE task_records SET {', '.join(sets)}
                 WHERE id = %s
-                RETURNING id, project_id, description, status, complexity,
-                          plan, subtask_count, completed_subtasks,
-                          human_decision, merged_diff, thread_id,
-                          token_usage, duration_seconds,
-                          created_at, updated_at
+                RETURNING {_TASK_SELECT}
                 """,
                 params,
             )
