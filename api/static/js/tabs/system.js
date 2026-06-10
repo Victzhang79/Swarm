@@ -39,13 +39,6 @@ async function fetchStatus() {
   } catch { /* ignore */ }
 }
 
-function notificationsUrl(since) {
-  const params = [];
-  if (selectedProjectId) params.push('project_id=' + encodeURIComponent(selectedProjectId));
-  if (since) params.push('since=' + encodeURIComponent(since));
-  return params.length ? '/api/notifications?' + params.join('&') : '/api/notifications';
-}
-
 async function loadSystemStats() {
   try {
     const url = selectedProjectId
@@ -58,6 +51,7 @@ async function loadSystemStats() {
     set('stat-total', data.total_tasks ?? 0);
     set('stat-completed', data.completed ?? 0);
     set('stat-failed', data.failed ?? 0);
+    set('stat-merge-rate', formatAcceptRate(data.merge_rate));
     set('stat-accept-rate', formatAcceptRate(data.accept_rate));
     set('stat-avg-duration', formatDurationSeconds(data.avg_duration_seconds));
     set('stat-total-tokens', formatTokenCount(data.total_tokens));
@@ -73,75 +67,13 @@ async function loadSystemStats() {
   } catch { /* ignore */ }
 }
 
-function notificationEventLabel(eventType) {
-  if (eventType === 'task_failed') return '失败';
-  if (eventType === 'waiting_review') return '待审';
-  return '完成';
-}
-
-function notificationEventPill(eventType) {
-  if (eventType === 'task_failed') return 'pill-red';
-  if (eventType === 'waiting_review') return 'pill-amber';
-  return 'pill-green';
-}
-
-function renderNotifications(items) {
-  const el = $('notifications-list');
-  if (!el) return;
-  if (!items.length) {
-    el.innerHTML = '<p class="hint" style="padding:8px 0;margin:0">暂无通知</p>';
-    return;
-  }
-  el.innerHTML = items.map(n => `
-    <div class="notification-item" role="button" tabindex="0"
-         onclick="openNotificationTask('${escapeHtml(n.task_id)}','${escapeHtml(n.project_id || '')}')">
-      <span class="pill ${notificationEventPill(n.event_type)}">${escapeHtml(notificationEventLabel(n.event_type))}</span>
-      <div class="notification-body">
-        <p class="notification-msg">${escapeHtml(n.message || n.description || '')}</p>
-        <span class="notification-meta">${escapeHtml(formatTime(n.updated_at))}</span>
-      </div>
-    </div>`).join('');
-}
-
-async function loadNotifications() {
-  try {
-    const resp = await fetch(notificationsUrl());
-    if (!resp.ok) return;
-    const data = await resp.json();
-    renderNotifications(data.notifications || []);
-  } catch { /* ignore */ }
-}
-
-async function pollSystemNotifications() {
-  if (!lastSystemPollAt) {
-    await loadNotifications();
-    lastSystemPollAt = new Date().toISOString();
-    return;
-  }
-  try {
-    const resp = await fetch(notificationsUrl(lastSystemPollAt));
-    if (resp.ok) {
-      const data = await resp.json();
-      const newItems = data.notifications || [];
-      if (newItems.length) {
-        showNotificationBanner(newItems.length);
-        await maybeShowBrowserNotifications(newItems);
-      }
-    }
-  } catch { /* ignore */ }
-  lastSystemPollAt = new Date().toISOString();
-  await loadNotifications();
-}
-
 function loadSystemTab() {
   fetchStatus();
   loadSystemStats();
-  loadNotifications();
 }
 
 function startSystemRefresh() {
   stopSystemRefresh();
-  lastSystemPollAt = null;
   loadSystemTab();
   systemStatsInterval = setInterval(async () => {
     if (currentTab !== 'system') return;
@@ -495,6 +427,41 @@ async function destroyAllSandboxes() {
     resetSandboxDetail();
     refreshSandboxes(selectedProjectId);
   } catch { /* ignore */ }
+}
+
+// ── 全局沙箱运维（系统设置抽屉，不跟项目走）──────────────
+// 孤儿沙箱 = 服务端在跑但无项目/任务关联的沙箱。
+async function refreshOrphanCount() {
+  const cntEl = document.getElementById('orphan-count');
+  const totEl = document.getElementById('orphan-total');
+  if (cntEl) cntEl.textContent = '…';
+  try {
+    const resp = await fetch('/api/sandbox/orphans');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || 'HTTP ' + resp.status);
+    if (cntEl) cntEl.textContent = String(data.orphan_count ?? 0);
+    if (totEl) totEl.textContent = ` / 服务端共 ${data.total ?? 0} 个`;
+  } catch (e) {
+    if (cntEl) cntEl.textContent = '?';
+    if (totEl) totEl.textContent = ' (获取失败)';
+  }
+}
+
+async function cleanupOrphanSandboxes() {
+  if (!confirm('清理孤儿沙箱？只销毁无项目/任务关联的沙箱，不影响正在使用的。')) return;
+  const btn = document.getElementById('btn-cleanup-orphans');
+  if (btn) { btn.disabled = true; btn.textContent = '清理中…'; }
+  try {
+    const resp = await fetch('/api/sandbox/cleanup?orphans_only=true', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '清理失败');
+    showToast(`已清理 ${data.killed} 个孤儿沙箱${data.failed ? `（${data.failed} 个失败）` : ''}`, 'success');
+    await refreshOrphanCount();
+  } catch (e) {
+    showToast('清理失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧹 清理孤儿'; }
+  }
 }
 
 // ─── Retrieve experiment ─────────────────────────────────────

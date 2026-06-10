@@ -106,6 +106,27 @@ async def _emit(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> 
     await queue.put(event)
 
 
+def _emit_task_notification(task_id: str, task_rec: dict[str, Any], status: str) -> None:
+    """写入应用内通知（任务完成/失败，带 task_id）。失败不影响主流程。"""
+    try:
+        desc = (task_rec.get("description") or "")[:80]
+        if status == "DONE":
+            title, etype = "任务已完成", "task_completed"
+        elif status == "FAILED":
+            title, etype = "任务失败", "task_failed"
+        else:
+            title, etype = "任务更新", "task_updated"
+        store.create_notification(
+            etype,
+            task_id=task_id,
+            project_id=task_rec.get("project_id"),
+            title=title,
+            message=f"#{task_id[:8]} {desc}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[RUNNER] 写通知失败: %s", exc)
+
+
 def _set_workspace(project_id: str) -> None:
     try:
         project = store.get_project(project_id)
@@ -358,6 +379,7 @@ async def _handle_post_run(
         token_usage=token_usage,
         duration_seconds=round(duration, 2) if duration is not None else None,
     )
+    _emit_task_notification(task_id, task_rec, "DONE")
     output_parts = _build_result_payload(state)
     await _emit(queue, {
         "step": "complete",
@@ -391,6 +413,11 @@ async def run_task(
     auto_accept: bool | None = None,
 ) -> None:
     """后台启动 Brain 任务（从 SUBMITTED 到 DONE 或 interrupt）"""
+    # 绑定 task 上下文：本协程（asyncio.Task）内所有 swarm 日志自动带 [task=...]。
+    # 放在 run_task 内可覆盖所有入口（调度器准入 / 后台 / 直接调用）。
+    from swarm.logging_config import set_task_context
+
+    set_task_context(task_id)
     queue = register_task_queue(task_id)
     if task_id in _task_running:
         await _emit(queue, {"step": "error", "status": "error", "message": "任务已在执行中"})
@@ -483,6 +510,7 @@ async def run_task(
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
         store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id, project_id=project_id, error=str(exc)[:300])
         await _emit(queue, {
             "step": "error",
@@ -493,6 +521,13 @@ async def run_task(
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # 兜底：释放本任务残留的沙箱（正常路径 worker 已自清，此处防漏）
+        try:
+            from swarm.worker.sandbox import get_sandbox_manager
+
+            get_sandbox_manager().kill_by_task(task_id)
+        except Exception:
+            pass
 
 
 async def resume_task(
@@ -501,6 +536,9 @@ async def resume_task(
     feedback: str = "",
 ) -> None:
     """恢复被 interrupt 暂停的任务"""
+    from swarm.logging_config import set_task_context
+
+    set_task_context(task_id)
     queue = _task_queues.get(task_id) or register_task_queue(task_id)
 
     if task_id in _task_running:
@@ -549,6 +587,7 @@ async def resume_task(
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {
             "step": "error",
             "status": "error",
@@ -581,15 +620,18 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
     if task_id in _task_running:
         return False, "任务正在执行中"
 
+    status = task.get("status", "")
+
+    # 人工审核态优先拦截：即使本进程未在跑（orphaned），这类任务也需要
+    # 先由人工 通过/修订/拒绝 决策，而不是直接重跑（否则丢失待审产出）。
+    if status in ("DELIVERING", "CONFIRMING"):
+        return False, "任务等待人工审核，请先通过/修订/拒绝"
+
     if is_task_orphaned(task_id):
         return True, ""
 
-    status = task.get("status", "")
     if status in ("FAILED", "CANCELLED", "DONE"):
         return True, ""
-
-    if status in ("DELIVERING", "CONFIRMING"):
-        return False, "任务等待人工审核，请先通过/修订/拒绝"
 
     if status in _ACTIVE_DB_STATUSES:
         return False, "任务仍在执行中"
@@ -612,6 +654,18 @@ async def cancel_task(task_id: str) -> bool:
             pass
 
     _task_running.discard(task_id)
+
+    # 释放该任务占用的沙箱（释放远程小模型/容器资源）——取消时容器不会自动销毁。
+    # CancelledError 不保证传播到 worker 的 finally（取消时机可能不在 await 点，
+    # 或 brain 级 L2/L3 sandbox 不在 worker 生命周期内），故在此显式按 task 清理。
+    try:
+        from swarm.worker.sandbox import get_sandbox_manager
+
+        killed = get_sandbox_manager().kill_by_task(task_id)
+        if killed:
+            logger.info("[RUNNER] 取消任务 %s 释放 %d 个沙箱", task_id, killed)
+    except Exception as exc:
+        logger.warning("[RUNNER] 取消任务 %s 释放沙箱失败: %s", task_id, exc)
 
     queue = _task_queues.get(task_id)
     if queue:
@@ -672,10 +726,13 @@ def start_task_background(
     register_task_queue(task_id)
 
     async def _wrap() -> None:
-        try:
-            await run_task(task_id, project_id, description, auto_accept=auto_accept)
-        finally:
-            _task_handles.pop(task_id, None)
+        from swarm.logging_config import bind_task
+
+        with bind_task(task_id):
+            try:
+                await run_task(task_id, project_id, description, auto_accept=auto_accept)
+            finally:
+                _task_handles.pop(task_id, None)
 
     _task_handles[task_id] = asyncio.create_task(_wrap())
 
@@ -683,10 +740,13 @@ def start_task_background(
 def resume_task_background(task_id: str, decision: str, feedback: str = "") -> None:
     """在 FastAPI 后台 resume 任务"""
     async def _wrap() -> None:
-        try:
-            await resume_task(task_id, decision, feedback)
-        finally:
-            _task_handles.pop(task_id, None)
+        from swarm.logging_config import bind_task
+
+        with bind_task(task_id):
+            try:
+                await resume_task(task_id, decision, feedback)
+            finally:
+                _task_handles.pop(task_id, None)
 
     _task_handles[task_id] = asyncio.create_task(_wrap())
 
@@ -701,9 +761,12 @@ def retry_task_background(task_id: str, auto_accept: bool | None = None) -> None
     register_task_queue(task_id)
 
     async def _wrap() -> None:
-        try:
-            await retry_task(task_id, auto_accept=auto_accept)
-        finally:
-            _task_handles.pop(task_id, None)
+        from swarm.logging_config import bind_task
+
+        with bind_task(task_id):
+            try:
+                await retry_task(task_id, auto_accept=auto_accept)
+            finally:
+                _task_handles.pop(task_id, None)
 
     _task_handles[task_id] = asyncio.create_task(_wrap())

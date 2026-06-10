@@ -78,7 +78,7 @@ async function startWorkerRun() {
 function startWorkerSSE(runId) {
   closeWorkerSSE();
   const url = '/api/worker/' + encodeURIComponent(runId) + '/stream';
-  workerEventSource = new EventSource(url);
+  workerEventSource = new EventSource(sseUrl(url));
 
   const handle = (e, eventType) => {
     try {

@@ -117,6 +117,7 @@ def test_create_task_allows_ready_project():
         }
         mock_store.create_task.return_value = created
         mock_store.get_task.return_value = created
+        mock_store.find_active_duplicate_task.return_value = None
         with patch("swarm.brain.runner.start_task_background"):
             client = TestClient(app)
             resp = client.post(
@@ -143,6 +144,7 @@ def test_create_task_allows_partial_ready():
         }
         mock_store.create_task.return_value = {"id": "t2", "project_id": "p1"}
         mock_store.get_task.return_value = {"id": "t2", "project_id": "p1"}
+        mock_store.find_active_duplicate_task.return_value = None
         with patch("swarm.brain.runner.start_task_background"):
             client = TestClient(app)
             resp = client.post("/api/projects/p1/tasks", json={"description": "x"})

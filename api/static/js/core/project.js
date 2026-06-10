@@ -51,6 +51,8 @@ function reloadCurrentProjectTab(projectId) {
     refreshTaskReadinessHint(projectId);
   } else if (currentTab === 'system') {
     refreshSandboxes(projectId);
+    loadSystemStats();       // 数据统计跟随项目刷新（之前漏了，切项目时统计不更新）
+    fetchStatus();           // 组件健康（全局基础设施，但随面板刷新）
   }
 }
 

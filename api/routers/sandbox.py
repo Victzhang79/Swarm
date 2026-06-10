@@ -106,6 +106,95 @@ async def create_sandbox(req: SandboxCreateRequest):
         raise HTTPException(status_code=500, detail=f"Failed to create sandbox: {str(e)}")
 
 
+# ─── 9b. POST /api/sandbox/cleanup — 批量清理（释放泄漏资源）─
+@router.post("/api/sandbox/cleanup", tags=["沙箱"])
+async def cleanup_sandboxes(task_id: str | None = None, server: bool = False, orphans_only: bool = False):
+    """批量销毁沙箱，释放 CubeSandbox/小模型资源。
+
+    - task_id：只销毁该任务关联的沙箱（kill_by_task）。
+    - orphans_only=true：只销毁孤儿沙箱（服务端在跑、但无任何项目/任务关联）。
+      **全局运维推荐**——不误伤正在被某项目/任务使用的沙箱。
+    - server=true：以服务端权威列表为准，销毁所有服务端沙箱（含正在用的）。
+    - 默认（无参数）：销毁本进程追踪的全部沙箱（仅本地 _instances）。
+
+    并行 kill，避免逐个串行耗时（实测 95 个串行需 ~280s）。
+    """
+    manager = _app._get_sandbox_manager()
+    loop = asyncio.get_running_loop()
+
+    if task_id:
+        killed = await loop.run_in_executor(None, manager.kill_by_task, task_id)
+        return {"status": "ok", "scope": "task", "task_id": task_id, "killed": killed}
+
+    if orphans_only:
+        orphans = await loop.run_in_executor(None, _orphan_sandbox_ids, manager)
+        sids = orphans
+        scope = "orphans"
+    elif server:
+        server_list = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
+        sids = list({sb.get("id") for sb in server_list if sb.get("id")} | set(manager._instances.keys()))
+        scope = "server"
+    else:
+        sids = list(manager._instances.keys())
+        scope = "all"
+
+    if not sids:
+        return {"status": "ok", "scope": scope, "killed": 0, "message": "无沙箱可清理"}
+
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, manager.kill, sid) for sid in sids],
+        return_exceptions=True,
+    )
+    failed = sum(1 for r in results if isinstance(r, Exception))
+    killed = len(sids) - failed
+    _app.logger.info("[Sandbox] cleanup(scope=%s): 成功 %d, 失败 %d", scope, killed, failed)
+    return {"status": "ok", "scope": scope, "killed": killed, "failed": failed}
+
+
+# ─── 9c. GET /api/sandbox/orphans — 孤儿沙箱统计（全局，不跟项目）─
+@router.get("/api/sandbox/orphans", tags=["沙箱"])
+async def list_orphan_sandboxes():
+    """列出孤儿沙箱：服务端在跑、但无任何项目/任务关联的沙箱。
+
+    全局运维视图（不绑定项目）。用于系统设置里展示「孤儿数 / 服务端总数」。
+    """
+    manager = _app._get_sandbox_manager()
+    loop = asyncio.get_running_loop()
+    server_list = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
+    orphan_ids = _orphan_sandbox_ids(manager, server_list)
+    orphan_set = set(orphan_ids)
+    orphans = [sb for sb in server_list if sb.get("id") in orphan_set]
+    return {
+        "status": "ok",
+        "total": len(server_list),     # 服务端沙箱总数
+        "orphan_count": len(orphan_ids),
+        "orphans": orphans,
+    }
+
+
+def _orphan_sandbox_ids(manager, server_list=None) -> list[str]:
+    """计算孤儿沙箱 ID：服务端存在，但本进程 meta 里无 project_id 且无 task_id 关联。
+
+    判定为孤儿的条件（任一）：
+    - 该 sandbox_id 在 _sandbox_meta 中无记录（API 重启后丢失追踪）
+    - 记录存在但 project_id 与 task_id 均为空（无归属）
+    """
+    if server_list is None:
+        server_list = _app._fetch_sandbox_list_from_server()
+    orphans: list[str] = []
+    for sb in server_list:
+        sid = sb.get("id")
+        if not sid:
+            continue
+        meta = manager.get_sandbox_meta(sid)
+        if not meta:
+            orphans.append(sid)
+            continue
+        if not meta.get("project_id") and not meta.get("task_id"):
+            orphans.append(sid)
+    return orphans
+
+
 # ─── 9. DELETE /api/sandbox/{sandbox_id} ───────────
 @router.delete("/api/sandbox/{sandbox_id}", tags=["沙箱"])
 async def destroy_sandbox(sandbox_id: str):

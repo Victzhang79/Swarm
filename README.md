@@ -138,7 +138,9 @@ pip install -e ".[dev]"
 | 预处理 | scan/index/embed/analyze |
 | 知识库 | Layer A/B · 检索 · Harness · 一致性 |
 | 记忆 | L1 画像 · L5/L6 · 任务摘要 |
-| 系统 | 健康 · 统计 · 通知 · 沙箱 |
+| 系统 | 健康 · 统计 · 学习趋势 · 组件状态(chip+悬浮详情) · 沙箱 |
+
+> 通知已从系统 tab 迁移到右上角**铃铛**（持久化 `notifications` 表 + 未读绿点 + 浮窗逐条归档）。
 
 ---
 
@@ -209,6 +211,13 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `test_plan_validator.py` | 计划校验 |
 | `test_l1_pipeline.py` | Worker L1 lint + LLM 自检 |
 | `test_norms_extractor.py` | Layer C 规范自动提取 |
+| `test_stats_api.py` | 统计 + 通知端点（list/unread/archive） |
+| `test_scheduler.py` | 准入调度 · TaskQueue 优先级 · 模块锁 · 项目软限制 |
+| `test_l3_gitlab.py` | V3 GitLab 配置 · pipeline 触发轮询 · MR 创建（mock httpx） |
+| `test_runner.py` | 任务状态判断(orphaned/can_retry) · SSE 队列 · 通知钩子 |
+| `test_updater.py` | 增量更新 dedupe/merge · AST 符号抽取 · handle_event 分发 |
+| `test_executor.py` | scope 收集 · 路径归一化 · L1 自报解析 · **本地模式 diff 快照** |
+| `test_cn_keywords.py` | 中文 2-gram 关键词抽取 · 时间衰减加权 |
 
 ---
 
@@ -224,6 +233,20 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `SWARM_GITLAB_*` | V3 验证 / MR |
 | `SWARM_REDIS_ENABLED` | 模块锁 |
 | `SWARM_RBAC_ENABLED` | 多用户 |
+| `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关 |
+| `SWARM_LOG_LEVEL` | 日志级别 DEBUG/INFO/WARNING/ERROR（默认 INFO） |
+| `SWARM_LOG_FILE` | 日志文件路径（默认 swarm.log，空串=仅控制台） |
+| `SWARM_LOG_JSON` | true=结构化 JSON 行日志（便于聚合） |
+| `SWARM_LOG_MAX_BYTES` / `SWARM_LOG_BACKUP_COUNT` | 轮转大小/保留数（默认 20MB×5） |
+
+### 日志系统
+
+统一入口 `swarm/logging_config.py`，API / CLI / 脚本 / cron 共用：
+
+- **轮转文件**：`RotatingFileHandler`（默认 20MB×5），修复 `swarm.log` 无限增长
+- **task 上下文贯穿**：`bind_task(task_id)` 用 contextvar 跨协程传播，并发任务日志带 `[task=xxxxxxxx sub=st-N]` 前缀，可按任务追踪
+- **可选 JSON 结构化**：`SWARM_LOG_JSON=true` 输出每行 JSON（ts/level/logger/msg/task_id），便于 ELK/Loki
+- **配置驱动**：级别、文件、轮转、控制台开关全走 `AppConfig.log_*` / 环境变量
 
 ---
 
@@ -242,9 +265,9 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 
 ## 已知差距与 Roadmap
 
-> 对照设计文档（`docs/Swarm_System.html` V2）走读全部 22.8K 行代码后的诚实评估。
+> 对照设计文档（`docs/Swarm_System.html` V2）走读全部 26K 行代码后的诚实评估。
 > 核心链路（提交→Brain 编排→Worker 沙箱→审核→Learn→KB 增量）端到端可用，
-> 经两轮强化后整体完成度约 **95%**。设计文档列出的差距已全部补齐。
+> 经三轮强化后整体完成度约 **95%**。设计文档列出的差距已全部补齐。
 
 ### 本轮已修复
 
@@ -279,6 +302,19 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 - ✅ **外部通知未接** → 新增 `api/notify.py`，支持飞书/Slack/通用 webhook（`SWARM_NOTIFY_WEBHOOK_URL` + `SWARM_NOTIFY_FORMAT`），未配置静默跳过，已接入 approve/revise/reject
 - ✅ **任务队列无优先级** → `TaskQueue` 支持 urgent>normal>background（Redis 三 List + 内存 fallback 同步），向后兼容；新增 `check_project_limit()` 软限制（`SWARM_MAX_ACTIVE_PROJECTS`，默认 10）（`infra/redis_client.py`）
 - ✅ **embedding 不可用无降级路径** → Layer B 失败时 Layer A 独立成功，文件暂存 `kb_pending_embeddings` 重试队列，`retry_pending_embeddings()` 在服务恢复后补处理（`knowledge/updater.py`）
+
+**第三轮 — 全项目梳理（代码走读 + 测试审查后修复）**
+
+> 走读全部 26K 行代码（brain/worker/knowledge/memory/project）+ 审查 30 个测试文件后修复的真实 bug。
+
+- ✅ **本地执行模式产出空 diff** → `WorkerExecutor._pre/_post_sync_contents` 未在 `__init__` 初始化，无沙箱降级时 `_get_git_diff` 永远返回"(无变更)"。新增 `_snapshot_scope_local()`，本地模式直接快照 writable 文件前后内容（`worker/executor.py`）
+- ✅ **L5 批量衰减与逐条不一致** → `decay_l5_batch_sql` 原用平坦 `decay_weight*factor`，忽略 occurrence_boost；改为 CASE + `POWER(factor, 1/occurrence_count)`，与逐条 `decay_l5` 公式对齐（`memory/decay.py`）
+- ✅ **Qdrant point ID 跨进程碰撞** → 原用 Python 内置 `hash()`（PYTHONHASHSEED 随机化），重复预处理同符号生成不同 ID、旧向量残留；改用稳定 `blake2b` 哈希（`project/preprocess.py`）
+- ✅ **检索有副作用（违反 CQRS）** → `retrieve_for_brain` 每次检索都对 top-5 错题/成功自增 occurrence/reuse，反复检索人为推高权重扭曲衰减；移除检索期自增，复用计数应在模式实际采纳时单独触发（`knowledge/retriever.py`）
+- ✅ **embedding 重试队列无自动调度** → `retry_pending_embeddings()` 接入 KBScheduler 轮询（每 60s 一次），并加 `retry_count<10` 上限避免永久失败无限空转（`knowledge/scheduler.py`、`knowledge/updater.py`）
+- ✅ **学习趋势永远"未知"** → `_get_learning_effectiveness` 原只看 mem_mistakes，无错题→unknown；改为综合 mem_successes，新增 `learning`（无错题有成功=健康）/`regressing` 趋势（`project/store.py`、前端 `memory.js`）
+
+> **测试审查 + 补测**：209→291 passing（+82）。新增 6 个真实单测文件覆盖此前零直接单测的核心模块：`test_scheduler.py`（准入调度/队列优先级/锁）、`test_l3_gitlab.py`（V3 GitLab，mock httpx）、`test_runner.py`（任务生命周期状态判断）、`test_updater.py`（增量更新 dedupe/AST/handle_event 分发）、`test_executor.py`（scope/路径/本地模式 diff 快照）、`test_cn_keywords.py`（中文关键词，从项目根 print 脚本归类为正式测试）。补测过程发现并修复一个真实 bug：orphaned 的人工审核态任务被错误允许重跑（`runner.can_retry_task` 调整审核态拦截顺序）。**假绿治理**：`test_worker_api` 的 git 静默跳过改为 `pytest.skip`；`test_sandbox_integration` 加沙箱可达性门控（不可达时整体 skip 而非报错，`SWARM_RUN_SANDBOX_IT=1` 强制运行）。
 
 ---
 

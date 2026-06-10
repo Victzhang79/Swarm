@@ -29,6 +29,9 @@ class SiliconFlowProvider:
             temperature=temperature,
             timeout=self.config.timeout_seconds,
             max_retries=self.config.max_retries,
+            # streaming=True：取消/断连时 httpx 关闭流式连接，推理服务端(vLLM)
+            # 检测到 client disconnect 即 abort 解码，释放 GPU；非流式则会跑完整段。
+            streaming=True,
         )
 
 
@@ -45,7 +48,10 @@ class LocalProvider:
             api_key=self.config.local_api_key,
             temperature=temperature,
             timeout=self.config.timeout_seconds,
-            max_retries=self.config.max_retries,
+            # 本地小模型：取消后绝不重试（避免取消瞬间又发起新请求继续占 GPU）。
+            max_retries=0,
+            # streaming=True：取消时关闭连接 → vLLM abort 解码序列，立即释放显存。
+            streaming=True,
         )
 
 

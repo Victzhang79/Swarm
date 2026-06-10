@@ -24,6 +24,39 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
+# ── 集成测试门控 ──────────────────────────────────────────
+# 这些是连接真实 CubeSandbox 的集成测试（慢、需外部 infra、会装 pip 包）。
+# 默认在沙箱不可达时整体 skip，避免 (1) 无 infra 时报错噪音 (2) 误判为单元测试。
+# 强制运行：设 SWARM_RUN_SANDBOX_IT=1（CI 的集成阶段用）。
+def _sandbox_reachable() -> bool:
+    import os
+    if os.environ.get("SWARM_RUN_SANDBOX_IT") == "1":
+        return True
+    try:
+        from swarm.config.settings import get_config
+
+        cfg = get_config()
+        api_url = getattr(cfg.sandbox, "api_url", "") or ""
+        if not api_url:
+            return False
+        import httpx
+
+        # 探测 envd/健康端点（短超时，不可达即跳过）
+        base = api_url.rstrip("/")
+        resp = httpx.get(base, timeout=3.0)
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.skipif(
+    not _sandbox_reachable(),
+    reason="CubeSandbox 不可达（设 SWARM_RUN_SANDBOX_IT=1 或配置 sandbox.api_url 后运行集成测试）",
+)
+
+
 def separator(title: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {title}")

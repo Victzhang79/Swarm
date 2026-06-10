@@ -209,16 +209,4 @@ def _format_successes_for_worker(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _format_knowledge_items(items: list[dict]) -> str:
-    """格式化知识条目为可读文本"""
-    if not items:
-        return "（无）"
-    lines = []
-    for i, item in enumerate(items, 1):
-        title = item.get("title", item.get("description", f"条目 {i}"))
-        content = item.get("content", item.get("solution", ""))
-        line = f"  {i}. {title}"
-        if content:
-            line += f"\n     {content[:150]}"
-        lines.append(line)
-    return "\n".join(lines)
+

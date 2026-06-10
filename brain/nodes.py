@@ -64,7 +64,9 @@ _TRIVIAL_HINTS = ("docstring", "注释", "comment", "一行", "typo", "拼写", 
 
 
 def _guess_target_files(task_description: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"[\w./-]+\.(?:py|js|ts|java|go|rs)", task_description)))
+    # 覆盖常见代码 + 文档/配置扩展名（README.md、pyproject.toml 等也要能抓到）
+    pat = r"[\w./-]+\.(?:py|js|jsx|ts|tsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|cs|kt|swift|scala|sh|md|rst|txt|toml|yaml|yml|json|ini|cfg|env|xml|html|css)"
+    return list(dict.fromkeys(re.findall(pat, task_description)))
 
 
 def _heuristic_complexity(task_description: str) -> Complexity | None:
@@ -74,9 +76,25 @@ def _heuristic_complexity(task_description: str) -> Complexity | None:
     return None
 
 
-def _build_simple_plan(task_description: str) -> TaskPlan:
-    files = _guess_target_files(task_description)
-    scope = FileScope(readable=files, writable=files)
+def _build_simple_plan(task_description: str, affected_files: list[str] | None = None) -> TaskPlan:
+    # Scope 解析优先级（确保 scope 既非空又精准）：
+    # 1) 任务描述中【显式点名】的文件（如 "只修改 README.md"）—— 最强信号，
+    #    用户意图明确时，writable 应严格限定为这些文件，避免改到无关文件。
+    # 2) analyze 节点经知识库检索得到的 affected_files —— 作为上下文/回退。
+    explicit = _guess_target_files(task_description)
+    retrieved = [f for f in (affected_files or []) if f]
+
+    if explicit:
+        # 用户点名了文件：writable 只限点名文件；readable 额外纳入检索文件作上下文
+        writable = list(dict.fromkeys(explicit))
+        readable = list(dict.fromkeys(explicit + retrieved))
+    elif retrieved:
+        writable = list(dict.fromkeys(retrieved))
+        readable = writable
+    else:
+        writable = []
+        readable = []
+    scope = FileScope(readable=readable, writable=writable)
     return TaskPlan(
         subtasks=[
             SubTask(
@@ -235,7 +253,7 @@ async def analyze(state: BrainState) -> dict:
             session_metadata=session_prompt,
             sliding_context=sliding_ctx,
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": ANALYZE_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -284,7 +302,7 @@ async def analyze(state: BrainState) -> dict:
     }
 
 
-def plan(state: BrainState) -> dict:
+async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
     输入: task_description, complexity, knowledge_context
@@ -297,8 +315,12 @@ def plan(state: BrainState) -> dict:
     logger.info(f"[PLAN] 拆解任务 (复杂度={complexity.value})")
 
     if complexity == Complexity.SIMPLE:
-        task_plan = _build_simple_plan(task_description)
-        logger.info("[PLAN] SIMPLE 快速路径 — 1 个 trivial 子任务")
+        affected_files = state.get("affected_files") or []
+        task_plan = _build_simple_plan(task_description, affected_files)
+        logger.info(
+            "[PLAN] SIMPLE 快速路径 — 1 个 trivial 子任务 (scope=%d 文件)",
+            len(affected_files),
+        )
         from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 
         task_plan = enrich_plan_with_shared_contract(task_plan)
@@ -338,7 +360,7 @@ def plan(state: BrainState) -> dict:
             recent_tasks=recent_tasks_prompt,
             sliding_context=sliding_ctx,
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": PLAN_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -397,7 +419,7 @@ def plan(state: BrainState) -> dict:
     }
 
 
-def validate_plan(state: BrainState) -> dict:
+async def validate_plan(state: BrainState) -> dict:
     """VALIDATE_PLAN 节点 — PlanValidator 硬校验 + 可选 LLM 补充
 
     输入: plan, task_description, affected_files
@@ -455,7 +477,7 @@ def validate_plan(state: BrainState) -> dict:
             plan_json=plan_json,
             user_profile=_brain_profile_prompt(state),
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -475,27 +497,6 @@ def validate_plan(state: BrainState) -> dict:
         "plan_retry_count": retry_count,
         "plan_validation_issues": [] if plan_valid else ["LLM 计划验证未通过"],
     }
-
-
-def _structural_validate(plan_obj: TaskPlan) -> bool:
-    """计划结构验证（兼容旧调用，委托 PlanValidator）"""
-    from swarm.brain.plan_validator import validate_plan_structure
-
-    return validate_plan_structure(plan_obj).valid
-
-
-def _all_deps(task: SubTask, plan_obj: TaskPlan) -> set[str]:
-    """获取任务的所有（直接+间接）依赖"""
-    deps = set()
-    to_visit = list(task.depends_on)
-    while to_visit:
-        dep_id = to_visit.pop()
-        if dep_id not in deps:
-            deps.add(dep_id)
-            dep_task = next((t for t in plan_obj.subtasks if t.id == dep_id), None)
-            if dep_task:
-                to_visit.extend(dep_task.depends_on)
-    return deps
 
 
 def confirm_plan(state: BrainState) -> dict:
@@ -800,7 +801,7 @@ def monitor(state: BrainState) -> dict:
     return {}
 
 
-def handle_failure(state: BrainState) -> dict:
+async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
     输入: failed_subtask_ids, subtask_results, plan, merge_conflicts
@@ -875,7 +876,7 @@ def handle_failure(state: BrainState) -> dict:
             failure_details=failure_details,
             plan_json=plan_json,
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": HANDLE_FAILURE_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -1263,7 +1264,7 @@ def _try_l2_local_verify(
     return _run_l2_local(project_path, merged_diff, test_cmd, timeout=timeout)
 
 
-def _verify_l2_via_llm(
+async def _verify_l2_via_llm(
     task_description: str,
     merged_diff: str,
     acceptance_criteria: list[str],
@@ -1276,7 +1277,7 @@ def _verify_l2_via_llm(
             merged_diff=merged_diff[:4000],
             acceptance_criteria=json.dumps(acceptance_criteria, ensure_ascii=False),
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": VERIFY_L2_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -1294,7 +1295,7 @@ def _verify_l2_via_llm(
         return False
 
 
-def verify_l2(state: BrainState) -> dict:
+async def verify_l2(state: BrainState) -> dict:
     """VERIFY_L2 节点 — L2 集成测试验证
 
     输入: merged_diff, plan, task_description
@@ -1375,7 +1376,7 @@ def verify_l2(state: BrainState) -> dict:
                 return _l2_failure_state(subtask_results)
             return {"l2_passed": local_result}
 
-    l2_passed = _verify_l2_via_llm(
+    l2_passed = await _verify_l2_via_llm(
         task_description,
         merged_diff,
         acceptance_criteria,
@@ -1407,7 +1408,7 @@ def _l3_failure_state() -> dict:
     }
 
 
-def verify_l3(state: BrainState) -> dict:
+async def verify_l3(state: BrainState) -> dict:
     """VERIFY_L3 节点 — L3 预发/扩展验证（COMPLEX/ULTRA）
 
     输入: merged_diff, complexity, task_description
@@ -1488,7 +1489,7 @@ def verify_l3(state: BrainState) -> dict:
             merged_diff=merged_diff[:4000],
             staging_url=staging_url,
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": VERIFY_L3_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -1580,7 +1581,7 @@ def deliver(state: BrainState) -> dict:
     }
 
 
-def revision(state: BrainState) -> dict:
+async def revision(state: BrainState) -> dict:
     """REVISION 节点 — 根据人工修订反馈生成修订子任务
 
     输入: revision_feedback, merged_diff, task_description, plan
@@ -1601,7 +1602,7 @@ def revision(state: BrainState) -> dict:
             task_description=task_description,
             merged_diff=merged_diff[:4000],
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": REVISION_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])
@@ -1690,7 +1691,7 @@ async def learn_success(state: BrainState) -> dict:
                 merged_diff=merged_diff[:4000],
                 complexity=_complexity_str(complexity),
             )
-            response = llm.invoke([
+            response = await llm.ainvoke([
                 {"role": "system", "content": LEARN_SUCCESS_SYSTEM},
                 {"role": "user", "content": prompt_user},
             ])
@@ -1782,7 +1783,7 @@ async def learn_failure(state: BrainState) -> dict:
             revision_feedback=revision_feedback,
             failed_subtask_ids=failed_ids,
         )
-        response = llm.invoke([
+        response = await llm.ainvoke([
             {"role": "system", "content": LEARN_FAILURE_SYSTEM},
             {"role": "user", "content": prompt_user},
         ])

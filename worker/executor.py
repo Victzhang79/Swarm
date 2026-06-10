@@ -96,6 +96,10 @@ class WorkerExecutor:
         self._agent: dict | None = None
         self._sandbox: Any | None = None
         self._sandbox_manager: Any | None = None
+        # diff 基线/产出快照（difflib 生成 diff 用）。沙箱模式由 _sync_to/from_sandbox 填充，
+        # 本地模式由 _snapshot_scope_local 填充。__init__ 初始化避免本地模式下属性缺失。
+        self._pre_sync_contents: dict[str, str | None] = {}
+        self._post_sync_contents: dict[str, str | None] = {}
 
     def _log(self, message: str) -> None:
         """记录执行日志"""
@@ -139,8 +143,8 @@ class WorkerExecutor:
                     self._sandbox_manager = get_sandbox_manager()
                     self._sandbox = self._sandbox_manager.create(
                         project_id=self.project_id,
-                        task_id=self.subtask.id,
-                        source="worker",
+                        task_id=self.task_id or self.subtask.id,
+                        source=f"worker:{self.subtask.id}",
                     )
                     set_sandbox_context(self._sandbox, self._sandbox_manager)
                     self._log(f"远程沙箱已创建: {self._sandbox.sandbox_id}")
@@ -336,49 +340,134 @@ class WorkerExecutor:
             shared_contract=self.shared_contract,
         )
 
+    def _scope_files(self) -> list[str]:
+        """子任务 scope 内的相对文件清单（readable ∪ writable，去重保序）。"""
+        scope = self.effective_scope
+        files: list[str] = []
+        for f in list(getattr(scope, "readable", []) or []) + list(getattr(scope, "writable", []) or []):
+            rel = str(f).strip()
+            if rel and rel not in files:
+                files.append(rel)
+        return files
+
+    def _writable_files(self) -> list[str]:
+        """子任务可写文件清单（pull-back 范围）。"""
+        out: list[str] = []
+        for f in list(getattr(self.effective_scope, "writable", []) or []):
+            rel = str(f).strip()
+            if rel and rel not in out:
+                out.append(rel)
+        return out
+
+    @staticmethod
+    def _norm_rel(local_root: Path, f: str) -> str:
+        """把 scope 里的文件路径归一化为相对 local_root 的 posix 路径。"""
+        p = Path(f)
+        if p.is_absolute():
+            try:
+                return p.resolve().relative_to(local_root).as_posix()
+            except ValueError:
+                return p.name  # 越界则退化为文件名
+        return p.as_posix().lstrip("/")
+
+    def _snapshot_scope_local(
+        self, local_root: Path, files: list[str] | None = None
+    ) -> dict[str, str | None]:
+        """读取本地文件内容快照，作为 difflib diff 的基线/产出。
+
+        files 为 None 时用 writable scope（diff 只关心可写文件的前后变化）。
+        值为文件文本；不存在的文件记为空串；二进制/不可读记为 None。
+        """
+        rel_files = [
+            self._norm_rel(local_root, f)
+            for f in (files if files is not None else self._writable_files())
+        ]
+        snapshot: dict[str, str | None] = {}
+        for rel in rel_files:
+            lp = local_root / rel
+            try:
+                snapshot[rel] = lp.read_text("utf-8") if lp.is_file() else ""
+            except (UnicodeDecodeError, OSError):
+                snapshot[rel] = None
+        return snapshot
+
     async def _sync_to_sandbox(self, reason: str) -> None:
-        """bootstrap：将本地项目一次性推送到沙箱 /workspace。"""
+        """精准上传：只把子任务 scope 内的文件推送到沙箱 /workspace。
+
+        同时保存上传前内容快照 self._pre_sync_contents，供 difflib 生成 diff。
+        本地执行模式（无沙箱）下仅记录本地快照作为 diff 基线。
+        """
+        local_root = Path(self.project_path).resolve()
+        self._pre_sync_contents = self._snapshot_scope_local(local_root)
         if not self._sandbox or not self._sandbox_manager:
             return
         cfg = get_config()
+
+        rel_files = [self._norm_rel(local_root, f) for f in self._scope_files()]
+        if not rel_files:
+            self._log(f"{reason} scope 为空，跳过文件上传（无目标文件）")
+            return
+
+        # 记录上传前内容快照（用于 diff 基线）
+        for rel in rel_files:
+            lp = (local_root / rel)
+            try:
+                self._pre_sync_contents[rel] = lp.read_text("utf-8") if lp.is_file() else ""
+            except (UnicodeDecodeError, OSError):
+                self._pre_sync_contents[rel] = None  # 二进制/不可读
+
         try:
             sync_stats = await asyncio.to_thread(
-                self._sandbox_manager.sync_project_to_sandbox,
+                self._sandbox_manager.sync_files_to_sandbox,
                 self._sandbox,
-                Path(self.project_path),
+                local_root,
+                rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
             )
             err_count = len(sync_stats.get("errors") or [])
             self._log(
-                f"{reason} 本地→沙箱同步: "
+                f"{reason} 本地→沙箱精准上传: "
                 f"uploaded={sync_stats.get('uploaded', 0)}, "
-                f"skipped={sync_stats.get('skipped', 0)}, "
-                f"errors={err_count}"
+                f"errors={err_count}, files={sync_stats.get('files')}"
             )
             for err in (sync_stats.get("errors") or [])[:5]:
-                self._log(f"同步警告: {err}")
+                self._log(f"上传警告: {err}")
         except Exception as sync_exc:
-            self._log(f"{reason} 本地→沙箱同步失败: {sync_exc}")
+            self._log(f"{reason} 本地→沙箱精准上传失败: {sync_exc}")
 
     async def _sync_from_sandbox(self, reason: str) -> None:
-        """产出 pull-back：将沙箱 /workspace 变更写回本地 project_path。"""
+        """精准拉回：只把子任务可写文件从沙箱拉回本地 project_path。
+
+        拉回内容存入 self._post_sync_contents，供 difflib 生成 diff。
+        本地执行模式（无沙箱）下读取本地 writable 文件当前内容作为产出快照
+        （agent 已直接改本地文件），从而本地模式也能正确产出 diff。
+        """
+        local_root = Path(self.project_path).resolve()
         if not self._sandbox or not self._sandbox_manager:
+            # 本地模式：直接快照本地 writable 文件（agent 已就地修改）
+            self._post_sync_contents = self._snapshot_scope_local(
+                local_root, files=self._writable_files()
+            )
             return
+        self._post_sync_contents = {}
         cfg = get_config()
-        if not cfg.sandbox.sandbox_first:
+        rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
+        if not rel_files:
+            self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
         try:
             sync_stats = await asyncio.to_thread(
-                self._sandbox_manager.sync_sandbox_to_local,
+                self._sandbox_manager.sync_files_from_sandbox,
                 self._sandbox,
-                Path(self.project_path),
+                local_root,
+                rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
             )
+            self._post_sync_contents = sync_stats.get("contents") or {}
             err_count = len(sync_stats.get("errors") or [])
             self._log(
-                f"{reason} 沙箱→本地 pull-back: "
+                f"{reason} 沙箱→本地精准 pull-back: "
                 f"downloaded={sync_stats.get('downloaded', 0)}, "
-                f"skipped={sync_stats.get('skipped', 0)}, "
                 f"errors={err_count}"
             )
             for err in (sync_stats.get("errors") or [])[:5]:
@@ -387,44 +476,59 @@ class WorkerExecutor:
             self._log(f"{reason} 沙箱→本地 pull-back 失败: {sync_exc}")
 
     def _get_git_diff(self) -> str:
-        """优先在沙箱 /workspace 执行 git diff，失败则本地 diff（pull-back 后）。"""
-        if self._sandbox and self._sandbox_manager and get_config().sandbox.sandbox_first:
-            try:
-                workdir = get_config().sandbox.sandbox_remote_workdir
-                code = f"""
-import subprocess
-_r = subprocess.run(['git', 'diff'], cwd={workdir!r}, capture_output=True, text=True, timeout=30)
-print(_r.stdout)
-if _r.stderr:
-    print(_r.stderr, end='')
-"""
-                result = self._sandbox_manager.run_code(self._sandbox, code, timeout=40)
-                if result.success and not result.error:
-                    return result.stdout or "(无变更)"
-                self._log(f"沙箱 git diff 失败，降级本地: {result.error or result.stderr}")
-            except Exception as exc:
-                self._log(f"沙箱 git diff 异常，降级本地: {exc}")
+        """用 difflib 对比上传前快照与拉回后内容生成 unified diff（不依赖 git）。
 
-        import subprocess
+        基线 = _sync_to_sandbox 保存的 _pre_sync_contents；
+        新值 = _sync_from_sandbox 拉回的 _post_sync_contents。
+        二进制文件（值为 None）仅标注变更，不产 diff 文本。
+        """
+        import difflib
 
-        try:
-            diff_result = subprocess.run(
-                ["git", "diff"],
-                cwd=self.project_path,
-                capture_output=True,
-                text=True,
-                timeout=30,
+        pre = getattr(self, "_pre_sync_contents", None) or {}
+        post = getattr(self, "_post_sync_contents", None) or {}
+
+        if not post:
+            return "(无变更)"
+
+        diff_parts: list[str] = []
+        for rel in sorted(post.keys()):
+            new_text = post.get(rel)
+            old_text = pre.get(rel, "")
+            # 二进制文件
+            if new_text is None or old_text is None:
+                if new_text != old_text:
+                    diff_parts.append(f"二进制文件变更: {rel}")
+                continue
+            if old_text == new_text:
+                continue
+            old_lines = old_text.splitlines(keepends=True)
+            new_lines = new_text.splitlines(keepends=True)
+            ud = difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+                lineterm="",
             )
-            return diff_result.stdout or "(无变更)"
-        except Exception:
-            return "(无法获取 git diff)"
+            block = "\n".join(ud)
+            if block.strip():
+                diff_parts.append(block)
+
+        if not diff_parts:
+            return "(无变更)"
+        return "\n".join(diff_parts)
 
     def create_sandbox(self) -> Any:
         """创建远程 CubeSandbox 实例（用于沙箱内代码执行和编译验证）"""
         from swarm.worker.sandbox import get_sandbox_manager
 
         manager = get_sandbox_manager()
-        sandbox = manager.create()
+        # 传 task_id/project_id，使 cancel_task 能按任务 kill_by_task 释放资源
+        sandbox = manager.create(
+            project_id=self.project_id,
+            task_id=self.task_id,
+            source="worker",
+        )
         self._sandbox = sandbox
         self._sandbox_manager = manager
         self._log(f"远程沙箱已创建: {sandbox.sandbox_id}")

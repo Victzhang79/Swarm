@@ -75,9 +75,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from swarm.api._shared import (
-    _parse_since_param,
-)
 from swarm.config.settings import (
     get_config,
 )
@@ -112,22 +109,15 @@ _LOG_FILE = _PROJECT_ROOT / "swarm.log"
 
 
 def _configure_app_logging() -> None:
-    """将 swarm.* 应用日志写入 swarm.log（与 uvicorn 访问日志同文件）"""
-    if getattr(_configure_app_logging, "_done", False):
-        return
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    try:
-        fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
-        fh.setFormatter(fmt)
-        fh.setLevel(logging.INFO)
-        for name in ("swarm", "uvicorn.error"):
-            lg = logging.getLogger(name)
-            lg.setLevel(logging.INFO)
-            if not any(isinstance(h, logging.FileHandler) for h in lg.handlers):
-                lg.addHandler(fh)
-    except OSError as exc:
-        logger.warning("Cannot write app logs to %s: %s", _LOG_FILE, exc)
-    _configure_app_logging._done = True  # type: ignore[attr-defined]
+    """配置应用日志（委托统一日志系统 swarm.logging_config）。
+
+    API 进程由 restart-api.sh 将 stdout/stderr 重定向到 swarm.log，
+    因此这里关闭控制台 handler，避免「console(stderr→文件) + 文件 handler」
+    对同一 swarm.log 双写导致每行日志重复。
+    """
+    from swarm.logging_config import setup_logging
+
+    setup_logging(console=False)
 
 # ═══════════════════════════════════════════════════
 # 启动时初始化 dev_sidecar
@@ -890,18 +880,61 @@ async def get_project_stats(project_id: str):
 
 
 @app.get("/api/notifications", tags=["系统"])
-async def get_notifications(project_id: str | None = None, since: str | None = None):
-    """最近任务事件：完成 / 失败 / 待审核（基于 task_records.updated_at）"""
+async def get_notifications(
+    project_id: str | None = None,
+    include_archived: bool = False,
+    limit: int = 50,
+):
+    """应用内通知列表（持久化、可归档）。默认只返回未归档。"""
     loop = asyncio.get_running_loop()
-    since_dt = _parse_since_param(since)
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
-
     notifications = await loop.run_in_executor(
         None,
-        lambda: store.get_task_notifications(project_id=project_id, since=since_dt),
+        lambda: store.list_notifications(
+            project_id=project_id,
+            include_archived=include_archived,
+            limit=min(limit, 200),
+        ),
     )
-    return {"notifications": notifications}
+    unread = await loop.run_in_executor(
+        None,
+        lambda: store.count_unread_notifications(project_id=project_id),
+    )
+    return {"notifications": notifications, "unread_count": unread}
+
+
+@app.get("/api/notifications/unread_count", tags=["系统"])
+async def get_unread_count(project_id: str | None = None):
+    """未归档通知数（铃铛绿点轮询用，轻量）。"""
+    loop = asyncio.get_running_loop()
+    count = await loop.run_in_executor(
+        None,
+        lambda: store.count_unread_notifications(project_id=project_id),
+    )
+    return {"unread_count": count}
+
+
+@app.post("/api/notifications/{notification_id}/archive", tags=["系统"])
+async def archive_notification_endpoint(notification_id: int):
+    """归档单条通知。"""
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(
+        None,
+        lambda: store.archive_notification(notification_id),
+    )
+    return {"status": "ok", "archived": ok}
+
+
+@app.post("/api/notifications/archive_all", tags=["系统"])
+async def archive_all_notifications_endpoint(project_id: str | None = None):
+    """归档全部未读通知（可选按项目过滤）。"""
+    loop = asyncio.get_running_loop()
+    count = await loop.run_in_executor(
+        None,
+        lambda: store.archive_all_notifications(project_id=project_id),
+    )
+    return {"status": "ok", "archived_count": count}
 
 
 @app.get("/api/milestones", tags=["系统"])
@@ -943,12 +976,36 @@ async def post_milestone_report(body: MilestoneReportBody):
 
 
 # ─── 前端入口 ──────────────────────────────────────
+def _stamp_static_assets(html: str) -> str:
+    """给 index.html 里的本地 /static/ 资源 URL 追加基于文件 mtime 的版本号。
+
+    无构建工具下的缓存失效方案：资源内容变化 → mtime 变化 → URL 变化 →
+    浏览器强制重新拉取。避免用户看到旧 CSS/JS（修改 UI 后必现的陷阱）。
+    """
+    import re as _re
+
+    def _ver(rel_path: str) -> str:
+        try:
+            fp = _static_dir / rel_path.lstrip("/").removeprefix("static/")
+            return str(int(fp.stat().st_mtime))
+        except Exception:
+            return "0"
+
+    def _repl(m: "_re.Match[str]") -> str:
+        attr, url = m.group(1), m.group(2)
+        if url.startswith("/static/") and "?" not in url:
+            return f'{attr}="{url}?v={_ver(url)}"'
+        return m.group(0)
+
+    return _re.sub(r'(href|src)="(/static/[^"]+)"', _repl, html)
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def index():
-    """根路径：提供前端页面"""
+    """根路径：提供前端页面（本地静态资源带 mtime 版本号，自动缓存失效）"""
     index_file = _static_dir / "index.html"
     if index_file.exists():
-        return index_file.read_text(encoding="utf-8")
+        return _stamp_static_assets(index_file.read_text(encoding="utf-8"))
     return HTMLResponse(
         content="""<!DOCTYPE html>
 <html lang="zh-CN">

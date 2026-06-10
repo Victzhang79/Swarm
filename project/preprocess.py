@@ -989,8 +989,15 @@ def _store_vectors_qdrant(
                 "class_name": sym.get("class_name") or "",
             }
             point_id = f"{project_id}:{sym.get('file_path', '')}:{name}:{sym.get('start_line', 0)}"
+            # 用稳定哈希（blake2b）生成 Qdrant point ID。Python 内置 hash() 受
+            # PYTHONHASHSEED 随机化，跨进程不一致，会导致重复预处理时同一符号生成
+            # 不同 point ID、旧向量无法被覆盖而残留。
+            stable_id = int.from_bytes(
+                hashlib.blake2b(point_id.encode("utf-8"), digest_size=8).digest(),
+                "big",
+            ) & 0x7FFFFFFFFFFFFFFF
             points.append(
-                PointStruct(id=hash(point_id) & 0x7FFFFFFFFFFFFFFF, vector=vec, payload=payload)
+                PointStruct(id=stable_id, vector=vec, payload=payload)
             )
 
         client.upsert(collection_name=collection_name, points=points)

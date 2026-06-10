@@ -215,6 +215,10 @@ class SwarmRetriever:
             stats["behavior_error"] = str(exc)
 
         # ── L5/L6: 记忆检索 ───────────────────
+        # 注意：检索是只读操作，不在此处自增 occurrence/reuse 计数。
+        # 原实现每次检索都对 top-5 自增权重，导致"被检索"等同于"被复用"，
+        # 反复检索会人为推高权重、扭曲衰减。真正的复用计数应在模式实际被采纳时
+        # （learn 阶段命中成功模式 / 错题重现）单独触发。
         if self._memory:
             try:
                 mistakes = await self._memory.query_mistakes(
@@ -223,20 +227,6 @@ class SwarmRetriever:
                 successes = await self._memory.query_successes(
                     project_id, task_desc, top_k=5
                 )
-                for m in mistakes:
-                    mid = m.get("id")
-                    if mid is not None:
-                        try:
-                            await self._memory.increment_mistake_occurrence(int(mid))
-                        except Exception as exc:
-                            logger.debug("increment_mistake_occurrence 失败 mid=%s: %s", mid, exc)
-                for s in successes:
-                    sid = s.get("id")
-                    if sid is not None:
-                        try:
-                            await self._memory.increment_success_reuse(int(sid))
-                        except Exception as exc:
-                            logger.debug("increment_success_reuse 失败 sid=%s: %s", sid, exc)
                 context["mistakes"] = mistakes
                 context["successes"] = successes
                 stats["mistakes_count"] = len(mistakes)

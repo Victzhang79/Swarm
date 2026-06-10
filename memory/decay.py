@@ -171,15 +171,31 @@ class MemoryDecay:
         }
 
         async with conn.cursor() as cur:
-            # 批量衰减
-            await cur.execute(
-                """
-                UPDATE mem_mistakes
-                SET decay_weight = decay_weight * %s
-                WHERE decay_weight > 0
-                """,
-                (self.decay_factor,),
-            )
+            # 批量衰减：与逐条 decay_l5 公式保持一致——
+            # occurrence_boost 开启且 occurrence_count>1 时，多次出现的错题衰减更慢
+            # (decay_factor ^ (1/occurrence_count))，否则用平坦 decay_factor。
+            if self.occurrence_boost:
+                await cur.execute(
+                    """
+                    UPDATE mem_mistakes
+                    SET decay_weight = decay_weight * CASE
+                        WHEN COALESCE(occurrence_count, 1) > 1
+                            THEN POWER(%s, 1.0 / COALESCE(occurrence_count, 1))
+                        ELSE %s
+                    END
+                    WHERE decay_weight > 0
+                    """,
+                    (self.decay_factor, self.decay_factor),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE mem_mistakes
+                    SET decay_weight = decay_weight * %s
+                    WHERE decay_weight > 0
+                    """,
+                    (self.decay_factor,),
+                )
             stats["total_updated"] = cur.rowcount
             stats["total_processed"] = cur.rowcount
 
@@ -401,27 +417,3 @@ class MemoryDecay:
             "last_decay_at": self._last_decay_at.isoformat() if self._last_decay_at else None,
         }
 
-    # ── 衰减曲线可视化(可选) ──────────────────
-
-    @staticmethod
-    def project_decay_curve(
-        days: int = 30,
-        decay_factor: float = 0.95,
-        initial_weight: float = 1.0,
-        occurrence_count: int = 1,
-    ) -> list[dict[str, Any]]:
-        """预测衰减曲线(不修改数据)
-
-        返回每天的理论 decay_weight，供调试/可视化。
-        """
-        curve: list[dict[str, Any]] = []
-        weight = initial_weight
-        for day in range(days + 1):
-            effective_factor = decay_factor ** (1.0 / occurrence_count) if occurrence_count > 1 else decay_factor
-            curve.append({
-                "day": day,
-                "weight": round(weight, 4),
-                "effective_factor": round(effective_factor, 4),
-            })
-            weight *= effective_factor
-        return curve

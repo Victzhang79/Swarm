@@ -21,6 +21,8 @@ function toggleSettings() {
   const overlay = $('settings-overlay');
   const open = drawer.classList.toggle('open');
   overlay.classList.toggle('open', open);
+  // 抽屉打开时刷新孤儿沙箱数（全局运维，不跟项目）
+  if (open && typeof refreshOrphanCount === 'function') refreshOrphanCount();
 }
 
 // ─── Add Project Modal ─────────────────────────────────────
@@ -79,20 +81,6 @@ function tryShowLearnNotice(data) {
 }
 
 // ─── Pipeline & Logs ───────────────────────────────────────
-
-function showNotificationBanner(count) {
-  const banner = $('stats-banner');
-  if (!banner) return;
-  banner.classList.remove('hidden');
-  banner.innerHTML = `
-    <span>${count} 条新通知</span>
-    <button class="btn btn-ghost btn-sm" onclick="dismissNotificationBanner()">知道了</button>`;
-}
-
-function dismissNotificationBanner() {
-  const banner = $('stats-banner');
-  if (banner) banner.classList.add('hidden');
-}
 
 async function maybeShowBrowserNotifications(items) {
   if (!items.length || !document.hidden) return;

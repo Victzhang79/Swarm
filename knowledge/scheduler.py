@@ -30,12 +30,21 @@ async def start_kb_update_scheduler(*, interval_seconds: int = 5) -> None:
     _polling_started = True
 
     async def _loop() -> None:
+        # 每 N 个轮询周期尝试补处理一次暂存的 embedding（服务恢复后自动追赶）。
+        # 默认 12 周期 × 5s = 60s 一次，避免 embedding 服务持续不可用时空转刷日志。
+        retry_every = 12
+        cycle = 0
         while True:
             try:
                 updater = await get_shared_updater()
                 processed = await updater.process_pending_events()
                 if processed:
                     logger.info("[KBScheduler] processed %d queued events", processed)
+                cycle += 1
+                if cycle % retry_every == 0:
+                    recovered = await updater.retry_pending_embeddings()
+                    if recovered:
+                        logger.info("[KBScheduler] 补处理 %d 个暂存 embedding", recovered)
             except Exception as exc:
                 logger.exception("[KBScheduler] polling error: %s", exc)
             await asyncio.sleep(interval_seconds)

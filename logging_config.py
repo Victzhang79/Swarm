@@ -1,0 +1,330 @@
+"""Swarm 统一日志系统。
+
+设计目标（替代散落在 api/app.py 的临时配置）：
+- 单一入口 setup_logging()，API / CLI / 脚本 / cron 都可调用，幂等
+- 配置驱动（AppConfig.log_*）：级别、文件、轮转、JSON、控制台
+- 轮转文件处理器（RotatingFileHandler）——修复 swarm.log 无限增长
+- task_id / subtask_id 上下文（contextvar + filter）——并发任务日志可追踪
+- 可选 JSON 结构化输出——便于 ELK / Loki 等日志聚合
+
+用法：
+    from swarm.logging_config import setup_logging, bind_task
+    setup_logging()                      # 进程启动时调用一次
+    with bind_task("task-123"):          # Brain/Worker 执行期绑定 task_id
+        logger.info("...")               # 该作用域内所有日志自动带 task_id
+"""
+
+from __future__ import annotations
+
+import contextvars
+import json
+import logging
+import logging.handlers
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+# ── task 上下文（跨协程传播）─────────────────────────────
+_task_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("swarm_task_id", default="")
+_subtask_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("swarm_subtask_id", default="")
+
+_LOGGED_TEXT_FMT = "%(asctime)s [%(levelname)s] %(name)s%(task_suffix)s: %(message)s"
+
+
+class _ContextFilter(logging.Filter):
+    """把当前 task_id/subtask_id 注入每条 record，供格式化使用。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        tid = _task_id_var.get("")
+        sid = _subtask_id_var.get("")
+        record.task_id = tid
+        record.subtask_id = sid
+        # 文本格式用的可读后缀，无 task 时为空
+        if tid and sid:
+            record.task_suffix = f" [task={tid[:8]} sub={sid}]"
+        elif tid:
+            record.task_suffix = f" [task={tid[:8]}]"
+        else:
+            record.task_suffix = ""
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    """结构化 JSON 行：每条日志一行 JSON，含 task 上下文。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if getattr(record, "task_id", ""):
+            payload["task_id"] = record.task_id
+        if getattr(record, "subtask_id", ""):
+            payload["subtask_id"] = record.subtask_id
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+# 幂等标记（同一进程多次调用只配置一次，除非 force）
+_configured = False
+
+
+def setup_logging(*, force: bool = False, console: bool | None = None) -> None:
+    """配置 swarm 根 logger（幂等）。从 AppConfig.log_* 读取参数。
+
+    在所有进程入口调用：API on_startup、CLI 入口、scripts/init_db、cron 任务。
+
+    console: 覆盖 AppConfig.log_console。API 进程传 False（其 stdout/stderr
+    已被 shell 重定向到 swarm.log，再开 console 会对同一文件双写）。
+    """
+    global _configured
+    if _configured and not force:
+        return
+
+    from swarm.config.settings import PROJECT_ROOT, get_config
+
+    cfg = get_config()
+    level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
+    use_console = cfg.log_console if console is None else console
+
+    swarm_logger = logging.getLogger("swarm")
+    swarm_logger.setLevel(level)
+    # 清掉旧 handler（force 重配 / 替换 api/app.py 旧的临时 FileHandler / 防重复挂载）。
+    # 用 sentinel 标记本模块挂的 handler，避免与第三方(uvicorn)的 handler 冲突。
+    for h in list(swarm_logger.handlers):
+        if getattr(h, "_swarm_managed", False):
+            swarm_logger.removeHandler(h)
+            h.close()
+        else:
+            swarm_logger.removeHandler(h)
+
+    ctx_filter = _ContextFilter()
+    if cfg.log_json:
+        formatter: logging.Formatter = _JsonFormatter()
+    else:
+        formatter = logging.Formatter(_LOGGED_TEXT_FMT)
+
+    handlers: list[logging.Handler] = []
+
+    # 控制台 handler
+    if use_console:
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(formatter)
+        ch.addFilter(ctx_filter)
+        ch._swarm_managed = True  # type: ignore[attr-defined]
+        handlers.append(ch)
+
+    # 轮转文件 handler
+    if cfg.log_file:
+        log_path = Path(cfg.log_file)
+        if not log_path.is_absolute():
+            log_path = PROJECT_ROOT / log_path
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=cfg.log_max_bytes,
+                backupCount=cfg.log_backup_count,
+                encoding="utf-8",
+            )
+            fh.setLevel(level)
+            fh.setFormatter(formatter)
+            fh.addFilter(ctx_filter)
+            fh._swarm_managed = True  # type: ignore[attr-defined]
+            handlers.append(fh)
+        except OSError as exc:
+            # 文件不可写不应致命，控制台仍可用
+            logging.getLogger(__name__).warning(
+                "无法写日志文件 %s: %s（仅控制台输出）", log_path, exc
+            )
+
+    for h in handlers:
+        swarm_logger.addHandler(h)
+    # 不向 root 传播，避免与 uvicorn / pytest 的 root handler 重复打印
+    swarm_logger.propagate = False
+
+    # 让 uvicorn.error 也写进同一文件（与历史行为一致）
+    uvicorn_logger = logging.getLogger("uvicorn.error")
+    for h in handlers:
+        if isinstance(h, logging.handlers.RotatingFileHandler) and not any(
+            isinstance(eh, logging.handlers.RotatingFileHandler)
+            for eh in uvicorn_logger.handlers
+        ):
+            uvicorn_logger.addHandler(h)
+
+    _configured = True
+
+
+@contextmanager
+def bind_task(task_id: str, subtask_id: str = "") -> Iterator[None]:
+    """在作用域内绑定 task_id（含 subtask_id），该域内所有 swarm 日志自动携带。
+
+    用 contextvars，跨 async 任务安全传播；退出作用域自动还原。
+    """
+    t_token = _task_id_var.set(task_id or "")
+    s_token = _subtask_id_var.set(subtask_id or "")
+    try:
+        yield
+    finally:
+        _task_id_var.reset(t_token)
+        _subtask_id_var.reset(s_token)
+
+
+def set_task_context(task_id: str, subtask_id: str = "") -> None:
+    """非上下文管理器形式绑定（如无法用 with 的回调里）。不会自动还原。"""
+    _task_id_var.set(task_id or "")
+    _subtask_id_var.set(subtask_id or "")
+
+
+def clear_task_context() -> None:
+    _task_id_var.set("")
+    _subtask_id_var.set("")
+
+
+def current_task_id() -> str:
+    return _task_id_var.get("")
+
+
+def resolve_log_path() -> "Path | None":
+    """返回当前配置的日志文件绝对路径（无文件日志时 None）。"""
+    from swarm.config.settings import PROJECT_ROOT, get_config
+
+    cfg = get_config()
+    if not cfg.log_file:
+        return None
+    p = Path(cfg.log_file)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p
+
+
+def read_task_logs(task_id: str, *, limit: int = 500, tail_scan: int = 200_000) -> list[str]:
+    """从日志文件中提取某 task 的日志行（按 [task=<前8位>] 前缀过滤）。
+
+    - task_id: 完整 task_id，内部用前 8 位匹配（与 _ContextFilter 前缀一致）
+    - limit: 最多返回的行数（取最新 limit 行）
+    - tail_scan: 只扫描文件末尾这么多字节，避免大日志全量读
+
+    返回时间顺序（旧→新）的日志行列表；文件不存在或无匹配返回空列表。
+    JSON 模式下匹配 "task_id": "<完整id>"。
+    """
+    path = resolve_log_path()
+    if not path or not path.exists():
+        return []
+
+    short = (task_id or "")[:8]
+    if not short:
+        return []
+    text_marker = f"[task={short}"      # 文本格式前缀
+    json_marker = f'"task_id": "{task_id}"'  # JSON 格式字段
+
+    matched: list[str] = []
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > tail_scan:
+                f.seek(size - tail_scan)
+                f.readline()  # 丢弃可能被截断的半行
+            chunk = f.read().decode("utf-8", errors="replace")
+        for line in chunk.splitlines():
+            if text_marker in line or json_marker in line:
+                matched.append(line)
+    except OSError:
+        return []
+
+    if len(matched) > limit:
+        matched = matched[-limit:]
+    return matched
+
+
+def iter_task_log_tail(task_id: str, *, from_end_bytes: int = 50_000):
+    """生成器：先吐已有匹配行（末尾 from_end_bytes 内），再持续 tail 新增匹配行。
+
+    用于 SSE 实时流。每次 yield 一行（已 rstrip）。调用方负责节流/sleep 与
+    连接断开处理。不触发任何任务执行——纯文件读。
+
+    轮转处理：检测到文件 inode 变化（RotatingFileHandler 滚动）时重新打开。
+    """
+    poller = TaskLogPoller(task_id, from_end_bytes=from_end_bytes)
+    import time as _time
+
+    while True:
+        batch = poller.poll()
+        if batch:
+            yield from batch
+        else:
+            _time.sleep(1.0)
+
+
+class TaskLogPoller:
+    """非阻塞日志轮询器：每次 poll() 返回自上次以来的新匹配行（可能为空）。
+
+    适合 SSE：异步层控制节流，不在工作线程里 sleep（避免线程泄漏）。
+    """
+
+    def __init__(self, task_id: str, *, from_end_bytes: int = 50_000) -> None:
+        import os
+
+        self.task_id = task_id
+        self.short = (task_id or "")[:8]
+        self.text_marker = f"[task={self.short}"
+        self.json_marker = f'"task_id": "{task_id}"'
+        self.path = resolve_log_path()
+        self.pos = 0
+        self.inode = None
+        self._primed = False
+        self._from_end = from_end_bytes
+        self._os = os
+
+    def _match(self, line: str) -> bool:
+        return bool(self.short) and (self.text_marker in line or self.json_marker in line)
+
+    def _prime(self) -> list[str]:
+        """首次：读末尾 from_end_bytes 的已有匹配行，并把 pos 定位到文件末尾。"""
+        out: list[str] = []
+        if not self.path or not self.path.exists():
+            return out
+        try:
+            size = self.path.stat().st_size
+            with open(self.path, "rb") as f:
+                if size > self._from_end:
+                    f.seek(size - self._from_end)
+                    f.readline()
+                for raw in f.read().decode("utf-8", errors="replace").splitlines():
+                    if self._match(raw):
+                        out.append(raw)
+                self.pos = f.tell()
+            self.inode = self._os.stat(self.path).st_ino
+        except OSError:
+            pass
+        return out
+
+    def poll(self) -> list[str]:
+        """返回自上次以来的新匹配行（首次含尾部回放）。无新增返回空列表。"""
+        if not self._primed:
+            self._primed = True
+            return self._prime()
+        if not self.path or not self.path.exists():
+            return []
+        out: list[str] = []
+        try:
+            cur_inode = self._os.stat(self.path).st_ino
+            if self.inode is not None and cur_inode != self.inode:
+                self.pos = 0  # 轮转，从头读新文件
+                self.inode = cur_inode
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                chunk = f.read()
+                self.pos = f.tell()
+            if chunk:
+                for raw in chunk.decode("utf-8", errors="replace").splitlines():
+                    if self._match(raw):
+                        out.append(raw)
+        except OSError:
+            pass
+        return out
+

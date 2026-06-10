@@ -91,7 +91,23 @@ CREATE TABLE IF NOT EXISTS milestone_reports (
 CREATE INDEX IF NOT EXISTS idx_milestone_project ON milestone_reports(project_id, created_at DESC);
 """
 
-ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL]
+# 应用内通知（持久化、可归档）。区别于 api/notify.py 的外部 webhook。
+NOTIFICATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS notifications (
+    id SERIAL PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    task_id TEXT,
+    project_id TEXT,
+    title TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    archived BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_archived ON notifications(archived, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_project ON notifications(project_id, created_at DESC);
+"""
+
+ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL, NOTIFICATIONS_DDL]
 
 # 幂等列迁移（已有库 ADD COLUMN IF NOT EXISTS）
 _TASK_RECORDS_MIGRATIONS = [
@@ -395,6 +411,37 @@ def create_task(
     return _row_to_task(row)
 
 
+def find_active_duplicate_task(
+    project_id: str,
+    description: str,
+    conn_str: str | None = None,
+) -> dict[str, Any] | None:
+    """查找同项目内「描述相同且仍在进行（非终态）」的任务，用于创建去重。
+
+    终态(DONE/FAILED/CANCELLED)不算重复——允许对历史任务重新发起。
+    描述做 trim + 大小写无关比较。无匹配返回 None。
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return None
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_TASK_SELECT}
+                FROM task_records
+                WHERE project_id = %s
+                  AND LOWER(BTRIM(description)) = LOWER(%s)
+                  AND status <> ALL(%s)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (project_id, desc, list(_TERMINAL_STATUSES)),
+            )
+            row = cur.fetchone()
+    return _row_to_task(row) if row else None
+
+
 def get_task(task_id: str, conn_str: str | None = None) -> dict[str, Any] | None:
     """按 ID 查询任务"""
     with _get_conn(conn_str) as conn:
@@ -544,10 +591,20 @@ def _get_learning_effectiveness(
     project_id: str,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
-    """对比 mem_mistakes 近 30 天 vs 前 30 天数量，判断学习趋势"""
+    """学习趋势：综合 mem_mistakes（错题）与 mem_successes（成功模式）。
+
+    趋势判定（优先级从上到下）：
+      - improving: 近30天错题数 < 前30天，或（无历史错题但已积累成功模式）
+      - stable:    近30天错题数 与前30天持平
+      - regressing: 近30天错题数 > 前30天
+      - learning:  尚无任何错题但已有成功模式（健康冷启动）
+      - unknown:   完全无数据（错题+成功都为 0）
+    """
     default: dict[str, Any] = {
         "recent_mistakes": 0,
         "prior_mistakes": 0,
+        "recent_successes": 0,
+        "total_successes": 0,
         "trend": "unknown",
     }
     try:
@@ -572,18 +629,43 @@ def _get_learning_effectiveness(
                     (project_id,),
                 )
                 prior = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM mem_successes
+                    WHERE project_id = %s
+                      AND created_at >= NOW() - INTERVAL '30 days'
+                    """,
+                    (project_id,),
+                )
+                recent_succ = int(cur.fetchone()[0])
+                cur.execute(
+                    "SELECT COUNT(*) FROM mem_successes WHERE project_id = %s",
+                    (project_id,),
+                )
+                total_succ = int(cur.fetchone()[0])
     except Exception as exc:
         logger.debug("learning_effectiveness unavailable: %s", exc)
         return default
 
-    if recent == 0 and prior == 0:
-        trend = "unknown"
+    # 趋势判定：错题变化为主信号，成功模式作为「健康冷启动」补充
+    if recent == 0 and prior == 0 and total_succ == 0:
+        trend = "unknown"          # 完全无数据
+    elif recent == 0 and prior == 0 and total_succ > 0:
+        trend = "learning"         # 无错题、有成功积累 → 健康
     elif recent < prior:
-        trend = "improving"
+        trend = "improving"        # 错题减少
+    elif recent > prior:
+        trend = "regressing"       # 错题增多
     else:
-        trend = "stable"
+        trend = "stable"           # 持平
 
-    return {"recent_mistakes": recent, "prior_mistakes": prior, "trend": trend}
+    return {
+        "recent_mistakes": recent,
+        "prior_mistakes": prior,
+        "recent_successes": recent_succ,
+        "total_successes": total_succ,
+        "trend": trend,
+    }
 
 
 def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -> dict[str, Any]:
@@ -664,6 +746,10 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
             recent_rows = cur.fetchall()
 
     accept_rate = round(approved / completed, 4) if completed else None
+    # 合并率/成功率：DONE 占所有终态任务（DONE+FAILED+CANCELLED）的比例。
+    # 区别于 accept_rate（只在 DONE 内部算人工通过比例，分母不含失败 → 会误导）。
+    terminal_total = (completed or 0) + (failed or 0) + (cancelled or 0)
+    merge_rate = round(completed / terminal_total, 4) if terminal_total else None
 
     recent_tasks = [
         {
@@ -687,6 +773,7 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
         "cancelled": cancelled,
         "approved": approved,
         "accept_rate": accept_rate,
+        "merge_rate": merge_rate,
         "avg_duration_seconds": round(avg_duration, 2) if avg_duration is not None else None,
         "total_tokens": total_tokens,
         "avg_tokens": avg_tokens,
@@ -760,6 +847,144 @@ def _notification_message(status: str, description: str) -> str:
     if status in ("CONFIRMING", "DELIVERING"):
         return f"待审核: {short}"
     return short
+
+
+# ──────────────────────────────────────────────
+# 应用内通知 CRUD（持久化 notifications 表）
+# ──────────────────────────────────────────────
+
+def create_notification(
+    event_type: str,
+    *,
+    task_id: str | None = None,
+    project_id: str | None = None,
+    title: str = "",
+    message: str = "",
+    conn_str: str | None = None,
+) -> dict[str, Any]:
+    """写入一条应用内通知，返回完整记录。失败不抛出（通知非关键路径）。"""
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO notifications
+                        (event_type, task_id, project_id, title, message)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id, event_type, task_id, project_id,
+                              title, message, archived, created_at
+                    """,
+                    (event_type, task_id, project_id, title, message),
+                )
+                row = cur.fetchone()
+        return _row_to_notification(row)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("create_notification failed: %s", exc)
+        return {}
+
+
+def list_notifications(
+    *,
+    project_id: str | None = None,
+    include_archived: bool = False,
+    limit: int = 50,
+    conn_str: str | None = None,
+) -> list[dict[str, Any]]:
+    """列出通知，默认只返回未归档，按时间倒序。"""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if not include_archived:
+        conditions.append("archived = FALSE")
+    if project_id:
+        conditions.append("project_id = %s")
+        params.append(project_id)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, event_type, task_id, project_id,
+                       title, message, archived, created_at
+                FROM notifications
+                {where}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [_row_to_notification(r) for r in rows]
+
+
+def count_unread_notifications(
+    *,
+    project_id: str | None = None,
+    conn_str: str | None = None,
+) -> int:
+    """未归档通知数（铃铛绿点用）。"""
+    conditions = ["archived = FALSE"]
+    params: list[Any] = []
+    if project_id:
+        conditions.append("project_id = %s")
+        params.append(project_id)
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM notifications WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def archive_notification(
+    notification_id: int,
+    conn_str: str | None = None,
+) -> bool:
+    """归档单条通知，返回是否命中。"""
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE notifications SET archived = TRUE WHERE id = %s AND archived = FALSE",
+                (notification_id,),
+            )
+            return cur.rowcount > 0
+
+
+def archive_all_notifications(
+    *,
+    project_id: str | None = None,
+    conn_str: str | None = None,
+) -> int:
+    """归档全部（可选按项目过滤），返回归档条数。"""
+    conditions = ["archived = FALSE"]
+    params: list[Any] = []
+    if project_id:
+        conditions.append("project_id = %s")
+        params.append(project_id)
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE notifications SET archived = TRUE WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            return cur.rowcount
+
+
+def _row_to_notification(row: Any) -> dict[str, Any]:
+    if not row:
+        return {}
+    return {
+        "id": row[0],
+        "event_type": row[1],
+        "task_id": row[2],
+        "project_id": row[3],
+        "title": row[4],
+        "message": row[5],
+        "archived": bool(row[6]),
+        "created_at": _serialize_dt(row[7]),
+    }
 
 
 # ──────────────────────────────────────────────

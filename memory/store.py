@@ -338,30 +338,6 @@ class MemoryStore:
             row = await cur.fetchone()
         return row[0]
 
-    async def write_mistake_with_vector(
-        self, project_id: str, entry: MistakeEntry, vector: list[float]
-    ) -> int:
-        """写入错题并附带向量(pgvector 格式)"""
-        conn = self._conn_or_raise()
-        vector_str = _vector_to_pg(vector)
-
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO mem_mistakes
-                    (project_id, task_id, error_type, description, context,
-                     fix_description, embedding, metadata_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)
-                RETURNING id
-                """,
-                (project_id, entry.task_id, entry.error_type, entry.description,
-                 entry.context, entry.fix_description,
-                 vector_str,
-                 psycopg.types.json.Jsonb(entry.metadata)),
-            )
-            row = await cur.fetchone()
-        return row[0]
-
     async def query_mistakes(
         self,
         project_id: str,

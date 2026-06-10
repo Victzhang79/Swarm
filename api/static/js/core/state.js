@@ -57,9 +57,34 @@ const ACTIVE_STATUSES = new Set([
   'IN_REVISION', 'LEARNING_SUCCESS', 'LEARNING_FAILURE',
 ]);
 
+// 任务状态 → 当前所处的 pipeline 阶段（用于选中任务时回放进度，不依赖实时 SSE）。
+// 值为该状态对应「正在进行」的 pipeline 节点；其之前的节点都标记为 done。
+const STATUS_TO_PIPELINE_NODE = {
+  SUBMITTED: 'analyze',
+  ANALYZING: 'analyze',
+  PLANNING: 'plan',
+  VALIDATING_PLAN: 'plan',
+  CONFIRMING: 'plan',
+  DISPATCHING: 'dispatch',
+  MONITORING: 'dispatch',
+  HANDLING_FAILURE: 'dispatch',
+  IN_REVISION: 'dispatch',
+  MERGING: 'merge',
+  VERIFYING_L2: 'verify',
+  DELIVERING: 'deliver',
+  LEARNING_SUCCESS: 'learn',
+  LEARNING_FAILURE: 'learn',
+};
+
+// 终态：全部 7 步亮起（done）或失败定位。
+const TERMINAL_DONE_STATUSES = new Set(['DONE']);
+const TERMINAL_FAIL_STATUSES = new Set(['FAILED', 'CANCELLED']);
+
 // ─── State ───────────────────────────────────────────────
 
 let statusInterval = null;
+
+let pollersStarted = false;
 
 let taskEventSource = null;
 
@@ -103,7 +128,9 @@ let workerLastDiff = '';
 
 let systemStatsInterval = null;
 
-let lastSystemPollAt = null;
+// 通知铃铛状态
+let notifPanelOpen = false;
+let notifUnreadCount = 0;
 
 const PROJECT_STORAGE_KEY = 'swarm_selected_project_id';
 

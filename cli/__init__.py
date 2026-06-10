@@ -46,7 +46,13 @@ def _auth_headers(extra: dict | None = None) -> dict:
 @click.version_option(version="0.1.0", prog_name="swarm")
 def main():
     """🐝 Swarm — 蜂群 AI 编程智能体系统"""
-    pass
+    # 统一日志（CLI 本地执行 worker/check 等命令时也走轮转文件 + task 上下文）
+    try:
+        from swarm.logging_config import setup_logging
+
+        setup_logging()
+    except Exception:
+        pass
 
 
 @main.command()

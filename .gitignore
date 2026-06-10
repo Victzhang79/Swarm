@@ -27,6 +27,7 @@ wheels/
 qdrant.log
 swarm.log
 *.log
+*.log.*
 snapshots/
 workspace/
 

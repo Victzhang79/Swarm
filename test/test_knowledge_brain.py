@@ -80,7 +80,7 @@ async def _test_analyze_retrieval_async():
     with patch("swarm.brain.nodes._get_brain_llm") as mock_llm:
         mock_response = MagicMock()
         mock_response.content = '{"complexity": "simple", "reasoning": "test", "key_risks": [], "suggested_subtask_count": 1}'
-        mock_llm.return_value.invoke.return_value = mock_response
+        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
 
         with patch(
             "swarm.knowledge.service.retrieve_knowledge",
@@ -150,7 +150,7 @@ async def _test_learn_persist_async():
             "pattern_description": "描述",
             "applicable_scenarios": ["场景"],
         })
-        mock_llm.return_value.invoke.return_value = mock_response
+        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
 
         with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
             out = await learn_success({**state, "merged_diff": "diff"})

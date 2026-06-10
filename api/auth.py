@@ -38,6 +38,10 @@ def _extract_token(request: Request) -> str:
         auth = request.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
+    # 兜底：浏览器原生 EventSource(SSE) 无法携带自定义请求头，
+    # 故 SSE 端点通过 query param ?token= 传递（header 优先级更高）。
+    if not provided:
+        provided = request.query_params.get("token") or ""
     return provided.strip()
 
 

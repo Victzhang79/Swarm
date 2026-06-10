@@ -16,6 +16,14 @@ function authHeaders(extra) {
   return h;
 }
 
+// SSE 专用：浏览器原生 EventSource 无法携带自定义请求头，
+// 故把 token 作为 query param 附加到 URL（后端 _extract_token 兜底解析）。
+function sseUrl(path) {
+  const t = getAuthToken();
+  if (!t) return path;
+  return path + (path.indexOf('?') === -1 ? '?' : '&') + 'token=' + encodeURIComponent(t);
+}
+
 function installAuthFetch() {
   const nativeFetch = window.fetch.bind(window);
   window.fetch = function swarmFetch(url, opts) {
@@ -102,7 +110,9 @@ async function submitLogin() {
     hideLoginModal();
     updateAuthUI();
     showToast('欢迎，' + (currentUser.display_name || currentUser.username), 'success');
-    await loadProjects();
+    // 登录成功：触发首屏加载（与 init() 已登录路径一致）
+    if (typeof startInitialLoad === 'function') startInitialLoad();
+    else await loadProjects();
     if (selectedProjectId && currentTab === 'memory') {
       loadAllMemories(selectedProjectId);
     }

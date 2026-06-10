@@ -68,7 +68,7 @@ async def _test_learn_after_accept_writes_memory_async():
             "pattern_description": "列表排序实现",
             "applicable_scenarios": ["CRUD 列表"],
         })
-        mock_llm.return_value.invoke.return_value = mock_response
+        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
 
         with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
             out = await learn_success(state)

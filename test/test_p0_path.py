@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
@@ -33,7 +34,7 @@ def test_after_validate_exhausted_routes_confirm():
 
 
 def test_handle_failure_l2_replan():
-    out = handle_failure({"verification_failure": "l2", "failed_subtask_ids": ["st-1"]})
+    out = asyncio.run(handle_failure({"verification_failure": "l2", "failed_subtask_ids": ["st-1"]}))
     assert out["failure_strategy"] == "replan"
     assert out.get("verification_failure") is None
 
@@ -55,7 +56,7 @@ def test_verify_l3_push_before_pipeline():
         "swarm.brain.l3_gitlab.trigger_and_poll_pipeline",
         return_value=(True, "ok"),
     ) as mock_trigger:
-        out = verify_l3(state)
+        out = asyncio.run(verify_l3(state))
         mock_push.assert_called_once()
         mock_trigger.assert_called_once()
         assert mock_trigger.call_args.kwargs.get("ref") == "swarm/l3-task-abc"

@@ -127,7 +127,8 @@ def test_notifications_endpoint():
     from swarm.api.app import app
 
     with patch("swarm.api.app.store") as mock_store:
-        mock_store.get_task_notifications.return_value = MOCK_NOTIFICATIONS
+        mock_store.list_notifications.return_value = MOCK_NOTIFICATIONS
+        mock_store.count_unread_notifications.return_value = 1
         client = TestClient(app)
         resp = client.get("/api/notifications")
         assert resp.status_code == 200, resp.text
@@ -135,18 +136,41 @@ def test_notifications_endpoint():
         assert "notifications" in data
         assert len(data["notifications"]) == 1
         assert data["notifications"][0]["event_type"] == "task_completed"
-        mock_store.get_task_notifications.assert_called_once()
+        assert data["unread_count"] == 1
+        mock_store.list_notifications.assert_called_once()
     print("  ✅ GET /api/notifications")
 
 
-def test_notifications_invalid_since():
+def test_notifications_unread_count():
     from fastapi.testclient import TestClient
     from swarm.api.app import app
 
-    client = TestClient(app)
-    resp = client.get("/api/notifications?since=not-a-date")
-    assert resp.status_code == 400
-    print("  ✅ GET /api/notifications rejects invalid since")
+    with patch("swarm.api.app.store") as mock_store:
+        mock_store.count_unread_notifications.return_value = 3
+        client = TestClient(app)
+        resp = client.get("/api/notifications/unread_count")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["unread_count"] == 3
+    print("  ✅ GET /api/notifications/unread_count")
+
+
+def test_notifications_archive():
+    from fastapi.testclient import TestClient
+    from swarm.api.app import app
+
+    with patch("swarm.api.app.store") as mock_store:
+        mock_store.archive_notification.return_value = True
+        mock_store.archive_all_notifications.return_value = 5
+        client = TestClient(app)
+        resp = client.post("/api/notifications/42/archive")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived"] is True
+        mock_store.archive_notification.assert_called_once_with(42)
+
+        resp = client.post("/api/notifications/archive_all")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived_count"] == 5
+    print("  ✅ POST /api/notifications/{id}/archive + archive_all")
 
 
 if __name__ == "__main__":
@@ -154,5 +178,6 @@ if __name__ == "__main__":
     test_stats_scoped_to_project()
     test_stats_unknown_project_404()
     test_notifications_endpoint()
-    test_notifications_invalid_since()
+    test_notifications_unread_count()
+    test_notifications_archive()
     print("\nAll Phase 5 stats API tests passed.")

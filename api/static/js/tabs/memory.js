@@ -5,10 +5,16 @@ function learningTrendBadge(trend) {
   if (trend === 'improving') {
     return '<span class="pill pill-green" title="近 30 天错题少于前 30 天">改善中</span>';
   }
-  if (trend === 'stable') {
-    return '<span class="pill pill-amber" title="错题数量持平或上升">稳定</span>';
+  if (trend === 'learning') {
+    return '<span class="pill pill-teal" title="暂无错题，已积累成功模式（健康）">学习中</span>';
   }
-  return '<span class="pill pill-gray" title="数据不足">未知</span>';
+  if (trend === 'stable') {
+    return '<span class="pill pill-amber" title="近 30 天错题与前 30 天持平">稳定</span>';
+  }
+  if (trend === 'regressing') {
+    return '<span class="pill pill-red" title="近 30 天错题多于前 30 天">退步</span>';
+  }
+  return '<span class="pill pill-gray" title="暂无任务数据">未知</span>';
 }
 
 function loadAllMemories(projectId) {

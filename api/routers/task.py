@@ -27,6 +27,7 @@ class TaskCreateRequest(BaseModel):
     description: str = Field(description="任务描述")
     auto_accept: bool = Field(default=False, description="自动通过审核（E2E/演示）")
     priority: str = Field(default="normal", description="队列优先级: urgent / normal / background")
+    force: bool = Field(default=False, description="跳过重复检测，强制新建（即使有同描述的进行中任务）")
 
 
 class TaskReviseRequest(BaseModel):
@@ -79,6 +80,24 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
             detail=reason or "项目知识库未就绪，请先完成预处理",
         )
 
+    # 去重：同项目内已有「相同描述 + 进行中（非终态）」任务时，默认不重复创建，
+    # 直接复用并返回已有任务（避免误触/重复提交建出多个一样的任务）。
+    # force=true 可显式绕过。终态任务不算重复，允许重新发起。
+    if not req.force:
+        dup = await loop.run_in_executor(
+            None,
+            lambda: _app.store.find_active_duplicate_task(project_id, req.description),
+        )
+        if dup:
+            return {
+                "status": "duplicate",
+                "task": dup,
+                "message": (
+                    f"已存在进行中的同描述任务（#{str(dup.get('id'))[:8]}，"
+                    f"状态 {dup.get('status')}）。如需强制新建请用 force=true。"
+                ),
+            }
+
     task_id = str(uuid.uuid4())
     try:
         task = await loop.run_in_executor(
@@ -106,6 +125,20 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
         task_id, project_id, req.description,
         auto_accept=req.auto_accept, priority=priority,
     )
+
+    # 应用内通知：任务已建立（带 task_id）
+    short = (req.description or "")[:80]
+    await loop.run_in_executor(
+        None,
+        lambda: _app.store.create_notification(
+            "task_created",
+            task_id=task_id,
+            project_id=project_id,
+            title="任务已建立",
+            message=f"#{task_id[:8]} {short}",
+        ),
+    )
+
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     return {"status": "ok", "task": task}
 
@@ -299,6 +332,78 @@ async def retry_task_endpoint(task_id: str, req: TaskRetryRequest | None = None)
     register_task_queue(task_id)
     retry_task_background(task_id, auto_accept=auto_accept)
     return {"status": "ok", "task": jsonable_encoder(task), "message": "已提交重跑，Brain 重新执行"}
+
+
+# ─── GET /api/tasks/{task_id}/logs — 该任务执行日志 ─
+@router.get("/api/tasks/{task_id}/logs", tags=["任务管理"])
+async def get_task_logs(task_id: str, limit: int = 500):
+    """读取某任务的执行日志（从 swarm.log 按 [task=前8位] 过滤）。
+
+    依赖统一日志系统的 task 上下文前缀（swarm.logging_config.bind/set_task_context）。
+    """
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    from swarm.logging_config import read_task_logs, resolve_log_path
+
+    limit = max(1, min(int(limit or 500), 2000))
+    lines = await loop.run_in_executor(None, lambda: read_task_logs(task_id, limit=limit))
+    log_path = resolve_log_path()
+    return {
+        "task_id": task_id,
+        "status": task.get("status"),
+        "count": len(lines),
+        "lines": lines,
+        "log_file": str(log_path) if log_path else None,
+        "hint": "" if lines else "暂无该任务日志（可能任务在日志轮转前执行，或日志文件未配置）",
+    }
+
+
+# ─── GET /api/tasks/{task_id}/logs/stream — 实时日志 SSE ─
+@router.get("/api/tasks/{task_id}/logs/stream", tags=["任务管理"])
+async def stream_task_logs(task_id: str):
+    """SSE 实时推送某任务的执行日志（tail swarm.log 按 [task=前8位] 过滤）。
+
+    纯文件读，不触发任何任务执行。任务进入终态后自动结束流。
+    认证：中间件从 ?token= 读取（EventSource 不能带 Authorization 头）。
+    """
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    from swarm.logging_config import TaskLogPoller
+
+    _TERMINAL = {"DONE", "FAILED", "CANCELLED"}
+
+    async def event_generator():
+        poller = TaskLogPoller(task_id)
+        terminal_idle = 0
+        try:
+            while True:
+                batch = await loop.run_in_executor(None, poller.poll)
+                if batch:
+                    for line in batch:
+                        yield {"event": "log", "data": line}
+                    terminal_idle = 0
+                    continue
+
+                # 无新行：心跳，并检查任务是否已终态
+                yield {"event": "heartbeat", "data": ""}
+                cur = await loop.run_in_executor(None, _app.store.get_task, task_id)
+                if cur and cur.get("status") in _TERMINAL:
+                    terminal_idle += 1
+                    # 终态后再多轮询一次确保尾部日志吐完，然后收尾
+                    if terminal_idle >= 2:
+                        yield {"event": "end", "data": cur.get("status")}
+                        break
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    return EventSourceResponse(event_generator())
 
 
 # ─── 10. POST /api/tasks/{task_id}/approve — 审核通过 ─

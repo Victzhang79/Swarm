@@ -7,7 +7,7 @@ import asyncio
 import importlib.util
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -333,8 +333,8 @@ def test_handle_failure_retry_strategy():
     }
     mock_response = type("R", (), {"content": '{"strategy": "retry", "reasoning": "transient"}'})()
     with patch("swarm.brain.nodes._get_brain_llm") as llm_get:
-        llm_get.return_value.invoke.return_value = mock_response
-        out = handle_failure(state)
+        llm_get.return_value.ainvoke = AsyncMock(return_value=mock_response)
+        out = asyncio.run(handle_failure(state))
     assert out["failure_strategy"] == "retry"
     assert out["failed_subtask_ids"] == []
     assert "st-1" in out["dispatch_remaining"]
@@ -354,8 +354,8 @@ def test_handle_failure_replan_strategy():
     }
     mock_response = type("R", (), {"content": '{"strategy": "replan", "reasoning": "plan broken"}'})()
     with patch("swarm.brain.nodes._get_brain_llm") as llm_get:
-        llm_get.return_value.invoke.return_value = mock_response
-        out = handle_failure(state)
+        llm_get.return_value.ainvoke = AsyncMock(return_value=mock_response)
+        out = asyncio.run(handle_failure(state))
     assert out["failure_strategy"] == "replan"
     assert out["plan_valid"] is False
     assert out["failed_subtask_ids"] == []
@@ -375,8 +375,8 @@ def test_handle_failure_escalate_routes_to_deliver():
     }
     mock_response = type("R", (), {"content": '{"strategy": "escalate", "reasoning": "human needed"}'})()
     with patch("swarm.brain.nodes._get_brain_llm") as llm_get:
-        llm_get.return_value.invoke.return_value = mock_response
-        out = handle_failure(state)
+        llm_get.return_value.ainvoke = AsyncMock(return_value=mock_response)
+        out = asyncio.run(handle_failure(state))
     assert out["failure_strategy"] == "escalate"
     assert out["failure_escalated"] is True
     assert out["l2_passed"] is False
@@ -390,7 +390,7 @@ def test_verify_l3_skip_simple():
         "merged_diff": DIFF_A,
         "task_description": "test",
     }
-    out = verify_l3(state)
+    out = asyncio.run(verify_l3(state))
     assert out["l3_skipped"] is True
     assert out["l3_passed"] is None
     print("  ✅ verify_l3 — SIMPLE skips quickly")
@@ -405,7 +405,7 @@ def test_verify_l3_skip_without_staging_url():
     with patch.dict("os.environ", {}, clear=False):
         import os
         os.environ.pop("SWARM_STAGING_URL", None)
-        out = verify_l3(state)
+        out = asyncio.run(verify_l3(state))
     assert out["l3_skipped"] is True
     assert out["l3_passed"] is None
     assert "No staging URL" in out["l3_message"]
@@ -421,8 +421,8 @@ def test_verify_l3_pass_with_staging():
     mock_response = type("R", (), {"content": '{"l3_passed": true, "message": "staging ok"}'})()
     with patch.dict("os.environ", {"SWARM_STAGING_URL": "https://staging.example.com"}):
         with patch("swarm.brain.nodes._get_brain_llm") as llm_get:
-            llm_get.return_value.invoke.return_value = mock_response
-            out = verify_l3(state)
+            llm_get.return_value.ainvoke = AsyncMock(return_value=mock_response)
+            out = asyncio.run(verify_l3(state))
     assert out["l3_skipped"] is False
     assert out["l3_passed"] is True
     assert "staging ok" in out["l3_message"]
@@ -443,7 +443,7 @@ def test_verify_l2_sandbox_pass():
     }
     with patch("swarm.brain.nodes._try_l2_sandbox_verify", return_value=True):
         with patch("swarm.brain.nodes._verify_l2_via_llm") as llm_mock:
-            out = verify_l2(state)
+            out = asyncio.run(verify_l2(state))
     assert out["l2_passed"] is True
     llm_mock.assert_not_called()
     print("  ✅ verify_l2 — sandbox path returns l2_passed True")
@@ -461,7 +461,7 @@ def test_verify_l2_sandbox_fail():
     with patch("swarm.brain.nodes._try_l2_sandbox_verify", return_value=False):
         with patch("swarm.brain.nodes._try_l2_local_verify", return_value=None):
             with patch("swarm.brain.nodes._verify_l2_via_llm") as llm_mock:
-                out = verify_l2(state)
+                out = asyncio.run(verify_l2(state))
     assert out["l2_passed"] is False
     llm_mock.assert_not_called()
     print("  ✅ verify_l2 — sandbox path returns l2_passed False")

@@ -112,26 +112,48 @@ def _run_with_slot(task_id: str, meta: dict, start_fn) -> None:
     import asyncio as _asyncio
 
     async def _wrap() -> None:
-        try:
-            # start_task_background 内部 create_task 异步执行；这里要等它真正跑完
-            # 才能释放额度，所以直接 await run_task 逻辑的包装。
-            from swarm.brain.runner import run_task
+        from swarm.logging_config import bind_task
 
-            await run_task(
-                task_id,
-                meta["project_id"],
-                meta["description"],
-                auto_accept=meta["auto_accept"],
-            )
-        except Exception as exc:
-            logger.exception("[Scheduler] 任务执行异常 task=%s: %s", task_id, exc)
-        finally:
-            _inflight.discard(task_id)
-            if _wakeup is not None:
-                _wakeup.set()  # 释放额度 → 唤醒消费循环取下一个
+        with bind_task(task_id):
+            try:
+                # start_task_background 内部 create_task 异步执行；这里要等它真正跑完
+                # 才能释放额度，所以直接 await run_task 逻辑的包装。
+                from swarm.brain.runner import run_task
+
+                await run_task(
+                    task_id,
+                    meta["project_id"],
+                    meta["description"],
+                    auto_accept=meta["auto_accept"],
+                )
+            except _asyncio.CancelledError:
+                # 取消时静默退出（cancel_task 已负责 DB 状态 + 沙箱释放）
+                logger.info("[Scheduler] 任务 %s 被取消", task_id)
+                raise
+            except Exception as exc:
+                logger.exception("[Scheduler] 任务执行异常 task=%s: %s", task_id, exc)
+            finally:
+                _inflight.discard(task_id)
+                # 仅当当前 handle 仍是自己时才清理，避免误删重跑产生的新 handle
+                if _task_handles.get(task_id) is _current_task():
+                    _task_handles.pop(task_id, None)
+                if _wakeup is not None:
+                    _wakeup.set()  # 释放额度 → 唤醒消费循环取下一个
 
     # 注册 SSE 队列（与原 start_task_background 行为一致）
-    from swarm.brain.runner import register_task_queue
+    from swarm.brain.runner import _task_handles, register_task_queue
 
     register_task_queue(task_id)
-    _asyncio.create_task(_wrap())
+    task_obj = _asyncio.create_task(_wrap())
+    # 关键：把 handle 注册到 _task_handles，使 cancel_task 能 handle.cancel() 真正中断
+    # （否则取消只翻 DB 状态，asyncio 任务与 LLM 调用继续跑，小模型资源不释放）。
+    _task_handles[task_id] = task_obj
+
+
+def _current_task():
+    import asyncio as _asyncio
+
+    try:
+        return _asyncio.current_task()
+    except RuntimeError:
+        return None

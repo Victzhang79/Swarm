@@ -234,6 +234,21 @@ class SandboxManager:
             if meta.get("project_id") == project_id
         }
 
+    def sandboxes_for_task(self, task_id: str) -> set[str]:
+        return {
+            sid for sid, meta in self._sandbox_meta.items()
+            if meta.get("task_id") == task_id
+        }
+
+    def kill_by_task(self, task_id: str) -> int:
+        """销毁某任务关联的所有沙箱，返回销毁数量（任务取消/失败时释放资源）。"""
+        sids = self.sandboxes_for_task(task_id)
+        for sid in sids:
+            self.kill(sid)
+        if sids:
+            logger.info("kill_by_task: 任务 %s 释放 %d 个沙箱", task_id, len(sids))
+        return len(sids)
+
     def unregister_sandbox_meta(self, sandbox_id: str) -> None:
         self._sandbox_meta.pop(sandbox_id, None)
         self._sandbox_activity.pop(sandbox_id, None)
@@ -569,6 +584,125 @@ print(json.dumps(files))
             sandbox.sandbox_id,
             stats["downloaded"],
             stats["skipped"],
+            len(stats["errors"]),
+        )
+        return stats
+
+    def sync_files_to_sandbox(
+        self,
+        sandbox: Any,
+        local_root: Path,
+        rel_files: list[str],
+        remote_root: str | None = None,
+    ) -> dict[str, Any]:
+        """精准上传：只把 rel_files 列出的文件推送到沙箱（不全量同步）。
+
+        rel_files 为相对 local_root 的路径列表（来自子任务 scope）。
+        缺失的本地文件记入 errors 但不中断其它文件上传。
+        """
+        remote_root = remote_root or self.config.sandbox_remote_workdir
+        stats: dict[str, Any] = {"uploaded": 0, "skipped": 0, "errors": [], "files": []}
+        local_root = Path(local_root).resolve()
+
+        if not local_root.is_dir():
+            stats["errors"].append(f"local_root is not a directory: {local_root}")
+            logger.warning("Targeted sync skipped: %s", stats["errors"][-1])
+            return stats
+
+        use_files_api = hasattr(sandbox, "files") and hasattr(sandbox.files, "write")
+        self._ensure_remote_dir(sandbox, remote_root, use_files_api)
+
+        for rel in rel_files:
+            rel_posix = Path(rel).as_posix().lstrip("/")
+            if not rel_posix:
+                continue
+            local_path = (local_root / rel_posix).resolve()
+            # 防目录穿越：必须在 local_root 内
+            try:
+                local_path.relative_to(local_root)
+            except ValueError:
+                stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
+                continue
+            if not local_path.is_file():
+                stats["errors"].append(f"{rel_posix}: 本地文件不存在")
+                continue
+            remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
+            try:
+                data = local_path.read_bytes()
+                if use_files_api:
+                    self._ensure_remote_dir(
+                        sandbox,
+                        remote_path.rsplit("/", 1)[0],
+                        use_files_api,
+                    )
+                    sandbox.files.write(remote_path, data)
+                else:
+                    self._write_file_via_code(sandbox, remote_path, data)
+                stats["uploaded"] += 1
+                stats["files"].append(rel_posix)
+            except Exception as exc:
+                stats["errors"].append(f"{rel_posix}: {exc}")
+                logger.warning("Targeted upload failed: %s: %s", rel_posix, exc)
+
+        logger.info(
+            "Targeted sync to sandbox %s: uploaded=%d errors=%d files=%s",
+            sandbox.sandbox_id,
+            stats["uploaded"],
+            len(stats["errors"]),
+            stats["files"],
+        )
+        return stats
+
+    def sync_files_from_sandbox(
+        self,
+        sandbox: Any,
+        local_root: Path,
+        rel_files: list[str],
+        remote_root: str | None = None,
+    ) -> dict[str, Any]:
+        """精准拉回：只把 rel_files 列出的文件从沙箱拉回本地。
+
+        返回 stats 含 contents={rel: text}，供 difflib 生成 diff。
+        """
+        remote_root = remote_root or self.config.sandbox_remote_workdir
+        stats: dict[str, Any] = {
+            "downloaded": 0, "skipped": 0, "errors": [], "contents": {}
+        }
+        local_root = Path(local_root).resolve()
+
+        for rel in rel_files:
+            rel_posix = Path(rel).as_posix().lstrip("/")
+            if not rel_posix:
+                continue
+            remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
+            try:
+                data = read_file_from_sandbox(sandbox, remote_path, manager=self)
+                if isinstance(data, str):
+                    data = data.encode("utf-8")
+                if len(data) > MAX_SYNC_FILE_SIZE:
+                    stats["skipped"] += 1
+                    continue
+                local_path = (local_root / rel_posix).resolve()
+                try:
+                    local_path.relative_to(local_root)
+                except ValueError:
+                    stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
+                    continue
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(data)
+                stats["downloaded"] += 1
+                try:
+                    stats["contents"][rel_posix] = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    stats["contents"][rel_posix] = None  # 二进制
+            except Exception as exc:
+                stats["errors"].append(f"{rel_posix}: {exc}")
+                logger.warning("Targeted pull-back failed: %s: %s", rel_posix, exc)
+
+        logger.info(
+            "Targeted sync from sandbox %s: downloaded=%d errors=%d",
+            sandbox.sandbox_id,
+            stats["downloaded"],
             len(stats["errors"]),
         )
         return stats

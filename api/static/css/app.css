@@ -118,7 +118,89 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-left: auto;
 }
+
+/* 通知铃铛 + 浮窗 */
+.notif-bell-wrap { position: relative; display: inline-flex; }
+.notif-bell { position: relative; font-size: 16px; }
+.notif-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 2px var(--bg-base, #16181d);
+}
+.notif-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 360px;
+  max-height: 460px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated, #1e2128);
+  border: 1px solid var(--border-subtle, #2a2e37);
+  border-radius: var(--radius-md, 8px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  overflow: hidden;
+}
+.notif-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle, #2a2e37);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary, #c4c9d4);
+}
+.notif-panel-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+}
+.notif-empty {
+  padding: 24px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted, #8b93a3);
+  margin: 0;
+}
+.notif-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px;
+  border-radius: 6px;
+  transition: background 0.12s;
+}
+.notif-row:hover { background: rgba(255, 255, 255, 0.04); }
+.notif-row + .notif-row { border-top: 1px solid var(--border-subtle, #2a2e37); }
+.notif-row-body { flex: 1; min-width: 0; cursor: pointer; }
+.notif-row-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary, #e6e9ef); margin: 0 0 2px; }
+.notif-row-msg {
+  font-size: 12px;
+  color: var(--text-secondary, #c4c9d4);
+  margin: 0 0 3px;
+  word-break: break-word;
+}
+.notif-row-meta { font-size: 10.5px; color: var(--text-muted, #8b93a3); }
+.notif-row-archive {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted, #8b93a3);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.notif-row-archive:hover { background: rgba(255, 255, 255, 0.08); color: var(--text-primary, #e6e9ef); }
 
 /* Badges & pills */
 .pill {
@@ -905,20 +987,128 @@ html, body {
   transition: width 0.3s ease;
 }
 
-/* Component grid (system tab) */
+/* Component grid (system tab) — 紧凑 chip，尽量一行展示，悬浮显示详情 */
 .component-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
-.component-card {
-  padding: 14px;
+.component-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  cursor: default;
+  white-space: nowrap;
 }
-.component-card .name { font-size: 12px; font-weight: 500; margin-bottom: 6px; }
-.component-card .status { font-size: 11px; color: var(--text-muted); }
+.component-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.component-dot.dot-green { background: #22c55e; }
+.component-dot.dot-amber { background: #f59e0b; }
+.component-dot.dot-red { background: #ef4444; }
+.component-dot.dot-gray { background: #6b7280; }
+.component-chip-name { line-height: 1; }
+/* 顶栏常驻组件健康条：logo 后横向排列，持续显示状态 */
+.components-strip {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 5px;
+  margin-left: 14px;
+  margin-right: 16px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  scrollbar-width: none;
+}
+.components-strip::-webkit-scrollbar { display: none; }
+.components-strip .component-chip {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+/* 正常态：低调绿点 + 浅色 */
+.components-strip .component-chip-ok {
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
+}
+/* 异常态：醒目，红/琥珀底色高亮，确保一眼看到 */
+.components-strip .component-chip-bad {
+  font-weight: 600;
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.5);
+  background: rgba(239, 68, 68, 0.12);
+}
+.components-strip .component-chip-bad:has(.dot-amber) {
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.12);
+}
+/* 红灯呼吸动画，提高可见性 */
+.components-strip .component-chip-bad .dot-red {
+  animation: chip-pulse 1.4s ease-in-out infinite;
+}
+@keyframes chip-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  50% { opacity: 0.65; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0); }
+}
+/* 顶栏内 tooltip 向下弹出（header 在页面顶部，向上会被裁剪） */
+.components-strip .component-chip[data-tip]:hover::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+.components-strip .component-chip[data-tip]:hover::before {
+  bottom: auto;
+  top: calc(100% + 1px);
+  border-top-color: transparent;
+  border-bottom-color: #0f1117;
+}
+@media (max-width: 1100px) {
+  .components-strip { display: none; }
+}
+/* 悬浮 tooltip：显示状态 + 详情 */
+.component-chip[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0f1117;
+  color: #e6e9ef;
+  border: 1px solid var(--border-subtle, #2a2e37);
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 1200;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+.component-chip[data-tip]:hover::before {
+  content: "";
+  position: absolute;
+  bottom: calc(100% + 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: #0f1117;
+  z-index: 1200;
+  pointer-events: none;
+}
 
 /* Phase 5 — stats cards & notifications */
 .stats-grid {
@@ -1017,7 +1207,7 @@ html, body {
   flex-direction: column;
   gap: 12px;
   padding: 12px 16px 16px;
-  overflow: hidden;
+  overflow-y: auto;
 }
 .system-section {
   background: var(--bg-elevated);
@@ -1032,8 +1222,8 @@ html, body {
   padding: 12px 14px 14px;
 }
 .system-section-grow {
-  flex: 1;
-  min-height: 200px;
+  flex: 1 0 auto;
+  min-height: 460px;
   padding: 0;
   overflow: hidden;
 }

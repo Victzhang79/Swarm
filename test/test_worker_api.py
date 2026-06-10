@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,12 @@ def test_files_from_unified_diff():
 
 
 def test_apply_git_diff_in_repo():
+    import pytest
+
     from swarm.project.diff_apply import apply_git_diff
+
+    if not shutil.which("git"):
+        pytest.skip("git 不可用，跳过真实 git 仓库测试")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -41,8 +47,7 @@ def test_apply_git_diff_in_repo():
         if init.returncode != 0:
             init = subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True)
         if init.returncode != 0:
-            print(f"  ⚠ apply_git_diff 跳过（git init 不可用: {init.stderr[:120]}）")
-            return
+            pytest.skip(f"git init 不可用: {init.stderr[:120]}")
         subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=root, check=True)
         subprocess.run(["git", "config", "user.name", "test"], cwd=root, check=True)
         f = root / "hello.txt"

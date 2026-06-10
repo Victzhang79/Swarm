@@ -133,7 +133,7 @@ function renderPreprocessStats(data) {
 function connectPreprocessSSE(projectId) {
   disconnectPreprocessSSE();
   try {
-    preprocessSSE = new EventSource('/api/projects/' + encodeURIComponent(projectId) + '/preprocess/progress');
+    preprocessSSE = new EventSource(sseUrl('/api/projects/' + encodeURIComponent(projectId) + '/preprocess/progress'));
 
     const handleProgress = (e) => {
       try {

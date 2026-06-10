@@ -159,6 +159,7 @@ function renderTaskDetail(task) {
   renderDiff(task.merged_diff || '');
   renderPlan(task.plan);
   renderOverviewSubtasks(task);
+  restorePipelineFromStatus(task);
 
   if (task.learn_summary) {
     tryShowLearnNotice(typeof task.learn_summary === 'string' ? JSON.parse(task.learn_summary) : task.learn_summary);
@@ -166,7 +167,90 @@ function renderTaskDetail(task) {
 
   const actionsEl = $('detail-actions');
   if (actionsEl) {
-    actionsEl.innerHTML = renderTaskActions(task, false);
+    actionsEl.innerHTML =
+      `<button class="btn btn-secondary btn-sm" onclick="viewTaskLogs('${task.id}')" title="查看该任务的执行日志">📜 日志</button>`
+      + renderTaskActions(task, false);
+  }
+}
+
+// ── 任务执行日志查看（SSE 实时流）──────────────────
+let _taskLogsES = null;
+async function viewTaskLogs(taskId) {
+  let overlay = document.getElementById('task-logs-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'task-logs-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;justify-content:center';
+    overlay.innerHTML = `
+      <div style="background:var(--bg-primary,#1e1e1e);border:1px solid var(--border,#333);border-radius:8px;width:min(900px,92vw);height:min(640px,86vh);display:flex;flex-direction:column">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border,#333)">
+          <strong id="task-logs-title">任务日志</strong>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="task-logs-live" style="font-size:11px;color:var(--text-muted,#888)"></span>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="task-logs-follow" checked>跟随</label>
+            <button class="btn btn-ghost btn-sm" id="task-logs-close" title="关闭">✕</button>
+          </div>
+        </div>
+        <pre id="task-logs-body" style="flex:1;overflow:auto;margin:0;padding:12px 16px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,monospace"></pre>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => { _closeTaskLogsStream(); overlay.remove(); };
+    overlay.querySelector('#task-logs-close').onclick = close;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  }
+  overlay.querySelector('#task-logs-title').textContent = '任务日志 #' + String(taskId).substring(0, 8);
+  const body = overlay.querySelector('#task-logs-body');
+  const liveEl = overlay.querySelector('#task-logs-live');
+  const followEl = overlay.querySelector('#task-logs-follow');
+  body.textContent = '';
+
+  _closeTaskLogsStream();
+  let gotAny = false;
+  const appendLine = (line) => {
+    gotAny = true;
+    body.textContent += (body.textContent ? '\n' : '') + line;
+    if (followEl.checked) body.scrollTop = body.scrollHeight;
+  };
+
+  // 优先 SSE 实时流；失败则回退到一次性拉取
+  try {
+    const es = new EventSource(sseUrl('/api/tasks/' + encodeURIComponent(taskId) + '/logs/stream'));
+    _taskLogsES = es;
+    liveEl.textContent = '● 实时';
+    liveEl.style.color = '#4ade80';
+    es.addEventListener('log', (e) => appendLine(e.data));
+    es.addEventListener('end', () => {
+      liveEl.textContent = '— 已结束';
+      liveEl.style.color = 'var(--text-muted,#888)';
+      if (!gotAny) body.textContent = '暂无该任务日志。';
+      _closeTaskLogsStream();
+    });
+    es.onerror = () => {
+      // 连接错误：若尚无数据，回退一次性拉取
+      liveEl.textContent = '○ 断开';
+      liveEl.style.color = 'var(--text-muted,#888)';
+      _closeTaskLogsStream();
+      if (!gotAny) fetchTaskLogsOnce(taskId, body);
+    };
+  } catch (e) {
+    fetchTaskLogsOnce(taskId, body);
+  }
+}
+
+function _closeTaskLogsStream() {
+  if (_taskLogsES) { try { _taskLogsES.close(); } catch (e) {} _taskLogsES = null; }
+}
+
+async function fetchTaskLogsOnce(taskId, body) {
+  body.textContent = '加载中…';
+  try {
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=1000');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    body.textContent = (data.lines && data.lines.length) ? data.lines.join('\n') : (data.hint || '暂无该任务日志。');
+    body.scrollTop = body.scrollHeight;
+  } catch (e) {
+    body.textContent = '加载日志失败: ' + e.message;
   }
 }
 
@@ -263,6 +347,36 @@ function updateNodeStatus(nodeName, status) {
   if (!step) return;
   if (status === 'done') step.className = 'pipeline-step done';
   else if (status === 'error') step.className = 'pipeline-step error';
+}
+
+// 根据任务当前状态回放 pipeline 进度（选中任意任务时调用，含已完成/失败任务）。
+// 解决「已完成任务 7 个状态不亮」「选中进行中任务在 SSE 首个事件前一片灰」的问题。
+function restorePipelineFromStatus(task) {
+  if (!task || !task.status) { resetPipeline(); return; }
+  const status = task.status;
+
+  // 终态 DONE：全部 7 步亮起
+  if (TERMINAL_DONE_STATUSES.has(status)) {
+    PIPELINE_NODES.forEach(n => {
+      const step = document.querySelector(`.pipeline-step[data-node="${n}"]`);
+      if (step) step.className = 'pipeline-step done';
+    });
+    return;
+  }
+
+  // 失败/取消：把已走过的阶段标 done，当前阶段标 error，其余 pending
+  const curNode = STATUS_TO_PIPELINE_NODE[status];
+  const curIdx = curNode ? PIPELINE_NODES.indexOf(curNode) : -1;
+  const isFail = TERMINAL_FAIL_STATUSES.has(status);
+
+  PIPELINE_NODES.forEach((n, i) => {
+    const step = document.querySelector(`.pipeline-step[data-node="${n}"]`);
+    if (!step) return;
+    if (curIdx < 0) { step.className = 'pipeline-step pending'; return; }
+    if (i < curIdx) step.className = 'pipeline-step done';
+    else if (i === curIdx) step.className = isFail ? 'pipeline-step error' : 'pipeline-step running';
+    else step.className = 'pipeline-step pending';
+  });
 }
 
 function updateSubtaskList(subtasks) {
@@ -483,7 +597,7 @@ function startTaskSSE(taskId) {
 
   try {
     const url = '/api/tasks/' + encodeURIComponent(taskId) + '/stream';
-    taskEventSource = new EventSource(url);
+    taskEventSource = new EventSource(sseUrl(url));
 
     const handlePayload = (e, eventType) => {
       try {
@@ -650,27 +764,45 @@ async function rejectTask(taskId) {
 }
 
 function renderComponents(components) {
-  const grid = $('components-grid');
+  // 组件健康常驻顶栏（#components-strip）；兼容旧的系统标签页容器。
+  // 设计：平时不显示一排绿灯——只在某组件异常(error/degraded/unknown)时亮灯，
+  // 全部正常则显示一个简洁的"系统正常"绿点，让用户一眼看出有没有问题。
+  const grid = $('components-strip') || $('components-grid');
+  if (!grid) return;
   const map = {};
   (components || []).forEach(c => { map[c.name] = c; });
 
-  grid.innerHTML = COMPONENT_DEFS.map(def => {
-    const c = map[def.name] || { status: 'unknown', detail: '' };
-    const statusCls = c.status === 'running' || c.status === 'ready' ? 'pill-green'
-      : c.status === 'degraded' ? 'pill-amber' : c.status === 'error' ? 'pill-red' : 'pill-gray';
+  const healthy = (s) => s === 'running' || s === 'ready';
+  const problems = COMPONENT_DEFS
+    .map(def => ({ def, c: map[def.name] || { status: 'unknown', detail: '' } }))
+    .filter(({ c }) => !healthy(c.status));
+
+  if (problems.length === 0) {
+    // 全部正常：单个绿点 + 文案（仍可悬浮提示"组件全部正常"）
+    grid.innerHTML = `
+      <div class="component-chip component-chip-ok" data-tip="系统组件全部正常（每 5s 刷新）">
+        <span class="component-dot dot-green"></span>
+        <span class="component-chip-name">系统正常</span>
+      </div>`;
+    return;
+  }
+
+  grid.innerHTML = problems.map(({ def, c }) => {
+    const dotCls = c.status === 'degraded' ? 'dot-amber'
+      : c.status === 'error' ? 'dot-red' : 'dot-gray';
+    const tip = `${def.name}: ${c.status}${c.detail ? ' · ' + c.detail : ''}`;
     return `
-      <div class="component-card">
-        <div class="name">${escapeHtml(def.name)}</div>
-        <span class="pill ${statusCls}">${escapeHtml(c.status)}</span>
-        <div class="status" style="margin-top:6px">${escapeHtml(c.detail || '')}</div>
+      <div class="component-chip component-chip-bad" data-tip="${escapeHtml(tip)}">
+        <span class="component-dot ${dotCls}"></span>
+        <span class="component-chip-name">${escapeHtml(def.name)}</span>
       </div>`;
   }).join('');
 }
 
-// ─── Phase 5: System stats & notifications ───────────────────
+// ─── 点击通知跳转到对应任务 ───────────────────
 
 async function openNotificationTask(taskId, projectId) {
-  dismissNotificationBanner();
+  if (typeof closeNotifPanel === 'function') closeNotifPanel();
   if (projectId && projectId !== selectedProjectId) {
     selectProject(projectId);
   }

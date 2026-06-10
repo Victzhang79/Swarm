@@ -17,6 +17,7 @@
           <div class="brand-sub">AI 编程智能体系统</div>
         </div>
       </div>
+      <div class="components-strip" id="components-strip" title="系统组件状态（每 5s 刷新）"></div>
       <div class="header-actions">
         <span class="pill pill-gray" id="user-badge" title="当前用户">未登录</span>
         <button class="btn btn-ghost btn-sm" id="btn-login" onclick="showLoginModal()">登录</button>
@@ -24,6 +25,20 @@
         <span class="pill pill-gray" id="version-badge">v0.3.0</span>
         <span class="health-dot loading" id="health-dot"></span>
         <span class="pill pill-gray" id="health-text">检测中</span>
+        <div class="notif-bell-wrap">
+          <button class="btn btn-ghost btn-icon notif-bell" id="notif-bell" onclick="toggleNotifPanel()" title="通知">
+            🔔<span class="notif-dot hidden" id="notif-dot"></span>
+          </button>
+          <div class="notif-panel hidden" id="notif-panel">
+            <div class="notif-panel-head">
+              <span>通知</span>
+              <button class="btn btn-ghost btn-sm" id="notif-archive-all" onclick="archiveAllNotifications()">全部归档</button>
+            </div>
+            <div class="notif-panel-list" id="notif-panel-list">
+              <p class="notif-empty">暂无通知</p>
+            </div>
+          </div>
+        </div>
         <button class="btn btn-ghost btn-icon" onclick="toggleSettings()" title="系统设置">⚙️</button>
       </div>
     </header>
@@ -517,28 +532,13 @@
                   <div class="stats-card"><span class="stats-label">总任务</span><span class="stats-value" id="stat-total">—</span></div>
                   <div class="stats-card"><span class="stats-label">已完成</span><span class="stats-value" id="stat-completed">—</span></div>
                   <div class="stats-card"><span class="stats-label">失败</span><span class="stats-value stats-value-red" id="stat-failed">—</span></div>
-                  <div class="stats-card"><span class="stats-label">Accept 率</span><span class="stats-value" id="stat-accept-rate">—</span></div>
+                  <div class="stats-card"><span class="stats-label">成功率 <span class="hint">(DONE/终态)</span></span><span class="stats-value" id="stat-merge-rate">—</span></div>
+                  <div class="stats-card"><span class="stats-label">Accept 率 <span class="hint">(DONE 内人工通过)</span></span><span class="stats-value" id="stat-accept-rate">—</span></div>
                   <div class="stats-card"><span class="stats-label">平均耗时</span><span class="stats-value" id="stat-avg-duration">—</span></div>
                   <div class="stats-card"><span class="stats-label">Token 合计 <span class="hint">(估算)</span></span><span class="stats-value" id="stat-total-tokens">—</span></div>
                   <div class="stats-card"><span class="stats-label">平均 Token <span class="hint">(估算)</span></span><span class="stats-value" id="stat-avg-tokens">—</span></div>
                   <div class="stats-card stats-card-learning"><span class="stats-label">学习趋势</span><span class="stats-value" id="stat-learning-trend"><span class="pill pill-gray">—</span></span></div>
                 </div>
-              </section>
-              <section class="system-section system-section-compact">
-                <div class="system-section-head">
-                  <h3>通知</h3>
-                  <button class="btn btn-ghost btn-sm" onclick="loadNotifications()">刷新</button>
-                </div>
-                <div id="notifications-list" class="notifications-list">
-                  <p class="hint" style="padding:8px 0;margin:0">暂无通知</p>
-                </div>
-              </section>
-              <section class="system-section system-section-compact">
-                <div class="system-section-head">
-                  <h3>系统组件</h3>
-                  <span class="hint">每 5s 刷新</span>
-                </div>
-                <div class="component-grid" id="components-grid"></div>
               </section>
               <section class="system-section system-section-grow">
                 <div class="system-section-head">
@@ -634,6 +634,13 @@
       <div id="routing-table"></div>
       <button class="btn btn-secondary" style="width:100%;margin:12px 0" onclick="testConfig()" id="btn-test-config">测试模型连接</button>
       <div id="config-test-result" style="font-size:12px;color:var(--text-muted);margin-bottom:12px"></div>
+      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">全局沙箱运维</h3>
+      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">孤儿沙箱 = CubeSandbox 服务端仍在运行、但无任何项目/任务关联的沙箱（多因 API 重启丢失追踪）。它们持续占用小模型/GPU 资源，建议定期清理。</p>
+      <div class="form-group" style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:12px;color:var(--text-secondary)">孤儿沙箱：<b id="orphan-count" style="color:var(--text-primary)">—</b> 个<span id="orphan-total" style="color:var(--text-muted)"></span></span>
+        <button class="btn btn-ghost btn-sm" onclick="refreshOrphanCount()">刷新</button>
+        <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" onclick="cleanupOrphanSandboxes()">🧹 清理孤儿</button>
+      </div>
       <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
     </div>
   </div>
@@ -693,6 +700,7 @@
   <script src="/static/js/core/utils.js"></script>
   <script src="/static/js/core/diff.js"></script>
   <script src="/static/js/core/ui.js"></script>
+  <script src="/static/js/core/notifications.js"></script>
   <script src="/static/js/core/auth.js"></script>
   <script src="/static/js/core/project.js"></script>
   <!-- tab 业务域 -->

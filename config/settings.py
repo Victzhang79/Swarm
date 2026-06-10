@@ -147,6 +147,14 @@ class AppConfig(BaseSettings):
     langsmith_project: str = "swarm-dev"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
+    # 日志系统
+    log_level: str = "INFO"               # DEBUG/INFO/WARNING/ERROR
+    log_file: str = "swarm.log"           # 相对项目根或绝对路径；空串=仅控制台
+    log_json: bool = False                # true=结构化 JSON 行（便于日志聚合）
+    log_max_bytes: int = 20_000_000       # 单文件上限，超过轮转（默认 ~20MB）
+    log_backup_count: int = 5             # 保留轮转文件数
+    log_console: bool = True              # 是否同时输出到控制台/stderr
+
     # API 安全：多用户 RBAC（默认开启；关闭则匿名 admin）
     rbac_enabled: bool = True
     bootstrap_admin_password: str = "swarm"

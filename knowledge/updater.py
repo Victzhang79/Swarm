@@ -437,8 +437,14 @@ class KnowledgeUpdater:
 
         # 与轮询/入队共享连接，串行化
         async with self._lock:
-            where = "WHERE project_id = %s" if project_id else ""
-            params: tuple = (project_id, limit) if project_id else (limit,)
+            # 跳过重试已达上限的条目（retry_count >= 10 视为永久失败，避免无限空转）。
+            # 这些条目保留在表中供排查，但不再自动重试。
+            if project_id:
+                where = "WHERE project_id = %s AND retry_count < 10"
+                params: tuple = (project_id, limit)
+            else:
+                where = "WHERE retry_count < 10"
+                params = (limit,)
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     f"""
@@ -625,23 +631,6 @@ class KnowledgeUpdater:
                         )
 
         return processed
-
-    # ── 后台轮询 ────────────────────────────────
-
-    async def start_polling(
-        self, interval_seconds: int = 5, max_iterations: int | None = None
-    ) -> None:
-        """启动后台轮询处理队列"""
-        iteration = 0
-        while max_iterations is None or iteration < max_iterations:
-            iteration += 1
-            try:
-                processed = await self.process_pending_events()
-                if processed > 0:
-                    logger.info("Polling processed %d events", processed)
-            except Exception as e:
-                logger.exception("Polling error: %s", e)
-            await asyncio.sleep(interval_seconds)
 
 
 # ──────────────────────────────────────────────
