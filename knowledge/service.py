@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
+import threading
 from contextvars import ContextVar
 from typing import Any
 
@@ -40,7 +40,6 @@ LAYER_LABELS: dict[str, str] = {
 }
 
 _retriever: SwarmRetriever | None = None
-_retriever_lock = asyncio.Lock()
 
 _current_project_id: ContextVar[str | None] = ContextVar("swarm_project_id", default=None)
 
@@ -54,9 +53,57 @@ def get_worker_project_id() -> str | None:
     return _current_project_id.get()
 
 
+# ── 专用持久事件循环（修复 "Lock bound to a different event loop"）──────
+# 问题：retriever 单例持有 psycopg.AsyncConnection（含内部 asyncio.Lock），
+# 该连接绑定到创建它的事件循环。原 retrieve_knowledge_sync 用 asyncio.run()
+# 每次新建临时 loop，loop 结束即销毁，但单例连接仍指向已死的 loop → 下次
+# 复用时报 "is bound to a different event loop" 并永久卡住（waiters 等不到）。
+# 修复：所有 retriever 相关协程都路由到这个【唯一、长生命周期】的后台 loop，
+# 连接的归属 loop 永不消失。Brain(主loop) 与 Worker工具(线程) 都走它。
+_kb_loop: asyncio.AbstractEventLoop | None = None
+_kb_loop_lock = threading.Lock()
+# 单例创建用 asyncio.Lock，但它必须在 _kb_loop 上创建/使用（懒初始化于该 loop）
+_retriever_async_lock: asyncio.Lock | None = None
+
+
+def _get_kb_loop() -> asyncio.AbstractEventLoop:
+    """获取（懒启动）专用知识检索事件循环，运行在守护线程中。"""
+    global _kb_loop
+    if _kb_loop is not None and not _kb_loop.is_closed():
+        return _kb_loop
+    with _kb_loop_lock:
+        if _kb_loop is not None and not _kb_loop.is_closed():
+            return _kb_loop
+        loop = asyncio.new_event_loop()
+
+        def _run() -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        t = threading.Thread(target=_run, name="swarm-kb-loop", daemon=True)
+        t.start()
+        _kb_loop = loop
+        logger.info("[knowledge] 专用检索事件循环已启动 (thread=%s)", t.name)
+        return _kb_loop
+
+
+def _run_on_kb_loop(coro):
+    """把协程提交到专用 KB loop 并阻塞等待结果（线程安全）。
+
+    无论调用方处于哪个 loop / 线程，retriever 的连接操作都在同一个 loop 上执行，
+    彻底规避跨 loop 复用 asyncio 原语的问题。
+    """
+    loop = _get_kb_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result()
+
+
 async def get_retriever() -> SwarmRetriever:
-    global _retriever
-    async with _retriever_lock:
+    """获取 retriever 单例（必须在 _kb_loop 上调用）。"""
+    global _retriever, _retriever_async_lock
+    if _retriever_async_lock is None:
+        _retriever_async_lock = asyncio.Lock()  # 在 _kb_loop 首次运行时创建，归属该 loop
+    async with _retriever_async_lock:
         if _retriever is None:
             _retriever = SwarmRetriever()
             await _retriever.connect_all()
@@ -72,10 +119,9 @@ async def get_retriever() -> SwarmRetriever:
 
 async def close_retriever() -> None:
     global _retriever
-    async with _retriever_lock:
-        if _retriever is not None:
-            await _retriever.close_all()
-            _retriever = None
+    if _retriever is not None:
+        await _retriever.close_all()
+        _retriever = None
 
 
 @swarm_traceable(
@@ -89,20 +135,28 @@ async def retrieve_knowledge(
     project_id: str,
     extra_keywords: list[str] | None = None,
 ) -> tuple[KnowledgeContext, dict[str, Any]]:
-    """Brain analyze / Worker tool 统一检索"""
-    if not project_id:
-        empty: KnowledgeContext = {
-            "struct": [],
-            "semantic": [],
-            "norms": [],
-            "behavior": [],
-            "mistakes": [],
-            "successes": [],
-            "project_summary": "",
-            "preprocess_stats": {},
-        }
-        return empty, {}
+    """Brain analyze / Worker tool 统一检索（异步入口）。
 
+    实际检索在专用 KB loop 上执行（_retrieve_knowledge_impl），本函数把工作
+    派发过去再用 asyncio.wrap_future 桥接回调用方 loop，避免阻塞调用方。
+    """
+    if not project_id:
+        return _empty_knowledge(), {}
+
+    loop = _get_kb_loop()
+    cfut = asyncio.run_coroutine_threadsafe(
+        _retrieve_knowledge_impl(task_desc, project_id, extra_keywords), loop
+    )
+    # 把 concurrent.futures.Future 桥接到当前调用方 loop（非阻塞 await）
+    return await asyncio.wrap_future(cfut)
+
+
+async def _retrieve_knowledge_impl(
+    task_desc: str,
+    project_id: str,
+    extra_keywords: list[str] | None = None,
+) -> tuple[KnowledgeContext, dict[str, Any]]:
+    """真正的检索逻辑——始终在专用 KB loop 上运行，连接归属该 loop。"""
     try:
         retriever = await get_retriever()
         result = await retriever.retrieve_for_brain(
@@ -111,17 +165,20 @@ async def retrieve_knowledge(
         return result.context, result.stats
     except Exception as exc:
         logger.warning("retrieve_knowledge failed for project %s: %s", project_id, exc)
-        empty = {
-            "struct": [],
-            "semantic": [],
-            "norms": [],
-            "behavior": [],
-            "mistakes": [],
-            "successes": [],
-            "project_summary": "",
-            "preprocess_stats": {},
-        }
-        return empty, {"error": str(exc)}
+        return _empty_knowledge(), {"error": str(exc)}
+
+
+def _empty_knowledge() -> KnowledgeContext:
+    return {
+        "struct": [],
+        "semantic": [],
+        "norms": [],
+        "behavior": [],
+        "mistakes": [],
+        "successes": [],
+        "project_summary": "",
+        "preprocess_stats": {},
+    }
 
 
 def retrieve_knowledge_sync(
@@ -129,16 +186,16 @@ def retrieve_knowledge_sync(
     project_id: str,
     extra_keywords: list[str] | None = None,
 ) -> tuple[KnowledgeContext, dict[str, Any]]:
-    """从同步上下文（LangChain Tool）调用 async 检索"""
-    coro = retrieve_knowledge(task_desc, project_id, extra_keywords)
+    """从同步上下文（LangChain Tool）调用检索。
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+    直接把 impl 协程提交到专用 KB loop 并阻塞等待——不再用 asyncio.run 创建
+    临时 loop（那是 "Lock bound to a different event loop" 的根源）。
+    """
+    if not project_id:
+        return _empty_knowledge(), {}
+    return _run_on_kb_loop(
+        _retrieve_knowledge_impl(task_desc, project_id, extra_keywords)
+    )
 
 
 def empty_knowledge_context() -> KnowledgeContext:
