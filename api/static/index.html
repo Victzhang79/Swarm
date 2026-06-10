@@ -687,6 +687,23 @@
     </div>
   </div>
 
+  <!-- 模块按依赖顺序加载（原生多 script 共享全局作用域，无构建工具）：core 先于 tabs，app.js 入口最后 -->
+  <!-- core 公共层 -->
+  <script src="/static/js/core/state.js"></script>
+  <script src="/static/js/core/utils.js"></script>
+  <script src="/static/js/core/diff.js"></script>
+  <script src="/static/js/core/ui.js"></script>
+  <script src="/static/js/core/auth.js"></script>
+  <script src="/static/js/core/project.js"></script>
+  <!-- tab 业务域 -->
+  <script src="/static/js/tabs/tasks.js"></script>
+  <script src="/static/js/tabs/worker.js"></script>
+  <script src="/static/js/tabs/knowledge.js"></script>
+  <script src="/static/js/tabs/memory.js"></script>
+  <script src="/static/js/tabs/preprocess.js"></script>
+  <script src="/static/js/tabs/system.js"></script>
+  <script src="/static/js/tabs/config.js"></script>
+  <!-- 应用入口 -->
   <script src="/static/js/app.js"></script>
 </body>
 </html>
