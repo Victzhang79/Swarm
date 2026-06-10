@@ -68,7 +68,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sys
 import time
 import traceback
@@ -83,13 +82,40 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from swarm.api._shared import (
+    _EMBEDDING_ZERO,
+    _flatten_model_config,
+    _mask_config_dict,
+    _parse_since_param,
+    _profile_storage_key,
+    _require_perm,
+    _require_user,
+    _resolve_key,
+)
 from swarm.config.settings import (
-    AppConfig,
     get_config,
     reload_config,
 )
-from swarm.project import store, preprocess
+from swarm.project import preprocess, store
 from swarm.tracing import configure_langsmith
+
+
+def _get_pg_conn():
+    """获取池化 psycopg 同步连接（autocommit）。
+
+    返回的是连接池的 connection() 上下文管理器，用法 `with _get_pg_conn() as conn:`，
+    退出时归还池而非关闭。
+    """
+    from swarm.infra.db import sync_pool
+
+    return sync_pool().connection()
+
+
+def _validate_project(project_id: str) -> None:
+    """校验项目是否存在，不存在则抛 404"""
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
 # LangSmith 在 on_startup 中初始化（需在 _configure_app_logging 之后，才能写入 swarm.log）
 
@@ -152,38 +178,10 @@ def _init_sidecar() -> None:
 # API Key 脱敏
 # ═══════════════════════════════════════════════════
 
-_API_KEY_PATTERN = re.compile(r"(sk-|key-|e2b_)(.{4,})(.{4,})", re.IGNORECASE)
 
 
-def _mask_api_key(value: str) -> str:
-    """脱敏 API Key: sk-xxxx...xxxx (只显示前4后4位)"""
-    if not value or len(value) < 12:
-        return value
-    # 尝试匹配常见前缀
-    m = _API_KEY_PATTERN.match(value)
-    if m:
-        prefix = m.group(1)
-        middle = m.group(2)
-        suffix = m.group(3)
-        return f"{prefix}{middle[:4]}...{suffix[-4:]}"
-    # 通用脱敏: 前4后4
-    return f"{value[:4]}...{value[-4:]}"
 
 
-def _mask_config_dict(cfg: dict) -> dict:
-    """递归脱敏配置中的 API Key 字段"""
-    out: dict[str, Any] = {}
-    for k, v in cfg.items():
-        key_lower = k.lower()
-        if isinstance(v, str) and any(
-            p in key_lower for p in ("api_key", "apikey", "secret", "password")
-        ):
-            out[k] = _mask_api_key(v)
-        elif isinstance(v, dict):
-            out[k] = _mask_config_dict(v)
-        else:
-            out[k] = v
-    return out
 
 
 # ═══════════════════════════════════════════════════
@@ -358,6 +356,7 @@ async def _check_component(name: str) -> dict[str, Any]:
                 result: dict[str, Any] = {}
                 try:
                     from e2b_code_interpreter import Sandbox
+
                     # 设置必要环境变量
                     from swarm.config.settings import get_config as _get_cfg
                     sc = _get_cfg().sandbox
@@ -529,43 +528,8 @@ class ConfigUpdateRequest(BaseModel):
 
 
 # 短名 → 环境变量名映射
-_SHORT_KEY_MAP = {
-    "siliconflow_api_key": "SWARM_MODEL_SILICONFLOW_API_KEY",
-    "siliconflow_base_url": "SWARM_MODEL_SILICONFLOW_BASE_URL",
-    "local_api_key": "SWARM_MODEL_LOCAL_API_KEY",
-    "local_base_url": "SWARM_MODEL_LOCAL_BASE_URL",
-    "brain_primary": "SWARM_MODEL_BRAIN_PRIMARY",
-    "brain_fallback": "SWARM_MODEL_BRAIN_FALLBACK",
-    "worker_primary": "SWARM_MODEL_WORKER_PRIMARY",
-    "worker_local": "SWARM_MODEL_WORKER_LOCAL",
-    "worker_fallback": "SWARM_MODEL_WORKER_FALLBACK",
-    "brain_temperature": "SWARM_MODEL_BRAIN_TEMPERATURE",
-    "worker_temperature": "SWARM_MODEL_WORKER_TEMPERATURE",
-    "brain_model": "SWARM_MODEL_BRAIN_PRIMARY",   # 前端别名
-    "worker_model": "SWARM_MODEL_WORKER_PRIMARY",  # 前端别名
-    "routing_trivial": "SWARM_MODEL_ROUTING_TRIVIAL",
-    "routing_trivial_fallback": "SWARM_MODEL_ROUTING_TRIVIAL_FALLBACK",
-    "routing_medium": "SWARM_MODEL_ROUTING_MEDIUM",
-    "routing_medium_fallback": "SWARM_MODEL_ROUTING_MEDIUM_FALLBACK",
-    "routing_complex": "SWARM_MODEL_ROUTING_COMPLEX",
-    "routing_complex_fallback": "SWARM_MODEL_ROUTING_COMPLEX_FALLBACK",
-    "routing_multimodal": "SWARM_MODEL_ROUTING_MULTIMODAL",
-    "routing_multimodal_fallback": "SWARM_MODEL_ROUTING_MULTIMODAL_FALLBACK",
-    "langsmith_tracing": "SWARM_LANGSMITH_TRACING",
-    "langsmith_api_key": "SWARM_LANGSMITH_API_KEY",
-    "langsmith_project": "SWARM_LANGSMITH_PROJECT",
-    "langsmith_endpoint": "SWARM_LANGSMITH_ENDPOINT",
-    "sandbox_api_url": "SWARM_SANDBOX_API_URL",
-    "sandbox_proxy_base": "SWARM_SANDBOX_PROXY_BASE",
-    "sandbox_default_template": "SWARM_SANDBOX_DEFAULT_TEMPLATE",
-    "sandbox_api_key": "SWARM_SANDBOX_API_KEY",
-    "sandbox_use_for_worker": "SWARM_SANDBOX_USE_FOR_WORKER",
-}
 
 
-def _resolve_key(key: str) -> str:
-    """短名 → 完整环境变量名"""
-    return _SHORT_KEY_MAP.get(key, key)
 
 
 class SandboxCreateRequest(BaseModel):
@@ -709,10 +673,10 @@ async def on_startup():
         logger.warning(f"Failed to ensure project tables: {e}")
     try:
         from swarm.auth.store import (
+            backfill_legacy_project_members,
+            ensure_admin_default_profile,
             ensure_auth_tables,
             ensure_bootstrap_admin,
-            ensure_admin_default_profile,
-            backfill_legacy_project_members,
         )
         from swarm.config.settings import get_config
 
@@ -911,19 +875,8 @@ class MemberRequest(BaseModel):
     role: str = "developer"
 
 
-def _require_user(request: Request):
-    from swarm.api.deps import get_current_user
-
-    return get_current_user(request)
 
 
-def _require_perm(request: Request, permission: str, project_id: str | None = None):
-    from swarm.auth.store import user_can_on_project
-
-    user = _require_user(request)
-    if not user_can_on_project(user, permission, project_id):
-        raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
-    return user
 
 
 @app.post("/api/auth/login", tags=["认证"])
@@ -1038,26 +991,6 @@ async def get_status():
 
 
 # ─── 3. GET /api/config ────────────────────────────
-def _flatten_model_config(cfg: AppConfig) -> dict[str, Any]:
-    """供前端使用的扁平模型配置"""
-    m = cfg.model
-    return {
-        "siliconflow_api_key": m.siliconflow_api_key,
-        "siliconflow_base_url": m.siliconflow_base_url,
-        "local_api_key": m.local_api_key,
-        "local_base_url": m.local_base_url,
-        "brain_primary": m.brain_primary,
-        "brain_fallback": m.brain_fallback,
-        "worker_primary": m.worker_primary,
-        "routing_trivial": m.routing_trivial,
-        "routing_trivial_fallback": m.routing_trivial_fallback,
-        "routing_medium": m.routing_medium,
-        "routing_medium_fallback": m.routing_medium_fallback,
-        "routing_complex": m.routing_complex,
-        "routing_complex_fallback": m.routing_complex_fallback,
-        "routing_multimodal": m.routing_multimodal,
-        "routing_multimodal_fallback": m.routing_multimodal_fallback,
-    }
 
 
 @app.get("/api/config", tags=["配置"])
@@ -1828,6 +1761,7 @@ async def sandbox_file_content(sandbox_id: str, path: str):
     manager = _get_sandbox_manager()
     try:
         from e2b_code_interpreter import Sandbox as _Sandbox
+
         from swarm.worker.sandbox import read_file_from_sandbox
 
         sandbox = manager._instances.get(sandbox_id)
@@ -2423,7 +2357,7 @@ async def cancel_task_endpoint(task_id: str):
 @app.post("/api/tasks/{task_id}/retry", tags=["任务管理"])
 async def retry_task_endpoint(task_id: str, req: TaskRetryRequest | None = None):
     """重跑失败/已取消/orphaned 任务"""
-    from swarm.brain.runner import can_retry_task, retry_task_background, register_task_queue
+    from swarm.brain.runner import can_retry_task, register_task_queue, retry_task_background
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, store.get_task, task_id)
@@ -2481,7 +2415,7 @@ async def approve_task(task_id: str, req: ApproveTaskRequest | None = None):
             task_id=task_id,
         )
 
-    from swarm.brain.runner import resume_task_background, register_task_queue
+    from swarm.brain.runner import register_task_queue, resume_task_background
 
     register_task_queue(task_id)
     resume_task_background(task_id, "accept")
@@ -2557,7 +2491,7 @@ async def revise_task(task_id: str, req: TaskReviseRequest):
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-    from swarm.brain.runner import resume_task_background, register_task_queue
+    from swarm.brain.runner import register_task_queue, resume_task_background
 
     register_task_queue(task_id)
     resume_task_background(task_id, "revise", req.feedback)
@@ -2580,7 +2514,7 @@ async def reject_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-    from swarm.brain.runner import resume_task_background, register_task_queue
+    from swarm.brain.runner import register_task_queue, resume_task_background
 
     register_task_queue(task_id)
     resume_task_background(task_id, "reject")
@@ -2599,25 +2533,6 @@ async def reject_task(task_id: str):
 # ═══════════════════════════════════════════════════
 
 import psycopg as _psycopg
-
-
-def _get_pg_conn():
-    """获取池化 psycopg 同步连接（autocommit）。
-
-    返回的是连接池的 connection() 上下文管理器，用法 `with _get_pg_conn() as conn:`，
-    退出时归还池而非关闭。
-    """
-    from swarm.infra.db import sync_pool
-
-    return sync_pool().connection()
-
-
-def _validate_project(project_id: str) -> None:
-    """校验项目是否存在，不存在则抛 404"""
-    project = store.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-
 
 # ─── Pydantic Request Models ─────────────────────
 
@@ -3054,7 +2969,6 @@ async def git_knowledge_webhook(project_id: str, payload: GitWebhookPayload):
 
 # ─── 记忆 — 错题集 (mem_mistakes) ────────────────
 
-_EMBEDDING_ZERO = [0.0] * 1024  # 零向量占位，维度与 bge-m3 一致
 
 
 @app.get("/api/projects/{project_id}/memories/mistakes", tags=["记忆"])
@@ -3307,10 +3221,6 @@ async def delete_summary(project_id: str, sid: int):
 # ─── 记忆 — L1 用户画像 (mem_user_profile) ───────
 
 
-def _profile_storage_key(user_id: str, project_id: str) -> str:
-    from swarm.auth.store import profile_key
-
-    return profile_key(user_id, project_id)
 
 
 @app.get("/api/projects/{project_id}/memories/profile", tags=["记忆"])
@@ -3402,19 +3312,6 @@ async def update_memory_profile(project_id: str, req: ProfileUpdateRequest, requ
 # ─── Phase 5: Stats & Notifications ─────────────────
 
 
-def _parse_since_param(since: str | None) -> datetime | None:
-    """解析 ?since= ISO8601 时间戳"""
-    if not since:
-        return None
-    from datetime import datetime
-
-    text = since.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid since timestamp: {since}") from exc
 
 
 @app.get("/api/stats", tags=["系统"])
