@@ -303,6 +303,28 @@ def _heuristic_complexity(task_description: str) -> Complexity | None:
     return None
 
 
+def _match_files_by_description(task_description: str, candidate_files: list[str]) -> list[str]:
+    """用描述中的标识符 token(类名/文件名)精确匹配候选文件 basename。
+
+    解决"未显式写文件路径但点了类名"的场景(如 "给 StringUtils 加方法")：从描述
+    提取标识符 token，匹配检索候选的 basename(不含扩展名)，命中才作为 writable
+    目标，避免把整个检索候选集设为可写。返回匹配到的文件路径(去重保序)。
+    """
+    import re as _re
+
+    if not task_description or not candidate_files:
+        return []
+    tokens = {t.lower() for t in _re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", task_description)}
+    if not tokens:
+        return []
+    matched: list[str] = []
+    for fp in candidate_files:
+        stem = fp.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        if stem in tokens:  # basename(无扩展)整体命中，避免泛匹配整个模块
+            matched.append(fp)
+    return list(dict.fromkeys(matched))
+
+
 def _build_simple_plan(task_description: str, affected_files: list[str] | None = None) -> TaskPlan:
     # Scope 解析优先级（确保 scope 既非空又精准）：
     # 1) 任务描述中【显式点名】的文件（如 "只修改 README.md"）—— 最强信号，
@@ -320,18 +342,28 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
         delete_files = list(dict.fromkeys(ops["delete"]))
         readable = list(dict.fromkeys(explicit + retrieved))
     elif retrieved:
-        modify_files = list(dict.fromkeys(retrieved))
+        # 未显式点名文件，但检索到候选。【不要把所有检索文件一股脑塞进 writable】——
+        # 那会导致 worker 上传/拉回整个模块、diff 巨大且脏(实测 RuoYi "加一个方法"
+        # 却圈了 88 文件)。改为：用描述里的【标识符 token】(类名/文件名)精确匹配检索
+        # 文件的 basename，命中的才作为 writable 目标；全部检索文件作 readable 上下文。
+        name_matched = _match_files_by_description(task_description, retrieved)
+        if name_matched:
+            modify_files = name_matched
+        else:
+            # 没匹配到具体文件：writable 留空 + allow_any，让 worker 在检索上下文里
+            # 自行定位并创建/修改目标文件，而不是盲目把整个候选集设为可写。
+            modify_files = []
         create_files = []
         delete_files = []
-        readable = modify_files
+        readable = list(dict.fromkeys(retrieved))
     else:
         modify_files = []
         create_files = []
         delete_files = []
         readable = []
-    # 无任何文件线索（如"写个推箱子游戏"这类从零/开放式需求）→ 放行任意路径，
+    # 无明确写目标（开放式需求 或 检索未精确命中文件）→ 放行任意路径，
     # 否则 scope_guard 会拒绝所有写操作导致 worker 寸步难行。
-    allow_any = not (modify_files or create_files or delete_files or readable)
+    allow_any = not (modify_files or create_files or delete_files)
     scope = FileScope(
         readable=readable,
         writable=modify_files,

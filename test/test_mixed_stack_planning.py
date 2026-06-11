@@ -78,6 +78,36 @@ def test_dominant_language_ignores_stray_other_lang_file():
     print("  ✅ [回归] 主导语言判定：87 java + 1 js → java(不被夹带文件误判)")
 
 
+def test_simple_plan_scope_not_over_inflated():
+    """[回归] SIMPLE 路径不再把所有检索候选塞进 writable(RuoYi e2e 暴露:88→1)。
+
+    描述点了类名 StringUtils → writable 应精确命中 StringUtils.java，
+    其余检索文件作 readable 上下文。
+    """
+    from swarm.brain.nodes import _build_simple_plan
+
+    desc = "在 ruoyi-common 模块给字符串工具类 StringUtils 增加 isMobile 方法"
+    affected = ["ruoyi-common/src/main/java/com/ruoyi/common/utils/StringUtils.java"] + [
+        f"ruoyi-admin/src/x/Foo{i}.java" for i in range(87)
+    ]
+    plan = _build_simple_plan(desc, affected)
+    sc = plan.subtasks[0].scope
+    assert len(sc.writable) == 1, f"writable 应精确为 1，实际 {len(sc.writable)}"
+    assert "StringUtils.java" in sc.writable[0]
+    assert len(sc.readable) == 88, "全部候选应作 readable 上下文"
+    print("  ✅ [回归] SIMPLE scope 精准化：88 候选 → writable 仅 StringUtils.java")
+
+
+def test_simple_plan_no_match_uses_allow_any():
+    """[回归] 描述未命中任何候选文件名 → writable 空 + allow_any(让 worker 自定位)。"""
+    from swarm.brain.nodes import _build_simple_plan
+
+    plan = _build_simple_plan("优化一下性能", ["a/Foo.java", "b/Bar.java"])
+    sc = plan.subtasks[0].scope
+    assert len(sc.writable) == 0 and sc.allow_any, "无命中应 writable 空 + allow_any"
+    print("  ✅ [回归] 无文件名命中 → allow_any 兜底(不盲圈整个候选集)")
+
+
 def main() -> int:
     print("=== test_mixed_stack_planning ===")
     failed = 0
@@ -87,6 +117,8 @@ def main() -> int:
         test_each_stack_maps_to_its_template,
         test_mixed_scope_dominant_when_no_produced_ext,
         test_dominant_language_ignores_stray_other_lang_file,
+        test_simple_plan_scope_not_over_inflated,
+        test_simple_plan_no_match_uses_allow_any,
     ):
         try:
             fn()
