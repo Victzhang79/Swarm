@@ -30,6 +30,9 @@ swarm.log
 *.log.*
 snapshots/
 workspace/
+# greenfield 从零创建的项目内容（保留目录本身，忽略生成内容）
+workdir/*
+!workdir/.gitkeep
 
 # ─── OS ───────────────────────────────────
 .DS_Store
