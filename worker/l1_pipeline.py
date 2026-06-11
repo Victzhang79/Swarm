@@ -20,6 +20,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tuple[int, str]:
+    """L1 命令执行器：沙箱优先(sandbox-first)。
+
+    若有活跃沙箱上下文 → 在沙箱里跑(那里有 mvn/java/go/cargo 等工具链)，
+    否则本地 subprocess。返回 (exit_code, output)。
+
+    这是 L1 确定性闸门跑 build/test/verify 的统一入口——保证 Java/Go/Rust 等
+    需要工具链的命令在沙箱里真实执行(本机通常没装这些工具链)。
+    """
+    sandbox = manager = None
+    try:
+        from swarm.tools.build_tools import get_sandbox_context
+        sandbox, manager = get_sandbox_context()
+    except Exception:  # noqa: BLE001
+        sandbox = manager = None
+
+    if sandbox is not None and manager is not None and hasattr(manager, "run_command"):
+        # 沙箱里跑：cd 到远程工作目录
+        try:
+            from swarm.config.settings import get_config
+            remote = get_config().sandbox.sandbox_remote_workdir
+        except Exception:  # noqa: BLE001
+            remote = "/workspace"
+        cr = manager.run_command(sandbox, f"cd {remote} && {command}", timeout=timeout)
+        out = (cr.stdout or "") + (("\n" + cr.stderr) if cr.stderr else "")
+        # run_command 成功 success=True；失败时 error 形如 exit_code=N
+        if cr.success:
+            return 0, out
+        ec = 1
+        if cr.error and "exit_code=" in cr.error:
+            try:
+                ec = int(cr.error.split("exit_code=")[1].split()[0])
+            except (ValueError, IndexError):
+                ec = 1
+        return ec, out + (f"\n{cr.error}" if cr.error else "")
+
+    # 本地兜底
+    try:
+        proc = subprocess.run(
+            _normalize_python_cmd(command), cwd=project_path, shell=True,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "command timeout"
+    except Exception as exc:  # noqa: BLE001
+        return 1, str(exc)
+
+
+
 def _scope_violations(diff: str, scope: FileScope) -> list[str]:
     modified = files_from_unified_diff(diff)
     writable = set(scope.writable or [])
@@ -620,6 +670,21 @@ def run_l1_pipeline(
     if not compile_ok:
         return False, details
 
+    # ── L1.2.1 harness.build_command 编译闸门（Java/Go/Rust 等需工具链语言）──
+    # _compile_files 仅覆盖 py/js 语法检查；Java(mvn)/Go(go build)/Rust(cargo)
+    # 的真实编译靠 Brain 编写的 harness.build_command，在沙箱里跑(那里有工具链)。
+    # 这是补齐 5 语言生产级编译验证的关键——杜绝"Java 改坏了但确定性层不知道"。
+    build_cmd = getattr(harness, "build_command", "") if harness else ""
+    if build_cmd:
+        b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
+        build_ok = b_ec == 0
+        details["l1_2_1_build_ok"] = build_ok
+        details["build_command"] = build_cmd
+        details["build_output"] = compress_tool_output(b_out, max_chars=1500)
+        if not build_ok:
+            details["build_failed"] = build_cmd
+            return False, details
+
     # ── L1.2.0 自动格式化（L0 闸门）──
     # 在 lint 之前先确定性格式化改动文件：把"风格"从模型负担降级为系统自动行为。
     # SWARM_WORKER_L1_FORMAT=false 可关闭。工具缺失优雅 skip，绝不阻断。
@@ -675,31 +740,15 @@ def run_l1_pipeline(
         details["l1_3_test_ok"] = True
         details["test_skipped"] = True
     else:
-        try:
-            proc = subprocess.run(
-                _normalize_python_cmd(test_cmd),
-                cwd=project_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            test_ok = proc.returncode == 0
-            details["l1_3_test_ok"] = test_ok
-            # 智能压缩：提取关键失败信号行（FAILED/Error/Traceback/assert），
-            # 替代盲目硬截断 —— 避免丢失位于输出末尾的 pytest 失败摘要。
-            details["test_output"] = compress_tool_output(
-                proc.stdout or proc.stderr or "", max_chars=1500
-            )
-            if not test_ok:
-                return False, details
-        except subprocess.TimeoutExpired:
-            details["l1_3_test_ok"] = False
+        t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=timeout)
+        test_ok = t_ec == 0
+        details["l1_3_test_ok"] = test_ok
+        # 智能压缩：提取关键失败信号行（FAILED/Error/Traceback/assert），
+        # 替代盲目硬截断 —— 避免丢失位于输出末尾的 pytest 失败摘要。
+        details["test_output"] = compress_tool_output(t_out, max_chars=1500)
+        if t_ec == 124:
             details["test_output"] = "test timeout"
-            return False, details
-        except Exception as exc:
-            details["l1_3_test_ok"] = False
-            details["test_output"] = str(exc)
+        if not test_ok:
             return False, details
 
     # ── L1.3.5 harness 验收命令（verify_commands）——
@@ -709,27 +758,13 @@ def run_l1_pipeline(
     if verify_cmds:
         verify_results = []
         for vc in verify_cmds:
-            try:
-                proc = subprocess.run(
-                    _normalize_python_cmd(vc), cwd=project_path, shell=True,
-                    capture_output=True, text=True, timeout=timeout,
-                )
-                ok = proc.returncode == 0
-                verify_results.append({
-                    "cmd": vc, "ok": ok,
-                    "output": compress_tool_output(proc.stdout or proc.stderr or "", max_chars=500),
-                })
-                if not ok:
-                    details["verify_commands"] = verify_results
-                    details["verify_failed"] = vc
-                    return False, details
-            except subprocess.TimeoutExpired:
-                verify_results.append({"cmd": vc, "ok": False, "output": "timeout"})
-                details["verify_commands"] = verify_results
-                details["verify_failed"] = vc
-                return False, details
-            except Exception as exc:
-                verify_results.append({"cmd": vc, "ok": False, "output": str(exc)})
+            v_ec, v_out = _run_l1_command(vc, project_path, timeout=timeout)
+            ok = v_ec == 0
+            verify_results.append({
+                "cmd": vc, "ok": ok,
+                "output": compress_tool_output(v_out, max_chars=500),
+            })
+            if not ok:
                 details["verify_commands"] = verify_results
                 details["verify_failed"] = vc
                 return False, details
