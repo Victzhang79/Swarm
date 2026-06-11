@@ -191,7 +191,7 @@ curl -X POST http://localhost:8420/api/projects/<pid>/knowledge/webhook/git \
 
 ## 测试
 
-> 当前 **340 passing**（不含需外部 CubeSandbox 的 `test_sandbox_integration.py`）。
+> 当前 **432 passing**（不含需外部 CubeSandbox 的 `test_sandbox_integration.py`）。
 
 ```bash
 # 推荐
@@ -249,6 +249,7 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `SWARM_GITLAB_*` | V3 验证 / MR |
 | `SWARM_REDIS_ENABLED` | 模块锁 |
 | `SWARM_RBAC_ENABLED` | 多用户 |
+| `SWARM_SANDBOX_POOL_ENABLED` | 沙箱热池（预热复用，省去每任务冷启动；池状态见系统 tab + `GET /api/sandbox/pool`）|
 | `SWARM_WORKER_L1_LINT` / `_LINT_GATE` / `_SELF_REVIEW` | Worker L1 确定性闸门开关（默认全开硬阻断）|
 | `SWARM_WORKER_COMMAND_WHITELIST` | 全局命令白名单（harness.extra_whitelist 在其上追加）|
 | `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关（L1 确定性证据回写为结构化 feedback）|
@@ -313,6 +314,49 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 
 - ✅ **只能导入现有目录** → `POST /api/projects` 支持 `greenfield=true`（path 可空，自动建 `workdir/<name>`）；WebUI 加「导入现有 / 从零创建」单选；`FileScope.allow_any` 让开放式需求可自由建文件（`api/routers/project.py`、`api/static/js/core/project.js`、`types.py`）。实测：「写个推箱子游戏」→生成可运行 229 行代码。
 - ✅ **派发偏串行**（LLM 把独立子任务拆进各自 group）→ `get_dispatch_batch` 改为**依赖驱动**：派发所有 `depends_on` 已满足的子任务并行执行，`parallel_groups` 降为软提示（`types.py`）。
+
+### 最新一轮 — RuoYi 混编 E2E 实战（沙箱池 + 真实编译验证打通）
+
+> 用真实企业级多模块 Java 项目（RuoYi，6 模块）+ 开启沙箱热池跑端到端，
+> 每个 bug 均有任务日志 + 沙箱日志 + mvn 编译结果佐证（非单测推断）。
+> 成果：trivial 改动「代码生成→沙箱编译→diff 收集→merge→DONE」全链路真通，
+> `mvn -pl <mod> -am compile exit=0` + L1 确定性通过 + 干净 diff + 单次无重试循环。
+
+**沙箱 / 编译验证（5 语言生产级的真实落地）**
+
+- ✅ **L1 确定性闸门只编 py/js，不验 Java/Go/Rust** → 新增 L1.2.1 build 闸门，
+  在沙箱里真跑 `harness.build_command`（mvn/go build/cargo）；新增 `_run_l1_command`
+  沙箱优先执行器（工具链在沙箱，不在本机）（`worker/l1_pipeline.py`）。
+- ✅ **502 Bad Gateway（shell 命令走 Jupyter，语言镜像无 kernel）** → build/clean/
+  健康探针/pull-back 文件枚举/webui 读文件与列目录全切原生 shell 端点（`commands.run`）
+  （`tools/build_tools.py`、`worker/sandbox.py`、`worker/executor.py`）。
+- ✅ **mvn 找不到 POM / 多模块 reactor 秒挂** → 同步构建清单（pom/gradle/go.mod/
+  Cargo.toml 等）+ 多模块按改动模块限定 `mvn -pl <mod> -am`（`worker/executor.py`、
+  `worker/l1_pipeline.py`）。
+- ✅ **cannot find symbol 秒挂** → 编译型语言（JVM 系）同步【改动所在模块的完整源码树】，
+  解决「精准 scope 同步」与「整模块编译」的根本矛盾（`worker/executor.py`）。
+- ✅ **构建/测试闸门工程文件缺失误判失败**（如 Java 项目里的纯前端 JS 触发 npm）→
+  `_build_cmd_applicable` 按工具链工程文件存在性优雅跳过（`worker/l1_pipeline.py`）。
+
+**diff 收集 / 闸门正确性（杜绝假通）**
+
+- ✅ **「DONE 但 merged_diff 为空」假通 + 重试死循环** → diff 基线改用 git HEAD 提交版，
+  防本地工作副本被前序运行 pull-back 污染（`worker/executor.py`）。
+- ✅ **CRLF/LF 行尾不一致 → 整文件 churn 垃圾 diff（44KB 全删全增，真实改动被淹没）** →
+  diff 比较前归一化行尾（`worker/executor.py`）。
+- ✅ **空 diff 却因「原代码能编译」误判 PASS** → 空 diff + 期望有产出（writable/
+  create_files 非空）直接判失败，触发重试/换模型，杜绝「没干活」假 DONE（`worker/executor.py`）。
+
+**小模型可用性 / 上下文**
+
+- ✅ **小模型反复「need more steps」** → trivial 路径 recursion_limit 12→30，撞上限优雅
+  交确定性闸门按真实文件状态裁决（`worker/executor.py`）。
+- ✅ **196k 上下文顶穿（read_file 无界返回整文件 + run_command 无界输出）** → 工具输出硬
+  上限（read 450 行/32KB，命令输出 compress 4KB），防 ReAct message 历史爆炸（`tools/`）。
+- ✅ **embedding 端点硬编码 localhost:3000** → 改用配置 `SWARM_MODEL_LOCAL_BASE_URL`（`project/preprocess.py`）。
+
+> 已知外部变量：本地模型（ai.bit:3000 网关）偶发流式 stall（120s 无 chunk），属远端
+> 推理服务可靠性问题，现有 fallback 容错可恢复；待办见 [`TECH_DEBT.md`](TECH_DEBT.md)。
 
 ### 本轮已修复
 
