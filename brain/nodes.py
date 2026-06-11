@@ -55,6 +55,7 @@ from swarm.types import (
     SubTaskDifficulty,
     SubTaskModality,
     TaskHarness,
+    TaskIntent,
     TaskPlan,
     WorkerOutput,
 )
@@ -160,47 +161,105 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
     def has(*kw: str) -> bool:
         return any(k in text for k in kw)
 
-    # 语言判定（scope 后缀优先，其次描述关键词）
+    # 语言判定（scope 后缀优先，其次描述关键词）→ 完整工具链矩阵
+    # 每语言给出 build/test/lint/typecheck/sast + setup(运行时装工具) + 白名单。
+    # 工具缺失时由 L1/审计层优雅降级，这里只声明"理想命令"。
     if "py" in exts or has("python", "pytest", "django", "flask", "fastapi", "pygame"):
         return TaskHarness(
             language="python",
+            setup_commands=["pip install -q ruff bandit pip-audit 2>/dev/null || true"],
             build_command="python -m py_compile .",
             test_command="python -m pytest -q",
+            lint_command="ruff check .",
+            typecheck_command="mypy . --ignore-missing-imports",
+            sast_command="bandit -r . -ll -f json",
             extra_whitelist=[
                 "python", "python3", "python -m", "python -c",
-                "pytest", "ruff", "mypy", "pip install", "ls", "cat",
+                "pytest", "ruff", "mypy", "bandit", "pip-audit", "pip install",
+                "ls", "cat",
             ],
         )
     if exts & {"js", "jsx", "ts", "tsx"} or has("node", "npm", "react", "typescript", "vue"):
         return TaskHarness(
             language="node",
-            build_command="npm run build",
+            setup_commands=["npm ci 2>/dev/null || npm install 2>/dev/null || true"],
+            build_command="npm run build --if-present",
             test_command="npm test",
-            extra_whitelist=["node", "npm", "npx", "tsc", "eslint", "ls", "cat"],
+            lint_command="npx --no-install eslint .",
+            typecheck_command="npx --no-install tsc --noEmit",
+            sast_command="npm audit --json",
+            extra_whitelist=[
+                "node", "npm", "npx", "tsc", "eslint", "semgrep", "ls", "cat",
+            ],
         )
     if "go" in exts or has("golang", " go "):
         return TaskHarness(
             language="go",
+            setup_commands=["go mod download 2>/dev/null || true"],
             build_command="go build ./...",
             test_command="go test ./...",
-            extra_whitelist=["go ", "gofmt", "ls", "cat"],
+            lint_command="go vet ./...",
+            sast_command="gosec -fmt=json ./... 2>/dev/null || govulncheck ./...",
+            extra_whitelist=[
+                "go ", "gofmt", "go vet", "staticcheck", "gosec", "govulncheck",
+                "ls", "cat",
+            ],
         )
     if "rs" in exts or has("rust", "cargo"):
         return TaskHarness(
             language="rust",
             build_command="cargo build",
             test_command="cargo test",
-            extra_whitelist=["cargo", "rustc", "ls", "cat"],
+            lint_command="cargo clippy -- -D warnings",
+            sast_command="cargo audit",
+            extra_whitelist=[
+                "cargo", "rustc", "clippy-driver", "cargo-audit", "ls", "cat",
+            ],
         )
     if exts & {"java", "kt"} or has("maven", "gradle", "java", "spring"):
         return TaskHarness(
             language="java",
-            build_command="mvn compile",
-            test_command="mvn test",
-            extra_whitelist=["mvn", "gradle", "javac", "ls", "cat"],
+            build_command="mvn -q compile",
+            test_command="mvn -q test",
+            lint_command="mvn -q checkstyle:check",
+            sast_command="mvn -q com.github.spotbugs:spotbugs-maven-plugin:check",
+            extra_whitelist=[
+                "mvn", "gradle", "javac", "checkstyle", "spotbugs",
+                "dependency-check", "ls", "cat",
+            ],
         )
-    # 兜底：通用，至少放行基本探查命令
-    return TaskHarness(language="", extra_whitelist=["ls", "cat", "python -c", "python -m py_compile"])
+    # 兜底：通用，至少放行基本探查命令 + 跨语言密钥扫描
+    return TaskHarness(
+        language="",
+        extra_whitelist=["ls", "cat", "python -c", "python -m py_compile", "gitleaks", "trufflehog"],
+    )
+
+
+def _infer_intent(task_description: str, *, greenfield: bool = False) -> "TaskIntent":
+    """从任务描述启发式推断意图（LLM 未显式给出时的兜底）。
+
+    优先级：审计/排错/重构 关键词 > greenfield(新建) > 默认 MODIFY。
+    LLM plan 显式给出 intent 时以 LLM 为准（TaskPlan(**result) 自动覆盖）。
+    """
+    from swarm.types import TaskIntent
+
+    t = (task_description or "").lower()
+
+    def has(*kw: str) -> bool:
+        return any(k in t for k in kw)
+
+    if has("安全审计", "审计", "漏洞", "security audit", "audit", "sast",
+           "vulnerab", "cve", "渗透", "安全扫描", "密钥泄露", "secret scan"):
+        return TaskIntent.AUDIT
+    if has("排错", "调试", "修复 bug", "fix bug", "debug", "报错", "复现",
+           "traceback", "异常", "崩溃", "stack trace", "failing test"):
+        return TaskIntent.DEBUG
+    if has("重构", "refactor", "重组", "拆分模块", "解耦", "整理代码", "代码清理"):
+        return TaskIntent.REFACTOR
+    if greenfield or has("从零", "新建项目", "写一个", "写个", "实现一个", "做一个",
+                         "create a new", "build a", "greenfield", "scaffold"):
+        return TaskIntent.CREATE
+    return TaskIntent.MODIFY
 
 
 def _heuristic_complexity(task_description: str) -> Complexity | None:
@@ -251,6 +310,7 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
             SubTask(
                 id="st-1",
                 description=task_description,
+                intent=_infer_intent(task_description, greenfield=allow_any),
                 difficulty=SubTaskDifficulty.TRIVIAL,
                 modality=SubTaskModality.TEXT,
                 scope=scope,
@@ -567,6 +627,12 @@ async def plan(state: BrainState) -> dict:
         h = getattr(st, "harness", None)
         if h is None or not (h.build_command or h.test_command or h.verify_commands or h.extra_whitelist):
             st.harness = _infer_harness(st.description or task_description, st.scope)
+        # intent 兜底：LLM 未显式给出(默认 MODIFY) 时按描述启发式推断，
+        # 让 AUDIT/DEBUG/REFACTOR 等差异化意图也能在 LLM 漏标时被识别。
+        if st.intent == TaskIntent.MODIFY:
+            inferred = _infer_intent(st.description or task_description)
+            if inferred != TaskIntent.MODIFY:
+                st.intent = inferred
     plan_touch = touch_context(
         state,
         "plan",

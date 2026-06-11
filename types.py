@@ -116,6 +116,23 @@ class SubTaskModality(str, Enum):
     MULTIMODAL = "multimodal"  # 需要看图/UI截图/设计图/文档图片
 
 
+class TaskIntent(str, Enum):
+    """任务意图分类 — 驱动差异化编排/harness/验收。
+
+    不同意图的工作流根本不同：
+    - CREATE 从零写新代码(greenfield)，验收=能构建+测试通过
+    - MODIFY 在现有代码上改(默认)，验收=改动正确+不回归
+    - DEBUG 排错，工作流=复现失败→定位→修复→回归验证
+    - AUDIT 安全审计，不产 diff 而产结构化报告(SAST+依赖+密钥)
+    - REFACTOR 重构，验收=行为不变(测试全过)+结构改善
+    """
+    CREATE = "create"
+    MODIFY = "modify"      # 默认，向后兼容
+    DEBUG = "debug"
+    AUDIT = "audit"
+    REFACTOR = "refactor"
+
+
 class TaskHarness(BaseModel):
     """子任务验证 harness — Brain 编排时精心编写，告诉 Worker【如何验证产出合格】。
 
@@ -130,6 +147,22 @@ class TaskHarness(BaseModel):
     setup_commands: list[str] = Field(default_factory=list, description="依赖安装/准备命令(如 pip install -r)")
     build_command: str = Field(default="", description="编译/构建命令(解释型语言可为语法检查)")
     test_command: str = Field(default="", description="测试命令(如 python -m pytest -q)")
+    lint_command: str = Field(
+        default="",
+        description="静态检查命令(如 ruff check / go vet / cargo clippy)；L1 静态闸门用",
+    )
+    typecheck_command: str = Field(
+        default="",
+        description="类型检查命令(如 mypy / tsc --noEmit)；默认仅警告不阻断",
+    )
+    sast_command: str = Field(
+        default="",
+        description="安全静态扫描命令(如 bandit / gosec / semgrep)；AUDIT 意图用",
+    )
+    failing_test_command: str = Field(
+        default="",
+        description="DEBUG 意图：复现 bug 的失败用例命令(修复前应失败、修复后应通过)",
+    )
     verify_commands: list[str] = Field(
         default_factory=list,
         description="额外验收命令(如 python -c 'import m; assert m.f()' 烟雾测试)",
@@ -137,6 +170,10 @@ class TaskHarness(BaseModel):
     extra_whitelist: list[str] = Field(
         default_factory=list,
         description="本任务需放行的命令前缀(并入全局白名单，让上述命令可执行)",
+    )
+    sandbox_template: str = Field(
+        default="",
+        description="可选：指定 CubeSandbox 模板ID(预建语言镜像)；留空用默认镜像+setup_commands 运行时装工具链",
     )
 
     def all_commands(self) -> list[str]:
@@ -153,6 +190,10 @@ class SubTask(BaseModel):
     """一个可独立执行的子任务"""
     id: str
     description: str
+    intent: TaskIntent = Field(
+        default=TaskIntent.MODIFY,
+        description="任务意图(create/modify/debug/audit/refactor)，驱动差异化编排与验收",
+    )
     difficulty: SubTaskDifficulty = SubTaskDifficulty.MEDIUM
     modality: SubTaskModality = SubTaskModality.TEXT
     scope: FileScope
@@ -232,6 +273,27 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+class Severity(str, Enum):
+    """安全发现严重度（与 CVSS 分级对齐）"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+class SecurityFinding(BaseModel):
+    """单条安全审计发现（SAST / 依赖漏洞 / 密钥泄露）"""
+    severity: Severity = Severity.MEDIUM
+    category: str = Field(default="", description="类别: sast / dependency / secret")
+    rule_id: str = Field(default="", description="规则/CWE/CVE 标识(如 CWE-89, CVE-2024-xxx)")
+    title: str = Field(default="", description="问题摘要")
+    file: str = Field(default="", description="文件路径")
+    line: int = Field(default=0, description="行号(0=不适用,如依赖漏洞)")
+    tool: str = Field(default="", description="检出工具: bandit/gosec/semgrep/gitleaks/...")
+    recommendation: str = Field(default="", description="修复建议")
+
+
 class WorkerOutput(BaseModel):
     """Worker 执行完子任务后的产出"""
     subtask_id: str
@@ -242,6 +304,10 @@ class WorkerOutput(BaseModel):
     l1_details: dict[str, Any] = Field(default_factory=dict)
     execution_log: str = ""
     notes: str = Field(default="", description="需人工审查的部分（Worker 自报，供审批/学习节点参考）")
+    audit_findings: list[SecurityFinding] = Field(
+        default_factory=list,
+        description="AUDIT 意图产出：安全审计发现列表(此类任务通常不产 diff)",
+    )
 
 
 # ──────────────────────────────────────────────
