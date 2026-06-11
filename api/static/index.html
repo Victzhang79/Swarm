@@ -641,6 +641,15 @@
         <button class="btn btn-ghost btn-sm" onclick="refreshOrphanCount()">刷新</button>
         <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" onclick="cleanupOrphanSandboxes()">🧹 清理孤儿</button>
       </div>
+
+      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🔥 热沙箱池</h3>
+      <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">预热复用沙箱省冷启动；按语言分桶、自动健康检查 + TTL/空闲回收。<code>SWARM_SANDBOX_POOL_ENABLED=true</code> 开启。</p>
+      <div id="pool-status-card" style="font-size:12px;color:var(--text-muted);padding:8px;background:var(--bg-secondary,rgba(0,0,0,0.03));border-radius:6px">加载中…</div>
+      <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-top:8px">
+        <button class="btn btn-ghost btn-sm" onclick="refreshPoolStatus()">刷新池状态</button>
+        <button class="btn btn-secondary btn-sm" id="btn-pool-reap" onclick="reapPool()">♻️ 回收(池+孤儿)</button>
+      </div>
+
       <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
     </div>
   </div>

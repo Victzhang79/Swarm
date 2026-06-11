@@ -21,8 +21,9 @@ function toggleSettings() {
   const overlay = $('settings-overlay');
   const open = drawer.classList.toggle('open');
   overlay.classList.toggle('open', open);
-  // 抽屉打开时刷新孤儿沙箱数（全局运维，不跟项目）
+  // 抽屉打开时刷新孤儿沙箱数 + 热池状态（全局运维，不跟项目）
   if (open && typeof refreshOrphanCount === 'function') refreshOrphanCount();
+  if (open && typeof refreshPoolStatus === 'function') refreshPoolStatus();
 }
 
 // ─── Add Project Modal ─────────────────────────────────────

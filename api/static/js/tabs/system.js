@@ -464,4 +464,53 @@ async function cleanupOrphanSandboxes() {
   }
 }
 
+// ─── 全局热沙箱池状态卡 ───────────────────────────────────────
+async function refreshPoolStatus() {
+  const el = document.getElementById('pool-status-card');
+  if (!el) return;
+  el.textContent = '加载中…';
+  try {
+    const resp = await fetch('/api/sandbox/pool');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || 'HTTP ' + resp.status);
+    if (!data.pool_enabled) {
+      el.innerHTML = '<span class="pill pill-gray">未启用</span> 设 <code>SWARM_SANDBOX_POOL_ENABLED=true</code> 开启热池复用。'
+        + `<div style="margin-top:6px">服务端沙箱 ${data.server_total ?? 0} 个，孤儿 ${data.orphan_count ?? 0} 个。</div>`;
+      return;
+    }
+    const p = data.pool || {};
+    const buckets = p.idle_by_template || {};
+    const bucketRows = Object.keys(buckets).length
+      ? Object.entries(buckets).map(([k, v]) => `<code>${escapeHtml(k.substring(0, 16) || '(default)')}</code>: ${v} 待命`).join(' · ')
+      : '（暂无待命沙箱）';
+    el.innerHTML = `
+      <div><span class="pill pill-green">已启用</span></div>
+      <div style="margin-top:6px">借出 <b>${p.borrowed ?? 0}</b> · 空闲 <b>${p.total_idle ?? 0}</b> · 总计 <b>${p.total ?? 0}</b>/${p.max_total ?? '?'} · 历史创建 ${p.created_total ?? 0}</div>
+      <div style="margin-top:6px">按语言桶: ${bucketRows}</div>
+      <div style="margin-top:6px;color:var(--text-muted)">服务端共 ${data.server_total ?? 0} 个 · 孤儿 ${data.orphan_count ?? 0} 个 · TTL ${p.ttl_seconds ?? '?'}s / 空闲 ${p.idle_seconds ?? '?'}s</div>`;
+  } catch (e) {
+    el.textContent = '获取池状态失败: ' + e.message;
+  }
+}
+
+async function reapPool() {
+  if (!confirm('回收：清理池内超时/空闲沙箱 + 服务端孤儿沙箱？不影响正在使用的。')) return;
+  const btn = document.getElementById('btn-pool-reap');
+  if (btn) { btn.disabled = true; btn.textContent = '回收中…'; }
+  try {
+    const resp = await fetch('/api/sandbox/pool/reap?include_orphans=true', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '回收失败');
+    const pr = data.pool_reap || {};
+    const oc = data.orphan_cleanup || {};
+    showToast(`回收完成：池 kill ${pr.killed ?? 0}、孤儿 kill ${oc.killed ?? 0}`, 'success');
+    await refreshPoolStatus();
+    await refreshOrphanCount();
+  } catch (e) {
+    showToast('回收失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '♻️ 回收(池+孤儿)'; }
+  }
+}
+
 // ─── Retrieve experiment ─────────────────────────────────────

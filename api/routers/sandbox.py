@@ -172,6 +172,89 @@ async def list_orphan_sandboxes():
     }
 
 
+# ─── 9d. GET /api/sandbox/pool — 全局热池可观测面板 ─
+@router.get("/api/sandbox/pool", tags=["沙箱"])
+async def sandbox_pool_status():
+    """全局热沙箱池状态卡：池统计 + 孤儿沙箱 + 服务端总数，一处汇总。
+
+    供 webui 全局池面板展示：是否启用、各语言桶深度、借出/空闲、孤儿数、复用率。
+    """
+    from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+
+    manager = _app._get_sandbox_manager()
+    loop = asyncio.get_running_loop()
+    server_list = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
+    orphan_ids = _orphan_sandbox_ids(manager, server_list)
+
+    enabled = pool_enabled()
+    pool_stats: dict = {}
+    if enabled:
+        try:
+            pool_stats = get_sandbox_pool().stats()
+        except Exception as exc:  # noqa: BLE001
+            _app.logger.warning("获取池 stats 失败: %s", exc)
+            pool_stats = {"error": str(exc)}
+
+    return {
+        "status": "ok",
+        "pool_enabled": enabled,
+        "pool": pool_stats,
+        "server_total": len(server_list),
+        "orphan_count": len(orphan_ids),
+        "config": {
+            "templates": {
+                "python": _app.get_config().sandbox.template_python,
+                "node": _app.get_config().sandbox.template_node,
+                "java": _app.get_config().sandbox.template_java,
+                "go": _app.get_config().sandbox.template_go,
+                "rust": _app.get_config().sandbox.template_rust,
+            },
+            "max_total": _app.get_config().sandbox.pool_max_total,
+            "max_idle_per_template": _app.get_config().sandbox.pool_max_idle_per_template,
+            "ttl_seconds": _app.get_config().sandbox.pool_ttl_seconds,
+            "idle_seconds": _app.get_config().sandbox.pool_idle_seconds,
+        },
+    }
+
+
+# ─── 9e. POST /api/sandbox/pool/reap — 主动回收(孤儿/超时统一入口) ─
+@router.post("/api/sandbox/pool/reap", tags=["沙箱"])
+async def sandbox_pool_reap(include_orphans: bool = True):
+    """主动触发回收：池内超 TTL/空闲沙箱 + （可选）服务端孤儿沙箱。
+
+    统一的"清理孤儿"入口（取代分散的手动清理）：
+    - 池 reap：回收池内超龄/空闲沙箱。
+    - include_orphans=true（默认）：并清理服务端孤儿沙箱（无项目/任务关联）。
+    """
+    from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+
+    manager = _app._get_sandbox_manager()
+    loop = asyncio.get_running_loop()
+    result: dict = {"status": "ok"}
+
+    if pool_enabled():
+        try:
+            result["pool_reap"] = await loop.run_in_executor(None, get_sandbox_pool().reap)
+        except Exception as exc:  # noqa: BLE001
+            result["pool_reap"] = {"error": str(exc)}
+    else:
+        result["pool_reap"] = {"skipped": "pool disabled"}
+
+    if include_orphans:
+        orphans = await loop.run_in_executor(None, _orphan_sandbox_ids, manager)
+        if orphans:
+            kills = await asyncio.gather(
+                *[loop.run_in_executor(None, manager.kill, sid) for sid in orphans],
+                return_exceptions=True,
+            )
+            failed = sum(1 for r in kills if isinstance(r, Exception))
+            result["orphan_cleanup"] = {"killed": len(orphans) - failed, "failed": failed}
+        else:
+            result["orphan_cleanup"] = {"killed": 0}
+
+    return result
+
+
 def _orphan_sandbox_ids(manager, server_list=None) -> list[str]:
     """计算孤儿沙箱 ID：服务端存在，但本进程 meta 里无 project_id 且无 task_id 关联。
 
