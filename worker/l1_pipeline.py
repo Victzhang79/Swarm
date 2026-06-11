@@ -104,109 +104,367 @@ def _find_ruff_bin() -> str | None:
     return None
 
 
-def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tuple[bool, str, list[dict]]:
-    """对修改的文件跑 lint（ruff / eslint），返回 (has_error, message, issues)。
+def _find_tool(name: str) -> str | None:
+    """通用工具探测（shutil.which），找不到返回 None。"""
+    return shutil.which(name)
 
-    - Python: ruff check，只计 error 级别，warning 忽略
-    - JS/TS: eslint（项目有配置才跑，否则跳过）
-    - lint 工具不可用时优雅跳过
+
+# ── 语言分派: per-linter 辅助 ──
+
+def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+    """Python: ruff check。返回 (has_error, messages, issues)。"""
+    has_error = False
+    messages: list[str] = []
+    issues: list[dict] = []
+
+    ruff_bin = _find_ruff_bin()
+    if not ruff_bin:
+        messages.append("ruff 未安装，跳过 Python lint")
+        return has_error, messages, issues
+
+    for fp in py_files[:20]:
+        try:
+            proc = subprocess.run(
+                [ruff_bin, "check", fp, "--output-format=json"],
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            # ruff 退出码: 0=无问题, 1=有问题, 2=运行错误
+            if proc.returncode == 2:
+                messages.append(f"ruff 运行错误({fp}): {proc.stderr[:200]}")
+                continue
+            if proc.stdout.strip():
+                try:
+                    findings = json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    findings = []
+                for item in findings:
+                    # ruff JSON: code 可能是 str("F401"/"invalid-syntax") 或旧版 dict{value}
+                    raw_code = item.get("code")
+                    if isinstance(raw_code, dict):
+                        rule_code = raw_code.get("value", "") or ""
+                    else:
+                        rule_code = raw_code or ""
+                    issue_entry = {
+                        "file": fp,
+                        "line": item.get("location", {}).get("row"),
+                        "code": rule_code,
+                        "message": item.get("message", ""),
+                    }
+                    # 优先用 ruff 自报的 severity；否则按代码前缀判定。
+                    # invalid-syntax / E9(语法) / F4(导入*等致命) / F82(未定义名) 视为 error。
+                    ruff_sev = (item.get("severity") or "").lower()
+                    is_error = (
+                        ruff_sev == "error"
+                        or rule_code == "invalid-syntax"
+                        or rule_code.startswith(("E9", "F4", "F82", "F7"))
+                    )
+                    if is_error:
+                        issue_entry["severity"] = "error"
+                        has_error = True
+                    else:
+                        issue_entry["severity"] = "warning"
+                    issues.append(issue_entry)
+        except subprocess.TimeoutExpired:
+            messages.append(f"ruff 超时({fp})")
+        except Exception as exc:
+            messages.append(f"ruff 跳过({fp}): {exc}")
+    return has_error, messages, issues
+
+
+def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+    """JS/TS: eslint（有配置才跑）。返回 (has_error, messages, issues)。"""
+    has_error = False
+    messages: list[str] = []
+    issues: list[dict] = []
+
+    has_eslint_config = any(
+        os.path.isfile(os.path.join(project_path, cfg))
+        for cfg in (".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", ".eslintrc", "eslint.config.js")
+    )
+    if not has_eslint_config:
+        messages.append("项目无 eslint 配置，跳过 JS/TS lint")
+        return has_error, messages, issues
+
+    try:
+        proc = subprocess.run(
+            "npx eslint --format json " + " ".join(f'"{f}"' for f in js_ts[:20]),
+            cwd=project_path,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        # eslint 退出码: 0=无问题, 1=有问题, 2=运行错误
+        if proc.returncode == 2:
+            messages.append(f"eslint 运行错误: {proc.stderr[:200]}")
+        elif proc.stdout.strip():
+            try:
+                eslint_results = json.loads(proc.stdout)
+                for file_result in eslint_results:
+                    for msg in file_result.get("messages", []):
+                        sev = "error" if msg.get("severity") == 2 else "warning"
+                        issues.append({
+                            "file": file_result.get("filePath", ""),
+                            "line": msg.get("line"),
+                            "code": msg.get("ruleId", ""),
+                            "message": msg.get("message", ""),
+                            "severity": sev,
+                        })
+                        if sev == "error":
+                            has_error = True
+            except json.JSONDecodeError:
+                messages.append("eslint 输出解析失败")
+    except subprocess.TimeoutExpired:
+        messages.append("eslint 超时")
+    except Exception as exc:
+        messages.append(f"eslint 跳过: {exc}")
+    return has_error, messages, issues
+
+
+def _lint_go(project_path: str, go_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+    """Go: go vet ./...（在 project_path 跑；非0退出且有 error 输出才算 has_error）。"""
+    has_error = False
+    messages: list[str] = []
+    issues: list[dict] = []
+
+    go_bin = _find_tool("go")
+    if not go_bin:
+        messages.append("go 未安装，跳过 Go lint")
+        return has_error, messages, issues
+
+    # 无 go.mod 时 go vet 无法跑，跳过（对齐 eslint 无配置则跳过的风格）
+    if not os.path.isfile(os.path.join(project_path, "go.mod")):
+        messages.append("项目无 go.mod，跳过 Go lint")
+        return has_error, messages, issues
+
+    try:
+        proc = subprocess.run(
+            [go_bin, "vet", "./..."],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            err_output = (proc.stderr or "").strip()
+            if err_output:
+                for line in err_output.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    issue_entry: dict = {
+                        "file": "",
+                        "line": None,
+                        "code": "govet",
+                        "message": line,
+                        "severity": "error",
+                    }
+                    # 尝试解析 file:line:col: message 格式
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        issue_entry["file"] = parts[0]
+                        try:
+                            issue_entry["line"] = int(parts[1])
+                        except ValueError:
+                            pass
+                    issues.append(issue_entry)
+                has_error = True
+    except subprocess.TimeoutExpired:
+        messages.append("go vet 超时")
+    except Exception as exc:
+        messages.append(f"go vet 跳过: {exc}")
+    return has_error, messages, issues
+
+
+def _lint_rust(project_path: str, rs_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+    """Rust: cargo clippy -- -D warnings（clippy 把 warning 当 error）。"""
+    has_error = False
+    messages: list[str] = []
+    issues: list[dict] = []
+
+    cargo_bin = _find_tool("cargo")
+    if not cargo_bin:
+        messages.append("cargo 未安装，跳过 Rust lint")
+        return has_error, messages, issues
+
+    # 无 Cargo.toml 时 cargo clippy 无法跑，跳过
+    if not os.path.isfile(os.path.join(project_path, "Cargo.toml")):
+        messages.append("项目无 Cargo.toml，跳过 Rust lint")
+        return has_error, messages, issues
+
+    try:
+        proc = subprocess.run(
+            [cargo_bin, "clippy", "--", "-D", "warnings"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            err_output = (proc.stderr or "").strip()
+            if err_output:
+                for line in err_output.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # 跳过摘要行
+                    if line.startswith("warning: generated") or line.startswith("error: aborting"):
+                        continue
+                    if ": error[" in line or ": warning[" in line or line.startswith("error:"):
+                        issue_entry: dict = {
+                            "file": "",
+                            "line": None,
+                            "code": "clippy",
+                            "message": line,
+                            "severity": "error",  # -D warnings => all warnings are errors
+                        }
+                        # 尝试解析 file:line:col 格式
+                        # Rust 输出: src/main.rs:2:5: error[E0425]: ...
+                        for prefix in line.split(": "):
+                            parts = prefix.split(":")
+                            if len(parts) >= 2:
+                                try:
+                                    int(parts[1])
+                                    issue_entry["file"] = parts[0]
+                                    issue_entry["line"] = int(parts[1])
+                                    break
+                                except ValueError:
+                                    continue
+                        issues.append(issue_entry)
+                if issues:
+                    has_error = True
+    except subprocess.TimeoutExpired:
+        messages.append("cargo clippy 超时")
+    except Exception as exc:
+        messages.append(f"cargo clippy 跳过: {exc}")
+    return has_error, messages, issues
+
+
+def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+    """Java/Kotlin: checkstyle（找不到 checkstyle 就 skip，不报错）。"""
+    has_error = False
+    messages: list[str] = []
+    issues: list[dict] = []
+
+    checkstyle_bin = _find_tool("checkstyle")
+    if not checkstyle_bin:
+        messages.append("checkstyle 未安装，跳过 Java lint")
+        return has_error, messages, issues
+
+    try:
+        proc = subprocess.run(
+            [checkstyle_bin] + java_files[:20],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            err_output = (proc.stderr or proc.stdout or "").strip()
+            if err_output:
+                for line in err_output.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    issue_entry: dict = {
+                        "file": "",
+                        "line": None,
+                        "code": "checkstyle",
+                        "message": line,
+                        "severity": "error",
+                    }
+                    # 尝试解析 [ERROR] file:line:col: message 格式
+                    import re
+                    m = re.match(r"\[(?:ERROR|WARN)\]\s+(.+?):(\d+)", line)
+                    if m:
+                        issue_entry["file"] = m.group(1)
+                        issue_entry["line"] = int(m.group(2))
+                    issues.append(issue_entry)
+                has_error = True
+    except subprocess.TimeoutExpired:
+        messages.append("checkstyle 超时")
+    except Exception as exc:
+        messages.append(f"checkstyle 跳过: {exc}")
+    return has_error, messages, issues
+
+
+def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tuple[bool, str, list[dict]]:
+    """对修改的文件跑 lint（按语言分派矩阵），返回 (has_error, message, issues)。
+
+    语言分派：
+    - Python (.py): ruff check
+    - JS/TS (.js/.jsx/.ts/.tsx): eslint（项目有配置才跑）
+    - Go (.go): go vet ./...（无 go.mod 跳过）
+    - Rust (.rs): cargo clippy -- -D warnings（无 Cargo.toml 跳过）
+    - Java/Kotlin (.java/.kt): checkstyle（找不到工具则跳过）
+    - lint 工具不可用时优雅跳过，绝不让缺工具导致崩溃或误判失败
     """
     issues: list[dict] = []
     has_error = False
     messages: list[str] = []
 
-    # ── Python: ruff check ──
-    py_files = [f for f in files if f.endswith(".py")]
-    if py_files:
-        ruff_bin = _find_ruff_bin()
-        if ruff_bin:
-            for fp in py_files[:20]:
-                try:
-                    proc = subprocess.run(
-                        [ruff_bin, "check", fp, "--output-format=json"],
-                        cwd=project_path,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout,
-                    )
-                    # ruff 退出码: 0=无问题, 1=有问题, 2=运行错误
-                    if proc.returncode == 2:
-                        messages.append(f"ruff 运行错误({fp}): {proc.stderr[:200]}")
-                        continue
-                    if proc.stdout.strip():
-                        try:
-                            findings = json.loads(proc.stdout)
-                        except json.JSONDecodeError:
-                            findings = []
-                        for item in findings:
-                            severity = item.get("fix", {}).get("message", "")  # noqa
-                            # ruff 没有 error/warning 字段；用 .code 和是否 autofixable 判断
-                            # 保守策略：只要 ruff 报出来就算 issue，但不标记为 error
-                            issue_entry = {
-                                "file": fp,
-                                "line": item.get("location", {}).get("row"),
-                                "code": item.get("code", {}).get("value", ""),
-                                "message": item.get("message", ""),
-                            }
-                            # ruff 报出的默认都是可整改项，
-                            # 只有 E9xx (syntax/indentation) 和 F4xx (unreachable) 才算 error
-                            rule_code = issue_entry["code"]
-                            if rule_code.startswith("E9") or rule_code.startswith("F4"):
-                                issue_entry["severity"] = "error"
-                                has_error = True
-                            else:
-                                issue_entry["severity"] = "warning"
-                            issues.append(issue_entry)
-                except subprocess.TimeoutExpired:
-                    messages.append(f"ruff 超时({fp})")
-                except Exception as exc:
-                    messages.append(f"ruff 跳过({fp}): {exc}")
-        else:
-            messages.append("ruff 未安装，跳过 Python lint")
+    # ── 按语言分组 ──
+    lang_groups: dict[str, list[str]] = {
+        "python": [],
+        "js_ts": [],
+        "go": [],
+        "rust": [],
+        "java": [],
+    }
+    for f in files:
+        if f.endswith(".py"):
+            lang_groups["python"].append(f)
+        elif f.endswith((".ts", ".tsx", ".js", ".jsx")):
+            lang_groups["js_ts"].append(f)
+        elif f.endswith(".go"):
+            lang_groups["go"].append(f)
+        elif f.endswith(".rs"):
+            lang_groups["rust"].append(f)
+        elif f.endswith((".java", ".kt")):
+            lang_groups["java"].append(f)
 
-    # ── JS/TS: eslint（有配置才跑） ──
-    js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]
+    # ── Python: ruff check ──
+    py_files = lang_groups["python"]
+    if py_files:
+        py_err, py_msgs, py_issues = _lint_python(project_path, py_files, timeout=timeout)
+        has_error = has_error or py_err
+        messages.extend(py_msgs)
+        issues.extend(py_issues)
+
+    # ── JS/TS: eslint ──
+    js_ts = lang_groups["js_ts"]
     if js_ts:
-        has_eslint_config = any(
-            os.path.isfile(os.path.join(project_path, cfg))
-            for cfg in (".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", ".eslintrc", "eslint.config.js")
-        )
-        if has_eslint_config:
-            try:
-                proc = subprocess.run(
-                    "npx eslint --format json " + " ".join(f'"{f}"' for f in js_ts[:20]),
-                    cwd=project_path,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
-                # eslint 退出码: 0=无问题, 1=有问题, 2=运行错误
-                if proc.returncode == 2:
-                    messages.append(f"eslint 运行错误: {proc.stderr[:200]}")
-                elif proc.stdout.strip():
-                    try:
-                        eslint_results = json.loads(proc.stdout)
-                        for file_result in eslint_results:
-                            for msg in file_result.get("messages", []):
-                                sev = "error" if msg.get("severity") == 2 else "warning"
-                                issues.append({
-                                    "file": file_result.get("filePath", ""),
-                                    "line": msg.get("line"),
-                                    "code": msg.get("ruleId", ""),
-                                    "message": msg.get("message", ""),
-                                    "severity": sev,
-                                })
-                                if sev == "error":
-                                    has_error = True
-                    except json.JSONDecodeError:
-                        messages.append("eslint 输出解析失败")
-            except subprocess.TimeoutExpired:
-                messages.append("eslint 超时")
-            except Exception as exc:
-                messages.append(f"eslint 跳过: {exc}")
-        else:
-            messages.append("项目无 eslint 配置，跳过 JS/TS lint")
+        js_err, js_msgs, js_issues = _lint_js_ts(project_path, js_ts, timeout=timeout)
+        has_error = has_error or js_err
+        messages.extend(js_msgs)
+        issues.extend(js_issues)
+
+    # ── Go: go vet ──
+    go_files = lang_groups["go"]
+    if go_files:
+        go_err, go_msgs, go_issues = _lint_go(project_path, go_files, timeout=timeout)
+        has_error = has_error or go_err
+        messages.extend(go_msgs)
+        issues.extend(go_issues)
+
+    # ── Rust: cargo clippy ──
+    rs_files = lang_groups["rust"]
+    if rs_files:
+        rs_err, rs_msgs, rs_issues = _lint_rust(project_path, rs_files, timeout=timeout)
+        has_error = has_error or rs_err
+        messages.extend(rs_msgs)
+        issues.extend(rs_issues)
+
+    # ── Java/Kotlin: checkstyle ──
+    java_files = lang_groups["java"]
+    if java_files:
+        java_err, java_msgs, java_issues = _lint_java(project_path, java_files, timeout=timeout)
+        has_error = has_error or java_err
+        messages.extend(java_msgs)
+        issues.extend(java_issues)
 
     summary = "; ".join(messages) if messages else "lint ok"
     return has_error, summary, issues
