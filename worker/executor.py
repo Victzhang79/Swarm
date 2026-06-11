@@ -341,19 +341,27 @@ class WorkerExecutor:
         )
 
     def _scope_files(self) -> list[str]:
-        """子任务 scope 内的相对文件清单（readable ∪ writable，去重保序）。"""
+        """上传到沙箱的文件清单（readable ∪ writable(modify)，去重保序）。
+
+        注意：排除 create_files——它们是【待新建】文件，本地不存在，强行 read/upload
+        会 FileNotFoundError（曾导致 worker 把"新建 readme"当成读取不存在文件而卡住）。
+        delete_files 也不上传（要删的没必要传）。
+        """
         scope = self.effective_scope
         files: list[str] = []
+        create = set(getattr(scope, "create_files", []) or [])
+        delete = set(getattr(scope, "delete_files", []) or [])
         for f in list(getattr(scope, "readable", []) or []) + list(getattr(scope, "writable", []) or []):
             rel = str(f).strip()
-            if rel and rel not in files:
+            if rel and rel not in files and rel not in create and rel not in delete:
                 files.append(rel)
         return files
 
     def _writable_files(self) -> list[str]:
-        """子任务可写文件清单（pull-back 范围）。"""
+        """pull-back 范围：可修改文件 + 新建文件（都要从沙箱拉回）；不含删除文件。"""
         out: list[str] = []
-        for f in list(getattr(self.effective_scope, "writable", []) or []):
+        scope = self.effective_scope
+        for f in list(getattr(scope, "writable", []) or []) + list(getattr(scope, "create_files", []) or []):
             rel = str(f).strip()
             if rel and rel not in out:
                 out.append(rel)
@@ -614,19 +622,39 @@ class WorkerExecutor:
             return getattr(last, "content", str(last))
         return "(Agent 无输出)"
 
+    def _scope_ops_hint(self) -> str:
+        """生成给 LLM 的文件操作清单：明确哪些是修改/新建/删除。"""
+        s = self.effective_scope
+        modify = list(getattr(s, "writable", []) or [])
+        create = list(getattr(s, "create_files", []) or [])
+        delete = list(getattr(s, "delete_files", []) or [])
+        readable = [f for f in (getattr(s, "readable", []) or []) if f not in modify + create + delete]
+        lines = []
+        if modify:
+            lines.append(f"【修改现有文件】{', '.join(modify)} — 先 read_file 读取，再 patch_file/write_file 改动")
+        if create:
+            lines.append(f"【新建文件】{', '.join(create)} — 不要 read_file（文件还不存在），直接 write_file 写入完整内容")
+        if delete:
+            lines.append(f"【删除文件】{', '.join(delete)} — 用 run_command 执行 rm 删除")
+        if readable:
+            lines.append(f"【只读参考】{', '.join(readable)} — 仅供理解上下文，不要修改")
+        return "\n".join(lines) if lines else "见 scope（无显式文件清单，请先用工具探查项目结构）"
+
     async def _run_trivial_fast(self) -> WorkerOutput:
         """trivial 子任务快速路径：合并定位+编码，最小 L1，快速产出"""
         self.phase = WorkerPhase.CODING
         self._log("trivial 快速路径：合并定位与编码")
-        scope_hint = ", ".join(self.effective_scope.writable or self.effective_scope.readable or [])
         combined = await self._run_agent(
             "这是 trivial 简单子任务，请一次完成：\n"
-            f"任务：{self.subtask.description}\n"
-            f"可写文件：{scope_hint or '见 scope'}\n"
-            "1. read_file 读取目标文件\n"
-            "2. patch_file 做最小必要改动\n"
-            "3. 若是 Python 文件，run_command 执行 python -m py_compile 验证语法\n"
-            "完成后简要说明改动内容。",
+            f"任务：{self.subtask.description}\n\n"
+            "文件操作清单（务必按操作类型处理）：\n"
+            f"{self._scope_ops_hint()}\n\n"
+            "执行步骤：\n"
+            "1. 对【修改】文件：read_file 读取后 patch_file 做最小必要改动\n"
+            "2. 对【新建】文件：直接 write_file 写入完整内容（切勿先 read_file）\n"
+            "3. 对【删除】文件：run_command 执行 rm\n"
+            "4. 若涉及 Python 文件，run_command 执行 python -m py_compile 验证语法\n"
+            "完成后简要说明你做了哪些改动。",
             step="trivial-combined",
         )
         self._log(f"合并执行完成: {combined[:200]}")
@@ -656,10 +684,13 @@ class WorkerExecutor:
         return (
             "请开始 Phase 2（编码）：\n"
             f"定位结果: {locate_result}\n\n"
-            "根据定位结果和子任务要求，现在进行代码实现：\n"
-            "1. 使用 patch_file 或 write_file 修改可写范围内的文件\n"
-            "2. 确保修改符合接口契约\n"
-            "3. 保持代码风格一致\n"
+            "文件操作清单（务必按操作类型处理）：\n"
+            f"{self._scope_ops_hint()}\n\n"
+            "根据定位结果和子任务要求进行实现：\n"
+            "1. 【修改】文件：用 patch_file 在可写范围内改动\n"
+            "2. 【新建】文件：用 write_file 直接写入完整内容，不要先 read_file\n"
+            "3. 【删除】文件：用 run_command 执行 rm\n"
+            "4. 确保修改符合接口契约，保持代码风格一致\n"
             "完成后请确认你做了哪些修改。"
         )
 

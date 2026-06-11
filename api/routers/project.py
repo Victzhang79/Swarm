@@ -83,7 +83,8 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     # 后台启动预处理（不阻塞响应）
     async def _run_preprocess():
         try:
-            await _app.preprocess.preprocess_project(project_id, req.path)
+            from swarm.project.preprocess import preprocess_project
+            await preprocess_project(project_id, req.path)
         except Exception as e:
             _app.logger.error(f"Preprocessing failed for project {project_id}: {e}")
 
@@ -149,7 +150,8 @@ async def trigger_preprocess(project_id: str):
     # 后台启动预处理
     async def _run_preprocess():
         try:
-            await _app.preprocess.preprocess_project(project_id, project_path)
+            from swarm.project.preprocess import preprocess_project
+            await preprocess_project(project_id, project_path)
         except Exception:
             _app.logger.exception("Preprocessing failed for project %s", project_id)
 

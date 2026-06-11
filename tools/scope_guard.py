@@ -108,5 +108,6 @@ def require_writable(path: str) -> str:
     scope = get_scope()
     if scope.is_writable(path):
         return ""
-    writable_list = ", ".join(scope.writable)
-    return f"⛔ 权限拒绝：路径 '{path}' 不在可写范围内。可写文件：[{writable_list}]"
+    targets = getattr(scope, "all_write_targets", lambda: scope.writable)()
+    writable_list = ", ".join(targets)
+    return f"⛔ 权限拒绝：路径 '{path}' 不在可写范围内。可写文件（含新建/删除）：[{writable_list}]"

@@ -312,6 +312,14 @@ class SwarmRetriever:
             class_symbols = await self._struct.query_symbols_by_class(project_id, kw)
             results.extend(class_symbols)
 
+            # 按文件路径模糊查（补盲区：关键词是模块/文件名而非符号名时，
+            # 如 'parser'→src/dotenv/parser.py，前两种查法全空但这个能命中）
+            if len(kw) >= 3 and not _is_cjk(kw):  # 仅对英文 token 做文件名匹配，避免中文 2-gram 噪声
+                file_symbols = await self._struct.query_symbols_by_file_keyword(
+                    project_id, kw, limit=15
+                )
+                results.extend(file_symbols)
+
         # 去重(按 file_path + symbol_name)
         seen: set[str] = set()
         deduped: list[dict[str, Any]] = []
@@ -600,6 +608,11 @@ class SwarmRetriever:
 # ──────────────────────────────────────────────
 # 工具函数
 # ──────────────────────────────────────────────
+
+def _is_cjk(token: str) -> bool:
+    """token 是否含中日韩字符（用于跳过中文 2-gram 的文件名匹配）。"""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in token)
+
 
 def _extract_keywords(task_desc: str) -> list[str]:
     """从任务描述中提取检索关键词(简单启发式)

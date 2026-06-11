@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -19,6 +21,47 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# codegraph CLI 二进制路径缓存（解析一次）
+_CODEGRAPH_BIN: str | None = None
+
+
+def _resolve_codegraph_bin() -> str | None:
+    """定位 codegraph 可执行文件，绝对路径优先。
+
+    API 服务进程的 PATH 可能不含 ~/.local/bin（GUI/launchd 启动时尤其常见），
+    导致 shutil.which 找不到。这里显式探测常见安装位置，确保后台进程也能用。
+    """
+    global _CODEGRAPH_BIN
+    if _CODEGRAPH_BIN and Path(_CODEGRAPH_BIN).is_file():
+        return _CODEGRAPH_BIN
+
+    # 1) 环境变量覆盖优先
+    env_bin = os.environ.get("SWARM_CODEGRAPH_BIN")
+    if env_bin and Path(env_bin).is_file():
+        _CODEGRAPH_BIN = env_bin
+        return env_bin
+
+    # 2) PATH 中查找
+    found = shutil.which("codegraph")
+    if found:
+        _CODEGRAPH_BIN = found
+        return found
+
+    # 3) 显式探测常见安装位置（pip --user / cargo / homebrew）
+    home = Path.home()
+    for c in (
+        home / ".local/bin/codegraph",
+        home / ".cargo/bin/codegraph",
+        Path("/usr/local/bin/codegraph"),
+        Path("/opt/homebrew/bin/codegraph"),
+        home / "bin/codegraph",
+    ):
+        if c.is_file() and os.access(c, os.X_OK):
+            _CODEGRAPH_BIN = str(c)
+            logger.info("codegraph 二进制定位: %s", _CODEGRAPH_BIN)
+            return _CODEGRAPH_BIN
+    return None
 
 # colbymchenry codegraph 中视为「代码符号」的 node kind
 _SYMBOL_NODE_KINDS = frozenset({
@@ -68,22 +111,26 @@ class CodegraphResult:
 
 
 def is_codegraph_installed() -> bool:
-    """检查 codegraph CLI 是否已安装"""
+    """检查 codegraph CLI 是否已安装（PATH 健壮，绝对路径兜底）"""
+    bin_path = _resolve_codegraph_bin()
+    if not bin_path:
+        logger.info("codegraph CLI not found in PATH or common locations")
+        return False
     try:
         result = subprocess.run(
-            ["codegraph", "--version"],
+            [bin_path, "--version"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         installed = result.returncode == 0
         if installed:
-            logger.info("codegraph CLI found: %s", result.stdout.strip())
+            logger.info("codegraph CLI found: %s (%s)", result.stdout.strip(), bin_path)
         else:
             logger.warning("codegraph CLI returned non-zero exit code")
         return installed
     except FileNotFoundError:
-        logger.info("codegraph CLI not found in PATH")
+        logger.info("codegraph CLI not found at %s", bin_path)
         return False
     except subprocess.TimeoutExpired:
         logger.warning("codegraph --version timed out")
@@ -105,9 +152,10 @@ def find_codegraph_db(project_path: str) -> Path | None:
 
 def run_codegraph_init(project_path: str) -> subprocess.CompletedProcess[str]:
     """执行 codegraph init -i，在项目目录生成 .codegraph/ 并索引"""
-    logger.info("Running codegraph init -i in %s", project_path)
+    cg = _resolve_codegraph_bin() or "codegraph"
+    logger.info("Running codegraph init -i in %s (bin=%s)", project_path, cg)
     return subprocess.run(
-        ["codegraph", "init", "-i"],
+        [cg, "init", "-i"],
         cwd=project_path,
         capture_output=True,
         text=True,
@@ -117,10 +165,11 @@ def run_codegraph_init(project_path: str) -> subprocess.CompletedProcess[str]:
 
 def run_codegraph_index(project_path: str) -> subprocess.CompletedProcess[str]:
     """执行 codegraph index / sync，刷新已有索引"""
-    logger.info("Running codegraph index in %s", project_path)
+    cg = _resolve_codegraph_bin() or "codegraph"
+    logger.info("Running codegraph index in %s (bin=%s)", project_path, cg)
     # colbymchenry 支持 index；若已有索引则 refresh
     result = subprocess.run(
-        ["codegraph", "index"],
+        [cg, "index"],
         cwd=project_path,
         capture_output=True,
         text=True,
@@ -129,7 +178,7 @@ def run_codegraph_index(project_path: str) -> subprocess.CompletedProcess[str]:
     if result.returncode != 0:
         logger.info("codegraph index failed, trying sync: %s", result.stderr[:200])
         return subprocess.run(
-            ["codegraph", "sync"],
+            [cg, "sync"],
             cwd=project_path,
             capture_output=True,
             text=True,

@@ -62,11 +62,56 @@ logger = logging.getLogger(__name__)
 
 _TRIVIAL_HINTS = ("docstring", "注释", "comment", "一行", "typo", "拼写", "添加一行")
 
+# 文件名匹配：要求左边界是非文件名字符（含中文/空格/标点），杜绝中文粘连。
+# 旧正则 [\w./-]+ 会把中文也算进 \w，导致 "输出readme.md" → "输出readme.md"。
+_FILE_EXT = (
+    r"py|js|jsx|ts|tsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|cs|kt|swift|scala|"
+    r"sh|md|rst|txt|toml|yaml|yml|json|ini|cfg|env|xml|html|css"
+)
+# (?<![\w/.\-]) 前面不能是文件名字符（ASCII），中文不在此类→自然成为边界
+# 末尾用 (?![A-Za-z0-9_./\-]) 而非 \b：中文是 \w，\b 在 ".md出" 处不成立会漏匹配。
+_FILE_PAT = re.compile(
+    rf"(?<![A-Za-z0-9_/.\-])([A-Za-z0-9_][A-Za-z0-9_./\-]*\.(?:{_FILE_EXT}))(?![A-Za-z0-9_./\-])"
+)
+
+# 操作意图关键词
+_CREATE_HINTS = ("新建", "新增", "创建", "添加文件", "生成", "输出", "create", "add file", "new file", "生成一个", "写一个")
+_DELETE_HINTS = ("删除", "移除", "去掉", "删掉", "delete", "remove")
+
 
 def _guess_target_files(task_description: str) -> list[str]:
-    # 覆盖常见代码 + 文档/配置扩展名（README.md、pyproject.toml 等也要能抓到）
-    pat = r"[\w./-]+\.(?:py|js|jsx|ts|tsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|cs|kt|swift|scala|sh|md|rst|txt|toml|yaml|yml|json|ini|cfg|env|xml|html|css)"
-    return list(dict.fromkeys(re.findall(pat, task_description)))
+    """从需求中抠出 ASCII 文件名（中文不会粘连）。"""
+    return list(dict.fromkeys(m.group(1) for m in _FILE_PAT.finditer(task_description)))
+
+
+def _classify_file_ops(task_description: str) -> dict[str, list[str]]:
+    """把需求里点名的文件按操作意图分类: modify / create / delete。
+
+    启发式：在文件名附近（同一子句）出现删除/新建关键词则归类，否则默认 modify。
+    用中文/标点/英文动词切分子句，逐句判断该句里的文件归哪类。
+    """
+    create: list[str] = []
+    delete: list[str] = []
+    modify: list[str] = []
+    # 按常见分隔符切子句，让"删除 a.py，新增 b.py"能分别归类。
+    # 注意：不能用 '.' 当分隔符（会切断 readme.md）；中文句号'。'可以。
+    clauses = re.split(r"[，,；;。\n、]| and | then |然后|以及|并且|并|再|同时", task_description)
+    for clause in clauses:
+        files = _guess_target_files(clause)
+        if not files:
+            continue
+        low = clause.lower()
+        if any(h in clause or h in low for h in _DELETE_HINTS):
+            delete.extend(files)
+        elif any(h in clause or h in low for h in _CREATE_HINTS):
+            create.extend(files)
+        else:
+            modify.extend(files)
+    # 去重 + 互斥优先级：delete > create > modify（同名只归最强意图）
+    delete = list(dict.fromkeys(delete))
+    create = list(dict.fromkeys(f for f in create if f not in delete))
+    modify = list(dict.fromkeys(f for f in modify if f not in delete and f not in create))
+    return {"modify": modify, "create": create, "delete": delete}
 
 
 def _heuristic_complexity(task_description: str) -> Complexity | None:
@@ -81,20 +126,33 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
     # 1) 任务描述中【显式点名】的文件（如 "只修改 README.md"）—— 最强信号，
     #    用户意图明确时，writable 应严格限定为这些文件，避免改到无关文件。
     # 2) analyze 节点经知识库检索得到的 affected_files —— 作为上下文/回退。
-    explicit = _guess_target_files(task_description)
+    ops = _classify_file_ops(task_description)
+    explicit = ops["modify"] + ops["create"] + ops["delete"]
     retrieved = [f for f in (affected_files or []) if f]
 
     if explicit:
-        # 用户点名了文件：writable 只限点名文件；readable 额外纳入检索文件作上下文
-        writable = list(dict.fromkeys(explicit))
+        # 用户点名了文件：按操作意图分别填 modify/create/delete；
+        # readable 额外纳入检索文件作上下文
+        modify_files = list(dict.fromkeys(ops["modify"]))
+        create_files = list(dict.fromkeys(ops["create"]))
+        delete_files = list(dict.fromkeys(ops["delete"]))
         readable = list(dict.fromkeys(explicit + retrieved))
     elif retrieved:
-        writable = list(dict.fromkeys(retrieved))
-        readable = writable
+        modify_files = list(dict.fromkeys(retrieved))
+        create_files = []
+        delete_files = []
+        readable = modify_files
     else:
-        writable = []
+        modify_files = []
+        create_files = []
+        delete_files = []
         readable = []
-    scope = FileScope(readable=readable, writable=writable)
+    scope = FileScope(
+        readable=readable,
+        writable=modify_files,
+        create_files=create_files,
+        delete_files=delete_files,
+    )
     return TaskPlan(
         subtasks=[
             SubTask(

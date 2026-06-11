@@ -39,6 +39,7 @@ async def test_retrieve_includes_deps_in_context():
         {"file_path": "main.py", "symbol_name": "Main"},
     ])
     mock_struct.query_symbols_by_class = AsyncMock(return_value=[])
+    mock_struct.query_symbols_by_file_keyword = AsyncMock(return_value=[])
     mock_struct.query_transitive_deps = AsyncMock(return_value=["util.py"])
     retriever.set_structure_indexer(mock_struct)
 

@@ -352,7 +352,30 @@ class StructureIndexer:
             rows = await cur.fetchall()
         return [self._row_to_symbol_dict(r) for r in rows]
 
-    # ── 查询: 依赖关系 ─────────────────────────
+    async def query_symbols_by_file_keyword(
+        self, project_id: str, keyword: str, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        """按关键词模糊匹配【文件路径】，返回这些文件的符号。
+
+        补 Layer A 盲区：关键词常是模块/文件名（如 'parser'、'cli'），它不是
+        任何符号名，但精确指向 src/dotenv/parser.py。按符号名查会全空，按文件
+        路径模糊查才能命中。
+        """
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT file_path, symbol_name, symbol_type, start_line, end_line,
+                       signature, docstring, class_name, metadata_json
+                FROM kb_symbol_index
+                WHERE project_id = %s AND file_path ILIKE %s
+                ORDER BY file_path, start_line
+                LIMIT %s
+                """,
+                (project_id, f"%{keyword}%", limit),
+            )
+            rows = await cur.fetchall()
+        return [self._row_to_symbol_dict(r) for r in rows]
 
     async def query_dependencies(
         self, project_id: str, file_path: str, direction: str = "outgoing"

@@ -54,17 +54,42 @@ class HumanDecision(str, Enum):
 # 文件 Scope（Worker 权限控制）
 # ──────────────────────────────────────────────
 class FileScope(BaseModel):
-    """定义 Worker 对文件的访问权限"""
-    writable: list[str] = Field(default_factory=list, description="可写文件列表")
-    readable: list[str] = Field(default_factory=list, description="可读文件列表")
+    """定义 Worker 对文件的访问权限 + 文件操作意图。
+
+    操作语义（解决"只有改、没有增删"的缺陷）：
+    - writable:     现有文件，允许【修改】（patch/write）。
+    - create_files: 新文件，需要【新建】（worker 不应先读取，直接 write）。
+    - delete_files: 需要【删除】的现有文件。
+    - readable:     只读上下文（不修改）。
+    writable/create_files/delete_files 三者共同构成"可写权限"，scope_guard 据此放行。
+    """
+    writable: list[str] = Field(default_factory=list, description="可修改的现有文件")
+    readable: list[str] = Field(default_factory=list, description="只读上下文文件")
+    create_files: list[str] = Field(default_factory=list, description="需新建的文件")
+    delete_files: list[str] = Field(default_factory=list, description="需删除的文件")
 
     def is_writable(self, path: str) -> bool:
-        return any(path.endswith(p) or p.endswith(path) for p in self.writable)
+        targets = self.writable + self.create_files + self.delete_files
+        return any(path.endswith(p) or p.endswith(path) for p in targets)
 
     def is_readable(self, path: str) -> bool:
         return self.is_writable(path) or any(
             path.endswith(p) or p.endswith(path) for p in self.readable
         )
+
+    def is_create(self, path: str) -> bool:
+        return any(path.endswith(p) or p.endswith(path) for p in self.create_files)
+
+    def is_delete(self, path: str) -> bool:
+        return any(path.endswith(p) or p.endswith(path) for p in self.delete_files)
+
+    def all_write_targets(self) -> list[str]:
+        """所有写目标（修改+新建+删除），去重保序。"""
+        out: list[str] = []
+        for f in self.writable + self.create_files + self.delete_files:
+            if f and f not in out:
+                out.append(f)
+        return out
 
 
 # ──────────────────────────────────────────────
