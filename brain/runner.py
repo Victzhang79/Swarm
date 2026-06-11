@@ -640,17 +640,23 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
 
 
 async def cancel_task(task_id: str) -> bool:
-    """取消正在运行的任务，或将 orphaned 活跃任务标记为 CANCELLED"""
+    """取消正在运行的任务，或将 orphaned 活跃任务标记为 CANCELLED。
+
+    即使 DB 记录已不存在（如项目被删），仍必须取消内存中的 asyncio 句柄 +
+    释放沙箱——否则 asyncio 任务会变成幽灵，陷入 replan 死循环持续烧 GPU。
+    """
     task = store.get_task(task_id)
-    if not task:
-        return False
 
     handle = _task_handles.get(task_id)
+    handle_cancelled = False
     if handle and not handle.done():
         handle.cancel()
+        handle_cancelled = True
         try:
             await handle
         except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — 句柄内部异常不应阻断清理
             pass
 
     _task_running.discard(task_id)
@@ -676,9 +682,51 @@ async def cancel_task(task_id: str) -> bool:
             "progress": -1,
         })
 
+    # DB 记录已被删（如级联删项目）→ 仅完成了内存侧清理，仍算成功取消。
+    if task is None:
+        if handle_cancelled:
+            logger.info("[RUNNER] 任务 %s 无 DB 记录(可能项目已删)，已终止内存句柄+沙箱", task_id)
+        return handle_cancelled
+
     if task.get("status") != "CANCELLED":
         store.update_task(task_id, status="CANCELLED")
     return True
+
+
+async def cancel_project_tasks(project_id: str) -> int:
+    """取消某项目下所有运行中的任务（删项目前调用，防止幽灵任务残留）。
+
+    覆盖两类：(1) 内存中有 asyncio 句柄的活跃任务；(2) DB 标记为活跃状态的任务。
+    返回取消的任务数。
+    """
+    cancelled = 0
+    # 1) 内存中所有句柄属于该项目的（句柄字典只有 task_id，需查 DB 反查 project）
+    candidate_ids: set[str] = set()
+    for tid, handle in list(_task_handles.items()):
+        if handle and not handle.done():
+            candidate_ids.add(tid)
+    # 2) DB 中该项目活跃状态的任务
+    try:
+        for t in store.list_tasks(project_id):
+            if t.get("status") in _ACTIVE_DB_STATUSES:
+                candidate_ids.add(t.get("id"))
+    except Exception as exc:
+        logger.warning("[RUNNER] 枚举项目 %s 活跃任务失败: %s", project_id, exc)
+
+    # 对候选逐个取消（cancel_task 已能处理 DB 记录缺失的情况）
+    for tid in candidate_ids:
+        # 仅取消属于该项目的：若 DB 还能查到则校验 project_id，查不到则按内存句柄取消
+        t = store.get_task(tid)
+        if t is not None and t.get("project_id") != project_id:
+            continue
+        try:
+            if await cancel_task(tid):
+                cancelled += 1
+        except Exception as exc:
+            logger.warning("[RUNNER] 级联取消任务 %s 失败: %s", tid, exc)
+    if cancelled:
+        logger.info("[RUNNER] 项目 %s 级联取消 %d 个运行中任务", project_id, cancelled)
+    return cancelled
 
 
 async def retry_task(task_id: str, auto_accept: bool | None = None) -> bool:

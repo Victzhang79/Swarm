@@ -134,13 +134,27 @@ async def get_project(project_id: str, request: Request):
 # ─── 4. DELETE /api/projects/{project_id} — 删除项目 ─
 @router.delete("/api/projects/{project_id}", tags=["项目管理"])
 async def delete_project(project_id: str, request: Request):
-    """删除项目及其关联数据"""
+    """删除项目及其关联数据。
+
+    删除前先级联取消该项目所有运行中的任务+释放沙箱，否则正在跑的 asyncio 任务
+    会因 DB 记录被删而失去取消入口，变成幽灵任务陷入 replan 死循环持续烧 GPU。
+    """
     _require_perm(request, "project:delete", project_id)
     loop = asyncio.get_running_loop()
     # 先确认项目存在
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    # 级联终止运行中任务（在删 DB 记录之前，确保 cancel_task 还能查到 task）
+    try:
+        from swarm.brain.runner import cancel_project_tasks
+        cancelled = await cancel_project_tasks(project_id)
+        if cancelled:
+            _app.logger.info("删除项目 %s 前级联取消了 %d 个运行中任务", project_id, cancelled)
+    except Exception:
+        _app.logger.exception("删除项目 %s 前级联取消任务失败（继续删除）", project_id)
+
     deleted = await loop.run_in_executor(None, _app.store.delete_project, project_id)
     if not deleted:
         raise HTTPException(status_code=500, detail="Failed to delete project")
