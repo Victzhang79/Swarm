@@ -114,12 +114,35 @@ class SandboxConfig(BaseSettings):
     use_for_worker: bool = True
     sandbox_first: bool = True
     sandbox_remote_workdir: str = "/workspace"
+    # 按语言预建的沙箱模板 ID（各装好对应工具链，避免运行时 setup 慢/脆）。
+    # 留空的语言回退到 default_template + 运行时 setup_commands。
+    # 用户已构建：go/node/java/rust/python 各一个镜像。
+    template_python: str = "tpl-8fa882f5d775429cad1530c9"
+    template_node: str = "tpl-530d6aa6162b41e38a790b30"
+    template_java: str = "tpl-d3098a499a25492282284a76"
+    template_go: str = "tpl-edf1a5aec16343249304abe3"
+    template_rust: str = "tpl-d480ef3bd69f49c2b07930af"
     # 热沙箱池（默认关闭，SWARM_SANDBOX_POOL_ENABLED=true 开启）
     pool_max_idle_per_template: int = 2
     pool_max_total: int = 8
     pool_ttl_seconds: int = 600
     pool_idle_seconds: int = 300
     pool_reap_interval: int = 60
+
+    def template_for_language(self, language: str) -> str:
+        """语言 → 预建模板 ID。未知语言或未配置则回退 default_template。
+
+        让 worker 按子任务语言起预装工具链的镜像（避免运行时 setup 慢/脆）。
+        """
+        lang = (language or "").lower()
+        mapping = {
+            "python": self.template_python,
+            "node": self.template_node,
+            "java": self.template_java,
+            "go": self.template_go,
+            "rust": self.template_rust,
+        }
+        return mapping.get(lang, "") or self.default_template
 
 
 class KnowledgeConfig(BaseSettings):

@@ -53,6 +53,9 @@ class FakeManager:
         self._run_code_error = run_code_error
         # 可以注入按 sandbox_id 的探针失败
         self._unhealthy_ids: set[str] = set()
+        # workspace 清理记录 + 可注入清理失败
+        self._cleaned: list[str] = []
+        self._clean_fail_ids: set[str] = set()
 
     def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual"):
         self._next_id += 1
@@ -76,6 +79,11 @@ class FakeManager:
         if not self._run_code_success:
             return CodeResult(success=False, error=self._run_code_error or "probe failed")
         return CodeResult(stdout="1\n", success=True)
+
+    def clean_workspace(self, sandbox, workdir="/workspace"):
+        sid = getattr(sandbox, "sandbox_id", str(sandbox))
+        self._cleaned.append(sid)
+        return sid not in self._clean_fail_ids
 
     def register_sandbox_meta(self, sandbox_id, *, project_id=None, task_id=None, source="manual"):
         self._meta[sandbox_id] = {
@@ -495,6 +503,42 @@ def test_none_template_uses_empty_key():
     print("  ✅ template_id=None 用空字符串分桶")
 
 
+def test_release_cleans_workspace_before_pooling():
+    """[#2 修复] 归还可复用沙箱时先清理 workspace 再回池(防跨任务污染)。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sb = pool.acquire(project_id="p", task_id="t1")
+    pool.release(sb, reusable=True)
+    assert sb.sandbox_id in mgr._cleaned, "归还回池前未清理 workspace"
+    assert pool.stats()["total_idle"] == 1, "清理成功应回池"
+    print("  ✅ [#2] 归还回池前清理 workspace")
+
+
+def test_release_clean_failure_kills_instead_of_pooling():
+    """[#2 修复] 清理失败的沙箱不回池，直接 kill(绝不留脏沙箱给下个任务)。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sb = pool.acquire(project_id="p", task_id="t1")
+    mgr._clean_fail_ids.add(sb.sandbox_id)  # 注入清理失败
+    pool.release(sb, reusable=True)
+    assert sb.sandbox_id in mgr._killed, "清理失败的沙箱应被 kill"
+    assert pool.stats()["total_idle"] == 0, "清理失败不应回池"
+    print("  ✅ [#2] 清理失败的沙箱不回池而是 kill")
+
+
+def test_acquire_cleans_reused_sandbox():
+    """[#2 修复] 复用沙箱取用前再清一次 workspace(双保险)。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sb = pool.acquire(project_id="p", task_id="t1")
+    pool.release(sb, reusable=True)
+    mgr._cleaned.clear()
+    sb2 = pool.acquire(project_id="p2", task_id="t2")  # 复用
+    assert sb2.sandbox_id == sb.sandbox_id, "应复用同一沙箱"
+    assert sb2.sandbox_id in mgr._cleaned, "复用取用前未再次清理"
+    print("  ✅ [#2] 复用沙箱取用前再次清理(双保险)")
+
+
 # ── main ──
 
 def test_acquire_skips_ttl_expired_pooled_sandbox():
@@ -556,6 +600,9 @@ def main():
         test_none_template_uses_empty_key,
         test_acquire_skips_ttl_expired_pooled_sandbox,
         test_release_ttl_expired_does_not_pool,
+        test_release_cleans_workspace_before_pooling,
+        test_release_clean_failure_kills_instead_of_pooling,
+        test_acquire_cleans_reused_sandbox,
     ]
     passed = failed = 0
     for t in tests:

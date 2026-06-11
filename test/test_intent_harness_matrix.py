@@ -96,6 +96,24 @@ def test_harness_fallback_has_secret_scan():
     print("  ✅ 兜底 harness 含密钥扫描白名单")
 
 
+def test_language_to_template_mapping():
+    """#5: 语言→预建沙箱模板 ID 映射；未知语言回退默认模板。"""
+    from swarm.config.settings import SandboxConfig
+
+    c = SandboxConfig()
+    # 5 语言各映射到非空模板
+    for lang in ("python", "node", "java", "go", "rust"):
+        tpl = c.template_for_language(lang)
+        assert tpl and tpl.startswith("tpl-"), f"{lang} 未映射到模板: {tpl!r}"
+    # 5 个模板互不相同
+    tpls = {c.template_for_language(l) for l in ("python", "node", "java", "go", "rust")}
+    assert len(tpls) == 5, f"模板应互不相同，实际 {tpls}"
+    # 未知语言回退默认
+    assert c.template_for_language("ruby") == c.default_template
+    assert c.template_for_language("") == c.default_template
+    print("  ✅ #5 语言→模板映射正确(5 语言各异，未知回退默认)")
+
+
 def main() -> int:
     print("=== test_intent_harness_matrix ===")
     failed = 0
@@ -105,6 +123,7 @@ def main() -> int:
         test_infer_intent_heuristics,
         test_harness_matrix_all_languages,
         test_harness_fallback_has_secret_scan,
+        test_language_to_template_mapping,
     ):
         try:
             fn()

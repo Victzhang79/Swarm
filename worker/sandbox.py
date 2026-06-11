@@ -390,6 +390,38 @@ class SandboxManager:
         for sid in list(self._instances.keys()):
             self.kill(sid)
 
+    def clean_workspace(self, sandbox: Any, workdir: str = "/workspace") -> bool:
+        """清空沙箱工作区内容（复用沙箱前/归还后调用，防跨任务文件污染）。
+
+        删除 workdir 下所有内容(含隐藏文件)但保留 workdir 本身。
+        返回是否成功；失败记日志不抛(调用方据返回决定是否仍复用)。
+        """
+        sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
+        # 用 python 在沙箱内清理，避免 shell 注入/通配符陷阱；保留 workdir 目录本身。
+        code = (
+            "import shutil, os\n"
+            f"d = {workdir!r}\n"
+            "os.makedirs(d, exist_ok=True)\n"
+            "for name in os.listdir(d):\n"
+            "    p = os.path.join(d, name)\n"
+            "    try:\n"
+            "        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)\n"
+            "    except Exception as e:\n"
+            "        print('skip', p, e)\n"
+            "print('WORKSPACE_CLEANED')\n"
+        )
+        try:
+            result = self.run_code(sandbox, code, timeout=30)
+            ok = result.success and "WORKSPACE_CLEANED" in (result.stdout or "")
+            if ok:
+                self.append_activity(sid, "clean", f"workspace 已清理: {workdir}")
+            else:
+                logger.warning("clean_workspace 未确认成功 %s: %s", sid, (result.stdout or result.error or "")[:200])
+            return ok
+        except Exception as exc:
+            logger.warning("clean_workspace 失败 %s: %s", sid, exc)
+            return False
+
     def run_code(self, sandbox: Any, code: str, timeout: int = 30) -> "CodeResult":
         """在沙箱中执行代码（捕获 SDK/代理异常，不向上抛 HTTP 500）"""
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)

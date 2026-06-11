@@ -157,7 +157,14 @@ class WorkerExecutor:
                     # 热池启用时从池借（省冷启动），否则直接创建
                     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
 
-                    _tpl = getattr(getattr(self.subtask, "harness", None), "sandbox_template", "") or None
+                    # 模板选择优先级：harness 显式指定 > 按子任务语言映射 > 默认模板。
+                    # 按语言起预建镜像(装好工具链)，混编项目各子任务用各自语言模板。
+                    _harness = getattr(self.subtask, "harness", None)
+                    _tpl = getattr(_harness, "sandbox_template", "") or ""
+                    if not _tpl:
+                        _lang = getattr(_harness, "language", "") or ""
+                        _tpl = cfg.sandbox.template_for_language(_lang)
+                    _tpl = _tpl or None
                     if pool_enabled():
                         self._sandbox_pool = get_sandbox_pool()
                         self._sandbox = self._sandbox_pool.acquire(

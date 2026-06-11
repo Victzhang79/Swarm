@@ -115,6 +115,17 @@ class HotSandboxPool:
         except Exception:
             return False
 
+    def _clean_workspace(self, sandbox: Any) -> bool:
+        """锁外调用：清空沙箱工作区(防跨任务文件污染)。manager 无此能力则视为成功(不阻断)。"""
+        fn = getattr(self._manager, "clean_workspace", None)
+        if fn is None:
+            return True
+        try:
+            return bool(fn(sandbox))
+        except Exception:
+            logger.warning("pool _clean_workspace 异常", exc_info=True)
+            return False
+
     def _pool_size_for(self, key: str) -> int:
         """必须持锁调用。"""
         return len(self._pool.get(key, []))
@@ -168,7 +179,15 @@ class HotSandboxPool:
             # 锁外做健康探针
             healthy = self._health_check(sandbox)
             if healthy:
-                # 探针成功：更新 meta 并返回
+                # 取用前再清一次 workspace（双保险：防归还清理失败的残留）。
+                # 清理失败则弃用该沙箱、新建，绝不把脏沙箱交给任务。
+                if not self._clean_workspace(sandbox):
+                    logger.warning("复用沙箱 %s 取用前清理失败，弃用并新建", sandbox.sandbox_id)
+                    self._kill_one(sandbox.sandbox_id)
+                    with self._lock:
+                        self._created_at.pop(sandbox.sandbox_id, None)
+                    return self._create_and_return(template_id, project_id, task_id, key)
+                # 探针+清理成功：更新 meta 并返回
                 try:
                     self._manager.register_sandbox_meta(
                         sandbox.sandbox_id,
@@ -260,6 +279,7 @@ class HotSandboxPool:
             return
 
         should_kill = False
+        try_pool = False
 
         with self._lock:
             self._borrowed = max(0, self._borrowed - 1)
@@ -270,27 +290,36 @@ class HotSandboxPool:
 
             if not reusable or ttl_expired:
                 should_kill = True
+            elif self._pool_size_for(key) >= self._max_idle_per_template:
+                should_kill = True
             else:
-                bucket = self._pool.setdefault(key, [])
-                # 检查容量
-                if len(bucket) >= self._max_idle_per_template:
-                    should_kill = True
-                else:
-                    # 放回池中（保留首次创建时间用于 TTL，刷新 last_used_at）
-                    entry = _PoolEntry(
-                        sandbox=sandbox,
-                        template_id=key,
-                        created_at=created_at,
-                        last_used_at=now,
-                    )
-                    bucket.append(entry)
-                    # 清理 task 绑定 meta（锁内调 register 是轻量内存操作，可接受）
-                    try:
-                        self._manager.register_sandbox_meta(
-                            sid, project_id=None, task_id=None, source="pool-idle"
-                        )
-                    except Exception:
-                        logger.warning("register_sandbox_meta cleanup failed for %s", sid, exc_info=True)
+                try_pool = True  # 候选回池，但需先（锁外）清理 workspace
+
+        # 锁外清理 workspace（慢 SDK 调用不持锁）：清理成功才回池，失败则 kill
+        if try_pool:
+            cleaned = self._clean_workspace(sandbox)
+            if not cleaned:
+                logger.warning("归还沙箱 %s workspace 清理失败，弃用不回池(防污染)", sid)
+                should_kill = True
+            else:
+                with self._lock:
+                    # 二次校验容量（清理期间可能有并发归还）
+                    bucket = self._pool.setdefault(key, [])
+                    if len(bucket) >= self._max_idle_per_template:
+                        should_kill = True
+                    else:
+                        bucket.append(_PoolEntry(
+                            sandbox=sandbox,
+                            template_id=key,
+                            created_at=created_at,
+                            last_used_at=time.monotonic(),
+                        ))
+                        try:
+                            self._manager.register_sandbox_meta(
+                                sid, project_id=None, task_id=None, source="pool-idle"
+                            )
+                        except Exception:
+                            logger.warning("register_sandbox_meta cleanup failed for %s", sid, exc_info=True)
 
         if should_kill:
             self._kill_one(sid)
