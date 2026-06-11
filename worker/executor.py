@@ -1133,6 +1133,20 @@ class WorkerExecutor:
         has_harness_checks = bool(
             harness and (harness.build_command or harness.test_command or harness.verify_commands)
         )
+        # 空 diff = worker 没产生任何改动。若任务【本应改/建文件】(scope 有 writable/
+        # create_files)，这是"没干活"，绝不能因 mvn 编译未改动代码恰好通过就误判 PASS。
+        # 实测：模型 "need more steps"/stall 后没改 StringUtils，diff 空但 L1 却通过 →
+        # 任务假 DONE。空 diff + 期望有产出 → 确定性判失败，触发重试/换模型。
+        scope = self.effective_scope
+        expects_changes = bool(
+            (getattr(scope, "writable", []) or []) or (getattr(scope, "create_files", []) or [])
+        )
+        if empty_diff and expects_changes:
+            return False, {
+                "deterministic_gate": "fail",
+                "reason": "empty_diff_but_changes_expected",
+                "note": "worker 未产生任何改动（期望修改/新建文件），判定未完成",
+            }
         if empty_diff and not has_harness_checks:
             # 既无 diff 又无 harness 可执行检查，才回退 LLM 自报
             return None, {"deterministic_gate": "skipped: empty diff"}
