@@ -418,11 +418,15 @@ class WorkerExecutor:
         )
 
     def _scope_files(self) -> list[str]:
-        """上传到沙箱的文件清单（readable ∪ writable(modify)，去重保序）。
+        """上传到沙箱的文件清单（readable ∪ writable(modify) ∪ 构建清单，去重保序）。
 
         注意：排除 create_files——它们是【待新建】文件，本地不存在，强行 read/upload
         会 FileNotFoundError（曾导致 worker 把"新建 readme"当成读取不存在文件而卡住）。
         delete_files 也不上传（要删的没必要传）。
+
+        关键：必须额外带上【构建清单文件】(pom.xml/build.gradle/go.mod/Cargo.toml/
+        package.json 等)，否则 mvn/gradle/go build/cargo 在沙箱里因找不到工程描述
+        文件而失败（实测 RuoYi: "no POM in /workspace"）。
         """
         scope = self.effective_scope
         files: list[str] = []
@@ -432,7 +436,87 @@ class WorkerExecutor:
             rel = str(f).strip()
             if rel and rel not in files and rel not in create and rel not in delete:
                 files.append(rel)
+        # 追加构建清单（沙箱编译/测试的前提）
+        for rel in self._build_manifest_files():
+            if rel not in files and rel not in create and rel not in delete:
+                files.append(rel)
         return files
+
+    def _build_manifest_files(self) -> list[str]:
+        """发现项目里的构建清单文件，确保沙箱编译有工程描述。
+
+        覆盖 5 语言主流构建系统。从【已 scope 的文件路径】向上回溯各级目录找清单
+        (多模块项目根 + 模块各有 pom.xml)，再补项目根的清单。只返回真实存在的相对路径。
+        """
+        if not self.project_path:
+            return []
+        root = Path(self.project_path).resolve()
+        manifest_names = (
+            "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+            "settings.gradle.kts", "go.mod", "go.sum", "Cargo.toml", "Cargo.lock",
+            "package.json", "tsconfig.json", "pyproject.toml", "setup.py",
+            "requirements.txt", "build.xml",
+        )
+        found: list[str] = []
+
+        def _add_dir_manifests(d: Path) -> None:
+            for name in manifest_names:
+                p = d / name
+                if p.is_file():
+                    try:
+                        rel = str(p.relative_to(root))
+                    except ValueError:
+                        continue
+                    if rel not in found:
+                        found.append(rel)
+
+        # 1) 项目根清单（多模块工程的父 pom / 聚合构建）
+        _add_dir_manifests(root)
+        # 2) 沿已 scope 文件向上回溯到根，收集每级目录的清单（覆盖各子模块）
+        scope = self.effective_scope
+        scoped = (list(getattr(scope, "readable", []) or [])
+                  + list(getattr(scope, "writable", []) or [])
+                  + list(getattr(scope, "create_files", []) or []))
+        seen_dirs: set[Path] = set()
+        for f in scoped:
+            try:
+                cur = (root / str(f).strip()).resolve().parent
+            except (OSError, ValueError):
+                continue
+            # 向上回溯到 root（含中间各级模块目录）
+            while True:
+                if cur in seen_dirs:
+                    break
+                seen_dirs.add(cur)
+                if root not in cur.parents and cur != root:
+                    break
+                _add_dir_manifests(cur)
+                if cur == root:
+                    break
+                cur = cur.parent
+        # 3) 多模块工程：聚合父 pom 会引用【所有】子模块，mvn -pl/聚合构建需要全部
+        #    模块的构建清单在场。项目级 glob 收集所有清单(限 60 个，防超大 monorepo)。
+        #    只收清单文件本身(小)，不碰源码，开销可忽略。
+        _SKIP = {".git", "node_modules", "target", "build", ".venv", "venv",
+                 "dist", ".gradle", "__pycache__", ".codegraph"}
+        manifest_set = set(manifest_names)
+        count = 0
+        for p in root.rglob("*"):
+            if count >= 60:
+                break
+            if p.name not in manifest_set or not p.is_file():
+                continue
+            if any(part in _SKIP for part in p.relative_to(root).parts):
+                continue
+            try:
+                rel = str(p.relative_to(root))
+            except ValueError:
+                continue
+            if rel not in found:
+                found.append(rel)
+                count += 1
+        return found
+
 
     def _writable_files(self) -> list[str]:
         """pull-back 范围：可修改文件 + 新建文件（都要从沙箱拉回）；不含删除文件。"""

@@ -153,6 +153,23 @@ def read_file_from_sandbox(
                 logger.warning("sandbox.files.read failed for %s: %s", path, exc)
                 break
 
+    # 最终兜底：走 shell 端点(run_command + base64)，不依赖 Jupyter kernel
+    # (自建语言镜像无 kernel，run_code 会 502)。base64 -w0 保证单行输出。
+    if hasattr(mgr, "run_command"):
+        # 先判断是否为目录：是目录直接报错(读文件接口不该读目录)，避免 cat 目录卡住
+        cr = mgr.run_command(
+            sandbox,
+            f"test -f {path!r} && base64 {path!r} | tr -d '\\n' || echo __NOT_A_FILE__",
+            timeout=30,
+        )
+        out = (cr.stdout or "").strip()
+        if out == "__NOT_A_FILE__" or not out:
+            raise RuntimeError(f"not a file or empty: {path}")
+        try:
+            return base64.b64decode(out)
+        except Exception:
+            # 某些 coreutils base64 不支持，回退 python(若镜像有 python)
+            pass
     code = f"""
 import base64
 with open({path!r}, 'rb') as f:
@@ -532,6 +549,38 @@ class SandboxManager:
                 return files
         except Exception as exc:
             logger.warning("sandbox.files.list failed for %s: %s", sandbox_id, exc)
+
+        # 兜底：走 shell 端点(run_command)，不依赖 Jupyter kernel(语言镜像无 kernel→502)。
+        # 用 ls -lAp 列目录：目录名带 / 后缀，便于判断 is_dir；解析每行 size。
+        if hasattr(self, "run_command"):
+            cr = self.run_command(
+                sandbox,
+                f"cd {path!r} 2>/dev/null && ls -lAp --time-style=+ 2>/dev/null || echo __LS_FAIL__",
+                timeout=30,
+            )
+            out = (cr.stdout or "").strip()
+            if out and out != "__LS_FAIL__":
+                for line in out.splitlines():
+                    line = line.rstrip()
+                    if not line or line.startswith("total "):
+                        continue
+                    parts = line.split(None, 4)
+                    if len(parts) < 5:
+                        continue
+                    perms, _links, _owner, size_s, name = parts
+                    if name in (".", ".."):
+                        continue
+                    is_dir = perms.startswith("d") or name.endswith("/")
+                    clean = name.rstrip("/")
+                    try:
+                        size = int(size_s) if not is_dir else 0
+                    except ValueError:
+                        size = 0
+                    abs_path = f"{path.rstrip('/')}/{clean}"
+                    if not abs_path.startswith("/"):
+                        abs_path = "/" + abs_path
+                    files.append({"name": clean, "path": abs_path, "is_dir": is_dir, "size": size})
+                return files
 
         list_code = f"""
 import os, json
