@@ -78,7 +78,14 @@ def ensure_auth_tables(conn_str: str | None = None) -> None:
     with psycopg.connect(conn_str, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(AUTH_DDL)
-            cur.execute(_PROFILE_MIGRATION)
+            # _PROFILE_MIGRATION 是对 memory 层的 mem_user_profile 表做 ALTER。
+            # 全新空库若 auth 先于 memory 建表（如 CI 的 init_db 顺序），该表尚不存在，
+            # 直接 ALTER 会报 relation 不存在。仅在表已存在时执行，否则交由 memory
+            # 建表后再补（DEFAULT 已在 mem_user_profile DDL 里，缺这列也无碍）。
+            cur.execute("SELECT to_regclass('mem_user_profile')")
+            _row = cur.fetchone()
+            if _row is not None and _row[0] is not None:
+                cur.execute(_PROFILE_MIGRATION)
     logger.info("Auth tables ensured")
 
 
