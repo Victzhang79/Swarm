@@ -142,7 +142,13 @@ def _run_in_sandbox(command: str, timeout: int = 120) -> str:
         status = "✅" if cr.success else "❌"
         exit_hint = "0" if cr.success else (cr.error or "non-zero")
         body = cr.stdout + (("\n" + cr.stderr) if cr.stderr else "")
-        return f"{status} (sandbox {exit_hint})\n{body.strip()}"
+        # 防上下文爆炸：压缩超长命令输出(mvn/npm 可输出上万行)，保留关键失败信号。
+        try:
+            from swarm.worker.output_compress import compress_tool_output
+            body = compress_tool_output(body.strip(), max_chars=4000)
+        except Exception:
+            body = body.strip()[:4000]
+        return f"{status} (sandbox {exit_hint})\n{body}"
 
     # 兜底(旧路径)：manager 无 run_command 时用 Jupyter 包 subprocess
     code = f"""

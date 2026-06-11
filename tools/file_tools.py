@@ -87,7 +87,26 @@ def _format_numbered_lines(
     s = max(1, start_line) - 1
     e = total if end_line == -1 else min(end_line, total)
     selected = lines[s:e]
-    return "".join(f"{i}|{line}" for i, line in enumerate(selected, start=s + 1))
+    # 防 ReAct 上下文爆炸：单次 read 输出硬上限(行数 + 字节)。RuoYi 等企业项目
+    # 有几千行的巨型文件(ExcelUtil 等)，无界返回会把工具结果累积进 message 历史
+    # 撑爆模型上下文(实测 MiniMax 196k 上限被一次性顶穿)。超限截断并提示用行号分段读。
+    _MAX_LINES = 450
+    _MAX_CHARS = 32000
+    truncated_note = ""
+    if len(selected) > _MAX_LINES:
+        shown_end = s + _MAX_LINES
+        truncated_note = (
+            f"\n... [已截断: 文件共 {total} 行，本次只显示 {s + 1}-{shown_end} 行。"
+            f"用 read_file(path, start_line=N, end_line=M) 按行号分段读取后续内容] ..."
+        )
+        selected = selected[:_MAX_LINES]
+    body = "".join(f"{i}|{line}" for i, line in enumerate(selected, start=s + 1))
+    if len(body) > _MAX_CHARS:
+        body = body[:_MAX_CHARS]
+        truncated_note = (
+            f"\n... [已截断: 输出超 {_MAX_CHARS} 字符。用 read_file 按更窄的行号区间读取] ..."
+        )
+    return body + truncated_note
 
 
 @tool
