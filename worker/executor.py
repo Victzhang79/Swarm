@@ -85,7 +85,12 @@ class WorkerExecutor:
         self.max_iterations = config.worker.max_iterations
         self.max_fix_rounds = config.worker.max_fix_rounds
         if subtask.difficulty == SubTaskDifficulty.TRIVIAL:
-            self.max_iterations = min(self.max_iterations, 12)
+            # trivial 快速路径：合并定位+编码于一次 agent 运行，recursion_limit 要给够。
+            # LangGraph recursion_limit 计每个节点访问(agent节点+tool节点各 1)，
+            # 故 N 步 ≈ N/2 个 think-act 循环。原来 12(≈6 循环)对真实企业级文件编辑
+            # (read→think→patch→compile→read→fix)不够，小模型频繁撞 "need more steps"。
+            # 提到 30(≈15 循环)，与"子代理迭代到完成"理念一致；仍受 max_execution_time 兜底。
+            self.max_iterations = min(self.max_iterations, 30)
             self.max_fix_rounds = 0
 
         # 运行时状态
@@ -732,6 +737,15 @@ class WorkerExecutor:
         except asyncio.TimeoutError:
             self._log(f"Agent 调用超时（剩余预算 {remaining:.0f}s）")
             return f"❌ Agent 调用超时（预算 {self.max_execution_time}s）"
+        except Exception as exc:
+            # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
+            # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
+            # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。
+            cls = type(exc).__name__
+            if "Recursion" in cls or "recursion" in str(exc).lower():
+                self._log(f"Agent 撞迭代上限({self.max_iterations})，以沙箱实际产出为准交确定性闸门裁决")
+                return f"⚠️ Agent 达到迭代上限（{self.max_iterations}），已做改动交由确定性 L1 验证"
+            raise
 
         # 提取最后一条 AI 消息
         messages = result.get("messages", [])
