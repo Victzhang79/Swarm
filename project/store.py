@@ -61,6 +61,24 @@ CREATE TABLE IF NOT EXISTS task_records (
 CREATE INDEX IF NOT EXISTS idx_task_records_project ON task_records(project_id);
 """
 
+# 任务审计日志（append-only，永不随项目/任务删除而清除）。
+# 解决可追溯性盲区：task_records 被硬删后无任何痕迹，无法回答"那个任务是什么/
+# 什么时候删的"。每次创建/状态变更/删除都在此留一条不可变记录。
+TASK_AUDIT_DDL = """
+CREATE TABLE IF NOT EXISTS task_audit_log (
+    id SERIAL PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT,
+    event TEXT NOT NULL,
+    status TEXT,
+    description TEXT,
+    detail TEXT,
+    at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_task_audit_task ON task_audit_log(task_id, at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_audit_project ON task_audit_log(project_id, at DESC);
+"""
+
 PREPROCESS_PROGRESS_DDL = """
 CREATE TABLE IF NOT EXISTS preprocess_progress (
     project_id TEXT PRIMARY KEY REFERENCES projects(id),
@@ -107,7 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_notifications_archived ON notifications(archived,
 CREATE INDEX IF NOT EXISTS idx_notifications_project ON notifications(project_id, created_at DESC);
 """
 
-ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL, NOTIFICATIONS_DDL]
+ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, TASK_AUDIT_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL, NOTIFICATIONS_DDL]
 
 # 幂等列迁移（已有库 ADD COLUMN IF NOT EXISTS）
 _TASK_RECORDS_MIGRATIONS = [
@@ -374,7 +392,26 @@ def update_project(
 
 
 def delete_project(project_id: str, conn_str: str | None = None) -> bool:
-    """删除项目及其关联数据（task_records + preprocess_progress 级联删除需手动）"""
+    """删除项目及其关联数据（task_records + preprocess_progress 级联删除需手动）。
+
+    删除前把该项目所有任务写入 append-only 审计日志，保证可追溯（避免再次发生
+    "任务被删后无任何痕迹、无法回答删了什么"的问题）。
+    """
+    # 先快照所有任务写审计
+    try:
+        for t in list_tasks(project_id, conn_str):
+            append_task_audit(
+                t.get("id"),
+                event="deleted_with_project",
+                project_id=project_id,
+                status=t.get("status"),
+                description=t.get("description"),
+                detail="cascade delete via delete_project",
+                conn_str=conn_str,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("删除项目 %s 前写任务审计失败: %s", project_id, exc)
+
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             # 先删关联
@@ -408,7 +445,14 @@ def create_task(
                 (task_id, project_id, description, created_by_user_id),
             )
             row = cur.fetchone()
-    return _row_to_task(row)
+    task = _row_to_task(row)
+    # 创建即留痕（append-only 审计）
+    append_task_audit(
+        task_id, event="created", project_id=project_id,
+        status=task.get("status") if task else "SUBMITTED",
+        description=description, conn_str=conn_str,
+    )
+    return task
 
 
 def find_active_duplicate_task(
@@ -552,8 +596,77 @@ def update_task(
     return _row_to_task(row) if row else None
 
 
+def append_task_audit(
+    task_id: str,
+    event: str,
+    *,
+    project_id: str | None = None,
+    status: str | None = None,
+    description: str | None = None,
+    detail: str | None = None,
+    conn_str: str | None = None,
+) -> None:
+    """向 append-only 审计日志写一条记录（永不随删除清除，保证可追溯）。
+
+    容错：审计失败不应阻断主流程（best-effort）。
+    """
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO task_audit_log (task_id, project_id, event, status, description, detail)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (task_id, project_id, event, status, description, detail),
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("写任务审计日志失败 task=%s event=%s: %s", task_id, event, exc)
+
+
+def list_task_audit(
+    task_id: str | None = None,
+    project_id: str | None = None,
+    limit: int = 100,
+    conn_str: str | None = None,
+) -> list[dict[str, Any]]:
+    """查询任务审计日志（按时间倒序）。"""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if task_id:
+        conditions.append("task_id = %s")
+        params.append(task_id)
+    if project_id:
+        conditions.append("project_id = %s")
+        params.append(project_id)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, task_id, project_id, event, status, description, detail, at "
+                f"FROM task_audit_log{where} ORDER BY at DESC LIMIT %s",
+                params,
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def delete_task(task_id: str, conn_str: str | None = None) -> bool:
-    """删除任务"""
+    """删除任务（删除前在 append-only 审计日志留痕，保证可追溯）。"""
+    # 先抓取任务快照写审计（删除后就查不到了）
+    snap = get_task(task_id, conn_str)
+    if snap is not None:
+        append_task_audit(
+            task_id,
+            event="deleted",
+            project_id=snap.get("project_id"),
+            status=snap.get("status"),
+            description=snap.get("description"),
+            detail="task_records hard-deleted",
+            conn_str=conn_str,
+        )
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM task_records WHERE id = %s", (task_id,))

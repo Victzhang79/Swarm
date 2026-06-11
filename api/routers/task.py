@@ -253,6 +253,23 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
 
 
 # ─── 9. GET /api/tasks/{task_id} — 任务详情 ──────
+# 注：/api/tasks/audit 必须在此【之前】注册，否则 'audit' 会被 {task_id} 捕获。
+@router.get("/api/tasks/audit", tags=["任务管理"])
+async def task_audit_endpoint(task_id: str = "", project_id: str = "", limit: int = 100):
+    """查询任务审计日志（append-only，含已删除任务的生命周期留痕）。
+
+    解决可追溯性：即使任务/项目被硬删，仍能在此查到它的创建/删除记录与描述。
+    """
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(
+        None,
+        lambda: _app.store.list_task_audit(
+            task_id=task_id or None, project_id=project_id or None, limit=limit
+        ),
+    )
+    return {"status": "ok", "audit": rows}
+
+
 @router.get("/api/tasks/{task_id}", tags=["任务管理"])
 async def get_task(task_id: str):
     """获取任务详情"""
