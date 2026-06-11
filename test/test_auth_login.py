@@ -24,15 +24,17 @@ def test_login_api_admin_swarm():
     from fastapi.testclient import TestClient
     from swarm.api.app import app
 
-    client = TestClient(app)
-    bad = client.post("/api/auth/login", json={"username": "", "password": "swarm"})
-    assert bad.status_code == 401 or bad.status_code == 422
+    # 用 with 触发 lifespan/startup 事件，确保 bootstrap admin 已创建。
+    # 不用 with 时 startup 不执行，全新库上 admin 不存在 → 401（CI 实测）。
+    with TestClient(app) as client:
+        bad = client.post("/api/auth/login", json={"username": "", "password": "swarm"})
+        assert bad.status_code == 401 or bad.status_code == 422
 
-    ok = client.post("/api/auth/login", json={"username": "admin", "password": "swarm"})
-    assert ok.status_code == 200, ok.text
-    data = ok.json()
-    assert data["user"]["username"] == "admin"
-    assert data.get("token")
+        ok = client.post("/api/auth/login", json={"username": "admin", "password": "swarm"})
+        assert ok.status_code == 200, ok.text
+        data = ok.json()
+        assert data["user"]["username"] == "admin"
+        assert data.get("token")
     print("  ✅ POST /api/auth/login admin/swarm")
 
 

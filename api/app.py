@@ -575,18 +575,21 @@ async def on_startup():
         cfg = get_config()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, ensure_auth_tables)
+        # bootstrap admin 始终创建（即使 RBAC 关闭）：RBAC 开关只控制【鉴权是否强制】，
+        # 不改变 admin 账号是否存在。否则 RBAC=off 的全新库上 /api/auth/login admin/swarm
+        # 会 401（CI 实测复现）。ensure_bootstrap_admin 幂等，已存在则不动。
+        admin_user = await loop.run_in_executor(
+            None,
+            lambda: ensure_bootstrap_admin(
+                password=cfg.bootstrap_admin_password,
+                reset_password=cfg.bootstrap_reset_admin_password,
+            ),
+        )
+        await loop.run_in_executor(
+            None,
+            lambda: ensure_admin_default_profile(admin_user.id),
+        )
         if cfg.rbac_enabled:
-            admin_user = await loop.run_in_executor(
-                None,
-                lambda: ensure_bootstrap_admin(
-                    password=cfg.bootstrap_admin_password,
-                    reset_password=cfg.bootstrap_reset_admin_password,
-                ),
-            )
-            await loop.run_in_executor(
-                None,
-                lambda: ensure_admin_default_profile(admin_user.id),
-            )
             await loop.run_in_executor(None, backfill_legacy_project_members)
         logger.info("Auth/RBAC tables ensured")
     except Exception as e:
