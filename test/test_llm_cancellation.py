@@ -26,7 +26,10 @@ def test_local_provider_streaming_no_retry():
     from swarm.config.settings import ModelConfig
     from swarm.models.router import LocalProvider
 
-    llm = LocalProvider(ModelConfig()).get_chat_model("local-model")
+    # 注入 dummy key：ChatOpenAI 构造需要 api_key，否则无 .env 的 CI 环境会
+    # 报 "Missing credentials"。本测试只检查 streaming/max_retries 属性，不发请求。
+    cfg = ModelConfig(local_api_key="test-dummy-key")
+    llm = LocalProvider(cfg).get_chat_model("local-model")
     assert llm.streaming is True, "本地模型未启用 streaming → 取消无法中断服务端解码"
     assert llm.max_retries == 0, "本地模型重试>0 → 取消瞬间可能又发新请求占 GPU"
     print("  ✅ LocalProvider streaming=True, max_retries=0")
@@ -36,7 +39,8 @@ def test_siliconflow_provider_streaming():
     from swarm.config.settings import ModelConfig
     from swarm.models.router import SiliconFlowProvider
 
-    llm = SiliconFlowProvider(ModelConfig()).get_chat_model("cloud-model")
+    cfg = ModelConfig(siliconflow_api_key="test-dummy-key")
+    llm = SiliconFlowProvider(cfg).get_chat_model("cloud-model")
     assert llm.streaming is True
     print("  ✅ SiliconFlowProvider streaming=True")
 

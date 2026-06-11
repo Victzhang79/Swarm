@@ -307,6 +307,12 @@ class SandboxManager:
                 logger.info("dev_sidecar initialized successfully")
             else:
                 logger.warning("dev_sidecar not found at %s, skipping", sidecar_path)
+        except ModuleNotFoundError as e:
+            # dev_sidecar 依赖 aiohttp（仅开发期代理用，非核心运行时依赖）。
+            # 缺失时优雅降级：记录告警但不崩溃（CI/精简环境无 aiohttp 时不应 raise）。
+            logger.warning(
+                "dev_sidecar 依赖缺失，跳过代理初始化（不影响核心功能）: %s", e
+            )
         except Exception as e:
             logger.error("Failed to init dev_sidecar: %s", e)
             raise

@@ -98,12 +98,15 @@ class SandboxConfig(BaseSettings):
         extra="ignore",
     )
 
-    api_url: str = "http://192.168.60.106:3000"
-    api_key: str = "e2b_000000"
-    proxy_base: str = "https://192.168.60.106:443"
+    # 默认留空 = 不启用远程沙箱（Worker 走本地执行降级）。真实部署在 .env 配置。
+    # 注意：不要把私有开发 IP 硬编码为默认值——会导致 CI/他人环境探测到不可达甚至
+    # 误连，且把内网地址泄露进仓库。
+    api_url: str = ""
+    api_key: str = ""
+    proxy_base: str = ""
     sandbox_domain: str = "cube.app"
     verify_ssl: bool = False
-    default_template: str = "tpl-8fa882f5d775429cad1530c9"
+    default_template: str = ""
     dev_sidecar_path: str = "test/sandbox/dev_sidecar.py"
     use_for_worker: bool = True
     sandbox_first: bool = True
