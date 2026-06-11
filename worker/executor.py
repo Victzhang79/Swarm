@@ -716,7 +716,8 @@ class WorkerExecutor:
     def _build_produce_prompt(self) -> str:
         return (
             "请开始 Phase 4（产出）：\n"
-            "1. 使用 git_diff 查看你的所有变更\n"
+            "1. 回顾你刚才用 write_file/patch_file 做的所有改动（系统会自动采集文件 diff，"
+            "无需依赖 git；若你想复核可用 read_file 查看最终内容）\n"
             "2. 撰写变更摘要\n"
             "3. 评估你的置信度\n\n"
             "请按以下格式输出：\n"

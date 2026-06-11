@@ -109,6 +109,15 @@ def git_diff(
     rc, output = _run_git(args)
     if rc == 0:
         return output or "(无变更)"
+    # 沙箱 /workspace 不是 git 仓库、或镜像无 git（git: not found / not a git
+    # repository）。系统已用 difflib 独立采集权威 diff，这里无需 git，给出明确提示
+    # 让 LLM 不要纠结于 git_diff，直接基于自己的改动描述变更即可。
+    low = output.lower()
+    if "not found" in low or "not a git repository" in low or "command not found" in low:
+        return (
+            "(沙箱非 git 仓库，git_diff 不可用。无需 git——系统会自动采集你的文件"
+            "变更。请直接根据你刚才用 write_file/patch_file 做的改动撰写变更摘要。)"
+        )
     return f"❌ git diff 失败：{output}"
 
 

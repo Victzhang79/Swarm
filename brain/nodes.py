@@ -649,14 +649,11 @@ async def dispatch(state: BrainState) -> dict:
     project_id = state.get("project_id", "")
     task_id = state.get("task_id", "")
 
-    cfg = get_config().sandbox
-    if cfg.use_for_worker and cfg.api_url and project_id:
-        try:
-            from swarm.worker.sandbox import SandboxPool, get_sandbox_manager
-
-            SandboxPool(get_sandbox_manager()).warmup(project_id)
-        except Exception as exc:
-            logger.debug("[DISPATCH] sandbox warmup skipped: %s", exc)
+    # 注：原先这里调用 SandboxPool(...).warmup(project_id) 做"预热"，但那是
+    # 失效死代码——每次都 new 一个临时 SandboxPool，warmup 把沙箱塞进它的 _pool
+    # 后实例即被 GC，远端沙箱却永不回收 → 每次 dispatch 必产生 1 个孤儿沙箱。
+    # 而真正的 worker 走 executor 的 create 路径，从不 acquire 这个池。
+    # 预热既无收益又泄漏，直接移除。如需预热，应由长生命周期的单例池统一管理。
 
     use_alternate = bool(state.get("use_alternate_model", False))
     shared_contract = state.get("shared_contract") or (
