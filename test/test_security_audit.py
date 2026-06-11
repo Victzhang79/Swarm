@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -211,7 +210,7 @@ def test_block_severity_none_with_critical_finding():
 def test_block_severity_critical_with_medium_finding():
     """含 medium finding + block_severity='critical' → should_block=False。"""
     from swarm.worker.security_scan import run_security_scan
-    from swarm.types import SecurityFinding, Severity
+    from swarm.types import Severity
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "config.py").write_text(

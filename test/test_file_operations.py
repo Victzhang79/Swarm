@@ -118,7 +118,6 @@ def test_simple_plan_populates_ops():
 def test_greenfield_open_ended_allows_any():
     """开放式需求(无文件线索)→ scope.allow_any=True，否则 worker 无法写任何文件。"""
     from swarm.brain.nodes import _build_simple_plan
-    from swarm.types import FileScope
 
     plan = _build_simple_plan("帮我写一个推箱子游戏")
     scope = plan.subtasks[0].scope

@@ -8,7 +8,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
 
 # ── swarm_bootstrap ──
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
@@ -161,7 +160,6 @@ def test_health_probe_failure_discards_and_creates_new():
 
 def test_reap_ttl_expired():
     """reap 回收超 TTL 的沙箱（伪造过期 created_at）。"""
-    from swarm.worker.sandbox_pool import _PoolEntry
     mgr = FakeManager()
     pool = _make_pool(mgr, ttl_seconds=10)
     sbx = pool.acquire("tpl-a")

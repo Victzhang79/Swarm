@@ -94,7 +94,6 @@ def test_lint_dispatch_mixed_languages_no_crash():
 
 def test_lint_python_detects_syntax_error_if_ruff():
     """若 ruff 可用，Python 语法错误应被检出为 error；ruff 不可用则优雅 skip。"""
-    import shutil
 
     from swarm.worker.l1_pipeline import _find_ruff_bin, _lint_python
 

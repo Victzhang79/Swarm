@@ -1259,17 +1259,43 @@ async def handle_failure(state: BrainState) -> dict:
         }
 
     if state.get("complexity") == Complexity.SIMPLE:
+        # 确定性重试上限（与复杂路径一致，防止 SIMPLE 任务无限重试死循环）。
+        # 历史 bug：SIMPLE 分支原先无条件 retry，遇到"L1 通过但 diff 收集为空"
+        # (如重试时本地文件已被上一轮改过→difflib 基线已含变更→diff=空→被判失败)
+        # 会无限循环。这里引入与复杂路径相同的 subtask_retry_counts 硬上限。
+        max_retries = get_config().model.max_retries  # 默认 2
+        retry_counts = dict(state.get("subtask_retry_counts", {}))
+        next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
+        deepest = max(next_counts.values(), default=0)
+        if deepest > max_retries + 1:
+            logger.warning(
+                "[HANDLE_FAILURE] SIMPLE 子任务重试达上限(%d+alternate)，升级人工: %s",
+                max_retries, failed_ids,
+            )
+            return {
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "l2_passed": False,
+                "failed_subtask_ids": failed_ids,
+                "subtask_retry_counts": {**retry_counts, **next_counts},
+            }
         dispatch_remaining = list(state.get("dispatch_remaining", []))
         for fid in failed_ids:
             subtask_results.pop(fid, None)
             if fid not in dispatch_remaining:
                 dispatch_remaining.append(fid)
-        logger.info("[HANDLE_FAILURE] SIMPLE 快速路径 — 重试失败子任务")
+        forced_alternate = deepest > max_retries
+        logger.info(
+            "[HANDLE_FAILURE] SIMPLE 快速路径 — 重试失败子任务(第 %d 次%s)",
+            deepest, "，换备选模型" if forced_alternate else "",
+        )
         return {
             "subtask_results": subtask_results,
             "dispatch_remaining": dispatch_remaining,
             "failed_subtask_ids": [],
-            "failure_strategy": "retry",
+            "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+            "use_alternate_model": forced_alternate,
+            "subtask_retry_counts": {**retry_counts, **next_counts},
         }
 
     # ── LLM 故障分析 ──
