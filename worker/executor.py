@@ -566,37 +566,30 @@ class WorkerExecutor:
     def _list_sandbox_workspace_files(self) -> list[str]:
         """递归列出沙箱 /workspace 下的相对文件路径（allow_any/greenfield pull-back 用）。
 
-        用 run_code 跑 os.walk，过滤常见噪声目录，返回相对 remote_workdir 的路径。
+        走 shell 端点(run_command + find)——不依赖 Jupyter kernel(自建语言镜像无
+        kernel 会 502)。过滤常见噪声目录，返回相对 remote_workdir 的路径(上限 200)。
         """
         if not self._sandbox or not self._sandbox_manager:
             return []
         cfg = get_config()
         remote = cfg.sandbox.sandbox_remote_workdir
-        code = (
-            "import os, json\n"
-            f"root = {remote!r}\n"
-            "skip = {'.git','__pycache__','node_modules','.venv','venv','.codegraph','dist','build','.pytest_cache'}\n"
-            "out = []\n"
-            "for dp, dns, fns in os.walk(root):\n"
-            "    dns[:] = [d for d in dns if d not in skip]\n"
-            "    for fn in fns:\n"
-            "        full = os.path.join(dp, fn)\n"
-            "        rel = os.path.relpath(full, root)\n"
-            "        try:\n"
-            "            if os.path.getsize(full) <= 2_000_000:\n"
-            "                out.append(rel)\n"
-            "        except OSError:\n"
-            "            pass\n"
-            "print(json.dumps(out[:200]))\n"
+        # find 排除噪声目录 + 限 2MB；-printf 输出相对路径
+        prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name .pytest_cache \)"
+        cmd = (
+            f"cd {remote} 2>/dev/null && "
+            f"find . {prune} -prune -o -type f -size -2000k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -200"
         )
-        result = self._sandbox_manager.run_code(self._sandbox, code, timeout=30)
-        if getattr(result, "error", None) or not getattr(result, "stdout", ""):
+        rc = getattr(self._sandbox_manager, "run_command", None)
+        if rc is None:
             return []
-        import json as _json
-        try:
-            return _json.loads(result.stdout.strip().split("\n")[-1])
-        except (ValueError, IndexError):
+        result = rc(self._sandbox, cmd, timeout=30)
+        if getattr(result, "error", None) and not getattr(result, "stdout", ""):
             return []
+        out = (result.stdout or "").strip()
+        if not out:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
 
     def _get_git_diff(self) -> str:
         """用 difflib 对比上传前快照与拉回后内容生成 unified diff（不依赖 git）。
