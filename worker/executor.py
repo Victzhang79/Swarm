@@ -802,10 +802,15 @@ class WorkerExecutor:
                 if new_text != old_text:
                     diff_parts.append(f"二进制文件变更: {rel}")
                 continue
-            if old_text == new_text:
+            # 行尾归一化：基线(git HEAD/本地)可能是 LF，pull-back 回来可能是 CRLF
+            # (RuoYi 原始文件即 Windows CRLF)。不归一会让 difflib 把每行都判为变更，
+            # 产出整文件 churn 的垃圾 diff(实测 StringUtils 862 行全变 44KB)，淹没真实改动。
+            old_norm = old_text.replace("\r\n", "\n").replace("\r", "\n")
+            new_norm = new_text.replace("\r\n", "\n").replace("\r", "\n")
+            if old_norm == new_norm:
                 continue
-            old_lines = old_text.splitlines(keepends=True)
-            new_lines = new_text.splitlines(keepends=True)
+            old_lines = old_norm.splitlines(keepends=True)
+            new_lines = new_norm.splitlines(keepends=True)
             ud = difflib.unified_diff(
                 old_lines,
                 new_lines,
