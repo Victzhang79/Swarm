@@ -67,12 +67,20 @@ class FileScope(BaseModel):
     readable: list[str] = Field(default_factory=list, description="只读上下文文件")
     create_files: list[str] = Field(default_factory=list, description="需新建的文件")
     delete_files: list[str] = Field(default_factory=list, description="需删除的文件")
+    allow_any: bool = Field(
+        default=False,
+        description="放行任意路径读写（greenfield/从零创建 或 scope 无法预判时）",
+    )
 
     def is_writable(self, path: str) -> bool:
+        if self.allow_any:
+            return True
         targets = self.writable + self.create_files + self.delete_files
         return any(path.endswith(p) or p.endswith(path) for p in targets)
 
     def is_readable(self, path: str) -> bool:
+        if self.allow_any:
+            return True
         return self.is_writable(path) or any(
             path.endswith(p) or p.endswith(path) for p in self.readable
         )

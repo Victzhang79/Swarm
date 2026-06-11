@@ -75,7 +75,7 @@ _FILE_PAT = re.compile(
 )
 
 # 操作意图关键词
-_CREATE_HINTS = ("新建", "新增", "创建", "添加文件", "生成", "输出", "create", "add file", "new file", "生成一个", "写一个")
+_CREATE_HINTS = ("新建", "新增", "创建", "添加文件", "生成", "输出", "create", "add file", "new file", "生成一个", "写一个", "写个", "实现一个", "做一个", "开发")
 _DELETE_HINTS = ("删除", "移除", "去掉", "删掉", "delete", "remove")
 
 
@@ -114,6 +114,35 @@ def _classify_file_ops(task_description: str) -> dict[str, list[str]]:
     return {"modify": modify, "create": create, "delete": delete}
 
 
+def _format_project_structure(knowledge_context: dict | None) -> str:
+    """从知识上下文(codegraph struct 层)提炼真实文件/符号清单，供 LLM 拆分参考。
+
+    让大模型基于真实存在的文件分配 scope，而非凭需求文字臆造文件名。
+    """
+    if not knowledge_context:
+        return "（无项目结构索引——可能是新项目或预处理未完成，请根据需求合理新建文件）"
+    struct = knowledge_context.get("struct") or []
+    if not struct:
+        return "（结构索引为空，请根据需求合理命名新建文件）"
+    by_file: dict[str, list[str]] = {}
+    for item in struct:
+        fp = item.get("file_path") or item.get("file") or ""
+        name = item.get("symbol_name") or item.get("name") or ""
+        if not fp:
+            continue
+        by_file.setdefault(fp, [])
+        if name and len(by_file[fp]) < 8:
+            by_file[fp].append(name)
+    if not by_file:
+        return "（结构索引为空，请根据需求合理命名新建文件）"
+    lines = []
+    for fp in sorted(by_file)[:25]:  # 限制文件数，避免 prompt 膨胀
+        syms = ", ".join(by_file[fp])
+        lines.append(f"- {fp}" + (f"  (符号: {syms})" if syms else ""))
+    extra = "" if len(by_file) <= 25 else f"\n…… 等共 {len(by_file)} 个相关文件"
+    return "\n".join(lines) + extra
+
+
 def _heuristic_complexity(task_description: str) -> Complexity | None:
     t = task_description.lower()
     if any(h in t for h in _TRIVIAL_HINTS) and len(task_description) < 280:
@@ -147,11 +176,15 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
         create_files = []
         delete_files = []
         readable = []
+    # 无任何文件线索（如"写个推箱子游戏"这类从零/开放式需求）→ 放行任意路径，
+    # 否则 scope_guard 会拒绝所有写操作导致 worker 寸步难行。
+    allow_any = not (modify_files or create_files or delete_files or readable)
     scope = FileScope(
         readable=readable,
         writable=modify_files,
         create_files=create_files,
         delete_files=delete_files,
+        allow_any=allow_any,
     )
     return TaskPlan(
         subtasks=[
@@ -413,6 +446,7 @@ async def plan(state: BrainState) -> dict:
             task_description=task_description,
             complexity=complexity.value,
             routing_table=json.dumps(routing_table, ensure_ascii=False, indent=2),
+            project_structure=_format_project_structure(knowledge_context),
             knowledge_context=knowledge_prompt,
             user_profile=_brain_profile_prompt(state),
             recent_tasks=recent_tasks_prompt,

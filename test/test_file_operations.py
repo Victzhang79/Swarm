@@ -115,6 +115,30 @@ def test_simple_plan_populates_ops():
     print("  ✅ _build_simple_plan 正确填充 create/delete")
 
 
+def test_greenfield_open_ended_allows_any():
+    """开放式需求(无文件线索)→ scope.allow_any=True，否则 worker 无法写任何文件。"""
+    from swarm.brain.nodes import _build_simple_plan
+    from swarm.types import FileScope
+
+    plan = _build_simple_plan("帮我写一个推箱子游戏")
+    scope = plan.subtasks[0].scope
+    assert scope.allow_any is True
+    assert scope.is_writable("game.py") and scope.is_writable("any/path/main.py")
+    print("  ✅ 开放式需求 allow_any 放行任意写")
+
+
+def test_explicit_files_not_allow_any():
+    """点名了文件 → 不应 allow_any（精确 scope）。"""
+    from swarm.brain.nodes import _build_simple_plan
+
+    plan = _build_simple_plan("修改 config.py")
+    scope = plan.subtasks[0].scope
+    assert scope.allow_any is False
+    assert scope.is_writable("config.py")
+    assert not scope.is_writable("unrelated.py")
+    print("  ✅ 点名文件不触发 allow_any")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

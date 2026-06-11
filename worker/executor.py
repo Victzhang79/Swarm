@@ -460,6 +460,14 @@ class WorkerExecutor:
         self._post_sync_contents = {}
         cfg = get_config()
         rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
+        # greenfield/allow_any 模式：scope 没有预设文件，worker 自由创建。
+        # 列出沙箱 workspace 实际文件作为 pull-back 清单，否则新建文件拉不回来。
+        if not rel_files and getattr(self.effective_scope, "allow_any", False):
+            try:
+                rel_files = await asyncio.to_thread(self._list_sandbox_workspace_files)
+                self._log(f"{reason} allow_any 模式：枚举沙箱产物 {len(rel_files)} 个文件")
+            except Exception as exc:
+                self._log(f"{reason} allow_any 枚举沙箱文件失败: {exc}")
         if not rel_files:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
@@ -482,6 +490,41 @@ class WorkerExecutor:
                 self._log(f"pull-back 警告: {err}")
         except Exception as sync_exc:
             self._log(f"{reason} 沙箱→本地 pull-back 失败: {sync_exc}")
+
+    def _list_sandbox_workspace_files(self) -> list[str]:
+        """递归列出沙箱 /workspace 下的相对文件路径（allow_any/greenfield pull-back 用）。
+
+        用 run_code 跑 os.walk，过滤常见噪声目录，返回相对 remote_workdir 的路径。
+        """
+        if not self._sandbox or not self._sandbox_manager:
+            return []
+        cfg = get_config()
+        remote = cfg.sandbox.sandbox_remote_workdir
+        code = (
+            "import os, json\n"
+            f"root = {remote!r}\n"
+            "skip = {'.git','__pycache__','node_modules','.venv','venv','.codegraph','dist','build','.pytest_cache'}\n"
+            "out = []\n"
+            "for dp, dns, fns in os.walk(root):\n"
+            "    dns[:] = [d for d in dns if d not in skip]\n"
+            "    for fn in fns:\n"
+            "        full = os.path.join(dp, fn)\n"
+            "        rel = os.path.relpath(full, root)\n"
+            "        try:\n"
+            "            if os.path.getsize(full) <= 2_000_000:\n"
+            "                out.append(rel)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "print(json.dumps(out[:200]))\n"
+        )
+        result = self._sandbox_manager.run_code(self._sandbox, code, timeout=30)
+        if getattr(result, "error", None) or not getattr(result, "stdout", ""):
+            return []
+        import json as _json
+        try:
+            return _json.loads(result.stdout.strip().split("\n")[-1])
+        except (ValueError, IndexError):
+            return []
 
     def _get_git_diff(self) -> str:
         """用 difflib 对比上传前快照与拉回后内容生成 unified diff（不依赖 git）。
@@ -625,6 +668,14 @@ class WorkerExecutor:
     def _scope_ops_hint(self) -> str:
         """生成给 LLM 的文件操作清单：明确哪些是修改/新建/删除。"""
         s = self.effective_scope
+        if getattr(s, "allow_any", False) and not (
+            getattr(s, "writable", []) or getattr(s, "create_files", []) or getattr(s, "delete_files", [])
+        ):
+            return (
+                "【自由创建模式】这是一个从零开始/开放式任务，没有预设文件清单。"
+                "你可以根据需求自由用 write_file 创建任意需要的文件（如源码、README、配置等），"
+                "用 run_command 建目录/跑命令。请规划合理的项目结构并实现完整功能。"
+            )
         modify = list(getattr(s, "writable", []) or [])
         create = list(getattr(s, "create_files", []) or [])
         delete = list(getattr(s, "delete_files", []) or [])

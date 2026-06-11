@@ -52,13 +52,21 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
 1. 每个子任务应有明确的输入输出契约
 2. 子任务之间通过 depends_on 声明依赖关系
 3. 无依赖的子任务应归入同一并行组
-4. 每个子任务需定义文件访问范围（scope）
+4. 每个子任务需定义文件访问范围（scope），并【按操作类型区分文件】：
+   - writable: 需【修改】的现有文件
+   - create_files: 需【新建】的文件（worker 会直接写入，不会先读取）
+   - delete_files: 需【删除】的现有文件
+   - readable: 仅供理解上下文的只读文件
+   关键：新建文件务必放 create_files（不要放 writable），否则 worker 会
+   先试图读取不存在的文件而失败。删除文件务必放 delete_files。
 5. 子任务粒度: 单个子任务应能在 10 分钟内完成
 6. 验收标准必须可量化、可自动检查
 7. 多子任务/跨模块任务必须在 plan 级定义 shared_contract（Brain 统一定义接口，Worker 只实现）
 8. 每个子任务必须评定 difficulty: trivial/medium/complex
 8. difficulty 决定模型路由: trivial→本地快速模型, medium→本地代码模型, complex→云端大模型
 9. 需要看图/UI的任务标记为 modality=multimodal
+10. 若提供了「项目结构」，scope 里的文件路径必须引用真实存在的文件（修改/删除时），
+    新建文件则给出合理的新路径；不要凭空臆造不存在的文件名
 
 请以 JSON 格式输出执行计划。"""
 
@@ -80,6 +88,9 @@ PLAN_USER = """## 任务描述
 ## 可用模型路由表
 {routing_table}
 
+## 项目结构（codegraph 索引出的真实文件/符号，scope 文件路径应引用这些真实文件）
+{project_structure}
+
 ## 知识上下文（按任务检索的相关片段，非全库）
 {knowledge_context}
 
@@ -98,8 +109,10 @@ PLAN_USER = """## 任务描述
       "difficulty": "trivial|medium|complex",
       "modality": "text|multimodal",
       "scope": {{
-        "writable": ["path/to/file1"],
-        "readable": ["path/to/file2"]
+        "writable": ["path/to/modify.py"],
+        "create_files": ["path/to/new_file.py"],
+        "delete_files": ["path/to/obsolete.py"],
+        "readable": ["path/to/context.py"]
       }},
       "contract": {{
         "input": "描述输入",

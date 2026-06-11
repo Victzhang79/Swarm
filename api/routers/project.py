@@ -23,8 +23,9 @@ router = APIRouter()
 class ProjectCreateRequest(BaseModel):
     """创建项目请求"""
     name: str = Field(description="项目名称")
-    path: str = Field(description="项目根目录绝对路径")
+    path: str = Field(default="", description="项目根目录绝对路径；greenfield 留空则自动在 workspace 下创建")
     description: str = Field(default="", description="项目描述")
+    greenfield: bool = Field(default=False, description="从零创建（空项目），path 不存在时自动建目录")
 
 
 @router.get("/api/projects", tags=["项目管理"])
@@ -60,6 +61,31 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     project_id = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
 
+    # ── 路径解析 + greenfield（从零创建）支持 ──
+    # 既有项目：path 必须指向存在的目录。
+    # greenfield：path 不存在则自动创建；留空则在 workspace 下按项目名建目录。
+    import os
+    import re as _re
+    from swarm.config.settings import PROJECT_ROOT
+
+    resolved_path = (req.path or "").strip()
+    if req.greenfield:
+        if not resolved_path:
+            safe = _re.sub(r"[^A-Za-z0-9_.-]+", "-", req.name).strip("-") or project_id[:8]
+            resolved_path = str((PROJECT_ROOT / "workdir" / safe).resolve())
+        try:
+            os.makedirs(resolved_path, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"无法创建项目目录 {resolved_path}: {e}") from e
+    else:
+        if not resolved_path:
+            raise HTTPException(status_code=400, detail="既有项目必须提供 path（或设 greenfield=true 从零创建）")
+        if not os.path.isdir(resolved_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"路径不存在: {resolved_path}。如需从零创建空项目，请设 greenfield=true",
+            )
+
     # 创建项目记录
     try:
         project = await loop.run_in_executor(
@@ -67,7 +93,7 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             lambda: _app.store.create_project(
                 project_id=project_id,
                 name=req.name,
-                path=req.path,
+                path=resolved_path,
                 description=req.description,
             ),
         )
@@ -84,7 +110,7 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     async def _run_preprocess():
         try:
             from swarm.project.preprocess import preprocess_project
-            await preprocess_project(project_id, req.path)
+            await preprocess_project(project_id, resolved_path)
         except Exception as e:
             _app.logger.error(f"Preprocessing failed for project {project_id}: {e}")
 
