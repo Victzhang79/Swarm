@@ -114,6 +114,12 @@ class SandboxConfig(BaseSettings):
     use_for_worker: bool = True
     sandbox_first: bool = True
     sandbox_remote_workdir: str = "/workspace"
+    # 热沙箱池（默认关闭，SWARM_SANDBOX_POOL_ENABLED=true 开启）
+    pool_max_idle_per_template: int = 2
+    pool_max_total: int = 8
+    pool_ttl_seconds: int = 600
+    pool_idle_seconds: int = 300
+    pool_reap_interval: int = 60
 
 
 class KnowledgeConfig(BaseSettings):

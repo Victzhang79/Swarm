@@ -598,8 +598,21 @@ async def on_startup():
     await _start_kb_update_scheduler()
     await _start_consistency_scheduler()
     await _start_task_scheduler()
+    _start_sandbox_pool_reaper()
     _warn_if_multiprocess()
     logger.info("Swarm API started")
+
+
+def _start_sandbox_pool_reaper() -> None:
+    """热沙箱池启用时启动后台 reaper（回收超 TTL/空闲沙箱，防泄漏）。"""
+    try:
+        from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+
+        if pool_enabled():
+            get_sandbox_pool().start_reaper()
+            logger.info("热沙箱池 reaper 已启动")
+    except Exception as exc:
+        logger.warning("Failed to start sandbox pool reaper: %s", exc)
 
 
 def _warn_if_multiprocess():
@@ -636,7 +649,17 @@ async def _start_task_scheduler() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """应用关闭钩子：优雅关闭数据库连接池。"""
+    """应用关闭钩子：优雅关闭数据库连接池 + 排空热沙箱池。"""
+    try:
+        from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+
+        if pool_enabled():
+            pool = get_sandbox_pool()
+            pool.stop_reaper()
+            pool.drain()
+            logger.info("热沙箱池已排空")
+    except Exception as exc:
+        logger.warning("Failed to drain sandbox pool: %s", exc)
     try:
         from swarm.infra.db import close_async_pools, close_sync_pools
 

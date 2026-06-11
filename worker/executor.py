@@ -96,6 +96,10 @@ class WorkerExecutor:
         self._agent: dict | None = None
         self._sandbox: Any | None = None
         self._sandbox_manager: Any | None = None
+        self._sandbox_pool: Any | None = None
+        self._from_pool: bool = False
+        # 沙箱归还热池时据此决定 reusable（L1 通过/无异常才复用，脏沙箱不回池）
+        self._l1_passed_flag: bool = True
         # diff 基线/产出快照（difflib 生成 diff 用）。沙箱模式由 _sync_to/from_sandbox 填充，
         # 本地模式由 _snapshot_scope_local 填充。__init__ 初始化避免本地模式下属性缺失。
         self._pre_sync_contents: dict[str, str | None] = {}
@@ -150,13 +154,29 @@ class WorkerExecutor:
                     from swarm.worker.sandbox import get_sandbox_manager
 
                     self._sandbox_manager = get_sandbox_manager()
-                    self._sandbox = self._sandbox_manager.create(
-                        project_id=self.project_id,
-                        task_id=self.task_id or self.subtask.id,
-                        source=f"worker:{self.subtask.id}",
-                    )
+                    # 热池启用时从池借（省冷启动），否则直接创建
+                    from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+
+                    _tpl = getattr(getattr(self.subtask, "harness", None), "sandbox_template", "") or None
+                    if pool_enabled():
+                        self._sandbox_pool = get_sandbox_pool()
+                        self._sandbox = self._sandbox_pool.acquire(
+                            _tpl,
+                            project_id=self.project_id,
+                            task_id=self.task_id or self.subtask.id,
+                        )
+                        self._from_pool = True
+                        self._log(f"远程沙箱(热池)已就绪: {self._sandbox.sandbox_id}")
+                    else:
+                        self._sandbox = self._sandbox_manager.create(
+                            template_id=_tpl,
+                            project_id=self.project_id,
+                            task_id=self.task_id or self.subtask.id,
+                            source=f"worker:{self.subtask.id}",
+                        )
+                        self._from_pool = False
+                        self._log(f"远程沙箱已创建: {self._sandbox.sandbox_id}")
                     set_sandbox_context(self._sandbox, self._sandbox_manager)
-                    self._log(f"远程沙箱已创建: {self._sandbox.sandbox_id}")
                     await self._sync_to_sandbox("bootstrap")
                 except Exception as exc:
                     self._log(f"沙箱创建失败，降级本地执行: {exc}")
@@ -340,11 +360,15 @@ class WorkerExecutor:
             self.phase = WorkerPhase.DONE
             self._log(f"执行完成，置信度: {output.confidence.value}")
 
+            # 记录 L1 结果供 kill_sandbox 决定是否归还热池复用（脏沙箱不回池）
+            self._l1_passed_flag = bool(getattr(output, "l1_passed", False))
+
             return output
 
         except Exception as e:
             self.phase = WorkerPhase.FAILED
             self._log(f"执行异常: {e}")
+            self._l1_passed_flag = False  # 异常路径：沙箱可能脏，不归还复用
             return self._make_output(
                 diff="",
                 summary=f"执行异常: {e}",
@@ -643,15 +667,25 @@ class WorkerExecutor:
         return "\n".join(output_parts)
 
     def kill_sandbox(self) -> None:
-        """销毁远程沙箱"""
+        """释放远程沙箱：热池借来的归还(健康则回池)，否则销毁。"""
         if hasattr(self, "_sandbox") and self._sandbox is not None:
+            from_pool = getattr(self, "_from_pool", False)
+            pool = getattr(self, "_sandbox_pool", None)
+            sid = self._sandbox.sandbox_id
             try:
-                self._sandbox_manager.kill(self._sandbox.sandbox_id)
-                self._log(f"远程沙箱已销毁: {self._sandbox.sandbox_id}")
+                if from_pool and pool is not None:
+                    # 归还：L1 通过/无异常的沙箱可复用；失败的不回池(可能脏)
+                    reusable = bool(getattr(self, "_l1_passed_flag", True))
+                    pool.release(self._sandbox, reusable=reusable)
+                    self._log(f"远程沙箱已归还热池(reusable={reusable}): {sid}")
+                else:
+                    self._sandbox_manager.kill(sid)
+                    self._log(f"远程沙箱已销毁: {sid}")
             except Exception as e:
-                self._log(f"沙箱销毁失败: {e}")
+                self._log(f"沙箱释放失败: {e}")
             self._sandbox = None
             self._sandbox_manager = None
+            self._sandbox_pool = None
 
     def _remaining_seconds(self) -> float:
         if not self.start_time:
