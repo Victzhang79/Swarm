@@ -467,12 +467,17 @@ def test_verify_l2_sandbox_fail():
     print("  ✅ verify_l2 — sandbox path returns l2_passed False")
 
 
-def test_dispatch_batch_first_parallel_group():
-    plan = _plan_with_groups([["st-1", "st-2"], ["st-3"]])
+def test_dispatch_batch_independent_tasks_parallelize():
+    """依赖驱动：无 depends_on 的独立子任务即使被 LLM 拆进不同 group 也并行派发。
+
+    （旧行为只派第一个 group；新行为按 depends_on DAG，独立任务全并行——
+    这是 P4 修复：消除 LLM 过度保守分组导致的无谓串行。）
+    """
+    plan = _plan_with_groups([["st-1", "st-2"], ["st-3"]])  # st-3 无依赖
     batch = plan.get_dispatch_batch(set(), ["st-1", "st-2", "st-3"], max_concurrent=4)
     ids = {t.id for t in batch}
-    assert ids == {"st-1", "st-2"}, f"expected first group only, got {ids}"
-    print("  ✅ get_dispatch_batch — first parallel group")
+    assert ids == {"st-1", "st-2", "st-3"}, f"独立任务应全部并行, got {ids}"
+    print("  ✅ get_dispatch_batch — 独立子任务并行（不受 LLM 分组限制）")
 
 
 def test_dispatch_batch_respects_group_order_after_deps():
@@ -489,20 +494,20 @@ def test_dispatch_batch_max_concurrent_within_group():
     plan = _plan_with_groups([["a", "b", "c"]])
     batch = plan.get_dispatch_batch(set(), ["a", "b", "c"], max_concurrent=2)
     assert len(batch) == 2
-    assert {t.id for t in batch} == {"a", "b"}
-    batch2 = plan.get_dispatch_batch({"a", "b"}, ["c"], max_concurrent=2)
-    assert len(batch2) == 1 and batch2[0].id == "c"
-    print("  ✅ get_dispatch_batch — max_concurrent within group")
+    print("  ✅ get_dispatch_batch — max_concurrent 截断")
 
 
-def test_dispatch_batch_blocked_when_group_not_ready():
+def test_dispatch_batch_blocked_when_dep_unmet():
+    """依赖未满足的任务不派发；依赖已满足的（含独立的）才派发。"""
     plan = _plan_with_groups(
         [["st-1", "st-2"], ["st-3"]],
-        deps={"st-2": ["st-1"]},
+        deps={"st-2": ["st-1"]},  # st-2 依赖 st-1；st-1/st-3 独立
     )
     batch = plan.get_dispatch_batch(set(), ["st-1", "st-2", "st-3"], max_concurrent=4)
-    assert len(batch) == 1 and batch[0].id == "st-1"
-    print("  ✅ get_dispatch_batch — blocked when dep unmet in group")
+    ids = {t.id for t in batch}
+    # st-1 和 st-3 无依赖可并行；st-2 依赖未满足被阻塞
+    assert ids == {"st-1", "st-3"}, f"应派发无依赖的 st-1/st-3, got {ids}"
+    print("  ✅ get_dispatch_batch — 依赖未满足的任务被阻塞，独立任务仍并行")
 
 
 def test_dispatch_batch_fallback_without_parallel_groups():
@@ -633,10 +638,10 @@ def main():
     test_verify_l3_pass_with_staging()
     test_verify_l2_sandbox_pass()
     test_verify_l2_sandbox_fail()
-    test_dispatch_batch_first_parallel_group()
+    test_dispatch_batch_independent_tasks_parallelize()
     test_dispatch_batch_respects_group_order_after_deps()
     test_dispatch_batch_max_concurrent_within_group()
-    test_dispatch_batch_blocked_when_group_not_ready()
+    test_dispatch_batch_blocked_when_dep_unmet()
     test_dispatch_batch_fallback_without_parallel_groups()
     test_parallel_dispatch_gather()
     test_dispatch_failure_stops_batch()

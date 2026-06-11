@@ -194,38 +194,28 @@ class TaskPlan(BaseModel):
         dispatch_remaining: list[str],
         max_concurrent: int,
     ) -> list[SubTask]:
-        """按 parallel_groups 选取下一批可派发子任务。
+        """选取下一批可并行派发的子任务。
 
-        同一组内可并行；组间顺序执行。若 parallel_groups 为空则回退到
-        get_ready_tasks + max_concurrent 截断。
+        【依赖驱动】真正的并行约束是 depends_on DAG，而非 LLM 给的 parallel_groups。
+        实践中 LLM 常把本可并行的独立子任务拆进各自的 group（如 [["st-1"],["st-2"]]），
+        导致无谓串行。这里改为：派发【所有依赖已满足】的待执行子任务（受 max_concurrent
+        截断），不受 LLM 过度保守分组的限制——只要 depends_on 满足就能并行。
+
+        parallel_groups 仅作为「软提示」保留（向后兼容/可视化），不再用于阻断并行。
         """
         remaining = set(dispatch_remaining)
         if not remaining:
             return []
-
-        subtask_by_id = {t.id: t for t in self.subtasks}
 
         def _is_ready(task: SubTask) -> bool:
             return task.id not in completed_ids and all(
                 d in completed_ids for d in task.depends_on
             )
 
-        if self.parallel_groups:
-            for group in self.parallel_groups:
-                group_remaining = [tid for tid in group if tid in remaining]
-                if not group_remaining:
-                    continue
-                ready_in_group = [
-                    subtask_by_id[tid]
-                    for tid in group_remaining
-                    if tid in subtask_by_id and _is_ready(subtask_by_id[tid])
-                ]
-                if ready_in_group:
-                    return ready_in_group[:max_concurrent]
-                return []
-
+        # 所有 remaining 中依赖已满足的子任务都可并行派发
         ready = [
-            t for t in self.get_ready_tasks(completed_ids) if t.id in remaining
+            t for t in self.subtasks
+            if t.id in remaining and _is_ready(t)
         ]
         return ready[:max_concurrent]
 
