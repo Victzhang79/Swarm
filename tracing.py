@@ -89,6 +89,73 @@ def configure_langsmith(*, reload: bool = False) -> bool:
     return False
 
 
+def push_l1_feedback(
+    l1_details: dict[str, Any],
+    *,
+    l1_passed: bool,
+    run_id: str | None = None,
+) -> None:
+    """把 L1 确定性验证结果作为【结构化 feedback】上报 LangSmith。
+
+    解决"Smith 上断言太水/不规范"：原来 LangSmith 只能看到 LLM 自报通过这种
+    弱信号。这里把确定性闸门的真实证据(scope/compile/lint/test/verify 各分项)
+    作为规范化的 feedback key-score 推回当前 run，让每条断言可量化、可筛选、
+    可追溯到底是确定性验证还是 LLM 自报。
+
+    tracing 关闭时 no-op；任何异常都吞掉(可观测性不应影响主流程)。
+    """
+    if not is_langsmith_active():
+        return
+    try:
+        from langsmith import Client
+        from langsmith.run_helpers import get_current_run_tree
+
+        rid = run_id
+        if not rid:
+            rt = get_current_run_tree()
+            rid = str(rt.id) if rt else None
+        if not rid:
+            return
+
+        client = Client()
+        source = l1_details.get("l1_decision_source", "unknown")
+
+        def _fb(key: str, score: float | bool, comment: str = "") -> None:
+            try:
+                client.create_feedback(
+                    run_id=rid, key=key,
+                    score=float(bool(score)) if isinstance(score, bool) else score,
+                    comment=comment or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("create_feedback %s skipped: %s", key, exc)
+
+        # 顶层结论 + 决策来源（规范化断言：明确是确定性还是自报）
+        _fb("l1_passed", l1_passed, f"decision_source={source}")
+        _fb("l1_decision_is_deterministic", source == "deterministic",
+            "确定性闸门=可信；llm_self_report=弱信号")
+
+        # 各分项确定性证据
+        for key, fb_key in (
+            ("l1_1_scope_ok", "scope_ok"),
+            ("l1_2_compile_ok", "compile_ok"),
+            ("l1_3_test_ok", "test_ok"),
+        ):
+            if key in l1_details:
+                _fb(fb_key, bool(l1_details[key]))
+        lint = l1_details.get("lint") or {}
+        if isinstance(lint, dict) and lint.get("status") in ("ok", "error"):
+            _fb("lint_ok", lint.get("status") == "ok", lint.get("message", "")[:200])
+        # harness verify 命令逐条
+        vcs = l1_details.get("verify_commands") or []
+        if vcs:
+            passed = sum(1 for v in vcs if v.get("ok"))
+            _fb("verify_pass_rate", passed / len(vcs),
+                f"{passed}/{len(vcs)} harness 验收命令通过")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("push_l1_feedback skipped: %s", exc)
+
+
 def _base_tags(*, phase: str, component: str, extra: list[str] | None = None) -> list[str]:
     tags = ["swarm", f"swarm-{phase}", f"swarm-{component}"]
     if extra:

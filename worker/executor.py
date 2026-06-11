@@ -250,6 +250,13 @@ class WorkerExecutor:
                     f"| 来源: {l1_details.get('l1_decision_source')} | 详情: {l1_details}"
                 )
 
+                # 把 L1 确定性证据作为规范化 feedback 推回 LangSmith（可量化断言）
+                try:
+                    from swarm.tracing import push_l1_feedback
+                    push_l1_feedback(l1_details, l1_passed=l1_passed)
+                except Exception:  # noqa: BLE001
+                    pass
+
                 if l1_passed:
                     break
 
