@@ -39,6 +39,8 @@ SYSTEM_PROMPT_TEMPLATE = """\
 ## 🔧 验证 Harness（如何确认你的产出合格）
 {harness_section}
 
+{coding_standards_section}
+
 {debug_section}
 
 ## 🔄 工作流程
@@ -151,6 +153,10 @@ def build_worker_prompt(
     # DEBUG 意图段落 —— 结构化排错 4 阶段
     debug_section = _format_debug_section(subtask)
 
+    # 编码规范段落（L2）—— 按模型档位裁剪量，机器可强制项交给 L0/L1
+    from swarm.worker.coding_standards import build_coding_standards_section
+    coding_standards_section = build_coding_standards_section(subtask)
+
     # 知识段落
     knowledge_section = ""
     if knowledge:
@@ -180,6 +186,7 @@ def build_worker_prompt(
         readable_files=readable_files,
         harness_section=harness_section,
         debug_section=debug_section,
+        coding_standards_section=coding_standards_section,
         max_fix_rounds=config.worker.max_fix_rounds,
         max_iterations=config.worker.max_iterations,
         max_execution_time=config.worker.max_execution_time,

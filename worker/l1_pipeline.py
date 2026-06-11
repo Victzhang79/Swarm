@@ -620,6 +620,21 @@ def run_l1_pipeline(
     if not compile_ok:
         return False, details
 
+    # ── L1.2.0 自动格式化（L0 闸门）──
+    # 在 lint 之前先确定性格式化改动文件：把"风格"从模型负担降级为系统自动行为。
+    # SWARM_WORKER_L1_FORMAT=false 可关闭。工具缺失优雅 skip，绝不阻断。
+    format_enabled = os.environ.get("SWARM_WORKER_L1_FORMAT", "true").lower() not in ("false", "0", "no")
+    if format_enabled and modified:
+        try:
+            from swarm.worker.format_gate import format_files
+
+            fmt_result = format_files(project_path, modified, timeout=timeout)
+            details["format"] = fmt_result
+        except Exception as exc:  # noqa: BLE001
+            # 格式化失败绝不阻断主流程（纯锦上添花层）
+            logger.debug("L0 format 跳过(异常): %s", exc)
+            details["format"] = {"status": "skipped", "error": str(exc)}
+
     # ── L1.2.5 lint ──
     lint_enabled = os.environ.get("SWARM_WORKER_L1_LINT", "true").lower() not in ("false", "0", "no")
     if lint_enabled:
