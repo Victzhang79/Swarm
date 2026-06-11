@@ -650,8 +650,16 @@
   <div class="modal" id="add-project-modal">
     <div class="modal-head"><h3>添加项目</h3></div>
     <div class="modal-body">
-      <div class="form-group"><label class="form-label">项目路径（绝对路径）</label><input id="add-project-path" class="form-input" placeholder="/path/to/your/project"></div>
+      <div class="form-group">
+        <label class="form-label">创建方式</label>
+        <div style="display:flex;gap:16px;margin-top:4px">
+          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="import" checked onchange="onAddProjectModeChange()" style="margin-right:6px">导入现有目录</label>
+          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="greenfield" onchange="onAddProjectModeChange()" style="margin-right:6px">从零创建（空项目）</label>
+        </div>
+      </div>
+      <div class="form-group" id="add-project-path-group"><label class="form-label" id="add-project-path-label">项目路径（绝对路径）</label><input id="add-project-path" class="form-input" placeholder="/path/to/your/project"></div>
       <div class="form-group"><label class="form-label">项目名称</label><input id="add-project-name" class="form-input" placeholder="自动从路径推断"></div>
+      <p id="add-project-greenfield-hint" class="hidden" style="font-size:11px;color:var(--text-muted);margin:0">从零创建：留空路径将自动在 workdir/&lt;项目名&gt; 下建目录，可直接发起"写个推箱子游戏"这类需求。</p>
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="hideAddProjectModal()">取消</button>

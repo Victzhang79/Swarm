@@ -16,6 +16,10 @@ function showAddProjectModal() {
   $('add-project-modal').classList.add('open');
   $('add-project-path').value = '';
   $('add-project-name').value = '';
+  // 重置为"导入现有"模式
+  const importRadio = document.querySelector('input[name="add-project-mode"][value="import"]');
+  if (importRadio) importRadio.checked = true;
+  onAddProjectModeChange();
   $('add-project-path').focus();
 }
 
@@ -24,12 +28,30 @@ function hideAddProjectModal() {
   $('add-project-modal').classList.remove('open');
 }
 
+function getAddProjectMode() {
+  const checked = document.querySelector('input[name="add-project-mode"]:checked');
+  return checked ? checked.value : 'import';
+}
+
+function onAddProjectModeChange() {
+  const greenfield = getAddProjectMode() === 'greenfield';
+  const label = $('add-project-path-label');
+  const pathInput = $('add-project-path');
+  const hint = $('add-project-greenfield-hint');
+  if (label) label.textContent = greenfield ? '项目路径（可留空，自动创建）' : '项目路径（绝对路径）';
+  if (pathInput) pathInput.placeholder = greenfield ? '留空则自动在 workdir/<项目名> 下创建' : '/path/to/your/project';
+  if (hint) hint.classList.toggle('hidden', !greenfield);
+}
+
 function submitAddProjectFromModal() {
+  const greenfield = getAddProjectMode() === 'greenfield';
   const path = $('add-project-path').value.trim();
-  if (!path) { showToast('请输入项目路径', 'warning'); return; }
-  const name = $('add-project-name').value.trim() || path.split('/').pop() || 'New Project';
+  if (!greenfield && !path) { showToast('请输入项目路径', 'warning'); return; }
+  let name = $('add-project-name').value.trim();
+  if (!name) name = path.split('/').pop() || (greenfield ? '' : 'New Project');
+  if (greenfield && !name) { showToast('从零创建请填写项目名称', 'warning'); return; }
   hideAddProjectModal();
-  submitAddProject(name, path);
+  submitAddProject(name, path, greenfield);
 }
 
 // ─── Revise Modal ──────────────────────────────────────────
@@ -126,18 +148,18 @@ function renderProjectList() {
   }).join('');
 }
 
-async function submitAddProject(name, path) {
+async function submitAddProject(name, path, greenfield) {
   try {
     const resp = await fetch('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, path }),
+      body: JSON.stringify({ name, path, greenfield: !!greenfield }),
     });
     if (!resp.ok) {
       const err = await resp.text();
       throw new Error(err);
     }
-    showToast('项目已添加，预处理启动中', 'success');
+    showToast(greenfield ? '空项目已创建，可直接发起任务' : '项目已添加，预处理启动中', 'success');
     await loadProjects();
     const data = await resp.json();
     const pid = data.project?.id || data.id;
@@ -186,7 +208,23 @@ function selectProject(id) {
 
 async function deleteProject() {
   if (!selectedProjectId) return;
-  if (!confirm('确定删除此项目？')) return;
+  const project = projects.find(p => p.id === selectedProjectId);
+  const pname = project ? project.name : selectedProjectId;
+  // 二次确认防误删：查该项目任务数，明确告知将级联删除的内容（任务硬删不可恢复）
+  let taskCount = 0;
+  try {
+    const r = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId) + '/tasks');
+    if (r.ok) {
+      const d = await r.json();
+      taskCount = (d.tasks || d || []).length || 0;
+    }
+  } catch (e) { /* 查不到任务数不阻断，仍走确认 */ }
+  const warn = `确定删除项目「${pname}」？\n\n` +
+    `这将级联取消运行中任务并永久删除该项目下的 ${taskCount} 个任务记录（硬删除，不可恢复）。\n` +
+    `审计日志会保留删除留痕，但任务内容无法找回。`;
+  if (!confirm(warn)) return;
+  // 有任务时再要求一次显式确认，进一步防误删
+  if (taskCount > 0 && !confirm(`再次确认：真的要删除「${pname}」及其 ${taskCount} 个任务？`)) return;
   try {
     const resp = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId), { method: 'DELETE' });
     if (!resp.ok) throw new Error('删除失败');
