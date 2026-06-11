@@ -80,6 +80,19 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
     - verify_commands: 针对验收标准的烟雾测试/断言命令，让"合格"可被确定性验证
     - extra_whitelist: 上述命令所需放行的命令前缀（否则 Worker 因白名单拒绝跑不了）
     harness 必须与 acceptance_criteria 对应：每条验收标准都应有命令能验证它。
+12. 【混编项目按技术栈拆分】若任务横跨多种语言/技术栈（如前端 Vue/React +
+    后端 Java/Go + 脚本 Python/Shell），必须【按技术栈拆成独立子任务】，每个
+    子任务只含【单一语言】，理由：
+    - 每个子任务的 harness.language 必须单一明确（一个 harness 只能一套构建/测试）；
+    - 系统会按子任务语言起【对应语言的沙箱镜像】（前端子任务用 node 镜像、后端
+      用 java 镜像），混在一个子任务里会导致沙箱工具链不全、验证跑不起来；
+    - 前后端通过 shared_contract 定义接口契约（如 REST API 形状），后端子任务
+      实现接口、前端子任务消费，仅在【前端真的依赖后端接口定义】时才用 depends_on，
+      否则二者并行。
+    示例："做带前后端的登录功能" → 子任务A(language=java: 后端 auth 接口) +
+    子任务B(language=node: Vue 登录页, depends_on=[A] 因需接口契约) +
+    可选子任务C(language=python: 数据迁移脚本, 与 A 并行)。
+    每个子任务的 scope 文件按其语言/目录归属（前端文件归前端子任务，等等）。
 
 请以 JSON 格式输出执行计划。"""
 

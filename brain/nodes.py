@@ -151,11 +151,15 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
     用于 SIMPLE 快速路径，以及 LLM plan 未给出 harness 时的兜底。按语言给出
     构建/测试/验收命令 + 需放行的命令白名单，让 Worker 能真正跑验证而非口头自报。
     """
-    # 收集 scope 内所有文件后缀判断语言
-    files: list[str] = []
-    for attr in ("writable", "create_files", "readable"):
-        files.extend(getattr(scope, attr, []) or [])
-    exts = {f.rsplit(".", 1)[-1].lower() for f in files if "." in f}
+    # 收集 scope 内文件后缀判断语言。
+    # 关键：优先用【可写/新建】文件(子任务实际产出的语言)，readable 仅在前者
+    # 无后缀时兜底——混编项目里 readable 常含其他语言的上下文文件，会误判。
+    produced: list[str] = []
+    for attr in ("writable", "create_files"):
+        produced.extend(getattr(scope, attr, []) or [])
+    readable = list(getattr(scope, "readable", []) or [])
+    primary_files = produced if any("." in f for f in produced) else (produced + readable)
+    exts = {f.rsplit(".", 1)[-1].lower() for f in primary_files if "." in f}
     text = (task_description or "").lower()
 
     def has(*kw: str) -> bool:
@@ -179,7 +183,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "ls", "cat",
             ],
         )
-    if exts & {"js", "jsx", "ts", "tsx"} or has("node", "npm", "react", "typescript", "vue"):
+    if exts & {"js", "jsx", "ts", "tsx", "vue", "svelte", "mjs", "cjs"} or has("node", "npm", "react", "typescript", "vue"):
         return TaskHarness(
             language="node",
             setup_commands=["npm ci 2>/dev/null || npm install 2>/dev/null || true"],
