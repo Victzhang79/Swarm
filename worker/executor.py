@@ -727,12 +727,37 @@ class WorkerExecutor:
         )
         self._log(f"合并执行完成: {combined[:200]}")
 
-        l1_passed = "fail" not in combined.lower() and "❌" not in combined
+        # LLM 自报仅作弱信号
+        llm_passed = "fail" not in combined.lower() and "❌" not in combined
         l1_details = {"mode": "trivial_fast", "agent_summary": combined[:500]}
 
         self.phase = WorkerPhase.PRODUCING
         self._log("产出阶段：从沙箱 pull-back 并收集 diff")
         await self._sync_from_sandbox("产出")
+
+        # 确定性 L1 闸门：trivial 路径过去仅靠 LLM 文本里有无 "fail" 判定（纯自报，
+        # 曾让 "Sorry, need more steps" 也被判通过）。pull-back 后文件已在本地，
+        # 用 harness 真跑 compile/test/verify 覆盖自报，杜绝幻觉 PASS。
+        det_ok, det_details = self._deterministic_l1_gate()
+        l1_details = {**l1_details, **det_details}
+        if det_ok is None:
+            l1_passed = llm_passed
+            l1_details["l1_decision_source"] = "llm_self_report"
+        else:
+            l1_passed = det_ok
+            l1_details["l1_decision_source"] = "deterministic"
+            if not det_ok and llm_passed:
+                self._log("trivial: LLM 自报通过但确定性闸门失败，以确定性为准（拦截幻觉 PASS）")
+        self._log(
+            f"trivial L1: {'通过 ✅' if l1_passed else '未通过 ❌'} "
+            f"| 来源: {l1_details.get('l1_decision_source')}"
+        )
+        try:
+            from swarm.tracing import push_l1_feedback
+            push_l1_feedback(l1_details, l1_passed=l1_passed)
+        except Exception:  # noqa: BLE001
+            pass
+
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
         output = self._parse_produce_result(produce_result, l1_passed, l1_details)
         self.phase = WorkerPhase.DONE
