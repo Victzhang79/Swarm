@@ -69,6 +69,61 @@ def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tupl
         return 1, str(exc)
 
 
+# 构建/测试命令 → 该命令运行所【必需的工程描述文件】。缺这些文件时命令必然失败
+# (如 mvn 无 pom.xml、npm 无 package.json)，应优雅跳过而非误判为产出不合格。
+_BUILD_TOOL_MANIFESTS: dict[str, tuple[str, ...]] = {
+    "mvn": ("pom.xml",),
+    "gradle": ("build.gradle", "build.gradle.kts", "settings.gradle"),
+    "./gradlew": ("build.gradle", "build.gradle.kts", "settings.gradle"),
+    "npm": ("package.json",),
+    "yarn": ("package.json",),
+    "pnpm": ("package.json",),
+    "npx": ("package.json",),
+    "go": ("go.mod",),
+    "cargo": ("Cargo.toml",),
+}
+
+
+def _build_cmd_applicable(command: str, project_path: str) -> bool:
+    """判断 build/test 命令的工具链工程文件是否存在(沙箱优先)。
+
+    缺工程文件(mvn 无 pom / npm 无 package.json)时命令必失败，此时应跳过该闸门，
+    不能把"工具不适用"误判成"产出不合格"。返回 True=可执行；False=应跳过。
+    """
+    tokens = command.strip().split()
+    if not tokens:
+        return False
+    tool = tokens[0]
+    manifests = _BUILD_TOOL_MANIFESTS.get(tool)
+    if not manifests:
+        return True  # 未知工具(如直接 python/pytest)不做工程文件校验，照常跑
+    # 沙箱优先：在远程工作目录递归找工程文件
+    sandbox = manager = None
+    try:
+        from swarm.tools.build_tools import get_sandbox_context
+        sandbox, manager = get_sandbox_context()
+    except Exception:  # noqa: BLE001
+        sandbox = manager = None
+    if sandbox is not None and manager is not None and hasattr(manager, "run_command"):
+        try:
+            from swarm.config.settings import get_config
+            remote = get_config().sandbox.sandbox_remote_workdir
+        except Exception:  # noqa: BLE001
+            remote = "/workspace"
+        # 任一 manifest 在 workspace 下存在即视为适用
+        names = " -o ".join(f"-name {m!r}" for m in manifests)
+        cr = manager.run_command(
+            sandbox,
+            f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",
+            timeout=20,
+        )
+        return bool((cr.stdout or "").strip())
+    # 本地兜底
+    from pathlib import Path as _P
+    root = _P(project_path)
+    return any(any(root.rglob(m)) for m in manifests)
+
+
 
 def _scope_violations(diff: str, scope: FileScope) -> list[str]:
     modified = files_from_unified_diff(diff)
@@ -675,7 +730,7 @@ def run_l1_pipeline(
     # 的真实编译靠 Brain 编写的 harness.build_command，在沙箱里跑(那里有工具链)。
     # 这是补齐 5 语言生产级编译验证的关键——杜绝"Java 改坏了但确定性层不知道"。
     build_cmd = getattr(harness, "build_command", "") if harness else ""
-    if build_cmd:
+    if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
         b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
         build_ok = b_ec == 0
@@ -686,6 +741,10 @@ def run_l1_pipeline(
         if not build_ok:
             details["build_failed"] = build_cmd
             return False, details
+    elif build_cmd:
+        details["l1_2_1_build_ok"] = True
+        details["build_skipped"] = f"工程文件缺失，跳过构建闸门: {build_cmd}"
+        logger.info("[L1.2.1] 跳过构建闸门(无对应工程文件): %s", build_cmd)
 
     # ── L1.2.0 自动格式化（L0 闸门）──
     # 在 lint 之前先确定性格式化改动文件：把"风格"从模型负担降级为系统自动行为。
@@ -741,6 +800,11 @@ def run_l1_pipeline(
     if not test_cmd:
         details["l1_3_test_ok"] = True
         details["test_skipped"] = True
+    elif not _build_cmd_applicable(test_cmd, project_path):
+        # 测试工具的工程文件缺失(npm test 无 package.json 等)→ 跳过，不误判失败
+        details["l1_3_test_ok"] = True
+        details["test_skipped"] = f"工程文件缺失，跳过测试: {test_cmd}"
+        logger.info("[L1.3] 跳过测试(无对应工程文件): %s", test_cmd)
     else:
         t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=timeout)
         test_ok = t_ec == 0
