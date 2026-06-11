@@ -55,4 +55,5 @@ jobs:
           ruff check . --exclude .venv --select E9,F63,F7,F82
 
       - name: Run tests
-        run: pytest test/ -p no:warnings -v --tb=short -rA
+        # --tb=short：失败时直接显示是哪个测试+断言（纯 -q 会隐藏，曾导致排查困难）
+        run: pytest test/ -p no:warnings -q --tb=short
