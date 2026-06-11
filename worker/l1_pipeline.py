@@ -676,11 +676,13 @@ def run_l1_pipeline(
     # 这是补齐 5 语言生产级编译验证的关键——杜绝"Java 改坏了但确定性层不知道"。
     build_cmd = getattr(harness, "build_command", "") if harness else ""
     if build_cmd:
+        logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
         b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
         build_ok = b_ec == 0
         details["l1_2_1_build_ok"] = build_ok
         details["build_command"] = build_cmd
         details["build_output"] = compress_tool_output(b_out, max_chars=1500)
+        logger.info("[L1.2.1] 构建闸门结果: exit=%s ok=%s", b_ec, build_ok)
         if not build_ok:
             details["build_failed"] = build_cmd
             return False, details
