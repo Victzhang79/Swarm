@@ -1027,6 +1027,25 @@ async def _dispatch_to_worker(
     """将子任务派发给 Worker 执行 — 真实调用 WorkerExecutor"""
     from swarm.knowledge.service import compact_knowledge_context, set_worker_context
 
+    # 解析项目路径（AUDIT 分支与 Worker 都需要）
+    project_path = None
+    if project_id:
+        try:
+            from swarm.project import store
+            proj = store.get_project(project_id)
+            if proj and proj.get("path"):
+                project_path = proj["path"]
+        except Exception as exc:
+            logger.warning("[DISPATCH] 获取项目路径失败: %s", exc)
+
+    # ── AUDIT 意图：走安全审计分支(不产 diff，产结构化报告) ──
+    # 必须在 ModelRouter 初始化之前短路：审计不需要 Worker LLM，
+    # 否则无模型凭证的环境(如 CI)会在此误初始化 ChatOpenAI 而崩。
+    if subtask.intent == TaskIntent.AUDIT:
+        return await _run_security_audit(
+            subtask, project_path, project_id=project_id, task_id=task_id
+        )
+
     router = ModelRouter()
     difficulty = subtask.difficulty.value if hasattr(subtask.difficulty, "value") else str(subtask.difficulty)
     modality = subtask.modality.value if hasattr(subtask.modality, "value") else str(subtask.modality)
@@ -1051,22 +1070,6 @@ async def _dispatch_to_worker(
         knowledge_context,
         limits={"mistakes": 3, "successes": 3, "struct": 8, "semantic": 3, "norms": 5, "behavior": 3},
     )
-
-    project_path = None
-    if project_id:
-        try:
-            from swarm.project import store
-            proj = store.get_project(project_id)
-            if proj and proj.get("path"):
-                project_path = proj["path"]
-        except Exception as exc:
-            logger.warning("[DISPATCH] 获取项目路径失败: %s", exc)
-
-    # ── AUDIT 意图：走安全审计分支(不产 diff，产结构化报告) ──
-    if subtask.intent == TaskIntent.AUDIT:
-        return await _run_security_audit(
-            subtask, project_path, project_id=project_id, task_id=task_id
-        )
 
     audit(
         "dispatch_handoff",
