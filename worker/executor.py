@@ -539,6 +539,30 @@ class WorkerExecutor:
                 return p.name  # 越界则退化为文件名
         return p.as_posix().lstrip("/")
 
+    def _git_baseline_text(self, local_root: Path, rel: str) -> str | None:
+        """从 git HEAD 读取文件的提交版作为 diff 基线（防本地工作副本被前序运行污染）。
+
+        sandbox-first 模式下，前一个相同任务的 pull-back 会把改动写回本地工作副本，
+        导致下次运行的 _pre_sync_contents 基线already含该改动 → diff 空 → 误判"无变更"
+        → 重试死循环(实测 c592c562 连跑 3 次 diff 均为"(无变更)")。
+        用 git HEAD 的提交版做基线，diff 永远相对干净的已提交状态，杜绝污染。
+        返回 None 表示无法用 git(非 git 仓库/文件未跟踪)，调用方回退本地工作副本。
+        """
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["git", "show", f"HEAD:{rel}"],
+                cwd=str(local_root), capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode == 0:
+                return proc.stdout
+            # 文件在 HEAD 不存在(新建文件)→ 基线为空串
+            if "exists on disk, but not in" in proc.stderr or "does not exist" in proc.stderr or "fatal: path" in proc.stderr:
+                return ""
+            return None
+        except Exception:
+            return None
+
     def _snapshot_scope_local(
         self, local_root: Path, files: list[str] | None = None
     ) -> dict[str, str | None]:
@@ -546,7 +570,11 @@ class WorkerExecutor:
 
         files 为 None 时用 writable scope（diff 只关心可写文件的前后变化）。
         值为文件文本；不存在的文件记为空串；二进制/不可读记为 None。
+
+        基线优先用 git HEAD 提交版(防前序运行 pull-back 污染本地工作副本)；
+        git 不可用时回退本地工作副本。仅在 baseline 模式(files is None)下用 git。
         """
+        use_git_baseline = files is None  # 只有基线快照需要防污染；产出快照读真实本地
         rel_files = [
             self._norm_rel(local_root, f)
             for f in (files if files is not None else self._writable_files())
@@ -554,6 +582,11 @@ class WorkerExecutor:
         snapshot: dict[str, str | None] = {}
         for rel in rel_files:
             lp = local_root / rel
+            if use_git_baseline:
+                git_text = self._git_baseline_text(local_root, rel)
+                if git_text is not None:
+                    snapshot[rel] = git_text
+                    continue
             try:
                 snapshot[rel] = lp.read_text("utf-8") if lp.is_file() else ""
             except (UnicodeDecodeError, OSError):
@@ -577,8 +610,16 @@ class WorkerExecutor:
             self._log(f"{reason} scope 为空，跳过文件上传（无目标文件）")
             return
 
-        # 记录上传前内容快照（用于 diff 基线）
+        # 记录上传前内容快照（用于 diff 基线）。writable 文件的基线已由
+        # _snapshot_scope_local 用 git HEAD 填好(防污染)，这里【不覆盖】已有键，
+        # 只为额外的 scope 文件(readable/构建清单)补基线，且同样优先 git。
         for rel in rel_files:
+            if rel in self._pre_sync_contents:
+                continue  # 已有 git 基线，绝不用本地工作副本覆盖(否则前序污染复现)
+            git_text = self._git_baseline_text(local_root, rel)
+            if git_text is not None:
+                self._pre_sync_contents[rel] = git_text
+                continue
             lp = (local_root / rel)
             try:
                 self._pre_sync_contents[rel] = lp.read_text("utf-8") if lp.is_file() else ""
