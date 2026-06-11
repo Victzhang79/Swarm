@@ -87,6 +87,9 @@ class WorkerConfig(BaseSettings):
         "python -m py_compile", "python -m pytest",
         "tsc --noEmit", "eslint", "javac",
     ])
+    # 安全审计阻断级别：critical/high=发现该级别漏洞则阻断交付；none=仅报告不阻断。
+    # 满足"阻断交付 + 仅报告"双模式(用户决策)。
+    security_block_severity: str = "critical"
 
 
 class SandboxConfig(BaseSettings):

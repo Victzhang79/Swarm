@@ -907,6 +907,113 @@ async def dispatch(state: BrainState) -> dict:
     return result
 
 
+async def _run_security_audit(
+    subtask: SubTask,
+    project_path: str | None,
+    *,
+    project_id: str = "",
+    task_id: str = "",
+) -> WorkerOutput:
+    """AUDIT 意图执行分支：跑安全扫描，产结构化报告(不产 diff)。
+
+    阻断/仅报告双模式由 WorkerConfig.security_block_severity 控制：
+    - critical/high：发现该级别漏洞 → should_block → l1_passed=False(阻断交付)
+    - none：仅报告，永不阻断(l1_passed=True)
+    """
+    import asyncio as _asyncio
+
+    from swarm.config.settings import get_config
+
+    lang = getattr(getattr(subtask, "harness", None), "language", "") or ""
+    block_severity = get_config().worker.security_block_severity
+
+    audit(
+        "security_audit_start",
+        orchestrator="Brain",
+        executor="Worker",
+        task_id=task_id,
+        subtask_id=subtask.id,
+        language=lang,
+        block_severity=block_severity,
+    )
+
+    if not project_path:
+        logger.warning("[AUDIT] 子任务 %s 无项目路径，安全审计跳过", subtask.id)
+        return WorkerOutput(
+            subtask_id=subtask.id,
+            diff="",
+            summary="安全审计跳过：无项目路径",
+            confidence=Confidence.LOW,
+            l1_passed=True,  # 无路径不阻断，避免误杀
+            l1_details={"mode": "audit", "skipped": "no_project_path"},
+            audit_findings=[],
+        )
+
+    def _scan() -> tuple[list, bool]:
+        from swarm.worker.security_scan import run_security_scan
+
+        scope_files = list(
+            getattr(subtask.scope, "writable", []) or []
+        ) + list(getattr(subtask.scope, "readable", []) or [])
+        return run_security_scan(
+            project_path,
+            lang,
+            files=scope_files or None,
+            block_severity=block_severity,
+        )
+
+    try:
+        findings, should_block = await _asyncio.get_running_loop().run_in_executor(None, _scan)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[AUDIT] 安全扫描失败: %s", exc)
+        return WorkerOutput(
+            subtask_id=subtask.id,
+            diff="",
+            summary=f"安全审计执行失败: {exc}",
+            confidence=Confidence.LOW,
+            l1_passed=True,  # 扫描器自身故障不阻断交付(可观测性不应误杀)
+            l1_details={"mode": "audit", "error": str(exc)},
+            audit_findings=[],
+        )
+
+    by_sev: dict[str, int] = {}
+    for f in findings:
+        sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        by_sev[sev] = by_sev.get(sev, 0) + 1
+    summary = (
+        f"安全审计完成：{len(findings)} 项发现 "
+        f"({', '.join(f'{k}={v}' for k, v in sorted(by_sev.items())) or '无'})"
+        f"；block_severity={block_severity} → {'阻断交付' if should_block else '通过'}"
+    )
+    audit(
+        "security_audit_done",
+        orchestrator="Brain",
+        executor="Worker",
+        task_id=task_id,
+        subtask_id=subtask.id,
+        findings=len(findings),
+        should_block=should_block,
+        by_severity=by_sev,
+    )
+    logger.info("[AUDIT] %s | %s", subtask.id, summary)
+    return WorkerOutput(
+        subtask_id=subtask.id,
+        diff="",  # 审计不产 diff
+        summary=summary,
+        confidence=Confidence.HIGH,
+        l1_passed=not should_block,  # 阻断模式下有高危发现即 L1 不通过
+        l1_details={
+            "mode": "audit",
+            "l1_decision_source": "deterministic",
+            "findings_total": len(findings),
+            "by_severity": by_sev,
+            "block_severity": block_severity,
+            "should_block": should_block,
+        },
+        audit_findings=findings,
+    )
+
+
 async def _dispatch_to_worker(
     subtask: SubTask,
     knowledge_context: KnowledgeContext,
@@ -954,6 +1061,12 @@ async def _dispatch_to_worker(
                 project_path = proj["path"]
         except Exception as exc:
             logger.warning("[DISPATCH] 获取项目路径失败: %s", exc)
+
+    # ── AUDIT 意图：走安全审计分支(不产 diff，产结构化报告) ──
+    if subtask.intent == TaskIntent.AUDIT:
+        return await _run_security_audit(
+            subtask, project_path, project_id=project_id, task_id=task_id
+        )
 
     audit(
         "dispatch_handoff",
