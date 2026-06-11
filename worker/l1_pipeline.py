@@ -680,6 +680,47 @@ def _normalize_python_cmd(cmd: str) -> str:
     return re.sub(r"(^|[\s;&|])python(?=\s)", lambda m: f"{m.group(1)}{py}", cmd)
 
 
+def _maven_modules(project_path: str) -> dict[str, str]:
+    """返回 {模块目录名: 相对路径} 映射(读根 pom 的 <module> 列表)。无则空。"""
+    from pathlib import Path as _P
+    root = _P(project_path)
+    pom = root / "pom.xml"
+    if not pom.is_file():
+        return {}
+    try:
+        import re
+        text = pom.read_text("utf-8", errors="ignore")
+        mods = re.findall(r"<module>\s*([^<\s]+)\s*</module>", text)
+        return {m.rstrip("/").split("/")[-1]: m.rstrip("/") for m in mods}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
+    """多模块 Maven：把整 reactor 的 mvn 命令改写成只编【改动所在模块】(-pl <mod> -am)。
+
+    RuoYi 等多模块工程根 pom 聚合 6 个模块，整 reactor `mvn compile` 需要所有模块
+    源码齐备(而 worker 只同步改动模块) → reactor 失败。正确做法是 -pl 限定改动模块、
+    -am 连带构建其依赖的上游模块。已含 -pl 的命令不动；非 mvn 命令原样返回。
+    """
+    if "mvn" not in command or "-pl" in command:
+        return command
+    modules = _maven_modules(project_path)
+    if not modules:
+        return command
+    # 从改动文件路径推断所属模块(取路径首段命中 module 名)
+    hit: list[str] = []
+    for f in modified:
+        seg = str(f).strip().split("/")[0]
+        if seg in modules and modules[seg] not in hit:
+            hit.append(modules[seg])
+    if not hit:
+        return command
+    pl = ",".join(hit)
+    # 插到 mvn 之后：mvn <args> → mvn -pl <pl> -am <args>
+    return command.replace("mvn", f"mvn -pl {pl} -am", 1)
+
+
 def run_l1_pipeline(
     project_path: str,
     subtask: SubTask,
@@ -730,6 +771,8 @@ def run_l1_pipeline(
     # 的真实编译靠 Brain 编写的 harness.build_command，在沙箱里跑(那里有工具链)。
     # 这是补齐 5 语言生产级编译验证的关键——杜绝"Java 改坏了但确定性层不知道"。
     build_cmd = getattr(harness, "build_command", "") if harness else ""
+    if build_cmd:
+        build_cmd = _scope_maven_command(build_cmd, project_path, modified)
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
         b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
@@ -795,6 +838,8 @@ def run_l1_pipeline(
     # 没有 harness 时才回退到启发式 _guess_test_cmd。（harness 已在上方取得）
     harness_test = getattr(harness, "test_command", "") if harness else ""
     test_cmd = harness_test or _guess_test_cmd(project_path, modified)
+    if test_cmd:
+        test_cmd = _scope_maven_command(test_cmd, project_path, modified)
     details["test_cmd"] = test_cmd
     details["test_cmd_source"] = "harness" if harness_test else "heuristic"
     if not test_cmd:
