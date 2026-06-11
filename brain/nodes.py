@@ -145,6 +145,10 @@ def _format_project_structure(knowledge_context: dict | None) -> str:
     return "\n".join(lines) + extra
 
 
+# 子任务 writable 文件数告警阈值：超过则疑似规划过度圈定(把整个模块塞进 scope)。
+_SCOPE_WRITABLE_WARN_THRESHOLD = 20
+
+
 def _infer_harness(task_description: str, scope, project_path: str = "") -> "TaskHarness":
     """根据任务描述/scope 文件/项目结构推断一个合理的验证 harness。
 
@@ -159,16 +163,42 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
         produced.extend(getattr(scope, attr, []) or [])
     readable = list(getattr(scope, "readable", []) or [])
     primary_files = produced if any("." in f for f in produced) else (produced + readable)
-    exts = {f.rsplit(".", 1)[-1].lower() for f in primary_files if "." in f}
+
+    # 按【主导语言】判定，而非"任一后缀命中即算"——混编 scope 里夹带的少量
+    # 其他语言文件(如 87 个 .java 里混 1 个 .js)不应让整体被误判为 node。
+    # 统计各语言扩展名计数，取最多的作为主导语言。
+    _LANG_EXTS = {
+        "python": {"py"},
+        "node": {"js", "jsx", "ts", "tsx", "vue", "svelte", "mjs", "cjs"},
+        "java": {"java", "kt"},
+        "go": {"go"},
+        "rust": {"rs"},
+    }
+    _ext_counts: dict[str, int] = {}
+    for f in primary_files:
+        if "." not in f:
+            continue
+        e = f.rsplit(".", 1)[-1].lower()
+        for lang, langexts in _LANG_EXTS.items():
+            if e in langexts:
+                _ext_counts[lang] = _ext_counts.get(lang, 0) + 1
+                break
+    dominant_lang = max(_ext_counts, key=lambda k: _ext_counts[k]) if _ext_counts else None
     text = (task_description or "").lower()
 
     def has(*kw: str) -> bool:
         return any(k in text for k in kw)
 
+    def is_lang(lang: str, *kw: str) -> bool:
+        """主导语言匹配优先；无主导语言(scope 无代码文件)时回退描述关键词。"""
+        if dominant_lang is not None:
+            return dominant_lang == lang
+        return has(*kw)
+
     # 语言判定（scope 后缀优先，其次描述关键词）→ 完整工具链矩阵
     # 每语言给出 build/test/lint/typecheck/sast + setup(运行时装工具) + 白名单。
     # 工具缺失时由 L1/审计层优雅降级，这里只声明"理想命令"。
-    if "py" in exts or has("python", "pytest", "django", "flask", "fastapi", "pygame"):
+    if is_lang("python", "python", "pytest", "django", "flask", "fastapi", "pygame"):
         return TaskHarness(
             language="python",
             setup_commands=["pip install -q ruff bandit pip-audit 2>/dev/null || true"],
@@ -183,7 +213,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "ls", "cat",
             ],
         )
-    if exts & {"js", "jsx", "ts", "tsx", "vue", "svelte", "mjs", "cjs"} or has("node", "npm", "react", "typescript", "vue"):
+    if is_lang("node", "node", "npm", "react", "typescript", "vue"):
         return TaskHarness(
             language="node",
             setup_commands=["npm ci 2>/dev/null || npm install 2>/dev/null || true"],
@@ -196,7 +226,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "node", "npm", "npx", "tsc", "eslint", "semgrep", "ls", "cat",
             ],
         )
-    if "go" in exts or has("golang", " go "):
+    if is_lang("go", "golang", " go "):
         return TaskHarness(
             language="go",
             setup_commands=["go mod download 2>/dev/null || true"],
@@ -209,7 +239,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "ls", "cat",
             ],
         )
-    if "rs" in exts or has("rust", "cargo"):
+    if is_lang("rust", "rust", "cargo"):
         return TaskHarness(
             language="rust",
             build_command="cargo build",
@@ -220,7 +250,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "cargo", "rustc", "clippy-driver", "cargo-audit", "ls", "cat",
             ],
         )
-    if exts & {"java", "kt"} or has("maven", "gradle", "java", "spring"):
+    if is_lang("java", "maven", "gradle", "java", "spring"):
         return TaskHarness(
             language="java",
             build_command="mvn -q compile",
@@ -637,6 +667,16 @@ async def plan(state: BrainState) -> dict:
             inferred = _infer_intent(st.description or task_description)
             if inferred != TaskIntent.MODIFY:
                 st.intent = inferred
+        # scope 过度圈定守卫：弱规划模型常把整个模块塞进 writable(实测 RuoYi 暴露:
+        # "加一个方法"却圈了 88 个文件)。超阈值时告警 + 审计，便于排查"diff 巨大且脏"
+        # 的根因。不自动裁剪(可能误删真需要的文件)，但把信号显式暴露出来。
+        _writable = list(getattr(st.scope, "writable", []) or [])
+        if len(_writable) > _SCOPE_WRITABLE_WARN_THRESHOLD:
+            logger.warning(
+                "[PLAN] 子任务 %s scope 过度圈定: writable=%d 个文件(阈值 %d)，"
+                "可能导致上传/拉回大量无关文件、diff 巨大。建议规划时只圈真正改动的文件。",
+                getattr(st, "id", "?"), len(_writable), _SCOPE_WRITABLE_WARN_THRESHOLD,
+            )
     plan_touch = touch_context(
         state,
         "plan",

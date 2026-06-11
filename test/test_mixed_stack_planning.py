@@ -67,6 +67,17 @@ def test_mixed_scope_dominant_when_no_produced_ext():
     print("  ✅ produced 无后缀时优雅回退(不崩)")
 
 
+def test_dominant_language_ignores_stray_other_lang_file():
+    """[回归] 大量 Java 中夹带 1 个 .js 不应被误判为 node(真实 RuoYi e2e 暴露的 bug)。"""
+    from swarm.brain.nodes import _infer_harness
+    from swarm.types import FileScope
+
+    files = [f"src/Foo{i}.java" for i in range(87)] + ["static/highlight.min.js"]
+    h = _infer_harness("给 StringUtils 加 isMobile 方法", FileScope(writable=files))
+    assert h.language == "java", f"主导语言应为 java，实际 {h.language}"
+    print("  ✅ [回归] 主导语言判定：87 java + 1 js → java(不被夹带文件误判)")
+
+
 def main() -> int:
     print("=== test_mixed_stack_planning ===")
     failed = 0
@@ -75,6 +86,7 @@ def main() -> int:
         test_per_stack_subtasks_get_distinct_languages,
         test_each_stack_maps_to_its_template,
         test_mixed_scope_dominant_when_no_produced_ext,
+        test_dominant_language_ignores_stray_other_lang_file,
     ):
         try:
             fn()

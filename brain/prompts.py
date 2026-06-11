@@ -62,6 +62,12 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
    - readable: 仅供理解上下文的只读文件
    关键：新建文件务必放 create_files（不要放 writable），否则 worker 会
    先试图读取不存在的文件而失败。删除文件务必放 delete_files。
+   ⚠️【scope 最小化，严禁过度圈定】writable/create_files 只放【本子任务真正要
+   改动的文件】(通常 1-5 个)，绝不要把整个模块/包的文件一股脑放进 writable。
+   例：「给 StringUtils 加一个方法」→ writable 只含 StringUtils.java(+其测试)，
+   不是把整个 utils 包都放进去。需要参考的文件放 readable，不要放 writable。
+   过度圈定会导致：上传/拉回大量无关文件、diff 巨大且脏、构建变慢、模型被无关
+   上下文淹没。scope 越精准，执行越快越准。
 5. 子任务粒度: 单个子任务应能在 10 分钟内完成
 6. 验收标准必须可量化、可自动检查
 7. 多子任务/跨模块任务必须在 plan 级定义 shared_contract（Brain 统一定义接口，Worker 只实现）
