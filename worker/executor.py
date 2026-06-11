@@ -440,7 +440,64 @@ class WorkerExecutor:
         for rel in self._build_manifest_files():
             if rel not in files and rel not in create and rel not in delete:
                 files.append(rel)
+        # 追加【改动所在模块的完整源码树】——仅当 harness 需真实编译时。
+        # 精准 scope 同步只传选中文件，但 mvn/gradle 编译整模块会因缺同级类
+        # (DateUtils 依赖 Constants/StringUtils 等)报 cannot find symbol 秒挂。
+        # 编译型语言必须带齐改动模块的全部源码。
+        for rel in self._module_source_files():
+            if rel not in files and rel not in create and rel not in delete:
+                files.append(rel)
         return files
+
+    def _module_source_files(self) -> list[str]:
+        """改动文件所在【构建模块】的完整源码树(仅编译型语言需要)。
+
+        判据：harness.build_command 存在(说明要真实编译)。从改动文件向上找最近的
+        构建清单(pom.xml/build.gradle)确定模块根，再收该模块 src/ 下全部源文件。
+        防超大：单模块上限 800 文件。非编译型(无 build_command)返回空，保持精准同步。
+        """
+        harness = getattr(self.subtask, "harness", None)
+        build_cmd = getattr(harness, "build_command", "") if harness else ""
+        if not build_cmd or not self.project_path:
+            return []
+        # 仅对 JVM 系(mvn/gradle)启用整模块同步；其他语言模块边界不同，暂不扩展
+        if not any(t in build_cmd for t in ("mvn", "gradle")):
+            return []
+        root = Path(self.project_path).resolve()
+        scope = self.effective_scope
+        changed = (list(getattr(scope, "writable", []) or [])
+                   + list(getattr(scope, "create_files", []) or [])
+                   + list(getattr(scope, "readable", []) or []))
+        module_roots: set[Path] = set()
+        for f in changed:
+            cur = (root / str(f).strip()).resolve().parent
+            # 向上找最近含 pom.xml/build.gradle 的目录 = 模块根
+            while True:
+                if (cur / "pom.xml").is_file() or (cur / "build.gradle").is_file() or (cur / "build.gradle.kts").is_file():
+                    module_roots.add(cur)
+                    break
+                if cur == root or root not in cur.parents:
+                    break
+                cur = cur.parent
+        out: list[str] = []
+        _SRC_EXT = (".java", ".kt", ".scala", ".groovy")
+        for mroot in module_roots:
+            src_dir = mroot / "src"
+            base = src_dir if src_dir.is_dir() else mroot
+            count = 0
+            for p in base.rglob("*"):
+                if count >= 800:
+                    break
+                if not p.is_file() or p.suffix not in _SRC_EXT:
+                    continue
+                if "target" in p.relative_to(root).parts or "build" in p.relative_to(root).parts:
+                    continue
+                try:
+                    out.append(str(p.relative_to(root)))
+                    count += 1
+                except ValueError:
+                    continue
+        return out
 
     def _build_manifest_files(self) -> list[str]:
         """发现项目里的构建清单文件，确保沙箱编译有工程描述。
