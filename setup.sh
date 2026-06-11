@@ -4,6 +4,8 @@
 #  用法: bash setup.sh [--skip-pg] [--skip-codegraph] [--skip-env] [--dev]
 #
 #  当前进度 (2026-06): Phase 0–5 主链路 ✅ · 记忆 L0-L6 · KB 入队调度 · V2/V3 双 gate
+#    · harness 验证工程(Brain 编写/Worker 执行/确定性 L1 闸门) · greenfield 从零建项目
+#    · 任务级联取消 + append-only 审计日志 · 依赖驱动并行派发
 #  架构设计: docs/Swarm_System.html · 详见 README.md
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -424,6 +426,12 @@ SWARM_WORKER_MAX_CONCURRENT=4
 SWARM_WORKER_MAX_EXECUTION_TIME=600
 SWARM_WORKER_MAX_ITERATIONS=50
 SWARM_WORKER_MAX_FIX_ROUNDS=3
+
+# Worker L1 确定性验证闸门（默认全开；harness.extra_whitelist 会在全局白名单上追加）
+# SWARM_WORKER_L1_LINT=true
+# SWARM_WORKER_L1_LINT_GATE=true
+# SWARM_WORKER_L1_SELF_REVIEW=true
+# SWARM_WORKER_COMMAND_WHITELIST=mvn compile,mvn test,npm build,npm test,python -m py_compile,python -m pytest,tsc --noEmit,eslint,javac
 
 # 任务自动化（/api/demo 默认 auto_accept；任务主链路默认等待人工审核）
 # SWARM_AUTO_ACCEPT=true

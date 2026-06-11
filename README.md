@@ -18,7 +18,7 @@ swarm/                          ← 项目根（当前目录）
 ├── .env.example                ← 环境变量模板
 ├── api/                        ← FastAPI + Web UI (static/)
 ├── auth/                       ← RBAC · 默认 L1 profile
-├── brain/                      ← LangGraph 17 节点状态机
+├── brain/                      ← LangGraph 15 节点状态机
 ├── worker/                     ← ReAct Agent · L1 pipeline · sandbox
 ├── knowledge/                  ← Layer A-D · 检索 · 增量调度
 ├── memory/                     ← L0-L6 · sliding_window · decay
@@ -28,6 +28,7 @@ swarm/                          ← 项目根（当前目录）
 ├── cli/                        ← Click CLI
 ├── config/                     ← pydantic-settings
 ├── tools/                      ← Agent tools
+├── workdir/                    ← greenfield 从零创建项目的默认根目录
 ├── scripts/                    ← 运维脚本
 │   ├── init_db.py              ← 统一建表（schema 单一事实来源）
 │   ├── start-services.sh       ← Qdrant + API
@@ -121,11 +122,12 @@ pip install -e ".[dev]"
 
 | 域 | 要点 |
 |----|------|
-| Brain | 并行 dispatch（批次容错）· 3-way merge · PlanValidator · shared_contract · **确定性失败升级阶梯**（retry→换模型→人工）|
-| 验证 | Worker L1（语法+**lint**+单测+**LLM 自检**）· V2 gate 硬阻断 · V3 GitLab push/CI · integration_review |
+| Brain | 并行 dispatch（**依赖驱动 DAG**·批次容错）· 3-way merge · PlanValidator · shared_contract · **确定性失败升级阶梯**（retry→换模型→人工）|
+| 验证 | Worker L1（语法+**lint**+单测+**LLM 自检**）· **harness 确定性闸门**（Brain 编写 build/test/verify，真跑命令覆盖 LLM 自报）· V2 gate 硬阻断 · V3 GitLab push/CI · integration_review |
 | 知识 | hybrid 检索（**中文关键词+时间权重+共现过滤**）· approve/webhook 入队 · **按项目批量合并消费** · Layer C **规范自动提取** · consistency repair |
 | 记忆 | L1 结构化 UI · L2 注入 analyze/plan · L3 滑动窗口 · PatternExtractor · **L5+L6 衰减** |
-| 平台 | RBAC · `infra/` Redis 模块锁 · MR 历史日 sync · `scripts/init_db.py` 统一建表 |
+| 项目 | **导入现有目录 / greenfield 从零创建** · CodeGraph 预处理 · FileScope（writable/create/delete/allow_any）|
+| 平台 | RBAC · `infra/` Redis 模块锁 · **任务级联取消（删项目→终止运行中任务+沙箱）** · **append-only 任务审计日志** · `scripts/init_db.py` 统一建表 |
 
 ---
 
@@ -167,8 +169,17 @@ curl -X POST http://localhost:8420/api/auth/login \
 
 # 任务
 curl -X POST http://localhost:8420/api/projects/<pid>/tasks \
-  -H 'Authorization: Bearer <token>' \
+  -H "Authorization: Bearer TOKEN" \
   -d '{"description":"..."}'
+
+# 从零创建项目（greenfield，path 可留空自动建目录）
+curl -X POST http://localhost:8420/api/projects \
+  -H "Authorization: Bearer TOKEN" \
+  -d '{"name":"sokoban","greenfield":true}'
+
+# 任务审计日志（append-only，删除后仍可追溯）
+curl 'http://localhost:8420/api/tasks/audit?project_id=<pid>' \
+  -H "Authorization: Bearer TOKEN"
 
 # 知识库
 curl 'http://localhost:8420/api/projects/<pid>/knowledge/consistency?repair=true'
@@ -179,6 +190,8 @@ curl -X POST http://localhost:8420/api/projects/<pid>/knowledge/webhook/git \
 ---
 
 ## 测试
+
+> 当前 **340 passing**（不含需外部 CubeSandbox 的 `test_sandbox_integration.py`）。
 
 ```bash
 # 推荐
@@ -218,6 +231,9 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `test_updater.py` | 增量更新 dedupe/merge · AST 符号抽取 · handle_event 分发 |
 | `test_executor.py` | scope 收集 · 路径归一化 · L1 自报解析 · **本地模式 diff 快照** |
 | `test_cn_keywords.py` | 中文 2-gram 关键词抽取 · 时间衰减加权 |
+| `test_cascade_cancel.py` | 删项目级联取消 · 幽灵任务终止 · 不误伤其他项目 |
+| `test_harness_l1.py` | harness 语言推断 · L1 优先用 harness.test_command · verify_commands 硬阻断 |
+| `test_file_operations.py` | FileScope create/delete/allow_any · greenfield 开放式需求放行 |
 
 ---
 
@@ -233,7 +249,9 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `SWARM_GITLAB_*` | V3 验证 / MR |
 | `SWARM_REDIS_ENABLED` | 模块锁 |
 | `SWARM_RBAC_ENABLED` | 多用户 |
-| `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关 |
+| `SWARM_WORKER_L1_LINT` / `_LINT_GATE` / `_SELF_REVIEW` | Worker L1 确定性闸门开关（默认全开硬阻断）|
+| `SWARM_WORKER_COMMAND_WHITELIST` | 全局命令白名单（harness.extra_whitelist 在其上追加）|
+| `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关（L1 确定性证据回写为结构化 feedback）|
 | `SWARM_LOG_LEVEL` | 日志级别 DEBUG/INFO/WARNING/ERROR（默认 INFO） |
 | `SWARM_LOG_FILE` | 日志文件路径（默认 swarm.log，空串=仅控制台） |
 | `SWARM_LOG_JSON` | true=结构化 JSON 行日志（便于聚合） |
@@ -267,7 +285,34 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 
 > 对照设计文档（`docs/Swarm_System.html` V2）走读全部 26K 行代码后的诚实评估。
 > 核心链路（提交→Brain 编排→Worker 沙箱→审核→Learn→KB 增量）端到端可用，
-> 经三轮强化后整体完成度约 **95%**。设计文档列出的差距已全部补齐。
+> 经多轮强化后整体完成度约 **95%**。设计文档列出的差距已全部补齐。
+
+### 最新一轮 — 生命周期 / harness 工程 / greenfield / 并行（实测驱动）
+
+> 真实运行中暴露并修复的问题，每项均有任务日志 + 沙箱日志佐证（非单测推断）。
+
+**生命周期 / 资源**
+
+- ✅ **删项目不取消运行中任务 → 幽灵任务烧 GPU** → 删项目前级联 `cancel_project_tasks`：取消 asyncio 句柄 + 释放沙箱；`cancel_task` 即使 DB 记录已删仍清理内存句柄，杜绝陷入 replan 死循环（`brain/runner.py`、`api/routers/project.py`）。实测：删运行中项目→「级联取消 1 个运行中任务」→25s 零新活动→孤儿沙箱 0。
+- ✅ **warmup 死代码每次 dispatch 泄漏孤儿沙箱** → 移除失效的临时 `SandboxPool.warmup`（实例即弃、远端沙箱永不回收）。
+
+**可追溯性 / 防误删**
+
+- ✅ **任务硬删后无任何痕迹** → 新增 `task_audit_log`（append-only，永不随删除清除）：create/delete/级联删都留痕，`GET /api/tasks/audit` 可查（`project/store.py`、`api/routers/task.py`）。
+- ✅ **删除确认太弱** → WebUI 删项目二次确认，明确告知级联取消 + 硬删 N 个任务不可恢复（`api/static/js/core/project.js`）。
+
+**harness 验证工程（确定性闸门，杜绝"自报合格"）**
+
+- ✅ **Worker 只被告知"run_compile/run_tests"但无项目命令、白名单固定** → 新增 `TaskHarness`（language/build/test/verify_commands/extra_whitelist）：Brain 在 PLAN 时为每个子任务编写 harness（prompt 强制，必填）；`_infer_harness` 按语言兜底（python/node/go/rust/java）（`types.py`、`brain/nodes.py`、`brain/prompts.py`）。
+- ✅ **小模型拿不到验证依据 / 命令白名单拒绝** → worker prompt 注入 harness 段「必须实跑命令」；`run_command` 白名单 = 全局 + 本任务 `harness.extra_whitelist`（`worker/prompts.py`、`tools/build_tools.py`）。
+- ✅ **L1 凭 LLM 自报通过** → L1 优先用 `harness.test_command`，新增 L1.3.5 真跑 `verify_commands` 硬阻断；空 diff 但有 harness 也跑确定性验证；确定性证据回写 LangSmith 结构化 feedback（`worker/l1_pipeline.py`、`tracing.py`）。
+- ✅ **trivial 快速路径绕过 L1（纯字符串判 "fail"）** → 端到端实测发现：`Sorry, need more steps`（未完成）也被判通过 high。改为 pull-back 后跑 `_deterministic_l1_gate`，实测从「无决策来源」变为「来源: deterministic」（`worker/executor.py`）。
+- ✅ **环境漂移误判**（实测发现）→ L1 闸门本地跑命令时：`_python_bin` 优先 `sys.executable`（带 pytest 的 venv，非系统 python3）；裸 `python`→可用解释器归一化。
+
+**greenfield 从零创建 + 并行**
+
+- ✅ **只能导入现有目录** → `POST /api/projects` 支持 `greenfield=true`（path 可空，自动建 `workdir/<name>`）；WebUI 加「导入现有 / 从零创建」单选；`FileScope.allow_any` 让开放式需求可自由建文件（`api/routers/project.py`、`api/static/js/core/project.js`、`types.py`）。实测：「写个推箱子游戏」→生成可运行 229 行代码。
+- ✅ **派发偏串行**（LLM 把独立子任务拆进各自 group）→ `get_dispatch_batch` 改为**依赖驱动**：派发所有 `depends_on` 已满足的子任务并行执行，`parallel_groups` 降为软提示（`types.py`）。
 
 ### 本轮已修复
 
