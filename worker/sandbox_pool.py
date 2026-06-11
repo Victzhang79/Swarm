@@ -108,9 +108,15 @@ class HotSandboxPool:
         return sandbox
 
     def _health_check(self, sandbox: Any) -> bool:
-        """锁外调用：健康探针 run_code("print(1)", timeout=5)。"""
+        """锁外调用：健康探针。优先 shell 端点(run_command)——不依赖 Jupyter
+        kernel(自建语言镜像无 kernel，run_code 探针会误判沙箱全死)。
+        """
         try:
-            result = self._manager.run_code(sandbox, "print(1)", timeout=5)
+            rc = getattr(self._manager, "run_command", None)
+            if rc is not None:
+                result = rc(sandbox, "echo ok", timeout=5)
+            else:
+                result = self._manager.run_code(sandbox, "print(1)", timeout=5)
             return bool(result.success)
         except Exception:
             return False

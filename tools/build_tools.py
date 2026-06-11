@@ -128,8 +128,23 @@ def _run_in_sandbox(command: str, timeout: int = 120) -> str:
     workdir = _sandbox_workdir()
     sandbox_command = f"cd {workdir} && {command}"
 
-    # 使用 subprocess 模块在沙箱内执行 shell 命令
-    # 注意：变量名用 _sbx_proc 避免与外层 result 冲突
+    # 优先用沙箱原生 shell 端点(commands.run)执行——所有语言镜像都可用，
+    # 不依赖 Jupyter kernel(自建语言镜像未装 kernel 会 502)。
+    if hasattr(manager, "run_command"):
+        cr = manager.run_command(sandbox, sandbox_command, timeout=timeout)
+        # 基础设施级失败(连接/502/没有 exit_code)才降级；命令非0退出是有效结果
+        infra_fail = (not cr.success) and (cr.error or "").startswith(
+            ("TimeoutException", "SandboxException", "ConnectionError", "502", "500")
+        )
+        if infra_fail:
+            log.warning("沙箱 shell 端点失败，降级本地执行: %s", cr.error)
+            return _run_local(command, timeout=timeout)
+        status = "✅" if cr.success else "❌"
+        exit_hint = "0" if cr.success else (cr.error or "non-zero")
+        body = cr.stdout + (("\n" + cr.stderr) if cr.stderr else "")
+        return f"{status} (sandbox {exit_hint})\n{body.strip()}"
+
+    # 兜底(旧路径)：manager 无 run_command 时用 Jupyter 包 subprocess
     code = f"""
 import subprocess
 _sbx_proc = subprocess.run({sandbox_command!r}, shell=True, capture_output=True, text=True, timeout={timeout})

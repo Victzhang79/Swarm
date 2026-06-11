@@ -320,18 +320,29 @@ class SandboxManager:
     def create(
         self,
         template_id: str | None = None,
-        timeout: int = 60,
+        timeout: int | None = None,
         *,
         project_id: str | None = None,
         task_id: str | None = None,
         source: str = "manual",
     ) -> Any:
-        """创建新的沙箱实例"""
+        """创建新的沙箱实例。
+
+        timeout = 沙箱【生命周期】秒数(到期远端自动销毁)。默认取 worker
+        max_execution_time(通常 600s)——原来硬编码 60s 会导致 mvn/npm 等长构建
+        跑到一半沙箱就被远端杀，后续 run_code/run_command 打到死沙箱返回 502。
+        """
         from e2b_code_interpreter import Sandbox
 
+        if timeout is None:
+            try:
+                from swarm.config.settings import get_config as _gc
+                timeout = max(int(_gc().worker.max_execution_time), 120)
+            except Exception:
+                timeout = 600
         template = template_id or self.config.default_template
         t0 = time.monotonic()
-        logger.info("Creating sandbox with template=%s project=%s", template, project_id)
+        logger.info("Creating sandbox with template=%s project=%s timeout=%ss", template, project_id, timeout)
 
         sandbox = Sandbox.create(template=template, timeout=timeout)
         self._instances[sandbox.sandbox_id] = sandbox
@@ -393,34 +404,70 @@ class SandboxManager:
     def clean_workspace(self, sandbox: Any, workdir: str = "/workspace") -> bool:
         """清空沙箱工作区内容（复用沙箱前/归还后调用，防跨任务文件污染）。
 
-        删除 workdir 下所有内容(含隐藏文件)但保留 workdir 本身。
+        走 shell 端点(commands.run)——不依赖 Jupyter kernel(自建语言镜像无 kernel)。
+        用 find 删除 workdir 下所有内容(含隐藏文件)但保留 workdir 本身。
         返回是否成功；失败记日志不抛(调用方据返回决定是否仍复用)。
         """
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
-        # 用 python 在沙箱内清理，避免 shell 注入/通配符陷阱；保留 workdir 目录本身。
-        code = (
-            "import shutil, os\n"
-            f"d = {workdir!r}\n"
-            "os.makedirs(d, exist_ok=True)\n"
-            "for name in os.listdir(d):\n"
-            "    p = os.path.join(d, name)\n"
-            "    try:\n"
-            "        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)\n"
-            "    except Exception as e:\n"
-            "        print('skip', p, e)\n"
-            "print('WORKSPACE_CLEANED')\n"
+        # mkdir -p 保证目录在；find ... -delete 清空内容(保留 workdir)。
+        cmd = (
+            f"mkdir -p {workdir} && "
+            f"find {workdir} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
+            f"echo WORKSPACE_CLEANED"
         )
         try:
-            result = self.run_code(sandbox, code, timeout=30)
-            ok = result.success and "WORKSPACE_CLEANED" in (result.stdout or "")
-            if ok:
-                self.append_activity(sid, "clean", f"workspace 已清理: {workdir}")
-            else:
-                logger.warning("clean_workspace 未确认成功 %s: %s", sid, (result.stdout or result.error or "")[:200])
+            cr = self.run_command(sandbox, cmd, timeout=30)
+            ok = cr.success and "WORKSPACE_CLEANED" in (cr.stdout or "")
+            if not ok:
+                logger.warning("clean_workspace 未确认成功 %s: %s", sid, (cr.stdout or cr.error or "")[:200])
             return ok
         except Exception as exc:
             logger.warning("clean_workspace 失败 %s: %s", sid, exc)
             return False
+
+    def run_command(self, sandbox: Any, command: str, timeout: int = 120) -> "CodeResult":
+        """在沙箱内执行 shell 命令 —— 走 SDK 原生 commands.run(shell 端点)。
+
+        与 run_code 的区别：run_code 用 Jupyter kernel 端点(部分自建语言镜像未装
+        kernel → 502)；commands.run 是 shell 端点，所有镜像都可用，且执行 mvn/
+        npm/go 等构建命令更直接。优先用本方法跑 shell，run_code 仅用于真 Python 片段。
+        """
+        sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
+        logger.debug("Running command in sandbox %s: %s...", sid, command[:80])
+        try:
+            res = sandbox.commands.run(command, timeout=timeout)
+            stdout = getattr(res, "stdout", "") or ""
+            stderr = getattr(res, "stderr", "") or ""
+            exit_code = getattr(res, "exit_code", 0)
+            cr = CodeResult(
+                stdout=stdout,
+                stderr=stderr,
+                error=None if exit_code == 0 else f"exit_code={exit_code}",
+                success=(exit_code == 0),
+            )
+            self.append_activity(
+                sid, "exec",
+                f"run_command exit={exit_code} ({timeout}s) — {command[:120]}",
+                stdout=stdout, stderr=stderr, code=command,
+                error=cr.error,
+            )
+            return cr
+        except Exception as exc:
+            # commands.run 抛异常通常意味着非 0 退出码(SDK 行为)或连接问题。
+            # CommandExitException 带 stdout/stderr/exit_code，尽量提取。
+            stdout = getattr(exc, "stdout", "") or ""
+            stderr = getattr(exc, "stderr", "") or ""
+            exit_code = getattr(exc, "exit_code", None)
+            if exit_code is not None:
+                # 命令正常跑了但非 0 退出(如编译失败)——这是有效结果，非基础设施错误
+                cr = CodeResult(stdout=stdout, stderr=stderr, error=f"exit_code={exit_code}", success=False)
+                self.append_activity(sid, "exec", f"run_command exit={exit_code} — {command[:120]}",
+                                     stdout=stdout, stderr=stderr, code=command, error=cr.error)
+                return cr
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning("Sandbox run_command failed for %s: %s", sid, str(exc)[:200])
+            self.append_activity(sid, "exec", f"run_command 失败 — {err}", code=command, error=err)
+            return CodeResult(stdout=stdout, stderr=stderr, error=err, success=False)
 
     def run_code(self, sandbox: Any, code: str, timeout: int = 30) -> "CodeResult":
         """在沙箱中执行代码（捕获 SDK/代理异常，不向上抛 HTTP 500）"""

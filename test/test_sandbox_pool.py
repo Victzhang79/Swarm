@@ -80,6 +80,15 @@ class FakeManager:
             return CodeResult(success=False, error=self._run_code_error or "probe failed")
         return CodeResult(stdout="1\n", success=True)
 
+    def run_command(self, sandbox, command, timeout=120):
+        # 镜像 run_code 的健康/失败注入语义，让健康探针走 shell 端点路径也可测
+        sid = getattr(sandbox, "sandbox_id", str(sandbox))
+        if sid in self._unhealthy_ids:
+            return CodeResult(success=False, error="unhealthy sandbox")
+        if not self._run_code_success:
+            return CodeResult(success=False, error=self._run_code_error or "probe failed")
+        return CodeResult(stdout="ok\n", success=True)
+
     def clean_workspace(self, sandbox, workdir="/workspace"):
         sid = getattr(sandbox, "sandbox_id", str(sandbox))
         self._cleaned.append(sid)
