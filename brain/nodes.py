@@ -54,6 +54,7 @@ from swarm.types import (
     SubTask,
     SubTaskDifficulty,
     SubTaskModality,
+    TaskHarness,
     TaskPlan,
     WorkerOutput,
 )
@@ -143,6 +144,65 @@ def _format_project_structure(knowledge_context: dict | None) -> str:
     return "\n".join(lines) + extra
 
 
+def _infer_harness(task_description: str, scope, project_path: str = "") -> "TaskHarness":
+    """根据任务描述/scope 文件/项目结构推断一个合理的验证 harness。
+
+    用于 SIMPLE 快速路径，以及 LLM plan 未给出 harness 时的兜底。按语言给出
+    构建/测试/验收命令 + 需放行的命令白名单，让 Worker 能真正跑验证而非口头自报。
+    """
+    # 收集 scope 内所有文件后缀判断语言
+    files: list[str] = []
+    for attr in ("writable", "create_files", "readable"):
+        files.extend(getattr(scope, attr, []) or [])
+    exts = {f.rsplit(".", 1)[-1].lower() for f in files if "." in f}
+    text = (task_description or "").lower()
+
+    def has(*kw: str) -> bool:
+        return any(k in text for k in kw)
+
+    # 语言判定（scope 后缀优先，其次描述关键词）
+    if "py" in exts or has("python", "pytest", "django", "flask", "fastapi", "pygame"):
+        return TaskHarness(
+            language="python",
+            build_command="python -m py_compile .",
+            test_command="python -m pytest -q",
+            extra_whitelist=[
+                "python", "python3", "python -m", "python -c",
+                "pytest", "ruff", "mypy", "pip install", "ls", "cat",
+            ],
+        )
+    if exts & {"js", "jsx", "ts", "tsx"} or has("node", "npm", "react", "typescript", "vue"):
+        return TaskHarness(
+            language="node",
+            build_command="npm run build",
+            test_command="npm test",
+            extra_whitelist=["node", "npm", "npx", "tsc", "eslint", "ls", "cat"],
+        )
+    if "go" in exts or has("golang", " go "):
+        return TaskHarness(
+            language="go",
+            build_command="go build ./...",
+            test_command="go test ./...",
+            extra_whitelist=["go ", "gofmt", "ls", "cat"],
+        )
+    if "rs" in exts or has("rust", "cargo"):
+        return TaskHarness(
+            language="rust",
+            build_command="cargo build",
+            test_command="cargo test",
+            extra_whitelist=["cargo", "rustc", "ls", "cat"],
+        )
+    if exts & {"java", "kt"} or has("maven", "gradle", "java", "spring"):
+        return TaskHarness(
+            language="java",
+            build_command="mvn compile",
+            test_command="mvn test",
+            extra_whitelist=["mvn", "gradle", "javac", "ls", "cat"],
+        )
+    # 兜底：通用，至少放行基本探查命令
+    return TaskHarness(language="", extra_whitelist=["ls", "cat", "python -c", "python -m py_compile"])
+
+
 def _heuristic_complexity(task_description: str) -> Complexity | None:
     t = task_description.lower()
     if any(h in t for h in _TRIVIAL_HINTS) and len(task_description) < 280:
@@ -197,6 +257,7 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
                 contract={"input": "当前代码", "output": "按要求修改后的代码"},
                 acceptance_criteria=["变更符合任务描述", "语法检查通过"],
                 depends_on=[],
+                harness=_infer_harness(task_description, scope),
             )
         ],
         parallel_groups=[["st-1"]],
@@ -499,6 +560,13 @@ async def plan(state: BrainState) -> dict:
     from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 
     task_plan = enrich_plan_with_shared_contract(task_plan)
+
+    # harness 兜底：LLM 未给出 harness 的子任务，按语言推断一个，确保 Worker 有
+    # 项目特定的构建/测试命令 + 命令白名单可用（否则又退化成"口头自报通过"）。
+    for st in task_plan.subtasks:
+        h = getattr(st, "harness", None)
+        if h is None or not (h.build_command or h.test_command or h.verify_commands or h.extra_whitelist):
+            st.harness = _infer_harness(st.description or task_description, st.scope)
     plan_touch = touch_context(
         state,
         "plan",

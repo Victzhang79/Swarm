@@ -31,6 +31,25 @@ def _worker_config() -> WorkerConfig:
 _current_sandbox: Any | None = None
 _current_sandbox_manager: Any | None = None
 
+# ── 每任务额外命令白名单（harness 注入）——
+# WorkerExecutor 启动时按子任务 harness 设置，让本任务的构建/测试/验收命令可执行。
+_extra_whitelist: list[str] = []
+
+
+def set_extra_whitelist(prefixes: list[str] | None) -> None:
+    """设置当前 worker 的额外命令白名单（harness.extra_whitelist）。"""
+    global _extra_whitelist
+    _extra_whitelist = list(prefixes or [])
+
+
+def get_extra_whitelist() -> list[str]:
+    return list(_extra_whitelist)
+
+
+def clear_extra_whitelist() -> None:
+    global _extra_whitelist
+    _extra_whitelist = []
+
 
 def set_sandbox_context(sandbox: Any, manager: Any) -> None:
     """设置全局沙箱上下文（WorkerExecutor 调用）"""
@@ -163,10 +182,11 @@ def run_command(command: str, timeout: int = 120) -> str:
         命令输出或权限拒绝消息
     """
     cfg = _worker_config()
-    allowed, matched = _is_command_allowed(command, cfg.command_whitelist)
+    effective_whitelist = list(cfg.command_whitelist) + get_extra_whitelist()
+    allowed, matched = _is_command_allowed(command, effective_whitelist)
 
     if not allowed:
-        whitelist_str = "\n  - ".join(cfg.command_whitelist)
+        whitelist_str = "\n  - ".join(effective_whitelist)
         return (
             f"⛔ 命令被拒绝：'{command}' 不在白名单中。\n"
             f"允许的命令前缀：\n  - {whitelist_str}\n"

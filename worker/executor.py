@@ -128,7 +128,16 @@ class WorkerExecutor:
         self.start_time = time.monotonic()
         self._log(f"开始执行子任务: {self.subtask.id}")
 
-        from swarm.tools.build_tools import clear_sandbox_context, set_sandbox_context
+        from swarm.tools.build_tools import (
+            clear_extra_whitelist,
+            clear_sandbox_context,
+            set_extra_whitelist,
+            set_sandbox_context,
+        )
+
+        # 按子任务 harness 放行其构建/测试/验收命令（否则 worker 跑不了验证命令）
+        _harness = getattr(self.subtask, "harness", None)
+        set_extra_whitelist(getattr(_harness, "extra_whitelist", None) if _harness else None)
 
         try:
             # ── Phase 0: 准备 ──
@@ -315,6 +324,7 @@ class WorkerExecutor:
         finally:
             clear_sandbox_context()
             clear_scope()
+            clear_extra_whitelist()
             self.kill_sandbox()
             elapsed = time.monotonic() - self.start_time
             self._log(f"总执行时间: {elapsed:.1f}s")
@@ -827,15 +837,25 @@ class WorkerExecutor:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: diff error {exc}"}
-        if not diff or diff in ("(无变更)", "(无法获取 git diff)"):
+        empty_diff = not diff or diff in ("(无变更)", "(无法获取 git diff)")
+        harness = getattr(self.subtask, "harness", None)
+        has_harness_checks = bool(
+            harness and (harness.build_command or harness.test_command or harness.verify_commands)
+        )
+        if empty_diff and not has_harness_checks:
+            # 既无 diff 又无 harness 可执行检查，才回退 LLM 自报
             return None, {"deterministic_gate": "skipped: empty diff"}
         try:
             from swarm.worker.l1_pipeline import run_l1_pipeline
 
+            # 空 diff 但有 harness（如 greenfield 新建文件 diff 未被捕获）：
+            # 仍用 harness 命令做确定性验证，杜绝 LLM 口头自报合格。
             ok, details = run_l1_pipeline(
-                self.project_path, self.subtask, diff, llm=None
+                self.project_path, self.subtask, diff or "", llm=None
             )
             details["deterministic_gate"] = "pass" if ok else "fail"
+            if empty_diff:
+                details["note"] = "empty diff，仅靠 harness 命令验证"
             return ok, details
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: pipeline error {exc}"}

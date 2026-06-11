@@ -116,6 +116,39 @@ class SubTaskModality(str, Enum):
     MULTIMODAL = "multimodal"  # 需要看图/UI截图/设计图/文档图片
 
 
+class TaskHarness(BaseModel):
+    """子任务验证 harness — Brain 编排时精心编写，告诉 Worker【如何验证产出合格】。
+
+    解决核心问题：原来 Worker 只被告知"运行 run_compile/run_tests"，但没有项目
+    特定的构建/测试命令，且命令白名单固定(Maven 导向)，导致 Worker 在 Python
+    游戏等项目里跑不了验证命令(日志实证"由于命令白名单限制")，只能口头自报通过。
+
+    harness 由 Brain 根据任务+项目语言生成，Worker 据此执行确定性验证，L1 闸门
+    也据此跑真实命令而非信 LLM 自报。
+    """
+    language: str = Field(default="", description="主语言: python/node/java/go/rust 等")
+    setup_commands: list[str] = Field(default_factory=list, description="依赖安装/准备命令(如 pip install -r)")
+    build_command: str = Field(default="", description="编译/构建命令(解释型语言可为语法检查)")
+    test_command: str = Field(default="", description="测试命令(如 python -m pytest -q)")
+    verify_commands: list[str] = Field(
+        default_factory=list,
+        description="额外验收命令(如 python -c 'import m; assert m.f()' 烟雾测试)",
+    )
+    extra_whitelist: list[str] = Field(
+        default_factory=list,
+        description="本任务需放行的命令前缀(并入全局白名单，让上述命令可执行)",
+    )
+
+    def all_commands(self) -> list[str]:
+        cmds = list(self.setup_commands)
+        if self.build_command:
+            cmds.append(self.build_command)
+        if self.test_command:
+            cmds.append(self.test_command)
+        cmds.extend(self.verify_commands)
+        return [c for c in cmds if c]
+
+
 class SubTask(BaseModel):
     """一个可独立执行的子任务"""
     id: str
@@ -127,6 +160,10 @@ class SubTask(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list, description="依赖的子任务 ID")
     model_preference: str | None = None
+    harness: TaskHarness = Field(
+        default_factory=TaskHarness,
+        description="验证 harness：如何构建/测试/验收本子任务(Brain 编排时编写)",
+    )
 
 
 # ──────────────────────────────────────────────

@@ -36,6 +36,9 @@ SYSTEM_PROMPT_TEMPLATE = """\
 
 ⚠️ **严格遵守 Scope 约束**：你只能修改可写文件，只能读取可读文件。超出范围的文件操作将被拒绝。
 
+## 🔧 验证 Harness（如何确认你的产出合格）
+{harness_section}
+
 ## 🔄 工作流程
 
 ### Phase 1: 定位（目标 <5s）
@@ -140,6 +143,9 @@ def build_worker_prompt(
     writable_files = ", ".join(effective_scope.writable) if effective_scope.writable else "（无）"
     readable_files = ", ".join(effective_scope.readable) if effective_scope.readable else "（仅可写文件）"
 
+    # Harness 段落 —— 告诉 Worker 用什么命令验证产出合格
+    harness_section = _format_harness_section(getattr(subtask, "harness", None))
+
     # 知识段落
     knowledge_section = ""
     if knowledge:
@@ -167,12 +173,37 @@ def build_worker_prompt(
         contract=contract_str,
         writable_files=writable_files,
         readable_files=readable_files,
+        harness_section=harness_section,
         max_fix_rounds=config.worker.max_fix_rounds,
         max_iterations=config.worker.max_iterations,
         max_execution_time=config.worker.max_execution_time,
         user_profile_section=user_profile_section,
         knowledge_section=knowledge_section,
     )
+
+
+def _format_harness_section(harness) -> str:
+    """格式化验证 harness 给 Worker：明确的构建/测试/验收命令。"""
+    if harness is None:
+        return "（无特定 harness，请用 run_compile/run_tests 做基本验证）"
+    lines: list[str] = []
+    if getattr(harness, "language", ""):
+        lines.append(f"- 语言: {harness.language}")
+    if getattr(harness, "setup_commands", None):
+        lines.append(f"- 准备: {' && '.join(harness.setup_commands)}")
+    if getattr(harness, "build_command", ""):
+        lines.append(f"- 构建/语法检查: `{harness.build_command}`（用 run_command 执行）")
+    if getattr(harness, "test_command", ""):
+        lines.append(f"- 测试: `{harness.test_command}`（用 run_command 执行）")
+    if getattr(harness, "verify_commands", None):
+        for vc in harness.verify_commands:
+            lines.append(f"- 验收: `{vc}`")
+    if not lines:
+        return "（无特定 harness，请用 run_compile/run_tests 做基本验证）"
+    lines.append(
+        "完成编码后**必须实际运行上述命令**确认通过，不要仅凭阅读代码就声称验证通过。"
+    )
+    return "\n".join(lines)
 
 
 def _format_mistakes_for_worker(items: list[dict]) -> str:

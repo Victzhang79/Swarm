@@ -67,6 +67,16 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
 9. 需要看图/UI的任务标记为 modality=multimodal
 10. 若提供了「项目结构」，scope 里的文件路径必须引用真实存在的文件（修改/删除时），
     新建文件则给出合理的新路径；不要凭空臆造不存在的文件名
+11. 【harness 验证工程，必填且精心编写】每个子任务必须给出 harness，告诉 Worker
+    【如何验证产出合格】。这是质量闸门的依据，绝不能马虎：
+    - language: 按项目/任务真实语言填（python/node/java/go/rust）
+    - build_command: 该语言的编译或语法检查命令（解释型语言用语法检查，如
+      python -m py_compile）
+    - test_command: 真实可跑的测试命令（如 python -m pytest -q）；若任务要求写
+      测试，这里要能跑到新写的测试
+    - verify_commands: 针对验收标准的烟雾测试/断言命令，让"合格"可被确定性验证
+    - extra_whitelist: 上述命令所需放行的命令前缀（否则 Worker 因白名单拒绝跑不了）
+    harness 必须与 acceptance_criteria 对应：每条验收标准都应有命令能验证它。
 
 请以 JSON 格式输出执行计划。"""
 
@@ -120,7 +130,15 @@ PLAN_USER = """## 任务描述
       }},
       "acceptance_criteria": ["标准1", "标准2"],
       "depends_on": [],
-      "model_preference": null
+      "model_preference": null,
+      "harness": {{
+        "language": "python",
+        "setup_commands": ["pip install -r requirements.txt"],
+        "build_command": "python -m py_compile .",
+        "test_command": "python -m pytest -q",
+        "verify_commands": ["python -c \\"import mymod; assert mymod.f()\\""],
+        "extra_whitelist": ["python", "python -m", "python -c", "pytest"]
+      }}
     }}
   ],
   "parallel_groups": [["st-1", "st-2"], ["st-3"]]

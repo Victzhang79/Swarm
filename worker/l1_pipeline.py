@@ -33,7 +33,15 @@ def _scope_violations(diff: str, scope: FileScope) -> list[str]:
 
 
 def _python_bin() -> str:
-    """寻找可用的 Python 解释器（python3 > python）。"""
+    """寻找可用的 Python 解释器。
+
+    优先级：项目 .venv > 当前运行解释器(sys.executable) > python3 > python。
+    用 sys.executable 而非裸 python3，确保拿到带项目依赖(pytest 等)的解释器，
+    避免命中系统 python3(无 pytest)导致测试误判失败。
+    """
+    import sys
+    if getattr(sys, "executable", ""):
+        return sys.executable
     for name in ("python3", "python"):
         if shutil.which(name):
             return name
@@ -292,6 +300,23 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
     return None
 
 
+def _normalize_python_cmd(cmd: str) -> str:
+    """把命令里的裸 `python`/`python3` 归一到本机可用解释器。
+
+    Brain/LLM 生成的 harness 常写 `python ...`，但本机(确定性闸门运行处)可能只有
+    `python3`(macOS 常见)。沙箱里 python 存在，本地却 command not found —— 这类
+    环境漂移会让确定性验证误判。统一替换前缀。
+    """
+    if not cmd:
+        return cmd
+    py = _python_bin()
+    if py == "python":
+        return cmd
+    # 替换行首或 && / ; / | 后的裸 python（不动 python3 已正确的情况）
+    import re
+    return re.sub(r"(^|[\s;&|])python(?=\s)", lambda m: f"{m.group(1)}{py}", cmd)
+
+
 def run_l1_pipeline(
     project_path: str,
     subtask: SubTask,
@@ -321,7 +346,9 @@ def run_l1_pipeline(
     modified = files_from_unified_diff(diff)
     details["modified_files"] = modified
 
-    if not modified:
+    harness = getattr(subtask, "harness", None)
+    _has_verify = bool(getattr(harness, "verify_commands", None)) if harness else False
+    if not modified and not _has_verify:
         details["l1_2_compile_ok"] = True
         details["lint"] = {"status": "skipped", "reason": "no files"}
         details["l1_3_test_ok"] = True
@@ -365,15 +392,19 @@ def run_l1_pipeline(
         details["lint"] = {"status": "disabled", "reason": "SWARM_WORKER_L1_LINT=false"}
 
     # ── L1.3 scoped test ──
-    test_cmd = _guess_test_cmd(project_path, modified)
+    # 优先用 Brain 编排的 harness.test_command（精心编写、确定性）；
+    # 没有 harness 时才回退到启发式 _guess_test_cmd。（harness 已在上方取得）
+    harness_test = getattr(harness, "test_command", "") if harness else ""
+    test_cmd = harness_test or _guess_test_cmd(project_path, modified)
     details["test_cmd"] = test_cmd
+    details["test_cmd_source"] = "harness" if harness_test else "heuristic"
     if not test_cmd:
         details["l1_3_test_ok"] = True
         details["test_skipped"] = True
     else:
         try:
             proc = subprocess.run(
-                test_cmd,
+                _normalize_python_cmd(test_cmd),
                 cwd=project_path,
                 shell=True,
                 capture_output=True,
@@ -397,6 +428,39 @@ def run_l1_pipeline(
             details["l1_3_test_ok"] = False
             details["test_output"] = str(exc)
             return False, details
+
+    # ── L1.3.5 harness 验收命令（verify_commands）——
+    # Brain 为每条验收标准编写的烟雾测试/断言，硬阻断。这是"产出是否合格"的
+    # 确定性证据，杜绝 LLM 口头自报合格。
+    verify_cmds = list(getattr(harness, "verify_commands", []) or []) if harness else []
+    if verify_cmds:
+        verify_results = []
+        for vc in verify_cmds:
+            try:
+                proc = subprocess.run(
+                    _normalize_python_cmd(vc), cwd=project_path, shell=True,
+                    capture_output=True, text=True, timeout=timeout,
+                )
+                ok = proc.returncode == 0
+                verify_results.append({
+                    "cmd": vc, "ok": ok,
+                    "output": compress_tool_output(proc.stdout or proc.stderr or "", max_chars=500),
+                })
+                if not ok:
+                    details["verify_commands"] = verify_results
+                    details["verify_failed"] = vc
+                    return False, details
+            except subprocess.TimeoutExpired:
+                verify_results.append({"cmd": vc, "ok": False, "output": "timeout"})
+                details["verify_commands"] = verify_results
+                details["verify_failed"] = vc
+                return False, details
+            except Exception as exc:
+                verify_results.append({"cmd": vc, "ok": False, "output": str(exc)})
+                details["verify_commands"] = verify_results
+                details["verify_failed"] = vc
+                return False, details
+        details["verify_commands"] = verify_results
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = os.environ.get("SWARM_WORKER_L1_SELF_REVIEW", "true").lower() not in ("false", "0", "no")
