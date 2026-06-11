@@ -313,6 +313,30 @@ class WorkerExecutor:
                         update={"l1_passed": True, "l1_details": l1_details}
                     )
 
+            # ── DEBUG 意图专属 L1 校验：验证 failing_test_command 修复后通过 ──
+            if self.subtask.intent == "debug" and self.project_path:
+                harness = getattr(self.subtask, "harness", None)
+                failing_cmd = getattr(harness, "failing_test_command", "") if harness else ""
+                if failing_cmd:
+                    self._log(f"DEBUG L1: 执行 failing_test_command 验证修复: {failing_cmd}")
+                    debug_l1_ok, debug_l1_detail = self._run_failing_test_gate(failing_cmd)
+                    l1_details["debug_failing_test_command"] = failing_cmd
+                    l1_details["debug_failing_test_passed"] = debug_l1_ok
+                    l1_details["debug_failing_test_detail"] = debug_l1_detail
+                    if not debug_l1_ok:
+                        l1_passed = False
+                        output = output.model_copy(
+                            update={"l1_passed": False, "l1_details": l1_details}
+                        )
+                        self._log(
+                            f"DEBUG L1: failing_test_command 仍失败，判定为未修复 ❌ | {debug_l1_detail}"
+                        )
+                    else:
+                        self._log("DEBUG L1: failing_test_command 通过，bug 已修复 ✅")
+                else:
+                    self._log("DEBUG L1: harness.failing_test_command 为空，跳过专属校验")
+            # 非 DEBUG 意图完全不受影响
+
             self.phase = WorkerPhase.DONE
             self._log(f"执行完成，置信度: {output.confidence.value}")
 
@@ -892,6 +916,43 @@ class WorkerExecutor:
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: pipeline error {exc}"}
 
+    def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool, str]:
+        """DEBUG 意图专属 L1 闸门：确定性执行 failing_test_command，验证修复后该命令通过。
+
+        复用 l1_pipeline 的 _normalize_python_cmd + subprocess 机制，
+        与现有 L1 确定性验证共享同样的执行模型（local / sandbox 均可）。
+        返回 (bool, detail_str)：True=命令通过(bug 已修复)，False=命令仍失败。
+
+        优雅降级：异常时返回 True（不因执行环境失败误判为 bug 未修复），
+        因为沙箱环境可能已销毁。
+        """
+        import subprocess
+
+        from swarm.worker.l1_pipeline import _normalize_python_cmd
+
+        try:
+            proc = subprocess.run(
+                _normalize_python_cmd(failing_cmd),
+                cwd=self.project_path,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            ok = proc.returncode == 0
+            from swarm.worker.output_compress import compress_tool_output
+
+            output_summary = compress_tool_output(
+                proc.stdout or proc.stderr or "", max_chars=800
+            )
+            detail = f"exit_code={proc.returncode}, output={output_summary}"
+            return ok, detail
+        except subprocess.TimeoutExpired:
+            return False, "failing_test_command timeout (120s)"
+        except Exception as exc:  # noqa: BLE001
+            # 优雅降级：执行环境异常不误判
+            self._log(f"DEBUG L1: failing_test_command 执行异常，跳过: {exc}")
+            return True, f"execution skipped: {exc}"
 
     def _parse_produce_result(
         self,

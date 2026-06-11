@@ -39,6 +39,8 @@ SYSTEM_PROMPT_TEMPLATE = """\
 ## 🔧 验证 Harness（如何确认你的产出合格）
 {harness_section}
 
+{debug_section}
+
 ## 🔄 工作流程
 
 ### Phase 1: 定位（目标 <5s）
@@ -146,6 +148,9 @@ def build_worker_prompt(
     # Harness 段落 —— 告诉 Worker 用什么命令验证产出合格
     harness_section = _format_harness_section(getattr(subtask, "harness", None))
 
+    # DEBUG 意图段落 —— 结构化排错 4 阶段
+    debug_section = _format_debug_section(subtask)
+
     # 知识段落
     knowledge_section = ""
     if knowledge:
@@ -174,6 +179,7 @@ def build_worker_prompt(
         writable_files=writable_files,
         readable_files=readable_files,
         harness_section=harness_section,
+        debug_section=debug_section,
         max_fix_rounds=config.worker.max_fix_rounds,
         max_iterations=config.worker.max_iterations,
         max_execution_time=config.worker.max_execution_time,
@@ -204,6 +210,67 @@ def _format_harness_section(harness) -> str:
         "完成编码后**必须实际运行上述命令**确认通过，不要仅凭阅读代码就声称验证通过。"
     )
     return "\n".join(lines)
+
+
+DEBUG_SECTION_TEMPLATE = """\
+## 🐛 DEBUG 排错流程（务必严格遵守）
+
+本任务是 DEBUG 意图 — 你必须按以下 **4 阶段** 进行系统性排错，**不许跳过任何阶段**：
+
+### 阶段 A：复现 Bug ⚠️ 必须先做
+1. 运行失败用例命令：`{failing_test_command}`
+2. **确认该命令当前确实失败**（exit code ≠ 0）— 这是排错的起点
+3. 记录完整的错误输出（报错信息、traceback、断言失败细节）
+4. **⛔ 未复现就动手改代码 = 禁止。** 你必须亲眼看到 bug 复现，才能进入下一阶段
+
+### 阶段 B：定位根因
+1. 根据复现时获得的错误信息，阅读相关代码
+2. 追踪调用链，找到 bug 的根本原因（不要凭猜测修改）
+3. 确认你理解了 bug 的完整因果链
+
+### 阶段 C：最小修复
+1. 只做修复 bug 所需的最小改动，不做额外重构
+2. 修复应当直接针对阶段 B 定位的根因
+3. 避免过度修改——每多改一行就多一分引入新 bug 的风险
+
+### 阶段 D：回归验证
+1. **再次运行失败用例命令**：`{failing_test_command}` — 修复后应**通过**（exit code = 0）
+2. 运行完整测试命令确认无回归（如果提供了 test_command）
+3. 如果回归测试失败，必须回退到阶段 B 重新定位
+
+**核心原则**：不复现不许改，改完必须验证。
+"""
+
+
+def _format_debug_section(subtask) -> str:
+    """当 intent==DEBUG 时，返回结构化排错 4 阶段提示；否则返回空串。"""
+    from swarm.types import TaskIntent
+
+    if getattr(subtask, "intent", None) != TaskIntent.DEBUG:
+        return ""
+
+    harness = getattr(subtask, "harness", None)
+    failing_cmd = getattr(harness, "failing_test_command", "") if harness else ""
+
+    if not failing_cmd:
+        # 优雅降级：没有 failing_test_command 也给通用 DEBUG 提示
+        return (
+            "## 🐛 DEBUG 排错流程（务必严格遵守）\n\n"
+            "本任务是 DEBUG 意图 — 你必须按以下 **4 阶段** 进行系统性排错：\n\n"
+            "### 阶段 A：复现 Bug ⚠️ 必须先做\n"
+            "1. 根据子任务描述中的错误信息，找到并运行可以触发 bug 的命令或测试\n"
+            "2. **确认 bug 确实可以复现** — 不复现不许改\n\n"
+            "### 阶段 B：定位根因\n"
+            "1. 阅读代码，追踪调用链找到根因（不要猜测）\n\n"
+            "### 阶段 C：最小修复\n"
+            "1. 只做修复所需的最小改动\n\n"
+            "### 阶段 D：回归验证\n"
+            "1. 再跑一遍阶段 A 的用例——修复后应通过\n"
+            "2. 跑完整测试确认无回归\n\n"
+            "⚠️ **核心原则**：不复现不许改，改完必须验证。\n"
+        )
+
+    return DEBUG_SECTION_TEMPLATE.format(failing_test_command=failing_cmd)
 
 
 def _format_mistakes_for_worker(items: list[dict]) -> str:
