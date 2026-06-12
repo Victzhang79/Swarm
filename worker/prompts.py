@@ -80,6 +80,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 5. **注意事项**: 需要人工审查的部分（如有）
 
 {user_profile_section}
+{project_knowledge_section}
 {knowledge_section}
 """
 
@@ -96,6 +97,17 @@ KNOWLEDGE_SECTION_TEMPLATE = """\
 
 ### 🟢 成功范例（可参考）
 {successes}
+"""
+
+# 项目规范 + 相关代码段：让小模型"像熟悉本项目的工程师"那样按既有惯例写代码。
+PROJECT_KNOWLEDGE_TEMPLATE = """\
+## 🧭 本项目工程经验（务必遵循既有惯例，不要另起炉灶）
+
+### 📐 编码规范 / 约定
+{norms}
+
+### 🧩 相关既有代码（优先复用，模仿其风格）
+{semantic}
 """
 
 
@@ -157,7 +169,7 @@ def build_worker_prompt(
     from swarm.worker.coding_standards import build_coding_standards_section
     coding_standards_section = build_coding_standards_section(subtask)
 
-    # 知识段落
+    # 知识段落（错题/成功模式）
     knowledge_section = ""
     if knowledge:
         mistakes = knowledge.get("mistakes", [])
@@ -169,6 +181,19 @@ def build_worker_prompt(
             knowledge_section = KNOWLEDGE_SECTION_TEMPLATE.format(
                 mistakes=mistakes_str,
                 successes=successes_str,
+            )
+
+    # 项目工程经验段落（norms 规范 + semantic 相关代码）——让小模型按本项目惯例写代码。
+    # 此前这两类知识虽被检索+传到 worker，却从未注入 prompt（worker 编码时看不到），
+    # 是"任务执行蠢笨"的关键原因之一。
+    project_knowledge_section = ""
+    if knowledge:
+        norms = knowledge.get("norms", [])
+        semantic = knowledge.get("semantic", [])
+        if norms or semantic:
+            project_knowledge_section = PROJECT_KNOWLEDGE_TEMPLATE.format(
+                norms=_format_norms_for_worker(norms),
+                semantic=_format_semantic_for_worker(semantic),
             )
 
     user_profile_section = ""
@@ -192,6 +217,7 @@ def build_worker_prompt(
         max_execution_time=config.worker.max_execution_time,
         user_profile_section=user_profile_section,
         knowledge_section=knowledge_section,
+        project_knowledge_section=project_knowledge_section,
     )
 
 
@@ -311,6 +337,43 @@ def _format_successes_for_worker(items: list[dict]) -> str:
             lines.append(f"     {approach[:200]}")
         if snippet:
             lines.append(f"     ```\n{snippet[:500]}\n     ```")
+    return "\n".join(lines)
+
+
+def _format_norms_for_worker(items: list[dict]) -> str:
+    """格式化项目规范（Layer C norms）给 worker：标题 + 内容，按 tag 分组提示。"""
+    if not items:
+        return "（无项目规范记录）"
+    lines: list[str] = []
+    for i, item in enumerate(items, 1):
+        title = (item.get("title") or item.get("name") or f"规范 {i}").strip()
+        content = (item.get("content") or item.get("description") or "").strip()
+        tag = (item.get("tag") or "").strip()
+        tag_label = f"[{tag}] " if tag and tag not in ("general", "") else ""
+        lines.append(f"  {i}. {tag_label}{title}")
+        if content:
+            lines.append(f"     {content[:300]}")
+    return "\n".join(lines)
+
+
+def _format_semantic_for_worker(items: list[dict]) -> str:
+    """格式化相关既有代码片段（Layer B semantic）给 worker：路径 + 符号 + 代码摘要。
+
+    让小模型"看到"项目里相关的现成实现，按其风格写、优先复用工具类，而非凭空造。
+    """
+    if not items:
+        return "（无相关代码片段）"
+    lines: list[str] = []
+    for i, item in enumerate(items, 1):
+        fp = (item.get("file_path") or item.get("path") or "").strip()
+        sym = (item.get("symbol") or item.get("name") or "").strip()
+        snippet = (item.get("content") or item.get("text") or item.get("code") or "").strip()
+        header = fp or sym or f"片段 {i}"
+        if fp and sym:
+            header = f"{fp} :: {sym}"
+        lines.append(f"  {i}. `{header}`")
+        if snippet:
+            lines.append(f"     ```\n{snippet[:600]}\n     ```")
     return "\n".join(lines)
 
 
