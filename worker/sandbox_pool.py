@@ -493,7 +493,11 @@ def get_sandbox_pool() -> HotSandboxPool:
 
 
 def pool_enabled() -> bool:
-    """热池是否启用（SWARM_SANDBOX_POOL_ENABLED，默认 false 稳妥起步）。"""
-    import os
-
-    return os.environ.get("SWARM_SANDBOX_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+    """热池是否启用。优先读 SandboxConfig.pool_enabled（来自 SWARM_SANDBOX_POOL_ENABLED），
+    config 不可用时回退直接读环境变量（向后兼容）。"""
+    try:
+        from swarm.config.settings import get_config
+        return bool(get_config().sandbox.pool_enabled)
+    except Exception:
+        import os
+        return os.environ.get("SWARM_SANDBOX_POOL_ENABLED", "true").lower() in ("true", "1", "yes")

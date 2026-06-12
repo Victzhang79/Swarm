@@ -58,6 +58,16 @@ function submitAddProjectFromModal() {
 
 function reloadCurrentProjectTab(projectId) {
   if (!projectId) return;
+  // 上层在系统级 tab 时，刷新系统面板（不再由下层 currentTab 驱动）
+  if (typeof currentTopTab !== 'undefined' && currentTopTab === 'system') {
+    refreshSandboxes(projectId);
+    loadSystemStats();
+    fetchStatus();
+    return;
+  }
+  if (typeof currentTopTab !== 'undefined' && currentTopTab === 'observability') {
+    return;  // 可观测全局，不随项目刷新
+  }
   if (currentTab === 'knowledge') {
     loadKnowledgeOverview(projectId);
     loadBehaviorHotspots(projectId);
@@ -71,10 +81,10 @@ function reloadCurrentProjectTab(projectId) {
   } else if (currentTab === 'tasks') {
     loadTasks(projectId);
     refreshTaskReadinessHint(projectId);
-  } else if (currentTab === 'system') {
+  } else if (currentTab === 'stats') {
+    // 下层项目级统计 tab：当前项目任务统计 + 项目关联沙箱
+    loadSystemStats();
     refreshSandboxes(projectId);
-    loadSystemStats();       // 数据统计跟随项目刷新（之前漏了，切项目时统计不更新）
-    fetchStatus();           // 组件健康（全局基础设施，但随面板刷新）
   }
 }
 

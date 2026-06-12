@@ -16,39 +16,82 @@ function togglePassword(inputId) {
   input.style.webkitTextSecurity = input.style.webkitTextSecurity === 'none' ? 'disc' : 'none';
 }
 
+// 设置已升级为上层「设置」tab（原抽屉退役）。保留 no-op 兼容任何残留引用。
 function toggleSettings() {
-  const drawer = $('settings-drawer');
-  const overlay = $('settings-overlay');
-  const open = drawer.classList.toggle('open');
-  overlay.classList.toggle('open', open);
-  // 抽屉打开时刷新孤儿沙箱数 + 热池状态（全局运维，不跟项目）
-  if (open && typeof refreshOrphanCount === 'function') refreshOrphanCount();
-  if (open && typeof refreshPoolStatus === 'function') refreshPoolStatus();
+  if (typeof switchTopTab === 'function') switchTopTab('settings');
+}
+
+// 设置 tab 入口：配置数据在启动时已 loadConfig/loadRoutingTable 预填，这里刷新一次保证最新。
+function loadSettingsTab() {
+  if (typeof loadConfig === 'function') loadConfig();
+  if (typeof loadRoutingTable === 'function') loadRoutingTable();
+  if (typeof syncPoolToggleState === 'function') syncPoolToggleState();
 }
 
 // ─── Add Project Modal ─────────────────────────────────────
 
+// ─── 两层导航：上层系统级 / 下层项目级 ───────────────────────
+// 系统级 tab（observability/system）不依赖 selectedProjectId；
+// 项目工作台（workspace）下挂项目级 tab（tasks/worker/knowledge/memory/preprocess）。
+
+let currentTopTab = 'workspace';
+
+function switchTopTab(topTab) {
+  currentTopTab = topTab;
+  document.querySelectorAll('.nav-tab-top').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.toptab === topTab);
+  });
+  const subNav = $('nav-tabs-sub');
+
+  if (topTab === 'workspace') {
+    // 显示下层项目 nav，激活当前项目 tab（默认 tasks）
+    if (subNav) subNav.classList.remove('hidden');
+    stopSystemRefresh();
+    switchTab(currentTab && currentTab !== 'observability' && currentTab !== 'system' ? currentTab : 'tasks');
+    return;
+  }
+
+  // 系统级：隐藏下层 nav，直接激活对应系统 panel
+  if (subNav) subNav.classList.add('hidden');
+  document.querySelectorAll('.tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.id === 'tab-' + topTab);
+  });
+  // 下层 nav 高亮清掉（避免残留）
+  document.querySelectorAll('.nav-tabs-sub .nav-tab').forEach(btn => btn.classList.remove('active'));
+
+  if (topTab === 'observability') {
+    stopSystemRefresh();
+    loadObservability();
+  } else if (topTab === 'system') {
+    startSystemRefresh();
+  } else if (topTab === 'settings') {
+    stopSystemRefresh();
+    if (typeof loadSettingsTab === 'function') loadSettingsTab();
+  }
+}
+
 function switchTab(tabId) {
+  // 下层项目级 tab 切换（tasks/worker/knowledge/memory/preprocess）
   currentTab = tabId;
-  document.querySelectorAll('.nav-tab').forEach(btn => {
+  document.querySelectorAll('.nav-tabs-sub .nav-tab').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tabId);
   });
   document.querySelectorAll('.tab-panel').forEach(panel => {
     panel.classList.toggle('active', panel.id === 'tab-' + tabId);
   });
-  if (!selectedProjectId) {
-    if (tabId === 'system') {
-      const list = $('sandbox-list');
-      if (list) list.innerHTML = '<p style="font-size:12px;color:var(--text-muted);padding:8px">请先在左侧选择项目</p>';
-      startSystemRefresh();
-    } else {
-      stopSystemRefresh();
-    }
-    return;
+  // 从系统级 tab 点回项目 tab 时（如 learn-notice 的"查看记忆"），确保上层切到工作台
+  if (currentTopTab !== 'workspace') {
+    currentTopTab = 'workspace';
+    document.querySelectorAll('.nav-tab-top').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.toptab === 'workspace');
+    });
+    const subNav = $('nav-tabs-sub');
+    if (subNav) subNav.classList.remove('hidden');
   }
-  reloadCurrentProjectTab(selectedProjectId);
-  if (tabId === 'system') startSystemRefresh();
-  else stopSystemRefresh();
+  stopSystemRefresh();
+  if (selectedProjectId) {
+    reloadCurrentProjectTab(selectedProjectId);
+  }
 }
 
 function switchDetailTab(tabId) {

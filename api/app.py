@@ -1117,6 +1117,7 @@ from swarm.api.routers import auth as _auth_router  # noqa: E402
 from swarm.api.routers import config as _config_router  # noqa: E402
 from swarm.api.routers import knowledge as _knowledge_router  # noqa: E402
 from swarm.api.routers import memory as _memory_router  # noqa: E402
+from swarm.api.routers import observability as _observability_router  # noqa: E402
 from swarm.api.routers import project as _project_router  # noqa: E402
 from swarm.api.routers import sandbox as _sandbox_router  # noqa: E402
 from swarm.api.routers import task as _task_router  # noqa: E402
@@ -1130,3 +1131,4 @@ app.include_router(_sandbox_router.router)
 app.include_router(_project_router.router)
 app.include_router(_task_router.router)
 app.include_router(_config_router.router)
+app.include_router(_observability_router.router)

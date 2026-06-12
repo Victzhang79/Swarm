@@ -39,7 +39,6 @@
             </div>
           </div>
         </div>
-        <button class="btn btn-ghost btn-icon" onclick="toggleSettings()" title="系统设置">⚙️</button>
       </div>
     </header>
 
@@ -52,9 +51,6 @@
         </div>
         <div class="project-list" id="project-list">
           <div class="empty-state" style="padding:24px"><p>加载中…</p></div>
-        </div>
-        <div class="sidebar-foot">
-          <button class="btn btn-secondary" style="width:100%" onclick="toggleSettings()">系统设置</button>
         </div>
       </aside>
 
@@ -84,13 +80,22 @@
             </div>
           </div>
 
-          <nav class="nav-tabs">
+          <!-- 上层导航：系统级 -->
+          <nav class="nav-tabs nav-tabs-top">
+            <button class="nav-tab nav-tab-top active" data-toptab="workspace" onclick="switchTopTab('workspace')">📁 项目工作台</button>
+            <button class="nav-tab nav-tab-top" data-toptab="observability" onclick="switchTopTab('observability')">📊 可观测</button>
+            <button class="nav-tab nav-tab-top" data-toptab="system" onclick="switchTopTab('system')">🖥️ 系统</button>
+            <button class="nav-tab nav-tab-top" data-toptab="settings" onclick="switchTopTab('settings')">⚙️ 设置</button>
+          </nav>
+
+          <!-- 下层导航：项目级（仅项目工作台激活时显示）-->
+          <nav class="nav-tabs nav-tabs-sub" id="nav-tabs-sub">
             <button class="nav-tab active" data-tab="tasks" onclick="switchTab('tasks')">任务</button>
             <button class="nav-tab" data-tab="worker" onclick="switchTab('worker')">Worker</button>
             <button class="nav-tab" data-tab="knowledge" onclick="switchTab('knowledge')">知识库</button>
             <button class="nav-tab" data-tab="memory" onclick="switchTab('memory')">记忆</button>
             <button class="nav-tab" data-tab="preprocess" onclick="switchTab('preprocess')">预处理</button>
-            <button class="nav-tab" data-tab="system" onclick="switchTab('system')">系统</button>
+            <button class="nav-tab" data-tab="stats" onclick="switchTab('stats')">统计</button>
           </nav>
 
           <!-- Tasks Tab -->
@@ -519,13 +524,62 @@
             </div>
           </div>
 
-          <!-- System Tab -->
-          <div id="tab-system" class="tab-panel">
+          <!-- Observability Tab -->
+          <div id="tab-observability" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="system-layout">
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>LLM / Embed / Rerank 调用可观测</h3>
+                    <div class="system-section-actions">
+                      <select id="obs-hours" class="input input-sm" onchange="loadObservability()">
+                        <option value="1">近 1h</option>
+                        <option value="6">近 6h</option>
+                        <option value="24" selected>近 24h</option>
+                        <option value="72">近 3d</option>
+                        <option value="168">近 7d</option>
+                      </select>
+                      <button class="btn btn-ghost btn-sm" onclick="loadObservability()">刷新</button>
+                    </div>
+                  </div>
+                  <div id="obs-unavailable" class="hidden" style="padding:16px;color:var(--text-muted)">
+                    ClickHouse 数据源未配置或不可达 —— 面板降级。
+                    <span class="hint">配置 observability.clickhouse_http_url 后刷新。数据源默认指向 OpenLIT。</span>
+                  </div>
+                  <div id="obs-summary-grid" class="stats-grid">
+                    <div class="stats-card"><span class="stats-label">总调用</span><span class="stats-value" id="obs-total-calls">—</span></div>
+                    <div class="stats-card"><span class="stats-label">错误数</span><span class="stats-value stats-value-red" id="obs-total-errors">—</span></div>
+                    <div class="stats-card"><span class="stats-label">错误率</span><span class="stats-value" id="obs-error-rate">—</span></div>
+                    <div class="stats-card"><span class="stats-label">Embed p95</span><span class="stats-value" id="obs-embed-p95">—</span></div>
+                    <div class="stats-card"><span class="stats-label">LLM p95</span><span class="stats-value" id="obs-llm-p95">—</span></div>
+                    <div class="stats-card"><span class="stats-label">LLM max</span><span class="stats-value" id="obs-llm-max">—</span></div>
+                  </div>
+                </section>
+                <section class="system-section system-section-grow">
+                  <div class="system-section-head">
+                    <h3>各 Span 延迟分位</h3>
+                    <span class="hint">按调用量降序 · 单位 ms</span>
+                  </div>
+                  <div id="obs-latency-table" class="obs-table-wrap"></div>
+                </section>
+                <section class="system-section system-section-grow">
+                  <div class="system-section-head">
+                    <h3>慢调用 <span class="hint">(&gt; 5000ms)</span></h3>
+                    <span class="hint">定位 stall</span>
+                  </div>
+                  <div id="obs-slow-table" class="obs-table-wrap"></div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <!-- Stats Tab（下层项目级：当前项目任务统计 + 项目关联沙箱）-->
+          <div id="tab-stats" class="tab-panel">
             <div class="system-layout">
               <section class="system-section system-section-compact">
                 <div class="system-section-head">
-                  <h3>任务统计</h3>
-                  <span class="hint" id="stats-refresh-hint">每 30s 刷新</span>
+                  <h3>当前项目任务统计</h3>
+                  <span class="hint" id="stats-refresh-hint">每 30s 刷新 · 仅当前项目</span>
                 </div>
                 <div id="stats-banner" class="stats-banner hidden"></div>
                 <div class="stats-grid" id="stats-grid">
@@ -542,7 +596,7 @@
               </section>
               <section class="system-section system-section-grow">
                 <div class="system-section-head">
-                  <h3>CubeSandbox</h3>
+                  <h3>本项目关联沙箱 <span class="hint">CubeSandbox</span></h3>
                   <div class="system-section-actions">
                     <button class="btn btn-primary btn-sm" onclick="createSandbox()">创建</button>
                     <button class="btn btn-danger btn-sm" onclick="destroyAllSandboxes()">全部销毁</button>
@@ -591,6 +645,104 @@
               </section>
             </div>
           </div>
+
+          <!-- System Tab（上层系统级：全局统计 + 全局沙箱运维 + 系统设置）-->
+          <div id="tab-system" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="system-layout">
+                <!-- 全局任务统计（所有项目汇总）-->
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>全局任务统计 <span class="hint">所有项目汇总</span></h3>
+                    <button class="btn btn-ghost btn-sm" onclick="loadGlobalStats()">刷新</button>
+                  </div>
+                  <div class="stats-grid">
+                    <div class="stats-card"><span class="stats-label">总任务</span><span class="stats-value" id="gstat-total">—</span></div>
+                    <div class="stats-card"><span class="stats-label">已完成</span><span class="stats-value" id="gstat-completed">—</span></div>
+                    <div class="stats-card"><span class="stats-label">失败</span><span class="stats-value stats-value-red" id="gstat-failed">—</span></div>
+                    <div class="stats-card"><span class="stats-label">成功率 <span class="hint">(DONE/终态)</span></span><span class="stats-value" id="gstat-merge-rate">—</span></div>
+                    <div class="stats-card"><span class="stats-label">Accept 率</span><span class="stats-value" id="gstat-accept-rate">—</span></div>
+                    <div class="stats-card"><span class="stats-label">平均耗时</span><span class="stats-value" id="gstat-avg-duration">—</span></div>
+                    <div class="stats-card"><span class="stats-label">Token 合计 <span class="hint">(估算)</span></span><span class="stats-value" id="gstat-total-tokens">—</span></div>
+                    <div class="stats-card stats-card-learning"><span class="stats-label">学习趋势</span><span class="stats-value" id="gstat-learning-trend"><span class="pill pill-gray">—</span></span></div>
+                  </div>
+                </section>
+
+                <!-- 组件健康 -->
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>组件健康</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="fetchStatus()">刷新</button>
+                  </div>
+                  <div id="components-grid" class="component-grid"></div>
+                </section>
+
+                <!-- 全局沙箱运维：池化 / 孤儿 / 回收（跨项目）-->
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>全局沙箱运维 <span class="hint">跨项目 · CubeSandbox 服务端</span></h3>
+                    <div class="system-section-actions">
+                      <button class="btn btn-ghost btn-sm" onclick="refreshOrphanCount();refreshPoolStatus()">刷新</button>
+                      <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" onclick="cleanupOrphanSandboxes()">🧹 清理孤儿</button>
+                      <button class="btn btn-secondary btn-sm" id="btn-pool-reap" onclick="reapPool()">♻️ 回收(池+孤儿)</button>
+                    </div>
+                  </div>
+                  <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+                    <span style="font-size:12px;color:var(--text-secondary)">孤儿沙箱：<b id="orphan-count" style="color:var(--text-primary)">—</b> 个<span id="orphan-total" style="color:var(--text-muted)"></span></span>
+                  </div>
+                  <div id="pool-status-card" style="font-size:12px;color:var(--text-muted);padding:8px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:6px">加载中…</div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <!-- Settings Tab（上层系统级：模型 / 路由 / LangSmith 配置）-->
+          <div id="tab-settings" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="settings-panel">
+                <div class="form-group"><label class="form-label">SiliconFlow API Key</label>
+                  <div style="position:relative"><input id="cfg-sf-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-sf-api-key')">👁</button></div>
+                </div>
+                <div class="form-group"><label class="form-label">SiliconFlow Base URL</label><input id="cfg-sf-base-url" class="form-input" placeholder="https://api.siliconflow.cn/v1"></div>
+                <div class="form-group"><label class="form-label">本地模型 API Key</label>
+                  <div style="position:relative"><input id="cfg-local-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-local-api-key')">👁</button></div>
+                </div>
+                <div class="form-group"><label class="form-label">本地模型 Base URL</label><input id="cfg-local-base-url" class="form-input" placeholder="http://localhost:11434/v1"></div>
+                <div class="form-row">
+                  <div class="form-group"><label class="form-label">Brain 主模型（云端编排）</label><div id="cfg-brain-model-wrapper"><select id="cfg-brain-model" class="form-select"><option value="">配置 API Key</option></select></div></div>
+                  <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
+                </div>
+                <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" onclick="fetchModels()" id="btn-refresh-models">刷新模型列表</button>
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
+                <div class="form-group">
+                  <label class="form-label"><input type="checkbox" id="cfg-langsmith-tracing" style="margin-right:8px">启用 LangSmith Tracing</label>
+                </div>
+                <div class="form-group"><label class="form-label">LangSmith API Key</label>
+                  <div style="position:relative"><input id="cfg-langsmith-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-langsmith-api-key')">👁</button></div>
+                </div>
+                <div class="form-group"><label class="form-label">LangSmith Project</label><input id="cfg-langsmith-project" class="form-input" placeholder="swarm-dev"></div>
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">Worker 子任务路由</h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">Brain 拆解子任务后，按难度选择模型：trivial/medium 走本地，complex 走云端，multimodal 看图任务。</p>
+                <div id="routing-table"></div>
+                <button class="btn btn-secondary" style="width:100%;margin:12px 0" onclick="testConfig()" id="btn-test-config">测试模型连接</button>
+                <div id="config-test-result" style="font-size:12px;color:var(--text-muted);margin-bottom:12px"></div>
+
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🔥 热沙箱池</h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">预热复用沙箱省冷启动；按语言分桶、自动健康检查 + TTL/空闲回收。开启后 Worker 派发任务时从池借用。</p>
+                <div class="form-group" style="display:flex;align-items:center;gap:10px">
+                  <label class="form-label" style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer">
+                    <input type="checkbox" id="cfg-pool-enabled" onchange="togglePoolEnabled(this.checked)">
+                    启用热沙箱池
+                  </label>
+                  <span id="pool-toggle-status" style="font-size:11px;color:var(--text-muted)"></span>
+                </div>
+                <p style="font-size:11px;color:var(--orange);margin:0 0 12px">⚠️ 开关即时写入并启停后台回收器；已在运行的 Worker 在下次任务派发时生效。池参数（max_total / TTL 等）改动需重启 API。</p>
+
+                <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
+              </div>
+            </div>
+          </div>
         </div>
       </main>
     </div>
@@ -598,61 +750,6 @@
 
   <!-- Toast -->
   <div class="toast-container" id="toast-container"></div>
-
-  <!-- Settings Drawer -->
-  <div class="overlay" id="settings-overlay" onclick="toggleSettings()"></div>
-  <div class="drawer" id="settings-drawer">
-    <div class="drawer-head">
-      <h2>系统设置</h2>
-      <button class="btn btn-ghost btn-icon" onclick="toggleSettings()">✕</button>
-    </div>
-    <div class="drawer-body">
-      <div class="form-group"><label class="form-label">SiliconFlow API Key</label>
-        <div style="position:relative"><input id="cfg-sf-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-sf-api-key')">👁</button></div>
-      </div>
-      <div class="form-group"><label class="form-label">SiliconFlow Base URL</label><input id="cfg-sf-base-url" class="form-input" placeholder="https://api.siliconflow.cn/v1"></div>
-      <div class="form-group"><label class="form-label">本地模型 API Key</label>
-        <div style="position:relative"><input id="cfg-local-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-local-api-key')">👁</button></div>
-      </div>
-      <div class="form-group"><label class="form-label">本地模型 Base URL</label><input id="cfg-local-base-url" class="form-input" placeholder="http://localhost:11434/v1"></div>
-      <div class="form-row">
-        <div class="form-group"><label class="form-label">Brain 主模型（云端编排）</label><div id="cfg-brain-model-wrapper"><select id="cfg-brain-model" class="form-select"><option value="">配置 API Key</option></select></div></div>
-        <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
-      </div>
-      <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" onclick="fetchModels()" id="btn-refresh-models">刷新模型列表</button>
-      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
-      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
-      <div class="form-group">
-        <label class="form-label"><input type="checkbox" id="cfg-langsmith-tracing" style="margin-right:8px">启用 LangSmith Tracing</label>
-      </div>
-      <div class="form-group"><label class="form-label">LangSmith API Key</label>
-        <div style="position:relative"><input id="cfg-langsmith-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-langsmith-api-key')">👁</button></div>
-      </div>
-      <div class="form-group"><label class="form-label">LangSmith Project</label><input id="cfg-langsmith-project" class="form-input" placeholder="swarm-dev"></div>
-      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">Worker 子任务路由</h3>
-      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">Brain 拆解子任务后，按难度选择模型：trivial/medium 走本地，complex 走云端，multimodal 看图任务。</p>
-      <div id="routing-table"></div>
-      <button class="btn btn-secondary" style="width:100%;margin:12px 0" onclick="testConfig()" id="btn-test-config">测试模型连接</button>
-      <div id="config-test-result" style="font-size:12px;color:var(--text-muted);margin-bottom:12px"></div>
-      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">全局沙箱运维</h3>
-      <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">孤儿沙箱 = CubeSandbox 服务端仍在运行、但无任何项目/任务关联的沙箱（多因 API 重启丢失追踪）。它们持续占用小模型/GPU 资源，建议定期清理。</p>
-      <div class="form-group" style="display:flex;align-items:center;gap:12px">
-        <span style="font-size:12px;color:var(--text-secondary)">孤儿沙箱：<b id="orphan-count" style="color:var(--text-primary)">—</b> 个<span id="orphan-total" style="color:var(--text-muted)"></span></span>
-        <button class="btn btn-ghost btn-sm" onclick="refreshOrphanCount()">刷新</button>
-        <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" onclick="cleanupOrphanSandboxes()">🧹 清理孤儿</button>
-      </div>
-
-      <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🔥 热沙箱池</h3>
-      <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">预热复用沙箱省冷启动；按语言分桶、自动健康检查 + TTL/空闲回收。<code>SWARM_SANDBOX_POOL_ENABLED=true</code> 开启。</p>
-      <div id="pool-status-card" style="font-size:12px;color:var(--text-muted);padding:8px;background:var(--bg-secondary,rgba(0,0,0,0.03));border-radius:6px">加载中…</div>
-      <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-top:8px">
-        <button class="btn btn-ghost btn-sm" onclick="refreshPoolStatus()">刷新池状态</button>
-        <button class="btn btn-secondary btn-sm" id="btn-pool-reap" onclick="reapPool()">♻️ 回收(池+孤儿)</button>
-      </div>
-
-      <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
-    </div>
-  </div>
 
   <!-- Add Project Modal -->
   <div class="overlay" id="add-project-overlay" onclick="hideAddProjectModal()"></div>
@@ -726,6 +823,7 @@
   <script src="/static/js/tabs/knowledge.js"></script>
   <script src="/static/js/tabs/memory.js"></script>
   <script src="/static/js/tabs/preprocess.js"></script>
+  <script src="/static/js/tabs/observability.js"></script>
   <script src="/static/js/tabs/system.js"></script>
   <script src="/static/js/tabs/config.js"></script>
   <!-- 应用入口 -->

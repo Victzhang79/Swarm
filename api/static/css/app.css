@@ -367,6 +367,49 @@ html, body {
   border-bottom-color: var(--accent);
 }
 
+/* ─── 两层导航：上层系统级 / 下层项目级 ─────────────── */
+.nav-tabs-top {
+  margin-top: 12px;
+  align-items: center;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.nav-tab-top {
+  font-size: 13.5px;
+  font-weight: 600;
+  padding: 11px 18px;
+}
+.nav-tab-top.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
+}
+.nav-top-spacer { flex: 1; }
+.nav-tab-settings {
+  color: var(--text-secondary);
+  border-bottom-color: transparent !important;
+}
+.nav-tab-settings:hover { color: var(--text-primary); }
+
+/* 下层：项目级，次级视觉、略缩进、字号小一号 */
+.nav-tabs-sub {
+  margin-top: 0;
+  padding-left: 28px;
+  background: transparent;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.nav-tabs-sub .nav-tab {
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 8px 14px;
+}
+.nav-tabs.hidden { display: none; }
+
+/* 设置 tab：限制表单宽度，居中，避免在宽屏上拉得过长 */
+.settings-panel {
+  max-width: 720px;
+  padding: 4px 4px 24px;
+}
+
 .tab-panel { display: none; flex: 1; min-height: 0; overflow: hidden; }
 .tab-panel.active { display: flex; flex-direction: column; }
 
@@ -1667,3 +1710,41 @@ html, body {
     border-bottom: 1px solid var(--border-subtle);
   }
 }
+
+/* ─── Observability tab ─────────────────────────────── */
+.input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.input-sm { padding: 4px 8px; font-size: 12px; }
+.obs-table-wrap { overflow-x: auto; }
+.obs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.obs-table th, .obs-table td {
+  text-align: right;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+.obs-table th:first-child, .obs-table td:first-child { text-align: left; }
+.obs-table th {
+  color: var(--text-muted);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg-elevated);
+}
+.obs-table td:first-child {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.obs-table tbody tr:hover { background: var(--border-subtle); }
+

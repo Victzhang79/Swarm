@@ -67,17 +67,43 @@ async function loadSystemStats() {
   } catch { /* ignore */ }
 }
 
-function loadSystemTab() {
+// ─── 上层系统级（全局，不依赖项目）──────────────────────────
+// 全局任务统计：调 /api/stats（无 project_id = 所有项目汇总）。
+async function loadGlobalStats() {
+  try {
+    const resp = await fetch('/api/stats');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+    set('gstat-total', data.total_tasks ?? 0);
+    set('gstat-completed', data.completed ?? 0);
+    set('gstat-failed', data.failed ?? 0);
+    set('gstat-merge-rate', formatAcceptRate(data.merge_rate));
+    set('gstat-accept-rate', formatAcceptRate(data.accept_rate));
+    set('gstat-avg-duration', formatDurationSeconds(data.avg_duration_seconds));
+    set('gstat-total-tokens', formatTokenCount(data.total_tokens));
+    const trendEl = $('gstat-learning-trend');
+    if (trendEl) {
+      const eff = data.learning_effectiveness;
+      trendEl.innerHTML = eff ? learningTrendBadge(eff.trend) : learningTrendBadge('unknown');
+    }
+  } catch { /* ignore */ }
+}
+
+// 上层系统 tab 入口：全局统计 + 组件健康 + 全局沙箱运维。
+function loadGlobalSystemTab() {
+  loadGlobalStats();
   fetchStatus();
-  loadSystemStats();
+  if (typeof refreshOrphanCount === 'function') refreshOrphanCount();
+  if (typeof refreshPoolStatus === 'function') refreshPoolStatus();
 }
 
 function startSystemRefresh() {
   stopSystemRefresh();
-  loadSystemTab();
+  loadGlobalSystemTab();
   systemStatsInterval = setInterval(async () => {
-    if (currentTab !== 'system') return;
-    await loadSystemStats();
+    if (typeof currentTopTab === 'undefined' || currentTopTab !== 'system') return;
+    await loadGlobalStats();
     fetchStatus();
   }, 30000);
 }
@@ -464,6 +490,46 @@ async function cleanupOrphanSandboxes() {
   }
 }
 
+// ─── 热沙箱池开关（设置 tab）────────────────────────────────
+async function togglePoolEnabled(enabled) {
+  const statusEl = document.getElementById('pool-toggle-status');
+  const cb = document.getElementById('cfg-pool-enabled');
+  if (statusEl) statusEl.textContent = '应用中…';
+  if (cb) cb.disabled = true;
+  try {
+    const resp = await fetch('/api/sandbox/pool/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !!enabled }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || 'HTTP ' + resp.status);
+    if (cb) cb.checked = !!data.pool_enabled;
+    if (statusEl) statusEl.textContent = data.pool_enabled ? '已启用（reaper ' + (data.reaper || '') + '）' : '已关闭';
+    showToast(data.pool_enabled ? '热沙箱池已启用' : '热沙箱池已关闭', 'success');
+    // 同步刷新系统 tab 的池状态卡（若可见）
+    if (typeof refreshPoolStatus === 'function') refreshPoolStatus();
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '失败: ' + e.message;
+    if (cb) cb.checked = !enabled;  // 回滚 UI
+    showToast('切换失败: ' + e.message, 'error');
+  } finally {
+    if (cb) cb.disabled = false;
+  }
+}
+
+// 读当前池启用状态，同步设置 tab 的 checkbox。
+async function syncPoolToggleState() {
+  const cb = document.getElementById('cfg-pool-enabled');
+  if (!cb) return;
+  try {
+    const data = await fetch('/api/sandbox/pool').then(r => r.json());
+    cb.checked = !!data.pool_enabled;
+    const statusEl = document.getElementById('pool-toggle-status');
+    if (statusEl) statusEl.textContent = data.pool_enabled ? '已启用' : '已关闭';
+  } catch { /* ignore */ }
+}
+
 // ─── 全局热沙箱池状态卡 ───────────────────────────────────────
 async function refreshPoolStatus() {
   const el = document.getElementById('pool-status-card');
@@ -474,7 +540,7 @@ async function refreshPoolStatus() {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || 'HTTP ' + resp.status);
     if (!data.pool_enabled) {
-      el.innerHTML = '<span class="pill pill-gray">未启用</span> 设 <code>SWARM_SANDBOX_POOL_ENABLED=true</code> 开启热池复用。'
+      el.innerHTML = '<span class="pill pill-gray">未启用</span> 在「设置」tab 的「热沙箱池」处可一键开启。'
         + `<div style="margin-top:6px">服务端沙箱 ${data.server_total ?? 0} 个，孤儿 ${data.orphan_count ?? 0} 个。</div>`;
       return;
     }

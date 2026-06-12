@@ -125,7 +125,8 @@ class SandboxConfig(BaseSettings):
     template_java: str = "tpl-d3098a499a25492282284a76"
     template_go: str = "tpl-edf1a5aec16343249304abe3"
     template_rust: str = "tpl-d480ef3bd69f49c2b07930af"
-    # 热沙箱池（默认关闭，SWARM_SANDBOX_POOL_ENABLED=true 开启）
+    # 热沙箱池（默认启用，预热复用省冷启动；SWARM_SANDBOX_POOL_ENABLED=false 可关闭）
+    pool_enabled: bool = True
     pool_max_idle_per_template: int = 2
     pool_max_total: int = 8
     pool_ttl_seconds: int = 600
@@ -183,6 +184,23 @@ class KnowledgeConfig(BaseSettings):
     index_update_timeout: int = 30    # 秒
 
 
+class ObservabilityConfig(BaseSettings):
+    """OpenLIT/ClickHouse 可观测数据源（LLM/embed/rerank 调用 trace）。"""
+    model_config = SettingsConfigDict(
+        env_prefix="SWARM_OBS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # 留空 host 则面板降级（前端显示"未配置"）。默认指向局域网 OpenLIT ClickHouse。
+    clickhouse_http_url: str = "http://ai.bit:8123"
+    clickhouse_user: str = "admin"
+    clickhouse_password: str = ""
+    clickhouse_database: str = "openlit"
+    query_timeout: int = 15
+
+
 class AppConfig(BaseSettings):
     """全局配置 — 聚合所有子配置"""
     model_config = SettingsConfigDict(
@@ -226,6 +244,7 @@ class AppConfig(BaseSettings):
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
 
 # 全局单例

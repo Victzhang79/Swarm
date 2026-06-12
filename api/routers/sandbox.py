@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import swarm.api.app as _app
@@ -169,6 +169,66 @@ async def list_orphan_sandboxes():
         "total": len(server_list),     # 服务端沙箱总数
         "orphan_count": len(orphan_ids),
         "orphans": orphans,
+    }
+
+
+# ─── 9d-toggle. POST /api/sandbox/pool/toggle — 开关热池（写 .env + 实时启停 reaper）─
+@router.post("/api/sandbox/pool/toggle", tags=["沙箱"])
+async def toggle_sandbox_pool(request: Request):
+    """开关热沙箱池：写 SWARM_SANDBOX_POOL_ENABLED 到 .env + 同步 os.environ + reload，
+    并实时启动/停止后台 reaper（无需重启 API 即可生效）。
+
+    Body: {"enabled": true/false}
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+
+    # 1. 写 .env + 同步 os.environ（复用 config 路由的写入约定）
+    import os
+    from pathlib import Path
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    env_key = "SWARM_SANDBOX_POOL_ENABLED"
+    val = "true" if enabled else "false"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    found = False
+    out_lines = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s and s.partition("=")[0].strip().upper() == env_key:
+            out_lines.append(f"{env_key}={val}")
+            found = True
+        else:
+            out_lines.append(line)
+    if not found:
+        out_lines.append(f"{env_key}={val}")
+    env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    os.environ[env_key] = val
+
+    # 2. reload config 让 SandboxConfig.pool_enabled 反映新值
+    from swarm.config.settings import reload_config as _reload_config
+    _reload_config()
+
+    # 3. 实时启停 reaper（运行时尽量生效，避免必须重启）
+    from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+    reaper_action = "none"
+    try:
+        pool = get_sandbox_pool()
+        if pool_enabled():
+            pool.start_reaper()
+            reaper_action = "started"
+        else:
+            pool.stop_reaper()
+            reaper_action = "stopped"
+    except Exception as exc:  # noqa: BLE001
+        _app.logger.warning("toggle pool reaper 失败: %s", exc)
+        reaper_action = f"error: {exc}"
+
+    _app.logger.info("热沙箱池开关 → %s (reaper=%s)", val, reaper_action)
+    return {
+        "status": "ok",
+        "pool_enabled": pool_enabled(),
+        "reaper": reaper_action,
+        "note": "已写入 .env 并实时启停 reaper。已在运行的 Worker executor 行为在下次任务派发时生效。",
     }
 
 

@@ -76,8 +76,8 @@ function startPollers() {
 
   setInterval(() => {
     if (!getAuthToken()) return;
-    if (selectedProjectId && currentTab === 'system') {
-      refreshSandboxes(selectedProjectId);
+    if (typeof currentTopTab !== 'undefined' && currentTopTab === 'system') {
+      if (selectedProjectId) refreshSandboxes(selectedProjectId);
     }
   }, 15000);
 
