@@ -334,6 +334,9 @@ NOTIFY_EVENT_TYPES: list[dict] = [
     {"type": "task_completed",  "label": "任务完成"},
     {"type": "task_failed",     "label": "任务失败"},
     {"type": "awaiting_review", "label": "等待审核"},
+    {"type": "task_approved",   "label": "审核通过"},
+    {"type": "task_revised",    "label": "提交修订"},
+    {"type": "task_rejected",   "label": "审核拒绝"},
 ]
 
 

@@ -18,7 +18,7 @@ swarm/                          ← 项目根（当前目录）
 ├── .env.example                ← 环境变量模板
 ├── api/                        ← FastAPI + Web UI (static/)
 ├── auth/                       ← RBAC · 默认 L1 profile
-├── brain/                      ← LangGraph 15 节点状态机
+├── brain/                      ← LangGraph 20 节点状态机（含 Q4 交互式规划子图）
 ├── worker/                     ← ReAct Agent · L1 pipeline · sandbox
 ├── knowledge/                  ← Layer A-D · 检索 · 增量调度
 ├── memory/                     ← L0-L6 · sliding_window · decay
@@ -56,7 +56,8 @@ swarm/                          ← 项目根（当前目录）
 ┌─────────────────────────────────────────────────────────────────┐
 │  交互层 — Web :8420 · REST/SSE · CLI (swarm)                    │
 ├─────────────────────────────────────────────────────────────────┤
-│  Brain — ANALYZE→PLAN→VALIDATE→DISPATCH⇄MONITOR→MERGE         │
+│  Brain — ANALYZE→[CLARIFY⟲→ASSESS→TECH_DESIGN→REVIEW]→PLAN     │
+│          →ELABORATE→VALIDATE→DISPATCH⇄MONITOR→MERGE            │
 │          → verify_l2 (V2) → verify_l3 (V3) → DELIVER → LEARN   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Worker — ReAct · L1 流水线 · CubeSandbox                       │
@@ -123,6 +124,7 @@ pip install -e ".[dev]"
 | 域 | 要点 |
 |----|------|
 | Brain | 并行 dispatch（**依赖驱动 DAG**·批次容错）· 3-way merge · PlanValidator · shared_contract · **确定性失败升级阶梯**（retry→换模型→人工）|
+| 规划 | **Q4 交互式渐进规划**：多轮自适应澄清（≤5 轮，启发式提问，可跳过）· **复杂度后置定级**（先澄清再判级）· 技术方案+**人工评审**（打回≤3）· 接口先行 · **微任务极速通道** · **上下文预算二次拆分**（>150k 自动再拆）· 规划产物持久化可回看 |
 | 验证 | Worker L1（语法+**lint**+单测+**LLM 自检**）· **harness 确定性闸门**（Brain 编写 build/test/verify，真跑命令覆盖 LLM 自报）· V2 gate 硬阻断 · V3 GitLab push/CI · integration_review |
 | 知识 | hybrid 检索（**中文关键词+时间权重+共现过滤**）· approve/webhook 入队 · **按项目批量合并消费** · Layer C **规范自动提取** · consistency repair |
 | 记忆 | L1 结构化 UI · L2 注入 analyze/plan · L3 滑动窗口 · PatternExtractor · **L5+L6 衰减** |
@@ -254,6 +256,8 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `SWARM_REDIS_ENABLED` | 模块锁 |
 | `SWARM_RBAC_ENABLED` | 多用户 |
 | `SWARM_SANDBOX_POOL_ENABLED` | 沙箱热池（**默认开**，预热复用省去每任务冷启动；设置 tab 可一键开关，池状态见系统 tab + `GET /api/sandbox/pool`）|
+| `SWARM_SUBTASK_CONTEXT_BUDGET` | 子任务上下文预算（默认 150k，< 本地小模型 196k）。规划时按难度+scope 估每个子任务上下文，超预算的由 elaborate 二次拆分；拆不下则标记 oversized + 告警 |
+| `SWARM_AUTO_ACCEPT` | API/CI 自动化模式：跳过所有 interrupt（澄清/方案评审/计划确认/交付审核走默认假设），用于无人值守 |
 | `SWARM_WORKER_L1_LINT` / `_LINT_GATE` / `_SELF_REVIEW` | Worker L1 确定性闸门开关（默认全开硬阻断）|
 | `SWARM_WORKER_COMMAND_WHITELIST` | 全局命令白名单（harness.extra_whitelist 在其上追加）|
 | `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关（L1 确定性证据回写为结构化 feedback）|

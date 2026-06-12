@@ -476,11 +476,17 @@ async def approve_task(task_id: str, req: ApproveTaskRequest | None = None):
     if apply_result:
         out["apply_diff"] = apply_result
 
-    # NOTE(tech-debt): 此处发出的是"审批事件"通知（task_approved），语义正确。
-    # 待办：未来应在 Brain runner 任务真正执行完成时，额外发一条"完成事件"通知
-    # （需在 brain/runner.py 任务生命周期回调挂钩）。当前两类事件未区分，属已知缺口。
+    # 审批事件通知（task_approved），与任务"完成事件"正交：
+    # 完成事件（task_completed/task_failed）由 brain/runner.py 的 _emit_task_notification 在
+    # 任务生命周期 DONE/FAILED 时发出。两类事件语义不同，分别发送。
+    # 统一走 store.create_notification（→ 应用内铃铛 + hook 自动推外部渠道），
+    # 并保留旧单 webhook notify() 向后兼容（SWARM_NOTIFY_WEBHOOK_URL）。
+    msg = f"任务 {task_id} 已审核通过，Brain 继续执行"
+    await loop.run_in_executor(None, lambda: _app.store.create_notification(
+        "task_approved", task_id=task_id, project_id=updated.get("project_id") if isinstance(updated, dict) else None,
+        title="任务已通过", message=msg))
     from swarm.api.notify import notify
-    await notify("task_approved", task_id, f"任务 {task_id} 已审核通过，Brain 继续执行")
+    await notify("task_approved", task_id, msg)
 
     return out
 
@@ -550,10 +556,14 @@ async def revise_task(task_id: str, req: TaskReviseRequest):
         None,
         lambda: _app.store.update_task(task_id, human_decision="REVISE"),
     )
-    # NOTE(tech-debt): 发出的是"审批事件"通知（task_revised），语义正确。
-    # 待办：完成事件通知应在 brain/runner.py 任务生命周期回调中补充（见 accept 同款注释）。
+    # 审批事件通知（task_revised），与完成事件正交（完成事件见 runner._emit_task_notification）。
+    # 统一走 create_notification（铃铛 + 多渠道），保留旧 notify() 兼容。
+    msg = f"任务 {task_id} 已提交修订，Brain 重新调度"
+    await loop.run_in_executor(None, lambda: _app.store.create_notification(
+        "task_revised", task_id=task_id, project_id=updated.get("project_id") if isinstance(updated, dict) else None,
+        title="任务已修订", message=msg))
     from swarm.api.notify import notify
-    await notify("task_revised", task_id, f"任务 {task_id} 已提交修订，Brain 重新调度")
+    await notify("task_revised", task_id, msg)
     return {"status": "ok", "task": updated, "message": "已提交修订，Brain 重新调度"}
 
 
@@ -574,8 +584,60 @@ async def reject_task(task_id: str):
         None,
         lambda: _app.store.update_task(task_id, human_decision="REJECT"),
     )
-    # NOTE(tech-debt): 发出的是"审批事件"通知（task_rejected），语义正确。
-    # 待办：完成事件通知应在 brain/runner.py 任务生命周期回调中补充（见 accept 同款注释）。
+    # 审批事件通知（task_rejected），与完成事件正交（完成事件见 runner._emit_task_notification）。
+    # 统一走 create_notification（铃铛 + 多渠道），保留旧 notify() 兼容。
+    msg = f"任务 {task_id} 已拒绝，Brain 进入学习失败流程"
+    await loop.run_in_executor(None, lambda: _app.store.create_notification(
+        "task_rejected", task_id=task_id, project_id=updated.get("project_id") if isinstance(updated, dict) else None,
+        title="任务已拒绝", message=msg))
     from swarm.api.notify import notify
-    await notify("task_rejected", task_id, f"任务 {task_id} 已拒绝，Brain 进入学习失败流程")
+    await notify("task_rejected", task_id, msg)
     return {"status": "ok", "task": updated, "message": "已拒绝，Brain 进入学习失败流程"}
+
+
+@router.get("/api/tasks/{task_id}/planning", tags=["任务管理"])
+async def get_task_planning(task_id: str):
+    """读取任务的规划过程产物（Q4 可追溯）：澄清问答 / 技术方案 / 评审决策 / 澄清后定级。
+
+    任务详情页"规划过程"区用。无规划产物（微任务/轻量路径）时返回空。
+    """
+    loop = asyncio.get_running_loop()
+    artifacts = await loop.run_in_executor(
+        None, lambda: _app.store.get_planning_artifacts(task_id)
+    )
+    return {"task_id": task_id, "planning": artifacts or {}}
+
+
+@router.post("/api/tasks/{task_id}/clarify", tags=["任务管理"])
+async def submit_clarify(task_id: str, request: Request):
+    """提交需求澄清答复（恢复被 clarify interrupt 暂停的任务）。
+
+    Body: {"answers": {"0": "...", "1": "..."}} 逐条回答，或 {"action": "skip"} 整体跳过。
+    """
+    body = await request.json()
+    if body.get("action") == "skip":
+        payload: dict = {"action": "skip"}
+    else:
+        answers = body.get("answers")
+        if not isinstance(answers, dict):
+            raise HTTPException(status_code=400, detail="需要 answers 字典或 action=skip")
+        payload = answers
+    from swarm.brain.runner import resume_planning_background
+    resume_planning_background(task_id, payload)
+    return {"status": "ok", "message": "澄清已提交，规划继续"}
+
+
+@router.post("/api/tasks/{task_id}/review-design", tags=["任务管理"])
+async def submit_design_review(task_id: str, request: Request):
+    """提交技术方案评审决策（恢复被 review_design interrupt 暂停的任务）。
+
+    Body: {"decision": "approve"} 通过，或 {"decision": "reject", "feedback": "..."} 打回重做。
+    """
+    body = await request.json()
+    decision = body.get("decision")
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="decision 须为 approve 或 reject")
+    payload = {"decision": decision, "feedback": body.get("feedback", "")}
+    from swarm.brain.runner import resume_planning_background
+    resume_planning_background(task_id, payload)
+    return {"status": "ok", "message": "方案评审已提交，规划继续"}

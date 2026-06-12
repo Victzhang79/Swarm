@@ -201,6 +201,11 @@ class SubTask(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list, description="依赖的子任务 ID")
     model_preference: str | None = None
+    est_context_tokens: int = Field(
+        default=0,
+        description="Brain 预估本子任务执行时的输入上下文规模(tokens)；0=未估。"
+        "超过预算(SWARM_SUBTASK_CONTEXT_BUDGET，默认150k<本地小模型196k)的会被 elaborate 二次拆分。",
+    )
     harness: TaskHarness = Field(
         default_factory=TaskHarness,
         description="验证 harness：如何构建/测试/验收本子任务(Brain 编排时编写)",

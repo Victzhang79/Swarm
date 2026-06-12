@@ -81,7 +81,15 @@ _NODE_STATUS_MAP: dict[str, str] = {
 }
 
 # 需要在人工审核处暂停的 interrupt 类型
-_REVIEW_INTERRUPT_TYPES = frozenset({"deliver", "confirm_plan"})
+_REVIEW_INTERRUPT_TYPES = frozenset({"deliver", "confirm_plan", "clarify", "review_design"})
+
+# interrupt 类型 → (任务状态, 人类可读标签)
+_INTERRUPT_STATUS_LABEL = {
+    "confirm_plan": ("CONFIRMING", "计划确认"),
+    "deliver": ("DELIVERING", "结果审核"),
+    "clarify": ("CLARIFYING", "需求澄清"),
+    "review_design": ("DESIGN_REVIEW", "技术方案评审"),
+}
 
 
 def get_task_queue(task_id: str) -> asyncio.Queue[dict[str, Any]] | None:
@@ -351,9 +359,8 @@ async def _handle_post_run(
     if interrupt_info:
         interrupt_type = interrupt_info.get("type", "")
         if interrupt_type in _REVIEW_INTERRUPT_TYPES:
-            status = "CONFIRMING" if interrupt_type == "confirm_plan" else "DELIVERING"
+            status, label = _INTERRUPT_STATUS_LABEL.get(interrupt_type, ("DELIVERING", "结果审核"))
             store.update_task(task_id, status=status)
-            label = "计划确认" if interrupt_type == "confirm_plan" else "结果审核"
             await _emit(queue, {
                 "step": "awaiting_review",
                 "status": "waiting",
@@ -596,6 +603,63 @@ async def resume_task(
         })
     finally:
         _task_running.discard(task_id)
+
+
+async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
+    """恢复被规划子图 interrupt（clarify / review_design）暂停的任务。
+
+    与 resume_task 区别：clarify/review 的 resume 是结构化 payload（透传原样给 graph），
+    不走 ACCEPT/REVISE/REJECT 那套人工决策归一化。
+    - clarify：payload = {q_index: answer, ...} 或 {"action": "skip"}
+    - review_design：payload = {"decision": "approve"|"reject", "feedback": "..."}
+    """
+    from swarm.logging_config import set_task_context
+
+    set_task_context(task_id)
+
+    queue = _task_queues.get(task_id) or register_task_queue(task_id)
+    if task_id in _task_running:
+        await _emit(queue, {"step": "error", "status": "error", "message": "任务正在执行，请稍候"})
+        return
+    task = store.get_task(task_id)
+    if not task:
+        await _emit(queue, {"step": "error", "status": "error", "message": "任务不存在"})
+        return
+
+    _task_running.add(task_id)
+    _set_workspace(task["project_id"])
+    store.update_task(task_id, status="ANALYZING")
+    try:
+        await _emit(queue, {
+            "step": "resume", "status": "running",
+            "message": "恢复规划（澄清/方案评审已提交）", "mode": "brain", "progress": 30,
+        })
+        state, snapshot, _lock = await _stream_brain_events(
+            task_id,
+            Command(resume=payload),
+            queue,
+            project_id=task.get("project_id", ""),
+        )
+        await _handle_post_run(task_id, state, queue, snapshot)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
+        store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
+        await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
+    finally:
+        _task_running.discard(task_id)
+
+
+def resume_planning_background(task_id: str, payload: dict[str, Any]) -> None:
+    """在 FastAPI 后台 resume 规划 interrupt。"""
+    async def _wrap() -> None:
+        try:
+            from swarm.logging_config import bind_task
+            with bind_task(task_id):
+                await resume_planning(task_id, payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("[RUNNER] resume_planning_background 失败 task=%s", task_id)
+    _task_handles[task_id] = asyncio.create_task(_wrap())
 
 
 def is_task_running(task_id: str) -> bool:

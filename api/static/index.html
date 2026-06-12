@@ -84,7 +84,8 @@
           <nav class="nav-tabs nav-tabs-top">
             <button class="nav-tab nav-tab-top active" data-toptab="workspace" onclick="switchTopTab('workspace')">📁 项目工作台</button>
             <button class="nav-tab nav-tab-top" data-toptab="observability" onclick="switchTopTab('observability')">📊 可观测</button>
-            <button class="nav-tab nav-tab-top" data-toptab="system" onclick="switchTopTab('system')">🖥️ 系统</button>
+            <button class="nav-tab nav-tab-top" data-toptab="sandboxes" onclick="switchTopTab('sandboxes')">🖥️ 沙箱</button>
+            <button class="nav-tab nav-tab-top" data-toptab="system" onclick="switchTopTab('system')">📈 系统</button>
             <button class="nav-tab nav-tab-top" data-toptab="settings" onclick="switchTopTab('settings')">⚙️ 设置</button>
           </nav>
 
@@ -696,6 +697,64 @@
             </div>
           </div>
 
+          <!-- Sandboxes Tab（上层系统级：全服务端沙箱总览 + 运维 + 日志）-->
+          <div id="tab-sandboxes" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="system-layout">
+                <section class="system-section system-section-grow">
+                  <div class="system-section-head">
+                    <h3>全服务端沙箱 <span class="hint">跨项目 · CubeSandbox 服务端全部实例</span></h3>
+                    <div class="system-section-actions">
+                      <button class="btn btn-danger btn-sm" id="btn-g-cleanup-orphans" onclick="cleanupOrphanSandboxes(true)">清理孤儿</button>
+                      <button class="btn btn-danger btn-sm" id="btn-g-destroy-all" onclick="destroyAllServerSandboxes()">全部销毁</button>
+                      <button class="btn btn-secondary btn-sm" id="btn-g-pool-reap" onclick="reapPool(true)">回收池</button>
+                      <button class="btn btn-ghost btn-sm" onclick="refreshGlobalSandboxes()">刷新</button>
+                    </div>
+                  </div>
+                  <div class="sandbox-config" id="g-sandbox-summary"></div>
+                  <div class="sandbox-workspace">
+                    <div class="sandbox-list-col">
+                      <p class="sandbox-col-label">活跃沙箱</p>
+                      <div id="global-sandbox-list" class="sandbox-list-scroll"></div>
+                    </div>
+                    <div class="sandbox-detail-col">
+                      <div id="g-sandbox-detail-empty" class="sandbox-detail-empty">
+                        <p>选择沙箱查看 /workspace 产物与执行日志</p>
+                        <p class="hint">点击文件可预览内容；目录可进入</p>
+                      </div>
+                      <div id="g-sandbox-detail-panel" class="sandbox-detail-panel hidden">
+                        <div class="sandbox-detail-head">
+                          <span class="sandbox-id" id="g-sandbox-detail-id"></span>
+                          <span id="g-sandbox-detail-meta" class="sandbox-meta"></span>
+                        </div>
+                        <div class="sandbox-detail-split">
+                          <div class="sandbox-pane">
+                            <div class="sandbox-pane-head">
+                              <span>Workspace 产物</span>
+                              <div class="sandbox-breadcrumb" id="g-sandbox-breadcrumb"></div>
+                              <button class="btn btn-ghost btn-sm" onclick="gLoadFiles()">刷新</button>
+                            </div>
+                            <div class="sandbox-file-list" id="g-sandbox-files"></div>
+                            <div class="sandbox-file-preview" id="g-sandbox-file-content">
+                              <p class="hint">点击文件预览内容（文本）；二进制以 base64 提示</p>
+                            </div>
+                          </div>
+                          <div class="sandbox-pane">
+                            <div class="sandbox-pane-head">
+                              <span>执行日志</span>
+                              <button class="btn btn-ghost btn-sm" onclick="gLoadLogs()">刷新</button>
+                            </div>
+                            <div class="log-view sandbox-log-view" id="g-sandbox-logs"></div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+
           <!-- Settings Tab（上层系统级：模型 / 路由 / LangSmith 配置）-->
           <div id="tab-settings" class="tab-panel">
             <div class="tab-scroll">
@@ -832,6 +891,7 @@
   <script src="/static/js/core/auth.js"></script>
   <script src="/static/js/core/project.js"></script>
   <!-- tab 业务域 -->
+  <script src="/static/js/tabs/planning_ui.js"></script>
   <script src="/static/js/tabs/tasks.js"></script>
   <script src="/static/js/tabs/worker.js"></script>
   <script src="/static/js/tabs/knowledge.js"></script>
@@ -839,6 +899,7 @@
   <script src="/static/js/tabs/preprocess.js"></script>
   <script src="/static/js/tabs/observability.js"></script>
   <script src="/static/js/tabs/system.js"></script>
+  <script src="/static/js/tabs/sandboxes.js"></script>
   <script src="/static/js/tabs/config.js"></script>
   <script src="/static/js/tabs/notify.js"></script>
   <!-- 应用入口 -->

@@ -84,3 +84,26 @@ class BrainState(TypedDict, total=False):
 
     # ─── API/自动化模式 ───
     auto_accept: bool                   # API 模式下自动接受 interrupt 节点
+
+    # ═══ Q4 交互式渐进规划 Agent（规划子图，纯加法）═══
+    # ─── 微任务极速通道(D) ───
+    is_micro_task: bool                 # 单点/低风险/无架构影响（如"按钮黄→绿"）→ 跳过澄清/方案/明细
+    # ─── 澄清阶段（多轮自适应 ≤5）───
+    ambiguity_score: float              # analyze 初判的信息缺口程度 0-1
+    needs_clarify: bool                 # analyze 初判：是否需进入澄清流程
+    clarify_round: int                  # 当前澄清轮次（0 起）
+    clarify_history: list[dict]         # [{round, questions:[{q,why,default_if_skipped}], answers}]
+    clarify_summary: str                # 多轮澄清的滚动摘要（C：防上下文堆积）
+    clarify_done: bool                  # 信息已足够 / 达上限 / 用户跳过
+    # ─── 澄清后定级(Q2 复杂度后置)───
+    assessed_complexity: Complexity     # 澄清后基于完整信息+知识库定的真复杂度（覆盖 analyze 初判）
+    # ─── 技术方案 + 评审(Q5/Q6/B)───
+    tech_design: dict                   # {stack, architecture, data_model_diagram, flow_diagram, risks, notes, acceptance, change_impact, maintainability, comment_requirements}
+    shared_contract_draft: dict         # 接口先行(B)：API schema / 数据模型，供并行子任务作稳定前置
+    design_review: dict                 # {decision: approve|reject, feedback, reject_count}
+    # ─── 渐进明细(两层)───
+    plan_milestones: list[dict]         # L0 骨架：[{goal, modules, risks}]
+    plan_elaborated: bool               # 是否已从骨架展开为子任务 DAG
+    # ─── 上下文预算 + INVEST 自检(Q7/A)───
+    oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）
+    invest_fail_count: int              # INVEST 自检未过被打回再拆的次数

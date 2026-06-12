@@ -156,6 +156,63 @@ def push_l1_feedback(
         logger.debug("push_l1_feedback skipped: %s", exc)
 
 
+def push_planning_feedback(planning: dict[str, Any], *, run_id: str | None = None) -> None:
+    """把 Q4 规划子图的关键决策作为结构化 feedback 上报 LangSmith。
+
+    指标：澄清轮数、是否跳过、澄清后定级、技术方案评审(通过/打回)、拆分密度、
+    超预算子任务数、INVEST 自检失败数。tracing 关闭 no-op；异常全吞。
+    """
+    if not is_langsmith_active():
+        return
+    try:
+        from langsmith import Client
+        from langsmith.run_helpers import get_current_run_tree
+
+        rid = run_id
+        if not rid:
+            rt = get_current_run_tree()
+            rid = str(rt.id) if rt else None
+        if not rid:
+            return
+
+        client = Client()
+
+        def _fb(key: str, score: float | bool, comment: str = "") -> None:
+            try:
+                client.create_feedback(
+                    run_id=rid, key=key,
+                    score=float(bool(score)) if isinstance(score, bool) else score,
+                    comment=comment or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("create_feedback %s skipped: %s", key, exc)
+
+        if "clarify_rounds" in planning:
+            _fb("clarify_rounds", float(planning.get("clarify_rounds", 0)),
+                f"自适应澄清轮数（上限 {planning.get('clarify_max', 5)}）")
+        if "clarify_skipped" in planning:
+            _fb("clarify_skipped", bool(planning.get("clarify_skipped")), "用户是否整体跳过澄清")
+        if planning.get("assessed_complexity"):
+            _fb("assessed_complexity_is_complex",
+                planning["assessed_complexity"] in ("complex", "ultra"),
+                f"澄清后定级={planning['assessed_complexity']}")
+        if "design_review_decision" in planning:
+            _fb("design_approved", planning.get("design_review_decision") == "approve",
+                f"打回 {planning.get('design_reject_count', 0)} 次")
+        ms = planning.get("milestone_count")
+        sub = planning.get("subtask_count")
+        if ms and sub:
+            _fb("plan_elaboration_ratio", sub / ms, f"{sub} 子任务 / {ms} 里程碑")
+        if "oversized_count" in planning:
+            _fb("oversized_subtasks", float(planning.get("oversized_count", 0)),
+                "预估超上下文预算、拆不下的子任务数（>0 表示需重新切分）")
+        if "invest_fail_count" in planning:
+            _fb("invest_fail_count", float(planning.get("invest_fail_count", 0)),
+                "INVEST 自检未过（如缺验收标准）的子任务数")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("push_planning_feedback skipped: %s", exc)
+
+
 def _base_tags(*, phase: str, component: str, extra: list[str] | None = None) -> list[str]:
     tags = ["swarm", f"swarm-{phase}", f"swarm-{component}"]
     if extra:

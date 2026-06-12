@@ -64,15 +64,6 @@
 - **影响**：首个 Java 任务慢；池复用后 `.m2` 预热则快（实测复用后 2-3s）。
 - **建议**：模板镜像预置常见依赖的 `.m2` 缓存，或挂载共享只读 `.m2` 卷。
 
-### 8. 沙箱集成测试缺 reachability 门禁 → 无 infra 时假失败
-- **现象**：`test/test_sandbox_integration.py`（如 `test_5_build_tools_sandbox_mode` 断言
-  `"sandbox exit code 0" in result`）需真实 CubeSandbox infra；本机/CI 无 infra 时被 pytest
-  收集并失败，干扰单元套件结果判断。
-- **影响**：发布前跑全量测试时混入 infra 依赖的失败，需手动 `--ignore` 排除，易误判回归。
-- **建议**：按 `service-architecture-review` skill 加模块级 reachability 门禁——
-  `pytestmark = pytest.mark.skipif(not _reachable(), reason="infra unreachable; set SWARM_RUN_SANDBOX_IT=1")`，
-  infra 不可达优雅 skip（可见），CI 在装备 infra 的 runner 上设 `SWARM_RUN_SANDBOX_IT=1` 强制跑。
-
 ---
 
 ## 已根治（2026-06 E2E 修复，留档备查）
@@ -101,4 +92,18 @@
 - **外部通知单一注入点**：`store.create_notification` 写库后触发 hook（解耦，store 不依赖
   httpx），`api/notify.dispatch_notification` 按 enabled+事件过滤推送多渠道；hook 用
   `run_coroutine_threadsafe` 投主 loop（避免 skill#16 跨 loop 陷阱）+ future 异常回调可见。
+- **审批事件接入统一通知**：approve/revise/reject 原只发旧单 webhook notify()，未进新多渠道；
+  改为同时走 store.create_notification（→ 铃铛 + hook 多渠道）+ 保留旧 notify() 兼容；
+  NOTIFY_EVENT_TYPES 补 task_approved/revised/rejected 供 UI 订阅。
+- **沙箱集成测试断言漂移**：`test_5_build_tools_sandbox_mode` 断言旧输出格式 `"sandbox exit
+  code 0"`，而 build_tools._run 实际输出 `"✅ (sandbox 0)"`（格式演进后测试没跟上）→ 真跑假
+  失败。修正断言为 `(sandbox 0)`。注：reachability 门禁(`_sandbox_reachable` + pytestmark
+  skipif)其实早已存在并正确，原 TECH_DEBT#8 对"缺门禁"的判断有误——真因是断言漂移。
+- **Q4 交互式渐进规划 Agent**：plan 阶段原"一次性 LLM 出全量 DAG，零澄清/方案/评审"过于简单。
+  在 brain LangGraph 增量加规划子图（clarify 多轮自适应澄清≤5 / assess 澄清后定级 /
+  tech_design 技术方案+接口先行 / review_design 人工评审+打回≤3 / elaborate 上下文预算
+  150k+INVEST 自检），微任务极速通道，依赖驱动并行(已有)，LangSmith 上报，规划产物持久化
+  可追溯，前端多轮问答/评审/回看 UI。详见 docs/Q4_Planning_Agent_Design.md。
+  踩坑留记：LangGraph interrupt 节点 resume 会从头重跑——interrupt 前的 LLM 调用须确定，
+  否则二次判断会丢用户答复（测试用计数器 mock 复现过假失败，确定性 mock 即通过）。
 

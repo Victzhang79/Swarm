@@ -134,6 +134,8 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS merge_conflicts JSONB DEFAULT '[]'",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS l3_result JSONB DEFAULT '{}'",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS created_by_user_id TEXT",
+    # Q4 规划子图：澄清/技术方案/评审产物（可追溯回看）
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS planning_artifacts JSONB DEFAULT '{}'",
 ]
 
 _TASK_SELECT = """
@@ -499,6 +501,45 @@ def get_task(task_id: str, conn_str: str | None = None) -> dict[str, Any] | None
             )
             row = cur.fetchone()
     return _row_to_task(row) if row else None
+
+
+def save_planning_artifacts(
+    task_id: str, artifacts: dict[str, Any], conn_str: str | None = None
+) -> bool:
+    """持久化 Q4 规划产物（澄清历史/技术方案/评审决策）到 task_records.planning_artifacts。
+
+    可追溯(F)：任务详情页可回看"当初为何这么规划"。失败不抛出（非关键路径）。
+    """
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE task_records SET planning_artifacts = %s WHERE id = %s",
+                    (json.dumps(artifacts, ensure_ascii=False), task_id),
+                )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("save_planning_artifacts failed: %s", exc)
+        return False
+
+
+def get_planning_artifacts(task_id: str, conn_str: str | None = None) -> dict[str, Any]:
+    """读取任务的规划产物。无则返回空 dict。"""
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT planning_artifacts FROM task_records WHERE id = %s",
+                    (task_id,),
+                )
+                row = cur.fetchone()
+        if not row or not row[0]:
+            return {}
+        val = row[0]
+        return val if isinstance(val, dict) else json.loads(val)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_planning_artifacts failed: %s", exc)
+        return {}
 
 
 def list_tasks(project_id: str, conn_str: str | None = None) -> list[dict[str, Any]]:

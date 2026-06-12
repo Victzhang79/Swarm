@@ -473,16 +473,18 @@ async function refreshOrphanCount() {
   }
 }
 
-async function cleanupOrphanSandboxes() {
+async function cleanupOrphanSandboxes(global) {
   if (!confirm('清理孤儿沙箱？只销毁无项目/任务关联的沙箱，不影响正在使用的。')) return;
-  const btn = document.getElementById('btn-cleanup-orphans');
+  const btnId = global ? 'btn-g-cleanup-orphans' : 'btn-cleanup-orphans';
+  const btn = document.getElementById(btnId);
   if (btn) { btn.disabled = true; btn.textContent = '清理中…'; }
   try {
     const resp = await fetch('/api/sandbox/cleanup?orphans_only=true', { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || '清理失败');
     showToast(`已清理 ${data.killed} 个孤儿沙箱${data.failed ? `（${data.failed} 个失败）` : ''}`, 'success');
-    await refreshOrphanCount();
+    if (global && typeof refreshGlobalSandboxes === 'function') await refreshGlobalSandboxes();
+    else await refreshOrphanCount();
   } catch (e) {
     showToast('清理失败: ' + e.message, 'error');
   } finally {
@@ -559,9 +561,9 @@ async function refreshPoolStatus() {
   }
 }
 
-async function reapPool() {
+async function reapPool(global) {
   if (!confirm('回收：清理池内超时/空闲沙箱 + 服务端孤儿沙箱？不影响正在使用的。')) return;
-  const btn = document.getElementById('btn-pool-reap');
+  const btn = document.getElementById(global ? 'btn-g-pool-reap' : 'btn-pool-reap');
   if (btn) { btn.disabled = true; btn.textContent = '回收中…'; }
   try {
     const resp = await fetch('/api/sandbox/pool/reap?include_orphans=true', { method: 'POST' });
@@ -570,8 +572,12 @@ async function reapPool() {
     const pr = data.pool_reap || {};
     const oc = data.orphan_cleanup || {};
     showToast(`回收完成：池 kill ${pr.killed ?? 0}、孤儿 kill ${oc.killed ?? 0}`, 'success');
-    await refreshPoolStatus();
-    await refreshOrphanCount();
+    if (global && typeof refreshGlobalSandboxes === 'function') {
+      await refreshGlobalSandboxes();
+    } else {
+      await refreshPoolStatus();
+      await refreshOrphanCount();
+    }
   } catch (e) {
     showToast('回收失败: ' + e.message, 'error');
   } finally {

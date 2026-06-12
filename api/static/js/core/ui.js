@@ -63,6 +63,9 @@ function switchTopTab(topTab) {
   if (topTab === 'observability') {
     stopSystemRefresh();
     loadObservability();
+  } else if (topTab === 'sandboxes') {
+    stopSystemRefresh();
+    if (typeof refreshGlobalSandboxes === 'function') refreshGlobalSandboxes();
   } else if (topTab === 'system') {
     startSystemRefresh();
   } else if (topTab === 'settings') {

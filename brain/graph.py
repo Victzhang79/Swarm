@@ -45,6 +45,13 @@ from swarm.brain.nodes import (
     verify_l2,
     verify_l3,
 )
+from swarm.brain.planning_nodes import (
+    assess,
+    clarify,
+    elaborate,
+    review_design,
+    tech_design,
+)
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.types import Complexity, HumanDecision
@@ -62,6 +69,56 @@ _memory_checkpointer = None
 # ══════════════════════════════════════════════
 # 条件边函数
 # ══════════════════════════════════════════════
+
+
+def after_analyze(state: BrainState) -> Literal["clarify", "plan"]:
+    """ANALYZE 后路由（Q4 规划子图入口）：
+    - needs_clarify(非微任务&非自动化) → CLARIFY（进交互式渐进规划）
+    - 微任务 / 自动化 / 不需澄清 → PLAN（直达，极速/轻量）
+    """
+    if state.get("needs_clarify") and not state.get("is_micro_task"):
+        logger.info("[ROUTE] ANALYZE → CLARIFY (进规划子图)")
+        return "clarify"
+    logger.info("[ROUTE] ANALYZE → PLAN (微任务/自动化/直达)")
+    return "plan"
+
+
+def after_clarify(state: BrainState) -> Literal["clarify", "assess"]:
+    """CLARIFY 后路由（多轮循环）：
+    - clarify_done → ASSESS（澄清完成，定级）
+    - 否则 → CLARIFY（继续下一轮，LLM 再评估是否还要问）
+    """
+    if state.get("clarify_done"):
+        logger.info("[ROUTE] CLARIFY → ASSESS (澄清完成)")
+        return "assess"
+    logger.info("[ROUTE] CLARIFY → CLARIFY (下一轮澄清)")
+    return "clarify"
+
+
+def after_assess(state: BrainState) -> Literal["tech_design", "plan"]:
+    """ASSESS 后路由（澄清后定级）：
+    - complex/ultra → TECH_DESIGN（出技术方案+评审）
+    - simple/medium → PLAN（轻量直达）
+    """
+    comp = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
+    if comp in (Complexity.COMPLEX, Complexity.ULTRA):
+        logger.info("[ROUTE] ASSESS → TECH_DESIGN (%s)", comp.value)
+        return "tech_design"
+    logger.info("[ROUTE] ASSESS → PLAN (%s 轻量)", comp.value)
+    return "plan"
+
+
+def after_review(state: BrainState) -> Literal["tech_design", "plan"]:
+    """REVIEW_DESIGN 后路由：
+    - 评审通过(approve) → PLAN
+    - 打回(reject) → TECH_DESIGN（带反馈重做；打回上限由节点内强制 approve 收敛）
+    """
+    review = state.get("design_review") or {}
+    if review.get("decision") == "reject":
+        logger.info("[ROUTE] REVIEW → TECH_DESIGN (打回重做)")
+        return "tech_design"
+    logger.info("[ROUTE] REVIEW → PLAN (方案通过)")
+    return "plan"
 
 
 def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
@@ -255,6 +312,12 @@ def build_brain_graph() -> StateGraph:
 
     # ── 注册节点 ──
     graph.add_node("analyze", analyze)
+    # Q4 规划子图节点
+    graph.add_node("clarify", clarify)
+    graph.add_node("assess", assess)
+    graph.add_node("tech_design", tech_design)
+    graph.add_node("review_design", review_design)
+    graph.add_node("elaborate", elaborate)
     graph.add_node("plan", plan)
     graph.add_node("validate_plan", validate_plan)
     graph.add_node("confirm", confirm_plan)
@@ -274,12 +337,41 @@ def build_brain_graph() -> StateGraph:
     graph.set_entry_point("analyze")
 
     # ── 线性边 ──
-    graph.add_edge("analyze", "plan")
-    graph.add_edge("plan", "validate_plan")
+    # analyze → plan 改为条件边（见下方 after_analyze，接入 Q4 规划子图）
+    graph.add_edge("plan", "elaborate")          # plan 后做上下文预算/INVEST 后处理
+    graph.add_edge("elaborate", "validate_plan")
     graph.add_edge("confirm", "dispatch")       # confirm 后实际路由在 after_confirm 条件边
     graph.add_edge("revision", "dispatch")
     graph.add_edge("learn_success", END)
     graph.add_edge("learn_failure", END)
+
+    # ── Q4 规划子图边 ──
+    # ANALYZE →[条件] CLARIFY / PLAN
+    graph.add_conditional_edges(
+        "analyze",
+        after_analyze,
+        {"clarify": "clarify", "plan": "plan"},
+    )
+    # CLARIFY ⟲[条件] CLARIFY(多轮) / ASSESS
+    graph.add_conditional_edges(
+        "clarify",
+        after_clarify,
+        {"clarify": "clarify", "assess": "assess"},
+    )
+    # ASSESS →[条件] TECH_DESIGN / PLAN
+    graph.add_conditional_edges(
+        "assess",
+        after_assess,
+        {"tech_design": "tech_design", "plan": "plan"},
+    )
+    # TECH_DESIGN → REVIEW_DESIGN
+    graph.add_edge("tech_design", "review_design")
+    # REVIEW_DESIGN →[条件] TECH_DESIGN(打回) / PLAN(通过)
+    graph.add_conditional_edges(
+        "review_design",
+        after_review,
+        {"tech_design": "tech_design", "plan": "plan"},
+    )
 
     # ── 条件边 ──
 

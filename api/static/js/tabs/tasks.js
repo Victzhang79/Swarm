@@ -161,6 +161,11 @@ function renderTaskDetail(task) {
   renderOverviewSubtasks(task);
   restorePipelineFromStatus(task);
 
+  // Q4：规划过程回看（澄清/技术方案/评审）
+  if (typeof loadPlanningArtifacts === 'function' && task.id) {
+    loadPlanningArtifacts(task.id);
+  }
+
   if (task.learn_summary) {
     tryShowLearnNotice(typeof task.learn_summary === 'string' ? JSON.parse(task.learn_summary) : task.learn_summary);
   }
@@ -605,8 +610,17 @@ function startTaskSSE(taskId) {
         handleBrainProgressEvent(data, eventType);
 
         if (eventType === 'awaiting_review' || data.step === 'awaiting_review') {
-          appendLog('warning', data.message || '等待人工审核');
-          if (selectedProjectId) loadTasks(selectedProjectId).then(() => selectTask(taskId));
+          const itype = data.interrupt_type || '';
+          if (itype === 'clarify') {
+            renderClarifyPrompt(taskId, data.interrupt || {});
+            appendLog('warning', data.message || '等待需求澄清');
+          } else if (itype === 'review_design') {
+            renderDesignReviewPrompt(taskId, data.interrupt || {});
+            appendLog('warning', data.message || '等待技术方案评审');
+          } else {
+            appendLog('warning', data.message || '等待人工审核');
+            if (selectedProjectId) loadTasks(selectedProjectId).then(() => selectTask(taskId));
+          }
         }
         if (data.knowledge_stats) showKnowledgeBanner(data.knowledge_stats, data.complexity);
         if (eventType === 'result' || data.step === 'result') {

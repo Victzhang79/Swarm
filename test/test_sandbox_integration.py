@@ -291,7 +291,8 @@ def test_5_build_tools_sandbox_mode():
     print("  [5.3] _run() 自动路由到沙箱...")
     result = _run("echo 'hello from sandbox _run'")
     print(f"  result: {result[:200]}")
-    assert "sandbox exit code 0" in result
+    # build_tools._run 沙箱成功输出格式为 "✅ (sandbox 0)\n<body>"（exit_hint=0 表示退出码 0）。
+    assert "(sandbox 0)" in result, f"期望沙箱成功标记 (sandbox 0)，实际: {result[:120]}"
     assert "hello from sandbox _run" in result
     print("  ✅ _run 沙箱路由成功")
 

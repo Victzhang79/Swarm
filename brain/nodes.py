@@ -444,11 +444,30 @@ def _worker_profile_prompt(state: BrainState) -> str:
     return state.get("user_profile_prompt_worker") or "（未加载用户画像）"
 
 
+def _planning_triage(task_description: str, complexity: Complexity, state: BrainState) -> dict:
+    """规划初判（Q4）：是否微任务 + 是否需进澄清流程。不额外调 LLM（控成本）。
+
+    - 微任务：启发式判 simple 且描述短、含典型微改动词（改/换/调/重命名/文案/颜色）→ 极速通道。
+    - needs_clarify：非微任务 且 非自动化模式 → 倾向进澄清（真复杂度由 assess 澄清后定）。
+    """
+    desc = (task_description or "").strip()
+    micro_markers = ("改", "换成", "调整", "重命名", "文案", "颜色", "typo", "错别字", "rename", "颜色", "样式")
+    is_micro = (
+        complexity == Complexity.SIMPLE
+        and len(desc) <= 40
+        and any(m in desc.lower() for m in micro_markers)
+    )
+    auto = bool(state.get("auto_accept")) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    needs_clarify = (not is_micro) and (not auto)
+    return {"is_micro_task": is_micro, "needs_clarify": needs_clarify}
+
+
 async def analyze(state: BrainState) -> dict:
-    """ANALYZE 节点 — 分析任务复杂度 & 检索知识上下文
+    """ANALYZE 节点 — 任务初判 & 检索知识上下文
 
     输入: task_description, project_id
-    输出: complexity, knowledge_context
+    输出: complexity(初判，终复杂度由 assess 澄清后定), knowledge_context,
+          is_micro_task, needs_clarify
     """
     from swarm.knowledge.service import (
         empty_knowledge_context,
@@ -513,6 +532,7 @@ async def analyze(state: BrainState) -> dict:
             "knowledge_context": knowledge_context,
             "affected_files": affected_files,
             "recent_task_summaries": recent_summaries or [],
+            **_planning_triage(task_description, heuristic, state),
             **context_patch,
             **analyze_touch,
         }
@@ -575,6 +595,7 @@ async def analyze(state: BrainState) -> dict:
         "knowledge_context": knowledge_context,
         "affected_files": affected_files,
         "recent_task_summaries": recent_summaries or [],
+        **_planning_triage(task_description, complexity, state),
         **context_patch,
         **analyze_touch,
     }
@@ -587,7 +608,8 @@ async def plan(state: BrainState) -> dict:
     输出: plan
     """
     task_description = state.get("task_description", "")
-    complexity = state.get("complexity", Complexity.MEDIUM)
+    # 优先用澄清后定级(assess)，回退 analyze 初判
+    complexity = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
     knowledge_context = state.get("knowledge_context", {})
 
     logger.info(f"[PLAN] 拆解任务 (复杂度={complexity.value})")
@@ -709,6 +731,14 @@ async def plan(state: BrainState) -> dict:
                 "可能导致上传/拉回大量无关文件、diff 巨大。建议规划时只圈真正改动的文件。",
                 getattr(st, "id", "?"), len(_writable), _SCOPE_WRITABLE_WARN_THRESHOLD,
             )
+        # est_context_tokens 兜底(Q7 上下文预算)：LLM 未估时按难度+scope 文件数启发式估算，
+        # 让 elaborate 的二次拆分有真实信号(否则字段恒 0，预算检测形同虚设)。
+        if not getattr(st, "est_context_tokens", 0):
+            _diff = getattr(st, "difficulty", SubTaskDifficulty.MEDIUM)
+            _base = {SubTaskDifficulty.TRIVIAL: 8000, SubTaskDifficulty.MEDIUM: 50000,
+                     SubTaskDifficulty.COMPLEX: 120000}.get(_diff, 50000)
+            # 每个 writable 文件按 ~6k token 估(读+改)，叠加难度基线
+            st.est_context_tokens = _base + len(_writable) * 6000
     plan_touch = touch_context(
         state,
         "plan",
