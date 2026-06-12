@@ -62,3 +62,8 @@
 - 空 diff + 期望有产出 → 确定性判失败（杜绝“没干活”假 DONE）
 - trivial 迭代上限 12→30 + 撞 recursion 上限优雅交确定性闸门裁决
 - embedding 端点改用配置 local_base_url（原硬编码 localhost:3000）
+- **池化后孤儿沙箱泄漏**（2026-06 修）：①硬重启/崩溃跳过 shutdown drain → 启动
+  时 `_sweep_startup_orphans` 清扫残留；②kill_by_task 不告知池 → `pool.forget`
+  对账 borrowed 计数 + 清死引用；③trivial 路径脏沙箱误标 reusable=True → 显式设
+  `_l1_passed_flag`；④孤儿检测器误判 pool-idle 为孤儿 → 排除 source=pool-idle。
+
