@@ -110,6 +110,43 @@ class WorkerExecutor:
         self._pre_sync_contents: dict[str, str | None] = {}
         self._post_sync_contents: dict[str, str | None] = {}
 
+        # 归一化 scope：Brain 有时把【已存在】文件误判进 create_files（如"给现有
+        # ruoyi.js 加函数"），create_files 走"新建"路径(不上传/不读取原内容)会丢内容。
+        # 放在 execution_log 等运行时状态初始化之后，因其内部会 _log。
+        self._normalize_scope_create_files()
+
+    def _normalize_scope_create_files(self) -> None:
+        """把 scope.create_files 中【本地已存在】的文件降级到 writable（修改语义）。
+
+        Brain 规划偶把现有文件误判为新建（实测：给已存在的 ruoyi.js 加函数被分到
+        create_files）。create_files 走"新建"路径(不上传/不读取原内容)，对追加改动
+        会丢失原文件内容。这里在 worker 启动即纠正：存在即视为修改。幂等、无副作用。
+        """
+        scope = self.effective_scope
+        create = list(getattr(scope, "create_files", []) or [])
+        if not create or not self.project_path:
+            return
+        from pathlib import Path as _P
+        root = _P(self.project_path)
+        writable = list(getattr(scope, "writable", []) or [])
+        still_create: list[str] = []
+        moved: list[str] = []
+        for f in create:
+            rel = str(f).strip()
+            if rel and (root / rel).is_file():
+                if rel not in writable:
+                    writable.append(rel)
+                moved.append(rel)
+            else:
+                still_create.append(rel)
+        if moved:
+            try:
+                scope.create_files = still_create
+                scope.writable = writable
+            except Exception:  # noqa: BLE001
+                return  # scope 不可变则放弃（不阻断）
+            self._log(f"scope 归一化：{len(moved)} 个已存在文件从 create_files 降级为 writable: {moved[:5]}")
+
     def _log(self, message: str) -> None:
         """记录执行日志"""
         elapsed = time.monotonic() - self.start_time if self.start_time else 0

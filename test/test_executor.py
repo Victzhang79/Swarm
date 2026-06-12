@@ -20,7 +20,7 @@ from swarm.types import FileScope, SubTask, SubTaskDifficulty
 from swarm.worker.executor import WorkerExecutor
 
 
-def _executor(tmp_path, writable=None, readable=None):
+def _executor(tmp_path, writable=None, readable=None, create_files=None):
     st = SubTask(
         id="sub-1",
         description="测试子任务",
@@ -28,9 +28,21 @@ def _executor(tmp_path, writable=None, readable=None):
         scope=FileScope(
             writable=writable if writable is not None else ["a.py"],
             readable=readable if readable is not None else ["a.py"],
+            create_files=create_files if create_files is not None else [],
         ),
     )
     return WorkerExecutor(st, project_path=str(tmp_path), project_id="p1", task_id="t1")
+
+
+def test_normalize_create_files_existing_to_writable(tmp_path):
+    """[回归] scope.create_files 里【已存在】的文件归一化到 writable（防"给现有文件加内容"被当新建丢内容）。"""
+    (tmp_path / "exists.js").write_text("console.log(1)\n", encoding="utf-8")
+    ex = _executor(tmp_path, writable=[], readable=[], create_files=["exists.js", "new.js"])
+    # exists.js 本地存在 → 应移到 writable；new.js 不存在 → 仍是 create_files
+    assert "exists.js" in ex.effective_scope.writable, "已存在文件应降级为 writable"
+    assert "exists.js" not in ex.effective_scope.create_files
+    assert "new.js" in ex.effective_scope.create_files, "不存在文件仍是 create_files"
+    print("  ✅ [回归] create_files 已存在项归一化为 writable")
 
 
 # ── __init__ 初始化快照属性（修复回归保护）─────
