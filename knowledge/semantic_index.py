@@ -115,19 +115,19 @@ class SemanticIndexer:
 
     @staticmethod
     async def _default_embed(texts: list[str]) -> list[list[float]]:
-        """默认占位: 返回零向量。实际部署时替换为 bge-m3 模型调用。
+        """默认 embedding：优先专用 embed 服务，不可用回退零向量(告警)。
 
-        示例真实实现:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("BAAI/bge-m3")
-            embeddings = model.encode(texts, normalize_embeddings=True)
-            return embeddings.tolist()
+        这是检索期 query 向量化入口，必须接真服务，否则向量检索全零向量=关闭。
         """
+        from swarm.knowledge.embed_client import embed_texts_async
+        vecs = await embed_texts_async(texts)
+        if vecs is not None:
+            return vecs
         if not SemanticIndexer._placeholder_warned:
             SemanticIndexer._placeholder_warned = True
             logger.warning(
                 "⚠️  Using PLACEHOLDER zero-vector embedding in SemanticIndexer — "
-                "vector search is DISABLED! Replace with real bge-m3 model.",
+                "vector search is DISABLED! 配置 SWARM_KB_EMBED_BASE_URL 指向真 bge-m3 服务。",
                 stacklevel=2,
             )
         return [[0.0] * BGE_M3_DIMENSION for _ in texts]

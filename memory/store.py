@@ -198,12 +198,16 @@ class MemoryStore:
 
     @staticmethod
     async def _default_embed(texts: list[str]) -> list[list[float]]:
-        """默认占位: 返回零向量。实际部署时替换为 bge-m3"""
+        """默认 embedding：优先专用 embed 服务，不可用回退零向量(告警)。"""
+        from swarm.knowledge.embed_client import embed_texts_async
+        vecs = await embed_texts_async(texts)
+        if vecs is not None:
+            return vecs
         if not MemoryStore._placeholder_warned:
             MemoryStore._placeholder_warned = True
             logger.warning(
                 "⚠️  Using PLACEHOLDER zero-vector embedding in MemoryStore — "
-                "vector search is DISABLED! Replace with real bge-m3 model.",
+                "vector search is DISABLED! 配置 SWARM_KB_EMBED_BASE_URL 指向真 bge-m3 服务。",
                 stacklevel=2,
             )
         return [[0.0] * BGE_M3_DIMENSION for _ in texts]

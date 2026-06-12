@@ -904,9 +904,19 @@ def _build_embed_texts(symbols: list[dict[str, Any]]) -> list[str]:
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     """使用 bge-m3 嵌入文本列表
 
-    优先尝试使用 sentence-transformers，回退到 HTTP API 调用。
+    优先级：专用 embed 服务(SWARM_KB_EMBED_BASE_URL) → sentence-transformers →
+    本地 LLM 网关 → SiliconFlow。专用服务最稳(真 bge-m3,归一化向量)，放第一位。
     """
     dim = 1024  # bge-m3 维度
+
+    # 尝试 0: 专用 embedding 服务（统一客户端，OpenAI 兼容 /embeddings，ai.bit:8082）
+    try:
+        from swarm.knowledge.embed_client import embed_texts_sync
+        vecs = embed_texts_sync(texts)
+        if vecs is not None:
+            return vecs
+    except Exception as exc:
+        logger.warning("专用 embed 服务调用失败(回退): %s", exc)
 
     # 尝试 1: sentence-transformers
     try:

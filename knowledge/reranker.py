@@ -24,12 +24,7 @@ def rerank_documents(
         return documents[:top_k]
 
     cfg = get_config()
-    api_key = cfg.model.siliconflow_api_key or ""
-    base_url = (cfg.model.siliconflow_base_url or "").rstrip("/")
-    model = cfg.knowledge.reranker_model
-
-    if not api_key or not base_url:
-        return _fallback_sort(documents, top_k)
+    kcfg = cfg.knowledge
 
     texts = []
     for doc in documents:
@@ -37,6 +32,38 @@ def rerank_documents(
         if not t and doc.get("file_path"):
             t = f"{doc.get('file_path')} {doc.get('symbol_name', '')}"
         texts.append(str(t)[:2000])
+
+    # 优先：专用 reranker 服务（ai.bit:8081，schema: {query, texts} → [{index, score}]）
+    rerank_url = (getattr(kcfg, "rerank_url", "") or "").strip()
+    if rerank_url:
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(rerank_url, json={"query": query, "texts": texts})
+                resp.raise_for_status()
+                data = resp.json()
+                # 兼容两种返回：纯数组 [{index,score}] 或 {results:[...]}
+                items = data if isinstance(data, list) else (data.get("results") or data.get("data") or [])
+                out: list[dict[str, Any]] = []
+                for item in items:
+                    idx = item.get("index")
+                    if idx is None or int(idx) >= len(documents):
+                        continue
+                    doc = dict(documents[int(idx)])
+                    doc["rerank_score"] = item.get("score", item.get("relevance_score", 0.0))
+                    out.append(doc)
+                if out:
+                    out.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                    return out[:top_k]
+        except Exception as exc:
+            logger.warning("专用 rerank 服务失败(回退): %s", exc)
+
+    # 回退：SiliconFlow / OpenAI 兼容 /rerank
+    api_key = cfg.model.siliconflow_api_key or ""
+    base_url = (cfg.model.siliconflow_base_url or "").rstrip("/")
+    model = kcfg.reranker_model
+
+    if not api_key or not base_url:
+        return _fallback_sort(documents, top_k)
 
     try:
         with httpx.Client(timeout=30.0) as client:

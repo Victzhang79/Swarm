@@ -159,6 +159,12 @@ class KnowledgeConfig(BaseSettings):
 
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # 专用 embedding / reranker 服务端点（ai.bit 上独立部署，非 LLM 网关）。
+    # embed 走 OpenAI 兼容 /embeddings；rerank 走 {query, texts} → [{index, score}]。
+    # 留空则回退旧逻辑（sentence-transformers → local_base_url → SiliconFlow）。
+    embed_base_url: str = "http://ai.bit:8082/v1"
+    embed_api_key: str = ""
+    rerank_url: str = "http://ai.bit:8081/rerank"
     chunk_size: int = 512
     chunk_overlap: int = 50
     retrieval_top_k: int = 20
