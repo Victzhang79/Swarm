@@ -65,6 +65,9 @@ class ModelConfig(BaseSettings):
     worker_temperature: float = 0.2
     max_retries: int = 2
     timeout_seconds: int = 120
+    # 流式无 chunk 看门狗：两次 parsed chunk 间隔超此秒数即中断，触发 fallback。
+    # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
+    stream_chunk_timeout: float = 45.0
 
 
 class WorkerConfig(BaseSettings):

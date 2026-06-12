@@ -65,6 +65,8 @@ class SiliconFlowProvider:
             # streaming=True：取消/断连时 httpx 关闭流式连接，推理服务端(vLLM)
             # 检测到 client disconnect 即 abort 解码，释放 GPU；非流式则会跑完整段。
             streaming=True,
+            # 流式无 chunk 看门狗：远端 stall 时尽早中断 → fallback 更快接管。
+            stream_chunk_timeout=self.config.stream_chunk_timeout,
         )
 
 
@@ -86,6 +88,9 @@ class LocalProvider:
             max_retries=0,
             # streaming=True：取消时关闭连接 → vLLM abort 解码序列，立即释放显存。
             streaming=True,
+            # 流式无 chunk 看门狗：本地小模型(ai.bit 网关)偶发 stall(120s 无 chunk)，
+            # 调短到 45s 让 fallback 尽早接管，避免每次抖动卡满预算。
+            stream_chunk_timeout=self.config.stream_chunk_timeout,
         )
 
 
