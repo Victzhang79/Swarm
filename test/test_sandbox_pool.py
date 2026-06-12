@@ -582,6 +582,35 @@ def test_release_ttl_expired_does_not_pool():
     print("  ✅ [回归] release 超 TTL 沙箱直接 kill 不入池")
 
 
+def test_forget_borrowed_decrements_counter():
+    """[回归] forget 一个借出态沙箱：borrowed 计数回退，防 kill_by_task 后账本漂移泄漏。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sb = pool.acquire(project_id="p", task_id="t1")
+    assert pool.stats()["borrowed"] == 1
+    # 模拟 cancel_task / kill_by_task 外部直接 kill 了它，再通知池 forget
+    pool.forget(sb.sandbox_id)
+    assert pool.stats()["borrowed"] == 0, "forget 后 borrowed 应回退到 0"
+    assert sb.sandbox_id not in pool._created_at, "forget 应清 created_at"
+    print("  ✅ [回归] forget 借出态沙箱回退 borrowed 计数")
+
+
+def test_forget_idle_removes_from_pool():
+    """[回归] forget 一个 idle 池内沙箱：从池桶移除死引用，不误减 borrowed。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sb = pool.acquire("tpl-a")
+    pool.release(sb, reusable=True)  # 进 idle 池
+    assert pool.stats()["total_idle"] == 1
+    assert pool.stats()["borrowed"] == 0
+    # 外部 kill 了这个 idle 沙箱，通知池 forget
+    hit = pool.forget(sb.sandbox_id)
+    assert hit, "应命中 idle 池内沙箱"
+    assert pool.stats()["total_idle"] == 0, "forget 应从 idle 池移除"
+    assert pool.stats()["borrowed"] == 0, "idle 沙箱 forget 不应动 borrowed"
+    print("  ✅ [回归] forget idle 沙箱移除死引用、不误减 borrowed")
+
+
 def main():
     tests = [
         test_acquire_empty_creates_new,
@@ -610,6 +639,8 @@ def main():
         test_release_cleans_workspace_before_pooling,
         test_release_clean_failure_kills_instead_of_pooling,
         test_acquire_cleans_reused_sandbox,
+        test_forget_borrowed_decrements_counter,
+        test_forget_idle_removes_from_pool,
     ]
     passed = failed = 0
     for t in tests:

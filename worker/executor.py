@@ -1020,6 +1020,10 @@ class WorkerExecutor:
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
         output = self._parse_produce_result(produce_result, l1_passed, l1_details)
         self.phase = WorkerPhase.DONE
+        # 记录 L1 结果供 kill_sandbox 决定 reusable（脏沙箱不回池）。
+        # trivial 快速路径直接 return，不经过 run() 末尾的 _l1_passed_flag 赋值，
+        # 必须在此显式设置，否则 L1 失败的脏沙箱会以默认 reusable=True 回池污染。
+        self._l1_passed_flag = bool(getattr(output, "l1_passed", False))
         self._log(f"trivial 快速路径完成，置信度: {output.confidence.value}")
         return output
 

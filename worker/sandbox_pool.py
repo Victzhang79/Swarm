@@ -381,6 +381,38 @@ class HotSandboxPool:
             for sid in all_sids:
                 self._created_at.pop(sid, None)
 
+    def forget(self, sandbox_id: str, *, was_borrowed: bool | None = None) -> bool:
+        """从池账本中【剔除】一个 sid（外部已 kill，如 cancel_task / kill_by_task）。
+
+        解决泄漏：外部直接 kill 了沙箱却不告知池 → 池的 _pool 残留死引用、
+        _borrowed 计数永不回落（漂移到 max_total 后新沙箱全降级为临时，疯狂 churn）。
+        本方法把该 sid 从 idle 池移除、按需回退 borrowed 计数、清 _created_at。
+        返回是否命中（在池账本里找到并清理）。was_borrowed=None 时自动判断。
+        """
+        hit = False
+        with self._lock:
+            # 1) 从 idle 池各桶移除
+            in_idle = False
+            for key in list(self._pool.keys()):
+                bucket = self._pool[key]
+                kept = [e for e in bucket if e.sandbox.sandbox_id != sandbox_id]
+                if len(kept) != len(bucket):
+                    in_idle = True
+                    hit = True
+                if kept:
+                    self._pool[key] = kept
+                else:
+                    self._pool.pop(key, None)
+            # 2) borrowed 计数回退：若不在 idle 池里、且曾登记过 created_at，多半是借出态
+            known = sandbox_id in self._created_at
+            self._created_at.pop(sandbox_id, None)
+            self._temp_sids.discard(sandbox_id)
+            decr = was_borrowed if was_borrowed is not None else (known and not in_idle)
+            if decr and self._borrowed > 0:
+                self._borrowed -= 1
+                hit = True
+        return hit
+
     def stats(self) -> dict:
         """可观测指标快照。"""
         with self._lock:

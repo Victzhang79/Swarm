@@ -598,6 +598,8 @@ async def on_startup():
     await _start_kb_update_scheduler()
     await _start_consistency_scheduler()
     await _start_task_scheduler()
+    # 先清扫上一进程残留的孤儿沙箱，再启动池 reaper（顺序重要：清扫在池接管前）
+    _sweep_startup_orphans()
     _start_sandbox_pool_reaper()
     _warn_if_multiprocess()
     logger.info("Swarm API started")
@@ -613,6 +615,32 @@ def _start_sandbox_pool_reaper() -> None:
             logger.info("热沙箱池 reaper 已启动")
     except Exception as exc:
         logger.warning("Failed to start sandbox pool reaper: %s", exc)
+
+
+def _sweep_startup_orphans() -> None:
+    """启动时清扫上一进程残留的孤儿沙箱。
+
+    池是进程内内存态：上次进程若被 SIGKILL / 崩溃 / OOM（shutdown 钩子的 drain
+    没跑完或没跑），远端 pool/pool-idle 沙箱就成了无主孤儿，本进程 _sandbox_meta
+    为空认不得它们 → 永久泄漏烧资源。单进程模型下，启动这一刻远端任何存活沙箱
+    都必是上一轮的残留，安全清扫。失败静默（不阻断启动）。
+    """
+    try:
+        server_list = _fetch_sandbox_list_from_server()
+        sids = [sb.get("id") for sb in server_list if sb.get("id")]
+        if not sids:
+            return
+        manager = _get_sandbox_manager()
+        killed = 0
+        for sid in sids:
+            try:
+                manager.kill(sid)
+                killed += 1
+            except Exception:  # noqa: BLE001
+                logger.debug("启动清扫: kill %s 失败", sid, exc_info=True)
+        logger.info("启动清扫残留孤儿沙箱: 发现 %d, 清理 %d", len(sids), killed)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动孤儿清扫失败（不阻断）: %s", exc)
 
 
 def _warn_if_multiprocess():

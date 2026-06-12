@@ -261,15 +261,35 @@ def _orphan_sandbox_ids(manager, server_list=None) -> list[str]:
     判定为孤儿的条件（任一）：
     - 该 sandbox_id 在 _sandbox_meta 中无记录（API 重启后丢失追踪）
     - 记录存在但 project_id 与 task_id 均为空（无归属）
+
+    例外：热池 idle 沙箱（source=pool-idle，或当前在池 _pool 桶里）虽 project_id/
+    task_id 均空，但它【归热池所有、待复用】，不是孤儿——否则孤儿清理会误杀活池沙箱、
+    留下死引用。这类排除掉。
     """
     if server_list is None:
         server_list = _app._fetch_sandbox_list_from_server()
+    # 收集热池当前持有的 idle sid（启用时），这些不算孤儿
+    pooled_idle: set[str] = set()
+    try:
+        from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
+        if pool_enabled():
+            pool = get_sandbox_pool()
+            with pool._lock:  # noqa: SLF001
+                for bucket in pool._pool.values():  # noqa: SLF001
+                    for entry in bucket:
+                        pooled_idle.add(entry.sandbox.sandbox_id)
+    except Exception:  # noqa: BLE001
+        pass
     orphans: list[str] = []
     for sb in server_list:
         sid = sb.get("id")
         if not sid:
             continue
+        if sid in pooled_idle:
+            continue  # 活池沙箱，归池所有，待复用
         meta = manager.get_sandbox_meta(sid)
+        if meta and meta.get("source") == "pool-idle":
+            continue  # 池 idle 标记，归池所有（reaper 按 TTL 回收）
         if not meta:
             orphans.append(sid)
             continue

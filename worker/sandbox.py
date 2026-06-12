@@ -262,9 +262,27 @@ class SandboxManager:
         sids = self.sandboxes_for_task(task_id)
         for sid in sids:
             self.kill(sid)
+        # 同步通知热池剔除这些 sid，回退 borrowed 计数、清死引用，防账本漂移泄漏。
+        self._pool_forget(sids)
         if sids:
             logger.info("kill_by_task: 任务 %s 释放 %d 个沙箱", task_id, len(sids))
         return len(sids)
+
+    @staticmethod
+    def _pool_forget(sids) -> None:
+        """若热池启用，把这些 sid 从池账本剔除（外部已 kill）。无池/异常静默。"""
+        if not sids:
+            return
+        try:
+            from swarm.worker.sandbox_pool import pool_enabled
+            if not pool_enabled():
+                return
+            from swarm.worker.sandbox_pool import get_sandbox_pool
+            pool = get_sandbox_pool()
+            for sid in sids:
+                pool.forget(sid)
+        except Exception:  # noqa: BLE001
+            logger.debug("pool.forget 通知失败（不影响 kill）", exc_info=True)
 
     def unregister_sandbox_meta(self, sandbox_id: str) -> None:
         self._sandbox_meta.pop(sandbox_id, None)
