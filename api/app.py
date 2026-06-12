@@ -699,11 +699,15 @@ async def on_shutdown():
 
 
 async def _start_kb_update_scheduler() -> None:
-    """PG kb_update_events 队列后台消费（P0）。"""
+    """PG kb_update_events 队列后台消费（P0）+ 周期全量重预处理（opt-in）。"""
     try:
-        from swarm.knowledge.scheduler import start_kb_update_scheduler
+        from swarm.knowledge.scheduler import (
+            start_kb_update_scheduler,
+            start_preprocess_refresh_scheduler,
+        )
 
         await start_kb_update_scheduler(interval_seconds=5)
+        await start_preprocess_refresh_scheduler()
     except Exception as exc:
         logger.warning("Failed to start KB update scheduler: %s", exc)
 

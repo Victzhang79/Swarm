@@ -66,3 +66,79 @@ async def shutdown_kb_scheduler() -> None:
         await _updater.close()
         _updater = None
     _polling_started = False
+
+
+# ── 周期全量重预处理调度 ────────────────────────────────
+_reprocess_started = False
+
+
+def _is_stale(progress: dict | None, max_age_hours: float) -> bool:
+    """项目预处理是否已过期（completed_at 早于 max_age_hours 前）。"""
+    from datetime import datetime, timezone
+    if not progress:
+        return True  # 从无预处理记录 → 视为需要
+    if (progress.get("phase") or "").lower() != "complete":
+        return False  # 正在跑/失败的不碰（避免叠加）
+    completed = progress.get("completed_at")
+    if completed is None:
+        return True
+    if isinstance(completed, str):
+        try:
+            completed = datetime.fromisoformat(completed)
+        except ValueError:
+            return True
+    now = datetime.now(timezone.utc)
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    age_hours = (now - completed).total_seconds() / 3600.0
+    return age_hours >= max_age_hours
+
+
+async def start_preprocess_refresh_scheduler() -> None:
+    """周期检查 stale 项目并触发全量重预处理（兜底增量更新的遗漏/漂移）。
+
+    opt-in：SWARM_KB_AUTO_REPROCESS_HOURS>0 才启用。串行触发（一次只重跑一个，
+    避免同时重跑多个项目打爆 embedding/索引）。
+    """
+    global _reprocess_started
+    if _reprocess_started:
+        return
+
+    from swarm.config.settings import get_config
+    cfg = get_config()
+    max_age = float(getattr(cfg.knowledge, "auto_reprocess_hours", 0.0) or 0.0)
+    if max_age <= 0:
+        logger.info("[ReprocessScheduler] 未启用（auto_reprocess_hours=0）")
+        return
+
+    interval = int(getattr(cfg.knowledge, "auto_reprocess_check_interval", 1800) or 1800)
+    _reprocess_started = True
+
+    async def _loop() -> None:
+        import asyncio as _aio
+
+        from swarm.project import store as _store
+        from swarm.project.preprocess import preprocess_project
+        while True:
+            try:
+                loop = _aio.get_running_loop()
+                projects = await loop.run_in_executor(None, _store.list_projects)
+                for proj in projects or []:
+                    pid = proj.get("id") or proj.get("project_id")
+                    ppath = proj.get("path") or proj.get("repo_path")
+                    if not pid or not ppath:
+                        continue
+                    progress = await loop.run_in_executor(None, _store.get_progress, pid)
+                    if not _is_stale(progress, max_age):
+                        continue
+                    logger.info("[ReprocessScheduler] 项目 %s 已 stale(>%.1fh)，触发全量重预处理", pid, max_age)
+                    try:
+                        await preprocess_project(pid, ppath)  # 串行，跑完再下一个
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("[ReprocessScheduler] 重预处理 %s 失败: %s", pid, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[ReprocessScheduler] loop error: %s", exc)
+            await _aio.sleep(interval)
+
+    asyncio.create_task(_loop())
+    logger.info("[ReprocessScheduler] started (stale>%.1fh, check every %ds)", max_age, interval)

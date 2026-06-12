@@ -176,6 +176,10 @@ class KnowledgeConfig(BaseSettings):
     priority_file_top_k: int = 3         # priority 文件内每个取几条
     max_priority_files: int = 5          # 最多在几个 priority 文件内细检索
     hybrid_bm25_weight: float = 0.3      # 混合检索 BM25 权重（0=纯向量，1=纯关键词）
+    # 周期全量重预处理（增量更新由 KBScheduler 处理；这里是兜底全量刷新）
+    # 0 = 关闭（默认，仅靠增量 + 手动触发）；>0 = 每 N 小时检查一次 stale 项目并重跑。
+    auto_reprocess_hours: float = 0.0
+    auto_reprocess_check_interval: int = 1800   # 调度器检查间隔（秒，默认 30 分钟）
     index_update_timeout: int = 30    # 秒
 
 
