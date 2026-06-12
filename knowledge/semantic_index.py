@@ -281,17 +281,22 @@ class SemanticIndexer:
         query: str,
         top_k: int | None = None,
         filter_dict: dict[str, Any] | None = None,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """语义搜索: query → 向量 → Qdrant search
+
+        query_vector: 预先算好的查询向量。传入则跳过 embedding（避免同一 query
+        在多次 search 中重复向量化，省 LAN 往返）。
 
         返回格式: [{id, score, payload}, ...]
         """
         client = self._client_or_raise()
         top_k = top_k or self._kb_config.retrieval_top_k
 
-        # 向量化 query
-        query_vectors = await self._embed_fn([query])
-        query_vector = query_vectors[0]
+        # 向量化 query（已传入向量则复用，不重复调远端 embed）
+        if query_vector is None:
+            query_vectors = await self._embed_fn([query])
+            query_vector = query_vectors[0]
 
         # 构造过滤条件
         must_filters = [
@@ -354,18 +359,20 @@ class SemanticIndexer:
         query: str,
         retrieval_top_k: int | None = None,
         rerank_top_k: int | None = None,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """语义搜索 + 简单分数重排
 
         使用 Qdrant 的 prefetch + rerank API（若可用）,
         否则先多取再按 Qdrant 原始分数降序截断。
+        query_vector: 预算向量复用（避免重复 embed）。
         """
         retrieval_top_k = retrieval_top_k or self._kb_config.retrieval_top_k
         rerank_top_k = rerank_top_k or self._kb_config.rerank_top_k
 
         # 先多取
         candidates = await self.search(
-            project_id, query, top_k=retrieval_top_k
+            project_id, query, top_k=retrieval_top_k, query_vector=query_vector
         )
 
         import asyncio

@@ -169,6 +169,13 @@ class KnowledgeConfig(BaseSettings):
     chunk_overlap: int = 50
     retrieval_top_k: int = 20
     rerank_top_k: int = 5
+    # 检索调优（局域网 embed/rerank 服务，调用便宜但仍按需控量）
+    embed_batch_size: int = 32           # 服务端 batch 上限（bge-m3=32），分批避 422
+    rerank_score_threshold: float = 0.0  # rerank 分数低于此值的结果丢弃（0=不过滤）
+    semantic_score_threshold: float = 0.0  # 向量相似度低于此值丢弃（0=不过滤）
+    priority_file_top_k: int = 3         # priority 文件内每个取几条
+    max_priority_files: int = 5          # 最多在几个 priority 文件内细检索
+    hybrid_bm25_weight: float = 0.3      # 混合检索 BM25 权重（0=纯向量，1=纯关键词）
     index_update_timeout: int = 30    # 秒
 
 

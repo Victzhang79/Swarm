@@ -53,6 +53,11 @@ def rerank_documents(
                     out.append(doc)
                 if out:
                     out.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                    thr = getattr(kcfg, "rerank_score_threshold", 0.0) or 0.0
+                    if thr > 0:
+                        filtered = [d for d in out if d.get("rerank_score", 0.0) >= thr]
+                        # 阈值过滤后若全空，保留 top1 兜底（宁缺毋滥但别全丢）
+                        out = filtered or out[:1]
                     return out[:top_k]
         except Exception as exc:
             logger.warning("专用 rerank 服务失败(回退): %s", exc)

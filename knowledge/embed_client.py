@@ -14,15 +14,16 @@ logger = logging.getLogger(__name__)
 _MAX_BATCH = 32
 
 
-def _endpoint() -> tuple[str, str, str] | None:
-    """返回 (base_url, api_key, model) 或 None（未配置）。"""
+def _endpoint() -> tuple[str, str, str, int] | None:
+    """返回 (base_url, api_key, model, batch_size) 或 None（未配置）。"""
     try:
         from swarm.config.settings import KnowledgeConfig
         kcfg = KnowledgeConfig()
         base = (kcfg.embed_base_url or "").strip().rstrip("/")
         if not base:
             return None
-        return base, (kcfg.embed_api_key or ""), kcfg.embedding_model
+        batch = getattr(kcfg, "embed_batch_size", 32) or 32
+        return base, (kcfg.embed_api_key or ""), kcfg.embedding_model, int(batch)
     except Exception:  # noqa: BLE001
         return None
 
@@ -32,15 +33,15 @@ def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:
     ep = _endpoint()
     if not ep:
         return None
-    base, api_key, model = ep
+    base, api_key, model, max_batch = ep
     try:
         import requests
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         out: list[list[float]] = []
-        for i in range(0, len(texts), _MAX_BATCH):
-            batch = texts[i: i + _MAX_BATCH]
+        for i in range(0, len(texts), max_batch):
+            batch = texts[i: i + max_batch]
             resp = requests.post(
                 f"{base}/embeddings",
                 json={"model": model, "input": batch},
@@ -66,7 +67,7 @@ async def embed_texts_async(texts: list[str]) -> list[list[float]] | None:
     ep = _endpoint()
     if not ep:
         return None
-    base, api_key, model = ep
+    base, api_key, model, max_batch = ep
     try:
         import httpx
         headers = {"Content-Type": "application/json"}
@@ -74,8 +75,8 @@ async def embed_texts_async(texts: list[str]) -> list[list[float]] | None:
             headers["Authorization"] = f"Bearer {api_key}"
         out: list[list[float]] = []
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for i in range(0, len(texts), _MAX_BATCH):
-                batch = texts[i: i + _MAX_BATCH]
+            for i in range(0, len(texts), max_batch):
+                batch = texts[i: i + max_batch]
                 resp = await client.post(
                     f"{base}/embeddings",
                     json={"model": model, "input": batch},

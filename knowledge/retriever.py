@@ -362,15 +362,28 @@ class SwarmRetriever:
         if not self._semantic:
             return []
 
+        # 同一 query 向量化【一次】，复用到所有 search（priority 各文件 + 全局）。
+        # 此前每个 priority_file + 全局各 embed 一次(最多 6 次相同 query)，纯浪费 LAN 往返。
+        query_vector = None
+        try:
+            vecs = await self._semantic._embed_fn([query])  # noqa: SLF001
+            if vecs:
+                query_vector = vecs[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("query 预向量化失败(降级为各自 embed): %s", exc)
+
         # 在指定文件中优先检索(若 Layer A 有结果)
         results: list[dict[str, Any]] = []
 
         if priority_files:
-            for fp in priority_files[:5]:
+            max_pf = getattr(self._kb_config, "max_priority_files", 5)
+            pf_top_k = getattr(self._kb_config, "priority_file_top_k", 3)
+            for fp in priority_files[:max_pf]:
                 file_results = await self._semantic.search(
                     project_id, query,
-                    top_k=3,
+                    top_k=pf_top_k,
                     filter_dict={"file_path": fp},
+                    query_vector=query_vector,
                 )
                 results.extend(file_results)
 
@@ -379,6 +392,7 @@ class SwarmRetriever:
             project_id, query,
             retrieval_top_k=self._kb_config.retrieval_top_k,
             rerank_top_k=self._kb_config.rerank_top_k,
+            query_vector=query_vector,
         )
         results.extend(global_results)
 
