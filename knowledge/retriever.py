@@ -180,7 +180,7 @@ class SwarmRetriever:
         # ── Layer B: 语义扩展 ──────────────────
         try:
             semantic_results = await self._retrieve_layer_b(
-                project_id, task_desc, located_files
+                project_id, task_desc, located_files, keywords=keywords
             )
             context["semantic"] = semantic_results
             stats["semantic_count"] = len(semantic_results)
@@ -357,8 +357,9 @@ class SwarmRetriever:
     async def _retrieve_layer_b(
         self, project_id: str, query: str,
         priority_files: list[str] | None = None,
+        keywords: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Layer B: 语义扩展检索"""
+        """Layer B: 语义扩展检索（向量 + BM25 混合）"""
         if not self._semantic:
             return []
 
@@ -393,6 +394,7 @@ class SwarmRetriever:
             retrieval_top_k=self._kb_config.retrieval_top_k,
             rerank_top_k=self._kb_config.rerank_top_k,
             query_vector=query_vector,
+            query_terms=keywords,
         )
         results.extend(global_results)
 

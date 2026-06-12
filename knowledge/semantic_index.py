@@ -360,20 +360,32 @@ class SemanticIndexer:
         retrieval_top_k: int | None = None,
         rerank_top_k: int | None = None,
         query_vector: list[float] | None = None,
+        query_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """语义搜索 + 简单分数重排
+        """语义搜索 + (可选)BM25 混合融合 + rerank 精排
 
-        使用 Qdrant 的 prefetch + rerank API（若可用）,
-        否则先多取再按 Qdrant 原始分数降序截断。
-        query_vector: 预算向量复用（避免重复 embed）。
+        流程：向量召回 retrieval_top_k 候选 → 若 query_terms 提供且 bm25_weight>0
+        则 hybrid 融合重排 → reranker 取 rerank_top_k。
+        query_vector: 预算向量复用；query_terms: 关键词(英文+中文2gram)用于 BM25。
         """
         retrieval_top_k = retrieval_top_k or self._kb_config.retrieval_top_k
         rerank_top_k = rerank_top_k or self._kb_config.rerank_top_k
 
-        # 先多取
+        # 先多取（向量召回）
         candidates = await self.search(
             project_id, query, top_k=retrieval_top_k, query_vector=query_vector
         )
+
+        # BM25 混合融合（召回后重打分，零额外远端调用）
+        bm25_w = getattr(self._kb_config, "hybrid_bm25_weight", 0.0) or 0.0
+        if query_terms and bm25_w > 0 and candidates:
+            try:
+                from swarm.knowledge.hybrid import hybrid_fuse
+                candidates = hybrid_fuse(
+                    candidates, query_terms, bm25_weight=bm25_w, text_key="content"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("hybrid 融合失败(降级纯向量): %s", exc)
 
         import asyncio
 
