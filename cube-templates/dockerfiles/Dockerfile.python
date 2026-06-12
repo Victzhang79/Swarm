@@ -1,0 +1,17 @@
+# Python 依赖预热模板 — Python 3.11 + 预热 pip cache / site-packages
+FROM ghcr.io/tencentcloud/cubesandbox-base:2026.16
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# pip 用清华镜像加速（构建期）
+RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 预热：装常用库进 site-packages（沙箱克隆后 import 即用，无需 pip install）
+COPY warmup/requirements.txt /opt/warmup/requirements.txt
+RUN pip3 install --no-cache-dir -r /opt/warmup/requirements.txt || true
+
+RUN python3 --version && pip3 --version || true

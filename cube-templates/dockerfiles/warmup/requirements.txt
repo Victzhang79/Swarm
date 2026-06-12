@@ -1,0 +1,15 @@
+# 预热常用 Python 库（沙箱克隆后免 pip install）。按需增删。
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+requests
+httpx
+sqlalchemy
+psycopg2-binary
+pandas
+numpy
+pytest
+ruff
+python-dotenv
+pyyaml

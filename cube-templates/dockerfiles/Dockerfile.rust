@@ -1,0 +1,24 @@
+# Rust 依赖预热模板 — Rust stable + 预热 cargo registry/cache
+FROM ghcr.io/tencentcloud/cubesandbox-base:2026.16
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 装 Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CARGO_HOME=/root/.cargo
+
+# 国内源加速（构建期）
+RUN mkdir -p /root/.cargo \
+    && printf '[source.crates-io]\nreplace-with = "rsproxy"\n[source.rsproxy]\nregistry = "https://rsproxy.cn/crates.io-index"\n' > /root/.cargo/config.toml
+
+# 预热：用 warmup Cargo.toml 拉取常用 crate 进 cargo cache
+COPY warmup/Cargo.toml /opt/warmup/Cargo.toml
+RUN cd /opt/warmup && mkdir -p src && echo 'fn main(){}' > src/main.rs \
+    && (cargo fetch || true) && (cargo build || true) \
+    && rm -rf target
+
+RUN rustc --version && cargo --version || true

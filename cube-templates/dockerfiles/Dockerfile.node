@@ -1,0 +1,19 @@
+# Node 依赖预热模板 — Node 20 + 预热 node_modules / npm cache
+FROM ghcr.io/tencentcloud/cubesandbox-base:2026.16
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# npm 用淘宝镜像加速（构建期）
+RUN npm config set registry https://registry.npmmirror.com
+
+# 预热：装一份常用依赖填充 npm cache + 一个全局 node_modules 供复用
+COPY warmup/package.json /opt/warmup/package.json
+RUN cd /opt/warmup \
+    && (npm install --no-audit --no-fund || true)
+
+RUN node -v && npm -v || true
