@@ -61,6 +61,24 @@ def test_parse_garbage_returns_empty():
     print("  ✅ 垃圾输入返回空")
 
 
+def test_parse_salvages_truncated_array():
+    """数组被 max_tokens 截断(无收尾 ])→逐对象 salvage。"""
+    raw = '[{"title":"A","tag":"naming","content":"a"},{"title":"B","tag":"utility","content":"b"},{"title":"C","content":"截断'
+    norms = _parse_norms_json(raw)
+    assert len(norms) == 2, "应 salvage 出 2 个完整对象(第3个被截断丢弃)"
+    print("  ✅ 截断数组逐对象 salvage")
+
+
+def test_parse_capital_keys():
+    """模型输出首字母大写键名 Title/Content。"""
+    raw = '[{"Title":"工具类","Tag":"utility","Content":"复用 StringUtils","Priority":5}]'
+    norms = _parse_norms_json(raw)
+    assert len(norms) == 1
+    assert norms[0].title == "工具类"
+    assert norms[0].tag == "utility"
+    print("  ✅ 大写键名解析")
+
+
 def test_parse_skips_incomplete_items():
     raw = '[{"title":"有","content":"内容"},{"title":"","content":"无标题"},{"content":"无标题2"}]'
     norms = _parse_norms_json(raw)
@@ -97,6 +115,8 @@ def main():
         test_parse_invalid_tag_falls_back_general,
         test_parse_strips_think_block,
         test_parse_garbage_returns_empty,
+        test_parse_salvages_truncated_array,
+        test_parse_capital_keys,
         test_parse_skips_incomplete_items,
         test_pick_sample_files_filters,
         test_infer_empty_project_returns_empty,
