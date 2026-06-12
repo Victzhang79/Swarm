@@ -299,11 +299,14 @@ class SandboxManager:
         code: str = "",
         error: str | None = None,
     ) -> None:
-        """记录沙箱活动（Worker 日志 / run_code 输出），供 UI 精确展示。"""
+        """记录沙箱活动（Worker 日志 / run_code 输出），供 UI 精确展示。
+
+        同时写一份到持久化 JSONL 文件（~/.swarm/sandbox_logs/<sid>.jsonl），
+        进程重启后仍可追溯（内存态会随重启清空）。失败静默不阻断主流程。
+        """
         from datetime import datetime, timezone
 
-        entries = self._sandbox_activity.setdefault(sandbox_id, [])
-        entries.append({
+        entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "kind": kind,
             "message": message,
@@ -311,13 +314,57 @@ class SandboxManager:
             "stderr": stderr[:8000] if stderr else "",
             "code": code[:2000] if code else "",
             "error": error or "",
-        })
+        }
+        entries = self._sandbox_activity.setdefault(sandbox_id, [])
+        entries.append(entry)
         if len(entries) > 500:
             del entries[:-500]
+        # 持久化（追加写 JSONL，便于重启后/事后 grep 追查）
+        self._persist_activity(sandbox_id, entry)
+
+    @staticmethod
+    def _activity_log_dir():
+        from pathlib import Path
+        d = Path.home() / ".swarm" / "sandbox_logs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _persist_activity(self, sandbox_id: str, entry: dict) -> None:
+        """把单条活动追加到 ~/.swarm/sandbox_logs/<sid>.jsonl。失败静默。"""
+        try:
+            import json as _json
+            fp = self._activity_log_dir() / f"{sandbox_id}.jsonl"
+            with open(fp, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.debug("沙箱活动持久化失败（不阻断）: %s", sandbox_id, exc_info=True)
 
     def get_activity(self, sandbox_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        entries = self._sandbox_activity.get(sandbox_id, [])
-        return entries[-limit:] if limit else list(entries)
+        entries = self._sandbox_activity.get(sandbox_id)
+        if entries:
+            return entries[-limit:] if limit else list(entries)
+        # 内存里没有（如进程重启后）→ 从持久化 JSONL 读回
+        return self._load_persisted_activity(sandbox_id, limit)
+
+    def _load_persisted_activity(self, sandbox_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """从 JSONL 文件读回活动（内存态丢失时的兜底）。失败返回空。"""
+        try:
+            import json as _json
+            fp = self._activity_log_dir() / f"{sandbox_id}.jsonl"
+            if not fp.is_file():
+                return []
+            out: list[dict[str, Any]] = []
+            with open(fp, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            out.append(_json.loads(line))
+                        except Exception:  # noqa: BLE001
+                            continue
+            return out[-limit:] if limit else out
+        except Exception:  # noqa: BLE001
+            return []
 
     def _setup_env(self) -> None:
         """设置环境变量（必须在 import Sandbox / setup_dev_sidecar 之前）"""

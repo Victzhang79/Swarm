@@ -9,25 +9,26 @@
 
 ## P1 — 影响正确性/可靠性
 
-### 1. 本地模型流式 stall 韧性不足
+> ✅ 本节 3 项已于 2026-06 全部根治，见文末「已根治」。原文留作记录。
+
+### 1. 本地模型流式 stall 韧性不足 ✅ 已修
 - **现象**：`Qwen3.6-27B` / `MiniMax-M2.7-Pro`（ai.bit:3000 网关）偶发流式中断
   —— `No streaming chunk received for 120.0s (chunks_received=N)`，TCP 活着但不再产出。
 - **影响**：worker 一轮 ReAct 卡 120s 才超时，拖慢任务；虽有 fallback 但接管慢。
-- **建议**：把 langchain_openai 的 `stream_chunk_timeout` 调短（如 45s）让 fallback
-  更快接管；或在 router 层加“首 token / chunk 间隔”双超时。属远端推理服务可靠性问题，
-  我方只能增强容错（适配，不强求远端重建）。
+- **修复**：`ModelConfig.stream_chunk_timeout`（默认 45s）配置化，两个 provider 都传给
+  ChatOpenAI，远端 stall 时尽早中断 → with_fallbacks 更快接管。
 
-### 2. 沙箱活动日志不持久
+### 2. 沙箱活动日志不持久 ✅ 已修
 - **现象**：`/api/sandbox/{id}/logs` 的活动日志存在 manager 内存，进程重启即清空。
 - **影响**：事后追查沙箱行为（如调试某次失败）时无据可查，只能靠 swarm.log。
-- **建议**：把 sandbox 活动日志落库（store.py 加表）或写专用日志文件，按 task_id 可检索。
+- **修复**：`append_activity` 写穿到 `~/.swarm/sandbox_logs/<sid>.jsonl`（追加写、不碰
+  DB 热路径）；`get_activity` 内存缺失时从 JSONL 读回。重启/kill 后仍可追溯。
 
-### 3. harness 把已存在文件误判为 create_files
-- **现象**：E2E 用例2（给已存在的 ruoyi.js 加函数）被 Brain 规划进 `scope.create_files`，
-  而非 `writable`。
-- **影响**：create_files 不上传不读取（按“新建”处理），对“给现有文件追加内容”语义错误；
-  靠 worker 容错才没出事。
-- **建议**：Brain 规划阶段对 create_files 逐个校验本地是否已存在，存在则降级为 writable。
+### 3. harness 把已存在文件误判为 create_files ✅ 已修
+- **现象**：E2E 用例2（给已存在的 ruoyi.js 加函数）被 Brain 规划进 `scope.create_files`。
+- **影响**：create_files 不上传不读取（按"新建"处理），对"给现有文件追加内容"语义错误。
+- **修复**：WorkerExecutor 启动即 `_normalize_scope_create_files`：本地已存在的
+  create_files 项降级为 writable。幂等、无副作用。
 
 ---
 
