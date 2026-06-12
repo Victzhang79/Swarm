@@ -131,6 +131,16 @@ def _parse_norms_json(raw: str) -> list[Norm]:
     if not raw:
         return []
     text = raw.strip()
+    # 剥掉推理模型的 <think>...</think> 块（MiniMax/Qwen 等会先输出思考再给 JSON）
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # 未闭合的 <think>（被 max_tokens 截断）：取最后一个 </think> 之后，或丢弃 think 起始
+    if "<think>" in text.lower():
+        idx = text.lower().rfind("</think>")
+        if idx != -1:
+            text = text[idx + len("</think>"):]
+        else:
+            text = text[: text.lower().find("<think>")]
+    text = text.strip()
     # 剥 ```json ... ```
     m = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     if m:
@@ -151,15 +161,17 @@ def _parse_norms_json(raw: str) -> list[Norm]:
     for item in arr:
         if not isinstance(item, dict):
             continue
-        title = str(item.get("title") or "").strip()
-        content = str(item.get("content") or "").strip()
+        # 大小写不敏感取键（模型有时输出 "Title"/"Content" 等）
+        low = {str(k).lower(): v for k, v in item.items()}
+        title = str(low.get("title") or low.get("name") or "").strip()
+        content = str(low.get("content") or low.get("description") or low.get("desc") or "").strip()
         if not title or not content:
             continue
-        tag = str(item.get("tag") or "general").strip()
+        tag = str(low.get("tag") or low.get("category") or "general").strip().lower()
         if tag not in valid_tags:
             tag = "general"
         try:
-            priority = int(item.get("priority", 2))
+            priority = int(low.get("priority", 2))
         except (TypeError, ValueError):
             priority = 2
         priority = max(0, min(priority, 5))
@@ -195,7 +207,7 @@ def _call_llm(project_name: str, samples: str) -> str:
                 model=model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=2000,
+                max_tokens=4000,
             )
             content = resp.choices[0].message.content or ""
             if content.strip():

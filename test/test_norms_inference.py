@@ -45,6 +45,15 @@ def test_parse_invalid_tag_falls_back_general():
     print("  ✅ 非法 tag 回退 general")
 
 
+def test_parse_strips_think_block():
+    """推理模型先输出 <think>...</think> 再给 JSON（MiniMax/Qwen）。"""
+    raw = '<think>让我分析一下\n包名 com.ruoyi...\n</think>\n[{"title":"Impl后缀","tag":"naming","content":"实现类用 Impl 后缀"}]'
+    norms = _parse_norms_json(raw)
+    assert len(norms) == 1, "应剥掉 think 块后解析出 JSON"
+    assert norms[0].title == "Impl后缀"
+    print("  ✅ 剥离 <think> 块后解析")
+
+
 def test_parse_garbage_returns_empty():
     assert _parse_norms_json("完全不是 JSON") == []
     assert _parse_norms_json("") == []
@@ -86,6 +95,7 @@ def main():
         test_parse_plain_json_array,
         test_parse_with_code_fence,
         test_parse_invalid_tag_falls_back_general,
+        test_parse_strips_think_block,
         test_parse_garbage_returns_empty,
         test_parse_skips_incomplete_items,
         test_pick_sample_files_filters,
