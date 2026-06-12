@@ -922,9 +922,9 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     # 尝试 2: HTTP API (本地 embedding 服务) —— 用配置的 local_base_url(不再硬编码 localhost)
     try:
         import requests
-        from swarm.config.settings import DatabaseConfig, ModelConfig
+        from swarm.config.settings import KnowledgeConfig, ModelConfig
         mcfg = ModelConfig()
-        emb_model = DatabaseConfig().embedding_model
+        emb_model = KnowledgeConfig().embedding_model
         base = mcfg.local_base_url.rstrip("/")
         headers = {}
         if mcfg.local_api_key:
@@ -944,9 +944,9 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     # 尝试 3: OpenAI-compatible API —— 同样用配置端点
     try:
         from openai import OpenAI
-        from swarm.config.settings import DatabaseConfig, ModelConfig
+        from swarm.config.settings import KnowledgeConfig, ModelConfig
         mcfg = ModelConfig()
-        emb_model = DatabaseConfig().embedding_model
+        emb_model = KnowledgeConfig().embedding_model
         client = OpenAI(base_url=mcfg.local_base_url, api_key=mcfg.local_api_key or "dummy")
         response = client.embeddings.create(model=emb_model, input=texts)
         return [d.embedding for d in response.data]
