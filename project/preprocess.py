@@ -568,22 +568,46 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
         from swarm.knowledge.norms_extractor import extract_norms_from_project
         norms = await asyncio.to_thread(extract_norms_from_project, project_path)
 
-        if not norms:
-            logger.info("No auto norms extracted for project %s", project_id)
+        # Phase 1.6: 从【实际代码】推断工程惯例（资深工程师读代码），补 config 提取的不足。
+        # 老项目无 .editorconfig/.ruff.toml 时 config 提取=0，inferred 是主要来源。
+        inferred: list = []
+        try:
+            from swarm.knowledge.norms_inference import infer_norms_from_code
+            proj_name = ""
+            try:
+                from swarm.project import store as _pstore
+                p = _pstore.get_project(project_id)
+                proj_name = (p or {}).get("name", "") if p else ""
+            except Exception:  # noqa: BLE001
+                pass
+            inferred = await asyncio.to_thread(infer_norms_from_code, project_path, proj_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("norms 代码推断失败(不阻断) %s: %s", project_id, exc)
+
+        if not norms and not inferred:
+            logger.info("No norms (config or inferred) for project %s", project_id)
             return
 
-        # 写入 NormsStore — 先删旧 auto 规范再插（幂等）
+        # 写入 NormsStore — config 提取的标 'auto'，代码推断的标 'inferred'，各自幂等替换
         from swarm.config.settings import DatabaseConfig
         from swarm.knowledge.norms_store import NormsStore
 
         store = NormsStore(DatabaseConfig())
         await store.connect()
         try:
-            deleted = await store.delete_norms_by_tag(project_id, "auto")
-            if deleted:
-                logger.info("Cleared %d old auto norms for project %s", deleted, project_id)
-            ids = await store.add_norms_batch(project_id, norms)
-            logger.info("Inserted %d auto norms for project %s", len(ids), project_id)
+            if norms:
+                deleted = await store.delete_norms_by_tag(project_id, "auto")
+                if deleted:
+                    logger.info("Cleared %d old auto norms for project %s", deleted, project_id)
+                ids = await store.add_norms_batch(project_id, norms)
+                logger.info("Inserted %d auto(config) norms for project %s", len(ids), project_id)
+            if inferred:
+                deleted_inf = await store.delete_norms_by_tag(project_id, "inferred")
+                if deleted_inf:
+                    logger.info("Cleared %d old inferred norms for project %s", deleted_inf, project_id)
+                # add_norms_batch 用各 Norm 自身的 tag（这里是 'inferred'），不被覆盖
+                inf_ids = await store.add_norms_batch(project_id, inferred)
+                logger.info("Inserted %d inferred(code) norms for project %s", len(inf_ids), project_id)
         finally:
             await store.close()
 
