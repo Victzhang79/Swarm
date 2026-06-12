@@ -34,18 +34,16 @@
 
 ## P1(新增) — 语义检索因无嵌入服务而退化
 
-### 7. 无可用 embedding 服务 → 语义检索退化为随机向量
-- **现象**：`_embed_texts` 三级回退（sentence-transformers → 本地 HTTP → SiliconFlow）
-  全不可用：本机未装 sentence-transformers(需下载 bge-m3 ~2GB)；`ai.bit:3000` 是 LLM
-  网关、不提供 `/embeddings`(返回 Internal Server Error)；最终落到【随机向量】。
-- **影响**：Layer B 语义检索（semantic）实际是噪声，worker/Brain 拿到的"相关代码"
-  并不相关 → 知识注入的 semantic 部分质量差(struct/norms 不受影响,它们走 SQL/关键词)。
-- **建议（需用户决策）**：三选一 —
-  (a) 本机 `pip install sentence-transformers` 并下载 bge-m3（离线、~2GB、首次慢）；
-  (b) 起一个专用 embedding 服务(如 vLLM/TEI 跑 bge-m3)，新增 `SWARM_KB_EMBED_BASE_URL`
-      配置项指向它；
-  (c) 用 SiliconFlow 的 embedding API(云端，需 key + 联网)。
-  代码侧已就绪（端点可配、模型名走 KnowledgeConfig.embedding_model），只差一个真服务。
+### 7. 无可用 embedding 服务 → 语义检索退化为随机向量 ✅ 已修
+- **现象**：`_embed_texts` 三级回退全不可用 → 落到随机向量；query 端 SemanticIndexer/
+  MemoryStore 用零向量占位 → 语义检索是噪声。
+- **修复（2026-06，用户提供专用服务）**：接入 ai.bit:8082/v1(bge-m3 embedding,OpenAI
+  兼容) + ai.bit:8081/rerank(bge-reranker-v2-m3, {query,texts}→[{index,score}])。
+  新增 `knowledge/embed_client.py` 统一客户端(sync+async,按 batch≤32 分批避 422)；
+  SemanticIndexer/MemoryStore/preprocess/reranker 全切真服务。配置 `SWARM_KB_EMBED_
+  BASE_URL`/`SWARM_KB_RERANK_URL`(默认指向 ai.bit)。实测：预处理 3525 符号真向量入
+  Qdrant(无 422/无随机回退)；检索"字符串判空"→StringUtils 0.61、"日期格式化"→
+  DateUtils 0.92，相关性恢复正常。
 
 ---
 
