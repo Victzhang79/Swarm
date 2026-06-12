@@ -345,3 +345,233 @@ async def update_routing(request: Request):
         "updated_keys": list(update_map.keys()),
         **router.get_routing_table(),
     }
+
+
+# ─── 4.7 PUT /api/model-providers ────────────────────────────
+@router.put("/api/model-providers", tags=["配置"])
+async def update_model_providers(request: Request):
+    """更新模型接入点(providers) + 模型归属(model_providers) + 规模标签(model_sizes)。
+
+    这些是复杂结构(list/dict)，以 JSON 写入 .env 的 SWARM_MODEL_PROVIDERS /
+    SWARM_MODEL_MODEL_PROVIDERS / SWARM_MODEL_MODEL_SIZES —— pydantic-settings
+    从 env 读 list/dict 字段时按 JSON 解析。
+
+    Body: {
+      "providers": [{"id","label","kind","base_url","api_key","max_retries"}, ...],
+      "model_providers": {"<model>": "<provider_id>", ...},
+      "model_sizes": {"<model>": "large|small", ...}
+    }
+    api_key 为脱敏值(***)的 provider 会保留原 key（不覆盖）。
+    """
+    import json as _json
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    cur = _app.get_config().model
+    update_map: dict[str, str] = {}
+
+    # providers：合并脱敏 key（前端回传 *** 时保留原 key）
+    if isinstance(body.get("providers"), list):
+        old_by_id = {p.id: p for p in cur._effective_providers()}
+        clean: list[dict] = []
+        for p in body["providers"]:
+            if not isinstance(p, dict) or not p.get("id"):
+                continue
+            key = str(p.get("api_key", "") or "")
+            if "***" in key or (key == "" and p["id"] in old_by_id):
+                # 脱敏或空 → 保留原 key
+                _old = old_by_id.get(p["id"])
+                key = _old.api_key if _old is not None else ""
+            entry = {
+                "id": str(p["id"]).strip(),
+                "label": str(p.get("label", "") or ""),
+                "kind": p.get("kind", "cloud") if p.get("kind") in ("cloud", "local") else "cloud",
+                "base_url": str(p.get("base_url", "") or ""),
+                "api_key": key,
+            }
+            if p.get("max_retries") is not None:
+                try:
+                    entry["max_retries"] = int(p["max_retries"])
+                except (ValueError, TypeError):
+                    pass
+            clean.append(entry)
+        update_map["SWARM_MODEL_PROVIDERS"] = _json.dumps(clean, ensure_ascii=False)
+
+        # B 方案：providers 是唯一真相源，但 /api/models 等老读取点仍读扁平字段。
+        # 把内置 id(siliconflow/local) 的 base_url/key 同步回写老字段，保持兼容。
+        for entry in clean:
+            if entry["id"] == "siliconflow":
+                update_map["SWARM_MODEL_SILICONFLOW_BASE_URL"] = entry["base_url"]
+                if entry["api_key"]:
+                    update_map["SWARM_MODEL_SILICONFLOW_API_KEY"] = entry["api_key"]
+            elif entry["id"] == "local":
+                update_map["SWARM_MODEL_LOCAL_BASE_URL"] = entry["base_url"]
+                if entry["api_key"]:
+                    update_map["SWARM_MODEL_LOCAL_API_KEY"] = entry["api_key"]
+
+    if isinstance(body.get("model_providers"), dict):
+        mp = {str(k): str(v) for k, v in body["model_providers"].items() if v}
+        update_map["SWARM_MODEL_MODEL_PROVIDERS"] = _json.dumps(mp, ensure_ascii=False)
+
+    if isinstance(body.get("model_sizes"), dict):
+        ms = {str(k): str(v) for k, v in body["model_sizes"].items() if v in ("large", "small")}
+        update_map["SWARM_MODEL_MODEL_SIZES"] = _json.dumps(ms, ensure_ascii=False)
+
+    if not update_map:
+        raise HTTPException(status_code=400, detail="无 providers/model_providers/model_sizes 字段")
+
+    # 写 .env + 同步 os.environ
+    env_path = _app._PROJECT_ROOT / ".env"
+    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+    for line in existing_lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.partition("=")[0].strip().upper()
+            if k in update_map:
+                new_lines.append(f"{k}={update_map[k]}")
+                updated_keys.add(k)
+                continue
+        new_lines.append(line)
+    for k, v in update_map.items():
+        if k not in updated_keys:
+            new_lines.append(f"{k}={v}")
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    for k, v in update_map.items():
+        os.environ[k] = v
+
+    from swarm.config.settings import reload_config as _reload_config
+    _reload_config()
+    _app.logger.info("Updated model providers: %s", list(update_map.keys()))
+
+    from swarm.models.router import ModelRouter
+    return {"status": "ok", "updated_keys": list(update_map.keys()), **ModelRouter().get_routing_table()}
+
+
+# ─── 4.8 GET /api/model-providers/catalog ────────────────────
+@router.get("/api/model-providers/catalog", tags=["配置"])
+async def model_providers_catalog():
+    """预置云端接入点目录 —— 前端"添加接入点"下拉用，选中自动填 base_url/label/kind。
+
+    base_url 来自 Hermes-Agent 源码的权威端点（OpenAI 兼容）。
+    """
+    from swarm.config.settings import KNOWN_PROVIDERS
+    return {"catalog": KNOWN_PROVIDERS}
+
+
+# ─── 5. 通知渠道 ─────────────────────────────────────
+@router.get("/api/notify-channels", tags=["配置"])
+async def get_notify_channels():
+    """当前通知渠道列表 + 预置类型目录 + 可订阅事件目录。api_key/webhook_url 脱敏。"""
+    from swarm.config.settings import KNOWN_NOTIFY_TYPES, NOTIFY_EVENT_TYPES
+    cfg = _app.get_config()
+    channels = []
+    for ch in cfg.notify_channels:
+        url = ch.webhook_url or ""
+        # 脱敏 webhook_url（含 token）：保留协议+host 头尾
+        masked = url
+        if len(url) > 24:
+            masked = url[:20] + "…" + url[-6:]
+        channels.append({
+            "id": ch.id, "type": ch.type, "label": ch.label,
+            "webhook_url_masked": masked, "has_url": bool(url),
+            "enabled": ch.enabled, "events": list(ch.events), "user_id": ch.user_id,
+        })
+    return {"channels": channels, "catalog": KNOWN_NOTIFY_TYPES, "event_types": NOTIFY_EVENT_TYPES}
+
+
+@router.put("/api/notify-channels", tags=["配置"])
+async def update_notify_channels(request: Request):
+    """更新通知渠道列表 → 写 SWARM_NOTIFY_CHANNELS(JSON) 到 .env + reload。
+
+    Body: {"channels": [{id,type,label,webhook_url,enabled,events,user_id}, ...]}
+    webhook_url 为脱敏值(含 …)或空 → 保留原 url（不覆盖）。
+    """
+    import json as _json
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("channels"), list):
+        raise HTTPException(status_code=400, detail="需要 channels 列表")
+
+    cur = _app.get_config()
+    old_by_id = {c.id: c for c in cur.notify_channels}
+    valid_types = {"feishu", "dingtalk", "wecom", "slack", "generic"}
+
+    clean: list[dict] = []
+    for c in body["channels"]:
+        if not isinstance(c, dict) or not c.get("id"):
+            continue
+        cid = str(c["id"]).strip()
+        url = str(c.get("webhook_url", "") or "")
+        # 脱敏或空 → 保留原 url
+        if "…" in url or "***" in url or (url == "" and cid in old_by_id):
+            _old = old_by_id.get(cid)
+            url = _old.webhook_url if _old is not None else ""
+        ctype = c.get("type", "generic")
+        if ctype not in valid_types:
+            ctype = "generic"
+        events = c.get("events") or []
+        events = [str(e) for e in events if isinstance(e, str)] if isinstance(events, list) else []
+        clean.append({
+            "id": cid,
+            "type": ctype,
+            "label": str(c.get("label", "") or ""),
+            "webhook_url": url,
+            "enabled": bool(c.get("enabled", True)),
+            "user_id": str(c.get("user_id", "") or ""),
+            "events": events,
+        })
+
+    env_path = _app._PROJECT_ROOT / ".env"
+    env_key = "SWARM_NOTIFY_CHANNELS"
+    val = _json.dumps(clean, ensure_ascii=False)
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    found = False
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s and s.partition("=")[0].strip().upper() == env_key:
+            out.append(f"{env_key}={val}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{env_key}={val}")
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.environ[env_key] = val
+
+    from swarm.config.settings import reload_config as _reload_config
+    _reload_config()
+    _app.logger.info("Updated notify channels: %d 个", len(clean))
+    return {"status": "ok", "count": len(clean)}
+
+
+@router.post("/api/notify-channels/test", tags=["配置"])
+async def test_notify_channel(request: Request):
+    """发送一条测试通知到指定渠道（或临时渠道配置），验证 webhook 可达。
+
+    Body: {"channel_id": "ch1"}  或  {"type":"feishu","webhook_url":"..."}
+    """
+    from swarm.api.notify import _build_payload, _post_webhook
+    body = await request.json()
+
+    url = ""
+    ctype = "generic"
+    if body.get("channel_id"):
+        cur = _app.get_config()
+        ch = next((c for c in cur.notify_channels if c.id == body["channel_id"]), None)
+        if ch is None:
+            raise HTTPException(status_code=404, detail="渠道不存在")
+        url, ctype = ch.webhook_url, ch.type
+    else:
+        url = str(body.get("webhook_url", "") or "").strip()
+        ctype = body.get("type", "generic")
+        # 临时测试时若 url 是脱敏值，回退到同 type 已存渠道的真 url
+        if "…" in url or not url:
+            raise HTTPException(status_code=400, detail="请填写有效 webhook_url")
+
+    payload = _build_payload(ctype, "test", "", "这是一条来自 Swarm 的测试通知 ✅")
+    ok = await _post_webhook(url, payload, tag="test")
+    return {"status": "ok" if ok else "failed", "delivered": ok}

@@ -9,14 +9,7 @@ async function loadConfig() {
     const cfg = data.config || {};
     const flat = data.flat || data.config?.model || {};
     originalConfig = { ...flat, ...cfg };
-    const sfKey = flat.siliconflow_api_key || '';
-    const localKey = flat.local_api_key || '';
-    $('cfg-sf-api-key').value = sfKey.includes('...') ? '' : sfKey;
-    $('cfg-sf-api-key').placeholder = sfKey.includes('...') ? sfKey : 'SiliconFlow API Key';
-    $('cfg-sf-base-url').value = flat.siliconflow_base_url || '';
-    $('cfg-local-api-key').value = localKey.includes('...') ? '' : localKey;
-    $('cfg-local-api-key').placeholder = localKey.includes('...') ? localKey : '本地 API Key';
-    $('cfg-local-base-url').value = flat.local_base_url || '';
+    // SiliconFlow / 本地接入点已统一由「模型接入点」区(providers)承载，不再有独立扁平字段。
     const lsKey = cfg.langsmith_api_key || '';
     if ($('cfg-langsmith-tracing')) $('cfg-langsmith-tracing').checked = !!cfg.langsmith_tracing;
     if ($('cfg-langsmith-api-key')) {
@@ -87,10 +80,6 @@ async function saveConfig() {
   btn.disabled = true;
   try {
     const config = {
-      siliconflow_api_key: $('cfg-sf-api-key').value,
-      siliconflow_base_url: $('cfg-sf-base-url').value,
-      local_api_key: $('cfg-local-api-key').value,
-      local_base_url: $('cfg-local-base-url').value,
       brain_primary: $('cfg-brain-model').value,
       brain_fallback: $('cfg-brain-fallback').value,
       langsmith_tracing: $('cfg-langsmith-tracing')?.checked || false,
@@ -185,8 +174,266 @@ async function loadRoutingTable() {
   try {
     const resp = await fetch('/api/routing');
     if (!resp.ok) return;
-    renderRoutingTable(await resp.json());
+    const data = await resp.json();
+    renderRoutingTable(data);
+    renderProviders(data.providers || []);
+    loadProviderCatalog();
   } catch { /* ignore */ }
+}
+
+// ─── 模型接入点(providers) 管理 ──────────────────────────────
+let _providersState = [];
+let _providerCatalog = [];
+
+async function loadProviderCatalog() {
+  if (_providerCatalog.length) return _providerCatalog;
+  try {
+    const data = await fetch('/api/model-providers/catalog').then(r => r.json());
+    _providerCatalog = data.catalog || [];
+    const sel = $('provider-catalog-select');
+    if (sel) {
+      sel.innerHTML = '<option value="">+ 从预置添加…</option>' +
+        _providerCatalog.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
+    }
+  } catch { /* ignore */ }
+  return _providerCatalog;
+}
+
+function addProviderFromCatalog(catalogId) {
+  const sel = $('provider-catalog-select');
+  if (sel) sel.value = '';  // 复位下拉
+  if (!catalogId) return;
+  const tpl = _providerCatalog.find(c => c.id === catalogId);
+  if (!tpl) return;
+  _syncProvidersFromDom();
+  // 同 id 已存在则不重复加
+  if (_providersState.some(p => p.id === tpl.id)) {
+    showToast(`接入点 ${tpl.id} 已存在`, 'warning');
+    return;
+  }
+  _providersState.push({
+    id: tpl.id, label: tpl.label || '', kind: tpl.kind || 'cloud',
+    base_url: tpl.base_url || '', has_key: false, api_key: '',
+  });
+  markProvidersDirty();
+  drawProviders();
+  showToast(`已添加 ${tpl.label || tpl.id}，填入 API Key 后保存`, 'info');
+}
+
+function renderProviders(providers) {
+  _providersState = (providers || []).map(p => ({
+    id: p.id || '', label: p.label || '', kind: p.kind || 'cloud',
+    base_url: p.base_url || '', has_key: !!p.has_key, api_key: '',
+  }));
+  clearProvidersDirty();
+  drawProviders();
+}
+
+// 未保存改动标记 —— 高亮保存按钮 + 显示提示。
+function markProvidersDirty() {
+  const hint = $('providers-dirty-hint');
+  if (hint) hint.style.display = '';
+  const btn = $('btn-save-providers');
+  if (btn) btn.classList.add('btn-pulse');
+}
+
+function clearProvidersDirty() {
+  const hint = $('providers-dirty-hint');
+  if (hint) hint.style.display = 'none';
+  const btn = $('btn-save-providers');
+  if (btn) btn.classList.remove('btn-pulse');
+}
+
+function _isKnownProvider(id) {
+  return _providerCatalog.some(c => c.id === id);
+}
+
+function drawProviders() {
+  const el = $('providers-list');
+  if (!el) return;
+  if (!_providersState.length) {
+    el.innerHTML = '<p style="font-size:11px;color:var(--text-muted);padding:6px">（暂无接入点。从下方"预置"添加，或"+ 空白接入点"自定义。）</p>';
+    return;
+  }
+  // 按 kind 分组展示：云端 / 本地
+  const groups = [
+    { key: 'cloud', label: '☁️ 云端接入点' },
+    { key: 'local', label: '💻 本地接入点' },
+  ];
+  let html = '';
+  groups.forEach(g => {
+    const rows = _providersState
+      .map((p, i) => ({ p, i }))
+      .filter(x => (x.p.kind || 'cloud') === g.key);
+    if (!rows.length) return;
+    html += `<div style="font-size:11px;font-weight:600;color:var(--text-muted);margin:10px 0 4px">${g.label}</div>`;
+    html += rows.map(({ p, i }) => _renderProviderCard(p, i)).join('');
+  });
+  el.innerHTML = html;
+}
+
+// 每个接入点一行，第一列是预置下拉（10 预置 + 本地 + 自定义）：
+//  - 选某预置云端 → 收起，只露 API Key（base_url 灰字展示）
+//  - 选"本地推理(local)" → 露 Base URL + Key
+//  - 选"自定义" → 展开 id/label/kind/base_url/key 全字段
+function _providerSelectHtml(p, i) {
+  const isLocal = p.id === 'local' && !p._custom;
+  const isCustom = p._custom || (!_isKnownProvider(p.id) && !isLocal);
+  const opts = _providerCatalog.map(c =>
+    `<option value="${escapeHtml(c.id)}"${(!isCustom && !isLocal && p.id === c.id) ? ' selected' : ''}>${escapeHtml(c.label || c.id)}</option>`
+  ).join('');
+  return `<select class="form-select prov-preset" onchange="changeProviderPreset(${i}, this.value)" style="flex:0 0 180px">
+    ${opts}
+    <option value="__local__"${isLocal ? ' selected' : ''}>本地推理 (local)</option>
+    <option value="__custom__"${isCustom ? ' selected' : ''}>自定义端点…</option>
+  </select>`;
+}
+
+function _renderProviderCard(p, i) {
+  const isLocal = p.id === 'local' && !p._custom;
+  const isCustom = p._custom || (!_isKnownProvider(p.id) && !isLocal);
+  const keyHint = p.has_key ? '已配置(留空不改)' : (p.kind === 'local' ? 'API Key（本地通常可留空）' : '填入 API Key');
+
+  if (isLocal) {
+    return `
+      <div class="card prov-card" style="margin-bottom:6px;padding:8px 10px" data-pidx="${i}">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          ${_providerSelectHtml(p, i)}
+          <input class="form-input prov-f" data-f="base_url" style="flex:1" value="${escapeHtml(p.base_url)}" placeholder="http://ai.bit:3000/api" oninput="markProvidersDirty()">
+          <button class="btn btn-ghost btn-sm" onclick="removeProviderRow(${i})" title="移除">✕</button>
+        </div>
+        <input class="form-input prov-f" data-f="api_key" type="password" value="" placeholder="${keyHint}" oninput="markProvidersDirty()">
+        <input type="hidden" class="prov-f" data-f="id" value="local">
+        <input type="hidden" class="prov-f" data-f="kind" value="local">
+        <input type="hidden" class="prov-f" data-f="label" value="${escapeHtml(p.label || '本地推理')}">
+      </div>`;
+  }
+
+  if (isCustom) {
+    return `
+      <div class="card prov-card" style="margin-bottom:8px;padding:10px" data-pidx="${i}">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+          ${_providerSelectHtml(p, i)}
+          <button class="btn btn-danger btn-sm" style="margin-left:auto" onclick="removeProviderRow(${i})">删除</button>
+        </div>
+        <div class="form-row" style="gap:8px">
+          <div class="form-group" style="flex:0 0 120px"><label class="form-label">ID</label>
+            <input class="form-input prov-f" data-f="id" value="${escapeHtml(p.id)}" placeholder="my-provider" oninput="markProvidersDirty()"></div>
+          <div class="form-group" style="flex:0 0 110px"><label class="form-label">类型</label>
+            <select class="form-select prov-f" data-f="kind" onchange="markProvidersDirty()">
+              <option value="cloud"${p.kind === 'cloud' ? ' selected' : ''}>云端 cloud</option>
+              <option value="local"${p.kind === 'local' ? ' selected' : ''}>本地 local</option>
+            </select></div>
+          <div class="form-group" style="flex:1"><label class="form-label">展示名</label>
+            <input class="form-input prov-f" data-f="label" value="${escapeHtml(p.label)}" placeholder="My Endpoint" oninput="markProvidersDirty()"></div>
+        </div>
+        <div class="form-row" style="gap:8px">
+          <div class="form-group" style="flex:2"><label class="form-label">Base URL</label>
+            <input class="form-input prov-f" data-f="base_url" value="${escapeHtml(p.base_url)}" placeholder="https://api.example.com/v1" oninput="markProvidersDirty()"></div>
+          <div class="form-group" style="flex:1"><label class="form-label">API Key</label>
+            <input class="form-input prov-f" data-f="api_key" type="password" placeholder="${keyHint}" oninput="markProvidersDirty()"></div>
+        </div>
+      </div>`;
+  }
+
+  // 预置云端：收起，只露 key
+  const tpl = _providerCatalog.find(c => c.id === p.id) || {};
+  return `
+    <div class="card prov-card" style="margin-bottom:6px;padding:8px 10px" data-pidx="${i}">
+      <div style="display:flex;gap:8px;align-items:center">
+        ${_providerSelectHtml(p, i)}
+        <input class="form-input prov-f" data-f="api_key" type="password" style="flex:1" placeholder="${keyHint}" oninput="markProvidersDirty()">
+        <button class="btn btn-ghost btn-sm" onclick="removeProviderRow(${i})" title="移除">✕</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-muted);margin-top:3px;padding-left:2px">${escapeHtml(p.base_url || tpl.base_url || '')}</div>
+      <input type="hidden" class="prov-f" data-f="id" value="${escapeHtml(p.id)}">
+      <input type="hidden" class="prov-f" data-f="kind" value="${escapeHtml(p.kind || 'cloud')}">
+      <input type="hidden" class="prov-f" data-f="base_url" value="${escapeHtml(p.base_url || tpl.base_url || '')}">
+      <input type="hidden" class="prov-f" data-f="label" value="${escapeHtml(p.label || tpl.label || '')}">
+    </div>`;
+}
+
+// 行内切换预置：选某预置 → 重填该行 base_url/label/kind（key 重置，因为换了接入点）。
+function changeProviderPreset(i, presetId) {
+  _syncProvidersFromDom();
+  if (!_providersState[i]) return;
+  const cur = _providersState[i];
+  if (presetId === '__custom__') {
+    cur._custom = true;
+    if (_isKnownProvider(cur.id)) { cur.id = ''; cur.label = ''; }
+    cur.kind = cur.kind || 'cloud';
+  } else if (presetId === '__local__') {
+    cur._custom = false;
+    cur.id = 'local'; cur.kind = 'local'; cur.label = '本地推理';
+    if (!cur.base_url) cur.base_url = 'http://ai.bit:3000/api';
+  } else {
+    const tpl = _providerCatalog.find(c => c.id === presetId);
+    if (!tpl) return;
+    if (_providersState.some((x, idx) => idx !== i && x.id === tpl.id && !x._custom)) {
+      showToast(`接入点 ${tpl.label || tpl.id} 已存在`, 'warning');
+      drawProviders();
+      return;
+    }
+    cur._custom = false;
+    cur.id = tpl.id; cur.label = tpl.label || ''; cur.kind = tpl.kind || 'cloud';
+    cur.base_url = tpl.base_url || '';
+    cur.has_key = false;
+  }
+  markProvidersDirty();
+  drawProviders();
+}
+
+function _syncProvidersFromDom() {
+  document.querySelectorAll('#providers-list [data-pidx]').forEach(card => {
+    const i = parseInt(card.dataset.pidx, 10);
+    if (Number.isNaN(i) || !_providersState[i]) return;
+    card.querySelectorAll('.prov-f').forEach(f => {
+      _providersState[i][f.dataset.f] = f.value;
+    });
+  });
+}
+
+function addProviderRow() {
+  _syncProvidersFromDom();
+  _providersState.push({ id: '', label: '', kind: 'cloud', base_url: '', has_key: false, api_key: '', _custom: true });
+  markProvidersDirty();
+  drawProviders();
+}
+
+function removeProviderRow(i) {
+  _syncProvidersFromDom();
+  _providersState.splice(i, 1);
+  markProvidersDirty();
+  drawProviders();
+}
+
+async function saveProviders() {
+  _syncProvidersFromDom();
+  const btn = $('btn-save-providers');
+  if (btn) btn.disabled = true;
+  try {
+    // 过滤空 id；api_key 留空时不发送(后端保留原 key)
+    const providers = _providersState
+      .filter(p => (p.id || '').trim())
+      .map(p => {
+        const o = { id: p.id.trim(), label: p.label || '', kind: p.kind || 'cloud', base_url: p.base_url || '' };
+        if (p.api_key) o.api_key = p.api_key;  // 仅在用户输入了新 key 时发送
+        return o;
+      });
+    const resp = await fetch('/api/model-providers', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providers }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    renderProviders(data.providers || []);
+    showToast('接入点已保存', 'success');
+  } catch (e) {
+    showToast('保存失败: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function renderRoutingTable(data) {

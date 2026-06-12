@@ -77,6 +77,7 @@ from pydantic import BaseModel, Field
 
 from swarm.config.settings import (
     get_config,
+    reload_config,
 )
 from swarm.project import store
 from swarm.tracing import configure_langsmith
@@ -552,10 +553,46 @@ app.add_middleware(SwarmAPIKeyMiddleware)
 
 @app.on_event("startup")
 async def on_startup():
-    """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度"""
+    """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""
     _configure_app_logging()
     configure_langsmith()
     _init_sidecar()
+    # 注册通知推送 hook：store.create_notification 写入后，把记录调度到外部渠道推送。
+    # create_notification 常在线程池(run_in_executor)里被调，故用 run_coroutine_threadsafe
+    # 把异步推送投回主事件循环；拿不到 loop 时退化为后台线程跑。
+    try:
+        _main_loop = asyncio.get_running_loop()
+
+        def _log_push_exc(fut) -> None:
+            """记录通知推送的异步异常（否则被吞在 future 里不可见）。"""
+            try:
+                exc = fut.exception()
+                if exc:
+                    logger.warning("notification dispatch error: %s", exc)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _push_notification(record: dict) -> None:
+            try:
+                from swarm.api.notify import dispatch_notification
+                import asyncio as _aio
+                try:
+                    running = _aio.get_running_loop()
+                except RuntimeError:
+                    running = None
+                if running is _main_loop and running is not None:
+                    task = _main_loop.create_task(dispatch_notification(record))
+                    task.add_done_callback(_log_push_exc)
+                else:
+                    fut = _aio.run_coroutine_threadsafe(dispatch_notification(record), _main_loop)
+                    fut.add_done_callback(_log_push_exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("push notification failed: %s", exc)
+
+        store.register_notification_hook(_push_notification)
+        logger.info("Notification push hook registered")
+    except Exception as e:
+        logger.warning(f"Failed to register notification hook: {e}")
     # 确保 project/task 表存在
     try:
         loop = asyncio.get_running_loop()

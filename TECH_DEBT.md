@@ -3,7 +3,7 @@
 本文件登记已知但暂未根治的技术债，按优先级排列。每项含：现象、影响、建议修法。
 完成后从本表移除并在 commit 注明。
 
-> 最近更新：2026-06（RuoYi 混编 E2E 验证后系统盘点）
+> 最近更新：2026-06（多接入点重构 + 通知渠道 + 发布前 CTO 走查）
 
 ---
 
@@ -64,6 +64,15 @@
 - **影响**：首个 Java 任务慢；池复用后 `.m2` 预热则快（实测复用后 2-3s）。
 - **建议**：模板镜像预置常见依赖的 `.m2` 缓存，或挂载共享只读 `.m2` 卷。
 
+### 8. 沙箱集成测试缺 reachability 门禁 → 无 infra 时假失败
+- **现象**：`test/test_sandbox_integration.py`（如 `test_5_build_tools_sandbox_mode` 断言
+  `"sandbox exit code 0" in result`）需真实 CubeSandbox infra；本机/CI 无 infra 时被 pytest
+  收集并失败，干扰单元套件结果判断。
+- **影响**：发布前跑全量测试时混入 infra 依赖的失败，需手动 `--ignore` 排除，易误判回归。
+- **建议**：按 `service-architecture-review` skill 加模块级 reachability 门禁——
+  `pytestmark = pytest.mark.skipif(not _reachable(), reason="infra unreachable; set SWARM_RUN_SANDBOX_IT=1")`，
+  infra 不可达优雅 skip（可见），CI 在装备 infra 的 runner 上设 `SWARM_RUN_SANDBOX_IT=1` 强制跑。
+
 ---
 
 ## 已根治（2026-06 E2E 修复，留档备查）
@@ -82,4 +91,14 @@
   时 `_sweep_startup_orphans` 清扫残留；②kill_by_task 不告知池 → `pool.forget`
   对账 borrowed 计数 + 清死引用；③trivial 路径脏沙箱误标 reusable=True → 显式设
   `_l1_passed_flag`；④孤儿检测器误判 pool-idle 为孤儿 → 排除 source=pool-idle。
+
+## 已根治（2026-06 多接入点 + 通知渠道发布，留档备查）
+- **模型 provider 写死 + 按名猜路由**：重构为多接入点（provider 一等公民），
+  `provider_for_model` 按显式 `model_providers` 映射路由，启发式仅兜底；老扁平字段
+  由 `_effective_providers()` 合成两接入点，零迁移向后兼容；10 个常用云端预置目录。
+- **设置 tab 配置可设性**：热池开关、模型接入点、通知渠道全部从只读/env-only 改为
+  Web 可视化增删改 + 即时生效（写 .env + reload + 内置 id 同步回写老字段保 /api/models 兼容）。
+- **外部通知单一注入点**：`store.create_notification` 写库后触发 hook（解耦，store 不依赖
+  httpx），`api/notify.dispatch_notification` 按 enabled+事件过滤推送多渠道；hook 用
+  `run_coroutine_threadsafe` 投主 loop（避免 skill#16 跨 loop 陷阱）+ future 异常回调可见。
 

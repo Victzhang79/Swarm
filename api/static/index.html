@@ -700,14 +700,18 @@
           <div id="tab-settings" class="tab-panel">
             <div class="tab-scroll">
               <div class="settings-panel">
-                <div class="form-group"><label class="form-label">SiliconFlow API Key</label>
-                  <div style="position:relative"><input id="cfg-sf-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-sf-api-key')">👁</button></div>
+                <h3 style="font-size:13px;margin:0 0 8px;color:var(--text-secondary)">🔌 模型接入点 <span class="hint">云端 / 本地端点</span></h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">每个接入点是一个 OpenAI 兼容端点。每行左侧下拉可切换是哪个预置（SiliconFlow / OpenRouter / DeepSeek / MiniMax 等 10 个）——预置只需填 API Key；选"本地推理"可改 Base URL；选"自定义端点"展开全部字段。<b>改动后需点「保存接入点」生效。</b></p>
+                <div style="display:flex;gap:8px;margin:0 0 10px;align-items:center;flex-wrap:wrap">
+                  <button class="btn btn-primary btn-sm" onclick="saveProviders()" id="btn-save-providers">💾 保存接入点</button>
+                  <span id="providers-dirty-hint" style="font-size:11px;color:var(--orange);display:none">● 有未保存改动</span>
+                  <span style="flex:1"></span>
+                  <select id="provider-catalog-select" class="form-select" style="flex:0 0 200px" onchange="addProviderFromCatalog(this.value)">
+                    <option value="">+ 添加预置接入点…</option>
+                  </select>
+                  <button class="btn btn-ghost btn-sm" onclick="addProviderRow()">+ 自定义</button>
                 </div>
-                <div class="form-group"><label class="form-label">SiliconFlow Base URL</label><input id="cfg-sf-base-url" class="form-input" placeholder="https://api.siliconflow.cn/v1"></div>
-                <div class="form-group"><label class="form-label">本地模型 API Key</label>
-                  <div style="position:relative"><input id="cfg-local-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-local-api-key')">👁</button></div>
-                </div>
-                <div class="form-group"><label class="form-label">本地模型 Base URL</label><input id="cfg-local-base-url" class="form-input" placeholder="http://localhost:11434/v1"></div>
+                <div id="providers-list"></div>
                 <div class="form-row">
                   <div class="form-group"><label class="form-label">Brain 主模型（云端编排）</label><div id="cfg-brain-model-wrapper"><select id="cfg-brain-model" class="form-select"><option value="">配置 API Key</option></select></div></div>
                   <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
@@ -738,6 +742,16 @@
                   <span id="pool-toggle-status" style="font-size:11px;color:var(--text-muted)"></span>
                 </div>
                 <p style="font-size:11px;color:var(--orange);margin:0 0 12px">⚠️ 开关即时写入并启停后台回收器；已在运行的 Worker 在下次任务派发时生效。池参数（max_total / TTL 等）改动需重启 API。</p>
+
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">📢 通知渠道 <span class="hint">系统通知推送到外部</span></h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">系统每产生一条通知（任务完成/失败/待审等）即推送到下方 enabled 的渠道。每行下拉选渠道类型（飞书/钉钉/企业微信/Slack/通用），填 Webhook URL。事件留空=接收全部。<b>改动后需点「保存渠道」。</b></p>
+                <div style="display:flex;gap:8px;margin:0 0 10px;align-items:center;flex-wrap:wrap">
+                  <button class="btn btn-primary btn-sm" onclick="saveNotifyChannels()" id="btn-save-channels">💾 保存渠道</button>
+                  <span id="channels-dirty-hint" style="font-size:11px;color:var(--orange);display:none">● 有未保存改动</span>
+                  <span style="flex:1"></span>
+                  <button class="btn btn-ghost btn-sm" onclick="addNotifyChannel()">+ 添加渠道</button>
+                </div>
+                <div id="notify-channels-list"></div>
 
                 <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
               </div>
@@ -826,6 +840,7 @@
   <script src="/static/js/tabs/observability.js"></script>
   <script src="/static/js/tabs/system.js"></script>
   <script src="/static/js/tabs/config.js"></script>
+  <script src="/static/js/tabs/notify.js"></script>
   <!-- 应用入口 -->
   <script src="/static/js/app.js"></script>
 </body>

@@ -966,6 +966,26 @@ def _notification_message(status: str, description: str) -> str:
 # 应用内通知 CRUD（持久化 notifications 表）
 # ──────────────────────────────────────────────
 
+# 通知创建后的回调钩子（解耦：store 不依赖 httpx/asyncio）。
+# app.py 启动时注册一个 hook，把新通知转发给 api.notify.dispatch_notification。
+_notification_hooks: list = []
+
+
+def register_notification_hook(fn) -> None:
+    """注册一个 "通知已创建" 回调。fn(record: dict) 同步调用，内部自行调度异步推送。"""
+    if fn not in _notification_hooks:
+        _notification_hooks.append(fn)
+
+
+def _fire_notification_hooks(record: dict) -> None:
+    """触发所有已注册 hook。任一失败不影响通知写入（非关键路径）。"""
+    for fn in list(_notification_hooks):
+        try:
+            fn(record)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("notification hook failed: %s", exc)
+
+
 def create_notification(
     event_type: str,
     *,
@@ -990,7 +1010,9 @@ def create_notification(
                     (event_type, task_id, project_id, title, message),
                 )
                 row = cur.fetchone()
-        return _row_to_notification(row)
+        record = _row_to_notification(row)
+        _fire_notification_hooks(record)
+        return record
     except Exception as exc:  # noqa: BLE001
         logger.warning("create_notification failed: %s", exc)
         return {}

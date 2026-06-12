@@ -26,6 +26,53 @@ class DatabaseConfig(BaseSettings):
     qdrant_collection: str = "swarm_kb"
 
 
+class ProviderConfig(BaseSettings):
+    """单个模型接入点（云端 API 或本地推理服务）。
+
+    成熟 agent 的做法：接入点是一等公民，用户可配任意多个云端/本地端点，
+    每个模型显式声明归属哪个 provider —— 不再靠"模型名含 / 就是云端"这种脆弱启发式。
+    """
+    id: str = ""                 # 唯一标识，如 siliconflow / deepseek / local
+    label: str = ""              # 展示名（前端用），留空回退 id
+    kind: str = "cloud"          # cloud | local —— 决定默认重试/超时策略
+    base_url: str = ""
+    api_key: str = ""
+    # 本地推理服务通常 no_retry（取消后绝不重发，避免占 GPU）；云端可重试。
+    # 留空(None)则按 kind 推导：local→0 重试，cloud→max_retries。
+    max_retries: int | None = None
+
+    def display(self) -> str:
+        return self.label or self.id
+
+
+# 预置云端接入点目录（base_url 来自 Hermes-Agent 源码，OpenAI 兼容端点）。
+# 前端"添加接入点"时可一键选用，自动填 base_url/label/kind，用户只填 API Key。
+# 仅作模板供选择，不自动启用——用户选了并填 key 才进 providers 配置。
+KNOWN_PROVIDERS: list[dict] = [
+    {"id": "openrouter",   "label": "OpenRouter（聚合 300+ 模型）", "kind": "cloud", "base_url": "https://openrouter.ai/api/v1",                              "key_hint": "OPENROUTER_API_KEY"},
+    {"id": "siliconflow",  "label": "SiliconFlow 硅基流动",         "kind": "cloud", "base_url": "https://api.siliconflow.cn/v1",                            "key_hint": "SiliconFlow"},
+    {"id": "deepseek",     "label": "DeepSeek 深度求索",            "kind": "cloud", "base_url": "https://api.deepseek.com/v1",                              "key_hint": "DEEPSEEK_API_KEY"},
+    {"id": "minimax",      "label": "MiniMax（国际）",              "kind": "cloud", "base_url": "https://api.minimax.io/v1",                                "key_hint": "MINIMAX_API_KEY"},
+    {"id": "minimax_cn",   "label": "MiniMax（国内）",              "kind": "cloud", "base_url": "https://api.minimaxi.com/v1",                              "key_hint": "MINIMAX_CN_API_KEY"},
+    {"id": "moonshot",     "label": "Moonshot / Kimi（国内）",      "kind": "cloud", "base_url": "https://api.moonshot.cn/v1",                               "key_hint": "KIMI_API_KEY"},
+    {"id": "zhipu",        "label": "智谱 GLM / Z.AI（国内）",      "kind": "cloud", "base_url": "https://open.bigmodel.cn/api/paas/v4",                     "key_hint": "GLM_API_KEY"},
+    {"id": "dashscope",    "label": "阿里百炼 Qwen（国内）",        "kind": "cloud", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",        "key_hint": "DASHSCOPE_API_KEY"},
+    {"id": "xai",          "label": "xAI Grok",                    "kind": "cloud", "base_url": "https://api.x.ai/v1",                                      "key_hint": "XAI_API_KEY"},
+    {"id": "openai",       "label": "OpenAI",                      "kind": "cloud", "base_url": "https://api.openai.com/v1",                                "key_hint": "OPENAI_API_KEY"},
+]
+
+
+class ModelEntry(BaseSettings):
+    """模型条目 —— 把模型按【接入点 × 规模】两个正交维度归类。
+
+    location(local/cloud) 不单独存，从 provider.kind 推导；size 用户标注，
+    供前端按"本地小/本地大/云端小/云端大"分组展示与按成本选型。
+    """
+    name: str = ""               # 模型名，如 Pro/zai-org/GLM-5.1
+    provider_id: str = ""        # 归属的 provider.id —— 显式路由依据
+    size: str = "large"          # large | small —— 规模维度（大模型/小模型）
+
+
 class ModelConfig(BaseSettings):
     """模型路由配置"""
     model_config = SettingsConfigDict(
@@ -34,6 +81,15 @@ class ModelConfig(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # ── 多接入点（providers）+ 模型归属 ────────────────────────
+    # providers 为空时，由 _effective_providers() 从下方老扁平字段(siliconflow+local)
+    # 自动合成两个 provider —— 向后兼容，老 .env 零迁移即可工作。
+    providers: list[ProviderConfig] = Field(default_factory=list)
+    # 模型名 → provider_id 显式映射（覆盖一切猜测）。前端配置模型归属时写这里。
+    model_providers: dict[str, str] = Field(default_factory=dict)
+    # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
+    model_sizes: dict[str, str] = Field(default_factory=dict)
 
     # Brain 层
     brain_primary: str = "Pro/zai-org/GLM-5.1"
@@ -44,7 +100,7 @@ class ModelConfig(BaseSettings):
     worker_local: str = "qwen3:27b"          # 本地 Ollama
     worker_fallback: str = "Qwen3.5"
 
-    # API 端点
+    # API 端点（兼容字段：providers 为空时合成默认的 siliconflow + local 两个接入点）
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_api_key: str = ""
     local_base_url: str = "http://ai.bit:3000/api"
@@ -68,6 +124,52 @@ class ModelConfig(BaseSettings):
     # 流式无 chunk 看门狗：两次 parsed chunk 间隔超此秒数即中断，触发 fallback。
     # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
     stream_chunk_timeout: float = 45.0
+
+    # ── 接入点解析 ────────────────────────────────────────────
+    def _effective_providers(self) -> list[ProviderConfig]:
+        """返回生效的 provider 列表。
+
+        providers 显式配置则用之；否则从老扁平字段合成 siliconflow(cloud) + local(local)
+        两个默认接入点 —— 保证老 .env 不改也能工作。
+        """
+        if self.providers:
+            return self.providers
+        synthesized: list[ProviderConfig] = []
+        if self.siliconflow_base_url:
+            synthesized.append(ProviderConfig(
+                id="siliconflow", label="SiliconFlow", kind="cloud",
+                base_url=self.siliconflow_base_url, api_key=self.siliconflow_api_key,
+            ))
+        if self.local_base_url:
+            synthesized.append(ProviderConfig(
+                id="local", label="本地推理", kind="local",
+                base_url=self.local_base_url, api_key=self.local_api_key,
+            ))
+        return synthesized
+
+    def provider_for_model(self, model_name: str) -> ProviderConfig | None:
+        """模型 → 接入点。优先显式映射(model_providers)，否则启发式兜底。
+
+        启发式（仅兜底）：含 '/' 视为云端(取第一个 cloud provider)，否则本地。
+        显式映射存在即权威，彻底摆脱'靠名字猜'。
+        """
+        providers = self._effective_providers()
+        by_id = {p.id: p for p in providers}
+        # 1) 显式映射
+        pid = self.model_providers.get(model_name)
+        if pid and pid in by_id:
+            return by_id[pid]
+        # 2) 启发式兜底（向后兼容老行为）
+        if "/" in model_name:
+            for p in providers:
+                if p.kind == "cloud":
+                    return p
+        else:
+            for p in providers:
+                if p.kind == "local":
+                    return p
+        # 3) 实在没有就第一个
+        return providers[0] if providers else None
 
 
 class WorkerConfig(BaseSettings):
@@ -201,6 +303,40 @@ class ObservabilityConfig(BaseSettings):
     query_timeout: int = 15
 
 
+class NotifyChannel(BaseSettings):
+    """单个外部通知渠道（飞书/Slack/钉钉/通用 webhook）。
+
+    设计为列表项，即便当前单用户也预留 user_id（空=全局，将来多用户按 user 过滤投递）。
+    events 留空 = 订阅所有事件；否则只推送列表内的 event_type。
+    """
+    id: str = ""                          # 唯一标识（前端生成，如 ch1）
+    type: str = "generic"                 # feishu | slack | dingtalk | generic
+    label: str = ""                       # 展示名
+    webhook_url: str = ""
+    enabled: bool = True
+    user_id: str = ""                     # 预留：空=全局；将来按用户投递
+    events: list[str] = Field(default_factory=list)  # 空=全部事件
+
+
+# 预置通知渠道类型目录（前端"添加渠道"下拉用）。payload 格式见 api/notify.py。
+KNOWN_NOTIFY_TYPES: list[dict] = [
+    {"type": "feishu",   "label": "飞书 / Lark 群机器人", "url_hint": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"},
+    {"type": "dingtalk", "label": "钉钉群机器人",          "url_hint": "https://oapi.dingtalk.com/robot/send?access_token=xxx"},
+    {"type": "wecom",    "label": "企业微信群机器人",      "url_hint": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"},
+    {"type": "slack",    "label": "Slack Incoming Webhook", "url_hint": "https://hooks.slack.com/services/xxx"},
+    {"type": "generic",  "label": "通用 HTTP POST (JSON)",  "url_hint": "https://your-endpoint/webhook"},
+]
+
+# 所有系统通知事件类型（前端可选订阅；空订阅=全部）。与 store.create_notification 的 event_type 对齐。
+NOTIFY_EVENT_TYPES: list[dict] = [
+    {"type": "task_created",    "label": "任务创建"},
+    {"type": "task_updated",    "label": "任务更新"},
+    {"type": "task_completed",  "label": "任务完成"},
+    {"type": "task_failed",     "label": "任务失败"},
+    {"type": "awaiting_review", "label": "等待审核"},
+]
+
+
 class AppConfig(BaseSettings):
     """全局配置 — 聚合所有子配置"""
     model_config = SettingsConfigDict(
@@ -237,6 +373,10 @@ class AppConfig(BaseSettings):
     max_task_tokens: int = 500_000  # 单任务 token 估算硬上限（P1）
     context_max_tokens: int = 80_000   # L3 滑动窗口总预算
     context_reserve_tokens: int = 16_000  # 预留给模型输出
+
+    # 外部通知渠道（SWARM_NOTIFY_CHANNELS，JSON list）。系统每产生一条通知即推送到
+    # enabled 且事件匹配的渠道。空列表=不推送外部（仅应用内铃铛）。
+    notify_channels: list[NotifyChannel] = Field(default_factory=list)
 
     # 子配置
     db: DatabaseConfig = Field(default_factory=DatabaseConfig)

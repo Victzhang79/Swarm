@@ -244,12 +244,16 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | 变量 | 说明 |
 |------|------|
 | `SWARM_DB_POSTGRES_URI` | PostgreSQL |
-| `SWARM_MODEL_SILICONFLOW_API_KEY` | 云端模型 |
+| `SWARM_MODEL_SILICONFLOW_API_KEY` | 默认云端接入点（SiliconFlow）API Key |
+| `SWARM_MODEL_PROVIDERS` | 多接入点（JSON list）：每个 `{id,type,base_url,api_key,kind}`，支持任意多个云端/本地端点；空则由 siliconflow+local 两个扁平字段合成（向后兼容）。设置 tab「🔌 模型接入点」可视化增删，含 OpenRouter/DeepSeek/MiniMax/Kimi/GLM/Qwen/xAI/OpenAI 等 10 个预置 |
+| `SWARM_MODEL_MODEL_PROVIDERS` | 模型→接入点显式映射（JSON dict），覆盖"按模型名猜"的启发式 |
+| `SWARM_NOTIFY_CHANNELS` | 外部通知渠道（JSON list）：`{id,type,webhook_url,enabled,events}`，系统每产生一条通知即推送到 enabled 且事件匹配的渠道（飞书/钉钉/企业微信/Slack/通用）。设置 tab「📢 通知渠道」可视化配置 + 测试 |
+| `SWARM_OBS_CLICKHOUSE_*` | 可观测数据源（OpenLIT/ClickHouse），LLM/embed/rerank 调用 trace；「📊 可观测」面板展示 p95/慢调用/错误率，不可达时降级 |
 | `SWARM_CONTEXT_MAX_TOKENS` | Memory L3 预算 |
 | `SWARM_GITLAB_*` | V3 验证 / MR |
 | `SWARM_REDIS_ENABLED` | 模块锁 |
 | `SWARM_RBAC_ENABLED` | 多用户 |
-| `SWARM_SANDBOX_POOL_ENABLED` | 沙箱热池（预热复用，省去每任务冷启动；池状态见系统 tab + `GET /api/sandbox/pool`）|
+| `SWARM_SANDBOX_POOL_ENABLED` | 沙箱热池（**默认开**，预热复用省去每任务冷启动；设置 tab 可一键开关，池状态见系统 tab + `GET /api/sandbox/pool`）|
 | `SWARM_WORKER_L1_LINT` / `_LINT_GATE` / `_SELF_REVIEW` | Worker L1 确定性闸门开关（默认全开硬阻断）|
 | `SWARM_WORKER_COMMAND_WHITELIST` | 全局命令白名单（harness.extra_whitelist 在其上追加）|
 | `SWARM_LANGSMITH_TRACING` | LangSmith 追踪开关（L1 确定性证据回写为结构化 feedback）|
@@ -257,6 +261,23 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | `SWARM_LOG_FILE` | 日志文件路径（默认 swarm.log，空串=仅控制台） |
 | `SWARM_LOG_JSON` | true=结构化 JSON 行日志（便于聚合） |
 | `SWARM_LOG_MAX_BYTES` / `SWARM_LOG_BACKUP_COUNT` | 轮转大小/保留数（默认 20MB×5） |
+
+### 模型接入点（多云端 + 本地）
+
+接入点（provider）是一等公民：每个模型显式声明归属哪个接入点，**不再靠"模型名含 / 就是云端"的脆弱启发式**。
+
+- **多接入点**：云端可配任意多个（SiliconFlow / OpenRouter / DeepSeek / MiniMax / Kimi / GLM / Qwen / xAI / OpenAI…），本地推理一个或多个。设置 tab「🔌 模型接入点」每行下拉切换预置，预置只需填 API Key，本地可改 Base URL，自定义端点展开全字段。
+- **预置目录** `GET /api/model-providers/catalog`：10 个常用云端的权威 `base_url`（参照 Hermes-Agent）。
+- **向后兼容零迁移**：`SWARM_MODEL_PROVIDERS` 为空时，由 `_effective_providers()` 从老的 `siliconflow_*`+`local_*` 扁平字段合成两个接入点；保存内置 id 时同步回写老字段，`/api/models` 等老读取点不受影响。
+
+### 外部通知渠道
+
+系统每产生一条通知（任务创建/完成/失败/待审）即推送到外部渠道 —— **单一注入点**：`store.create_notification` 写库后触发 hook → `api/notify.dispatch_notification` 遍历 enabled 渠道按事件过滤推送，覆盖所有通知来源不会漏。
+
+- 支持飞书 / 钉钉 / 企业微信 / Slack incoming webhook + 通用 HTTP POST。
+- 设置 tab「📢 通知渠道」配置：每渠道选类型、填 webhook、勾选订阅事件（空=全部）、即时「测试」。
+- 渠道列表预留 `user_id`（当前空=全局；多用户时按用户投递，无需改结构）。
+- 旧的单 webhook（`SWARM_NOTIFY_WEBHOOK_URL` + `SWARM_NOTIFY_FORMAT`）保留向后兼容。
 
 ### 日志系统
 
@@ -388,7 +409,7 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 - ✅ **增量更新正则抽取符号** → Python 改用 stdlib **ast** 精确解析（嵌套类/async/装饰器/docstring/准确行号），语法错误回退正则；其他语言保留正则（`knowledge/updater.py`）
 - ✅ **合并缺 rebase 重生成** → 3-way merge 与硬冲突之间新增中间档：选一方为 base 保留，另一方子任务标记 `rebase_subtask_ids` 重跑（不计入重试次数），`after_merge` 路由到 dispatch（`brain/merge_engine.py`、`brain/nodes.py`、`brain/graph.py`）
 - ✅ **WebSocket 未实现** → 新增 `WS /ws/tasks/{task_id}` 与 SSE 并存，复用同一事件队列（`api/app.py`）
-- ✅ **外部通知未接** → 新增 `api/notify.py`，支持飞书/Slack/通用 webhook（`SWARM_NOTIFY_WEBHOOK_URL` + `SWARM_NOTIFY_FORMAT`），未配置静默跳过，已接入 approve/revise/reject
+- ✅ **外部通知** → `api/notify.py` 多渠道分发：`store.create_notification` 单一注入点触发 hook，推送飞书/钉钉/企业微信/Slack/通用 webhook；设置 tab 可视化配置 + 测试（`SWARM_NOTIFY_CHANNELS`，预留多用户 user_id），未配置静默跳过
 - ✅ **任务队列无优先级** → `TaskQueue` 支持 urgent>normal>background（Redis 三 List + 内存 fallback 同步），向后兼容；新增 `check_project_limit()` 软限制（`SWARM_MAX_ACTIVE_PROJECTS`，默认 10）（`infra/redis_client.py`）
 - ✅ **embedding 不可用无降级路径** → Layer B 失败时 Layer A 独立成功，文件暂存 `kb_pending_embeddings` 重试队列，`retry_pending_embeddings()` 在服务恢复后补处理（`knowledge/updater.py`）
 
