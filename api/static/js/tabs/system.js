@@ -69,7 +69,31 @@ async function loadSystemStats() {
         trendEl.title = `近30天 ${eff.recent_mistakes} · 前30天 ${eff.prior_mistakes}`;
       }
     }
+    // 项目级定制沙箱：展示当前项目专属模板 ID（系统在预处理时按真实环境构建并配置）。
+    renderProjectSandboxTemplate(data.sandbox_template, data.sandbox_deps_hash);
   } catch { /* ignore */ }
+}
+
+// 渲染「当前项目专属沙箱模板」块（项目统计/关联沙箱页）。
+// 一个模板可开多个沙箱，这里明确标注本项目【使用】的专属模板 ID。
+function renderProjectSandboxTemplate(templateId, depsHash) {
+  const el = $('project-sandbox-template');
+  if (!el) return;
+  if (templateId) {
+    el.innerHTML = `
+      <div class="psbtpl-row">
+        <span class="psbtpl-label">本项目专属模板</span>
+        <code class="psbtpl-id" title="一个模板可开多个沙箱，下方列表为基于此模板的活跃实例">${escapeHtml(templateId)}</code>
+        <button class="btn btn-ghost btn-xs" onclick="navigator.clipboard.writeText('${escapeHtml(templateId)}').then(()=>showToast('已复制模板 ID','success'))" title="复制模板 ID">复制</button>
+        ${depsHash ? `<span class="psbtpl-hash hint" title="依赖指纹：依赖变化时重建模板">deps:${escapeHtml(depsHash)}</span>` : ''}
+      </div>`;
+  } else {
+    el.innerHTML = `
+      <div class="psbtpl-row psbtpl-empty">
+        <span class="psbtpl-label">本项目专属模板</span>
+        <span class="hint">未配置（使用通用语言模板；启用项目级定制沙箱后预处理时自动构建）</span>
+      </div>`;
+  }
 }
 
 // ─── 上层系统级（全局，不依赖项目）──────────────────────────

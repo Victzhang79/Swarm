@@ -1690,6 +1690,42 @@ html, body {
   word-break: break-all;
 }
 
+/* 项目专属沙箱模板块（stats/关联沙箱页） */
+.project-sandbox-template {
+  margin: 0 14px 8px;
+  flex-shrink: 0;
+}
+.psbtpl-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-elevated, rgba(255,255,255,0.03));
+  border: 1px solid var(--border, rgba(255,255,255,0.08));
+  border-left: 3px solid var(--accent, #4a9eff);
+  border-radius: var(--radius-sm);
+}
+.psbtpl-row.psbtpl-empty {
+  border-left-color: var(--text-muted, #888);
+}
+.psbtpl-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.psbtpl-id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary, #e8e8e8);
+  word-break: break-all;
+}
+.psbtpl-hash {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 /* Animations */
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }

@@ -1004,6 +1004,17 @@ async def get_stats(project_id: str | None = None):
     stats = await loop.run_in_executor(None, lambda: store.get_task_stats(project_id))
     if project_id:
         stats["project_id"] = project_id
+        # 项目级定制沙箱：附带当前项目专属模板 ID（系统配置好的，供项目统计页展示）。
+        # 见 docs/Project_Scoped_Sandbox_Design.md。
+        try:
+            from swarm.project.store import get_project
+            _proj = await loop.run_in_executor(None, lambda: get_project(project_id))
+            _cfg = (_proj or {}).get("config") or {}
+            stats["sandbox_template"] = _cfg.get("sandbox_template") or ""
+            stats["sandbox_deps_hash"] = _cfg.get("sandbox_deps_hash") or ""
+        except Exception:  # noqa: BLE001 — 读项目失败不影响统计返回
+            stats["sandbox_template"] = ""
+            stats["sandbox_deps_hash"] = ""
     return stats
 
 
