@@ -112,37 +112,41 @@ def test_delete_and_cache_invalidate(_clean):
 
 @_pg
 def test_provider_key_from_db_overrides_env(_clean):
-    """_effective_providers 的 api_key 从 db 优先（覆盖 .env 明文）。"""
+    """_resolve_api_key 从 db 优先（覆盖 .env 明文）。
+
+    用测试专用 provider id（_test_prov_*），绝不碰真实 provider key（siliconflow/local），
+    避免测试污染生产库的真实 API key。
+    """
     from swarm.config.settings import ModelConfig
 
-    secret_store.set_secret("provider_api_key:siliconflow", "db-encrypted-key")
+    test_pid = "_test_prov_override"
+    secret_store.set_secret(f"provider_api_key:{test_pid}", "db-encrypted-key")
     secret_store.invalidate_cache()
-    cfg = ModelConfig(
-        siliconflow_base_url="https://api.siliconflow.cn/v1",
-        siliconflow_api_key="env-plaintext-key",  # .env 明文
-    )
-    providers = cfg._effective_providers()
-    sf = next(p for p in providers if p.id == "siliconflow")
-    assert sf.api_key == "db-encrypted-key", "应优先用 db 的 key"
-    secret_store.delete_secret("provider_api_key:siliconflow")
-    secret_store.invalidate_cache()
+    try:
+        cfg = ModelConfig()
+        resolved = cfg._resolve_api_key(test_pid, "env-plaintext-key")
+        assert resolved == "db-encrypted-key", "应优先用 db 的 key"
+    finally:
+        secret_store.delete_secret(f"provider_api_key:{test_pid}")
+        secret_store.invalidate_cache()
     print("  ✅ 集成: provider key 从 db 优先(覆盖.env明文)")
 
 
 @_pg
 def test_provider_key_falls_back_to_env(_clean):
-    """db 没有该 provider key 时回退 .env 明文（向后兼容）。"""
+    """db 没有该 provider key 时回退 .env 明文（向后兼容）。
+
+    用测试专用 provider id，确保该 id 在 db 中不存在 → 回退传入的 env 值。
+    不删除/触碰任何真实 provider key。
+    """
     from swarm.config.settings import ModelConfig
 
-    secret_store.delete_secret("provider_api_key:local")
+    test_pid = "_test_prov_fallback_nonexist"
+    secret_store.delete_secret(f"provider_api_key:{test_pid}")  # 确保不存在
     secret_store.invalidate_cache()
-    cfg = ModelConfig(
-        local_base_url="http://ai.bit:3000/api",
-        local_api_key="env-local-key",
-    )
-    providers = cfg._effective_providers()
-    local = next(p for p in providers if p.id == "local")
-    assert local.api_key == "env-local-key", "db 无则回退 .env"
+    cfg = ModelConfig()
+    resolved = cfg._resolve_api_key(test_pid, "env-local-key")
+    assert resolved == "env-local-key", "db 无则回退 .env"
     print("  ✅ 集成: db 无 key → 回退 .env(向后兼容)")
 
 
