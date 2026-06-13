@@ -56,10 +56,17 @@ def _ensure_sync_tables() -> None:
     注意：auth 表单独放在 _ensure_auth_tables_after_memory()，因为 auth 的
     _PROFILE_MIGRATION 会 ALTER mem_user_profile，必须在 memory 表建好之后才能跑。
     """
+    from swarm.models.capability_store import ensure_tables as ensure_capability_tables
     from swarm.project.store import ensure_tables as ensure_project_tables
 
     ensure_project_tables()
     print("  ✅ project / task_records / preprocess_progress / milestone_reports")
+    ensure_capability_tables()
+    print("  ✅ model_capabilities")
+    from swarm.config.secret_store import ensure_tables as ensure_secret_tables
+
+    ensure_secret_tables()
+    print("  ✅ secret_store（敏感信息加密存储）")
 
 
 def _ensure_auth_tables() -> None:

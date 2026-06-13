@@ -45,10 +45,66 @@ def _auto_mode(state: BrainState) -> bool:
 
 
 def _context_budget() -> int:
+    """子任务上下文预算（设计 v3 A.4，诚实分步）。
+
+    预算 = min(实际干活模型真实 context_window × 0.75, 启发式兜底)。
+    - 用能力库探测到的真实窗口设上限（消除写死 150k 与真实模型脱钩的债）。
+    - 取所有候选 worker 模型里**最小**的窗口（保守：预算须让各难度子任务都装得下）。
+    - 无能力数据 / 全是 default 兜底 → 退回写死兜底常量，不假装精确。
+    - env 显式设 SWARM_SUBTASK_CONTEXT_BUDGET 时**强制覆盖**（运维逃生口）。
+
+    诚实声明：est_context_tokens 当前仍是启发式粗估（难度基线+文件数×6k），
+    本批只把"上限"接到真实窗口；预估精度升级（tokenizer 实算+执行回写校准）
+    是后续债，见 docs/Multimodal_Ingestion_Design.md A.5 第二步。
+    """
+    # env 显式覆盖优先（运维逃生口，向后兼容）
+    env_val = os.environ.get("SWARM_SUBTASK_CONTEXT_BUDGET", "").strip()
+    if env_val:
+        try:
+            return int(env_val)
+        except (ValueError, TypeError):
+            pass
+
+    fallback = DEFAULT_CONTEXT_BUDGET
+    real_window = _min_worker_context_window()
+    if real_window and real_window > 0:
+        # 真实窗口 × 0.75 与兜底取 min（既用真值设上限，又保留保守兜底）
+        return min(int(real_window * 0.75), fallback)
+    return fallback
+
+
+def _min_worker_context_window() -> int | None:
+    """从能力库取所有候选 worker 模型里最小的真实 context_window。
+
+    候选 = 路由三档 primary + fallback（实际可能干活的模型）。
+    只采纳 source != default 的记录（真值/解析/人工）；全是 default 兜底则返回 None
+    → 调用方退回写死兜底，不假装精确。
+    """
     try:
-        return int(os.environ.get("SWARM_SUBTASK_CONTEXT_BUDGET", "") or DEFAULT_CONTEXT_BUDGET)
-    except (ValueError, TypeError):
-        return DEFAULT_CONTEXT_BUDGET
+        from swarm.config.settings import get_config
+        from swarm.models import capability_store as cap
+
+        cfg = get_config().model
+        candidate_models = [
+            cfg.routing_trivial, cfg.routing_trivial_fallback,
+            cfg.routing_medium, cfg.routing_medium_fallback,
+            cfg.routing_complex, cfg.routing_complex_fallback,
+        ]
+        candidate_models = [m for m in candidate_models if m]
+
+        windows: list[int] = []
+        for model_name in candidate_models:
+            pc = cfg.provider_for_model(model_name)
+            if pc is None:
+                continue
+            rec = cap.get_capability(pc.id, model_name)
+            # 只信真值（探测/解析/人工），跳过启发式默认与缺失
+            if (rec and rec.get("context_window") and rec.get("source") != cap.SOURCE_DEFAULT):
+                windows.append(int(rec["context_window"]))
+        return min(windows) if windows else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读能力库取最小窗口失败，回退写死兜底: %s", exc)
+        return None
 
 
 # ══════════════════════════════════════════════
@@ -115,6 +171,18 @@ async def clarify(state: BrainState) -> dict:
     # 故 history 记录（interrupt 之后）能正确拿到答复。
     knowledge_prompt = _format_knowledge(state)
     history_prompt = _format_clarify_history(history) or "（无）"
+    # B 部分：有待确认的 AI 视觉理解 → 提示 LLM 优先确认（防幻觉，B.2）。
+    vision_pending = state.get("ingest_vision_pending") or []
+    if vision_pending:
+        vlines = "\n".join(
+            f"- 文件「{v.get('filename')}」AI 理解为：{v.get('understanding', '')[:200]}"
+            for v in vision_pending
+        )
+        knowledge_prompt = (
+            f"{knowledge_prompt}\n\n"
+            f"【⚠️ 以下是 AI 对上传图片/扫描件的视觉理解，尚未经用户确认，"
+            f"请优先生成问题让用户核对其准确性】：\n{vlines}"
+        )
     try:
         llm = _get_brain_llm()
         resp = await llm.ainvoke([

@@ -169,6 +169,12 @@ class ModelRouter:
     def _resolve_route(self, difficulty: str, modality: str) -> tuple[str, str]:
         """查路由表 → (primary_model_name, fallback_model_name)"""
         if modality == "multimodal":
+            # 设计 v3 A.5：优先从能力库筛 supports_multimodal=True 的模型，
+            # 而非读写死的 routing_multimodal。能力库无可用项则回退写死配置。
+            mm_primary = self._multimodal_model_from_capabilities()
+            if mm_primary:
+                # primary 用能力库选出的真·多模态模型；fallback 仍用写死配置兜底
+                return (mm_primary, self.config.routing_multimodal_fallback)
             return (
                 self.config.routing_multimodal,
                 self.config.routing_multimodal_fallback,
@@ -183,6 +189,32 @@ class ModelRouter:
             difficulty,
             (self.config.routing_medium, self.config.routing_medium_fallback),
         )
+
+    def _multimodal_model_from_capabilities(self) -> str | None:
+        """从能力库挑一个 supports_multimodal=True 的模型（设计 A.5）。
+
+        偏好：探测确认（source=probed/parsed/manual）的多模态模型优先于启发式默认；
+        同等条件下 context_window 大者优先（看图常带长文本）。
+        无能力库数据 / 无多模态模型 → 返回 None，调用方回退写死 routing_multimodal。
+        """
+        try:
+            from swarm.models import capability_store as cap
+
+            rows = cap.list_capabilities()
+            mm = [r for r in rows if r.get("supports_multimodal")]
+            if not mm:
+                return None
+
+            def _rank(r: dict) -> tuple[int, int]:
+                # 探测确认的排前（source != default → 1），再按 context_window 降序
+                confirmed = 0 if r.get("source") == cap.SOURCE_DEFAULT else 1
+                return (confirmed, int(r.get("context_window") or 0))
+
+            best = max(mm, key=_rank)
+            return best.get("model_id") or None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("从能力库选多模态模型失败，回退写死配置: %s", exc)
+            return None
 
     def _get_provider_for_model(self, model_name: str) -> EndpointProvider:
         """模型 → EndpointProvider。按 config.provider_for_model() 显式归属优先，
