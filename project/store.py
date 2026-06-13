@@ -136,6 +136,11 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS created_by_user_id TEXT",
     # Q4 规划子图：澄清/技术方案/评审产物（可追溯回看）
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS planning_artifacts JSONB DEFAULT '{}'",
+    # B 部分：多模态摄取 —— 上传文件路径 + 「模型自行确认」选项 + 需求池模式
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS uploaded_files JSONB DEFAULT '[]'",
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS auto_confirm_vision BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS pooled BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
 ]
 
 _TASK_SELECT = """
@@ -144,7 +149,8 @@ _TASK_SELECT = """
     human_decision, merged_diff, thread_id,
     token_usage, duration_seconds,
     merge_conflicts, l3_result, created_by_user_id,
-    created_at, updated_at
+    created_at, updated_at,
+    uploaded_files, auto_confirm_vision, pooled, ingest_draft
 """
 
 
@@ -433,18 +439,30 @@ def create_task(
     project_id: str,
     description: str,
     created_by_user_id: str | None = None,
+    uploaded_files: list[str] | None = None,
+    auto_confirm_vision: bool = False,
+    pooled: bool = False,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
-    """创建任务记录"""
+    """创建任务记录。
+
+    uploaded_files: B 部分上传的文件路径（任务专属目录，绝对路径）。
+    auto_confirm_vision: 用户勾选「模型自行确认」→ 跳过图片理解人工确认。
+    pooled: True=仅入需求池（不立即执行），False=立即执行。
+    """
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                INSERT INTO task_records (id, project_id, description, created_by_user_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO task_records (
+                    id, project_id, description, created_by_user_id,
+                    uploaded_files, auto_confirm_vision, pooled
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING {_TASK_SELECT}
                 """,
-                (task_id, project_id, description, created_by_user_id),
+                (task_id, project_id, description, created_by_user_id,
+                 Jsonb(uploaded_files or []), auto_confirm_vision, pooled),
             )
             row = cur.fetchone()
     task = _row_to_task(row)
@@ -1344,6 +1362,10 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         "created_by_user_id": row[15],
         "created_at": row[16],
         "updated_at": row[17],
+        "uploaded_files": _parse_json_list(row[18]) if len(row) > 18 else [],
+        "auto_confirm_vision": bool(row[19]) if len(row) > 19 else False,
+        "pooled": bool(row[20]) if len(row) > 20 else False,
+        "ingest_draft": (row[21] or "") if len(row) > 21 else "",
     }
 
 

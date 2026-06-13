@@ -469,6 +469,14 @@ async def run_task(
         "auto_accept": auto_accept,
     }
 
+    # B 部分：透传上传文件给摄取节点（存在 task_records.uploaded_files）。
+    # 无文件时 ingest 节点 no-op 直通，对纯文字任务零影响。
+    _uploaded = task_rec.get("uploaded_files") or []
+    if _uploaded:
+        initial_state["uploaded_files"] = list(_uploaded)
+    if task_rec.get("auto_confirm_vision"):
+        initial_state["auto_confirm_vision"] = True
+
     project_path = None
     try:
         proj = store.get_project(project_id)

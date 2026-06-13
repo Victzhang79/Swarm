@@ -52,6 +52,7 @@ from swarm.brain.planning_nodes import (
     review_design,
     tech_design,
 )
+from swarm.brain.ingest_node import ingest
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.types import Complexity, HumanDecision
@@ -311,6 +312,7 @@ def build_brain_graph() -> StateGraph:
     graph = StateGraph(BrainState)
 
     # ── 注册节点 ──
+    graph.add_node("ingest", ingest)        # B 部分：多模态需求摄取（前置于 analyze）
     graph.add_node("analyze", analyze)
     # Q4 规划子图节点
     graph.add_node("clarify", clarify)
@@ -334,7 +336,8 @@ def build_brain_graph() -> StateGraph:
     graph.add_node("increment_retry", _increment_plan_retry)
 
     # ── 设置入口 ──
-    graph.set_entry_point("analyze")
+    graph.set_entry_point("ingest")          # B 部分：先摄取上传文件（无文件则直通）
+    graph.add_edge("ingest", "analyze")      # 摄取后进入分析
 
     # ── 线性边 ──
     # analyze → plan 改为条件边（见下方 after_analyze，接入 Q4 规划子图）

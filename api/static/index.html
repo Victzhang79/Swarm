@@ -107,9 +107,26 @@
                 <div class="task-list-head">
                   <div class="task-compose">
                     <textarea id="new-task-input" placeholder="描述任务，例如：给 parser.py 添加 TOML 注释支持…" rows="3"></textarea>
+                    <!-- B 部分：多模态附件上传（拖拽/选择，白名单 png/jpg/webp/pdf/docx/md/txt）-->
+                    <div id="task-upload-zone" style="border:1px dashed var(--border);border-radius:6px;padding:6px 10px;margin:4px 0;font-size:11px;color:var(--text-muted);cursor:pointer"
+                         onclick="document.getElementById('task-file-input').click()"
+                         ondragover="event.preventDefault();this.style.borderColor='var(--primary,#4f8)'"
+                         ondragleave="this.style.borderColor='var(--border)'"
+                         ondrop="event.preventDefault();this.style.borderColor='var(--border)';handleTaskFileDrop(event)">
+                      📎 拖拽或点击上传需求文件（图片/PDF/DOCX/MD/TXT，单文件≤20MB）
+                      <input type="file" id="task-file-input" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,.docx,.md,.markdown,.txt"
+                             style="display:none" onchange="handleTaskFileSelect(event)">
+                    </div>
+                    <div id="task-upload-list" style="font-size:11px;margin-bottom:4px"></div>
                     <div class="task-compose-actions">
                       <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
                         <input type="checkbox" id="task-auto-accept"> 自动通过审核（E2E）
+                      </label>
+                      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer" title="上传图片时，跳过人工确认 AI 的视觉理解（信任模型）">
+                        <input type="checkbox" id="task-auto-confirm-vision"> 模型自行确认图片理解
+                      </label>
+                      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer" title="仅放入需求池，稍后手动执行">
+                        <input type="checkbox" id="task-pooled"> 仅入池（不立即执行）
                       </label>
                       <div id="task-readiness-hint" class="hidden" style="font-size:11px;color:var(--orange);flex:1;min-width:200px"></div>
                       <button class="btn btn-primary btn-sm" id="btn-create-task" onclick="createTask()">创建任务</button>

@@ -107,3 +107,11 @@ class BrainState(TypedDict, total=False):
     # ─── 上下文预算 + INVEST 自检(Q7/A)───
     oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）
     invest_fail_count: int              # INVEST 自检未过被打回再拆的次数
+
+    # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
+    uploaded_files: list[str]           # 任务创建时上传的文件路径（绝对路径，任务专属目录）
+    ingest_draft: str                   # 摄取层产出的需求草稿（文档解析+图片理解合并）
+    ingest_vision_pending: list[dict]   # 待人工确认的 AI 视觉理解 [{filename, understanding, confirmed}]
+    ingest_done: bool                   # 摄取是否已完成（幂等：避免重复摄取）
+    ingest_errors: list[str]            # 摄取过程中的非致命错误（单文件失败等）
+    auto_confirm_vision: bool           # 用户勾选「模型自行确认」→ 跳过图片理解的人工确认（B.2）

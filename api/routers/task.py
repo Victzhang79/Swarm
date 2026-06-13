@@ -28,6 +28,10 @@ class TaskCreateRequest(BaseModel):
     auto_accept: bool = Field(default=False, description="自动通过审核（E2E/演示）")
     priority: str = Field(default="normal", description="队列优先级: urgent / normal / background")
     force: bool = Field(default=False, description="跳过重复检测，强制新建（即使有同描述的进行中任务）")
+    # B 部分：多模态摄取
+    uploaded_files: list[str] = Field(default_factory=list, description="上传文件路径（来自 /api/uploads）")
+    auto_confirm_vision: bool = Field(default=False, description="模型自行确认图片理解（跳过人工确认）")
+    pooled: bool = Field(default=False, description="仅入需求池（不立即执行），稍后手动触发")
 
 
 class TaskReviseRequest(BaseModel):
@@ -107,15 +111,35 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 project_id=project_id,
                 description=req.description,
                 created_by_user_id=user.id,
+                uploaded_files=req.uploaded_files or [],
+                auto_confirm_vision=req.auto_confirm_vision,
+                pooled=req.pooled,
             ),
         )
+        # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
+        initial_status = "POOLED" if req.pooled else "SUBMITTED"
         await loop.run_in_executor(
             None,
-            lambda: _app.store.update_task(task_id, status="SUBMITTED", thread_id=task_id),
+            lambda: _app.store.update_task(task_id, status=initial_status, thread_id=task_id),
         )
     except Exception as e:
         _app.logger.error(f"Failed to create task: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
+
+    # 需求池模式：不立即执行，等用户手动「执行」触发（POST .../execute）。
+    if req.pooled:
+        await loop.run_in_executor(
+            None,
+            lambda: _app.store.create_notification(
+                "task_created",
+                task_id=task_id,
+                project_id=project_id,
+                title="任务已入池",
+                message=f"#{task_id[:8]} {(req.description or '')[:80]}（待执行）",
+            ),
+        )
+        task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+        return {"status": "pooled", "task": task}
 
     from swarm.brain.scheduler import submit_task
 
@@ -349,6 +373,41 @@ async def retry_task_endpoint(task_id: str, req: TaskRetryRequest | None = None)
     register_task_queue(task_id)
     retry_task_background(task_id, auto_accept=auto_accept)
     return {"status": "ok", "task": jsonable_encoder(task), "message": "已提交重跑，Brain 重新执行"}
+
+
+# ─── POST /api/tasks/{task_id}/execute — 执行需求池任务（B.5）─
+@router.post("/api/tasks/{task_id}/execute", tags=["任务管理"])
+async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None, request: Request = None):  # type: ignore[assignment]
+    """把需求池里的 POOLED 任务转入执行（B.5 需求池模式）。
+
+    仅 POOLED 状态可执行；转 SUBMITTED 并入调度队列，走正常 Brain 流程
+    （含 ingest 摄取已上传的文件）。
+    """
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    if task.get("status") != "POOLED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务状态为 {task.get('status')}，仅 POOLED（需求池）任务可执行",
+        )
+
+    # 转 SUBMITTED + 清 pooled 标记
+    await loop.run_in_executor(
+        None,
+        lambda: _app.store.update_task(task_id, status="SUBMITTED"),
+    )
+
+    from swarm.brain.scheduler import submit_task
+
+    auto_accept = req.auto_accept if req else False
+    submit_task(
+        task_id, task["project_id"], task["description"],
+        auto_accept=bool(auto_accept), priority="normal",
+    )
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    return {"status": "ok", "task": jsonable_encoder(task), "message": "已从需求池触发执行"}
 
 
 # ─── GET /api/tasks/{task_id}/logs — 该任务执行日志 ─

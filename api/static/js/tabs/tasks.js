@@ -21,6 +21,10 @@ function renderTaskActions(t, compact) {
     : '';
   const cls = compact ? 'btn btn-ghost btn-sm' : 'btn btn-secondary btn-sm';
   let html = '';
+  // 需求池任务（B.5）：显示「执行」按钮
+  if (t.status === 'POOLED') {
+    html += `<button class="btn btn-primary btn-sm" style="${btnStyle}" onclick="event.stopPropagation();executePooledTask('${t.id}')" title="从需求池执行">▶ 执行</button>`;
+  }
   if (active) {
     html += `<button class="${cls}" style="${btnStyle}" onclick="event.stopPropagation();cancelTask('${t.id}')" title="取消">取消</button>`;
   }
@@ -553,10 +557,81 @@ async function ensureTaskReadiness() {
 
 // ─── Create & SSE ────────────────────────────────────────────
 
+// ─── B 部分：任务附件上传 ──────────────────────────────────
+// 选中文件暂存（待创建任务时一并上传）。
+let _pendingTaskFiles = [];
+
+function handleTaskFileSelect(event) {
+  _addTaskFiles(event.target.files);
+  event.target.value = '';  // 允许重复选同名文件
+}
+
+function handleTaskFileDrop(event) {
+  if (event.dataTransfer && event.dataTransfer.files) {
+    _addTaskFiles(event.dataTransfer.files);
+  }
+}
+
+const _UPLOAD_ALLOWED = ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.docx', '.md', '.markdown', '.txt'];
+const _UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
+
+function _addTaskFiles(fileList) {
+  for (const f of fileList) {
+    const ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
+    if (!_UPLOAD_ALLOWED.includes(ext)) {
+      showToast(`不支持的格式: ${f.name}`, 'warning');
+      continue;
+    }
+    if (f.size > _UPLOAD_MAX_BYTES) {
+      showToast(`文件过大(>20MB): ${f.name}`, 'warning');
+      continue;
+    }
+    if (_pendingTaskFiles.length >= 10) {
+      showToast('最多 10 个文件', 'warning');
+      break;
+    }
+    _pendingTaskFiles.push(f);
+  }
+  _renderTaskFileList();
+}
+
+function _renderTaskFileList() {
+  const el = $('task-upload-list');
+  if (!el) return;
+  if (!_pendingTaskFiles.length) { el.innerHTML = ''; return; }
+  el.innerHTML = _pendingTaskFiles.map((f, i) =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--bg-subtle,rgba(0,0,0,0.04));border-radius:4px;padding:2px 6px;margin:2px">
+       📄 ${escapeHtml(f.name)} (${(f.size / 1024).toFixed(0)}KB)
+       <span style="cursor:pointer;color:var(--text-muted)" onclick="_removeTaskFile(${i})">✕</span>
+     </span>`
+  ).join('');
+}
+
+function _removeTaskFile(i) {
+  _pendingTaskFiles.splice(i, 1);
+  _renderTaskFileList();
+}
+
+async function _uploadPendingFiles() {
+  if (!_pendingTaskFiles.length) return [];
+  const fd = new FormData();
+  for (const f of _pendingTaskFiles) fd.append('files', f);
+  const resp = await fetch('/api/uploads', { method: 'POST', body: fd });
+  if (!resp.ok) throw new Error('文件上传失败: ' + await resp.text());
+  const data = await resp.json();
+  const errors = (data.files || []).filter(f => f.error);
+  if (errors.length) {
+    errors.forEach(e => showToast(`${e.filename}: ${e.error}`, 'warning'));
+  }
+  return (data.files || []).filter(f => f.path).map(f => f.path);
+}
+
 async function createTask() {
   if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
   const description = $('new-task-input').value.trim();
-  if (!description) { showToast('请输入任务描述', 'warning'); return; }
+  if (!description && !_pendingTaskFiles.length) {
+    showToast('请输入任务描述或上传需求文件', 'warning'); return;
+  }
   if (!await ensureTaskReadiness()) return;
 
   $('btn-create-task').disabled = true;
@@ -565,12 +640,23 @@ async function createTask() {
     resetPipeline();
     showTaskDetailPanel();
 
+    // 先上传附件，拿到隔离存储后的路径
+    let uploadedPaths = [];
+    if (_pendingTaskFiles.length) {
+      appendLog('info', `上传 ${_pendingTaskFiles.length} 个附件…`);
+      uploadedPaths = await _uploadPendingFiles();
+    }
+
+    const pooled = $('task-pooled')?.checked || false;
     const resp = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId) + '/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        description,
+        description: description || '（见上传的需求文件）',
         auto_accept: $('task-auto-accept')?.checked || false,
+        uploaded_files: uploadedPaths,
+        auto_confirm_vision: $('task-auto-confirm-vision')?.checked || false,
+        pooled,
       }),
     });
     if (!resp.ok) throw new Error(await resp.text());
@@ -579,8 +665,19 @@ async function createTask() {
     const taskId = data.task?.id;
     if (!taskId) throw new Error('未返回 task id');
 
+    // 清空输入
     $('new-task-input').value = '';
+    _pendingTaskFiles = [];
+    _renderTaskFileList();
     selectedTaskId = taskId;
+
+    if (data.status === 'pooled') {
+      showToast('任务已入池（待执行）', 'success');
+      await loadTasks(selectedProjectId);
+      await selectTask(taskId);
+      return;
+    }
+
     appendLog('info', '任务已创建，Brain 编排中…');
     showToast('任务已创建', 'success');
     switchDetailTab('logs');
@@ -593,6 +690,24 @@ async function createTask() {
     appendLog('error', e.message);
   } finally {
     $('btn-create-task').disabled = false;
+  }
+}
+
+// 需求池：执行 POOLED 任务
+async function executePooledTask(taskId) {
+  try {
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    showToast('已从需求池触发执行', 'success');
+    await loadTasks(selectedProjectId);
+    await selectTask(taskId);
+    startTaskSSE(taskId);
+  } catch (e) {
+    showToast('执行失败: ' + e.message, 'error');
   }
 }
 
