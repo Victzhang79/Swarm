@@ -332,23 +332,55 @@ class HotSandboxPool:
             with self._lock:
                 self._created_at.pop(sid, None)
 
-    def reap(self) -> dict:
-        """回收超 TTL / 空闲 / 不健康的沙箱。
+    def _server_alive_ids(self) -> set[str] | None:
+        """拉 CubeSandbox 服务端权威存活沙箱 id 集合（用于清幽灵）。
 
-        返回 {"killed": n, "kept": m}。
+        返回 None 表示拉取失败（调用方应跳过幽灵清理，避免误杀）。
+        服务端可能比 Swarm 池更早回收沙箱（两边 TTL 不一致），导致池里残留
+        “幽灵”idle 条目——取用时才被 health_check 发现死掉。这里提前识别。
+        """
+        try:
+            from e2b_code_interpreter import Sandbox as _Sandbox
+            alive: set[str] = set()
+            paginator = _Sandbox.list()
+            items = getattr(paginator, "sandboxes", None)
+            if items is None and hasattr(paginator, "next_items"):
+                # 分页 API：取首页即可（池规模小）
+                items = paginator.next_items()
+            for sb in (items or []):
+                sid = getattr(sb, "sandbox_id", None) or getattr(sb, "id", None)
+                if sid:
+                    alive.add(sid)
+            return alive
+        except Exception:  # noqa: BLE001 — 拉取失败返回 None，调用方跳过幽灵清理
+            logger.debug("拉取服务端沙箱列表失败，跳过幽灵清理", exc_info=True)
+            return None
+
+    def reap(self) -> dict:
+        """回收超 TTL / 空闲 / 不健康 / 服务端已消失（幽灵）的沙箱。
+
+        返回 {"killed": n, "kept": m, "ghosts": g}。
         锁内收集待杀列表，锁外逐一 kill（单个失败不中断）。
         """
         to_kill: list[str] = []
         to_keep: list[_PoolEntry] = []
+        ghost_sids: list[str] = []
         now = time.monotonic()
+
+        # 锁外拉服务端权威存活列表（慢调用不持锁）。None=拉取失败，本轮不清幽灵。
+        alive_ids = self._server_alive_ids()
 
         with self._lock:
             for key in list(self._pool.keys()):
                 bucket = self._pool[key]
                 surviving: list[_PoolEntry] = []
                 for entry in bucket:
+                    sid = entry.sandbox.sandbox_id
                     if self._is_expired_ttl(entry, now) or self._is_expired_idle(entry, now):
-                        to_kill.append(entry.sandbox.sandbox_id)
+                        to_kill.append(sid)
+                    elif alive_ids is not None and sid not in alive_ids:
+                        # 幽灵：Swarm 池还留着，但服务端已无此沙箱 → 剔除（无需远端 kill）
+                        ghost_sids.append(sid)
                     else:
                         surviving.append(entry)
                         to_keep.append(entry)
@@ -357,14 +389,16 @@ class HotSandboxPool:
                 else:
                     del self._pool[key]
 
-        # 锁外 kill
+        # 锁外 kill（仅对 TTL/idle 过期的真实远端沙箱；幽灵无需 kill，已不存在）
         for sid in to_kill:
             self._kill_one(sid)
         with self._lock:
-            for sid in to_kill:
+            for sid in to_kill + ghost_sids:
                 self._created_at.pop(sid, None)
+        if ghost_sids:
+            logger.info("reap 清理幽灵 idle 条目（服务端已消失）: %d 个", len(ghost_sids))
 
-        return {"killed": len(to_kill), "kept": len(to_keep)}
+        return {"killed": len(to_kill), "kept": len(to_keep), "ghosts": len(ghost_sids)}
 
     def drain(self) -> None:
         """清空池，全部 kill。单个失败不中断。"""

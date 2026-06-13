@@ -25,7 +25,10 @@ source "${PROJECT_ROOT}/.env" 2>/dev/null || true
 set +a
 
 log "启动 Swarm API (端口 ${PORT})..."
-nohup "${VENV}/bin/uvicorn" swarm.api.app:app \
+# PYTHONUNBUFFERED=1: stdout 重定向到文件时默认块缓冲，导致 worker 早期日志
+# （准备/选沙箱模板等）延迟数十秒甚至任务跑完才落盘，排障时看不到。
+# 设为无缓冲让日志实时进 swarm.log。
+nohup env PYTHONUNBUFFERED=1 "${VENV}/bin/uvicorn" swarm.api.app:app \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --log-level info \

@@ -196,18 +196,51 @@ def test_reap_idle_expired():
     print("  ✅ reap 回收超空闲沙箱")
 
 
-def test_reap_keeps_healthy():
+def test_reap_keeps_healthy(monkeypatch):
     """reap 保留未过期且健康的沙箱。"""
     mgr = FakeManager()
     pool = _make_pool(mgr, ttl_seconds=600, idle_seconds=300)
     sbx = pool.acquire("tpl-a")
     pool.release(sbx, reusable=True)
 
+    # 隔离真实 e2b：不依赖服务端列表（否则 FakeManager 假沙箱会被当幽灵清掉）
+    monkeypatch.setattr(pool, "_server_alive_ids", lambda: None)
     result = pool.reap()
     assert result["killed"] == 0
     assert result["kept"] == 1
     assert sbx.sandbox_id not in mgr._killed
     print("  ✅ reap 保留健康未过期沙箱")
+
+
+def test_reap_cleans_ghost(monkeypatch):
+    """reap 清理幽灵：池里有但服务端已消失的 idle 条目被剔除（无需远端 kill）。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr, ttl_seconds=600, idle_seconds=300)
+    sbx = pool.acquire("tpl-a")
+    pool.release(sbx, reusable=True)
+    # 模拟服务端权威列表【不含】该沙箱（它被服务端提前回收了）→ 幽灵
+    monkeypatch.setattr(pool, "_server_alive_ids", lambda: set())
+    result = pool.reap()
+    assert result["ghosts"] == 1, f"应识别1个幽灵, got {result}"
+    assert result["kept"] == 0
+    # 幽灵无需远端 kill（已不存在），不应进 _killed
+    assert sbx.sandbox_id not in mgr._killed
+    # 池内已剔除
+    with pool._lock:
+        assert not pool._pool.get("tpl-a")
+    print("  ✅ reap 清理幽灵 idle 条目（服务端已消失，不误 kill）")
+
+
+def test_reap_skips_ghost_when_server_list_unavailable(monkeypatch):
+    """服务端列表拉取失败(None) → 跳过幽灵清理，保留沙箱（避免误杀）。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr, ttl_seconds=600, idle_seconds=300)
+    sbx = pool.acquire("tpl-a")
+    pool.release(sbx, reusable=True)
+    monkeypatch.setattr(pool, "_server_alive_ids", lambda: None)  # 拉取失败
+    result = pool.reap()
+    assert result["ghosts"] == 0 and result["kept"] == 1
+    print("  ✅ 服务端列表不可用时跳过幽灵清理(不误杀)")
 
 
 def test_max_total_temp_sandbox():

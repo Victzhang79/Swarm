@@ -83,7 +83,8 @@ source "${PROJECT_ROOT}/.env" 2>/dev/null || true
 set +a
 
 log "启动 Swarm API (端口 ${PORT})..."
-daemonize swarm "${VENV}/bin/uvicorn" swarm.api.app:app \
+# PYTHONUNBUFFERED=1: 避免 stdout 重定向到文件时块缓冲导致 worker 早期日志延迟落盘
+daemonize swarm env PYTHONUNBUFFERED=1 "${VENV}/bin/uvicorn" swarm.api.app:app \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --log-level info >/dev/null
