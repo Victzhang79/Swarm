@@ -17,6 +17,11 @@ async function checkHealth() {
   try {
     const resp = await fetch('/api/health');
     const data = await resp.json();
+    // 动态版本号（单一真相源 = swarm.__version__ / pyproject）
+    if (data.version) {
+      const vb = $('version-badge');
+      if (vb) vb.textContent = 'v' + data.version;
+    }
     if (data.status === 'ok' || resp.ok) {
       dot.className = 'health-dot ok';
       text.textContent = '在线';

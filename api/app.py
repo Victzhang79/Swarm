@@ -878,8 +878,12 @@ if _static_dir.is_dir():
 # ─── 1. GET /api/health ────────────────────────────
 @app.get("/api/health", tags=["系统"])
 async def health_check():
-    """健康检查"""
-    return {"status": "ok", "timestamp": time.time()}
+    """健康检查（含版本号，供前端 version-badge 动态显示）"""
+    try:
+        from swarm import __version__ as _ver
+    except Exception:  # noqa: BLE001
+        _ver = ""
+    return {"status": "ok", "timestamp": time.time(), "version": _ver}
 
 
 # ─── Auth / RBAC ───────────────────────────────────
