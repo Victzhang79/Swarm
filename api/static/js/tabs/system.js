@@ -157,7 +157,6 @@ function renderSandboxConfig(config) {
     <div class="sandbox-config-grid">
       <div><span class="label">API</span><code>${escapeHtml(config.api_url || '-')}</code></div>
       <div><span class="label">Proxy</span><code>${escapeHtml(config.proxy_base || '-')}</code></div>
-      <div><span class="label">模板</span><code>${escapeHtml(config.default_template || '-')}</code></div>
       <div><span class="label">Worker</span><span class="pill ${config.use_for_worker ? 'pill-green' : 'pill-gray'}">${config.use_for_worker ? '沙箱执行' : '本地执行'}</span></div>
     </div>`;
 }
