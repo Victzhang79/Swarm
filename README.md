@@ -195,7 +195,13 @@ curl -X POST http://localhost:8420/api/projects/<pid>/knowledge/webhook/git \
 
 ## 测试
 
-> 当前 **432 passing**（不含需外部 CubeSandbox 的 `test_sandbox_integration.py`）。
+> 当前 **585+ passing**（不含需外部 CubeSandbox 的 `test_sandbox_integration.py`）。
+
+> ⚠️ **测试隔离铁律**：任何接触真实数据存储（PG 表、secret_store、配置）的测试，
+> 必须用隔离命名空间（如 `_test_` 前缀的 key 名 / 临时记录 id），**绝不能用生产真实
+> 标识符在真库上 set/delete**，并用 `try/finally` 清理。本地跑测试连的是真 swarm 库，
+> 用真实标识符会覆盖/删除用户的真实数据（曾因 secret_store 测试用真实 key 名清空了
+> 用户的 API key，导致模型全 401）。secret_store/config 类测试一律用 `_test_prov_*` 等隔离名。
 
 ```bash
 # 推荐
