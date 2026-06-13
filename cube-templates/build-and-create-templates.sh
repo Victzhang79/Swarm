@@ -26,6 +26,25 @@ for lang in "${LANGS[@]}"; do
   img="$REGISTRY/sandbox-$lang:$TAG"
   log "==== 构建 $lang → $img ===="
   docker build -f "$DF_DIR/Dockerfile.$lang" -t "$img" "$DF_DIR"
+
+  # 构建后自测：envd /health（防 node 那种 envd 故障发布坏模板）
+  log "envd 健康自测 $lang ..."
+  cid="$(docker run -d -p 49983:49983 "$img" 2>/dev/null || true)"
+  if [ -n "$cid" ]; then
+    sleep 5
+    if curl -fsS localhost:49983/health >/dev/null 2>&1; then
+      log "✅ $lang envd /health 通过"
+    else
+      log "❌ $lang envd /health 不通 —— 镜像 envd 故障，跳过 create-from-image！（见 NODE_ENVD_FIX.md）"
+      docker rm -f "$cid" >/dev/null 2>&1 || true
+      NEW_TPL[$lang]="<envd自测失败,未创建模板>"
+      continue
+    fi
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+  else
+    log "⚠️ $lang 无法本地启动自测（端口占用?），跳过自测继续"
+  fi
+
   log "推送 $img"
   docker push "$img"
 
