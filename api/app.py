@@ -600,6 +600,24 @@ async def on_startup():
         logger.info("Project/Task tables ensured")
     except Exception as e:
         logger.warning(f"Failed to ensure project tables: {e}")
+    # 确保模型能力库表存在（设计 v3 A 部分）
+    try:
+        from swarm.models import capability_store
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, capability_store.ensure_tables)
+        logger.info("model_capabilities table ensured")
+    except Exception as e:
+        logger.warning(f"Failed to ensure model_capabilities table: {e}")
+    # 确保敏感信息加密存储表存在（API keys 等加密存 db）
+    try:
+        from swarm.config import secret_store
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, secret_store.ensure_tables)
+        logger.info("secret_store table ensured")
+    except Exception as e:
+        logger.warning(f"Failed to ensure secret_store table: {e}")
     try:
         from swarm.auth.store import (
             backfill_legacy_project_members,
@@ -1158,6 +1176,7 @@ from swarm.api.routers import observability as _observability_router  # noqa: E4
 from swarm.api.routers import project as _project_router  # noqa: E402
 from swarm.api.routers import sandbox as _sandbox_router  # noqa: E402
 from swarm.api.routers import task as _task_router  # noqa: E402
+from swarm.api.routers import upload as _upload_router  # noqa: E402
 from swarm.api.routers import worker as _worker_router  # noqa: E402
 
 app.include_router(_memory_router.router)
@@ -1167,5 +1186,6 @@ app.include_router(_auth_router.router)
 app.include_router(_sandbox_router.router)
 app.include_router(_project_router.router)
 app.include_router(_task_router.router)
+app.include_router(_upload_router.router)
 app.include_router(_config_router.router)
 app.include_router(_observability_router.router)

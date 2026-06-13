@@ -381,6 +381,11 @@ if [[ "$SKIP_ENV" == "false" ]]; then
         read -rp "LangSmith Project [swarm-dev]: " LS_PROJ
         LS_PROJ="${LS_PROJ:-swarm-dev}"
 
+        # 敏感信息加密根密钥（secret_store 用它加密 API keys 存 db）。
+        # 自动生成强随机值；用户无需输入。绝不提交 git（.env 已在 .gitignore）。
+        SECRET_KEY=$("$VENV_DIR/bin/python" -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" 2>/dev/null \
+            || openssl rand -base64 32)
+
         cat > "$ENV_FILE" << ENVEOF
 # ──────────────────────────────────────────────
 # Swarm 环境配置 — 由 setup.sh 自动生成
@@ -390,6 +395,9 @@ if [[ "$SKIP_ENV" == "false" ]]; then
 SWARM_DB_POSTGRES_URI=${PG_URI}
 SWARM_DB_REDIS_URI=redis://localhost:6379/0
 SWARM_DB_QDRANT_URL=http://localhost:6333
+
+# 敏感信息加密根密钥（secret_store 用它加密 API keys 存 db；务必保密，勿提交 git）
+SWARM_SECRET_KEY=${SECRET_KEY}
 
 # 模型 — SiliconFlow
 SWARM_MODEL_SILICONFLOW_BASE_URL=${SF_URL}

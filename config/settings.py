@@ -126,24 +126,52 @@ class ModelConfig(BaseSettings):
     stream_chunk_timeout: float = 45.0
 
     # ── 接入点解析 ────────────────────────────────────────────
+    def _resolve_api_key(self, provider_id: str, env_fallback: str) -> str:
+        """provider 的 api_key：优先从 db secret_store 解密读，回退 .env 明文值。
+
+        敏感信息加密存 db（用户需求）；db 没有该项时无缝回退 .env，保证向后兼容、
+        渐进迁移。延迟 import 避免与 secret_store 循环依赖。
+        secret key 命名约定：provider_api_key:<provider_id>。
+        """
+        try:
+            from swarm.config import secret_store
+
+            val = secret_store.get_secret(f"provider_api_key:{provider_id}")
+            if val:
+                return val
+        except Exception:  # noqa: BLE001
+            pass
+        return env_fallback
+
     def _effective_providers(self) -> list[ProviderConfig]:
         """返回生效的 provider 列表。
 
         providers 显式配置则用之；否则从老扁平字段合成 siliconflow(cloud) + local(local)
         两个默认接入点 —— 保证老 .env 不改也能工作。
+        每个 provider 的 api_key 优先从 db secret_store 解密读取（回退 .env 明文）。
         """
         if self.providers:
-            return self.providers
+            # 显式 providers：每个的 key 优先从 db 读（回退该 provider 自带的 .env 值）
+            resolved: list[ProviderConfig] = []
+            for p in self.providers:
+                key = self._resolve_api_key(p.id, p.api_key)
+                if key != p.api_key:
+                    resolved.append(p.model_copy(update={"api_key": key}))
+                else:
+                    resolved.append(p)
+            return resolved
         synthesized: list[ProviderConfig] = []
         if self.siliconflow_base_url:
             synthesized.append(ProviderConfig(
                 id="siliconflow", label="SiliconFlow", kind="cloud",
-                base_url=self.siliconflow_base_url, api_key=self.siliconflow_api_key,
+                base_url=self.siliconflow_base_url,
+                api_key=self._resolve_api_key("siliconflow", self.siliconflow_api_key),
             ))
         if self.local_base_url:
             synthesized.append(ProviderConfig(
                 id="local", label="本地推理", kind="local",
-                base_url=self.local_base_url, api_key=self.local_api_key,
+                base_url=self.local_base_url,
+                api_key=self._resolve_api_key("local", self.local_api_key),
             ))
         return synthesized
 
@@ -170,6 +198,36 @@ class ModelConfig(BaseSettings):
                     return p
         # 3) 实在没有就第一个
         return providers[0] if providers else None
+
+    def models_in_use(self) -> list[str]:
+        """用户模型策略里实际会用到的模型名集合（去重，保序）。
+
+        = brain(primary+fallback) + worker(primary+local+fallback)
+          + routing 四档(trivial/medium/complex/multimodal 各 primary+fallback)。
+        探测只需覆盖这些 —— 云端聚合接入点可能列出几十上百模型，全探既花钱又无意义。
+        """
+        candidates = [
+            self.brain_primary, self.brain_fallback,
+            self.worker_primary, self.worker_local, self.worker_fallback,
+            self.routing_trivial, self.routing_trivial_fallback,
+            self.routing_medium, self.routing_medium_fallback,
+            self.routing_complex, self.routing_complex_fallback,
+            self.routing_multimodal, self.routing_multimodal_fallback,
+        ]
+        seen: dict[str, None] = {}
+        for m in candidates:
+            if m and m not in seen:
+                seen[m] = None
+        return list(seen.keys())
+
+    def models_in_use_for_provider(self, provider_id: str) -> list[str]:
+        """在用模型里、归属指定 provider 的那些（探测某接入点时的精确目标集合）。"""
+        result: list[str] = []
+        for m in self.models_in_use():
+            pc = self.provider_for_model(m)
+            if pc and pc.id == provider_id:
+                result.append(m)
+        return result
 
 
 class WorkerConfig(BaseSettings):

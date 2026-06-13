@@ -14,7 +14,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 import swarm.api.app as _app
-from swarm.api._shared import _flatten_model_config, _mask_config_dict, _resolve_key
+from swarm.api._shared import (
+    _flatten_model_config,
+    _mask_config_dict,
+    _require_perm,
+    _require_user,
+    _resolve_key,
+)
 
 router = APIRouter()
 
@@ -397,19 +403,31 @@ async def update_model_providers(request: Request):
                 except (ValueError, TypeError):
                     pass
             clean.append(entry)
+
+        # 敏感信息加密存 db：把每个 provider 的 api_key 加密入 secret_store，
+        # 写进 .env 的 JSON 里 key 字段【清空】（不再明文落盘）。读取时 _effective_providers
+        # 从 db 解密补回。db 写失败则回退原行为（明文进 .env），保证不丢配置。
+        try:
+            from swarm.config import secret_store
+
+            for entry in clean:
+                key_val = entry.get("api_key", "")
+                if key_val:
+                    secret_store.set_secret(f"provider_api_key:{entry['id']}", key_val)
+                    entry["api_key"] = ""  # .env 里不留明文
+            _app.logger.info("provider api_keys 已加密存入 secret_store")
+        except Exception as exc:  # noqa: BLE001
+            _app.logger.warning("secret_store 写入失败，回退明文 .env: %s", exc)
+
         update_map["SWARM_MODEL_PROVIDERS"] = _json.dumps(clean, ensure_ascii=False)
 
         # B 方案：providers 是唯一真相源，但 /api/models 等老读取点仍读扁平字段。
-        # 把内置 id(siliconflow/local) 的 base_url/key 同步回写老字段，保持兼容。
+        # 把内置 id(siliconflow/local) 的 base_url 同步回写老字段（key 已转 db，不写明文）。
         for entry in clean:
             if entry["id"] == "siliconflow":
                 update_map["SWARM_MODEL_SILICONFLOW_BASE_URL"] = entry["base_url"]
-                if entry["api_key"]:
-                    update_map["SWARM_MODEL_SILICONFLOW_API_KEY"] = entry["api_key"]
             elif entry["id"] == "local":
                 update_map["SWARM_MODEL_LOCAL_BASE_URL"] = entry["base_url"]
-                if entry["api_key"]:
-                    update_map["SWARM_MODEL_LOCAL_API_KEY"] = entry["api_key"]
 
     if isinstance(body.get("model_providers"), dict):
         mp = {str(k): str(v) for k, v in body["model_providers"].items() if v}
@@ -445,6 +463,11 @@ async def update_model_providers(request: Request):
 
     from swarm.config.settings import reload_config as _reload_config
     _reload_config()
+    try:
+        from swarm.config import secret_store
+        secret_store.invalidate_cache()
+    except Exception:  # noqa: BLE001
+        pass
     _app.logger.info("Updated model providers: %s", list(update_map.keys()))
 
     from swarm.models.router import ModelRouter
@@ -575,3 +598,308 @@ async def test_notify_channel(request: Request):
     payload = _build_payload(ctype, "test", "", "这是一条来自 Swarm 的测试通知 ✅")
     ok = await _post_webhook(url, payload, tag="test")
     return {"status": "ok" if ok else "failed", "delivered": ok}
+
+
+# ═══════════════════════════════════════════════════════════
+# 模型能力探测与注册（设计 v3 A 部分 / A批2）
+# ═══════════════════════════════════════════════════════════
+
+# 探测 job 内存 registry（探测是瞬时操作，进程内存足够；能力结果本身落
+# model_capabilities 表已持久化）。key=provider_id。前端轮询 status 端点。
+_PROBE_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _provider_by_id(provider_id: str):
+    """从生效 provider 列表里按 id 找一个 ProviderConfig；找不到返回 None。"""
+    cfg = _app.get_config()
+    for p in cfg.model._effective_providers():
+        if p.id == provider_id:
+            return p
+    return None
+
+
+@router.post("/api/models/probe", tags=["配置"])
+async def probe_models(request: Request):
+    """触发对某 provider 模型的能力探测（异步，立即返回 job）。
+
+    设计 A.4：探测有副作用（真实 API 调用花 token/算力），必须用户显式触发；
+    不阻塞 —— 立即返回 job，后台异步探测写库，前端轮询 status。
+
+    scope：
+      - 省略（默认）= "auto"：按接入点类型智能决定 ——
+          * local（本地推理，免费）→ 全探（发现全部可用模型）
+          * cloud（云端 API，按 token 计费）→ 只探路由策略在用的模型（省钱）
+      - "in_use"：强制只探在用模型（任何接入点）。
+      - "all"：强制全探（任何接入点；云端慎用，几十上百模型费 token）。
+    Body: {"provider_id": "siliconflow", "scope": "auto"}
+    """
+    _require_perm(request, "config:write")
+    body = await request.json()
+    provider_id = str(body.get("provider_id", "")).strip()
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="缺少 provider_id")
+
+    provider = _provider_by_id(provider_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"接入点不存在: {provider_id}")
+
+    scope = str(body.get("scope", "auto")).strip() or "auto"
+    cfg = _app.get_config()
+
+    # auto：本地全探、云端只探在用（按 token 成本差异决定）
+    if scope == "auto":
+        scope = "all" if provider.kind == "local" else "in_use"
+
+    only_models: list[str] | None
+    if scope == "all":
+        only_models = None
+    else:
+        only_models = cfg.model.models_in_use_for_provider(provider_id)
+        if not only_models:
+            return {"status": "no_models_in_use", "provider_id": provider_id,
+                    "message": "该接入点下没有在用模型（路由策略未引用），无需探测"}
+
+    # 已在探测中则拒绝重复触发
+    existing = _PROBE_JOBS.get(provider_id)
+    if existing and existing.get("status") == "running":
+        return {"status": "already_running", "job": existing}
+
+    job = {
+        "provider_id": provider_id,
+        "status": "running",
+        "scope": scope,
+        "done": 0,
+        "total": len(only_models) if only_models is not None else 0,
+        "current": "",
+        "error": None,
+        "result": None,
+    }
+    _PROBE_JOBS[provider_id] = job
+
+    measure_speed = bool(body.get("measure_speed", True))
+
+    async def _run_probe():
+        from swarm.models import prober
+
+        def _cb(done, total, current):
+            job["done"] = done
+            job["total"] = total
+            job["current"] = current
+
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: prober.probe_provider(
+                    provider, only_models=only_models,
+                    measure_speed=measure_speed,
+                    persist=True, progress_cb=_cb,
+                ),
+            )
+            job["result"] = {
+                "total": result["total"],
+                "probed": result["probed"],
+                "errors": result.get("errors", []),
+                "provider_error": result.get("error"),
+            }
+            # provider 级错误（如认证失败/端点不可达）= 探测失败，不能伪装成 done。
+            if result.get("error"):
+                job["status"] = "error"
+                job["error"] = result["error"]
+                _app.logger.warning(
+                    "模型能力探测失败 provider=%s: %s", provider_id, result["error"],
+                )
+            else:
+                job["status"] = "done"
+                _app.logger.info(
+                    "模型能力探测完成 provider=%s probed=%d/%d",
+                    provider_id, result["probed"], result["total"],
+                )
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "error"
+            job["error"] = str(exc)
+            _app.logger.exception("模型能力探测失败 provider=%s", provider_id)
+
+    asyncio.create_task(_run_probe())
+    return {"status": "started", "job": job}
+
+
+@router.get("/api/models/probe/status", tags=["配置"])
+async def probe_status(provider_id: str, request: Request):
+    """查询某 provider 的探测 job 状态（前端轮询用）。"""
+    _require_user(request)
+    job = _PROBE_JOBS.get(provider_id)
+    if job is None:
+        return {"status": "idle", "provider_id": provider_id}
+    return job
+
+
+@router.get("/api/models/capabilities", tags=["配置"])
+async def get_capabilities(request: Request, provider_id: str | None = None):
+    """读模型能力库（全部或按 provider 过滤）。"""
+    _require_user(request)
+    from swarm.models import capability_store as cap
+
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(
+        None, lambda: cap.list_capabilities(provider_id)
+    )
+    return {"capabilities": rows, "count": len(rows)}
+
+
+@router.put("/api/models/capabilities", tags=["配置"])
+async def update_capability(request: Request):
+    """人工修正一条能力记录（A.4：探测失败/不准时手填，source=manual）。
+
+    Body: {"provider_id":"x","model_id":"y","context_window":128000,
+           "supports_multimodal":true,"gen_speed_tps":0,"kind":"local"}
+    """
+    _require_perm(request, "config:write")
+    from swarm.models import capability_store as cap
+
+    body = await request.json()
+    provider_id = str(body.get("provider_id", "")).strip()
+    model_id = str(body.get("model_id", "")).strip()
+    if not provider_id or not model_id:
+        raise HTTPException(status_code=400, detail="缺少 provider_id 或 model_id")
+
+    loop = asyncio.get_running_loop()
+    row = await loop.run_in_executor(
+        None,
+        lambda: cap.upsert_capability(
+            provider_id, model_id,
+            context_window=body.get("context_window"),
+            supports_multimodal=bool(body.get("supports_multimodal", False)),
+            gen_speed_tps=float(body.get("gen_speed_tps", 0.0) or 0.0),
+            kind=str(body.get("kind", "cloud")),
+            source=cap.SOURCE_MANUAL,
+            note=str(body.get("note", "人工修正")),
+        ),
+    )
+    return {"status": "ok", "capability": row}
+
+
+@router.delete("/api/models/capabilities", tags=["配置"])
+async def delete_capability_endpoint(request: Request, provider_id: str, model_id: str):
+    """删一条能力记录（清理脏数据/重探前用）。"""
+    _require_perm(request, "config:write")
+    from swarm.models import capability_store as cap
+
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(
+        None, lambda: cap.delete_capability(provider_id, model_id)
+    )
+    return {"status": "ok", "deleted": deleted}
+
+
+# ═══════════════════════════════════════════════════════════
+# 敏感信息加密存储（API keys 加密存 db，明文不落 .env）
+# ═══════════════════════════════════════════════════════════
+
+@router.get("/api/secrets/status", tags=["配置"])
+async def secrets_status(request: Request):
+    """敏感信息存储状态：哪些 key 已加密入 db、根密钥来源。"""
+    _require_user(request)
+    from swarm.config import secret_store
+
+    loop = asyncio.get_running_loop()
+    names = await loop.run_in_executor(None, secret_store.list_secret_names)
+    has_env_key = bool(os.environ.get("SWARM_SECRET_KEY", "").strip())
+    return {
+        "stored_secrets": names,
+        "count": len(names),
+        "root_key_source": "env(SWARM_SECRET_KEY)" if has_env_key else "db派生(弱,建议设SWARM_SECRET_KEY)",
+    }
+
+
+@router.post("/api/secrets/migrate", tags=["配置"])
+async def migrate_secrets_to_db(request: Request):
+    """一键迁移：把 .env 里现存的明文 API keys 加密入 db，并从 .env 清除明文。
+
+    扫描 providers 的 api_key + 扁平字段（siliconflow/local），加密存 secret_store，
+    然后把 .env 里对应明文清空。已在 db 的不重复迁移。
+    """
+    _require_perm(request, "config:write")
+    from swarm.config import secret_store
+
+    cfg = _app.get_config().model
+    loop = asyncio.get_running_loop()
+    migrated: list[str] = []
+
+    def _do_migrate():
+        # 1) 显式 providers 的 key
+        for p in (cfg.providers or []):
+            # 直接读原始配置的明文（绕过 _effective_providers 的 db 解密）
+            if p.api_key and "***" not in p.api_key:
+                secret_store.set_secret(f"provider_api_key:{p.id}", p.api_key)
+                migrated.append(f"provider_api_key:{p.id}")
+        # 2) 扁平字段（合成 provider）
+        if cfg.siliconflow_api_key:
+            secret_store.set_secret("provider_api_key:siliconflow", cfg.siliconflow_api_key)
+            migrated.append("provider_api_key:siliconflow")
+        if cfg.local_api_key:
+            secret_store.set_secret("provider_api_key:local", cfg.local_api_key)
+            migrated.append("provider_api_key:local")
+
+    await loop.run_in_executor(None, _do_migrate)
+
+    # 从 .env 清除已迁移的明文 key（SWARM_MODEL_PROVIDERS 的 JSON + 扁平字段）
+    cleared = await loop.run_in_executor(None, _clear_plaintext_keys_from_env)
+
+    # reload + 失效缓存
+    from swarm.config.settings import reload_config as _reload_config
+    await loop.run_in_executor(None, _reload_config)
+    await loop.run_in_executor(None, secret_store.invalidate_cache)
+
+    return {
+        "status": "ok",
+        "migrated": list(dict.fromkeys(migrated)),
+        "env_cleared": cleared,
+        "message": "明文 key 已加密入 db 并从 .env 清除",
+    }
+
+
+def _clear_plaintext_keys_from_env() -> list[str]:
+    """把 .env 里的明文 API key 字段清空（迁移到 db 后）。返回被清的字段名。"""
+    import json as _json
+
+    env_path = _app._PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return []
+    cleared: list[str] = []
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k, _, v = s.partition("=")
+            k = k.strip()
+            ku = k.upper()
+            # 扁平 key 字段 → 清空
+            if ku in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY") and v.strip():
+                out.append(f"{k}=")
+                cleared.append(k)
+                continue
+            # SWARM_MODEL_PROVIDERS 的 JSON → 清掉每个 provider 的 api_key
+            if ku == "SWARM_MODEL_PROVIDERS" and v.strip():
+                try:
+                    arr = _json.loads(v)
+                    changed = False
+                    for entry in arr:
+                        if isinstance(entry, dict) and entry.get("api_key"):
+                            entry["api_key"] = ""
+                            changed = True
+                    if changed:
+                        out.append(f"{k}={_json.dumps(arr, ensure_ascii=False)}")
+                        cleared.append(k)
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+        out.append(line)
+    if cleared:
+        env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        # 同步 os.environ
+        for k in cleared:
+            if k in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY"):
+                os.environ[k] = ""
+    return cleared

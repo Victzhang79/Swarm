@@ -130,6 +130,8 @@ pip install -e ".[dev]"
 | 记忆 | L1 结构化 UI · L2 注入 analyze/plan · L3 滑动窗口 · PatternExtractor · **L5+L6 衰减** |
 | 项目 | **导入现有目录 / greenfield 从零创建** · CodeGraph 预处理 · FileScope（writable/create/delete/allow_any）|
 | 平台 | RBAC · `infra/` Redis 模块锁 · **任务级联取消（删项目→终止运行中任务+沙箱）** · **append-only 任务审计日志** · `scripts/init_db.py` 统一建表 |
+| 模型能力 | **能力探测注册**（`model_capabilities` 表单一真相源）：分层探测真实 context_window（models字段→错误消息解析→网关200+usage推下界→启发式兜底）· 多模态/速度探测 · **本地全探/云端只探在用模型**（省 token）· 上下文预算/多模态选型读库消除写死常量 |
+| 多模态摄取 | **任务可上传需求文件**（图片/PDF/DOCX/MD/TXT，白名单+MIME+大小+路径隔离）· 文档确定性解析（PyMuPDF/python-docx）· **图片/扫描件多模态理解**（防幻觉标注，默认人工确认/可勾选模型自行确认）· **需求池**（仅入池待执行）· 摄取前置于 analyze，无文件零影响 |
 
 ---
 
@@ -246,7 +248,8 @@ python scripts/benchmark_accept_rate.py --project-id <pid> --phase 1
 | 变量 | 说明 |
 |------|------|
 | `SWARM_DB_POSTGRES_URI` | PostgreSQL |
-| `SWARM_MODEL_SILICONFLOW_API_KEY` | 默认云端接入点（SiliconFlow）API Key |
+| `SWARM_SECRET_KEY` | **敏感信息加密根密钥**：secret_store 用它把 API keys 加密存 db（明文不落 .env）。setup.sh 自动生成；手动部署用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。未设则用 db 连接串派生弱密钥（生产务必显式设置）。一键迁移现存明文 key 入库：`POST /api/secrets/migrate` |
+| `SWARM_MODEL_SILICONFLOW_API_KEY` | 默认云端接入点（SiliconFlow）API Key（可由 secret_store 加密接管，迁移后此处留空）|
 | `SWARM_MODEL_PROVIDERS` | 多接入点（JSON list）：每个 `{id,type,base_url,api_key,kind}`，支持任意多个云端/本地端点；空则由 siliconflow+local 两个扁平字段合成（向后兼容）。设置 tab「🔌 模型接入点」可视化增删，含 OpenRouter/DeepSeek/MiniMax/Kimi/GLM/Qwen/xAI/OpenAI 等 10 个预置 |
 | `SWARM_MODEL_MODEL_PROVIDERS` | 模型→接入点显式映射（JSON dict），覆盖"按模型名猜"的启发式 |
 | `SWARM_NOTIFY_CHANNELS` | 外部通知渠道（JSON list）：`{id,type,webhook_url,enabled,events}`，系统每产生一条通知即推送到 enabled 且事件匹配的渠道（飞书/钉钉/企业微信/Slack/通用）。设置 tab「📢 通知渠道」可视化配置 + 测试 |

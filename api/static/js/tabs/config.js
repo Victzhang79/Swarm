@@ -267,9 +267,132 @@ function drawProviders() {
       .filter(x => (x.p.kind || 'cloud') === g.key);
     if (!rows.length) return;
     html += `<div style="font-size:11px;font-weight:600;color:var(--text-muted);margin:10px 0 4px">${g.label}</div>`;
-    html += rows.map(({ p, i }) => _renderProviderCard(p, i)).join('');
+    html += rows.map(({ p, i }) => _renderProviderCard(p, i) + _renderCapabilitySection(p)).join('');
   });
   el.innerHTML = html;
+  // 渲染后异步加载已存能力（不阻塞）
+  _providersState.forEach(p => { if (p.id) loadCapabilities(p.id); });
+}
+
+// ─── 模型能力探测（设计 v3 A批3）──────────────────────────
+// 每个接入点卡片下挂一个能力区：探测按钮 + 进度 + 能力表格。
+
+function _renderCapabilitySection(p) {
+  if (!p.id) return '';
+  const pid = escapeHtml(p.id);
+  const isLocal = (p.kind || 'cloud') === 'local';
+  // 本地默认全探（免费），云端默认只探在用（省 token）。主按钮走 auto，副按钮提供另一选项。
+  const primaryLabel = isLocal ? '🔍 探测全部模型' : '🔍 探测在用模型';
+  const primaryTitle = isLocal
+    ? '本地推理免费，探测该接入点下全部可用模型'
+    : '云端按 token 计费，只探路由策略里实际用到的模型（省钱，推荐）';
+  const altBtn = isLocal
+    ? `<button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'in_use')" title="只探路由策略在用的模型" style="opacity:0.7">仅在用</button>`
+    : `<button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'all')" title="探测该接入点下全部模型（云端会很慢且花 token，慎用）" style="opacity:0.7">全部模型</button>`;
+  return `
+    <div class="cap-section" data-cap-provider="${pid}" style="margin:-2px 0 10px;padding:6px 10px;border-left:2px solid var(--border);background:var(--bg-subtle, rgba(0,0,0,0.02))">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'auto')" title="${primaryTitle}">${primaryLabel}</button>
+        ${altBtn}
+        <span class="cap-status" data-cap-status="${pid}" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+      <div class="cap-table" data-cap-table="${pid}" style="margin-top:6px"></div>
+    </div>`;
+}
+
+const _capPollTimers = {};
+
+async function probeProvider(providerId, scope) {
+  scope = scope || 'auto';
+  const statusEl = document.querySelector(`[data-cap-status="${providerId}"]`);
+  if (scope === 'all' && !confirm(`确定探测「${providerId}」下的全部模型吗？\n若为云端聚合接入点，可能有几十上百个模型，会消耗较多 token 和时间。\n本地推理则无成本。`)) return;
+  try {
+    const resp = await fetch('/api/models/probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider_id: providerId, scope }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (statusEl) statusEl.textContent = '⚠️ ' + (err.detail || resp.status);
+      return;
+    }
+    const data = await resp.json();
+    if (data.status === 'no_models_in_use') {
+      if (statusEl) statusEl.textContent = 'ℹ️ ' + (data.message || '无在用模型');
+      return;
+    }
+    if (statusEl) statusEl.textContent = '探测中…';
+    _pollProbeStatus(providerId);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '⚠️ ' + e.message;
+  }
+}
+
+function _pollProbeStatus(providerId) {
+  if (_capPollTimers[providerId]) clearTimeout(_capPollTimers[providerId]);
+  const statusEl = document.querySelector(`[data-cap-status="${providerId}"]`);
+  const tick = async () => {
+    try {
+      const resp = await fetch(`/api/models/probe/status?provider_id=${encodeURIComponent(providerId)}`);
+      const job = await resp.json();
+      if (job.status === 'running') {
+        if (statusEl) statusEl.textContent = `探测中… ${job.done}/${job.total} ${job.current || ''}`;
+        _capPollTimers[providerId] = setTimeout(tick, 1000);
+      } else if (job.status === 'done') {
+        const r = job.result || {};
+        if (statusEl) statusEl.textContent = `✅ 探测完成：${r.probed}/${r.total}` + (r.errors && r.errors.length ? `（${r.errors.length} 失败）` : '');
+        loadCapabilities(providerId);
+      } else if (job.status === 'error') {
+        if (statusEl) statusEl.textContent = '⚠️ 探测失败：' + (job.error || '');
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = '⚠️ ' + e.message;
+    }
+  };
+  tick();
+}
+
+async function loadCapabilities(providerId) {
+  const tableEl = document.querySelector(`[data-cap-table="${providerId}"]`);
+  if (!tableEl) return;
+  try {
+    const resp = await fetch(`/api/models/capabilities?provider_id=${encodeURIComponent(providerId)}`);
+    const data = await resp.json();
+    const rows = data.capabilities || [];
+    if (!rows.length) { tableEl.innerHTML = ''; return; }
+    tableEl.innerHTML = _renderCapTable(rows);
+  } catch (e) { /* 静默 */ }
+}
+
+function _sourceBadge(source) {
+  const map = {
+    probed: ['探测', '#22c55e'], parsed: ['解析', '#22c55e'],
+    manual: ['人工', '#3b82f6'], default: ['默认/未探明', '#f59e0b'],
+  };
+  const [label, color] = map[source] || [source, 'var(--text-muted)'];
+  return `<span style="font-size:9px;padding:1px 5px;border-radius:6px;background:${color}22;color:${color}">${escapeHtml(label)}</span>`;
+}
+
+function _renderCapTable(rows) {
+  const head = `<tr style="font-size:10px;color:var(--text-muted)">
+    <th style="text-align:left;padding:2px 6px">模型</th>
+    <th style="padding:2px 6px">上下文</th>
+    <th style="padding:2px 6px">多模态</th>
+    <th style="padding:2px 6px">速度(tps)</th>
+    <th style="padding:2px 6px">来源</th></tr>`;
+  const body = rows.map(r => {
+    const ctx = r.context_window ? (r.context_window >= 1000 ? (r.context_window / 1000).toFixed(0) + 'k' : r.context_window) : '—';
+    const mm = r.supports_multimodal ? '🖼️' : '—';
+    const tps = r.gen_speed_tps ? r.gen_speed_tps.toFixed(1) : '—';
+    return `<tr style="font-size:11px;border-top:1px solid var(--border)">
+      <td style="padding:3px 6px;font-family:monospace">${escapeHtml(r.model_id)}</td>
+      <td style="text-align:center;padding:3px 6px">${ctx}</td>
+      <td style="text-align:center;padding:3px 6px">${mm}</td>
+      <td style="text-align:center;padding:3px 6px">${tps}</td>
+      <td style="text-align:center;padding:3px 6px">${_sourceBadge(r.source)}</td></tr>`;
+  }).join('');
+  return `<table style="width:100%;border-collapse:collapse"><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
 
 // 每个接入点一行，第一列是预置下拉（10 预置 + 本地 + 自定义）：

@@ -29,6 +29,8 @@ jobs:
       # 测试默认关 RBAC（与 test/conftest.py 一致），连 CI 的 PG
       SWARM_RBAC_ENABLED: "false"
       SWARM_DB_POSTGRES_URI: "postgresql://postgres:postgres@localhost:5432/swarm"
+      # secret_store 加密根密钥（CI 固定值，仅供测试；与生产无关）
+      SWARM_SECRET_KEY: "ci-test-fixed-secret-key-not-for-production"
 
     steps:
       - uses: actions/checkout@v4
