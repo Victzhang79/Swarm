@@ -278,13 +278,23 @@ class SandboxConfig(BaseSettings):
     sandbox_first: bool = True
     sandbox_remote_workdir: str = "/workspace"
     # 按语言预建的沙箱模板 ID（各装好对应工具链，避免运行时 setup 慢/脆）。
+    # 区分两类（方案 B，按子任务性质选）：
+    #   - exec(2c2g)：agent 写代码用，轻量。
+    #   - verify(4c4g)：带完整环境+依赖缓存，重编译/集成验证用。
+    # 运行时优先读 db(sandbox_templates 表，系统级 WebUI 可配)，db 空则用下面默认值。
     # 留空的语言回退到 default_template + 运行时 setup_commands。
-    # 用户已构建：go/node/java/rust/python 各一个镜像。
+    # exec 默认暂用旧轻量镜像（待补 2c2g 专用镜像 ID）；verify 默认为新 4c4g 带缓存镜像。
     template_python: str = "tpl-8fa882f5d775429cad1530c9"
     template_node: str = "tpl-530d6aa6162b41e38a790b30"
     template_java: str = "tpl-d3098a499a25492282284a76"
     template_go: str = "tpl-edf1a5aec16343249304abe3"
     template_rust: str = "tpl-d480ef3bd69f49c2b07930af"
+    # 验证镜像默认（4c4g，带依赖缓存，warmup 好 .m2/node_modules/go mod/cargo）
+    verify_template_python: str = "tpl-7bdf0d757d68421ab45320bb"
+    verify_template_node: str = "tpl-5084cf67e28d4f14b16e0f33"
+    verify_template_java: str = "tpl-431f89c0ced647919e673e05"
+    verify_template_go: str = "tpl-c2a769763f804eefa53de627"
+    verify_template_rust: str = "tpl-57e62a8b3af74a409655aaca"
     # 热沙箱池（默认启用，预热复用省冷启动；SWARM_SANDBOX_POOL_ENABLED=false 可关闭）
     pool_enabled: bool = True
     pool_max_idle_per_template: int = 2
@@ -293,20 +303,46 @@ class SandboxConfig(BaseSettings):
     pool_idle_seconds: int = 300
     pool_reap_interval: int = 60
 
-    def template_for_language(self, language: str) -> str:
-        """语言 → 预建模板 ID。未知语言或未配置则回退 default_template。
+    def template_for_language(self, language: str, purpose: str = "exec") -> str:
+        """语言 + 用途 → 预建模板 ID。
 
-        让 worker 按子任务语言起预装工具链的镜像（避免运行时 setup 慢/脆）。
+        purpose='exec'(默认,写代码类子任务,2c2g) / 'verify'(重编译/集成验证类,4c4g)。
+        优先读 db(sandbox_templates 表,系统级 WebUI 可配)，db 无则用 SandboxConfig 默认值。
+        未知语言或未配置则回退 default_template。
+
+        让 worker 按子任务语言+性质起合适镜像（执行省资源，验证用带缓存的完整环境）。
         """
         lang = (language or "").lower()
-        mapping = {
+        # 1) 优先 db（落库的系统级配置）
+        try:
+            from swarm.config import sandbox_store
+
+            db_val = sandbox_store.get_template(lang, purpose=purpose)
+            if db_val:
+                return db_val
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) 回退 SandboxConfig 默认值
+        if purpose == "verify":
+            verify_map = {
+                "python": self.verify_template_python,
+                "node": self.verify_template_node,
+                "java": self.verify_template_java,
+                "go": self.verify_template_go,
+                "rust": self.verify_template_rust,
+            }
+            val = verify_map.get(lang, "")
+            if val:
+                return val
+            # verify 未配则回退 exec 同语言（保证有可用镜像）
+        exec_map = {
             "python": self.template_python,
             "node": self.template_node,
             "java": self.template_java,
             "go": self.template_go,
             "rust": self.template_rust,
         }
-        return mapping.get(lang, "") or self.default_template
+        return exec_map.get(lang, "") or self.default_template
 
 
 class KnowledgeConfig(BaseSettings):

@@ -194,3 +194,67 @@ async function destroyAllServerSandboxes() {
     if (btn) { btn.disabled = false; btn.textContent = '全部销毁'; }
   }
 }
+
+// ─── 语言镜像配置（exec/verify，落库可配，保存即 reload）───
+async function loadSandboxTemplates() {
+  const box = $('sandbox-tpl-config');
+  if (!box) return;
+  try {
+    const r = await fetch('/api/sandbox/templates');
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const langs = data.languages || [];
+    const t = data.templates || {};
+    let html = `<table style="width:100%;border-collapse:collapse">
+      <tr style="text-align:left;color:var(--text-muted)">
+        <th style="padding:4px 6px">语言</th>
+        <th style="padding:4px 6px">执行镜像 (2c2g)</th>
+        <th style="padding:4px 6px">验证镜像 (4c4g)</th>
+      </tr>`;
+    for (const lang of langs) {
+      const row = t[lang] || {};
+      const eMark = row.exec_from_db ? '' : ' <span style="color:var(--text-muted)" title="默认值（未在库中覆盖）">默认</span>';
+      const vMark = row.verify_from_db ? '' : ' <span style="color:var(--text-muted)" title="默认值（未在库中覆盖）">默认</span>';
+      html += `<tr>
+        <td style="padding:4px 6px;font-weight:600">${escapeHtml(lang)}</td>
+        <td style="padding:4px 6px"><input id="tpl-exec-${lang}" value="${escapeHtml(row.exec_template || '')}" style="width:100%;font-family:monospace;font-size:11px" placeholder="tpl-…">${eMark}</td>
+        <td style="padding:4px 6px"><input id="tpl-verify-${lang}" value="${escapeHtml(row.verify_template || '')}" style="width:100%;font-family:monospace;font-size:11px" placeholder="tpl-…">${vMark}</td>
+      </tr>`;
+    }
+    html += '</table>';
+    box.innerHTML = html;
+    box._langs = langs;
+  } catch (e) {
+    box.innerHTML = `<p class="hint" style="color:var(--orange)">加载失败: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function saveSandboxTemplates() {
+  const box = $('sandbox-tpl-config');
+  const langs = (box && box._langs) || [];
+  if (!langs.length) { showToast('请先刷新加载', 'warning'); return; }
+  const templates = {};
+  for (const lang of langs) {
+    templates[lang] = {
+      exec_template: ($('tpl-exec-' + lang)?.value || '').trim(),
+      verify_template: ($('tpl-verify-' + lang)?.value || '').trim(),
+    };
+  }
+  const btn = $('btn-save-sandbox-tpl');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/sandbox/templates', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ templates }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    showToast(`已保存并生效: ${(d.saved || []).join(', ')}`, 'success');
+    await loadSandboxTemplates();
+  } catch (e) {
+    showToast('保存失败: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}

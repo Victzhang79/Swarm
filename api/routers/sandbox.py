@@ -480,3 +480,71 @@ async def sandbox_logs(sandbox_id: str, limit: int = 200):
         "task_id": meta.get("task_id"),
         "source": meta.get("source"),
     }
+
+
+# ═══════════════════════════════════════════════════════════
+# 沙箱模板配置（exec/verify 镜像，落库，系统级 WebUI 可配）
+# ═══════════════════════════════════════════════════════════
+
+class SandboxTemplatesRequest(BaseModel):
+    """保存沙箱模板配置：每语言 exec(2c2g) + verify(4c4g)。"""
+    templates: dict = Field(
+        description="{language: {exec_template, verify_template}}，language ∈ python/node/java/go/rust",
+    )
+
+
+@router.get("/api/sandbox/templates", tags=["沙箱"])
+async def get_sandbox_templates(request: Request):
+    """当前沙箱模板配置：每语言 exec+verify 的【生效值】（db 优先，回退默认）+ 来源标注。"""
+    from swarm.api._shared import _require_user
+    from swarm.config import sandbox_store
+
+    _require_user(request)
+    cfg = _app.get_config().sandbox
+    loop = asyncio.get_running_loop()
+    db_rows = await loop.run_in_executor(None, sandbox_store.get_all)
+
+    out = {}
+    for lang in sandbox_store.LANGUAGES:
+        # 生效值（db 优先回退默认），同时标来源便于 UI 显示
+        eff_exec = cfg.template_for_language(lang, purpose="exec")
+        eff_verify = cfg.template_for_language(lang, purpose="verify")
+        db_row = db_rows.get(lang, {})
+        out[lang] = {
+            "exec_template": eff_exec,
+            "verify_template": eff_verify,
+            "exec_from_db": bool(db_row.get("exec_template")),
+            "verify_from_db": bool(db_row.get("verify_template")),
+        }
+    return {"templates": out, "languages": list(sandbox_store.LANGUAGES)}
+
+
+@router.put("/api/sandbox/templates", tags=["沙箱"])
+async def update_sandbox_templates(req: SandboxTemplatesRequest, request: Request):
+    """保存沙箱模板配置到 db（落库），并 reload 让生效。
+
+    body: {"templates": {"java": {"exec_template": "tpl-...", "verify_template": "tpl-..."}, ...}}
+    只接受已知语言；空串表示该项清空（回退默认值）。
+    """
+    from swarm.api._shared import _require_perm
+    from swarm.config import sandbox_store
+
+    _require_perm(request, "config:write")
+    loop = asyncio.get_running_loop()
+    saved = []
+    for lang, vals in (req.templates or {}).items():
+        if lang not in sandbox_store.LANGUAGES or not isinstance(vals, dict):
+            continue
+        exec_t = str(vals.get("exec_template", "") or "").strip()
+        verify_t = str(vals.get("verify_template", "") or "").strip()
+        await loop.run_in_executor(
+            None, lambda l=lang, e=exec_t, v=verify_t: sandbox_store.set_templates(l, e, v)
+        )
+        saved.append(lang)
+
+    # reload + 失效缓存（让运行进程立即用新配置）
+    from swarm.config.settings import reload_config as _reload_config
+    await loop.run_in_executor(None, _reload_config)
+    await loop.run_in_executor(None, sandbox_store.invalidate_cache)
+    _app.logger.info("沙箱模板配置已更新: %s", saved)
+    return {"status": "ok", "saved": saved}

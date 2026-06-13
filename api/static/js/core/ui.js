@@ -66,6 +66,7 @@ function switchTopTab(topTab) {
   } else if (topTab === 'sandboxes') {
     stopSystemRefresh();
     if (typeof refreshGlobalSandboxes === 'function') refreshGlobalSandboxes();
+    if (typeof loadSandboxTemplates === 'function') loadSandboxTemplates();
   } else if (topTab === 'system') {
     startSystemRefresh();
   } else if (topTab === 'settings') {

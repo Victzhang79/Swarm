@@ -199,13 +199,19 @@ class WorkerExecutor:
                     # 热池启用时从池借（省冷启动），否则直接创建
                     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
 
-                    # 模板选择优先级：harness 显式指定 > 按子任务语言映射 > 默认模板。
-                    # 按语言起预建镜像(装好工具链)，混编项目各子任务用各自语言模板。
+                    # 模板选择优先级：harness 显式指定 > 按子任务语言+性质映射 > 默认模板。
+                    # 性质判定（方案 B）：harness 有 build/test 命令 → 需真编译/测试 →
+                    # 用 verify(4c4g 带缓存完整环境)；纯写代码类 → 用 exec(2c2g 轻量)。
+                    # 一个沙箱跑到底（不分阶段切换），按子任务整体性质选镜像。
                     _harness = getattr(self.subtask, "harness", None)
                     _tpl = getattr(_harness, "sandbox_template", "") or ""
                     if not _tpl:
                         _lang = getattr(_harness, "language", "") or ""
-                        _tpl = cfg.sandbox.template_for_language(_lang)
+                        _has_build = bool(getattr(_harness, "build_command", "") or "")
+                        _has_test = bool(getattr(_harness, "test_command", "") or "")
+                        _purpose = "verify" if (_has_build or _has_test) else "exec"
+                        _tpl = cfg.sandbox.template_for_language(_lang, purpose=_purpose)
+                        self._log(f"沙箱镜像选择: 语言={_lang or '?'} 用途={_purpose} 模板={_tpl or '默认'}")
                     _tpl = _tpl or None
                     if pool_enabled():
                         self._sandbox_pool = get_sandbox_pool()

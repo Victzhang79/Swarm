@@ -67,6 +67,10 @@ def _ensure_sync_tables() -> None:
 
     ensure_secret_tables()
     print("  ✅ secret_store（敏感信息加密存储）")
+    from swarm.config.sandbox_store import ensure_tables as ensure_sandbox_tpl_tables
+
+    ensure_sandbox_tpl_tables()
+    print("  ✅ sandbox_templates（沙箱执行/验证镜像配置）")
 
 
 def _ensure_auth_tables() -> None:

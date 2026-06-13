@@ -768,6 +768,19 @@
                     </div>
                   </div>
                 </section>
+
+                <!-- 语言镜像配置（执行 exec/2c2g vs 验证 verify/4c4g），落库可配，保存即 reload -->
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>语言镜像配置 <span class="hint">跨项目 · 执行(2c2g)/验证(4c4g) 模板，保存即生效</span></h3>
+                    <div class="system-section-actions">
+                      <button class="btn btn-ghost btn-sm" onclick="loadSandboxTemplates()">刷新</button>
+                      <button class="btn btn-primary btn-sm" id="btn-save-sandbox-tpl" onclick="saveSandboxTemplates()">保存</button>
+                    </div>
+                  </div>
+                  <p class="hint" style="margin:4px 0 8px">执行镜像跑 agent 写代码（轻量）；验证镜像带完整环境+依赖缓存（重编译/测试）。含 build/test 命令的子任务自动用验证镜像。留空=回退默认值。</p>
+                  <div id="sandbox-tpl-config" style="font-size:12px">加载中…</div>
+                </section>
               </div>
             </div>
           </div>

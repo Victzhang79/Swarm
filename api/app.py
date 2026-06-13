@@ -630,6 +630,15 @@ async def on_startup():
         logger.info("secret_store table ensured")
     except Exception as e:
         logger.warning(f"Failed to ensure secret_store table: {e}")
+    # 确保沙箱模板配置表存在（exec/verify 镜像，系统级 WebUI 可配）
+    try:
+        from swarm.config import sandbox_store
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, sandbox_store.ensure_tables)
+        logger.info("sandbox_templates table ensured")
+    except Exception as e:
+        logger.warning(f"Failed to ensure sandbox_templates table: {e}")
     try:
         from swarm.auth.store import (
             backfill_legacy_project_members,
