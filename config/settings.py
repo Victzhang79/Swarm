@@ -308,6 +308,10 @@ class SandboxConfig(BaseSettings):
     sandbox_health_check: bool = True
     sandbox_health_retries: int = 2
     sandbox_fail_threshold: int = 5
+    # 项目级定制沙箱（docs/Project_Scoped_Sandbox_Design.md）：
+    # 预处理时按项目真实环境构建专属沙箱镜像，executor 优先用 project.config.sandbox_template。
+    # 默认 False（灰度试点，先 ruoyi-e2e 验证），需沙箱机 SSH 凭据在 secret_store。
+    project_scoped_enabled: bool = False
 
     def template_for_language(self, language: str, purpose: str = "exec") -> str:
         """语言 + 用途 → 预建模板 ID。

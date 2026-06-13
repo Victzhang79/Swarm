@@ -208,6 +208,18 @@ class WorkerExecutor:
                     # 一个沙箱跑到底（不分阶段切换），按子任务整体性质选镜像。
                     _harness = getattr(self.subtask, "harness", None)
                     _tpl = getattr(_harness, "sandbox_template", "") or ""
+                    # 【项目级定制沙箱】优先用项目专属模板（预处理时按真实环境构建，
+                    # 见 docs/Project_Scoped_Sandbox_Design.md）。无则回退按语言选通用模板。
+                    if not _tpl and self.project_id:
+                        try:
+                            from swarm.project.store import get_project
+                            _proj = get_project(self.project_id)
+                            _proj_tpl = ((_proj or {}).get("config") or {}).get("sandbox_template", "")
+                            if _proj_tpl:
+                                _tpl = _proj_tpl
+                                self._log(f"沙箱镜像选择: 项目专属模板={_tpl}")
+                        except Exception as exc:  # noqa: BLE001 — 读项目失败不阻断，回退通用
+                            self._log(f"读项目专属模板失败，回退通用: {exc}")
                     if not _tpl:
                         _lang = getattr(_harness, "language", "") or ""
                         _has_build = bool(getattr(_harness, "build_command", "") or "")

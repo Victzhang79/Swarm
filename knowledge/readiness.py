@@ -31,6 +31,11 @@ def assess_knowledge_readiness(
             "message": pp.get("error") or pp.get("message") or "预处理失败，请查看预处理 Tab",
         }
     if preprocess_running:
+        # 项目级沙箱构建阶段（_phase_build_sandbox 设的 message 含"构建项目专属沙箱"）
+        # 透传更明确的提示，让用户知道是在构建沙箱而非笼统"预处理中"。
+        running_msg = pp.get("message") or ""
+        if "沙箱" in running_msg:
+            return {"level": "running", "message": running_msg}
         return {
             "level": "running",
             "message": f"预处理进行中（{phase or '…'}）— 完成后 Brain 检索将可用",

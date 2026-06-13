@@ -168,6 +168,11 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         # 统计信息当前无需在此使用，故不接收返回值（避免 F841 死变量）。
         await _phase_analyze(project_id, project_path, scan_result)
 
+        # ── Phase 5: BUILD SANDBOX（项目级定制沙箱）──
+        # 按真实环境构建项目专属沙箱镜像 → 写 project.config["sandbox_template"]。
+        # 构建失败不阻断预处理（回退通用池）。见 docs/Project_Scoped_Sandbox_Design.md。
+        await _phase_build_sandbox(project_id, project_path)
+
         # ── 完成 ──
         await asyncio.to_thread(
             upsert_progress,
@@ -614,6 +619,60 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
     except Exception as exc:
         # 规范提取失败不阻断预处理
         logger.warning("Norms extraction failed for project %s: %s", project_id, exc)
+
+
+# ──────────────────────────────────────────────
+# Phase 5: BUILD SANDBOX — 项目级定制沙箱
+# ──────────────────────────────────────────────
+async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
+    """按项目真实环境构建专属沙箱镜像，写 project.config["sandbox_template"]。
+
+    见 docs/Project_Scoped_Sandbox_Design.md。失败不阻断预处理（回退通用池）。
+    开关：config.sandbox.project_scoped_enabled（默认 False，灰度试点）。
+    """
+    from swarm.config.settings import get_config
+    cfg = get_config()
+    if not getattr(cfg.sandbox, "project_scoped_enabled", False):
+        return  # 未启用项目级沙箱，跳过（沿用通用池）
+
+    try:
+        from swarm.project.sandbox_spec import infer_env_spec
+        from swarm.project.store import get_project, update_project, upsert_progress
+        from swarm.worker.image_builder import SSHConfig, build_project_image
+
+        spec = infer_env_spec(project_path, project_id=project_id)
+        if spec.base_only:
+            logger.info("项目 %s 无构建文件(全新项目)，跳过专属沙箱，等首个任务需求分析", project_id)
+            return
+
+        # 已有相同 deps_hash 的模板则复用（避免重复构建）
+        proj = get_project(project_id) or {}
+        existing = (proj.get("config") or {})
+        if existing.get("sandbox_template") and existing.get("sandbox_deps_hash") == spec.deps_hash():
+            logger.info("项目 %s 依赖未变，复用已有专属模板 %s", project_id, existing["sandbox_template"])
+            return
+
+        if SSHConfig.from_secret_store() is None:
+            logger.warning("项目 %s: 沙箱机 SSH 凭据未配置，跳过专属沙箱构建（回退通用池）", project_id)
+            return
+
+        await asyncio.to_thread(
+            upsert_progress, project_id,
+            phase="analyzing", phase_progress=0.95,
+            message=f"构建项目专属沙箱（{[t.name for t in spec.toolchains]}），耗时数分钟…",
+        )
+        logger.info("项目 %s 开始构建专属沙箱: %s", project_id, [t.name for t in spec.toolchains])
+        result = await asyncio.to_thread(build_project_image, spec, project_path)
+        if result.ok and result.template_id:
+            new_config = {**existing,
+                          "sandbox_template": result.template_id,
+                          "sandbox_deps_hash": spec.deps_hash()}
+            await asyncio.to_thread(update_project, project_id, config=new_config)
+            logger.info("项目 %s 专属沙箱就绪: %s", project_id, result.template_id)
+        else:
+            logger.warning("项目 %s 专属沙箱构建失败(回退通用池): %s", project_id, result.message)
+    except Exception as exc:  # noqa: BLE001 — 构建失败不阻断预处理
+        logger.warning("项目 %s 专属沙箱构建异常(回退通用池): %s", project_id, exc)
 
 
 # ──────────────────────────────────────────────
