@@ -389,14 +389,26 @@ async def _check_component(name: str) -> dict[str, Any]:
             cfg = get_config()
             details = []
 
+            # 从生效 providers 取【解密后】的 key（单一真相源；key 可能加密存 db）。
+            # 不再直接读扁平字段 local_api_key/siliconflow_api_key —— 迁移到 secret_store
+            # 后扁平字段为空，会误报"未配置"。
+            _eff = {p.id: p for p in cfg.model._effective_providers()}
+            _local_p = _eff.get("local")
+            _cloud_p = _eff.get("siliconflow") or next(
+                (p for p in _eff.values() if p.kind == "cloud"), None
+            )
+            _local_key = _local_p.api_key if _local_p else ""
+            _local_url = _local_p.base_url if _local_p else (cfg.model.local_base_url or "")
+            _cloud_key = _cloud_p.api_key if _cloud_p else ""
+
             # 检测本地模型可用性
             local_ok = False
             try:
                 headers = {}
-                if cfg.model.local_api_key and cfg.model.local_api_key not in ("", "***"):
-                    headers["Authorization"] = f"Bearer {cfg.model.local_api_key}"
+                if _local_key and _local_key not in ("", "***"):
+                    headers["Authorization"] = f"Bearer {_local_key}"
                 async with httpx.AsyncClient(timeout=5) as client:
-                    resp = await client.get(f"{cfg.model.local_base_url}/models", headers=headers)
+                    resp = await client.get(f"{_local_url}/models", headers=headers)
                     if resp.status_code == 200:
                         models_data = resp.json().get("data", [])
                         local_count = len(models_data)
@@ -410,8 +422,8 @@ async def _check_component(name: str) -> dict[str, Any]:
             except Exception:
                 details.append("本地模型不可达")
 
-            # 检测云端模型可用性
-            cloud_ok = bool(cfg.model.siliconflow_api_key and cfg.model.siliconflow_api_key not in ("", "***"))
+            # 检测云端模型可用性（用解密后的 key）
+            cloud_ok = bool(_cloud_key and _cloud_key not in ("", "***"))
             if cloud_ok:
                 details.append("云端(SiliconFlow)已配置")
             else:
