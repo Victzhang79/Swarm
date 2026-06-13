@@ -217,8 +217,8 @@ async function loadSandboxTemplates() {
       const vMark = row.verify_from_db ? '' : ' <span style="color:var(--text-muted)" title="默认值（未在库中覆盖）">默认</span>';
       html += `<tr>
         <td style="padding:4px 6px;font-weight:600">${escapeHtml(lang)}</td>
-        <td style="padding:4px 6px"><input id="tpl-exec-${lang}" value="${escapeHtml(row.exec_template || '')}" style="width:100%;font-family:monospace;font-size:11px" placeholder="tpl-…">${eMark}</td>
-        <td style="padding:4px 6px"><input id="tpl-verify-${lang}" value="${escapeHtml(row.verify_template || '')}" style="width:100%;font-family:monospace;font-size:11px" placeholder="tpl-…">${vMark}</td>
+        <td style="padding:4px 6px"><input id="tpl-exec-${lang}" class="form-input" value="${escapeHtml(row.exec_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${eMark}</td>
+        <td style="padding:4px 6px"><input id="tpl-verify-${lang}" class="form-input" value="${escapeHtml(row.verify_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${vMark}</td>
       </tr>`;
     }
     html += '</table>';
