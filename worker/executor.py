@@ -193,7 +193,10 @@ class WorkerExecutor:
             cfg = get_config()
             if cfg.sandbox.use_for_worker and cfg.sandbox.api_url:
                 try:
-                    from swarm.worker.sandbox import get_sandbox_manager
+                    from swarm.worker.sandbox import (
+                        SandboxUnhealthyError,
+                        get_sandbox_manager,
+                    )
 
                     self._sandbox_manager = get_sandbox_manager()
                     # 热池启用时从池借（省冷启动），否则直接创建
@@ -213,26 +216,59 @@ class WorkerExecutor:
                         _tpl = cfg.sandbox.template_for_language(_lang, purpose=_purpose)
                         self._log(f"沙箱镜像选择: 语言={_lang or '?'} 用途={_purpose} 模板={_tpl or '默认'}")
                     _tpl = _tpl or None
-                    if pool_enabled():
+                    # 借/建沙箱 + envd 健康探活：不健康则弃用换新（最多 health_retries 次）。
+                    # 修复：坏镜像/envd 故障的沙箱会让 agent 空转到超时（实测 node 坏镜像
+                    # 死循环 186 次/10 分钟），探活提前拦截。
+                    _health_on = getattr(cfg.sandbox, "sandbox_health_check", True)
+                    _max_tries = (getattr(cfg.sandbox, "sandbox_health_retries", 2) + 1) if _health_on else 1
+                    self._from_pool = pool_enabled()
+                    if self._from_pool:
                         self._sandbox_pool = get_sandbox_pool()
-                        self._sandbox = self._sandbox_pool.acquire(
-                            _tpl,
-                            project_id=self.project_id,
-                            task_id=self.task_id or self.subtask.id,
+                    for _attempt in range(_max_tries):
+                        if self._from_pool:
+                            self._sandbox = self._sandbox_pool.acquire(
+                                _tpl,
+                                project_id=self.project_id,
+                                task_id=self.task_id or self.subtask.id,
+                            )
+                        else:
+                            self._sandbox = self._sandbox_manager.create(
+                                template_id=_tpl,
+                                project_id=self.project_id,
+                                task_id=self.task_id or self.subtask.id,
+                                source=f"worker:{self.subtask.id}",
+                            )
+                        # envd 健康探活
+                        if _health_on and not self._sandbox_manager.health_check(self._sandbox):
+                            _bad = self._sandbox.sandbox_id
+                            self._log(
+                                f"沙箱 {_bad} envd 健康探活失败"
+                                f"（疑似镜像/envd 故障），弃用换新 [{_attempt + 1}/{_max_tries}]"
+                            )
+                            # 坏沙箱不归还热池，直接销毁
+                            try:
+                                self._sandbox_manager.kill(_bad)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            self._sandbox = None
+                            continue
+                        # 健康（或未开启探活）→ 用它
+                        if self._from_pool:
+                            self._log(f"远程沙箱(热池)已就绪: {self._sandbox.sandbox_id}")
+                        else:
+                            self._log(f"远程沙箱已创建: {self._sandbox.sandbox_id}")
+                        break
+                    if self._sandbox is None:
+                        raise RuntimeError(
+                            f"连续 {_max_tries} 个沙箱 envd 健康探活均失败"
+                            f"（镜像 {_tpl} 疑似故障），放弃远程沙箱"
                         )
-                        self._from_pool = True
-                        self._log(f"远程沙箱(热池)已就绪: {self._sandbox.sandbox_id}")
-                    else:
-                        self._sandbox = self._sandbox_manager.create(
-                            template_id=_tpl,
-                            project_id=self.project_id,
-                            task_id=self.task_id or self.subtask.id,
-                            source=f"worker:{self.subtask.id}",
-                        )
-                        self._from_pool = False
-                        self._log(f"远程沙箱已创建: {self._sandbox.sandbox_id}")
                     set_sandbox_context(self._sandbox, self._sandbox_manager)
                     await self._sync_to_sandbox("bootstrap")
+                except SandboxUnhealthyError as exc:
+                    # 熔断：沙箱运行中连续失败达阈值 → 明确失败，不降级空转
+                    self._log(f"沙箱熔断: {exc}")
+                    raise
                 except Exception as exc:
                     self._log(f"沙箱创建失败，降级本地执行: {exc}")
             else:

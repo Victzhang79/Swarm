@@ -207,6 +207,14 @@ def _iter_sync_candidates(local_root: Path) -> Iterator[tuple[Path, Path, str]]:
 # ──────────────────────────────────────────────
 # 沙箱管理器
 # ──────────────────────────────────────────────
+class SandboxUnhealthyError(RuntimeError):
+    """沙箱不健康（envd 探活失败 或 连续操作失败达阈值，疑似镜像/envd 故障）。
+
+    由 worker 捕获 → 弃用该沙箱（不归还热池）→ 子任务以明确错误失败，
+    而非让 agent 在坏沙箱上空转到超时。
+    """
+
+
 class SandboxManager:
     """
     管理远程 CubeSandbox 生命周期
@@ -223,6 +231,8 @@ class SandboxManager:
         self._instances: dict[str, Any] = {}
         # sandbox_id → {project_id, task_id, source}
         self._sandbox_meta: dict[str, dict[str, str | None]] = {}
+        # sandbox_id → 连续操作失败次数（5xx/连接类）。成功清零，达阈值熔断。
+        self._fail_counts: dict[str, int] = {}
         # sandbox_id → [{ts, kind, message, stdout?, stderr?, code?, error?}]
         self._sandbox_activity: dict[str, list[dict[str, Any]]] = {}
         self._setup_env()
@@ -507,7 +517,51 @@ class SandboxManager:
             logger.warning("clean_workspace 失败 %s: %s", sid, exc)
             return False
 
-    def run_command(self, sandbox: Any, command: str, timeout: int = 120) -> "CodeResult":
+    def _fail_threshold(self) -> int:
+        return int(getattr(self.config, "sandbox_fail_threshold", 5) or 5)
+
+    def _record_sandbox_failure(self, sid: str) -> None:
+        """记录一次沙箱基础设施失败（5xx/连接类）。达阈值抛 SandboxUnhealthyError。
+
+        仅由 run_code/run_command 的【基础设施错误】路径调用——命令真跑了但非0退出
+        (编译失败等业务错误)不算，避免把"代码写错"误判成"沙箱坏"。
+        """
+        n = self._fail_counts.get(sid, 0) + 1
+        self._fail_counts[sid] = n
+        threshold = self._fail_threshold()
+        if n >= threshold:
+            logger.error(
+                "沙箱 %s 连续 %d 次基础设施操作失败，触发熔断（疑似镜像/envd 故障）",
+                sid, n,
+            )
+            raise SandboxUnhealthyError(
+                f"沙箱 {sid} 连续 {n} 次操作失败（疑似镜像/envd 故障），已中止"
+            )
+
+    def _record_sandbox_success(self, sid: str) -> None:
+        """一次成功操作 → 清零失败计数（连续失败才熔断，偶发抖动可恢复）。"""
+        if self._fail_counts.get(sid):
+            self._fail_counts[sid] = 0
+
+    def health_check(self, sandbox: Any) -> bool:
+        """envd 健康探活：跑一个轻量 shell 命令验证 envd shell 端点可用。
+
+        借出/创建沙箱后调用；不健康（探活失败）则弃用换新沙箱。
+        用 run_command（shell 端点，不依赖 Jupyter kernel）跑 echo 标记。
+        """
+        sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
+        try:
+            cr = self.run_command(sandbox, "echo __SWARM_HEALTH_OK__", timeout=15, _count_failures=False)
+            ok = cr.success and "__SWARM_HEALTH_OK__" in (cr.stdout or "")
+            if not ok:
+                logger.warning("沙箱 %s 健康探活未通过: success=%s err=%s",
+                               sid, cr.success, (cr.error or "")[:120])
+            return ok
+        except Exception as exc:  # noqa: BLE001 — 探活不应让上层崩
+            logger.warning("沙箱 %s 健康探活异常: %s", sid, str(exc)[:120])
+            return False
+
+    def run_command(self, sandbox: Any, command: str, timeout: int = 120, _count_failures: bool = True) -> "CodeResult":
         """在沙箱内执行 shell 命令 —— 走 SDK 原生 commands.run(shell 端点)。
 
         与 run_code 的区别：run_code 用 Jupyter kernel 端点(部分自建语言镜像未装
@@ -533,6 +587,7 @@ class SandboxManager:
                 stdout=stdout, stderr=stderr, code=command,
                 error=cr.error,
             )
+            self._record_sandbox_success(sid)
             return cr
         except Exception as exc:
             # commands.run 抛异常通常意味着非 0 退出码(SDK 行为)或连接问题。
@@ -545,10 +600,14 @@ class SandboxManager:
                 cr = CodeResult(stdout=stdout, stderr=stderr, error=f"exit_code={exit_code}", success=False)
                 self.append_activity(sid, "exec", f"run_command exit={exit_code} — {command[:120]}",
                                      stdout=stdout, stderr=stderr, code=command, error=cr.error)
+                self._record_sandbox_success(sid)  # envd 通了（命令真跑了），清零基础设施失败计数
                 return cr
             err = f"{type(exc).__name__}: {exc}"
             logger.warning("Sandbox run_command failed for %s: %s", sid, str(exc)[:200])
             self.append_activity(sid, "exec", f"run_command 失败 — {err}", code=command, error=err)
+            if _count_failures:
+                # 基础设施错误（连接/5xx），计数+1，达阈值抛 SandboxUnhealthyError
+                self._record_sandbox_failure(sid)
             return CodeResult(stdout=stdout, stderr=stderr, error=err, success=False)
 
     def run_code(self, sandbox: Any, code: str, timeout: int = 30) -> "CodeResult":
@@ -568,6 +627,7 @@ class SandboxManager:
                 code=code,
                 error=cr.error,
             )
+            self._record_sandbox_success(sid)
             return cr
         except Exception as exc:
             logger.warning("Sandbox run_code failed for %s: %s", sid, exc)
@@ -579,6 +639,8 @@ class SandboxManager:
                 code=code,
                 error=err,
             )
+            # 注意：run_code 走 Jupyter kernel 端点，语言镜像(无 kernel)本就可能 502，
+            # 属已知非致命情况，不计入熔断；熔断仅依赖 run_command(shell 端点，所有镜像通用)。
             return CodeResult(
                 stdout="",
                 stderr="",
@@ -839,9 +901,13 @@ print(json.dumps(files))
                     self._write_file_via_code(sandbox, remote_path, data)
                 stats["uploaded"] += 1
                 stats["files"].append(rel_posix)
+                self._record_sandbox_success(sandbox.sandbox_id)
             except Exception as exc:
                 stats["errors"].append(f"{rel_posix}: {exc}")
                 logger.warning("Targeted upload failed: %s: %s", rel_posix, exc)
+                # 上传走 envd 文件系统端点；5xx/连接错误计入熔断（这次 node 镜像故障即此类）。
+                # 业务类错误(越界/本地文件不存在)在上面已 continue，不会到这里。
+                self._record_sandbox_failure(sandbox.sandbox_id)
 
         logger.info(
             "Targeted sync to sandbox %s: uploaded=%d errors=%d files=%s",

@@ -302,6 +302,12 @@ class SandboxConfig(BaseSettings):
     pool_ttl_seconds: int = 600
     pool_idle_seconds: int = 300
     pool_reap_interval: int = 60
+    # 沙箱健康防护（修死循环烧资源）：
+    # - 借/建沙箱后做 envd 健康探活，不健康则弃用换新（最多换 sandbox_health_retries 次）
+    # - 运行中连续基础设施失败(5xx/连接)达 sandbox_fail_threshold 即熔断中止子任务
+    sandbox_health_check: bool = True
+    sandbox_health_retries: int = 2
+    sandbox_fail_threshold: int = 5
 
     def template_for_language(self, language: str, purpose: str = "exec") -> str:
         """语言 + 用途 → 预建模板 ID。
