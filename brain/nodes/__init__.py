@@ -301,6 +301,24 @@ async def plan(state: BrainState) -> dict:
     complexity = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
     knowledge_context = state.get("knowledge_context", {})
 
+    # I3 防 premature victory：检测 replan 重入——若 state 已有 subtask_results（说明这是
+    # handle_failure(replan) / confirm(revise) 触发的重新规划，非首次），则旧的完成态事实表
+    # 不可信（新 plan 可能复用旧子任务 id 但语义已变，旧"成功"结果会让新子任务被误判已完成
+    # 而跳过执行 = premature victory）。replan 语义 = 一切重来，确定性清空完成态 + 派发队列，
+    # 让新 plan 的所有子任务都重新派发。完成态只由 dispatch 基于真实 WorkerOutput 重新写。
+    _replan_reset: dict = {}
+    if state.get("subtask_results"):
+        logger.info(
+            "[PLAN] 检测到 replan 重入（已有 %d 个旧完成态）→ 清空完成态事实表，"
+            "防 premature victory（新 plan 子任务全部重新派发）",
+            len(state.get("subtask_results") or {}),
+        )
+        _replan_reset = {
+            "subtask_results": {},
+            "dispatch_remaining": [],
+            "failed_subtask_ids": [],
+        }
+
     logger.info(f"[PLAN] 拆解任务 (复杂度={complexity.value})")
 
     if complexity == Complexity.SIMPLE:
@@ -321,6 +339,7 @@ async def plan(state: BrainState) -> dict:
         return {
             "plan": task_plan,
             "shared_contract": task_plan.shared_contract or {},
+            **_replan_reset,
             **plan_touch,
         }
 
@@ -442,6 +461,7 @@ async def plan(state: BrainState) -> dict:
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
         ),
+        **_replan_reset,
         **plan_touch,
     }
 
