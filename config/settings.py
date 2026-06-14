@@ -372,6 +372,17 @@ class KnowledgeConfig(BaseSettings):
     embed_base_url: str = "http://ai.bit:8082/v1"
     embed_api_key: str = ""
     rerank_url: str = "http://ai.bit:8081/rerank"
+    rerank_api_key: str = ""
+    # 格式适配（embed 统一 OpenAI /embeddings；rerank 三种：
+    #   simple        = 自建 {query,texts} → [{index,score}]（默认，对应 ai.bit:8081）
+    #   openai_rerank = SiliconFlow/OpenAI 兼容 /rerank {model,query,documents,top_n}
+    #   cohere_rerank = Cohere /v1/rerank
+    embed_format: str = "openai"
+    rerank_format: str = "simple"
+    # 复用 LLM provider 的 Key（只在 base_url 同源时生效，读取时回退；自己有 key 优先）。
+    # 留空=不复用；填 provider id（如 "siliconflow"）=从该 provider 取 key。
+    embed_reuse_provider: str = ""
+    rerank_reuse_provider: str = ""
     chunk_size: int = 512
     chunk_overlap: int = 50
     retrieval_top_k: int = 20
