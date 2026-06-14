@@ -403,7 +403,7 @@ class WorkerExecutor:
                 if fix_round < self.max_fix_rounds:
                     self._log(f"修复尝试 {fix_round + 1}/{self.max_fix_rounds}")
                     fix_result = await self._run_agent(
-                        self._build_fix_prompt(verify_result),
+                        self._build_fix_prompt(verify_result, l1_details),
                         step=f"fix-{fix_round}",
                     )
                     self._log(f"修复完成: {fix_result[:200]}")
@@ -1170,11 +1170,43 @@ class WorkerExecutor:
             "格式：L1_RESULT: PASS 或 L1_RESULT: FAIL，然后说明详情。"
         )
 
-    def _build_fix_prompt(self, verify_result: str) -> str:
+    def _l1_failure_digest(self, l1_details: dict) -> str:
+        """从确定性 L1 结果提取【真实失败证据】摘要（已是压缩值，不膨胀 context）。
+
+        I4（Anthropic code-execution/context-engineering 启发）：fix prompt 过去只带 LLM
+        自己上轮的 verify_result（自报，可能没说清真正的 compile 错误）。这里改为优先注入
+        确定性 pipeline 抓到的真实失败信号（compile_message / lint / build_output，均已被
+        compress_tool_output 压到 ≤1500 字符），让修复有的放矢，且因用压缩摘要不灌全量输出。
+        """
+        if not l1_details:
+            return ""
+        parts: list[str] = []
+        # scope 越权（最高优先，确定性硬失败）
+        sv = l1_details.get("scope_violations")
+        if sv:
+            parts.append(f"[scope 越权] 改了 scope 外的文件: {sv}")
+        cm = (l1_details.get("compile_message") or "").strip()
+        if cm and not l1_details.get("l1_2_compile_ok", True):
+            parts.append(f"[编译失败]\n{cm}")
+        lint = l1_details.get("lint") or {}
+        if isinstance(lint, dict) and lint.get("message") and lint.get("status") == "error":
+            parts.append(f"[lint 失败]\n{str(lint.get('message')).strip()}")
+        bo = (l1_details.get("build_output") or "").strip()
+        if bo and l1_details.get("l1_2_1_build_ok") is False:
+            parts.append(f"[构建失败]\n{bo}")
+        reason = l1_details.get("reason")
+        if reason and not parts:
+            parts.append(f"[确定性闸门] {reason}: {l1_details.get('note', '')}")
+        return "\n\n".join(parts).strip()
+
+    def _build_fix_prompt(self, verify_result: str, l1_details: dict | None = None) -> str:
+        # I4：优先用确定性失败证据（真实 compile/lint/scope，已压缩），回退 LLM 自报
+        digest = self._l1_failure_digest(l1_details or {})
+        evidence = digest if digest else verify_result
         return (
-            f"L1 验证未通过，结果：{verify_result}\n\n"
+            f"L1 验证未通过，确定性失败证据：\n{evidence}\n\n"
             "请分析失败原因并修复代码：\n"
-            "1. 仔细阅读错误信息\n"
+            "1. 仔细阅读上面的错误信息（这是真实的编译/lint/scope 检查结果）\n"
             "2. 定位问题根因\n"
             "3. 使用 patch_file 修复\n"
             "完成后请再次运行验证。"
