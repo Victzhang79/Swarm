@@ -424,10 +424,22 @@ def _parse_json_from_llm(text: str | list) -> dict:
     # 去除 markdown 代码块包裹
     text = text.strip()
     if text.startswith("```"):
-        # 找到第一个换行后、最后一个 ``` 之前
-        first_nl = text.index("\n")
+        # audit #18：边界保护——` ```json ` 无换行时 index 会 ValueError；rfind 找不到
+        # 收尾 ``` 时返回 -1 导致截取范围出错。改为安全提取。
+        first_nl = text.find("\n")  # find 而非 index：无换行返回 -1 不抛
         last_fence = text.rfind("```")
-        text = text[first_nl + 1 : last_fence].strip()
+        if first_nl != -1 and last_fence > first_nl:
+            text = text[first_nl + 1 : last_fence].strip()
+        else:
+            # 退化形态：剥掉开头的 ```lang 与可能的收尾 ```，尽力取中间内容
+            body = text[3:]
+            if body.endswith("```"):
+                body = body[:-3]
+            # 去掉紧随 ``` 的语言标识首行（若存在）
+            nl = body.find("\n")
+            if nl != -1 and " " not in body[:nl].strip():
+                body = body[nl + 1 :]
+            text = body.strip()
     return json.loads(text)
 
 
@@ -864,14 +876,28 @@ def confirm_plan(state: BrainState) -> dict:
     # interrupt 会暂停图执行，等待外部输入
     # 外部调用方通过 Command(resume=...) 提供人类决策
     plan_obj = state.get("plan")
+    # audit #8：confirm 有两种进入原因，文案需区分，否则"计划校验失败"场景会误用
+    # "架构级变更（ultra）"措辞，让用户误以为这是 ultra 任务。
+    _complexity = state.get("complexity", Complexity.MEDIUM)
+    _plan_valid = state.get("plan_valid", True)
+    if not _plan_valid:
+        _reason = "validation_failed"
+        _msg = "此任务的执行计划多次自动校验未通过，需人工审核后决定是否继续。"
+    elif _complexity == Complexity.ULTRA:
+        _reason = "ultra"
+        _msg = "此任务为架构级变更（ultra），请审核执行计划并决定是否继续。"
+    else:
+        _reason = "manual_confirm"
+        _msg = "此任务需人工确认执行计划，请审核后决定是否继续。"
     decision = interrupt(
         {
             "type": "confirm_plan",
+            "confirm_reason": _reason,
             "task_id": state.get("task_id"),
             "task_description": state.get("task_description"),
-            "complexity": state.get("complexity", Complexity.ULTRA).value,
+            "complexity": _complexity.value if hasattr(_complexity, "value") else str(_complexity),
             "plan": plan_obj.model_dump() if plan_obj is not None and hasattr(plan_obj, "model_dump") else {},
-            "message": "此任务为架构级变更（ultra），请审核执行计划并决定是否继续。",
+            "message": _msg,
         }
     )
 

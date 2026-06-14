@@ -313,9 +313,9 @@ def _format_mistakes_for_worker(items: list[dict]) -> str:
     for i, item in enumerate(items, 1):
         summary = item.get("description") or item.get("title") or f"错题 {i}"
         fix = item.get("fix_description") or item.get("solution") or ""
-        snippet = (item.get("metadata") or {}).get("code_snippet", "")
-        if isinstance(item.get("metadata"), dict) is False:
-            snippet = ""
+        # audit #4：metadata 非 dict 时 (… or {}) 已兜底为空 dict，snippet 自然取空串，
+        # 原 `if isinstance(...) is False: snippet = ""` 是冗余死逻辑（且 is False 风格怪），移除。
+        snippet = (item.get("metadata") or {}).get("code_snippet", "") if isinstance(item.get("metadata"), dict) else ""
         lines.append(f"  {i}. {summary}")
         if fix:
             lines.append(f"     正确做法: {fix[:200]}")
