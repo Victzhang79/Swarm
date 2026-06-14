@@ -30,6 +30,7 @@ Swarm 把一个编程需求交给一套协作的 AI 智能体：**Brain** 负责
 | CubeSandbox / E2B | — | ⬜ | 隔离沙箱执行；留空则 Worker 本地执行 |
 | Embedding / Rerank 服务 | OpenAI 兼容 | ⬜ | 可走云端（SiliconFlow 等）或自建；缺失时回退内置 fastembed |
 | Redis | ≥ 6 | ⬜ | 模块锁 / 任务队列；默认关闭 |
+| [Docker](https://docs.docker.com/) + Compose v2 | — | ⬜ | 用「方式一 Docker 一键拉起」时需要；裸机部署不需要 |
 
 **操作系统**：macOS（Apple Silicon）/ Ubuntu 22.04+ / Debian / RHEL 系（setup.sh 自动适配 brew / apt / dnf）。
 
@@ -37,7 +38,23 @@ Swarm 把一个编程需求交给一套协作的 AI 智能体：**Brain** 负责
 
 ## 🚀 快速开始
 
-### 一键安装（推荐）
+### 方式一：Docker 一键拉起（最快，推荐试用）
+
+整套 Swarm 服务栈（API + PostgreSQL/pgvector + Qdrant）一条命令拉起，无需手动装依赖：
+
+```bash
+git clone https://github.com/Victzhang79/Swarm.git
+cd Swarm/swarm                   # 项目根在内层 swarm/ 目录
+cp .env.docker.example .env      # 按需填 LLM Key / CubeSandbox 地址等（不填也能起，登录后在 WebUI 配）
+docker compose up -d --build     # 拉起 postgres + qdrant + swarm 三容器
+```
+
+启动后访问 **http://localhost:8420**（默认登录 `admin` / `swarm`，首次登录强制改密）。
+启动钩子会自动建表，无需手动初始化。
+
+> **注意**：Docker 化的是 **Swarm 自身**；**CubeSandbox（远程沙箱执行服务器）是独立服务**，不在 compose 内。Worker 通过 `SWARM_SANDBOX_*` 环境变量连它（在 `.env` 填），留空则 Worker 退回本地执行。
+
+### 方式二：一键安装脚本（裸机部署）
 
 ```bash
 git clone https://github.com/Victzhang79/Swarm.git
@@ -57,7 +74,7 @@ bash setup.sh --dev              # 额外装开发依赖 + 跑冒烟测试
 bash setup.sh --help             # 查看全部选项
 ```
 
-### 手动安装
+### 方式三：手动安装
 
 ```bash
 # 1. 准备 PostgreSQL 16 + pgvector，创建数据库 swarm
@@ -91,7 +108,9 @@ open http://localhost:8420                  # Web UI（默认登录 admin / swar
 
 | 脚本 | 作用 |
 |---|---|
-| `bash setup.sh` | 一键安装 + 启动（首次部署） |
+| `docker compose up -d` | Docker 方式：一键拉起全栈（首选试用） |
+| `docker compose down` | Docker 方式：停止全栈（加 `-v` 清数据卷） |
+| `bash setup.sh` | 裸机一键安装 + 启动（首次部署） |
 | `bash scripts/start-services.sh` | 启动 Qdrant + API（已装好后日常启动） |
 | `bash scripts/restart-api.sh` | 重载 API（代码 / .env 变更后） |
 | `bash scripts/stop-api.sh` | 停止 API |

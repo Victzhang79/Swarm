@@ -517,11 +517,19 @@ if ! curl -sf "http://localhost:6333/collections" >/dev/null 2>&1; then
     fi
     if ! curl -sf "http://localhost:6333/collections" >/dev/null 2>&1; then
         if [[ ! -x "$QDRANT_BIN_DIR/qdrant" ]]; then
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-                arm64) QD_ARCH="aarch64-apple-darwin" ;;
-                x86_64) QD_ARCH="x86_64-apple-darwin" ;;
-                *) QD_ARCH="" ;;
+            OS="$(uname -s)"; ARCH="$(uname -m)"
+            QD_ARCH=""
+            case "$OS" in
+                Darwin)
+                    case "$ARCH" in
+                        arm64) QD_ARCH="aarch64-apple-darwin" ;;
+                        x86_64) QD_ARCH="x86_64-apple-darwin" ;;
+                    esac ;;
+                Linux)
+                    case "$ARCH" in
+                        aarch64|arm64) QD_ARCH="aarch64-unknown-linux-gnu" ;;
+                        x86_64) QD_ARCH="x86_64-unknown-linux-gnu" ;;
+                    esac ;;
             esac
             if [[ -n "$QD_ARCH" ]]; then
                 info "下载 Qdrant 二进制 ($QD_ARCH)..."

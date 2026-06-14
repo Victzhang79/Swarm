@@ -28,26 +28,46 @@ daemonize() {
 if curl -sf "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
   log "Qdrant 已在运行 (6333)"
 else
-  mkdir -p "$QDRANT_DIR" "$(dirname "$QDRANT_BIN")"
-  if [[ ! -x "$QDRANT_BIN" ]]; then
-    ARCH="$(uname -m)"
-    case "$ARCH" in
-      arm64) QD_ARCH="aarch64-apple-darwin" ;;
-      x86_64) QD_ARCH="x86_64-apple-darwin" ;;
-      *) log "无法自动下载 Qdrant (arch=$ARCH)"; QD_ARCH="" ;;
-    esac
-    if [[ -n "${QD_ARCH}" ]]; then
-      log "下载 Qdrant ${QD_ARCH}..."
-      curl -fsSL "https://github.com/qdrant/qdrant/releases/download/v1.13.2/qdrant-${QD_ARCH}.tar.gz" \
-        | tar -xz -C /tmp
-      mv /tmp/qdrant "$QDRANT_BIN"
-      chmod +x "$QDRANT_BIN"
-    fi
-  fi
-  if [[ -x "$QDRANT_BIN" ]]; then
-    log "启动 Qdrant..."
-    daemonize qdrant env QDRANT__STORAGE__STORAGE_PATH="$QDRANT_DIR" "$QDRANT_BIN" >/dev/null
+  # 优先 Docker（跨平台最省事），无 Docker 再下原生二进制
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker 启动 Qdrant..."
+    docker rm -f swarm-qdrant >/dev/null 2>&1 || true
+    docker run -d --name swarm-qdrant -p 6333:6333 -p 6334:6334 \
+      -v "${QDRANT_DIR}:/qdrant/storage" qdrant/qdrant >/dev/null 2>&1 || log "Docker Qdrant 启动失败，回退二进制"
     sleep 2
+  fi
+  if ! curl -sf "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
+    mkdir -p "$QDRANT_DIR" "$(dirname "$QDRANT_BIN")"
+    if [[ ! -x "$QDRANT_BIN" ]]; then
+      OS="$(uname -s)"; ARCH="$(uname -m)"
+      QD_ARCH=""
+      case "$OS" in
+        Darwin)
+          case "$ARCH" in
+            arm64) QD_ARCH="aarch64-apple-darwin" ;;
+            x86_64) QD_ARCH="x86_64-apple-darwin" ;;
+          esac ;;
+        Linux)
+          case "$ARCH" in
+            aarch64|arm64) QD_ARCH="aarch64-unknown-linux-gnu" ;;
+            x86_64) QD_ARCH="x86_64-unknown-linux-gnu" ;;
+          esac ;;
+      esac
+      if [[ -n "${QD_ARCH}" ]]; then
+        log "下载 Qdrant ${QD_ARCH}..."
+        curl -fsSL "https://github.com/qdrant/qdrant/releases/download/v1.13.2/qdrant-${QD_ARCH}.tar.gz" \
+          | tar -xz -C /tmp
+        mv /tmp/qdrant "$QDRANT_BIN"
+        chmod +x "$QDRANT_BIN"
+      else
+        log "无法自动下载 Qdrant (OS=$OS arch=$ARCH)，请手动安装或用 Docker"
+      fi
+    fi
+    if [[ -x "$QDRANT_BIN" ]]; then
+      log "启动 Qdrant..."
+      daemonize qdrant env QDRANT__STORAGE__STORAGE_PATH="$QDRANT_DIR" "$QDRANT_BIN" >/dev/null
+      sleep 2
+    fi
   fi
   if curl -sf "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
     log "Qdrant 已启动"
