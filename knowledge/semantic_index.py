@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # bge-m3 向量维度
 BGE_M3_DIMENSION = 1024
 
+# Qdrant payload 索引版本（12.4）：标记 payload 形态版本，便于排查"首次增量更新后
+# 向量库内容形态变化"。预处理全量(CodeGraph 符号嵌入)与增量(SemanticIndexer 语义分块)
+# 两条路径写入形态不同，靠 index_source 区分、index_version 标版本。
+INDEX_VERSION = "v1"
+INDEX_SOURCE_SEMANTIC = "semantic"   # SemanticIndexer 语义分块（增量路径）
+INDEX_SOURCE_CODEGRAPH = "codegraph"  # 预处理 CodeGraph 符号嵌入（全量路径）
+
 
 @dataclass
 class Chunk:
@@ -247,6 +254,9 @@ class SemanticIndexer:
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     **chunk.metadata,
+                    # 索引溯源（12.4）：放在 metadata 展开之后，确保系统字段权威、不被覆盖
+                    "index_version": INDEX_VERSION,
+                    "index_source": INDEX_SOURCE_SEMANTIC,
                 }
                 points.append(
                     PointStruct(id=point_id, vector=vector, payload=payload)

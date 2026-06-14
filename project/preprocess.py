@@ -1045,6 +1045,11 @@ def _store_vectors_qdrant(
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, PointStruct, VectorParams
 
+    from swarm.knowledge.semantic_index import (
+        INDEX_SOURCE_CODEGRAPH,
+        INDEX_VERSION,
+    )
+
     cfg = DatabaseConfig()
     collection_name = cfg.qdrant_collection
     client = QdrantClient(url=cfg.qdrant_url, check_compatibility=False)
@@ -1091,6 +1096,9 @@ def _store_vectors_qdrant(
                 "signature": signature,
                 "docstring": docstring,
                 "class_name": sym.get("class_name") or "",
+                # 索引溯源（12.4）：标记本路径为预处理全量 CodeGraph 符号嵌入
+                "index_version": INDEX_VERSION,
+                "index_source": INDEX_SOURCE_CODEGRAPH,
             }
             point_id = f"{project_id}:{sym.get('file_path', '')}:{name}:{sym.get('start_line', 0)}"
             # 用稳定哈希（blake2b）生成 Qdrant point ID。Python 内置 hash() 受
