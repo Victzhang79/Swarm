@@ -541,6 +541,7 @@ async def analyze(state: BrainState) -> dict:
     knowledge_prompt = format_brain_knowledge_prompt(
         knowledge_context, task_description
     )
+    _analyze_degraded: str | None = None  # LLM 降级原因（audit #12），非降级保持 None
     try:
         llm = _get_brain_llm()
         prompt_user = ANALYZE_USER.format(
@@ -566,6 +567,7 @@ async def analyze(state: BrainState) -> dict:
             "suggested_subtask_count": 2,
         }
         complexity = Complexity(result["complexity"])
+        _analyze_degraded = f"analyze LLM 输出解析失败，复杂度静默回退 MEDIUM（{e}）"
     except Exception as e:
         logger.warning(f"[ANALYZE] LLM 调用失败，回退到 medium: {e}")
         complexity = Complexity.MEDIUM
@@ -575,6 +577,7 @@ async def analyze(state: BrainState) -> dict:
             "key_risks": [],
             "suggested_subtask_count": 2,
         }
+        _analyze_degraded = f"analyze LLM 调用失败，复杂度静默回退 MEDIUM（{e}）"
 
     logger.info(f"[ANALYZE] 复杂度判定: {complexity.value}")
     affected_files = list(knowledge_context.get("affected_files") or [])
@@ -595,6 +598,9 @@ async def analyze(state: BrainState) -> dict:
         "knowledge_context": knowledge_context,
         "affected_files": affected_files,
         "recent_task_summaries": recent_summaries or [],
+        "degraded_reasons": list(state.get("degraded_reasons") or []) + (
+            [_analyze_degraded] if _analyze_degraded else []
+        ),
         **_planning_triage(task_description, complexity, state),
         **context_patch,
         **analyze_touch,
@@ -644,6 +650,7 @@ async def plan(state: BrainState) -> dict:
     recent_tasks_prompt = format_recent_tasks_for_brain(
         state.get("recent_task_summaries") or []
     )
+    _plan_degraded: str | None = None  # LLM 降级原因（audit #13），非降级保持 None
     sliding_ctx = sliding_context_prompt(state)
 
     # ── LLM 任务拆解 ──
@@ -668,7 +675,8 @@ async def plan(state: BrainState) -> dict:
         result = _parse_json_from_llm(response.content)
         task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
-        logger.warning(f"[PLAN] LLM 输出 JSON 解析失败，使用简单单子任务 plan: {e}")
+        logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
+        _plan_degraded = f"plan LLM 输出解析失败，产出空 scope 兜底计划（Worker 大概率失败，需人工关注）（{e}）"
         task_plan = TaskPlan(
             subtasks=[
                 SubTask(
@@ -687,6 +695,7 @@ async def plan(state: BrainState) -> dict:
         )
     except Exception as e:
         logger.error(f"[PLAN] LLM 调用失败: {e}")
+        _plan_degraded = f"plan LLM 调用失败，产出最简空验证兜底计划（Worker 大概率失败，需人工关注）（{e}）"
         # 创建最简单的回退计划
         task_plan = TaskPlan(
             subtasks=[
@@ -747,6 +756,9 @@ async def plan(state: BrainState) -> dict:
     return {
         "plan": task_plan,
         "shared_contract": task_plan.shared_contract or {},
+        "degraded_reasons": list(state.get("degraded_reasons") or []) + (
+            [_plan_degraded] if _plan_degraded else []
+        ),
         **plan_touch,
     }
 

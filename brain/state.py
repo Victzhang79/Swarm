@@ -40,6 +40,10 @@ class BrainState(TypedDict, total=False):
     affected_files: list[str]           # 检索定位文件（plan 覆盖校验）
     session_metadata: dict              # L0 会话元数据（ephemeral）
     recent_task_summaries: list[dict]    # L2 近期摘要（只读）
+    # LLM 降级可见性（audit #12/#13）：analyze/plan 等节点在 LLM 不可用而走静默兜底
+    # （复杂度回退 MEDIUM、空 scope 兜底 plan）时追加原因，透传到交付/通知，让人工
+    # 审核能看见"本任务经历了降级"，而非误以为系统正常。
+    degraded_reasons: list[str]
 
     # ─── 计划阶段 ───
     plan: TaskPlan                      # 拆解后的子任务 DAG
