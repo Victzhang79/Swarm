@@ -609,4 +609,90 @@ async function saveRouting() {
   /* 已合并到 saveConfig */
 }
 
+// ─── KB Embedding / Rerank 接入点（方案 A）──────────────────────
+let _kbCatalog = { embed: [], rerank: [] };
+
+async function loadKbEmbedRerank() {
+  try {
+    // catalog 填充两个预置下拉
+    const cat = await fetch('/api/kb/embed-rerank/catalog').then(r => r.json());
+    _kbCatalog = { embed: cat.embed || [], rerank: cat.rerank || [] };
+    const fill = (selId, items) => {
+      const sel = $(selId);
+      if (!sel) return;
+      sel.innerHTML = '<option value="">选择预置自动填…</option>' +
+        items.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
+    };
+    fill('kb-embed-catalog', _kbCatalog.embed);
+    fill('kb-rerank-catalog', _kbCatalog.rerank);
+    // 当前配置回填
+    const cur = await fetch('/api/kb/embed-rerank').then(r => r.json());
+    const e = cur.embed || {}, r = cur.rerank || {};
+    const set = (id, v) => { const el = $(id); if (el) el.value = v ?? ''; };
+    set('kb-embed-base-url', e.base_url); set('kb-embed-model', e.model);
+    set('kb-embed-format', e.format || 'openai'); set('kb-embed-reuse', e.reuse_provider);
+    set('kb-rerank-url', r.url); set('kb-rerank-model', r.model);
+    set('kb-rerank-format', r.format || 'simple'); set('kb-rerank-reuse', r.reuse_provider);
+    // key 已配则 placeholder 提示（不回填明文）
+    const ek = $('kb-embed-api-key'), rk = $('kb-rerank-api-key');
+    if (ek) { ek.value = ''; ek.placeholder = e.has_key ? '已配置（留空不改）' : 'API Key（自建可留空）'; }
+    if (rk) { rk.value = ''; rk.placeholder = r.has_key ? '已配置（留空不改）' : 'API Key（自建可留空）'; }
+  } catch { /* ignore */ }
+}
+
+function applyKbCatalog(kind, catalogId) {
+  if (!catalogId) return;
+  const item = (_kbCatalog[kind] || []).find(c => c.id === catalogId);
+  if (!item) return;
+  if (kind === 'embed') {
+    if (item.base_url) $('kb-embed-base-url').value = item.base_url;
+    if (item.model) $('kb-embed-model').value = item.model;
+    $('kb-embed-format').value = item.format || 'openai';
+  } else {
+    if (item.base_url) $('kb-rerank-url').value = item.base_url;
+    if (item.model) $('kb-rerank-model').value = item.model;
+    $('kb-rerank-format').value = item.format || 'simple';
+  }
+  showToast(`已填入 ${item.label || item.id}，填 Key 后保存`, 'info');
+}
+
+async function saveKbEmbedRerank() {
+  const btn = $('btn-save-kb-er');
+  const out = $('kb-er-result');
+  if (btn) btn.disabled = true;
+  try {
+    const v = id => ($(id)?.value || '').trim();
+    const body = {
+      embed: {
+        base_url: v('kb-embed-base-url'), model: v('kb-embed-model'),
+        format: v('kb-embed-format') || 'openai', reuse_provider: v('kb-embed-reuse'),
+      },
+      rerank: {
+        url: v('kb-rerank-url'), model: v('kb-rerank-model'),
+        format: v('kb-rerank-format') || 'simple', reuse_provider: v('kb-rerank-reuse'),
+      },
+    };
+    // key 有填才传（空=不改，保留原）
+    const ek = v('kb-embed-api-key'), rk = v('kb-rerank-api-key');
+    if (ek) body.embed.api_key = ek;
+    if (rk) body.rerank.api_key = rk;
+    const resp = await fetch('/api/kb/embed-rerank', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || '保存失败');
+    showToast('Embedding/Rerank 已保存', 'success');
+    if (data.embed_model_changed && out) {
+      out.innerHTML = `<span style="color:var(--orange)">⚠ ${escapeHtml(data.reprocess_hint || 'Embedding 模型已变更，建议重新预处理所有项目')}</span>`;
+    } else if (out) {
+      out.textContent = '已保存并生效';
+    }
+    loadKbEmbedRerank();
+  } catch (e) {
+    showToast(e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // ─── Sandbox ─────────────────────────────────────────────────

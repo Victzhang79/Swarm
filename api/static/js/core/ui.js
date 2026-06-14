@@ -25,6 +25,7 @@ function toggleSettings() {
 function loadSettingsTab() {
   if (typeof loadConfig === 'function') loadConfig();
   if (typeof loadRoutingTable === 'function') loadRoutingTable();
+  if (typeof loadKbEmbedRerank === 'function') loadKbEmbedRerank();
   if (typeof syncPoolToggleState === 'function') syncPoolToggleState();
   if (typeof loadNotifyChannels === 'function') loadNotifyChannels();
 }

@@ -807,6 +807,38 @@
                   <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
                 </div>
                 <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" onclick="fetchModels()" id="btn-refresh-models">刷新模型列表</button>
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🧠 知识库 Embedding / Rerank 接入点 <span class="hint">检索质量核心</span></h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 10px">Embedding 用于预处理建向量库 + 检索；Rerank 对召回结果重排。可走自建服务或云端成熟服务（SiliconFlow/OpenAI/Cohere）。<b>改 Embedding 模型若维度变化，需重新预处理所有项目。</b></p>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label class="form-label">Embedding 预置</label>
+                    <select id="kb-embed-catalog" class="form-select" onchange="applyKbCatalog('embed', this.value)"><option value="">选择预置自动填…</option></select>
+                  </div>
+                  <div class="form-group"><label class="form-label">Embedding 模型</label><input id="kb-embed-model" class="form-input" placeholder="BAAI/bge-m3"></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group"><label class="form-label">Embedding Base URL</label><input id="kb-embed-base-url" class="form-input" placeholder="http://ai.bit:8082/v1"></div>
+                  <div class="form-group"><label class="form-label">Embedding API Key</label>
+                    <div style="position:relative"><input id="kb-embed-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('kb-embed-api-key')">👁</button></div>
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label class="form-label">Rerank 预置</label>
+                    <select id="kb-rerank-catalog" class="form-select" onchange="applyKbCatalog('rerank', this.value)"><option value="">选择预置自动填…</option></select>
+                  </div>
+                  <div class="form-group"><label class="form-label">Rerank 模型</label><input id="kb-rerank-model" class="form-input" placeholder="BAAI/bge-reranker-v2-m3"></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group"><label class="form-label">Rerank URL</label><input id="kb-rerank-url" class="form-input" placeholder="http://ai.bit:8081/rerank"></div>
+                  <div class="form-group"><label class="form-label">Rerank API Key</label>
+                    <div style="position:relative"><input id="kb-rerank-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('kb-rerank-api-key')">👁</button></div>
+                  </div>
+                </div>
+                <input type="hidden" id="kb-embed-format"><input type="hidden" id="kb-rerank-format">
+                <input type="hidden" id="kb-embed-reuse"><input type="hidden" id="kb-rerank-reuse">
+                <button class="btn btn-primary" style="width:100%;margin-bottom:8px" onclick="saveKbEmbedRerank()" id="btn-save-kb-er">💾 保存 Embedding/Rerank</button>
+                <div id="kb-er-result" style="font-size:12px;color:var(--text-muted);margin-bottom:16px"></div>
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
                 <div class="form-group">
