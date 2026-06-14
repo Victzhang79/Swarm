@@ -39,10 +39,20 @@ L1 确定性闸门=deterministic code over token generation）。这不是过时
 
 **I2 沙箱 headroom 实验** 🔬
 - **假设**：Java/Maven/Go 等重工具链子任务在 2g 硬限下，**装依赖阶段就 OOM**，根本到不了写代码——这可能是历史"fresh sandbox Java build 失败"的真根因（非模型问题）。
-- **实验**：同一 Java 子任务，2c2g vs 2c4g vs 4c8g 三组各跑 N 次，对比 L1 编译/构建成功率 + OOM 率。
+- **实验**：同一 Java 子任务，2c2g vs 4c4g vs 4c8g 三组各跑 N 次，对比 L1 编译/构建成功率 + OOM 率。
 - **量化目标**：若 4g 组成功率显著高于 2g（参考 Anthropic 3x headroom：错误率 5.8%→2.1%, p<0.001），则证实根因，落地"按子任务语言/技术栈分级沙箱资源"。
 - **成本**：改沙箱 create 的资源参数（CubeSandbox template 支持），跑对比。**风险极低**（不改业务逻辑）。
 - **产出**：实验报告 + 若证实则加 `sandbox_resource_tier`（按 harness 语言路由 2g/4g/8g）。
+
+- **实验结论（2026-06-18，真实远程实测，⚠️ 原假设被证伪）**：
+  - 经 Swarm SandboxManager（真实 Worker 路径，dev_sidecar 代理）实测：
+    - **EXEC 2c2g**：全量 Spring Boot 6 starter（web/data-jpa/security/webflux/actuator/test）`dependency:go-offline` + `package`（含测试编译+打 jar）→ **BUILD SUCCESS，300s，无 OOM**（memory.events oom_kill=0）。
+    - **VERIFY 4c4g**（对照）：同任务 → **BUILD SUCCESS，307s，无 OOM**。
+  - **结论1**：2c2g 跑中-重依赖 Java 构建**不会 OOM**，原假设（"2g 装 Java 依赖必 OOM"）**不成立**。java 模板内存够用。
+  - **结论2**：4c4g 几乎不比 2c2g 快（307s vs 300s）——瓶颈是 **Maven 依赖下载的网络 I/O**（经 dev_sidecar 拉公网 Maven 仓库），不是 CPU/内存。多核无用武之地。
+  - **校准后的真问题**：不是 headroom（OOM），而是**依赖下载慢**（5 分钟主要耗在拉依赖）。verify 模板号称"带 .m2 缓存 warmup"，但本次走 exec 模板冷拉证明缓存未命中/未生效。
+  - **新方向（替代原 sandbox_resource_tier）**：① 验证 verify 模板的 .m2/node_modules 缓存是否真 warmup 命中（命中则重任务路由 verify 可省下载）；② 配本地 Maven/npm 镜像源（dev_sidecar 侧加速）；③ 资源分级**降级为低优**（无 OOM 证据）。
+  - **诚实标注**：cgroup v2 memory.peak 采样失败（沙箱内读取权限问题），但 oom_kill 计数器=0 确凿，无 OOM 结论可信。极端场景（更大单体 / 并发构建）未测，如后续遇真实 OOM 再补梯度实验。
 
 ### P1 — 高收益，局部改动，需测试护航
 
@@ -71,6 +81,12 @@ L1 确定性闸门=deterministic code over token generation）。这不是过时
 **I8 凭证可达性安全复核**
 - Anthropic 强调"token 永不可达沙箱"。Swarm 经 dev_sidecar 代理已隔离，但需复核：沙箱内进程能否读到任何 LLM key / git token / DB 凭证？
 - **动作**：审计沙箱环境变量 + 注入路径，确认零凭证可达。**纯审计，无代码**（除非发现泄漏）。
+- **审计结论（2026-06-18，✅ 通过，无泄漏）**：
+  - `apply_sandbox_env` 把 `E2B_API_KEY`(CubeSandbox 控制面 key)写入 **swarm 进程自己的 os.environ**，非注入沙箱；沙箱内用户代码跑在远端，够不到 swarm 进程 environ。
+  - 沙箱 `create()` 只传 `metadata`(swarm_instance/swarm_task 标签)，**零 env 注入**。
+  - 沙箱 `run_command` 执行的是 build/test/lint(L1 闸门)，命令体不拼任何凭证。
+  - GitLab L3 token：全在 **Brain 进程侧** `subprocess.run` 本地 git，**不进沙箱**；token 走 `-c http.extraHeader`(不进 URL/命令位置参数) + `_redact_secrets` 脱敏(测试覆盖)。
+  - 结论：沙箱内零凭证可达，符合 Anthropic "token 永不可达沙箱"。CubeSandbox 边界(控制面+PG+公网全封)是第二道保险。**无需改动。**
 
 ### P2 — 范式级 / 低优，需独立 DESIGN DOC
 

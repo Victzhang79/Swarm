@@ -463,6 +463,78 @@ async def review_design(state: BrainState) -> dict:
 # ══════════════════════════════════════════════
 
 
+def _decouple_independent_subtasks(plan_obj) -> int:
+    """剥离 LLM 误加的【假 depends_on】，提升并行度（I6，原地修改 plan_obj.subtasks）。
+
+    背景：dispatch 用 depends_on DAG 决定并行（get_dispatch_batch：依赖全完成才就绪）。
+    parallel_groups 的过度串行已被 get_dispatch_batch 绕过，但 depends_on 本身是硬约束——
+    LLM 常给本可并行的独立子任务加无谓 depends_on（如"先建 utils 再写 service"，但 service
+    根本不碰 utils 的文件、不引用其契约），导致无谓串行。
+
+    判定一条 depends_on 是【假依赖】需【同时】满足（保守，宁可漏剥不可误剥）：
+      1. 被依赖任务的写文件 ∩ 当前任务的(读∪写文件) = ∅（当前任务完全不碰它产出/改动的文件）
+      2. 当前任务 contract 为空 或 被依赖任务 contract 为空（无跨任务接口契约耦合）
+      3. 两者都不是 allow_any（allow_any 边界不可判定，保守保留依赖）
+    真依赖（文件重叠 / 契约耦合 / allow_any）一律保留。merge 的冲突检测是最终兜底。
+
+    Returns: 剥离的假依赖条数。
+    """
+    subtasks = getattr(plan_obj, "subtasks", None)
+    if not subtasks:
+        return 0
+    by_id = {st.id: st for st in subtasks}
+
+    def _write_set(st) -> set[str]:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            return set()
+        return set(getattr(sc, "writable", []) or []) | set(getattr(sc, "create_files", []) or []) | set(getattr(sc, "delete_files", []) or [])
+
+    def _touch_set(st) -> set[str]:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            return set()
+        return _write_set(st) | set(getattr(sc, "readable", []) or [])
+
+    def _allow_any(st) -> bool:
+        sc = getattr(st, "scope", None)
+        return bool(getattr(sc, "allow_any", False)) if sc else False
+
+    removed = 0
+    for st in subtasks:
+        deps = list(getattr(st, "depends_on", []) or [])
+        if not deps:
+            continue
+        kept: list[str] = []
+        cur_touch = _touch_set(st)
+        cur_contract = dict(getattr(st, "contract", {}) or {})
+        for dep_id in deps:
+            dep = by_id.get(dep_id)
+            if dep is None:
+                kept.append(dep_id)  # 悬空依赖 ID 保留（不臆断）
+                continue
+            # 条件3：任一 allow_any → 保留
+            if _allow_any(st) or _allow_any(dep):
+                kept.append(dep_id)
+                continue
+            # 条件1：文件重叠 → 真依赖，保留
+            if _write_set(dep) & cur_touch:
+                kept.append(dep_id)
+                continue
+            # 条件2：双方都有 contract → 可能契约耦合，保守保留
+            if cur_contract and dict(getattr(dep, "contract", {}) or {}):
+                kept.append(dep_id)
+                continue
+            # 三条件均不构成真依赖 → 判定为假依赖，剥离
+            removed += 1
+            logger.info("[ELABORATE] 剥离假依赖: %s ⊥ %s（零文件重叠+无契约耦合，可并行）", st.id, dep_id)
+        if len(kept) != len(deps):
+            st.depends_on = kept
+    if removed:
+        logger.info("[ELABORATE] 共剥离 %d 条假依赖，提升并行度", removed)
+    return removed
+
+
 async def elaborate(state: BrainState) -> dict:
     """渐进明细：对超上下文预算 / INVEST 不过的子任务做二次 LLM 拆分（打回循环），
     直到每个子任务都在预算内且可独立验证，或达拆分上限（标记 oversized 供人工介入）。
@@ -495,6 +567,9 @@ async def elaborate(state: BrainState) -> dict:
         if not changed:
             break  # LLM 拆不动了，避免空转
         plan_obj = _rebuild_plan(plan_obj, new_subtasks)
+
+    # ── I6：剥离 LLM 误加的假 depends_on，提升 dispatch 并行度 ──
+    decoupled = _decouple_independent_subtasks(plan_obj)
 
     # 最终检查：仍超预算/缺验收的标记出来（人工介入信号）
     oversized: list[str] = []
@@ -538,8 +613,8 @@ async def elaborate(state: BrainState) -> dict:
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
     }
-    if resplit_rounds > 0:
-        # 拆分改变了 plan，回写
+    if resplit_rounds > 0 or decoupled > 0:
+        # 拆分或剥离假依赖改变了 plan，回写
         out["plan"] = plan_obj
     return out
 
