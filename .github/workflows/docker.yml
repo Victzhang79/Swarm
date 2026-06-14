@@ -1,0 +1,89 @@
+name: Docker Smoke
+
+# 验证 "Swarm 一键拉起" 真实可用：docker compose build + up，探活 /api/health。
+# 不依赖开发者本机有无 Docker —— GitHub runner 自带 docker + compose v2。
+#
+# 注意：CubeSandbox（远程沙箱执行服务器）不在 compose、CI 也不连它——
+# SWARM_SANDBOX_* 留空。沙箱连不上不影响 Swarm 启动/建表/health（Worker 派发降级），
+# 这正体现"沙箱是独立服务、Swarm 容器只是客户端"的边界。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch: {}
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 写入最小 .env（CI 冒烟用；CubeSandbox 留空）
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_USER=swarm
+          POSTGRES_PASSWORD=swarm_ci_smoke
+          POSTGRES_DB=swarm
+          SWARM_PORT=8420
+          SWARM_RBAC_ENABLED=true
+          SWARM_SANDBOX_POOL_ENABLED=false
+          SWARM_SECRET_KEY=ci-test-fixed-secret-key-not-for-production
+          EOF
+
+      - name: docker compose build
+        run: docker compose build
+
+      - name: docker compose up（后台）
+        run: docker compose up -d
+
+      - name: 等 swarm 服务 healthy（最多 ~150s）
+        run: |
+          set -e
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q swarm)" 2>/dev/null || echo "starting")
+            echo "[$i] swarm health = $status"
+            if [ "$status" = "healthy" ]; then echo "✅ swarm healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "❌ swarm 未在时限内 healthy，dump 日志："
+          docker compose logs --no-color swarm | tail -100
+          exit 1
+
+      - name: 探活 /api/health（容器外部端口）
+        run: |
+          set -e
+          body=$(curl -fsS http://localhost:8420/api/health)
+          echo "health = $body"
+          echo "$body" | grep -q '"status":"ok"'
+          echo "✅ /api/health 返回 ok"
+
+      - name: 验证建表（startup 钩子应已幂等建全表）
+        run: |
+          set -e
+          # 连 compose 内 postgres，确认核心表存在
+          docker compose exec -T postgres psql -U swarm -d swarm -c "\dt" | tee /tmp/tables.txt
+          for t in project task_records mem_user_profile swarm_users command_blacklist; do
+            grep -q "$t" /tmp/tables.txt && echo "  ✅ 表 $t 存在" || { echo "  ❌ 缺表 $t"; exit 1; }
+          done
+
+      - name: 失败兜底 dump 全栈日志
+        if: failure()
+        run: docker compose logs --no-color | tail -200
+
+      - name: 清理
+        if: always()
+        run: docker compose down -v
