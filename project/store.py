@@ -399,6 +399,19 @@ def update_project(
     return _row_to_project(row) if row else None
 
 
+def _delete_if_table_exists(cur: Any, table: str, project_id: str) -> None:
+    """按 project_id 删除某表行；表不存在则跳过（兼容未启用某些子系统的部署）。
+
+    用 to_regclass 预检，避免因表缺失抛错而回滚整个级联删除事务（12.5）。
+    table 来自固定白名单常量，非用户输入，无注入风险。
+    """
+    cur.execute("SELECT to_regclass(%s)", (table,))
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return
+    cur.execute(f"DELETE FROM {table} WHERE project_id = %s", (project_id,))
+
+
 def delete_project(project_id: str, conn_str: str | None = None) -> bool:
     """删除项目及其关联数据（task_records + preprocess_progress 级联删除需手动）。
 
@@ -422,9 +435,31 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
 
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
-            # 先删关联
+            # 级联删除该项目所有关联数据（修复 12.5：此前仅删 task_records +
+            # preprocess_progress + projects，残留 kb_*/mem_* 行成为孤立数据，长期膨胀）。
+            # 全部在同一事务内，要么全删要么回滚。Qdrant 向量在路由层事务外 best-effort 清理。
             cur.execute("DELETE FROM task_records WHERE project_id = %s", (project_id,))
             cur.execute("DELETE FROM preprocess_progress WHERE project_id = %s", (project_id,))
+            # 知识库 Layer A/C/D + 增量队列
+            for tbl in (
+                "kb_file_index",
+                "kb_symbol_index",
+                "kb_dependency_graph",
+                "kb_norms",
+                "kb_modification_log",
+                "kb_co_occurrence",
+                "kb_update_events",
+                "kb_pending_embeddings",
+            ):
+                _delete_if_table_exists(cur, tbl, project_id)
+            # 记忆 L1/L2/L5/L6（向量随行一并删）
+            for tbl in (
+                "mem_user_profile",
+                "mem_task_summary",
+                "mem_mistakes",
+                "mem_successes",
+            ):
+                _delete_if_table_exists(cur, tbl, project_id)
             cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
             deleted = cur.rowcount
     return deleted > 0

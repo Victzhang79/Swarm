@@ -158,6 +158,23 @@ async def delete_project(project_id: str, request: Request):
     deleted = await loop.run_in_executor(None, _app.store.delete_project, project_id)
     if not deleted:
         raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # 12.5：PG 级联已在 store.delete_project 事务内完成。Qdrant 向量在事务外
+    # best-effort 清理——失败仅告警不阻断（残留向量是孤儿，后续可清理/被覆盖，
+    # 不应因远程抖动让用户删不掉项目）。
+    try:
+        from swarm.knowledge.semantic_index import SemanticIndexer
+        indexer = SemanticIndexer()
+        await indexer.connect()
+        try:
+            await indexer.delete_by_project(project_id)
+        finally:
+            await indexer.close()
+    except Exception:
+        _app.logger.warning(
+            "删除项目 %s 的 Qdrant 向量失败（孤儿向量将残留，可后续清理）", project_id,
+            exc_info=True,
+        )
     return {"status": "ok", "message": f"Project {project_id} deleted"}
 
 
