@@ -301,6 +301,10 @@ class SandboxConfig(BaseSettings):
     pool_max_total: int = 8
     pool_ttl_seconds: int = 600
     pool_idle_seconds: int = 300
+    # A2 批2：跨项目隔离。False（默认）=按 template 复用沙箱（高复用率，靠 clean_workspace
+    # 清理防泄漏）；True=池按 project+template 分桶，跨项目绝不复用同一沙箱（高隔离，
+    # 牺牲复用率）。生产敏感项目可开启。
+    isolate_per_project: bool = False
     pool_reap_interval: int = 60
     # 沙箱健康防护（修死循环烧资源）：
     # - 借/建沙箱后做 envd 健康探活，不健康则弃用换新（最多换 sandbox_health_retries 次）

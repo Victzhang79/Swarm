@@ -522,21 +522,29 @@ class SandboxManager:
             self.kill(sid)
 
     def clean_workspace(self, sandbox: Any, workdir: str = "/workspace") -> bool:
-        """清空沙箱工作区内容（复用沙箱前/归还后调用，防跨任务文件污染）。
+        """清空沙箱工作区内容（复用沙箱前/归还后调用，防跨任务/跨项目文件污染）。
+
+        A2 批2：除 workdir 外，扩展清理 /tmp 与 $HOME 下常见缓存目录——防跨项目泄漏
+        （旧实现只清 workdir，残留 /tmp、pip/npm/cargo 缓存可能被下个项目看到）。
+        保守策略：清缓存与临时文件，不动 shell 配置（.bashrc 等），避免坏环境。
 
         走 shell 端点(commands.run)——不依赖 Jupyter kernel(自建语言镜像无 kernel)。
-        用 find 删除 workdir 下所有内容(含隐藏文件)但保留 workdir 本身。
         返回是否成功；失败记日志不抛(调用方据返回决定是否仍复用)。
         """
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
-        # mkdir -p 保证目录在；find ... -delete 清空内容(保留 workdir)。
+        # 1) 清 workdir 内容（保留目录本身）
+        # 2) 清 /tmp 内容
+        # 3) 清 $HOME 下常见缓存（pip/npm/cargo/go/gradle/.cache 等），保留 shell 配置
+        cache_dirs = ".cache .npm .cargo .gradle .m2 go/pkg .config/pip __pycache__ .pytest_cache .mypy_cache node_modules"
         cmd = (
             f"mkdir -p {workdir} && "
             f"find {workdir} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
+            f"find /tmp -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null; "
+            f'for d in {cache_dirs}; do rm -rf "$HOME/$d" 2>/dev/null; done; '
             f"echo WORKSPACE_CLEANED"
         )
         try:
-            cr = self.run_command(sandbox, cmd, timeout=30)
+            cr = self.run_command(sandbox, cmd, timeout=45, _skip_blacklist=True)
             ok = cr.success and "WORKSPACE_CLEANED" in (cr.stdout or "")
             if not ok:
                 logger.warning("clean_workspace 未确认成功 %s: %s", sid, (cr.stdout or cr.error or "")[:200])
@@ -589,14 +597,41 @@ class SandboxManager:
             logger.warning("沙箱 %s 健康探活异常: %s", sid, str(exc)[:120])
             return False
 
-    def run_command(self, sandbox: Any, command: str, timeout: int = 120, _count_failures: bool = True) -> "CodeResult":
+    def run_command(self, sandbox: Any, command: str, timeout: int = 120, _count_failures: bool = True, _skip_blacklist: bool = False) -> "CodeResult":
         """在沙箱内执行 shell 命令 —— 走 SDK 原生 commands.run(shell 端点)。
 
         与 run_code 的区别：run_code 用 Jupyter kernel 端点(部分自建语言镜像未装
         kernel → 502)；commands.run 是 shell 端点，所有镜像都可用，且执行 mvn/
         npm/go 等构建命令更直接。优先用本方法跑 shell，run_code 仅用于真 Python 片段。
+
+        _skip_blacklist: 内部系统命令（如 clean_workspace）跳过黑名单检查。
         """
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
+        # A2 批3：命令安全黑名单（防误操作）。命中则拒绝执行 + 审计留痕。
+        # db 不可用时 fail-open（check_command 内部处理），不阻断业务——真正安全边界是
+        # CubeSandbox 沙箱隔离（已实测：非 root / 网络封锁 / 资源限额）。
+        if not _skip_blacklist:
+            try:
+                from swarm.config import command_blacklist_store
+                allowed, reason = command_blacklist_store.check_command(command)
+            except Exception:  # noqa: BLE001
+                allowed, reason = True, ""
+            if not allowed:
+                logger.warning("[A2] 命令被黑名单拦截 sid=%s reason=%s cmd=%s", sid, reason, command[:120])
+                try:
+                    from swarm.audit import audit
+                    audit("command_blocked", executor="Worker", sandbox_id=sid, reason=reason)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.append_activity(
+                    sid, "exec",
+                    f"命令被安全黑名单拦截（{reason}）— {command[:120]}",
+                    code=command, error=f"blocked: {reason}",
+                )
+                return CodeResult(
+                    stdout="", stderr=f"⛔ 命令被安全黑名单拦截：{reason}",
+                    error=f"command_blocked: {reason}", success=False,
+                )
         logger.debug("Running command in sandbox %s: %s...", sid, command[:80])
         try:
             res = sandbox.commands.run(command, timeout=timeout)

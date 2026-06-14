@@ -71,6 +71,10 @@ def _ensure_sync_tables() -> None:
 
     ensure_sandbox_tpl_tables()
     print("  ✅ sandbox_templates（沙箱执行/验证镜像配置）")
+    from swarm.config.command_blacklist_store import ensure_tables as ensure_cmd_blacklist_tables
+
+    ensure_cmd_blacklist_tables()
+    print("  ✅ command_blacklist（命令安全黑名单 + 内置默认规则）")
 
 
 def _ensure_auth_tables() -> None:

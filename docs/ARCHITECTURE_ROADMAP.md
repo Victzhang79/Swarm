@@ -20,7 +20,7 @@
   - 调度器（task/decay/kb_update/consistency）多副本下的 leader election？
 - **前置依赖**：CubeSandbox metadata 过滤已实测可行（见 supermemory，2026-06），是沙箱归属方案的基础。
 
-### A2. 沙箱级隔离 enforcement（REVISED 12.10 / 12.18）
+### A2. 沙箱级隔离 enforcement（REVISED 12.10 / 12.18）✅ 完成 @ v0.7.1
 - **现状**：FileScope 越权拦截在**工具层**（scope_guard）；run_command 白名单是**应用层**。
 - **约束**：多租户/不可信代码场景下，应用层拦截可被绕过（沙箱内进程直接 syscall）。
 - **DESIGN DOC 需回答**：沙箱网络隔离策略、文件系统 chroot/挂载限制、能否复用 CubeSandbox 原生隔离能力。

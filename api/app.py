@@ -650,6 +650,14 @@ async def on_startup():
     except Exception as e:
         logger.warning(f"Failed to ensure sandbox_templates table: {e}")
     try:
+        from swarm.config import command_blacklist_store
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, command_blacklist_store.ensure_tables)
+        logger.info("command_blacklist table ensured")
+    except Exception as e:
+        logger.warning(f"Failed to ensure command_blacklist table: {e}")
+    try:
         from swarm.auth.store import (
             backfill_legacy_project_members,
             ensure_admin_default_profile,

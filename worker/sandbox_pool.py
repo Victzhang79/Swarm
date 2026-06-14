@@ -81,8 +81,16 @@ class HotSandboxPool:
 
     # ── 内部辅助 ──────────────────────────────────────
 
-    def _bucket_key(self, template_id: str | None) -> str:
-        return template_id or ""
+    def _bucket_key(self, template_id: str | None, project_id: str | None = None) -> str:
+        # A2 批2：isolate_per_project 开启时把 project 并入桶键，跨项目不复用同一沙箱。
+        tpl = template_id or ""
+        try:
+            from swarm.config.settings import get_config
+            if get_config().sandbox.isolate_per_project and project_id:
+                return f"{tpl}@@proj:{project_id}"
+        except Exception:  # noqa: BLE001
+            pass
+        return tpl
 
     def _is_expired_ttl(self, entry: _PoolEntry, now: float) -> bool:
         return (now - entry.created_at) > self._ttl_seconds
@@ -154,7 +162,7 @@ class HotSandboxPool:
         2. 池空 → create
         3. 超 max_total → 创建临时沙箱（不进池）+ warning
         """
-        key = self._bucket_key(template_id)
+        key = self._bucket_key(template_id, project_id)
 
         # ── 尝试从池内取（跳过 TTL/空闲已过期的，它们留给 reap 清理）──
         candidate_entry: _PoolEntry | None = None
@@ -269,7 +277,15 @@ class HotSandboxPool:
         临时沙箱始终 kill。
         """
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
-        key = self._bucket_key(getattr(sandbox, "template_id", None) or "")
+        # A2 批2：隔离开启时桶键含 project，归还须用与借出一致的 key——从 manager meta
+        # 读回 project_id（借出时 register_sandbox_meta 已存），否则回错桶破坏隔离。
+        _proj = None
+        try:
+            _meta = self._manager.get_sandbox_meta(sid) or {}
+            _proj = _meta.get("project_id")
+        except Exception:  # noqa: BLE001
+            pass
+        key = self._bucket_key(getattr(sandbox, "template_id", None) or "", _proj)
 
         # 检查是否临时沙箱
         with self._lock:

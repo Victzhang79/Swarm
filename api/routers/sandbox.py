@@ -17,6 +17,57 @@ import swarm.api.app as _app
 router = APIRouter()
 
 
+def _sandbox_project_id(manager, sandbox_id: str) -> str | None:
+    """取沙箱归属项目（A2 批1）。优先本进程 meta，回退服务端 metadata 标签。"""
+    meta = manager.get_sandbox_meta(sandbox_id) or {}
+    pid = meta.get("project_id")
+    if pid:
+        return pid
+    # 回退：服务端 metadata 的 swarm_project 标签（批3 create 打的）
+    try:
+        for sb in _app._fetch_sandbox_list_from_server():
+            if sb.get("id") == sandbox_id:
+                return (sb.get("metadata") or {}).get("swarm_project")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _require_sandbox_access(request: Request, sandbox_id: str, permission: str):
+    """A2 批1：校验当前用户对某沙箱所属项目的权限。
+
+    - admin：全权（user_can_on_project 对 admin 恒 True）。
+    - 普通用户：仅对自己有权限的项目的沙箱放行。
+    - 无项目归属的沙箱（孤儿/手动创建）：视为系统级资源，仅 admin。
+    - RBAC-off：_require_user 返回 anonymous admin，自然放行（开箱即用）。
+    """
+    from swarm.api._shared import _require_perm, _require_user
+
+    pid = _sandbox_project_id(_app._get_sandbox_manager(), sandbox_id)
+    if pid is None:
+        # 无归属 → 系统级，仅 admin
+        user = _require_user(request)
+        from swarm.auth.rbac import Role
+        if user.global_role != Role.ADMIN.value:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="该沙箱无项目归属，仅管理员可操作")
+        return user
+    return _require_perm(request, permission, pid)
+
+
+def _require_admin(request: Request):
+    """A2 批1：系统级操作仅 admin（RBAC-off 时 anonymous admin 放行）。"""
+    from fastapi import HTTPException
+
+    from swarm.api._shared import _require_user
+    from swarm.auth.rbac import Role
+
+    user = _require_user(request)
+    if user.global_role != Role.ADMIN.value:
+        raise HTTPException(status_code=403, detail="系统级操作仅管理员可执行")
+    return user
+
+
 class SandboxCreateRequest(BaseModel):
     """创建沙箱请求"""
     template_id: str | None = Field(
@@ -28,8 +79,21 @@ class SandboxCreateRequest(BaseModel):
 
 
 @router.get("/api/sandbox/status", tags=["沙箱"])
-async def sandbox_status(project_id: str | None = None):
-    """活跃沙箱列表（可按 project_id 过滤，仅显示本项目注册/创建的沙箱）"""
+async def sandbox_status(request: Request, project_id: str | None = None):
+    """活跃沙箱列表（A2 批1：按当前用户可见项目过滤，admin 看全部）"""
+    from swarm.api._shared import _require_user
+    from swarm.auth.rbac import Role
+    user = _require_user(request)
+    is_admin = user.global_role == Role.ADMIN.value
+    # 普通用户可见项目集合（admin 不限）
+    visible_pids: set[str] | None = None
+    if not is_admin:
+        from swarm.auth.store import list_user_project_ids
+        try:
+            visible_pids = list_user_project_ids(user.id)
+        except Exception:  # noqa: BLE001
+            visible_pids = set()
+
     loop = asyncio.get_running_loop()
     sandboxes = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
     manager = _app._get_sandbox_manager()
@@ -67,6 +131,12 @@ async def sandbox_status(project_id: str | None = None):
                 sb["task_id"] = meta.get("task_id")
                 sb["source"] = meta.get("source")
 
+    # A2 批1：非 admin 只能看自己有权限项目的沙箱（无归属沙箱对普通用户不可见）
+    if not is_admin:
+        def _sb_pid(sb: dict) -> str | None:
+            return sb.get("project_id") or (sb.get("metadata") or {}).get("swarm_project")
+        sandboxes = [sb for sb in sandboxes if _sb_pid(sb) and _sb_pid(sb) in (visible_pids or set())]
+
     return {
         "active_count": len(sandboxes),
         "sandboxes": sandboxes,
@@ -82,8 +152,13 @@ async def sandbox_status(project_id: str | None = None):
 
 # ─── 8. POST /api/sandbox/create ───────────────────
 @router.post("/api/sandbox/create", tags=["沙箱"])
-async def create_sandbox(req: SandboxCreateRequest):
-    """创建新沙箱"""
+async def create_sandbox(req: SandboxCreateRequest, request: Request):
+    """创建新沙箱（A2 批1：需对目标项目有 task:create 权限；无项目时仅 admin）"""
+    from swarm.api._shared import _require_perm
+    if req.project_id:
+        _require_perm(request, "task:create", req.project_id)
+    else:
+        _require_admin(request)
     manager = _app._get_sandbox_manager()
     try:
         loop = asyncio.get_running_loop()
@@ -108,8 +183,11 @@ async def create_sandbox(req: SandboxCreateRequest):
 
 # ─── 9b. POST /api/sandbox/cleanup — 批量清理（释放泄漏资源）─
 @router.post("/api/sandbox/cleanup", tags=["沙箱"])
-async def cleanup_sandboxes(task_id: str | None = None, server: bool = False, orphans_only: bool = False):
+async def cleanup_sandboxes(request: Request, task_id: str | None = None, server: bool = False, orphans_only: bool = False):
     """批量销毁沙箱，释放 CubeSandbox/小模型资源。
+
+    A2 批1：批量清理是系统级运维操作（可能影响全局/他人沙箱），仅 admin。
+    按单任务释放请用 DELETE /api/sandbox/{sid}（项目级鉴权）。
 
     - task_id：只销毁该任务关联的沙箱（kill_by_task）。
     - orphans_only=true：只销毁孤儿沙箱（服务端在跑、但无任何项目/任务关联）。
@@ -119,6 +197,7 @@ async def cleanup_sandboxes(task_id: str | None = None, server: bool = False, or
 
     并行 kill，避免逐个串行耗时（实测 95 个串行需 ~280s）。
     """
+    _require_admin(request)
     manager = _app._get_sandbox_manager()
     loop = asyncio.get_running_loop()
 
@@ -153,11 +232,12 @@ async def cleanup_sandboxes(task_id: str | None = None, server: bool = False, or
 
 # ─── 9c. GET /api/sandbox/orphans — 孤儿沙箱统计（全局，不跟项目）─
 @router.get("/api/sandbox/orphans", tags=["沙箱"])
-async def list_orphan_sandboxes():
+async def list_orphan_sandboxes(request: Request):
     """列出孤儿沙箱：服务端在跑、但无任何项目/任务关联的沙箱。
 
-    全局运维视图（不绑定项目）。用于系统设置里展示「孤儿数 / 服务端总数」。
+    全局运维视图（不绑定项目），A2 批1：仅 admin。
     """
+    _require_admin(request)
     manager = _app._get_sandbox_manager()
     loop = asyncio.get_running_loop()
     server_list = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
@@ -180,6 +260,7 @@ async def toggle_sandbox_pool(request: Request):
 
     Body: {"enabled": true/false}
     """
+    _require_admin(request)
     body = await request.json()
     enabled = bool(body.get("enabled"))
 
@@ -234,11 +315,12 @@ async def toggle_sandbox_pool(request: Request):
 
 # ─── 9d. GET /api/sandbox/pool — 全局热池可观测面板 ─
 @router.get("/api/sandbox/pool", tags=["沙箱"])
-async def sandbox_pool_status():
+async def sandbox_pool_status(request: Request):
     """全局热沙箱池状态卡：池统计 + 孤儿沙箱 + 服务端总数，一处汇总。
 
-    供 webui 全局池面板展示：是否启用、各语言桶深度、借出/空闲、孤儿数、复用率。
+    供 webui 全局池面板展示（A2 批1：全局运维视图，仅 admin）。
     """
+    _require_admin(request)
     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
 
     manager = _app._get_sandbox_manager()
@@ -279,13 +361,14 @@ async def sandbox_pool_status():
 
 # ─── 9e. POST /api/sandbox/pool/reap — 主动回收(孤儿/超时统一入口) ─
 @router.post("/api/sandbox/pool/reap", tags=["沙箱"])
-async def sandbox_pool_reap(include_orphans: bool = True):
+async def sandbox_pool_reap(request: Request, include_orphans: bool = True):
     """主动触发回收：池内超 TTL/空闲沙箱 + （可选）服务端孤儿沙箱。
 
-    统一的"清理孤儿"入口（取代分散的手动清理）：
+    统一的"清理孤儿"入口（A2 批1：全局运维操作，仅 admin）：
     - 池 reap：回收池内超龄/空闲沙箱。
     - include_orphans=true（默认）：并清理服务端孤儿沙箱（无项目/任务关联）。
     """
+    _require_admin(request)
     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
 
     manager = _app._get_sandbox_manager()
@@ -360,8 +443,9 @@ def _orphan_sandbox_ids(manager, server_list=None) -> list[str]:
 
 # ─── 9. DELETE /api/sandbox/{sandbox_id} ───────────
 @router.delete("/api/sandbox/{sandbox_id}", tags=["沙箱"])
-async def destroy_sandbox(sandbox_id: str):
-    """销毁沙箱"""
+async def destroy_sandbox(sandbox_id: str, request: Request):
+    """销毁沙箱（A2 批1：仅本项目成员/admin 可销毁）"""
+    _require_sandbox_access(request, sandbox_id, "task:cancel")
     manager = _app._get_sandbox_manager()
     # 先在本地 _instances 中查找；找不到则尝试直接调 kill
     if sandbox_id not in manager._instances:
@@ -383,8 +467,9 @@ async def destroy_sandbox(sandbox_id: str):
 
 # ─── 10. GET /api/sandbox/{sandbox_id}/files ───────
 @router.get("/api/sandbox/{sandbox_id}/files", tags=["沙箱"])
-async def sandbox_files(sandbox_id: str, path: str = "/"):
-    """获取沙箱内目录列表（CubeProxy 经 dev_sidecar 转发）"""
+async def sandbox_files(sandbox_id: str, request: Request, path: str = "/"):
+    """获取沙箱内目录列表（A2 批1：仅本项目成员/admin 可读）"""
+    _require_sandbox_access(request, sandbox_id, "task:read")
     manager = _app._get_sandbox_manager()
     try:
         loop = asyncio.get_running_loop()
@@ -419,8 +504,9 @@ async def sandbox_files(sandbox_id: str, path: str = "/"):
 
 # ─── 11. GET /api/sandbox/{sandbox_id}/files/content ─
 @router.get("/api/sandbox/{sandbox_id}/files/content", tags=["沙箱"])
-async def sandbox_file_content(sandbox_id: str, path: str):
-    """读取沙箱内单个文件内容（CubeProxy 经 dev_sidecar 转发）"""
+async def sandbox_file_content(sandbox_id: str, path: str, request: Request):
+    """读取沙箱内单个文件内容（A2 批1：仅本项目成员/admin 可读）"""
+    _require_sandbox_access(request, sandbox_id, "task:read")
     if not path or not path.startswith("/"):
         raise HTTPException(status_code=400, detail="path 必须为沙箱内绝对路径，如 /workspace/foo.py")
     manager = _app._get_sandbox_manager()
@@ -463,8 +549,9 @@ async def sandbox_file_content(sandbox_id: str, path: str):
 
 
 @router.get("/api/sandbox/{sandbox_id}/logs", tags=["沙箱"])
-async def sandbox_logs(sandbox_id: str, limit: int = 200):
-    """沙箱活动日志 — Worker 阶段日志 + run_code stdout/stderr"""
+async def sandbox_logs(sandbox_id: str, request: Request, limit: int = 200):
+    """沙箱活动日志（A2 批1：仅本项目成员/admin 可读）"""
+    _require_sandbox_access(request, sandbox_id, "task:read")
     manager = _app._get_sandbox_manager()
     cap = max(1, min(limit, 500))
     loop = asyncio.get_running_loop()
@@ -548,3 +635,65 @@ async def update_sandbox_templates(req: SandboxTemplatesRequest, request: Reques
     await loop.run_in_executor(None, sandbox_store.invalidate_cache)
     _app.logger.info("沙箱模板配置已更新: %s", saved)
     return {"status": "ok", "saved": saved}
+
+
+# ═══════════════════════════════════════════════════════════
+# 命令安全黑名单（A2 批3，落库 + 管理员 WebUI 可配 + 内置默认）
+# ═══════════════════════════════════════════════════════════
+
+class BlacklistRuleRequest(BaseModel):
+    """新增黑名单规则：正则 pattern + 描述。"""
+    pattern: str = Field(description="正则表达式，对整条命令 search 匹配")
+    description: str = Field(default="", description="规则说明")
+
+
+@router.get("/api/sandbox/command-blacklist", tags=["沙箱"])
+async def list_command_blacklist(request: Request):
+    """命令黑名单规则列表（A2 批3：系统级安全配置，仅 admin）。"""
+    _require_admin(request)
+    from swarm.config import command_blacklist_store
+    loop = asyncio.get_running_loop()
+    rules = await loop.run_in_executor(None, command_blacklist_store.list_rules)
+    return {"status": "ok", "rules": rules}
+
+
+@router.post("/api/sandbox/command-blacklist", tags=["沙箱"])
+async def add_command_blacklist(req: BlacklistRuleRequest, request: Request):
+    """新增黑名单规则（仅 admin）。保存即生效（失效缓存）。"""
+    _require_admin(request)
+    from swarm.config import command_blacklist_store
+    import re as _re
+    try:
+        _re.compile(req.pattern)
+    except _re.error as exc:
+        raise HTTPException(status_code=400, detail=f"无效正则: {exc}")
+    loop = asyncio.get_running_loop()
+    rid = await loop.run_in_executor(
+        None, lambda: command_blacklist_store.add_rule(req.pattern, req.description)
+    )
+    _app.logger.info("[A2] 新增命令黑名单规则 #%d: %s", rid, req.pattern)
+    return {"status": "ok", "id": rid}
+
+
+@router.post("/api/sandbox/command-blacklist/{rule_id}/toggle", tags=["沙箱"])
+async def toggle_command_blacklist(rule_id: int, request: Request):
+    """启停某规则（仅 admin）。body: {"enabled": true/false}"""
+    _require_admin(request)
+    from swarm.config import command_blacklist_store
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: command_blacklist_store.set_rule_enabled(rule_id, enabled))
+    return {"status": "ok", "id": rule_id, "enabled": enabled}
+
+
+@router.delete("/api/sandbox/command-blacklist/{rule_id}", tags=["沙箱"])
+async def delete_command_blacklist(rule_id: int, request: Request):
+    """删除规则（仅 admin）。内置规则不可删（只能 disable）。"""
+    _require_admin(request)
+    from swarm.config import command_blacklist_store
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, lambda: command_blacklist_store.delete_rule(rule_id))
+    if not ok:
+        raise HTTPException(status_code=400, detail="规则不存在或为内置规则（内置规则只能停用不能删除）")
+    return {"status": "ok", "deleted": rule_id}
