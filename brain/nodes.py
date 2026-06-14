@@ -1341,6 +1341,9 @@ async def handle_failure(state: BrainState) -> dict:
         }
 
     # ── LLM 故障分析 ──
+    # audit #17：strategy 必须在 try 前有确定默认值——否则 _get_brain_llm() 抛异常时
+    # except 分支用到 strategy 会 NameError。默认 "retry" 表示确定性回退（非 LLM 建议）。
+    strategy = "retry"
     try:
         llm = _get_brain_llm()
         failure_details_dict: dict[str, dict] = {}
@@ -1367,9 +1370,11 @@ async def handle_failure(state: BrainState) -> dict:
         strategy = result.get("strategy", "retry")
         logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {result.get('reasoning', '')}")
     except json.JSONDecodeError as e:
-        logger.warning(f"[HANDLE_FAILURE] LLM 输出 JSON 解析失败，回退到简单重试: {e}")
+        logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
+        strategy = "retry"
     except Exception as e:
-        logger.warning(f"[HANDLE_FAILURE] 分析异常，回退到简单重试: {e}")
+        logger.warning(f"[HANDLE_FAILURE] LLM 分析异常 → 确定性回退 retry（非 LLM 建议）: {e}")
+        strategy = "retry"
 
     if strategy == "replan":
         for fid in failed_ids:

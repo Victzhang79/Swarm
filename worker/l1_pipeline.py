@@ -203,7 +203,9 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
             if proc.returncode != 0:
                 return False, proc.stderr or proc.stdout or "py_compile failed"
         except Exception as exc:
-            return False, str(exc)
+            # audit #10：保留完整 traceback 便于诊断编译为何失败（原仅 str(exc) 丢栈）
+            logger.warning("[L1.2] py_compile 执行异常: %s", exc, exc_info=True)
+            return False, f"py_compile execution error: {exc}"
 
     js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]
     if js_ts and os.path.isfile(os.path.join(project_path, "package.json")):
@@ -219,7 +221,8 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
             if proc.returncode != 0 and "error TS" in (proc.stdout or proc.stderr or ""):
                 return False, (proc.stderr or proc.stdout or "")[:1000]
         except Exception as exc:
-            logger.debug("tsc skipped: %s", exc)
+            # audit #11：tsc 编译失败可能掩盖真实编译错误，从 debug 升 warning（生产可见）
+            logger.warning("[L1.2] tsc 编译跳过（异常）: %s", exc)
 
     return True, "compile ok"
 
