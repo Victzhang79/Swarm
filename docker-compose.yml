@@ -1,0 +1,83 @@
+# Swarm 一键拉起 —— docker compose up -d 即可启动整个 Swarm 服务栈。
+#
+# 服务：
+#   postgres  : PG 16 + pgvector（状态/checkpointer/向量列；与 CI 镜像一致）
+#   qdrant    : 向量库（知识库）
+#   swarm     : Swarm 本体（API + Brain 编排 + Worker 子进程 + 知识库 + 记忆）
+#
+# 不在 compose 内（务必勿混淆）：
+#   CubeSandbox —— 独立的远程沙箱执行服务器（跑用户代码），架构不动、不容器化。
+#   Swarm 的 Worker 只是 SDK 客户端，经 dev_sidecar 代理连它；连接参数通过下方
+#   SWARM_SANDBOX_* 环境变量注入（在 .env 里填，见 .env.docker.example）。
+#
+# 用法：
+#   1. cp .env.docker.example .env  并填入真实值（PG 密码、SiliconFlow key、CubeSandbox 地址等）
+#   2. docker compose up -d --build
+#   3. 打开 http://localhost:8420 （默认登录 admin/swarm，首次登录强制改密）
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-swarm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-swarm}
+      POSTGRES_DB: ${POSTGRES_DB:-swarm}
+    volumes:
+      - swarm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-swarm} -d ${POSTGRES_DB:-swarm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - swarm_qdrantdata:/qdrant/storage
+    healthcheck:
+      # qdrant 镜像无 curl/wget，用内置 bash /dev/tcp 探活 6333 端口
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  swarm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "${SWARM_PORT:-8420}:8420"
+    environment:
+      # ── 数据库（容器内用 service 名互联，非 localhost）──
+      # 注：用户名/口令从下方 POSTGRES_* 变量取（默认 swarm/swarm，生产请在 .env 改）
+      SWARM_DB_POSTGRES_URI: postgresql://${POSTGRES_USER:-swarm}:${POSTGRES_PASSWORD:-swarm}@postgres:5432/${POSTGRES_DB:-swarm}
+      SWARM_DB_QDRANT_URL: http://qdrant:6333
+      # ── RBAC（生产建议开启）──
+      SWARM_RBAC_ENABLED: ${SWARM_RBAC_ENABLED:-true}
+      # ── 热沙箱池开关 ──
+      SWARM_SANDBOX_POOL_ENABLED: ${SWARM_SANDBOX_POOL_ENABLED:-true}
+      # ── 实例 ID（多副本沙箱隔离用，单机可留空自动随机）──
+      SWARM_INSTANCE_ID: ${SWARM_INSTANCE_ID:-}
+      # ── CubeSandbox 远程沙箱（独立服务器，经 dev_sidecar 代理；不在 compose）──
+      SWARM_SANDBOX_API_URL: ${SWARM_SANDBOX_API_URL:-}
+      SWARM_SANDBOX_API_KEY: ${SWARM_SANDBOX_API_KEY:-}
+      SWARM_SANDBOX_PROXY_BASE: ${SWARM_SANDBOX_PROXY_BASE:-}
+      SWARM_SANDBOX_DEFAULT_TEMPLATE: ${SWARM_SANDBOX_DEFAULT_TEMPLATE:-}
+      # ── 模型接入点 / 其它密钥：建议登录后在 WebUI「设置」里配（落 secret_store 加密），
+      #    或在此按需补充 env（如 OPENAI_API_KEY 等）──
+    env_file:
+      # 可选：把其余敏感/自定义 env 放 .env，compose 自动注入（.env 已被 .gitignore/.dockerignore 排除）
+      - path: .env
+        required: false
+    restart: unless-stopped
+
+volumes:
+  swarm_pgdata:
+  swarm_qdrantdata:

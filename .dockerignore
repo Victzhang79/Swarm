@@ -1,0 +1,50 @@
+# 构建上下文裁剪：不进镜像的本地产物 / 密钥 / 缓存。
+# 与 .gitignore 大体一致，额外排除 .git 与测试沙箱。
+
+# 版本控制 / IDE
+.git
+.gitignore
+.github
+
+# Python 缓存 / 虚拟环境
+__pycache__/
+*.py[oc]
+.venv/
+*.egg-info/
+build/
+dist/
+wheels/
+
+# 密钥 / 环境（绝不进镜像）
+.env
+.env.local
+.env.docker
+*.key
+*.pem
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.hermes/
+
+# 运行时产物 / 数据
+.codegraph/
+.qdrant-initialized
+*.log
+*.log.*
+snapshots/
+workspace/
+workdir/*
+
+# 测试 / 文档（镜像运行时不需要）
+test/
+docs/
+DEVLOG.md
+
+# Docker 自身
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# OS
+.DS_Store
