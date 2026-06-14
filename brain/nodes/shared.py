@@ -433,3 +433,11 @@ def _l2_test_command_from_criteria(criteria: list[str]) -> str:
         if stripped.startswith(("pytest", "python -m pytest", "npm test", "mvn test", "make test")):
             return stripped
     return "pytest -q"
+
+
+# B1 批3: verify_l2 引用的纯函数，归入 shared
+def _diff_has_changes(diff: str) -> bool:
+    return any(
+        line.startswith("+") and not line.startswith("+++")
+        for line in (diff or "").splitlines()
+    )
