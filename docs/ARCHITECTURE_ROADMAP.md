@@ -51,6 +51,15 @@
 - **待落地（与 Docker 合并）**：`QueueDispatcher`（PG 任务队列 SKIP LOCKED）+ 独立 Worker 容器 + Worker 写 PG 进度回传。
 - **设计文档**：`docs/design/B2_service_boundaries.md`。延续 A1 留地基范式（Coordination/Leadership/状态外置 PG/配置 env 全就绪）。
 
+### C. Docker 一键拉起（Swarm 自身可一键部署）— 🟢 文件就绪，待 CI 冒烟实跑
+- **范围澄清（务必勿混淆）**：Docker 化的是 **Swarm 自身**（API/Brain编排/Worker子进程/知识库/记忆）打包成容器，`docker compose up` 一键拉起整个 Swarm 服务栈。**CubeSandbox 是独立的远程沙箱执行服务器，架构不动、不容器化、不进 compose**；Worker 经 `SWARM_SANDBOX_*` env 注入连接参数，仅作 SDK 客户端。
+- **已交付**：
+  - `Dockerfile`：多阶段（py3.12-slim 对齐 CI）、`pip install .`、非 root、`/api/health` healthcheck。
+  - `docker-compose.yml`：`postgres`(pgvector/pg16) + `qdrant` + `swarm` 三服务；swarm `depends_on` PG/Qdrant `service_healthy`；service 名互联；startup 钩子幂等建全表（无需单独 init_db）；volumes 持久化。
+  - `.env.docker.example` 模板 + `.dockerignore`（排除密钥/缓存/test/docs）。
+  - `.github/workflows/docker.yml`：Docker Smoke —— 云端真实 `compose build + up`，验证 healthy + `/api/health` + 建表。
+- **验证状态**：compose 结构静态校验全过；本机（macOS）无 Docker 运行时未能实跑，已加 CI 冒烟 workflow，**push 后 GitHub runner 真实拉起验证**（诚实标注，未自欺宣称本机拉起成功）。
+
 ---
 
 ## 已确认【无需处理】的架构相关项（复核结论，留档防重复讨论）
