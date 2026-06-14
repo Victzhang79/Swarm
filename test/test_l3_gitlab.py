@@ -81,8 +81,14 @@ def test_git_push_remote_url(monkeypatch):
         SWARM_GITLAB_PROJECT_ID="group/proj",
     )
     url = l3_gitlab._git_push_remote_url()
-    assert url == "https://oauth2:secret@gitlab.example.com/group/proj.git"
-    print("  ✅ _git_push_remote_url 构造带 token 的 push URL")
+    # audit #40：push URL 不再内嵌 token（避免进程参数/日志泄漏），token 改走
+    # http.extraHeader。URL 应为干净的 HTTPS 地址，不含 oauth2:secret 凭证。
+    assert url == "https://gitlab.example.com/group/proj.git"
+    assert "secret" not in url and "oauth2:" not in url
+    # token 经 auth header 参数注入
+    hdr = l3_gitlab._gitlab_auth_header_args()
+    assert hdr and hdr[0] == "-c" and "secret" in hdr[1] and "extraHeader" in hdr[1]
+    print("  ✅ _git_push_remote_url 构造无凭证 push URL，token 走 extraHeader")
 
 
 def test_git_push_remote_url_unconfigured(monkeypatch):
