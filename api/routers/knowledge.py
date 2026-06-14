@@ -407,3 +407,70 @@ async def git_knowledge_webhook(project_id: str, payload: GitWebhookPayload):
         project["path"],
         payload.model_dump(),
     )
+
+
+# ── 12.16: pending_embeddings 死信队列可观测 + 手动 requeue ──
+# 背景：embedding 服务长期不可用时，kb_pending_embeddings 条目 retry_count 累积，
+# >=10 被视为永久失败不再自动重试，但此前无 API 暴露、无法手动恢复——运维盲区。
+
+@router.get("/api/projects/{project_id}/knowledge/pending-embeddings", tags=["知识库"])
+async def list_pending_embeddings(project_id: str):
+    """列出该项目待补 embedding 的文件，含 dead(retry_count>=10 永久失败) 标记。"""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _app._validate_project, project_id)
+
+    def _query() -> dict[str, Any]:
+        with _app._get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT file_path, change_type, language, retry_count, last_error, created_at
+                    FROM kb_pending_embeddings
+                    WHERE project_id = %s
+                    ORDER BY retry_count DESC, created_at ASC
+                    """,
+                    (project_id,),
+                )
+                rows = cur.fetchall()
+        items = [
+            {
+                "file_path": r[0],
+                "change_type": r[1],
+                "language": r[2],
+                "retry_count": r[3],
+                "last_error": r[4],
+                "created_at": r[5].isoformat() if r[5] else None,
+                "dead": r[3] >= 10,  # 与 updater.retry_pending_embeddings 的 retry_count<10 阈值一致
+            }
+            for r in rows
+        ]
+        dead = sum(1 for it in items if it["dead"])
+        return {"total": len(items), "dead": dead, "pending": len(items) - dead, "items": items}
+
+    return await loop.run_in_executor(None, _query)
+
+
+@router.post("/api/projects/{project_id}/knowledge/pending-embeddings/requeue", tags=["知识库"])
+async def requeue_pending_embeddings(project_id: str):
+    """把该项目所有 dead(retry_count>=10) 条目的 retry_count 清零，重新纳入自动重试。
+
+    用于 embedding 服务恢复后手动恢复死信。返回被重置的条目数。
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _app._validate_project, project_id)
+
+    def _requeue() -> dict[str, Any]:
+        with _app._get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE kb_pending_embeddings
+                    SET retry_count = 0, last_error = NULL
+                    WHERE project_id = %s AND retry_count >= 10
+                    """,
+                    (project_id,),
+                )
+                n = cur.rowcount
+        return {"requeued": n}
+
+    return await loop.run_in_executor(None, _requeue)
