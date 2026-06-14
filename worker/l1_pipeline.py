@@ -20,6 +20,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# audit #37/#38：编译/lint 每次最多处理的文件数。原为硬编码 20，大变更集会遗漏后续
+# 文件的编译/lint 错误。改为可配（SWARM_WORKER_L1_MAX_FILES，默认 20），并在截断时告警。
+def _max_files_per_check() -> int:
+    try:
+        return max(1, int(os.environ.get("SWARM_WORKER_L1_MAX_FILES", "20")))
+    except ValueError:
+        return 20
+
+
+def _cap_files(files: list[str], kind: str) -> list[str]:
+    """按上限截断文件列表；截断时告警（避免静默遗漏后续文件的检查）。"""
+    cap = _max_files_per_check()
+    if len(files) > cap:
+        logger.warning(
+            "[L1] %s 文件数 %d 超过上限 %d，仅检查前 %d 个（其余未覆盖，可调 "
+            "SWARM_WORKER_L1_MAX_FILES）", kind, len(files), cap, cap,
+        )
+        return files[:cap]
+    return files
+
+
 def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tuple[int, str]:
     """L1 命令执行器：沙箱优先(sandbox-first)。
 
@@ -190,7 +211,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
     py_files = [f for f in files if f.endswith(".py")]
     if py_files:
         py_bin = _python_bin()
-        cmd = f"{py_bin} -m py_compile " + " ".join(f'"{f}"' for f in py_files[:20])
+        cmd = f"{py_bin} -m py_compile " + " ".join(f'"{f}"' for f in _cap_files(py_files, "py_compile"))
         try:
             proc = subprocess.run(
                 cmd,
@@ -263,7 +284,7 @@ def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60) -
         messages.append("ruff 未安装，跳过 Python lint")
         return has_error, messages, issues
 
-    for fp in py_files[:20]:
+    for fp in _cap_files(py_files, "pyflakes"):
         try:
             proc = subprocess.run(
                 [ruff_bin, "check", fp, "--output-format=json"],
@@ -331,7 +352,7 @@ def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tu
 
     try:
         proc = subprocess.run(
-            "npx eslint --format json " + " ".join(f'"{f}"' for f in js_ts[:20]),
+            "npx eslint --format json " + " ".join(f'"{f}"' for f in _cap_files(js_ts, "eslint")),
             cwd=project_path,
             shell=True,
             capture_output=True,
@@ -497,7 +518,7 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
 
     try:
         proc = subprocess.run(
-            [checkstyle_bin] + java_files[:20],
+            [checkstyle_bin] + _cap_files(java_files, "checkstyle"),
             cwd=project_path,
             capture_output=True,
             text=True,
@@ -866,8 +887,17 @@ def run_l1_pipeline(
             else:
                 details["lint"]["note"] = "lint error 仅作警告（SWARM_WORKER_L1_LINT_GATE=false）"
                 details["lint"]["gated"] = False
+                # audit #27：lint gate 被显式关闭时本应阻断的 error 被放行，属安全护栏降级，
+                # 必须在日志可见（否则误配置导致 lint 静默失效无人察觉）。
+                if error_issues:
+                    logger.warning(
+                        "[L1.2.5] lint gate 已关闭(SWARM_WORKER_L1_LINT_GATE=false)，"
+                        "%d 个语法级 lint error 未阻断流水线", len(error_issues),
+                    )
     else:
         details["lint"] = {"status": "disabled", "reason": "SWARM_WORKER_L1_LINT=false"}
+        # audit #27：lint 整体禁用是确定性护栏降级，日志留痕。
+        logger.warning("[L1.2.5] L1 lint 已禁用(SWARM_WORKER_L1_LINT=false) — 确定性 lint 校验不生效")
 
     # ── L1.3 scoped test ──
     # 优先用 Brain 编排的 harness.test_command（精心编写、确定性）；

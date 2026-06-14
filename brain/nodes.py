@@ -939,6 +939,19 @@ async def dispatch(state: BrainState) -> dict:
     if not dispatch_remaining and not subtask_results:
         dispatch_remaining = [t.id for t in plan_obj.subtasks]
 
+    # audit #19：重入防护——dispatch_remaining 为空但仍有"既未完成、也不在 remaining"
+    # 的子任务时（理论上不该出现，但 handle_failure/rebase 等异常路径可能造成），
+    # 把这些遗漏子任务补回 remaining，避免直接跳过派发导致任务卡死/漏做。
+    _completed = set(subtask_results.keys())
+    if not dispatch_remaining:
+        _orphaned = [t.id for t in plan_obj.subtasks if t.id not in _completed]
+        if _orphaned:
+            logger.warning(
+                "[DISPATCH] 检测到 %d 个未完成但不在 remaining 的子任务，补回派发队列: %s",
+                len(_orphaned), _orphaned,
+            )
+            dispatch_remaining = _orphaned
+
     completed_ids = set(subtask_results.keys())
     config = get_config()
     max_concurrent = config.worker.max_concurrent
@@ -1206,7 +1219,14 @@ async def _dispatch_to_worker(
             difficulty=difficulty,
             modality=modality,
         )
-        model_name = getattr(worker_llm, 'model_name', None) or getattr(worker_llm, 'model', 'routed')
+        model_name = getattr(worker_llm, 'model_name', None) or getattr(worker_llm, 'model', None)
+        if not model_name:
+            # audit #35：两个属性都取不到 → 丧失模型追踪能力，显式告警而非静默用 'routed'
+            model_name = 'routed'
+            logger.warning(
+                "[DISPATCH] 子任务 %s 无法从 LLM 对象读取模型名(model_name/model 均缺)，"
+                "追踪降级为 'routed'", subtask.id,
+            )
         logger.info(f"[DISPATCH] 子任务 {subtask.id} 使用模型: {model_name}")
 
     set_worker_context(project_id or None)
