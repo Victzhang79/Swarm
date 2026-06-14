@@ -304,9 +304,19 @@ def _python_merge3(base: str, ours: str, theirs: str) -> tuple[str, bool]:
             continue
 
         if i1a == i1b and tag_a == tag_b == "insert":
-            merged.extend(a_lines[j1a:j2a])
-            if b_lines[j1b:j2b] != a_lines[j1a:j2a]:
+            # audit #23：同一 base 位置双方都插入。
+            # - 内容相同：非冲突，取其一。
+            # - 内容不同：这是真冲突，静默"先 a 后 b"拼接会产生语义错乱的合并结果
+            #   （顺序任意、两段都塞进去）。改为标记冲突，交上层(merge 节点)重新生成。
+            if a_lines[j1a:j2a] == b_lines[j1b:j2b]:
+                merged.extend(a_lines[j1a:j2a])
+            else:
+                conflict = True
+                merged.append("<<<<<<< ours\n")
+                merged.extend(a_lines[j1a:j2a])
+                merged.append("=======\n")
                 merged.extend(b_lines[j1b:j2b])
+                merged.append(">>>>>>> theirs\n")
             ai += 1
             bi += 1
             continue
@@ -324,11 +334,9 @@ def _python_merge3(base: str, ours: str, theirs: str) -> tuple[str, bool]:
         chunk_b = b_lines[j1b:j2b] if tag_b != "equal" else base_lines[i1b:i2b]
         if chunk_a == chunk_b:
             merged.extend(chunk_a)
-        elif tag_a == "insert" and tag_b == "insert":
-            merged.extend(chunk_a)
-            if chunk_b != chunk_a:
-                merged.extend(chunk_b)
         else:
+            # audit #23：双方不同的修改/插入即冲突。原 insert+insert 分支静默拼接
+            # （先 a 后 b）会产生语义错乱的结果，改为统一标记冲突，交上层重新生成。
             conflict = True
             merged.append("<<<<<<< ours\n")
             merged.extend(chunk_a)
