@@ -766,9 +766,11 @@ async def _dispatch_to_worker(
     )
 
     try:
-        from swarm.worker.executor import WorkerExecutor
-        executor = WorkerExecutor(
-            subtask=subtask,
+        from swarm.infra.worker_dispatcher import get_worker_dispatcher
+        dispatcher = get_worker_dispatcher()
+        t0 = time.monotonic()
+        output = await dispatcher.dispatch(
+            subtask,
             model_name=model_name if isinstance(model_name, str) else None,
             knowledge=worker_knowledge,
             project_id=project_id or None,
@@ -777,8 +779,6 @@ async def _dispatch_to_worker(
             user_profile_prompt=user_profile_prompt,
             shared_contract=shared_contract or {},
         )
-        t0 = time.monotonic()
-        output = await executor.run()
         duration_ms = int((time.monotonic() - t0) * 1000)
         audit(
             "worker_complete",

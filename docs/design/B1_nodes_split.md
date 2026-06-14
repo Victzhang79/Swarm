@@ -1,6 +1,6 @@
 # B1 设计文档：brain/nodes.py 单体拆分
 
-状态：**待拍板** · 版本 v0.1 · 2026-06-14
+状态：**🟡 粗拆完成（拍板范围）** · 版本 v0.1 · 2026-06-14
 关联：ROADMAP P1 可维护性 · skill `python-module-splitting`
 
 ---

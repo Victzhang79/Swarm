@@ -30,17 +30,26 @@
 
 ## P1 — 可维护性 / 长期健康
 
-### B1. brain/nodes.py 单体拆分（REVISED 12.8）
-- **现状**：~2350 行，14 个节点 + 大量辅助函数集中一个文件。
-- **方案草案**：按节点域拆 `brain/nodes/`（analyze.py / plan.py / dispatch.py / verify.py / learn.py / merge.py + shared.py）。
-- **风险**：纯重构，回归风险 > 收益；需充分测试护航（当前 688 测试是基础，但节点间 import 关系复杂）。
-- **建议时机**：有一次"反正要大改 brain"的功能迭代时顺带拆，不单独为拆而拆。
-- **已有先例**：参考已沉淀的 `python-module-splitting` / `fastapi-monolith-router-split` skill（AST 脚本化提取 + mock 合约保持）。
+### B1. brain/nodes.py 单体拆分（REVISED 12.8）— 🟡 粗拆完成 @ 进行中
+- **现状**：~~2361 行单文件~~ → 已拆 `brain/nodes/` 包（`__init__` re-export 保 `swarm.brain.nodes.X` 路径 100% 不变）。
+- **已完成（拍板：先粗拆最大最常改的域 + 抽 shared，其余暂留）**：
+  - `shared.py`：20 个无状态纯 helper + 常量
+  - `dispatch.py`：dispatch / monitor 节点
+  - `verify.py`：verify_l2 / verify_l3 + 失败态/巡检 helper
+  - 🔑 mock 锚点零改：被 patch 的符号（`_get_brain_llm`/`_dispatch_to_worker`/`_get_project_path`/`_try_l2_*`/`_verify_l2_via_llm`）留 `__init__`，抽出节点内对其调用改 `nodes.X(...)` 模块限定 → `patch("swarm.brain.nodes.X")` 仍命中。
+  - `__init__` 2361 → 1632 行；测试零改；723 passed。
+- **暂留 `__init__`**：analyze / plan / validate_plan / confirm_plan / handle_failure / merge / deliver / revision / learn_success / learn_failure（后续需要时按同法继续抽）。
+- **设计文档**：`docs/design/B1_nodes_split.md`。
 
-### B2. 全子系统共进程 → 服务边界（REVISED 12.20）
-- **现状**：API / Brain 编排 / Worker 执行 / 知识库 / 记忆 全在一个进程。
+### B2. 全子系统共进程 → 服务边界（REVISED 12.20）— 🟡 抽象地基完成 @ 进行中
+- **现状**：API / Brain 编排 / Worker 执行 / 知识库 / 记忆 全在一个进程；核心耦合点 `_dispatch_to_worker` 同进程直跑 WorkerExecutor。
 - **长期**：Worker 执行（重、可能 OOM）与 API（要稳）应进程/服务隔离。
-- **建议时机**：A1 状态外置化之后的自然延伸。
+- **核心判断（拍板）**：**B2 ≈ Docker 多容器交付**，落地与 Docker 合并（避免通信层返工）。
+- **已完成（拍板：抽象先行，单机零变化）**：
+  - `infra/worker_dispatcher.py`：`WorkerDispatcher` 接口 + `InProcessDispatcher`（默认，行为与拆分前逐字节一致）+ `get_worker_dispatcher()` 工厂（`SWARM_WORKER_DISPATCH_MODE` 切换点，queue 未实现时回退 inprocess）。
+  - `_dispatch_to_worker` 改为走 dispatcher 接口；单机/当前部署零变化；5 单测覆盖。
+- **待落地（与 Docker 合并）**：`QueueDispatcher`（PG 任务队列 SKIP LOCKED）+ 独立 Worker 容器 + Worker 写 PG 进度回传。
+- **设计文档**：`docs/design/B2_service_boundaries.md`。延续 A1 留地基范式（Coordination/Leadership/状态外置 PG/配置 env 全就绪）。
 
 ---
 
