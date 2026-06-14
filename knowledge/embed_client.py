@@ -15,15 +15,17 @@ _MAX_BATCH = 32
 
 
 def _endpoint() -> tuple[str, str, str, int] | None:
-    """返回 (base_url, api_key, model, batch_size) 或 None（未配置）。"""
+    """返回 (base_url, api_key, model, batch_size) 或 None（未配置）。
+
+    委托 embed_rerank_config.get_embed_endpoint（统一解析：secret_store key +
+    复用 provider key 同源校验）。批2 改造：不再直接读 KnowledgeConfig 明文字段。
+    """
     try:
-        from swarm.config.settings import KnowledgeConfig
-        kcfg = KnowledgeConfig()
-        base = (kcfg.embed_base_url or "").strip().rstrip("/")
-        if not base:
+        from swarm.knowledge.embed_rerank_config import get_embed_endpoint
+        ep = get_embed_endpoint()
+        if ep is None:
             return None
-        batch = getattr(kcfg, "embed_batch_size", 32) or 32
-        return base, (kcfg.embed_api_key or ""), kcfg.embedding_model, int(batch)
+        return ep.base_url, ep.api_key, ep.model, int(ep.batch_size or 32)
     except Exception:  # noqa: BLE001
         return None
 

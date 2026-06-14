@@ -33,74 +33,110 @@ def rerank_documents(
             t = f"{doc.get('file_path')} {doc.get('symbol_name', '')}"
         texts.append(str(t)[:2000])
 
-    # 优先：专用 reranker 服务（ai.bit:8081，schema: {query, texts} → [{index, score}]）
-    rerank_url = (getattr(kcfg, "rerank_url", "") or "").strip()
-    if rerank_url:
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.post(rerank_url, json={"query": query, "texts": texts})
-                resp.raise_for_status()
-                data = resp.json()
-                # 兼容两种返回：纯数组 [{index,score}] 或 {results:[...]}
-                items = data if isinstance(data, list) else (data.get("results") or data.get("data") or [])
-                out: list[dict[str, Any]] = []
-                for item in items:
-                    idx = item.get("index")
-                    if idx is None or int(idx) >= len(documents):
-                        continue
-                    doc = dict(documents[int(idx)])
-                    doc["rerank_score"] = item.get("score", item.get("relevance_score", 0.0))
-                    out.append(doc)
-                if out:
-                    out.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-                    thr = getattr(kcfg, "rerank_score_threshold", 0.0) or 0.0
-                    if thr > 0:
-                        filtered = [d for d in out if d.get("rerank_score", 0.0) >= thr]
-                        # 阈值过滤后若全空，保留 top1 兜底（宁缺毋滥但别全丢）
-                        out = filtered or out[:1]
-                    return out[:top_k]
-        except Exception as exc:
-            logger.warning("专用 rerank 服务失败(回退): %s", exc)
-
-    # 回退：SiliconFlow / OpenAI 兼容 /rerank
-    api_key = cfg.model.siliconflow_api_key or ""
-    base_url = (cfg.model.siliconflow_base_url or "").rstrip("/")
-    model = kcfg.reranker_model
-
-    if not api_key or not base_url:
-        return _fallback_sort(documents, top_k)
-
+    # 批2 改造：从统一解析取 rerank 接入点（含 secret_store key / 复用 provider key 同源校验），
+    # 按 rerank_format 选适配器（simple / openai_rerank / cohere_rerank）。
+    ep = None
     try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(
-                f"{base_url}/rerank",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "query": query,
-                    "documents": texts,
-                    "top_n": min(top_k, len(texts)),
-                },
-            )
-            if resp.status_code == 404:
-                return _rerank_via_embeddings_fallback(query, documents, top_k, client, base_url, api_key)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results") or data.get("data") or []
-            out: list[dict[str, Any]] = []
-            for item in results:
-                idx = item.get("index", item.get("document", {}).get("index"))
-                if idx is None:
-                    continue
-                doc = dict(documents[int(idx)])
-                doc["rerank_score"] = item.get("relevance_score", item.get("score", 0.0))
-                out.append(doc)
+        from swarm.knowledge.embed_rerank_config import get_rerank_endpoint
+        ep = get_rerank_endpoint()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("rerank 接入点解析失败: %s", exc)
+
+    if ep is not None:
+        thr = getattr(kcfg, "rerank_score_threshold", 0.0) or 0.0
+        try:
+            if ep.fmt == "simple":
+                out = _rerank_simple(ep, query, texts, documents)
+            elif ep.fmt == "cohere_rerank":
+                out = _rerank_cohere(ep, query, texts, documents, top_k)
+            else:  # openai_rerank（含 SiliconFlow）
+                out = _rerank_openai(ep, query, texts, documents, top_k)
             if out:
+                out.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                if thr > 0:
+                    out = [d for d in out if d.get("rerank_score", 0.0) >= thr] or out[:1]
                 return out[:top_k]
-    except Exception as exc:
-        logger.warning("rerank API failed, using score fallback: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("rerank(%s) 失败(回退本地排序): %s", ep.fmt, exc)
 
     return _fallback_sort(documents, top_k)
+
+
+def _rerank_simple(ep, query: str, texts: list[str], documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """自建格式：POST {query, texts} → [{index, score}] 或 {results:[...]}。"""
+    headers = {"Content-Type": "application/json"}
+    if ep.api_key:
+        headers["Authorization"] = f"Bearer {ep.api_key}"
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(ep.url, json={"query": query, "texts": texts}, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    items = data if isinstance(data, list) else (data.get("results") or data.get("data") or [])
+    out: list[dict[str, Any]] = []
+    for item in items:
+        idx = item.get("index")
+        if idx is None or int(idx) >= len(documents):
+            continue
+        doc = dict(documents[int(idx)])
+        doc["rerank_score"] = item.get("score", item.get("relevance_score", 0.0))
+        out.append(doc)
+    return out
+
+
+def _rerank_openai(ep, query: str, texts: list[str], documents: list[dict[str, Any]],
+                   top_k: int) -> list[dict[str, Any]]:
+    """SiliconFlow/OpenAI 兼容：POST {base}/rerank {model,query,documents,top_n}。"""
+    headers = {"Content-Type": "application/json"}
+    if ep.api_key:
+        headers["Authorization"] = f"Bearer {ep.api_key}"
+    base = ep.url.rstrip("/")
+    url = base if base.endswith("/rerank") else f"{base}/rerank"
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(url, headers=headers, json={
+            "model": ep.model, "query": query, "documents": texts,
+            "top_n": min(top_k, len(texts)),
+        })
+        if resp.status_code == 404:
+            return _rerank_via_embeddings_fallback(query, documents, top_k, client, base, ep.api_key)
+        resp.raise_for_status()
+        data = resp.json()
+    results = data.get("results") or data.get("data") or []
+    out: list[dict[str, Any]] = []
+    for item in results:
+        idx = item.get("index", item.get("document", {}).get("index"))
+        if idx is None or int(idx) >= len(documents):
+            continue
+        doc = dict(documents[int(idx)])
+        doc["rerank_score"] = item.get("relevance_score", item.get("score", 0.0))
+        out.append(doc)
+    return out
+
+
+def _rerank_cohere(ep, query: str, texts: list[str], documents: list[dict[str, Any]],
+                   top_k: int) -> list[dict[str, Any]]:
+    """Cohere /v1/rerank：POST {base}/rerank {model,query,documents,top_n} → {results:[{index,relevance_score}]}。"""
+    headers = {"Content-Type": "application/json"}
+    if ep.api_key:
+        headers["Authorization"] = f"Bearer {ep.api_key}"
+    base = ep.url.rstrip("/")
+    url = base if base.endswith("/rerank") else f"{base}/rerank"
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(url, headers=headers, json={
+            "model": ep.model, "query": query, "documents": texts,
+            "top_n": min(top_k, len(texts)),
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    results = data.get("results") or []
+    out: list[dict[str, Any]] = []
+    for item in results:
+        idx = item.get("index")
+        if idx is None or int(idx) >= len(documents):
+            continue
+        doc = dict(documents[int(idx)])
+        doc["rerank_score"] = item.get("relevance_score", 0.0)
+        out.append(doc)
+    return out
 
 
 def _fallback_sort(documents: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
