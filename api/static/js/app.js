@@ -56,6 +56,8 @@ function startInitialLoad() {
   loadProjects();
   loadRoutingTable();
   pollNotificationBell();
+  // A2 治本：登录后即显示应用外壳（系统级导航栏常驻），系统/设置不再依赖先选项目
+  if (typeof showAppShell === 'function') showAppShell();
 }
 
 // 后台轮询：每个 tick 都先检查登录态，未登录直接跳过（防 401 风暴）。

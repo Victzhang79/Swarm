@@ -50,12 +50,16 @@ function switchTopTab(topTab) {
     // 显示下层项目 nav，激活当前项目 tab（默认 tasks）
     if (subNav) subNav.classList.remove('hidden');
     stopSystemRefresh();
+    // A2：workspace 未选项目时显示占位提示
+    if (typeof applyNoProjectPlaceholder === 'function') applyNoProjectPlaceholder();
     switchTab(currentTab && currentTab !== 'observability' && currentTab !== 'system' ? currentTab : 'tasks');
     return;
   }
 
   // 系统级：隐藏下层 nav，直接激活对应系统 panel
   if (subNav) subNav.classList.add('hidden');
+  // A2：系统级 tab 不需要项目，隐藏"选择项目"占位
+  if (typeof applyNoProjectPlaceholder === 'function') applyNoProjectPlaceholder();
   document.querySelectorAll('.tab-panel').forEach(panel => {
     panel.classList.toggle('active', panel.id === 'tab-' + topTab);
   });

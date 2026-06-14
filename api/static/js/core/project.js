@@ -101,16 +101,46 @@ function clearProjectScopedUI() {
   resetSandboxDetail();
 }
 
-function showProjectView(show) {
-  $('no-project-view').classList.toggle('hidden', show);
+// A2 治本：登录后即显示应用外壳（含系统级导航栏），让"系统/设置"等系统级 tab
+// 不再依赖"先选中一个项目"。系统级功能(用户管理/沙箱/系统)本就独立于项目。
+// project-view 容器登录后常驻显示；未选项目时仅 workspace tab 内显示占位提示。
+function showAppShell() {
   const pv = $('project-view');
-  if (show) {
+  if (pv) {
     pv.classList.remove('hidden');
     pv.style.display = 'flex';
-  } else {
-    pv.classList.add('hidden');
-    pv.style.display = 'none';
   }
+  // 项目栏(标题/预处理/删除)依赖选中项目，未选时隐藏
+  applyProjectBarVisibility();
+  // workspace 区的"选择项目"占位：仅当前在 workspace tab 且未选项目时显示
+  applyNoProjectPlaceholder();
+}
+
+// 项目栏(project-bar)仅在选中项目时有意义
+function applyProjectBarVisibility() {
+  const bar = document.querySelector('#project-view .project-bar');
+  if (bar) bar.style.display = selectedProjectId ? '' : 'none';
+}
+
+// "选择或创建项目"占位：仅在 workspace 顶tab + 未选项目时显示；
+// 系统级 tab(沙箱/系统/设置)下永远不显示（它们不需要项目）。
+function applyNoProjectPlaceholder() {
+  const np = $('no-project-view');
+  if (!np) return;
+  const onWorkspace = (typeof currentTopTab === 'undefined') || currentTopTab === 'workspace';
+  const show = onWorkspace && !selectedProjectId;
+  np.classList.toggle('hidden', !show);
+}
+
+function showProjectView(show) {
+  // 选中项目后：确保外壳显示 + 项目栏出现 + 隐藏占位 + 子导航可用
+  const pv = $('project-view');
+  if (pv) {
+    pv.classList.remove('hidden');
+    pv.style.display = 'flex';
+  }
+  applyProjectBarVisibility();
+  applyNoProjectPlaceholder();
 }
 
 // ─── Projects ──────────────────────────────────────────────
