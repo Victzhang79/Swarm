@@ -52,15 +52,39 @@ jobs:
 
       - name: 等 swarm 服务 healthy（最多 ~150s）
         run: |
-          set -e
+          cid="$(docker compose ps -q swarm)"
+          echo "swarm container = $cid"
           for i in $(seq 1 30); do
-            status=$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q swarm)" 2>/dev/null || echo "starting")
-            echo "[$i] swarm health = $status"
-            if [ "$status" = "healthy" ]; then echo "✅ swarm healthy"; exit 0; fi
+            state=$(docker inspect --format '{{ .State.Status }}' "$cid" 2>/dev/null || echo "missing")
+            health=$(docker inspect --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}no-healthcheck{{ end }}' "$cid" 2>/dev/null || echo "?")
+            echo "[$i] state=$state health=$health"
+            if [ "$health" = "healthy" ]; then echo "✅ swarm healthy"; exit 0; fi
+            # 容器已退出/挂掉 → 不傻等，立即诊断
+            if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
+              echo "❌ swarm 容器已 $state"
+              break
+            fi
             sleep 5
           done
-          echo "❌ swarm 未在时限内 healthy，dump 日志："
-          docker compose logs --no-color swarm | tail -100
+          echo "❌ swarm 未 healthy —— 诊断信息写入 step summary"
+          {
+            echo "## ❌ compose-smoke 失败诊断"
+            echo '### docker compose ps'
+            echo '```'
+            docker compose ps
+            echo '```'
+            echo '### swarm 容器日志（tail 200）'
+            echo '```'
+            docker compose logs --no-color swarm 2>&1 | tail -200
+            echo '```'
+            echo '### swarm 容器 inspect（State）'
+            echo '```'
+            docker inspect --format '{{ json .State }}' "$cid" 2>&1 | head -c 2000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 同时打到控制台
+          docker compose ps
+          docker compose logs --no-color swarm 2>&1 | tail -200
           exit 1
 
       - name: 探活 /api/health（容器外部端口）
