@@ -51,14 +51,17 @@ swarm-web = "swarm.api.app:app"
 packages = [
     "swarm",
     "swarm.api",
+    "swarm.api.routers",
     "swarm.auth",
     "swarm.brain",
+    "swarm.brain.nodes",
     "swarm.cli",
     "swarm.config",
     "swarm.infra",
     "swarm.knowledge",
     "swarm.memory",
     "swarm.models",
+    "swarm.observability",
     "swarm.project",
     "swarm.tools",
     "swarm.worker",
@@ -66,6 +69,14 @@ packages = [
 
 [tool.setuptools.package-dir]
 "swarm" = "."
+
+# 打包非 .py 资源：WebUI 静态文件（HTML/JS/CSS）必须随包安装，否则容器内
+# （正式 install，非 editable）Web 界面 404。scripts 同理供运行时引用。
+[tool.setuptools.package-data]
+"swarm.api" = ["static/**/*", "static/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
