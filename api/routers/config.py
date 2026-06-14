@@ -561,6 +561,16 @@ async def get_kb_embed_rerank():
             "reuse_provider": k.rerank_reuse_provider, "has_key": bool(r_ep and r_ep.api_key),
             "score_threshold": k.rerank_score_threshold,
         },
+        # 检索调优参数（top_k / 阈值 / 切块）—— 全部可在 WebUI 配置，保存即 reload
+        "retrieval": {
+            "retrieval_top_k": k.retrieval_top_k,
+            "rerank_top_k": k.rerank_top_k,
+            "semantic_score_threshold": k.semantic_score_threshold,
+            "priority_file_top_k": k.priority_file_top_k,
+            "max_priority_files": k.max_priority_files,
+            "chunk_size": k.chunk_size,
+            "chunk_overlap": k.chunk_overlap,
+        },
     }
 
 
@@ -618,6 +628,37 @@ async def update_kb_embed_rerank(request: Request):
         if rkey and "***" not in rkey:
             secret_store.set_secret(SECRET_RERANK_KEY, rkey)
             update_map["SWARM_KB_RERANK_API_KEY"] = ""
+
+    # 检索调优参数（top_k / 阈值 / 切块）—— 整型/浮点，带范围保护防误填
+    rt = body.get("retrieval") or {}
+    if rt:
+        def _pint(name: str, env: str, lo: int, hi: int) -> None:
+            if rt.get(name) is not None:
+                try:
+                    val = int(rt[name])
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"{name} 必须为整数")
+                if not (lo <= val <= hi):
+                    raise HTTPException(status_code=400, detail=f"{name} 应在 [{lo}, {hi}]")
+                update_map[env] = str(val)
+
+        def _pfloat(name: str, env: str, lo: float, hi: float) -> None:
+            if rt.get(name) is not None:
+                try:
+                    val = float(rt[name])
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"{name} 必须为数字")
+                if not (lo <= val <= hi):
+                    raise HTTPException(status_code=400, detail=f"{name} 应在 [{lo}, {hi}]")
+                update_map[env] = str(val)
+
+        _pint("retrieval_top_k", "SWARM_KB_RETRIEVAL_TOP_K", 1, 500)
+        _pint("rerank_top_k", "SWARM_KB_RERANK_TOP_K", 1, 100)
+        _pfloat("semantic_score_threshold", "SWARM_KB_SEMANTIC_SCORE_THRESHOLD", 0.0, 1.0)
+        _pint("priority_file_top_k", "SWARM_KB_PRIORITY_FILE_TOP_K", 0, 50)
+        _pint("max_priority_files", "SWARM_KB_MAX_PRIORITY_FILES", 0, 50)
+        _pint("chunk_size", "SWARM_KB_CHUNK_SIZE", 64, 4096)
+        _pint("chunk_overlap", "SWARM_KB_CHUNK_OVERLAP", 0, 1024)
 
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")

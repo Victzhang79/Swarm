@@ -113,3 +113,48 @@ def test_catalog_shape():
         assert {"id", "label", "base_url", "model", "format"} <= set(c)
         assert c["format"] in ("simple", "openai_rerank", "cohere_rerank")
     print("  ✅ catalog 结构完整")
+
+
+def test_retrieval_tuning_defaults():
+    """检索调优参数默认值（WebUI 可配项的兜底）。"""
+    from swarm.config.settings import KnowledgeConfig
+    k = KnowledgeConfig()
+    assert k.retrieval_top_k == 20
+    assert k.rerank_top_k == 5
+    assert k.semantic_score_threshold == 0.0
+    assert k.priority_file_top_k == 3
+    assert k.max_priority_files == 5
+    assert k.chunk_size == 512
+    assert k.chunk_overlap == 50
+    print("  ✅ 检索调优默认值")
+
+
+def test_retrieval_tuning_env_override(monkeypatch):
+    """检索调优参数可经 SWARM_KB_* env 覆盖（WebUI 保存即写这些 env）。
+
+    固化 WebUI「检索调优」表单 → PUT /api/kb/embed-rerank → SWARM_KB_* → KnowledgeConfig 链路。
+    用 monkeypatch.setenv（纯 env，不碰任何存储，无污染）。
+    """
+    from swarm.config.settings import KnowledgeConfig
+    monkeypatch.setenv("SWARM_KB_RETRIEVAL_TOP_K", "30")
+    monkeypatch.setenv("SWARM_KB_RERANK_TOP_K", "8")
+    monkeypatch.setenv("SWARM_KB_SEMANTIC_SCORE_THRESHOLD", "0.15")
+    monkeypatch.setenv("SWARM_KB_PRIORITY_FILE_TOP_K", "4")
+    monkeypatch.setenv("SWARM_KB_MAX_PRIORITY_FILES", "6")
+    monkeypatch.setenv("SWARM_KB_CHUNK_SIZE", "256")
+    monkeypatch.setenv("SWARM_KB_CHUNK_OVERLAP", "30")
+    k = KnowledgeConfig()
+    assert k.retrieval_top_k == 30
+    assert k.rerank_top_k == 8
+    assert abs(k.semantic_score_threshold - 0.15) < 1e-9
+    assert k.priority_file_top_k == 4
+    assert k.max_priority_files == 6
+    assert k.chunk_size == 256
+    assert k.chunk_overlap == 30
+    print("  ✅ 检索调优 env 覆盖（SWARM_KB_* → KnowledgeConfig）")
+
+
+if __name__ == "__main__":
+    import sys
+    import pytest
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

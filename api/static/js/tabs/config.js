@@ -633,6 +633,15 @@ async function loadKbEmbedRerank() {
     set('kb-embed-format', e.format || 'openai'); set('kb-embed-reuse', e.reuse_provider);
     set('kb-rerank-url', r.url); set('kb-rerank-model', r.model);
     set('kb-rerank-format', r.format || 'simple'); set('kb-rerank-reuse', r.reuse_provider);
+    // 检索调优回填
+    const rt = cur.retrieval || {};
+    set('kb-retrieval-top-k', rt.retrieval_top_k);
+    set('kb-rerank-top-k', rt.rerank_top_k);
+    set('kb-semantic-threshold', rt.semantic_score_threshold);
+    set('kb-priority-file-top-k', rt.priority_file_top_k);
+    set('kb-max-priority-files', rt.max_priority_files);
+    set('kb-chunk-size', rt.chunk_size);
+    set('kb-chunk-overlap', rt.chunk_overlap);
     // key 已配则 placeholder 提示（不回填明文）
     const ek = $('kb-embed-api-key'), rk = $('kb-rerank-api-key');
     if (ek) { ek.value = ''; ek.placeholder = e.has_key ? '已配置（留空不改）' : 'API Key（自建可留空）'; }
@@ -676,6 +685,22 @@ async function saveKbEmbedRerank() {
     const ek = v('kb-embed-api-key'), rk = v('kb-rerank-api-key');
     if (ek) body.embed.api_key = ek;
     if (rk) body.rerank.api_key = rk;
+    // 检索调优：只提交填了值的字段（空=不改，保留原），数值由后端做范围校验
+    const retrieval = {};
+    const numFields = {
+      'kb-retrieval-top-k': 'retrieval_top_k',
+      'kb-rerank-top-k': 'rerank_top_k',
+      'kb-semantic-threshold': 'semantic_score_threshold',
+      'kb-priority-file-top-k': 'priority_file_top_k',
+      'kb-max-priority-files': 'max_priority_files',
+      'kb-chunk-size': 'chunk_size',
+      'kb-chunk-overlap': 'chunk_overlap',
+    };
+    for (const [elId, key] of Object.entries(numFields)) {
+      const raw = v(elId);
+      if (raw !== '') retrieval[key] = Number(raw);
+    }
+    if (Object.keys(retrieval).length) body.retrieval = retrieval;
     const resp = await fetch('/api/kb/embed-rerank', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });

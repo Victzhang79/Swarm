@@ -854,7 +854,29 @@
                 </div>
                 <input type="hidden" id="kb-embed-format"><input type="hidden" id="kb-rerank-format">
                 <input type="hidden" id="kb-embed-reuse"><input type="hidden" id="kb-rerank-reuse">
-                <button class="btn btn-primary" style="width:100%;margin-bottom:8px" onclick="saveKbEmbedRerank()" id="btn-save-kb-er">💾 保存 Embedding/Rerank</button>
+                <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">检索调优</h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">控制每次检索召回/重排/过滤的数量与阈值。保存即生效（热重载），无需重启。</p>
+                <div class="form-row">
+                  <div class="form-group"><label class="form-label">向量召回数 (retrieval_top_k)</label><input id="kb-retrieval-top-k" class="form-input" type="number" min="1" max="500" placeholder="20"></div>
+                  <div class="form-group"><label class="form-label">Rerank 保留数 (rerank_top_k)</label><input id="kb-rerank-top-k" class="form-input" type="number" min="1" max="100" placeholder="5"></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group"><label class="form-label">向量相似度阈值 (0=不过滤)</label><input id="kb-semantic-threshold" class="form-input" type="number" step="0.01" min="0" max="1" placeholder="0.0"></div>
+                  <div class="form-group"></div>
+                </div>
+                <details style="margin:0 0 12px">
+                  <summary style="font-size:12px;color:var(--text-secondary);cursor:pointer">高级（切块 / priority 文件细检索）</summary>
+                  <div class="form-row" style="margin-top:8px">
+                    <div class="form-group"><label class="form-label">priority 文件内取条数</label><input id="kb-priority-file-top-k" class="form-input" type="number" min="0" max="50" placeholder="3"></div>
+                    <div class="form-group"><label class="form-label">最多细检索几个 priority 文件</label><input id="kb-max-priority-files" class="form-input" type="number" min="0" max="50" placeholder="5"></div>
+                  </div>
+                  <div class="form-row">
+                    <div class="form-group"><label class="form-label">切块大小 (chunk_size)</label><input id="kb-chunk-size" class="form-input" type="number" min="64" max="4096" placeholder="512"></div>
+                    <div class="form-group"><label class="form-label">切块重叠 (chunk_overlap)</label><input id="kb-chunk-overlap" class="form-input" type="number" min="0" max="1024" placeholder="50"></div>
+                  </div>
+                  <p style="font-size:11px;color:var(--text-muted);margin:0">注：改 chunk_size/overlap 仅影响后续新预处理的项目，已建向量需重新预处理才生效。</p>
+                </details>
+                <button class="btn btn-primary" style="width:100%;margin-bottom:8px" onclick="saveKbEmbedRerank()" id="btn-save-kb-er">💾 保存 Embedding/Rerank + 检索调优</button>
                 <div id="kb-er-result" style="font-size:12px;color:var(--text-muted);margin-bottom:16px"></div>
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
