@@ -166,6 +166,26 @@ class ModelRouter:
             return primary.with_fallbacks([fallback])
         return primary
 
+    def get_alternate_llm_for_subtask(
+        self, difficulty: str, modality: str = "text"
+    ) -> tuple[Runnable, str]:
+        """换备选模型路径（audit #34）：返回 (备选模型 LLM, 模型名)。
+
+        用于失败重试时强制切换到备选模型。封装原先 dispatch 直接调用 ModelRouter
+        私有方法(_resolve_route/_get_provider_for_model)的逻辑，恢复封装边界。
+        优先用路由表的 fallback，无 fallback 时回退 primary。
+        """
+        primary_name, fallback_name = self._resolve_route(difficulty, modality)
+        model_name = fallback_name or primary_name
+        prov = self._get_provider_for_model(model_name)
+        role = f"worker/{difficulty}/alternate"
+        llm = prov.get_chat_model(
+            model_name,
+            temperature=self.config.worker_temperature,
+            callbacks=[ModelInvocationLogger(role, model_name, prov.provider.id)],
+        )
+        return llm, model_name
+
     def _resolve_route(self, difficulty: str, modality: str) -> tuple[str, str]:
         """查路由表 → (primary_model_name, fallback_model_name)"""
         if modality == "multimodal":

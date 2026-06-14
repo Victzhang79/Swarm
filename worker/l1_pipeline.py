@@ -694,11 +694,13 @@ def _run_self_review(
             issues = [str(issues)]
         return {"passed": passed, "issues": issues, "raw": text[:500]}
     except json.JSONDecodeError:
-        logger.debug("LLM 自检输出非标准 JSON，视为通过")
-        return {"passed": True, "issues": [], "raw": text[:500] or "json parse error"}
+        # audit #6/#9：自检无法解析时被迫"视为通过"，但必须标 skipped 让下游区分
+        # "真审查通过" vs "异常跳过"，否则静默吞没自检是否真执行过的信息。
+        logger.warning("[L1.4] LLM 自检输出非标准 JSON，跳过自检（视为通过但标记 skipped）")
+        return {"passed": True, "skipped": True, "skip_reason": "json_parse_error", "issues": [], "raw": text[:500] or "json parse error"}
     except Exception as exc:
-        logger.debug("LLM 自检异常，跳过: %s", exc)
-        return {"passed": True, "issues": [], "raw": f"self_review skipped: {exc}"}
+        logger.warning("[L1.4] LLM 自检异常，跳过自检（视为通过但标记 skipped）: %s", exc)
+        return {"passed": True, "skipped": True, "skip_reason": f"exception: {exc}", "issues": [], "raw": f"self_review skipped: {exc}"}
 
 
 # ── 主流水线 ──

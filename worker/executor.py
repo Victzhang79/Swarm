@@ -441,7 +441,9 @@ class WorkerExecutor:
                     output.diff,
                     llm=l1_llm,
                 )
-                l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok}
+                # audit #5/#29：标记此为 Phase 4 产出后最终复核(带 LLM 自检)，与 Phase 3
+                # 循环内确定性闸门(llm=None)区分，便于调试两个 L1 调用点的行为差异。
+                l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok, "l1_phase": "phase4_final_with_llm"}
                 if not det_ok:
                     l1_passed = False
                     output = output.model_copy(
@@ -1272,6 +1274,8 @@ class WorkerExecutor:
                 self.project_path, self.subtask, diff or "", llm=None
             )
             details["deterministic_gate"] = "pass" if ok else "fail"
+            # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
+            details["l1_phase"] = "phase3_loop_deterministic"
             if empty_diff:
                 details["note"] = "empty diff，仅靠 harness 命令验证"
             return ok, details

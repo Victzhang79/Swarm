@@ -1207,12 +1207,8 @@ async def _dispatch_to_worker(
     difficulty = subtask.difficulty.value if hasattr(subtask.difficulty, "value") else str(subtask.difficulty)
     modality = subtask.modality.value if hasattr(subtask.modality, "value") else str(subtask.modality)
     if use_alternate:
-        _primary, fallback_name = router._resolve_route(difficulty, modality)
-        model_name = fallback_name or _primary
-        worker_llm = router._get_provider_for_model(model_name).get_chat_model(
-            model_name,
-            temperature=router.config.worker_temperature,
-        )
+        # audit #34：用公共方法替代直接调 ModelRouter 私有方法，恢复封装边界。
+        worker_llm, model_name = router.get_alternate_llm_for_subtask(difficulty, modality)
         logger.info(f"[DISPATCH] 子任务 {subtask.id} 使用备选模型: {model_name}")
     else:
         worker_llm = router.get_llm_for_subtask(
@@ -1602,8 +1598,24 @@ def merge(state: BrainState) -> dict:
     # ── Rebase 重生成路径 ──
     # 将 rebase 子任务从 subtask_results 移除，加入 dispatch_remaining 重跑
     # 不增加重试计数（rebase 是策略性重生成，不是失败重试）
+    # audit #30：但用独立的 rebase 计数设上限，防 rebase→fail→rebase 无限循环。
     if result.rebase_subtask_ids:
+        rebase_counts = dict(state.get("subtask_rebase_counts", {}))
+        max_rebase = get_config().model.max_retries + 1  # 与重试上限同量级，独立计数
+        next_rebase = {sid: rebase_counts.get(sid, 0) + 1 for sid in result.rebase_subtask_ids}
+        over_limit = [sid for sid, n in next_rebase.items() if n > max_rebase]
+        if over_limit:
+            # rebase 已达上限仍冲突 → 升级人工，不再无限重生成
+            logger.warning(
+                "[MERGE] 子任务 rebase 达上限(%d)，升级人工: %s", max_rebase, over_limit,
+            )
+            out["failure_escalated"] = True
+            out["failure_strategy"] = "escalate"
+            out["l2_passed"] = False
+            out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
+            return out
         out["rebase_subtask_ids"] = result.rebase_subtask_ids
+        out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
         dispatch_remaining = list(state.get("dispatch_remaining", []))
         remaining_results = dict(subtask_results)
         for sid in result.rebase_subtask_ids:

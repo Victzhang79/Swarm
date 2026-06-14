@@ -65,6 +65,9 @@ class BrainState(TypedDict, total=False):
     merged_diff: str                    # 合并后的完整 diff
     merge_conflicts: list[dict]         # merge 冲突详情（file_path, subtask_ids, message）
     rebase_subtask_ids: list[str]       # rebase 重生成子任务 ID（3-way 失败后选一方 base，另一方重新生成）
+    # audit #30：rebase 不计入 subtask_retry_counts（策略性重生成≠失败重试），但需独立上限
+    # 防 rebase→fail→rebase 无限循环。记录每个子任务的累计 rebase 次数。
+    subtask_rebase_counts: dict[str, int]
     l2_passed: bool                     # L2 集成测试是否通过
     l3_passed: bool | None              # L3 预发验证结果（None=跳过）
     l3_skipped: bool                    # L3 是否跳过
