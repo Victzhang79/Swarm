@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  Swarm 一键拉起脚本 — 兼容 macOS (Apple Silicon) + Ubuntu 22.04+
+#  Swarm 一键安装脚本 — 兼容 macOS (Apple Silicon) + Ubuntu 22.04+
 #  用法: bash setup.sh [--skip-pg] [--skip-codegraph] [--skip-env] [--dev]
 #
-#  当前进度 (2026-06): Phase 0–5 主链路 ✅ · 记忆 L0-L6 · KB 入队调度 · V2/V3 双 gate
-#    · harness 验证工程(Brain 编写/Worker 执行/确定性 L1 闸门) · greenfield 从零建项目
-#    · 任务级联取消 + append-only 审计日志 · 依赖驱动并行派发
-#  架构设计: docs/Swarm_System.html · 详见 README.md
+#  9 步全自动部署：系统依赖 → pgvector → PostgreSQL → Python venv →
+#    依赖安装 → 建表 → CodeGraph CLI → .env 配置 → Qdrant → 启动服务
+#  详见 README.md
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
