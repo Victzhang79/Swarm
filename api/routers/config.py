@@ -508,6 +508,135 @@ async def update_model_providers(request: Request):
     return {"status": "ok", "updated_keys": list(update_map.keys()), **ModelRouter().get_routing_table()}
 
 
+def _persist_env_updates(update_map: dict[str, str]) -> None:
+    """写 .env + 同步 os.environ + reload_config（抽取自 update_model_providers，供 kb 端点等复用）。"""
+    env_path = _app._PROJECT_ROOT / ".env"
+    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+    for line in existing_lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.partition("=")[0].strip().upper()
+            if k in update_map:
+                new_lines.append(f"{k}={update_map[k]}")
+                updated_keys.add(k)
+                continue
+        new_lines.append(line)
+    for k, v in update_map.items():
+        if k not in updated_keys:
+            new_lines.append(f"{k}={v}")
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    for k, v in update_map.items():
+        os.environ[k] = v
+    from swarm.config.settings import reload_config as _reload_config
+    _reload_config()
+
+
+# ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
+@router.get("/api/kb/embed-rerank/catalog", tags=["配置"])
+async def kb_embed_rerank_catalog():
+    """embed/rerank 预置接入点目录 —— 前端下拉用，选中自动填 base_url/model/format。"""
+    from swarm.knowledge.embed_rerank_config import EMBED_CATALOG, RERANK_CATALOG
+    return {"embed": EMBED_CATALOG, "rerank": RERANK_CATALOG}
+
+
+@router.get("/api/kb/embed-rerank", tags=["配置"])
+async def get_kb_embed_rerank():
+    """读 embed/rerank 当前配置（key 脱敏，仅返回是否已配 has_key）。"""
+    from swarm.config.settings import KnowledgeConfig
+    from swarm.knowledge.embed_rerank_config import get_embed_endpoint, get_rerank_endpoint
+    k = KnowledgeConfig()
+    # has_key：解析后的有效 key（含 secret_store/复用）是否非空
+    e_ep = get_embed_endpoint()
+    r_ep = get_rerank_endpoint()
+    return {
+        "embed": {
+            "base_url": k.embed_base_url, "model": k.embedding_model, "format": k.embed_format,
+            "reuse_provider": k.embed_reuse_provider, "has_key": bool(e_ep and e_ep.api_key),
+            "batch_size": k.embed_batch_size,
+        },
+        "rerank": {
+            "url": k.rerank_url, "model": k.reranker_model, "format": k.rerank_format,
+            "reuse_provider": k.rerank_reuse_provider, "has_key": bool(r_ep and r_ep.api_key),
+            "score_threshold": k.rerank_score_threshold,
+        },
+    }
+
+
+@router.put("/api/kb/embed-rerank", tags=["配置"])
+async def update_kb_embed_rerank(request: Request):
+    """更新 embed/rerank 接入点。非敏感写 .env(SWARM_KB_*)，key 加密入 secret_store。
+
+    Body: {
+      "embed":  {"base_url","model","format","reuse_provider","api_key"?,"batch_size"?},
+      "rerank": {"url","model","format","reuse_provider","api_key"?,"score_threshold"?}
+    }
+    api_key 为 *** 或省略 → 保留原 key（不覆盖）。
+    返回 dim_changed 提示：embed 维度可能变化时（模型变了）提醒重新预处理。
+    """
+    from swarm.config import secret_store
+    from swarm.config.settings import KnowledgeConfig
+    from swarm.knowledge.embed_rerank_config import SECRET_EMBED_KEY, SECRET_RERANK_KEY
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    old = KnowledgeConfig()
+    update_map: dict[str, str] = {}
+    old_embed_model = old.embedding_model
+
+    emb = body.get("embed") or {}
+    if emb:
+        if "base_url" in emb:
+            update_map["SWARM_KB_EMBED_BASE_URL"] = str(emb.get("base_url") or "")
+        if emb.get("model"):
+            update_map["SWARM_KB_EMBEDDING_MODEL"] = str(emb["model"])
+        if emb.get("format"):
+            update_map["SWARM_KB_EMBED_FORMAT"] = str(emb["format"])
+        update_map["SWARM_KB_EMBED_REUSE_PROVIDER"] = str(emb.get("reuse_provider") or "")
+        if emb.get("batch_size") is not None:
+            update_map["SWARM_KB_EMBED_BATCH_SIZE"] = str(int(emb["batch_size"]))
+        ekey = str(emb.get("api_key", "") or "")
+        if ekey and "***" not in ekey:
+            secret_store.set_secret(SECRET_EMBED_KEY, ekey)
+            update_map["SWARM_KB_EMBED_API_KEY"] = ""  # 不留明文
+
+    rk = body.get("rerank") or {}
+    if rk:
+        if "url" in rk:
+            update_map["SWARM_KB_RERANK_URL"] = str(rk.get("url") or "")
+        if rk.get("model"):
+            update_map["SWARM_KB_RERANKER_MODEL"] = str(rk["model"])
+        if rk.get("format"):
+            update_map["SWARM_KB_RERANK_FORMAT"] = str(rk["format"])
+        update_map["SWARM_KB_RERANK_REUSE_PROVIDER"] = str(rk.get("reuse_provider") or "")
+        if rk.get("score_threshold") is not None:
+            update_map["SWARM_KB_RERANK_SCORE_THRESHOLD"] = str(float(rk["score_threshold"]))
+        rkey = str(rk.get("api_key", "") or "")
+        if rkey and "***" not in rkey:
+            secret_store.set_secret(SECRET_RERANK_KEY, rkey)
+            update_map["SWARM_KB_RERANK_API_KEY"] = ""
+
+    if not update_map:
+        raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
+
+    _persist_env_updates(update_map)
+    try:
+        secret_store.invalidate_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 维度变更提示：embedding 模型变了 → 已有 Qdrant 向量可能维度不符，需重新预处理（用户决定）。
+    # 直接比较 body 传入的新模型 vs 旧模型（不依赖 reload 时序，更可靠）。
+    new_embed_model = str(emb.get("model") or "") if emb else ""
+    dim_changed = bool(new_embed_model and new_embed_model != old_embed_model)
+    _app.logger.info("Updated kb embed/rerank: %s (dim_changed=%s)", list(update_map.keys()), dim_changed)
+    return {"status": "ok", "updated_keys": list(update_map.keys()), "embed_model_changed": dim_changed,
+            "reprocess_hint": "embedding 模型已变更，建议重新预处理所有项目以重建向量" if dim_changed else ""}
+
+
 # ─── 4.8 GET /api/model-providers/catalog ────────────────────
 @router.get("/api/model-providers/catalog", tags=["配置"])
 async def model_providers_catalog():
