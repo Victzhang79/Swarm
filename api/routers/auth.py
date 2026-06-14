@@ -169,3 +169,19 @@ async def set_member_api(project_id: str, req: MemberRequest, request: Request):
         lambda: set_project_member(project_id, req.user_id, req.role),
     )
     return {"project_id": project_id, "user_id": req.user_id, "role": req.role}
+
+
+@router.delete("/api/projects/{project_id}/members/{user_id}", tags=["认证"])
+async def remove_member_api(project_id: str, user_id: str, request: Request):
+    """移除项目成员（需 member:manage 权限：项目 owner / admin）。"""
+    _require_perm(request, "member:manage", project_id)
+    from swarm.auth.store import remove_project_member
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _app._validate_project, project_id)
+    removed = await loop.run_in_executor(
+        None, lambda: remove_project_member(project_id, user_id)
+    )
+    if not removed:
+        raise HTTPException(status_code=404, detail="该用户不是项目成员")
+    return {"project_id": project_id, "user_id": user_id, "removed": True}

@@ -8,33 +8,46 @@ let _gSelectedSandbox = null;
 async function refreshGlobalSandboxes() {
   const list = $('global-sandbox-list');
   if (!list) return;
+  // A2 三级可见性：非 admin 隐藏系统级运维按钮（清理孤儿/全部销毁/回收池）。
+  // 后端仍强制 admin，这里仅改善体验。列表本身由后端按三级过滤后返回。
+  const admin = typeof isAdmin === 'function' ? isAdmin() : true;
+  ['btn-g-cleanup-orphans', 'btn-g-destroy-all', 'btn-g-pool-reap'].forEach(bid => {
+    const b = $(bid);
+    if (b) b.style.display = admin ? '' : 'none';
+  });
   list.innerHTML = '<p class="hint" style="padding:8px">加载中…</p>';
   try {
-    const [statusResp, orphanResp] = await Promise.all([
-      fetch('/api/sandbox/status'),                 // 无 project_id = 全部
-      fetch('/api/sandbox/orphans').catch(() => null),
-    ]);
+    // 非 admin 跳过系统级 orphans/pool 查询（后端 admin-only，避免 403 噪音）
+    const statusResp = await fetch('/api/sandbox/status');  // 后端已按三级过滤
     if (!statusResp.ok) throw new Error('HTTP ' + statusResp.status);
     const data = await statusResp.json();
     const arr = data.sandboxes || [];
 
     // 摘要条（对齐项目级 sandbox-config 风格）
-    let orphanCount = '—';
-    if (orphanResp && orphanResp.ok) {
-      try { const od = await orphanResp.json(); orphanCount = od.orphan_count != null ? od.orphan_count : '—'; } catch { /* ignore */ }
-    }
-    let poolText = '';
-    try {
-      const p = await fetch('/api/sandbox/pool').then(r => r.ok ? r.json() : null);
-      if (p) {
-        const total = p.total != null ? p.total : (p.pool_total != null ? p.pool_total : '—');
-        poolText = `　热池：${p.pool_enabled ? '开' : '关'}（池内 ${total}）`;
-      }
-    } catch { /* ignore */ }
     const summary = $('g-sandbox-summary');
-    if (summary) {
-      const total = data.active_count != null ? data.active_count : arr.length;
-      summary.innerHTML = `服务端共 <b>${total}</b> 个　孤儿 <b style="color:var(--orange)">${orphanCount}</b> 个${poolText}`;
+    if (!admin) {
+      // 成员视角：只展示自己可见的沙箱数 + 角色提示
+      if (summary) {
+        summary.innerHTML = `可见沙箱 <b>${arr.length}</b> 个 <span class="hint">（按你的角色：项目管理员见项目内全部，成员见自建任务沙箱）</span>`;
+      }
+    } else {
+      let orphanCount = '—';
+      try {
+        const od = await fetch('/api/sandbox/orphans').then(r => r.ok ? r.json() : null);
+        if (od) orphanCount = od.orphan_count != null ? od.orphan_count : '—';
+      } catch { /* ignore */ }
+      let poolText = '';
+      try {
+        const p = await fetch('/api/sandbox/pool').then(r => r.ok ? r.json() : null);
+        if (p) {
+          const total = p.total != null ? p.total : (p.pool_total != null ? p.pool_total : '—');
+          poolText = `　热池：${p.pool_enabled ? '开' : '关'}（池内 ${total}）`;
+        }
+      } catch { /* ignore */ }
+      if (summary) {
+        const total = data.active_count != null ? data.active_count : arr.length;
+        summary.innerHTML = `服务端共 <b>${total}</b> 个　孤儿 <b style="color:var(--orange)">${orphanCount}</b> 个${poolText}`;
+      }
     }
 
     if (!arr.length) {
@@ -256,5 +269,115 @@ async function saveSandboxTemplates() {
     showToast('保存失败: ' + e.message, 'error');
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+// ─── 命令安全黑名单（A2 批3，系统级，仅管理员）───
+async function loadCommandBlacklist() {
+  const box = $('cmd-blacklist-list');
+  const section = $('cmd-blacklist-section');
+  if (!box) return;
+  // 非管理员隐藏整个区块（前端体验；后端仍强制鉴权）
+  if (section && typeof isAdmin === 'function' && !isAdmin()) {
+    section.style.display = 'none';
+    return;
+  }
+  if (section) section.style.display = '';
+  box.innerHTML = '<p class="hint">加载中…</p>';
+  try {
+    const r = await fetch('/api/sandbox/command-blacklist');
+    if (!r.ok) {
+      if (r.status === 403) { box.innerHTML = '<p class="hint">仅管理员可查看</p>'; return; }
+      throw new Error('HTTP ' + r.status);
+    }
+    const data = await r.json();
+    const rules = data.rules || [];
+    if (!rules.length) { box.innerHTML = '<p class="hint">暂无规则</p>'; return; }
+    let html = `<table style="width:100%;border-collapse:collapse">
+      <tr style="text-align:left;color:var(--text-muted)">
+        <th style="padding:4px 6px">规则 (正则)</th>
+        <th style="padding:4px 6px">说明</th>
+        <th style="padding:4px 6px;width:60px">类型</th>
+        <th style="padding:4px 6px;width:60px">状态</th>
+        <th style="padding:4px 6px;width:120px">操作</th>
+      </tr>`;
+    for (const rule of rules) {
+      const builtin = rule.builtin
+        ? '<span class="pill pill-gray" title="内置规则，不可删除">内置</span>'
+        : '<span class="pill pill-gray">自定义</span>';
+      const status = rule.enabled
+        ? '<span class="pill pill-green">启用</span>'
+        : '<span class="pill pill-gray">停用</span>';
+      const toggleLabel = rule.enabled ? '停用' : '启用';
+      const delBtn = rule.builtin
+        ? ''
+        : `<button class="btn btn-danger btn-sm" onclick="deleteCommandBlacklist(${rule.id})">删除</button>`;
+      html += `<tr>
+        <td style="padding:4px 6px;font-family:monospace;font-size:11px">${escapeHtml(rule.pattern)}</td>
+        <td style="padding:4px 6px">${escapeHtml(rule.description || '')}</td>
+        <td style="padding:4px 6px">${builtin}</td>
+        <td style="padding:4px 6px">${status}</td>
+        <td style="padding:4px 6px">
+          <button class="btn btn-ghost btn-sm" onclick="toggleCommandBlacklist(${rule.id}, ${!rule.enabled})">${toggleLabel}</button>
+          ${delBtn}
+        </td>
+      </tr>`;
+    }
+    html += '</table>';
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = `<p class="hint" style="color:var(--orange)">加载失败: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function addCommandBlacklist() {
+  const pat = ($('bl-new-pattern')?.value || '').trim();
+  const desc = ($('bl-new-desc')?.value || '').trim();
+  if (!pat) { showToast('请填写正则 pattern', 'warning'); return; }
+  const btn = $('btn-add-blacklist');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/sandbox/command-blacklist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pattern: pat, description: desc }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || 'HTTP ' + r.status);
+    showToast('规则已添加并生效', 'success');
+    if ($('bl-new-pattern')) $('bl-new-pattern').value = '';
+    if ($('bl-new-desc')) $('bl-new-desc').value = '';
+    await loadCommandBlacklist();
+  } catch (e) {
+    showToast('添加失败: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function toggleCommandBlacklist(ruleId, enabled) {
+  try {
+    const r = await fetch('/api/sandbox/command-blacklist/' + ruleId + '/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'HTTP ' + r.status); }
+    showToast(enabled ? '已启用' : '已停用', 'success');
+    await loadCommandBlacklist();
+  } catch (e) {
+    showToast('操作失败: ' + e.message, 'error');
+  }
+}
+
+async function deleteCommandBlacklist(ruleId) {
+  if (!confirm('删除该黑名单规则？')) return;
+  try {
+    const r = await fetch('/api/sandbox/command-blacklist/' + ruleId, { method: 'DELETE' });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'HTTP ' + r.status); }
+    showToast('规则已删除', 'success');
+    await loadCommandBlacklist();
+  } catch (e) {
+    showToast('删除失败: ' + e.message, 'error');
   }
 }

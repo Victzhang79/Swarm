@@ -58,6 +58,21 @@ function updateAuthUI() {
     btnLogin.classList.remove('hidden');
     btnLogout.classList.add('hidden');
   }
+  applyRoleVisibility();
+}
+
+// A2：按角色显隐导航 tab。系统/设置等管理类 tab 仅 admin 可见。
+// RBAC-off 时 currentUser 为 anonymous admin → 全可见（开箱即用）。
+function applyRoleVisibility() {
+  const admin = !!(currentUser && currentUser.global_role === 'admin');
+  document.querySelectorAll('[data-admin-only="1"]').forEach(function (el) {
+    el.style.display = admin ? '' : 'none';
+  });
+  // 非 admin 若当前停留在管理类 tab，回退到项目工作台
+  if (!admin) {
+    const active = document.querySelector('.nav-tab-top.active[data-admin-only="1"]');
+    if (active && typeof switchTopTab === 'function') switchTopTab('workspace');
+  }
 }
 
 function showLoginModal() {
@@ -182,3 +197,9 @@ async function refreshCurrentUser() {
 }
 
 // ─── Constants ───────────────────────────────────────────
+
+// A2：当前用户是否系统管理员（global admin）。RBAC-off 时后端 /api/auth/me 返回
+// anonymous admin，故这里也为 true（开箱即用，UI 全功能可见）。
+function isAdmin() {
+  return !!(currentUser && currentUser.global_role === 'admin');
+}

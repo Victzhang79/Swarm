@@ -25,6 +25,7 @@ function toggleSettings() {
 function loadSettingsTab() {
   if (typeof loadConfig === 'function') loadConfig();
   if (typeof loadRoutingTable === 'function') loadRoutingTable();
+  if (typeof loadUserAdmin === 'function') loadUserAdmin();
   if (typeof loadKbEmbedRerank === 'function') loadKbEmbedRerank();
   if (typeof syncPoolToggleState === 'function') syncPoolToggleState();
   if (typeof loadNotifyChannels === 'function') loadNotifyChannels();
@@ -68,6 +69,7 @@ function switchTopTab(topTab) {
     stopSystemRefresh();
     if (typeof refreshGlobalSandboxes === 'function') refreshGlobalSandboxes();
     if (typeof loadSandboxTemplates === 'function') loadSandboxTemplates();
+    if (typeof loadCommandBlacklist === 'function') loadCommandBlacklist();
   } else if (topTab === 'system') {
     startSystemRefresh();
   } else if (topTab === 'settings') {

@@ -17,42 +17,82 @@ import swarm.api.app as _app
 router = APIRouter()
 
 
-def _sandbox_project_id(manager, sandbox_id: str) -> str | None:
-    """取沙箱归属项目（A2 批1）。优先本进程 meta，回退服务端 metadata 标签。"""
+def _sandbox_owner_info(manager, sandbox_id: str) -> tuple[str | None, str | None]:
+    """取沙箱归属 (project_id, task_id)（A2）。优先本进程 meta，回退服务端 metadata 标签。"""
     meta = manager.get_sandbox_meta(sandbox_id) or {}
     pid = meta.get("project_id")
-    if pid:
-        return pid
-    # 回退：服务端 metadata 的 swarm_project 标签（批3 create 打的）
+    tid = meta.get("task_id")
+    if pid or tid:
+        return pid, tid
+    # 回退：服务端 metadata 的 swarm_project / swarm_task 标签（批3 create 打的）
     try:
         for sb in _app._fetch_sandbox_list_from_server():
             if sb.get("id") == sandbox_id:
-                return (sb.get("metadata") or {}).get("swarm_project")
+                m = sb.get("metadata") or {}
+                return m.get("swarm_project"), m.get("swarm_task")
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return None, None
 
 
-def _require_sandbox_access(request: Request, sandbox_id: str, permission: str):
-    """A2 批1：校验当前用户对某沙箱所属项目的权限。
+def _task_creator(task_id: str | None) -> str | None:
+    """查任务创建者 user_id（三级权限第三级依据）。失败返回 None。"""
+    if not task_id:
+        return None
+    try:
+        from swarm.project import store
+        task = store.get_task(task_id)
+        return (task or {}).get("created_by_user_id")
+    except Exception:  # noqa: BLE001
+        return None
 
-    - admin：全权（user_can_on_project 对 admin 恒 True）。
-    - 普通用户：仅对自己有权限的项目的沙箱放行。
-    - 无项目归属的沙箱（孤儿/手动创建）：视为系统级资源，仅 admin。
-    - RBAC-off：_require_user 返回 anonymous admin，自然放行（开箱即用）。
+
+def _can_see_sandbox(user, project_id: str | None, task_creator: str | None) -> bool:
+    """A2 三级可见性判定（核心）：
+
+    - 系统管理员（global admin）：所有沙箱。
+    - 项目管理员（该项目 member_role=owner，或对项目有 project:write）：项目内所有沙箱。
+    - 项目成员（developer/viewer）：仅自己创建任务的沙箱（task.created_by_user_id == 自己）。
+    - 无项目归属沙箱：仅 admin（在调用处单独处理）。
     """
-    from swarm.api._shared import _require_perm, _require_user
+    from swarm.auth.rbac import Role
+    from swarm.auth.store import get_project_member_role
 
-    pid = _sandbox_project_id(_app._get_sandbox_manager(), sandbox_id)
-    if pid is None:
-        # 无归属 → 系统级，仅 admin
-        user = _require_user(request)
-        from swarm.auth.rbac import Role
-        if user.global_role != Role.ADMIN.value:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=403, detail="该沙箱无项目归属，仅管理员可操作")
-        return user
-    return _require_perm(request, permission, pid)
+    if user.global_role == Role.ADMIN.value:
+        return True
+    if not project_id:
+        return False  # 无归属仅 admin
+    # 项目角色
+    try:
+        member_role = get_project_member_role(project_id, user.id)
+    except Exception:  # noqa: BLE001
+        member_role = None
+    if member_role is None:
+        return False  # 非该项目成员
+    # 项目管理员（owner）→ 项目内全部
+    if member_role == Role.OWNER.value:
+        return True
+    # 项目成员 → 仅自建任务的沙箱
+    return bool(task_creator) and task_creator == user.id
+
+
+def _require_sandbox_access(request: Request, sandbox_id: str, permission: str = "task:read"):
+    """A2 三级可见性 enforce：校验当前用户能否操作某沙箱。
+
+    admin → 全部；项目 owner → 项目内全部；项目成员 → 仅自建任务沙箱；无归属 → 仅 admin。
+    RBAC-off：_require_user 返回 anonymous admin，自然放行（开箱即用）。
+    """
+    from fastapi import HTTPException
+
+    from swarm.api._shared import _require_user
+
+    user = _require_user(request)
+    manager = _app._get_sandbox_manager()
+    pid, tid = _sandbox_owner_info(manager, sandbox_id)
+    creator = _task_creator(tid)
+    if not _can_see_sandbox(user, pid, creator):
+        raise HTTPException(status_code=403, detail="无权操作该沙箱（仅管理员/项目管理员/任务创建者可访问）")
+    return user
 
 
 def _require_admin(request: Request):
@@ -80,19 +120,16 @@ class SandboxCreateRequest(BaseModel):
 
 @router.get("/api/sandbox/status", tags=["沙箱"])
 async def sandbox_status(request: Request, project_id: str | None = None):
-    """活跃沙箱列表（A2 批1：按当前用户可见项目过滤，admin 看全部）"""
+    """活跃沙箱列表（A2 三级可见性）：
+
+    - 系统管理员：所有沙箱
+    - 项目管理员（owner）：其项目内所有沙箱
+    - 项目成员：仅自己创建任务的沙箱
+    """
     from swarm.api._shared import _require_user
     from swarm.auth.rbac import Role
     user = _require_user(request)
     is_admin = user.global_role == Role.ADMIN.value
-    # 普通用户可见项目集合（admin 不限）
-    visible_pids: set[str] | None = None
-    if not is_admin:
-        from swarm.auth.store import list_user_project_ids
-        try:
-            visible_pids = list_user_project_ids(user.id)
-        except Exception:  # noqa: BLE001
-            visible_pids = set()
 
     loop = asyncio.get_running_loop()
     sandboxes = await loop.run_in_executor(None, _app._fetch_sandbox_list_from_server)
@@ -131,16 +168,43 @@ async def sandbox_status(request: Request, project_id: str | None = None):
                 sb["task_id"] = meta.get("task_id")
                 sb["source"] = meta.get("source")
 
-    # A2 批1：非 admin 只能看自己有权限项目的沙箱（无归属沙箱对普通用户不可见）
+    # A2 三级可见性过滤（admin 不过滤）
     if not is_admin:
         def _sb_pid(sb: dict) -> str | None:
             return sb.get("project_id") or (sb.get("metadata") or {}).get("swarm_project")
-        sandboxes = [sb for sb in sandboxes if _sb_pid(sb) and _sb_pid(sb) in (visible_pids or set())]
+
+        def _sb_tid(sb: dict) -> str | None:
+            return sb.get("task_id") or (sb.get("metadata") or {}).get("swarm_task")
+
+        # 预取用户在各项目的角色（避免每沙箱重复查）
+        from swarm.auth.store import get_project_member_role
+        role_cache: dict[str, str | None] = {}
+
+        def _visible(sb: dict) -> bool:
+            pid = _sb_pid(sb)
+            if not pid:
+                return False
+            if pid not in role_cache:
+                try:
+                    role_cache[pid] = get_project_member_role(pid, user.id)
+                except Exception:  # noqa: BLE001
+                    role_cache[pid] = None
+            role = role_cache[pid]
+            if role is None:
+                return False
+            if role == Role.OWNER.value:
+                return True  # 项目管理员看项目内全部
+            # 项目成员：仅自建任务沙箱
+            creator = _task_creator(_sb_tid(sb))
+            return bool(creator) and creator == user.id
+
+        sandboxes = [sb for sb in sandboxes if _visible(sb)]
 
     return {
         "active_count": len(sandboxes),
         "sandboxes": sandboxes,
         "project_id": project_id,
+        "viewer_role": "admin" if is_admin else "member",
         "config": {
             "api_url": _app.get_config().sandbox.api_url,
             "proxy_base": _app.get_config().sandbox.proxy_base,

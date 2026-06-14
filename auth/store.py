@@ -364,6 +364,21 @@ def set_project_member(
             )
 
 
+def remove_project_member(
+    project_id: str,
+    user_id: str,
+    conn_str: str | None = None,
+) -> bool:
+    """移除项目成员。返回是否删除了行。"""
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM swarm_project_members WHERE project_id = %s AND user_id = %s",
+                (project_id, user_id),
+            )
+            return cur.rowcount > 0
+
+
 def list_project_members(project_id: str, conn_str: str | None = None) -> list[dict[str, Any]]:
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:

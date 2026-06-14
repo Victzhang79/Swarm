@@ -1,12 +1,11 @@
-"""A2 批1 单测：沙箱操作 RBAC 项目级 enforce。
+"""A2 三级沙箱可见性单测（升级版）。
 
-验证 _require_sandbox_access / _require_admin：
-- admin 全权
-- 普通用户仅自己有权限项目的沙箱
-- 无项目归属沙箱仅 admin
-- 普通用户访问别人项目沙箱被拒（403）
+三级模型：
+- 系统管理员（global admin）：所有沙箱
+- 项目管理员（项目 owner）：项目内所有沙箱
+- 项目成员（developer/viewer）：仅自己创建任务的沙箱
 
-需真 PG（RBAC 表）。PG 不可用则跳过。
+需真 PG。PG 不可用则跳过。
 """
 
 from __future__ import annotations
@@ -34,74 +33,128 @@ def _fake_request(user):
     return SimpleNamespace(state=SimpleNamespace(user=user), path_params={})
 
 
-def _patch_manager(monkeypatch, sandbox_pid):
-    """让 _sandbox_project_id 返回指定 project_id。"""
-    import swarm.api.routers.sandbox as sbx
-    fake_mgr = SimpleNamespace(get_sandbox_meta=lambda sid: {"project_id": sandbox_pid} if sandbox_pid else {})
-    monkeypatch.setattr(sbx._app, "_get_sandbox_manager", lambda: fake_mgr)
-    return sbx
+# ─── _can_see_sandbox 三级逻辑（纯判定，不依赖沙箱实例）───
 
-
-def test_admin_full_access(monkeypatch):
+def test_admin_sees_all():
+    from swarm.api.routers.sandbox import _can_see_sandbox
     from swarm.auth.store import SwarmUser
-    sbx = _patch_manager(monkeypatch, "any_proj")
     admin = SwarmUser("a", "admin", "A", "admin")
-    # admin 对任意项目沙箱放行
-    u = sbx._require_sandbox_access(_fake_request(admin), "sid1", "task:read")
-    assert u.global_role == "admin"
+    assert _can_see_sandbox(admin, "any_proj", "someone_else") is True
+    assert _can_see_sandbox(admin, None, None) is True  # 无归属也可见
 
 
-def test_member_access_own_project(monkeypatch):
-    from swarm.auth.store import create_user, set_project_member
-    sbx = _patch_manager(monkeypatch, None)
-    suffix = uuid.uuid4().hex[:8]
-    user = create_user(username=f"_test_m_{suffix}", password="x", global_role="developer")
-    pid = f"_test_proj_{suffix}"
-    set_project_member(pid, user.id, "developer")
-    _patch_manager(monkeypatch, pid)  # 沙箱归属该项目
-    u = sbx._require_sandbox_access(_fake_request(user), "sid1", "task:read")
-    assert u.id == user.id
-
-
-def test_member_denied_other_project(monkeypatch):
+def test_project_owner_sees_all_in_project():
+    from swarm.api.routers.sandbox import _can_see_sandbox
     from swarm.auth.store import create_user, set_project_member
     suffix = uuid.uuid4().hex[:8]
-    user = create_user(username=f"_test_d_{suffix}", password="x", global_role="developer")
-    # 沙箱归属【别人的】项目，user 非成员
-    other_pid = f"_test_other_{suffix}"
-    other = create_user(username=f"_test_o_{suffix}", password="x", global_role="developer")
-    set_project_member(other_pid, other.id, "owner")
-    sbx = _patch_manager(monkeypatch, other_pid)
-    with pytest.raises(HTTPException) as ei:
-        sbx._require_sandbox_access(_fake_request(user), "sid1", "task:read")
-    assert ei.value.status_code == 403
+    owner = create_user(username=f"_test_own_{suffix}", password="x", global_role="developer")
+    pid = f"_test_p_{suffix}"
+    set_project_member(pid, owner.id, "owner")
+    # owner 能看项目内别人创建任务的沙箱
+    assert _can_see_sandbox(owner, pid, "another_user_id") is True
 
 
-def test_unowned_sandbox_admin_only(monkeypatch):
-    from swarm.auth.store import SwarmUser, create_user
-    sbx = _patch_manager(monkeypatch, None)  # 无归属
-    # 让回退的服务端查询也返回空（无 swarm_project 标签）
-    monkeypatch.setattr(sbx._app, "_fetch_sandbox_list_from_server", lambda: [])
+def test_project_member_sees_only_own_tasks():
+    from swarm.api.routers.sandbox import _can_see_sandbox
+    from swarm.auth.store import create_user, set_project_member
     suffix = uuid.uuid4().hex[:8]
-    user = create_user(username=f"_test_u_{suffix}", password="x", global_role="developer")
-    # 普通用户对无归属沙箱被拒
-    with pytest.raises(HTTPException) as ei:
-        sbx._require_sandbox_access(_fake_request(user), "sid_orphan", "task:read")
-    assert ei.value.status_code == 403
-    # admin 可
-    admin = SwarmUser("a", "admin", "A", "admin")
-    u = sbx._require_sandbox_access(_fake_request(admin), "sid_orphan", "task:read")
-    assert u.global_role == "admin"
+    member = create_user(username=f"_test_mem_{suffix}", password="x", global_role="developer")
+    pid = f"_test_pm_{suffix}"
+    set_project_member(pid, member.id, "developer")
+    # 自建任务沙箱 → 可见
+    assert _can_see_sandbox(member, pid, member.id) is True
+    # 别人创建任务的沙箱（同项目）→ 不可见（成员只看自建）
+    assert _can_see_sandbox(member, pid, "other_user_id") is False
+    # 任务无创建者信息 → 不可见
+    assert _can_see_sandbox(member, pid, None) is False
 
 
-def test_require_admin_rejects_non_admin(monkeypatch):
+def test_non_member_sees_nothing():
+    from swarm.api.routers.sandbox import _can_see_sandbox
     from swarm.auth.store import create_user
+    suffix = uuid.uuid4().hex[:8]
+    outsider = create_user(username=f"_test_out_{suffix}", password="x", global_role="developer")
+    # 非该项目成员 → 任何沙箱都不可见
+    assert _can_see_sandbox(outsider, f"_test_foreign_{suffix}", outsider.id) is False
+
+
+def test_require_sandbox_access_denies_member_on_others_task(monkeypatch):
+    """端点级：成员访问别人任务的沙箱 → 403。"""
     import swarm.api.routers.sandbox as sbx
+    from swarm.auth.store import create_user, set_project_member
+    suffix = uuid.uuid4().hex[:8]
+    member = create_user(username=f"_test_d_{suffix}", password="x", global_role="developer")
+    pid = f"_test_pd_{suffix}"
+    set_project_member(pid, member.id, "developer")
+    # mock 沙箱归属该项目、任务由别人创建
+    monkeypatch.setattr(
+        sbx, "_sandbox_owner_info", lambda mgr, sid: (pid, "task_x")
+    )
+    monkeypatch.setattr(sbx, "_task_creator", lambda tid: "someone_else")
+    monkeypatch.setattr(sbx._app, "_get_sandbox_manager", lambda: SimpleNamespace())
+    with pytest.raises(HTTPException) as ei:
+        sbx._require_sandbox_access(_fake_request(member), "sid1")
+    assert ei.value.status_code == 403
+
+
+def test_require_sandbox_access_allows_member_own_task(monkeypatch):
+    """端点级：成员访问自建任务的沙箱 → 放行。"""
+    import swarm.api.routers.sandbox as sbx
+    from swarm.auth.store import create_user, set_project_member
+    suffix = uuid.uuid4().hex[:8]
+    member = create_user(username=f"_test_d2_{suffix}", password="x", global_role="developer")
+    pid = f"_test_pd2_{suffix}"
+    set_project_member(pid, member.id, "developer")
+    monkeypatch.setattr(sbx, "_sandbox_owner_info", lambda mgr, sid: (pid, "task_y"))
+    monkeypatch.setattr(sbx, "_task_creator", lambda tid: member.id)
+    monkeypatch.setattr(sbx._app, "_get_sandbox_manager", lambda: SimpleNamespace())
+    u = sbx._require_sandbox_access(_fake_request(member), "sid1")
+    assert u.id == member.id
+
+
+def test_require_admin_rejects_non_admin():
+    import swarm.api.routers.sandbox as sbx
+    from swarm.auth.store import create_user
     suffix = uuid.uuid4().hex[:8]
     user = create_user(username=f"_test_na_{suffix}", password="x", global_role="developer")
     with pytest.raises(HTTPException) as ei:
         sbx._require_admin(_fake_request(user))
     assert ei.value.status_code == 403
+
+
+# ─── 项目成员管理（A2 用户/角色闭环）───
+
+def test_set_and_remove_project_member():
+    """指派项目成员 → 角色生效 → 移除 → 角色消失。"""
+    from swarm.auth.store import (
+        create_user,
+        get_project_member_role,
+        remove_project_member,
+        set_project_member,
+    )
+    suffix = uuid.uuid4().hex[:8]
+    user = create_user(username=f"_test_mm_{suffix}", password="x", global_role="developer")
+    pid = f"_test_mmproj_{suffix}"
+    # 指派为项目管理员（owner）
+    set_project_member(pid, user.id, "owner")
+    assert get_project_member_role(pid, user.id) == "owner"
+    # 改为成员
+    set_project_member(pid, user.id, "developer")
+    assert get_project_member_role(pid, user.id) == "developer"
+    # 移除
+    assert remove_project_member(pid, user.id) is True
+    assert get_project_member_role(pid, user.id) is None
+    # 重复移除返回 False
+    assert remove_project_member(pid, user.id) is False
+
+
+def test_member_manage_permission_by_role():
+    """member:manage 权限：owner 有、developer/viewer 无（决定能否指派成员）。"""
+    from swarm.auth.rbac import can
+    assert can("admin", "member:manage") is True
+    assert can("owner", "member:manage") is True
+    assert can("developer", "member:manage") is False
+    assert can("viewer", "member:manage") is False
 
 
 if __name__ == "__main__":
