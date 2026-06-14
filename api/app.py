@@ -716,35 +716,81 @@ def _start_sandbox_pool_reaper() -> None:
         logger.warning("Failed to start sandbox pool reaper: %s", exc)
 
 
-def _sweep_startup_orphans() -> None:
-    """启动时清扫上一进程残留的孤儿沙箱。
+def _partition_sweep_targets(
+    server_list: list[dict], my_instance: str | None, sweep_untagged: bool
+) -> tuple[list[str], int, int]:
+    """A1 批3：把服务端沙箱列表按归属分类（纯函数，可单测）。
 
-    池是进程内内存态：上次进程若被 SIGKILL / 崩溃 / OOM（shutdown 钩子的 drain
-    没跑完或没跑），远端 pool/pool-idle 沙箱就成了无主孤儿，本进程 _sandbox_meta
-    为空认不得它们 → 永久泄漏烧资源。单进程模型下，启动这一刻远端任何存活沙箱
-    都必是上一轮的残留，安全清扫。失败静默（不阻断启动）。
+    返回 (to_kill, kept_other, kept_untagged)：
+    - 有 swarm_instance 标签 == 本实例 → to_kill（本进程残留）
+    - 有标签但 != 本实例 → kept_other（别副本，绝不动）
+    - 无标签 → sweep_untagged 决定 kill 还是 kept_untagged
+    """
+    to_kill: list[str] = []
+    kept_other = 0
+    kept_untagged = 0
+    for sb in server_list:
+        sid = sb.get("id")
+        if not sid:
+            continue
+        owner = (sb.get("metadata") or {}).get("swarm_instance")
+        if owner:
+            if owner == my_instance:
+                to_kill.append(sid)
+            else:
+                kept_other += 1
+        else:
+            if sweep_untagged:
+                to_kill.append(sid)
+            else:
+                kept_untagged += 1
+    return to_kill, kept_other, kept_untagged
+
+
+def _sweep_startup_orphans() -> None:
+    """启动时清扫【本实例】上一进程残留的孤儿沙箱（A1 批3：实例隔离）。
+
+    池是进程内内存态：上次进程若被 SIGKILL/崩溃/OOM，远端 pool 沙箱成无主孤儿，
+    本进程 _sandbox_meta 为空认不得 → 永久泄漏。
+
+    A1 批3 用实例标签精确清扫（替代 12.2 的 opt-in 全清扫开关止血）：
+    - 有 swarm_instance 标签且 == 本实例 → 必是本进程上一轮残留，清扫（多副本安全，不误杀别副本）。
+    - 无标签沙箱（降级创建/旧版残留）→ 退回 sweep_orphans_on_startup 开关控制：
+      开关 on（单机默认）则清，off（共享集群保守）则留。
+    失败静默（不阻断启动）。
     """
     try:
         from swarm.config.settings import get_config
-        if not get_config().sandbox.sweep_orphans_on_startup:
-            logger.info("启动孤儿清扫已关闭 (SWARM_SANDBOX_SWEEP_ORPHANS_ON_STARTUP=false) — 共享集群安全模式")
-            return
-    except Exception:  # noqa: BLE001 — 配置读取失败不应阻断，按原默认行为继续清扫
-        pass
+        from swarm.worker.sandbox import get_instance_id
+
+        sweep_untagged = get_config().sandbox.sweep_orphans_on_startup
+        my_instance = get_instance_id()
+    except Exception:  # noqa: BLE001 — 配置/实例读取失败按保守默认
+        sweep_untagged = True
+        my_instance = None
+
     try:
         server_list = _fetch_sandbox_list_from_server()
-        sids = [sb.get("id") for sb in server_list if sb.get("id")]
-        if not sids:
+        to_kill, kept_other, kept_untagged = _partition_sweep_targets(
+            server_list, my_instance, sweep_untagged
+        )
+        if not to_kill:
+            logger.info(
+                "启动清扫: 无本实例残留可清（别副本=%d, 无标签保留=%d）", kept_other, kept_untagged
+            )
             return
         manager = _get_sandbox_manager()
         killed = 0
-        for sid in sids:
+        for sid in to_kill:
             try:
                 manager.kill(sid)
                 killed += 1
             except Exception:  # noqa: BLE001
                 logger.debug("启动清扫: kill %s 失败", sid, exc_info=True)
-        logger.info("启动清扫残留孤儿沙箱: 发现 %d, 清理 %d", len(sids), killed)
+        logger.info(
+            "启动清扫本实例孤儿沙箱: 清理 %d/%d（别副本保留=%d, 无标签保留=%d, 实例=%s）",
+            killed, len(to_kill), kept_other, kept_untagged, my_instance,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动孤儿清扫失败（不阻断）: %s", exc)
 
@@ -1014,6 +1060,8 @@ def _fetch_sandbox_list_from_server() -> list[dict]:
                 "template_id": sb.template_id or "-",
                 "cpu_count": sb.cpu_count,
                 "memory_mb": sb.memory_mb,
+                # A1 批3：回读实例归属标签，供启动清扫按本实例过滤
+                "metadata": getattr(sb, "metadata", None) or {},
             })
         return result
     except Exception as e:

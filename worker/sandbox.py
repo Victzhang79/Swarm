@@ -29,6 +29,22 @@ from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
+
+# A1 批3：进程级稳定实例 ID。多副本场景下，每个 swarm 进程有唯一 instance_id，
+# 创建的沙箱打 metadata={"swarm_instance": <id>} 标签，启动清扫只 kill 本实例标签的
+# 沙箱——多副本互不误杀（替代 12.2 的 opt-in 全清扫开关止血）。
+# 优先用 SWARM_INSTANCE_ID 环境变量（容器编排可注入稳定 ID），否则进程级随机 UUID。
+_INSTANCE_ID: str | None = None
+
+
+def get_instance_id() -> str:
+    """返回本进程的稳定实例 ID（用于沙箱归属标签）。"""
+    global _INSTANCE_ID
+    if _INSTANCE_ID is None:
+        import uuid
+        _INSTANCE_ID = os.environ.get("SWARM_INSTANCE_ID") or f"swarm-{uuid.uuid4().hex[:12]}"
+    return _INSTANCE_ID
+
 MAX_SYNC_FILE_SIZE = 1_048_576  # 1 MiB
 
 _sidecar_initialized = False
@@ -436,7 +452,19 @@ class SandboxManager:
         t0 = time.monotonic()
         logger.info("Creating sandbox with template=%s project=%s timeout=%ss", template, project_id, timeout)
 
-        sandbox = Sandbox.create(template=template, timeout=timeout)
+        # A1 批3：打实例归属标签，供启动清扫按本实例过滤（多副本互不误杀）。
+        # metadata 不被 SDK 支持时降级为无标签创建（回退 12.2 开关行为）。
+        _meta = {"swarm_instance": get_instance_id()}
+        if project_id:
+            _meta["swarm_project"] = str(project_id)
+        if task_id:
+            _meta["swarm_task"] = str(task_id)
+        try:
+            sandbox = Sandbox.create(template=template, timeout=timeout, metadata=_meta)
+        except TypeError:
+            # 旧 SDK 不接受 metadata 参数 → 降级
+            logger.warning("[A1] Sandbox.create 不支持 metadata，降级无标签创建（实例隔离失效，回退开关清扫）")
+            sandbox = Sandbox.create(template=template, timeout=timeout)
         self._instances[sandbox.sandbox_id] = sandbox
         self.register_sandbox_meta(
             sandbox.sandbox_id,
