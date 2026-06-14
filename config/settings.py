@@ -312,6 +312,11 @@ class SandboxConfig(BaseSettings):
     # 预处理时按项目真实环境构建专属沙箱镜像，executor 优先用 project.config.sandbox_template。
     # 默认 False（灰度试点，先 ruoyi-e2e 验证），需沙箱机 SSH 凭据在 secret_store。
     project_scoped_enabled: bool = False
+    # 启动时清扫"残留孤儿沙箱"（12.2）。默认 True 保持单机部署行为（启动这一刻远端
+    # 任何存活沙箱都是上一进程残留，安全清扫）。⚠️ 共享 CubeSandbox 集群部署务必设
+    # False：本实例无差别 kill 服务器上所有沙箱会误杀其他实例/用户的沙箱。
+    # 根治方案（按实例标签过滤）见 B 事项，落地后此开关可退役。
+    sweep_orphans_on_startup: bool = True
 
     def template_for_language(self, language: str, purpose: str = "exec") -> str:
         """语言 + 用途 → 预建模板 ID。

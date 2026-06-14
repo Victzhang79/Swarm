@@ -712,6 +712,13 @@ def _sweep_startup_orphans() -> None:
     都必是上一轮的残留，安全清扫。失败静默（不阻断启动）。
     """
     try:
+        from swarm.config.settings import get_config
+        if not get_config().sandbox.sweep_orphans_on_startup:
+            logger.info("启动孤儿清扫已关闭 (SWARM_SANDBOX_SWEEP_ORPHANS_ON_STARTUP=false) — 共享集群安全模式")
+            return
+    except Exception:  # noqa: BLE001 — 配置读取失败不应阻断，按原默认行为继续清扫
+        pass
+    try:
         server_list = _fetch_sandbox_list_from_server()
         sids = [sb.get("id") for sb in server_list if sb.get("id")]
         if not sids:
