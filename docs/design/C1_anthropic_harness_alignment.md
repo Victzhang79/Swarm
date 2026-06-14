@@ -94,6 +94,15 @@ L1 确定性闸门=deterministic code over token generation）。这不是过时
 **I7 Worker 工具集审计去重** — 中优，配合 writing-tools 的 eval 驱动法。
 **I9 节点 prompt 渐进披露** — 低优，收益有限。
 
+#### P2 复核 + 落地结论（2026-06-18）
+复核发现：**P2 大部分已具备或 ROI 不值得**——Swarm 架构本就接近 Anthropic 最佳实践，强行写代码是过度工程。逐项：
+
+- **I5（已具备 + 轻量优化已做）**：Worker 工具集**早已有 `query_knowledge_base`**，Worker 能自主按需检索 KB（just-in-time 已实现一半）。retrieval_top_k 也已 WebUI 可配（可调小预灌量）。**轻量优化已落地**：Worker prompt Phase 1 加"按需检索"指引，明确鼓励上下文不足时主动 query_kb 而非依赖预灌、凭空猜测。无需大改。
+- **I7（工具集已健康 + eval 门禁已加）**：12 个工具（file 4 / git 4 / build 3 / knowledge 1）职责清晰、几乎无重叠，符合 Anthropic "few thoughtful tools"。**落地**：新增 `test_i7_tool_quality_eval.py`（5 测）作质量门禁——校验 description 充分 / 参数 schema / write_file vs patch_file 职责区分 / 工具集精简 / 命令类可区分。eval 全过 = 工具集本就健康，门禁防未来退化。
+- **I9（不做）**：节点 prompt 不大，渐进披露主要针对"几百工具/skill"场景。Anthropic 原文亦称"formatting matters less as models improve"。ROI 低，**主动不做**（避免过度工程）。
+
+**结论**：P2 = I5 轻量 prompt 优化 + I7 eval 门禁；I9 不做。这本身是健康信号——架构无需大动。
+
 ---
 
 ## 3. 待确认疑问（拍板表）
