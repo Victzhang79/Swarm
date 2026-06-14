@@ -688,10 +688,15 @@ async def on_startup():
         await init_postgres_checkpointer()
     except Exception as e:
         logger.warning(f"PG checkpointer init skipped: {e}")
-    await _start_memory_decay_scheduler()
-    await _start_kb_update_scheduler()
-    await _start_consistency_scheduler()
-    await _start_task_scheduler()
+    # A1 批2：调度器选主——leader 副本跑全部后台调度器，非 leader 待命可接管。
+    # 单进程/PG 不可用时降级为"本进程即 leader"（单机行为不变）。
+    try:
+        from swarm.infra.scheduler_leadership import init_coordination_backend
+
+        await init_coordination_backend()
+    except Exception as e:
+        logger.warning(f"协调后端初始化跳过: {e}")
+    asyncio.create_task(_run_schedulers_with_leadership())
     # 先清扫上一进程残留的孤儿沙箱，再启动池 reaper（顺序重要：清扫在池接管前）
     _sweep_startup_orphans()
     _start_sandbox_pool_reaper()
@@ -804,6 +809,13 @@ async def on_shutdown():
         await close_postgres_checkpointer()
     except Exception as exc:
         logger.warning("Failed to close PG checkpointer: %s", exc)
+    # A1 批2：关闭协调后端（释放 advisory lock，让其它副本可接管调度）
+    try:
+        from swarm.infra.scheduler_leadership import close_coordination_backend
+
+        await close_coordination_backend()
+    except Exception as exc:
+        logger.warning("Failed to close coordination backend: %s", exc)
 
 
 async def _start_kb_update_scheduler() -> None:
@@ -880,6 +892,27 @@ async def _sync_mr_history_all_projects() -> None:
             logger.warning("[MR history] project=%s failed: %s", pid, exc)
 
 
+async def _run_schedulers_with_leadership() -> None:
+    """A1 批2：仅 leader 副本启动全部后台调度器，非 leader 待命并周期重试抢主。
+
+    4 个调度器内部各自是常驻 loop（每日/每5s），故 leader 只需启动一次。
+    非 leader 每 30s 重试；原 leader 挂掉（连接断→advisory lock 释放）后接管。
+    单进程/PG 不可用时 try_become_leader 恒为 True（降级单机不变）。
+    """
+    from swarm.infra.scheduler_leadership import make_leadership
+
+    lead = make_leadership("scheduler:all")
+    while True:
+        if await lead.try_become_leader():
+            logger.info("[A1] 本副本成为调度器 leader，启动后台调度器")
+            await _start_memory_decay_scheduler()
+            await _start_kb_update_scheduler()
+            await _start_consistency_scheduler()
+            await _start_task_scheduler()
+            return  # 启动完成（调度器各自常驻），leader 循环结束
+        await asyncio.sleep(30)
+
+
 async def _start_memory_decay_scheduler() -> None:
     """启动 L5 错题集每日衰减调度；PG 不可用时仅记录警告"""
     try:
@@ -893,9 +926,6 @@ async def _start_memory_decay_scheduler() -> None:
         logger.info("L5 memory decay scheduler started (daily at 03:00)")
     except Exception as exc:
         logger.warning("Failed to start L5 memory decay scheduler: %s", exc)
-
-
-# ─── 静态文件 ──────────────────────────────────────
 
 _static_dir = Path(__file__).parent / "static"
 if _static_dir.is_dir():
