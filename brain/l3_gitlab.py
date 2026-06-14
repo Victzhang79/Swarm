@@ -41,14 +41,39 @@ def _project_path_encoded() -> str:
 
 
 def _git_push_remote_url() -> str | None:
-    """构造带 token 的 GitLab HTTPS push URL。"""
+    """构造 GitLab HTTPS push URL（不含凭证）。
+
+    安全（audit #40）：token 不再拼进 URL（避免进程参数/stderr/日志泄漏），
+    改由 push 时经 `git -c http.extraHeader` 注入 Authorization。
+    """
     base = os.environ.get("SWARM_GITLAB_URL", "").rstrip("/")
     token = os.environ.get("SWARM_GITLAB_TOKEN", "").strip()
     project = os.environ.get("SWARM_GITLAB_PROJECT_ID", "").strip()
     if not base or not token or not project:
         return None
     host = base.replace("https://", "").replace("http://", "")
-    return f"https://oauth2:{token}@{host}/{project}.git"
+    return f"https://{host}/{project}.git"
+
+
+def _redact_secrets(text: str) -> str:
+    """从 git 输出/错误信息中抹除 token，避免泄漏进日志/返回值（audit #40）。"""
+    if not text:
+        return text
+    token = os.environ.get("SWARM_GITLAB_TOKEN", "").strip()
+    if token and token in text:
+        text = text.replace(token, "***")
+    # 兜底：oauth2:xxx@ 形式（兼容历史 URL 残留）
+    import re
+    text = re.sub(r"(oauth2:)[^@]+(@)", r"\1***\2", text)
+    return text
+
+
+def _gitlab_auth_header_args() -> list[str]:
+    """返回 push 用的 `-c http.extraHeader=...` 参数（token 不进 URL/不进命令位置参数前缀）。"""
+    token = os.environ.get("SWARM_GITLAB_TOKEN", "").strip()
+    if not token:
+        return []
+    return ["-c", f"http.extraHeader=Authorization: Bearer {token}"]
 
 
 def _run_git(
@@ -131,18 +156,18 @@ def push_merged_diff_branch(
 
         push = _run_git(
             project_path,
-            ["push", remote_url, f"HEAD:{branch}"],
+            [*_gitlab_auth_header_args(), "push", remote_url, f"HEAD:{branch}"],
             timeout=300,
         )
         if push.returncode != 0:
-            return None, f"git push failed: {push.stderr.strip()}"
+            return None, f"git push failed: {_redact_secrets(push.stderr.strip())}"
 
         logger.info("[L3 push] 分支 %s 已推送 (base=%s)", branch, base_ref)
         return branch, ""
     except subprocess.TimeoutExpired:
         return None, "git operation timeout"
     except Exception as exc:
-        return None, str(exc)
+        return None, _redact_secrets(str(exc))
     finally:
         try:
             _run_git(project_path, ["checkout", "-"], timeout=30)

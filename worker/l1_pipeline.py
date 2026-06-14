@@ -125,6 +125,39 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
 
 
 
+def _scope_match(fp: str, w: str) -> bool:
+    """路径感知的 scope 匹配（audit #31 修复）。
+
+    旧实现 `fp.endswith(w) or w.endswith(fp)` 是任意字符后缀匹配，会误放行：
+    scope `main.py` 放行 `src/main.py`、scope `src/main.py` 放行 `2src/main.py` 等。
+    新规则按【路径段】对齐，避免子串误判：
+      1. 规范化(去 ./、统一 /)；
+      2. 完全相等 → 匹配；
+      3. w 以 / 结尾(目录 scope) → fp 在该目录下 → 匹配；
+      4. fp 以 w 结尾且边界是路径分隔符(w 是 fp 的完整尾部路径段序列) → 匹配
+         (容忍 diff 路径带仓库根前缀，如 scope 'src/a.py' 匹配 'repo/src/a.py')。
+    """
+    def norm(p: str) -> str:
+        p = p.strip().replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        return p.strip("/")
+
+    f, ww = norm(fp), norm(w)
+    if not f or not ww:
+        return False
+    if f == ww:
+        return True
+    # 目录 scope：w 原始以 / 结尾，或作为 f 的祖先目录段
+    if f.startswith(ww + "/"):
+        return True
+    # fp 带额外根前缀：仅当 w 本身是【多段路径】(含 /) 时容忍根前缀对齐，
+    # 避免单段 basename(如 'main.py') 尾匹配任意目录下同名文件(audit #31 核心)。
+    if "/" in ww and f.endswith("/" + ww):
+        return True
+    return False
+
+
 def _scope_violations(diff: str, scope: FileScope) -> list[str]:
     modified = files_from_unified_diff(diff)
     writable = set(scope.writable or [])
@@ -132,7 +165,7 @@ def _scope_violations(diff: str, scope: FileScope) -> list[str]:
         return []
     violations = []
     for fp in modified:
-        if not any(fp.endswith(w) or w.endswith(fp) for w in writable):
+        if not any(_scope_match(fp, w) for w in writable):
             violations.append(fp)
     return violations
 
