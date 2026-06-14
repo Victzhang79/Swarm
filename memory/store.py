@@ -505,6 +505,7 @@ class MemoryStore:
                        last_used_at, metadata_json
                 FROM mem_successes
                 WHERE project_id = %s
+                  AND decay_weight > 0.05
                   AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
