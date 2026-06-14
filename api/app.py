@@ -254,26 +254,36 @@ async def _check_component(name: str) -> dict[str, Any]:
                 except ImportError:
                     pass
             if not embed_ok:
-                # 尝试通过 HTTP 检测远程 embedding endpoint
+                # 通过【统一入口】get_embed_endpoint 探测远程 embedding，确保探测目标
+                # 与实际嵌入所用端点一致（修复 12.7：此前直读 siliconflow_* 与实际使用
+                # 的 embed_rerank_config 入口不一致，可能误报 ready/degraded）。
                 try:
-                    async with httpx.AsyncClient(timeout=5) as client:
-                        if cfg.model.siliconflow_api_key:
+                    from swarm.knowledge.embed_rerank_config import get_embed_endpoint
+                    ep = get_embed_endpoint()
+                    if ep is not None:
+                        async with httpx.AsyncClient(timeout=5) as client:
+                            headers = {"Authorization": f"Bearer {ep.api_key}"} if ep.api_key else {}
                             resp = await client.post(
-                                f"{cfg.model.siliconflow_base_url}/embeddings",
-                                json={"model": cfg.knowledge.embedding_model, "input": "test"},
-                                headers={"Authorization": f"Bearer {cfg.model.siliconflow_api_key}"},
+                                f"{ep.base_url}/embeddings",
+                                json={"model": ep.model, "input": "test"},
+                                headers=headers,
                             )
                             if resp.status_code == 200:
                                 dim = len(resp.json().get("data", [{}])[0].get("embedding", []))
-                                details.append(f"embedding: {cfg.knowledge.embedding_model} (remote, dim={dim})")
+                                details.append(f"embedding: {ep.model} (remote, dim={dim})")
                                 embed_ok = True
+                            else:
+                                details.append(
+                                    f"embedding: endpoint {ep.base_url} 返回 status={resp.status_code}"
+                                )
                 except Exception as exc:
                     logger.debug("embedding 远程探测失败: %s", exc)
             if not embed_ok:
-                details.append("embedding: no local model, no remote endpoint")
+                # KB 检索仍可用（降级为 BM25 关键词检索），但语义召回质量下降
+                details.append("embedding: no local model, no remote endpoint (KB 检索降级为 BM25)")
 
             qdrant_ok_flag = any("qdrant" in d for d in details)
-            embed_ok_flag = any("embedding:" in d for d in details)
+            embed_ok_flag = embed_ok  # 用显式探测结果，不靠脆弱的字符串匹配（降级文案也含 "embedding:"）
             if qdrant_ok_flag and embed_ok_flag:
                 status["status"] = "running"
             elif qdrant_ok_flag or embed_ok_flag:

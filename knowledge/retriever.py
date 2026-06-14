@@ -23,6 +23,16 @@ from swarm.types import KnowledgeContext
 logger = logging.getLogger(__name__)
 
 
+def _is_zero_vec(vec: list[float] | None, sample_size: int = 8) -> bool:
+    """检测查询向量是否为零向量（embedding 服务不可用时的占位回退信号）。
+
+    采样前若干维即可判定（bge-m3 零向量回退是全 0）。用于 Layer B 优雅降级（12.7）。
+    """
+    if not vec:
+        return True
+    return all(abs(x) < 1e-12 for x in vec[:sample_size])
+
+
 @dataclass
 class SwarmRetrieverResult:
     """检索结果封装"""
@@ -372,6 +382,24 @@ class SwarmRetriever:
                 query_vector = vecs[0]
         except Exception as exc:  # noqa: BLE001
             logger.debug("query 预向量化失败(降级为各自 embed): %s", exc)
+
+        # ── 优雅降级（修复 12.7）：embedding 不可用(零向量/None)时，不用零向量污染
+        #    向量检索，改走 BM25-only 关键词检索保住基本召回能力。──
+        if query_vector is None or _is_zero_vec(query_vector):
+            if not getattr(self, "_embed_degraded_warned", False):
+                logger.warning(
+                    "[Layer B] embedding 服务不可用(零向量) — KB 语义检索降级为 BM25 关键词检索。"
+                    "请检查 SWARM_KB_EMBED_* 配置或 embed 服务可用性。"
+                )
+                self._embed_degraded_warned = True
+            try:
+                bm25_results = await self._semantic.bm25_only_search(
+                    project_id, query_terms=keywords,
+                )
+                return bm25_results
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Layer B] BM25 降级检索失败: %s", exc)
+                return []
 
         # 在指定文件中优先检索(若 Layer A 有结果)
         results: list[dict[str, Any]] = []

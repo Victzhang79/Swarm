@@ -399,6 +399,56 @@ class SemanticIndexer:
             text_key="content",
         )
 
+    async def bm25_only_search(
+        self,
+        project_id: str,
+        query_terms: list[str] | None = None,
+        top_k: int | None = None,
+        scroll_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """无向量降级检索（修复 12.7）：embedding 服务不可用时的优雅降级路径。
+
+        不做向量相似度，改用 Qdrant scroll 按 project_id 过滤拉取候选 chunk，
+        再用与 hybrid 相同口径的 BM25 对 content 关键词打分排序，取 top_k。
+        这样 embed 挂了也能保住"关键词检索"能力，而非返回空或零向量噪声。
+
+        query_terms: 已提取的查询关键词（英文 token + 中文 2-gram）。为空则只能
+        靠 scroll 顺序返回（无排序信号），仍优于零向量噪声。
+        scroll_limit: 候选池上限，默认 retrieval_top_k*10（保守，避免拉全库）。
+        """
+        from swarm.knowledge.hybrid import _bm25_scores, _tokenize_doc
+
+        client = self._client_or_raise()
+        top_k = top_k or self._kb_config.retrieval_top_k
+        scroll_limit = scroll_limit or (self._kb_config.retrieval_top_k * 10)
+
+        flt = models.Filter(
+            must=[models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))]
+        )
+        points, _ = await client.scroll(
+            collection_name=self._collection_name,
+            scroll_filter=flt,
+            limit=scroll_limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        candidates: list[dict[str, Any]] = [
+            {"id": str(p.id), "score": 0.0, **(p.payload or {})} for p in points
+        ]
+        if not candidates:
+            return []
+
+        # BM25 关键词排序（无 query_terms 则保持 scroll 顺序）
+        if query_terms:
+            docs_terms = [_tokenize_doc(str(c.get("content") or "")) for c in candidates]
+            scores = _bm25_scores([t.lower() for t in query_terms], docs_terms)
+            for c, s in zip(candidates, scores):
+                c["bm25_score"] = round(s, 4)
+                c["score"] = round(s, 4)  # 让下游按 score 排序/筛选时有信号
+            candidates.sort(key=lambda c: c.get("bm25_score", 0.0), reverse=True)
+
+        return candidates[:top_k]
+
     # ── 删除 ────────────────────────────────────
 
     async def delete_by_file(self, project_id: str, file_path: str) -> None:
