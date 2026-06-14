@@ -65,6 +65,10 @@ MAX_PLAN_RETRY = 3
 # 进程内单例 — 共享 checkpointer，支持跨 HTTP 请求 interrupt/resume
 _compiled_brain_graph = None
 _memory_checkpointer = None
+# A1 批1：PG checkpointer 单例 + 其 context manager（连接生命周期 = app 生命周期）。
+# 多副本共享同一 PG checkpoint 表，实现跨副本 interrupt/resume。
+_pg_checkpointer = None
+_pg_checkpointer_cm = None  # AsyncPostgresSaver.from_conn_string(...) 的 cm，shutdown 时 __aexit__
 
 
 # ══════════════════════════════════════════════
@@ -513,10 +517,18 @@ def compile_brain_graph(checkpointer: AsyncPostgresSaver | None = None):
 
 
 def get_compiled_brain_graph():
-    """获取进程内单例 Brain graph（任务 runner 与 API 共享，支持 resume）"""
+    """获取进程内单例 Brain graph（任务 runner 与 API 共享，支持 resume）。
+
+    A1 批1：优先使用已初始化的 PG checkpointer 版（多副本共享、跨副本 resume）；
+    若 PG checkpointer 未初始化（未调 init_postgres_checkpointer 或初始化失败），
+    回退到 MemorySaver 版（开发/CI/单机开箱即用）。
+    """
     global _compiled_brain_graph
     if _compiled_brain_graph is None:
-        _compiled_brain_graph = compile_brain_graph()
+        if _pg_checkpointer is not None:
+            _compiled_brain_graph = compile_brain_graph(checkpointer=_pg_checkpointer)
+        else:
+            _compiled_brain_graph = compile_brain_graph()
     return _compiled_brain_graph
 
 
@@ -527,20 +539,50 @@ def reset_compiled_brain_graph() -> None:
     _memory_checkpointer = None
 
 
-async def compile_brain_graph_with_postgres(
-    postgres_uri: str | None = None,
-):
-    """使用 PostgresSaver 编译 Brain 状态机（异步）
+async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
+    """A1 批1：初始化 PG checkpointer 单例（在 FastAPI startup 内调用）。
 
-    Args:
-        postgres_uri: PostgreSQL 连接串，默认从配置读取
+    关键：连接生命周期 = app 生命周期。用 from_conn_string 的 cm 进入（__aenter__）
+    并把 cm + checkpointer 都存为模块单例，shutdown 时 close_postgres_checkpointer
+    退出（__aexit__）。绝不在函数作用域内用 `async with`（那样函数返回即关连接——
+    这正是原 compile_brain_graph_with_postgres 的 bug）。
 
-    Returns:
-        编译好的 CompiledGraph
+    返回 True=PG checkpointer 就绪；False=失败已降级（get_compiled_brain_graph 会用 MemorySaver）。
     """
-    config = get_config()
-    uri = postgres_uri or config.db.postgres_uri
+    global _pg_checkpointer, _pg_checkpointer_cm, _compiled_brain_graph
+    if _pg_checkpointer is not None:
+        return True
+    try:
+        config = get_config()
+        uri = postgres_uri or config.db.postgres_uri
+        cm = AsyncPostgresSaver.from_conn_string(uri)
+        checkpointer = await cm.__aenter__()
+        await checkpointer.setup()  # 幂等创建 checkpoint 表
+        _pg_checkpointer_cm = cm
+        _pg_checkpointer = checkpointer
+        # 让已编译单例（若已用 MemorySaver 建过）失效，下次取用 PG 版
+        _compiled_brain_graph = None
+        logger.info("[A1] PG checkpointer 已初始化（跨副本 interrupt/resume 就绪）")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[A1] PG checkpointer 初始化失败，降级 MemorySaver（单机/开发模式不受影响）: %s", exc
+        )
+        _pg_checkpointer = None
+        _pg_checkpointer_cm = None
+        return False
 
-    async with AsyncPostgresSaver.from_conn_string(uri) as checkpointer:
-        await checkpointer.setup()  # 创建 checkpoint 表
-        return compile_brain_graph(checkpointer=checkpointer)
+
+async def close_postgres_checkpointer() -> None:
+    """A1 批1：关闭 PG checkpointer 连接（在 FastAPI shutdown 内调用）。"""
+    global _pg_checkpointer, _pg_checkpointer_cm, _compiled_brain_graph
+    cm = _pg_checkpointer_cm
+    _pg_checkpointer = None
+    _pg_checkpointer_cm = None
+    _compiled_brain_graph = None
+    if cm is not None:
+        try:
+            await cm.__aexit__(None, None, None)
+            logger.info("[A1] PG checkpointer 连接已关闭")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[A1] 关闭 PG checkpointer 失败: %s", exc)

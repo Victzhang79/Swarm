@@ -124,6 +124,17 @@ async def _ensure_async_tables() -> None:
             await cur.execute(EVENT_QUEUE_DDL)
     print("  ✅ knowledge 增量队列: kb_update_events")
 
+    # A1 批1：LangGraph PG checkpointer 表（多副本共享 + 跨副本 interrupt/resume）。
+    # langgraph 自带幂等 setup()，并入统一入口让全新库一次建好（与 startup 一致）。
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        async with AsyncPostgresSaver.from_conn_string(db.postgres_uri) as cp:
+            await cp.setup()
+        print("  ✅ LangGraph checkpointer: checkpoints / checkpoint_writes / checkpoint_blobs")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️  checkpointer 表建表跳过（不阻断，startup 会重试）: {exc}")
+
 
 def main() -> int:
     db = DatabaseConfig()

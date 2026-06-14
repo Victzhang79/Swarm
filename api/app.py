@@ -680,6 +680,14 @@ async def on_startup():
         logger.info("Auth/RBAC tables ensured")
     except Exception as e:
         logger.warning(f"Failed to ensure auth tables: {e}")
+    # A1 批1：初始化 PG checkpointer（多副本共享 + 跨副本 interrupt/resume）。
+    # 必须在 runner/调度器使用 graph 之前；失败自动降级 MemorySaver（单机不受影响）。
+    try:
+        from swarm.brain.graph import init_postgres_checkpointer
+
+        await init_postgres_checkpointer()
+    except Exception as e:
+        logger.warning(f"PG checkpointer init skipped: {e}")
     await _start_memory_decay_scheduler()
     await _start_kb_update_scheduler()
     await _start_consistency_scheduler()
@@ -789,6 +797,13 @@ async def on_shutdown():
         logger.info("DB pools closed")
     except Exception as exc:
         logger.warning("Failed to close DB pools: %s", exc)
+    # A1 批1：关闭 PG checkpointer 连接（与 app 生命周期对齐）
+    try:
+        from swarm.brain.graph import close_postgres_checkpointer
+
+        await close_postgres_checkpointer()
+    except Exception as exc:
+        logger.warning("Failed to close PG checkpointer: %s", exc)
 
 
 async def _start_kb_update_scheduler() -> None:

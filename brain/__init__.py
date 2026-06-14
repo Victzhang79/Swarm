@@ -12,16 +12,18 @@
 
 from swarm.brain.graph import (
     build_brain_graph,
+    close_postgres_checkpointer,
     compile_brain_graph,
-    compile_brain_graph_with_postgres,
     get_compiled_brain_graph,
+    init_postgres_checkpointer,
 )
 from swarm.brain.state import BrainState
 
 __all__ = [
     "BrainState",
     "build_brain_graph",
+    "close_postgres_checkpointer",
     "compile_brain_graph",
-    "compile_brain_graph_with_postgres",
     "get_compiled_brain_graph",
+    "init_postgres_checkpointer",
 ]
