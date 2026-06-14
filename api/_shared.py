@@ -23,6 +23,8 @@ _SHORT_KEY_MAP = {
     "siliconflow_api_key": "SWARM_MODEL_SILICONFLOW_API_KEY",
     "siliconflow_base_url": "SWARM_MODEL_SILICONFLOW_BASE_URL",
     "local_api_key": "SWARM_MODEL_LOCAL_API_KEY",
+    "tier_enabled": "SWARM_MODEL_TIER_ENABLED",
+    "tier": "SWARM_MODEL_TIER",
     "local_base_url": "SWARM_MODEL_LOCAL_BASE_URL",
     "brain_primary": "SWARM_MODEL_BRAIN_PRIMARY",
     "brain_fallback": "SWARM_MODEL_BRAIN_FALLBACK",
@@ -112,6 +114,8 @@ def _flatten_model_config(cfg: AppConfig) -> dict[str, Any]:
         "routing_complex_fallback": m.routing_complex_fallback,
         "routing_multimodal": m.routing_multimodal,
         "routing_multimodal_fallback": m.routing_multimodal_fallback,
+        "tier_enabled": m.tier_enabled,
+        "tier": m.tier,
     }
 
 

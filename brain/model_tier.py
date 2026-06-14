@@ -86,22 +86,40 @@ def infer_tier_from_model(model_name: str | None) -> ModelCapabilityTier:
 
 
 def resolve_tier(model_name: str | None = None) -> ModelCapabilityTier:
-    """解析当前生效 tier：SWARM_MODEL_TIER 手动覆盖 > 模型名推断 > STANDARD。"""
-    override = (os.environ.get("SWARM_MODEL_TIER", "") or "").strip().lower()
+    """解析当前生效 tier：config.model.tier / SWARM_MODEL_TIER 手动覆盖 > 模型名推断 > STANDARD。"""
+    override = ""
+    # 优先读 config（WebUI 可配，落库 .env）；config 不可用时回退直接读 env
+    try:
+        from swarm.config.settings import get_config
+        override = (get_config().model.tier or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        override = ""
+    if not override:
+        override = (os.environ.get("SWARM_MODEL_TIER", "") or "").strip().lower()
     if override in (t.value for t in ModelCapabilityTier):
         return ModelCapabilityTier(override)
-    if override:
-        logger.warning("[MODEL_TIER] 无效的 SWARM_MODEL_TIER=%r，忽略（用推断/默认）", override)
+    # "auto"/"" = 显式要求自动推断（不算无效值，不告警）
+    if override and override != "auto":
+        logger.warning("[MODEL_TIER] 无效的 tier 覆盖=%r，忽略（用推断/默认）", override)
     return infer_tier_from_model(model_name)
 
 
 def tier_constraints(model_name: str | None = None) -> dict[str, int]:
     """返回当前 tier 的约束上限 dict（clarify_rounds/design_rejects/elaborate_resplit）。
 
-    全局开关 SWARM_MODEL_TIER_ENABLED：默认 false（=永远 standard，行为与改动前一致，零风险）。
-    显式置 true 才让 tier 分级生效。这是"默认关 + 显式启用 + A/B"的安全闸门。
+    全局开关 config.model.tier_enabled（兼容 env SWARM_MODEL_TIER_ENABLED）：默认 false（=永远
+    standard，行为与改动前一致，零风险）。显式置 true 才让 tier 分级生效。这是"默认关 +
+    显式启用 + A/B"的安全闸门。config 优先（WebUI 可配，保存即 reload），回退 env。
     """
-    enabled = (os.environ.get("SWARM_MODEL_TIER_ENABLED", "false") or "false").lower() in ("true", "1", "yes")
+    enabled = False
+    try:
+        from swarm.config.settings import get_config
+        enabled = bool(get_config().model.tier_enabled)
+    except Exception:  # noqa: BLE001
+        enabled = False
+    if not enabled:
+        # config 没开时，仍尊重 env 显式开关（向后兼容老部署）
+        enabled = (os.environ.get("SWARM_MODEL_TIER_ENABLED", "false") or "false").lower() in ("true", "1", "yes")
     if not enabled:
         return dict(_TIER_CONSTRAINTS[ModelCapabilityTier.STANDARD])
     tier = resolve_tier(model_name)

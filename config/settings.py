@@ -125,6 +125,15 @@ class ModelConfig(BaseSettings):
     # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
     stream_chunk_timeout: float = 45.0
 
+    # ── I1 模型能力分级（Brain 编排约束随模型能力调整）──────────────
+    # tier_enabled 默认 False = 永远 standard = 现有硬编码约束上限，行为零变化（安全闸门）。
+    # 显式开启后，按 Brain 主模型能力 tier 调整 clarify/design_reject/elaborate_resplit 上限：
+    # 强模型收紧（少澄清/打回/拆分=降延迟），弱模型放宽（多兜底）。
+    # tier 取值 ""（自动从 brain_primary 模型名推断）/ "strong" / "standard" / "weak"（手动覆盖）。
+    # 对应 env：SWARM_MODEL_TIER_ENABLED / SWARM_MODEL_TIER。
+    tier_enabled: bool = False
+    tier: str = ""
+
     # ── 接入点解析 ────────────────────────────────────────────
     def _resolve_api_key(self, provider_id: str, env_fallback: str) -> str:
         """provider 的 api_key：优先从 db secret_store 解密读，回退 .env 明文值。

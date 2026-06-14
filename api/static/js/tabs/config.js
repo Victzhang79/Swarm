@@ -17,6 +17,11 @@ async function loadConfig() {
       $('cfg-langsmith-api-key').placeholder = lsKey.includes('...') ? lsKey : 'LangSmith API Key';
     }
     if ($('cfg-langsmith-project')) $('cfg-langsmith-project').value = cfg.langsmith_project || 'swarm-dev';
+    // I1 模型能力分级回填（flat 优先，回退 config.model）
+    const _tierEnabled = flat.tier_enabled ?? cfg.model?.tier_enabled ?? false;
+    const _tier = flat.tier ?? cfg.model?.tier ?? '';
+    if ($('cfg-tier-enabled')) $('cfg-tier-enabled').checked = !!_tierEnabled;
+    if ($('cfg-tier')) $('cfg-tier').value = _tier || 'auto';
     await fetchModels();
     await loadRoutingTable();
   } catch { /* ignore */ }
@@ -104,6 +109,8 @@ async function saveConfig() {
       langsmith_tracing: $('cfg-langsmith-tracing')?.checked || false,
       langsmith_api_key: $('cfg-langsmith-api-key')?.value || '',
       langsmith_project: $('cfg-langsmith-project')?.value || 'swarm-dev',
+      tier_enabled: $('cfg-tier-enabled')?.checked || false,
+      tier: $('cfg-tier')?.value || '',
       ...collectRoutingPayload(),
     };
     const resp = await fetch('/api/config', {

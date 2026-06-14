@@ -20,6 +20,23 @@ from swarm.brain.model_tier import (
     tier_constraints,
 )
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_from_env(monkeypatch):
+    """这些测试验证 model_tier 的 env 路径逻辑。但 model_tier 现在优先读
+    get_config().model.tier/tier_enabled（真相源），其从 .env 文件加载会干扰 env 用例。
+    强制让 config 读取抛异常 → model_tier 回退到纯 env 路径（代码已有 try/except），
+    使测试聚焦于 env 优先级/推断逻辑本身。config 优先于 env 的真实闭环已由浏览器
+    dogfood + 全新进程探针验证（见会话记录），此处不重复。
+    """
+    import swarm.config.settings as _settings
+
+    def _boom():
+        raise RuntimeError("config disabled in unit test (force env path)")
+    monkeypatch.setattr(_settings, "get_config", _boom, raising=True)
+
 
 def test_infer_strong_models():
     assert infer_tier_from_model("Pro/zai-org/GLM-5.1") == ModelCapabilityTier.STRONG
