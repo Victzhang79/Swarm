@@ -47,12 +47,26 @@ async def list_models():
 
     # SiliconFlow 模型列表
     cfg = _app.get_config()
-    sf_key = cfg.model.siliconflow_api_key
+    # B 方案修复：key 已迁入 providers(真相源)，扁平字段 siliconflow_api_key/local_api_key
+    # 可能为空。优先从 _effective_providers 按 id 取 key/base_url，回退扁平字段(向后兼容)。
+    _prov_key: dict[str, str] = {}
+    _prov_base: dict[str, str] = {}
+    try:
+        for _p in (cfg.model._effective_providers() or []):
+            _pid = getattr(_p, "id", "")
+            if _pid:
+                _prov_key[_pid] = getattr(_p, "api_key", "") or ""
+                _prov_base[_pid] = getattr(_p, "base_url", "") or ""
+    except Exception as _exc:  # noqa: BLE001 — providers 读取失败回退扁平字段
+        _app.logger.warning("读取 providers 失败，回退扁平字段: %s", _exc)
+
+    sf_key = _prov_key.get("siliconflow") or cfg.model.siliconflow_api_key
+    sf_base = _prov_base.get("siliconflow") or cfg.model.siliconflow_base_url
     if sf_key:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    f"{cfg.model.siliconflow_base_url}/models",
+                    f"{sf_base}/models",
                     headers={"Authorization": f"Bearer {sf_key}"},
                 )
                 if resp.status_code == 200:
@@ -66,8 +80,8 @@ async def list_models():
             result["siliconflow_error"] = str(e)
 
     # 本地模型列表 (支持 OpenAI 兼容 / Open WebUI / Ollama)
-    local_url = cfg.model.local_base_url
-    local_key = cfg.model.local_api_key
+    local_url = _prov_base.get("local") or cfg.model.local_base_url
+    local_key = _prov_key.get("local") or cfg.model.local_api_key
     if local_url:
         try:
             headers = {}
