@@ -5,6 +5,16 @@
 
 ---
 
+## 0. 术语边界（务必勿混淆）
+
+- **Docker 多容器交付** = 把 **Swarm 自身**（API / Worker 子进程 / Brain 编排 / 知识库 / 记忆）打包成容器，`docker compose up` **一键拉起整个 Swarm 服务栈**。目标是"Swarm 项目可一键部署"。
+- **"Worker 容器"** 指 **Swarm 自己的 Worker 子进程**独立成容器，**不是** CubeSandbox。
+- **CubeSandbox** = 独立的**远程沙箱执行服务器**（跑用户代码，经 dev_sidecar 代理）。**架构永不动、不容器化、不进 compose、不归 Swarm 部署管**。Swarm 的 Worker 只是 SDK 客户端去连它。
+
+> 本文档所有"拆进程 / 容器"均指 Swarm 自身的子系统，与 CubeSandbox 无关。
+
+---
+
 ## 1. 问题与现状（实测）
 
 **当前**：API / Brain 编排 / Worker 执行 / 知识库 / 记忆，**全在一个 uvicorn 进程**。
