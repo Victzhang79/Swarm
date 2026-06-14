@@ -110,5 +110,8 @@ def run_integration_review(
     modified = files_from_unified_diff(merged_diff)
     details["modified_files"] = modified
 
-    passed = not any("failed" in i.lower() or "未出现" in i for i in issues)
+    # audit #25：passed 判定改用结构化标志——issues 本就是"问题列表"，非空即未通过。
+    # 原 `not any("failed" in i.lower() ...)` 靠子串匹配，既会漏判(问题描述里无 "failed"
+    # 字样的真问题被放行)，又会误判("No test failed" 这类描述含 "failed" 被判失败)。
+    passed = len(issues) == 0
     return passed, issues, details

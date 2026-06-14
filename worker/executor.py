@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from enum import Enum
 from pathlib import Path
@@ -37,6 +38,22 @@ from swarm.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# audit #22：trivial 快路径的 LLM 自报判定。原 `"fail" not in combined.lower()` 是裸
+# 子串，会把 "check for failures" / "failed to X but recovered" 等正常叙述误判为失败。
+# 改用词边界正则只命中独立失败词。注意：这只是【弱信号】，仅在确定性 L1 闸门无法判定
+# （无工程文件可编译/测试）时回退使用；闸门可判时其结果优先覆盖本判定。
+_FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|errors)\b")
+
+
+def _trivial_llm_self_report_passed(combined: str) -> bool:
+    """从 trivial agent 自由文本自报中弱判断是否通过（词边界匹配失败词）。"""
+    if not combined:
+        return True
+    if "❌" in combined:
+        return False
+    return not bool(_FAIL_WORD_RE.search(combined.lower()))
 
 
 class WorkerPhase(str, Enum):
@@ -1077,8 +1094,9 @@ class WorkerExecutor:
         )
         self._log(f"合并执行完成: {combined[:200]}")
 
-        # LLM 自报仅作弱信号
-        llm_passed = "fail" not in combined.lower() and "❌" not in combined
+        # LLM 自报仅作弱信号（仅在确定性闸门无法判定时回退使用）。audit #22 见
+        # _trivial_llm_self_report_passed。
+        llm_passed = _trivial_llm_self_report_passed(combined)
         l1_details = {"mode": "trivial_fast", "agent_summary": combined[:500]}
 
         self.phase = WorkerPhase.PRODUCING
