@@ -37,6 +37,23 @@ DEFAULT_CONTEXT_BUDGET = 150_000  # Q7：子任务上下文预算（留余量 < 
 MAX_ELABORATE_RESPLIT = 3       # 超预算二次拆分上限
 
 
+def _tier_limits() -> dict:
+    """I1：按 Brain 主模型能力 tier 返回约束上限。
+
+    默认（SWARM_MODEL_TIER_ENABLED 未开）= standard = 上面的硬编码常量，行为零变化。
+    显式启用后，强模型收紧上限（少澄清/打回/拆分=降延迟），弱模型放宽（多兜底）。
+    """
+    try:
+        from swarm.brain.model_tier import tier_constraints
+        from swarm.config.settings import get_config
+        model_name = get_config().model.brain_primary
+        return tier_constraints(model_name)
+    except Exception:  # noqa: BLE001
+        # 任何异常都回退到 standard 默认（绝不因 tier 解析失败影响主流程）
+        return {"clarify_rounds": MAX_CLARIFY_ROUNDS, "design_rejects": MAX_DESIGN_REJECTS,
+                "elaborate_resplit": MAX_ELABORATE_RESPLIT}
+
+
 def _auto_mode(state: BrainState) -> bool:
     """API/CI 自动化模式：永不交互（澄清/评审走默认假设）。"""
     if state.get("auto_accept"):
@@ -160,8 +177,9 @@ async def clarify(state: BrainState) -> dict:
     rnd = int(state.get("clarify_round", 0))
     history = list(state.get("clarify_history", []))
 
-    if rnd >= MAX_CLARIFY_ROUNDS:
-        logger.info("[CLARIFY] 达轮数上限 %d，结束澄清", MAX_CLARIFY_ROUNDS)
+    _max_clarify = _tier_limits()["clarify_rounds"]
+    if rnd >= _max_clarify:
+        logger.info("[CLARIFY] 达轮数上限 %d，结束澄清", _max_clarify)
         return {"clarify_done": True}
 
     # ── LLM 评估本轮是否需要提问 ──
@@ -436,8 +454,9 @@ async def review_design(state: BrainState) -> dict:
     if _auto_mode(state):
         return {"design_review": {"decision": "approve", "feedback": "自动化模式自动通过", "reject_count": reject_count}}
 
-    if reject_count >= MAX_DESIGN_REJECTS:
-        logger.warning("[REVIEW_DESIGN] 打回达上限 %d，强制通过并标记需人工关注", MAX_DESIGN_REJECTS)
+    if reject_count >= _tier_limits()["design_rejects"]:
+        _mdr = _tier_limits()["design_rejects"]
+        logger.warning("[REVIEW_DESIGN] 打回达上限 %d，强制通过并标记需人工关注", _mdr)
         return {"design_review": {"decision": "approve", "feedback": f"打回{reject_count}次达上限，强制继续", "reject_count": reject_count, "forced": True}}
 
     decision = interrupt({
@@ -548,8 +567,9 @@ async def elaborate(state: BrainState) -> dict:
     budget = _context_budget()
     invest_fail = 0
     resplit_rounds = 0
+    _max_resplit = _tier_limits()["elaborate_resplit"]
     # 多轮：每轮找出"需再拆"的子任务，二次拆分替换，重新检查
-    while resplit_rounds < MAX_ELABORATE_RESPLIT:
+    while resplit_rounds < _max_resplit:
         need_resplit = [st for st in plan_obj.subtasks if _needs_resplit(st, budget)]
         if not need_resplit:
             break
