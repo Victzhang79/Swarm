@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS swarm_users (
     password_hash   TEXT,
     api_token       TEXT UNIQUE,
     global_role     TEXT NOT NULL DEFAULT 'developer',
+    must_change_password BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -41,9 +42,11 @@ CREATE INDEX IF NOT EXISTS idx_swarm_members_user ON swarm_project_members(user_
 
 _PROFILE_MIGRATION = """
 ALTER TABLE mem_user_profile ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
 """
 
 _BOOTSTRAP_USERNAME = "admin"
+_DEFAULT_BOOTSTRAP_PASSWORD = "swarm"  # 默认弱密码；用此值创建 admin 时强制改密(12.19)
 
 
 @dataclass
@@ -103,7 +106,13 @@ def ensure_bootstrap_admin(
     reset_password: bool = False,
     conn_str: str | None = None,
 ) -> SwarmUser:
-    """确保 admin 用户存在；可选重置密码（开发环境恢复）。"""
+    """确保 admin 用户存在；可选重置密码（开发环境恢复）。
+
+    安全（12.19）：当 admin 仍在使用默认弱密码 'swarm' 时，置 must_change_password=true，
+    RBAC 开启时前端将强制首次登录改密。自定义了 SWARM_BOOTSTRAP_ADMIN_PASSWORD 的
+    部署不触发（视为已主动设密）。RBAC 关闭（开发/CI）时该标志返回但不阻断登录。
+    """
+    must_change = (password == _DEFAULT_BOOTSTRAP_PASSWORD)
     record = get_user_by_username(_BOOTSTRAP_USERNAME, conn_str)
     if record is None:
         token = generate_api_token()
@@ -113,12 +122,14 @@ def ensure_bootstrap_admin(
             display_name="Administrator",
             global_role=Role.ADMIN.value,
             api_token=token,
+            must_change_password=must_change,
             conn_str=conn_str,
         )
         logger.warning(
-            "Default admin created: username=%s password=<bootstrap> token=%s",
+            "Default admin created: username=%s password=<bootstrap> token=%s%s",
             _BOOTSTRAP_USERNAME,
             token,
+            " ⚠️ 使用默认弱密码 'swarm'，请尽快修改！" if must_change else "",
         )
         return user
 
@@ -138,6 +149,30 @@ def update_user_password(user_id: str, password: str, conn_str: str | None = Non
             cur.execute(
                 "UPDATE swarm_users SET password_hash = %s, updated_at = now() WHERE id = %s",
                 (pwd_hash, user_id),
+            )
+
+
+def get_must_change_password(user_id: str, conn_str: str | None = None) -> bool:
+    """查询用户是否需强制改密（12.19）。列缺失时安全返回 False（兼容旧库未迁移）。"""
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT must_change_password FROM swarm_users WHERE id = %s", (user_id,)
+                )
+                row = cur.fetchone()
+            except Exception:  # noqa: BLE001 — 列不存在(旧库)等
+                return False
+    return bool(row[0]) if row else False
+
+
+def clear_must_change_password(user_id: str, conn_str: str | None = None) -> None:
+    """用户成功改密后清除强制改密标志（12.19）。"""
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE swarm_users SET must_change_password = false, updated_at = now() WHERE id = %s",
+                (user_id,),
             )
 
 
@@ -183,6 +218,7 @@ def create_user(
     display_name: str | None = None,
     global_role: str = Role.DEVELOPER.value,
     api_token: str | None = None,
+    must_change_password: bool = False,
     conn_str: str | None = None,
 ) -> SwarmUser:
     user_id = str(uuid.uuid4())
@@ -192,11 +228,11 @@ def create_user(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO swarm_users (id, username, display_name, password_hash, api_token, global_role)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO swarm_users (id, username, display_name, password_hash, api_token, global_role, must_change_password)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, username, display_name, global_role, api_token
                 """,
-                (user_id, username, display_name, pwd_hash, token, global_role),
+                (user_id, username, display_name, pwd_hash, token, global_role, must_change_password),
             )
             row = cur.fetchone()
     return _row_to_user(row)

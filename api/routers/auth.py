@@ -37,14 +37,20 @@ class MemberRequest(BaseModel):
 @router.post("/api/auth/login", tags=["认证"])
 async def auth_login(req: LoginRequest):
     """用户名密码登录，返回 api_token（Bearer / X-Swarm-Token）。"""
-    from swarm.auth.store import authenticate
+    from swarm.auth.store import authenticate, get_must_change_password
 
     loop = asyncio.get_running_loop()
     user = await loop.run_in_executor(None, lambda: authenticate(req.username, req.password))
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    # 12.19：默认弱密码的 admin 需强制改密。RBAC 关闭(开发/CI)时仍返回标志，
+    # 但前端不阻断——保证开箱即用与 CI 的 admin/swarm 登录不受影响。
+    must_change = await loop.run_in_executor(
+        None, lambda: get_must_change_password(user.id)
+    )
     return {
         "token": user.api_token,
+        "must_change_password": must_change,
         "user": {
             "id": user.id,
             "username": user.username,
@@ -52,6 +58,42 @@ async def auth_login(req: LoginRequest):
             "global_role": user.global_role,
         },
     }
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@router.post("/api/auth/change-password", tags=["认证"])
+async def auth_change_password(request: Request, req: ChangePasswordRequest):
+    """当前登录用户修改自己的密码（12.19）：校验旧密码→更新→清除强制改密标志。"""
+    user = _require_user(request)
+    if not req.new_password or len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    if req.new_password == req.old_password:
+        raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
+
+    from swarm.auth.store import (
+        authenticate,
+        clear_must_change_password,
+        update_user_password,
+    )
+
+    loop = asyncio.get_running_loop()
+    # 用旧密码校验身份（authenticate 按用户名+密码）
+    verified = await loop.run_in_executor(
+        None, lambda: authenticate(user.username, req.old_password)
+    )
+    if verified is None:
+        raise HTTPException(status_code=401, detail="旧密码不正确")
+
+    def _apply() -> None:
+        update_user_password(user.id, req.new_password)
+        clear_must_change_password(user.id)
+
+    await loop.run_in_executor(None, _apply)
+    return {"ok": True}
 
 
 @router.get("/api/auth/me", tags=["认证"])

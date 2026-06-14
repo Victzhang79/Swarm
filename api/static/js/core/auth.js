@@ -110,6 +110,11 @@ async function submitLogin() {
     hideLoginModal();
     updateAuthUI();
     showToast('欢迎，' + (currentUser.display_name || currentUser.username), 'success');
+    // 12.19：默认弱密码 admin 强制改密。后端仅在使用默认密码时置标志；
+    // RBAC 关闭时后端仍可能返回 false（开箱即用不受影响）。
+    if (data.must_change_password) {
+      await forceChangePassword();
+    }
     // 登录成功：触发首屏加载（与 init() 已登录路径一致）
     if (typeof startInitialLoad === 'function') startInitialLoad();
     else await loadProjects();
@@ -119,6 +124,31 @@ async function submitLogin() {
   } catch (e) {
     errEl.textContent = '登录请求失败: ' + (e.message || e);
     errEl.style.display = 'block';
+  }
+}
+
+// 12.19：强制改密 — 循环直到成功修改（不可取消），保证默认弱密码被替换。
+async function forceChangePassword() {
+  showToast('检测到默认密码，请立即修改以保证安全', 'warning');
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const oldPw = window.prompt('安全提示：请输入当前密码（默认为 swarm）');
+    if (oldPw === null) { showToast('必须修改默认密码后才能继续使用', 'warning'); continue; }
+    const newPw = window.prompt('请输入新密码（至少 6 位，不能与旧密码相同）');
+    if (newPw === null) { showToast('必须修改默认密码后才能继续使用', 'warning'); continue; }
+    if (!newPw || newPw.length < 6) { showToast('新密码至少 6 位', 'error'); continue; }
+    try {
+      const r = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
+      });
+      if (r.ok) { showToast('密码已修改，请妥善保管', 'success'); return; }
+      const err = await r.json().catch(() => ({}));
+      showToast('修改失败: ' + (err.detail || r.status), 'error');
+    } catch (e) {
+      showToast('修改请求失败: ' + (e.message || e), 'error');
+    }
   }
 }
 
