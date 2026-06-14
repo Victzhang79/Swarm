@@ -40,79 +40,99 @@ async def get_config_endpoint():
 # ─── 3.5 GET /api/models ─────────────────────────
 @router.get("/api/models", tags=["配置"])
 async def list_models():
-    """从 SiliconFlow 和本地 API 拉取可用模型列表"""
+    """拉取所有已配 providers 的可用模型列表。
+
+    遍历 _effective_providers（真相源），每个 provider 调其 base_url 的 OpenAI 兼容
+    /models 端点（本地额外尝试 Open WebUI /api/models、Ollama /api/tags）。
+    返回：
+      - by_provider: {<provider_id>: {"label","kind","models":[...],"error"?}}  ← 新结构，支持任意多接入点
+      - siliconflow / local: [...]  ← 向后兼容旧前端（保留）
+      - siliconflow_error / local_error  ← 向后兼容
+    单个 provider 不可达不影响其它（各自 try）。
+    """
+    import asyncio
+
     import httpx
 
-    result = {"siliconflow": [], "local": []}
-
-    # SiliconFlow 模型列表
     cfg = _app.get_config()
-    # B 方案修复：key 已迁入 providers(真相源)，扁平字段 siliconflow_api_key/local_api_key
-    # 可能为空。优先从 _effective_providers 按 id 取 key/base_url，回退扁平字段(向后兼容)。
-    _prov_key: dict[str, str] = {}
-    _prov_base: dict[str, str] = {}
-    try:
-        for _p in (cfg.model._effective_providers() or []):
-            _pid = getattr(_p, "id", "")
-            if _pid:
-                _prov_key[_pid] = getattr(_p, "api_key", "") or ""
-                _prov_base[_pid] = getattr(_p, "base_url", "") or ""
-    except Exception as _exc:  # noqa: BLE001 — providers 读取失败回退扁平字段
-        _app.logger.warning("读取 providers 失败，回退扁平字段: %s", _exc)
+    providers = list(cfg.model._effective_providers() or [])
 
-    sf_key = _prov_key.get("siliconflow") or cfg.model.siliconflow_api_key
-    sf_base = _prov_base.get("siliconflow") or cfg.model.siliconflow_base_url
-    if sf_key:
+    async def _fetch_one(pid: str, label: str, kind: str, base_url: str, api_key: str) -> dict:
+        """拉单个 provider 的模型。返回 {label,kind,models,error?}。"""
+        entry = {"label": label or pid, "kind": kind or "cloud", "models": []}
+        if not base_url:
+            entry["error"] = "未配置 base_url"
+            return entry
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        base = base_url.rstrip("/")
+        # 候选端点：标准 OpenAI /models（base 已含 /v1 时直接用）；本地兼容 Open WebUI / Ollama
+        root = base.removesuffix("/v1").removesuffix("/api")
+        candidates = [f"{base}/models", f"{root}/v1/models", f"{root}/api/models", f"{root}/api/tags"]
+        seen = set()
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{sf_base}/models",
-                    headers={"Authorization": f"Bearer {sf_key}"},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    models = data.get("data", data.get("models", []))
-                    result["siliconflow"] = sorted(
-                        [m.get("id", m.get("name", "")) for m in models if m.get("id") or m.get("name")]
-                    )
-        except Exception as e:
-            _app.logger.warning(f"Failed to fetch SiliconFlow models: {e}")
-            result["siliconflow_error"] = str(e)
-
-    # 本地模型列表 (支持 OpenAI 兼容 / Open WebUI / Ollama)
-    local_url = _prov_base.get("local") or cfg.model.local_base_url
-    local_key = _prov_key.get("local") or cfg.model.local_api_key
-    if local_url:
-        try:
-            headers = {}
-            if local_key:
-                headers["Authorization"] = f"Bearer {local_key}"
-            base = local_url.rstrip("/").removesuffix("/v1").removesuffix("/api")
-            async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                # 尝试多种端点：OpenAI /v1/models → Open WebUI /api/models → Ollama /api/tags
-                models = []
-                for endpoint in [f"{base}/v1/models", f"{base}/api/models", f"{base}/api/tags"]:
-                    try:
-                        resp = await client.get(endpoint, headers=headers)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            # OpenAI 格式: {"data": [{"id": "..."}]}
-                            # Ollama 格式: {"models": [{"name": "..."}]}
-                            raw = data.get("data", data.get("models", []))
-                            models = [m.get("id", m.get("name", "")) for m in raw if m.get("id") or m.get("name")]
-                            if models:
-                                break
-                        elif resp.status_code == 401:
-                            result["local_error"] = "认证失败：请配置本地 API Key"
-                            break
-                    except Exception:
+            async with httpx.AsyncClient(timeout=15, verify=False) as client:
+                for ep in candidates:
+                    if ep in seen:
                         continue
-                if models:
-                    result["local"] = sorted(models)
-        except Exception as e:
-            _app.logger.warning(f"Failed to fetch local models: {e}")
-            result["local_error"] = str(e)
+                    seen.add(ep)
+                    try:
+                        resp = await client.get(ep, headers=headers)
+                    except Exception:  # noqa: BLE001 — 端点不通试下一个
+                        continue
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw = data.get("data", data.get("models", []))
+                        models = sorted(
+                            m.get("id", m.get("name", "")) for m in raw if m.get("id") or m.get("name")
+                        )
+                        if models:
+                            entry["models"] = models
+                            return entry
+                    elif resp.status_code in (401, 403):
+                        entry["error"] = "认证失败：请检查 API Key"
+                        return entry
+                if not entry["models"] and "error" not in entry:
+                    entry["error"] = "未返回模型列表"
+        except Exception as e:  # noqa: BLE001
+            entry["error"] = str(e)
+        return entry
 
+    # 并发拉所有 provider
+    tasks = [
+        _fetch_one(
+            getattr(p, "id", ""),
+            getattr(p, "label", "") or getattr(p, "id", ""),
+            getattr(p, "kind", "cloud"),
+            getattr(p, "base_url", "") or "",
+            getattr(p, "api_key", "") or "",
+        )
+        for p in providers
+        if getattr(p, "id", "")
+    ]
+    fetched = await asyncio.gather(*tasks, return_exceptions=True)
+
+    by_provider: dict[str, dict] = {}
+    for p, res in zip([pp for pp in providers if getattr(pp, "id", "")], fetched):
+        pid = getattr(p, "id", "")
+        if isinstance(res, Exception):
+            by_provider[pid] = {"label": getattr(p, "label", "") or pid,
+                                "kind": getattr(p, "kind", "cloud"),
+                                "models": [], "error": str(res)}
+        else:
+            by_provider[pid] = res
+
+    # 向后兼容：保留 siliconflow / local 扁平字段（旧前端仍读）
+    result: dict[str, Any] = {"by_provider": by_provider}
+    for compat_id in ("siliconflow", "local"):
+        ent = by_provider.get(compat_id)
+        if ent is not None:
+            result[compat_id] = ent.get("models", [])
+            if ent.get("error"):
+                result[f"{compat_id}_error"] = ent["error"]
+        else:
+            result[compat_id] = []
     return result
 
 

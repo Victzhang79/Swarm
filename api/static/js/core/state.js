@@ -98,7 +98,7 @@ let eventSource = null;
 
 let originalConfig = {};
 
-let modelLists = { siliconflow: [], local: [] };
+let modelLists = { siliconflow: [], local: [], byProvider: {}, all: [] };
 
 let projects = [];
 

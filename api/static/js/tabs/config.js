@@ -43,15 +43,32 @@ async function fetchModels() {
     const resp = await fetch('/api/models');
     if (!resp.ok) return;
     const data = await resp.json();
-    modelLists.siliconflow = data.siliconflow || [];
-    modelLists.local = data.local || [];
-    populateModelSelect('cfg-brain-model', 'cfg-brain-model-wrapper', modelLists.siliconflow, modelLists.local, originalConfig.siliconflow_api_key, originalConfig.local_api_key, originalConfig.brain_primary);
-    populateModelSelect('cfg-brain-fallback', 'cfg-brain-fallback-wrapper', modelLists.siliconflow, modelLists.local, originalConfig.siliconflow_api_key, originalConfig.local_api_key, originalConfig.brain_fallback);
+    // 新结构 by_provider: {<id>:{label,kind,models,error}}；回退旧 siliconflow/local。
+    const byProvider = data.by_provider || {};
+    if (Object.keys(byProvider).length) {
+      modelLists.byProvider = byProvider;
+      // 汇总所有模型（供 includes 校验等），并保留 siliconflow/local 兼容引用
+      modelLists.all = [];
+      Object.values(byProvider).forEach(p => { modelLists.all.push(...(p.models || [])); });
+      modelLists.siliconflow = (byProvider.siliconflow && byProvider.siliconflow.models) || data.siliconflow || [];
+      modelLists.local = (byProvider.local && byProvider.local.models) || data.local || [];
+    } else {
+      // 旧结构兼容
+      modelLists.byProvider = {
+        siliconflow: { label: 'SiliconFlow', kind: 'cloud', models: data.siliconflow || [] },
+        local: { label: '本地', kind: 'local', models: data.local || [] },
+      };
+      modelLists.siliconflow = data.siliconflow || [];
+      modelLists.local = data.local || [];
+      modelLists.all = [...modelLists.siliconflow, ...modelLists.local];
+    }
+    populateModelSelect('cfg-brain-model', 'cfg-brain-model-wrapper', modelLists.byProvider, originalConfig.brain_primary);
+    populateModelSelect('cfg-brain-fallback', 'cfg-brain-fallback-wrapper', modelLists.byProvider, originalConfig.brain_fallback);
   } catch { /* ignore */ }
   finally { if (btn) btn.disabled = false; }
 }
 
-function populateModelSelect(selectId, wrapperId, sfModels, localModels, hasSfKey, hasLocalKey, currentValue) {
+function populateModelSelect(selectId, wrapperId, byProvider, currentValue) {
   const sel = $(selectId);
   if (!sel) return;
   sel.innerHTML = '';
@@ -67,8 +84,10 @@ function populateModelSelect(selectId, wrapperId, sfModels, localModels, hasSfKe
     });
     sel.appendChild(grp);
   };
-  if (sfModels.length) addGroup('SiliconFlow', sfModels);
-  if (localModels.length) addGroup('本地', localModels);
+  // 遍历所有已配接入点，每个 provider 一个分组（云端在前，本地在后，便于查找）
+  const entries = Object.entries(byProvider || {});
+  entries.sort((a, b) => (a[1].kind === 'local' ? 1 : 0) - (b[1].kind === 'local' ? 1 : 0));
+  entries.forEach(([, p]) => addGroup(p.label || '接入点', p.models || []));
   if (!sel.options.length) {
     sel.innerHTML = '<option value="">请先配置 API Key 并刷新</option>';
   }
@@ -159,9 +178,12 @@ function buildModelOptions(current) {
     });
     opts.push('</optgroup>');
   };
-  addGroup('SiliconFlow 云端', modelLists.siliconflow);
-  addGroup('本地', modelLists.local);
-  if (current && !modelLists.siliconflow.includes(current) && !modelLists.local.includes(current)) {
+  // 遍历所有已配接入点（云端在前，本地在后）
+  const entries = Object.entries(modelLists.byProvider || {});
+  entries.sort((a, b) => (a[1].kind === 'local' ? 1 : 0) - (b[1].kind === 'local' ? 1 : 0));
+  entries.forEach(([, p]) => addGroup(p.label || '接入点', p.models || []));
+  const allModels = modelLists.all || [...(modelLists.siliconflow || []), ...(modelLists.local || [])];
+  if (current && !allModels.includes(current)) {
     opts.push(`<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (当前)</option>`);
   }
   if (!opts.length) {
