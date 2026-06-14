@@ -53,7 +53,7 @@ from swarm.brain.planning_nodes import (
     tech_design,
 )
 from swarm.brain.ingest_node import ingest
-from swarm.brain.state import BrainState
+from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.types import Complexity, HumanDecision
 
@@ -131,7 +131,7 @@ def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
     """
     plan_valid = state.get("plan_valid", False)
     retry_count = state.get("plan_retry_count", 0)
-    complexity = state.get("complexity", Complexity.MEDIUM)
+    complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先，避免漏 ultra 确认闸门
 
     if not plan_valid and retry_count < MAX_PLAN_RETRY:
         logger.info(f"[ROUTE] VALIDATE → PLAN (重试 {retry_count + 1}/{MAX_PLAN_RETRY})")

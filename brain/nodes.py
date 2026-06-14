@@ -41,7 +41,7 @@ from swarm.brain.prompts import (
     VERIFY_L3_SYSTEM,
     VERIFY_L3_USER,
 )
-from swarm.brain.state import BrainState
+from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.memory.sliding_window import PRIORITY_WORKER
 from swarm.models.router import ModelRouter
@@ -791,7 +791,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": struct_result.issues,
         }
 
-    if state.get("complexity") == Complexity.SIMPLE:
+    if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
         logger.info("[VALIDATE_PLAN] SIMPLE 快速路径 — 结构验证通过")
         return {
             "plan_valid": True,
@@ -1288,7 +1288,7 @@ async def handle_failure(state: BrainState) -> dict:
             "verification_failure": None,
         }
 
-    if state.get("complexity") == Complexity.SIMPLE:
+    if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
         # 确定性重试上限（与复杂路径一致，防止 SIMPLE 任务无限重试死循环）。
         # 历史 bug：SIMPLE 分支原先无条件 retry，遇到"L1 通过但 diff 收集为空"
         # (如重试时本地文件已被上一轮改过→difflib 基线已含变更→diff=空→被判失败)
@@ -1780,7 +1780,7 @@ async def verify_l2(state: BrainState) -> dict:
 
     logger.info("[VERIFY_L2] 执行集成验证")
 
-    complexity = state.get("complexity", Complexity.MEDIUM)
+    complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
     if complexity == Complexity.SIMPLE:
         merged = (merged_diff or "").strip()
         l2_passed = _diff_has_changes(merged)
@@ -1885,7 +1885,7 @@ async def verify_l3(state: BrainState) -> dict:
     输入: merged_diff, complexity, task_description
     输出: l3_passed, l3_skipped, l3_message
     """
-    complexity = state.get("complexity", Complexity.MEDIUM)
+    complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先，避免漏跑 L3
     merged_diff = (state.get("merged_diff") or "").strip()
     task_description = state.get("task_description", "")
 
@@ -2139,7 +2139,7 @@ async def learn_success(state: BrainState) -> dict:
     task_description = state.get("task_description", "")
     plan_obj = state.get("plan")
     merged_diff = state.get("merged_diff", "")
-    complexity = state.get("complexity", Complexity.MEDIUM)
+    complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
 
     logger.info("[LEARN_SUCCESS] 提炼成功模式")
 

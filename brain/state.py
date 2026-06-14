@@ -115,3 +115,20 @@ class BrainState(TypedDict, total=False):
     ingest_done: bool                   # 摄取是否已完成（幂等：避免重复摄取）
     ingest_errors: list[str]            # 摄取过程中的非致命错误（单文件失败等）
     auto_confirm_vision: bool           # 用户勾选「模型自行确认」→ 跳过图片理解的人工确认（B.2）
+
+
+# ─────────────────────────────────────────────────────────────
+# 复杂度真值入口（单一来源，杜绝散落读法导致的分歧）
+# ─────────────────────────────────────────────────────────────
+def effective_complexity(state: BrainState) -> Complexity:
+    """复杂度的唯一真值入口：澄清后定级(assess) 优先，回退 analyze 初判，再兜底 MEDIUM。
+
+    背景（修复 12.3）：`complexity` 由 analyze 节点写入（初评），`assessed_complexity`
+    由 clarify→assess 节点在澄清后重新定级写入。若任务在澄清后才升/降级，所有"读初评
+    complexity"的路由/跳过逻辑都会基于过期判断 —— 典型后果是澄清后升到 ultra 的任务
+    漏掉 CONFIRM 人工确认闸门，或仍走 SIMPLE 快速路径跳过校验/集成验证。
+
+    所有需要"当前生效复杂度"的判断点都应调用本函数，而非各自 `state.get(...)`，
+    以保证语义一致、避免未来新增节点再次踩坑。
+    """
+    return state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
