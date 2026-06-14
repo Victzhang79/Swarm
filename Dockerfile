@@ -32,28 +32,36 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8420
 
-WORKDIR /app
+# ⚠️ 关键：工作目录绝不能是含 swarm 源码（尤其 types.py）的目录。
+# 否则 `python -m uvicorn` 会把 cwd 放进 sys.path[0]，本仓库的 swarm/types.py
+# 会遮蔽 Python 标准库 types 模块 → stdlib enum.py 的 `from types import MappingProxyType`
+# 触发循环导入 → 容器无限重启（本机 editable+包内导入不暴露，容器才炸）。
+# swarm 已 pip install 进 site-packages，运行时无需源码根在 path 里；静态资源(WebUI)
+# 已随包 package-data 打包。故用独立空工作目录 /srv。
+WORKDIR /srv
 
-# 运行时系统依赖：curl 用于 healthcheck；git 供 worker 在沙箱外的本地操作（difflib 兜底，但保留）
+# 运行时系统依赖：curl 用于 healthcheck；git 供 worker 本地操作
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# 拷贝已安装的依赖 + swarm 包
+# 拷贝已安装的依赖 + swarm 包（含打包进去的 WebUI 静态资源）
 COPY --from=builder /install /usr/local
-# 拷贝源码（静态资源 WebUI、scripts 等运行时需要的非包文件）
-COPY . /app
+
+# 运行时辅助脚本（init_db 等）放到不在 sys.path 顶层的位置，按需调用；
+# 不放进 cwd，避免任何源码文件（types.py 等）遮蔽标准库。
+COPY scripts /opt/swarm/scripts
 
 # 非 root 运行
-RUN useradd -m -u 10001 swarm && chown -R swarm:swarm /app
+RUN useradd -m -u 10001 swarm && chown -R swarm:swarm /srv /opt/swarm
 USER swarm
 
 EXPOSE 8420
 
-# 健康检查：/api/health（公开端点，不需鉴权）
-HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
+# 健康检查：/api/health（公开端点，不需鉴权）。start-period 给足首启建表时间。
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=6 \
     CMD curl -fsS http://localhost:8420/api/health || exit 1
 
-# 启动：uvicorn 起 API；app.py on_startup 钩子幂等建全部表（与 init_db 一致），
-# 故无需单独 init_db step。沙箱池开关由 env 控制。
+# 启动：uvicorn 起 API（从 site-packages 加载 swarm 包，cwd=/srv 无源码遮蔽）；
+# app.py on_startup 钩子幂等建全部表（与 init_db 一致），无需单独 init_db step。
 CMD ["python", "-m", "uvicorn", "swarm.api.app:app", "--host", "0.0.0.0", "--port", "8420"]
