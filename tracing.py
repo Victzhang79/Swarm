@@ -25,6 +25,11 @@ PHASE_0 = "phase-0"  # Worker 直跑
 PHASE_1 = "phase-1"  # Brain 任务链路
 PHASE_2 = "phase-2"  # 知识库 / 预处理
 
+# P0-2：Brain LangGraph 递归预算（节点访问次数上限）。默认 25 不够（见 task 0f93f1fc
+# GRAPH_RECURSION_LIMIT 崩溃）；50 给规划循环+多子任务派发+replan 重入留足余量。
+# 可通过环境变量 SWARM_BRAIN_RECURSION_LIMIT 覆盖。
+BRAIN_RECURSION_LIMIT = int(os.environ.get("SWARM_BRAIN_RECURSION_LIMIT", "50"))
+
 
 def is_langsmith_active() -> bool:
     """当前进程是否已向 LangChain 注入 tracing 环境变量。"""
@@ -243,7 +248,16 @@ def brain_graph_config(
     description: str = "",
 ) -> dict[str, Any]:
     """Phase 1 — Brain LangGraph 根 run（create_task / approve resume）。"""
-    base: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    # P0-2 修复：显式设 recursion_limit。LangGraph 默认 25 对 Brain 状态机不够——
+    # 规划循环(PLAN→ELABORATE→VALIDATE 重试) + 多子任务 DISPATCH→MONITOR 往返 +
+    # HANDLE_FAILURE→replan 重入，累计极易撞穿 25 导致 GRAPH_RECURSION_LIMIT 硬崩
+    # （见 task 0f93f1fc）。50 给规划/派发/重规划留足往返余量；真死循环由
+    # 规划失败熔断(plan_validator 重试上限 + replan 携带失败原因)提前 fail-fast 拦截，
+    # 而非依赖 recursion limit 兜底。
+    base: dict[str, Any] = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": BRAIN_RECURSION_LIMIT,
+    }
     if not is_langsmith_active():
         return base
 

@@ -88,10 +88,12 @@ def _format_numbered_lines(
     e = total if end_line == -1 else min(end_line, total)
     selected = lines[s:e]
     # 防 ReAct 上下文爆炸：单次 read 输出硬上限(行数 + 字节)。RuoYi 等企业项目
-    # 有几千行的巨型文件(ExcelUtil 等)，无界返回会把工具结果累积进 message 历史
-    # 撑爆模型上下文(实测 MiniMax 196k 上限被一次性顶穿)。超限截断并提示用行号分段读。
-    _MAX_LINES = 450
-    _MAX_CHARS = 32000
+    # 有几千行的巨型文件(ExcelUtil/StringUtils 等)，无界返回会把工具结果累积进 message
+    # 历史撑爆模型上下文。实测 Qwen3.5-122B(65536 窗口)改 877 行 StringUtils 时，450 行
+    # 一次读≈6-9K token，多读两次+历史累积就超 65536 → 400 报错 → 子任务死循环。
+    # 收紧到 150 行/8K 字符：单次读≈2-3K token，强制小模型用 start_line/end_line 局部读。
+    _MAX_LINES = 150
+    _MAX_CHARS = 8000
     truncated_note = ""
     if len(selected) > _MAX_LINES:
         shown_end = s + _MAX_LINES

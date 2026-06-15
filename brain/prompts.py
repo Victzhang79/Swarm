@@ -8,10 +8,17 @@ from __future__ import annotations
 ANALYZE_SYSTEM = """你是一个任务分析专家。你需要分析用户提交的编程任务，判断其复杂度等级。
 
 复杂度等级定义:
-- simple:  改配置/加字段/小修复 → 单个 Worker 即可完成
-- medium:  单模块功能开发 → 需要 2-3 个 Worker 串行协作
+- simple:  改配置/加字段/小修复，且【仅改动单个已存在文件、不新建文件、不新增公共方法/类】→ 单个 Worker 即可完成
+- medium:  单模块功能开发，或【新建任意文件/类、新增公共方法、改动涉及 2 个及以上文件】→ 需要 2-3 个 Worker 串行协作
 - complex: 跨模块 Feature → 需要多个 Worker 并行协作
 - ultra:   架构变更/重大重构 → 需要先出方案让人工确认后再执行
+
+判级铁律：
+1. 任务【新建文件或新建类】→ 至少 medium（哪怕只是个工具类）。
+2. 任务涉及【2 个及以上文件】或【一处定义+另一处调用】→ 至少 medium。
+3. "加注释/补 JavaDoc/改 typo" 只有在【纯粹单文件、不新增任何方法或类】时才算 simple；
+   一旦同时要求新增方法/新建类/跨文件，注释只是附带要求，不能据此判 simple。
+4. 拿不准时【就高不就低】——宁可 medium 多拆子任务，也不要误判 simple 漏掉拆解。
 
 请根据任务描述和项目上下文，输出 JSON 格式的分析结果。"""
 
@@ -156,7 +163,7 @@ PLAN_USER = """## 任务描述
       "harness": {{
         "language": "python",
         "setup_commands": ["pip install -r requirements.txt"],
-        "build_command": "python -m py_compile .",
+        "build_command": "python -m compileall -q .",
         "test_command": "python -m pytest -q",
         "verify_commands": ["python -c \\"import mymod; assert mymod.f()\\""],
         "extra_whitelist": ["python", "python -m", "python -c", "pytest"]

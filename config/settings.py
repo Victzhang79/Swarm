@@ -121,6 +121,11 @@ class ModelConfig(BaseSettings):
     worker_temperature: float = 0.2
     max_retries: int = 2
     timeout_seconds: int = 120
+    # worker 单次响应输出上限（token）。防止 worker 改大文件时全文重写输出撑爆 context
+    # （实测 Qwen3.5-122B 改 877 行 StringUtils 时输出 38086 token，叠加输入 27451 超 65536
+    # 上下文上限 → 400 报错 → 子任务失败）。worker 应用 patch_file 做最小改动，输出本不该
+    # 这么大；限上限既强制增量编辑、又留 fallback 接管空间。0 表示不限制（向后兼容）。
+    worker_max_tokens: int = 8192
     # 流式无 chunk 看门狗：两次 parsed chunk 间隔超此秒数即中断，触发 fallback。
     # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
     stream_chunk_timeout: float = 45.0
@@ -322,9 +327,11 @@ class SandboxConfig(BaseSettings):
     sandbox_health_retries: int = 2
     sandbox_fail_threshold: int = 5
     # 项目级定制沙箱（docs/Project_Scoped_Sandbox_Design.md）：
-    # 预处理时按项目真实环境构建专属沙箱镜像，executor 优先用 project.config.sandbox_template。
-    # 默认 False（灰度试点，先 ruoyi-e2e 验证），需沙箱机 SSH 凭据在 secret_store。
-    project_scoped_enabled: bool = False
+    # 预处理时按项目真实环境构建专属沙箱镜像（方案 B：自带完整源码），executor 优先用
+    # project.config.sandbox_template。默认 True（通用主流程：所有有构建文件的项目都精准
+    # 构建专属沙箱）。需沙箱机 SSH 凭据在 secret_store；无凭据/构建失败自动回退通用池。
+    # 设 False 可全局关闭，所有项目用旧通用池。
+    project_scoped_enabled: bool = True
     # 启动时清扫"残留孤儿沙箱"（12.2）。默认 True 保持单机部署行为（启动这一刻远端
     # 任何存活沙箱都是上一进程残留，安全清扫）。⚠️ 共享 CubeSandbox 集群部署务必设
     # False：本实例无差别 kill 服务器上所有沙箱会误杀其他实例/用户的沙箱。

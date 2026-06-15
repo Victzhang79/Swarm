@@ -18,6 +18,38 @@ from swarm.types import FileScope, KnowledgeContext, SubTask
 from swarm.worker.prompts import build_worker_prompt
 
 
+def _make_pre_model_hook(max_input_tokens: int):
+    """生成 create_react_agent 的 pre_model_hook：每次调 LLM 前裁剪历史 messages，
+    防止 ReAct 多轮工具调用的历史(read_file 结果/reasoning/tool 输出)无限累积撞穿
+    模型上下文窗口(实测 Qwen3.5-122B 65536 窗口被累积到 57345 输入 → 400 报错 → 子任务死循环)。
+
+    用 LangChain trim_messages 保留最近的 message(strategy="last")，按 token 预算裁剪，
+    但始终保留 system prompt(include_system=True)。裁剪结果写入 llm_input_messages —— 只影响
+    传给 LLM 的输入，不改持久 state(工具结果仍在 state 里供 diff 采集)。
+    """
+    from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+
+    def _hook(state: dict) -> dict:
+        msgs = state.get("messages", [])
+        if not msgs:
+            return {}
+        try:
+            trimmed = trim_messages(
+                msgs,
+                max_tokens=max_input_tokens,
+                token_counter=count_tokens_approximately,
+                strategy="last",          # 保留最近的(当前任务上下文最相关)
+                include_system=True,      # 始终保留 system prompt
+                start_on="human",         # 裁剪后首条非 system 必须是 human(满足 API 要求)
+                allow_partial=False,
+            )
+            return {"llm_input_messages": trimmed}
+        except Exception:  # noqa: BLE001 — 裁剪失败不应让子任务崩，退回原 messages
+            return {}
+
+    return _hook
+
+
 def _get_worker_tools() -> list[BaseTool]:
     """获取 Worker 可用的所有 Tool 列表"""
     return [
@@ -90,10 +122,19 @@ def create_worker_agent(
     )
 
     # 创建 ReAct Agent
+    # pre_model_hook：每次调 LLM 前裁剪历史 messages，防 ReAct 多轮累积撞穿上下文窗口。
+    # 预算 = worker 上下文预算(min(模型窗口×0.75,150k))再留余量给输出+system，取 0.7。
+    # 复用 planning_nodes._context_budget()(已按真实模型窗口算)，保持单一事实源。
+    try:
+        from swarm.brain.planning_nodes import _context_budget
+        _budget = int(_context_budget() * 0.7)
+    except Exception:  # noqa: BLE001
+        _budget = 40000
     agent = create_react_agent(
         model=llm,
         tools=tools,
         prompt=system_prompt,
+        pre_model_hook=_make_pre_model_hook(_budget),
     )
 
     return {

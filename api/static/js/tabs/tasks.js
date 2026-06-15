@@ -231,8 +231,12 @@ async function viewTaskLogs(taskId) {
     es.addEventListener('end', () => {
       liveEl.textContent = '— 已结束';
       liveEl.style.color = 'var(--text-muted,#888)';
-      if (!gotAny) body.textContent = '暂无该任务日志。';
       _closeTaskLogsStream();
+      // 终态任务：SSE 仅吐末尾窗口内的实时增量，历史日志（已被新日志挤出
+      // tail 窗口 / 滚动到 backup）SSE 吐不出 → 正常 end 但 gotAny=false。
+      // 必须回退到一次性 /logs 拉取（后端有全量+轮转 backup 回退），否则历史
+      // 终态任务永远显示"暂无日志"。此前只在 onerror 回退，end 路径漏了。
+      if (!gotAny) fetchTaskLogsOnce(taskId, body);
     });
     es.onerror = () => {
       // 连接错误：若尚无数据，回退一次性拉取

@@ -584,12 +584,57 @@ async def elaborate(state: BrainState) -> dict:
                     new_subtasks[idx:idx + 1] = children
                     changed = True
                     logger.info("[ELABORATE] 子任务 %s 二次拆分为 %d 个", st.id, len(children))
+                    # P0-1 修复：二次拆分替换了节点，但其它子任务可能仍 depends_on 旧 id
+                    # （如 st-2 depends_on st-1，st-1 被拆成 st-1-1/st-1-2 后 st-1 已不存在）。
+                    # 必须把所有指向旧 id 的下游依赖重映射到子链尾节点（children[-1]），
+                    # 否则 VALIDATE_PLAN 结构校验必报"依赖未知任务"，陷入规划死循环。
+                    # 选尾节点：子链内部已串行（见 _resplit_subtask），尾节点完成 ⇒ 全链完成，
+                    # 语义最简且不破坏依赖驱动调度的并行度判定。
+                    remapped = _remap_dependents(new_subtasks, st.id, children[-1].id)
+                    if remapped:
+                        logger.info(
+                            "[ELABORATE] 重映射 %d 条下游依赖: %s → %s（避免悬空依赖）",
+                            remapped, st.id, children[-1].id,
+                        )
         if not changed:
             break  # LLM 拆不动了，避免空转
         plan_obj = _rebuild_plan(plan_obj, new_subtasks)
 
     # ── I6：剥离 LLM 误加的假 depends_on，提升 dispatch 并行度 ──
+    # 注意顺序：decouple 必须在 normalize【之前】跑。decouple 用"文件重叠"判真假依赖，
+    # 需要看到子任务【归一前】的原始写意图（task 0f93f1fc 真实场景：st-2 readable
+    # st-1 产出的 NumberUtils.java 是真依赖）。若 normalize 先跑把 st-1 子链尾节点的
+    # 写权降级，decouple 会误判 st-2 与尾节点"零文件重叠"而错误剥离真依赖。
     decoupled = _decouple_independent_subtasks(plan_obj)
+
+    # ── P1-1：scope 归一（同文件写权唯一 + 降级者依赖首写者，Bug-3 防并发写冲突）──
+    # 放在 decouple 之后。Bug-3 的并发安全由 normalize 的"降级者依赖首写者"独立保证，
+    # 不依赖与 decouple 的相对顺序——normalize 加的 st-1-1→st-1-2 依赖因两者文件重叠
+    # 不会被（已跑完的）decouple 剥离。
+    from swarm.brain.contract_utils import enrich_java_package_readable, normalize_plan_scopes
+    scope_normalized = normalize_plan_scopes(plan_obj)
+
+    # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
+    _proj_path = None
+    try:
+        from swarm.project import store as _store
+        _pid = state.get("project_id") or ""
+        if _pid:
+            _proj = _store.get_project(_pid)
+            _proj_path = _proj.get("path") if _proj else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[ELABORATE] 获取 project_path 失败，跳过 Java 同包入域: %s", exc)
+    java_enriched = enrich_java_package_readable(plan_obj, _proj_path)
+    if java_enriched:
+        logger.info("[ELABORATE] P2-1: 已将 Java 同 package 类纳入相关子任务 readable")
+
+    # ── Bug-1 根治：plan 成型后全局悬空依赖兜底（单一收口点）──
+    # 二次拆分 + 多轮 replan 可能残留指向不存在子任务的 depends_on，
+    # _remap_dependents 只兜单次 resplit 映射，这里收口所有路径，杜绝
+    # VALIDATE_PLAN 结构校验 "依赖未知任务" 死循环（task 0f93f1fc 实证）。
+    dangling_fixed = _prune_dangling_dependencies(plan_obj.subtasks)
+    if dangling_fixed:
+        logger.info("[ELABORATE] 悬空依赖兜底：修正 %d 个子任务的 depends_on", dangling_fixed)
 
     # 最终检查：仍超预算/缺验收的标记出来（人工介入信号）
     oversized: list[str] = []
@@ -633,14 +678,29 @@ async def elaborate(state: BrainState) -> dict:
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
     }
-    if resplit_rounds > 0 or decoupled > 0:
-        # 拆分或剥离假依赖改变了 plan，回写
+    if resplit_rounds > 0 or decoupled > 0 or scope_normalized or java_enriched or dangling_fixed:
+        # 拆分 / 剥离假依赖 / scope 归一 / Java 同包入域 / 悬空依赖兜底改变了 plan，回写
         out["plan"] = plan_obj
     return out
 
 
 def _needs_resplit(st, budget: int) -> bool:
-    """子任务是否需二次拆分：超上下文预算（INVEST 缺验收不强制拆，仅标记）。"""
+    """子任务是否需二次拆分：超上下文预算（INVEST 缺验收不强制拆，仅标记）。
+
+    关键守卫：若子任务只改【单个文件】(writable≤1)，绝不二次拆分——拆了也只能让
+    多个子任务都改同一文件，各自产出针对同一文件的 diff，MERGE 时行号冲突拼成
+    损坏 patch(git apply --check failed)，契约符号永远落不了地、任务无法闭环
+    (实测 task 8c9782b4：单文件任务拆 4 子任务 → merged_diff 5399字符是坏 patch →
+    apply 失败 → defaultIfEmpty 方法没落地)。单文件超预算靠 worker 的 pre_model_hook
+    历史裁剪在单子任务内消化，而非拆分。
+    """
+    scope = getattr(st, "scope", None)
+    n_writable = len(getattr(scope, "writable", []) or []) if scope else 0
+    n_create = len(getattr(scope, "create_files", []) or []) if scope else 0
+    # 单文件修改(恰好1个writable、0个新建)不拆：拆了多个子任务改同一文件→diff冲突坏 patch。
+    # 注意 0 文件(greenfield/scope未明)不在此守卫内——仍按预算判，可拆。
+    if n_writable == 1 and n_create == 0:
+        return False
     est = getattr(st, "est_context_tokens", 0) or 0
     return est > budget
 
@@ -661,6 +721,7 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                 est=est,
                 budget=budget,
                 files=", ".join(getattr(getattr(st, "scope", None), "writable", []) or []) or "（无）",
+                readables=", ".join(getattr(getattr(st, "scope", None), "readable", []) or []) or "（无）",
             )},
         ])
         result = _parse_json_from_llm(resp.content)
@@ -669,13 +730,29 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
             return [st]
         children = []
         base_scope = getattr(st, "scope", None) or FileScope(writable=[], readable=[])
+        _parent_w = set(getattr(base_scope, "writable", []) or [])
+        _parent_r = set(getattr(base_scope, "readable", []) or [])
         for i, s in enumerate(subs[:4]):
+            # 修复别名 bug：每个子节点必须用【独立深拷贝】的 scope，绝不能共享同一
+            # base_scope 对象。否则 normalize_plan_scopes 原地改 scope.create_files
+            # 时会污染所有兄弟节点（同一引用），导致 scope 错乱变空 → Worker 无写权
+            # 创建文件（task 39f7be5a 现场：子任务 writable/create_files 全空）。
+            child_scope = base_scope.model_copy(deep=True)
+            # P0-1 修复：按 LLM 给的 writable_files/readable_files 收窄子任务 scope，
+            # 不再全量继承父 scope（否则每个子任务都面对整个大文件 → 输入累积撞上下文上限）。
+            # 取与父 scope 的【交集】防越权；LLM 没给或给空时回退父 scope（保守不阻断）。
+            _cw = [f for f in (s.get("writable_files") or []) if f in _parent_w]
+            _cr = [f for f in (s.get("readable_files") or []) if f in (_parent_r | _parent_w)]
+            if _cw:
+                child_scope.writable = _cw
+            if _cr:
+                child_scope.readable = _cr
             children.append(SubTask(
                 id=f"{st.id}-{i + 1}",
                 description=s.get("description", "")[:500],
                 difficulty=getattr(st, "difficulty", SubTaskDifficulty.MEDIUM),
                 modality=getattr(st, "modality", SubTaskModality.TEXT),
-                scope=base_scope,
+                scope=child_scope,
                 depends_on=list(getattr(st, "depends_on", []) or []) + (
                     [f"{st.id}-{i}"] if i > 0 else []  # 子任务间默认串行(保守，避免同 scope 并行写冲突)
                 ),
@@ -686,6 +763,98 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ELABORATE] 子任务 %s 二次拆分失败，保留原样: %s", getattr(st, "id", "?"), exc)
         return [st]
+
+
+def _remap_dependents(subtasks: list, old_id: str, new_id: str) -> int:
+    """把所有子任务 depends_on 中指向 old_id 的项重映射到 new_id（原地修改）。
+
+    用于 ELABORATE 二次拆分后修复悬空依赖：st-1 被拆成 st-1-1/st-1-2 后，
+    原先 depends_on=[st-1] 的下游 st-2 需改为 depends_on=[st-1-2]（子链尾节点）。
+
+    跳过被拆出的子节点自身（它们 id 以 old_id 为前缀，内部串行已由
+    _resplit_subtask 建好，不应再被重映射到自己的尾节点造成自依赖/环）。
+
+    返回重映射的依赖条数（去重后按"涉及的子任务数"计，便于日志可读）。
+    """
+    remapped = 0
+    child_prefix = f"{old_id}-"
+    for st in subtasks:
+        sid = getattr(st, "id", "")
+        # 被拆出的子节点自身不参与重映射（避免 st-1-2 depends_on st-1 → 自指）
+        if sid == new_id or sid.startswith(child_prefix):
+            continue
+        deps = list(getattr(st, "depends_on", []) or [])
+        if old_id not in deps:
+            continue
+        # 替换 old_id → new_id，并去重（防止已存在 new_id 造成重复）
+        rewritten = []
+        seen = set()
+        for d in deps:
+            target = new_id if d == old_id else d
+            if target not in seen:
+                seen.add(target)
+                rewritten.append(target)
+        st.depends_on = rewritten
+        remapped += 1
+    return remapped
+
+
+def _prune_dangling_dependencies(subtasks: list) -> int:
+    """全局悬空依赖兜底清理：把任何指向【不存在子任务】的 depends_on 修正。
+
+    Bug-1 根治（task 0f93f1fc 实证）：ELABORATE 二次拆分 + 多轮 replan 后，
+    下游子任务的 depends_on 可能残留指向已不存在的旧 id（如 st-1 被拆成
+    st-1-1/st-1-2 后某轮 replan 又重置，st-2 仍 depends_on 旧 "st-1" 或旧
+    "st-1-2"）。_remap_dependents 只在单次 resplit 的 old→new 映射时生效，
+    兜不住跨轮累积的悬空依赖 → VALIDATE_PLAN 结构校验报 "依赖未知任务" 死循环。
+
+    本函数是 plan 成型后的【单一收口点】，对每个悬空 dep：
+      1. 若存在以该 dep 为前缀的现存子链（dep="st-1"，存在 st-1-1/st-1-2）→
+         重映射到该子链尾节点（id 最大者，语义=全链完成）。
+      2. 否则（无任何前缀匹配）→ 直接剥离该依赖（保守：宁可少一条依赖让其
+         并行，也不要悬空依赖卡死规划。剥离不影响正确性，最多并行度判定偏激进，
+         由 scope 归一 + worker 串行 reset 兜底）。
+    返回被修正的子任务数。
+    """
+    existing = {getattr(st, "id", "") for st in subtasks}
+    fixed = 0
+    for st in subtasks:
+        deps = list(getattr(st, "depends_on", []) or [])
+        if not deps:
+            continue
+        new_deps = []
+        seen = set()
+        changed = False
+        for d in deps:
+            if d in existing:
+                target = d
+            else:
+                # 悬空：找以 d 为前缀的现存子链尾节点
+                children = sorted(
+                    [e for e in existing if e.startswith(f"{d}-")]
+                )
+                if children:
+                    target = children[-1]
+                    changed = True
+                    logger.info(
+                        "[ELABORATE] 悬空依赖兜底: %s 的 depends_on %s → %s（子链尾节点）",
+                        getattr(st, "id", "?"), d, target,
+                    )
+                else:
+                    # 无前缀匹配 → 剥离
+                    changed = True
+                    logger.warning(
+                        "[ELABORATE] 悬空依赖剥离: %s 的 depends_on %s 指向不存在子任务，已移除",
+                        getattr(st, "id", "?"), d,
+                    )
+                    continue
+            if target not in seen and target != getattr(st, "id", ""):
+                seen.add(target)
+                new_deps.append(target)
+        if changed:
+            st.depends_on = new_deps
+            fixed += 1
+    return fixed
 
 
 def _rebuild_plan(plan_obj, new_subtasks):
@@ -702,10 +871,18 @@ RESPLIT_SYSTEM = """你是任务拆解专家。一个子任务预估执行上下
 说明它太大，本地小模型做不完会上下文爆炸。把它拆成 2-4 个更小的、各自上下文在预算内、\
 可独立验证的子任务。每个子任务必须单一职责、有明确验收标准。
 
+关键原则（防小模型上下文爆炸）：
+- 每个子任务只圈定它【真正需要改动】的最小文件子集（writable_files），从"涉及文件"里挑，绝不全量继承。
+- 若多个子任务都要改同一个大文件，说明拆分维度错了——应按【文件】或【独立功能点】拆，让每个子任务面对尽量少的文件，而不是让它们都盯着同一个大文件。
+- readable_files 只列该子任务真正要读的依赖文件，宁少勿多。
+
 严格输出 JSON：
 {{
   "subtasks": [
-    {{"description": "子任务描述", "acceptance_criteria": ["验收1"], "est_context_tokens": 数字}}
+    {{"description": "子任务描述", "acceptance_criteria": ["验收1"],
+      "writable_files": ["该子任务真正要改的文件(父scope子集)"],
+      "readable_files": ["该子任务真正要读的依赖文件"],
+      "est_context_tokens": 数字}}
   ]
 }}"""
 
@@ -713,9 +890,11 @@ RESPLIT_USER = """需二次拆分的子任务：
 {desc}
 
 预估上下文：{est} tokens（预算 {budget}）
-涉及文件：{files}
+可写文件(writable)：{files}
+可读文件(readable)：{readables}
 
-请拆成 2-4 个各自在预算内的子任务。"""
+请拆成 2-4 个各自在预算内的子任务。为每个子任务圈定最小必要的 writable_files/readable_files
+（从上面列表里挑子集），让每个子任务面对尽量少的文件。"""
 
 
 def _persist_planning_artifacts(state: BrainState) -> None:

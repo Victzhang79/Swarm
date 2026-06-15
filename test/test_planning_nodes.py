@@ -93,12 +93,13 @@ def test_review_reject_cap_forces_approve():
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
 
 
-def _real_sub(sid, est=0, acc=None):
+def _real_sub(sid, est=0, acc=None, deps=None, readable=None, writable=None):
     return SubTask(
         id=sid, description=f"task {sid}",
         difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
-        scope=FileScope(writable=[], readable=[]),
+        scope=FileScope(writable=writable or [], readable=readable or []),
         acceptance_criteria=acc or [], est_context_tokens=est,
+        depends_on=deps or [],
     )
 
 
@@ -144,6 +145,95 @@ def test_elaborate_invest_counts_missing_acceptance():
     print("  ✅ elaborate: 无验收标准计入 invest_fail")
 
 
+# ── P0-1: 二次拆分后下游依赖重映射（复现 task 0f93f1fc 规划死循环）──
+def test_remap_dependents_basic():
+    # st-1 拆成 st-1-1/st-1-2 后，st-2 depends_on st-1 应重映射到尾节点 st-1-2
+    subs = [_real_sub("st-1-1"), _real_sub("st-1-2", deps=["st-1-1"]),
+            _real_sub("st-2", deps=["st-1"])]
+    n = P._remap_dependents(subs, "st-1", "st-1-2")
+    assert n == 1, f"应重映射 1 个下游，实际 {n}"
+    st2 = next(s for s in subs if s.id == "st-2")
+    assert st2.depends_on == ["st-1-2"], f"st-2 依赖应重映射到 st-1-2，实际 {st2.depends_on}"
+    # 子链尾节点自身不被改（st-1-2 仍依赖 st-1-1，未被重映射成自指）
+    st12 = next(s for s in subs if s.id == "st-1-2")
+    assert st12.depends_on == ["st-1-1"], "子链内部串行不应被破坏"
+    print("  ✅ _remap_dependents: 下游依赖重映射到子链尾节点，子链内部串行保留")
+
+
+def test_remap_dependents_dedup():
+    # 下游已同时依赖 st-1 和 st-1-2 → 重映射后去重，不产生重复 st-1-2
+    subs = [_real_sub("st-1-2", deps=["st-1-1"]), _real_sub("st-3", deps=["st-1", "st-1-2"])]
+    P._remap_dependents(subs, "st-1", "st-1-2")
+    st3 = next(s for s in subs if s.id == "st-3")
+    assert st3.depends_on == ["st-1-2"], f"应去重为单个 st-1-2，实际 {st3.depends_on}"
+    print("  ✅ _remap_dependents: 重映射后去重")
+
+
+def test_needs_resplit_single_file_guard():
+    """单文件修改(恰好1个writable、0新建)绝不二次拆分——拆同一文件会 diff 冲突坏 patch
+    (task 8c9782b4 实证)。多文件/0文件(greenfield)仍按预算判。"""
+    budget = P._context_budget()
+    # 单文件超预算 → 守卫禁拆
+    single = _real_sub("s1", est=budget + 99_999, writable=["StringUtils.java"])
+    assert P._needs_resplit(single, budget) is False, "单文件超预算也不该拆"
+    # 多文件超预算 → 应拆
+    multi = _real_sub("s2", est=budget + 99_999, writable=["A.java", "B.java"])
+    assert P._needs_resplit(multi, budget) is True, "多文件超预算应拆"
+    # 0文件(greenfield)超预算 → 不受单文件守卫限制，按预算判应拆
+    green = _real_sub("s3", est=budget + 99_999, writable=[])
+    assert P._needs_resplit(green, budget) is True, "0文件超预算应可拆"
+    print("  ✅ _needs_resplit: 单文件禁拆/多文件可拆/greenfield可拆")
+
+
+def test_elaborate_resplit_no_dangling_dependency():
+    """端到端复现 task 0f93f1fc：st-1 超预算被二次拆分，st-2 depends_on st-1。
+    修复前 st-2 依赖悬空 → VALIDATE_PLAN 必报"依赖未知任务 st-1"陷入死循环。
+    修复后 st-2 应依赖子链尾节点，全图无悬空依赖。"""
+    budget = P._context_budget()
+
+    class _R:
+        content = ('{"subtasks":[{"description":"part A","acceptance_criteria":["a"],"est_context_tokens":40000},'
+                   '{"description":"part B","acceptance_criteria":["b"],"est_context_tokens":40000}]}')
+
+    class _L:
+        async def ainvoke(self, m): return _R()
+
+    _orig = P._get_brain_llm
+    P._get_brain_llm = lambda: _L()
+    try:
+        # st-1 产出 NumberUtils.java（writable），st-2 读它（readable）形成真实耦合，
+        # 避免被 _decouple_independent_subtasks 当假依赖剥离（还原 task 0f93f1fc 真实场景：
+        # st-2 的 StringUtils.isNumericStr 真依赖 st-1 产出的 NumberUtils 契约）。
+        # st-1 给【2 个 writable】触发二次拆分（单文件已被守卫禁拆——拆同一文件会 diff 冲突，
+        # 见 _needs_resplit 单文件守卫）；多文件拆分才是合法场景。
+        plan = TaskPlan(
+            subtasks=[
+                _real_sub("st-1", est=budget + 50_000, acc=["x"],
+                          writable=["NumberUtils.java", "MathUtils.java"]),
+                _real_sub("st-2", est=1000, acc=["y"], deps=["st-1"],
+                          readable=["NumberUtils.java"], writable=["StringUtils.java"]),
+            ],
+            parallel_groups=[["st-1"], ["st-2"]],
+        )
+        out = asyncio.run(P.elaborate({"plan": plan, "task_id": ""}))
+        new_plan = out.get("plan")
+        assert new_plan is not None, "二次拆分应回写 plan"
+        ids = {s.id for s in new_plan.subtasks}
+        # st-1 被拆成 st-1-1/st-1-2，原 st-1 不再存在
+        assert "st-1" not in ids, "拆分后 st-1 应被替换"
+        assert {"st-1-1", "st-1-2", "st-2"} <= ids, f"应含拆分子节点+st-2，实际 {ids}"
+        # 关键断言：全图无悬空依赖（所有 depends_on 目标都存在）
+        for s in new_plan.subtasks:
+            for d in (s.depends_on or []):
+                assert d in ids, f"悬空依赖: {s.id} depends_on 不存在的 {d}（修复失败）"
+        # st-2 应改依赖子链尾节点 st-1-2
+        st2 = next(s for s in new_plan.subtasks if s.id == "st-2")
+        assert "st-1-2" in st2.depends_on, f"st-2 应依赖尾节点 st-1-2，实际 {st2.depends_on}"
+        print("  ✅ elaborate: 二次拆分后下游依赖重映射，全图无悬空依赖（task 0f93f1fc 死循环已修复）")
+    finally:
+        P._get_brain_llm = _orig
+
+
 # ── 简易 LLM mock fixture（assess greenfield 用）──
 def monkeypatch_llm():
     """非 pytest 运行时的占位；pytest 下由下方 conftest 风格 fixture 注入。"""
@@ -161,6 +251,8 @@ if __name__ == "__main__":
         test_review_auto_approves, test_review_reject_cap_forces_approve,
         test_elaborate_resplits_oversized, test_elaborate_normal_no_resplit,
         test_elaborate_invest_counts_missing_acceptance,
+        test_remap_dependents_basic, test_remap_dependents_dedup,
+        test_elaborate_resplit_no_dangling_dependency,
     ]
     for t in tests:
         try:

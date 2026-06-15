@@ -207,10 +207,14 @@ def read_task_logs(task_id: str, *, limit: int = 500, tail_scan: int = 200_000) 
 
     - task_id: 完整 task_id，内部用前 8 位匹配（与 _ContextFilter 前缀一致）
     - limit: 最多返回的行数（取最新 limit 行）
-    - tail_scan: 只扫描文件末尾这么多字节，避免大日志全量读
+    - tail_scan: 先只扫主日志末尾这么多字节（快路径，避免大日志全量读）
 
     返回时间顺序（旧→新）的日志行列表；文件不存在或无匹配返回空列表。
     JSON 模式下匹配 "task_id": "<完整id>"。
+
+    修复"done 任务查不到日志"：任务跑完后新日志不断写入，旧任务日志会被推出 tail_scan
+    窗口 + 被 RotatingFileHandler 滚动到 .1/.2 备份文件。因此：快路径（主日志尾部）未命中时，
+    自动回退扫描【主日志全文件 + 所有轮转 backup（swarm.log.1/.2...）】，确保历史任务可查。
     """
     path = resolve_log_path()
     if not path or not path.exists():
@@ -222,19 +226,40 @@ def read_task_logs(task_id: str, *, limit: int = 500, tail_scan: int = 200_000) 
     text_marker = f"[task={short}"      # 文本格式前缀
     json_marker = f'"task_id": "{task_id}"'  # JSON 格式字段
 
-    matched: list[str] = []
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            if size > tail_scan:
-                f.seek(size - tail_scan)
-                f.readline()  # 丢弃可能被截断的半行
-            chunk = f.read().decode("utf-8", errors="replace")
-        for line in chunk.splitlines():
-            if text_marker in line or json_marker in line:
-                matched.append(line)
-    except OSError:
-        return []
+    def _scan_file(p, *, tail: int | None) -> list[str]:
+        out: list[str] = []
+        try:
+            size = p.stat().st_size
+            with open(p, "rb") as f:
+                if tail is not None and size > tail:
+                    f.seek(size - tail)
+                    f.readline()  # 丢弃可能被截断的半行
+                chunk = f.read().decode("utf-8", errors="replace")
+            for line in chunk.splitlines():
+                if text_marker in line or json_marker in line:
+                    out.append(line)
+        except OSError:
+            return []
+        return out
+
+    # 快路径：主日志尾部 tail_scan 字节
+    matched = _scan_file(path, tail=tail_scan)
+
+    # 回退：尾部没命中（典型 = 历史 done 任务被新日志挤出窗口）→ 扫全量 + 轮转 backup
+    if not matched:
+        all_lines: list[str] = []
+        # 轮转 backup 从旧到新：swarm.log.3 → .2 → .1 → swarm.log（时间顺序）
+        import glob as _glob
+        backups = sorted(
+            _glob.glob(str(path) + ".*"),
+            key=lambda s: int(s.rsplit(".", 1)[-1]) if s.rsplit(".", 1)[-1].isdigit() else 0,
+            reverse=True,
+        )
+        for b in backups:
+            from pathlib import Path as _P
+            all_lines.extend(_scan_file(_P(b), tail=None))
+        all_lines.extend(_scan_file(path, tail=None))
+        matched = all_lines
 
     if len(matched) > limit:
         matched = matched[-limit:]

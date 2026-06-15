@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from enum import Enum
@@ -45,6 +46,27 @@ logger = logging.getLogger(__name__)
 # 改用词边界正则只命中独立失败词。注意：这只是【弱信号】，仅在确定性 L1 闸门无法判定
 # （无工程文件可编译/测试）时回退使用；闸门可判时其结果优先覆盖本判定。
 _FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|errors)\b")
+
+
+# Bug-4（task 0f93f1fc 实证）：模型拒答/截断标记。worker agent 主回复命中这些 =
+# 它根本没真正完成工作（停滞/截断/算力耗尽），产出不可信。此前这类回复仅让 LLM 自报
+# 判 False，但 deterministic gate（diff 非空 + compile 恰好过）会翻盘判通过 → 幻觉 PASS。
+# 这类标记必须【硬否决整个 L1】，覆盖 deterministic gate——产出来源不可信时编译过也不算数。
+_REFUSAL_MARKERS = (
+    "sorry, need more steps",
+    "need more steps to process",
+    "i'm unable to",
+    "i am unable to",
+    "cannot complete this request",
+)
+
+
+def _is_refusal_or_truncated(text: str) -> bool:
+    """判断 agent 回复是否为模型拒答/截断标记（非有效产出信号）。"""
+    if not text or not text.strip():
+        return False
+    low = text.lower()
+    return any(mk in low for mk in _REFUSAL_MARKERS)
 
 
 def _trivial_llm_self_report_passed(combined: str) -> bool:
@@ -225,8 +247,11 @@ class WorkerExecutor:
                     # 一个沙箱跑到底（不分阶段切换），按子任务整体性质选镜像。
                     _harness = getattr(self.subtask, "harness", None)
                     _tpl = getattr(_harness, "sandbox_template", "") or ""
+                    # 项目专属模板（方案 B）自带完整项目源码进 /workspace；用它时 worker
+                    # 只需上传被改的 writable 文件（readable 镜像已有，不必传，见 _sync_to_sandbox）。
+                    self._sandbox_has_source = False
                     # 【项目级定制沙箱】优先用项目专属模板（预处理时按真实环境构建，
-                    # 见 docs/Project_Scoped_Sandbox_Design.md）。无则回退按语言选通用模板。
+                    # 见 docs/DESIGN_project_sandbox_prebake_source.md）。无则回退按语言选通用模板。
                     if not _tpl and self.project_id:
                         try:
                             from swarm.project.store import get_project
@@ -234,7 +259,8 @@ class WorkerExecutor:
                             _proj_tpl = ((_proj or {}).get("config") or {}).get("sandbox_template", "")
                             if _proj_tpl:
                                 _tpl = _proj_tpl
-                                self._log(f"沙箱镜像选择: 项目专属模板={_tpl}")
+                                self._sandbox_has_source = True  # 专属模板自带源码
+                                self._log(f"沙箱镜像选择: 项目专属模板={_tpl}（自带项目源码）")
                         except Exception as exc:  # noqa: BLE001 — 读项目失败不阻断，回退通用
                             self._log(f"读项目专属模板失败，回退通用: {exc}")
                     if not _tpl:
@@ -274,9 +300,16 @@ class WorkerExecutor:
                                 f"沙箱 {_bad} envd 健康探活失败"
                                 f"（疑似镜像/envd 故障），弃用换新 [{_attempt + 1}/{_max_tries}]"
                             )
-                            # 坏沙箱不归还热池，直接销毁
+                            # 坏沙箱不归还热池，直接销毁。
+                            # 关键修复：从池借出的沙箱(_from_pool)必须走 pool.release(reusable=False)
+                            # 而非裸 manager.kill —— kill 只销毁服务端实例，不扣减池的 borrowed 计数，
+                            # 导致探活失败的沙箱永久泄漏 borrowed（实测 borrowed=3/server=0 幽灵记账，
+                            # 占满 max_total 配额后续无法借出）。release(reusable=False) 既 kill 又扣计数。
                             try:
-                                self._sandbox_manager.kill(_bad)
+                                if self._from_pool and self._sandbox_pool is not None:
+                                    self._sandbox_pool.release(self._sandbox, reusable=False)
+                                else:
+                                    self._sandbox_manager.kill(_bad)
                             except Exception:  # noqa: BLE001
                                 pass
                             self._sandbox = None
@@ -293,6 +326,9 @@ class WorkerExecutor:
                             f"（镜像 {_tpl} 疑似故障），放弃远程沙箱"
                         )
                     set_sandbox_context(self._sandbox, self._sandbox_manager)
+                    # 批次2-B：bootstrap 上传前先把 scope 内 tracked 文件 reset 到 HEAD，
+                    # 杜绝上一轮 pull-back 写回本地的改动跨子任务/重试累积叠加。
+                    self._reset_scope_to_head()
                     await self._sync_to_sandbox("bootstrap")
                 except SandboxUnhealthyError as exc:
                     # 熔断：沙箱运行中连续失败达阈值 → 明确失败，不降级空转
@@ -371,6 +407,13 @@ class WorkerExecutor:
 
                 # 确定性闸门优先：用真实 compile/lint/scope 结果覆盖 LLM 自报。
                 # 借鉴 ECC —— 确定性断言驱动修复循环，杜绝 LLM 幻觉 PASS 提前 break。
+                # ── 关键修复：循环内确定性闸门查的是本地 difflib diff（_post_sync_contents），
+                #    但 worker 在【沙箱】里改文件，循环内若不先 pull-back，本地 diff 恒空 →
+                #    `empty_diff_but_changes_expected` 每轮必 fail（medium/complex 子任务白跑满
+                #    修复轮，靠 Phase4 pull-back 后才翻盘，又慢又易误判）。
+                #    故沙箱模式下：闸门前先把沙箱改动 pull-back 刷新本地，使 diff 反映真实改动。
+                if self._sandbox and self._sandbox_manager:
+                    await self._sync_from_sandbox(f"verify-{fix_round} 闸门前同步")
                 det_ok, det_details = self._deterministic_l1_gate()
                 l1_details = {**l1_details, **det_details}
                 if det_ok is None:
@@ -384,6 +427,14 @@ class WorkerExecutor:
                         self._log("确定性闸门通过但 LLM 自报失败，以确定性结果为准")
                     elif not det_ok and llm_passed:
                         self._log("LLM 自报通过但确定性闸门失败，以确定性结果为准（拦截幻觉 PASS）")
+
+                # Bug-4 根治：verify 回复是拒答/截断标记 → worker 没真正完成，产出不可信，
+                # 硬否决覆盖 deterministic gate（即便 compile 恰好过也不算数）。
+                if _is_refusal_or_truncated(verify_result):
+                    l1_passed = False
+                    l1_details["l1_decision_source"] = "refusal_hard_fail"
+                    l1_details["raw_refusal"] = (verify_result or "")[:200]
+                    self._log("verify 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")
 
                 self._log(
                     f"L1 验证结果: {'通过 ✅' if l1_passed else '未通过 ❌'} "
@@ -423,37 +474,63 @@ class WorkerExecutor:
 
             output = self._parse_produce_result(produce_result, l1_passed, l1_details)
 
-            # L1 确定性流水线（scope / compile / lint / scoped test / LLM 自检）
-            if output.diff and self.project_path:
-                from swarm.worker.l1_pipeline import run_l1_pipeline
+            # ── Phase 4 最终复核：与 Phase3 循环(L374)、trivial 通道(L1121)同源 ──
+            # 关键修复(task 37460a5b)：此处过去裸调 run_l1_pipeline()，绕过了
+            # _deterministic_l1_gate 的 "empty_diff + expects_changes → False" 拦截，
+            # 导致占位/空 diff 被 run_l1_pipeline 当 "no diff changes" 返回 True → 翻盘为通过。
+            # 现统一走确定性闸门拿三态，再以 LLM 自检作为 Phase4 增值，杜绝 "skip 当 pass"。
+            if self.project_path:
+                det_ok, det_details = self._deterministic_l1_gate()
+                l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok,
+                              "l1_phase": "phase4_final"}
 
-                # 获取 LLM 句柄用于 L1.4 自检（可选，不传则自检跳过）
-                l1_llm = None
-                try:
-                    from swarm.models.router import ModelRouter
-                    l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
-                except Exception as exc:
-                    self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
-
-                det_ok, det_details = run_l1_pipeline(
-                    self.project_path,
-                    self.subtask,
-                    output.diff,
-                    llm=l1_llm,
-                )
-                # audit #5/#29：标记此为 Phase 4 产出后最终复核(带 LLM 自检)，与 Phase 3
-                # 循环内确定性闸门(llm=None)区分，便于调试两个 L1 调用点的行为差异。
-                l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok, "l1_phase": "phase4_final_with_llm"}
-                if not det_ok:
+                if det_ok is False:
+                    # 确定性闸门判失败（空 diff 但期望变更 / 编译失败 / scope 违规）→ 禁止翻盘。
                     l1_passed = False
-                    output = output.model_copy(
-                        update={"l1_passed": False, "l1_details": l1_details}
+                    self._log(
+                        "L1 最终复核（Phase4 产出后）: 未通过 ❌ — 确定性闸门判失败，"
+                        f"不予翻盘 | {det_details.get('reason') or det_details.get('deterministic_gate')}"
                     )
-                elif det_ok and not l1_passed:
-                    l1_passed = True
-                    output = output.model_copy(
-                        update={"l1_passed": True, "l1_details": l1_details}
+                elif det_ok is True:
+                    # 确定性闸门通过。Phase4 增值：再跑一次带 LLM 自检的 pipeline 做最终复核
+                    # （仅当 diff 真有可解析变更时；纯占位 diff 不会到这分支，已被闸门拦在 False/None）。
+                    llm_ok = True
+                    if output.diff:
+                        from swarm.worker.l1_pipeline import run_l1_pipeline
+
+                        l1_llm = None
+                        try:
+                            from swarm.models.router import ModelRouter
+                            l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
+                        except Exception as exc:  # noqa: BLE001
+                            self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
+                        llm_ok, llm_details = run_l1_pipeline(
+                            self.project_path, self.subtask, output.diff, llm=l1_llm,
+                        )
+                        l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
+                    if not llm_ok:
+                        l1_passed = False
+                        self._log("L1 最终复核（Phase4 产出后）: 未通过 ❌ — 带 LLM 自检的 pipeline 判失败")
+                    elif not l1_passed:
+                        # Phase3 循环内 fail（如中途无 diff/拒答），但 pull-back 后收集到【有效】
+                        # 产出且确定性闸门 + pipeline 双双通过 → 翻盘为通过。空 diff 已被上面
+                        # det_ok is False/None 两条分支拦住，到不了这里。
+                        l1_passed = True
+                        self._log(
+                            "L1 最终复核（Phase4 产出后）: 翻盘为通过 ✅ — "
+                            "循环内未通过多因中途无 diff，pull-back 后收集到有效产出且确定性+LLM 校验通过"
+                        )
+                    else:
+                        self._log("L1 最终复核（Phase4 产出后）: 维持通过 ✅")
+                else:
+                    # det_ok is None：无 diff 可检且无 harness 可执行检查 → 回退 LLM 信号。
+                    # 此时【不主动翻盘】：循环内若已 fail，缺乏确定性证据不足以翻盘为通过。
+                    l1_details["l1_decision_source"] = "llm_self_report"
+                    self._log(
+                        f"L1 最终复核（Phase4 产出后）: 无确定性证据(det=None)，维持循环内结论 "
+                        f"{'通过 ✅' if l1_passed else '未通过 ❌'}（不主动翻盘）"
                     )
+                output = output.model_copy(update={"l1_passed": l1_passed, "l1_details": l1_details})
 
             # ── DEBUG 意图专属 L1 校验：验证 failing_test_command 修复后通过 ──
             if self.subtask.intent == "debug" and self.project_path:
@@ -491,12 +568,15 @@ class WorkerExecutor:
             self.phase = WorkerPhase.FAILED
             self._log(f"执行异常: {e}")
             self._l1_passed_flag = False  # 异常路径：沙箱可能脏，不归还复用
+            # P2：分类失败类型，供 handle_failure 决定退避重试(transient) 还是换模型(capability)。
+            from swarm.models.errors import classify_failure
+            failure_class = classify_failure(e)
             return self._make_output(
                 diff="",
                 summary=f"执行异常: {e}",
                 confidence=Confidence.LOW,
                 l1_passed=False,
-                l1_details={"error": str(e)},
+                l1_details={"error": str(e), "failure_class": failure_class},
             )
         finally:
             clear_sandbox_context()
@@ -760,6 +840,92 @@ class WorkerExecutor:
                 snapshot[rel] = None
         return snapshot
 
+    def _reset_scope_to_head(self) -> int:
+        """批次2-B（Bug：跨任务/重试 workspace 累积脏）：子任务起点把本 scope 内的
+        git【跟踪】文件 reset 到 HEAD，杜绝上一轮 pull-back 写回的改动累积叠加。
+
+        - 只 reset writable ∪ scope 内【被 git 跟踪】的文件（git ls-files 白名单）；
+          untracked / 新建产物（create_files 尚未提交）一律不碰，零误删风险。
+        - per-project 文件锁（fcntl.flock）串行化：并发子任务共享同一 project_path 时，
+          同一时刻只有一个 executor 在 reset（dispatch 用 asyncio.gather 真并发，
+          scope 可能重叠，见 task 0f93f1fc）。reset 是毫秒级 git 操作，串行无实质开销。
+        - SWARM_WORKER_RESET_SCOPE=false 可回退旧行为（默认 true）。
+        - 非 git 仓库 / 无 project_path 优雅跳过，返回 0。
+
+        返回被 reset 的文件数。
+        """
+        import subprocess
+
+        if os.environ.get("SWARM_WORKER_RESET_SCOPE", "true").lower() in ("false", "0", "no"):
+            return 0
+        if not self.project_path:
+            return 0
+        local_root = Path(self.project_path).resolve()
+        if not (local_root / ".git").exists():
+            return 0
+
+        # 候选：writable ∪ scope 文件（modify 意图的文件；create_files 新建产物在
+        # _writable_files 里，但只有【已被 git 跟踪】的才 reset）
+        candidates = set()
+        for f in self._writable_files():
+            candidates.add(self._norm_rel(local_root, f))
+        for f in self._scope_files():
+            candidates.add(self._norm_rel(local_root, f))
+        if not candidates:
+            return 0
+
+        # 只保留 git 跟踪的文件（ls-files --error-unmatch 逐个判定）
+        tracked = []
+        for rel in candidates:
+            try:
+                r = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", rel],
+                    cwd=str(local_root), capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    tracked.append(rel)
+            except Exception:  # noqa: BLE001
+                continue
+        if not tracked:
+            return 0
+
+        # 锁文件放系统临时目录（按 project_path 派生稳定名），不污染目标 workdir
+        # （避免 .swarm_reset.lock 出现在用户项目的 git status）。
+        import hashlib
+        import tempfile as _tf
+        _proj_hash = hashlib.sha1(str(local_root).encode()).hexdigest()[:16]
+        lock_path = Path(_tf.gettempdir()) / f"swarm_reset_{_proj_hash}.lock"
+        try:
+            import fcntl
+            lock_f = open(lock_path, "w")
+        except Exception:  # noqa: BLE001
+            lock_f = None
+        try:
+            if lock_f is not None:
+                try:
+                    fcntl.flock(lock_f, fcntl.LOCK_EX)
+                except Exception:  # noqa: BLE001
+                    pass
+            r = subprocess.run(
+                ["git", "checkout", "HEAD", "--", *tracked],
+                cwd=str(local_root), capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到 HEAD（防跨轮脏叠加）")
+                return len(tracked)
+            self._log(f"workspace reset 警告（git checkout 非零）: {r.stderr.strip()[:200]}")
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"workspace reset 跳过（异常）: {exc}")
+            return 0
+        finally:
+            if lock_f is not None:
+                try:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+                    lock_f.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def _sync_to_sandbox(self, reason: str) -> None:
         """精准上传：只把子任务 scope 内的文件推送到沙箱 /workspace。
 
@@ -772,7 +938,16 @@ class WorkerExecutor:
             return
         cfg = get_config()
 
-        rel_files = [self._norm_rel(local_root, f) for f in self._scope_files()]
+        # 上传范围：
+        # - 项目专属沙箱（镜像自带完整源码，方案 B）→ 只传被改的 writable/create_files；
+        #   readable 镜像已有，传了反而可能用本地覆盖镜像基线（且浪费 I/O）。
+        # - 通用池沙箱（/workspace 空）→ 传完整 scope_files（readable ∪ writable ∪ 构建清单），
+        #   否则编译找不到依赖源文件/pom。
+        if getattr(self, "_sandbox_has_source", False):
+            rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
+            self._log(f"{reason} 专属沙箱自带源码 → 仅上传 {len(rel_files)} 个改动文件（writable/create）")
+        else:
+            rel_files = [self._norm_rel(local_root, f) for f in self._scope_files()]
         if not rel_files:
             self._log(f"{reason} scope 为空，跳过文件上传（无目标文件）")
             return
@@ -793,11 +968,70 @@ class WorkerExecutor:
             except (UnicodeDecodeError, OSError):
                 self._pre_sync_contents[rel] = None  # 二进制/不可读
 
+        # ── 批次2-A（Bug：跨重试改动叠加）：上传 git HEAD 内容而非脏磁盘 ──
+        # 根因：上一个 executor 的 pull-back 把改动写回本地 project_path，重新派发时
+        # bootstrap 上传脏文件 → LLM 在脏版本上叠加修改（docstring 重复等）。
+        # _git_baseline_text 此前只兜住了 diff 基线，没兜上传内容（半个修复）。
+        # 这里把 writable(modify) 中【git 跟踪】的文件改用 HEAD 版写入临时 staging
+        # 目录上传；untracked/新建/readable 仍从真实磁盘上传（HEAD 取不到）。
+        # SWARM_WORKER_CLEAN_UPLOAD=false 可回退旧行为（默认 true）。
+        import shutil
+        import tempfile
+
+        clean_upload = os.environ.get(
+            "SWARM_WORKER_CLEAN_UPLOAD", "true"
+        ).lower() not in ("false", "0", "no")
+        writable_set = {self._norm_rel(local_root, f) for f in self._writable_files()}
+        upload_root = local_root
+        staging_dir: str | None = None
+        if clean_upload:
+            import subprocess as _sp
+            try:
+                staging_dir = tempfile.mkdtemp(prefix="swarm_clean_upload_")
+                staging_root = Path(staging_dir)
+                cleaned = 0
+                for rel in rel_files:
+                    dst = staging_root / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    # 仅当 rel 是 writable 且【确实被 git 跟踪】时用 HEAD 版。
+                    # 用 ls-files 显式判定，区分 "tracked"（含空文件）与 "untracked/新建"
+                    # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
+                    is_tracked = False
+                    if rel in writable_set:
+                        try:
+                            _r = _sp.run(
+                                ["git", "ls-files", "--error-unmatch", rel],
+                                cwd=str(local_root), capture_output=True, text=True, timeout=10,
+                            )
+                            is_tracked = _r.returncode == 0
+                        except Exception:  # noqa: BLE001
+                            is_tracked = False
+                    git_text = self._git_baseline_text(local_root, rel) if is_tracked else None
+                    if git_text is not None:
+                        # writable 且 git 跟踪 → 用 HEAD 干净版（杜绝脏磁盘叠加）
+                        dst.write_text(git_text, encoding="utf-8")
+                        cleaned += 1
+                    else:
+                        # readable / untracked / 新建 → copy 真实磁盘（HEAD 无此版）
+                        src = local_root / rel
+                        if src.is_file():
+                            shutil.copy2(src, dst)
+                        # 源不存在（待新建）→ staging 也不建，上传层跳过
+                upload_root = staging_root
+                if cleaned:
+                    self._log(f"{reason} 干净上传：{cleaned} 个 writable 文件用 git HEAD 版上传（防脏叠加）")
+            except Exception as stage_exc:  # noqa: BLE001
+                self._log(f"{reason} staging 构造失败，回退脏磁盘上传: {stage_exc}")
+                upload_root = local_root
+                if staging_dir:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    staging_dir = None
+
         try:
             sync_stats = await asyncio.to_thread(
                 self._sandbox_manager.sync_files_to_sandbox,
                 self._sandbox,
-                local_root,
+                upload_root,
                 rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
             )
@@ -811,6 +1045,9 @@ class WorkerExecutor:
                 self._log(f"上传警告: {err}")
         except Exception as sync_exc:
             self._log(f"{reason} 本地→沙箱精准上传失败: {sync_exc}")
+        finally:
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     async def _sync_from_sandbox(self, reason: str) -> None:
         """精准拉回：只把子任务可写文件从沙箱拉回本地 project_path。
@@ -1101,6 +1338,24 @@ class WorkerExecutor:
         llm_passed = _trivial_llm_self_report_passed(combined)
         l1_details = {"mode": "trivial_fast", "agent_summary": combined[:500]}
 
+        # Bug-4 根治：agent 主回复是拒答/截断标记 → worker 没真正完成，产出不可信，
+        # 硬否决整个 L1（覆盖 deterministic gate）。否则沙箱里残留/部分编辑导致 diff
+        # 非空 + compile 恰好过会翻盘判通过（task 0f93f1fc：st-1-1 "Sorry need more
+        # steps" 却 L1=通过）。
+        if _is_refusal_or_truncated(combined):
+            l1_details["l1_decision_source"] = "refusal_hard_fail"
+            l1_details["raw_refusal"] = combined[:200]
+            self._log("trivial: agent 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")
+            self.phase = WorkerPhase.PRODUCING
+            await self._sync_from_sandbox("产出")
+            produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
+            output = self._parse_produce_result(produce_result, False, l1_details)
+            self.phase = WorkerPhase.DONE
+            self._l1_passed_flag = False
+            self._log(f"trivial 快速路径完成（拒答否决），置信度: {output.confidence.value}")
+            return output
+
+
         self.phase = WorkerPhase.PRODUCING
         self._log("产出阶段：从沙箱 pull-back 并收集 diff")
         await self._sync_from_sandbox("产出")
@@ -1144,6 +1399,8 @@ class WorkerExecutor:
             "1. 阅读你权限范围内的相关文件\n"
             "2. 定位需要修改或实现的代码位置\n"
             "3. 确认接口契约和依赖关系\n"
+            "⚠️ 上下文有限：大文件务必用 read_file(path, start_line=N, end_line=M) 只读需要的"
+            "行范围，或先 search_files 定位行号再局部读。禁止对大文件无参数读全文（会撑爆上下文）。\n"
             "请简要汇报你的定位结果。"
         )
 
@@ -1154,6 +1411,8 @@ class WorkerExecutor:
             "文件操作清单（务必按操作类型处理）：\n"
             f"{self._scope_ops_hint()}\n\n"
             "根据定位结果和子任务要求进行实现：\n"
+            "⚠️ 上下文有限：改文件前用 read_file(path, start_line=N, end_line=M) 只读目标行范围，"
+            "不要无参数读全文；用 patch_file 做最小必要改动，不要全文重写输出（大文件全文重写会撑爆上下文）。\n"
             "1. 【修改】文件：用 patch_file 在可写范围内改动\n"
             "2. 【新建】文件：用 write_file 直接写入完整内容，不要先 read_file\n"
             "3. 【删除】文件：用 run_command 执行 rm\n"
@@ -1237,6 +1496,22 @@ class WorkerExecutor:
         import re
 
         text = verify_result or ""
+
+        # P1-2：识别模型拒答/截断响应（复用模块级 _is_refusal_or_truncated，
+        # 与 trivial / Phase3 硬否决同一事实源）。这类不是真正的验证结论，
+        # 标记为 unavailable，明确区分"模型没给出有效自报"与"模型报告失败"。
+        llm_unavailable = _is_refusal_or_truncated(text)
+        if llm_unavailable:
+            details: dict = {
+                "raw_result": "(模型拒答/截断，非有效验证自报)",
+                "raw_refusal": text[:200],
+                "llm_self_report": "unavailable",
+                "compile_passed": False,
+                "tests_passed": False,
+            }
+            # 自报不可用 → 保守判 fail（但最终以 deterministic gate 为准）
+            return False, details
+
         # 显式标记优先：L1_RESULT: PASS / FAIL（容忍大小写与空格）
         m = re.search(r"L1_RESULT\s*:?\s*(PASS|FAIL)", text, re.IGNORECASE)
         if m:
@@ -1253,7 +1528,7 @@ class WorkerExecutor:
             )
             passed = has_pass and not has_fail
 
-        details: dict = {
+        details = {
             "raw_result": text[:500],
             "llm_self_report": "pass" if passed else "fail",
             "compile_passed": bool(re.search(r"编译.*通过|compile.*ok|compiled", text, re.IGNORECASE)),
@@ -1275,7 +1550,14 @@ class WorkerExecutor:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: diff error {exc}"}
-        empty_diff = not diff or diff in ("(无变更)", "(无法获取 git diff)")
+        # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
+        # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"
+        # 送进 pipeline → 解析出 0 文件 → "no diff changes → True" → 空 diff 漏判通过。
+        _diff_stripped = (diff or "").strip()
+        empty_diff = (
+            not _diff_stripped
+            or _diff_stripped in ("(无变更)", "(无法获取 git diff)")
+        )
         harness = getattr(self.subtask, "harness", None)
         has_harness_checks = bool(
             harness and (harness.build_command or harness.test_command or harness.verify_commands)

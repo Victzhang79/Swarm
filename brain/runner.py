@@ -372,6 +372,29 @@ async def _handle_post_run(
             })
             return
 
+    # P0-3：confirm 节点对非法计划返回 REJECT（auto_accept fail-fast）会路由到 END，
+    # 这条路径不经 deliver/learn_failure，若按"正常结束"无脑标 DONE 会把"计划非法
+    # 自动失败"误报成成功（task 0f93f1fc 类场景）。这里在标 DONE 前拦截非法终态。
+    _hd = state.get("human_decision")
+    _hd_val = _hd.value if hasattr(_hd, "value") else str(_hd or "")
+    _vf = state.get("verification_failure")
+    if _vf == "plan_invalid" or (_hd_val == HumanDecision.REJECT.value and state.get("confirm_reason")):
+        issues = state.get("plan_validation_issues") or []
+        reason = "; ".join(issues) or "执行计划自动校验未通过，已 fail-fast 终止"
+        logger.warning("[RUNNER] 任务 %s 因计划非法 fail-fast 终止: %s", task_id, reason)
+        _rec = store.get_task(task_id) or {}
+        store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, _rec, "FAILED")
+        audit("task_failed", orchestrator="Brain", task_id=task_id,
+              project_id=_rec.get("project_id"),
+              error=f"plan_invalid: {reason}"[:300])
+        await _emit(queue, {
+            "step": "error", "status": "error",
+            "message": f"计划校验未通过，已终止：{reason}",
+            "mode": "brain", "progress": -1,
+        })
+        return
+
     # 正常结束
     task_rec = store.get_task(task_id) or {}
     token_usage = store.estimate_token_usage(

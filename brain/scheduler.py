@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # 队列只存 task_id/project_id，执行参数在此补全（避免 Redis payload 过大）
 _pending_meta: dict[str, dict] = {}
 
+# 准入闸门重试计数：task_id → 因沙箱未就绪被留池的次数（防 ERROR 项目无限 re-enqueue）
+_admission_retries: dict[str, int] = {}
+# 超过此次数仍未就绪 → 放弃留池，强制放行交由 runner 兜底（executor 选通用池模板）
+_MAX_ADMISSION_RETRIES = 200  # ×3s ≈ 10min，覆盖最长沙箱构建耗时
+
 _consumer_started = False
 _inflight: set[str] = set()
 _wakeup: asyncio.Event | None = None
@@ -70,6 +75,29 @@ def pending_count() -> int:
     return len(_pending_meta) + len(_inflight)
 
 
+def _project_ready_for_exec(project_id: str) -> bool:
+    """准入闸门：项目是否可以启动任务执行。
+
+    构建期间任务仅入池不启动（docs/DESIGN_project_sandbox_prebake_source.md §5.1）。
+    判据：项目 status == READY。预处理流水线中 _phase_build_sandbox（Phase 5）在 READY
+    之前执行——专属沙箱构建成功（写入 sandbox_template）或明确回退通用池后，项目才置 READY。
+    所以 status==READY 即意味着"沙箱已就绪（专属模板 or 通用池兜底）"，可放行。
+    PREPROCESSING / BUILDING / ERROR / 不存在 → 不放行（留池等待；ERROR 由上层清理）。
+
+    读项目失败时保守放行（避免因 DB 抖动卡死所有任务；执行端 executor 仍会兜底选模板）。
+    """
+    try:
+        from swarm.project.store import get_project
+        proj = get_project(project_id)
+        if not proj:
+            return True  # 项目记录缺失，保守放行交由 runner 处理
+        status = (proj.get("status") or "").upper()
+        return status == "READY"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Scheduler] 准入检查读项目失败，保守放行 %s: %s", project_id, exc)
+        return True
+
+
 async def start_task_scheduler() -> None:
     """启动后台消费循环（API startup 调用，幂等）。"""
     global _consumer_started, _wakeup
@@ -87,11 +115,29 @@ async def start_task_scheduler() -> None:
                 item = TaskQueue.dequeue()
                 if item:
                     task_id = item["task_id"]
-                    meta = _pending_meta.pop(task_id, None)
+                    meta = _pending_meta.get(task_id)
                     if meta is None:
                         # 元数据丢失（如进程重启）→ 跳过，由 orphan 恢复逻辑处理
                         logger.warning("[Scheduler] 任务 %s 缺执行元数据，跳过", task_id)
                         continue
+                    # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
+                    # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）
+                    if not _project_ready_for_exec(meta["project_id"]):
+                        n = _admission_retries.get(task_id, 0) + 1
+                        _admission_retries[task_id] = n
+                        if n <= _MAX_ADMISSION_RETRIES:
+                            # 重新入队尾部，稍后再试（不消费 meta），避免忙等
+                            TaskQueue.enqueue(task_id, meta["project_id"], priority="normal")
+                            if n == 1 or n % 20 == 0:
+                                logger.info("[Scheduler] 任务 %s 等待项目 %s 沙箱就绪，留池中（第 %d 次）",
+                                            task_id, meta["project_id"], n)
+                            await asyncio.sleep(3.0)
+                            continue
+                        # 超上限：放弃留池，强制放行交由 runner/executor 兜底（通用池模板）
+                        logger.warning("[Scheduler] 任务 %s 等待沙箱就绪超 %d 次，强制放行（executor 兜底选模板）",
+                                       task_id, _MAX_ADMISSION_RETRIES)
+                    _admission_retries.pop(task_id, None)
+                    _pending_meta.pop(task_id, None)
                     _inflight.add(task_id)
                     _run_with_slot(task_id, meta, start_task_background)
                     continue  # 立即尝试下一个（填满并发额度）

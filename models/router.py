@@ -75,12 +75,13 @@ class EndpointProvider:
         return 0 if self.provider.kind == "local" else self.config.max_retries
 
     def get_chat_model(
-        self, model_name: str, temperature: float = 0.2, callbacks: list | None = None
+        self, model_name: str, temperature: float = 0.2, callbacks: list | None = None,
+        max_tokens: int | None = None,
     ) -> BaseChatModel:
         from langchain_openai import ChatOpenAI
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
         api_key: str = self.provider.api_key or "EMPTY"  # type: ignore[assignment]
-        return ChatOpenAI(
+        _kwargs: dict = dict(
             model=model_name,
             base_url=self.provider.base_url,
             api_key=api_key,  # type: ignore[arg-type]
@@ -94,6 +95,10 @@ class EndpointProvider:
             # 流式无 chunk 看门狗：远端 stall 时尽早中断 → fallback 更快接管。
             stream_chunk_timeout=self.config.stream_chunk_timeout,
         )
+        # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
+        if max_tokens and max_tokens > 0:
+            _kwargs["max_tokens"] = max_tokens
+        return ChatOpenAI(**_kwargs)
 
 
 # ── 向后兼容别名 ─────────────────────────────────────────────
@@ -150,11 +155,13 @@ class ModelRouter:
         primary_name, fallback_name = self._resolve_route(difficulty, modality)
 
         role = f"worker/{difficulty}"
+        _wmax = getattr(self.config, "worker_max_tokens", 0) or None
         p_prov = self._get_provider_for_model(primary_name)
         primary = p_prov.get_chat_model(
             primary_name,
             temperature=self.config.worker_temperature,
             callbacks=[ModelInvocationLogger(role, primary_name, p_prov.provider.id)],
+            max_tokens=_wmax,
         )
         if fallback_name:
             f_prov = self._get_provider_for_model(fallback_name)
@@ -162,6 +169,7 @@ class ModelRouter:
                 fallback_name,
                 temperature=self.config.worker_temperature,
                 callbacks=[ModelInvocationLogger(role + "/fallback", fallback_name, f_prov.provider.id)],
+                max_tokens=_wmax,
             )
             return primary.with_fallbacks([fallback])
         return primary
@@ -183,6 +191,7 @@ class ModelRouter:
             model_name,
             temperature=self.config.worker_temperature,
             callbacks=[ModelInvocationLogger(role, model_name, prov.provider.id)],
+            max_tokens=(getattr(self.config, "worker_max_tokens", 0) or None),
         )
         return llm, model_name
 
@@ -279,6 +288,9 @@ class ModelRouter:
             callbacks=[ModelInvocationLogger(
                 role=f"worker/{kind_label}", model_name=model_name, provider_id=prov.provider.id,
             )],
+            # worker 输出上限：防改大文件时全文重写撑爆 context（worker agent 走此路径，
+            # 非 get_llm_for_subtask；之前只在后者加 max_tokens 故未生效，必须在此也加）。
+            max_tokens=(getattr(self.config, "worker_max_tokens", 0) or None),
         )
 
     def get_routing_table(self) -> dict:

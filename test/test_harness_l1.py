@@ -36,7 +36,10 @@ def test_infer_harness_python():
     plan = _build_simple_plan("用 python 写一个计算器 calc.py")
     h = plan.subtasks[0].harness
     assert h.language == "python"
-    assert "py_compile" in h.build_command
+    # build_command 必须是【可对目录执行】的编译闸门：py_compile 只接受文件，传目录会
+    # 报 Is a directory（task d4f9db79 假阴性根因），故默认用 compileall。
+    assert "compileall" in h.build_command
+    assert "py_compile ." not in h.build_command  # 防回归：不得退回坏命令
     assert "pytest" in h.test_command
     assert any("python" in w for w in h.extra_whitelist)
     print("  ✅ _infer_harness 正确推断 Python harness")

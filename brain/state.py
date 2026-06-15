@@ -59,7 +59,11 @@ class BrainState(TypedDict, total=False):
     failure_strategy: str               # handle_failure 决策: retry|retry_alternate|replan|escalate
     use_alternate_model: bool           # retry_alternate 时使用备选模型
     failure_escalated: bool             # escalate 时标记需人工介入
-    subtask_retry_counts: dict[str, int]  # 每个子任务的累计重试次数（确定性递进升级）
+    subtask_retry_counts: dict[str, int]  # 每个子任务的累计【capability】重试次数（换模型/升级阶梯）
+    subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
+    replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
+    replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
+    confirm_reason: str                 # P0-3：confirm 进入原因(validation_failed|ultra|manual_confirm)
 
     # ─── 合并 & 验证 ───
     merged_diff: str                    # 合并后的完整 diff

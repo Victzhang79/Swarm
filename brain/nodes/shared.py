@@ -24,9 +24,6 @@ from swarm.types import (
 )
 
 
-_TRIVIAL_HINTS = ("docstring", "注释", "comment", "一行", "typo", "拼写", "添加一行")
-
-
 _FILE_EXT = (
     r"py|js|jsx|ts|tsx|java|go|rs|rb|php|c|cc|cpp|h|hpp|cs|kt|swift|scala|"
     r"sh|md|rst|txt|toml|yaml|yml|json|ini|cfg|env|xml|html|css"
@@ -161,7 +158,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
         return TaskHarness(
             language="python",
             setup_commands=["pip install -q ruff bandit pip-audit 2>/dev/null || true"],
-            build_command="python -m py_compile .",
+            build_command="python -m compileall -q .",
             test_command="python -m pytest -q",
             lint_command="ruff check .",
             typecheck_command="mypy . --ignore-missing-imports",
@@ -253,13 +250,6 @@ def _infer_intent(task_description: str, *, greenfield: bool = False) -> "TaskIn
                          "create a new", "build a", "greenfield", "scaffold"):
         return TaskIntent.CREATE
     return TaskIntent.MODIFY
-
-
-def _heuristic_complexity(task_description: str) -> Complexity | None:
-    t = task_description.lower()
-    if any(h in t for h in _TRIVIAL_HINTS) and len(task_description) < 280:
-        return Complexity.SIMPLE
-    return None
 
 
 def _match_files_by_description(task_description: str, candidate_files: list[str]) -> list[str]:

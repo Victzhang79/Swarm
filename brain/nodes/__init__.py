@@ -58,14 +58,12 @@ from swarm.brain.nodes.shared import (  # noqa: E402,F401
     _FILE_EXT,
     _FILE_PAT,
     _L2_CMD_RE,
-    _TRIVIAL_HINTS,
     _brain_profile_prompt,
     _build_simple_plan,
     _classify_file_ops,
     _complexity_str,
     _format_project_structure,
     _guess_target_files,
-    _heuristic_complexity,
     _infer_harness,
     _infer_intent,
     _l2_test_command_from_criteria,
@@ -195,30 +193,10 @@ async def analyze(state: BrainState) -> dict:
 
     sliding_ctx = sliding_context_prompt(work_state)
 
-    heuristic = _heuristic_complexity(task_description)
-    if heuristic is not None:
-        logger.info("[ANALYZE] 启发式判定复杂度: %s", heuristic.value)
-        affected_files = list(knowledge_context.get("affected_files") or [])
-        if not affected_files:
-            affected_files = [
-                r.get("file_path", "")
-                for r in knowledge_context.get("struct", [])
-                if r.get("file_path")
-            ]
-        analyze_touch = touch_context(
-            work_state,
-            "analyze",
-            f"复杂度={heuristic.value}（启发式判定）",
-        )
-        return {
-            "complexity": heuristic,
-            "knowledge_context": knowledge_context,
-            "affected_files": affected_files,
-            "recent_task_summaries": recent_summaries or [],
-            **_planning_triage(task_description, heuristic, state),
-            **context_patch,
-            **analyze_touch,
-        }
+    # 复杂度判定：一律走【带知识库检索结果的云端 Brain 大模型】判定。
+    # （历史曾有 _heuristic_complexity 关键词短路抢在 LLM 前拦截——命中"注释/typo"等词就
+    # 直接判死、连大模型都不调，导致跨文件/新建类任务被误降级成 simple。已废弃该短路：
+    # 复杂度是语义判断，应由拿到 struct/semantic/norms/项目摘要 的大模型来定，而非脆弱关键词。）
 
     # ── LLM 复杂度分类 ──
     knowledge_prompt = format_brain_knowledge_prompt(
@@ -354,6 +332,18 @@ async def plan(state: BrainState) -> dict:
     )
     _plan_degraded: str | None = None  # LLM 降级原因（audit #13），非降级保持 None
     sliding_ctx = sliding_context_prompt(state)
+
+    # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
+    # （见 task 0f93f1fc：replan 后 LLM 看不到"依赖悬空/scope 冲突"原因 → 原样重生成）。
+    _replan_feedback = (state.get("replan_feedback") or "").strip()
+    if _replan_feedback:
+        sliding_ctx = (
+            f"⚠️ 上一轮规划执行失败，本次为重新规划（第 {state.get('replan_count', 1)} 次）。\n"
+            f"上轮失败根因（务必规避，不要重复同样的拆分/依赖/scope 错误）：\n"
+            f"{_replan_feedback}\n\n"
+            + (sliding_ctx or "")
+        )
+        logger.info("[PLAN] replan 重入 — 已注入上轮失败原因供 LLM 规避")
 
     # ── LLM 任务拆解 ──
     try:
@@ -514,8 +504,21 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": [],
         }
 
-    # ── LLM 计划验证（结构已通过后的补充）──
+    # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
+    # Bug-2 根治（task 92ff8a71/70543ea2/37460a5b 实证）：过去 llm_valid =
+    # result.get("valid", False) 是 fail-closed —— LLM 没明确返回 valid:true 就否决，
+    # 叠加 GLM-5.1 流式超时返回截断/畸形 JSON（无 valid 键）→ 反复否决 → 耗尽 3 重试
+    # → 主流程卡死在 PLAN，根本走不到 DISPATCH。而异常路径反而 fail-open，策略自相矛盾。
+    #
+    # 新策略：【结构校验通过即放行】。LLM 验证仅作软建议——收集 issues/suggestions
+    # 记日志供观测，绝不阻断流程。结构校验（validate_plan_structure）已硬保证 DAG/
+    # scope/依赖可执行性，这是确定性闸门；LLM 的"质量"判断是主观软信号，不该一票否决。
+    # SWARM_VALIDATE_PLAN_LLM_GATE=true 可恢复旧的硬否决行为（默认 false=软建议）。
+    llm_gate_hard = os.environ.get(
+        "SWARM_VALIDATE_PLAN_LLM_GATE", "false"
+    ).lower() in ("true", "1", "yes")
     llm_valid = True
+    llm_issues: list[str] = []
     try:
         llm = _get_brain_llm()
         plan_json = plan_obj.model_dump_json(indent=2)
@@ -529,7 +532,17 @@ async def validate_plan(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         result = _parse_json_from_llm(response.content)
-        llm_valid = bool(result.get("valid", False))
+        llm_says_valid = bool(result.get("valid", False))
+        llm_issues = list(result.get("issues", []) or [])
+        if not llm_says_valid:
+            if llm_gate_hard:
+                llm_valid = False
+            else:
+                # 软建议：记录 LLM 的顾虑但放行（结构已通过）
+                logger.info(
+                    "[VALIDATE_PLAN] LLM 软建议（不阻断）：valid=false, issues=%s",
+                    llm_issues or "(未给出具体问题)",
+                )
     except json.JSONDecodeError as e:
         logger.warning(f"[VALIDATE_PLAN] LLM JSON 解析失败，结构已通过则放行: {e}")
         llm_valid = True
@@ -538,37 +551,33 @@ async def validate_plan(state: BrainState) -> dict:
         llm_valid = True
 
     plan_valid = llm_valid
-    logger.info(f"[VALIDATE_PLAN] 结果: {'通过' if plan_valid else '未通过'}")
+    logger.info(
+        f"[VALIDATE_PLAN] 结果: {'通过' if plan_valid else '未通过'} "
+        f"(LLM门={'硬否决' if llm_gate_hard else '软建议'})"
+    )
     return {
         "plan_valid": plan_valid,
         "plan_retry_count": retry_count,
-        "plan_validation_issues": [] if plan_valid else ["LLM 计划验证未通过"],
+        "plan_validation_issues": [] if plan_valid else (llm_issues or ["LLM 计划验证未通过"]),
     }
 
 
 def confirm_plan(state: BrainState) -> dict:
-    """CONFIRM 节点 — ultra 复杂度任务的人工确认点
+    """CONFIRM 节点 — 人工确认点（ultra 复杂度 / 计划校验失败 / 显式人工确认）
 
     使用 langgraph.types.interrupt 实现挂起等待人工输入。
-    输入: plan, task_description, complexity
+    输入: plan, task_description, complexity, plan_valid
     输出: human_decision
 
-    在 auto_accept 模式下（API 调用），跳过 interrupt 直接接受。
+    auto_accept 模式语义（P0-3 修复）：
+    - plan_valid=True  → 自动接受（原行为，纯自动 API 场景顺畅放行）。
+    - plan_valid=False → **不得自动接受非法计划**（task 0f93f1fc：auto_accept 把
+      校验失败 4 次的计划直接放行，送进 dispatch 后 scope 冲突 + 悬空依赖必败）。
+      按产品决策(Q2)：有人工监听 → interrupt 等人工出选项/输入框；纯自动无监听
+      (auto_accept) → 降级 fail-fast(REJECT)，给出清晰原因，而非蒙混放行。
     """
-    logger.info("[CONFIRM] 等待人工确认 (ultra 复杂度)")
-
-    # API 模式下自动接受，避免 ainvoke 挂起
-    auto_accept = state.get("auto_accept", False) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
-
-    if auto_accept:
-        logger.info("[CONFIRM] 自动接受 (auto_accept 模式)")
-        return {"human_decision": HumanDecision.ACCEPT}
-
-    # interrupt 会暂停图执行，等待外部输入
-    # 外部调用方通过 Command(resume=...) 提供人类决策
-    plan_obj = state.get("plan")
-    # audit #8：confirm 有两种进入原因，文案需区分，否则"计划校验失败"场景会误用
-    # "架构级变更（ultra）"措辞，让用户误以为这是 ultra 任务。
+    # P2-2 修复：进入 confirm 有三种原因，文案/日志按 reason 区分，
+    # 不再无条件打印"ultra 复杂度"（误导：medium 校验失败也会进这里）。
     _complexity = state.get("complexity", Complexity.MEDIUM)
     _plan_valid = state.get("plan_valid", True)
     if not _plan_valid:
@@ -580,6 +589,31 @@ def confirm_plan(state: BrainState) -> dict:
     else:
         _reason = "manual_confirm"
         _msg = "此任务需人工确认执行计划，请审核后决定是否继续。"
+
+    logger.info("[CONFIRM] 等待人工确认 (reason=%s)", _reason)
+
+    auto_accept = state.get("auto_accept", False) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+
+    if auto_accept:
+        # P0-3 闸门：auto_accept 只对合法计划生效。非法计划纯自动场景 fail-fast。
+        # 放行判据收敛在 brain.gates 单一事实源（与 DELIVER 同构，杜绝"修一个漏一个"）。
+        from swarm.brain.gates import can_auto_accept_plan
+
+        allow, reason = can_auto_accept_plan(state)
+        if not allow:
+            logger.warning(
+                "[CONFIRM] auto_accept 模式拒绝放行非法计划（fail-fast）：%s", reason,
+            )
+            return {
+                "human_decision": HumanDecision.REJECT,
+                "confirm_reason": _reason,
+                "verification_failure": "plan_invalid",
+            }
+        logger.info("[CONFIRM] 自动接受 (auto_accept 模式，计划合法)")
+        return {"human_decision": HumanDecision.ACCEPT}
+
+    # 有人工监听：interrupt 暂停图执行，等待外部 Command(resume=...) 提供决策。
+    plan_obj = state.get("plan")
     decision = interrupt(
         {
             "type": "confirm_plan",
@@ -588,6 +622,7 @@ def confirm_plan(state: BrainState) -> dict:
             "task_description": state.get("task_description"),
             "complexity": _complexity.value if hasattr(_complexity, "value") else str(_complexity),
             "plan": plan_obj.model_dump() if plan_obj is not None and hasattr(plan_obj, "model_dump") else {},
+            "plan_validation_issues": state.get("plan_validation_issues") or [],
             "message": _msg,
         }
     )
@@ -948,12 +983,39 @@ async def handle_failure(state: BrainState) -> dict:
     if strategy == "replan":
         for fid in failed_ids:
             subtask_results.pop(fid, None)
-        logger.info("[HANDLE_FAILURE] 策略=replan — 清除失败结果，触发重新规划")
+        # P0-2 熔断：replan 不能无限重入。每次 replan 计数，超过上限直接升级人工，
+        # 而非继续 PLAN→ELABORATE→（可能同样的坏计划）→再失败，最终撞穿 recursion_limit
+        # （见 task 0f93f1fc：replan 后又拆出同样的悬空依赖）。
+        replan_count = state.get("replan_count", 0) + 1
+        max_replan = get_config().model.max_retries  # 复用 max_retries（默认 2）
+        if replan_count > max_replan:
+            logger.warning(
+                "[HANDLE_FAILURE] replan 已达上限(%d 次)仍失败 → 升级人工审核（避免无限重规划）",
+                max_replan,
+            )
+            return {
+                "subtask_results": subtask_results,
+                "failed_subtask_ids": failed_ids,
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "l2_passed": False,
+                "replan_count": replan_count,
+            }
+        # P0-2 携带失败原因：把本轮失败详情注入 state，供 PLAN 重新规划时参考，
+        # 避免 LLM 看不到失败原因而原样重生成同一个坏计划。
+        replan_feedback = (result.get("reasoning") or "").strip()
+        logger.info(
+            "[HANDLE_FAILURE] 策略=replan（第 %d/%d 次）— 清除失败结果，触发重新规划%s",
+            replan_count, max_replan,
+            "（已携带失败原因供 PLAN 参考）" if replan_feedback else "",
+        )
         return {
             "subtask_results": subtask_results,
             "failed_subtask_ids": [],
             "plan_valid": False,
             "failure_strategy": "replan",
+            "replan_count": replan_count,
+            "replan_feedback": replan_feedback,
         }
 
     if strategy == "escalate":
@@ -964,6 +1026,65 @@ async def handle_failure(state: BrainState) -> dict:
             "l2_passed": False,
             "failed_subtask_ids": failed_ids,
         }
+
+    # ── P2：瞬时(transient)失败优先走退避重试，与 capability 配额隔离 ──
+    # 背景(task 37460a5b)：Connection error/Internal Server Error 等基础设施抖动，过去与
+    # 拒答/空 diff 等能力问题混在同一条 retry 阶梯，0.8s 内连撞两次烧光配额直接 escalate。
+    # 现在：本批若【全部】是 transient 失败 → 走带指数退避的轻量重试(独立计数器，上限 3)，
+    # 不消耗 capability 的 subtask_retry_counts。一旦混入 capability 失败，则交给下方阶梯
+    # (capability 才是该换模型/升级的真问题，不能被 transient 掩盖)。
+    from swarm.models.errors import TRANSIENT, classify_failure, backoff_seconds
+
+    def _failure_class_of(fid: str) -> str | None:
+        out = subtask_results.get(fid)
+        details: dict = {}
+        summary = ""
+        if isinstance(out, WorkerOutput):
+            details = out.l1_details or {}
+            summary = out.summary or ""
+        elif isinstance(out, dict):
+            details = out.get("l1_details", {}) or {}
+            summary = out.get("summary", "") or ""
+        fc = details.get("failure_class")
+        if fc:
+            return fc
+        # 兜底：summary/error 文本再分类一次（worker 未显式标注时）
+        return classify_failure(summary or details.get("error"))
+
+    failure_classes = {fid: _failure_class_of(fid) for fid in failed_ids}
+    transient_ids = [fid for fid, fc in failure_classes.items() if fc == TRANSIENT]
+    MAX_TRANSIENT_RETRY = 3
+
+    # 仅当本批失败【全部】为 transient 时才走退避快路（混入 capability 则不抢占阶梯）。
+    if transient_ids and len(transient_ids) == len(failed_ids):
+        transient_counts = dict(state.get("subtask_transient_counts", {}))
+        next_tcounts = {fid: transient_counts.get(fid, 0) + 1 for fid in transient_ids}
+        deepest_t = max(next_tcounts.values(), default=0)
+        if deepest_t <= MAX_TRANSIENT_RETRY:
+            delay = backoff_seconds(deepest_t)
+            logger.info(
+                "[HANDLE_FAILURE] 策略=retry(transient 退避，第 %d/%d 次，sleep %.1fs，不计 capability 配额): %s",
+                deepest_t, MAX_TRANSIENT_RETRY, delay, transient_ids,
+            )
+            await asyncio.sleep(delay)
+            dispatch_remaining = list(state.get("dispatch_remaining", []))
+            for fid in transient_ids:
+                subtask_results.pop(fid, None)
+                if fid not in dispatch_remaining:
+                    dispatch_remaining.append(fid)
+            return {
+                "dispatch_remaining": dispatch_remaining,
+                "failed_subtask_ids": [],
+                "subtask_results": subtask_results,
+                "failure_strategy": "retry",
+                "use_alternate_model": False,
+                "subtask_transient_counts": {**transient_counts, **next_tcounts},
+            }
+        # transient 退避也用尽 → 落入下方 capability 阶梯（基础设施持续不可用，升级人工）
+        logger.warning(
+            "[HANDLE_FAILURE] transient 退避重试已达上限(%d 次)仍失败，转入 capability 阶梯: %s",
+            MAX_TRANSIENT_RETRY, transient_ids,
+        )
 
     # retry / retry_alternate — 确定性递进升级（覆盖 LLM 决策，防止无限重试）
     #
@@ -1380,7 +1501,23 @@ def deliver(state: BrainState) -> dict:
     auto_accept = state.get("auto_accept", False) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
 
     if auto_accept:
-        logger.info("[DELIVER] 自动接受 (auto_accept 模式)")
+        # P1 闸门（对齐 CONFIRM 的 P0-3）：auto_accept 只对【真正成功】的产出放行。
+        # 失败/升级/未验证通过的产出绝不能被当成功 ACCEPT，否则 after_deliver 会路由到
+        # LEARN_SUCCESS，把失败任务学成成功模式污染知识库（task 37460a5b: escalate 后
+        # 仍 LEARN_SUCCESS id=393）。放行判据收敛在 brain.gates 单一事实源。
+        from swarm.brain.gates import can_auto_accept_delivery
+
+        allow, reason = can_auto_accept_delivery(state)
+        if not allow:
+            logger.warning(
+                "[DELIVER] auto_accept 拒绝放行未成功产出（fail-fast，走 LEARN_FAILURE）：%s",
+                reason,
+            )
+            return {
+                "human_decision": HumanDecision.REJECT,
+                "deliver_auto_reject_reason": reason,
+            }
+        logger.info("[DELIVER] 自动接受 (auto_accept 模式，产出已验证通过)")
         return {"human_decision": HumanDecision.ACCEPT}
 
     # interrupt 暂停图执行，等待外部输入

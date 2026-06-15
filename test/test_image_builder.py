@@ -22,10 +22,12 @@ def test_dockerfile_java_jdk_version():
     """Java 工具链 → Dockerfile 用探测到的 JDK 版本。"""
     spec = EnvSpec(project_id="p1", toolchains=[
         Toolchain(name="java", version="17", build_tool="maven", dep_source="pom.xml")])
-    df = generate_dockerfile(spec)
+    # src_included=True：warmup 离线自测(mvn -o)现在发生在 COPY 真项目源码之后
+    # （v3+：对真项目编译预热 .m2，而非旧的精简 warmup pom）。
+    df = generate_dockerfile(spec, src_included=True)
     assert "openjdk-17-jdk maven" in df
     assert "java-17-openjdk" in df
-    assert "mvn -o" in df  # 离线自测
+    assert "mvn -o" in df  # 离线自测（COPY 源码后对真项目离线编译）
     assert "FROM ghcr.io/tencentcloud/cubesandbox-base" in df
     print("  ✅ Java Dockerfile: JDK17 + maven + mvn -o 自测")
 

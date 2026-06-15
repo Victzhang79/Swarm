@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re as _re
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,67 @@ from swarm.config.settings import SandboxConfig, get_config
 from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
+
+# 裸 `python` token（命令开头或管道/分隔符/&&/||/; 之后），但排除 python3 / pythonX。
+# 沙箱镜像 PATH 只有 python3，无 python 别名 → 裸 python 调用须规范化为 python3。
+_PYTHON_TOKEN_RE = _re.compile(r"(?<![\w./-])python(?![\w.-])")
+
+# `py_compile` 只接受【文件】参数，传目录（如 `.`）必报 [Errno 21] Is a directory，
+# exit=1 → L1 构建闸门假阴性（task d4f9db79 实证：trivial 成功却被判失败）。
+# 默认 harness build_command="python -m py_compile ." 一直不可执行，被 python→python3
+# 修复前的 127 错误掩盖。compileall 才接受目录并递归编译。在统一入口幂等规范化：
+# 当 py_compile 的参数含非 .py 路径（目录）时整体改 compileall。与 _normalize_python_cmd
+# 同源，沙箱/本地两条路径自动覆盖；LLM 即使再生成 py_compile <dir> 也被兜底改正。
+# 捕获 `-m py_compile <args...>`，args 直到命令分隔符（&& || ; | 换行）或行尾。
+_PY_COMPILE_RE = _re.compile(r"-m\s+py_compile\s+(?P<args>[^&|;\n]+)")
+
+
+def _normalize_py_compile_cmd(command: str) -> str:
+    """把 `py_compile <含目录参数>` 规范化为 `compileall <同参数>`（幂等）。
+
+    py_compile 仅接受文件；只要参数里出现任一非 .py 结尾的路径（典型是目录 `.`），
+    命令必失败。compileall 接受目录递归编译，是"编译整个项目"的正确工具。
+      - "python3 -m py_compile ."              → "python3 -m compileall ."         ✅
+      - "python -m py_compile src/"            → "python -m compileall src/"        ✅
+      - 'python3 -m py_compile "a.py" "b.py"'  → 不变（全是 .py 文件，py_compile 正确）✅
+      - "python3 -m compileall ."              → 不变（已是 compileall）             ✅
+    """
+    if not command or "py_compile" not in command:
+        return command
+
+    def _sub(m: "_re.Match[str]") -> str:
+        raw = m.group("args")
+        # 拆 token 检查：剥掉成对引号后，任一非 .py 结尾的 token 视为目录 → 需 compileall。
+        toks = [t.strip("'\"") for t in raw.split() if t.strip("'\"")]
+        # 仅看位置参数（跳过 -q/-f 等选项），任一不以 .py 结尾即判定含目录。
+        pos = [t for t in toks if not t.startswith("-")]
+        has_dir = any(not t.endswith(".py") for t in pos) if pos else True
+        if has_dir:
+            return m.group(0).replace("py_compile", "compileall", 1)
+        return m.group(0)
+
+    return _PY_COMPILE_RE.sub(_sub, command)
+
+
+def _normalize_python_cmd(command: str) -> str:
+    """把命令中独立的 `python` token 规范化为 `python3`（幂等）。
+
+    沙箱 python 镜像 PATH 只有 python3，无 python 别名。harness/trivial 生成的
+    "python -m py_compile" / "python -m pytest" 等会 exit=127 command not found，
+    导致 L1 误判失败（task a4988789 实证）。在沙箱命令执行统一入口规范化，单一事实源，
+    覆盖所有 harness/worker/trivial 命令，避免逐处改命令字符串"修一个漏一个"。
+
+    用负向断言只替换独立 token：
+      - "python -m pytest"   → "python3 -m pytest"   ✅
+      - "python3 -m pytest"  → 不变（python3 不匹配）  ✅
+      - "PYTHONPATH=. python" → "PYTHONPATH=. python3"（PYTHONPATH 不受影响）✅
+      - "/usr/bin/python"    → 不变（前面有 / ，不匹配）✅
+    """
+    if not command or "python" not in command:
+        return command
+    # 先 python→python3，再 py_compile <dir>→compileall <dir>（两道幂等规范化串联，单一事实源）
+    command = _PYTHON_TOKEN_RE.sub("python3", command)
+    return _normalize_py_compile_cmd(command)
 
 
 # A1 批3：进程级稳定实例 ID。多副本场景下，每个 swarm 进程有唯一 instance_id，
@@ -534,8 +596,12 @@ class SandboxManager:
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
         # 1) 清 workdir 内容（保留目录本身）
         # 2) 清 /tmp 内容
-        # 3) 清 $HOME 下常见缓存（pip/npm/cargo/go/gradle/.cache 等），保留 shell 配置
-        cache_dirs = ".cache .npm .cargo .gradle .m2 go/pkg .config/pip __pycache__ .pytest_cache .mypy_cache node_modules"
+        # 3) 清 $HOME 下常见缓存，保留 shell 配置
+        # ⚠️ 关键：绝不清 .m2/.gradle —— 这是项目专属模板（方案 B）warmup 预热的依赖缓存，
+        #    是宝贵资产。误删会导致 worker 跑 mvn/gradle 时重新在线下载几十个 jar（实测
+        #    清 .m2 后沙箱每次编译下载 60+ 依赖，warmup 白做）。依赖按 GAV 坐标隔离、是只读
+        #    下载物、不含项目源码，跨同语言项目复用反而加速，无泄漏风险，故保留。
+        cache_dirs = ".cache .npm .cargo go/pkg .config/pip __pycache__ .pytest_cache .mypy_cache node_modules"
         cmd = (
             f"mkdir -p {workdir} && "
             f"find {workdir} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
@@ -584,18 +650,35 @@ class SandboxManager:
 
         借出/创建沙箱后调用；不健康（探活失败）则弃用换新沙箱。
         用 run_command（shell 端点，不依赖 Jupyter kernel）跑 echo 标记。
+
+        关键：探活经 CubeProxy/openresty 网关，大量并发创建沙箱时网关会瞬时
+        504 Gateway Time-out（实测一个任务因 504 雪崩弃用 17 个沙箱）。504/网关超时
+        是【瞬时】错误，沙箱本身往往是好的——故对这类错误做短退避重试，区分"网关
+        瞬时过载"与"沙箱真故障"，避免误弃用引发创建雪崩、加重网关负载、耗尽资源。
         """
+        import time as _time
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
-        try:
-            cr = self.run_command(sandbox, "echo __SWARM_HEALTH_OK__", timeout=15, _count_failures=False)
-            ok = cr.success and "__SWARM_HEALTH_OK__" in (cr.stdout or "")
-            if not ok:
-                logger.warning("沙箱 %s 健康探活未通过: success=%s err=%s",
-                               sid, cr.success, (cr.error or "")[:120])
-            return ok
-        except Exception as exc:  # noqa: BLE001 — 探活不应让上层崩
-            logger.warning("沙箱 %s 健康探活异常: %s", sid, str(exc)[:120])
-            return False
+        _GATEWAY_HINTS = ("504", "gateway time-out", "gateway timeout",
+                          "timeoutexception", "502", "bad gateway", "openresty")
+        last_err = ""
+        for _attempt in range(3):  # 最多 3 次（含首次），瞬时 504 通常第 2 次即恢复
+            try:
+                cr = self.run_command(sandbox, "echo __SWARM_HEALTH_OK__", timeout=15, _count_failures=False)
+                ok = cr.success and "__SWARM_HEALTH_OK__" in (cr.stdout or "")
+                if ok:
+                    return True
+                last_err = (cr.error or "")[:160]
+            except Exception as exc:  # noqa: BLE001 — 探活不应让上层崩
+                last_err = str(exc)[:160]
+            # 仅对网关瞬时错误重试；非网关错误（真沙箱故障）立即判死不浪费时间
+            if any(h in last_err.lower() for h in _GATEWAY_HINTS) and _attempt < 2:
+                logger.info("沙箱 %s 探活遇网关瞬时错误(504/网关超时)，退避重试 [%d/3]: %s",
+                            sid, _attempt + 1, last_err[:80])
+                _time.sleep(2.0 * (_attempt + 1))  # 2s, 4s 退避
+                continue
+            break
+        logger.warning("沙箱 %s 健康探活未通过: err=%s", sid, last_err)
+        return False
 
     def run_command(self, sandbox: Any, command: str, timeout: int = 120, _count_failures: bool = True, _skip_blacklist: bool = False) -> "CodeResult":
         """在沙箱内执行 shell 命令 —— 走 SDK 原生 commands.run(shell 端点)。
@@ -632,6 +715,11 @@ class SandboxManager:
                     stdout="", stderr=f"⛔ 命令被安全黑名单拦截：{reason}",
                     error=f"command_blocked: {reason}", success=False,
                 )
+        # 沙箱 python 镜像 PATH 只有 python3，无 python 别名。harness/trivial 生成的
+        # "python -m py_compile" 等命令会 exit=127 command not found，导致 L1 误判失败
+        # （task a4988789 实证）。在执行统一入口做幂等规范化：裸 python 调用 → python3。
+        # 用词边界正则只替换独立 token，不误伤 pythonpath / python3 / /usr/bin/python。
+        command = _normalize_python_cmd(command)
         logger.debug("Running command in sandbox %s: %s...", sid, command[:80])
         try:
             res = sandbox.commands.run(command, timeout=timeout)

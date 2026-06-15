@@ -347,7 +347,12 @@ def build_brain_graph() -> StateGraph:
     # analyze → plan 改为条件边（见下方 after_analyze，接入 Q4 规划子图）
     graph.add_edge("plan", "elaborate")          # plan 后做上下文预算/INVEST 后处理
     graph.add_edge("elaborate", "validate_plan")
-    graph.add_edge("confirm", "dispatch")       # confirm 后实际路由在 after_confirm 条件边
+    # 注意：confirm 的出口【完全】由 after_confirm 条件边决定（见下方 add_conditional_edges）。
+    # 此处【绝不能】再加 graph.add_edge("confirm", "dispatch") —— LangGraph 会把同节点的
+    # 静态边与条件边当 fan-out 并行触发：即使 after_confirm 返回 "end"(REJECT)，静态边仍会
+    # 把流程拽进 dispatch，导致"计划已判非法 / 已 reject，执行层却照样派发"(task 37460a5b
+    # 13 分钟空烧的根因)。该缺陷自初始提交起潜伏，直到 plan_invalid→CONFIRM(REJECT) 路径
+    # 被启用才显形。test/test_confirm_fanout_topology.py 用图拓扑断言守护此不变量。
     graph.add_edge("revision", "dispatch")
     graph.add_edge("learn_success", END)
     graph.add_edge("learn_failure", END)
