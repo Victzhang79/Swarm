@@ -111,6 +111,9 @@ class BrainState(TypedDict, total=False):
     # ─── 技术方案 + 评审(Q5/Q6/B)───
     tech_design: dict                   # {stack, architecture, data_model_diagram, flow_diagram, risks, notes, acceptance, change_impact, maintainability, comment_requirements}
     shared_contract_draft: dict         # 接口先行(B)：API schema / 数据模型，供并行子任务作稳定前置
+    tech_design_fact_issues: list       # 事实核验问题（虚假前提）：[{claim, verdict(false/already_exists/uncertain), detail, suggestion}]
+    tech_design_file_plan: list         # 文件级技术方案：[{path, action(create/modify), responsibility, depends_on}]，喂给 PLAN 定 scope
+    clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
     design_review: dict                 # {decision: approve|reject, feedback, reject_count}
     # ─── 渐进明细(两层)───
     plan_milestones: list[dict]         # L0 骨架：[{goal, modules, risks}]

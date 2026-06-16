@@ -171,6 +171,39 @@ async def clarify(state: BrainState) -> dict:
     """
     if state.get("is_micro_task"):
         return {"clarify_done": True, "clarify_summary": "微任务，跳过澄清。"}
+
+    # ── 虚假前提优先处理（需求转化层 tech_design 检出，覆盖 auto_accept）──
+    # 用户决策："涉及事实需澄清，就不能 auto_accept"。虚假前提是【事实错误】非信息不足，
+    # auto 模式也【绝不能用默认假设硬跑】——基于虚假前提产出的都是垃圾、纯烧算力。
+    false_premises = [
+        fi for fi in (state.get("tech_design_fact_issues") or [])
+        if isinstance(fi, dict) and fi.get("verdict") == "false"
+    ]
+    if false_premises:
+        _msgs = []
+        for fp in false_premises:
+            sug = f"（{fp.get('suggestion')}）" if fp.get("suggestion") else ""
+            _msgs.append(f"- {fp.get('claim', '?')}：{fp.get('detail', '事实核验未通过')}{sug}")
+        summary = "需求存在虚假前提，无法基于不存在的事实执行：\n" + "\n".join(_msgs)
+        if _auto_mode(state):
+            # auto 模式：不假设、不硬跑，标记需人工澄清后终止本轮（覆盖 auto_accept）
+            logger.warning("[CLARIFY] 检出虚假前提，auto 模式下仍终止待人工澄清（覆盖 auto_accept）")
+            return {
+                "clarify_done": True,
+                "clarify_blocked_by_facts": True,
+                "clarify_summary": summary,
+            }
+        # 交互模式：向用户提问"你是指 X 吗"
+        from langgraph.types import interrupt as _interrupt
+        ask = summary + "\n\n请确认或修正需求（如指明正确的文件/模块）。"
+        try:
+            answer = _interrupt({"type": "clarify_fact_issue", "question": ask})
+            history = list(state.get("clarify_history", []))
+            history.append({"q": ask, "a": str(answer)})
+            return {"clarify_history": history, "clarify_round": int(state.get("clarify_round", 0)) + 1}
+        except Exception:  # noqa: BLE001
+            return {"clarify_done": True, "clarify_blocked_by_facts": True, "clarify_summary": summary}
+
     if _auto_mode(state):
         return {"clarify_done": True, "clarify_summary": "自动化模式，跳过澄清，用默认假设。"}
 
@@ -295,6 +328,108 @@ def _format_knowledge(state: BrainState) -> str:
         return "（无项目知识库上下文）"
 
 
+def _resolve_project_path(state: BrainState) -> str | None:
+    """从 state 解析项目真实磁盘路径（事实核验/file_plan 的 ground truth 源）。"""
+    pid = state.get("project_id") or ""
+    if not pid:
+        return None
+    try:
+        from swarm.project import store as _store
+        proj = _store.get_project(pid)
+        return proj.get("path") if proj else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gather_project_facts(project_path: str | None, max_dirs: int = 60) -> str:
+    """采集项目真实结构事实供 tech_design 核验【事实依据】（ground truth=磁盘，不靠可能滞后的索引）。
+
+    产出：① 顶层目录树（前若干层，识别分层规范如 RuoYi 的 controller/service/mapper/domain）；
+    ② 各典型层下的样例文件名（让 LLM 学到命名/路径规律，设计新文件路径时照此推导）。
+    这样 tech_design 能核验"需求点名的文件是否真实存在"+ 据真实结构设计新文件路径。
+    """
+    if not project_path:
+        return "（无项目路径，无法核验文件事实——方案中的文件存在性需 worker 沙箱实地确认）"
+    import os
+    try:
+        lines: list[str] = []
+        # 识别典型分层目录的样例文件（帮 LLM 学命名规律）
+        sample_patterns = ("controller", "service", "mapper", "domain", "entity",
+                            "model", "dao", "repository", "api", "views", "components")
+        seen_samples: dict[str, list[str]] = {}
+        dir_count = 0
+        for root, dirs, files in os.walk(project_path):
+            # 跳过噪音目录
+            dirs[:] = [d for d in dirs if d not in (
+                ".git", "node_modules", "target", "dist", "build", ".venv",
+                "__pycache__", ".idea", ".codegraph")]
+            rel = os.path.relpath(root, project_path)
+            if rel == ".":
+                rel = ""
+            depth = rel.count(os.sep) if rel else 0
+            if depth > 4:
+                dirs[:] = []
+                continue
+            dir_count += 1
+            if dir_count > max_dirs * 5:
+                break
+            low = rel.lower()
+            for pat in sample_patterns:
+                if pat in low and len(seen_samples.get(pat, [])) < 3:
+                    for f in files[:3]:
+                        seen_samples.setdefault(pat, []).append(os.path.join(rel, f))
+        if seen_samples:
+            lines.append("项目分层样例文件（据此学习命名/路径规律，新文件路径照此推导）：")
+            for pat, fs in list(seen_samples.items())[:8]:
+                for f in fs[:2]:
+                    lines.append(f"  - {f}")
+        return "\n".join(lines) if lines else "（项目结构已扫描，未识别到典型分层目录）"
+    except Exception as exc:  # noqa: BLE001
+        return f"（项目结构扫描失败：{exc}；文件存在性需 worker 沙箱实地确认）"
+
+
+def _verify_named_files_exist(task_description: str, project_path: str | None) -> list[dict]:
+    """事实核验：从需求中提取被点名的文件，查真实磁盘是否存在（虚假前提检测）。
+
+    返回 [{"file": basename, "exists": bool, "candidates": [近似文件]}]。
+    project_path 缺失 → 返回空（无法核验，不误判）。
+    用于 tech_design：点名文件不存在 → 虚假前提 → 触发澄清（不能 auto_accept）。
+    """
+    if not project_path:
+        return []
+    import os
+    import re
+    # 提取需求里像文件名的 token（含扩展名）
+    named = re.findall(r"\b([A-Za-z_][\w./-]*\.[A-Za-z]{1,5})\b", task_description or "")
+    if not named:
+        return []
+    # 建一次全项目文件 basename → 路径 索引
+    all_files: dict[str, list[str]] = {}
+    try:
+        for root, dirs, files in os.walk(project_path):
+            dirs[:] = [d for d in dirs if d not in (
+                ".git", "node_modules", "target", "dist", "build", ".venv",
+                "__pycache__", ".idea", ".codegraph")]
+            for f in files:
+                all_files.setdefault(f.lower(), []).append(
+                    os.path.relpath(os.path.join(root, f), project_path))
+    except Exception:  # noqa: BLE001
+        return []
+    results: list[dict] = []
+    for token in set(named):
+        base = os.path.basename(token).lower()
+        if base in all_files:
+            results.append({"file": token, "exists": True, "candidates": all_files[base][:2]})
+        else:
+            # 找近似（同前缀/编辑距离近）的候选，供澄清"你是指 X 吗"
+            stem = base.rsplit(".", 1)[0]
+            cands = [p for fn, ps in all_files.items()
+                     for p in ps
+                     if fn.rsplit(".", 1)[0].startswith(stem[:3]) and len(stem) >= 3][:3]
+            results.append({"file": token, "exists": False, "candidates": cands})
+    return results
+
+
 # ══════════════════════════════════════════════
 # 节点 2：assess — 澄清后定级（Q2 复杂度后置）
 # ══════════════════════════════════════════════
@@ -366,30 +501,40 @@ async def assess(state: BrainState) -> dict:
 # 节点 3：tech_design — 技术方案 + 接口先行（Q6/B）
 # ══════════════════════════════════════════════
 
-TECH_DESIGN_SYSTEM = """你是资深技术负责人。基于澄清后的完整需求 + 项目知识库，\
-产出一份可评审的技术方案。
+TECH_DESIGN_SYSTEM = """你是资深技术负责人。基于【真实产品需求】+ 项目知识库 + 项目真实结构，\
+产出一份可执行的技术方案。你的核心职责有两个：
+
+【职责一：事实核验】先核对需求的事实依据，不要基于虚假前提设计：
+- 需求点名的文件/类/表是否在项目里真实存在？（见下方"被点名文件的真实存在性核验"）
+- 若需求说"在 X 文件加内容"但 X 不存在 → 这是【虚假前提】，必须在输出标记 fact_issues，不要硬编方案。
+- 若需求说"新增 Y 模块"但 Y 已存在 → 标记，避免重复创建。
+
+【职责二：需求转化（产品话→技术方案）】真实产品经理只说"要个功能管设备"，不说表/字段/类名。\
+你要基于项目真实结构与分层规范，把模糊的产品需求翻译成明确的【文件级技术方案】：
+- 设计数据模型（要建什么表、字段、类型）。
+- 据项目分层规范（见"项目分层样例文件"，学其命名/路径规律）设计要【新建/修改】哪些文件，给出【完整相对路径】+ 每个文件的职责。
+- 这就是后续 worker 要照着干的清单——务必具体到文件路径，不要只给抽象架构。
 
 要求：
-- 新建项目：给出技术栈选型（前端/后端/存储）及理由。
-- 既有项目：沿用既有技术栈（从知识库判断），重点评估【变更对原功能的影响】和【可维护性】。
-- 必含：架构概述、数据模型（用文字描述的 ER/结构，可 mermaid）、业务流程（文字描述的流程，可 mermaid）、\
-关键风险、注意事项、验收标准、代码注释要求。
-- 接口先行：定义本任务的共享契约（API schema / 关键数据结构），供后续并行子任务作稳定前置。
+- 既有项目：沿用既有技术栈与分层规范（从样例文件学）。
+- file_plan 的路径必须符合项目真实结构（参照样例文件的目录/命名规律推导，勿凭空捏造路径）。
 
 严格输出 JSON：
 {
-  "stack": {"frontend": "...", "backend": "...", "storage": "...", "rationale": "选型理由（新建项目）/沿用说明（既有项目）"},
+  "fact_issues": [{"claim": "需求中的事实主张", "verdict": "false|already_exists|uncertain", "detail": "说明", "suggestion": "近似候选或建议"}],
+  "stack": {"frontend": "...", "backend": "...", "storage": "...", "rationale": "沿用说明"},
   "architecture": "架构概述",
-  "data_model_diagram": "数据模型（文字/mermaid）",
-  "flow_diagram": "业务流程（文字/mermaid）",
-  "risks": ["风险1", "风险2"],
-  "notes": ["注意事项1", "注意事项2"],
-  "acceptance": ["验收标准1", "验收标准2"],
-  "change_impact": "变更对原功能的影响评估（既有项目；新建项目填'新建，无存量影响'）",
-  "maintainability": "可维护性考量",
-  "comment_requirements": "代码注释要求（保证易读）",
+  "data_model": "数据模型（表/字段/类型，文字或 mermaid）",
+  "flow": "业务流程（文字）",
+  "file_plan": [{"path": "完整相对路径", "action": "create|modify", "responsibility": "该文件职责", "depends_on": ["前置文件路径"]}],
+  "risks": ["风险1"],
+  "acceptance": ["验收标准1"],
+  "comment_requirements": "代码注释要求",
   "shared_contract": {"apis": [...], "data_structures": [...]}
-}"""
+}
+
+注意：file_plan 是方案的核心产出——必须列全实现该功能所需的所有文件（新建+修改），路径完整、职责清晰。\
+若 fact_issues 中有 verdict=false 的虚假前提，file_plan 可留空或仅列确定的部分。"""
 
 TECH_DESIGN_USER = """需求：
 {task_description}
@@ -402,7 +547,13 @@ TECH_DESIGN_USER = """需求：
 项目知识库（既有技术栈/结构）：
 {knowledge}
 
-{review_feedback}请产出技术方案。"""
+项目真实结构（事实依据，ground truth）：
+{project_facts}
+
+被点名文件的真实存在性核验（事实依据，标记 exists）：
+{file_verification}
+
+{review_feedback}请先做事实核验，再产出技术方案与文件级 file_plan。"""
 
 
 async def tech_design(state: BrainState) -> dict:
@@ -415,26 +566,78 @@ async def tech_design(state: BrainState) -> dict:
 
     comp = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
     comp_str = comp.value if hasattr(comp, "value") else str(comp)
+
+    # 事实依据采集（ground truth = 真实磁盘，不靠可能滞后的索引）
+    proj_path = _resolve_project_path(state)
+    task_desc = state.get("task_description", "")
+    project_facts = _gather_project_facts(proj_path)
+    file_checks = _verify_named_files_exist(task_desc, proj_path)
+    if file_checks:
+        _fv_lines = []
+        for fc in file_checks:
+            mark = "✓存在" if fc["exists"] else "✗不存在(疑似虚假前提!)"
+            cand = f" 近似候选:{fc['candidates']}" if fc["candidates"] else ""
+            _fv_lines.append(f"  - {fc['file']}: {mark}{cand}")
+        file_verification = "\n".join(_fv_lines)
+    else:
+        file_verification = "（需求未点名具体文件，或无项目路径——无需文件存在性核验）"
+
     try:
         llm = _get_brain_llm()
         resp = await llm.ainvoke([
             {"role": "system", "content": TECH_DESIGN_SYSTEM},
             {"role": "user", "content": TECH_DESIGN_USER.format(
-                task_description=state.get("task_description", ""),
+                task_description=task_desc,
                 clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
                 complexity=comp_str,
                 greenfield="是" if greenfield else "否",
                 knowledge=_format_knowledge(state),
+                project_facts=project_facts,
+                file_verification=file_verification,
                 review_feedback=review_feedback,
             )},
         ])
         result = _parse_json_from_llm(resp.content)
         contract = result.pop("shared_contract", {}) if isinstance(result, dict) else {}
-        logger.info("[TECH_DESIGN] 技术方案已产出 (stack=%s)", (result.get("stack") or {}).get("backend", "?"))
-        return {"tech_design": result, "shared_contract_draft": contract or {}}
+        fact_issues = result.get("fact_issues", []) if isinstance(result, dict) else []
+        file_plan = result.get("file_plan", []) if isinstance(result, dict) else []
+        # 确定性兜底：磁盘核验出"点名文件不存在"，即便 LLM 没标 fact_issues 也补上（事实优先于 LLM）
+        det_false = [fc for fc in file_checks if not fc["exists"]]
+        if det_false and not any(
+            (fi.get("verdict") == "false") for fi in (fact_issues or []) if isinstance(fi, dict)
+        ):
+            for fc in det_false:
+                fact_issues.append({
+                    "claim": f"需求点名文件 {fc['file']}",
+                    "verdict": "false",
+                    "detail": "磁盘核验：该文件在项目中不存在",
+                    "suggestion": f"近似候选：{fc['candidates']}" if fc["candidates"] else "无近似文件",
+                })
+        logger.info(
+            "[TECH_DESIGN] 技术方案已产出 (file_plan=%d 文件, fact_issues=%d)",
+            len(file_plan or []), len(fact_issues or []),
+        )
+        return {
+            "tech_design": result,
+            "shared_contract_draft": contract or {},
+            "tech_design_fact_issues": fact_issues or [],
+            "tech_design_file_plan": file_plan or [],
+        }
     except Exception as exc:  # noqa: BLE001
         logger.warning("[TECH_DESIGN] LLM 失败，产出空方案安全继续: %s", exc)
-        return {"tech_design": {"architecture": "（自动生成失败，降级直接规划）", "risks": [], "notes": []}, "shared_contract_draft": {}}
+        # LLM 失败仍保留确定性磁盘核验结果（虚假前提不能因 LLM 挂了就漏过）
+        det_false = [fc for fc in file_checks if not fc["exists"]]
+        det_issues = [{
+            "claim": f"需求点名文件 {fc['file']}", "verdict": "false",
+            "detail": "磁盘核验：该文件在项目中不存在",
+            "suggestion": f"近似候选：{fc['candidates']}" if fc["candidates"] else "无近似文件",
+        } for fc in det_false]
+        return {
+            "tech_design": {"architecture": "（自动生成失败，降级直接规划）", "risks": [], "notes": []},
+            "shared_contract_draft": {},
+            "tech_design_fact_issues": det_issues,
+            "tech_design_file_plan": [],
+        }
 
 
 # ══════════════════════════════════════════════

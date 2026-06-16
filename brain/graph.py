@@ -76,23 +76,31 @@ _pg_checkpointer_cm = None  # AsyncPostgresSaver.from_conn_string(...) 的 cm，
 # ══════════════════════════════════════════════
 
 
-def after_analyze(state: BrainState) -> Literal["clarify", "plan"]:
+def after_analyze(state: BrainState) -> Literal["clarify", "tech_design"]:
     """ANALYZE 后路由（Q4 规划子图入口）：
-    - needs_clarify(非微任务&非自动化) → CLARIFY（进交互式渐进规划）
-    - 微任务 / 自动化 / 不需澄清 → PLAN（直达，极速/轻量）
+    - needs_clarify(非微任务&非自动化) → CLARIFY（进交互式渐进规划，澄清后经 assess→tech_design）
+    - 其余（含微任务/自动化/直达）→ TECH_DESIGN（需求转化层：事实核验 + 文件级方案）
+
+    需求转化/技术设计前置阶段：所有任务进 PLAN 前都先过 tech_design。它做两件事——
+    ① 事实核验（虚假前提检测，如"改不存在的文件"）；② 产品需求→文件级技术方案。
+    任何级别的任务都可能有虚假前提，故不分难度都核验（轻量核验廉价，转化按需）。
     """
     if state.get("needs_clarify") and not state.get("is_micro_task"):
         logger.info("[ROUTE] ANALYZE → CLARIFY (进规划子图)")
         return "clarify"
-    logger.info("[ROUTE] ANALYZE → PLAN (微任务/自动化/直达)")
-    return "plan"
+    logger.info("[ROUTE] ANALYZE → TECH_DESIGN (需求转化/事实核验前置)")
+    return "tech_design"
 
 
-def after_clarify(state: BrainState) -> Literal["clarify", "assess"]:
+def after_clarify(state: BrainState) -> Literal["clarify", "assess", "deliver"]:
     """CLARIFY 后路由（多轮循环）：
+    - clarify_blocked_by_facts → DELIVER（虚假前提阻断：不进规划，直接报告"基于虚假事实无法执行"）
     - clarify_done → ASSESS（澄清完成，定级）
     - 否则 → CLARIFY（继续下一轮，LLM 再评估是否还要问）
     """
+    if state.get("clarify_blocked_by_facts"):
+        logger.warning("[ROUTE] CLARIFY → DELIVER (虚假前提阻断，终止并报告)")
+        return "deliver"
     if state.get("clarify_done"):
         logger.info("[ROUTE] CLARIFY → ASSESS (澄清完成)")
         return "assess"
@@ -124,6 +132,26 @@ def after_review(state: BrainState) -> Literal["tech_design", "plan"]:
         return "tech_design"
     logger.info("[ROUTE] REVIEW → PLAN (方案通过)")
     return "plan"
+
+
+def after_tech_design(state: BrainState) -> Literal["clarify", "review_design"]:
+    """TECH_DESIGN 后路由（需求转化层出口）：
+    - 检出【虚假前提】（fact_issues 含 verdict=false）→ CLARIFY 强制澄清。
+      事实层不确定必须打断自动化——基于虚假前提自动跑下去只会产垃圾、烧算力。
+      这会【覆盖 auto_accept】：事实存疑就不能自动接受（用户决策："涉及事实需澄清，就不能 auto_accept"）。
+    - 无虚假前提 → REVIEW_DESIGN（原流程：人工评审/auto_accept 自动通过 → plan）。
+    """
+    fact_issues = state.get("tech_design_fact_issues") or []
+    false_premises = [fi for fi in fact_issues if isinstance(fi, dict) and fi.get("verdict") == "false"]
+    if false_premises:
+        logger.warning(
+            "[ROUTE] TECH_DESIGN → CLARIFY (检出 %d 个虚假前提，强制澄清，覆盖 auto_accept): %s",
+            len(false_premises),
+            [fi.get("claim", "?") for fi in false_premises][:3],
+        )
+        return "clarify"
+    logger.info("[ROUTE] TECH_DESIGN → REVIEW_DESIGN (事实核验通过)")
+    return "review_design"
 
 
 def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
@@ -358,17 +386,17 @@ def build_brain_graph() -> StateGraph:
     graph.add_edge("learn_failure", END)
 
     # ── Q4 规划子图边 ──
-    # ANALYZE →[条件] CLARIFY / PLAN
+    # ANALYZE →[条件] CLARIFY / TECH_DESIGN（需求转化前置：直达路径也先过 tech_design）
     graph.add_conditional_edges(
         "analyze",
         after_analyze,
-        {"clarify": "clarify", "plan": "plan"},
+        {"clarify": "clarify", "tech_design": "tech_design"},
     )
     # CLARIFY ⟲[条件] CLARIFY(多轮) / ASSESS
     graph.add_conditional_edges(
         "clarify",
         after_clarify,
-        {"clarify": "clarify", "assess": "assess"},
+        {"clarify": "clarify", "assess": "assess", "deliver": "deliver"},
     )
     # ASSESS →[条件] TECH_DESIGN / PLAN
     graph.add_conditional_edges(
@@ -376,8 +404,12 @@ def build_brain_graph() -> StateGraph:
         after_assess,
         {"tech_design": "tech_design", "plan": "plan"},
     )
-    # TECH_DESIGN → REVIEW_DESIGN
-    graph.add_edge("tech_design", "review_design")
+    # TECH_DESIGN →[条件] CLARIFY(虚假前提，强制澄清) / REVIEW_DESIGN(核验通过)
+    graph.add_conditional_edges(
+        "tech_design",
+        after_tech_design,
+        {"clarify": "clarify", "review_design": "review_design"},
+    )
     # REVIEW_DESIGN →[条件] TECH_DESIGN(打回) / PLAN(通过)
     graph.add_conditional_edges(
         "review_design",

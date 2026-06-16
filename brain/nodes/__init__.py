@@ -302,6 +302,35 @@ async def analyze(state: BrainState) -> dict:
     }
 
 
+def _format_tech_design_for_plan(state: BrainState) -> str:
+    """把 tech_design 产出（file_plan + 数据模型 + 契约）格式化给 PLAN，作为定 scope 的权威依据。
+
+    空（未经 tech_design 或失败）→ 返回提示让 PLAN 回退自推导。
+    """
+    td = state.get("tech_design") or {}
+    file_plan = state.get("tech_design_file_plan") or []
+    if not file_plan and not td.get("data_model"):
+        return "（无技术设计方案——请据项目结构/知识库自行推导要建/改的文件）"
+    lines: list[str] = []
+    if td.get("data_model"):
+        lines.append(f"【数据模型】{td.get('data_model')}")
+    if file_plan:
+        lines.append("【文件级方案 file_plan】（据此确定子任务 scope 的文件，路径已经过事实核验）：")
+        for fp in file_plan:
+            if not isinstance(fp, dict):
+                continue
+            act = fp.get("action", "?")
+            dep = f" 依赖:{fp.get('depends_on')}" if fp.get("depends_on") else ""
+            lines.append(f"  - [{act}] {fp.get('path', '?')} — {fp.get('responsibility', '')}{dep}")
+    contract = state.get("shared_contract_draft") or {}
+    if contract:
+        import json as _json
+        lines.append(f"【共享契约】{_json.dumps(contract, ensure_ascii=False)[:600]}")
+    if td.get("architecture"):
+        lines.append(f"【架构概述】{str(td.get('architecture'))[:300]}")
+    return "\n".join(lines)
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -387,6 +416,9 @@ async def plan(state: BrainState) -> dict:
         llm = _get_brain_llm()
         router = ModelRouter()
         routing_table = router.get_routing_table()
+        # 需求转化层产出注入：把 tech_design 的 file_plan/数据模型/契约喂给 PLAN，
+        # PLAN 据此定 scope（不再从零猜文件）。空则提示回退自推导。
+        tech_design_plan = _format_tech_design_for_plan(state)
         prompt_user = PLAN_USER.format(
             task_description=task_description,
             complexity=complexity.value,
@@ -396,6 +428,7 @@ async def plan(state: BrainState) -> dict:
             user_profile=_brain_profile_prompt(state),
             recent_tasks=recent_tasks_prompt,
             sliding_context=sliding_ctx,
+            tech_design_plan=tech_design_plan,
         )
         response = await llm.ainvoke([
             {"role": "system", "content": PLAN_SYSTEM},

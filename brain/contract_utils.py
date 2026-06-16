@@ -162,24 +162,51 @@ def format_shared_contract_for_prompt(plan: TaskPlan | None) -> str:
 
 
 def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
-    """从共享契约提取需出现在变更中的符号/接口名。"""
+    """从共享契约提取需出现在变更中的【核心标识符】（非整句描述）。
+
+    task 2c019bc5：契约 apis 常是 "GET /system/device/list — 分页查询设备列表，参数：..."
+    这种带中文描述的整句。旧实现把整句当符号去 diff 精确匹配 → 必然找不到 → 误判契约偏离。
+    修复：抽核心标识——API 取 URL 路径段（/system/device/list → device/list 或末段），
+    类/方法/字段取其标识符 token。这样匹配的是代码里真会出现的东西，而非自然语言描述。
+    """
     if not shared_contract:
         return []
+    import re
+
+    def _core(item: str) -> str:
+        """从一条契约描述抽核心标识：优先 URL 路径末段，否则首个标识符 token。"""
+        s = item.strip()
+        # 截断描述部分（破折号/冒号/中文逗号后多为说明）
+        s = re.split(r"\s*[—–:：，,]\s*", s, maxsplit=1)[0].strip()
+        # API 形如 "GET /system/device/list" 或 "/system/device/edit/{id}"
+        # → 取路径最后一个【非占位符】段（list / edit / device）
+        url = re.search(r"/([\w/{}.\-]+)", s)
+        if url:
+            segs = [seg for seg in url.group(1).split("/")
+                    if seg and "{" not in seg and seg.replace("-", "").replace(".", "").isalnum()]
+            if segs:
+                return segs[-1]
+        # 否则取首个像标识符的 token（类名/方法名/字段名）
+        tok = re.search(r"[A-Za-z_]\w{2,}", s)
+        return tok.group(0) if tok else ""
+
     symbols: list[str] = []
     for key in ("interfaces", "types", "apis", "fields", "methods"):
         val = shared_contract.get(key)
         if isinstance(val, list):
             for item in val:
                 if isinstance(item, str):
-                    symbols.append(item)
+                    symbols.append(_core(item))
                 elif isinstance(item, dict):
                     symbols.append(str(item.get("name") or item.get("id") or ""))
         elif isinstance(val, dict):
             symbols.extend(str(k) for k in val.keys())
     for item in shared_contract.get("symbols", []) or []:
         if isinstance(item, str):
-            symbols.append(item)
-    return [s for s in symbols if s]
+            symbols.append(_core(item))
+    # 去重 + 过滤太短/HTTP 动词噪音
+    _noise = {"get", "post", "put", "delete", "patch", "the", "and", "for"}
+    return [s for s in dict.fromkeys(symbols) if s and len(s) >= 3 and s.lower() not in _noise]
 
 
 def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bool:

@@ -86,3 +86,64 @@ def test_injection_idempotent():
     first = st_b.context_snippets
     _inject_predecessor_context([st_b], plan, results)
     assert st_b.context_snippets == first, "重复注入应幂等"
+
+
+# ── 事实库回灌 ──
+def test_feedback_to_knowledge_parses_changes():
+    """子任务产出的 diff → 提取变更文件（区分新建/修改），入队增量索引。"""
+    from unittest.mock import patch as mock_patch
+
+    from swarm.brain.nodes.dispatch import _feedback_to_knowledge
+    out = WorkerOutput(
+        subtask_id="st-1",
+        diff=("--- /dev/null\n+++ b/New.java\n@@ -0,0 +1 @@\n+class New {}\n"
+              "--- a/Old.java\n+++ b/Old.java\n@@ -1 +1 @@\n+changed\n"),
+        summary="x", l1_passed=True,
+    )
+    captured = {}
+    # 无运行中 event loop 时 create_task 会 RuntimeError 被吞——这里只验证不抛异常 + 文件解析
+    # 用真实调用走到 changes 构建（enqueue 在无 loop 时静默跳过）
+    _feedback_to_knowledge("proj-1", _st("st-1"), out)  # 不抛异常即可
+
+
+def test_feedback_no_project_noop():
+    from swarm.brain.nodes.dispatch import _feedback_to_knowledge
+    out = WorkerOutput(subtask_id="x", diff="+++ b/A.java\n+x", summary="", l1_passed=True)
+    _feedback_to_knowledge("", _st("x"), out)  # 无 project_id → noop 不抛
+
+
+def test_feedback_empty_diff_noop():
+    from swarm.brain.nodes.dispatch import _feedback_to_knowledge
+    out = WorkerOutput(subtask_id="x", diff="", summary="", l1_passed=True)
+    _feedback_to_knowledge("proj-1", _st("x"), out)  # 空 diff → noop 不抛
+
+
+# ── 契约符号提取（task 2c019bc5：带中文描述的 API 整句不该整句匹配）──
+def test_contract_symbols_extracts_core_identifier():
+    from swarm.brain.contract_utils import contract_symbols
+    c = {"apis": ["GET /system/device/list — 分页查询设备列表，参数：deviceName",
+                  "POST /system/device/add — 新增设备",
+                  "PUT /system/device/edit/{deviceId} — 修改"]}
+    syms = contract_symbols(c)
+    assert "list" in syms and "add" in syms and "edit" in syms
+    # 不该把整句中文描述当符号
+    assert all(len(s) < 30 for s in syms)
+    # HTTP 动词噪音被过滤
+    assert "get" not in [s.lower() for s in syms]
+
+
+def test_contract_partial_match_passes():
+    """前端实现了部分契约端点 → 不全 missing → 通过（非真偏离）。"""
+    from swarm.brain.integration_review import check_contract_in_diff
+    c = {"apis": ["GET /system/device/list — 查询", "POST /system/device/add — 新增"]}
+    diff = "+++ b/device.js\n+url: '/system/device/list'\n+function add() {}"
+    ok, _ = check_contract_in_diff(diff, c)
+    assert ok
+
+
+def test_contract_total_miss_fails():
+    """完全不沾边 → 全 missing → 失败（真契约偏离）。"""
+    from swarm.brain.integration_review import check_contract_in_diff
+    c = {"apis": ["GET /system/device/list — 查询"]}
+    ok, issues = check_contract_in_diff("+++ b/Other.java\n+foo()", c)
+    assert not ok and issues

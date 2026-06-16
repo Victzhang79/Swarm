@@ -60,6 +60,60 @@ def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) ->
             logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))
 
 
+def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
+    """事实库回灌：子任务产出的变更文件 → knowledge updater 增量索引（best-effort，不阻塞）。
+
+    补"worker 产出不回灌"的断裂——worker 在沙箱建文件 pull-back 到本地但不 git push，
+    knowledge 收不到事件 → 事实库滞后 → 下个任务核验"文件在不在"误判。这里 DONE 后直接喂。
+    只索引本子任务变更的少数文件（updater 本就支持文件级增量），轻量。异步 fire-and-forget。
+    """
+    if not project_id:
+        return
+    try:
+        import re
+
+        from swarm.knowledge.updater import ChangeType, FileChange, UpdateEvent
+
+        diff = worker_output.diff or ""
+        changes: list = []
+        for m in re.finditer(r"^\+\+\+ b/(\S+)", diff, re.MULTILINE):
+            fpath = m.group(1)
+            seg_start = m.start()
+            prev = diff.rfind("--- ", 0, seg_start)
+            is_new = prev >= 0 and "/dev/null" in diff[prev:seg_start]
+            changes.append(FileChange(
+                file_path=fpath,
+                change_type=ChangeType.ADDED if is_new else ChangeType.MODIFIED,
+            ))
+        if not changes:
+            return
+        event = UpdateEvent(
+            project_id=project_id,
+            task_id=getattr(subtask, "id", None),
+            changes=changes,
+            metadata={"source": "worker_feedback"},
+        )
+
+        async def _run():
+            try:
+                from swarm.knowledge.hooks import enqueue_kb_update
+                await enqueue_kb_update(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[DISPATCH] 知识库回灌入队失败(非致命): %s", exc)
+
+        # fire-and-forget：入队异步消费，不阻塞主流程
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_run())
+        except RuntimeError:
+            pass
+        logger.info("[DISPATCH] 事实库回灌：%d 个变更文件入队增量索引（子任务 %s）",
+                    len(changes), getattr(subtask, "id", "?"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[DISPATCH] 知识库回灌跳过(非致命): %s", exc)
+
+
 async def dispatch(state: BrainState) -> dict:
     """DISPATCH 节点 — 将就绪的子任务派发给 Worker
 
@@ -197,6 +251,10 @@ async def dispatch(state: BrainState) -> dict:
         if not _diff_has_changes(worker_output.diff or "") or not worker_output.l1_passed:
             if subtask.id not in failed_ids:
                 failed_ids.append(subtask.id)
+        else:
+            # 事实库回灌（补滞后断裂）：子任务 L1 通过 + 有改动 → 把变更文件喂 knowledge updater
+            # 增量索引，让后续子任务/任务的事实核验能看到最新产出（worker 不 git push，否则知识库永远不知）。
+            _feedback_to_knowledge(state.get("project_id", ""), subtask, worker_output)
 
     result: dict = {
         "subtask_results": subtask_results,
