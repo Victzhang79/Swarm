@@ -97,3 +97,22 @@ def test_verify_both_sources_high_confidence():
     r = _verify_named_files_exist("改 User.java", d)
     hit = [x for x in r if x["file"] == "User.java"][0]
     assert hit["confidence"] == "high" and set(hit["sources"]) == {"disk", "git"}
+
+
+def test_verify_existing_returns_real_path_for_correction():
+    """核验已存在文件 → candidates[0] 是真实路径，供 file_plan 路径校正用（bug 9bd1d5b5）。
+
+    任务1 把 HealthController 建在 monitor/，任务2 LLM 可能猜成 common/。
+    核验必须返回真实路径 monitor/...，让确定性后处理覆盖 LLM 猜的路径。
+    """
+    import os
+    d = _mk_ruoyi_like()
+    # 模拟任务1产出：monitor 目录下的 HealthController
+    os.makedirs(os.path.join(d, "src/controller/monitor"), exist_ok=True)
+    with open(os.path.join(d, "src/controller/monitor/HealthController.java"), "w") as f:
+        f.write("// health\n")
+    r = _verify_named_files_exist("给 HealthController.java 加 version 字段", d)
+    hit = [x for x in r if x["file"] == "HealthController.java"][0]
+    assert hit["exists"] is True
+    assert hit["candidates"], "已存在文件必须返回真实路径"
+    assert "monitor" in hit["candidates"][0], f"真实路径应指向 monitor/: {hit['candidates']}"

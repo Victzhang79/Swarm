@@ -364,7 +364,8 @@ async def plan(state: BrainState) -> dict:
 
     if complexity == Complexity.SIMPLE:
         affected_files = state.get("affected_files") or []
-        task_plan = _build_simple_plan(task_description, affected_files)
+        _proj_path = _get_project_path(state.get("project_id") or "")
+        task_plan = _build_simple_plan(task_description, affected_files, project_path=_proj_path)
         logger.info(
             "[PLAN] SIMPLE 快速路径 — 1 个 trivial 子任务 (scope=%d 文件)",
             len(affected_files),
@@ -1801,13 +1802,18 @@ async def learn_success(state: BrainState) -> dict:
                 )
                 out_files = files_from_unified_diff(merged_diff)
                 import asyncio as _asyncio
-                # 先确保产出在工作区——VERIFY_L2 的 reset 可能已把新建文件删掉，
-                # 这里把 merged_diff 重新 apply（幂等：已存在则跳过/已应用则 no-op），再 commit。
-                _ap = await _asyncio.to_thread(
-                    lambda: apply_git_diff(proj_path, merged_diff, check_only=False))
-                if not _ap.get("ok"):
-                    logger.warning("[LEARN_SUCCESS] commit 前重新 apply 失败(非致命): %s",
-                                   _ap.get("stderr", "")[:160])
+                import os as _os2
+                # 仅当产出文件【在工作区缺失】时才重新 apply（VERIFY_L2 reset 删了新建文件的场景）。
+                # 若文件已在工作区（worker pull-back 已写入改好的内容），跳过 apply——
+                # 否则对 modify 文件会因"补丁基线已变"冲突报错（task 5dc6e634）。commit 直接收录工作区现状。
+                missing = [f for f in out_files
+                           if not _os2.path.isfile(_os2.path.join(proj_path, f))]
+                if missing:
+                    _ap = await _asyncio.to_thread(
+                        lambda: apply_git_diff(proj_path, merged_diff, check_only=False))
+                    if not _ap.get("ok"):
+                        logger.warning("[LEARN_SUCCESS] commit 前重新 apply(补缺失文件)失败(非致命): %s",
+                                       _ap.get("stderr", "")[:160])
                 _c = await _asyncio.to_thread(
                     commit_task_output, proj_path, out_files, task_id=state.get("task_id"))
                 if _c.get("committed"):

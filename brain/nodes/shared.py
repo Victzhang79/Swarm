@@ -274,7 +274,11 @@ def _match_files_by_description(task_description: str, candidate_files: list[str
     return list(dict.fromkeys(matched))
 
 
-def _build_simple_plan(task_description: str, affected_files: list[str] | None = None) -> TaskPlan:
+def _build_simple_plan(
+    task_description: str,
+    affected_files: list[str] | None = None,
+    project_path: str | None = None,
+) -> TaskPlan:
     # Scope 解析优先级（确保 scope 既非空又精准）：
     # 1) 任务描述中【显式点名】的文件（如 "只修改 README.md"）—— 最强信号，
     #    用户意图明确时，writable 应严格限定为这些文件，避免改到无关文件。
@@ -296,14 +300,61 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
         # 解法：对每个点名文件，先在 retrieved(已存在文件全路径集)里按 basename 匹配——
         #   命中(文件已存在) → 解析成全路径 + 强制归 modify（无论原判 modify/create）；
         #   未命中 → 保留原操作类型(可能是真新建/真删除)与裸名。
+        # ── 根因修复(task 9bd1d5b5)：retrieved 来自【知识库检索】，索引滞后——
+        #   前一个任务刚 commit 的文件(如 monitor/HealthController.java)还没被索引，
+        #   retrieved 里查不到 → basename 匹配失败 → 退回用 LLM 猜的裸名/错路径(common/) →
+        #   bootstrap 找不到 → worker 拿空文件绕圈 → "Sorry, need more steps" 拒答失败。
+        #   治本：除 retrieved 外，再查 git ls-files + 工作区磁盘(ground truth，不滞后)，
+        #   建 basename→真实路径 索引兜底。事实库不滞后的关键是【定位用 ground truth 不靠索引】。
+        ground_truth: dict[str, list[str]] = {}
+        if project_path:
+            import os as _os
+            import subprocess as _sp
+            try:
+                _r = _sp.run(["git", "-C", project_path, "ls-files"],
+                             capture_output=True, text=True, timeout=20)
+                if _r.returncode == 0:
+                    for _p in _r.stdout.splitlines():
+                        _p = _p.strip()
+                        if _p:
+                            ground_truth.setdefault(_os.path.basename(_p).lower(), []).append(_p)
+            except Exception:  # noqa: BLE001
+                pass
+            # 磁盘补充（未跟踪但已存在的文件）
+            try:
+                for _root, _dirs, _files in _os.walk(project_path):
+                    _dirs[:] = [d for d in _dirs if d not in (
+                        ".git", "node_modules", "target", "dist", "build", ".venv",
+                        "__pycache__", ".idea", ".codegraph")]
+                    for _f in _files:
+                        _rel = _os.path.relpath(_os.path.join(_root, _f), project_path)
+                        ground_truth.setdefault(_f.lower(), [])
+                        if _rel not in ground_truth[_f.lower()]:
+                            ground_truth[_f.lower()].append(_rel)
+            except Exception:  # noqa: BLE001
+                pass
+
         def _resolve_one(n: str) -> tuple[str, bool]:
-            """返回 (解析后路径, 是否已存在于项目)。"""
+            """返回 (解析后路径, 是否已存在于项目)。retrieved 优先，ground truth 兜底。"""
+            base_n = n.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             if "/" in n or "\\" in n:
-                exists = any(r == n for r in retrieved)
-                return n, exists
+                # 带路径：先精确匹配 retrieved
+                if any(r == n for r in retrieved):
+                    return n, True
+                # retrieved 没有 → 查 ground truth 的 basename（路径可能是 LLM 猜错的目录）
+                gt = ground_truth.get(base_n.lower(), [])
+                if gt:
+                    # 真实路径覆盖 LLM 猜的路径（事实优先）
+                    return (gt[0] if len(gt) == 1 else sorted(gt, key=len)[0]), True
+                return n, False
+            # 裸名：retrieved basename 匹配
             matches = [r for r in retrieved if r.rsplit("/", 1)[-1] == n]
             if matches:
                 return (matches[0] if len(matches) == 1 else sorted(matches, key=len)[0]), True
+            # retrieved 没有 → ground truth 兜底
+            gt = ground_truth.get(n.lower(), [])
+            if gt:
+                return (gt[0] if len(gt) == 1 else sorted(gt, key=len)[0]), True
             return n, False
 
         modify_files: list[str] = []

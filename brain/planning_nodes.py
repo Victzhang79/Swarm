@@ -608,9 +608,17 @@ async def tech_design(state: BrainState) -> dict:
     if file_checks:
         _fv_lines = []
         for fc in file_checks:
-            mark = "✓存在" if fc["exists"] else "✗不存在(疑似虚假前提!)"
-            cand = f" 近似候选:{fc['candidates']}" if fc["candidates"] else ""
-            _fv_lines.append(f"  - {fc['file']}: {mark}{cand}")
+            if fc["exists"]:
+                # 存在 → 给出【真实路径】，强制 file_plan 用它（不许 LLM 重猜路径）。
+                # 这是"事实库不滞后"的关键：已 commit 的产出，定位时必须读真实路径。
+                real = fc["candidates"][0] if fc["candidates"] else "(路径未知)"
+                src = "+".join(fc.get("sources", [])) or "?"
+                _fv_lines.append(
+                    f"  - {fc['file']}: ✓已存在【真实路径={real}】(来源:{src}) "
+                    f"→ 若需修改此文件，file_plan 必须用这个真实路径，禁止另猜目录")
+            else:
+                cand = f" 近似候选:{fc['candidates']}" if fc["candidates"] else ""
+                _fv_lines.append(f"  - {fc['file']}: ✗不存在(疑似虚假前提!){cand}")
         file_verification = "\n".join(_fv_lines)
     else:
         file_verification = "（需求未点名具体文件，或无项目路径——无需文件存在性核验）"
@@ -634,6 +642,30 @@ async def tech_design(state: BrainState) -> dict:
         contract = result.pop("shared_contract", {}) if isinstance(result, dict) else {}
         fact_issues = result.get("fact_issues", []) if isinstance(result, dict) else []
         file_plan = result.get("file_plan", []) if isinstance(result, dict) else []
+
+        # ── 确定性路径校正（治本：用核验到的真实路径覆盖 LLM 猜的路径）──
+        # bug(task 9bd1d5b5)：LLM file_plan 把已存在文件的路径猜错（monitor/→common/），
+        # 导致 worker 去错目录找不到文件→拒答→任务失败。事实库不滞后的关键是【定位用真实路径】。
+        # 对核验出"已存在"的文件，按 basename 匹配，强制 file_plan 里对应项用真实路径。
+        import os as _os
+        real_by_base = {}
+        for fc in file_checks:
+            if fc["exists"] and fc.get("candidates"):
+                real_by_base[_os.path.basename(fc["file"]).lower()] = fc["candidates"][0]
+        if real_by_base and isinstance(file_plan, list):
+            for fp in file_plan:
+                if not isinstance(fp, dict) or not fp.get("path"):
+                    continue
+                base_name = _os.path.basename(fp["path"]).lower()
+                real = real_by_base.get(base_name)
+                if real and fp["path"] != real:
+                    logger.info("[TECH_DESIGN] 路径校正(事实优先): file_plan %s → 真实路径 %s",
+                                fp["path"], real)
+                    fp["path"] = real
+                    # 已存在的文件必然是 modify 而非 create
+                    if fp.get("action") == "create":
+                        fp["action"] = "modify"
+
         # 确定性兜底：磁盘核验出"点名文件不存在"，即便 LLM 没标 fact_issues 也补上（事实优先于 LLM）
         det_false = [fc for fc in file_checks if not fc["exists"]]
         if det_false and not any(
