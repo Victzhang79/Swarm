@@ -1786,6 +1786,38 @@ async def learn_success(state: BrainState) -> dict:
     merged_diff = state.get("merged_diff", "")
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
 
+    # ── 第二批根因(选项A)：产出本地 git commit（单一收口点，覆盖 auto+人工 accept）──
+    # accept 后必经 learn_success。worker pull-back 把产出写进工作区但【不 commit】，
+    # 后续 git checkout / VERIFY_L2 reset / 下个任务会把未提交产出冲掉 → 事实库滞后丢失。
+    # 这里 commit（仅本地，不 push）让产出稳定落盘，且触发已有 git 增量索引链路。
+    try:
+        if merged_diff.strip():
+            proj_path = _get_project_path(state.get("project_id") or "")
+            if proj_path:
+                from swarm.project.diff_apply import (
+                    apply_git_diff,
+                    commit_task_output,
+                    files_from_unified_diff,
+                )
+                out_files = files_from_unified_diff(merged_diff)
+                import asyncio as _asyncio
+                # 先确保产出在工作区——VERIFY_L2 的 reset 可能已把新建文件删掉，
+                # 这里把 merged_diff 重新 apply（幂等：已存在则跳过/已应用则 no-op），再 commit。
+                _ap = await _asyncio.to_thread(
+                    lambda: apply_git_diff(proj_path, merged_diff, check_only=False))
+                if not _ap.get("ok"):
+                    logger.warning("[LEARN_SUCCESS] commit 前重新 apply 失败(非致命): %s",
+                                   _ap.get("stderr", "")[:160])
+                _c = await _asyncio.to_thread(
+                    commit_task_output, proj_path, out_files, task_id=state.get("task_id"))
+                if _c.get("committed"):
+                    logger.info("[LEARN_SUCCESS] 产出已本地 commit: %s (%d 文件)",
+                                _c.get("commit_hash"), len(out_files))
+                elif not _c.get("ok"):
+                    logger.warning("[LEARN_SUCCESS] 产出 commit 跳过(非致命): %s", _c.get("reason"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[LEARN_SUCCESS] 产出 commit 异常(非致命): %s", exc)
+
     logger.info("[LEARN_SUCCESS] 提炼成功模式")
 
     parsed: dict = {}

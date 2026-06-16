@@ -181,12 +181,16 @@ def _scope_match(fp: str, w: str) -> bool:
 
 def _scope_violations(diff: str, scope: FileScope) -> list[str]:
     modified = files_from_unified_diff(diff)
-    writable = set(scope.writable or [])
-    if not writable:
+    # 可写权限 = writable + create_files + delete_files（FileScope 契约，见 is_writable）。
+    # bug 修复(task 9da731ab)：原仅检查 writable，把【新建文件】(create_files)误判越权 →
+    # tech_design file_plan 含新建文件的任务必然 L1 失败 → replan 死循环。create_files 是合法可写。
+    allowed = set(scope.writable or []) | set(getattr(scope, "create_files", []) or []) \
+        | set(getattr(scope, "delete_files", []) or [])
+    if not allowed:
         return []
     violations = []
     for fp in modified:
-        if not any(_scope_match(fp, w) for w in writable):
+        if not any(_scope_match(fp, w) for w in allowed):
             violations.append(fp)
     return violations
 

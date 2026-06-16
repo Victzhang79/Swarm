@@ -389,44 +389,77 @@ def _gather_project_facts(project_path: str | None, max_dirs: int = 60) -> str:
 
 
 def _verify_named_files_exist(task_description: str, project_path: str | None) -> list[dict]:
-    """事实核验：从需求中提取被点名的文件，查真实磁盘是否存在（虚假前提检测）。
+    """事实核验（多源仲裁 + 可信度）：从需求提取被点名文件，多源核实是否存在。
 
-    返回 [{"file": basename, "exists": bool, "candidates": [近似文件]}]。
-    project_path 缺失 → 返回空（无法核验，不误判）。
-    用于 tech_design：点名文件不存在 → 虚假前提 → 触发澄清（不能 auto_accept）。
+    第二批-2 动态可信度：事实源按可信度仲裁，避免单源滞后误杀——
+      - 工作区磁盘（os.walk）：当前实地状态，ground truth。
+      - git 已跟踪（git ls-files）：已 commit 的产出（VERIFY_L2 reset 临时改工作区时，git 仍是真相）。
+    两源任一命中即视为存在；双源都命中 → confidence=high；仅一源 → medium；
+    都未命中 → exists=False（confidence=high，可触发澄清——已 ground truth 双查）。
+    这样"知识库索引滞后说不存在"不会误杀（这里根本不靠索引，靠磁盘+git 两个 ground truth）。
+
+    返回 [{"file", "exists", "confidence", "sources":[...], "candidates":[...]}]。
     """
     if not project_path:
         return []
     import os
     import re
-    # 提取需求里像文件名的 token（含扩展名）
+    import subprocess
     named = re.findall(r"\b([A-Za-z_][\w./-]*\.[A-Za-z]{1,5})\b", task_description or "")
     if not named:
         return []
-    # 建一次全项目文件 basename → 路径 索引
-    all_files: dict[str, list[str]] = {}
+
+    # 源1：工作区磁盘 basename → 路径
+    disk_files: dict[str, list[str]] = {}
     try:
         for root, dirs, files in os.walk(project_path):
             dirs[:] = [d for d in dirs if d not in (
                 ".git", "node_modules", "target", "dist", "build", ".venv",
                 "__pycache__", ".idea", ".codegraph")]
             for f in files:
-                all_files.setdefault(f.lower(), []).append(
+                disk_files.setdefault(f.lower(), []).append(
                     os.path.relpath(os.path.join(root, f), project_path))
     except Exception:  # noqa: BLE001
         return []
+
+    # 源2：git 已跟踪文件 basename（已 commit 的产出，工作区被 reset 时仍是真相）
+    git_files: dict[str, list[str]] = {}
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_path, "ls-files"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode == 0:
+            for p in r.stdout.splitlines():
+                if p.strip():
+                    git_files.setdefault(os.path.basename(p).lower(), []).append(p.strip())
+    except Exception:  # noqa: BLE001
+        pass
+
     results: list[dict] = []
     for token in set(named):
         base = os.path.basename(token).lower()
-        if base in all_files:
-            results.append({"file": token, "exists": True, "candidates": all_files[base][:2]})
+        in_disk = base in disk_files
+        in_git = base in git_files
+        sources = ([("disk", disk_files[base][:2])] if in_disk else []) + \
+                  ([("git", git_files[base][:2])] if in_git else [])
+        if in_disk or in_git:
+            conf = "high" if (in_disk and in_git) else "medium"
+            paths = (disk_files.get(base) or git_files.get(base) or [])[:2]
+            results.append({
+                "file": token, "exists": True, "confidence": conf,
+                "sources": [s[0] for s in sources], "candidates": paths,
+            })
         else:
-            # 找近似（同前缀/编辑距离近）的候选，供澄清"你是指 X 吗"
+            # 双 ground truth 源都未命中 → 高可信度判定不存在（非索引滞后）
             stem = base.rsplit(".", 1)[0]
-            cands = [p for fn, ps in all_files.items()
+            cands = [p for fn, ps in disk_files.items()
                      for p in ps
                      if fn.rsplit(".", 1)[0].startswith(stem[:3]) and len(stem) >= 3][:3]
-            results.append({"file": token, "exists": False, "candidates": cands})
+            results.append({
+                "file": token, "exists": False, "confidence": "high",
+                "sources": [], "candidates": cands,
+            })
     return results
 
 

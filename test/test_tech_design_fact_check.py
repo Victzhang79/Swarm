@@ -56,3 +56,44 @@ def test_verify_no_named_file():
 
 def test_verify_no_path_noop():
     assert _verify_named_files_exist("改 X.java", None) == []
+
+
+# ── 第二批-2 多源仲裁 + 可信度 ──
+def test_verify_returns_confidence():
+    """核验结果带 confidence 字段。"""
+    d = _mk_ruoyi_like()
+    r = _verify_named_files_exist("给 UserController.java 加方法", d)
+    hit = [x for x in r if x["file"] == "UserController.java"][0]
+    assert "confidence" in hit and "sources" in hit
+
+
+def test_verify_git_tracked_file_recognized():
+    """git 已跟踪但工作区被临时删的文件 → git 源仍命中（不误判不存在）。"""
+    import subprocess
+    d = _mk_ruoyi_like()
+    subprocess.run(["git", "-C", d, "init", "-q"], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", d, "add", "."], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    # 模拟 VERIFY_L2 reset 临时删工作区文件，但 git 里还在
+    import os
+    os.remove(os.path.join(d, "src/controller/UserController.java"))
+    r = _verify_named_files_exist("改 UserController.java", d)
+    hit = [x for x in r if x["file"] == "UserController.java"][0]
+    assert hit["exists"] is True, "git 跟踪的文件应被认存在（不靠工作区单源）"
+    assert "git" in hit["sources"]
+
+
+def test_verify_both_sources_high_confidence():
+    """磁盘+git 双命中 → confidence high。"""
+    import subprocess
+    d = _mk_ruoyi_like()
+    subprocess.run(["git", "-C", d, "init", "-q"], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", d, "add", "."], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    r = _verify_named_files_exist("改 User.java", d)
+    hit = [x for x in r if x["file"] == "User.java"][0]
+    assert hit["confidence"] == "high" and set(hit["sources"]) == {"disk", "git"}

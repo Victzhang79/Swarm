@@ -44,17 +44,32 @@ def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) ->
             diff = getattr(out, "diff", "") or ""
             if not diff.strip():
                 continue
-            # 从 diff 抽新增（+ 开头）的类/方法/接口签名行
+            added = [ln[1:].strip() for ln in diff.split("\n")
+                     if ln.startswith("+") and not ln.startswith("+++")]
+            # ① 类/方法/接口签名
             sigs = []
-            for line in diff.split("\n"):
-                if not line.startswith("+") or line.startswith("+++"):
-                    continue
-                s = line[1:].strip()
+            for s in added:
                 if re.match(r"^(public|private|protected|class|interface|enum|def |func |function |export )", s) \
                    or re.search(r"\b[A-Za-z_]\w*\s*\([^)]*\)\s*[{;:]?\s*$", s):
                     sigs.append(s[:140])
+            # ② API 端点契约（第二批-4：前端最需要——后端暴露了哪些 HTTP 端点）。
+            # 抽 @GetMapping/@PostMapping/@PutMapping/@DeleteMapping/@RequestMapping(含路径) +
+            # @RequestMapping 类级前缀；前端据此对齐 URL，减少前后端契约偏离。
+            endpoints = []
+            for s in added:
+                m = re.search(r'@(Get|Post|Put|Delete|Patch|Request)Mapping\s*\(\s*(?:value\s*=\s*)?["\']([^"\']+)["\']', s)
+                if m:
+                    verb = m.group(1).upper()
+                    endpoints.append(f"{verb if verb != 'REQUEST' else 'ANY'} {m.group(2)}")
+                elif re.search(r"@(Get|Post|Put|Delete|Patch|Request)Mapping", s):
+                    endpoints.append(s[:100])
+            block_parts = []
+            if endpoints:
+                block_parts.append("API 端点（前端请对齐这些后端实际暴露的 URL/方法）:\n" + "\n".join(f"  {e}" for e in endpoints[:30]))
             if sigs:
-                pred_blocks.append(f"### 来自 {dep_id} 的产出签名:\n" + "\n".join(sigs[:40]))
+                block_parts.append("方法/类签名:\n" + "\n".join(sigs[:30]))
+            if block_parts:
+                pred_blocks.append(f"### 来自 {dep_id} 的产出契约:\n" + "\n".join(block_parts))
         if pred_blocks:
             st.context_snippets = (getattr(st, "context_snippets", "") or "") + marker + "\n\n".join(pred_blocks)
             logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))

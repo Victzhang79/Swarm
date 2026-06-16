@@ -68,6 +68,29 @@ def test_inject_predecessor_signatures():
     assert "selectUsers" in snip or "IService" in snip
 
 
+def test_inject_api_endpoints():
+    """第二批-4：前序 Controller 的 API 端点契约注入后序（前端对齐）。"""
+    st_a = _st("a", writable=["DeviceController.java"])
+    st_b = _st("b", writable=["device.js"], depends_on=["a"])
+    plan = TaskPlan(subtasks=[st_a, st_b], parallel_groups=[["a"], ["b"]])
+    results = {
+        "a": WorkerOutput(
+            subtask_id="a",
+            diff=('--- /dev/null\n+++ b/DeviceController.java\n@@ -0,0 +1,4 @@\n'
+                  '+    @GetMapping("/system/device/list")\n'
+                  '+    public AjaxResult list() {}\n'
+                  '+    @PostMapping("/system/device/add")\n'
+                  '+    public AjaxResult add() {}'),
+            summary="controller", l1_passed=True,
+        )
+    }
+    _inject_predecessor_context([st_b], plan, results)
+    snip = st_b.context_snippets
+    assert "API 端点" in snip
+    assert "/system/device/list" in snip and "/system/device/add" in snip
+    assert "GET" in snip and "POST" in snip
+
+
 def test_no_deps_no_injection():
     """无依赖子任务不注入。"""
     st = _st("a", writable=["X.java"])
