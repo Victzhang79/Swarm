@@ -6,7 +6,13 @@ from dataclasses import dataclass, field
 
 from swarm.types import SubTask, TaskPlan
 
-MAX_WRITABLE_FILES_PER_SUBTASK = 3
+# 单子任务可写文件数：软上限 = 一个垂直功能合理跨越的分层文件数（domain/controller/service/
+# impl/mapper+xml 等，RuoYi 这类分层框架一个功能天然 4-6 个文件）。软上限内不告警；
+# 软~硬之间仅 warning（不阻断，尊重垂直切片：一个完整功能即使跨多文件也归一个子任务）；
+# 超硬上限才判 fail（真正失控的 scope 过度圈定，如把整个模块塞进 writable）。
+# task 34fab09e：旧 MAX=3 硬上限把"导出 Excel"功能（4 个分层文件）强制 replan 砍碎丢文件。
+SOFT_WRITABLE_FILES_PER_SUBTASK = 6
+MAX_WRITABLE_FILES_PER_SUBTASK = 12
 
 
 @dataclass
@@ -61,12 +67,19 @@ def validate_plan_structure(
     if plan.parallel_groups and missing_in_groups:
         result.add(f"以下子任务未出现在 parallel_groups: {sorted(missing_in_groups)}")
 
-    # 单任务文件数上限
+    # 单任务文件数：软上限内放行；软~硬之间仅告警（尊重垂直切片，一个完整功能可跨多文件）；
+    # 超硬上限才判失败（scope 失控，如整个模块塞进 writable）。
     for t in plan.subtasks:
         n = len(t.scope.writable or [])
         if n > MAX_WRITABLE_FILES_PER_SUBTASK:
             result.add(
-                f"子任务 {t.id} 涉及 {n} 个可写文件，超过上限 {MAX_WRITABLE_FILES_PER_SUBTASK}，应继续拆分"
+                f"子任务 {t.id} 涉及 {n} 个可写文件，超过硬上限 {MAX_WRITABLE_FILES_PER_SUBTASK}"
+                f"（scope 可能失控，需拆分或收窄）"
+            )
+        elif n > SOFT_WRITABLE_FILES_PER_SUBTASK:
+            result.warn(
+                f"子任务 {t.id} 涉及 {n} 个可写文件（超软上限 {SOFT_WRITABLE_FILES_PER_SUBTASK}）。"
+                f"若为单一垂直功能跨分层文件属正常；若含多个独立功能建议拆分"
             )
 
     # 并行组内 writable 不得冲突（同组即并行）

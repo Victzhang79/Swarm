@@ -235,3 +235,141 @@ def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bo
             scope.readable = readables
             changed = True
     return changed
+
+
+# ── 方案A(task 34fab09e)：上下文预注入 ───────────────────────────────────
+# worker 在执行阶段把 50 步迭代预算【全耗在 cat/ls 探索代码】上（实测 84 命令多为 cat），
+# 没到写代码就步数耗尽 → 空 diff。根因：scope 只给了文件路径，没给"理解功能所需的上下文"。
+# 这里在 ELABORATE 阶段【直接读 scope 文件真实内容】抽取关键片段注入子任务 context_snippets，
+# worker prompt 带上后即可直接写，无需自己 cat 探索。
+
+_MAX_SNIPPET_CHARS_PER_FILE = 6000   # 单文件片段上限（防 prompt 爆炸）
+_MAX_TOTAL_SNIPPET_CHARS = 24000     # 单子任务所有片段总上限
+_READABLE_FULL_LINE_LIMIT = 280      # readable 参照文件 ≤此行数则全给，否则抽签名
+
+
+def _extract_signatures(text: str, lang_ext: str) -> str:
+    """轻量抽取类/方法/函数签名骨架（不依赖外部工具，正则即可，跨语言）。"""
+    import re
+    lines = text.split("\n")
+    sig_lines: list[str] = []
+    # 跨语言签名特征：类/接口/方法/函数声明行（含可见性修饰或 def/func/class 等）
+    pat = re.compile(
+        r"^\s*(?:"
+        r"(?:public|private|protected|static|final|abstract|async|export|default)\s+)*"
+        r"(?:class|interface|enum|struct|trait|def|func|function|fn|public|private|protected|void|"
+        r"[A-Z][A-Za-z0-9_<>\[\]]*\s+[a-zA-Z_]\w*\s*\()"
+    )
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        # 类/接口/枚举声明，或方法/函数签名（带括号）
+        if pat.match(ln) or re.match(r"^\s*(class|interface|enum|struct|def |func |function |fn )", ln):
+            sig_lines.append(f"{i+1}: {s[:160]}")
+    return "\n".join(sig_lines[:120])
+
+
+def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
+    """把 scope 文件的关键代码片段抽进每个子任务的 context_snippets。
+
+    - readable 参照文件（worker 要"照着写"的，如工具类/基类）：小文件给全文，大文件给签名。
+    - writable 已存在文件（worker 要在其上改的）：给类声明 + 方法签名骨架（知道现有结构/往哪插）。
+    返回是否发生注入。无 project_path → no-op。
+    """
+    if not project_path:
+        return False
+    import os
+
+    changed = False
+    for st in getattr(plan, "subtasks", []) or []:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        if getattr(st, "context_snippets", ""):
+            continue  # 已有则不覆盖（replan 幂等）
+
+        writable = list(getattr(scope, "writable", []) or [])
+        readable = list(getattr(scope, "readable", []) or [])
+        parts: list[str] = []
+        total = 0
+
+        def _read(rel: str) -> str | None:
+            abs = os.path.join(project_path, rel)
+            if not os.path.isfile(abs):
+                return None
+            try:
+                with open(abs, encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except OSError:
+                return None
+
+        # 1) writable 已存在文件 → 类/方法签名骨架（worker 需知现有结构，避免破坏/重复）
+        for rel in writable:
+            if total >= _MAX_TOTAL_SNIPPET_CHARS:
+                break
+            txt = _read(rel)
+            if txt is None:
+                continue  # 新建文件不存在，跳过
+            ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+            sigs = _extract_signatures(txt, ext)
+            if not sigs:
+                continue
+            block = f"### 待修改文件（现有结构，在此基础上改）: {rel}\n```\n{sigs[:_MAX_SNIPPET_CHARS_PER_FILE]}\n```"
+            parts.append(block)
+            total += len(block)
+
+        # 2) readable 参照文件 → 小文件给全文（最有价值：worker 照着写），大文件给签名
+        for rel in readable:
+            if total >= _MAX_TOTAL_SNIPPET_CHARS:
+                break
+            txt = _read(rel)
+            if txt is None:
+                continue
+            nlines = txt.count("\n") + 1
+            ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+            if nlines <= _READABLE_FULL_LINE_LIMIT and len(txt) <= _MAX_SNIPPET_CHARS_PER_FILE:
+                body = txt
+                label = "参照文件（完整，照此写法/调用）"
+            else:
+                body = _extract_signatures(txt, ext)
+                label = "参照文件（签名，可调用的接口）"
+            if not body.strip():
+                continue
+            block = f"### {label}: {rel}\n```\n{body[:_MAX_SNIPPET_CHARS_PER_FILE]}\n```"
+            parts.append(block)
+            total += len(block)
+
+        if parts:
+            st.context_snippets = (
+                "以下是本子任务相关文件的真实代码（已为你预读，直接据此编写，"
+                "无需再逐个 cat 探索）：\n\n" + "\n\n".join(parts)
+            )
+            changed = True
+    return changed
+
+
+def correct_misclassified_intent(plan: TaskPlan) -> bool:
+    """用确定性信号（scope 有无写文件）校正 LLM 误判的子任务意图。
+
+    task dbfc265f：产品功能需求"操作日志导出 Excel"被 LLM 误判 intent=AUDIT（因含
+    "操作日志/权限校验"语义联想），→ 走 security_audit 不产 diff → findings=0 判失败 →
+    retry 死循环。但 AUDIT 是【只读安全分析】，子任务若有 writable/create 文件，本质是
+    【写代码】(MODIFY/CREATE)，意图必然判错。这里以"有无写文件"硬信号纠正 LLM 自由判断：
+      - intent=AUDIT 但有 create_files（无对应 writable）→ CREATE
+      - intent=AUDIT 但有 writable → MODIFY
+    返回是否发生校正。
+    """
+    from swarm.types import TaskIntent
+
+    changed = False
+    for st in getattr(plan, "subtasks", []) or []:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        writable = list(getattr(scope, "writable", []) or [])
+        create = list(getattr(scope, "create_files", []) or [])
+        if st.intent == TaskIntent.AUDIT and (writable or create):
+            st.intent = TaskIntent.CREATE if (create and not writable) else TaskIntent.MODIFY
+            changed = True
+    return changed

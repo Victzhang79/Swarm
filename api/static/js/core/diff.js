@@ -36,45 +36,94 @@ function setDiffViewMode(mode) {
   renderDiff(lastDiffText);
 }
 
-function renderUnifiedDiff(diff) {
-  const lines = diff.split('\n');
-  return lines.map(line => {
-    let cls = '';
-    if (line.startsWith('+') && !line.startsWith('+++')) cls = 'diff-line-add';
-    else if (line.startsWith('-') && !line.startsWith('---')) cls = 'diff-line-del';
-    else if (line.startsWith('@@')) cls = 'diff-line-hunk';
-    return `<div class="${cls}">${escapeHtml(line)}</div>`;
-  }).join('');
-}
-
 function extractDiffFilePath(line) {
   const m = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
   if (m) return m[2] || m[1];
-  if (line.startsWith('+++ ')) return line.slice(4).replace(/^b\//, '');
+  if (line.startsWith('+++ ')) return line.slice(4).replace(/^b\//, '').replace(/\t.*$/, '').trim();
+  if (line.startsWith('--- ')) return line.slice(4).replace(/^a\//, '').replace(/\t.*$/, '').trim();
   return line;
 }
 
+// 把 unified diff 拆成 per-file sections。
+// 关键(task a58b5cd8)：swarm 的 merged_diff 用 `--- a/ +++ b/` 分隔文件，【没有 diff --git 行】，
+// 所以文件边界必须同时识别 `--- a/`（在已有 hunk 之后再遇到 --- 即为新文件）和 `diff --git`。
 function parseUnifiedDiffSections(diff) {
   const sections = [];
   let current = null;
   let currentHunk = null;
 
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('diff --git')) {
+  const lines = diff.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isGitHeader = line.startsWith('diff --git');
+    // `--- a/...` 且下一行是 `+++ b/...` → 新文件起点（swarm diff 无 diff --git 时的边界）
+    const isFileMinus = line.startsWith('--- ') && (lines[i + 1] || '').startsWith('+++ ');
+
+    if (isGitHeader || (isFileMinus && (!current || current.hunks.length > 0 || current.started))) {
       if (current) sections.push(current);
-      current = { header: line, filePath: extractDiffFilePath(line), hunks: [], fileHeaders: [] };
+      current = { filePath: '', hunks: [], started: false, adds: 0, dels: 0 };
       currentHunk = null;
+      if (isGitHeader) current.filePath = extractDiffFilePath(line);
+      else { current.filePath = extractDiffFilePath(line); current.started = true; i++; /* 吃掉 +++ 行 */ }
+    } else if (line.startsWith('+++ ')) {
+      if (current && !current.filePath) current.filePath = extractDiffFilePath(line);
+    } else if (line.startsWith('--- ')) {
+      // 文件头的 --- 行（紧跟 diff --git 后），忽略
     } else if (line.startsWith('@@')) {
       currentHunk = { header: line, lines: [] };
       if (current) current.hunks.push(currentHunk);
-    } else if (currentHunk) {
+    } else if (currentHunk && current) {
       currentHunk.lines.push(line);
-    } else if (current && (line.startsWith('---') || line.startsWith('+++'))) {
-      current.fileHeaders.push(line);
+      if (line.startsWith('+') && !line.startsWith('+++')) current.adds++;
+      else if (line.startsWith('-') && !line.startsWith('---')) current.dels++;
     }
   }
   if (current) sections.push(current);
-  return sections;
+  return sections.filter(s => s.filePath && s.hunks.length);
+}
+
+// GitHub 风格：按文件分组，每文件带文件名标题 + 增删统计 + 该文件的 hunks。
+function renderUnifiedDiff(diff) {
+  const sections = parseUnifiedDiffSections(diff);
+  if (!sections.length) {
+    // 兜底：解析不出文件就平铺（极少见）
+    return diff.split('\n').map(line => {
+      let cls = '';
+      if (line.startsWith('+') && !line.startsWith('+++')) cls = 'diff-line-add';
+      else if (line.startsWith('-') && !line.startsWith('---')) cls = 'diff-line-del';
+      else if (line.startsWith('@@')) cls = 'diff-line-hunk';
+      return `<div class="${cls}">${escapeHtml(line)}</div>`;
+    }).join('');
+  }
+
+  const totalAdds = sections.reduce((s, f) => s + f.adds, 0);
+  const totalDels = sections.reduce((s, f) => s + f.dels, 0);
+  const summary = `<div class="diff-summary">${sections.length} 个文件变更`
+    + ` <span class="diff-stat-add">+${totalAdds}</span>`
+    + ` <span class="diff-stat-del">-${totalDels}</span></div>`;
+
+  const files = sections.map(sec => {
+    const label = escapeHtml(sec.filePath || 'file');
+    const stat = `<span class="diff-file-stat">`
+      + `<span class="diff-stat-add">+${sec.adds}</span> `
+      + `<span class="diff-stat-del">-${sec.dels}</span></span>`;
+    const body = sec.hunks.map(hunk => {
+      const hunkHeader = `<div class="diff-line-hunk">${escapeHtml(hunk.header)}</div>`;
+      const hunkLines = hunk.lines.map(line => {
+        let cls = '';
+        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'diff-line-add';
+        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'diff-line-del';
+        else cls = 'diff-line-ctx';
+        return `<div class="${cls}">${escapeHtml(line) || '&nbsp;'}</div>`;
+      }).join('');
+      return hunkHeader + hunkLines;
+    }).join('');
+    return `<div class="diff-file-section">`
+      + `<div class="diff-file-header"><span class="diff-file-name">📄 ${label}</span>${stat}</div>`
+      + `<div class="diff-file-body">${body}</div></div>`;
+  }).join('');
+
+  return summary + files;
 }
 
 function renderSplitDiff(diff) {

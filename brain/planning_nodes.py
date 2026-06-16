@@ -611,8 +611,18 @@ async def elaborate(state: BrainState) -> dict:
     # 放在 decouple 之后。Bug-3 的并发安全由 normalize 的"降级者依赖首写者"独立保证，
     # 不依赖与 decouple 的相对顺序——normalize 加的 st-1-1→st-1-2 依赖因两者文件重叠
     # 不会被（已跑完的）decouple 剥离。
-    from swarm.brain.contract_utils import enrich_java_package_readable, normalize_plan_scopes
+    from swarm.brain.contract_utils import (
+        correct_misclassified_intent,
+        enrich_context_snippets,
+        enrich_java_package_readable,
+        normalize_plan_scopes,
+    )
     scope_normalized = normalize_plan_scopes(plan_obj)
+
+    # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
+    # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
+    if correct_misclassified_intent(plan_obj):
+        logger.info("[ELABORATE] 意图校正：AUDIT 子任务含写文件 → 纠正为 MODIFY/CREATE（确定性信号覆盖 LLM 误判）")
 
     # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
     _proj_path = None
@@ -627,6 +637,15 @@ async def elaborate(state: BrainState) -> dict:
     java_enriched = enrich_java_package_readable(plan_obj, _proj_path)
     if java_enriched:
         logger.info("[ELABORATE] P2-1: 已将 Java 同 package 类纳入相关子任务 readable")
+
+    # ── 方案A(task 34fab09e)：上下文预注入。readable 补全后抽取 scope 文件关键代码片段，
+    # 注入子任务 context_snippets，随 worker prompt 下发 → worker 不必 cat 探索耗尽步数。
+    try:
+        snippets_injected = enrich_context_snippets(plan_obj, _proj_path)
+        if snippets_injected:
+            logger.info("[ELABORATE] 方案A: 已为子任务预注入 scope 文件代码片段（worker 免 cat 探索）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ELABORATE] 上下文预注入失败（非致命，worker 仍可自行探索）: %s", exc)
 
     # ── Bug-1 根治：plan 成型后全局悬空依赖兜底（单一收口点）──
     # 二次拆分 + 多轮 replan 可能残留指向不存在子任务的 depends_on，

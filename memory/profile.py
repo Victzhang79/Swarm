@@ -118,11 +118,15 @@ def format_user_profile_for_brain(profile: dict[str, Any]) -> str:
     ]
 
     identity = profile.get("identity") or {}
-    if identity.get("display_name") or identity.get("role"):
-        parts.append(
-            f"**负责人**: {identity.get('display_name', '—')} "
-            f"（{identity.get('role', 'developer')}）"
-        )
+    _dn = identity.get("display_name")
+    _role = identity.get("role")
+    if _dn or _role:
+        if _dn and _role:
+            parts.append(f"**负责人**: {_dn}（{_role}）")
+        elif _role:
+            parts.append(f"**视角**: {_role}")
+        else:
+            parts.append(f"**负责人**: {_dn}")
         parts.append("")
 
     brain_ins = profile.get("instructions_for_brain")
@@ -164,6 +168,12 @@ def format_user_profile_for_worker(profile: dict[str, Any]) -> str:
     if isinstance(worker_ins, list) and worker_ins:
         parts.append("### 实现指令")
         parts.extend(_bullet_lines(worker_ins))
+        parts.append("")
+
+    # 不可协商红线（no_secrets / must_compile / 风格一致 等）——Worker 也须遵守
+    qbar = profile.get("quality_bar")
+    if isinstance(qbar, dict) and qbar:
+        parts.extend(_flatten_dict_section("不可协商红线", qbar))
         parts.append("")
 
     prefs = profile.get("preferences")

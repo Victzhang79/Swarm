@@ -102,8 +102,14 @@ def apply_git_diff(
     if not diff.strip():
         return {"ok": False, "stage": "input", "stderr": "empty diff"}
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False, encoding="utf-8") as tf:
-        tf.write(diff)
+    # 关键(task bce82e96)：git apply 要求 patch 文件【以换行结尾】，否则最后一行 hunk 被判
+    # "corrupt patch at line N"（末行截断）。worker git diff 经 rstrip("\n") 后末尾无换行，
+    # 这里补回一个 \n。用【bytes 模式】写，避免文本模式的 universal-newlines 改写 CRLF 的 \r。
+    patch_bytes = diff.encode("utf-8")
+    if not patch_bytes.endswith(b"\n"):
+        patch_bytes += b"\n"
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".patch", delete=False) as tf:
+        tf.write(patch_bytes)
         patch_path = tf.name
 
     try:

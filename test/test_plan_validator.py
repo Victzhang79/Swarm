@@ -67,13 +67,32 @@ def test_parallel_writable_conflict():
 
 
 def test_max_writable_files():
-    plan = TaskPlan(
+    # C1(task 34fab09e)：软上限(6)内合法——一个垂直功能跨分层文件（如导出功能的
+    # domain/controller/service/impl）不应被判失败。
+    plan_ok = TaskPlan(
         subtasks=[_st("a", writable=["f1.py", "f2.py", "f3.py", "f4.py"])],
         parallel_groups=[["a"]],
     )
-    r = validate_plan_structure(plan)
-    assert not r.valid
-    assert any("超过上限" in i for i in r.issues)
+    r_ok = validate_plan_structure(plan_ok)
+    assert r_ok.valid, f"4 个文件（垂直功能）应合法: {r_ok.issues}"
+
+    # 超软上限(6) 但未超硬上限(12)：仅 warning，不阻断
+    plan_warn = TaskPlan(
+        subtasks=[_st("a", writable=[f"f{i}.py" for i in range(8)])],
+        parallel_groups=[["a"]],
+    )
+    r_warn = validate_plan_structure(plan_warn)
+    assert r_warn.valid, "8 个文件应仅告警不阻断"
+    assert any("软上限" in w for w in r_warn.warnings)
+
+    # 超硬上限(12)：判失败
+    plan_fail = TaskPlan(
+        subtasks=[_st("a", writable=[f"f{i}.py" for i in range(15)])],
+        parallel_groups=[["a"]],
+    )
+    r_fail = validate_plan_structure(plan_fail)
+    assert not r_fail.valid
+    assert any("硬上限" in i for i in r_fail.issues)
 
 
 def test_unknown_dependency():

@@ -131,6 +131,19 @@ class WorkerExecutor:
             # 提到 30(≈15 循环)，与"子代理迭代到完成"理念一致；仍受 max_execution_time 兜底。
             self.max_iterations = min(self.max_iterations, 30)
             self.max_fix_rounds = 0
+        else:
+            # ── B1(task 34fab09e/b63792fa)：非 trivial 按 scope 文件数动态加预算 ──
+            # 实证：跨多文件功能(导出 Excel 涉 4 文件)的 worker 撞固定上限 50 共 8 次，
+            # 步数不够写完所有文件。每个 writable/create 文件约需一轮 read→改→自检，
+            # 故 base + 每文件 +15 步，封顶 100（受 max_execution_time 兜底，不会无限跑）。
+            try:
+                sc = getattr(subtask, "scope", None)
+                _nfiles = len(list(getattr(sc, "writable", []) or [])
+                               + list(getattr(sc, "create_files", []) or [])) if sc else 0
+                if _nfiles > 1:
+                    self.max_iterations = min(100, self.max_iterations + _nfiles * 15)
+            except Exception:  # noqa: BLE001
+                pass
 
         # 运行时状态
         self.phase = WorkerPhase.PREPARING
@@ -584,6 +597,26 @@ class WorkerExecutor:
                 else:
                     self._log("DEBUG L1: harness.failing_test_command 为空，跳过专属校验")
             # 非 DEBUG 意图完全不受影响
+
+            # ── C2 修复(task 34fab09e)：消除"空 diff/未过 L1 却报 high 置信度"的假性成功 ──
+            # worker 撞迭代上限(50)后可能产出空 diff，但 confidence 仍是 LLM 自报的 high，
+            # 误导 handle_failure 与人工审核。这里以【确定性结果】校正自报置信度：
+            #   ① L1 未通过 → 置信度封顶 LOW（不让自报 high 掩盖失败）；
+            #   ② diff 为空但本应有改动 → 置信度强制 LOW（撞上限空转的典型特征）。
+            try:
+                _diff_empty = not (getattr(output, "diff", "") or "").strip()
+                _l1_ok = bool(getattr(output, "l1_passed", False))
+                if (not _l1_ok or _diff_empty) and output.confidence != Confidence.LOW:
+                    _old = output.confidence.value
+                    output = output.model_copy(update={"confidence": Confidence.LOW})
+                    self._log(
+                        f"置信度校正：{_old} → low（"
+                        + ("L1未通过" if not _l1_ok else "")
+                        + ("+空diff" if _diff_empty else "")
+                        + "，确定性结果覆盖自报置信度）"
+                    )
+            except Exception as _ce:  # noqa: BLE001
+                self._log(f"置信度校正跳过（非致命）: {_ce}")
 
             self.phase = WorkerPhase.DONE
             self._log(f"执行完成，置信度: {output.confidence.value}")
@@ -1437,6 +1470,14 @@ class WorkerExecutor:
             lines.append(f"【只读参考】{', '.join(readable)} — 仅供理解上下文，不要修改")
         return "\n".join(lines) if lines else "见 scope（无显式文件清单，请先用工具探查项目结构）"
 
+    def _context_snippets_block(self) -> str:
+        """方案A(task 34fab09e)：ELABORATE 预注入的 scope 文件代码片段。
+        worker 直接据此编写，无需在沙箱里 cat 探索耗尽迭代步数。无则返回空串。"""
+        snip = getattr(self.subtask, "context_snippets", "") or ""
+        if not snip.strip():
+            return ""
+        return f"\n\n📎 预读代码上下文（已为你读好，直接据此实现，无需再 cat 探索）：\n{snip}\n"
+
     async def _run_trivial_fast(self) -> WorkerOutput:
         """trivial 子任务快速路径：合并定位+编码，最小 L1，快速产出"""
         self.phase = WorkerPhase.CODING
@@ -1445,12 +1486,12 @@ class WorkerExecutor:
             "这是 trivial 简单子任务，请一次完成：\n"
             f"任务：{self.subtask.description}\n\n"
             "文件操作清单（务必按操作类型处理）：\n"
-            f"{self._scope_ops_hint()}\n\n"
+            f"{self._scope_ops_hint()}\n"
+            f"{self._context_snippets_block()}\n"
             "执行步骤：\n"
             "1. 对【修改】文件：read_file 读取后 patch_file 做最小必要改动\n"
             "2. 对【新建】文件：直接 write_file 写入完整内容（切勿先 read_file）\n"
-            "3. 对【删除】文件：run_command 执行 rm\n"
-            "4. 若涉及 Python 文件，run_command 执行 python -m py_compile 验证语法\n\n"
+            "3. 对【删除】文件：run_command 执行 rm\n\n"
             "⚠️ 重要约束（避免绕圈耗尽步数）：\n"
             "- 【禁止】自己运行重型构建/测试命令：不要跑 mvn compile / mvn test / "
             "gradle build / npm build / npm test 等。编译和测试由系统的确定性 L1 闸门统一负责，"
@@ -1556,7 +1597,9 @@ class WorkerExecutor:
             "3. 确认接口契约和依赖关系\n"
             "⚠️ 上下文有限：大文件务必用 read_file(path, start_line=N, end_line=M) 只读需要的"
             "行范围，或先 search_files 定位行号再局部读。禁止对大文件无参数读全文（会撑爆上下文）。\n"
+            "✅ 若下方已提供【预读代码上下文】，优先据此定位，能不 cat 就不 cat（省步数预算）。\n"
             "请简要汇报你的定位结果。"
+            + self._context_snippets_block()
         )
 
     def _build_code_prompt(self, locate_result: str) -> str:

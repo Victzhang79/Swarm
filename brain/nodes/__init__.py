@@ -402,6 +402,16 @@ async def plan(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         result = _parse_json_from_llm(response.content)
+        # 健壮性(task 88d69519)：LLM 可能输出 "harness": null / "model_preference" 等可选字段为
+        # null。SubTask.harness 类型是 TaskHarness（非 Optional，靠 default_factory），显式传
+        # None 会触发 pydantic validation error → 整个 plan 解析失败 → 降级空 scope 兜底。
+        # 这里剔除值为 None 的可选字段，让 default_factory 生效。
+        if isinstance(result, dict):
+            for _st in result.get("subtasks", []) or []:
+                if isinstance(_st, dict):
+                    for _opt in ("harness", "contract"):
+                        if _opt in _st and _st[_opt] is None:
+                            _st.pop(_opt)
         task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")

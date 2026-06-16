@@ -1,4 +1,16 @@
-"""默认 L1 用户画像 — 编排时注入 Brain / Worker LLM prompt。"""
+"""默认 L1 用户画像 — 编排时注入 Brain / Worker LLM prompt。
+
+设计原则（CTO 重写 v2）：
+  L1 画像是【第一个、也是最高优先级】传给云端 Brain 的工程约束，每个 token 都直接
+  影响任务拆解、代码生成、验收判定。因此默认画像只放【项目无关、可执行、对任何技术栈
+  都成立】的工程治理规则，严禁放入：
+    - 产品/UI 操作说明（如"保存后写入项目专属画像"）—— 对模型是纯噪音；
+    - 自我指涉文案（如"描述你的编码习惯"）—— 模型无法回答、稀释真实约束；
+    - 写死的技术栈/测试框架（如 pytest / FastAPI）—— Swarm 是【通用】代码生成系统，
+      要处理 Java/Maven、前端、Go 等任意项目；技术栈应由项目预处理(codegraph 语言探测)
+      提供真实信号，默认画像【不预设】，否则会误导 Brain 用错栈思路拆解 Java 项目。
+  每条指令都是【动词开头的硬规则】，可被 Brain/Worker 直接执行，可被 validate 节点对照检查。
+"""
 
 from __future__ import annotations
 
@@ -7,54 +19,63 @@ from typing import Any
 GLOBAL_PROFILE_SUFFIX = "__global__"
 
 DEFAULT_ADMIN_PROFILE: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "identity": {
-        "display_name": "Administrator",
         "role": "tech_lead",
     },
+    # ── 给 Brain 的拆解/编排纪律（任务拆解 + 计划验证 + 复杂度判断时遵循）──
     "instructions_for_brain": [
-        "拆解子任务时优先「最小可行改动」，禁止无关重构或 scope creep",
-        "每个子任务的 acceptance_criteria 必须可自动验证（编译/测试/类型检查至少一项）",
-        "并行组内子任务不得写同一文件；有依赖时用 depends_on 串行",
-        "complex 任务优先拆成可独立验证的小步，避免单个 Worker 承担跨模块大改",
-        "计划验证时对照用户 quality_bar：逻辑变更需测试、禁止提交密钥",
+        # 垂直切片（最高优先，反水平切分）
+        "按【垂直功能切片】拆子任务：每个子任务是一个端到端可独立交付、可独立验证的完整功能。"
+        "同一语言/技术栈内的一个功能即使跨多个文件，也归【一个】子任务由一个 Worker 一次改完；"
+        "严禁按文件或按技术层（Controller/Service/Mapper）水平拆分——那会制造子任务间依赖、"
+        "合并冲突、失败面放大。",
+        # 子任务数由功能数决定
+        "子任务数量由【相互独立的功能数】决定，不由文件数决定。只在以下情况拆多个子任务："
+        "①真正跨语言/技术栈（前端+后端+脚本，因沙箱镜像/harness 必须单语言）；"
+        "②多个互不相关的独立功能；③单功能巨大到一个 Worker 一轮做不完。默认倾向少拆/不拆。",
+        # 最小可行改动
+        "拆解遵循【最小可行改动】：只规划完成需求必需的改动，禁止顺带重构、改名、清理无关代码"
+        "等 scope creep。writable/create_files 只放本子任务真正要改的文件（通常 1-5 个），"
+        "禁止把整个模块/包一股脑圈进 scope。",
+        # 测试：按需，不默认强制
+        "【不要】主动给任务添加测试文件或测试子任务——除非任务描述明确要求写/补测试。"
+        "为'加一个方法/修一个 bug'这类任务擅自塞测试，常因目标项目缺测试依赖而导致验证失败。",
+        # 可验证性
+        "每个子任务的 acceptance_criteria 必须可被【确定性手段】验证（编译通过、类型检查、"
+        "或任务明确要求时的测试），避免只能靠主观判断的验收标准。",
+        # 依赖与并行
+        "depends_on 是唯一的串行控制：仅在子任务间【真有数据/接口依赖】时声明；独立子任务"
+        "留空 depends_on 以并行执行。并行组内的子任务不得写同一文件。",
+        # 复杂度判断
+        "复杂度判断基于任务的真实工程规模（跨模块范围、改动面、风险），不被措辞表象左右；"
+        "判错会导致拆解过粗（Worker 超载）或过细（无谓串行+合并冲突）。",
     ],
+    # ── 给 Worker 的执行纪律（编码阶段遵循）──
     "instructions_for_worker": [
-        "用中文解释思路与摘要；代码、标识符、commit message 主体用英文",
-        "严格遵循 Scope，只改 writable 文件；风格与周边代码保持一致",
-        "优先最小 diff：能改一行不写十行，能局部修不整文件重写",
-        "逻辑变更后运行 compile/test；失败则小步修复，最多 3 轮",
-        "产出前 git_diff 自检，summary 说明影响范围与验证结果",
+        "严格遵守 Scope：只修改 writable 内的文件，新建文件用 create_files，不越权改 scope 外文件。",
+        "改动与目标文件【周边现有代码风格保持一致】（缩进、命名、注释密度、行尾），不引入个人风格。",
+        "优先【最小 diff】：能改一行不写十行，能局部 patch 不整文件重写；保留无关代码原样。",
+        "【禁止自行运行重型构建/测试命令】（mvn/gradle/npm build/test 等）——编译与测试由系统的"
+        "确定性 L1 闸门统一负责。你只管把代码改对；反复自跑构建会耗尽步数预算导致任务失败。",
+        "产出前自检改动是否完整覆盖子任务要求，summary 简述改了什么、影响范围。",
+        "用中文解释思路与摘要；代码、标识符、注释主体、commit message 用英文（或与项目现有语言一致）。",
     ],
-    "preferences": {
-        "language": "zh-CN",
-        "response_language": "中文说明 + 英文代码",
-        "coding_style": "简洁、可维护、与仓库现有风格一致",
-        "comment_density": "minimal",
-        "diff_scope": "最小必要改动",
-        "test_framework": "pytest",
-        "commit_message_style": "conventional commits，中文描述意图",
-    },
-    "tech_stack": {
-        "backend": ["Python 3.11+", "FastAPI", "LangGraph"],
-        "frontend": ["Vanilla JS", "SSE"],
-        "database": ["PostgreSQL", "pgvector", "Qdrant"],
-        "infra": ["E2B Sandbox", "Docker Compose"],
-    },
-    "workflow": {
-        "review_before_apply": True,
-        "prefer_incremental_changes": True,
-        "parallel_subtasks": True,
-        "on_merge_conflict": "先 3-way 自动消解，失败则标记人工处理",
-        "on_test_failure": "定位根因后小步修复，最多 3 轮",
-    },
+    # ── 不可协商的工程红线（validate/L1 闸门据此硬性检查）──
     "quality_bar": {
-        "require_tests_for_logic_changes": True,
-        "lint_before_commit": True,
-        "no_secrets_in_code": True,
+        "no_secrets_in_code": True,            # 绝不在代码/diff 中写入密钥、口令、token
+        "must_compile": True,                  # 改动后目标必须能编译/解析通过
+        "respect_existing_style": True,        # 不破坏仓库既有代码风格与约定
+        "minimal_blast_radius": True,          # 改动面最小化，不扩散到无关文件
+        "tests_only_when_requested": True,     # 仅在任务明确要求时才写测试（默认不强制）
     },
-    "notes": (
-        "L1 用户画像会在 Brain 编排（analyze/plan/validate）与 Worker 执行时注入 LLM prompt。"
-        "Web UI 保存后写入「当前用户 + 当前项目」；未配置时回退到用户全局画像。"
-    ),
+    # ── 工作流偏好（Brain/Worker 行为调参，项目无关）──
+    "workflow": {
+        "prefer_incremental_changes": True,    # 增量小步，不大爆炸式改写
+        "parallel_independent_subtasks": True, # 无依赖子任务并行
+        "on_merge_conflict": "先尝试 3-way 自动消解，失败则标记人工处理，不强行覆盖",
+        "on_verify_failure": "定位根因后小步修复，有限轮次内收敛；不为过门而伪造通过",
+    },
+    # 注：技术栈、测试框架、构建命令【不在默认画像预设】——由项目预处理(codegraph 语言探测
+    # + harness 推断)按目标项目真实情况提供，避免用错栈思路误导通用代码生成。
 }

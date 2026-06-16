@@ -450,11 +450,16 @@ def test_verify_l2_sandbox_pass():
 
 
 def test_verify_l2_sandbox_fail():
+    # 显式带测试命令的 subtask → test_cmd 非空 → 走沙箱验证路径（保留本测试意图：
+    # 沙箱测试失败时 L2 失败）。无显式测试命令时 L2 会跳过测试验证（见
+    # test_verify_l2_skips_test_when_no_command），是另一条路径。
+    _st = _subtask("t1")
+    _st.acceptance_criteria = ["pytest -q tests/test_t1.py"]
     state: BrainState = {
         "complexity": Complexity.COMPLEX,
         "merged_diff": DIFF_A,
         "project_id": "proj-1",
-        "plan": TaskPlan(subtasks=[_subtask("t1")]),
+        "plan": TaskPlan(subtasks=[_st]),
         "task_description": "test task",
         "subtask_results": {},
     }

@@ -79,7 +79,8 @@ def test_harness_matrix_all_languages():
         h = _infer_harness("实现功能", FileScope(writable=[fname]))
         assert h.language == lang, f"{fname} → {h.language}，期望 {lang}"
         assert h.build_command, f"{lang} 缺 build_command"
-        assert h.test_command, f"{lang} 缺 test_command"
+        # S1(task 34fab09e)：test_command 默认为空，不强制跑测试。
+        assert h.test_command == "", f"{lang} 默认不应带 test_command"
         assert h.lint_command, f"{lang} 缺 lint_command"
         assert h.sast_command, f"{lang} 缺 sast_command"
         assert h.extra_whitelist, f"{lang} 缺 extra_whitelist"

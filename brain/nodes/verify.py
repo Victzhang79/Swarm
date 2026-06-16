@@ -92,7 +92,7 @@ async def verify_l2(state: BrainState) -> dict:
                 }
             return _l2_failure_state(subtask_results)
 
-    if (merged_diff or "").strip():
+    if (merged_diff or "").strip() and test_cmd.strip():
         sandbox_result = nodes._try_l2_sandbox_verify(
             project_id, merged_diff, test_cmd, timeout=180
         )
@@ -110,6 +110,12 @@ async def verify_l2(state: BrainState) -> dict:
             if not local_result:
                 return _l2_failure_state(subtask_results)
             return {"l2_passed": local_result}
+    elif (merged_diff or "").strip() and not test_cmd.strip():
+        # 任务未要求测试（criteria 无显式测试命令）→ 跳过测试验证。
+        # integration_review（编译+契约+git apply 同源）已通过，即视为 L2 通过，
+        # 不因无谓/写死框架的测试而误判（task dc1ec890）。
+        logger.info("[VERIFY_L2] 无显式测试命令，integration_review 已通过 → L2 通过（跳过测试验证）")
+        return {"l2_passed": True}
 
     l2_passed = await nodes._verify_l2_via_llm(
         task_description,

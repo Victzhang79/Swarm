@@ -71,11 +71,17 @@ def _parse_int(value: str | None, default: int = 1) -> int:
 
 def _split_raw_diffs(diff: str) -> list[str]:
     """Split a multi-file unified diff into per-file chunks."""
-    text = diff.strip()
+    # 只剥首尾的 \n（不能用 .strip()：会吃掉行内/行尾的 \r 和有意义的尾部空格，
+    # 导致 CRLF 项目的 diff 最后一行 context 丢 \r → git apply 损坏。task 4b244174 实测）。
+    text = diff.strip("\n")
     if not text:
         return []
 
-    lines = text.splitlines(keepends=True)
+    # 用 split("\n") 而非 splitlines()：splitlines 会把行内尾部的 \r 也当行尾去掉，
+    # 破坏 CRLF 行尾。split("\n") 只按 \n 拆，每行保留尾部 \r。
+    raw_lines = text.split("\n")
+    # 重组为带 \n 的行（最后一行不补 \n），保留每行原有的 \r
+    lines = [ln + "\n" for ln in raw_lines[:-1]] + [raw_lines[-1]]
     chunks: list[list[str]] = []
     current: list[str] = []
 
@@ -92,7 +98,13 @@ def _split_raw_diffs(diff: str) -> list[str]:
     if current:
         chunks.append(current)
 
-    return ["".join(c).strip() for c in chunks if "".join(c).strip()]
+    # 每块只剥首尾 \n（保 \r 和尾部空格），空块（剥 \n 后为空）剔除
+    out = []
+    for c in chunks:
+        joined = "".join(c).strip("\n")
+        if joined:
+            out.append(joined)
+    return out
 
 
 def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:

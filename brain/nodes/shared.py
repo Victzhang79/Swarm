@@ -159,7 +159,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
             language="python",
             setup_commands=["pip install -q ruff bandit pip-audit 2>/dev/null || true"],
             build_command="python -m compileall -q .",
-            test_command="python -m pytest -q",
+            test_command="",  # S1(task 34fab09e)：默认不带测试命令，任务明确要求测试时才由规划注入
             lint_command="ruff check .",
             typecheck_command="mypy . --ignore-missing-imports",
             sast_command="bandit -r . -ll -f json",
@@ -174,7 +174,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
             language="node",
             setup_commands=["npm ci 2>/dev/null || npm install 2>/dev/null || true"],
             build_command="npm run build --if-present",
-            test_command="npm test",
+            test_command="",  # S1：默认不带测试命令
             lint_command="npx --no-install eslint .",
             typecheck_command="npx --no-install tsc --noEmit",
             sast_command="npm audit --json",
@@ -187,7 +187,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
             language="go",
             setup_commands=["go mod download 2>/dev/null || true"],
             build_command="go build ./...",
-            test_command="go test ./...",
+            test_command="",  # S1：默认不带测试命令
             lint_command="go vet ./...",
             sast_command="gosec -fmt=json ./... 2>/dev/null || govulncheck ./...",
             extra_whitelist=[
@@ -199,7 +199,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
         return TaskHarness(
             language="rust",
             build_command="cargo build",
-            test_command="cargo test",
+            test_command="",  # S1：默认不带测试命令
             lint_command="cargo clippy -- -D warnings",
             sast_command="cargo audit",
             extra_whitelist=[
@@ -210,7 +210,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
         return TaskHarness(
             language="java",
             build_command="mvn -q compile",
-            test_command="mvn -q test",
+            test_command="",  # S1：默认不带测试命令（RuoYi 等项目常无测试依赖，强跑必失败）
             lint_command="mvn -q checkstyle:check",
             sast_command="mvn -q com.github.spotbugs:spotbugs-maven-plugin:check",
             extra_whitelist=[
@@ -449,6 +449,11 @@ _L2_CMD_RE = re.compile(
 
 
 def _l2_test_command_from_criteria(criteria: list[str]) -> str:
+    # 仅当 acceptance_criteria 里【显式包含】测试命令时才返回它；否则返回空串。
+    # 旧逻辑默认返回 "pytest -q"（写死 Python），对 Java/Go/前端等非 Python 项目必然失败，
+    # 且任务【未要求测试】时本就不该跑测试——VERIFY_L2 的 integration_review（编译+契约+
+    # git apply 同源）已是充分的确定性集成验证。返回空串 → 上层跳过沙箱/本地测试验证，
+    # 不因写死框架或无谓测试而误判 L2 失败（task dc1ec890：Java 项目被 pytest -q 卡死）。
     for item in criteria:
         match = _L2_CMD_RE.search(item)
         if match:
@@ -456,7 +461,7 @@ def _l2_test_command_from_criteria(criteria: list[str]) -> str:
         stripped = item.strip()
         if stripped.startswith(("pytest", "python -m pytest", "npm test", "mvn test", "make test")):
             return stripped
-    return "pytest -q"
+    return ""
 
 
 # B1 批3: verify_l2 引用的纯函数，归入 shared

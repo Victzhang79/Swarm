@@ -210,6 +210,14 @@ class SubTask(BaseModel):
         default_factory=TaskHarness,
         description="验证 harness：如何构建/测试/验收本子任务(Brain 编排时编写)",
     )
+    context_snippets: str = Field(
+        default="",
+        description=(
+            "方案A(task 34fab09e)：ELABORATE 预抽取的 scope 文件关键代码片段"
+            "（writable 文件的类/方法签名骨架 + readable 参照文件的相关实现），"
+            "随 worker prompt 下发，省掉 worker 在沙箱里 cat 探索耗尽迭代步数。"
+        ),
+    )
 
 
 # ──────────────────────────────────────────────

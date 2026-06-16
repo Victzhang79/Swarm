@@ -37,7 +37,8 @@ def test_harness_matrix_5x_complete():
     for lang, fname in LANG_FILES.items():
         h = _infer_harness("实现并测试一个功能", FileScope(writable=[fname]))
         assert h.language == lang, f"{fname} → {h.language}"
-        for field in ("build_command", "test_command", "lint_command", "sast_command"):
+        # S1(task 34fab09e)：test_command 默认为空（任务未要求测试时不强制跑），故不在必填断言内。
+        for field in ("build_command", "lint_command", "sast_command"):
             assert getattr(h, field), f"{lang} 缺 {field}"
         assert h.extra_whitelist, f"{lang} 缺白名单"
     print("  ✅ 5 语言 harness 工具链矩阵齐备")

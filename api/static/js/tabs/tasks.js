@@ -180,6 +180,43 @@ function renderTaskDetail(task) {
       `<button class="btn btn-secondary btn-sm" onclick="viewTaskLogs('${task.id}')" title="查看该任务的执行日志">📜 日志</button>`
       + renderTaskActions(task, false);
   }
+
+  // 日志 tab(#log-panel)：运行中任务靠 SSE appendLog 实时填充；
+  // 【已结束任务】(DONE/FAILED/CANCELLED)选中时不会再有 SSE 推送，必须主动拉历史日志，
+  // 否则点进\"日志\" tab 永远显示\"等待执行…\"（task a58b5cd8 实测）。
+  const RUNNING = ['PENDING', 'ANALYZING', 'PLANNING', 'VALIDATING_PLAN', 'DISPATCHING',
+                   'EXECUTING', 'MERGING', 'VERIFYING', 'HANDLING_FAILURE', 'DELIVERING'];
+  const isRunning = RUNNING.includes(String(task.status || '').toUpperCase());
+  if (!isRunning && task.id) {
+    loadTaskLogsIntoPanel(task.id);
+  }
+}
+
+// 把已结束任务的历史日志拉进 tab 的 #log-panel（复用 /logs 端点）。
+async function loadTaskLogsIntoPanel(taskId) {
+  const panel = $('log-panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="log-line info">加载历史日志…</div>';
+  try {
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=1000');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const lines = data.lines || [];
+    if (!lines.length) {
+      panel.innerHTML = `<div class="log-line info">${escapeHtml(data.hint || '暂无该任务日志。')}</div>`;
+      return;
+    }
+    // 按日志级别上色（ERROR/WARNING/INFO）
+    panel.innerHTML = lines.map(line => {
+      let level = 'info';
+      if (/\bERROR\b|\b错误\b|Traceback/i.test(line)) level = 'error';
+      else if (/\bWARNING\b|\bWARN\b|警告/i.test(line)) level = 'warn';
+      return `<div class="log-line ${level}">${escapeHtml(line)}</div>`;
+    }).join('');
+    panel.scrollTop = panel.scrollHeight;
+  } catch (e) {
+    panel.innerHTML = `<div class="log-line error">加载日志失败: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // ── 任务执行日志查看（SSE 实时流）──────────────────

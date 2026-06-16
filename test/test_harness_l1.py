@@ -40,7 +40,9 @@ def test_infer_harness_python():
     # 报 Is a directory（task d4f9db79 假阴性根因），故默认用 compileall。
     assert "compileall" in h.build_command
     assert "py_compile ." not in h.build_command  # 防回归：不得退回坏命令
-    assert "pytest" in h.test_command
+    # S1(task 34fab09e)：默认 test_command 为空（任务未要求测试时不强制跑）。但 pytest 仍在白名单。
+    assert h.test_command == "", f"默认不应带测试命令，got: {h.test_command!r}"
+    assert any("pytest" in w for w in h.extra_whitelist)
     assert any("python" in w for w in h.extra_whitelist)
     print("  ✅ _infer_harness 正确推断 Python harness")
 

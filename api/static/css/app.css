@@ -515,15 +515,25 @@ html, body {
   overflow: hidden;
 }
 .task-detail-head {
-  padding: 16px 20px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
 .task-detail-title {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 500;
-  margin: 0 0 8px;
-  line-height: 1.4;
+  margin: 0 0 4px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  cursor: pointer;
+}
+.task-detail-title.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
 }
 .task-detail-meta {
   display: flex;
@@ -537,7 +547,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 0;
-  padding: 16px 20px;
+  padding: 8px 20px;
   border-bottom: 1px solid var(--border-subtle);
   overflow-x: auto;
   flex-shrink: 0;
@@ -546,16 +556,16 @@ html, body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  min-width: 64px;
+  gap: 3px;
+  min-width: 52px;
   position: relative;
 }
 .pipeline-step:not(:last-child)::after {
   content: '';
   position: absolute;
-  top: 14px;
-  left: calc(50% + 18px);
-  width: calc(100% - 36px);
+  top: 11px;
+  left: calc(50% + 14px);
+  width: calc(100% - 28px);
   height: 2px;
   background: var(--border);
 }
@@ -564,13 +574,13 @@ html, body {
   background: linear-gradient(90deg, var(--accent) 50%, var(--border) 50%);
 }
 .pipeline-dot {
-  width: 28px;
-  height: 28px;
+  width: 22px;
+  height: 22px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   border: 2px solid var(--border);
   background: var(--bg-surface);
@@ -690,11 +700,14 @@ html, body {
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: 12px;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
 }
+.diff-view:not(.diff-view-split) { padding: 0; white-space: normal; }
+/* detail-diff pane 撑满 task-detail 剩余高度，让 diff-view 能 flex:1 滚动 */
+#detail-diff { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+#detail-diff.hidden { display: none; }
 .diff-line-add { color: var(--green); background: rgba(52, 211, 153, 0.06); }
 .diff-line-del { color: var(--red); background: rgba(248, 113, 113, 0.06); }
 .diff-line-hunk { color: var(--blue); }
@@ -714,6 +727,28 @@ html, body {
   border-bottom: 1px solid var(--border-subtle);
 }
 .diff-file-meta { padding: 2px 12px; color: var(--text-muted); font-size: 11px; }
+/* GitHub 风格多文件 diff（task a58b5cd8）*/
+.diff-summary {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.diff-file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.diff-file-name { font-family: var(--font-mono); word-break: break-all; }
+.diff-file-stat { font-size: 11px; white-space: nowrap; font-family: var(--font-mono); }
+.diff-stat-add { color: var(--green); font-weight: 600; }
+.diff-stat-del { color: var(--red); font-weight: 600; }
+.diff-file-body { white-space: pre-wrap; word-break: break-all; }
+.diff-file-body > div { padding: 0 12px; }
+.diff-file-section { margin: 0; }
 .diff-hunk-header {
   padding: 4px 12px;
   color: var(--blue);

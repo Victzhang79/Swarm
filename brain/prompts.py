@@ -171,10 +171,10 @@ PLAN_USER = """## 任务描述
       "difficulty": "trivial|medium|complex",
       "modality": "text|multimodal",
       "scope": {{
-        "writable": ["path/to/modify.py"],
-        "create_files": ["path/to/new_file.py"],
-        "delete_files": ["path/to/obsolete.py"],
-        "readable": ["path/to/context.py"]
+        "writable": ["相对路径/待修改文件（按项目实际语言/扩展名）"],
+        "create_files": ["相对路径/新建文件（按项目实际语言/扩展名）"],
+        "delete_files": ["相对路径/待删除文件"],
+        "readable": ["相对路径/需阅读的上下文文件（如被调用的工具类、基类、接口）"]
       }},
       "contract": {{
         "input": "描述输入",
@@ -182,20 +182,17 @@ PLAN_USER = """## 任务描述
       }},
       "acceptance_criteria": ["标准1", "标准2"],
       "depends_on": [],
-      "model_preference": null,
-      "harness": {{
-        "language": "python",
-        "setup_commands": ["pip install -r requirements.txt"],
-        "build_command": "python -m compileall -q .",
-        "test_command": "python -m pytest -q",
-        "verify_commands": ["python -c \\"import mymod; assert mymod.f()\\""],
-        "extra_whitelist": ["python", "python -m", "python -c", "pytest"]
-      }}
+      "model_preference": null
     }}
   ],
   "parallel_groups": [["st-1", "st-2"], ["st-3"]]
 }}
 ```
+
+注意：
+- 文件路径/扩展名必须匹配【项目实际技术栈】（Java 项目用 .java、前端用 .ts/.vue 等），切勿默认 Python/.py。
+- 【不要】输出 harness 字段：系统会按项目主导语言自动推断 build/lint/工具链。
+- 仅当任务【明确要求跑测试】时，才在 acceptance_criteria 写出具体测试命令（如 "mvn -q test -pl xxx"），否则不写——默认不强制跑测试。
 
 难度判定规则:
 - trivial: 改CSS/修typo/加日志/加注释/简单配置变更
