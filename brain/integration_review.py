@@ -14,29 +14,50 @@ logger = logging.getLogger(__name__)
 
 
 def _reset_worktree_to_head(project_path: str, merged_diff: str) -> None:
-    """把 merged_diff 涉及的文件 reset 到 git HEAD（清除 worker pull-back 写入的脏改动）。
+    """把 merged_diff 涉及的文件 reset 到干净的补丁基线（清除 worker pull-back 写入的脏改动）。
 
-    只 checkout 补丁涉及的文件（精准，不动工作区其他文件）。非 git 仓库或失败时静默跳过
-    （apply_git_diff 自身仍会给出结果）。task fdaa1932：VERIFY_L2 在脏工作区做 git apply
-    --check 会假阴性，reset 后补丁基线与 HEAD 一致。
+    精准处理补丁涉及的文件（不动工作区其他文件）。非 git 仓库或失败时静默跳过。
+    - 【已跟踪文件】（HEAD 有）：checkout 回 HEAD 版本，撤销脏改动。
+    - 【新建文件】（HEAD 没有，但 worker pull-back 已写进工作区）：删除工作区残留——
+      否则 git apply 要新建该文件时报"文件已存在/补丁未应用"（task 691c1670 实证：
+      6 文件 CRUD 全是新建，pull-back 写入后 checkout 无效残留 → apply --check 全失败）。
     """
+    import os
     try:
         files = files_from_unified_diff(merged_diff) or []
         if not files:
             return
-        # 确认是 git 仓库
         chk = subprocess.run(
             ["git", "-C", project_path, "rev-parse", "--is-inside-work-tree"],
             capture_output=True, text=True, timeout=15,
         )
         if chk.returncode != 0:
             return
-        # 只 checkout 补丁涉及的文件（已存在的文件 reset 到 HEAD；新建文件 checkout 会报错，忽略）
         for f in files:
-            subprocess.run(
-                ["git", "-C", project_path, "checkout", "HEAD", "--", f],
+            # 判断该文件在 HEAD 是否存在（已跟踪 vs 新建）
+            in_head = subprocess.run(
+                ["git", "-C", project_path, "cat-file", "-e", f"HEAD:{f}"],
                 capture_output=True, text=True, timeout=15,
-            )
+            ).returncode == 0
+            if in_head:
+                # 已跟踪 → reset 到 HEAD 版本
+                subprocess.run(
+                    ["git", "-C", project_path, "checkout", "HEAD", "--", f],
+                    capture_output=True, text=True, timeout=15,
+                )
+            else:
+                # 新建文件 → 删除工作区残留（pull-back 写入的），让 apply 能干净新建
+                abs_f = os.path.join(project_path, f)
+                if os.path.isfile(abs_f):
+                    try:
+                        os.remove(abs_f)
+                    except OSError:
+                        pass
+                # 也从 git index 撤出（worker checkpoint 可能 git add 过）
+                subprocess.run(
+                    ["git", "-C", project_path, "rm", "--cached", "--force", "-q", f],
+                    capture_output=True, text=True, timeout=15,
+                )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[L2] reset worktree to HEAD failed (非致命): %s", exc)
 

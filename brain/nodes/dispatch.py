@@ -21,6 +21,45 @@ from swarm.types import Confidence, SubTask, WorkerOutput
 logger = logging.getLogger(__name__)
 
 
+def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) -> None:
+    """跨子任务上下文传递：把前序已完成依赖子任务的产出注入后序子任务的 context_snippets。
+
+    B3 依赖序拆分（接口→实现→装配）场景：后序子任务（如 ServiceImpl）需要看到前序
+    （Service 接口）实际定义了什么方法签名，才能正确实现。这里把前序产出的 diff 里【新增的
+    方法/类签名行】抽出来，append 到后序子任务的 context_snippets，随 worker prompt 下发。
+    无依赖 / 前序未完成 → no-op。幂等：重复注入同一前序会去重（按标记）。
+    """
+    import re
+
+    for st in to_dispatch:
+        deps = [d for d in (getattr(st, "depends_on", []) or []) if d in subtask_results]
+        if not deps:
+            continue
+        marker = "\n\n🔗 前序子任务已产出（实现时对齐这些已定义的接口/签名）：\n"
+        if marker.strip()[:10] in (getattr(st, "context_snippets", "") or ""):
+            continue  # 已注入过
+        pred_blocks: list[str] = []
+        for dep_id in deps:
+            out = subtask_results.get(dep_id)
+            diff = getattr(out, "diff", "") or ""
+            if not diff.strip():
+                continue
+            # 从 diff 抽新增（+ 开头）的类/方法/接口签名行
+            sigs = []
+            for line in diff.split("\n"):
+                if not line.startswith("+") or line.startswith("+++"):
+                    continue
+                s = line[1:].strip()
+                if re.match(r"^(public|private|protected|class|interface|enum|def |func |function |export )", s) \
+                   or re.search(r"\b[A-Za-z_]\w*\s*\([^)]*\)\s*[{;:]?\s*$", s):
+                    sigs.append(s[:140])
+            if sigs:
+                pred_blocks.append(f"### 来自 {dep_id} 的产出签名:\n" + "\n".join(sigs[:40]))
+        if pred_blocks:
+            st.context_snippets = (getattr(st, "context_snippets", "") or "") + marker + "\n\n".join(pred_blocks)
+            logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))
+
+
 async def dispatch(state: BrainState) -> dict:
     """DISPATCH 节点 — 将就绪的子任务派发给 Worker
 
@@ -60,6 +99,10 @@ async def dispatch(state: BrainState) -> dict:
     to_dispatch = plan_obj.get_dispatch_batch(
         completed_ids, dispatch_remaining, max_concurrent
     )
+
+    # ── 跨子任务上下文传递(B3 配套)：把【前序已完成依赖子任务】的产出注入后序子任务，
+    # 让后序看到前序定义的真实接口签名/新建符号，避免接口对不上（依赖序拆分场景）。
+    _inject_predecessor_context(to_dispatch, plan_obj, subtask_results)
 
     logger.info(
         f"[DISPATCH] 派发 {len(to_dispatch)} 个子任务（并行批次） "

@@ -69,3 +69,21 @@ def test_detect_build_cmd_skips_when_tool_missing():
         assert cmd and "mvn" in cmd
     else:
         assert cmd is None, "本机无 mvn 时应返回 None 而非 mvn 命令"
+
+
+def test_reset_worktree_removes_new_file_residue():
+    """task 691c1670：新建文件被 worker pull-back 残留工作区时，reset 应删除残留，
+    让 git apply 能干净新建（不再"补丁未应用"）。"""
+    d = _init_repo()  # 只有 A.java
+    # 新建文件的 diff（New.java HEAD 不存在）
+    diff = "--- /dev/null\n+++ b/New.java\n@@ -0,0 +1,2 @@\n+class New {\n+}\n"
+    # 模拟 worker pull-back：New.java 已残留工作区
+    with open(os.path.join(d, "New.java"), "w") as f:
+        f.write("class New {\n}\n")
+    from swarm.project.diff_apply import apply_git_diff
+    # 残留时 apply --check 失败（文件已存在）
+    assert not apply_git_diff(d, diff, check_only=True).get("ok"), "残留新文件应致 apply 失败"
+    # reset 删掉残留后通过
+    _reset_worktree_to_head(d, diff)
+    assert not os.path.isfile(os.path.join(d, "New.java")), "新文件残留应被删除"
+    assert apply_git_diff(d, diff, check_only=True).get("ok"), "删除残留后应能干净新建"

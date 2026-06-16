@@ -97,10 +97,14 @@ def validate_plan_structure(
                 else:
                     seen[fp] = tid
 
-    # 跨子任务写冲突（无依赖关系时不可写同一文件）
+    # 跨子任务写冲突。writable + create_files 都算"写"（B3：每个文件只应属一个子任务）。
+    # - 无依赖关系还写同文件 → 硬失败（并行必冲突）。
+    # - 有依赖关系写同文件 → 告警（B3 依赖序拆分要求文件不重叠；即使串行，两子任务各自
+    #   在独立沙箱改同文件，MERGE 时仍会冲突。降级 warn 不阻断，尊重少数合理场景如
+    #   前序 create + 后序 modify，但提示风险）。
     writable_map: dict[str, list[str]] = {}
     for t in plan.subtasks:
-        for fp in t.scope.writable or []:
+        for fp in (list(t.scope.writable or []) + list(getattr(t.scope, "create_files", []) or [])):
             writable_map.setdefault(fp, []).append(t.id)
     for fp, ids in writable_map.items():
         if len(ids) < 2:
@@ -111,6 +115,11 @@ def validate_plan_structure(
                 tb = subtask_by_id[id_b]
                 if not _depends(id_a, id_b, ta, tb, subtask_by_id):
                     result.add(f"无依赖的子任务 {id_a} 与 {id_b} 同时写 {fp}")
+                else:
+                    result.warn(
+                        f"依赖序子任务 {id_a} 与 {id_b} 都写 {fp}（B3 要求文件不重叠，"
+                        f"MERGE 可能冲突，建议每个文件只归一个子任务）"
+                    )
 
     # 检索定位文件覆盖（可选）
     if affected_files:

@@ -414,13 +414,10 @@ class WorkerExecutor:
                     l1_details={"error": "timeout_in_locating"},
                 )
 
-            # ── Phase 2: 编码 ──
+            # ── Phase 2: 编码（B2：多文件分阶段执行）──
             self.phase = WorkerPhase.CODING
             self._log("编码阶段：实现变更")
-            code_result = await self._run_agent(
-                self._build_code_prompt(locate_result),
-                step="code",
-            )
+            code_result = await self._run_coding_phase(locate_result)
             self._log(f"编码完成: {code_result[:200]}")
 
             if self._check_timeout():
@@ -1620,10 +1617,77 @@ class WorkerExecutor:
             "预算导致任务失败。改完目标文件即【立即停止】并确认改动，不要反复读取/编译/自我怀疑。\n"
         )
 
+    async def _run_coding_phase(self, locate_result: str) -> str:
+        """B2(task 82104bf1)：多文件子任务分阶段编码，避免单次 agent loop 步数爆。
+
+        scope 写文件 ≤3 → 单次 loop（保持原行为）。
+        >3 → 按文件分批（每批 1-2 个），每批独立 agent loop（独立步数预算），
+        写完即在沙箱 git add 锁定进度。阶段间不丢已写文件，每批步数充裕。
+        """
+        scope = self.effective_scope
+        write_files = (list(getattr(scope, "writable", []) or [])
+                       + list(getattr(scope, "create_files", []) or []))
+        # ≤3 文件：单次（原行为，不引入分批开销）
+        if len(write_files) <= 3:
+            return await self._run_agent(self._build_code_prompt(locate_result), step="code")
+
+        # >3 文件：按文件分批，每批 2 个
+        batch_size = 2
+        batches = [write_files[i:i + batch_size] for i in range(0, len(write_files), batch_size)]
+        self._log(f"B2 分阶段编码：{len(write_files)} 个文件分 {len(batches)} 批（每批≤{batch_size}），各批独立步数预算")
+        results: list[str] = []
+        done_files: list[str] = []
+        for bi, batch in enumerate(batches):
+            self._log(f"B2 批次 {bi + 1}/{len(batches)}：聚焦 {batch}")
+            r = await self._run_agent(
+                self._build_batch_code_prompt(locate_result, batch, done_files, bi + 1, len(batches)),
+                step=f"code-batch-{bi + 1}",
+            )
+            results.append(f"[批次{bi + 1}] {r[:150]}")
+            done_files.extend(batch)
+            # 在沙箱里 git add 已写文件，锁定进度（即使后续批次撞上限，已写的不丢）
+            await self._sandbox_checkpoint(batch)
+            if self._check_timeout():
+                self._log("B2 分阶段编码：时间预算用尽，停止后续批次（已写文件保留）")
+                break
+        return " | ".join(results)
+
+    async def _sandbox_checkpoint(self, files: list[str]) -> None:
+        """B2：在沙箱里 git add 指定文件，锁定阶段进度（best-effort，失败不致命）。"""
+        if not self._sandbox or not files:
+            return
+        try:
+            quoted = " ".join(f"'{f}'" for f in files)
+            cmd = f"cd /workspace && git add {quoted} 2>/dev/null || true"
+            run = getattr(self._sandbox, "commands", None)
+            if run and hasattr(run, "run"):
+                await asyncio.to_thread(run.run, cmd)
+            self._log(f"B2 checkpoint：已 git add {len(files)} 个文件锁定进度")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"B2 checkpoint 跳过（非致命）: {exc}")
+
+    def _build_batch_code_prompt(
+        self, locate_result: str, batch: list[str], done: list[str], idx: int, total: int
+    ) -> str:
+        """B2 分批编码 prompt：只聚焦本批文件，已完成的不重做。"""
+        done_hint = f"\n已完成文件（勿重做）：{done}\n" if done else "\n"
+        return (
+            f"请开始 Phase 2 编码（分批 {idx}/{total}）：\n"
+            f"定位结果: {locate_result[:400]}\n"
+            f"{done_hint}"
+            f"\n🎯 本批【只】负责这些文件，其它文件本批不要碰：\n{batch}\n\n"
+            "处理规则：\n"
+            "1. 【修改】用 read_file(局部行范围) 后 patch_file 最小改动\n"
+            "2. 【新建】直接 write_file 写完整内容（不要先 read_file）\n"
+            "3. 确保符合接口契约、与已完成文件协调一致、保持代码风格\n"
+            "⚠️ 只写本批文件即【立即停止】，禁止跑 mvn/gradle/npm 构建测试（L1 闸门统一负责），"
+            "不要反复读取/自我怀疑（省步数预算）。\n"
+            + self._context_snippets_block()
+        )
+
     def _build_verify_prompt(self) -> str:
         # ── 根因修复(task 51c8e1f8)：medium/complex 路径的 worker 自验证绕圈 ──
         # 旧 prompt 让 worker 自己 run_compile + run_tests，但系统的确定性 L1 闸门
-        # (_deterministic_l1_gate → run_l1_pipeline)【已经独立跑了权威的真实编译/测试】。
         # worker 再自己反复跑 mvn compile/test 是【纯多余的绕圈】：在复杂项目(RuoYi junit
         # 环境)测试跑不起来时，worker 会反复 mvn test + 查 junit 依赖，耗尽迭代上限(50)，
         # 即使实现代码本身 mvn compile=exit0(对的)也被拖死。
