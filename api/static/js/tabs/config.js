@@ -616,6 +616,33 @@ async function saveRouting() {
   /* 已合并到 saveConfig */
 }
 
+// 仅保存 Worker 路由（trivial/medium/complex/multimodal）——只 PUT /api/routing 的
+// routing_* 字段，【不传 brain_*、不传 langsmith/tier】，避免点底部"保存配置"时把
+// Brain 模型/LangSmith/分级开关等无关配置一并覆盖（用户反馈：很多不该更新的被更新了）。
+async function saveRoutingOnly() {
+  const btn = $('btn-save-routing');
+  if (btn) btn.disabled = true;
+  try {
+    const payload = collectRoutingPayload();  // 只含 routing_<tier>[_fallback]
+    if (!Object.keys(payload).length) {
+      showToast('未检测到路由变更', 'info');
+      return;
+    }
+    const resp = await fetch('/api/routing', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    showToast('Worker 路由已保存（未触碰其它配置）', 'success');
+    await loadRoutingTable();
+  } catch (e) {
+    showToast('路由保存失败: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // ─── KB Embedding / Rerank 接入点（方案 A）──────────────────────
 let _kbCatalog = { embed: [], rerank: [] };
 

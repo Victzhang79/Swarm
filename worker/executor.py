@@ -186,6 +186,35 @@ class WorkerExecutor:
                 return  # scope 不可变则放弃（不阻断）
             self._log(f"scope 归一化：{len(moved)} 个已存在文件从 create_files 降级为 writable: {moved[:5]}")
 
+        # ── 确定性兜底：任务未要求测试时，剔除 scope 里的测试文件（task 5c17c464）──
+        # Brain 偶把"加方法"任务擅自配测试子任务/塞 src/test 文件进 scope（PLAN prompt 已加软
+        # 约束，此处为硬兜底）。测试文件常本地不存在(bootstrap errors=1)、徒增失败面。
+        # 仅当子任务描述【明确要求】测试时才保留；否则从 writable/create_files 剔除测试路径。
+        desc = (getattr(self.subtask, "description", "") or "")
+        _wants_test = any(kw in desc for kw in (
+            "测试", "单测", "test", "Test", "覆盖", "coverage", "用例",
+        ))
+        if not _wants_test:
+            def _is_test_path(p: str) -> bool:
+                pl = str(p).replace("\\", "/").lower()
+                return ("/test/" in pl or "/tests/" in pl
+                        or pl.endswith("test.java") or pl.endswith("tests.java")
+                        or "test_" in pl.rsplit("/", 1)[-1]
+                        or pl.endswith("_test.py") or pl.endswith(".test.js")
+                        or pl.endswith(".spec.ts") or pl.endswith(".test.ts"))
+            try:
+                w2 = [f for f in (getattr(scope, "writable", []) or []) if not _is_test_path(f)]
+                c2 = [f for f in (getattr(scope, "create_files", []) or []) if not _is_test_path(f)]
+                removed = (len(getattr(scope, "writable", []) or []) - len(w2)) + \
+                          (len(getattr(scope, "create_files", []) or []) - len(c2))
+                # 仅当剔除后 scope 仍有可写目标时才生效（避免把唯一目标误删成空 scope）
+                if removed > 0 and (w2 or c2):
+                    scope.writable = w2
+                    scope.create_files = c2
+                    self._log(f"scope 兜底：任务未要求测试，剔除 {removed} 个测试文件（防 Brain 擅自塞测试）")
+            except Exception:  # noqa: BLE001
+                pass
+
     def _log(self, message: str) -> None:
         """记录执行日志"""
         elapsed = time.monotonic() - self.start_time if self.start_time else 0
@@ -1126,12 +1155,23 @@ class WorkerExecutor:
         return [line.strip() for line in out.splitlines() if line.strip()]
 
     def _get_git_diff(self) -> str:
-        """用 difflib 对比上传前快照与拉回后内容生成 unified diff（不依赖 git）。
+        """生成子任务改动的 unified diff。
 
-        基线 = _sync_to_sandbox 保存的 _pre_sync_contents；
-        新值 = _sync_from_sandbox 拉回的 _post_sync_contents。
-        二进制文件（值为 None）仅标注变更，不产 diff 文本。
+        ── 优先用【本地 git diff】(task 1a49aa66 治本)──
+        diff 在【本地】生成(worker 在沙箱改文件→pull-back 写回本地→在此比对)。
+        若本地 project_path 是 git 仓库(本机开发的真实项目几乎都是)，直接用 `git diff`
+        生成——它与 git apply 同源，产出的补丁【必被 git apply 接受】，从根上消除 difflib
+        手工拼 unified diff 的格式错乱(hunk 行数/前导符错位→"补丁损坏")。
+        仅当无 git 仓库(greenfield/无 .git)时回退到 difflib(已修正 keepends/lineterm 用法)。
+
+        基线 = HEAD（项目模板/本地工作区的干净基线）；新值 = pull-back 后的工作区当前内容。
         """
+        # ── 路径1：本地 git 仓库 → git diff（治本，必被 git apply 接受）──
+        git_diff = self._try_local_git_diff()
+        if git_diff is not None:
+            return git_diff if git_diff.strip() else "(无变更)"
+
+        # ── 路径2：difflib fallback（无 git 仓库时）──
         import difflib
 
         pre = getattr(self, "_pre_sync_contents", None) or {}
@@ -1156,6 +1196,12 @@ class WorkerExecutor:
             new_norm = new_text.replace("\r\n", "\n").replace("\r", "\n")
             if old_norm == new_norm:
                 continue
+            # ── 关键修复(task 1a49aa66)：difflib unified_diff 的正确用法 ──
+            # 实测唯一能被 git apply 接受的组合：splitlines(keepends=True)[内容行自带\n] +
+            # lineterm=""[difflib 不给 hunk头/文件头加换行] + 逐元素规范化补换行 + "".join。
+            # 旧代码 keepends=True + lineterm="" + "\n".join 会给本已含\n的内容行再加\n（行尾翻倍）；
+            # 而 keepends=False + lineterm="\n" 会让内容行【没有】换行符（全挤一行）。两者都让
+            # git apply 报"补丁损坏"。下面的 normalize 方案兼顾：内容行用自带\n，头部行补\n。
             old_lines = old_norm.splitlines(keepends=True)
             new_lines = new_norm.splitlines(keepends=True)
             ud = difflib.unified_diff(
@@ -1165,13 +1211,90 @@ class WorkerExecutor:
                 tofile=f"b/{rel}",
                 lineterm="",
             )
-            block = "\n".join(ud)
+            # 逐元素规范化：hunk头/文件头(lineterm="" 故无换行)补\n；内容行(keepends 已含\n)不动。
+            block = "".join(x if x.endswith("\n") else x + "\n" for x in ud)
+            block = block.rstrip("\n")
             if block.strip():
                 diff_parts.append(block)
 
         if not diff_parts:
             return "(无变更)"
         return "\n".join(diff_parts)
+
+    def _try_local_git_diff(self) -> str | None:
+        """本地 git 仓库 → 用 git diff 生成子任务 scope 文件的 unified diff。
+
+        返回 None 表示不可用（无 project_path / 非 git 仓库 / git 调用失败）→ 上层回退 difflib。
+        返回 "" 或 diff 文本表示成功（""=无变更）。
+
+        关键：worker 已把沙箱改动 pull-back 写回本地工作区，所以工作区当前内容就是改动后状态，
+        git diff 基线为 HEAD。只 diff 子任务 scope 文件（writable∪create∪delete），避免把
+        .codegraph/ 等无关变更带进来。新建文件用 `git diff --no-index /dev/null <file>` 或
+        `git add -N` 让其出现在 diff 中。
+        """
+        import subprocess as _sp
+        from pathlib import Path as _P
+
+        root = getattr(self, "project_path", None)
+        if not root:
+            return None
+        root = str(_P(root).resolve())
+        if not (_P(root) / ".git").exists():
+            return None
+
+        scope = self.effective_scope
+        # scope 内所有受影响文件（相对路径）
+        modify = [f for f in (getattr(scope, "writable", []) or []) if f]
+        create = [f for f in (getattr(scope, "create_files", []) or []) if f]
+        delete = [f for f in (getattr(scope, "delete_files", []) or []) if f]
+        targets = list(dict.fromkeys(modify + create + delete))
+        if not targets:
+            return None
+
+        try:
+            # 让新建/未跟踪文件也能进 git diff：对 create_files 做 intent-to-add（-N，不暂存内容，
+            # 仅登记路径，使 git diff 能显示其全部新增行）。幂等、无副作用（不真正 commit）。
+            untracked = []
+            for f in targets:
+                p = _P(root) / f
+                if p.is_file():
+                    # 是否已跟踪
+                    r = _sp.run(["git", "-C", root, "ls-files", "--error-unmatch", f],
+                                capture_output=True, text=True)
+                    if r.returncode != 0:
+                        untracked.append(f)
+            if untracked:
+                _sp.run(["git", "-C", root, "add", "-N", *untracked],
+                        capture_output=True, text=True, timeout=30)
+
+            # 生成 diff：HEAD 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
+            # --no-color 防 ANSI；-- <files> 限定 scope，不带入无关变更。
+            # 行尾一致性由 pull-back 的 _preserve_line_endings 保证（CRLF 项目写回仍 CRLF），
+            # 工作区与 git HEAD 同行尾 → git diff 不会全文 churn、产出的 context 行带正确行尾，
+            # git apply 同源必成功。故【不再用 --ignore-cr-at-eol】(那会产 LF context 反而和
+            # CRLF 的 HEAD 对不上，task f20ea68d 实测 git apply --ignore-whitespace 都救不了)。
+            # 【关键(task f20ea68d 根因)】用 bytes 模式读 git diff，不能用 text=True！
+            # text=True 触发 Python universal-newlines，会把 git diff 输出里 CRLF 文件的
+            # context 行尾 \r\n 静默转成 \n → diff 丢失 \r → git apply 回 CRLF 的 HEAD 时
+            # context 字节不匹配（实测 --ignore-whitespace/--3way 都救不了）。bytes 模式
+            # 保留 \r，产出与 CRLF 源文件完全同源的 diff，git apply 直接成功（无需任何忽略参数）。
+            r = _sp.run(
+                ["git", "-C", root, "diff", "--no-color", "--", *targets],
+                capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
+            )
+            if r.returncode != 0:
+                _err = (r.stderr or b"").decode("utf-8", "replace")
+                self._log(f"git diff 失败(rc={r.returncode})，回退 difflib: {_err[:120]}")
+                return None
+            # 解码保留行尾：用 decode 不做 newline 转换（bytes→str 不触发 universal newlines）
+            diff = (r.stdout or b"").decode("utf-8", "replace")
+            # 删除文件：git diff 已能体现（工作区文件被删 → diff 显示删除）。
+            self._log(f"diff 来源: 本地 git diff（{len(targets)} 个 scope 文件，行尾同源，git apply 直通）")
+            # 仅去掉【整个 diff 末尾】的多余空行，不碰行内 \r（rstrip 只删尾部 \n，\r 在行内不受影响）
+            return diff.rstrip("\n")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"git diff 异常({str(e)[:80]})，回退 difflib")
+            return None
 
     def create_sandbox(self) -> Any:
         """创建远程 CubeSandbox 实例（用于沙箱内代码执行和编译验证）"""
@@ -1348,6 +1471,33 @@ class WorkerExecutor:
         # 非空 + compile 恰好过会翻盘判通过（task 0f93f1fc：st-1-1 "Sorry need more
         # steps" 却 L1=通过）。
         if _is_refusal_or_truncated(combined):
+            # ── 韧性修复(task 5c17c464/94334785)：reasoning 模型偶发拒答(空转输出
+            # "Sorry, need more steps")是【概率性瞬时】问题，非确定性能力失败。立即换【用户
+            # 配置的 fallback 模型】(_resolve_route 返回的 tier fallback，由用户在 WebUI 路由表
+            # 设置，如 MiniMax-M2.7-Pro)worker 内部重试一次，避免抛给上层 HANDLE_FAILURE 走完整
+            # 重试轮(慢+清空兄弟)。仅重试 1 次：备选还拒答才硬否决 L1。
+            if not getattr(self, "_trivial_alt_retried", False):
+                self._trivial_alt_retried = True
+                self._log("trivial: 主模型拒答，换备选模型 worker 内部重试一次")
+                try:
+                    from swarm.models.router import ModelRouter
+                    _r = ModelRouter()
+                    _alt = None
+                    try:
+                        _alt_name = _r._resolve_route(
+                            self.subtask.difficulty.value if hasattr(self.subtask.difficulty, "value")
+                            else str(self.subtask.difficulty),
+                            getattr(self.subtask, "modality", "text") or "text",
+                        )[1]
+                    except Exception:  # noqa: BLE001
+                        _alt_name = None
+                    if _alt_name and _alt_name != self.model_name:
+                        self.model_name = _alt_name
+                        self._agent = self._create_agent()  # 用备选模型重建 agent
+                        self._log(f"trivial: 已切换到备选模型 {_alt_name} 重试")
+                        return await self._run_trivial_fast()
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"trivial: 备选模型重试初始化失败({str(e)[:60]})，硬否决 L1")
             l1_details["l1_decision_source"] = "refusal_hard_fail"
             l1_details["raw_refusal"] = combined[:200]
             self._log("trivial: agent 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")
@@ -1421,17 +1571,29 @@ class WorkerExecutor:
             "1. 【修改】文件：用 patch_file 在可写范围内改动\n"
             "2. 【新建】文件：用 write_file 直接写入完整内容，不要先 read_file\n"
             "3. 【删除】文件：用 run_command 执行 rm\n"
-            "4. 确保修改符合接口契约，保持代码风格一致\n"
-            "完成后请确认你做了哪些修改。"
+            "4. 确保修改符合接口契约，保持代码风格一致\n\n"
+            "⚠️ 本阶段【只管把目标文件改对】，禁止运行 mvn/gradle/npm 等重型构建或测试命令"
+            "（编译和测试由后续 Phase 3 / 系统确定性 L1 闸门统一负责）。反复跑构建会耗光步数"
+            "预算导致任务失败。改完目标文件即【立即停止】并确认改动，不要反复读取/编译/自我怀疑。\n"
         )
 
     def _build_verify_prompt(self) -> str:
+        # ── 根因修复(task 51c8e1f8)：medium/complex 路径的 worker 自验证绕圈 ──
+        # 旧 prompt 让 worker 自己 run_compile + run_tests，但系统的确定性 L1 闸门
+        # (_deterministic_l1_gate → run_l1_pipeline)【已经独立跑了权威的真实编译/测试】。
+        # worker 再自己反复跑 mvn compile/test 是【纯多余的绕圈】：在复杂项目(RuoYi junit
+        # 环境)测试跑不起来时，worker 会反复 mvn test + 查 junit 依赖，耗尽迭代上限(50)，
+        # 即使实现代码本身 mvn compile=exit0(对的)也被拖死。
+        # 修复：worker 只【自查改动是否完整】(读回改的文件确认)，编译/测试由系统确定性闸门负责。
+        # 与 trivial 路径"禁止自跑 mvn"一致。worker 是开发，不是测试工程师。
         return (
-            "请开始 Phase 3（L1 验证）：\n"
-            "1. 运行编译命令（run_compile），确认无语法错误\n"
-            "2. 运行测试（run_tests），确认功能正确\n"
-            "请报告验证结果：编译是否通过？测试是否通过？\n"
-            "格式：L1_RESULT: PASS 或 L1_RESULT: FAIL，然后说明详情。"
+            "请开始 Phase 3（自查）：\n"
+            "1. 简要 review 你本轮的改动是否【完整覆盖】子任务要求（可 read_file 看几眼改过的文件）。\n"
+            "2. 确认没有明显语法错误（凭阅读判断，不要运行构建）。\n\n"
+            "⚠️【禁止运行重型构建/测试命令】：不要跑 mvn compile / mvn test / gradle / npm 等。\n"
+            "编译和测试由系统的确定性 L1 闸门统一负责（系统会真跑一次编译+harness 测试），\n"
+            "你自己反复跑会耗光步数预算导致任务失败。改动完整即【立即停止】。\n"
+            "报告格式：L1_RESULT: PASS（你认为改动完整）或 L1_RESULT: FAIL（发现改漏/改错），然后简述。"
         )
 
     def _l1_failure_digest(self, l1_details: dict) -> str:

@@ -1104,6 +1104,15 @@ print(json.dumps(files))
                 except ValueError:
                     stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
                     continue
+                # ── 行尾保留（task f20ea68d 根因·CRLF）──
+                # RuoYi 等项目源文件是 Windows CRLF。worker 在沙箱用 patch/write 改文件后
+                # 行尾变 LF，直接 write_bytes 覆盖会把本地 CRLF 文件【整体变成 LF】→ git HEAD
+                # (CRLF) 与工作区(LF) 行尾不一致 → git diff 要么全文 churn，要么 --ignore-cr-at-eol
+                # 产出 LF context 但 git apply 回不去 CRLF 的 HEAD（context 字节不匹配，
+                # --ignore-whitespace/--3way 都救不了，因为差的是 CR 不是空白量）。
+                # 修复：若【本地原文件】主体是 CRLF，则把沙箱返回的 LF 内容【转回 CRLF】再写，
+                # 保持行尾与 git HEAD 一致 → git diff 同源、apply 必成功。二进制/已是 LF 的不动。
+                data = self._preserve_line_endings(local_path, data)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 local_path.write_bytes(data)
                 stats["downloaded"] += 1
@@ -1122,6 +1131,38 @@ print(json.dumps(files))
             len(stats["errors"]),
         )
         return stats
+
+    @staticmethod
+    def _preserve_line_endings(local_path: Path, new_data: bytes) -> bytes:
+        """保持写回内容的行尾与本地原文件一致（task f20ea68d 根因·CRLF）。
+
+        若本地原文件存在且主体为 CRLF（\\r\\n），而沙箱返回内容是 LF（worker 改写后），
+        则把返回内容的裸 LF 转回 CRLF，使工作区行尾与 git HEAD 一致——这样 git diff
+        产出的 context 行带正确 CRLF、git apply 同源必成功。
+
+        判定与转换都保守：
+          - 本地文件不存在（新建）→ 不转（按沙箱产出的行尾，通常 LF，新文件无 HEAD 约束）；
+          - 本地或新内容含 NUL（二进制）→ 不动；
+          - 本地主体不是 CRLF（已是 LF）→ 不动；
+          - 转换用 \"先归一化到 LF 再统一替换为 CRLF\"，幂等，不会产生 \\r\\r\\n。
+        """
+        try:
+            if not local_path.exists():
+                return new_data
+            old = local_path.read_bytes()
+            # 二进制不处理
+            if b"\x00" in old or b"\x00" in new_data:
+                return new_data
+            # 本地主体是否 CRLF：CRLF 行数占多数（容忍个别 LF）
+            crlf = old.count(b"\r\n")
+            lf_total = old.count(b"\n")
+            if crlf == 0 or crlf < (lf_total - crlf):
+                return new_data  # 本地不是 CRLF 主体 → 保持沙箱产出（LF）
+            # 沙箱内容归一化到 LF 后统一转 CRLF（幂等：先 \r\n→\n 再 \n→\r\n）
+            normalized = new_data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            return normalized.replace(b"\n", b"\r\n")
+        except Exception:  # noqa: BLE001
+            return new_data  # 任何异常都退回原始字节，不阻断 pull-back
 
     def _ensure_remote_dir(
         self, sandbox: Any, remote_root: str, use_files_api: bool

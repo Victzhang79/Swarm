@@ -107,8 +107,11 @@ def apply_git_diff(
         patch_path = tf.name
 
     try:
+        # --ignore-whitespace：关键(task 93159ec3)——RuoYi 等项目源文件是 CRLF，但 worker
+        # 产出/归一化后的 diff 是 LF。不忽略空白(行尾)差异会让 git apply 因 context 行 CRLF↔LF
+        # 不匹配而 "补丁未应用/损坏"。--ignore-whitespace 让行尾差异不阻断 apply，只比对真实内容。
         check = subprocess.run(
-            ["git", "apply", "--check", patch_path],
+            ["git", "apply", "--check", "--ignore-whitespace", patch_path],
             cwd=project_path,
             capture_output=True,
             text=True,
@@ -129,7 +132,7 @@ def apply_git_diff(
             snapshot = snapshot_files(project_path, files_from_unified_diff(diff))
 
         applied = subprocess.run(
-            ["git", "apply", patch_path],
+            ["git", "apply", "--ignore-whitespace", patch_path],
             cwd=project_path,
             capture_output=True,
             text=True,

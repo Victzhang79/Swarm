@@ -890,6 +890,8 @@
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">Worker 子任务路由</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">Brain 拆解子任务后，按难度选择模型：trivial/medium 走本地，complex 走云端，multimodal 看图任务。</p>
                 <div id="routing-table"></div>
+                <button class="btn btn-secondary btn-sm" style="margin-top:8px" id="btn-save-routing" onclick="saveRoutingOnly()">仅保存 Worker 路由</button>
+                <p style="font-size:11px;color:var(--text-muted);margin:6px 0 0">只更新上方路由选择，不触碰 Brain 模型 / LangSmith / 其它配置。</p>
 
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🧠 模型能力分级（I1）</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">按 Brain 主模型能力调整编排约束：强模型收紧澄清/打回/拆分上限（降延迟），弱模型放宽（多兜底）。<b>默认关闭=现有行为不变</b>，建议开启后 A/B 观察。</p>

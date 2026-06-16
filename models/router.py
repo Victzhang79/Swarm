@@ -98,6 +98,15 @@ class EndpointProvider:
         # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens
+        # ── 关闭本地推理模型的 reasoning/think 块（task 94334785 根因）──
+        # 本地 Qwen 系 reasoning 模型(如 Qwen3.6-40B-Claude-4.6)默认输出 <think>...</think>
+        # 推理块，但经 vLLM chat template 后【开头 <think> 被吃掉、内容全进 think、think 外的
+        # 真实答案为空】→ worker agent 拿到空回复 → 反复要求 → "Sorry, need more steps" 拒答
+        # (实证：st-1 30s 空转拒答，未调任何工具)。worker 执行不需要 reasoning(要直接调工具
+        # 干活)，故对【本地 provider】统一关 thinking；云端 provider(brain 规划用 GLM-5.1)不动，
+        # 保留其 reasoning 能力。vLLM/Qwen 通过 chat_template_kwargs.enable_thinking 控制。
+        if self.provider.kind == "local":
+            _kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         return ChatOpenAI(**_kwargs)
 
 

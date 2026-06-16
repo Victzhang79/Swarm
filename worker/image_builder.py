@@ -482,7 +482,11 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "4"  # v4: warmup 去掉重量级 dependency:go-offline,直接 mvn -T 1C compile(快得多)
+_BUILDER_VERSION = "5"  # v5: CubeSandbox 0.4.0 适配——create-from-image 加 --with-cube-ca=true
+#                              （CubeEgress MITM 出网信任）+ --allow-internet-access。0.3.x 旧模板
+#                              snapshot 与 0.4.0 guest-image 不匹配(image version not eq)起不来，
+#                              bump 版本使 fingerprint 变化 → 旧模板自动失效、按 0.4.0 重建。
+#                       v4: warmup 去掉重量级 dependency:go-offline,直接 mvn -T 1C compile(快得多)
 
 
 def compute_project_fingerprint(spec: EnvSpec, project_root: str | Path) -> str:
@@ -583,9 +587,18 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
             # MicroVM 起不来 → envd 不存在 → run_command/探活 504。钉单节点后无竞态、与访问路径一致。
             _node = (ssh.host or "").strip()
             _node_opt = f"--node {shlex.quote(_node)} " if _node else ""
+            # CubeSandbox 0.4.0 升级必带参数（实测 task 60网段沙箱机验证）：
+            # --with-cube-ca=true：0.4.0 引入 CubeEgress(OpenResty MITM 透明代理)，沙箱出网
+            #   HTTPS 被 TPROXY(443→8443) 重定向到 CubeEgress 做 MITM。沙箱必须信任 CubeEgress
+            #   根 CA 才能完成 TLS 握手——不烤 CA 则【所有 HTTPS 出网 SSL reset】，worker 跑
+            #   mvn/npm 拉依赖全废。虽 0.4.0 文档称默认 true，但实测【不显式传则 CA 没装进信任库】，
+            #   故必须显式 --with-cube-ca=true（实测加后 curl maven central HTTP=200 拉到依赖）。
+            # --allow-internet-access：0.4.0 出网默认走 CubeEgress L7 策略(可能 deny)，显式放行
+            #   保证 worker 能联网补拉构建依赖(mvn/npm/go/pip)。
+            _v040_opts = "--with-cube-ca=true --allow-internet-access "
             code, out, err = r.run(
                 f"cubemastercli tpl create-from-image --image {shlex.quote(tag)} "
-                f"{_node_opt}"
+                f"{_node_opt}{_v040_opts}"
                 f"--writable-layer-size 2G --expose-port 49983 --probe 49983 --probe-path /health 2>&1",
                 timeout=300,
             )

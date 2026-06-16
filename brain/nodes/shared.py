@@ -465,3 +465,203 @@ def _diff_has_changes(diff: str) -> bool:
         line.startswith("+") and not line.startswith("+++")
         for line in (diff or "").splitlines()
     )
+
+
+def _is_test_file_path(p: str) -> bool:
+    """判定是否测试文件路径（跨语言：java/py/js/ts/go）。"""
+    pl = str(p or "").replace("\\", "/").lower()
+    base = pl.rsplit("/", 1)[-1]
+    return (
+        "/test/" in pl or "/tests/" in pl or "/src/test/" in pl
+        or base.endswith("test.java") or base.endswith("tests.java")
+        or base.startswith("test_") or base.endswith("_test.py")
+        or base.endswith(".test.js") or base.endswith(".test.ts")
+        or base.endswith(".spec.ts") or base.endswith(".spec.js")
+        or base.endswith("_test.go")
+    )
+
+
+def _task_requests_tests(task_description: str) -> bool:
+    """任务【是否明确要求】写/跑测试。保守：仅在描述显式提到测试相关词时为 True。"""
+    d = (task_description or "")
+    return any(kw in d for kw in (
+        "写测试", "单元测试", "单测", "测试用例", "测试覆盖", "加测试", "补测试",
+        "unit test", "unit-test", "write test", "add test", "test coverage",
+        "覆盖率",
+    ))
+
+
+def _strip_unrequested_tests(plan: TaskPlan, task_description: str) -> TaskPlan:
+    """源头剔除未被要求的测试（task 744316e7 根因·单一事实源）。
+
+    病根链（实测 RuoYi 两方法任务）：
+      ① Brain 给"加方法"任务擅自塞测试文件进 scope.create_files（StringUtilsTest.java 等）；
+      ② harness 自动带 test_command（mvn test -Dtest=XxxTest）；
+      ③ worker 现造的测试用 JUnit5/4，但 ruoyi-common pom.xml 无 junit 依赖 →
+         测试类【编译失败】(package org.junit does not exist) → L1 test_ok=False；
+      ④ 结果：mvn compile（主代码）exit=0 实现正确，却因 mvn test 编译失败被 L1 判死，
+         worker 还在修 junit 依赖上撞迭代上限(50)绕圈。
+    根因：任务【没要求测试】，就不该有测试文件 + 不该有 test_command 强制门。
+    本函数在 PLAN 阶段(守卫前)统一剔除：
+      - scope.create_files / writable / readable 里的测试文件路径；
+      - harness.test_command（消除强制测试门，只留 build_command 编译门）。
+    仅当任务【未明确要求测试】时生效（_task_requests_tests=False）。worker 端 scope 兜底
+    保留作二道防线，但此处是单一事实源（判定用原始 task_description，比 worker 子任务描述准）。
+    """
+    if _task_requests_tests(task_description):
+        return plan  # 任务确实要求测试 → 保留
+    subs = list(plan.subtasks or [])
+    if not subs:
+        return plan
+    changed = False
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        if sc is not None:
+            for attr in ("create_files", "writable", "readable"):
+                lst = getattr(sc, attr, None) or []
+                kept = [f for f in lst if not _is_test_file_path(f)]
+                if len(kept) != len(lst):
+                    setattr(sc, attr, kept)
+                    changed = True
+        # 剔除 harness 的 test_command（强制测试门）
+        h = getattr(st, "harness", None)
+        if h is not None and getattr(h, "test_command", ""):
+            try:
+                h.test_command = ""
+                changed = True
+            except Exception:  # noqa: BLE001
+                pass
+    if changed:
+        import logging
+        logging.getLogger(__name__).info(
+            "[PLAN] 测试剔除：任务未要求测试，已从 scope 移除测试文件 + 清空 harness.test_command"
+            "（防 Brain 擅自塞测试导致 L1 因 junit 缺失误判）"
+        )
+    return plan
+
+
+def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
+    """垂直切片守卫（确定性硬兜底，方向A）：合并被水平切分的同语言子任务。
+
+    病根（task 5c17c464/94334785）：PLAN 倾向把同语言的功能按文件/按层水平切成多个子任务
+    （st-1改文件A、st-2改文件B / st-1实现、st-2测试），违反"垂直功能切片"原则，制造子任务
+    间依赖、MERGE 冲突、失败面放大。
+
+    本函数把【可安全合并】的子任务合并为一个：
+      - 同一沙箱语言（harness.language，决定沙箱镜像，不同语言不能合一个沙箱）；
+      - 同一 modality（multimodal 看图任务不参与合并，保持隔离）；
+      - 整组内部【无 depends_on 依赖】也【不被组外子任务依赖】（有依赖=真串行，尊重不动）。
+    合并策略：scope 各列表并集去重、description 编号拼接、acceptance_criteria 并集、
+    difficulty 取最高、intent 取多数/第一个。保守：单子任务或无可合并组时原样返回。
+
+    注意：这【不是】把所有东西塞一个子任务——真跨语言、真有依赖、multimodal 仍各自独立。
+    只消除"同语言无依赖却被拆开"这一类水平切分。
+    """
+    subs = list(plan.subtasks or [])
+    if len(subs) <= 1:
+        return plan
+
+    def _lang(st) -> str:
+        h = getattr(st, "harness", None)
+        return (getattr(h, "language", "") or "").strip().lower() if h else ""
+
+    def _modality(st) -> str:
+        m = getattr(st, "modality", None)
+        if m is None:
+            return "text"
+        return m.value if hasattr(m, "value") else str(m)
+
+    # 任何子任务被别人依赖 or 自己依赖别人 → 整个 plan 存在真实依赖链，保守不合并
+    # （依赖是 Brain 显式声明的串行需求，垂直切片守卫只处理"本可并行却被拆开"的情形）。
+    has_any_dep = any(getattr(st, "depends_on", None) for st in subs)
+    if has_any_dep:
+        return plan
+
+    # multimodal 子任务隔离：不参与合并
+    mergeable = [st for st in subs if _modality(st) != "multimodal"]
+    isolated = [st for st in subs if _modality(st) == "multimodal"]
+    if len(mergeable) <= 1:
+        return plan
+
+    # 按语言分组（空语言归一组，视为同沙箱默认镜像）
+    from collections import OrderedDict
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for st in mergeable:
+        groups.setdefault(_lang(st), []).append(st)
+
+    # 若分组后没有任何组 size>1，无可合并，原样返回
+    if all(len(g) <= 1 for g in groups.values()):
+        return plan
+
+    _DIFF_RANK = {"trivial": 0, "medium": 1, "complex": 2}
+    merged_subs: list = []
+    _idx = 0
+    for lang, group in groups.items():
+        if len(group) == 1:
+            merged_subs.append(group[0])
+            continue
+        # 合并这一组
+        _idx += 1
+        base = group[0]
+        # scope 并集去重
+        def _u(attr: str) -> list[str]:
+            seen: list[str] = []
+            for st in group:
+                for f in (getattr(st.scope, attr, []) or []):
+                    if f and f not in seen:
+                        seen.append(f)
+            return seen
+        merged_scope = FileScope(
+            writable=_u("writable"),
+            readable=_u("readable"),
+            create_files=_u("create_files"),
+            delete_files=_u("delete_files"),
+            allow_any=any(getattr(st.scope, "allow_any", False) for st in group),
+        )
+        # description 编号拼接（保留每个原子功能的描述）
+        descs = [f"({i+1}) {st.description}" for i, st in enumerate(group)]
+        merged_desc = "本子任务包含以下同语言独立功能，请在一次执行中全部完成：\n" + "\n".join(descs)
+        # acceptance_criteria 并集
+        ac: list[str] = []
+        for st in group:
+            for c in (getattr(st, "acceptance_criteria", []) or []):
+                if c and c not in ac:
+                    ac.append(c)
+        # difficulty 取最高
+        hardest = max(
+            group,
+            key=lambda s: _DIFF_RANK.get(
+                s.difficulty.value if hasattr(s.difficulty, "value") else str(s.difficulty), 1
+            ),
+        ).difficulty
+        merged = SubTask(
+            id=base.id,
+            description=merged_desc,
+            intent=base.intent,
+            difficulty=hardest,
+            modality=base.modality,
+            scope=merged_scope,
+            contract=base.contract or {},
+            acceptance_criteria=ac,
+            depends_on=[],
+            harness=base.harness,
+        )
+        merged_subs.append(merged)
+
+    merged_subs.extend(isolated)
+
+    if len(merged_subs) == len(subs):
+        return plan  # 没有实际合并发生
+
+    import logging
+    logging.getLogger(__name__).info(
+        "[PLAN] 垂直切片守卫：%d 个子任务合并为 %d 个（消除同语言水平切分）",
+        len(subs), len(merged_subs),
+    )
+    # 重建 parallel_groups：合并后各子任务独立（无依赖），各成一组
+    new_ids = [st.id for st in merged_subs]
+    return TaskPlan(
+        subtasks=merged_subs,
+        parallel_groups=[[i] for i in new_ids],
+        shared_contract=getattr(plan, "shared_contract", None) or {},
+    )

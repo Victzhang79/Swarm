@@ -343,6 +343,9 @@ async def plan(state: BrainState) -> dict:
         from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 
         task_plan = enrich_plan_with_shared_contract(task_plan)
+        # 测试剔除（同主路径，task 744316e7）：SIMPLE 路径也防 Brain 塞测试
+        from swarm.brain.nodes.shared import _strip_unrequested_tests
+        task_plan = _strip_unrequested_tests(task_plan, task_description)
         plan_touch = touch_context(
             state,
             "plan",
@@ -440,6 +443,15 @@ async def plan(state: BrainState) -> dict:
         )
 
     logger.info(f"[PLAN] 生成 {len(task_plan.subtasks)} 个子任务")
+
+    # ── 垂直切片守卫（确定性硬兜底，方向A）──
+    # PLAN prompt 已软引导"按垂直功能切片、同语言不按文件/层拆"，但 LLM 是软约束，可能仍
+    # 把同语言无依赖的功能水平切成多个子任务（task 5c17c464/94334785 实证：两文件拆两子任务）。
+    # 这里在代码层硬合并：同沙箱语言 + 无相互依赖 + 同 modality 的多个子任务 → 合并成 1 个，
+    # 消除水平切分带来的子任务依赖/MERGE 冲突/失败面放大。详见 _merge_horizontal_subtasks。
+    from swarm.brain.nodes.shared import _merge_horizontal_subtasks
+    task_plan = _merge_horizontal_subtasks(task_plan)
+
     from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 
     task_plan = enrich_plan_with_shared_contract(task_plan)
@@ -474,6 +486,14 @@ async def plan(state: BrainState) -> dict:
                      SubTaskDifficulty.COMPLEX: 120000}.get(_diff, 50000)
             # 每个 writable 文件按 ~6k token 估(读+改)，叠加难度基线
             st.est_context_tokens = _base + len(_writable) * 6000
+
+    # ── 测试剔除（task 744316e7 根因·单一事实源）──
+    # 此处 scope + harness 都已齐备。任务未明确要求测试时，统一剔除 scope 里的测试文件
+    # + 清空 harness.test_command，杜绝"Brain 擅自塞测试 → 测试用 junit 但项目无依赖 →
+    # 测试类编译失败 → mvn compile 过了却被 L1 判死 + worker 修 junit 绕圈"病根链。
+    from swarm.brain.nodes.shared import _strip_unrequested_tests
+    task_plan = _strip_unrequested_tests(task_plan, task_description)
+
     plan_touch = touch_context(
         state,
         "plan",

@@ -96,8 +96,13 @@ def _split_raw_diffs(diff: str) -> list[str]:
 
 
 def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
-    lines = raw.splitlines()
-    if not lines:
+    # 用 split("\n") 而非 splitlines()（task f20ea68d 根因·CRLF）：
+    # splitlines() 会把行内容尾部的 \r 也当行尾去掉 → CRLF 项目的 diff 经 MERGE 重组后
+    # 丢失 \r → git apply 回 CRLF 的 HEAD 时 context 字节不匹配。split("\n") 只按 \n 拆，
+    # 保留每行尾部的 \r，使 CRLF diff 经 MERGE 后仍与源文件同行尾。
+    # 注意：split("\n") 对以 \n 结尾的文本会在末尾产生一个 "" 元素，下游 _format 会处理。
+    lines = raw.split("\n")
+    if not lines or (len(lines) == 1 and lines[0] == ""):
         return None
 
     file_path = ""
@@ -168,14 +173,23 @@ def _format_file_patch(file_path: str, header_lines: list[str], hunks: list[_Hun
     for hunk in sorted(hunks, key=lambda h: h.old_start):
         body.extend(hunk.lines)
 
-    # hunk.lines 来自 _parse_file_patch 的 raw.splitlines()（不含尾换行），
-    # 故用 "\n".join 补换行是正确的。但 body 行可能混入【空字符串】元素
-    # （worker 产出的 diff 行尾为 \n\n / CRLF 时，上游 splitlines 留下空行），
-    # 直接 join 会把空行变成额外换行 → diff 行尾翻倍 → git apply "补丁损坏"
-    # （task 16098179 实证）。这里过滤 body 内的纯空行（diff 正文每行至少有
-    # 一个前缀字符 ' '/'+'/'-'/'@'/'\'，真正的空上下文行是 " " 单空格，不会是 ""）。
-    body = [ln for ln in body if ln != ""]
-    return "\n".join(header + body)
+    # ── 空行/行尾处理（task 3adfeca5 + f20ea68d）──
+    # hunk.lines 来自 _parse_file_patch 的 raw.split("\n")（保留行内 \r，不含 \n）。
+    # 两类空字符串元素要区别处理：
+    #  (a) 末尾的 ""：split("\n") 对以 \n 结尾的 diff 文本会多产一个尾部 "" → 直接丢弃；
+    #  (b) 中间的 ""：原是【空行 context】(" " 或 CRLF 的 " \r")，经传输尾部空白被 strip 成
+    #      "" → 必须【还原为 " "】(单空格 context 标记)，否则 hunk 实际 context 行数 < @@
+    #      头声明 old_count → git apply "补丁未应用"（task 3adfeca5 实测）。
+    # 先去掉【尾部】连续的 ""（split 产物），再把【中间】残留的 "" 还原为 " "。
+    while body and body[-1] == "":
+        body.pop()
+    normalized: list[str] = []
+    for ln in body:
+        if ln == "":
+            normalized.append(" ")  # 中间空行 → 单空格 context 标记，保 hunk 行数
+        else:
+            normalized.append(ln)
+    return "\n".join(header + normalized)
 
 
 def _format_conflict_hunks(file_path: str, hunks: list[_Hunk]) -> str:
