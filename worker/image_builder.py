@@ -576,8 +576,16 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
                 "COMPILE_DIAG_FAIL(联网兜底)" if selftest else "no-selftest")
             logger.info("项目 %s 镜像自测: HEALTH_OK, 离线编译诊断=%s", spec.project_id, compile_diag)
             # 6) create-from-image
+            # 关键：带 --node 把模板【钉死在 swarm 访问的单一节点】(ssh.host = cube-proxy host_ip)。
+            # 不带 --node 时 CubeMaster 会往【所有节点】派构建任务——双网卡机器(.30 有线/.60 无线)
+            # 被注册成两个节点，两节点抢同一 cubebox_os_image 磁盘目录 → rootfs rename 竞态 →
+            # 一个 READY 一个 FAILED。swarm 经 cube-proxy(.60) 命中 FAILED 节点 → rootfs 没准备好 →
+            # MicroVM 起不来 → envd 不存在 → run_command/探活 504。钉单节点后无竞态、与访问路径一致。
+            _node = (ssh.host or "").strip()
+            _node_opt = f"--node {shlex.quote(_node)} " if _node else ""
             code, out, err = r.run(
                 f"cubemastercli tpl create-from-image --image {shlex.quote(tag)} "
+                f"{_node_opt}"
                 f"--writable-layer-size 2G --expose-port 49983 --probe 49983 --probe-path /health 2>&1",
                 timeout=300,
             )

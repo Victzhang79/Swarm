@@ -1327,8 +1327,13 @@ class WorkerExecutor:
             "1. 对【修改】文件：read_file 读取后 patch_file 做最小必要改动\n"
             "2. 对【新建】文件：直接 write_file 写入完整内容（切勿先 read_file）\n"
             "3. 对【删除】文件：run_command 执行 rm\n"
-            "4. 若涉及 Python 文件，run_command 执行 python -m py_compile 验证语法\n"
-            "完成后简要说明你做了哪些改动。",
+            "4. 若涉及 Python 文件，run_command 执行 python -m py_compile 验证语法\n\n"
+            "⚠️ 重要约束（避免绕圈耗尽步数）：\n"
+            "- 【禁止】自己运行重型构建/测试命令：不要跑 mvn compile / mvn test / "
+            "gradle build / npm build / npm test 等。编译和测试由系统的确定性 L1 闸门统一负责，"
+            "你只管把文件改对。反复跑构建会耗光你的步数预算导致任务失败。\n"
+            "- 改完目标文件即【立即停止】并简要说明改动，不要反复读取/验证/自我怀疑。\n"
+            "- Java/前端等非 Python 文件：改完直接结束，不要尝试编译。\n",
             step="trivial-combined",
         )
         self._log(f"合并执行完成: {combined[:200]}")

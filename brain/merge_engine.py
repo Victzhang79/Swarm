@@ -168,6 +168,13 @@ def _format_file_patch(file_path: str, header_lines: list[str], hunks: list[_Hun
     for hunk in sorted(hunks, key=lambda h: h.old_start):
         body.extend(hunk.lines)
 
+    # hunk.lines 来自 _parse_file_patch 的 raw.splitlines()（不含尾换行），
+    # 故用 "\n".join 补换行是正确的。但 body 行可能混入【空字符串】元素
+    # （worker 产出的 diff 行尾为 \n\n / CRLF 时，上游 splitlines 留下空行），
+    # 直接 join 会把空行变成额外换行 → diff 行尾翻倍 → git apply "补丁损坏"
+    # （task 16098179 实证）。这里过滤 body 内的纯空行（diff 正文每行至少有
+    # 一个前缀字符 ' '/'+'/'-'/'@'/'\'，真正的空上下文行是 " " 单空格，不会是 ""）。
+    body = [ln for ln in body if ln != ""]
     return "\n".join(header + body)
 
 
@@ -180,7 +187,7 @@ def _format_conflict_hunks(file_path: str, hunks: list[_Hunk]) -> str:
     ]
     for hunk in hunks:
         parts.append(f"<<<<<<< {hunk.subtask_id}")
-        parts.extend(hunk.lines)
+        parts.extend(ln for ln in hunk.lines if ln != "")
         parts.append("=======")
     parts.append(f">>>>>>> {subtask_ids[-1]}")
     return "\n".join(parts)

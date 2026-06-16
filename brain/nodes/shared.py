@@ -285,11 +285,45 @@ def _build_simple_plan(task_description: str, affected_files: list[str] | None =
 
     if explicit:
         # 用户点名了文件：按操作意图分别填 modify/create/delete；
-        # readable 额外纳入检索文件作上下文
-        modify_files = list(dict.fromkeys(ops["modify"]))
-        create_files = list(dict.fromkeys(ops["create"]))
-        delete_files = list(dict.fromkeys(ops["delete"]))
-        readable = list(dict.fromkeys(explicit + retrieved))
+        # readable 额外纳入检索文件作上下文。
+        # ── 关键修复(task ec2b095b)：两个语义陷阱 ──
+        # ① _classify_file_ops 把"给已有类【新增】方法"误判为 create file（"新增"关键词），
+        #    但给已存在文件加方法实质是 modify，不是创建新文件。
+        # ② 点名常是【裸文件名】(如 "StringUtils.java")，项目真实路径是
+        #    "ruoyi-common/src/.../StringUtils.java"。裸名直接进 scope → bootstrap 在
+        #    /workspace 找不到(uploaded=0,errors=1) → worker 拿不存在的文件无从下手 →
+        #    绕圈耗尽步数 → "Sorry, need more steps"（与模型无关，换 40B-Claude 也一样）。
+        # 解法：对每个点名文件，先在 retrieved(已存在文件全路径集)里按 basename 匹配——
+        #   命中(文件已存在) → 解析成全路径 + 强制归 modify（无论原判 modify/create）；
+        #   未命中 → 保留原操作类型(可能是真新建/真删除)与裸名。
+        def _resolve_one(n: str) -> tuple[str, bool]:
+            """返回 (解析后路径, 是否已存在于项目)。"""
+            if "/" in n or "\\" in n:
+                exists = any(r == n for r in retrieved)
+                return n, exists
+            matches = [r for r in retrieved if r.rsplit("/", 1)[-1] == n]
+            if matches:
+                return (matches[0] if len(matches) == 1 else sorted(matches, key=len)[0]), True
+            return n, False
+
+        modify_files: list[str] = []
+        create_files: list[str] = []
+        delete_files: list[str] = []
+        for n in dict.fromkeys(ops["delete"]):
+            path, exists = _resolve_one(n)
+            delete_files.append(path)  # 删除意图明确，保留
+        for n in dict.fromkeys(ops["modify"] + ops["create"]):
+            path, exists = _resolve_one(n)
+            if exists:
+                modify_files.append(path)   # 文件已存在 → 一律 modify（修正 create 误判）
+            elif n in ops["create"]:
+                create_files.append(path)   # 项目里没有 + 原判 create → 真新建
+            else:
+                modify_files.append(path)   # 原判 modify 但没检索到 → 仍按 modify 试
+        modify_files = list(dict.fromkeys(modify_files))
+        create_files = list(dict.fromkeys(create_files))
+        delete_files = list(dict.fromkeys(delete_files))
+        readable = list(dict.fromkeys(modify_files + create_files + delete_files + retrieved))
     elif retrieved:
         # 未显式点名文件，但检索到候选。【不要把所有检索文件一股脑塞进 writable】——
         # 那会导致 worker 上传/拉回整个模块、diff 巨大且脏(实测 RuoYi "加一个方法"

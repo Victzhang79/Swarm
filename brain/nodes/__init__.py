@@ -248,6 +248,40 @@ async def analyze(state: BrainState) -> dict:
             for r in knowledge_context.get("struct", [])
             if r.get("file_path")
         ]
+
+    # ── 修复 A：单文件改动后置降级 medium → SIMPLE ──
+    # 背景(task dab669bb/16098179)："给某个类加一个方法"这类【单文件单点改动】被 LLM 判
+    # medium → 走 PLAN/ELABORATE/VALIDATE 四道慢 LLM 规划(~11min) + 拆成「实现+测试」多子任务
+    # → 多子任务改同文件 MERGE 冲突 / 测试子任务写错 → replan 死循环。
+    # 单文件任务由【一个 worker 一次写完】，有完整上下文、不拆强耦合坏子任务，SIMPLE 快速路径
+    # 跳过四道大模型规划。
+    # 信号源关键：必须用【任务描述里显式点名的文件】(_classify_file_ops)，【不能】用知识库
+    # 检索的 affected_files——后者是"相关上下文文件"(常 25+ 个 struct)，不是"要改的文件"，
+    # 用它判单文件永远不成立(踩坑 task 94f41bec：struct=25 导致降级失效)。
+    # 仅在【LLM 判 medium】+【任务描述明确点名恰好 1 个 modify 文件】+【无 create/delete】时生效，
+    # 不降级 complex，不误伤跨文件(点名 >1 文件不触发)、不误伤新建文件任务。
+    if complexity == Complexity.MEDIUM:
+        from swarm.brain.nodes.shared import _classify_file_ops
+        _ops = _classify_file_ops(task_description)
+        # 合并点名的所有文件（modify/create/delete 去重）。注意：_classify_file_ops 会把
+        # "新增方法"误归类为 create（"新增"关键词），但"给已有类加方法"实质是改单个已存在文件。
+        # 故不区分 modify/create，只看【任务点名的不同文件总数】——恰好 1 个即单文件任务。
+        _named_all = list(dict.fromkeys(
+            [f for f in (_ops.get("modify", []) + _ops.get("create", []) + _ops.get("delete", [])) if f]
+        ))
+        if len(_named_all) == 1:
+            logger.info(
+                "[ANALYZE] 单文件改动后置降级 medium → SIMPLE（任务点名唯一文件=%s，"
+                "走快速路径：单 worker 一次写完，跳过四道慢规划，避免多子任务同文件冲突）",
+                _named_all[0],
+            )
+            complexity = Complexity.SIMPLE
+            if isinstance(result, dict):
+                result["complexity"] = "simple"
+                result["reasoning"] = (
+                    f"[后置降级] 原判 medium，但任务仅点名单文件 {_named_all[0]}，"
+                    f"降级 SIMPLE 走快速路径。原因：{result.get('reasoning', '')}"
+                )
     reasoning = str(result.get("reasoning", ""))[:300] if isinstance(result, dict) else ""
     analyze_touch = touch_context(
         work_state,
@@ -981,6 +1015,52 @@ async def handle_failure(state: BrainState) -> dict:
         strategy = "retry"
 
     if strategy == "replan":
+        # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──
+        # 背景(task dab669bb)：medium 任务拆成 st-1(实现)+st-2(测试)，st-1 成功 DONE、
+        # st-2 因写错 JUnit L1 失败 → LLM 选 replan → 清空【含成功的 st-1】全部重新规划 ~10min →
+        # 循环。replan 只该用于【计划本身有结构性问题】(拆分错/依赖悬空)，单个子任务的
+        # L1 质量失败应只【重做失败子任务】，保留成功成果。
+        # 守卫条件：本批失败是子任务级 L1 失败 + 存在已成功(L1 通过)的兄弟子任务 +
+        #          失败子任务未达重试上限 → 降级为 retry（只重派失败的，不动成功的）。
+        def _is_l1_passed(out) -> bool:
+            if isinstance(out, WorkerOutput):
+                return bool(out.l1_passed)
+            if isinstance(out, dict):
+                return bool(out.get("l1_passed"))
+            return False
+
+        succeeded_siblings = [
+            sid for sid, out in subtask_results.items()
+            if sid not in failed_ids and _is_l1_passed(out)
+        ]
+        _retry_counts = dict(state.get("subtask_retry_counts", {}))
+        _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed_ids}
+        _deepest = max(_next_counts.values(), default=0)
+        _max_retries = get_config().model.max_retries  # 默认 2
+        # 仅在【有成功兄弟】且【失败子任务还没烧光重试配额】时拦截 replan，降级为 retry。
+        # 没有成功兄弟（整批都失败）或已达上限，仍走原 replan 逻辑（可能真是计划问题）。
+        if succeeded_siblings and failed_ids and _deepest <= _max_retries + 1:
+            dispatch_remaining = list(state.get("dispatch_remaining", []))
+            for fid in failed_ids:
+                subtask_results.pop(fid, None)
+                if fid not in dispatch_remaining:
+                    dispatch_remaining.append(fid)
+            forced_alternate = _deepest > _max_retries
+            logger.info(
+                "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
+                "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
+                len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
+                "，换备选模型" if forced_alternate else "",
+            )
+            return {
+                "subtask_results": subtask_results,
+                "dispatch_remaining": dispatch_remaining,
+                "failed_subtask_ids": [],
+                "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+                "use_alternate_model": forced_alternate,
+                "subtask_retry_counts": {**_retry_counts, **_next_counts},
+            }
+
         for fid in failed_ids:
             subtask_results.pop(fid, None)
         # P0-2 熔断：replan 不能无限重入。每次 replan 计数，超过上限直接升级人工，
