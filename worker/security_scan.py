@@ -345,33 +345,43 @@ def _sast_java(project_path: str, *, files: list[str] | None = None) -> list[Sec
         logger.warning("SAST(java): spotbugs execution failed: %s", stderr)
         return []
 
-    # spotbugs XML 输出解析 — 简单正则提取 (比完整 XML 解析更健壮)
+    # N-11 修复：spotbugs `-xml` 产 XML，原代码用 _safe_json_parse 当 JSON 解析→恒 None→
+    # Java diff 永报零发现(静默失效)。改为正确解析 spotbugs XML(BugCollection/BugInstance)。
+    if not stdout.strip():
+        return []
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(stdout)
+    except ET.ParseError as exc:
+        # 解析失败显式告警(而非静默吞)——便于诊断"为何 Java 永远零发现"
+        logger.warning("SAST(java): spotbugs XML 解析失败: %s", exc)
+        return []
+
     findings: list[SecurityFinding] = []
-    # 如果输出不是 XML 格式（比如 spotbugs 还支持 -json），尝试 JSON
-    data = _safe_json_parse(stdout)
-    if data is not None and isinstance(data, dict):
-        for bug in data.get("BugInstance", data.get("bugInstances", [])):
-            if not isinstance(bug, dict):
-                continue
-            sev_str = bug.get("priority", bug.get("severity", "Medium"))
-            sev = _map_spotbugs_severity(str(sev_str))
-            src = bug.get("SourceLine", {})
-            if isinstance(src, dict):
-                fpath = src.get("sourcefile", src.get("className", ""))
-                line = int(src.get("start", 0))
-            else:
-                fpath = str(src)
+    for bug in root.iter("BugInstance"):
+        sev = _map_spotbugs_severity(str(bug.get("priority", "2")))
+        short = bug.findtext("ShortMessage") or bug.findtext("Message") or "spotbugs finding"
+        long_msg = bug.findtext("LongMessage") or ""
+        src = bug.find("SourceLine")
+        if src is not None:
+            fpath = src.get("sourcefile") or src.get("sourcepath") or src.get("classname", "")
+            try:
+                line = int(src.get("start", "0") or 0)
+            except (TypeError, ValueError):
                 line = 0
-            findings.append(SecurityFinding(
-                severity=sev,
-                category="sast",
-                rule_id=bug.get("type", ""),
-                title=bug.get("ShortMessage", bug.get("message", "spotbugs finding")),
-                file=fpath,
-                line=line,
-                tool="spotbugs",
-                recommendation=bug.get("LongMessage", ""),
-            ))
+        else:
+            fpath, line = "", 0
+        findings.append(SecurityFinding(
+            severity=sev,
+            category="sast",
+            rule_id=bug.get("type", ""),
+            title=short,
+            file=fpath,
+            line=line,
+            tool="spotbugs",
+            recommendation=long_msg,
+        ))
     return findings
 
 

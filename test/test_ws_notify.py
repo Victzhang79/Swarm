@@ -163,17 +163,15 @@ def test_ws_task_progress_receives_events():
     with patch("swarm.api.app.store") as mock_store:
         mock_store.get_task.return_value = task
 
-        # 预填充队列事件
-        async def _fill_queue():
-            q = asyncio.Queue()
-            await q.put({"step": "progress", "message": "正在执行", "progress": 50})
-            await q.put({"step": "complete", "message": "执行完成", "progress": 100})
-            return q
+        # 预填充 fanout 主题（N-CW1：pub/sub 多订阅扇出 + 历史回放）
+        from swarm.brain.runner import _FanoutTopic
 
-        mock_queue = asyncio.run(_fill_queue())
+        topic = _FanoutTopic()
+        topic.publish({"step": "progress", "message": "正在执行", "progress": 50})
+        topic.publish({"step": "complete", "message": "执行完成", "progress": 100})
 
-        with patch("swarm.brain.runner.get_task_queue", return_value=mock_queue):
-            with patch("swarm.brain.runner.register_task_queue", return_value=mock_queue):
+        # subscribe_task 返回 (主题, 已回放历史的专属订阅队列)
+        with patch("swarm.brain.runner.subscribe_task", return_value=(topic, topic.subscribe())):
                 client = TestClient(app)
                 with client.websocket_connect("/ws/tasks/task-ws-1") as ws:
                     # 接收进度事件

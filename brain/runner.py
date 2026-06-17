@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import secrets
+from collections import deque
 from typing import Any
 
 from langgraph.types import Command
@@ -34,8 +35,47 @@ class TaskTokenLimitExceeded(Exception):
         self.usage = usage
         super().__init__(f"token limit exceeded: {usage.get('total')}")
 
-# task_id → SSE 事件队列
-_task_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+class _FanoutTopic:
+    """单 task 的进度事件【发布-订阅】主题（N-CW1/N-CW2 根因修复）。
+
+    旧实现：每 task 一个 asyncio.Queue 单消费者。SSE+WS 同开会争抢 queue.get() 各取一半→
+    两端都丢进度；retry 期 register 覆盖队列对象→在途消费者孤儿化；断开不注销→内存涨。
+
+    新实现：生产者 publish() 扇出到【每个订阅者各自的队列】；保留有界历史，late 订阅者订阅
+    时回放历史（保持"任务先跑、SSE 后连仍能看到先前进度"的语义）。订阅者断开 unsubscribe()
+    即回收其队列。生产侧 API（_emit/register/get）不变，仅语义升级。
+    """
+
+    __slots__ = ("_subs", "_history")
+
+    def __init__(self, history: int = 500) -> None:
+        self._subs: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._history: deque[dict[str, Any]] = deque(maxlen=history)
+
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        for ev in self._history:  # 回放历史，late 订阅者也能看到先前进度
+            q.put_nowait(ev)
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        self._subs.discard(q)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        self._history.append(event)
+        for q in list(self._subs):  # 扇出到每个订阅者各自队列（put_nowait 不阻塞）
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:  # 理论不会（无界队列），保险丢弃保护其它订阅者
+                pass
+
+    def __bool__(self) -> bool:  # 兼容旧 `if queue:` 判断
+        return True
+
+
+# task_id → 进度事件 fanout 主题（pub/sub 多订阅扇出）
+_task_queues: dict[str, _FanoutTopic] = {}
 
 # task_id → 是否正在执行（防止重复 resume）
 _task_running: set[str] = set()
@@ -92,15 +132,24 @@ _INTERRUPT_STATUS_LABEL = {
 }
 
 
-def get_task_queue(task_id: str) -> asyncio.Queue[dict[str, Any]] | None:
+def get_task_queue(task_id: str) -> _FanoutTopic | None:
     return _task_queues.get(task_id)
 
 
-def register_task_queue(task_id: str) -> asyncio.Queue[dict[str, Any]]:
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    _task_queues[task_id] = queue
-    _cleanup_old_queues()
-    return queue
+def register_task_queue(task_id: str) -> _FanoutTopic:
+    # N-CW1：幂等——已存在则【复用】同一主题，绝不覆盖（否则 retry/revise 会孤儿化在途订阅者）。
+    topic = _task_queues.get(task_id)
+    if topic is None:
+        topic = _FanoutTopic()
+        _task_queues[task_id] = topic
+        _cleanup_old_queues()
+    return topic
+
+
+def subscribe_task(task_id: str) -> tuple[_FanoutTopic, asyncio.Queue[dict[str, Any]]]:
+    """消费者（SSE/WS）订阅某 task 的进度，返回 (主题, 专属队列)。用完须 unsubscribe。"""
+    topic = get_task_queue(task_id) or register_task_queue(task_id)
+    return topic, topic.subscribe()
 
 
 def _cleanup_old_queues() -> None:
@@ -110,8 +159,9 @@ def _cleanup_old_queues() -> None:
                 _task_queues.pop(key, None)
 
 
-async def _emit(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
-    await queue.put(event)
+async def _emit(topic: _FanoutTopic, event: dict[str, Any]) -> None:
+    # 扇出到所有订阅者各自队列（非阻塞）；无订阅者时仅入历史，供 late 订阅者回放。
+    topic.publish(event)
 
 
 def _emit_task_notification(task_id: str, task_rec: dict[str, Any], status: str) -> None:

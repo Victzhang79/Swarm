@@ -849,7 +849,38 @@ async def _start_task_scheduler() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """应用关闭钩子：优雅关闭数据库连接池 + 排空热沙箱池。"""
+    """应用关闭钩子：优雅关闭数据库连接池 + 排空热沙箱池。
+
+    N-08/N-10：必须【先】取消所有后台循环 task（leadership/decay/consistency/KB 调度），
+    再关池/释放 advisory lock——否则循环会在已关闭的池上继续跑抛错，并重抢刚释放的
+    advisory lock 导致脑裂（两副本同时调度）。
+    """
+    # 1) 取消应用级后台循环（_spawn_bg 持引用的 leadership/decay/consistency 等）
+    import asyncio as _aio
+
+    _bg = list(_APP_BG_TASKS)
+    for _t in _bg:
+        if not _t.done():
+            _t.cancel()
+    if _bg:
+        await _aio.gather(*_bg, return_exceptions=True)
+        logger.info("已取消 %d 个应用后台任务", len(_bg))
+    # 2) 取消 KB 调度循环并关闭共享 updater（此前 shutdown_kb_scheduler 从不被调用）
+    try:
+        from swarm.knowledge.scheduler import shutdown_kb_scheduler
+
+        await shutdown_kb_scheduler()
+        logger.info("KB 调度器已关闭")
+    except Exception as exc:
+        logger.warning("Failed to shutdown KB scheduler: %s", exc)
+    # 3) 停止任务准入调度器消费循环
+    try:
+        from swarm.brain.scheduler import stop_task_scheduler
+
+        await stop_task_scheduler()
+        logger.info("任务准入调度器已停止")
+    except Exception as exc:
+        logger.warning("Failed to stop task scheduler: %s", exc)
     try:
         from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled
 

@@ -17,6 +17,16 @@ from __future__ import annotations
 TRANSIENT = "transient"
 CAPABILITY = "capability"
 
+
+class TransientInfraError(Exception):
+    """基础设施瞬时失败（沙箱上传/拉回失败、网络抖动等）。
+
+    N-06/N-07：这类失败若被吞掉，会让"成功执行但同步失败"伪装成空 diff/能力失败，
+    错误触发换模型降级。显式抛此异常 → classify_failure 归类 TRANSIENT →
+    handle_failure 走退避重试【同模型】（基础设施抖动退避后大概率自愈），不浪费 capability 配额。
+    """
+
+
 # 拒答/截断标记（模型能力问题，非基础设施）——与 executor._REFUSAL_MARKERS 对齐。
 _REFUSAL_MARKERS = (
     "sorry, need more steps",
@@ -76,7 +86,7 @@ def classify_failure(err: BaseException | str | None) -> str | None:
 
     # 1) 异常对象：isinstance 优先
     if isinstance(err, BaseException):
-        if _is_transient_instance(err):
+        if isinstance(err, TransientInfraError) or _is_transient_instance(err):
             return TRANSIENT
         text = str(err)
     else:

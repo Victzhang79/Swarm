@@ -110,6 +110,9 @@ async def _test_learn_persist_async():
     mock_store.write_success = AsyncMock(return_value=42)
     mock_store.write_mistake = AsyncMock(return_value=99)
     mock_store.write_task_summary = AsyncMock()
+    # P1-DEBT-03：落库前查相似已有记录决定强化 vs 插新；测试为新记录 → []。
+    mock_store.query_successes = AsyncMock(return_value=[])
+    mock_store.query_mistakes = AsyncMock(return_value=[])
 
     state = {
         "project_id": "proj-test",

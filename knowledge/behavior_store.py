@@ -199,7 +199,7 @@ class BehaviorStore:
                     """
                     SELECT file_path, COUNT(*) AS mod_count, MAX(modified_at) AS last_modified
                     FROM kb_modification_log
-                    WHERE project_id = %s AND modified_at >= now() - INTERVAL '%s days'
+                    WHERE project_id = %s AND modified_at >= now() - make_interval(days => %s)
                     GROUP BY file_path
                     ORDER BY mod_count DESC
                     LIMIT %s
@@ -291,7 +291,7 @@ class BehaviorStore:
             await cur.execute(
                 """
                 DELETE FROM kb_modification_log
-                WHERE project_id = %s AND modified_at < now() - INTERVAL '%s days'
+                WHERE project_id = %s AND modified_at < now() - make_interval(days => %s)
                 """,
                 (project_id, retention_days),
             )

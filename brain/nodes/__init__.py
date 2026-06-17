@@ -953,6 +953,12 @@ async def _run_security_audit(
         block_severity=block_severity,
     )
 
+    # N-01 fail-closed 判据：仅用于【扫描器崩溃】路径——我们【有】东西可扫但扫挂了，
+    # 在阻断模式(block_severity != "none")下"扫不了"绝不能与"真·零漏洞"混同放行。
+    # report-only(none)模式是运维明示"永不阻断"，此时保持不阻断(可观测性不误杀)。
+    # 注意：无 project_path 是【编排未提供可扫对象】(非攻击面/非扫描失败)，按既有契约安全跳过。
+    _audit_fail_closed = block_severity != "none"
+
     if not project_path:
         logger.warning("[AUDIT] 子任务 %s 无项目路径，安全审计跳过", subtask.id)
         return WorkerOutput(
@@ -960,7 +966,7 @@ async def _run_security_audit(
             diff="",
             summary="安全审计跳过：无项目路径",
             confidence=Confidence.LOW,
-            l1_passed=True,  # 无路径不阻断，避免误杀
+            l1_passed=True,  # 无路径=无可扫对象，安全跳过不误杀（既有契约）
             l1_details={"mode": "audit", "skipped": "no_project_path"},
             audit_findings=[],
         )
@@ -981,14 +987,20 @@ async def _run_security_audit(
     try:
         findings, should_block = await _asyncio.get_running_loop().run_in_executor(None, _scan)
     except Exception as exc:  # noqa: BLE001
-        logger.error("[AUDIT] 安全扫描失败: %s", exc)
+        logger.error("[AUDIT] 安全扫描失败: %s (fail_closed=%s)", exc, _audit_fail_closed)
         return WorkerOutput(
             subtask_id=subtask.id,
             diff="",
             summary=f"安全审计执行失败: {exc}",
             confidence=Confidence.LOW,
-            l1_passed=True,  # 扫描器自身故障不阻断交付(可观测性不应误杀)
-            l1_details={"mode": "audit", "error": str(exc)},
+            # N-01：阻断模式下扫描器崩溃→fail-closed(不可与"真零漏洞"混同)；none 模式不阻断
+            l1_passed=not _audit_fail_closed,
+            l1_details={
+                "mode": "audit",
+                "error": str(exc),
+                "fail_closed": _audit_fail_closed,
+                "block_severity": block_severity,
+            },
             audit_findings=[],
         )
 

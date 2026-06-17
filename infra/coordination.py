@@ -63,6 +63,16 @@ class PgCoordinationBackend(CoordinationBackend):
 
     async def _ensure_conn(self):
         if self._conn is None or self._conn.closed:
+            # P1-DEBT-13：连接断开/重建意味着旧【会话级】advisory lock 已被 PG 自动释放。
+            # 此时本地 _held 全部失效，必须清空——否则重连后 is_held/try_acquire 会沿用旧
+            # 标记误报仍是 leader，与已接管的另一副本同时自认 leader（脑裂）。重连后须在
+            # 【新会话】上重新 pg_try_advisory_lock 才算真正持锁。
+            if self._held:
+                logger.warning(
+                    "[coordination] 协调连接重建，清空 %d 个失效的本地持锁标记并需重新选主（防脑裂）",
+                    len(self._held),
+                )
+                self._held.clear()
             import psycopg
 
             from swarm.config.settings import DatabaseConfig
@@ -103,6 +113,12 @@ class PgCoordinationBackend(CoordinationBackend):
             self._held.discard(key)
 
     async def is_held(self, key: str) -> bool:
+        # P1-DEBT-13：连接断开 → 该会话所有 advisory lock 已被 PG 释放，本地标记失效。
+        # 必须校验【真实连接存活】，不能只查本地 _held（否则连接断后仍误报持锁→脑裂）。
+        if self._conn is None or self._conn.closed:
+            if self._held:
+                self._held.clear()
+            return False
         return key in self._held
 
     async def close(self) -> None:

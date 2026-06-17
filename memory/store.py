@@ -358,6 +358,13 @@ class MemoryStore:
         # 生成 query 向量
         vectors = await self._embed_fn([query])
         query_vector = vectors[0]
+        # N-13：embedding 服务挂时 _default_embed 返回零向量，ORDER BY embedding <=> 零向量
+        # 距离恒定→排序任意→L5 错题检索退化为随机。随机错题注入 prompt 比无错题更有害，故返回 []。
+        if _is_zero_vector(query_vector):
+            logger.warning(
+                "[MEM] query_mistakes 查询向量为零向量(embedding 不可用)→返回空，避免随机错题排序"
+            )
+            return []
         vector_str = _vector_to_pg(query_vector)
 
         type_filter = ""
@@ -494,6 +501,12 @@ class MemoryStore:
 
         vectors = await self._embed_fn([query])
         query_vector = vectors[0]
+        # N-13：同 query_mistakes，零向量→相似度排序退化随机，L6 成功模式返回 [] 而非随机模式。
+        if _is_zero_vector(query_vector):
+            logger.warning(
+                "[MEM] query_successes 查询向量为零向量(embedding 不可用)→返回空，避免随机成功模式排序"
+            )
+            return []
         vector_str = _vector_to_pg(query_vector)
 
         async with conn.cursor() as cur:

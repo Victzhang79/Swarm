@@ -38,6 +38,9 @@ _MAX_ADMISSION_RETRIES = 200  # ×3s ≈ 10min，覆盖最长沙箱构建耗时
 _consumer_started = False
 _inflight: set[str] = set()
 _wakeup: asyncio.Event | None = None
+# N-09：持引用保存消费循环 task，供 stop_task_scheduler 取消（否则 fire-and-forget
+# 可被 GC、且无法停止）。
+_consumer_task: asyncio.Task | None = None
 
 
 def _max_concurrent() -> int:
@@ -109,48 +112,72 @@ async def start_task_scheduler() -> None:
     async def _loop() -> None:
         from swarm.brain.runner import start_task_background
 
+        # N-09：每次迭代包 try/except 保活——单次出队/准入/派发异常绝不能杀死整个消费
+        # 循环（否则后续所有任务永久卡队列且无告警）。CancelledError 须放行以支持优雅停止。
         while True:
-            # 并发未满则尝试出队
-            if len(_inflight) < _max_concurrent():
-                item = TaskQueue.dequeue()
-                if item:
-                    task_id = item["task_id"]
-                    meta = _pending_meta.get(task_id)
-                    if meta is None:
-                        # 元数据丢失（如进程重启）→ 跳过，由 orphan 恢复逻辑处理
-                        logger.warning("[Scheduler] 任务 %s 缺执行元数据，跳过", task_id)
-                        continue
-                    # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
-                    # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）
-                    if not _project_ready_for_exec(meta["project_id"]):
-                        n = _admission_retries.get(task_id, 0) + 1
-                        _admission_retries[task_id] = n
-                        if n <= _MAX_ADMISSION_RETRIES:
-                            # 重新入队尾部，稍后再试（不消费 meta），避免忙等
-                            TaskQueue.enqueue(task_id, meta["project_id"], priority="normal")
-                            if n == 1 or n % 20 == 0:
-                                logger.info("[Scheduler] 任务 %s 等待项目 %s 沙箱就绪，留池中（第 %d 次）",
-                                            task_id, meta["project_id"], n)
-                            await asyncio.sleep(3.0)
-                            continue
-                        # 超上限：放弃留池，强制放行交由 runner/executor 兜底（通用池模板）
-                        logger.warning("[Scheduler] 任务 %s 等待沙箱就绪超 %d 次，强制放行（executor 兜底选模板）",
-                                       task_id, _MAX_ADMISSION_RETRIES)
-                    _admission_retries.pop(task_id, None)
-                    _pending_meta.pop(task_id, None)
-                    _inflight.add(task_id)
-                    _run_with_slot(task_id, meta, start_task_background)
-                    continue  # 立即尝试下一个（填满并发额度）
-            # 队列空或并发已满 → 等唤醒或轮询
             try:
-                if _wakeup is not None:
-                    await asyncio.wait_for(_wakeup.wait(), timeout=2.0)
-                    _wakeup.clear()
-            except asyncio.TimeoutError:
-                pass
+                # 并发未满则尝试出队
+                if len(_inflight) < _max_concurrent():
+                    item = TaskQueue.dequeue()
+                    if item:
+                        task_id = item["task_id"]
+                        meta = _pending_meta.get(task_id)
+                        if meta is None:
+                            # 元数据丢失（如进程重启）→ 跳过，由 orphan 恢复逻辑处理
+                            logger.warning("[Scheduler] 任务 %s 缺执行元数据，跳过", task_id)
+                            continue
+                        # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
+                        # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）
+                        if not _project_ready_for_exec(meta["project_id"]):
+                            n = _admission_retries.get(task_id, 0) + 1
+                            _admission_retries[task_id] = n
+                            if n <= _MAX_ADMISSION_RETRIES:
+                                # 重新入队尾部，稍后再试（不消费 meta），避免忙等
+                                TaskQueue.enqueue(task_id, meta["project_id"], priority="normal")
+                                if n == 1 or n % 20 == 0:
+                                    logger.info("[Scheduler] 任务 %s 等待项目 %s 沙箱就绪，留池中（第 %d 次）",
+                                                task_id, meta["project_id"], n)
+                                await asyncio.sleep(3.0)
+                                continue
+                            # 超上限：放弃留池，强制放行交由 runner/executor 兜底（通用池模板）
+                            logger.warning("[Scheduler] 任务 %s 等待沙箱就绪超 %d 次，强制放行（executor 兜底选模板）",
+                                           task_id, _MAX_ADMISSION_RETRIES)
+                        _admission_retries.pop(task_id, None)
+                        _pending_meta.pop(task_id, None)
+                        _inflight.add(task_id)
+                        _run_with_slot(task_id, meta, start_task_background)
+                        continue  # 立即尝试下一个（填满并发额度）
+                # 队列空或并发已满 → 等唤醒或轮询
+                try:
+                    if _wakeup is not None:
+                        await asyncio.wait_for(_wakeup.wait(), timeout=2.0)
+                        _wakeup.clear()
+                except asyncio.TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                logger.info("[Scheduler] 消费循环被取消，退出")
+                raise
+            except Exception as exc:  # noqa: BLE001 — 保活：任何单次异常都不得杀死循环
+                logger.exception("[Scheduler] 消费循环单次迭代异常（已保活，继续）: %s", exc)
+                await asyncio.sleep(1.0)  # 防热旋
 
-    asyncio.create_task(_loop())
+    global _consumer_task
+    _consumer_task = asyncio.create_task(_loop())
     logger.info("[Scheduler] 任务准入调度器已启动 (max_concurrent=%d)", _max_concurrent())
+
+
+async def stop_task_scheduler() -> None:
+    """停止后台消费循环（应用关闭调用，幂等）。N-09：取消并清理状态以便重启。"""
+    global _consumer_started, _consumer_task, _wakeup
+    if _consumer_task is not None and not _consumer_task.done():
+        _consumer_task.cancel()
+        try:
+            await _consumer_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _consumer_task = None
+    _consumer_started = False
+    _wakeup = None
 
 
 def _run_with_slot(task_id: str, meta: dict, start_fn) -> None:

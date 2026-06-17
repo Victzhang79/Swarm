@@ -50,6 +50,9 @@ async def _test_learn_after_accept_writes_memory_async():
     mock_store.close = AsyncMock()
     mock_store.write_success = AsyncMock(return_value=7)
     mock_store.write_task_summary = AsyncMock()
+    # P1-DEBT-03：learn 落库前会查相似已有记录决定强化 vs 插新；新模式无前例 → []。
+    mock_store.query_successes = AsyncMock(return_value=[])
+    mock_store.query_mistakes = AsyncMock(return_value=[])
 
     state = {
         "project_id": "proj-1",

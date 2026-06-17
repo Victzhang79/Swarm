@@ -177,14 +177,15 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
 @router.get("/api/tasks/{task_id}/stream", tags=["任务管理"])
 async def stream_task(task_id: str):
     """SSE 流式推送任务 Brain 执行进度"""
-    from swarm.brain.runner import get_task_queue, register_task_queue
+    from swarm.brain.runner import subscribe_task
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-    queue = get_task_queue(task_id) or register_task_queue(task_id)
+    # N-CW1/N-CW2：每个连接订阅【自己的】队列（多端互不抢事件），断开时注销回收。
+    topic, queue = subscribe_task(task_id)
 
     async def event_generator():
         try:
@@ -213,6 +214,8 @@ async def stream_task(task_id: str):
                     break
         except asyncio.CancelledError:
             pass
+        finally:
+            topic.unsubscribe(queue)  # N-CW2：断开即注销，避免内存增长
 
     return EventSourceResponse(event_generator())
 
@@ -222,11 +225,11 @@ async def stream_task(task_id: str):
 async def ws_task_progress(websocket: WebSocket, task_id: str):
     """WebSocket 推送任务 Brain 执行进度
 
-    复用 SSE 的同一个 asyncio.Queue 事件源，通过 WebSocket 传输。
+    与 SSE 共享同一 fanout 主题，但【各自独立订阅队列】（N-CW1：不再争抢同一 queue）。
     消息格式: JSON {"event": "progress"|"result"|"error"|"heartbeat", "data": {...}}
-    连接断开时优雅处理。
+    连接断开时优雅处理并注销订阅。
     """
-    from swarm.brain.runner import get_task_queue, register_task_queue
+    from swarm.brain.runner import subscribe_task
 
     await websocket.accept()
 
@@ -238,7 +241,8 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         await websocket.close()
         return
 
-    queue = get_task_queue(task_id) or register_task_queue(task_id)
+    # N-CW1/N-CW2：独立订阅 + 断开注销
+    topic, queue = subscribe_task(task_id)
 
     try:
         while True:
@@ -274,6 +278,7 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
     except Exception as exc:
         _app.logger.warning("WebSocket /ws/tasks/%s 异常: %s", task_id, exc)
     finally:
+        topic.unsubscribe(queue)  # N-CW2：断开即注销订阅
         try:
             await websocket.close()
         except Exception:

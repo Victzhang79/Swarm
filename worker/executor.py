@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from swarm.config.settings import get_config
+from swarm.models.errors import TransientInfraError
 from swarm.tools.scope_guard import clear_scope
 from swarm.types import (
     Confidence,
@@ -1103,7 +1104,13 @@ class WorkerExecutor:
             for err in (sync_stats.get("errors") or [])[:5]:
                 self._log(f"上传警告: {err}")
         except Exception as sync_exc:
-            self._log(f"{reason} 本地→沙箱精准上传失败: {sync_exc}")
+            # N-06：bootstrap 上传失败若吞掉，agent 会对【缺文件的沙箱】空跑→被误判能力失败
+            # （空 diff）→错误触发换模型。这是基础设施瞬时失败，显式抛 TransientInfraError →
+            # run() 归类 transient → 退避重试同模型（自愈）。
+            self._log(f"{reason} 本地→沙箱精准上传失败（infra 瞬时，将退避重试）: {sync_exc}")
+            raise TransientInfraError(
+                f"sandbox upload failed ({reason}): {sync_exc}"
+            ) from sync_exc
         finally:
             if staging_dir:
                 shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1154,7 +1161,12 @@ class WorkerExecutor:
             for err in (sync_stats.get("errors") or [])[:5]:
                 self._log(f"pull-back 警告: {err}")
         except Exception as sync_exc:
-            self._log(f"{reason} 沙箱→本地 pull-back 失败: {sync_exc}")
+            # N-07：pull-back 失败若吞掉，成功执行的产出拉不回来→diff 空→报"无变更"→
+            # 错误触发换模型降级。这是基础设施瞬时失败，显式抛 → run() 归类 transient → 退避重试。
+            self._log(f"{reason} 沙箱→本地 pull-back 失败（infra 瞬时，将退避重试）: {sync_exc}")
+            raise TransientInfraError(
+                f"sandbox pull-back failed ({reason}): {sync_exc}"
+            ) from sync_exc
 
     def _list_sandbox_workspace_files(self) -> list[str]:
         """递归列出沙箱 /workspace 下的相对文件路径（allow_any/greenfield pull-back 用）。

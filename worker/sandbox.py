@@ -21,6 +21,7 @@ import posixpath
 import re as _re
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -325,8 +326,10 @@ class SandboxManager:
         self._sandbox_meta: dict[str, dict[str, str | None]] = {}
         # sandbox_id → 连续操作失败次数（5xx/连接类）。成功清零，达阈值熔断。
         self._fail_counts: dict[str, int] = {}
-        # sandbox_id → [{ts, kind, message, stdout?, stderr?, code?, error?}]
-        self._sandbox_activity: dict[str, list[dict[str, Any]]] = {}
+        # sandbox_id → deque[{ts, kind, message, stdout?, stderr?, code?, error?}]
+        # N-CW3：用 deque(maxlen) —— append+越界丢弃是 GIL 下单原子操作，杜绝
+        # reaper 线程×并发 worker 交错 append+del 损坏列表。
+        self._sandbox_activity: dict[str, deque[dict[str, Any]]] = {}
         self._setup_env()
         self._init_sidecar()
 
@@ -417,10 +420,8 @@ class SandboxManager:
             "code": code[:2000] if code else "",
             "error": error or "",
         }
-        entries = self._sandbox_activity.setdefault(sandbox_id, [])
-        entries.append(entry)
-        if len(entries) > 500:
-            del entries[:-500]
+        entries = self._sandbox_activity.setdefault(sandbox_id, deque(maxlen=500))
+        entries.append(entry)  # deque(maxlen) 自动丢弃最旧，无需手动 truncate（原 del 切片非原子）
         # 持久化（追加写 JSONL，便于重启后/事后 grep 追查）
         self._persist_activity(sandbox_id, entry)
 
@@ -444,7 +445,9 @@ class SandboxManager:
     def get_activity(self, sandbox_id: str, limit: int = 200) -> list[dict[str, Any]]:
         entries = self._sandbox_activity.get(sandbox_id)
         if entries:
-            return entries[-limit:] if limit else list(entries)
+            # deque 不支持切片，先转 list 再取尾部 limit 条
+            snapshot = list(entries)
+            return snapshot[-limit:] if limit else snapshot
         # 内存里没有（如进程重启后）→ 从持久化 JSONL 读回
         return self._load_persisted_activity(sandbox_id, limit)
 

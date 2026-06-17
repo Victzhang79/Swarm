@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 _updater: KnowledgeUpdater | None = None
 _polling_started = False
+# N-08/N-10：持引用保存后台循环 task，关闭时显式 cancel（否则 fire-and-forget 循环
+# 会在已关闭的池上继续跑、并重建 updater 抢资源 → 热重启脑裂）。
+_poll_task: asyncio.Task | None = None
+_reprocess_task: asyncio.Task | None = None
 
 
 async def get_shared_updater() -> KnowledgeUpdater:
@@ -49,7 +53,8 @@ async def start_kb_update_scheduler(*, interval_seconds: int = 5) -> None:
                 logger.exception("[KBScheduler] polling error: %s", exc)
             await asyncio.sleep(interval_seconds)
 
-    asyncio.create_task(_loop())
+    global _poll_task
+    _poll_task = asyncio.create_task(_loop())
     logger.info("[KBScheduler] started (interval=%ds)", interval_seconds)
 
 
@@ -60,12 +65,27 @@ async def enqueue_kb_update(event: UpdateEvent) -> int:
 
 
 async def shutdown_kb_scheduler() -> None:
-    """关闭共享 updater（测试/进程退出）。"""
-    global _updater, _polling_started
+    """关闭共享 updater + 取消后台轮询循环（测试/进程退出）。
+
+    N-08/N-10：必须先 cancel 循环 task，否则循环会在 updater 关闭后立即重建它、
+    并在已关闭的 DB 池上继续轮询抛错（热重启时还会重抢 advisory lock 致脑裂）。
+    """
+    global _updater, _polling_started, _poll_task, _reprocess_task
+    for _t in (_poll_task, _reprocess_task):
+        if _t is not None and not _t.done():
+            _t.cancel()
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+    _poll_task = None
+    _reprocess_task = None
     if _updater is not None:
         await _updater.close()
         _updater = None
     _polling_started = False
+    global _reprocess_started
+    _reprocess_started = False
 
 
 # ── 周期全量重预处理调度 ────────────────────────────────
@@ -140,5 +160,6 @@ async def start_preprocess_refresh_scheduler() -> None:
                 logger.exception("[ReprocessScheduler] loop error: %s", exc)
             await _aio.sleep(interval)
 
-    asyncio.create_task(_loop())
+    global _reprocess_task
+    _reprocess_task = asyncio.create_task(_loop())
     logger.info("[ReprocessScheduler] started (stale>%.1fh, check every %ds)", max_age, interval)

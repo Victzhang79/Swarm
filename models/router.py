@@ -301,7 +301,14 @@ class ModelRouter:
         """
         pc = self.config.provider_for_model(model_name)
         if pc is None:
-            # 没有任何接入点配置 —— 合成一个 local 兜底（保持旧"默认本地"行为）
+            # N-14：无 provider 归属时合成 local 兜底（保持旧"默认本地"行为），但必须【显式告警】——
+            # 否则打错的模型名会静默全发本地端点、get_routing_table 仍显示预期名，配置错误不可察。
+            logger.warning(
+                "[ROUTER] 模型 '%s' 无任何 provider 归属 → 合成 local 兜底端点(%s)。"
+                "若该模型本应走云端/其他端点，请检查模型名拼写或 model_providers 映射，"
+                "否则请求会静默全部发往本地。",
+                model_name, self.config.local_base_url,
+            )
             fallback_pc = ProviderConfig(
                 id="local", kind="local",
                 base_url=self.config.local_base_url, api_key=self.config.local_api_key,
