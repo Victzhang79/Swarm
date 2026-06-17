@@ -102,10 +102,14 @@ def _min_worker_context_window() -> int | None:
         from swarm.models import capability_store as cap
 
         cfg = get_config().model
+        # 预算基于【各档 primary 主力模型】窗口——worker 正常走 primary，
+        # fallback 链是异常降级路径（如终极兜底 122B-A10B 仅 64K），不该让它的小窗口
+        # 把全局预算压低，否则 est 基线(medium=50k)恒超预算 → ELABORATE 误判全员需二次拆分
+        # → 逐个 LLM 拆碎(与垂直切片冲突)+ 极慢/卡死(根因 task e3618f1e)。
         candidate_models = [
-            cfg.routing_trivial, *cfg.routing_trivial_fallback,
-            cfg.routing_medium, *cfg.routing_medium_fallback,
-            cfg.routing_complex, *cfg.routing_complex_fallback,
+            cfg.routing_trivial,
+            cfg.routing_medium,
+            cfg.routing_complex,
         ]
         candidate_models = [m for m in candidate_models if m]
 
