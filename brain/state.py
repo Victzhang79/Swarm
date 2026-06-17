@@ -76,6 +76,7 @@ class BrainState(TypedDict, total=False):
     l3_passed: bool | None              # L3 预发验证结果（None=跳过）
     l3_skipped: bool                    # L3 是否跳过
     l3_message: str                     # L3 验证说明
+    l3_branch: str                      # N-04：verify_l3 实际推送的分支，供 learn_success MR 指向正确分支
     verification_failure: str | None    # l2 / l3 等验证失败来源
 
     # ─── L3 滑动窗口（任务执行期上下文）───

@@ -185,11 +185,14 @@ async def verify_l3(state: BrainState) -> dict:
             )
             logger.info("[VERIFY_L3] GitLab: %s — %s", "通过" if l3_passed else "未通过", l3_message)
             if not l3_passed:
-                return {**_l3_failure_state(), "l3_message": l3_message}
+                return {**_l3_failure_state(), "l3_message": l3_message, "l3_branch": ref}
             return {
                 "l3_passed": l3_passed,
                 "l3_skipped": False,
                 "l3_message": l3_message,
+                # N-04 修复：把实际推送的 L3 分支(ref)写进 state，否则 learn_success 读
+                # state['l3_branch'] 为空 → MR 回退到从未推送的 swarm/task-xxx 分支。
+                "l3_branch": ref,
             }
         except Exception as exc:
             logger.warning("[VERIFY_L3] GitLab pipeline 失败，回退 staging/LLM: %s", exc)

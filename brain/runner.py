@@ -397,6 +397,28 @@ async def _handle_post_run(
         })
         return
 
+    # P1-DEBT-07 修复：终态判定下沉 gates 单一事实源。原 runner 只拦 plan_invalid/REJECT，
+    # 漏了 failure_escalated / 未恢复失败子任务 / L2 未过 等——这些任务会走到下方"正常结束"
+    # 被无脑标 DONE（learn_failure 已学错题却对外报成功 = 假 DONE）。auto_accept 模式下用
+    # gates.can_auto_accept_delivery 复核：不可放行则标 FAILED。
+    if state.get("auto_accept"):
+        from swarm.brain import gates
+        _allow, _reason = gates.can_auto_accept_delivery(state)
+        if not _allow:
+            logger.warning("[RUNNER] 任务 %s 终态非成功（gates 复核）: %s", task_id, _reason)
+            _rec = store.get_task(task_id) or {}
+            store.update_task(task_id, status="FAILED")
+            _emit_task_notification(task_id, _rec, "FAILED")
+            audit("task_failed", orchestrator="Brain", task_id=task_id,
+                  project_id=_rec.get("project_id"),
+                  error=f"delivery_not_accepted: {_reason}"[:300])
+            await _emit(queue, {
+                "step": "error", "status": "error",
+                "message": f"任务未达成功终态：{_reason}",
+                "mode": "brain", "progress": -1,
+            })
+            return
+
     # 正常结束
     task_rec = store.get_task(task_id) or {}
     token_usage = store.estimate_token_usage(

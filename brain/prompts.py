@@ -161,7 +161,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 - 子任务 depends_on 只引用【本批内】的其他子任务 id（跨模块依赖由系统按模块顺序处理）。
 - 子任务 id 本批内唯一即可（系统会全局重编号）。
 
-严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance":["mvn -pl <module> -am compile"],"contract":{}}]}"""
+严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance_criteria":["mvn -pl <module> -am compile"],"contract":{}}]}"""
 
 PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
 {task_description}

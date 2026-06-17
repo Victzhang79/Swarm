@@ -178,6 +178,13 @@ async def analyze(state: BrainState) -> dict:
     knowledge_context: KnowledgeContext = empty_knowledge_context()
     if project_id:
         knowledge_context, stats = await retrieve_knowledge(task_description, project_id)
+        # N-12 修复：检索整体崩溃时 service 返回空知识 + stats['error']，但下游只用 context
+        # → "检索崩溃"与"真无知识"不可区分，Brain 在零知识上规划还以为正常。显式告警区分。
+        if stats.get("error"):
+            logger.error(
+                "[ANALYZE] ⚠️ 知识检索崩溃(非'无知识')，Brain 将在零知识上下文上规划: %s",
+                stats.get("error"),
+            )
         logger.info(
             "[ANALYZE] 知识检索完成: struct=%s semantic=%s norms=%s "
             "summary=%s mistakes=%s successes=%s",
@@ -355,9 +362,16 @@ async def _plan_ultra_batched(
     )
     from swarm.brain.prompts import PLAN_BATCH_SYSTEM, PLAN_BATCH_USER
 
-    td = state.get("tech_design_result") or {}
+    td = state.get("tech_design") or {}
+    # P1-DEBT-02 修复：① 键名 tech_design_result→tech_design（原键全项目无人写，td 恒空
+    #   导致 module_deps 批间依赖排序失效 + data_model 注入空）；② shared_contract 不在
+    #   tech_design dict 里——它被 tech_design 节点单独 pop 为 shared_contract_draft，须从
+    #   state.shared_contract_draft 取（contract_design 节点产出也落此键）。
     tech_design_extra = json.dumps(
-        {"data_model": td.get("data_model", ""), "shared_contract": td.get("shared_contract", {})},
+        {
+            "data_model": td.get("data_model", ""),
+            "shared_contract": state.get("shared_contract_draft") or {},
+        },
         ensure_ascii=False,
     )[:3000]
     proj_struct = _format_project_structure(knowledge_context)
@@ -458,6 +472,11 @@ async def _plan_ultra_batched(
             difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
             scope=FileScope(writable=[], readable=[]), contract={},
         )])
+    # N-03 兼容：万一 LLM 仍吐旧键 acceptance（SubTask 字段是 acceptance_criteria，
+    # extra=ignore 会静默丢弃致验收恒空），重映射后再构造。
+    for st in merged:
+        if isinstance(st, dict) and "acceptance" in st and "acceptance_criteria" not in st:
+            st["acceptance_criteria"] = st.pop("acceptance")
     return TaskPlan(subtasks=[SubTask(**st) for st in merged])
 
 
@@ -1810,11 +1829,13 @@ async def _verify_l2_via_llm(
         return bool(result.get("l2_passed", result.get("passed", False)))
     except json.JSONDecodeError as e:
         logger.warning(f"[VERIFY_L2] LLM 输出 JSON 解析失败，回退到 L1 检查: {e}")
-        return all(
-            out.l1_passed
-            for out in subtask_results.values()
-            if isinstance(out, WorkerOutput)
-        )
+        # N-05 修复：all([]) 恒 True 会把"无可信 worker 产出"误判为通过 → 假 DONE。
+        # 必须有至少一个 WorkerOutput 佐证，且全部 l1_passed，才算回退通过；空集合判失败。
+        l1_outs = [out for out in subtask_results.values() if isinstance(out, WorkerOutput)]
+        if not l1_outs:
+            logger.warning("[VERIFY_L2] 回退检查无任何 WorkerOutput 佐证 → 判未通过（防 all([])→True 假 DONE）")
+            return False
+        return all(out.l1_passed for out in l1_outs)
     except Exception as e:
         logger.warning(f"[VERIFY_L2] LLM 验证异常，默认未通过: {e}")
         return False
@@ -1924,16 +1945,21 @@ async def revision(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         result = _parse_json_from_llm(response.content)
+        # N-02 修复：REVISION_SYSTEM 产出 {"revision_subtasks":[{id,description,scope,...}]}（嵌数组），
+        # 原从顶层 result.get("id") 读永远落空 → 人工修订退化成空 scope 桩任务空跑。
+        # 优先从 revision_subtasks[0] 取；兼容旧的顶层平铺格式。
+        _subs = result.get("revision_subtasks")
+        rsrc = _subs[0] if isinstance(_subs, list) and _subs and isinstance(_subs[0], dict) else result
         # 尝试从 LLM 结果中提取修订子任务
         revision_subtask = SubTask(
-            id=result.get("id", f"rev-{len(plan_obj.subtasks) + 1 if plan_obj else 1}"),
-            description=result.get("description", f"修订: {revision_feedback[:100]}"),
-            difficulty=SubTaskDifficulty(result.get("difficulty", "medium")),
-            modality=SubTaskModality(result.get("modality", "text")),
-            scope=FileScope(**result.get("scope", {"writable": [], "readable": []})),
-            contract=result.get("contract", {"input": "修订反馈", "output": "修订后代码"}),
-            acceptance_criteria=result.get("acceptance_criteria", ["修订内容正确", "回归测试通过"]),
-            depends_on=result.get("depends_on", []),
+            id=rsrc.get("id", f"rev-{len(plan_obj.subtasks) + 1 if plan_obj else 1}"),
+            description=rsrc.get("description", f"修订: {revision_feedback[:100]}"),
+            difficulty=SubTaskDifficulty(rsrc.get("difficulty", "medium")),
+            modality=SubTaskModality(rsrc.get("modality", "text")),
+            scope=FileScope(**rsrc.get("scope", {"writable": [], "readable": []})),
+            contract=rsrc.get("contract", {"input": "修订反馈", "output": "修订后代码"}),
+            acceptance_criteria=rsrc.get("acceptance_criteria", ["修订内容正确", "回归测试通过"]),
+            depends_on=rsrc.get("depends_on", []),
         )
     except json.JSONDecodeError as e:
         logger.warning(f"[REVISION] LLM 输出 JSON 解析失败，使用默认修订子任务: {e}")
