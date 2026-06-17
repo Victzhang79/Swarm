@@ -119,3 +119,44 @@ def test_merge_remaps_intra_batch_depends():
 def test_progress_line_format():
     line = batch_progress_line(3, 11, 12, llm_seconds=43.2)
     assert "批 3/11" in line and "27%" in line and "文件数=12" in line and "43.2s" in line
+
+
+def test_dedupe_same_basename():
+    """P5：不同模块各建同名文件(INotifyService)→去重保留首个。"""
+    from swarm.brain.plan_batch import dedupe_file_plan
+    fp = [_fp("channel/INotifyService.java", module="channel"),
+          _fp("engine/INotifyService.java", module="engine"),
+          _fp("channel/Foo.java", module="channel")]
+    d = dedupe_file_plan(fp)
+    paths = [x["path"] for x in d]
+    assert len(d) == 2, f"同名应去重: {paths}"
+    assert "channel/INotifyService.java" in paths  # 保留首个
+    assert "engine/INotifyService.java" not in paths
+
+
+def test_dedupe_exact_path():
+    """完全同路径也去重。"""
+    from swarm.brain.plan_batch import dedupe_file_plan
+    fp = [_fp("a/X.java"), _fp("a/X.java"), _fp("b/Y.java")]
+    assert len(dedupe_file_plan(fp)) == 2
+
+
+def test_module_batches_one_per_module():
+    """P1：按模块分批——每模块一批（不再 10% 机械切）。"""
+    from swarm.brain.plan_batch import group_into_module_batches
+    fp = [_fp(f"m1/F{i}.java", module="m1") for i in range(15)] + \
+         [_fp(f"m2/G{i}.java", module="m2") for i in range(5)]
+    batches = group_into_module_batches(fp)
+    assert len(batches) == 2, "2 模块应 2 批"
+    by_mod = dict(batches)
+    assert len(by_mod["m1"]) == 15 and len(by_mod["m2"]) == 5
+
+
+def test_module_batches_dep_order():
+    """P2：批间按 tech_design 模块 depends_on 排序。"""
+    from swarm.brain.plan_batch import group_into_module_batches
+    fp = [_fp("svc/S.java", module="service"), _fp("ent/E.java", module="entity")]
+    deps = {"service": ["entity"], "entity": []}
+    batches = group_into_module_batches(fp, deps)
+    names = [n for n, _ in batches]
+    assert names.index("entity") < names.index("service"), f"entity 应先于 service: {names}"

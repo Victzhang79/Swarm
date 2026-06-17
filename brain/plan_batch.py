@@ -102,6 +102,32 @@ def order_groups_flatten(file_plan: list[dict]) -> list[dict]:
     return out
 
 
+def group_into_module_batches(file_plan: list[dict],
+                              module_deps: dict[str, list[str]] | None = None,
+                              ) -> list[tuple[str, list[dict]]]:
+    """按【功能模块】分批（治本 P1/P2/P5）：每个模块 = 一批，批间按模块依赖排序。
+
+    替代旧的 10% 机械文件切片——模块即垂直切片边界，保证一个功能模块的
+    Entity+Mapper+Service+Controller 在同一批拆解，避免水平切片 + 跨批依赖丢失。
+
+    module_deps: {模块名: [前置模块名]}（来自 tech_design 阶段1 modules.depends_on）。
+                 用于批间排序；缺失则回退文件级 depends_on/分层序。
+    返回 [(module_name, [file_plan_item, ...]), ...]，已按依赖序排列。
+    """
+    groups = group_file_plan(file_plan)
+    if not groups:
+        return []
+    names = list(groups.keys())
+    # 优先用 tech_design 的模块依赖排序
+    ordered: list[str] | None = None
+    if module_deps:
+        edges = {n: set(d for d in (module_deps.get(n) or []) if d in groups) for n in names}
+        ordered = _toposort(names, edges)
+    if ordered is None:
+        ordered = _order_groups(groups)  # 回退：文件级 depends_on/分层序
+    return [(g, groups[g]) for g in ordered]
+
+
 def _order_groups(groups: dict[str, list[dict]]) -> list[str]:
     """对组排序：先尝试 depends_on 跨组拓扑序，无有效依赖则用分层序兜底。"""
     names = list(groups.keys())
@@ -166,6 +192,34 @@ def _toposort(names: list[str], edges: dict[str, set[str]]) -> list[str] | None:
         queue.extend(sorted(nxt, key=_layer_rank))
     if len(out) != len(names):
         return None  # 有环
+    return out
+
+
+def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
+    """P5：同名文件去重（全局符号表）。
+
+    分批/分模块拆解时，不同模块可能各建一个同名文件（如 INotifyService.java
+    被 channel 和 engine 各建一次，路径不同）→ 语义冲突 + 编译重复定义。
+    按 basename 去重：保留首个，丢弃后续同名（保留先出现的，通常是更基础的模块）。
+    路径完全相同的也去重。返回去重后的 file_plan + 记录被去重项数。
+    """
+    seen_base: dict[str, str] = {}  # basename(lower) -> 已保留的 path
+    seen_path: set[str] = set()
+    out: list[dict] = []
+    for fp in file_plan:
+        if not isinstance(fp, dict) or not fp.get("path"):
+            out.append(fp)
+            continue
+        path = fp["path"].replace("\\", "/").strip("/")
+        base = os.path.basename(path).lower()
+        if path in seen_path:
+            continue  # 完全同路径，跳过
+        if base in seen_base and seen_base[base] != path:
+            # 同名不同路径 → 疑似重复创建，跳过后者（保留先出现的）
+            continue
+        seen_path.add(path)
+        seen_base[base] = path
+        out.append(fp)
     return out
 
 

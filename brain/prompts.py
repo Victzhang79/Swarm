@@ -142,18 +142,26 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
 
 请以 JSON 格式输出执行计划。"""
 
-PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【分批】拆解一个超大需求。
-整个需求的完整技术方案已由 tech_design 产出（上百文件），现在按模块分批处理——
-【你这一批只负责拆解给定的这组文件】，不要管其他批次的文件。
+PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批】拆解一个超大需求。
+整个需求的完整技术方案已由 tech_design 产出，现在按模块逐个处理——
+【你这一批只负责一个功能模块的文件】，不要管其他模块。
+
+【核心原则-P1 垂直切片】（最重要，违反会导致接口对不上）：
+- 一个【完整功能】= 一个子任务，包含它的 Entity + Mapper + Service + ServiceImpl + Controller + XML。
+- 【绝对禁止】按技术层水平拆（禁止"st-1仅Entity / st-2仅Mapper / st-3仅Service"这种）——
+  那会制造大量人为跨子任务依赖和接口对齐风险。
+- 同一个功能的纵向所有层放进【同一个子任务】的 scope，让一个 worker 一次写完整个功能。
+- 一个模块通常拆成 1-4 个垂直功能子任务（按功能点，不按层）。
+
+【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
+【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选可确定性验证的 `mvn compile` 或具体编译/测试命令。
 
 规则：
-- 只为【本批文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
-- 同一批内可拆成多个子任务（按文件依赖/分层），也可合并相关文件到一个子任务。
-- 子任务的 depends_on 只引用【本批内】的其他子任务 id（跨批依赖由系统在合并时处理）。
-- 子任务 id 在本批内唯一即可（如 st-1/st-2，系统会全局重编号）。
-- 保持每个子任务 scope 聚焦、可独立执行，不要把整个模块塞进一个子任务的 writable。
+- 只为【本批模块文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
+- 子任务 depends_on 只引用【本批内】的其他子任务 id（跨模块依赖由系统按模块顺序处理）。
+- 子任务 id 本批内唯一即可（系统会全局重编号）。
 
-严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"contract":{}}]}"""
+严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance":["mvn -pl <module> -am compile"],"contract":{}}]}"""
 
 PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
 {task_description}

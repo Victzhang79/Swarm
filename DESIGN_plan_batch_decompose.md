@@ -144,7 +144,33 @@ file_plan 的超长 JSON 时不稳定，0.1% cpu = 纯等 LLM IO）。
 - **方向 B**：tech_design 产出 file_plan 时限制粒度——只产出【模块级方案 + 每模块文件数估计】，
   不展开到 125 个具体文件路径；具体文件路径下放到 PLAN 分批时按模块现推。
 - **方向 C**：换更快/更稳的 brain 模型跑 ultra 的 tech_design（运维侧，非架构）。
-- **方向 D**：给 brain LLM 超长输出加硬上限 + 分段续写（max_tokens 分段 continuation）。
+- **方向D**：给 brain LLM 超长输出加硬上限 + 分段续写（max_tokens 分段 continuation）。
+
+---
+
+## 九、e2e 实证(task fd5470e0)：分批跑通了但暴露拆解质量回退（待治本）
+
+两阶段 tech_design(6模块86文件) + PLAN 10%分批(42子任务,0卡死) 全程跑通进 dispatch，
+worker 开始并发执行——**"不卡死"目标达成**。但 VALIDATE_PLAN 软建议 + st-26 失败(600s超时空产出)
+暴露分批引入的**拆解质量回退**（分批为了规模可控，丢了 PLAN 原有的垂直切片+全局协调）：
+
+| # | 问题 | 根因 |
+|---|------|------|
+| P1 | 违反垂直切片：一个功能拆成 Entity→Mapper→Service→Impl→XML→Controller 6 子任务 | 每批 9 文件被 LLM 按技术层水平切，丢"一功能=一子任务" |
+| P2 | 跨批依赖丢失：st-26(ServiceImpl)依赖的 Mapper/实体在别批，depends_on 没建→worker 找不到→600s超时空产出 | merge 只加机械批间串行，没按真实语义依赖排 |
+| P3 | 新模块基础设施缺失：ruoyi-alarm 全新 maven 模块无 pom.xml/目录→该模块全部编译失败 | 无"模块脚手架"前置子任务 |
+| P4 | 文件路径前缀不一致(src/ vs ruoyi-alarm/src/)→编译失败 | 各批独立拆，路径未统一 |
+| P5 | 重复创建：INotifyService/工厂类被两个批各建一次 | 跨批无全局符号表 |
+| P6 | acceptance_criteria 全空 | 分批 prompt 没要求验收标准 |
+
+### 治本方向（待拍板）
+核心：**分批要按"垂直功能切片"分组，而非"技术层水平切片"**。即：
+- **分组键改为"功能模块"而非"文件批次"**：alarm-task 这个功能的 Entity+Mapper+Service+Controller
+  应在【同一个子任务/同一批】，而非散落多批。tech_design 的 module 字段正是天然的垂直切片边界。
+- **A. 按 module 分批(而非 10% 机械切)**：每个 tech_design 模块 = 一批，批内 LLM 拆该模块为垂直切片子任务。
+  模块即垂直边界，天然避免 P1/P2/P5。配合模块脚手架前置(P3)、路径规范化(P4)、要求验收标准(P6)。
+- **B. 模块依赖排序**：tech_design 阶段1 已产出模块 depends_on，按它排批间序(P2)。
+- **C. 全局符号表**：合并时检测重复创建的同名文件，去重(P5)。
 
 ---
 

@@ -335,16 +335,22 @@ async def _plan_ultra_batched(
     llm, state, task_description, complexity, routing_table,
     knowledge_context, knowledge_prompt, recent_tasks_prompt, sliding_ctx, file_plan,
 ):
-    """ultra 超大需求分批拆解（DESIGN_plan_batch_decompose M-3/M-4/M-5）。
+    """ultra 超大需求【按模块分批】拆解（DESIGN 第九节治本 P1-P6）。
 
-    按 10% 比例分批，逐批调 brain LLM 只拆该批文件，每批进度日志（批次/百分比/LLM 耗时），
-    某批失败降级跳过不阻断，最后合并成全局 DAG（id 全局唯一 + 批间串行依赖）。
+    治本核心：按【功能模块】分批（每模块一批，批内垂直切片），替代旧的 10% 机械文件切片。
+    - P1 垂直切片：批内 prompt 要求"一个完整功能=一个子任务"（含 Entity+Mapper+Service+Controller）
+    - P2 跨批依赖：批间按 tech_design 模块 depends_on 排序 + merge 批间串行
+    - P3 模块脚手架：新模块(无现有目录)加前置脚手架子任务
+    - P4 路径规范：prompt 强制模块路径前缀统一
+    - P5 去重：分批前 dedupe_file_plan 去同名文件
+    - P6 验收：prompt 强制每子任务给 acceptance(首选 mvn compile)
     """
     import time as _time
 
     from swarm.brain.plan_batch import (
         batch_progress_line,
-        compute_batches,
+        dedupe_file_plan,
+        group_into_module_batches,
         merge_subtask_batches,
     )
     from swarm.brain.prompts import PLAN_BATCH_SYSTEM, PLAN_BATCH_USER
@@ -356,23 +362,61 @@ async def _plan_ultra_batched(
     )[:3000]
     proj_struct = _format_project_structure(knowledge_context)
 
-    batches = compute_batches(file_plan, ratio=0.1)
-    total = len(batches)
+    # P5：分批前全局去重同名文件
+    _before = len(file_plan)
+    file_plan = dedupe_file_plan(file_plan)
+    if len(file_plan) < _before:
+        logger.info("[PLAN-BATCH] P5 去重：%d → %d 文件（移除 %d 个同名重复）",
+                    _before, len(file_plan), _before - len(file_plan))
+
+    # 模块依赖（tech_design 阶段1 modules.depends_on）供批间排序
+    module_deps = {}
+    for m in (td.get("modules") or []):
+        if isinstance(m, dict) and m.get("name"):
+            module_deps[m["name"]] = m.get("depends_on") or []
+
+    # P1/P2：按模块分批（每模块一批，批间依赖序）
+    module_batches = group_into_module_batches(file_plan, module_deps or None)
+    total = len(module_batches)
     logger.info(
-        "[PLAN-BATCH] ultra 超大需求分批拆解启动：file_plan=%d 文件 → %d 批（每批约 %d 文件）",
-        len(file_plan), total, (len(batches[0]) if batches else 0),
+        "[PLAN-BATCH] 按模块分批拆解启动：%d 文件 → %d 个模块批（垂直切片，非机械10%%切）",
+        len(file_plan), total,
     )
+
+    # P3：识别新模块（项目里无该模块目录前缀的）→ 需脚手架前置
+    existing_dirs = set()
+    proj_path = _get_project_path(state.get("project_id") or "")
+    if proj_path:
+        import os as _os
+        try:
+            for d in _os.listdir(proj_path):
+                if _os.path.isdir(_os.path.join(proj_path, d)):
+                    existing_dirs.add(d)
+        except Exception:  # noqa: BLE001
+            pass
+
     batch_results: list[list[dict]] = []
     failed_batches = 0
-    for i, batch in enumerate(batches, start=1):
+    for i, (mod_name, batch) in enumerate(module_batches, start=1):
         batch_fp_text = "\n".join(
             f"  - {fp.get('path')} [{fp.get('action', 'create')}] {fp.get('responsibility', '')}"
             for fp in batch
         )
+        # P3：判断该模块是否为新模块（文件路径顶层目录不在现有目录里）
+        top_dirs = {(fp.get("path") or "").replace("\\", "/").split("/")[0]
+                    for fp in batch if fp.get("path")}
+        new_module_dirs = [d for d in top_dirs if d and d not in existing_dirs]
+        scaffold_hint = ""
+        if new_module_dirs:
+            scaffold_hint = (
+                f"\n\n【重要-P3 新模块脚手架】本模块涉及新建模块目录 {new_module_dirs}，"
+                f"项目中尚不存在。请在本批【第一个子任务】先创建该模块的基础设施"
+                f"（如 Maven 模块的 pom.xml 并注册到父 pom 的 <modules>、基础目录结构），"
+                f"该模块其他子任务 depends_on 这个脚手架子任务。")
         prompt_user = PLAN_BATCH_USER.format(
             task_description=task_description[:2000],
             batch_idx=i, total_batches=total,
-            batch_file_plan=batch_fp_text,
+            batch_file_plan=f"模块 '{mod_name}'：\n{batch_fp_text}{scaffold_hint}",
             project_structure=proj_struct,
             tech_design_extra=tech_design_extra,
         )
@@ -385,7 +429,6 @@ async def _plan_ultra_batched(
             _dt = _time.monotonic() - _t0
             result = _parse_json_from_llm(response.content)
             subs = result.get("subtasks", []) if isinstance(result, dict) else []
-            # 清理 None 可选字段（同主路径健壮性）
             for _st in subs:
                 if isinstance(_st, dict):
                     for _opt in ("harness", "contract"):
@@ -393,25 +436,23 @@ async def _plan_ultra_batched(
                             _st.pop(_opt)
             if subs:
                 batch_results.append(subs)
-                logger.info("%s 拆出 %d 个子任务",
-                            batch_progress_line(i, total, len(batch), _dt), len(subs))
+                logger.info("%s 模块'%s' 拆出 %d 个子任务",
+                            batch_progress_line(i, total, len(batch), _dt), mod_name, len(subs))
             else:
                 failed_batches += 1
-                logger.warning("%s 本批未拆出子任务（降级跳过，不阻断）",
-                               batch_progress_line(i, total, len(batch), _dt))
+                logger.warning("%s 模块'%s' 未拆出子任务（降级跳过）",
+                               batch_progress_line(i, total, len(batch), _dt), mod_name)
         except Exception as exc:  # noqa: BLE001
-            # M-5 失败隔离：单批失败降级跳过，不阻断其他批
             failed_batches += 1
-            logger.warning("%s 本批拆解异常（降级跳过）: %s",
-                           batch_progress_line(i, total, len(batch)), exc)
+            logger.warning("%s 模块'%s' 拆解异常（降级跳过）: %s",
+                           batch_progress_line(i, total, len(batch)), mod_name, exc)
 
     merged = merge_subtask_batches(batch_results)
     logger.info(
-        "[PLAN-BATCH] 分批拆解完成：%d/%d 批成功，合并出 %d 个子任务（失败批 %d）",
+        "[PLAN-BATCH] 按模块分批完成：%d/%d 模块成功，合并出 %d 个子任务（失败 %d）",
         total - failed_batches, total, len(merged), failed_batches,
     )
     if not merged:
-        # 全批失败兜底：空 scope plan（与单次路径解析失败兜底一致，交人工）
         return TaskPlan(subtasks=[SubTask(
             id="st-1", description=task_description,
             difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
