@@ -10,12 +10,12 @@ import asyncio
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
-from swarm.api._shared import ApplyDiffRequest
+from swarm.api._shared import ApplyDiffRequest, _require_perm
 
 router = APIRouter()
 
@@ -32,8 +32,9 @@ class WorkerRunRequest(BaseModel):
 
 # ─── Phase 0: POST /api/projects/{project_id}/worker/run ───
 @router.post("/api/projects/{project_id}/worker/run", tags=["Worker"])
-async def start_worker_run(project_id: str, req: WorkerRunRequest):
+async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Request):
     """单 Worker 直跑（不经 Brain），用于 Phase 0 验证 scope + L1 + diff"""
+    _require_perm(request, "project:write", project_id)  # P0-SEC-02：起 worker 会写盘，须授权
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
@@ -90,8 +91,9 @@ async def stream_worker_run(run_id: str):
 
 
 @router.post("/api/projects/{project_id}/apply-diff", tags=["Worker"])
-async def apply_project_diff(project_id: str, req: ApplyDiffRequest):
+async def apply_project_diff(project_id: str, req: ApplyDiffRequest, request: Request):
     """Phase 0/1 — 将 diff 应用到项目 git 工作区（Worker 直跑或手动 patch）"""
+    _require_perm(request, "project:write", project_id)  # P0-SEC-02：写盘端点须授权
     if not req or not (req.diff or "").strip():
         raise HTTPException(status_code=400, detail="请求体须包含 diff 字段")
     loop = asyncio.get_running_loop()

@@ -46,9 +46,52 @@ def _build_payload(
         return {"event_type": event_type, "task_id": task_id, "text": message or text, **kw}
 
 
+def _ssrf_unsafe_reason(url: str) -> str | None:
+    """P0-SEC-04：出站 webhook URL SSRF 防护。返回拒绝原因（None=放行）。
+
+    策略：拒绝非 http(s)、回环(127/8、::1、localhost)、链路本地/云元数据(169.254/16，
+    含 169.254.169.254 IMDS)。私有网段(10/172.16/192.168)【放行】——本部署内网服务
+    (ai.bit 等)合法走内网；只拦最危险的元数据窃取/本机端口扫描面。
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return "URL 无法解析"
+    if parsed.scheme not in ("http", "https"):
+        return f"不允许的协议: {parsed.scheme or '(空)'}"
+    host = parsed.hostname or ""
+    if not host:
+        return "缺少主机名"
+    if host.lower() == "localhost":
+        return "禁止回环地址 localhost"
+    # 解析所有 A/AAAA，任一命中危险段即拒（防 DNS rebinding 首层）
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except Exception:  # noqa: BLE001 — 解析不了交给后续请求自然失败
+        addrs = {host}
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_loopback:
+            return f"禁止回环地址: {addr}"
+        if ip.is_link_local:  # 169.254.0.0/16 (含 IMDS 169.254.169.254) / fe80::/10
+            return f"禁止链路本地/元数据地址: {addr}"
+    return None
+
+
 async def _post_webhook(url: str, payload: dict[str, Any], *, tag: str = "") -> bool:
     """POST 一个 webhook，成功返回 True。异常/非 2xx 返回 False（不抛出）。"""
     if not url:
+        return False
+    _reason = _ssrf_unsafe_reason(url)
+    if _reason:
+        logger.warning("Webhook 被 SSRF 防护拦截 %s: %s (url=%s)", tag, _reason, url[:80])
         return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:

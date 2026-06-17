@@ -794,6 +794,7 @@ async def test_notify_channel(request: Request):
 
     Body: {"channel_id": "ch1"}  或  {"type":"feishu","webhook_url":"..."}
     """
+    _require_perm(request, "config:write")  # P0-SEC-04：补鉴权（原无授权即可触发出站请求=SSRF）
     from swarm.api.notify import _build_payload, _post_webhook
     body = await request.json()
 

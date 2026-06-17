@@ -582,12 +582,14 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
 
 
 @router.post("/api/tasks/{task_id}/apply-diff", tags=["任务管理"])
-async def apply_task_diff(task_id: str, req: ApplyDiffRequest | None = None):
+async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest | None = None):
     """Phase 1 — 将 merged_diff 应用到项目 git 工作区（git apply）"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    # P0-SEC-02：写盘端点须 task:write 授权 + 成员资格（原零鉴权，任意认证者可写任意项目工作区）。
+    _require_perm(request, "task:write", task.get("project_id"))
 
     project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
     if not project or not project.get("path"):

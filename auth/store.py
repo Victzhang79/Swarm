@@ -47,6 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_swarm_members_user ON swarm_project_members(user_
 _PROFILE_MIGRATION = """
 ALTER TABLE mem_user_profile ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
+-- P0-SEC-01：token 吊销 + 可选过期（非破坏式：revoked 默认 false、expires_at 默认 NULL=永不过期，
+-- 既有长期 token 不受影响；提供吊销/限期能力，泄露后可即时失效而不必改库）。
+ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS token_revoked BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 """
 
 _BOOTSTRAP_USERNAME = "admin"
@@ -250,15 +254,32 @@ def get_user_by_token(token: str, conn_str: str | None = None) -> SwarmUser | No
         return None
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:
+            # P0-SEC-01：吊销/过期的 token 不予认证（expires_at IS NULL = 永不过期，兼容既有 token）。
             cur.execute(
                 """
                 SELECT id, username, display_name, global_role, api_token, must_change_password
-                FROM swarm_users WHERE api_token = %s
+                FROM swarm_users
+                WHERE api_token = %s
+                  AND token_revoked = false
+                  AND (token_expires_at IS NULL OR token_expires_at > now())
                 """,
                 (token,),
             )
             row = cur.fetchone()
     return _row_to_user(row) if row else None
+
+
+def revoke_user_token(user_id: str, conn_str: str | None = None) -> bool:
+    """P0-SEC-01：吊销某用户当前 API token（泄露应急）。返回是否更新到行。"""
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE swarm_users SET token_revoked = true, updated_at = now() WHERE id = %s",
+                (user_id,),
+            )
+            updated = cur.rowcount
+        conn.commit()
+    return updated > 0
 
 
 def get_user_by_username(username: str, conn_str: str | None = None) -> dict[str, Any] | None:
