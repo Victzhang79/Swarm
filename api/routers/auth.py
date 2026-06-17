@@ -17,6 +17,51 @@ from swarm.api._shared import _require_perm, _require_user
 router = APIRouter()
 
 
+class _LoginThrottle:
+    """M8：登录失败限流/锁定（进程内内存，多副本部署可后续换 Redis）。
+
+    每个 key（用户名|IP）维护失败时间戳列表；窗口内失败 >= 阈值则锁定。
+    成功登录清空该 key。线程安全（authenticate 在 executor 线程跑，但本类操作很轻，用锁守护）。
+    """
+
+    def __init__(self, max_failures: int = 5, window_sec: int = 300, lockout_sec: int = 300):
+        self.max_failures = max_failures
+        self.window_sec = window_sec
+        self.lockout_sec = lockout_sec
+        self._failures: dict[str, list[float]] = {}
+        self._locked_until: dict[str, float] = {}
+        import threading
+        self._lock = threading.Lock()
+
+    def is_locked(self, key: str) -> tuple[bool, int]:
+        import time
+        now = time.time()
+        with self._lock:
+            until = self._locked_until.get(key, 0)
+            if until > now:
+                return True, int(until - now) + 1
+            return False, 0
+
+    def record_failure(self, key: str) -> None:
+        import time
+        now = time.time()
+        with self._lock:
+            stamps = [t for t in self._failures.get(key, []) if now - t < self.window_sec]
+            stamps.append(now)
+            self._failures[key] = stamps
+            if len(stamps) >= self.max_failures:
+                self._locked_until[key] = now + self.lockout_sec
+                self._failures[key] = []
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+            self._locked_until.pop(key, None)
+
+
+_login_throttle = _LoginThrottle()
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -35,14 +80,28 @@ class MemberRequest(BaseModel):
 
 
 @router.post("/api/auth/login", tags=["认证"])
-async def auth_login(req: LoginRequest):
+async def auth_login(req: LoginRequest, request: Request):
     """用户名密码登录，返回 api_token（Bearer / X-Swarm-Token）。"""
     from swarm.auth.store import authenticate, get_must_change_password
+
+    # M8 修复：登录限流/锁定，防默认账户暴力破解。按 用户名+客户端IP 计失败次数，
+    # 超阈值在锁定窗口内直接 429，避免无限尝试。
+    client_ip = request.client.host if request.client else "unknown"
+    throttle_key = f"{req.username}|{client_ip}"
+    locked, retry_after = _login_throttle.is_locked(throttle_key)
+    if locked:
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录尝试过于频繁，请 {retry_after} 秒后重试",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     loop = asyncio.get_running_loop()
     user = await loop.run_in_executor(None, lambda: authenticate(req.username, req.password))
     if user is None:
+        _login_throttle.record_failure(throttle_key)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    _login_throttle.record_success(throttle_key)
     # 12.19：默认弱密码的 admin 需强制改密。RBAC 关闭(开发/CI)时仍返回标志，
     # 但前端不阻断——保证开箱即用与 CI 的 admin/swarm 登录不受影响。
     must_change = await loop.run_in_executor(

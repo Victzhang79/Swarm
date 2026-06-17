@@ -127,8 +127,8 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
             lambda: _app.store.update_task(task_id, status=initial_status, thread_id=task_id),
         )
     except Exception as e:
-        _app.logger.error(f"Failed to create task: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
+        _app.logger.error("Failed to create task: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="创建任务失败") from e
 
     # 需求池模式：不立即执行，等用户手动「执行」触发（POST .../execute）。
     if req.pooled:

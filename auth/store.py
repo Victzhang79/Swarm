@@ -14,6 +14,10 @@ from swarm.auth.passwords import generate_api_token, hash_password, verify_passw
 from swarm.auth.rbac import Role, can, effective_project_role
 from swarm.config.settings import DatabaseConfig
 
+# M8：固定 dummy 密码 hash，供 authenticate 在用户不存在时跑等价 PBKDF2（常量时间防计时侧信道）。
+# 模块加载时生成一次（一次 PBKDF2 开销可忽略），格式合法、verify_password 会走完整计算。
+_DUMMY_PASSWORD_HASH = hash_password("swarm-dummy-timing-equalizer")
+
 logger = logging.getLogger(__name__)
 
 AUTH_DDL = """
@@ -296,7 +300,11 @@ def get_user_by_id(user_id: str, conn_str: str | None = None) -> SwarmUser | Non
 
 def authenticate(username: str, password: str, conn_str: str | None = None) -> SwarmUser | None:
     record = get_user_by_username(username, conn_str)
+    # M8 修复：用户不存在/无密码哈希时，跑一次等价耗时的 PBKDF2 校验（丢弃结果），
+    # 使"用户存在"与"用户不存在"两条路径耗时一致，消除计时侧信道枚举用户名。
     if not record or not record.get("password_hash"):
+        # 一个固定的合法格式 dummy hash，让 verify_password 走完整 PBKDF2 计算
+        verify_password(password, _DUMMY_PASSWORD_HASH)
         return None
     if not verify_password(password, record["password_hash"]):
         return None

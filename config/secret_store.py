@@ -165,9 +165,21 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
                 )
                 row = cur.fetchone()
         if not row:
+            # 真正的 miss（无此 secret）→ 静默返回 None，回退 .env 是预期行为
             return None
-        plaintext = decrypt(row[0])
+        try:
+            plaintext = decrypt(row[0])
+        except Exception as dec_exc:  # noqa: BLE001
+            # M5 修复：decrypt 失败（key 轮换/密文损坏）与 miss 是两回事——
+            # 此时 DB 里【有】密文却解不开，静默回退 .env 旧值会让 key 轮换问题极难排查。
+            # 升级为 warning 显式告警，便于运维定位。
+            logger.warning(
+                "secret %s 解密失败（可能 SWARM_SECRET_KEY 轮换或密文损坏），回退 .env: %s",
+                key_name, dec_exc,
+            )
+            return None
     except Exception as exc:  # noqa: BLE001
+        # DB 连接/查询失败（非解密问题）→ debug 即可
         logger.debug("读取 secret %s 失败（回退 .env）: %s", key_name, exc)
         return None
 

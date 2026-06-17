@@ -40,7 +40,9 @@ async def _emit(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> 
 def _set_workspace(project_id: str) -> str | None:
     project = store.get_project(project_id)
     if project and project.get("path"):
-        os.environ["SWARM_WORKSPACE_ROOT"] = project["path"]
+        # M2 修复：ContextVar 隔离工作根（同步写 os.environ 兼容子进程）
+        from swarm.tools.paths import set_workspace_root
+        set_workspace_root(project["path"])
         return project["path"]
     return None
 

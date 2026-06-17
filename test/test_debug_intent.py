@@ -178,7 +178,7 @@ def test_failing_test_gate_fails_when_cmd_fails():
 
 
 def test_failing_test_gate_graceful_on_exception():
-    """执行环境异常 → 优雅降级返回 True（不误判）。"""
+    """执行环境异常 → 保守判失败返回 False（M1 修复：不把"验证不了"误判为"已修复 PASS"）。"""
     from swarm.worker.executor import WorkerExecutor
 
     subtask = _make_subtask(
@@ -193,9 +193,9 @@ def test_failing_test_gate_graceful_on_exception():
     ):
         ok, detail = executor._run_failing_test_gate("python -m pytest test_bug.py -q")
 
-    assert ok is True, f"异常时应优雅降级返回 True，实际: {ok}"
-    assert "execution skipped" in detail
-    print("  ✅ _run_failing_test_gate: 执行异常 → 优雅降级 True")
+    assert ok is False, f"异常时应保守判失败返回 False（M1），实际: {ok}"
+    assert "execution error" in detail
+    print("  ✅ _run_failing_test_gate: 执行异常 → 保守失败 False (M1)")
 
 
 def test_failing_test_gate_timeout_returns_false():

@@ -114,12 +114,12 @@
 > 下列为中危需较大改动/观测性优化 + 低危清理，排期处理：
 
 ### 中危（M）
-- **M1** worker/executor.py:1873-1909 失败测试闸门在沙箱 kill 后本地 shell=True 跑，异常 `return True` 当 PASS → 未修 bug 被误报已修。修法：本地降级路径异常应 return False(保守失败)，非 Python 栈不在本地跑。
-- **M2** runner.py:40-45 把 SWARM_WORKSPACE_ROOT 写进进程级 os.environ，并发跑不同项目互相覆盖工作根。修法：改 ContextVar 或随任务传参（同 S1 思路）。
-- **M3** worker 大量同步 subprocess.run(git baseline/diff/reset、l1_pipeline npx tsc)跑在事件循环线程，并发互相阻塞；_reset_scope_to_head 持 flock 卡整进程。修法：to_thread 包裹 + 细化锁粒度。
-- **M5** config/secret_store.py:151-164 decrypt 失败(如 key 轮换)与"不存在"同等当 None 静默回退 .env 旧值，难排查。修法：区分 decrypt 异常与 miss，前者告警。
-- **M6** 多处 detail=f"...{str(e)}" 把内部异常/路径/DB 错误透给客户端(sandbox.py:245 等)。修法：对外返回泛化消息，详情仅记日志。
-- **M8** /api/auth/login 无限流/锁定，配合默认账户可暴破；auth/store.py:294 用户不存在跳过 PBKDF2 → 计时侧信道枚举用户名。修法：登录失败计数+锁定；用户不存在也跑等价耗时 PBKDF2(常量时间)。
+- **M1** ✅已修(commit 见 git log) worker/executor.py `_run_failing_test_gate` 异常 `return True` → 改 `return False`(保守失败，不把"验证不了"误判"已修复")。
+- **M2** ✅已修 SWARM_WORKSPACE_ROOT 进程级 os.environ 并发覆盖 → tools/paths.py 改 ContextVar 隔离(set_workspace_root，保留 os.environ 兼容子进程)，runner/worker.runner 同步改。
+- **M3** ⏳已评估暂留 worker 大量同步 subprocess(git baseline/diff/reset、l1_pipeline npx tsc)跑在事件循环线程并发阻塞；_reset_scope_to_head 持 flock 卡整进程。判定：这是【性能/并发优化，非正确性 bug】(不产出错误结果，只是高并发慢)，包 to_thread 涉及大量调用点、回归风险高 → 留待真有并发性能瓶颈时专门处理(优于现在大面积低收益改动)。
+- **M5** ✅已修 secret_store.get_secret decrypt 失败与 miss 同等静默回退 → 拆开：miss 静默(预期)，decrypt 失败(key 轮换/密文损坏)升级 logger.warning 显式告警。
+- **M6** ✅已修 多处 detail=f"...{e}" 透传 → 内部基础设施错误(project/sandbox/task 创建销毁 6 处)泛化对外消息 + logger.error(exc_info) 记详情；用户输入纠错类(无效正则/目录路径/not found 4 处)保留。
+- **M8** ✅已修 /api/auth/login 无限流 + 用户不存在跳过 PBKDF2(计时侧信道) → ① _LoginThrottle(用户名+IP 失败计数，5 次/5 分窗口锁 5 分，429+Retry-After)；② authenticate 用户不存在也跑 _DUMMY_PASSWORD_HASH 的等价 PBKDF2(常量时间)。
 
 ### 低危 / 清理
 - brain/merge_engine.py:26 auto_resolved 死字段；:413-441 并发插入顺序不确定(当干净合并)。

@@ -1877,8 +1877,8 @@ class WorkerExecutor:
         与现有 L1 确定性验证共享同样的执行模型（local / sandbox 均可）。
         返回 (bool, detail_str)：True=命令通过(bug 已修复)，False=命令仍失败。
 
-        优雅降级：异常时返回 True（不因执行环境失败误判为 bug 未修复），
-        因为沙箱环境可能已销毁。
+        优雅降级：异常时返回 False（保守失败，M1 修复）——执行环境失败
+        不能误判为 bug 已修复，宁可判未通过让其重试/人工复核。
         """
         import subprocess
 
@@ -1904,9 +1904,10 @@ class WorkerExecutor:
         except subprocess.TimeoutExpired:
             return False, "failing_test_command timeout (120s)"
         except Exception as exc:  # noqa: BLE001
-            # 优雅降级：执行环境异常不误判
-            self._log(f"DEBUG L1: failing_test_command 执行异常，跳过: {exc}")
-            return True, f"execution skipped: {exc}"
+            # M1 修复：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"）。
+            # 原返回 True 会把执行环境失败误判为 bug 已修复 PASS，放过未修的坏代码。
+            self._log(f"DEBUG L1: failing_test_command 执行异常，保守判未通过: {exc}")
+            return False, f"execution error (conservative fail): {exc}"
 
     def _parse_produce_result(
         self,

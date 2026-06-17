@@ -139,7 +139,9 @@ def _set_workspace(project_id: str) -> None:
     try:
         project = store.get_project(project_id)
         if project and project.get("path"):
-            os.environ["SWARM_WORKSPACE_ROOT"] = project["path"]
+            # M2 修复：用 ContextVar 设工作根（并发隔离），不再裸写进程级 os.environ
+            from swarm.tools.paths import set_workspace_root
+            set_workspace_root(project["path"])
             logger.info("[RUNNER] workspace → %s", project["path"])
     except Exception as exc:
         logger.warning("[RUNNER] 设置 workspace 失败: %s", exc)

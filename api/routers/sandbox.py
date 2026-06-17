@@ -241,8 +241,8 @@ async def create_sandbox(req: SandboxCreateRequest, request: Request):
             "sandbox_id": sandbox.sandbox_id,
         }
     except Exception as e:
-        _app.logger.error(f"Failed to create sandbox: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create sandbox: {str(e)}")
+        _app.logger.error("Failed to create sandbox: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="创建沙箱失败") from e
 
 
 # ─── 9b. POST /api/sandbox/cleanup — 批量清理（释放泄漏资源）─
@@ -526,7 +526,7 @@ async def destroy_sandbox(sandbox_id: str, request: Request):
         return {"status": "ok", "message": f"Sandbox {sandbox_id} destroyed"}
     except Exception as e:
         _app.logger.error(f"Failed to destroy sandbox {sandbox_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to destroy sandbox: {str(e)}")
+        raise HTTPException(status_code=500, detail="销毁沙箱失败") from e
 
 
 # ─── 10. GET /api/sandbox/{sandbox_id}/files ───────

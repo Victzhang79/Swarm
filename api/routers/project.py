@@ -122,8 +122,8 @@ async def create_project(req: ProjectCreateRequest, request: Request):
                 lambda: set_project_member(project_id, user.id, Role.OWNER.value),
             )
     except Exception as e:
-        _app.logger.error(f"Failed to create project: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")
+        _app.logger.error("Failed to create project: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="创建项目失败，请稍后重试或联系管理员") from e
 
     # 后台启动预处理（不阻塞响应）
     async def _run_preprocess():
@@ -206,7 +206,7 @@ async def trigger_preprocess(project_id: str):
         project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     except Exception as e:
         _app.logger.exception("Failed to load project %s for preprocess", project_id)
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {e}") from e
+        raise HTTPException(status_code=503, detail="数据库暂时不可用") from e
 
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
@@ -221,7 +221,7 @@ async def trigger_preprocess(project_id: str):
         )
     except Exception as e:
         _app.logger.exception("Failed to reset preprocess state for %s", project_id)
-        raise HTTPException(status_code=500, detail=f"Failed to start preprocess: {e}") from e
+        raise HTTPException(status_code=500, detail="启动预处理失败，请稍后重试") from e
 
     # 后台启动预处理
     async def _run_preprocess():
