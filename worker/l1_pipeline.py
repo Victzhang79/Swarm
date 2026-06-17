@@ -814,8 +814,12 @@ def run_l1_pipeline(
     details["modified_files"] = modified
 
     harness = getattr(subtask, "harness", None)
+    # N-19：空 diff 短路只有在【没有任何确定性验收命令】时才成立。原代码只看 verify_commands，
+    # 忽略 build_command/test_command → "无 diff 但 acceptance=跑测试" 的任务会不跑测试直接 PASS。
     _has_verify = bool(getattr(harness, "verify_commands", None)) if harness else False
-    if not modified and not _has_verify:
+    _has_build = bool(getattr(harness, "build_command", "")) if harness else False
+    _has_test = bool(getattr(harness, "test_command", "")) if harness else False
+    if not modified and not (_has_verify or _has_build or _has_test):
         details["l1_2_compile_ok"] = True
         details["lint"] = {"status": "skipped", "reason": "no files"}
         details["l1_3_test_ok"] = True

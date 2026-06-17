@@ -225,6 +225,11 @@ async def analyze(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         result = _parse_json_from_llm(response.content)
+        # N-26：JSON 合法但缺 complexity 键时，原 result["complexity"] KeyError 会落到下方
+        # 泛 except 被误标"通用失败"。与 JSONDecodeError 分支一致回退 MEDIUM（而非崩溃）。
+        if not result.get("complexity"):
+            logger.warning("[ANALYZE] LLM 输出缺 complexity 键，回退 MEDIUM（N-26）")
+            result["complexity"] = "medium"
         complexity = Complexity(result["complexity"])
     except json.JSONDecodeError as e:
         logger.warning(f"[ANALYZE] LLM 输出 JSON 解析失败: {e}")

@@ -1119,14 +1119,13 @@ def _store_vectors_qdrant(
                 "index_version": INDEX_VERSION,
                 "index_source": INDEX_SOURCE_CODEGRAPH,
             }
-            point_id = f"{project_id}:{sym.get('file_path', '')}:{name}:{sym.get('start_line', 0)}"
-            # 用稳定哈希（blake2b）生成 Qdrant point ID。Python 内置 hash() 受
-            # PYTHONHASHSEED 随机化，跨进程不一致，会导致重复预处理时同一符号生成
-            # 不同 point ID、旧向量无法被覆盖而残留。
-            stable_id = int.from_bytes(
-                hashlib.blake2b(point_id.encode("utf-8"), digest_size=8).digest(),
-                "big",
-            ) & 0x7FFFFFFFFFFFFFFF
+            # P1-DEBT-04：与增量(semantic)路径共用同一 ID 方案（make_point_id），
+            # 同一 (file,line,content) 产同一 point ID → 两路径可互相 upsert 去重，
+            # 不再因 int/uuid 双方案不相交导致同集合内召回漂移。
+            from swarm.knowledge.semantic_index import make_point_id
+            stable_id = make_point_id(
+                sym.get("file_path", ""), sym.get("start_line", 0), content
+            )
             points.append(
                 PointStruct(id=stable_id, vector=vec, payload=payload)
             )

@@ -241,7 +241,7 @@ def create_user(
                 """
                 INSERT INTO swarm_users (id, username, display_name, password_hash, api_token, global_role, must_change_password)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id, username, display_name, global_role, api_token
+                RETURNING id, username, display_name, global_role, api_token, must_change_password
                 """,
                 (user_id, username, display_name, pwd_hash, token, global_role, must_change_password),
             )
