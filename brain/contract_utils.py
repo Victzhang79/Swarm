@@ -3,9 +3,82 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from swarm.types import TaskPlan
+
+# Maven `-pl <module>` 提取（reactor 模块选择）。
+_MVN_PL_RE = re.compile(r"-pl\s+([^\s,]+)")
+
+
+def _ensure_maven_module_build_scope(subtasks: list) -> bool:
+    """规则3：Maven 新模块构建闸门【可满足性】补全（现场 task 69d34b1b）。
+
+    现场：子任务新建 `ruoyi-alarm-app/src/...` 下 7 个文件，验收 `mvn -pl ruoyi-alarm-app -am compile`，
+    但模块自己的 `pom.xml` 与父 `pom.xml` 的 `<module>` 注册都不在任何 scope →
+    `Could not find the selected project in the reactor` 必败、worker 够不着、空转到超时升级。
+
+    规则：凡子任务 build/test/verify/acceptance 命令含 `-pl <module>` 且该 `<module>/` 目录下
+    在本计划里有 create_files（=正在新建该模块），就把 `<module>/pom.xml` 与根 `pom.xml` 并入该
+    子任务写权——前者用于建模块 POM，后者用于在父 `<modules>` 注册。pom 已存在时 executor 的
+    scope 归一会把 create 自动降级为 modify，故对"模块其实已存在"的情况也安全（至多 no-op）。
+    """
+    changed = False
+    all_creates: list[str] = []
+    all_write_targets: set[str] = set()
+    for st in subtasks:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        creates = list(getattr(scope, "create_files", []) or [])
+        writables = list(getattr(scope, "writable", []) or [])
+        all_creates += creates
+        all_write_targets |= set(creates) | set(writables)
+
+    for st in subtasks:
+        scope = getattr(st, "scope", None)
+        harness = getattr(st, "harness", None)
+        if scope is None:
+            continue
+        cmds: list[str] = []
+        if harness is not None:
+            for attr in ("build_command", "test_command"):
+                v = getattr(harness, attr, "") or ""
+                if v:
+                    cmds.append(v)
+            cmds += [c for c in (getattr(harness, "verify_commands", []) or []) if c]
+        cmds += [c for c in (getattr(st, "acceptance_criteria", []) or []) if c]
+
+        modules: set[str] = set()
+        for c in cmds:
+            for m in _MVN_PL_RE.findall(c):
+                m = m.lstrip(":").strip()
+                # 只处理目录式模块名（`:artifactId` 形式无法可靠映射到目录，跳过）。
+                if m and "/" not in m:
+                    modules.add(m)
+
+        for mod in modules:
+            mod_prefix = mod.rstrip("/") + "/"
+            # 仅当该模块目录下确有 create_files（=本计划在新建它）才补 pom，避免对既有模块乱扩 scope。
+            if not any(cf.startswith(mod_prefix) for cf in all_creates):
+                continue
+            mod_pom = f"{mod}/pom.xml"
+            root_pom = "pom.xml"
+            creates = list(getattr(scope, "create_files", []) or [])
+            writables = list(getattr(scope, "writable", []) or [])
+            if mod_pom not in all_write_targets:
+                creates.append(mod_pom)
+                all_write_targets.add(mod_pom)
+                changed = True
+            if root_pom not in writables and root_pom not in creates:
+                writables.append(root_pom)
+                all_write_targets.add(root_pom)
+                changed = True
+            scope.create_files = creates
+            scope.writable = writables
+
+    return changed
 
 
 def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:
@@ -41,6 +114,10 @@ def normalize_plan_scopes(plan: TaskPlan) -> bool:
     if not subtasks:
         return False
     changed = False
+
+    # ── 规则 3（先于规则1跑）：Maven 新模块构建闸门可满足性补全（治本 task 69d34b1b）。
+    # 放规则1前，使补进来的 pom 也受"同文件写权唯一"去重/串行化（多模块子任务不并发抢写根 pom）。
+    changed = _ensure_maven_module_build_scope(subtasks) or changed
 
     # ── 规则 1：同文件写权处理（区分串行协作 vs 独立并发）──
     # 记录每个文件的首个写者（按 subtasks 顺序，近似拓扑序）
