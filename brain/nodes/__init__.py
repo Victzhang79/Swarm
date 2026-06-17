@@ -331,6 +331,95 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
+async def _plan_ultra_batched(
+    llm, state, task_description, complexity, routing_table,
+    knowledge_context, knowledge_prompt, recent_tasks_prompt, sliding_ctx, file_plan,
+):
+    """ultra 超大需求分批拆解（DESIGN_plan_batch_decompose M-3/M-4/M-5）。
+
+    按 10% 比例分批，逐批调 brain LLM 只拆该批文件，每批进度日志（批次/百分比/LLM 耗时），
+    某批失败降级跳过不阻断，最后合并成全局 DAG（id 全局唯一 + 批间串行依赖）。
+    """
+    import time as _time
+
+    from swarm.brain.plan_batch import (
+        batch_progress_line,
+        compute_batches,
+        merge_subtask_batches,
+    )
+    from swarm.brain.prompts import PLAN_BATCH_SYSTEM, PLAN_BATCH_USER
+
+    td = state.get("tech_design_result") or {}
+    tech_design_extra = json.dumps(
+        {"data_model": td.get("data_model", ""), "shared_contract": td.get("shared_contract", {})},
+        ensure_ascii=False,
+    )[:3000]
+    proj_struct = _format_project_structure(knowledge_context)
+
+    batches = compute_batches(file_plan, ratio=0.1)
+    total = len(batches)
+    logger.info(
+        "[PLAN-BATCH] ultra 超大需求分批拆解启动：file_plan=%d 文件 → %d 批（每批约 %d 文件）",
+        len(file_plan), total, (len(batches[0]) if batches else 0),
+    )
+    batch_results: list[list[dict]] = []
+    failed_batches = 0
+    for i, batch in enumerate(batches, start=1):
+        batch_fp_text = "\n".join(
+            f"  - {fp.get('path')} [{fp.get('action', 'create')}] {fp.get('responsibility', '')}"
+            for fp in batch
+        )
+        prompt_user = PLAN_BATCH_USER.format(
+            task_description=task_description[:2000],
+            batch_idx=i, total_batches=total,
+            batch_file_plan=batch_fp_text,
+            project_structure=proj_struct,
+            tech_design_extra=tech_design_extra,
+        )
+        _t0 = _time.monotonic()
+        try:
+            response = await llm.ainvoke([
+                {"role": "system", "content": PLAN_BATCH_SYSTEM},
+                {"role": "user", "content": prompt_user},
+            ])
+            _dt = _time.monotonic() - _t0
+            result = _parse_json_from_llm(response.content)
+            subs = result.get("subtasks", []) if isinstance(result, dict) else []
+            # 清理 None 可选字段（同主路径健壮性）
+            for _st in subs:
+                if isinstance(_st, dict):
+                    for _opt in ("harness", "contract"):
+                        if _opt in _st and _st[_opt] is None:
+                            _st.pop(_opt)
+            if subs:
+                batch_results.append(subs)
+                logger.info("%s 拆出 %d 个子任务",
+                            batch_progress_line(i, total, len(batch), _dt), len(subs))
+            else:
+                failed_batches += 1
+                logger.warning("%s 本批未拆出子任务（降级跳过，不阻断）",
+                               batch_progress_line(i, total, len(batch), _dt))
+        except Exception as exc:  # noqa: BLE001
+            # M-5 失败隔离：单批失败降级跳过，不阻断其他批
+            failed_batches += 1
+            logger.warning("%s 本批拆解异常（降级跳过）: %s",
+                           batch_progress_line(i, total, len(batch)), exc)
+
+    merged = merge_subtask_batches(batch_results)
+    logger.info(
+        "[PLAN-BATCH] 分批拆解完成：%d/%d 批成功，合并出 %d 个子任务（失败批 %d）",
+        total - failed_batches, total, len(merged), failed_batches,
+    )
+    if not merged:
+        # 全批失败兜底：空 scope plan（与单次路径解析失败兜底一致，交人工）
+        return TaskPlan(subtasks=[SubTask(
+            id="st-1", description=task_description,
+            difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
+            scope=FileScope(writable=[], readable=[]), contract={},
+        )])
+    return TaskPlan(subtasks=[SubTask(**st) for st in merged])
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -420,33 +509,55 @@ async def plan(state: BrainState) -> dict:
         # 需求转化层产出注入：把 tech_design 的 file_plan/数据模型/契约喂给 PLAN，
         # PLAN 据此定 scope（不再从零猜文件）。空则提示回退自推导。
         tech_design_plan = _format_tech_design_for_plan(state)
-        prompt_user = PLAN_USER.format(
-            task_description=task_description,
-            complexity=complexity.value,
-            routing_table=json.dumps(routing_table, ensure_ascii=False, indent=2),
-            project_structure=_format_project_structure(knowledge_context),
-            knowledge_context=knowledge_prompt,
-            user_profile=_brain_profile_prompt(state),
-            recent_tasks=recent_tasks_prompt,
-            sliding_context=sliding_ctx,
-            tech_design_plan=tech_design_plan,
-        )
-        response = await llm.ainvoke([
-            {"role": "system", "content": PLAN_SYSTEM},
-            {"role": "user", "content": prompt_user},
-        ])
-        result = _parse_json_from_llm(response.content)
-        # 健壮性(task 88d69519)：LLM 可能输出 "harness": null / "model_preference" 等可选字段为
-        # null。SubTask.harness 类型是 TaskHarness（非 Optional，靠 default_factory），显式传
-        # None 会触发 pydantic validation error → 整个 plan 解析失败 → 降级空 scope 兜底。
-        # 这里剔除值为 None 的可选字段，让 default_factory 生效。
-        if isinstance(result, dict):
-            for _st in result.get("subtasks", []) or []:
-                if isinstance(_st, dict):
-                    for _opt in ("harness", "contract"):
-                        if _opt in _st and _st[_opt] is None:
-                            _st.pop(_opt)
-        task_plan = TaskPlan(**result)
+
+        # ── ultra 超大需求分批拆解（DESIGN_plan_batch_decompose）──
+        # tech_design 产出 file_plan 上百文件时，单次 LLM 拆全量 DAG 会卡死（stream chunk 不超时 +
+        # 超长 JSON 极慢）。改：按 10% 比例分批，逐批 LLM 拆解，每批规模可控 + 进度日志。
+        _file_plan = state.get("tech_design_file_plan") or []
+        _BATCH_TRIGGER = 30  # file_plan 超过此数才分批（中小需求单次最优，零回归）
+        # Q5 判定点（第二阶段）：超大到一定程度应切成串行主任务（主任务间依赖，A 合格才走 B）。
+        # 本批先留判定与告警，完整串行主任务编排是后续迭代（见 DESIGN_plan_batch_decompose 七）。
+        _SERIAL_MASTER_TRIGGER = 200
+        if len(_file_plan) > _SERIAL_MASTER_TRIGGER:
+            logger.warning(
+                "[PLAN] file_plan=%d 文件超过串行主任务阈值(%d)：建议切分为多个串行主任务"
+                "（A 产出合格→B），当前仍用单任务 10%% 分批拆解兜底。Q5 串行主任务编排待第二阶段实现。",
+                len(_file_plan), _SERIAL_MASTER_TRIGGER,
+            )
+        if complexity == Complexity.ULTRA and len(_file_plan) > _BATCH_TRIGGER:
+            task_plan = await _plan_ultra_batched(
+                llm, state, task_description, complexity, routing_table,
+                knowledge_context, knowledge_prompt, recent_tasks_prompt,
+                sliding_ctx, _file_plan,
+            )
+        else:
+            prompt_user = PLAN_USER.format(
+                task_description=task_description,
+                complexity=complexity.value,
+                routing_table=json.dumps(routing_table, ensure_ascii=False, indent=2),
+                project_structure=_format_project_structure(knowledge_context),
+                knowledge_context=knowledge_prompt,
+                user_profile=_brain_profile_prompt(state),
+                recent_tasks=recent_tasks_prompt,
+                sliding_context=sliding_ctx,
+                tech_design_plan=tech_design_plan,
+            )
+            response = await llm.ainvoke([
+                {"role": "system", "content": PLAN_SYSTEM},
+                {"role": "user", "content": prompt_user},
+            ])
+            result = _parse_json_from_llm(response.content)
+            # 健壮性(task 88d69519)：LLM 可能输出 "harness": null / "model_preference" 等可选字段为
+            # null。SubTask.harness 类型是 TaskHarness（非 Optional，靠 default_factory），显式传
+            # None 会触发 pydantic validation error → 整个 plan 解析失败 → 降级空 scope 兜底。
+            # 这里剔除值为 None 的可选字段，让 default_factory 生效。
+            if isinstance(result, dict):
+                for _st in result.get("subtasks", []) or []:
+                    if isinstance(_st, dict):
+                        for _opt in ("harness", "contract"):
+                            if _opt in _st and _st[_opt] is None:
+                                _st.pop(_opt)
+            task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
         _plan_degraded = f"plan LLM 输出解析失败，产出空 scope 兜底计划（Worker 大概率失败，需人工关注）（{e}）"

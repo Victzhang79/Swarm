@@ -142,6 +142,34 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
 
 请以 JSON 格式输出执行计划。"""
 
+PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【分批】拆解一个超大需求。
+整个需求的完整技术方案已由 tech_design 产出（上百文件），现在按模块分批处理——
+【你这一批只负责拆解给定的这组文件】，不要管其他批次的文件。
+
+规则：
+- 只为【本批文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
+- 同一批内可拆成多个子任务（按文件依赖/分层），也可合并相关文件到一个子任务。
+- 子任务的 depends_on 只引用【本批内】的其他子任务 id（跨批依赖由系统在合并时处理）。
+- 子任务 id 在本批内唯一即可（如 st-1/st-2，系统会全局重编号）。
+- 保持每个子任务 scope 聚焦、可独立执行，不要把整个模块塞进一个子任务的 writable。
+
+严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"contract":{}}]}"""
+
+PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
+{task_description}
+
+## 本批要拆解的文件清单（第 {batch_idx}/{total_batches} 批，只拆这些）
+{batch_file_plan}
+
+## 项目结构参考
+{project_structure}
+
+## 数据模型/契约参考（来自 tech_design）
+{tech_design_extra}
+
+请只为上面【本批文件清单】生成子任务 DAG，输出 JSON。"""
+
+
 PLAN_USER = """## 任务描述
 {task_description}
 
