@@ -1522,11 +1522,13 @@ class WorkerExecutor:
                     _r = ModelRouter()
                     _alt = None
                     try:
-                        _alt_name = _r._resolve_route(
+                        _alt_chain = _r._resolve_route(
                             self.subtask.difficulty.value if hasattr(self.subtask.difficulty, "value")
                             else str(self.subtask.difficulty),
                             getattr(self.subtask, "modality", "text") or "text",
                         )[1]
+                        # fallback 现为多级链(list)，取链首作为备选模型
+                        _alt_name = _alt_chain[0] if _alt_chain else None
                     except Exception:  # noqa: BLE001
                         _alt_name = None
                     if _alt_name and _alt_name != self.model_name:
