@@ -203,8 +203,13 @@ async def dispatch(state: BrainState) -> dict:
     shared_contract = state.get("shared_contract") or (
         plan_obj.shared_contract if plan_obj else {}
     )
+    # 主力并行轮转：把本批子任务按序轮转分配到 worker_parallel_pool 里的本地主力，
+    # 让两个能力相当的本地主力(Qwen3.6-40B-Claude/MiniMax)同时干、分散负载、产出更快。
+    # 轮转不覆盖 alternate(失败重试)；池空则不轮转(按 difficulty 路由)。
+    _pool = list(getattr(config.worker, "worker_parallel_pool", []) or [])
 
-    async def _run_one(subtask: SubTask) -> tuple[SubTask, WorkerOutput | Exception]:
+    async def _run_one(subtask: SubTask, idx: int = 0) -> tuple[SubTask, WorkerOutput | Exception]:
+        _override = _pool[idx % len(_pool)] if (_pool and not use_alternate) else None
         try:
             output = await nodes._dispatch_to_worker(
                 subtask,
@@ -214,12 +219,13 @@ async def dispatch(state: BrainState) -> dict:
                 use_alternate=use_alternate,
                 user_profile_prompt=_worker_profile_prompt(state),
                 shared_contract=shared_contract,
+                model_override=_override,
             )
             return subtask, output
         except Exception as e:
             return subtask, e
 
-    outcomes = await asyncio.gather(*[_run_one(st) for st in to_dispatch])
+    outcomes = await asyncio.gather(*[_run_one(st, i) for i, st in enumerate(to_dispatch)])
 
     def _worker_batch_context() -> dict:
         lines: list[str] = []

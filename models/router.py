@@ -191,6 +191,38 @@ class ModelRouter:
             return primary.with_fallbacks(fallback_llms)
         return primary
 
+    def get_llm_by_name(self, model_name: str, difficulty: str = "medium") -> Runnable:
+        """按指定模型名取 worker LLM（用于主力并行轮转 override），带该难度的 fallback 链兜底。
+
+        worker_parallel_pool 轮转时用：把同难度子任务分到不同本地主力模型，
+        但仍保留该难度的 fallback 链（override 模型挂了能降级），不牺牲健壮性。
+        """
+        role = f"worker/{difficulty}"
+        _wmax = getattr(self.config, "worker_max_tokens", 0) or None
+        p_prov = self._get_provider_for_model(model_name)
+        primary = p_prov.get_chat_model(
+            model_name,
+            temperature=self.config.worker_temperature,
+            callbacks=[ModelInvocationLogger(role, model_name, p_prov.provider.id)],
+            max_tokens=_wmax,
+        )
+        # 复用该难度的 fallback 链（排除掉 override 模型自己，避免重复）
+        _, fallback_names = self._resolve_route(difficulty, "text")
+        fallback_llms = []
+        for i, fb_name in enumerate(fallback_names):
+            if not fb_name or fb_name == model_name:
+                continue
+            f_prov = self._get_provider_for_model(fb_name)
+            fallback_llms.append(f_prov.get_chat_model(
+                fb_name,
+                temperature=self.config.worker_temperature,
+                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
+                max_tokens=_wmax,
+            ))
+        if fallback_llms:
+            return primary.with_fallbacks(fallback_llms)
+        return primary
+
     def get_alternate_llm_for_subtask(
         self, difficulty: str, modality: str = "text"
     ) -> tuple[Runnable, str]:

@@ -21,13 +21,23 @@ def test_complex_primary_is_strongest_local():
 
 
 def test_complex_fallback_chain_order():
-    """Q-T2-1：complex 兜底链 = 同级主力 MiniMax → 次级 Saka → 兜底 122B-A10B。"""
+    """Q-T2-1：complex 兜底链 = 同级主力 MiniMax → 次级 Saka（122B-A10B 64K 已排除）。"""
     c = _cfg()
     fb = c.routing_complex_fallback
-    assert isinstance(fb, list) and len(fb) >= 3, f"应多级兜底 list: {fb}"
+    assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
     assert "MiniMax-M2.7-Pro" in fb[0], f"第一兜底应同级主力 MiniMax: {fb}"
     assert "Saka" in fb[1], f"第二兜底应次级 Saka: {fb}"
-    assert "122B-A10B" in fb[2], f"最终兜底应 122B-A10B: {fb}"
+    # 122B-A10B(64K) 已排除出 worker 列表
+    assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
+
+
+def test_no_small_context_model_in_workers():
+    """64K 小窗口的 122B-A10B 不应出现在任何 worker 路由档/兜底链/worker_fallback。"""
+    c = _cfg()
+    allmodels = ([c.routing_trivial, c.routing_medium, c.routing_complex, c.worker_fallback]
+                 + c.routing_trivial_fallback + c.routing_medium_fallback
+                 + c.routing_complex_fallback)
+    assert not any("122B-A10B" in m for m in allmodels), f"122B-A10B(64K) 应排除出 worker: {allmodels}"
 
 
 def test_no_kimi_403_anywhere():
@@ -44,7 +54,7 @@ def test_resolve_route_returns_list_fallback():
     r = ModelRouter()
     primary, fb = r._resolve_route("complex", "text")
     assert "Qwen3.6-40B-Claude" in primary
-    assert isinstance(fb, list) and len(fb) >= 3
+    assert isinstance(fb, list) and len(fb) >= 2  # MiniMax + Saka（122B-A10B 已排除）
 
 
 def test_alternate_picks_same_tier_main():

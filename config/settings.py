@@ -113,15 +113,15 @@ class ModelConfig(BaseSettings):
     # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
     model_sizes: dict[str, str] = Field(default_factory=dict)
 
-    # Brain 层（云端大模型编排，符合范式；fallback 改为可用的 Kimi-K2.7-Code，
-    # 旧 Kimi-K2.6 在 SiliconFlow 上 403 private 不可用——见 PROJECT_STATUS T2）
-    brain_primary: str = "Pro/zai-org/GLM-5.1"
+    # Brain 层（云端大模型编排，符合范式）：主 GLM-5.2(1024K 超长上下文)，
+    # 备 Kimi-K2.7-Code(256K)。旧 Kimi-K2.6 在 SiliconFlow 403 private 不可用——见 PROJECT_STATUS T2。
+    brain_primary: str = "zai-org/GLM-5.2"
     brain_fallback: str = "moonshotai/Kimi-K2.7-Code"
 
     # Worker 层
     worker_primary: str = "MiniMax-M2.7-Pro"
     worker_local: str = "qwen3:27b"          # 本地 Ollama
-    worker_fallback: str = "Qwen3.5"
+    worker_fallback: str = "Qwen3.6-27B-Saka-NVFP4"  # 大窗口本地（122B-A10B 64K 已排除）
 
     # API 端点（兼容字段：providers 为空时合成默认的 siliconflow + local 两个接入点）
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
@@ -141,8 +141,8 @@ class ModelConfig(BaseSettings):
         default_factory=lambda: ["Qwen3.6-40B-Claude-4.6-NVFP4", "Qwen3.6-27B-Saka-NVFP4"])
     routing_complex: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 复杂任务首选(架构/跨模块)，最强本地(256K)
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
-        # 终极兜底 Qwen3.5-122B 仅 64K，须控输入规模
-        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwen3.6-27B-Saka-NVFP4", "Qwen3.5-122B-A10B-NVFP4"])
+        # 全本地大窗口模型；122B-A10B 仅 64K 上下文，已排除出 worker 列表（易撑爆、拖累预算）
+        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwen3.6-27B-Saka-NVFP4"])
     routing_multimodal: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 多模态首选(看图/UI截图)，mm✓256K
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["Qwen3.6-27B-Saka-NVFP4", "stepfun-ai/Step-3.7-Flash-FP8"])
@@ -294,6 +294,11 @@ class WorkerConfig(BaseSettings):
     )
 
     max_concurrent: int = 4
+    # worker 本地主力并行池：并发批次内同难度子任务轮转分配到这些模型，
+    # 让两个能力相当的本地主力(Qwen3.6-40B-Claude 256K / MiniMax 196K)同时干、分散负载、产出更快。
+    # 空列表 = 不轮转(按 difficulty 路由单一模型,向后兼容)。
+    worker_parallel_pool: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["Qwen3.6-40B-Claude-4.6-NVFP4", "MiniMax-M2.7-Pro"])
     max_execution_time: int = 600     # 10 分钟
     max_iterations: int = 50          # Agent 最大 Tool 调用轮次
     max_fix_rounds: int = 3           # 编码内循环最大修复轮次
@@ -307,6 +312,11 @@ class WorkerConfig(BaseSettings):
     # 安全审计阻断级别：critical/high=发现该级别漏洞则阻断交付；none=仅报告不阻断。
     # 满足"阻断交付 + 仅报告"双模式(用户决策)。
     security_block_severity: str = "critical"
+
+    @field_validator("worker_parallel_pool", mode="before")
+    @classmethod
+    def _normalize_parallel_pool(cls, v: object) -> list[str]:
+        return _coerce_model_list(v)
 
 
 class SandboxConfig(BaseSettings):

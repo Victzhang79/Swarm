@@ -50,7 +50,7 @@ def test_config():
 
     config = get_config()
     assert config.app_name == "Swarm"
-    assert config.model.brain_primary == "Pro/zai-org/GLM-5.1"
+    assert config.model.brain_primary == "zai-org/GLM-5.2"
     assert config.model.worker_primary == "MiniMax-M2.7-Pro"
     assert config.worker.max_concurrent == 4
 
@@ -63,7 +63,7 @@ def test_model_router():
 
     router = ModelRouter()
     # 验证路由器能创建（不实际调用 API）
-    assert router.config.brain_primary == "Pro/zai-org/GLM-5.1"
+    assert router.config.brain_primary == "zai-org/GLM-5.2"
     assert router.config.worker_primary == "MiniMax-M2.7-Pro"
 
     print("  ✅ models — 模型路由正常")

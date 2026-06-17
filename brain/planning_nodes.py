@@ -102,15 +102,16 @@ def _min_worker_context_window() -> int | None:
         from swarm.models import capability_store as cap
 
         cfg = get_config().model
-        # 预算基于【各档 primary 主力模型】窗口——worker 正常走 primary，
-        # fallback 链是异常降级路径（如终极兜底 122B-A10B 仅 64K），不该让它的小窗口
-        # 把全局预算压低，否则 est 基线(medium=50k)恒超预算 → ELABORATE 误判全员需二次拆分
-        # → 逐个 LLM 拆碎(与垂直切片冲突)+ 极慢/卡死(根因 task e3618f1e)。
-        candidate_models = [
-            cfg.routing_trivial,
-            cfg.routing_medium,
-            cfg.routing_complex,
-        ]
+        wcfg = get_config().worker
+        # 预算基于【worker 主力池】窗口——三个本地模型都是 worker(不按难度绑死)，
+        # 但预算该用主力(Qwen3.6-40B-Claude 256K / MiniMax 196K)窗口算，
+        # 不被次级 Saka(112K,只跑trivial小活+fallback)拖低。
+        # 安全性：budget×0.75×0.7≈103K < Saka 112K，即使降级到 Saka，worker 的
+        # pre_model_hook 裁剪后输入也装得下——三个 worker 模型通吃，无需额外重拆。
+        candidate_models = list(getattr(wcfg, "worker_parallel_pool", []) or [])
+        if not candidate_models:
+            # 池空兜底：退回各档 primary（向后兼容）
+            candidate_models = [cfg.routing_trivial, cfg.routing_medium, cfg.routing_complex]
         candidate_models = [m for m in candidate_models if m]
 
         windows: list[int] = []

@@ -1020,6 +1020,7 @@ async def _dispatch_to_worker(
     use_alternate: bool = False,
     user_profile_prompt: str = "",
     shared_contract: dict | None = None,
+    model_override: str | None = None,
 ) -> WorkerOutput:
     """将子任务派发给 Worker 执行 — 真实调用 WorkerExecutor"""
     from swarm.knowledge.service import compact_knowledge_context, set_worker_context
@@ -1050,6 +1051,12 @@ async def _dispatch_to_worker(
         # audit #34：用公共方法替代直接调 ModelRouter 私有方法，恢复封装边界。
         worker_llm, model_name = router.get_alternate_llm_for_subtask(difficulty, modality)
         logger.info(f"[DISPATCH] 子任务 {subtask.id} 使用备选模型: {model_name}")
+    elif model_override and modality != "multimodal":
+        # 主力并行轮转：把同难度子任务分到不同本地主力(worker_parallel_pool)，
+        # 两个主力同时干、分散负载、产出更快；仍带该难度 fallback 链兜底。
+        worker_llm = router.get_llm_by_name(model_override, difficulty=difficulty)
+        model_name = model_override
+        logger.info(f"[DISPATCH] 子任务 {subtask.id} 主力并行轮转 → {model_name}")
     else:
         worker_llm = router.get_llm_for_subtask(
             difficulty=difficulty,

@@ -8,9 +8,15 @@ from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 
 
 def test_budget_not_dragged_by_small_fallback():
-    """预算应 > medium est 基线(50000)，不被 64K 兜底模型压到 49152。"""
+    """预算基于双主力池窗口(MiniMax 196K)，不被次级 Saka(112K)拖低。
+
+    budget=147456(196608×0.75)，medium est 基线50000 仅占 34%，子任务拆得宽松不碎。
+    安全性：worker 裁剪后输入≈103K < Saka 112K，降级到任一 worker 都装得下。
+    """
     budget = _context_budget()
-    assert budget > 50000, f"预算被小兜底模型绑架了: {budget}（应基于 primary 主力窗口）"
+    assert budget >= 140000, f"预算应基于双主力窗口(~147456)，被次级模型拖低了: {budget}"
+    # 裁剪后输入(budget×0.7)必须 < 最小 worker 窗口 Saka 112000，否则降级会撑穿
+    assert int(budget * 0.7) < 112000, f"裁剪后输入 {int(budget*0.7)} 会撑穿 Saka 112K"
 
 
 def test_medium_subtask_not_force_resplit():
