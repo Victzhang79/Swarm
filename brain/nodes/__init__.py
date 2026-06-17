@@ -650,7 +650,18 @@ async def plan(state: BrainState) -> dict:
 
     from swarm.brain.contract_utils import enrich_plan_with_shared_contract
 
+    # T1：把 contract_design 节点产出的全局共享契约(state.shared_contract_draft)注入 plan，
+    # 再 enrich 进每个子任务的 contract → worker 执行时看到统一契约，避免各写各的接口对不上。
+    _contract = state.get("shared_contract_draft") or {}
+    if _contract and not (task_plan.shared_contract or {}):
+        task_plan.shared_contract = _contract
     task_plan = enrich_plan_with_shared_contract(task_plan)
+
+    # T3：同文件写权唯一——消除"同一文件被多个子任务并发写"的冲突（写权保留首个，
+    # 其余降级为 readable）+ 被依赖产物自动入域。防多 worker 同时编辑同一文件互相覆盖。
+    from swarm.brain.contract_utils import normalize_plan_scopes
+    if normalize_plan_scopes(task_plan):
+        logger.info("[PLAN] T3 scope 归一：消除同文件并发写冲突（写权唯一化 + 依赖产物入域）")
 
     # harness 兜底：LLM 未给出 harness 的子任务，按语言推断一个，确保 Worker 有
     # 项目特定的构建/测试命令 + 命令白名单可用（否则又退化成"口头自报通过"）。

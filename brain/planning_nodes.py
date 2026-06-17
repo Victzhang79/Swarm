@@ -103,9 +103,9 @@ def _min_worker_context_window() -> int | None:
 
         cfg = get_config().model
         candidate_models = [
-            cfg.routing_trivial, cfg.routing_trivial_fallback,
-            cfg.routing_medium, cfg.routing_medium_fallback,
-            cfg.routing_complex, cfg.routing_complex_fallback,
+            cfg.routing_trivial, *cfg.routing_trivial_fallback,
+            cfg.routing_medium, *cfg.routing_medium_fallback,
+            cfg.routing_complex, *cfg.routing_complex_fallback,
         ]
         candidate_models = [m for m in candidate_models if m]
 
@@ -906,6 +906,94 @@ async def tech_design(state: BrainState) -> dict:
             "tech_design_fact_issues": det_issues,
             "tech_design_file_plan": [],
         }
+
+
+# ══════════════════════════════════════════════
+# 节点 3.5：contract_design — 共享契约设计（T1，DESIGN_multiworker_collaboration）
+# ══════════════════════════════════════════════
+
+CONTRACT_DESIGN_SYSTEM = """你是系统架构师，负责为一个【多模块大型需求】设计【跨模块共享契约】。
+
+背景：这个需求会被拆成多个子任务，由多个 worker【并行】实现。为防止各 worker 各写各的、
+接口对不上（如两人各建一个 INotifyService、DTO 字段不一致、API 路径冲突），
+你要先把【所有 worker 都必须遵守的共享契约】定下来——这是全局唯一的一份基石。
+
+只定【跨模块/跨子任务共享】的部分（模块内部细节由各 worker 自决，不要管）：
+1. 共享接口：跨模块调用的接口名 + 完整方法签名（参数/返回类型）。
+2. 共享 DTO/实体：被多个模块引用的数据结构 + 字段。
+3. 共享常量/枚举：渠道类型、状态码、回调类型等。
+4. API 路径规范：对外接口的 URL 路径 + HTTP 方法 + 请求/响应结构。
+5. 命名/路径约定：包名前缀、模块目录规范，避免同名重复创建。
+
+严格输出 JSON：
+{"shared_contract": {
+  "interfaces": [{"name","module","signature":"完整方法签名","purpose"}],
+  "dtos": [{"name","module","fields":["类型 字段名"]}],
+  "constants": [{"name","values":["..."]}],
+  "apis": [{"path","method","request","response"}],
+  "conventions": ["命名/路径约定1", "..."]
+}}"""
+
+CONTRACT_DESIGN_USER = """需求：
+{task_description}
+
+模块清单（来自技术方案）：
+{modules}
+
+数据模型：
+{data_model}
+
+文件级方案概览（看哪些文件跨模块被引用）：
+{file_plan_summary}
+
+请产出【跨模块共享契约】JSON。只定共享部分，求精准（这是所有 worker 的基石）。"""
+
+
+async def contract_design(state: BrainState) -> dict:
+    """共享契约设计节点（T1）：多模块大需求并行实现前，用 Brain 大模型产出全局共享契约。
+
+    决策（Q-T1-1/Q-T1-2）：独立节点 + Brain 大模型直接生成（全局基石求准）。
+    仅对【ultra 且多模块】需求产契约；其余直通（沿用 tech_design 的 shared_contract_draft）。
+    产出的 shared_contract 会：① 注入每个 worker 作只读契约；② 作为"契约子任务"最先落盘（dispatch 层）。
+    """
+    file_plan = state.get("tech_design_file_plan") or []
+    td = state.get("tech_design") or {}
+    modules = td.get("modules") or []
+    comp = state.get("assessed_complexity") or state.get("complexity")
+    comp_str = comp.value if hasattr(comp, "value") else str(comp)
+
+    # 仅 ultra 多模块才需要全局契约（简单/单模块沿用 draft，零开销）
+    if comp_str != "ultra" or len(modules) < 2:
+        return {}
+
+    try:
+        llm = _get_brain_llm()
+        fp_summary = "\n".join(
+            f"  - {fp.get('path')} [{fp.get('module', '?')}] {fp.get('responsibility', '')}"
+            for fp in file_plan[:120]
+        )
+        resp = await llm.ainvoke([
+            {"role": "system", "content": CONTRACT_DESIGN_SYSTEM},
+            {"role": "user", "content": CONTRACT_DESIGN_USER.format(
+                task_description=(state.get("task_description", ""))[:2500],
+                modules=json.dumps(modules, ensure_ascii=False)[:2000],
+                data_model=str(td.get("data_model", ""))[:2000],
+                file_plan_summary=fp_summary[:3000],
+            )},
+        ])
+        result = _parse_json_from_llm(resp.content)
+        contract = result.get("shared_contract", result) if isinstance(result, dict) else {}
+        n_if = len(contract.get("interfaces", []) or []) if isinstance(contract, dict) else 0
+        n_dto = len(contract.get("dtos", []) or []) if isinstance(contract, dict) else 0
+        n_api = len(contract.get("apis", []) or []) if isinstance(contract, dict) else 0
+        logger.info(
+            "[CONTRACT_DESIGN] 共享契约已产出：接口=%d DTO=%d API=%d（Brain 大模型，全局基石）",
+            n_if, n_dto, n_api,
+        )
+        return {"shared_contract_draft": contract or state.get("shared_contract_draft") or {}}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[CONTRACT_DESIGN] 契约生成失败，沿用 tech_design draft 继续: %s", exc)
+        return {}
 
 
 # ══════════════════════════════════════════════

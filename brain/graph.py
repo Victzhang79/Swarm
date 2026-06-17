@@ -48,6 +48,7 @@ from swarm.brain.nodes import (
 from swarm.brain.planning_nodes import (
     assess,
     clarify,
+    contract_design,
     elaborate,
     review_design,
     tech_design,
@@ -350,6 +351,7 @@ def build_brain_graph() -> StateGraph:
     graph.add_node("clarify", clarify)
     graph.add_node("assess", assess)
     graph.add_node("tech_design", tech_design)
+    graph.add_node("contract_design", contract_design)  # T1：多模块共享契约（Brain 大模型）
     graph.add_node("review_design", review_design)
     graph.add_node("elaborate", elaborate)
     graph.add_node("plan", plan)
@@ -402,7 +404,7 @@ def build_brain_graph() -> StateGraph:
     graph.add_conditional_edges(
         "assess",
         after_assess,
-        {"tech_design": "tech_design", "plan": "plan"},
+        {"tech_design": "tech_design", "plan": "contract_design"},
     )
     # TECH_DESIGN →[条件] CLARIFY(虚假前提，强制澄清) / REVIEW_DESIGN(核验通过)
     graph.add_conditional_edges(
@@ -410,12 +412,14 @@ def build_brain_graph() -> StateGraph:
         after_tech_design,
         {"clarify": "clarify", "review_design": "review_design"},
     )
-    # REVIEW_DESIGN →[条件] TECH_DESIGN(打回) / PLAN(通过)
+    # REVIEW_DESIGN →[条件] TECH_DESIGN(打回) / CONTRACT_DESIGN→PLAN(通过)
     graph.add_conditional_edges(
         "review_design",
         after_review,
-        {"tech_design": "tech_design", "plan": "plan"},
+        {"tech_design": "tech_design", "plan": "contract_design"},
     )
+    # T1：CONTRACT_DESIGN → PLAN（多模块共享契约设计后进入拆解；非多模块直通空契约）
+    graph.add_edge("contract_design", "plan")
 
     # ── 条件边 ──
 
