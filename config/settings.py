@@ -3,9 +3,31 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def _coerce_model_list(v: object) -> list[str]:
+    """env 值 → list[str]。兼容三种写法（NoDecode 关掉自动 JSON 解码后由本函数接管）：
+    - 纯字符串单模型 'A'         → ['A']（向后兼容旧 .env）
+    - 逗号链 'A,B,C'             → ['A','B','C']（多级兜底链，推荐写法）
+    - JSON 数组 '["A","B"]'      → ['A','B']
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            import json
+            return [str(x).strip() for x in json.loads(s) if str(x).strip()]
+        return [x.strip() for x in s.split(",") if x.strip()]
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [str(v)]
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -91,9 +113,10 @@ class ModelConfig(BaseSettings):
     # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
     model_sizes: dict[str, str] = Field(default_factory=dict)
 
-    # Brain 层
+    # Brain 层（云端大模型编排，符合范式；fallback 改为可用的 Kimi-K2.7-Code，
+    # 旧 Kimi-K2.6 在 SiliconFlow 上 403 private 不可用——见 PROJECT_STATUS T2）
     brain_primary: str = "Pro/zai-org/GLM-5.1"
-    brain_fallback: str = "moonshotai/Kimi-K2.6"
+    brain_fallback: str = "moonshotai/Kimi-K2.7-Code"
 
     # Worker 层
     worker_primary: str = "MiniMax-M2.7-Pro"
@@ -106,15 +129,32 @@ class ModelConfig(BaseSettings):
     local_base_url: str = "http://ai.bit:3000/api"
     local_api_key: str = ""
 
-    # 子任务路由分层
-    routing_trivial: str = "Qwen3.6-27B-Saka"       # 简单任务首选（改CSS/修typo）
-    routing_trivial_fallback: str = "Step-3.7-Flash" # 简单任务备选
-    routing_medium: str = "MiniMax-M2.7-Pro"         # 中等任务首选（加API/修bug）
-    routing_medium_fallback: str = "Qwen3.5-122B-A10B-NVFP4"  # 中等任务备选
-    routing_complex: str = "Pro/zai-org/GLM-5.1"     # 复杂任务首选（架构重构/跨模块）
-    routing_complex_fallback: str = "moonshotai/Kimi-K2.6"    # 复杂任务备选
-    routing_multimodal: str = "Step-3.7-Flash"       # 多模态首选（看图/UI截图）
-    routing_multimodal_fallback: str = "MiniMax-M2.7-Pro"     # 多模态备选
+    # 子任务路由分层（worker 全部用【本地小模型】，云端只给 Brain——见 PROJECT_STATUS T2）。
+    # primary 单模型；*_fallback 为【多级兜底链】(list)，主→次→兜底逐级降级，全本地。
+    # 差异化分档让 4 个并发 worker 槽天然命中不同本地模型，分散推理负载。
+    # fallback 字段用 NoDecode 关掉 pydantic JSON 自动解码，env 支持 'A,B,C' 逗号链写法。
+    routing_trivial: str = "Qwen3.6-27B-Saka-NVFP4"   # 简单任务首选(改CSS/修typo)，轻快(112K)
+    routing_trivial_fallback: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwen3.6-40B-Claude-4.6-NVFP4"])
+    routing_medium: str = "MiniMax-M2.7-Pro"          # 中等任务首选(加API/修bug)，196K
+    routing_medium_fallback: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["Qwen3.6-40B-Claude-4.6-NVFP4", "Qwen3.6-27B-Saka-NVFP4"])
+    routing_complex: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 复杂任务首选(架构/跨模块)，最强本地(256K)
+    routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
+        # 终极兜底 Qwen3.5-122B 仅 64K，须控输入规模
+        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwen3.6-27B-Saka-NVFP4", "Qwen3.5-122B-A10B-NVFP4"])
+    routing_multimodal: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 多模态首选(看图/UI截图)，mm✓256K
+    routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["Qwen3.6-27B-Saka-NVFP4", "stepfun-ai/Step-3.7-Flash-FP8"])
+
+    @field_validator(
+        "routing_trivial_fallback", "routing_medium_fallback",
+        "routing_complex_fallback", "routing_multimodal_fallback",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_fallback_chain(cls, v: object) -> list[str]:
+        return _coerce_model_list(v)
 
     # 参数
     brain_temperature: float = 0.1
@@ -223,10 +263,10 @@ class ModelConfig(BaseSettings):
         candidates = [
             self.brain_primary, self.brain_fallback,
             self.worker_primary, self.worker_local, self.worker_fallback,
-            self.routing_trivial, self.routing_trivial_fallback,
-            self.routing_medium, self.routing_medium_fallback,
-            self.routing_complex, self.routing_complex_fallback,
-            self.routing_multimodal, self.routing_multimodal_fallback,
+            self.routing_trivial, *self.routing_trivial_fallback,
+            self.routing_medium, *self.routing_medium_fallback,
+            self.routing_complex, *self.routing_complex_fallback,
+            self.routing_multimodal, *self.routing_multimodal_fallback,
         ]
         seen: dict[str, None] = {}
         for m in candidates:

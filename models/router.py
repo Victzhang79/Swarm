@@ -160,8 +160,12 @@ class ModelRouter:
         return primary.with_fallbacks([fallback])
 
     def get_llm_for_subtask(self, difficulty: str, modality: str = "text") -> Runnable:
-        """根据子任务难度和模态动态选择模型"""
-        primary_name, fallback_name = self._resolve_route(difficulty, modality)
+        """根据子任务难度和模态动态选择模型。
+
+        fallback 为【多级兜底链】：primary 失败 → 链上第 1 个 → 第 2 个 … 逐级降级
+        （全本地，主→次→兜底）。LangChain with_fallbacks 接受多个，按序尝试。
+        """
+        primary_name, fallback_names = self._resolve_route(difficulty, modality)
 
         role = f"worker/{difficulty}"
         _wmax = getattr(self.config, "worker_max_tokens", 0) or None
@@ -172,15 +176,19 @@ class ModelRouter:
             callbacks=[ModelInvocationLogger(role, primary_name, p_prov.provider.id)],
             max_tokens=_wmax,
         )
-        if fallback_name:
-            f_prov = self._get_provider_for_model(fallback_name)
-            fallback = f_prov.get_chat_model(
-                fallback_name,
+        fallback_llms = []
+        for i, fb_name in enumerate(fallback_names):
+            if not fb_name:
+                continue
+            f_prov = self._get_provider_for_model(fb_name)
+            fallback_llms.append(f_prov.get_chat_model(
+                fb_name,
                 temperature=self.config.worker_temperature,
-                callbacks=[ModelInvocationLogger(role + "/fallback", fallback_name, f_prov.provider.id)],
+                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
                 max_tokens=_wmax,
-            )
-            return primary.with_fallbacks([fallback])
+            ))
+        if fallback_llms:
+            return primary.with_fallbacks(fallback_llms)
         return primary
 
     def get_alternate_llm_for_subtask(
@@ -192,8 +200,8 @@ class ModelRouter:
         私有方法(_resolve_route/_get_provider_for_model)的逻辑，恢复封装边界。
         优先用路由表的 fallback，无 fallback 时回退 primary。
         """
-        primary_name, fallback_name = self._resolve_route(difficulty, modality)
-        model_name = fallback_name or primary_name
+        primary_name, fallback_names = self._resolve_route(difficulty, modality)
+        model_name = (fallback_names[0] if fallback_names else None) or primary_name
         prov = self._get_provider_for_model(model_name)
         role = f"worker/{difficulty}/alternate"
         llm = prov.get_chat_model(
@@ -204,8 +212,9 @@ class ModelRouter:
         )
         return llm, model_name
 
-    def _resolve_route(self, difficulty: str, modality: str) -> tuple[str, str]:
-        """查路由表 → (primary_model_name, fallback_model_name)"""
+    def _resolve_route(self, difficulty: str, modality: str) -> tuple[str, list[str]]:
+        """查路由表 → (primary_model_name, fallback_model_names)。
+        fallback 现为【多级兜底链】(list)：主失败后逐级降级，全本地。"""
         if modality == "multimodal":
             # 设计 v3 A.5：优先从能力库筛 supports_multimodal=True 的模型，
             # 而非读写死的 routing_multimodal。能力库无可用项则回退写死配置。

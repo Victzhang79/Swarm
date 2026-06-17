@@ -335,7 +335,13 @@ async def update_routing(request: Request):
     update_map: dict[str, str] = {}
     for key, env_key in mapping.items():
         if key in body:
-            val = str(body[key]).strip()
+            raw = body[key]
+            # fallback 链可能是 list（前端多级兜底链）→ 存成逗号链，供 _coerce_model_list 还原。
+            # 不能用 str(list)（会得到 "['A', 'B']" 单引号非法 JSON）。
+            if isinstance(raw, (list, tuple)):
+                val = ",".join(str(x).strip() for x in raw if str(x).strip())
+            else:
+                val = str(raw).strip()
             if val:
                 update_map[env_key] = val
 

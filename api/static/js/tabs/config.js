@@ -165,11 +165,19 @@ async function testConfig() {
 
 function collectRoutingPayload() {
   const payload = {};
+  // primary：单选 select
   document.querySelectorAll('.routing-select').forEach(sel => {
     const tier = sel.dataset.tier;
     const role = sel.dataset.role;
     if (!tier || !role || !sel.value) return;
     payload[role === 'primary' ? `routing_${tier}` : `routing_${tier}_fallback`] = sel.value;
+  });
+  // fallback：多级链文本输入（逗号分隔，后端 _coerce_model_list 解析为 list）
+  document.querySelectorAll('.routing-fallback-input').forEach(inp => {
+    const tier = inp.dataset.tier;
+    if (!tier) return;
+    const chain = (inp.value || '').split(',').map(s => s.trim()).filter(Boolean);
+    payload[`routing_${tier}_fallback`] = chain;
   });
   return payload;
 }
@@ -604,8 +612,10 @@ function renderRoutingTable(data) {
             <select class="form-select routing-select" data-tier="${t.key}" data-role="primary">${buildModelOptions(cfg.primary || '')}</select>
           </div>
           <div class="form-group">
-            <label class="form-label">备选模型</label>
-            <select class="form-select routing-select" data-tier="${t.key}" data-role="fallback">${buildModelOptions(cfg.fallback || '')}</select>
+            <label class="form-label">备选模型链（多级兜底，逗号分隔，按序降级）</label>
+            <input class="form-input routing-fallback-input" data-tier="${t.key}" data-role="fallback"
+                   value="${escapeHtml(Array.isArray(cfg.fallback) ? cfg.fallback.join(', ') : (cfg.fallback || ''))}"
+                   placeholder="如 MiniMax-M2.7-Pro, Qwen3.6-27B-Saka-NVFP4" />
           </div>
         </div>
       </div>`;
