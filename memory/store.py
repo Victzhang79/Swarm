@@ -367,13 +367,16 @@ class MemoryStore:
             return []
         vector_str = _vector_to_pg(query_vector)
 
+        # 按 SQL 占位符出现顺序【显式】构造参数，杜绝拼接顺序错位：
+        #   select(vector) → where(project_id) → [type_filter(error_type)] → order by(vector) → limit
+        # 旧写法 [vector]+params[:1]+[vector]+params[1:] 在带 error_type 时把 error_type 绑到了
+        # ORDER BY 的 %s::vector 上 → "invalid input syntax for type vector"（P1-DEBT-03 强化首次触发）。
         type_filter = ""
-        params: list[Any] = [project_id]
+        sql_params: list[Any] = [vector_str, project_id]
         if error_type:
             type_filter = "AND error_type = %s"
-            params.append(error_type)
-
-        params.append(top_k)
+            sql_params.append(error_type)
+        sql_params.extend([vector_str, top_k])
 
         async with conn.cursor() as cur:
             await cur.execute(
@@ -389,7 +392,7 @@ class MemoryStore:
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
-                [vector_str] + params[:1] + [vector_str] + params[1:],
+                sql_params,
             )
             rows = await cur.fetchall()
 

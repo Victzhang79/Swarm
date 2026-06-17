@@ -68,6 +68,43 @@ def test_memory_zero_vector_query_returns_empty():
     asyncio.run(_run())
 
 
+# ── query_mistakes 带 error_type 时参数顺序必须与 SQL 占位符一致（P1-DEBT-03 强化首次触发的 latent bug） ──
+def test_query_mistakes_param_order_with_error_type():
+    from swarm.memory.store import MemoryStore
+
+    captured = {}
+
+    class _FakeCur:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = list(params)
+        async def fetchall(self):
+            return []
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCur()
+
+    async def _run():
+        store = MemoryStore()
+        store._conn = _FakeConn()
+        store._embed_fn = AsyncMock(return_value=[[0.1, 0.2, 0.3, 0.4]])
+        await store.query_mistakes("p", "x is None", top_k=1, error_type="integration_failure")
+
+    asyncio.run(_run())
+    params = captured["params"]
+    # 占位符顺序：select(vector) → where(project_id) → error_type → order by(vector) → limit
+    assert len(params) == 5, params
+    assert params[0].startswith("[") and params[3].startswith("["), "两个 %s::vector 位都必须是向量串"
+    assert params[1] == "p"
+    assert params[2] == "integration_failure", "error_type 必须绑到 AND error_type=%s（而非 ORDER BY 的向量位）"
+    assert params[4] == 1
+
+
 # ── P1-DEBT-03：错题重现/成功复用强化已有记录（occurrence_count++/reuse_count++） ──
 def test_reinforce_mistake_increments_existing_on_high_similarity():
     from swarm.brain.learn_store import _maybe_reinforce_mistake

@@ -424,25 +424,39 @@ async def _handle_post_run(
             })
             return
 
-    # P0-3：confirm 节点对非法计划返回 REJECT（auto_accept fail-fast）会路由到 END，
-    # 这条路径不经 deliver/learn_failure，若按"正常结束"无脑标 DONE 会把"计划非法
-    # 自动失败"误报成成功（task 0f93f1fc 类场景）。这里在标 DONE 前拦截非法终态。
+    # P1-DEBT-07 根因修复（终态判定与图路由同源）：
+    # human_decision 是图 after_confirm/after_deliver 路由到失败分支（END/LEARN_FAILURE）
+    # 的【权威信号】，由 confirm/deliver 节点直接产出，一路保留到 END，不被后续节点污染。
+    # 原 runner 只拦"plan_invalid"或"REJECT+confirm_reason"（仅 CONFIRM 来源），
+    # 漏了 DELIVER 阶段的 REJECT（虚假前提阻断 / handle_failure escalate）——这些走
+    # DELIVER→LEARN_FAILURE，confirm_reason 为空、verification_failure 也常为空，
+    # 于是落到下方 gates 复核；而 gates 看的 l2_passed 在 BrainState last-write-wins
+    # （P1-DEBT-06）下会被回填污染成 True → 误判可放行 → 假 DONE（task 69d34b1b 实证：
+    # 走 LEARN_FAILURE、human_decision=REJECT、0 产出，却落 status=DONE）。
+    # 修法：只要终态 human_decision==REJECT，一律判失败终态，与图路由严格同源。
     _hd = state.get("human_decision")
     _hd_val = _hd.value if hasattr(_hd, "value") else str(_hd or "")
     _vf = state.get("verification_failure")
-    if _vf == "plan_invalid" or (_hd_val == HumanDecision.REJECT.value and state.get("confirm_reason")):
+    _is_reject = _hd_val == HumanDecision.REJECT.value
+    if _vf == "plan_invalid" or _is_reject:
         issues = state.get("plan_validation_issues") or []
-        reason = "; ".join(issues) or "执行计划自动校验未通过，已 fail-fast 终止"
-        logger.warning("[RUNNER] 任务 %s 因计划非法 fail-fast 终止: %s", task_id, reason)
+        # 归因优先级：plan 校验问题 > deliver 自动拒绝原因 > confirm 原因 > 兜底
+        reason = (
+            "; ".join(issues)
+            or state.get("deliver_auto_reject_reason")
+            or state.get("confirm_reason")
+            or "任务未达成功终态，已 fail-fast 终止"
+        )
+        logger.warning("[RUNNER] 任务 %s REJECT/非法终态 fail-fast: %s", task_id, reason)
         _rec = store.get_task(task_id) or {}
         store.update_task(task_id, status="FAILED")
         _emit_task_notification(task_id, _rec, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
               project_id=_rec.get("project_id"),
-              error=f"plan_invalid: {reason}"[:300])
+              error=f"rejected: {reason}"[:300])
         await _emit(queue, {
             "step": "error", "status": "error",
-            "message": f"计划校验未通过，已终止：{reason}",
+            "message": f"任务未达成功终态，已终止：{reason}",
             "mode": "brain", "progress": -1,
         })
         return

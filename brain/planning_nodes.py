@@ -739,53 +739,97 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         # 阶段1 没给模块 → 退回单次（小需求或 LLM 没按格式）
         return stage1, stage1.get("file_plan", []) or [], fact_issues, contract
 
-    # ── 阶段2：按模块逐个产出 file_plan（每次短输出）──
-    all_file_plan: list[dict] = []
+    # ── 阶段2：按模块并行产出 file_plan（每次短输出）──
+    # P1-DEBT-12 修复（并行 + 双护栏）：
+    #   ① 并行：各模块只读阶段1 已定的 architecture/data_model（共享契约在阶段1 已 pop，
+    #     模块间在阶段2 无数据依赖），故可 asyncio.gather 并发。Semaphore 限并发=3
+    #     （单云端 key 友好，防限流/KV 压满）。
+    #   ② 单模块 500s 超时（asyncio.wait_for）——防某模块 LLM hang。有超时托底，并行最坏
+    #     封顶 = ceil(N/并发)×500s，正常一波 ~500s 即过，远优于串行累加。
+    #   ③ 失败/超时模块记入 failed_modules 并硬告警（ERROR）——非静默跳过，便于事实核验对账。
+    # 产出顺序：gather 保序返回，按模块原始顺序聚合 file_plan，保证稳定可复现。
+    import asyncio as _asyncio
+
     mod_total = len(modules)
-    for mi, mod in enumerate(modules, start=1):
-        if not isinstance(mod, dict):
-            continue
+    _STAGE2_MODULE_TIMEOUT = 500.0  # 秒/模块
+    _STAGE2_CONCURRENCY = 3         # 单云端 key 友好的并发上限
+    _sem = _asyncio.Semaphore(_STAGE2_CONCURRENCY)
+
+    async def _gen_one_module(mi: int, mod: dict) -> dict:
+        """产出单个模块的 file_plan。返回 {idx,name,file_plan,error}。"""
         mod_name = mod.get("name") or f"module-{mi}"
         _tm = _time.monotonic()
-        try:
-            resp2 = await llm.ainvoke([
-                {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
-                {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
-                    task_description=task_desc[:2000],
-                    architecture=str(architecture)[:1500],
-                    data_model=str(data_model)[:2500],
-                    project_facts=project_facts,
-                    mod_idx=mi, mod_total=mod_total,
-                    mod_name=mod_name,
-                    mod_responsibility=mod.get("responsibility", ""),
-                    mod_est_files=mod.get("est_files", "?"),
-                )},
-            ])
-            r2 = _parse_json_from_llm(resp2.content)
-            fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
-            # 确保 module 字段（小模型/LLM 可能漏填）
-            for item in fp:
-                if isinstance(item, dict) and not item.get("module"):
-                    item["module"] = mod_name
-            all_file_plan.extend(fp)
-            logger.info(
-                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs",
-                mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 产出失败（降级跳过）: %s",
-                mi, mod_total, mod_name, exc,
-            )
+        async with _sem:
+            try:
+                resp2 = await _asyncio.wait_for(
+                    llm.ainvoke([
+                        {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
+                        {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
+                            task_description=task_desc[:2000],
+                            architecture=str(architecture)[:1500],
+                            data_model=str(data_model)[:2500],
+                            project_facts=project_facts,
+                            mod_idx=mi, mod_total=mod_total,
+                            mod_name=mod_name,
+                            mod_responsibility=mod.get("responsibility", ""),
+                            mod_est_files=mod.get("est_files", "?"),
+                        )},
+                    ]),
+                    timeout=_STAGE2_MODULE_TIMEOUT,
+                )
+                r2 = _parse_json_from_llm(resp2.content)
+                fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
+                for item in fp:
+                    if isinstance(item, dict) and not item.get("module"):
+                        item["module"] = mod_name
+                logger.info(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs",
+                    mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
+                )
+                return {"idx": mi, "name": mod_name, "file_plan": fp, "error": None}
+            except _asyncio.TimeoutError:
+                logger.error(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 超时 >%.0fs（硬告警，该模块文件丢失）",
+                    mi, mod_total, mod_name, _STAGE2_MODULE_TIMEOUT,
+                )
+                return {"idx": mi, "name": mod_name, "file_plan": [], "error": "timeout"}
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 产出失败（硬告警，该模块文件丢失）: %s",
+                    mi, mod_total, mod_name, exc,
+                )
+                return {"idx": mi, "name": mod_name, "file_plan": [], "error": str(exc)[:200]}
+
+    _valid = [(mi, mod) for mi, mod in enumerate(modules, start=1) if isinstance(mod, dict)]
+    _results = await _asyncio.gather(*[_gen_one_module(mi, mod) for mi, mod in _valid])
+    # gather 保序：按模块原始顺序聚合，保证 file_plan 稳定可复现
+    _results.sort(key=lambda r: r["idx"])
+
+    all_file_plan: list[dict] = []
+    failed_modules: list[dict] = []
+    for r in _results:
+        if r["error"]:
+            failed_modules.append({"name": r["name"], "idx": r["idx"], "reason": r["error"]})
+        else:
+            all_file_plan.extend(r["file_plan"])
+
+    if failed_modules:
+        _failed_names = [m["name"] for m in failed_modules]
+        logger.error(
+            "[TECH_DESIGN-STAGE2] ⚠ %d/%d 模块产出失败 %s——file_plan 不完整，"
+            "下游事实核验/计划校验应据此对账，勿当成功",
+            len(failed_modules), mod_total, _failed_names,
+        )
 
     result = {
         "architecture": architecture, "data_model": data_model,
         "stack": stage1.get("stack", {}), "modules": modules,
         "file_plan": all_file_plan, "fact_issues": fact_issues,
+        "stage2_failed_modules": failed_modules,
     }
     logger.info(
-        "[TECH_DESIGN-STAGED] 两阶段完成：%d 模块 → 合计 %d 文件",
-        mod_total, len(all_file_plan),
+        "[TECH_DESIGN-STAGED] 两阶段完成：%d 模块（%d 失败，并发=%d）→ 合计 %d 文件",
+        mod_total, len(failed_modules), _STAGE2_CONCURRENCY, len(all_file_plan),
     )
     return result, all_file_plan, fact_issues, contract
 
