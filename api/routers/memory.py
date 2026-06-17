@@ -71,8 +71,9 @@ class ProfileUpdateRequest(BaseModel):
 
 
 @router.get("/api/projects/{project_id}/memories/mistakes", tags=["记忆"])
-async def list_mistakes(project_id: str):
+async def list_mistakes(project_id: str, request: Request):
     """获取项目错题列表"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03：防跨项目读
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -164,8 +165,9 @@ async def delete_mistake(project_id: str, mid: int, request: Request):
 
 
 @router.get("/api/projects/{project_id}/memories/successes", tags=["记忆"])
-async def list_successes(project_id: str):
+async def list_successes(project_id: str, request: Request):
     """获取项目成功模式列表"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03：防跨项目读
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -234,8 +236,9 @@ async def delete_success(project_id: str, sid: int, request: Request):
 
 
 @router.get("/api/projects/{project_id}/memories/summaries", tags=["记忆"])
-async def list_summaries(project_id: str):
+async def list_summaries(project_id: str, request: Request):
     """获取项目任务摘要列表"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03：防跨项目读
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 

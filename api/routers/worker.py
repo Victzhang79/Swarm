@@ -56,8 +56,10 @@ async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Requ
 
 # ─── Phase 0: GET /api/worker/{run_id}/stream ───
 @router.get("/api/worker/{run_id}/stream", tags=["Worker"])
-async def stream_worker_run(run_id: str):
+async def stream_worker_run(run_id: str, request: Request):
     """SSE 订阅 Standalone Worker 进度"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # P0-SEC-03：worker 进度流至少需认证（run_id 非项目映射）
     from swarm.worker.runner import get_worker_queue, register_worker_queue
 
     queue = get_worker_queue(run_id) or register_worker_queue(run_id)

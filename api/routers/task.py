@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
-from swarm.api._shared import ApplyDiffRequest, _require_perm
+from swarm.api._shared import ApplyDiffRequest, _require_perm, _require_user
 
 router = APIRouter()
 
@@ -53,8 +53,9 @@ class ApproveTaskRequest(BaseModel):
 
 
 @router.get("/api/projects/{project_id}/tasks", tags=["任务管理"])
-async def list_tasks(project_id: str):
+async def list_tasks(project_id: str, request: Request):
     """获取项目下的所有任务"""
+    _require_perm(request, "task:read", project_id)  # P0-SEC-03：防跨项目读任务列表
     loop = asyncio.get_running_loop()
     # 确认项目存在
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
@@ -304,11 +305,16 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
 # ─── 9. GET /api/tasks/{task_id} — 任务详情 ──────
 # 注：/api/tasks/audit 必须在此【之前】注册，否则 'audit' 会被 {task_id} 捕获。
 @router.get("/api/tasks/audit", tags=["任务管理"])
-async def task_audit_endpoint(task_id: str = "", project_id: str = "", limit: int = 100):
+async def task_audit_endpoint(request: Request, task_id: str = "", project_id: str = "", limit: int = 100):
     """查询任务审计日志（append-only，含已删除任务的生命周期留痕）。
 
     解决可追溯性：即使任务/项目被硬删，仍能在此查到它的创建/删除记录与描述。
     """
+    # P0-SEC-03：至少需认证；按 project_id 查询时校验该项目 task:read（防跨项目审计读）。
+    if project_id:
+        _require_perm(request, "task:read", project_id)
+    else:
+        _require_user(request)
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(
         None,
@@ -384,7 +390,7 @@ async def cancel_task_endpoint(task_id: str, request: Request):
 
 
 @router.post("/api/tasks/{task_id}/retry", tags=["任务管理"])
-async def retry_task_endpoint(task_id: str, req: TaskRetryRequest | None = None):
+async def retry_task_endpoint(task_id: str, request: Request, req: TaskRetryRequest | None = None):
     """重跑失败/已取消/orphaned 任务"""
     from swarm.brain.runner import can_retry_task, register_task_queue, retry_task_background
 
@@ -392,6 +398,7 @@ async def retry_task_endpoint(task_id: str, req: TaskRetryRequest | None = None)
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
 
     allowed, reason = can_retry_task(task_id)
     if not allowed:
@@ -415,6 +422,7 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
     if task.get("status") != "POOLED":
         raise HTTPException(
             status_code=409,
@@ -633,12 +641,13 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
 
 # ─── 11. POST /api/tasks/{task_id}/revise — 审核修订 ─
 @router.post("/api/tasks/{task_id}/revise", tags=["任务管理"])
-async def revise_task(task_id: str, req: TaskReviseRequest):
+async def revise_task(task_id: str, request: Request, req: TaskReviseRequest):
     """审核修订 — resume Brain (revise + feedback)"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
 
     from swarm.brain.runner import register_task_queue, resume_task_background
 
@@ -661,12 +670,13 @@ async def revise_task(task_id: str, req: TaskReviseRequest):
 
 # ─── 12. POST /api/tasks/{task_id}/reject — 审核拒绝 ─
 @router.post("/api/tasks/{task_id}/reject", tags=["任务管理"])
-async def reject_task(task_id: str):
+async def reject_task(task_id: str, request: Request):
     """审核拒绝 — resume Brain (reject)"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
 
     from swarm.brain.runner import register_task_queue, resume_task_background
 
@@ -710,6 +720,12 @@ async def submit_clarify(task_id: str, request: Request):
 
     Body: {"answers": {"0": "...", "1": "..."}} 逐条回答，或 {"action": "skip"} 整体跳过。
     """
+    # P0-SEC-03：澄清答复会推进任务规划，须 task:write + 成员资格。
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))
     body = await request.json()
     if body.get("action") == "skip":
         payload: dict = {"action": "skip"}
@@ -729,6 +745,12 @@ async def submit_design_review(task_id: str, request: Request):
 
     Body: {"decision": "approve"} 通过，或 {"decision": "reject", "feedback": "..."} 打回重做。
     """
+    # P0-SEC-03：评审决策推进规划，须 task:write + 成员资格。
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))
     body = await request.json()
     decision = body.get("decision")
     if decision not in ("approve", "reject"):

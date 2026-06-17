@@ -70,7 +70,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -1156,8 +1156,14 @@ def _fetch_sandbox_list_from_server() -> list[dict]:
 
 
 @app.get("/api/stats", tags=["系统"])
-async def get_stats(project_id: str | None = None):
+async def get_stats(request: Request, project_id: str | None = None):
     """任务统计：总量、完成/失败/取消、Accept 率、平均耗时、token 估算、学习趋势、最近 10 条"""
+    # P0-SEC-03：项目级统计须 project:read（防跨项目）；全局统计须认证用户。
+    from swarm.api._shared import _require_perm, _require_user
+    if project_id:
+        _require_perm(request, "project:read", project_id)
+    else:
+        _require_user(request)
     loop = asyncio.get_running_loop()
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
@@ -1180,8 +1186,10 @@ async def get_stats(project_id: str | None = None):
 
 
 @app.get("/api/projects/{project_id}/stats", tags=["系统"])
-async def get_project_stats(project_id: str):
+async def get_project_stats(project_id: str, request: Request):
     """项目 scoped 任务统计"""
+    from swarm.api._shared import _require_perm
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _validate_project, project_id)
     stats = await loop.run_in_executor(None, lambda: store.get_task_stats(project_id))

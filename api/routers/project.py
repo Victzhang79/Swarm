@@ -199,8 +199,9 @@ async def delete_project(project_id: str, request: Request):
 
 # ─── 5. POST /api/projects/{project_id}/preprocess — 手动触发预处理 ─
 @router.post("/api/projects/{project_id}/preprocess", tags=["项目管理"])
-async def trigger_preprocess(project_id: str):
+async def trigger_preprocess(project_id: str, request: Request):
     """手动触发/重新触发项目预处理"""
+    _require_perm(request, "project:write", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     try:
         project = await loop.run_in_executor(None, _app.store.get_project, project_id)
@@ -239,8 +240,9 @@ async def trigger_preprocess(project_id: str):
 
 # ─── 6b. GET /api/projects/{project_id}/preprocess/status — 预处理状态快照 ─
 @router.get("/api/projects/{project_id}/preprocess/status", tags=["项目管理"])
-async def get_preprocess_status(project_id: str):
+async def get_preprocess_status(project_id: str, request: Request):
     """返回当前预处理进度（非 SSE，供 Tab 打开时加载）"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
     progress = await loop.run_in_executor(None, _app.store.get_progress, project_id)
@@ -253,12 +255,14 @@ async def get_preprocess_status(project_id: str):
 
 # ─── 6. GET /api/projects/{project_id}/preprocess/progress — SSE 预处理进度流 ─
 @router.get("/api/projects/{project_id}/preprocess/progress", tags=["项目管理"])
-async def stream_preprocess_progress(project_id: str):
+async def stream_preprocess_progress(project_id: str, request: Request):
     """SSE 流式推送项目预处理进度
 
     事件格式: event: progress, data: {phase, phase_progress, message, ...}
     当 phase 为 complete 或 error 时发送后关闭流。
+    认证：EventSource 不能带头，中间件从 ?token= 读取；此处补 project:read 授权。
     """
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
 
     async def event_generator():
         last_phase = None

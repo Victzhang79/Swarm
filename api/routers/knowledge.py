@@ -38,8 +38,9 @@ class NormUpdateRequest(BaseModel):
 
 
 @router.get("/api/projects/{project_id}/knowledge/overview", tags=["知识库"])
-async def knowledge_overview(project_id: str):
+async def knowledge_overview(project_id: str, request: Request):
     """项目知识库概览：预处理结果 + 索引统计"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03：防跨项目读知识库
     import httpx
 
     from swarm.config.settings import get_config
@@ -127,8 +128,9 @@ async def knowledge_overview(project_id: str):
 
 
 @router.get("/api/projects/{project_id}/knowledge/symbols", tags=["知识库"])
-async def search_symbols(project_id: str, q: str, limit: int = 30):
+async def search_symbols(project_id: str, q: str, request: Request, limit: int = 30):
     """Layer A — 按符号名模糊搜索"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     from swarm.config.settings import get_config
     from swarm.knowledge.structure_index import StructureIndexer
 
@@ -152,8 +154,9 @@ async def search_symbols(project_id: str, q: str, limit: int = 30):
 
 
 @router.get("/api/projects/{project_id}/knowledge/semantic", tags=["知识库"])
-async def search_semantic_chunks(project_id: str, q: str, limit: int = 20):
+async def search_semantic_chunks(project_id: str, q: str, request: Request, limit: int = 20):
     """Layer B — 语义 chunk 检索（Qdrant）"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     from swarm.config.settings import get_config
     from swarm.knowledge.semantic_index import SemanticIndexer
 
@@ -200,8 +203,10 @@ class KnowledgeRetrieveRequest(BaseModel):
 async def knowledge_retrieve_experiment(
     project_id: str,
     req: KnowledgeRetrieveRequest,
+    request: Request,
 ):
     """按任务检索知识库+记忆，返回 Brain 编排将注入的 prompt 预览"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     from swarm.knowledge.service import DEFAULT_BRAIN_LIMITS, experiment_retrieval
 
     loop = asyncio.get_running_loop()
@@ -221,10 +226,12 @@ async def knowledge_retrieve_experiment(
 @router.get("/api/projects/{project_id}/knowledge/norms", tags=["知识库"])
 async def list_norms(
     project_id: str,
+    request: Request,
     tag: str | None = None,
     active_only: bool = True,
 ):
     """获取项目规范列表"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -322,8 +329,9 @@ async def delete_norm(project_id: str, norm_id: int, request: Request):
 
 
 @router.get("/api/projects/{project_id}/knowledge/behavior-hotspots", tags=["知识库"])
-async def list_behavior_hotspots(project_id: str, top_k: int = 20, days: int | None = None):
+async def list_behavior_hotspots(project_id: str, request: Request, top_k: int = 20, days: int | None = None):
     """Layer D — 高频修改文件排行（行为热点）"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -374,6 +382,7 @@ async def list_behavior_hotspots(project_id: str, top_k: int = 20, days: int | N
 @router.get("/api/projects/{project_id}/knowledge/consistency", tags=["知识库"])
 async def knowledge_consistency_check(project_id: str, request: Request, repair: bool = False):
     """ConsistencyChecker — 比对工作区与 Layer A 索引；repair=true 时入队修复。"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03：读路径也需授权
     if repair:
         _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
@@ -459,8 +468,9 @@ async def git_knowledge_webhook(project_id: str, request: Request, payload: GitW
 # >=10 被视为永久失败不再自动重试，但此前无 API 暴露、无法手动恢复——运维盲区。
 
 @router.get("/api/projects/{project_id}/knowledge/pending-embeddings", tags=["知识库"])
-async def list_pending_embeddings(project_id: str):
+async def list_pending_embeddings(project_id: str, request: Request):
     """列出该项目待补 embedding 的文件，含 dead(retry_count>=10 永久失败) 标记。"""
+    _require_perm(request, "project:read", project_id)  # P0-SEC-03
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
