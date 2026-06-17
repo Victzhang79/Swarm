@@ -107,3 +107,26 @@
   踩坑留记：LangGraph interrupt 节点 resume 会从头重跑——interrupt 前的 LLM 调用须确定，
   否则二次判断会丢用户答复（测试用计数器 mock 复现过假失败，确定性 mock 即通过）。
 
+
+## 走查报告 2026-06-17 — 中/低危待办（严重+高危已修，见 swarm_走查报告 勾选）
+
+> 已修：S1-S5 全部、H1-H9 全部、M4(pool min>max)、M7(项目根敏感目录黑名单)。
+> 下列为中危需较大改动/观测性优化 + 低危清理，排期处理：
+
+### 中危（M）
+- **M1** worker/executor.py:1873-1909 失败测试闸门在沙箱 kill 后本地 shell=True 跑，异常 `return True` 当 PASS → 未修 bug 被误报已修。修法：本地降级路径异常应 return False(保守失败)，非 Python 栈不在本地跑。
+- **M2** runner.py:40-45 把 SWARM_WORKSPACE_ROOT 写进进程级 os.environ，并发跑不同项目互相覆盖工作根。修法：改 ContextVar 或随任务传参（同 S1 思路）。
+- **M3** worker 大量同步 subprocess.run(git baseline/diff/reset、l1_pipeline npx tsc)跑在事件循环线程，并发互相阻塞；_reset_scope_to_head 持 flock 卡整进程。修法：to_thread 包裹 + 细化锁粒度。
+- **M5** config/secret_store.py:151-164 decrypt 失败(如 key 轮换)与"不存在"同等当 None 静默回退 .env 旧值，难排查。修法：区分 decrypt 异常与 miss，前者告警。
+- **M6** 多处 detail=f"...{str(e)}" 把内部异常/路径/DB 错误透给客户端(sandbox.py:245 等)。修法：对外返回泛化消息，详情仅记日志。
+- **M8** /api/auth/login 无限流/锁定，配合默认账户可暴破；auth/store.py:294 用户不存在跳过 PBKDF2 → 计时侧信道枚举用户名。修法：登录失败计数+锁定；用户不存在也跑等价耗时 PBKDF2(常量时间)。
+
+### 低危 / 清理
+- brain/merge_engine.py:26 auto_resolved 死字段；:413-441 并发插入顺序不确定(当干净合并)。
+- worker/sandbox.py:1251-1281 遗留 SandboxPool(带泄漏)应删除。
+- models/prober.py:162 给每个模型发 ~1.2MB 探测体，被接受时实际计费 → 缩小探测体。
+- api/app.py 用已废弃 @app.on_event，未来 FastAPI 会移除 → 迁移 lifespan。
+
+### 已有 WALKTHROUGH_REPORT.md 中仍未修(knowledge/memory/project 域)
+随机向量嵌入兜底、hash() 做 Qdrant point ID(PYTHONHASHSEED 随机化)、L5 批量衰减漏 occurrence_boost、retrieve_for_brain 检索副作用自增权重(违 CQRS)、retry_pending_embeddings 无自动调度。
+

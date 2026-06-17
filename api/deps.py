@@ -19,6 +19,7 @@ def get_current_user(request: Request) -> SwarmUser:
                 username="dev",
                 display_name="Dev",
                 global_role=Role.ADMIN.value,
+                must_change_password=False,
             )
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user

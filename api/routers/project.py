@@ -69,10 +69,29 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     from swarm.config.settings import PROJECT_ROOT
 
     resolved_path = (req.path or "").strip()
+
+    # M7 修复：拒绝把项目根指向系统敏感目录（后续 apply-diff 会写入该目录）。
+    # 不强制 containment 到 workspace（用户合法用例就是指向本机已有项目），
+    # 但黑名单系统关键目录，避免误指/恶意指向 /etc /usr /bin 等。
+    def _reject_sensitive(p: str) -> None:
+        if not p:
+            return
+        norm = os.path.realpath(os.path.abspath(p))
+        sensitive = ("/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev",
+                     "/boot", "/var/run", "/lib", "/lib64", "/root")
+        for s in sensitive:
+            if norm == s or norm.startswith(s + "/"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"拒绝将项目根指向系统敏感目录: {norm}",
+                )
+
+    _reject_sensitive(resolved_path)
     if req.greenfield:
         if not resolved_path:
             safe = _re.sub(r"[^A-Za-z0-9_.-]+", "-", req.name).strip("-") or project_id[:8]
             resolved_path = str((PROJECT_ROOT / "workdir" / safe).resolve())
+        _reject_sensitive(resolved_path)
         try:
             os.makedirs(resolved_path, exist_ok=True)
         except OSError as e:

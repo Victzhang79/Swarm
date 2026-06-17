@@ -192,10 +192,13 @@ async def test_config():
 async def update_config(request: Request):
     """更新配置 — 写入 .env 文件并重新加载
 
+    S4 修复：补鉴权——此端点把任意 KEY=VALUE 写进 .env，可被滥用篡改 base_url 钓 key。
+
     接收格式:
     - {"config": {"siliconflow_api_key": "...", ...}}
     - {"siliconflow_api_key": "...", ...}
     """
+    _require_perm(request, "config:write")
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
@@ -294,6 +297,7 @@ async def get_routing():
 @router.put("/api/routing", tags=["配置"])
 async def update_routing(request: Request):
     """更新模型路由表配置 — 写入 .env 并重载"""
+    _require_perm(request, "config:write")  # S4 修复：补鉴权
     body = await request.json()
 
     # 兼容前端旧格式 { routes: { tiers: "..." } }
@@ -403,6 +407,7 @@ async def update_model_providers(request: Request):
     }
     api_key 为脱敏值(***)的 provider 会保留原 key（不覆盖）。
     """
+    _require_perm(request, "config:write")  # S4 修复：补鉴权
     import json as _json
 
     body = await request.json()
@@ -585,6 +590,7 @@ async def update_kb_embed_rerank(request: Request):
     api_key 为 *** 或省略 → 保留原 key（不覆盖）。
     返回 dim_changed 提示：embed 维度可能变化时（模型变了）提醒重新预处理。
     """
+    _require_perm(request, "config:write")  # S4 修复：补鉴权
     from swarm.config import secret_store
     from swarm.config.settings import KnowledgeConfig
     from swarm.knowledge.embed_rerank_config import SECRET_EMBED_KEY, SECRET_RERANK_KEY
@@ -717,6 +723,7 @@ async def update_notify_channels(request: Request):
     Body: {"channels": [{id,type,label,webhook_url,enabled,events,user_id}, ...]}
     webhook_url 为脱敏值(含 …)或空 → 保留原 url（不覆盖）。
     """
+    _require_perm(request, "config:write")  # S4 修复：补鉴权
     import json as _json
     body = await request.json()
     if not isinstance(body, dict) or not isinstance(body.get("channels"), list):

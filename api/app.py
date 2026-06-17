@@ -106,6 +106,18 @@ def _validate_project(project_id: str) -> None:
 _PROJECT_ROOT = Path(__file__).parent.parent
 
 logger = logging.getLogger(__name__)
+
+# H9 修复：startup 长生命周期后台任务强引用集合，防被 GC 静默丢失。
+_APP_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro):
+    """持引用地 create_task（H9）：避免 asyncio 弱引用下任务被回收。"""
+    import asyncio as _a
+    _t = _a.create_task(coro)
+    _APP_BG_TASKS.add(_t)
+    _t.add_done_callback(_APP_BG_TASKS.discard)
+    return _t
 _LOG_FILE = _PROJECT_ROOT / "swarm.log"
 
 
@@ -704,7 +716,7 @@ async def on_startup():
         await init_coordination_backend()
     except Exception as e:
         logger.warning(f"协调后端初始化跳过: {e}")
-    asyncio.create_task(_run_schedulers_with_leadership())
+    _spawn_bg(_run_schedulers_with_leadership())
     # 先清扫上一进程残留的孤儿沙箱，再启动池 reaper（顺序重要：清扫在池接管前）
     _sweep_startup_orphans()
     _start_sandbox_pool_reaper()
@@ -906,7 +918,7 @@ async def _start_consistency_scheduler() -> None:
                 logger.warning("ConsistencyChecker daily run failed: %s", exc)
 
     try:
-        asyncio.create_task(_loop())
+        _spawn_bg(_loop())
         logger.info("Knowledge ConsistencyChecker scheduled (daily ~04:00)")
     except Exception as exc:
         logger.warning("Failed to start ConsistencyChecker: %s", exc)
@@ -976,7 +988,7 @@ async def _start_memory_decay_scheduler() -> None:
         mem_store = MemoryStore()
         await mem_store.connect()
         decay = MemoryDecay(mem_store)
-        asyncio.create_task(decay.start_daily_decay())
+        _spawn_bg(decay.start_daily_decay())
         logger.info("L5 memory decay scheduler started (daily at 03:00)")
     except Exception as exc:
         logger.warning("Failed to start L5 memory decay scheduler: %s", exc)

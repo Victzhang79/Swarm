@@ -9,6 +9,7 @@ run_command 使用白名单制，不在白名单中的命令会被拒绝。
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -27,47 +28,48 @@ def _worker_config() -> WorkerConfig:
     return get_config().worker
 
 
-# ── 远程沙箱上下文 ──
-_current_sandbox: Any | None = None
-_current_sandbox_manager: Any | None = None
+# ── 远程沙箱上下文（ContextVar：并发 worker 间隔离，杜绝跨 worker 串味，S1 修复）──
+# 原为模块级全局变量，asyncio.gather 真并发时 Worker B 的 set 会盖掉 Worker A，
+# 导致 A 的 build/test/L1/文件写入打到 B 的沙箱、先结束者 clear 抹掉别人上下文。
+# ContextVar 在每个 asyncio task 有独立副本，参照 tools/scope_guard.py 的正确做法。
+import contextvars
 
-# ── 每任务额外命令白名单（harness 注入）——
-# WorkerExecutor 启动时按子任务 harness 设置，让本任务的构建/测试/验收命令可执行。
-_extra_whitelist: list[str] = []
+_sandbox_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "swarm_current_sandbox", default=None)
+_sandbox_manager_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "swarm_current_sandbox_manager", default=None)
+_extra_whitelist_var: contextvars.ContextVar[list[str]] = contextvars.ContextVar(
+    "swarm_extra_whitelist", default=[])
 
 
 def set_extra_whitelist(prefixes: list[str] | None) -> None:
     """设置当前 worker 的额外命令白名单（harness.extra_whitelist）。"""
-    global _extra_whitelist
-    _extra_whitelist = list(prefixes or [])
+    _extra_whitelist_var.set(list(prefixes or []))
 
 
 def get_extra_whitelist() -> list[str]:
-    return list(_extra_whitelist)
+    return list(_extra_whitelist_var.get())
 
 
 def clear_extra_whitelist() -> None:
-    global _extra_whitelist
-    _extra_whitelist = []
+    _extra_whitelist_var.set([])
 
 
 def set_sandbox_context(sandbox: Any, manager: Any) -> None:
-    """设置全局沙箱上下文（WorkerExecutor 调用）"""
-    global _current_sandbox, _current_sandbox_manager
-    _current_sandbox = sandbox
-    _current_sandbox_manager = manager
+    """设置沙箱上下文（WorkerExecutor 调用，按 asyncio task 隔离）"""
+    _sandbox_var.set(sandbox)
+    _sandbox_manager_var.set(manager)
 
 
 def get_sandbox_context() -> tuple[Any | None, Any | None]:
     """获取当前沙箱上下文"""
-    return _current_sandbox, _current_sandbox_manager
+    return _sandbox_var.get(), _sandbox_manager_var.get()
 
 
 def clear_sandbox_context() -> None:
     """清除沙箱上下文"""
-    global _current_sandbox, _current_sandbox_manager
-    _current_sandbox = None
-    _current_sandbox_manager = None
+    _sandbox_var.set(None)
+    _sandbox_manager_var.set(None)
 
 
 def _is_command_allowed(command: str, whitelist: list[str]) -> tuple[bool, str]:
@@ -83,6 +85,52 @@ def _is_command_allowed(command: str, whitelist: list[str]) -> tuple[bool, str]:
     for allowed in whitelist:
         if cmd_stripped == allowed or cmd_stripped.startswith(allowed + " "):
             return True, allowed
+    return False, ""
+
+
+# ── H7 修复：shell 元字符注入检测 ──
+# 白名单前缀检查无法阻止 'mvn test; rm -rf ~' 这类拼接命令，
+# 因为 '; rm -rf ~' 躲在前缀匹配之后。在执行前额外检测危险元字符。
+_SHELL_INJECTION_RE = re.compile(
+    r"""(?x)        # verbose mode
+    ;               # command separator
+    | \|            # pipe
+    | &             # background / AND / OR
+    | \$\(          # command substitution $(...)
+    | `             # backtick command substitution
+    | [><]          # redirection
+    | \n            # newline (another command separator)
+    """
+)
+
+_SAFE_CHARS_PATTERN = re.compile(r"""^[a-zA-Z0-9 ./_\-:=,.~@#%^+\[\]]+$""")
+
+
+def _has_shell_injection(command: str) -> tuple[bool, str]:
+    """检测命令中是否包含危险的 shell 元字符。
+
+    Returns:
+        (has_injection, reason) — has_injection 为 True 表示命令应被拒绝，
+        reason 为命中的危险字符/模式描述。
+    """
+    # 快速路径：只含安全字符的命令无需正则扫描
+    if _SAFE_CHARS_PATTERN.match(command):
+        return False, ""
+
+    # 逐项检测危险模式，返回第一个命中的描述（帮助诊断）
+    for match in _SHELL_INJECTION_RE.finditer(command):
+        ch = match.group()
+        descriptions = {
+            ";": "分号(命令分隔符)",
+            "|": "管道符",
+            "&": "与/后台符",
+            "$(": "命令替换 $(...)",
+            "`": "反引号命令替换",
+            ">": "重定向 >",
+            "<": "重定向 <",
+            "\n": "换行(命令分隔符)",
+        }
+        return True, descriptions.get(ch, f"危险元字符 {ch!r}")
     return False, ""
 
 
@@ -214,6 +262,11 @@ def run_command(command: str, timeout: int = 120) -> str:
             f"如需执行该命令，请联系管理员将其加入 SWARM_WORKER_COMMAND_WHITELIST。"
         )
 
+    # H7 修复：白名单通过后，检测 shell 元字符注入
+    has_injection, reason = _has_shell_injection(command)
+    if has_injection:
+        return f"⛔ 命令被拒绝：'{command}' 包含{reason}，可能存在 shell 注入风险。"
+
     return _run(command, timeout=timeout)
 
 
@@ -268,6 +321,11 @@ def run_compile(language: str = "auto", target: str = "") -> str:
             f"⛔ 编译命令被拒绝：'{cmd}' 不在白名单中。\n"
             f"允许的命令前缀：\n  - {whitelist_str}"
         )
+
+    # H7 修复：白名单通过后，检测 shell 元字符注入
+    has_injection, reason = _has_shell_injection(cmd)
+    if has_injection:
+        return f"⛔ 编译命令被拒绝：'{cmd}' 包含{reason}，可能存在 shell 注入风险。"
 
     return _run(cmd, timeout=180)
 
@@ -326,5 +384,10 @@ def run_tests(
             f"⛔ 测试命令被拒绝：'{cmd}' 不在白名单中。\n"
             f"允许的命令前缀：\n  - {whitelist_str}"
         )
+
+    # H7 修复：白名单通过后，检测 shell 元字符注入
+    has_injection, reason = _has_shell_injection(cmd)
+    if has_injection:
+        return f"⛔ 测试命令被拒绝：'{cmd}' 包含{reason}，可能存在 shell 注入风险。"
 
     return _run(cmd, timeout=timeout)

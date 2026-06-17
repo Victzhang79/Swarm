@@ -130,6 +130,16 @@ def _require_perm(request: Request, permission: str, project_id: str | None = No
     from swarm.auth.store import user_can_on_project
 
     user = _require_user(request)
+    # H6: 默认弱密码硬门槛 —— must_change_password=True 时只放行 auth/password 相关权限，
+    # 其余操作一律 423 Locked，防止未改密用户越权操作。
+    # 改密码端点(auth_change_password)使用 _require_user 而非 _require_perm，不会死锁。
+    if getattr(user, "must_change_password", False):
+        perm_prefix = permission.split(":")[0]
+        if perm_prefix not in ("auth", "password"):
+            raise HTTPException(
+                status_code=423,
+                detail="Password change required before proceeding",
+            )
     if not user_can_on_project(user, permission, project_id):
         raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
     return user

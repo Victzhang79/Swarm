@@ -20,6 +20,9 @@ from swarm.types import Confidence, SubTask, WorkerOutput
 
 logger = logging.getLogger(__name__)
 
+# H9 修复：fire-and-forget 后台任务强引用集合，防 asyncio 弱引用下被 GC。
+_BG_TASKS: set = set()
+
 
 def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) -> None:
     """跨子任务上下文传递：把前序已完成依赖子任务的产出注入后序子任务的 context_snippets。
@@ -120,7 +123,10 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
         import asyncio
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_run())
+            # H9 修复：持任务强引用 + 完成时移除，防 asyncio 弱引用下被 GC 静默丢失回灌
+            _t = loop.create_task(_run())
+            _BG_TASKS.add(_t)
+            _t.add_done_callback(_BG_TASKS.discard)
         except RuntimeError:
             pass
         logger.info("[DISPATCH] 事实库回灌：%d 个变更文件入队增量索引（子任务 %s）",
@@ -276,8 +282,9 @@ async def dispatch(state: BrainState) -> dict:
         "dispatch_remaining": dispatch_remaining,
         **worker_ctx,
     }
-    if failed_ids:
-        result["failed_subtask_ids"] = failed_ids
+    # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，
+    # 若仅非空时返回，上一轮失败列表会残留 → gates 误拒真正成功的运行。
+    result["failed_subtask_ids"] = failed_ids
     return result
 
 

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import atexit
+import asyncio
 import logging
 import os
 import threading
@@ -46,7 +47,12 @@ def _pool_size() -> tuple[int, int]:
         pmax = int(os.environ.get("SWARM_DB_POOL_MAX", "10"))
     except ValueError:
         pmax = 10
-    return max(0, pmin), max(1, pmax)
+    # M4 修复：保证 pmin ≤ pmax，否则 ConnectionPool(min>max) 启动即崩。
+    pmin = max(0, pmin)
+    pmax = max(1, pmax)
+    if pmin > pmax:
+        pmin = pmax
+    return pmin, pmax
 
 
 def _default_conn_str() -> str:
@@ -89,6 +95,15 @@ def sync_pool(conn_str: str | None = None) -> ConnectionPool:
 # ── 异步连接池（按连接串缓存）──────────────────────
 
 _async_pools: dict[str, AsyncConnectionPool] = {}
+_async_lock: "asyncio.Lock | None" = None
+
+
+def _get_async_lock() -> "asyncio.Lock":
+    # 惰性创建（避免 import 时无事件循环）。同一事件循环内单例即可。
+    global _async_lock
+    if _async_lock is None:
+        _async_lock = asyncio.Lock()
+    return _async_lock
 
 
 async def async_pool(conn_str: str | None = None) -> AsyncConnectionPool:
@@ -97,19 +112,25 @@ async def async_pool(conn_str: str | None = None) -> AsyncConnectionPool:
     pool = _async_pools.get(conn_str)
     if pool is not None:
         return pool
-    pmin, pmax = _pool_size()
-    pool = AsyncConnectionPool(
-        conninfo=conn_str,
-        min_size=pmin,
-        max_size=pmax,
-        kwargs={"autocommit": True},
-        open=False,
-        name="swarm-async",
-    )
-    await pool.open()
-    _async_pools[conn_str] = pool
-    logger.info("[db] async pool created (min=%d max=%d)", pmin, pmax)
-    return pool
+    # H4 修复：原无锁 check-then-act，两协程同时见 None 各建一池并 await open()，
+    # 一个被字典覆盖后永不关闭 → 连接池泄漏。加锁 + 锁内复查（照 sync_pool 做法）。
+    async with _get_async_lock():
+        pool = _async_pools.get(conn_str)
+        if pool is not None:
+            return pool
+        pmin, pmax = _pool_size()
+        pool = AsyncConnectionPool(
+            conninfo=conn_str,
+            min_size=pmin,
+            max_size=pmax,
+            kwargs={"autocommit": True},
+            open=False,
+            name="swarm-async",
+        )
+        await pool.open()
+        _async_pools[conn_str] = pool
+        logger.info("[db] async pool created (min=%d max=%d)", pmin, pmax)
+        return pool
 
 
 # ── 关闭（测试/进程退出）──────────────────────────

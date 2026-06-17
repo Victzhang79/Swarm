@@ -299,17 +299,18 @@ async def task_audit_endpoint(task_id: str = "", project_id: str = "", limit: in
 
 
 @router.get("/api/tasks/{task_id}", tags=["任务管理"])
-async def get_task(task_id: str):
+async def get_task(task_id: str, request: Request):
     """获取任务详情"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:read", task.get("project_id"))
     return {"task": jsonable_encoder(task)}
 
 
 @router.delete("/api/tasks/{task_id}", tags=["任务管理"])
-async def delete_task_endpoint(task_id: str, force: bool = False):
+async def delete_task_endpoint(task_id: str, request: Request, force: bool = False):
     """删除任务；force=true 时先取消运行中任务；orphaned 活跃任务可直接删除"""
     from swarm.brain.runner import (
         _ACTIVE_DB_STATUSES,
@@ -322,6 +323,7 @@ async def delete_task_endpoint(task_id: str, force: bool = False):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))
 
     status = task.get("status", "")
     if is_task_running(task_id):
@@ -339,7 +341,7 @@ async def delete_task_endpoint(task_id: str, force: bool = False):
 
 
 @router.post("/api/tasks/{task_id}/cancel", tags=["任务管理"])
-async def cancel_task_endpoint(task_id: str):
+async def cancel_task_endpoint(task_id: str, request: Request):
     """取消运行中任务，或将 orphaned 活跃任务标记为已取消"""
     from swarm.brain.runner import cancel_task, is_task_orphaned, is_task_running
 
@@ -347,6 +349,7 @@ async def cancel_task_endpoint(task_id: str):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))
 
     if not is_task_running(task_id) and not is_task_orphaned(task_id):
         status = task.get("status", "")
@@ -416,7 +419,7 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
 
 # ─── GET /api/tasks/{task_id}/logs — 该任务执行日志 ─
 @router.get("/api/tasks/{task_id}/logs", tags=["任务管理"])
-async def get_task_logs(task_id: str, limit: int = 500):
+async def get_task_logs(task_id: str, request: Request, limit: int = 500):
     """读取某任务的执行日志（从 swarm.log 按 [task=前8位] 过滤）。
 
     依赖统一日志系统的 task 上下文前缀（swarm.logging_config.bind/set_task_context）。
@@ -425,6 +428,7 @@ async def get_task_logs(task_id: str, limit: int = 500):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:read", task.get("project_id"))
 
     from swarm.logging_config import read_task_logs, resolve_log_path
 
@@ -443,7 +447,7 @@ async def get_task_logs(task_id: str, limit: int = 500):
 
 # ─── GET /api/tasks/{task_id}/logs/stream — 实时日志 SSE ─
 @router.get("/api/tasks/{task_id}/logs/stream", tags=["任务管理"])
-async def stream_task_logs(task_id: str):
+async def stream_task_logs(task_id: str, request: Request):
     """SSE 实时推送某任务的执行日志（tail swarm.log 按 [task=前8位] 过滤）。
 
     纯文件读，不触发任何任务执行。任务进入终态后自动结束流。
@@ -453,6 +457,7 @@ async def stream_task_logs(task_id: str):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:read", task.get("project_id"))
 
     from swarm.logging_config import TaskLogPoller
 
@@ -488,12 +493,13 @@ async def stream_task_logs(task_id: str):
 
 # ─── 10. POST /api/tasks/{task_id}/approve — 审核通过 ─
 @router.post("/api/tasks/{task_id}/approve", tags=["任务管理"])
-async def approve_task(task_id: str, req: ApproveTaskRequest | None = None):
+async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest | None = None):
     """审核通过 — 可选 apply diff + 增量知识更新，然后 resume Brain"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:write", task.get("project_id"))
 
     project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
     merged_diff = task.get("merged_diff") or ""
@@ -659,12 +665,16 @@ async def reject_task(task_id: str):
 
 
 @router.get("/api/tasks/{task_id}/planning", tags=["任务管理"])
-async def get_task_planning(task_id: str):
+async def get_task_planning(task_id: str, request: Request):
     """读取任务的规划过程产物（Q4 可追溯）：澄清问答 / 技术方案 / 评审决策 / 澄清后定级。
 
     任务详情页"规划过程"区用。无规划产物（微任务/轻量路径）时返回空。
     """
     loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:read", task.get("project_id"))
     artifacts = await loop.run_in_executor(
         None, lambda: _app.store.get_planning_artifacts(task_id)
     )

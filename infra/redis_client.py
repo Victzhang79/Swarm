@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,9 @@ class ModuleLock:
         self.module_key = module_key
         self.key = f"swarm:lock:{project_id}:{module_key}"
         self.ttl_sec = ttl_sec
-        self.token = f"{time.time()}"
+        # H8 修复：token 用 uuid 而非时间戳——同一时钟刻度两进程 token 会相同，
+        # 导致 B 能释放 A 持有的锁。uuid4 保证全局唯一。
+        self.token = uuid.uuid4().hex
         self._held = False
 
     def acquire(self) -> bool:
@@ -68,8 +71,13 @@ class ModuleLock:
             self._held = False
             return
         try:
-            if r.get(self.key) == self.token:
-                r.delete(self.key)
+            # H8 修复：get-then-del 非原子（两步间锁可能过期被他人获取，误删他人锁）。
+            # 用 Lua 脚本原子比对+删除：仅当 value==自己的 token 才删。
+            _release_lua = (
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end"
+            )
+            r.eval(_release_lua, 1, self.key, self.token)
         except Exception as exc:
             logger.debug("[ModuleLock] release: %s", exc)
         self._held = False

@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import swarm.api.app as _app
+from swarm.api._shared import _require_perm
 
 router = APIRouter()
 
@@ -251,8 +252,9 @@ async def list_norms(
 
 
 @router.post("/api/projects/{project_id}/knowledge/norms", tags=["知识库"])
-async def create_norm(project_id: str, req: NormCreateRequest):
+async def create_norm(project_id: str, request: Request, req: NormCreateRequest):
     """添加项目规范"""
+    _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -271,8 +273,9 @@ async def create_norm(project_id: str, req: NormCreateRequest):
 
 
 @router.put("/api/projects/{project_id}/knowledge/norms/{norm_id}", tags=["知识库"])
-async def update_norm(project_id: str, norm_id: int, req: NormUpdateRequest):
+async def update_norm(project_id: str, norm_id: int, request: Request, req: NormUpdateRequest):
     """编辑项目规范 — 只更新提供的字段"""
+    _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -298,8 +301,9 @@ async def update_norm(project_id: str, norm_id: int, req: NormUpdateRequest):
 
 
 @router.delete("/api/projects/{project_id}/knowledge/norms/{norm_id}", tags=["知识库"])
-async def delete_norm(project_id: str, norm_id: int):
+async def delete_norm(project_id: str, norm_id: int, request: Request):
     """删除项目规范"""
+    _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -368,8 +372,10 @@ async def list_behavior_hotspots(project_id: str, top_k: int = 20, days: int | N
 
 
 @router.get("/api/projects/{project_id}/knowledge/consistency", tags=["知识库"])
-async def knowledge_consistency_check(project_id: str, repair: bool = False):
+async def knowledge_consistency_check(project_id: str, request: Request, repair: bool = False):
     """ConsistencyChecker — 比对工作区与 Layer A 索引；repair=true 时入队修复。"""
+    if repair:
+        _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
@@ -394,8 +400,47 @@ class GitWebhookPayload(BaseModel):
 
 
 @router.post("/api/projects/{project_id}/knowledge/webhook/git", tags=["知识库"])
-async def git_knowledge_webhook(project_id: str, payload: GitWebhookPayload):
-    """Git push webhook → Layer A/B/D 增量更新（P2）。"""
+async def git_knowledge_webhook(project_id: str, request: Request, payload: GitWebhookPayload):
+    """Git push webhook → Layer A/B/D 增量更新（P2）。
+
+    S5 修复：webhook 由外部 git 系统调用（无用户登录态），不走 _require_perm，
+    改用 per-project HMAC 签名校验——请求头 X-Swarm-Signature: sha256=<hmac(secret, raw_body)>。
+    secret 存 secret_store（key=webhook_secret:<project_id>）。未配置 secret 时：
+      - RBAC 开启 → 拒绝（403，强制要求配置签名，防 SSRF/KB 投毒）；
+      - RBAC 关闭（本地开发）→ 放行并告警（不破坏本地无签名调用）。
+    """
+    import hashlib
+    import hmac as _hmac
+    import logging as _logging
+
+    from swarm.config import secret_store
+    from swarm.config.settings import get_config
+
+    raw_body = await request.body()
+    secret = ""
+    try:
+        secret = (secret_store.get_secret(f"webhook_secret:{project_id}") or "").strip()
+    except Exception:  # noqa: BLE001
+        secret = ""
+
+    rbac_on = bool(getattr(get_config(), "rbac_enabled", True))
+    if secret:
+        sig_header = request.headers.get("X-Swarm-Signature", "").strip()
+        expected = "sha256=" + _hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not sig_header or not _hmac.compare_digest(sig_header, expected):
+            raise HTTPException(status_code=403, detail="webhook 签名校验失败")
+    elif rbac_on:
+        # 生产(RBAC 开)未配置 secret → 拒绝，避免无签名 webhook 被滥用投毒/SSRF
+        raise HTTPException(
+            status_code=403,
+            detail="该项目未配置 webhook secret，拒绝无签名调用（请先设置 webhook_secret）",
+        )
+    else:
+        _logging.getLogger("swarm.api.knowledge").warning(
+            "[webhook] 项目 %s 未配置 webhook secret 且 RBAC 关闭，放行无签名调用（仅限本地开发）",
+            project_id,
+        )
+
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project or not project.get("path"):
@@ -451,11 +496,12 @@ async def list_pending_embeddings(project_id: str):
 
 
 @router.post("/api/projects/{project_id}/knowledge/pending-embeddings/requeue", tags=["知识库"])
-async def requeue_pending_embeddings(project_id: str):
+async def requeue_pending_embeddings(project_id: str, request: Request):
     """把该项目所有 dead(retry_count>=10) 条目的 retry_count 清零，重新纳入自动重试。
 
     用于 embedding 服务恢复后手动恢复死信。返回被重置的条目数。
     """
+    _require_perm(request, "knowledge:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 

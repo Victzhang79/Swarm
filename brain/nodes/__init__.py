@@ -974,12 +974,31 @@ async def handle_failure(state: BrainState) -> dict:
     logger.info(f"[HANDLE_FAILURE] 处理 {len(failed_ids)} 个失败子任务")
 
     if state.get("verification_failure") == "l2":
-        logger.info("[HANDLE_FAILURE] L2 集成验证失败 — 触发 replan")
+        # H2 修复：L2 失败 replan 也要走 replan_count 计数/上限，否则绕过熔断可无限重规划
+        # （原直接 return replan 不自增计数，仅靠 recursion_limit=50 兜底，违背承诺）。
+        _l2_replan = state.get("replan_count", 0) + 1
+        _l2_max = get_config().model.max_retries
+        if _l2_replan > _l2_max:
+            logger.warning(
+                "[HANDLE_FAILURE] L2 集成验证失败且 replan 已达上限(%d 次) → 升级人工审核",
+                _l2_max,
+            )
+            return {
+                "failure_strategy": "escalate",
+                "failed_subtask_ids": failed_ids,
+                "failure_escalated": True,
+                "verification_failure": None,
+                "l2_passed": False,
+                "replan_count": _l2_replan,
+            }
+        logger.info("[HANDLE_FAILURE] L2 集成验证失败 — 触发 replan (第 %d/%d 次)",
+                    _l2_replan, _l2_max)
         return {
             "failure_strategy": "replan",
             "failed_subtask_ids": [],
             "verification_failure": None,
             "l2_passed": False,
+            "replan_count": _l2_replan,
         }
 
     if state.get("verification_failure") == "l3":
@@ -1479,6 +1498,17 @@ def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout
     except Exception as exc:
         logger.warning("[VERIFY_L2] 本地测试异常: %s", exc)
         return False
+    finally:
+        # H1 修复：L2 验证用的是临时 apply，验证完必须还原工作树——否则脏改动残留，
+        # 污染下一任务的事实核验 ground truth(git ls-files/os.walk) 和 learn_success 的 commit。
+        # 照抄 integration_review 的回滚：checkout 已跟踪文件 + clean 未跟踪文件。
+        try:
+            subprocess.run(["git", "checkout", "--", "."], cwd=project_path,
+                           capture_output=True, timeout=60)
+            subprocess.run(["git", "clean", "-fd"], cwd=project_path,
+                           capture_output=True, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[VERIFY_L2] 工作树回滚失败(非致命): %s", exc)
 
 
 def _run_l2_in_sandbox(

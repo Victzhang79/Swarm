@@ -66,10 +66,18 @@ def _get_fernet():
 
         raw = os.environ.get("SWARM_SECRET_KEY", "").strip()
         if not raw:
+            # H5 修复：DB 派生根密钥是弱保护（DB dump + 本仓库即可解密所有存储 key）。
+            # 生产环境应显式设 SWARM_SECRET_KEY；置 SWARM_REQUIRE_SECRET_KEY=1 时强制拒绝派生回退。
+            if os.environ.get("SWARM_REQUIRE_SECRET_KEY", "").strip().lower() in ("1", "true", "yes"):
+                raise RuntimeError(
+                    "SWARM_REQUIRE_SECRET_KEY 已启用但未设置 SWARM_SECRET_KEY。"
+                    "生产环境必须显式提供高熵根密钥（32 字节 base64），拒绝用 DB 连接串派生的弱回退。"
+                )
             raw = _derive_key_from_db()
             logger.warning(
-                "未设置 SWARM_SECRET_KEY，使用 db 连接串派生的弱根密钥加密敏感信息。"
-                "生产环境请显式设置 SWARM_SECRET_KEY（32 字节 base64）以增强保护。"
+                "【安全风险】未设置 SWARM_SECRET_KEY，回退到 DB 连接串派生的弱根密钥加密敏感信息——"
+                "拿到 DB dump + 本仓库即可解密所有存储的 API key。生产环境请显式设置 "
+                "SWARM_SECRET_KEY（32 字节 base64），并置 SWARM_REQUIRE_SECRET_KEY=1 强制校验。"
             )
         # Fernet 需要 32 字节 urlsafe base64 key —— 用 sha256 归一化任意输入
         digest = hashlib.sha256(raw.encode("utf-8")).digest()

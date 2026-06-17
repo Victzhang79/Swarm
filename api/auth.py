@@ -29,6 +29,7 @@ _LEGACY_USER = SwarmUser(
     username="api-key",
     display_name="API Key User",
     global_role=Role.ADMIN.value,
+    must_change_password=False,
 )
 
 
@@ -75,6 +76,7 @@ class SwarmAuthMiddleware(BaseHTTPMiddleware):
                 username="dev",
                 display_name="Dev",
                 global_role=Role.ADMIN.value,
+                must_change_password=False,
             )
             return await call_next(request)
 

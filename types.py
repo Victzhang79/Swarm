@@ -53,6 +53,37 @@ class HumanDecision(str, Enum):
 # ──────────────────────────────────────────────
 # 文件 Scope（Worker 权限控制）
 # ──────────────────────────────────────────────
+def _path_scope_match(fp: str, w: str) -> bool:
+    """路径感知的 scope 匹配（S2 修复：弃用裸 endswith 双向匹配）。
+
+    旧实现 `fp.endswith(w) or w.endswith(fp)` 有两个漏洞：
+      - 越权：scope 'a.py' 放行 'evil/a.py'、'xa.py'；
+      - 空串恒真：scope '' 时 ''.endswith() 恒 True，等于全开。
+    新规则按【路径段】对齐（与 worker/l1_pipeline.py:_scope_match 同源）：
+      1. 规范化(去 ./、统一 /、去首尾 /)；空串直接拒绝；
+      2. 完全相等 → 匹配；
+      3. w 作为 fp 的祖先目录段(fp 在 w/ 下) → 匹配；
+      4. w 是多段路径且作为 fp 的完整尾部段(容忍仓库根前缀) → 匹配；
+         单段 basename 不做尾匹配，避免放行任意目录下同名文件。
+    """
+    def _norm(p: str) -> str:
+        p = (p or "").strip().replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        return p.strip("/")
+
+    f, ww = _norm(fp), _norm(w)
+    if not f or not ww:
+        return False
+    if f == ww:
+        return True
+    if f.startswith(ww + "/"):
+        return True
+    if "/" in ww and f.endswith("/" + ww):
+        return True
+    return False
+
+
 class FileScope(BaseModel):
     """定义 Worker 对文件的访问权限 + 文件操作意图。
 
@@ -76,20 +107,20 @@ class FileScope(BaseModel):
         if self.allow_any:
             return True
         targets = self.writable + self.create_files + self.delete_files
-        return any(path.endswith(p) or p.endswith(path) for p in targets)
+        return any(_path_scope_match(path, p) for p in targets)
 
     def is_readable(self, path: str) -> bool:
         if self.allow_any:
             return True
         return self.is_writable(path) or any(
-            path.endswith(p) or p.endswith(path) for p in self.readable
+            _path_scope_match(path, p) for p in self.readable
         )
 
     def is_create(self, path: str) -> bool:
-        return any(path.endswith(p) or p.endswith(path) for p in self.create_files)
+        return any(_path_scope_match(path, p) for p in self.create_files)
 
     def is_delete(self, path: str) -> bool:
-        return any(path.endswith(p) or p.endswith(path) for p in self.delete_files)
+        return any(_path_scope_match(path, p) for p in self.delete_files)
 
     def all_write_targets(self) -> list[str]:
         """所有写目标（修改+新建+删除），去重保序。"""

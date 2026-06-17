@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import posixpath
 import re as _re
 import sys
 import time
@@ -150,11 +151,24 @@ def reset_sandbox_manager() -> None:
 
 
 def sandbox_path(local_rel: str, remote_root: str = "/workspace") -> str:
-    """将 workspace 相对路径映射为沙箱内绝对路径。"""
+    """将 workspace 相对路径映射为沙箱内绝对路径。
+
+    拼接后用 posixpath.normpath 归一化，并验证结果仍在 remote_root 下，
+    防止 ``../`` 目录穿越逃逸出沙箱。
+    """
+    root = remote_root.rstrip("/")
     rel = local_rel.lstrip("/").replace("\\", "/").strip()
     if not rel or rel == ".":
-        return remote_root.rstrip("/")
-    return f"{remote_root.rstrip('/')}/{rel}"
+        return root
+    candidate = f"{root}/{rel}"
+    normalized = posixpath.normpath(candidate)
+    # 防目录穿越：归一化后必须仍在 remote_root 内
+    if normalized != root and not normalized.startswith(root + "/"):
+        raise ValueError(
+            f"sandbox_path 越界: {local_rel!r} 解析为 {normalized!r}，"
+            f"不在 {root!r} 下"
+        )
+    return normalized
 
 
 def write_file_to_sandbox(

@@ -94,8 +94,9 @@ async def list_mistakes(project_id: str):
 
 
 @router.post("/api/projects/{project_id}/memories/mistakes", tags=["记忆"])
-async def create_mistake(project_id: str, req: MistakeCreateRequest):
+async def create_mistake(project_id: str, request: Request, req: MistakeCreateRequest):
     """添加错题"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -116,8 +117,9 @@ async def create_mistake(project_id: str, req: MistakeCreateRequest):
 
 
 @router.post("/api/projects/{project_id}/memories/mistakes/{mid}/dismiss", tags=["记忆"])
-async def dismiss_mistake(project_id: str, mid: int):
+async def dismiss_mistake(project_id: str, mid: int, request: Request):
     """标记错题为已修复/归档（检索降权，不物理删除）"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -138,8 +140,9 @@ async def dismiss_mistake(project_id: str, mid: int):
 
 
 @router.delete("/api/projects/{project_id}/memories/mistakes/{mid}", tags=["记忆"])
-async def delete_mistake(project_id: str, mid: int):
+async def delete_mistake(project_id: str, mid: int, request: Request):
     """删除错题"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -184,8 +187,9 @@ async def list_successes(project_id: str):
 
 
 @router.post("/api/projects/{project_id}/memories/successes", tags=["记忆"])
-async def create_success(project_id: str, req: SuccessCreateRequest):
+async def create_success(project_id: str, request: Request, req: SuccessCreateRequest):
     """添加成功模式"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -206,8 +210,9 @@ async def create_success(project_id: str, req: SuccessCreateRequest):
 
 
 @router.delete("/api/projects/{project_id}/memories/successes/{sid}", tags=["记忆"])
-async def delete_success(project_id: str, sid: int):
+async def delete_success(project_id: str, sid: int, request: Request):
     """删除成功模式"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -250,8 +255,9 @@ async def list_summaries(project_id: str):
 
 
 @router.post("/api/projects/{project_id}/memories/summaries", tags=["记忆"])
-async def create_summary(project_id: str, req: SummaryCreateRequest):
+async def create_summary(project_id: str, request: Request, req: SummaryCreateRequest):
     """添加任务摘要"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -271,8 +277,9 @@ async def create_summary(project_id: str, req: SummaryCreateRequest):
 
 
 @router.put("/api/projects/{project_id}/memories/summaries/{sid}", tags=["记忆"])
-async def update_summary(project_id: str, sid: int, req: SummaryUpdateRequest):
+async def update_summary(project_id: str, sid: int, request: Request, req: SummaryUpdateRequest):
     """编辑任务摘要 — 只更新提供的字段"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
@@ -298,8 +305,9 @@ async def update_summary(project_id: str, sid: int, req: SummaryUpdateRequest):
 
 
 @router.delete("/api/projects/{project_id}/memories/summaries/{sid}", tags=["记忆"])
-async def delete_summary(project_id: str, sid: int):
+async def delete_summary(project_id: str, sid: int, request: Request):
     """删除任务摘要"""
+    _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 

@@ -104,6 +104,7 @@ async def auth_me(request: Request):
         "username": user.username,
         "display_name": user.display_name,
         "global_role": user.global_role,
+        "must_change_password": getattr(user, "must_change_password", False),
     }
 
 

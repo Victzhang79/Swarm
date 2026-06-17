@@ -56,6 +56,7 @@ class SwarmUser:
     display_name: str | None
     global_role: str
     api_token: str | None = None
+    must_change_password: bool = False
 
     def has_permission(self, permission: str, *, project_role: str | None = None) -> bool:
         role = effective_project_role(self.global_role, project_role)
@@ -208,6 +209,7 @@ def _row_to_user(row: tuple) -> SwarmUser:
         display_name=row[2],
         global_role=row[3],
         api_token=row[4] if len(row) > 4 else None,
+        must_change_password=bool(row[5]) if len(row) > 5 else False,
     )
 
 
@@ -245,7 +247,7 @@ def get_user_by_token(token: str, conn_str: str | None = None) -> SwarmUser | No
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, username, display_name, global_role, api_token
+                SELECT id, username, display_name, global_role, api_token, must_change_password
                 FROM swarm_users WHERE api_token = %s
                 """,
                 (token,),
@@ -259,7 +261,7 @@ def get_user_by_username(username: str, conn_str: str | None = None) -> dict[str
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, username, display_name, password_hash, global_role, api_token
+                SELECT id, username, display_name, password_hash, global_role, api_token, must_change_password
                 FROM swarm_users WHERE username = %s
                 """,
                 (username,),
@@ -274,6 +276,7 @@ def get_user_by_username(username: str, conn_str: str | None = None) -> dict[str
         "password_hash": row[3],
         "global_role": row[4],
         "api_token": row[5],
+        "must_change_password": row[6],
     }
 
 
@@ -282,7 +285,7 @@ def get_user_by_id(user_id: str, conn_str: str | None = None) -> SwarmUser | Non
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, username, display_name, global_role, api_token
+                SELECT id, username, display_name, global_role, api_token, must_change_password
                 FROM swarm_users WHERE id = %s
                 """,
                 (user_id,),
@@ -303,6 +306,7 @@ def authenticate(username: str, password: str, conn_str: str | None = None) -> S
         display_name=record["display_name"],
         global_role=record["global_role"],
         api_token=record["api_token"],
+        must_change_password=record.get("must_change_password", False),
     )
 
 
