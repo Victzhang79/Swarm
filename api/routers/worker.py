@@ -34,7 +34,7 @@ class WorkerRunRequest(BaseModel):
 @router.post("/api/projects/{project_id}/worker/run", tags=["Worker"])
 async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Request):
     """单 Worker 直跑（不经 Brain），用于 Phase 0 验证 scope + L1 + diff"""
-    _require_perm(request, "project:write", project_id)  # P0-SEC-02：起 worker 会写盘，须授权
+    _require_perm(request, "worker:run", project_id)  # P0-SEC-02：起 worker（owner/developer 均有 worker:run）
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
@@ -95,7 +95,7 @@ async def stream_worker_run(run_id: str, request: Request):
 @router.post("/api/projects/{project_id}/apply-diff", tags=["Worker"])
 async def apply_project_diff(project_id: str, req: ApplyDiffRequest, request: Request):
     """Phase 0/1 — 将 diff 应用到项目 git 工作区（Worker 直跑或手动 patch）"""
-    _require_perm(request, "project:write", project_id)  # P0-SEC-02：写盘端点须授权
+    _require_perm(request, "task:approve", project_id)  # P0-SEC-02：应用 diff=接受产出（owner/developer 可）
     if not req or not (req.diff or "").strip():
         raise HTTPException(status_code=400, detail="请求体须包含 diff 字段")
     loop = asyncio.get_running_loop()

@@ -350,7 +350,7 @@ async def delete_task_endpoint(task_id: str, request: Request, force: bool = Fal
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))
+    _require_perm(request, "task:cancel", task.get("project_id"))  # 删除=终止性操作，owner/developer 可
 
     status = task.get("status", "")
     if is_task_running(task_id):
@@ -376,7 +376,7 @@ async def cancel_task_endpoint(task_id: str, request: Request):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))
+    _require_perm(request, "task:cancel", task.get("project_id"))
 
     if not is_task_running(task_id) and not is_task_orphaned(task_id):
         status = task.get("status", "")
@@ -398,7 +398,7 @@ async def retry_task_endpoint(task_id: str, request: Request, req: TaskRetryRequ
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
+    _require_perm(request, "task:create", task.get("project_id"))  # 重跑=重新发起执行
 
     allowed, reason = can_retry_task(task_id)
     if not allowed:
@@ -422,7 +422,7 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
+    _require_perm(request, "task:create", task.get("project_id"))  # 起跑需求池=发起执行
     if task.get("status") != "POOLED":
         raise HTTPException(
             status_code=409,
@@ -528,7 +528,7 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))
+    _require_perm(request, "task:approve", task.get("project_id"))
 
     project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
     merged_diff = task.get("merged_diff") or ""
@@ -596,8 +596,8 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    # P0-SEC-02：写盘端点须 task:write 授权 + 成员资格（原零鉴权，任意认证者可写任意项目工作区）。
-    _require_perm(request, "task:write", task.get("project_id"))
+    # P0-SEC-02：写盘端点须授权 + 成员资格。应用产出=审核接受类操作 → task:approve（owner/developer 可）。
+    _require_perm(request, "task:approve", task.get("project_id"))
 
     project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
     if not project or not project.get("path"):
@@ -647,7 +647,7 @@ async def revise_task(task_id: str, request: Request, req: TaskReviseRequest):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
+    _require_perm(request, "task:approve", task.get("project_id"))  # 审核修订=审批决策
 
     from swarm.brain.runner import register_task_queue, resume_task_background
 
@@ -676,7 +676,7 @@ async def reject_task(task_id: str, request: Request):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))  # P0-SEC-03
+    _require_perm(request, "task:approve", task.get("project_id"))  # 审核拒绝=审批决策
 
     from swarm.brain.runner import register_task_queue, resume_task_background
 
@@ -720,12 +720,12 @@ async def submit_clarify(task_id: str, request: Request):
 
     Body: {"answers": {"0": "...", "1": "..."}} 逐条回答，或 {"action": "skip"} 整体跳过。
     """
-    # P0-SEC-03：澄清答复会推进任务规划，须 task:write + 成员资格。
+    # P0-SEC-03：澄清答复会推进任务规划，须 task:approve（审批/规划决策）+ 成员资格。
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))
+    _require_perm(request, "task:approve", task.get("project_id"))
     body = await request.json()
     if body.get("action") == "skip":
         payload: dict = {"action": "skip"}
@@ -745,12 +745,12 @@ async def submit_design_review(task_id: str, request: Request):
 
     Body: {"decision": "approve"} 通过，或 {"decision": "reject", "feedback": "..."} 打回重做。
     """
-    # P0-SEC-03：评审决策推进规划，须 task:write + 成员资格。
+    # P0-SEC-03：评审决策推进规划，须 task:approve（审批/规划决策）+ 成员资格。
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:write", task.get("project_id"))
+    _require_perm(request, "task:approve", task.get("project_id"))
     body = await request.json()
     decision = body.get("decision")
     if decision not in ("approve", "reject"):

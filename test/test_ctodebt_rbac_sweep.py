@@ -11,27 +11,45 @@ from swarm.auth.rbac import ROLE_PERMISSIONS
 
 # RBAC 词汇全集（admin 的 "*" 除外）
 _VALID_PERMS = set().union(*[p for p in ROLE_PERMISSIONS.values()]) - {"*"}
-# 已知约定：task:write 在代码库被既有端点(approve/cancel/delete/apply-diff)广泛使用，但
-# 不在任何角色集合 → rbac-on 下实为 admin-only(via "*")。属【既有】RBAC 词汇缺口(已记入
-# CTO_GUIDE §12，待 RBAC 词汇评审)，本横扫沿用该约定保持一致，不在此盲改授权语义。
-_KNOWN_WRITE_CONVENTION = {"task:write"}
-
-
 def _src(func) -> str:
     return inspect.getsource(func)
 
 
 def test_task_endpoints_gated():
+    """task 生命周期端点改用细粒度【已存在】权限（task:write 词汇缺口已修，owner/developer 生效）。"""
     from swarm.api.routers import task
 
     assert '_require_perm(request, "task:read", project_id)' in _src(task.list_tasks)
-    assert "_require_perm" in _src(task.retry_task_endpoint)
-    assert "_require_perm" in _src(task.execute_pooled_task)
-    assert '_require_perm(request, "task:write"' in _src(task.revise_task)
-    assert '_require_perm(request, "task:write"' in _src(task.reject_task)
-    assert '_require_perm(request, "task:write"' in _src(task.submit_clarify)
-    assert '_require_perm(request, "task:write"' in _src(task.submit_design_review)
+    # 重跑/起跑 = 发起执行 → task:create
+    assert '_require_perm(request, "task:create"' in _src(task.retry_task_endpoint)
+    assert '_require_perm(request, "task:create"' in _src(task.execute_pooled_task)
+    # 审批/规划决策 → task:approve
+    assert '_require_perm(request, "task:approve"' in _src(task.revise_task)
+    assert '_require_perm(request, "task:approve"' in _src(task.reject_task)
+    assert '_require_perm(request, "task:approve"' in _src(task.approve_task)
+    assert '_require_perm(request, "task:approve"' in _src(task.apply_task_diff)
+    assert '_require_perm(request, "task:approve"' in _src(task.submit_clarify)
+    assert '_require_perm(request, "task:approve"' in _src(task.submit_design_review)
+    # 取消/删除 = 终止性 → task:cancel
+    assert '_require_perm(request, "task:cancel"' in _src(task.cancel_task_endpoint)
+    assert '_require_perm(request, "task:cancel"' in _src(task.delete_task_endpoint)
     assert "_require_perm" in _src(task.task_audit_endpoint) or "_require_user" in _src(task.task_audit_endpoint)
+
+
+def test_no_task_write_residue():
+    """task:write 不在任何角色 → 全库不得再用它授权（防回归）。"""
+    import swarm.api.routers.task as t
+    import swarm.api.routers.worker as w
+
+    for mod in (t, w):
+        assert '"task:write"' not in inspect.getsource(mod), f"{mod.__name__} 残留 task:write"
+
+
+def test_worker_endpoints_use_existing_perms():
+    from swarm.api.routers import worker
+
+    assert '_require_perm(request, "worker:run"' in _src(worker.start_worker_run)
+    assert '_require_perm(request, "task:approve"' in _src(worker.apply_project_diff)
 
 
 def test_memory_reads_gated():
@@ -96,8 +114,8 @@ def test_all_swept_perm_strings_valid():
         for m in re.finditer(r'_require_perm\(request,\s*"([a-z]+:[a-z]+)"', inspect.getsource(mod)):
             used.add(m.group(1))
     assert used, "应至少提取到若干权限串"
-    # 允许合法 RBAC 词汇 + 已知 task:write 约定；其余即拼写错误(会静默放行/锁死)。
-    bad = used - _VALID_PERMS - _KNOWN_WRITE_CONVENTION
+    # task:write 缺口已修，所有权限串都必须在合法 RBAC 词汇表内（否则拼写错误→静默放行/锁死）。
+    bad = used - _VALID_PERMS
     assert not bad, f"无效权限串(疑似拼写错误，不在 RBAC 词汇表): {bad}"
     # 横扫的【读】端点必须用合法读权限（project:read 等），不得误用 task:write
     assert "project:read" in used
