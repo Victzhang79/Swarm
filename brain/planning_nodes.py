@@ -632,6 +632,159 @@ TECH_DESIGN_USER = """需求：
 {review_feedback}请先做事实核验，再产出技术方案与文件级 file_plan。"""
 
 
+# ── ultra 超大需求两阶段 tech_design（DESIGN 第八节 A+B）──
+# 阶段1：只产出模块清单 + 数据模型 + 架构（短输出），不展开到上百具体文件路径。
+TECH_DESIGN_STAGE1_SYSTEM = """你是资深技术负责人。面对一个【超大需求】，先做【顶层方案】——
+不要急着列出所有文件，而是先划分模块、定数据模型、定架构。这是第一阶段（短输出）。
+
+职责：
+1. 事实核验：需求是否基于不存在的已有文件（虚假前提）？产品经理式新建需求几乎无虚假前提。
+   注意：上传附件(PRD.md)、示例代码标准库(Map.of/log.info)、要新建的文件，都【不算】虚假前提。
+2. 把需求划分为若干【业务模块】，每个模块给：名称、职责、预估文件数、模块间依赖。
+3. 设计数据模型（要建哪些表/核心字段）。
+4. 定技术栈与架构（沿用项目既有分层）。
+
+严格输出 JSON：
+{"fact_issues": [{"claim","verdict":"false|already_exists|uncertain","detail","suggestion"}],
+ "stack": {"frontend","backend","storage","rationale"},
+ "architecture": "架构概述",
+ "data_model": "数据模型(表/字段)",
+ "modules": [{"name":"模块名(如 alarm-task)","responsibility":"职责","est_files":12,"depends_on":["前置模块名"]}]}"""
+
+TECH_DESIGN_STAGE1_USER = """需求：
+{task_description}
+
+澄清摘要：{clarify_summary}
+复杂度：{complexity}　是否新建项目：{greenfield}
+
+项目知识库：
+{knowledge}
+
+项目真实结构（ground truth）：
+{project_facts}
+
+被点名文件核验：
+{file_verification}
+
+{review_feedback}请先做事实核验，再产出【模块清单 + 数据模型 + 架构】（不要列具体文件）。"""
+
+# 阶段2：按单个模块产出该模块的 file_plan（短输出，只列这一个模块的文件）。
+TECH_DESIGN_STAGE2_SYSTEM = """你是资深技术负责人，正在为【一个模块】产出文件级方案。
+整体架构/数据模型已定，你只负责【当前这一个模块】的文件清单——不要管其他模块。
+
+据项目分层规范设计该模块要【新建/修改】的文件，给完整相对路径 + 职责 + 依赖。
+所有文件的 module 字段都填【当前模块名】。
+
+严格输出 JSON：
+{"file_plan": [{"path":"完整相对路径","action":"create|modify","module":"当前模块名","responsibility":"职责","depends_on":["前置文件路径"]}]}"""
+
+TECH_DESIGN_STAGE2_USER = """总需求（背景）：{task_description}
+
+整体架构：{architecture}
+数据模型：{data_model}
+
+项目真实结构（参照其分层/命名规律）：
+{project_facts}
+
+## 当前要产出 file_plan 的模块（第 {mod_idx}/{mod_total} 个）
+模块名：{mod_name}
+职责：{mod_responsibility}
+预估文件数：{mod_est_files}
+
+只为这个模块产出 file_plan（完整路径），module 字段统一填 "{mod_name}"。"""
+
+
+async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
+                              project_facts, file_verification, review_feedback):
+    """ultra 超大需求两阶段 tech_design（DESIGN 第八节 A+B）。
+
+    阶段1：LLM 出模块清单+数据模型+架构（短输出）。
+    阶段2：按模块逐个 LLM 出该模块 file_plan（每次短输出）→ 合并。
+    每阶段短输出，规避单次生成上百文件超长 JSON 卡死。
+    返回 (result_dict, file_plan, fact_issues, contract)，与单次路径同结构供后续复用。
+    """
+    import time as _time
+
+    # ── 阶段1：顶层方案（模块清单 + 数据模型 + 架构）──
+    _t0 = _time.monotonic()
+    resp1 = await llm.ainvoke([
+        {"role": "system", "content": TECH_DESIGN_STAGE1_SYSTEM},
+        {"role": "user", "content": TECH_DESIGN_STAGE1_USER.format(
+            task_description=task_desc,
+            clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
+            complexity=comp_str, greenfield="是" if greenfield else "否",
+            knowledge=_format_knowledge(state),
+            project_facts=project_facts, file_verification=file_verification,
+            review_feedback=review_feedback,
+        )},
+    ])
+    stage1 = _parse_json_from_llm(resp1.content)
+    if not isinstance(stage1, dict):
+        stage1 = {}
+    modules = stage1.get("modules", []) or []
+    architecture = stage1.get("architecture", "")
+    data_model = stage1.get("data_model", "")
+    fact_issues = stage1.get("fact_issues", []) or []
+    contract = stage1.pop("shared_contract", {}) if isinstance(stage1, dict) else {}
+    logger.info(
+        "[TECH_DESIGN-STAGE1] 顶层方案：%d 个模块，数据模型 %d 字，耗时 %.1fs",
+        len(modules), len(str(data_model)), _time.monotonic() - _t0,
+    )
+    if not modules:
+        # 阶段1 没给模块 → 退回单次（小需求或 LLM 没按格式）
+        return stage1, stage1.get("file_plan", []) or [], fact_issues, contract
+
+    # ── 阶段2：按模块逐个产出 file_plan（每次短输出）──
+    all_file_plan: list[dict] = []
+    mod_total = len(modules)
+    for mi, mod in enumerate(modules, start=1):
+        if not isinstance(mod, dict):
+            continue
+        mod_name = mod.get("name") or f"module-{mi}"
+        _tm = _time.monotonic()
+        try:
+            resp2 = await llm.ainvoke([
+                {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
+                {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
+                    task_description=task_desc[:2000],
+                    architecture=str(architecture)[:1500],
+                    data_model=str(data_model)[:2500],
+                    project_facts=project_facts,
+                    mod_idx=mi, mod_total=mod_total,
+                    mod_name=mod_name,
+                    mod_responsibility=mod.get("responsibility", ""),
+                    mod_est_files=mod.get("est_files", "?"),
+                )},
+            ])
+            r2 = _parse_json_from_llm(resp2.content)
+            fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
+            # 确保 module 字段（小模型/LLM 可能漏填）
+            for item in fp:
+                if isinstance(item, dict) and not item.get("module"):
+                    item["module"] = mod_name
+            all_file_plan.extend(fp)
+            logger.info(
+                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs",
+                mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 产出失败（降级跳过）: %s",
+                mi, mod_total, mod_name, exc,
+            )
+
+    result = {
+        "architecture": architecture, "data_model": data_model,
+        "stack": stage1.get("stack", {}), "modules": modules,
+        "file_plan": all_file_plan, "fact_issues": fact_issues,
+    }
+    logger.info(
+        "[TECH_DESIGN-STAGED] 两阶段完成：%d 模块 → 合计 %d 文件",
+        mod_total, len(all_file_plan),
+    )
+    return result, all_file_plan, fact_issues, contract
+
+
 async def tech_design(state: BrainState) -> dict:
     """产出技术方案 + 共享契约草案。打回重做时带上评审反馈。"""
     greenfield = bool((state.get("session_metadata") or {}).get("greenfield"))
@@ -668,23 +821,30 @@ async def tech_design(state: BrainState) -> dict:
 
     try:
         llm = _get_brain_llm()
-        resp = await llm.ainvoke([
-            {"role": "system", "content": TECH_DESIGN_SYSTEM},
-            {"role": "user", "content": TECH_DESIGN_USER.format(
-                task_description=task_desc,
-                clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
-                complexity=comp_str,
-                greenfield="是" if greenfield else "否",
-                knowledge=_format_knowledge(state),
-                project_facts=project_facts,
-                file_verification=file_verification,
-                review_feedback=review_feedback,
-            )},
-        ])
-        result = _parse_json_from_llm(resp.content)
-        contract = result.pop("shared_contract", {}) if isinstance(result, dict) else {}
-        fact_issues = result.get("fact_issues", []) if isinstance(result, dict) else []
-        file_plan = result.get("file_plan", []) if isinstance(result, dict) else []
+        # ── ultra 超大需求走两阶段产出（规避单次生成上百文件超长 JSON 卡死）──
+        if comp == Complexity.ULTRA or comp_str == "ultra":
+            result, file_plan, fact_issues, contract = await _tech_design_staged(
+                llm, task_desc, comp_str, greenfield, state,
+                project_facts, file_verification, review_feedback,
+            )
+        else:
+            resp = await llm.ainvoke([
+                {"role": "system", "content": TECH_DESIGN_SYSTEM},
+                {"role": "user", "content": TECH_DESIGN_USER.format(
+                    task_description=task_desc,
+                    clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
+                    complexity=comp_str,
+                    greenfield="是" if greenfield else "否",
+                    knowledge=_format_knowledge(state),
+                    project_facts=project_facts,
+                    file_verification=file_verification,
+                    review_feedback=review_feedback,
+                )},
+            ])
+            result = _parse_json_from_llm(resp.content)
+            contract = result.pop("shared_contract", {}) if isinstance(result, dict) else {}
+            fact_issues = result.get("fact_issues", []) if isinstance(result, dict) else []
+            file_plan = result.get("file_plan", []) if isinstance(result, dict) else []
 
         # ── 确定性路径校正（治本：用核验到的真实路径覆盖 LLM 猜的路径）──
         # bug(task 9bd1d5b5)：LLM file_plan 把已存在文件的路径猜错（monitor/→common/），
