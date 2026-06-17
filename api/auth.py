@@ -59,6 +59,41 @@ def resolve_user(token: str) -> SwarmUser | None:
     return None
 
 
+def _extract_token_ws(websocket) -> str:
+    """从 WebSocket 提取 token（header 优先，其次 ?token= query）。"""
+    provided = (
+        websocket.headers.get("x-swarm-token")
+        or websocket.headers.get("x-swarm-key")
+        or ""
+    )
+    if not provided:
+        auth = websocket.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if not provided:
+        provided = websocket.query_params.get("token") or ""
+    return provided.strip()
+
+
+def authenticate_ws(websocket) -> SwarmUser | None:
+    """P0-SEC-NEW：WebSocket 独立鉴权。
+
+    BaseHTTPMiddleware 不处理 WebSocket scope → WS 端点必须自行校验 token，否则任何人
+    无需 token 即可订阅任意 task_id 执行流。返回 user；rbac 关闭时返回 dev admin（与
+    HTTP 中间件一致）；token 无效/缺失返回 None（调用方应关闭连接）。
+    """
+    cfg = get_config()
+    if not cfg.rbac_enabled:
+        return SwarmUser(
+            id="anonymous",
+            username="dev",
+            display_name="Dev",
+            global_role=Role.ADMIN.value,
+            must_change_password=False,
+        )
+    return resolve_user(_extract_token_ws(websocket))
+
+
 class SwarmAuthMiddleware(BaseHTTPMiddleware):
     """解析 Bearer / X-Swarm-Token；未配置 RBAC 时允许匿名 admin。"""
 

@@ -130,10 +130,11 @@ def ensure_bootstrap_admin(
             must_change_password=must_change,
             conn_str=conn_str,
         )
+        # P0-SEC-09：绝不把 API token 明文打进日志（日志常被聚合/转储/留存，等同长期凭据泄露）。
+        # 仅提示已创建；token 通过登录(/api/auth/login)或 DB 安全获取。
         logger.warning(
-            "Default admin created: username=%s password=<bootstrap> token=%s%s",
+            "Default admin created: username=%s password=<bootstrap>%s",
             _BOOTSTRAP_USERNAME,
-            token,
             " ⚠️ 使用默认弱密码 'swarm'，请尽快修改！" if must_change else "",
         )
         return user
@@ -494,10 +495,12 @@ def user_can_on_project(user: SwarmUser, permission: str, project_id: str | None
         try:
             member_count = count_project_members(project_id)
         except Exception as exc:
-            logger.debug("member count unavailable for %s: %s", project_id, exc)
-            member_count = 0
+            # P0-SEC-09：成员数查询失败【不能】fail-open（原 member_count=0→放行 = DB 抖动即授权）。
+            # 无法确认成员关系时 fail-closed 拒绝（非 admin 已在顶部短路，不影响管理员运维）。
+            logger.warning("member count unavailable for %s, fail-closed deny: %s", project_id, exc)
+            return False
         if member_count == 0:
-            # RBAC 之前创建的项目：无成员记录时保持登录用户可访问
+            # RBAC 之前创建的项目：无成员记录时保持登录用户可访问（向后兼容，非错误路径）
             return can(user.global_role, permission)
         member_role = get_project_member_role(project_id, user.id)
         if member_role is None:

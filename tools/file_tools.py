@@ -28,6 +28,28 @@ def _resolve(path: str) -> Path:
     return p.resolve()
 
 
+class WorkspaceEscapeError(PermissionError):
+    """解析后的路径越出 workspace 边界（P0-SEC-07 防穿越复校）。"""
+
+
+def _resolve_write(path: str) -> Path:
+    """P0-SEC-07：写/改/删等【变更】操作的路径解析——在 .resolve() 跟随 symlink/`..` 后，
+    复校结果仍位于 workspace_root 内（scope_guard 校验用原始字符串、落盘用 resolve 绝对路径，
+    二者不一致时 symlink 可越界；此处补一道落盘前的边界复校，defense-in-depth）。
+    """
+    from swarm.tools.paths import workspace_root
+
+    resolved = _resolve(path)
+    root = Path(workspace_root()).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceEscapeError(
+            f"路径越出 workspace 边界，拒绝写入: {path!r} → {resolved}"
+        ) from exc
+    return resolved
+
+
 def _local_rel(path: str) -> str:
     """将路径转为 workspace 相对 posix 路径。"""
     p = Path(path)
@@ -173,7 +195,10 @@ def write_file(path: str, content: str) -> str:
         except Exception as e:
             return f"❌ 沙箱写入失败：{e}"
 
-    resolved = _resolve(path)
+    try:
+        resolved = _resolve_write(path)  # P0-SEC-07：落盘前 workspace 边界复校
+    except WorkspaceEscapeError as e:
+        return f"❌ 拒绝写入（越界）：{e}"
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
@@ -208,7 +233,10 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
             return f"❌ 沙箱读取失败：{e}"
         display = remote
     else:
-        resolved = _resolve(path)
+        try:
+            resolved = _resolve_write(path)  # P0-SEC-07：变更操作落盘前 workspace 边界复校
+        except WorkspaceEscapeError as e:
+            return f"❌ 拒绝修改（越界）：{e}"
         if not resolved.exists():
             return f"❌ 文件不存在：{resolved}"
         try:

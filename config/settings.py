@@ -335,7 +335,9 @@ class SandboxConfig(BaseSettings):
     api_key: str = ""
     proxy_base: str = ""
     sandbox_domain: str = "cube.app"
-    verify_ssl: bool = False
+    # P0-SEC-05：默认开启 TLS 校验（secure-by-default，防 MITM 注入沙箱产物字节）。
+    # 内网自签证书部署须显式设 SWARM_SANDBOX_VERIFY_SSL=false 降级（见 .env.example）。
+    verify_ssl: bool = True
     default_template: str = ""
     dev_sidecar_path: str = "test/sandbox/dev_sidecar.py"
     use_for_worker: bool = True

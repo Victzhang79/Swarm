@@ -19,6 +19,7 @@ import logging
 import os
 import posixpath
 import re as _re
+import shlex
 import sys
 import time
 from collections import deque
@@ -250,9 +251,12 @@ def read_file_from_sandbox(
     # (自建语言镜像无 kernel，run_code 会 502)。base64 -w0 保证单行输出。
     if hasattr(mgr, "run_command"):
         # 先判断是否为目录：是目录直接报错(读文件接口不该读目录)，避免 cat 目录卡住
+        # P0-SEC-05(b)：shell 上下文用 shlex.quote 正确转义（{path!r} 是 Python repr，
+        # 对含单引号的路径不等价于 shell 引号，有残余注入面）。
+        _qp = shlex.quote(path)
         cr = mgr.run_command(
             sandbox,
-            f"test -f {path!r} && base64 {path!r} | tr -d '\\n' || echo __NOT_A_FILE__",
+            f"test -f {_qp} && base64 {_qp} | tr -d '\\n' || echo __NOT_A_FILE__",
             timeout=30,
         )
         out = (cr.stdout or "").strip()

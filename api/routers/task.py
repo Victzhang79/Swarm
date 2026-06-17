@@ -175,7 +175,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
 
 # ─── 9. GET /api/tasks/{task_id}/stream — SSE 任务进度 ─
 @router.get("/api/tasks/{task_id}/stream", tags=["任务管理"])
-async def stream_task(task_id: str):
+async def stream_task(task_id: str, request: Request):
     """SSE 流式推送任务 Brain 执行进度"""
     from swarm.brain.runner import subscribe_task
 
@@ -183,6 +183,8 @@ async def stream_task(task_id: str):
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    # P0-SEC-03：进度流也需 task:read 授权（防已认证用户跨项目订阅任意任务执行流）。
+    _require_perm(request, "task:read", task.get("project_id"))
 
     # N-CW1/N-CW2：每个连接订阅【自己的】队列（多端互不抢事件），断开时注销回收。
     topic, queue = subscribe_task(task_id)
@@ -239,6 +241,20 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
     if not task:
         await websocket.send_json({"event": "error", "data": {"detail": f"Task {task_id} not found"}})
         await websocket.close()
+        return
+
+    # P0-SEC-NEW：WS 独立鉴权（中间件不覆盖 WS scope）+ 跨项目越权防护（task:read 授权）。
+    from swarm.api.auth import authenticate_ws
+    from swarm.auth.store import user_can_on_project
+
+    user = authenticate_ws(websocket)
+    if user is None:
+        await websocket.send_json({"event": "error", "data": {"detail": "Unauthorized: missing/invalid token"}})
+        await websocket.close(code=1008)
+        return
+    if not user_can_on_project(user, "task:read", task.get("project_id")):
+        await websocket.send_json({"event": "error", "data": {"detail": "Permission denied: task:read"}})
+        await websocket.close(code=1008)
         return
 
     # N-CW1/N-CW2：独立订阅 + 断开注销

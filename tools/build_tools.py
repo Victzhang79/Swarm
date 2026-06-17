@@ -185,8 +185,11 @@ def _run_in_sandbox(command: str, timeout: int = 120) -> str:
             ("TimeoutException", "SandboxException", "ConnectionError", "502", "500")
         )
         if infra_fail:
-            log.warning("沙箱 shell 端点失败，降级本地执行: %s", cr.error)
-            return _run_local(command, timeout=timeout)
+            # P0-SEC-08：沙箱是隔离边界。沙箱已激活但单次基础设施失败时【绝不能】降级到
+            # _run_local（worker 命令会落 swarm 宿主机 shell=True 执行，越过隔离边界）。
+            # fail-closed：返回错误交由 executor 瞬时重试，命令不在宿主机执行。
+            log.error("沙箱 shell 端点基础设施失败，fail-closed 拒绝执行（不落宿主机）: %s", cr.error)
+            return f"❌ 沙箱不可用(基础设施失败)，命令未执行(fail-closed 隔离边界): {cr.error}"
         status = "✅" if cr.success else "❌"
         exit_hint = "0" if cr.success else (cr.error or "non-zero")
         body = cr.stdout + (("\n" + cr.stderr) if cr.stderr else "")
@@ -210,8 +213,9 @@ print(f"EXIT_CODE:{{_sbx_proc.returncode}}")
     code_result = manager.run_code(sandbox, code, timeout=timeout + 10)
 
     if code_result.error:
-        log.warning("沙箱命令失败，降级本地执行: %s", code_result.error)
-        return _run_local(command, timeout=timeout)
+        # P0-SEC-08：同上，沙箱激活下基础设施失败 fail-closed，不落宿主机执行。
+        log.error("沙箱命令基础设施失败，fail-closed 拒绝执行（不落宿主机）: %s", code_result.error)
+        return f"❌ 沙箱不可用(基础设施失败)，命令未执行(fail-closed 隔离边界): {code_result.error}"
 
     # 解析输出
     output = code_result.stdout
