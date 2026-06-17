@@ -670,8 +670,8 @@ async function _uploadPendingFiles() {
 async function createTask() {
   if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
   const description = $('new-task-input').value.trim();
-  if (!description && !_pendingTaskFiles.length) {
-    showToast('请输入任务描述或上传需求文件', 'warning'); return;
+  if (!description) {
+    showToast('请输入任务描述（附件只作补充，不能替代描述）', 'warning'); return;
   }
   if (!await ensureTaskReadiness()) return;
 
@@ -693,7 +693,7 @@ async function createTask() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        description: description || '（见上传的需求文件）',
+        description: description,
         auto_accept: $('task-auto-accept')?.checked || false,
         uploaded_files: uploadedPaths,
         auto_confirm_vision: $('task-auto-confirm-vision')?.checked || false,

@@ -129,6 +129,30 @@ def test_create_task_allows_ready_project():
     print("  ✅ POST /tasks ok when ready")
 
 
+def test_create_task_rejects_empty_description():
+    """描述严格必填：空描述 → 400（即使有附件也不能替代描述）。"""
+    from fastapi.testclient import TestClient
+    from swarm.api.app import app
+
+    with patch("swarm.api.app.store") as mock_store:
+        mock_store.get_project.return_value = {"id": "p1", "status": "READY", "graph_status": "INDEXED"}
+        client = TestClient(app)
+        # 空描述
+        r1 = client.post("/api/projects/p1/tasks", json={"description": ""})
+        assert r1.status_code == 400, r1.text
+        assert "描述不能为空" in r1.json().get("detail", "")
+        # 纯空白
+        r2 = client.post("/api/projects/p1/tasks", json={"description": "   \n  "})
+        assert r2.status_code == 400, r2.text
+        # 空描述 + 有附件 → 仍 400（附件不能替代描述）
+        r3 = client.post(
+            "/api/projects/p1/tasks",
+            json={"description": "", "uploaded_files": ["/tmp/x/req.pdf"]},
+        )
+        assert r3.status_code == 400, r3.text
+    print("  ✅ POST /tasks 400 when description empty (even with attachments)")
+
+
 def test_create_task_allows_partial_ready():
     from fastapi.testclient import TestClient
     from swarm.api.app import app

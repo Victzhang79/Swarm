@@ -69,6 +69,10 @@ async def list_tasks(project_id: str):
 async def create_task(project_id: str, req: TaskCreateRequest, request: Request):
     """创建任务并后台启动 Brain 编排"""
     user = _require_perm(request, "task:create", project_id)
+    # 任务描述严格必填（入口硬门槛）：附件只作补充，不能替代描述。
+    # 后端兜底校验——前端校验可被绕过/直接调 API，这里是单一可信防线。
+    if not (req.description or "").strip():
+        raise HTTPException(status_code=400, detail="任务描述不能为空（附件只作补充，不能替代描述）")
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
