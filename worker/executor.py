@@ -108,6 +108,7 @@ class WorkerExecutor:
         task_id: str | None = None,
         user_profile_prompt: str = "",
         shared_contract: dict | None = None,
+        recursion_boost: int = 0,
     ):
         self.subtask = subtask
         self.effective_scope = scope or subtask.scope
@@ -145,6 +146,13 @@ class WorkerExecutor:
                     self.max_iterations = min(100, self.max_iterations + _nfiles * 15)
             except Exception:  # noqa: BLE001
                 pass
+
+        # FINDING-12：拒答/步数耗尽子任务重试时，除换最强模型外还要给更多步数。
+        # RUN5 死在 trivial 档 recursion_limit(~30)——`Sorry, need more steps`。只换 40B
+        # 不抬上限，多步任务照样撞同一堵墙。boost 抬顶(trivial 30→60，非 trivial 封顶 150)，
+        # 仍受 max_execution_time 兜底，不会无限跑。boost=0 时此分支不动（默认零行为差）。
+        if recursion_boost > 0:
+            self.max_iterations = min(150, self.max_iterations + recursion_boost)
 
         # 运行时状态
         self.phase = WorkerPhase.PREPARING

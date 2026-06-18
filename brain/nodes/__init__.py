@@ -1070,6 +1070,7 @@ async def _dispatch_to_worker(
     user_profile_prompt: str = "",
     shared_contract: dict | None = None,
     model_override: str | None = None,
+    recursion_boost: int = 0,
 ) -> WorkerOutput:
     """将子任务派发给 Worker 执行 — 真实调用 WorkerExecutor"""
     from swarm.knowledge.service import compact_knowledge_context, set_worker_context
@@ -1150,6 +1151,7 @@ async def _dispatch_to_worker(
             task_id=task_id or None,
             user_profile_prompt=user_profile_prompt,
             shared_contract=shared_contract or {},
+            recursion_boost=recursion_boost,
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
         audit(

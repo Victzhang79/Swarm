@@ -86,3 +86,29 @@ def test_b1_dynamic_max_iterations():
                   scope=FileScope(writable=["a.java", "b.java", "c.java", "d.java"]))
     w2 = WorkerExecutor(st2, task_id="t3")
     assert w2.max_iterations <= 30
+
+
+def test_finding12_recursion_boost_lifts_trivial_cap():
+    """FINDING-12：force_strong 子任务重试时 recursion_boost 抬高 trivial 步数上限。
+
+    RUN5 死在 trivial 档 recursion_limit(~30) `Sorry, need more steps`。Feature B 只换最强
+    模型不够——还须给更多步数。boost=30 把 trivial 30→60；boost=0 保持零行为差。
+    """
+    from swarm.worker.executor import WorkerExecutor
+
+    st = SubTask(id="st-1", description="trivial", difficulty=SubTaskDifficulty.TRIVIAL,
+                 scope=FileScope(writable=["a.java"]))
+
+    # 不 boost：trivial 仍封顶 30（默认零行为差）
+    w0 = WorkerExecutor(st, task_id="t0", recursion_boost=0)
+    assert w0.max_iterations <= 30, f"无 boost 应≤30: {w0.max_iterations}"
+
+    # boost=30：trivial 30 → 60（拒答重试给够步数，最强模型才有机会在步内收敛）
+    w1 = WorkerExecutor(st, task_id="t1", recursion_boost=30)
+    assert w1.max_iterations == w0.max_iterations + 30, \
+        f"boost 应在原上限上加 30: {w0.max_iterations} → {w1.max_iterations}"
+    assert w1.max_iterations > 30, "boost 后必须突破 trivial 30 档，否则照样撞墙"
+
+    # 封顶 150：超大 boost 不会让步数无限膨胀
+    w2 = WorkerExecutor(st, task_id="t2", recursion_boost=1000)
+    assert w2.max_iterations == 150, f"boost 封顶 150: {w2.max_iterations}"

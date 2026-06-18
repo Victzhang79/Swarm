@@ -41,6 +41,7 @@ class WorkerDispatcher(ABC):
         task_id: str | None,
         user_profile_prompt: str,
         shared_contract: dict | None,
+        recursion_boost: int = 0,
     ) -> WorkerOutput:
         ...
 
@@ -62,6 +63,7 @@ class InProcessDispatcher(WorkerDispatcher):
         task_id: str | None,
         user_profile_prompt: str,
         shared_contract: dict | None,
+        recursion_boost: int = 0,
     ) -> WorkerOutput:
         from swarm.worker.executor import WorkerExecutor
 
@@ -74,6 +76,7 @@ class InProcessDispatcher(WorkerDispatcher):
             task_id=task_id or None,
             user_profile_prompt=user_profile_prompt,
             shared_contract=shared_contract or {},
+            recursion_boost=recursion_boost,
         )
         return await executor.run()
 

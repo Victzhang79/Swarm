@@ -215,8 +215,12 @@ async def dispatch(state: BrainState) -> dict:
         _fs = bool(_force_strong.get(subtask.id))
         _ua = use_alternate and not _fs
         _override = _pool[idx % len(_pool)] if (_pool and not _ua) else None
+        # FINDING-12：拒答/步数耗尽子任务重试时，换最强模型 + 加步数(trivial 30→60)。
+        # 只换 40B 不抬 recursion_limit，多步任务照样撞 `Sorry, need more steps`(RUN5 实证)。
+        _boost = 0
         if _fs:
             _override = config.model.routing_complex
+            _boost = 30
         try:
             output = await nodes._dispatch_to_worker(
                 subtask,
@@ -227,6 +231,7 @@ async def dispatch(state: BrainState) -> dict:
                 user_profile_prompt=_worker_profile_prompt(state),
                 shared_contract=shared_contract,
                 model_override=_override,
+                recursion_boost=_boost,
             )
             return subtask, output
         except Exception as e:
