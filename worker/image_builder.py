@@ -56,6 +56,11 @@ def template_exists_in_cubemaster(template_id: str) -> bool | None:
         return False
     try:
         s = get_config().sandbox
+        if not getattr(s, "api_url", ""):
+            # 没配 CubeMaster 端点(api_url 空)→ 无从探活，返回 None(无法判定，调用方保守不复用)。
+            # 也避免 Py3.14 起 urllib Request() 对无 scheme 的 "/templates" 在构造期即抛 ValueError。
+            logger.warning("template_exists_in_cubemaster(%s)：sandbox.api_url 未配置，无法探活", template_id)
+            return None
         url = s.api_url.rstrip("/") + "/templates"
         headers = {"Authorization": f"Bearer {s.api_key}"} if getattr(s, "api_key", "") else {}
         req = urllib.request.Request(url, headers=headers)

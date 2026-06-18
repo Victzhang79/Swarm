@@ -141,8 +141,12 @@ class ModelConfig(BaseSettings):
         default_factory=lambda: ["Qwen3.6-40B-Claude-4.6-NVFP4", "Qwen3.6-27B-Saka-NVFP4"])
     routing_complex: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 复杂任务首选(架构/跨模块)，最强本地(256K)
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
+        # 用户编排(2026-06-18)：complex primary=40B 挂了先上 27B-Saka(轻快112k 先顶) →
+        # 再另一台大的 MiniMax(196k 保上下文) → 最后 Step-Flash(256k 但 20t/s 慢，最终垫底)。
+        # 真实机器在 .env 配同款链；此默认值是无 .env 环境(CI/他人)的策略落点，须与编排一致。
         # 全本地大窗口模型；122B-A10B 仅 64K 上下文，已排除出 worker 列表（易撑爆、拖累预算）
-        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwen3.6-27B-Saka-NVFP4"])
+        default_factory=lambda: [
+            "Qwen3.6-27B-Saka-NVFP4", "MiniMax-M2.7-Pro", "stepfun-ai/Step-3.7-Flash-FP8"])
     routing_multimodal: str = "Qwen3.6-40B-Claude-4.6-NVFP4"  # 多模态首选(看图/UI截图)，mm✓256K
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["Qwen3.6-27B-Saka-NVFP4", "stepfun-ai/Step-3.7-Flash-FP8"])
