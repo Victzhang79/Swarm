@@ -378,6 +378,20 @@ class WorkerExecutor:
                     self._log(f"沙箱熔断: {exc}")
                     raise
                 except Exception as exc:
+                    # fail-closed（治本，对齐 P0-SEC-08 精神）：若任务依赖【项目专属镜像自带源码】
+                    # (_sandbox_has_source)，沙箱创建失败时绝不降级本地——本地没有项目源码，
+                    # agent 在空环境里找不到目标文件，必然产出空 diff（dispatch 判空产出=失败）、
+                    # 白烧 3 次重试后 escalate，且把"镜像丢失/不可用"伪装成"任务失败"误导用户。
+                    # 实证 task 82f12ce4「推箱子」：tpl 在 CubeMaster 丢失(130404 template not found)
+                    # → 降级本地 → 无 README → diff=5 空产出 → 3 次重试全败 → escalate。
+                    # 明确抛错（提示重建项目镜像），而非降级到注定失败的本地空跑。
+                    if getattr(self, "_sandbox_has_source", False):
+                        self._log(f"沙箱创建失败且任务依赖项目专属镜像源码，fail-closed 不降级本地: {exc}")
+                        raise RuntimeError(
+                            f"项目专属沙箱镜像不可用（{exc}）——镜像可能已过期/被清理。"
+                            f"本地无项目源码，拒绝降级空跑。请重建该项目沙箱模板后重试。"
+                        ) from exc
+                    # 通用镜像/无源码依赖（纯文字等）→ 降级本地合法
                     self._log(f"沙箱创建失败，降级本地执行: {exc}")
             else:
                 self._log("沙箱未启用，文件与命令将在本地执行")

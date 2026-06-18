@@ -645,6 +645,7 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
             SSHConfig,
             build_project_image,
             compute_project_fingerprint,
+            template_exists_in_cubemaster,
         )
 
         spec = infer_env_spec(project_path, project_id=project_id)
@@ -657,8 +658,24 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
         proj = get_project(project_id) or {}
         existing = (proj.get("config") or {})
         if existing.get("sandbox_template") and existing.get("sandbox_deps_hash") == fingerprint:
-            logger.info("项目 %s 依赖+源码未变，复用已有专属模板 %s", project_id, existing["sandbox_template"])
-            return
+            # 复用前探活：CubeMaster 模板会因 TTL 过期/存储清理而消失，DB 记录却仍在
+            # （实测 task 82f12ce4：tpl-2ebae48 被清，复用悬空引用→worker 创建沙箱必报
+            # 130404）。只有模板【确认存在】(True) 才复用；【确认不存在】(False) 继续往下重建；
+            # 探活失败(None) 保守复用（避免网络抖动触发昂贵重建），但告警。
+            _exists = await asyncio.to_thread(
+                template_exists_in_cubemaster, existing["sandbox_template"]
+            )
+            if _exists is True:
+                logger.info("项目 %s 依赖+源码未变且模板存在，复用专属模板 %s",
+                            project_id, existing["sandbox_template"])
+                return
+            if _exists is None:
+                logger.warning("项目 %s 模板 %s 探活失败（无法判定存在性），保守复用；"
+                               "若后续创建沙箱报 template_not_found 请手动触发重新预处理",
+                               project_id, existing["sandbox_template"])
+                return
+            logger.warning("项目 %s 的专属模板 %s 在 CubeMaster 已不存在（悬空引用，疑似过期/被清），"
+                           "重建专属沙箱", project_id, existing["sandbox_template"])
 
         if SSHConfig.from_secret_store() is None:
             logger.warning("项目 %s: 沙箱机 SSH 凭据未配置，跳过专属沙箱构建（回退通用池）", project_id)

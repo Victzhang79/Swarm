@@ -35,6 +35,44 @@ _JDK_DEFAULT = "17"
 _NODE_DEFAULT = "20"
 
 
+def template_exists_in_cubemaster(template_id: str) -> bool | None:
+    """探活：模板是否真实存在于 CubeMaster 的模板 store。
+
+    用途：预处理复用判据（preprocess._phase_build_sandbox）在复用 DB 记录的
+    project.config["sandbox_template"] 之前先探活——CubeMaster 模板会因 TTL 过期/
+    存储清理而消失（实测 task 82f12ce4：tpl-2ebae48 及全部基础模板被清，DB 仍留记录），
+    若不探活直接复用悬空引用，worker 创建沙箱必报 130404 template_not_found。
+
+    返回：True=存在；False=确认不存在（store 里没有此 id）；None=探活本身失败
+    （网络/认证错误，无法判定）——None 时调用方应保守不复用（按需重建更安全）。
+    """
+    import json
+    import ssl
+    import urllib.request
+
+    from swarm.config import get_config
+
+    if not template_id:
+        return False
+    try:
+        s = get_config().sandbox
+        url = s.api_url.rstrip("/") + "/templates"
+        headers = {"Authorization": f"Bearer {s.api_key}"} if getattr(s, "api_key", "") else {}
+        req = urllib.request.Request(url, headers=headers)
+        ctx = None
+        if url.lower().startswith("https") and not getattr(s, "verify_ssl", True):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+        ids = {t.get("templateID") or t.get("template_id") for t in data} if isinstance(data, list) else set()
+        return template_id in ids
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("template_exists_in_cubemaster(%s) 探活失败（无法判定）: %s", template_id, exc)
+        return None
+
+
 @dataclass
 class SSHConfig:
     host: str
