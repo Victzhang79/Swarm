@@ -79,6 +79,49 @@ def test_pom_not_duplicated_when_already_in_scope():
     assert sc.writable.count("pom.xml") == 1
 
 
+# ── 多 builder：根 pom 单一归属（治 task 927d95c6 的 N 路争写） ──
+def test_multi_module_root_pom_single_owner():
+    sts = []
+    for i, mod in enumerate(["alarm-app", "alarm-channel", "alarm-api"], start=1):
+        sts.append(SubTask(
+            id=f"st-{i}", description="d",
+            scope=FileScope(create_files=[f"{mod}/src/main/java/X{i}.java"]),
+            harness=TaskHarness(language="java", build_command=f"mvn -pl {mod} -am compile"),
+        ))
+    plan = TaskPlan(subtasks=sts)
+    normalize_plan_scopes(plan)
+    owners = [s.id for s in plan.subtasks
+              if "pom.xml" in (s.scope.writable or []) or "pom.xml" in (s.scope.create_files or [])]
+    assert owners == ["st-1"], f"根 pom 应只归第一个 builder，实际 {owners}"
+    # 各模块自己的 pom 仍在各自 create_files（不同文件，无争用）
+    for i, mod in enumerate(["alarm-app", "alarm-channel", "alarm-api"], start=1):
+        assert f"{mod}/pom.xml" in plan.subtasks[i - 1].scope.create_files
+
+
+# ── 验证器：N 子任务写同一文件聚合成 1 条（不再 O(n²) 刷屏） ──
+def test_validator_aggregates_conflicts():
+    from swarm.brain.plan_validator import validate_plan_structure
+
+    # 5 个无依赖子任务都写 pom.xml
+    sts = [SubTask(id=f"st-{i}", description="d",
+                   scope=FileScope(writable=["pom.xml"])) for i in range(1, 6)]
+    res = validate_plan_structure(TaskPlan(subtasks=sts))
+    pom_msgs = [m for m in res.issues if "pom.xml" in m]
+    assert len(pom_msgs) == 1, f"应聚合成 1 条，实际 {len(pom_msgs)}: {pom_msgs}"
+    assert "5 个无依赖子任务" in pom_msgs[0]
+
+
+# ── 验证器：同一子任务文件双列(writable+create_files) 不报自冲突(st-N 与 st-N) ──
+def test_validator_no_self_conflict_on_dual_listed_file():
+    from swarm.brain.plan_validator import validate_plan_structure
+
+    st = SubTask(id="st-1", description="d",
+                 scope=FileScope(writable=["a.txt"], create_files=["a.txt"]))
+    res = validate_plan_structure(TaskPlan(subtasks=[st]))
+    self_confs = [m for m in (res.issues + res.warnings) if "st-1 与 st-1" in m]
+    assert not self_confs, f"不应出现自比较冲突: {self_confs}"
+
+
 if __name__ == "__main__":
     import sys
 

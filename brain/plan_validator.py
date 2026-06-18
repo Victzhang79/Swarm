@@ -104,22 +104,32 @@ def validate_plan_structure(
     #   前序 create + 后序 modify，但提示风险）。
     writable_map: dict[str, list[str]] = {}
     for t in plan.subtasks:
-        for fp in (list(t.scope.writable or []) + list(getattr(t.scope, "create_files", []) or [])):
+        # 同一子任务内 writable ∪ create_files 去重：否则文件【既在 writable 又在 create_files】
+        # 时同一子任务 id 被记两次 → 下方两两比较会出现 "st-N 与 st-N 同时写"（自己跟自己冲突）。
+        for fp in (set(t.scope.writable or []) | set(getattr(t.scope, "create_files", []) or [])):
             writable_map.setdefault(fp, []).append(t.id)
     for fp, ids in writable_map.items():
+        ids = list(dict.fromkeys(ids))  # 跨子任务再去重（保序）
         if len(ids) < 2:
             continue
-        for i, id_a in enumerate(ids):
-            for id_b in ids[i + 1 :]:
-                ta = subtask_by_id[id_a]
-                tb = subtask_by_id[id_b]
-                if not _depends(id_a, id_b, ta, tb, subtask_by_id):
-                    result.add(f"无依赖的子任务 {id_a} 与 {id_b} 同时写 {fp}")
-                else:
-                    result.warn(
-                        f"依赖序子任务 {id_a} 与 {id_b} 都写 {fp}（B3 要求文件不重叠，"
-                        f"MERGE 可能冲突，建议每个文件只归一个子任务）"
-                    )
+        # 按文件【聚合】成一条，而非两两组合 O(n²) 刷屏（N 个子任务写同一文件原会打 N²/2 条）。
+        # 只要存在一对【无依赖】争写者即硬失败（并行必冲突）；否则全为依赖序 → 告警。
+        has_independent = any(
+            not _depends(a, b, subtask_by_id[a], subtask_by_id[b], subtask_by_id)
+            for i, a in enumerate(ids)
+            for b in ids[i + 1 :]
+        )
+        joined = ", ".join(ids)
+        if has_independent:
+            result.add(
+                f"{len(ids)} 个无依赖子任务同时写 {fp}: [{joined}]"
+                f"（并行必冲突，每个文件应只归一个子任务）"
+            )
+        else:
+            result.warn(
+                f"{len(ids)} 个依赖序子任务都写 {fp}: [{joined}]"
+                f"（B3 要求文件不重叠，MERGE 可能冲突，建议每个文件只归一个子任务）"
+            )
 
     # 检索定位文件覆盖（可选）
     if affected_files:

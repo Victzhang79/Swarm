@@ -20,22 +20,28 @@ def _ensure_maven_module_build_scope(subtasks: list) -> bool:
     `Could not find the selected project in the reactor` 必败、worker 够不着、空转到超时升级。
 
     规则：凡子任务 build/test/verify/acceptance 命令含 `-pl <module>` 且该 `<module>/` 目录下
-    在本计划里有 create_files（=正在新建该模块），就把 `<module>/pom.xml` 与根 `pom.xml` 并入该
-    子任务写权——前者用于建模块 POM，后者用于在父 `<modules>` 注册。pom 已存在时 executor 的
-    scope 归一会把 create 自动降级为 modify，故对"模块其实已存在"的情况也安全（至多 no-op）。
+    在本计划里有 create_files（=正在新建该模块）：
+    - `<module>/pom.xml` → 归该子任务 create_files（各模块自己的 POM，不同文件，无争用）；
+    - 根 `pom.xml`（父 `<modules>` 注册）→【单一归属】只归第一个这样的子任务，并从其余同类
+      子任务的写权移除。否则 N 个模块子任务都写同一根 pom → 验证器判 N 路写冲突（task 927d95c6
+      实证：45 子任务里 40+ 个都写 pom.xml，VALIDATE_PLAN 结构校验失败、刷屏、重试耗尽）。
+    pom 已存在时 executor 的 scope 归一会把 create 自动降级为 modify，故对"模块已存在"也安全。
     """
     changed = False
+    root_pom = "pom.xml"
     all_creates: list[str] = []
     all_write_targets: set[str] = set()
     for st in subtasks:
         scope = getattr(st, "scope", None)
         if scope is None:
             continue
-        creates = list(getattr(scope, "create_files", []) or [])
-        writables = list(getattr(scope, "writable", []) or [])
-        all_creates += creates
-        all_write_targets |= set(creates) | set(writables)
+        all_creates += list(getattr(scope, "create_files", []) or [])
+        all_write_targets |= set(getattr(scope, "create_files", []) or []) | set(
+            getattr(scope, "writable", []) or []
+        )
 
+    # 找出所有"新建 Maven 模块"的子任务（有 -pl <module> 且该模块目录下有 create_files）。
+    builders: list = []
     for st in subtasks:
         scope = getattr(st, "scope", None)
         harness = getattr(st, "harness", None)
@@ -54,29 +60,43 @@ def _ensure_maven_module_build_scope(subtasks: list) -> bool:
         for c in cmds:
             for m in _MVN_PL_RE.findall(c):
                 m = m.lstrip(":").strip()
-                # 只处理目录式模块名（`:artifactId` 形式无法可靠映射到目录，跳过）。
-                if m and "/" not in m:
+                # 只处理目录式模块名（`:artifactId` 无法可靠映射目录，跳过）+ 该模块确在新建。
+                if m and "/" not in m and any(
+                    cf.startswith(m.rstrip("/") + "/") for cf in all_creates
+                ):
                     modules.add(m)
+        if modules:
+            builders.append((st, scope, modules))
 
+    if not builders:
+        return False
+
+    # ① 各模块自己的 <module>/pom.xml → 归该 builder（不同文件，无争用）。
+    for _st, scope, modules in builders:
+        creates = list(getattr(scope, "create_files", []) or [])
         for mod in modules:
-            mod_prefix = mod.rstrip("/") + "/"
-            # 仅当该模块目录下确有 create_files（=本计划在新建它）才补 pom，避免对既有模块乱扩 scope。
-            if not any(cf.startswith(mod_prefix) for cf in all_creates):
-                continue
             mod_pom = f"{mod}/pom.xml"
-            root_pom = "pom.xml"
-            creates = list(getattr(scope, "create_files", []) or [])
-            writables = list(getattr(scope, "writable", []) or [])
             if mod_pom not in all_write_targets:
                 creates.append(mod_pom)
                 all_write_targets.add(mod_pom)
                 changed = True
-            if root_pom not in writables and root_pom not in creates:
-                writables.append(root_pom)
-                all_write_targets.add(root_pom)
-                changed = True
-            scope.create_files = creates
-            scope.writable = writables
+        scope.create_files = creates
+
+    # ② 根 pom.xml 单一归属：只归第一个 builder；从其余 builder 写权移除，杜绝 N 路争写。
+    owner_scope = builders[0][1]
+    owner_writ = list(getattr(owner_scope, "writable", []) or [])
+    owner_cre = list(getattr(owner_scope, "create_files", []) or [])
+    if root_pom not in owner_writ and root_pom not in owner_cre:
+        owner_writ.append(root_pom)
+        owner_scope.writable = owner_writ
+        changed = True
+    for _st, scope, _modules in builders[1:]:
+        w = list(getattr(scope, "writable", []) or [])
+        c = list(getattr(scope, "create_files", []) or [])
+        if root_pom in w or root_pom in c:
+            scope.writable = [f for f in w if f != root_pom]
+            scope.create_files = [f for f in c if f != root_pom]
+            changed = True
 
     return changed
 
