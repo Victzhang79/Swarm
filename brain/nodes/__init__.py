@@ -414,6 +414,11 @@ async def _plan_ultra_batched(
         except Exception:  # noqa: BLE001
             pass
 
+    # FINDING-10(task 25a6d83c)：每批 LLM 调用加【总墙钟上限】(asyncio.wait_for)——与 TECH_DESIGN
+    # stage2 单模块 500s 超时同构。否则 brain 模型(GLM-5.2)某批失控持续生成时,无 chunk 看门狗抓不到、
+    # read-timeout 不管总时长 → PLAN 单批挂死整个任务(实测挂 16min)。超时按已有 except 分支降级跳过。
+    import asyncio as _asyncio
+    _PLAN_BATCH_TIMEOUT = 300.0  # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
     batch_results: list[list[dict]] = []
     failed_batches = 0
     for i, (mod_name, batch) in enumerate(module_batches, start=1):
@@ -441,10 +446,13 @@ async def _plan_ultra_batched(
         )
         _t0 = _time.monotonic()
         try:
-            response = await llm.ainvoke([
-                {"role": "system", "content": PLAN_BATCH_SYSTEM},
-                {"role": "user", "content": prompt_user},
-            ])
+            response = await _asyncio.wait_for(
+                llm.ainvoke([
+                    {"role": "system", "content": PLAN_BATCH_SYSTEM},
+                    {"role": "user", "content": prompt_user},
+                ]),
+                timeout=_PLAN_BATCH_TIMEOUT,
+            )
             _dt = _time.monotonic() - _t0
             result = _parse_json_from_llm(response.content)
             subs = result.get("subtasks", []) if isinstance(result, dict) else []
@@ -461,6 +469,11 @@ async def _plan_ultra_batched(
                 failed_batches += 1
                 logger.warning("%s 模块'%s' 未拆出子任务（降级跳过）",
                                batch_progress_line(i, total, len(batch), _dt), mod_name)
+        except _asyncio.TimeoutError:
+            failed_batches += 1
+            logger.warning(
+                "%s 模块'%s' LLM 调用超时 >%.0fs（降级跳过，防 PLAN 无限挂 — FINDING-10）",
+                batch_progress_line(i, total, len(batch)), mod_name, _PLAN_BATCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             failed_batches += 1
             logger.warning("%s 模块'%s' 拆解异常（降级跳过）: %s",

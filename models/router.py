@@ -150,12 +150,19 @@ class ModelRouter:
         }
 
     def get_brain_llm(self) -> BaseChatModel:
-        """Brain 编排层 — 必须大模型（云端优先，本地 fallback）"""
+        """Brain 编排层 — 必须大模型（云端优先，本地 fallback）。
+
+        FINDING-10：brain 调用传 max_tokens 上限（防 reasoning 模型失控持续生成把 PLAN/规划
+        无限挂死）。0 表示不限（向后兼容）。
+        """
+        _bmt = getattr(self.config, "brain_max_tokens", 0) or None
         primary = self._get_provider_for_model(self.config.brain_primary).get_chat_model(
             self.config.brain_primary, temperature=self.config.brain_temperature,
+            max_tokens=_bmt,
         )
         fallback = self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
             self.config.brain_fallback, temperature=self.config.brain_temperature,
+            max_tokens=_bmt,
         )
         return primary.with_fallbacks([fallback])
 

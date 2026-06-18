@@ -166,6 +166,11 @@ class ModelConfig(BaseSettings):
     # 上下文上限 → 400 报错 → 子任务失败）。worker 应用 patch_file 做最小改动，输出本不该
     # 这么大；限上限既强制增量编辑、又留 fallback 接管空间。0 表示不限制（向后兼容）。
     worker_max_tokens: int = 8192
+    # brain 规划单次输出上限（token）。FINDING-10(task 25a6d83c)：brain 旧实现【不限】输出，
+    # 云端 reasoning 模型(GLM-5.2)在某规划批陷入【失控持续生成】→ 无 chunk 看门狗抓不到(chunk
+    # 一直在吐)、read-timeout 不管总时长 → PLAN 单批挂 16min。设上限封顶单次生成,失控时被截断
+    # → 该批降级而非无限挂。32k 足够最长的两阶段方案/分批拆解输出。0=不限(向后兼容,不建议)。
+    brain_max_tokens: int = 32768
     # 流式无 chunk 看门狗：两次 parsed chunk 间隔超此秒数即中断，触发 fallback。
     # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
     stream_chunk_timeout: float = 45.0

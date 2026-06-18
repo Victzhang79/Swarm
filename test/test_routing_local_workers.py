@@ -21,12 +21,14 @@ def test_complex_primary_is_strongest_local():
 
 
 def test_complex_fallback_chain_order():
-    """Q-T2-1：complex 兜底链 = 同级主力 MiniMax → 次级 Saka（122B-A10B 64K 已排除）。"""
+    """用户编排(2026-06-18)：complex 兜底链 = 先 27B-Saka(轻快112k) → 再另一台大的(保上下文)
+    → 最后 Step-Flash(256k但慢)。并行主力 40B/MiniMax 任一挂先上 27B-Saka。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert "MiniMax-M2.7-Pro" in fb[0], f"第一兜底应同级主力 MiniMax: {fb}"
-    assert "Saka" in fb[1], f"第二兜底应次级 Saka: {fb}"
+    assert "Saka" in fb[0], f"第一兜底应 27B-Saka(挂了先上小的): {fb}"
+    assert any("MiniMax" in x or "40B" in x for x in fb), f"应含另一台大模型兜底(保上下文): {fb}"
+    assert any("Step" in x for x in fb), f"应含 Step-Flash 最终垫底: {fb}"
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
 
@@ -57,12 +59,13 @@ def test_resolve_route_returns_list_fallback():
     assert isinstance(fb, list) and len(fb) >= 2  # MiniMax + Saka（122B-A10B 已排除）
 
 
-def test_alternate_picks_same_tier_main():
-    """retry 换备选取 fallback 链上首个≠primary 的同级主力 MiniMax（Q-T2-1），不是 Kimi。"""
+def test_alternate_picks_first_non_primary():
+    """retry 换备选取 fallback 链上【首个≠primary】的模型(FINDING-8)。用户编排下 complex
+    primary=40B、链首=27B-Saka → alternate=27B-Saka(大模型挂了先上小的兜底)。"""
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     _, model_name = r.get_alternate_llm_for_subtask("complex", "text")
-    assert "MiniMax-M2.7-Pro" in model_name, f"retry 应换同级主力: {model_name}"
+    assert "Saka" in model_name, f"complex(primary=40B) 挂了 alternate 应先上 27B-Saka: {model_name}"
 
 
 def test_alternate_skips_primary_duplicate():
