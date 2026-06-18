@@ -38,6 +38,7 @@ class TaskStatus(str, Enum):
     LEARNING_FAILURE = "LEARNING_FAILURE"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    PARTIAL = "PARTIAL"                 # 部分交付：部分子任务放弃，已完成的真实落盘（诚实未完成，非 DONE）
     DONE = "DONE"
 
 

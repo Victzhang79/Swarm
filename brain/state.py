@@ -59,6 +59,8 @@ class BrainState(TypedDict, total=False):
     failure_strategy: str               # handle_failure 决策: retry|retry_alternate|replan|escalate
     use_alternate_model: bool           # retry_alternate 时使用备选模型
     failure_escalated: bool             # escalate 时标记需人工介入
+    subtask_force_strong: dict[str, bool]  # FINDING-12：拒答/步数耗尽的子任务，重试强制走最强模型+更多步数
+    abandoned_subtask_ids: list[str]    # 部分交付：重试耗尽被放弃的子任务（+其依赖者），任务终态 PARTIAL 而非灭全部
     subtask_retry_counts: dict[str, int]  # 每个子任务的累计【capability】重试次数（换模型/升级阶梯）
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）

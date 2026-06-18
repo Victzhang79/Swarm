@@ -207,16 +207,23 @@ async def dispatch(state: BrainState) -> dict:
     # 让两个能力相当的本地主力(Qwen3.6-40B-Claude/MiniMax)同时干、分散负载、产出更快。
     # 轮转不覆盖 alternate(失败重试)；池空则不轮转(按 difficulty 路由)。
     _pool = list(getattr(config.worker, "worker_parallel_pool", []) or [])
+    _force_strong = state.get("subtask_force_strong") or {}  # FINDING-12
 
     async def _run_one(subtask: SubTask, idx: int = 0) -> tuple[SubTask, WorkerOutput | Exception]:
-        _override = _pool[idx % len(_pool)] if (_pool and not use_alternate) else None
+        # FINDING-12：拒答/步数耗尽子任务强制走【最强模型】(routing_complex=40B 256k)，不走 alternate
+        # 也不走轮转池——小模型 agent 循环不收敛，最强模型最能在步数内完成。
+        _fs = bool(_force_strong.get(subtask.id))
+        _ua = use_alternate and not _fs
+        _override = _pool[idx % len(_pool)] if (_pool and not _ua) else None
+        if _fs:
+            _override = config.model.routing_complex
         try:
             output = await nodes._dispatch_to_worker(
                 subtask,
                 knowledge_context,
                 project_id=project_id,
                 task_id=task_id,
-                use_alternate=use_alternate,
+                use_alternate=_ua,
                 user_profile_prompt=_worker_profile_prompt(state),
                 shared_contract=shared_contract,
                 model_override=_override,

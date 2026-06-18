@@ -304,6 +304,10 @@ class WorkerConfig(BaseSettings):
     # 空列表 = 不轮转(按 difficulty 路由单一模型,向后兼容)。
     worker_parallel_pool: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["Qwen3.6-40B-Claude-4.6-NVFP4", "MiniMax-M2.7-Pro"])
+    # 部分交付：单个子任务重试耗尽时，放弃它(+依赖者)继续交付其余，终态 PARTIAL(非 DONE)，
+    # 而非 fail-fast 灭掉整个任务(原行为：1 个子任务拒答 → 33 个好子任务一起 FAILED)。
+    # True=部分交付(仍诚实标 PARTIAL，不假成功)；False=旧 fail-fast。
+    allow_partial_delivery: bool = True
     max_execution_time: int = 600     # 10 分钟
     max_iterations: int = 50          # Agent 最大 Tool 调用轮次
     max_fix_rounds: int = 3           # 编码内循环最大修复轮次

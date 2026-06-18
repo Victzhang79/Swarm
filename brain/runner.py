@@ -491,21 +491,36 @@ async def _handle_post_run(
         subtask_results=state.get("subtask_results"),
     )
     duration = store.compute_task_duration_seconds(task_rec)
+    # 部分交付：有子任务被放弃(重试耗尽)→ 终态 PARTIAL(非 DONE)。已完成子任务的真实产物照常
+    # 落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃项——绝不当 DONE 假成功。
+    _abandoned = state.get("abandoned_subtask_ids") or []
+    _final_status = "PARTIAL" if _abandoned else "DONE"
     store.update_task(
         task_id,
-        status="DONE",
+        status=_final_status,
         token_usage=token_usage,
         duration_seconds=round(duration, 2) if duration is not None else None,
     )
-    _emit_task_notification(task_id, task_rec, "DONE")
+    _emit_task_notification(task_id, task_rec, _final_status)
     output_parts = _build_result_payload(state)
-    await _emit(queue, {
-        "step": "complete",
-        "status": "done",
-        "message": "任务执行完成",
-        "mode": "brain",
-        "progress": 100,
-    })
+    if _abandoned:
+        logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个子任务 %s",
+                       task_id, len(_abandoned), _abandoned)
+        await _emit(queue, {
+            "step": "complete",
+            "status": "partial",
+            "message": f"部分交付：已完成子任务真实落盘，放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}",
+            "mode": "brain",
+            "progress": 100,
+        })
+    else:
+        await _emit(queue, {
+            "step": "complete",
+            "status": "done",
+            "message": "任务执行完成",
+            "mode": "brain",
+            "progress": 100,
+        })
     await _emit(queue, {"step": "result", "mode": "brain", "result": output_parts})
 
 

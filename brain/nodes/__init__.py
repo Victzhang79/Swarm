@@ -1484,8 +1484,49 @@ async def handle_failure(state: BrainState) -> dict:
     next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
     deepest = max(next_counts.values(), default=0)
 
+    # FINDING-12：拒答/步数耗尽(refusal_hard_fail)的子任务，重试强制走【最强模型】(40B 256k)，
+    # 而非更弱 fallback——步数耗尽是小模型 agent 循环不收敛，换更弱只会更糟。
+    force_strong = dict(state.get("subtask_force_strong", {}))
+    for _fid in failed_ids:
+        _res = subtask_results.get(_fid)
+        _src = (getattr(_res, "l1_details", {}) or {}).get("l1_decision_source") if _res else None
+        if _src == "refusal_hard_fail":
+            force_strong[_fid] = True
+
     if deepest > max_retries + 1:
-        # 已用尽 retry(max_retries 次) + retry_alternate(1 次) 仍失败 → 升级人工
+        # 重试耗尽。【部分交付】：已有完成子任务 + 开启 partial → 放弃 failed(+传递依赖者)，
+        # 继续交付其余，终态 PARTIAL(非 DONE，诚实未完成)。否则(0 完成 / 关闭 partial) →
+        # 维持 escalate(整任务失败)，避免无产出却假成功。
+        _abandoned_so_far = set(state.get("abandoned_subtask_ids") or [])
+        _done = [tid for tid in subtask_results
+                 if tid not in failed_ids and tid not in _abandoned_so_far]
+        _allow_partial = getattr(get_config().worker, "allow_partial_delivery", True)
+        if _allow_partial and _done and plan_obj is not None:
+            abandoned = _abandoned_so_far | set(failed_ids)
+            # 传递放弃：依赖被放弃者的子任务也放弃(缺依赖跑不了)，避免它们永留 remaining 死循环
+            _changed = True
+            while _changed:
+                _changed = False
+                for _st in plan_obj.subtasks:
+                    if _st.id not in abandoned and any(
+                        d in abandoned for d in (getattr(_st, "depends_on", []) or [])
+                    ):
+                        abandoned.add(_st.id)
+                        _changed = True
+            _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
+            logger.warning(
+                "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",
+                failed_ids, len(abandoned), len(_remaining),
+            )
+            return {
+                "failure_strategy": "abandon",
+                "abandoned_subtask_ids": sorted(abandoned),
+                "failed_subtask_ids": [],
+                "dispatch_remaining": _remaining,
+                "subtask_force_strong": force_strong,
+                "subtask_retry_counts": {**retry_counts, **next_counts},
+            }
+        # 已用尽 retry + alternate 且无可交付/关闭 partial → 升级人工(整任务失败)
         logger.warning(
             "[HANDLE_FAILURE] 子任务重试已达上限（retry %d + alternate 1），升级人工审核: %s",
             max_retries, failed_ids,
@@ -1518,6 +1559,7 @@ async def handle_failure(state: BrainState) -> dict:
         "subtask_results": subtask_results,
         "failure_strategy": effective_strategy,
         "subtask_retry_counts": {**retry_counts, **next_counts},
+        "subtask_force_strong": force_strong,  # FINDING-12：拒答子任务重试走最强模型
     }
     if effective_strategy == "retry_alternate":
         out["use_alternate_model"] = True
