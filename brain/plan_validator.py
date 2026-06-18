@@ -128,7 +128,8 @@ def validate_plan_structure(
         else:
             result.warn(
                 f"{len(ids)} 个依赖序子任务都写 {fp}: [{joined}]"
-                f"（B3 要求文件不重叠，MERGE 可能冲突，建议每个文件只归一个子任务）"
+                f"（已串行化；聚合/注册类共享文件由 bootstrap 传播 + MERGE 3-way/rebase 收口，"
+                f"非聚合文件建议仍只归一个子任务）"
             )
 
     # 检索定位文件覆盖（可选）

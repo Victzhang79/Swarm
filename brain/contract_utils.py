@@ -12,6 +12,41 @@ from swarm.types import TaskPlan
 _MVN_PL_RE = re.compile(r"-pl\s+([^\s,]+)")
 
 
+def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool]) -> bool:
+    """文件是否已存在于项目 repo 基线（用于区分"聚合修改"vs"新建撞车"）。
+
+    争抢分流的事实依据：已存在文件被多个独立子任务写 = 聚合/注册类共享文件
+    （父 pom/settings.gradle/路由 index/DI 注册表…），必须保留各自写权（串行）不可
+    静默降级丢贡献；不存在 = 真·新建撞车，独占首写者即可。
+
+    git repo → 以 HEAD 为权威基线（`git cat-file -e HEAD:<rel>`，整洁排除未跟踪残留）；
+    非 git → 退化 os.path.isfile。project_path 为空 → 一律 False（退化为今日 demote 行为，
+    向后兼容）。结果按 rel 缓存，避免对同一文件重复 fork git。
+    """
+    if not project_path or not rel:
+        return False
+    if rel in cache:
+        return cache[rel]
+    import os
+    import subprocess
+
+    result = False
+    try:
+        if os.path.isdir(os.path.join(project_path, ".git")):
+            r = subprocess.run(
+                ["git", "-C", project_path, "cat-file", "-e", f"HEAD:{rel}"],
+                capture_output=True,
+                timeout=10,
+            )
+            result = r.returncode == 0
+        else:
+            result = os.path.isfile(os.path.join(project_path, rel))
+    except (OSError, subprocess.SubprocessError):
+        result = False
+    cache[rel] = result
+    return result
+
+
 def _ensure_maven_module_build_scope(subtasks: list) -> bool:
     """规则3：Maven 新模块构建闸门【可满足性】补全（现场 task 69d34b1b）。
 
@@ -90,20 +125,25 @@ def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:
     return plan
 
 
-def normalize_plan_scopes(plan: TaskPlan) -> bool:
+def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。
 
     task 0f93f1fc 现场：st-1-1 把 NumberUtilsTest.java 放进 create_files，st-1-2 想改它
     但该文件既不在 st-1-2 的 writable 也不在 create_files → scope_guard 拦截 → empty_diff。
 
-    两条归一规则（原地修改 plan.subtasks）：
-    1. 同文件写权唯一：同一文件被多个子任务列为写目标(create_files ∪ writable)时，
-       按子任务在列表中的顺序（近似拓扑序：上游在前）保留首个为"写者"，
-       后续子任务对该文件的写权降级——从 create_files/writable 移除，并入 readable
-       （它们仍可读到上游产物，但不重复创建/抢写，避免 scope 冲突）。
-    2. 被依赖产物自动入域：子任务 depends_on 的上游写产物(create_files ∪ writable)，
-       若不在本任务任何写权内，自动并入本任务 readable（保证能读到依赖的契约/实现）。
+    归一规则（原地修改 plan.subtasks）：
+    1. 同文件写权处理：同一文件被多个子任务列为写目标(create_files ∪ writable)时，按子任务
+       顺序（近似拓扑序：上游在前）取首写者。其余写者分流（治本"文件被争抢"这一类，2026-06-18）：
+       - 串行链协作（其一传递依赖另一）：create→writable 改首写者产物，保留写权。
+       - 独立并发 + 文件【已存在于 repo】（聚合/注册类共享文件，如父 pom/settings.gradle/
+         路由 index/DI 注册表）：【保留写权】并按写者序【串行化】（依赖前序写者，防环守卫）。
+         绝不降级 readable——降级会静默丢失各写者的登记。MERGE 3-way+rebase + bootstrap
+         传播负责收口。需 project_path 判存在；缺省退化为下一条 demote（向后兼容）。
+       - 独立并发 + 文件【不存在】（真·新建撞车）：首写者建，其余降级 readable + 依赖首写者。
+    2. 被依赖产物自动入域：子任务 depends_on 的上游写产物，自动并入本任务 readable。
+    （规则3=Maven 模块自身 pom 补全；规则4=Maven 父 pom 单 owner 注册 backstop，见下。）
 
+    project_path：项目仓库路径（用于判断文件是否已存在 → 区分聚合修改 vs 新建撞车）。
     返回是否发生了任何 scope 改动（供调用方决定是否回写 plan）。
     """
     subtasks = list(getattr(plan, "subtasks", []) or [])
@@ -115,17 +155,20 @@ def normalize_plan_scopes(plan: TaskPlan) -> bool:
     # 放规则1前，使补进来的 pom 也受"同文件写权唯一"去重/串行化（多模块子任务不并发抢写根 pom）。
     changed = _ensure_maven_module_build_scope(subtasks) or changed
 
-    # ── 规则 1：同文件写权处理（区分串行协作 vs 独立并发）──
-    # 记录每个文件的首个写者（按 subtasks 顺序，近似拓扑序）
-    first_writer: dict[str, str] = {}
+    # ── 规则 1：同文件写权处理（区分串行协作 vs 独立并发 vs 聚合修改）──
+    # 每个文件的【有序写者列表】（按 subtasks 顺序，近似拓扑序：上游在前）。
+    writers_by_file: dict[str, list[str]] = {}
     for st in subtasks:
         scope = getattr(st, "scope", None)
         if scope is None:
             continue
-        write_targets = list(getattr(scope, "create_files", []) or []) + list(getattr(scope, "writable", []) or [])
-        for f in write_targets:
-            if f not in first_writer:
-                first_writer[f] = st.id
+        _wt = list(getattr(scope, "create_files", []) or [])
+        _wt += list(getattr(scope, "writable", []) or [])
+        for f in _wt:
+            ids = writers_by_file.setdefault(f, [])
+            if st.id not in ids:
+                ids.append(st.id)
+    first_writer: dict[str, str] = {f: ids[0] for f, ids in writers_by_file.items()}
 
     # 依赖可达性：判断 a 是否（直接/间接）依赖 b，用于区分"串行子链协作"与"独立并发"。
     by_id_all = {getattr(s, "id", ""): s for s in subtasks}
@@ -148,6 +191,29 @@ def normalize_plan_scopes(plan: TaskPlan) -> bool:
         """两个写者是否在同一串行链上（其一传递依赖另一）→ 串行写同一文件安全。"""
         return _depends_transitively(a_id, b_id) or _depends_transitively(b_id, a_id)
 
+    # 争抢分流分类（仅对 ≥2 写者的文件）：文件【已存在于 repo】= 聚合/注册类共享文件
+    # （父 pom/settings.gradle/路由 index/DI 注册表…），独立写者保留写权 + 串行化（防丢贡献）；
+    # 不存在 = 真·新建撞车，独占首写者，其余降级。project_path 缺省 → 无聚合文件（退化今日行为）。
+    _exist_cache: dict[str, bool] = {}
+    aggregate_files: set[str] = {
+        f for f, ids in writers_by_file.items()
+        if len(ids) >= 2 and _exists_in_repo(project_path, f, _exist_cache)
+    }
+
+    def _prev_safe_writer(f: str, me: str) -> str | None:
+        """聚合文件串行化：返回写者序里 me 之前、不会与 me 成环的最近前序写者；无则 None。"""
+        ids = writers_by_file.get(f, [])
+        if me not in ids:
+            return None
+        for j in range(ids.index(me) - 1, -1, -1):
+            cand = ids[j]
+            # cand 不能（传递）依赖 me，否则加 me→cand 依赖会成环。
+            if not _depends_transitively(cand, me):
+                return cand
+        return None
+
+    serialized_ids: set[str] = set()  # 因聚合文件被串行化（保留写权）的子任务
+
     for st in subtasks:
         scope = getattr(st, "scope", None)
         if scope is None:
@@ -156,49 +222,139 @@ def normalize_plan_scopes(plan: TaskPlan) -> bool:
         writables = list(getattr(scope, "writable", []) or [])
         readables = list(getattr(scope, "readable", []) or [])
         new_creates: list[str] = []
-        new_writables = list(writables)
-        demoted: list[str] = []  # 真正降级为只读的文件（独立并发竞争者）
-        chain_modify: list[str] = []  # 串行链协作：create→writable（修改首写者产物）
+        new_writables: list[str] = []
+        demoted: list[str] = []  # 真正降级为只读的文件（独立并发新建撞车）
+        serialize_after: dict[str, str] = {}  # 聚合文件 → 需串行依赖的前序写者
 
-        for f in creates:
+        # 合并写目标按 (文件, 是否新建) 处理：create 优先，writable 去重（同文件双列只算一次）。
+        targets: list[tuple[str, bool]] = [(f, True) for f in creates]
+        _seen_t = set(creates)
+        for f in writables:
+            if f not in _seen_t:
+                targets.append((f, False))
+                _seen_t.add(f)
+
+        for f, from_create in targets:
             writer = first_writer.get(f)
             if writer == st.id:
-                new_creates.append(f)  # 首写者：保留 create
-            elif writer and _on_same_serial_chain(st.id, writer):
-                # 串行链上的后续写者：不能重复 create（首写者已新建），转为 writable 修改。
+                # 首写者：聚合文件且已存在 → 实为 modify，落 writable；否则保留原操作类型。
+                if f in aggregate_files:
+                    if f not in new_writables:
+                        new_writables.append(f)
+                elif from_create:
+                    new_creates.append(f)
+                else:
+                    new_writables.append(f)
+            elif writer is None or _on_same_serial_chain(st.id, writer):
+                # 串行链协作（或无主）：保留写权（create→writable 改首写者产物）。
                 if f not in new_writables:
-                    chain_modify.append(f)
+                    new_writables.append(f)
+            elif f in aggregate_files:
+                # 独立并发 + 聚合文件：保留写权（转 writable 修改）+ 串行到前序写者，绝不降级。
+                prev = _prev_safe_writer(f, st.id)
+                if prev:
+                    if f not in new_writables:
+                        new_writables.append(f)
+                    serialize_after[f] = prev
+                    serialized_ids.add(st.id)
+                else:
+                    demoted.append(f)  # 无安全前序（防环兜底）→ 退化降级
             else:
-                # 独立并发的非首写者：降级 readable，杜绝并发抢建同一文件。
+                # 独立并发 + 新建撞车：降级 readable，杜绝并发抢建同一文件。
                 demoted.append(f)
 
-        # writable 同理：非首写者且不在串行链 → 降级；串行链上保留可写。
-        kept_writables: list[str] = []
-        for f in new_writables:
-            writer = first_writer.get(f)
-            if writer is None or writer == st.id or _on_same_serial_chain(st.id, writer):
-                kept_writables.append(f)
-            else:
-                demoted.append(f)
-        new_writables = kept_writables + chain_modify
-
-        if demoted or chain_modify or new_creates != creates or new_writables != writables:
+        # serialize_after 也要进：聚合文件保留写权时 scope 内容不变，但仍需补串行依赖。
+        if (new_creates != creates or new_writables != writables or demoted or serialize_after):
             for f in demoted:
-                if f not in readables:
+                if f not in readables and f not in new_writables:
                     readables.append(f)
             scope.create_files = new_creates
             scope.writable = new_writables
             scope.readable = readables
             changed = True
-            # Bug-3 根治：写权被降级（独立并发竞争者）→ 依赖首写者强制串行，杜绝并发
-            # 物理冲突。串行链上的协作写者已有依赖关系，无需重复加。
             deps = list(getattr(st, "depends_on", []) or [])
+            # 降级者（新建撞车）依赖首写者强制串行，杜绝并发物理冲突。
             for f in demoted:
                 writer = first_writer.get(f)
                 if writer and writer != st.id and writer not in deps:
                     deps.append(writer)
+            # 聚合文件保留写权者：依赖前序写者，串行追加（bootstrap 传播 + MERGE 3-way/rebase 收口）。
+            for prev in serialize_after.values():
+                if prev and prev != st.id and prev not in deps:
+                    deps.append(prev)
             if deps != list(getattr(st, "depends_on", []) or []):
                 st.depends_on = deps
+
+    # 聚合文件被串行化保留写权后，相关子任务不能再与前序写者同处一个 parallel_group
+    # （否则 validator 的 parallel-group 同写检查会硬 fail）。parallel_groups 已 vestigial
+    # （dispatch 走 depends_on，见 planning_nodes._rebuild_plan "依赖驱动调度不需要它"），
+    # 直接清空交由依赖驱动调度，与既有约定一致。
+    if serialized_ids and getattr(plan, "parallel_groups", None):
+        plan.parallel_groups = []
+        changed = True
+
+    # ── 规则 4：Maven 父 pom 单 owner 注册 backstop（治本"文件被争抢"之 Maven 专项）──
+    # 规则3 只补各模块【自己的】pom；父 `<modules>` 注册是 N 个新模块往同一文件追加。planner
+    # 通常已给一个脚手架子任务 own 根 pom（line76 不可重叠硬约束）；多 owner 情形交规则1 串行网。
+    # 唯一缺口：有新模块但【无人】own 根 pom → 模块永不被注册、`mvn -pl X` reactor not found。
+    # 本规则仅补这个缺口：指派单一 owner 登记全部新模块（additive，不动既有 owner）。
+    new_modules: set[str] = set()
+    pom_owned = False
+    for st in subtasks:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        creates = list(getattr(scope, "create_files", []) or [])
+        writables = list(getattr(scope, "writable", []) or [])
+        if "pom.xml" in creates or "pom.xml" in writables:
+            pom_owned = True
+        for cf in creates:
+            if cf.endswith("/pom.xml") and cf.count("/") == 1:
+                new_modules.add(cf.split("/", 1)[0])
+    # 仅当：有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）+ 当前无人 own 根 pom。
+    if new_modules and not pom_owned and _exists_in_repo(project_path, "pom.xml", _exist_cache):
+        owner = next(
+            (
+                st for st in subtasks
+                if any(
+                    cf.endswith("/pom.xml") and cf.count("/") == 1
+                    for cf in (getattr(getattr(st, "scope", None), "create_files", []) or [])
+                )
+            ),
+            None,
+        )
+        if owner is not None and getattr(owner, "scope", None) is not None:
+            w = list(getattr(owner.scope, "writable", []) or [])
+            if "pom.xml" not in w:
+                w.append("pom.xml")
+                owner.scope.writable = w
+                changed = True
+            ac = list(getattr(owner, "acceptance_criteria", []) or [])
+            note = f"在根 pom.xml 的 <modules> 中登记全部新模块: {sorted(new_modules)}"
+            if note not in ac:
+                ac.append(note)
+                owner.acceptance_criteria = ac
+                changed = True
+            # 其余构建新模块的子任务依赖 owner（确保注册已就位再 mvn -pl），带防环守卫。
+            for st in subtasks:
+                if st.id == owner.id:
+                    continue
+                scope = getattr(st, "scope", None)
+                if scope is None:
+                    continue
+                builds_new_module = any(
+                    "/" in cf and cf.split("/", 1)[0] in new_modules
+                    for cf in (
+                        list(getattr(scope, "create_files", []) or [])
+                        + list(getattr(scope, "writable", []) or [])
+                    )
+                )
+                if builds_new_module and not _depends_transitively(owner.id, st.id):
+                    deps = list(getattr(st, "depends_on", []) or [])
+                    if owner.id not in deps:
+                        deps.append(owner.id)
+                        st.depends_on = deps
+                        changed = True
 
     # ── 规则 2：被依赖产物自动入 readable ──
     by_id = {st.id: st for st in subtasks}

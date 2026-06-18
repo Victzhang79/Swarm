@@ -1225,14 +1225,8 @@ async def elaborate(state: BrainState) -> dict:
         enrich_java_package_readable,
         normalize_plan_scopes,
     )
-    scope_normalized = normalize_plan_scopes(plan_obj)
-
-    # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
-    # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
-    if correct_misclassified_intent(plan_obj):
-        logger.info("[ELABORATE] 意图校正：AUDIT 子任务含写文件 → 纠正为 MODIFY/CREATE（确定性信号覆盖 LLM 误判）")
-
-    # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
+    # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
+    # （治本文件争抢——已存在聚合文件多写者串行保留写权，不静默降级丢贡献）。
     _proj_path = None
     try:
         from swarm.project import store as _store
@@ -1241,7 +1235,15 @@ async def elaborate(state: BrainState) -> dict:
             _proj = _store.get_project(_pid)
             _proj_path = _proj.get("path") if _proj else None
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[ELABORATE] 获取 project_path 失败，跳过 Java 同包入域: %s", exc)
+        logger.debug("[ELABORATE] 获取 project_path 失败，scope 归一退化为 demote 行为: %s", exc)
+    scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
+
+    # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
+    # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
+    if correct_misclassified_intent(plan_obj):
+        logger.info("[ELABORATE] 意图校正：AUDIT 子任务含写文件 → 纠正为 MODIFY/CREATE（确定性信号覆盖 LLM 误判）")
+
+    # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
     java_enriched = enrich_java_package_readable(plan_obj, _proj_path)
     if java_enriched:
         logger.info("[ELABORATE] P2-1: 已将 Java 同 package 类纳入相关子任务 readable")

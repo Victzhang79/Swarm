@@ -25,7 +25,7 @@ def test_dependent_subtasks_overlap_warns():
     )
     r = validate_plan_structure(plan)
     assert r.valid, "依赖序重叠应仅 warn 不阻断"
-    assert any("文件不重叠" in w or "MERGE 可能冲突" in w for w in r.warnings)
+    assert any("串行化" in w or "MERGE" in w or "只归一个子任务" in w for w in r.warnings)
 
 
 def test_independent_subtasks_overlap_fails():
