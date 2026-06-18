@@ -230,10 +230,20 @@ class ModelRouter:
 
         用于失败重试时强制切换到备选模型。封装原先 dispatch 直接调用 ModelRouter
         私有方法(_resolve_route/_get_provider_for_model)的逻辑，恢复封装边界。
-        优先用路由表的 fallback，无 fallback 时回退 primary。
+        选【第一个 ≠ primary 的 fallback】做备选——FINDING-8(task 3e07c592)：旧实现盲取
+        fallback_names[0]，而 fallback 链首常就是 primary 本身(如 MEDIUM_FALLBACK 链首=primary)，
+        导致 retry_alternate "换" 到刚失败的同一个模型，形同虚设(本地引擎崩溃时整盘失败)。
+        无真异构备选时(如 COMPLEX 只配单模型)回退 primary 并告警(可观测，不静默)。
         """
         primary_name, fallback_names = self._resolve_route(difficulty, modality)
-        model_name = (fallback_names[0] if fallback_names else None) or primary_name
+        alt = next((f for f in (fallback_names or []) if f and f != primary_name), None)
+        if not alt:
+            logger.warning(
+                "[ROUTER] %s/%s 无异构备选模型(fallback 链为空或全=primary '%s')，"
+                "retry_alternate 仍用 primary；建议为该难度配异构后端 fallback",
+                difficulty, modality, primary_name,
+            )
+        model_name = alt or primary_name
         prov = self._get_provider_for_model(model_name)
         role = f"worker/{difficulty}/alternate"
         llm = prov.get_chat_model(

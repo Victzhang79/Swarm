@@ -58,11 +58,36 @@ def test_resolve_route_returns_list_fallback():
 
 
 def test_alternate_picks_same_tier_main():
-    """retry 换备选取 fallback[0]=同级主力 MiniMax（Q-T2-1），不是 Kimi。"""
+    """retry 换备选取 fallback 链上首个≠primary 的同级主力 MiniMax（Q-T2-1），不是 Kimi。"""
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     _, model_name = r.get_alternate_llm_for_subtask("complex", "text")
     assert "MiniMax-M2.7-Pro" in model_name, f"retry 应换同级主力: {model_name}"
+
+
+def test_alternate_skips_primary_duplicate():
+    """FINDING-8(task 3e07c592)：fallback 链首=primary 时，备选须跳到下一个≠primary 的模型，
+    绝不重选刚失败的 primary（否则本地引擎崩溃时 retry_alternate 形同虚设、整盘失败）。"""
+    from swarm.config.settings import ModelConfig
+    from swarm.models.router import ModelRouter
+    r = ModelRouter(ModelConfig(
+        routing_medium="Qwen-40B",
+        routing_medium_fallback="Qwen-40B,Qwen-27B",  # 链首=primary（现场 MEDIUM 链就这样）
+    ))
+    _, model_name = r.get_alternate_llm_for_subtask("medium", "text")
+    assert model_name == "Qwen-27B", f"应跳过=primary 的链首、取下一个异构模型: {model_name}"
+
+
+def test_alternate_falls_back_to_primary_when_no_distinct():
+    """链全=primary 或空（如 COMPLEX 只配单模型）→ 回退 primary，不崩。"""
+    from swarm.config.settings import ModelConfig
+    from swarm.models.router import ModelRouter
+    r = ModelRouter(ModelConfig(
+        routing_complex="Solo-40B",
+        routing_complex_fallback="Solo-40B",  # 唯一且=primary，无真异构备选
+    ))
+    _, model_name = r.get_alternate_llm_for_subtask("complex", "text")
+    assert model_name == "Solo-40B"
 
 
 def test_coerce_model_list_formats():
