@@ -21,12 +21,13 @@ def test_new_maven_module_injects_pom_and_parent():
     changed = normalize_plan_scopes(plan)
     sc = plan.subtasks[0].scope
     assert changed is True
-    assert "ruoyi-alarm-app/pom.xml" in sc.create_files, "模块 pom 必须并入写权"
-    assert "pom.xml" in sc.writable, "根 pom 必须并入写权（注册 <module>）"
+    assert "ruoyi-alarm-app/pom.xml" in sc.create_files, "模块自己的 pom 必须并入写权"
+    # 回滚后：Rule 3 不再碰根 pom（父注册交给脚手架子任务 + bootstrap 传播）
+    assert "pom.xml" not in (sc.writable or []), "Rule 3 不应再添加根 pom"
 
 
 def test_acceptance_criteria_also_detected():
-    """`-pl` 出现在 acceptance_criteria 里同样应触发补全。"""
+    """`-pl` 出现在 acceptance_criteria 里同样应触发模块 pom 补全（不碰根 pom）。"""
     plan = _plan(
         FileScope(create_files=["mymod/src/main/java/A.java"]),
         TaskHarness(language="java"),
@@ -35,7 +36,7 @@ def test_acceptance_criteria_also_detected():
     normalize_plan_scopes(plan)
     sc = plan.subtasks[0].scope
     assert "mymod/pom.xml" in sc.create_files
-    assert "pom.xml" in sc.writable
+    assert "pom.xml" not in (sc.writable or [])
 
 
 def test_existing_module_not_expanded():
@@ -69,18 +70,16 @@ def test_pom_not_duplicated_when_already_in_scope():
     plan = _plan(
         FileScope(
             create_files=["mod/src/main/java/D.java", "mod/pom.xml"],
-            writable=["pom.xml"],
         ),
         TaskHarness(language="java", build_command="mvn -pl mod -am compile"),
     )
     normalize_plan_scopes(plan)
     sc = plan.subtasks[0].scope
     assert sc.create_files.count("mod/pom.xml") == 1
-    assert sc.writable.count("pom.xml") == 1
 
 
-# ── 多 builder：根 pom 单一归属（治 task 927d95c6 的 N 路争写） ──
-def test_multi_module_root_pom_single_owner():
+# ── 回滚守护：多 builder 时 Rule 3 不再给任何子任务加根 pom（不喷洒、不单归属） ──
+def test_multi_module_rule3_does_not_touch_root_pom():
     sts = []
     for i, mod in enumerate(["alarm-app", "alarm-channel", "alarm-api"], start=1):
         sts.append(SubTask(
@@ -90,10 +89,10 @@ def test_multi_module_root_pom_single_owner():
         ))
     plan = TaskPlan(subtasks=sts)
     normalize_plan_scopes(plan)
-    owners = [s.id for s in plan.subtasks
-              if "pom.xml" in (s.scope.writable or []) or "pom.xml" in (s.scope.create_files or [])]
-    assert owners == ["st-1"], f"根 pom 应只归第一个 builder，实际 {owners}"
-    # 各模块自己的 pom 仍在各自 create_files（不同文件，无争用）
+    root_writers = [s.id for s in plan.subtasks
+                    if "pom.xml" in (s.scope.writable or []) or "pom.xml" in (s.scope.create_files or [])]
+    assert root_writers == [], f"Rule 3 不应给任何子任务加根 pom，实际 {root_writers}"
+    # 但各模块自己的 pom 仍补齐（不同文件，无争用）
     for i, mod in enumerate(["alarm-app", "alarm-channel", "alarm-api"], start=1):
         assert f"{mod}/pom.xml" in plan.subtasks[i - 1].scope.create_files
 
