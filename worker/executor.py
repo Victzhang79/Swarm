@@ -1060,6 +1060,37 @@ class WorkerExecutor:
                         rel_files.append(rel)
                         _seen.add(rel)
                         _extra.append(rel)
+                # FINDING-11(task 0847c303)：build-critical 清单(root/模块 pom、settings/build.gradle)
+                # 任何 `mvn -pl`/reactor 构建都隐式依赖父 pom 的 <modules> 注册，但这些文件常【不在本
+                # 子任务 scope】(上面 readable 循环漏掉)→ 上游脚手架注册的父 pom 不传到本沙箱 → reactor
+                # not found(实测 st-3 跨 replan/retry 全败)。故【始终】补传变更的 build 清单(local≠HEAD)，
+                # 不限 scope——是 69d34b1b 修复的泛化(从"传 scope 内变更"扩到"额外始终传 build-critical")。
+                _BUILD_MANIFESTS = (
+                    "pom.xml", "settings.gradle", "build.gradle",
+                    "settings.gradle.kts", "build.gradle.kts",
+                )
+                try:
+                    _ch = _sp.run(
+                        ["git", "diff", "--name-only", "HEAD"],
+                        cwd=str(local_root), capture_output=True, text=True, timeout=15,
+                    ).stdout.splitlines()
+                    _ut = _sp.run(
+                        ["git", "ls-files", "--others", "--exclude-standard"],
+                        cwd=str(local_root), capture_output=True, text=True, timeout=15,
+                    ).stdout.splitlines()
+                except Exception:  # noqa: BLE001
+                    _ch, _ut = [], []
+                for rel in (_ch + _ut):
+                    rel = (rel or "").strip()
+                    if not rel or rel in _seen:
+                        continue
+                    if rel.rsplit("/", 1)[-1] not in _BUILD_MANIFESTS:
+                        continue
+                    if not (local_root / rel).is_file():
+                        continue
+                    rel_files.append(rel)
+                    _seen.add(rel)
+                    _extra.append(rel)
             if _extra:
                 self._log(
                     f"{reason} 自带源码：补传 {len(_extra)} 个上游产物(本地≠HEAD，如模块/父 pom): {_extra[:5]}"

@@ -62,6 +62,48 @@ def test_reset_scope_no_longer_targets_readable():
     assert "for f in self._scope_files():" not in src, "reset 不应再遍历 _scope_files(含 readable)"
 
 
+def test_bootstrap_always_propagates_build_manifests_out_of_scope(tmp_path):
+    """FINDING-11(task 0847c303)：变更的 build 清单(root/模块 pom)即使【不在子任务 scope】也始终补传。
+
+    现场：st-3(service 子任务)scope 不含 root pom；上游脚手架已注册父 pom，但 092b189 只补传
+    scope-readable 内的变更 → 父注册不传到 st-3 沙箱 → `mvn -pl <module>` reactor not found。
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "base.java").write_text("class Base{}\n")
+    (proj / "pom.xml").write_text("<modules></modules>\n")  # 真·root pom
+    (proj / "mod").mkdir()
+    (proj / "mod" / "S.java").write_text("class S{}\n")
+    _git(proj, "init", "-q")
+    _git(proj, "add", "-A")
+    _git(proj, "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-q", "-m", "init")
+    # 上游脚手架：注册父 pom(改 tracked) + 新建模块 pom(untracked)——都【不在 st-3 scope】
+    (proj / "pom.xml").write_text("<modules><module>mod</module></modules>\n")
+    (proj / "mod" / "pom.xml").write_text("<project/>\n")
+
+    st = SubTask(id="st-3", description="d", scope=FileScope(
+        writable=[], readable=["base.java"]))  # scope 不含任何 pom
+    ex = WorkerExecutor(st, project_path=str(proj))
+    ex._sandbox_has_source = True
+    ex._sandbox = object()
+
+    captured: dict = {}
+    mgr = MagicMock()
+
+    def _cap(sb, root, rel_files, workdir):
+        captured["rel"] = list(rel_files)
+        return {"uploaded": len(rel_files), "errors": []}
+
+    mgr.sync_files_to_sandbox.side_effect = _cap
+    ex._sandbox_manager = mgr
+
+    asyncio.run(ex._sync_to_sandbox("bootstrap"))
+    rel = captured.get("rel", [])
+    assert "pom.xml" in rel, f"变更的 root pom(注册了模块)应始终补传(不限 scope): {rel}"
+    assert "mod/pom.xml" in rel, f"新建模块 pom 应始终补传(不限 scope): {rel}"
+    assert "base.java" not in rel, f"未改的 readable 不补传: {rel}"
+
+
 if __name__ == "__main__":
     import sys
     import pytest
