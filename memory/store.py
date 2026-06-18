@@ -498,12 +498,21 @@ class MemoryStore:
         project_id: str,
         query: str,
         top_k: int = 5,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """基于向量的成功模式检索"""
+        """基于向量的成功模式检索。
+
+        query_vector：可选显式查询向量。传入则绕过 embed 服务（供测试用真实
+        非零向量验证 decay/过滤逻辑，不依赖外部 bge-m3 服务，避免 CI 无服务时
+        零向量短路返空导致的 CI-only 失败）。生产不传，走 _embed_fn 原路径。
+        """
         conn = self._conn_or_raise()
 
-        vectors = await self._embed_fn([query])
-        query_vector = vectors[0]
+        if query_vector is not None:
+            query_vector = list(query_vector)
+        else:
+            vectors = await self._embed_fn([query])
+            query_vector = vectors[0]
         # N-13：同 query_mistakes，零向量→相似度排序退化随机，L6 成功模式返回 [] 而非随机模式。
         if _is_zero_vector(query_vector):
             logger.warning(

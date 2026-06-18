@@ -64,8 +64,12 @@ async def _run() -> None:
         # 把 stale 衰减到阈值以下（0.01 < 0.05）
         await store.update_success_decay_weight(stale_id, 0.01)
 
-        # 检索（query 任意，向量相同，靠 decay 过滤区分）
-        results = await store.query_successes(_TEST_PROJECT_ID, query="pattern", top_k=10)
+        # 检索（query 任意，显式传非零向量绕过 embed 服务——CI 无 bge-m3 服务时
+        # 文字 query 会被 embed 成零向量并短路返空，导致 CI-only 失败；本测试只验
+        # decay 过滤逻辑，不该依赖外部 embed 服务）
+        results = await store.query_successes(
+            _TEST_PROJECT_ID, query="pattern", top_k=10, query_vector=_unit_vector()
+        )
         ids = {r["id"] for r in results}
 
         assert fresh_id in ids, "活跃成功模式应被检索到"
