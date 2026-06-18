@@ -938,12 +938,12 @@ class WorkerExecutor:
         if not (local_root / ".git").exists():
             return 0
 
-        # 候选：writable ∪ scope 文件（modify 意图的文件；create_files 新建产物在
-        # _writable_files 里，但只有【已被 git 跟踪】的才 reset）
+        # 候选：仅本子任务【会写】的文件（writable ∪ create_files；只 reset 已被 git 跟踪者）。
+        # 根因修复(69d34b1b)：【不再 reset readable / 构建清单文件】——它们本子任务不写，却可能
+        # 含【上游子任务的产物】(脚手架建的模块 pom、注册了新模块的父 pom)。把这些 reset 到 HEAD
+        # 会抹掉上游改动 → 本子任务沙箱缺依赖 → `mvn -pl <module>` 报 reactor not found（实测）。
         candidates = set()
         for f in self._writable_files():
-            candidates.add(self._norm_rel(local_root, f))
-        for f in self._scope_files():
             candidates.add(self._norm_rel(local_root, f))
         if not candidates:
             return 0
@@ -1019,7 +1019,54 @@ class WorkerExecutor:
         #   否则编译找不到依赖源文件/pom。
         if getattr(self, "_sandbox_has_source", False):
             rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
-            self._log(f"{reason} 专属沙箱自带源码 → 仅上传 {len(rel_files)} 个改动文件（writable/create）")
+            # 根因修复(69d34b1b)：自带源码模式默认不传 readable（baked 镜像=git HEAD 已有）。
+            # 但【上游子任务改过/新建的文件】(脚手架建的模块 pom、注册了模块的父 pom)在本依赖
+            # 子任务里常列为 readable，其本地内容 ≠ git HEAD（镜像里是旧版/没有）→ 不补传则本
+            # 子任务沙箱看不到上游产物 → `mvn -pl <module>` 报 reactor not found。
+            # 判据：readable 文件【本地存在】且【本地内容 ≠ git HEAD 版】= 被上游改动 → 补传。
+            _seen = set(rel_files)
+            _extra: list[str] = []
+            if (local_root / ".git").exists():
+                import subprocess as _sp
+                for f in (getattr(self.effective_scope, "readable", []) or []):
+                    rel = self._norm_rel(local_root, f)
+                    if rel in _seen:
+                        continue
+                    abs_p = local_root / rel
+                    if not abs_p.is_file():
+                        continue
+                    try:
+                        in_head = _sp.run(
+                            ["git", "cat-file", "-e", f"HEAD:{rel}"],
+                            cwd=str(local_root), capture_output=True, timeout=10,
+                        ).returncode == 0
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not in_head:
+                        # 上游新建（HEAD 无、本地有，如脚手架建的模块 pom）→ 补传
+                        rel_files.append(rel)
+                        _seen.add(rel)
+                        _extra.append(rel)
+                        continue
+                    # 在 HEAD：比对内容，本地 ≠ HEAD = 上游改动（如父 pom 注册了模块）→ 补传
+                    head_text = self._git_baseline_text(local_root, rel)
+                    if head_text is None:
+                        continue
+                    try:
+                        local_text = abs_p.read_text(encoding="utf-8")
+                    except (UnicodeDecodeError, OSError):
+                        continue
+                    if local_text != head_text:
+                        rel_files.append(rel)
+                        _seen.add(rel)
+                        _extra.append(rel)
+            if _extra:
+                self._log(
+                    f"{reason} 自带源码：补传 {len(_extra)} 个上游产物(本地≠HEAD，如模块/父 pom): {_extra[:5]}"
+                )
+            self._log(
+                f"{reason} 专属沙箱自带源码 → 上传 {len(rel_files)} 个文件（改动 + 上游产物）"
+            )
         else:
             rel_files = [self._norm_rel(local_root, f) for f in self._scope_files()]
         if not rel_files:
