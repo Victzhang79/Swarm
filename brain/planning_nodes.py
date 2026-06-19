@@ -35,13 +35,12 @@ MAX_QUESTIONS_PER_ROUND = 3     # 每轮最多问题数
 MAX_DESIGN_REJECTS = 3          # E：评审打回收敛上限
 DEFAULT_CONTEXT_BUDGET = 150_000  # Q7：子任务上下文预算（留余量 < 本地小模型 196k）
 MAX_ELABORATE_RESPLIT = 3       # 超预算二次拆分上限
-# RUN13 治本：单子任务文件数上限。9 文件垂直切片(entity+vo+dto+mapper+xml+service+impl+
-# controller+...) 的 CODING 单阶段就 ~560s 撞预算→VERIFY 超时→重试死循环。小模型在
-# 「精准圈定、单层目标」的子任务上无智能瓶颈——按层拆成 ≤N 文件的子任务，每个只面对一层，
-# 编码确定性高、稳进预算。超过此数 → 确定性按分层拆分(非 LLM，可复现)。
+# 子任务【跨实体】打包目标文件数。多实体子任务按此把小实体打包成批；但【单个实体的全栈永不
+# 被拆穿】(契约自洽优先)，单实体即便超此数也整批原子，靠 A=900s 预算兜底(实测 9 文件≈560s)。
+# RUN13(预算)+RUN14(契约漂移)双教训：拆分边界只能落在实体之间，不能落在一个实体的层之间。
 MAX_FILES_PER_SUBTASK = 4
-# 分层秩(数据模型→持久层→业务层→Web 层)：拆分时按此序聚类，让耦合紧的文件(mapper+xml、
-# service+impl)尽量同批，下游层串行依赖上游层(controller 依赖 service 依赖 entity)。
+# 分层秩(数据模型→持久层→业务层→Web 层)：仅用于【批内文件排序】(描述里数据层在前读着自然)，
+# 不再作为拆分边界——拆分边界是实体词干(_entity_stem)。
 _LAYER_ORDER = {
     "domain": 0, "entity": 0, "vo": 1, "dto": 2,
     "mapper": 3, "mapperxml": 4, "service": 5, "serviceimpl": 6, "controller": 7,
@@ -1439,8 +1438,8 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
 def _layer_rank(rel: str) -> tuple[int, str]:
     """文件按分层秩排序键：数据模型(0)→VO→DTO→mapper→xml→service→impl→controller(7)→未知(90)。
 
-    让耦合紧的层(mapper+xml、service+impl)排序后相邻 → 分批时尽量同批；下游层(controller)
-    排在上游层(entity)之后 → 串行链方向与编译依赖方向一致。次级键 rel 保证同层稳定有序。
+    仅用于【批内文件排序】(描述里数据层在前、Web 层在后，读着自然)，不再作为拆分边界——
+    拆分边界已改为【实体词干】(见 _split_oversized_by_files)。次级键 rel 保证同层稳定有序。
     """
     from swarm.brain.contract_utils import _infer_create_layer
     info = _infer_create_layer(rel)
@@ -1449,17 +1448,44 @@ def _layer_rank(rel: str) -> tuple[int, str]:
     return (_LAYER_ORDER.get(info[0], 80), rel)
 
 
+# 实体词干提取用：剥离 RuoYi 分层后缀 + 接口 I 前缀，让同一实体的 entity/vo/mapper/xml/
+# service/impl/controller 归一到同一词干(AlarmApp*)。顺序敏感(ServiceImpl 须在 Service 前匹配)。
+# 仅列【极不可能是实体名一部分】的纯分层后缀，避免误伤(如不剥 Task/Job/Config，"AlarmTask"是实体)。
+_LAYER_SUFFIXES = ("ServiceImpl", "Service", "Controller", "MapperImpl", "Mapper",
+                   "Repository", "Vo", "VO", "Dto", "DTO", "Bo", "BO")
+
+
+def _entity_stem(rel: str) -> str:
+    """从文件路径提取【实体/特性词干】。同实体全栈共享词干(AlarmApp.java / AlarmAppMapper.xml /
+    IAlarmAppService.java / AlarmAppController.java → 都是 AlarmApp)。
+
+    治本 RUN14 死循环：按层拆把 service 接口与调用它的 controller 拆进不同子任务 → 两个 worker
+    各自臆测方法签名 → 跨子任务契约漂移 → 整模块编译失败(st-3 处爆出、改不了上游 → 死循环)。
+    改按实体词干分组，同一实体全栈留在【一个子任务】，由一个 worker 一次写完、签名自洽。
+    """
+    import re as _re
+    name = rel.replace("\\", "/").split("/")[-1]
+    name = _re.sub(r"\.(java|xml|sql|vue|js|ts)$", "", name)
+    if len(name) > 1 and name[0] == "I" and name[1].isupper():  # IAlarmAppService → AlarmAppService
+        name = name[1:]
+    for suf in _LAYER_SUFFIXES:
+        if name.endswith(suf) and len(name) > len(suf):
+            name = name[: -len(suf)]
+            break
+    return name or "misc"
+
+
 def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> list:
-    """确定性按【分层】把文件数超标的子任务拆成多个 ≤max_files 的子任务(不调 LLM，可复现)。
+    """确定性按【实体词干】把文件数超标的子任务拆成多个子任务(不调 LLM，可复现)。
 
-    治本 RUN13：9 文件垂直切片 CODING 单阶段 560s 撞预算。把它按层切成若干小批，每批只面对
-    一层(如 [entity,vo,dto,mapper])，worker 目标单一、上下文精准、CODING 稳进预算。
-
-    - create_files 按分层秩排序后顺序切批；writable(对既有文件的修改，如注册/pom)排在最后批。
-    - 子链【串行】：child-(i) depends_on child-(i-1)，方向与编译依赖一致(先建实体再建用它的服务)。
-    - 下游依赖重映射(指向旧 id → 子链尾节点)由调用方 _remap_dependents 统一处理。
-    - 每个子节点用独立深拷贝 scope(防别名污染，见 _resplit_subtask 注释)。
-    返回 children(len≥2)；若实际无需拆(总数≤max_files)返回 [st] 不变。
+    治本 RUN13(预算) + RUN14(契约漂移)双约束：
+    - 拆分边界 = 实体之间；【绝不拆穿一个实体的全栈】(entity+mapper+xml+service+impl+controller
+      必须同批，否则接口与调用方分家 → 签名漂移 → 编译失败死循环)。
+    - 多实体子任务 → 按实体打包(小实体可同批，单实体超 max_files 仍【整批原子】不拆，靠 A=900s 兜底)。
+    - 单实体大切片(如 6 文件全 AlarmApp) → 不拆，返回 [st]，靠 A=900s 预算容纳(实测 9 文件≈560s)。
+    - writable(改既有文件，如注册/pom)垫最后批；子链串行 child-(i) depends_on child-(i-1)。
+    - 每个子节点独立深拷贝 scope(防别名污染)。下游依赖重映射由调用方 _remap_dependents 统一处理。
+    返回 children(len≥2)；若拆不出≥2 个内聚批(单实体/总数不超)返回 [st] 不变。
     """
     from swarm.types import SubTask, SubTaskDifficulty, SubTaskModality
 
@@ -1469,37 +1495,64 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     if len(creates) + len(writables) <= max_files:
         return [st]
 
-    # create 按层排序，writable(修改既有文件)统一垫后；标 kind 以便回填到正确 scope 字段
-    items = [("create", f) for f in sorted(creates, key=_layer_rank)] + \
-            [("write", f) for f in writables]
-    groups = [items[i:i + max_files] for i in range(0, len(items), max_files)]
+    def _basename(f: str) -> str:
+        return f.replace("\\", "/").rsplit("/", 1)[-1]
+
+    # 锚点 = 各 Controller：一个 Controller ≙ 一个独立 REST 资源/特性。拆分边界只落在【特性之间】。
+    # <2 个 Controller = 单特性(或纯脚手架/SDK) → 不拆,整体交一个 worker,靠 A=900s 预算兜底。
+    # 这杜绝 RUN14 漂移：单特性的 service 接口与 controller 永远同批,签名自洽。
+    anchors = sorted({_entity_stem(f) for f in creates
+                      if _basename(f).rsplit(".", 1)[0].endswith("Controller")}, key=len, reverse=True)
+    if len(anchors) < 2:
+        return [st]   # 单特性 → 不拆(契约自洽优先于切分),靠 A=900s 预算
+
+    # 每个文件按【最长前缀匹配】归到某锚特性(anchors 已按词干长度降序 → 最长前缀优先)；
+    # 无前缀匹配的(共用工具/常量等)挂到第一个锚批,保证不丢。
+    feat: dict[str, list[str]] = {a: [] for a in anchors}
+    for f in sorted(creates, key=_layer_rank):
+        s = _entity_stem(f)
+        match = next((a for a in anchors if s.startswith(a)), anchors[-1])
+        feat[match].append(f)
+
+    # 批序按锚词干长度【升序】(基实体在前,派生/子实体在后),子链串行；writable 垫最后批
+    norm_batches: list[list[tuple[str, str]]] = []
+    for a in sorted(anchors, key=len):
+        if feat[a]:
+            norm_batches.append([(p, "create") for p in feat[a]])
+    if writables:
+        if norm_batches and len(norm_batches[-1]) + len(writables) <= max_files:
+            norm_batches[-1] += [(w, "write") for w in writables]
+        else:
+            norm_batches.append([(w, "write") for w in writables])
+
+    if len(norm_batches) <= 1:
+        return [st]
 
     base_desc = (getattr(st, "description", "") or "")[:300]
-    n = len(groups)
+    n = len(norm_batches)
     children = []
-    for i, grp in enumerate(groups):
+    for i, grp in enumerate(norm_batches):
         child_scope = scope.model_copy(deep=True)
-        child_scope.create_files = [f for k, f in grp if k == "create"]
-        child_scope.writable = [f for k, f in grp if k == "write"]
-        # readable 保持父集(同包/参照文件仍可读)；同批文件名列入描述，目标明确
-        files_label = "、".join(f.rsplit("/", 1)[-1] for _, f in grp)
+        child_scope.create_files = [p for p, k in grp if k == "create"]
+        child_scope.writable = [p for p, k in grp if k == "write"]
+        files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
         children.append(SubTask(
             id=f"{st.id}-{i + 1}",
-            description=f"{base_desc}（按层第 {i + 1}/{n} 批：{files_label}）",
+            description=f"{base_desc}（按实体第 {i + 1}/{n} 批：{files_label}）",
             difficulty=getattr(st, "difficulty", None) or SubTaskDifficulty.MEDIUM,
             modality=getattr(st, "modality", None) or SubTaskModality.TEXT,
             scope=child_scope,
             depends_on=list(getattr(st, "depends_on", []) or []) + (
-                [f"{st.id}-{i}"] if i > 0 else []  # 串行：本批依赖上一批(下游层依赖上游层)
+                [f"{st.id}-{i}"] if i > 0 else []  # 串行：本批依赖上一批
             ),
             acceptance_criteria=[
                 f"本子任务 scope 内 {len(grp)} 个文件全部创建/修改完成，且模块可编译通过（mvn compile）",
             ],
             est_context_tokens=int((getattr(st, "est_context_tokens", 0) or 0) * len(grp) /
-                                   max(1, len(items))) or 1,
+                                   max(1, len(creates) + len(writables))) or 1,
         ))
-    logger.info("[ELABORATE] 子任务 %s 文件数 %d 超上限 %d → 确定性按层拆为 %d 个 ≤%d 文件子任务",
-                st.id, len(items), max_files, n, max_files)
+    logger.info("[ELABORATE] 子任务 %s 文件数 %d(Controller 锚点 %d 个)→ 按特性拆为 %d 批(单特性全栈不拆穿)",
+                st.id, len(creates) + len(writables), len(anchors), n)
     return children
 
 
