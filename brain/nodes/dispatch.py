@@ -213,7 +213,11 @@ async def dispatch(state: BrainState) -> dict:
         # FINDING-12：拒答/步数耗尽子任务强制走【最强模型】(routing_complex=40B 256k)，不走 alternate
         # 也不走轮转池——小模型 agent 循环不收敛，最强模型最能在步数内完成。
         _fs = bool(_force_strong.get(subtask.id))
-        _ua = use_alternate and not _fs
+        # 单模型模式(池只 1 个)：一切(含失败重试)都留在唯一模型，绝不降级到 difficulty fallback。
+        # RUN10 实证：单模型下 st-5 重试走 use_alternate → 落到更弱 Saka，破坏"单模型一致性"本意。
+        # 无"备选"可换，重试改给 recursion_boost 助收敛，而非换更弱模型。
+        _single = len(_pool) == 1
+        _ua = use_alternate and not _fs and not _single
         _override = _pool[idx % len(_pool)] if (_pool and not _ua) else None
         # FINDING-12：拒答/步数耗尽子任务重试时，换最强模型 + 加步数(trivial 30→60)。
         # 只换 40B 不抬 recursion_limit，多步任务照样撞 `Sorry, need more steps`(RUN5 实证)。
@@ -221,6 +225,8 @@ async def dispatch(state: BrainState) -> dict:
         if _fs:
             _override = config.model.routing_complex
             _boost = 30
+        elif _single and use_alternate:
+            _boost = 30  # 单模型重试：留在唯一模型 + 加步数助收敛(不降级)
         try:
             output = await nodes._dispatch_to_worker(
                 subtask,

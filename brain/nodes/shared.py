@@ -464,7 +464,24 @@ def _parse_json_from_llm(text: str | list) -> dict:
             if nl != -1 and " " not in body[:nl].strip():
                 body = body[nl + 1 :]
             text = body.strip()
-    return json.loads(text)
+    # 严格解析优先（合法 JSON 零行为差）；失败则 json_repair 修复 LLM 常见瑕疵
+    # （缺逗号/尾逗号/截断/Python 字面量 True/None…）。治本 RUN10：TECH_DESIGN stage1 因
+    # 单个 'Expecting , delimiter' 整个设计塌成空方案 → PLAN 凭空拼小计划 → 欠 PRD 40-50% 假 DONE。
+    # 一处鲁棒化保护所有 LLM JSON 解析点(tech_design 两阶段/模块批/plan 分批/单发)。
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError) as _je:
+        try:
+            import json_repair
+        except ImportError:
+            raise _je  # 无修复库则维持原异常，交调用方重试/降级
+        repaired = json_repair.loads(text)
+        if not isinstance(repaired, (dict, list)) or repaired == "" or repaired == []:
+            raise _je  # 修复后仍非结构化/空 → 维持原异常，不静默吞成空
+        import logging
+        logging.getLogger(__name__).warning(
+            "[_parse_json] 严格 JSON 解析失败(%s)，json_repair 修复成功", str(_je)[:60])
+        return repaired
 
 
 def _brain_profile_prompt(state: BrainState) -> str:

@@ -76,3 +76,31 @@ if __name__ == "__main__":
             print(f"  💥 {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n=== #18/#4 small fixes: {len(fns) - failed}/{len(fns)} passed ===")
     sys.exit(1 if failed else 0)
+
+
+# ── RUN10 治本：LLM JSON 瑕疵(缺逗号/尾逗号/截断) → json_repair 修复，杜绝单字符瑕疵
+#    让 TECH_DESIGN 整个设计塌成空方案 → 欠规划 PRD 假成功 ──
+def test_json_repair_missing_comma():
+    """缺逗号(RUN10 实证 'Expecting , delimiter')→ 修复成功，不丢内容。"""
+    r = _parse_json_from_llm('{"modules": [{"name": "a" "x": 1}], "file_plan": [{"p":"f.java"}]}')
+    assert isinstance(r, dict) and len(r.get("file_plan", [])) == 1, r
+    assert r["modules"][0]["name"] == "a"
+
+
+def test_json_repair_trailing_comma_and_truncation():
+    assert _parse_json_from_llm('{"a": [1, 2,], "b": 3,}')["a"] == [1, 2]
+    # 截断(超长 JSON 被截) → 尽力恢复已完整部分
+    r = _parse_json_from_llm('{"file_plan": [{"path":"a.java"},{"path":"b.j')
+    assert isinstance(r, dict) and "file_plan" in r
+
+
+def test_json_repair_valid_unchanged():
+    """合法 JSON 零行为差(走严格解析快路径)。"""
+    assert _parse_json_from_llm('{"x": [1, 2, 3], "y": {"z": true}}') == {"x": [1, 2, 3], "y": {"z": True}}
+
+
+def test_json_garbage_still_raises():
+    """纯垃圾仍抛异常(不静默吞成空 → 交调用方重试/降级，不假成功)。"""
+    import pytest
+    with pytest.raises(Exception):
+        _parse_json_from_llm("this is not json at all !!!")
