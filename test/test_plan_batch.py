@@ -160,3 +160,89 @@ def test_module_batches_dep_order():
     batches = group_into_module_batches(fp, deps)
     names = [n for n, _ in batches]
     assert names.index("entity") < names.index("service"), f"entity 应先于 service: {names}"
+
+
+# ── RUN6 复盘(task f3f85f3d)：分批分解把"建 ruoyi-alarm 模块脚手架"拆了两遍
+#    (st-1 无依赖 / st-7 依赖倒置依赖填充该模块的 st-6) → 模型对已完工活反复拒答
+#    → Brain 循环撞 recursion_limit 崩。merge 后须去重 + 断环治本。 ──
+def test_dedupe_drops_duplicate_scaffold_keeps_foundational():
+    from swarm.brain.plan_batch import dedupe_subtasks
+    subs = [
+        {"id": "st-1", "scope": {"create_files": ["ruoyi-alarm/pom.xml"], "writable": ["pom.xml"]}, "depends_on": []},
+        {"id": "st-6", "scope": {"create_files": ["ruoyi-alarm/src/X.java"]}, "depends_on": ["st-5"]},
+        {"id": "st-7", "scope": {"writable": ["ruoyi-alarm/pom.xml", "pom.xml"]}, "depends_on": ["st-6"]},
+        {"id": "st-8", "scope": {"create_files": ["ruoyi-alarm/src/Y.java"]}, "depends_on": ["st-7"]},
+    ]
+    out = dedupe_subtasks(subs)
+    ids = [s["id"] for s in out]
+    assert "st-7" not in ids, f"重复脚手架 st-7 应去重: {ids}"
+    assert "st-1" in ids, "无依赖的地基 st-1 应保留"
+    st8 = next(s for s in out if s["id"] == "st-8")
+    assert st8["depends_on"] == ["st-1"], f"依赖被去重者应改指保留者: {st8['depends_on']}"
+
+
+def test_dedupe_ignores_shared_existing_file_no_special_casing():
+    """仅共写既存文件（各模块都合法注册进根 pom）不构成重复，不得误去重。
+
+    判据零生态特判：根 pom 不在任何 create_files → 不入 global_creates → 自动排除。
+    三个真实模块各建各的 pom + 都改根 pom，签名 {a/pom}≠{b/pom}≠{c/pom}，全保留。
+    """
+    from swarm.brain.plan_batch import dedupe_subtasks
+    subs = [
+        {"id": "st-1", "scope": {"writable": ["pom.xml"], "create_files": ["a/pom.xml"]}, "depends_on": []},
+        {"id": "st-2", "scope": {"writable": ["pom.xml"], "create_files": ["b/pom.xml"]}, "depends_on": []},
+        {"id": "st-3", "scope": {"writable": ["pom.xml"], "create_files": ["c/pom.xml"]}, "depends_on": []},
+    ]
+    out = dedupe_subtasks(subs)
+    assert {s["id"] for s in out} == {"st-1", "st-2", "st-3"}, "不同模块脚手架不应被共享根文件误判重复"
+
+
+def test_dedupe_is_ecosystem_agnostic():
+    """去重判据内生于计划，对任意构建生态一视同仁（非 Maven/RuoYi 特判）。
+
+    Go：go.mod 是既存共享文件（只被 modify，不在 create_files），两子任务重复建同一新包
+    pkg/alarm/alarm.go（一个 create 一个 writable 口径分歧）→ 仍判重，与 Maven 同理。
+    """
+    from swarm.brain.plan_batch import dedupe_subtasks
+    go = [
+        {"id": "g1", "scope": {"create_files": ["pkg/alarm/alarm.go"], "writable": ["go.mod"]}, "depends_on": []},
+        {"id": "g2", "scope": {"writable": ["pkg/alarm/alarm.go", "go.mod"]}, "depends_on": ["g1"]},
+    ]
+    out = dedupe_subtasks(go)
+    assert {s["id"] for s in out} == {"g1"}, "go.mod 生态同样判重，证明零生态特判"
+
+
+def test_break_dependency_cycles_and_dangling():
+    from swarm.brain.plan_batch import break_dependency_cycles
+    subs = [
+        {"id": "a", "depends_on": ["b"]},
+        {"id": "b", "depends_on": ["a"]},          # 与 a 成环
+        {"id": "c", "depends_on": ["ghost"]},      # 悬空依赖
+        {"id": "d", "depends_on": ["d"]},          # 自指
+    ]
+    out = break_dependency_cycles(subs)
+    deps = {s["id"]: s["depends_on"] for s in out}
+    assert not (deps["a"] and deps["b"]), f"环应断开一条边: {deps}"
+    assert deps["c"] == [], "悬空依赖应剔除"
+    assert deps["d"] == [], "自指应剔除"
+
+
+def test_merge_applies_dedupe_and_cycle_break():
+    """merge_subtask_batches 端到端：跨批重复脚手架被去重。"""
+    from swarm.brain.plan_batch import merge_subtask_batches
+    batch_a = [{"id": "s1", "scope": {"create_files": ["mod/pom.xml"]}, "depends_on": []}]
+    batch_b = [{"id": "s1", "scope": {"writable": ["mod/pom.xml"]}, "depends_on": []}]
+    merged = merge_subtask_batches([batch_a, batch_b])
+    sigs = [s for s in merged if "mod/pom.xml" in (
+        (s.get("scope") or {}).get("create_files", []) + (s.get("scope") or {}).get("writable", []))]
+    assert len(sigs) == 1, f"跨批重复的 mod/pom.xml 脚手架应只剩一个: {[s['id'] for s in merged]}"
+
+
+def test_resolve_brain_recursion_limit_scales():
+    from swarm.tracing import resolve_brain_recursion_limit as R, BRAIN_RECURSION_LIMIT
+    assert R(None, 45) == 45 * 4 + 40, "按子任务数 4×+40"
+    assert R("ultra") == 300, "ultra 档兜底 300"
+    assert R("complex") == 150
+    assert R(None, 1) == BRAIN_RECURSION_LIMIT, "小计划不低于 floor"
+    assert R("trivial") == BRAIN_RECURSION_LIMIT
+    assert R(None, 200) == 200 * 4 + 40, "超大计划继续放大"

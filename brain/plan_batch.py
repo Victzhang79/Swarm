@@ -223,11 +223,118 @@ def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
     return out
 
 
+def _norm_paths(st: dict, *keys: str) -> set[str]:
+    """取子任务 scope 中若干键的归一化路径集合。"""
+    sc = st.get("scope") or {}
+    out: set[str] = set()
+    for key in keys:
+        for f in (sc.get(key) or []):
+            if isinstance(f, str) and f.strip():
+                out.add(f.replace("\\", "/").strip("/"))
+    return out
+
+
+def _fresh_deliverable_signature(st: dict, global_creates: frozenset[str]) -> frozenset[str]:
+    """子任务"新建交付物"签名 = (create∪writable) ∩ 全计划 create_files 并集。
+
+    判据完全内生于计划、零生态特判：一个文件只要被【任一】子任务 create，它就是"需新建、
+    有明确 owner 的交付物"；而共享的【既存】文件（根 pom / settings.gradle / go.mod /
+    Cargo.toml / pyproject.toml / *.csproj…）永远只被 modify、绝不在 create_files →
+    天然不入 global_creates，自动排除，无需文件名清单也无需查 git。两子任务触碰同一新建
+    交付物 = 同一桩活的重复（含 create vs writable 的口径分歧），正是 RUN6 的 st-1/st-7。
+    """
+    return frozenset((_norm_paths(st, "create_files", "writable")) & global_creates)
+
+
+def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
+    """跨批重复子任务去重（治本 RUN6：分批分解把地基活每批各拆一遍）。
+
+    实证 RUN6 task f3f85f3d：st-1 与 st-7 都是"创建 ruoyi-alarm 模块脚手架"，后者还依赖
+    倒置依赖了填充该模块的 st-6 → 模型对着已完工的活反复拒答 → Brain 循环撞 recursion_limit
+    崩。判据：新建交付物签名（见 _fresh_deliverable_signature，零生态特判）非空且相等 → 同一
+    桩活。保留依赖更少者（更地基，避免保留依赖倒置的副本）；位次相同保留先出现者。被丢弃者
+    id 重映射到保留者，所有 depends_on 改指保留者。与 contract_utils"同文件写权唯一"同源。
+    """
+    global_creates = frozenset().union(
+        *[_norm_paths(st, "create_files") for st in subtasks]
+    ) if subtasks else frozenset()
+    keep_by_sig: dict[frozenset[str], dict] = {}
+    drop_remap: dict[str, str] = {}  # 被丢弃 id -> 保留 id
+    order: list[dict] = []
+    for st in subtasks:
+        sig = _fresh_deliverable_signature(st, global_creates)
+        if not sig:
+            order.append(st)
+            continue
+        prev = keep_by_sig.get(sig)
+        if prev is None:
+            keep_by_sig[sig] = st
+            order.append(st)
+            continue
+        # 同签名重复：保留依赖更少者（更地基）。当前更地基则顶替 prev。
+        if len(st.get("depends_on") or []) < len(prev.get("depends_on") or []):
+            drop_remap[prev["id"]] = st["id"]
+            order[order.index(prev)] = st
+            keep_by_sig[sig] = st
+        else:
+            drop_remap[st["id"]] = prev["id"]
+    if not drop_remap:
+        return subtasks
+    out: list[dict] = []
+    for st in order:
+        if st["id"] in drop_remap:
+            continue
+        deps: list[str] = []
+        for d in (st.get("depends_on") or []):
+            nd = drop_remap.get(d, d)
+            if nd != st["id"] and nd not in deps:
+                deps.append(nd)
+        out.append({**st, "depends_on": deps})
+    return out
+
+
+def break_dependency_cycles(subtasks: list[dict]) -> list[dict]:
+    """剔除悬空依赖 + 打断 depends_on 环（DFS 回边）。
+
+    分批串行门控（批首挂前批末尾）叠加 LLM 误标依赖，可能造成环/倒置 → 依赖驱动调度
+    死锁或永不就绪。只剔除：①指向不存在子任务的悬空依赖 ②自指 ③构成真实环的回边
+    （DFS 灰点回边）。不动合法的前向边，避免误删正确依赖。
+    """
+    ids = {st["id"] for st in subtasks}
+    graph: dict[str, list[str]] = {
+        st["id"]: [d for d in (st.get("depends_on") or []) if d in ids and d != st["id"]]
+        for st in subtasks
+    }
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {i: WHITE for i in graph}
+    removed: set[tuple[str, str]] = set()
+
+    def dfs(u: str) -> None:
+        color[u] = GRAY
+        for v in graph[u]:
+            if (u, v) in removed:
+                continue
+            if color[v] == GRAY:
+                removed.add((u, v))  # 回边 → 环，剔除
+            elif color[v] == WHITE:
+                dfs(v)
+        color[u] = BLACK
+
+    for i in graph:
+        if color[i] == WHITE:
+            dfs(i)
+    return [
+        {**st, "depends_on": [d for d in graph[st["id"]] if (st["id"], d) not in removed]}
+        for st in subtasks
+    ]
+
+
 def merge_subtask_batches(batch_results: list[list[dict]]) -> list[dict]:
     """合并各批拆出的子任务，重编全局唯一 id（Q：组前缀+序号），保留批内 depends_on。
 
     batch_results: [[subtask_dict, ...], ...]（每批 LLM 拆出的子任务列表）
     返回扁平 subtasks 列表，id 重写为 st-<全局序号>，并建立批间串行依赖（后批依赖前批末尾）。
+    合并后做跨批去重（dedupe_subtasks）+ 环打断（break_dependency_cycles）以治本分批重复/倒置。
     """
     merged: list[dict] = []
     seq = 0
@@ -259,6 +366,9 @@ def merge_subtask_batches(batch_results: list[list[dict]]) -> list[dict]:
             merged.append(st)
         if local_ids:
             prev_batch_last_id = local_ids[-1]["id"]
+    # 跨批去重（地基活每批各拆一遍）+ 环/悬空依赖打断，治本 RUN6 崩溃。
+    merged = dedupe_subtasks(merged)
+    merged = break_dependency_cycles(merged)
     return merged
 
 

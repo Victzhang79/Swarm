@@ -239,6 +239,24 @@ def merge_invoke_config(base: dict[str, Any], tracing: dict[str, Any]) -> dict[s
     return out
 
 
+def resolve_brain_recursion_limit(
+    complexity: str | None = None, subtask_count: int | None = None
+) -> int:
+    """按计划规模解析 Brain graph recursion_limit。
+
+    固定 50 对 ultra 大计划（实证 RUN6：45 子任务）远不够——光健康派发就吃掉大量
+    节点访问，叠加 HANDLE_FAILURE→DISPATCH 重试往返必撞穿 50 抛 GraphRecursionError
+    硬崩（连带未落地的 abandon→PARTIAL 一起灭）。recursion_limit 只是兜底；真死循环由
+    replan 熔断 + 子任务 max_retries + abandon 提前拦截，故放大兜底是安全的。
+    已知子任务数则按 4×+余量算；否则按复杂度档给保守上限。floor=BRAIN_RECURSION_LIMIT。
+    """
+    floor = BRAIN_RECURSION_LIMIT
+    if subtask_count and subtask_count > 0:
+        return max(floor, subtask_count * 4 + 40)
+    by_complexity = {"ultra": 300, "complex": 150, "epic": 300}
+    return max(floor, by_complexity.get((complexity or "").lower(), floor))
+
+
 def brain_graph_config(
     *,
     task_id: str,
@@ -246,17 +264,19 @@ def brain_graph_config(
     thread_id: str,
     resume: bool = False,
     description: str = "",
+    complexity: str | None = None,
+    subtask_count: int | None = None,
 ) -> dict[str, Any]:
     """Phase 1 — Brain LangGraph 根 run（create_task / approve resume）。"""
     # P0-2 修复：显式设 recursion_limit。LangGraph 默认 25 对 Brain 状态机不够——
     # 规划循环(PLAN→ELABORATE→VALIDATE 重试) + 多子任务 DISPATCH→MONITOR 往返 +
     # HANDLE_FAILURE→replan 重入，累计极易撞穿 25 导致 GRAPH_RECURSION_LIMIT 硬崩
-    # （见 task 0f93f1fc）。50 给规划/派发/重规划留足往返余量；真死循环由
-    # 规划失败熔断(plan_validator 重试上限 + replan 携带失败原因)提前 fail-fast 拦截，
-    # 而非依赖 recursion limit 兜底。
+    # （见 task 0f93f1fc）。RUN6 复盘：固定 50 对 45 子任务 ultra 仍不够 → 按规模放大
+    # （resolve_brain_recursion_limit）。真死循环由规划失败熔断 + max_retries + abandon
+    # 提前 fail-fast 拦截，而非依赖 recursion limit 兜底。
     base: dict[str, Any] = {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": BRAIN_RECURSION_LIMIT,
+        "recursion_limit": resolve_brain_recursion_limit(complexity, subtask_count),
     }
     if not is_langsmith_active():
         return base

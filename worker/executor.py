@@ -1621,35 +1621,22 @@ class WorkerExecutor:
         # 非空 + compile 恰好过会翻盘判通过（task 0f93f1fc：st-1-1 "Sorry need more
         # steps" 却 L1=通过）。
         if _is_refusal_or_truncated(combined):
-            # ── 韧性修复(task 5c17c464/94334785)：reasoning 模型偶发拒答(空转输出
-            # "Sorry, need more steps")是【概率性瞬时】问题，非确定性能力失败。立即换【用户
-            # 配置的 fallback 模型】(_resolve_route 返回的 tier fallback，由用户在 WebUI 路由表
-            # 设置，如 MiniMax-M2.7-Pro)worker 内部重试一次，避免抛给上层 HANDLE_FAILURE 走完整
-            # 重试轮(慢+清空兄弟)。仅重试 1 次：备选还拒答才硬否决 L1。
-            if not getattr(self, "_trivial_alt_retried", False):
+            # ── 拒答(空转输出 "Sorry, need more steps")是【模型能力】问题
+            # (models/errors.py 归 CAPABILITY，非瞬时)。RUN5/RUN6 实证：trivial 档拒答时换
+            # 该难度 fallback 链首=更弱模型(如 27B-Saka)→ 雪上加霜，仍拒答。修正方向：
+            # 换【最强本地模型】(routing_complex=40B 256k)worker 内部重试一次；已在最强模型上
+            # 则无可再升，直接硬否决，抛给上层 HANDLE_FAILURE 走 force_strong/abandon。
+            _strongest = get_config().model.routing_complex
+            if (not getattr(self, "_trivial_alt_retried", False)
+                    and _strongest and _strongest != self.model_name):
                 self._trivial_alt_retried = True
-                self._log("trivial: 主模型拒答，换备选模型 worker 内部重试一次")
+                self._log(f"trivial: 主模型({self.model_name})拒答 → 升级最强模型 {_strongest} 内部重试一次")
                 try:
-                    from swarm.models.router import ModelRouter
-                    _r = ModelRouter()
-                    _alt = None
-                    try:
-                        _alt_chain = _r._resolve_route(
-                            self.subtask.difficulty.value if hasattr(self.subtask.difficulty, "value")
-                            else str(self.subtask.difficulty),
-                            getattr(self.subtask, "modality", "text") or "text",
-                        )[1]
-                        # fallback 现为多级链(list)，取链首作为备选模型
-                        _alt_name = _alt_chain[0] if _alt_chain else None
-                    except Exception:  # noqa: BLE001
-                        _alt_name = None
-                    if _alt_name and _alt_name != self.model_name:
-                        self.model_name = _alt_name
-                        self._agent = self._create_agent()  # 用备选模型重建 agent
-                        self._log(f"trivial: 已切换到备选模型 {_alt_name} 重试")
-                        return await self._run_trivial_fast()
+                    self.model_name = _strongest
+                    self._agent = self._create_agent()  # 用最强模型重建 agent
+                    return await self._run_trivial_fast()
                 except Exception as e:  # noqa: BLE001
-                    self._log(f"trivial: 备选模型重试初始化失败({str(e)[:60]})，硬否决 L1")
+                    self._log(f"trivial: 最强模型重试初始化失败({str(e)[:60]})，硬否决 L1")
             l1_details["l1_decision_source"] = "refusal_hard_fail"
             l1_details["raw_refusal"] = combined[:200]
             self._log("trivial: agent 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")

@@ -265,12 +265,21 @@ async def _stream_brain_events(
     thread_id = task_rec.get("thread_id") or task_id
     resume = isinstance(graph_input, Command)
     pid = project_id or task_rec.get("project_id") or ""
+    # recursion_limit 按计划规模放大（RUN6：45 子任务 ultra 撞穿固定 50 崩）。复杂度/子任务数
+    # 取自任务记录与已存计划——重跑/resume 时已有，新任务首轮按复杂度档兜底。
+    _plan_rec = task_rec.get("plan")
+    _subtask_n = None
+    if isinstance(_plan_rec, dict):
+        _subs = _plan_rec.get("subtasks")
+        _subtask_n = len(_subs) if isinstance(_subs, list) else None
     config = brain_graph_config(
         task_id=task_id,
         project_id=pid,
         thread_id=thread_id,
         resume=resume,
         description=(task_rec.get("description") or "")[:200],
+        complexity=task_rec.get("complexity"),
+        subtask_count=_subtask_n,
     )
     progress = 10
 
