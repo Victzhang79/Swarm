@@ -35,6 +35,17 @@ MAX_QUESTIONS_PER_ROUND = 3     # 每轮最多问题数
 MAX_DESIGN_REJECTS = 3          # E：评审打回收敛上限
 DEFAULT_CONTEXT_BUDGET = 150_000  # Q7：子任务上下文预算（留余量 < 本地小模型 196k）
 MAX_ELABORATE_RESPLIT = 3       # 超预算二次拆分上限
+# RUN13 治本：单子任务文件数上限。9 文件垂直切片(entity+vo+dto+mapper+xml+service+impl+
+# controller+...) 的 CODING 单阶段就 ~560s 撞预算→VERIFY 超时→重试死循环。小模型在
+# 「精准圈定、单层目标」的子任务上无智能瓶颈——按层拆成 ≤N 文件的子任务，每个只面对一层，
+# 编码确定性高、稳进预算。超过此数 → 确定性按分层拆分(非 LLM，可复现)。
+MAX_FILES_PER_SUBTASK = 4
+# 分层秩(数据模型→持久层→业务层→Web 层)：拆分时按此序聚类，让耦合紧的文件(mapper+xml、
+# service+impl)尽量同批，下游层串行依赖上游层(controller 依赖 service 依赖 entity)。
+_LAYER_ORDER = {
+    "domain": 0, "entity": 0, "vo": 1, "dto": 2,
+    "mapper": 3, "mapperxml": 4, "service": 5, "serviceimpl": 6, "controller": 7,
+}
 
 
 def _tier_limits() -> dict:
@@ -1195,7 +1206,11 @@ async def elaborate(state: BrainState) -> dict:
         new_subtasks = list(plan_obj.subtasks)
         changed = False
         for st in need_resplit:
-            children = await _resplit_subtask(st, state, budget)
+            # 文件数超标 → 确定性按层拆(可复现、精准投喂)；纯上下文预算超标(文件少但大)→ LLM 拆。
+            if _oversized_by_files(st):
+                children = _split_oversized_by_files(st)
+            else:
+                children = await _resplit_subtask(st, state, budget)
             if children and len(children) > 1:
                 idx = next((i for i, x in enumerate(new_subtasks) if x.id == st.id), None)
                 if idx is not None:
@@ -1340,8 +1355,25 @@ def _needs_resplit(st, budget: int) -> bool:
     # 注意 0 文件(greenfield/scope未明)不在此守卫内——仍按预算判，可拆。
     if n_writable == 1 and n_create == 0:
         return False
+    # RUN13 治本：文件数超标也需拆（即使上下文预算够）。9 文件子任务 est_tokens 可能没超
+    # 150k 预算，但 CODING 工作量(逐个写 9 个文件)远超时间预算。按文件数拆，确定性投喂。
+    if _oversized_by_files(st):
+        return True
     est = getattr(st, "est_context_tokens", 0) or 0
     return est > budget
+
+
+def _oversized_by_files(st) -> bool:
+    """子任务涉及文件数(create + writable)是否超 MAX_FILES_PER_SUBTASK。
+
+    与上下文预算正交：文件多但每个小，est_tokens 可能没超预算，可 CODING 逐文件写仍撞
+    时间墙(RUN13 实测 9 文件 CODING 560s)。这是【时间/工作量】维度的超标，须拆。
+    """
+    scope = getattr(st, "scope", None)
+    if not scope:
+        return False
+    n = len(getattr(scope, "create_files", []) or []) + len(getattr(scope, "writable", []) or [])
+    return n > MAX_FILES_PER_SUBTASK
 
 
 async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
@@ -1402,6 +1434,73 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ELABORATE] 子任务 %s 二次拆分失败，保留原样: %s", getattr(st, "id", "?"), exc)
         return [st]
+
+
+def _layer_rank(rel: str) -> tuple[int, str]:
+    """文件按分层秩排序键：数据模型(0)→VO→DTO→mapper→xml→service→impl→controller(7)→未知(90)。
+
+    让耦合紧的层(mapper+xml、service+impl)排序后相邻 → 分批时尽量同批；下游层(controller)
+    排在上游层(entity)之后 → 串行链方向与编译依赖方向一致。次级键 rel 保证同层稳定有序。
+    """
+    from swarm.brain.contract_utils import _infer_create_layer
+    info = _infer_create_layer(rel)
+    if not info:
+        return (90, rel)
+    return (_LAYER_ORDER.get(info[0], 80), rel)
+
+
+def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> list:
+    """确定性按【分层】把文件数超标的子任务拆成多个 ≤max_files 的子任务(不调 LLM，可复现)。
+
+    治本 RUN13：9 文件垂直切片 CODING 单阶段 560s 撞预算。把它按层切成若干小批，每批只面对
+    一层(如 [entity,vo,dto,mapper])，worker 目标单一、上下文精准、CODING 稳进预算。
+
+    - create_files 按分层秩排序后顺序切批；writable(对既有文件的修改，如注册/pom)排在最后批。
+    - 子链【串行】：child-(i) depends_on child-(i-1)，方向与编译依赖一致(先建实体再建用它的服务)。
+    - 下游依赖重映射(指向旧 id → 子链尾节点)由调用方 _remap_dependents 统一处理。
+    - 每个子节点用独立深拷贝 scope(防别名污染，见 _resplit_subtask 注释)。
+    返回 children(len≥2)；若实际无需拆(总数≤max_files)返回 [st] 不变。
+    """
+    from swarm.types import SubTask, SubTaskDifficulty, SubTaskModality
+
+    scope = getattr(st, "scope", None)
+    creates = list(getattr(scope, "create_files", []) or []) if scope else []
+    writables = list(getattr(scope, "writable", []) or []) if scope else []
+    if len(creates) + len(writables) <= max_files:
+        return [st]
+
+    # create 按层排序，writable(修改既有文件)统一垫后；标 kind 以便回填到正确 scope 字段
+    items = [("create", f) for f in sorted(creates, key=_layer_rank)] + \
+            [("write", f) for f in writables]
+    groups = [items[i:i + max_files] for i in range(0, len(items), max_files)]
+
+    base_desc = (getattr(st, "description", "") or "")[:300]
+    n = len(groups)
+    children = []
+    for i, grp in enumerate(groups):
+        child_scope = scope.model_copy(deep=True)
+        child_scope.create_files = [f for k, f in grp if k == "create"]
+        child_scope.writable = [f for k, f in grp if k == "write"]
+        # readable 保持父集(同包/参照文件仍可读)；同批文件名列入描述，目标明确
+        files_label = "、".join(f.rsplit("/", 1)[-1] for _, f in grp)
+        children.append(SubTask(
+            id=f"{st.id}-{i + 1}",
+            description=f"{base_desc}（按层第 {i + 1}/{n} 批：{files_label}）",
+            difficulty=getattr(st, "difficulty", None) or SubTaskDifficulty.MEDIUM,
+            modality=getattr(st, "modality", None) or SubTaskModality.TEXT,
+            scope=child_scope,
+            depends_on=list(getattr(st, "depends_on", []) or []) + (
+                [f"{st.id}-{i}"] if i > 0 else []  # 串行：本批依赖上一批(下游层依赖上游层)
+            ),
+            acceptance_criteria=[
+                f"本子任务 scope 内 {len(grp)} 个文件全部创建/修改完成，且模块可编译通过（mvn compile）",
+            ],
+            est_context_tokens=int((getattr(st, "est_context_tokens", 0) or 0) * len(grp) /
+                                   max(1, len(items))) or 1,
+        ))
+    logger.info("[ELABORATE] 子任务 %s 文件数 %d 超上限 %d → 确定性按层拆为 %d 个 ≤%d 文件子任务",
+                st.id, len(items), max_files, n, max_files)
+    return children
 
 
 def _remap_dependents(subtasks: list, old_id: str, new_id: str) -> int:

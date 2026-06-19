@@ -312,7 +312,10 @@ class WorkerConfig(BaseSettings):
     # 而非 fail-fast 灭掉整个任务(原行为：1 个子任务拒答 → 33 个好子任务一起 FAILED)。
     # True=部分交付(仍诚实标 PARTIAL，不假成功)；False=旧 fail-fast。
     allow_partial_delivery: bool = True
-    max_execution_time: int = 600     # 10 分钟
+    max_execution_time: int = 900     # 15 分钟（安全垫：LOCATING 已封顶提速后，复杂子任务
+                                      # CODING 仍可能逼近旧 600s 上限——RUN13 实测 9 文件子任务
+                                      # 光 CODING 就 560s，VERIFY 没预算超时→重试死循环。配合
+                                      # PLAN 端按层拆分(每子任务≤4文件)双管：拆分治本、预算兜底。
     max_iterations: int = 50          # Agent 最大 Tool 调用轮次
     max_fix_rounds: int = 3           # 编码内循环最大修复轮次
     memory_limit: str = "2g"
