@@ -755,50 +755,60 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     _STAGE2_CONCURRENCY = 3         # 单云端 key 友好的并发上限
     _sem = _asyncio.Semaphore(_STAGE2_CONCURRENCY)
 
+    _STAGE2_MAX_ATTEMPTS = 3  # 单模块失败重试：LLM 返空(char0)/瑕疵/超时多为瞬时，重试治本
+                              # (RUN12 实证 alarm-config 'Expecting value: char0' 空响应 → 整模块丢失 → 欠 PRD)
+
     async def _gen_one_module(mi: int, mod: dict) -> dict:
-        """产出单个模块的 file_plan。返回 {idx,name,file_plan,error}。"""
+        """产出单个模块的 file_plan，失败重试至多 _STAGE2_MAX_ATTEMPTS 次。返回 {idx,name,file_plan,error}。"""
         mod_name = mod.get("name") or f"module-{mi}"
-        _tm = _time.monotonic()
-        async with _sem:
-            try:
-                resp2 = await _asyncio.wait_for(
-                    llm.ainvoke([
-                        {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
-                        {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
-                            task_description=task_desc[:2000],
-                            architecture=str(architecture)[:1500],
-                            data_model=str(data_model)[:2500],
-                            project_facts=project_facts,
-                            mod_idx=mi, mod_total=mod_total,
-                            mod_name=mod_name,
-                            mod_responsibility=mod.get("responsibility", ""),
-                            mod_est_files=mod.get("est_files", "?"),
-                        )},
-                    ]),
-                    timeout=_STAGE2_MODULE_TIMEOUT,
+        _last_err = "unknown"
+        for _attempt in range(1, _STAGE2_MAX_ATTEMPTS + 1):
+            _tm = _time.monotonic()
+            async with _sem:
+                try:
+                    resp2 = await _asyncio.wait_for(
+                        llm.ainvoke([
+                            {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
+                            {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
+                                task_description=task_desc[:2000],
+                                architecture=str(architecture)[:1500],
+                                data_model=str(data_model)[:2500],
+                                project_facts=project_facts,
+                                mod_idx=mi, mod_total=mod_total,
+                                mod_name=mod_name,
+                                mod_responsibility=mod.get("responsibility", ""),
+                                mod_est_files=mod.get("est_files", "?"),
+                            )},
+                        ]),
+                        timeout=_STAGE2_MODULE_TIMEOUT,
+                    )
+                    r2 = _parse_json_from_llm(resp2.content)
+                    fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
+                    if not fp:
+                        raise ValueError("file_plan 为空（模块未产出文件）")  # 空也算失败 → 触发重试
+                    for item in fp:
+                        if isinstance(item, dict) and not item.get("module"):
+                            item["module"] = mod_name
+                    logger.info(
+                        "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs%s",
+                        mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
+                        f"（第 {_attempt} 次成功）" if _attempt > 1 else "",
+                    )
+                    return {"idx": mi, "name": mod_name, "file_plan": fp, "error": None}
+                except _asyncio.TimeoutError:
+                    _last_err = "timeout"
+                except Exception as exc:  # noqa: BLE001
+                    _last_err = str(exc)[:200]
+            if _attempt < _STAGE2_MAX_ATTEMPTS:
+                logger.warning(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试",
+                    mi, mod_total, mod_name, _attempt, _last_err,
                 )
-                r2 = _parse_json_from_llm(resp2.content)
-                fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
-                for item in fp:
-                    if isinstance(item, dict) and not item.get("module"):
-                        item["module"] = mod_name
-                logger.info(
-                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs",
-                    mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
-                )
-                return {"idx": mi, "name": mod_name, "file_plan": fp, "error": None}
-            except _asyncio.TimeoutError:
-                logger.error(
-                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 超时 >%.0fs（硬告警，该模块文件丢失）",
-                    mi, mod_total, mod_name, _STAGE2_MODULE_TIMEOUT,
-                )
-                return {"idx": mi, "name": mod_name, "file_plan": [], "error": "timeout"}
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 产出失败（硬告警，该模块文件丢失）: %s",
-                    mi, mod_total, mod_name, exc,
-                )
-                return {"idx": mi, "name": mod_name, "file_plan": [], "error": str(exc)[:200]}
+        logger.error(
+            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 重试 %d 次仍失败（硬告警，该模块文件丢失）: %s",
+            mi, mod_total, mod_name, _STAGE2_MAX_ATTEMPTS, _last_err,
+        )
+        return {"idx": mi, "name": mod_name, "file_plan": [], "error": _last_err}
 
     _valid = [(mi, mod) for mi, mod in enumerate(modules, start=1) if isinstance(mod, dict)]
     _results = await _asyncio.gather(*[_gen_one_module(mi, mod) for mi, mod in _valid])
