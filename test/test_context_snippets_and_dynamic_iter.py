@@ -112,3 +112,25 @@ def test_finding12_recursion_boost_lifts_trivial_cap():
     # 封顶 150：超大 boost 不会让步数无限膨胀
     w2 = WorkerExecutor(st, task_id="t2", recursion_boost=1000)
     assert w2.max_iterations == 150, f"boost 封顶 150: {w2.max_iterations}"
+
+
+def test_enrich_create_subtask_gets_existing_layer_reference():
+    """治本 RUN11：纯 CREATE 子任务(writable/readable 皆空)→ 旧 enrich 产出空 context_snippets
+    → worker 探索全项目找模式烧光 600s 预算。新逻辑：给 create 文件找【同类既有文件】作范例预读，
+    照 RuoYi 写法实现，无需探索。"""
+    with tempfile.TemporaryDirectory() as d:
+        # 既有参照：system 模块的一个 entity（与待建 entity 同层）
+        ref_dir = os.path.join(d, "mod-system", "src", "main", "java", "com", "x", "system", "domain")
+        os.makedirs(ref_dir)
+        with open(os.path.join(ref_dir, "SysFoo.java"), "w") as f:
+            f.write("package com.x.system.domain;\npublic class SysFoo extends BaseEntity {\n  private Long id;\n  public Long getId(){return id;}\n}\n")
+        # 待建：alarm 模块的 entity（纯 create，无 writable/readable）
+        st = SubTask(
+            id="st-1", description="创建 AlarmFoo 实体",
+            scope=FileScope(create_files=["mod-alarm/src/main/java/com/x/alarm/domain/AlarmFoo.java"]),
+        )
+        plan = TaskPlan(subtasks=[st])
+        changed = enrich_context_snippets(plan, d)
+        assert changed is True, "应为 create 子任务注入范例"
+        cs = st.context_snippets or ""
+        assert "SysFoo" in cs and "同类既有范例" in cs, f"应预读同层既有 entity 作模板: {cs[:200]}"

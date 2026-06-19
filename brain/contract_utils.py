@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools as _functools
 import json
 import re
 from typing import Any
@@ -561,6 +562,52 @@ def _extract_signatures(text: str, lang_ext: str) -> str:
     return "\n".join(sig_lines[:120])
 
 
+def _infer_create_layer(rel: str) -> tuple[str, str] | None:
+    """从待新建文件路径推断其【分层类型】→ 返回 (层名, glob 范式) 用于找同类既有文件作模板。
+
+    治本 RUN11：纯 CREATE 子任务 writable/readable 皆空 → context_snippets 空 → worker
+    探索全项目找 RuoYi 写法烧光 600s 预算。给它预读一个【同类既有文件】(建 entity 就给个既有
+    entity、建 mapper 就给个既有 mapper)，照着写即可，无需探索。跨语言可扩展，当前覆盖 Java 分层。
+    """
+    low = rel.replace("\\", "/").lower()
+    if low.endswith(".xml") and "mapper" in low:
+        return ("mapperxml", "**/resources/mapper/**/*.xml")
+    if not low.endswith(".java"):
+        return None
+    if "/controller/" in low:
+        return ("controller", "**/controller/*.java")
+    if "/service/impl/" in low:
+        return ("serviceimpl", "**/service/impl/*.java")
+    if "/service/" in low:
+        return ("service", "**/service/I*.java")
+    if "/mapper/" in low:
+        return ("mapper", "**/mapper/*.java")
+    if "/vo/" in low:
+        return ("vo", "**/vo/*.java")
+    if "/dto/" in low:
+        return ("dto", "**/dto/*.java")
+    if "/domain/" in low or "/entity/" in low:
+        return ("domain", "**/domain/*.java")
+    return None
+
+
+@_functools.lru_cache(maxsize=512)
+def _find_layer_reference(project_path: str, pattern: str, exclude_top: str) -> str | None:
+    """项目内匹配 pattern 的既有文件里挑【最小的一个】作模板(省 token)，排除新建模块目录。"""
+    import glob as _glob
+    import os as _os
+    matches = _glob.glob(_os.path.join(project_path, pattern), recursive=True)
+    cands = [
+        m for m in matches
+        if _os.path.isfile(m)
+        and not _os.path.relpath(m, project_path).replace("\\", "/").startswith(exclude_top + "/")
+    ]
+    if not cands:
+        return None
+    cands.sort(key=lambda p: _os.path.getsize(p))
+    return _os.path.relpath(cands[0], project_path).replace("\\", "/")
+
+
 def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
     """把 scope 文件的关键代码片段抽进每个子任务的 context_snippets。
 
@@ -628,6 +675,38 @@ def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
             if not body.strip():
                 continue
             block = f"### {label}: {rel}\n```\n{body[:_MAX_SNIPPET_CHARS_PER_FILE]}\n```"
+            parts.append(block)
+            total += len(block)
+
+        # 3) CREATE 文件无既有可读 → 找【同类既有文件】作模板注入(治本 LOCATING 空转)。
+        # 每个分层类型只取一个范例(去重)，让 worker 照 RuoYi 写法实现，无需探索全项目。
+        creates = list(getattr(scope, "create_files", []) or [])
+        _exclude_top = ""
+        for cf in creates:  # 新建模块顶层目录(如 ruoyi-alarm)——范例要排除它(它还不存在/正在建)
+            top = cf.replace("\\", "/").split("/", 1)[0]
+            if top:
+                _exclude_top = top
+                break
+        seen_layers: set[str] = set()
+        for rel in creates:
+            if total >= _MAX_TOTAL_SNIPPET_CHARS:
+                break
+            layer = _infer_create_layer(rel)
+            if not layer or layer[0] in seen_layers:
+                continue
+            ref = _find_layer_reference(project_path, layer[1], _exclude_top)
+            if not ref:
+                continue
+            txt = _read(ref)
+            if not txt:
+                continue
+            seen_layers.add(layer[0])
+            ext = ref.rsplit(".", 1)[-1].lower() if "." in ref else ""
+            body = txt if len(txt) <= _MAX_SNIPPET_CHARS_PER_FILE else _extract_signatures(txt, ext)
+            if not body.strip():
+                continue
+            block = (f"### 同类既有范例（照此 RuoYi 写法实现 {rel} 这一层，无需再探索项目）: {ref}\n"
+                     f"```\n{body[:_MAX_SNIPPET_CHARS_PER_FILE]}\n```")
             parts.append(block)
             total += len(block)
 
