@@ -51,6 +51,10 @@ _FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|error
 
 # Bug-4（task 0f93f1fc 实证）：模型拒答/截断标记。worker agent 主回复命中这些 =
 # 它根本没真正完成工作（停滞/截断/算力耗尽），产出不可信。此前这类回复仅让 LLM 自报
+# LOCATING 阶段步数硬上限（recursion_limit 计节点访问，agent+tool 各 1，故 ~20 ≈ 10 think-act
+# 循环）。定位只是"理解结构/确认落点"，有预读范例+契约时足够；逼模型少探索、把预算留给 CODING。
+_LOCATE_STEP_CAP = 20
+
 # 判 False，但 deterministic gate（diff 非空 + compile 恰好过）会翻盘判通过 → 幻觉 PASS。
 # 这类标记必须【硬否决整个 L1】，覆盖 deterministic gate——产出来源不可信时编译过也不算数。
 _REFUSAL_MARKERS = (
@@ -420,11 +424,16 @@ class WorkerExecutor:
                 return await self._run_trivial_fast()
 
             # ── Phase 1: 定位 ──
+            # 硬砍 LOCATING 预算（治本 RUN12：预读注入了但模型仍探索 167-286s 烧光整体 600s 预算，
+            # 导致 CODING/VERIFY 没预算 → 超时 → 集成级联）。定位只是"理解结构/确认落点"，不该烧 50 步；
+            # 有预读范例+共享契约时 ~20 步(≈10 think-act 循环)足够。撞 cap 非硬失败(返回提示交 CODING)，
+            # 省下的预算留给真正干活的 CODING+VERIFY。把整体超时根因从"探索吃光预算"摁住。
             self.phase = WorkerPhase.LOCATING
             self._log("定位阶段：阅读代码，理解结构")
             locate_result = await self._run_agent(
                 self._build_locate_prompt(),
                 step="locate",
+                max_steps=min(self.max_iterations, _LOCATE_STEP_CAP),
             )
             self._log(f"定位完成: {locate_result[:200]}")
 
@@ -1496,8 +1505,14 @@ class WorkerExecutor:
             return float(self.max_execution_time)
         return max(0.0, self.max_execution_time - (time.monotonic() - self.start_time))
 
-    async def _run_agent(self, human_message: str, *, step: str = "react") -> str:
-        """调用 Agent 执行一步并返回结果（受总执行时间预算约束）"""
+    async def _run_agent(self, human_message: str, *, step: str = "react",
+                         max_steps: int | None = None) -> str:
+        """调用 Agent 执行一步并返回结果（受总执行时间预算约束）。
+
+        max_steps：本步专属 recursion_limit 上限（默认用整体 max_iterations）。LOCATING 等
+        "理解/定位"阶段用更紧的 cap，逼模型少探索直接产出（RUN12 实证：预读注入了但模型仍
+        探索 167-286s 烧光预算）。撞 cap 非硬失败——下方 GraphRecursionError 优雅返回，交 CODING。
+        """
         if self._agent is None:
             return "❌ Agent 未创建"
 
@@ -1521,8 +1536,9 @@ class WorkerExecutor:
             step=step,
             source=source,
         )
+        _limit = max_steps if (max_steps and max_steps > 0) else self.max_iterations
         invoke_config = merge_invoke_config(
-            {"recursion_limit": self.max_iterations},
+            {"recursion_limit": _limit},
             trace_cfg,
         )
         try:
@@ -1542,8 +1558,8 @@ class WorkerExecutor:
             # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。
             cls = type(exc).__name__
             if "Recursion" in cls or "recursion" in str(exc).lower():
-                self._log(f"Agent 撞迭代上限({self.max_iterations})，以沙箱实际产出为准交确定性闸门裁决")
-                return f"⚠️ Agent 达到迭代上限（{self.max_iterations}），已做改动交由确定性 L1 验证"
+                self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
+                return f"⚠️ Agent 达到迭代上限（{_limit}），已做改动交由确定性 L1 验证"
             raise
 
         # 提取最后一条 AI 消息
