@@ -355,7 +355,10 @@ def _format_norms_for_worker(items: list[dict]) -> str:
         tag_label = f"[{tag}] " if tag and tag not in ("general", "") else ""
         lines.append(f"  {i}. {tag_label}{title}")
         if content:
-            lines.append(f"     {content[:300]}")
+            # 500（原 300）：norm 内容多为含类名/注解/方法签名的完整约定，300 处常截在句中
+            # (实测 RuoYi 规范 10 条 308~393 字被腰斩)。只注入 top-8 norm，+200 字/条 ≈ +500 token，
+            # 对 80k 窗口可忽略，却让约定完整可照搬。
+            lines.append(f"     {content[:500]}")
     return "\n".join(lines)
 
 
