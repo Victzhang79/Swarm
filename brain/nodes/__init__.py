@@ -421,7 +421,13 @@ async def _plan_ultra_batched(
     _PLAN_BATCH_TIMEOUT = 300.0  # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
     batch_results: list[list[dict]] = []
     failed_batches = 0
-    for i, (mod_name, batch) in enumerate(module_batches, start=1):
+    # 各模块批【独立分解】(生成时无跨批依赖，跨批串行依赖在 merge 阶段才加)→ 并发执行。
+    # 实测本地 40B 后端(2×5090 连续批处理)8 并发仍近线性(1.46×)，保守取 4 并发，留足余量。
+    # 串行 11 批 ~20min → 并发4 ~5min。gather 保序：结果按 module_batches 顺序收集，merge 全局
+    # 编号与串行版一致。逐批超时/异常降级与原行为逐字节一致(返回标记，主循环统一计 failed_batches)。
+    _plan_sem = _asyncio.Semaphore(4)
+
+    async def _decompose_batch(i: int, mod_name: str, batch: list) -> tuple:
         batch_fp_text = "\n".join(
             f"  - {fp.get('path')} [{fp.get('action', 'create')}] {fp.get('responsibility', '')}"
             for fp in batch
@@ -444,40 +450,53 @@ async def _plan_ultra_batched(
             project_structure=proj_struct,
             tech_design_extra=tech_design_extra,
         )
-        _t0 = _time.monotonic()
-        try:
-            response = await _asyncio.wait_for(
-                llm.ainvoke([
-                    {"role": "system", "content": PLAN_BATCH_SYSTEM},
-                    {"role": "user", "content": prompt_user},
-                ]),
-                timeout=_PLAN_BATCH_TIMEOUT,
-            )
-            _dt = _time.monotonic() - _t0
-            result = _parse_json_from_llm(response.content)
-            subs = result.get("subtasks", []) if isinstance(result, dict) else []
-            for _st in subs:
-                if isinstance(_st, dict):
-                    for _opt in ("harness", "contract"):
-                        if _opt in _st and _st[_opt] is None:
-                            _st.pop(_opt)
-            if subs:
-                batch_results.append(subs)
-                logger.info("%s 模块'%s' 拆出 %d 个子任务",
-                            batch_progress_line(i, total, len(batch), _dt), mod_name, len(subs))
-            else:
-                failed_batches += 1
-                logger.warning("%s 模块'%s' 未拆出子任务（降级跳过）",
-                               batch_progress_line(i, total, len(batch), _dt), mod_name)
-        except _asyncio.TimeoutError:
+        async with _plan_sem:
+            _t0 = _time.monotonic()
+            try:
+                response = await _asyncio.wait_for(
+                    llm.ainvoke([
+                        {"role": "system", "content": PLAN_BATCH_SYSTEM},
+                        {"role": "user", "content": prompt_user},
+                    ]),
+                    timeout=_PLAN_BATCH_TIMEOUT,
+                )
+                _dt = _time.monotonic() - _t0
+                result = _parse_json_from_llm(response.content)
+                subs = result.get("subtasks", []) if isinstance(result, dict) else []
+                for _st in subs:
+                    if isinstance(_st, dict):
+                        for _opt in ("harness", "contract"):
+                            if _opt in _st and _st[_opt] is None:
+                                _st.pop(_opt)
+                return ("ok", i, mod_name, subs, _dt, len(batch))
+            except _asyncio.TimeoutError:
+                return ("timeout", i, mod_name, None, None, len(batch))
+            except Exception as exc:  # noqa: BLE001
+                return ("error", i, mod_name, exc, None, len(batch))
+
+    # gather 按输入顺序返回 → 保持 module_batches(模块依赖序)的批次顺序
+    _outcomes = await _asyncio.gather(*[
+        _decompose_batch(i, mod_name, batch)
+        for i, (mod_name, batch) in enumerate(module_batches, start=1)
+    ])
+    for kind, i, mod_name, payload, _dt, _nfiles in _outcomes:
+        if kind == "ok" and payload:
+            batch_results.append(payload)
+            logger.info("%s 模块'%s' 拆出 %d 个子任务",
+                        batch_progress_line(i, total, _nfiles, _dt), mod_name, len(payload))
+        elif kind == "ok":
+            failed_batches += 1
+            logger.warning("%s 模块'%s' 未拆出子任务（降级跳过）",
+                           batch_progress_line(i, total, _nfiles, _dt), mod_name)
+        elif kind == "timeout":
             failed_batches += 1
             logger.warning(
                 "%s 模块'%s' LLM 调用超时 >%.0fs（降级跳过，防 PLAN 无限挂 — FINDING-10）",
-                batch_progress_line(i, total, len(batch)), mod_name, _PLAN_BATCH_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
+                batch_progress_line(i, total, _nfiles), mod_name, _PLAN_BATCH_TIMEOUT)
+        else:
             failed_batches += 1
             logger.warning("%s 模块'%s' 拆解异常（降级跳过）: %s",
-                           batch_progress_line(i, total, len(batch)), mod_name, exc)
+                           batch_progress_line(i, total, _nfiles), mod_name, payload)
 
     merged = merge_subtask_batches(batch_results)
     logger.info(
