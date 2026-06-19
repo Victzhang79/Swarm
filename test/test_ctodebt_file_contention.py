@@ -159,3 +159,36 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q", "-p", "no:warnings"]))
+
+
+def test_run9_writers_chained_to_first_but_mutually_parallel(tmp_path):
+    """RUN9 根 class(task 225b1c7e)：多写者各自【传递依赖到首写者】却【彼此并行】。
+
+    旧逻辑 normalize 只查"与首写者同链"→ 判这些写者"同链"保留写权，但漏了它们【彼此之间】
+    无依赖序 → plan_validator 判"N 个无依赖子任务同时写"硬失败 → auto_accept fail-fast（实证
+    RUN9：5 个子任务都写根 pom.xml）。串行流水化守卫须把全部写者串成【单一总序链】→ 校验通过。
+    无 project_path（复现 VALIDATE 路径 nodes/__init__.py:719），不依赖仓库感知。
+    """
+    sts = [
+        _st("st-0", writable=["pom.xml"], create=["base/Base.java"]),                  # 首写者
+        _st("st-a1", create=["modA/A.java"], depends=["st-0"]),
+        _st("st-a2", writable=["pom.xml"], create=["modA/B.java"], depends=["st-a1"]),  # 链→st-0
+        _st("st-b1", create=["modB/C.java"], depends=["st-0"]),
+        _st("st-b2", writable=["pom.xml"], create=["modB/D.java"], depends=["st-b1"]),  # 链→st-0，与 a2 并行
+    ]
+    plan = TaskPlan(subtasks=sts)
+    normalize_plan_scopes(plan)  # 无 project_path
+    res = validate_plan_structure(plan)
+    assert res.valid, f"串行流水化后校验应通过(全部 pom 写者串成总序、无独立并行): {res.issues}"
+    # 反向断言：a2 与 b2 必有依赖序（不再并行）
+    def _d(sid):
+        s = next(s for s in plan.subtasks if s.id == sid)
+        seen, stack = set(), list(s.depends_on or [])
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(next((t.depends_on for t in plan.subtasks if t.id == x), []) or [])
+        return seen
+    assert "st-a2" in _d("st-b2") or "st-b2" in _d("st-a2"), "a2/b2 必须串行（其一传递依赖另一）"

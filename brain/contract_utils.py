@@ -356,6 +356,41 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
                         st.depends_on = deps
                         changed = True
 
+    # ── 规则 1.5：共享文件写者【串行流水化】(治本 RUN9 类——同类反复出现的根 class) ──
+    # 前述规则1只保证每个写者与【首写者】同链，漏了"多个写者各自挂首写者链、彼此却并行"：
+    # 实证 RUN9(task 225b1c7e)：5 个子任务都写根 pom.xml，各自传递依赖到 scaffold 故被判"同链"
+    # 保留写权，但彼此无依赖序 → plan_validator 判"N 个无依赖子任务同时写"硬失败 → auto_accept
+    # fail-fast。注册/聚合类共享文件(根 pom/settings.gradle/DI 注册表…)多写者本是合法模式，
+    # 正解是把全部写者按拓扑序串成【单一总序链】(writer[i] 依赖 writer[i-1])，确保任意两写者
+    # 必有依赖序、零并行 → 各写者顺序追加注册、MERGE 3-way/bootstrap 传播收口。带防环守卫。
+    # 无需 project_path，故 VALIDATE 路径(line 719 无 project_path)也生效。
+    _writers_final: dict[str, list[str]] = {}
+    _pos = {st.id: i for i, st in enumerate(subtasks)}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        for f in (set(getattr(sc, "create_files", []) or []) | set(getattr(sc, "writable", []) or [])):
+            _writers_final.setdefault(f, []).append(st.id)
+    for f, wids in _writers_final.items():
+        wids = list(dict.fromkeys(wids))
+        if len(wids) < 2:
+            continue
+        ordered = sorted(wids, key=lambda _i: _pos.get(_i, 1 << 30))  # 列表位次≈拓扑序，上游在前
+        for k in range(1, len(ordered)):
+            cur_id, prev_id = ordered[k], ordered[k - 1]
+            cur = by_id_all.get(cur_id)
+            if cur is None:
+                continue
+            # 已(传递)有序则跳过；防环：若 prev 已传递依赖 cur，加 cur→prev 会成环 → 跳过
+            if _depends_transitively(cur_id, prev_id) or _depends_transitively(prev_id, cur_id):
+                continue
+            deps = list(getattr(cur, "depends_on", []) or [])
+            if prev_id not in deps:
+                deps.append(prev_id)
+                cur.depends_on = deps
+                changed = True
+
     # ── 规则 2：被依赖产物自动入 readable ──
     by_id = {st.id: st for st in subtasks}
     for st in subtasks:
