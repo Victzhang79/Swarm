@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -29,9 +30,11 @@ logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = frozenset({
     ".md", ".markdown", ".txt", ".text",
     ".pdf", ".docx",
+    ".html", ".htm",
     ".png", ".jpg", ".jpeg", ".webp",
 })
 TEXT_EXTENSIONS = frozenset({".md", ".markdown", ".txt", ".text"})
+HTML_EXTENSIONS = frozenset({".html", ".htm"})
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024   # 单文件 20MB（B.3 默认，可配）
@@ -46,7 +49,7 @@ class ParsedDocument:
     """单个文件的解析结果。"""
     filename: str
     ext: str
-    kind: str                    # text | pdf | docx | image | unknown
+    kind: str                    # text | pdf | docx | html | image | unknown
     text: str = ""               # 抽取的文本（确定性解析）
     needs_vision: bool = False   # True=需多模态理解（图片/扫描件），留给 B批2
     char_count: int = 0
@@ -154,6 +157,70 @@ def _parse_docx(path: Path) -> str:
     return "\n".join(parts).strip()
 
 
+class _HTMLTextExtractor(HTMLParser):
+    """标准库 HTML → 纯文本(去 script/style，标题/列表保留换行)。
+
+    只用 html.parser（不引入 bs4）。不追求完整 HTML 规范，够喂下游切分即可：
+      - <script>/<style> 内容整段丢弃（不进文本）。
+      - 标题(h1-h6)/列表项(li)/段落(p,div,br…)前后补换行，保留结构感。
+      - 其余文本折叠连续空白为单空格。
+    """
+
+    _SKIP_TAGS = {"script", "style"}
+    _BREAK_TAGS = {
+        "p", "div", "section", "article", "br", "tr",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: object) -> None:  # noqa: ARG002
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag == "li":
+            self._parts.append("\n- ")
+        elif tag in self._BREAK_TAGS:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif tag in self._BREAK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        collapsed = " ".join(data.split())
+        if collapsed:
+            self._parts.append(collapsed + " ")
+
+    def get_text(self) -> str:
+        body = "".join(self._parts)
+        # 压掉过多空行 + 行尾空白
+        cleaned = "\n".join(line.rstrip() for line in body.splitlines())
+        while "\n\n\n" in cleaned:
+            cleaned = cleaned.replace("\n\n\n", "\n\n")
+        return cleaned.strip()
+
+
+def _parse_html(path: Path) -> str:
+    """标准库 html.parser 抽 HTML 文本。去 script/style，保留标题/列表换行。
+
+    不依赖 bs4（B.3：不引入新依赖）。容错编码，沿用纯文本读取的编码兜底。
+    """
+    raw = _read_text_file(path)
+    parser = _HTMLTextExtractor()
+    parser.feed(raw)
+    parser.close()
+    return parser.get_text()
+
+
 def parse_file(
     path: str | Path, max_bytes: int = DEFAULT_MAX_FILE_BYTES
 ) -> ParsedDocument:
@@ -185,6 +252,9 @@ def parse_file(
         elif ext == ".docx":
             doc.kind = "docx"
             doc.text = _parse_docx(p)
+        elif ext in HTML_EXTENSIONS:
+            doc.kind = "html"
+            doc.text = _parse_html(p)
         elif ext in IMAGE_EXTENSIONS:
             doc.kind = "image"
             doc.needs_vision = True   # 图片必走多模态（B批2）
