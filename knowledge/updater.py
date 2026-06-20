@@ -249,6 +249,9 @@ class KnowledgeUpdater:
         # 用 in-process dict（最简健壮）：重启即重置不影响正确性——增量已删自身
         # 出边兜底，重建只是纠正缺边的尽力而为优化。
         self._depgraph_dirty: dict[str, int] = {}
+        # 持后台重建 task 强引用，防 GC 中途回收（与 api.app._spawn_bg 同纪律）；
+        # 完成即从集合 discard。
+        self._depgraph_tasks: set = set()
 
     # ── 连接管理 ──────────────────────────────
 
@@ -437,7 +440,9 @@ class KnowledgeUpdater:
             project_id, count, threshold,
         )
         try:
-            asyncio.create_task(self._rebuild_depgraph_async(project_id))
+            task = asyncio.create_task(self._rebuild_depgraph_async(project_id))
+            self._depgraph_tasks.add(task)
+            task.add_done_callback(self._depgraph_tasks.discard)
         except RuntimeError:
             # 无运行中的事件循环（极少见）→ 直接 await，失败也吞掉。
             try:

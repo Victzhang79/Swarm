@@ -559,6 +559,7 @@ def _make_updater_for_index_file(threshold=50):
     kb.depgraph_rebuild_threshold = threshold
     upd._kb_config = kb
     upd._depgraph_dirty = {}
+    upd._depgraph_tasks = set()
     struct = MagicMock()
     struct.upsert_file = AsyncMock()
     struct.upsert_symbols_batch = AsyncMock()
@@ -611,6 +612,35 @@ def test_depgraph_dirty_counter_triggers_rebuild_at_threshold():
         await upd._maybe_rebuild_depgraph("p")
         await asyncio.sleep(0)
         assert rebuild.await_count == 1, "清零后不得立即再触发"
+
+    asyncio.run(_run())
+
+
+def test_depgraph_rebuild_task_reference_is_held_then_discarded():
+    """K4 收口：后台重建 task 必须被强引用持有(防 GC 中途回收)，完成后从集合 discard。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    upd, _struct = _make_updater_for_index_file(threshold=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_rebuild(_pid):
+        started.set()
+        await release.wait()
+
+    upd._rebuild_depgraph_async = _slow_rebuild
+
+    async def _run():
+        await upd._maybe_rebuild_depgraph("p")
+        await started.wait()
+        # 重建在途：集合里持有该 task 的强引用
+        assert len(upd._depgraph_tasks) == 1, "在途重建 task 必须被持有引用防 GC"
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # 完成后 done_callback 应已 discard
+        assert len(upd._depgraph_tasks) == 0, "重建完成后须从集合 discard"
 
     asyncio.run(_run())
 
