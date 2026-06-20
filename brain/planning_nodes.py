@@ -1246,6 +1246,7 @@ async def elaborate(state: BrainState) -> dict:
     from swarm.brain.contract_utils import (
         correct_misclassified_intent,
         enrich_context_snippets,
+        dedupe_module_scaffolds,
         enrich_java_package_readable,
         fix_dependency_ordering,
         normalize_plan_scopes,
@@ -1261,6 +1262,9 @@ async def elaborate(state: BrainState) -> dict:
             _proj_path = _proj.get("path") if _proj else None
     except Exception as exc:  # noqa: BLE001
         logger.debug("[ELABORATE] 获取 project_path 失败，scope 归一退化为 demote 行为: %s", exc)
+    # ── 治本(RUN17 严重冲突)：先合并重复模块脚手架(4 个建同一 module pom → 1 个)，再归一/排序 ──
+    scaffolds_merged = dedupe_module_scaffolds(plan_obj)
+
     scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
 
     # ── 治本(RUN17 依赖倒置死锁)：脚手架置根 + SQL 依赖实体跑最后 + 防"建全部表"巨任务成根瓶颈 ──
@@ -1338,7 +1342,7 @@ async def elaborate(state: BrainState) -> dict:
         "invest_fail_count": invest_fail,
     }
     if (resplit_rounds > 0 or decoupled > 0 or scope_normalized or java_enriched
-            or dangling_fixed or dep_reordered):
+            or dangling_fixed or dep_reordered or scaffolds_merged):
         # 拆分 / 剥离假依赖 / scope 归一 / Java 同包入域 / 悬空依赖兜底 / 依赖序修正改变了 plan，回写
         out["plan"] = plan_obj
     return out

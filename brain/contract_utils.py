@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import functools as _functools
 import json
+import logging
 import re
 from typing import Any
 
 from swarm.types import TaskPlan
+
+logger = logging.getLogger(__name__)
 
 # Maven `-pl <module>` 提取（reactor 模块选择）。
 _MVN_PL_RE = re.compile(r"-pl\s+([^\s,]+)")
@@ -736,6 +739,67 @@ def _is_sql_subtask(st) -> bool:
     """纯 SQL 子任务 = create 全是 .sql(建表 DDL / seed)。"""
     cf = _st_create_files(st)
     return bool(cf) and all(f.endswith(".sql") for f in cf)
+
+
+def _union_keep_order(*lists) -> list:
+    seen: set = set()
+    out: list = []
+    for lst in lists:
+        for x in (lst or []):
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
+
+
+def dedupe_module_scaffolds(plan: TaskPlan) -> int:
+    """治本(RUN17 严重冲突,VALIDATE 只软警告未修)：多个子任务重复创建【同一模块脚手架】
+    (都建同一个 <module>/pom.xml)→ 合并为一个 canonical。
+
+    重复地基即便各自编译过,也是冗余/互相覆盖的非生产级产物(4 个子任务各建一遍 ruoyi-alarm
+    模块 pom/目录/根 pom 注册)。确定性合并:保留首个,其余 create/writable/readable/depends_on
+    并入它,下游依赖重映射到它,删除其余。返回合并掉的子任务数。
+    """
+    import collections
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if len(subs) < 2:
+        return 0
+    # 按【模块 pom 路径】给脚手架子任务分组(只认带目录前缀的模块 pom,排除根 pom.xml)
+    groups: "collections.OrderedDict[str, list]" = collections.OrderedDict()
+    for st in subs:
+        if not _is_scaffold_subtask(st):
+            continue
+        for f in _st_create_files(st):
+            norm = f.replace("\\", "/")
+            if norm.rsplit("/", 1)[-1] == "pom.xml" and "/" in norm:
+                groups.setdefault(norm, []).append(st)
+                break
+    drop_to_canon: dict[str, str] = {}
+    merged = 0
+    for _pom, group in groups.items():
+        if len(group) < 2:
+            continue
+        canon = group[0]
+        for dup in group[1:]:
+            cs, ds = getattr(canon, "scope", None), getattr(dup, "scope", None)
+            if cs and ds:
+                cs.create_files = _union_keep_order(cs.create_files, ds.create_files)
+                cs.writable = _union_keep_order(cs.writable, ds.writable)
+                cs.readable = _union_keep_order(cs.readable, ds.readable)
+            canon.depends_on = _union_keep_order(getattr(canon, "depends_on", []),
+                                                 getattr(dup, "depends_on", []))
+            drop_to_canon[dup.id] = canon.id
+            merged += 1
+    if not merged:
+        return 0
+    plan.subtasks = [s for s in subs if s.id not in drop_to_canon]
+    # 重映射所有下游依赖到 canonical，去自依赖
+    for s in plan.subtasks:
+        s.depends_on = sorted({drop_to_canon.get(d, d) for d in (getattr(s, "depends_on", []) or [])
+                               if drop_to_canon.get(d, d) != s.id})
+    logger.info("[ELABORATE] 重复模块脚手架合并：%d 个重复脚手架并入 canonical(杜绝冗余地基,治严重文件冲突)",
+                merged)
+    return merged
 
 
 def fix_dependency_ordering(plan: TaskPlan) -> bool:
