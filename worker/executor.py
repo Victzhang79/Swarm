@@ -260,7 +260,12 @@ class WorkerExecutor:
         return elapsed >= self.max_execution_time
 
     async def run(self) -> WorkerOutput:
-        """执行完整的 Worker 生命周期
+        """执行完整的 Worker 生命周期（编排器：依次调用各 phase 方法）
+
+        W1.2 重构：原单体 run() 拆为 _phase_prepare / _phase_locate /
+        _phase_code / _phase_verify_loop / _phase_produce 五个 phase 方法。
+        编排逻辑（超时早返、trivial 分流、异常归类、finally 清理）保留在此。
+        各 phase 早返时返回 WorkerOutput；否则返回 None 继续下一阶段。
 
         Returns:
             WorkerOutput 产出物
@@ -270,9 +275,7 @@ class WorkerExecutor:
 
         from swarm.tools.build_tools import (
             clear_extra_whitelist,
-            clear_sandbox_context,
             set_extra_whitelist,
-            set_sandbox_context,
         )
 
         # 按子任务 harness 放行其构建/测试/验收命令（否则 worker 跑不了验证命令）
@@ -281,9 +284,62 @@ class WorkerExecutor:
 
         try:
             # ── Phase 0: 准备 ──
-            self.phase = WorkerPhase.PREPARING
-            self._log("准备阶段：设置 Scope，创建 Agent")
+            early = await self._phase_prepare()
+            if early is not None:
+                return early
+            if self.subtask.difficulty == SubTaskDifficulty.TRIVIAL:
+                return await self._run_trivial_fast()
 
+            # ── Phase 1: 定位 ──
+            locate_result, early = await self._phase_locate()
+            if early is not None:
+                return early
+
+            # ── Phase 2: 编码 ──
+            early = await self._phase_code(locate_result)
+            if early is not None:
+                return early
+
+            # ── Phase 3: L1 验证（含重试循环） ──
+            l1_passed, l1_details = await self._phase_verify_loop()
+
+            # ── Phase 4: 产出 + 最终复核 + DEBUG 闸门 + 置信度校正 ──
+            return await self._phase_produce(l1_passed, l1_details)
+
+        except Exception as e:
+            self.phase = WorkerPhase.FAILED
+            self._log(f"执行异常: {e}")
+            self._l1_passed_flag = False  # 异常路径：沙箱可能脏，不归还复用
+            # P2：分类失败类型，供 handle_failure 决定退避重试(transient) 还是换模型(capability)。
+            from swarm.models.errors import classify_failure
+            failure_class = classify_failure(e)
+            return self._make_output(
+                diff="",
+                summary=f"执行异常: {e}",
+                confidence=Confidence.LOW,
+                l1_passed=False,
+                l1_details={"error": str(e), "failure_class": failure_class},
+            )
+        finally:
+            from swarm.tools.build_tools import clear_sandbox_context
+            clear_sandbox_context()
+            clear_scope()
+            clear_extra_whitelist()
+            self.kill_sandbox()
+            elapsed = time.monotonic() - self.start_time
+            self._log(f"总执行时间: {elapsed:.1f}s")
+
+    async def _phase_prepare(self) -> WorkerOutput | None:
+        """Phase 0：创建/借用远程沙箱、bootstrap 同步、创建 Agent。
+
+        早返：超时 → 返回 WorkerOutput；否则返回 None 继续。
+        """
+        from swarm.tools.build_tools import set_sandbox_context
+
+        self.phase = WorkerPhase.PREPARING
+        self._log("准备阶段：设置 Scope，创建 Agent")
+
+        if True:
             cfg = get_config()
             if cfg.sandbox.use_for_worker and cfg.sandbox.api_url:
                 try:
@@ -419,53 +475,57 @@ class WorkerExecutor:
                     l1_passed=False,
                     l1_details={"error": "timeout_in_preparing"},
                 )
+        return None
 
-            if self.subtask.difficulty == SubTaskDifficulty.TRIVIAL:
-                return await self._run_trivial_fast()
+    async def _phase_locate(self) -> tuple[str, WorkerOutput | None]:
+        """Phase 1：定位。返回 (locate_result, early_output)；early 非 None 即超时早返。"""
+        # 硬砍 LOCATING 预算（治本 RUN12：预读注入了但模型仍探索 167-286s 烧光整体 600s 预算，
+        # 导致 CODING/VERIFY 没预算 → 超时 → 集成级联）。定位只是"理解结构/确认落点"，不该烧 50 步；
+        # 有预读范例+共享契约时 ~20 步(≈10 think-act 循环)足够。撞 cap 非硬失败(返回提示交 CODING)，
+        # 省下的预算留给真正干活的 CODING+VERIFY。把整体超时根因从"探索吃光预算"摁住。
+        self.phase = WorkerPhase.LOCATING
+        self._log("定位阶段：阅读代码，理解结构")
+        locate_result = await self._run_agent(
+            self._build_locate_prompt(),
+            step="locate",
+            max_steps=min(self.max_iterations, _LOCATE_STEP_CAP),
+        )
+        self._log(f"定位完成: {locate_result[:200]}")
 
-            # ── Phase 1: 定位 ──
-            # 硬砍 LOCATING 预算（治本 RUN12：预读注入了但模型仍探索 167-286s 烧光整体 600s 预算，
-            # 导致 CODING/VERIFY 没预算 → 超时 → 集成级联）。定位只是"理解结构/确认落点"，不该烧 50 步；
-            # 有预读范例+共享契约时 ~20 步(≈10 think-act 循环)足够。撞 cap 非硬失败(返回提示交 CODING)，
-            # 省下的预算留给真正干活的 CODING+VERIFY。把整体超时根因从"探索吃光预算"摁住。
-            self.phase = WorkerPhase.LOCATING
-            self._log("定位阶段：阅读代码，理解结构")
-            locate_result = await self._run_agent(
-                self._build_locate_prompt(),
-                step="locate",
-                max_steps=min(self.max_iterations, _LOCATE_STEP_CAP),
+        if self._check_timeout():
+            return locate_result, self._make_output(
+                diff="",
+                summary="超时：定位阶段超时",
+                confidence=Confidence.LOW,
+                l1_passed=False,
+                l1_details={"error": "timeout_in_locating"},
             )
-            self._log(f"定位完成: {locate_result[:200]}")
+        return locate_result, None
 
-            if self._check_timeout():
-                return self._make_output(
-                    diff="",
-                    summary="超时：定位阶段超时",
-                    confidence=Confidence.LOW,
-                    l1_passed=False,
-                    l1_details={"error": "timeout_in_locating"},
-                )
+    async def _phase_code(self, locate_result: str) -> WorkerOutput | None:
+        """Phase 2：编码（B2 多文件分阶段执行）。超时早返 WorkerOutput，否则 None。"""
+        self.phase = WorkerPhase.CODING
+        self._log("编码阶段：实现变更")
+        code_result = await self._run_coding_phase(locate_result)
+        self._log(f"编码完成: {code_result[:200]}")
 
-            # ── Phase 2: 编码（B2：多文件分阶段执行）──
-            self.phase = WorkerPhase.CODING
-            self._log("编码阶段：实现变更")
-            code_result = await self._run_coding_phase(locate_result)
-            self._log(f"编码完成: {code_result[:200]}")
+        if self._check_timeout():
+            return self._make_output(
+                diff="",
+                summary="超时：编码阶段超时",
+                confidence=Confidence.LOW,
+                l1_passed=False,
+                l1_details={"error": "timeout_in_coding"},
+            )
+        return None
 
-            if self._check_timeout():
-                return self._make_output(
-                    diff="",
-                    summary="超时：编码阶段超时",
-                    confidence=Confidence.LOW,
-                    l1_passed=False,
-                    l1_details={"error": "timeout_in_coding"},
-                )
+    async def _phase_verify_loop(self) -> tuple[bool, dict]:
+        """Phase 3：L1 验证（含修复重试循环）。返回 (l1_passed, l1_details)。"""
+        self.phase = WorkerPhase.VERIFYING
+        l1_passed = False
+        l1_details: dict = {}
 
-            # ── Phase 3: L1 验证（含重试循环） ──
-            self.phase = WorkerPhase.VERIFYING
-            l1_passed = False
-            l1_details: dict = {}
-
+        if True:
             for fix_round in range(self.max_fix_rounds + 1):
                 self.fix_rounds = fix_round
                 self._log(f"L1 验证轮次 {fix_round + 1}/{self.max_fix_rounds + 1}")
@@ -535,6 +595,11 @@ class WorkerExecutor:
                     self._log("验证阶段超时")
                     break
 
+        return l1_passed, l1_details
+
+    async def _phase_produce(self, l1_passed: bool, l1_details: dict) -> WorkerOutput:
+        """Phase 4：产出 + 最终复核 + DEBUG 闸门 + 置信度校正，返回最终 WorkerOutput。"""
+        if True:
             # ── Phase 4: 产出 ──
             self.phase = WorkerPhase.PRODUCING
             self._log("产出阶段：从沙箱 pull-back 并收集 diff")
@@ -655,28 +720,6 @@ class WorkerExecutor:
             self._l1_passed_flag = bool(getattr(output, "l1_passed", False))
 
             return output
-
-        except Exception as e:
-            self.phase = WorkerPhase.FAILED
-            self._log(f"执行异常: {e}")
-            self._l1_passed_flag = False  # 异常路径：沙箱可能脏，不归还复用
-            # P2：分类失败类型，供 handle_failure 决定退避重试(transient) 还是换模型(capability)。
-            from swarm.models.errors import classify_failure
-            failure_class = classify_failure(e)
-            return self._make_output(
-                diff="",
-                summary=f"执行异常: {e}",
-                confidence=Confidence.LOW,
-                l1_passed=False,
-                l1_details={"error": str(e), "failure_class": failure_class},
-            )
-        finally:
-            clear_sandbox_context()
-            clear_scope()
-            clear_extra_whitelist()
-            self.kill_sandbox()
-            elapsed = time.monotonic() - self.start_time
-            self._log(f"总执行时间: {elapsed:.1f}s")
 
     # ──────────────────────────────────────────
     # 内部方法
