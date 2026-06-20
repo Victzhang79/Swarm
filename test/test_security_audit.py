@@ -229,13 +229,39 @@ def test_block_severity_critical_with_medium_finding():
 
 
 def test_clean_project_no_block():
-    """干净项目 + 任何阈值 → should_block=False。"""
+    """干净项目 + 阈值。
+
+    A-P0-2 修复后语义变更：阻断模式(critical)下，若【没有任何真实扫描器执行】
+    （CI/本地常无 bandit/pip-audit/gitleaks），不能与"真·零漏洞"混同放行 → fail-closed 阻断。
+    - 有真实扫描器执行 → 干净项目 should_block=False（保持原意图）。
+    - 无任何扫描器执行 → should_block=True（fail-closed，注入 fail-closed-no-scanner 合成发现）。
+    报告模式(none)永远不阻断（见 test_clean_project_report_mode_never_blocks）。
+    """
+    import shutil
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
         findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
-        assert should_block is False, f"干净项目不应阻断, findings: {findings}"
-    print("  ✅ 干净项目不阻断")
+        real_scanner_present = any(
+            shutil.which(t) for t in ("bandit", "pip-audit", "gitleaks", "trufflehog")
+        )
+        if real_scanner_present:
+            assert should_block is False, f"有扫描器+干净项目不应阻断, findings: {findings}"
+        else:
+            assert should_block is True, "无任何扫描器→阻断模式必须 fail-closed"
+            assert any(f.rule_id == "fail-closed-no-scanner" for f in findings)
+    print("  ✅ 干净项目: 有扫描器不阻断 / 无扫描器 fail-closed")
+
+
+def test_clean_project_report_mode_never_blocks():
+    """报告模式(none)下，即便无任何扫描器执行也绝不阻断（运维明示永不阻断）。"""
+    from swarm.worker.security_scan import run_security_scan
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
+        findings, should_block = run_security_scan(tmp, "python", block_severity="none")
+        assert should_block is False, "report-only 模式永不阻断"
+        assert not any(f.rule_id == "fail-closed-no-scanner" for f in findings)
+    print("  ✅ 报告模式无扫描器也不阻断")
 
 
 # ─── SecurityFinding 结构验证 ───

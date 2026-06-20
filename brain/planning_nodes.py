@@ -194,6 +194,24 @@ async def clarify(state: BrainState) -> dict:
         fi for fi in (state.get("tech_design_fact_issues") or [])
         if isinstance(fi, dict) and fi.get("verdict") == "false"
     ]
+    # A-P1-02：轮数上限必须在虚假前提分支【之前】检查，否则该分支永远先命中，
+    # 用户答复后 tech_design_fact_issues 未被清空 → 每轮重新推导出同一虚假前提 → 同问题死问到
+    # recursion_limit。达上限后停止再问（保留 blocked 标记交人工），不再无限 interrupt。
+    _fact_rnd = int(state.get("clarify_round", 0))
+    _fact_max = _tier_limits()["clarify_rounds"]
+    if false_premises and _fact_rnd >= _fact_max:
+        logger.warning(
+            "[CLARIFY] 虚假前提澄清达轮数上限 %d，停止再问，交人工/降级继续", _fact_max,
+        )
+        return {
+            "clarify_done": True,
+            "clarify_blocked_by_facts": True,
+            "clarify_summary": (
+                "需求存在虚假前提且澄清已达轮数上限，停止追问交人工处理。"
+            ),
+            # 消费掉，避免下游再次将其视作未决事实问题。
+            "tech_design_fact_issues": [],
+        }
     if false_premises:
         _msgs = []
         for fp in false_premises:
@@ -215,9 +233,21 @@ async def clarify(state: BrainState) -> dict:
             answer = _interrupt({"type": "clarify_fact_issue", "question": ask})
             history = list(state.get("clarify_history", []))
             history.append({"q": ask, "a": str(answer)})
-            return {"clarify_history": history, "clarify_round": int(state.get("clarify_round", 0)) + 1}
+            # A-P1-02：用户已就该虚假前提作答 → 消费掉 tech_design_fact_issues，
+            # 否则它会被反复重新识别为未决问题，每轮重问同一事实。后续若需基于答复
+            # 重新核验，由 tech_design 重新生成新的 fact_issues（而非沿用旧的）。
+            return {
+                "clarify_history": history,
+                "clarify_round": int(state.get("clarify_round", 0)) + 1,
+                "tech_design_fact_issues": [],
+            }
         except Exception:  # noqa: BLE001
-            return {"clarify_done": True, "clarify_blocked_by_facts": True, "clarify_summary": summary}
+            return {
+                "clarify_done": True,
+                "clarify_blocked_by_facts": True,
+                "clarify_summary": summary,
+                "tech_design_fact_issues": [],
+            }
 
     if _auto_mode(state):
         return {"clarify_done": True, "clarify_summary": "自动化模式，跳过澄清，用默认假设。"}

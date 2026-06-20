@@ -9,9 +9,10 @@ ClickHouse 未配置/不可达时各端点返回 {"available": false, ...}，前
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 import swarm.api.app as _app  # noqa: F401  (保持与其它 router 一致的反向引用约定)
+from swarm.api._shared import _require_user
 from swarm.observability import clickhouse as ch
 
 router = APIRouter()
@@ -27,36 +28,43 @@ async def obs_ping():
 
 
 @router.get("/api/observability/summary", tags=[_TAG])
-async def obs_summary(hours: int = Query(24, ge=1, le=720)):
+async def obs_summary(request: Request, hours: int = Query(24, ge=1, le=720)):
     """面板顶部概览卡：总调用 / 错误数 / embed & llm p95。"""
+    _require_user(request)
     return await _run(ch.summary, hours)
 
 
 @router.get("/api/observability/latency", tags=[_TAG])
 async def obs_latency(
+    request: Request,
     hours: int = Query(24, ge=1, le=720),
     limit: int = Query(25, ge=1, le=200),
 ):
     """各 SpanName 调用量 + 延迟分位 (p50/p95/p99/max) + 错误数。"""
+    _require_user(request)
     return await _run(ch.latency_by_span, hours, limit)
 
 
 @router.get("/api/observability/timeseries", tags=[_TAG])
 async def obs_timeseries(
+    request: Request,
     hours: int = Query(24, ge=1, le=720),
     bucket_minutes: int = Query(60, ge=1, le=1440),
 ):
     """调用量时间序列（按 bucket 分桶，区分 llm/embed/rerank/other）。"""
+    _require_user(request)
     return await _run(ch.calls_timeseries, hours, bucket_minutes)
 
 
 @router.get("/api/observability/slow", tags=[_TAG])
 async def obs_slow(
+    request: Request,
     hours: int = Query(24, ge=1, le=720),
     threshold_ms: int = Query(5000, ge=1),
     limit: int = Query(20, ge=1, le=200),
 ):
     """近 N 小时最慢调用（> threshold_ms），定位 stall。"""
+    _require_user(request)
     return await _run(ch.slow_calls, hours, threshold_ms, limit)
 
 

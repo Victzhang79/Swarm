@@ -346,7 +346,8 @@ async def toggle_sandbox_pool(request: Request):
             out_lines.append(line)
     if not found:
         out_lines.append(f"{env_key}={val}")
-    env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    from swarm.config.settings import atomic_write_env
+    atomic_write_env(env_path, "\n".join(out_lines) + "\n")  # A-P1-29：原子写
     os.environ[env_key] = val
 
     # 2. reload config 让 SandboxConfig.pool_enabled 反映新值

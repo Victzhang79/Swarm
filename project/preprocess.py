@@ -516,6 +516,28 @@ async def _phase_embed(
     texts = _build_embed_texts(symbols)
     vectors = await asyncio.to_thread(_embed_texts, texts)
 
+    # audit A-P0-1：嵌入服务不可用时 _embed_texts 返回 None（拒绝写随机向量）。
+    # 此处必须跳过 upsert，并把阶段标记为 degraded/skipped，绝不报成功污染 KB。
+    if vectors is None or len(vectors) != len(symbols):
+        reason = (
+            "embedding service unavailable"
+            if vectors is None
+            else f"vector/symbol count mismatch ({len(vectors)} != {len(symbols)})"
+        )
+        logger.error(
+            "[EMBED] skipping Qdrant upsert for project %s — %s", project_id, reason
+        )
+        await asyncio.to_thread(
+            upsert_progress,
+            project_id,
+            phase="embedding",
+            phase_progress=1.0,
+            message=f"Embedding skipped: {reason}",
+            embed_stats={"vectors": 0, "dim": 0, "skipped": True, "reason": reason},
+        )
+        await asyncio.sleep(0.1)
+        return {"vector_count": 0, "dim": 0, "skipped": True, "reason": reason}
+
     dim = len(vectors[0]) if vectors else 0
 
     def _embed_progress_cb(progress: float, message: str) -> None:
@@ -996,7 +1018,7 @@ def _build_embed_texts(symbols: list[dict[str, Any]]) -> list[str]:
     return texts
 
 
-def _embed_texts(texts: list[str]) -> list[list[float]]:
+def _embed_texts(texts: list[str]) -> list[list[float]] | None:
     """使用 bge-m3 嵌入文本列表
 
     优先级：专用 embed 服务(SWARM_KB_EMBED_BASE_URL) → sentence-transformers →
@@ -1060,14 +1082,25 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     except Exception as exc:
         logger.warning("OpenAI-compatible embedding API failed: %s", exc)
 
-    # 回退: 随机向量（仅用于开发测试，生产环境必须配置嵌入服务）
-    logger.warning(
-        "No embedding service available — using random vectors. "
-        "Configure sentence-transformers or embedding API for production."
+    # audit A-P0-1：无嵌入服务时【绝不】返回随机占位向量。随机向量被写入 Qdrant
+    # 会永久污染 KB（检索结果是噪声但阶段报成功），属严重数据完整性事故。
+    # 改为返回 None 表示“嵌入失败”，由调用方跳过 upsert 并标记 degraded。
+    # 仅当显式设置 SWARM_ALLOW_RANDOM_EMBED=1（本地纯测试）时才保留随机回退。
+    import os
+    if os.getenv("SWARM_ALLOW_RANDOM_EMBED") == "1":
+        logger.warning(
+            "No embedding service available — SWARM_ALLOW_RANDOM_EMBED=1, "
+            "using random vectors (DEV ONLY, will pollute KB if used in prod)."
+        )
+        import random
+        random.seed(42)
+        return [[random.gauss(0, 1) for _ in range(dim)] for _ in texts]
+    logger.error(
+        "No embedding service available — refusing to write random placeholder "
+        "vectors (would poison KB). Skipping embedding. Configure "
+        "sentence-transformers or an embedding API for this to succeed."
     )
-    import random
-    random.seed(42)
-    return [[random.gauss(0, 1) for _ in range(dim)] for _ in texts]
+    return None
 
 
 def _store_vectors_qdrant(

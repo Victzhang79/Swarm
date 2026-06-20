@@ -1299,14 +1299,35 @@ async def handle_failure(state: BrainState) -> dict:
         }
 
     if state.get("verification_failure") == "contract":
-        logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务")
+        # audit A-P1-03：契约偏离重试必须计数+设上限，否则与能力分支不同——
+        # 可无限 retry→contract→retry 至 recursion_limit。复用 subtask_retry_counts
+        # 与 max_retries 上限（与 capability/SIMPLE 路径一致），超限升级人工。
         failed = list(state.get("failed_subtask_ids", [])) or list(
             (state.get("subtask_results") or {}).keys()
         )
+        failed = failed[:3]
+        _max_retries = get_config().model.max_retries  # 默认 2
+        _retry_counts = dict(state.get("subtask_retry_counts", {}))
+        _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed}
+        _deepest = max(_next_counts.values(), default=0)
+        if _deepest > _max_retries + 1:
+            logger.warning(
+                "[HANDLE_FAILURE] 契约偏离重试达上限(%d+alternate)，升级人工: %s",
+                _max_retries, failed,
+            )
+            return {
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "failed_subtask_ids": failed,
+                "verification_failure": None,
+                "subtask_retry_counts": {**_retry_counts, **_next_counts},
+            }
+        logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务(第 %d 次)", _deepest)
         return {
             "failure_strategy": "retry",
-            "failed_subtask_ids": failed[:3],
+            "failed_subtask_ids": failed,
             "verification_failure": None,
+            "subtask_retry_counts": {**_retry_counts, **_next_counts},
         }
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
@@ -1735,6 +1756,12 @@ def merge(state: BrainState) -> dict:
         ),
     )
     out: dict = {"merged_diff": result.merged_diff, **merge_touch}
+
+    # H3 纪律：BrainState 无 reducer（last-write-wins），clean merge 必须显式回写
+    # rebase_subtask_ids=[]，否则上一轮的非空 rebase 列表会残留，导致 after_merge
+    # 误判仍需 rebase → MERGE→DISPATCH 死循环至 recursion_limit。
+    # 仅在下方 rebase 路径命中时被覆盖为非空。
+    out["rebase_subtask_ids"] = []
 
     # ── 硬冲突路径（无 base_reader 可用或单子任务冲突）──
     if result.conflicts:

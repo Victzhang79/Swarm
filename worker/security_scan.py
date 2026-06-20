@@ -41,6 +41,26 @@ def _severity_gte(found: Severity, threshold: str) -> bool:
     return _SEVERITY_ORDER.get(found, 0) >= _SEVERITY_ORDER.get(threshold, 0)
 
 
+# audit A-P0-2：跨扫描器记录"是否真的有扫描器执行过"。
+# 工具缺失(FileNotFoundError→rc=-1)/超时/解析失败都返回 []，与"干净通过"无法区分。
+# 用一个可变 dict 让各 helper 在【确实跑起了某个真实工具】时置 ran=True。
+_SEVERITY_FAILCLOSED_TITLE = "Security scanning unavailable (fail-closed)"
+
+
+class _ScanContext:
+    """跨各扫描器累积执行状态。scanner_ran=True 表示【至少一个真实工具成功执行】
+    （rc != -1，即非缺失/非超时/非异常）——哪怕它本身零发现。
+
+    注意：builtin-regex 密钥兜底【不算】真实扫描器（它在工具全缺时也能跑，会掩盖
+    SAST/依赖工具全缺的事实）；只有外部工具真正执行才置位。
+    """
+
+    __slots__ = ("scanner_ran",)
+
+    def __init__(self) -> None:
+        self.scanner_ran = False
+
+
 # ──────────────────────────────────────────────
 # 公共入口
 # ──────────────────────────────────────────────
@@ -66,24 +86,82 @@ def run_security_scan(
     language = language.lower().strip()
     findings: list[SecurityFinding] = []
 
+    # audit A-P0-2：记录是否有真实扫描器执行（区分"扫过且干净" vs "工具缺失/没扫"）。
+    ctx = _ScanContext()
+
     # (a) SAST
-    findings.extend(_run_sast(project_path, language, files=files))
+    findings.extend(_run_sast(project_path, language, files=files, ctx=ctx))
     # (b) 依赖漏洞
-    findings.extend(_run_dependency_scan(project_path, language))
+    findings.extend(_run_dependency_scan(project_path, language, ctx=ctx))
     # (c) 密钥扫描
-    findings.extend(_run_secret_scan(project_path, files=files))
+    findings.extend(_run_secret_scan(project_path, files=files, ctx=ctx))
 
     # 判断是否阻断
     if block_severity == "none":
+        # report-only 模式：运维明示永不阻断（即便没扫成），保持可观测不误杀。
         should_block = False
+        # A-P0-2 report-mode 可见性：即便不阻断，也绝不让"根本没扫"伪装成"扫过且干净"。
+        # 注入一条 INFO 级（rank 0，永不触发任何阈值）发现 + WARNING 日志，使覆盖率缺口可观测。
+        if not ctx.scanner_ran:
+            logger.warning(
+                "Security scan: no real scanner executed for language '%s' in report-only mode "
+                "(block_severity=none) — 0 coverage, NOT clean. Install scanners for real signal.",
+                language,
+            )
+            findings.append(SecurityFinding(
+                severity=Severity.INFO,
+                category="sast",
+                rule_id="scan-coverage-zero",
+                title="Security scanning unavailable (report-only, 0 coverage)",
+                file="",
+                line=0,
+                tool="swarm-security-gate",
+                recommendation=(
+                    "No security scanner ran for this language (tooling absent/failed). "
+                    "Result is 'not scanned', NOT 'clean'. Install the relevant scanners "
+                    "(bandit/semgrep/gosec/clippy/spotbugs, pip-audit/npm/govulncheck/cargo-audit) "
+                    "to obtain real findings, or set security_block_severity to enforce blocking."
+                ),
+            ))
     else:
         should_block = any(_severity_gte(f.severity, block_severity) for f in findings)
+        # A-P0-2 fail-closed：阻断模式下，若【没有任何真实扫描器执行】（工具全缺/全超时/全解析失败），
+        # 绝不能与"真·零漏洞"混同放行。注入一条 = 阈值级别的合成发现，强制 should_block=True。
+        if not ctx.scanner_ran:
+            logger.warning(
+                "Security scan: no real scanner executed for language '%s' in block mode "
+                "(threshold=%s) — failing closed.",
+                language,
+                block_severity,
+            )
+            synthetic_sev = (
+                block_severity
+                if block_severity in _SEVERITY_ORDER
+                else Severity.CRITICAL
+            )
+            findings.append(SecurityFinding(
+                severity=synthetic_sev,  # type: ignore[arg-type]
+                category="sast",
+                rule_id="fail-closed-no-scanner",
+                title=_SEVERITY_FAILCLOSED_TITLE,
+                file="",
+                line=0,
+                tool="swarm-security-gate",
+                recommendation=(
+                    "No security scanner ran for this language (tooling absent/failed). "
+                    "Install the relevant scanners (e.g. bandit/semgrep/gosec/clippy/spotbugs, "
+                    "pip-audit/npm/govulncheck/cargo-audit/dependency-check) or set "
+                    "security_block_severity=none to explicitly accept un-scanned deliveries."
+                ),
+            ))
+            should_block = True
 
     logger.info(
-        "Security scan done: %d findings, should_block=%s (threshold=%s)",
+        "Security scan done: %d findings, should_block=%s (threshold=%s, scanner_ran=%s)",
         len(findings),
         should_block,
         block_severity,
+        ctx.scanner_ran,
     )
     return findings, should_block
 
@@ -137,11 +215,17 @@ def _safe_json_parse(raw: str) -> Any:
         return None
 
 
+def _mark_ran(ctx: "_ScanContext | None") -> None:
+    """标记：某真实外部扫描器已成功执行（rc != -1）。A-P0-2 fail-closed 判据用。"""
+    if ctx is not None:
+        ctx.scanner_ran = True
+
+
 # ──────────────────────────────────────────────
 # (a) SAST 扫描
 # ──────────────────────────────────────────────
 def _run_sast(
-    project_path: str, language: str, *, files: list[str] | None = None
+    project_path: str, language: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None
 ) -> list[SecurityFinding]:
     """SAST 静态分析扫描。"""
     dispatch = {
@@ -155,10 +239,10 @@ def _run_sast(
     if handler is None:
         logger.warning("SAST: unsupported language '%s', skipping", language)
         return []
-    return handler(project_path, files=files)
+    return handler(project_path, files=files, ctx=ctx)
 
 
-def _sast_python(project_path: str, *, files: list[str] | None = None) -> list[SecurityFinding]:
+def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Python SAST: bandit -f json。"""
     if not shutil.which("bandit"):
         logger.info("SAST(python): bandit not found, skipping")
@@ -170,6 +254,7 @@ def _sast_python(project_path: str, *, files: list[str] | None = None) -> list[S
     if rc == -1:
         logger.warning("SAST(python): bandit execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -199,7 +284,7 @@ def _map_bandit_severity(sev: str) -> Severity:
     return mapping.get(sev.upper(), Severity.MEDIUM)
 
 
-def _sast_node(project_path: str, *, files: list[str] | None = None) -> list[SecurityFinding]:
+def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Node SAST: semgrep --json (可选)。"""
     if not shutil.which("semgrep"):
         logger.info("SAST(node): semgrep not found, skipping")
@@ -210,6 +295,7 @@ def _sast_node(project_path: str, *, files: list[str] | None = None) -> list[Sec
     if rc == -1:
         logger.warning("SAST(node): semgrep execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -238,7 +324,7 @@ def _map_semgrep_severity(sev: str) -> Severity:
     return mapping.get(sev.upper(), Severity.MEDIUM)
 
 
-def _sast_go(project_path: str, *, files: list[str] | None = None) -> list[SecurityFinding]:
+def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Go SAST: gosec -fmt=json。"""
     if not shutil.which("gosec"):
         logger.info("SAST(go): gosec not found, skipping")
@@ -249,6 +335,7 @@ def _sast_go(project_path: str, *, files: list[str] | None = None) -> list[Secur
     if rc == -1:
         logger.warning("SAST(go): gosec execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -277,7 +364,7 @@ def _map_gosec_severity(sev: str) -> Severity:
     return mapping.get(sev.upper(), Severity.MEDIUM)
 
 
-def _sast_rust(project_path: str, *, files: list[str] | None = None) -> list[SecurityFinding]:
+def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Rust SAST: cargo clippy 安全规则 (warn=->deny)。"""
     if not shutil.which("cargo"):
         logger.info("SAST(rust): cargo not found, skipping")
@@ -288,6 +375,7 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None) -> list[Sec
     if rc == -1:
         logger.warning("SAST(rust): cargo clippy execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     findings: list[SecurityFinding] = []
     for line in stdout.splitlines():
@@ -333,7 +421,7 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None) -> list[Sec
     return findings
 
 
-def _sast_java(project_path: str, *, files: list[str] | None = None) -> list[SecurityFinding]:
+def _sast_java(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Java SAST: spotbugs。"""
     if not shutil.which("spotbugs"):
         logger.info("SAST(java): spotbugs not found, skipping")
@@ -344,6 +432,7 @@ def _sast_java(project_path: str, *, files: list[str] | None = None) -> list[Sec
     if rc == -1:
         logger.warning("SAST(java): spotbugs execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     # N-11 修复：spotbugs `-xml` 产 XML，原代码用 _safe_json_parse 当 JSON 解析→恒 None→
     # Java diff 永报零发现(静默失效)。改为正确解析 spotbugs XML(BugCollection/BugInstance)。
@@ -395,7 +484,7 @@ def _map_spotbugs_severity(sev: str) -> Severity:
 # ──────────────────────────────────────────────
 # (b) 依赖漏洞扫描
 # ──────────────────────────────────────────────
-def _run_dependency_scan(project_path: str, language: str) -> list[SecurityFinding]:
+def _run_dependency_scan(project_path: str, language: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """依赖漏洞扫描。"""
     dispatch = {
         "python": _dep_python,
@@ -408,10 +497,10 @@ def _run_dependency_scan(project_path: str, language: str) -> list[SecurityFindi
     if handler is None:
         logger.warning("Dependency scan: unsupported language '%s', skipping", language)
         return []
-    return handler(project_path)
+    return handler(project_path, ctx=ctx)
 
 
-def _dep_python(project_path: str) -> list[SecurityFinding]:
+def _dep_python(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Python: pip-audit --format=json。"""
     if not shutil.which("pip-audit"):
         logger.info("Dep(python): pip-audit not found, skipping")
@@ -422,6 +511,7 @@ def _dep_python(project_path: str) -> list[SecurityFinding]:
     if rc == -1:
         logger.warning("Dep(python): pip-audit execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -453,7 +543,7 @@ def _map_pip_audit_severity(sev: str) -> Severity:
     return mapping.get(sev.lower(), Severity.MEDIUM)
 
 
-def _dep_node(project_path: str) -> list[SecurityFinding]:
+def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Node: npm audit --json。"""
     if not shutil.which("npm"):
         logger.info("Dep(node): npm not found, skipping")
@@ -464,6 +554,7 @@ def _dep_node(project_path: str) -> list[SecurityFinding]:
     if rc == -1:
         logger.warning("Dep(node): npm audit execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -498,7 +589,7 @@ def _map_npm_severity(sev: str) -> Severity:
     return mapping.get(sev.lower(), Severity.MEDIUM)
 
 
-def _dep_go(project_path: str) -> list[SecurityFinding]:
+def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Go: govulncheck -json。"""
     if not shutil.which("govulncheck"):
         logger.info("Dep(go): govulncheck not found, skipping")
@@ -509,6 +600,7 @@ def _dep_go(project_path: str) -> list[SecurityFinding]:
     if rc == -1:
         logger.warning("Dep(go): govulncheck execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     # govulncheck JSONL 格式: 每行一个 JSON 对象
     findings: list[SecurityFinding] = []
@@ -547,7 +639,7 @@ def _map_vuln_severity(sev: str) -> Severity:
     return mapping.get(sev.lower(), Severity.MEDIUM)
 
 
-def _dep_rust(project_path: str) -> list[SecurityFinding]:
+def _dep_rust(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Rust: cargo audit --json。"""
     if not shutil.which("cargo"):
         logger.info("Dep(rust): cargo not found, skipping")
@@ -563,6 +655,7 @@ def _dep_rust(project_path: str) -> list[SecurityFinding]:
     if rc == -1:
         logger.warning("Dep(rust): cargo audit execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     data = _safe_json_parse(stdout)
     if data is None:
@@ -616,7 +709,7 @@ def _cargo_subcommand_available(subcmd: str) -> bool:
         return False
 
 
-def _dep_java(project_path: str) -> list[SecurityFinding]:
+def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
     """Java: dependency-check。"""
     if not shutil.which("dependency-check"):
         logger.info("Dep(java): dependency-check not found, skipping")
@@ -628,6 +721,7 @@ def _dep_java(project_path: str) -> list[SecurityFinding]:
     if rc == -1:
         logger.warning("Dep(java): dependency-check execution failed: %s", stderr)
         return []
+    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     # dependency-check JSON 报告在 out_dir 下
     report_path = Path(out_dir) / "dependency-check-report.json"
@@ -684,24 +778,28 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
 
 
 def _run_secret_scan(
-    project_path: str, *, files: list[str] | None = None
+    project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None
 ) -> list[SecurityFinding]:
-    """密钥扫描: gitleaks > trufflehog > 内置正则兜底。"""
+    """密钥扫描: gitleaks > trufflehog > 内置正则兜底。
+
+    A-P0-2：gitleaks/trufflehog 是真实外部扫描器→执行成功时标记 ctx.scanner_ran；
+    builtin-regex 兜底【不】标记（工具全缺时它也能跑，不能掩盖 SAST/依赖工具全缺）。
+    """
     # 先尝试 gitleaks
-    findings = _secret_gitleaks(project_path)
+    findings = _secret_gitleaks(project_path, ctx=ctx)
     if findings is not None:
         return findings
 
     # 再尝试 trufflehog
-    findings = _secret_trufflehog(project_path)
+    findings = _secret_trufflehog(project_path, ctx=ctx)
     if findings is not None:
         return findings
 
-    # 内置正则兜底
+    # 内置正则兜底（不标记 scanner_ran）
     return _secret_builtin_regex(project_path, files=files)
 
 
-def _secret_gitleaks(project_path: str) -> list[SecurityFinding] | None:
+def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
     """gitleaks 密钥扫描。None=工具不可用。"""
     if not shutil.which("gitleaks"):
         return None
@@ -713,6 +811,7 @@ def _secret_gitleaks(project_path: str) -> list[SecurityFinding] | None:
     if rc not in (0, 1):
         logger.warning("Secret scan: gitleaks execution failed (rc=%d): %s", rc, stderr)
         return None
+    _mark_ran(ctx)  # gitleaks 已成功执行
 
     try:
         data = json.loads(Path(report_path).read_text(encoding="utf-8"))
@@ -746,7 +845,7 @@ def _secret_gitleaks(project_path: str) -> list[SecurityFinding] | None:
     return findings
 
 
-def _secret_trufflehog(project_path: str) -> list[SecurityFinding] | None:
+def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
     """trufflehog 密钥扫描。None=工具不可用。"""
     if not shutil.which("trufflehog"):
         return None
@@ -756,6 +855,7 @@ def _secret_trufflehog(project_path: str) -> list[SecurityFinding] | None:
     if rc == -1:
         logger.warning("Secret scan: trufflehog execution failed: %s", stderr)
         return None
+    _mark_ran(ctx)  # trufflehog 已成功执行
 
     findings: list[SecurityFinding] = []
     for line in stdout.splitlines():

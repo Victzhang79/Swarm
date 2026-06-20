@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -305,8 +306,61 @@ class YuqueSource:
                 f"{self.SETUP_DOC}"
             )
 
+    # ── audit A-P0-6：SSRF / 路径穿越防护 ────────────────────────────
+    def _base_host(self) -> str:
+        """校验 self.base 的 scheme∈{http,https}，返回 (小写)host:port，否则抛错。"""
+        parsed = urllib.parse.urlsplit(self.base)
+        if parsed.scheme not in ("http", "https"):
+            raise RuntimeError(
+                f"[{self.source_name}] YUQUE_BASE scheme 非法({parsed.scheme or '空'}); "
+                f"仅允许 http/https: {self.base}"
+            )
+        if not parsed.netloc:
+            raise RuntimeError(f"[{self.source_name}] YUQUE_BASE 缺少 host: {self.base}")
+        return parsed.netloc.lower()
+
+    @staticmethod
+    def _safe_path_component(value: str, *, allow_slash: bool, label: str) -> str:
+        """拒绝会逃逸 /repos/{ns}/docs 路径的输入(.. / @ / 反斜杠)，再 URL 转义。
+
+        namespace 形如 user/repo，允许内部单个 '/'；doc_id(slug) 不允许 '/'。
+        """
+        if value is None or value == "":
+            raise RuntimeError(f"[YuqueSource] {label} 为空")
+        raw = str(value)
+        # 显式黑名单：路径穿越 / 改 host / 协议相对 / 反斜杠
+        if ".." in raw or "@" in raw or "\\" in raw or raw.startswith("//"):
+            raise RuntimeError(f"[YuqueSource] {label} 含非法字符(可能 SSRF/路径穿越): {raw!r}")
+        if not allow_slash and "/" in raw:
+            raise RuntimeError(f"[YuqueSource] {label} 不允许包含 '/': {raw!r}")
+        if allow_slash:
+            # namespace=user/repo：逐段校验非空，整体再转义(保留 '/')
+            segments = raw.split("/")
+            if any(seg == "" for seg in segments):
+                raise RuntimeError(f"[YuqueSource] {label} 含空路径段: {raw!r}")
+            return urllib.parse.quote(raw, safe="/")
+        return urllib.parse.quote(raw, safe="")
+
     def _get_json(self, url: str) -> Any:
-        """GET url(带 X-Auth-Token),返回解析后的 JSON;HTTP/网络错误抛带状态码的 RuntimeError。"""
+        """GET url(带 X-Auth-Token),返回解析后的 JSON;HTTP/网络错误抛带状态码的 RuntimeError。
+
+        audit A-P0-6：用自定义 redirect handler 拒绝跨 host 跳转，防 SSRF 经 30x 逃逸。
+        """
+        base_host = self._base_host()
+
+        class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                new_host = urllib.parse.urlsplit(newurl).netloc.lower()
+                if new_host != base_host:
+                    raise RuntimeError(
+                        f"[YuqueSource] 拒绝跨 host 重定向(cross-host redirect): "
+                        f"{base_host} → {new_host} ({newurl})"
+                    )
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        # 安装带"拒绝跨 host 重定向"的 opener 为默认，再走 urllib.request.urlopen——
+        # 这样既启用了 redirect 防护(生产)，又让测试对 urlopen 的 monkeypatch 仍生效。
+        urllib.request.install_opener(urllib.request.build_opener(_NoCrossHostRedirect))
         req = urllib.request.Request(
             url,
             headers={"X-Auth-Token": self.token or "", "User-Agent": "swarm-kb-ingest"},
@@ -340,7 +394,8 @@ class YuqueSource:
 
     def list_documents(self) -> list[DocRef]:
         self._require_config("list_documents")
-        url = f"{self.base}/repos/{self.namespace}/docs"
+        ns = self._safe_path_component(self.namespace, allow_slash=True, label="namespace")
+        url = f"{self.base}/repos/{ns}/docs"
         payload = self._get_json(url)
         data = payload.get("data", []) if isinstance(payload, dict) else []
         refs: list[DocRef] = []
@@ -360,7 +415,9 @@ class YuqueSource:
 
     def fetch(self, doc_id: str) -> FetchedDoc:
         self._require_config("fetch")
-        url = f"{self.base}/repos/{self.namespace}/docs/{doc_id}"
+        ns = self._safe_path_component(self.namespace, allow_slash=True, label="namespace")
+        slug = self._safe_path_component(doc_id, allow_slash=False, label="doc_id")
+        url = f"{self.base}/repos/{ns}/docs/{slug}"
         payload = self._get_json(url)
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         body = data.get("body") or ""  # 语雀正文本就是 markdown

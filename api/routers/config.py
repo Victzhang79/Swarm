@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 import swarm.api.app as _app
+from swarm.config.settings import atomic_write_env
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -26,8 +27,9 @@ router = APIRouter()
 
 
 @router.get("/api/config", tags=["配置"])
-async def get_config_endpoint():
+async def get_config_endpoint(request: Request):
     """返回当前配置（脱敏 API Key）"""
+    _require_user(request)  # A-P0-7：配置读取需鉴权（泄露 provider/路由拓扑）
     cfg = _app.get_config()
     raw = cfg.model_dump()
     masked = _mask_config_dict(raw)
@@ -39,7 +41,7 @@ async def get_config_endpoint():
 
 # ─── 3.5 GET /api/models ─────────────────────────
 @router.get("/api/models", tags=["配置"])
-async def list_models():
+async def list_models(request: Request):
     """拉取所有已配 providers 的可用模型列表。
 
     遍历 _effective_providers（真相源），每个 provider 调其 base_url 的 OpenAI 兼容
@@ -50,6 +52,7 @@ async def list_models():
       - siliconflow_error / local_error  ← 向后兼容
     单个 provider 不可达不影响其它（各自 try）。
     """
+    _require_user(request)  # A-P0-7：模型清单需鉴权（泄露 provider 拓扑/端点）
     import asyncio
 
     import httpx
@@ -137,9 +140,9 @@ async def list_models():
 
 
 @router.post("/api/config/test", tags=["配置"])
-async def test_config():
+async def test_config(request: Request):
     """测试 Brain / 本地 Worker / 云端 Worker 模型是否可调用"""
-
+    _require_perm(request, "config:write")  # A-P0-7：触发出站模型探活=需写权限
     cfg = _app.get_config()
     from swarm.models.router import ModelRouter
 
@@ -254,9 +257,9 @@ async def update_config(request: Request):
         if k not in updated_keys:
             new_lines.append(f"{k}={v}")
 
-    # 写回 .env
+    # 写回 .env（A-P1-29：原子写）
     content = "\n".join(new_lines) + "\n"
-    env_path.write_text(content, encoding="utf-8")
+    atomic_write_env(env_path, content)
 
     # 同步更新 os.environ（让 _app.reload_config 新建的 BaseSettings 能读到新值）
     for k, v in update_map.items():
@@ -286,8 +289,9 @@ async def update_config(request: Request):
 
 # ─── 4.5 GET /api/routing ────────────────────────────
 @router.get("/api/routing", tags=["配置"])
-async def get_routing():
+async def get_routing(request: Request):
     """获取当前模型路由表"""
+    _require_user(request)  # A-P0-7：路由表需鉴权（泄露内部模型拓扑）
     from swarm.models.router import ModelRouter
     router = ModelRouter()
     return router.get_routing_table()
@@ -380,7 +384,7 @@ async def update_routing(request: Request):
             new_lines.append(f"{k}={v}")
 
     content = "\n".join(new_lines) + "\n"
-    env_path.write_text(content, encoding="utf-8")
+    atomic_write_env(env_path, content)
 
     _app.logger.info(f"Updated routing .env + os.environ with keys: {list(update_map.keys())}")
 
@@ -502,7 +506,7 @@ async def update_model_providers(request: Request):
     for k, v in update_map.items():
         if k not in updated_keys:
             new_lines.append(f"{k}={v}")
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    atomic_write_env(env_path, "\n".join(new_lines) + "\n")
     for k, v in update_map.items():
         os.environ[k] = v
 
@@ -537,7 +541,7 @@ def _persist_env_updates(update_map: dict[str, str]) -> None:
     for k, v in update_map.items():
         if k not in updated_keys:
             new_lines.append(f"{k}={v}")
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    atomic_write_env(env_path, "\n".join(new_lines) + "\n")
     for k, v in update_map.items():
         os.environ[k] = v
     from swarm.config.settings import reload_config as _reload_config
@@ -553,8 +557,9 @@ async def kb_embed_rerank_catalog():
 
 
 @router.get("/api/kb/embed-rerank", tags=["配置"])
-async def get_kb_embed_rerank():
+async def get_kb_embed_rerank(request: Request):
     """读 embed/rerank 当前配置（key 脱敏，仅返回是否已配 has_key）。"""
+    _require_user(request)  # A-P0-7：embed/rerank 端点配置需鉴权
     from swarm.config.settings import KnowledgeConfig
     from swarm.knowledge.embed_rerank_config import get_embed_endpoint, get_rerank_endpoint
     k = KnowledgeConfig()
@@ -703,8 +708,9 @@ async def model_providers_catalog():
 
 # ─── 5. 通知渠道 ─────────────────────────────────────
 @router.get("/api/notify-channels", tags=["配置"])
-async def get_notify_channels():
+async def get_notify_channels(request: Request):
     """当前通知渠道列表 + 预置类型目录 + 可订阅事件目录。api_key/webhook_url 脱敏。"""
+    _require_user(request)  # A-P0-7：通知渠道配置需鉴权（含脱敏 webhook）
     from swarm.config.settings import KNOWN_NOTIFY_TYPES, NOTIFY_EVENT_TYPES
     cfg = _app.get_config()
     channels = []
@@ -779,7 +785,7 @@ async def update_notify_channels(request: Request):
             out.append(line)
     if not found:
         out.append(f"{env_key}={val}")
-    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    atomic_write_env(env_path, "\n".join(out) + "\n")
     os.environ[env_key] = val
 
     from swarm.config.settings import reload_config as _reload_config
@@ -1115,7 +1121,7 @@ def _clear_plaintext_keys_from_env() -> list[str]:
                     pass
         out.append(line)
     if cleared:
-        env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        atomic_write_env(env_path, "\n".join(out) + "\n")
         # 同步 os.environ
         for k in cleared:
             if k in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY"):

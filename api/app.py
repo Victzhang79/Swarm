@@ -1199,11 +1199,14 @@ async def get_project_stats(project_id: str, request: Request):
 
 @app.get("/api/notifications", tags=["系统"])
 async def get_notifications(
+    request: Request,
     project_id: str | None = None,
     include_archived: bool = False,
     limit: int = 50,
 ):
     """应用内通知列表（持久化、可归档）。默认只返回未归档。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # A-P1-27：通知含任务/项目信息，需鉴权
     loop = asyncio.get_running_loop()
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
@@ -1223,8 +1226,10 @@ async def get_notifications(
 
 
 @app.get("/api/notifications/unread_count", tags=["系统"])
-async def get_unread_count(project_id: str | None = None):
+async def get_unread_count(request: Request, project_id: str | None = None):
     """未归档通知数（铃铛绿点轮询用，轻量）。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # A-P1-27
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,
@@ -1234,8 +1239,10 @@ async def get_unread_count(project_id: str | None = None):
 
 
 @app.post("/api/notifications/{notification_id}/archive", tags=["系统"])
-async def archive_notification_endpoint(notification_id: int):
+async def archive_notification_endpoint(notification_id: int, request: Request):
     """归档单条通知。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # A-P1-27
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(
         None,
@@ -1245,8 +1252,10 @@ async def archive_notification_endpoint(notification_id: int):
 
 
 @app.post("/api/notifications/archive_all", tags=["系统"])
-async def archive_all_notifications_endpoint(project_id: str | None = None):
+async def archive_all_notifications_endpoint(request: Request, project_id: str | None = None):
     """归档全部未读通知（可选按项目过滤）。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # A-P1-27
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,
@@ -1256,8 +1265,10 @@ async def archive_all_notifications_endpoint(project_id: str | None = None):
 
 
 @app.get("/api/milestones", tags=["系统"])
-async def list_milestones(project_id: str | None = None, limit: int = 10):
+async def list_milestones(request: Request, project_id: str | None = None, limit: int = 10):
     """Accept 率基准历史报告（P0）。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)  # A-P1-27
     loop = asyncio.get_running_loop()
     reports = await loop.run_in_executor(
         None,
@@ -1276,8 +1287,10 @@ class MilestoneReportBody(BaseModel):
 
 
 @app.post("/api/milestones", tags=["系统"])
-async def post_milestone_report(body: MilestoneReportBody):
+async def post_milestone_report(body: MilestoneReportBody, request: Request):
     """保存 benchmark 脚本产出的里程碑报告。"""
+    from swarm.api._shared import _require_perm
+    _require_perm(request, "config:write")  # A-P1-27：写里程碑需写权限
     loop = asyncio.get_running_loop()
     saved = await loop.run_in_executor(
         None,

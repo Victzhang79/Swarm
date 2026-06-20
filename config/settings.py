@@ -33,6 +33,42 @@ def _coerce_model_list(v: object) -> list[str]:
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+# audit A-P1-29：.env 写入必须原子化 + 串行化。
+# 历史问题：多处直接 path.write_text(...)（截断后重写），并发或写到一半进程被打断
+# → .env 被截断/损坏 → 路由/密钥全丢，服务起不来。
+# 修复：写同目录临时文件后 os.replace 原子改名（同 FS rename 原子），并用全局锁串行化。
+import os as _os
+import threading as _threading
+
+_ENV_WRITE_LOCK = _threading.Lock()
+
+
+def atomic_write_env(env_path: "Path | str", content: str) -> None:
+    """原子写 .env：同目录写 tmp → fsync → os.replace 改名；全局锁串行化并发写。
+
+    content 应为完整文件内容（含结尾换行）。任一步失败会清理 tmp，绝不留下截断的目标文件。
+    """
+    env_path = Path(env_path)
+    directory = env_path.parent
+    with _ENV_WRITE_LOCK:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = __import__("tempfile").mkstemp(
+            prefix=".env.", suffix=".tmp", dir=str(directory)
+        )
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp_name, env_path)  # 原子改名（同 FS）
+        except BaseException:
+            try:
+                _os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+
 class DatabaseConfig(BaseSettings):
     """数据库连接配置"""
     model_config = SettingsConfigDict(
