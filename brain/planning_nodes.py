@@ -1498,27 +1498,42 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     def _basename(f: str) -> str:
         return f.replace("\\", "/").rsplit("/", 1)[-1]
 
-    # 锚点 = 各 Controller：一个 Controller ≙ 一个独立 REST 资源/特性。拆分边界只落在【特性之间】。
-    # <2 个 Controller = 单特性(或纯脚手架/SDK) → 不拆,整体交一个 worker,靠 A=900s 预算兜底。
-    # 这杜绝 RUN14 漂移：单特性的 service 接口与 controller 永远同批,签名自洽。
-    anchors = sorted({_entity_stem(f) for f in creates
+    def _layer_of(f: str) -> str:
+        low = f.replace("\\", "/").lower()
+        b = _basename(low)
+        if b.endswith(".html") or "/static/" in low or "/templates/" in low:
+            return "web"          # Thymeleaf 模板 / 静态 js/css —— 不经 javac 编译
+        if b.endswith(".sql"):
+            return "sql"          # 建表/seed —— 完全独立
+        return "core"            # .java / mybatis .xml —— 编译耦合核心
+
+    # 治本 RUN16(st-10 16 文件过大)：先按【是否参与 javac 编译】分层。
+    # web(.html/static) 不经 javac、sql 独立 —— 与 java 核心【无编译耦合】,安全剥成独立批,
+    # 既减体积又不引入契约漂移。只有 java 核心受"接口↔控制器签名"约束须谨慎按特性拆。
+    core = [f for f in creates if _layer_of(f) == "core"]
+    web = [f for f in creates if _layer_of(f) == "web"]
+    sql = [f for f in creates if _layer_of(f) == "sql"]
+
+    # core 按 Controller 锚点拆特性(≥2 个 Controller 才拆,杜绝 RUN14 单特性接口/控制器分家);
+    # <2 个 → core 整体一批(契约自洽优先,靠 A=900s 预算)。
+    anchors = sorted({_entity_stem(f) for f in core
                       if _basename(f).rsplit(".", 1)[0].endswith("Controller")}, key=len, reverse=True)
-    if len(anchors) < 2:
-        return [st]   # 单特性 → 不拆(契约自洽优先于切分),靠 A=900s 预算
+    core_batches: list[list[str]] = []
+    if len(anchors) >= 2:
+        feat: dict[str, list[str]] = {a: [] for a in anchors}
+        for f in sorted(core, key=_layer_rank):
+            s = _entity_stem(f)
+            feat[next((a for a in anchors if s.startswith(a)), anchors[-1])].append(f)
+        core_batches = [feat[a] for a in sorted(anchors, key=len) if feat[a]]
+    elif core:
+        core_batches = [core]
 
-    # 每个文件按【最长前缀匹配】归到某锚特性(anchors 已按词干长度降序 → 最长前缀优先)；
-    # 无前缀匹配的(共用工具/常量等)挂到第一个锚批,保证不丢。
-    feat: dict[str, list[str]] = {a: [] for a in anchors}
-    for f in sorted(creates, key=_layer_rank):
-        s = _entity_stem(f)
-        match = next((a for a in anchors if s.startswith(a)), anchors[-1])
-        feat[match].append(f)
+    # web/sql 各自成批(web 多则按 max_files 分块);批序：core → web(引用控制器URL,放其后) → sql(独立,末)
+    web_batches = [web[i:i + max_files] for i in range(0, len(web), max_files)] if web else []
+    sql_batches = [sql] if sql else []
+    all_batches = core_batches + web_batches + sql_batches
 
-    # 批序按锚词干长度【升序】(基实体在前,派生/子实体在后),子链串行；writable 垫最后批
-    norm_batches: list[list[tuple[str, str]]] = []
-    for a in sorted(anchors, key=len):
-        if feat[a]:
-            norm_batches.append([(p, "create") for p in feat[a]])
+    norm_batches: list[list[tuple[str, str]]] = [[(p, "create") for p in b] for b in all_batches]
     if writables:
         if norm_batches and len(norm_batches[-1]) + len(writables) <= max_files:
             norm_batches[-1] += [(w, "write") for w in writables]
@@ -1526,7 +1541,7 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             norm_batches.append([(w, "write") for w in writables])
 
     if len(norm_batches) <= 1:
-        return [st]
+        return [st]   # 拆不出≥2 个内聚批(纯单特性 java) → 不拆,靠 A=900s 预算
 
     base_desc = (getattr(st, "description", "") or "")[:300]
     n = len(norm_batches)
@@ -1538,7 +1553,7 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
         files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
         children.append(SubTask(
             id=f"{st.id}-{i + 1}",
-            description=f"{base_desc}（按实体第 {i + 1}/{n} 批：{files_label}）",
+            description=f"{base_desc}（分层第 {i + 1}/{n} 批：{files_label}）",
             difficulty=getattr(st, "difficulty", None) or SubTaskDifficulty.MEDIUM,
             modality=getattr(st, "modality", None) or SubTaskModality.TEXT,
             scope=child_scope,
@@ -1551,8 +1566,10 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             est_context_tokens=int((getattr(st, "est_context_tokens", 0) or 0) * len(grp) /
                                    max(1, len(creates) + len(writables))) or 1,
         ))
-    logger.info("[ELABORATE] 子任务 %s 文件数 %d(Controller 锚点 %d 个)→ 按特性拆为 %d 批(单特性全栈不拆穿)",
-                st.id, len(creates) + len(writables), len(anchors), n)
+    logger.info("[ELABORATE] 子任务 %s 文件数 %d → 分层/特性拆为 %d 批"
+                "(core:%d批+web:%d+sql:%d，Controller 锚点 %d，单特性java不拆穿)",
+                st.id, len(creates) + len(writables), n,
+                len(core_batches), len(web_batches), len(sql_batches), len(anchors))
     return children
 
 

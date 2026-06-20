@@ -108,6 +108,39 @@ def test_multi_entity_splits_by_entity():
                 f"{c.id} 接口与控制器必须同批(RUN14 漂移点),实得 {names}"
 
 
+def test_fullstack_single_feature_peels_web_and_sql():
+    """治本 RUN16(st-10 16文件过大)：单特性(1 Controller)但全栈 → 剥离 .html(Thymeleaf 不编译)
+    与 .sql(独立),java 核心保持完整。这些层与 java 无编译耦合,安全剥成独立批,减体积不引漂移。"""
+    j = "ruoyi-alarm/src/main/java/com/ruoyi/alarm"
+    files = _entity_files("AlarmApp") + [
+        "ruoyi-admin/src/main/resources/templates/alarm/app/app.html",
+        "ruoyi-admin/src/main/resources/templates/alarm/app/add.html",
+        "ruoyi-admin/src/main/resources/templates/alarm/app/edit.html",
+        "sql/alarm_app.sql",
+    ]
+    st = SubTask(id="st-10", description="应用秘钥全栈", scope=FileScope(create_files=files))
+    children = _split_oversized_by_files(st)
+    assert len(children) >= 2, "全栈单特性应剥离 web/sql"
+    for c in children:
+        exts = {f.rsplit(".", 1)[-1] for f in c.scope.create_files}
+        assert not ("html" in exts and "java" in exts), f"{c.id} 不应 html+java 混批(无编译耦合应分开)"
+        assert not ("sql" in exts and "java" in exts), f"{c.id} 不应 sql+java 混批"
+    # java 核心(接口+控制器)仍在同一批 —— 契约自洽不被破坏
+    core = next(c for c in children if any(f.endswith(".java") for f in c.scope.create_files))
+    names = [f.split("/")[-1] for f in core.scope.create_files]
+    assert any("IAlarmAppService" in x for x in names) and any("Controller" in x for x in names), \
+        "接口与控制器必须同批(不重蹈 RUN14 漂移)"
+    # 文件无丢失
+    got = sorted(f for c in children for f in c.scope.create_files)
+    assert got == sorted(files)
+
+
+def test_pure_java_single_feature_still_not_split():
+    """纯 java 单特性(无 web/sql)仍不拆 —— 保住 RUN14 修复。"""
+    st = _single_entity_slice()
+    assert _split_oversized_by_files(st) == [st]
+
+
 def test_no_split_when_within_cap():
     st = SubTask(id="st-z", description="3 文件", difficulty=SubTaskDifficulty.MEDIUM,
                  scope=FileScope(create_files=["a/A.java", "a/B.java", "a/C.java"]))

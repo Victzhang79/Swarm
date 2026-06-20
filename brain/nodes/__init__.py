@@ -1200,6 +1200,54 @@ async def _dispatch_to_worker(
 
 
 
+def _l1_details_of(subtask_results: dict, fid: str) -> dict:
+    """取子任务的 L1 详情(含 build_output/编译标志),WorkerOutput / dict 两种形态兼容。"""
+    out = subtask_results.get(fid)
+    if isinstance(out, WorkerOutput):
+        return out.l1_details or {}
+    if isinstance(out, dict):
+        return out.get("l1_details", {}) or {}
+    return {}
+
+
+def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[str]:
+    """治本(RUN16 st-20 死循环)：子任务编译失败、但【根因在其 scope 之外】(模块 pom 缺依赖 /
+    上游文件签名不符)→ 该子任务 scope 改不到那些文件 → 重试永远编不过 → 死循环。
+
+    重试前把根因文件纳入该子任务 writable scope,让重试能真正修：
+      1. 模块 pom.xml(从子任务文件推断 <module>/pom.xml)——治"缺依赖/包不存在"(报错只点症状文件、
+         不点 pom,故无条件补模块 pom)。
+      2. 编译错误输出里【点名的项目文件】(.java/.xml,去 /workspace/ 前缀)——治"上游接口缺方法/缺类"。
+    仅在确实是编译失败时加宽,返回新增文件列表(空=未加宽)。pom 多写者由 normalize 串行化,安全。
+    """
+    if not plan_obj or not getattr(plan_obj, "subtasks", None) or not details:
+        return []
+    build_ok = details.get("l1_2_1_build_ok", details.get("l1_2_compile_ok"))
+    build_out = str(details.get("build_output") or "")
+    is_compile_fail = (build_ok is False) or ("COMPILATION" in build_out) or ("cannot find symbol" in build_out)
+    if not is_compile_fail:
+        return []
+    st = next((s for s in plan_obj.subtasks if getattr(s, "id", None) == fid), None)
+    scope = getattr(st, "scope", None) if st else None
+    if not scope:
+        return []
+    import re as _re
+    cur = set(getattr(scope, "writable", []) or []) | set(getattr(scope, "create_files", []) or [])
+    add: set[str] = set()
+    # 1) 模块 pom：从已 scope 文件的 "<module>/src/" 推断 <module>/pom.xml
+    for f in cur:
+        m = _re.match(r"(.+?)/src/", f.replace("\\", "/"))
+        if m:
+            add.add(f"{m.group(1)}/pom.xml")
+    # 2) 编译报错点名的项目文件(绝对沙箱路径去 /workspace/ 前缀)
+    for m in _re.finditer(r"/workspace/([\w./\-]+\.(?:java|xml))", build_out):
+        add.add(m.group(1))
+    new = sorted(f for f in add if f not in cur)
+    if new and st is not None:
+        scope.writable = list(getattr(scope, "writable", []) or []) + new
+    return new
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -1574,6 +1622,18 @@ async def handle_failure(state: BrainState) -> dict:
     if strategy == "retry_alternate":
         effective_strategy = "retry_alternate"
 
+    # ── 治本：编译失败根因在 scope 外(缺 pom 依赖/上游文件)→ 加宽 scope 让重试能真正修 ──
+    _scope_widened = False
+    if plan_obj is not None:
+        for fid in failed_ids:
+            new_files = _widen_scope_for_compile_repair(plan_obj, fid, _l1_details_of(subtask_results, fid))
+            if new_files:
+                _scope_widened = True
+                logger.info(
+                    "[HANDLE_FAILURE] 编译修复加宽 scope：子任务 %s 纳入 %s（治根因在 scope 外的编译失败，使重试可改 pom/上游）",
+                    fid, new_files,
+                )
+
     out: dict = {
         "dispatch_remaining": dispatch_remaining,
         "failed_subtask_ids": [],
@@ -1582,6 +1642,8 @@ async def handle_failure(state: BrainState) -> dict:
         "subtask_retry_counts": {**retry_counts, **next_counts},
         "subtask_force_strong": force_strong,  # FINDING-12：拒答子任务重试走最强模型
     }
+    if _scope_widened:
+        out["plan"] = plan_obj  # 回写加宽后的 scope，dispatch 重试用
     if effective_strategy == "retry_alternate":
         out["use_alternate_model"] = True
         logger.info(
