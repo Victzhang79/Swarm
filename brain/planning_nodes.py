@@ -1279,6 +1279,14 @@ async def elaborate(state: BrainState) -> dict:
 
     scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
 
+    # ── 治本(RUN19 根脚手架卡死)：脚手架/写根 pom 的子任务难度下限提 MEDIUM，逃出 trivial 单发陷阱 ──
+    # trivial 走 worker 单发快速路径(合并定位+编码,封顶 30 步)，根脚手架要读改庞大根 pom 单次塞不下
+    # → 40B 吐 "Sorry, need more steps" → 根脚手架失败 → 全依赖链卡死。结构化多步路径才接得住。
+    from swarm.brain.contract_utils import bump_scaffold_difficulty
+    _bumped = bump_scaffold_difficulty(plan_obj)
+    if _bumped:
+        logger.info("[ELABORATE] 脚手架难度提升：%d 个脚手架/根pom写者 trivial→MEDIUM（避开单发拒答）", _bumped)
+
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
     if correct_misclassified_intent(plan_obj):

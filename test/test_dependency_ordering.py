@@ -10,6 +10,7 @@ from __future__ import annotations
 from swarm.brain.contract_utils import (
     _is_scaffold_subtask,
     _is_sql_subtask,
+    bump_scaffold_difficulty,
     dedupe_module_scaffolds,
     fix_dependency_ordering,
     normalize_plan_scopes,
@@ -235,6 +236,51 @@ def test_run18_fix_preserves_fix_dep_duties():
     st24 = next(s for s in p.subtasks if s.id == "st-24")
     assert "pom.xml" in (st24.scope.writable or []), "脚手架B 的根 pom 写权应保留(串行化而非删除)"
     assert st24.depends_on, "脚手架B 应被串行化(有前序写者依赖)，而非裸置根并发写"
+
+
+def _mk_diff(sid, *, create=None, writable=None, difficulty=SubTaskDifficulty.TRIVIAL):
+    return SubTask(
+        id=sid, description=sid, difficulty=difficulty, modality=SubTaskModality.TEXT,
+        scope=FileScope(create_files=create or [], writable=writable or []),
+        depends_on=[], acceptance_criteria=["ok"],
+    )
+
+
+def test_bump_scaffold_trivial_to_medium():
+    """RUN19 现场：st-1 建模块 pom + 写根 pom，被判 trivial → 提 MEDIUM 逃出单发拒答陷阱。"""
+    p = TaskPlan(subtasks=[
+        _mk_diff("st-1", create=["ruoyi-alarm/pom.xml"], writable=["pom.xml"]),  # 根脚手架
+    ], parallel_groups=[], shared_contract={})
+    assert bump_scaffold_difficulty(p) == 1
+    assert p.subtasks[0].difficulty == SubTaskDifficulty.MEDIUM
+
+
+def test_bump_root_pom_writer_even_if_not_scaffold():
+    """写根 pom 的非脚手架 trivial 子任务(如 SQL 顺带注册)也要提 MEDIUM。"""
+    p = TaskPlan(subtasks=[
+        _mk_diff("st-16", create=["sql/x.sql"], writable=["pom.xml"]),
+    ], parallel_groups=[], shared_contract={})
+    assert bump_scaffold_difficulty(p) == 1
+    assert p.subtasks[0].difficulty == SubTaskDifficulty.MEDIUM
+
+
+def test_bump_leaves_real_trivial_alone():
+    """真 trivial(改 CSS/加注释,不碰脚手架/根 pom)不动，零误伤。"""
+    p = TaskPlan(subtasks=[
+        _mk_diff("st-x", writable=["ruoyi-admin/src/main/resources/static/css/x.css"]),
+        _mk_diff("st-y", create=["a/b/Helper.java"]),
+    ], parallel_groups=[], shared_contract={})
+    assert bump_scaffold_difficulty(p) == 0
+    assert all(s.difficulty == SubTaskDifficulty.TRIVIAL for s in p.subtasks)
+
+
+def test_bump_noop_when_already_medium():
+    """已是 MEDIUM/COMPLEX 的脚手架不降级、不重复计数。"""
+    p = TaskPlan(subtasks=[
+        _mk_diff("st-1", create=["ruoyi-alarm/pom.xml"], difficulty=SubTaskDifficulty.MEDIUM),
+    ], parallel_groups=[], shared_contract={})
+    assert bump_scaffold_difficulty(p) == 0
+    assert p.subtasks[0].difficulty == SubTaskDifficulty.MEDIUM
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import logging
 import re
 from typing import Any
 
-from swarm.types import TaskPlan
+from swarm.types import SubTaskDifficulty, TaskPlan
 
 logger = logging.getLogger(__name__)
 
@@ -739,6 +739,32 @@ def _is_sql_subtask(st) -> bool:
     """纯 SQL 子任务 = create 全是 .sql(建表 DDL / seed)。"""
     cf = _st_create_files(st)
     return bool(cf) and all(f.endswith(".sql") for f in cf)
+
+
+def bump_scaffold_difficulty(plan: TaskPlan) -> int:
+    """治本(RUN19 根脚手架卡死)：脚手架 / 写根 pom 的子任务，难度下限提到 MEDIUM。
+
+    RUN19 现场：st-1 是"建模块 pom.xml + 编辑庞大根 pom 的 <modules> 注册 + 建目录"的根脚手架，
+    被 LLM 误判 difficulty=trivial → 走 worker 的【trivial 单发快速路径】(合并定位+编码于一次 agent
+    运行，封顶 30 步)。但读懂大根 pom + 定位 <modules> + 追加注册 + 另建模块 pom 本质是【多步】任务，
+    单发塞不下 → 40B 吐 "Sorry, need more steps" 拒答(撞内部上限) → 根脚手架硬失败。因所有功能子任务
+    都依赖它，全依赖链卡死 → 看守判死循环取消(3/13)。即便 force_strong 换最强模型也救不了：问题不在
+    模型强弱，在【路径】——这种脚手架必须走结构化 locate→code→verify 多步路径(MEDIUM 起，按文件数
+    动态加步数预算)，而非 trivial 单发。
+
+    规则：difficulty==TRIVIAL 且 (是脚手架子任务 或 写根 pom.xml) → 提到 MEDIUM。原地改，返回提升个数。
+    """
+    bumped = 0
+    for st in getattr(plan, "subtasks", []) or []:
+        if getattr(st, "difficulty", None) != SubTaskDifficulty.TRIVIAL:
+            continue
+        sc = getattr(st, "scope", None)
+        writes = set(_st_create_files(st)) | set(getattr(sc, "writable", []) or [])
+        writes_root_pom = "pom.xml" in writes  # 根 pom：大文件 + 多模块登记，读改皆重
+        if _is_scaffold_subtask(st) or writes_root_pom:
+            st.difficulty = SubTaskDifficulty.MEDIUM
+            bumped += 1
+    return bumped
 
 
 def _union_keep_order(*lists) -> list:
