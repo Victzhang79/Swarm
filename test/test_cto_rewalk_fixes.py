@@ -443,3 +443,217 @@ def test_tech_design_surfaces_failed_modules_to_degraded_reasons():
     # 失败模块时追加 degraded_reasons
     assert '"degraded_reasons"' in src
     assert "stage2_failed_modules" in src
+
+
+# ─────────────────────────────────────────────────────────
+# 共用测试桩: 捕获 SQL + params 的假 async cursor
+# ─────────────────────────────────────────────────────────
+class _CapturingCursor:
+    """捕获 execute() 的 SQL 与 params；fetchall 返回预置行。"""
+
+    def __init__(self, rows=None):
+        self.executed: list[tuple] = []
+        self._rows = rows or []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, query, params=None):
+        self.executed.append((str(query), params))
+
+    async def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
+
+
+# ─────────────────────────────────────────────────────────
+# FIX K2 — 时间权重跨项目泄漏: _load_file_mod_times 必带 project_id 过滤
+# ─────────────────────────────────────────────────────────
+def test_load_file_mod_times_filters_by_project_id():
+    """_load_file_mod_times 的 SQL 必须含 project_id 过滤，且把 project_id 绑入参数，
+    否则同名文件跨项目碰撞会取到错误项目的修改时间（时间权重污染）。"""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from swarm.knowledge.retriever import SwarmRetriever
+
+    cur = _CapturingCursor(rows=[("a.py", 1700000000.0)])
+    struct = MagicMock()
+    struct._conn_or_raise.return_value = _FakeConn(cur)
+
+    retr = SwarmRetriever.__new__(SwarmRetriever)
+    retr._struct = struct
+
+    result = asyncio.run(
+        retr._load_file_mod_times(["a.py"], "proj-A")
+    )
+    assert result == {"a.py": 1700000000.0}
+    assert cur.executed, "应执行查询"
+    sql_text, params = cur.executed[0]
+    assert "project_id = %s" in sql_text, f"SQL 必须带 project_id 过滤: {sql_text}"
+    # project_id 必须作为第一个绑定参数传入
+    assert params[0] == "proj-A", f"project_id 必须绑入参数: {params}"
+    assert "a.py" in (params[1] if len(params) > 1 else []), f"文件列表绑入: {params}"
+
+
+# ─────────────────────────────────────────────────────────
+# FIX K3 — query_dependencies 方向颠倒
+# ─────────────────────────────────────────────────────────
+def test_query_dependencies_outgoing_filters_source_file():
+    """outgoing(本文件依赖谁) → WHERE source_file = file_path。"""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from swarm.knowledge.structure_index import StructureIndexer
+
+    cur = _CapturingCursor(rows=[])
+    idx = StructureIndexer.__new__(StructureIndexer)
+    idx._conn_or_raise = MagicMock(return_value=_FakeConn(cur))
+
+    asyncio.run(idx.query_dependencies("p", "x.py", direction="outgoing"))
+    sql_text, _ = cur.executed[0]
+    # 列名经 sql.Identifier 注入 → str(Composed) 中体现为 Identifier('source_file')
+    assert "Identifier('source_file')" in sql_text, sql_text
+    assert "Identifier('target_file')" not in sql_text, sql_text
+
+
+def test_query_dependencies_incoming_filters_target_file():
+    """incoming(谁依赖本文件) → WHERE target_file = file_path。"""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from swarm.knowledge.structure_index import StructureIndexer
+
+    cur = _CapturingCursor(rows=[])
+    idx = StructureIndexer.__new__(StructureIndexer)
+    idx._conn_or_raise = MagicMock(return_value=_FakeConn(cur))
+
+    asyncio.run(idx.query_dependencies("p", "x.py", direction="incoming"))
+    sql_text, _ = cur.executed[0]
+    assert "Identifier('target_file')" in sql_text, sql_text
+    assert "Identifier('source_file')" not in sql_text, sql_text
+
+
+# ─────────────────────────────────────────────────────────
+# FIX K4 — 增量依赖图陈旧: 删出边 + 阈值重建
+# ─────────────────────────────────────────────────────────
+def _make_updater_for_index_file(threshold=50):
+    """构造一个绕过 connect 的 Updater，注入 mock 结构索引器。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from swarm.config.settings import KnowledgeConfig
+    from swarm.knowledge.updater import KnowledgeUpdater
+
+    upd = KnowledgeUpdater.__new__(KnowledgeUpdater)
+    kb = KnowledgeConfig()
+    kb.depgraph_rebuild_threshold = threshold
+    upd._kb_config = kb
+    upd._depgraph_dirty = {}
+    struct = MagicMock()
+    struct.upsert_file = AsyncMock()
+    struct.upsert_symbols_batch = AsyncMock()
+    struct.delete_outgoing_dependencies = AsyncMock()
+    upd._struct = struct
+    upd._semantic = None
+    upd._conn = None
+    return upd, struct
+
+
+def test_index_file_modified_deletes_outgoing_dependencies():
+    """K4-a: MODIFIED 文件索引时必须删除其旧出边（防 query_transitive_deps 服务错误边）。"""
+    import asyncio
+
+    from swarm.knowledge.updater import ChangeType, FileChange
+
+    upd, struct = _make_updater_for_index_file()
+    change = FileChange(
+        file_path="svc.py",
+        change_type=ChangeType.MODIFIED,
+        content="import os",
+        language="python",
+    )
+    asyncio.run(upd._index_file("proj-X", change))
+    struct.delete_outgoing_dependencies.assert_awaited_once_with("proj-X", "svc.py")
+
+
+def test_depgraph_dirty_counter_triggers_rebuild_at_threshold():
+    """K4-b: 计数器到阈值才触发重建一次并清零；阈值前不触发。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    upd, _struct = _make_updater_for_index_file(threshold=3)
+    rebuild = AsyncMock()
+    upd._rebuild_depgraph_async = rebuild
+
+    async def _run():
+        # 前 2 次不触发
+        await upd._maybe_rebuild_depgraph("p")
+        await upd._maybe_rebuild_depgraph("p")
+        assert rebuild.await_count == 0, "阈值前不得触发"
+        # 第 3 次触发一次
+        await upd._maybe_rebuild_depgraph("p")
+        # create_task 触发的协程需让出一次事件循环才执行
+        await asyncio.sleep(0)
+        assert rebuild.await_count == 1, "到阈值须触发一次"
+        # 计数器已清零
+        assert upd._depgraph_dirty["p"] == 0
+        # 再来一次又从头计数，不立即触发
+        await upd._maybe_rebuild_depgraph("p")
+        await asyncio.sleep(0)
+        assert rebuild.await_count == 1, "清零后不得立即再触发"
+
+    asyncio.run(_run())
+
+
+def test_depgraph_rebuild_failure_is_swallowed_and_indexing_succeeds():
+    """K4: 重建失败必须被吞掉，绝不影响 _index_file 成功。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from swarm.knowledge.updater import ChangeType, FileChange
+
+    upd, struct = _make_updater_for_index_file(threshold=1)
+
+    async def _boom(_pid):
+        raise RuntimeError("rebuild blew up")
+
+    upd._rebuild_depgraph_async = _boom
+
+    change = FileChange(
+        file_path="svc.py",
+        change_type=ChangeType.MODIFIED,
+        content="import os",
+        language="python",
+    )
+    # 不应抛异常（阈值=1 → 立即触发重建，重建失败被吞）
+    asyncio.run(upd._index_file("proj-X", change))
+    # 即使重建失败，Layer A 出边删除仍执行
+    struct.delete_outgoing_dependencies.assert_awaited_once()
+
+
+def test_depgraph_threshold_zero_disables_auto_rebuild():
+    """阈值<=0 关闭自动重建：计数器照常累积但永不触发重建。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    upd, _struct = _make_updater_for_index_file(threshold=0)
+    rebuild = AsyncMock()
+    upd._rebuild_depgraph_async = rebuild
+
+    async def _run():
+        for _ in range(10):
+            await upd._maybe_rebuild_depgraph("p")
+        await asyncio.sleep(0)
+        assert rebuild.await_count == 0, "阈值<=0 必须永不触发"
+
+    asyncio.run(_run())

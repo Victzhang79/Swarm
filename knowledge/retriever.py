@@ -571,7 +571,7 @@ class SwarmRetriever:
                 )
 
         # ── 时间权重: 文件越新得分越高 ──
-        file_times = await self._load_file_mod_times(list(scores.keys()))
+        file_times = await self._load_file_mod_times(list(scores.keys()), project_id)
         if file_times:
             scores = _apply_time_decay(scores, file_times)
 
@@ -584,9 +584,12 @@ class SwarmRetriever:
         return context
 
     async def _load_file_mod_times(
-        self, file_paths: list[str]
+        self, file_paths: list[str], project_id: str = ""
     ) -> dict[str, float]:
         """从 kb_file_index 查询文件最后修改时间(UNIX 时间戳)。
+
+        kb_file_index 以 project_id 为键，必须按 project_id 过滤，否则同名文件
+        跨项目碰撞会取到错误项目的修改时间（时间权重污染）。
 
         优雅降级: 查不到返回空字典，调用方不加权。
         """
@@ -599,9 +602,9 @@ class SwarmRetriever:
                     """
                     SELECT file_path, EXTRACT(EPOCH FROM last_modified) AS ts
                     FROM kb_file_index
-                    WHERE file_path = ANY(%s)
+                    WHERE project_id = %s AND file_path = ANY(%s)
                     """,
-                    (file_paths,),
+                    (project_id, file_paths),
                 )
                 rows = await cur.fetchall()
             return {r[0]: float(r[1]) for r in rows if r[1] is not None}

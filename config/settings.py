@@ -528,6 +528,10 @@ class KnowledgeConfig(BaseSettings):
     auto_reprocess_hours: float = 0.0
     auto_reprocess_check_interval: int = 1800   # 调度器检查间隔（秒，默认 30 分钟）
     index_update_timeout: int = 30    # 秒
+    # 增量更新累计 N 次文件变更后，后台触发一次依赖图重建（kb_dependency_graph
+    # 只在全量 preprocess 时才建，增量更新只删自身出边兜底；累积漂移到阈值后
+    # 触发真重建以纠正缺边）。<=0 关闭自动重建（仅删出边 + 阈值日志）。
+    depgraph_rebuild_threshold: int = 50
 
 
 class ObservabilityConfig(BaseSettings):

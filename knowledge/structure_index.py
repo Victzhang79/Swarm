@@ -380,9 +380,13 @@ class StructureIndexer:
     async def query_dependencies(
         self, project_id: str, file_path: str, direction: str = "outgoing"
     ) -> list[dict[str, Any]]:
-        """查询依赖关系(outgoing: 文件依赖谁; incoming: 谁依赖此文件)"""
+        """查询依赖关系(outgoing: 文件依赖谁; incoming: 谁依赖此文件)。
+
+        outgoing = "本文件依赖谁" → WHERE source_file = file_path
+        incoming = "谁依赖本文件" → WHERE target_file = file_path
+        """
         conn = self._conn_or_raise()
-        column = "source_file" if direction == "incoming" else "target_file"
+        column = "target_file" if direction == "incoming" else "source_file"
         async with conn.cursor() as cur:
             await cur.execute(
                 sql.SQL(
@@ -451,6 +455,25 @@ class StructureIndexer:
             await cur.execute(
                 "DELETE FROM kb_file_index WHERE project_id = %s AND file_path = %s",
                 (project_id, file_path),
+            )
+
+    async def delete_outgoing_dependencies(
+        self, project_id: str, source_file: str
+    ) -> None:
+        """删除某文件的所有出边(它依赖谁)。
+
+        增量更新场景: 文件被改后旧的 import 关系可能失效，但增量索引不重建
+        依赖图(全量 preprocess 才建)。删掉该文件的出边可避免 query_transitive_deps
+        服务到"错误的依赖边"; 缺边在 BFS 中优雅降级，错误边才会误导。
+        """
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM kb_dependency_graph
+                WHERE project_id = %s AND source_file = %s
+                """,
+                (project_id, source_file),
             )
 
     # ── 内部工具 ────────────────────────────────

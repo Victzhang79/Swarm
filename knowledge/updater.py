@@ -245,6 +245,10 @@ class KnowledgeUpdater:
         # 单例 updater 的连接（含子索引器）被 HTTP webhook 入队与后台轮询消费
         # 并发共享；psycopg AsyncConnection 不支持并发查询，用锁串行化临界区。
         self._lock = asyncio.Lock()
+        # 每项目增量变更计数器（进程内）；累积到阈值触发依赖图后台重建后清零。
+        # 用 in-process dict（最简健壮）：重启即重置不影响正确性——增量已删自身
+        # 出边兜底，重建只是纠正缺边的尽力而为优化。
+        self._depgraph_dirty: dict[str, int] = {}
 
     # ── 连接管理 ──────────────────────────────
 
@@ -375,6 +379,21 @@ class KnowledgeUpdater:
             )
             await self._struct.upsert_symbols_batch(project_id, symbols)
 
+            # 依赖图维护(K4-a): 删除该文件的旧出边。增量不重建依赖图，旧 import
+            # 关系可能已失效——删出边让 query_transitive_deps 不再服务错误边
+            # （缺边在 BFS 中优雅降级）。失败不得拖垮 Layer A。
+            try:
+                await self._struct.delete_outgoing_dependencies(
+                    project_id, change.file_path
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Updater] 删除旧出边失败(忽略): %s (%s)",
+                    change.file_path, exc,
+                )
+            # 依赖图维护(K4-b): 累积漂移到阈值后台触发真重建。
+            await self._maybe_rebuild_depgraph(project_id)
+
         # Layer B: 切分 + 语义索引（embedding 服务不可用时显式降级，不拖垮 Layer A）
         if self._semantic:
             try:
@@ -395,6 +414,92 @@ class KnowledgeUpdater:
                     change.file_path, exc,
                 )
                 await self._defer_embedding_retry(project_id, change)
+
+    async def _maybe_rebuild_depgraph(self, project_id: str) -> None:
+        """累积每项目增量变更计数；到阈值后台触发依赖图重建并清零。
+
+        全程 fail-soft：阈值<=0 关闭自动重建（仅累积日志）；重建在后台任务里跑，
+        失败被吞掉，绝不影响当前文件的索引成功。
+        """
+        threshold = int(
+            getattr(self._kb_config, "depgraph_rebuild_threshold", 50) or 0
+        )
+        count = self._depgraph_dirty.get(project_id, 0) + 1
+        self._depgraph_dirty[project_id] = count
+        if threshold <= 0:
+            return
+        if count < threshold:
+            return
+        # 到阈值：清零并后台触发重建（fire-and-forget，不阻塞索引）。
+        self._depgraph_dirty[project_id] = 0
+        logger.info(
+            "[Updater] 项目 %s 增量变更累计 %d 次(>=%d)，后台触发依赖图重建",
+            project_id, count, threshold,
+        )
+        try:
+            asyncio.create_task(self._rebuild_depgraph_async(project_id))
+        except RuntimeError:
+            # 无运行中的事件循环（极少见）→ 直接 await，失败也吞掉。
+            try:
+                await self._rebuild_depgraph_async(project_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("[Updater] 依赖图重建失败(忽略): %s", project_id)
+
+    async def _rebuild_depgraph_async(self, project_id: str) -> None:
+        """复用 preprocess 的 codegraph 依赖抽取路径重建该项目依赖图。
+
+        从 project store 取项目路径 → 跑 codegraph → 删本项目旧边 → 写新边。
+        懒导入避免与 preprocess/project 形成循环依赖。失败必须 fail-soft。
+        """
+        try:
+            from swarm.project import store as _store
+            from swarm.project.codegraph import (
+                is_codegraph_installed,
+                run_codegraph_full,
+            )
+            from swarm.project.preprocess import _save_dependency_graph
+
+            loop = asyncio.get_running_loop()
+            proj = await loop.run_in_executor(
+                None, _store.get_project, project_id
+            )
+            if not proj:
+                logger.warning("[Updater] 依赖图重建跳过：项目 %s 不存在", project_id)
+                return
+            ppath = proj.get("path") or proj.get("repo_path")
+            if not ppath:
+                logger.warning("[Updater] 依赖图重建跳过：项目 %s 无路径", project_id)
+                return
+            if not await loop.run_in_executor(None, is_codegraph_installed):
+                logger.info("[Updater] 依赖图重建跳过：codegraph 未安装")
+                return
+
+            cg_result = await loop.run_in_executor(
+                None, run_codegraph_full, ppath
+            )
+            edges = getattr(cg_result, "edges", None) or []
+            if not edges:
+                logger.info("[Updater] 依赖图重建：%s 无依赖边，跳过", project_id)
+                return
+            # 删本项目旧边后整体重写（_save_dependency_graph 是 upsert，先清避免残留）。
+            if self._struct:
+                try:
+                    conn = self._struct._conn_or_raise()
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM kb_dependency_graph WHERE project_id = %s",
+                            (project_id,),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[Updater] 清旧依赖边失败(继续 upsert): %s", exc)
+            await loop.run_in_executor(
+                None, _save_dependency_graph, project_id, edges
+            )
+            logger.info(
+                "[Updater] 项目 %s 依赖图重建完成(%d 边)", project_id, len(edges)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Updater] 依赖图重建失败(忽略): %s (%s)", project_id, exc)
 
     async def _defer_embedding_retry(
         self, project_id: str, change: FileChange
