@@ -1247,6 +1247,7 @@ async def elaborate(state: BrainState) -> dict:
         correct_misclassified_intent,
         enrich_context_snippets,
         enrich_java_package_readable,
+        fix_dependency_ordering,
         normalize_plan_scopes,
     )
     # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
@@ -1261,6 +1262,11 @@ async def elaborate(state: BrainState) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.debug("[ELABORATE] 获取 project_path 失败，scope 归一退化为 demote 行为: %s", exc)
     scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
+
+    # ── 治本(RUN17 依赖倒置死锁)：脚手架置根 + SQL 依赖实体跑最后 + 防"建全部表"巨任务成根瓶颈 ──
+    dep_reordered = fix_dependency_ordering(plan_obj)
+    if dep_reordered:
+        logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
 
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
@@ -1331,8 +1337,9 @@ async def elaborate(state: BrainState) -> dict:
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
     }
-    if resplit_rounds > 0 or decoupled > 0 or scope_normalized or java_enriched or dangling_fixed:
-        # 拆分 / 剥离假依赖 / scope 归一 / Java 同包入域 / 悬空依赖兜底改变了 plan，回写
+    if (resplit_rounds > 0 or decoupled > 0 or scope_normalized or java_enriched
+            or dangling_fixed or dep_reordered):
+        # 拆分 / 剥离假依赖 / scope 归一 / Java 同包入域 / 悬空依赖兜底 / 依赖序修正改变了 plan，回写
         out["plan"] = plan_obj
     return out
 

@@ -719,6 +719,85 @@ def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
     return changed
 
 
+def _st_create_files(st) -> list[str]:
+    sc = getattr(st, "scope", None)
+    return list(getattr(sc, "create_files", []) or []) if sc else []
+
+
+def _is_scaffold_subtask(st) -> bool:
+    """脚手架子任务 = 创建模块 pom.xml(且不建实体)，是模块的地基,应最先就位。"""
+    cf = _st_create_files(st)
+    has_pom = any(f.replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml" for f in cf)
+    builds_entity = any(f.endswith(".java") and ("/domain/" in f or "/entity/" in f) for f in cf)
+    return has_pom and not builds_entity
+
+
+def _is_sql_subtask(st) -> bool:
+    """纯 SQL 子任务 = create 全是 .sql(建表 DDL / seed)。"""
+    cf = _st_create_files(st)
+    return bool(cf) and all(f.endswith(".sql") for f in cf)
+
+
+def fix_dependency_ordering(plan: TaskPlan) -> bool:
+    """治本(RUN17 依赖倒置死锁)：确定性修正子任务【依赖序】，杜绝"建全部表 SQL"巨任务
+    成为全局根瓶颈 → 无实体上下文空转超时 → 整个项目卡死。
+
+    三条规则(纯结构,不调 LLM,可复现)：
+      1. 没人应依赖 SQL 子任务 —— 把其它子任务 depends_on 里的 sql id 剥掉(SQL 不该挡路)。
+      2. 脚手架子任务【置根】(depends_on=[]) —— 模块 pom 最先建,别吊在 SQL/seed 后面。
+      3. SQL 子任务改为【依赖所有实体(java)子任务】、跑在最后 —— 实体建完才有字段可建表;
+         并把实体 domain 文件纳入其 readable，让 worker 照字段生成 DDL(防无上下文空转)。
+    返回是否改动了 plan。
+    """
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if not subs:
+        return False
+    scaffold_ids = {st.id for st in subs if _is_scaffold_subtask(st)}
+    sql_ids = {st.id for st in subs if _is_sql_subtask(st)}
+    if not sql_ids and not scaffold_ids:
+        return False
+    java_ids = sorted({st.id for st in subs
+                       if any(f.endswith(".java") for f in _st_create_files(st))
+                       and st.id not in scaffold_ids and st.id not in sql_ids})
+    entity_files = sorted({f for st in subs for f in _st_create_files(st)
+                           if f.endswith(".java") and ("/domain/" in f or "/entity/" in f)})
+    changed = False
+
+    # 规则 1：剥离别人对 SQL 的依赖
+    for st in subs:
+        if st.id in sql_ids:
+            continue
+        deps = list(getattr(st, "depends_on", []) or [])
+        nd = [d for d in deps if d not in sql_ids]
+        if nd != deps:
+            st.depends_on = nd
+            changed = True
+
+    # 规则 2：脚手架置根
+    for st in subs:
+        if st.id in scaffold_ids and (getattr(st, "depends_on", None) or []):
+            st.depends_on = []
+            changed = True
+
+    # 规则 3：SQL 依赖所有实体(无 java 则兜底依赖脚手架),并纳入实体 readable
+    target = java_ids or sorted(scaffold_ids)
+    for st in subs:
+        if st.id not in sql_ids:
+            continue
+        nd = [t for t in target if t != st.id]
+        if set(getattr(st, "depends_on", []) or []) != set(nd):
+            st.depends_on = nd
+            changed = True
+        sc = getattr(st, "scope", None)
+        if sc and entity_files:
+            r = list(getattr(sc, "readable", []) or [])
+            add = [f for f in entity_files if f not in r]
+            if add:
+                sc.readable = r + add
+                changed = True
+    return changed
+
+
 def correct_misclassified_intent(plan: TaskPlan) -> bool:
     """用确定性信号（scope 有无写文件）校正 LLM 误判的子任务意图。
 
