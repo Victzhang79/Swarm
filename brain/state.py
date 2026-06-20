@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Annotated, TypedDict
 
 from swarm.types import (
     Complexity,
@@ -11,6 +11,38 @@ from swarm.types import (
     TaskPlan,
     WorkerOutput,
 )
+
+
+def _merge_degraded_reasons(
+    old: list[str] | None, new: list[str] | None
+) -> list[str]:
+    """LangGraph reducer for ``degraded_reasons`` — append + dedup, order-preserving.
+
+    Why this is the ONLY reduced field in BrainState:
+    降级原因是「累积事实」（多个节点各自留痕，谁都不该覆盖谁），所以需要 reducer
+    把每个节点返回的更新【合并】进当前列表，而非 last-write-wins 覆盖。其余字段需要
+    replace/reset 语义（如 plan、failed_subtask_ids 在 replan/重试时要整体替换），
+    因此【绝不能】加 reducer。
+
+    合并规则：返回 ``old`` 后追加 ``new`` 中尚未出现的条目（去重、保序）。
+    任一侧为 None 容错为 []。
+
+    ── ALWAYS-EMIT 结构契约（重要，新增节点必读）──
+    引入 reducer 后，节点返回的 ``{"degraded_reasons": X}`` 会被【合并】进当前态而非
+    替换。因此：
+      1. 写降级原因的节点，返回【完整合并列表】或【仅增量】都正确——dedup 保证不重不漏。
+         本仓库现状是返回完整列表（已 dedup），reducer 再幂等合并一次，安全。
+      2. 处于「环路源头」的节点（merge / handle_failure(dispatch) / validate_plan），
+         无论成功/干净路径，都必须显式 emit 自己的【路由控制键】（如 merge 的
+         ``rebase_subtask_ids``、dispatch 的 ``failed_subtask_ids``），不能依赖上一轮
+         的残留——否则重入时会读到过期值导致错误路由。该契约由
+         test/test_brainstate_always_emit.py 以源码静态断言锁定，防回归。
+    """
+    merged = list(old or [])
+    for item in (new or []):
+        if item not in merged:
+            merged.append(item)
+    return merged
 
 
 class BrainState(TypedDict, total=False):
@@ -43,7 +75,7 @@ class BrainState(TypedDict, total=False):
     # LLM 降级可见性（audit #12/#13）：analyze/plan 等节点在 LLM 不可用而走静默兜底
     # （复杂度回退 MEDIUM、空 scope 兜底 plan）时追加原因，透传到交付/通知，让人工
     # 审核能看见"本任务经历了降级"，而非误以为系统正常。
-    degraded_reasons: list[str]
+    degraded_reasons: Annotated[list[str], _merge_degraded_reasons]
 
     # ─── 计划阶段 ───
     plan: TaskPlan                      # 拆解后的子任务 DAG
