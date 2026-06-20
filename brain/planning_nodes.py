@@ -1262,15 +1262,22 @@ async def elaborate(state: BrainState) -> dict:
             _proj_path = _proj.get("path") if _proj else None
     except Exception as exc:  # noqa: BLE001
         logger.debug("[ELABORATE] 获取 project_path 失败，scope 归一退化为 demote 行为: %s", exc)
-    # ── 治本(RUN17 严重冲突)：先合并重复模块脚手架(4 个建同一 module pom → 1 个)，再归一/排序 ──
+    # ── 治本(RUN17 严重冲突)：先合并重复模块脚手架(4 个建同一 module pom → 1 个) ──
     scaffolds_merged = dedupe_module_scaffolds(plan_obj)
 
-    scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
-
     # ── 治本(RUN17 依赖倒置死锁)：脚手架置根 + SQL 依赖实体跑最后 + 防"建全部表"巨任务成根瓶颈 ──
+    # 【顺序要害·RUN18 实证】fix_dependency_ordering 必须在 normalize_plan_scopes【之前】跑：
+    #   fix_dep 的"脚手架置根"会把脚手架子任务 depends_on 清空。而脚手架子任务常【同时】是
+    #   共享聚合文件(根 pom <modules>)的写者——normalize 为这些写者加的【串行化依赖】(防多写者
+    #   并发抢写) 一旦被 fix_dep 的置根清掉，就退回"N 个无依赖子任务同时写 pom"→ plan_validator
+    #   硬失败 → auto_accept fail-fast → 0 交付(RUN18: st-1/st-24 双脚手架皆写根 pom，被置根抹依赖)。
+    #   正解：依赖序重构(脚手架置根/SQL 依赖实体)先做，scope 单一写者不变量(VALIDATE 校验的同一条)
+    #   由 normalize 【最后定锤】——它给共享文件写者补的串行化依赖不再被任何后续 pass 撤销。
     dep_reordered = fix_dependency_ordering(plan_obj)
     if dep_reordered:
         logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
+
+    scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
 
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
