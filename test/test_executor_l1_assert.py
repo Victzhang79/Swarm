@@ -75,12 +75,18 @@ def test_parse_mixed_signal_prefers_fail():
 
 
 def test_parse_empty_input():
-    """空输入安全处理。"""
+    """空输入安全处理。
+
+    W1.2 commit②：refusal 硬化后，空回复被判为【不可用】(截断/空转)，
+    走 _parse_l1_result 的 llm_unavailable 分支：passed=False、
+    llm_self_report='unavailable'。这是契约刻意收紧——空 verify 回复
+    不再被当作"有内容的常规保守判定"，而是明确标记不可用。
+    """
     ex = _executor_stub()
     passed, details = ex._parse_l1_result("")
     assert passed is False
-    assert details["raw_result"] == ""
-    print("  ✅ 空输入安全处理")
+    assert details["llm_self_report"] == "unavailable"
+    print("  ✅ 空输入安全处理（W1.2：标记 unavailable）")
 
 
 def main() -> int:

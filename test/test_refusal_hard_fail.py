@@ -25,10 +25,21 @@ def test_normal_output_not_flagged():
     assert not _is_refusal_or_truncated("SUMMARY: 修改完成 CONFIDENCE: high")
 
 
-def test_empty_not_flagged():
-    assert not _is_refusal_or_truncated("")
-    assert not _is_refusal_or_truncated("   ")
-    assert not _is_refusal_or_truncated(None)
+def test_empty_flagged_as_unavailable():
+    """W1.2 commit②（契约刻意收紧）：空/纯空格/None 回复 = 模型截断/空转，
+    无有效产出信号 → 按不可用处理(flagged)，非 PASS。此前空回复不 flagged，
+    会被当"有内容"送进确定性闸门，compile 恰好过即幻觉 PASS。None 安全归一为空。"""
+    assert _is_refusal_or_truncated("")
+    assert _is_refusal_or_truncated("   ")
+    assert _is_refusal_or_truncated(None)  # None 归一为空字符串，按不可用处理
+
+
+def test_chinese_refusal_markers_detected():
+    """W1.2 commit②：补齐中文拒答标记（本地中文模型常用中文措辞拒答）。"""
+    assert _is_refusal_or_truncated("抱歉，我无法完成这个任务")
+    assert _is_refusal_or_truncated("无法完成该请求")
+    assert _is_refusal_or_truncated("需要更多步骤来处理")
+    assert _is_refusal_or_truncated("这超出我的能力范围")
 
 
 def test_substring_in_normal_text_edge():

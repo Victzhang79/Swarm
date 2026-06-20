@@ -109,39 +109,55 @@ def test_char_trivial_det_true_passes():
 #        llm_ok True  → 若 prior(循环内) l1_passed False → 翻盘 True；否则维持 True
 #   det_ok is None  → 维持 prior l1_passed（不主动翻盘），source=llm_self_report
 # ────────────────────────────────────────────────────────────────────
-def _phase4_current(*, det_ok, llm_ok, prior_passed) -> bool:
+# W1.2 commit②（契约刻意改变）：翻盘从【无条件】收紧为【仅可翻盘来源】。
+# 复刻新契约：prior fail 仅当 source∈{empty_diff_transient, llm_self_report} 且非
+# sticky 才翻盘。其余真值表（det False 压回 / det True+llm False fail / det None 维持）不变。
+def _phase4_contract(*, det_ok, llm_ok, prior_passed, prior_source="llm_self_report",
+                     prior_sticky=False) -> bool:
     if det_ok is False:
         return False
     if det_ok is True:
         if not llm_ok:
             return False
-        # llm_ok True：循环内 fail → 翻盘；否则维持
-        return True
+        if prior_passed:
+            return True
+        # prior fail：仅可翻盘来源 + 非 sticky 才翻盘
+        return (not prior_sticky) and prior_source in ("empty_diff_transient", "llm_self_report")
     # det_ok is None：维持 prior，不主动翻盘
     return prior_passed
 
 
 def test_char_phase4_det_false_no_flip():
-    # 即便循环内 pass，det False 也压回 False
-    assert _phase4_current(det_ok=False, llm_ok=True, prior_passed=True) is False
+    # 即便循环内 pass，det False 也压回 False（行为未变）
+    assert _phase4_contract(det_ok=False, llm_ok=True, prior_passed=True) is False
 
 
 def test_char_phase4_det_true_llm_false_fails():
-    assert _phase4_current(det_ok=True, llm_ok=False, prior_passed=True) is False
+    # 行为未变
+    assert _phase4_contract(det_ok=True, llm_ok=False, prior_passed=True) is False
 
 
-def test_char_phase4_det_true_llm_true_flips_prior_fail():
-    # 关键：当前实现【无条件】翻盘——prior fail + det True + llm True → True
-    assert _phase4_current(det_ok=True, llm_ok=True, prior_passed=False) is True
+def test_char_phase4_flip_only_flippable_source():
+    # W1.2 收紧：可翻盘来源(llm_self_report/empty_diff_transient)才翻盘
+    assert _phase4_contract(det_ok=True, llm_ok=True, prior_passed=False,
+                            prior_source="llm_self_report", prior_sticky=False) is True
+    assert _phase4_contract(det_ok=True, llm_ok=True, prior_passed=False,
+                            prior_source="empty_diff_transient", prior_sticky=False) is True
+    # 不可翻盘来源(compile/scope/test/refusal) → 维持 fail（关闭幻觉 PASS 漏洞）
+    for src in ("compile", "scope", "test", "refusal_hard_fail"):
+        assert _phase4_contract(det_ok=True, llm_ok=True, prior_passed=False,
+                                prior_source=src, prior_sticky=True) is False, src
 
 
 def test_char_phase4_det_true_llm_true_maintains_prior_pass():
-    assert _phase4_current(det_ok=True, llm_ok=True, prior_passed=True) is True
+    # 行为未变
+    assert _phase4_contract(det_ok=True, llm_ok=True, prior_passed=True) is True
 
 
 def test_char_phase4_det_none_maintains_prior():
-    assert _phase4_current(det_ok=None, llm_ok=True, prior_passed=False) is False
-    assert _phase4_current(det_ok=None, llm_ok=True, prior_passed=True) is True
+    # 行为未变
+    assert _phase4_contract(det_ok=None, llm_ok=True, prior_passed=False) is False
+    assert _phase4_contract(det_ok=None, llm_ok=True, prior_passed=True) is True
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -153,10 +169,11 @@ def test_char_refusal_markers_current():
     assert _is_refusal_or_truncated("cannot complete this request") is True
 
 
-def test_char_refusal_empty_current():
-    # Commit ① 前：空/纯空格 → False（非拒答）
-    assert _is_refusal_or_truncated("") is False
-    assert _is_refusal_or_truncated("   ") is False
+def test_char_refusal_empty_contract():
+    # W1.2 commit②（契约刻意收紧，原 commit① 前为 False）：
+    # 空/纯空格回复 = 模型截断/空转，无有效结论 → 按不可用处理 True。
+    assert _is_refusal_or_truncated("") is True
+    assert _is_refusal_or_truncated("   ") is True
 
 
 def test_char_refusal_normal_text_current():

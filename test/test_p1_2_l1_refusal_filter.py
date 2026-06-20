@@ -40,12 +40,14 @@ def test_explicit_fail_still_works():
     print("  ✅ L1 解析: 显式 FAIL 正常识别，raw_result 保留真实内容")
 
 
-def test_empty_not_treated_as_refusal():
+def test_empty_treated_as_unavailable():
+    """W1.2 commit②（契约刻意收紧）：空 verify 回复 = 模型截断/空转，无有效结论 →
+    标记 unavailable、非 PASS。此前(P1-2 旧行为)把空串当"有内容的常规保守判定"，
+    会让"沙箱里残留改动 + compile 恰好过"的空回复轮借确定性闸门翻盘判通过。"""
     passed, details = _parse("")
-    # 空串不是拒答，走常规保守判定
-    assert details["llm_self_report"] in ("fail", "pass")
-    assert details.get("raw_refusal") is None
-    print("  ✅ L1 解析: 空串不误判为拒答")
+    assert passed is False
+    assert details["llm_self_report"] == "unavailable"
+    print("  ✅ L1 解析: 空串标记 unavailable（W1.2 收紧）")
 
 
 if __name__ == "__main__":
@@ -53,7 +55,7 @@ if __name__ == "__main__":
         test_refusal_marked_unavailable,
         test_explicit_pass_still_works,
         test_explicit_fail_still_works,
-        test_empty_not_treated_as_refusal,
+        test_empty_treated_as_unavailable,
     ]
     passed = failed = 0
     for t in tests:

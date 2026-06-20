@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -57,21 +58,55 @@ _LOCATE_STEP_CAP = 20
 
 # 判 False，但 deterministic gate（diff 非空 + compile 恰好过）会翻盘判通过 → 幻觉 PASS。
 # 这类标记必须【硬否决整个 L1】，覆盖 deterministic gate——产出来源不可信时编译过也不算数。
+# W1.2 commit②：补齐中文拒答/截断标记。本地中文模型（27B/40B）拒答多用中文措辞
+# （"抱歉/我无法/无法完成/需要更多步骤"），原英文清单全部漏过 → 中文拒答被当有效产出
+# 送进确定性闸门，compile 恰好过即幻觉 PASS。
 _REFUSAL_MARKERS = (
+    # ── 英文 ──
     "sorry, need more steps",
     "need more steps to process",
     "i'm unable to",
     "i am unable to",
     "cannot complete this request",
+    "unable to complete",
+    "i cannot complete",
+    # ── 中文 ──
+    "抱歉",
+    "我无法",
+    "无法完成",
+    "无法继续",
+    "需要更多步骤",
+    "需要更多步数",
+    "我不能完成",
+    "超出我的能力",
 )
+
+# W1.2 commit②：verify 回复"可用性"下限。空/纯空格、或极短且无 L1_RESULT 标记的回复，
+# 都不是有效的验证结论（模型截断/算力耗尽/空转），按不可用处理 → 非 PASS。
+# 阈值设为 8：低于此长度且无显式 L1_RESULT 标记的回复，不可能承载有意义的验证结论。
+_MIN_VERIFY_REPLY_CHARS = 8
 
 
 def _is_refusal_or_truncated(text: str) -> bool:
-    """判断 agent 回复是否为模型拒答/截断标记（非有效产出信号）。"""
-    if not text or not text.strip():
-        return False
-    low = text.lower()
-    return any(mk in low for mk in _REFUSAL_MARKERS)
+    """判断 agent 回复是否为模型拒答/截断/不可用（非有效产出信号）。
+
+    W1.2 commit② 硬化：
+      1. 命中拒答/截断标记（中英）→ True。
+      2. 空/纯空格回复 → True（截断/空转，无有效结论）。
+      3. 极短回复（strip 后 < _MIN_VERIFY_REPLY_CHARS）且不含 L1_RESULT 标记 → True
+         （无法承载有意义的验证结论；含 L1_RESULT 的短回复如 "L1_RESULT:PASS" 例外放行）。
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        # 空/纯空格 = 模型没给出任何有效回复（截断/空转），不可用 → 非 PASS。
+        return True
+    low = stripped.lower()
+    if any(mk in low for mk in _REFUSAL_MARKERS):
+        return True
+    # 极短且无显式验证标记 → 不可用。含 L1_RESULT 的短回复仍是有效结论，放行。
+    if len(stripped) < _MIN_VERIFY_REPLY_CHARS and "l1_result" not in low:
+        return True
+    return False
 
 
 def _trivial_llm_self_report_passed(combined: str) -> bool:
@@ -81,6 +116,159 @@ def _trivial_llm_self_report_passed(combined: str) -> bool:
     if "❌" in combined:
         return False
     return not bool(_FAIL_WORD_RE.search(combined.lower()))
+
+
+# ════════════════════════════════════════════════════════════════════
+# W1.2：单一 L1 裁决仲裁器（L1Verdict + evaluate_l1）
+#
+# 此前三处裁决点（Phase-3 循环 / trivial / Phase-4 翻盘）各自内联裁决逻辑，
+# 真值表互有差异，且 Phase-4 的翻盘是【无条件】翻盘——只要 det True + llm True
+# 就把循环内任何 fail（含编译失败、scope 违规等已确定的真错误）翻成 PASS，这是
+# 幻觉 PASS 的最后一道漏洞。本仲裁器把三处统一到一张真值表，翻盘仅限【可翻盘来源】。
+# ════════════════════════════════════════════════════════════════════
+
+# 可翻盘来源白名单：仅这两类 fail 才允许 Phase-4 在确定性+LLM 双证据下翻盘为通过。
+#   - empty_diff_transient：循环内空 diff（沙箱尚未 pull-back），pull-back 后可能有真产出。
+#   - llm_self_report：纯 LLM 弱信号 fail（无确定性证据），收到确定性证据后可被覆盖。
+# 编译/lint/scope/test/verify/refusal 失败都是【确定的真错误】，sticky=True，永不翻盘。
+_FLIPPABLE_SOURCES = frozenset({"empty_diff_transient", "llm_self_report"})
+
+
+@dataclass
+class L1Verdict:
+    """单一 L1 裁决结论。
+
+    passed:  True=通过 / False=未通过 / None=无确定结论（仅 det_ok=None 且无 prior 时）。
+    source:  裁决来源（refusal_hard_fail / 各确定性失败原因 / llm_self_report /
+             deterministic / empty_diff_transient ...）。
+    reason:  人类可读说明。
+    sticky:  True=该 fail 是确定的真错误，永不翻盘；False=可在后续阶段被确定性证据翻盘。
+    details: 透传的 l1_details 证据字典。
+    """
+    passed: bool | None
+    source: str
+    reason: str = ""
+    sticky: bool = False
+    details: dict = field(default_factory=dict)
+
+
+def _det_fail_source(det_details: dict) -> tuple[str, str]:
+    """把确定性闸门的失败 det_details 映射为 (source, reason)。
+
+    覆盖契约要求的 5 类确定性失败：empty_diff_expected_changes / scope / compile /
+    lint / test（含 build/verify 归入 test/compile 语义）。映射依据 _deterministic_l1_gate
+    与 run_l1_pipeline 写入 details 的键。
+    """
+    reason_key = det_details.get("reason") or ""
+    # 空 diff 但期望有变更：这是循环内最常见的"中途无 diff"，标记为 transient（可翻盘）。
+    if reason_key == "empty_diff_but_changes_expected":
+        return "empty_diff_transient", "空 diff 但期望有变更（沙箱可能尚未 pull-back）"
+    # scope 违规
+    if det_details.get("scope_violations"):
+        return "scope", f"scope 违规: {det_details.get('scope_violations')}"
+    if det_details.get("l1_1_scope_ok") is False:
+        return "scope", "scope 违规"
+    # 编译 / build 失败
+    if det_details.get("l1_2_compile_ok") is False:
+        return "compile", f"编译失败: {det_details.get('compile_message', '')[:120]}"
+    if det_details.get("l1_2_1_build_ok") is False or det_details.get("build_failed"):
+        return "compile", f"构建失败: {det_details.get('build_failed', '')}"
+    # lint 语法级 error 硬阻断
+    _lint = det_details.get("lint") or {}
+    if isinstance(_lint, dict) and _lint.get("has_error") and _lint.get("gated"):
+        return "lint", "lint 语法级 error 硬阻断"
+    # 测试 / 验收命令失败
+    if det_details.get("l1_3_test_ok") is False:
+        return "test", "scoped 测试失败"
+    if det_details.get("verify_failed"):
+        return "test", f"验收命令失败: {det_details.get('verify_failed')}"
+    # 兜底：确定性闸门判 fail 但未识别具体阶段
+    return "deterministic", det_details.get("deterministic_gate") or "确定性闸门判失败"
+
+
+def evaluate_l1(
+    *,
+    det_ok: bool | None,
+    det_details: dict,
+    verify_result: str | None,
+    llm_ok: bool | None,
+    prior: L1Verdict | None,
+    phase: str,
+) -> L1Verdict:
+    """单一 L1 裁决仲裁器——三处裁决点共用。决策顺序（首个命中即返回）：
+
+    1. refusal/截断（_is_refusal_or_truncated(verify_result)）→ False，
+       source=refusal_hard_fail，sticky=True。最高优先，覆盖一切（含 det_ok=True）。永不翻盘。
+    2. det_ok is False → False，sticky=True，source 携带确定性失败原因。永不翻盘。
+       （例外：empty_diff_transient sticky=False，是设计上唯一可翻盘的 det fail。）
+    3. det_ok is None（无 diff 可检 + 无 harness）→ passed=llm_self_report，
+       source=llm_self_report，sticky=False。不主动翻盘 prior 的 fail（维持 prior 结论）。
+    4. det_ok is True → 考虑 llm_ok：
+       - llm_ok is False → False（确定性证据冲突，非 sticky 但当前结论 fail）。
+       - llm_ok is True：
+         · prior is None → True。
+         · prior.passed is True → True（维持）。
+         · prior.passed is False → 仅当 prior.sticky is False 且
+           prior.source ∈ _FLIPPABLE_SOURCES 才翻盘为 True；否则维持 False。
+    """
+    details = dict(det_details or {})
+
+    # ① refusal / 截断 / 不可用 → 硬否决，最高优先。
+    #    verify_result is None 表示【本阶段不提供 verify 文本】（如 Phase-4：refusal 已在
+    #    循环内裁过并落进 prior），跳过 refusal 检测——绝不能把"没传文本"误判为"空回复拒答"。
+    if verify_result is not None and _is_refusal_or_truncated(verify_result):
+        details["l1_decision_source"] = "refusal_hard_fail"
+        if verify_result:
+            details["raw_refusal"] = verify_result[:200]
+        return L1Verdict(
+            passed=False, source="refusal_hard_fail",
+            reason="agent 回复为拒答/截断/不可用（产出不可信，覆盖确定性闸门）",
+            sticky=True, details=details,
+        )
+
+    # ② det_ok is False → 确定性失败
+    if det_ok is False:
+        source, reason = _det_fail_source(details)
+        sticky = source != "empty_diff_transient"  # 仅 transient 空 diff 可翻盘
+        details["l1_decision_source"] = (
+            "empty_diff_transient" if source == "empty_diff_transient" else "deterministic"
+        )
+        return L1Verdict(passed=False, source=source, reason=reason,
+                         sticky=sticky, details=details)
+
+    # ③ det_ok is None → 回退 LLM 自报弱信号，不主动翻盘 prior
+    if det_ok is None:
+        details["l1_decision_source"] = "llm_self_report"
+        if prior is not None and prior.passed is False:
+            # 缺乏确定性证据，不足以翻盘循环内/此前的 fail → 维持 prior 结论。
+            return L1Verdict(passed=False, source=prior.source,
+                             reason="无确定性证据(det=None)，维持 prior 的未通过结论",
+                             sticky=prior.sticky, details=details)
+        passed = bool(llm_ok)
+        return L1Verdict(passed=passed, source="llm_self_report",
+                         reason="无确定性证据，回退 LLM 自报弱信号",
+                         sticky=False, details=details)
+
+    # ④ det_ok is True → 考虑 LLM 自检
+    details["l1_decision_source"] = "deterministic"
+    if llm_ok is False:
+        return L1Verdict(passed=False, source="deterministic_llm_conflict",
+                         reason="确定性闸门通过但 LLM 自检判失败（证据冲突，当前结论 fail）",
+                         sticky=False, details=details)
+    # llm_ok is True（或 None 视作不反对，由调用点决定是否传 True）
+    if prior is None or prior.passed is True:
+        return L1Verdict(passed=True, source="deterministic",
+                         reason="确定性闸门 + LLM 自检通过", sticky=False, details=details)
+    # prior.passed is False：仅可翻盘来源 + 非 sticky 才翻盘
+    if prior.sticky is False and prior.source in _FLIPPABLE_SOURCES:
+        return L1Verdict(passed=True, source="deterministic",
+                         reason="确定性+LLM 双证据通过，翻盘可翻盘来源的 prior fail",
+                         sticky=False, details=details)
+    return L1Verdict(
+        passed=False, source=prior.source,
+        reason=f"prior fail 不可翻盘(source={prior.source}, sticky={prior.sticky})，维持未通过",
+        sticky=prior.sticky, details=details,
+    )
 
 
 class WorkerPhase(str, Enum):
@@ -301,10 +489,10 @@ class WorkerExecutor:
                 return early
 
             # ── Phase 3: L1 验证（含重试循环） ──
-            l1_passed, l1_details = await self._phase_verify_loop()
+            l1_passed, l1_details, prior_verdict = await self._phase_verify_loop()
 
             # ── Phase 4: 产出 + 最终复核 + DEBUG 闸门 + 置信度校正 ──
-            return await self._phase_produce(l1_passed, l1_details)
+            return await self._phase_produce(l1_passed, l1_details, prior=prior_verdict)
 
         except Exception as e:
             self.phase = WorkerPhase.FAILED
@@ -519,11 +707,17 @@ class WorkerExecutor:
             )
         return None
 
-    async def _phase_verify_loop(self) -> tuple[bool, dict]:
-        """Phase 3：L1 验证（含修复重试循环）。返回 (l1_passed, l1_details)。"""
+    async def _phase_verify_loop(self) -> tuple[bool, dict, L1Verdict]:
+        """Phase 3：L1 验证（含修复重试循环）。
+
+        W1.2 commit②：三处裁决统一走 evaluate_l1 仲裁器。返回 (l1_passed,
+        l1_details, verdict)；verdict 作为 prior 传入 Phase-4，决定是否允许翻盘
+        （仅 empty_diff_transient / llm_self_report 这类非 sticky fail 可翻盘）。
+        """
         self.phase = WorkerPhase.VERIFYING
         l1_passed = False
         l1_details: dict = {}
+        verdict = L1Verdict(passed=None, source="init", reason="未执行验证")
 
         if True:
             for fix_round in range(self.max_fix_rounds + 1):
@@ -546,26 +740,28 @@ class WorkerExecutor:
                 if self._sandbox and self._sandbox_manager:
                     await self._sync_from_sandbox(f"verify-{fix_round} 闸门前同步")
                 det_ok, det_details = self._deterministic_l1_gate()
-                l1_details = {**l1_details, **det_details}
-                if det_ok is None:
-                    # 无 diff 可检，回退到 LLM 自报信号
-                    l1_passed = llm_passed
-                    l1_details["l1_decision_source"] = "llm_self_report"
-                else:
-                    l1_passed = det_ok
-                    l1_details["l1_decision_source"] = "deterministic"
-                    if det_ok and not llm_passed:
-                        self._log("确定性闸门通过但 LLM 自报失败，以确定性结果为准")
-                    elif not det_ok and llm_passed:
-                        self._log("LLM 自报通过但确定性闸门失败，以确定性结果为准（拦截幻觉 PASS）")
-
-                # Bug-4 根治：verify 回复是拒答/截断标记 → worker 没真正完成，产出不可信，
-                # 硬否决覆盖 deterministic gate（即便 compile 恰好过也不算数）。
-                if _is_refusal_or_truncated(verify_result):
-                    l1_passed = False
-                    l1_details["l1_decision_source"] = "refusal_hard_fail"
-                    l1_details["raw_refusal"] = (verify_result or "")[:200]
+                # W1.2：单一仲裁器裁决（refusal → det False → det None → det True）。
+                # 循环内不传 prior（每轮独立裁决），翻盘逻辑只在 Phase-4 生效。
+                # llm_ok 语义对齐契约：det_ok=None 时用 LLM 弱自报作为唯一信号；
+                # det_ok 非 None 时循环内【无独立 LLM pipeline 自检】，故 llm_ok=True
+                # 表示"无 LLM 反对"，让确定性闸门权威（保持旧行为：det True+自报 fail→以 det 为准）。
+                _llm_ok_for_arbiter = llm_passed if det_ok is None else True
+                verdict = evaluate_l1(
+                    det_ok=det_ok,
+                    det_details={**l1_details, **det_details},
+                    verify_result=verify_result,
+                    llm_ok=_llm_ok_for_arbiter,
+                    prior=None,
+                    phase="phase3_loop",
+                )
+                l1_passed = bool(verdict.passed)
+                l1_details = {**l1_details, **verdict.details}
+                if verdict.source == "refusal_hard_fail":
                     self._log("verify 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")
+                elif det_ok is True and not llm_passed:
+                    self._log("确定性闸门通过但 LLM 自报失败，以确定性结果为准")
+                elif det_ok is False and llm_passed:
+                    self._log("LLM 自报通过但确定性闸门失败，以确定性结果为准（拦截幻觉 PASS）")
 
                 self._log(
                     f"L1 验证结果: {'通过 ✅' if l1_passed else '未通过 ❌'} "
@@ -595,9 +791,11 @@ class WorkerExecutor:
                     self._log("验证阶段超时")
                     break
 
-        return l1_passed, l1_details
+        return l1_passed, l1_details, verdict
 
-    async def _phase_produce(self, l1_passed: bool, l1_details: dict) -> WorkerOutput:
+    async def _phase_produce(
+        self, l1_passed: bool, l1_details: dict, prior: L1Verdict | None = None,
+    ) -> WorkerOutput:
         """Phase 4：产出 + 最终复核 + DEBUG 闸门 + 置信度校正，返回最终 WorkerOutput。"""
         if True:
             # ── Phase 4: 产出 ──
@@ -621,52 +819,41 @@ class WorkerExecutor:
                 l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok,
                               "l1_phase": "phase4_final"}
 
-                if det_ok is False:
-                    # 确定性闸门判失败（空 diff 但期望变更 / 编译失败 / scope 违规）→ 禁止翻盘。
-                    l1_passed = False
-                    self._log(
-                        "L1 最终复核（Phase4 产出后）: 未通过 ❌ — 确定性闸门判失败，"
-                        f"不予翻盘 | {det_details.get('reason') or det_details.get('deterministic_gate')}"
-                    )
-                elif det_ok is True:
-                    # 确定性闸门通过。Phase4 增值：再跑一次带 LLM 自检的 pipeline 做最终复核
-                    # （仅当 diff 真有可解析变更时；纯占位 diff 不会到这分支，已被闸门拦在 False/None）。
-                    llm_ok = True
-                    if output.diff:
-                        from swarm.worker.l1_pipeline import run_l1_pipeline
+                # W1.2 commit②：Phase-4 增值——det_ok=True 时跑带 LLM 自检的 pipeline 拿 llm_ok。
+                # 仅当 diff 真有可解析变更时跑（纯占位/空 diff 已被闸门拦在 False/None）。
+                llm_ok: bool | None = True
+                if det_ok is True and output.diff:
+                    from swarm.worker.l1_pipeline import run_l1_pipeline
 
-                        l1_llm = None
-                        try:
-                            from swarm.models.router import ModelRouter
-                            l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
-                        except Exception as exc:  # noqa: BLE001
-                            self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
-                        llm_ok, llm_details = run_l1_pipeline(
-                            self.project_path, self.subtask, output.diff, llm=l1_llm,
-                        )
-                        l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
-                    if not llm_ok:
-                        l1_passed = False
-                        self._log("L1 最终复核（Phase4 产出后）: 未通过 ❌ — 带 LLM 自检的 pipeline 判失败")
-                    elif not l1_passed:
-                        # Phase3 循环内 fail（如中途无 diff/拒答），但 pull-back 后收集到【有效】
-                        # 产出且确定性闸门 + pipeline 双双通过 → 翻盘为通过。空 diff 已被上面
-                        # det_ok is False/None 两条分支拦住，到不了这里。
-                        l1_passed = True
-                        self._log(
-                            "L1 最终复核（Phase4 产出后）: 翻盘为通过 ✅ — "
-                            "循环内未通过多因中途无 diff，pull-back 后收集到有效产出且确定性+LLM 校验通过"
-                        )
-                    else:
-                        self._log("L1 最终复核（Phase4 产出后）: 维持通过 ✅")
-                else:
-                    # det_ok is None：无 diff 可检且无 harness 可执行检查 → 回退 LLM 信号。
-                    # 此时【不主动翻盘】：循环内若已 fail，缺乏确定性证据不足以翻盘为通过。
-                    l1_details["l1_decision_source"] = "llm_self_report"
-                    self._log(
-                        f"L1 最终复核（Phase4 产出后）: 无确定性证据(det=None)，维持循环内结论 "
-                        f"{'通过 ✅' if l1_passed else '未通过 ❌'}（不主动翻盘）"
+                    l1_llm = None
+                    try:
+                        from swarm.models.router import ModelRouter
+                        l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
+                    llm_ok, llm_details = run_l1_pipeline(
+                        self.project_path, self.subtask, output.diff, llm=l1_llm,
                     )
+                    l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
+
+                # 单一仲裁器裁决。prior=循环内结论；翻盘仅限 prior 为可翻盘来源
+                # （empty_diff_transient / llm_self_report）且非 sticky。编译/lint/scope/
+                # test/refusal 失败 sticky=True，到此【永不翻盘】（W1.2 关闭的幻觉 PASS 漏洞）。
+                prior_for_phase4 = prior if (prior and prior.source != "init") else None
+                final_verdict = evaluate_l1(
+                    det_ok=det_ok,
+                    det_details=l1_details,
+                    verify_result=None,  # Phase-4 不再看 verify 文本（refusal 已在循环内裁过并落进 prior）
+                    llm_ok=llm_ok,
+                    prior=prior_for_phase4,
+                    phase="phase4_final",
+                )
+                l1_passed = bool(final_verdict.passed)
+                l1_details = {**l1_details, **final_verdict.details}
+                self._log(
+                    f"L1 最终复核（Phase4 产出后）: {'通过 ✅' if l1_passed else '未通过 ❌'} "
+                    f"| 来源={final_verdict.source} | {final_verdict.reason}"
+                )
                 output = output.model_copy(update={"l1_passed": l1_passed, "l1_details": l1_details})
 
             # ── DEBUG 意图专属 L1 校验：验证 failing_test_command 修复后通过 ──
@@ -1718,15 +1905,22 @@ class WorkerExecutor:
         # 曾让 "Sorry, need more steps" 也被判通过）。pull-back 后文件已在本地，
         # 用 harness 真跑 compile/test/verify 覆盖自报，杜绝幻觉 PASS。
         det_ok, det_details = self._deterministic_l1_gate()
-        l1_details = {**l1_details, **det_details}
-        if det_ok is None:
-            l1_passed = llm_passed
-            l1_details["l1_decision_source"] = "llm_self_report"
-        else:
-            l1_passed = det_ok
-            l1_details["l1_decision_source"] = "deterministic"
-            if not det_ok and llm_passed:
-                self._log("trivial: LLM 自报通过但确定性闸门失败，以确定性为准（拦截幻觉 PASS）")
+        # W1.2 commit②：trivial 也走单一仲裁器。此处 combined 已确认非 refusal（上方
+        # refusal 分支已早返），故 verify_result=None 避免重复 refusal 检测；llm_ok 语义
+        # 同 Phase-3：det_ok=None 时用弱自报，det_ok 非 None 时 llm_ok=True 让确定性权威。
+        _llm_ok_for_arbiter = llm_passed if det_ok is None else True
+        verdict = evaluate_l1(
+            det_ok=det_ok,
+            det_details={**l1_details, **det_details},
+            verify_result=None,
+            llm_ok=_llm_ok_for_arbiter,
+            prior=None,
+            phase="trivial",
+        )
+        l1_passed = bool(verdict.passed)
+        l1_details = {**l1_details, **verdict.details}
+        if det_ok is False and llm_passed:
+            self._log("trivial: LLM 自报通过但确定性闸门失败，以确定性为准（拦截幻觉 PASS）")
         self._log(
             f"trivial L1: {'通过 ✅' if l1_passed else '未通过 ❌'} "
             f"| 来源: {l1_details.get('l1_decision_source')}"
