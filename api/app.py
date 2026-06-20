@@ -576,7 +576,7 @@ def _get_sandbox_manager() -> Any:
 
 app = FastAPI(
     title="Swarm API",
-    version="0.9.0",
+    version="0.9.3",
     description="Swarm Web 后端 API",
 )
 
