@@ -767,6 +767,31 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     return bumped
 
 
+def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None) -> dict[str, int]:
+    """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
+
+    顺序是治本要害(RUN18 实证：两 pass 互撤 → 0 交付)，做成单一函数杜绝调用点各写一份导致漂移：
+
+      1) dedupe_module_scaffolds  —— 先合并重复模块脚手架(N 个建同一 module pom → 1 个)，
+         避免后续按文件归一时把重复地基当多写者乱串。
+      2) fix_dependency_ordering  —— 依赖序重构(脚手架置根 + SQL 依赖实体跑最后)。【必须在 normalize 前】：
+         它的"脚手架置根"会清空脚手架 depends_on。
+      3) normalize_plan_scopes    —— scope 单一写者不变量【最后定锤】(给共享聚合文件 root pom 写者补
+         串行化依赖)。放在 fix_dep【之后】，其补的串行化依赖不再被任何后续 pass 撤销。
+         ★ 反例(RUN18)：normalize→fix_dep 顺序下，fix_dep 把脚手架(恰是 root pom 写者)依赖清空 →
+           退回"N 个无依赖子任务同时写 pom" → plan_validator 硬失败 → auto_accept fail-fast → 0 交付。
+      4) bump_scaffold_difficulty —— 脚手架/根 pom 写者难度提 MEDIUM，避开 worker trivial 单发拒答(RUN19)。
+
+    plan_validator 校验的"每个文件单一写者 + 无悬空依赖"不变量，由本函数确定性满足。返回各 pass 改动计数。
+    """
+    return {
+        "scaffolds_merged": dedupe_module_scaffolds(plan),
+        "dep_reordered": int(fix_dependency_ordering(plan)),
+        "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path)),
+        "difficulty_bumped": bump_scaffold_difficulty(plan),
+    }
+
+
 def _union_keep_order(*lists) -> list:
     seen: set = set()
     out: list = []

@@ -1,0 +1,448 @@
+{
+ "subtasks": [
+  {
+   "id": "st-1",
+   "description": "创建 ruoyi-alarm Maven 模块脚手架：新建 ruoyi-alarm/pom.xml（parent 继承 ruoyi 根 pom，artifactId=ruoyi-alarm，依赖 ruoyi-common），将 ruoyi-alarm 注册到根 pom.xml 的 <modules> 中。创建基础目录结",
+   "difficulty": "trivial",
+   "depends_on": [],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/pom.xml"
+    ],
+    "writable": [
+     "pom.xml"
+    ],
+    "readable": [
+     "ruoyi-common/pom.xml",
+     "ruoyi-system/pom.xml",
+     "ruoyi-admin/pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-2",
+   "description": "实现【机器人管理】完整垂直切片功能（一个子任务包含全部层）：\n1. AlarmBot 实体类——继承 BaseEntity，映射 alarm_bot 表，字段含 botId(Long)/botType(String)/botName(String)/webhookUrl(String)/status(String) 及",
+   "difficulty": "medium",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/bot/domain/AlarmBot.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/bot/mapper/AlarmBotMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/bot/AlarmBotMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/bot/service/IAlarmBotService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/bot/service/impl/AlarmBotServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/bot/controller/AlarmBotController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/bot/bot.html",
+     "sql/alarm_bot.sql"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/UserConstants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/poi/ExcelUtil.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/demo/controller/DemoFormController.java",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-4",
+   "description": "实现应用秘钥管理完整功能（垂直切片）：(1) sql/alarm_app.sql — alarm_app 建表 DDL（app_id VARCHAR 主键、app_name、app_secret、status CHAR、BaseEntity 审计字段）+ 菜单/权限 seed 数据（菜单路径 alarm/app，权限标",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "sql/alarm_app.sql",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/app/domain/AlarmApp.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/app/mapper/AlarmAppMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/app/AlarmAppMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/app/service/IAlarmAppService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/app/service/impl/AlarmAppServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/app/controller/AlarmAppController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/app/app.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/app/add.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/app/edit.html"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/page/TableSupport.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/page/PageDomain.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/UserConstants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/Constants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/uuid/IdUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/poi/ExcelUtil.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/demo/controller/DemoFormController.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/demo/domain/CustomerModel.java",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-6",
+   "description": "实现通知用户（AlarmNotifyUser）完整垂直切片，包含以下所有层：\n\n1. Entity（AlarmNotifyUser.java）：继承 BaseEntity，映射 alarm_notify_user 表；字段 userId/name/slackId/wechatWorkId/email/phone/int",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/domain/AlarmNotifyUser.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/mapper/AlarmNotifyUserMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmNotifyUserMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/IAlarmNotifyUserService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/impl/AlarmNotifyUserServiceImpl.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/alarm/AlarmNotifyUserController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/notifyuser/list.html",
+     "sql/alarm_notify_user.sql"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/page/TableDataInfo.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/annotation/Excel.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/ExcelUtil.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/annotation/Log.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/enums/BusinessType.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/exception/ServiceException.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/UserConstants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/security/AesEncryptUtil.java",
+     "ruoyi-system/src/main/java/com/ruoyi/system/mapper/SysUserMapper.java",
+     "ruoyi-system/src/main/resources/mapper/system/SysUserMapper.xml",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysUserController.java",
+     "ruoyi-admin/src/main/resources/templates/system/user/list.html",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-7",
+   "description": "创建 ruoyi-alarm Maven 模块脚手架：新建 ruoyi-alarm/pom.xml（继承父 pom，依赖 ruoyi-common、ruoyi-framework），将 ruoyi-alarm 注册到根 pom.xml 的 <modules> 中，创建基础包目录结构 com/ruoyi/alarm/sc",
+   "difficulty": "trivial",
+   "depends_on": [
+    "st-6"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/job/.gitkeep",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/.gitkeep"
+    ],
+    "writable": [
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ],
+    "readable": [
+     "pom.xml",
+     "ruoyi-admin/pom.xml",
+     "ruoyi-framework/pom.xml",
+     "ruoyi-system/pom.xml",
+     "ruoyi-common/pom.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/domain/AlarmNotifyUser.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/mapper/AlarmNotifyUserMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmNotifyUserMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/IAlarmNotifyUserService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/impl/AlarmNotifyUserServiceImpl.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/alarm/AlarmNotifyUserController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/notifyuser/list.html",
+     "sql/alarm_notify_user.sql"
+    ]
+   }
+  },
+  {
+   "id": "st-8",
+   "description": "排班策略管理垂直切片（完整功能）：①创建 sql/alarm_schedule.sql，包含 alarm_schedule_strategy、alarm_schedule_group、alarm_schedule_group_member、alarm_holiday_plan、alarm_schedule_snapsh",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-7"
+   ],
+   "scope": {
+    "create_files": [
+     "sql/alarm_schedule.sql",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleStrategy.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleGroup.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/HolidayPlan.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleStrategyMapper.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleGroupMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleStrategyMapper.xml",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleGroupMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/IScheduleStrategyService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/ScheduleStrategyServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/ScheduleStrategyController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy-add.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy-edit.html"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/page/PageDomain.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysUserController.java",
+     "ruoyi-admin/src/main/resources/templates/system/user/list.html",
+     "ruoyi-admin/src/main/resources/templates/system/user/add.html",
+     "ruoyi-admin/src/main/resources/templates/system/user/edit.html",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/.gitkeep",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/job/.gitkeep",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/.gitkeep",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-9",
+   "description": "排班快照引擎垂直切片（完整功能）：①创建 ScheduleSnapshot 实体类（snapshotId、strategyId、dutyDate、groupId、userIds、userNames、source、status、remark）；②创建 ScheduleSnapshotMapper + XML（快照CRUD",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-8"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleSnapshot.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleSnapshotMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleSnapshotMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/IScheduleSnapshotService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/ScheduleSnapshotServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/ScheduleSnapshotController.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/job/ScheduleSnapshotJob.java"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleStrategy.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleGroup.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/HolidayPlan.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleStrategyMapper.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleGroupMapper.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/IScheduleStrategyService.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-quartz/src/main/java/com/ruoyi/quartz/task/RyTask.java",
+     "sql/alarm_schedule.sql",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleStrategyMapper.xml",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleGroupMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/ScheduleStrategyServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/ScheduleStrategyController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy-add.html",
+     "ruoyi-admin/src/main/resources/templates/alarm/schedule/strategy-edit.html"
+    ]
+   }
+  },
+  {
+   "id": "st-10",
+   "description": "创建 ruoyi-alarm-interface Maven 模块脚手架：新建 pom.xml（打包方式 jar，坐标 com.ruoyi:ruoyi-alarm-interface，仅依赖 httpclient + jackson-databind + slf4j-api，不依赖 RuoYi 体系），并将该模块注册到",
+   "difficulty": "trivial",
+   "depends_on": [
+    "st-9"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm-interface/pom.xml"
+    ],
+    "writable": [
+     "pom.xml"
+    ],
+    "readable": [
+     "pom.xml",
+     "ruoyi-common/pom.xml",
+     "ruoyi-system/pom.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/domain/ScheduleSnapshot.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/mapper/ScheduleSnapshotMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/schedule/ScheduleSnapshotMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/IScheduleSnapshotService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/service/impl/ScheduleSnapshotServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/controller/ScheduleSnapshotController.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/schedule/job/ScheduleSnapshotJob.java"
+    ]
+   }
+  },
+  {
+   "id": "st-11",
+   "description": "实现 SDK 完整功能链：① AlarmResponse——统一响应 POJO，含 code(int)/msg(String)/data(Object) 字段及 isSuccess() 方法（code==200 为成功）；② AlarmClient——HTTP 客户端封装，构造器接收 appId/appSecret/s",
+   "difficulty": "medium",
+   "depends_on": [
+    "st-10"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/AlarmResponse.java",
+     "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/AlarmClient.java",
+     "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/AlarmMessageBuilder.java",
+     "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/AlarmSimpleUtil.java"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-alarm-interface/pom.xml",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/R.java",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-13",
+   "description": "实现预警任务(alarm-task)完整功能垂直切片——从 Entity 到 Controller 到前端模板到 SQL 一次写完：\n\n1. 实体层：AlarmTask(主表,继承BaseEntity,含 task_name/status/alarm_level/alarm_type/idempotent_value/",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTask.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTaskChannel.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTaskUser.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTaskTestDTO.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/mapper/AlarmTaskMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTaskMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/mapper/AlarmTaskChannelMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTaskChannelMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/mapper/AlarmTaskUserMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTaskUserMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/IAlarmTaskService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/impl/AlarmTaskServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/controller/AlarmTaskController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/task/detail.html",
+     "sql/alarm_task.sql"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/page/TableDataInfo.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/annotation/Excel.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/poi/ExcelUtil.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/uuid/IdUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/UserConstants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/annotation/Log.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/demo/controller/DemoFormController.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/demo/domain/CustomerModel.java",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-15",
+   "description": "实现【模板管理】完整功能垂直切片（Entity→Mapper→XML→Service→ServiceImpl→Controller→Thymeleaf→SQL）：\n1. AlarmTemplate 实体类：映射 alarm_template 表，字段含 templateId(Long)/templateType(Str",
+   "difficulty": "medium",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/domain/AlarmTemplate.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/mapper/AlarmTemplateMapper.java",
+     "ruoyi-alarm/src/main/resources/mapper/alarm/template/AlarmTemplateMapper.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/service/IAlarmTemplateService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/service/impl/AlarmTemplateServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/controller/AlarmTemplateController.java",
+     "ruoyi-admin/src/main/resources/templates/alarm/template/template.html",
+     "sql/alarm_template.sql"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/BaseEntity.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/UserConstants.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/SecurityUtils.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/utils/poi/ExcelUtil.java",
+     "ruoyi-admin/src/main/resources/templates/system/dict/type.html",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysDictTypeController.java",
+     "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysDictTypeServiceImpl.java",
+     "ruoyi-system/src/main/resources/mapper/system/SysDictTypeMapper.xml",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-17",
+   "description": "创建对外预警 API 的基础设施层（6 个文件）：① ApiResult——统一响应对象，含 code(0成功/非0失败)/msg/data 字段，提供 success(data)/fail(msg) 静态工厂方法，不使用 RuoYi AjaxResult；② SimpleNotifyRequest——简化预警请求 D",
+   "difficulty": "medium",
+   "depends_on": [
+    "st-1"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/ApiResult.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/SimpleNotifyRequest.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/ComposeNotifyRequest.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/config/AlarmApiThreadPoolConfig.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/interceptor/AppAuthInterceptor.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/config/AlarmApiWebMvcConfig.java"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/R.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/config/ServerConfig.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/Constants.java",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml"
+    ]
+   }
+  },
+  {
+   "id": "st-18",
+   "description": "创建对外预警发送 API 的完整业务链路（Service 接口 + ServiceImpl + Controller，3 个文件）：① NotifyApiService 接口——定义 simpleNotify(SimpleNotifyRequest)/composeNotify(ComposeNotifyRequest",
+   "difficulty": "complex",
+   "depends_on": [
+    "st-1",
+    "st-17"
+   ],
+   "scope": {
+    "create_files": [
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/service/NotifyApiService.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/service/impl/NotifyApiServiceImpl.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/controller/NotifyApiController.java"
+    ],
+    "writable": [],
+    "readable": [
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/controller/BaseController.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+     "ruoyi-common/src/main/java/com/ruoyi/common/constant/Constants.java",
+     "ruoyi-admin/src/main/java/com/ruoyi/web/controller/tool/TestController.java",
+     "ruoyi-alarm/pom.xml",
+     "pom.xml",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/ApiResult.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/SimpleNotifyRequest.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/dto/ComposeNotifyRequest.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/config/AlarmApiThreadPoolConfig.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/interceptor/AppAuthInterceptor.java",
+     "ruoyi-alarm/src/main/java/com/ruoyi/alarm/api/config/AlarmApiWebMvcConfig.java"
+    ]
+   }
+  }
+ ],
+ "parallel_groups": [],
+ "shared_contract": {}
+}

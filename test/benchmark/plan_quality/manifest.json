@@ -1,0 +1,27 @@
+{
+  "description": "Plan-quality 离线评测夹具——真实 E2E 失败/通过的 plan 快照。每改 planning 确定性 pass 先跑本基准(秒级、零 LLM),替代 $30/次 的 live E2E 撞 bug。借鉴 multi-rag-agent 的'廉价评测兜底'文化。",
+  "fixtures": [
+    {
+      "file": "run18_dual_scaffold_root_pom.json",
+      "run": "RUN18",
+      "subtasks": 33,
+      "bug": "两脚手架(st-1 建 ruoyi-alarm/pom、st-24 建 alarm-sdk/pom)皆写根 pom <modules> 注册。pass 序若为 normalize→fix_dep，fix_dep 的'脚手架置根'清空脚手架 depends_on → 抹掉 normalize 给根 pom 写者补的串行化依赖 → 退回'N 个无依赖子任务同时写 pom' → plan_validator 硬失败 → auto_accept fail-fast → 0/33 交付。",
+      "fix": "resolve_plan_conflicts 固定 fix_dep→normalize 顺序(normalize 最后定锤单一写者不变量)。",
+      "aggregate_files": ["pom.xml"],
+      "expect_before_valid": false,
+      "expect_after_valid": true,
+      "invariants": ["no_parallel_file_writers"]
+    },
+    {
+      "file": "run19_scaffold_trivial.json",
+      "run": "RUN19",
+      "subtasks": 13,
+      "bug": "根脚手架 st-1(建模块 pom + 编辑庞大根 pom 注册)被 LLM 误判 difficulty=trivial → worker 走单发快速路径(封顶 30 步)单次塞不下读改大根 pom → 40B 吐 'Sorry, need more steps' 拒答 → 根脚手架失败 → 全依赖链卡死(3/13 被看守取消)。规划本身结构合法,故 before_valid=true。",
+      "fix": "bump_scaffold_difficulty 把脚手架/根 pom 写者 trivial→MEDIUM,走结构化多步路径。",
+      "aggregate_files": ["pom.xml"],
+      "expect_before_valid": true,
+      "expect_after_valid": true,
+      "invariants": ["no_trivial_scaffold", "no_parallel_file_writers"]
+    }
+  ]
+}

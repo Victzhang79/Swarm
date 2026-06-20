@@ -1246,10 +1246,8 @@ async def elaborate(state: BrainState) -> dict:
     from swarm.brain.contract_utils import (
         correct_misclassified_intent,
         enrich_context_snippets,
-        dedupe_module_scaffolds,
         enrich_java_package_readable,
-        fix_dependency_ordering,
-        normalize_plan_scopes,
+        resolve_plan_conflicts,
     )
     # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
     # （治本文件争抢——已存在聚合文件多写者串行保留写权，不静默降级丢贡献）。
@@ -1262,30 +1260,16 @@ async def elaborate(state: BrainState) -> dict:
             _proj_path = _proj.get("path") if _proj else None
     except Exception as exc:  # noqa: BLE001
         logger.debug("[ELABORATE] 获取 project_path 失败，scope 归一退化为 demote 行为: %s", exc)
-    # ── 治本(RUN17 严重冲突)：先合并重复模块脚手架(4 个建同一 module pom → 1 个) ──
-    scaffolds_merged = dedupe_module_scaffolds(plan_obj)
 
-    # ── 治本(RUN17 依赖倒置死锁)：脚手架置根 + SQL 依赖实体跑最后 + 防"建全部表"巨任务成根瓶颈 ──
-    # 【顺序要害·RUN18 实证】fix_dependency_ordering 必须在 normalize_plan_scopes【之前】跑：
-    #   fix_dep 的"脚手架置根"会把脚手架子任务 depends_on 清空。而脚手架子任务常【同时】是
-    #   共享聚合文件(根 pom <modules>)的写者——normalize 为这些写者加的【串行化依赖】(防多写者
-    #   并发抢写) 一旦被 fix_dep 的置根清掉，就退回"N 个无依赖子任务同时写 pom"→ plan_validator
-    #   硬失败 → auto_accept fail-fast → 0 交付(RUN18: st-1/st-24 双脚手架皆写根 pom，被置根抹依赖)。
-    #   正解：依赖序重构(脚手架置根/SQL 依赖实体)先做，scope 单一写者不变量(VALIDATE 校验的同一条)
-    #   由 normalize 【最后定锤】——它给共享文件写者补的串行化依赖不再被任何后续 pass 撤销。
-    dep_reordered = fix_dependency_ordering(plan_obj)
-    if dep_reordered:
+    # ── 计划冲突解决【唯一事实源】：dedupe → fix_dep → normalize → bump_difficulty（顺序是治本要害） ──
+    # 顺序固化在 resolve_plan_conflicts（contract_utils），_elaborate 与离线 plan-quality 评测共用同一条
+    # 代码，杜绝调用点各写一份导致漂移。RUN17/18/19 三轮治本(脚手架合并/依赖序/单一写者/难度)全在此收口。
+    _resolve = resolve_plan_conflicts(plan_obj, project_path=_proj_path)
+    if _resolve["dep_reordered"]:
         logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
-
-    scope_normalized = normalize_plan_scopes(plan_obj, project_path=_proj_path)
-
-    # ── 治本(RUN19 根脚手架卡死)：脚手架/写根 pom 的子任务难度下限提 MEDIUM，逃出 trivial 单发陷阱 ──
-    # trivial 走 worker 单发快速路径(合并定位+编码,封顶 30 步)，根脚手架要读改庞大根 pom 单次塞不下
-    # → 40B 吐 "Sorry, need more steps" → 根脚手架失败 → 全依赖链卡死。结构化多步路径才接得住。
-    from swarm.brain.contract_utils import bump_scaffold_difficulty
-    _bumped = bump_scaffold_difficulty(plan_obj)
-    if _bumped:
-        logger.info("[ELABORATE] 脚手架难度提升：%d 个脚手架/根pom写者 trivial→MEDIUM（避开单发拒答）", _bumped)
+    if _resolve["difficulty_bumped"]:
+        logger.info("[ELABORATE] 脚手架难度提升：%d 个脚手架/根pom写者 trivial→MEDIUM（避开单发拒答）",
+                    _resolve["difficulty_bumped"])
 
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
@@ -1356,9 +1340,9 @@ async def elaborate(state: BrainState) -> dict:
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
     }
-    if (resplit_rounds > 0 or decoupled > 0 or scope_normalized or java_enriched
-            or dangling_fixed or dep_reordered or scaffolds_merged):
-        # 拆分 / 剥离假依赖 / scope 归一 / Java 同包入域 / 悬空依赖兜底 / 依赖序修正改变了 plan，回写
+    if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or java_enriched
+            or dangling_fixed):
+        # 拆分 / 剥离假依赖 / 冲突解决(合并·依赖序·归一·难度) / Java 同包入域 / 悬空依赖兜底 改变了 plan，回写
         out["plan"] = plan_obj
     return out
 
