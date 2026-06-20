@@ -36,6 +36,22 @@ class NormUpdateRequest(BaseModel):
     is_active: bool | None = Field(default=None, description="是否启用")
 
 
+class IngestRequest(BaseModel):
+    """文档采集请求 — 把外部资料灌进项目知识库（语义层 Layer B）。
+
+    source_type:
+      - "local"   用 file_paths（一般来自 POST /api/uploads 返回的 path）建 LocalFileSource。
+      - "feishu"/"tencent"/"yuque"  建对应远端 adapter；无 token 时其 list/fetch 抛
+        NotImplementedError，端点 catch 后返 400 + 清晰接入提示。
+    dry_run:
+      默认 False（用户主动点"导入"即落库）；传 True 只解析+切分预览，绝不触达 Qdrant。
+    """
+    file_paths: list[str] = Field(default_factory=list, description="本地文件绝对路径列表（source_type=local）")
+    source_type: str = Field(default="local", description="来源类型：local/feishu/tencent/yuque")
+    source_config: dict = Field(default_factory=dict, description="远端来源额外配置（预留，当前 token 走环境变量）")
+    dry_run: bool = Field(default=False, description="True 仅预览不落库；False（默认）真落库")
+
+
 
 @router.get("/api/projects/{project_id}/knowledge/overview", tags=["知识库"])
 async def knowledge_overview(project_id: str, request: Request):
@@ -326,6 +342,148 @@ async def delete_norm(project_id: str, norm_id: int, request: Request):
         return {"deleted": True}
 
     return await loop.run_in_executor(None, _do_delete)
+
+
+# ─── 文档采集（KB ingest） ────────────────────────────────────────────────
+
+
+def _build_ingest_source(source_type: str, file_paths: list[str]):
+    """按 source_type 构造 SourceAdapter。
+
+    local 用 file_paths（每个路径建一个 LocalFileSource，下面会合并文档引用）；
+    远端返回对应 stub adapter（无 token 时其 list/fetch 会抛 NotImplementedError）。
+    """
+    from swarm.knowledge.ingest.sources import (
+        FeishuSource,
+        LocalFileSource,
+        TencentDocSource,
+        YuqueSource,
+    )
+
+    st = (source_type or "local").lower()
+    if st == "local":
+        if not file_paths:
+            raise HTTPException(status_code=400, detail="source_type=local 需提供 file_paths（先调 POST /api/uploads 拿路径）")
+        return _MultiLocalSource(file_paths)
+    remote = {
+        "feishu": FeishuSource,
+        "tencent": TencentDocSource,
+        "tencent_doc": TencentDocSource,
+        "yuque": YuqueSource,
+    }
+    cls = remote.get(st)
+    if cls is None:
+        raise HTTPException(status_code=400, detail=f"不支持的 source_type: {source_type}（可选 local/feishu/tencent/yuque）")
+    return cls()
+
+
+class _MultiLocalSource:
+    """把多个本地文件路径合并成单一 SourceAdapter（每个 path 一个 DocRef）。
+
+    复用 LocalFileSource 的 list/fetch（白名单/读盘），但允许任意一组离散文件路径
+    （上传端点返回的是离散 path，不是单个目录）。
+    """
+
+    source_name = "local"
+
+    def __init__(self, file_paths: list[str]) -> None:
+        from swarm.knowledge.ingest.sources import LocalFileSource
+
+        self._sources = [LocalFileSource(p) for p in file_paths]
+
+    def list_documents(self):
+        refs = []
+        for s in self._sources:
+            refs.extend(s.list_documents())
+        return refs
+
+    def fetch(self, doc_id: str):
+        from swarm.knowledge.ingest.sources import LocalFileSource
+
+        return LocalFileSource(doc_id).fetch(doc_id)
+
+
+def _summarize_report(report) -> dict[str, Any]:
+    """把 IngestReport 压成前端友好的 JSON 摘要。"""
+    return {
+        "source_name": report.source_name,
+        "project_id": report.project_id,
+        "dry_run": report.dry_run,
+        "total_docs": report.total_docs,
+        "parsed_docs": report.parsed_docs,
+        "skipped_docs": report.skipped_docs,
+        "failed_docs": report.failed_docs,
+        "total_chunks": report.total_chunks,
+        "indexed_chunks": report.indexed_chunks,
+        "docs": [
+            {
+                "filename": d.filename,
+                "title": d.title,
+                "status": d.status,
+                "num_chunks": d.num_chunks,
+                "error": d.error,
+            }
+            for d in report.docs
+        ],
+    }
+
+
+@router.post("/api/projects/{project_id}/knowledge/ingest", tags=["知识库"])
+async def ingest_documents(project_id: str, request: Request, req: IngestRequest):
+    """采集外部文档进项目知识库（语义层）。
+
+    dry_run=True：纯预览（解析+切分），绝不落 Qdrant。
+    dry_run=False（默认）：用已连接的 SemanticIndexer 真落库（走专用 KB loop，复用单例连接）。
+    远端源无 token → adapter 抛 NotImplementedError → 这里 catch 后返 400 + 接入提示。
+    """
+    _require_perm(request, "knowledge:write", project_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _app._validate_project, project_id)
+
+    from swarm.knowledge.ingest.pipeline import ingest as _ingest_pipeline
+
+    # 构造来源（local 校验在 _build_ingest_source 内，远端缺 token 在 list/fetch 才抛）
+    source = _build_ingest_source(req.source_type, req.file_paths)
+
+    def _run_blocking() -> dict[str, Any]:
+        """在 executor 线程里跑：dry_run 纯异步预览；非 dry_run 走 KB loop 拿连好的 indexer 落库。"""
+        if req.dry_run:
+            # 预览不碰真实 KB，独立 loop 跑 async pipeline 即可
+            report = asyncio.run(
+                _ingest_pipeline(source, project_id=project_id, dry_run=True)
+            )
+            return _summarize_report(report)
+
+        # 真落库：必须用已连接的 SemanticIndexer（在专用 KB loop 上），否则跨 loop 复用连接会炸
+        from swarm.knowledge.service import _run_on_kb_loop, get_retriever
+
+        async def _go():
+            retriever = await get_retriever()
+            indexer = getattr(retriever, "_semantic", None)
+            if indexer is None:
+                raise RuntimeError(
+                    "语义索引器不可用（Qdrant 未连接或未嵌入）。请先确保 Qdrant 运行并完成预处理。"
+                )
+            return await _ingest_pipeline(
+                source, project_id=project_id, indexer=indexer, dry_run=False
+            )
+
+        report = _run_on_kb_loop(_go())
+        return _summarize_report(report)
+
+    try:
+        return await loop.run_in_executor(None, _run_blocking)
+    except HTTPException:
+        raise
+    except NotImplementedError as e:
+        # 远端源未配置 token / 未实现 → 把 adapter 写好的接入说明直接回给前端
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"文件不存在: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - 兜底，绝不 500 裸抛
+        raise HTTPException(status_code=500, detail=f"采集失败: {e}")
 
 
 @router.get("/api/projects/{project_id}/knowledge/behavior-hotspots", tags=["知识库"])

@@ -296,6 +296,43 @@
           <div id="tab-knowledge" class="tab-panel">
             <div class="tab-scroll">
               <div class="knowledge-layout">
+                <div class="knowledge-block">
+                  <div class="knowledge-block-head">
+                    <h3>📥 导入文档</h3>
+                    <span class="hint">把外部资料灌进本项目语义库（Layer B）</span>
+                  </div>
+                  <div class="knowledge-row-2">
+                    <!-- 本地文件 -->
+                    <div class="form-group" style="margin:0">
+                      <label class="form-label">本地文件（可多选）</label>
+                      <input id="ingest-files" class="form-input" type="file" multiple
+                        accept=".pdf,.docx,.md,.txt,.html,.png,.jpg,.jpeg">
+                      <p class="hint" style="margin:6px 0 0">支持 pdf / docx / md / txt / html / 图片（图片无文本会跳过）</p>
+                      <div style="display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap">
+                        <button class="btn btn-primary btn-sm" id="btn-ingest-local" onclick="ingestLocalFiles()">导入本地文件</button>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
+                          <input type="checkbox" id="ingest-dry-run"> 仅预览（dry_run，不落库）
+                        </label>
+                      </div>
+                    </div>
+                    <!-- 远端源 -->
+                    <div class="form-group" style="margin:0">
+                      <label class="form-label">远端来源</label>
+                      <div class="form-row" style="align-items:flex-end;margin:0">
+                        <div class="form-group" style="margin:0">
+                          <select id="ingest-remote-source" class="form-select">
+                            <option value="feishu">飞书 Feishu</option>
+                            <option value="tencent">腾讯文档</option>
+                            <option value="yuque">语雀 Yuque</option>
+                          </select>
+                        </div>
+                      </div>
+                      <p class="hint" style="margin:8px 0 0">Token 走环境变量配置；未配置时点导入会返回所需 token/scope 提示。</p>
+                      <button class="btn btn-secondary btn-sm" style="margin-top:10px" id="btn-ingest-remote" onclick="ingestRemoteSource()">从远端导入</button>
+                    </div>
+                  </div>
+                  <div id="ingest-result" style="margin-top:14px"></div>
+                </div>
                 <div class="knowledge-row-2">
                   <div class="knowledge-block">
                     <div class="knowledge-block-head">

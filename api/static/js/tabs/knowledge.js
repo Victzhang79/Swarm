@@ -120,6 +120,127 @@ async function searchSymbols() {
   }
 }
 
+// ─── Knowledge (Import / Ingest) ─────────────────────────────
+
+// 本地文件：先 POST /api/uploads 拿隔离存储后的 path，再 POST .../knowledge/ingest。
+async function ingestLocalFiles() {
+  const el = $('ingest-result');
+  const fileInput = $('ingest-files');
+  const btn = $('btn-ingest-local');
+  if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
+  const files = fileInput && fileInput.files ? Array.from(fileInput.files) : [];
+  if (!files.length) { showToast('请选择文件', 'warning'); return; }
+  const dryRun = !!($('ingest-dry-run') && $('ingest-dry-run').checked);
+
+  if (btn) btn.disabled = true;
+  if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">上传中…</p>';
+  try {
+    // 1) 上传到隔离目录
+    const fd = new FormData();
+    files.forEach(f => fd.append('files', f));
+    const upResp = await fetch('/api/uploads', { method: 'POST', body: fd });
+    if (!upResp.ok) throw new Error('上传失败: ' + (await upResp.text()));
+    const upData = await upResp.json();
+    const paths = (upData.files || []).filter(f => f.path).map(f => f.path);
+    const upErrors = (upData.files || []).filter(f => f.error);
+    if (!paths.length) {
+      const msg = upErrors.map(f => `${f.filename}: ${f.error}`).join('；') || '无可用文件';
+      if (el) el.innerHTML = '<p style="color:var(--red);font-size:12px">上传后无可导入文件（' + escapeHtml(msg) + '）</p>';
+      return;
+    }
+    if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">解析' + (dryRun ? '预览' : '+落库') + '中（共 ' + paths.length + ' 个文件）…</p>';
+
+    // 2) 采集
+    const resp = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId) + '/knowledge/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_paths: paths, source_type: 'local', dry_run: dryRun }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || ('HTTP ' + resp.status));
+    }
+    renderIngestResult(await resp.json(), upErrors);
+  } catch (e) {
+    if (el) el.innerHTML = '<p style="color:var(--red);font-size:12px">失败: ' + escapeHtml(e.message || String(e)) + '</p>';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// 远端源：无 token 时端点返 400 + 接入提示，直接显示给用户。
+async function ingestRemoteSource() {
+  const el = $('ingest-result');
+  const btn = $('btn-ingest-remote');
+  if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
+  const sourceType = ($('ingest-remote-source') && $('ingest-remote-source').value) || 'feishu';
+  const dryRun = !!($('ingest-dry-run') && $('ingest-dry-run').checked);
+
+  if (btn) btn.disabled = true;
+  if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">连接 ' + escapeHtml(sourceType) + ' 中…</p>';
+  try {
+    const resp = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId) + '/knowledge/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_type: sourceType, dry_run: dryRun }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      // 400 一般是缺 token —— 把后端的接入说明完整显示
+      if (el) el.innerHTML = '<div class="card" style="padding:12px;border:1px solid var(--amber)">'
+        + '<p style="margin:0 0 6px;font-size:12px;font-weight:600;color:var(--amber)">无法从 ' + escapeHtml(sourceType) + ' 导入</p>'
+        + '<pre style="margin:0;font-size:11px;white-space:pre-wrap;color:var(--text-secondary)">' + escapeHtml(err.detail || ('HTTP ' + resp.status)) + '</pre></div>';
+      return;
+    }
+    renderIngestResult(await resp.json(), []);
+  } catch (e) {
+    if (el) el.innerHTML = '<p style="color:var(--red);font-size:12px">失败: ' + escapeHtml(e.message || String(e)) + '</p>';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderIngestResult(data, uploadErrors) {
+  const el = $('ingest-result');
+  if (!el) return;
+  const dry = data.dry_run;
+  const docs = data.docs || [];
+  const skipped = docs.filter(d => d.status === 'skipped');
+  const failed = docs.filter(d => d.status === 'error');
+  const ok = docs.filter(d => d.status === 'parsed');
+  const upErrs = uploadErrors || [];
+
+  let html = `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+    <span class="pill ${dry ? 'pill-amber' : 'pill-green'}">${dry ? '预览（未落库）' : '已落库'}</span>
+    <span class="pill pill-gray">总 ${data.total_docs || 0}</span>
+    <span class="pill pill-green">解析 ${data.parsed_docs || 0}</span>
+    <span class="pill pill-gray">跳过 ${data.skipped_docs || 0}</span>
+    <span class="pill pill-red">失败 ${data.failed_docs || 0}</span>
+    ${dry ? '' : `<span class="pill pill-blue">落库 ${data.indexed_chunks || 0} chunk</span>`}
+  </div>`;
+
+  const block = (title, items, color) => {
+    if (!items || !items.length) return '';
+    return `<details style="margin-bottom:8px"${color === 'green' ? ' open' : ''}>
+      <summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--${color})">${title} (${items.length})</summary>
+      <ul style="margin:6px 0 0;padding-left:18px;font-size:11px;line-height:1.6">
+        ${items.map(d => `<li>${escapeHtml(d.filename || d.title || '?')}${d.num_chunks ? ` — ${d.num_chunks} chunk` : ''}${d.error ? `：${escapeHtml(d.error)}` : ''}</li>`).join('')}
+      </ul></details>`;
+  };
+  html += block('成功', ok, 'green');
+  html += block('跳过', skipped, 'amber');
+  html += block('失败', failed, 'red');
+  if (upErrs.length) {
+    html += `<details style="margin-bottom:8px"><summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--text-muted)">上传被拒 (${upErrs.length})</summary>
+      <ul style="margin:6px 0 0;padding-left:18px;font-size:11px;line-height:1.6">${upErrs.map(f => `<li>${escapeHtml(f.filename || '?')}：${escapeHtml(f.error || '')}</li>`).join('')}</ul></details>`;
+  }
+  el.innerHTML = html;
+  if (!dry && data.parsed_docs) {
+    showToast(`导入完成：${data.parsed_docs} 篇 / ${data.indexed_chunks} chunk`, 'success');
+    if (typeof loadKnowledgeOverview === 'function') loadKnowledgeOverview(selectedProjectId);
+  }
+}
+
 // ─── Knowledge (Overview + Norms) ────────────────────────────
 
 async function loadKnowledgeOverview(projectId) {
