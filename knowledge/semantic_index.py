@@ -107,22 +107,23 @@ class SemanticIndexer:
             )
             logger.info("Created Qdrant collection: %s", self._collection_name)
 
-            # 创建 payload 索引以加速过滤
-            await self._client.create_payload_index(
-                collection_name=self._collection_name,
-                field_name="project_id",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            await self._client.create_payload_index(
-                collection_name=self._collection_name,
-                field_name="file_path",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            await self._client.create_payload_index(
-                collection_name=self._collection_name,
-                field_name="chunk_type",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
+        # 创建 payload 索引以加速过滤 —— 必须每次 ensure_collection 都执行（幂等）。
+        # 预处理路径(project/preprocess.py)创建集合时不建这些索引；若仅在
+        # "集合不存在"分支建索引，则集合已由预处理建出来时这里会跳过，导致
+        # 所有带过滤的查询走未建索引的全量扫描。Qdrant create_payload_index
+        # 可重复调用，对"已存在"容错（try/except 吞掉重复创建报错）。
+        for field_name in ("project_id", "file_path", "chunk_type"):
+            try:
+                await self._client.create_payload_index(
+                    collection_name=self._collection_name,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception as exc:  # noqa: BLE001 — 索引已存在等可容错
+                logger.debug(
+                    "create_payload_index(%s) on %s skipped: %s",
+                    field_name, self._collection_name, exc,
+                )
 
     def _client_or_raise(self) -> AsyncQdrantClient:
         if self._client is None:
@@ -320,9 +321,10 @@ class SemanticIndexer:
             query_vector = query_vectors[0]
 
         # 构造过滤条件
-        must_filters = [
-            models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id))
-        ]
+        project_filter = models.FieldCondition(
+            key="project_id", match=models.MatchValue(value=project_id)
+        )
+        must_filters = [project_filter]
         if filter_dict:
             for k, v in filter_dict.items():
                 must_filters.append(
@@ -339,8 +341,10 @@ class SemanticIndexer:
         if not results:
             legacy = f"project_{project_id}"
             if await self._collection_exists(legacy):
+                # 旧集合回退路径同样必须带 project_id 过滤，否则跨项目返回
+                # 其他项目的点 = 数据越权泄漏。
                 results = await self._query_collection(
-                    client, legacy, query_vector, None, top_k,
+                    client, legacy, query_vector, [project_filter], top_k,
                 )
         return results
 

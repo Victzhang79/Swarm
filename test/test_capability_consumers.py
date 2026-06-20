@@ -66,16 +66,23 @@ def test_min_worker_window_skips_default_source():
     print("  ✅ 预算: 全 default 源被跳过 → None (不假装精确)")
 
 
-def test_min_worker_window_takes_min_of_real():
-    """多个真值取最小（保守，预算须让各档子任务都装得下）。"""
-    windows = {"probed_a": 128000, "probed_b": 32768}
-    calls = {"i": 0}
+def test_min_worker_window_takes_min_of_real(monkeypatch):
+    """多个真值取最小（保守，预算须让各档子任务都装得下）。
+
+    不锁定 .env 里 worker_parallel_pool 的具体条目数（已随路由配置漂移到 1 个），
+    而是显式注入 2 个候选模型来验证【多真值取最小】这一不变量本身。每个模型按
+    其名字返回固定真值（避免依赖调用次序/池长度）。
+    """
+    from swarm.config.settings import get_config
+
+    # 注入两个候选模型 → 强制走"多窗口取最小"分支，与 live config 解耦
+    monkeypatch.setattr(
+        get_config().worker, "worker_parallel_pool", ["probed_a", "probed_b"]
+    )
+    real_windows = {"probed_a": 128000, "probed_b": 32768}
 
     def fake_get_cap(provider_id, model_id, conn_str=None):
-        # 交替返回不同真值
-        calls["i"] += 1
-        w = 128000 if calls["i"] % 2 else 32768
-        return {"context_window": w, "source": cap.SOURCE_PROBED}
+        return {"context_window": real_windows[model_id], "source": cap.SOURCE_PROBED}
 
     with patch("swarm.models.capability_store.get_capability", side_effect=fake_get_cap):
         result = P._min_worker_context_window()

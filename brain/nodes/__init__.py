@@ -919,13 +919,20 @@ def confirm_plan(state: BrainState) -> dict:
         allow, reason = can_auto_accept_plan(state)
         if not allow:
             logger.warning(
-                "[CONFIRM] auto_accept 模式拒绝放行非法计划（fail-fast）：%s", reason,
+                "[CONFIRM] auto_accept 模式拒绝放行（fail-fast）：%s", reason,
             )
-            return {
+            # W1.1：tech_design 有失败模块时，auto_accept 不得静默成功——
+            # 升级人工(failure_escalated)，与"计划非法"一样走 fail-fast，但归因区分。
+            _vf = "tech_design_incomplete" if reason.startswith("tech_design_incomplete") else "plan_invalid"
+            _patch = {
                 "human_decision": HumanDecision.REJECT,
                 "confirm_reason": _reason,
-                "verification_failure": "plan_invalid",
+                "verification_failure": _vf,
             }
+            if _vf == "tech_design_incomplete":
+                _patch["failure_escalated"] = True
+                _patch["failure_strategy"] = "escalate"
+            return _patch
         logger.info("[CONFIRM] 自动接受 (auto_accept 模式，计划合法)")
         return {"human_decision": HumanDecision.ACCEPT}
 
@@ -940,6 +947,9 @@ def confirm_plan(state: BrainState) -> dict:
             "complexity": _complexity.value if hasattr(_complexity, "value") else str(_complexity),
             "plan": plan_obj.model_dump() if plan_obj is not None and hasattr(plan_obj, "model_dump") else {},
             "plan_validation_issues": state.get("plan_validation_issues") or [],
+            # W1.1：把失败模块/降级原因带进 interrupt，人工审核时能看到"设计不完整"
+            "tech_design_failed_modules": state.get("tech_design_failed_modules") or [],
+            "degraded_reasons": state.get("degraded_reasons") or [],
             "message": _msg,
         }
     )

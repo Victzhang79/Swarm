@@ -984,12 +984,26 @@ async def tech_design(state: BrainState) -> dict:
             "[TECH_DESIGN] 技术方案已产出 (file_plan=%d 文件, fact_issues=%d)",
             len(file_plan or []), len(fact_issues or []),
         )
-        return {
+        # W1.1：ultra 两阶段产出里 phase-2 失败的模块（文件丢失）必须被下游看见——
+        # 既写入专用 state 字段（confirm 闸门据此阻断静默 auto_accept），又追加到
+        # degraded_reasons（透传到交付/通知，人工审核可见"本任务交付不完整"）。
+        _failed_mods = (result.get("stage2_failed_modules") or []) if isinstance(result, dict) else []
+        _out: dict = {
             "tech_design": result,
             "shared_contract_draft": contract or {},
             "tech_design_fact_issues": fact_issues or [],
             "tech_design_file_plan": file_plan or [],
+            "tech_design_failed_modules": _failed_mods,
         }
+        if _failed_mods:
+            _names = [m.get("name", "?") for m in _failed_mods if isinstance(m, dict)]
+            _reason = (
+                f"tech_design 阶段 {len(_failed_mods)} 个模块设计生成失败 {_names}"
+                "——这些模块的文件未进入 file_plan，交付不完整，需人工介入"
+            )
+            logger.error("[TECH_DESIGN] %s", _reason)
+            _out["degraded_reasons"] = list(state.get("degraded_reasons") or []) + [_reason]
+        return _out
     except Exception as exc:  # noqa: BLE001
         logger.warning("[TECH_DESIGN] LLM 失败，产出空方案安全继续: %s", exc)
         # LLM 失败仍保留确定性磁盘核验结果（虚假前提不能因 LLM 挂了就漏过）

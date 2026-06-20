@@ -297,3 +297,149 @@ def test_atomic_write_env_writes_correct_content(tmp_path):
     assert env.read_text(encoding="utf-8") == "A=3\n"
     leftovers = [p.name for p in tmp_path.iterdir() if p.name != ".env"]
     assert leftovers == [], f"不应残留临时文件: {leftovers}"
+
+
+# ─────────────────────────────────────────────────────────
+# FIX W1.3 — KB payload 索引必建 + 旧集合回退也带 project_id 过滤
+# ─────────────────────────────────────────────────────────
+def test_ensure_collection_builds_payload_index_even_when_exists():
+    """集合已存在(预处理路径建出、无 payload 索引)时，ensure_collection 仍必须
+    为 project_id/file_path/chunk_type 建 payload 索引（幂等），否则过滤查询全量扫描。"""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from swarm.knowledge.semantic_index import SemanticIndexer
+
+    idx = SemanticIndexer()
+    client = AsyncMock()
+    # 模拟集合【已存在】
+    coll = MagicMock()
+    coll.name = idx._collection_name
+    collections_resp = MagicMock()
+    collections_resp.collections = [coll]
+    client.get_collections.return_value = collections_resp
+    idx._client = client
+
+    asyncio.run(idx.ensure_collection())
+
+    # 集合已存在 → 不应再 create_collection
+    client.create_collection.assert_not_called()
+    # 但 payload 索引必须每次都建（幂等），三个字段各一次
+    indexed_fields = {
+        call.kwargs.get("field_name")
+        for call in client.create_payload_index.call_args_list
+    }
+    assert {"project_id", "file_path", "chunk_type"} <= indexed_fields, indexed_fields
+
+
+def test_ensure_collection_tolerates_index_already_exists():
+    """create_payload_index 抛"已存在"异常时 ensure_collection 不应崩（吞掉续跑）。"""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from swarm.knowledge.semantic_index import SemanticIndexer
+
+    idx = SemanticIndexer()
+    client = AsyncMock()
+    coll = MagicMock()
+    coll.name = idx._collection_name
+    collections_resp = MagicMock()
+    collections_resp.collections = [coll]
+    client.get_collections.return_value = collections_resp
+    client.create_payload_index.side_effect = RuntimeError("index already exists")
+    idx._client = client
+
+    # 不应抛异常
+    asyncio.run(idx.ensure_collection())
+
+
+def test_legacy_fallback_search_applies_project_filter():
+    """旧集合(project_<id>)回退搜索路径必须带 project_id 过滤，禁止 must_filters=None
+    导致跨项目返回他人数据（数据越权泄漏）。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from qdrant_client import models
+
+    from swarm.knowledge.semantic_index import SemanticIndexer
+
+    idx = SemanticIndexer()
+    idx._client = AsyncMock()
+    idx.set_embed_fn(AsyncMock(return_value=[[0.1] * 4]))
+
+    captured = {"calls": []}
+
+    async def fake_query(client, collection_name, query_vector, must_filters, top_k):
+        captured["calls"].append((collection_name, must_filters))
+        return []  # 主集合返回空 → 触发旧集合回退
+
+    async def fake_exists(name):
+        return True  # 旧集合存在
+
+    idx._query_collection = fake_query
+    idx._collection_exists = fake_exists
+
+    asyncio.run(idx.search("proj-A", "some query", top_k=5))
+
+    # 至少两次调用：主集合 + 旧集合回退
+    assert len(captured["calls"]) >= 2
+    legacy_call = [c for c in captured["calls"] if c[0] == "project_proj-A"]
+    assert legacy_call, "应走旧集合回退路径"
+    legacy_filters = legacy_call[0][1]
+    assert legacy_filters is not None, "旧集合回退路径 must_filters 不得为 None（会跨项目泄漏）"
+    # 过滤条件里必须含 project_id=proj-A
+    keys = {f.key for f in legacy_filters if isinstance(f, models.FieldCondition)}
+    assert "project_id" in keys, f"旧集合回退必须带 project_id 过滤: {keys}"
+
+
+# ─────────────────────────────────────────────────────────
+# FIX W1.1 — ultra tech_design 失败模块阻断静默 auto_accept
+# ─────────────────────────────────────────────────────────
+def test_failed_modules_block_auto_accept_plan():
+    """tech_design_failed_modules 非空 → can_auto_accept_plan 拒绝放行（fail-fast）。"""
+    from swarm.brain.gates import can_auto_accept_plan
+
+    # 无失败模块 + 计划合法 → 放行
+    allow, _ = can_auto_accept_plan({"plan_valid": True})
+    assert allow is True
+
+    # 有失败模块 → 拒绝放行
+    allow, reason = can_auto_accept_plan({
+        "plan_valid": True,
+        "tech_design_failed_modules": [{"name": "payment", "idx": 3, "reason": "timeout"}],
+    })
+    assert allow is False
+    assert "tech_design_incomplete" in reason
+    assert "payment" in reason
+
+
+def test_confirm_plan_escalates_on_failed_modules_under_auto_accept():
+    """auto_accept + tech_design 有失败模块 → confirm 不得 ACCEPT，须 REJECT + 升级人工。"""
+    from swarm.brain.nodes import confirm_plan
+    from swarm.brain.state import Complexity, HumanDecision
+
+    state = {
+        "auto_accept": True,
+        "plan_valid": True,
+        "complexity": Complexity.ULTRA,
+        "tech_design_failed_modules": [{"name": "auth", "idx": 1, "reason": "json parse"}],
+    }
+    out = confirm_plan(state)
+    assert out["human_decision"] == HumanDecision.REJECT, "有失败模块绝不能 auto-ACCEPT"
+    assert out.get("failure_escalated") is True, "须升级人工"
+    assert out.get("failure_strategy") == "escalate"
+    assert out.get("verification_failure") == "tech_design_incomplete"
+
+
+def test_tech_design_surfaces_failed_modules_to_degraded_reasons():
+    """tech_design 节点把 stage2_failed_modules 透传进 degraded_reasons + 专用 state 字段。"""
+    import inspect
+
+    from swarm.brain import planning_nodes
+
+    src = inspect.getsource(planning_nodes.tech_design)
+    # 返回 patch 里带 tech_design_failed_modules 字段
+    assert '"tech_design_failed_modules"' in src
+    # 失败模块时追加 degraded_reasons
+    assert '"degraded_reasons"' in src
+    assert "stage2_failed_modules" in src

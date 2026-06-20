@@ -24,12 +24,24 @@ from typing import Any
 def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
     """CONFIRM 阶段：auto_accept 是否可放行此计划。
 
-    规则：计划自动校验未通过(plan_valid=False) → 不放行(fail-fast)。
+    任一为真即【拒绝放行】(fail-fast)：
+      - plan_valid=False：计划自动校验未通过。
+      - tech_design_failed_modules 非空（W1.1）：ultra 两阶段 tech_design 里有模块的
+        phase-2 设计生成失败 → 这些模块文件丢失、file_plan 不完整。绝不能让 auto_accept
+        把"交付不完整"的任务静默放行当成功，须升级人工审核残缺的设计。
     """
     if not state.get("plan_valid", True):
         issues = state.get("plan_validation_issues") or []
         reason = "; ".join(issues) if issues else "计划自动校验未通过"
         return False, f"plan_invalid: {reason}"
+
+    failed_modules = state.get("tech_design_failed_modules") or []
+    if failed_modules:
+        names = [m.get("name", "?") for m in failed_modules if isinstance(m, dict)]
+        return False, (
+            f"tech_design_incomplete: {len(failed_modules)} 个模块设计生成失败 {names}"
+            "——file_plan 不完整，不得静默 auto_accept，须人工介入"
+        )
     return True, ""
 
 
