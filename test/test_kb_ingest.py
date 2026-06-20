@@ -14,6 +14,8 @@ sources（遍历/抓取/远端 stub）+ pipeline（dry_run 不落库、复用 br
 
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -241,5 +243,142 @@ def test_remote_sources_raise_not_implemented_without_token(cls, monkeypatch):
         src.list_documents()
     # 报错里要写清需要的 env
     assert "环境变量" in str(ei.value) or "env" in str(ei.value).lower()
+    with pytest.raises(NotImplementedError):
+        src.fetch("any-id")
+
+
+# ── YuqueSource 真实现：mock urlopen 验证解析逻辑（不真发网络） ──────────
+
+
+class _FakeResp:
+    """最小 urlopen() 返回对象：支持 with 语句 + read()。"""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+def _yuque_src(monkeypatch, *, token="tk", namespace="user/repo"):
+    from swarm.knowledge.ingest import YuqueSource
+
+    monkeypatch.setenv("YUQUE_TOKEN", token)
+    monkeypatch.setenv("YUQUE_NAMESPACE", namespace)
+    monkeypatch.delenv("YUQUE_BASE", raising=False)
+    return YuqueSource()
+
+
+def test_yuque_list_documents_parses_data_array(monkeypatch):
+    """mock urlopen 返回假 docs JSON → 解析成 DocRef[]（slug→doc_id, title 保留, ext=.md）。"""
+    import swarm.knowledge.ingest.sources as srcmod
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["token"] = req.get_header("X-auth-token")
+        payload = {
+            "data": [
+                {"slug": "intro", "title": "介绍"},
+                {"slug": "guide", "title": "指南"},
+                {"title": "无 slug 应被跳过"},  # 缺 slug → 跳过
+            ]
+        }
+        return _FakeResp(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    src = _yuque_src(monkeypatch)
+    refs = src.list_documents()
+
+    assert captured["url"] == "https://www.yuque.com/api/v2/repos/user/repo/docs"
+    assert captured["token"] == "tk"  # header 带上 X-Auth-Token
+    ids = [r.doc_id for r in refs]
+    assert ids == ["intro", "guide"]  # 缺 slug 的被跳过
+    assert refs[0].title == "介绍"
+    assert all(r.ext == ".md" for r in refs)
+    assert refs[0].metadata["source"] == "yuque"
+    assert refs[0].metadata["namespace"] == "user/repo"
+
+
+def test_yuque_fetch_returns_markdown_body(monkeypatch):
+    """mock urlopen 返回单文档 JSON → FetchedDoc.data=body bytes, filename=<slug>.md。"""
+    import swarm.knowledge.ingest.sources as srcmod
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        payload = {"data": {"title": "介绍", "body": "# 标题\n\n正文 hello-yuque。"}}
+        return _FakeResp(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    src = _yuque_src(monkeypatch)
+    fetched = src.fetch("intro")
+
+    assert captured["url"] == "https://www.yuque.com/api/v2/repos/user/repo/docs/intro"
+    assert fetched.filename == "intro.md"
+    assert fetched.title == "介绍"
+    assert "hello-yuque" in fetched.data.decode("utf-8")
+    assert fetched.metadata["namespace"] == "user/repo"
+
+
+def test_yuque_custom_base_and_namespace_override(monkeypatch):
+    """YUQUE_BASE 覆盖默认 base；构造参数 namespace 覆盖 env。"""
+    import swarm.knowledge.ingest.sources as srcmod
+    from swarm.knowledge.ingest import YuqueSource
+
+    monkeypatch.setenv("YUQUE_TOKEN", "tk")
+    monkeypatch.setenv("YUQUE_NAMESPACE", "env/ns")
+    monkeypatch.setenv("YUQUE_BASE", "https://yuque.corp.local/api/v2/")  # 尾斜杠应被去掉
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeResp(json.dumps({"data": []}).encode("utf-8"))
+
+    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    src = YuqueSource(namespace="arg/ns")  # 显式 namespace 覆盖 env
+    src.list_documents()
+    assert captured["url"] == "https://yuque.corp.local/api/v2/repos/arg/ns/docs"
+
+
+def test_yuque_http_error_raises_with_status_code(monkeypatch):
+    """HTTP 401/404 → RuntimeError 带状态码（而非 NotImplementedError，也不静默）。"""
+    import swarm.knowledge.ingest.sources as srcmod
+
+    def fake_urlopen(req, timeout=None):
+        raise srcmod.urllib.error.HTTPError(
+            req.full_url, 401, "Unauthorized", hdrs=None,
+            fp=io.BytesIO(b'{"message":"Token Invalid"}'),
+        )
+
+    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    src = _yuque_src(monkeypatch)
+    with pytest.raises(RuntimeError) as ei:
+        src.list_documents()
+    msg = str(ei.value)
+    assert "401" in msg
+    assert "yuque" in msg.lower()
+
+
+def test_yuque_missing_env_raises_not_implemented(monkeypatch):
+    """缺 token/namespace → NotImplementedError 列出所需 env（可测，不联网）。"""
+    from swarm.knowledge.ingest import YuqueSource
+
+    monkeypatch.delenv("YUQUE_TOKEN", raising=False)
+    monkeypatch.delenv("YUQUE_NAMESPACE", raising=False)
+    src = YuqueSource()
+    with pytest.raises(NotImplementedError) as ei:
+        src.list_documents()
+    assert "YUQUE_TOKEN" in str(ei.value)
+    assert "YUQUE_NAMESPACE" in str(ei.value)
     with pytest.raises(NotImplementedError):
         src.fetch("any-id")

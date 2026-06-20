@@ -347,29 +347,33 @@ async def delete_norm(project_id: str, norm_id: int, request: Request):
 # ─── 文档采集（KB ingest） ────────────────────────────────────────────────
 
 
-def _build_ingest_source(source_type: str, file_paths: list[str]):
+def _build_ingest_source(source_type: str, file_paths: list[str], source_config: dict | None = None):
     """按 source_type 构造 SourceAdapter。
 
     local 用 file_paths（每个路径建一个 LocalFileSource，下面会合并文档引用）；
-    远端返回对应 stub adapter（无 token 时其 list/fetch 会抛 NotImplementedError）。
+    yuque 为真实现（缺 token/namespace 时 list/fetch 抛 NotImplementedError）；
+    feishu/tencent 仍是 stub（缺 token 时其 list/fetch 抛 NotImplementedError）。
+    yuque 的 namespace 可由 source_config.namespace 覆盖（否则走 YUQUE_NAMESPACE env）。
     """
     from swarm.knowledge.ingest.sources import (
         FeishuSource,
-        LocalFileSource,
         TencentDocSource,
         YuqueSource,
     )
 
+    cfg = source_config or {}
     st = (source_type or "local").lower()
     if st == "local":
         if not file_paths:
             raise HTTPException(status_code=400, detail="source_type=local 需提供 file_paths（先调 POST /api/uploads 拿路径）")
         return _MultiLocalSource(file_paths)
+    if st == "yuque":
+        namespace = (cfg.get("namespace") or "").strip() or None
+        return YuqueSource(namespace=namespace)
     remote = {
         "feishu": FeishuSource,
         "tencent": TencentDocSource,
         "tencent_doc": TencentDocSource,
-        "yuque": YuqueSource,
     }
     cls = remote.get(st)
     if cls is None:
@@ -443,7 +447,7 @@ async def ingest_documents(project_id: str, request: Request, req: IngestRequest
     from swarm.knowledge.ingest.pipeline import ingest as _ingest_pipeline
 
     # 构造来源（local 校验在 _build_ingest_source 内，远端缺 token 在 list/fetch 才抛）
-    source = _build_ingest_source(req.source_type, req.file_paths)
+    source = _build_ingest_source(req.source_type, req.file_paths, req.source_config)
 
     def _run_blocking() -> dict[str, Any]:
         """在 executor 线程里跑：dry_run 纯异步预览；非 dry_run 走 KB loop 拿连好的 indexer 落库。"""
@@ -482,6 +486,13 @@ async def ingest_documents(project_id: str, request: Request, req: IngestRequest
         raise HTTPException(status_code=400, detail=f"文件不存在: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        # 远端源(如语雀)的 HTTP/网络错误 —— 多是 token/namespace 配错或网络不通，
+        # 属客户端可纠正问题，返 400 + 带状态码的清晰提示，而非 500。
+        msg = str(e)
+        if msg.startswith("[yuque]") or "语雀" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=500, detail=f"采集失败: {e}")
     except Exception as e:  # noqa: BLE001 - 兜底，绝不 500 裸抛
         raise HTTPException(status_code=500, detail=f"采集失败: {e}")
 

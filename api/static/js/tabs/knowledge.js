@@ -122,6 +122,19 @@ async function searchSymbols() {
 
 // ─── Knowledge (Import / Ingest) ─────────────────────────────
 
+// 隐藏原生 input，选中后用 pill chip 列出文件名（统一风格，不裸露 <input type=file>）。
+function renderIngestFileChips() {
+  const input = $('ingest-files');
+  const chips = $('ingest-file-chips');
+  const count = $('ingest-files-count');
+  const files = input && input.files ? Array.from(input.files) : [];
+  if (count) count.textContent = files.length ? `已选 ${files.length} 个文件` : '未选择文件';
+  if (!chips) return;
+  chips.innerHTML = files.map(f =>
+    `<span class="pill pill-gray" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>`
+  ).join('');
+}
+
 // 本地文件：先 POST /api/uploads 拿隔离存储后的 path，再 POST .../knowledge/ingest。
 async function ingestLocalFiles() {
   const el = $('ingest-result');
@@ -161,6 +174,8 @@ async function ingestLocalFiles() {
       throw new Error(err.detail || ('HTTP ' + resp.status));
     }
     renderIngestResult(await resp.json(), upErrors);
+    // 落库成功后清空已选文件（dry_run 预览保留，便于继续真导入）
+    if (!dryRun && fileInput) { fileInput.value = ''; renderIngestFileChips(); }
   } catch (e) {
     if (el) el.innerHTML = '<p style="color:var(--red);font-size:12px">失败: ' + escapeHtml(e.message || String(e)) + '</p>';
   } finally {
@@ -173,8 +188,14 @@ async function ingestRemoteSource() {
   const el = $('ingest-result');
   const btn = $('btn-ingest-remote');
   if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
-  const sourceType = ($('ingest-remote-source') && $('ingest-remote-source').value) || 'feishu';
+  const sourceType = ($('ingest-remote-source') && $('ingest-remote-source').value) || 'yuque';
   const dryRun = !!($('ingest-dry-run') && $('ingest-dry-run').checked);
+  // 语雀可填命名空间覆盖 env（留空走 YUQUE_NAMESPACE）。
+  const sourceConfig = {};
+  if (sourceType === 'yuque') {
+    const ns = ($('ingest-yuque-namespace') && $('ingest-yuque-namespace').value || '').trim();
+    if (ns) sourceConfig.namespace = ns;
+  }
 
   if (btn) btn.disabled = true;
   if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">连接 ' + escapeHtml(sourceType) + ' 中…</p>';
@@ -182,7 +203,7 @@ async function ingestRemoteSource() {
     const resp = await fetch('/api/projects/' + encodeURIComponent(selectedProjectId) + '/knowledge/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source_type: sourceType, dry_run: dryRun }),
+      body: JSON.stringify({ source_type: sourceType, source_config: sourceConfig, dry_run: dryRun }),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));

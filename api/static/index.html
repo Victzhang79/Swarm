@@ -305,8 +305,15 @@
                     <!-- 本地文件 -->
                     <div class="form-group" style="margin:0">
                       <label class="form-label">本地文件（可多选）</label>
-                      <input id="ingest-files" class="form-input" type="file" multiple
-                        accept=".pdf,.docx,.md,.txt,.html,.png,.jpg,.jpeg">
+                      <!-- 原生 input 隐藏，统一用 btn 触发；选中后渲染文件名 chip 列表 -->
+                      <input id="ingest-files" type="file" multiple class="hidden"
+                        accept=".pdf,.docx,.md,.txt,.html,.png,.jpg,.jpeg"
+                        onchange="renderIngestFileChips()">
+                      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="document.getElementById('ingest-files').click()">选择文件…</button>
+                        <span class="hint" id="ingest-files-count">未选择文件</span>
+                      </div>
+                      <div id="ingest-file-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0"></div>
                       <p class="hint" style="margin:6px 0 0">支持 pdf / docx / md / txt / html / 图片（图片无文本会跳过）</p>
                       <div style="display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap">
                         <button class="btn btn-primary btn-sm" id="btn-ingest-local" onclick="ingestLocalFiles()">导入本地文件</button>
@@ -315,19 +322,22 @@
                         </label>
                       </div>
                     </div>
-                    <!-- 远端源 -->
+                    <!-- 远端源：仅语雀可用；飞书/腾讯需 OAuth，规划中 -->
                     <div class="form-group" style="margin:0">
                       <label class="form-label">远端来源</label>
-                      <div class="form-row" style="align-items:flex-end;margin:0">
-                        <div class="form-group" style="margin:0">
-                          <select id="ingest-remote-source" class="form-select">
-                            <option value="feishu">飞书 Feishu</option>
-                            <option value="tencent">腾讯文档</option>
-                            <option value="yuque">语雀 Yuque</option>
-                          </select>
-                        </div>
+                      <div class="form-group" style="margin:0">
+                        <select id="ingest-remote-source" class="form-select">
+                          <option value="yuque">语雀 Yuque</option>
+                          <option value="feishu" disabled>飞书 Feishu（规划中·需 OAuth）</option>
+                          <option value="tencent" disabled>腾讯文档（规划中·需 OAuth）</option>
+                        </select>
                       </div>
-                      <p class="hint" style="margin:8px 0 0">Token 走环境变量配置；未配置时点导入会返回所需 token/scope 提示。</p>
+                      <div class="form-group" style="margin:8px 0 0">
+                        <label class="form-label" style="font-size:11px">命名空间（user/repo，留空则用 YUQUE_NAMESPACE）</label>
+                        <input id="ingest-yuque-namespace" class="form-input" type="text"
+                          placeholder="例如 my-team/handbook" autocomplete="off">
+                      </div>
+                      <p class="hint" style="margin:8px 0 0">语雀 Token 走环境变量 YUQUE_TOKEN；未配置时点导入会返回所需 token 提示。</p>
                       <button class="btn btn-secondary btn-sm" style="margin-top:10px" id="btn-ingest-remote" onclick="ingestRemoteSource()">从远端导入</button>
                     </div>
                   </div>

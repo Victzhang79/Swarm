@@ -6,7 +6,9 @@ SourceAdapter:
 
 实现:
   - LocalFileSource: 本地文件/目录(真能用,有测试)。
-  - FeishuSource / TencentDocSource / YuqueSource: 接口 + stub。
+  - YuqueSource: 真实现(标准库 urllib,Token 走 Header,无 OAuth)。缺 token/namespace
+    抛清晰错误;网络/HTTP 错误带状态码。
+  - FeishuSource / TencentDocSource: 仍是 stub(需 OAuth/企业资质,确实未实现)。
     没有 API token 一律抛 NotImplementedError 并写清需要的 env/scope/端点,
     绝不伪造抓取结果。
 
@@ -15,7 +17,10 @@ SourceAdapter:
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol, runtime_checkable
@@ -169,6 +174,9 @@ class RemoteSourceStub:
 class FeishuSource(RemoteSourceStub):
     """飞书(Lark)云文档来源 — 接口 + stub。
 
+    未实现:需 OAuth/自建应用换 tenant_access_token + 开放平台开通只读 scope
+    并授权目标文档,故保持 stub(缺 token 抛 NotImplementedError,绝不伪造抓取)。
+
     接入清单:
       env:
         SWARM_INGEST_FEISHU_APP_ID      自建应用 App ID
@@ -204,6 +212,9 @@ class FeishuSource(RemoteSourceStub):
 class TencentDocSource(RemoteSourceStub):
     """腾讯文档来源 — 接口 + stub。
 
+    未实现:需走 OAuth2 授权码流程拿 access_token(用户登录授权)+ token 会过期需
+    refresh,且开放平台需企业/开发者资质申请,故保持 stub(缺 token 抛 NotImplementedError)。
+
     接入清单:
       env:
         SWARM_INGEST_TENCENT_CLIENT_ID      开放平台应用 ClientID
@@ -234,11 +245,10 @@ class TencentDocSource(RemoteSourceStub):
 # ── 语雀 ──────────────────────────────────────────────────────────────
 
 
-class YuqueSource(RemoteSourceStub):
-    """语雀来源 — 接口 + 较完整骨架(无 token 不联网、不测)。
+class YuqueSource:
+    """语雀来源 — 真实现(标准库 urllib,Token 走 Header,无 OAuth,无第三方依赖)。
 
-    语雀 API 较简单(Token 直接走 Header,无 OAuth),这里写出端点与组织方式骨架,
-    但没有 token 时一律 stub 抛错,绝不联网。
+    语雀 API 简单:个人 Token 走 Header `X-Auth-Token`,正文本就是 markdown。
 
     接入清单:
       env:
@@ -251,6 +261,11 @@ class YuqueSource(RemoteSourceStub):
       说明:
         语雀文档正文本就是 markdown(data.body),fetch 后 filename 用 "<slug>.md",
         直接走 parsers 的 .md parser,无需额外解析。
+
+    错误约定:
+      缺 YUQUE_TOKEN/YUQUE_NAMESPACE  → NotImplementedError(列出所需 env + 接入说明)。
+      HTTP 4xx/5xx(401/404 等)        → RuntimeError(带状态码 + 端点 + 响应片段)。
+      网络/解析错误                     → RuntimeError(带原因)。
     """
 
     source_name = "yuque"
@@ -260,35 +275,99 @@ class YuqueSource(RemoteSourceStub):
         " 列表 GET /repos/{ns}/docs、正文 GET /repos/{ns}/docs/{slug}.data.body(markdown)。"
     )
 
-    def __init__(self) -> None:
-        self.token = os.environ.get("YUQUE_TOKEN")
-        self.namespace = os.environ.get("YUQUE_NAMESPACE")
-        self.base = os.environ.get("YUQUE_BASE", "https://www.yuque.com/api/v2")
+    # 网络超时(秒)。真实联网调用用得到;单测 mock urlopen 不触达。
+    TIMEOUT = 30
 
-    # 骨架: 真要启用时把 stub 换成下面注释的真实实现(需 httpx + token)。
+    def __init__(self, namespace: str | None = None) -> None:
+        # token/base 仍只从 env 读;namespace 允许调用方(如 WebUI)显式传入覆盖 env。
+        self.token = os.environ.get("YUQUE_TOKEN")
+        self.namespace = namespace or os.environ.get("YUQUE_NAMESPACE")
+        self.base = os.environ.get("YUQUE_BASE", "https://www.yuque.com/api/v2").rstrip("/")
+
+    # ── 内部:配置校验 + HTTP GET ────────────────────────────────────
+
+    def _missing_env(self) -> list[str]:
+        """返回缺失项(human-readable env 名),namespace 缺失也归到 YUQUE_NAMESPACE。"""
+        missing = []
+        if not self.token:
+            missing.append("YUQUE_TOKEN")
+        if not self.namespace:
+            missing.append("YUQUE_NAMESPACE")
+        return missing
+
+    def _require_config(self, action: str) -> None:
+        missing = self._missing_env()
+        if missing:
+            raise NotImplementedError(
+                f"[{self.source_name}] {action} 未配置。\n"
+                f"需要的环境变量: {', '.join(self.REQUIRED_ENV)}\n"
+                f"当前缺失: {', '.join(missing)}\n"
+                f"{self.SETUP_DOC}"
+            )
+
+    def _get_json(self, url: str) -> Any:
+        """GET url(带 X-Auth-Token),返回解析后的 JSON;HTTP/网络错误抛带状态码的 RuntimeError。"""
+        req = urllib.request.Request(
+            url,
+            headers={"X-Auth-Token": self.token or "", "User-Agent": "swarm-kb-ingest"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:  # pragma: no cover - 防御性
+                pass
+            raise RuntimeError(
+                f"[{self.source_name}] 语雀 API HTTP {e.code} {e.reason}: {url}"
+                + (f" — {body}" if body else "")
+            ) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"[{self.source_name}] 语雀 API 网络错误: {url} — {e.reason}"
+            ) from e
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise RuntimeError(
+                f"[{self.source_name}] 语雀 API 返回非 JSON: {url} — {e}"
+            ) from e
+
+    # ── 公开:list / fetch(真实联网) ──────────────────────────────
+
     def list_documents(self) -> list[DocRef]:
-        if self._missing_env():
-            self._raise_not_implemented("list_documents")
-        # --- 真实实现骨架(需 token 时启用,这里不联网) ---
-        # import httpx
-        # url = f"{self.base}/repos/{self.namespace}/docs"
-        # r = httpx.get(url, headers={"X-Auth-Token": self.token}, timeout=30)
-        # r.raise_for_status()
-        # return [DocRef(doc_id=d["slug"], title=d["title"], ext=".md",
-        #                metadata={"source": "yuque", "namespace": self.namespace})
-        #         for d in r.json()["data"]]
-        raise NotImplementedError("unreachable")  # pragma: no cover
+        self._require_config("list_documents")
+        url = f"{self.base}/repos/{self.namespace}/docs"
+        payload = self._get_json(url)
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        refs: list[DocRef] = []
+        for d in data:
+            slug = d.get("slug")
+            if not slug:
+                continue
+            refs.append(
+                DocRef(
+                    doc_id=str(slug),
+                    title=d.get("title") or str(slug),
+                    ext=".md",
+                    metadata={"source": "yuque", "namespace": self.namespace, "slug": slug},
+                )
+            )
+        return refs
 
     def fetch(self, doc_id: str) -> FetchedDoc:
-        if self._missing_env():
-            self._raise_not_implemented("fetch")
-        # --- 真实实现骨架(需 token 时启用,这里不联网) ---
-        # import httpx
-        # url = f"{self.base}/repos/{self.namespace}/docs/{doc_id}"
-        # r = httpx.get(url, headers={"X-Auth-Token": self.token}, timeout=30)
-        # r.raise_for_status()
-        # body = r.json()["data"]["body"]  # markdown 正文
-        # return FetchedDoc(doc_id=doc_id, data=body.encode("utf-8"),
-        #                   filename=f"{doc_id}.md", title=r.json()["data"].get("title"),
-        #                   metadata={"source": "yuque", "namespace": self.namespace})
-        raise NotImplementedError("unreachable")  # pragma: no cover
+        self._require_config("fetch")
+        url = f"{self.base}/repos/{self.namespace}/docs/{doc_id}"
+        payload = self._get_json(url)
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        body = data.get("body") or ""  # 语雀正文本就是 markdown
+        return FetchedDoc(
+            doc_id=doc_id,
+            data=body.encode("utf-8"),
+            filename=f"{doc_id}.md",
+            title=data.get("title"),
+            metadata={"source": "yuque", "namespace": self.namespace, "slug": doc_id},
+        )
