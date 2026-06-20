@@ -124,6 +124,32 @@ async def close_retriever() -> None:
         _retriever = None
 
 
+def resolve_symbols_sync(
+    build_output: str, project_id: str, create_files: list[str] | None = None
+) -> str:
+    """同步入口：把编译输出的 `cannot find symbol` 拿去 codegraph 解析成 FQN 修复提示。
+
+    供 worker 编译修复回路调用（治本 RUN20 主导缺陷类：40B 在猜的包/接口名上引用类）。
+    任何异常一律吞掉返空串——接地提示是【增益】，绝不能让它拖垮修复回路。走专用 KB loop，
+    复用 retriever 已连接的 StructureIndexer，不新建连接。
+    """
+    if not build_output or "cannot find symbol" not in build_output:
+        return ""
+
+    async def _go() -> str:
+        retriever = await get_retriever()
+        indexer = getattr(retriever, "_struct", None)
+        if indexer is None:
+            return ""
+        from swarm.worker.symbol_resolver import resolve_and_format
+        return await resolve_and_format(build_output, project_id, indexer, create_files)
+
+    try:
+        return _run_on_kb_loop(_go())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 @swarm_traceable(
     "knowledge/retrieve-brain",
     phase=PHASE_2,

@@ -524,8 +524,9 @@ class WorkerExecutor:
 
                 if fix_round < self.max_fix_rounds:
                     self._log(f"修复尝试 {fix_round + 1}/{self.max_fix_rounds}")
+                    symbol_hint = await self._symbol_grounding_hint(verify_result, l1_details)
                     fix_result = await self._run_agent(
-                        self._build_fix_prompt(verify_result, l1_details),
+                        self._build_fix_prompt(verify_result, l1_details, symbol_hint),
                         step=f"fix-{fix_round}",
                     )
                     self._log(f"修复完成: {fix_result[:200]}")
@@ -1849,15 +1850,42 @@ class WorkerExecutor:
             parts.append(f"[确定性闸门] {reason}: {l1_details.get('note', '')}")
         return "\n\n".join(parts).strip()
 
-    def _build_fix_prompt(self, verify_result: str, l1_details: dict | None = None) -> str:
+    async def _symbol_grounding_hint(self, verify_result: str, l1_details: dict | None) -> str:
+        """路径1 治本：编译报 cannot find symbol → codegraph 解析真实 FQN 提示。
+
+        只在出现 cannot find symbol 时触发；offload 到线程不阻塞执行 loop；全程 try 包裹 +
+        service 层自身吞异常——接地是【增益】，绝不能因它让修复回路崩或卡。
+        """
+        try:
+            digest = self._l1_failure_digest(l1_details or {})
+            evidence = digest or verify_result or ""
+            if "cannot find symbol" not in evidence:
+                return ""
+            import asyncio as _asyncio
+
+            from swarm.knowledge.service import resolve_symbols_sync
+            sc = getattr(self.subtask, "scope", None)
+            create_files = list(getattr(sc, "create_files", []) or []) if sc else []
+            return await _asyncio.to_thread(
+                resolve_symbols_sync, evidence, self.project_id or "", create_files
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _build_fix_prompt(
+        self, verify_result: str, l1_details: dict | None = None, symbol_hint: str = ""
+    ) -> str:
         # I4：优先用确定性失败证据（真实 compile/lint/scope，已压缩），回退 LLM 自报
         digest = self._l1_failure_digest(l1_details or {})
         evidence = digest if digest else verify_result
+        # 路径1 治本：编译报 cannot find symbol 时，附 codegraph 解析的真实 FQN，
+        # 让 worker 照真实位置改 import，而非再猜包名（RUN20 主导缺陷类）。
+        grounding = f"\n\n{symbol_hint}" if symbol_hint else ""
         return (
-            f"L1 验证未通过，确定性失败证据：\n{evidence}\n\n"
+            f"L1 验证未通过，确定性失败证据：\n{evidence}{grounding}\n\n"
             "请分析失败原因并修复代码：\n"
             "1. 仔细阅读上面的错误信息（这是真实的编译/lint/scope 检查结果）\n"
-            "2. 定位问题根因\n"
+            "2. 定位问题根因（若有【符号接地提示】，照其给出的真实 FQN 修正引用，勿臆造包名）\n"
             "3. 使用 patch_file 修复\n"
             "完成后请再次运行验证。"
         )
