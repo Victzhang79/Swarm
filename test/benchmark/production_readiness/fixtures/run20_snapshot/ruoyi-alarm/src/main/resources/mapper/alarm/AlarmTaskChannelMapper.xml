@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmTaskChannelMapper">
+
+    <resultMap type="com.ruoyi.alarm.domain.AlarmTaskChannel" id="AlarmTaskChannelResult">
+        <id property="id" column="id"/>
+        <result property="taskId" column="task_id"/>
+        <result property="channelType" column="channel_type"/>
+        <result property="robotId" column="robot_id"/>
+        <result property="templateId" column="template_id"/>
+        <result property="callbackEnabled" column="callback_enabled"/>
+        <result property="dividerEnabled" column="divider_enabled"/>
+        <result property="phoneNumber" column="phone_number"/>
+        <result property="createBy" column="create_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateBy" column="update_by"/>
+        <result property="updateTime" column="update_time"/>
+    </resultMap>
+
+    <sql id="selectAlarmTaskChannelVo">
+        select id, task_id, channel_type, robot_id, template_id, callback_enabled, divider_enabled, phone_number, create_by, create_time, update_by, update_time from alarm_task_channel
+    </sql>
+
+    <sql id="alarmTaskChannelWhere">
+        <where>
+            <if test="taskId != null">
+                and task_id = #{taskId}
+            </if>
+            <if test="channelType != null and channelType != ''">
+                and channel_type = #{channelType}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAlarmTaskChannelList" parameterType="com.ruoyi.alarm.domain.AlarmTaskChannel" resultMap="AlarmTaskChannelResult">
+        <include refid="selectAlarmTaskChannelVo"/>
+        <include refid="alarmTaskChannelWhere"/>
+        order by create_time desc
+    </select>
+
+    <select id="selectAlarmTaskChannelById" parameterType="Long" resultMap="AlarmTaskChannelResult">
+        <include refid="selectAlarmTaskChannelVo"/>
+        where id = #{id}
+    </select>
+
+    <select id="selectAlarmTaskChannelsByTaskId" parameterType="Long" resultMap="AlarmTaskChannelResult">
+        <include refid="selectAlarmTaskChannelVo"/>
+        where task_id = #{taskId}
+        order by create_time desc
+    </select>
+
+    <insert id="insertAlarmTaskChannel" parameterType="com.ruoyi.alarm.domain.AlarmTaskChannel" useGeneratedKeys="true" keyProperty="id">
+        insert into alarm_task_channel
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <if test="taskId != null">task_id,</if>
+            <if test="channelType != null and channelType != ''">channel_type,</if>
+            <if test="robotId != null">robot_id,</if>
+            <if test="templateId != null">template_id,</if>
+            <if test="callbackEnabled != null and callbackEnabled != ''">callback_enabled,</if>
+            <if test="dividerEnabled != null and dividerEnabled != ''">divider_enabled,</if>
+            <if test="phoneNumber != null and phoneNumber != ''">phone_number,</if>
+            <if test="createBy != null and createBy != ''">create_by,</if>
+            <if test="createTime != null">create_time,</if>
+        </trim>
+        <trim prefix="values(" suffix=")" suffixOverrides=",">
+            <if test="taskId != null">#{taskId},</if>
+            <if test="channelType != null and channelType != ''">#{channelType},</if>
+            <if test="robotId != null">#{robotId},</if>
+            <if test="templateId != null">#{templateId},</if>
+            <if test="callbackEnabled != null and callbackEnabled != ''">#{callbackEnabled},</if>
+            <if test="dividerEnabled != null and dividerEnabled != ''">#{dividerEnabled},</if>
+            <if test="phoneNumber != null and phoneNumber != ''">#{phoneNumber},</if>
+            <if test="createBy != null and createBy != ''">#{createBy},</if>
+            <if test="createTime != null">#{createTime},</if>
+        </trim>
+    </insert>
+
+    <update id="updateAlarmTaskChannel" parameterType="com.ruoyi.alarm.domain.AlarmTaskChannel">
+        update alarm_task_channel
+        <trim prefix="SET" suffixOverrides=",">
+            <if test="taskId != null">task_id = #{taskId},</if>
+            <if test="channelType != null and channelType != ''">channel_type = #{channelType},</if>
+            <if test="robotId != null">robot_id = #{robotId},</if>
+            <if test="templateId != null">template_id = #{templateId},</if>
+            <if test="callbackEnabled != null and callbackEnabled != ''">callback_enabled = #{callbackEnabled},</if>
+            <if test="dividerEnabled != null and dividerEnabled != ''">divider_enabled = #{dividerEnabled},</if>
+            <if test="phoneNumber != null and phoneNumber != ''">phone_number = #{phoneNumber},</if>
+            <if test="updateBy != null and updateBy != ''">update_by = #{updateBy},</if>
+            <if test="updateTime != null">update_time = #{updateTime},</if>
+        </trim>
+        where id = #{id}
+    </update>
+
+    <delete id="deleteAlarmTaskChannelById" parameterType="Long">
+        delete from alarm_task_channel where id = #{id}
+    </delete>
+
+    <delete id="deleteAlarmTaskChannelByIds" parameterType="Long[]">
+        delete from alarm_task_channel where id in
+        <foreach item="id" collection="array" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </delete>
+
+    <delete id="deleteAlarmTaskChannelByTaskId" parameterType="Long">
+        delete from alarm_task_channel where task_id = #{taskId}
+    </delete>
+
+</mapper>

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmScheduleGroupMapper">
+
+    <resultMap type="AlarmScheduleGroup" id="AlarmScheduleGroupResult">
+        <result property="groupId"      column="group_id"      />
+        <result property="strategyId"   column="strategy_id"   />
+        <result property="groupIndex"   column="group_index"   />
+        <result property="groupName"    column="group_name"    />
+        <result property="memberIds"    column="member_ids"    />
+        <result property="createBy"     column="create_by"     />
+        <result property="createTime"   column="create_time"   />
+        <result property="updateBy"     column="update_by"     />
+        <result property="updateTime"   column="update_time"   />
+    </resultMap>
+
+    <sql id="selectScheduleGroupVo">
+        select group_id, strategy_id, group_index, group_name, member_ids, create_by, create_time, update_by, update_time
+        from alarm_schedule_group
+    </sql>
+
+    <select id="selectScheduleGroupByStrategyId" parameterType="Long" resultMap="AlarmScheduleGroupResult">
+        <include refid="selectScheduleGroupVo"/>
+        where strategy_id = #{strategyId}
+        order by group_index asc
+    </select>
+
+    <insert id="batchInsertScheduleGroup" parameterType="java.util.List" useGeneratedKeys="true" keyProperty="groupId">
+        insert into alarm_schedule_group(group_id, strategy_id, group_index, group_name, member_ids, create_by, create_time, update_by, update_time)
+        values
+        <foreach item="item" collection="list" separator=",">
+            (#{item.groupId}, #{item.strategyId}, #{item.groupIndex}, #{item.groupName}, #{item.memberIds}, #{item.createBy}, #{item.createTime}, #{item.updateBy}, #{item.updateTime})
+        </foreach>
+    </insert>
+
+    <delete id="deleteScheduleGroupByStrategyId" parameterType="Long">
+        delete from alarm_schedule_group where strategy_id = #{strategyId}
+    </delete>
+
+    <delete id="deleteScheduleGroupByStrategyIds" parameterType="Long">
+        delete from alarm_schedule_group where strategy_id in
+        <foreach collection="array" item="strategyId" open="(" separator="," close=")">
+            #{strategyId}
+        </foreach>
+    </delete>
+
+</mapper>

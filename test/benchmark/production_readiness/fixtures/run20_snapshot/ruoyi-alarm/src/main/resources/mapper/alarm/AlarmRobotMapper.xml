@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmRobotMapper">
+
+    <resultMap type="AlarmRobot" id="AlarmRobotResult">
+        <id property="robotId" column="robot_id"/>
+        <result property="robotType" column="robot_type"/>
+        <result property="robotName" column="robot_name"/>
+        <result property="webhookUrl" column="webhook_url"/>
+        <result property="status" column="status"/>
+        <result property="remark" column="remark"/>
+        <result property="createBy" column="create_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateBy" column="update_by"/>
+        <result property="updateTime" column="update_time"/>
+    </resultMap>
+
+    <sql id="selectAlarmRobotVo">
+        select robot_id, robot_type, robot_name, webhook_url, status, remark, create_by, create_time, update_by, update_time
+        from alarm_robot
+    </sql>
+
+    <select id="selectAlarmRobotList" parameterType="AlarmRobot" resultMap="AlarmRobotResult">
+        <include refid="selectAlarmRobotVo"/>
+        <where>
+            <if test="robotType != null and robotType != ''">
+                AND robot_type = #{robotType}
+            </if>
+            <if test="status != null and status != ''">
+                AND status = #{status}
+            </if>
+            <if test="robotName != null and robotName != ''">
+                AND robot_name like concat('%', #{robotName}, '%')
+            </if>
+        </where>
+        order by robot_id desc
+    </select>
+
+    <select id="selectAlarmRobotById" parameterType="Long" resultMap="AlarmRobotResult">
+        <include refid="selectAlarmRobotVo"/>
+        where robot_id = #{robotId}
+    </select>
+
+    <insert id="insertAlarmRobot" parameterType="AlarmRobot" useGeneratedKeys="true" keyProperty="robotId">
+        insert into alarm_robot (
+            <if test="robotType != null and robotType != ''">robot_type,</if>
+            <if test="robotName != null and robotName != ''">robot_name,</if>
+            <if test="webhookUrl != null and webhookUrl != ''">webhook_url,</if>
+            <if test="status != null">status,</if>
+            <if test="remark != null and remark != ''">remark,</if>
+            <if test="createBy != null and createBy != ''">create_by,</if>
+            create_time
+        ) values (
+            <if test="robotType != null and robotType != ''">#{robotType},</if>
+            <if test="robotName != null and robotName != ''">#{robotName},</if>
+            <if test="webhookUrl != null and webhookUrl != ''">#{webhookUrl},</if>
+            <if test="status != null">#{status},</if>
+            <if test="remark != null and remark != ''">#{remark},</if>
+            <if test="createBy != null and createBy != ''">#{createBy},</if>
+            sysdate()
+        )
+    </insert>
+
+    <update id="updateAlarmRobot" parameterType="AlarmRobot">
+        update alarm_robot
+        <set>
+            <if test="robotType != null and robotType != ''">robot_type = #{robotType},</if>
+            <if test="robotName != null and robotName != ''">robot_name = #{robotName},</if>
+            <if test="webhookUrl != null and webhookUrl != ''">webhook_url = #{webhookUrl},</if>
+            <if test="status != null">status = #{status},</if>
+            <if test="remark != null">remark = #{remark},</if>
+            <if test="updateBy != null and updateBy != ''">update_by = #{updateBy},</if>
+            update_time = sysdate()
+        </set>
+        where robot_id = #{robotId}
+    </update>
+
+    <delete id="deleteAlarmRobotById" parameterType="Long">
+        delete from alarm_robot where robot_id = #{robotId}
+    </delete>
+
+</mapper>

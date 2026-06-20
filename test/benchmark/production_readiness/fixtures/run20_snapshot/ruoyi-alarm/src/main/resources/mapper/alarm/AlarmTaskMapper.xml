@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmTaskMapper">
+
+    <resultMap type="com.ruoyi.alarm.domain.AlarmTask" id="AlarmTaskResult">
+        <id property="taskId" column="task_id"/>
+        <result property="taskName" column="task_name"/>
+        <result property="status" column="status"/>
+        <result property="alarmLevel" column="alarm_level"/>
+        <result property="alarmType" column="alarm_type"/>
+        <result property="idempotentValue" column="idempotent_value"/>
+        <result property="minNotifyInterval" column="min_notify_interval"/>
+        <result property="ignoreInterval" column="ignore_interval"/>
+        <result property="minAccumulateCount" column="min_accumulate_count"/>
+        <result property="appId" column="app_id"/>
+        <result property="scheduleStrategyId" column="schedule_strategy_id"/>
+        <result property="notifyUserIds" column="notify_user_ids"/>
+        <result property="createBy" column="create_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateBy" column="update_by"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="remark" column="remark"/>
+    </resultMap>
+
+    <sql id="selectAlarmTaskVo">
+        select task_id, task_name, status, alarm_level, alarm_type, idempotent_value, min_notify_interval, ignore_interval, min_accumulate_count, app_id, schedule_strategy_id, notify_user_ids, create_by, create_time, update_by, update_time, remark from alarm_task
+    </sql>
+
+    <sql id="alarmTaskWhere">
+        <where>
+            <if test="taskName != null and taskName != ''">
+                and task_name like concat('%', #{taskName}, '%')
+            </if>
+            <if test="status != null and status != ''">
+                and status = #{status}
+            </if>
+            <if test="alarmLevel != null and alarmLevel != ''">
+                and alarm_level = #{alarmLevel}
+            </if>
+            <if test="alarmType != null and alarmType != ''">
+                and alarm_type = #{alarmType}
+            </if>
+            <if test="appId != null">
+                and app_id = #{appId}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAlarmTaskList" parameterType="com.ruoyi.alarm.domain.AlarmTask" resultMap="AlarmTaskResult">
+        <include refid="selectAlarmTaskVo"/>
+        <include refid="alarmTaskWhere"/>
+        order by create_time desc
+    </select>
+
+    <select id="selectAlarmTaskById" parameterType="Long" resultMap="AlarmTaskResult">
+        <include refid="selectAlarmTaskVo"/>
+        where task_id = #{taskId}
+    </select>
+
+    <select id="selectAlarmTaskByName" parameterType="String" resultMap="AlarmTaskResult">
+        <include refid="selectAlarmTaskVo"/>
+        where task_name = #{taskName}
+    </select>
+
+    <insert id="insertAlarmTask" parameterType="com.ruoyi.alarm.domain.AlarmTask" useGeneratedKeys="true" keyProperty="taskId">
+        insert into alarm_task
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <if test="taskName != null and taskName != ''">task_name,</if>
+            <if test="status != null and status != ''">status,</if>
+            <if test="alarmLevel != null and alarmLevel != ''">alarm_level,</if>
+            <if test="alarmType != null and alarmType != ''">alarm_type,</if>
+            <if test="idempotentValue != null and idempotentValue != ''">idempotent_value,</if>
+            <if test="minNotifyInterval != null">min_notify_interval,</if>
+            <if test="ignoreInterval != null">ignore_interval,</if>
+            <if test="minAccumulateCount != null">min_accumulate_count,</if>
+            <if test="appId != null">app_id,</if>
+            <if test="scheduleStrategyId != null">schedule_strategy_id,</if>
+            <if test="notifyUserIds != null and notifyUserIds != ''">notify_user_ids,</if>
+            <if test="createBy != null and createBy != ''">create_by,</if>
+            <if test="createTime != null">create_time,</if>
+            <if test="remark != null and remark != ''">remark,</if>
+        </trim>
+        <trim prefix="values(" suffix=")" suffixOverrides=",">
+            <if test="taskName != null and taskName != ''">#{taskName},</if>
+            <if test="status != null and status != ''">#{status},</if>
+            <if test="alarmLevel != null and alarmLevel != ''">#{alarmLevel},</if>
+            <if test="alarmType != null and alarmType != ''">#{alarmType},</if>
+            <if test="idempotentValue != null and idempotentValue != ''">#{idempotentValue},</if>
+            <if test="minNotifyInterval != null">#{minNotifyInterval},</if>
+            <if test="ignoreInterval != null">#{ignoreInterval},</if>
+            <if test="minAccumulateCount != null">#{minAccumulateCount},</if>
+            <if test="appId != null">#{appId},</if>
+            <if test="scheduleStrategyId != null">#{scheduleStrategyId},</if>
+            <if test="notifyUserIds != null and notifyUserIds != ''">#{notifyUserIds},</if>
+            <if test="createBy != null and createBy != ''">#{createBy},</if>
+            <if test="createTime != null">#{createTime},</if>
+            <if test="remark != null and remark != ''">#{remark},</if>
+        </trim>
+    </insert>
+
+    <update id="updateAlarmTask" parameterType="com.ruoyi.alarm.domain.AlarmTask">
+        update alarm_task
+        <trim prefix="SET" suffixOverrides=",">
+            <if test="taskName != null and taskName != ''">task_name = #{taskName},</if>
+            <if test="status != null and status != ''">status = #{status},</if>
+            <if test="alarmLevel != null and alarmLevel != ''">alarm_level = #{alarmLevel},</if>
+            <if test="alarmType != null and alarmType != ''">alarm_type = #{alarmType},</if>
+            <if test="idempotentValue != null and idempotentValue != ''">idempotent_value = #{idempotentValue},</if>
+            <if test="minNotifyInterval != null">min_notify_interval = #{minNotifyInterval},</if>
+            <if test="ignoreInterval != null">ignore_interval = #{ignoreInterval},</if>
+            <if test="minAccumulateCount != null">min_accumulate_count = #{minAccumulateCount},</if>
+            <if test="appId != null">app_id = #{appId},</if>
+            <if test="scheduleStrategyId != null">schedule_strategy_id = #{scheduleStrategyId},</if>
+            <if test="notifyUserIds != null and notifyUserIds != ''">notify_user_ids = #{notifyUserIds},</if>
+            <if test="updateBy != null and updateBy != ''">update_by = #{updateBy},</if>
+            <if test="updateTime != null">update_time = #{updateTime},</if>
+            <if test="remark != null and remark != ''">remark = #{remark},</if>
+        </trim>
+        where task_id = #{taskId}
+    </update>
+
+    <delete id="deleteAlarmTaskById" parameterType="Long">
+        delete from alarm_task where task_id = #{taskId}
+    </delete>
+
+    <delete id="deleteAlarmTaskByIds" parameterType="Long[]">
+        delete from alarm_task where task_id in
+        <foreach item="taskId" collection="array" open="(" separator="," close=")">
+            #{taskId}
+        </foreach>
+    </delete>
+
+</mapper>

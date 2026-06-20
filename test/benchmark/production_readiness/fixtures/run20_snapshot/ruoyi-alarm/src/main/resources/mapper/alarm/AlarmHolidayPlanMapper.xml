@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmHolidayPlanMapper">
+
+    <resultMap type="com.ruoyi.alarm.domain.AlarmHolidayPlan" id="AlarmHolidayPlanResult">
+        <result property="planId" column="plan_id"/>
+        <result property="strategyId" column="strategy_id"/>
+        <result property="holidayName" column="holiday_name"/>
+        <result property="startDate" column="start_date"/>
+        <result property="endDate" column="end_date"/>
+        <result property="memberIds" column="member_ids"/>
+        <result property="createBy" column="create_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateBy" column="update_by"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="remark" column="remark"/>
+    </resultMap>
+
+    <sql id="selectHolidayPlanVo">
+        select plan_id, strategy_id, holiday_name, start_date, end_date, member_ids, create_by, create_time, update_by, update_time, remark
+        from alarm_holiday_plan
+    </sql>
+
+    <select id="selectHolidayPlanList" resultMap="AlarmHolidayPlanResult" parameterType="com.ruoyi.alarm.domain.AlarmHolidayPlan">
+        <include refid="selectHolidayPlanVo"/>
+        <where>
+            <if test="strategyId != null">
+                and strategy_id = #{strategyId}
+            </if>
+            <if test="holidayName != null and holidayName != ''">
+                and holiday_name like concat('%', #{holidayName}, '%')
+            </if>
+        </where>
+        order by plan_id desc
+    </select>
+
+    <select id="selectHolidayPlanById" resultMap="AlarmHolidayPlanResult" parameterType="Long">
+        <include refid="selectHolidayPlanVo"/>
+        where plan_id = #{planId}
+    </select>
+
+    <insert id="insertHolidayPlan" parameterType="com.ruoyi.alarm.domain.AlarmHolidayPlan" useGeneratedKeys="true" keyProperty="planId">
+        insert into alarm_holiday_plan
+        <trim>
+            <if test="strategyId != null">strategy_id,</if>
+            <if test="holidayName != null">holiday_name,</if>
+            <if test="startDate != null">start_date,</if>
+            <if test="endDate != null">end_date,</if>
+            <if test="memberIds != null">member_ids,</if>
+            <if test="createBy != null">create_by,</if>
+            <if test="createTime != null">create_time,</if>
+            <if test="remark != null">remark,</if>
+        </trim>
+        values
+        <trim>
+            <if test="strategyId != null">#{strategyId},</if>
+            <if test="holidayName != null">#{holidayName},</if>
+            <if test="startDate != null">#{startDate},</if>
+            <if test="endDate != null">#{endDate},</if>
+            <if test="memberIds != null">#{memberIds},</if>
+            <if test="createBy != null">#{createBy},</if>
+            <if test="createTime != null">#{createTime},</if>
+            <if test="remark != null">#{remark},</if>
+        </trim>
+    </insert>
+
+    <update id="updateHolidayPlan" parameterType="com.ruoyi.alarm.domain.AlarmHolidayPlan">
+        update alarm_holiday_plan
+        <trim>
+            <if test="strategyId != null">strategy_id = #{strategyId},</if>
+            <if test="holidayName != null">holiday_name = #{holidayName},</if>
+            <if test="startDate != null">start_date = #{startDate},</if>
+            <if test="endDate != null">end_date = #{endDate},</if>
+            <if test="memberIds != null">member_ids = #{memberIds},</if>
+            <if test="updateBy != null">update_by = #{updateBy},</if>
+            <if test="updateTime != null">update_time = #{updateTime},</if>
+            <if test="remark != null">remark = #{remark},</if>
+        </trim>
+        where plan_id = #{planId}
+    </update>
+
+    <delete id="deleteHolidayPlanById" parameterType="Long">
+        delete from alarm_holiday_plan where plan_id = #{planId}
+    </delete>
+
+    <delete id="deleteHolidayPlanByIds" parameterType="Long">
+        delete from alarm_holiday_plan where plan_id in
+        <foreach collection="array" item="planId" open="(" separator="," close=")">
+            #{planId}
+        </foreach>
+    </delete>
+
+    <select id="selectHolidayPlanByDateRange" resultMap="AlarmHolidayPlanResult">
+        <include refid="selectHolidayPlanVo"/>
+        where start_date &lt;= #{endDate} and end_date &gt;= #{startDate}
+        order by plan_id desc
+    </select>
+
+    <select id="selectHolidayByDate" resultMap="AlarmHolidayPlanResult">
+        <include refid="selectHolidayPlanVo"/>
+        where #{date} between start_date and end_date
+        <if test="strategyId != null">
+            and strategy_id = #{strategyId}
+        </if>
+        limit 1
+    </select>
+
+</mapper>

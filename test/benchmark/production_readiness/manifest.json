@@ -1,0 +1,19 @@
+{
+  "description": "生产就绪度离线评测夹具——E2E 生成产物的快照 + 原始 plan。对产物做 4 维静态分析(覆盖度/分层完整性/规范合规/悬空符号),零 LLM、秒级,作为'真生产级完整'的客观合格证。期望以快照实测为准设定(产物落盘态可能不含所有沙箱期缺陷),不硬编死数字。",
+  "fixtures": [
+    {
+      "run": "RUN20",
+      "desc": "RUN20 RuoYi 告警平台:plan 应建 95 文件,快照实际落盘 72 java + 12 mapper.xml + 3 html + 0 sql。实测缺陷:覆盖率 92.6%(缺 5 个建表/菜单 sql、1 个 edit.html、1 个 ruoyi-admin/pom);2 个子表实体(AlarmScheduleGroup/AlarmTaskChannel)缺 service/serviceImpl/controller 层;4 处悬空符号(NotifyCallbackController/NotifyApiServiceImpl 引用不存在的 com.ruoyi.alarm.dto.* 与 com.ruoyi.alarm.service.IAlarmEngineService——同 RedisCache 一类的编译失败);2 个 Notify* controller 未 extends BaseController。落盘态已无沙箱期的 @PreAuthorize/RedisCache(被修复或未持久化),故 @PreAuthorize 期望按实测为 0,不硬设。",
+      "plan": "run20_plan.json",
+      "snapshot": "run20_snapshot",
+      "whitelist": "ruoyi_common_whitelist.txt",
+      "expect": {
+        "coverage_lt": 100.0,
+        "coverage_ge": 85.0,
+        "missing_layers": ["sql", "html"],
+        "incomplete_entities_min": 2,
+        "dangling_min": 4
+      }
+    }
+  ]
+}

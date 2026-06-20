@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ruoyi.alarm.mapper.AlarmNotifyUserMapper">
+
+    <resultMap type="com.ruoyi.alarm.domain.AlarmNotifyUser" id="AlarmNotifyUserResult">
+        <id property="userId" column="user_id"/>
+        <result property="userName" column="user_name"/>
+        <result property="slackId" column="slack_id"/>
+        <result property="wechatWorkId" column="wechat_work_id"/>
+        <result property="email" column="email"/>
+        <result property="phone" column="phone"/>
+        <result property="innerPushId" column="inner_push_id"/>
+        <result property="voipId" column="voip_id"/>
+        <result property="status" column="status"/>
+        <result property="createBy" column="create_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateBy" column="update_by"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="remark" column="remark"/>
+    </resultMap>
+
+    <sql id="selectAlarmNotifyUserVo">
+        select user_id, user_name, slack_id, wechat_work_id, email, phone, inner_push_id, voip_id, status, create_by, create_time, update_by, update_time, remark
+        from alarm_notify_user
+    </sql>
+
+    <select id="selectAlarmNotifyUserById" parameterType="Long" resultMap="AlarmNotifyUserResult">
+        <include refid="selectAlarmNotifyUserVo"/>
+        where user_id = #{userId}
+    </select>
+
+    <select id="selectAlarmNotifyUserList" parameterType="com.ruoyi.alarm.domain.AlarmNotifyUser"
+            resultMap="AlarmNotifyUserResult">
+        <include refid="selectAlarmNotifyUserVo"/>
+        <where>
+            <if test="userName != null and userName != ''">
+                AND user_name like concat('%', #{userName}, '%')
+            </if>
+            <if test="slackId != null and slackId != ''">
+                AND slack_id like concat('%', #{slackId}, '%')
+            </if>
+            <if test="wechatWorkId != null and wechatWorkId != ''">
+                AND wechat_work_id like concat('%', #{wechatWorkId}, '%')
+            </if>
+            <if test="email != null and email != ''">
+                AND email like concat('%', #{email}, '%')
+            </if>
+            <if test="phone != null and phone != ''">
+                AND phone like concat('%', #{phone}, '%')
+            </if>
+            <if test="status != null and status != ''">
+                AND status = #{status}
+            </if>
+        </where>
+        order by create_time desc
+    </select>
+
+    <insert id="insertAlarmNotifyUser" parameterType="com.ruoyi.alarm.domain.AlarmNotifyUser"
+            useGeneratedKeys="true" keyProperty="userId">
+        insert into alarm_notify_user
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <if test="userName != null and userName != ''">user_name,</if>
+            <if test="slackId != null">slack_id,</if>
+            <if test="wechatWorkId != null">wechat_work_id,</if>
+            <if test="email != null">email,</if>
+            <if test="phone != null">phone,</if>
+            <if test="innerPushId != null">inner_push_id,</if>
+            <if test="voipId != null">voip_id,</if>
+            <if test="status != null">status,</if>
+            <if test="createBy != null and createBy != ''">create_by,</if>
+            <if test="remark != null">remark,</if>
+            create_time
+        </trim>
+        values
+        <trim suffix=")">
+            <if test="userName != null and userName != ''">#{userName},</if>
+            <if test="slackId != null">#{slackId},</if>
+            <if test="wechatWorkId != null">#{wechatWorkId},</if>
+            <if test="email != null">#{email},</if>
+            <if test="phone != null">#{phone},</if>
+            <if test="innerPushId != null">#{innerPushId},</if>
+            <if test="voipId != null">#{voipId},</if>
+            <if test="status != null">#{status},</if>
+            <if test="createBy != null and createBy != ''">#{createBy},</if>
+            <if test="remark != null">#{remark},</if>
+            sysdate()
+        </trim>
+    </insert>
+
+    <update id="updateAlarmNotifyUser" parameterType="com.ruoyi.alarm.domain.AlarmNotifyUser">
+        update alarm_notify_user
+        <set>
+            <if test="userName != null and userName != ''">user_name = #{userName},</if>
+            <if test="slackId != null">slack_id = #{slackId},</if>
+            <if test="wechatWorkId != null">wechat_work_id = #{wechatWorkId},</if>
+            <if test="email != null">email = #{email},</if>
+            <if test="phone != null">phone = #{phone},</if>
+            <if test="innerPushId != null">inner_push_id = #{innerPushId},</if>
+            <if test="voipId != null">voip_id = #{voipId},</if>
+            <if test="status != null">status = #{status},</if>
+            <if test="updateBy != null and updateBy != ''">update_by = #{updateBy},</if>
+            <if test="remark != null">remark = #{remark},</if>
+            update_time = sysdate()
+        </set>
+        where user_id = #{userId}
+    </update>
+
+    <delete id="deleteAlarmNotifyUserByIds" parameterType="Long">
+        delete from alarm_notify_user where user_id in
+        <foreach collection="array" item="userId" open="(" separator="," close=")">
+            #{userId}
+        </foreach>
+    </delete>
+
+    <select id="selectAlarmNotifyUserByIds" parameterType="java.util.List"
+            resultMap="AlarmNotifyUserResult">
+        <include refid="selectAlarmNotifyUserVo"/>
+        where user_id in
+        <foreach collection="list" item="userId" open="(" separator="," close=")">
+            #{userId}
+        </foreach>
+    </select>
+
+</mapper>

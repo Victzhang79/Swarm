@@ -1,0 +1,80 @@
+{
+  "fixtures": [
+    {
+      "run": "RUN20",
+      "snapshot_counts": {
+        "java": 72,
+        "xml": 12,
+        "html": 3,
+        "sql": 0
+      },
+      "coverage": {
+        "expected": 95,
+        "present": 88,
+        "coverage_pct": 92.6,
+        "missing_by_layer": {
+          "pom": 1,
+          "html": 1,
+          "sql": 5
+        },
+        "missing": [
+          "ruoyi-admin/pom.xml",
+          "ruoyi-admin/src/main/resources/templates/alarm/user/edit.html",
+          "sql/alarm_app.sql",
+          "sql/alarm_schedule.sql",
+          "sql/alarm_task.sql",
+          "sql/alarm_task_menu.sql",
+          "sql/alarm_user.sql"
+        ]
+      },
+      "layering": {
+        "entities_total": 10,
+        "incomplete": {
+          "AlarmScheduleGroup": [
+            "service",
+            "serviceImpl",
+            "controller"
+          ],
+          "AlarmTaskChannel": [
+            "service",
+            "serviceImpl",
+            "controller"
+          ]
+        }
+      },
+      "convention": {
+        "preauthorize": [],
+        "spring_security": [],
+        "controller_no_basecontroller": [
+          "ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/NotifyApiController.java",
+          "ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/NotifyCallbackController.java"
+        ]
+      },
+      "dangling": {
+        "produced_classes": 72,
+        "whitelist_classes": 164,
+        "dangling": [
+          {
+            "file": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/NotifyCallbackController.java",
+            "symbol": "com.ruoyi.alarm.dto.CallbackRequest"
+          },
+          {
+            "file": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/NotifyCallbackController.java",
+            "symbol": "com.ruoyi.alarm.dto.NotifyResponse"
+          },
+          {
+            "file": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/NotifyCallbackController.java",
+            "symbol": "com.ruoyi.alarm.service.IAlarmEngineService"
+          },
+          {
+            "file": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/impl/NotifyApiServiceImpl.java",
+            "symbol": "com.ruoyi.alarm.service.IAlarmEngineService"
+          }
+        ]
+      },
+      "total_defects": 15,
+      "expectations_met": true,
+      "notes": []
+    }
+  ]
+}
