@@ -434,34 +434,39 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
         logger.warning("删除项目 %s 前写任务审计失败: %s", project_id, exc)
 
     with _get_conn(conn_str) as conn:
-        with conn.cursor() as cur:
-            # 级联删除该项目所有关联数据（修复 12.5：此前仅删 task_records +
-            # preprocess_progress + projects，残留 kb_*/mem_* 行成为孤立数据，长期膨胀）。
-            # 全部在同一事务内，要么全删要么回滚。Qdrant 向量在路由层事务外 best-effort 清理。
-            cur.execute("DELETE FROM task_records WHERE project_id = %s", (project_id,))
-            cur.execute("DELETE FROM preprocess_progress WHERE project_id = %s", (project_id,))
-            # 知识库 Layer A/C/D + 增量队列
-            for tbl in (
-                "kb_file_index",
-                "kb_symbol_index",
-                "kb_dependency_graph",
-                "kb_norms",
-                "kb_modification_log",
-                "kb_co_occurrence",
-                "kb_update_events",
-                "kb_pending_embeddings",
-            ):
-                _delete_if_table_exists(cur, tbl, project_id)
-            # 记忆 L1/L2/L5/L6（向量随行一并删）
-            for tbl in (
-                "mem_user_profile",
-                "mem_task_summary",
-                "mem_mistakes",
-                "mem_successes",
-            ):
-                _delete_if_table_exists(cur, tbl, project_id)
-            cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
-            deleted = cur.rowcount
+        # A-P1-23 修复：池连接是 autocommit，每条 DELETE 各自落库，原注释「全部在同一
+        # 事务内、要么全删要么回滚」是假话——中途任一句失败会留下半删的孤立数据。
+        # psycopg 在 autocommit 连接上也支持 conn.transaction()：它会显式 BEGIN，块内
+        # 所有 DELETE 在一个事务里，块正常退出才 COMMIT，抛异常则整体 ROLLBACK，
+        # 真正做到级联删除原子化。Qdrant 向量在路由层事务外 best-effort 清理。
+        with conn.transaction():
+            with conn.cursor() as cur:
+                # 级联删除该项目所有关联数据（修复 12.5：此前仅删 task_records +
+                # preprocess_progress + projects，残留 kb_*/mem_* 行成为孤立数据，长期膨胀）。
+                cur.execute("DELETE FROM task_records WHERE project_id = %s", (project_id,))
+                cur.execute("DELETE FROM preprocess_progress WHERE project_id = %s", (project_id,))
+                # 知识库 Layer A/C/D + 增量队列
+                for tbl in (
+                    "kb_file_index",
+                    "kb_symbol_index",
+                    "kb_dependency_graph",
+                    "kb_norms",
+                    "kb_modification_log",
+                    "kb_co_occurrence",
+                    "kb_update_events",
+                    "kb_pending_embeddings",
+                ):
+                    _delete_if_table_exists(cur, tbl, project_id)
+                # 记忆 L1/L2/L5/L6（向量随行一并删）
+                for tbl in (
+                    "mem_user_profile",
+                    "mem_task_summary",
+                    "mem_mistakes",
+                    "mem_successes",
+                ):
+                    _delete_if_table_exists(cur, tbl, project_id)
+                cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
+                deleted = cur.rowcount
     return deleted > 0
 
 

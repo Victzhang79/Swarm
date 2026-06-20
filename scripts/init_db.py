@@ -15,7 +15,6 @@ setup.sh 在 PG 就绪后调用本脚本完成建表；应用启动钩子（api/
 
 from __future__ import annotations
 
-import asyncio
 import sys
 
 
@@ -150,18 +149,17 @@ def main() -> int:
     print(f"🗄️  初始化数据库: {shown}")
 
     try:
-        _ensure_pgvector(conn_str)
-        _ensure_sync_tables()
-        # memory 表（含 mem_user_profile）必须先于 auth：auth 的 _PROFILE_MIGRATION
-        # 会 ALTER mem_user_profile，bootstrap admin 也会写它。全新空库若顺序反了
-        # 会报 'relation "mem_user_profile" does not exist'（CI 实测复现）。
-        asyncio.run(_ensure_async_tables())
-        _ensure_auth_tables()
+        # W2.2：统一走轻量迁移运行器。它内部用 to_regclass 探针决策——
+        # 既有库只「盖章」基线不重跑 DDL，全新库才按本模块的确切顺序跑基线 DDL
+        # （memory 先于 auth）。helper 函数(_ensure_*)仍是单一事实来源，被 runner 复用。
+        from swarm.infra.migrations import run_migrations
+
+        run_migrations(conn_str)
     except Exception as exc:  # noqa: BLE001
         print(f"\n❌ 建表失败: {exc}", file=sys.stderr)
         return 1
 
-    print("\n✅ 全部数据表就绪（schema 由各业务模块统一定义）")
+    print("\n✅ 全部数据表就绪（schema 由各业务模块统一定义，迁移由 schema_version 追踪）")
     return 0
 
 
