@@ -503,6 +503,14 @@ def _try_three_way_resolve(
     sid_a, sid_b = subtask_ids[0], subtask_ids[1]
     merged_text, ok = three_way_merge_text(base_raw, versions[sid_a], versions[sid_b])
 
+    # 链式三方折叠累加 >2 个子任务的改动。base 必须始终保持 base_raw（=HEAD，
+    # 所有 versions[sid] 唯一的共同祖先），绝不能"演进"成上一轮的 merged_text：
+    # 每次 three_way_merge_text(base_raw, merged_text, versions[C]) 等价于
+    # git merge-file ours=merged_text base=base_raw theirs=C，三方算法据共同祖先
+    # base_raw 算出 C 相对祖先的改动并叠加到 merged_text，正确累加 base+A+B+C。
+    # 若把 base 换成 merged_text(已含 A+B)，C 相对它的 diff 会把 A/B 的新增内容
+    # 误判为"需删除"，从而丢掉更早分支的改动——这是回归，故 base 固定不变。
+    # 特征化保护见 test/test_merge_engine_nway.py。
     if len(subtask_ids) > 2:
         for sid in subtask_ids[2:]:
             merged_text, ok2 = three_way_merge_text(base_raw, merged_text, versions[sid])
