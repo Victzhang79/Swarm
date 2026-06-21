@@ -98,9 +98,13 @@ def test_app_stats_gated():
 
 
 def test_worker_stream_gated():
+    # A-P1-28：worker 进度流升级为按【run 归属项目】的所有权校验(task:read)，
+    # 而非仅验认证——杜绝任一已认证用户拿 run_id 即读他人 worker 流。
     from swarm.api.routers import worker
 
-    assert "_require_user" in _src(worker.stream_worker_run)
+    src = _src(worker.stream_worker_run)
+    assert "get_worker_run_project" in src
+    assert '_require_perm(request, "task:read"' in src
 
 
 def test_all_swept_perm_strings_valid():

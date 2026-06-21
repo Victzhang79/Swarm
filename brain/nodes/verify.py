@@ -111,11 +111,18 @@ async def verify_l2(state: BrainState) -> dict:
                 return _l2_failure_state(subtask_results)
             return {"l2_passed": local_result}
     elif (merged_diff or "").strip() and not test_cmd.strip():
-        # 任务未要求测试（criteria 无显式测试命令）→ 跳过测试验证。
-        # integration_review（编译+契约+git apply 同源）已通过，即视为 L2 通过，
-        # 不因无谓/写死框架的测试而误判（task dc1ec890）。
-        logger.info("[VERIFY_L2] 无显式测试命令，integration_review 已通过 → L2 通过（跳过测试验证）")
-        return {"l2_passed": True}
+        # 任务未要求测试（criteria 无显式测试命令）→ 跳过功能测试验证。
+        # integration_review（编译+契约+git apply 同源）已作为确定性证据通过，故【放行】
+        # L2，不因无谓/写死框架的测试而误判（task dc1ec890），更不会硬卡 docs/config 这类
+        # 本就无测试的任务。
+        # A-P1-06（诚实/可见性，非阻断）：编译通过 ≠ 功能正确，且本路径未跑任何功能测试，
+        # 因此打一条 degraded 标记 l2_no_test_executed，让交付/确认环节看得见"L2 未经测试
+        # 验证"，避免静默当成"已测通过"。仍 l2_passed=True 放行。
+        logger.info(
+            "[VERIFY_L2] 无显式测试命令，integration_review 已通过 → L2 放行"
+            "（未跑功能测试，标记 degraded: l2_no_test_executed）"
+        )
+        return {"l2_passed": True, "degraded_reasons": ["l2_no_test_executed"]}
 
     l2_passed = await nodes._verify_l2_via_llm(
         task_description,

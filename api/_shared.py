@@ -73,8 +73,37 @@ def _mask_api_key(value: str) -> str:
     # 通用脱敏: 前4后4
     return f"{value[:4]}...{value[-4:]}"
 
+# A-P1-30：以下 webhook 提供方把【机器人 token 嵌在 URL 路径/查询里】，
+# 该 token 本身即凭据——webhook_url 必须脱敏，不能明文出现在 GET /config 等响应中。
+_WEBHOOK_HOST_HINTS = (
+    "open.feishu.cn", "open.larksuite.com",          # 飞书/Lark
+    "oapi.dingtalk.com",                             # 钉钉
+    "qyapi.weixin.qq.com",                           # 企业微信
+    "hooks.slack.com", "discord.com/api/webhooks",   # Slack / Discord
+    "discordapp.com/api/webhooks",
+)
+
+
+def _is_webhook_url(key_lower: str, value: str) -> bool:
+    """key 名为 webhook_url，或 *_url 且 host 命中已知 webhook 提供方 → 视为含凭据需脱敏。"""
+    if "webhook_url" in key_lower:
+        return True
+    if key_lower.endswith("_url") or key_lower == "url":
+        low = value.lower()
+        return any(h in low for h in _WEBHOOK_HOST_HINTS)
+    return False
+
+
+def _mask_webhook_url(value: str) -> str:
+    """脱敏 webhook URL：保留协议+host 头部与尾部少量字符，隐去含 token 的中段。"""
+    if not value or len(value) <= 24:
+        # 太短：整体隐去中段，避免短 token 全暴露
+        return _mask_api_key(value) if value and len(value) >= 12 else value
+    return f"{value[:20]}…{value[-6:]}"
+
+
 def _mask_config_dict(cfg: dict) -> dict:
-    """递归脱敏配置中的 API Key 字段"""
+    """递归脱敏配置中的 API Key / webhook_url 字段（token 即凭据）"""
     out: dict[str, Any] = {}
     for k, v in cfg.items():
         key_lower = k.lower()
@@ -82,8 +111,15 @@ def _mask_config_dict(cfg: dict) -> dict:
             p in key_lower for p in ("api_key", "apikey", "secret", "password")
         ):
             out[k] = _mask_api_key(v)
+        elif isinstance(v, str) and _is_webhook_url(key_lower, v):
+            out[k] = _mask_webhook_url(v)
         elif isinstance(v, dict):
             out[k] = _mask_config_dict(v)
+        elif isinstance(v, list):
+            out[k] = [
+                _mask_config_dict(item) if isinstance(item, dict) else item
+                for item in v
+            ]
         else:
             out[k] = v
     return out

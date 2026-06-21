@@ -77,7 +77,10 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
 
     parsed = dict(parsed)
     parsed.setdefault("source", "learn_success")
-    l2 = build_l2_summary(state, outcome="success", parsed=parsed)
+    # A-P1-05：部分交付(放弃了子任务)= 终态 PARTIAL，L2 摘要如实记 outcome=partial，
+    # 不得标 success；should_write_success 已同源拦下 L6 成功模式的写入。
+    _outcome = "partial" if state.get("abandoned_subtask_ids") else "success"
+    l2 = build_l2_summary(state, outcome=_outcome, parsed=parsed)
     success_payload = build_success_payload(state, parsed)
 
     store = MemoryStore()
@@ -123,7 +126,7 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
                 TaskSummary(
                     task_id=task_id or "unknown",
                     summary=l2["summary"],
-                    outcome="success",
+                    outcome=_outcome,
                     lessons_learned=(
                         str(l2["lessons_learned"])[:500] if l2.get("lessons_learned") else None
                     ),

@@ -58,9 +58,19 @@ async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Requ
 @router.get("/api/worker/{run_id}/stream", tags=["Worker"])
 async def stream_worker_run(run_id: str, request: Request):
     """SSE 订阅 Standalone Worker 进度"""
-    from swarm.api._shared import _require_user
-    _require_user(request)  # P0-SEC-03：worker 进度流至少需认证（run_id 非项目映射）
-    from swarm.worker.runner import get_worker_queue, register_worker_queue
+    from swarm.worker.runner import (
+        get_worker_queue,
+        get_worker_run_project,
+        register_worker_queue,
+    )
+
+    # A-P1-28：run 进度流必须按【该 run 归属项目】做所有权/成员校验（task:read），
+    # 而非只验认证——否则任一已认证用户拿到 run_id 即可订阅他人 worker 流（越权读）。
+    # 未知 run_id（无映射）一律 404，fail-closed：既不泄露存在性，也不为任意 run_id 建队。
+    project_id = get_worker_run_project(run_id)
+    if project_id is None:
+        raise HTTPException(status_code=404, detail=f"Worker run {run_id} not found")
+    _require_perm(request, "task:read", project_id)
 
     queue = get_worker_queue(run_id) or register_worker_queue(run_id)
 

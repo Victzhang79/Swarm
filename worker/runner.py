@@ -17,10 +17,24 @@ logger = logging.getLogger(__name__)
 
 _worker_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 _worker_running: set[str] = set()
+# A-P1-28：run_id → project_id 映射(进程内，与 _worker_queues 同生命周期)。
+# worker 进度流(GET /api/worker/{run_id}/stream)凭此对该项目做成员/权限校验，
+# 杜绝"任一已认证用户拿到 run_id 即可读他人 worker 流"的越权。
+_worker_run_project: dict[str, str] = {}
 
 
 def get_worker_queue(run_id: str) -> asyncio.Queue[dict[str, Any]] | None:
     return _worker_queues.get(run_id)
+
+
+def register_worker_run_project(run_id: str, project_id: str) -> None:
+    """记录 run_id 归属的 project_id(供 stream 端点做所有权校验)。"""
+    _worker_run_project[run_id] = project_id
+
+
+def get_worker_run_project(run_id: str) -> str | None:
+    """取 run_id 归属的 project_id；未知 run_id 返回 None。"""
+    return _worker_run_project.get(run_id)
 
 
 def register_worker_queue(run_id: str) -> asyncio.Queue[dict[str, Any]]:
@@ -160,6 +174,7 @@ def start_standalone_worker_background(
     **kwargs: Any,
 ) -> None:
     register_worker_queue(run_id)
+    register_worker_run_project(run_id, project_id)  # A-P1-28：记录归属项目供 stream 鉴权
     asyncio.create_task(
         run_standalone_worker(run_id, project_id, description, **kwargs)
     )

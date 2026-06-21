@@ -13,6 +13,11 @@ SUCCESS_WRITE_MIN_COMPLEXITY = {Complexity.MEDIUM, Complexity.COMPLEX, Complexit
 
 
 def should_write_success(state: BrainState) -> bool:
+    # A-P1-05：部分交付(abandoned_subtask_ids 非空)= 任务【未完成】(终态 PARTIAL)，
+    # 绝不能把它当"成功模式"写进 L6——否则会把"放弃了若干子任务"的残缺执行提炼成
+    # 可复用成功经验，污染知识库并误导后续任务复用。单一事实源在此收口。
+    if state.get("abandoned_subtask_ids"):
+        return False
     complexity = state.get("complexity")
     if isinstance(complexity, str):
         try:
