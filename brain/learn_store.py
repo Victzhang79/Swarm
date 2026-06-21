@@ -83,49 +83,53 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
     store = MemoryStore()
     await store.connect()
     try:
+        # A-P1-26：L6 成功模式(写新 / reuse_count++) 与 L2 任务摘要 包进单事务。
+        # 否则 step-1(写 success / 强化复用计数) 成功而 step-2(写 task_summary) 失败时，
+        # 会留下孤儿成功记录 + 已自增的 reuse_count（双重计数），下次仍可被强化，污染权重。
         success_id = None
-        if should_write_success(state):
-            metadata = {
-                "key_decisions": _as_list(parsed.get("key_decisions")),
-                "lessons_learned": _as_list(parsed.get("lessons_learned")),
-                "tags": success_payload.get("tags", []),
-                "code_snippet": success_payload.get("code_snippet", ""),
-                "source": "learn_success",
-            }
-            reinforced_id = await _maybe_reinforce_success(
-                store, project_id, success_payload["description"]
-            )
-            if reinforced_id is not None:
-                success_id = reinforced_id
-                logger.info("[LEARN_STORE] L6 成功模式复用，强化已有 id=%s(reuse_count++)", success_id)
-            else:
-                success_id = await store.write_success(
-                    project_id,
-                    SuccessEntry(
-                        pattern_name=success_payload["pattern_name"],
-                        description=success_payload["description"],
-                        approach=success_payload.get("approach"),
-                        applicable_when=success_payload.get("applicable_when"),
-                        task_id=task_id or None,
-                        metadata=metadata,
-                    ),
+        async with store.transaction():
+            if should_write_success(state):
+                metadata = {
+                    "key_decisions": _as_list(parsed.get("key_decisions")),
+                    "lessons_learned": _as_list(parsed.get("lessons_learned")),
+                    "tags": success_payload.get("tags", []),
+                    "code_snippet": success_payload.get("code_snippet", ""),
+                    "source": "learn_success",
+                }
+                reinforced_id = await _maybe_reinforce_success(
+                    store, project_id, success_payload["description"]
                 )
-                logger.info("[LEARN_STORE] L6 成功模式 id=%s", success_id)
-        else:
-            logger.info("[LEARN_STORE] SIMPLE 任务跳过 L6，仅写 L2")
+                if reinforced_id is not None:
+                    success_id = reinforced_id
+                    logger.info("[LEARN_STORE] L6 成功模式复用，强化已有 id=%s(reuse_count++)", success_id)
+                else:
+                    success_id = await store.write_success(
+                        project_id,
+                        SuccessEntry(
+                            pattern_name=success_payload["pattern_name"],
+                            description=success_payload["description"],
+                            approach=success_payload.get("approach"),
+                            applicable_when=success_payload.get("applicable_when"),
+                            task_id=task_id or None,
+                            metadata=metadata,
+                        ),
+                    )
+                    logger.info("[LEARN_STORE] L6 成功模式 id=%s", success_id)
+            else:
+                logger.info("[LEARN_STORE] SIMPLE 任务跳过 L6，仅写 L2")
 
-        await store.write_task_summary(
-            project_id,
-            TaskSummary(
-                task_id=task_id or "unknown",
-                summary=l2["summary"],
-                outcome="success",
-                lessons_learned=(
-                    str(l2["lessons_learned"])[:500] if l2.get("lessons_learned") else None
+            await store.write_task_summary(
+                project_id,
+                TaskSummary(
+                    task_id=task_id or "unknown",
+                    summary=l2["summary"],
+                    outcome="success",
+                    lessons_learned=(
+                        str(l2["lessons_learned"])[:500] if l2.get("lessons_learned") else None
+                    ),
+                    metadata={**(l2.get("metadata") or {}), "success_id": success_id},
                 ),
-                metadata={**(l2.get("metadata") or {}), "success_id": success_id},
-            ),
-        )
+            )
         return {
             "persisted": True,
             "success_id": success_id,
@@ -166,34 +170,37 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
     store = MemoryStore()
     await store.connect()
     try:
-        reinforced_id = await _maybe_reinforce_mistake(
-            store, project_id, mistake["error_type"], mistake["description"]
-        )
-        if reinforced_id is not None:
-            mistake_id = reinforced_id
-            logger.info("[LEARN_STORE] L5 错题重现，强化已有 id=%s(occurrence_count++)", mistake_id)
-        else:
-            mistake_id = await store.write_mistake(
+        # A-P1-26：L5 错题(写新 / occurrence_count++) 与 L2 摘要 包进单事务，
+        # 避免 step-2 失败留下孤儿错题 + 双重计数的 occurrence_count。
+        async with store.transaction():
+            reinforced_id = await _maybe_reinforce_mistake(
+                store, project_id, mistake["error_type"], mistake["description"]
+            )
+            if reinforced_id is not None:
+                mistake_id = reinforced_id
+                logger.info("[LEARN_STORE] L5 错题重现，强化已有 id=%s(occurrence_count++)", mistake_id)
+            else:
+                mistake_id = await store.write_mistake(
+                    project_id,
+                    MistakeEntry(
+                        error_type=mistake["error_type"],
+                        description=mistake["description"],
+                        context=mistake.get("context"),
+                        fix_description=mistake.get("fix_description"),
+                        task_id=task_id or None,
+                        metadata=metadata,
+                    ),
+                )
+            await store.write_task_summary(
                 project_id,
-                MistakeEntry(
-                    error_type=mistake["error_type"],
-                    description=mistake["description"],
-                    context=mistake.get("context"),
-                    fix_description=mistake.get("fix_description"),
-                    task_id=task_id or None,
-                    metadata=metadata,
+                TaskSummary(
+                    task_id=task_id or "unknown",
+                    summary=l2["summary"],
+                    outcome="failure",
+                    lessons_learned=mistake.get("fix_description"),
+                    metadata={**(l2.get("metadata") or {}), "mistake_id": mistake_id},
                 ),
             )
-        await store.write_task_summary(
-            project_id,
-            TaskSummary(
-                task_id=task_id or "unknown",
-                summary=l2["summary"],
-                outcome="failure",
-                lessons_learned=mistake.get("fix_description"),
-                metadata={**(l2.get("metadata") or {}), "mistake_id": mistake_id},
-            ),
-        )
         logger.info("[LEARN_STORE] L5 错题 id=%s project=%s", mistake_id, project_id)
         return {"persisted": True, "mistake_id": mistake_id, "l2_written": True}
     except Exception as exc:

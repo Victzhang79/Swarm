@@ -104,6 +104,8 @@ async def _test_learn_persist_async():
     )
     from swarm.brain.nodes import learn_success
 
+    from test.conftest import install_noop_transaction
+
     mock_store = AsyncMock()
     mock_store.connect = AsyncMock()
     mock_store.close = AsyncMock()
@@ -113,6 +115,7 @@ async def _test_learn_persist_async():
     # P1-DEBT-03：落库前查相似已有记录决定强化 vs 插新；测试为新记录 → []。
     mock_store.query_successes = AsyncMock(return_value=[])
     mock_store.query_mistakes = AsyncMock(return_value=[])
+    install_noop_transaction(mock_store)  # A-P1-26 事务上下文
 
     state = {
         "project_id": "proj-test",

@@ -428,15 +428,25 @@ def merge_insert_only_changes(base: str, *branches: str) -> str | None:
     if not grouped:
         return base
 
+    # A-P1-26 (a)：同一锚点(anchor)多个分支各插入不同内容，绝非"clean"——之前直接把
+    # 各 chunk 顺序拼接(AAA 后接 BBB)，等于无声吞掉冲突；且同一内容会被重复插两遍(XXX XXX)。
+    # 现：同锚点若插入内容不一致 → 返回 None，交给上层 3-way / 硬冲突路径处理；
+    #     若完全一致 → 去重只留一份。不同锚点彼此独立、照常合并。
+    deduped: dict[int, list[str]] = {}
+    for pos, chunks in grouped.items():
+        first = chunks[0]
+        for other in chunks[1:]:
+            if other != first:
+                return None  # 同锚点冲突插入，拒绝当 clean
+        deduped[pos] = first  # 同内容去重，只保留一份
+
     result: list[str] = []
     for idx, line in enumerate(base_lines):
-        if idx in grouped:
-            for chunk in grouped[idx]:
-                result.extend(chunk)
+        if idx in deduped:
+            result.extend(deduped[idx])
         result.append(line)
-    if len(base_lines) in grouped:
-        for chunk in grouped[len(base_lines)]:
-            result.extend(chunk)
+    if len(base_lines) in deduped:
+        result.extend(deduped[len(base_lines)])
 
     return _join_lines(result)
 

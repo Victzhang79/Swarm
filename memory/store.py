@@ -191,6 +191,17 @@ class MemoryStore:
             raise RuntimeError("MemoryStore not connected — call connect() first")
         return self._conn
 
+    def transaction(self):
+        """A-P1-26：原子地把多次写包进单事务（连接为 autocommit，psycopg 会在块内
+        显式 BEGIN/COMMIT，块中任一步失败则整体回滚）。
+
+        用法:
+            async with store.transaction():
+                await store.write_success(...)
+                await store.write_task_summary(...)
+        """
+        return self._conn_or_raise().transaction()
+
     # ── Embedding 占位 ──────────────────────────
 
     # 模块级标志: 零向量占位只警告一次，避免刷屏

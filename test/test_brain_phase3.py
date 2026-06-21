@@ -135,6 +135,13 @@ BASE_X_PY = "\n".join(
 
 
 def test_merge_engine_overlap_auto_resolve_with_base():
+    """A-P1-26 (a)：两个子任务在【同一锚点】插入【不同】内容，不再被静默拼接成"clean"。
+
+    旧行为（已修正）：merge_insert_only_changes 把 `from st-a` 与 `from st-b` 顺序拼接，
+    当成无冲突合并 —— 这是无声吞冲突。现在同锚点不同内容 → insert-only 返回 None →
+    升级到 3-way；3-way 无法判定取舍 → rebase 策略：保留首个子任务、其余标记待 rebase 重生成。
+    关键是不再"两条都塞进去当没事"。
+    """
     def reader(path: str) -> str | None:
         if path == "x.py":
             return BASE_X_PY
@@ -145,13 +152,34 @@ def test_merge_engine_overlap_auto_resolve_with_base():
         base_reader=reader,
         auto_resolve=True,
     )
+    # 不再静默把两条不同插入都当 clean 合并
+    assert not (
+        "from st-a" in result.merged_diff and "from st-b" in result.merged_diff
+    ), "同锚点不同插入不应被静默拼接：" + result.merged_diff
+    # 升级走 rebase：保留 st-a，st-b 待重生成（安全、可恢复，非无声丢失）
+    assert "st-b" in result.rebase_subtask_ids
+    assert "from st-a" in result.merged_diff
+    print("  ✅ merge_engine — 同锚点不同插入升级冲突(非静默拼接)")
+
+
+def test_merge_engine_same_anchor_identical_insert_dedupes():
+    """A-P1-26 (a)：两个子任务在同一锚点插入【相同】内容 → 去重为一份，不重复两遍。"""
+    def reader(path: str) -> str | None:
+        if path == "x.py":
+            return BASE_X_PY
+        return None
+
+    # 两边插入完全相同的行
+    result = merge_diffs(
+        [("st-a", DIFF_X_OVERLAP_A), ("st-b", DIFF_X_OVERLAP_A.replace("st-a", "st-a"))],
+        base_reader=reader,
+        auto_resolve=True,
+    )
     assert result.success is True, result.merged_diff
     assert result.conflicts == []
-    assert "x.py" in result.merged_diff
-    assert "from st-a" in result.merged_diff
-    assert "from st-b" in result.merged_diff
-    assert "MERGE CONFLICT" not in result.merged_diff
-    print("  ✅ merge_engine — 3-way auto-resolve compatible inserts")
+    # 仅一份，不是两遍
+    assert result.merged_diff.count("from st-a") == 1, result.merged_diff
+    print("  ✅ merge_engine — 同锚点相同插入去重")
 
 
 DIFF_X_REPLACE_A = """--- a/x.py
@@ -628,6 +656,7 @@ def main():
     test_merge_engine_same_file_non_overlapping()
     test_merge_engine_overlapping_conflict()
     test_merge_engine_overlap_auto_resolve_with_base()
+    test_merge_engine_same_anchor_identical_insert_dedupes()
     test_merge_engine_overlap_rebase_on_same_line()
     test_merge_engine_overlap_hard_conflict_without_base()
     test_merge_node_uses_merge_engine()

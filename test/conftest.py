@@ -12,6 +12,23 @@ import pytest
 # 认证相关测试（test_auth_login / test_rbac）直接调用 auth 模块或公开端点，不受影响。
 os.environ.setdefault("SWARM_RBAC_ENABLED", "false")
 
+def install_noop_transaction(mock_store) -> None:
+    """A-P1-26：给 AsyncMock 的 MemoryStore 装一个 no-op 的 transaction() 异步上下文。
+
+    learn_store 现把 L5/L6 + L2 两写包进 `async with store.transaction():`。真实 store
+    返回 psycopg 事务对象；AsyncMock 默认让 store.transaction() 返回 coroutine（非 async CM）
+    会炸。此 helper 让 transaction() 同步返回一个 enter/exit 都 no-op 的异步上下文。
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    @asynccontextmanager
+    async def _txn():
+        yield None
+
+    mock_store.transaction = MagicMock(side_effect=_txn)
+
+
 _path = Path(__file__).parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _path)
 assert _spec and _spec.loader

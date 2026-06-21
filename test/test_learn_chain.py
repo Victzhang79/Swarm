@@ -45,6 +45,8 @@ async def _test_learn_after_accept_writes_memory_async():
     from swarm.brain.learn_store import persist_learn_success
     from swarm.brain.nodes import learn_success
 
+    from test.conftest import install_noop_transaction
+
     mock_store = AsyncMock()
     mock_store.connect = AsyncMock()
     mock_store.close = AsyncMock()
@@ -53,6 +55,7 @@ async def _test_learn_after_accept_writes_memory_async():
     # P1-DEBT-03：learn 落库前会查相似已有记录决定强化 vs 插新；新模式无前例 → []。
     mock_store.query_successes = AsyncMock(return_value=[])
     mock_store.query_mistakes = AsyncMock(return_value=[])
+    install_noop_transaction(mock_store)  # A-P1-26 事务上下文
 
     state = {
         "project_id": "proj-1",

@@ -16,6 +16,77 @@ import pytest
 from swarm.knowledge.readiness import assess_knowledge_readiness
 
 
+# ── A-P1-26 learn_store 事务 ───────────────────────────────
+def test_learn_success_step2_failure_rolls_back(monkeypatch):
+    """step-2(write_task_summary) 失败 → 整个事务回滚，step-1(write_success)被撤销。
+
+    用一个记录式 fake store：transaction() 进入时快照，__aexit__ 收到异常则把
+    success 写入"回滚"（移除）。write_task_summary 抛错 → 验证 success 未持久。
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    from swarm.brain import learn_store
+
+    persisted: dict[str, list] = {"success": [], "task_summary": []}
+    in_txn_writes: list[tuple] = []
+
+    class _FakeStore:
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def query_successes(self, *a, **k):
+            return []
+
+        async def query_mistakes(self, *a, **k):
+            return []
+
+        def transaction(self):
+            @asynccontextmanager
+            async def _cm():
+                in_txn_writes.clear()
+                try:
+                    yield None
+                except Exception:
+                    # 回滚：丢弃本事务内的写
+                    in_txn_writes.clear()
+                    raise
+                else:
+                    # 提交：落库
+                    for kind, val in in_txn_writes:
+                        persisted[kind].append(val)
+            return _cm()
+
+        async def write_success(self, project_id, entry):
+            in_txn_writes.append(("success", 1))
+            return 1
+
+        async def write_task_summary(self, project_id, summary):
+            raise RuntimeError("step-2 boom")
+
+    monkeypatch.setattr(learn_store, "MemoryStore", _FakeStore)
+
+    state = {
+        "project_id": "proj-1",
+        "task_id": "t1",
+        "task_description": "add feature",
+        "complexity": "medium",
+        "merged_diff": "diff",
+    }
+    meta = asyncio.run(learn_store.persist_learn_success(state, {
+        "pattern_name": "p",
+        "pattern_description": "d",
+        "applicable_scenarios": [],
+    }))
+    assert meta["persisted"] is False
+    # step-1 不应留下孤儿 success
+    assert persisted["success"] == [], persisted
+    assert persisted["task_summary"] == []
+
+
 # ── A-P1-20 ───────────────────────────────────────────────
 def test_retrieve_knowledge_crash_sets_retrieval_failed():
     """检索整体崩溃时返回空知识，并显式置 retrieval_failed=True + error。"""
