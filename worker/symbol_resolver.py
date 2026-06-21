@@ -35,7 +35,7 @@ class MissingSymbol:
 @dataclass
 class SymbolHint:
     name: str
-    status: str                              # resolved | planned | absent
+    status: str                              # resolved | planned | absent | unverified
     real_fqns: list[str] = field(default_factory=list)   # codegraph 查到的真实 FQN
     planned_paths: list[str] = field(default_factory=list)  # plan 里将创建它的文件
     message: str = ""
@@ -74,12 +74,19 @@ def build_symbol_hints(
     missing: list[MissingSymbol],
     resolved: dict[str, list[str]],
     plan_create_files: list[str] | None = None,
+    query_failed: set[str] | None = None,
 ) -> list[SymbolHint]:
     """组装提示(纯函数)。
     resolved: {符号名: [codegraph 查到的真实 FQN]}（调用方据 codegraph 预取，已按精确名过滤）。
     plan_create_files: 整个 plan 将创建的文件全集 → 判断"是 sibling 子任务将建(等它)"。
+    query_failed: codegraph 查询【失败(异常)】的符号名集合 → 与"查到=不存在"严格区分。
+
+    A-P1-11：codegraph 查询失败(DB 未连/超时)旧实现把 rows 当空 → 误判"符号在整个项目
+    中不存在"→ 反向误导模型臆造新类。修复：查询失败的符号标 status=unverified，措辞改为
+    "无法核实(查询失败)"，绝不断言不存在。仅【真查到为空】才判 absent。
     """
     plan_files = plan_create_files or []
+    failed = query_failed or set()
     hints: list[SymbolHint] = []
     for ms in missing:
         if ms.kind not in ("class", "interface", "enum"):
@@ -102,6 +109,13 @@ def build_symbol_hints(
                 name=name, status="planned", planned_paths=planned,
                 message=(f"符号 `{name}` 由其它子任务创建于 {planned}（尚未就绪）。"
                          "确保依赖该子任务先完成，勿自行臆造。"),
+            ))
+        elif name in failed:
+            # 查询失败 ≠ 不存在：不下"项目中不存在"结论，避免反向误导模型臆造新类。
+            hints.append(SymbolHint(
+                name=name, status="unverified",
+                message=(f"符号 `{name}` 无法核实（codegraph 查询失败，非「不存在」）。"
+                         "请优先在项目中搜索其真实包路径后再引用，切勿据此臆造新类或包名。"),
             ))
         else:
             hints.append(SymbolHint(
@@ -138,13 +152,16 @@ async def resolve_and_format(
         if not missing:
             return ""
         resolved: dict[str, list[str]] = {}
+        query_failed: set[str] = set()  # A-P1-11：查询失败(异常)的符号，与"查到为空"区分
         for ms in missing:
             if ms.kind not in ("class", "interface", "enum"):
                 continue
             try:
                 rows = await indexer.query_symbols_by_name(project_id, ms.name)
             except Exception:  # noqa: BLE001
-                rows = []
+                # 查询失败 ≠ 符号不存在：标记失败，下游措辞为"无法核实"而非"不存在"
+                query_failed.add(ms.name)
+                continue
             fqns: list[str] = []
             for r in rows or []:
                 # ILIKE 模糊 → 精确名过滤（symbol_name 或 class_name 精确等于）
@@ -154,7 +171,7 @@ async def resolve_and_format(
                         fqns.append(fqn)
             if fqns:
                 resolved[ms.name] = fqns
-        hints = build_symbol_hints(missing, resolved, plan_create_files)
+        hints = build_symbol_hints(missing, resolved, plan_create_files, query_failed)
         return format_symbol_hints(hints)
     except Exception:  # noqa: BLE001
         return ""

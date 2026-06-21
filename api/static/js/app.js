@@ -67,6 +67,8 @@ function startPollers() {
 
   statusInterval = setInterval(() => {
     if (!getAuthToken()) return;
+    // W3.1：会话过期则主动清理并弹重登，避免后台轮询持续 401。
+    if (typeof enforceSessionExpiry === 'function' && enforceSessionExpiry()) return;
     fetchStatus();
     checkHealth();
   }, 5000);

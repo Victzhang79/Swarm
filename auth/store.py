@@ -269,6 +269,46 @@ def get_user_by_token(token: str, conn_str: str | None = None) -> SwarmUser | No
     return _row_to_user(row) if row else None
 
 
+def set_token_expiry(
+    user_id: str, ttl_hours: int, conn_str: str | None = None
+) -> str | None:
+    """W3.1：把用户 token 的有效期刷新为 now()+ttl_hours（登录时调用，滑动续期）。
+
+    ttl_hours<=0 → 视为永不过期：清空 token_expires_at（NULL）并返回 None。
+    >0 → 设为 now()+interval 并返回 ISO8601 expires_at 字符串供登录响应回传。
+    顺带清掉 token_revoked（重新登录成功即视为恢复该 token 的可用性）。
+    """
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            if ttl_hours and ttl_hours > 0:
+                cur.execute(
+                    """
+                    UPDATE swarm_users
+                       SET token_expires_at = now() + (%s || ' hours')::interval,
+                           token_revoked = false,
+                           updated_at = now()
+                     WHERE id = %s
+                    RETURNING token_expires_at
+                    """,
+                    (str(int(ttl_hours)), user_id),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                if row and row[0] is not None:
+                    return row[0].isoformat()
+                return None
+            cur.execute(
+                """
+                UPDATE swarm_users
+                   SET token_expires_at = NULL, token_revoked = false, updated_at = now()
+                 WHERE id = %s
+                """,
+                (user_id,),
+            )
+            conn.commit()
+    return None
+
+
 def revoke_user_token(user_id: str, conn_str: str | None = None) -> bool:
     """P0-SEC-01：吊销某用户当前 API token（泄露应急）。返回是否更新到行。"""
     with _pooled_conn(conn_str) as conn:

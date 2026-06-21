@@ -90,6 +90,121 @@ def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tupl
         return 1, str(exc)
 
 
+# ── 沙箱优先的确定性检查执行（A-P1-10）──
+# compile/lint 旧实现一律本地 subprocess：沙箱模式下本地只 pull-back 了【可写文件】，
+# 工程其余部分(依赖/兄弟源码/manifest)不在本地 → 整树工具(tsc/go vet/cargo clippy/
+# eslint/checkstyle)在【部分树】上跑出假 PASS(找不到东西→exit 0)或假错(解析不到 import)。
+# 修复：把这些"需要完整工程树+目标工具链"的检查走与 _run_l1_command 同款沙箱优先，
+# 在沙箱里对真实完整树执行；无沙箱才本地兜底。(逐文件的 py_compile/ruff/格式化器仍
+# 本地——可写文件已 pull-back，逐文件检查本地即正确，且 ruff 是本仓工具未必在目标沙箱。)
+
+def _sandbox_ctx() -> tuple[Any, Any, str] | None:
+    """返回 (sandbox, manager, remote_workdir) 或 None(无活跃沙箱)。"""
+    try:
+        from swarm.tools.build_tools import get_sandbox_context
+        sandbox, manager = get_sandbox_context()
+    except Exception:  # noqa: BLE001
+        return None
+    if sandbox is None or manager is None or not hasattr(manager, "run_command"):
+        return None
+    try:
+        from swarm.config.settings import get_config
+        remote = get_config().sandbox.sandbox_remote_workdir
+    except Exception:  # noqa: BLE001
+        remote = "/workspace"
+    return sandbox, manager, remote
+
+
+def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
+    """运行确定性检查命令，沙箱优先，返回 (exit_code, stdout, stderr)。
+
+    stdout/stderr 保持分离(不像 _run_l1_command 合并)，以便结构化解析 eslint/tsc 的
+    JSON 输出。活跃沙箱 → cd 远程工作目录在【完整真实树】上执行；否则本地兜底。
+    """
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        cr = manager.run_command(sandbox, f"cd {remote} && {shell_cmd}", timeout=timeout)
+        out, err = (cr.stdout or ""), (cr.stderr or "")
+        if cr.success:
+            return 0, out, err
+        ec = 1
+        if cr.error and "exit_code=" in cr.error:
+            try:
+                ec = int(cr.error.split("exit_code=")[1].split()[0])
+            except (ValueError, IndexError):
+                ec = 1
+        if cr.error and not err:
+            err = cr.error
+        return ec, out, err
+    try:
+        proc = subprocess.run(
+            _normalize_python_cmd(shell_cmd), cwd=project_path, shell=True,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timeout"
+    except Exception as exc:  # noqa: BLE001
+        return 1, "", str(exc)
+
+
+def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
+    """工程 manifest(go.mod/Cargo.toml/package.json…)是否存在，沙箱优先。
+
+    沙箱模式下本地只有可写文件，manifest 多半不在本地——旧的 os.path.isfile(本地)
+    会误判"无 manifest 而跳过 lint"。沙箱里在远程工作目录(深度 3 内)查。
+    """
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        names = " -o ".join(f"-name {m!r}" for m in manifests)
+        try:
+            cr = manager.run_command(
+                sandbox,
+                f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",
+                timeout=20,
+            )
+            return bool((cr.stdout or "").strip())
+        except Exception:  # noqa: BLE001
+            return False
+    return any(os.path.isfile(os.path.join(project_path, m)) for m in manifests)
+
+
+# ── 基础设施/工具瞬时错误识别（A-P1-09）──
+# Go/Rust/Java lint 旧实现"非0退出 + 任意 stderr 即 has_error"，把【无网拉依赖、工具缺失、
+# 文件锁、磁盘满、系统资源】等瞬时基础设施/工具故障误判成"代码能力失败"→ 触发错误降级
+# (换更弱模型/abandon)。修复：lint 输出命中下列【明确属基础设施/工具】的标记时，判 skip
+# (非 error)。只收"明确非代码问题"的标记——通用编译错误(模型引错符号)仍算真错误，不放过。
+_LINT_INFRA_MARKERS: tuple[str, ...] = (
+    # 网络/拉依赖
+    "dial tcp", "connection refused", "connection reset", "i/o timeout",
+    "tls handshake timeout", "network is unreachable", "could not resolve host",
+    "temporary failure in name resolution", "no such host", "proxyconnect",
+    "502 bad gateway", "503 service", "504 gateway", "timeout was reached",
+    "operation timed out", "error sending request",
+    "go: downloading", "go: download", "reading https://", "could not download",
+    "failed to download", "failed to fetch", "spurious network error",
+    "registry index was not found", "unable to get packages",
+    # 文件锁/并发
+    "blocking waiting for file lock", "waiting for file lock",
+    # 系统资源
+    "no space left on device", "read-only file system", "cannot allocate memory",
+    "out of memory", "disk quota exceeded", "too many open files",
+    # 工具本身缺失(目标沙箱未必装 go/cargo/checkstyle/eslint)
+    "command not found", "executable file not found", ": not found",
+    "is not recognized as an internal or external command",
+)
+
+
+def _is_infra_failure(text: str) -> bool:
+    """lint/编译输出是否为基础设施/工具瞬时故障(非代码能力问题)。"""
+    if not text:
+        return False
+    low = text.lower()
+    return any(mk in low for mk in _LINT_INFRA_MARKERS)
+
+
 # 构建/测试命令 → 该命令运行所【必需的工程描述文件】。缺这些文件时命令必然失败
 # (如 mvn 无 pom.xml、npm 无 package.json)，应优雅跳过而非误判为产出不合格。
 _BUILD_TOOL_MANIFESTS: dict[str, tuple[str, ...]] = {
@@ -233,18 +348,17 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
             return False, f"py_compile execution error: {exc}"
 
     js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]
-    if js_ts and os.path.isfile(os.path.join(project_path, "package.json")):
+    # tsc --noEmit 需要【完整工程树+node_modules】才能解析 import → 走沙箱优先(A-P1-10)。
+    # 沙箱模式下 package.json 不在本地，用 _manifest_present 沙箱感知判定。
+    if js_ts and _manifest_present(("package.json",), project_path):
         try:
-            proc = subprocess.run(
-                "npx tsc --noEmit --pretty false",
-                cwd=project_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if proc.returncode != 0 and "error TS" in (proc.stdout or proc.stderr or ""):
-                return False, (proc.stderr or proc.stdout or "")[:1000]
+            rc, out, err = _run_check_split("npx tsc --noEmit --pretty false", project_path, timeout=timeout)
+            combined = (out or "") + (("\n" + err) if err else "")
+            # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
+            if rc != 0 and _is_infra_failure(combined):
+                logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
+            elif rc != 0 and "error TS" in combined:
+                return False, combined.strip()[:1000]
         except Exception as exc:
             # audit #11：tsc 编译失败可能掩盖真实编译错误，从 debug 升 warning（生产可见）
             logger.warning("[L1.2] tsc 编译跳过（异常）: %s", exc)
@@ -346,29 +460,33 @@ def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tu
     messages: list[str] = []
     issues: list[dict] = []
 
-    has_eslint_config = any(
-        os.path.isfile(os.path.join(project_path, cfg))
-        for cfg in (".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", ".eslintrc", "eslint.config.js")
+    # eslint 需完整工程(node_modules/共享配置)→ 沙箱优先(A-P1-10)。沙箱模式下配置文件
+    # 不在本地，用 _manifest_present 沙箱感知判定。
+    has_eslint_config = _manifest_present(
+        (".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", ".eslintrc", "eslint.config.js"),
+        project_path,
     )
     if not has_eslint_config:
         messages.append("项目无 eslint 配置，跳过 JS/TS lint")
         return has_error, messages, issues
 
     try:
-        proc = subprocess.run(
+        rc, out, err = _run_check_split(
             "npx eslint --format json " + " ".join(f'"{f}"' for f in _cap_files(js_ts, "eslint")),
-            cwd=project_path,
-            shell=True,
-            capture_output=True,
-            text=True,
+            project_path,
             timeout=timeout,
         )
         # eslint 退出码: 0=无问题, 1=有问题, 2=运行错误
-        if proc.returncode == 2:
-            messages.append(f"eslint 运行错误: {proc.stderr[:200]}")
-        elif proc.stdout.strip():
+        if rc == 124:
+            messages.append("eslint 超时")
+        elif rc != 0 and _is_infra_failure((err or "") + (out or "")):
+            # 基础设施/工具瞬时错误(无网装 eslint、网络拉插件)→ skip 非 error(A-P1-09)
+            messages.append(f"eslint 基础设施/工具瞬时错误，跳过(非能力失败): {(err or out)[:200]}")
+        elif rc == 2 and not out.strip():
+            messages.append(f"eslint 运行错误: {err[:200]}")
+        elif out.strip():
             try:
-                eslint_results = json.loads(proc.stdout)
+                eslint_results = json.loads(out)
                 for file_result in eslint_results:
                     for msg in file_result.get("messages", []):
                         sev = "error" if msg.get("severity") == 2 else "warning"
@@ -396,50 +514,46 @@ def _lint_go(project_path: str, go_files: list[str], *, timeout: int = 60) -> tu
     messages: list[str] = []
     issues: list[dict] = []
 
-    go_bin = _find_tool("go")
-    if not go_bin:
+    # go vet ./... 需完整 module 树+工具链 → 沙箱优先(A-P1-10)。无沙箱才要求本地有 go。
+    if _sandbox_ctx() is None and not _find_tool("go"):
         messages.append("go 未安装，跳过 Go lint")
         return has_error, messages, issues
 
-    # 无 go.mod 时 go vet 无法跑，跳过（对齐 eslint 无配置则跳过的风格）
-    if not os.path.isfile(os.path.join(project_path, "go.mod")):
+    # 无 go.mod 时 go vet 无法跑，跳过（沙箱感知判定，对齐 eslint 无配置则跳过的风格）
+    if not _manifest_present(("go.mod",), project_path):
         messages.append("项目无 go.mod，跳过 Go lint")
         return has_error, messages, issues
 
     try:
-        proc = subprocess.run(
-            [go_bin, "vet", "./..."],
-            cwd=project_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            err_output = (proc.stderr or "").strip()
-            if err_output:
-                for line in err_output.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    issue_entry: dict = {
-                        "file": "",
-                        "line": None,
-                        "code": "govet",
-                        "message": line,
-                        "severity": "error",
-                    }
-                    # 尝试解析 file:line:col: message 格式
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        issue_entry["file"] = parts[0]
-                        try:
-                            issue_entry["line"] = int(parts[1])
-                        except ValueError:
-                            pass
-                    issues.append(issue_entry)
-                has_error = True
-    except subprocess.TimeoutExpired:
-        messages.append("go vet 超时")
+        rc, out, err = _run_check_split("go vet ./...", project_path, timeout=timeout)
+        err_output = (err or "").strip() or (out or "").strip()
+        if rc == 124:
+            messages.append("go vet 超时")
+        elif rc != 0 and _is_infra_failure(err_output):
+            # 无网拉依赖/工具缺失等基础设施瞬时错误 → skip 非 error(A-P1-09)，避免错误降级
+            messages.append(f"go vet 基础设施/工具瞬时错误，跳过(非能力失败): {err_output[:200]}")
+        elif rc != 0 and err_output:
+            for line in err_output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                issue_entry: dict = {
+                    "file": "",
+                    "line": None,
+                    "code": "govet",
+                    "message": line,
+                    "severity": "error",
+                }
+                # 尝试解析 file:line:col: message 格式
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    issue_entry["file"] = parts[0]
+                    try:
+                        issue_entry["line"] = int(parts[1])
+                    except ValueError:
+                        pass
+                issues.append(issue_entry)
+            has_error = True
     except Exception as exc:
         messages.append(f"go vet 跳过: {exc}")
     return has_error, messages, issues
@@ -451,59 +565,55 @@ def _lint_rust(project_path: str, rs_files: list[str], *, timeout: int = 60) -> 
     messages: list[str] = []
     issues: list[dict] = []
 
-    cargo_bin = _find_tool("cargo")
-    if not cargo_bin:
+    # cargo clippy 需完整 crate 树+工具链 → 沙箱优先(A-P1-10)。无沙箱才要求本地有 cargo。
+    if _sandbox_ctx() is None and not _find_tool("cargo"):
         messages.append("cargo 未安装，跳过 Rust lint")
         return has_error, messages, issues
 
-    # 无 Cargo.toml 时 cargo clippy 无法跑，跳过
-    if not os.path.isfile(os.path.join(project_path, "Cargo.toml")):
+    # 无 Cargo.toml 时 cargo clippy 无法跑，跳过（沙箱感知判定）
+    if not _manifest_present(("Cargo.toml",), project_path):
         messages.append("项目无 Cargo.toml，跳过 Rust lint")
         return has_error, messages, issues
 
     try:
-        proc = subprocess.run(
-            [cargo_bin, "clippy", "--", "-D", "warnings"],
-            cwd=project_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            err_output = (proc.stderr or "").strip()
-            if err_output:
-                for line in err_output.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # 跳过摘要行
-                    if line.startswith("warning: generated") or line.startswith("error: aborting"):
-                        continue
-                    if ": error[" in line or ": warning[" in line or line.startswith("error:"):
-                        issue_entry: dict = {
-                            "file": "",
-                            "line": None,
-                            "code": "clippy",
-                            "message": line,
-                            "severity": "error",  # -D warnings => all warnings are errors
-                        }
-                        # 尝试解析 file:line:col 格式
-                        # Rust 输出: src/main.rs:2:5: error[E0425]: ...
-                        for prefix in line.split(": "):
-                            parts = prefix.split(":")
-                            if len(parts) >= 2:
-                                try:
-                                    int(parts[1])
-                                    issue_entry["file"] = parts[0]
-                                    issue_entry["line"] = int(parts[1])
-                                    break
-                                except ValueError:
-                                    continue
-                        issues.append(issue_entry)
-                if issues:
-                    has_error = True
-    except subprocess.TimeoutExpired:
-        messages.append("cargo clippy 超时")
+        rc, out, err = _run_check_split("cargo clippy -- -D warnings", project_path, timeout=timeout)
+        err_output = (err or "").strip() or (out or "").strip()
+        if rc == 124:
+            messages.append("cargo clippy 超时")
+        elif rc != 0 and _is_infra_failure(err_output):
+            # 无网拉 crate/文件锁/工具缺失等基础设施瞬时错误 → skip 非 error(A-P1-09)
+            messages.append(f"cargo clippy 基础设施/工具瞬时错误，跳过(非能力失败): {err_output[:200]}")
+        elif rc != 0 and err_output:
+            for line in err_output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # 跳过摘要行
+                if line.startswith("warning: generated") or line.startswith("error: aborting"):
+                    continue
+                if ": error[" in line or ": warning[" in line or line.startswith("error:"):
+                    issue_entry: dict = {
+                        "file": "",
+                        "line": None,
+                        "code": "clippy",
+                        "message": line,
+                        "severity": "error",  # -D warnings => all warnings are errors
+                    }
+                    # 尝试解析 file:line:col 格式
+                    # Rust 输出: src/main.rs:2:5: error[E0425]: ...
+                    for prefix in line.split(": "):
+                        parts = prefix.split(":")
+                        if len(parts) >= 2:
+                            try:
+                                int(parts[1])
+                                issue_entry["file"] = parts[0]
+                                issue_entry["line"] = int(parts[1])
+                                break
+                            except ValueError:
+                                continue
+                    issues.append(issue_entry)
+            if issues:
+                has_error = True
     except Exception as exc:
         messages.append(f"cargo clippy 跳过: {exc}")
     return has_error, messages, issues
@@ -515,43 +625,41 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
     messages: list[str] = []
     issues: list[dict] = []
 
-    checkstyle_bin = _find_tool("checkstyle")
-    if not checkstyle_bin:
+    # checkstyle 沙箱优先(A-P1-10)。无沙箱才要求本地有 checkstyle；沙箱里多半未装 →
+    # 命中 "command not found" 走基础设施 skip。
+    if _sandbox_ctx() is None and not _find_tool("checkstyle"):
         messages.append("checkstyle 未安装，跳过 Java lint")
         return has_error, messages, issues
 
     try:
-        proc = subprocess.run(
-            [checkstyle_bin] + _cap_files(java_files, "checkstyle"),
-            cwd=project_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            err_output = (proc.stderr or proc.stdout or "").strip()
-            if err_output:
-                for line in err_output.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    issue_entry: dict = {
-                        "file": "",
-                        "line": None,
-                        "code": "checkstyle",
-                        "message": line,
-                        "severity": "error",
-                    }
-                    # 尝试解析 [ERROR] file:line:col: message 格式
-                    import re
-                    m = re.match(r"\[(?:ERROR|WARN)\]\s+(.+?):(\d+)", line)
-                    if m:
-                        issue_entry["file"] = m.group(1)
-                        issue_entry["line"] = int(m.group(2))
-                    issues.append(issue_entry)
-                has_error = True
-    except subprocess.TimeoutExpired:
-        messages.append("checkstyle 超时")
+        cmd = "checkstyle " + " ".join(f'"{f}"' for f in _cap_files(java_files, "checkstyle"))
+        rc, out, err = _run_check_split(cmd, project_path, timeout=timeout)
+        err_output = (err or "").strip() or (out or "").strip()
+        if rc == 124:
+            messages.append("checkstyle 超时")
+        elif rc != 0 and _is_infra_failure(err_output):
+            # 工具缺失/无网等基础设施瞬时错误 → skip 非 error(A-P1-09)
+            messages.append(f"checkstyle 基础设施/工具瞬时错误，跳过(非能力失败): {err_output[:200]}")
+        elif rc != 0 and err_output:
+            for line in err_output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                issue_entry: dict = {
+                    "file": "",
+                    "line": None,
+                    "code": "checkstyle",
+                    "message": line,
+                    "severity": "error",
+                }
+                # 尝试解析 [ERROR] file:line:col: message 格式
+                import re
+                m = re.match(r"\[(?:ERROR|WARN)\]\s+(.+?):(\d+)", line)
+                if m:
+                    issue_entry["file"] = m.group(1)
+                    issue_entry["line"] = int(m.group(2))
+                issues.append(issue_entry)
+            has_error = True
     except Exception as exc:
         messages.append(f"checkstyle 跳过: {exc}")
     return has_error, messages, issues

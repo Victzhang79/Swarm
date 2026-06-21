@@ -107,9 +107,20 @@ async def auth_login(req: LoginRequest, request: Request):
     must_change = await loop.run_in_executor(
         None, lambda: get_must_change_password(user.id)
     )
+    # W3.1：按配置 TTL 刷新 token 有效期（滑动续期），并回传 expires_at 供前端到期提示。
+    # token_ttl_hours=0 时返回 None（永不过期），保持既有行为。
+    from swarm.auth.store import set_token_expiry
+    from swarm.config.settings import get_config
+
+    ttl_hours = get_config().token_ttl_hours
+    expires_at = await loop.run_in_executor(
+        None, lambda: set_token_expiry(user.id, ttl_hours)
+    )
     return {
         "token": user.api_token,
         "must_change_password": must_change,
+        "expires_at": expires_at,  # ISO8601 或 null(永不过期)
+        "token_ttl_hours": ttl_hours,
         "user": {
             "id": user.id,
             "username": user.username,

@@ -639,6 +639,10 @@ class AppConfig(BaseSettings):
     rbac_enabled: bool = True
     bootstrap_admin_password: str = "swarm"
     bootstrap_reset_admin_password: bool = False  # true 时每次启动重置 admin 密码
+    # W3.1：登录签发 token 的有效期（小时）。0=永不过期（向后兼容既有行为）。
+    # >0 时登录会把 token_expires_at 刷新为 now()+TTL，并在登录响应回传 expires_at，
+    # 前端据此到期前提示重登。吊销/过期校验能力见 auth.store.get_user_by_token。
+    token_ttl_hours: int = 0  # SWARM_TOKEN_TTL_HOURS
     # 遗留单 Key（非空且与 user token 匹配时视为 admin）
     api_key: str = ""
     max_task_tokens: int = 500_000  # 单任务 token 估算硬上限（P1）

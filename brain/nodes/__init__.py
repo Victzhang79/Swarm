@@ -1731,7 +1731,15 @@ def merge(state: BrainState) -> dict:
         elif isinstance(output, dict):
             subtask_diffs.append((subtask_id, output.get("diff", "") or ""))
 
-    result = merge_diffs(subtask_diffs, base_reader=_make_base_reader(state))
+    # A-P1-26c：传入依赖拓扑序，让 rebase 策略以【上游子任务】为 base（非 hunk 出现序）。
+    plan = state.get("plan")
+    subtask_order = plan.topological_order() if plan is not None else None
+
+    result = merge_diffs(
+        subtask_diffs,
+        base_reader=_make_base_reader(state),
+        subtask_order=subtask_order,
+    )
 
     if result.conflicts:
         for conflict in result.conflicts:

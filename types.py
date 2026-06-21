@@ -308,6 +308,36 @@ class TaskPlan(BaseModel):
     def all_completed(self, completed_ids: set[str]) -> bool:
         return all(t.id in completed_ids for t in self.subtasks)
 
+    def topological_order(self) -> list[str]:
+        """返回子任务 ID 的拓扑序（被依赖者在前，依赖者在后）。
+
+        用于 MERGE 选 rebase base（A-P1-26c）：3-way 失败的重叠冲突应以【依赖上游】
+        (被依赖者)为 base 先保留其 diff、把【依赖下游】标记 rebase 重生成——而非按 hunk
+        在文件中的出现序任选 base（出现序与依赖无关，可能让上游反被 rebase，破坏地基）。
+
+        Kahn 算法按原始 subtasks 顺序稳定出队；悬空依赖(指向计划外 ID)忽略；存在环时
+        把剩余未排序的子任务按原序补在末尾（稳定兜底，绝不丢子任务）。
+        """
+        ids = [t.id for t in self.subtasks]
+        id_set = set(ids)
+        # 仅保留指向计划内子任务的依赖边（忽略悬空依赖，避免永远无法出队）
+        deps = {t.id: [d for d in t.depends_on if d in id_set and d != t.id] for t in self.subtasks}
+        indeg = {i: len(deps[i]) for i in ids}
+        ready = [i for i in ids if indeg[i] == 0]
+        order: list[str] = []
+        while ready:
+            n = ready.pop(0)
+            order.append(n)
+            for i in ids:  # 子任务量小，O(n^2) 可接受
+                if n in deps[i]:
+                    indeg[i] -= 1
+                    if indeg[i] == 0:
+                        ready.append(i)
+        if len(order) < len(ids):  # 环：剩余按原序补全
+            seen = set(order)
+            order.extend(i for i in ids if i not in seen)
+        return order
+
 
 # ──────────────────────────────────────────────
 # Worker 产出

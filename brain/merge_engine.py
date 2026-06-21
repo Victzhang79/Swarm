@@ -528,14 +528,24 @@ def merge_diffs(
     *,
     base_reader: BaseReader | None = None,
     auto_resolve: bool = True,
+    subtask_order: list[str] | None = None,
 ) -> MergeResult:
     """Merge unified diffs from multiple subtasks.
 
     When ``base_reader`` is provided and ``auto_resolve`` is True, overlapping
     hunks are resolved via 3-way merge (git merge-file or Python fallback).
+
+    ``subtask_order``：子任务 ID 的依赖拓扑序（被依赖者在前）。rebase 策略据此选 base
+    （A-P1-26c）——以依赖【上游】为 base 保留其 diff，把【下游】依赖者标记 rebase 重生成；
+    缺省 None 时退回旧行为（按冲突 hunk 在文件中的出现序选第一个为 base）。
     """
     if not subtask_diffs:
         return MergeResult(merged_diff="", conflicts=[], success=True)
+
+    # 拓扑优先级：值越小越上游（越该当 base）。缺省/缺失 ID 退回出现序兜底。
+    order_prio: dict[str, int] = {
+        sid: idx for idx, sid in enumerate(subtask_order or [])
+    }
 
     by_file: dict[str, list[_Hunk]] = {}
     headers: dict[str, list[str]] = {}
@@ -591,7 +601,8 @@ def merge_diffs(
 
             # ── Rebase 重生成策略（3-way 和硬冲突之间的中间档）──
             # 当 3-way 无法自动解决且提供了 base_reader 时：
-            #   1. 选第一个子任务(st-a)的 diff 作为 base 先 apply
+            #   1. 选【依赖上游】子任务(st-a)的 diff 作为 base 先 apply（A-P1-26c：
+            #      依拓扑序而非 hunk 出现序——上游是地基，下游才该 rebase 到其之上）
             #   2. 将其余冲突子任务标记为 rebase（需要基于已含 st-a 变更的最新状态重新生成）
             #   3. 保留 base 方的 diff，不报硬冲突
             # 前提: base_reader 能读取该文件的内容（否则无法构建 base 版本，走硬冲突）
@@ -602,8 +613,13 @@ def merge_diffs(
                 and base_reader(file_path) is not None
                 and len(subtask_ids) >= 2
             ):
-                base_sid = subtask_ids[0]
-                rebase_sids = subtask_ids[1:]
+                # 选最上游(拓扑序最小)的冲突子任务为 base；无 order 时退回出现序首个。
+                # min 对相等键返回首个遇到者(=subtask_ids 出现序)，故缺序时与旧行为一致。
+                base_sid = min(
+                    subtask_ids,
+                    key=lambda s: order_prio.get(s, len(order_prio) + subtask_ids.index(s)),
+                )
+                rebase_sids = [s for s in subtask_ids if s != base_sid]
                 # 收集 base 方的冲突 hunk（保留到合并结果）
                 base_conflict_hunks = [h for h in conflict_hunks if h.subtask_id == base_sid]
                 # 收集所有非冲突 hunk

@@ -2,11 +2,38 @@
 'use strict';
 
 const AUTH_TOKEN_KEY = 'swarm_auth_token';
+// W3.1：登录返回的 token 到期时间（ISO8601）。空=永不过期。前端据此到期前清理并提示重登。
+const AUTH_EXPIRES_KEY = 'swarm_auth_expires_at';
 
 let currentUser = null;
 
 function getAuthToken() {
   return localStorage.getItem(AUTH_TOKEN_KEY) || '';
+}
+
+function getTokenExpiresAt() {
+  return localStorage.getItem(AUTH_EXPIRES_KEY) || '';
+}
+
+// W3.1：会话是否已过期（仅当 expires_at 存在且已早于当前时刻）。永不过期 token → false。
+function isSessionExpired() {
+  const iso = getTokenExpiresAt();
+  if (!iso) return false;
+  const exp = Date.parse(iso);
+  if (isNaN(exp)) return false;
+  return Date.now() >= exp;
+}
+
+// W3.1：会话过期则清理本地 token 并弹出重登框（带过期提示）。返回是否发生过期。
+// 主动调用（轮询/请求前），不必等后端 401，体验更顺。
+function enforceSessionExpiry() {
+  if (!getAuthToken() || !isSessionExpired()) return false;
+  localStorage.removeItem(AUTH_TOKEN_KEY);
+  localStorage.removeItem(AUTH_EXPIRES_KEY);
+  currentUser = null;
+  updateAuthUI();
+  showLoginModal('登录已过期，请重新登录');
+  return true;
 }
 
 function authHeaders(extra) {
@@ -30,6 +57,8 @@ function installAuthFetch() {
     opts = opts || {};
     const path = typeof url === 'string' ? url : (url && url.url) || '';
     if (path.startsWith('/api/') && !path.startsWith('/api/auth/login') && !path.startsWith('/api/health')) {
+      // W3.1：发请求前先查会话是否过期，过期则主动清理+弹重登（避免无谓 401）。
+      enforceSessionExpiry();
       opts.headers = authHeaders(opts.headers);
     }
     return nativeFetch(url, opts).then(function (resp) {
@@ -75,10 +104,17 @@ function applyRoleVisibility() {
   }
 }
 
-function showLoginModal() {
+function showLoginModal(message) {
   $('login-overlay').classList.add('open');
   $('login-modal').classList.add('open');
-  $('login-error').style.display = 'none';
+  const errEl = $('login-error');
+  // W3.1：过期等场景可带提示文案（如"登录已过期，请重新登录"）。
+  if (message && errEl) {
+    errEl.textContent = message;
+    errEl.style.display = 'block';
+  } else if (errEl) {
+    errEl.style.display = 'none';
+  }
   const userInput = $('login-username');
   if (userInput) setTimeout(function () { userInput.focus(); }, 100);
 }
@@ -121,6 +157,9 @@ async function submitLogin() {
     }
     const data = await resp.json();
     localStorage.setItem(AUTH_TOKEN_KEY, data.token);
+    // W3.1：记录到期时间（永不过期则清除旧值），供前端到期前主动清理重登。
+    if (data.expires_at) localStorage.setItem(AUTH_EXPIRES_KEY, data.expires_at);
+    else localStorage.removeItem(AUTH_EXPIRES_KEY);
     currentUser = data.user;
     hideLoginModal();
     updateAuthUI();
@@ -169,6 +208,7 @@ async function forceChangePassword() {
 
 function logoutUser() {
   localStorage.removeItem(AUTH_TOKEN_KEY);
+  localStorage.removeItem(AUTH_EXPIRES_KEY);
   currentUser = null;
   updateAuthUI();
   showLoginModal();
@@ -184,6 +224,7 @@ async function refreshCurrentUser() {
     const resp = await fetch('/api/auth/me');
     if (!resp.ok) {
       localStorage.removeItem(AUTH_TOKEN_KEY);
+      localStorage.removeItem(AUTH_EXPIRES_KEY);
       currentUser = null;
       updateAuthUI();
       return false;
