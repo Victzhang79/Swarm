@@ -49,8 +49,17 @@ async def sync_mr_history_from_gitlab(
     headers = {"PRIVATE-TOKEN": token}
     count = 0
 
+    # A-P1-24：单个 httpx.Client 复用到整个循环（含每 MR 的 /changes），避免每 MR 新建
+    # 连接；同时 /changes 显式处理非 200（429/401）—— 原先 status_code != 200 静默落库
+    # 空 changed_files，会把"被限流/鉴权失败"伪装成"该 MR 没改文件"，污染共现检索。
     try:
-        with httpx.Client(timeout=30.0) as client:
+        client = httpx.Client(timeout=30.0)
+    except Exception as exc:
+        logger.warning("[MR history] client init failed: %s", exc)
+        return 0
+
+    try:
+        try:
             resp = client.get(
                 url,
                 headers=headers,
@@ -58,59 +67,66 @@ async def sync_mr_history_from_gitlab(
             )
             resp.raise_for_status()
             mrs = resp.json()
-    except Exception as exc:
-        logger.warning("[MR history] fetch failed: %s", exc)
-        return 0
+        except Exception as exc:
+            logger.warning("[MR history] fetch failed: %s", exc)
+            return 0
 
-    conn = store_conn_factory()
-    if hasattr(conn, "__await__"):
-        conn = await conn
-    try:
-        async with conn.cursor() as cur:
-            for mr in mrs:
-                iid = mr.get("iid")
-                if not iid:
-                    continue
-                changed: list[str] = []
-                try:
-                    ch_url = f"{base}/api/v4/projects/{encoded}/merge_requests/{iid}/changes"
-                    with httpx.Client(timeout=20.0) as client:
-                        cr = client.get(ch_url, headers=headers)
-                        if cr.status_code == 200:
-                            for ch in cr.json().get("changes") or []:
-                                if ch.get("new_path"):
-                                    changed.append(ch["new_path"])
-                                elif ch.get("old_path"):
-                                    changed.append(ch["old_path"])
-                except Exception as exc:
-                    logger.debug("解析 MR changed_files 失败: %s", exc)
+        conn = store_conn_factory()
+        if hasattr(conn, "__await__"):
+            conn = await conn
+        try:
+            async with conn.cursor() as cur:
+                for mr in mrs:
+                    iid = mr.get("iid")
+                    if not iid:
+                        continue
+                    changed: list[str] = []
+                    try:
+                        ch_url = f"{base}/api/v4/projects/{encoded}/merge_requests/{iid}/changes"
+                        cr = client.get(ch_url, headers=headers, timeout=20.0)
+                        # 非 200（429 限流 / 401 鉴权失败 / 5xx）→ 记录失败并跳过本 MR 的
+                        # changed_files 更新，绝不把空列表当"真实无变更"静默写库。
+                        cr.raise_for_status()
+                        for ch in cr.json().get("changes") or []:
+                            if ch.get("new_path"):
+                                changed.append(ch["new_path"])
+                            elif ch.get("old_path"):
+                                changed.append(ch["old_path"])
+                    except Exception as exc:
+                        logger.warning(
+                            "[MR history] MR %s /changes 拉取失败(%s)，跳过 changed_files 更新",
+                            iid, exc,
+                        )
+                        continue
 
-                await cur.execute(
-                    """
-                    INSERT INTO kb_mr_history
-                        (project_id, mr_iid, title, description, author, state, web_url, changed_files, merged_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (project_id, mr_iid) DO UPDATE SET
-                        title = EXCLUDED.title,
-                        description = EXCLUDED.description,
-                        changed_files = EXCLUDED.changed_files,
-                        merged_at = EXCLUDED.merged_at
-                    """,
-                    (
-                        project_id,
-                        iid,
-                        mr.get("title"),
-                        (mr.get("description") or "")[:4000],
-                        (mr.get("author") or {}).get("username"),
-                        mr.get("state"),
-                        mr.get("web_url"),
-                        changed,
-                        mr.get("merged_at"),
-                    ),
-                )
-                count += 1
+                    await cur.execute(
+                        """
+                        INSERT INTO kb_mr_history
+                            (project_id, mr_iid, title, description, author, state, web_url, changed_files, merged_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (project_id, mr_iid) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            description = EXCLUDED.description,
+                            changed_files = EXCLUDED.changed_files,
+                            merged_at = EXCLUDED.merged_at
+                        """,
+                        (
+                            project_id,
+                            iid,
+                            mr.get("title"),
+                            (mr.get("description") or "")[:4000],
+                            (mr.get("author") or {}).get("username"),
+                            mr.get("state"),
+                            mr.get("web_url"),
+                            changed,
+                            mr.get("merged_at"),
+                        ),
+                    )
+                    count += 1
+        finally:
+            await conn.close()
     finally:
-        await conn.close()
+        client.close()
     return count
 
 

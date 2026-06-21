@@ -180,10 +180,10 @@ async def analyze(state: BrainState) -> dict:
         knowledge_context, stats = await retrieve_knowledge(task_description, project_id)
         # N-12 修复：检索整体崩溃时 service 返回空知识 + stats['error']，但下游只用 context
         # → "检索崩溃"与"真无知识"不可区分，Brain 在零知识上规划还以为正常。显式告警区分。
-        if stats.get("error"):
+        if stats.get("retrieval_failed") or stats.get("error"):
             logger.error(
                 "[ANALYZE] ⚠️ 知识检索崩溃(非'无知识')，Brain 将在零知识上下文上规划: %s",
-                stats.get("error"),
+                stats.get("error") or "retrieval_failed",
             )
         logger.info(
             "[ANALYZE] 知识检索完成: struct=%s semantic=%s norms=%s "

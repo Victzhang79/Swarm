@@ -58,6 +58,19 @@ def assess_knowledge_readiness(
             "level": "partial",
             "message": "预处理已完成 · " + "，".join(parts) + "（Brain 仍可使用扫描/分析结果）",
         }
+
+    # A-P1-25：阶段=complete 但既无结构符号也无向量 → "完成"是空壳，绝非 ready。
+    # 原先只看 status==READY，会把"预处理跑完但 0 索引/0 嵌入"误报为已就绪，
+    # Brain 在空知识库上检索却以为正常。纯分类器：只看入参里已有的计数，不探活 DB。
+    # （index 计数取 symbols，embed 计数取 vectors，与 preprocess 写入字段对齐。）
+    index_count = int(index.get("symbols") or 0)
+    embed_count = int(embed.get("vectors") or 0)
+    if index_count == 0 and embed_count == 0:
+        return {
+            "level": "degraded",
+            "message": "预处理已完成但结构索引与向量嵌入均为空 — Brain 检索将无可用知识，请重跑预处理",
+            "show_preprocess_cta": True,
+        }
     return {"level": "ready", "message": "知识库已就绪 — Brain 可正常检索本项目"}
 
 

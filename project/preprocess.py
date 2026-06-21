@@ -842,17 +842,30 @@ def _run_codegraph(project_path: str):
 
 
 def _save_file_index(project_id: str, files: list[dict[str, Any]]) -> None:
-    """将扫描结果写入 kb_file_index"""
+    """将扫描结果写入 kb_file_index
+
+    A-P1-22：用连接池 + executemany。原先每次 psycopg.connect(autocommit) 绕过池、
+    异常时只在成功路径 conn.close() → 抛错即泄漏连接；逐行 execute 多次往返。
+    """
+    if not files:
+        return
     try:
-        # 使用同步 psycopg 直接写
         import psycopg
 
-        from swarm.config.settings import DatabaseConfig
-        cfg = DatabaseConfig()
-        conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
-        with conn.cursor() as cur:
-            for f in files:
-                cur.execute(
+        from swarm.infra.db import sync_pool
+        rows = [
+            (
+                project_id,
+                f["rel_path"],
+                f["language"],
+                f["hash"],
+                psycopg.types.json.Jsonb({"lines": f["lines"], "abs_path": f["abs_path"]}),
+            )
+            for f in files
+        ]
+        with sync_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
                     """
                     INSERT INTO kb_file_index (project_id, file_path, language, file_hash, metadata_json)
                     VALUES (%s, %s, %s, %s, %s)
@@ -862,30 +875,38 @@ def _save_file_index(project_id: str, files: list[dict[str, Any]]) -> None:
                         metadata_json = EXCLUDED.metadata_json,
                         last_modified = NOW()
                     """,
-                    (
-                        project_id,
-                        f["rel_path"],
-                        f["language"],
-                        f["hash"],
-                        psycopg.types.json.Jsonb({"lines": f["lines"], "abs_path": f["abs_path"]}),
-                    ),
+                    rows,
                 )
-        conn.close()
     except Exception as exc:
         logger.warning("Failed to save file index: %s", exc)
 
 
 def _save_symbol_index(project_id: str, symbols: list) -> None:
-    """将 codegraph 符号写入 kb_symbol_index"""
+    """将 codegraph 符号写入 kb_symbol_index（A-P1-22：池 + executemany）"""
+    if not symbols:
+        return
     try:
         import psycopg
 
-        from swarm.config.settings import DatabaseConfig
-        cfg = DatabaseConfig()
-        conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
-        with conn.cursor() as cur:
-            for sym in symbols:
-                cur.execute(
+        from swarm.infra.db import sync_pool
+        rows = [
+            (
+                project_id,
+                sym.file_path,
+                sym.name,
+                sym.symbol_type,
+                sym.start_line,
+                sym.end_line,
+                sym.signature,
+                sym.docstring,
+                sym.class_name,
+                psycopg.types.json.Jsonb({}),
+            )
+            for sym in symbols
+        ]
+        with sync_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
                     """
                     INSERT INTO kb_symbol_index
                         (project_id, file_path, symbol_name, symbol_type,
@@ -899,35 +920,28 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
                         class_name = EXCLUDED.class_name,
                         metadata_json = EXCLUDED.metadata_json
                     """,
-                    (
-                        project_id,
-                        sym.file_path,
-                        sym.name,
-                        sym.symbol_type,
-                        sym.start_line,
-                        sym.end_line,
-                        sym.signature,
-                        sym.docstring,
-                        sym.class_name,
-                        psycopg.types.json.Jsonb({}),
-                    ),
+                    rows,
                 )
-        conn.close()
     except Exception as exc:
         logger.warning("Failed to save symbol index: %s", exc)
 
 
 def _save_dependency_graph(project_id: str, edges: list) -> None:
-    """将 codegraph 依赖写入 kb_dependency_graph"""
+    """将 codegraph 依赖写入 kb_dependency_graph（A-P1-22：池 + executemany）"""
+    if not edges:
+        return
     try:
         import psycopg
 
-        from swarm.config.settings import DatabaseConfig
-        cfg = DatabaseConfig()
-        conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
-        with conn.cursor() as cur:
-            for edge in edges:
-                cur.execute(
+        from swarm.infra.db import sync_pool
+        rows = [
+            (project_id, edge.source_file, edge.target_file, edge.import_type,
+             psycopg.types.json.Jsonb({}))
+            for edge in edges
+        ]
+        with sync_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
                     """
                     INSERT INTO kb_dependency_graph (project_id, source_file, target_file, import_type, metadata_json)
                     VALUES (%s, %s, %s, %s, %s)
@@ -935,35 +949,29 @@ def _save_dependency_graph(project_id: str, edges: list) -> None:
                         import_type = EXCLUDED.import_type,
                         metadata_json = EXCLUDED.metadata_json
                     """,
-                    (project_id, edge.source_file, edge.target_file, edge.import_type,
-                     psycopg.types.json.Jsonb({})),
+                    rows,
                 )
-        conn.close()
     except Exception as exc:
         logger.warning("Failed to save dependency graph: %s", exc)
 
 
 def _read_symbols_for_embed(project_id: str) -> list[dict[str, Any]]:
-    """从 kb_symbol_index 读取符号（用于嵌入）"""
+    """从 kb_symbol_index 读取符号（用于嵌入）（A-P1-22：池，with 不泄漏）"""
     try:
-        import psycopg
-
-        from swarm.config.settings import DatabaseConfig
-        cfg = DatabaseConfig()
-        conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT file_path, symbol_name, symbol_type, start_line, end_line,
-                       signature, docstring, class_name
-                FROM kb_symbol_index
-                WHERE project_id = %s
-                ORDER BY file_path, start_line
-                """,
-                (project_id,),
-            )
-            rows = cur.fetchall()
-        conn.close()
+        from swarm.infra.db import sync_pool
+        with sync_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT file_path, symbol_name, symbol_type, start_line, end_line,
+                           signature, docstring, class_name
+                    FROM kb_symbol_index
+                    WHERE project_id = %s
+                    ORDER BY file_path, start_line
+                    """,
+                    (project_id,),
+                )
+                rows = cur.fetchall()
         return [
             {
                 "file_path": r[0],

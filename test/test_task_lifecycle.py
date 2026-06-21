@@ -110,10 +110,11 @@ def test_create_task_allows_ready_project():
 
     with patch("swarm.api.app.store") as mock_store:
         mock_store.get_project.return_value = project
+        # A-P1-25：ready 需要非零索引/嵌入计数（complete+0计数 现为 degraded）。
         mock_store.get_progress.return_value = {
             "phase": "complete",
-            "index_stats": {},
-            "embed_stats": {},
+            "index_stats": {"symbols": 50},
+            "embed_stats": {"vectors": 50},
         }
         mock_store.create_task.return_value = created
         mock_store.get_task.return_value = created
@@ -179,9 +180,10 @@ def test_create_task_allows_partial_ready():
 def test_readiness_assessment():
     from swarm.knowledge.readiness import assess_knowledge_readiness, brain_task_ready
 
+    # A-P1-25：非零计数 → ready/允许；complete 但 0 计数现为 degraded（见 test_kb_wave_k）。
     ok, _ = brain_task_ready(
         {"status": "READY"},
-        {"phase": "complete", "index_stats": {}, "embed_stats": {}},
+        {"phase": "complete", "index_stats": {"symbols": 10}, "embed_stats": {"vectors": 10}},
     )
     assert ok
 

@@ -191,7 +191,10 @@ async def _retrieve_knowledge_impl(
         return result.context, result.stats
     except Exception as exc:
         logger.warning("retrieve_knowledge failed for project %s: %s", project_id, exc)
-        return _empty_knowledge(), {"error": str(exc)}
+        # A-P1-20：检索整体崩溃 ≠ "项目无知识"。返回空知识时显式置 retrieval_failed=True
+        # （并保留 error 文本），让下游（Brain analyze）能区分"检索崩了"与"真没知识"，
+        # 不会在零知识上把规划当正常进行。consumer 既查 error 也查 retrieval_failed。
+        return _empty_knowledge(), {"error": str(exc), "retrieval_failed": True}
 
 
 def _empty_knowledge() -> KnowledgeContext:
