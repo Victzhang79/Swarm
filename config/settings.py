@@ -617,6 +617,8 @@ class AppConfig(BaseSettings):
 
     app_name: str = "Swarm"
     debug: bool = False
+    # 运行环境：development（默认）/ production。production 时启动期强校验安全配置。
+    env: str = "development"  # 来自 SWARM_ENV
     workspace_root: Path = Field(default=PROJECT_ROOT / "workspace")
 
     # LangSmith 追踪
@@ -654,6 +656,63 @@ class AppConfig(BaseSettings):
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    def is_production(self) -> bool:
+        """运行在生产环境（SWARM_ENV=production/prod）。"""
+        return (self.env or "").strip().lower() in {"production", "prod"}
+
+
+# 默认 bootstrap admin 密码（与 AppConfig.bootstrap_admin_password 默认值对齐）。
+# 生产环境若仍是此值视为不安全，拒绝启动。
+_DEFAULT_BOOTSTRAP_ADMIN_PASSWORD = "swarm"
+
+
+def validate_production_security(cfg: "AppConfig | None" = None) -> None:
+    """生产模式启动期安全强校验（fail-closed）。
+
+    仅当 is_production() 为真时，下列任一不安全配置都会 raise RuntimeError，
+    让误配的生产部署在启动期就快速失败，而非带病运行到运行期才暴雷：
+      1. 未显式设置 SWARM_SECRET_KEY —— 否则 secret_store 的 Fernet 根密钥会
+         从公开默认连接串派生（弱保护，DB dump + 本仓库即可解密所有存储 key）。
+         这里镜像 secret_store._get_fernet 的判定（os.environ 取 SWARM_SECRET_KEY 后 strip）。
+      2. bootstrap_admin_password 仍是公开默认值 "swarm" —— 任何人都可登录 admin。
+    开发模式（默认）永不 raise，仅在发现弱配置时打 warning 提示。
+    """
+    cfg = cfg if cfg is not None else get_config()
+    # 镜像 secret_store._get_fernet 的判定：os.environ 取 SWARM_SECRET_KEY 再 strip
+    secret_key = _os.environ.get("SWARM_SECRET_KEY", "").strip()
+    insecure_secret = not secret_key
+    insecure_password = cfg.bootstrap_admin_password == _DEFAULT_BOOTSTRAP_ADMIN_PASSWORD
+
+    if not cfg.is_production():
+        # 开发模式不拦截，但提醒弱配置
+        if insecure_secret:
+            _logger.warning(
+                "未设置 SWARM_SECRET_KEY（开发模式放行）；生产部署前必须显式设置高熵根密钥。"
+            )
+        if insecure_password:
+            _logger.warning(
+                "bootstrap_admin_password 仍为默认值（开发模式放行）；生产部署前必须改为非默认强密码。"
+            )
+        return
+
+    problems: list[str] = []
+    if insecure_secret:
+        problems.append(
+            "未设置 SWARM_SECRET_KEY：生产环境必须显式提供高熵根密钥（32 字节 base64），"
+            "否则 secret_store 会用公开默认连接串派生的弱密钥加密所有敏感信息。"
+            "请设置环境变量 SWARM_SECRET_KEY。"
+        )
+    if insecure_password:
+        problems.append(
+            'bootstrap_admin_password 仍为公开默认值 "swarm"：任何人都可登录 admin。'
+            "请设置环境变量 SWARM_BOOTSTRAP_ADMIN_PASSWORD 为非默认强密码。"
+        )
+    if problems:
+        raise RuntimeError(
+            "生产模式（SWARM_ENV=production）安全自检失败，拒绝启动：\n  - "
+            + "\n  - ".join(problems)
+        )
 
 
 # 全局单例

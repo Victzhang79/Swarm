@@ -589,6 +589,10 @@ app.add_middleware(SwarmAPIKeyMiddleware)
 async def on_startup():
     """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""
     _configure_app_logging()
+    # 生产模式安全自检（fail-closed）：默认凭据/未设根密钥时拒绝启动，
+    # 让误配的生产部署在启动期就快速失败，而非带病运行到运行期才暴雷。
+    from swarm.config.settings import validate_production_security
+    validate_production_security()
     configure_langsmith()
     _init_sidecar()
     # 注册通知推送 hook：store.create_notification 写入后，把记录调度到外部渠道推送。
