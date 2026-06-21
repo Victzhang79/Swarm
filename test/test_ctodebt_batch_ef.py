@@ -14,10 +14,23 @@ def test_make_point_id_stable_and_shared():
 
     a = make_point_id("pkg/m.py", 10, "def foo(): return 1")
     b = make_point_id("pkg/m.py", 10, "def foo(): return 1")
-    assert a == b, "同 (file,line,content) 必须产同一 ID"
+    assert a == b, "同 (file,line) 必须产同一 ID"
     assert a != make_point_id("pkg/m.py", 11, "def foo(): return 1")  # 行不同→不同
-    assert a != make_point_id("pkg/m.py", 10, "def bar(): return 2")  # 内容不同→不同
+    # A-P1-19：ID 只按 (file,line)，content 不参与 → 同 (file,line) 不同内容产同一 ID，
+    # 这才让 codegraph(签名|文档|名) 与 semantic(分块原文) 两路径对同一逻辑 chunk 真正去重。
+    assert a == make_point_id("pkg/m.py", 10, "def bar(): return 2")  # 内容不同→仍同 ID
     assert isinstance(a, str) and len(a) == 36  # uuid5 字符串
+
+
+def test_make_point_id_cross_path_same_chunk():
+    """A-P1-19：codegraph 与 semantic 对同一 (file,line) 即便喂不同 content 也产同一 ID。"""
+    from swarm.knowledge.semantic_index import make_point_id
+
+    codegraph_content = "def foo(a, b): ... | 计算两数之和 | foo"   # 签名|文档|名
+    semantic_content = "def foo(a, b):\n    return a + b\n"        # 分块原文
+    assert make_point_id("svc/x.py", 42, codegraph_content) == make_point_id(
+        "svc/x.py", 42, semantic_content
+    )
 
 
 def test_preprocess_uses_shared_point_id():
