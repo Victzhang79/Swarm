@@ -84,6 +84,12 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
     progress = await loop.run_in_executor(None, _app.store.get_progress, project_id)
     ready, reason = brain_task_ready(project, progress)
     if not ready:
+        # 可诊断性：拒绝创建任务=对运维可见的决策点（区分 degraded/missing/error），
+        # 否则只有客户端能看到 409，服务端无审计痕迹。
+        _app.logger.warning(
+            "拒绝创建 Brain 任务: project_id=%s 知识库未就绪 — %s",
+            project_id, reason,
+        )
         raise HTTPException(
             status_code=409,
             detail=reason or "项目知识库未就绪，请先完成预处理",

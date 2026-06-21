@@ -850,6 +850,19 @@ class WorkerExecutor:
                 )
                 l1_passed = bool(final_verdict.passed)
                 l1_details = {**l1_details, **final_verdict.details}
+                # W1.2 可诊断性：显式标注【翻盘】与【sticky 不翻盘】两类争议裁决，
+                # 便于事后定位某个 L1 结论为何翻/为何不翻（disputed L1 outcome 的根因）。
+                if prior_for_phase4 is not None and prior_for_phase4.passed is False:
+                    if l1_passed:
+                        self._log(
+                            f"L1 翻盘：prior fail(source={prior_for_phase4.source}, "
+                            f"sticky={prior_for_phase4.sticky}) 被 Phase4 确定性+LLM 双证据翻为通过"
+                        )
+                    elif prior_for_phase4.sticky:
+                        self._log(
+                            f"L1 不翻盘(sticky)：prior fail(source={prior_for_phase4.source}) "
+                            f"为确定性真错误，维持未通过（关闭幻觉 PASS）"
+                        )
                 self._log(
                     f"L1 最终复核（Phase4 产出后）: {'通过 ✅' if l1_passed else '未通过 ❌'} "
                     f"| 来源={final_verdict.source} | {final_verdict.reason}"

@@ -108,7 +108,9 @@ class ModuleLock:
             ok = r.eval(_renew_lua, 1, self.key, self.token, self.ttl_sec)
             return bool(ok)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[ModuleLock] renew: %s", exc)
+            # 续期失败=降级信号：锁可能在持有期内静默过期 → 同模块并发写风险，
+            # 必须可见（带 key 定位是哪把锁）。
+            logger.warning("[ModuleLock] renew 失败(锁=%s)，可能静默失锁: %s", self.key, exc)
             return False
 
     def release(self) -> None:

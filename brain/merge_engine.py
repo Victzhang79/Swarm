@@ -622,6 +622,11 @@ def merge_diffs(
                 continue
 
             # ── 硬冲突兜底（无 base_reader 或仅单子任务冲突）──
+            logger.warning(
+                "[MERGE] 硬冲突升级: 文件 %s, 子任务 %s 存在重叠/同锚点不同插入 hunk，"
+                "无法自动合并，落入冲突标记（需人工或 rebase 重生成）",
+                file_path, ", ".join(subtask_ids),
+            )
             conflicts.append(
                 MergeConflict(
                     file_path=file_path,
