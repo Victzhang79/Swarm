@@ -12,32 +12,55 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _redis_client: Any = None
-_redis_checked = False
+# A-P1-13：上次「不可用」探测的时间戳（None=从未探测/当前可用）。
+# 旧实现用布尔 _redis_checked 永久锁存失败 → 启动期一次瞬时抖动会让整个进程
+# 永久退化为内存锁(永不重连) → 多副本 split-brain 风险。改为带冷却的重探：
+# 失败后缓存 unavailable 状态 N 秒，冷却到期下次访问重新尝试连接。
+_redis_unavailable_at: float | None = None
+
+# 重探冷却（秒）。可经环境变量覆盖；默认 30s——足够吸收瞬时抖动，又不至于
+# 长时间停留在退化态。非阻塞：只是决定是否在下次访问时重试。
+_REDIS_REPROBE_COOLDOWN_SEC = 30.0
 
 
 def redis_enabled() -> bool:
     return os.environ.get("SWARM_REDIS_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
+def _reprobe_cooldown() -> float:
+    try:
+        return float(os.environ.get("SWARM_REDIS_REPROBE_COOLDOWN_SEC", _REDIS_REPROBE_COOLDOWN_SEC))
+    except (TypeError, ValueError):
+        return _REDIS_REPROBE_COOLDOWN_SEC
+
+
 def get_redis() -> Any | None:
-    global _redis_client, _redis_checked
-    if _redis_checked:
+    global _redis_client, _redis_unavailable_at
+    # 已有可用连接：直接复用。
+    if _redis_client is not None:
         return _redis_client
-    _redis_checked = True
     if not redis_enabled():
         return None
+    # 上次探测失败且仍在冷却窗内：暂不重试，继续用内存兜底（非阻塞）。
+    if _redis_unavailable_at is not None:
+        if (time.monotonic() - _redis_unavailable_at) < _reprobe_cooldown():
+            return None
+        # 冷却到期：清状态，下面重新尝试连接。
     try:
         import redis
 
         from swarm.config.settings import get_config
 
-        _redis_client = redis.from_url(get_config().db.redis_uri, decode_responses=True)
-        _redis_client.ping()
+        client = redis.from_url(get_config().db.redis_uri, decode_responses=True)
+        client.ping()
+        _redis_client = client
+        _redis_unavailable_at = None
         logger.info("[Redis] connected")
         return _redis_client
     except Exception as exc:
-        logger.warning("[Redis] unavailable, using in-memory fallback: %s", exc)
         _redis_client = None
+        _redis_unavailable_at = time.monotonic()
+        logger.warning("[Redis] unavailable, using in-memory fallback: %s", exc)
         return None
 
 
@@ -62,6 +85,31 @@ class ModuleLock:
         ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         self._held = bool(ok)
         return self._held
+
+    def renew(self) -> bool:
+        """续期持有中的锁 TTL（原子比对+EXPIRE，仅当 value==自己的 token）。
+
+        A-P1-14：旧实现 TTL=3600s 无续期，一次 build 持锁 > TTL 会静默失锁 →
+        同模块并发写。完整的后台续期需为每把锁起一个任务（复杂，且本系统 Redis
+        默认关闭、单进程），过度工程。最小正确做法：提供 renew()，由 brain 事件
+        循环在已有的每节点回调里搭车调用——无额外线程/任务，进程在干活时顺带续期。
+        内存兜底(r is None)下锁永不过期，renew 直接 no-op 返回 True。
+        """
+        if not self._held:
+            return False
+        r = get_redis()
+        if r is None:
+            return True
+        try:
+            _renew_lua = (
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+            )
+            ok = r.eval(_renew_lua, 1, self.key, self.token, self.ttl_sec)
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[ModuleLock] renew: %s", exc)
+            return False
 
     def release(self) -> None:
         if not self._held:

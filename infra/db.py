@@ -55,6 +55,25 @@ def _pool_size() -> tuple[int, int]:
     return pmin, pmax
 
 
+# A-P1-16：连接池安全参数。可经环境变量覆盖。
+def _pool_timeout() -> float:
+    try:
+        return float(os.environ.get("SWARM_DB_POOL_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _pool_max_lifetime() -> float:
+    try:
+        return float(os.environ.get("SWARM_DB_POOL_MAX_LIFETIME", "3600"))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
+_POOL_TIMEOUT_SEC = _pool_timeout()
+_POOL_MAX_LIFETIME_SEC = _pool_max_lifetime()
+
+
 def _default_conn_str() -> str:
     return DatabaseConfig().postgres_uri
 
@@ -84,6 +103,14 @@ def sync_pool(conn_str: str | None = None) -> ConnectionPool:
                 min_size=pmin,
                 max_size=pmax,
                 kwargs={"autocommit": True},
+                # A-P1-16：原先未设安全参数 → 池耗尽时 connection() 无限阻塞、
+                # 半开/陈旧连接永不校验回收。
+                # timeout：取连接最多等 30s，超时抛 PoolTimeout 而非永久挂起。
+                # max_lifetime：连接最多存活 1h 后回收，避免长寿连接累积问题。
+                # check：归还/取出时校验连接活性，dead conn 自动回收重建。
+                timeout=_POOL_TIMEOUT_SEC,
+                max_lifetime=_POOL_MAX_LIFETIME_SEC,
+                check=ConnectionPool.check_connection,
                 open=True,
                 name="swarm-sync",
             )
@@ -124,6 +151,10 @@ async def async_pool(conn_str: str | None = None) -> AsyncConnectionPool:
             min_size=pmin,
             max_size=pmax,
             kwargs={"autocommit": True},
+            # A-P1-16：同 sync pool，设超时/最大寿命/活性校验。
+            timeout=_POOL_TIMEOUT_SEC,
+            max_lifetime=_POOL_MAX_LIFETIME_SEC,
+            check=AsyncConnectionPool.check_connection,
             open=False,
             name="swarm-async",
         )

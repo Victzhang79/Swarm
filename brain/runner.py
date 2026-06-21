@@ -292,6 +292,10 @@ async def _stream_brain_events(
     })
 
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
+        # A-P1-14：搭车续期模块锁——build 跑得比 TTL 久时不至于静默失锁。
+        # 无额外后台任务，进程处理每个图事件时顺带 renew（Redis 关闭时 no-op）。
+        if module_lock is not None:
+            module_lock.renew()
         kind = event.get("event", "")
         if kind == "on_chain_start":
             name = event.get("name", "")

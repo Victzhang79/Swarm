@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+_logger = logging.getLogger(__name__)
 
 
 def _coerce_model_list(v: object) -> list[str]:
@@ -145,6 +148,9 @@ class ModelConfig(BaseSettings):
     # 自动合成两个 provider —— 向后兼容，老 .env 零迁移即可工作。
     providers: list[ProviderConfig] = Field(default_factory=list)
     # 模型名 → provider_id 显式映射（覆盖一切猜测）。前端配置模型归属时写这里。
+    # ⚠️ 多云必读(A-P1-15)：配置了 2 个及以上 cloud provider 时，含 '/' 的模型名
+    # 启发式只会取「第一个」cloud provider——不同厂商模型会全部静默路由到同一家。
+    # 多云场景务必在此为每个模型配置显式映射，否则路由不可控。
     model_providers: dict[str, str] = Field(default_factory=dict)
     # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
     model_sizes: dict[str, str] = Field(default_factory=dict)
@@ -288,9 +294,21 @@ class ModelConfig(BaseSettings):
             return by_id[pid]
         # 2) 启发式兜底（向后兼容老行为）
         if "/" in model_name:
-            for p in providers:
-                if p.kind == "cloud":
-                    return p
+            cloud = [p for p in providers if p.kind == "cloud"]
+            if cloud:
+                chosen = cloud[0]
+                # A-P1-15：配置了 >1 个 cloud provider 却无显式 model_providers 映射时，
+                # 启发式只会无脑取第一个 cloud → 不同厂商模型全部静默路由到同一家。
+                # 当前部署(Brain 单云 + Worker 本地)碰不到，故仅告警(不改路由行为)，
+                # 提示多云必须用显式 model_providers 映射。
+                if len(cloud) > 1:
+                    _logger.warning(
+                        "[provider_for_model] 模型 '%s' 经启发式在 %d 个 cloud provider 中"
+                        "选了 '%s'（首个）。多云场景下不同厂商模型会全部静默路由到同一家——"
+                        "请在 model_providers 中为该模型配置显式映射以消除歧义。",
+                        model_name, len(cloud), chosen.id,
+                    )
+                return chosen
         else:
             for p in providers:
                 if p.kind == "local":
