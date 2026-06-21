@@ -35,6 +35,13 @@ dependencies = [
     "python-multipart>=0.0.9",
     "cryptography>=42",
     "paramiko>=3.4",
+    # W2.3：tree-sitter 多语言语义切分（Java/TS/JS/Go）。grammar 缺失时切分会优雅回退
+    # 字符切兜底，故视为软依赖——但默认安装以保证 KB 对 Java 重项目(RuoYi)的嵌入质量。
+    "tree-sitter>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-go>=0.23",
 ]
 
 [project.optional-dependencies]

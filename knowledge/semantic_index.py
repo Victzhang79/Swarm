@@ -178,10 +178,22 @@ class SemanticIndexer:
         """将源码按语义单元切分
 
         策略:
-        1. 按 class/function/docstring 边界识别语义单元
+        1. W2.3：Java/TS/JS/Go 用 tree-sitter 按 类/方法/函数 节点切（语法树精准）；
+           Python 走原有缩进/关键字识别；未知语言/解析失败 → 原有 free_text + 字符切兜底。
         2. 过长的单元按 chunk_size 重叠切分
         3. 附加 file_path / module / class_name 元信息
         """
+        # W2.3：按扩展名分派多语言 tree-sitter 切分（Java 重点：RuoYi 是 Java 单体）。
+        ts_lang = _ts_lang_for_path(file_path)
+        if ts_lang is not None:
+            ts_chunks = _chunk_with_treesitter(
+                source, file_path, ts_lang, module_name, class_name,
+                chunk_size, chunk_overlap,
+            )
+            if ts_chunks is not None:
+                return ts_chunks
+            # tree-sitter 不可用/解析失败 → 落到下方原有兜底（free_text + 字符切）
+
         lines = source.splitlines()
         chunks: list[Chunk] = []
 
@@ -567,3 +579,203 @@ def _flush_block(
         line_offset += lines_in_chunk
         if offset >= len(text):
             break
+
+
+# ════════════════════════════════════════════════
+# W2.3 — tree-sitter 多语言切分
+# ════════════════════════════════════════════════
+
+# 扩展名 → tree-sitter 语言键。Python 不在此（走原 AST/缩进路径）。
+_TS_EXT_TO_LANG = {
+    ".java": "java",
+    ".go": "go",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+}
+
+# 各语言的「语义单元」节点类型（类/接口/方法/函数/构造器）。
+_TS_CHUNK_NODE_TYPES = {
+    "java": {
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "method_declaration", "constructor_declaration",
+    },
+    "go": {
+        "function_declaration", "method_declaration", "type_declaration",
+    },
+    "javascript": {
+        "function_declaration", "method_definition", "class_declaration",
+        "generator_function_declaration",
+    },
+    "typescript": {
+        "function_declaration", "method_definition", "class_declaration",
+        "interface_declaration", "enum_declaration", "abstract_class_declaration",
+    },
+    "tsx": {
+        "function_declaration", "method_definition", "class_declaration",
+        "interface_declaration", "enum_declaration", "abstract_class_declaration",
+    },
+}
+
+# 类型容器节点：遇到它则下钻其方法，而非把整类当一个巨块。
+_TS_CONTAINER_NODE_TYPES = {
+    "java": {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration"},
+    "go": set(),
+    "javascript": {"class_declaration"},
+    "typescript": {"class_declaration", "abstract_class_declaration", "interface_declaration"},
+    "tsx": {"class_declaration", "abstract_class_declaration", "interface_declaration"},
+}
+
+_TS_PARSERS: dict[str, Any] = {}
+_TS_LOAD_FAILED: set[str] = set()
+_TS_WARNED = False
+
+
+def _ts_lang_for_path(file_path: str) -> str | None:
+    """按扩展名返回 tree-sitter 语言键；非目标语言返回 None。"""
+    import os
+    ext = os.path.splitext(file_path or "")[1].lower()
+    return _TS_EXT_TO_LANG.get(ext)
+
+
+def _get_ts_parser(lang_name: str):
+    """惰性加载并缓存某语言的 tree-sitter Parser；不可用则返回 None（优雅降级）。"""
+    global _TS_WARNED
+    if lang_name in _TS_PARSERS:
+        return _TS_PARSERS[lang_name]
+    if lang_name in _TS_LOAD_FAILED:
+        return None
+    try:
+        from tree_sitter import Language, Parser
+
+        if lang_name == "java":
+            import tree_sitter_java as ts_mod
+            language = Language(ts_mod.language())
+        elif lang_name == "go":
+            import tree_sitter_go as ts_mod
+            language = Language(ts_mod.language())
+        elif lang_name == "javascript":
+            import tree_sitter_javascript as ts_mod
+            language = Language(ts_mod.language())
+        elif lang_name == "typescript":
+            import tree_sitter_typescript as ts_mod
+            language = Language(ts_mod.language_typescript())
+        elif lang_name == "tsx":
+            import tree_sitter_typescript as ts_mod
+            language = Language(ts_mod.language_tsx())
+        else:
+            _TS_LOAD_FAILED.add(lang_name)
+            return None
+        parser = Parser(language)
+        _TS_PARSERS[lang_name] = parser
+        return parser
+    except Exception as exc:  # noqa: BLE001 — grammar 缺失/版本不兼容 → 降级
+        _TS_LOAD_FAILED.add(lang_name)
+        if not _TS_WARNED:
+            _TS_WARNED = True
+            logger.warning(
+                "tree-sitter grammar 不可用(%s: %s)，多语言切分回退字符切兜底。"
+                "如需精准切分请安装 tree-sitter + 对应 grammar。",
+                lang_name, exc,
+            )
+        return None
+
+
+def _chunk_with_treesitter(
+    source: str,
+    file_path: str,
+    lang_name: str,
+    module_name: str | None,
+    class_name: str | None,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> list[Chunk] | None:
+    """用 tree-sitter 按 类/方法/函数 节点切分。
+
+    返回 None 表示 grammar 不可用或解析异常 → 调用方走原有兜底。
+    返回 [] 表示成功解析但无可识别语义单元（空文件/纯声明）→ 调用方亦可视情况兜底，
+    本实现此时返回 None 让兜底处理，避免丢内容。
+    """
+    parser = _get_ts_parser(lang_name)
+    if parser is None:
+        return None
+    try:
+        src_bytes = source.encode("utf-8", errors="ignore")
+        tree = parser.parse(src_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tree-sitter parse 失败(%s, %s)：%s", lang_name, file_path, exc)
+        return None
+
+    node_types = _TS_CHUNK_NODE_TYPES.get(lang_name, set())
+    container_types = _TS_CONTAINER_NODE_TYPES.get(lang_name, set())
+    chunks: list[Chunk] = []
+
+    def _node_text(node) -> str:
+        return src_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+    def _node_name(node) -> str | None:
+        nm = node.child_by_field_name("name")
+        if nm is not None:
+            return src_bytes[nm.start_byte:nm.end_byte].decode("utf-8", errors="ignore")
+        return None
+
+    def _emit(node, chunk_type: str, enclosing_class: str | None) -> None:
+        text = _node_text(node)
+        start = node.start_point[0] + 1
+        end = node.end_point[0] + 1
+        if len(text) <= chunk_size:
+            chunks.append(Chunk(
+                content=text,
+                chunk_type=chunk_type,
+                file_path=file_path,
+                module_name=module_name,
+                class_name=enclosing_class or class_name,
+                start_line=start,
+                end_line=end,
+                metadata={"chunker": "tree-sitter", "lang": lang_name},
+            ))
+        else:
+            # 超长方法仍按字符重叠切，保留语义起点行号
+            block = text.split("\n")
+            _flush_block(
+                block, chunk_type, start, end, file_path, module_name,
+                enclosing_class or class_name, chunk_size, chunk_overlap, chunks,
+            )
+
+    def _walk(node, enclosing_class: str | None) -> None:
+        for child in node.children:
+            ctype = child.type
+            if ctype in container_types:
+                # 容器（类/接口）：发一个"类签名"chunk（仅头部，不含全部方法体），
+                # 再下钻其方法，避免把整类塞成一个巨块。
+                cname = _node_name(child) or enclosing_class
+                body = child.child_by_field_name("body")
+                header_end_byte = body.start_byte if body is not None else child.end_byte
+                header_text = src_bytes[child.start_byte:header_end_byte].decode("utf-8", errors="ignore").strip()
+                if header_text:
+                    chunks.append(Chunk(
+                        content=header_text,
+                        chunk_type="class_signature",
+                        file_path=file_path,
+                        module_name=module_name,
+                        class_name=cname,
+                        start_line=child.start_point[0] + 1,
+                        end_line=(body.start_point[0] + 1) if body is not None else child.end_point[0] + 1,
+                        metadata={"chunker": "tree-sitter", "lang": lang_name},
+                    ))
+                _walk(child, cname)
+            elif ctype in node_types:
+                _emit(child, "method" if "method" in ctype or "constructor" in ctype else ctype, enclosing_class)
+                # 方法内一般不再下钻（嵌套函数少见，足够用）
+            else:
+                _walk(child, enclosing_class)
+
+    _walk(tree.root_node, class_name)
+
+    if not chunks:
+        # 解析成功但没抓到任何语义单元（如纯 import 文件）→ 让兜底处理，不丢内容。
+        return None
+    return chunks
