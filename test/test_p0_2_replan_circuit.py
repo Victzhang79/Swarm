@@ -118,11 +118,18 @@ def test_plan_injects_replan_feedback():
 
 # ── recursion_limit 显式注入 ──────────────────────────────
 def test_brain_graph_config_sets_recursion_limit():
-    from swarm.tracing import BRAIN_RECURSION_LIMIT, brain_graph_config
+    from swarm.tracing import (
+        BRAIN_RECURSION_LIMIT,
+        brain_graph_config,
+        resolve_brain_recursion_limit,
+    )
+    # RUN21 修复后：不带 complexity/subtask_count（新任务首轮 invoke 的真实情形）时，
+    # 不再落低 floor，而是按最坏情况 ultra 兜底（避免大 ultra 任务全程跑 50 撞穿）。
     cfg = brain_graph_config(task_id="t1", project_id="p1", thread_id="th1")
-    assert cfg.get("recursion_limit") == BRAIN_RECURSION_LIMIT, cfg
-    assert BRAIN_RECURSION_LIMIT >= 50, f"recursion_limit 应 >=50，实际 {BRAIN_RECURSION_LIMIT}"
-    print(f"  ✅ brain_graph_config: recursion_limit={BRAIN_RECURSION_LIMIT}（默认 25 不够，已显式提升）")
+    assert cfg.get("recursion_limit") == resolve_brain_recursion_limit(None, None), cfg
+    assert cfg.get("recursion_limit") >= 300, f"未知规模应按 ultra 兜底(>=300)，实得 {cfg.get('recursion_limit')}"
+    assert BRAIN_RECURSION_LIMIT >= 50, f"floor 应 >=50，实际 {BRAIN_RECURSION_LIMIT}"
+    print(f"  ✅ brain_graph_config: 未知规模 recursion_limit={cfg.get('recursion_limit')}（RUN21 修复，不再落 50）")
 
 
 if __name__ == "__main__":

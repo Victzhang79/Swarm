@@ -249,12 +249,27 @@ def resolve_brain_recursion_limit(
     硬崩（连带未落地的 abandon→PARTIAL 一起灭）。recursion_limit 只是兜底；真死循环由
     replan 熔断 + 子任务 max_retries + abandon 提前拦截，故放大兜底是安全的。
     已知子任务数则按 4×+余量算；否则按复杂度档给保守上限。floor=BRAIN_RECURSION_LIMIT。
+
+    RUN21 实证修复：**新任务首次 invoke 时 complexity 与 subtask_count 都还未知**
+    （complexity 由图内 ANALYZE 节点判定、subtasks 由图内 PLAN 节点生成，均晚于本函数
+    在 runner 里 invoke 的时刻）→ 两个放大分支都不命中 → 旧实现落到低 floor(50)，使
+    37 子任务 ultra 全程跑在 50 上，rebase 轮一叠加即撞穿 GraphRecursionError 硬崩
+    （连带 35/37 已完成产出 + abandon→PARTIAL 一起灭）。修：complexity/subtask_count
+    均未知时按【最坏情况 ultra 档】给上限，而非低 floor——新任务真实规模未知，宁可给足。
     """
     floor = BRAIN_RECURSION_LIMIT
     if subtask_count and subtask_count > 0:
         return max(floor, subtask_count * 4 + 40)
     by_complexity = {"ultra": 300, "complex": 150, "epic": 300}
-    return max(floor, by_complexity.get((complexity or "").lower(), floor))
+    key = (complexity or "").lower()
+    if not key:
+        # complexity 也【未知】（新任务首轮 invoke——complexity 由图内 ANALYZE 才判定，
+        # subtask_count 由图内 PLAN 才生成）：真实规模未知，不能落低 floor(50)，否则大
+        # ultra 任务全程跑 50 必撞穿（RUN21 实证）。按最坏情况 ultra 上限兜底。
+        # 注意：仅【空/None】才算未知；明确的 trivial/medium/simple 是【已知小任务】，
+        # 仍走下方 dict 默认到 floor，不被抬高。
+        return max(floor, by_complexity["ultra"])
+    return max(floor, by_complexity.get(key, floor))
 
 
 def brain_graph_config(
