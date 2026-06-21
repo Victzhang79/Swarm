@@ -259,11 +259,15 @@ def probe_multimodal(provider: ProviderConfig, model_id: str) -> bool | None:
         if resp.status_code == 200:
             return True
         text = (resp.text or "").lower()
-        # 明确"不支持图像/多模态"信号 → False
+        # 明确"不支持图像/多模态"信号 → False。
+        # 修复(P2)：原清单含 "invalid"/"unsupported"/"image_url" 等过宽词——通用校验错误
+        # (鉴权失败、参数畸形、字段名出现在报文里)会命中这些词被误判成"模型不支持多模态"。
+        # 收紧为【明确指向图像/视觉能力】的短语，避免把不确定(应 None)误判成不支持(False)。
         neg_signals = (
-            "does not support image", "image input", "not support multimodal",
-            "no multimodal", "invalid", "unsupported", "image_url",
-            "vision", "not a multimodal", "cannot process image",
+            "does not support image", "image input not supported",
+            "images are not supported", "not support multimodal", "no multimodal",
+            "not a multimodal", "cannot process image", "vision is not supported",
+            "model does not support vision", "multimodal not supported",
         )
         if resp.status_code in (400, 422) and any(s in text for s in neg_signals):
             return False

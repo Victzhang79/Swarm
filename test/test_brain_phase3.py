@@ -590,9 +590,8 @@ async def _test_parallel_dispatch_gather_async():
         "knowledge_context": {},
     }
 
-    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker), patch(
-        "swarm.worker.sandbox.SandboxPool.warmup", return_value=None
-    ):
+    # 注：旧 SandboxPool.warmup 的 patch 已删除——该死桩类已移除，dispatch 不再调用它。
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker):
         t0 = time.monotonic()
         result = await dispatch(state)
         elapsed = time.monotonic() - t0

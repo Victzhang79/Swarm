@@ -132,8 +132,12 @@ async def start_task_scheduler() -> None:
                             n = _admission_retries.get(task_id, 0) + 1
                             _admission_retries[task_id] = n
                             if n <= _MAX_ADMISSION_RETRIES:
-                                # 重新入队尾部，稍后再试（不消费 meta），避免忙等
-                                TaskQueue.enqueue(task_id, meta["project_id"], priority="normal")
+                                # 重新入队尾部，稍后再试（不消费 meta），避免忙等。
+                                # P2 修复优先级反转：保留任务【原优先级】，不要硬降为 normal——
+                                # 否则 urgent 任务因沙箱未就绪留池一次即被降级，会被后到的
+                                # normal/background 抢先出队执行（高优先级被饿死）。
+                                orig_priority = item.get("priority", "normal")
+                                TaskQueue.enqueue(task_id, meta["project_id"], priority=orig_priority)
                                 if n == 1 or n % 20 == 0:
                                     logger.info("[Scheduler] 任务 %s 等待项目 %s 沙箱就绪，留池中（第 %d 次）",
                                                 task_id, meta["project_id"], n)

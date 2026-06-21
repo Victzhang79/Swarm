@@ -89,13 +89,20 @@ def compress_context_log(
 
     evicted: list[dict] = []
     while rest and total_tk(pinned + rest, summary) > budget:
-        # 先 evict 最低 priority 的最旧事件
+        # 先 evict 最低 priority 的最旧事件。
+        # 修复(P2)：USER 原始需求(PRIORITY_USER=1)【永不逐出】。旧实现当 rest 中无
+        # priority>=PRIORITY_PROCESS 的事件时 victim_idx 兜底为 0，排序后 rest[0] 恰是最低
+        # priority(可能就是 USER)→ USER 被静默逐出，违反"永不丢弃用户需求"契约。
+        # 新规则：只在 priority>PRIORITY_USER 的事件里挑最旧的逐出；若没有可逐出者
+        # （全是 USER），宁可超预算也 break，绝不动 USER。
         rest.sort(key=lambda e: (e.get("priority", 3), 0))
-        victim_idx = 0
+        victim_idx = None
         for i, e in enumerate(rest):
-            if e.get("priority", 3) >= PRIORITY_PROCESS:
+            if e.get("priority", PRIORITY_PROCESS) > PRIORITY_USER:
                 victim_idx = i
                 break
+        if victim_idx is None:
+            break  # 只剩 USER，拒绝逐出（接受预算溢出）
         evicted.append(rest.pop(victim_idx))
 
     if evicted:

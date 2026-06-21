@@ -38,21 +38,29 @@ def resolve_user_profile(
     if project_id:
         keys.append(project_id)
 
-    try:
-        from swarm.infra.db import sync_pool
+    if keys:
+        try:
+            from swarm.infra.db import sync_pool
 
-        with sync_pool(conn_str).connection() as conn:
-            with conn.cursor() as cur:
-                for key in keys:
+            # P2：原实现按 keys 逐个查（N+1 往返）。改为单次 ANY(%s) 批量取，再在内存里
+            # 按 keys 的优先级顺序选首个非空画像（项目专属 > 用户全局 > 旧版 project_id）。
+            found: dict[str, dict] = {}
+            with sync_pool(conn_str).connection() as conn:
+                with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT profile_json FROM mem_user_profile WHERE user_id = %s",
-                        (key,),
+                        "SELECT user_id, profile_json FROM mem_user_profile WHERE user_id = ANY(%s)",
+                        (keys,),
                     )
-                    row = cur.fetchone()
-                    if row and isinstance(row[0], dict) and row[0]:
-                        return _enrich_profile(row[0])
-    except Exception as exc:
-        logger.warning("resolve_user_profile failed: %s", exc)
+                    for uid, pj in cur.fetchall():
+                        if isinstance(pj, dict) and pj:
+                            found[str(uid)] = pj
+            for key in keys:  # 保持优先级顺序
+                if key in found:
+                    return _enrich_profile(found[key])
+        except Exception as exc:
+            # 不静默吞：DB 故障升 error 级（区别于"用户未配画像"的正常缺省），
+            # 仍回退默认画像保证编排不中断，但失败在日志可见。
+            logger.error("resolve_user_profile DB 查询失败，回退默认画像: %s", exc, exc_info=True)
 
     return _enrich_profile(dict(DEFAULT_ADMIN_PROFILE))
 

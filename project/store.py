@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1423,6 +1424,14 @@ def _parse_json_list(value: Any) -> list[Any]:
     return []
 
 
+def _milestone_reports_keep() -> int:
+    """每个项目保留的 milestone_reports 最大条数（P2 防无界，默认 200）。"""
+    try:
+        return max(10, int(os.environ.get("SWARM_MILESTONE_REPORTS_KEEP", "200")))
+    except ValueError:
+        return 200
+
+
 def save_milestone_report(
     *,
     project_id: str | None,
@@ -1444,6 +1453,23 @@ def save_milestone_report(
                 (project_id, phase, accept_rate, threshold, passed, Jsonb(report)),
             )
             row = cur.fetchone()
+            # P2：milestone_reports 旧实现只增不删 → 长寿项目无界膨胀。每次写入后保留该项目
+            # 最近 N 条(默认 200，可配 SWARM_MILESTONE_REPORTS_KEEP)，删除更早的。
+            if project_id:
+                keep = _milestone_reports_keep()
+                cur.execute(
+                    """
+                    DELETE FROM milestone_reports
+                     WHERE project_id = %s
+                       AND id NOT IN (
+                           SELECT id FROM milestone_reports
+                            WHERE project_id = %s
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT %s
+                       )
+                    """,
+                    (project_id, project_id, keep),
+                )
     return {
         "id": row[0],
         "project_id": row[1],

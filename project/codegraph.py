@@ -369,7 +369,9 @@ def _parse_symbols_table(cur: sqlite3.Cursor) -> list[CodegraphSymbol]:
 def _parse_references_table(cur: sqlite3.Cursor) -> list[CodegraphEdge]:
     edges: list[CodegraphEdge] = []
     try:
-        cur.execute("SELECT * FROM references")
+        # references 是 SQL 保留字，必须加引号(P2)。SQLite 宽松放行，但裸名在严格方言
+        # (PostgreSQL 等)会语法报错；加双引号既兼容当前 SQLite 又防未来迁移踩雷。
+        cur.execute('SELECT * FROM "references"')
         cols = {desc[0] for desc in cur.description}
         for row in cur.fetchall():
             edge = CodegraphEdge(

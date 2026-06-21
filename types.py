@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -218,8 +221,42 @@ class TaskHarness(BaseModel):
         return [c for c in cmds if c]
 
 
+_SUBTASK_KEY_ALIASES = {
+    # LLM 旧键 → 现字段。N-03：模型偶吐 acceptance（字段名是 acceptance_criteria），
+    # 默认 extra=ignore 会静默丢弃致验收恒空。把重映射收敛进模型本身（单一事实源），
+    # 替代散落在 brain/nodes 的手工补丁。
+    "acceptance": "acceptance_criteria",
+    "deps": "depends_on",
+    "dependencies": "depends_on",
+}
+
+
 class SubTask(BaseModel):
     """一个可独立执行的子任务"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _remap_and_warn_extra(cls, data: Any) -> Any:
+        """P2：消除 extra=ignore 的"静默丢键"。
+
+        ① 把已知旧键别名重映射到现字段（不丢数据）；
+        ② 对仍无法识别的多余键打 warning（可见而非静默吞），便于发现 schema 漂移。
+        仅处理 dict 输入（pydantic 也会传模型实例等，非 dict 原样放行）。
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for old, new in _SUBTASK_KEY_ALIASES.items():
+            if old in data and new not in data:
+                data[new] = data.pop(old)
+            elif old in data:
+                data.pop(old, None)  # 新键已在，丢弃同义旧键避免冲突
+        known = set(cls.model_fields.keys())
+        unknown = [k for k in data if k not in known]
+        if unknown:
+            logger.warning("[SubTask] 忽略未知键(可能 schema 漂移/LLM 变体): %s", unknown)
+        return data
+
     id: str
     description: str
     intent: TaskIntent = Field(

@@ -21,6 +21,15 @@ from swarm.config.settings import DatabaseConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
+
+def _preprocess_timeout_sec() -> int:
+    """预处理总超时秒数（P2 防永卡 PREPROCESSING，默认 3600，可配）。"""
+    try:
+        return max(60, int(os.environ.get("SWARM_PREPROCESS_TIMEOUT_SEC", "3600")))
+    except ValueError:
+        return 3600
+
+
 # ──────────────────────────────────────────────
 # 排除目录和文件
 # ──────────────────────────────────────────────
@@ -150,28 +159,32 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         status="PREPROCESSING",
     )
 
-    try:
+    async def _run_phases() -> tuple[dict, dict, dict]:
         # ── Phase 1: SCAN ──
         scan_result = await _phase_scan(project_id, project_path)
-
         # ── Phase 1.5: NORMS EXTRACT — 从配置文件自动提取项目规范 ──
         await _phase_extract_norms(project_id, project_path)
-
         # ── Phase 2: INDEX ──
         index_result = await _phase_index(project_id, project_path)
-
         # ── Phase 3: EMBED ──
         embed_result = await _phase_embed(project_id, project_path, index_result)
-
         # ── Phase 4: ANALYZE ──
         # _phase_analyze 内部已持久化摘要(_save_analysis_summary)与进度，返回的
         # 统计信息当前无需在此使用，故不接收返回值（避免 F841 死变量）。
         await _phase_analyze(project_id, project_path, scan_result)
-
         # ── Phase 5: BUILD SANDBOX（项目级定制沙箱）──
         # 按真实环境构建项目专属沙箱镜像 → 写 project.config["sandbox_template"]。
         # 构建失败不阻断预处理（回退通用池）。见 docs/Project_Scoped_Sandbox_Design.md。
         await _phase_build_sandbox(project_id, project_path)
+        return scan_result, index_result, embed_result
+
+    try:
+        # P2：整段预处理设总超时（默认 3600s，可配 SWARM_PREPROCESS_TIMEOUT_SEC）。
+        # 任一阶段挂死(如 embedding/沙箱构建端点 hang)→ TimeoutError → 下方 except 置 ERROR，
+        # 避免项目【永卡 PREPROCESSING】无人能用(准入闸门只放行 READY)。
+        scan_result, index_result, embed_result = await asyncio.wait_for(
+            _run_phases(), timeout=_preprocess_timeout_sec()
+        )
 
         # ── 完成 ──
         await asyncio.to_thread(
@@ -192,6 +205,15 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         )
         logger.info("Preprocessing complete for project %s", project_id)
 
+    except (TimeoutError, asyncio.TimeoutError):
+        msg = f"预处理超时(>{_preprocess_timeout_sec()}s)，置 ERROR 避免永卡 PREPROCESSING"
+        logger.error("Preprocessing TIMEOUT for project %s: %s", project_id, msg)
+        await asyncio.to_thread(
+            upsert_progress, project_id, phase="error", phase_progress=0.0,
+            message=msg, error="preprocess_timeout",
+        )
+        await asyncio.to_thread(update_project, project_id, status="ERROR")
+        return
     except Exception as exc:
         logger.exception("Preprocessing failed for project %s", project_id)
         await asyncio.to_thread(

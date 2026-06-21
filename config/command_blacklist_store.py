@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 
 import psycopg
@@ -48,6 +49,20 @@ _DEFAULT_RULES: list[tuple[str, str]] = [
 _CACHE: list | None = None
 _CACHE_AT = 0.0
 _CACHE_TTL = 30.0
+# P2：缓存有并发读写（多 worker 线程同时 run_command），加锁防竞态读到半更新状态。
+_CACHE_LOCK = threading.Lock()
+
+
+def _compile_default_rules() -> list[tuple[int, str, str]]:
+    """把内置默认危险规则编成 (id, pattern, desc)，作为 DB 不可用时的安全基线。"""
+    out: list[tuple[int, str, str]] = []
+    for i, (pat, desc) in enumerate(_DEFAULT_RULES):
+        try:
+            re.compile(pat)
+            out.append((-(i + 1), pat, desc))  # 负 id 标记内置兜底
+        except re.error:
+            continue
+    return out
 
 
 def _conn_str() -> str:
@@ -97,11 +112,18 @@ def list_rules(conn_str: str | None = None) -> list[dict]:
 
 
 def _enabled_patterns(conn_str: str | None = None) -> list[tuple[int, str, str]]:
-    """启用的规则 (id, pattern, description)，带 TTL 缓存。db 错误返回空（fail-open）。"""
+    """启用的规则 (id, pattern, description)，带 TTL 缓存（加锁）。
+
+    P2 加固：① 缓存读写加锁防并发竞态；② DB 错误不再【完全 fail-open 放行】——优先复用
+    上次成功加载的缓存（即便已过 TTL，旧规则胜过无规则）；连缓存都没有时退回【内置默认
+    危险规则基线】(_compile_default_rules)，保证 rm -rf / / fork bomb 等始终被拦，而非 DB
+    一抖就全放行。
+    """
     global _CACHE, _CACHE_AT
     now = time.monotonic()
-    if _CACHE is not None and (now - _CACHE_AT) < _CACHE_TTL:
-        return _CACHE  # type: ignore[return-value]
+    with _CACHE_LOCK:
+        if _CACHE is not None and (now - _CACHE_AT) < _CACHE_TTL:
+            return list(_CACHE)
     try:
         with _pooled_conn(conn_str) as conn:
             with conn.cursor() as cur:
@@ -116,17 +138,29 @@ def _enabled_patterns(conn_str: str | None = None) -> list[tuple[int, str, str]]
                 compiled.append((rid, pat, desc))
             except re.error:
                 logger.warning("command_blacklist 规则 %d 正则无效，跳过: %s", rid, pat)
-        _CACHE = compiled
-        _CACHE_AT = now
-        return compiled
+        with _CACHE_LOCK:
+            _CACHE = compiled
+            _CACHE_AT = now
+        return list(compiled)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("加载命令黑名单失败（fail-open 放行）: %s", exc)
-        return []
+        with _CACHE_LOCK:
+            stale = list(_CACHE) if _CACHE is not None else None
+        if stale is not None:
+            logger.warning("加载命令黑名单失败，复用上次缓存(%d 条)以免失保护: %s", len(stale), exc)
+            return stale
+        baseline = _compile_default_rules()
+        logger.warning(
+            "加载命令黑名单失败且无缓存，退回内置默认基线(%d 条，非完全放行): %s",
+            len(baseline), exc,
+        )
+        return baseline
 
 
 def invalidate_cache() -> None:
-    global _CACHE
-    _CACHE = None
+    global _CACHE, _CACHE_AT
+    with _CACHE_LOCK:
+        _CACHE = None
+        _CACHE_AT = 0.0
 
 
 def check_command(command: str, conn_str: str | None = None) -> tuple[bool, str]:

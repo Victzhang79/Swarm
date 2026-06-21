@@ -12,6 +12,23 @@ from swarm.project.diff_apply import files_from_unified_diff
 
 logger = logging.getLogger(__name__)
 
+# P2：后台任务强引用集。loop.create_task 的返回值若不被持有，任务可能在完成前被 GC，
+# 异常也随之丢失。把任务存进模块级集合保活，并在完成回调里移除 + 暴露异常。
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _track_bg_task(task: asyncio.Task) -> None:
+    _BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _BG_TASKS.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                logger.error("[hooks] 后台知识库更新任务异常: %r", exc)
+
+    task.add_done_callback(_done)
+
 
 def _build_changes(project_path: str, merged_diff: str) -> list[FileChange]:
     root = Path(project_path)
@@ -127,7 +144,7 @@ def schedule_incremental_update(
 
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_run())
+        _track_bg_task(loop.create_task(_run()))  # P2：保活 + 异常暴露，非 fire-and-forget
     except RuntimeError:
         asyncio.run(_run())
 

@@ -1267,35 +1267,8 @@ class CodeResult(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# 预热池（可选 — Phase 3+ 使用）
+# 旧 SandboxPool（已移除，P2 死桩清理）
 # ──────────────────────────────────────────────
-class SandboxPool:
-    """沙箱预热池 — 每个项目保持 1 个待命沙箱，任务来了直接用"""
-
-    def __init__(self, manager: SandboxManager, max_pool_size: int = 4):
-        self.manager = manager
-        self.max_pool_size = max_pool_size
-        self._pool: dict[str, Any] = {}
-
-    def warmup(self, project_id: str, template_id: str | None = None) -> None:
-        if project_id in self._pool:
-            return
-        sandbox = self.manager.create(template_id)
-        self._pool[project_id] = sandbox
-        logger.info("Warmed up sandbox for project %s: %s", project_id, sandbox.sandbox_id)
-
-    def acquire(self, project_id: str) -> Any:
-        if project_id in self._pool:
-            return self._pool.pop(project_id)
-        return self.manager.create()
-
-    def release(self, project_id: str, sandbox: Any, keep_alive: bool = True) -> None:
-        if keep_alive and len(self._pool) < self.max_pool_size:
-            self._pool[project_id] = sandbox
-        else:
-            self.manager.kill(sandbox.sandbox_id)
-
-    def drain(self) -> None:
-        for _pid, sbx in self._pool.items():
-            self.manager.kill(sbx.sandbox_id)
-        self._pool.clear()
+# 原 SandboxPool 是失效死代码：dispatch 每次 new 一个临时实例、warmup 把沙箱塞进它的
+# _pool 后实例即被 GC，预热指针随之丢失（见 brain/nodes/dispatch.py 的历史注释）。
+# 真正生效的是单例 HotSandboxPool（worker/sandbox_pool.py）。本类已删除，勿再引用。

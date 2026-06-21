@@ -113,12 +113,24 @@ async def upload_files(request: Request):
             results.append({"filename": raw_name, "error": f"不支持的格式: {ext}"})
             continue
 
-        # 读内容（一次性，受总大小约束）
+        # P2：先读后判 size → 巨型文件被全量读进内存后才拒绝(内存放大/可被滥用打爆)。
+        # Starlette UploadFile 暴露 .size（来自 multipart 部分长度），先据此预检，超限直接拒绝
+        # 不读内容；预检通过/size 未知时再 read（此时单文件上限已基本可控）。
+        declared = getattr(item, "size", None)
+        if isinstance(declared, int):
+            if declared > doc_ingest.DEFAULT_MAX_FILE_BYTES:
+                results.append({"filename": raw_name, "error": f"文件过大: {declared / 1024 / 1024:.1f}MB"})
+                continue
+            if total_bytes + declared > MAX_TOTAL_BYTES:
+                results.append({"filename": raw_name, "error": "批次总大小超限"})
+                continue
+
+        # 读内容（一次性；上方已据 declared size 预拦超限文件）
         content = await item.read()
         size = len(content)
         total_bytes += size
 
-        # 2) 单文件大小
+        # 2) 单文件大小（declared 缺失或谎报时的兜底实测校验）
         if size > doc_ingest.DEFAULT_MAX_FILE_BYTES:
             results.append({"filename": raw_name, "error": f"文件过大: {size / 1024 / 1024:.1f}MB"})
             continue

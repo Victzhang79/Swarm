@@ -460,11 +460,11 @@ def test_8_smoke_reimport():
             modules_ok = False
 
     # 专门验证 sandbox 相关导出
-    from swarm.worker import CodeResult, SandboxConfig, SandboxManager, SandboxPool
+    from swarm.worker import CodeResult, SandboxConfig, SandboxManager
     print(f"  ✅ SandboxManager: {SandboxManager}")
     print(f"  ✅ SandboxConfig:  {SandboxConfig}")
     print(f"  ✅ CodeResult:     {CodeResult}")
-    print(f"  ✅ SandboxPool:    {SandboxPool}")
+    # SandboxPool 已移除(P2 死桩清理)，真正生效的是 HotSandboxPool(worker/sandbox_pool.py)
 
     from swarm.tools.build_tools import (
         clear_sandbox_context,

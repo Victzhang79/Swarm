@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,8 +30,16 @@ def _is_source_file(path: Path) -> bool:
     return True
 
 
-def check_project_consistency(project_id: str, project_path: str) -> dict[str, Any]:
-    """比对磁盘 mtime 与 kb 索引记录，返回 stale / missing 文件列表。"""
+def check_project_consistency(
+    project_id: str, project_path: str, *, display_limit: int | None = 100
+) -> dict[str, Any]:
+    """比对磁盘 mtime 与 kb 索引记录，返回 stale / missing 文件列表。
+
+    display_limit：stale_files/missing_index 在返回里的展示上限（默认 100，避免 API 响应
+    巨大）。**修复(P2)**：repair 路径传 None 取【全量】列表——旧实现 repair 直接吃 [:100]
+    截断后的展示列表，导致 stale 文件 >100 时每次只修前 100、其余永不被纳入修复目标，
+    无法收敛。display_limit=None → 不截断（供 repair 用全量目标）。
+    """
     root = Path(project_path)
     if not root.is_dir():
         return {"ok": False, "error": "project path not found", "stale_files": [], "missing_index": []}
@@ -80,8 +89,8 @@ def check_project_consistency(project_id: str, project_path: str) -> dict[str, A
         "indexed_count": len(indexed),
         "stale_count": len(stale_files),
         "missing_index_count": len(missing_index),
-        "stale_files": stale_files[:100],
-        "missing_index": missing_index[:100],
+        "stale_files": stale_files if display_limit is None else stale_files[:display_limit],
+        "missing_index": missing_index if display_limit is None else missing_index[:display_limit],
         "recommendation": (
             "run preprocess or POST /knowledge/consistency-check?repair=true"
             if stale_files or missing_index
@@ -100,7 +109,12 @@ async def repair_project_consistency(
     from swarm.knowledge.scheduler import enqueue_kb_update
     from swarm.knowledge.updater import ChangeType, FileChange, UpdateEvent
 
-    report = check_project_consistency(project_id, project_path)
+    # P2：① 取【全量】列表(display_limit=None)，让 repair 据 limit 真正推进收敛，
+    # 不被展示截断卡在前 100；② 同步扫描(psycopg.connect + rglob)走 to_thread，
+    # 不阻塞事件循环。
+    report = await asyncio.to_thread(
+        check_project_consistency, project_id, project_path, display_limit=None
+    )
     if not report.get("ok"):
         return report
 
@@ -109,6 +123,12 @@ async def repair_project_consistency(
     targets.extend(report.get("missing_index") or [])
     targets.extend(item["file_path"] for item in (report.get("stale_files") or []))
     targets = list(dict.fromkeys(targets))[:limit]
+    # 返回给调用方的报告仍按展示上限截断，避免响应体过大
+    report = {
+        **report,
+        "stale_files": (report.get("stale_files") or [])[:100],
+        "missing_index": (report.get("missing_index") or [])[:100],
+    }
 
     if not targets:
         return {**report, "repair": {"status": "noop", "queued": 0}}
@@ -176,7 +196,8 @@ async def run_daily_consistency_all_projects(*, repair: bool = False) -> None:
                         report["repair"].get("queued"),
                     )
             else:
-                report = check_project_consistency(pid, path)
+                # P2：同步扫描走 to_thread，不阻塞每日巡检所在的事件循环
+                report = await asyncio.to_thread(check_project_consistency, pid, path)
                 if report.get("stale_count") or report.get("missing_index_count"):
                     logger.warning(
                         "[ConsistencyChecker] project=%s stale=%s missing=%s",

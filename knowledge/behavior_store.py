@@ -20,6 +20,10 @@ from swarm.config.settings import DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
+# P2：单任务参与共现计算的文件数上限。超过即跳过(共现是 O(n²) 对，巨型任务既无意义又
+# 拖垮写入)。40 文件 → 780 对，已是上界；更大基本是批量重排/格式化，非"经常一起改"信号。
+_CO_OCCURRENCE_MAX_FILES = 40
+
 # ──────────────────────────────────────────────
 # PG DDL — 行为存储
 # ──────────────────────────────────────────────
@@ -162,24 +166,35 @@ class BehaviorStore:
             if r.task_id:
                 by_task[r.task_id].append(r.file_path)
 
+        # P2：① 单任务文件数上限——共现是 O(n²) 对，巨型任务(一次改几十上百文件)既产生
+        # 海量噪声对又拖垮写入。超 _CO_OCCURRENCE_MAX_FILES 的任务跳过共现(那已非有意义的
+        # "经常一起改"信号)。② 所有对【批量 executemany】单次往返，替代逐对 await。
+        params: list[tuple[str, str, str]] = []
+        for _task_id, files in by_task.items():
+            unique_files = sorted(set(files))
+            if len(unique_files) > _CO_OCCURRENCE_MAX_FILES:
+                logger.info(
+                    "[co-occurrence] task 改动 %d 文件超上限 %d，跳过共现(避免 O(n²) 噪声膨胀)",
+                    len(unique_files), _CO_OCCURRENCE_MAX_FILES,
+                )
+                continue
+            for i in range(len(unique_files)):
+                for j in range(i + 1, len(unique_files)):
+                    params.append((project_id, unique_files[i], unique_files[j]))
+        if not params:
+            return
         conn = self._conn_or_raise()
         async with conn.cursor() as cur:
-            for _task_id, files in by_task.items():
-                # 去重
-                unique_files = sorted(set(files))
-                for i in range(len(unique_files)):
-                    for j in range(i + 1, len(unique_files)):
-                        fa, fb = unique_files[i], unique_files[j]
-                        await cur.execute(
-                            """
-                            INSERT INTO kb_co_occurrence (project_id, file_a, file_b, co_count, last_co_seen)
-                            VALUES (%s, %s, %s, 1, now())
-                            ON CONFLICT (project_id, file_a, file_b) DO UPDATE SET
-                                co_count    = kb_co_occurrence.co_count + 1,
-                                last_co_seen = now()
-                            """,
-                            (project_id, fa, fb),
-                        )
+            await cur.executemany(
+                """
+                INSERT INTO kb_co_occurrence (project_id, file_a, file_b, co_count, last_co_seen)
+                VALUES (%s, %s, %s, 1, now())
+                ON CONFLICT (project_id, file_a, file_b) DO UPDATE SET
+                    co_count    = kb_co_occurrence.co_count + 1,
+                    last_co_seen = now()
+                """,
+                params,
+            )
 
     # ── 查询: 高频修改文件 ──────────────────────
 
@@ -285,7 +300,7 @@ class BehaviorStore:
     # ── 清理 ────────────────────────────────────
 
     async def prune_old_logs(self, project_id: str, retention_days: int = 180) -> int:
-        """清理过旧的修改日志"""
+        """清理过旧的修改日志（顺带清理陈旧共现条目，防 kb_co_occurrence 无界）。"""
         conn = self._conn_or_raise()
         async with conn.cursor() as cur:
             await cur.execute(
@@ -296,5 +311,17 @@ class BehaviorStore:
                 (project_id, retention_days),
             )
             deleted = cur.rowcount
-        logger.info("Pruned %d old modification logs for project %s", deleted, project_id)
+            # P2：共现表同样按 last_co_seen 过期清理，避免只增不删无界膨胀。
+            await cur.execute(
+                """
+                DELETE FROM kb_co_occurrence
+                WHERE project_id = %s AND last_co_seen < now() - make_interval(days => %s)
+                """,
+                (project_id, retention_days),
+            )
+            co_deleted = cur.rowcount
+        logger.info(
+            "Pruned %d old modification logs + %d stale co-occurrences for project %s",
+            deleted, co_deleted, project_id,
+        )
         return deleted
