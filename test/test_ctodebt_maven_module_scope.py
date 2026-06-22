@@ -97,6 +97,81 @@ def test_multi_module_rule3_does_not_touch_root_pom():
         assert f"{mod}/pom.xml" in plan.subtasks[i - 1].scope.create_files
 
 
+# ── 规则5：模块依赖契约落地（治本 task f9e38dae：编译期缺依赖→必败→全量 replan） ──
+def test_rule5_deps_appended_to_pom_owner_acceptance():
+    """shared_contract.dependencies 的 artifacts 应确定性追加进【模块 pom owner】验收。"""
+    owner = SubTask(
+        id="st-1", description="脚手架+AlarmApp",
+        scope=FileScope(create_files=["ruoyi-alarm/pom.xml", "ruoyi-alarm/src/main/java/App.java"]),
+    )
+    coder = SubTask(
+        id="st-24", description="VoipNotifyServiceImpl 用 RedisTemplate",
+        scope=FileScope(create_files=["ruoyi-alarm/src/main/java/impl/Voip.java"]),
+        depends_on=["st-1"],
+    )
+    plan = TaskPlan(
+        subtasks=[owner, coder],
+        shared_contract={
+            "dependencies": [
+                {"module": "ruoyi-alarm",
+                 "artifacts": ["org.projectlombok:lombok", "org.springframework.boot:spring-boot-starter-data-redis"],
+                 "reason": "引擎/渠道子任务用 @Slf4j/RedisTemplate"}
+            ]
+        },
+    )
+    changed = normalize_plan_scopes(plan)
+    assert changed is True
+    ac = plan.subtasks[0].acceptance_criteria or []
+    hit = [c for c in ac if "ruoyi-alarm/pom.xml 必须声明依赖" in c]
+    assert hit, f"pom owner 验收应含依赖声明，实际 {ac}"
+    assert "org.projectlombok:lombok" in hit[0]
+    assert "spring-boot-starter-data-redis" in hit[0]
+    # 非 owner 子任务不应被加依赖验收
+    assert not any("必须声明依赖" in c for c in (plan.subtasks[1].acceptance_criteria or []))
+
+
+def test_rule5_no_owner_logs_warning_no_crash():
+    """依赖契约指向的模块无 pom owner 时：告警但不崩、不误伤。
+
+    用 patch 直接拦 logger.warning（caplog 在全量套件里受其他测试改 logging 配置影响而不稳）。
+    """
+    from unittest.mock import patch
+    coder = SubTask(
+        id="st-1", description="只写代码没人建 pom",
+        scope=FileScope(create_files=["orphan-mod/src/main/java/A.java"]),
+    )
+    plan = TaskPlan(
+        subtasks=[coder],
+        shared_contract={"dependencies": [{"module": "orphan-mod", "artifacts": ["g:a"]}]},
+    )
+    with patch("swarm.brain.contract_utils.logger.warning") as mock_warn:
+        normalize_plan_scopes(plan)
+    assert any("无 pom owner 承接" in str(c.args[0]) for c in mock_warn.call_args_list), \
+        mock_warn.call_args_list
+    assert not any("必须声明依赖" in c for c in (plan.subtasks[0].acceptance_criteria or []))
+
+
+def test_rule5_idempotent_and_dedup():
+    """重复跑 normalize 不重复追加同一条依赖验收。"""
+    owner = SubTask(id="st-1", description="脚手架",
+                    scope=FileScope(create_files=["m/pom.xml"]))
+    plan = TaskPlan(subtasks=[owner],
+                    shared_contract={"dependencies": [{"module": "m", "artifacts": ["g:a"]}]})
+    normalize_plan_scopes(plan)
+    normalize_plan_scopes(plan)
+    notes = [c for c in (plan.subtasks[0].acceptance_criteria or []) if "必须声明依赖" in c]
+    assert len(notes) == 1, f"应去重为 1 条，实际 {notes}"
+
+
+def test_rule5_noop_without_dependencies():
+    """无 shared_contract.dependencies 时规则5 不动任何东西（向后兼容）。"""
+    owner = SubTask(id="st-1", description="脚手架",
+                    scope=FileScope(create_files=["m/pom.xml", "m/src/A.java"]))
+    plan = TaskPlan(subtasks=[owner])  # 无 shared_contract
+    normalize_plan_scopes(plan)
+    assert not any("必须声明依赖" in c for c in (plan.subtasks[0].acceptance_criteria or []))
+
+
 # ── 验证器：N 子任务写同一文件聚合成 1 条（不再 O(n²) 刷屏） ──
 def test_validator_aggregates_conflicts():
     from swarm.brain.plan_validator import validate_plan_structure

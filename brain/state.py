@@ -97,6 +97,8 @@ class BrainState(TypedDict, total=False):
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
     replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
+    targeted_recovery_count: int        # P0-B(f9e38dae)：缺依赖编译失败的定向恢复次数（熔断防死循环）
+    targeted_recovery: bool             # P0-B：本轮走了定向恢复（补 pom 写权+只重派失败，不进 PLAN/不清全表）
     confirm_reason: str                 # P0-3：confirm 进入原因(validation_failed|ultra|manual_confirm)
 
     # ─── 合并 & 验证 ───

@@ -467,7 +467,8 @@ async def get_task_logs(task_id: str, request: Request, limit: int = 500):
 
     from swarm.logging_config import read_task_logs, resolve_log_path
 
-    limit = max(1, min(int(limit or 500), 2000))
+    # 上限 2000→20000：ultra 任务单轮日志轻松上万行，2000 封顶导致 WebUI 只见尾段、早期阶段被截。
+    limit = max(1, min(int(limit or 500), 20000))
     lines = await loop.run_in_executor(None, lambda: read_task_logs(task_id, limit=limit))
     log_path = resolve_log_path()
     return {
@@ -718,6 +719,25 @@ async def get_task_planning(task_id: str, request: Request):
         None, lambda: _app.store.get_planning_artifacts(task_id)
     )
     return {"task_id": task_id, "planning": artifacts or {}}
+
+
+# ─── GET /api/tasks/{task_id}/pending — 当前挂起的人机交互(刷新后恢复用) ─
+@router.get("/api/tasks/{task_id}/pending", tags=["任务管理"])
+async def get_task_pending(task_id: str, request: Request):
+    """返回任务当前【挂起的 interrupt】(澄清/虚假前提/技术方案评审)，供前端刷新后恢复交互卡片。
+
+    治本：澄清卡片此前仅由瞬时 SSE 渲染，刷新页面即丢失、无法答复。前端选中任务时拉此端点
+    重渲染待答问题。无挂起返回 pending=null。
+    """
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _require_perm(request, "task:read", task.get("project_id"))
+    from swarm.brain.runner import get_pending_interrupt
+
+    pending = await get_pending_interrupt(task_id)
+    return {"task_id": task_id, "pending": pending}
 
 
 @router.post("/api/tasks/{task_id}/clarify", tags=["任务管理"])

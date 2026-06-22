@@ -68,6 +68,73 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+class _PerTaskFileHandler(logging.Handler):
+    """把每条带 task 上下文的日志【额外】落到 logs/<task_id>.log；沙箱相关日志
+    (logger=swarm.worker.sandbox) 再单独落 logs/<task_id>.sandbox.log。
+
+    目的：逐任务回看体验（每个任务一份独立日志 + 一份沙箱日志），独立于全局 swarm.log
+    的轮转/混杂。LRU 控制同时打开的文件句柄数，避免大量并发任务 fd 泄漏。逐行 flush，
+    确保跑挂/被杀也能看到已写内容。`logs/` 目录 gitignore，不进版本库。
+    """
+
+    def __init__(self, logs_dir: "Path", *, max_open: int = 32) -> None:
+        super().__init__()
+        self._dir = logs_dir
+        self._max_open = max(4, int(max_open))
+        from collections import OrderedDict
+        self._files: "OrderedDict[str, object]" = OrderedDict()
+
+    def _open(self, fname: str):
+        f = self._files.get(fname)
+        if f is not None:
+            self._files.move_to_end(fname)
+            return f
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            f = open(self._dir / fname, "a", encoding="utf-8")
+        except OSError:
+            return None
+        self._files[fname] = f
+        while len(self._files) > self._max_open:
+            _, old = self._files.popitem(last=False)
+            try:
+                old.close()
+            except OSError:
+                pass
+        return f
+
+    def _write(self, fname: str, line: str) -> None:
+        f = self._open(fname)
+        if f is None:
+            return
+        try:
+            f.write(line)
+            f.flush()
+        except OSError:
+            pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        tid = getattr(record, "task_id", "") or _task_id_var.get("")
+        if not tid:
+            return  # 无 task 上下文的日志只进全局 swarm.log，不落逐任务文件
+        try:
+            line = self.format(record) + "\n"
+        except Exception:  # noqa: BLE001 — 格式化失败不应影响主流程
+            return
+        self._write(f"{tid}.log", line)
+        if record.name.startswith("swarm.worker.sandbox"):
+            self._write(f"{tid}.sandbox.log", line)
+
+    def close(self) -> None:
+        for f in list(self._files.values()):
+            try:
+                f.close()
+            except OSError:
+                pass
+        self._files.clear()
+        super().close()
+
+
 # 幂等标记（同一进程多次调用只配置一次，除非 force）
 _configured = False
 
@@ -141,6 +208,21 @@ def setup_logging(*, force: bool = False, console: bool | None = None) -> None:
             logging.getLogger(__name__).warning(
                 "无法写日志文件 %s: %s（仅控制台输出）", log_path, exc
             )
+
+    # 逐任务日志文件 handler（logs/<task_id>.log + <task_id>.sandbox.log）。
+    # 默认开启；SWARM_PER_TASK_LOGS=false 可关。便于逐任务回看，与全局 swarm.log 并存。
+    import os as _os
+    if _os.environ.get("SWARM_PER_TASK_LOGS", "true").lower() not in ("false", "0", "no"):
+        try:
+            logs_dir = PROJECT_ROOT / "logs"
+            pth = _PerTaskFileHandler(logs_dir)
+            pth.setLevel(level)
+            pth.setFormatter(formatter)
+            pth.addFilter(ctx_filter)
+            pth._swarm_managed = True  # type: ignore[attr-defined]
+            handlers.append(pth)
+        except Exception as exc:  # noqa: BLE001 — 逐任务日志失败不应致命
+            logging.getLogger(__name__).warning("逐任务日志 handler 初始化失败: %s", exc)
 
     for h in handlers:
         swarm_logger.addHandler(h)
@@ -245,8 +327,12 @@ def read_task_logs(task_id: str, *, limit: int = 500, tail_scan: int = 200_000) 
     # 快路径：主日志尾部 tail_scan 字节
     matched = _scan_file(path, tail=tail_scan)
 
-    # 回退：尾部没命中（典型 = 历史 done 任务被新日志挤出窗口）→ 扫全量 + 轮转 backup
-    if not matched:
+    # 回退：尾部匹配【不足 limit】→ 扫全量 + 轮转 backup（治本 WebUI 任务日志不完整）。
+    # 原仅在 `not matched`（零命中）才回退，对【长跑中任务】失效：其尾部总有近期匹配 →
+    # matched 非空 → 永不回退 → 早期 ANALYZE/PLAN 日志一旦被挤出 tail 窗口/滚进 .1 就丢失。
+    # 改为"尾部匹配 < limit 就回退"：仍能命中更早行（含轮转 backup）补齐，直到凑满 limit；
+    # 尾部已 ≥limit（纯 live tail 场景）则跳过全量扫，保持高效。全量扫含 tail 区，无需去重。
+    if len(matched) < limit:
         all_lines: list[str] = []
         # 轮转 backup 从旧到新：swarm.log.3 → .2 → .1 → swarm.log（时间顺序）
         import glob as _glob

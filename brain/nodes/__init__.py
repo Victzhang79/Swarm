@@ -711,6 +711,12 @@ async def plan(state: BrainState) -> dict:
     _contract = state.get("shared_contract_draft") or {}
     if _contract and not (task_plan.shared_contract or {}):
         task_plan.shared_contract = _contract
+    elif _contract and isinstance(task_plan.shared_contract, dict):
+        # PLAN LLM 自带了 shared_contract（无 dependencies）会盖掉 contract_design 的草案。
+        # dependencies 是编译期硬契约（Rule5 据此把模块依赖并集落进 pom owner 验收），
+        # 绝不能被丢——草案有、plan 自身没有时补进去（其余键以 plan 自身为准，不动）。
+        if _contract.get("dependencies") and not task_plan.shared_contract.get("dependencies"):
+            task_plan.shared_contract["dependencies"] = _contract["dependencies"]
     task_plan = enrich_plan_with_shared_contract(task_plan)
 
     # T3：同文件写权唯一——消除"同一文件被多个子任务并发写"的冲突（写权保留首个，
@@ -1258,6 +1264,153 @@ def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[s
     return new
 
 
+# ── P0-B/P1-D：scope 不可满足的编译失败（缺依赖/缺符号）识别 + 定向恢复（task f9e38dae）──
+# 现场：st-24 用 RedisTemplate 但 ruoyi-alarm/pom.xml 没声明依赖、pom 又不在 st-24 scope →
+# 原地重试 N 次必败（数学上不可满足）→ 耗尽配额 → 落全量 replan 清空 23 个完成态。治本：识别
+# 这类"缺符号/缺依赖"失败，给失败子任务补其【模块 pom】写权 + 重置徒劳的重试计数，只重派失败
+# 子任务（保留成功兄弟），让 worker 拿到编译错误 + pom 写权后真正补依赖，而非推倒重来。
+# 仅保留【缺依赖/缺符号】的特异信号，杜绝 "does not exist"/"无法访问" 这类宽串误伤
+# （会命中 "User does not exist"/"table does not exist"/Java 模块可见性 "cannot access" 等
+# 非依赖失败 → 误授 pom 写权、空烧定向恢复配额）。各语言 javac/go/rustc/py/node 的缺包特征：
+_MISSING_DEP_PATTERNS = (
+    "cannot find symbol",      # javac (en)
+    "找不到符号",               # javac (zh)
+    "程序包",                   # javac (zh): "程序包 xxx 不存在"
+    "package does not exist",  # javac (en): "package xxx does not exist"
+    "cannot find package",     # go
+    "unresolved import",       # rust / python 工具链
+    "no module named",         # python ImportError
+    "module not found",        # node
+)
+
+
+def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> bool:
+    """失败详情里是否命中"缺符号/缺依赖"编译特征（确定性、零 LLM）。"""
+    for fid in failed_ids:
+        out = subtask_results.get(fid)
+        if isinstance(out, WorkerOutput):
+            det = out.l1_details or {}
+        elif isinstance(out, dict):
+            det = out.get("l1_details", {}) or {}
+        else:
+            det = {}
+        try:
+            blob = json.dumps(det, ensure_ascii=False).lower()
+        except (TypeError, ValueError):
+            blob = str(det).lower()
+        if any(p in blob for p in _MISSING_DEP_PATTERNS):
+            return True
+    return False
+
+
+# 顶层不是【模块目录】的常见前缀——取模块名时跳过，避免把 src/test 误当模块（MEDIUM-1）。
+_NON_MODULE_TOP = ("src", "test", "target", "build", "dist", "out", "node_modules")
+
+
+def _module_of(files: list) -> str | None:
+    """从文件路径列表取顶层【模块目录】（首个含 '/' 且首段不是 src/test 等的路径）。"""
+    for f in files or []:
+        if "/" in f:
+            top = f.split("/", 1)[0]
+            if top and top not in _NON_MODULE_TOP:
+                return top
+    return None
+
+
+def _reaches(by_id: dict, start: str, target: str) -> bool:
+    """start 是否经 depends_on 链（传递）到达 target——用于加边前防环（HIGH-4）。"""
+    seen, stack = set(), [start]
+    while stack:
+        cur = stack.pop()
+        if cur == target:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        st = by_id.get(cur)
+        if st is not None:
+            stack.extend(getattr(st, "depends_on", []) or [])
+    return False
+
+
+def _add_dep_safe(by_id: dict, dependent: str, dep: str) -> bool:
+    """给 dependent 加 depends_on=dep，带传递防环（dep 已传递依赖 dependent 则不加）。"""
+    if dependent == dep:
+        return False
+    cur = by_id.get(dependent)
+    if cur is None:
+        return False
+    existing = list(getattr(cur, "depends_on", []) or [])
+    if dep in existing:
+        return False
+    if _reaches(by_id, dep, dependent):  # dep 已能到达 dependent → 加边会成环
+        return False
+    cur.depends_on = existing + [dep]
+    return True
+
+
+def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
+    """给失败子任务补其模块 <module>/pom.xml 写权，返回 {sid: mod_pom} 已授权映射。
+
+    让重试能真正改 pom 补依赖（原本 pom 不在 scope，重试再多也修不了）。同时让失败子任务
+    depends_on【该 pom 的既有 owner】（HIGH-2）：owner 可能是已 DONE 的脚手架子任务，二者都写
+    同一 pom，必须靠拓扑序让 owner 的 pom-create 在前、coder 的 pom-modify 在后，MERGE 才不冲突。
+    """
+    granted: dict = {}
+    if plan_obj is None or not hasattr(plan_obj, "subtasks"):
+        return granted
+    subs = list(plan_obj.subtasks)
+    by_id = {st.id: st for st in subs}
+    for st in subs:
+        if st.id not in failed_ids:
+            continue
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        files = list(getattr(sc, "create_files", []) or []) + list(getattr(sc, "writable", []) or [])
+        mod = _module_of(files)
+        if not mod:
+            continue
+        mod_pom = f"{mod}/pom.xml"
+        w = list(getattr(sc, "writable", []) or [])
+        cf = list(getattr(sc, "create_files", []) or [])
+        if mod_pom not in w and mod_pom not in cf:
+            w.append(mod_pom)
+            sc.writable = w
+        granted[st.id] = mod_pom
+        # 串到该 pom 的既有 owner 后面（owner = create/writable 含 mod_pom 的另一子任务）。
+        owner = next(
+            (
+                o for o in subs
+                if o.id != st.id and mod_pom in (
+                    list(getattr(getattr(o, "scope", None), "create_files", []) or [])
+                    + list(getattr(getattr(o, "scope", None), "writable", []) or [])
+                )
+            ),
+            None,
+        )
+        if owner is not None:
+            _add_dep_safe(by_id, st.id, owner.id)
+    return granted
+
+
+def _serialize_pom_writers(plan_obj, pom_by_id: dict) -> None:
+    """同一模块 pom 的多个失败写者按 id 序串成依赖链，杜绝并发写同一 pom 争抢。
+
+    传递防环（HIGH-4）：经 _add_dep_safe 检查传递可达性，不止看直接边。
+    """
+    if plan_obj is None or not hasattr(plan_obj, "subtasks"):
+        return
+    by_id = {st.id: st for st in plan_obj.subtasks}
+    groups: dict = {}
+    for sid, pom in pom_by_id.items():
+        groups.setdefault(pom, []).append(sid)
+    for _pom, members in groups.items():
+        members = sorted(members)
+        for i in range(1, len(members)):
+            _add_dep_safe(by_id, members[i], members[i - 1])
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -1415,6 +1568,58 @@ async def handle_failure(state: BrainState) -> dict:
     except Exception as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 分析异常 → 确定性回退 retry（非 LLM 建议）: {e}")
         strategy = "retry"
+
+    # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
+    # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
+    # 选 retry 还是 replan，都先走定向恢复：补模块 pom 写权 + 重置徒劳的重试计数 + 只重派失败
+    # 子任务（保留成功兄弟、不进 PLAN、不清完成态全表）。targeted_recovery_count 熔断防死循环。
+    if _is_missing_dependency_failure(subtask_results, failed_ids) and failed_ids:
+        _tr = state.get("targeted_recovery_count", 0) + 1
+        _tr_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
+        if _tr > _tr_max:
+            # 熔断：达上限仍缺依赖 → 不再 mutate plan，落常规 strategy 兜底（HIGH-3：先判上限再改 plan）。
+            logger.warning(
+                "[HANDLE_FAILURE] 定向恢复已达上限(%d 次)仍缺依赖 → 落常规 %s 兜底",
+                _tr_max, strategy,
+            )
+        else:
+            # 仅在配额内才 mutate plan（补 pom 写权 + 串 owner 依赖），杜绝兜底路径留下孤儿 scope 改动。
+            granted = _grant_module_pom_writable(plan_obj, failed_ids)
+            if granted:
+                _serialize_pom_writers(plan_obj, granted)
+                dispatch_remaining = list(state.get("dispatch_remaining", []))
+                for fid in failed_ids:
+                    subtask_results.pop(fid, None)
+                    if fid not in dispatch_remaining:
+                        dispatch_remaining.append(fid)
+                # 之前的重试因 scope 不可满足而徒劳，不计入配额——重置失败子任务重试计数。
+                _rc = dict(state.get("subtask_retry_counts", {}))
+                for fid in failed_ids:
+                    _rc[fid] = 0
+                _kept = [sid for sid in subtask_results if sid not in failed_ids]
+                logger.info(
+                    "[HANDLE_FAILURE] 定向恢复（第 %d/%d 次）：缺符号/缺依赖编译失败 → 给失败子任务 "
+                    "补模块 pom 写权 %s + 重置重试计数，仅重派失败子任务 %s（保留 %d 个完成态），"
+                    "换备选模型，不进 PLAN、不清完成态全表",
+                    _tr, _tr_max, granted, failed_ids, len(_kept),
+                )
+                return {
+                    "plan": plan_obj,
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": dispatch_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry_alternate",
+                    "use_alternate_model": True,
+                    "subtask_retry_counts": _rc,
+                    "targeted_recovery_count": _tr,
+                    "targeted_recovery": True,
+                }
+            # granted 为空（推不出模块 pom）→ 不 mutate、不自增计数，落常规 strategy（其自带
+            # replan_count 熔断会兜底升级），不会在此空转（MEDIUM-2）。
+            logger.info(
+                "[HANDLE_FAILURE] 缺依赖失败但推不出可补的模块 pom（失败子任务无模块路径）→ 落常规 %s",
+                strategy,
+            )
 
     if strategy == "replan":
         # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──

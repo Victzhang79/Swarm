@@ -67,6 +67,29 @@ def test_gate_delivery_verification_failure_blocks():
     assert allow is False and "verification_failure" in reason
 
 
+def test_gate_clarify_block_attributed_correctly_not_l2(  ):
+    """治本 661ecacb：虚假前提阻断（从未跑 L2）应归因 clarification_required，绝不误报 l2_failed。"""
+    allow, reason = can_auto_accept_delivery({
+        "clarify_blocked_by_facts": True,
+        "clarify_summary": "需求存在虚假前提：渠道配置表列出的 4 种渠道已覆盖 PRD 全部发送方式",
+        # 注意：l2_passed 缺省 False（L2 从未跑），旧逻辑会误报 l2_failed
+    })
+    assert allow is False
+    assert "clarification_required" in reason, reason
+    assert "l2_failed" not in reason, "绝不能把'需澄清'误报成 L2 失败"
+    assert "4 种渠道" in reason, "应带上具体虚假前提供用户澄清"
+
+
+def test_gate_clarify_block_precedes_l2_check():
+    """clarify 阻断优先级高于 l2：即便 l2_passed=False 也按 clarify 归因。"""
+    allow, reason = can_auto_accept_delivery({
+        "clarify_blocked_by_facts": True,
+        "clarify_summary": "X",
+        "l2_passed": False,
+    })
+    assert allow is False and "clarification_required" in reason
+
+
 def test_gate_plan_invalid_blocks():
     allow, reason = can_auto_accept_plan({"plan_valid": False, "plan_validation_issues": ["悬空依赖"]})
     assert allow is False and "plan_invalid" in reason

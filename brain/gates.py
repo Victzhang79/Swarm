@@ -57,6 +57,17 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
 
     返回 (allow, reason)。reason 同时用作 verification_failure 的归因值。
     """
+    # 治本(task 661ecacb)：虚假前提阻断（TECH_DESIGN 事实核验 → CLARIFY → DELIVER）必须【最先】
+    # 判定并【如实归因】。否则会落到下面的 l2_passed=False 分支，把"需澄清"误报成 "l2_failed:
+    # L2 集成验证未通过"——而该任务【从未派发、从未跑过 L2】，归因错误且污染 L5 错题（学成不存在
+    # 的 L2 失败）。此处给准确原因 + 可操作指引（用 --no-auto-accept 重跑并在澄清处补全事实）。
+    if state.get("clarify_blocked_by_facts"):
+        summary = (state.get("clarify_summary") or "需求存在虚假前提，需人工澄清").strip()
+        return False, (
+            "clarification_required: 检出虚假前提，需人工澄清后再执行"
+            "（请用 --no-auto-accept 重跑并在澄清处补全事实）。详情：" + summary[:400]
+        )
+
     if state.get("failure_escalated", False):
         return False, "failure_escalated: 子任务重试耗尽已升级人工"
 

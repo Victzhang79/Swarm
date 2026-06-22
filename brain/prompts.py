@@ -75,6 +75,7 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
    - 子任务间用 depends_on 串成【严格串行】依赖序（后序依赖前序），后序子任务能看到前序产出的真实接口签名，避免接口对不上。
    - 【硬约束：子任务之间 writable/create 文件【绝对不可重叠】】——每个文件只能属于一个子任务，否则 MERGE 必冲突。
    - 【聚合/注册类共享文件例外】：父 `pom.xml` 的 `<modules>`、`settings.gradle`、路由 `index` 表、DI 容器注册、i18n bundle 这类【需多处登记】的文件，指定【单一 owner 子任务】统一登记所有条目（如脚手架子任务一次注册全部新模块），其余子任务 depends_on 该 owner 并把该文件放 readable，【绝不】各自写——多写者必争抢。
+   - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个 maven/gradle 模块时，建该模块 `pom.xml` 的脚手架子任务【必须】在 pom 里一次性声明【本计划里该模块任何子任务会用到、而父 pom 未传递】的全部依赖（如 lombok、spring-boot-starter-data-redis、各 starter/web/validation 等）。后续写代码的子任务【碰不到 pom】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架 pom 多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"pom 声明全部所需依赖且 mvn compile 通过"。
    - 每个子功能子任务自身仍是垂直切片（自洽、可验证）。
    - ⚠️ 不满足"≥7文件或多组件"的功能【不要】用此拆分——4-6 文件的普通功能（如单个导出接口）仍是【一个】子任务，由一个 worker 一次改完（worker 内部会自动分阶段写，不需你拆）。
 默认倾向【少拆/不拆】：能一个子任务做完的功能就不要拆。拆分的代价（依赖/合并/失败面）通常高于收益。
@@ -156,6 +157,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
 【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选可确定性验证的 `mvn compile` 或具体编译/测试命令。
+【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块 `pom.xml`，建 pom 的子任务【必须】一次性声明本模块全部子任务会用到、而父 pom 未传递的依赖（lombok、spring-boot-starter-data-redis、各 starter 等）——写代码的子任务碰不到 pom，缺一个依赖即整模块编译失败。宁多勿漏。
 
 规则：
 - 只为【本批模块文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
@@ -212,7 +214,10 @@ PLAN_USER = """## 任务描述
   "shared_contract": {{
     "interfaces": ["InterfaceName"],
     "fields": ["fieldName"],
-    "description": "Brain 统一定义的跨子任务接口契约"
+    "dependencies": [
+      {{"module": "<新模块目录名>", "artifacts": ["groupId:artifactId", "org.projectlombok:lombok"], "reason": "本模块子任务用到 @Slf4j/RedisTemplate 等，父 pom 未传递"}}
+    ],
+    "description": "Brain 统一定义的跨子任务接口契约。dependencies：每个新建模块需在其 pom 声明的依赖并集（建 pom 的脚手架子任务负责落地，写代码的子任务碰不到 pom）"
   }},
   "subtasks": [
     {{

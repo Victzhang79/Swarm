@@ -121,13 +121,19 @@ _NODE_STATUS_MAP: dict[str, str] = {
 }
 
 # 需要在人工审核处暂停的 interrupt 类型
-_REVIEW_INTERRUPT_TYPES = frozenset({"deliver", "confirm_plan", "clarify", "review_design"})
+# 治本(task 661ecacb)：补上 clarify_fact_issue——TECH_DESIGN 事实核验检出虚假前提后，交互模式
+# 走 interrupt({"type":"clarify_fact_issue"})。此前它不在本集合 → runner 不 surfaced →
+# --no-auto-accept 下任务在 clarify 处静默暂停、前端无提示 → 死等。补进来才能让用户答复。
+_REVIEW_INTERRUPT_TYPES = frozenset(
+    {"deliver", "confirm_plan", "clarify", "clarify_fact_issue", "review_design"}
+)
 
 # interrupt 类型 → (任务状态, 人类可读标签)
 _INTERRUPT_STATUS_LABEL = {
     "confirm_plan": ("CONFIRMING", "计划确认"),
     "deliver": ("DELIVERING", "结果审核"),
     "clarify": ("CLARIFYING", "需求澄清"),
+    "clarify_fact_issue": ("CLARIFYING", "需求澄清（虚假前提）"),
     "review_design": ("DESIGN_REVIEW", "技术方案评审"),
 }
 
@@ -220,7 +226,35 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
 
     subtask_results = state.get("subtask_results")
     if isinstance(subtask_results, dict):
-        updates["completed_subtasks"] = len(subtask_results)
+        # 治本(task 1bc867a1：concept 概览 completed 35 > count 34)：completed 不能用
+        # len(subtask_results)——它累积了跨 replan/retry/rebase 的【全部】结果（含失败结果 +
+        # st-N-2 重生成变体 + 已不在当前 plan 的旧 id），必然 > 当前 plan 的 subtask_count。
+        # 正确语义 = 【在当前 plan 内 且 L1 通过】的子任务数；并夹紧到 subtask_count 兜底。
+        def _passed(out: Any) -> bool:
+            v = getattr(out, "l1_passed", None)
+            if v is None and isinstance(out, dict):
+                v = out.get("l1_passed")
+            return bool(v)
+
+        plan_ids: set | None = None
+        _plan_obj = state.get("plan")
+        if _plan_obj is not None:
+            _subs = getattr(_plan_obj, "subtasks", None)
+            if _subs is None and isinstance(_plan_obj, dict):
+                _subs = _plan_obj.get("subtasks")
+            if _subs:
+                plan_ids = {
+                    (getattr(s, "id", None) if not isinstance(s, dict) else s.get("id"))
+                    for s in _subs
+                }
+        if plan_ids:
+            done = sum(1 for sid, out in subtask_results.items() if sid in plan_ids and _passed(out))
+        else:
+            done = sum(1 for out in subtask_results.values() if _passed(out))
+        _cnt = updates.get("subtask_count")
+        if isinstance(_cnt, int) and done > _cnt:
+            done = _cnt  # 兜底夹紧：completed 永不超过 subtask_count
+        updates["completed_subtasks"] = done
 
     merged_diff = state.get("merged_diff")
     if merged_diff:
@@ -409,6 +443,48 @@ def _extract_interrupt_info(snapshot: Any, state: dict[str, Any]) -> dict[str, A
             if isinstance(val, dict):
                 return val
     return None
+
+
+async def get_pending_interrupt(task_id: str) -> dict[str, Any] | None:
+    """读任务的 LangGraph 快照，返回当前【挂起的 interrupt】，供前端刷新后恢复人机交互卡片。
+
+    治本(task 661ecacb)：澄清/审核卡片此前只由瞬时 SSE 事件渲染，刷新页面后无法找回 →
+    挂起的澄清问题丢失、无法答复。本函数读取实时快照（纯读、不推进图），让前端在选中任务时
+    主动拉取并重渲染。无挂起 / 非人机交互类型返回 None。
+    """
+    from swarm.tracing import brain_graph_config
+
+    graph = get_compiled_brain_graph()
+    task_rec = store.get_task(task_id) or {}
+    thread_id = task_rec.get("thread_id") or task_id
+    _plan_rec = task_rec.get("plan")
+    _subtask_n = None
+    if isinstance(_plan_rec, dict):
+        _subs = _plan_rec.get("subtasks")
+        _subtask_n = len(_subs) if isinstance(_subs, list) else None
+    config = brain_graph_config(
+        task_id=task_id,
+        project_id=task_rec.get("project_id") or "",
+        thread_id=thread_id,
+        resume=False,
+        description=(task_rec.get("description") or "")[:200],
+        complexity=task_rec.get("complexity"),
+        subtask_count=_subtask_n,
+    )
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回无挂起
+        logger.debug("[PENDING] 读取快照失败 task=%s: %s", task_id, exc)
+        return None
+    state = dict(snapshot.values) if snapshot and snapshot.values else {}
+    info = _extract_interrupt_info(snapshot, state)
+    if not info:
+        return None
+    itype = info.get("type", "")
+    if itype not in _REVIEW_INTERRUPT_TYPES:
+        return None
+    _status, label = _INTERRUPT_STATUS_LABEL.get(itype, ("DELIVERING", "结果审核"))
+    return {"interrupt_type": itype, "interrupt": info, "label": label}
 
 
 async def _handle_post_run(

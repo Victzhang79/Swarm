@@ -170,6 +170,12 @@ function renderTaskDetail(task) {
     loadPlanningArtifacts(task.id);
   }
 
+  // 治本：刷新/重选任务后，恢复【当前挂起的人机交互卡片】（澄清/虚假前提/方案评审）。
+  // 之前澄清卡片只由瞬时 SSE 渲染，刷新即丢失、无法答复。
+  if (typeof recoverPendingInteraction === 'function' && task.id) {
+    recoverPendingInteraction(task);
+  }
+
   if (task.learn_summary) {
     tryShowLearnNotice(typeof task.learn_summary === 'string' ? JSON.parse(task.learn_summary) : task.learn_summary);
   }
@@ -198,7 +204,7 @@ async function loadTaskLogsIntoPanel(taskId) {
   if (!panel) return;
   panel.innerHTML = '<div class="log-line info">加载历史日志…</div>';
   try {
-    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=1000');
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=20000');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     const lines = data.lines || [];
@@ -258,7 +264,24 @@ async function viewTaskLogs(taskId) {
     if (followEl.checked) body.scrollTop = body.scrollHeight;
   };
 
-  // 优先 SSE 实时流；失败则回退到一次性拉取
+  // 先一次性拉【历史全量】（含早期阶段 + 轮转 backup），再挂 SSE 吐实时增量。
+  // 治本"running 任务日志不完整"：SSE 的 poller 只从连接时刻往后吐新行，开窗前已发生的
+  // ANALYZE/PLAN/TECH_DESIGN 它一概不补 → 之前 running 任务只能看到打开后的尾巴。
+  let historyLoaded = false;
+  liveEl.textContent = '加载历史…';
+  try {
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=20000');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.lines && data.lines.length) {
+        body.textContent = data.lines.join('\n');
+        body.scrollTop = body.scrollHeight;
+        historyLoaded = true;
+      }
+    }
+  } catch (e) { /* 历史拉取失败不致命，下面 SSE 仍会吐实时 */ }
+
+  // 挂 SSE 实时增量（接在历史之后）；失败且无历史才回退一次性拉取
   try {
     const es = new EventSource(sseUrl('/api/tasks/' + encodeURIComponent(taskId) + '/logs/stream'));
     _taskLogsES = es;
@@ -269,21 +292,17 @@ async function viewTaskLogs(taskId) {
       liveEl.textContent = '— 已结束';
       liveEl.style.color = 'var(--text-muted,#888)';
       _closeTaskLogsStream();
-      // 终态任务：SSE 仅吐末尾窗口内的实时增量，历史日志（已被新日志挤出
-      // tail 窗口 / 滚动到 backup）SSE 吐不出 → 正常 end 但 gotAny=false。
-      // 必须回退到一次性 /logs 拉取（后端有全量+轮转 backup 回退），否则历史
-      // 终态任务永远显示"暂无日志"。此前只在 onerror 回退，end 路径漏了。
-      if (!gotAny) fetchTaskLogsOnce(taskId, body);
+      // 终态任务 SSE 吐不出历史；若历史也没拉到才回退一次性拉取。
+      if (!gotAny && !historyLoaded) fetchTaskLogsOnce(taskId, body);
     });
     es.onerror = () => {
-      // 连接错误：若尚无数据，回退一次性拉取
-      liveEl.textContent = '○ 断开';
+      liveEl.textContent = historyLoaded ? '○ 实时断开（历史已载）' : '○ 断开';
       liveEl.style.color = 'var(--text-muted,#888)';
       _closeTaskLogsStream();
-      if (!gotAny) fetchTaskLogsOnce(taskId, body);
+      if (!gotAny && !historyLoaded) fetchTaskLogsOnce(taskId, body);
     };
   } catch (e) {
-    fetchTaskLogsOnce(taskId, body);
+    if (!historyLoaded) fetchTaskLogsOnce(taskId, body);
   }
 }
 
@@ -294,7 +313,7 @@ function _closeTaskLogsStream() {
 async function fetchTaskLogsOnce(taskId, body) {
   body.textContent = '加载中…';
   try {
-    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=1000');
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=20000');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     body.textContent = (data.lines && data.lines.length) ? data.lines.join('\n') : (data.hint || '暂无该任务日志。');
@@ -770,6 +789,9 @@ function startTaskSSE(taskId) {
           if (itype === 'clarify') {
             renderClarifyPrompt(taskId, data.interrupt || {});
             appendLog('warning', data.message || '等待需求澄清');
+          } else if (itype === 'clarify_fact_issue') {
+            renderFactIssueClarify(taskId, data.interrupt || {});
+            appendLog('warning', data.message || '检出虚假前提，等待澄清');
           } else if (itype === 'review_design') {
             renderDesignReviewPrompt(taskId, data.interrupt || {});
             appendLog('warning', data.message || '等待技术方案评审');

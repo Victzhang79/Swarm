@@ -395,6 +395,47 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
                 cur.depends_on = deps
                 changed = True
 
+    # ── 规则 5：模块依赖契约落地（治本：编译期缺依赖 → 必败 → 全量 replan，task f9e38dae）──
+    # 现场：st-1 顺手建 ruoyi-alarm/pom.xml 只声明自己要的依赖；后续 30 个引擎/渠道子任务用
+    # RedisTemplate/@Slf4j 但 pom 没声明、它们 scope 又碰不到 pom → mvn compile 必败。根因=
+    # 规划器从不把"模块依赖并集"当契约。本规则：把 shared_contract.dependencies 里每个模块需要的
+    # artifacts，确定性地追加进【该模块 pom owner 子任务】的 acceptance_criteria（additive、去重），
+    # 即使 LLM 漏写 prompt 要求，也强制 owner 把依赖声明全、可被 mvn compile 验收。零 LLM、纯函数可测。
+    shared = getattr(plan, "shared_contract", None) or {}
+    deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
+    if isinstance(deps_spec, list) and deps_spec:
+        for entry in deps_spec:
+            if not isinstance(entry, dict):
+                continue
+            mod = (entry.get("module") or "").strip().rstrip("/")
+            arts = [a for a in (entry.get("artifacts") or []) if a]
+            if not mod or not arts:
+                continue
+            mod_pom = f"{mod}/pom.xml"
+            owner = next(
+                (
+                    st for st in subtasks
+                    if mod_pom in (
+                        list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+                        + list(getattr(getattr(st, "scope", None), "writable", []) or [])
+                    )
+                ),
+                None,
+            )
+            if owner is None:
+                logger.warning(
+                    "[normalize] 规则5：模块 %s 的依赖契约无 pom owner 承接（%d 个 artifacts 落空）"
+                    "——编译期可能缺依赖，请确认有脚手架子任务建 %s",
+                    mod, len(arts), mod_pom,
+                )
+                continue
+            ac = list(getattr(owner, "acceptance_criteria", []) or [])
+            note = f"{mod}/pom.xml 必须声明依赖: {sorted(arts)}（缺一即整模块 mvn compile 失败）"
+            if note not in ac:
+                ac.append(note)
+                owner.acceptance_criteria = ac
+                changed = True
+
     # ── 规则 2：被依赖产物自动入 readable ──
     by_id = {st.id: st for st in subtasks}
     for st in subtasks:
