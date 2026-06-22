@@ -231,12 +231,18 @@ class SwarmRetriever:
         # （learn 阶段命中成功模式 / 错题重现）单独触发。
         if self._memory:
             try:
+                # 宽召回(retrieval_top_k) → cross-encoder 精排 + 近因融合 → 截 rerank_top_k。
+                # 复用已有 rerank 通路(ai.bit:8081 TEI bge-reranker-v2-m3，reranker.simple 格式)，
+                # 服务不可用时优雅回退原(余弦+近因)序，不阻塞。
+                wide = self._kb_config.retrieval_top_k or 20
                 mistakes = await self._memory.query_mistakes(
-                    project_id, task_desc, top_k=5
+                    project_id, task_desc, top_k=wide
                 )
                 successes = await self._memory.query_successes(
-                    project_id, task_desc, top_k=5
+                    project_id, task_desc, top_k=wide
                 )
+                mistakes = await self._rerank_memory(task_desc, mistakes)
+                successes = await self._rerank_memory(task_desc, successes)
                 context["mistakes"] = mistakes
                 context["successes"] = successes
                 stats["mistakes_count"] = len(mistakes)
@@ -537,17 +543,53 @@ class SwarmRetriever:
                 key=lambda x: x.get("co_count", x.get("mod_count", 0)), reverse=True
             )
 
+        # 已 cross-encoder 精排+近因融合的，优先用 memory_rank_score 保序；否则回退 similarity。
         if context.get("mistakes"):
             context["mistakes"].sort(
-                key=lambda x: x.get("similarity", 0.0), reverse=True
+                key=lambda x: x.get("memory_rank_score", x.get("similarity", 0.0)), reverse=True
             )
 
         if context.get("successes"):
             context["successes"].sort(
-                key=lambda x: x.get("similarity", 0.0), reverse=True
+                key=lambda x: x.get("memory_rank_score", x.get("similarity", 0.0)), reverse=True
             )
 
         return context
+
+    # 近因融合地板：与 store.RECENCY_RANK_FLOOR 同义——精排语义分至多被近因打 5 折。
+    _MEM_RECENCY_FLOOR = 0.5
+
+    async def _rerank_memory(
+        self, query: str, items: list[dict[str, Any]], text_key: str = "description"
+    ) -> list[dict[str, Any]]:
+        """L5/L6 cross-encoder 精排 + 近因融合，截 rerank_top_k。
+
+        宽召回候选 → TEI bge-reranker(simple) 现成通路打语义分 → 乘近因因子(effective_weight)
+        → 截断。服务不可用/异常时优雅回退原(余弦+近因)序，绝不阻塞主检索。
+        """
+        top_k = self._kb_config.rerank_top_k or 5
+        if not items or len(items) <= 1:
+            return items[:top_k]
+        try:
+            import asyncio
+
+            from swarm.knowledge.reranker import rerank_documents
+            reranked = await asyncio.to_thread(
+                rerank_documents, query, items, top_k=len(items), text_key=text_key
+            )
+            floor = self._MEM_RECENCY_FLOOR
+            for d in reranked:
+                base = d.get("rerank_score")
+                if base is None:
+                    base = d.get("similarity", 0.0)
+                eff = float(d.get("effective_weight", 1.0) or 0.0)
+                eff = min(max(eff, 0.0), 1.0)
+                d["memory_rank_score"] = base * (floor + (1.0 - floor) * eff)
+            reranked.sort(key=lambda x: x.get("memory_rank_score", 0.0), reverse=True)
+            return reranked[:top_k]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("L5/L6 rerank 失败(回退原序): %s", exc)
+            return items[:top_k]
 
     async def _apply_hybrid_fusion(
         self, context: KnowledgeContext, project_id: str = ""

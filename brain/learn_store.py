@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
@@ -22,6 +23,26 @@ logger = logging.getLogger(__name__)
 # 完全失效。阈值取偏高余弦相似度，确保只对【确属同一条】记录强化，避免误并不同记录。
 # 注：query_* 在 embedding 不可用(零向量)时返回 []，此时自动跳过强化、退回插新行(优雅降级)。
 _REINFORCE_SIMILARITY = 0.92
+
+
+def _idempotency_key(task_id: str, outcome: str, content: str) -> str:
+    """learn 写入的确定性幂等键：同一(task, outcome, 摘要)重放得同键 → 用于去重防双计数。"""
+    raw = f"{task_id}|{outcome}|{content}".encode("utf-8", "ignore")
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+async def _already_persisted(store: MemoryStore, project_id: str, idem_key: str) -> bool:
+    """L2 摘要里是否已落过该幂等键(防 learn 重放：成功后重试会二次写 L2 + 二次强化计数)。
+
+    best-effort：检查失败时返回 False(放行)，绝不因可观测性阻塞主落库。
+    注：检查与写入非原子(TOCTOU)，挡的是【顺序重放/重试】这一现实场景；
+    并发同任务 learn 极罕见(一个任务一次 learn)，真要强一致需加唯一约束(留作迁移)。
+    """
+    try:
+        return await store.summary_has_idempotency_key(project_id, idem_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[LEARN_STORE] 幂等检查跳过(非致命): %s", exc)
+        return False
 
 
 def _as_list(value: Any) -> list[str]:
@@ -83,9 +104,15 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
     l2 = build_l2_summary(state, outcome=_outcome, parsed=parsed)
     success_payload = build_success_payload(state, parsed)
 
+    idem_key = _idempotency_key(task_id, _outcome, l2["summary"])
+
     store = MemoryStore()
     await store.connect()
     try:
+        # WS4 幂等：learn 重放(成功后重试)若已落过同键 → 跳过，避免二次写 L2 + 二次 reuse_count++。
+        if await _already_persisted(store, project_id, idem_key):
+            logger.info("[LEARN_STORE] 幂等命中(重放)，跳过成功落库 key=%s", idem_key)
+            return {"persisted": False, "reason": "duplicate", "idempotent": True}
         # A-P1-26：L6 成功模式(写新 / reuse_count++) 与 L2 任务摘要 包进单事务。
         # 否则 step-1(写 success / 强化复用计数) 成功而 step-2(写 task_summary) 失败时，
         # 会留下孤儿成功记录 + 已自增的 reuse_count（双重计数），下次仍可被强化，污染权重。
@@ -130,7 +157,8 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
                     lessons_learned=(
                         str(l2["lessons_learned"])[:500] if l2.get("lessons_learned") else None
                     ),
-                    metadata={**(l2.get("metadata") or {}), "success_id": success_id},
+                    metadata={**(l2.get("metadata") or {}), "success_id": success_id,
+                              "idempotency_key": idem_key},
                 ),
             )
         return {
@@ -170,9 +198,15 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
         "source": "learn_failure",
     }
 
+    idem_key = _idempotency_key(task_id, "failure", l2["summary"])
+
     store = MemoryStore()
     await store.connect()
     try:
+        # WS4 幂等：learn 重放若已落过同键 → 跳过，避免二次写 L5 + 二次 occurrence_count++。
+        if await _already_persisted(store, project_id, idem_key):
+            logger.info("[LEARN_STORE] 幂等命中(重放)，跳过错题落库 key=%s", idem_key)
+            return {"persisted": False, "reason": "duplicate", "idempotent": True}
         # A-P1-26：L5 错题(写新 / occurrence_count++) 与 L2 摘要 包进单事务，
         # 避免 step-2 失败留下孤儿错题 + 双重计数的 occurrence_count。
         async with store.transaction():
@@ -201,7 +235,8 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
                     summary=l2["summary"],
                     outcome="failure",
                     lessons_learned=mistake.get("fix_description"),
-                    metadata={**(l2.get("metadata") or {}), "mistake_id": mistake_id},
+                    metadata={**(l2.get("metadata") or {}), "mistake_id": mistake_id,
+                              "idempotency_key": idem_key},
                 ),
             )
         logger.info("[LEARN_STORE] L5 错题 id=%s project=%s", mistake_id, project_id)

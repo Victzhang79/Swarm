@@ -97,12 +97,20 @@ def test_query_mistakes_param_order_with_error_type():
 
     asyncio.run(_run())
     params = captured["params"]
-    # 占位符顺序：select(vector) → where(project_id) → error_type → order by(vector) → limit
-    assert len(params) == 5, params
-    assert params[0].startswith("[") and params[3].startswith("["), "两个 %s::vector 位都必须是向量串"
-    assert params[1] == "p"
-    assert params[2] == "integration_failure", "error_type 必须绑到 AND error_type=%s（而非 ORDER BY 的向量位）"
-    assert params[4] == 1
+    # WS1/WS2 后占位符顺序(子查询现算 effective_weight，外层近因融合排序，无第二个向量位)：
+    #   similarity(vector) → effective_weight(factor, as_of) → where(project_id) → error_type
+    #   → outer where(threshold) → order by(rec_floor, rec_floor) → limit
+    assert len(params) == 9, params
+    assert params[0].startswith("["), "唯一的 %s::vector 位必须是向量串"
+    assert params[1] == 0.9, "L5 衰减因子"
+    assert params[2] is None, "as_of 默认 None(→ now())"
+    assert params[3] == "p"
+    assert params[4] == "integration_failure", "error_type 必须绑到 AND error_type=%s（而非向量/因子位）"
+    assert params[5] == 0.05, "effective_weight 阈值"
+    assert params[6] == 0.5 and params[7] == 0.5, "近因排序地板 RECENCY_RANK_FLOOR ×2"
+    assert params[8] == 1, "top_k"
+    # 强化护栏：唯一的向量位是 params[0]，error_type 绝不会落到任何 ::vector 占位符上
+    assert sum(1 for p in params if isinstance(p, str) and p.startswith("[")) == 1
 
 
 # ── P1-DEBT-03：错题重现/成功复用强化已有记录（occurrence_count++/reuse_count++） ──

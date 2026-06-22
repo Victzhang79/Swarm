@@ -117,6 +117,27 @@ async def create_mistake(project_id: str, request: Request, req: MistakeCreateRe
     return await loop.run_in_executor(None, _insert)
 
 
+@router.get("/api/projects/{project_id}/memories/health", tags=["记忆"])
+async def memory_health(project_id: str, request: Request):
+    """WS4 可观测：L5/L6 记忆规模 + 有效权重分布 + 去重(merged)率。"""
+    _require_perm(request, "memory:read", project_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _app._validate_project, project_id)
+
+    async def _do():
+        from swarm.memory.decay import MemoryDecay
+        from swarm.memory.store import MemoryStore
+
+        store = MemoryStore()
+        await store.connect()
+        try:
+            return await MemoryDecay(store).get_memory_health(project_id)
+        finally:
+            await store.close()
+
+    return await _do()
+
+
 @router.post("/api/projects/{project_id}/memories/mistakes/{mid}/dismiss", tags=["记忆"])
 async def dismiss_mistake(project_id: str, mid: int, request: Request):
     """标记错题为已修复/归档（检索降权，不物理删除）"""
@@ -383,22 +404,33 @@ async def get_memory_profile(project_id: str, request: Request):
 
 
 @router.put("/api/projects/{project_id}/memories/profile", tags=["记忆"])
-async def update_memory_profile(project_id: str, req: ProfileUpdateRequest, request: Request):
-    """更新当前用户在项目下的 L1 画像"""
+async def update_memory_profile(
+    project_id: str, req: ProfileUpdateRequest, request: Request, merge: bool = False
+):
+    """更新当前用户在项目下的 L1 画像。
+
+    merge=false(默认)：整体覆盖(替换全部字段)。
+    merge=true：顶层键浅合并(只更新给出的字段，其余历史画像保留)——WS4 覆盖 vs 合并显式分流。
+    """
     user = _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
     storage_key = _profile_storage_key(user.id, project_id)
 
     def _upsert() -> dict[str, Any]:
+        set_clause = (
+            "profile_json = COALESCE(mem_user_profile.profile_json, '{}'::jsonb) || EXCLUDED.profile_json"
+            if merge
+            else "profile_json = EXCLUDED.profile_json"
+        )
         with _app._get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO mem_user_profile (user_id, profile_json, updated_at)
                     VALUES (%s, %s, now())
                     ON CONFLICT (user_id) DO UPDATE SET
-                        profile_json = EXCLUDED.profile_json,
+                        {set_clause},
                         updated_at   = now()
                     RETURNING profile_json
                     """,
@@ -416,4 +448,5 @@ async def update_memory_profile(project_id: str, req: ProfileUpdateRequest, requ
         "project_id": project_id,
         "profile_json": profile_json,
         "updated": True,
+        "merged": merge,
     }

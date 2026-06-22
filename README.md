@@ -2,39 +2,76 @@
 
 > 不是又一个 AI 编程助手 —— 而是一套**对交付结果负责**的多智能体工程系统。
 
-大模型很会写代码，但**很会自信地交付错的东西**。在"满地都是编程智能体"的今天，真正的瓶颈早已不是"让 AI 写出代码"，而是**怎么让一群自主的 AI 在没有人盯着时，把活干对、干完、并且每一步都可追溯**。
+大模型很会写代码，但**也很会自信地交付错的东西**。在"满地都是编程智能体"的今天，瓶颈早已不是"让 AI 写出代码"，而是**怎么让一群自主的 AI 在没人盯着时，把活干对、干完、且每一步可追溯**。
 
-Swarm 解决的就是这件事：把一个需求交给一套**有分工、有验证、有记忆**的 AI 智能体团队——
+Swarm 把一个需求交给一套**有分工、有验证、有记忆**的智能体团队：**Brain** 理解需求、做技术设计、拆解子任务；**Worker** 在隔离沙箱里写代码、跑构建、自我验证；**确定性闸门**在 LLM 自评之前先用编译/测试/lint 卡一道硬标准；**记忆系统**把每次审核反馈沉淀下来，让系统越用越懂你的项目。
 
-- **Brain** 理解需求、做技术设计、把活拆成子任务；
-- **Worker** 在隔离沙箱里实际写代码、跑构建、自我验证；
-- **确定性闸门** 在 LLM 自评之前，先用编译/测试/lint 这类**不靠模型嘴说**的硬标准卡一道；
-- **记忆系统** 把每次审核反馈沉淀下来，让系统越用越懂这个项目。
-
-> **和 Cursor / Copilot / Claude Code 的区别**：它们是"坐在你旁边帮你写"的副驾，由你逐行把关；Swarm 是"接过整个需求、自己拆解执行、跑完验证再交还给你"的工程班子。前者优化的是**单人手速**，Swarm 优化的是**无人值守下的交付可信度**——这恰恰是智能体越自主、越不可或缺的那一层。
-
-**为什么"流程"在 agent 时代反而更重要？** 模型能力越强、越敢自己做主，越需要一层不依赖它自我感觉的客观约束：谁拆的任务、谁执行的、过没过确定性闸门、哪条记忆影响了决策——全程状态机驱动、可追溯、可回放。这不是上个时代的瀑布流程，这是让自主智能体**可被信任**的工程问责制。
+> **和 Cursor / Copilot / Claude Code 的区别**：它们是"坐你旁边帮你写"的副驾，由你逐行把关，优化的是**单人手速**；Swarm 是"接过整个需求、自己拆解执行、跑完验证再交还给你"的工程班子，优化的是**无人值守下的交付可信度**——智能体越自主，这一层越不可或缺。
 
 ---
 
-## ✨ 核心特性
+## 🔄 它是怎么干活的
 
-- **多智能体编排**：Brain（编排）→ 难度路由 → Worker（执行）→ 验证 → 记忆学习，全程状态机驱动（LangGraph）。
-- **隔离沙箱执行**：Worker 在 CubeSandbox（E2B 兼容）中写代码、跑构建/测试，支持**项目级定制沙箱**（按项目真实环境构建专属镜像，依赖缓存命中、构建零下载）。
-- **混合模型路由**：子任务按难度（trivial / medium / complex / multimodal）路由到不同模型。Worker 执行层默认走**本地小模型并行**（多模型分担不同难度子任务），各档配**多级兜底链**——主力失败自动逐级降级到同级另一主力 → 次级 → 兜底模型，全本地不外溢；Brain 编排层用大模型。可接 SiliconFlow / OpenAI / OpenRouter / DeepSeek / 智谱 / 本地推理等任意 OpenAI 兼容接入点，路由表与多级兜底链均可在 WebUI 可视化配置。
-- **模型能力分级（可选）**：按 Brain 主模型能力自动收紧/放宽编排约束——强模型少澄清/少打回/少二次拆分（降延迟），弱模型多兜底。默认关闭（行为零变化），Web UI 一键启用 + A/B。
-- **自动并行编排**：剥离 LLM 误加的"假依赖"，让真正独立的子任务并行执行（依赖 DAG 驱动，非保守串行），merge 冲突检测兜底。
-- **代码知识库**：基于符号表 + 向量检索（embedding + rerank，可配云端或自建），为每个任务精准注入相关代码上下文；Worker 可按需即时检索（just-in-time），不止预灌。**多语言语法感知切分**：装有 tree-sitter 对应 grammar 时按 Java / TypeScript / JavaScript / Go 的真实语法结构切块（Java 按方法切），检索粒度更准；缺 grammar 时自动回退字符切兜底（不阻断）。**多源/多格式资料采集**（Web UI 知识库页"导入文档"一键操作）：本地 PDF / Word / HTML / Markdown / 图片解析（统一解析层，含格式白名单 / 大小上限 / 超时加固）+ 语雀远端接口（配置只读 Token 即可；飞书 / 腾讯文档规划中，需 OAuth），可先 dry-run 预览再落库。
-- **确定性验证闸门**：Worker 产物先过确定性 L1 闸门（编译/测试/lint），再走 LLM 审查，最后人工 accept —— **不把"模型说它对了"当成"它真的对了"**：修复轮用真实编译/lint 证据驱动；返工重规划时清空旧完成态、防"提前宣告完成"（premature victory）。
-- **失败隔离与部分交付**：单个子任务重试耗尽（如模型在某文件上卡住）不再让整个任务"全有或全无"地失败——系统**放弃该子任务及其下游依赖，继续交付其余已完成且编译通过的产物**，任务诚实标记为 `PARTIAL`（明确列出放弃项，绝不当成功 `DONE`）。重试时还会把"卡住/拒答"的子任务**升级到能力更强的模型**，而非降级。多 Worker 主力（强模型）并行接活、任一推理后端故障自动跨后端兜底（强→次→慢但大上下文），让无人值守下尽量多产出、不被单点拖垮。
-- **记忆学习闭环**：每次审核反馈沉淀为分层记忆（L0–L6），影响后续编排与生成。
-- **小模型友好的上下文治理**：Worker 在有限上下文窗口的小模型上也能稳定干活——ReAct 历史按 token 预算自动裁剪、文件按需局部读取、子任务 scope 精确收窄到最小文件集，避免"大模型做脑、小模型做手"时小模型上下文被撑爆。规划阶段还会**把相关文件的真实代码片段预读注入子任务**，让 Worker 拿到即可动手、不必在沙箱里逐个翻文件耗尽步数预算。
-- **产品经理式需求**：需求只描述"要什么功能"即可，**无需点名要改哪个文件/类**——系统先经【需求转化/技术设计前置阶段】把模糊的产品话翻译成文件级技术方案（要建什么表/字段、按项目分层规范要新建/修改哪些文件），再交给规划。已验证"想要个功能管理设备"一句话 → 系统自主设计并产出 8 文件全栈模块（实体/Mapper/Service/Controller + 前端 + 建表）端到端跑通。一个跨多文件的完整功能按"垂直切片"作为一个子任务交付，而非机械按文件数拆碎；文件较多时 Worker **自动分阶段编码**（按文件分批、各批独立步数预算、阶段间锁定进度），即便单批触限也不丢已写文件。超大功能（多组件）按"接口→实现→装配"依赖序拆成多个子任务，前序产出（接口签名）自动注入后序子任务。**超大型需求（上百文件）按功能模块分批拆解**——每个模块作为一批垂直切片，规避单次 LLM 生成超长方案/DAG 卡死，逐批产出可见进度（批次/百分比/耗时）；多模块并行实现前先由 Brain 产出**全局共享契约**（跨模块接口/DTO/常量/API 规范）注入每个 Worker，确保多个 Worker 产出的接口对得上、不重复造同名类；同一文件的写权在规划期统一协调——独占型文件归单一 Worker；而**注册表/清单类聚合文件**（构建模块清单 `pom.xml`/`settings.gradle`、路由表、依赖注入注册表、i18n 资源等天然需多处登记的文件）则让各 Worker **串行登记、互不覆盖且不丢任何一方的改动**（旧策略只保留第一个写者会静默丢失其余登记，已治本）。
-- **事实核验前置**：任何级别的任务在规划前都先核对【事实依据】——需求点名的文件/类/表是否真实存在。若需求说"改 X 文件"但项目里没有 X（虚假前提），系统识别后【强制转人工澄清】而非基于假前提硬跑（即使自动化模式也会拦下，不浪费算力产垃圾）。文件存在性与定位同时核对【工作区磁盘】与【git 已跟踪】两个 ground truth 源，不依赖可能滞后的检索索引——前一个任务刚创建的文件，后一个任务能立刻按真实路径定位到（避免去错目录导致 Worker 找不到文件而空转）。
-- **产出持久化与事实自洽**：任务验证通过后，产出会自动 git commit 到**本地仓库**（不 push，推送仍由人决定），确保产出稳定落盘、不被后续操作冲掉，下一个任务的事实核验与上下文能看到最新状态——多任务串联时不会"前一个建的文件后一个看不到"。
-- **生产模式安全自检**：设 `SWARM_ENV=production` 启动时做 fail-closed 安全自检——未设强根密钥 `SWARM_SECRET_KEY` 或 admin 密码仍为默认值时**拒绝启动**，避免带弱密钥/默认口令裸奔上线。
-- **登录会话有效期**：`SWARM_TOKEN_TTL_HOURS` 可配 token 有效期（默认 0=永不过期），登录滑动续期并回传到期时间，Web UI 到期前主动清理并提示重新登录（吊销/过期校验在后端 fail-closed）。
-- **配置式、开箱即用**：模型、沙箱、Embedding/Rerank 接入点、检索调优均可在 Web UI 配置，敏感 Key 加密存储，保存即生效。
+```mermaid
+flowchart TB
+    U([产品话需求<br/>“要个功能管理设备”]) --> B1
+
+    subgraph Brain["🧠 Brain 编排 · LangGraph 状态机"]
+        direction TB
+        B1[需求转化 → 文件级技术设计] --> B2{事实核验<br/>点名的文件/类/表真实存在?}
+        B2 -->|虚假前提| HC[[强制人工澄清]]
+        B2 -->|通过| B3[拆解子任务<br/>依赖 DAG · 垂直切片 · 全局契约]
+    end
+
+    B3 --> R{难度路由<br/>trivial · medium · complex · multimodal}
+
+    subgraph Worker["🛠️ Worker 执行 · 隔离沙箱"]
+        direction TB
+        W1[ReAct 写代码 / 跑构建] --> G{L1 确定性闸门<br/>编译 · 测试 · lint}
+        G -->|失败 → 证据驱动修复| W1
+        G -->|通过| LR[LLM 审查]
+    end
+
+    R --> W1
+    LR --> HM{人工 accept?}
+    HM -->|返工：清旧完成态| B3
+    HM -->|通过| CM[git commit 本地仓库]
+    CM --> MEM[(记忆 L0–L6<br/>错题集 / 成功模式)]
+
+    KB[(知识库<br/>符号表 + 向量 + rerank)] -. 上下文注入 .-> B3
+    KB -. just-in-time 检索 .-> W1
+    MEM -. 近因优先 · 时间衰减 · 自动去重 .-> B1
+
+    classDef store fill:#1f2937,stroke:#4b5563,color:#e5e7eb;
+    class MEM,KB store;
+```
+
+**一句话需求 → 8 文件全栈模块端到端跑通**：已验证"想要个功能管理设备"一句话 → 系统自主设计并产出 实体/Mapper/Service/Controller + 前端 + 建表，编译通过、可运行。
+
+---
+
+## ✨ 亮点
+
+### 🔒 可信交付：不把"模型说它对了"当成"它真的对了"
+- **确定性闸门优先**：Worker 产物先过 L1 硬闸门（编译/测试/lint），**再**走 LLM 审查，最后人工 accept。修复轮用真实编译/lint 证据驱动，返工时清空旧完成态、防"提前宣告完成"。
+- **事实核验前置**：规划前先核对需求点名的文件/类/表是否**真实存在**——虚假前提强制转人工澄清而非硬跑（自动化模式也拦）。存在性同时查**工作区磁盘**与 **git 已跟踪**两个 ground truth，不依赖可能滞后的索引。
+- **失败隔离 + 部分交付**：单个子任务重试耗尽不再"全有或全无"地失败——放弃它及其下游、继续交付其余编译通过的产物，任务诚实标记 `PARTIAL`（明列放弃项，绝不当 `DONE`）。卡住的子任务重试时**升级到更强模型**而非降级。
+
+### 🧠 编排与分工：产品经理式需求，自动并行
+- **产品话即可**：只描述"要什么功能"，无需点名改哪个文件——系统先把模糊需求翻译成文件级技术方案（建什么表/字段、按分层规范新建/改哪些文件）再规划。
+- **垂直切片 + 自动并行**：一个跨多文件的完整功能作为一个子任务交付，而非按文件数拆碎；剥离 LLM 误加的"假依赖"让真正独立的子任务并行（DAG 驱动），merge 冲突检测兜底。
+- **超大型需求分批拆解**：上百文件按功能模块分批（逐批可见进度），多模块并行前先由 Brain 产出**全局共享契约**（跨模块接口/DTO/API 规范）注入每个 Worker，确保接口对得上；**注册表/清单类聚合文件**（`pom.xml`/路由表/i18n 等）让各 Worker 串行登记、互不覆盖、不丢任何一方改动。
+
+### 📚 知识库 + 记忆闭环：越用越懂你的项目
+- **代码知识库**：符号表 + 向量检索（embedding + rerank，可配云端或自建），为每个任务精准注入相关代码；Worker 还可 just-in-time 即时检索。**多语言语法感知切分**（tree-sitter：Java 按方法切块）+ 多源资料采集（PDF/Word/HTML/图片 + 语雀）。
+- **分层记忆 L0–L6**：每次审核反馈沉淀为记忆，影响后续编排与生成。**时间感知衰减**让六个月前的坏案例自动淡出、新鲜教训优先；**近因融合排序**把"新鲜且相关"的经验顶到前面；**cross-encoder 精排**提升错题/成功模式召回精度；**批量碎片整合**自动合并近义重复，库越用越干净。
+- **可观测**：记忆健康度端点暴露规模 / 有效权重分布 / 去重率，写入幂等防重放双计数。
+
+### 🛠️ 工程化：开箱即用、生产安全
+- **混合模型路由**：子任务按难度路由不同模型，Worker 层默认**本地小模型并行** + 多级兜底链（主力失败逐级降级，全本地不外溢），Brain 用大模型；可接任意 OpenAI 兼容接入点，WebUI 可视化配置。
+- **小模型友好的上下文治理**：ReAct 历史按 token 预算裁剪、文件按需局部读取、子任务 scope 精确收窄，让小模型也能稳定干活。
+- **产出持久化**：验证通过自动 git commit 到**本地仓库**（不 push），确保落盘稳定、下个任务能看到最新状态。
+- **生产模式安全自检**：`SWARM_ENV=production` 启动做 fail-closed 自检——弱根密钥/默认 admin 口令拒绝启动。配置/敏感 Key 加密存储，WebUI 保存即生效。
 
 ---
 
@@ -43,14 +80,14 @@ Swarm 解决的就是这件事：把一个需求交给一套**有分工、有验
 | 依赖 | 版本 | 必需 | 说明 |
 |---|---|---|---|
 | Python | ≥ 3.11 | ✅ | 推荐 3.12 |
-| PostgreSQL | 16 + [pgvector](https://github.com/pgvector/pgvector) | ✅ | 任务/项目/记忆/向量元数据存储 |
-| [Qdrant](https://qdrant.tech/) | ≥ 1.13 | ✅ | 代码向量库（检索）。setup.sh 自动下载本地二进制或用 Docker |
+| PostgreSQL | 16 + [pgvector](https://github.com/pgvector/pgvector) | ✅ | 任务/项目/记忆/向量元数据 |
+| [Qdrant](https://qdrant.tech/) | ≥ 1.13 | ✅ | 代码向量库；setup.sh 自动下载本地二进制或用 Docker |
 | LLM 接入点 | OpenAI 兼容 API | ✅ | 至少配一个（云端 key 或本地推理服务） |
-| [CodeGraph CLI](https://github.com/colbymchenry/codegraph) | latest | ⬜ | 预处理时构建符号表/依赖图；缺失则跳过该阶段，不影响主链路 |
+| [CodeGraph CLI](https://github.com/colbymchenry/codegraph) | latest | ⬜ | 构建符号表/依赖图；缺失则跳过该阶段，不影响主链路 |
 | CubeSandbox / E2B | — | ⬜ | 隔离沙箱执行；留空则 Worker 本地执行 |
-| Embedding / Rerank 服务 | OpenAI 兼容 | ⬜ | 可走云端（SiliconFlow 等）或自建；缺失时回退内置 fastembed |
+| Embedding / Rerank 服务 | OpenAI 兼容 | ⬜ | 云端（SiliconFlow 等）或自建；缺失回退内置 fastembed |
 | Redis | ≥ 6 | ⬜ | 模块锁 / 任务队列；默认关闭 |
-| [Docker](https://docs.docker.com/) + Compose v2 | — | ⬜ | 用「方式一 Docker 一键拉起」时需要；裸机部署不需要 |
+| [Docker](https://docs.docker.com/) + Compose v2 | — | ⬜ | 用 Docker 一键拉起时需要；裸机部署不需要 |
 
 **操作系统**：macOS（Apple Silicon）/ Ubuntu 22.04+ / Debian / RHEL 系（setup.sh 自动适配 brew / apt / dnf）。
 
@@ -60,185 +97,92 @@ Swarm 解决的就是这件事：把一个需求交给一套**有分工、有验
 
 ### 方式一：Docker 一键拉起（最快，推荐试用）
 
-整套 Swarm 服务栈（API + PostgreSQL/pgvector + Qdrant）一条命令拉起，无需手动装依赖：
-
 ```bash
 git clone https://github.com/Victzhang79/Swarm.git
 cd Swarm/swarm                   # 项目根在内层 swarm/ 目录
-cp .env.docker.example .env      # 按需填 LLM Key / CubeSandbox 地址等（不填也能起，登录后在 WebUI 配）
+cp .env.docker.example .env      # 按需填 LLM Key 等（不填也能起，登录后在 WebUI 配）
 docker compose up -d --build     # 拉起 postgres + qdrant + swarm 三容器
 ```
 
-启动后访问 **http://localhost:8420**（默认登录 `admin` / `swarm`，首次登录强制改密）。
-启动钩子会自动建表，无需手动初始化。
+启动后访问 **http://localhost:8420**（默认登录 `admin` / `swarm`，首次强制改密）。启动钩子自动建表。
 
-> **注意**：Docker 化的是 **Swarm 自身**；**CubeSandbox（远程沙箱执行服务器）是独立服务**，不在 compose 内。Worker 通过 `SWARM_SANDBOX_*` 环境变量连它（在 `.env` 填），留空则 Worker 退回本地执行。
+> Docker 化的是 **Swarm 自身**；**CubeSandbox（远程沙箱）是独立服务**，不在 compose 内，Worker 通过 `SWARM_SANDBOX_*` 连它，留空则本地执行。
 
-### 方式二：一键安装脚本（裸机部署）
+### 方式二：一键安装脚本（裸机）
 
 ```bash
 git clone https://github.com/Victzhang79/Swarm.git
-cd Swarm/swarm          # 项目根在内层 swarm/ 目录
-bash setup.sh           # 9 步全自动：系统依赖 → pgvector → PG → venv → Python 依赖 → 建表 → CodeGraph → .env → Qdrant → 启动
+cd Swarm/swarm
+bash setup.sh           # 9 步全自动：系统依赖→pgvector→PG→venv→依赖→建表→CodeGraph→.env→Qdrant→启动
 ```
 
-`setup.sh` 会交互式引导你填入 LLM API Key 等配置，全部完成后服务启动在 **http://localhost:8420**。
-
-常用选项：
-
-```bash
-bash setup.sh --skip-pg          # 跳过 PostgreSQL 安装（已有 PG）
-bash setup.sh --skip-codegraph   # 跳过 CodeGraph CLI
-bash setup.sh --skip-env         # 跳过 .env 交互式配置
-bash setup.sh --dev              # 额外装开发依赖 + 跑冒烟测试
-bash setup.sh --help             # 查看全部选项
-```
+常用选项：`--skip-pg`（已有 PG）· `--skip-codegraph` · `--skip-env` · `--dev`（装开发依赖+冒烟）· `--help`。
 
 ### 方式三：手动安装
 
 ```bash
-# 1. 准备 PostgreSQL 16 + pgvector，创建数据库 swarm
-createdb swarm && psql -d swarm -c "CREATE EXTENSION IF NOT EXISTS vector;"
-
-# 2. Python 虚拟环境 + 依赖
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e .                 # 运行时依赖（pyproject.toml）
-pip install -e ".[dev]"          # 含 pytest / ruff（可选）
-
-# 3. 配置 .env（参考 .env.example）
-cp .env.example .env             # 然后填入 API Key / DB URI 等
-
-# 4. 建表
-python scripts/init_db.py
-
-# 5. 启动依赖服务 + API
-bash scripts/start-services.sh   # Qdrant + Swarm API
+createdb swarm && psql -d swarm -c "CREATE EXTENSION IF NOT EXISTS vector;"  # 1. PG16 + pgvector
+python3.12 -m venv .venv && source .venv/bin/activate && pip install -e .    # 2. venv + 依赖
+cp .env.example .env             # 3. 配置（填 API Key / DB URI）
+python scripts/init_db.py        # 4. 建表
+bash scripts/start-services.sh   # 5. 启动 Qdrant + API
 ```
 
-### 验证运行
-
-```bash
-curl http://localhost:8420/api/health      # 健康检查
-open http://localhost:8420                  # Web UI（默认登录 admin / swarm）
-```
+验证：`curl http://localhost:8420/api/health` · 浏览器开 `http://localhost:8420`。
 
 ---
 
 ## 🧭 日常运维
 
-| 脚本 | 作用 |
+| 命令 | 作用 |
 |---|---|
-| `docker compose up -d` | Docker 方式：一键拉起全栈（首选试用） |
-| `docker compose down` | Docker 方式：停止全栈（加 `-v` 清数据卷） |
-| `bash setup.sh` | 裸机一键安装 + 启动（首次部署） |
-| `bash scripts/start-services.sh` | 启动 Qdrant + API（已装好后日常启动） |
-| `bash scripts/restart-api.sh` | 重载 API（代码 / .env 变更后） |
-| `bash scripts/stop-api.sh` | 停止 API |
+| `docker compose up -d` / `down` | Docker：拉起 / 停止全栈（`down -v` 清数据卷） |
+| `bash setup.sh` | 裸机一键安装 + 启动（首次） |
+| `bash scripts/start-services.sh` | 启动 Qdrant + API（日常） |
+| `bash scripts/restart-api.sh` / `stop-api.sh` | 重载 / 停止 API |
 | `bash test/run_all.sh` | 运行全部测试 |
-
-CLI：
-
-```bash
-swarm --help                     # CLI 帮助
-swarm submit -p <project_id> --watch   # 提交任务并跟踪
-```
+| `swarm submit -p <project_id> --watch` | CLI 提交任务并跟踪 |
 
 ---
 
-## 🏗️ 架构概览
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  交互层   Web UI (:8420) · REST / SSE · CLI (swarm)       │
-├──────────────────────────────────────────────────────────┤
-│  Brain    理解需求 → 技术设计 → 拆解子任务 → 派发/监控/合并 │
-│           （LangGraph 状态机，含交互式澄清子图）            │
-├──────────────────────────────────────────────────────────┤
-│  路由     按难度 trivial/medium/complex/multimodal 选模型  │
-├──────────────────────────────────────────────────────────┤
-│  Worker   ReAct Agent 在沙箱写代码 → L1 确定性闸门 → 验证  │
-├──────────────────────────────────────────────────────────┤
-│  知识库   符号表 + 向量检索（embed + rerank）注入上下文     │
-│  记忆     L0–L6 分层记忆，审核反馈驱动学习闭环              │
-├──────────────────────────────────────────────────────────┤
-│  存储     PostgreSQL+pgvector · Qdrant · (可选 Redis)      │
-└──────────────────────────────────────────────────────────┘
-```
+## 🏗️ 模块一览
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
 | API + Web UI | `api/` | FastAPI 服务 + 静态前端 |
-| Brain | `brain/` | LangGraph 编排状态机 |
-| Worker | `worker/` | ReAct Agent · L1 验证 · 沙箱构建 |
+| Brain | `brain/` | LangGraph 编排状态机（需求转化 · 拆解 · 派发 · 合并） |
+| Worker | `worker/` | ReAct Agent · L1 确定性验证 · 沙箱构建 |
 | 知识库 | `knowledge/` | 检索 · embedding · rerank · 增量调度 |
-| 记忆 | `memory/` | L0–L6 分层记忆 · 衰减 |
+| 记忆 | `memory/` | L0–L6 分层记忆 · 时间感知衰减 · 去重整合 |
 | 项目 | `project/` | PG 存储 · 预处理 · diff 应用 · 沙箱推断 |
 | 模型 | `models/` | 多接入点路由 |
 | 配置 | `config/` | pydantic-settings · 密钥加密存储 |
 | CLI | `cli/` | Click 命令行 |
 
----
-
-## ⚙️ 服务与端口
-
-启动后涉及以下进程：
-
-| 服务 | 端口 | 进程 | 必需 |
-|---|---|---|---|
-| Swarm API + Web UI | 8420 | uvicorn | ✅ |
-| Qdrant | 6333 / 6334 | qdrant | ✅ |
-| PostgreSQL | 5432 | postgres | ✅ |
-| Redis | 6379 | redis | ⬜（默认关闭） |
-
-外部依赖（按需）：LLM 接入点、Embedding/Rerank 服务、CubeSandbox 沙箱宿主。
+**端口**：Swarm API + Web UI `8420`（✅）· Qdrant `6333/6334`（✅）· PostgreSQL `5432`（✅）· Redis `6379`（⬜默认关闭）。
 
 ---
 
-## 💻 资源占用（参考）
+## ⚙️ 配置
 
-最小可跑（单机开发）：
+`.env`（`SWARM_*` 前缀）与 Web UI「设置」面板双轨管理，保存即生效（热重载）：
 
-- **CPU**：2–4 核
-- **内存**：4–8 GB（Qdrant + PostgreSQL + Python 服务本体约 1–2 GB；其余为向量库与并发 Worker 余量）
-- **磁盘**：约 2–5 GB（Python 依赖含 torch/fastembed 较大；向量库与 .codegraph 随项目规模增长）
-- **GPU**：不需要（模型推理在外部 LLM 接入点/服务，本机不跑大模型）
+- **模型接入点**：多个 OpenAI 兼容接入点（云端 / 本地），Brain 与 Worker 各层自由选模型 + 多级兜底链。
+- **Embedding / Rerank**：云端（SiliconFlow / OpenAI / Cohere）或自建；敏感 Key 经 `secret_store` 加密存储。
+- **沙箱**：CubeSandbox 接入信息，支持项目级定制模板。
 
-> Embedding/Rerank、LLM 推理均通过外部接入点完成，Swarm 本体是轻量编排服务。若使用本地 fastembed 兜底嵌入，首次会下载 bge-m3 模型（约数百 MB）。
-
----
-
-## 🔧 配置
-
-配置通过 `.env`（`SWARM_*` 前缀）与 Web UI「设置」面板双轨管理：
-
-- **模型接入点**：可配多个 OpenAI 兼容接入点（云端 / 本地），Brain 与 Worker 各层路由自由选择模型。
-- **Embedding / Rerank**：可配云端成熟服务（SiliconFlow / OpenAI / Cohere）或自建服务，敏感 Key 加密存储。
-- **沙箱**：CubeSandbox 接入信息；支持项目级定制沙箱模板。
-- **敏感信息**：API Key 等通过 `secret_store` 加密存储，不以明文落 `.env`。
-
-完整变量见 [`.env.example`](.env.example)。Web UI 中修改的配置保存即生效（热重载）。
+完整变量见 [`.env.example`](.env.example)。
 
 ---
 
 ## ❓ 常见问题
 
-**Q：预处理时 index 阶段被跳过？**
-A：未安装 CodeGraph CLI。不影响 Brain 主链路；如需符号表检索，运行 `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh`。
-
-**Q：预处理跳过了向量嵌入？**
-A：Qdrant 未启动。检查 `curl http://localhost:6333/collections`，或重跑 `bash scripts/start-services.sh`。
-
-**Q：Web UI 模型下拉显示「配置 API Key」选不了模型？**
-A：对应接入点未配 Key 或不可达。在「设置 → 模型接入点」填入 Key 并保存，点「刷新模型列表」。
-
-**Q：Worker 没有沙箱，代码在哪执行？**
-A：未配 CubeSandbox 时 Worker 本地执行。生产建议配置隔离沙箱。
-
-**Q：端口 8420 被占用 / 改端口？**
-A：`export SWARM_PORT=<port>` 后重启，或先 `bash scripts/stop-api.sh`。
-
-**Q：数据库连不上 / 建表失败？**
-A：确认 PostgreSQL 16 已启动、`swarm` 库存在、pgvector 扩展已启用，`.env` 中 `SWARM_DB_POSTGRES_URI` 正确，然后 `python scripts/init_db.py`。
+- **预处理 index 阶段被跳过？** 未装 CodeGraph CLI，不影响主链路；需符号表检索则装 CodeGraph。
+- **预处理跳过向量嵌入？** Qdrant 未启动，查 `curl http://localhost:6333/collections` 或重跑 `start-services.sh`。
+- **模型下拉显示「配置 API Key」？** 接入点未配 Key/不可达，在「设置 → 模型接入点」填 Key 并刷新。
+- **Worker 代码在哪执行？** 未配 CubeSandbox 时本地执行；生产建议配隔离沙箱。
+- **端口 8420 被占用？** `export SWARM_PORT=<port>` 后重启。
+- **数据库连不上？** 确认 PG16 启动、`swarm` 库存在、pgvector 已启用、`SWARM_DB_POSTGRES_URI` 正确，再 `python scripts/init_db.py`。
 
 ---
 

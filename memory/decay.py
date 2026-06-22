@@ -19,7 +19,14 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from swarm.memory.store import MemoryStore
+from swarm.memory.store import (
+    DECAY_DELETE_THRESHOLD,
+    L5_DECAY_FACTOR,
+    L6_DECAY_FACTOR,
+    MemoryStore,
+    _effective_weight_sql_l5,
+    _effective_weight_sql_l6,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +45,9 @@ class MemoryDecay:
     def __init__(
         self,
         memory_store: MemoryStore,
-        decay_factor: float = 0.9,
-        l6_decay_factor: float = 0.95,
-        delete_threshold: float = 0.05,
+        decay_factor: float = L5_DECAY_FACTOR,
+        l6_decay_factor: float = L6_DECAY_FACTOR,
+        delete_threshold: float = DECAY_DELETE_THRESHOLD,
         occurrence_boost: bool = True,
     ) -> None:
         """初始化衰减参数
@@ -326,25 +333,73 @@ class MemoryDecay:
         logger.info("decay_l6_batch_sql: updated=%d deleted=%d", stats["total_updated"], stats["total_deleted"])
         return stats
 
-    # ── 每日自动衰减 ────────────────────────────
+    # ── WS1 惰性衰减下的物理清理(只删，不乘减) ──
+
+    async def purge_expired(
+        self, project_id: str | None = None, as_of: Any = None
+    ) -> dict[str, Any]:
+        """删除【有效权重】已沉到阈值下的 L5/L6 记录。
+
+        WS1 把“时间衰减”移到了 query 读时现算(effective_weight)，base(decay_weight) 不再被
+        后台乘减——否则与读时现算叠加成双重衰减。本方法是退化后的后台 job：仅按 effective_weight
+        物理清理过期条目，回收存储；不修改存活条目的 base。as_of 默认 now()，供测试时间旅行。
+        """
+        conn = self._store._conn_or_raise()
+        eff_l5 = _effective_weight_sql_l5()
+        eff_l6 = _effective_weight_sql_l6()
+        stats: dict[str, Any] = {"l5_deleted": 0, "l6_deleted": 0}
+
+        proj_l5 = ""
+        proj_l6 = ""
+        l5_params: list[Any] = [self.decay_factor, as_of, self.delete_threshold]
+        l6_params: list[Any] = [self.l6_decay_factor, as_of, self.delete_threshold]
+        if project_id is not None:
+            proj_l5 = proj_l6 = "AND project_id = %s"
+            l5_params.append(project_id)
+            l6_params.append(project_id)
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"DELETE FROM mem_mistakes WHERE {eff_l5} < %s {proj_l5}", l5_params
+            )
+            stats["l5_deleted"] = cur.rowcount
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"DELETE FROM mem_successes WHERE {eff_l6} < %s {proj_l6}", l6_params
+            )
+            stats["l6_deleted"] = cur.rowcount
+
+        self._last_decay_at = datetime.now()
+        self._total_deleted += stats["l5_deleted"] + stats["l6_deleted"]
+        logger.info(
+            "purge_expired: l5_deleted=%d l6_deleted=%d", stats["l5_deleted"], stats["l6_deleted"]
+        )
+        return stats
+
+    # ── 每日自动维护 ────────────────────────────
 
     async def start_daily_decay(
         self,
         hour: int = 3,
         minute: int = 0,
         project_ids: list[str] | None = None,
+        consolidate: bool = True,
     ) -> None:
-        """启动每日定时衰减(简易实现)
+        """启动每日定时维护(简易实现)
 
-        精确调度应使用外部 cron / APScheduler。
-        此方法为简便的后台循环实现。
-        同时执行 L5 错题集衰减和 L6 成功模式衰减。
+        精确调度应使用外部 cron / APScheduler；此方法为简便的后台循环实现。
+        WS1 后：衰减已移至 query 读时现算(effective_weight)，后台 job 退化为
+        **只删**过期条目(purge_expired)，不再乘减 base——避免与读时衰减叠加成双重衰减。
+        WS3：每轮维护顺带跑一次批量碎片整合(consolidate)，把写时去重漏网的近义碎片合并。
 
         Args:
             hour: 每日执行时间(时，0-23)
             minute: 每日执行时间(分，0-59)
-            project_ids: 需要衰减的项目列表(None=全量)
+            project_ids: 需要维护的项目列表(None=全量；整合时自动枚举全库项目)
+            consolidate: 是否在每轮维护顺带跑批量碎片整合(默认开)
         """
+        from swarm.memory.consolidate import MemoryConsolidator
+        consolidator = MemoryConsolidator(self._store)
         import asyncio
 
         logger.info("Starting daily decay scheduler at %02d:%02d", hour, minute)
@@ -361,18 +416,24 @@ class MemoryDecay:
             logger.info("Next decay run at %s (waiting %.0f seconds)", next_run, wait_seconds)
             await asyncio.sleep(wait_seconds)
 
-            # 执行衰减: L5 + L6
+            # 执行清理: 只删过期(L5+L6)，衰减由 query 读时现算
             try:
                 if project_ids:
                     for pid in project_ids:
-                        await self.decay_l5(project_id=pid)
-                        await self.decay_l6(project_id=pid)
+                        await self.purge_expired(project_id=pid)
                 else:
-                    await self.decay_l5()
-                    await self.decay_l6()
-                logger.info("Daily decay (L5+L6) completed successfully")
+                    await self.purge_expired()
+                logger.info("Daily purge (L5+L6 expired) completed successfully")
             except Exception as e:
-                logger.exception("Daily decay failed: %s", e)
+                logger.exception("Daily purge failed: %s", e)
+
+            # 批量碎片整合(WS3): 合并写时去重漏网的近义碎片
+            if consolidate:
+                try:
+                    res = await consolidator.consolidate_projects(project_ids)
+                    logger.info("Daily consolidate completed: %d project(s)", len(res))
+                except Exception as e:
+                    logger.exception("Daily consolidate failed: %s", e)
 
     # ── 状态查询 ────────────────────────────────
 
@@ -414,6 +475,49 @@ class MemoryDecay:
             "high_weight_count": high,
             "medium_weight_count": medium,
             "low_weight_count": low,
+            "last_decay_at": self._last_decay_at.isoformat() if self._last_decay_at else None,
+        }
+
+    async def get_memory_health(
+        self, project_id: str, as_of: Any = None
+    ) -> dict[str, Any]:
+        """WS4 可观测：L5/L6 记忆规模 + 有效权重分布(读时现算) + 去重(merged)情况。
+
+        权重分布按 effective_weight(惰性时间感知)分桶，反映“当下”而非锚点的记忆健康度；
+        dedup_rate = merged / 已存储(含 merged)，量化碎片整合(WS3)清理掉的比例。供 API/巡检消费。
+        """
+        mistakes = await self._store.get_all_mistakes(project_id, 0.0, as_of=as_of)
+        successes = await self._store.get_all_successes(project_id, 0.0, as_of=as_of)
+        conn = self._store._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT "
+                "(SELECT count(*) FROM mem_mistakes WHERE project_id=%s AND metadata_json->>'status'='merged'),"
+                "(SELECT count(*) FROM mem_successes WHERE project_id=%s AND metadata_json->>'status'='merged')",
+                (project_id, project_id),
+            )
+            row = await cur.fetchone()
+        m_merged, s_merged = int(row[0]), int(row[1])
+
+        def _summary(rows: list[dict[str, Any]], merged: int) -> dict[str, Any]:
+            eff = [float(r.get("effective_weight", 0.0) or 0.0) for r in rows]
+            n = len(eff)
+            stored = n + merged
+            return {
+                "stored": stored,                       # 含已 merged
+                "active": n,                            # get_all 已按 base>0 粗筛
+                "merged": merged,
+                "avg_effective_weight": round(sum(eff) / n, 4) if n else 0.0,
+                "high_gt_0_8": sum(1 for w in eff if w > 0.8),
+                "medium_0_3_0_8": sum(1 for w in eff if 0.3 < w <= 0.8),
+                "low_le_0_3": sum(1 for w in eff if w <= 0.3),
+                "dedup_rate": round(merged / stored, 4) if stored else 0.0,
+            }
+
+        return {
+            "project_id": project_id,
+            "mistakes": _summary(mistakes, m_merged),
+            "successes": _summary(successes, s_merged),
             "last_decay_at": self._last_decay_at.isoformat() if self._last_decay_at else None,
         }
 

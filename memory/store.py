@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 BGE_M3_DIMENSION = 1024
 
 # ──────────────────────────────────────────────
+# L5/L6 惰性衰减参数（单一事实源；decay.py 复用作默认）
+# ──────────────────────────────────────────────
+# WS1：衰减由“每日乘减 decay_weight”改为“读时按 last_seen_at 真实年龄现算”。
+# decay_weight 语义 → 最近一次 seen/used 时的【基准/锚点权重】(anchor)，不随时间被乘减，
+# 只在命中重振时刷新；时间流逝由 query 现算的 effective_weight 体现，摆脱调度器依赖。
+L5_DECAY_FACTOR = 0.9        # 错题每日有效衰减因子(0.9=每天 -10%)
+L6_DECAY_FACTOR = 0.95       # 成功模式每日有效衰减因子(更温和)
+DECAY_DELETE_THRESHOLD = 0.05  # 有效权重低于此值视为已遗忘/物理清理
+
+# WS2 近因排序地板：rank_score = max(similarity,0) * (FLOOR + (1-FLOOR)*recency_ratio)，
+# recency_ratio = effective_weight/decay_weight = factor^(age/boost) ∈ (0,1]。
+# 新鲜条目 age≈0 → ratio≈1 → 乘子=1.0 → 排序退化为纯余弦(向后兼容)；
+# 陈旧近义 ratio→0 → 乘子→FLOOR，被新鲜同义压到后面。FLOOR=0.5：近因至多让语义分打 5 折，
+# 不喧宾夺主(语义仍主导)，只在余弦接近时由近因破平/翻转。
+RECENCY_RANK_FLOOR = 0.5
+
+# ──────────────────────────────────────────────
 # PG DDL
 # ──────────────────────────────────────────────
 
@@ -240,6 +257,7 @@ class MemoryStore:
         return row[0] if row else {}
 
     async def set_user_profile(self, user_id: str, profile: dict[str, Any]) -> None:
+        """整体【覆盖】写入 L1 画像(替换全部字段)。部分增量更新请用 merge_user_profile。"""
         conn = self._conn_or_raise()
         async with conn.cursor() as cur:
             await cur.execute(
@@ -252,6 +270,31 @@ class MemoryStore:
                 """,
                 (user_id, psycopg.types.json.Jsonb(profile)),
             )
+
+    async def merge_user_profile(
+        self, user_id: str, partial: dict[str, Any]
+    ) -> dict[str, Any]:
+        """WS4 一致性：【合并】写入 L1 画像——顶层键浅合并(partial 覆盖同名键，其余保留)。
+
+        覆盖(set) vs 合并(merge) 策略明确分流：set 用于整表替换，merge 用于"只更新我给的几个字段"
+        而不抹掉历史画像。用 jsonb `||` 在 DB 端原子合并(读改写无竞态)。返回合并后的完整画像。
+        """
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO mem_user_profile (user_id, profile_json, updated_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    profile_json = COALESCE(mem_user_profile.profile_json, '{}'::jsonb)
+                                   || EXCLUDED.profile_json,
+                    updated_at   = now()
+                RETURNING profile_json
+                """,
+                (user_id, psycopg.types.json.Jsonb(partial)),
+            )
+            row = await cur.fetchone()
+        return row[0] if row and isinstance(row[0], dict) else partial
 
     # ── L2: 任务摘要 ────────────────────────────
 
@@ -284,6 +327,17 @@ class MemoryStore:
                 """,
                 (project_id, project_id, L2_ROLLING_WINDOW),
             )
+
+    async def summary_has_idempotency_key(self, project_id: str, idem_key: str) -> bool:
+        """L2 摘要中是否已存在该幂等键(WS4：learn 重放去重，防二次写 + 双计数)。"""
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM mem_task_summary WHERE project_id = %s "
+                "AND metadata_json->>'idempotency_key' = %s LIMIT 1",
+                (project_id, idem_key),
+            )
+            return (await cur.fetchone()) is not None
 
     async def query_task_summaries(
         self, project_id: str, limit: int = L2_ROLLING_WINDOW
@@ -359,10 +413,13 @@ class MemoryStore:
         query: str,
         top_k: int = 5,
         error_type: str | None = None,
+        as_of: Any = None,
     ) -> list[dict[str, Any]]:
         """基于向量的错题检索
 
-        使用 pgvector 的余弦距离进行相似度搜索。
+        使用 pgvector 的余弦距离进行相似度搜索；过滤/返回的 effective_weight 为
+        WS1 惰性时间感知衰减——按 last_seen_at 到 as_of(默认 now())的真实年龄现算，
+        摆脱后台 tick 调度依赖。as_of 仅供 eval 时间旅行，生产传 None。
         """
         conn = self._conn_or_raise()
 
@@ -378,29 +435,38 @@ class MemoryStore:
             return []
         vector_str = _vector_to_pg(query_vector)
 
-        # 按 SQL 占位符出现顺序【显式】构造参数，杜绝拼接顺序错位：
-        #   select(vector) → where(project_id) → [type_filter(error_type)] → order by(vector) → limit
-        # 旧写法 [vector]+params[:1]+[vector]+params[1:] 在带 error_type 时把 error_type 绑到了
-        # ORDER BY 的 %s::vector 上 → "invalid input syntax for type vector"（P1-DEBT-03 强化首次触发）。
+        # 按 SQL 占位符出现顺序【显式】构造参数，杜绝拼接顺序错位。内层 SELECT 现算 effective_weight
+        # (惰性衰减)，外层按 effective_weight 过滤；排序用 similarity DESC(== 旧 embedding<=> ASC，等价)。
+        #   inner: similarity(vector) → effective_weight(factor, as_of) → where(project_id) → [type(error_type)]
+        #   outer: where(threshold) → limit
+        eff = _effective_weight_sql_l5()
         type_filter = ""
-        sql_params: list[Any] = [vector_str, project_id]
+        sql_params: list[Any] = [vector_str, L5_DECAY_FACTOR, as_of, project_id]
         if error_type:
             type_filter = "AND error_type = %s"
             sql_params.append(error_type)
-        sql_params.extend([vector_str, top_k])
+        sql_params.extend([DECAY_DELETE_THRESHOLD, RECENCY_RANK_FLOOR, RECENCY_RANK_FLOOR, top_k])
 
         async with conn.cursor() as cur:
             await cur.execute(
                 f"""
                 SELECT id, task_id, error_type, description, context,
                        fix_description, decay_weight, occurrence_count,
-                       1 - (embedding <=> %s::vector) AS similarity,
-                       last_seen_at, metadata_json
-                FROM mem_mistakes
-                WHERE project_id = %s {type_filter}
-                  AND decay_weight > 0.05
-                  AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
-                ORDER BY embedding <=> %s::vector
+                       similarity, last_seen_at, metadata_json, effective_weight
+                FROM (
+                    SELECT id, task_id, error_type, description, context,
+                           fix_description, decay_weight, occurrence_count,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           last_seen_at, metadata_json,
+                           {eff} AS effective_weight
+                    FROM mem_mistakes
+                    WHERE project_id = %s {type_filter}
+                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
+                ) sub
+                WHERE effective_weight > %s
+                ORDER BY GREATEST(similarity, 0) * (%s + (1.0 - %s)
+                         * (effective_weight / GREATEST(decay_weight, 1e-6))) DESC,
+                         similarity DESC
                 LIMIT %s
                 """,
                 sql_params,
@@ -420,6 +486,7 @@ class MemoryStore:
                 "similarity": float(r[8]) if r[8] is not None else 0.0,
                 "last_seen_at": r[9],
                 "metadata": r[10],
+                "effective_weight": float(r[11]) if r[11] is not None else 0.0,
             }
             for r in rows
         ]
@@ -439,20 +506,25 @@ class MemoryStore:
             )
 
     async def get_all_mistakes(
-        self, project_id: str, min_weight: float = 0.0
+        self, project_id: str, min_weight: float = 0.0, as_of: Any = None
     ) -> list[dict[str, Any]]:
-        """查询所有错题(用于衰减轮询)"""
+        """查询所有错题(用于衰减轮询)。
+
+        decay_weight = 基准锚点权重；effective_weight = 按 last_seen_at 到 as_of 年龄现算的惰性衰减值。
+        min_weight 仍按 base 过滤(粗筛保留所有未被永久 dismiss 的条目)，遗忘判定看 effective_weight。
+        """
         conn = self._conn_or_raise()
+        eff = _effective_weight_sql_l5()
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT id, error_type, description, decay_weight,
-                       occurrence_count, last_seen_at
+                       occurrence_count, last_seen_at, {eff} AS effective_weight
                 FROM mem_mistakes
                 WHERE project_id = %s AND decay_weight > %s
                 ORDER BY decay_weight DESC
                 """,
-                (project_id, min_weight),
+                (L5_DECAY_FACTOR, as_of, project_id, min_weight),
             )
             rows = await cur.fetchall()
         return [
@@ -463,6 +535,7 @@ class MemoryStore:
                 "decay_weight": float(r[3]),
                 "occurrence_count": r[4],
                 "last_seen_at": r[5],
+                "effective_weight": float(r[6]) if r[6] is not None else 0.0,
             }
             for r in rows
         ]
@@ -510,12 +583,14 @@ class MemoryStore:
         query: str,
         top_k: int = 5,
         query_vector: list[float] | None = None,
+        as_of: Any = None,
     ) -> list[dict[str, Any]]:
         """基于向量的成功模式检索。
 
         query_vector：可选显式查询向量。传入则绕过 embed 服务（供测试用真实
         非零向量验证 decay/过滤逻辑，不依赖外部 bge-m3 服务，避免 CI 无服务时
         零向量短路返空导致的 CI-only 失败）。生产不传，走 _embed_fn 原路径。
+        as_of：WS1 惰性衰减时间旅行(默认 now())；effective_weight 按 last_used_at 真实年龄现算。
         """
         conn = self._conn_or_raise()
 
@@ -532,21 +607,33 @@ class MemoryStore:
             return []
         vector_str = _vector_to_pg(query_vector)
 
+        # 占位符顺序: similarity(vector) → effective_weight(factor, as_of) → where(project_id)
+        #            → outer where(threshold) → limit
+        eff = _effective_weight_sql_l6()
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT id, task_id, pattern_name, description,
                        approach, applicable_when, reuse_count,
-                       1 - (embedding <=> %s::vector) AS similarity,
-                       last_used_at, metadata_json
-                FROM mem_successes
-                WHERE project_id = %s
-                  AND decay_weight > 0.05
-                  AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
-                ORDER BY embedding <=> %s::vector
+                       similarity, last_used_at, metadata_json, effective_weight
+                FROM (
+                    SELECT id, task_id, pattern_name, description,
+                           approach, applicable_when, reuse_count,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           last_used_at, metadata_json, decay_weight,
+                           {eff} AS effective_weight
+                    FROM mem_successes
+                    WHERE project_id = %s
+                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
+                ) sub
+                WHERE effective_weight > %s
+                ORDER BY GREATEST(similarity, 0) * (%s + (1.0 - %s)
+                         * (effective_weight / GREATEST(decay_weight, 1e-6))) DESC,
+                         similarity DESC
                 LIMIT %s
                 """,
-                [vector_str, project_id, vector_str, top_k],
+                [vector_str, L6_DECAY_FACTOR, as_of, project_id, DECAY_DELETE_THRESHOLD,
+                 RECENCY_RANK_FLOOR, RECENCY_RANK_FLOOR, top_k],
             )
             rows = await cur.fetchall()
 
@@ -562,6 +649,7 @@ class MemoryStore:
                 "similarity": float(r[7]) if r[7] is not None else 0.0,
                 "last_used_at": r[8],
                 "metadata": r[9],
+                "effective_weight": float(r[10]) if r[10] is not None else 0.0,
             }
             for r in rows
         ]
@@ -638,20 +726,21 @@ class MemoryStore:
     # ── 通用: 衰减权重(L6 成功模式) ─────────────
 
     async def get_all_successes(
-        self, project_id: str, min_weight: float = 0.0
+        self, project_id: str, min_weight: float = 0.0, as_of: Any = None
     ) -> list[dict[str, Any]]:
-        """查询所有成功模式(用于衰减轮询)"""
+        """查询所有成功模式(用于衰减轮询)。effective_weight 按 last_used_at 年龄现算(惰性)。"""
         conn = self._conn_or_raise()
+        eff = _effective_weight_sql_l6()
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT id, pattern_name, description, decay_weight,
-                       reuse_count, last_used_at
+                       reuse_count, last_used_at, {eff} AS effective_weight
                 FROM mem_successes
                 WHERE project_id = %s AND decay_weight > %s
                 ORDER BY decay_weight DESC
                 """,
-                (project_id, min_weight),
+                (L6_DECAY_FACTOR, as_of, project_id, min_weight),
             )
             rows = await cur.fetchall()
         return [
@@ -662,6 +751,7 @@ class MemoryStore:
                 "decay_weight": float(r[3]),
                 "reuse_count": r[4],
                 "last_used_at": r[5],
+                "effective_weight": float(r[6]) if r[6] is not None else 0.0,
             }
             for r in rows
         ]
@@ -691,6 +781,29 @@ class MemoryStore:
 # ──────────────────────────────────────────────
 # 工具函数
 # ──────────────────────────────────────────────
+
+def _effective_weight_sql_l5() -> str:
+    """L5 有效权重 SQL 片段：base(decay_weight) * factor ^ (age_days / occurrence)。
+
+    占位符顺序 = (factor, as_of)。age 用 GREATEST(..,0) 夹住，防 as_of 早于 last_seen_at
+    时指数为负把权重反向放大到 base 之上(命中刚重振、时钟回拨等边角)。occurrence 越多衰减越慢，
+    与旧 tick 公式 factor^(1/occ) 连乘 d 天 = factor^(d/occ) 完全一致(连续化)。
+    """
+    return (
+        "decay_weight * POWER(%s, "
+        "GREATEST(EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, now()) - last_seen_at)) / 86400.0, 0.0)"
+        " / GREATEST(COALESCE(occurrence_count, 1), 1))"
+    )
+
+
+def _effective_weight_sql_l6() -> str:
+    """L6 有效权重 SQL 片段：base * factor ^ (age_days / (reuse_count+1))。占位符顺序 = (factor, as_of)。"""
+    return (
+        "decay_weight * POWER(%s, "
+        "GREATEST(EXTRACT(EPOCH FROM (COALESCE(%s::timestamptz, now()) - last_used_at)) / 86400.0, 0.0)"
+        " / (COALESCE(reuse_count, 0) + 1))"
+    )
+
 
 def _vector_to_pg(vector: list[float]) -> str:
     """将 Python list[float] 转为 pgvector 文本格式: '[0.1,0.2,...]'"""

@@ -20,13 +20,16 @@ def install_noop_transaction(mock_store) -> None:
     会炸。此 helper 让 transaction() 同步返回一个 enter/exit 都 no-op 的异步上下文。
     """
     from contextlib import asynccontextmanager
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
 
     @asynccontextmanager
     async def _txn():
         yield None
 
     mock_store.transaction = MagicMock(side_effect=_txn)
+    # WS4：learn 落库前会查幂等键防重放双计数。AsyncMock 默认让它返回 truthy Mock（误判为重复→跳过
+    # 落库）。默认置 False（非重复，放行），需要测重放的用例自行覆盖为 True。
+    mock_store.summary_has_idempotency_key = AsyncMock(return_value=False)
 
 
 _path = Path(__file__).parent / "swarm_bootstrap.py"

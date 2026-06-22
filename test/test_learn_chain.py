@@ -85,11 +85,14 @@ async def _test_learn_after_accept_writes_memory_async():
     assert summary["persist"]["persisted"] is True
     assert summary["persist"]["success_id"] == 7
 
-    meta = await persist_learn_success(state, {
-        "pattern_name": "x",
-        "pattern_description": "y",
-        "applicable_scenarios": [],
-    })
+    # 直调 persist 走 mock store（与上半同源，避免触真实 PG；WS4 幂等键确定性会让
+    # 真库上的同 task 重放被判重复，单测应隔离）。
+    with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
+        meta = await persist_learn_success(state, {
+            "pattern_name": "x",
+            "pattern_description": "y",
+            "applicable_scenarios": [],
+        })
     assert meta["persisted"] is True
     print("  ✅ accept → learn_success → MemoryStore")
 
