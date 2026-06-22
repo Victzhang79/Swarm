@@ -94,6 +94,68 @@ def configure_langsmith(*, reload: bool = False) -> bool:
     return False
 
 
+# ─── 有界 LangSmith 反馈客户端 ───────────────────────────────
+# 根因兜底：langsmith create_feedback 是同步 HTTP，默认 retry 退避最多 ~7 次，
+# LangSmith 端点不可达时会把主链路拖住数十秒（可观测性反噬主流程）。原来两处
+# 反馈上报都用裸 Client()（无超时、吃默认重试），重开 tracing 即原样卡死。
+# 这里给反馈路径单独配【短超时 + 单次重试】的客户端并缓存复用：
+#   - timeout_ms=(connect, read) 给每次 HTTP 调用硬上限
+#   - retry_config total=1 去掉默认多次退避这个卡死放大器
+# 各调用点仍保留 try/except；超时把"无限卡死"降级为"快速失败 + 丢弃本条反馈"。
+# 超时可经 SWARM_LANGSMITH_{CONNECT,READ}_TIMEOUT_MS 覆盖。
+_FEEDBACK_CLIENT: Any = None
+
+
+def _feedback_client() -> Any:
+    """返回缓存的、带超时与有限重试的 LangSmith 反馈客户端。"""
+    global _FEEDBACK_CLIENT
+    if _FEEDBACK_CLIENT is not None:
+        return _FEEDBACK_CLIENT
+    from langsmith import Client
+
+    connect_ms = int(os.environ.get("SWARM_LANGSMITH_CONNECT_TIMEOUT_MS", "3000"))
+    read_ms = int(os.environ.get("SWARM_LANGSMITH_READ_TIMEOUT_MS", "5000"))
+    try:
+        from urllib3.util import Retry
+
+        # total=1：连原始请求最多 2 次，杜绝默认 ~7 次退避叠加成数十秒卡顿。
+        retry = Retry(total=1, backoff_factor=0.2, allowed_methods=None)
+        _FEEDBACK_CLIENT = Client(timeout_ms=(connect_ms, read_ms), retry_config=retry)
+    except Exception:  # noqa: BLE001 — urllib3 不可用时退回仅超时
+        _FEEDBACK_CLIENT = Client(timeout_ms=(connect_ms, read_ms))
+    return _FEEDBACK_CLIENT
+
+
+def shutdown_tracing(timeout: float = 0.0) -> None:
+    """关停时立刻停掉 LangSmith 后台上报，绝不为可观测性阻塞进程退出。
+
+    运行时热路径已经不会被 Smith 卡住（运行树自动上报走后台 daemon 线程 + 有界
+    队列，满了 put_nowait 直接丢；create_feedback 走 _feedback_client 的超时）。
+    唯一残留阻塞点是进程退出：langsmith 注册了 atexit handler，会把队列里没传完
+    的 trace flush 给 Smith，端点不通时能把【关进程/重启】拖住数十秒。
+
+    这里在 app shutdown 主动调 cleanup(timeout=0)：跳过 flush 直接停后台线程，并置
+    _manual_cleanup=True 让后续 atexit drain no-op。丢弃未上报 trace 是刻意取舍——
+    Smith 网络抖动时，进程退出/重启不该被一个可观测性工具拖住。
+    """
+    clients = []
+    if _FEEDBACK_CLIENT is not None:
+        clients.append(_FEEDBACK_CLIENT)
+    # LangChain 自动埋点用的缓存客户端：仅在 tracing 开过时才会存在，避免空建一个。
+    try:
+        if is_langsmith_active():
+            from langchain_core.tracers.langchain import get_client
+
+            clients.append(get_client())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get tracer client skipped: %s", exc)
+    for c in clients:
+        try:
+            c.cleanup(timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("LangSmith cleanup skipped: %s", exc)
+
+
 def push_l1_feedback(
     l1_details: dict[str, Any],
     *,
@@ -112,7 +174,6 @@ def push_l1_feedback(
     if not is_langsmith_active():
         return
     try:
-        from langsmith import Client
         from langsmith.run_helpers import get_current_run_tree
 
         rid = run_id
@@ -122,7 +183,7 @@ def push_l1_feedback(
         if not rid:
             return
 
-        client = Client()
+        client = _feedback_client()
         source = l1_details.get("l1_decision_source", "unknown")
 
         def _fb(key: str, score: float | bool, comment: str = "") -> None:
@@ -170,7 +231,6 @@ def push_planning_feedback(planning: dict[str, Any], *, run_id: str | None = Non
     if not is_langsmith_active():
         return
     try:
-        from langsmith import Client
         from langsmith.run_helpers import get_current_run_tree
 
         rid = run_id
@@ -180,7 +240,7 @@ def push_planning_feedback(planning: dict[str, Any], *, run_id: str | None = Non
         if not rid:
             return
 
-        client = Client()
+        client = _feedback_client()
 
         def _fb(key: str, score: float | bool, comment: str = "") -> None:
             try:

@@ -917,6 +917,13 @@ async def on_shutdown():
         await close_coordination_backend()
     except Exception as exc:
         logger.warning("Failed to close coordination backend: %s", exc)
+    # 最后：立刻停掉 LangSmith 后台上报，绝不为可观测性 flush 阻塞进程退出/重启。
+    try:
+        from swarm.tracing import shutdown_tracing
+
+        shutdown_tracing(timeout=0.0)
+    except Exception as exc:
+        logger.warning("Failed to shutdown LangSmith tracing: %s", exc)
 
 
 async def _start_kb_update_scheduler() -> None:

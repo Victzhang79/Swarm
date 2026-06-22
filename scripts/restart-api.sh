@@ -28,11 +28,26 @@ log "启动 Swarm API (端口 ${PORT})..."
 # PYTHONUNBUFFERED=1: stdout 重定向到文件时默认块缓冲，导致 worker 早期日志
 # （准备/选沙箱模板等）延迟数十秒甚至任务跑完才落盘，排障时看不到。
 # 设为无缓冲让日志实时进 swarm.log。
-nohup env PYTHONUNBUFFERED=1 "${VENV}/bin/uvicorn" swarm.api.app:app \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
-  --log-level info \
-  >> "${PROJECT_ROOT}/swarm.log" 2>&1 &
+if [[ "${SWARM_DETACH_SESSION:-0}" == "1" ]]; then
+  # 固化原 /tmp/start_swarm.sh 的脱离能力：在独立 session 中启动，脱离父进程组
+  # （如 Hermes/编排器）。父进程组收到 SIGTERM 时不会连累 uvicorn 一起被杀。
+  # macOS 无 setsid 命令，用 .venv 的 python 调 os.setsid() 自建新 session 后
+  # exec uvicorn（exec 不换 PID，$! 仍指向最终的 uvicorn，pidfile 有效）。
+  nohup "${VENV}/bin/python" -c '
+import os, sys
+os.setsid()
+os.environ["PYTHONUNBUFFERED"] = "1"
+os.execv(sys.argv[1], sys.argv[1:])
+' "${VENV}/bin/uvicorn" swarm.api.app:app \
+    --host 0.0.0.0 --port "${PORT}" --log-level info \
+    >> "${PROJECT_ROOT}/swarm.log" 2>&1 &
+else
+  nohup env PYTHONUNBUFFERED=1 "${VENV}/bin/uvicorn" swarm.api.app:app \
+    --host 0.0.0.0 \
+    --port "${PORT}" \
+    --log-level info \
+    >> "${PROJECT_ROOT}/swarm.log" 2>&1 &
+fi
 api_pid=$!
 echo "$api_pid" > "${PID_DIR}/swarm.pid"
 disown -h "$api_pid" 2>/dev/null || true
