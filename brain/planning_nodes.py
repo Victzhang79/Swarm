@@ -719,6 +719,7 @@ async def detect_stack(state: BrainState) -> dict:
     from swarm.brain.stack_detect import (
         compute_repo_fingerprint,
         detect_stack_deterministic,
+        extract_stack_hints_from_knowledge,
     )
 
     proj_path = _resolve_project_path(state)
@@ -746,11 +747,19 @@ async def detect_stack(state: BrainState) -> dict:
 
     # ② 确定性磁盘探测
     profile = detect_stack_deterministic(proj_path)
+    # 合流 KB 已爬的项目架构/技术栈知识（如"[RuoYi规范] SpringBoot+Shiro+Thymeleaf"）——
+    # 我们爬了 wiki/规范进库，这里显式拎出来作高优先证据，别让它埋在 query-dependent 层（8537fa5e 续）。
+    kb_hints = extract_stack_hints_from_knowledge(state.get("knowledge_context"))
+    if kb_hints:
+        profile.setdefault("evidence", []).append("KB 已收录的项目架构/技术栈知识：")
+        profile["evidence"].extend("  · " + h for h in kb_hints)
+        profile["kb_stack_hints"] = kb_hints
     logger.info(
-        "[DETECT_STACK] 确定性探测：前端=%s(%s) 后端=%s 构建=%s 置信=%.2f%s",
+        "[DETECT_STACK] 确定性探测：前端=%s(%s) 后端=%s 构建=%s 置信=%.2f%s（KB 架构线索 %d 条）",
         profile.get("frontend"), profile.get("frontend_kind"), profile.get("backend"),
         profile.get("build"), profile.get("confidence"),
         "（需模型兜底）" if profile.get("needs_model_adjudication") else "",
+        len(kb_hints),
     )
 
     # ③ 仅低置信/歧义才调一次大模型裁决（据证据，不靠先验）

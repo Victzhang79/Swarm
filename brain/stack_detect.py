@@ -300,6 +300,56 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     }
 
 
+_STACK_KW = (
+    "技术栈", "架构", "框架", "前端", "后端", "thymeleaf", "freemarker", "velocity",
+    "vue", "react", "angular", "spring", "springboot", "spring boot", "shiro",
+    "security", "jsp", "模板", "bootstrap", "element", "单体", "微服务", "前后端分离",
+    "mybatis", "django", "flask", "express", "laravel", "stack", "framework",
+)
+
+
+def extract_stack_hints_from_knowledge(knowledge_context: dict | None, max_hits: int = 6) -> list[str]:
+    """从已检索的项目知识库上下文里抽取【技术栈/架构】相关条目（治本 8537fa5e 续：
+
+    我们爬了项目 wiki/规范进 KB（如"[RuoYi规范] RuoYi 是 SpringBoot+Shiro+Thymeleaf"），
+    但它埋在 query-dependent 的 semantic 层 / 当作普通 norms，tech_design 没据它定栈。
+    本函数把这些条目显式拎出来，作为 detect_stack 的【高优先证据源】（与磁盘事实合流）。
+    纯函数：只读已注入的 knowledge_context，不发起检索、不连库。
+    """
+    if not isinstance(knowledge_context, dict):
+        return []
+    hits: list[str] = []
+    seen: set[str] = set()
+
+    def _consider(text: str, tag: str) -> None:
+        if not text:
+            return
+        low = text.lower()
+        if any(kw in low for kw in _STACK_KW):
+            snip = " ".join(text.split())[:240]
+            key = snip[:80]
+            if key not in seen:
+                seen.add(key)
+                hits.append(f"[{tag}] {snip}")
+
+    summary = knowledge_context.get("project_summary")
+    if isinstance(summary, str):
+        _consider(summary, "项目摘要")
+    elif isinstance(summary, list) and summary:
+        _consider(str(summary[0]), "项目摘要")
+    for layer, tag in (("semantic", "KB语义"), ("norms", "KB规范"), ("struct", "KB结构")):
+        for item in (knowledge_context.get(layer) or []):
+            if len(hits) >= max_hits:
+                break
+            if isinstance(item, dict):
+                txt = item.get("content") or item.get("title") or ""
+                title = item.get("title") or ""
+                _consider(f"{title} {txt}".strip(), tag)
+            elif isinstance(item, str):
+                _consider(item, tag)
+    return hits[:max_hits]
+
+
 def format_stack_for_prompt(profile: dict | None) -> str:
     """把 project_stack 画像渲染成喂给 tech_design 的【权威栈指令】（磁盘优先于文档）。"""
     if not profile:
@@ -323,6 +373,10 @@ def format_stack_for_prompt(profile: dict | None) -> str:
         lines.append("- 前端落地约定：新增页面用该 SPA 框架的单文件组件/路由，落在既有前端工程目录。")
     elif kind == "separated":
         lines.append("- 前端落地约定：前后端分离，前端进 SPA 工程目录、后端只出 API；按各自既有约定落地。")
+    kb_hints = profile.get("kb_stack_hints") or []
+    if kb_hints:
+        lines.append("- KB 已收录的项目架构知识（与磁盘事实一致，佐证）：")
+        lines.extend("  · " + h for h in kb_hints[:4])
     lines.append(
         "- 若需求文档假定了与上面【不同】的框架/技术，一律以本画像（磁盘事实）为准【适配落地】，不算虚假前提、不要终止。"
     )

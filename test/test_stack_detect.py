@@ -9,6 +9,7 @@ import os
 from swarm.brain.stack_detect import (
     compute_repo_fingerprint,
     detect_stack_deterministic,
+    extract_stack_hints_from_knowledge,
     format_stack_for_prompt,
 )
 
@@ -98,6 +99,40 @@ def test_fingerprint_stable_then_changes(tmp_path):
     # 新增构建清单（栈相关）→ 指纹变
     _mk(t, "ruoyi-ui/package.json", '{"vue":"3"}')
     assert compute_repo_fingerprint(t) != fp1
+
+
+def test_kb_hints_extracted_from_norms_and_semantic():
+    """治本续：把爬进 KB 的项目架构知识(埋在 semantic/norms)显式拎出来作高优先证据。"""
+    kc = {
+        "project_summary": "Project with 624 files. Java/HTML/JS.",
+        "semantic": [{"content": "[RuoYi规范] RuoYi 技术栈与版本分支\nRuoYi 是基于经典组合 SpringBoot + Apache Shiro + Thymeleaf"}],
+        "norms": [
+            {"title": "RuoYi 数据字典约定", "content": "后端在模板用 [[${@dict.getType('x')}]] 取字典"},
+            {"title": "无关项", "content": "日志规范：用 slf4j"},
+        ],
+    }
+    hits = extract_stack_hints_from_knowledge(kc)
+    assert any("SpringBoot" in h and "Thymeleaf" in h for h in hits), hits
+    # 含 "模板" 关键字的规范也算栈线索
+    assert any("模板" in h for h in hits)
+    # 纯日志规范不含栈关键字 → 不混入
+    assert not any("slf4j" in h for h in hits)
+
+
+def test_kb_hints_surface_in_prompt():
+    profile = {
+        "frontend": "服务端模板（Thymeleaf）", "frontend_kind": "server-template",
+        "backend": "Spring Boot (java)", "build": "maven", "confidence": 0.95,
+        "kb_stack_hints": ["[KB语义] RuoYi 是 SpringBoot + Shiro + Thymeleaf"],
+    }
+    out = format_stack_for_prompt(profile)
+    assert "KB 已收录的项目架构知识" in out
+    assert "Thymeleaf" in out
+
+
+def test_kb_hints_empty_on_garbage():
+    assert extract_stack_hints_from_knowledge(None) == []
+    assert extract_stack_hints_from_knowledge({"norms": [{"content": "无关日志"}]}) == []
 
 
 def test_none_profile_format_empty():
