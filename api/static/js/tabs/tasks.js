@@ -9,7 +9,11 @@ function canRetryTask(t) {
   if (!t || !t.status) return false;
   const status = t.status;
   if (status === 'FAILED' || status === 'CANCELLED' || status === 'DONE') return true;
-  if (isTaskActive(status) && status !== 'DELIVERING' && status !== 'CONFIRMING') return true;
+  // 人机闸门态（澄清/方案评审/确认/交付）不显示「重跑」——这些状态用闸门自身的操作或「取消」，
+  // 重跑会从头重来；与 DELIVERING/CONFIRMING 一致地把 CLARIFYING/DESIGN_REVIEW 也排除。
+  const GATE = status === 'DELIVERING' || status === 'CONFIRMING'
+    || status === 'CLARIFYING' || status === 'DESIGN_REVIEW';
+  if (isTaskActive(status) && !GATE) return true;
   return false;
 }
 
