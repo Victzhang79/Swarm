@@ -526,6 +526,14 @@ async def plan(state: BrainState) -> dict:
     task_description = state.get("task_description", "")
     # 优先用澄清后定级(assess)，回退 analyze 初判
     complexity = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
+    # checkpoint resume 后枚举会反序列化成字符串("ultra")——这里统一归一为 Complexity 枚举，
+    # 否则下游 complexity.value / == Complexity.X 触发 AttributeError（task 8537fa5e 真因，
+    # 与 ASSESS 308cd191 同类：interrupt→resume 路径上状态枚举退化为 str）。
+    if not isinstance(complexity, Complexity):
+        try:
+            complexity = Complexity(str(complexity).lower())
+        except ValueError:
+            complexity = Complexity.MEDIUM
     knowledge_context = state.get("knowledge_context", {})
 
     # I3 防 premature victory：检测 replan 重入——若 state 已有 subtask_results（说明这是
@@ -901,7 +909,9 @@ def confirm_plan(state: BrainState) -> dict:
     """
     # P2-2 修复：进入 confirm 有三种原因，文案/日志按 reason 区分，
     # 不再无条件打印"ultra 复杂度"（误导：medium 校验失败也会进这里）。
-    _complexity = state.get("complexity", Complexity.MEDIUM)
+    # 用 effective_complexity（已归一枚举）：resume 后 state["complexity"] 是字符串，
+    # 直接 == Complexity.ULTRA 会静默 False、把 ultra 闸门误标成普通校验失败。
+    _complexity = effective_complexity(state)
     _plan_valid = state.get("plan_valid", True)
     if not _plan_valid:
         _reason = "validation_failed"

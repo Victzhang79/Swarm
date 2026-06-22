@@ -182,5 +182,14 @@ def effective_complexity(state: BrainState) -> Complexity:
 
     所有需要"当前生效复杂度"的判断点都应调用本函数，而非各自 `state.get(...)`，
     以保证语义一致、避免未来新增节点再次踩坑。
+
+    归一：checkpoint resume 后枚举会反序列化成字符串("ultra")——本函数统一返回 Complexity
+    枚举，杜绝下游 `== Complexity.X` 静默错配 / `.value` 抛 AttributeError（task 8537fa5e 真因）。
     """
-    return state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
+    comp = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
+    if isinstance(comp, Complexity):
+        return comp
+    try:
+        return Complexity(str(comp).lower())
+    except ValueError:
+        return Complexity.MEDIUM
