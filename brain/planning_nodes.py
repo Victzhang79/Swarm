@@ -697,6 +697,103 @@ async def assess(state: BrainState) -> dict:
 
 
 # ══════════════════════════════════════════════
+# 节点 2.7：detect_stack — 技术栈/架构识别（plan 前预处理，磁盘 ground truth）
+# ══════════════════════════════════════════════
+
+STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓库的【磁盘客观证据】，"""\
+"""请据此判定它的真实技术栈（不要靠框架名先验，只看证据）。严格输出 JSON：
+{"frontend":"前端栈(如 Vue / React / 服务端模板(Thymeleaf) / 无)",
+ "frontend_kind":"server-template|spa|separated|none",
+ "backend":"后端栈(如 Spring Boot (java) / Django (python))","build":"构建工具",
+ "confidence":0.0-1.0,"reason":"判定依据(引用证据)"}"""
+
+
+async def detect_stack(state: BrainState) -> dict:
+    """技术栈/架构识别（plan 前预处理）：磁盘事实为准，确定性优先、模型仅兜底、按 repo 指纹缓存 DB。
+
+    治本 task 8537fa5e：tech_design 曾因无栈事实而用"RuoYi=Vue"先验在 Thymeleaf 单体产 Vue 死代码。
+    本节点把"项目是什么栈"做成 plan 前的单一权威事实（project_stack），由 tech_design/plan/worker 统一消费。
+    流程：① 命中 (project_id, repo 指纹) 缓存即复用（零成本）；② 否则确定性磁盘探测；
+    ③ 仅当置信低/信号歧义才调【一次】大模型据证据裁决；④ 落 projects.config 按指纹缓存。
+    """
+    from swarm.brain.stack_detect import (
+        compute_repo_fingerprint,
+        detect_stack_deterministic,
+    )
+
+    proj_path = _resolve_project_path(state)
+    pid = state.get("project_id") or ""
+    if not proj_path:
+        return {}  # 无磁盘路径（如纯 greenfield 未落盘）→ 跳过，tech_design 回退原有 project_facts
+
+    try:
+        fingerprint = compute_repo_fingerprint(proj_path)
+    except Exception:  # noqa: BLE001
+        fingerprint = ""
+
+    # ① 缓存命中（同 repo 指纹）→ 复用
+    from swarm.project import store as _pstore
+    proj_rec = None
+    try:
+        proj_rec = _pstore.get_project(pid) if pid else None
+        cached = (proj_rec or {}).get("config", {}).get("project_stack") if proj_rec else None
+        if isinstance(cached, dict) and cached.get("fingerprint") and cached["fingerprint"] == fingerprint:
+            logger.info("[DETECT_STACK] 命中缓存（指纹 %s）：前端=%s 后端=%s",
+                        fingerprint, cached.get("frontend"), cached.get("backend"))
+            return {"project_stack": cached}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DETECT_STACK] 读缓存失败（不致命，继续探测）: %s", exc)
+
+    # ② 确定性磁盘探测
+    profile = detect_stack_deterministic(proj_path)
+    logger.info(
+        "[DETECT_STACK] 确定性探测：前端=%s(%s) 后端=%s 构建=%s 置信=%.2f%s",
+        profile.get("frontend"), profile.get("frontend_kind"), profile.get("backend"),
+        profile.get("build"), profile.get("confidence"),
+        "（需模型兜底）" if profile.get("needs_model_adjudication") else "",
+    )
+
+    # ③ 仅低置信/歧义才调一次大模型裁决（据证据，不靠先验）
+    if profile.get("needs_model_adjudication"):
+        try:
+            llm = _get_brain_llm()
+            ev = "\n".join(profile.get("evidence") or [])
+            resp = await llm.ainvoke([
+                {"role": "system", "content": STACK_ADJUDICATE_SYSTEM},
+                {"role": "user", "content": f"磁盘证据：\n{ev}\n\n确定性初判：{profile.get('frontend')} / "
+                                            f"{profile.get('backend')}（置信 {profile.get('confidence')}）。请裁决。"},
+            ])
+            adj = _parse_json_from_llm(resp.content)
+            if isinstance(adj, dict) and adj.get("frontend"):
+                profile.update({
+                    "frontend": adj.get("frontend", profile["frontend"]),
+                    "frontend_kind": adj.get("frontend_kind", profile["frontend_kind"]),
+                    "backend": adj.get("backend", profile["backend"]),
+                    "build": adj.get("build", profile["build"]),
+                    "confidence": float(adj.get("confidence", profile["confidence"]) or profile["confidence"]),
+                    "source": "deterministic+model",
+                })
+                logger.info("[DETECT_STACK] 大模型裁决后：前端=%s 后端=%s 置信=%.2f",
+                            profile["frontend"], profile["backend"], profile["confidence"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DETECT_STACK] 模型裁决失败，沿用确定性结果: %s", exc)
+
+    profile["fingerprint"] = fingerprint
+
+    # ④ 落 projects.config 按指纹缓存（合并写，不clobber其它config）
+    try:
+        if pid and proj_rec is not None:
+            cfg = dict(proj_rec.get("config") or {})
+            cfg["project_stack"] = profile
+            _pstore.update_project(pid, config=cfg)
+            logger.info("[DETECT_STACK] 画像已缓存到 projects.config（指纹 %s）", fingerprint)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DETECT_STACK] 写缓存失败（不致命）: %s", exc)
+
+    return {"project_stack": profile}
+
+
+# ══════════════════════════════════════════════
 # 节点 3：tech_design — 技术方案 + 接口先行（Q6/B）
 # ══════════════════════════════════════════════
 
@@ -995,6 +1092,14 @@ async def tech_design(state: BrainState) -> dict:
     proj_path = _resolve_project_path(state)
     task_desc = state.get("task_description", "")
     project_facts = _gather_project_facts(proj_path)
+    # detect_stack 预处理已产出权威技术栈画像 → 置顶为权威栈指令（磁盘优先于文档框架假设，
+    # 治本 8537fa5e）；缺画像（如跳过 detect_stack）时回退仅用 _gather_project_facts 原始事实。
+    _stack = state.get("project_stack")
+    if _stack:
+        from swarm.brain.stack_detect import format_stack_for_prompt
+        _stack_directive = format_stack_for_prompt(_stack)
+        if _stack_directive:
+            project_facts = _stack_directive + "\n\n" + project_facts
     file_checks = _verify_named_files_exist(task_desc, proj_path)
     if file_checks:
         _fv_lines = []

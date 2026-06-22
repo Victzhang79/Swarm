@@ -49,6 +49,7 @@ from swarm.brain.planning_nodes import (
     assess,
     clarify,
     contract_design,
+    detect_stack,
     elaborate,
     review_design,
     tech_design,
@@ -347,6 +348,7 @@ def build_brain_graph() -> StateGraph:
     # ── 注册节点 ──
     graph.add_node("ingest", ingest)        # B 部分：多模态需求摄取（前置于 analyze）
     graph.add_node("analyze", analyze)
+    graph.add_node("detect_stack", detect_stack)  # 2.7：技术栈/架构识别（plan 前预处理，磁盘 ground truth）
     # Q4 规划子图节点
     graph.add_node("clarify", clarify)
     graph.add_node("assess", assess)
@@ -388,9 +390,10 @@ def build_brain_graph() -> StateGraph:
     graph.add_edge("learn_failure", END)
 
     # ── Q4 规划子图边 ──
-    # ANALYZE →[条件] CLARIFY / TECH_DESIGN（需求转化前置：直达路径也先过 tech_design）
+    # ANALYZE → DETECT_STACK（先把"项目是什么栈"做成单一权威事实）→[条件] CLARIFY / TECH_DESIGN
+    graph.add_edge("analyze", "detect_stack")
     graph.add_conditional_edges(
-        "analyze",
+        "detect_stack",
         after_analyze,
         {"clarify": "clarify", "tech_design": "tech_design"},
     )

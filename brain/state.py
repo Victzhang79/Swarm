@@ -147,6 +147,7 @@ class BrainState(TypedDict, total=False):
     assessed_complexity: Complexity     # 澄清后基于完整信息+知识库定的真复杂度（覆盖 analyze 初判）
     # ─── 技术方案 + 评审(Q5/Q6/B)───
     tech_design: dict                   # {stack, architecture, data_model_diagram, flow_diagram, risks, notes, acceptance, change_impact, maintainability, comment_requirements}
+    project_stack: dict                 # 技术栈/架构画像(detect_stack 预处理产，磁盘 ground truth)：{frontend,frontend_kind,backend,build,confidence,evidence,...}，权威优先于需求文档框架假设，供 tech_design/plan/worker 统一消费
     shared_contract_draft: dict         # 接口先行(B)：API schema / 数据模型，供并行子任务作稳定前置
     tech_design_fact_issues: list       # 事实核验问题（虚假前提）：[{claim, verdict(false/already_exists/uncertain), detail, suggestion}]
     tech_design_file_plan: list         # 文件级技术方案：[{path, action(create/modify), responsibility, depends_on}]，喂给 PLAN 定 scope
