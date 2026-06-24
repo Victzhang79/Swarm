@@ -31,10 +31,11 @@ SYSTEM_PROMPT_TEMPLATE = """\
 ```
 
 ## 🔒 文件访问权限（Scope 约束）
-- ✏️ 可写文件: {writable_files}
+- ✏️ 可修改文件（已存在）: {writable_files}
+- 📄 需新建文件（已授权，必须创建）: {create_files}
 - 👁️ 可读文件: {readable_files}
 
-⚠️ **严格遵守 Scope 约束**：你只能修改可写文件，只能读取可读文件。超出范围的文件操作将被拒绝。
+⚠️ **严格遵守 Scope 约束**：你只能修改"可修改文件"列表中的文件、创建"需新建文件"列表中的文件、读取"可读文件"列表中的文件。超出范围的文件操作将被拒绝。
 
 {stack_section}
 
@@ -174,7 +175,8 @@ def build_worker_prompt(
 
     # Scope 格式化
     writable_files = ", ".join(effective_scope.writable) if effective_scope.writable else "（无）"
-    readable_files = ", ".join(effective_scope.readable) if effective_scope.readable else "（仅可写文件）"
+    create_files = ", ".join(effective_scope.create_files) if effective_scope.create_files else "（无）"
+    readable_files = ", ".join(effective_scope.readable) if effective_scope.readable else "（仅可写/新建文件）"
 
     # Harness 段落 —— 告诉 Worker 用什么命令验证产出合格
     harness_section = _format_harness_section(getattr(subtask, "harness", None))
@@ -250,6 +252,7 @@ def build_worker_prompt(
         acceptance_criteria=criteria_lines,
         contract=contract_str,
         writable_files=writable_files,
+        create_files=create_files,
         readable_files=readable_files,
         harness_section=harness_section,
         debug_section=debug_section,
