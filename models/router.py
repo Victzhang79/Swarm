@@ -21,6 +21,17 @@ from swarm.config.settings import ModelConfig, ProviderConfig, get_config
 logger = logging.getLogger(__name__)
 
 
+def _monotonic() -> float:
+    """心跳计时时钟（独立间接层）。
+
+    单列出来是为了【可测】：测试可只 patch 本函数喂受控时间，而不污染 asyncio 事件循环
+    自身依赖的 time.monotonic（直接全局 patch 会让 wait_for 的计时一起崩）。
+    """
+    import time
+
+    return time.monotonic()
+
+
 class ModelInvocationLogger(BaseCallbackHandler):
     """记录【实际被调用】的模型 + endpoint，并在 fallback 触发时显式告警。
 
@@ -65,10 +76,19 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     仅覆盖 async `_astream`（worker 热路径）；sync 路径沿用 langchain 内置 stream_chunk_timeout 兜底。
     超时抛 TransientInfraError（含 "timeout" 标记）→ classify_failure 归 transient（退避重试/fallback，
     【绝不】当 capability 去换模型——是基建瞬时，不是模型弱，对齐治本 C）。
+
+    治本（可观测）：双超时只保证"没 stall"，不报"还在跑多久"。brain 调用可吐满 brain_max_tokens
+    (32768)，云端 reasoning 模型按 ~20tok/s 算要数十分钟（实测 contract_design 单次 24.5min，全程
+    零日志）——一个【健康的长流式】与【真挂死】在日志上无法区分，运维只能空等/误判。这里加【自静默
+    心跳】：调用未超 heartbeat_after 秒一律不打（短的 worker 热路径零噪声），超了才每 heartbeat_every
+    秒记一行 elapsed+chunk 数，证明"流式仍在吐、未 stall"。不改超时语义，纯观测。
     """
 
     swarm_first_token_timeout: float = 180.0
     swarm_inter_chunk_timeout: float = 30.0
+    # 自静默心跳：调用总时长超过 after 秒才开始打心跳，之后每 every 秒一行（短调用零噪声）。
+    swarm_heartbeat_after: float = 60.0
+    swarm_heartbeat_every: float = 30.0
 
     async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
         import asyncio
@@ -77,6 +97,9 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
 
         agen = super()._astream(*args, **kwargs)
         first = True
+        t0 = _monotonic()
+        last_beat = t0
+        n_chunks = 0
         while True:
             to = self.swarm_first_token_timeout if first else self.swarm_inter_chunk_timeout
             try:
@@ -93,6 +116,15 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                     f"stream {phase} 超时 {to:.0f}s (stream stall timeout) —— 基建瞬时，退避重试/fallback"
                 ) from exc
             first = False
+            n_chunks += 1
+            # 自静默心跳：超过 after 且距上次心跳≥every 才记一行，证明长调用仍在吐 token（非挂死）。
+            now = _monotonic()
+            if now - t0 >= self.swarm_heartbeat_after and now - last_beat >= self.swarm_heartbeat_every:
+                last_beat = now
+                logger.info(
+                    "[stream] %s 流式生成中 %.0fs（已收 %d chunk，未 stall）",
+                    getattr(self, "model_name", None) or "model", now - t0, n_chunks,
+                )
             yield chunk
 
 

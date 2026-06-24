@@ -1393,6 +1393,12 @@ async def contract_design(state: BrainState) -> dict:
             f"  - {fp.get('path')} [{fp.get('module', '?')}] {fp.get('responsibility', '')}"
             for fp in file_plan[:120]
         )
+        # 起始 marker：这是单次 Brain 大模型长调用（实测 ultra 8 模块达 ~24min，吐满 brain_max_tokens）。
+        # 无此行时节点静默数十分钟，与挂死无法区分；配合 _astream 自静默心跳即可看到"仍在吐"。
+        logger.info(
+            "[CONTRACT_DESIGN] 启动全局契约生成（Brain 大模型，%d 模块/%d 文件，长方案可能数分钟）…",
+            len(modules), len(file_plan),
+        )
         resp = await llm.ainvoke([
             {"role": "system", "content": CONTRACT_DESIGN_SYSTEM},
             {"role": "user", "content": CONTRACT_DESIGN_USER.format(

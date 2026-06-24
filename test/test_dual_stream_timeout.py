@@ -84,6 +84,58 @@ def test_normal_stream_passes_through(monkeypatch):
     assert got == ["a", "b", "c"]
 
 
+def test_heartbeat_silent_for_short_calls(monkeypatch, caplog):
+    """治本（可观测）：短调用零心跳噪声——总时长未达 heartbeat_after 时一行不打。"""
+    import logging
+
+    import swarm.models.router as router_mod
+
+    async def quick(self, *a, **k):
+        for c in ("a", "b", "c"):
+            yield c
+    monkeypatch.setattr(ChatOpenAI, "_astream", quick, raising=False)
+    # 心跳时钟恒定 → 远未达 after=60（patch 间接层，不碰 asyncio 自身的 time.monotonic）
+    monkeypatch.setattr(router_mod, "_monotonic", lambda: 1.0)
+    m = _mk(5, 5)
+    got: list = []
+
+    async def run():
+        async for c in m._astream([]):
+            got.append(c)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(run())
+    assert got == ["a", "b", "c"]
+    assert not any("流式生成中" in r.getMessage() for r in caplog.records)
+
+
+def test_heartbeat_fires_for_long_calls(monkeypatch, caplog):
+    """治本（可观测）：长流式调用每 heartbeat_every 秒打一行 elapsed，证明仍在吐 token、未挂死。"""
+    import logging
+
+    import swarm.models.router as router_mod
+
+    async def slow(self, *a, **k):
+        for c in ("a", "b", "c", "d"):
+            yield c
+    monkeypatch.setattr(ChatOpenAI, "_astream", slow, raising=False)
+    # 受控心跳时钟：t0=0；4 个 chunk 后依次 now=3,12,14,18（patch 间接层，不碰 asyncio 计时）
+    seq = iter([0.0, 3.0, 12.0, 14.0, 18.0])
+    monkeypatch.setattr(router_mod, "_monotonic", lambda: next(seq))
+    m = _mk(5, 5)
+    m.swarm_heartbeat_after = 10.0
+    m.swarm_heartbeat_every = 5.0
+    got: list = []
+
+    async def run():
+        async for c in m._astream([]):
+            got.append(c)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(run())
+    assert got == ["a", "b", "c", "d"]
+    beats = [r for r in caplog.records if "流式生成中" in r.getMessage()]
+    assert len(beats) == 2  # now=12（首达 after 且距 t0≥every）与 now=18（距上次≥every）各一次
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
