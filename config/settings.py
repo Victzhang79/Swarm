@@ -217,9 +217,15 @@ class ModelConfig(BaseSettings):
     # 一直在吐)、read-timeout 不管总时长 → PLAN 单批挂 16min。设上限封顶单次生成,失控时被截断
     # → 该批降级而非无限挂。32k 足够最长的两阶段方案/分批拆解输出。0=不限(向后兼容,不建议)。
     brain_max_tokens: int = 32768
-    # 流式无 chunk 看门狗：两次 parsed chunk 间隔超此秒数即中断，触发 fallback。
-    # 默认 45s（远端 vLLM/网关偶发 stall，越早中断 fallback 越快接管；过小会误杀慢首 token）。
-    stream_chunk_timeout: float = 45.0
+    # 流式看门狗（治本 A：首 token 与解码间隔【双超时拆分】）。本质不同的两件事不该共用一个阈值：
+    #   - first_token_timeout：等首 token（含 prefill）——并发 + 大上下文下本就慢，给宽（默认 180s）；
+    #   - inter_chunk_timeout：解码中途两 chunk 间隔——本该快，真停 30s 就是异常，给紧（默认 30s）。
+    # 旧的单值 stream_chunk_timeout（45→120）把两者混为一谈：调大才容得下慢 prefill，但同时纵容了
+    # 真正的中途 stall（故障发现变慢）。拆开后：prefill 有空间、真 stall 仍秒级抓。是 ultra E2E
+    # "全是调用超时→空 diff→假失败"的根治。stream_chunk_timeout 保留为兜底/同步路径上限。
+    stream_chunk_timeout: float = 120.0
+    first_token_timeout: float = 180.0
+    inter_chunk_timeout: float = 30.0
 
     # ── I1 模型能力分级（Brain 编排约束随模型能力调整）──────────────
     # tier_enabled 默认 False = 永远 standard = 现有硬编码约束上限，行为零变化（安全闸门）。

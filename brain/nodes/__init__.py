@@ -1313,6 +1313,29 @@ def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> b
     return False
 
 
+# 治本 C：流式 stall（模型服务并发拥塞，_DualTimeoutChatOpenAI 抛 TransientInfraError 的特征词）。
+_STREAM_STALL_MARKERS = ("stream stall", "解码中途", "首 token(prefill)", "stream stall timeout")
+
+
+def _has_stream_stall(subtask_results: dict, ids: list) -> bool:
+    """失败详情里是否有【流式 stall】特征——据此给更长退避，让模型服务并发拥塞散去再重试。"""
+    for fid in ids or []:
+        out = (subtask_results or {}).get(fid)
+        if isinstance(out, WorkerOutput):
+            det, extra = (out.l1_details or {}), (out.summary or "")
+        elif isinstance(out, dict):
+            det, extra = (out.get("l1_details", {}) or {}), (out.get("summary", "") or "")
+        else:
+            det, extra = {}, ""
+        try:
+            blob = json.dumps(det, ensure_ascii=False) + extra
+        except (TypeError, ValueError):
+            blob = str(det) + extra
+        if any(m in blob for m in _STREAM_STALL_MARKERS):
+            return True
+    return False
+
+
 # 顶层不是【模块目录】的常见前缀——取模块名时跳过，避免把 src/test 误当模块（MEDIUM-1）。
 _NON_MODULE_TOP = ("src", "test", "target", "build", "dist", "out", "node_modules")
 
@@ -1922,10 +1945,14 @@ async def handle_failure(state: BrainState) -> dict:
         next_tcounts = {fid: transient_counts.get(fid, 0) + 1 for fid in transient_ids}
         deepest_t = max(next_tcounts.values(), default=0)
         if deepest_t <= MAX_TRANSIENT_RETRY:
-            delay = backoff_seconds(deepest_t)
+            # 治本 C：流式 stall（模型服务并发拥塞）立即重试会撞同一拥塞 → 给【更长退避】让拥塞散去
+            # （8/16/32s）；普通 transient（连接抖动/5xx）恢复快，沿用短退避（2/4/8s）。两者都【不换模型】
+            # （use_alternate_model=False）——是基建瞬时不是模型弱。
+            _stall = _has_stream_stall(subtask_results, transient_ids)
+            delay = backoff_seconds(deepest_t, base=8.0, cap=60.0) if _stall else backoff_seconds(deepest_t)
             logger.info(
-                "[HANDLE_FAILURE] 策略=retry(transient 退避，第 %d/%d 次，sleep %.1fs，不计 capability 配额): %s",
-                deepest_t, MAX_TRANSIENT_RETRY, delay, transient_ids,
+                "[HANDLE_FAILURE] 策略=retry(transient%s 退避，第 %d/%d 次，sleep %.1fs，不换模型/不计 capability 配额): %s",
+                "·流式stall" if _stall else "", deepest_t, MAX_TRANSIENT_RETRY, delay, transient_ids,
             )
             await asyncio.sleep(delay)
             dispatch_remaining = list(state.get("dispatch_remaining", []))

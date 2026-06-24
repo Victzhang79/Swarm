@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable
+from langchain_openai import ChatOpenAI
 
 from swarm.config.settings import ModelConfig, ProviderConfig, get_config
 
@@ -56,6 +57,45 @@ class ModelProvider(Protocol):
     def get_chat_model(self, model_name: str, temperature: float = 0.2) -> BaseChatModel: ...
 
 
+class _DualTimeoutChatOpenAI(ChatOpenAI):
+    """治本 A：流式【双超时拆分】——首 token 与解码间隔本质不同，不该共用一个阈值。
+
+    - 首 token（含 prefill）：并发 + 大上下文下本就慢，给宽（swarm_first_token_timeout，默认 180s）；
+    - 解码中途两 chunk 间隔：本该快，真停 >swarm_inter_chunk_timeout（默认 30s）就是异常，给紧。
+    仅覆盖 async `_astream`（worker 热路径）；sync 路径沿用 langchain 内置 stream_chunk_timeout 兜底。
+    超时抛 TransientInfraError（含 "timeout" 标记）→ classify_failure 归 transient（退避重试/fallback，
+    【绝不】当 capability 去换模型——是基建瞬时，不是模型弱，对齐治本 C）。
+    """
+
+    swarm_first_token_timeout: float = 180.0
+    swarm_inter_chunk_timeout: float = 30.0
+
+    async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        import asyncio
+
+        from swarm.models.errors import TransientInfraError
+
+        agen = super()._astream(*args, **kwargs)
+        first = True
+        while True:
+            to = self.swarm_first_token_timeout if first else self.swarm_inter_chunk_timeout
+            try:
+                chunk = await asyncio.wait_for(agen.__anext__(), timeout=to)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as exc:
+                phase = "首 token(prefill)" if first else "解码中途"
+                try:
+                    await agen.aclose()  # 关底层流，让推理端 abort 解码、释放 GPU
+                except Exception:  # noqa: BLE001
+                    pass
+                raise TransientInfraError(
+                    f"stream {phase} 超时 {to:.0f}s (stream stall timeout) —— 基建瞬时，退避重试/fallback"
+                ) from exc
+            first = False
+            yield chunk
+
+
 class EndpointProvider:
     """通用接入点提供者 —— 按 ProviderConfig 构建 OpenAI 兼容 ChatModel。
 
@@ -92,8 +132,10 @@ class EndpointProvider:
             # streaming=True：取消/断连时 httpx 关闭流式连接，推理服务端(vLLM)
             # 检测到 client disconnect 即 abort 解码，释放 GPU；非流式则会跑完整段。
             streaming=True,
-            # 流式无 chunk 看门狗：远端 stall 时尽早中断 → fallback 更快接管。
-            stream_chunk_timeout=self.config.stream_chunk_timeout,
+            # langchain 内置单值看门狗：设为【宽】的 first_token_timeout，作为 sync 路径 + 兜底上限；
+            # async 热路径的【紧】解码间隔由 _DualTimeoutChatOpenAI._astream 另行把关（治本 A）。
+            stream_chunk_timeout=getattr(
+                self.config, "first_token_timeout", self.config.stream_chunk_timeout),
         )
         # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
         if max_tokens and max_tokens > 0:
@@ -107,7 +149,10 @@ class EndpointProvider:
         # 保留其 reasoning 能力。vLLM/Qwen 通过 chat_template_kwargs.enable_thinking 控制。
         if self.provider.kind == "local":
             _kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-        return ChatOpenAI(**_kwargs)
+        # 治本 A：双超时拆分（首 token 宽 / 解码间隔紧）。读 config，缺省回退安全值。
+        _kwargs["swarm_first_token_timeout"] = getattr(self.config, "first_token_timeout", 180.0)
+        _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
+        return _DualTimeoutChatOpenAI(**_kwargs)
 
 
 # ── 向后兼容别名 ─────────────────────────────────────────────

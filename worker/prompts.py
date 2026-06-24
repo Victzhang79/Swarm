@@ -116,6 +116,17 @@ PROJECT_KNOWLEDGE_TEMPLATE = """\
 """
 
 
+def _cap_section(text: str, max_chars: int) -> str:
+    """治本 B：把单段注入内容按字符预算截断（压 prefill）。截断点尽量落在行尾，附可观测标记。"""
+    if not text or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    nl = cut.rfind("\n")
+    if nl > max_chars * 0.6:  # 尽量整行截断，不切半行
+        cut = cut[:nl]
+    return cut.rstrip() + f"\n…（上下文预算裁剪：省略 {len(text) - len(cut)} 字以压 prefill / 防流式超时）"
+
+
 def build_worker_prompt(
     subtask: SubTask,
     scope: FileScope | None = None,
@@ -201,6 +212,17 @@ def build_worker_prompt(
                 norms=_format_norms_for_worker(norms),
                 semantic=_format_semantic_for_worker(semantic),
             )
+
+    # 治本 B：按难度给【知识注入】字符预算，压 prefill。并发 + 大上下文(系统提示里的知识/工程经验
+    # 是最大且最可裁剪的块)正是本地模型流式首 token 超时的【负载根因】——体量小→prefill 快→不超时
+    # 且整体更快。trivial/medium 不需长篇，complex 给足。SWARM_WORKER_CTX_KB_CHARS 调基数(默认 4000)。
+    import os as _os
+    _kb_base = int(_os.environ.get("SWARM_WORKER_CTX_KB_CHARS", "4000") or 4000)
+    _diff = str(getattr(getattr(subtask, "difficulty", ""), "value",
+                        getattr(subtask, "difficulty", "")) or "").lower()
+    _kb_cap = max(800, int(_kb_base * {"trivial": 0.4, "medium": 1.0, "complex": 2.0}.get(_diff, 1.0)))
+    knowledge_section = _cap_section(knowledge_section, _kb_cap)
+    project_knowledge_section = _cap_section(project_knowledge_section, _kb_cap)
 
     # 技术栈权威画像段落（detect_stack 磁盘 ground truth）——把 jakarta/javax 命名空间、
     # Spring Boot/Java 版本等【写对 import 的硬前提】喂到 worker 跟前。此前 project_stack
