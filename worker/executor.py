@@ -134,7 +134,7 @@ def _trivial_llm_self_report_passed(combined: str) -> bool:
 #   - empty_diff_transient：循环内空 diff（沙箱尚未 pull-back），pull-back 后可能有真产出。
 #   - llm_self_report：纯 LLM 弱信号 fail（无确定性证据），收到确定性证据后可被覆盖。
 # 编译/lint/scope/test/verify/refusal 失败都是【确定的真错误】，sticky=True，永不翻盘。
-_FLIPPABLE_SOURCES = frozenset({"empty_diff_transient", "llm_self_report"})
+_FLIPPABLE_SOURCES = frozenset({"empty_diff_transient", "llm_self_report", "refusal_in_self_review"})
 
 
 @dataclass
@@ -200,8 +200,11 @@ def evaluate_l1(
 ) -> L1Verdict:
     """单一 L1 裁决仲裁器——三处裁决点共用。决策顺序（首个命中即返回）：
 
-    1. refusal/截断（_is_refusal_or_truncated(verify_result)）→ False，
-       source=refusal_hard_fail，sticky=True。最高优先，覆盖一切（含 det_ok=True）。永不翻盘。
+    1. refusal/截断（_is_refusal_or_truncated(verify_result)）：
+       - det_ok is True（文件已创建、编译通过）→ 拒答只在"自读验证"阶段（沙箱限制），
+         非执行拒绝。source=refusal_in_self_review，sticky=False（可翻盘）。
+       - det_ok 非 True（无确定性证据 / 确定性失败）→ source=refusal_hard_fail，
+         sticky=True，覆盖一切，永不翻盘。
     2. det_ok is False → False，sticky=True，source 携带确定性失败原因。永不翻盘。
        （例外：empty_diff_transient sticky=False，是设计上唯一可翻盘的 det fail。）
     3. det_ok is None（无 diff 可检 + 无 harness）→ passed=llm_self_report，
@@ -216,13 +219,24 @@ def evaluate_l1(
     """
     details = dict(det_details or {})
 
-    # ① refusal / 截断 / 不可用 → 硬否决，最高优先。
+    # ① refusal / 截断 / 不可用 → 视确定性证据分两级处理。
     #    verify_result is None 表示【本阶段不提供 verify 文本】（如 Phase-4：refusal 已在
     #    循环内裁过并落进 prior），跳过 refusal 检测——绝不能把"没传文本"误判为"空回复拒答"。
     if verify_result is not None and _is_refusal_or_truncated(verify_result):
-        details["l1_decision_source"] = "refusal_hard_fail"
         if verify_result:
             details["raw_refusal"] = verify_result[:200]
+        details["raw_result"] = "(模型拒答/截断，非有效验证自报)"
+        if det_ok is True:
+            # 确定性闸门已通过（文件真实创建、编译通过）：拒答只发生在"自读验证"步骤
+            # （沙箱限制致模型说"无法直接读取刚创建的文件"），非执行阶段拒绝。
+            # 降级为可翻盘的非 sticky fail，Phase4 确定性+LLM 双证据可接管。
+            details["l1_decision_source"] = "refusal_in_self_review"
+            return L1Verdict(
+                passed=False, source="refusal_in_self_review",
+                reason="verify 拒答/截断，但确定性闸门已通过——拒答只在自读验证阶段，降级为可翻盘 fail",
+                sticky=False, details=details,
+            )
+        details["l1_decision_source"] = "refusal_hard_fail"
         return L1Verdict(
             passed=False, source="refusal_hard_fail",
             reason="agent 回复为拒答/截断/不可用（产出不可信，覆盖确定性闸门）",

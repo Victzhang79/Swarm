@@ -62,9 +62,11 @@ def test_char_phase3_det_true_passes():
     assert _phase3_current(det_ok=True, llm_passed=False, verify_text="L1_RESULT: FAIL") == (True, "deterministic")
 
 
-def test_char_phase3_refusal_overrides_det_true():
-    # refusal 覆盖 det True → fail
-    assert _phase3_current(det_ok=True, llm_passed=True, verify_text="Sorry, need more steps to process") == (False, "refusal_hard_fail")
+def test_char_phase3_refusal_with_det_true_is_self_review():
+    # det_ok=True 时 refusal 发生在"自读验证"阶段（文件已创建/编译通过），
+    # 不应硬否决——请用 evaluate_l1 测试新行为（见下方 test_evaluate_l1_* 系列）。
+    # 本 _phase3_current 函数是旧行为快照，保留以记录架构演进，不再断言 refusal_hard_fail。
+    pass
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -178,6 +180,78 @@ def test_char_refusal_empty_contract():
 
 def test_char_refusal_normal_text_current():
     assert _is_refusal_or_truncated("L1_RESULT: PASS, compiled fine") is False
+
+
+# ────────────────────────────────────────────────────────────────────
+# evaluate_l1 直接测试 — Bug B 新行为：refusal + det_ok 分级
+#
+# 旧行为（已废弃）：refusal 无论 det_ok 为何值都 → refusal_hard_fail sticky=True。
+# 新行为（Bug B 修复）：
+#   - det_ok is True  → refusal_in_self_review，sticky=False（可翻盘，沙箱自读限制）
+#   - det_ok is None  → refusal_hard_fail，sticky=True（无确定性证据，拒答不可信）
+#   - det_ok is False → refusal_hard_fail，sticky=True（确定性本身已失败）
+# ────────────────────────────────────────────────────────────────────
+from swarm.worker.executor import L1Verdict, evaluate_l1  # noqa: E402
+
+_REFUSAL_TEXT = "我无法直接读取刚创建的文件"  # 沙箱自读常见拒答，含 _REFUSAL_MARKERS["我无法"]
+
+
+def test_evaluate_l1_refusal_with_det_true_is_self_review():
+    """Bug B 治本：det_ok=True 时 refusal 降级为 refusal_in_self_review（非硬否决）。"""
+    v = evaluate_l1(
+        det_ok=True, det_details={"deterministic_gate": "pass"},
+        verify_result=_REFUSAL_TEXT, llm_ok=None, prior=None, phase="loop",
+    )
+    assert v.passed is False
+    assert v.source == "refusal_in_self_review"
+    assert v.sticky is False, "沙箱自读拒答不应 sticky，Phase4 可翻盘"
+
+
+def test_evaluate_l1_refusal_with_det_none_is_hard_fail():
+    """无确定性证据时 refusal 仍 → refusal_hard_fail sticky=True。"""
+    v = evaluate_l1(
+        det_ok=None, det_details={},
+        verify_result=_REFUSAL_TEXT, llm_ok=None, prior=None, phase="loop",
+    )
+    assert v.passed is False
+    assert v.source == "refusal_hard_fail"
+    assert v.sticky is True
+
+
+def test_evaluate_l1_refusal_with_det_false_is_hard_fail():
+    """确定性本身失败时 refusal → refusal_hard_fail sticky=True。"""
+    v = evaluate_l1(
+        det_ok=False, det_details={"l1_2_compile_ok": False, "compile_message": "error"},
+        verify_result=_REFUSAL_TEXT, llm_ok=None, prior=None, phase="loop",
+    )
+    assert v.passed is False
+    assert v.source == "refusal_hard_fail"
+    assert v.sticky is True
+
+
+def test_evaluate_l1_refusal_in_self_review_is_flippable_by_phase4():
+    """refusal_in_self_review 在 _FLIPPABLE_SOURCES 中，Phase4 det+LLM 双证可翻盘。"""
+    prior = L1Verdict(passed=False, source="refusal_in_self_review",
+                      reason="自读拒答", sticky=False, details={})
+    v = evaluate_l1(
+        det_ok=True, det_details={"deterministic_gate": "pass"},
+        verify_result=None,  # Phase4 不传 verify_result（已在循环内裁过）
+        llm_ok=True, prior=prior, phase="phase4",
+    )
+    assert v.passed is True, "确定性+LLM 双证，prior=refusal_in_self_review(非sticky) 应翻盘"
+    assert v.source == "deterministic"
+
+
+def test_evaluate_l1_refusal_hard_fail_not_flippable():
+    """refusal_hard_fail 不在 _FLIPPABLE_SOURCES，Phase4 不可翻盘。"""
+    prior = L1Verdict(passed=False, source="refusal_hard_fail",
+                      reason="执行阶段拒答", sticky=True, details={})
+    v = evaluate_l1(
+        det_ok=True, det_details={"deterministic_gate": "pass"},
+        verify_result=None, llm_ok=True, prior=prior, phase="phase4",
+    )
+    assert v.passed is False, "refusal_hard_fail sticky=True 不可翻盘"
+    assert v.source == "refusal_hard_fail"
 
 
 if __name__ == "__main__":

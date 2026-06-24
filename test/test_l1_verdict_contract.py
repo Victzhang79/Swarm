@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """W1.2 commit② 契约测试 — 单一 L1 仲裁器 evaluate_l1 的真值表 + 翻盘门槛。
 
-钉死 LOCKED CONTRACT：决策顺序（首个命中即返回）：
-  1. refusal/截断 → False, source=refusal_hard_fail, sticky=True（覆盖一切，含 det True）。永不翻盘。
+钉死 LOCKED CONTRACT（Bug B 修复后最终版）：决策顺序（首个命中即返回）：
+  1. refusal/截断（_is_refusal_or_truncated(verify_result)）：
+     - det_ok is True  → source=refusal_in_self_review，sticky=False（沙箱自读限制，可翻盘）。
+     - det_ok 非 True  → source=refusal_hard_fail，sticky=True（无/失败确定性证据，永不翻盘）。
   2. det_ok False → False, sticky=True, source 携带确定性失败原因。永不翻盘
      （例外：empty_diff_transient sticky=False 可翻盘）。
   3. det_ok None → passed=llm_self_report, source=llm_self_report, sticky=False；不主动翻盘 prior fail。
   4. det_ok True → 看 llm_ok：
        llm_ok False → False（证据冲突）。
        llm_ok True → prior None/True→True；prior False 仅当 sticky False 且
-                     source∈{empty_diff_transient, llm_self_report} 才翻盘 True，否则维持 False。
+                     source∈{empty_diff_transient, llm_self_report, refusal_in_self_review} 才翻盘。
 
-净收益（关闭幻觉 PASS）的核心断言：refusal / 编译失败 / scope 违规 / 测试失败的 prior
+净收益（关闭幻觉 PASS）的核心断言：refusal_hard_fail / 编译失败 / scope 违规 / 测试失败的 prior
 在 Phase-4 det True + llm True 下【不再翻盘】（旧实现无条件翻盘）。
 """
 from __future__ import annotations
@@ -19,18 +21,33 @@ from __future__ import annotations
 from swarm.worker.executor import L1Verdict, evaluate_l1
 
 
-# ── 规则 1：refusal 最高优先，覆盖 det True ──
-def test_refusal_overrides_det_true():
+# ── 规则 1a：refusal + det True → self_review（沙箱自读限制，可翻盘）──
+def test_refusal_with_det_true_is_self_review():
+    """Bug B 修复：det_ok=True 时 refusal 降级为 refusal_in_self_review（非硬否决）。"""
     v = evaluate_l1(det_ok=True, det_details={}, verify_result="Sorry, need more steps to process",
                     llm_ok=True, prior=None, phase="x")
     assert v.passed is False
-    assert v.source == "refusal_hard_fail"
-    assert v.sticky is True
+    assert v.source == "refusal_in_self_review"
+    assert v.sticky is False
 
 
-def test_chinese_refusal_overrides_det_true():
+def test_chinese_refusal_with_det_true_is_self_review():
+    """Bug B 修复：中文拒答 + det True → refusal_in_self_review，非 refusal_hard_fail。"""
     v = evaluate_l1(det_ok=True, det_details={}, verify_result="抱歉，我无法完成这个任务",
                     llm_ok=True, prior=None, phase="x")
+    assert v.passed is False and v.source == "refusal_in_self_review" and v.sticky is False
+
+
+# ── 规则 1b：refusal + det 非 True → refusal_hard_fail（永不翻盘）──
+def test_refusal_with_det_none_is_hard_fail():
+    v = evaluate_l1(det_ok=None, det_details={}, verify_result="Sorry, need more steps to process",
+                    llm_ok=True, prior=None, phase="x")
+    assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is True
+
+
+def test_refusal_with_det_false_is_hard_fail():
+    v = evaluate_l1(det_ok=False, det_details={"l1_2_compile_ok": False},
+                    verify_result="我无法完成这个任务", llm_ok=True, prior=None, phase="x")
     assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is True
 
 
