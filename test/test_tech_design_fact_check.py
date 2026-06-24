@@ -116,3 +116,38 @@ def test_verify_existing_returns_real_path_for_correction():
     assert hit["exists"] is True
     assert hit["candidates"], "已存在文件必须返回真实路径"
     assert "monitor" in hit["candidates"][0], f"真实路径应指向 monitor/: {hit['candidates']}"
+
+
+def test_stack_mismatch_filter_doc_vs_disk_not_blocked():
+    """治本（用户原则"不以文档为准"）：磁盘已权威定栈后，PRD 的框架假设与磁盘不一致 =
+    栈差异，必须【适配不阻断】，哪怕描述里含"不存在/没有"。实测 RuoYi retry 卡死真因回归。"""
+    from swarm.brain.planning_nodes import _is_stack_mismatch_issue as f
+    # 卡死本体：PRD 说 Vue，磁盘是 Thymeleaf，detail 含"不存在" → 必须判为栈差异(剔除)
+    vue = {"claim": "PRD 提到'前端：Vue 页面'",
+           "detail": "磁盘事实：162 个 .html、0 个 .vue，无独立前端工程。PRD 假设的 Vue SPA 在本项目中不存在。"}
+    assert f(vue) is True
+    # React/SPA 同理
+    assert f({"claim": "PRD 假设 React SPA", "detail": "项目无 .jsx，前端为服务端模板"}) is True
+    # 真·缺文件/缺类（无框架关键词）→ 仍按虚假前提保留阻断，不被误剔除
+    real = {"claim": "PRD 要求修改 com.ruoyi.alarm.AlarmController",
+            "detail": "该类在项目中不存在，找不到对应文件"}
+    assert f(real) is False
+    # 空文本不剔除
+    assert f({"claim": "", "detail": ""}) is False
+
+
+def test_after_tech_design_blocks_only_grounded_false_premises():
+    """治本：block 必须确定性坐实——只阻断 grounded=True（磁盘坐实点名文件缺失）；
+    纯 LLM 框架/栈/语义 verdict=false(grounded=False) 降级 advisory 不阻断。"""
+    from swarm.brain.graph import after_tech_design as rt
+    vue = {"claim": "PRD 提到 Vue", "detail": "项目是 Thymeleaf，Vue 不存在",
+           "verdict": "false", "grounded": False}
+    miss = {"claim": "需求点名文件 X.java", "detail": "磁盘核验：不存在",
+            "verdict": "false", "grounded": True}
+    assert rt({"tech_design_fact_issues": [vue]}) == "review_design"        # 框架差异不阻断
+    assert rt({"tech_design_fact_issues": [miss]}) == "clarify"             # 坐实缺文件阻断
+    assert rt({"tech_design_fact_issues": [vue, miss]}) == "clarify"        # 有坐实即阻断
+    assert rt({"tech_design_fact_issues": []}) == "review_design"
+    # 缺 grounded 字段（旧 checkpoint 兼容）= 视为未坐实 → 不阻断（保守不误杀自动化）
+    legacy = {"claim": "PRD 提到 Vue", "verdict": "false"}
+    assert rt({"tech_design_fact_issues": [legacy]}) == "review_design"

@@ -36,6 +36,8 @@ SYSTEM_PROMPT_TEMPLATE = """\
 
 ⚠️ **严格遵守 Scope 约束**：你只能修改可写文件，只能读取可读文件。超出范围的文件操作将被拒绝。
 
+{stack_section}
+
 ## 🔧 验证 Harness（如何确认你的产出合格）
 {harness_section}
 
@@ -120,6 +122,7 @@ def build_worker_prompt(
     knowledge: KnowledgeContext | None = None,
     user_profile_prompt: str = "",
     shared_contract: dict | None = None,
+    project_stack: dict | None = None,
 ) -> str:
     """构建 Worker 系统提示词
 
@@ -199,6 +202,20 @@ def build_worker_prompt(
                 semantic=_format_semantic_for_worker(semantic),
             )
 
+    # 技术栈权威画像段落（detect_stack 磁盘 ground truth）——把 jakarta/javax 命名空间、
+    # Spring Boot/Java 版本等【写对 import 的硬前提】喂到 worker 跟前。此前 project_stack
+    # 只到 tech_design/plan，断在 worker 之前 → 本地模型按训练惯性写 javax.* → `package
+    # javax.servlet does not exist` → 复读死循环到迭代上限（实测 RuoYi st-3 等 8 子任务）。
+    stack_section = ""
+    if project_stack:
+        try:
+            from swarm.brain.stack_detect import format_stack_for_prompt
+            _sd = format_stack_for_prompt(project_stack)
+            if _sd:
+                stack_section = "## 🧱 技术栈权威画像（磁盘 ground truth，优先级最高）\n" + _sd
+        except Exception:  # noqa: BLE001
+            stack_section = ""
+
     user_profile_section = ""
     if (user_profile_prompt or "").strip():
         user_profile_section = USER_PROFILE_SECTION_TEMPLATE.format(
@@ -221,6 +238,7 @@ def build_worker_prompt(
         user_profile_section=user_profile_section,
         knowledge_section=knowledge_section,
         project_knowledge_section=project_knowledge_section,
+        stack_section=stack_section,
     )
 
 

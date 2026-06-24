@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections import Counter
 
 # ── 信号表（框架无关的探测，但内置常见框架 marker 以提高判定精度）──
@@ -130,6 +131,77 @@ def _read_text(path: str, limit: int = 20000) -> str:
         return ""
 
 
+def _detect_jvm_facts(
+    project_path: str, manifest_texts: dict[str, str], java_sample_paths: list[str]
+) -> dict | None:
+    """JVM 系专属事实：Jakarta/Javax 命名空间 + Spring Boot 大版本 + Java 版本。
+
+    这些是 worker 写对 import 的【硬前提】——Spring Boot 3/4 用 jakarta.*，2.x 用 javax.*；
+    本地模型常按训练惯性写 javax 导致 `package javax.servlet does not exist`（实测 RuoYi
+    E2E st-3 等 8 个子任务因此卡到迭代上限）。这里据磁盘 ground truth 把命名空间钉死。
+
+    判定优先级：现存源码 import 实证 > 构建清单版本推断。源码 0 命中时回退版本推断。
+    返回 None 表示非 JVM 项目（不污染非 Java 栈画像）。
+    """
+    # 根 pom / gradle 文本（manifest_texts 按 basename 去重，只够推版本，源码实证才是主依据）
+    root_pom = _read_text(os.path.join(project_path, "pom.xml"))
+    build_text = root_pom + " " + " ".join(manifest_texts.values())
+    is_jvm = bool(root_pom) or any(
+        k in manifest_texts for k in ("pom.xml", "build.gradle", "build.gradle.kts")
+    )
+    if not is_jvm:
+        return None
+
+    # ── 1) 源码实证：现存 .java 里 jakarta.* vs javax.*（servlet/persistence/validation/annotation）──
+    jakarta_hits = 0
+    javax_hits = 0
+    for p in java_sample_paths[:120]:
+        head = _read_text(p, limit=4000)  # 已小写；import 在文件头部
+        jakarta_hits += head.count("import jakarta.")
+        javax_hits += head.count("import javax.servlet") + head.count("import javax.persistence") \
+            + head.count("import javax.validation") + head.count("import javax.annotation")
+
+    namespace = ""
+    ns_source = ""
+    if jakarta_hits or javax_hits:
+        namespace = "jakarta" if jakarta_hits >= javax_hits else "javax"
+        ns_source = f"源码实证(jakarta×{jakarta_hits} vs javax×{javax_hits})"
+
+    # ── 2) Spring Boot 大版本（推断命名空间的兜底 + 独立事实）──
+    boot_version = ""
+    m = re.search(r"<spring-boot\.version>\s*([0-9]+(?:\.[0-9]+)*)", build_text)
+    if not m:
+        m = re.search(r"spring-boot-starter-parent[^0-9]{0,80}?([0-9]+\.[0-9]+\.[0-9]+)", build_text)
+    if not m:
+        m = re.search(r"org\.springframework\.boot[:'\" ]+spring-boot[^0-9]{0,40}?([0-9]+\.[0-9]+\.[0-9]+)", build_text)
+    if m:
+        boot_version = m.group(1)
+        if not namespace:  # 源码无实证时用版本推断：Boot ≥3 → jakarta
+            try:
+                major = int(boot_version.split(".")[0])
+                namespace = "jakarta" if major >= 3 else "javax"
+                ns_source = f"Spring Boot {boot_version} 推断"
+            except ValueError:
+                pass
+
+    # ── 3) Java 版本 ──
+    java_version = ""
+    jm = re.search(r"<java\.version>\s*([0-9]+)", build_text) \
+        or re.search(r"<maven\.compiler\.(?:source|release)>\s*([0-9]+)", build_text) \
+        or re.search(r"sourcecompatibility[\s=:'\"]+(?:javaversion\.version_)?([0-9]+)", build_text)
+    if jm:
+        java_version = jm.group(1)
+
+    if not (namespace or boot_version or java_version):
+        return None
+    return {
+        "servlet_namespace": namespace,        # 'jakarta' | 'javax' | ''
+        "namespace_source": ns_source,
+        "spring_boot_version": boot_version,
+        "java_version": java_version,
+    }
+
+
 def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     """确定性磁盘探测 → project_stack 画像 + 置信度 + 证据。不调 LLM、不连 DB。
 
@@ -148,6 +220,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     has_next = False
     has_vite = False
     frontend_proj_dirs: list[str] = []
+    java_sample_paths: list[str] = []  # 采样 .java 路径（判 javax/jakarta 命名空间用）
     dir_count = 0
 
     for root, dirs, files in os.walk(project_path):
@@ -163,6 +236,10 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             ext = ext.lower()
             if ext:
                 ext_counts[ext] += 1
+            # 采样 .java（优先 src/main/java 下的）供命名空间判定，封顶 120 个防大仓拖慢
+            if ext == ".java" and len(java_sample_paths) < 120:
+                if "src/main/java" in (rel.replace(os.sep, "/") + "/"):
+                    java_sample_paths.append(os.path.join(root, f))
             low = f.lower()
             if f in _MANIFEST_BACKEND or f.endswith(".csproj"):
                 manifests.append(os.path.join(rel, f) if rel else f)
@@ -282,11 +359,21 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     confidence = max(0.0, min(1.0, confidence))
     needs_adj = confidence < 0.65 or (has_spa and has_server_tmpl)
 
+    # ── JVM 系专属事实：jakarta/javax 命名空间 + Boot/Java 版本（worker 写对 import 的硬前提）──
+    jvm = _detect_jvm_facts(project_path, manifest_texts, java_sample_paths)
+    if jvm and jvm.get("servlet_namespace"):
+        evidence.append(
+            f"JVM 命名空间: {jvm['servlet_namespace']}（{jvm.get('namespace_source','')}）"
+            f"; Spring Boot={jvm.get('spring_boot_version') or '未判明'}"
+            f"; Java={jvm.get('java_version') or '未判明'}"
+        )
+
     return {
         "frontend": frontend,
         "frontend_kind": frontend_kind,
         "backend": (f"{backend_fw} ({backend_lang})" if backend_fw else backend_lang) or "未判明",
         "build": build_tool or "未判明",
+        "jvm": jvm or {},
         "confidence": round(confidence, 2),
         "evidence": evidence,
         "signals": {
@@ -373,6 +460,24 @@ def format_stack_for_prompt(profile: dict | None) -> str:
         lines.append("- 前端落地约定：新增页面用该 SPA 框架的单文件组件/路由，落在既有前端工程目录。")
     elif kind == "separated":
         lines.append("- 前端落地约定：前后端分离，前端进 SPA 工程目录、后端只出 API；按各自既有约定落地。")
+    jvm = profile.get("jvm") or {}
+    ns = jvm.get("servlet_namespace")
+    if ns:
+        other = "javax" if ns == "jakarta" else "jakarta"
+        boot = jvm.get("spring_boot_version")
+        jv = jvm.get("java_version")
+        ver_bits = []
+        if boot:
+            ver_bits.append(f"Spring Boot {boot}")
+        if jv:
+            ver_bits.append(f"Java {jv}")
+        ver_txt = ("（" + "、".join(ver_bits) + "）") if ver_bits else ""
+        lines.append(
+            f"- 【命名空间·硬约束{ver_txt}】本项目 Servlet/JPA/校验/注解一律用 `{ns}.*`（如 "
+            f"`{ns}.servlet.http.HttpServletRequest`、`{ns}.persistence.*`、`{ns}.validation.*`、"
+            f"`{ns}.annotation.Resource`）；【严禁】写 `{other}.*` 包名——本项目 classpath 没有它，"
+            f"会直接 `package {other}.servlet does not exist` 编译失败。新建模块 pom 也按此栈继承依赖。"
+        )
     kb_hints = profile.get("kb_stack_hints") or []
     if kb_hints:
         lines.append("- KB 已收录的项目架构知识（与磁盘事实一致，佐证）：")

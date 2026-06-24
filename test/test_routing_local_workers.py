@@ -15,9 +15,12 @@ def test_routing_all_local_no_cloud():
 
 
 def test_complex_primary_is_strongest_local():
-    """complex 首选 = 本地最强 Qwen3.6-40B-Claude（256K），不再云端 GLM。"""
+    """complex 首选 = 本地强模型（不再云端 GLM）。不写死具体型号——worker 主力会随线上
+    可用模型轮换（如 40B→Qwopus-27B-v2），断言"非空且非云端"而非锁名，避免换模型即测试红。"""
     c = _cfg()
-    assert "Qwen3.6-40B-Claude" in c.routing_complex, c.routing_complex
+    assert c.routing_complex, "complex 首选不应为空"
+    assert not any(m in c.routing_complex for m in ["GLM-5.1", "GLM-5.2", "Kimi", "moonshot", "zai-org"]), \
+        f"complex 首选不应云端: {c.routing_complex}"
 
 
 def test_complex_fallback_chain_order():
@@ -55,8 +58,8 @@ def test_resolve_route_returns_list_fallback():
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     primary, fb = r._resolve_route("complex", "text")
-    assert "Qwen3.6-40B-Claude" in primary
-    assert isinstance(fb, list) and len(fb) >= 2  # MiniMax + Saka（122B-A10B 已排除）
+    assert primary and not any(m in primary for m in ["GLM-5.1", "GLM-5.2", "Kimi", "zai-org"])  # 本地强模型，不锁具体名
+    assert isinstance(fb, list) and len(fb) >= 2  # 多级兜底链
 
 
 def test_alternate_picks_first_non_primary():

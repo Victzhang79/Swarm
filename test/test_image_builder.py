@@ -109,3 +109,43 @@ if __name__ == "__main__":
     test_warmup_pom_real_ruoyi()
     test_deps_hash_in_dockerfile()
     print("\n✅ image_builder 生成器全部测试通过")
+
+
+def test_go_toolchain_bakes_goimports():
+    """Go 工具链 → 烤入 goimports，且 GOBIN/PATH 在镜像层（非登录 shell 可解析）。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="g1", toolchains=[Toolchain(name="go", build_tool="go", dep_source="go.mod")]),
+        src_included=True,
+    )
+    assert "goimports@v0.24.0" in df
+    assert "GOBIN=/usr/local/bin" in df
+    assert "/root/go/bin" in df  # PATH 含 go bin
+
+
+def test_node_warmup_npm_install_in_frontend_dir():
+    """混合项目：每个 npm 工具链在其 package.json 目录 npm ci（烤 node_modules 进镜像层）。"""
+    spec = EnvSpec(project_id="m1", toolchains=[
+        Toolchain(name="java", build_tool="maven", dep_source="pom.xml"),
+        Toolchain(name="node", build_tool="npm", dep_source="ruoyi-ui/package.json"),
+    ])
+    df = generate_dockerfile(spec, src_included=True)
+    assert "cd /workspace/ruoyi-ui && (npm ci" in df  # 前端子目录
+    assert "mvn -B -T 1C" in df                        # 后端 Maven warmup 仍在
+
+
+def test_node_warmup_root_package_json():
+    """根级 package.json → 在 /workspace 直接 npm ci。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="m2", toolchains=[Toolchain(name="node", build_tool="npm", dep_source="package.json")]),
+        src_included=True,
+    )
+    assert "cd /workspace && (npm ci" in df
+
+
+def test_node_warmup_skipped_without_src():
+    """无源码(src_included=False)不做 npm warmup（warmup 依赖 COPY 的项目源码）。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="m3", toolchains=[Toolchain(name="node", build_tool="npm", dep_source="package.json")]),
+        src_included=False,
+    )
+    assert "npm ci" not in df

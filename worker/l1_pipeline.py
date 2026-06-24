@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +19,264 @@ if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
+
+
+# ── 包名前缀写错的两道确定性防线（治本：本地模型写错 import 前缀 → `package X does not
+#    exist` → 复读死循环到迭代上限，是"任务卡死被误判成模型能力不足→换模型"的通用机制）──
+#
+# 防线①（通用·权威）：_attempt_import_repair —— build 失败后，据【项目自身现存 import】
+#   推导同后缀包的权威前缀并改对。不含任何硬编码包名/框架、不限项目语言生态：servlet.http
+#   在本项目权威前缀是 jakarta 还是 javax，由项目源码自己说了算。这是真正的"治本"。
+#
+# 防线②（可选·零成本快路径）：rewrite_jvm_namespace —— Jakarta EE 整包迁移在现代 Spring
+#   项目里极普遍，pull-back 时按已知迁移表【前置】改对，省一次失败构建。仅是优化，不是
+#   治本依据；只收【整包迁移、与 JDK 无重叠】的前缀，杜绝误改仍属 JDK 的 javax.*
+# （javax.sql/crypto/net/naming/xml.parsers/xml.transform/transaction.xa/annotation.processing…）。
+# transaction（与 JDK javax.transaction.xa 重叠）、annotation（与 javax.annotation.processing
+# 重叠）故意不用裸前缀，改走下面的精确符号清单。
+_JAKARTA_MOVED_PREFIXES: tuple[str, ...] = (
+    "servlet", "persistence", "validation", "ws.rs", "websocket", "ejb",
+    "enterprise", "inject", "faces", "jms", "mail", "jws", "batch", "el",
+    "interceptor", "decorator", "xml.bind", "xml.soap", "xml.ws", "json",
+)
+# javax.annotation.* 仅这些符号迁到 jakarta.annotation；javax.annotation.processing 留在 JDK。
+_JAKARTA_MOVED_EXACT: tuple[str, ...] = (
+    "annotation.Resource", "annotation.Resources", "annotation.PostConstruct",
+    "annotation.PreDestroy", "annotation.Priority", "annotation.Generated",
+    "annotation.ManagedBean", "annotation.security.RolesAllowed",
+    "annotation.security.PermitAll", "annotation.security.DenyAll",
+    "annotation.security.DeclareRoles", "annotation.security.RunAs",
+    "annotation.sql.DataSourceDefinition",
+)
+
+
+def rewrite_jvm_namespace(text: str, target_ns: str) -> tuple[str, int]:
+    """把【写错的】Jakarta EE 命名空间确定性改成项目真实命名空间。
+
+    target_ns='jakarta'（项目是 Spring Boot ≥3）→ 把 javax.{moved} 改成 jakarta.{moved}；
+    target_ns='javax'（项目是 Spring Boot 2.x）→ 反向。其余 javax.*（JDK 自带）一律不动。
+    替换的是【点号包前缀】，import 与全限定用法一并覆盖（比只改 import 更稳）。
+    返回 (新文本, 改动次数)。纯函数、可单测、不碰磁盘。
+    """
+    if target_ns not in ("jakarta", "javax") or not text:
+        return text, 0
+    other = "javax" if target_ns == "jakarta" else "jakarta"
+    n = 0
+    for suf in _JAKARTA_MOVED_PREFIXES + _JAKARTA_MOVED_EXACT:
+        a = f"{other}.{suf}"
+        if a in text:
+            n += text.count(a)
+            text = text.replace(a, f"{target_ns}.{suf}")
+    return text, n
+
+
+_MISSING_PKG_RE = re.compile(
+    r"([^\s\[]+\.java):\[\d+,\d+\]\s*package\s+([\w.]+)\s+does not exist"
+)
+
+
+def parse_missing_packages(build_output: str) -> list[tuple[str, str]]:
+    """从编译输出解析 (出错文件, 不存在的包) 对，去重保序。纯函数、可单测。"""
+    if not build_output:
+        return []
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for m in _MISSING_PKG_RE.finditer(build_output):
+        key = (m.group(1), m.group(2))
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _attempt_import_repair(project_path: str, build_output: str, timeout: int) -> int:
+    """治本·通用：据【项目自身现存 import】确定性修正模块写错的包名前缀，返回改动文件数。
+
+    不含任何硬编码框架/包名、不限具体项目：对每个编不过的 `package P.suffix does not exist`，
+    在项目已有源码里查同 suffix 的【权威前缀】（如 servlet.http 在本项目权威前缀=jakarta），
+    若与写错的前缀不同 → 把出错文件里该前缀替换成权威前缀，交调用方重跑构建确认。
+    项目从未用过该 suffix（查无权威前缀）→ 不动（那是缺依赖问题，非前缀写错，绝不误修）。
+    沙箱优先：grep/sed 都走 _run_check_split/_run_l1_command，对真实完整树操作。
+    """
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return 0
+    by_pkg: dict[str, set[str]] = {}
+    for f, p in pairs:
+        by_pkg.setdefault(p, set()).add(f)
+    changed: set[str] = set()
+    for pkg, files in list(by_pkg.items())[:12]:
+        if "." not in pkg:
+            continue
+        first, suffix = pkg.split(".", 1)
+        suf_re = suffix.replace(".", r"\.")
+        # 项目现存源码里同 suffix 的权威前缀（按出现次数取主导）
+        gcmd = (
+            f"grep -rhoE 'import [A-Za-z0-9_]+\\.{suf_re}\\.' --include='*.java' . "
+            f"2>/dev/null | sort | uniq -c | sort -rn | head -8"
+        )
+        _ec, gout, _err = _run_check_split(gcmd, project_path, timeout=30)
+        counts: dict[str, int] = {}
+        for line in (gout or "").splitlines():
+            mm = re.search(r"(\d+)\s+import ([A-Za-z0-9_]+)\." + suf_re + r"\.", line)
+            if mm:
+                counts[mm.group(2)] = counts.get(mm.group(2), 0) + int(mm.group(1))
+        counts.pop(first, None)  # 写错的前缀不能当权威
+        if not counts:
+            continue  # 项目没用过该 suffix → 缺依赖而非前缀错，不动
+        canonical = max(counts, key=lambda k: counts[k])
+        for f in sorted(files):
+            # -i.bak 形式在 GNU(沙箱 Linux) 与 BSD(本地 macOS) sed 上行为一致，改完删 .bak
+            scmd = (
+                f"sed -i.bak 's#{first}\\.{suf_re}#{canonical}.{suffix}#g' '{f}' "
+                f"&& rm -f '{f}.bak'"
+            )
+            ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
+            if ec2 == 0:
+                changed.add(f)
+        logger.info(
+            "[L1.2.1·import-repair] %s.%s → %s.%s（项目权威前缀，据现存源码推导，%d 文件）",
+            first, suffix, canonical, suffix, len(files),
+        )
+    return len(changed)
+
+
+def _tool_missing(out: str) -> bool:
+    """命令输出是否表明【工具本身缺失】（→ 优雅跳过，不当作修复失败）。"""
+    low = (out or "").lower()
+    return any(
+        m in low for m in (
+            "command not found", "not found", "executable file not found",
+            "no such file or directory", "is not recognized",
+            "could not determine executable", "npm err", "cannot find module 'eslint'",
+        )
+    )
+
+
+# ── 跨生态确定性构建修复：每个生态委托其【事实标准 autofix】，按文件类型 dispatch ──
+# 通用框架（非 Java 细节才是可推广的部分）：build 失败 → 按出错/改动文件语言路由到对应
+# adapter → 套用该生态权威 autofix → 调用方重跑构建确认。混合项目按扩展名逐语言并行修。
+# 安全性自证：只在 build 已失败时触发，且必须重跑通过才算修好；工具缺失一律优雅跳过。
+_TS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs", ".cjs", ".mts", ".cts")
+
+
+def _repair_go(project_path: str, go_files: list[str], timeout: int) -> int:
+    """Go：goimports -w —— 事实标准，自动增删/解析 import。工具缺失则跳过。"""
+    if not go_files:
+        return 0
+    files = " ".join(f"'{f}'" for f in go_files[:50])
+    ec, out = _run_l1_command(f"goimports -w {files}", project_path, timeout=min(timeout, 120))
+    if ec != 0 and _tool_missing(out):
+        logger.info("[L1.2.1·repair] goimports 不可用，跳过 Go import 修复")
+        return 0
+    if ec == 0:
+        logger.info("[L1.2.1·repair] goimports -w 修复 %d 个 .go 文件 import", len(go_files))
+        return len(go_files)
+    return 0
+
+
+def _repair_rust(project_path: str, timeout: int) -> int:
+    """Rust：cargo fix —— 自动套用 rustc 机器可应用建议（含 use 路径）。crate 级。"""
+    cmd = "cargo fix --allow-dirty --allow-no-vcs --edition-idioms -q 2>&1"
+    ec, out = _run_l1_command(cmd, project_path, timeout=max(timeout, 240))
+    if _tool_missing(out):
+        logger.info("[L1.2.1·repair] cargo 不可用，跳过 Rust 修复")
+        return 0
+    # cargo fix 可能因冲突非 0 退出，但已应用的建议仍写盘；交重跑构建仲裁
+    logger.info("[L1.2.1·repair] cargo fix 已尝试套用 rustc 建议（exit=%s）", ec)
+    return 1
+
+
+def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> int:
+    """TS/JS/Vue/前端：eslint --fix —— 自动修 import/order、可修复规则。需项目本地 eslint+config。"""
+    if not ts_files:
+        return 0
+    files = " ".join(f"'{f}'" for f in ts_files[:60])
+    # --no-install：只用项目本地 eslint，绝不联网装；缺失则报错→识别为工具缺失跳过
+    ec, out = _run_l1_command(
+        f"npx --no-install eslint --fix {files} 2>&1", project_path, timeout=min(timeout, 180)
+    )
+    if _tool_missing(out) or "no eslint configuration" in (out or "").lower():
+        logger.info("[L1.2.1·repair] eslint 不可用/无配置，跳过 TS/JS 修复")
+        return 0
+    # eslint exit 0=干净 1=仍有不可自动修的错误（但可修的已写盘）→ 都算"已尝试修"
+    if ec in (0, 1):
+        logger.info("[L1.2.1·repair] eslint --fix 修复 %d 个 TS/JS/Vue 文件", len(ts_files))
+        return len(ts_files)
+    return 0
+
+
+def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
+    """据【权威栈画像】(detect_stack：小模型识别→大模型确认→KB 持久化) 选 repair 生态集合。
+
+    单一事实源：adapter 选择是 project_stack 的【消费者】，与 tech_design/plan/worker prompt
+    同源，不再独立按文件扩展名瞎猜语言。以 build 工具为准（maven/gradle/go/cargo/npm…，无歧义；
+    避开 "javascript" 含 "java" 子串陷阱）+ 前端形态。无画像/未判明 → 返回 None，调用方回退扩展名。
+    """
+    if not project_stack:
+        return None
+    build = (project_stack.get("build") or "").strip().lower()
+    fe = (project_stack.get("frontend") or "").lower()
+    fe_kind = (project_stack.get("frontend_kind") or "").lower()
+    langs: set[str] = set()
+    if build in ("maven", "gradle", "sbt"):
+        langs.add("java")
+    if build == "go":
+        langs.add("go")
+    if build == "cargo":
+        langs.add("rust")
+    if build in ("npm", "yarn", "pnpm"):
+        langs.add("ts")
+    if fe_kind in ("spa", "separated") or any(
+        x in fe for x in ("vue", "react", "angular", "svelte", "next")
+    ):
+        langs.add("ts")
+    return langs or None
+
+
+def _attempt_build_repair(
+    project_path: str,
+    build_output: str,
+    modified: list[str],
+    timeout: int,
+    project_stack: dict | None = None,
+) -> int:
+    """跨生态确定性构建修复 dispatcher。返回触达文件数（>0 调用方重跑构建确认）。
+
+    生态集合由【权威栈画像 project_stack】决定（单一事实源；detect_stack 已小模型识别→大模型
+    确认→KB 持久化，含混合项目/低置信模型兜底）；无画像时回退按 modified 扩展名。每个生态委托
+    其事实标准 autofix：Java=项目源码自证前缀、Go=goimports、Rust=cargo fix、TS/前端=eslint --fix。
+    任一生态工具缺失 → 该生态优雅跳过，不影响其它。
+    """
+    mods = [str(f).strip() for f in (modified or []) if str(f).strip()]
+    go_files = [f for f in mods if f.endswith(".go")]
+    ts_files = [f for f in mods if f.endswith(_TS_EXTS)]
+    has_rust_files = any(f.endswith(".rs") for f in mods)
+    stack_langs = _stack_repair_langs(project_stack)
+
+    def eligible(lang: str, file_signal: bool) -> bool:
+        # 有权威画像 → 以栈为准；无画像 → 回退该语言的文件扩展名信号
+        return (lang in stack_langs) if stack_langs is not None else file_signal
+
+    total = 0
+    # Java：错误信息里就带 .java 文件，无需 modified 列出 → file_signal=True
+    if eligible("java", True):
+        try:
+            total += _attempt_import_repair(project_path, build_output, timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
+    adapters = (
+        ("go", bool(go_files), lambda: _repair_go(project_path, go_files, timeout)),
+        ("rust", has_rust_files, lambda: _repair_rust(project_path, timeout)),
+        ("ts", bool(ts_files), lambda: _repair_ts(project_path, ts_files, timeout)),
+    )
+    for lang, file_signal, fn in adapters:
+        if eligible(lang, file_signal) and (file_signal or lang == "rust"):
+            try:
+                total += fn()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[L1.2.1·repair] %s adapter 异常(跳过): %s", lang, exc)
+    return total
 
 
 # audit #37/#38：编译/lint 每次最多处理的文件数。原为硬编码 20，大变更集会遗漏后续
@@ -899,6 +1158,7 @@ def run_l1_pipeline(
     *,
     timeout: int = 120,
     llm: BaseChatModel | None = None,
+    project_stack: dict | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
@@ -908,6 +1168,7 @@ def run_l1_pipeline(
         diff: 变更 diff
         timeout: 各阶段超时秒数
         llm: 可选 LLM 句柄，用于 L1.4 自检阶段；不传则自检跳过
+        project_stack: 权威栈画像（detect_stack 产）；驱动构建失败时的跨生态 repair adapter 选择
     """
     details: dict[str, Any] = {"pipeline": "L1.1-L1.4"}
 
@@ -957,8 +1218,31 @@ def run_l1_pipeline(
         details["build_output"] = compress_tool_output(b_out, max_chars=1500)
         logger.info("[L1.2.1] 构建闸门结果: exit=%s ok=%s", b_ec, build_ok)
         if not build_ok:
-            details["build_failed"] = build_cmd
-            return False, details
+            # 治本·通用：据项目自身惯例确定性修正写错的包名前缀后【重跑一次】构建确认。
+            # 安全性自证——只在构建已失败时触发，且必须重跑通过才算修好，修错了重跑仍失败=
+            # 不会制造假通过。SWARM_WORKER_IMPORT_REPAIR=false 可关。
+            repair_on = os.environ.get(
+                "SWARM_WORKER_IMPORT_REPAIR", "true"
+            ).lower() not in ("false", "0", "no")
+            repaired = 0
+            if repair_on:
+                try:
+                    repaired = _attempt_build_repair(
+                        project_path, b_out, modified, timeout, project_stack
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
+            if repaired:
+                logger.info("[L1.2.1] 跨生态确定性修复触达 %d 文件，重跑构建闸门", repaired)
+                b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
+                build_ok = b_ec == 0
+                details["l1_2_1_build_ok"] = build_ok
+                details["build_output"] = compress_tool_output(b_out, max_chars=1500)
+                details["import_repaired_files"] = repaired
+                logger.info("[L1.2.1] import-repair 后构建: exit=%s ok=%s", b_ec, build_ok)
+            if not build_ok:
+                details["build_failed"] = build_cmd
+                return False, details
     elif build_cmd:
         details["l1_2_1_build_ok"] = True
         details["build_skipped"] = f"工程文件缺失，跳过构建闸门: {build_cmd}"

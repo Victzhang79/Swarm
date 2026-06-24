@@ -219,10 +219,17 @@ def _toolchain_install(tc: Toolchain) -> str:
     if tc.name == "go":
         return (
             "ENV GO_VERSION=1.22.5\n"
+            "ENV GOPATH=/root/go\n"
+            "ENV GOPROXY=https://goproxy.cn,direct\n"
+            # go.dev 在沙箱构建机网络被墙（实测 SSL_ERROR_SYSCALL）→ 用阿里云 Go 镜像（实测 200）
             "RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates "
-            "&& curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz "
+            "&& curl -fsSL https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz "
             "&& rm -rf /var/lib/apt/lists/*\n"
-            'ENV PATH="/usr/local/go/bin:${PATH}"\n'
+            'ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"\n'
+            # 确定性修复工具：goimports（Go 事实标准 import autofix，L1 _repair_go 用）。
+            # GOBIN=/usr/local/bin 落在每个非登录 shell 的 PATH 上（sandbox.commands.run 不读 profile）。
+            # 钉版本可复现；|| true 让构建期偶发拉取失败不阻断镜像（repair 缺工具会优雅跳过）。
+            "RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@v0.24.0 || true\n"
         )
     if tc.name == "rust":
         return (
@@ -294,6 +301,24 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
                          "&& echo '✅ warmup 离线编译通过：.m2 已填满构建插件+依赖' "
                          "|| echo '⚠️ warmup 离线编译仍有缺漏：运行时联网兜底') "
                          "&& find . -type d -name target -exec rm -rf {} + 2>/dev/null || true")
+
+        # ── Node warmup：对每个前端工程跑一次 npm 安装，把 node_modules 烤进镜像层 ──
+        # 混合项目（前后端分离）主场：前端子任务的 `npm run build` 与 L1 的 TS/eslint repair
+        # (`npx --no-install eslint`) 都依赖项目本地 node_modules。源码 tar 已排除 node_modules
+        # (_SRC_EXCLUDE_DIRS)，故必须在镜像内 npm ci 装一遍（与 Maven 填 .m2 同理）。
+        # 用 tc.dep_source（相对 package.json 路径）定位每个前端目录，支持多前端/monorepo。
+        for tc in spec.toolchains:
+            if tc.name != "node" or tc.build_tool != "npm":
+                continue
+            dep = (tc.dep_source or "package.json").replace("\\", "/").lstrip("/")
+            sub = dep.rsplit("/", 1)[0] if "/" in dep else ""  # package.json 所在目录（"" = 项目根）
+            wd = "/workspace" + (f"/{sub}" if sub else "")
+            lines.append(f"# warmup：前端 {wd} 联网装依赖，固化 node_modules 进镜像层")
+            # npm ci 要求 lock 文件齐全；缺 lock 退化 npm install；都失败不阻断（运行时联网兜底）
+            lines.append(
+                f"RUN cd {wd} && (npm ci 2>&1 | tail -5 || npm install 2>&1 | tail -5 || "
+                f"echo '⚠️ {wd} npm 预装失败：运行时联网兜底')"
+            )
 
     lines.append("# envd 由 base entrypoint 拉起；无前台 CMD。")
     return "\n".join(lines) + "\n"
@@ -407,9 +432,12 @@ def _selftest_command(spec: EnvSpec) -> str | None:
         if tc.name == "python":
             return "cd /workspace && python3 -m compileall -q ."
         if tc.name == "go":
-            return "cd /workspace && go build ./... 2>&1 | head -40"
+            # 软诊断：顺带探 goimports 是否在场（L1 _repair_go 依赖它），不阻断发布
+            return ("(command -v goimports >/dev/null 2>&1 && echo 'goimports: present' "
+                    "|| echo 'goimports: MISSING') && cd /workspace && go build ./... 2>&1 | head -40")
         if tc.name == "rust":
-            return "cd /workspace && cargo build --offline 2>&1 | head -40"
+            return ("(cargo fix --help >/dev/null 2>&1 && echo 'cargo fix: present' "
+                    "|| echo 'cargo fix: MISSING') && cd /workspace && cargo build --offline 2>&1 | head -40")
     return None
 
 
@@ -525,7 +553,7 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "5"  # v5: CubeSandbox 0.4.0 适配——create-from-image 加 --with-cube-ca=true
+_BUILDER_VERSION = "6"  # v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像
 #                              （CubeEgress MITM 出网信任）+ --allow-internet-access。0.3.x 旧模板
 #                              snapshot 与 0.4.0 guest-image 不匹配(image version not eq)起不来，
 #                              bump 版本使 fingerprint 变化 → 旧模板自动失效、按 0.4.0 重建。

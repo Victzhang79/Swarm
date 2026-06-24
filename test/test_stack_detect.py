@@ -145,3 +145,30 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q", "-p", "no:warnings"]))
+
+
+# ── item-2: 技术栈框架 doc-mismatch 伪虚假前提的确定性剔除 ──
+from swarm.brain.planning_nodes import _is_stack_mismatch_issue
+
+
+def test_stack_mismatch_issue_flagged():
+    # "PRD 说 Vue 但项目 Thymeleaf" → 框架差异，应判 True（可剔除）
+    fi = {"claim": "PRD 代码生成器提到'前端：Vue 页面'", "verdict": "false",
+          "detail": "假设前端为 Vue SPA，但项目是 Thymeleaf"}
+    assert _is_stack_mismatch_issue(fi) is True
+
+
+def test_real_missing_file_not_flagged():
+    # 真·缺文件 → 不能当栈差异剔除
+    fi = {"claim": "需求点名文件 X.java", "verdict": "false",
+          "detail": "磁盘核验：该文件在项目中不存在"}
+    assert _is_stack_mismatch_issue(fi) is False
+
+
+def test_unrelated_issue_not_flagged():
+    fi = {"claim": "需求要求接入 Kafka", "verdict": "false", "detail": "项目无消息队列"}
+    assert _is_stack_mismatch_issue(fi) is False
+
+
+def test_empty_issue_not_flagged():
+    assert _is_stack_mismatch_issue({}) is False

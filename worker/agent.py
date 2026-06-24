@@ -81,6 +81,7 @@ def create_worker_agent(
     project_id: str | None = None,
     user_profile_prompt: str = "",
     shared_contract: dict | None = None,
+    project_stack: dict | None = None,
 ) -> dict:
     """创建一个 Worker ReAct Agent
 
@@ -119,6 +120,7 @@ def create_worker_agent(
         knowledge=knowledge,
         user_profile_prompt=user_profile_prompt,
         shared_contract=shared_contract,
+        project_stack=project_stack,
     )
 
     # 创建 ReAct Agent

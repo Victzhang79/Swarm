@@ -373,6 +373,34 @@ def _format_knowledge(state: BrainState) -> str:
         return "（无项目知识库上下文）"
 
 
+_STACK_MISMATCH_KW = (
+    "vue", "react", "angular", "svelte", "spa", "单页", "前端框架", "前端技术栈",
+    "thymeleaf", "jsp", "freemarker", "velocity", "服务端模板", "element", "vite",
+    "ruoyi-ui", ".vue", "前端为", "前端用", "前端是", "代码生成器", "生成器",
+)
+
+
+def _is_stack_mismatch_issue(fi: dict) -> bool:
+    """判定一条 fact_issue 是否属于【技术栈/框架 doc-mismatch】（而非真·缺文件虚假前提）。
+
+    治本 8537fa5e item-2：project_stack 已权威定栈、设计已按实际栈落地后，"PRD 说 Vue 但项目
+    是 Thymeleaf" 这类只是【需适配的框架差异】，不该当虚假前提阻断。命中前端框架/技术栈关键词
+    且不含"文件不存在/缺失"这类真缺失信号即判为栈差异。纯函数、保守（拿不准不剔除）。
+    """
+    text = f"{fi.get('claim', '')} {fi.get('detail', '')}".lower()
+    if not text.strip():
+        return False
+    # 命中前端框架/技术栈关键词 = doc 与磁盘事实的【栈差异】→ project_stack 已权威定栈，
+    # 一律【适配落地、不阻断】，哪怕文本含"不存在/没有"。治本（用户原则"不以文档为准"）：
+    #   "PRD 假设的 Vue 在本项目【不存在】" 里的"不存在"是【栈差异本身的描述】，不是缺交付文件——
+    #   旧实现把"不存在/缺失"无差别当真·缺文件优先保留，恰把这类框架差异误判成虚假前提阻断
+    #   （实测 RuoYi retry：PRD 提到 Vue、磁盘是 Thymeleaf → fail-fast，明明已正确适配 Thymeleaf）。
+    if any(k in text for k in _STACK_MISMATCH_KW):
+        return True
+    # 不含栈关键词时，交回上层按【真·缺文件/缺符号】虚假前提处理（保留阻断，不在此剔除）。
+    return False
+
+
 def _resolve_project_path(state: BrainState) -> str | None:
     """从 state 解析项目真实磁盘路径（事实核验/file_plan 的 ground truth 源）。"""
     pid = state.get("project_id") or ""
@@ -1178,18 +1206,46 @@ async def tech_design(state: BrainState) -> dict:
                     if fp.get("action") == "create":
                         fp["action"] = "modify"
 
-        # 确定性兜底：磁盘核验出"点名文件不存在"，即便 LLM 没标 fact_issues 也补上（事实优先于 LLM）
-        det_false = [fc for fc in file_checks if not fc["exists"]]
-        if det_false and not any(
-            (fi.get("verdict") == "false") for fi in (fact_issues or []) if isinstance(fi, dict)
-        ):
-            for fc in det_false:
+        # ── 治本：虚假前提【block 必须确定性坐实】（用户原则"不以文档为准"+"确定性兜住小模型"）──
+        # 唯一可坐实虚假前提的依据 = 磁盘核验"需求点名的具体文件/类是否真不存在"(file_checks)。
+        # 框架/技术栈维度由 detect_stack 权威拥有；tech_design 的 LLM 仍会把"PRD 提到 Vue 但项目是
+        # Thymeleaf"标 verdict=false（prompt 软约束压不住），但那是【已被 project_stack 解决的栈差异】，
+        # 绝不能因 LLM 自由文本而 block。故给每条 verdict=false 标 grounded：
+        #   grounded=True  ← 磁盘坐实点名文件缺失（真虚假前提，after_tech_design 据此 block）
+        #   grounded=False ← 纯 LLM 判定无磁盘佐证（框架/栈差异、语义臆测）→ advisory，不阻断
+        fact_issues = fact_issues or []
+        det_false = [fc for fc in file_checks if not fc.get("exists")]
+        det_missing = {str(fc.get("file", "")).strip() for fc in det_false if fc.get("file")}
+        det_missing_bases = {f.rsplit("/", 1)[-1] for f in det_missing if f}
+        # 磁盘坐实的缺失文件【始终】作为 grounded 虚假前提在场（不再依赖 LLM 是否标了）
+        _seen_text = " ".join(
+            f"{fi.get('claim', '')}{fi.get('detail', '')}" for fi in fact_issues if isinstance(fi, dict)
+        )
+        for fc in det_false:
+            f = str(fc.get("file", "")).strip()
+            if f and f not in _seen_text:
                 fact_issues.append({
-                    "claim": f"需求点名文件 {fc['file']}",
-                    "verdict": "false",
+                    "claim": f"需求点名文件 {f}", "verdict": "false", "grounded": True,
                     "detail": "磁盘核验：该文件在项目中不存在",
-                    "suggestion": f"近似候选：{fc['candidates']}" if fc["candidates"] else "无近似文件",
+                    "suggestion": f"近似候选：{fc['candidates']}" if fc.get("candidates") else "无近似文件",
                 })
+        # 标注既有 verdict=false 的 grounded：引用了磁盘确认缺失的文件名 且 非栈/框架差异 → 坐实
+        for fi in fact_issues:
+            if not isinstance(fi, dict) or fi.get("verdict") != "false" or "grounded" in fi:
+                continue
+            _t = f"{fi.get('claim', '')} {fi.get('detail', '')}"
+            _refs_missing = any(b and b in _t for b in det_missing_bases)
+            fi["grounded"] = bool(_refs_missing and not _is_stack_mismatch_issue(fi))
+        _advisory = [fi for fi in fact_issues
+                     if isinstance(fi, dict) and fi.get("verdict") == "false" and not fi.get("grounded")]
+        if _advisory:
+            # 未坐实的 LLM verdict=false 降级 advisory：记日志 + 透传 degraded_reasons（人可见，不阻断）
+            logger.info(
+                "[TECH_DESIGN] %d 个未确定性坐实的 verdict=false 降级为 advisory（不阻断；框架/栈差异或语义臆测，"
+                "project_stack 权威定栈=%s）：%s",
+                len(_advisory), (state.get("project_stack") or {}).get("frontend"),
+                [str(a.get("claim", ""))[:50] for a in _advisory],
+            )
         logger.info(
             "[TECH_DESIGN] 技术方案已产出 (file_plan=%d 文件, fact_issues=%d)",
             len(file_plan or []), len(fact_issues or []),

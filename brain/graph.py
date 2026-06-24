@@ -144,15 +144,26 @@ def after_tech_design(state: BrainState) -> Literal["clarify", "review_design"]:
     - 无虚假前提 → REVIEW_DESIGN（原流程：人工评审/auto_accept 自动通过 → plan）。
     """
     fact_issues = state.get("tech_design_fact_issues") or []
-    false_premises = [fi for fi in fact_issues if isinstance(fi, dict) and fi.get("verdict") == "false"]
+    # 治本：block 必须【确定性坐实】——只阻断 grounded=True（磁盘核验坐实点名文件缺失）的虚假前提。
+    # 纯 LLM 自由文本判定（框架/栈差异、语义臆测）grounded=False → advisory，不阻断 auto_accept
+    # （框架/栈维度由 detect_stack 权威拥有，"不以文档为准"）。tech_design 已标好 grounded。
+    false_premises = [
+        fi for fi in fact_issues
+        if isinstance(fi, dict) and fi.get("verdict") == "false" and fi.get("grounded")
+    ]
     if false_premises:
         logger.warning(
-            "[ROUTE] TECH_DESIGN → CLARIFY (检出 %d 个虚假前提，强制澄清，覆盖 auto_accept): %s",
+            "[ROUTE] TECH_DESIGN → CLARIFY (检出 %d 个【确定性坐实】虚假前提，强制澄清，覆盖 auto_accept): %s",
             len(false_premises),
             [fi.get("claim", "?") for fi in false_premises][:3],
         )
         return "clarify"
-    logger.info("[ROUTE] TECH_DESIGN → REVIEW_DESIGN (事实核验通过)")
+    _advisory = [fi for fi in fact_issues
+                 if isinstance(fi, dict) and fi.get("verdict") == "false" and not fi.get("grounded")]
+    logger.info(
+        "[ROUTE] TECH_DESIGN → REVIEW_DESIGN (无确定性坐实虚假前提%s)",
+        f"；%d 个未坐实 verdict=false 降级 advisory 不阻断" % len(_advisory) if _advisory else "",
+    )
     return "review_design"
 
 

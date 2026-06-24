@@ -42,6 +42,9 @@ from swarm.types import (
 
 logger = logging.getLogger(__name__)
 
+# 进程级技术栈画像缓存（按 project_path/project_id）：避免每个子任务重复扫盘探测栈。
+_PROJECT_STACK_CACHE: dict[str, dict | None] = {}
+
 
 # audit #22：trivial 快路径的 LLM 自报判定。原 `"fail" not in combined.lower()` 是裸
 # 子串，会把 "check for failures" / "failed to X but recovered" 等正常叙述误判为失败。
@@ -833,6 +836,7 @@ class WorkerExecutor:
                         self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
                     llm_ok, llm_details = run_l1_pipeline(
                         self.project_path, self.subtask, output.diff, llm=l1_llm,
+                        project_stack=self._resolve_project_stack(),
                     )
                     l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
 
@@ -940,7 +944,48 @@ class WorkerExecutor:
             project_id=self.project_id,
             user_profile_prompt=self.user_profile_prompt,
             shared_contract=self.shared_contract,
+            project_stack=self._resolve_project_stack(),
         )
+
+    def _resolve_project_stack(self) -> dict | None:
+        """解析本项目技术栈画像，喂给 worker prompt（jakarta/javax 命名空间等硬前提）。
+
+        单一权威事实复用：优先取 detect_stack 已缓存到 projects.config 的画像；该画像若是
+        本次改动【新增 jvm 字段】前的旧缓存（无 servlet_namespace），或无 project record
+        （ad-hoc 运行），则当场对磁盘做一次确定性探测兜底——保证命名空间事实始终在场。
+        结果按 project_path 进程级缓存，避免每个子任务重复扫盘。
+        """
+        key = self.project_path or self.project_id or ""
+        if key in _PROJECT_STACK_CACHE:
+            return _PROJECT_STACK_CACHE[key]
+        profile: dict | None = None
+        # ① projects.config 缓存（detect_stack 产出的权威画像）
+        if self.project_id:
+            try:
+                from swarm.project import store as _pstore
+                rec = _pstore.get_project(self.project_id)
+                cached = (rec or {}).get("config", {}).get("project_stack")
+                if isinstance(cached, dict):
+                    profile = cached
+            except Exception:  # noqa: BLE001
+                profile = None
+        # ② 旧缓存缺 jvm 命名空间 / 无 record → 当场磁盘探测兜底
+        need_disk = not profile or not (
+            (profile.get("jvm") or {}).get("servlet_namespace")
+        )
+        if need_disk and self.project_path:
+            try:
+                from swarm.brain.stack_detect import detect_stack_deterministic
+                fresh = detect_stack_deterministic(self.project_path)
+                if profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
+                    # 保留权威画像其它字段，仅补 jvm（前后端裁决以缓存为准）
+                    profile = {**profile, "jvm": fresh["jvm"]}
+                else:
+                    profile = profile or fresh
+            except Exception:  # noqa: BLE001
+                pass
+        _PROJECT_STACK_CACHE[key] = profile
+        return profile
 
     def _scope_files(self) -> list[str]:
         """上传到沙箱的文件清单（readable ∪ writable(modify) ∪ 构建清单，去重保序）。
@@ -1481,6 +1526,7 @@ class WorkerExecutor:
             self._post_sync_contents = self._snapshot_scope_local(
                 local_root, files=self._writable_files()
             )
+            await self._normalize_jvm_namespace(local_root, reason)
             return
         self._post_sync_contents = {}
         cfg = get_config()
@@ -1513,6 +1559,7 @@ class WorkerExecutor:
             )
             for err in (sync_stats.get("errors") or [])[:5]:
                 self._log(f"pull-back 警告: {err}")
+            await self._normalize_jvm_namespace(local_root, reason)
         except Exception as sync_exc:
             # N-07：pull-back 失败若吞掉，成功执行的产出拉不回来→diff 空→报"无变更"→
             # 错误触发换模型降级。这是基础设施瞬时失败，显式抛 → run() 归类 transient → 退避重试。
@@ -1520,6 +1567,69 @@ class WorkerExecutor:
             raise TransientInfraError(
                 f"sandbox pull-back failed ({reason}): {sync_exc}"
             ) from sync_exc
+
+    async def _normalize_jvm_namespace(self, local_root: Path, reason: str) -> None:
+        """确定性 Jakarta/Javax 命名空间归一（治本：短路模型复读死循环）。
+
+        worker 写代码后 pull-back 到本地，这里据 project_stack 的权威命名空间把改动文件里
+        【写错的】Jakarta EE 包前缀（如本项目用 jakarta 却写成 javax.servlet）确定性改对，
+        并把改过的文件【回写本地 + 重新上传沙箱】，使随后的 L1 build 闸门在沙箱里直接编过，
+        不再让本地小模型对着 `package javax.servlet does not exist` 空转到迭代上限。
+        - 仅当 project_stack.jvm.servlet_namespace ∈ {jakarta,javax} 时生效；非 JVM/未判明→no-op。
+        - 只动 .java 文件、只改整包迁移的 Jakarta EE 前缀（见 rewrite_jvm_namespace），JDK 自带
+          的 javax.*（sql/crypto/naming…）一律不碰。SWARM_WORKER_JVM_NS_FIX=false 可关。
+        """
+        if os.environ.get("SWARM_WORKER_JVM_NS_FIX", "true").lower() in ("false", "0", "no"):
+            return
+        contents = getattr(self, "_post_sync_contents", None)
+        if not contents:
+            return
+        profile = self._resolve_project_stack() or {}
+        target_ns = (profile.get("jvm") or {}).get("servlet_namespace")
+        if target_ns not in ("jakarta", "javax"):
+            return
+        from swarm.worker.l1_pipeline import rewrite_jvm_namespace
+
+        fixed: dict[str, int] = {}
+        for rel, text in list(contents.items()):
+            if not rel.endswith(".java") or not isinstance(text, str):
+                continue
+            new_text, n = rewrite_jvm_namespace(text, target_ns)
+            if n <= 0:
+                continue
+            other = "javax" if target_ns == "jakarta" else "jakarta"
+            # 回写本地（diff 源）+ 更新快照
+            try:
+                lp = (local_root / rel)
+                lp.parent.mkdir(parents=True, exist_ok=True)
+                data = new_text.encode("utf-8")
+                data = self._sandbox_manager._preserve_line_endings(lp, data) \
+                    if self._sandbox_manager else data
+                lp.write_bytes(data)
+                contents[rel] = new_text
+                fixed[rel] = n
+            except OSError as exc:
+                self._log(f"{reason} 命名空间归一回写本地失败 {rel}: {exc}")
+        if not fixed:
+            return
+        self._log(
+            f"{reason} 命名空间确定性归一（→{target_ns}.*，治本短路死循环）："
+            + ", ".join(f"{r}×{c}" for r, c in list(fixed.items())[:5])
+            + (f" 等 {len(fixed)} 文件" if len(fixed) > 5 else "")
+        )
+        # 沙箱模式：把改对的文件重新上传，使 L1 build 在沙箱里见到 jakarta 版
+        if self._sandbox and self._sandbox_manager:
+            try:
+                cfg = get_config()
+                await asyncio.to_thread(
+                    self._sandbox_manager.sync_files_to_sandbox,
+                    self._sandbox,
+                    local_root,
+                    list(fixed.keys()),
+                    cfg.sandbox.sandbox_remote_workdir,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"{reason} 命名空间归一回传沙箱失败（不致命，build 闸门会暴露）: {exc}")
 
     def _list_sandbox_workspace_files(self) -> list[str]:
         """递归列出沙箱 /workspace 下的相对文件路径（allow_any/greenfield pull-back 用）。
@@ -2254,7 +2364,8 @@ class WorkerExecutor:
             # 空 diff 但有 harness（如 greenfield 新建文件 diff 未被捕获）：
             # 仍用 harness 命令做确定性验证，杜绝 LLM 口头自报合格。
             ok, details = run_l1_pipeline(
-                self.project_path, self.subtask, diff or "", llm=None
+                self.project_path, self.subtask, diff or "", llm=None,
+                project_stack=self._resolve_project_stack(),
             )
             details["deterministic_gate"] = "pass" if ok else "fail"
             # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
