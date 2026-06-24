@@ -226,6 +226,14 @@ class ModelConfig(BaseSettings):
     stream_chunk_timeout: float = 120.0
     first_token_timeout: float = 180.0
     inter_chunk_timeout: float = 30.0
+    # 总时长看门狗（治本第三条腿）：单次 brain 流式累计超此秒数判 runaway → 抛 transient → fallback。
+    # 双超时管【两 chunk 间隔】、max_tokens 管【输出长度】，都拦不住"稳定吐却吐不完"的 reasoning runaway
+    # （实测 GLM-5.2 contract_design 稳定吐 6w+ chunk/22min 才 stall 失败，前 22min 全空烧、半成品作废）。
+    # 取值权衡：合法慢调用实测达 24.5min（contract_design 单次成功），故默认设【保守兜底】1500s(25min)——
+    # 只兜真正"永不收尾"的病态调用，不误杀合法慢调用；要对 runaway fail-fast（牺牲个别合法慢调用换 fallback
+    # 重跑）可调低，但更优解是从源头限 reasoning（reasoning_effort/关 thinking）。0=关闭。worker 热路径不开
+    # （已有 stall+worker_max_tokens=8192 双重兜底）。
+    brain_stream_wallclock_s: float = 1500.0
 
     # ── I1 模型能力分级（Brain 编排约束随模型能力调整）──────────────
     # tier_enabled 默认 False = 永远 standard = 现有硬编码约束上限，行为零变化（安全闸门）。

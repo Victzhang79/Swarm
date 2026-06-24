@@ -60,29 +60,34 @@ async def test_contract_design_skips_non_ultra():
 
 @pytest.mark.asyncio
 async def test_contract_design_ultra_multimodule(monkeypatch):
-    """ultra 多模块 → 调 Brain 大模型产共享契约，落 shared_contract_draft。"""
-    import json as _json
-    from unittest.mock import AsyncMock
+    """ultra 多模块 → 三段式（骨架+逐模块并发+合并）产共享契约，落 shared_contract_draft。"""
     import swarm.brain.planning_nodes as pn
 
-    contract = {"interfaces": [{"name": "INotifyService", "module": "channel",
-                                "signature": "send(NotifyRequest):NotifyResponse"}],
-                "dtos": [], "constants": [], "apis": [], "conventions": []}
-
     class _Resp:
-        content = _json.dumps({"shared_contract": contract})
+        def __init__(self, content): self.content = content
 
-    fake = AsyncMock()
-    fake.ainvoke.return_value = _Resp()
-    monkeypatch.setattr(pn, "_get_brain_llm", lambda: fake)
+    class _RoutingLLM:
+        async def ainvoke(self, msgs):
+            if "consumer_map" in msgs[0]["content"]:  # Stage A 骨架
+                return _Resp('{"skeleton": {"conventions": [], "constants": [], "consumer_map": []}}')
+            # Stage B：channel 模块吐 INotifyService，其余空片
+            mod = next((ln.split("：", 1)[1].strip() for ln in msgs[1]["content"].splitlines()
+                        if ln.startswith("模块名：")), "?")
+            if mod == "channel":
+                return _Resp('{"interfaces": [{"name": "INotifyService", "module": "channel",'
+                             ' "signature": "send(NotifyRequest):NotifyResponse"}],'
+                             ' "dtos": [], "apis": [], "dependencies": []}')
+            return _Resp('{"interfaces": [], "dtos": [], "apis": [], "dependencies": []}')
+
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda: _RoutingLLM())
 
     out = await pn.contract_design({
         "complexity": "ultra",
-        "tech_design": {"modules": [{"name": "channel"}, {"name": "engine"}],
+        "tech_design": {"modules": [{"name": "channel", "responsibility": "渠道"},
+                                    {"name": "engine", "responsibility": "引擎"}],
                         "data_model": "x"},
-        "tech_design_file_plan": [{"path": "channel/INotifyService.java", "module": "channel"}],
         "task_description": "建预警平台",
     })
     assert "shared_contract_draft" in out
-    assert out["shared_contract_draft"]["interfaces"][0]["name"] == "INotifyService"
-    fake.ainvoke.assert_awaited_once()
+    names = [i["name"] for i in out["shared_contract_draft"]["interfaces"]]
+    assert "INotifyService" in names

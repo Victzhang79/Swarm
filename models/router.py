@@ -82,6 +82,14 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     零日志）——一个【健康的长流式】与【真挂死】在日志上无法区分，运维只能空等/误判。这里加【自静默
     心跳】：调用未超 heartbeat_after 秒一律不打（短的 worker 热路径零噪声），超了才每 heartbeat_every
     秒记一行 elapsed+chunk 数，证明"流式仍在吐、未 stall"。不改超时语义，纯观测。
+
+    治本（超时第三条腿·总时长 wall-clock）：双超时管【两 chunk 间隔】、max_tokens 管【输出长度】，
+    但都管不住【稳定吐、却吐不完】的 runaway——实测 GLM-5.2 contract_design 稳定吐 6w+ chunk / 22min
+    后才 stall 失败、failover，前 22min 全是空烧（半成品在 ainvoke 失败时整段作废、不落盘）。max_tokens
+    没拦住是因为它只封最终答案、reasoning_content 豁免（或 chunk 亚 token 未数到上限）。这里加【总时长
+    看门狗】：单次流式累计超 swarm_wallclock_budget 秒即抛 TransientInfraError（同 stall 归 transient →
+    退避/fallback，绝不当 capability 换模型，对齐 C）。0=关闭（worker 热路径默认关，已有 stall+max_tokens
+    兜底）；brain 调用开（封顶 runaway，让它早 fail-fast 切 fallback，而非空烧到自然 stall）。
     """
 
     swarm_first_token_timeout: float = 180.0
@@ -89,6 +97,8 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     # 自静默心跳：调用总时长超过 after 秒才开始打心跳，之后每 every 秒一行（短调用零噪声）。
     swarm_heartbeat_after: float = 60.0
     swarm_heartbeat_every: float = 30.0
+    # 总时长看门狗：单次流式累计超此秒数即判 runaway 抛 transient。0=关闭（默认，worker 热路径不动）。
+    swarm_wallclock_budget: float = 0.0
 
     async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
         import asyncio
@@ -100,11 +110,27 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
         t0 = _monotonic()
         last_beat = t0
         n_chunks = 0
+        last_chunk: Any = None
         while True:
             to = self.swarm_first_token_timeout if first else self.swarm_inter_chunk_timeout
             try:
                 chunk = await asyncio.wait_for(agen.__anext__(), timeout=to)
             except StopAsyncIteration:
+                # 干净收尾：长调用记 elapsed+chunk 数+finish_reason。finish_reason=="length" 证明撞了
+                # max_tokens（output 计 token）；=="stop" 是自然收束——用于坐实 runaway 时 max_tokens 为何没拦。
+                elapsed = _monotonic() - t0
+                if elapsed >= self.swarm_heartbeat_after:
+                    fr = "?"
+                    try:
+                        meta = getattr(getattr(last_chunk, "message", None), "response_metadata", None) or \
+                            getattr(last_chunk, "generation_info", None) or {}
+                        fr = meta.get("finish_reason") or meta.get("stop_reason") or "?"
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.info(
+                        "[stream] %s 流式完成 %.0fs（共 %d chunk，finish_reason=%s）",
+                        getattr(self, "model_name", None) or "model", elapsed, n_chunks, fr,
+                    )
                 return
             except asyncio.TimeoutError as exc:
                 phase = "首 token(prefill)" if first else "解码中途"
@@ -117,14 +143,26 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                 ) from exc
             first = False
             n_chunks += 1
-            # 自静默心跳：超过 after 且距上次心跳≥every 才记一行，证明长调用仍在吐 token（非挂死）。
             now = _monotonic()
+            # 总时长看门狗（第三条腿）：稳定吐但吐不完的 runaway，stall 看门狗与 max_tokens 都拦不住，
+            # 累计超预算即判定 runaway → 抛 transient（早 fail-fast 切 fallback，不空烧到自然 stall）。
+            if self.swarm_wallclock_budget > 0 and now - t0 >= self.swarm_wallclock_budget:
+                try:
+                    await agen.aclose()  # 关底层流，让推理端 abort 解码、释放 GPU
+                except Exception:  # noqa: BLE001
+                    pass
+                raise TransientInfraError(
+                    f"stream 总时长 {now - t0:.0f}s 超预算 {self.swarm_wallclock_budget:.0f}s "
+                    f"(wall-clock runaway，已收 {n_chunks} chunk 仍未收尾) —— 基建瞬时，退避/fallback"
+                )
+            # 自静默心跳：超过 after 且距上次心跳≥every 才记一行，证明长调用仍在吐 token（非挂死）。
             if now - t0 >= self.swarm_heartbeat_after and now - last_beat >= self.swarm_heartbeat_every:
                 last_beat = now
                 logger.info(
                     "[stream] %s 流式生成中 %.0fs（已收 %d chunk，未 stall）",
                     getattr(self, "model_name", None) or "model", now - t0, n_chunks,
                 )
+            last_chunk = chunk
             yield chunk
 
 
@@ -148,7 +186,7 @@ class EndpointProvider:
 
     def get_chat_model(
         self, model_name: str, temperature: float = 0.2, callbacks: list | None = None,
-        max_tokens: int | None = None,
+        max_tokens: int | None = None, wallclock_budget: float | None = None,
     ) -> BaseChatModel:
         from langchain_openai import ChatOpenAI
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
@@ -184,6 +222,8 @@ class EndpointProvider:
         # 治本 A：双超时拆分（首 token 宽 / 解码间隔紧）。读 config，缺省回退安全值。
         _kwargs["swarm_first_token_timeout"] = getattr(self.config, "first_token_timeout", 180.0)
         _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
+        # 治本（第三条腿）：总时长看门狗。由调用方按角色传入（brain 开/worker 默认关），0=关闭。
+        _kwargs["swarm_wallclock_budget"] = float(wallclock_budget or 0.0)
         return _DualTimeoutChatOpenAI(**_kwargs)
 
 
@@ -230,16 +270,18 @@ class ModelRouter:
         """Brain 编排层 — 必须大模型（云端优先，本地 fallback）。
 
         FINDING-10：brain 调用传 max_tokens 上限（防 reasoning 模型失控持续生成把 PLAN/规划
-        无限挂死）。0 表示不限（向后兼容）。
+        无限挂死）。0 表示不限（向后兼容）。max_tokens 只封最终答案 token、拦不住 reasoning runaway
+        （实测 GLM-5.2 稳定吐 6w+ chunk/22min 才 stall），故再叠【总时长看门狗】wallclock 兜底。
         """
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
+        _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
         primary = self._get_provider_for_model(self.config.brain_primary).get_chat_model(
             self.config.brain_primary, temperature=self.config.brain_temperature,
-            max_tokens=_bmt,
+            max_tokens=_bmt, wallclock_budget=_wc,
         )
         fallback = self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
             self.config.brain_fallback, temperature=self.config.brain_temperature,
-            max_tokens=_bmt,
+            max_tokens=_bmt, wallclock_budget=_wc,
         )
         return primary.with_fallbacks([fallback])
 

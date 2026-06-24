@@ -1291,50 +1291,78 @@ async def tech_design(state: BrainState) -> dict:
 # 节点 3.5：contract_design — 共享契约设计（T1，DESIGN_multiworker_collaboration）
 # ══════════════════════════════════════════════
 
-CONTRACT_DESIGN_SYSTEM = """你是系统架构师，负责为一个【多模块大型需求】设计【跨模块共享契约】。
+# 三段式（治本 runaway）：契约不再一次性全局生成（云端 reasoning 模型实测 GLM-5.2/Kimi 均 20+min/
+# 6w chunk 才 stall），改 Stage A 全局骨架(小) + Stage B 逐模块并发(各自 owns 的片) + Stage C 确定性合并。
+# 每调用小而有界、可并发，runaway 从根上消失，且随模块数水平扩展。镜像 _tech_design_staged 的成熟模式。
+_CONTRACT_CONCURRENCY = 3       # 单云端 key 友好的并发上限（同 Stage2）
+_CONTRACT_MAX_ATTEMPTS = 3      # 单模块契约片失败重试（空响应/瑕疵/超时多为瞬时）
+_CONTRACT_STAGE_TIMEOUT = 300.0  # 秒/调用：契约片比 file_plan 小，比 Stage2 的 500s 更紧
 
-背景：这个需求会被拆成多个子任务，由多个 worker【并行】实现。为防止各 worker 各写各的、
-接口对不上（如两人各建一个 INotifyService、DTO 字段不一致、API 路径冲突），
-你要先把【所有 worker 都必须遵守的共享契约】定下来——这是全局唯一的一份基石。
+# ── Stage A：全局骨架（只定没有单一模块归属、必须全局统一的部分）──
+CONTRACT_SKELETON_SYSTEM = """你是系统架构师，为一个【多模块大型需求】定【全局骨架】——只定那些
+【没有单一模块归属、必须全局统一】的部分，给各模块后续细化当锚点。绝不写任何模块内部细节。
 
-只定【跨模块/跨子任务共享】的部分（模块内部细节由各 worker 自决，不要管）：
-1. 共享接口：跨模块调用的接口名 + 完整方法签名（参数/返回类型）。
-2. 共享 DTO/实体：被多个模块引用的数据结构 + 字段。
-3. 共享常量/枚举：渠道类型、状态码、回调类型等。
-4. API 路径规范：对外接口的 URL 路径 + HTTP 方法 + 请求/响应结构。
-5. 命名/路径约定：包名前缀、模块目录规范，避免同名重复创建。
-6. 【模块依赖并集 dependencies】（极重要，编译期硬约束）：每个新建模块的 pom.xml/构建文件
-   必须声明的【全部】第三方依赖。多个 worker 并行写同一模块，谁建 pom 谁就得把整模块用到的
-   依赖一次声明全——只要有一个子任务用了 RedisTemplate/@Slf4j/Validation 而 pom 没声明，
-   整模块 mvn compile 必败、触发全量返工。所以你要按模块枚举它编译期需要的依赖并集。
-   - Java/Maven：用 artifactId（如 spring-boot-starter-data-redis、lombok、
-     spring-boot-starter-validation、hutool-all、fastjson2），跨 group 同名时写 groupId:artifactId。
-   - 只列【该模块自身代码直接 import/用到】的依赖；模块名用技术方案里的【模块目录名】。
+只定三类全局事实：
+1. conventions：命名/路径约定（包名前缀、模块目录命名规范），防各 worker 撞名重复创建。
+2. constants：跨模块共享的常量/枚举（渠道类型、状态码、回调类型等），全局唯一一份。
+3. consumer_map：跨模块消费关系——每个模块【被哪些模块消费】、对方大致期望它暴露什么 surface
+   （接口/DTO/API 的方向）。据模块 depends_on 反转细化，让各模块知道"谁要用我、我该 expose 什么"。
 
 严格输出 JSON：
-{"shared_contract": {
-  "interfaces": [{"name","module","signature":"完整方法签名","purpose"}],
-  "dtos": [{"name","module","fields":["类型 字段名"]}],
-  "constants": [{"name","values":["..."]}],
-  "apis": [{"path","method","request","response"}],
+{"skeleton": {
   "conventions": ["命名/路径约定1", "..."],
-  "dependencies": [{"module":"模块目录名","artifacts":["编译期所需依赖的 artifactId 或 groupId:artifactId 并集"]}]
+  "constants": [{"name","values":["..."]}],
+  "consumer_map": [{"module":"模块目录名","consumed_by":["消费它的模块名"],"expected_surface":"对方期望它暴露的接口/DTO/API 概述"}]
 }}"""
 
-CONTRACT_DESIGN_USER = """需求：
+CONTRACT_SKELETON_USER = """需求：
 {task_description}
 
-模块清单（来自技术方案）：
+模块清单（含依赖关系 depends_on）：
 {modules}
 
 数据模型：
 {data_model}
 
-文件级方案概览（看哪些文件跨模块被引用）：
-{file_plan_summary}
+请只产出【全局骨架】JSON（conventions + 全局 constants + consumer_map）。求精准、勿写模块内部细节。"""
 
-请产出【跨模块共享契约】JSON。只定共享部分，求精准（这是所有 worker 的基石）。
-务必填全 dependencies：逐个新建模块，列出它编译期需要声明的全部第三方依赖并集（漏一个即整模块编译失败）。"""
+# ── Stage B：单模块视角，只产该模块 owns 的契约片（仿 TECH_DESIGN_STAGE2）──
+CONTRACT_MODULE_SYSTEM = """你是系统架构师，正在为【一个模块】产出它在【全局共享契约】里负责的那一片。
+全局骨架（命名约定/全局常量/谁消费你）已定，你只负责【当前这一个模块 owns 的契约】——
+即【本模块对外暴露、供其他模块消费】的部分。不要管别的模块、不要重复全局常量。
+
+只定本模块 owns 的共享契约：
+1. interfaces：本模块对外暴露的跨模块接口名 + 完整方法签名（参数/返回类型）+ purpose。
+2. dtos：本模块定义、被其他模块引用的数据结构 + 字段。
+3. apis：本模块对外的 URL 路径 + HTTP 方法 + 请求/响应结构。
+4. dependencies：本模块 pom.xml/构建文件【必须声明的全部】第三方依赖（编译期硬约束）。
+   多个 worker 并行写本模块，谁建 pom 谁就得把整模块用到的依赖一次声明全——漏一个
+   （如用了 RedisTemplate/@Slf4j/Validation 而 pom 没声明）整模块 mvn compile 必败、全量返工。
+   - Java/Maven：用 artifactId（spring-boot-starter-data-redis、lombok、
+     spring-boot-starter-validation、hutool-all、fastjson2…），跨 group 同名写 groupId:artifactId。
+   - 只列【本模块自身代码直接 import/用到】的依赖。
+
+所有条目的 module 字段都填【当前模块名】。严格输出 JSON：
+{"interfaces":[{"name","module","signature":"完整方法签名","purpose"}],
+ "dtos":[{"name","module","fields":["类型 字段名"]}],
+ "apis":[{"path","method","request","response"}],
+ "dependencies":[{"module":"当前模块名","artifacts":["artifactId 或 groupId:artifactId 并集"]}]}"""
+
+CONTRACT_MODULE_USER = """总需求（背景）：{task_description}
+
+数据模型：{data_model}
+
+全局骨架（命名约定/全局常量——遵守它，保持一致）：
+{skeleton}
+
+## 当前要产出契约片的模块（第 {mod_idx}/{mod_total} 个）
+模块名：{mod_name}
+职责：{mod_responsibility}
+被这些模块消费：{consumed_by}
+对方期望你暴露：{expected_surface}
+
+只产出【这个模块 owns 的契约片】JSON，module 字段统一填 "{mod_name}"。
+务必填全 dependencies：列出本模块编译期需声明的全部第三方依赖并集（漏一个即整模块编译失败）。"""
 
 
 def _normalize_contract_dependencies(raw) -> list[dict]:
@@ -1370,14 +1398,99 @@ def _normalize_contract_dependencies(raw) -> list[dict]:
     return out
 
 
-async def contract_design(state: BrainState) -> dict:
-    """共享契约设计节点（T1）：多模块大需求并行实现前，用 Brain 大模型产出全局共享契约。
+def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
+    """Stage C：把全局骨架 + 各模块契约片【确定性合并】成全局共享契约（0 LLM，纯函数可单测）。
 
-    决策（Q-T1-1/Q-T1-2）：独立节点 + Brain 大模型直接生成（全局基石求准）。
-    仅对【ultra 且多模块】需求产契约；其余直通（沿用 tech_design 的 shared_contract_draft）。
+    - union：interfaces/dtos/apis/dependencies 各模块片并集；conventions/constants 取自骨架。
+    - 冲突告警（决策2）：同名不同定义（interfaces 比 signature、dtos 比 fields、constants 比 values）
+      → logger.warning + 保留首个定义，graceful degrade，不阻断、不调 LLM。
+    - dependencies：合并 + 现有 _normalize_contract_dependencies 归一 + 按模块并集成一条/模块。
+    输出与单体版【完全相同】的 schema（interfaces/dtos/constants/apis/conventions/dependencies），
+    下游 contract_symbols/Rule5/worker 注入零改动。
+    """
+    skeleton = skeleton if isinstance(skeleton, dict) else {}
+    slices = [s for s in slices if isinstance(s, dict)]
+
+    def _merge_named(groups: list, key_label: str, sig_field: str) -> list[dict]:
+        """按 name 并集；同名不同定义（sig_field 不一致）→ 告警 + 保留首版。"""
+        out: list[dict] = []
+        seen: dict[str, dict] = {}
+        for group in groups:
+            for item in (group or []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    out.append(item)  # 无名项不去重，直接并入
+                    continue
+                if name not in seen:
+                    seen[name] = item
+                    out.append(item)
+                elif item.get(sig_field) != seen[name].get(sig_field):
+                    logger.warning(
+                        "[CONTRACT_MERGE] %s '%s' 同名不同定义冲突：保留首版(module=%s)，"
+                        "丢弃(module=%s)——人工复核",
+                        key_label, name, seen[name].get("module"), item.get("module"),
+                    )
+        return out
+
+    interfaces = _merge_named([s.get("interfaces") for s in slices], "interfaces", "signature")
+    dtos = _merge_named([s.get("dtos") for s in slices], "dtos", "fields")
+    constants = _merge_named([skeleton.get("constants")], "constants", "values")
+
+    apis_out: list[dict] = []
+    _api_seen: set = set()
+    for s in slices:
+        for a in (s.get("apis") or []):
+            if not isinstance(a, dict):
+                continue
+            k = (str(a.get("path") or ""), str(a.get("method") or ""))
+            if k in _api_seen:
+                continue
+            _api_seen.add(k)
+            apis_out.append(a)
+
+    # 每片【先各自归一】（容 list 与 dict 两种形态），再按模块并集成【一条/模块】（防重复 acceptance 注入）
+    by_mod: dict[str, list[str]] = {}
+    order: list[str] = []
+    norm_deps: list[dict] = []
+    for s in slices:
+        norm_deps.extend(_normalize_contract_dependencies(s.get("dependencies")))
+    for d in norm_deps:
+        m = d["module"]
+        if m not in by_mod:
+            by_mod[m] = []
+            order.append(m)
+        for a in d["artifacts"]:
+            if a not in by_mod[m]:
+                by_mod[m].append(a)
+    dependencies = [{"module": m, "artifacts": by_mod[m]} for m in order]
+
+    return {
+        "interfaces": interfaces,
+        "dtos": dtos,
+        "constants": constants,
+        "apis": apis_out,
+        "conventions": [c for c in (skeleton.get("conventions") or []) if c],
+        "dependencies": dependencies,
+    }
+
+
+async def contract_design(state: BrainState) -> dict:
+    """共享契约设计节点（T1）——三段式：骨架 → 逐模块并发 → 确定性合并。
+
+    单体一次性生成全局契约会让云端 reasoning 模型 runaway（实测 GLM-5.2/Kimi 均 20+min/6w chunk
+    才 stall→failover）。治本：契约的"全局一致"只需一次【确定性对账】，不需一次性吐完所有字。
+      Stage A 骨架（1 次小调用）：全局 conventions/constants/consumer_map。
+      Stage B 逐模块并发（仿 _tech_design_staged Stage2）：每模块只产自己 owns 的契约片，小而有界。
+      Stage C 确定性合并（0 LLM）：union + 冲突告警 + 依赖归一 → 全局契约。
+    每调用小、有界、可并发，runaway 从根上消失，随模块数水平扩展。仅 ultra+多模块走三段式；
+    其余直通沿用 tech_design 的 shared_contract_draft。输出 schema 与单体版一致，下游零改动。
     产出的 shared_contract 会：① 注入每个 worker 作只读契约；② 作为"契约子任务"最先落盘（dispatch 层）。
     """
-    file_plan = state.get("tech_design_file_plan") or []
+    import asyncio as _asyncio
+    import time as _time
+
     td = state.get("tech_design") or {}
     modules = td.get("modules") or []
     comp = state.get("assessed_complexity") or state.get("complexity")
@@ -1387,48 +1500,127 @@ async def contract_design(state: BrainState) -> dict:
     if comp_str != "ultra" or len(modules) < 2:
         return {}
 
+    task_desc = state.get("task_description", "") or ""
+    data_model = str(td.get("data_model", ""))
+    _valid_mods = [m for m in modules if isinstance(m, dict)]
+    mod_total = len(_valid_mods)
+    llm = _get_brain_llm()
+
+    # ── Stage A：全局骨架（1 次小调用）──
+    _t0 = _time.monotonic()
+    logger.info("[CONTRACT_SKELETON] 启动全局骨架（%d 模块：conventions/constants/consumer_map）…", mod_total)
     try:
-        llm = _get_brain_llm()
-        fp_summary = "\n".join(
-            f"  - {fp.get('path')} [{fp.get('module', '?')}] {fp.get('responsibility', '')}"
-            for fp in file_plan[:120]
-        )
-        # 起始 marker：这是单次 Brain 大模型长调用（实测 ultra 8 模块达 ~24min，吐满 brain_max_tokens）。
-        # 无此行时节点静默数十分钟，与挂死无法区分；配合 _astream 自静默心跳即可看到"仍在吐"。
-        logger.info(
-            "[CONTRACT_DESIGN] 启动全局契约生成（Brain 大模型，%d 模块/%d 文件，长方案可能数分钟）…",
-            len(modules), len(file_plan),
-        )
-        resp = await llm.ainvoke([
-            {"role": "system", "content": CONTRACT_DESIGN_SYSTEM},
-            {"role": "user", "content": CONTRACT_DESIGN_USER.format(
-                task_description=(state.get("task_description", ""))[:2500],
-                modules=json.dumps(modules, ensure_ascii=False)[:2000],
-                data_model=str(td.get("data_model", ""))[:2000],
-                file_plan_summary=fp_summary[:3000],
+        respA = await _asyncio.wait_for(llm.ainvoke([
+            {"role": "system", "content": CONTRACT_SKELETON_SYSTEM},
+            {"role": "user", "content": CONTRACT_SKELETON_USER.format(
+                task_description=task_desc[:2500],
+                modules=json.dumps(_valid_mods, ensure_ascii=False)[:2500],
+                data_model=data_model[:2000],
             )},
-        ])
-        result = _parse_json_from_llm(resp.content)
-        contract = result.get("shared_contract", result) if isinstance(result, dict) else {}
-        if isinstance(contract, dict):
-            contract["dependencies"] = _normalize_contract_dependencies(contract.get("dependencies"))
-        n_if = len(contract.get("interfaces", []) or []) if isinstance(contract, dict) else 0
-        n_dto = len(contract.get("dtos", []) or []) if isinstance(contract, dict) else 0
-        n_api = len(contract.get("apis", []) or []) if isinstance(contract, dict) else 0
-        n_dep = len(contract.get("dependencies", []) or []) if isinstance(contract, dict) else 0
-        logger.info(
-            "[CONTRACT_DESIGN] 共享契约已产出：接口=%d DTO=%d API=%d 模块依赖=%d（Brain 大模型，全局基石）",
-            n_if, n_dto, n_api, n_dep,
-        )
-        if n_dep == 0:
-            logger.warning(
-                "[CONTRACT_DESIGN] 契约未含 dependencies（模块依赖并集）——Rule5 将空转，"
-                "缺依赖编译失败只能靠定向恢复兜底；建议检查 contract LLM 输出。",
-            )
-        return {"shared_contract_draft": contract or state.get("shared_contract_draft") or {}}
+        ]), timeout=_CONTRACT_STAGE_TIMEOUT)
+        skel_raw = _parse_json_from_llm(respA.content)
+        skeleton = skel_raw.get("skeleton", skel_raw) if isinstance(skel_raw, dict) else {}
+        if not isinstance(skeleton, dict):
+            skeleton = {}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[CONTRACT_DESIGN] 契约生成失败，沿用 tech_design draft 继续: %s", exc)
+        logger.warning("[CONTRACT_SKELETON] 骨架生成失败，降级沿用 tech_design draft: %s", exc)
         return {}
+    cmap: dict[str, dict] = {}
+    for entry in (skeleton.get("consumer_map") or []):
+        if isinstance(entry, dict) and entry.get("module"):
+            cmap[str(entry["module"]).strip()] = entry
+    logger.info(
+        "[CONTRACT_SKELETON] 骨架产出：conventions=%d constants=%d consumer_map=%d，耗时 %.1fs",
+        len(skeleton.get("conventions") or []), len(skeleton.get("constants") or []),
+        len(skeleton.get("consumer_map") or []), _time.monotonic() - _t0,
+    )
+
+    # ── Stage B：逐模块并发产契约片（仿 _tech_design_staged Stage2：Semaphore + gather + 重试）──
+    _sem = _asyncio.Semaphore(_CONTRACT_CONCURRENCY)
+
+    async def _gen_one_module_contract(mi: int, mod: dict) -> dict:
+        mod_name = mod.get("name") or f"module-{mi}"
+        cm = cmap.get(mod_name.strip(), {})
+        _last_err = "unknown"
+        for _attempt in range(1, _CONTRACT_MAX_ATTEMPTS + 1):
+            _tm = _time.monotonic()
+            async with _sem:
+                try:
+                    resp = await _asyncio.wait_for(llm.ainvoke([
+                        {"role": "system", "content": CONTRACT_MODULE_SYSTEM},
+                        {"role": "user", "content": CONTRACT_MODULE_USER.format(
+                            task_description=task_desc[:1500],
+                            data_model=data_model[:2000],
+                            skeleton=json.dumps(
+                                {"conventions": skeleton.get("conventions") or [],
+                                 "constants": skeleton.get("constants") or []},
+                                ensure_ascii=False)[:1500],
+                            mod_idx=mi, mod_total=mod_total, mod_name=mod_name,
+                            mod_responsibility=mod.get("responsibility", ""),
+                            consumed_by="、".join(cm.get("consumed_by") or []) or "（无）",
+                            expected_surface=cm.get("expected_surface", "") or "（无特别约定）",
+                        )},
+                    ]), timeout=_CONTRACT_STAGE_TIMEOUT)
+                    r = _parse_json_from_llm(resp.content)
+                    if not isinstance(r, dict):
+                        raise ValueError("非 JSON dict")
+                    # 兜底 module 字段（owner 归属，供 Stage C 合并 + 下游 Rule5 按模块注入）
+                    for k in ("interfaces", "dtos", "dependencies"):
+                        for it in (r.get(k) or []):
+                            if isinstance(it, dict) and not it.get("module"):
+                                it["module"] = mod_name
+                    logger.info(
+                        "[CONTRACT_MODULE] 模块 %d/%d '%s' → 接口=%d DTO=%d API=%d 依赖=%d，耗时 %.1fs%s",
+                        mi, mod_total, mod_name, len(r.get("interfaces") or []),
+                        len(r.get("dtos") or []), len(r.get("apis") or []),
+                        len(r.get("dependencies") or []), _time.monotonic() - _tm,
+                        f"（第 {_attempt} 次成功）" if _attempt > 1 else "",
+                    )
+                    return {"idx": mi, "name": mod_name, "slice": r, "error": None}
+                except _asyncio.TimeoutError:
+                    _last_err = "timeout"
+                except Exception as exc:  # noqa: BLE001
+                    _last_err = str(exc)[:200]
+            if _attempt < _CONTRACT_MAX_ATTEMPTS:
+                logger.warning(
+                    "[CONTRACT_MODULE] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试",
+                    mi, mod_total, mod_name, _attempt, _last_err,
+                )
+        logger.error(
+            "[CONTRACT_MODULE] 模块 %d/%d '%s' 重试 %d 次仍失败（该模块契约片丢失）: %s",
+            mi, mod_total, mod_name, _CONTRACT_MAX_ATTEMPTS, _last_err,
+        )
+        return {"idx": mi, "name": mod_name, "slice": {}, "error": _last_err}
+
+    _results = await _asyncio.gather(
+        *[_gen_one_module_contract(mi, mod) for mi, mod in enumerate(_valid_mods, start=1)]
+    )
+    _results.sort(key=lambda r: r["idx"])
+    slices = [r["slice"] for r in _results if not r["error"]]
+    failed = [r["name"] for r in _results if r["error"]]
+    if failed:
+        logger.error(
+            "[CONTRACT_MODULE] ⚠ %d/%d 模块契约片产出失败 %s——合并将缺这些模块的接口/依赖，"
+            "下游缺依赖编译失败靠定向恢复兜底",
+            len(failed), mod_total, failed,
+        )
+    if not slices:
+        logger.warning("[CONTRACT_DESIGN] 全部模块契约片失败，降级沿用 tech_design draft")
+        return {}
+
+    # ── Stage C：确定性合并（0 LLM）──
+    merged = _merge_module_contracts(skeleton, slices)
+    logger.info(
+        "[CONTRACT_MERGE] 合并完成：接口=%d DTO=%d 常量=%d API=%d 约定=%d 模块依赖=%d（%d/%d 模块成功）",
+        len(merged["interfaces"]), len(merged["dtos"]), len(merged["constants"]),
+        len(merged["apis"]), len(merged["conventions"]), len(merged["dependencies"]),
+        len(slices), mod_total,
+    )
+    if not merged["dependencies"]:
+        logger.warning(
+            "[CONTRACT_MERGE] 契约未含 dependencies——Rule5 将空转，缺依赖编译失败只能靠定向恢复兜底",
+        )
+    return {"shared_contract_draft": merged or state.get("shared_contract_draft") or {}}
 
 
 # ══════════════════════════════════════════════

@@ -47,50 +47,61 @@ def test_normalize_garbage_returns_empty():
     assert _normalize_contract_dependencies([1, 2, 3]) == []
 
 
-# ── 2. contract_design 产出含规范化 dependencies ──
+# ── 2. contract_design（三段式）产出含规范化 dependencies ──
+# 治本后 contract_design = 骨架 + 逐模块并发 + 确定性合并。dependencies 由【各模块片】产出、
+# 在 Stage C 合并时各自归一（容 list/dict 两种形态）。下面用 routing fake LLM：骨架 call 返回
+# 空骨架，模块 call 返回该模块的契约片（携带被测的 dependencies 形态）。
 
 class _Resp:
     def __init__(self, content): self.content = content
 
 
-def _llm_returning(payload_json):
+def _routing_llm(module_slice_json: str):
+    """骨架 call → 空骨架；模块 call → 给定契约片（携带被测 dependencies）。"""
     class _L:
-        async def ainvoke(self, _msgs):
-            return _Resp(payload_json)
+        async def ainvoke(self, msgs):
+            sys = msgs[0]["content"]
+            if "consumer_map" in sys:  # Stage A 骨架
+                return _Resp('{"skeleton": {"conventions": [], "constants": [], "consumer_map": []}}')
+            return _Resp(module_slice_json)  # Stage B 单模块片
     return lambda: _L()
 
 
-def _ultra_multimodule_state():
+def _ultra_singlemodule_state():
+    # 单模块片测 dependencies 归一：仍需 ≥2 模块才进三段式，故给 2 个同名片由合并去重收口
     return {
         "assessed_complexity": "ultra",
         "task_description": "企业级预警编排平台",
-        "tech_design": {"modules": ["ruoyi-alarm", "ruoyi-notify"], "data_model": "Alarm{...}"},
-        "tech_design_file_plan": [{"path": "ruoyi-alarm/pom.xml", "module": "ruoyi-alarm"}],
+        "tech_design": {
+            "modules": [{"name": "ruoyi-alarm", "responsibility": "核心"},
+                        {"name": "ruoyi-alarm", "responsibility": "核心"}],
+            "data_model": "Alarm{...}",
+        },
     }
 
 
 def test_contract_design_emits_normalized_dependencies():
-    payload = (
-        '{"shared_contract": {"interfaces": [], "dtos": [],'
-        ' "dependencies": [{"module": "ruoyi-alarm/", "artifacts": ["lombok", "lombok"]}]}}'
-    )
-    with patch.object(pn, "_get_brain_llm", _llm_returning(payload)):
-        out = asyncio.run(pn.contract_design(_ultra_multimodule_state()))
+    # 模块片给 list 形态 + 尾斜杠 + 重复 → 合并归一后去斜杠/去重
+    slice_json = ('{"interfaces": [], "dtos": [],'
+                  ' "dependencies": [{"module": "ruoyi-alarm/", "artifacts": ["lombok", "lombok"]}]}')
+    with patch.object(pn, "_get_brain_llm", _routing_llm(slice_json)):
+        out = asyncio.run(pn.contract_design(_ultra_singlemodule_state()))
     deps = out["shared_contract_draft"]["dependencies"]
     assert deps == [{"module": "ruoyi-alarm", "artifacts": ["lombok"]}]
 
 
 def test_contract_design_dict_form_dependencies_normalized():
-    payload = '{"shared_contract": {"dependencies": {"ruoyi-notify": ["fastjson2"]}}}'
-    with patch.object(pn, "_get_brain_llm", _llm_returning(payload)):
-        out = asyncio.run(pn.contract_design(_ultra_multimodule_state()))
+    # 模块片给 dict 形态 → 各片归一时容错（治本：_merge 逐片 _normalize）
+    slice_json = '{"dependencies": {"ruoyi-notify": ["fastjson2"]}}'
+    with patch.object(pn, "_get_brain_llm", _routing_llm(slice_json)):
+        out = asyncio.run(pn.contract_design(_ultra_singlemodule_state()))
     assert out["shared_contract_draft"]["dependencies"] == [{"module": "ruoyi-notify", "artifacts": ["fastjson2"]}]
 
 
 def test_contract_design_missing_dependencies_is_empty_list_not_crash():
-    payload = '{"shared_contract": {"interfaces": [], "dtos": []}}'
-    with patch.object(pn, "_get_brain_llm", _llm_returning(payload)):
-        out = asyncio.run(pn.contract_design(_ultra_multimodule_state()))
+    slice_json = '{"interfaces": [], "dtos": []}'
+    with patch.object(pn, "_get_brain_llm", _routing_llm(slice_json)):
+        out = asyncio.run(pn.contract_design(_ultra_singlemodule_state()))
     assert out["shared_contract_draft"]["dependencies"] == []
 
 
