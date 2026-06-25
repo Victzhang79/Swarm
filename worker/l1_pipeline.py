@@ -141,6 +141,122 @@ def _attempt_import_repair(project_path: str, build_output: str, timeout: int) -
     return len(changed)
 
 
+# ── 防线③（通用·确定性）：Maven 依赖版本不存在 → 自动校正到最近的有效版本 ──
+# 治本场景：worker 实现新功能时引入第三方依赖，但【凭空写了不存在的版本号】（如
+# com.warrenstrange:googleauth:1.5.2，实际最高仅 1.5.0）→ mvn 任何仓库都拉不到 →
+# `Could not find artifact` → build-repair 救不回（一直用同一错版本撞墙到迭代上限）→
+# L1 fail 死循环。这是"任务卡死被误判成模型弱"的又一通用机制，与 import 前缀同源。
+# 解法（模型无关）：从仓库 maven-metadata 列出该 artifact 真实可用版本，若写的版本不在
+# 其中 → 选【≤目标的最高版本，否则最高可用版本】，把 pom 里该版本号改对 → 重跑确认。
+_MISSING_ARTIFACT_RE = re.compile(
+    r"(?:Could not find artifact|Failure to find|Could not resolve dependencies for[^\n]*?)\s*"
+    r"([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|pom|war):([A-Za-z0-9_.\-]+)"
+)
+
+
+def _ver_key(v: str) -> tuple:
+    """版本号 → 可比较元组（数字段按整数比，非数字段按字符串），用于版本排序/取最近。"""
+    parts = re.split(r"[.\-_]", v.strip())
+    key: list = []
+    for p in parts:
+        if p.isdigit():
+            key.append((1, int(p), ""))
+        else:
+            m = re.match(r"(\d+)(.*)", p)
+            if m:
+                key.append((1, int(m.group(1)), m.group(2)))
+            else:
+                key.append((0, 0, p))
+    return tuple(key)
+
+
+def parse_missing_artifacts(build_output: str) -> list[tuple[str, str, str]]:
+    """从 mvn build 输出解析【拉取不到的 artifact】=(groupId, artifactId, version)，去重保序。"""
+    seen: set[tuple[str, str, str]] = set()
+    out: list[tuple[str, str, str]] = []
+    for g, a, v in _MISSING_ARTIFACT_RE.findall(build_output or ""):
+        key = (g, a, v)
+        if key not in seen and g and a and v:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _fetch_maven_versions(group: str, artifact: str, project_path: str, timeout: int) -> list[str]:
+    """查仓库 maven-metadata.xml 列出 artifact 的真实可用版本（aliyun→Central 兜底）。
+
+    在沙箱内跑 curl/wget（沙箱有出网）。任一仓库取到非空版本即返回；都取不到返回 []。
+    """
+    gpath = group.replace(".", "/")
+    urls = [
+        f"https://maven.aliyun.com/repository/public/{gpath}/{artifact}/maven-metadata.xml",
+        f"https://repo1.maven.org/maven2/{gpath}/{artifact}/maven-metadata.xml",
+    ]
+    for url in urls:
+        cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+        _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
+        if _tool_missing(out):
+            continue
+        versions = re.findall(r"<version>([^<]+)</version>", out or "")
+        if versions:
+            return [v.strip() for v in versions if v.strip()]
+    return []
+
+
+def _choose_valid_version(bad: str, available: list[str]) -> str | None:
+    """选最近的有效版本：≤目标的最高版本；若无（目标比所有都低）→ 最高可用版本。"""
+    if not available or bad in available:
+        return None
+    bk = _ver_key(bad)
+    le = [v for v in available if _ver_key(v) <= bk]
+    pick = max(le, key=_ver_key) if le else max(available, key=_ver_key)
+    return pick if pick != bad else None
+
+
+def _attempt_maven_version_repair(project_path: str, build_output: str, timeout: int) -> int:
+    """治本·通用：把 pom 里【不存在的依赖版本】确定性校正为最近有效版本，返回改动文件数。
+
+    安全自证：只在 build 已失败时触发；查仓库确认版本【确实不存在】才改；改完调用方重跑构建，
+    修错（改成另一个不可用版本）则重跑仍失败=绝不制造假通过。版本号同时出现在内联
+    <version> 与 <xxx.version> 属性（可能在父 pom）两处，均覆盖；仅在 version 标签行替换，
+    不碰同值的非版本标签。
+    """
+    missing = parse_missing_artifacts(build_output)
+    if not missing:
+        return 0
+    changed: set[str] = set()
+    for group, artifact, bad_ver in missing[:8]:
+        available = _fetch_maven_versions(group, artifact, project_path, timeout)
+        good_ver = _choose_valid_version(bad_ver, available)
+        if not good_ver:
+            continue  # 版本其实存在（别的网络问题）或查不到可用版本 → 不动，绝不误修
+        # 定位声明该 artifact 的 pom + 持有该版本号的属性 pom（可能是父 pom）
+        gcmd = (
+            f"grep -rl '<artifactId>{re.escape(artifact)}</artifactId>' --include=pom.xml . 2>/dev/null; "
+            f"grep -rlE '<[^>]*[Vv]ersion>{re.escape(bad_ver)}</[^>]*[Vv]ersion>' --include=pom.xml . 2>/dev/null"
+        )
+        _ec, gout, _err = _run_check_split(gcmd, project_path, timeout=30)
+        poms = sorted({line.strip() for line in (gout or "").splitlines() if line.strip()})
+        if not poms:
+            continue
+        bv = bad_ver.replace(".", r"\.")
+        for pom in poms:
+            # 只在含 'version' 的标签行替换 >bad<→>good<，避免误改同值的非版本标签
+            scmd = (
+                f"sed -i.bak -E '/[Vv]ersion>/ s#>{bv}<#>{good_ver}<#g' '{pom}' "
+                f"&& rm -f '{pom}.bak'"
+            )
+            ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
+            if ec2 == 0:
+                changed.add(pom)
+        logger.info(
+            "[L1.2.1·version-repair] %s:%s 版本 %s 不存在（仓库可用最高=%s）→ 校正为 %s（%d pom）",
+            group, artifact, bad_ver,
+            max(available, key=_ver_key) if available else "?", good_ver, len(poms),
+        )
+    return len(changed)
+
+
 def _tool_missing(out: str) -> bool:
     """命令输出是否表明【工具本身缺失】（→ 优雅跳过，不当作修复失败）。"""
     low = (out or "").lower()
@@ -265,6 +381,11 @@ def _attempt_build_repair(
             total += _attempt_import_repair(project_path, build_output, timeout)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
+        # Maven 依赖版本不存在（worker 凭空写错版本号）→ 校正到最近有效版本
+        try:
+            total += _attempt_maven_version_repair(project_path, build_output, timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
     adapters = (
         ("go", bool(go_files), lambda: _repair_go(project_path, go_files, timeout)),
         ("rust", has_rust_files, lambda: _repair_rust(project_path, timeout)),
