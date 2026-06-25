@@ -444,6 +444,13 @@ def _selftest_command(spec: EnvSpec) -> str | None:
 # ──────────────────────────────────────────────
 # warmup pom 生成（Maven 多模块：聚合外部依赖，排内部模块）
 # ──────────────────────────────────────────────
+# 专属镜像 warmup（对真项目 mvn compile）用的 settings：
+#   ① aliyun 镜像加速 central（快）
+#   ② maven-central-direct 直连仓库兜底——aliyun 公共仓缺失的第三方包（如
+#      com.warrenstrange:googleauth）由此拉取。治本关键：mirrorOf=central 只代理
+#      ID 为 "central" 的仓库，maven-central-direct 用不同 ID 不被 aliyun 拦截，
+#      使 warmup `mvn compile` 能拉满【真实项目】的完整依赖闭包（含 aliyun 缺的包），
+#      不再因 aliyun 404 + `|| true` 静默漏依赖、运行时 build fail。
 _MAVEN_SETTINGS = """<?xml version="1.0" encoding="UTF-8"?>
 <settings>
   <mirrors>
@@ -453,6 +460,21 @@ _MAVEN_SETTINGS = """<?xml version="1.0" encoding="UTF-8"?>
       <mirrorOf>central</mirrorOf>
     </mirror>
   </mirrors>
+  <profiles>
+    <profile>
+      <id>maven-central-fallback</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <repositories>
+        <repository>
+          <id>maven-central-direct</id>
+          <name>Maven Central Direct</name>
+          <url>https://repo1.maven.org/maven2</url>
+          <releases><enabled>true</enabled><updatePolicy>never</updatePolicy></releases>
+          <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
 </settings>
 """
 
@@ -553,7 +575,8 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "6"  # v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像
+_BUILDER_VERSION = "7"  # v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像
+#                       v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像
 #                              （CubeEgress MITM 出网信任）+ --allow-internet-access。0.3.x 旧模板
 #                              snapshot 与 0.4.0 guest-image 不匹配(image version not eq)起不来，
 #                              bump 版本使 fingerprint 变化 → 旧模板自动失效、按 0.4.0 重建。
