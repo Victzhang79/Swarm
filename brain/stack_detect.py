@@ -131,6 +131,61 @@ def _read_text(path: str, limit: int = 20000) -> str:
         return ""
 
 
+# ── 基建符号锚点：worker 常按训练惯性臆造的【基础设施类】概念 → 真实存在性钉死 ──
+# 治本场景：本地模型实现新功能时引用框架"标准类"（如新版 RuoYi 的 RedisCache），但当前
+# 项目变体根本没有该类（经典 Shiro 变体用 CacheUtils/EhCache）→ `cannot find symbol`/
+# `package X does not exist` → 确定性 import 修复查无权威前缀（类真不存在）→ worker 反复
+# 重写同一臆造类撞迭代上限死循环。解法：扫项目真实存在的基建类，钉进栈画像喂 design+worker。
+# 每个概念用【类名(=文件名)】匹配，记录其真实 FQN（包名大小写敏感，故不用 _read_text 小写版）。
+_INFRA_CONCEPTS: tuple[tuple[str, "callable"], ...] = (
+    ("缓存", lambda n: "cache" in n.lower()),                       # CacheUtils/CacheService/RedisCache
+    ("Redis/会话存储", lambda n: n.lower().startswith("redis")),     # RedisCache/RedisTemplate 封装
+    ("统一响应封装", lambda n: n in (
+        "AjaxResult", "R", "Result", "ApiResult", "ResponseResult", "RestResult", "ResultData")),
+    ("基础实体基类", lambda n: n in ("BaseEntity", "BaseDO", "BaseDomain", "BaseModel")),
+    ("鉴权/安全工具", lambda n: n in (
+        "SecurityUtils", "ShiroUtils", "TokenService", "SecurityContextHolder", "LoginUser", "AuthUtils")),
+)
+
+
+def _is_infra_classname(name: str) -> bool:
+    """类名（=文件名去 .java）是否命中任一基建概念。"""
+    return any(match(name) for _label, match in _INFRA_CONCEPTS)
+
+
+def _detect_infra_symbols(infra_class_paths: list[str]) -> dict[str, list[str]]:
+    """扫基建类文件 → {概念: [真实FQN,...]}。供 format_stack_for_prompt 钉死给 design+worker。
+
+    包名大小写敏感（worker import 要原样），故用独立 case-preserving 读取，不复用 _read_text。
+    每概念封顶 6 个去重 FQN，防噪声/超长 prefill。
+    """
+    import re as _re
+    by_concept: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    pkg_re = _re.compile(r"^\s*package\s+([\w.]+)\s*;", _re.MULTILINE)
+    for path in infra_class_paths[:200]:
+        cls = os.path.basename(path)[:-5]  # 去 .java
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                head = f.read(2000)  # package 在文件头
+        except OSError:
+            continue
+        m = pkg_re.search(head)
+        if not m:
+            continue
+        fqn = f"{m.group(1)}.{cls}"
+        if fqn in seen:
+            continue
+        seen.add(fqn)
+        for label, match in _INFRA_CONCEPTS:
+            if match(cls):
+                lst = by_concept.setdefault(label, [])
+                if len(lst) < 6:
+                    lst.append(fqn)
+                break
+    return by_concept
+
+
 def _detect_jvm_facts(
     project_path: str, manifest_texts: dict[str, str], java_sample_paths: list[str]
 ) -> dict | None:
@@ -221,6 +276,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     has_vite = False
     frontend_proj_dirs: list[str] = []
     java_sample_paths: list[str] = []  # 采样 .java 路径（判 javax/jakarta 命名空间用）
+    infra_class_paths: list[str] = []  # 基建类 .java 路径（钉死真实可用符号，治本臆造类）
     dir_count = 0
 
     for root, dirs, files in os.walk(project_path):
@@ -240,6 +296,10 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             if ext == ".java" and len(java_sample_paths) < 120:
                 if "src/main/java" in (rel.replace(os.sep, "/") + "/"):
                     java_sample_paths.append(os.path.join(root, f))
+            # 顺带收集【基建类】.java 路径（类名=文件名匹配基建概念）供 _detect_infra_symbols
+            # 钉死真实可用符号——治本 worker 臆造不存在的框架类（如 RedisCache）。封顶防大仓拖慢。
+            if ext == ".java" and len(infra_class_paths) < 200 and _is_infra_classname(f[:-5]):
+                infra_class_paths.append(os.path.join(root, f))
             low = f.lower()
             if f in _MANIFEST_BACKEND or f.endswith(".csproj"):
                 manifests.append(os.path.join(rel, f) if rel else f)
@@ -360,6 +420,13 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     needs_adj = confidence < 0.65 or (has_spa and has_server_tmpl)
 
     # ── JVM 系专属事实：jakarta/javax 命名空间 + Boot/Java 版本（worker 写对 import 的硬前提）──
+    infra_symbols = _detect_infra_symbols(infra_class_paths)
+    if infra_symbols:
+        evidence.append(
+            "基建符号锚点（真实存在的基础设施类）：" + "；".join(
+                f"{k}={','.join(v)}" for k, v in infra_symbols.items()
+            )[:300]
+        )
     jvm = _detect_jvm_facts(project_path, manifest_texts, java_sample_paths)
     if jvm and jvm.get("servlet_namespace"):
         evidence.append(
@@ -374,6 +441,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         "backend": (f"{backend_fw} ({backend_lang})" if backend_fw else backend_lang) or "未判明",
         "build": build_tool or "未判明",
         "jvm": jvm or {},
+        "infra_symbols": infra_symbols,
         "confidence": round(confidence, 2),
         "evidence": evidence,
         "signals": {
@@ -477,6 +545,19 @@ def format_stack_for_prompt(profile: dict | None) -> str:
             f"`{ns}.servlet.http.HttpServletRequest`、`{ns}.persistence.*`、`{ns}.validation.*`、"
             f"`{ns}.annotation.Resource`）；【严禁】写 `{other}.*` 包名——本项目 classpath 没有它，"
             f"会直接 `package {other}.servlet does not exist` 编译失败。新建模块 pom 也按此栈继承依赖。"
+        )
+    infra = profile.get("infra_symbols") or {}
+    if infra:
+        lines.append(
+            "- 【基建符号·硬约束】本项目真实存在的基础设施类（按概念列真实 FQN，用这些、原样 import）："
+        )
+        for concept, fqns in infra.items():
+            lines.append(f"  · {concept}：{'、'.join(fqns)}")
+        lines.append(
+            "  ⚠️ 实现新功能需要缓存/响应/鉴权/基类等基础设施时，【必须】复用上面列出的本项目真实类；"
+            "【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）——"
+            "classpath 没有就 `cannot find symbol`/`package 不存在` 编译失败、死循环。需要的类不在列表里时，"
+            "先在项目里 grep 确认它真实存在再 import，绝不臆造。"
         )
     kb_hints = profile.get("kb_stack_hints") or []
     if kb_hints:

@@ -172,3 +172,58 @@ def test_unrelated_issue_not_flagged():
 
 def test_empty_issue_not_flagged():
     assert _is_stack_mismatch_issue({}) is False
+
+
+# ── 基建符号锚点：钉死真实可用基建类，治本 worker 臆造不存在的框架标准类（如 RedisCache）──
+def test_infra_symbols_scans_real_cache_class(tmp_path):
+    """扫到项目真实存在的缓存/响应/鉴权基建类，记录真实 FQN。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project><dependency>spring-boot-starter</dependency></project>")
+    _mk(t, "src/main/java/com/ruoyi/common/utils/CacheUtils.java",
+        "package com.ruoyi.common.utils;\npublic class CacheUtils {}")
+    _mk(t, "src/main/java/com/ruoyi/common/core/domain/AjaxResult.java",
+        "package com.ruoyi.common.core.domain;\npublic class AjaxResult {}")
+    _mk(t, "src/main/java/com/ruoyi/common/utils/ShiroUtils.java",
+        "package com.ruoyi.common.utils;\npublic class ShiroUtils {}")
+    p = detect_stack_deterministic(t)
+    infra = p.get("infra_symbols", {})
+    allf = [f for v in infra.values() for f in v]
+    assert "com.ruoyi.common.utils.CacheUtils" in allf
+    assert "com.ruoyi.common.core.domain.AjaxResult" in allf
+    assert "com.ruoyi.common.utils.ShiroUtils" in allf
+    # 臆造的 RedisCache 项目没有 → 不应出现
+    assert not any("RedisCache" in f for f in allf)
+
+
+def test_infra_symbols_rendered_in_prompt(tmp_path):
+    """基建符号渲染进栈画像，含'禁止臆造'硬约束。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project>x</project>")
+    _mk(t, "src/main/java/com/x/CacheUtils.java", "package com.x;\nclass CacheUtils{}")
+    p = detect_stack_deterministic(t)
+    fp = format_stack_for_prompt(p)
+    assert "基建符号" in fp
+    assert "com.x.CacheUtils" in fp
+    assert "臆造" in fp  # 硬约束警告在
+
+
+def test_infra_symbols_empty_when_no_infra(tmp_path):
+    """无基建类的项目 → infra_symbols 为空，不渲染该段（不污染）。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project>x</project>")
+    _mk(t, "src/main/java/com/x/SomeRandomController.java", "package com.x;\nclass SomeRandomController{}")
+    p = detect_stack_deterministic(t)
+    assert p.get("infra_symbols", {}) == {}
+    fp = format_stack_for_prompt(p)
+    assert "基建符号" not in fp
+
+
+def test_is_infra_classname_matching():
+    from swarm.brain.stack_detect import _is_infra_classname
+    assert _is_infra_classname("CacheUtils") is True
+    assert _is_infra_classname("RedisCache") is True
+    assert _is_infra_classname("AjaxResult") is True
+    assert _is_infra_classname("BaseEntity") is True
+    assert _is_infra_classname("ShiroUtils") is True
+    assert _is_infra_classname("AlarmController") is False
+    assert _is_infra_classname("UserServiceImpl") is False

@@ -735,6 +735,11 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
  "backend":"后端栈(如 Spring Boot (java) / Django (python))","build":"构建工具",
  "confidence":0.0-1.0,"reason":"判定依据(引用证据)"}"""
 
+# 栈画像 schema 版本：探测逻辑/画像字段变更时递增，使按指纹缓存的旧画像失效重探。
+# 仅指纹（repo 内容）相同不足以复用——画像结构变了（如新增 infra_symbols），旧缓存缺字段。
+# v2: 新增 infra_symbols（基建符号锚点，治本 worker 臆造不存在的框架类如 RedisCache）。
+_STACK_SCHEMA_VERSION = 2
+
 
 async def detect_stack(state: BrainState) -> dict:
     """技术栈/架构识别（plan 前预处理）：磁盘事实为准，确定性优先、模型仅兜底、按 repo 指纹缓存 DB。
@@ -766,9 +771,11 @@ async def detect_stack(state: BrainState) -> dict:
     try:
         proj_rec = _pstore.get_project(pid) if pid else None
         cached = (proj_rec or {}).get("config", {}).get("project_stack") if proj_rec else None
-        if isinstance(cached, dict) and cached.get("fingerprint") and cached["fingerprint"] == fingerprint:
-            logger.info("[DETECT_STACK] 命中缓存（指纹 %s）：前端=%s 后端=%s",
-                        fingerprint, cached.get("frontend"), cached.get("backend"))
+        if (isinstance(cached, dict) and cached.get("fingerprint")
+                and cached["fingerprint"] == fingerprint
+                and cached.get("schema_version") == _STACK_SCHEMA_VERSION):
+            logger.info("[DETECT_STACK] 命中缓存（指纹 %s, schema v%s）：前端=%s 后端=%s",
+                        fingerprint, _STACK_SCHEMA_VERSION, cached.get("frontend"), cached.get("backend"))
             return {"project_stack": cached}
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DETECT_STACK] 读缓存失败（不致命，继续探测）: %s", exc)
@@ -816,6 +823,7 @@ async def detect_stack(state: BrainState) -> dict:
             logger.warning("[DETECT_STACK] 模型裁决失败，沿用确定性结果: %s", exc)
 
     profile["fingerprint"] = fingerprint
+    profile["schema_version"] = _STACK_SCHEMA_VERSION
 
     # ④ 落 projects.config 按指纹缓存（合并写，不clobber其它config）
     try:
