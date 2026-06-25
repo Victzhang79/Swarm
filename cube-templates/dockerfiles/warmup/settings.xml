@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Maven 构建期用 Aliyun 镜像加速依赖下载（固化进镜像）。
-     运行期沙箱已有 ~/.m2 缓存，命中即不再走网络；未命中仍走此镜像。 -->
+     运行期沙箱已有 ~/.m2 缓存，命中即不再走网络；未命中走以下顺序：
+       ① aliyun（快，但部分第三方包如 googleauth 不在 aliyun 仓库）
+       ② maven-central-direct（直连 Maven Central，兜底 aliyun 缺失的包）
+     mirrorOf=central 只代理 ID 为 "central" 的仓库；"maven-central-direct"
+     使用不同 ID，Maven 不会对它应用 aliyun 镜像，可直接访问 repo1.maven.org。 -->
 <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
@@ -12,4 +16,29 @@
             <mirrorOf>central</mirrorOf>
         </mirror>
     </mirrors>
+
+    <profiles>
+        <profile>
+            <id>maven-central-fallback</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <repositories>
+                <!-- 直连 Maven Central（ID 非 "central"，不被 aliyun 镜像拦截）：
+                     aliyun 找不到的包（如 googleauth）由此仓库兜底。 -->
+                <repository>
+                    <id>maven-central-direct</id>
+                    <name>Maven Central Direct</name>
+                    <url>https://repo1.maven.org/maven2</url>
+                    <releases>
+                        <enabled>true</enabled>
+                        <updatePolicy>never</updatePolicy>
+                    </releases>
+                    <snapshots>
+                        <enabled>false</enabled>
+                    </snapshots>
+                </repository>
+            </repositories>
+        </profile>
+    </profiles>
 </settings>

@@ -173,6 +173,12 @@
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>${springdoc.version}</version>
         </dependency>
+        <!-- aliyun 镜像缺失，需从 Maven Central 预热（settings.xml 已配 maven-central-direct 兜底）-->
+        <dependency>
+            <groupId>com.warrenstrange</groupId>
+            <artifactId>googleauth</artifactId>
+            <version>1.5.2</version>
+        </dependency>
     </dependencies>
 
     <build>
