@@ -54,6 +54,48 @@ _PROJECT_STACK_CACHE: dict[str, dict | None] = {}
 _FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|errors)\b")
 
 
+class _ProjectGitFlock:
+    """per-project 文件锁，串行化同一 project_path 的 git 临界操作（reset / add -N + diff）。
+
+    TD2606-B5/C5/M5：dispatch 用 asyncio.gather 并发跑 worker，全部共享同一本地 git 工作树/索引。
+    原 flock 只包 _reset_scope_to_head 的 git checkout；`git add -N`（改共享 index）+ `git diff`
+    未锁 → 并发 worker 的 intent-to-add 泄漏进彼此 diff、reset 与 diff 互踩（脏 diff/假通/重试死循环）。
+    此锁把所有 git 临界操作串行化（操作短暂；沙箱内 CODING/编译不持锁、仍并行）。
+    fcntl 不可用（如 Windows）/打开失败时降级无锁（与旧行为一致，不阻断）。
+    """
+
+    def __init__(self, local_root: object) -> None:
+        self._lock_f = None
+        self._fcntl = None
+        try:
+            import fcntl
+            import hashlib
+            import tempfile as _tf
+            proj_hash = hashlib.sha1(str(local_root).encode()).hexdigest()[:16]
+            lock_path = Path(_tf.gettempdir()) / f"swarm_git_{proj_hash}.lock"
+            self._lock_f = open(lock_path, "w")  # noqa: SIM115
+            self._fcntl = fcntl
+        except Exception:  # noqa: BLE001
+            self._lock_f = None
+
+    def __enter__(self) -> "_ProjectGitFlock":
+        if self._lock_f is not None and self._fcntl is not None:
+            try:
+                self._fcntl.flock(self._lock_f, self._fcntl.LOCK_EX)
+            except Exception:  # noqa: BLE001
+                pass
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        if self._lock_f is not None and self._fcntl is not None:
+            try:
+                self._fcntl.flock(self._lock_f, self._fcntl.LOCK_UN)
+                self._lock_f.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+
 # Bug-4（task 0f93f1fc 实证）：模型拒答/截断标记。worker agent 主回复命中这些 =
 # 它根本没真正完成工作（停滞/截断/算力耗尽），产出不可信。此前这类回复仅让 LLM 自报
 # LOCATING 阶段步数硬上限（recursion_limit 计节点访问，agent+tool 各 1，故 ~20 ≈ 10 think-act
@@ -1315,27 +1357,14 @@ class WorkerExecutor:
         if not tracked:
             return 0
 
-        # 锁文件放系统临时目录（按 project_path 派生稳定名），不污染目标 workdir
-        # （避免 .swarm_reset.lock 出现在用户项目的 git status）。
-        import hashlib
-        import tempfile as _tf
-        _proj_hash = hashlib.sha1(str(local_root).encode()).hexdigest()[:16]
-        lock_path = Path(_tf.gettempdir()) / f"swarm_reset_{_proj_hash}.lock"
+        # TD2606-B5/C5：reset 与 diff/add-N 共用同一 per-project 锁（_ProjectGitFlock），
+        # 串行化所有 git 临界操作，杜绝并发 worker 在共享工作树/索引上互踩。
         try:
-            import fcntl
-            lock_f = open(lock_path, "w")
-        except Exception:  # noqa: BLE001
-            lock_f = None
-        try:
-            if lock_f is not None:
-                try:
-                    fcntl.flock(lock_f, fcntl.LOCK_EX)
-                except Exception:  # noqa: BLE001
-                    pass
-            r = subprocess.run(
-                ["git", "checkout", "HEAD", "--", *tracked],
-                cwd=str(local_root), capture_output=True, text=True, timeout=30,
-            )
+            with _ProjectGitFlock(local_root):
+                r = subprocess.run(
+                    ["git", "checkout", "HEAD", "--", *tracked],
+                    cwd=str(local_root), capture_output=True, text=True, timeout=30,
+                )
             if r.returncode == 0:
                 self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到 HEAD（防跨轮脏叠加）")
                 return len(tracked)
@@ -1344,13 +1373,6 @@ class WorkerExecutor:
         except Exception as exc:  # noqa: BLE001
             self._log(f"workspace reset 跳过（异常）: {exc}")
             return 0
-        finally:
-            if lock_f is not None:
-                try:
-                    fcntl.flock(lock_f, fcntl.LOCK_UN)
-                    lock_f.close()
-                except Exception:  # noqa: BLE001
-                    pass
 
     async def _sync_to_sandbox(self, reason: str) -> None:
         """精准上传：只把子任务 scope 内的文件推送到沙箱 /workspace。
@@ -1814,9 +1836,17 @@ class WorkerExecutor:
                                 capture_output=True, text=True)
                     if r.returncode != 0:
                         untracked.append(f)
-            if untracked:
-                _sp.run(["git", "-C", root, "add", "-N", *untracked],
-                        capture_output=True, text=True, timeout=30)
+            # TD2606-B5/C5/M5：add -N（改共享 index）+ diff 必须在同一 per-project 锁内原子完成，
+            # 否则并发 worker 的 intent-to-add 互相泄漏进对方 diff、与他人 reset/diff 互踩。
+            # 锁内只放这两条短命 git 命令；ls-files 探测（只读）与 diff 结果处理在锁外。
+            with _ProjectGitFlock(root):
+                if untracked:
+                    _sp.run(["git", "-C", root, "add", "-N", *untracked],
+                            capture_output=True, text=True, timeout=30)
+                r = _sp.run(
+                    ["git", "-C", root, "diff", "--no-color", "--", *targets],
+                    capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
+                )
 
             # 生成 diff：HEAD 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
             # --no-color 防 ANSI；-- <files> 限定 scope，不带入无关变更。
@@ -1829,10 +1859,7 @@ class WorkerExecutor:
             # context 行尾 \r\n 静默转成 \n → diff 丢失 \r → git apply 回 CRLF 的 HEAD 时
             # context 字节不匹配（实测 --ignore-whitespace/--3way 都救不了）。bytes 模式
             # 保留 \r，产出与 CRLF 源文件完全同源的 diff，git apply 直接成功（无需任何忽略参数）。
-            r = _sp.run(
-                ["git", "-C", root, "diff", "--no-color", "--", *targets],
-                capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
-            )
+            # （diff 已在上方 _ProjectGitFlock 锁内执行，结果即 r。）
             if r.returncode != 0:
                 _err = (r.stderr or b"").decode("utf-8", "replace")
                 self._log(f"git diff 失败(rc={r.returncode})，回退 difflib: {_err[:120]}")
