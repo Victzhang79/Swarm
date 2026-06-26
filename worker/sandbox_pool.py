@@ -542,6 +542,27 @@ def get_sandbox_pool() -> HotSandboxPool:
     return _pool_singleton
 
 
+def reset_sandbox_pool() -> None:
+    """重置进程级热池单例：停 reaper + drain 已池化沙箱 + 清单例。
+
+    TD2606-B15：reset_sandbox_manager（配置 reload/测试）只清了 manager 单例，热池单例仍持有
+    【旧的死 manager】引用且 borrowed 计数不归零 → 之后每次 acquire 都退化成 throwaway 临时
+    沙箱、持续 churn。必须连带重置热池。调用方须保证 manager 此时仍可用（drain 要靠它 kill）。
+    """
+    global _pool_singleton
+    with _pool_lock:
+        if _pool_singleton is not None:
+            try:
+                _pool_singleton.stop_reaper()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _pool_singleton.drain()
+            except Exception:  # noqa: BLE001
+                pass
+            _pool_singleton = None
+
+
 def pool_enabled() -> bool:
     """热池是否启用。优先读 SandboxConfig.pool_enabled（来自 SWARM_SANDBOX_POOL_ENABLED），
     config 不可用时回退直接读环境变量（向后兼容）。"""
