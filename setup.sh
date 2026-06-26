@@ -440,6 +440,8 @@ SWARM_WORKER_MAX_FIX_ROUNDS=3
 # SWARM_WORKER_L1_LINT_GATE=true
 # SWARM_WORKER_L1_SELF_REVIEW=true
 # SWARM_WORKER_COMMAND_WHITELIST=mvn compile,mvn test,npm build,npm test,python -m py_compile,python -m pytest,tsc --noEmit,eslint,javac
+# Brain 契约分模块生成（慢 brain 模型友好，默认已留足空间）
+# SWARM_CONTRACT_CONCURRENCY=2  # SWARM_CONTRACT_STAGE_TIMEOUT=600  # SWARM_CONTRACT_MAX_ATTEMPTS=3
 
 # 任务自动化（/api/demo 默认 auto_accept；任务主链路默认等待人工审核）
 # SWARM_AUTO_ACCEPT=true
