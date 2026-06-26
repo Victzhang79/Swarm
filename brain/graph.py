@@ -190,6 +190,13 @@ def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
         logger.info("[ROUTE] VALIDATE → CONFIRM (ultra 复杂度)")
         return "confirm"
 
+    # TD2606-A5 补漏：规划 LLM 失败产出的空 scope 兜底假计划【结构上】合法(plan_valid=True)，
+    # 非 ULTRA 时旧逻辑直接 validate→dispatch，绕过 confirm 里的 can_auto_accept_plan 拦截 →
+    # 空 diff 假 DONE。这里强制走 confirm，让 fail-fast 闸门(auto→REJECT+escalate / 人工→interrupt)生效。
+    if state.get("plan_generation_failed"):
+        logger.warning("[ROUTE] VALIDATE → CONFIRM (规划生成失败的兜底假计划，须人工/escalate，A5)")
+        return "confirm"
+
     logger.info("[ROUTE] VALIDATE → DISPATCH")
     return "dispatch"
 

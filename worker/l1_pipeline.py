@@ -1502,6 +1502,14 @@ def run_l1_pipeline(
         if t_ec == 124:
             details["test_output"] = "test timeout"
         if not test_ok:
+            # TD2606：测试命中 infra 瞬时故障(网络/工具/资源) → BLOCKED 转 transient 重试，不误判
+            # capability(错换模型)。与 L1.2.1 build gate 对称。timeout(124)按真失败处理(不放过)。
+            if t_ec != 124 and _is_infra_failure(t_out):
+                details["l1_3_test_ok"] = None
+                details["test_blocked"] = test_cmd
+                details["pipeline_blocked"] = "test_infra_failure"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                return True, details
             return False, details
 
     # ── L1.3.5 harness 验收命令（verify_commands）——
@@ -1519,6 +1527,11 @@ def run_l1_pipeline(
             })
             if not ok:
                 details["verify_commands"] = verify_results
+                # TD2606：验收命令命中 infra 瞬时故障 → BLOCKED 转 transient 重试（与 build/test 对称）。
+                if v_ec != 124 and _is_infra_failure(v_out):
+                    details["pipeline_blocked"] = "verify_infra_failure"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    return True, details
                 details["verify_failed"] = vc
                 return False, details
         details["verify_commands"] = verify_results

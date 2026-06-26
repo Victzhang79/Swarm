@@ -13,21 +13,33 @@
 > 全树跨切面。**四视角独立收敛到同一根因。** ✅ = 已亲自复核原文；其余为子审计报告，
 > 落地前需在 plan 阶段逐条复核 file:line。ID 形如 TD2606-X# 供 plan/commit 引用。
 
-> ### 清偿状态（2026-06-26，Waves 0–4，11 commit，全程 1531 passed）
-> **已修复 (FIXED)**：A1/A2/A3/A4/A5/A6/A7/A8（fail-closed 根因+编排 CRITICAL）·
-> B1（schema 边界）· B3 · B5/C5/M5（并发 git 锁）· B11 · B12 · B14 · B15 · B17 · B18 ·
+> ### 清偿状态（2026-06-26，Waves 0–4 + 遗漏复查，13 commit，全程 1533 passed）
+> 经三视角独立遗漏复查（审 aa0f8c9..HEAD），下列标签已据复查结论校正（含 1 处自引入损坏已修）。
+>
+> **已修复 (FIXED)**：A1–A8 · B1 · B3 · B5/C5/M5 · B11 · B12 · B14 · B15 · B17 · B18 ·
 > C1 · C2 · C6 · C8 · C14 · C16。
-> **核查后判定已充分处理 (ALREADY-OK)**：B19（无条件 WARN+REQUIRE opt-in）·
-> B20（detect_stack fingerprint 缓存+重探）· C3（已在 nodes/__init__.py:1065 调用）·
-> C10（degraded_reasons 已是 reducer 一等字段+透传）· C13（think/fence/逐对象 salvage 已鲁棒）。
-> **留待专门设计/大改 (DEFERRED — 需careful design，避免半改回归)**：
-> B8（L2 失败定位——需可靠 file→subtask 归因 + 恢复策略重构）·
-> B16（7 个 store 走连接池——大面积机械重构，现状可用仅并发下低效，属scale优化非正确性）·
-> C4（clean_workspace 抹烤源——依赖 pool+镜像+同步交互，需 image-type 标记）·
-> C7（pool 临时沙箱异常泄漏）· C9（fix 轮本地↔沙箱同步）。
-> **方法固有近似/低危 latent (WON'T-FIX 记录在案)**：B13（失败文本分类）·
-> C11（norms LLM 无法离线证伪）· C12（probe 下界）· C15（regex 符号抽取）·
-> C17（ContextVar 当前 explicit-arg 已安全）· C18（co-occurrence 排序噪声）。
+> **遗漏复查追加修复 (FOLLOW-UP FIXED)**：
+> ① B18 自引入 P0：revision 误把 `normalize_plan_scopes`/`resolve_plan_conflicts` 返回值(bool/dict)
+> 赋回 plan → state["plan"] 损坏成 dict。改为只调 resolve_plan_conflicts(原地变更)弃返回值 + 加测试。
+> ② A5 旁路：plan_generation_failed 闸门只在 confirm，非 ULTRA 走 validate→dispatch 绕过 →
+> after_validate 补 plan_generation_failed→confirm。③ B1：analyze 的 key_risks=list[dict] 会触
+> ValidationError 静默降级 MEDIUM → _coerce_risks 逐元素转字符串强容忍。④ worker：test/verify
+> 命中 infra 故障改 BLOCKED(转 transient，与 build gate 对称，原误判 capability)。
+> **核查后判定已充分处理 (ALREADY-OK，校正后)**：C3（run_security_scan 在 AUDIT 意图任务真触发；
+> 普通功能任务仍无安全闸门——可接受非死代码）· C13（think/fence/逐对象 salvage 真鲁棒）。
+> **部分处理 / 标签校正 (PARTIAL — 原 ALREADY-OK 偏乐观)**：
+> B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in）·
+> B20（detect_stack 端已 fingerprint 重探，但 worker `_resolve_project_stack` 仍盲信缓存——worker 端未修）·
+> C10（degraded_reasons 是 reducer 一等字段，但仅 ultra confirm 读；deliver/can_auto_accept_delivery
+> **不读** → 降级交付仍可静默 auto-ACCEPT，需专门决定 block vs 仅可见）。
+> **留待专门设计/大改 (DEFERRED)**：B8（L2 file→subtask 归因+恢复重构）·
+> B16（连接池：热路径已用池，真问题是长生命周期 store 的 `self._conn=await connect()` **无幂等守卫**
+> → 双连接泄漏，宜加 `if self._conn: return` 守卫，非"纯 scale"）· C4（clean_workspace 需 image-type 标记）·
+> C7（pool 临时沙箱窄窗泄漏，~5 行 try/finally 可补）· C9（fix 轮本地↔沙箱同步需 per-file provenance）。
+> **方法固有近似/低危 latent (WON'T-FIX，理由校正)**：B13 · C12 · C15 · C18 ·
+> C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
+> C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——
+> query_knowledge_base 只从 ContextVar 读 project_id，勿移除该 ContextVar）。
 
 ### §0 根因主线（THE root cause）
 

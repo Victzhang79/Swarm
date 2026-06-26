@@ -2632,13 +2632,14 @@ async def revision(state: BrainState) -> dict:
         )
 
     # TD2606-B18：修订计划过去直接 dispatch，绕过 plan 路径的 scope 归一/冲突消解 → 修订子任务
-    # 的写权可能与保留的兄弟成果冲突。补做归一+冲突消解（与 plan 路径同源），不再裸派发。
+    # 的写权可能与保留的兄弟成果冲突。补做冲突消解（与 plan 路径同源）。
+    # ⚠️ resolve_plan_conflicts 【原地变更】plan 并返回计数 dict（内部 step3 已含 normalize_plan_scopes）；
+    # 绝不能把返回值赋回 updated_plan（否则 plan 被替换成 dict，state["plan"] 损坏）。
     try:
-        from swarm.brain.contract_utils import normalize_plan_scopes, resolve_plan_conflicts
-        updated_plan = normalize_plan_scopes(updated_plan)
-        updated_plan = resolve_plan_conflicts(updated_plan)
+        from swarm.brain.contract_utils import resolve_plan_conflicts
+        resolve_plan_conflicts(updated_plan)  # 原地变更；返回值(计数 dict)丢弃
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[REVISION] 计划归一/冲突消解跳过(非致命): %s", exc)
+        logger.warning("[REVISION] 计划冲突消解跳过(非致命): %s", exc)
 
     # 保留已完成子任务的产出 —— 修订只新增一个 rev-* 子任务，不应丢弃此前所有
     # Worker 成果（否则 merge 阶段会丢失未被修订的文件 diff）。仅派发新子任务。

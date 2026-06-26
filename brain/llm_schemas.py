@@ -39,12 +39,16 @@ class ComplexityAssessmentResponse(BaseModel):
     @field_validator("key_risks", mode="before")
     @classmethod
     def _coerce_risks(cls, v):
-        # 装饰性字段容忍：字符串→单元素列表，其它非列表→空列表（不因此拒整条响应）。
+        # 装饰性字段【强容忍】：绝不因它的形状拒掉整条响应（否则 analyze 会把本判 ultra 的任务
+        # 静默降级 MEDIUM——key_risks 是 list[dict] 时 list[str] 校验会失败）。
+        # 字符串→单元素；列表→逐元素转字符串（兼容 list[dict]/混合）；其它→空。
         if v is None:
             return []
         if isinstance(v, str):
             return [v]
-        return v if isinstance(v, list) else []
+        if isinstance(v, list):
+            return [x if isinstance(x, str) else str(x) for x in v]
+        return []
 
 
 class StackAdjudicateResponse(BaseModel):
