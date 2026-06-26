@@ -106,7 +106,13 @@ def create_worker_agent(
     # 获取 Worker LLM
     router = ModelRouter()
     if model_name:
-        llm = router.get_model_by_name(model_name, temperature=0.2)
+        # 治本：主力并行轮转 override 模型【必须】带该难度 fallback 链。
+        # 此前误用 get_model_by_name（裸模型、无 fallback）→ override 模型不可用时
+        # （如端点中途下线返回 400 Model not found）无链可切，worker 直接抛异常死，
+        # 连累一簇子任务零进展 → 看守判死循环取消整任务（实测 E2E 996 第三轮）。
+        # 改用 get_llm_by_name（专为轮转 override 设计，复用该难度 fallback 链、排除自身）。
+        _diff = subtask.difficulty.value if hasattr(subtask.difficulty, "value") else str(subtask.difficulty)
+        llm = router.get_llm_by_name(model_name, difficulty=_diff)
     else:
         llm = router.get_worker_llm(strategy=model_strategy)
 

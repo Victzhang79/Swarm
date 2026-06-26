@@ -45,3 +45,40 @@ def test_round_robin_index_logic():
     # 4 个子任务 → 两个模型各 2 个（均衡）
     assert assigned.count(pool[0]) == 2
     assert assigned.count(pool[1]) == 2
+
+
+def test_override_model_carries_fallback_chain(monkeypatch):
+    """治本：主力轮转 override(model_name 已设)必须走 get_llm_by_name(带难度 fallback 链)，
+    而非 get_model_by_name(裸模型无 fallback)。否则 override 模型不可用(400 Model not found)
+    时无链可切→worker 直接死→看守判死循环取消整任务(E2E 996 第三轮实测)。"""
+    from unittest.mock import MagicMock
+    import swarm.worker.agent as wa
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty
+
+    calls = {"get_llm_by_name": None, "get_model_by_name": None}
+
+    class _FakeRouter:
+        def get_llm_by_name(self, model_name, difficulty="medium"):
+            calls["get_llm_by_name"] = (model_name, difficulty)
+            return MagicMock(name="llm_with_fallbacks")
+
+        def get_model_by_name(self, model_name, temperature=0.2):
+            calls["get_model_by_name"] = (model_name, temperature)
+            return MagicMock(name="bare_llm")
+
+        def get_worker_llm(self, strategy="cost_optimized"):
+            return MagicMock(name="default_llm")
+
+    monkeypatch.setattr(wa, "ModelRouter", _FakeRouter)
+    monkeypatch.setattr(wa, "create_react_agent", lambda **kw: MagicMock(name="agent"))
+    monkeypatch.setattr(wa, "_get_worker_tools", lambda: [])
+    monkeypatch.setattr(wa, "build_worker_prompt", lambda **kw: "SYS")
+
+    st = SubTask(id="st-1", description="d", difficulty=SubTaskDifficulty.COMPLEX,
+                 scope=FileScope(writable=["a.java"], readable=["a.java"]))
+    wa.create_worker_agent(subtask=st, scope=st.scope, model_name="Qwopus3.6-27B-v2-NVFP4")
+
+    # 必须走带 fallback 的 get_llm_by_name，且难度透传正确
+    assert calls["get_llm_by_name"] == ("Qwopus3.6-27B-v2-NVFP4", "complex"), calls
+    # 绝不走裸模型 get_model_by_name（那是 bug 源）
+    assert calls["get_model_by_name"] is None, calls
