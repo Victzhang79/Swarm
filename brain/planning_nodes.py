@@ -728,7 +728,12 @@ async def assess(state: BrainState) -> dict:
         return {"assessed_complexity": comp, "complexity": comp}
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ASSESS] LLM 失败，沿用 analyze 初判: %s", exc)
-        return {"assessed_complexity": state.get("complexity", Complexity.MEDIUM)}
+        # TD2606-B3：ASSESS 失败时只能沿用 analyze 初判（无法重新定级），但打 degraded 标记让
+        # 交付/确认环节看得见"复杂度未经 ASSESS 校正"，不静默当作已校正（ASSESS 本职是纠正低估）。
+        return {
+            "assessed_complexity": state.get("complexity", Complexity.MEDIUM),
+            "degraded_reasons": list(state.get("degraded_reasons") or []) + ["assess_skipped_llm_failed"],
+        }
 
 
 # ══════════════════════════════════════════════

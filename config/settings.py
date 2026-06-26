@@ -747,4 +747,16 @@ def get_config() -> AppConfig:
 def reload_config() -> AppConfig:
     global _config
     _config = AppConfig()
+    # TD2606-C16：配置 reload 必须连带刷新依赖 .env 的下游 TTL 缓存（secret/sandbox/黑名单 store），
+    # 否则新 base_url 配旧 key、旧沙箱模板等不一致最长可持续到各自 TTL 过期（~30s）。
+    import importlib
+    for _mod_name in (
+        "swarm.config.secret_store",
+        "swarm.config.sandbox_store",
+        "swarm.config.command_blacklist_store",
+    ):
+        try:
+            importlib.import_module(_mod_name).invalidate_cache()
+        except Exception:  # noqa: BLE001 — 某 store 未加载/无缓存时不阻断 reload
+            pass
     return _config
