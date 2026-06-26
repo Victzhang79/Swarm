@@ -65,6 +65,7 @@ async def _test_learn_after_accept_writes_memory_async():
         "plan": None,
         "merged_diff": "diff content",
         "human_decision": "ACCEPT",
+        "l2_passed": True,  # TD2606-A7：真实成功信号，should_write_success 才放行 L6 写入
     }
 
     with patch("swarm.brain.nodes._get_brain_llm") as mock_llm:

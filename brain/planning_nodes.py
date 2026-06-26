@@ -28,6 +28,12 @@ from swarm.brain.nodes import (  # noqa: E402
     _get_brain_llm,
     _parse_json_from_llm,
 )
+from swarm.brain.nodes.shared import parse_and_validate  # noqa: E402
+from swarm.brain.llm_schemas import (  # noqa: E402
+    ComplexityAssessmentResponse,
+    StackAdjudicateResponse,
+    validate_file_plan,
+)
 
 # ── 配置常量（带默认，可被 env 覆盖）──
 MAX_CLARIFY_ROUNDS = 5          # Q1：自适应轮数封顶
@@ -688,11 +694,12 @@ async def assess(state: BrainState) -> dict:
             )},
         ])
         result = _parse_json_from_llm(resp.content)
-        comp_str = str(result.get("complexity", "medium")).lower()
-        comp = {
-            "simple": Complexity.SIMPLE, "medium": Complexity.MEDIUM,
-            "complex": Complexity.COMPLEX, "ultra": Complexity.ULTRA,
-        }.get(comp_str, Complexity.MEDIUM)
+        # Wave 1/TD2606-B1：复杂度走类型边界（result 保留供下游读取）。形状非法 → 显式降级 MEDIUM（不静默错形）。
+        try:
+            comp = ComplexityAssessmentResponse.model_validate(result).complexity
+        except Exception as _ve:  # noqa: BLE001
+            logger.warning("[ASSESS] 复杂度评估输出形状非法，显式降级 MEDIUM（不静默错形）: %s", str(_ve)[:120])
+            comp = Complexity.MEDIUM
         # 新建项目至少 complex（需技术方案）
         if greenfield and comp in (Complexity.SIMPLE, Complexity.MEDIUM):
             comp = Complexity.COMPLEX
@@ -807,14 +814,16 @@ async def detect_stack(state: BrainState) -> dict:
                 {"role": "user", "content": f"磁盘证据：\n{ev}\n\n确定性初判：{profile.get('frontend')} / "
                                             f"{profile.get('backend')}（置信 {profile.get('confidence')}）。请裁决。"},
             ])
-            adj = _parse_json_from_llm(resp.content)
-            if isinstance(adj, dict) and adj.get("frontend"):
+            # Wave 1/TD2606-B1：裁决响应走类型边界（confidence 强制 float，frontend 为载荷关键）。
+            # 形状非法 → 抛出 → 下方 except 沿用确定性结果（不静默吞错形裁决）。
+            adj = parse_and_validate(resp.content, StackAdjudicateResponse)
+            if adj.frontend:
                 profile.update({
-                    "frontend": adj.get("frontend", profile["frontend"]),
-                    "frontend_kind": adj.get("frontend_kind", profile["frontend_kind"]),
-                    "backend": adj.get("backend", profile["backend"]),
-                    "build": adj.get("build", profile["build"]),
-                    "confidence": float(adj.get("confidence", profile["confidence"]) or profile["confidence"]),
+                    "frontend": adj.frontend or profile["frontend"],
+                    "frontend_kind": adj.frontend_kind or profile["frontend_kind"],
+                    "backend": adj.backend or profile["backend"],
+                    "build": adj.build or profile["build"],
+                    "confidence": adj.confidence or profile["confidence"],
                     "source": "deterministic+model",
                 })
                 logger.info("[DETECT_STACK] 大模型裁决后：前端=%s 后端=%s 置信=%.2f",
@@ -1015,7 +1024,7 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     )
     if not modules:
         # 阶段1 没给模块 → 退回单次（小需求或 LLM 没按格式）
-        return stage1, stage1.get("file_plan", []) or [], fact_issues, contract
+        return stage1, validate_file_plan(stage1.get("file_plan", [])), fact_issues, contract
 
     # ── 阶段2：按模块并行产出 file_plan（每次短输出）──
     # P1-DEBT-12 修复（并行 + 双护栏）：
@@ -1061,12 +1070,12 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                         timeout=_STAGE2_MODULE_TIMEOUT,
                     )
                     r2 = _parse_json_from_llm(resp2.content)
-                    fp = r2.get("file_plan", []) if isinstance(r2, dict) else []
+                    # Wave 1/TD2606-B1：清洗 file_plan——丢弃无有效 path 的 malformed 项（不让其流向 dispatch），
+                    # 并按模块名补全缺失的 module 字段。
+                    fp = validate_file_plan(
+                        r2.get("file_plan", []) if isinstance(r2, dict) else [], module=mod_name)
                     if not fp:
-                        raise ValueError("file_plan 为空（模块未产出文件）")  # 空也算失败 → 触发重试
-                    for item in fp:
-                        if isinstance(item, dict) and not item.get("module"):
-                            item["module"] = mod_name
+                        raise ValueError("file_plan 为空或全为无效项（模块未产出有效文件）")  # 触发重试
                     logger.info(
                         "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs%s",
                         mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
@@ -1189,7 +1198,8 @@ async def tech_design(state: BrainState) -> dict:
             result = _parse_json_from_llm(resp.content)
             contract = result.pop("shared_contract", {}) if isinstance(result, dict) else {}
             fact_issues = result.get("fact_issues", []) if isinstance(result, dict) else []
-            file_plan = result.get("file_plan", []) if isinstance(result, dict) else []
+            # Wave 1/TD2606-B1：清洗 file_plan，丢弃无有效 path 的 malformed 项。
+            file_plan = validate_file_plan(result.get("file_plan", []) if isinstance(result, dict) else [])
 
         # ── 确定性路径校正（治本：用核验到的真实路径覆盖 LLM 猜的路径）──
         # bug(task 9bd1d5b5)：LLM file_plan 把已存在文件的路径猜错（monitor/→common/），

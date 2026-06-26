@@ -385,6 +385,25 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+class NotRunKind(str, Enum):
+    """L1 确定性验证「没跑出结论」时的原因分类（fail-closed 的类型边界）。
+
+    背景：L1 裁决器历史上把「验证没跑」（det_ok is None / 异常跳过 / 工具或清单缺失 /
+    infra 串匹配）一律退化为「信模型自报」，这是静默成功的总根。现在「没跑」必须带上
+    原因，裁决器据此 fail-closed：
+
+    - BENIGN：真的没东西可验证（空 diff + 无 harness + scope 不期望改动 = 合法 no-op）。
+      可保留 LLM 弱信号。
+    - BLOCKED：本应验证却跑不起来（pipeline 异常 / 构建工具或工程清单缺失 / 构建命中
+      infra 瞬时故障 / diff 抽取失败 / 非空 diff 却解析到 0 文件）。绝不当 PASS——映射为
+      transient 失败，走退避重试，耗尽才硬 FAIL。
+
+    缺失/未知一律按 BLOCKED 处理（fail-closed 默认）。
+    """
+    BENIGN = "benign"
+    BLOCKED = "blocked"
+
+
 class Severity(str, Enum):
     """安全发现严重度（与 CVSS 分级对齐）"""
     CRITICAL = "critical"

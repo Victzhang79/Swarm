@@ -35,6 +35,7 @@ from swarm.types import (
     Confidence,
     FileScope,
     KnowledgeContext,
+    NotRunKind,
     SubTask,
     SubTaskDifficulty,
     WorkerOutput,
@@ -134,7 +135,12 @@ def _trivial_llm_self_report_passed(combined: str) -> bool:
 #   - empty_diff_transient：循环内空 diff（沙箱尚未 pull-back），pull-back 后可能有真产出。
 #   - llm_self_report：纯 LLM 弱信号 fail（无确定性证据），收到确定性证据后可被覆盖。
 # 编译/lint/scope/test/verify/refusal 失败都是【确定的真错误】，sticky=True，永不翻盘。
-_FLIPPABLE_SOURCES = frozenset({"empty_diff_transient", "llm_self_report", "refusal_in_self_review"})
+_FLIPPABLE_SOURCES = frozenset({
+    "empty_diff_transient", "llm_self_report", "refusal_in_self_review",
+    # 循环内「验证没跑成」(BLOCKED)是无确定性证据的非 sticky fail——Phase-4 pull-back 后
+    # 若确定性闸门真跑通，应允许翻盘为通过（与 llm_self_report 同类）。
+    "verification_not_run",
+})
 
 
 @dataclass
@@ -253,18 +259,36 @@ def evaluate_l1(
         return L1Verdict(passed=False, source=source, reason=reason,
                          sticky=sticky, details=details)
 
-    # ③ det_ok is None → 回退 LLM 自报弱信号，不主动翻盘 prior
+    # ③ det_ok is None → 无确定性结论。【fail-closed 核心】必须区分「为何没结论」。
+    #    not_run_kind 由 _deterministic_l1_gate / run_l1_pipeline 写入 details：
+    #      BENIGN  = 真 no-op（空 diff + 无 harness + scope 不期望改动）→ 可回退 LLM 弱信号。
+    #      BLOCKED = 本应验证却跑不起来（pipeline 异常 / 工具或工程清单缺失 / 构建命中 infra
+    #                故障 / 非空 diff 却解析到 0 文件）→ 绝不当 PASS。
+    #      缺失/未知 → 按 BLOCKED 处理（fail-closed 默认，这是与旧行为相反的关键反转：
+    #                旧行为 `passed = bool(llm_ok)` 把「没验证」判给模型自报，是静默成功总根）。
     if det_ok is None:
-        details["l1_decision_source"] = "llm_self_report"
+        kind = details.get("not_run_kind")
         if prior is not None and prior.passed is False:
             # 缺乏确定性证据，不足以翻盘循环内/此前的 fail → 维持 prior 结论。
+            details["l1_decision_source"] = "verification_not_run_keep_prior"
             return L1Verdict(passed=False, source=prior.source,
                              reason="无确定性证据(det=None)，维持 prior 的未通过结论",
                              sticky=prior.sticky, details=details)
-        passed = bool(llm_ok)
-        return L1Verdict(passed=passed, source="llm_self_report",
-                         reason="无确定性证据，回退 LLM 自报弱信号",
-                         sticky=False, details=details)
+        if kind == NotRunKind.BENIGN.value:
+            details["l1_decision_source"] = "no_op_benign"
+            return L1Verdict(passed=bool(llm_ok), source="no_op_benign",
+                             reason="真 no-op（无可验证产出），回退 LLM 弱信号",
+                             sticky=False, details=details)
+        # BLOCKED 或未知 → fail-closed：不采信 LLM 自报，标 transient 交 brain 退避重试，
+        # 耗尽 transient 配额后落 capability 阶梯 → 最终硬 FAIL（绝不静默通过）。
+        details["l1_decision_source"] = "verification_not_run"
+        details["failure_class"] = "transient"
+        return L1Verdict(
+            passed=False, source="verification_not_run",
+            reason=f"确定性验证未能执行(not_run_kind={kind or 'unknown'})，"
+                   "fail-closed 不采信 LLM 自报，转 transient 退避重试",
+            sticky=False, details=details,
+        )
 
     # ④ det_ok is True → 考虑 LLM 自检
     details["l1_decision_source"] = "deterministic"
@@ -793,6 +817,14 @@ class WorkerExecutor:
                     pass
 
                 if l1_passed:
+                    break
+
+                # fail-closed：本轮是「验证没跑成」(BLOCKED：构建 infra 故障 / 工具或工程清单缺失 /
+                # pipeline 异常)——re-prompt 模型无意义（不是代码能力问题）。提前 bail，把恢复交给
+                # brain 重新派发（verdict 已标 failure_class=transient → 退避重试，优先换新沙箱）。
+                # 同时这是 TD2606-B6「fix 循环无 no-progress 检测」开的第一刀。
+                if verdict.source == "verification_not_run":
+                    self._log("L1 验证未能执行(BLOCKED)，提前结束 fix 循环，转交 brain 退避重试")
                     break
 
                 if fix_round < self.max_fix_rounds:
@@ -2338,11 +2370,13 @@ class WorkerExecutor:
             (bool, details) 表示确定性结论。
         """
         if not self.project_path:
-            return None, {"deterministic_gate": "skipped: no project_path"}
+            return None, {"deterministic_gate": "skipped: no project_path",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
         try:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001
-            return None, {"deterministic_gate": f"skipped: diff error {exc}"}
+            return None, {"deterministic_gate": f"skipped: diff error {exc}",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
         # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
         # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"
         # 送进 pipeline → 解析出 0 文件 → "no diff changes → True" → 空 diff 漏判通过。
@@ -2370,8 +2404,10 @@ class WorkerExecutor:
                 "note": "worker 未产生任何改动（期望修改/新建文件），判定未完成",
             }
         if empty_diff and not has_harness_checks:
-            # 既无 diff 又无 harness 可执行检查，才回退 LLM 自报
-            return None, {"deterministic_gate": "skipped: empty diff"}
+            # 既无 diff 又无 harness 可执行检查——且上方已排除 expects_changes（那是 BLOCKED fail）。
+            # 此即真 no-op：合法地没东西可验证 → BENIGN，可回退 LLM 弱信号。
+            return None, {"deterministic_gate": "skipped: empty diff",
+                          "not_run_kind": NotRunKind.BENIGN.value}
         try:
             from swarm.worker.l1_pipeline import run_l1_pipeline
 
@@ -2381,14 +2417,22 @@ class WorkerExecutor:
                 self.project_path, self.subtask, diff or "", llm=None,
                 project_stack=self._resolve_project_stack(),
             )
-            details["deterministic_gate"] = "pass" if ok else "fail"
             # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
             details["l1_phase"] = "phase3_loop_deterministic"
+            # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程
+            # 清单缺失、构建命中 infra 瞬时故障、非空 diff 却解析到 0 文件）。这种 passed-but-blocked
+            # 绝不能当真 PASS → 降为 None(BLOCKED)，交裁决器走 transient 退避重试。
+            if ok and details.get("pipeline_blocked"):
+                details["deterministic_gate"] = "skipped: pipeline blocked"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                return None, details
+            details["deterministic_gate"] = "pass" if ok else "fail"
             if empty_diff:
                 details["note"] = "empty diff，仅靠 harness 命令验证"
             return ok, details
         except Exception as exc:  # noqa: BLE001
-            return None, {"deterministic_gate": f"skipped: pipeline error {exc}"}
+            return None, {"deterministic_gate": f"skipped: pipeline error {exc}",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
 
     def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool, str]:
         """DEBUG 意图专属 L1 闸门：确定性执行 failing_test_command，验证修复后该命令通过。

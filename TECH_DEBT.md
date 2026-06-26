@@ -3,7 +3,181 @@
 本文件登记已知但暂未根治的技术债，按优先级排列。每项含：现象、影响、建议修法。
 完成后从本表移除并在 commit 注明。
 
-> 最近更新：2026-06（多接入点重构 + 通知渠道 + 发布前 CTO 走查）
+> 最近更新：2026-06-26（整体走读 · 四视角并行深审 · 根因收敛）
+
+---
+
+## 2026-06-26 整体走读登记 — 静默成功根因 + 40 项系统性债
+
+> 来源：四个独立子审计并行读通 brain(13.7k)/worker(8.8k)/knowledge+models+config(9.7k)/
+> 全树跨切面。**四视角独立收敛到同一根因。** ✅ = 已亲自复核原文；其余为子审计报告，
+> 落地前需在 plan 阶段逐条复核 file:line。ID 形如 TD2606-X# 供 plan/commit 引用。
+
+### §0 根因主线（THE root cause）
+
+**系统没有"未验证模型输出"与"可信内部状态"之间的类型边界；其裁决器把"验证没跑"
+（`det_ok is None` / 异常跳过 / infra 串匹配 / 空 scope / 散文验收）当作软通过、退化为
+信模型自报。** 因为每个节点都是 catch-log-continue，任一阶段失败都会在下游退化成"看
+起来像成功"。两个多月的补丁史（version-repair / symbol 锚点 / override fallback /
+Central 兜底 / `_is_infra_failure` 串表）全是把*某一个*"没验证"场景一次一个地拖回"真
+验证了"那栏——补的是裁决器的**输入**，没改它 fail-**open** 的**默认值**。
+
+**一刀根治**：裁决器默认翻成 fail-closed，把"验证是否真跑过"变成一等带类型信号
+`VerificationOutcome ∈ {VERIFIED_PASS, VERIFIED_FAIL, NOT_RUN(reason)}`；`NOT_RUN`
+当 FAIL（除非运维 allowlist），永不退化为信 LLM 自报。配 Pydantic schema 边界让规划链
+不能静默错形。此改使整张 whack-a-mole 串表从"正确性关键"降级为"便利性优化"。
+
+### §A CRITICAL — 静默成功核心链（fail-open 默认值的各条入口）
+
+- **TD2606-A1 ✅ 裁决器 fail-open 总开关**：`worker/executor.py:256-267` 分支③
+  `det_ok is None → passed = bool(llm_ok)`。无确定性证据时把"成功"判给模型自报。所有
+  下列入口最终汇入此处。**根因，非补丁。**
+- **TD2606-A2 ✅ 自检解析失败→视为通过**：`worker/l1_pipeline.py:1188-1195` JSON 解析
+  失败/异常 → `{"passed":True,"skipped":True}`。且 `test/test_l1_pipeline.py:232`
+  `test_self_review_llm_exception_graceful` **断言 passed is True**，把静默成功写成契约。
+- **TD2606-A3 确定性闸门吞异常→返回 None**：`worker/executor.py:2390-2391`
+  `except Exception: return None` → 唯一硬正确性检查点崩溃后删证据、落回 A1。
+- **TD2606-A4 `_is_infra_failure` 串表丢真实编译错**：`worker/l1_pipeline.py:559-585`
+  30 条硬编码串；构建非零退出含 `command not found`/`: not found`/`504` 等即当 infra 跳过
+  闸门。这就是 whack-a-mole 机制本体——一张不断增长的"已知坏输出"查找表。
+- **TD2606-A5 规划 LLM 失败→造空 scope "无验证"巨任务**：`brain/nodes/__init__.py:685-703`
+  transient 规划错不失败，造一个空 FileScope、验收写字面"无验证"的任务 → 空 scope 使
+  `expects_changes=false` → 无东西可检 → 落回 A1。降级规划静默绕过整条验证链。
+- **TD2606-A6 merge rebase 超限 escalate 信号被丢**：`brain/nodes/__init__.py:2208-2234`
+  + `brain/graph.py:239-263`。设 `failure_escalated=True` 但没设 `merge_conflicts`/
+  `rebase_subtask_ids` → `after_merge` 路由去 verify_l2，escalate 无边承载 → 可进
+  MERGE↔VERIFY_L2↔HANDLE_FAILURE 死循环烧到 recursion_limit。
+- **TD2606-A7 错误"成功"零校验写进 L6 记忆毒化回路**：`brain/learn_store.py:91-169`、
+  `memory/pattern_extractor.py:15-27`、`memory/store.py:580-655,799-805`。
+  `should_write_success` 只查"非部分交付+复杂度档"，**不查 L1/L2/L3 真过 / 人审 ACCEPT**
+  （信号就在 state 里没被调用）；被复用越多 reuse_count 越高、衰减越慢 → 错误 pattern 越
+  永久。有正反馈、无解药（除手动 dismiss）的自毒化。
+- **TD2606-A8 路由 fallback 可终止在不存在的模型**：`models/router.py:288-318,434-458`。
+  `_get_provider_for_model` 不校验模型存在、不与 capability_store 交叉可达性校验，只
+  `logger.warning`；死模型运行期错又易被判 transient → 重试同一死模型烧光预算。
+
+### §B HIGH — 失败漂成成功 / 状态失序 / 并发安全
+
+- **TD2606-B1 LLM JSON 全程无 schema 校验**：`brain/nodes/shared.py:_parse_json_from_llm`
+  返回裸 dict，~12 处 `planning_nodes.py` 直接 `.get()/float()/Complexity(...)`，下个没见
+  过的形状抛异常或静默错解。确定性泄漏类的根因边界。
+- **TD2606-B2 裁决从散文 regex+子串投票**：`worker/executor.py:2309-2328`
+  `re.search("L1_RESULT:(PASS|FAIL)")` 失败后数 `pass/fail/通过/失败` 子串——"This test
+  will fail tomorrow" 翻盘。
+- **TD2606-B3 ASSESS 失败静默沿用它本该纠正的低估**：`brain/planning_nodes.py:295-297`
+  `return state.get("complexity", MEDIUM)`，且 state 无"ASSESS 被跳过"信号。
+- **TD2606-B4 沙箱创建失败→静默降级本地执行→构建闸门消失**：`worker/executor.py:580-582`
+  通用模板沙箱挂掉落本地，mvn/go/cargo 不存在 → command not found → 被 A4 跳过 → 假通。
+- **TD2606-B5 并发共享一棵 git 工作树损坏 diff 基线**：`worker/executor.py:1237-1321,
+  1743-1816`、`worker/sandbox.py:1093-1154`。dispatch `asyncio.gather` 真并发，pull-back
+  写回 + `git add -N` 改共享 index + flock 只锁 reset 一步不锁 pull-back-write/diff-read
+  窗口 → 06-23 记忆"疑似跨子任务同步 bug"的结构性真因。**设计让并发写者共享可变工作树。**
+- **TD2606-B6 fix 循环无 no-progress 检测**：`worker/executor.py:740-811`。模型每轮吐同一
+  `cannot find symbol` 会烧光每个 fix round 产同一 diff，只有 timeout 能停。开环修复。
+- **TD2606-B7 构建闸门 manifest find 深度3 把"找不到 pom"当 build PASS**：
+  `worker/l1_pipeline.py:603-640,1330-1370`（`:1367` elif 分支）。"工具不适用"与"定位不到
+  清单"被混为一谈，都判绿。
+- **TD2606-B8 L2 失败连坐全部 subtask→replan 清空全部成功成果**：`brain/nodes/verify.py:
+  248-255` `failed_ids = list(subtask_results.keys())`。40/41 成功+1 集成问题 → 全量重建，
+  击穿"保留成功兄弟"guard。L2 失败无法定位到具体文件/子任务。
+- **TD2606-B9 capability 探测 transient 把 probed 降级 default 且永不恢复**：
+  `models/prober.py:342-346`、`models/capability_store.py:204` 无条件 upsert、`router.py:419`
+  过滤 supports_multimodal=True → 一次 5xx 期探测把多模态/上下文窗口能力永久抹掉。
+- **TD2606-B10 decay_weight 在排序公式里被约掉**：`memory/store.py:442-471,467,494-506,
+  671-685`。`effective_weight/decay_weight = factor^(age/occ)`，锚点权重对排序完全无效，
+  "常遇错题重振"设计是哑的；reinforce 不查 dismissed 状态致两道 guard 失配。
+- **TD2606-B11 嵌入退化 BM25-only 不告知调用方**：`knowledge/retriever.py:394-408`、
+  `knowledge/service.py:197`（仅总异常才置 retrieval_failed）→ Brain 以为有语义召回实则
+  只关键词召回，照常规划。与 L5/L6 的零向量 fail-safe 不对称。
+- **TD2606-B12 PG checkpointer 挂→静默降级 MemorySaver 破多副本 resume**：
+  `brain/graph.py:597-628`。多副本下一个副本 PG init 失败，人闸 interrupt 不可跨副本恢复，
+  任务永久孤儿在 CONFIRMING/DELIVERING，仅 warning 不拒绝不告警。
+- **TD2606-B13 transient/capability 误分类靠散文串匹配**：`brain/nodes/__init__.py:1922-1975`
+  capability 失败含 timeout 字样被判 transient（不进 capability 预算不换模型）反之亦然；
+  载荷决策建在 LLM 自吐文本的脆弱匹配上。
+- **TD2606-B14 单跑 worker fire-and-forget 无 kill 杆**：`worker/runner.py:178`
+  `create_task` 句柄丢弃，卡死的单跑持沙箱直到自身 finally，无外部恢复。
+- **TD2606-B15 reset_sandbox_manager 不重置 pool 单例**：`worker/sandbox.py:144-152`
+  杀 manager 但 pool 账本仍指死 manager、borrowed 不减 → 配置 reload 后每次 acquire 退化
+  throwaway 临时沙箱、持续 churn。
+- **TD2606-B16 各 store 逐调用裸 PG 连接绕过连接池**：`knowledge/retriever.py:280`、
+  config/sandbox_store、command_blacklist_store、secret_store、auth/store、capability_store、
+  project/store 各自 `psycopg.connect`，并发下击穿 max_size；长生命周期 store 的 connect()
+  无幂等守卫，双连接泄漏。
+- **TD2606-B17 dedupe_subtasks 只在批量 ultra 路径，单发 plan 路径无去重**：
+  `brain/plan_batch.py:249-293,370`；单发 `brain/nodes/__init__.py:632-665`。RUN6"重复脚手架
+  子任务"根因仍可达于非批量路径——去重是 batch-merge 副产品而非全局不变量。
+- **TD2606-B18 revision 计划绕过 validate_plan 与全部 scope 归一**：`brain/graph.py:399`
+  `revision→dispatch` 直连，跳过 validate_plan/normalize/enrich/resolve_conflicts；LLM 解析失败
+  造空 scope（无 allow_any）→ worker 啥都不能写 → 静默空 diff。人工介入路径反而验证最弱。
+- **TD2606-B19 secret key 未设时由公开 DB URI 派生 + 生产校验是 opt-in**：
+  `config/settings.py:688-733`、`config/secret_store.py:51-86`。`SWARM_ENV` 没设则跳过校验，
+  Fernet 根 key 从默认公开 DSN 派生（代码自承"DB dump+repo 即可解密一切"）。安全姿态藏在
+  两个 opt-in flag 之后。
+- **TD2606-B20 stale project_stack JSONB 缓存在栈变更后仍被用**：`project/store.py:39`、
+  `worker/executor.py:964-974`。schemaless config JSONB 无 version/staleness 字段，栈迁移
+  （javax→jakarta / 加前端）未重跑 detect_stack 则旧画像当硬前提喂 worker。
+
+### §C MEDIUM — 环境错配 / 资源泄漏 / 覆盖空洞
+
+- **TD2606-C1 中文拒答裸子串误判**：`worker/executor.py:67-112` `"无法"/"抱歉"` 等片段
+  作子串匹配，正常验证散文"原代码无法处理空值已修复"被判拒答→sticky 硬失败。重蹈英文路径
+  早修过的同一类 bug，且此处更毒（不可翻盘）。
+- **TD2606-C2 DEBUG 闸门跑本地 subprocess 而非沙箱→非 Python 栈永远保守失败**：
+  `worker/executor.py:2393-2430` `subprocess.run(cwd=project_path)` 本地无工具链 → 永远 except
+  保守失败。非 DEBUG 路径已用 sandbox-first，DEBUG 闸门分叉退化。
+- **TD2606-C3 security_scan 在 worker 生命周期中从未被调用**：`worker/security_scan.py`
+  精心 fail-closed 的 secret/SAST 机器从 worker 视角是死代码。需确认是否在 deliver 路径接上；
+  若否则产出无任何安全闸门。
+- **TD2606-C4 clean_workspace 抹掉项目镜像烤进的源码**：`worker/sandbox.py:607-641` 池复用
+  清理 `find /workspace -mindepth 1 -delete`，对 `image_builder.py:282-288` 烤源进 /workspace
+  的项目专属镜像 = 删掉地基源码，下次 acquire 空 workspace 只增量上传 → 缺兄弟编译失败。
+- **TD2606-C5 git add -N 改共享 index 副作用**：`worker/executor.py:1774-1787` 并发下一个
+  worker 的 intent-to-add 泄漏进另一个的 diff/status，污染 scope 越权检查。注释称"无副作用"实
+  为真 index 写。
+- **TD2606-C6 maven -pl 模块由 `f.split("/")[0]` 推导，嵌套模块错**：`worker/l1_pipeline.py:
+  1262-1272` 对 `ruoyi-modules/ruoyi-system/...` 取到聚合器而非叶子 → 跑全 reactor 但只同步了
+  改动模块源 → 失败；且"构建哪个模块"与"上传哪个模块源"用不同解析逻辑会不一致。
+- **TD2606-C7 pool 临时沙箱异常路径泄漏**：`worker/sandbox_pool.py:228-270` create-failure /
+  temp 分支引用被丢且未 release → 临时 sid 不被 kill 不进清理对账。中等把握。
+- **TD2606-C8 malformed 非空 diff 解析到 0 文件→PASS**：`worker/l1_pipeline.py:1312-1317`
+  含垃圾无 `+++ b/` 头的非空 diff，`empty_diff` 检测（查空串）放过它进 run_l1_pipeline → 无
+  harness 项目判 True。
+- **TD2606-C9 fix 轮间本地↔沙箱只部分同步**：`worker/executor.py:757-758,1585-1646` 仅 JVM
+  修复回传，无通用 local→sandbox 再同步 → 两棵真值树（本地 diff/scope vs 沙箱 compile/test）
+  按修复类型 ad-hoc 同步，可静默分叉。
+- **TD2606-C10 L2 散文验收→零测试通过且 degraded 标记不 gate**：`brain/nodes/verify.py:
+  113-125` 返回 l2_passed=True + degraded_reasons，但无下游闸门读它 → 降级对 accept 闸门不可见。
+- **TD2606-C11 norms_inference 未校验 LLM 输出当 norms 注入**：`knowledge/norms_inference.py:
+  133-199,234-250` 本地模型臆造"StringUtils.isBlank 存在，务必复用"成高信号指令注入每个 worker
+  prompt。A7 的 norms 版。
+- **TD2606-C12 context 探测把下界当权威窗口持久化**：`models/prober.py:151-205` 网关接受超大
+  请求时读 prompt_tokens 当窗口（实为下界，可能被服务端截断）→ 下游预算低估；且每次探测发
+  ~1.2MB 体真计费。
+- **TD2606-C13 positional JSON 提取**：`worker/security_scan.py:200`、`knowledge/
+  norms_inference.py:153` `find("{")…rfind("}")` 遇散文里嵌套花括号即破。
+- **TD2606-C14 资源/生命周期泄漏**：MemoryDecay `while True` 无 stop（`memory/decay.py:407`，
+  api/app on_shutdown 不杀）；image_builder 失败无 finally 清 `/tmp/swarm-build` + `docker run
+  -d` 探测容器（`worker/image_builder.py:660,666-782`）；updater.close 不取消在飞
+  `_depgraph_tasks`（`knowledge/updater.py:443,277`）。
+- **TD2606-C15 lossy regex 符号重索引使 Layer A 漂离真值**：`knowledge/updater.py:889-957`
+  仅 Python 用 AST，Java/Kotlin/Go/TS 行 regex 漏多行签名/注解/泛型，每次增量删-重插累积漂移，
+  consistency 只比 mtime 不比符号保真度。
+- **TD2606-C16 reload_config 不刷 secret/sandbox 缓存**：`config/settings.py:737-750`、
+  `config/secret_store.py:38-41`。.env 改 + reload 后旧 key 缓存最长 30s，新 base_url 配旧 key。
+- **TD2606-C17 ContextVar 跨项目隔离潜在脚手枪（当前安全）**：`knowledge/service.py:44-54`、
+  `brain/nodes/dispatch.py:246`。当前靠"检索显式传 project_id 参数"幸存；若未来同 loop 并发跑
+  不同项目 Brain 任务且不各自包 asyncio.Task，`_current_project_id` last-writer-wins 即串。
+- **TD2606-C18 co-occurrence boost 把巨提交噪声当信号**：`knowledge/retriever.py:657-694`、
+  `knowledge/behavior_store.py:159-197` 一次大重构产 780 对 co-occurrence，使无关文件"常一起改"。
+
+### §D 测试理论（test theater）
+
+212 个测试文件、90 个用 mock。L1 裁决测试只喂 `det_ok=True/False/None` 验真值表，**从没把
+真的坏构建跑过真实流水线断言 FAIL**；构建闸门（mvn/go/cargo 经 `_run_l1_command`）与
+`_is_infra_failure` 跳过路径无任何"喂真坏构建断言 FAIL"的测试。最坏：`test/test_l1_pipeline.py:
+232` 把静默成功 encode 成契约。**这套 1000+ 测试抓不到 silent-failure 这一类——因为它们 encode
+了它。** 落地 fail-closed 时必须同步把这类测试反向（NOT_RUN→断言 FAIL）。
 
 ---
 

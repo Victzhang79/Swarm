@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from swarm.project.diff_apply import files_from_unified_diff
-from swarm.types import FileScope, SubTask
+from swarm.types import FileScope, NotRunKind, SubTask
 from swarm.worker.output_compress import compress_tool_output
 
 if TYPE_CHECKING:
@@ -1186,13 +1186,14 @@ def _run_self_review(
             issues = [str(issues)]
         return {"passed": passed, "issues": issues, "raw": text[:500]}
     except json.JSONDecodeError:
-        # audit #6/#9：自检无法解析时被迫"视为通过"，但必须标 skipped 让下游区分
-        # "真审查通过" vs "异常跳过"，否则静默吞没自检是否真执行过的信息。
-        logger.warning("[L1.4] LLM 自检输出非标准 JSON，跳过自检（视为通过但标记 skipped）")
-        return {"passed": True, "skipped": True, "skip_reason": "json_parse_error", "issues": [], "raw": text[:500] or "json parse error"}
+        # fail-closed（TD2606-A2）：自检无法解析时【绝不当 passed=True】。自检本就非阻塞（仅
+        # advisory），但解析失败必须 passed=None + skipped，让下游明确「未审查」而非「审查通过」，
+        # 杜绝静默把「没跑成」计入 PASS 信号。
+        logger.warning("[L1.4] LLM 自检输出非标准 JSON，跳过自检（passed=None，标记 skipped，不计入 PASS）")
+        return {"passed": None, "skipped": True, "skip_reason": "json_parse_error", "issues": [], "raw": text[:500] or "json parse error"}
     except Exception as exc:
-        logger.warning("[L1.4] LLM 自检异常，跳过自检（视为通过但标记 skipped）: %s", exc)
-        return {"passed": True, "skipped": True, "skip_reason": f"exception: {exc}", "issues": [], "raw": f"self_review skipped: {exc}"}
+        logger.warning("[L1.4] LLM 自检异常，跳过自检（passed=None，标记 skipped，不计入 PASS）: %s", exc)
+        return {"passed": None, "skipped": True, "skip_reason": f"exception: {exc}", "issues": [], "raw": f"self_review skipped: {exc}"}
 
 
 # ── 主流水线 ──
@@ -1313,7 +1314,15 @@ def run_l1_pipeline(
         details["l1_2_compile_ok"] = True
         details["lint"] = {"status": "skipped", "reason": "no files"}
         details["l1_3_test_ok"] = True
-        details["note"] = "no diff changes"
+        # fail-closed：区分「真空 diff」(BENIGN no-op) 与「非空 diff 却解析到 0 文件」
+        # （malformed diff，TD2606-C8/H4：垃圾输出 / 无 +++ b/ 头 → 看似有产出实则无法验证）。
+        if (diff or "").strip():
+            details["note"] = "diff 非空但解析到 0 个文件（疑似 malformed diff），无法验证"
+            details["pipeline_blocked"] = "malformed_diff_zero_files"
+            details["not_run_kind"] = NotRunKind.BLOCKED.value
+        else:
+            details["note"] = "no diff changes"
+            details["not_run_kind"] = NotRunKind.BENIGN.value
         return True, details
 
     # ── L1.2 编译(语法) ──
@@ -1362,12 +1371,32 @@ def run_l1_pipeline(
                 details["import_repaired_files"] = repaired
                 logger.info("[L1.2.1] import-repair 后构建: exit=%s ok=%s", b_ec, build_ok)
             if not build_ok:
+                # fail-closed 但不误判 capability：构建非零退出若命中网络/工具/资源 infra 瞬时故障，
+                # 不是代码能力失败 → 标 BLOCKED 走 transient 退避重试（耗尽才硬 FAIL），不错换模型。
+                if _is_infra_failure(b_out):
+                    details["l1_2_1_build_ok"] = None
+                    details["build_blocked"] = build_cmd
+                    details["pipeline_blocked"] = "build_infra_failure"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    logger.warning(
+                        "[L1.2.1] 构建命中 infra 瞬时故障，标 BLOCKED 转 transient 重试: %s",
+                        (b_out or "")[:200],
+                    )
+                    return True, details
                 details["build_failed"] = build_cmd
                 return False, details
     elif build_cmd:
-        details["l1_2_1_build_ok"] = True
-        details["build_skipped"] = f"工程文件缺失，跳过构建闸门: {build_cmd}"
-        logger.info("[L1.2.1] 跳过构建闸门(无对应工程文件): %s", build_cmd)
+        # Brain 指定了 build_command（即【期望】这是可构建项目），但工程清单(pom/go.mod/...)在同步后
+        # 的树里定位不到 → 本应构建却跑不起来。fail-closed：标 BLOCKED（TD2606-B7），不再静默当
+        # 「跳过=通过」。多因模块源同步不全/清单未上传 → 交裁决器走 transient 重试。
+        # 注：_build_cmd_applicable 的 find -maxdepth 3 本身偏浅（深 monorepo 会漏），Wave 4 修
+        # 该定位逻辑以降低误标 BLOCKED；当前先 fail-closed（重试有上限，绝不静默通过）。
+        details["l1_2_1_build_ok"] = None
+        details["build_skipped"] = f"期望构建但无法定位工程清单: {build_cmd}"
+        details["pipeline_blocked"] = "build_manifest_missing"
+        details["not_run_kind"] = NotRunKind.BLOCKED.value
+        logger.warning("[L1.2.1] 期望构建但无对应工程文件，标 BLOCKED 转 transient 重试: %s", build_cmd)
+        return True, details
 
     # ── L1.2.0 自动格式化（L0 闸门）──
     # 在 lint 之前先确定性格式化改动文件：把"风格"从模型负担降级为系统自动行为。
@@ -1475,7 +1504,10 @@ def run_l1_pipeline(
     if self_review_enabled and llm is not None:
         review_result = _run_self_review(llm, subtask, diff, timeout=timeout)
         details["self_review"] = review_result
-        if not review_result.get("passed", True):
+        if review_result.get("skipped"):
+            # 自检未能执行（解析失败/异常）——非阻塞，但明确标注「未审查」，不计入 PASS 信号。
+            details["self_review"]["note"] = "LLM 自检未能执行（skipped），不计入 PASS 信号"
+        elif review_result.get("passed") is False:
             # 自检发现问题，仅作为警告，不硬阻断
             details["self_review"]["note"] = "LLM 自检发现潜在问题，作为警告（不阻断）"
     elif not self_review_enabled:

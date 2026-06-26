@@ -71,6 +71,11 @@ from swarm.brain.nodes.shared import (  # noqa: E402,F401
     _parse_json_from_llm,
     _planning_triage,
     _worker_profile_prompt,
+    parse_and_validate,
+)
+from swarm.brain.llm_schemas import (  # noqa: E402
+    ComplexityAssessmentResponse,
+    FailureStrategyResponse,
 )
 from swarm.types import (
     Complexity,
@@ -230,7 +235,13 @@ async def analyze(state: BrainState) -> dict:
         if not result.get("complexity"):
             logger.warning("[ANALYZE] LLM 输出缺 complexity 键，回退 MEDIUM（N-26）")
             result["complexity"] = "medium"
-        complexity = Complexity(result["complexity"])
+        # Wave 1/TD2606-B1：经类型边界提取 complexity（容忍非字符串形状）；非法 → 显式回退 MEDIUM。
+        try:
+            complexity = ComplexityAssessmentResponse.model_validate(result).complexity
+        except Exception as _ve:  # noqa: BLE001
+            logger.warning("[ANALYZE] complexity 形状非法，显式回退 MEDIUM（B1）: %s", str(_ve)[:120])
+            result["complexity"] = "medium"
+            complexity = Complexity.MEDIUM
     except json.JSONDecodeError as e:
         logger.warning(f"[ANALYZE] LLM 输出 JSON 解析失败: {e}")
         result = {
@@ -782,6 +793,10 @@ async def plan(state: BrainState) -> dict:
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
         ),
+        # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
+        # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
+        # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
+        "plan_generation_failed": _plan_degraded is not None,
         **_replan_reset,
         **plan_touch,
     }
@@ -939,13 +954,20 @@ def confirm_plan(state: BrainState) -> dict:
             )
             # W1.1：tech_design 有失败模块时，auto_accept 不得静默成功——
             # 升级人工(failure_escalated)，与"计划非法"一样走 fail-fast，但归因区分。
-            _vf = "tech_design_incomplete" if reason.startswith("tech_design_incomplete") else "plan_invalid"
+            if reason.startswith("tech_design_incomplete"):
+                _vf = "tech_design_incomplete"
+            elif reason.startswith("plan_generation_failed"):
+                _vf = "plan_generation_failed"  # TD2606-A5
+            else:
+                _vf = "plan_invalid"
             _patch = {
                 "human_decision": HumanDecision.REJECT,
                 "confirm_reason": _reason,
                 "verification_failure": _vf,
             }
-            if _vf == "tech_design_incomplete":
+            # tech_design 残缺 / 规划生成失败 → 升级人工(escalate)，与"计划非法"一样 fail-fast
+            # 但归因区分，绝不静默成功。
+            if _vf in ("tech_design_incomplete", "plan_generation_failed"):
                 _patch["failure_escalated"] = True
                 _patch["failure_strategy"] = "escalate"
             return _patch
@@ -1748,8 +1770,11 @@ async def handle_failure(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         result = _parse_json_from_llm(response.content)
-        strategy = result.get("strategy", "retry")
-        logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {result.get('reasoning', '')}")
+        # Wave 1/TD2606-B1：策略走类型边界。未知策略 → ValidationError → 下方 except 确定性回退 retry
+        # （不让 LLM 吐的未知字符串静默穿过策略阶梯）。result 保留供下游读取 adjusted_subtasks 等。
+        _fs = FailureStrategyResponse.model_validate(result)
+        strategy = _fs.strategy
+        logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {_fs.reasoning}")
     except json.JSONDecodeError as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
         strategy = "retry"

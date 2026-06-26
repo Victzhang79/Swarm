@@ -236,13 +236,22 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
     return "merge"
 
 
-def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "dispatch"]:
+def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "dispatch", "deliver"]:
     """MERGE 后的路由:
 
+    - failure_escalated + escalate → DELIVER（rebase 超限已升级人工，escalate 终点）
     - merge_conflicts 非空 → HANDLE_FAILURE（failed_subtask_ids 已由 merge 节点填充）
     - rebase_subtask_ids 非空（无硬冲突）→ DISPATCH（rebase 子任务已加入 dispatch_remaining，需重跑）
     - 无冲突无 rebase → VERIFY_L2
     """
+    # TD2606-A6：rebase 超限时 merge 节点已设 failure_escalated/failure_strategy=escalate 但
+    # 不会设 merge_conflicts/rebase_subtask_ids → 旧逻辑落到 VERIFY_L2，escalate 信号被丢 →
+    # MERGE↔VERIFY_L2↔HANDLE_FAILURE 死循环烧 recursion_limit。直接路由 DELIVER（与
+    # after_handle_failure 的 escalate→deliver 同构，可被 can_auto_accept_delivery 如实归因）。
+    if state.get("failure_escalated") and state.get("failure_strategy") == "escalate":
+        logger.warning("[ROUTE] MERGE → DELIVER (rebase 超限升级人工 escalate，避免死循环 A6)")
+        return "deliver"
+
     conflicts = state.get("merge_conflicts", [])
     if conflicts:
         logger.info(
@@ -481,6 +490,7 @@ def build_brain_graph() -> StateGraph:
             "handle_failure": "handle_failure",
             "dispatch": "dispatch",
             "verify_l2": "verify_l2",
+            "deliver": "deliver",
         },
     )
 

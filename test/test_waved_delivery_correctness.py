@@ -24,8 +24,8 @@ def test_partial_delivery_does_not_write_l6_success():
     state_partial = {"complexity": Complexity.COMPLEX, "abandoned_subtask_ids": ["st-3"]}
     assert should_write_success(state_partial) is False, "PARTIAL 任务不得写 L6 成功模式"
 
-    # 对照：无 abandoned 的 complex 任务正常写 L6
-    state_ok = {"complexity": Complexity.COMPLEX, "abandoned_subtask_ids": []}
+    # 对照：无 abandoned + 真实成功信号(l2_passed)的 complex 任务正常写 L6（TD2606-A7）
+    state_ok = {"complexity": Complexity.COMPLEX, "abandoned_subtask_ids": [], "l2_passed": True}
     assert should_write_success(state_ok) is True
 
 
