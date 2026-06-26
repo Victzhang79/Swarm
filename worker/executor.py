@@ -108,7 +108,7 @@ _LOCATE_STEP_CAP = 20
 # （"抱歉/我无法/无法完成/需要更多步骤"），原英文清单全部漏过 → 中文拒答被当有效产出
 # 送进确定性闸门，compile 恰好过即幻觉 PASS。
 _REFUSAL_MARKERS = (
-    # ── 英文 ──
+    # ── 强标记：措辞特异，子串命中任意位置即拒答（不会出现在正常 fix 描述里）──
     "sorry, need more steps",
     "need more steps to process",
     "i'm unable to",
@@ -116,15 +116,19 @@ _REFUSAL_MARKERS = (
     "cannot complete this request",
     "unable to complete",
     "i cannot complete",
-    # ── 中文 ──
-    "抱歉",
-    "我无法",
-    "无法完成",
-    "无法继续",
     "需要更多步骤",
     "需要更多步数",
-    "我不能完成",
     "超出我的能力",
+)
+
+# TD2606-C1：弱中文"无能为力"标记。裸子串匹配会把【描述性回复】误判拒答，例如
+# "原代码无法完成空值校验，现已修复" / "抱歉之前漏了，已补上测试" → 命中"无法完成"/"抱歉"
+# 却是【成功产出】，旧逻辑判 refusal_hard_fail（sticky 不可翻盘）更毒。改为：弱标记只在
+# 【无任何成功/完成信号】时才算拒答（真拒答如"抱歉，我无法完成此任务"不含成功信号）。
+_REFUSAL_WEAK_CN = ("抱歉", "我无法", "无法完成", "无法继续", "我不能完成")
+_SUCCESS_SIGNALS = (
+    "已修复", "修复了", "已完成", "已实现", "已补", "已添加", "已新增",
+    "测试通过", "通过测试", "编译通过", "l1_result:pass", "l1_result: pass", "✅",
 )
 
 # W1.2 commit②：verify 回复"可用性"下限。空/纯空格、或极短且无 L1_RESULT 标记的回复，
@@ -148,6 +152,9 @@ def _is_refusal_or_truncated(text: str) -> bool:
         return True
     low = stripped.lower()
     if any(mk in low for mk in _REFUSAL_MARKERS):
+        return True
+    # C1：弱中文标记只在【无成功/完成信号】时才判拒答，避免误伤"无法…已修复"类描述性成功回复。
+    if any(mk in stripped for mk in _REFUSAL_WEAK_CN) and not any(s in low for s in _SUCCESS_SIGNALS):
         return True
     # 极短且无显式验证标记 → 不可用。含 L1_RESULT 的短回复仍是有效结论，放行。
     if len(stripped) < _MIN_VERIFY_REPLY_CHARS and "l1_result" not in low:
@@ -2471,32 +2478,19 @@ class WorkerExecutor:
         优雅降级：异常时返回 False（保守失败，M1 修复）——执行环境失败
         不能误判为 bug 已修复，宁可判未通过让其重试/人工复核。
         """
-        import subprocess
-
-        from swarm.worker.l1_pipeline import _normalize_python_cmd
+        # TD2606-C2：走 sandbox-first 的 _run_l1_command（与 L1 确定性闸门同执行模型）。
+        # 原实现裸 local subprocess，在非 Python 栈(本地无 mvn/go/cargo 工具链)必 except →
+        # DEBUG 意图任务的闸门【永远】保守失败、无法验证修复。沙箱可用即在沙箱跑、否则回退本地。
+        from swarm.worker.l1_pipeline import _run_l1_command
+        from swarm.worker.output_compress import compress_tool_output
 
         try:
-            proc = subprocess.run(
-                _normalize_python_cmd(failing_cmd),
-                cwd=self.project_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            ok = proc.returncode == 0
-            from swarm.worker.output_compress import compress_tool_output
-
-            output_summary = compress_tool_output(
-                proc.stdout or proc.stderr or "", max_chars=800
-            )
-            detail = f"exit_code={proc.returncode}, output={output_summary}"
+            ec, out = _run_l1_command(failing_cmd, self.project_path, timeout=120)
+            ok = ec == 0
+            detail = f"exit_code={ec}, output={compress_tool_output(out or '', max_chars=800)}"
             return ok, detail
-        except subprocess.TimeoutExpired:
-            return False, "failing_test_command timeout (120s)"
         except Exception as exc:  # noqa: BLE001
-            # M1 修复：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"）。
-            # 原返回 True 会把执行环境失败误判为 bug 已修复 PASS，放过未修的坏代码。
+            # M1：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"放过未修坏代码）。
             self._log(f"DEBUG L1: failing_test_command 执行异常，保守判未通过: {exc}")
             return False, f"execution error (conservative fail): {exc}"
 

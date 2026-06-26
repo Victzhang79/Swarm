@@ -1233,19 +1233,39 @@ def _normalize_python_cmd(cmd: str) -> str:
 
 
 def _maven_modules(project_path: str) -> dict[str, str]:
-    """返回 {模块目录名: 相对路径} 映射(读根 pom 的 <module> 列表)。无则空。"""
+    """返回 {模块相对路径: 模块相对路径} 映射，【递归】读各级 pom 的 <module>（含嵌套叶子）。
+
+    TD2606-C6：原只读根 pom 直接子模块、键取末段名 → 嵌套工程
+    （ruoyi-modules/ruoyi-system）只能匹配到聚合器 `ruoyi-modules`，而 `mvn -pl ruoyi-modules`
+    要构建其全部兄弟子模块的源码（worker 只同步了改动模块）→ 反应堆失败。递归到叶子并按
+    完整相对路径匹配，才能 -pl 精确限定到改动所在的叶子模块。
+    """
     from pathlib import Path as _P
+    import re
     root = _P(project_path)
-    pom = root / "pom.xml"
-    if not pom.is_file():
-        return {}
+    result: dict[str, str] = {}
+
+    def _walk(rel: str, depth: int) -> None:
+        if depth > 6:  # 防御异常深度/环
+            return
+        pom = (root / rel / "pom.xml") if rel else (root / "pom.xml")
+        if not pom.is_file():
+            return
+        try:
+            text = pom.read_text("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            return
+        for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", text):
+            child = f"{rel}/{m}".strip("/").rstrip("/") if rel else m.rstrip("/")
+            if child and child not in result:
+                result[child] = child
+                _walk(child, depth + 1)
+
     try:
-        import re
-        text = pom.read_text("utf-8", errors="ignore")
-        mods = re.findall(r"<module>\s*([^<\s]+)\s*</module>", text)
-        return {m.rstrip("/").split("/")[-1]: m.rstrip("/") for m in mods}
+        _walk("", 0)
     except Exception:  # noqa: BLE001
         return {}
+    return result
 
 
 def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
@@ -1260,12 +1280,16 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     modules = _maven_modules(project_path)
     if not modules:
         return command
-    # 从改动文件路径推断所属模块(取路径首段命中 module 名)
+    # TD2606-C6：按【最长模块路径前缀】匹配改动文件 → 命中最深叶子模块（而非首段聚合器）。
+    paths = sorted(modules.values(), key=len, reverse=True)
     hit: list[str] = []
     for f in modified:
-        seg = str(f).strip().split("/")[0]
-        if seg in modules and modules[seg] not in hit:
-            hit.append(modules[seg])
+        fp = str(f).strip().lstrip("/")
+        for mp in paths:
+            if fp == mp or fp.startswith(mp + "/"):
+                if mp not in hit:
+                    hit.append(mp)
+                break  # 命中最深模块即止（paths 已按长度降序）
     if not hit:
         return command
     pl = ",".join(hit)

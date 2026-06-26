@@ -187,8 +187,9 @@ def test_failing_test_gate_graceful_on_exception():
     )
     executor = WorkerExecutor(subtask=subtask, project_path="/tmp/fake_project")
 
+    # TD2606-C2：DEBUG 闸门改走 sandbox-first 的 _run_l1_command；模拟其执行异常 → 保守判失败。
     with patch(
-        "subprocess.run",
+        "swarm.worker.l1_pipeline._run_l1_command",
         side_effect=FileNotFoundError("sandbox destroyed"),
     ):
         ok, detail = executor._run_failing_test_gate("python -m pytest test_bug.py -q")
