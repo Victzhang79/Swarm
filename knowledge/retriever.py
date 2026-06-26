@@ -392,6 +392,9 @@ class SwarmRetriever:
         # ── 优雅降级（修复 12.7）：embedding 不可用(零向量/None)时，不用零向量污染
         #    向量检索，改走 BM25-only 关键词检索保住基本召回能力。──
         if query_vector is None or _is_zero_vec(query_vector):
+            # TD2606-B11：本次检索走 BM25-only 关键词降级（无语义召回）。置标记供 service 透传给
+            # Brain，使其知道"拿到的是关键词召回、非完整语义召回"，不静默当完整上下文规划。
+            self._embed_degraded_active = True
             if not getattr(self, "_embed_degraded_warned", False):
                 logger.warning(
                     "[Layer B] embedding 服务不可用(零向量) — KB 语义检索降级为 BM25 关键词检索。"

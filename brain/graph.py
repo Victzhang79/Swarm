@@ -630,8 +630,19 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
         logger.info("[A1] PG checkpointer 已初始化（跨副本 interrupt/resume 就绪）")
         return True
     except Exception as exc:  # noqa: BLE001
+        # TD2606-B12：多副本部署下降级 MemorySaver 会破坏【跨副本 interrupt/resume】——人工 ACCEPT
+        # 路由到另一副本时找不到 checkpoint，任务永久孤儿在 CONFIRMING/DELIVERING。
+        # SWARM_REQUIRE_PG_CHECKPOINTER=1 时 fail-closed 拒绝静默降级（生产多副本应启用）。
+        import os as _os
+        if _os.environ.get("SWARM_REQUIRE_PG_CHECKPOINTER", "").strip().lower() in ("1", "true", "yes"):
+            logger.error(
+                "[A1] PG checkpointer 初始化失败且 SWARM_REQUIRE_PG_CHECKPOINTER 已启用——"
+                "拒绝降级 MemorySaver（多副本 resume 不可用）: %s", exc
+            )
+            raise
         logger.warning(
-            "[A1] PG checkpointer 初始化失败，降级 MemorySaver（单机/开发模式不受影响）: %s", exc
+            "[A1] PG checkpointer 初始化失败，降级 MemorySaver（单机/开发不受影响；多副本部署请设"
+            " SWARM_REQUIRE_PG_CHECKPOINTER=1 强制 PG 以保跨副本 resume）: %s", exc
         )
         _pg_checkpointer = None
         _pg_checkpointer_cm = None
