@@ -673,6 +673,11 @@ async def plan(state: BrainState) -> dict:
                         for _opt in ("harness", "contract"):
                             if _opt in _st and _st[_opt] is None:
                                 _st.pop(_opt)
+                # TD2606-B17：create-signature 去重（dedupe_subtasks）此前只在批量 ultra 路径
+                # （merge_subtask_batches）跑。单发 plan 路径同样可能 LLM 吐重复脚手架子任务
+                # （RUN6 根因类）→ 在此对单发路径也做去重，使去重成为全路径不变量。
+                from swarm.brain.plan_batch import dedupe_subtasks
+                result["subtasks"] = dedupe_subtasks(result.get("subtasks", []) or [])
             task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
@@ -2616,12 +2621,24 @@ async def revision(state: BrainState) -> dict:
     if plan_obj:
         new_subtasks = list(plan_obj.subtasks) + [revision_subtask]
         new_parallel_groups = list(plan_obj.parallel_groups) + [[revision_subtask.id]]
-        updated_plan = TaskPlan(subtasks=new_subtasks, parallel_groups=new_parallel_groups)
+        updated_plan = TaskPlan(
+            subtasks=new_subtasks, parallel_groups=new_parallel_groups,
+            shared_contract=getattr(plan_obj, "shared_contract", {}) or {},  # B18：保留契约
+        )
     else:
         updated_plan = TaskPlan(
             subtasks=[revision_subtask],
             parallel_groups=[[revision_subtask.id]],
         )
+
+    # TD2606-B18：修订计划过去直接 dispatch，绕过 plan 路径的 scope 归一/冲突消解 → 修订子任务
+    # 的写权可能与保留的兄弟成果冲突。补做归一+冲突消解（与 plan 路径同源），不再裸派发。
+    try:
+        from swarm.brain.contract_utils import normalize_plan_scopes, resolve_plan_conflicts
+        updated_plan = normalize_plan_scopes(updated_plan)
+        updated_plan = resolve_plan_conflicts(updated_plan)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[REVISION] 计划归一/冲突消解跳过(非致命): %s", exc)
 
     # 保留已完成子任务的产出 —— 修订只新增一个 rev-* 子任务，不应丢弃此前所有
     # Worker 成果（否则 merge 阶段会丢失未被修订的文件 diff）。仅派发新子任务。
