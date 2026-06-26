@@ -16,8 +16,11 @@ from pathlib import Path
 from swarm.worker.l1_pipeline import (
     rewrite_jvm_namespace,
     parse_missing_packages,
+    parse_missing_versions,
     _attempt_import_repair,
+    _attempt_maven_version_repair,
     _attempt_build_repair,
+    _build_error_is_upstream,
     _stack_repair_langs,
     _tool_missing,
 )
@@ -278,3 +281,86 @@ if __name__ == "__main__":
             failed += 1
             print(f"  ❌ {fn.__name__}: {e}")
     sys.exit(1 if failed else 0)
+
+
+# ── P0-A：通用 pom 依赖对账——缺 <version> 元素注入（hutool reactor 毒根治） ──
+
+def test_parse_missing_versions():
+    out = (
+        "[ERROR] 'dependencies.dependency.version' for cn.hutool:hutool-all:jar is missing. @ line 33\n"
+        "The project com.ruoyi:ruoyi-generator:4.8.3 (/workspace/ruoyi-generator/pom.xml) has 1 error\n"
+    )
+    assert parse_missing_versions(out) == [("cn.hutool", "hutool-all")]
+    assert parse_missing_versions("无此类错误") == []
+
+
+def test_version_repair_injects_missing_version(monkeypatch):
+    """模块 pom 的依赖缺 <version>（非版本写错）→ 从仓库 metadata 注入有效版本。"""
+    import swarm.worker.l1_pipeline as L
+    monkeypatch.setattr(L, "_fetch_maven_versions",
+                        lambda g, a, p, t: ["5.8.0", "5.8.35", "5.7.22"])
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        pom = root / "ruoyi-generator" / "pom.xml"
+        pom.parent.mkdir(parents=True)
+        pom.write_text(
+            "<project>\n  <dependencies>\n"
+            "    <dependency>\n      <groupId>cn.hutool</groupId>\n"
+            "      <artifactId>hutool-all</artifactId>\n    </dependency>\n"
+            "  </dependencies>\n</project>\n"
+        )
+        build_out = ("[ERROR] 'dependencies.dependency.version' for "
+                     "cn.hutool:hutool-all:jar is missing.\n")
+        n, paths = _attempt_maven_version_repair(str(root), build_out, timeout=30)
+        assert n == 1, (n, paths)
+        assert "<version>5.8.35</version>" in pom.read_text()
+        assert any(p.endswith("pom.xml") for p in paths)
+
+
+def test_version_repair_skips_managed_pom(monkeypatch):
+    """带 dependencyManagement 的父 pom 不注入（受管块本就带版本，注入会造双 version）。"""
+    import swarm.worker.l1_pipeline as L
+    monkeypatch.setattr(L, "_fetch_maven_versions", lambda g, a, p, t: ["5.8.35"])
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        pom = root / "pom.xml"
+        pom.write_text(
+            "<project>\n  <dependencyManagement>\n    <dependencies>\n"
+            "      <dependency>\n        <groupId>cn.hutool</groupId>\n"
+            "        <artifactId>hutool-all</artifactId>\n        <version>5.8.0</version>\n"
+            "      </dependency>\n    </dependencies>\n  </dependencyManagement>\n</project>\n"
+        )
+        build_out = ("[ERROR] 'dependencies.dependency.version' for "
+                     "cn.hutool:hutool-all:jar is missing.\n")
+        n, _paths = _attempt_maven_version_repair(str(root), build_out, timeout=30)
+        assert n == 0, "受管父 pom 不应被注入"
+
+
+# ── P0-B：-am reactor 连坐——构建错归属判定 ──
+
+def test_upstream_error_not_blamed_on_subtask():
+    """-pl ruoyi-alarm 但报错在上游 ruoyi-generator 的坏 pom → 判上游(True)，不连坐本子任务。"""
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    out = ("[ERROR] 'dependencies.dependency.version' for cn.hutool:hutool-all:jar is missing.\n"
+           "The project com.ruoyi:ruoyi-generator:4.8.3 (/workspace/ruoyi-generator/pom.xml) has 1 error\n")
+    assert _build_error_is_upstream(out, cmd) is True
+
+
+def test_own_module_compile_error_is_capability():
+    """报错在本子任务自己的模块 → 非上游(False)，是真能力问题，照常判失败。"""
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    out = ("[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/x/A.java:[3,5] cannot find symbol\n")
+    assert _build_error_is_upstream(out, cmd) is False
+
+
+def test_mixed_own_and_upstream_is_not_excused():
+    """本模块也有错 + 上游也有错 → 不放过本子任务(False)。"""
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    out = ("The project com.ruoyi:ruoyi-generator:4.8.3 (/workspace/ruoyi-generator/pom.xml) has 1 error\n"
+           "[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/x/A.java:[3,5] cannot find symbol\n")
+    assert _build_error_is_upstream(out, cmd) is False
+
+
+def test_no_pl_or_no_error_is_false():
+    assert _build_error_is_upstream("some error", "mvn compile") is False
+    assert _build_error_is_upstream("BUILD SUCCESS", "mvn -pl ruoyi-alarm -am compile") is False
