@@ -240,6 +240,54 @@ def _run(command: str, cwd: Path | None = None, timeout: int = 120) -> str:
     return _run_local(command, cwd, timeout)
 
 
+# ── P1-C：命令规范化/守卫（减少本地小模型烧预算的无效命令）──
+_MVN_LIFECYCLE = {
+    "validate", "initialize", "generate-sources", "process-sources", "compile",
+    "process-classes", "test-compile", "test", "package", "verify", "install",
+    "deploy", "clean", "site", "integration-test", "prepare-package",
+}
+
+
+def _normalize_maven_module_command(command: str) -> tuple[str, bool]:
+    """把模型常犯的 `mvn compile <module>`（模块名当生命周期阶段，必报 Unknown lifecycle
+    phase）静默改写为正确的 `mvn -pl <module> -am compile`，省掉一轮白跑。
+
+    仅在【明确是该误用形态】（mvn + 生命周期阶段 + 恰一个裸模块名、且未含 -pl/-f）时改写，
+    否则原样返回，绝不误改正常命令。返回 (命令, 是否改写)。
+    """
+    parts = command.strip().split()
+    if len(parts) < 3 or parts[0] != "mvn":
+        return command, False
+    if any(p in ("-pl", "-f", "--projects", "--file", "-N") for p in parts):
+        return command, False
+    args = parts[1:]
+    phases = [p for p in args if p in _MVN_LIFECYCLE]
+    bare = [
+        p for p in args
+        if not p.startswith("-") and "=" not in p and ":" not in p
+        and "/" not in p and p not in _MVN_LIFECYCLE
+    ]
+    if phases and len(bare) == 1:
+        mod = bare[0]
+        rest = [p for p in args if p != mod]
+        return "mvn -pl " + mod + " -am " + " ".join(rest), True
+    return command, False
+
+
+def _guard_unhelpful_command(command: str) -> str | None:
+    """拦在沙箱里注定白烧步数的命令，返回一行提示（不执行）；无需拦截返回 None。
+
+    git 查看类：烤源沙箱（项目专属镜像）常【不含 .git】，git 必 128/129 失败；且沙箱内改动
+    由确定性 L1 闸门自动追踪，worker 本就无需用 git。拦掉省得模型反复撞失败。
+    """
+    if re.match(r"\s*git\s+(diff|log|status|show|blame|ls-files|rev-parse|stash)\b", command):
+        return (
+            "ℹ️ 沙箱内改动由确定性 L1 闸门自动追踪，无需也勿用 git 查看"
+            "（烤源沙箱常无 .git，git 命令会失败）。请直接读写文件，编译/验证交闸门。"
+        )
+    return None
+
+
 @tool
 def run_command(command: str, timeout: int = 120) -> str:
     """执行白名单内的 shell 命令。
@@ -270,6 +318,13 @@ def run_command(command: str, timeout: int = 120) -> str:
     has_injection, reason = _has_shell_injection(command)
     if has_injection:
         return f"⛔ 命令被拒绝：'{command}' 包含{reason}，可能存在 shell 注入风险。"
+
+    # P1-C：堵住本地小模型烧预算的两类无效命令（996db614 实测白烧几十步 → 喂大 900s 超时）。
+    guard = _guard_unhelpful_command(command)
+    if guard is not None:
+        return guard
+    # mvn 模块语法误用静默改写为正确 -pl 形式，省掉"Unknown lifecycle phase"白跑一轮。
+    command, _normalized = _normalize_maven_module_command(command)
 
     return _run(command, timeout=timeout)
 
