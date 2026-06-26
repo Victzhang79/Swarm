@@ -1941,8 +1941,13 @@ class WorkerExecutor:
             sid = self._sandbox.sandbox_id
             try:
                 if from_pool and pool is not None:
-                    # 归还：L1 通过/无异常的沙箱可复用；失败的不回池(可能脏)
-                    reusable = bool(getattr(self, "_l1_passed_flag", True))
+                    # 归还：L1 通过/无异常的沙箱可复用；失败的不回池(可能脏)。
+                    # TD2606-C4：项目专属镜像(_sandbox_has_source)把源码烤进 /workspace 且【不含 .git】。
+                    # 池复用前 clean_workspace 的 `rm -rf /workspace` 会抹掉烤进的源码 → 下个任务缺源编译失败；
+                    # 而仅"保留 /workspace"又会带入上个任务的改动破坏跨任务隔离。两难。故烤源沙箱【不回池】，
+                    # 每任务从【缓存镜像】创建新容器（镜像层仍含源码+.m2/warmup，启动快），杜绝抹源与污染两种 bug。
+                    reusable = bool(getattr(self, "_l1_passed_flag", True)) and not getattr(
+                        self, "_sandbox_has_source", False)
                     pool.release(self._sandbox, reusable=reusable)
                     self._log(f"远程沙箱已归还热池(reusable={reusable}): {sid}")
                 else:
