@@ -753,3 +753,59 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
         parallel_groups=[[i] for i in new_ids],
         shared_contract=getattr(plan, "shared_contract", None) or {},
     )
+
+
+# ── TD2606-B8：L2 集成失败归因（把失败定位到具体子任务，避免连坐全量 replan）──
+def build_writers_by_file(plan) -> dict[str, list[str]]:
+    """反转每个子任务的写权（create_files ∪ writable）→ {文件相对路径: [写者子任务 id]}。
+
+    与 contract_utils 的同名内联逻辑同源（单一事实源：scope 写权）。供 L2 失败归因把
+    编译出错的文件映射回拥有它的子任务。"""
+    writers: dict[str, list[str]] = {}
+    for st in getattr(plan, "subtasks", []) or []:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        files = list(getattr(scope, "create_files", []) or []) + list(
+            getattr(scope, "writable", []) or []
+        )
+        sid = getattr(st, "id", "")
+        for f in files:
+            f = str(f).strip()
+            if not f or not sid:
+                continue
+            ids = writers.setdefault(f, [])
+            if sid not in ids:
+                ids.append(sid)
+    return writers
+
+
+def attribute_l2_failure(plan, l2_details: dict | None, subtask_results: dict) -> list[str] | None:
+    """把 L2 集成失败归因到具体子任务 id 列表。无法可靠定位时返回 None（调用方回退全量 replan）。
+
+    证据来自 integration_review 的 compile_output + issues（已含出错文件路径）。对每个写权
+    文件，若其相对路径或 basename 出现在证据文本里 → 该文件的写者子任务判为失败源。
+    仅当结果非空【且为成功子任务集合的真子集】（即至少保留一个兄弟）时返回，否则 None
+    —— 退化为全量 replan 与现状一致，绝不因误归因而把本应保留的成功成果也连坐重做。"""
+    if not plan or not subtask_results:
+        return None
+    ir = (l2_details or {}).get("integration_review") or {}
+    blob = str(ir.get("compile_output") or "")
+    for it in (l2_details or {}).get("issues") or []:
+        blob += "\n" + str(it)
+    if not blob.strip():
+        return None
+    writers = build_writers_by_file(plan)
+    if not writers:
+        return None
+    failed: list[str] = []
+    for f, ids in writers.items():
+        base = os.path.basename(f)
+        if (f and f in blob) or (base and base in blob):
+            for sid in ids:
+                if sid in subtask_results and sid not in failed:
+                    failed.append(sid)
+    all_ids = set(subtask_results.keys())
+    if failed and set(failed) < all_ids:
+        return failed
+    return None

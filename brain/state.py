@@ -108,6 +108,7 @@ class BrainState(TypedDict, total=False):
     # audit #30：rebase 不计入 subtask_retry_counts（策略性重生成≠失败重试），但需独立上限
     # 防 rebase→fail→rebase 无限循环。记录每个子任务的累计 rebase 次数。
     subtask_rebase_counts: dict[str, int]
+    l2_targeted: bool                   # TD2606-B8：L2 失败已归因到具体子任务（定向重做，保留成功兄弟）
     l2_passed: bool                     # L2 集成测试是否通过
     l3_passed: bool | None              # L3 预发验证结果（None=跳过）
     l3_skipped: bool                    # L3 是否跳过
