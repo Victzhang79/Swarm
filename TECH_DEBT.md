@@ -40,11 +40,21 @@
 > 的 `rm -rf /workspace` 抹掉源码（下任务缺源编译失败），仅保留又带入上任务改动破坏隔离。两难。
 > 故烤源沙箱(`_sandbox_has_source`)【不回池】(kill_sandbox 设 reusable=False)，每任务从缓存镜像
 > 创建新容器（镜像层仍含源码+.m2/warmup，启动快）→ 杜绝抹源与污染两种 bug。+测试。
+> ⑩ B8 L2 集成失败连坐全表：`_l2_failure_state` 原把 subtask_results 全部 key 标失败 →
+> handle_failure 全量 replan，40/41 个 L1 通过的子任务被推倒重来。改为据 integration_review
+> 编译输出把失败【归因】到具体子任务（写权文件出现在编译错误里 → 该文件写者），handle_failure
+> 走【定向恢复】只重做归因子任务、保留成功兄弟（复用 replan 守卫模式）；归因不了才回退全量
+> replan（与现状一致，绝不误连坐）。replan_count 共用熔断。+测试。
+> ⑪ C9 修复只活在沙箱：L1 闸门 sandbox-first 修复（version-repair/import-repair/goimports…）
+> 改的是沙箱文件，但 `_sync_from_sandbox` 只 pull-back 写权 scope、`_get_git_diff` 也只 diff
+> scope 内文件 → scope 外被修复文件（典型：父 pom 版本号）回不到本地、缺席 merged_diff →
+> brain 端 L2 集成在干净树上重炸。改：repair 函数返回触达文件【路径】(非仅计数) → run_l1_pipeline
+> 透传 `repaired_file_paths` → executor 累积 `_repaired_extra_paths`，并入 pull-back 清单与
+> git diff targets（含 difflib 基线），per-file provenance 收口两棵真值树。+测试。
 > **部分处理 / 标签校正 (PARTIAL，剩余)**：
 > B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in；
 > 改默认会破坏现有部署，属【部署策略决策】留运维拍板，非代码缺陷）。
-> **留待专门设计/大改 (DEFERRED)**：B8（L2 file→subtask 归因+恢复重构）·
-> C9（fix 轮本地↔沙箱同步需 per-file provenance）。
+> **留待专门设计/大改 (DEFERRED)**：~~B8 · C9~~ → 已于 2026-06-26 清偿（见上 ⑩⑪），DEFERRED 清空。
 > **方法固有近似/低危 latent (WON'T-FIX，理由校正)**：B13 · C12 · C15 · C18 ·
 > C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
 > C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——
@@ -114,7 +124,7 @@ Central 兜底 / `_is_infra_failure` 串表）全是把*某一个*"没验证"场
 - **TD2606-B7 构建闸门 manifest find 深度3 把"找不到 pom"当 build PASS**：
   `worker/l1_pipeline.py:603-640,1330-1370`（`:1367` elif 分支）。"工具不适用"与"定位不到
   清单"被混为一谈，都判绿。
-- **TD2606-B8 L2 失败连坐全部 subtask→replan 清空全部成功成果**：`brain/nodes/verify.py:
+- **TD2606-B8 ✅FIXED(2026-06-26) L2 失败连坐全部 subtask→replan 清空全部成功成果**：`brain/nodes/verify.py:
   248-255` `failed_ids = list(subtask_results.keys())`。40/41 成功+1 集成问题 → 全量重建，
   击穿"保留成功兄弟"guard。L2 失败无法定位到具体文件/子任务。
 - **TD2606-B9 capability 探测 transient 把 probed 降级 default 且永不恢复**：
@@ -180,7 +190,7 @@ Central 兜底 / `_is_infra_failure` 串表）全是把*某一个*"没验证"场
 - **TD2606-C8 malformed 非空 diff 解析到 0 文件→PASS**：`worker/l1_pipeline.py:1312-1317`
   含垃圾无 `+++ b/` 头的非空 diff，`empty_diff` 检测（查空串）放过它进 run_l1_pipeline → 无
   harness 项目判 True。
-- **TD2606-C9 fix 轮间本地↔沙箱只部分同步**：`worker/executor.py:757-758,1585-1646` 仅 JVM
+- **TD2606-C9 ✅FIXED(2026-06-26) fix 轮间本地↔沙箱只部分同步**：`worker/executor.py:757-758,1585-1646` 仅 JVM
   修复回传，无通用 local→sandbox 再同步 → 两棵真值树（本地 diff/scope vs 沙箱 compile/test）
   按修复类型 ad-hoc 同步，可静默分叉。
 - **TD2606-C10 L2 散文验收→零测试通过且 degraded 标记不 gate**：`brain/nodes/verify.py:

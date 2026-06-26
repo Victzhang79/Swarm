@@ -1626,6 +1626,15 @@ def _serialize_pom_writers(plan_obj, pom_by_id: dict) -> None:
             _add_dep_safe(by_id, members[i], members[i - 1])
 
 
+def _subtask_out_l1_passed(out) -> bool:
+    """子任务输出 L1 是否通过（WorkerOutput 或 dict 两种形态）。供保留成功兄弟判定。"""
+    if isinstance(out, WorkerOutput):
+        return bool(out.l1_passed)
+    if isinstance(out, dict):
+        return bool(out.get("l1_passed"))
+    return False
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -1657,6 +1666,43 @@ async def handle_failure(state: BrainState) -> dict:
                 "l2_passed": False,
                 "replan_count": _l2_replan,
             }
+        # TD2606-B8：L2 失败已归因到具体子任务（verify_l2 设 l2_targeted）+ 存在成功兄弟
+        # → 定向恢复：只重做归因到的子任务、保留成功成果，不全量推倒重来。replan_count 仍
+        # 自增（与全量 replan 共用熔断，上面已判上限），杜绝定向重试→L2→定向重试无限循环。
+        if state.get("l2_targeted") and failed_ids:
+            succeeded_siblings = [
+                sid for sid, out in subtask_results.items()
+                if sid not in failed_ids and _subtask_out_l1_passed(out)
+            ]
+            if succeeded_siblings:
+                dispatch_remaining = list(state.get("dispatch_remaining", []))
+                for fid in failed_ids:
+                    subtask_results.pop(fid, None)
+                    if fid not in dispatch_remaining:
+                        dispatch_remaining.append(fid)
+                # L2 集成失败非这些子任务的 capability 失败（它们各自 L1 已过）→ 重置其重试计数，
+                # 不无谓烧 capability 配额；循环边界由 replan_count 熔断保证。
+                _rc = dict(state.get("subtask_retry_counts", {}))
+                for fid in failed_ids:
+                    _rc[fid] = 0
+                logger.info(
+                    "[HANDLE_FAILURE] L2 定向恢复（第 %d/%d 次）：集成失败归因到 %s，"
+                    "保留 %d 个成功兄弟 %s，仅重做归因子任务，不全量 replan",
+                    _l2_replan, _l2_max, failed_ids, len(succeeded_siblings), succeeded_siblings,
+                )
+                return {
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": dispatch_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry",
+                    "verification_failure": None,
+                    "l2_passed": False,
+                    "l2_targeted": False,
+                    "replan_count": _l2_replan,
+                    "subtask_retry_counts": _rc,
+                    "targeted_recovery": True,
+                }
+
         logger.info("[HANDLE_FAILURE] L2 集成验证失败 — 触发 replan (第 %d/%d 次)",
                     _l2_replan, _l2_max)
         return {

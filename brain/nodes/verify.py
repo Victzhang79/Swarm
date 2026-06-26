@@ -22,6 +22,7 @@ from swarm.brain.nodes.shared import (
     _diff_has_changes,
     _l2_test_command_from_criteria,
     _parse_json_from_llm,
+    attribute_l2_failure,
 )
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
@@ -90,7 +91,13 @@ async def verify_l2(state: BrainState) -> dict:
                     "failed_subtask_ids": list(subtask_results.keys()),
                     "l2_details": {"integration_review": ir_details, "issues": ir_issues},
                 }
-            return _l2_failure_state(subtask_results)
+            # TD2606-B8：把集成编译失败归因到具体子任务（编译输出已含出错文件路径），
+            # 能定位则只重做相关子任务、保留成功兄弟；定位不了回退现状（全量 replan）。
+            _l2_details = {"integration_review": ir_details, "issues": ir_issues}
+            attributed = attribute_l2_failure(plan_obj, _l2_details, subtask_results)
+            return _l2_failure_state(
+                subtask_results, attributed_ids=attributed, l2_details=_l2_details
+            )
 
     if (merged_diff or "").strip() and test_cmd.strip():
         sandbox_result = nodes._try_l2_sandbox_verify(
@@ -245,14 +252,26 @@ async def verify_l3(state: BrainState) -> dict:
     }
 
 
-def _l2_failure_state(subtask_results: dict) -> dict:
-    failed_ids = list(subtask_results.keys()) if subtask_results else []
-    return {
+def _l2_failure_state(
+    subtask_results: dict,
+    attributed_ids: list[str] | None = None,
+    l2_details: dict | None = None,
+) -> dict:
+    """L2 失败态。TD2606-B8：attributed_ids 非空 → 只把这些子任务标失败并打 l2_targeted，
+    供 handle_failure 走定向恢复（保留成功兄弟）；否则连坐全部、走原全量 replan。"""
+    state: dict = {
         "l2_passed": False,
         "verification_failure": "l2",
         "failure_strategy": "replan",
-        "failed_subtask_ids": failed_ids,
     }
+    if l2_details:
+        state["l2_details"] = l2_details
+    if attributed_ids:
+        state["failed_subtask_ids"] = list(attributed_ids)
+        state["l2_targeted"] = True
+    else:
+        state["failed_subtask_ids"] = list(subtask_results.keys()) if subtask_results else []
+    return state
 
 
 def _l3_failure_state() -> dict:
