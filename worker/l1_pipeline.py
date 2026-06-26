@@ -187,6 +187,28 @@ def parse_missing_artifacts(build_output: str) -> list[tuple[str, str, str]]:
     return out
 
 
+# 另一类形态：模型给依赖【根本没写 <version>】且父 dependencyManagement 也不管它 →
+# `'dependencies.dependency.version' for G:A:jar is missing`（pom 解析期错，早于 artifact 解析）。
+# 与「版本写错」是同一【模型手写依赖坐标不可靠】问题类的不同表象——统一在依赖对账里处理，
+# 不再逐错加正则（避免 §0 的 whack-a-mole）。
+_MISSING_VERSION_RE = re.compile(
+    r"'dependencies\.dependency\.version' for "
+    r"([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|pom|war|zip|maven-plugin|ejb|bundle)"
+    r"\b[^\n]*?\bis missing"
+)
+
+
+def parse_missing_versions(build_output: str) -> list[tuple[str, str]]:
+    """解析【缺 <version> 元素】的依赖 =(groupId, artifactId)，去重保序。纯函数、可单测。"""
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for g, a in _MISSING_VERSION_RE.findall(build_output or ""):
+        if (g, a) not in seen and g and a:
+            seen.add((g, a))
+            out.append((g, a))
+    return out
+
+
 def _fetch_maven_versions(group: str, artifact: str, project_path: str, timeout: int) -> list[str]:
     """查仓库 maven-metadata.xml 列出 artifact 的真实可用版本（aliyun→Central 兜底）。
 
@@ -221,20 +243,26 @@ def _choose_valid_version(bad: str, available: list[str]) -> str | None:
 def _attempt_maven_version_repair(
     project_path: str, build_output: str, timeout: int
 ) -> tuple[int, list[str]]:
-    """治本·通用：把 pom 里【不存在的依赖版本】确定性校正为最近有效版本。
+    """治本·通用：pom 依赖【版本】对账——统一处理「模型手写依赖坐标不可靠」整类机械错。
+
+    覆盖两种表象（同一问题类，不再逐错加正则）：
+      ① 版本写错/不存在（`Could not find artifact G:A:jar:V`）→ 校正为最近有效版本。
+      ② 根本没写 <version>（`'dependencies.dependency.version' for G:A is missing`）→ 注入
+         一个有效版本（从仓库 metadata 取最新；仅在【无 dependencyManagement 的模块 pom】注入，
+         避免误碰父 pom 受管块产生双 version）。
 
     返回 (改动 pom 数, 改动 pom 相对路径列表)。TD2606-C9：父 pom 常在子任务写权 scope
     之外，被修复后必须随路径回传本地，否则修复只活在沙箱、merged_diff 缺失 → 集成重炸。
 
-    安全自证：只在 build 已失败时触发；查仓库确认版本【确实不存在】才改；改完调用方重跑构建，
-    修错（改成另一个不可用版本）则重跑仍失败=绝不制造假通过。版本号同时出现在内联
-    <version> 与 <xxx.version> 属性（可能在父 pom）两处，均覆盖；仅在 version 标签行替换，
-    不碰同值的非版本标签。
+    安全自证：只在 build 已失败时触发；改完调用方重跑构建，修错（不可用版本/双 version）则重跑
+    仍失败=绝不制造假通过。
     """
     missing = parse_missing_artifacts(build_output)
-    if not missing:
+    missing_versions = parse_missing_versions(build_output)
+    if not missing and not missing_versions:
         return 0, []
     changed: set[str] = set()
+    # ── ① 版本写错/不存在 → 校正 ──
     for group, artifact, bad_ver in missing[:8]:
         available = _fetch_maven_versions(group, artifact, project_path, timeout)
         good_ver = _choose_valid_version(bad_ver, available)
@@ -263,6 +291,40 @@ def _attempt_maven_version_repair(
             "[L1.2.1·version-repair] %s:%s 版本 %s 不存在（仓库可用最高=%s）→ 校正为 %s（%d pom）",
             group, artifact, bad_ver,
             max(available, key=_ver_key) if available else "?", good_ver, len(poms),
+        )
+    # ── ② 缺 <version> 元素 → 注入有效版本 ──
+    for group, artifact in missing_versions[:8]:
+        available = _fetch_maven_versions(group, artifact, project_path, timeout)
+        if not available:
+            continue  # 查不到可用版本 → 不动（缺依赖而非缺版本，交其它防线/定向恢复）
+        good_ver = max(available, key=_ver_key)
+        art_esc = artifact.replace(".", r"\.")
+        gcmd = (
+            f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null"
+        )
+        _ec, gout, _err = _run_check_split(gcmd, project_path, timeout=30)
+        poms = sorted({line.strip() for line in (gout or "").splitlines() if line.strip()})
+        for pom in poms:
+            # 只在【无 dependencyManagement 的模块 pom】注入：父 pom 的受管块本就带版本，
+            # 误插会造双 version。模块 pom 里该 artifactId 唯一，插在其后安全。
+            _gc, gmgmt, _ge = _run_check_split(
+                f"grep -c '<dependencyManagement>' '{pom}'", project_path, timeout=10
+            )
+            if (gmgmt or "").strip() not in ("", "0"):
+                continue
+            # 在该 artifact 的 <artifactId> 行后插入 <version>（模块 pom 内唯一，安全）。
+            # 用 perl（GNU/BSD/沙箱皆一致，避开 sed a\ 在 BSD 上不可用），\Q\E 字面转义。
+            scmd = (
+                f"perl -i.bak -pe "
+                f"'s#(<artifactId>\\Q{artifact}\\E</artifactId>)#$1\\n            "
+                f"<version>{good_ver}</version>#' '{pom}' && rm -f '{pom}.bak'"
+            )
+            ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
+            if ec2 == 0:
+                changed.add(pom)
+        logger.info(
+            "[L1.2.1·version-repair] %s:%s 缺 <version> → 注入 %s（%d pom，受管 pom 跳过）",
+            group, artifact, good_ver, len(poms),
         )
     return len(changed), sorted(changed)
 
@@ -1043,6 +1105,17 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
         messages.append("checkstyle 未安装，跳过 Java lint")
         return has_error, messages, issues
 
+    # P2-F：沙箱里多半未装 checkstyle——开跑前先廉价探在场，缺则直接 skip，省掉注定 exit 127
+    # 的命令（减少白跑往返与日志噪声；996db614 每个过编的子任务都白敲一次 checkstyle）。
+    if _sandbox_ctx() is not None:
+        _pc, _po = _run_l1_command(
+            "command -v checkstyle >/dev/null 2>&1 && echo __HAS__ || echo __NO__",
+            project_path, timeout=15,
+        )
+        if "__HAS__" not in (_po or ""):
+            messages.append("checkstyle 未安装(沙箱)，跳过 Java lint")
+            return has_error, messages, issues
+
     try:
         cmd = "checkstyle " + " ".join(f'"{f}"' for f in _cap_files(java_files, "checkstyle"))
         rc, out, err = _run_check_split(cmd, project_path, timeout=timeout)
@@ -1329,6 +1402,44 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     return command.replace("mvn", f"mvn -pl {pl} -am", 1)
 
 
+# ── P0-B：构建错误归属判定（本子任务模块 vs 上游模块）──
+_POM_ERR_MODULE_RE = re.compile(r"The project [\w.\-]+:([\w.\-]+):")
+_COMPILE_ERR_PATH_RE = re.compile(r"(?:^|[ /])([A-Za-z0-9_.\-]+)/src/(?:main|test)/")
+
+
+def _pl_modules_from_cmd(build_cmd: str) -> set[str]:
+    """从闸门命令里抽本子任务【自己的】模块（-pl <a,b> 的各段末路径名）。"""
+    m = re.search(r"-pl\s+(\S+)", build_cmd or "")
+    if not m:
+        return set()
+    out: set[str] = set()
+    for seg in m.group(1).split(","):
+        seg = seg.strip().lstrip("!").strip("/")
+        if seg:
+            out.add(seg.split("/")[-1])
+    return out
+
+
+def _build_error_modules(build_output: str) -> set[str]:
+    """从构建输出抽【报错所在模块】：pom 解析错的 `The project G:art` + 编译错的文件路径段。"""
+    mods = {m.group(1) for m in _POM_ERR_MODULE_RE.finditer(build_output or "")}
+    mods |= {m.group(1) for m in _COMPILE_ERR_PATH_RE.finditer(build_output or "")}
+    return {x for x in mods if x}
+
+
+def _build_error_is_upstream(build_output: str, build_cmd: str) -> bool:
+    """构建错是否【全在本子任务模块之外】（上游模块坏，非本子任务能力问题）。
+
+    本子任务模块取自 `-pl`；报错模块取自输出。两者都非空且【报错模块不含本模块】→ True。
+    报错里只要含本模块（自己也有错）→ False（不放过本子任务）。
+    """
+    own = _pl_modules_from_cmd(build_cmd)
+    errs = _build_error_modules(build_output)
+    if not own or not errs:
+        return False
+    return own.isdisjoint(errs)
+
+
 def run_l1_pipeline(
     project_path: str,
     subtask: SubTask,
@@ -1442,6 +1553,20 @@ def run_l1_pipeline(
                     logger.warning(
                         "[L1.2.1] 构建命中 infra 瞬时故障，标 BLOCKED 转 transient 重试: %s",
                         (b_out or "")[:200],
+                    )
+                    return True, details
+                # P0-B：错误归属——构建错若【全在本子任务模块之外的上游模块】（如 -pl ruoyi-alarm
+                # 但报错在 ruoyi-generator 的坏 pom），是上游子任务没收尾，非本子任务能力问题。
+                # 标 BLOCKED 交退避重试（待上游 pom 被其 owner/对账修好），不烧本子任务修复轮——
+                # 杜绝一个坏 pom 经 -am reactor 连坐拖死十几个无辜子任务（996db614 实测）。
+                if _build_error_is_upstream(b_out, build_cmd):
+                    details["l1_2_1_build_ok"] = None
+                    details["build_blocked"] = build_cmd
+                    details["pipeline_blocked"] = "upstream_module_broken"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    logger.warning(
+                        "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
+                        "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
                     )
                     return True, details
                 details["build_failed"] = build_cmd
