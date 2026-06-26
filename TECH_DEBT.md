@@ -13,6 +13,22 @@
 > 全树跨切面。**四视角独立收敛到同一根因。** ✅ = 已亲自复核原文；其余为子审计报告，
 > 落地前需在 plan 阶段逐条复核 file:line。ID 形如 TD2606-X# 供 plan/commit 引用。
 
+> ### 清偿状态（2026-06-26，Waves 0–4，11 commit，全程 1531 passed）
+> **已修复 (FIXED)**：A1/A2/A3/A4/A5/A6/A7/A8（fail-closed 根因+编排 CRITICAL）·
+> B1（schema 边界）· B3 · B5/C5/M5（并发 git 锁）· B11 · B12 · B14 · B15 · B17 · B18 ·
+> C1 · C2 · C6 · C8 · C14 · C16。
+> **核查后判定已充分处理 (ALREADY-OK)**：B19（无条件 WARN+REQUIRE opt-in）·
+> B20（detect_stack fingerprint 缓存+重探）· C3（已在 nodes/__init__.py:1065 调用）·
+> C10（degraded_reasons 已是 reducer 一等字段+透传）· C13（think/fence/逐对象 salvage 已鲁棒）。
+> **留待专门设计/大改 (DEFERRED — 需careful design，避免半改回归)**：
+> B8（L2 失败定位——需可靠 file→subtask 归因 + 恢复策略重构）·
+> B16（7 个 store 走连接池——大面积机械重构，现状可用仅并发下低效，属scale优化非正确性）·
+> C4（clean_workspace 抹烤源——依赖 pool+镜像+同步交互，需 image-type 标记）·
+> C7（pool 临时沙箱异常泄漏）· C9（fix 轮本地↔沙箱同步）。
+> **方法固有近似/低危 latent (WON'T-FIX 记录在案)**：B13（失败文本分类）·
+> C11（norms LLM 无法离线证伪）· C12（probe 下界）· C15（regex 符号抽取）·
+> C17（ContextVar 当前 explicit-arg 已安全）· C18（co-occurrence 排序噪声）。
+
 ### §0 根因主线（THE root cause）
 
 **系统没有"未验证模型输出"与"可信内部状态"之间的类型边界；其裁决器把"验证没跑"
