@@ -456,6 +456,9 @@ class WorkerExecutor:
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
         self._repaired_extra_paths: set[str] = set()
+        # P1-D：fix 循环 no-progress 早停——记上一轮确定性失败签名 + 连同次数。
+        self._last_fail_sig: str = ""
+        self._same_fail_streak: int = 0
 
         # 归一化 scope：Brain 有时把【已存在】文件误判进 create_files（如"给现有
         # ruoyi.js 加函数"），create_files 走"新建"路径(不上传/不读取原内容)会丢内容。
@@ -878,6 +881,23 @@ class WorkerExecutor:
                 # 同时这是 TD2606-B6「fix 循环无 no-progress 检测」开的第一刀。
                 if verdict.source == "verification_not_run":
                     self._log("L1 验证未能执行(BLOCKED)，提前结束 fix 循环，转交 brain 退避重试")
+                    break
+
+                # P1-D（TD2606-B6 第二刀）：no-progress 早停——确定性闸门连轮吐【完全相同的
+                # 失败签名】(同一组编译错/同一坏 pom)说明上一轮"修复"毫无进展（996db614 实测
+                # 模型把 4 轮 + 900s 全烧在同一个 cannot find symbol 上）。提前结束交 brain，
+                # 不空烧到超时。签名按【整组归一化错误行】算：模型只要修掉任一错→签名变→重置。
+                _sig = self._failure_signature(l1_details)
+                if _sig and _sig == self._last_fail_sig:
+                    self._same_fail_streak += 1
+                else:
+                    self._same_fail_streak = 0
+                self._last_fail_sig = _sig
+                if _sig and self._same_fail_streak >= 1:
+                    self._log(
+                        "fix 循环连续 2 轮同一失败签名、零进展 → 提前结束交 brain 退避"
+                        "（修不动，不空烧到超时）"
+                    )
                     break
 
                 if fix_round < self.max_fix_rounds:
@@ -2433,6 +2453,33 @@ class WorkerExecutor:
             "tests_passed": bool(re.search(r"测试.*通过|tests?.*pass", text, re.IGNORECASE)),
         }
         return passed, details
+
+    @staticmethod
+    def _failure_signature(l1_details: dict) -> str:
+        """P1-D：把确定性闸门的失败归一化成稳定签名，用于跨轮 no-progress 比对。
+
+        取 build/test/compile 输出里的错误行，剥掉行列号/绝对路径/ANSI（这些每轮可能抖动但
+        不代表进展），对【去重排序后的错误行集合】求 hash。整组错误一字不变 → 同签名 → 无进展。
+        """
+        if not isinstance(l1_details, dict):
+            return ""
+        import hashlib
+        blob = "\n".join(
+            str(l1_details.get(k) or "")
+            for k in ("build_output", "test_output", "compile_message", "reason", "build_failed")
+        )
+        if not blob.strip():
+            return ""
+        t = re.sub(r"\x1b\[[0-9;]*m", "", blob)                       # 去 ANSI
+        t = re.sub(r":\[\d+,\d+\]", ":[L,C]", t)                      # 去行列号
+        t = re.sub(r"(/[^\s:]+)+/", "<path>/", t)                     # 去绝对路径
+        # 去掉每轮必抖动但与进展无关的噪声（时长/时间戳/maven 下载进度）
+        t = re.sub(r"(?m)^.*(Total time|Finished at|Progress \(\d+\)|"
+                   r"Download(ing|ed) from).*$", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            return ""
+        return hashlib.md5(t.encode("utf-8")).hexdigest()[:12]
 
     def _record_repaired_paths(self, details: dict) -> None:
         """TD2606-C9：登记 L1 闸门在沙箱里确定性修复的文件相对路径。
