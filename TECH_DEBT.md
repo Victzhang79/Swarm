@@ -34,12 +34,13 @@
 > 本身避免误伤无测试 docs 任务，但绝不学成可复用成功模式；+测试）。
 > ⑦ B20 worker 端：`_resolve_project_stack` 用廉价 `compute_repo_fingerprint` 比对缓存指纹，
 > 漂移（栈迁移）则整画像重探，不再盲信旧前后端裁决喂 worker。
+> ⑧ C7 pool 临时沙箱孤儿：`_create_and_return` 包 try/except——create 成功后记账/注册若抛异常，
+> 立即 kill 刚建的沙箱再抛，杜绝调用方拿不到引用的远端孤儿泄漏。
 > **部分处理 / 标签校正 (PARTIAL，剩余)**：
 > B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in；
 > 改默认会破坏现有部署，属【部署策略决策】留运维拍板，非代码缺陷）。
 > **留待专门设计/大改 (DEFERRED)**：B8（L2 file→subtask 归因+恢复重构）·
-> C4（clean_workspace 需 image-type 标记）· C7（pool 临时沙箱窄窗泄漏，~5 行 try/finally 可补）·
-> C9（fix 轮本地↔沙箱同步需 per-file provenance）。
+> C4（clean_workspace 需 image-type 标记）· C9（fix 轮本地↔沙箱同步需 per-file provenance）。
 > **方法固有近似/低危 latent (WON'T-FIX，理由校正)**：B13 · C12 · C15 · C18 ·
 > C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
 > C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——

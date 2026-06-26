@@ -245,29 +245,41 @@ class HotSandboxPool:
 
         sandbox = self._create_sandbox(template_id, project_id=project_id, task_id=task_id)
 
-        with self._lock:
-            self._created_total += 1
-            # 记录首次创建时间（跨 acquire/release 保持，TTL 据此判定）
-            self._created_at[sandbox.sandbox_id] = time.monotonic()
-            if not is_temp:
-                self._borrowed += 1
-            # 标记临时沙箱（release 时自动 kill）
+        # TD2606-C7：create 成功后的记账/注册若抛异常，调用方拿不到 sandbox、它也未入池 →
+        # 远端孤儿永不会被 release/kill。包 try/except，记账失败立即 kill 刚建的沙箱再抛。
+        try:
+            with self._lock:
+                self._created_total += 1
+                # 记录首次创建时间（跨 acquire/release 保持，TTL 据此判定）
+                self._created_at[sandbox.sandbox_id] = time.monotonic()
+                if not is_temp:
+                    self._borrowed += 1
+                # 标记临时沙箱（release 时自动 kill）
+                if is_temp:
+                    self._temp_sids.add(sandbox.sandbox_id)
+
             if is_temp:
-                self._temp_sids.add(sandbox.sandbox_id)
+                # 注册 meta（虽然临时，也需要绑定 task）
+                try:
+                    self._manager.register_sandbox_meta(
+                        sandbox.sandbox_id,
+                        project_id=project_id,
+                        task_id=task_id,
+                        source="pool-temp",
+                    )
+                except Exception:
+                    logger.warning("register_sandbox_meta failed for temp sandbox %s", sandbox.sandbox_id, exc_info=True)
 
-        if is_temp:
-            # 注册 meta（虽然临时，也需要绑定 task）
+            return sandbox
+        except Exception:
+            sid = getattr(sandbox, "sandbox_id", None)
+            logger.warning("C7: 沙箱创建后记账失败，kill 孤儿沙箱 %s", sid, exc_info=True)
             try:
-                self._manager.register_sandbox_meta(
-                    sandbox.sandbox_id,
-                    project_id=project_id,
-                    task_id=task_id,
-                    source="pool-temp",
-                )
-            except Exception:
-                logger.warning("register_sandbox_meta failed for temp sandbox %s", sandbox.sandbox_id, exc_info=True)
-
-        return sandbox
+                if sid:
+                    self._manager.kill(sid)
+            except Exception:  # noqa: BLE001
+                logger.warning("C7: 清理孤儿沙箱失败 %s", sid, exc_info=True)
+            raise
 
     def release(self, sandbox: Any, *, reusable: bool = True) -> None:
         """归还沙箱。
