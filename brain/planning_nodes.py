@@ -1317,9 +1317,12 @@ async def tech_design(state: BrainState) -> dict:
 # 三段式（治本 runaway）：契约不再一次性全局生成（云端 reasoning 模型实测 GLM-5.2/Kimi 均 20+min/
 # 6w chunk 才 stall），改 Stage A 全局骨架(小) + Stage B 逐模块并发(各自 owns 的片) + Stage C 确定性合并。
 # 每调用小而有界、可并发，runaway 从根上消失，且随模块数水平扩展。镜像 _tech_design_staged 的成熟模式。
-_CONTRACT_CONCURRENCY = 3       # 单云端 key 友好的并发上限（同 Stage2）
-_CONTRACT_MAX_ATTEMPTS = 3      # 单模块契约片失败重试（空响应/瑕疵/超时多为瞬时）
-_CONTRACT_STAGE_TIMEOUT = 300.0  # 秒/调用：契约片比 file_plan 小，比 Stage2 的 500s 更紧
+# P1-E（996db614 实测）：慢 brain 模型（GLM-5.2 单调用 100-270s）+ 并发 3 争抢单端点 →
+# 2/10 模块契约片撑爆 300s 超时丢失 → 下游缺契约靠重试自愈、代价巨大。
+# 治本：降并发（每调用更快、超时更少）+ 上调单调用超时（给慢模型留空间）+ 重试退避。均可 env 调。
+_CONTRACT_CONCURRENCY = int(os.environ.get("SWARM_CONTRACT_CONCURRENCY", "2") or "2")
+_CONTRACT_MAX_ATTEMPTS = int(os.environ.get("SWARM_CONTRACT_MAX_ATTEMPTS", "3") or "3")
+_CONTRACT_STAGE_TIMEOUT = float(os.environ.get("SWARM_CONTRACT_STAGE_TIMEOUT", "600") or "600")
 
 # ── Stage A：全局骨架（只定没有单一模块归属、必须全局统一的部分）──
 CONTRACT_SKELETON_SYSTEM = """你是系统架构师，为一个【多模块大型需求】定【全局骨架】——只定那些
@@ -1606,9 +1609,11 @@ async def contract_design(state: BrainState) -> dict:
                     _last_err = str(exc)[:200]
             if _attempt < _CONTRACT_MAX_ATTEMPTS:
                 logger.warning(
-                    "[CONTRACT_MODULE] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试",
+                    "[CONTRACT_MODULE] 模块 %d/%d '%s' 第 %d 次失败(%s)，退避重试",
                     mi, mod_total, mod_name, _attempt, _last_err,
                 )
+                # P1-E：退避——超时/瞬时拥塞多因端点争抢，给它喘息再试（指数，封顶 10s）。
+                await _asyncio.sleep(min(2.0 * _attempt, 10.0))
         logger.error(
             "[CONTRACT_MODULE] 模块 %d/%d '%s' 重试 %d 次仍失败（该模块契约片丢失）: %s",
             mi, mod_total, mod_name, _CONTRACT_MAX_ATTEMPTS, _last_err,
