@@ -484,6 +484,21 @@ def _parse_json_from_llm(text: str | list) -> dict:
         return repaired
 
 
+def parse_and_validate(text: str | list, model_cls):
+    """解析 LLM JSON 并按 Pydantic 模型校验（Wave 1 / TD2606-B1 的类型边界）。
+
+    成功 → 返回校验后的【模型实例】（载荷关键字段已类型化）。
+    失败（JSON 解析失败 / 形状非法 / 缺载荷关键字段）→ 抛异常，由调用方【显式降级/重试】，
+    绝不静默返回错形 dict 让坏数据流向下游。
+
+    Args:
+        text: LLM response.content（str 或多模态 list）。
+        model_cls: pydantic BaseModel 子类（见 brain/llm_schemas.py）。
+    """
+    data = _parse_json_from_llm(text)
+    return model_cls.model_validate(data)
+
+
 def _brain_profile_prompt(state: BrainState) -> str:
     return state.get("user_profile_prompt_brain") or "（未加载用户画像）"
 

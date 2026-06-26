@@ -143,6 +143,13 @@ def apply_sandbox_env(config: SandboxConfig | None = None) -> SandboxConfig:
 
 def reset_sandbox_manager() -> None:
     """测试或配置重载后重置单例"""
+    # TD2606-B15：先连带重置热池（drain 需 manager 仍活着 kill 池内沙箱），再清 manager 单例。
+    # 否则热池单例仍持死 manager 引用、borrowed 不归零 → 后续 acquire 退化 throwaway churn。
+    try:
+        from swarm.worker.sandbox_pool import reset_sandbox_pool
+        reset_sandbox_pool()
+    except Exception:  # noqa: BLE001
+        pass
     global _sandbox_manager
     if _sandbox_manager is not None:
         try:

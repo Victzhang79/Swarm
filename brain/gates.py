@@ -30,6 +30,15 @@ def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
         phase-2 设计生成失败 → 这些模块文件丢失、file_plan 不完整。绝不能让 auto_accept
         把"交付不完整"的任务静默放行当成功，须升级人工审核残缺的设计。
     """
+    # TD2606-A5：规划 LLM 失败产出的空 scope「无验证」兜底假计划。validate_plan 可能把这种
+    # 单子任务结构判"合法"(plan_valid=True) → 旧逻辑会静默 auto_accept → dispatch → 空 diff →
+    # 假 DONE。专用标记 fail-fast 拦下，不得静默放行，须人工介入。
+    if state.get("plan_generation_failed"):
+        return False, (
+            "plan_generation_failed: 规划 LLM 失败，产出的是空 scope 兜底假计划"
+            "（Worker 必失败），不得静默 auto_accept，须人工介入"
+        )
+
     if not state.get("plan_valid", True):
         issues = state.get("plan_validation_issues") or []
         reason = "; ".join(issues) if issues else "计划自动校验未通过"

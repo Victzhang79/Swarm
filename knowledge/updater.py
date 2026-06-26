@@ -257,6 +257,8 @@ class KnowledgeUpdater:
 
     async def connect(self) -> None:
         """连接所有组件"""
+        if self._conn is not None:
+            return  # TD2606-B16：幂等守卫——重复 connect 不再丢弃旧连接造成泄漏
         self._conn = await psycopg.AsyncConnection.connect(
             self._db_config.postgres_uri, autocommit=True
         )
@@ -275,6 +277,10 @@ class KnowledgeUpdater:
         logger.info("KnowledgeUpdater connected")
 
     async def close(self) -> None:
+        # TD2606-C14：取消在飞的后台 depgraph 重建任务，避免其写向即将关闭的连接（孤儿协程）。
+        for _t in list(self._depgraph_tasks):
+            _t.cancel()
+        self._depgraph_tasks.clear()
         if self._struct:
             await self._struct.close()
         if self._semantic:

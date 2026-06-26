@@ -378,6 +378,12 @@ class MemoryDecay:
 
     # ── 每日自动维护 ────────────────────────────
 
+    def stop_daily_decay(self) -> None:
+        """停止后台维护循环（TD2606-C14：原 while True 无停止钩子）。幂等，可在 api 关闭钩子调用。"""
+        stop = getattr(self, "_decay_stop", None)
+        if stop is not None:
+            stop.set()
+
     async def start_daily_decay(
         self,
         hour: int = 3,
@@ -404,7 +410,10 @@ class MemoryDecay:
 
         logger.info("Starting daily decay scheduler at %02d:%02d", hour, minute)
 
-        while True:
+        # TD2606-C14：可停止的后台循环。原 `while True` 无停止钩子 → 进程生命周期泄漏
+        # task + PG 连接（api 关闭时无法优雅停）。stop_daily_decay() 置位即提前唤醒退出。
+        self._decay_stop = asyncio.Event()
+        while not self._decay_stop.is_set():
             now = datetime.now()
             # 计算下次执行时间
             next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -414,7 +423,12 @@ class MemoryDecay:
             wait_seconds = (next_run - now).total_seconds()
 
             logger.info("Next decay run at %s (waiting %.0f seconds)", next_run, wait_seconds)
-            await asyncio.sleep(wait_seconds)
+            # 可中断 sleep：被 stop 唤醒 → 退出；正常到点(TimeoutError) → 继续维护。
+            try:
+                await asyncio.wait_for(self._decay_stop.wait(), timeout=wait_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
 
             # 执行清理: 只删过期(L5+L6)，衰减由 query 读时现算
             try:

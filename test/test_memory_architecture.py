@@ -62,8 +62,16 @@ def test_l2_format_for_brain():
 
 
 def test_simple_skips_l6():
-    assert should_write_success({"complexity": Complexity.SIMPLE}) is False
-    assert should_write_success({"complexity": Complexity.MEDIUM}) is True
+    # TD2606-A7：写 L6 成功模式需【真实成功】信号（l2_passed 等）。给齐成功状态。
+    _ok = {"l2_passed": True}
+    assert should_write_success({"complexity": Complexity.SIMPLE, **_ok}) is False
+    assert should_write_success({"complexity": Complexity.MEDIUM, **_ok}) is True
+    # 防毒化：L2 未过 / 升级人工 / 仍有失败子任务 → 即便 medium 也不得写 L6 成功模式
+    assert should_write_success({"complexity": Complexity.MEDIUM}) is False  # l2_passed 缺失
+    assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "failure_escalated": True}) is False
+    assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "failed_subtask_ids": ["st-2"]}) is False
+    # TD2606-C10：降级交付（degraded_reasons 非空）不学成 L6 成功模式（防降级污染）
+    assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "degraded_reasons": ["l2_no_test_executed"]}) is False
 
 
 def test_mistake_snippet():

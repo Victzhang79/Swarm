@@ -125,7 +125,9 @@ async def _test_learn_persist_async():
         "plan": None,
         "merged_diff": "",
         "revision_feedback": "tests failed",
-        "failed_subtask_ids": ["st-1"],
+        # TD2606-A7：persist_learn_success 机制测试需真实成功状态（l2_passed），否则
+        # should_write_success 正确拦下 L6 写入（failed_subtask_ids 会被判非成功）。
+        "l2_passed": True,
     }
 
     with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):

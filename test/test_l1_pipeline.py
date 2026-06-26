@@ -230,7 +230,11 @@ def test_self_review_llm_finds_issues():
 
 
 def test_self_review_llm_exception_graceful():
-    """LLM 异常时自检优雅跳过。"""
+    """fail-closed（TD2606-A2）：LLM 异常时自检跳过，但【绝不当 passed=True】——
+    passed=None + skipped=True，不计入任何 PASS 信号。
+
+    历史上此测试断言 passed is True（"异常时默认通过"），把静默成功写成了契约。
+    这是整条静默成功链的一环，现反转为 fail-closed 语义。"""
     from swarm.worker.l1_pipeline import _run_self_review
 
     mock_llm = MagicMock()
@@ -238,9 +242,10 @@ def test_self_review_llm_exception_graceful():
 
     subtask = _make_subtask()
     result = _run_self_review(mock_llm, subtask, "diff content")
-    assert result["passed"] is True  # 异常时默认通过
+    assert result["passed"] is None  # 异常【不再】默认通过（A2 反转）
+    assert result["skipped"] is True
     assert "skipped" in result["raw"]
-    print("  ✅ LLM 异常时自检优雅跳过")
+    print("  ✅ LLM 异常时自检 skipped 且不计入 PASS（fail-closed）")
 
 
 # ── 流水线端到端测试 ──

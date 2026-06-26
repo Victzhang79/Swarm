@@ -258,6 +258,8 @@ class LocalProvider(EndpointProvider):
 class ModelRouter:
     """动态模型路由器 — 根据子任务难度/模态选择模型，按 provider 归属构建。"""
 
+    _reachability_validated = False  # 类级：每进程只做一次路由可达性校验（避免多次实例化刷屏）
+
     def __init__(self, config: ModelConfig | None = None):
         self.config = config or get_config().model
         # 按 provider.id 缓存 EndpointProvider 实例
@@ -265,6 +267,69 @@ class ModelRouter:
             p.id: EndpointProvider(p, self.config)
             for p in self.config._effective_providers()
         }
+        # TD2606-A8：启动期路由可达性校验（每进程一次）。死模型/拼错名不再只在【调用时】
+        # 静默合成 local 兜底 + 埋日志 warning，而是在此显式列出；整条链全不可达 → ERROR。
+        if not ModelRouter._reachability_validated:
+            ModelRouter._reachability_validated = True
+            try:
+                self.validate_routing_reachability()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[ROUTER] 路由可达性校验跳过(非致命): %s", exc)
+
+    def validate_routing_reachability(self) -> list[dict]:
+        """交叉校验每个路由档(primary + fallback 链)是否可达，返回不可达条目（供启动/健康检查）。
+
+        可达判据（离线、确定性）：
+          - 能力库(capability_store)【已探测】(非空) → 以探测结果为准：模型名在探测集内才算可达
+            （provider 映射不证明模型真的在端点上——本地启发式会把任意名映射到 local 端点，
+            故映射存在 ≠ 可达；探测过的清单才是事实源）。
+          - 能力库为空（从未探测）→ 无法离线判定 → 退化到"有 provider 映射即假定可达"，不误报。
+        整条链(primary+所有 fallback)均不可达 → ERROR（该难度档请求必失败）；部分不可达 → WARNING。
+        TD2606-A8。
+        """
+        cfg = self.config
+        try:
+            from swarm.models.capability_store import list_capabilities
+            known = {c.get("model_id") for c in (list_capabilities() or []) if c.get("model_id")}
+        except Exception as exc:  # noqa: BLE001 — 能力库不可用时退化为"不校验"，不阻断
+            logger.debug("[ROUTER] 能力库读取失败，跳过可达性校验: %s", exc)
+            return []
+
+        def _reachable(name: str) -> bool:
+            if not name:
+                return False
+            if known:
+                # 能力库已探测 → 以探测为准（映射存在 ≠ 模型真的可用）。
+                return name in known
+            # 能力库为空（从未探测）→ 退化到"有 provider 映射即假定可达"，不离线误报。
+            return cfg.provider_for_model(name) is not None
+
+        tiers = [
+            ("trivial", cfg.routing_trivial, list(cfg.routing_trivial_fallback or [])),
+            ("medium", cfg.routing_medium, list(cfg.routing_medium_fallback or [])),
+            ("complex", cfg.routing_complex, list(cfg.routing_complex_fallback or [])),
+            ("multimodal", cfg.routing_multimodal, list(cfg.routing_multimodal_fallback or [])),
+            ("brain", cfg.brain_primary, [cfg.brain_fallback]),
+        ]
+        issues: list[dict] = []
+        for tier, primary, fbs in tiers:
+            chain = [n for n in [primary, *fbs] if n]
+            if not chain:
+                continue
+            unreachable = [n for n in chain if not _reachable(n)]
+            if len(unreachable) == len(chain):
+                logger.error(
+                    "[ROUTER] 路由档 '%s' 整条链(primary+fallback)均不可达: %s —— 该难度请求将必失败，"
+                    "请检查模型名拼写 / model_providers 映射 / 是否已探测上线。", tier, chain)
+                issues.append({"tier": tier, "severity": "error",
+                               "kind": "whole_chain_unreachable", "chain": chain})
+            elif unreachable:
+                logger.warning(
+                    "[ROUTER] 路由档 '%s' 含不可达模型 %s（链上仍有可达兜底，建议核对名称/映射）。",
+                    tier, unreachable)
+                issues.append({"tier": tier, "severity": "warning",
+                               "kind": "partial_unreachable", "unreachable": unreachable})
+        return issues
 
     def get_brain_llm(self) -> BaseChatModel:
         """Brain 编排层 — 必须大模型（云端优先，本地 fallback）。

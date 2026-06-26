@@ -21,6 +21,19 @@ _worker_running: set[str] = set()
 # worker 进度流(GET /api/worker/{run_id}/stream)凭此对该项目做成员/权限校验，
 # 杜绝"任一已认证用户拿到 run_id 即可读他人 worker 流"的越权。
 _worker_run_project: dict[str, str] = {}
+# TD2606-B14：run_id → 后台单跑任务句柄。原 start_standalone_worker_background 直接丢弃
+# create_task 句柄 → 卡死的单跑既无法外部取消、异常也被静默吞没。在此登记以便取消/可见。
+_worker_tasks: dict[str, asyncio.Task] = {}
+
+
+def cancel_standalone_worker(run_id: str) -> bool:
+    """外部取消一个卡死/失控的后台单跑 worker。返回是否实际发起取消。TD2606-B14。"""
+    task = _worker_tasks.get(run_id)
+    if task is not None and not task.done():
+        task.cancel()
+        logger.warning("[WORKER] 外部取消后台单跑任务 run_id=%s", run_id)
+        return True
+    return False
 
 
 def get_worker_queue(run_id: str) -> asyncio.Queue[dict[str, Any]] | None:
@@ -175,6 +188,18 @@ def start_standalone_worker_background(
 ) -> None:
     register_worker_queue(run_id)
     register_worker_run_project(run_id, project_id)  # A-P1-28：记录归属项目供 stream 鉴权
-    asyncio.create_task(
+    # TD2606-B14：保留任务句柄 + done-callback——可外部取消，且异常不再被静默吞没。
+    task = asyncio.create_task(
         run_standalone_worker(run_id, project_id, description, **kwargs)
     )
+    if task is not None:  # 防御：测试可能 mock create_task 返回 None
+        _worker_tasks[run_id] = task
+
+        def _on_done(t: asyncio.Task, _rid: str = run_id) -> None:
+            _worker_tasks.pop(_rid, None)
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    logger.error("[WORKER] 后台单跑任务异常退出 run_id=%s: %s", _rid, exc, exc_info=exc)
+
+        task.add_done_callback(_on_done)

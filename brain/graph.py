@@ -190,6 +190,13 @@ def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
         logger.info("[ROUTE] VALIDATE → CONFIRM (ultra 复杂度)")
         return "confirm"
 
+    # TD2606-A5 补漏：规划 LLM 失败产出的空 scope 兜底假计划【结构上】合法(plan_valid=True)，
+    # 非 ULTRA 时旧逻辑直接 validate→dispatch，绕过 confirm 里的 can_auto_accept_plan 拦截 →
+    # 空 diff 假 DONE。这里强制走 confirm，让 fail-fast 闸门(auto→REJECT+escalate / 人工→interrupt)生效。
+    if state.get("plan_generation_failed"):
+        logger.warning("[ROUTE] VALIDATE → CONFIRM (规划生成失败的兜底假计划，须人工/escalate，A5)")
+        return "confirm"
+
     logger.info("[ROUTE] VALIDATE → DISPATCH")
     return "dispatch"
 
@@ -236,13 +243,22 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
     return "merge"
 
 
-def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "dispatch"]:
+def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "dispatch", "deliver"]:
     """MERGE 后的路由:
 
+    - failure_escalated + escalate → DELIVER（rebase 超限已升级人工，escalate 终点）
     - merge_conflicts 非空 → HANDLE_FAILURE（failed_subtask_ids 已由 merge 节点填充）
     - rebase_subtask_ids 非空（无硬冲突）→ DISPATCH（rebase 子任务已加入 dispatch_remaining，需重跑）
     - 无冲突无 rebase → VERIFY_L2
     """
+    # TD2606-A6：rebase 超限时 merge 节点已设 failure_escalated/failure_strategy=escalate 但
+    # 不会设 merge_conflicts/rebase_subtask_ids → 旧逻辑落到 VERIFY_L2，escalate 信号被丢 →
+    # MERGE↔VERIFY_L2↔HANDLE_FAILURE 死循环烧 recursion_limit。直接路由 DELIVER（与
+    # after_handle_failure 的 escalate→deliver 同构，可被 can_auto_accept_delivery 如实归因）。
+    if state.get("failure_escalated") and state.get("failure_strategy") == "escalate":
+        logger.warning("[ROUTE] MERGE → DELIVER (rebase 超限升级人工 escalate，避免死循环 A6)")
+        return "deliver"
+
     conflicts = state.get("merge_conflicts", [])
     if conflicts:
         logger.info(
@@ -481,6 +497,7 @@ def build_brain_graph() -> StateGraph:
             "handle_failure": "handle_failure",
             "dispatch": "dispatch",
             "verify_l2": "verify_l2",
+            "deliver": "deliver",
         },
     )
 
@@ -620,8 +637,19 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
         logger.info("[A1] PG checkpointer 已初始化（跨副本 interrupt/resume 就绪）")
         return True
     except Exception as exc:  # noqa: BLE001
+        # TD2606-B12：多副本部署下降级 MemorySaver 会破坏【跨副本 interrupt/resume】——人工 ACCEPT
+        # 路由到另一副本时找不到 checkpoint，任务永久孤儿在 CONFIRMING/DELIVERING。
+        # SWARM_REQUIRE_PG_CHECKPOINTER=1 时 fail-closed 拒绝静默降级（生产多副本应启用）。
+        import os as _os
+        if _os.environ.get("SWARM_REQUIRE_PG_CHECKPOINTER", "").strip().lower() in ("1", "true", "yes"):
+            logger.error(
+                "[A1] PG checkpointer 初始化失败且 SWARM_REQUIRE_PG_CHECKPOINTER 已启用——"
+                "拒绝降级 MemorySaver（多副本 resume 不可用）: %s", exc
+            )
+            raise
         logger.warning(
-            "[A1] PG checkpointer 初始化失败，降级 MemorySaver（单机/开发模式不受影响）: %s", exc
+            "[A1] PG checkpointer 初始化失败，降级 MemorySaver（单机/开发不受影响；多副本部署请设"
+            " SWARM_REQUIRE_PG_CHECKPOINTER=1 强制 PG 以保跨副本 resume）: %s", exc
         )
         _pg_checkpointer = None
         _pg_checkpointer_cm = None

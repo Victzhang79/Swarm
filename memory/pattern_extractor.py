@@ -18,6 +18,31 @@ def should_write_success(state: BrainState) -> bool:
     # 可复用成功经验，污染知识库并误导后续任务复用。单一事实源在此收口。
     if state.get("abandoned_subtask_ids"):
         return False
+
+    # TD2606-C10：降级交付（degraded_reasons 非空：L2 未真测 l2_no_test_executed / ASSESS 跳过 /
+    # 规划降级等）"看起来成功"但缺确定性证据。不【阻断】交付本身（避免误伤无测试的 docs/config
+    # 任务），但绝不把它学成【可复用成功模式】写 L6（与 A7 同向防毒化；degraded 仅记录、可见）。
+    if state.get("degraded_reasons"):
+        import logging
+        logging.getLogger(__name__).info(
+            "[LEARN] 交付带 degraded_reasons=%s，跳过 L6 成功模式写入（C10 防降级污染）",
+            state.get("degraded_reasons"))
+        return False
+
+    # TD2606-A7（记忆毒化回路根治）：learn_success 在 human_decision==ACCEPT 时触发，但【人工
+    # 可 ACCEPT-override 一个 L2 未过/升级人工/仍有失败子任务的残缺交付】。若仍写 L6 成功模式，
+    # 会把错误执行学成可复用经验，且被复用越多 reuse_count 越高、衰减越慢 → 自毒化无解药。
+    # 这里复用 can_auto_accept_delivery 的【真实成功判据】(单一事实源)：只有确定性验证真过的
+    # 交付才可作为成功模式写入 L6。宁可漏学一个真成功(保守)，绝不学一个毒模式。
+    from swarm.brain.gates import can_auto_accept_delivery
+
+    allow, reason = can_auto_accept_delivery(state)
+    if not allow:
+        import logging
+        logging.getLogger(__name__).info(
+            "[LEARN] 交付未达真实成功判据，跳过 L6 成功模式写入（防记忆毒化 A7）: %s", reason)
+        return False
+
     complexity = state.get("complexity")
     if isinstance(complexity, str):
         try:

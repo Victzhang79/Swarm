@@ -185,10 +185,16 @@ async def _retrieve_knowledge_impl(
     """真正的检索逻辑——始终在专用 KB loop 上运行，连接归属该 loop。"""
     try:
         retriever = await get_retriever()
+        retriever._embed_degraded_active = False  # TD2606-B11：每次检索前清降级标记
         result = await retriever.retrieve_for_brain(
             task_desc, project_id, extra_keywords=extra_keywords
         )
-        return result.context, result.stats
+        stats = dict(result.stats or {})
+        # TD2606-B11：embedding 不可用 → BM25-only 关键词召回（无语义召回）时显式透传，
+        # 让 Brain 知道"上下文是关键词召回非完整语义召回"，与 retrieval_failed 对称、不静默。
+        if getattr(retriever, "_embed_degraded_active", False):
+            stats["retrieval_degraded"] = "embed_unavailable_bm25_only"
+        return result.context, stats
     except Exception as exc:
         logger.warning("retrieve_knowledge failed for project %s: %s", project_id, exc)
         # A-P1-20：检索整体崩溃 ≠ "项目无知识"。返回空知识时显式置 retrieval_failed=True

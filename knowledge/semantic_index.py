@@ -90,6 +90,8 @@ class SemanticIndexer:
 
     async def connect(self) -> None:
         """建立 Qdrant 连接并确保集合存在"""
+        if self._client is not None:
+            return  # TD2606-B16：幂等守卫——重复 connect 不再丢弃旧 Qdrant 客户端
         self._client = AsyncQdrantClient(
             url=self._db_config.qdrant_url,
             check_compatibility=False,

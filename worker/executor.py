@@ -35,6 +35,7 @@ from swarm.types import (
     Confidence,
     FileScope,
     KnowledgeContext,
+    NotRunKind,
     SubTask,
     SubTaskDifficulty,
     WorkerOutput,
@@ -53,6 +54,48 @@ _PROJECT_STACK_CACHE: dict[str, dict | None] = {}
 _FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|errors)\b")
 
 
+class _ProjectGitFlock:
+    """per-project 文件锁，串行化同一 project_path 的 git 临界操作（reset / add -N + diff）。
+
+    TD2606-B5/C5/M5：dispatch 用 asyncio.gather 并发跑 worker，全部共享同一本地 git 工作树/索引。
+    原 flock 只包 _reset_scope_to_head 的 git checkout；`git add -N`（改共享 index）+ `git diff`
+    未锁 → 并发 worker 的 intent-to-add 泄漏进彼此 diff、reset 与 diff 互踩（脏 diff/假通/重试死循环）。
+    此锁把所有 git 临界操作串行化（操作短暂；沙箱内 CODING/编译不持锁、仍并行）。
+    fcntl 不可用（如 Windows）/打开失败时降级无锁（与旧行为一致，不阻断）。
+    """
+
+    def __init__(self, local_root: object) -> None:
+        self._lock_f = None
+        self._fcntl = None
+        try:
+            import fcntl
+            import hashlib
+            import tempfile as _tf
+            proj_hash = hashlib.sha1(str(local_root).encode()).hexdigest()[:16]
+            lock_path = Path(_tf.gettempdir()) / f"swarm_git_{proj_hash}.lock"
+            self._lock_f = open(lock_path, "w")  # noqa: SIM115
+            self._fcntl = fcntl
+        except Exception:  # noqa: BLE001
+            self._lock_f = None
+
+    def __enter__(self) -> "_ProjectGitFlock":
+        if self._lock_f is not None and self._fcntl is not None:
+            try:
+                self._fcntl.flock(self._lock_f, self._fcntl.LOCK_EX)
+            except Exception:  # noqa: BLE001
+                pass
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        if self._lock_f is not None and self._fcntl is not None:
+            try:
+                self._fcntl.flock(self._lock_f, self._fcntl.LOCK_UN)
+                self._lock_f.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+
 # Bug-4（task 0f93f1fc 实证）：模型拒答/截断标记。worker agent 主回复命中这些 =
 # 它根本没真正完成工作（停滞/截断/算力耗尽），产出不可信。此前这类回复仅让 LLM 自报
 # LOCATING 阶段步数硬上限（recursion_limit 计节点访问，agent+tool 各 1，故 ~20 ≈ 10 think-act
@@ -65,7 +108,7 @@ _LOCATE_STEP_CAP = 20
 # （"抱歉/我无法/无法完成/需要更多步骤"），原英文清单全部漏过 → 中文拒答被当有效产出
 # 送进确定性闸门，compile 恰好过即幻觉 PASS。
 _REFUSAL_MARKERS = (
-    # ── 英文 ──
+    # ── 强标记：措辞特异，子串命中任意位置即拒答（不会出现在正常 fix 描述里）──
     "sorry, need more steps",
     "need more steps to process",
     "i'm unable to",
@@ -73,15 +116,19 @@ _REFUSAL_MARKERS = (
     "cannot complete this request",
     "unable to complete",
     "i cannot complete",
-    # ── 中文 ──
-    "抱歉",
-    "我无法",
-    "无法完成",
-    "无法继续",
     "需要更多步骤",
     "需要更多步数",
-    "我不能完成",
     "超出我的能力",
+)
+
+# TD2606-C1：弱中文"无能为力"标记。裸子串匹配会把【描述性回复】误判拒答，例如
+# "原代码无法完成空值校验，现已修复" / "抱歉之前漏了，已补上测试" → 命中"无法完成"/"抱歉"
+# 却是【成功产出】，旧逻辑判 refusal_hard_fail（sticky 不可翻盘）更毒。改为：弱标记只在
+# 【无任何成功/完成信号】时才算拒答（真拒答如"抱歉，我无法完成此任务"不含成功信号）。
+_REFUSAL_WEAK_CN = ("抱歉", "我无法", "无法完成", "无法继续", "我不能完成")
+_SUCCESS_SIGNALS = (
+    "已修复", "修复了", "已完成", "已实现", "已补", "已添加", "已新增",
+    "测试通过", "通过测试", "编译通过", "l1_result:pass", "l1_result: pass", "✅",
 )
 
 # W1.2 commit②：verify 回复"可用性"下限。空/纯空格、或极短且无 L1_RESULT 标记的回复，
@@ -105,6 +152,9 @@ def _is_refusal_or_truncated(text: str) -> bool:
         return True
     low = stripped.lower()
     if any(mk in low for mk in _REFUSAL_MARKERS):
+        return True
+    # C1：弱中文标记只在【无成功/完成信号】时才判拒答，避免误伤"无法…已修复"类描述性成功回复。
+    if any(mk in stripped for mk in _REFUSAL_WEAK_CN) and not any(s in low for s in _SUCCESS_SIGNALS):
         return True
     # 极短且无显式验证标记 → 不可用。含 L1_RESULT 的短回复仍是有效结论，放行。
     if len(stripped) < _MIN_VERIFY_REPLY_CHARS and "l1_result" not in low:
@@ -134,7 +184,12 @@ def _trivial_llm_self_report_passed(combined: str) -> bool:
 #   - empty_diff_transient：循环内空 diff（沙箱尚未 pull-back），pull-back 后可能有真产出。
 #   - llm_self_report：纯 LLM 弱信号 fail（无确定性证据），收到确定性证据后可被覆盖。
 # 编译/lint/scope/test/verify/refusal 失败都是【确定的真错误】，sticky=True，永不翻盘。
-_FLIPPABLE_SOURCES = frozenset({"empty_diff_transient", "llm_self_report", "refusal_in_self_review"})
+_FLIPPABLE_SOURCES = frozenset({
+    "empty_diff_transient", "llm_self_report", "refusal_in_self_review",
+    # 循环内「验证没跑成」(BLOCKED)是无确定性证据的非 sticky fail——Phase-4 pull-back 后
+    # 若确定性闸门真跑通，应允许翻盘为通过（与 llm_self_report 同类）。
+    "verification_not_run",
+})
 
 
 @dataclass
@@ -253,18 +308,36 @@ def evaluate_l1(
         return L1Verdict(passed=False, source=source, reason=reason,
                          sticky=sticky, details=details)
 
-    # ③ det_ok is None → 回退 LLM 自报弱信号，不主动翻盘 prior
+    # ③ det_ok is None → 无确定性结论。【fail-closed 核心】必须区分「为何没结论」。
+    #    not_run_kind 由 _deterministic_l1_gate / run_l1_pipeline 写入 details：
+    #      BENIGN  = 真 no-op（空 diff + 无 harness + scope 不期望改动）→ 可回退 LLM 弱信号。
+    #      BLOCKED = 本应验证却跑不起来（pipeline 异常 / 工具或工程清单缺失 / 构建命中 infra
+    #                故障 / 非空 diff 却解析到 0 文件）→ 绝不当 PASS。
+    #      缺失/未知 → 按 BLOCKED 处理（fail-closed 默认，这是与旧行为相反的关键反转：
+    #                旧行为 `passed = bool(llm_ok)` 把「没验证」判给模型自报，是静默成功总根）。
     if det_ok is None:
-        details["l1_decision_source"] = "llm_self_report"
+        kind = details.get("not_run_kind")
         if prior is not None and prior.passed is False:
             # 缺乏确定性证据，不足以翻盘循环内/此前的 fail → 维持 prior 结论。
+            details["l1_decision_source"] = "verification_not_run_keep_prior"
             return L1Verdict(passed=False, source=prior.source,
                              reason="无确定性证据(det=None)，维持 prior 的未通过结论",
                              sticky=prior.sticky, details=details)
-        passed = bool(llm_ok)
-        return L1Verdict(passed=passed, source="llm_self_report",
-                         reason="无确定性证据，回退 LLM 自报弱信号",
-                         sticky=False, details=details)
+        if kind == NotRunKind.BENIGN.value:
+            details["l1_decision_source"] = "no_op_benign"
+            return L1Verdict(passed=bool(llm_ok), source="no_op_benign",
+                             reason="真 no-op（无可验证产出），回退 LLM 弱信号",
+                             sticky=False, details=details)
+        # BLOCKED 或未知 → fail-closed：不采信 LLM 自报，标 transient 交 brain 退避重试，
+        # 耗尽 transient 配额后落 capability 阶梯 → 最终硬 FAIL（绝不静默通过）。
+        details["l1_decision_source"] = "verification_not_run"
+        details["failure_class"] = "transient"
+        return L1Verdict(
+            passed=False, source="verification_not_run",
+            reason=f"确定性验证未能执行(not_run_kind={kind or 'unknown'})，"
+                   "fail-closed 不采信 LLM 自报，转 transient 退避重试",
+            sticky=False, details=details,
+        )
 
     # ④ det_ok is True → 考虑 LLM 自检
     details["l1_decision_source"] = "deterministic"
@@ -795,6 +868,14 @@ class WorkerExecutor:
                 if l1_passed:
                     break
 
+                # fail-closed：本轮是「验证没跑成」(BLOCKED：构建 infra 故障 / 工具或工程清单缺失 /
+                # pipeline 异常)——re-prompt 模型无意义（不是代码能力问题）。提前 bail，把恢复交给
+                # brain 重新派发（verdict 已标 failure_class=transient → 退避重试，优先换新沙箱）。
+                # 同时这是 TD2606-B6「fix 循环无 no-progress 检测」开的第一刀。
+                if verdict.source == "verification_not_run":
+                    self._log("L1 验证未能执行(BLOCKED)，提前结束 fix 循环，转交 brain 退避重试")
+                    break
+
                 if fix_round < self.max_fix_rounds:
                     self._log(f"修复尝试 {fix_round + 1}/{self.max_fix_rounds}")
                     symbol_hint = await self._symbol_grounding_hint(verify_result, l1_details)
@@ -983,15 +1064,35 @@ class WorkerExecutor:
                     profile = cached
             except Exception:  # noqa: BLE001
                 profile = None
-        # ② 旧缓存缺 jvm 命名空间 / 无 record → 当场磁盘探测兜底
-        need_disk = not profile or not (
+        # ② 重探触发：旧缓存缺 jvm 命名空间 / 无 record / 【指纹漂移=栈已变更】。
+        # TD2606-B20：原仅在 servlet_namespace 缺失时兜底，盲信缓存的前后端裁决——栈迁移
+        # （javax→jakarta、加 JS 前端等）但 detect_stack 未重跑时，旧画像会当硬前提喂错 worker。
+        # 这里用廉价 compute_repo_fingerprint 比对缓存指纹，漂移则【整画像重探】（每进程每 key 仅一次）。
+        cur_fp = ""
+        if self.project_path:
+            try:
+                from swarm.brain.stack_detect import compute_repo_fingerprint
+                cur_fp = compute_repo_fingerprint(self.project_path)
+            except Exception:  # noqa: BLE001
+                cur_fp = ""
+        fp_drifted = bool(
+            profile and cur_fp and profile.get("fingerprint") and cur_fp != profile.get("fingerprint")
+        )
+        if fp_drifted:
+            logger.info("[STACK] 缓存技术栈指纹漂移(%s→%s)，整画像重探（B20）",
+                        profile.get("fingerprint"), cur_fp)
+        need_disk = fp_drifted or not profile or not (
             (profile.get("jvm") or {}).get("servlet_namespace")
         )
         if need_disk and self.project_path:
             try:
                 from swarm.brain.stack_detect import detect_stack_deterministic
                 fresh = detect_stack_deterministic(self.project_path)
-                if profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
+                if fp_drifted:
+                    profile = fresh  # 指纹漂移 → 整画像重取，不保留旧前后端裁决
+                    if cur_fp:
+                        profile["fingerprint"] = cur_fp
+                elif profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
                     # 保留权威画像其它字段，仅补 jvm（前后端裁决以缓存为准）
                     profile = {**profile, "jvm": fresh["jvm"]}
                 else:
@@ -1283,27 +1384,14 @@ class WorkerExecutor:
         if not tracked:
             return 0
 
-        # 锁文件放系统临时目录（按 project_path 派生稳定名），不污染目标 workdir
-        # （避免 .swarm_reset.lock 出现在用户项目的 git status）。
-        import hashlib
-        import tempfile as _tf
-        _proj_hash = hashlib.sha1(str(local_root).encode()).hexdigest()[:16]
-        lock_path = Path(_tf.gettempdir()) / f"swarm_reset_{_proj_hash}.lock"
+        # TD2606-B5/C5：reset 与 diff/add-N 共用同一 per-project 锁（_ProjectGitFlock），
+        # 串行化所有 git 临界操作，杜绝并发 worker 在共享工作树/索引上互踩。
         try:
-            import fcntl
-            lock_f = open(lock_path, "w")
-        except Exception:  # noqa: BLE001
-            lock_f = None
-        try:
-            if lock_f is not None:
-                try:
-                    fcntl.flock(lock_f, fcntl.LOCK_EX)
-                except Exception:  # noqa: BLE001
-                    pass
-            r = subprocess.run(
-                ["git", "checkout", "HEAD", "--", *tracked],
-                cwd=str(local_root), capture_output=True, text=True, timeout=30,
-            )
+            with _ProjectGitFlock(local_root):
+                r = subprocess.run(
+                    ["git", "checkout", "HEAD", "--", *tracked],
+                    cwd=str(local_root), capture_output=True, text=True, timeout=30,
+                )
             if r.returncode == 0:
                 self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到 HEAD（防跨轮脏叠加）")
                 return len(tracked)
@@ -1312,13 +1400,6 @@ class WorkerExecutor:
         except Exception as exc:  # noqa: BLE001
             self._log(f"workspace reset 跳过（异常）: {exc}")
             return 0
-        finally:
-            if lock_f is not None:
-                try:
-                    fcntl.flock(lock_f, fcntl.LOCK_UN)
-                    lock_f.close()
-                except Exception:  # noqa: BLE001
-                    pass
 
     async def _sync_to_sandbox(self, reason: str) -> None:
         """精准上传：只把子任务 scope 内的文件推送到沙箱 /workspace。
@@ -1782,9 +1863,17 @@ class WorkerExecutor:
                                 capture_output=True, text=True)
                     if r.returncode != 0:
                         untracked.append(f)
-            if untracked:
-                _sp.run(["git", "-C", root, "add", "-N", *untracked],
-                        capture_output=True, text=True, timeout=30)
+            # TD2606-B5/C5/M5：add -N（改共享 index）+ diff 必须在同一 per-project 锁内原子完成，
+            # 否则并发 worker 的 intent-to-add 互相泄漏进对方 diff、与他人 reset/diff 互踩。
+            # 锁内只放这两条短命 git 命令；ls-files 探测（只读）与 diff 结果处理在锁外。
+            with _ProjectGitFlock(root):
+                if untracked:
+                    _sp.run(["git", "-C", root, "add", "-N", *untracked],
+                            capture_output=True, text=True, timeout=30)
+                r = _sp.run(
+                    ["git", "-C", root, "diff", "--no-color", "--", *targets],
+                    capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
+                )
 
             # 生成 diff：HEAD 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
             # --no-color 防 ANSI；-- <files> 限定 scope，不带入无关变更。
@@ -1797,10 +1886,7 @@ class WorkerExecutor:
             # context 行尾 \r\n 静默转成 \n → diff 丢失 \r → git apply 回 CRLF 的 HEAD 时
             # context 字节不匹配（实测 --ignore-whitespace/--3way 都救不了）。bytes 模式
             # 保留 \r，产出与 CRLF 源文件完全同源的 diff，git apply 直接成功（无需任何忽略参数）。
-            r = _sp.run(
-                ["git", "-C", root, "diff", "--no-color", "--", *targets],
-                capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
-            )
+            # （diff 已在上方 _ProjectGitFlock 锁内执行，结果即 r。）
             if r.returncode != 0:
                 _err = (r.stderr or b"").decode("utf-8", "replace")
                 self._log(f"git diff 失败(rc={r.returncode})，回退 difflib: {_err[:120]}")
@@ -2338,11 +2424,13 @@ class WorkerExecutor:
             (bool, details) 表示确定性结论。
         """
         if not self.project_path:
-            return None, {"deterministic_gate": "skipped: no project_path"}
+            return None, {"deterministic_gate": "skipped: no project_path",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
         try:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001
-            return None, {"deterministic_gate": f"skipped: diff error {exc}"}
+            return None, {"deterministic_gate": f"skipped: diff error {exc}",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
         # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
         # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"
         # 送进 pipeline → 解析出 0 文件 → "no diff changes → True" → 空 diff 漏判通过。
@@ -2370,8 +2458,10 @@ class WorkerExecutor:
                 "note": "worker 未产生任何改动（期望修改/新建文件），判定未完成",
             }
         if empty_diff and not has_harness_checks:
-            # 既无 diff 又无 harness 可执行检查，才回退 LLM 自报
-            return None, {"deterministic_gate": "skipped: empty diff"}
+            # 既无 diff 又无 harness 可执行检查——且上方已排除 expects_changes（那是 BLOCKED fail）。
+            # 此即真 no-op：合法地没东西可验证 → BENIGN，可回退 LLM 弱信号。
+            return None, {"deterministic_gate": "skipped: empty diff",
+                          "not_run_kind": NotRunKind.BENIGN.value}
         try:
             from swarm.worker.l1_pipeline import run_l1_pipeline
 
@@ -2381,14 +2471,22 @@ class WorkerExecutor:
                 self.project_path, self.subtask, diff or "", llm=None,
                 project_stack=self._resolve_project_stack(),
             )
-            details["deterministic_gate"] = "pass" if ok else "fail"
             # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
             details["l1_phase"] = "phase3_loop_deterministic"
+            # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程
+            # 清单缺失、构建命中 infra 瞬时故障、非空 diff 却解析到 0 文件）。这种 passed-but-blocked
+            # 绝不能当真 PASS → 降为 None(BLOCKED)，交裁决器走 transient 退避重试。
+            if ok and details.get("pipeline_blocked"):
+                details["deterministic_gate"] = "skipped: pipeline blocked"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                return None, details
+            details["deterministic_gate"] = "pass" if ok else "fail"
             if empty_diff:
                 details["note"] = "empty diff，仅靠 harness 命令验证"
             return ok, details
         except Exception as exc:  # noqa: BLE001
-            return None, {"deterministic_gate": f"skipped: pipeline error {exc}"}
+            return None, {"deterministic_gate": f"skipped: pipeline error {exc}",
+                          "not_run_kind": NotRunKind.BLOCKED.value}
 
     def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool, str]:
         """DEBUG 意图专属 L1 闸门：确定性执行 failing_test_command，验证修复后该命令通过。
@@ -2400,32 +2498,19 @@ class WorkerExecutor:
         优雅降级：异常时返回 False（保守失败，M1 修复）——执行环境失败
         不能误判为 bug 已修复，宁可判未通过让其重试/人工复核。
         """
-        import subprocess
-
-        from swarm.worker.l1_pipeline import _normalize_python_cmd
+        # TD2606-C2：走 sandbox-first 的 _run_l1_command（与 L1 确定性闸门同执行模型）。
+        # 原实现裸 local subprocess，在非 Python 栈(本地无 mvn/go/cargo 工具链)必 except →
+        # DEBUG 意图任务的闸门【永远】保守失败、无法验证修复。沙箱可用即在沙箱跑、否则回退本地。
+        from swarm.worker.l1_pipeline import _run_l1_command
+        from swarm.worker.output_compress import compress_tool_output
 
         try:
-            proc = subprocess.run(
-                _normalize_python_cmd(failing_cmd),
-                cwd=self.project_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            ok = proc.returncode == 0
-            from swarm.worker.output_compress import compress_tool_output
-
-            output_summary = compress_tool_output(
-                proc.stdout or proc.stderr or "", max_chars=800
-            )
-            detail = f"exit_code={proc.returncode}, output={output_summary}"
+            ec, out = _run_l1_command(failing_cmd, self.project_path, timeout=120)
+            ok = ec == 0
+            detail = f"exit_code={ec}, output={compress_tool_output(out or '', max_chars=800)}"
             return ok, detail
-        except subprocess.TimeoutExpired:
-            return False, "failing_test_command timeout (120s)"
         except Exception as exc:  # noqa: BLE001
-            # M1 修复：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"）。
-            # 原返回 True 会把执行环境失败误判为 bug 已修复 PASS，放过未修的坏代码。
+            # M1：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"放过未修坏代码）。
             self._log(f"DEBUG L1: failing_test_command 执行异常，保守判未通过: {exc}")
             return False, f"execution error (conservative fail): {exc}"
 

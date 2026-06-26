@@ -7,11 +7,17 @@
      - det_ok 非 True  → source=refusal_hard_fail，sticky=True（无/失败确定性证据，永不翻盘）。
   2. det_ok False → False, sticky=True, source 携带确定性失败原因。永不翻盘
      （例外：empty_diff_transient sticky=False 可翻盘）。
-  3. det_ok None → passed=llm_self_report, source=llm_self_report, sticky=False；不主动翻盘 prior fail。
+  3. det_ok None → 【fail-closed，TD2606-A1 契约反转】按 not_run_kind 区分：
+       BENIGN（真 no-op：空 diff+无 harness+scope 不期望改动）→ passed=llm_ok, source=no_op_benign。
+       BLOCKED / 缺失/未知 → passed=False, source=verification_not_run, sticky=False，
+                            details.failure_class=transient（交 brain 退避重试，耗尽才硬 FAIL）。
+       prior fail 一律维持（无确定性证据不翻盘）。
+       【旧契约（已废弃）】det None → 一律信 LLM 自报，是静默成功总根。
   4. det_ok True → 看 llm_ok：
        llm_ok False → False（证据冲突）。
        llm_ok True → prior None/True→True；prior False 仅当 sticky False 且
-                     source∈{empty_diff_transient, llm_self_report, refusal_in_self_review} 才翻盘。
+                     source∈{empty_diff_transient, llm_self_report, refusal_in_self_review,
+                     verification_not_run} 才翻盘。
 
 净收益（关闭幻觉 PASS）的核心断言：refusal_hard_fail / 编译失败 / scope 违规 / 测试失败的 prior
 在 Phase-4 det True + llm True 下【不再翻盘】（旧实现无条件翻盘）。
@@ -84,12 +90,34 @@ def test_det_false_empty_diff_transient_flippable():
     assert v.sticky is False  # 唯一可翻盘的 det fail
 
 
-# ── 规则 3：det None → LLM 自报，不翻盘 prior fail ──
-def test_det_none_uses_llm_self_report():
-    assert evaluate_l1(det_ok=None, det_details={}, verify_result="L1_RESULT: PASS",
-                       llm_ok=True, prior=None, phase="x").passed is True
-    assert evaluate_l1(det_ok=None, det_details={}, verify_result="L1_RESULT: FAIL",
-                       llm_ok=False, prior=None, phase="x").passed is False
+# ── 规则 3：det None → fail-closed（按 not_run_kind 区分 BENIGN/BLOCKED）──
+def test_det_none_benign_uses_llm_self_report():
+    """BENIGN（真 no-op）→ 回退 LLM 弱信号，source=no_op_benign。"""
+    from swarm.types import NotRunKind
+    v_pass = evaluate_l1(det_ok=None, det_details={"not_run_kind": NotRunKind.BENIGN.value},
+                         verify_result="L1_RESULT: PASS", llm_ok=True, prior=None, phase="x")
+    assert v_pass.passed is True and v_pass.source == "no_op_benign"
+    v_fail = evaluate_l1(det_ok=None, det_details={"not_run_kind": NotRunKind.BENIGN.value},
+                         verify_result="L1_RESULT: FAIL", llm_ok=False, prior=None, phase="x")
+    assert v_fail.passed is False and v_fail.source == "no_op_benign"
+
+
+def test_det_none_blocked_is_fail_closed_transient():
+    """fail-closed 核心：BLOCKED 的「没验证」绝不当 PASS，标 transient 退避重试。"""
+    from swarm.types import NotRunKind
+    v = evaluate_l1(det_ok=None, det_details={"not_run_kind": NotRunKind.BLOCKED.value},
+                    verify_result="L1_RESULT: PASS", llm_ok=True, prior=None, phase="x")
+    assert v.passed is False
+    assert v.source == "verification_not_run"
+    assert v.sticky is False
+    assert v.details.get("failure_class") == "transient"
+
+
+def test_det_none_missing_kind_defaults_blocked():
+    """缺失 not_run_kind → 默认 BLOCKED（fail-closed 默认值，与旧 fail-open 相反）。"""
+    v = evaluate_l1(det_ok=None, det_details={}, verify_result="L1_RESULT: PASS",
+                    llm_ok=True, prior=None, phase="x")
+    assert v.passed is False and v.source == "verification_not_run"
 
 
 def test_det_none_does_not_flip_prior_fail():
@@ -126,6 +154,14 @@ def test_flip_empty_diff_transient():
 
 def test_flip_llm_self_report():
     prior = L1Verdict(passed=False, source="llm_self_report", sticky=False)
+    v = evaluate_l1(det_ok=True, det_details={}, verify_result=None, llm_ok=True, prior=prior, phase="x")
+    assert v.passed is True
+
+
+def test_flip_verification_not_run():
+    """循环内 BLOCKED(verification_not_run) 在 Phase4 det True+llm True 下应翻盘：
+    pull-back 后确定性闸门真跑通，无证据 fail 应被双证据覆盖（同 llm_self_report 类）。"""
+    prior = L1Verdict(passed=False, source="verification_not_run", sticky=False)
     v = evaluate_l1(det_ok=True, det_details={}, verify_result=None, llm_ok=True, prior=prior, phase="x")
     assert v.passed is True
 
