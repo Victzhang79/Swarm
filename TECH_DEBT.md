@@ -36,11 +36,15 @@
 > 漂移（栈迁移）则整画像重探，不再盲信旧前后端裁决喂 worker。
 > ⑧ C7 pool 临时沙箱孤儿：`_create_and_return` 包 try/except——create 成功后记账/注册若抛异常，
 > 立即 kill 刚建的沙箱再抛，杜绝调用方拿不到引用的远端孤儿泄漏。
+> ⑨ C4 烤源沙箱抹源：项目专属镜像把源码烤进 /workspace 且【不含 .git】，池复用前 clean_workspace
+> 的 `rm -rf /workspace` 抹掉源码（下任务缺源编译失败），仅保留又带入上任务改动破坏隔离。两难。
+> 故烤源沙箱(`_sandbox_has_source`)【不回池】(kill_sandbox 设 reusable=False)，每任务从缓存镜像
+> 创建新容器（镜像层仍含源码+.m2/warmup，启动快）→ 杜绝抹源与污染两种 bug。+测试。
 > **部分处理 / 标签校正 (PARTIAL，剩余)**：
 > B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in；
 > 改默认会破坏现有部署，属【部署策略决策】留运维拍板，非代码缺陷）。
 > **留待专门设计/大改 (DEFERRED)**：B8（L2 file→subtask 归因+恢复重构）·
-> C4（clean_workspace 需 image-type 标记）· C9（fix 轮本地↔沙箱同步需 per-file provenance）。
+> C9（fix 轮本地↔沙箱同步需 per-file provenance）。
 > **方法固有近似/低危 latent (WON'T-FIX，理由校正)**：B13 · C12 · C15 · C18 ·
 > C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
 > C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——
