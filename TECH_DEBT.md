@@ -59,6 +59,19 @@
 > C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
 > C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——
 > query_knowledge_base 只从 ContextVar 读 project_id，勿移除该 ContextVar）。
+> **审计补记 (2026-06-26，原汇总遗漏未归类的 6 项，按现行代码逐条核实)**：
+> · B4 **✅FIXED**（`executor.py:738`：烤源/build-critical 项目沙箱创建失败时 raise 拒绝降级本地，
+>   只有通用镜像才降级——构建闸门不再静默消失）。
+> · B7 **✅FIXED**（`l1_pipeline.py:1458`：期望构建但定位不到工程清单 → `pipeline_blocked`/BLOCKED
+>   fail-closed，不再把"找不到 pom"当 build PASS）。
+> · B2 **🟡PARTIAL（可接受）**（`executor.py:843`：`evaluate_l1`/`L1Verdict` 已是权威裁决，散文
+>   regex 仅余弱信号兜底，幻觉 PASS 已被确定性闸门拦截）。
+> · B10 **🟢非真问题**（`memory/store.py:469`：`effective_weight/decay_weight = factor^(age/occ)`，
+>   近因仍经指数项驱动排序，原"decay 哑火"判断不成立）。
+> · B6 **🔴OPEN**（`executor.py:878`：fix 循环仅 `verification_not_run` 提前 bail，无"模型每轮吐
+>   同一错误产出/无进展"检测，可白烧满修复轮）。下一批清偿候选。
+> · B9 **🔴OPEN**（`capability_store.py:207`：探测期 5xx 仍无条件 upsert 把 probed 能力覆盖成
+>   default 且不恢复 → 模型能力被永久误抹、整轮错路由）。下一批清偿候选。
 
 ### §0 根因主线（THE root cause）
 
