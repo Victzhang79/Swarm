@@ -27,15 +27,19 @@
 > 命中 infra 故障改 BLOCKED(转 transient，与 build gate 对称，原误判 capability)。
 > **核查后判定已充分处理 (ALREADY-OK，校正后)**：C3（run_security_scan 在 AUDIT 意图任务真触发；
 > 普通功能任务仍无安全闸门——可接受非死代码）· C13（think/fence/逐对象 salvage 真鲁棒）。
-> **部分处理 / 标签校正 (PARTIAL — 原 ALREADY-OK 偏乐观)**：
-> B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in）·
-> B20（detect_stack 端已 fingerprint 重探，但 worker `_resolve_project_stack` 仍盲信缓存——worker 端未修）·
-> C10（degraded_reasons 是 reducer 一等字段，但仅 ultra confirm 读；deliver/can_auto_accept_delivery
-> **不读** → 降级交付仍可静默 auto-ACCEPT，需专门决定 block vs 仅可见）。
+> **遗漏复查追加修复·批2 (FOLLOW-UP FIXED)**：
+> ⑤ B16 双连接泄漏：6 个长生命周期 store（behavior/norms/structure/updater/memory/semantic）的
+> `connect()` 加幂等守卫 `if self._conn(/_client) is not None: return`，重复 connect 不再丢弃旧连接。
+> ⑥ C10 降级污染：`should_write_success` 加 `degraded_reasons` 非空 → 不写 L6 成功模式（不阻断交付
+> 本身避免误伤无测试 docs 任务，但绝不学成可复用成功模式；+测试）。
+> ⑦ B20 worker 端：`_resolve_project_stack` 用廉价 `compute_repo_fingerprint` 比对缓存指纹，
+> 漂移（栈迁移）则整画像重探，不再盲信旧前后端裁决喂 worker。
+> **部分处理 / 标签校正 (PARTIAL，剩余)**：
+> B19（机制在但**默认仍 fail-open**：未设 env 时 Fernet key 从公开 DB URI 派生，安全是双 opt-in；
+> 改默认会破坏现有部署，属【部署策略决策】留运维拍板，非代码缺陷）。
 > **留待专门设计/大改 (DEFERRED)**：B8（L2 file→subtask 归因+恢复重构）·
-> B16（连接池：热路径已用池，真问题是长生命周期 store 的 `self._conn=await connect()` **无幂等守卫**
-> → 双连接泄漏，宜加 `if self._conn: return` 守卫，非"纯 scale"）· C4（clean_workspace 需 image-type 标记）·
-> C7（pool 临时沙箱窄窗泄漏，~5 行 try/finally 可补）· C9（fix 轮本地↔沙箱同步需 per-file provenance）。
+> C4（clean_workspace 需 image-type 标记）· C7（pool 临时沙箱窄窗泄漏，~5 行 try/finally 可补）·
+> C9（fix 轮本地↔沙箱同步需 per-file provenance）。
 > **方法固有近似/低危 latent (WON'T-FIX，理由校正)**：B13 · C12 · C15 · C18 ·
 > C11（**形状校验已有**：dict/title/content/tag 白名单/priority clamp；仅语义真伪无法离线证伪）·
 > C17（当前安全的真因是**每 asyncio.Task 各持 ContextVar 副本**，非"显式传 project_id"——

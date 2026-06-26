@@ -70,6 +70,8 @@ def test_simple_skips_l6():
     assert should_write_success({"complexity": Complexity.MEDIUM}) is False  # l2_passed 缺失
     assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "failure_escalated": True}) is False
     assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "failed_subtask_ids": ["st-2"]}) is False
+    # TD2606-C10：降级交付（degraded_reasons 非空）不学成 L6 成功模式（防降级污染）
+    assert should_write_success({"complexity": Complexity.MEDIUM, "l2_passed": True, "degraded_reasons": ["l2_no_test_executed"]}) is False
 
 
 def test_mistake_snippet():

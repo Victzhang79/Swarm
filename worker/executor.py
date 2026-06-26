@@ -1064,15 +1064,35 @@ class WorkerExecutor:
                     profile = cached
             except Exception:  # noqa: BLE001
                 profile = None
-        # ② 旧缓存缺 jvm 命名空间 / 无 record → 当场磁盘探测兜底
-        need_disk = not profile or not (
+        # ② 重探触发：旧缓存缺 jvm 命名空间 / 无 record / 【指纹漂移=栈已变更】。
+        # TD2606-B20：原仅在 servlet_namespace 缺失时兜底，盲信缓存的前后端裁决——栈迁移
+        # （javax→jakarta、加 JS 前端等）但 detect_stack 未重跑时，旧画像会当硬前提喂错 worker。
+        # 这里用廉价 compute_repo_fingerprint 比对缓存指纹，漂移则【整画像重探】（每进程每 key 仅一次）。
+        cur_fp = ""
+        if self.project_path:
+            try:
+                from swarm.brain.stack_detect import compute_repo_fingerprint
+                cur_fp = compute_repo_fingerprint(self.project_path)
+            except Exception:  # noqa: BLE001
+                cur_fp = ""
+        fp_drifted = bool(
+            profile and cur_fp and profile.get("fingerprint") and cur_fp != profile.get("fingerprint")
+        )
+        if fp_drifted:
+            logger.info("[STACK] 缓存技术栈指纹漂移(%s→%s)，整画像重探（B20）",
+                        profile.get("fingerprint"), cur_fp)
+        need_disk = fp_drifted or not profile or not (
             (profile.get("jvm") or {}).get("servlet_namespace")
         )
         if need_disk and self.project_path:
             try:
                 from swarm.brain.stack_detect import detect_stack_deterministic
                 fresh = detect_stack_deterministic(self.project_path)
-                if profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
+                if fp_drifted:
+                    profile = fresh  # 指纹漂移 → 整画像重取，不保留旧前后端裁决
+                    if cur_fp:
+                        profile["fingerprint"] = cur_fp
+                elif profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
                     # 保留权威画像其它字段，仅补 jvm（前后端裁决以缓存为准）
                     profile = {**profile, "jvm": fresh["jvm"]}
                 else:
