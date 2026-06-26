@@ -89,8 +89,13 @@ def parse_missing_packages(build_output: str) -> list[tuple[str, str]]:
     return out
 
 
-def _attempt_import_repair(project_path: str, build_output: str, timeout: int) -> int:
-    """治本·通用：据【项目自身现存 import】确定性修正模块写错的包名前缀，返回改动文件数。
+def _attempt_import_repair(
+    project_path: str, build_output: str, timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：据【项目自身现存 import】确定性修正模块写错的包名前缀。
+
+    返回 (改动文件数, 改动文件相对路径列表)。TD2606-C9：路径列表供调用方把【沙箱里】
+    被修复的文件（可能在子任务写权 scope 之外，如父 pom）回传本地，杜绝两棵真值树静默分叉。
 
     不含任何硬编码框架/包名、不限具体项目：对每个编不过的 `package P.suffix does not exist`，
     在项目已有源码里查同 suffix 的【权威前缀】（如 servlet.http 在本项目权威前缀=jakarta），
@@ -100,7 +105,7 @@ def _attempt_import_repair(project_path: str, build_output: str, timeout: int) -
     """
     pairs = parse_missing_packages(build_output)
     if not pairs:
-        return 0
+        return 0, []
     by_pkg: dict[str, set[str]] = {}
     for f, p in pairs:
         by_pkg.setdefault(p, set()).add(f)
@@ -138,7 +143,7 @@ def _attempt_import_repair(project_path: str, build_output: str, timeout: int) -
             "[L1.2.1·import-repair] %s.%s → %s.%s（项目权威前缀，据现存源码推导，%d 文件）",
             first, suffix, canonical, suffix, len(files),
         )
-    return len(changed)
+    return len(changed), sorted(changed)
 
 
 # ── 防线③（通用·确定性）：Maven 依赖版本不存在 → 自动校正到最近的有效版本 ──
@@ -213,8 +218,13 @@ def _choose_valid_version(bad: str, available: list[str]) -> str | None:
     return pick if pick != bad else None
 
 
-def _attempt_maven_version_repair(project_path: str, build_output: str, timeout: int) -> int:
-    """治本·通用：把 pom 里【不存在的依赖版本】确定性校正为最近有效版本，返回改动文件数。
+def _attempt_maven_version_repair(
+    project_path: str, build_output: str, timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：把 pom 里【不存在的依赖版本】确定性校正为最近有效版本。
+
+    返回 (改动 pom 数, 改动 pom 相对路径列表)。TD2606-C9：父 pom 常在子任务写权 scope
+    之外，被修复后必须随路径回传本地，否则修复只活在沙箱、merged_diff 缺失 → 集成重炸。
 
     安全自证：只在 build 已失败时触发；查仓库确认版本【确实不存在】才改；改完调用方重跑构建，
     修错（改成另一个不可用版本）则重跑仍失败=绝不制造假通过。版本号同时出现在内联
@@ -223,7 +233,7 @@ def _attempt_maven_version_repair(project_path: str, build_output: str, timeout:
     """
     missing = parse_missing_artifacts(build_output)
     if not missing:
-        return 0
+        return 0, []
     changed: set[str] = set()
     for group, artifact, bad_ver in missing[:8]:
         available = _fetch_maven_versions(group, artifact, project_path, timeout)
@@ -254,7 +264,7 @@ def _attempt_maven_version_repair(project_path: str, build_output: str, timeout:
             group, artifact, bad_ver,
             max(available, key=_ver_key) if available else "?", good_ver, len(poms),
         )
-    return len(changed)
+    return len(changed), sorted(changed)
 
 
 def _tool_missing(out: str) -> bool:
@@ -276,50 +286,59 @@ def _tool_missing(out: str) -> bool:
 _TS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs", ".cjs", ".mts", ".cts")
 
 
-def _repair_go(project_path: str, go_files: list[str], timeout: int) -> int:
-    """Go：goimports -w —— 事实标准，自动增删/解析 import。工具缺失则跳过。"""
+def _repair_go(project_path: str, go_files: list[str], timeout: int) -> tuple[int, list[str]]:
+    """Go：goimports -w —— 事实标准，自动增删/解析 import。工具缺失则跳过。
+
+    返回 (修复文件数, 文件相对路径列表)，TD2606-C9 供回传。"""
     if not go_files:
-        return 0
-    files = " ".join(f"'{f}'" for f in go_files[:50])
+        return 0, []
+    touched = list(go_files[:50])
+    files = " ".join(f"'{f}'" for f in touched)
     ec, out = _run_l1_command(f"goimports -w {files}", project_path, timeout=min(timeout, 120))
     if ec != 0 and _tool_missing(out):
         logger.info("[L1.2.1·repair] goimports 不可用，跳过 Go import 修复")
-        return 0
+        return 0, []
     if ec == 0:
-        logger.info("[L1.2.1·repair] goimports -w 修复 %d 个 .go 文件 import", len(go_files))
-        return len(go_files)
-    return 0
+        logger.info("[L1.2.1·repair] goimports -w 修复 %d 个 .go 文件 import", len(touched))
+        return len(touched), touched
+    return 0, []
 
 
-def _repair_rust(project_path: str, timeout: int) -> int:
-    """Rust：cargo fix —— 自动套用 rustc 机器可应用建议（含 use 路径）。crate 级。"""
+def _repair_rust(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Rust：cargo fix —— 自动套用 rustc 机器可应用建议（含 use 路径）。crate 级。
+
+    返回 (修复标记, 路径列表)。cargo fix 修改的具体文件集不可知（crate 级），故路径列表
+    为空——TD2606-C9 残留：依赖 rust crate 源在子任务写权 scope 内（pull-back 已覆盖）。"""
     cmd = "cargo fix --allow-dirty --allow-no-vcs --edition-idioms -q 2>&1"
     ec, out = _run_l1_command(cmd, project_path, timeout=max(timeout, 240))
     if _tool_missing(out):
         logger.info("[L1.2.1·repair] cargo 不可用，跳过 Rust 修复")
-        return 0
+        return 0, []
     # cargo fix 可能因冲突非 0 退出，但已应用的建议仍写盘；交重跑构建仲裁
     logger.info("[L1.2.1·repair] cargo fix 已尝试套用 rustc 建议（exit=%s）", ec)
-    return 1
+    return 1, []
 
 
-def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> int:
-    """TS/JS/Vue/前端：eslint --fix —— 自动修 import/order、可修复规则。需项目本地 eslint+config。"""
+def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> tuple[int, list[str]]:
+    """TS/JS/Vue/前端：eslint --fix —— 自动修 import/order、可修复规则。需项目本地 eslint+config。
+
+    返回 (修复文件数, 文件相对路径列表)，TD2606-C9 供回传。"""
     if not ts_files:
-        return 0
-    files = " ".join(f"'{f}'" for f in ts_files[:60])
+        return 0, []
+    touched = list(ts_files[:60])
+    files = " ".join(f"'{f}'" for f in touched)
     # --no-install：只用项目本地 eslint，绝不联网装；缺失则报错→识别为工具缺失跳过
     ec, out = _run_l1_command(
         f"npx --no-install eslint --fix {files} 2>&1", project_path, timeout=min(timeout, 180)
     )
     if _tool_missing(out) or "no eslint configuration" in (out or "").lower():
         logger.info("[L1.2.1·repair] eslint 不可用/无配置，跳过 TS/JS 修复")
-        return 0
+        return 0, []
     # eslint exit 0=干净 1=仍有不可自动修的错误（但可修的已写盘）→ 都算"已尝试修"
     if ec in (0, 1):
-        logger.info("[L1.2.1·repair] eslint --fix 修复 %d 个 TS/JS/Vue 文件", len(ts_files))
-        return len(ts_files)
-    return 0
+        logger.info("[L1.2.1·repair] eslint --fix 修复 %d 个 TS/JS/Vue 文件", len(touched))
+        return len(touched), touched
+    return 0, []
 
 
 def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
@@ -356,8 +375,11 @@ def _attempt_build_repair(
     modified: list[str],
     timeout: int,
     project_stack: dict | None = None,
-) -> int:
-    """跨生态确定性构建修复 dispatcher。返回触达文件数（>0 调用方重跑构建确认）。
+) -> tuple[int, list[str]]:
+    """跨生态确定性构建修复 dispatcher。返回 (触达文件数, 触达文件相对路径列表)。
+
+    触达数 >0 调用方重跑构建确认；路径列表（TD2606-C9）供调用方把【沙箱里】被修复的文件
+    （含子任务写权 scope 之外的，如父 pom）回传本地，杜绝本地 diff 与沙箱编译两棵真值树分叉。
 
     生态集合由【权威栈画像 project_stack】决定（单一事实源；detect_stack 已小模型识别→大模型
     确认→KB 持久化，含混合项目/低置信模型兜底）；无画像时回退按 modified 扩展名。每个生态委托
@@ -375,15 +397,25 @@ def _attempt_build_repair(
         return (lang in stack_langs) if stack_langs is not None else file_signal
 
     total = 0
+    paths: list[str] = []
+
+    def _accum(result: tuple[int, list[str]]) -> None:
+        nonlocal total
+        n, fs = result
+        total += n
+        for f in fs:
+            if f and f not in paths:
+                paths.append(f)
+
     # Java：错误信息里就带 .java 文件，无需 modified 列出 → file_signal=True
     if eligible("java", True):
         try:
-            total += _attempt_import_repair(project_path, build_output, timeout)
+            _accum(_attempt_import_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
         # Maven 依赖版本不存在（worker 凭空写错版本号）→ 校正到最近有效版本
         try:
-            total += _attempt_maven_version_repair(project_path, build_output, timeout)
+            _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
     adapters = (
@@ -394,10 +426,10 @@ def _attempt_build_repair(
     for lang, file_signal, fn in adapters:
         if eligible(lang, file_signal) and (file_signal or lang == "rust"):
             try:
-                total += fn()
+                _accum(fn())
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[L1.2.1·repair] %s adapter 异常(跳过): %s", lang, exc)
-    return total
+    return total, paths
 
 
 # audit #37/#38：编译/lint 每次最多处理的文件数。原为硬编码 20，大变更集会遗漏后续
@@ -1379,9 +1411,10 @@ def run_l1_pipeline(
                 "SWARM_WORKER_IMPORT_REPAIR", "true"
             ).lower() not in ("false", "0", "no")
             repaired = 0
+            repaired_paths: list[str] = []
             if repair_on:
                 try:
-                    repaired = _attempt_build_repair(
+                    repaired, repaired_paths = _attempt_build_repair(
                         project_path, b_out, modified, timeout, project_stack
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -1393,6 +1426,10 @@ def run_l1_pipeline(
                 details["l1_2_1_build_ok"] = build_ok
                 details["build_output"] = compress_tool_output(b_out, max_chars=1500)
                 details["import_repaired_files"] = repaired
+                # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
+                # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
+                if repaired_paths:
+                    details["repaired_file_paths"] = repaired_paths
                 logger.info("[L1.2.1] import-repair 后构建: exit=%s ok=%s", b_ec, build_ok)
             if not build_ok:
                 # fail-closed 但不误判 capability：构建非零退出若命中网络/工具/资源 infra 瞬时故障，

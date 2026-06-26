@@ -452,6 +452,10 @@ class WorkerExecutor:
         # 本地模式由 _snapshot_scope_local 填充。__init__ 初始化避免本地模式下属性缺失。
         self._pre_sync_contents: dict[str, str | None] = {}
         self._post_sync_contents: dict[str, str | None] = {}
+        # TD2606-C9：L1 确定性闸门在沙箱里修复（version-repair / import-repair / goimports …）
+        # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
+        # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
+        self._repaired_extra_paths: set[str] = set()
 
         # 归一化 scope：Brain 有时把【已存在】文件误判进 create_files（如"给现有
         # ruoyi.js 加函数"），create_files 走"新建"路径(不上传/不读取原内容)会丢内容。
@@ -1616,10 +1620,12 @@ class WorkerExecutor:
         （agent 已直接改本地文件），从而本地模式也能正确产出 diff。
         """
         local_root = Path(self.project_path).resolve()
+        # TD2606-C9：闸门在沙箱里确定性修复的文件（含 scope 外，如父 pom）也要回传。
+        extra_repaired = sorted(self._repaired_extra_paths)
         if not self._sandbox or not self._sandbox_manager:
-            # 本地模式：直接快照本地 writable 文件（agent 已就地修改）
+            # 本地模式：直接快照本地 writable 文件（agent 已就地修改）+ 被修复文件
             self._post_sync_contents = self._snapshot_scope_local(
-                local_root, files=self._writable_files()
+                local_root, files=self._writable_files() + extra_repaired
             )
             await self._normalize_jvm_namespace(local_root, reason)
             return
@@ -1634,6 +1640,11 @@ class WorkerExecutor:
                 self._log(f"{reason} allow_any 模式：枚举沙箱产物 {len(rel_files)} 个文件")
             except Exception as exc:
                 self._log(f"{reason} allow_any 枚举沙箱文件失败: {exc}")
+        # 并入被确定性修复的文件（去重保序），使其无论是否在写权 scope 内都被拉回本地。
+        if extra_repaired:
+            rel_files = list(dict.fromkeys(
+                rel_files + [self._norm_rel(local_root, p) for p in extra_repaired]
+            ))
         if not rel_files:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
@@ -1847,7 +1858,10 @@ class WorkerExecutor:
         modify = [f for f in (getattr(scope, "writable", []) or []) if f]
         create = [f for f in (getattr(scope, "create_files", []) or []) if f]
         delete = [f for f in (getattr(scope, "delete_files", []) or []) if f]
-        targets = list(dict.fromkeys(modify + create + delete))
+        # TD2606-C9：把闸门在沙箱里修复的文件（含 scope 外，如父 pom）纳入 diff，
+        # 否则修复进了本地工作区却因不在 scope 而被 `-- <files>` 过滤掉 → merged_diff 缺失。
+        repaired = [f for f in sorted(self._repaired_extra_paths) if f]
+        targets = list(dict.fromkeys(modify + create + delete + repaired))
         if not targets:
             return None
 
@@ -2420,6 +2434,41 @@ class WorkerExecutor:
         }
         return passed, details
 
+    def _record_repaired_paths(self, details: dict) -> None:
+        """TD2606-C9：登记 L1 闸门在沙箱里确定性修复的文件相对路径。
+
+        - 归一化（去 ./ 前缀），累积到 self._repaired_extra_paths；后续每次 _sync_from_sandbox
+          都会把它们一并 pull-back，_get_git_diff 也会把它们纳入 diff——即便文件在子任务写权
+          scope 之外（典型：父 pom 的版本号被 version-repair 改对）。
+        - 同时为【无 .git 回退 difflib】路径补 pre 基线：此刻本地文件尚未被沙箱修复触及
+          （修复发生在沙箱），其本地内容即 HEAD 基线，捕获后 difflib 才能算出正确增量。
+        """
+        paths = details.get("repaired_file_paths") if isinstance(details, dict) else None
+        if not paths:
+            return
+        local_root = Path(self.project_path) if self.project_path else None
+        for raw in paths:
+            rel = str(raw or "").strip()
+            if rel.startswith("./"):
+                rel = rel[2:]
+            if not rel:
+                continue
+            self._repaired_extra_paths.add(rel)
+            # difflib 基线（仅在尚未捕获时，且仅用于无 .git 回退路径）：优先 git HEAD 提交版
+            # （两种执行模式都正确）；无 git 时回退本地工作副本（沙箱模式下此刻本地仍是 HEAD）。
+            if local_root is not None and rel not in self._pre_sync_contents:
+                git_text = self._git_baseline_text(local_root, rel)
+                if git_text is not None:
+                    self._pre_sync_contents[rel] = git_text
+                else:
+                    try:
+                        lp = local_root / rel
+                        self._pre_sync_contents[rel] = (
+                            lp.read_text("utf-8") if lp.is_file() else ""
+                        )
+                    except (OSError, UnicodeDecodeError):
+                        self._pre_sync_contents[rel] = ""
+
     def _deterministic_l1_gate(self) -> tuple[bool | None, dict]:
         """循环内确定性 L1 闸门：用真实 compile/lint/scope 结果驱动修复轮次。
 
@@ -2476,6 +2525,8 @@ class WorkerExecutor:
                 self.project_path, self.subtask, diff or "", llm=None,
                 project_stack=self._resolve_project_stack(),
             )
+            # TD2606-C9：登记本轮在沙箱里被确定性修复的文件，使其回传本地 + 计入 diff。
+            self._record_repaired_paths(details)
             # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
             details["l1_phase"] = "phase3_loop_deterministic"
             # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程

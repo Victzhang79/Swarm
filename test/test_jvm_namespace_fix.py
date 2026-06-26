@@ -159,8 +159,10 @@ def test_import_repair_derives_canonical_prefix_from_project():
         bad.parent.mkdir(parents=True, exist_ok=True)
         bad.write_text("package com.x;\nimport javax.servlet.http.HttpServletRequest;\nclass Bad{}\n")
         build_out = f"[ERROR] {bad}:[2,26] package javax.servlet.http does not exist\n"
-        n = _attempt_import_repair(str(root), build_out, timeout=30)
+        n, paths = _attempt_import_repair(str(root), build_out, timeout=30)
         assert n == 1
+        # TD2606-C9：修复路径透传，供 executor 回传本地（即便文件在写权 scope 外）
+        assert any(p.endswith("Bad.java") for p in paths), paths
         fixed = bad.read_text()
         assert "jakarta.servlet.http" in fixed and "javax.servlet" not in fixed
         assert not (bad.parent / "Bad.java.bak").exists()  # 不留 .bak
@@ -175,7 +177,7 @@ def test_import_repair_leaves_missing_dependency_untouched():
         bad.write_text("import org.springframework.security.access.prepost.PreAuthorize;\nclass X{}\n")
         build_out = (f"[ERROR] {bad}:[1,51] package "
                      "org.springframework.security.access.prepost does not exist\n")
-        assert _attempt_import_repair(str(root), build_out, timeout=30) == 0
+        assert _attempt_import_repair(str(root), build_out, timeout=30) == (0, [])
         assert "org.springframework.security.access.prepost" in bad.read_text()
 
 
@@ -205,10 +207,10 @@ def test_stack_gating_overrides_stray_extensions(monkeypatch):
     """权威栈说是纯 Go 项目时，即便 modified 混入一个 .ts，也不跑 ts adapter（以栈为准）。"""
     import swarm.worker.l1_pipeline as L
     calls = []
-    monkeypatch.setattr(L, "_repair_go", lambda *a, **k: (calls.append("go"), 1)[1])
-    monkeypatch.setattr(L, "_repair_ts", lambda *a, **k: (calls.append("ts"), 1)[1])
-    monkeypatch.setattr(L, "_repair_rust", lambda *a, **k: (calls.append("rust"), 1)[1])
-    monkeypatch.setattr(L, "_attempt_import_repair", lambda *a, **k: 0)
+    monkeypatch.setattr(L, "_repair_go", lambda *a, **k: (calls.append("go"), (1, []))[1])
+    monkeypatch.setattr(L, "_repair_ts", lambda *a, **k: (calls.append("ts"), (1, []))[1])
+    monkeypatch.setattr(L, "_repair_rust", lambda *a, **k: (calls.append("rust"), (1, []))[1])
+    monkeypatch.setattr(L, "_attempt_import_repair", lambda *a, **k: (0, []))
     _attempt_build_repair("/x", "", ["svc/main.go", "stray.ts"], 10,
                           project_stack={"build": "go", "backend": "go"})
     assert "go" in calls and "ts" not in calls  # 栈=go → 不碰 stray .ts
@@ -235,8 +237,9 @@ def test_dispatcher_routes_java_through_to_project_derived_repair(monkeypatch):
         build_out = f"[ERROR] {bad}:[1,26] package javax.servlet.http does not exist\n"
         modified = ["mod/Bad.java", "web/app.ts", "svc/main.go", "core/lib.rs"]
         # 不论 goimports/eslint/cargo 是否安装，都不应抛异常；Java 至少改对 1 个
-        n = _attempt_build_repair(str(root), build_out, modified, timeout=30)
+        n, paths = _attempt_build_repair(str(root), build_out, modified, timeout=30)
         assert n >= 1
+        assert any(p.endswith("Bad.java") for p in paths), paths
         assert "jakarta.servlet.http" in bad.read_text()
 
 
@@ -249,9 +252,10 @@ def test_dispatcher_non_java_tools_absent_is_graceful(monkeypatch):
         # 强制各生态工具"缺失"以确定性验证优雅跳过
         import swarm.worker.l1_pipeline as L
         monkeypatch.setattr(L, "_run_l1_command", lambda *a, **k: (127, "command not found"))
-        n = _attempt_build_repair(str(root), "go build error: undefined: Foo",
-                                  ["main.go", "x.ts", "y.rs"], timeout=10)
+        n, paths = _attempt_build_repair(str(root), "go build error: undefined: Foo",
+                                         ["main.go", "x.ts", "y.rs"], timeout=10)
         assert n == 0
+        assert paths == []
 
 
 def test_detect_stack_non_jvm_has_empty_jvm():
