@@ -364,3 +364,77 @@ def test_mixed_own_and_upstream_is_not_excused():
 def test_no_pl_or_no_error_is_false():
     assert _build_error_is_upstream("some error", "mvn compile") is False
     assert _build_error_is_upstream("BUILD SUCCESS", "mvn -pl ruoyi-alarm -am compile") is False
+
+
+# ── 根因#3：文件级归属——别人的坏文件不连坐本子任务（996db614 7h雪崩根治） ──
+
+def test_error_in_other_subtask_file_is_upstream():
+    """本子任务改 AppAuthInterceptor，但 build 炸在别人的 AlarmAppSecretController → 标 BLOCKED。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/"
+           "AlarmAppSecretController.java:[134,61] incompatible types: String[] cannot be converted to Long[]\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is True
+
+
+def test_error_in_own_file_is_capability():
+    """build 炸在本子任务自己改的文件 → 不放过（False），由根因#1 全量闸门在源头修。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/"
+           "AppAuthInterceptor.java:[50,12] cannot find symbol\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is False
+
+
+def test_mixed_own_and_other_file_not_excused():
+    """自己的文件也有错 + 别人的也有错 → 不放过本子任务(False)。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/.../AlarmAppSecretController.java:[134,61] incompatible types\n"
+           "[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java:[5,1] cannot find symbol\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is False
+
+
+def test_filelevel_falls_back_to_module_when_no_modified():
+    """无 modified → 回退模块级(P0-B 原行为)，向后兼容。"""
+    out = "The project com.ruoyi:ruoyi-generator:4.8.3 (/workspace/ruoyi-generator/pom.xml) has 1 error\n"
+    assert _build_error_is_upstream(out, "mvn -pl ruoyi-alarm -am compile") is True
+
+
+# ── 根因#1 通用版：生产者全量构建闸门——任何栈皆然(非 Java 写死) ──
+from swarm.worker.l1_pipeline import _derive_full_build_command
+
+
+def test_derive_build_is_stack_general():
+    import os
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # Java/maven
+        (root / "pom.xml").write_text("<project/>")
+        assert _derive_full_build_command(str(root), ["ruoyi-alarm/X.java"], {"build": "maven"}) == "mvn -q compile"
+        # Go
+        (root / "go.mod").write_text("module x")
+        assert _derive_full_build_command(str(root), ["svc/main.go"], {"build": "go"}) == "go build ./..."
+        # Rust
+        (root / "Cargo.toml").write_text("[package]")
+        assert _derive_full_build_command(str(root), ["src/lib.rs"], {"build": "cargo"}) == "cargo build -q"
+        # 前端 TS
+        (root / "tsconfig.json").write_text("{}")
+        assert _derive_full_build_command(str(root), ["src/app.ts"], {"build": "npm"}) == "tsc --noEmit"
+
+
+def test_derive_build_gradle_vs_maven():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "build.gradle").write_text("plugins{}")
+        # 无 pom + 有 gradle + .java → gradle
+        assert "gradle" in _derive_full_build_command(str(root), ["app/A.java"], {"build": "gradle"})
+
+
+def test_derive_build_noop_without_source_or_manifest():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # 改的是 .md，无源码 → 不派生
+        assert _derive_full_build_command(str(root), ["README.md"], {"build": "maven"}) == ""
+        # .java 但无 pom/gradle 清单 → 不派生(不臆造)
+        assert _derive_full_build_command(str(root), ["X.java"], None) == ""
