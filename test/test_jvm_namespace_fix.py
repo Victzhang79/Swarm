@@ -438,3 +438,59 @@ def test_derive_build_noop_without_source_or_manifest():
         assert _derive_full_build_command(str(root), ["README.md"], {"build": "maven"}) == ""
         # .java 但无 pom/gradle 清单 → 不派生(不臆造)
         assert _derive_full_build_command(str(root), ["X.java"], None) == ""
+
+
+# ── 根因#2：通用符号 typo 修复——据项目现存符号纠近邻(非硬编码表) ──
+from swarm.worker.l1_pipeline import _attempt_symbol_repair, _edit_distance
+
+
+def test_edit_distance_bounds():
+    assert _edit_distance("isEmtpy", "isEmpty") == 2   # 转置
+    assert _edit_distance("StringBufffer", "StringBuffer") == 1
+    assert _edit_distance("getError", "getMessage") > 2  # 语义错，非 typo，不该纠
+
+
+def test_symbol_repair_fixes_typo_from_project_usage(monkeypatch):
+    """isEmtpy 拼错 → 项目里 isEmpty 高频 → 纠为 isEmpty；全程无硬编码符号表。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # 项目现存源码：isEmpty 高频出现（真理来源）
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{boolean f(String s){{return s.isEmpty();}}}}\n")
+        bad = root / "mod/Svc.java"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("class Svc{boolean g(String s){return s.isEmtpy();}}\n")
+        build_out = ("[ERROR] mod/Svc.java:[1,40] cannot find symbol\n"
+                     "  symbol:   method isEmtpy()\n  location: variable s of type java.lang.String\n")
+        n, paths = _attempt_symbol_repair(str(root), build_out, ["mod/Svc.java"], timeout=30)
+        assert n == 1, (n, paths)
+        assert "isEmpty()" in bad.read_text() and "isEmtpy" not in bad.read_text()
+
+
+def test_symbol_repair_skips_other_subtask_file(monkeypatch):
+    """报错文件不是本子任务改的 → 不动（交 owner，配合文件级归属）。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{boolean f(String s){{return s.isEmpty();}}}}\n")
+        other = root / "mod/Other.java"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("class Other{boolean g(String s){return s.isEmtpy();}}\n")
+        build_out = ("[ERROR] mod/Other.java:[1,40] cannot find symbol\n  symbol:   method isEmtpy()\n")
+        # 本子任务只改了 X.java，没改 Other.java
+        n, _p = _attempt_symbol_repair(str(root), build_out, ["mod/X.java"], timeout=30)
+        assert n == 0 and "isEmtpy" in other.read_text()
+
+
+def test_symbol_repair_noop_on_semantic_error(monkeypatch):
+    """getError→getMessage 是语义错(距>2)，无唯一近邻 → 不乱改。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{String f(Exception e){{return e.getMessage();}}}}\n")
+        bad = root / "mod/S.java"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("class S{String g(Exception e){return e.getError();}}\n")
+        build_out = ("[ERROR] mod/S.java:[1,40] cannot find symbol\n  symbol:   method getError()\n")
+        n, _p = _attempt_symbol_repair(str(root), build_out, ["mod/S.java"], timeout=30)
+        assert n == 0 and "getError" in bad.read_text()

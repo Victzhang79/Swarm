@@ -431,6 +431,83 @@ def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
     return langs or None
 
 
+_SYMBOL_ERR_RE = re.compile(
+    r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala)):\[\d+,\d+\][^\n]*cannot find symbol[^\n]*\n"
+    r"[^\n]*symbol:\s*(?:method|class|variable)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _edit_distance(a: str, b: str, cap: int = 3) -> int:
+    """Levenshtein，超 cap 提前返回 cap+1（够判近邻即可，省算）。"""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            best = min(best, cur[-1])
+        if best > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def _attempt_symbol_repair(
+    project_path: str, build_output: str, modified: list[str], timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：模型臆造/拼错的方法/类名（isEmtpy→isEmpty、StringBufffer→StringBuffer 等）→
+    据【项目自身现存符号】按编辑距离纠到最近的真实符号。与 import-repair 同源：真理取自项目用法，
+    无硬编码符号表，任何 .java/.kt/.scala 皆可（非 Java 写死、非 RuoYi 专用）。改完调用方重跑确认。
+
+    安全：仅当存在【唯一近邻】（编辑距离≤2、项目内高频≥5、≠原名）才改，歧义则放弃；只修【本子任务
+    改动的文件】（别人的文件交其 owner，配合文件级归属）；改错重跑仍失败=绝不假通过。
+    """
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", build_output or "")
+    errs = _SYMBOL_ERR_RE.findall(clean)
+    if not errs:
+        return 0, []
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
+    mcmd = ("grep -rhoE '[A-Za-z_][A-Za-z0-9_]+' --include='*.java' --include='*.kt' . "
+            "2>/dev/null | sort | uniq -c | sort -rn | head -4000")
+    _ec, gout, _e = _run_check_split(mcmd, project_path, timeout=min(timeout, 60))
+    freq: dict[str, int] = {}
+    for line in (gout or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)", line)
+        if m:
+            freq[m.group(2)] = int(m.group(1))
+    if not freq:
+        return 0, []
+    changed: set[str] = set()
+    seen: set[tuple] = set()
+    for fpath, name in errs:
+        rel = _norm_src_path(fpath)
+        if mods and rel not in mods and not any(rel.endswith(m) or m.endswith(rel) for m in mods):
+            continue  # 别人的文件，不动
+        if (rel, name) in seen:
+            continue
+        seen.add((rel, name))
+        cands = [(w, _edit_distance(name, w)) for w in freq
+                 if w != name and freq[w] >= 5 and abs(len(w) - len(name)) <= 2]
+        cands = [(w, d) for w, d in cands if d <= 2]
+        if not cands:
+            continue
+        best_d = min(d for _w, d in cands)
+        top = [w for w, d in cands if d == best_d]
+        if len(top) != 1:
+            continue  # 歧义近邻，不赌
+        good = top[0]
+        scmd = (f"perl -i.bak -pe 's#\\b{re.escape(name)}\\b#{good}#g' '{rel}' "
+                f"&& rm -f '{rel}.bak'")
+        ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
+        if ec2 == 0:
+            changed.add(rel)
+            logger.info("[L1.2.1·symbol-repair] %s: %s→%s（项目近邻 距=%d 频=%d）",
+                        rel, name, good, best_d, freq[good])
+    return len(changed), sorted(changed)
+
+
 def _attempt_build_repair(
     project_path: str,
     build_output: str,
@@ -480,6 +557,11 @@ def _attempt_build_repair(
             _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
+        # 模型臆造/拼错的方法/类名（isEmtpy→isEmpty 等）→ 据项目现存符号按编辑距离纠近邻
+        try:
+            _accum(_attempt_symbol_repair(project_path, build_output, modified, timeout))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] symbol-repair 异常(跳过): %s", exc)
     adapters = (
         ("go", bool(go_files), lambda: _repair_go(project_path, go_files, timeout)),
         ("rust", has_rust_files, lambda: _repair_rust(project_path, timeout)),
