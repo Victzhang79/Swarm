@@ -63,6 +63,26 @@ class _FilePatch:
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+def _recount_hunk_header(header_line: str, body_lines: list[str]) -> str:
+    """据 hunk 实际 body 行重算 @@ 头的 old_count/new_count（保 old_start/new_start 与尾部
+    section heading），确保头与体一致 → 杜绝合并/规范化后行数漂移导致的 git apply '补丁损坏'。"""
+    m = _HUNK_RE.match(header_line)
+    if not m:
+        return header_line
+    old_c = new_c = 0
+    for ln in body_lines:
+        c = ln[:1]
+        if c == "+":
+            new_c += 1
+        elif c == "-":
+            old_c += 1
+        else:  # context（" " / "\" no-newline 标记按 context 计，与 git 一致）
+            old_c += 1
+            new_c += 1
+    tail = header_line[m.end():]  # @@ 后可选的 section heading（如 ' func foo()'）
+    return f"@@ -{_parse_int(m.group(1))},{old_c} +{_parse_int(m.group(3))},{new_c} @@{tail}"
+
+
 def _parse_int(value: str | None, default: int = 1) -> int:
     if value is None or value == "":
         return default
@@ -181,27 +201,27 @@ def _format_file_patch(file_path: str, header_lines: list[str], hunks: list[_Hun
     else:
         header = [f"--- a/{file_path}", f"+++ b/{file_path}"]
 
+    # ── 逐 hunk 规范化 body + 【重算 @@ 头行数】（task 3adfeca5/f20ea68d + 996db614 merge 损坏）──
+    # 关键治本：规范化（丢尾部 split 产物 "" / 中间空行 "" 还原为 " "）会改变 hunk body 行数，
+    # 但原代码【不更新 @@ 头声明的 old_count/new_count】→ 头与体行数不符 → git apply 报"补丁
+    # 损坏"(malformed，996db614 第2822行实测)。逐 hunk 据【实际 body】重算头行数，保证头永远
+    # 与体一致 = 补丁永远 well-formed（即便内容有偏差，git apply 也只会干净 reject，不会"损坏"）。
     body: list[str] = []
     for hunk in sorted(hunks, key=lambda h: h.old_start):
-        body.extend(hunk.lines)
-
-    # ── 空行/行尾处理（task 3adfeca5 + f20ea68d）──
-    # hunk.lines 来自 _parse_file_patch 的 raw.split("\n")（保留行内 \r，不含 \n）。
-    # 两类空字符串元素要区别处理：
-    #  (a) 末尾的 ""：split("\n") 对以 \n 结尾的 diff 文本会多产一个尾部 "" → 直接丢弃；
-    #  (b) 中间的 ""：原是【空行 context】(" " 或 CRLF 的 " \r")，经传输尾部空白被 strip 成
-    #      "" → 必须【还原为 " "】(单空格 context 标记)，否则 hunk 实际 context 行数 < @@
-    #      头声明 old_count → git apply "补丁未应用"（task 3adfeca5 实测）。
-    # 先去掉【尾部】连续的 ""（split 产物），再把【中间】残留的 "" 还原为 " "。
-    while body and body[-1] == "":
-        body.pop()
-    normalized: list[str] = []
-    for ln in body:
-        if ln == "":
-            normalized.append(" ")  # 中间空行 → 单空格 context 标记，保 hunk 行数
-        else:
-            normalized.append(ln)
-    return "\n".join(header + normalized)
+        hlines = list(hunk.lines)
+        if not hlines:
+            continue
+        hdr, hbody = hlines[0], hlines[1:]
+        while hbody and hbody[-1] == "":          # 丢尾部 split 产物 ""
+            hbody.pop()
+        hbody = [(" " if ln == "" else ln) for ln in hbody]  # 中间空行 → " " context
+        if _HUNK_RE.match(hdr):
+            body.append(_recount_hunk_header(hdr, hbody))
+            body.extend(hbody)
+        else:  # 非标准 hunk（无 @@ 头）：保守原样
+            body.append(hdr)
+            body.extend(hbody)
+    return "\n".join(header + body)
 
 
 def _format_conflict_hunks(file_path: str, hunks: list[_Hunk]) -> str:

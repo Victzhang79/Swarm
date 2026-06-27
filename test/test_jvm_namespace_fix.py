@@ -364,3 +364,133 @@ def test_mixed_own_and_upstream_is_not_excused():
 def test_no_pl_or_no_error_is_false():
     assert _build_error_is_upstream("some error", "mvn compile") is False
     assert _build_error_is_upstream("BUILD SUCCESS", "mvn -pl ruoyi-alarm -am compile") is False
+
+
+# ── 根因#3：文件级归属——别人的坏文件不连坐本子任务（996db614 7h雪崩根治） ──
+
+def test_error_in_other_subtask_file_is_upstream():
+    """本子任务改 AppAuthInterceptor，但 build 炸在别人的 AlarmAppSecretController → 标 BLOCKED。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/controller/"
+           "AlarmAppSecretController.java:[134,61] incompatible types: String[] cannot be converted to Long[]\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is True
+
+
+def test_error_in_own_file_is_capability():
+    """build 炸在本子任务自己改的文件 → 不放过（False），由根因#1 全量闸门在源头修。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/"
+           "AppAuthInterceptor.java:[50,12] cannot find symbol\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is False
+
+
+def test_mixed_own_and_other_file_not_excused():
+    """自己的文件也有错 + 别人的也有错 → 不放过本子任务(False)。"""
+    out = ("[ERROR] /workspace/ruoyi-alarm/.../AlarmAppSecretController.java:[134,61] incompatible types\n"
+           "[ERROR] /workspace/ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java:[5,1] cannot find symbol\n")
+    cmd = "mvn -pl ruoyi-alarm -am -q compile"
+    modified = ["ruoyi-alarm/src/main/java/com/ruoyi/alarm/interceptor/AppAuthInterceptor.java"]
+    assert _build_error_is_upstream(out, cmd, modified) is False
+
+
+def test_filelevel_falls_back_to_module_when_no_modified():
+    """无 modified → 回退模块级(P0-B 原行为)，向后兼容。"""
+    out = "The project com.ruoyi:ruoyi-generator:4.8.3 (/workspace/ruoyi-generator/pom.xml) has 1 error\n"
+    assert _build_error_is_upstream(out, "mvn -pl ruoyi-alarm -am compile") is True
+
+
+# ── 根因#1 通用版：生产者全量构建闸门——任何栈皆然(非 Java 写死) ──
+from swarm.worker.l1_pipeline import _derive_full_build_command
+
+
+def test_derive_build_is_stack_general():
+    import os
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # Java/maven
+        (root / "pom.xml").write_text("<project/>")
+        assert _derive_full_build_command(str(root), ["ruoyi-alarm/X.java"], {"build": "maven"}) == "mvn -q compile"
+        # Go
+        (root / "go.mod").write_text("module x")
+        assert _derive_full_build_command(str(root), ["svc/main.go"], {"build": "go"}) == "go build ./..."
+        # Rust
+        (root / "Cargo.toml").write_text("[package]")
+        assert _derive_full_build_command(str(root), ["src/lib.rs"], {"build": "cargo"}) == "cargo build -q"
+        # 前端 TS
+        (root / "tsconfig.json").write_text("{}")
+        assert _derive_full_build_command(str(root), ["src/app.ts"], {"build": "npm"}) == "tsc --noEmit"
+
+
+def test_derive_build_gradle_vs_maven():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "build.gradle").write_text("plugins{}")
+        # 无 pom + 有 gradle + .java → gradle
+        assert "gradle" in _derive_full_build_command(str(root), ["app/A.java"], {"build": "gradle"})
+
+
+def test_derive_build_noop_without_source_or_manifest():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # 改的是 .md，无源码 → 不派生
+        assert _derive_full_build_command(str(root), ["README.md"], {"build": "maven"}) == ""
+        # .java 但无 pom/gradle 清单 → 不派生(不臆造)
+        assert _derive_full_build_command(str(root), ["X.java"], None) == ""
+
+
+# ── 根因#2：通用符号 typo 修复——据项目现存符号纠近邻(非硬编码表) ──
+from swarm.worker.l1_pipeline import _attempt_symbol_repair, _edit_distance
+
+
+def test_edit_distance_bounds():
+    assert _edit_distance("isEmtpy", "isEmpty") == 2   # 转置
+    assert _edit_distance("StringBufffer", "StringBuffer") == 1
+    assert _edit_distance("getError", "getMessage") > 2  # 语义错，非 typo，不该纠
+
+
+def test_symbol_repair_fixes_typo_from_project_usage(monkeypatch):
+    """isEmtpy 拼错 → 项目里 isEmpty 高频 → 纠为 isEmpty；全程无硬编码符号表。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # 项目现存源码：isEmpty 高频出现（真理来源）
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{boolean f(String s){{return s.isEmpty();}}}}\n")
+        bad = root / "mod/Svc.java"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("class Svc{boolean g(String s){return s.isEmtpy();}}\n")
+        build_out = ("[ERROR] mod/Svc.java:[1,40] cannot find symbol\n"
+                     "  symbol:   method isEmtpy()\n  location: variable s of type java.lang.String\n")
+        n, paths = _attempt_symbol_repair(str(root), build_out, ["mod/Svc.java"], timeout=30)
+        assert n == 1, (n, paths)
+        assert "isEmpty()" in bad.read_text() and "isEmtpy" not in bad.read_text()
+
+
+def test_symbol_repair_skips_other_subtask_file(monkeypatch):
+    """报错文件不是本子任务改的 → 不动（交 owner，配合文件级归属）。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{boolean f(String s){{return s.isEmpty();}}}}\n")
+        other = root / "mod/Other.java"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("class Other{boolean g(String s){return s.isEmtpy();}}\n")
+        build_out = ("[ERROR] mod/Other.java:[1,40] cannot find symbol\n  symbol:   method isEmtpy()\n")
+        # 本子任务只改了 X.java，没改 Other.java
+        n, _p = _attempt_symbol_repair(str(root), build_out, ["mod/X.java"], timeout=30)
+        assert n == 0 and "isEmtpy" in other.read_text()
+
+
+def test_symbol_repair_noop_on_semantic_error(monkeypatch):
+    """getError→getMessage 是语义错(距>2)，无唯一近邻 → 不乱改。"""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for i in range(6):
+            _write(root, f"src/U{i}.java", f"class U{i}{{String f(Exception e){{return e.getMessage();}}}}\n")
+        bad = root / "mod/S.java"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("class S{String g(Exception e){return e.getError();}}\n")
+        build_out = ("[ERROR] mod/S.java:[1,40] cannot find symbol\n  symbol:   method getError()\n")
+        n, _p = _attempt_symbol_repair(str(root), build_out, ["mod/S.java"], timeout=30)
+        assert n == 0 and "getError" in bad.read_text()

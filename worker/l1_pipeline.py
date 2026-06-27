@@ -431,6 +431,83 @@ def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
     return langs or None
 
 
+_SYMBOL_ERR_RE = re.compile(
+    r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala)):\[\d+,\d+\][^\n]*cannot find symbol[^\n]*\n"
+    r"[^\n]*symbol:\s*(?:method|class|variable)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _edit_distance(a: str, b: str, cap: int = 3) -> int:
+    """Levenshtein，超 cap 提前返回 cap+1（够判近邻即可，省算）。"""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            best = min(best, cur[-1])
+        if best > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def _attempt_symbol_repair(
+    project_path: str, build_output: str, modified: list[str], timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：模型臆造/拼错的方法/类名（isEmtpy→isEmpty、StringBufffer→StringBuffer 等）→
+    据【项目自身现存符号】按编辑距离纠到最近的真实符号。与 import-repair 同源：真理取自项目用法，
+    无硬编码符号表，任何 .java/.kt/.scala 皆可（非 Java 写死、非 RuoYi 专用）。改完调用方重跑确认。
+
+    安全：仅当存在【唯一近邻】（编辑距离≤2、项目内高频≥5、≠原名）才改，歧义则放弃；只修【本子任务
+    改动的文件】（别人的文件交其 owner，配合文件级归属）；改错重跑仍失败=绝不假通过。
+    """
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", build_output or "")
+    errs = _SYMBOL_ERR_RE.findall(clean)
+    if not errs:
+        return 0, []
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
+    mcmd = ("grep -rhoE '[A-Za-z_][A-Za-z0-9_]+' --include='*.java' --include='*.kt' . "
+            "2>/dev/null | sort | uniq -c | sort -rn | head -4000")
+    _ec, gout, _e = _run_check_split(mcmd, project_path, timeout=min(timeout, 60))
+    freq: dict[str, int] = {}
+    for line in (gout or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)", line)
+        if m:
+            freq[m.group(2)] = int(m.group(1))
+    if not freq:
+        return 0, []
+    changed: set[str] = set()
+    seen: set[tuple] = set()
+    for fpath, name in errs:
+        rel = _norm_src_path(fpath)
+        if mods and rel not in mods and not any(rel.endswith(m) or m.endswith(rel) for m in mods):
+            continue  # 别人的文件，不动
+        if (rel, name) in seen:
+            continue
+        seen.add((rel, name))
+        cands = [(w, _edit_distance(name, w)) for w in freq
+                 if w != name and freq[w] >= 5 and abs(len(w) - len(name)) <= 2]
+        cands = [(w, d) for w, d in cands if d <= 2]
+        if not cands:
+            continue
+        best_d = min(d for _w, d in cands)
+        top = [w for w, d in cands if d == best_d]
+        if len(top) != 1:
+            continue  # 歧义近邻，不赌
+        good = top[0]
+        scmd = (f"perl -i.bak -pe 's#\\b{re.escape(name)}\\b#{good}#g' '{rel}' "
+                f"&& rm -f '{rel}.bak'")
+        ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
+        if ec2 == 0:
+            changed.add(rel)
+            logger.info("[L1.2.1·symbol-repair] %s: %s→%s（项目近邻 距=%d 频=%d）",
+                        rel, name, good, best_d, freq[good])
+    return len(changed), sorted(changed)
+
+
 def _attempt_build_repair(
     project_path: str,
     build_output: str,
@@ -480,6 +557,11 @@ def _attempt_build_repair(
             _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
+        # 模型臆造/拼错的方法/类名（isEmtpy→isEmpty 等）→ 据项目现存符号按编辑距离纠近邻
+        try:
+            _accum(_attempt_symbol_repair(project_path, build_output, modified, timeout))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] symbol-repair 异常(跳过): %s", exc)
     adapters = (
         ("go", bool(go_files), lambda: _repair_go(project_path, go_files, timeout)),
         ("rust", has_rust_files, lambda: _repair_rust(project_path, timeout)),
@@ -692,6 +774,44 @@ _BUILD_TOOL_MANIFESTS: dict[str, tuple[str, ...]] = {
     "go": ("go.mod",),
     "cargo": ("Cargo.toml",),
 }
+
+
+def _derive_full_build_command(
+    project_path: str, modified: list[str], project_stack: dict | None
+) -> str:
+    """根因#1 通用版（范式化，非 Java/mvn 写死）：子任务改了某栈源码、但 Brain 没下发
+    build_command 时，据【权威栈画像 project_stack.build / 工程清单 + 改动文件语言】派生该栈的
+    【全量构建】命令，让生产者 L1 闸门与下游一样强——任何栈皆然（Java-maven/gradle、Go、Rust、
+    前端 TS）。单文件语法检查（_compile_files）抓不到需全工程上下文才暴露的类型/跨文件/符号错；
+    全量构建才能在【能改它的生产者】当场抓当场修，不漏到无权修的下游。
+
+    命令的工程文件可用性由 _build_cmd_applicable 兜底把关；无匹配栈返回 ''（不臆造）。
+    """
+    import os
+    mods = [str(f).strip() for f in (modified or []) if str(f).strip()]
+    if not mods:
+        return ""
+    build = ((project_stack or {}).get("build") or "").strip().lower()
+
+    def has(*names: str) -> bool:
+        return any(os.path.isfile(os.path.join(project_path, n)) for n in names)
+
+    def ext(*exts: str) -> bool:
+        return any(f.endswith(exts) for f in mods)
+
+    if ext(".java", ".kt", ".scala"):
+        if build == "gradle" or (not build and not has("pom.xml")
+                                 and has("build.gradle", "build.gradle.kts")):
+            return "./gradlew -q compileJava" if has("gradlew") else "gradle -q compileJava"
+        if build == "maven" or has("pom.xml"):
+            return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
+    if ext(".go") and (build == "go" or has("go.mod")):
+        return "go build ./..."
+    if ext(".rs") and (build == "cargo" or has("Cargo.toml")):
+        return "cargo build -q"
+    if ext(".ts", ".tsx") and has("tsconfig.json"):
+        return "tsc --noEmit"
+    return ""
 
 
 def _build_cmd_applicable(command: str, project_path: str) -> bool:
@@ -1402,9 +1522,13 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     return command.replace("mvn", f"mvn -pl {pl} -am", 1)
 
 
-# ── P0-B：构建错误归属判定（本子任务模块 vs 上游模块）──
+# ── P0-B/根因#3：构建错误归属判定（文件级——本子任务改动文件 vs 别人的文件）──
+# 文件级比模块级更精准：RuoYi-alarm 一个模块里几十个子任务各写不同文件，全量 mvn 编译时
+# 别人的坏文件会炸本子任务的 build；按【报错文件是否在本子任务改动集】判定，把"不是我写的
+# 文件的错"标 BLOCKED 交文件 owner 去修（owner 在自己的全量闸门会抓到，见根因#1），不连坐。
 _POM_ERR_MODULE_RE = re.compile(r"The project [\w.\-]+:([\w.\-]+):")
 _COMPILE_ERR_PATH_RE = re.compile(r"(?:^|[ /])([A-Za-z0-9_.\-]+)/src/(?:main|test)/")
+_ERR_FILE_RE = re.compile(r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala|go|rs|ts|tsx|js|vue|xml))")
 
 
 def _pl_modules_from_cmd(build_cmd: str) -> set[str]:
@@ -1427,12 +1551,37 @@ def _build_error_modules(build_output: str) -> set[str]:
     return {x for x in mods if x}
 
 
-def _build_error_is_upstream(build_output: str, build_cmd: str) -> bool:
-    """构建错是否【全在本子任务模块之外】（上游模块坏，非本子任务能力问题）。
+def _norm_src_path(p: str) -> str:
+    """归一化源路径为模块相对（去 /workspace/ 前缀与 ./）：/workspace/ruoyi-alarm/src/.../X.java
+    → ruoyi-alarm/src/.../X.java，便于与子任务 modified 相对路径比对。"""
+    p = str(p).strip().replace("\\", "/")
+    p = re.sub(r"^.*?/workspace/", "", p)
+    return p.lstrip("./").lstrip("/")
 
-    本子任务模块取自 `-pl`；报错模块取自输出。两者都非空且【报错模块不含本模块】→ True。
-    报错里只要含本模块（自己也有错）→ False（不放过本子任务）。
+
+def _build_error_files(build_output: str) -> set[str]:
+    """从构建输出抽【报错的源文件】(归一化模块相对路径)。"""
+    out: set[str] = set()
+    for m in _ERR_FILE_RE.finditer(build_output or ""):
+        f = _norm_src_path(m.group(1))
+        if "/" in f or f.endswith("pom.xml"):  # 过滤裸文件名噪声，保留真实路径
+            out.add(f)
+    return out
+
+
+def _build_error_is_upstream(build_output: str, build_cmd: str,
+                             modified: list[str] | None = None) -> bool:
+    """构建错是否【非本子任务写的代码造成】（→ 标 BLOCKED 交 owner 修，不连坐本子任务）。
+
+    优先【文件级】（根因#3）：报错文件全部不在本子任务 modified 改动集 → True；只要有一个报错
+    文件是本子任务改的 → False（自己有错，不放过，由根因#1 的全量闸门在源头当场修）。
+    无 modified 信息时回退【模块级】（-pl 模块 vs 报错模块），向后兼容。
     """
+    errs_files = _build_error_files(build_output)
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
+    if errs_files and mods:
+        return errs_files.isdisjoint(mods)
+    # 回退：模块级
     own = _pl_modules_from_cmd(build_cmd)
     errs = _build_error_modules(build_output)
     if not own or not errs:
@@ -1504,6 +1653,17 @@ def run_l1_pipeline(
     # 的真实编译靠 Brain 编写的 harness.build_command，在沙箱里跑(那里有工具链)。
     # 这是补齐 5 语言生产级编译验证的关键——杜绝"Java 改坏了但确定性层不知道"。
     build_cmd = getattr(harness, "build_command", "") if harness else ""
+    # 根因#1（producer-gate 不对称，996db614 实测 7h replan 雪崩的头号真因）：
+    # _compile_files 的【单文件 javac】抓不到需全类路径才暴露的类型/跨文件错（如
+    # `String[] cannot be converted to Long[]`、臆造方法签名）。这类错会从【能改它的生产者
+    # 子任务】（其 L1 仅跑了弱 javac）漏过，到【无权修复它的下游子任务】跑全量 `mvn -am` 时才
+    # 炸——下游修不动别人的文件 → 无限 replan → escalate → FAILED。
+    # 治本：子任务改了 .java 但 brain 没下发 build_command 时，确定性派生【全量 mvn 编译】，
+    # 让生产者闸门与下游一样强，把错堵在源头当场修。
+    if not build_cmd:
+        build_cmd = _derive_full_build_command(project_path, modified, project_stack)
+        if build_cmd:
+            details["build_command_derived"] = build_cmd
     if build_cmd:
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
@@ -1559,7 +1719,7 @@ def run_l1_pipeline(
                 # 但报错在 ruoyi-generator 的坏 pom），是上游子任务没收尾，非本子任务能力问题。
                 # 标 BLOCKED 交退避重试（待上游 pom 被其 owner/对账修好），不烧本子任务修复轮——
                 # 杜绝一个坏 pom 经 -am reactor 连坐拖死十几个无辜子任务（996db614 实测）。
-                if _build_error_is_upstream(b_out, build_cmd):
+                if _build_error_is_upstream(b_out, build_cmd, modified):
                     details["l1_2_1_build_ok"] = None
                     details["build_blocked"] = build_cmd
                     details["pipeline_blocked"] = "upstream_module_broken"
