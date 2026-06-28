@@ -585,6 +585,18 @@ def _max_files_per_check() -> int:
         return 20
 
 
+def _max_build_repair_rounds() -> int:
+    """确定性构建修复的【幂等收敛循环】最大轮数（SWARM_WORKER_BUILD_REPAIR_ROUNDS，默认 4）。
+
+    编译器错误掩蔽是级联的：一遍 repair 修掉可见 typo/缺 import 后，rerun 才暴露原先被上游
+    错误掩蔽的下一批 cannot-find-symbol。需多轮「修→重跑→再修」直到收敛。纯确定性、单调
+    （perl 改了不会被自己改回），有界即可，4 轮足以吃下实测最深级联，又不会空转太久。"""
+    try:
+        return max(1, int(os.environ.get("SWARM_WORKER_BUILD_REPAIR_ROUNDS", "4")))
+    except ValueError:
+        return 4
+
+
 def _cap_files(files: list[str], kind: str) -> list[str]:
     """按上限截断文件列表；截断时告警（避免静默遗漏后续文件的检查）。"""
     cap = _max_files_per_check()
@@ -1675,33 +1687,56 @@ def run_l1_pipeline(
         details["build_output"] = compress_tool_output(b_out, max_chars=1500)
         logger.info("[L1.2.1] 构建闸门结果: exit=%s ok=%s", b_ec, build_ok)
         if not build_ok:
-            # 治本·通用：据项目自身惯例确定性修正写错的包名前缀后【重跑一次】构建确认。
+            # 治本·通用：据项目自身惯例确定性修正写错的包名前缀/拼错符号后【重跑】构建确认。
             # 安全性自证——只在构建已失败时触发，且必须重跑通过才算修好，修错了重跑仍失败=
             # 不会制造假通过。SWARM_WORKER_IMPORT_REPAIR=false 可关。
+            #
+            # 根因#③（996db614 实测：531 cannot find symbol 仅确定性纠掉 17）：编译器错误
+            # 掩蔽是【级联】的——一遍 repair 修掉可见的 typo/缺 import 后，rerun 才会暴露原先
+            # 被上游错误掩蔽的下一批 cannot-find-symbol（实证：一个子任务的 isEmtpy 散落 6 文件，
+            # 单发只纠到 1 个，残余漏到慢 LLM 修复循环 → 模型反复写回同一 typo → 撞 900s 预算
+            # 超时 → FAILED）。治本：把确定性 repair 跑成【幂等收敛循环】——修→重跑→再修，直到
+            # 构建通过或某轮【零新增修复】（卡死，交后续 infra/upstream/fail 处理）。纯确定性、
+            # 单调收敛（perl 改了不会被自己改回，故不会震荡）、有界（默认 4 轮），全程无 LLM 介入，
+            # 把整条 typo 级联在【能改它的生产者】当场吃完，不漏到无权修的下游/慢循环。
             repair_on = os.environ.get(
                 "SWARM_WORKER_IMPORT_REPAIR", "true"
             ).lower() not in ("false", "0", "no")
-            repaired = 0
             repaired_paths: list[str] = []
             if repair_on:
-                try:
-                    repaired, repaired_paths = _attempt_build_repair(
-                        project_path, b_out, modified, timeout, project_stack
+                for _rr in range(_max_build_repair_rounds()):
+                    try:
+                        n_round, paths_round = _attempt_build_repair(
+                            project_path, b_out, modified, timeout, project_stack
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
+                        break
+                    if not n_round:
+                        break  # 本轮零新增修复 → 已收敛或卡死，停止空转重跑
+                    for p in paths_round:
+                        if p and p not in repaired_paths:
+                            repaired_paths.append(p)
+                    logger.info(
+                        "[L1.2.1] 确定性修复第 %d 轮触达 %d 文件，重跑构建闸门", _rr + 1, n_round
                     )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
-            if repaired:
-                logger.info("[L1.2.1] 跨生态确定性修复触达 %d 文件，重跑构建闸门", repaired)
-                b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
-                build_ok = b_ec == 0
+                    b_ec, b_out = _run_l1_command(
+                        build_cmd, project_path, timeout=max(timeout, 300)
+                    )
+                    build_ok = b_ec == 0
+                    if build_ok:
+                        break
+            if repaired_paths:
                 details["l1_2_1_build_ok"] = build_ok
                 details["build_output"] = compress_tool_output(b_out, max_chars=1500)
-                details["import_repaired_files"] = repaired
+                details["import_repaired_files"] = len(repaired_paths)
                 # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
                 # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
-                if repaired_paths:
-                    details["repaired_file_paths"] = repaired_paths
-                logger.info("[L1.2.1] import-repair 后构建: exit=%s ok=%s", b_ec, build_ok)
+                details["repaired_file_paths"] = repaired_paths
+                logger.info(
+                    "[L1.2.1] 确定性收敛修复累计 %d 文件后构建: ok=%s",
+                    len(repaired_paths), build_ok,
+                )
             if not build_ok:
                 # fail-closed 但不误判 capability：构建非零退出若命中网络/工具/资源 infra 瞬时故障，
                 # 不是代码能力失败 → 标 BLOCKED 走 transient 退避重试（耗尽才硬 FAIL），不错换模型。
