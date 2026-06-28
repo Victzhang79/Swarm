@@ -44,13 +44,43 @@ class _Resp:
 
 
 def test_llm_says_invalid_but_soft_gate_passes():
-    """LLM 返回 valid:false，软建议模式（默认）下结构已过仍 plan_valid=True。"""
+    """LLM 返回 valid:false 且 issue 非完整性缺陷（粒度偏大）→ 软建议放行 plan_valid=True。"""
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)  # 默认软建议
     fake_llm = AsyncMock()
     fake_llm.ainvoke = AsyncMock(return_value=_Resp('{"valid": false, "issues": ["粒度偏大"]}'))
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(_state()))
-    assert out["plan_valid"] is True, "软建议模式下 LLM valid=false 不应阻断"
+    assert out["plan_valid"] is True, "非完整性软建议不应阻断"
+
+
+# ── P6b：缺核心功能子任务（结构完整性缺陷）→ 在小预算内触发重规划补齐 ──
+
+def test_missing_core_subtasks_triggers_replan_first_pass():
+    """issue 含"缺失核心功能子任务" + retry=0 → plan_valid=False（触发重规划补齐）。"""
+    os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
+    os.environ.pop("SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", None)
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke = AsyncMock(return_value=_Resp(
+        '{"valid": false, "issues": ["缺失核心功能子任务：预警引擎（幂等收敛、免提醒）"]}'))
+    st = dict(_state()); st["plan_retry_count"] = 0
+    with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
+        out = asyncio.run(validate_plan(st))
+    assert out["plan_valid"] is False, "缺核心子任务应触发重规划(非软放行)"
+    assert any("缺失" in s for s in out["plan_validation_issues"])
+
+
+def test_missing_core_subtasks_proceeds_after_budget_exhausted():
+    """同样缺子任务但 retry 已达完整性预算 → plan_valid=True（放行，不无限阻断自动流）。"""
+    os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
+    os.environ.pop("SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", None)
+    os.environ.pop("SWARM_PLAN_COMPLETENESS_RETRIES", None)  # 默认 1
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke = AsyncMock(return_value=_Resp(
+        '{"valid": false, "issues": ["缺失核心功能子任务：预警引擎"]}'))
+    st = dict(_state()); st["plan_retry_count"] = 1  # 已用完完整性预算
+    with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
+        out = asyncio.run(validate_plan(st))
+    assert out["plan_valid"] is True, "完整性预算耗尽后应放行,不无限阻断"
 
 
 def test_llm_malformed_json_passes():

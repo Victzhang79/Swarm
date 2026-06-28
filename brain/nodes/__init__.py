@@ -430,6 +430,10 @@ async def _plan_ultra_batched(
     # read-timeout 不管总时长 → PLAN 单批挂死整个任务(实测挂 16min)。超时按已有 except 分支降级跳过。
     import asyncio as _asyncio
     _PLAN_BATCH_TIMEOUT = 300.0  # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
+    # P6a（治本，996db614 实测 2/9 模块批分解失败→那俩模块零子任务永不构建→交付残缺）：批分解
+    # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 GLM-5.2 瞬时 timeout，1 次
+    # 重试大概率恢复（镜像骨架/Stage B 成熟模式）。耗尽才计 failed_batches。env 可调。
+    _PLAN_BATCH_MAX_ATTEMPTS = int(os.environ.get("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "2") or "2")
     batch_results: list[list[dict]] = []
     failed_batches = 0
     # 各模块批【独立分解】(生成时无跨批依赖，跨批串行依赖在 merge 阶段才加)→ 并发执行。
@@ -462,28 +466,40 @@ async def _plan_ultra_batched(
             tech_design_extra=tech_design_extra,
         )
         async with _plan_sem:
-            _t0 = _time.monotonic()
-            try:
-                response = await _asyncio.wait_for(
-                    llm.ainvoke([
-                        {"role": "system", "content": PLAN_BATCH_SYSTEM},
-                        {"role": "user", "content": prompt_user},
-                    ]),
-                    timeout=_PLAN_BATCH_TIMEOUT,
-                )
-                _dt = _time.monotonic() - _t0
-                result = _parse_json_from_llm(response.content)
-                subs = result.get("subtasks", []) if isinstance(result, dict) else []
-                for _st in subs:
-                    if isinstance(_st, dict):
-                        for _opt in ("harness", "contract"):
-                            if _opt in _st and _st[_opt] is None:
-                                _st.pop(_opt)
-                return ("ok", i, mod_name, subs, _dt, len(batch))
-            except _asyncio.TimeoutError:
-                return ("timeout", i, mod_name, None, None, len(batch))
-            except Exception as exc:  # noqa: BLE001
-                return ("error", i, mod_name, exc, None, len(batch))
+            # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
+            last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
+            for _attempt in range(1, _PLAN_BATCH_MAX_ATTEMPTS + 1):
+                _t0 = _time.monotonic()
+                try:
+                    response = await _asyncio.wait_for(
+                        llm.ainvoke([
+                            {"role": "system", "content": PLAN_BATCH_SYSTEM},
+                            {"role": "user", "content": prompt_user},
+                        ]),
+                        timeout=_PLAN_BATCH_TIMEOUT,
+                    )
+                    _dt = _time.monotonic() - _t0
+                    result = _parse_json_from_llm(response.content)
+                    subs = result.get("subtasks", []) if isinstance(result, dict) else []
+                    for _st in subs:
+                        if isinstance(_st, dict):
+                            for _opt in ("harness", "contract"):
+                                if _opt in _st and _st[_opt] is None:
+                                    _st.pop(_opt)
+                    if subs:
+                        return ("ok", i, mod_name, subs, _dt, len(batch))
+                    last_fail = ("ok", i, mod_name, [], _dt, len(batch))  # 空 → 可重试
+                except _asyncio.TimeoutError:
+                    last_fail = ("timeout", i, mod_name, None, None, len(batch))
+                except Exception as exc:  # noqa: BLE001
+                    last_fail = ("error", i, mod_name, exc, None, len(batch))
+                if _attempt < _PLAN_BATCH_MAX_ATTEMPTS:
+                    logger.warning(
+                        "[PLAN-BATCH] 模块'%s' 第 %d/%d 次分解失败(%s)，退避重试",
+                        mod_name, _attempt, _PLAN_BATCH_MAX_ATTEMPTS, last_fail[0],
+                    )
+                    await _asyncio.sleep(min(2.0 * _attempt, 8.0))
+            return last_fail
 
     # gather 按输入顺序返回 → 保持 module_batches(模块依赖序)的批次顺序
     _outcomes = await _asyncio.gather(*[
@@ -893,6 +909,25 @@ async def validate_plan(state: BrainState) -> dict:
                 logger.info(
                     "[VALIDATE_PLAN] LLM 软建议（不阻断）：valid=false, issues=%s",
                     llm_issues or "(未给出具体问题)",
+                )
+        # P6b（治本，996db614 实测 VALIDATE_PLAN 报"缺核心功能子任务"却软放行→交付缺核心引擎）：
+        # 「缺子任务/未覆盖核心功能」是【结构完整性】缺陷（非主观顾虑），区别于一般软建议——
+        # 在【小预算】内触发一次重规划补齐（与 P6a plan-batch 重试组合：重规划时失败模块批被重试恢复），
+        # 耗尽预算才放行（不无限阻断自动流）。env SWARM_VALIDATE_PLAN_COMPLETENESS_GATE=false 可关。
+        _completeness_on = os.environ.get(
+            "SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", "true"
+        ).lower() not in ("false", "0", "no")
+        _completeness_budget = int(os.environ.get("SWARM_PLAN_COMPLETENESS_RETRIES", "1") or "1")
+        if _completeness_on and llm_valid and llm_issues and retry_count < _completeness_budget:
+            _missing = [
+                s for s in llm_issues
+                if any(k in str(s) for k in ("缺失", "缺核心", "缺少", "未覆盖", "missing", "incomplete"))
+            ]
+            if _missing:
+                llm_valid = False
+                logger.warning(
+                    "[VALIDATE_PLAN] 检出【缺核心功能子任务】(结构完整性缺陷,非软建议)→触发重规划"
+                    "补齐(完整性重试 %d/%d): %s", retry_count + 1, _completeness_budget, _missing,
                 )
     except json.JSONDecodeError as e:
         logger.warning(f"[VALIDATE_PLAN] LLM JSON 解析失败，结构已通过则放行: {e}")
