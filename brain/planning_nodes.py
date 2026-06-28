@@ -1323,15 +1323,17 @@ async def tech_design(state: BrainState) -> dict:
 _CONTRACT_CONCURRENCY = int(os.environ.get("SWARM_CONTRACT_CONCURRENCY", "2") or "2")
 _CONTRACT_MAX_ATTEMPTS = int(os.environ.get("SWARM_CONTRACT_MAX_ATTEMPTS", "3") or "3")
 _CONTRACT_STAGE_TIMEOUT = float(os.environ.get("SWARM_CONTRACT_STAGE_TIMEOUT", "600") or "600")
-# 治本 B（996db614 实测）：Stage A 全局骨架是【consumer_map（跨模块消费关系→确定性连 depends_on
-# 的唯一来源）的单点故障】，且是最大的单次生成（10 模块全局）。实测 GLM-5.2 在 600s 仍"未 stall"
-# 持续生成被墙钟掐断 → asyncio.TimeoutError → consumer_map 整个丢 → ② 跨模块依赖没连。给它【独立
-# 更大预算】（别 guillotine 健康的长生成——本地/云端模型能扛长推理，问题是被切断不是慢）+ 重试。
+# 治本 B（996db614 数据驱动）：Stage A 全局骨架是【consumer_map（跨模块消费关系→确定性连
+# depends_on 的唯一来源）的单点故障】。实测两组数据：2026-06-27 run 骨架【正常 75s 就完】(15 模块、
+# consumer_map=13)；2026-06-28 run 却 600s 没完被墙钟掐断 → consumer_map 整个丢 → ② 跨模块依赖没连。
+# 即骨架正常 ~75s，那次 600s 超时是【异常】(模型 runaway/端点抖动)，不是"生成本来就大"。故真正的
+# 修复是【重试】(换一次新生成大概率 75s 完成)——而非放宽超时(更慢检测异常、最坏更久)。timeout 保持
+# 600s(对 75s 正常值已 8x 余量、06-27 实测从未误杀健康生成)，靠重试兜异常。
 _CONTRACT_SKELETON_TIMEOUT = float(
-    os.environ.get("SWARM_CONTRACT_SKELETON_TIMEOUT", "1200") or "1200"
+    os.environ.get("SWARM_CONTRACT_SKELETON_TIMEOUT", "600") or "600"
 )
-# 骨架重试次数独立且更少（默认 2=1 次重试）：1200s 超时多因"生成太大/模型慢"，重跑同 prompt 大概率
-# 再超时，第 3 次纯浪费（3×1200=60min）。1 次重试兜住瞬时端点抖动即可，再失败即快速降级。
+# 骨架重试次数独立（默认 2=1 次重试）：异常多为瞬时(runaway/端点抖动)，1 次新生成即大概率恢复到
+# 正常 75s；重跑同 prompt 若仍超时，第 3 次纯浪费 → 封顶 2 次即快速降级。
 _CONTRACT_SKELETON_MAX_ATTEMPTS = int(
     os.environ.get("SWARM_CONTRACT_SKELETON_MAX_ATTEMPTS", "2") or "2"
 )

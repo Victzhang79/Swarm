@@ -111,6 +111,52 @@ def test_dep_repair_injects_missing_thirdparty():
     print("  ✅ 缺第三方依赖 → Central 反查坐标 → 注入 module pom（含最新版）")
 
 
+# ── ① artifact 家族补全：jjwt-api 编译够，但运行时需 jjwt-impl/jjwt-jackson（runtime scope）──
+
+def test_dep_repair_injects_runtime_companions():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import io.jsonwebtoken.Jwts;")
+        build_out = f"[ERROR] {rel}:[2,20] package io.jsonwebtoken does not exist\n"
+        restore = _patch_network(("io.jsonwebtoken", "jjwt-api"), ["0.12.6"])
+        orig_fam = l1._resolve_artifact_family
+        l1._resolve_artifact_family = lambda g, a, pp, to: ["jjwt-impl", "jjwt-jackson"]
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 1, (n, poms)
+            pom = (d / "modA/pom.xml").read_text()
+            # 主件 compile（无 scope）
+            assert "<artifactId>jjwt-api</artifactId>" in pom
+            # 运行时伴生件：runtime scope
+            assert "<artifactId>jjwt-impl</artifactId>" in pom
+            assert "<artifactId>jjwt-jackson</artifactId>" in pom
+            assert pom.count("<scope>runtime</scope>") == 2, "两个伴生件都应 runtime scope"
+            assert pom.count("<version>0.12.6</version>") == 3, "家族同版本"
+        finally:
+            l1._resolve_artifact_family = orig_fam
+            restore()
+    print("  ✅ ① artifact 家族：jjwt-api + jjwt-impl/jackson(runtime,同版本)")
+
+
+def test_resolve_family_base_and_suffix_logic():
+    # 纯逻辑：mock Central g: 查询返回同 group 全部 artifact
+    import json as _json
+    docs = {"response": {"docs": [
+        {"a": "jjwt-api"}, {"a": "jjwt-impl"}, {"a": "jjwt-jackson"},
+        {"a": "jjwt-gson"}, {"a": "jjwt-root"},  # gson 不取(避免双 JSON 绑定)、root 是 BOM
+    ]}}
+    orig = l1._run_l1_command
+    l1._run_l1_command = lambda cmd, pp, timeout=120: (0, _json.dumps(docs))
+    try:
+        fam = l1._resolve_artifact_family("io.jsonwebtoken", "jjwt-api", "/x", 30)
+        assert fam == ["jjwt-impl", "jjwt-jackson"], fam  # 顺序按后缀约定，无 gson/root
+        # 主件非 -api/-core → 不猜伴生件
+        assert l1._resolve_artifact_family("com.x", "plainlib", "/x", 30) == []
+    finally:
+        l1._run_l1_command = orig
+    print("  ✅ 家族解析：去 -api 基名 + 运行时后缀过滤（排 gson/root）")
+
+
 # ── 受管依赖（父 dependencyManagement 有）→ 注入【无 version】继承 ──
 
 def test_dep_repair_managed_no_version():

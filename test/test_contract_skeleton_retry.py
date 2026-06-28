@@ -125,11 +125,11 @@ def test_skeleton_non_timeout_error_logged_with_type():
 
 # ── B：独立 skeleton 超时 ≥ 逐模块 stage 超时（给最大单次生成更大预算）──
 
-def test_skeleton_timeout_is_dedicated_and_larger():
-    assert pn._CONTRACT_SKELETON_TIMEOUT >= pn._CONTRACT_STAGE_TIMEOUT, (
-        "骨架(最大单次生成)预算不应小于逐模块 stage 预算")
-    assert pn._CONTRACT_SKELETON_TIMEOUT >= 1200, "默认骨架预算应放宽到 ≥1200s"
-    print("  ✅ B：骨架用独立更大预算 _CONTRACT_SKELETON_TIMEOUT")
+def test_skeleton_has_dedicated_timeout_and_bounded_retries():
+    # 数据驱动：骨架正常 ~75s 就完，600s 是 8x 余量；真正的修复是重试(异常多瞬时)，非放宽超时。
+    assert pn._CONTRACT_SKELETON_TIMEOUT >= 300, "骨架预算应对正常 75s 留足余量"
+    assert 2 <= pn._CONTRACT_SKELETON_MAX_ATTEMPTS <= 3, "重试有界(默认 2),防同 prompt 重跑空转"
+    print("  ✅ B：骨架独立超时 + 有界重试（重试为主、非一味放宽超时）")
 
 
 if __name__ == "__main__":

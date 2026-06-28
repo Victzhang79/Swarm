@@ -465,17 +465,54 @@ def _artifact_is_managed(project_path: str, artifact: str, timeout: int) -> bool
     return (out or "").strip() not in ("", "0")
 
 
+# 运行时伴生件后缀约定：主件常是 `-api`/`-core`（仅编译期接口），运行时还需 `-impl`/`-runtime`
+# 及 JSON 绑定 `-jackson`/`-jaxb`，否则编译过但 L2/L3 运行期 ClassNotFound（jjwt 实测：仅 jjwt-api
+# 编译过、运行 Jwts.builder() 即炸，需 jjwt-impl+jjwt-jackson）。只取这几个【无歧义】伴生后缀，
+# 不含 `-gson`（与 jackson 二选一，避免双 JSON 绑定冲突）——通用约定，非硬编码具体库。
+_RUNTIME_COMPANION_SUFFIXES = ("impl", "runtime", "jackson", "jaxb")
+
+
+def _resolve_artifact_family(
+    group: str, primary: str, project_path: str, timeout: int
+) -> list[str]:
+    """主 artifact 的【运行时伴生件】（jjwt-api → jjwt-impl/jjwt-jackson）。
+
+    据 artifactId 基名（去 `-api`/`-core` 后缀）+ 运行时伴生后缀约定，查同 groupId 下确实存在的
+    伴生件。通用（任何 api/impl 拆分库），无硬编码库表。主件非 -api/-core → 不像拆分库，返回 []。"""
+    base = primary
+    for suf in ("-api", "-core"):
+        if primary.endswith(suf):
+            base = primary[: -len(suf)]
+            break
+    if base == primary:
+        return []
+    url = f"https://search.maven.org/solrsearch/select?q=g:%22{group}%22&rows=40&wt=json"
+    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
+    if _tool_missing(out) or not (out or "").strip():
+        return []
+    try:
+        docs = (json.loads(out).get("response", {}) or {}).get("docs", []) or []
+    except (ValueError, TypeError):
+        return []
+    present = {d.get("a") for d in docs if d.get("a")}
+    return [f"{base}-{s}" for s in _RUNTIME_COMPANION_SUFFIXES if f"{base}-{s}" in present]
+
+
 def _inject_dependency(
-    project_path: str, pom: str, group: str, artifact: str, version: str | None, timeout: int
+    project_path: str, pom: str, group: str, artifact: str, version: str | None,
+    timeout: int, scope: str | None = None,
 ) -> bool:
     """在 module pom 的【最后一个 </dependencies>】前插入 <dependency>（受管则无 version）。
 
     最后一个 </dependencies> 即常规依赖块（dependencyManagement 内的 </dependencies> 在其之前），
-    模块 pom 多无 depMgmt 故唯一即正确。perl -0777 整文件 + 贪婪 .* 命中最后一处。"""
+    模块 pom 多无 depMgmt 故唯一即正确。perl -0777 整文件 + 贪婪 .* 命中最后一处。scope 非空则带
+    `<scope>`（运行时伴生件用 runtime）。"""
     ver_line = f"<version>{version}</version>" if version else ""
+    scope_line = f"<scope>{scope}</scope>" if scope else ""
     block = (
         f"<dependency><groupId>{group}</groupId>"
-        f"<artifactId>{artifact}</artifactId>{ver_line}</dependency>"
+        f"<artifactId>{artifact}</artifactId>{ver_line}{scope_line}</dependency>"
     )
     # 贪婪匹配到最后一个 </dependencies>，在其前插入；无 </dependencies> 则不改（返回非0→跳过）
     cmd = (
@@ -528,6 +565,9 @@ def _attempt_dependency_repair(
             if not available:
                 continue  # 既不受管又查不到版本 → 不赌
             version = max(available, key=_ver_key)
+        # 运行时伴生件（jjwt-api → jjwt-impl/jjwt-jackson）：同版本、runtime scope，杜绝"编译过
+        # 但运行期 ClassNotFound"。受管(version=None)则伴生件也无 version 继承。
+        family = _resolve_artifact_family(group, artifact, project_path, timeout)
         for f in sorted(files):
             pom = _module_pom_for_file(project_path, f, timeout)
             if not pom:
@@ -536,9 +576,15 @@ def _attempt_dependency_repair(
                 continue  # 已声明（可能上一轮/别处补过）
             if _inject_dependency(project_path, pom, group, artifact, version, timeout):
                 changed.add(pom)
+                for sib in family:
+                    if not _pom_declares_artifact(project_path, pom, sib, timeout):
+                        _inject_dependency(
+                            project_path, pom, group, sib, version, timeout, scope="runtime"
+                        )
         logger.info(
-            "[L1.2.1·dep-repair] %s → %s:%s%s 注入 module pom（据 import 反查 Maven Central）",
+            "[L1.2.1·dep-repair] %s → %s:%s%s 注入 module pom（据 import 反查 Maven Central%s）",
             pkg, group, artifact, (":" + version) if version else "(受管,继承版本)",
+            f"，+运行时伴生件 {family}" if family else "",
         )
     return len(changed), sorted(changed)
 
