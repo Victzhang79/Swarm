@@ -298,11 +298,18 @@ class ModelRouter:
         def _reachable(name: str) -> bool:
             if not name:
                 return False
+            prov = cfg.provider_for_model(name)
+            # P1（治本，996db614 实测 GLM-5.2 误报"不可达"）：capability_store 是【本地模型】探测库
+            # （只有本地模型被探测进去）；云端模型经 provider 显式映射/启发式解析到【真实云端点】，
+            # 不进探测集却确实可达（实测 GLM-5.2 流式 79.9s 成功）。故云端模型【有云 provider 映射
+            # 即可达】，不据本地探测库误报。
+            if prov is not None and getattr(prov, "kind", "") == "cloud":
+                return True
             if known:
-                # 能力库已探测 → 以探测为准（映射存在 ≠ 模型真的可用）。
+                # 能力库已探测 → 本地模型以探测为准（本地映射存在 ≠ 模型真的烤进镜像）。
                 return name in known
             # 能力库为空（从未探测）→ 退化到"有 provider 映射即假定可达"，不离线误报。
-            return cfg.provider_for_model(name) is not None
+            return prov is not None
 
         tiers = [
             ("trivial", cfg.routing_trivial, list(cfg.routing_trivial_fallback or [])),

@@ -128,9 +128,20 @@ _SCOPE_WRITABLE_WARN_THRESHOLD = 20
 # ══════════════════════════════════════════════
 
 def _get_brain_llm():
-    """获取 Brain LLM 实例"""
+    """获取 Brain LLM 实例。
+
+    P2（可选 JSON mode，SWARM_BRAIN_JSON_MODE=true 开启，默认关）：provider 支持时让模型直接产
+    合法 JSON，减少 brain 输出脏逗号触发 json_repair。默认关——provider 若不支持 response_format
+    会拒整个调用（毁掉所有 brain 调用），故待确认端点支持再开；`_parse_json_from_llm` 的 json_repair
+    仍是恒在兜底（关着安全、开了无损）。绑定失败优雅回退不绑。"""
     router = ModelRouter()
-    return router.get_brain_llm()
+    llm = router.get_brain_llm()
+    if os.environ.get("SWARM_BRAIN_JSON_MODE", "false").lower() in ("true", "1", "yes"):
+        try:
+            return llm.bind(response_format={"type": "json_object"})
+        except Exception:  # noqa: BLE001
+            return llm
+    return llm
 
 
 
