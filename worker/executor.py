@@ -544,6 +544,16 @@ class WorkerExecutor:
         elapsed = time.monotonic() - self.start_time
         return elapsed >= self.max_execution_time
 
+    def _verify_bail_seconds(self) -> float:
+        """P7：fix 循环【提前 bail 的已用预算阈值】秒。超此且确定性闸门仍红即停，不烧满到超时。
+        SWARM_WORKER_VERIFY_BAIL_FRACTION（默认 0.6，钳 [0.3,0.95]）。"""
+        try:
+            frac = float(os.environ.get("SWARM_WORKER_VERIFY_BAIL_FRACTION", "0.6"))
+        except ValueError:
+            frac = 0.6
+        frac = min(max(frac, 0.3), 0.95)
+        return frac * self.max_execution_time
+
     async def run(self) -> WorkerOutput:
         """执行完整的 Worker 生命周期（编排器：依次调用各 phase 方法）
 
@@ -897,6 +907,22 @@ class WorkerExecutor:
                     self._log(
                         "fix 循环连续 2 轮同一失败签名、零进展 → 提前结束交 brain 退避"
                         "（修不动，不空烧到超时）"
+                    )
+                    break
+
+                # P7（治本，996db614 实测 18×900s grind 直接成因）：no-progress 早停按【单轮失败
+                # 签名】判，模型每轮把错改一点点→签名变→streak 重置→不早停→烧满 900s × 多次
+                # orchestration 重试。加【时间维度】兜底：已用预算超阈值(默认 60%)、确定性闸门仍红、
+                # 且至少跑过 1 轮 LLM 修复仍没过 → 提前 bail，别把剩余预算烧在大概率修不动的错上
+                # （交 brain 退避/换模型，比同模型再烧 360s 更值）。env SWARM_WORKER_VERIFY_BAIL_FRACTION。
+                if (
+                    not l1_passed and fix_round >= 1 and self.start_time
+                    and (time.monotonic() - self.start_time) >= self._verify_bail_seconds()
+                ):
+                    l1_details["verify_time_bail"] = True
+                    self._log(
+                        "fix 循环已用预算超阈值且确定性闸门仍未过 → 提前 bail（修不动，不烧满到"
+                        "超时，交 brain 退避/换模型）"
                     )
                     break
 
@@ -2365,9 +2391,52 @@ class WorkerExecutor:
             from swarm.knowledge.service import resolve_symbols_sync
             sc = getattr(self.subtask, "scope", None)
             create_files = list(getattr(sc, "create_files", []) or []) if sc else []
-            return await _asyncio.to_thread(
+            class_hint = await _asyncio.to_thread(
                 resolve_symbols_sync, evidence, self.project_id or "", create_files
             )
+            # P5：臆造【方法】接地——class-FQN 解析接不住"真实类上调不存在的方法"
+            # （Base64.encodeToByte），沙箱 javap 取真实方法集喂模型。
+            method_hint = await _asyncio.to_thread(self._javap_method_grounding, evidence)
+            return "\n\n".join(p for p in (class_hint, method_hint) if p)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _javap_method_grounding(self, evidence: str) -> str:
+        """P5（治本，996db614 实测 18×900s 主因之一）：编译报 `cannot find symbol: method X /
+        location: class C`（在真实存在的类上调臆造方法）→ 沙箱内 `javap C` 取 C 真实方法集，
+        生成"C 真实方法有 [...]，X 不存在，从中选"提示，杜绝模型反复臆造方法烧满 900s。
+
+        JDK 类（java.*/javax.*）javap 无需 classpath 直接解析；非 JDK/javap 失败优雅跳过（增益层，
+        绝不阻断）。symbol-repair 的近邻纠错接不住此类（无项目近邻），codegraph 也跳过 method。"""
+        try:
+            if not self._sandbox or not self._sandbox_manager:
+                return ""
+            from swarm.worker.symbol_resolver import (
+                build_method_grounding,
+                parse_javap_methods,
+                parse_missing_methods,
+                to_javap_class_name,
+            )
+            pairs = parse_missing_methods(evidence)
+            if not pairs:
+                return ""
+            rc = getattr(self._sandbox_manager, "run_command", None)
+            if rc is None:
+                return ""
+            remote = get_config().sandbox.sandbox_remote_workdir
+            probed: list[tuple[str, str, list[str]]] = []
+            seen_classes: set[str] = set()
+            for method, klass in pairs[:5]:
+                if klass in seen_classes:
+                    continue
+                seen_classes.add(klass)
+                bin_name = to_javap_class_name(klass)
+                cmd = f"cd {remote} 2>/dev/null && javap -public '{bin_name}' 2>/dev/null | head -80"
+                result = rc(self._sandbox, cmd, timeout=20)
+                methods = parse_javap_methods(getattr(result, "stdout", "") or "")
+                if methods:
+                    probed.append((method, klass, methods))
+            return build_method_grounding(probed)
         except Exception:  # noqa: BLE001
             return ""
 
