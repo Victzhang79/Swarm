@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -351,19 +352,28 @@ def _attempt_maven_version_repair(
 _DEP_REPAIR_SKIP_PREFIXES = ("java.", "javax.", "jakarta.", "sun.", "com.sun.", "jdk.")
 
 
-def _project_own_groups(project_path: str, timeout: int = 20) -> set[str]:
-    """项目【自有】groupId 集合：出现在 ≥2 个 pom 的 groupId（项目自身坐标在每个模块 pom 都
-    现身，第三方依赖通常仅个别 pom）。用于把【内部包未就绪】(②) 排除出缺第三方依赖修复——
-    纯项目事实推导，无硬编码 group 名。"""
+def _project_own_packages(project_path: str, timeout: int = 20) -> set[str]:
+    """项目【自有包根】：据【源码自身声明的 package】取前 2 段前缀（com.ruoyi 等）。
+
+    硬判据=源码事实，而非 pom <groupId>——pom 的 groupId 含一堆【第三方依赖】的 group（如
+    com.alibaba/org.springframework/org.apache.shiro 在父 dependencyManagement + 各模块 deps 都现身），
+    据 pom group 会把第三方误判成"自有"→ 缺第三方包(fastjson2 等)被当内部包误 BLOCKED、还不补依赖。
+    项目【自己 build】的包必由其 .java `package` 声明（com.ruoyi.**），第三方包只被 import 从不被
+    本项目源码声明（io.jsonwebtoken/com.alibaba.fastjson2 无任何 .java 声明它）——这才是内部 vs 第三方
+    的可靠分界。返回出现在 ≥2 个源文件的 2 段包根集合（滤噪）。"""
     cmd = (
-        "grep -rhoE '<groupId>[A-Za-z0-9_.-]+</groupId>' --include=pom.xml . 2>/dev/null "
-        "| sed -E 's#</?groupId>##g' | sort | uniq -c | sort -rn"
+        "grep -rhoE '^[[:space:]]*package[[:space:]]+[A-Za-z0-9_.]+' --include='*.java' . 2>/dev/null "
+        "| sed -E 's/^[[:space:]]*package[[:space:]]+//' "
+        "| awk -F. 'NF>=2{print $1\".\"$2}' | sort | uniq -c | sort -rn | head -10"
     )
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=timeout)
     groups: set[str] = set()
     for line in (out or "").splitlines():
-        m = re.match(r"\s*(\d+)\s+([A-Za-z0-9_.\-]+)", line)
-        if m and int(m.group(1)) >= 2:
+        m = re.match(r"\s*(\d+)\s+([A-Za-z0-9_.]+)", line)
+        # 任何被【项目源码 package 声明】的 2 段包根即项目自有（项目自己 build 它）。哪怕只 1 个
+        # 文件声明也算——源码 package 声明=定义性证据，无"第三方 group 混进来"的噪声（第三方只被
+        # import 从不被本项目源码声明）。
+        if m and int(m.group(1)) >= 1:
             groups.add(m.group(2))
     return groups
 
@@ -488,7 +498,7 @@ def _attempt_dependency_repair(
     if not pairs:
         return 0, []
     mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
-    own = _project_own_groups(project_path, timeout)
+    own = _project_own_packages(project_path, timeout)
     want: dict[str, set[str]] = {}
     for f, pkg in pairs:
         rel = _norm_src_path(f)
@@ -551,7 +561,7 @@ def _build_blocked_on_unbuilt_internal(
     pairs = parse_missing_packages(build_output)
     if not pairs:
         return False
-    own = _project_own_groups(project_path, timeout)
+    own = _project_own_packages(project_path, timeout)
     if not own:
         return False
     internal_pkgs: set[str] = set()
@@ -848,6 +858,18 @@ def _max_build_repair_rounds() -> int:
         return max(1, int(os.environ.get("SWARM_WORKER_BUILD_REPAIR_ROUNDS", "4")))
     except ValueError:
         return 4
+
+
+def _max_build_repair_seconds() -> float:
+    """收敛循环【墙钟上界】秒（SWARM_WORKER_BUILD_REPAIR_MAX_SECONDS，默认 900）。
+
+    轮数上界之外再加墙钟闸：每轮含一次全量 mvn 重跑（可达 300s）+ 网络反查，最坏 4 轮可逼近
+    20min，跑在同步确定性闸门里、worker 总预算无从中途打断 → 加墙钟硬上界防 runaway（默认 900s
+    够 1-2 次正常收敛重跑，又封死病态空转）。一旦超界即停，交后续 fail/BLOCKED 分类。"""
+    try:
+        return max(60.0, float(os.environ.get("SWARM_WORKER_BUILD_REPAIR_MAX_SECONDS", "900")))
+    except ValueError:
+        return 900.0
 
 
 def _cap_files(files: list[str], kind: str) -> list[str]:
@@ -1957,7 +1979,15 @@ def run_l1_pipeline(
             ).lower() not in ("false", "0", "no")
             repaired_paths: list[str] = []
             if repair_on:
+                _loop_t0 = _time.monotonic()
+                _loop_budget = _max_build_repair_seconds()
                 for _rr in range(_max_build_repair_rounds()):
+                    if _time.monotonic() - _loop_t0 >= _loop_budget:
+                        logger.warning(
+                            "[L1.2.1] 确定性收敛循环达墙钟上界 %.0fs（已修 %d 文件），停止，交后续分类",
+                            _loop_budget, len(repaired_paths),
+                        )
+                        break
                     try:
                         n_round, paths_round = _attempt_build_repair(
                             project_path, b_out, modified, timeout, project_stack

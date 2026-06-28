@@ -209,6 +209,39 @@ def test_dep_repair_skips_jdk_namespace():
     print("  ✅ javax/servlet 命名空间 → 不当缺依赖（交命名空间防线）")
 
 
+# ── 回归：第三方 group 出现在 pom（依赖声明）但不在源码 → 绝不当"项目自有"──
+# Bug：旧 _project_own_groups 据 pom <groupId> ≥2 pom 判自有 → com.alibaba/org.springframework
+# 等第三方依赖 group 在多 pom 现身被误判自有 → 缺 fastjson2 被当内部包误 BLOCKED 还不补依赖。
+# 治本：据源码 package 声明判自有。本测钉死：pom 里声明了 com.alibaba 依赖、但源码只声明 com.example
+# → own={com.example}，com.alibaba.fastjson2 缺包【不】被当自有，dep-repair 照常补。
+
+def test_thirdparty_group_in_pom_not_treated_as_own():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import com.alibaba.fastjson2.JSON;")
+        # 往两个 pom 都塞 com.alibaba 依赖声明（模拟父 dManagement + 模块 deps 都现身）
+        for pf in (d / "pom.xml", d / "modA/pom.xml"):
+            t = pf.read_text().replace(
+                "</project>",
+                "  <dependencies><dependency><groupId>com.alibaba</groupId>"
+                "<artifactId>fastjson</artifactId></dependency></dependencies>\n</project>")
+            pf.write_text(t)
+        own = l1._project_own_packages(str(d), 30)
+        assert "com.example" in own, f"源码声明的 com.example 应是自有: {own}"
+        assert "com.alibaba" not in own, f"第三方 com.alibaba(仅 pom 依赖,无源码)不应判自有: {own}"
+        # 端到端：fastjson2 缺包 → 不被当内部包 BLOCKED，dep-repair 照常补
+        build_out = f"[ERROR] {rel}:[2,20] package com.alibaba.fastjson2 does not exist\n"
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False, \
+            "第三方 fastjson2 缺包不应被误判为②内部包未就绪"
+        restore = _patch_network(("com.alibaba", "fastjson2"), ["2.0.51"])
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 1 and "fastjson2" in (d / "modA/pom.xml").read_text(), (n, poms)
+        finally:
+            restore()
+    print("  ✅ 第三方 group 在 pom 不在源码 → 不判自有，dep-repair 照常补（回归 bug 已治）")
+
+
 # ── _resolve_artifact_via_central 的 groupId 前缀过滤（纯逻辑，mock JSON）──
 
 def test_resolve_central_groupid_prefix_filter():
