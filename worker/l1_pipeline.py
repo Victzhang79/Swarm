@@ -329,6 +329,210 @@ def _attempt_maven_version_repair(
     return len(changed), sorted(changed)
 
 
+# ── 防线④（通用·确定性）：缺第三方依赖声明 → 据 import 反查坐标补进 module pom ──
+# 治本场景（996db614 实测头号 package-does-not-exist，~137/213）：worker 实现功能时 import 了
+# 第三方库（jjwt/redis/fastjson2/quartz/hutool…）但模块 pom 没声明该依赖 → `package P does
+# not exist` → 整文件编不过 → 下游 cannot-find-symbol 级联 → 复读死循环到迭代上限。这与
+# import 前缀错(import-repair)/版本错(version-repair)同源——都是「模型手写依赖坐标不可靠」，
+# 但表象是【整个依赖没声明】。import-repair 明确不碰它（"项目没用过该 suffix=缺依赖，不动"）。
+#
+# 解法（模型无关、非 Java 写死之外的"Maven 生态事实标准"）：对每个缺失的第三方包 P，
+#   1) 从出错文件的 import 行取一个具体 FQCN（如 io.jsonwebtoken.Jwts）；
+#   2) Maven Central 全文类检索 fc:<FQCN> → 提供该类的 (groupId, artifactId)（groupId 必须是
+#      P 的前缀，杜绝错配）——这是注册中心权威事实，臆造的类查无结果→自动跳过（天然过滤幻觉）；
+#   3) 该 artifact 若被父 dependencyManagement 受管 → 注入无 version 依赖（继承）；否则取 Central
+#      maven-metadata 最新版注入；
+#   4) 注入到出错文件所属 module pom 的 <dependencies>（已声明则跳过），交调用方重跑确认。
+# 安全自证：只在 build 已失败时触发；坐标查无/groupId 不匹配/已声明 → 不动；修错（坐标/版本不
+# 兼容）则重跑仍失败=绝不假通过。与 ③-A 收敛循环协同：补依赖→重跑→新浮现的符号错再被 typo 修。
+#
+# 排除：java./javax./jakarta./sun. 是 JDK 自带或 servlet 命名空间问题（rewrite_jvm_namespace 治），
+# 项目【自有 groupId】前缀是【内部包未就绪】(②依赖拓扑)，都不在"缺第三方依赖"范围。
+_DEP_REPAIR_SKIP_PREFIXES = ("java.", "javax.", "jakarta.", "sun.", "com.sun.", "jdk.")
+
+
+def _project_own_groups(project_path: str, timeout: int = 20) -> set[str]:
+    """项目【自有】groupId 集合：出现在 ≥2 个 pom 的 groupId（项目自身坐标在每个模块 pom 都
+    现身，第三方依赖通常仅个别 pom）。用于把【内部包未就绪】(②) 排除出缺第三方依赖修复——
+    纯项目事实推导，无硬编码 group 名。"""
+    cmd = (
+        "grep -rhoE '<groupId>[A-Za-z0-9_.-]+</groupId>' --include=pom.xml . 2>/dev/null "
+        "| sed -E 's#</?groupId>##g' | sort | uniq -c | sort -rn"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=timeout)
+    groups: set[str] = set()
+    for line in (out or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+([A-Za-z0-9_.\-]+)", line)
+        if m and int(m.group(1)) >= 2:
+            groups.add(m.group(2))
+    return groups
+
+
+def _fqcn_for_missing_pkg(project_path: str, rel_file: str, pkg: str, timeout: int) -> str | None:
+    """从出错文件的 import 行取该缺失包下的一个【具体 FQCN】（io.jsonwebtoken.Jwts 等）。
+
+    通配 `import P.*;` 无具体类 → 返回 None（无法精确反查，交契约/其它防线）。"""
+    pe = re.escape(pkg)
+    cmd = f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' '{rel_file}' 2>/dev/null | head -4"
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+    for line in (out or "").splitlines():
+        m = re.search(rf"import\s+(?:static\s+)?({pe}\.[A-Za-z_][A-Za-z0-9_.]*)", line)
+        if m:
+            fqcn = m.group(1)
+            leaf = fqcn.rsplit(".", 1)[-1]
+            if leaf and leaf[0].isupper():  # 取到的是类名(大写开头)，非子包/通配
+                return fqcn
+    return None
+
+
+def _resolve_artifact_via_central(
+    fqcn: str, pkg: str, project_path: str, timeout: int
+) -> tuple[str, str] | None:
+    """Maven Central 全文类检索 fc:<FQCN> → 提供该类的 (groupId, artifactId)。
+
+    只接受 groupId 是【缺失包 pkg 的前缀】的结果（杜绝同名类错配到无关库）；偏好非
+    -bom/-parent/-tests 的实体 artifact。查无/无网/groupId 不匹配 → None（臆造类天然在此被滤掉）。"""
+    url = (
+        "https://search.maven.org/solrsearch/select?"
+        f"q=fc:{fqcn}&rows=15&wt=json"
+    )
+    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
+    if _tool_missing(out) or not (out or "").strip():
+        return None
+    try:
+        docs = (json.loads(out).get("response", {}) or {}).get("docs", []) or []
+    except (ValueError, TypeError):
+        return None
+    cands: list[tuple[str, str]] = []
+    for d in docs:
+        g, a = d.get("g"), d.get("a")
+        if not g or not a:
+            continue
+        # groupId 必须是 pkg 前缀（pkg==g 或 pkg 以 g. 开头），否则同名类错配到无关库
+        if pkg == g or pkg.startswith(g + "."):
+            cands.append((g, a))
+    # 偏好实体 artifact（排除 bom/parent/tests/dependencies 聚合件）
+    def _rank(ga: tuple[str, str]) -> tuple:
+        a = ga[1].lower()
+        bad = any(t in a for t in ("-bom", "-parent", "-tests", "-test", "dependencies"))
+        return (1 if bad else 0, len(a))
+    cands.sort(key=_rank)
+    return cands[0] if cands else None
+
+
+def _module_pom_for_file(project_path: str, rel_file: str, timeout: int) -> str | None:
+    """从出错文件向上找最近的 module pom.xml（归一化模块相对路径）。"""
+    d = rel_file.rsplit("/", 1)[0] if "/" in rel_file else "."
+    cmd = (
+        f'd="{d}"; while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do '
+        f'[ -f "$d/pom.xml" ] && echo "$d/pom.xml" && break; d=$(dirname "$d"); done; '
+        f'[ -f "./pom.xml" ] && [ -z "$d" -o "$d" = "." ] && echo "pom.xml"'
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 15))
+    for line in (out or "").splitlines():
+        line = line.strip().lstrip("./") or line.strip()
+        if line.endswith("pom.xml"):
+            return line
+    return None
+
+
+def _pom_declares_artifact(project_path: str, pom: str, artifact: str, timeout: int) -> bool:
+    """module pom 是否已声明该 artifactId（避免重复注入）。"""
+    cmd = f"grep -c '<artifactId>{re.escape(artifact)}</artifactId>' '{pom}' 2>/dev/null"
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 10))
+    return (out or "").strip() not in ("", "0")
+
+
+def _artifact_is_managed(project_path: str, artifact: str, timeout: int) -> bool:
+    """该 artifactId 是否在某 pom 的 <dependencyManagement> 受管（→ 注入无 version 继承）。"""
+    cmd = (
+        "for p in $(grep -rl '<dependencyManagement>' --include=pom.xml . 2>/dev/null); do "
+        f"awk '/<dependencyManagement>/,/<\\/dependencyManagement>/' \"$p\"; done "
+        f"| grep -c '<artifactId>{re.escape(artifact)}</artifactId>'"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+    return (out or "").strip() not in ("", "0")
+
+
+def _inject_dependency(
+    project_path: str, pom: str, group: str, artifact: str, version: str | None, timeout: int
+) -> bool:
+    """在 module pom 的【最后一个 </dependencies>】前插入 <dependency>（受管则无 version）。
+
+    最后一个 </dependencies> 即常规依赖块（dependencyManagement 内的 </dependencies> 在其之前），
+    模块 pom 多无 depMgmt 故唯一即正确。perl -0777 整文件 + 贪婪 .* 命中最后一处。"""
+    ver_line = f"<version>{version}</version>" if version else ""
+    block = (
+        f"<dependency><groupId>{group}</groupId>"
+        f"<artifactId>{artifact}</artifactId>{ver_line}</dependency>"
+    )
+    # 贪婪匹配到最后一个 </dependencies>，在其前插入；无 </dependencies> 则不改（返回非0→跳过）
+    cmd = (
+        f"grep -q '</dependencies>' '{pom}' && perl -0777 -i.bak -pe "
+        f"'s#(.*)</dependencies>#$1    {block}\\n    </dependencies>#s' '{pom}' "
+        f"&& rm -f '{pom}.bak'"
+    )
+    ec, _o = _run_l1_command(cmd, project_path, timeout=min(timeout, 20))
+    return ec == 0
+
+
+def _attempt_dependency_repair(
+    project_path: str, build_output: str, modified: list[str], timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：缺第三方依赖声明 → 据 import 反查 Maven 坐标补进 module pom。见上方 防线④ 注释。
+
+    只修【本子任务文件】里缺的第三方包（别人的交其 owner/拓扑修，配合文件级归属与 ② 依赖拓扑）。
+    返回 (改动 pom 数, 改动 pom 相对路径列表)，TD2606-C9 供回传（module pom 可能在写权 scope 外）。"""
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return 0, []
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
+    own = _project_own_groups(project_path, timeout)
+    want: dict[str, set[str]] = {}
+    for f, pkg in pairs:
+        rel = _norm_src_path(f)
+        if mods and rel not in mods and not any(rel.endswith(m) or m.endswith(rel) for m in mods):
+            continue  # 别人的文件
+        if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
+            continue  # JDK / servlet 命名空间，非缺依赖
+        if any(pkg == g or pkg.startswith(g + ".") for g in own):
+            continue  # 项目自有 group → 内部包未就绪(②)，非缺第三方依赖
+        want.setdefault(pkg, set()).add(rel)
+    if not want:
+        return 0, []
+    changed: set[str] = set()
+    for pkg, files in list(want.items())[:8]:
+        first = sorted(files)[0]
+        fqcn = _fqcn_for_missing_pkg(project_path, first, pkg, timeout)
+        if not fqcn:
+            continue  # 通配 import / 取不到具体类 → 不赌
+        coord = _resolve_artifact_via_central(fqcn, pkg, project_path, timeout)
+        if not coord:
+            continue  # 坐标查无（臆造类 / 无网）→ 不动
+        group, artifact = coord
+        managed = _artifact_is_managed(project_path, artifact, timeout)
+        version: str | None = None
+        if not managed:
+            available = _fetch_maven_versions(group, artifact, project_path, timeout)
+            if not available:
+                continue  # 既不受管又查不到版本 → 不赌
+            version = max(available, key=_ver_key)
+        for f in sorted(files):
+            pom = _module_pom_for_file(project_path, f, timeout)
+            if not pom:
+                continue
+            if _pom_declares_artifact(project_path, pom, artifact, timeout):
+                continue  # 已声明（可能上一轮/别处补过）
+            if _inject_dependency(project_path, pom, group, artifact, version, timeout):
+                changed.add(pom)
+        logger.info(
+            "[L1.2.1·dep-repair] %s → %s:%s%s 注入 module pom（据 import 反查 Maven Central）",
+            pkg, group, artifact, (":" + version) if version else "(受管,继承版本)",
+        )
+    return len(changed), sorted(changed)
+
+
 def _tool_missing(out: str) -> bool:
     """命令输出是否表明【工具本身缺失】（→ 优雅跳过，不当作修复失败）。"""
     low = (out or "").lower()
@@ -552,6 +756,14 @@ def _attempt_build_repair(
             _accum(_attempt_import_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
+        # 缺第三方依赖声明（import 了库但 module pom 没声明）→ 据 import 反查坐标补进 pom。
+        # 放在 import 前缀修复之后、版本对账之前：先把"整个依赖没声明"补齐，版本问题再对账。
+        # SWARM_WORKER_DEP_REPAIR=false 可关（仅此一类，留逃生阀）。
+        if os.environ.get("SWARM_WORKER_DEP_REPAIR", "true").lower() not in ("false", "0", "no"):
+            try:
+                _accum(_attempt_dependency_repair(project_path, build_output, modified, timeout))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[L1.2.1·repair] dependency-repair 异常(跳过): %s", exc)
         # Maven 依赖版本不存在（worker 凭空写错版本号）→ 校正到最近有效版本
         try:
             _accum(_attempt_maven_version_repair(project_path, build_output, timeout))

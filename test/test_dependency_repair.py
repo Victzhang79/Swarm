@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""缺第三方依赖声明的确定性兜底（防线④ dep-repair）回归测试。
+
+治本背景（996db614 实测 package-does-not-exist ~137/213 头号）：worker import 了第三方库
+（jjwt/redis/fastjson2/hutool…）但 module pom 没声明 → `package P does not exist` → 整文件编不过
+→ 下游 cannot-find-symbol 级联 → 死循环。import-repair 明确不碰它（缺依赖≠前缀错）。
+
+本套用【真实临时 Maven 树 + 本地 grep/perl】（无沙箱时 _run_*命令回退本地 subprocess），只 mock
+网络部分（Central 反查坐标 + maven-metadata 版本），端到端验证注入正确、且三类该跳的都跳：
+  ① 项目自有 group 前缀（内部包未就绪 ②）不动；② 别人子任务的文件不动；③ 臆造类(查无坐标)不动。
+"""
+from __future__ import annotations
+
+import importlib.util
+import tempfile
+from pathlib import Path
+
+_bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
+_spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+import swarm.worker.l1_pipeline as l1  # noqa: E402
+
+
+_PARENT_POM = """<?xml version="1.0"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>demo-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <modules><module>modA</module></modules>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.alibaba</groupId>
+        <artifactId>fastjson</artifactId>
+        <version>1.2.83</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+"""
+
+_MODULE_POM = """<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>demo-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>modA</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+
+
+def _make_project(d: Path, svc_imports: str) -> str:
+    (d / "pom.xml").write_text(_PARENT_POM)
+    mod = d / "modA"
+    (mod).mkdir()
+    (mod / "pom.xml").write_text(_MODULE_POM)
+    src = mod / "src/main/java/com/example/a"
+    src.mkdir(parents=True)
+    (src / "Svc.java").write_text(
+        f"package com.example.a;\n{svc_imports}\npublic class Svc {{}}\n"
+    )
+    return "modA/src/main/java/com/example/a/Svc.java"
+
+
+def _patch_network(monkey_g_a, monkey_versions):
+    """mock 仅网络部分：Central 反查 + 版本。返回还原器。"""
+    orig_resolve = l1._resolve_artifact_via_central
+    orig_ver = l1._fetch_maven_versions
+    l1._resolve_artifact_via_central = lambda fqcn, pkg, pp, to: monkey_g_a
+    l1._fetch_maven_versions = lambda g, a, pp, to: monkey_versions
+
+    def restore():
+        l1._resolve_artifact_via_central = orig_resolve
+        l1._fetch_maven_versions = orig_ver
+    return restore
+
+
+# ── 端到端：缺 jjwt → 反查 io.jsonwebtoken:jjwt-api → 注入 module pom（含版本）──
+
+def test_dep_repair_injects_missing_thirdparty():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import io.jsonwebtoken.Jwts;")
+        build_out = (
+            f"[ERROR] {rel}:[2,20] package io.jsonwebtoken does not exist\n"
+        )
+        restore = _patch_network(("io.jsonwebtoken", "jjwt-api"), ["0.11.5", "0.12.6"])
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 1, (n, poms)
+            assert poms == ["modA/pom.xml"]
+            pom_txt = (d / "modA/pom.xml").read_text()
+            assert "<artifactId>jjwt-api</artifactId>" in pom_txt
+            assert "<groupId>io.jsonwebtoken</groupId>" in pom_txt
+            assert "<version>0.12.6</version>" in pom_txt  # 取最新可用版
+            # 注入在常规 <dependencies> 块内（spring-boot-starter 仍在）
+            assert "spring-boot-starter" in pom_txt
+        finally:
+            restore()
+    print("  ✅ 缺第三方依赖 → Central 反查坐标 → 注入 module pom（含最新版）")
+
+
+# ── 受管依赖（父 dependencyManagement 有）→ 注入【无 version】继承 ──
+
+def test_dep_repair_managed_no_version():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import com.alibaba.fastjson.JSON;")
+        build_out = f"[ERROR] {rel}:[2,20] package com.alibaba.fastjson does not exist\n"
+        # Central 反查到 com.alibaba:fastjson（父受管），版本不该被用到
+        restore = _patch_network(("com.alibaba", "fastjson"), ["1.2.99"])
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 1, (n, poms)
+            pom_txt = (d / "modA/pom.xml").read_text()
+            assert "<artifactId>fastjson</artifactId>" in pom_txt
+            # 受管 → 无 version（继承父 dependencyManagement），不得注入 1.2.99
+            assert "1.2.99" not in pom_txt
+        finally:
+            restore()
+    print("  ✅ 受管依赖 → 注入无 version 继承（不双 version）")
+
+
+# ── ② 项目自有 group 前缀（内部包未就绪）→ 不当缺依赖，绝不注入 ──
+
+def test_dep_repair_skips_own_group_internal_pkg():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import com.example.b.dto.FooDto;")
+        build_out = f"[ERROR] {rel}:[2,20] package com.example.b.dto does not exist\n"
+        # 即便 mock 了坐标，也必须因 own-group 在反查前就跳过
+        restore = _patch_network(("com.example", "modB"), ["1.0.0"])
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 0 and poms == [], (n, poms)
+            assert "modB" not in (d / "modA/pom.xml").read_text()
+        finally:
+            restore()
+    print("  ✅ 项目自有 group（内部包未就绪②）→ 不注入（交依赖拓扑）")
+
+
+# ── 别人子任务的文件 → 不动（配合文件级归属）──
+
+def test_dep_repair_skips_other_subtask_file():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import io.jsonwebtoken.Jwts;")
+        build_out = f"[ERROR] {rel}:[2,20] package io.jsonwebtoken does not exist\n"
+        restore = _patch_network(("io.jsonwebtoken", "jjwt-api"), ["0.12.6"])
+        try:
+            # 本子任务改的是别的文件，没改 Svc.java
+            n, poms = l1._attempt_dependency_repair(
+                str(d), build_out, ["modA/src/main/java/com/example/a/Other.java"], timeout=30
+            )
+            assert n == 0 and poms == [], (n, poms)
+            assert "jjwt" not in (d / "modA/pom.xml").read_text()
+        finally:
+            restore()
+    print("  ✅ 别人子任务的文件 → 不动（文件级归属）")
+
+
+# ── 臆造的类（Central 查无 prefix 匹配坐标）→ 不乱注入 ──
+
+def test_dep_repair_skips_hallucinated_pkg():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import org.fictional.lib.MagicThing;")
+        build_out = f"[ERROR] {rel}:[2,20] package org.fictional.lib does not exist\n"
+        restore = _patch_network(None, [])  # 反查返回 None（无 artifact 提供该类）
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 0 and poms == [], (n, poms)
+            assert "fictional" not in (d / "modA/pom.xml").read_text()
+        finally:
+            restore()
+    print("  ✅ 臆造包(坐标查无) → 不乱注入")
+
+
+# ── JDK / servlet 命名空间 → 不当缺依赖 ──
+
+def test_dep_repair_skips_jdk_namespace():
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import javax.servlet.http.HttpServletRequest;")
+        build_out = f"[ERROR] {rel}:[2,20] package javax.servlet.http does not exist\n"
+        called = {"resolve": False}
+
+        def _spy(fqcn, pkg, pp, to):
+            called["resolve"] = True
+            return ("x", "y")
+        orig = l1._resolve_artifact_via_central
+        l1._resolve_artifact_via_central = _spy
+        try:
+            n, poms = l1._attempt_dependency_repair(str(d), build_out, [rel], timeout=30)
+            assert n == 0 and not called["resolve"], "javax.* 应在反查前就跳过"
+        finally:
+            l1._resolve_artifact_via_central = orig
+    print("  ✅ javax/servlet 命名空间 → 不当缺依赖（交命名空间防线）")
+
+
+# ── _resolve_artifact_via_central 的 groupId 前缀过滤（纯逻辑，mock JSON）──
+
+def test_resolve_central_groupid_prefix_filter():
+    import json as _json
+    docs = {
+        "response": {"docs": [
+            {"g": "com.unrelated", "a": "wrong-lib"},        # groupId 非 pkg 前缀 → 拒
+            {"g": "io.jsonwebtoken", "a": "jjwt-bom"},        # 前缀匹配但 bom → 降权
+            {"g": "io.jsonwebtoken", "a": "jjwt-api"},        # 前缀匹配实体 → 选它
+        ]}
+    }
+    orig = l1._run_l1_command
+    l1._run_l1_command = lambda cmd, pp, timeout=120: (0, _json.dumps(docs))
+    try:
+        ga = l1._resolve_artifact_via_central(
+            "io.jsonwebtoken.Jwts", "io.jsonwebtoken", "/x", 30
+        )
+        assert ga == ("io.jsonwebtoken", "jjwt-api"), ga
+    finally:
+        l1._run_l1_command = orig
+    print("  ✅ Central 反查：groupId 前缀过滤 + 实体 artifact 优先")
+
+
+if __name__ == "__main__":
+    import sys
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    fails = 0
+    for fn in fns:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"  ❌ {fn.__name__}: {e}")
+            traceback.print_exc()
+            fails += 1
+    sys.exit(1 if fails else 0)
