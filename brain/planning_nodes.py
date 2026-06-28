@@ -1323,6 +1323,18 @@ async def tech_design(state: BrainState) -> dict:
 _CONTRACT_CONCURRENCY = int(os.environ.get("SWARM_CONTRACT_CONCURRENCY", "2") or "2")
 _CONTRACT_MAX_ATTEMPTS = int(os.environ.get("SWARM_CONTRACT_MAX_ATTEMPTS", "3") or "3")
 _CONTRACT_STAGE_TIMEOUT = float(os.environ.get("SWARM_CONTRACT_STAGE_TIMEOUT", "600") or "600")
+# 治本 B（996db614 实测）：Stage A 全局骨架是【consumer_map（跨模块消费关系→确定性连 depends_on
+# 的唯一来源）的单点故障】，且是最大的单次生成（10 模块全局）。实测 GLM-5.2 在 600s 仍"未 stall"
+# 持续生成被墙钟掐断 → asyncio.TimeoutError → consumer_map 整个丢 → ② 跨模块依赖没连。给它【独立
+# 更大预算】（别 guillotine 健康的长生成——本地/云端模型能扛长推理，问题是被切断不是慢）+ 重试。
+_CONTRACT_SKELETON_TIMEOUT = float(
+    os.environ.get("SWARM_CONTRACT_SKELETON_TIMEOUT", "1200") or "1200"
+)
+# 骨架重试次数独立且更少（默认 2=1 次重试）：1200s 超时多因"生成太大/模型慢"，重跑同 prompt 大概率
+# 再超时，第 3 次纯浪费（3×1200=60min）。1 次重试兜住瞬时端点抖动即可，再失败即快速降级。
+_CONTRACT_SKELETON_MAX_ATTEMPTS = int(
+    os.environ.get("SWARM_CONTRACT_SKELETON_MAX_ATTEMPTS", "2") or "2"
+)
 
 # ── Stage A：全局骨架（只定没有单一模块归属、必须全局统一的部分）──
 CONTRACT_SKELETON_SYSTEM = """你是系统架构师，为一个【多模块大型需求】定【全局骨架】——只定那些
@@ -1535,21 +1547,50 @@ async def contract_design(state: BrainState) -> dict:
     # ── Stage A：全局骨架（1 次小调用）──
     _t0 = _time.monotonic()
     logger.info("[CONTRACT_SKELETON] 启动全局骨架（%d 模块：conventions/constants/consumer_map）…", mod_total)
-    try:
-        respA = await _asyncio.wait_for(llm.ainvoke([
-            {"role": "system", "content": CONTRACT_SKELETON_SYSTEM},
-            {"role": "user", "content": CONTRACT_SKELETON_USER.format(
-                task_description=task_desc[:2500],
-                modules=json.dumps(_valid_mods, ensure_ascii=False)[:2500],
-                data_model=data_model[:2000],
-            )},
-        ]), timeout=_CONTRACT_STAGE_TIMEOUT)
-        skel_raw = _parse_json_from_llm(respA.content)
-        skeleton = skel_raw.get("skeleton", skel_raw) if isinstance(skel_raw, dict) else {}
-        if not isinstance(skeleton, dict):
-            skeleton = {}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[CONTRACT_SKELETON] 骨架生成失败，降级沿用 tech_design draft: %s", exc)
+    # 治本 B：Stage A 加【重试 + 独立更大预算】（镜像 Stage B 逐模块的成熟模式，此前 Stage A
+    # 独缺重试且共用 600s → consumer_map 单点故障一次超时即全丢）。拿到有效骨架(尤其 consumer_map)
+    # 即成功；耗尽重试才降级。
+    skeleton: dict = {}
+    _skel_ok = False
+    _skel_err = "unknown"
+    for _attempt in range(1, _CONTRACT_SKELETON_MAX_ATTEMPTS + 1):
+        _ta = _time.monotonic()
+        try:
+            respA = await _asyncio.wait_for(llm.ainvoke([
+                {"role": "system", "content": CONTRACT_SKELETON_SYSTEM},
+                {"role": "user", "content": CONTRACT_SKELETON_USER.format(
+                    task_description=task_desc[:2500],
+                    modules=json.dumps(_valid_mods, ensure_ascii=False)[:2500],
+                    data_model=data_model[:2000],
+                )},
+            ]), timeout=_CONTRACT_SKELETON_TIMEOUT)
+            skel_raw = _parse_json_from_llm(respA.content)
+            skeleton = skel_raw.get("skeleton", skel_raw) if isinstance(skel_raw, dict) else {}
+            if not isinstance(skeleton, dict):
+                skeleton = {}
+            # 成功返回并解析为 dict 即视为成功（空骨架也合法——模型可能无全局 conventions/constants/
+            # consumer_map，Stage B 逐模块照常跑；只重试【超时/异常】这类"没拿到结果"，不重试空内容）。
+            _skel_ok = True
+            break
+        except _asyncio.TimeoutError:
+            # 治本 A：错因可见——旧代码 `%s % TimeoutError()` 渲染为空串，运维永远看不出是【超时】
+            # 还是模型报错。显式记超时 + 预算 + 提示"模型可能仍在生成被掐断"。
+            _skel_err = f"超时 {_CONTRACT_SKELETON_TIMEOUT:.0f}s（模型可能仍在生成被墙钟掐断）"
+        except Exception as exc:  # noqa: BLE001
+            _skel_err = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if _attempt < _CONTRACT_SKELETON_MAX_ATTEMPTS:
+            logger.warning(
+                "[CONTRACT_SKELETON] 第 %d/%d 次失败(%s)，退避重试（耗时 %.1fs）",
+                _attempt, _CONTRACT_SKELETON_MAX_ATTEMPTS, _skel_err, _time.monotonic() - _ta,
+            )
+            await _asyncio.sleep(min(2.0 * _attempt, 10.0))
+    if not _skel_ok:
+        # consumer_map 丢失 = ② 跨模块 depends_on 无从确定性连线（靠 worker `_build_blocked_on_
+        # unbuilt_internal` BLOCKED 退避兜症状）。记 error 级（非 warning）+ 明确错因，别再静默空消息。
+        logger.error(
+            "[CONTRACT_SKELETON] 重试 %d 次仍失败，降级沿用 tech_design draft（consumer_map 丢失"
+            "→跨模块依赖靠 worker BLOCKED 退避兜底）: %s", _CONTRACT_SKELETON_MAX_ATTEMPTS, _skel_err,
+        )
         return {}
     cmap: dict[str, dict] = {}
     for entry in (skeleton.get("consumer_map") or []):
