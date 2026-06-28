@@ -533,6 +533,47 @@ def _attempt_dependency_repair(
     return len(changed), sorted(changed)
 
 
+def _build_blocked_on_unbuilt_internal(
+    project_path: str, build_output: str, timeout: int
+) -> bool:
+    """构建失败是否【全因引用了尚未建出的项目内部包】(②跨模块/跨子任务未就绪)。
+
+    治本场景（996db614 实测 ~70/213）：子任务 A 引用 `com.ruoyi.alarm.sender.dto` 等【别的子任务
+    还没建出的内部包】→ `package does not exist`。这不是 A 的能力问题，也无法由 A 修（包归别人建）；
+    plan 时拿不到 A 的 import 故无法确定性预先 depends_on。治本=worker 把它识别为 BLOCKED 退避，
+    待生产者子任务落地（merge 进项目树）后由 transient 重试自然消解，不烧 A 的修复轮 / 不误判
+    capability 换模型 / 不 escalate 清空已成功成果。
+
+    判据（保守，宁可不标也不误标）：所有 `package P does not exist` 的 P 都满足
+      ① P 是【项目自有 groupId 前缀】(内部包，非第三方——第三方交 dep-repair 防线④)；且
+      ② 当前项目树里【无任何 .java 声明 package P】(=确实还没被任何子任务建出)。
+    只要有一个缺包是第三方、或已在树里(=真编译错如包名拼错) → 返回 False，照常 FAIL。"""
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return False
+    own = _project_own_groups(project_path, timeout)
+    if not own:
+        return False
+    internal_pkgs: set[str] = set()
+    for _f, pkg in pairs:
+        if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
+            return False  # JDK/servlet 命名空间问题，非②
+        if not any(pkg == g or pkg.startswith(g + ".") for g in own):
+            return False  # 有第三方缺包 → 交 dep-repair，不是纯②
+        internal_pkgs.add(pkg)
+    if not internal_pkgs:
+        return False
+    for pkg in internal_pkgs:
+        cmd = (
+            f"grep -rlE '^[[:space:]]*package[[:space:]]+{re.escape(pkg)}[[:space:]]*;' "
+            f"--include='*.java' . 2>/dev/null | head -1"
+        )
+        _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+        if (out or "").strip():
+            return False  # 该内部包已在树里却报 does not exist → 真错(非未就绪)，照常 FAIL
+    return True
+
+
 def _tool_missing(out: str) -> bool:
     """命令输出是否表明【工具本身缺失】（→ 优雅跳过，不当作修复失败）。"""
     low = (out or "").lower()
@@ -1974,6 +2015,21 @@ def run_l1_pipeline(
                     logger.warning(
                         "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
                         "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
+                    )
+                    return True, details
+                # 根因#②（996db614 实测 ~70/213）：构建缺【尚未建出的项目内部包】（别的子任务
+                # 还没产出 com.ruoyi.alarm.sender.dto 等）→ 非本子任务能力问题、本子任务也无权建
+                # 那些包。标 BLOCKED 退避，待生产者子任务落地（merge 进树）后由 transient 重试自然
+                # 消解，不烧本子任务修复轮 / 不误判 capability 换模型 / 不 escalate 清空已成功成果。
+                # 保守判据见 _build_blocked_on_unbuilt_internal（有第三方缺包/包已在树里→照常 FAIL）。
+                if _build_blocked_on_unbuilt_internal(project_path, b_out, timeout):
+                    details["l1_2_1_build_ok"] = None
+                    details["build_blocked"] = build_cmd
+                    details["pipeline_blocked"] = "internal_pkg_not_built"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    logger.warning(
+                        "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
+                        "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],
                     )
                     return True, details
                 details["build_failed"] = build_cmd

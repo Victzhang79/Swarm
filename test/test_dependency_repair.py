@@ -232,6 +232,78 @@ def test_resolve_central_groupid_prefix_filter():
     print("  ✅ Central 反查：groupId 前缀过滤 + 实体 artifact 优先")
 
 
+# ── ② 跨模块/跨子任务内部包未就绪 → BLOCKED 退避（_build_blocked_on_unbuilt_internal）──
+
+def test_blocked_on_unbuilt_internal_pkg():
+    """缺【尚未建出的项目内部包】(own group + 树里无声明) → 判 BLOCKED（待生产者落地重试）。"""
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        _make_project(d, "import com.example.b.sender.dto.FooDto;")
+        build_out = (
+            "[ERROR] modA/src/main/java/com/example/a/Svc.java:[2,30] "
+            "package com.example.b.sender.dto does not exist\n"
+        )
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is True
+    print("  ✅ 内部包尚未建出 → BLOCKED（②退避待生产者）")
+
+
+def test_not_blocked_when_internal_pkg_exists_in_tree():
+    """内部包【已在树里】却报 does not exist → 真编译错(如包名拼错)，不标 BLOCKED，照常 FAIL。"""
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        _make_project(d, "import com.example.a.Helper;")
+        # com.example.a 已被 Svc.java 声明（在树里）
+        build_out = (
+            "[ERROR] modA/src/main/java/com/example/a/Svc.java:[2,30] "
+            "package com.example.a does not exist\n"
+        )
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False
+    print("  ✅ 内部包已在树里 → 真错，不误标 BLOCKED")
+
+
+def test_not_blocked_when_thirdparty_pkg_missing():
+    """混入第三方缺包（应交 dep-repair）→ 不算纯②，不标 BLOCKED。"""
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        _make_project(d, "import io.jsonwebtoken.Jwts;")
+        build_out = (
+            "[ERROR] modA/src/main/java/com/example/a/Svc.java:[2,30] "
+            "package com.example.b.dto does not exist\n"
+            "[ERROR] modA/src/main/java/com/example/a/Svc.java:[3,30] "
+            "package io.jsonwebtoken does not exist\n"
+        )
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False
+    print("  ✅ 含第三方缺包 → 交 dep-repair，不标 BLOCKED")
+
+
+def test_run_l1_pipeline_blocks_on_unbuilt_internal():
+    """端到端：run_l1_pipeline 构建缺内部包(repair 无能为力) → pipeline_blocked=internal_pkg_not_built。"""
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskHarness, NotRunKind
+
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd)
+        rel = _make_project(d, "import com.example.b.sender.dto.FooDto;")
+        st = SubTask(
+            id="s-1", description="② test", difficulty=SubTaskDifficulty.MEDIUM,
+            scope=FileScope(writable=[rel], readable=[rel]),
+            harness=TaskHarness(language="java", build_command="mvn -q -pl modA -am compile"),
+        )
+        diff = f"--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,2 @@\n+package com.example.a;\n+class Svc{{}}\n"
+        # 构建恒返回内部包缺失；repair 无可修(无第三方/无 typo)→ 落到 ② BLOCKED 分类
+        FAIL = (1, f"[ERROR] {rel}:[2,30] package com.example.b.sender.dto does not exist")
+        orig_run, orig_app = l1._run_l1_command, l1._build_cmd_applicable
+        l1._run_l1_command = lambda cmd, pp, timeout=120: FAIL
+        l1._build_cmd_applicable = lambda cmd, pp: True
+        try:
+            ok, details = l1.run_l1_pipeline(str(d), st, diff, timeout=30)
+            assert details.get("pipeline_blocked") == "internal_pkg_not_built", details
+            assert details.get("not_run_kind") == NotRunKind.BLOCKED.value
+            assert not details.get("build_failed"), "②未就绪不应记 capability FAIL"
+        finally:
+            l1._run_l1_command, l1._build_cmd_applicable = orig_run, orig_app
+    print("  ✅ run_l1_pipeline：缺内部包 → BLOCKED（非 capability FAIL）")
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
