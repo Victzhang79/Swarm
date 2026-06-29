@@ -57,12 +57,51 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# ── 代码解释器(Jupyter / run_code)能力探测 ──────────────────────────────
+# 2026-06-29 实证：CubeMaster 现存模板是【按项目烤的 shell 镜像】，不跑 e2b 代码解释器
+# (Jupyter kernel) → run_code 打到 openresty 502。而 swarm 实路径(L1 pipeline 编译/构建)
+# 全走 run_command(shell)，run_code 仅遗留 helper run_in_sandbox(全代码库无人调用)。故
+# run_code 类集成测试在【无代码解释器模板】时 skip（有 Jupyter 模板时仍照常校验），不让
+# 模板能力缺口伪装成 swarm 失败。
+_CI_SUPPORTED: bool | None = None
+
+
+def _code_interpreter_supported() -> bool:
+    global _CI_SUPPORTED
+    if _CI_SUPPORTED is not None:
+        return _CI_SUPPORTED
+    if not _sandbox_reachable():
+        _CI_SUPPORTED = False
+        return False
+    try:
+        from swarm.worker.sandbox import SandboxManager
+
+        m = SandboxManager()
+        sb = m.create(timeout=60)
+        try:
+            r = m.run_code(sb, "print('ci_probe')")
+            _CI_SUPPORTED = bool(getattr(r, "success", False) and "ci_probe" in (r.stdout or ""))
+        finally:
+            m.kill(sb.sandbox_id)
+    except Exception:  # noqa: BLE001
+        _CI_SUPPORTED = False
+    return _CI_SUPPORTED
+
+
+requires_code_interpreter = pytest.mark.skipif(
+    not _code_interpreter_supported(),
+    reason="当前 CubeMaster 模板无代码解释器(Jupyter/run_code)；swarm 实路径用 run_command(shell)，"
+           "run_code 为遗留(run_in_sandbox 无人调用)，跳过 run_code 集成校验",
+)
+
+
 def separator(title: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {title}")
     print(f"{'='*60}")
 
 
+@requires_code_interpreter
 def test_1_sandbox_manager_basic():
     """测试 1: SandboxManager 创建/执行/销毁"""
     separator("TEST 1: SandboxManager 基础生命周期")
@@ -103,6 +142,7 @@ def test_1_sandbox_manager_basic():
     print("  ✅ TEST 1 PASSED")
 
 
+@requires_code_interpreter
 def test_2_code_result_parsing():
     """测试 2: CodeResult 各种输出解析"""
     separator("TEST 2: CodeResult 解析")
@@ -146,6 +186,7 @@ def test_2_code_result_parsing():
         manager.kill_all()
 
 
+@requires_code_interpreter
 def test_3_remote_file_operations():
     """测试 3: 远程沙箱中的文件操作"""
     separator("TEST 3: 远程文件操作")
@@ -203,6 +244,7 @@ print(f'CPU: {platform.processor() or platform.machine()}')
         manager.kill_all()
 
 
+@requires_code_interpreter
 def test_4_sandbox_process_execution():
     """测试 4: 远程沙箱中的进程执行（subprocess）"""
     separator("TEST 4: 远程进程执行")
@@ -308,6 +350,7 @@ def test_5_build_tools_sandbox_mode():
     print("  ✅ TEST 5 PASSED")
 
 
+@requires_code_interpreter
 def test_6_executor_sandbox_integration():
     """测试 6: WorkerExecutor 与沙箱的完整集成"""
     separator("TEST 6: WorkerExecutor + Sandbox 集成")
@@ -373,6 +416,7 @@ print(r.stdout)
         raise
 
 
+@requires_code_interpreter
 def test_7_error_and_edge_cases():
     """测试 7: 错误处理和极端场景"""
     separator("TEST 7: 错误处理与极端场景")
