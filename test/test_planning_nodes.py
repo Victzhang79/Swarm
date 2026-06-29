@@ -89,6 +89,33 @@ def test_review_reject_cap_forces_approve():
     print(f"  ✅ review: 打回达 {P.MAX_DESIGN_REJECTS} 次上限强制通过")
 
 
+def _review_with_decision(monkeypatch, decision_payload):
+    """非 auto、未达上限 → 走 interrupt；patch interrupt 直接返回 resume payload。"""
+    monkeypatch.setattr(P, "interrupt", lambda _payload: decision_payload)
+    return asyncio.run(P.review_design({"auto_accept": False, "tech_design": {}}))
+
+
+def test_review_explicit_approve(monkeypatch):
+    out = _review_with_decision(monkeypatch, {"decision": "approve"})
+    assert out["design_review"]["decision"] == "approve"
+    print("  ✅ review: 显式 approve 通过")
+
+
+def test_review_explicit_reject(monkeypatch):
+    out = _review_with_decision(monkeypatch, {"decision": "reject", "feedback": "x"})
+    assert out["design_review"]["decision"] == "reject"
+    assert out["design_review"]["reject_count"] == 1
+    print("  ✅ review: 显式 reject 打回")
+
+
+def test_review_unknown_payload_failclosed_to_reject(monkeypatch):
+    """fail-closed：畸形/未知 decision 不再静默 approve，按打回处理。"""
+    for bad in ({"unexpected": "shape"}, "garbled", None, {"decision": "maybe"}):
+        out = _review_with_decision(monkeypatch, bad)
+        assert out["design_review"]["decision"] == "reject", f"未知 {bad!r} 应 fail-closed 打回"
+    print("  ✅ review: 未知/畸形决策 fail-closed 打回(非静默 approve)")
+
+
 # ── elaborate（用真实 SubTask/TaskPlan，避免 mock drift）──
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
 

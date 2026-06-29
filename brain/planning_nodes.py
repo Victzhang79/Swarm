@@ -1795,13 +1795,20 @@ async def review_design(state: BrainState) -> dict:
         "message": "请评审技术方案：通过则进入任务拆解，打回请填写反馈（最多打回 3 次）。",
     })
 
-    if isinstance(decision, dict) and decision.get("decision") == "reject":
-        fb = decision.get("feedback", "")
-        logger.info("[REVIEW_DESIGN] 方案被打回（第 %d 次）: %s", reject_count + 1, fb[:60])
-        return {"design_review": {"decision": "reject", "feedback": fb, "reject_count": reject_count + 1}}
+    # fail-closed：仅【显式 approve】才放行方案，其余（reject / 未知 / 畸形 payload）一律按打回。
+    # 安全前提已核实：submit_design_review(api/routers/task.py) 强校验 decision∈{approve,reject}
+    # 才会推进，故合法 approve 必是 {"decision":"approve"}；未知只可能来自非 API 入口/损坏 resume，
+    # 按打回再评审一轮（reject_count 有上限，到顶 review_design 强制通过兜底，不会死循环）。
+    _dec = decision.get("decision") if isinstance(decision, dict) else None
+    _fb = decision.get("feedback", "") if isinstance(decision, dict) else ""
+    if _dec == "approve":
+        logger.info("[REVIEW_DESIGN] 方案通过")
+        return {"design_review": {"decision": "approve", "feedback": _fb, "reject_count": reject_count}}
 
-    logger.info("[REVIEW_DESIGN] 方案通过")
-    return {"design_review": {"decision": "approve", "feedback": (decision or {}).get("feedback", "") if isinstance(decision, dict) else "", "reject_count": reject_count}}
+    if _dec != "reject":
+        logger.warning("[REVIEW_DESIGN] 未知决策 payload=%r → fail-closed 按打回处理", decision)
+    logger.info("[REVIEW_DESIGN] 方案被打回（第 %d 次）: %s", reject_count + 1, _fb[:60])
+    return {"design_review": {"decision": "reject", "feedback": _fb, "reject_count": reject_count + 1}}
 
 
 # ══════════════════════════════════════════════
