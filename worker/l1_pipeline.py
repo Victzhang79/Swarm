@@ -670,16 +670,27 @@ def _repair_go(project_path: str, go_files: list[str], timeout: int) -> tuple[in
 def _repair_rust(project_path: str, timeout: int) -> tuple[int, list[str]]:
     """Rust：cargo fix —— 自动套用 rustc 机器可应用建议（含 use 路径）。crate 级。
 
-    返回 (修复标记, 路径列表)。cargo fix 修改的具体文件集不可知（crate 级），故路径列表
-    为空——TD2606-C9 残留：依赖 rust crate 源在子任务写权 scope 内（pull-back 已覆盖）。"""
+    返回 (修复标记, 路径列表)。治本(TD2606-C9 收尾)：cargo fix 是 crate 级、可能改到【子任务
+    写权 scope 之外】的同 crate 兄弟文件/Cargo.lock；故用 `git diff --name-only` 取其实际触达的
+    文件集回传，杜绝"修复只活在沙箱"——与 pom 清单同类治本。git 不可用则优雅降级为空列表。"""
     cmd = "cargo fix --allow-dirty --allow-no-vcs --edition-idioms -q 2>&1"
     ec, out = _run_l1_command(cmd, project_path, timeout=max(timeout, 240))
     if _tool_missing(out):
         logger.info("[L1.2.1·repair] cargo 不可用，跳过 Rust 修复")
         return 0, []
     # cargo fix 可能因冲突非 0 退出，但已应用的建议仍写盘；交重跑构建仲裁
-    logger.info("[L1.2.1·repair] cargo fix 已尝试套用 rustc 建议（exit=%s）", ec)
-    return 1, []
+    touched: list[str] = []
+    try:
+        d_ec, d_out = _run_l1_command(
+            "git diff --name-only", project_path, timeout=min(timeout, 60)
+        )
+        if d_ec == 0:
+            touched = [ln.strip() for ln in (d_out or "").splitlines() if ln.strip()][:100]
+    except Exception:  # noqa: BLE001 —— 取触达清单失败不致命，退化为空列表
+        touched = []
+    logger.info("[L1.2.1·repair] cargo fix 已尝试套用 rustc 建议（exit=%s, 触达 %d 文件）",
+                ec, len(touched))
+    return 1, touched
 
 
 def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> tuple[int, list[str]]:
@@ -1836,74 +1847,17 @@ def _maven_modules(project_path: str) -> dict[str, str]:
 def _reconcile_maven_module_registration(project_path: str, modified: list[str]) -> list[str]:
     """治本(round8)：确保改动涉及的【内部子模块】已注册进根 pom <modules>。
 
-    根因：多模块工程里脚手架子任务在根 pom 注册了新模块(如 ruoyi-alarm)，但后续也改根 pom 的
-    子任务在各自沙箱基于 HEAD(无该注册)重写根 pom → pull-back/集成把注册【冲掉】。结果 ruoyi-admin
-    依赖 com.ruoyi:ruoyi-alarm:jar 在 reactor 里找不到 → 全 reactor `mvn compile` 确定性失败、
-    负解析被缓存；且 _scope_maven_command 因 _maven_modules 扫不到该模块而无法 -pl 收窄 → 退回全
-    reactor → 子任务"代码本是好的却确定性修不动"。本对账须在 _scope_maven_command 之前跑：注册后
-    _maven_modules 能扫到该模块，scope 改写成 `-pl <mod> -am`(只编它+上游、不带下游 ruoyi-admin)，
-    缓存的 jar-not-found 也随之绕开。确定性、模型无关、幂等。返回新注册的模块目录名列表。
+    Maven 专项入口，委托通用对账器(workspace_manifest)的 Maven 核心——所有生态(Maven/Gradle/
+    Cargo/.NET/Go)的聚合清单对账收口在一处，杜绝逐生态/逐调用点各写一份漂移。返回新注册的
+    模块目录名列表(扁平化，向后兼容旧签名)。详见 workspace_manifest._reconcile_maven 文档。
     """
     from pathlib import Path as _P
-    import re as _re
-    root = _P(project_path)
-    root_pom = root / "pom.xml"
-    if not root_pom.is_file():
-        return []
-    try:
-        root_text = root_pom.read_text("utf-8", errors="ignore")
-    except Exception:  # noqa: BLE001
-        return []
-    # 必须是聚合器(有 <modules> 块)才补注册；否则不擅自改 root pom 结构
-    mblock = _re.search(r"<modules>(.*?)</modules>", root_text, _re.S)
-    if not mblock:
-        return []
-    registered = set(_re.findall(r"<module>\s*([^<\s]+)\s*</module>", mblock.group(1)))
-    # 候选：改动文件的顶层目录 + 直接子目录扫描(兜底漏网)
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def _consider(d: str) -> None:
-        d = (d or "").strip().strip("/")
-        if not d or "/" in d or d in seen:
-            return
-        seen.add(d)
-        candidates.append(d)
-
-    for f in (modified or []):
-        _consider((f or "").strip().split("/", 1)[0])
-    try:
-        for child in root.iterdir():
-            if child.is_dir() and (child / "pom.xml").is_file():
-                _consider(child.name)
-    except OSError:
-        pass
-
-    added: list[str] = []
-    for d in candidates:
-        if d in registered:
-            continue
-        child_pom = root / d / "pom.xml"
-        if not child_pom.is_file():
-            continue
-        try:
-            ctext = child_pom.read_text("utf-8", errors="ignore")
-        except Exception:  # noqa: BLE001
-            continue
-        # 仅注册【本工程子模块】(声明 <parent>)；独立工程目录不碰
-        if "<parent>" not in ctext:
-            continue
-        added.append(d)
-        registered.add(d)
-    if not added:
-        return []
-    insert = "".join(f"        <module>{d}</module>\n" for d in added)
-    new_text = root_text.replace("</modules>", insert + "    </modules>", 1)
-    try:
-        root_pom.write_text(new_text, encoding="utf-8")
-    except OSError:
-        return []
-    return added
+    from swarm.worker.workspace_manifest import _reconcile_maven
+    _mods, _added = _reconcile_maven(_P(project_path), [str(m or "") for m in (modified or [])])
+    out: list[str] = []
+    for members in _added.values():
+        out.extend(members)
+    return out
 
 
 def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
@@ -2081,13 +2035,24 @@ def run_l1_pipeline(
         # 治本(round8)：先把改动涉及的内部子模块补注册进根 pom <modules>(对账被跨子任务冲掉的
         # 注册)，再 scope——否则 _maven_modules 扫不到该模块、无法 -pl 收窄，退回全 reactor 必死。
         try:
-            _reg = _reconcile_maven_module_registration(project_path, modified)
-            if _reg:
+            from swarm.worker.workspace_manifest import reconcile_workspace_manifests
+            _wm = reconcile_workspace_manifests(project_path, modified)
+            _manifests = _wm.get("modified_manifests") or []
+            if _manifests:
                 logger.info(
-                    "[L1.2.1·module-reg] 补注册内部子模块进根 pom <modules>: %s"
-                    "（修复 reactor 缺模块/缓存负解析致的确定性 FAIL）", _reg,
+                    "[L1.2.1·module-reg] 补注册聚合清单成员(Maven/Gradle/Cargo/.NET/Go): %s"
+                    "（修复缺模块/缓存负解析致的确定性 FAIL）", _wm.get("added"),
                 )
-                details["module_registration_added"] = _reg
+                details["module_registration_added"] = _wm.get("added")
+                # 治本关键(round8 自审补漏)：补注册改的是【聚合清单】(根 pom / settings.gradle /
+                # Cargo.toml / .sln / go.work)，它们【不在本子任务写权 scope 内】。必须登记进
+                # repaired_file_paths，否则 executor 的 pull-back 只回传 scope 内文件 → 注册只活在
+                # 【本沙箱】→ 下游子任务在干净沙箱基于 HEAD(仍缺注册)重建 → 毒复发、治本不级联。
+                # 挂到 repaired_file_paths 使其回传本地 + 计入 diff，持久化到权威库。
+                _rfp = details.setdefault("repaired_file_paths", [])
+                for _mf in _manifests:
+                    if _mf not in _rfp:
+                        _rfp.append(_mf)
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)
@@ -2153,7 +2118,13 @@ def run_l1_pipeline(
                 details["import_repaired_files"] = len(repaired_paths)
                 # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
                 # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
-                details["repaired_file_paths"] = repaired_paths
+                # 治本(自审补漏)：必须【并集合并】而非覆盖——构建前的聚合清单对账已把 pom.xml 等
+                # 清单写进 repaired_file_paths；若此处直接赋值会把它们【冲掉】→ 清单不回传 → 治本
+                # 在"既补注册又触发修复"的常见失败路径上被悄悄废掉。
+                _existing_rfp = details.get("repaired_file_paths") or []
+                details["repaired_file_paths"] = list(
+                    dict.fromkeys([*_existing_rfp, *repaired_paths])
+                )
                 logger.info(
                     "[L1.2.1] 确定性收敛修复累计 %d 文件后构建: ok=%s",
                     len(repaired_paths), build_ok,

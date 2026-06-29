@@ -158,6 +158,18 @@ def run_integration_review(
         if not applied.get("ok"):
             issues.append(f"git apply failed: {applied.get('stderr', '')[:500]}")
             return False, issues, details
+        # 通用治本：merged_diff apply 后磁盘上所有成员模块目录都在场(ground truth)。在【集成构建前】
+        # 对账聚合清单(Maven/Gradle/Cargo/.NET/Go)，使其枚举真实存在的成员——杜绝并行子任务 pull-back
+        # 整文件覆盖把成员注册【冲掉】致集成构建【假失败】(找不到模块)。此处是验证态(下方 finally 会
+        # reset 工作区)，持久化由交付 commit 处的同一对账器保证(learn_success)。
+        try:
+            from swarm.worker.workspace_manifest import reconcile_workspace_manifests
+            _wm = reconcile_workspace_manifests(project_path)
+            if _wm.get("modified_manifests"):
+                details["manifest_reconciled"] = _wm.get("added")
+                logger.info("[integration_review] 集成构建前对账聚合清单成员: %s", _wm.get("added"))
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("[integration_review] 聚合清单对账跳过(异常,不致命): %s", _exc)
         try:
             ok, out = _run_cmd(project_path, build_cmd, timeout=timeout)
             details["compile_ok"] = ok

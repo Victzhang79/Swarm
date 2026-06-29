@@ -3185,6 +3185,20 @@ async def learn_success(state: BrainState) -> dict:
                     if not _ap.get("ok"):
                         logger.warning("[LEARN_SUCCESS] commit 前重新 apply(补缺失文件)失败(非致命): %s",
                                        _ap.get("stderr", "")[:160])
+                # 通用治本(交付持久化收口)：所有产出文件已落工作区(ground truth)。对账聚合清单
+                # (Maven/Gradle/Cargo/.NET/Go)使其枚举真实存在的成员，并把被修正的清单【纳入本次
+                # commit 文件集】——否则并行子任务 pull-back 整文件覆盖把成员注册冲掉的残留会进入
+                # 【交付产物】，导致交付物缺模块构建不了(L2 即便对账通过也只是验证态)。幂等、确定性。
+                try:
+                    from swarm.worker.workspace_manifest import reconcile_workspace_manifests
+                    _wm = await _asyncio.to_thread(reconcile_workspace_manifests, proj_path)
+                    for _mf in (_wm.get("modified_manifests") or []):
+                        if _mf not in out_files:
+                            out_files.append(_mf)
+                    if _wm.get("modified_manifests"):
+                        logger.info("[LEARN_SUCCESS] 交付前对账聚合清单成员并纳入提交: %s", _wm.get("added"))
+                except Exception as _wmexc:  # noqa: BLE001
+                    logger.debug("[LEARN_SUCCESS] 聚合清单对账跳过(异常,不致命): %s", _wmexc)
                 _c = await _asyncio.to_thread(
                     commit_task_output, proj_path, out_files, task_id=state.get("task_id"))
                 if _c.get("committed"):
