@@ -453,7 +453,10 @@ def search_in_file(
     if _sandbox_active():
         return _search_in_sandbox(pattern, path, file_glob, max_results, regex)
 
-    resolved = _resolve(path)
+    try:
+        resolved = _resolve_read(path)  # #4：与 read_file 一致，堵 symlink 在 workspace 外搜索
+    except WorkspaceEscapeError as exc:
+        return f"❌ 拒绝搜索（越出 workspace 边界）：{exc}"
     if not resolved.exists():
         return f"❌ 路径不存在：{resolved}"
 

@@ -718,18 +718,36 @@ class KnowledgeUpdater:
                 try:
                     # 同项目多事件合并为一个，文件变更去重
                     merged = _merge_project_events(events, project_id)
-                    await self.handle_event(merged)
-                    # 该项目所有事件都标 done
-                    async with self._conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE kb_update_events
-                            SET status = 'done', processed_at = now()
-                            WHERE id = ANY(%s)
-                            """,
-                            (event_ids,),
-                        )
-                    processed += len(event_ids)
+                    _res = await self.handle_event(merged)
+                    # #3：handle_event 把单文件/Layer 错误吞进 result["errors"] 不抛出。
+                    # 若有错误（非 Layer B embedding 降级——那条走 kb_pending 重试队列、不入 errors），
+                    # 不能标 done 假装成功（会静默丢索引）。标 failed + 错误摘要，至少可观测可排查。
+                    _errs = _res.get("errors") if isinstance(_res, dict) else None
+                    if _errs:
+                        _summary = "; ".join(
+                            f"{e.get('file') or e.get('layer') or '?'}: {e.get('error', '')}"
+                            for e in _errs
+                        )[:500]
+                        async with self._conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE kb_update_events
+                                SET status = 'failed', error_message = %s, processed_at = now()
+                                WHERE id = ANY(%s)
+                                """,
+                                (f"partial failure: {_summary}", event_ids),
+                            )
+                    else:
+                        async with self._conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE kb_update_events
+                                SET status = 'done', processed_at = now()
+                                WHERE id = ANY(%s)
+                                """,
+                                (event_ids,),
+                            )
+                        processed += len(event_ids)
                 except Exception as e:
                     logger.exception(
                         "Failed to process batch for project %s (%d events)",

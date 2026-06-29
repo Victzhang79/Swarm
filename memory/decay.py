@@ -99,6 +99,13 @@ class MemoryDecay:
         Returns:
             统计信息 dict
         """
+        # #7：WS1 起 L5 改用【读时惰性衰减】(effective_weight 按 last_seen_at 实时算)，
+        # 日常调度走 purge_expired()。此写时乘减衰减已非主路径——手动调用会与读时衰减【叠加】
+        # 造成 double-decay。保留仅为兼容/手动运维，调用即告警。
+        logger.warning(
+            "[decay] decay_l5() 是 WS1 前的写时乘减路径，与读时惰性衰减叠加会 double-decay；"
+            "日常衰减应由 purge_expired() 负责。确认是有意的手动运维再使用。"
+        )
         stats: dict[str, Any] = {
             "total_processed": 0,
             "total_updated": 0,
@@ -234,6 +241,11 @@ class MemoryDecay:
         Returns:
             统计信息 dict
         """
+        # #7：同 decay_l5——WS1 后为非主路径，手动调用会与读时惰性衰减叠加 double-decay。
+        logger.warning(
+            "[decay] decay_l6() 是 WS1 前的写时乘减路径，与读时惰性衰减叠加会 double-decay；"
+            "日常衰减应由 purge_expired() 负责。确认是有意的手动运维再使用。"
+        )
         stats: dict[str, Any] = {
             "total_processed": 0,
             "total_updated": 0,

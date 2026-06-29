@@ -240,19 +240,18 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
     """
     from swarm.brain.runner import subscribe_task
 
-    await websocket.accept()
-
-    # #20：鉴权必须【先于】任务存在性查询，否则未鉴权调用方可凭 not-found vs 继续 区分出
-    # 哪些 task_id 真实存在（枚举预言机）。先验 token；再取任务；最后把"不存在"与"无权限"
-    # 收敛成同一条通用 close，避免泄露任务是否存在。
+    # #9/#20：鉴权【先于 accept】——token 无效直接在握手阶段拒绝，不建立连接（更严，
+    # 未鉴权连接不会被短暂建立）。鉴权也必须先于任务存在性查询，否则可凭 not-found
+    # 区分 task_id 是否存在（枚举预言机）。authenticate_ws 从 scope 读 token，无需 accept。
     from swarm.api.auth import authenticate_ws
     from swarm.auth.store import user_can_on_project
 
     user = authenticate_ws(websocket)
     if user is None:
-        await websocket.send_json({"event": "error", "data": {"detail": "Unauthorized: missing/invalid token"}})
-        await websocket.close(code=1008)
+        await websocket.close(code=1008)  # 握手阶段拒绝（不 accept）
         return
+
+    await websocket.accept()
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)

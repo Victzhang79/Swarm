@@ -1033,7 +1033,9 @@ def confirm_plan(state: BrainState) -> dict:
     # 用 effective_complexity（已归一枚举）：resume 后 state["complexity"] 是字符串，
     # 直接 == Complexity.ULTRA 会静默 False、把 ultra 闸门误标成普通校验失败。
     _complexity = effective_complexity(state)
-    _plan_valid = state.get("plan_valid", True)
+    # 与 can_auto_accept_plan / after_validate 一致缺省 False（缺标记=按未校验处理，
+    # 文案归到 validation_failed 而非误标 ultra/manual）。实际到此 plan_valid 必已设置。
+    _plan_valid = state.get("plan_valid", False)
     if not _plan_valid:
         _reason = "validation_failed"
         _msg = "此任务的执行计划多次自动校验未通过，需人工审核后决定是否继续。"

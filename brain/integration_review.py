@@ -165,8 +165,10 @@ def run_integration_review(
             if not ok:
                 issues.append(f"L2.1 compile failed: {out[:300]}")
         finally:
-            subprocess.run(["git", "checkout", "--", "."], cwd=project_path, capture_output=True)
-            subprocess.run(["git", "clean", "-fd"], cwd=project_path, capture_output=True)
+            # R1：限定回滚到 merged_diff 涉及的文件（复用 _reset_worktree_to_head 的 scoped 逻辑：
+            # 已跟踪→checkout HEAD，新建→删除），不再用整库 `checkout -- .` + `clean -fd`——
+            # 后者会抹掉用户在该项目里无关的未提交改动/未跟踪文件。
+            _reset_worktree_to_head(project_path, merged_diff)
     else:
         details["compile_ok"] = None
         logger.info("[integration_review] 未检测到构建文件，跳过全量编译")

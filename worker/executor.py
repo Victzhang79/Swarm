@@ -2024,7 +2024,8 @@ class WorkerExecutor:
                     # 池复用前 clean_workspace 的 `rm -rf /workspace` 会抹掉烤进的源码 → 下个任务缺源编译失败；
                     # 而仅"保留 /workspace"又会带入上个任务的改动破坏跨任务隔离。两难。故烤源沙箱【不回池】，
                     # 每任务从【缓存镜像】创建新容器（镜像层仍含源码+.m2/warmup，启动快），杜绝抹源与污染两种 bug。
-                    reusable = bool(getattr(self, "_l1_passed_flag", True)) and not getattr(
+                    # getattr 默认与 __init__ 一致取 False（fail-closed：缺标记=不复用脏沙箱）
+                    reusable = bool(getattr(self, "_l1_passed_flag", False)) and not getattr(
                         self, "_sandbox_has_source", False)
                     pool.release(self._sandbox, reusable=reusable)
                     self._log(f"远程沙箱已归还热池(reusable={reusable}): {sid}")
