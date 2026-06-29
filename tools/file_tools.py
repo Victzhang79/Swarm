@@ -157,7 +157,9 @@ def _read_text_any(path: str) -> str:
     remote = _resolve_sandbox(path)
     if remote is not None:
         return _read_sandbox_text(remote)
-    resolved = _resolve(path)
+    # #2：本地读走 _resolve_read 的 workspace 边界复校（最后一个 file_tools 读路径缺口，
+    # 此函数是 read_file basename 兜底定位用，越界则 WorkspaceEscapeError）。
+    resolved = _resolve_read(path)
     if not resolved.exists():
         raise FileNotFoundError(f"文件不存在：{resolved}")
     return resolved.read_text(encoding="utf-8")

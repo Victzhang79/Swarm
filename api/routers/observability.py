@@ -21,8 +21,9 @@ _TAG = "可观测"
 
 
 @router.get("/api/observability/ping", tags=[_TAG])
-async def obs_ping():
+async def obs_ping(request: Request):
     """探活：ClickHouse 数据源是否可达。前端用它决定面板是否降级。"""
+    _require_user(request)  # 与同域其它端点一致鉴权（不向匿名暴露 infra 可达性）
     ok = await _run(ch.ping)
     return {"available": bool(ok)}
 

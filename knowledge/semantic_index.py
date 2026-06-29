@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # bge-m3 向量维度
 BGE_M3_DIMENSION = 1024
 
+
+class EmbeddingUnavailableError(RuntimeError):
+    """embedding 服务不可用（返回零向量占位）→ 拒绝写入，避免污染检索/误删旧 chunk。"""
+
 # Qdrant payload 索引版本（12.4）：标记 payload 形态版本，便于排查"首次增量更新后
 # 向量库内容形态变化"。预处理全量(CodeGraph 符号嵌入)与增量(SemanticIndexer 语义分块)
 # 两条路径写入形态不同，靠 index_source 区分、index_version 标版本。
@@ -280,6 +284,15 @@ class SemanticIndexer:
             batch = chunks[i : i + batch_size]
             texts = [c.content for c in batch]
             vectors = await self._embed_fn(texts)
+
+            # 零向量占位 = embedding 服务不可用（真 bge-m3 不会返回全零）。绝不能 upsert：
+            # ① 写零向量污染检索；② 更糟——reindex_file_atomic 写完会 prune 旧代际，等于
+            # 删掉旧的有效 chunk 只留零向量。故检测到即抛出（在任何 upsert 之前），让
+            # 原子重建中止 prune、旧 chunk 原样保留；调用方降级到重试队列。
+            if any(not any(v) for v in vectors):
+                raise EmbeddingUnavailableError(
+                    "embedding 服务返回零向量占位，拒绝写入 Qdrant（避免污染检索/误删旧 chunk）"
+                )
 
             points = []
             for chunk, vector in zip(batch, vectors):

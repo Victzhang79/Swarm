@@ -59,6 +59,37 @@ def test_integration_review_full_dirty_worktree():
     assert ok, f"整体应通过: {issues}"
 
 
+def test_reset_worktree_preserves_unrelated_changes():
+    """R1 回归：scoped 回滚只动 diff 涉及文件，绝不抹用户【无关】的未提交改动/未跟踪文件
+    （原 `git checkout -- .` + `git clean -fd` 会全清——本测试守住治本）。"""
+    d = _init_repo()  # 已跟踪 A.java
+    # 用户无关改动：① 改一个已跟踪文件(非 diff 目标) ② 一个未跟踪新文件
+    with open(os.path.join(d, "B_tracked.txt"), "w") as f:
+        f.write("v1\n")
+    subprocess.run(["git", "-C", d, "add", "B_tracked.txt"], capture_output=True, check=False)
+    subprocess.run(
+        ["git", "-C", d, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "b"],
+        capture_output=True, check=False,
+    )
+    with open(os.path.join(d, "B_tracked.txt"), "w") as f:
+        f.write("v2-uncommitted-user-edit\n")          # 已跟踪文件的未提交改动
+    with open(os.path.join(d, "user_scratch.txt"), "w") as f:
+        f.write("important untracked note\n")           # 未跟踪文件
+
+    # diff 只涉及 A.java
+    diff = "--- a/A.java\n+++ b/A.java\n@@ -1,3 +1,4 @@\n class A {\n+    void g() {}\n     void f() {}\n }\n"
+    with open(os.path.join(d, "A.java"), "w") as f:
+        f.write("class A {\n    void g() {}\n    void f() {}\n}\n")
+
+    _reset_worktree_to_head(d, diff)
+
+    # A.java 被回滚到 HEAD；用户无关改动【完整保留】
+    assert open(os.path.join(d, "B_tracked.txt")).read() == "v2-uncommitted-user-edit\n", \
+        "无关已跟踪文件的未提交改动不应被抹除"
+    assert os.path.isfile(os.path.join(d, "user_scratch.txt")), \
+        "无关未跟踪文件不应被 clean 掉"
+
+
 def test_detect_build_cmd_skips_when_tool_missing():
     """pom.xml 存在但本机无 mvn → 返回 None（跳过本机编译，不误判）。"""
     d = tempfile.mkdtemp()

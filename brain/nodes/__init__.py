@@ -1100,13 +1100,15 @@ def confirm_plan(state: BrainState) -> dict:
         }
     )
 
-    # decision 可能是字符串 "accept"/"reject" 或 HumanDecision
-    if isinstance(decision, str):
-        human_decision = HumanDecision(decision)
-    elif isinstance(decision, dict) and "decision" in decision:
-        human_decision = HumanDecision(decision["decision"])
-    else:
-        human_decision = HumanDecision.ACCEPT  # 默认接受
+    # decision 可能是字符串 "accept"/"reject"、dict{"decision":...} 或 HumanDecision。
+    _raw = decision.get("decision") if isinstance(decision, dict) else decision
+    try:
+        human_decision = _raw if isinstance(_raw, HumanDecision) else HumanDecision(_raw)
+    except (ValueError, TypeError):
+        # 畸形/未知 resume payload → fail-closed：不再静默默认 ACCEPT（原 bug：把不确定的
+        # 人工意图当"通过"放行），也不让非法字符串抛异常把整图打成 FAILED。按 REJECT 处理 + 告警。
+        logger.warning("[CONFIRM] 无法解析人工决策 payload=%r → fail-closed 按 REJECT 处理", decision)
+        human_decision = HumanDecision.REJECT
 
     logger.info(f"[CONFIRM] 人工决策: {human_decision.value}")
     return {"human_decision": human_decision}

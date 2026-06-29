@@ -1738,7 +1738,14 @@ def _run_self_review(
         if json_str.startswith("json"):
             json_str = json_str[4:].strip()
         result = json.loads(json_str)
-        passed = bool(result.get("passed", True))
+        # #E：缺 passed 键 → fail-closed（与下方 JSON 解析失败分支一致）：passed=None+skipped，
+        # 不默认 True 把"没给结论"当审查通过。
+        if "passed" not in result:
+            logger.warning("[L1.4] LLM 自检 JSON 缺 passed 字段，跳过自检（passed=None，标记 skipped，不计入 PASS）")
+            return {"passed": None, "skipped": True, "skip_reason": "missing_passed_field",
+                    "issues": result.get("issues", []) if isinstance(result.get("issues"), list) else [],
+                    "raw": text[:500]}
+        passed = bool(result.get("passed"))
         issues = result.get("issues", [])
         if not isinstance(issues, list):
             issues = [str(issues)]
