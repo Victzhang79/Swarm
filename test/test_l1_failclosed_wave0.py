@@ -143,6 +143,58 @@ def test_build_manifest_missing_is_blocked():
     print("  ✅ 期望构建但清单缺失 → BLOCKED")
 
 
+# ── 治本(st-10 npm 误判空转)：纯静态资源被误派 node 构建 → 跳过放行，非 BLOCKED 空转 ──
+
+def _html_diff(path="src/main/resources/templates/alarm/x.html"):
+    return f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,2 @@\n+<html>\n+</html>\n"
+
+
+def _ts_diff(path="src/main/resources/static/app.ts"):
+    return f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+export const x = 1;\n"
+
+
+def test_node_build_on_maven_static_resource_skipped_not_blocked():
+    """治本(st-10)：Brain 给【纯静态资源子任务】误派 npm 构建 + Maven 项目(有 pom)无 package.json
+    → 跳过放行(走 scope+lint)，绝不 BLOCKED 空转(代码本没问题，旧逻辑每轮重试再撞、永远不过)。"""
+    import swarm.worker.l1_pipeline as l1
+    from swarm.types import TaskHarness
+
+    restore = _patch(l1, run_ret=(0, ""), applicable=False)  # npm 不适用(无 package.json)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "pom.xml").write_text("<project/>", encoding="utf-8")  # Maven 项目
+            # 故意不建 package.json
+            st = _subtask(["src/main/resources/templates/alarm/x.html"],
+                          TaskHarness(language="java", build_command="npm run build --if-present"))
+            ok, details = l1.run_l1_pipeline(d, st, _html_diff(), timeout=30)
+            assert details.get("build_command_skipped_reason") == "node_build_on_maven_static_resource", details
+            assert details.get("l1_2_1_build_ok") is True
+            assert "pipeline_blocked" not in details, "纯静态资源不该 BLOCKED 空转"
+    finally:
+        restore()
+    print("  ✅ 误派 node 构建+Maven 静态资源 → 跳过放行(非 BLOCKED)")
+
+
+def test_node_build_with_compilable_source_still_blocked():
+    """对照：有【可编译前端源(.ts)】+ 无 package.json → 仍 BLOCKED(真前端构建在等 upstream 建清单)，
+    不被新跳过逻辑误放(跳过只针对纯资源)。"""
+    import swarm.worker.l1_pipeline as l1
+    from swarm.types import NotRunKind, TaskHarness
+
+    restore = _patch(l1, run_ret=(0, ""), applicable=False)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "pom.xml").write_text("<project/>", encoding="utf-8")
+            st = _subtask(["src/main/resources/static/app.ts"],
+                          TaskHarness(language="node", build_command="npm run build --if-present"))
+            ok, details = l1.run_l1_pipeline(d, st, _ts_diff(), timeout=30)
+            assert details.get("pipeline_blocked") == "build_manifest_missing", details
+            assert details.get("not_run_kind") == NotRunKind.BLOCKED.value
+    finally:
+        restore()
+    print("  ✅ 真前端源(.ts)无清单 → 仍 BLOCKED(未被误放)")
+
+
 # ── 根因#③：确定性 repair 幂等收敛循环（吃下编译器错误掩蔽的级联 typo）──
 # 旧实现【单发单重跑】只纠第一层可见 typo，rerun 暴露的下一批级联 typo 漏到慢 LLM
 # 循环 → 模型反复写回 → 撞 900s 超时 → FAILED（996db614 实证 531 只纠 17）。
