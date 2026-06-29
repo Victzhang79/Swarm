@@ -1160,16 +1160,12 @@ def _store_vectors_qdrant(
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
 
-    # 清除该项目旧向量
+    # #2：write-then-prune（不再"先删后写"）。先 upsert 全部新向量（稳定 ID 覆盖同符号），
+    # 再按代际删除本项目残留的旧向量。避免"先删后写"在 upsert 中途崩溃时留下空/残检索窗口。
+    # 崩溃后重跑：稳定 ID 幂等覆盖 + 末尾 prune 兜底，最终一致可恢复。
+    import time as _time
     from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
-    client.delete(
-        collection_name=collection_name,
-        points_selector=FilterSelector(
-            filter=Filter(
-                must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))]
-            )
-        ),
-    )
+    _index_generation = str(_time.time_ns())
 
     batch_size = 100
     total = len(symbols)
@@ -1198,6 +1194,8 @@ def _store_vectors_qdrant(
                 # 索引溯源（12.4）：标记本路径为预处理全量 CodeGraph 符号嵌入
                 "index_version": INDEX_VERSION,
                 "index_source": INDEX_SOURCE_CODEGRAPH,
+                # #2：本次重建代际，末尾据此 prune 掉旧代际残留
+                "index_generation": _index_generation,
             }
             # P1-DEBT-04：与增量(semantic)路径共用同一 ID 方案（make_point_id），
             # 同一 (file,line,content) 产同一 point ID → 两路径可互相 upsert 去重，
@@ -1218,6 +1216,21 @@ def _store_vectors_qdrant(
                 progress,
                 f"Storing vectors {min(i + batch_size, total)}/{total}...",
             )
+
+    # #2：prune——全部新向量落盘后，删本项目【非本代际】的残留旧向量。
+    # 仅在新数据就位后执行，故检索全程有数据（无空窗）；崩在 upsert 中途则不 prune，
+    # 留待下次全量重建幂等收敛。symbols 为空(total=0)时本删除即清空本项目向量（符合"重建为空"语义）。
+    client.delete(
+        collection_name=collection_name,
+        points_selector=FilterSelector(
+            filter=Filter(
+                must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))],
+                must_not=[FieldCondition(
+                    key="index_generation", match=MatchValue(value=_index_generation)
+                )],
+            )
+        ),
+    )
 
 
 def _build_analysis_input(project_path: str, scan_result: dict[str, Any]) -> dict[str, Any]:

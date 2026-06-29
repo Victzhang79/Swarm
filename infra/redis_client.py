@@ -22,6 +22,21 @@ _redis_unavailable_at: float | None = None
 # 长时间停留在退化态。非阻塞：只是决定是否在下次访问时重试。
 _REDIS_REPROBE_COOLDOWN_SEC = 30.0
 
+# #14：ModuleLock 在 Redis 不可用时降级为进程内 no-op（无跨进程互斥）。多进程部署下这是
+# split-brain 风险，须可观测。仅首次降级打一次 WARNING（避免每次 acquire 刷屏）。
+_lock_fail_open_warned = False
+
+
+def _warn_lock_fail_open_once() -> None:
+    global _lock_fail_open_warned
+    if not _lock_fail_open_warned:
+        _lock_fail_open_warned = True
+        logger.warning(
+            "[ModuleLock] Redis 不可用 → 模块锁降级为进程内 no-op（无跨进程互斥）。"
+            "单进程部署可忽略；多进程/多副本部署存在同模块并发写 split-brain 风险，"
+            "请启用 Redis（SWARM_REDIS_ENABLED=true）。"
+        )
+
 
 def redis_enabled() -> bool:
     return os.environ.get("SWARM_REDIS_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -80,6 +95,9 @@ class ModuleLock:
     def acquire(self) -> bool:
         r = get_redis()
         if r is None:
+            # #14：Redis 不可用 → 锁降级为进程内 no-op（单进程默认有意行为）。
+            # 但多进程/多副本部署下这意味着【无跨进程互斥】，须可观测。首次降级打一次 WARNING。
+            _warn_lock_fail_open_once()
             self._held = True
             return True
         ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)

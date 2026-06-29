@@ -12,17 +12,35 @@ from typing import Any
 
 
 def files_from_unified_diff(diff: str) -> list[str]:
-    """从 unified diff 提取变更文件路径（去重，保持顺序）。"""
+    """从 unified diff 提取变更文件路径（去重，保持顺序）。
+
+    #10：除 `+++ b/`(新增/修改的目标)外，还须采集：
+      - `--- a/`(变更的源端)：纯删除时 `+++ /dev/null` 被跳过，只有 `--- a/path` 带路径，
+        若不采集则快照漏备份→回滚无法恢复被删文件。
+      - `rename from/to`：重命名的旧名只出现在 rename from（+++ b/ 仅含新名），
+        漏采集则回滚无法还原旧文件。
+    采集源端文件后，snapshot_files 会备份其原始内容(existed=True)，restore 据此恢复。
+    """
     seen: set[str] = set()
     paths: list[str] = []
+
+    def _add(path: str) -> None:
+        path = path.strip()
+        if not path or path == "/dev/null":
+            return
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
-            path = line[6:].strip()
-            if path == "/dev/null":
-                continue
-            if path not in seen:
-                seen.add(path)
-                paths.append(path)
+            _add(line[6:])
+        elif line.startswith("--- a/"):
+            _add(line[6:])  # 源端：覆盖纯删除 + 重命名旧名
+        elif line.startswith("rename from "):
+            _add(line[len("rename from "):])
+        elif line.startswith("rename to "):
+            _add(line[len("rename to "):])
     return paths
 
 

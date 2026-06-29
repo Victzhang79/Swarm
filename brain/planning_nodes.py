@@ -294,7 +294,7 @@ async def clarify(state: BrainState) -> dict:
                 knowledge=knowledge_prompt,
                 history=history_prompt,
                 round=rnd + 1,
-                max_rounds=MAX_CLARIFY_ROUNDS,
+                max_rounds=_max_clarify,  # #13：用真实 tier 上限，非固定常量
             )},
         ])
         result = _parse_json_from_llm(resp.content)
@@ -314,9 +314,9 @@ async def clarify(state: BrainState) -> dict:
         "task_id": state.get("task_id"),
         "task_description": state.get("task_description"),
         "round": rnd + 1,
-        "max_rounds": MAX_CLARIFY_ROUNDS,
+        "max_rounds": _max_clarify,  # #13：用真实 tier 上限
         "questions": questions,
-        "message": f"规划前需要澄清（第 {rnd + 1}/{MAX_CLARIFY_ROUNDS} 轮，可逐条回答，也可整体跳过用默认假设）。",
+        "message": f"规划前需要澄清（第 {rnd + 1}/{_max_clarify} 轮，可逐条回答，也可整体跳过用默认假设）。",
     })
 
     # 用户整体跳过

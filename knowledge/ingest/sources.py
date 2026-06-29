@@ -122,7 +122,17 @@ class LocalFileSource:
         return refs
 
     def fetch(self, doc_id: str) -> FetchedDoc:
-        p = Path(doc_id)
+        # 边界校验：doc_id 来自外部，须落在 root 内(resolve 后跟随 symlink/`..` 复校)，
+        # 否则可越界读任意文件。root 为单文件时只许该文件本身。
+        p = Path(doc_id).expanduser().resolve()
+        if self.root.is_file():
+            if p != self.root:
+                raise PermissionError(f"doc_id 越出来源边界: {doc_id}")
+        else:
+            try:
+                p.relative_to(self.root)
+            except ValueError as exc:
+                raise PermissionError(f"doc_id 越出来源边界: {doc_id}") from exc
         if not p.is_file():
             raise FileNotFoundError(f"文件不存在: {doc_id}")
         return FetchedDoc(

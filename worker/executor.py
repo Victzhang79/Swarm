@@ -54,6 +54,21 @@ _PROJECT_STACK_CACHE: dict[str, dict | None] = {}
 _FAIL_WORD_RE = re.compile(r"\b(fail|failed|failure|failures|error|errored|errors)\b")
 
 
+_git_flock_fail_open_warned = False
+
+
+def _warn_git_flock_fail_open_once(reason: str) -> None:
+    """#15：git flock 降级无锁时首次打 WARNING（多 worker 并发共享工作树下=脏 diff 风险，须可观测）。"""
+    global _git_flock_fail_open_warned
+    if not _git_flock_fail_open_warned:
+        _git_flock_fail_open_warned = True
+        logger.warning(
+            "[GitFlock] 文件锁降级为无锁（%s）。同项目并发 worker 共享 git 工作树/索引时"
+            "存在脏 diff/假通风险。Windows 等无 fcntl 平台属预期；类 Unix 上出现请排查。",
+            reason,
+        )
+
+
 class _ProjectGitFlock:
     """per-project 文件锁，串行化同一 project_path 的 git 临界操作（reset / add -N + diff）。
 
@@ -75,15 +90,16 @@ class _ProjectGitFlock:
             lock_path = Path(_tf.gettempdir()) / f"swarm_git_{proj_hash}.lock"
             self._lock_f = open(lock_path, "w")  # noqa: SIM115
             self._fcntl = fcntl
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._lock_f = None
+            _warn_git_flock_fail_open_once(f"fcntl/锁文件不可用: {type(exc).__name__}")
 
     def __enter__(self) -> "_ProjectGitFlock":
         if self._lock_f is not None and self._fcntl is not None:
             try:
                 self._fcntl.flock(self._lock_f, self._fcntl.LOCK_EX)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _warn_git_flock_fail_open_once(f"flock(LOCK_EX) 失败: {type(exc).__name__}")
         return self
 
     def __exit__(self, *exc: object) -> bool:
