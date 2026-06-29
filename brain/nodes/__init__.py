@@ -555,6 +555,47 @@ async def _plan_ultra_batched(
     return TaskPlan(subtasks=[SubTask(**st) for st in merged])
 
 
+def _subtask_signature(st) -> tuple:
+    """子任务签名（id+描述+写权 scope）——replan 前后【完全一致】才可复用旧完成态。"""
+    sc = getattr(st, "scope", None)
+    writable = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
+    creates = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
+    return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
+
+
+def _surgical_replan_reset(old_results: dict, old_plan, new_plan) -> dict:
+    """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
+
+    新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
+    （dispatch 据 completed_ids 自动跳过、不重跑）；新增/变更/失败 的清空重派。premature victory 由
+    "签名完全一致才保留"杜绝（旧 id 语义变=签名变→不保留→重派）。无旧完成态→空 reset（首规划）。"""
+    if not old_results:
+        return {}
+    old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
+    new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
+
+    def _passed(out) -> bool:
+        if isinstance(out, WorkerOutput):
+            return bool(out.l1_passed)
+        if isinstance(out, dict):
+            return bool(out.get("l1_passed"))
+        return False
+
+    preserved = {
+        sid: out for sid, out in old_results.items()
+        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and _passed(out)
+    }
+    logger.info(
+        "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber",
+        len(preserved), len(old_results),
+    )
+    return {
+        "subtask_results": preserved,
+        "dispatch_remaining": [],
+        "failed_subtask_ids": [],
+    }
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -579,18 +620,11 @@ async def plan(state: BrainState) -> dict:
     # 不可信（新 plan 可能复用旧子任务 id 但语义已变，旧"成功"结果会让新子任务被误判已完成
     # 而跳过执行 = premature victory）。replan 语义 = 一切重来，确定性清空完成态 + 派发队列，
     # 让新 plan 的所有子任务都重新派发。完成态只由 dispatch 基于真实 WorkerOutput 重新写。
-    _replan_reset: dict = {}
-    if state.get("subtask_results"):
-        logger.info(
-            "[PLAN] 检测到 replan 重入（已有 %d 个旧完成态）→ 清空完成态事实表，"
-            "防 premature victory（新 plan 子任务全部重新派发）",
-            len(state.get("subtask_results") or {}),
-        )
-        _replan_reset = {
-            "subtask_results": {},
-            "dispatch_remaining": [],
-            "failed_subtask_ids": [],
-        }
+    # R1b：replan 重入时改【按签名外科手术式保留】完成态（见 _surgical_replan_reset），不再无条件
+    # clobber 全部（旧行为把 34 个已完成全清空从头重跑=996db614 主失控）。新 plan 在各路径构建后，
+    # 于 return 处用 _surgical_replan_reset(旧结果, 旧plan, 新plan) 算保留集。此处仅捕获旧态（将被覆盖）。
+    _replan_old_results = state.get("subtask_results") or {}
+    _replan_old_plan = state.get("plan")
 
     logger.info(f"[PLAN] 拆解任务 (复杂度={complexity.value})")
 
@@ -616,7 +650,7 @@ async def plan(state: BrainState) -> dict:
         return {
             "plan": task_plan,
             "shared_contract": task_plan.shared_contract or {},
-            **_replan_reset,
+            **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
             **plan_touch,
         }
 
@@ -829,7 +863,7 @@ async def plan(state: BrainState) -> dict:
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
         "plan_generation_failed": _plan_degraded is not None,
-        **_replan_reset,
+        **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
         **plan_touch,
     }
 
@@ -1963,28 +1997,48 @@ async def handle_failure(state: BrainState) -> dict:
         _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed_ids}
         _deepest = max(_next_counts.values(), default=0)
         _max_retries = get_config().model.max_retries  # 默认 2
-        # 仅在【有成功兄弟】且【失败子任务还没烧光重试配额】时拦截 replan，降级为 retry。
-        # 没有成功兄弟（整批都失败）或已达上限，仍走原 replan 逻辑（可能真是计划问题）。
-        if succeeded_siblings and failed_ids and _deepest <= _max_retries + 1:
-            dispatch_remaining = list(state.get("dispatch_remaining", []))
-            for fid in failed_ids:
-                subtask_results.pop(fid, None)
-                if fid not in dispatch_remaining:
-                    dispatch_remaining.append(fid)
-            forced_alternate = _deepest > _max_retries
-            logger.info(
-                "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
-                "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
-                len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
-                "，换备选模型" if forced_alternate else "",
+        # R1a（治本，996db614 实测主失控）：**只要存在已成功兄弟子任务，就绝不全量 replan-clobber**。
+        # 旧守卫仅在【未烧光重试配额】时拦截，一旦失败子任务耗尽重试(_deepest>max+1)就落到下方全量
+        # replan→PLAN 清空完成态→把 34 个已完成全丢弃从头重跑（实测 剩余0/完成34→剩余47/完成1，再撞
+        # 同一幻觉 escalate→FAILED）。但 replan(重生成 plan) 治不了 worker 臆造方法/能力失败——只会重生成
+        # 同样的 plan 再失败。故：有成功兄弟时——还有重试预算→只重做失败的(retry/retry_alternate)；
+        # 已耗尽→escalate【失败子任务】并【完整保留成功成果】，绝不清空。
+        if succeeded_siblings and failed_ids:
+            if _deepest <= _max_retries + 1:
+                dispatch_remaining = list(state.get("dispatch_remaining", []))
+                for fid in failed_ids:
+                    subtask_results.pop(fid, None)
+                    if fid not in dispatch_remaining:
+                        dispatch_remaining.append(fid)
+                forced_alternate = _deepest > _max_retries
+                logger.info(
+                    "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
+                    "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
+                    len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
+                    "，换备选模型" if forced_alternate else "",
+                )
+                return {
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": dispatch_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+                    "use_alternate_model": forced_alternate,
+                    "subtask_retry_counts": {**_retry_counts, **_next_counts},
+                }
+            # 失败子任务耗尽重试 + 有成功兄弟 → escalate 失败子任务、【保留全部成功成果】，绝不全量
+            # replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
+            logger.warning(
+                "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个成功兄弟 → escalate 失败子任务、"
+                "完整保留成果，绝不全量 replan 清空（治本：局部能力失败不推倒全盘）",
+                failed_ids, len(succeeded_siblings),
             )
             return {
                 "subtask_results": subtask_results,
-                "dispatch_remaining": dispatch_remaining,
-                "failed_subtask_ids": [],
-                "failure_strategy": "retry_alternate" if forced_alternate else "retry",
-                "use_alternate_model": forced_alternate,
-                "subtask_retry_counts": {**_retry_counts, **_next_counts},
+                "failed_subtask_ids": failed_ids,
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "l2_passed": False,
+                "replan_count": state.get("replan_count", 0),
             }
 
         for fid in failed_ids:

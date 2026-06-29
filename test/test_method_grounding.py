@@ -104,6 +104,49 @@ def test_build_method_grounding_skips_empty():
     assert build_method_grounding([]) == ""
 
 
+# ── R2：javap 命令带项目 classpath（让项目类如 CipherUtils 可解析）──
+
+def test_javap_command_includes_project_classpath():
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty
+    from swarm.worker.executor import WorkerExecutor
+
+    w = WorkerExecutor(
+        SubTask(id="st-1", description="x", difficulty=SubTaskDifficulty.MEDIUM,
+                scope=FileScope(writable=["a.java"])),
+        task_id="t1",
+    )
+    cmds = []
+
+    class _R:
+        stdout = "  public java.security.Key generateNewKey(int, java.lang.String);"
+        stderr = ""
+
+    class _Mgr:
+        def run_command(self, sb, cmd, timeout=30):
+            cmds.append(cmd)
+            return _R()
+
+    w._sandbox = object()
+    w._sandbox_manager = _Mgr()
+    evidence = (
+        "AlarmNotifyUserServiceImpl.java:[144,40] cannot find symbol\n"
+        "  symbol:   method encrypt(java.lang.String,java.lang.String)\n"
+        "  location: class com.ruoyi.common.utils.security.CipherUtils\n"
+    )
+    hint = w._javap_method_grounding(evidence)
+    allcmds = "\n".join(cmds)
+    # R2 核心：classpath 同时覆盖【项目类】(target/classes)+【第三方库类】(build-classpath dep jar)
+    assert "dependency:build-classpath" in allcmds, allcmds  # 第三方库 jar
+    assert "target/classes" in allcmds, allcmds                # 项目类
+    # javap 用组好的完整 classpath
+    javap_cmd = next((c for c in cmds if "javap -cp" in c), "")
+    assert javap_cmd, cmds
+    assert "swarm_javap_cp.txt" in javap_cmd, javap_cmd
+    # 解析到真实方法 → 生成接地提示（臆造的 encrypt 不在真实方法里）
+    assert "generateNewKey" in hint and "encrypt" in hint
+    print("  ✅ R2：javap classpath 覆盖项目类+第三方库类，类可解析接地")
+
+
 if __name__ == "__main__":
     import sys
     fails = 0

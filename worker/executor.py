@@ -2424,6 +2424,21 @@ class WorkerExecutor:
             if rc is None:
                 return ""
             remote = get_config().sandbox.sandbox_remote_workdir
+            # R2（治本，996db614 实证 CipherUtils 类幻觉）：javap 无 -cp 解析不了【项目类】(CipherUtils
+            # 在 ruoyi-common)/【第三方库类】(RedisTemplate/Jwts/StrUtil 在依赖 jar)→ 空输出→无接地→
+            # 模型打地鼠猜方法名。组【完整 classpath】让任意 classpath 上的类都可 javap：
+            #   ① 项目类 = 各模块 target/classes（-am compile 后已存在）；
+            #   ② 第三方类 = mvn dependency:build-classpath 导出依赖 jar 全集（deps 已在 ~/.m2，本地解析快）。
+            # 合并去重写入沙箱临时文件一次，各 javap 复用。mvn 不可用/失败→优雅降级到仅 target/classes。
+            cp_build = (
+                f"cd {remote} 2>/dev/null && rm -f /tmp/swarm_dep_cp.txt 2>/dev/null; "
+                f"mvn -q dependency:build-classpath -Dmdep.outputFile=/tmp/swarm_dep_cp.txt "
+                f"-Dmdep.appendOutput=true >/dev/null 2>&1; "
+                f"{{ find . -path '*/target/classes' -type d 2>/dev/null; "
+                f"tr ':' '\\n' < /tmp/swarm_dep_cp.txt 2>/dev/null; }} "
+                f"| sort -u | tr '\\n' ':' > /tmp/swarm_javap_cp.txt"
+            )
+            rc(self._sandbox, cp_build, timeout=150)
             probed: list[tuple[str, str, list[str]]] = []
             seen_classes: set[str] = set()
             for method, klass in pairs[:5]:
@@ -2431,8 +2446,12 @@ class WorkerExecutor:
                     continue
                 seen_classes.add(klass)
                 bin_name = to_javap_class_name(klass)
-                cmd = f"cd {remote} 2>/dev/null && javap -public '{bin_name}' 2>/dev/null | head -80"
-                result = rc(self._sandbox, cmd, timeout=20)
+                cmd = (
+                    f"cd {remote} 2>/dev/null && "
+                    f"javap -cp \"$(cat /tmp/swarm_javap_cp.txt 2>/dev/null).\" "
+                    f"-public '{bin_name}' 2>/dev/null | head -80"
+                )
+                result = rc(self._sandbox, cmd, timeout=30)
                 methods = parse_javap_methods(getattr(result, "stdout", "") or "")
                 if methods:
                     probed.append((method, klass, methods))
