@@ -2820,12 +2820,11 @@ def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout
     finally:
         # H1 修复：L2 验证用的是临时 apply，验证完必须还原工作树——否则脏改动残留，
         # 污染下一任务的事实核验 ground truth(git ls-files/os.walk) 和 learn_success 的 commit。
-        # 照抄 integration_review 的回滚：checkout 已跟踪文件 + clean 未跟踪文件。
+        # R1 治本：限定回滚到 merged_diff 涉及的文件（scoped _reset_worktree_to_head），
+        # 不再用整库 `checkout -- .` + `clean -fd`——后者会抹掉用户在该项目里无关的未提交改动。
         try:
-            subprocess.run(["git", "checkout", "--", "."], cwd=project_path,
-                           capture_output=True, timeout=60)
-            subprocess.run(["git", "clean", "-fd"], cwd=project_path,
-                           capture_output=True, timeout=60)
+            from swarm.brain.integration_review import _reset_worktree_to_head
+            _reset_worktree_to_head(project_path, merged_diff)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[VERIFY_L2] 工作树回滚失败(非致命): %s", exc)
 

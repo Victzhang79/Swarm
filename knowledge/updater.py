@@ -406,10 +406,9 @@ class KnowledgeUpdater:
         # Layer B: 切分 + 语义索引（embedding 服务不可用时显式降级，不拖垮 Layer A）
         if self._semantic:
             try:
-                # 先删除旧的 chunks
-                await self._semantic.delete_by_file(project_id, change.file_path)
-                # 重新索引
-                await self._semantic.index_source_file(
+                # write-then-prune（替代先删后索引）：先 upsert 新 chunk 打代际，成功后删旧代际，
+                # index 失败则旧 chunk 原样保留（无向量空窗），走下方降级重试。
+                await self._semantic.reindex_file_atomic(
                     project_id,
                     change.content or "",
                     change.file_path,
@@ -595,8 +594,9 @@ class KnowledgeUpdater:
                 if content is None:
                     continue
                 try:
-                    await self._semantic.delete_by_file(pid, file_path)
-                    await self._semantic.index_source_file(
+                    # write-then-prune（替代先删后索引）：index 失败保留旧 chunk 无空窗，
+                    # 失败时该行仍留在 kb_pending_embeddings（下方 except 只 retry_count++）下轮重试。
+                    await self._semantic.reindex_file_atomic(
                         pid, content, file_path,
                         module_name=_guess_module(file_path),
                     )

@@ -265,9 +265,14 @@ class SemanticIndexer:
     # ── 写入 ────────────────────────────────────
 
     async def index_chunks(
-        self, project_id: str, chunks: list[Chunk], batch_size: int = 64
+        self, project_id: str, chunks: list[Chunk], batch_size: int = 64,
+        *, index_generation: str | None = None,
     ) -> int:
-        """将 chunks 向量化并存入 Qdrant"""
+        """将 chunks 向量化并存入 Qdrant。
+
+        index_generation：本次写入代际标记。配合 prune_file_stale 实现 write-then-prune
+        （先 upsert 新 chunk 打代际，再删本文件旧代际残留），消除"先删后索引"的空窗。
+        """
         client = self._client_or_raise()
         total = 0
 
@@ -293,6 +298,8 @@ class SemanticIndexer:
                     "index_version": INDEX_VERSION,
                     "index_source": INDEX_SOURCE_SEMANTIC,
                 }
+                if index_generation is not None:
+                    payload["index_generation"] = index_generation
                 points.append(
                     PointStruct(id=point_id, vector=vector, payload=payload)
                 )
@@ -309,14 +316,54 @@ class SemanticIndexer:
     async def index_source_file(
         self, project_id: str, source: str, file_path: str,
         module_name: str | None = None,
+        *, index_generation: str | None = None,
     ) -> int:
-        """便捷方法: 切分 + 索引单个文件"""
+        """便捷方法: 切分 + 索引单个文件。index_generation 透传给 index_chunks（write-then-prune）。"""
         chunks = self.chunk_source_code(
             source, file_path, module_name,
             chunk_size=self._kb_config.chunk_size,
             chunk_overlap=self._kb_config.chunk_overlap,
         )
-        return await self.index_chunks(project_id, chunks)
+        return await self.index_chunks(project_id, chunks, index_generation=index_generation)
+
+    async def reindex_file_atomic(
+        self, project_id: str, source: str, file_path: str,
+        module_name: str | None = None,
+    ) -> int:
+        """单文件 write-then-prune 重建：先 upsert 新 chunk（打代际），成功后删本文件旧代际残留。
+
+        替代"delete_by_file 然后 index_source_file"的先删后索引——后者在 index 失败时留下
+        向量空窗。本法 index 失败则抛出且不 prune，旧 chunk 原样保留（无空窗），由调用方重试兜底。
+        """
+        import time as _time
+        gen = str(_time.time_ns())
+        n = await self.index_source_file(
+            project_id, source, file_path, module_name, index_generation=gen,
+        )
+        await self.prune_file_stale(project_id, file_path, gen)
+        return n
+
+    async def prune_file_stale(
+        self, project_id: str, file_path: str, keep_generation: str
+    ) -> None:
+        """删某文件【非 keep_generation 代际】的 chunks（write-then-prune 的 prune 步）。"""
+        client = self._client_or_raise()
+        await client.delete(
+            collection_name=self._collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
+                        models.FieldCondition(key="file_path", match=models.MatchValue(value=file_path)),
+                    ],
+                    must_not=[
+                        models.FieldCondition(
+                            key="index_generation", match=models.MatchValue(value=keep_generation)
+                        ),
+                    ],
+                )
+            ),
+        )
 
     # ── 检索 ────────────────────────────────────
 
