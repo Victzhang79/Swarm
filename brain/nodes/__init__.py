@@ -3028,13 +3028,14 @@ def deliver(state: BrainState) -> dict:
         }
     )
 
-    # 解析决策
-    if isinstance(decision, str):
-        human_decision = HumanDecision(decision)
-    elif isinstance(decision, dict) and "decision" in decision:
-        human_decision = HumanDecision(decision["decision"])
-    else:
-        human_decision = HumanDecision.ACCEPT
+    # 解析决策（与 confirm_plan 对称 fail-closed）：畸形/未知 resume payload 不再静默默认 ACCEPT
+    # （原 bug：把不确定的人工意图当"接受交付"放行），非法决策字符串也不抛异常打崩整图。
+    _raw = decision.get("decision") if isinstance(decision, dict) else decision
+    try:
+        human_decision = _raw if isinstance(_raw, HumanDecision) else HumanDecision(_raw)
+    except (ValueError, TypeError):
+        logger.warning("[DELIVER] 无法解析人工决策 payload=%r → fail-closed 按 REJECT 处理", decision)
+        human_decision = HumanDecision.REJECT
 
     # 如果有修订反馈
     revision_feedback = ""
