@@ -1715,6 +1715,73 @@ def _subtask_out_l1_passed(out) -> bool:
     return False
 
 
+async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | None:
+    """卡死子任务恢复阶梯·阶梯二：把【多文件】卡死子任务【定点拆小】（复用 _resplit_subtask），
+    保留成功兄弟、只重派拆出的小块。每子任务最多 1 次。
+
+    工程依据：本地小模型卡在一个子任务，最常见是【子任务太大】（一个子任务又建 entity 又写
+    service 又拼 controller，7 个文件）→ 拆小真有用。单/双文件拆不动 → 返回 None 交阶梯三。
+    复用 elaborate 同款 plan 变异：换节点 + _remap_dependents 把下游 depends_on 重映射到子链尾。"""
+    plan_obj = state.get("plan")
+    if plan_obj is None:
+        return None
+    st = next((s for s in getattr(plan_obj, "subtasks", []) if s.id == failed_id), None)
+    if st is None:
+        return None
+    rd_counts = dict(state.get("subtask_redecompose_count", {}))
+    if rd_counts.get(failed_id, 0) >= 1:
+        return None  # 已拆过一次 → 不再拆（防无限拆）
+    sc = getattr(st, "scope", None)
+    n_files = len(getattr(sc, "writable", []) or []) + len(getattr(sc, "create_files", []) or [])
+    if n_files <= 2:
+        return None  # 单/双文件拆不动 → 交阶梯三
+    try:
+        from swarm.brain.planning_nodes import (
+            _context_budget,
+            _oversized_by_files,
+            _rebuild_plan,
+            _remap_dependents,
+            _resplit_subtask,
+            _split_oversized_by_files,
+        )
+        budget = _context_budget()
+        children = (
+            _split_oversized_by_files(st) if _oversized_by_files(st)
+            else await _resplit_subtask(st, state, budget)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[HANDLE_FAILURE] 阶梯二 定点拆小异常(跳过): %s", exc)
+        return None
+    if not children or len(children) <= 1:
+        return None  # 拆不动 → 交阶梯三
+    new_subtasks = list(plan_obj.subtasks)
+    idx = next((i for i, x in enumerate(new_subtasks) if x.id == failed_id), None)
+    if idx is None:
+        return None
+    new_subtasks[idx:idx + 1] = children
+    _remap_dependents(new_subtasks, failed_id, children[-1].id)
+    new_plan = _rebuild_plan(plan_obj, new_subtasks)
+    subtask_results = dict(state.get("subtask_results", {}))
+    subtask_results.pop(failed_id, None)
+    dispatch_remaining = list(state.get("dispatch_remaining", []))
+    for c in children:
+        if c.id not in dispatch_remaining:
+            dispatch_remaining.append(c.id)
+    rd_counts[failed_id] = rd_counts.get(failed_id, 0) + 1
+    logger.info(
+        "[HANDLE_FAILURE] 阶梯二：卡死子任务 %s 定点拆小为 %d 块 %s，保留成功兄弟、只重派小块（不全盘）",
+        failed_id, len(children), [c.id for c in children],
+    )
+    return {
+        "plan": new_plan,
+        "subtask_results": subtask_results,
+        "dispatch_remaining": dispatch_remaining,
+        "failed_subtask_ids": [],
+        "failure_strategy": "retry",
+        "subtask_redecompose_count": rd_counts,
+    }
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -2025,6 +2092,12 @@ async def handle_failure(state: BrainState) -> dict:
                     "use_alternate_model": forced_alternate,
                     "subtask_retry_counts": {**_retry_counts, **_next_counts},
                 }
+            # 卡死子任务恢复阶梯·阶梯二：escalate 前先试【定点拆小】（仅单个失败子任务时）。
+            # 多文件卡死多因子任务太大，拆小后小块各自更易成功，保留成功兄弟、只重派小块。
+            if len(failed_ids) == 1:
+                _redecomp = await _targeted_redecompose(state, failed_ids[0])
+                if _redecomp is not None:
+                    return _redecomp
             # 失败子任务耗尽重试 + 有成功兄弟 → escalate 失败子任务、【保留全部成功成果】，绝不全量
             # replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
             logger.warning(
