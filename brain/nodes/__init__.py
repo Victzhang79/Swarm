@@ -1782,6 +1782,252 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
     }
 
 
+def _subtask_footprint(st) -> list[str]:
+    """子任务在【本地树】可能留下的文件足迹（writable ∪ create_files），归一为相对 posix 路径。"""
+    sc = getattr(st, "scope", None)
+    files = list(getattr(sc, "writable", []) or []) + list(getattr(sc, "create_files", []) or [])
+    out: list[str] = []
+    for f in files:
+        rel = str(f).strip().lstrip("/")
+        if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _local_tree_revert_subtask(project_path: str | None, st) -> dict:
+    """卡死子任务恢复阶梯·阶梯三(revert)：把子任务在【本地树】的足迹清干净。
+
+    必要性（第六轮 + L2 源码实证）：worker 的坏文件经 pull-back 已写回本地 project_path
+    （新建文件为 untracked）。L2 `run_integration_review` 的 `_reset_worktree_to_head` 只
+    reset【merged_diff 内】的文件——放弃子任务空 diff 被 merge 排除 → 其坏 untracked 文件
+    不在 diff 内 → 不被 reset → 仍留本地树 → `mvn compile`/下游 bootstrap 仍会带上 → `-am`
+    整 reactor 中毒。故放弃时必须【主动清本地树足迹】，build 才真能保住。
+
+    - 已被 git 跟踪的文件 → `git checkout HEAD --`（还原提交版，撤销 pull-back 脏改动）。
+    - 未跟踪（新建产物）→ 删除文件。
+    通用：纯 git/文件操作，与语言无关。返回 {"reverted":[...], "removed":[...]}。"""
+    result: dict = {"reverted": [], "removed": []}
+    if not project_path:
+        return result
+    import subprocess
+    root = Path(project_path)
+    if not (root / ".git").exists():
+        return result
+    for rel in _subtask_footprint(st):
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", rel],
+                cwd=str(root), capture_output=True, text=True, timeout=10,
+            ).returncode == 0
+        except Exception:  # noqa: BLE001
+            tracked = False
+        if tracked:
+            try:
+                subprocess.run(
+                    ["git", "checkout", "HEAD", "--", rel],
+                    cwd=str(root), capture_output=True, text=True, timeout=20,
+                )
+                result["reverted"].append(rel)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            abs_f = root / rel
+            try:
+                if abs_f.is_file():
+                    abs_f.unlink()
+                    result["removed"].append(rel)
+            except OSError:
+                pass
+    return result
+
+
+def _git_diff_for_paths(project_path: str, rel_paths: list[str]) -> str:
+    """据本地树现状为给定文件生成 unified diff（相对 HEAD）。
+
+    新建文件用 `git add -N`（intent-to-add）让 `git diff` 能产出新增内容；产出后 `git reset`
+    撤销 intent-to-add（保留工作区文件本身）。通用、与语言无关。失败返回空串。"""
+    import subprocess
+    if not rel_paths:
+        return ""
+    try:
+        subprocess.run(["git", "add", "-N", "--", *rel_paths],
+                       cwd=project_path, capture_output=True, text=True, timeout=20)
+        proc = subprocess.run(["git", "diff", "HEAD", "--", *rel_paths],
+                              cwd=project_path, capture_output=True, text=True, timeout=30)
+        subprocess.run(["git", "reset", "-q", "--", *rel_paths],
+                       cwd=project_path, capture_output=True, text=True, timeout=20)
+        return proc.stdout if proc.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _generate_compile_stub(state: BrainState, st, project_path: str | None) -> str | None:
+    """卡死子任务恢复阶梯·阶梯三(stub)：为【被依赖】的卡死子任务生成可编译桩。
+
+    聚焦 LLM 调用：据 X 的描述/契约/目标文件，生成各文件的【可编译桩】——保留 public 类型/
+    签名让下游编译通过，方法体一律抛 not-implemented（语言对应：Java
+    `throw new UnsupportedOperationException(...)`、TS `throw new Error(...)`、Go `panic(...)` 等），
+    绝不留半成品坏代码。语言无关（prompt 让模型按文件后缀产出对应语言桩）。
+
+    写入本地树后用 git 生成 diff 作为 X 的 WorkerOutput.diff（merge 纳入、L2 验证其可编译）。
+    任何环节失败（无 LLM/无 project_path/解析失败/空产出）→ 返回 None，调用方回退 revert。
+    桩可编译性的最终校验由下游 L2 全量编译兜底（桩编不过 → L2 失败 → 熔断升级，有界）。"""
+    if not project_path:
+        return None
+    footprint = _subtask_footprint(st)
+    if not footprint:
+        return None
+    # 只为【会产出代码的源文件】打桩（排除 pom/配置/资源等非代码足迹，避免乱改构建文件）。
+    _CODE_EXT = (".java", ".kt", ".go", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".cs", ".scala")
+    code_files = [f for f in footprint if f.lower().endswith(_CODE_EXT)]
+    if not code_files:
+        return None
+    try:
+        llm = _get_brain_llm()
+        contract = getattr(st, "contract", None)
+        prompt = (
+            "一个子任务多次实现失败、需被放弃，但有【下游子任务依赖它】。请为它生成"
+            "【可编译的占位桩(stub)】，使下游能编译通过，而非半成品坏代码。严格要求：\n"
+            "1. 保留每个文件应有的 public 类型/接口/方法签名（据描述与契约推断）。\n"
+            "2. 所有方法体一律只抛“未实现”异常（按文件语言：.java→"
+            "`throw new UnsupportedOperationException(\"TODO: 子任务未完成\");`；.ts/.js→"
+            "`throw new Error(\"TODO: not implemented\");`；.go→`panic(\"TODO: not implemented\")`；"
+            ".py→`raise NotImplementedError(...)`；其它语言用其惯用未实现抛错）。\n"
+            "3. 桩必须能通过编译（import/包声明/类型完整），绝不留语法错误或未解析符号。\n"
+            "4. 仅输出 JSON：{\"files\": {\"<相对路径>\": \"<完整文件内容>\"}}，不要解释。\n\n"
+            f"子任务描述：{getattr(st, 'description', '')}\n"
+            f"契约：{json.dumps(contract, ensure_ascii=False) if contract else '无'}\n"
+            f"需打桩的文件：{code_files}\n"
+        )
+        response = await llm.ainvoke([
+            {"role": "system", "content": "你是资深工程师，生成最小可编译占位桩。只输出 JSON。"},
+            {"role": "user", "content": prompt},
+        ])
+        parsed = _parse_json_from_llm(response.content)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[阶梯三·桩] LLM 生成异常 → 回退 revert: %s", exc)
+        return None
+    files = parsed.get("files") if isinstance(parsed, dict) else None
+    if not isinstance(files, dict) or not files:
+        return None
+    root = Path(project_path)
+    written: list[str] = []
+    for rel, content in files.items():
+        rel_norm = str(rel).strip().lstrip("/")
+        if not rel_norm or rel_norm not in code_files or not isinstance(content, str) or not content.strip():
+            continue  # 只接受落在 X 足迹内的代码文件，杜绝越权写其它路径
+        abs_f = root / rel_norm
+        try:
+            abs_f.parent.mkdir(parents=True, exist_ok=True)
+            abs_f.write_text(content, encoding="utf-8")
+            written.append(rel_norm)
+        except OSError as exc:
+            logger.debug("[阶梯三·桩] 写文件失败 %s: %s", rel_norm, exc)
+    if not written:
+        return None
+    diff = _git_diff_for_paths(project_path, written)
+    if not diff.strip():
+        # diff 生成失败 → 清掉刚写的桩（防污染本地树）后回退 revert。
+        _local_tree_revert_subtask(project_path, st)
+        return None
+    logger.info("[阶梯三·桩] 为卡死子任务 %s 生成可编译桩 %s（下游可编译，需人工补完）",
+                getattr(st, "id", "?"), written)
+    return diff
+
+
+async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> dict | None:
+    """卡死子任务恢复阶梯·阶梯三：保 build 放弃（替代直接 escalate 全盘 FAILED）。
+
+    阶梯一(retry)→阶梯二(定点拆小)都耗尽仍失败、且有成功兄弟时调用。做法：
+      1. 自动判依赖：`any(X in st.depends_on for st in plan.subtasks)`。
+         - 被依赖 → 先试【可编译桩】(_generate_compile_stub)：下游可编译，不连坐放弃；
+           桩生成失败 → 回退 revert（并传递放弃下游，缺依赖跑不了）。
+         - 不被依赖 → revert（只丢 X，零连坐）。
+      2. 两路都【清本地树足迹】(_local_tree_revert_subtask)，杜绝坏文件毒 -am reactor。
+      3. 给 X 终态 WorkerOutput（计入 completed，让 dispatch 推进到 merge→L2），
+         记入 give_up_isolated_ids；revert 路若 X 被依赖则其下游进 abandoned_subtask_ids。
+      4. 返回 strategy=give_up_preserve（非 replan/escalate → 路由 DISPATCH → remaining 空 → merge），
+         保留全部成功成果，终态由 runner 据 give_up/abandoned 判 PARTIAL（诚实列明需人工补完）。
+
+    返回 None 表示无法保 build 放弃（无 plan / 无可放弃项），调用方回退 escalate。"""
+    plan_obj = state.get("plan")
+    if plan_obj is None or not failed_ids:
+        return None
+    project_path = _proj_path_from_state(state)
+    subtasks = list(getattr(plan_obj, "subtasks", []))
+    by_id = {s.id: s for s in subtasks}
+    subtask_results = dict(state.get("subtask_results", {}))
+    give_up = set(state.get("give_up_isolated_ids") or [])
+    abandoned = set(state.get("abandoned_subtask_ids") or [])
+    handled: list[tuple[str, str]] = []
+
+    for fid in failed_ids:
+        st = by_id.get(fid)
+        if st is None:
+            continue
+        depended = any(fid in (getattr(s, "depends_on", []) or []) for s in subtasks)
+        stub_diff = None
+        if depended:
+            stub_diff = await _generate_compile_stub(state, st, project_path)
+        if stub_diff:
+            mode = "stub"
+            subtask_results[fid] = WorkerOutput(
+                subtask_id=fid, diff=stub_diff,
+                summary=(f"[阶梯三·桩] {fid} 卡死 → 生成可编译桩（保留 public 签名、方法体抛 "
+                         "UnsupportedOperationException），下游可编译集成，需人工补完实现"),
+                l1_passed=True,
+                l1_details={"given_up": True, "give_up_mode": "stub"},
+                confidence=Confidence.LOW,
+            )
+        else:
+            rev = _local_tree_revert_subtask(project_path, st)
+            mode = "revert"
+            subtask_results[fid] = WorkerOutput(
+                subtask_id=fid, diff="",
+                summary=(f"[阶梯三·revert] {fid} 卡死 → 已清本地树足迹"
+                         f"(reverted={rev['reverted']}, removed={rev['removed']})，"
+                         "build 不被毒、其余成果照常交付，需人工补完"),
+                l1_passed=True,
+                l1_details={"given_up": True, "give_up_mode": "revert"},
+                confidence=Confidence.LOW,
+            )
+            # revert 路：X 被依赖 → 其下游缺依赖跑不了 → 传递放弃（清足迹防毒 + 出完成态）。
+            if depended:
+                _changed = True
+                while _changed:
+                    _changed = False
+                    for s in subtasks:
+                        if s.id in abandoned or s.id in give_up:
+                            continue
+                        deps = getattr(s, "depends_on", []) or []
+                        if fid in deps or any(d in abandoned for d in deps):
+                            abandoned.add(s.id)
+                            _changed = True
+                            _local_tree_revert_subtask(project_path, s)
+                            subtask_results.pop(s.id, None)
+        give_up.add(fid)
+        handled.append((fid, mode))
+
+    if not handled:
+        return None
+    _drop = {h[0] for h in handled} | abandoned
+    dispatch_remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in _drop]
+    logger.warning(
+        "[HANDLE_FAILURE] 阶梯三 保 build 放弃 %s（清本地树足迹防 reactor 中毒，保留全部成功成果，"
+        "run 继续 merge→L2，终态将 PARTIAL 诚实列明需人工补完）；连坐放弃下游 %d 个",
+        handled, len(abandoned),
+    )
+    return {
+        "plan": plan_obj,
+        "subtask_results": subtask_results,
+        "dispatch_remaining": dispatch_remaining,
+        "failed_subtask_ids": [],
+        "failure_strategy": "give_up_preserve",
+        "give_up_isolated_ids": sorted(give_up),
+        "abandoned_subtask_ids": sorted(abandoned),
+    }
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -2098,8 +2344,14 @@ async def handle_failure(state: BrainState) -> dict:
                 _redecomp = await _targeted_redecompose(state, failed_ids[0])
                 if _redecomp is not None:
                     return _redecomp
-            # 失败子任务耗尽重试 + 有成功兄弟 → escalate 失败子任务、【保留全部成功成果】，绝不全量
-            # replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
+            # 卡死子任务恢复阶梯·阶梯三：escalate(全盘 FAILED) 前先试【保 build 放弃】——
+            # 清本地树足迹防 -am reactor 中毒，被依赖→打可编译桩(救下游)、不被依赖→revert(只丢 X)，
+            # 给 X 终态计入 completed，run 继续 merge→L2，终态 PARTIAL 诚实交付而非整任务 FAILED。
+            _giveup = await _give_up_preserve_build(state, failed_ids)
+            if _giveup is not None:
+                return _giveup
+            # 阶梯三也无法保 build 放弃（无 plan/无足迹）→ 兜底 escalate 失败子任务、【保留全部成功
+            # 成果】，绝不全量 replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
             logger.warning(
                 "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个成功兄弟 → escalate 失败子任务、"
                 "完整保留成果，绝不全量 replan 清空（治本：局部能力失败不推倒全盘）",

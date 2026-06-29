@@ -580,10 +580,14 @@ async def _handle_post_run(
         subtask_results=state.get("subtask_results"),
     )
     duration = store.compute_task_duration_seconds(task_rec)
-    # 部分交付：有子任务被放弃(重试耗尽)→ 终态 PARTIAL(非 DONE)。已完成子任务的真实产物照常
-    # 落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃项——绝不当 DONE 假成功。
+    # 部分交付：有子任务被放弃(重试耗尽)或保 build 放弃(阶梯三 revert/桩)→ 终态 PARTIAL(非 DONE)。
+    # 已完成子任务的真实产物照常落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃/桩项——绝不当
+    # DONE 假成功。give_up_isolated_ids 是阶梯三保 build 放弃的子任务（本地树已清/打桩，build 未毒），
+    # 与 abandoned（重试耗尽连坐放弃）合并判 PARTIAL。
     _abandoned = state.get("abandoned_subtask_ids") or []
-    _final_status = "PARTIAL" if _abandoned else "DONE"
+    _given_up = state.get("give_up_isolated_ids") or []
+    _partial_ids = sorted(set(_abandoned) | set(_given_up))
+    _final_status = "PARTIAL" if _partial_ids else "DONE"
     store.update_task(
         task_id,
         status=_final_status,
@@ -592,13 +596,17 @@ async def _handle_post_run(
     )
     _emit_task_notification(task_id, task_rec, _final_status)
     output_parts = _build_result_payload(state)
-    if _abandoned:
-        logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个子任务 %s",
-                       task_id, len(_abandoned), _abandoned)
+    if _partial_ids:
+        logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)",
+                       task_id, len(_abandoned), _abandoned, len(_given_up), _given_up)
+        _msg = (f"部分交付：已完成子任务真实落盘且可构建(已过 L2)；放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}"
+                if _abandoned else "部分交付：已完成子任务真实落盘且可构建(已过 L2)")
+        if _given_up:
+            _msg += f"；保 build 放弃 {len(_given_up)} 个(本地树已清/打桩，需人工补完)：{_given_up}"
         await _emit(queue, {
             "step": "complete",
             "status": "partial",
-            "message": f"部分交付：已完成子任务真实落盘，放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}",
+            "message": _msg,
             "mode": "brain",
             "progress": 100,
         })
