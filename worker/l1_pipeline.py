@@ -2111,17 +2111,45 @@ def run_l1_pipeline(
                 details["build_failed"] = build_cmd
                 return False, details
     elif build_cmd:
-        # Brain 指定了 build_command（即【期望】这是可构建项目），但工程清单(pom/go.mod/...)在同步后
-        # 的树里定位不到 → 本应构建却跑不起来。fail-closed：标 BLOCKED（TD2606-B7），不再静默当
-        # 「跳过=通过」。多因模块源同步不全/清单未上传 → 交裁决器走 transient 重试。
-        # 注：_build_cmd_applicable 的 find -maxdepth 3 本身偏浅（深 monorepo 会漏），Wave 4 修
-        # 该定位逻辑以降低误标 BLOCKED；当前先 fail-closed（重试有上限，绝不静默通过）。
-        details["l1_2_1_build_ok"] = None
-        details["build_skipped"] = f"期望构建但无法定位工程清单: {build_cmd}"
-        details["pipeline_blocked"] = "build_manifest_missing"
-        details["not_run_kind"] = NotRunKind.BLOCKED.value
-        logger.warning("[L1.2.1] 期望构建但无对应工程文件，标 BLOCKED 转 transient 重试: %s", build_cmd)
-        return True, details
+        # 治本(st-10 npm 误判空转，996db614 实测)：Brain 给【纯静态资源子任务】(只改 .html/.js/.css/
+        # .vm 等服务端资源、无可编译源)误派了 node 构建(npm/yarn/pnpm/npx)，但项目是 Maven 单体
+        # (有 pom、无 package.json)——这些是 Thymeleaf/admin 静态资源，根本无 npm 工程、也【不会有
+        # upstream 建出 package.json】。旧逻辑标 BLOCKED → 每轮重试再撞同一探测、永远空转(代码其实
+        # 没问题)，还每轮白烧一次 HANDLE_FAILURE 的云模型调用。治本：仅当【node 构建工具 + 无可编译源
+        # + 项目无 package.json + 是 Maven 项目(有 pom)】这一【根本不匹配】组合时，判【无需构建】放行
+        # (走 scope+lint 即过)，绝不碰 ② 的合法 BLOCKED(.java 等可编译源缺 pom，pom 可由 upstream 建出)。
+        _node_tools = {"npm", "yarn", "pnpm", "npx"}
+        _tool = build_cmd.strip().split()[0] if build_cmd.strip() else ""
+        _has_compilable = any(
+            str(f).endswith((".java", ".kt", ".scala", ".go", ".rs", ".ts", ".tsx", ".vue"))
+            for f in (modified or [])
+        )
+        if (
+            _tool in _node_tools
+            and not _has_compilable
+            and not _manifest_present(("package.json",), project_path)
+            and _manifest_present(("pom.xml",), project_path)
+        ):
+            details["l1_2_1_build_ok"] = True
+            details["build_skipped"] = (
+                f"纯静态资源子任务(无可编译源)，Maven 项目无 npm 工程 → 跳过误派的 node 构建: {build_cmd}"
+            )
+            details["build_command_skipped_reason"] = "node_build_on_maven_static_resource"
+            logger.info(
+                "[L1.2.1] 纯静态资源(无可编译源)+Maven 项目无 package.json → 跳过误派的 node 构建"
+                "(放行非 BLOCKED，杜绝 st-10 式空转): %s", build_cmd,
+            )
+            # 不 return：继续走 format/lint 闸门，由 scope+lint 把关
+        else:
+            # Brain 指定了 build_command（即【期望】这是可构建项目），但工程清单(pom/go.mod/...)在同步后
+            # 的树里定位不到 → 本应构建却跑不起来。fail-closed：标 BLOCKED（TD2606-B7），不再静默当
+            # 「跳过=通过」。多因模块源同步不全/清单未上传 → 交裁决器走 transient 重试。
+            details["l1_2_1_build_ok"] = None
+            details["build_skipped"] = f"期望构建但无法定位工程清单: {build_cmd}"
+            details["pipeline_blocked"] = "build_manifest_missing"
+            details["not_run_kind"] = NotRunKind.BLOCKED.value
+            logger.warning("[L1.2.1] 期望构建但无对应工程文件，标 BLOCKED 转 transient 重试: %s", build_cmd)
+            return True, details
 
     # ── L1.2.0 自动格式化（L0 闸门）──
     # 在 lint 之前先确定性格式化改动文件：把"风格"从模型负担降级为系统自动行为。

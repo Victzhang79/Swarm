@@ -1442,6 +1442,39 @@ def _normalize_contract_dependencies(raw) -> list[dict]:
     return out
 
 
+def _union_contract_member(cur, new) -> tuple:
+    """并集合并两个契约成员值（同名接口/DTO/常量的 sig_field），返回 (合并值, 是否有变化)。
+
+    - 任一为 list（dtos.fields / constants.values）→ 按出现顺序并集去重；
+    - 否则按 str（interfaces.signature）→ 不同签名按行并集（已有行不重复并入），合并成多行串。
+    keep-first 会丢方法；并集保证同名接口的所有方法/字段都进共享契约。
+    """
+    if isinstance(cur, list) or isinstance(new, list):
+        def _as_list(v):
+            if isinstance(v, list):
+                return list(v)
+            return [v] if v not in (None, "") else []
+        out_l = _as_list(cur)
+        changed = False
+        for x in _as_list(new):
+            if x not in out_l:
+                out_l.append(x)
+                changed = True
+        return out_l, changed
+
+    cur_s = str(cur or "").strip()
+    new_s = str(new or "").strip()
+    if not new_s or new_s == cur_s:
+        return cur_s, False
+    if not cur_s:
+        return new_s, True
+    existing = {ln.strip() for ln in cur_s.splitlines() if ln.strip()}
+    new_lines = [ln.strip() for ln in new_s.splitlines() if ln.strip() and ln.strip() not in existing]
+    if not new_lines:
+        return cur_s, False
+    return cur_s + "\n" + "\n".join(new_lines), True
+
+
 def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
     """Stage C：把全局骨架 + 各模块契约片【确定性合并】成全局共享契约（0 LLM，纯函数可单测）。
 
@@ -1456,7 +1489,16 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
     slices = [s for s in slices if isinstance(s, dict)]
 
     def _merge_named(groups: list, key_label: str, sig_field: str) -> list[dict]:
-        """按 name 并集；同名不同定义（sig_field 不一致）→ 告警 + 保留首版。"""
+        """按 name 并集合并；同名项的 sig_field 成员【取并集，不丢方法/字段】。
+
+        治本（keep-first 隐患）：大模型大块结构化生成时常把同一接口重复吐多遍、每遍签名略有
+        出入。旧实现"保留首版、丢弃其余"：若被丢版含首版没有的方法 → 全局共享契约对该接口
+        【不完整】→ 下游消费方调缺失方法 → worker cannot-find-method。改为按成员并集合并：
+          - sig_field 为 list（dtos.fields / constants.values）→ 成员并集（保序去重）；
+          - sig_field 为 str（interfaces.signature 完整方法签名）→ 不同签名串并集（按行去重后
+            合并成多行），确保所有方法都进共享契约。
+          - 完全相同 → 静默去重，不告警。
+        """
         out: list[dict] = []
         seen: dict[str, dict] = {}
         for group in groups:
@@ -1468,13 +1510,20 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
                     out.append(item)  # 无名项不去重，直接并入
                     continue
                 if name not in seen:
-                    seen[name] = item
-                    out.append(item)
-                elif item.get(sig_field) != seen[name].get(sig_field):
-                    logger.warning(
-                        "[CONTRACT_MERGE] %s '%s' 同名不同定义冲突：保留首版(module=%s)，"
-                        "丢弃(module=%s)——人工复核",
-                        key_label, name, seen[name].get("module"), item.get("module"),
+                    merged = dict(item)
+                    seen[name] = merged
+                    out.append(merged)  # out 与 seen 共享同一引用，后续并集就地生效
+                    continue
+                base = seen[name]
+                merged_val, changed = _union_contract_member(
+                    base.get(sig_field), item.get(sig_field)
+                )
+                if changed:
+                    base[sig_field] = merged_val
+                    logger.info(
+                        "[CONTRACT_MERGE] %s '%s' 同名多版 → 并集合并(不丢方法/字段)："
+                        "首版 module=%s 并入 module=%s",
+                        key_label, name, base.get("module"), item.get("module"),
                     )
         return out
 
@@ -2186,7 +2235,10 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     if len(norm_batches) <= 1:
         return [st]   # 拆不出≥2 个内聚批(纯单特性 java) → 不拆,靠 A=900s 预算
 
-    base_desc = (getattr(st, "description", "") or "")[:300]
+    # 治本(ELABORATE 截断 → P6b 误判重拆)：保留父任务【完整实现指引】(原仅取 300 字成裸 stub →
+    # VALIDATE_PLAN 误标"描述截断/缺完整指引" → P6b 误判缺功能触发徒劳全量重拆)。给每个子块一段
+    # 自洽描述：父描述全文 + 明确"本批负责哪些文件、其余批由兄弟完成、接口以共享契约为准"。
+    base_desc = (getattr(st, "description", "") or "").strip()[:2000]
     n = len(norm_batches)
     children = []
     for i, grp in enumerate(norm_batches):
@@ -2194,9 +2246,15 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
         child_scope.create_files = [p for p, k in grp if k == "create"]
         child_scope.writable = [p for p, k in grp if k == "write"]
         files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
+        child_desc = (
+            f"{base_desc}\n\n【按文件分批 · 第 {i + 1}/{n} 批】本子任务是上述父任务按文件分层"
+            f"拆分的一批，仅负责创建/修改这些文件：{files_label}。父任务的完整实现目标见上述描述；"
+            f"其余文件由兄弟子任务（同一父任务的其它批）完成——跨文件接口以共享契约为准，"
+            f"勿重复实现不属于本批的文件。"
+        )
         children.append(SubTask(
             id=f"{st.id}-{i + 1}",
-            description=f"{base_desc}（分层第 {i + 1}/{n} 批：{files_label}）",
+            description=child_desc,
             difficulty=getattr(st, "difficulty", None) or SubTaskDifficulty.MEDIUM,
             modality=getattr(st, "modality", None) or SubTaskModality.TEXT,
             scope=child_scope,

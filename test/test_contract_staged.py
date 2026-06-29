@@ -46,14 +46,17 @@ def test_merge_union_and_schema_complete():
     assert {d["module"] for d in m["dependencies"]} == {"ch", "eng"}
 
 
-def test_merge_conflict_warns_and_keeps_first():
-    """两模块给同名接口不同签名 → 告警 + 保留首版（graceful degrade，不阻断）。"""
+def test_merge_same_name_unions_signatures_no_method_loss():
+    """治本：两模块给同名接口不同方法签名 → 并集合并，两个方法都在（不丢方法）。
+
+    旧行为是 keep-first 丢弃 → 被丢版独有的方法在共享契约里缺失 → 下游 cannot-find-method。
+    """
     skeleton = {"conventions": [], "constants": []}
     slices = [
         {"interfaces": [{"name": "INotify", "module": "ch", "signature": "send(A):B"}]},
-        {"interfaces": [{"name": "INotify", "module": "eng", "signature": "send(X):Y"}]},
+        {"interfaces": [{"name": "INotify", "module": "eng", "signature": "retry(X):Y"}]},
     ]
-    # 直接挂 handler 到具名 logger 抓告警——不依赖 caplog 的 root 传播（全套件乱序时会失灵）
+    # 直接挂 handler 到具名 logger 抓 info（并集合并打 info，不再是 warning 丢弃）
     logging.disable(logging.NOTSET)
     lg = logging.getLogger("swarm.brain.planning_nodes")
     msgs: list[str] = []
@@ -64,16 +67,43 @@ def test_merge_conflict_warns_and_keeps_first():
     h = _H()
     old = lg.level
     lg.addHandler(h)
-    lg.setLevel(logging.WARNING)
+    lg.setLevel(logging.INFO)
     try:
         m = _merge_module_contracts(skeleton, slices)
     finally:
         lg.removeHandler(h)
         lg.setLevel(old)
-    # 只保留一个 INotify，且是首版（module=ch / signature=send(A):B）
+    # 只一条 INotify，但签名并集含两个方法（不丢）
     ifs = [i for i in m["interfaces"] if i["name"] == "INotify"]
-    assert len(ifs) == 1 and ifs[0]["signature"] == "send(A):B" and ifs[0]["module"] == "ch"
-    assert any("同名不同定义" in mm for mm in msgs)
+    assert len(ifs) == 1
+    assert "send(A):B" in ifs[0]["signature"] and "retry(X):Y" in ifs[0]["signature"]
+    assert any("并集合并" in mm for mm in msgs)
+    assert not any("丢弃" in mm for mm in msgs)
+
+
+def test_merge_same_name_exact_dup_is_silent():
+    """同名且签名完全相同 → 静默去重，不告警、不重复。"""
+    skeleton = {"conventions": [], "constants": []}
+    slices = [
+        {"interfaces": [{"name": "ISvc", "module": "a", "signature": "f():v"}]},
+        {"interfaces": [{"name": "ISvc", "module": "b", "signature": "f():v"}]},
+    ]
+    m = _merge_module_contracts(skeleton, slices)
+    ifs = [i for i in m["interfaces"] if i["name"] == "ISvc"]
+    assert len(ifs) == 1 and ifs[0]["signature"] == "f():v"
+
+
+def test_merge_dto_fields_unioned():
+    """同名 DTO 跨模块字段不同 → fields 并集（保序去重），不丢字段。"""
+    skeleton = {"conventions": [], "constants": []}
+    slices = [
+        {"dtos": [{"name": "UserDTO", "module": "a", "fields": ["String name", "Long id"]}]},
+        {"dtos": [{"name": "UserDTO", "module": "b", "fields": ["Long id", "Integer age"]}]},
+    ]
+    m = _merge_module_contracts(skeleton, slices)
+    dto = [d for d in m["dtos"] if d["name"] == "UserDTO"]
+    assert len(dto) == 1
+    assert dto[0]["fields"] == ["String name", "Long id", "Integer age"]  # 并集、保序、去重
 
 
 def test_merge_dependencies_unioned_by_module():

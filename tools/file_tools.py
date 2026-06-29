@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -133,6 +134,131 @@ def _format_numbered_lines(
     return body + truncated_note
 
 
+def _read_text_any(path: str) -> str:
+    """沙箱或本地通用读取，返回文本；不存在/失败抛异常。"""
+    remote = _resolve_sandbox(path)
+    if remote is not None:
+        return _read_sandbox_text(remote)
+    resolved = _resolve(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"文件不存在：{resolved}")
+    return resolved.read_text(encoding="utf-8")
+
+
+def _sandbox_find_by_basename(base: str, limit: int = 20) -> list[str]:
+    """在沙箱 /workspace 树中按文件名定位，返回 workspace 相对 posix 路径。"""
+    from swarm.config.settings import get_config
+    from swarm.tools.build_tools import get_sandbox_context
+
+    sandbox, manager = get_sandbox_context()
+    if sandbox is None or manager is None or not hasattr(manager, "run_command"):
+        return []
+    remote_root = get_config().sandbox.sandbox_remote_workdir
+    cmd = (
+        f"find {shlex.quote(remote_root)} -type f -name {shlex.quote(base)} "
+        f"2>/dev/null | head -{int(limit)}"
+    )
+    try:
+        cr = manager.run_command(sandbox, cmd, timeout=20)
+    except Exception:
+        return []
+    out = (getattr(cr, "stdout", "") or "").strip()
+    if not out:
+        return []
+    rr = remote_root.rstrip("/") + "/"
+    rels: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rels.append(line[len(rr):] if line.startswith(rr) else line)
+    return rels
+
+
+def _find_by_basename(base: str, limit: int = 20) -> list[str]:
+    """按文件名在 workspace 树中定位（沙箱/本地通用），返回相对 posix 路径列表。"""
+    if _sandbox_active():
+        return _sandbox_find_by_basename(base, limit)
+    from swarm.tools.paths import workspace_root
+
+    root = Path(workspace_root()).resolve()
+    out: list[str] = []
+    try:
+        for m in root.rglob(base):
+            if m.is_file():
+                out.append(m.relative_to(root).as_posix())
+                if len(out) >= limit:
+                    break
+    except Exception:
+        return []
+    return out
+
+
+def _is_not_found_err(exc: Exception) -> bool:
+    """异常是否表示【文件不存在】(而非网络/解码等瞬时错误)。"""
+    s = str(exc).lower()
+    return any(
+        k in s for k in (
+            "not a file or empty", "does not exist", "no such file",
+            "文件不存在", "filenotfounderror", "read failed:",
+        )
+    ) or isinstance(exc, FileNotFoundError)
+
+
+def _handle_read_miss(
+    path: str, start_line: int, end_line: int, exc: Exception
+) -> str:
+    """治本读取失败兜底（解决跨子任务文件同步空转）：
+
+    ① 裸文件名（无目录段，小模型常给类名当路径）→ 按 basename 在树中定位：
+       唯一命中且在 scope 内 → 重读并提示完整路径；多命中 → 列候选；
+    ② 文件确实不存在（producer 未落地）→ 给【止转】信号，劝模型勿反复重读；
+    ③ 其它（瞬时错误）→ 沿用原始错误。
+    """
+    norm = (path or "").strip().replace("\\", "/")
+    base = Path(norm).name
+    is_bare = base and "/" not in norm.strip("/")
+
+    not_found = _is_not_found_err(exc)
+    matches: list[str] = []
+    if base and (is_bare or not_found):
+        matches = _find_by_basename(base)
+    in_scope = [m for m in matches if not require_readable(m)]
+
+    if len(in_scope) == 1 and in_scope[0] != norm:
+        target = in_scope[0]
+        try:
+            text = _read_text_any(target)
+            lines = text.splitlines(keepends=True)
+            numbered = _format_numbered_lines(lines, start_line, end_line)
+            head = (
+                f"ℹ️ 已按文件名定位到完整路径 `{target}`"
+                f"（你给的是 `{path}`，下次请直接用完整路径）：\n"
+            )
+            return head + (numbered or "(空文件)")
+        except Exception:
+            pass  # 定位到却读不动 → 落到下方通用处理
+
+    if len(in_scope) > 1:
+        cands = ", ".join(in_scope[:10])
+        return (
+            f"⚠️ 文件名 `{base}` 在工程中有多个同名文件：[{cands}]。"
+            f"请用其中的完整路径重新 read_file（勿只给裸文件名）。"
+        )
+
+    if not_found:
+        if matches:  # 存在但都不在可读 scope 内
+            return (
+                f"⛔ 文件 `{base}` 存在但不在你的可读范围内：[{', '.join(matches[:10])}]。"
+            )
+        return (
+            f"❌ 文件 `{base}` 在工程中尚不存在（很可能由其它子任务负责生成、当前尚未落地）。"
+            f"请勿反复重读同一文件——按现有可读上下文继续你的实现，对它的引用留待集成期解决。"
+        )
+
+    return f"❌ 沙箱读取失败：{exc}"
+
+
 @tool
 def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
     """读取文件内容。需要文件在可读范围内。
@@ -157,11 +283,13 @@ def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
             numbered = _format_numbered_lines(lines, start_line, end_line)
             return numbered or "(空文件)"
         except Exception as e:
-            return f"❌ 沙箱读取失败：{e}"
+            return _handle_read_miss(path, start_line, end_line, e)
 
     resolved = _resolve(path)
     if not resolved.exists():
-        return f"❌ 文件不存在：{resolved}"
+        return _handle_read_miss(
+            path, start_line, end_line, FileNotFoundError(f"文件不存在：{resolved}")
+        )
 
     try:
         lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
