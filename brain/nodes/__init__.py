@@ -2737,9 +2737,27 @@ def merge(state: BrainState) -> dict:
         next_rebase = {sid: rebase_counts.get(sid, 0) + 1 for sid in result.rebase_subtask_ids}
         over_limit = [sid for sid, n in next_rebase.items() if n > max_rebase]
         if over_limit:
-            # rebase 已达上限仍冲突 → 升级人工，不再无限重生成
+            # 杠杆B(交付韧性·止血，round9 治本)：rebase 达上限但【整体合并干净】(无硬冲突、merged_diff
+            # 有效)时，不该把"全子任务过/0 冲突"的近完整产物整体判 FAILED。result.merged_diff 已是 base
+            # 写者版本(超限的下游【聚合清单】加性变更——如多写者向根 pom 各加不同 <module>/<dependency>
+            # ——未并入)；接受它继续走 VERIFY_L2→交付(PARTIAL 质量)。聚合清单成员完整性由交付前 post-pass
+            # reconcile(integration_review/learn_success 的 reconcile_workspace_manifests)据 ground-truth
+            # 兜底补回(如缺失的 <module> 注册)。仅当存在【真硬冲突】时才升级人工 fail-fast(原行为)。
+            # round9 实测：35 子任务/失败 0/冲突 0/360KB 干净合并，仅因 st-30 根 pom rebase 超限被误判
+            # FAILED——本支挽回。
+            if not result.conflicts and result.merged_diff.strip():
+                logger.warning(
+                    "[MERGE] rebase 达上限(%d) 但整体合并干净(冲突=0) → 接受 base 版干净合并继续交付，"
+                    "超限聚合清单加性变更交 post-pass reconcile 据 ground-truth 兜底，不整体判 FAILED: %s",
+                    max_rebase, over_limit,
+                )
+                out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
+                out["merge_rebase_dropped"] = over_limit
+                # rebase_subtask_ids 维持 [](上方默认)、不设 failure_escalated → after_merge 路由 VERIFY_L2
+                return out
+            # rebase 已达上限【且有真硬冲突】→ 升级人工，不再无限重生成
             logger.warning(
-                "[MERGE] 子任务 rebase 达上限(%d)，升级人工: %s", max_rebase, over_limit,
+                "[MERGE] 子任务 rebase 达上限(%d)且存在硬冲突，升级人工: %s", max_rebase, over_limit,
             )
             out["failure_escalated"] = True
             out["failure_strategy"] = "escalate"

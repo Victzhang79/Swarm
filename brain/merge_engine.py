@@ -430,8 +430,29 @@ def _collect_pure_insertions(
     return inserts
 
 
-def merge_insert_only_changes(base: str, *branches: str) -> str | None:
-    """When every branch only inserts lines relative to base, combine all inserts."""
+def _is_aggregate_manifest(file_path: str) -> bool:
+    """聚合清单文件(成员/依赖显式列表)——多写者向同一锚点加不同条目应并集而非冲突。
+    与 worker.workspace_manifest 覆盖的生态一致：Maven/Gradle/Cargo/Go/.NET。"""
+    base = file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return (
+        base == "pom.xml"
+        or base in ("settings.gradle", "settings.gradle.kts")
+        or base == "cargo.toml"
+        or base == "go.work"
+        or base.endswith(".sln")
+    )
+
+
+def merge_insert_only_changes(
+    base: str, *branches: str, allow_anchor_union: bool = False
+) -> str | None:
+    """When every branch only inserts lines relative to base, combine all inserts.
+
+    ``allow_anchor_union``（杠杆A·round9 治本）：聚合清单文件(pom <modules>/<dependencies>、
+    settings.gradle include、Cargo members …)里【多写者向同一锚点各插入不同条目】(各加不同
+    <module>/<dependency>)是 order-independent 且都该保留——对它们做【并集】(去重相同块、拼接
+    不同块)而非拒绝当冲突。仅对聚合清单开启；普通代码仍保守拒绝(同锚点不同插入=真冲突)。
+    """
     base_lines = _split_lines(base)
     grouped: dict[int, list[list[str]]] = {}
 
@@ -452,13 +473,21 @@ def merge_insert_only_changes(base: str, *branches: str) -> str | None:
     # 各 chunk 顺序拼接(AAA 后接 BBB)，等于无声吞掉冲突；且同一内容会被重复插两遍(XXX XXX)。
     # 现：同锚点若插入内容不一致 → 返回 None，交给上层 3-way / 硬冲突路径处理；
     #     若完全一致 → 去重只留一份。不同锚点彼此独立、照常合并。
+    # 杠杆A 例外：聚合清单文件(allow_anchor_union)同锚点不同插入 → 并集保留(去重相同块)。
     deduped: dict[int, list[str]] = {}
     for pos, chunks in grouped.items():
         first = chunks[0]
-        for other in chunks[1:]:
-            if other != first:
-                return None  # 同锚点冲突插入，拒绝当 clean
-        deduped[pos] = first  # 同内容去重，只保留一份
+        if all(other == first for other in chunks[1:]):
+            deduped[pos] = first  # 同内容去重，只保留一份
+        elif allow_anchor_union:
+            # 聚合清单同锚点不同插入：去重相同块后按出现序拼接(各 <module>/<dependency> 并存)
+            seen: list[list[str]] = []
+            for ch in chunks:
+                if ch not in seen:
+                    seen.append(ch)
+            deduped[pos] = [ln for ch in seen for ln in ch]
+        else:
+            return None  # 普通代码同锚点冲突插入，拒绝当 clean
 
     result: list[str] = []
     for idx, line in enumerate(base_lines):
@@ -514,7 +543,10 @@ def _try_three_way_resolve(
     for sid, hunks in by_subtask.items():
         versions[sid] = apply_hunks_to_text(base_raw, hunks)
 
-    combined = merge_insert_only_changes(base_raw, *versions.values())
+    combined = merge_insert_only_changes(
+        base_raw, *versions.values(),
+        allow_anchor_union=_is_aggregate_manifest(file_path),
+    )
     if combined is not None and combined != base_raw:
         diff = _lines_to_unified_diff(file_path, base_raw, combined)
         if diff:
