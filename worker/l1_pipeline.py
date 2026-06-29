@@ -1833,6 +1833,79 @@ def _maven_modules(project_path: str) -> dict[str, str]:
     return result
 
 
+def _reconcile_maven_module_registration(project_path: str, modified: list[str]) -> list[str]:
+    """治本(round8)：确保改动涉及的【内部子模块】已注册进根 pom <modules>。
+
+    根因：多模块工程里脚手架子任务在根 pom 注册了新模块(如 ruoyi-alarm)，但后续也改根 pom 的
+    子任务在各自沙箱基于 HEAD(无该注册)重写根 pom → pull-back/集成把注册【冲掉】。结果 ruoyi-admin
+    依赖 com.ruoyi:ruoyi-alarm:jar 在 reactor 里找不到 → 全 reactor `mvn compile` 确定性失败、
+    负解析被缓存；且 _scope_maven_command 因 _maven_modules 扫不到该模块而无法 -pl 收窄 → 退回全
+    reactor → 子任务"代码本是好的却确定性修不动"。本对账须在 _scope_maven_command 之前跑：注册后
+    _maven_modules 能扫到该模块，scope 改写成 `-pl <mod> -am`(只编它+上游、不带下游 ruoyi-admin)，
+    缓存的 jar-not-found 也随之绕开。确定性、模型无关、幂等。返回新注册的模块目录名列表。
+    """
+    from pathlib import Path as _P
+    import re as _re
+    root = _P(project_path)
+    root_pom = root / "pom.xml"
+    if not root_pom.is_file():
+        return []
+    try:
+        root_text = root_pom.read_text("utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        return []
+    # 必须是聚合器(有 <modules> 块)才补注册；否则不擅自改 root pom 结构
+    mblock = _re.search(r"<modules>(.*?)</modules>", root_text, _re.S)
+    if not mblock:
+        return []
+    registered = set(_re.findall(r"<module>\s*([^<\s]+)\s*</module>", mblock.group(1)))
+    # 候选：改动文件的顶层目录 + 直接子目录扫描(兜底漏网)
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _consider(d: str) -> None:
+        d = (d or "").strip().strip("/")
+        if not d or "/" in d or d in seen:
+            return
+        seen.add(d)
+        candidates.append(d)
+
+    for f in (modified or []):
+        _consider((f or "").strip().split("/", 1)[0])
+    try:
+        for child in root.iterdir():
+            if child.is_dir() and (child / "pom.xml").is_file():
+                _consider(child.name)
+    except OSError:
+        pass
+
+    added: list[str] = []
+    for d in candidates:
+        if d in registered:
+            continue
+        child_pom = root / d / "pom.xml"
+        if not child_pom.is_file():
+            continue
+        try:
+            ctext = child_pom.read_text("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        # 仅注册【本工程子模块】(声明 <parent>)；独立工程目录不碰
+        if "<parent>" not in ctext:
+            continue
+        added.append(d)
+        registered.add(d)
+    if not added:
+        return []
+    insert = "".join(f"        <module>{d}</module>\n" for d in added)
+    new_text = root_text.replace("</modules>", insert + "    </modules>", 1)
+    try:
+        root_pom.write_text(new_text, encoding="utf-8")
+    except OSError:
+        return []
+    return added
+
+
 def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
     """多模块 Maven：把整 reactor 的 mvn 命令改写成只编【改动所在模块】(-pl <mod> -am)。
 
@@ -2005,6 +2078,18 @@ def run_l1_pipeline(
         if build_cmd:
             details["build_command_derived"] = build_cmd
     if build_cmd:
+        # 治本(round8)：先把改动涉及的内部子模块补注册进根 pom <modules>(对账被跨子任务冲掉的
+        # 注册)，再 scope——否则 _maven_modules 扫不到该模块、无法 -pl 收窄，退回全 reactor 必死。
+        try:
+            _reg = _reconcile_maven_module_registration(project_path, modified)
+            if _reg:
+                logger.info(
+                    "[L1.2.1·module-reg] 补注册内部子模块进根 pom <modules>: %s"
+                    "（修复 reactor 缺模块/缓存负解析致的确定性 FAIL）", _reg,
+                )
+                details["module_registration_added"] = _reg
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
