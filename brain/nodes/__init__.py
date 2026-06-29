@@ -868,6 +868,30 @@ async def plan(state: BrainState) -> dict:
     }
 
 
+_COMPLETENESS_MISSING_MARKERS = (
+    "缺失", "缺核心", "缺少", "未覆盖", "missing", "incomplete",
+)
+# 描述质量类问题（截断/措辞/指引不全）——绝不触发徒劳全量重拆：根因在 ELABORATE 拆分逻辑，
+# 重拆后仍会再截断；ultra 项目全量重拆=11 模块 TECH_DESIGN/CONTRACT/PLAN-BATCH 重跑，成本极高。
+_COMPLETENESS_DESC_QUALITY_MARKERS = (
+    "截断", "描述", "指引", "措辞", "模糊", "不清", "表述", "truncat", "description", "wording",
+)
+
+
+def _filter_completeness_missing(llm_issues: list) -> list:
+    """从 LLM 计划校验 issues 中筛出【缺功能子任务】(结构完整性缺陷,该触发补齐重规划)。
+
+    治本(ELABORATE 截断 → P6b 误判重拆)：命中 missing 关键词但同时带【描述质量】标记的 issue
+    （如"描述截断…缺少完整实现指引"）按描述质量放过——它不是少了功能子任务，顶多本地补描述，
+    绝不该触发徒劳的全量重拆。只有【真缺功能/缺文件/缺表 DDL】才进补齐。
+    """
+    return [
+        s for s in (llm_issues or [])
+        if any(k in str(s) for k in _COMPLETENESS_MISSING_MARKERS)
+        and not any(k in str(s) for k in _COMPLETENESS_DESC_QUALITY_MARKERS)
+    ]
+
+
 async def validate_plan(state: BrainState) -> dict:
     """VALIDATE_PLAN 节点 — PlanValidator 硬校验 + 可选 LLM 补充
 
@@ -964,10 +988,7 @@ async def validate_plan(state: BrainState) -> dict:
         ).lower() not in ("false", "0", "no")
         _completeness_budget = int(os.environ.get("SWARM_PLAN_COMPLETENESS_RETRIES", "1") or "1")
         if _completeness_on and llm_valid and llm_issues and retry_count < _completeness_budget:
-            _missing = [
-                s for s in llm_issues
-                if any(k in str(s) for k in ("缺失", "缺核心", "缺少", "未覆盖", "missing", "incomplete"))
-            ]
+            _missing = _filter_completeness_missing(llm_issues)
             if _missing:
                 llm_valid = False
                 logger.warning(

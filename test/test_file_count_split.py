@@ -176,6 +176,27 @@ def test_writables_go_to_last_batch():
         assert "pom.xml" not in (c.scope.writable or [])
 
 
+# ── 治本(ELABORATE 截断 → P6b 误判重拆)：子块描述自洽,非裸 stub ──
+def test_split_child_description_is_self_contained():
+    """文件拆分的子块描述必须含父任务【完整实现指引】+ 清晰分批语义,不再是 300 字裸 stub。"""
+    long_desc = "实现预警任务管理：" + "包含任务创建、调度、状态机流转、通知联动等完整业务逻辑。" * 12
+    st = SubTask(
+        id="st-20", description=long_desc, difficulty=SubTaskDifficulty.COMPLEX,
+        scope=FileScope(create_files=_entity_files("AlarmTask") + _entity_files("AlarmTaskChannel")),
+        depends_on=["st-1"],
+    )
+    children = _split_oversized_by_files(st)
+    assert len(children) >= 2
+    for c in children:
+        d = c.description
+        # 父描述全文保留(不再截到 300 字 stub)
+        assert "状态机流转" in d, f"{c.id} 丢了父任务实现指引: {d[:120]}"
+        # 自洽分批语义齐全
+        assert "第" in d and "批" in d, f"{c.id} 缺分批标识"
+        assert "共享契约" in d and "其余文件由兄弟子任务" in d, f"{c.id} 缺跨批协作说明"
+        assert len(d) > 300, f"{c.id} 描述仍像被截断的 stub: {len(d)} 字"
+
+
 # ── 触发器：单文件守卫不误伤 ──
 def test_single_file_guard_still_holds():
     st = SubTask(id="st-1", description="改一个大文件",
