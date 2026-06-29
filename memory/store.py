@@ -385,6 +385,17 @@ class MemoryStore:
         vectors = await self._embed_fn([embed_text])
         embedding = entry.embedding or vectors[0]
 
+        # 零向量占位(embedding 服务不可用且调用方未显式给向量)→ 跳过写入。
+        # 对齐查询侧(query_mistakes:433 零向量直接返回空)：写入占位行只会污染
+        # 相似度检索(ORDER BY embedding <=> 零向量 → 随机错题排序)，且服务恢复后这些行
+        # 仍是零向量永远检索不到。tag-and-write 留垃圾，不如不写。
+        if _is_zero_vector(embedding) and entry.embedding is None:
+            logger.warning(
+                "[MEM] write_mistake 跳过：embedding 为零向量占位(服务不可用)，不写入避免污染检索；error_type=%s",
+                entry.error_type,
+            )
+            return -1
+
         # 检测零向量占位 → 在 metadata 中打标记便于排查
         metadata = dict(entry.metadata) if entry.metadata else {}
         if _is_zero_vector(embedding):
@@ -463,7 +474,7 @@ class MemoryStore:
                            {eff} AS effective_weight
                     FROM mem_mistakes
                     WHERE project_id = %s {type_filter}
-                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
+                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed', 'merged')
                 ) sub
                 WHERE effective_weight > %s
                 ORDER BY GREATEST(similarity, 0) * (%s + (1.0 - %s)
@@ -556,6 +567,14 @@ class MemoryStore:
         vectors = await self._embed_fn([embed_text])
         vector = entry.embedding or vectors[0]
 
+        # 零向量占位 → 跳过写入(理由同 write_mistake：避免污染检索/留永久不可检索的垃圾行)。
+        if _is_zero_vector(vector) and entry.embedding is None:
+            logger.warning(
+                "[MEM] write_success 跳过：embedding 为零向量占位(服务不可用)，不写入避免污染检索；pattern=%s",
+                entry.pattern_name,
+            )
+            return -1
+
         # 检测零向量占位 → 在 metadata 中打标记
         metadata = dict(entry.metadata) if entry.metadata else {}
         if _is_zero_vector(vector):
@@ -626,7 +645,7 @@ class MemoryStore:
                            {eff} AS effective_weight
                     FROM mem_successes
                     WHERE project_id = %s
-                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed')
+                      AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed', 'merged')
                 ) sub
                 WHERE effective_weight > %s
                 ORDER BY GREATEST(similarity, 0) * (%s + (1.0 - %s)

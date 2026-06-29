@@ -77,12 +77,27 @@ def test_confirm_reason_text_distinguishes():
     print("  ✅ confirm: reason 按进入原因区分（P2-2 文案修正）")
 
 
+def test_confirm_tech_design_generation_failed_failfast():
+    """#22：tech_design 整体生成失败(LLM 异常,file_plan 为空) + auto_accept → fail-fast，不放行。
+
+    即便 plan_valid=True（兜底空计划可能被判合法），整体设计失败也绝不能静默 auto_accept。
+    """
+    out = nodes.confirm_plan({
+        "auto_accept": True, "plan_valid": True, "plan": _plan(),
+        "complexity": Complexity.ULTRA, "task_id": "t1",
+        "tech_design_generation_failed": True,
+    })
+    assert out["human_decision"] == HumanDecision.REJECT, out
+    print("  ✅ confirm: tech_design 整体生成失败 → fail-fast，不静默放行（#22 闸门）")
+
+
 if __name__ == "__main__":
     tests = [
         test_confirm_valid_plan_auto_accepts,
         test_confirm_invalid_plan_auto_failfast,
         test_confirm_invalid_plan_interrupts_for_human,
         test_confirm_reason_text_distinguishes,
+        test_confirm_tech_design_generation_failed_failfast,
     ]
     passed = failed = 0
     for t in tests:

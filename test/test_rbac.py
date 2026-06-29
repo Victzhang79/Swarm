@@ -57,8 +57,12 @@ def test_user_can_on_project_logic():
         "project:delete",
         "proj",
     )
-    # 无成员的旧项目：登录 developer 可访问（legacy 兼容）
-    assert user_can_on_project(owner, "project:read", "legacy_no_members_proj")
+    # #24：无成员的旧项目【fail-closed 拒绝】非 admin（原 legacy fail-open=跨项目 IDOR）。
+    # legacy 项目须经 backfill_legacy_project_members() 回填或显式 set_project_member 后才可访问。
+    assert not user_can_on_project(owner, "project:read", "legacy_no_members_proj")
+    # 但 admin 仍全程可访问（顶部短路，不受影响）。
+    assert user_can_on_project(SwarmUser("a", "admin", "A", "admin"),
+                               "project:read", "legacy_no_members_proj")
     # 有成员但未加入时不可访问
     other = create_user(username=f"other_{uuid.uuid4().hex[:6]}", password="x")
     blocked_pid = f"blocked_{uuid.uuid4().hex[:8]}"

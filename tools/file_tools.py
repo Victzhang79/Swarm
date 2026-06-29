@@ -51,6 +51,24 @@ def _resolve_write(path: str) -> Path:
     return resolved
 
 
+def _resolve_read(path: str) -> Path:
+    """#7：读路径的边界复校（镜像 _resolve_write）。require_readable 用原始字符串校验 scope，
+    但 _resolve 跟随 symlink/`..` 后可指向 workspace 外的任意文件（如 symlink → /etc/passwd）。
+    本地读分支落盘前补一道 relative_to(root) 复校，杜绝 symlink 穿越读取。
+    """
+    from swarm.tools.paths import workspace_root
+
+    resolved = _resolve(path)
+    root = Path(workspace_root()).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceEscapeError(
+            f"路径越出 workspace 边界，拒绝读取: {path!r} → {resolved}"
+        ) from exc
+    return resolved
+
+
 def _local_rel(path: str) -> str:
     """将路径转为 workspace 相对 posix 路径。"""
     p = Path(path)
@@ -285,7 +303,10 @@ def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
         except Exception as e:
             return _handle_read_miss(path, start_line, end_line, e)
 
-    resolved = _resolve(path)
+    try:
+        resolved = _resolve_read(path)
+    except WorkspaceEscapeError as exc:
+        return f"❌ 拒绝读取（越出 workspace 边界）：{exc}"
     if not resolved.exists():
         return _handle_read_miss(
             path, start_line, end_line, FileNotFoundError(f"文件不存在：{resolved}")

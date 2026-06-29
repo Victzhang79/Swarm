@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 _PUBLIC_PREFIXES = (
     "/api/health",
-    "/api/status",
+    # #21：/api/status 暴露 8 个组件(含 PostgreSQL/Qdrant/远程沙箱)健康拓扑给匿名调用方=基建信息泄露。
+    # 移出公开前缀 → 走鉴权(前端轮询本就持 token)。存活探针只留 /api/health(无组件细节)。
     "/api/auth/login",
     "/static",
     "/docs",

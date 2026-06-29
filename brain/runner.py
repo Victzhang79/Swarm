@@ -791,6 +791,22 @@ async def resume_task(
     _task_running.add(task_id)
     _set_workspace(task["project_id"])
 
+    # 与 run_task 一致：resume 也要持同项目模块锁，否则两个 resume / resume+run_task
+    # 并发改同一项目工作树会互相踩（无串行化）。
+    from swarm.infra.redis_client import ModuleLock, TaskQueue
+
+    _resume_project_id = task.get("project_id", "")
+    TaskQueue.enqueue(task_id, _resume_project_id)
+    module_lock = ModuleLock(_resume_project_id, "default")
+    if not module_lock.acquire():
+        await _emit(queue, {
+            "step": "error",
+            "status": "error",
+            "message": "同项目模块锁被占用，请稍后重试",
+        })
+        _task_running.discard(task_id)
+        return
+
     decision_norm = decision.lower().strip()
     if decision_norm in ("approved", "approve", "accept"):
         decision_norm = HumanDecision.ACCEPT.value
@@ -815,11 +831,12 @@ async def resume_task(
             "mode": "brain",
             "progress": 50,
         })
-        state, snapshot, _lock = await _stream_brain_events(
+        state, snapshot, module_lock = await _stream_brain_events(
             task_id,
             Command(resume=resume_payload),
             queue,
-            project_id=task.get("project_id", ""),
+            project_id=_resume_project_id,
+            module_lock=module_lock,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except Exception as exc:
@@ -833,6 +850,7 @@ async def resume_task(
             "progress": -1,
         })
     finally:
+        module_lock.release()
         _task_running.discard(task_id)
 
 
@@ -859,17 +877,34 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
 
     _task_running.add(task_id)
     _set_workspace(task["project_id"])
+
+    # 与 run_task / resume_task 一致：持同项目模块锁串行化工作树访问。
+    from swarm.infra.redis_client import ModuleLock, TaskQueue
+
+    _resume_project_id = task.get("project_id", "")
+    TaskQueue.enqueue(task_id, _resume_project_id)
+    module_lock = ModuleLock(_resume_project_id, "default")
+    if not module_lock.acquire():
+        await _emit(queue, {
+            "step": "error",
+            "status": "error",
+            "message": "同项目模块锁被占用，请稍后重试",
+        })
+        _task_running.discard(task_id)
+        return
+
     store.update_task(task_id, status="ANALYZING")
     try:
         await _emit(queue, {
             "step": "resume", "status": "running",
             "message": "恢复规划（澄清/方案评审已提交）", "mode": "brain", "progress": 30,
         })
-        state, snapshot, _lock = await _stream_brain_events(
+        state, snapshot, module_lock = await _stream_brain_events(
             task_id,
             Command(resume=payload),
             queue,
-            project_id=task.get("project_id", ""),
+            project_id=_resume_project_id,
+            module_lock=module_lock,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except Exception as exc:  # noqa: BLE001
@@ -878,6 +913,7 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:
+        module_lock.release()
         _task_running.discard(task_id)
 
 
@@ -925,7 +961,9 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
     if is_task_orphaned(task_id):
         return True, ""
 
-    if status in ("FAILED", "CANCELLED", "DONE"):
+    # PARTIAL（部分交付：部分子任务放弃/保 build 桩）也允许重跑——
+    # 否则一旦进入部分交付终态就永久卡死，无法对放弃的子任务再尝试。
+    if status in ("FAILED", "CANCELLED", "DONE", "PARTIAL"):
         return True, ""
 
     if status in _ACTIVE_DB_STATUSES:

@@ -446,8 +446,10 @@ class WorkerExecutor:
         self._sandbox_manager: Any | None = None
         self._sandbox_pool: Any | None = None
         self._from_pool: bool = False
-        # 沙箱归还热池时据此决定 reusable（L1 通过/无异常才复用，脏沙箱不回池）
-        self._l1_passed_flag: bool = True
+        # 沙箱归还热池时据此决定 reusable（L1 通过/无异常才复用，脏沙箱不回池）。
+        # fail-closed 初始化为 False：仅在正常完成(1069)/trivial 快速路径(2228)显式置真才复用；
+        # 任何 early-return（超时/异常路径未走到赋值点）保持 False → 脏沙箱不回池，避免污染下一子任务。
+        self._l1_passed_flag: bool = False
         # diff 基线/产出快照（difflib 生成 diff 用）。沙箱模式由 _sync_to/from_sandbox 填充，
         # 本地模式由 _snapshot_scope_local 填充。__init__ 初始化避免本地模式下属性缺失。
         self._pre_sync_contents: dict[str, str | None] = {}

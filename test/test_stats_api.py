@@ -161,6 +161,9 @@ def test_notifications_archive():
     with patch("swarm.api.app.store") as mock_store:
         mock_store.archive_notification.return_value = True
         mock_store.archive_all_notifications.return_value = 5
+        # #19：archive 前先查通知归属项目并鉴权。无项目归属(全局通知) + 测试默认 rbac 关闭→
+        # 匿名 admin 放行。返回 (exists=True, project_id=None)。
+        mock_store.get_notification_project_id.return_value = (True, None)
         client = TestClient(app)
         resp = client.post("/api/notifications/42/archive")
         assert resp.status_code == 200, resp.text

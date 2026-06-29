@@ -701,6 +701,9 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
     secret_key = _os.environ.get("SWARM_SECRET_KEY", "").strip()
     insecure_secret = not secret_key
     insecure_password = cfg.bootstrap_admin_password == _DEFAULT_BOOTSTRAP_ADMIN_PASSWORD
+    # #8：生产禁用 RBAC = 所有请求按匿名 admin 放行（api/auth.py 的 rbac_enabled=False 分支），
+    # 等于全站无鉴权。生产模式必须强制开启。
+    insecure_rbac = not cfg.rbac_enabled
 
     if not cfg.is_production():
         # 开发模式不拦截，但提醒弱配置
@@ -711,6 +714,10 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
         if insecure_password:
             _logger.warning(
                 "bootstrap_admin_password 仍为默认值（开发模式放行）；生产部署前必须改为非默认强密码。"
+            )
+        if insecure_rbac:
+            _logger.warning(
+                "rbac_enabled=False（开发模式放行）；生产部署前必须开启 RBAC，否则全站匿名 admin 放行。"
             )
         return
 
@@ -725,6 +732,11 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
         problems.append(
             'bootstrap_admin_password 仍为公开默认值 "swarm"：任何人都可登录 admin。'
             "请设置环境变量 SWARM_BOOTSTRAP_ADMIN_PASSWORD 为非默认强密码。"
+        )
+    if insecure_rbac:
+        problems.append(
+            "rbac_enabled=False：生产环境禁用 RBAC 会让所有请求按匿名 admin 放行（全站无鉴权）。"
+            "请开启 RBAC（移除 SWARM_RBAC_ENABLED=false 或设为 true）。"
         )
     if problems:
         raise RuntimeError(

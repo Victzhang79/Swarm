@@ -561,8 +561,16 @@ def user_can_on_project(user: SwarmUser, permission: str, project_id: str | None
             logger.warning("member count unavailable for %s, fail-closed deny: %s", project_id, exc)
             return False
         if member_count == 0:
-            # RBAC 之前创建的项目：无成员记录时保持登录用户可访问（向后兼容，非错误路径）
-            return can(user.global_role, permission)
+            # #24/IDOR：零成员（legacy）项目【不能】fail-open。原逻辑"无成员记录→按全局角色放行"
+            # 等于任何登录的非 admin（如全局 developer）可访问所有未 backfill 的项目（横向越权）。
+            # 治本=fail-closed：非 admin 一律拒绝（admin 已在 550 短路）。legacy 项目须由
+            # backfill_legacy_project_members() 回填成员 或 显式 set_project_member 授权后才可访问。
+            logger.warning(
+                "project %s has zero members → fail-closed deny for non-admin %s；"
+                "run backfill_legacy_project_members() or add explicit member",
+                project_id, user.id,
+            )
+            return False
         member_role = get_project_member_role(project_id, user.id)
         if member_role is None:
             return False

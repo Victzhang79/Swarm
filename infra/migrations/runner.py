@@ -122,7 +122,10 @@ def run_migrations(conn_str: str | None = None) -> None:
                     with conn.cursor() as cur:
                         _stamp(cur, _BASELINE_VERSION, "baseline")
             else:
-                # 全新库 → 跑基线 DDL 后盖章（同一事务保证原子）
+                # 全新库 → 先跑基线 DDL，再单独盖章。
+                # 注意：DDL 与盖章【不在同一事务】（_apply_baseline_ddl 自带连接/事务，
+                # 此处 transaction 仅包住 _stamp）。靠 DDL 幂等(IF NOT EXISTS)+盖章幂等保证
+                # 中途崩溃后重跑可自愈，而非原子性。
                 logger.info("[migrations] 全新库 → 运行 baseline DDL 后盖章 v%d", _BASELINE_VERSION)
                 _apply_baseline_ddl()
                 with conn.transaction():

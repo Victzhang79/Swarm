@@ -100,6 +100,25 @@ def _validate_project(project_id: str) -> None:
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
+
+def _accessible_project_ids_or_none(user, project_id: str | None, request) -> "set[str] | None":
+    """#19 通知/项目级资源的 IDOR 防护辅助。
+
+    - 指定了 project_id：要求调用方对该项目有 project:read（无权 → 403）；返回 None
+      （单项目已由 SQL 的 project_id= 约束，无需再传白名单）。
+    - 未指定 project_id：global admin 返回 None（全量可见）；其余用户返回其可访问项目 id 集合，
+      调用方据此把查询限定在白名单内（防跨项目读取/计数/归档）。
+    """
+    from swarm.auth.rbac import Role
+    if project_id:
+        from swarm.api._shared import _require_perm
+        _require_perm(request, "project:read", project_id)
+        return None
+    if getattr(user, "global_role", None) == Role.ADMIN.value:
+        return None
+    from swarm.auth.store import list_user_project_ids
+    return set(list_user_project_ids(user.id))
+
 # LangSmith 在 on_startup 中初始化（需在 _configure_app_logging 之后，才能写入 swarm.log）
 
 # 项目根目录（本仓库根 = swarm 包目录）
@@ -1216,8 +1235,11 @@ async def get_notifications(
     limit: int = 50,
 ):
     """应用内通知列表（持久化、可归档）。默认只返回未归档。"""
-    from swarm.api._shared import _require_user
-    _require_user(request)  # A-P1-27：通知含任务/项目信息，需鉴权
+    from swarm.api._shared import _require_perm, _require_user
+    user = _require_user(request)  # A-P1-27：通知含任务/项目信息，需鉴权
+    # #19：防跨项目 IDOR。指定 project_id → 必须有该项目 project:read；未指定 → 限定到
+    # 用户可访问项目集（admin 不受限，project_ids=None 表示全量）。
+    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)
     loop = asyncio.get_running_loop()
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
@@ -1225,13 +1247,14 @@ async def get_notifications(
         None,
         lambda: store.list_notifications(
             project_id=project_id,
+            project_ids=_scope_ids,
             include_archived=include_archived,
             limit=min(limit, 200),
         ),
     )
     unread = await loop.run_in_executor(
         None,
-        lambda: store.count_unread_notifications(project_id=project_id),
+        lambda: store.count_unread_notifications(project_id=project_id, project_ids=_scope_ids),
     )
     return {"notifications": notifications, "unread_count": unread}
 
@@ -1240,11 +1263,12 @@ async def get_notifications(
 async def get_unread_count(request: Request, project_id: str | None = None):
     """未归档通知数（铃铛绿点轮询用，轻量）。"""
     from swarm.api._shared import _require_user
-    _require_user(request)  # A-P1-27
+    user = _require_user(request)  # A-P1-27
+    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)  # #19
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,
-        lambda: store.count_unread_notifications(project_id=project_id),
+        lambda: store.count_unread_notifications(project_id=project_id, project_ids=_scope_ids),
     )
     return {"unread_count": count}
 
@@ -1252,9 +1276,21 @@ async def get_unread_count(request: Request, project_id: str | None = None):
 @app.post("/api/notifications/{notification_id}/archive", tags=["系统"])
 async def archive_notification_endpoint(notification_id: int, request: Request):
     """归档单条通知。"""
-    from swarm.api._shared import _require_user
-    _require_user(request)  # A-P1-27
+    from swarm.api._shared import _require_perm, _require_user
+    from swarm.auth.rbac import Role
+    user = _require_user(request)  # A-P1-27
     loop = asyncio.get_running_loop()
+    # #19：先查该通知归属项目并鉴权（project:read），杜绝凭 id 越权归档他人/他项目通知。
+    exists, notif_pid = await loop.run_in_executor(
+        None, lambda: store.get_notification_project_id(notification_id)
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    if notif_pid:
+        _require_perm(request, "project:read", notif_pid)
+    elif getattr(user, "global_role", None) != Role.ADMIN.value:
+        # 无项目归属的全局通知：仅 admin 可归档（非 admin 无从主张归属）。
+        raise HTTPException(status_code=403, detail="Permission denied")
     ok = await loop.run_in_executor(
         None,
         lambda: store.archive_notification(notification_id),
@@ -1266,11 +1302,12 @@ async def archive_notification_endpoint(notification_id: int, request: Request):
 async def archive_all_notifications_endpoint(request: Request, project_id: str | None = None):
     """归档全部未读通知（可选按项目过滤）。"""
     from swarm.api._shared import _require_user
-    _require_user(request)  # A-P1-27
+    user = _require_user(request)  # A-P1-27
+    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)  # #19
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,
-        lambda: store.archive_all_notifications(project_id=project_id),
+        lambda: store.archive_all_notifications(project_id=project_id, project_ids=_scope_ids),
     )
     return {"status": "ok", "archived_count": count}
 

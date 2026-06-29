@@ -189,7 +189,15 @@ async def list_users_api(request: Request):
 
 @router.post("/api/users", tags=["认证"])
 async def create_user_api(request: Request, req: CreateUserRequest):
-    _require_perm(request, "config:write")
+    caller = _require_perm(request, "config:write")
+    # 防提权：铸造特权角色（admin/owner）要求调用方本身是全局 admin。
+    # 否则仅有 config:write 的 OWNER 可凭空造出全局 admin（越权升级）。
+    if str(req.global_role).lower() in ("admin", "owner") and \
+            str(getattr(caller, "global_role", "")).lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only a global admin may create admin/owner users",
+        )
     from swarm.auth.store import create_user
 
     loop = asyncio.get_running_loop()

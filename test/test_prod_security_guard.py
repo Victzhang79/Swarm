@@ -17,8 +17,9 @@ import pytest
 from swarm.config.settings import AppConfig, validate_production_security
 
 
-def _cfg(env: str, password: str) -> AppConfig:
-    return AppConfig(env=env, bootstrap_admin_password=password)
+def _cfg(env: str, password: str, rbac_enabled: bool = True) -> AppConfig:
+    # rbac_enabled 默认 True（properly-configured 基线）；#8 起生产禁用 RBAC 也会 fail-closed。
+    return AppConfig(env=env, bootstrap_admin_password=password, rbac_enabled=rbac_enabled)
 
 
 def test_prod_no_secret_key_raises(monkeypatch):
@@ -42,6 +43,15 @@ def test_prod_both_set_properly_ok(monkeypatch):
     cfg = _cfg("production", "a-strong-non-default-password")
     # 不应抛出
     validate_production_security(cfg)
+
+
+def test_prod_rbac_disabled_raises(monkeypatch):
+    """#8：生产模式禁用 RBAC（全站匿名 admin 放行）→ fail-closed raise。"""
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    cfg = _cfg("production", "a-strong-non-default-password", rbac_enabled=False)
+    with pytest.raises(RuntimeError) as ei:
+        validate_production_security(cfg)
+    assert "rbac_enabled" in str(ei.value).lower() or "RBAC" in str(ei.value)
 
 
 def test_prod_blank_secret_key_treated_as_unset(monkeypatch):

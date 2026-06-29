@@ -102,12 +102,13 @@ def test_is_task_orphaned_no_task():
 
 def test_can_retry_terminal_states():
     _reset_runner_state()
-    for status in ("FAILED", "CANCELLED", "DONE"):
+    # PARTIAL（部分交付终态）也必须可重跑——否则放弃的子任务永久卡死无法再试。
+    for status in ("FAILED", "CANCELLED", "DONE", "PARTIAL"):
         with patch.object(runner.store, "get_task", return_value={"status": status}):
             ok, reason = runner.can_retry_task("t")
             assert ok is True, f"{status} 应可重跑"
             assert reason == ""
-    print("  ✅ can_retry_task 终态(FAILED/CANCELLED/DONE)可重跑")
+    print("  ✅ can_retry_task 终态(FAILED/CANCELLED/DONE/PARTIAL)可重跑")
 
 
 def test_can_retry_running_rejected():

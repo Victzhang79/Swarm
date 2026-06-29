@@ -39,9 +39,17 @@ def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
             "（Worker 必失败），不得静默 auto_accept，须人工介入"
         )
 
-    if not state.get("plan_valid", True):
+    if state.get("tech_design_generation_failed"):
+        return False, (
+            "tech_design_generation_failed: 技术方案整体生成失败（LLM 异常），"
+            "file_plan 为空、方案为占位，不得静默 auto_accept，须人工介入"
+        )
+
+    # #6：纵深防御——plan_valid 缺省判 False（validate 节点正常总会显式置位；缺失=未经校验，
+    # 保守拒绝放行，不假定合法）。
+    if not state.get("plan_valid", False):
         issues = state.get("plan_validation_issues") or []
-        reason = "; ".join(issues) if issues else "计划自动校验未通过"
+        reason = "; ".join(issues) if issues else "计划自动校验未通过/未执行"
         return False, f"plan_invalid: {reason}"
 
     failed_modules = state.get("tech_design_failed_modules") or []

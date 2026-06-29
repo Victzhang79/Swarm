@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from collections.abc import Iterable
 from typing import Any
 
 import psycopg
@@ -1121,11 +1122,16 @@ def create_notification(
 def list_notifications(
     *,
     project_id: str | None = None,
+    project_ids: "Iterable[str] | None" = None,
     include_archived: bool = False,
     limit: int = 50,
     conn_str: str | None = None,
 ) -> list[dict[str, Any]]:
-    """列出通知，默认只返回未归档，按时间倒序。"""
+    """列出通知，默认只返回未归档，按时间倒序。
+
+    #19：project_ids（可访问项目白名单）用于非 admin 调用方未指定单一 project_id 时，
+    把结果限定在用户有权访问的项目内（防跨项目 IDOR 读取）。空集合→不返回任何记录。
+    """
     conditions: list[str] = []
     params: list[Any] = []
     if not include_archived:
@@ -1133,6 +1139,12 @@ def list_notifications(
     if project_id:
         conditions.append("project_id = %s")
         params.append(project_id)
+    elif project_ids is not None:
+        _ids = list(project_ids)
+        if not _ids:
+            return []
+        conditions.append("project_id = ANY(%s)")
+        params.append(_ids)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     params.append(limit)
     with _get_conn(conn_str) as conn:
@@ -1155,14 +1167,21 @@ def list_notifications(
 def count_unread_notifications(
     *,
     project_id: str | None = None,
+    project_ids: "Iterable[str] | None" = None,
     conn_str: str | None = None,
 ) -> int:
-    """未归档通知数（铃铛绿点用）。"""
+    """未归档通知数（铃铛绿点用）。project_ids 见 list_notifications（#19 防跨项目计数泄露）。"""
     conditions = ["archived = FALSE"]
     params: list[Any] = []
     if project_id:
         conditions.append("project_id = %s")
         params.append(project_id)
+    elif project_ids is not None:
+        _ids = list(project_ids)
+        if not _ids:
+            return 0
+        conditions.append("project_id = ANY(%s)")
+        params.append(_ids)
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1171,6 +1190,23 @@ def count_unread_notifications(
             )
             row = cur.fetchone()
     return int(row[0]) if row else 0
+
+
+def get_notification_project_id(
+    notification_id: int,
+    conn_str: str | None = None,
+) -> tuple[bool, str | None]:
+    """#19：取单条通知的 project_id（供 archive 鉴权用）。返回 (存在?, project_id)。"""
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id FROM notifications WHERE id = %s",
+                (notification_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return False, None
+    return True, row[0]
 
 
 def archive_notification(
@@ -1190,14 +1226,21 @@ def archive_notification(
 def archive_all_notifications(
     *,
     project_id: str | None = None,
+    project_ids: "Iterable[str] | None" = None,
     conn_str: str | None = None,
 ) -> int:
-    """归档全部（可选按项目过滤），返回归档条数。"""
+    """归档全部（可选按项目过滤），返回归档条数。project_ids 见 list_notifications（#19）。"""
     conditions = ["archived = FALSE"]
     params: list[Any] = []
     if project_id:
         conditions.append("project_id = %s")
         params.append(project_id)
+    elif project_ids is not None:
+        _ids = list(project_ids)
+        if not _ids:
+            return 0
+        conditions.append("project_id = ANY(%s)")
+        params.append(_ids)
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(

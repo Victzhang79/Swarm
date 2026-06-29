@@ -52,7 +52,8 @@ async def verify_l2(state: BrainState) -> dict:
         if subtask_results:
             l2_passed = l2_passed and all(
                 (isinstance(o, WorkerOutput) and o.l1_passed)
-                or (isinstance(o, dict) and o.get("l1_passed", True))
+                # #5：dict 结果缺 l1_passed 时保守判 False（默认 True 会把"未验证"当通过）。
+                or (isinstance(o, dict) and o.get("l1_passed", False))
                 for o in subtask_results.values()
             )
         logger.info("[VERIFY_L2] SIMPLE 快速路径 — diff+L1 检查: %s", "通过" if l2_passed else "未通过")

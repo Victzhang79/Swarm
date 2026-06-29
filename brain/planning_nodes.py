@@ -1302,11 +1302,18 @@ async def tech_design(state: BrainState) -> dict:
             "detail": "磁盘核验：该文件在项目中不存在",
             "suggestion": f"近似候选：{fc['candidates']}" if fc["candidates"] else "无近似文件",
         } for fc in det_false]
+        # W1.2：tech_design 整体 LLM 失败 → file_plan 为空、方案为占位。绝不能让 auto_accept
+        # 把这种"无设计"的降级计划静默放行当成功。打 fail-fast 标记 + degraded_reasons，
+        # 供 gates.can_auto_accept_plan 拦下升级人工审核。
+        _reason = f"tech_design 整体生成失败（LLM 异常 {type(exc).__name__}），方案/file_plan 为空，须人工介入"
+        logger.error("[TECH_DESIGN] %s", _reason)
         return {
             "tech_design": {"architecture": "（自动生成失败，降级直接规划）", "risks": [], "notes": []},
             "shared_contract_draft": {},
             "tech_design_fact_issues": det_issues,
             "tech_design_file_plan": [],
+            "tech_design_generation_failed": True,
+            "degraded_reasons": list(state.get("degraded_reasons") or []) + [_reason],
         }
 
 
@@ -1722,15 +1729,22 @@ async def contract_design(state: BrainState) -> dict:
     _results.sort(key=lambda r: r["idx"])
     slices = [r["slice"] for r in _results if not r["error"]]
     failed = [r["name"] for r in _results if r["error"]]
+    _degraded: list[str] = list(state.get("degraded_reasons") or [])
     if failed:
         logger.error(
             "[CONTRACT_MODULE] ⚠ %d/%d 模块契约片产出失败 %s——合并将缺这些模块的接口/依赖，"
             "下游缺依赖编译失败靠定向恢复兜底",
             len(failed), mod_total, failed,
         )
+        # #22：契约片缺失透传人工可见（非硬闸——契约仅辅助，worker BLOCKED 退避+定向恢复兜底），
+        # 让交付/通知能看到"共享契约不完整"。
+        _degraded.append(
+            f"共享契约 {len(failed)}/{mod_total} 模块契约片生成失败 {failed}"
+            "——这些模块的接口/依赖未进契约，下游靠定向恢复兜底"
+        )
     if not slices:
         logger.warning("[CONTRACT_DESIGN] 全部模块契约片失败，降级沿用 tech_design draft")
-        return {}
+        return {"degraded_reasons": _degraded} if failed else {}
 
     # ── Stage C：确定性合并（0 LLM）──
     merged = _merge_module_contracts(skeleton, slices)
@@ -1744,7 +1758,10 @@ async def contract_design(state: BrainState) -> dict:
         logger.warning(
             "[CONTRACT_MERGE] 契约未含 dependencies——Rule5 将空转，缺依赖编译失败只能靠定向恢复兜底",
         )
-    return {"shared_contract_draft": merged or state.get("shared_contract_draft") or {}}
+    _out_contract: dict = {"shared_contract_draft": merged or state.get("shared_contract_draft") or {}}
+    if failed:
+        _out_contract["degraded_reasons"] = _degraded
+    return _out_contract
 
 
 # ══════════════════════════════════════════════

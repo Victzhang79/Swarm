@@ -242,15 +242,9 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
 
     await websocket.accept()
 
-    # 校验任务是否存在
-    loop = asyncio.get_running_loop()
-    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        await websocket.send_json({"event": "error", "data": {"detail": f"Task {task_id} not found"}})
-        await websocket.close()
-        return
-
-    # P0-SEC-NEW：WS 独立鉴权（中间件不覆盖 WS scope）+ 跨项目越权防护（task:read 授权）。
+    # #20：鉴权必须【先于】任务存在性查询，否则未鉴权调用方可凭 not-found vs 继续 区分出
+    # 哪些 task_id 真实存在（枚举预言机）。先验 token；再取任务；最后把"不存在"与"无权限"
+    # 收敛成同一条通用 close，避免泄露任务是否存在。
     from swarm.api.auth import authenticate_ws
     from swarm.auth.store import user_can_on_project
 
@@ -259,8 +253,12 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         await websocket.send_json({"event": "error", "data": {"detail": "Unauthorized: missing/invalid token"}})
         await websocket.close(code=1008)
         return
-    if not user_can_on_project(user, "task:read", task.get("project_id")):
-        await websocket.send_json({"event": "error", "data": {"detail": "Permission denied: task:read"}})
+
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    # 不存在 OR 无 task:read 权限 → 统一通用拒绝（不区分，防任务存在性枚举）。
+    if not task or not user_can_on_project(user, "task:read", task.get("project_id")):
+        await websocket.send_json({"event": "error", "data": {"detail": "Not found or access denied"}})
         await websocket.close(code=1008)
         return
 
