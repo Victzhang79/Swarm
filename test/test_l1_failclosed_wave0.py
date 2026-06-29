@@ -143,6 +143,112 @@ def test_build_manifest_missing_is_blocked():
     print("  ✅ 期望构建但清单缺失 → BLOCKED")
 
 
+# ── 根因#③：确定性 repair 幂等收敛循环（吃下编译器错误掩蔽的级联 typo）──
+# 旧实现【单发单重跑】只纠第一层可见 typo，rerun 暴露的下一批级联 typo 漏到慢 LLM
+# 循环 → 模型反复写回 → 撞 900s 超时 → FAILED（996db614 实证 531 只纠 17）。
+# 治本：修→重跑→再修，直到通过或零新增。下列三测钉死收敛/早停/有界三性质。
+
+def _patch_repair_loop(l1, *, run_seq, repair_seq):
+    """monkeypatch _run_l1_command(返回序列) + _attempt_build_repair(返回序列) + 闸门可用。"""
+    orig_run = l1._run_l1_command
+    orig_app = l1._build_cmd_applicable
+    orig_rep = l1._attempt_build_repair
+    rc = {"build": 0, "repair": 0}
+
+    def fake_run(cmd, pp, timeout=120):
+        i = rc["build"]; rc["build"] += 1
+        return run_seq[min(i, len(run_seq) - 1)]
+
+    def fake_repair(pp, out, mods, timeout, stack=None):
+        i = rc["repair"]; rc["repair"] += 1
+        return repair_seq[min(i, len(repair_seq) - 1)]
+
+    l1._run_l1_command = fake_run
+    l1._build_cmd_applicable = lambda cmd, pp: True
+    l1._attempt_build_repair = fake_repair
+
+    def restore():
+        l1._run_l1_command = orig_run
+        l1._build_cmd_applicable = orig_app
+        l1._attempt_build_repair = orig_rep
+    return rc, restore
+
+
+def test_build_repair_loop_absorbs_cascade():
+    """级联收敛：构建前 3 次失败（每次暴露下一层 typo），repair 每轮纠 1 文件，
+    第 4 次构建通过 → L1 PASS。证明【不再单发单重跑】，整条级联当场吃完。"""
+    import swarm.worker.l1_pipeline as l1
+    from swarm.types import TaskHarness
+
+    FAIL = (1, "main.go:3:5: cannot find symbol: undefined: isEmtpy")
+    OK = (0, "")
+    # 初始构建(call0)失败 + 3 次重跑(call1,2)失败 + 第4次(call3)通过
+    rc, restore = _patch_repair_loop(
+        l1, run_seq=[FAIL, FAIL, FAIL, OK],
+        repair_seq=[(1, ["f1.go"]), (1, ["f2.go"]), (1, ["f3.go"])],
+    )
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            st = _subtask(["main.go"], TaskHarness(language="go", build_command="go build ./..."))
+            ok, details = l1.run_l1_pipeline(d, st, _go_diff(), timeout=30)
+            assert ok is True, f"级联应被收敛吃完 → PASS, details={details}"
+            assert rc["repair"] == 3, f"应跑 3 轮收敛 repair，实际 {rc['repair']}"
+            assert rc["build"] == 4, f"初始1+重跑3=4 次构建，实际 {rc['build']}"
+            assert details.get("import_repaired_files") == 3
+            assert details.get("repaired_file_paths") == ["f1.go", "f2.go", "f3.go"]
+            assert "build_failed" not in details
+    finally:
+        restore()
+    print("  ✅ 级联 typo → 多轮确定性收敛 → PASS（不再单发漏级联）")
+
+
+def test_build_repair_loop_stops_on_no_progress():
+    """零进展早停：repair 立刻返回 0（修不动）→ 不空转重跑，构建仍失败 → FAIL。"""
+    import swarm.worker.l1_pipeline as l1
+    from swarm.types import TaskHarness
+
+    FAIL = (1, "main.go:3:5: cannot find symbol: undefined: HttpServletException")
+    rc, restore = _patch_repair_loop(l1, run_seq=[FAIL], repair_seq=[(0, [])])
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            st = _subtask(["main.go"], TaskHarness(language="go", build_command="go build ./..."))
+            ok, details = l1.run_l1_pipeline(d, st, _go_diff(), timeout=30)
+            assert ok is False, f"修不动应 FAIL, details={details}"
+            assert rc["repair"] == 1, "零进展应在第 1 轮就 break"
+            assert rc["build"] == 1, "零进展不应触发任何重跑构建"
+            assert details.get("build_failed")
+            assert "import_repaired_files" not in details
+    finally:
+        restore()
+    print("  ✅ repair 零进展 → 立即停（不空转）→ FAIL")
+
+
+def test_build_repair_loop_bounded():
+    """有界不死循环：repair 每轮都报修了文件但构建始终不过 → 至多 N 轮后停（默认 4）。"""
+    import os
+    import swarm.worker.l1_pipeline as l1
+    from swarm.types import TaskHarness
+
+    FAIL = (1, "main.go:3:5: cannot find symbol")
+    rc, restore = _patch_repair_loop(l1, run_seq=[FAIL], repair_seq=[(1, ["x.go"])])
+    old = os.environ.get("SWARM_WORKER_BUILD_REPAIR_ROUNDS")
+    os.environ["SWARM_WORKER_BUILD_REPAIR_ROUNDS"] = "4"
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            st = _subtask(["main.go"], TaskHarness(language="go", build_command="go build ./..."))
+            ok, details = l1.run_l1_pipeline(d, st, _go_diff(), timeout=30)
+            assert ok is False, "始终修不动应 FAIL"
+            assert rc["repair"] == 4, f"应至多 4 轮，实际 {rc['repair']}（死循环风险！）"
+            assert details.get("build_failed")
+    finally:
+        if old is None:
+            os.environ.pop("SWARM_WORKER_BUILD_REPAIR_ROUNDS", None)
+        else:
+            os.environ["SWARM_WORKER_BUILD_REPAIR_ROUNDS"] = old
+        restore()
+    print("  ✅ 始终修不动 → 有界 4 轮后停（非死循环）→ FAIL")
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

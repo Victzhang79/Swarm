@@ -136,6 +136,107 @@ def format_symbol_hints(hints: list[SymbolHint]) -> str:
     return "\n".join(lines)
 
 
+# ── P5：臆造【方法】接地（symbol-repair 的近邻纠错接不住——无项目近邻；codegraph 也跳过 method）──
+# 治本(996db614 实测 18×900s 主因之一)：模型在【真实存在的类】上调用【不存在的方法】
+# （如 java.util.Base64.Encoder.encodeToByte，真方法 encodeToString/encode）→ javac
+# `cannot find symbol: method X / location: class C`。worker 拿到原始错只会再臆造一个方法 →
+# fix-loop 烧满 900s。gap 在【worker 不知道类 C 的真实方法集】。解法：沙箱内 javap C 取真实
+# 方法，告诉模型"C 真实方法有 [...]，X 不存在，从中选"。纯解析为纯函数(易测)，javap 执行由
+# 调用方(executor，持沙箱)薄包一层。
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_METHOD_SYM_RE = re.compile(r"symbol:\s*method\s+([A-Za-z_]\w*)\s*\(")
+_LOC_CLASS_RE = re.compile(r"location:\s*(?:class|interface)\s+([\w.$]+)")
+_LOC_VAR_RE = re.compile(r"location:\s*variable\s+\w+\s+of\s+type\s+([\w.$]+)")
+
+
+def parse_missing_methods(build_output: str) -> list[tuple[str, str]]:
+    """从编译输出抽 `cannot find symbol: method X / location: class C`（或 variable of type T）→
+    [(method_name, owner_class_fqn)]，去重保序。纯函数。"""
+    if not build_output:
+        return []
+    lines = _ANSI_RE.sub("", build_output).split("\n")
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for i, line in enumerate(lines):
+        ms = _METHOD_SYM_RE.search(line)
+        if not ms:
+            continue
+        method = ms.group(1)
+        klass = None
+        for j in range(i + 1, min(i + 3, len(lines))):
+            cm = _LOC_CLASS_RE.search(lines[j])
+            if cm:
+                klass = cm.group(1)
+                break
+            vm = _LOC_VAR_RE.search(lines[j])
+            if vm:
+                klass = vm.group(1)
+                break
+        if klass and (method, klass) not in seen:
+            seen.add((method, klass))
+            out.append((method, klass))
+    return out
+
+
+def to_javap_class_name(fqn: str) -> str:
+    """`java.util.Base64.Encoder`(javac 点分嵌套) → `java.util.Base64$Encoder`(javap 二进制名)。
+
+    包段(小写首字母)保留点；首个类段(大写首)之后的段用 $ 连接（内部类）。"""
+    parts = fqn.split(".")
+    out: list[str] = []
+    in_class = False
+    for p in parts:
+        if not p:
+            continue
+        if not in_class and p[:1].isupper():
+            in_class = True
+            out.append(p)
+        elif in_class:
+            out[-1] = out[-1] + "$" + p
+        else:
+            out.append(p)
+    return ".".join(out)
+
+
+_JAVAP_METHOD_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+_JAVAP_NOISE = frozenset({"class", "interface", "enum", "if", "for", "while", "switch", "catch"})
+
+
+def parse_javap_methods(javap_output: str) -> list[str]:
+    """从 javap 输出抽公有方法名（去重保序）。纯函数。"""
+    if not javap_output:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in javap_output.split("\n"):
+        if "(" not in line:
+            continue
+        m = _JAVAP_METHOD_RE.search(line)
+        if m:
+            name = m.group(1)
+            if name not in seen and name not in _JAVAP_NOISE:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def build_method_grounding(probed: list[tuple[str, str, list[str]]]) -> str:
+    """组装方法接地提示。probed: [(臆造方法, 类, 该类真实方法集)]。无可用返回空串。纯函数。"""
+    blocks = []
+    for method, klass, real in probed:
+        if not real:
+            continue
+        shown = ", ".join(real[:30])
+        blocks.append(
+            f"  - 类 `{klass}` 没有方法 `{method}`（你臆造了它）。其真实方法有: [{shown}]。"
+            f"从中选语义最接近的真实方法，勿再臆造。"
+        )
+    if not blocks:
+        return ""
+    return "【方法接地提示】你在真实存在的类上调用了不存在的方法（javap 实证）：\n" + "\n".join(blocks)
+
+
 async def resolve_and_format(
     build_output: str,
     project_id: str,

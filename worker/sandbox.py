@@ -319,6 +319,12 @@ class SandboxUnhealthyError(RuntimeError):
     """
 
 
+# ── CubeMaster 真实模板清单缓存（治本：随服务器实际模板解析，杜绝死配漂移 ID）──
+# 进程级 TTL 缓存：多 worker 并发 create 不必每次都打 /templates。
+_SERVER_TEMPLATES_CACHE: dict[str, Any] = {"ts": 0.0, "items": None}
+_SERVER_TEMPLATES_TTL = 60.0  # 秒
+
+
 class SandboxManager:
     """
     管理远程 CubeSandbox 生命周期
@@ -343,6 +349,86 @@ class SandboxManager:
         self._sandbox_activity: dict[str, deque[dict[str, Any]]] = {}
         self._setup_env()
         self._init_sidecar()
+
+    def _fetch_server_templates(self, force: bool = False) -> list[dict]:
+        """查 CubeMaster 实际可用模板（GET {api_url}/templates）。进程级 TTL 缓存避免每 worker 打。
+
+        返回 [{"id","status","imageInfo"}]；任何失败返回上次缓存或 []（调用方据空判定沿用原配置、
+        绝不阻断 create）。"""
+        now = time.monotonic()
+        cached = _SERVER_TEMPLATES_CACHE
+        if not force and cached["items"] is not None and (now - cached["ts"]) < _SERVER_TEMPLATES_TTL:
+            return cached["items"]
+        api_url = (getattr(self.config, "api_url", "") or "").rstrip("/")
+        if not api_url:
+            return cached["items"] or []
+        try:
+            import httpx
+
+            headers = {}
+            key = getattr(self.config, "api_key", "") or ""
+            if key:
+                headers["X-API-KEY"] = key
+            verify = bool(getattr(self.config, "verify_ssl", True))
+            resp = httpx.get(f"{api_url}/templates", headers=headers, timeout=5.0, verify=verify)
+            if resp.status_code != 200:
+                logger.warning("[template] 查 /templates 非 200(%s)，沿用上次缓存", resp.status_code)
+                return cached["items"] or []
+            raw = resp.json()
+            items = [
+                {
+                    "id": t.get("templateID") or t.get("templateId") or t.get("id"),
+                    "status": t.get("status"),
+                    "imageInfo": t.get("imageInfo", "") or "",
+                }
+                for t in raw if isinstance(t, dict)
+            ]
+            items = [t for t in items if t["id"]]
+            cached["items"] = items
+            cached["ts"] = now
+            return items
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[template] 查 /templates 失败(%s)，沿用上次缓存/原配置", e)
+            return cached["items"] or []
+
+    def _resolve_template(self, template: str | None, project_id: str | None) -> str:
+        """治本：按 CubeMaster 实际可用模板解析 template，配置漂移时自愈兜底。
+
+        背景（2026-06-29 实证）：服务器只剩 3 个 READY 模板，而 .env/DB/默认全配的是早已被
+        回收的 ID（tpl-8fa882… 等）→ 每次 create 都 `130404 template not found` → worker 静默
+        “降级本地执行”绕过沙箱隔离、WebUI 点创建直接失败。死配模板 ID 本质脆弱，治本=随服务器
+        真实清单解析。优先级：
+          ① 配置值在服务器 READY 集 → 直接用（尊重显式配置）；
+          ② 否则在 READY 集挑【项目匹配】镜像（imageInfo 含 sandbox-proj-<project_id 前缀>，
+             CubeMaster 按项目烤的专属镜像）；
+          ③ 再否则挑任一 READY；
+          ④ 拿不到服务器清单（网络等）→ 沿用配置值，不擅改（失败按原行为如实暴露）。"""
+        configured = template or self.config.default_template
+        servers = self._fetch_server_templates()
+        if not servers:
+            return configured  # 拿不到清单 → 不擅改，沿用配置
+        ready = [t for t in servers if (t.get("status") or "").upper() == "READY"]
+        ready_ids = {t["id"] for t in ready}
+        if configured and configured in ready_ids:
+            return configured
+        pick = None
+        if project_id:
+            prefix = str(project_id)[:8]
+            pick = next(
+                (t["id"] for t in ready if f"sandbox-proj-{prefix}" in (t.get("imageInfo") or "")),
+                None,
+            )
+        if not pick and ready:
+            pick = ready[0]["id"]
+        if pick:
+            logger.warning(
+                "[template] 配置模板 %s 不在 CubeMaster 可用集 %s → 自愈选用 %s（治本：随服务器真实"
+                "模板，杜绝死配漂移 ID 致 create 必炸/静默降级本地）",
+                configured, sorted(ready_ids), pick,
+            )
+            return pick
+        logger.error("[template] CubeMaster 无任何 READY 模板，沿用配置 %s（create 可能失败）", configured)
+        return configured
 
     def register_sandbox_meta(
         self,
@@ -538,7 +624,9 @@ class SandboxManager:
                 timeout = max(int(_gc().worker.max_execution_time), 120)
             except Exception:
                 timeout = 600
-        template = template_id or self.config.default_template
+        # 治本：随 CubeMaster 真实可用模板解析（配置漂移自愈兜底），杜绝死配不存在的模板 ID
+        # 致 create 必炸 130404 / 静默降级本地（2026-06-29 实证根因）。
+        template = self._resolve_template(template_id, project_id)
         t0 = time.monotonic()
         logger.info("Creating sandbox with template=%s project=%s timeout=%ss", template, project_id, timeout)
 

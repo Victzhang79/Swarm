@@ -128,9 +128,20 @@ _SCOPE_WRITABLE_WARN_THRESHOLD = 20
 # ══════════════════════════════════════════════
 
 def _get_brain_llm():
-    """获取 Brain LLM 实例"""
+    """获取 Brain LLM 实例。
+
+    P2（可选 JSON mode，SWARM_BRAIN_JSON_MODE=true 开启，默认关）：provider 支持时让模型直接产
+    合法 JSON，减少 brain 输出脏逗号触发 json_repair。默认关——provider 若不支持 response_format
+    会拒整个调用（毁掉所有 brain 调用），故待确认端点支持再开；`_parse_json_from_llm` 的 json_repair
+    仍是恒在兜底（关着安全、开了无损）。绑定失败优雅回退不绑。"""
     router = ModelRouter()
-    return router.get_brain_llm()
+    llm = router.get_brain_llm()
+    if os.environ.get("SWARM_BRAIN_JSON_MODE", "false").lower() in ("true", "1", "yes"):
+        try:
+            return llm.bind(response_format={"type": "json_object"})
+        except Exception:  # noqa: BLE001
+            return llm
+    return llm
 
 
 
@@ -430,6 +441,10 @@ async def _plan_ultra_batched(
     # read-timeout 不管总时长 → PLAN 单批挂死整个任务(实测挂 16min)。超时按已有 except 分支降级跳过。
     import asyncio as _asyncio
     _PLAN_BATCH_TIMEOUT = 300.0  # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
+    # P6a（治本，996db614 实测 2/9 模块批分解失败→那俩模块零子任务永不构建→交付残缺）：批分解
+    # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 GLM-5.2 瞬时 timeout，1 次
+    # 重试大概率恢复（镜像骨架/Stage B 成熟模式）。耗尽才计 failed_batches。env 可调。
+    _PLAN_BATCH_MAX_ATTEMPTS = int(os.environ.get("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "2") or "2")
     batch_results: list[list[dict]] = []
     failed_batches = 0
     # 各模块批【独立分解】(生成时无跨批依赖，跨批串行依赖在 merge 阶段才加)→ 并发执行。
@@ -462,28 +477,40 @@ async def _plan_ultra_batched(
             tech_design_extra=tech_design_extra,
         )
         async with _plan_sem:
-            _t0 = _time.monotonic()
-            try:
-                response = await _asyncio.wait_for(
-                    llm.ainvoke([
-                        {"role": "system", "content": PLAN_BATCH_SYSTEM},
-                        {"role": "user", "content": prompt_user},
-                    ]),
-                    timeout=_PLAN_BATCH_TIMEOUT,
-                )
-                _dt = _time.monotonic() - _t0
-                result = _parse_json_from_llm(response.content)
-                subs = result.get("subtasks", []) if isinstance(result, dict) else []
-                for _st in subs:
-                    if isinstance(_st, dict):
-                        for _opt in ("harness", "contract"):
-                            if _opt in _st and _st[_opt] is None:
-                                _st.pop(_opt)
-                return ("ok", i, mod_name, subs, _dt, len(batch))
-            except _asyncio.TimeoutError:
-                return ("timeout", i, mod_name, None, None, len(batch))
-            except Exception as exc:  # noqa: BLE001
-                return ("error", i, mod_name, exc, None, len(batch))
+            # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
+            last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
+            for _attempt in range(1, _PLAN_BATCH_MAX_ATTEMPTS + 1):
+                _t0 = _time.monotonic()
+                try:
+                    response = await _asyncio.wait_for(
+                        llm.ainvoke([
+                            {"role": "system", "content": PLAN_BATCH_SYSTEM},
+                            {"role": "user", "content": prompt_user},
+                        ]),
+                        timeout=_PLAN_BATCH_TIMEOUT,
+                    )
+                    _dt = _time.monotonic() - _t0
+                    result = _parse_json_from_llm(response.content)
+                    subs = result.get("subtasks", []) if isinstance(result, dict) else []
+                    for _st in subs:
+                        if isinstance(_st, dict):
+                            for _opt in ("harness", "contract"):
+                                if _opt in _st and _st[_opt] is None:
+                                    _st.pop(_opt)
+                    if subs:
+                        return ("ok", i, mod_name, subs, _dt, len(batch))
+                    last_fail = ("ok", i, mod_name, [], _dt, len(batch))  # 空 → 可重试
+                except _asyncio.TimeoutError:
+                    last_fail = ("timeout", i, mod_name, None, None, len(batch))
+                except Exception as exc:  # noqa: BLE001
+                    last_fail = ("error", i, mod_name, exc, None, len(batch))
+                if _attempt < _PLAN_BATCH_MAX_ATTEMPTS:
+                    logger.warning(
+                        "[PLAN-BATCH] 模块'%s' 第 %d/%d 次分解失败(%s)，退避重试",
+                        mod_name, _attempt, _PLAN_BATCH_MAX_ATTEMPTS, last_fail[0],
+                    )
+                    await _asyncio.sleep(min(2.0 * _attempt, 8.0))
+            return last_fail
 
     # gather 按输入顺序返回 → 保持 module_batches(模块依赖序)的批次顺序
     _outcomes = await _asyncio.gather(*[
@@ -528,6 +555,47 @@ async def _plan_ultra_batched(
     return TaskPlan(subtasks=[SubTask(**st) for st in merged])
 
 
+def _subtask_signature(st) -> tuple:
+    """子任务签名（id+描述+写权 scope）——replan 前后【完全一致】才可复用旧完成态。"""
+    sc = getattr(st, "scope", None)
+    writable = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
+    creates = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
+    return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
+
+
+def _surgical_replan_reset(old_results: dict, old_plan, new_plan) -> dict:
+    """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
+
+    新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
+    （dispatch 据 completed_ids 自动跳过、不重跑）；新增/变更/失败 的清空重派。premature victory 由
+    "签名完全一致才保留"杜绝（旧 id 语义变=签名变→不保留→重派）。无旧完成态→空 reset（首规划）。"""
+    if not old_results:
+        return {}
+    old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
+    new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
+
+    def _passed(out) -> bool:
+        if isinstance(out, WorkerOutput):
+            return bool(out.l1_passed)
+        if isinstance(out, dict):
+            return bool(out.get("l1_passed"))
+        return False
+
+    preserved = {
+        sid: out for sid, out in old_results.items()
+        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and _passed(out)
+    }
+    logger.info(
+        "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber",
+        len(preserved), len(old_results),
+    )
+    return {
+        "subtask_results": preserved,
+        "dispatch_remaining": [],
+        "failed_subtask_ids": [],
+    }
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -552,18 +620,11 @@ async def plan(state: BrainState) -> dict:
     # 不可信（新 plan 可能复用旧子任务 id 但语义已变，旧"成功"结果会让新子任务被误判已完成
     # 而跳过执行 = premature victory）。replan 语义 = 一切重来，确定性清空完成态 + 派发队列，
     # 让新 plan 的所有子任务都重新派发。完成态只由 dispatch 基于真实 WorkerOutput 重新写。
-    _replan_reset: dict = {}
-    if state.get("subtask_results"):
-        logger.info(
-            "[PLAN] 检测到 replan 重入（已有 %d 个旧完成态）→ 清空完成态事实表，"
-            "防 premature victory（新 plan 子任务全部重新派发）",
-            len(state.get("subtask_results") or {}),
-        )
-        _replan_reset = {
-            "subtask_results": {},
-            "dispatch_remaining": [],
-            "failed_subtask_ids": [],
-        }
+    # R1b：replan 重入时改【按签名外科手术式保留】完成态（见 _surgical_replan_reset），不再无条件
+    # clobber 全部（旧行为把 34 个已完成全清空从头重跑=996db614 主失控）。新 plan 在各路径构建后，
+    # 于 return 处用 _surgical_replan_reset(旧结果, 旧plan, 新plan) 算保留集。此处仅捕获旧态（将被覆盖）。
+    _replan_old_results = state.get("subtask_results") or {}
+    _replan_old_plan = state.get("plan")
 
     logger.info(f"[PLAN] 拆解任务 (复杂度={complexity.value})")
 
@@ -589,7 +650,7 @@ async def plan(state: BrainState) -> dict:
         return {
             "plan": task_plan,
             "shared_contract": task_plan.shared_contract or {},
-            **_replan_reset,
+            **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
             **plan_touch,
         }
 
@@ -802,7 +863,7 @@ async def plan(state: BrainState) -> dict:
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
         "plan_generation_failed": _plan_degraded is not None,
-        **_replan_reset,
+        **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
         **plan_touch,
     }
 
@@ -893,6 +954,25 @@ async def validate_plan(state: BrainState) -> dict:
                 logger.info(
                     "[VALIDATE_PLAN] LLM 软建议（不阻断）：valid=false, issues=%s",
                     llm_issues or "(未给出具体问题)",
+                )
+        # P6b（治本，996db614 实测 VALIDATE_PLAN 报"缺核心功能子任务"却软放行→交付缺核心引擎）：
+        # 「缺子任务/未覆盖核心功能」是【结构完整性】缺陷（非主观顾虑），区别于一般软建议——
+        # 在【小预算】内触发一次重规划补齐（与 P6a plan-batch 重试组合：重规划时失败模块批被重试恢复），
+        # 耗尽预算才放行（不无限阻断自动流）。env SWARM_VALIDATE_PLAN_COMPLETENESS_GATE=false 可关。
+        _completeness_on = os.environ.get(
+            "SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", "true"
+        ).lower() not in ("false", "0", "no")
+        _completeness_budget = int(os.environ.get("SWARM_PLAN_COMPLETENESS_RETRIES", "1") or "1")
+        if _completeness_on and llm_valid and llm_issues and retry_count < _completeness_budget:
+            _missing = [
+                s for s in llm_issues
+                if any(k in str(s) for k in ("缺失", "缺核心", "缺少", "未覆盖", "missing", "incomplete"))
+            ]
+            if _missing:
+                llm_valid = False
+                logger.warning(
+                    "[VALIDATE_PLAN] 检出【缺核心功能子任务】(结构完整性缺陷,非软建议)→触发重规划"
+                    "补齐(完整性重试 %d/%d): %s", retry_count + 1, _completeness_budget, _missing,
                 )
     except json.JSONDecodeError as e:
         logger.warning(f"[VALIDATE_PLAN] LLM JSON 解析失败，结构已通过则放行: {e}")
@@ -1635,6 +1715,319 @@ def _subtask_out_l1_passed(out) -> bool:
     return False
 
 
+async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | None:
+    """卡死子任务恢复阶梯·阶梯二：把【多文件】卡死子任务【定点拆小】（复用 _resplit_subtask），
+    保留成功兄弟、只重派拆出的小块。每子任务最多 1 次。
+
+    工程依据：本地小模型卡在一个子任务，最常见是【子任务太大】（一个子任务又建 entity 又写
+    service 又拼 controller，7 个文件）→ 拆小真有用。单/双文件拆不动 → 返回 None 交阶梯三。
+    复用 elaborate 同款 plan 变异：换节点 + _remap_dependents 把下游 depends_on 重映射到子链尾。"""
+    plan_obj = state.get("plan")
+    if plan_obj is None:
+        return None
+    st = next((s for s in getattr(plan_obj, "subtasks", []) if s.id == failed_id), None)
+    if st is None:
+        return None
+    rd_counts = dict(state.get("subtask_redecompose_count", {}))
+    if rd_counts.get(failed_id, 0) >= 1:
+        return None  # 已拆过一次 → 不再拆（防无限拆）
+    sc = getattr(st, "scope", None)
+    n_files = len(getattr(sc, "writable", []) or []) + len(getattr(sc, "create_files", []) or [])
+    if n_files <= 2:
+        return None  # 单/双文件拆不动 → 交阶梯三
+    try:
+        from swarm.brain.planning_nodes import (
+            _context_budget,
+            _oversized_by_files,
+            _rebuild_plan,
+            _remap_dependents,
+            _resplit_subtask,
+            _split_oversized_by_files,
+        )
+        budget = _context_budget()
+        children = (
+            _split_oversized_by_files(st) if _oversized_by_files(st)
+            else await _resplit_subtask(st, state, budget)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[HANDLE_FAILURE] 阶梯二 定点拆小异常(跳过): %s", exc)
+        return None
+    if not children or len(children) <= 1:
+        return None  # 拆不动 → 交阶梯三
+    new_subtasks = list(plan_obj.subtasks)
+    idx = next((i for i, x in enumerate(new_subtasks) if x.id == failed_id), None)
+    if idx is None:
+        return None
+    new_subtasks[idx:idx + 1] = children
+    _remap_dependents(new_subtasks, failed_id, children[-1].id)
+    new_plan = _rebuild_plan(plan_obj, new_subtasks)
+    subtask_results = dict(state.get("subtask_results", {}))
+    subtask_results.pop(failed_id, None)
+    dispatch_remaining = list(state.get("dispatch_remaining", []))
+    for c in children:
+        if c.id not in dispatch_remaining:
+            dispatch_remaining.append(c.id)
+    rd_counts[failed_id] = rd_counts.get(failed_id, 0) + 1
+    logger.info(
+        "[HANDLE_FAILURE] 阶梯二：卡死子任务 %s 定点拆小为 %d 块 %s，保留成功兄弟、只重派小块（不全盘）",
+        failed_id, len(children), [c.id for c in children],
+    )
+    return {
+        "plan": new_plan,
+        "subtask_results": subtask_results,
+        "dispatch_remaining": dispatch_remaining,
+        "failed_subtask_ids": [],
+        "failure_strategy": "retry",
+        "subtask_redecompose_count": rd_counts,
+    }
+
+
+def _subtask_footprint(st) -> list[str]:
+    """子任务在【本地树】可能留下的文件足迹（writable ∪ create_files），归一为相对 posix 路径。"""
+    sc = getattr(st, "scope", None)
+    files = list(getattr(sc, "writable", []) or []) + list(getattr(sc, "create_files", []) or [])
+    out: list[str] = []
+    for f in files:
+        rel = str(f).strip().lstrip("/")
+        if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _local_tree_revert_subtask(project_path: str | None, st) -> dict:
+    """卡死子任务恢复阶梯·阶梯三(revert)：把子任务在【本地树】的足迹清干净。
+
+    必要性（第六轮 + L2 源码实证）：worker 的坏文件经 pull-back 已写回本地 project_path
+    （新建文件为 untracked）。L2 `run_integration_review` 的 `_reset_worktree_to_head` 只
+    reset【merged_diff 内】的文件——放弃子任务空 diff 被 merge 排除 → 其坏 untracked 文件
+    不在 diff 内 → 不被 reset → 仍留本地树 → `mvn compile`/下游 bootstrap 仍会带上 → `-am`
+    整 reactor 中毒。故放弃时必须【主动清本地树足迹】，build 才真能保住。
+
+    - 已被 git 跟踪的文件 → `git checkout HEAD --`（还原提交版，撤销 pull-back 脏改动）。
+    - 未跟踪（新建产物）→ 删除文件。
+    通用：纯 git/文件操作，与语言无关。返回 {"reverted":[...], "removed":[...]}。"""
+    result: dict = {"reverted": [], "removed": []}
+    if not project_path:
+        return result
+    import subprocess
+    root = Path(project_path)
+    if not (root / ".git").exists():
+        return result
+    for rel in _subtask_footprint(st):
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", rel],
+                cwd=str(root), capture_output=True, text=True, timeout=10,
+            ).returncode == 0
+        except Exception:  # noqa: BLE001
+            tracked = False
+        if tracked:
+            try:
+                subprocess.run(
+                    ["git", "checkout", "HEAD", "--", rel],
+                    cwd=str(root), capture_output=True, text=True, timeout=20,
+                )
+                result["reverted"].append(rel)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            abs_f = root / rel
+            try:
+                if abs_f.is_file():
+                    abs_f.unlink()
+                    result["removed"].append(rel)
+            except OSError:
+                pass
+    return result
+
+
+def _git_diff_for_paths(project_path: str, rel_paths: list[str]) -> str:
+    """据本地树现状为给定文件生成 unified diff（相对 HEAD）。
+
+    新建文件用 `git add -N`（intent-to-add）让 `git diff` 能产出新增内容；产出后 `git reset`
+    撤销 intent-to-add（保留工作区文件本身）。通用、与语言无关。失败返回空串。"""
+    import subprocess
+    if not rel_paths:
+        return ""
+    try:
+        subprocess.run(["git", "add", "-N", "--", *rel_paths],
+                       cwd=project_path, capture_output=True, text=True, timeout=20)
+        proc = subprocess.run(["git", "diff", "HEAD", "--", *rel_paths],
+                              cwd=project_path, capture_output=True, text=True, timeout=30)
+        subprocess.run(["git", "reset", "-q", "--", *rel_paths],
+                       cwd=project_path, capture_output=True, text=True, timeout=20)
+        return proc.stdout if proc.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _generate_compile_stub(state: BrainState, st, project_path: str | None) -> str | None:
+    """卡死子任务恢复阶梯·阶梯三(stub)：为【被依赖】的卡死子任务生成可编译桩。
+
+    聚焦 LLM 调用：据 X 的描述/契约/目标文件，生成各文件的【可编译桩】——保留 public 类型/
+    签名让下游编译通过，方法体一律抛 not-implemented（语言对应：Java
+    `throw new UnsupportedOperationException(...)`、TS `throw new Error(...)`、Go `panic(...)` 等），
+    绝不留半成品坏代码。语言无关（prompt 让模型按文件后缀产出对应语言桩）。
+
+    写入本地树后用 git 生成 diff 作为 X 的 WorkerOutput.diff（merge 纳入、L2 验证其可编译）。
+    任何环节失败（无 LLM/无 project_path/解析失败/空产出）→ 返回 None，调用方回退 revert。
+    桩可编译性的最终校验由下游 L2 全量编译兜底（桩编不过 → L2 失败 → 熔断升级，有界）。"""
+    if not project_path:
+        return None
+    footprint = _subtask_footprint(st)
+    if not footprint:
+        return None
+    # 只为【会产出代码的源文件】打桩（排除 pom/配置/资源等非代码足迹，避免乱改构建文件）。
+    _CODE_EXT = (".java", ".kt", ".go", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".cs", ".scala")
+    code_files = [f for f in footprint if f.lower().endswith(_CODE_EXT)]
+    if not code_files:
+        return None
+    try:
+        llm = _get_brain_llm()
+        contract = getattr(st, "contract", None)
+        prompt = (
+            "一个子任务多次实现失败、需被放弃，但有【下游子任务依赖它】。请为它生成"
+            "【可编译的占位桩(stub)】，使下游能编译通过，而非半成品坏代码。严格要求：\n"
+            "1. 保留每个文件应有的 public 类型/接口/方法签名（据描述与契约推断）。\n"
+            "2. 所有方法体一律只抛“未实现”异常（按文件语言：.java→"
+            "`throw new UnsupportedOperationException(\"TODO: 子任务未完成\");`；.ts/.js→"
+            "`throw new Error(\"TODO: not implemented\");`；.go→`panic(\"TODO: not implemented\")`；"
+            ".py→`raise NotImplementedError(...)`；其它语言用其惯用未实现抛错）。\n"
+            "3. 桩必须能通过编译（import/包声明/类型完整），绝不留语法错误或未解析符号。\n"
+            "4. 仅输出 JSON：{\"files\": {\"<相对路径>\": \"<完整文件内容>\"}}，不要解释。\n\n"
+            f"子任务描述：{getattr(st, 'description', '')}\n"
+            f"契约：{json.dumps(contract, ensure_ascii=False) if contract else '无'}\n"
+            f"需打桩的文件：{code_files}\n"
+        )
+        response = await llm.ainvoke([
+            {"role": "system", "content": "你是资深工程师，生成最小可编译占位桩。只输出 JSON。"},
+            {"role": "user", "content": prompt},
+        ])
+        parsed = _parse_json_from_llm(response.content)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[阶梯三·桩] LLM 生成异常 → 回退 revert: %s", exc)
+        return None
+    files = parsed.get("files") if isinstance(parsed, dict) else None
+    if not isinstance(files, dict) or not files:
+        return None
+    root = Path(project_path)
+    written: list[str] = []
+    for rel, content in files.items():
+        rel_norm = str(rel).strip().lstrip("/")
+        if not rel_norm or rel_norm not in code_files or not isinstance(content, str) or not content.strip():
+            continue  # 只接受落在 X 足迹内的代码文件，杜绝越权写其它路径
+        abs_f = root / rel_norm
+        try:
+            abs_f.parent.mkdir(parents=True, exist_ok=True)
+            abs_f.write_text(content, encoding="utf-8")
+            written.append(rel_norm)
+        except OSError as exc:
+            logger.debug("[阶梯三·桩] 写文件失败 %s: %s", rel_norm, exc)
+    if not written:
+        return None
+    diff = _git_diff_for_paths(project_path, written)
+    if not diff.strip():
+        # diff 生成失败 → 清掉刚写的桩（防污染本地树）后回退 revert。
+        _local_tree_revert_subtask(project_path, st)
+        return None
+    logger.info("[阶梯三·桩] 为卡死子任务 %s 生成可编译桩 %s（下游可编译，需人工补完）",
+                getattr(st, "id", "?"), written)
+    return diff
+
+
+async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> dict | None:
+    """卡死子任务恢复阶梯·阶梯三：保 build 放弃（替代直接 escalate 全盘 FAILED）。
+
+    阶梯一(retry)→阶梯二(定点拆小)都耗尽仍失败、且有成功兄弟时调用。做法：
+      1. 自动判依赖：`any(X in st.depends_on for st in plan.subtasks)`。
+         - 被依赖 → 先试【可编译桩】(_generate_compile_stub)：下游可编译，不连坐放弃；
+           桩生成失败 → 回退 revert（并传递放弃下游，缺依赖跑不了）。
+         - 不被依赖 → revert（只丢 X，零连坐）。
+      2. 两路都【清本地树足迹】(_local_tree_revert_subtask)，杜绝坏文件毒 -am reactor。
+      3. 给 X 终态 WorkerOutput（计入 completed，让 dispatch 推进到 merge→L2），
+         记入 give_up_isolated_ids；revert 路若 X 被依赖则其下游进 abandoned_subtask_ids。
+      4. 返回 strategy=give_up_preserve（非 replan/escalate → 路由 DISPATCH → remaining 空 → merge），
+         保留全部成功成果，终态由 runner 据 give_up/abandoned 判 PARTIAL（诚实列明需人工补完）。
+
+    返回 None 表示无法保 build 放弃（无 plan / 无可放弃项），调用方回退 escalate。"""
+    plan_obj = state.get("plan")
+    if plan_obj is None or not failed_ids:
+        return None
+    project_path = _proj_path_from_state(state)
+    subtasks = list(getattr(plan_obj, "subtasks", []))
+    by_id = {s.id: s for s in subtasks}
+    subtask_results = dict(state.get("subtask_results", {}))
+    give_up = set(state.get("give_up_isolated_ids") or [])
+    abandoned = set(state.get("abandoned_subtask_ids") or [])
+    handled: list[tuple[str, str]] = []
+
+    for fid in failed_ids:
+        st = by_id.get(fid)
+        if st is None:
+            continue
+        depended = any(fid in (getattr(s, "depends_on", []) or []) for s in subtasks)
+        stub_diff = None
+        if depended:
+            stub_diff = await _generate_compile_stub(state, st, project_path)
+        if stub_diff:
+            mode = "stub"
+            subtask_results[fid] = WorkerOutput(
+                subtask_id=fid, diff=stub_diff,
+                summary=(f"[阶梯三·桩] {fid} 卡死 → 生成可编译桩（保留 public 签名、方法体抛 "
+                         "UnsupportedOperationException），下游可编译集成，需人工补完实现"),
+                l1_passed=True,
+                l1_details={"given_up": True, "give_up_mode": "stub"},
+                confidence=Confidence.LOW,
+            )
+        else:
+            rev = _local_tree_revert_subtask(project_path, st)
+            mode = "revert"
+            subtask_results[fid] = WorkerOutput(
+                subtask_id=fid, diff="",
+                summary=(f"[阶梯三·revert] {fid} 卡死 → 已清本地树足迹"
+                         f"(reverted={rev['reverted']}, removed={rev['removed']})，"
+                         "build 不被毒、其余成果照常交付，需人工补完"),
+                l1_passed=True,
+                l1_details={"given_up": True, "give_up_mode": "revert"},
+                confidence=Confidence.LOW,
+            )
+            # revert 路：X 被依赖 → 其下游缺依赖跑不了 → 传递放弃（清足迹防毒 + 出完成态）。
+            if depended:
+                _changed = True
+                while _changed:
+                    _changed = False
+                    for s in subtasks:
+                        if s.id in abandoned or s.id in give_up:
+                            continue
+                        deps = getattr(s, "depends_on", []) or []
+                        if fid in deps or any(d in abandoned for d in deps):
+                            abandoned.add(s.id)
+                            _changed = True
+                            _local_tree_revert_subtask(project_path, s)
+                            subtask_results.pop(s.id, None)
+        give_up.add(fid)
+        handled.append((fid, mode))
+
+    if not handled:
+        return None
+    _drop = {h[0] for h in handled} | abandoned
+    dispatch_remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in _drop]
+    logger.warning(
+        "[HANDLE_FAILURE] 阶梯三 保 build 放弃 %s（清本地树足迹防 reactor 中毒，保留全部成功成果，"
+        "run 继续 merge→L2，终态将 PARTIAL 诚实列明需人工补完）；连坐放弃下游 %d 个",
+        handled, len(abandoned),
+    )
+    return {
+        "plan": plan_obj,
+        "subtask_results": subtask_results,
+        "dispatch_remaining": dispatch_remaining,
+        "failed_subtask_ids": [],
+        "failure_strategy": "give_up_preserve",
+        "give_up_isolated_ids": sorted(give_up),
+        "abandoned_subtask_ids": sorted(abandoned),
+    }
+
+
 async def handle_failure(state: BrainState) -> dict:
     """HANDLE_FAILURE 节点 — 处理子任务失败
 
@@ -1917,28 +2310,60 @@ async def handle_failure(state: BrainState) -> dict:
         _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed_ids}
         _deepest = max(_next_counts.values(), default=0)
         _max_retries = get_config().model.max_retries  # 默认 2
-        # 仅在【有成功兄弟】且【失败子任务还没烧光重试配额】时拦截 replan，降级为 retry。
-        # 没有成功兄弟（整批都失败）或已达上限，仍走原 replan 逻辑（可能真是计划问题）。
-        if succeeded_siblings and failed_ids and _deepest <= _max_retries + 1:
-            dispatch_remaining = list(state.get("dispatch_remaining", []))
-            for fid in failed_ids:
-                subtask_results.pop(fid, None)
-                if fid not in dispatch_remaining:
-                    dispatch_remaining.append(fid)
-            forced_alternate = _deepest > _max_retries
-            logger.info(
-                "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
-                "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
-                len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
-                "，换备选模型" if forced_alternate else "",
+        # R1a（治本，996db614 实测主失控）：**只要存在已成功兄弟子任务，就绝不全量 replan-clobber**。
+        # 旧守卫仅在【未烧光重试配额】时拦截，一旦失败子任务耗尽重试(_deepest>max+1)就落到下方全量
+        # replan→PLAN 清空完成态→把 34 个已完成全丢弃从头重跑（实测 剩余0/完成34→剩余47/完成1，再撞
+        # 同一幻觉 escalate→FAILED）。但 replan(重生成 plan) 治不了 worker 臆造方法/能力失败——只会重生成
+        # 同样的 plan 再失败。故：有成功兄弟时——还有重试预算→只重做失败的(retry/retry_alternate)；
+        # 已耗尽→escalate【失败子任务】并【完整保留成功成果】，绝不清空。
+        if succeeded_siblings and failed_ids:
+            if _deepest <= _max_retries + 1:
+                dispatch_remaining = list(state.get("dispatch_remaining", []))
+                for fid in failed_ids:
+                    subtask_results.pop(fid, None)
+                    if fid not in dispatch_remaining:
+                        dispatch_remaining.append(fid)
+                forced_alternate = _deepest > _max_retries
+                logger.info(
+                    "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
+                    "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
+                    len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
+                    "，换备选模型" if forced_alternate else "",
+                )
+                return {
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": dispatch_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+                    "use_alternate_model": forced_alternate,
+                    "subtask_retry_counts": {**_retry_counts, **_next_counts},
+                }
+            # 卡死子任务恢复阶梯·阶梯二：escalate 前先试【定点拆小】（仅单个失败子任务时）。
+            # 多文件卡死多因子任务太大，拆小后小块各自更易成功，保留成功兄弟、只重派小块。
+            if len(failed_ids) == 1:
+                _redecomp = await _targeted_redecompose(state, failed_ids[0])
+                if _redecomp is not None:
+                    return _redecomp
+            # 卡死子任务恢复阶梯·阶梯三：escalate(全盘 FAILED) 前先试【保 build 放弃】——
+            # 清本地树足迹防 -am reactor 中毒，被依赖→打可编译桩(救下游)、不被依赖→revert(只丢 X)，
+            # 给 X 终态计入 completed，run 继续 merge→L2，终态 PARTIAL 诚实交付而非整任务 FAILED。
+            _giveup = await _give_up_preserve_build(state, failed_ids)
+            if _giveup is not None:
+                return _giveup
+            # 阶梯三也无法保 build 放弃（无 plan/无足迹）→ 兜底 escalate 失败子任务、【保留全部成功
+            # 成果】，绝不全量 replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
+            logger.warning(
+                "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个成功兄弟 → escalate 失败子任务、"
+                "完整保留成果，绝不全量 replan 清空（治本：局部能力失败不推倒全盘）",
+                failed_ids, len(succeeded_siblings),
             )
             return {
                 "subtask_results": subtask_results,
-                "dispatch_remaining": dispatch_remaining,
-                "failed_subtask_ids": [],
-                "failure_strategy": "retry_alternate" if forced_alternate else "retry",
-                "use_alternate_model": forced_alternate,
-                "subtask_retry_counts": {**_retry_counts, **_next_counts},
+                "failed_subtask_ids": failed_ids,
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "l2_passed": False,
+                "replan_count": state.get("replan_count", 0),
             }
 
         for fid in failed_ids:

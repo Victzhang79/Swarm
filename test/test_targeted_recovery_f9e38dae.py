@@ -173,15 +173,20 @@ def test_targeted_recovery_fires_even_with_exhausted_budget():
     assert "ruoyi-alarm/pom.xml" in st24.scope.writable
 
 
-def test_targeted_recovery_circuit_breaks_then_falls_through():
-    """定向恢复达上限仍缺依赖 → 不再定向，落常规 replan 兜底。"""
+def test_targeted_recovery_circuit_breaks_then_giveup_preserves_build():
+    """定向恢复达上限仍缺依赖 + 有成功兄弟(st-1) → 阶梯三治本：保 build 放弃（revert/桩）
+    而非整任务 escalate FAILED（消化在阶梯内）。仍绝不全量 replan clobber、仍完整保留成果。
+    （996db614 主失控：为 1 个修不动的子任务清空 34 个完成。阶梯三让其降级为诚实部分交付。）"""
     from swarm.config.settings import get_config
     cap = get_config().model.max_retries
     with patch.object(nodes, "_get_brain_llm", _fake_llm("replan")):
         out = asyncio.run(nodes.handle_failure(_state(targeted_recovery_count=cap)))
-    # 第 cap+1 次定向恢复被熔断 → 落常规 replan（携带 replan_count）
-    assert out.get("failure_strategy") == "replan", out.get("failure_strategy")
+    # 定向恢复熔断 + 有成功兄弟 → 阶梯二(单文件拆不动)→阶梯三 give_up_preserve（非全盘 escalate）
+    assert out.get("failure_strategy") == "give_up_preserve", out.get("failure_strategy")
+    assert out.get("failure_escalated") is not True, "阶梯三消化 → 不再整任务 escalate FAILED"
+    assert "st-24" in out.get("give_up_isolated_ids", []), "卡死子任务记入保 build 放弃"
     assert out.get("targeted_recovery") is not True
+    assert "st-1" in out["subtask_results"], "成功兄弟 st-1 必须保留，不被 replan 清空"
 
 
 def test_generic_failure_skips_targeted_recovery():

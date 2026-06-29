@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -329,6 +330,306 @@ def _attempt_maven_version_repair(
     return len(changed), sorted(changed)
 
 
+# ── 防线④（通用·确定性）：缺第三方依赖声明 → 据 import 反查坐标补进 module pom ──
+# 治本场景（996db614 实测头号 package-does-not-exist，~137/213）：worker 实现功能时 import 了
+# 第三方库（jjwt/redis/fastjson2/quartz/hutool…）但模块 pom 没声明该依赖 → `package P does
+# not exist` → 整文件编不过 → 下游 cannot-find-symbol 级联 → 复读死循环到迭代上限。这与
+# import 前缀错(import-repair)/版本错(version-repair)同源——都是「模型手写依赖坐标不可靠」，
+# 但表象是【整个依赖没声明】。import-repair 明确不碰它（"项目没用过该 suffix=缺依赖，不动"）。
+#
+# 解法（模型无关、非 Java 写死之外的"Maven 生态事实标准"）：对每个缺失的第三方包 P，
+#   1) 从出错文件的 import 行取一个具体 FQCN（如 io.jsonwebtoken.Jwts）；
+#   2) Maven Central 全文类检索 fc:<FQCN> → 提供该类的 (groupId, artifactId)（groupId 必须是
+#      P 的前缀，杜绝错配）——这是注册中心权威事实，臆造的类查无结果→自动跳过（天然过滤幻觉）；
+#   3) 该 artifact 若被父 dependencyManagement 受管 → 注入无 version 依赖（继承）；否则取 Central
+#      maven-metadata 最新版注入；
+#   4) 注入到出错文件所属 module pom 的 <dependencies>（已声明则跳过），交调用方重跑确认。
+# 安全自证：只在 build 已失败时触发；坐标查无/groupId 不匹配/已声明 → 不动；修错（坐标/版本不
+# 兼容）则重跑仍失败=绝不假通过。与 ③-A 收敛循环协同：补依赖→重跑→新浮现的符号错再被 typo 修。
+#
+# 排除：java./javax./jakarta./sun. 是 JDK 自带或 servlet 命名空间问题（rewrite_jvm_namespace 治），
+# 项目【自有 groupId】前缀是【内部包未就绪】(②依赖拓扑)，都不在"缺第三方依赖"范围。
+_DEP_REPAIR_SKIP_PREFIXES = ("java.", "javax.", "jakarta.", "sun.", "com.sun.", "jdk.")
+
+
+def _project_own_packages(project_path: str, timeout: int = 20) -> set[str]:
+    """项目【自有包根】：据【源码自身声明的 package】取前 2 段前缀（com.ruoyi 等）。
+
+    硬判据=源码事实，而非 pom <groupId>——pom 的 groupId 含一堆【第三方依赖】的 group（如
+    com.alibaba/org.springframework/org.apache.shiro 在父 dependencyManagement + 各模块 deps 都现身），
+    据 pom group 会把第三方误判成"自有"→ 缺第三方包(fastjson2 等)被当内部包误 BLOCKED、还不补依赖。
+    项目【自己 build】的包必由其 .java `package` 声明（com.ruoyi.**），第三方包只被 import 从不被
+    本项目源码声明（io.jsonwebtoken/com.alibaba.fastjson2 无任何 .java 声明它）——这才是内部 vs 第三方
+    的可靠分界。返回出现在 ≥2 个源文件的 2 段包根集合（滤噪）。"""
+    cmd = (
+        "grep -rhoE '^[[:space:]]*package[[:space:]]+[A-Za-z0-9_.]+' --include='*.java' . 2>/dev/null "
+        "| sed -E 's/^[[:space:]]*package[[:space:]]+//' "
+        "| awk -F. 'NF>=2{print $1\".\"$2}' | sort | uniq -c | sort -rn | head -10"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=timeout)
+    groups: set[str] = set()
+    for line in (out or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+([A-Za-z0-9_.]+)", line)
+        # 任何被【项目源码 package 声明】的 2 段包根即项目自有（项目自己 build 它）。哪怕只 1 个
+        # 文件声明也算——源码 package 声明=定义性证据，无"第三方 group 混进来"的噪声（第三方只被
+        # import 从不被本项目源码声明）。
+        if m and int(m.group(1)) >= 1:
+            groups.add(m.group(2))
+    return groups
+
+
+def _fqcn_for_missing_pkg(project_path: str, rel_file: str, pkg: str, timeout: int) -> str | None:
+    """从出错文件的 import 行取该缺失包下的一个【具体 FQCN】（io.jsonwebtoken.Jwts 等）。
+
+    通配 `import P.*;` 无具体类 → 返回 None（无法精确反查，交契约/其它防线）。"""
+    pe = re.escape(pkg)
+    cmd = f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' '{rel_file}' 2>/dev/null | head -4"
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+    for line in (out or "").splitlines():
+        m = re.search(rf"import\s+(?:static\s+)?({pe}\.[A-Za-z_][A-Za-z0-9_.]*)", line)
+        if m:
+            fqcn = m.group(1)
+            leaf = fqcn.rsplit(".", 1)[-1]
+            if leaf and leaf[0].isupper():  # 取到的是类名(大写开头)，非子包/通配
+                return fqcn
+    return None
+
+
+def _resolve_artifact_via_central(
+    fqcn: str, pkg: str, project_path: str, timeout: int
+) -> tuple[str, str] | None:
+    """Maven Central 全文类检索 fc:<FQCN> → 提供该类的 (groupId, artifactId)。
+
+    只接受 groupId 是【缺失包 pkg 的前缀】的结果（杜绝同名类错配到无关库）；偏好非
+    -bom/-parent/-tests 的实体 artifact。查无/无网/groupId 不匹配 → None（臆造类天然在此被滤掉）。"""
+    url = (
+        "https://search.maven.org/solrsearch/select?"
+        f"q=fc:{fqcn}&rows=15&wt=json"
+    )
+    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
+    if _tool_missing(out) or not (out or "").strip():
+        return None
+    try:
+        docs = (json.loads(out).get("response", {}) or {}).get("docs", []) or []
+    except (ValueError, TypeError):
+        return None
+    cands: list[tuple[str, str]] = []
+    for d in docs:
+        g, a = d.get("g"), d.get("a")
+        if not g or not a:
+            continue
+        # groupId 必须是 pkg 前缀（pkg==g 或 pkg 以 g. 开头），否则同名类错配到无关库
+        if pkg == g or pkg.startswith(g + "."):
+            cands.append((g, a))
+    # 偏好实体 artifact（排除 bom/parent/tests/dependencies 聚合件）
+    def _rank(ga: tuple[str, str]) -> tuple:
+        a = ga[1].lower()
+        bad = any(t in a for t in ("-bom", "-parent", "-tests", "-test", "dependencies"))
+        return (1 if bad else 0, len(a))
+    cands.sort(key=_rank)
+    return cands[0] if cands else None
+
+
+def _module_pom_for_file(project_path: str, rel_file: str, timeout: int) -> str | None:
+    """从出错文件向上找最近的 module pom.xml（归一化模块相对路径）。"""
+    d = rel_file.rsplit("/", 1)[0] if "/" in rel_file else "."
+    cmd = (
+        f'd="{d}"; while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do '
+        f'[ -f "$d/pom.xml" ] && echo "$d/pom.xml" && break; d=$(dirname "$d"); done; '
+        f'[ -f "./pom.xml" ] && [ -z "$d" -o "$d" = "." ] && echo "pom.xml"'
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 15))
+    for line in (out or "").splitlines():
+        line = line.strip().lstrip("./") or line.strip()
+        if line.endswith("pom.xml"):
+            return line
+    return None
+
+
+def _pom_declares_artifact(project_path: str, pom: str, artifact: str, timeout: int) -> bool:
+    """module pom 是否已声明该 artifactId（避免重复注入）。"""
+    cmd = f"grep -c '<artifactId>{re.escape(artifact)}</artifactId>' '{pom}' 2>/dev/null"
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 10))
+    return (out or "").strip() not in ("", "0")
+
+
+def _artifact_is_managed(project_path: str, artifact: str, timeout: int) -> bool:
+    """该 artifactId 是否在某 pom 的 <dependencyManagement> 受管（→ 注入无 version 继承）。"""
+    cmd = (
+        "for p in $(grep -rl '<dependencyManagement>' --include=pom.xml . 2>/dev/null); do "
+        f"awk '/<dependencyManagement>/,/<\\/dependencyManagement>/' \"$p\"; done "
+        f"| grep -c '<artifactId>{re.escape(artifact)}</artifactId>'"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+    return (out or "").strip() not in ("", "0")
+
+
+# 运行时伴生件后缀约定：主件常是 `-api`/`-core`（仅编译期接口），运行时还需 `-impl`/`-runtime`
+# 及 JSON 绑定 `-jackson`/`-jaxb`，否则编译过但 L2/L3 运行期 ClassNotFound（jjwt 实测：仅 jjwt-api
+# 编译过、运行 Jwts.builder() 即炸，需 jjwt-impl+jjwt-jackson）。只取这几个【无歧义】伴生后缀，
+# 不含 `-gson`（与 jackson 二选一，避免双 JSON 绑定冲突）——通用约定，非硬编码具体库。
+_RUNTIME_COMPANION_SUFFIXES = ("impl", "runtime", "jackson", "jaxb")
+
+
+def _resolve_artifact_family(
+    group: str, primary: str, project_path: str, timeout: int
+) -> list[str]:
+    """主 artifact 的【运行时伴生件】（jjwt-api → jjwt-impl/jjwt-jackson）。
+
+    据 artifactId 基名（去 `-api`/`-core` 后缀）+ 运行时伴生后缀约定，查同 groupId 下确实存在的
+    伴生件。通用（任何 api/impl 拆分库），无硬编码库表。主件非 -api/-core → 不像拆分库，返回 []。"""
+    base = primary
+    for suf in ("-api", "-core"):
+        if primary.endswith(suf):
+            base = primary[: -len(suf)]
+            break
+    if base == primary:
+        return []
+    url = f"https://search.maven.org/solrsearch/select?q=g:%22{group}%22&rows=40&wt=json"
+    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
+    if _tool_missing(out) or not (out or "").strip():
+        return []
+    try:
+        docs = (json.loads(out).get("response", {}) or {}).get("docs", []) or []
+    except (ValueError, TypeError):
+        return []
+    present = {d.get("a") for d in docs if d.get("a")}
+    return [f"{base}-{s}" for s in _RUNTIME_COMPANION_SUFFIXES if f"{base}-{s}" in present]
+
+
+def _inject_dependency(
+    project_path: str, pom: str, group: str, artifact: str, version: str | None,
+    timeout: int, scope: str | None = None,
+) -> bool:
+    """在 module pom 的【最后一个 </dependencies>】前插入 <dependency>（受管则无 version）。
+
+    最后一个 </dependencies> 即常规依赖块（dependencyManagement 内的 </dependencies> 在其之前），
+    模块 pom 多无 depMgmt 故唯一即正确。perl -0777 整文件 + 贪婪 .* 命中最后一处。scope 非空则带
+    `<scope>`（运行时伴生件用 runtime）。"""
+    ver_line = f"<version>{version}</version>" if version else ""
+    scope_line = f"<scope>{scope}</scope>" if scope else ""
+    block = (
+        f"<dependency><groupId>{group}</groupId>"
+        f"<artifactId>{artifact}</artifactId>{ver_line}{scope_line}</dependency>"
+    )
+    # 贪婪匹配到最后一个 </dependencies>，在其前插入；无 </dependencies> 则不改（返回非0→跳过）
+    cmd = (
+        f"grep -q '</dependencies>' '{pom}' && perl -0777 -i.bak -pe "
+        f"'s#(.*)</dependencies>#$1    {block}\\n    </dependencies>#s' '{pom}' "
+        f"&& rm -f '{pom}.bak'"
+    )
+    ec, _o = _run_l1_command(cmd, project_path, timeout=min(timeout, 20))
+    return ec == 0
+
+
+def _attempt_dependency_repair(
+    project_path: str, build_output: str, modified: list[str], timeout: int
+) -> tuple[int, list[str]]:
+    """治本·通用：缺第三方依赖声明 → 据 import 反查 Maven 坐标补进 module pom。见上方 防线④ 注释。
+
+    只修【本子任务文件】里缺的第三方包（别人的交其 owner/拓扑修，配合文件级归属与 ② 依赖拓扑）。
+    返回 (改动 pom 数, 改动 pom 相对路径列表)，TD2606-C9 供回传（module pom 可能在写权 scope 外）。"""
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return 0, []
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
+    own = _project_own_packages(project_path, timeout)
+    want: dict[str, set[str]] = {}
+    for f, pkg in pairs:
+        rel = _norm_src_path(f)
+        if mods and rel not in mods and not any(rel.endswith(m) or m.endswith(rel) for m in mods):
+            continue  # 别人的文件
+        if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
+            continue  # JDK / servlet 命名空间，非缺依赖
+        if any(pkg == g or pkg.startswith(g + ".") for g in own):
+            continue  # 项目自有 group → 内部包未就绪(②)，非缺第三方依赖
+        want.setdefault(pkg, set()).add(rel)
+    if not want:
+        return 0, []
+    changed: set[str] = set()
+    for pkg, files in list(want.items())[:8]:
+        first = sorted(files)[0]
+        fqcn = _fqcn_for_missing_pkg(project_path, first, pkg, timeout)
+        if not fqcn:
+            continue  # 通配 import / 取不到具体类 → 不赌
+        coord = _resolve_artifact_via_central(fqcn, pkg, project_path, timeout)
+        if not coord:
+            continue  # 坐标查无（臆造类 / 无网）→ 不动
+        group, artifact = coord
+        managed = _artifact_is_managed(project_path, artifact, timeout)
+        version: str | None = None
+        if not managed:
+            available = _fetch_maven_versions(group, artifact, project_path, timeout)
+            if not available:
+                continue  # 既不受管又查不到版本 → 不赌
+            version = max(available, key=_ver_key)
+        # 运行时伴生件（jjwt-api → jjwt-impl/jjwt-jackson）：同版本、runtime scope，杜绝"编译过
+        # 但运行期 ClassNotFound"。受管(version=None)则伴生件也无 version 继承。
+        family = _resolve_artifact_family(group, artifact, project_path, timeout)
+        for f in sorted(files):
+            pom = _module_pom_for_file(project_path, f, timeout)
+            if not pom:
+                continue
+            if _pom_declares_artifact(project_path, pom, artifact, timeout):
+                continue  # 已声明（可能上一轮/别处补过）
+            if _inject_dependency(project_path, pom, group, artifact, version, timeout):
+                changed.add(pom)
+                for sib in family:
+                    if not _pom_declares_artifact(project_path, pom, sib, timeout):
+                        _inject_dependency(
+                            project_path, pom, group, sib, version, timeout, scope="runtime"
+                        )
+        logger.info(
+            "[L1.2.1·dep-repair] %s → %s:%s%s 注入 module pom（据 import 反查 Maven Central%s）",
+            pkg, group, artifact, (":" + version) if version else "(受管,继承版本)",
+            f"，+运行时伴生件 {family}" if family else "",
+        )
+    return len(changed), sorted(changed)
+
+
+def _build_blocked_on_unbuilt_internal(
+    project_path: str, build_output: str, timeout: int
+) -> bool:
+    """构建失败是否【全因引用了尚未建出的项目内部包】(②跨模块/跨子任务未就绪)。
+
+    治本场景（996db614 实测 ~70/213）：子任务 A 引用 `com.ruoyi.alarm.sender.dto` 等【别的子任务
+    还没建出的内部包】→ `package does not exist`。这不是 A 的能力问题，也无法由 A 修（包归别人建）；
+    plan 时拿不到 A 的 import 故无法确定性预先 depends_on。治本=worker 把它识别为 BLOCKED 退避，
+    待生产者子任务落地（merge 进项目树）后由 transient 重试自然消解，不烧 A 的修复轮 / 不误判
+    capability 换模型 / 不 escalate 清空已成功成果。
+
+    判据（保守，宁可不标也不误标）：所有 `package P does not exist` 的 P 都满足
+      ① P 是【项目自有 groupId 前缀】(内部包，非第三方——第三方交 dep-repair 防线④)；且
+      ② 当前项目树里【无任何 .java 声明 package P】(=确实还没被任何子任务建出)。
+    只要有一个缺包是第三方、或已在树里(=真编译错如包名拼错) → 返回 False，照常 FAIL。"""
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return False
+    own = _project_own_packages(project_path, timeout)
+    if not own:
+        return False
+    internal_pkgs: set[str] = set()
+    for _f, pkg in pairs:
+        if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
+            return False  # JDK/servlet 命名空间问题，非②
+        if not any(pkg == g or pkg.startswith(g + ".") for g in own):
+            return False  # 有第三方缺包 → 交 dep-repair，不是纯②
+        internal_pkgs.add(pkg)
+    if not internal_pkgs:
+        return False
+    for pkg in internal_pkgs:
+        cmd = (
+            f"grep -rlE '^[[:space:]]*package[[:space:]]+{re.escape(pkg)}[[:space:]]*;' "
+            f"--include='*.java' . 2>/dev/null | head -1"
+        )
+        _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+        if (out or "").strip():
+            return False  # 该内部包已在树里却报 does not exist → 真错(非未就绪)，照常 FAIL
+    return True
+
+
 def _tool_missing(out: str) -> bool:
     """命令输出是否表明【工具本身缺失】（→ 优雅跳过，不当作修复失败）。"""
     low = (out or "").lower()
@@ -552,6 +853,14 @@ def _attempt_build_repair(
             _accum(_attempt_import_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
+        # 缺第三方依赖声明（import 了库但 module pom 没声明）→ 据 import 反查坐标补进 pom。
+        # 放在 import 前缀修复之后、版本对账之前：先把"整个依赖没声明"补齐，版本问题再对账。
+        # SWARM_WORKER_DEP_REPAIR=false 可关（仅此一类，留逃生阀）。
+        if os.environ.get("SWARM_WORKER_DEP_REPAIR", "true").lower() not in ("false", "0", "no"):
+            try:
+                _accum(_attempt_dependency_repair(project_path, build_output, modified, timeout))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[L1.2.1·repair] dependency-repair 异常(跳过): %s", exc)
         # Maven 依赖版本不存在（worker 凭空写错版本号）→ 校正到最近有效版本
         try:
             _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
@@ -583,6 +892,30 @@ def _max_files_per_check() -> int:
         return max(1, int(os.environ.get("SWARM_WORKER_L1_MAX_FILES", "20")))
     except ValueError:
         return 20
+
+
+def _max_build_repair_rounds() -> int:
+    """确定性构建修复的【幂等收敛循环】最大轮数（SWARM_WORKER_BUILD_REPAIR_ROUNDS，默认 4）。
+
+    编译器错误掩蔽是级联的：一遍 repair 修掉可见 typo/缺 import 后，rerun 才暴露原先被上游
+    错误掩蔽的下一批 cannot-find-symbol。需多轮「修→重跑→再修」直到收敛。纯确定性、单调
+    （perl 改了不会被自己改回），有界即可，4 轮足以吃下实测最深级联，又不会空转太久。"""
+    try:
+        return max(1, int(os.environ.get("SWARM_WORKER_BUILD_REPAIR_ROUNDS", "4")))
+    except ValueError:
+        return 4
+
+
+def _max_build_repair_seconds() -> float:
+    """收敛循环【墙钟上界】秒（SWARM_WORKER_BUILD_REPAIR_MAX_SECONDS，默认 900）。
+
+    轮数上界之外再加墙钟闸：每轮含一次全量 mvn 重跑（可达 300s）+ 网络反查，最坏 4 轮可逼近
+    20min，跑在同步确定性闸门里、worker 总预算无从中途打断 → 加墙钟硬上界防 runaway（默认 900s
+    够 1-2 次正常收敛重跑，又封死病态空转）。一旦超界即停，交后续 fail/BLOCKED 分类。"""
+    try:
+        return max(60.0, float(os.environ.get("SWARM_WORKER_BUILD_REPAIR_MAX_SECONDS", "900")))
+    except ValueError:
+        return 900.0
 
 
 def _cap_files(files: list[str], kind: str) -> list[str]:
@@ -1675,33 +2008,64 @@ def run_l1_pipeline(
         details["build_output"] = compress_tool_output(b_out, max_chars=1500)
         logger.info("[L1.2.1] 构建闸门结果: exit=%s ok=%s", b_ec, build_ok)
         if not build_ok:
-            # 治本·通用：据项目自身惯例确定性修正写错的包名前缀后【重跑一次】构建确认。
+            # 治本·通用：据项目自身惯例确定性修正写错的包名前缀/拼错符号后【重跑】构建确认。
             # 安全性自证——只在构建已失败时触发，且必须重跑通过才算修好，修错了重跑仍失败=
             # 不会制造假通过。SWARM_WORKER_IMPORT_REPAIR=false 可关。
+            #
+            # 根因#③（996db614 实测：531 cannot find symbol 仅确定性纠掉 17）：编译器错误
+            # 掩蔽是【级联】的——一遍 repair 修掉可见的 typo/缺 import 后，rerun 才会暴露原先
+            # 被上游错误掩蔽的下一批 cannot-find-symbol（实证：一个子任务的 isEmtpy 散落 6 文件，
+            # 单发只纠到 1 个，残余漏到慢 LLM 修复循环 → 模型反复写回同一 typo → 撞 900s 预算
+            # 超时 → FAILED）。治本：把确定性 repair 跑成【幂等收敛循环】——修→重跑→再修，直到
+            # 构建通过或某轮【零新增修复】（卡死，交后续 infra/upstream/fail 处理）。纯确定性、
+            # 单调收敛（perl 改了不会被自己改回，故不会震荡）、有界（默认 4 轮），全程无 LLM 介入，
+            # 把整条 typo 级联在【能改它的生产者】当场吃完，不漏到无权修的下游/慢循环。
             repair_on = os.environ.get(
                 "SWARM_WORKER_IMPORT_REPAIR", "true"
             ).lower() not in ("false", "0", "no")
-            repaired = 0
             repaired_paths: list[str] = []
             if repair_on:
-                try:
-                    repaired, repaired_paths = _attempt_build_repair(
-                        project_path, b_out, modified, timeout, project_stack
+                _loop_t0 = _time.monotonic()
+                _loop_budget = _max_build_repair_seconds()
+                for _rr in range(_max_build_repair_rounds()):
+                    if _time.monotonic() - _loop_t0 >= _loop_budget:
+                        logger.warning(
+                            "[L1.2.1] 确定性收敛循环达墙钟上界 %.0fs（已修 %d 文件），停止，交后续分类",
+                            _loop_budget, len(repaired_paths),
+                        )
+                        break
+                    try:
+                        n_round, paths_round = _attempt_build_repair(
+                            project_path, b_out, modified, timeout, project_stack
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
+                        break
+                    if not n_round:
+                        break  # 本轮零新增修复 → 已收敛或卡死，停止空转重跑
+                    for p in paths_round:
+                        if p and p not in repaired_paths:
+                            repaired_paths.append(p)
+                    logger.info(
+                        "[L1.2.1] 确定性修复第 %d 轮触达 %d 文件，重跑构建闸门", _rr + 1, n_round
                     )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
-            if repaired:
-                logger.info("[L1.2.1] 跨生态确定性修复触达 %d 文件，重跑构建闸门", repaired)
-                b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
-                build_ok = b_ec == 0
+                    b_ec, b_out = _run_l1_command(
+                        build_cmd, project_path, timeout=max(timeout, 300)
+                    )
+                    build_ok = b_ec == 0
+                    if build_ok:
+                        break
+            if repaired_paths:
                 details["l1_2_1_build_ok"] = build_ok
                 details["build_output"] = compress_tool_output(b_out, max_chars=1500)
-                details["import_repaired_files"] = repaired
+                details["import_repaired_files"] = len(repaired_paths)
                 # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
                 # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
-                if repaired_paths:
-                    details["repaired_file_paths"] = repaired_paths
-                logger.info("[L1.2.1] import-repair 后构建: exit=%s ok=%s", b_ec, build_ok)
+                details["repaired_file_paths"] = repaired_paths
+                logger.info(
+                    "[L1.2.1] 确定性收敛修复累计 %d 文件后构建: ok=%s",
+                    len(repaired_paths), build_ok,
+                )
             if not build_ok:
                 # fail-closed 但不误判 capability：构建非零退出若命中网络/工具/资源 infra 瞬时故障，
                 # 不是代码能力失败 → 标 BLOCKED 走 transient 退避重试（耗尽才硬 FAIL），不错换模型。
@@ -1727,6 +2091,21 @@ def run_l1_pipeline(
                     logger.warning(
                         "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
                         "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
+                    )
+                    return True, details
+                # 根因#②（996db614 实测 ~70/213）：构建缺【尚未建出的项目内部包】（别的子任务
+                # 还没产出 com.ruoyi.alarm.sender.dto 等）→ 非本子任务能力问题、本子任务也无权建
+                # 那些包。标 BLOCKED 退避，待生产者子任务落地（merge 进树）后由 transient 重试自然
+                # 消解，不烧本子任务修复轮 / 不误判 capability 换模型 / 不 escalate 清空已成功成果。
+                # 保守判据见 _build_blocked_on_unbuilt_internal（有第三方缺包/包已在树里→照常 FAIL）。
+                if _build_blocked_on_unbuilt_internal(project_path, b_out, timeout):
+                    details["l1_2_1_build_ok"] = None
+                    details["build_blocked"] = build_cmd
+                    details["pipeline_blocked"] = "internal_pkg_not_built"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    logger.warning(
+                        "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
+                        "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],
                     )
                     return True, details
                 details["build_failed"] = build_cmd
