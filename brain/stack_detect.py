@@ -145,6 +145,10 @@ _INFRA_CONCEPTS: tuple[tuple[str, "callable"], ...] = (
     ("基础实体基类", lambda n: n in ("BaseEntity", "BaseDO", "BaseDomain", "BaseModel")),
     ("鉴权/安全工具", lambda n: n in (
         "SecurityUtils", "ShiroUtils", "TokenService", "SecurityContextHolder", "LoginUser", "AuthUtils")),
+    # round11 治本②：列出本项目真实 *Utils（如 CipherUtils/AlarmEncryptUtils），让模型用真有的、
+    # 知其真实包名，少臆造 com.ruoyi.common.utils.SecurityUtils 这类"标准类"。catch-all 放最后，
+    # named 桶先匹配(per-class break)，其余 *Utils 落此桶。
+    ("项目工具类", lambda n: n.endswith("Utils") or n.endswith("Util")),
 )
 
 
@@ -184,6 +188,38 @@ def _detect_infra_symbols(infra_class_paths: list[str]) -> dict[str, list[str]]:
                     lst.append(fqn)
                 break
     return by_concept
+
+
+def _detect_auth_variant(java_sample_paths: list[str], build_text: str) -> dict | None:
+    """探测鉴权框架变体：Apache Shiro vs Spring Security（round11 治本②）。
+
+    现场：基线是经典 Shiro 变体（@RequiresPermissions×17 + ShiroUtils），但不同子任务各自臆测
+    变体——有的用 Spring-Security 的 @PreAuthorize("@ss.hasPermi") 还往 pom 塞 spring-boot-
+    starter-security（本项目无 @ss bean），有的用 ShiroUtils——同模块鉴权分裂、SecurityUtils 臆造。
+    据磁盘 ground truth 把变体钉死，format_stack_for_prompt 显式禁用另一变体的 canonical 类。
+    返回 None 表示无鉴权信号（不污染画像）。
+    """
+    bt = (build_text or "").lower()
+    shiro = springsec = 0
+    if "org.apache.shiro" in bt or "shiro-spring" in bt:
+        shiro += 3
+    if "spring-boot-starter-security" in bt or "spring-security" in bt:
+        springsec += 3
+    for p in java_sample_paths[:120]:
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                txt = f.read(8000)
+        except OSError:
+            continue
+        if "@RequiresPermissions" in txt or "ShiroUtils" in txt or "org.apache.shiro" in txt:
+            shiro += 1
+        if "@PreAuthorize" in txt or "@ss.hasPermi" in txt or "hasPermi(" in txt \
+                or "org.springframework.security" in txt:
+            springsec += 1
+    if shiro == 0 and springsec == 0:
+        return None
+    variant = "shiro" if shiro >= springsec else "spring-security"
+    return {"variant": variant, "shiro_hits": shiro, "springsec_hits": springsec}
 
 
 def _detect_jvm_facts(
@@ -434,6 +470,14 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             f"; Spring Boot={jvm.get('spring_boot_version') or '未判明'}"
             f"; Java={jvm.get('java_version') or '未判明'}"
         )
+    # 鉴权变体钉死（Shiro vs Spring Security）—— round11 治本②，消除同模块鉴权分裂 + SecurityUtils 臆造
+    auth = _detect_auth_variant(
+        java_sample_paths, _read_text(os.path.join(project_path, "pom.xml")) + " " + " ".join(manifest_texts.values())
+    )
+    if auth:
+        evidence.append(
+            f"鉴权变体: {auth['variant']}（shiro_hits={auth['shiro_hits']}, springsec_hits={auth['springsec_hits']}）"
+        )
 
     return {
         "frontend": frontend,
@@ -441,6 +485,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         "backend": (f"{backend_fw} ({backend_lang})" if backend_fw else backend_lang) or "未判明",
         "build": build_tool or "未判明",
         "jvm": jvm or {},
+        "auth": auth or {},
         "infra_symbols": infra_symbols,
         "confidence": round(confidence, 2),
         "evidence": evidence,
@@ -558,6 +603,22 @@ def format_stack_for_prompt(profile: dict | None) -> str:
             "【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）——"
             "classpath 没有就 `cannot find symbol`/`package 不存在` 编译失败、死循环。需要的类不在列表里时，"
             "先在项目里 grep 确认它真实存在再 import，绝不臆造。"
+        )
+    auth = profile.get("auth") or {}
+    av = auth.get("variant")
+    if av == "shiro":
+        lines.append(
+            "- 【鉴权变体·硬约束】本项目用 Apache Shiro：控制器权限注解一律 `@RequiresPermissions(\"模块:操作\")`，"
+            "取当前登录用户/权限【只用上方〖基建符号·鉴权/安全工具〗里列出的本项目真实类】，绝不臆造未列出的鉴权类。"
+            "【严禁】Spring Security 写法：`@PreAuthorize`、`org.springframework.security.*`、给任何 pom 加 "
+            "`spring-boot-starter-security`——本项目 classpath 无 Spring Security，写了必 `cannot find symbol`"
+            "/bean 注入失败。"
+        )
+    elif av == "spring-security":
+        lines.append(
+            "- 【鉴权变体·硬约束】本项目用 Spring Security：权限注解用 `@PreAuthorize(...)`，取当前用户/权限"
+            "【只用上方〖基建符号·鉴权/安全工具〗里列出的本项目真实类】，绝不臆造未列出的鉴权类。"
+            "【严禁】Apache Shiro 写法：`@RequiresPermissions`、`org.apache.shiro.*`——本项目 classpath 无 Shiro。"
         )
     kb_hints = profile.get("kb_stack_hints") or []
     if kb_hints:

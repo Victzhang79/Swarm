@@ -225,5 +225,56 @@ def test_is_infra_classname_matching():
     assert _is_infra_classname("AjaxResult") is True
     assert _is_infra_classname("BaseEntity") is True
     assert _is_infra_classname("ShiroUtils") is True
+    # round11 ②：catch-all *Utils/*Util 也算基建类(列真实工具类防臆造)
+    assert _is_infra_classname("CipherUtils") is True
+    assert _is_infra_classname("DateUtil") is True
     assert _is_infra_classname("AlarmController") is False
     assert _is_infra_classname("UserServiceImpl") is False
+
+
+# ── round11 治本②：鉴权变体钉死 + *Utils 覆盖 ──
+def test_auth_variant_shiro_pins_and_forbids_securityutils(tmp_path):
+    """基线含 @RequiresPermissions+ShiroUtils → 钉 Shiro；prompt 显式禁 SecurityUtils/@ss/spring-security。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project><dependency>shiro-spring</dependency></project>")
+    _mk(t, "src/main/java/com/ruoyi/alarm/controller/AlarmController.java",
+        "package com.ruoyi.alarm.controller;\nimport com.ruoyi.common.utils.ShiroUtils;\n"
+        "class AlarmController { @RequiresPermissions(\"alarm:list\") void f(){ShiroUtils.getUserId();} }")
+    _mk(t, "src/main/java/com/ruoyi/common/utils/ShiroUtils.java",
+        "package com.ruoyi.common.utils;\nclass ShiroUtils{}")
+    _mk(t, "src/main/java/com/ruoyi/alarm/util/CipherUtils.java",
+        "package com.ruoyi.alarm.util;\nclass CipherUtils{}")
+    p = detect_stack_deterministic(t)
+    assert p.get("auth", {}).get("variant") == "shiro", f"应钉 Shiro: {p.get('auth')}"
+    fp = format_stack_for_prompt(p)
+    assert "鉴权变体" in fp and "Apache Shiro" in fp
+    # 通用(非硬编码 RuoYi FQN)：禁 Spring Security 框架级写法 + 指向项目派生的基建符号列表
+    assert "@PreAuthorize" in fp and "org.springframework.security" in fp \
+        and "spring-boot-starter-security" in fp, "应禁 Spring Security 框架级写法"
+    assert "绝不臆造未列出的鉴权类" in fp, "应指向项目派生列表、泛化禁臆造(覆盖 SecurityUtils 等)"
+    assert "com.ruoyi.common.utils.SecurityUtils" not in fp, "不该硬编码 RuoYi 专属 FQN(通用性)"
+    # *Utils 覆盖：CipherUtils 真实 FQN(项目派生)被列出
+    assert "com.ruoyi.alarm.util.CipherUtils" in fp, "项目工具类应列真实 *Utils FQN"
+
+
+def test_auth_variant_spring_security(tmp_path):
+    """基线含 @PreAuthorize + spring-boot-starter-security → 钉 spring-security 变体。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project><dependency>spring-boot-starter-security</dependency></project>")
+    _mk(t, "src/main/java/com/x/AlarmController.java",
+        "package com.x;\nimport org.springframework.security.access.prepost.PreAuthorize;\n"
+        "class AlarmController { @PreAuthorize(\"@ss.hasPermi('alarm:list')\") void f(){} }")
+    p = detect_stack_deterministic(t)
+    assert p.get("auth", {}).get("variant") == "spring-security", f"{p.get('auth')}"
+    fp = format_stack_for_prompt(p)
+    assert "Spring Security" in fp and "@RequiresPermissions" in fp  # 禁 Shiro 注解
+
+
+def test_auth_variant_none_when_no_signal(tmp_path):
+    """无鉴权信号 → auth 空，不渲染鉴权硬约束块(不污染)。"""
+    t = str(tmp_path)
+    _mk(t, "pom.xml", "<project>x</project>")
+    _mk(t, "src/main/java/com/x/PlainController.java", "package com.x;\nclass PlainController{}")
+    p = detect_stack_deterministic(t)
+    assert p.get("auth", {}) == {}
+    assert "鉴权变体" not in format_stack_for_prompt(p)
