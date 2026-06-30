@@ -101,6 +101,11 @@
 
 **结论**: round11 把 round10-after 一批治本(CONTRACT union/sticky-fail/round6/A2/定向恢复有界/端点稳)线上验证为**生效**; 唯一未线上验证的 pom MERGE 并集 B+A(6b39449) 因未到 MERGE 仍只有单测+逻辑验证。剩余瓶颈=**本地模型在大切片/框架类上的能力天花板**(非编排 bug), 及 P-2/P-3 两个确定性 hint 治本空间。
 
+## A5/A6/A7 评估（通用性纪律下的取舍，非懒惰）
+- **A6 预算 repair 饥饿 [不强修]**: 既有系统闸门已覆盖——LOCATING 硬砍预算(RUN12, executor.py:795 留给 CODING/VERIFY) + P7 fix 循环早停(executor.py:931, 60% 预算且闸门红即 bail 不烧满 900s)。"851s CODING 后 repair 0s"是 CODING 合法用满；强加固定 repair 预留会**削 CODING 预算→大子任务更易超时(反向回归)**。A1/A2/A3 已消除使其显形的注定重试 grind。故不强修(避免反治本)。
+- **A5 契约模块↔布局不符 [defer]**: rule5 仅告警, round11 未因它崩(killer 是 A1/②)；真修需辨"逻辑模块 vs 物理 Maven 模块"意图, 过度工程风险。记 follow-up。
+- **A7 符号扫描重复 [perf follow-up]**: VERIFYING/PRODUCING 重跑同一 4000-符号 grep(60-180s 浪费)。缓存是干净通用 perf 赢(无正确性 trade-off), 但属效率非 round11 致因。记 follow-up, 可后续单独做。
+
 ## B 类（能力 artifact·既有闸门已抓+恢复·不加 hack·通用性纪律）
 - **B4/B5/isE mpty [不修, 诚实记 B 类]**: 模型 token 退化(`isE mpty`×6 文件 / `is Empty` babble / 臆造 `GoogleAuthenticatorConfig.Builder`/`CipherUtils.encrypt`) + 盲目 `perl -i 's/Builder/builder/'` 自毁。取证: 沙箱 jsonl `isEmpty` 37×对 / `is Empty` 14× / `isE mpty` 仅 1×(非确定性 pipeline 变换=非写入 bug，是模型不一致 splitting=能力)。**既有系统闸门已捕获+恢复**: L1 编译闸门抓 `cannot find symbol` → sticky-fail 不放幻觉 PASS → 换备选模型重试。故**不加定向 gate/后处理**——那是打地鼠+治标+可能误伤合法代码(违 [[swarm-fix-generic-systemic-not-whackamole]])。缓解靠 A4(诊断 hint) + 根因②(框架变体钉死降低臆造诱因) + 既有 alternate-model swap。
 
