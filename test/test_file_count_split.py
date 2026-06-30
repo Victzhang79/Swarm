@@ -78,15 +78,53 @@ def test_single_entity_never_split():
     assert out == [st], "单实体即使超文件数也不拆(否则接口/控制器分家→契约漂移→死循环)"
 
 
-def test_single_entity_9_files_still_not_split():
-    """单实体哪怕 9 文件(加 vo/dto/额外 controller)也不拆,靠 900s 预算(实测 560s)。"""
+def test_single_entity_oversized_splits_by_layer():
+    """round10 #3 治本(策略变更)：单实体超文件数上界(MAX_SINGLE_ENTITY_FILES=6)→【按层】拆
+    消除 900s 超时(实测 st-8-1 10/st-12-1 11/st-16-1 14 文件单实体反复超时)。RUN14 仍守：逻辑层
+    (IService+ServiceImpl+Controller,签名相关)留同批,只把数据层(domain/DTO/mapper)剥成前置批。"""
     files = _entity_files("AlarmRule") + [
         "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/vo/AlarmRuleVo.java",
         "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/dto/AlarmRuleDto.java",
         "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/vo/AlarmRuleListVo.java",
-    ]
-    st = SubTask(id="st-6", description="告警规则全栈", scope=FileScope(create_files=files))
-    assert _split_oversized_by_files(st) == [st], "单实体 9 文件不拆"
+    ]  # 9 文件单实体
+    st = SubTask(id="st-6", description="告警规则全栈(超大)", scope=FileScope(create_files=files))
+    children = _split_oversized_by_files(st)
+    assert len(children) >= 2, "9 文件单实体超上界应按层拆(消除 900s 超时)"
+    # RUN14 守：IService+ServiceImpl+Controller 必须【同批】(签名相关文件不分家,杜绝漂移)
+    logic_batch = next((c for c in children
+                        if any("Controller" in f for f in c.scope.create_files)), None)
+    assert logic_batch is not None, "应有含 Controller 的逻辑批"
+    names = [f.split("/")[-1] for f in logic_batch.scope.create_files]
+    assert any("IAlarmRuleService" in n for n in names), "IService 应与 Controller 同批(RUN14)"
+    assert any("ServiceImpl" in n for n in names), "ServiceImpl 应与 Controller 同批(RUN14)"
+    # 文件无丢失
+    got = sorted(f for c in children for f in c.scope.create_files)
+    assert got == sorted(files), "按层拆不得丢/重文件"
+
+
+def test_split_single_entity_by_layer_unit():
+    """_split_single_entity_by_layer 直测：数据层(快)前置 + 逻辑层(慢)同批;无层 seam 不拆。"""
+    from swarm.brain.planning_nodes import _split_single_entity_by_layer
+    j = "ruoyi-alarm/src/main/java/com/ruoyi/alarm"
+    core = _entity_files("AlarmTemplate") + [
+        f"{j}/domain/dto/TemplatePreviewDTO.java",
+        f"{j}/domain/dto/TemplateRenderResult.java",
+        f"{j}/util/TemplateVariableParser.java",
+        f"{j}/domain/TemplateRenderContext.java",
+    ]  # 10 文件(st-8-1 真实形态)
+    batches = _split_single_entity_by_layer(core, max_files=4)
+    assert len(batches) >= 2, "10 文件应拆"
+    # 逻辑层(Controller/Service/Impl)在最后一批且齐全
+    logic = batches[-1]
+    lnames = [f.split("/")[-1] for f in logic]
+    assert any("Controller" in n for n in lnames) and any("ServiceImpl" in n for n in lnames) \
+        and any(n.startswith("IAlarmTemplateService") for n in lnames), f"逻辑层应同批: {lnames}"
+    # 数据层不含 Controller/Impl
+    for b in batches[:-1]:
+        assert not any("Controller" in f or "ServiceImpl" in f for f in b), "数据批不应含逻辑文件"
+    # 纯逻辑/纯数据无 seam → 不拆
+    assert _split_single_entity_by_layer([f"{j}/controller/XController.java"], 4) == \
+        [[f"{j}/controller/XController.java"]]
 
 
 # ── 不变量 2：多实体按实体拆,每批是完整实体全栈 ──

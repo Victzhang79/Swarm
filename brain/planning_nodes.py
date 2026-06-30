@@ -45,6 +45,12 @@ MAX_ELABORATE_RESPLIT = 3       # 超预算二次拆分上限
 # 被拆穿】(契约自洽优先)，单实体即便超此数也整批原子，靠 A=900s 预算兜底(实测 9 文件≈560s)。
 # RUN13(预算)+RUN14(契约漂移)双教训：拆分边界只能落在实体之间，不能落在一个实体的层之间。
 MAX_FILES_PER_SUBTASK = 4
+# round10 #3 治本：单实体全栈【文件数上界】。RUN14"不拆穿实体"对【正常 6 文件实体】(domain/
+# mapper/xml/IService/Impl/Controller)成立；但【含多 DTO/helper 的大实体】(实测 st-8-1 10/
+# st-12-1 11/st-16-1 14 文件)整批必撞 900s 超时(LLM 反复诊断该拆,旧逻辑守 RUN14 不拆→换模型空转)。
+# 超此上界则【按层】拆(数据层 boilerplate 快 → 逻辑层 service/impl/controller 复杂,串行)：共享
+# 契约(CONTRACT_MODULE)已锚定接口/DTO 签名,按层拆+契约注入不致漂移。正常实体(≤此数)仍整批守 RUN14。
+MAX_SINGLE_ENTITY_FILES = 6
 # 分层秩(数据模型→持久层→业务层→Web 层)：仅用于【批内文件排序】(描述里数据层在前读着自然)，
 # 不再作为拆分边界——拆分边界是实体词干(_entity_stem)。
 _LAYER_ORDER = {
@@ -2191,6 +2197,27 @@ def _entity_stem(rel: str) -> str:
     return name or "misc"
 
 
+def _split_single_entity_by_layer(core: list[str], max_files: int) -> list[list[str]]:
+    """round10 #3 治本：单实体大 core 按【层】拆——数据层(domain/DTO/mapper/xml,boilerplate 快)
+    → 逻辑层(service/impl/controller,复杂慢)，串行(逻辑依赖数据)。共享契约(CONTRACT_MODULE)已锚定
+    接口/DTO 签名，故按层拆+契约注入不致 RUN14 漂移。数据层若仍超 max_files 再按块拆(DTO/domain
+    低耦合可分)。返回 ≥2 批=拆成功；无清晰层 seam(纯逻辑/纯数据)返回 [core] 不拆(避免空批)。"""
+    def _is_logic(f: str) -> bool:
+        b = f.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        return b.endswith("Controller") or b.endswith("Service") or b.endswith("ServiceImpl")
+    logic = [f for f in core if _is_logic(f)]
+    data = [f for f in core if not _is_logic(f)]
+    if not logic or not data:
+        return [core]   # 无层 seam → 不拆
+    batches: list[list[str]] = []
+    if len(data) > max_files:
+        batches += [data[i:i + max_files] for i in range(0, len(data), max_files)]
+    else:
+        batches.append(data)
+    batches.append(logic)
+    return batches
+
+
 def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> list:
     """确定性按【实体词干】把文件数超标的子任务拆成多个子任务(不调 LLM，可复现)。
 
@@ -2242,7 +2269,12 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             feat[next((a for a in anchors if s.startswith(a)), anchors[-1])].append(f)
         core_batches = [feat[a] for a in sorted(anchors, key=len) if feat[a]]
     elif core:
-        core_batches = [core]
+        # round10 #3 治本：单实体 core 超文件数上界 → 按层拆(数据→逻辑,契约锚定不漂移)消除 900s
+        # 超时；正常实体(≤上界)仍整批守 RUN14。
+        if len(core) > MAX_SINGLE_ENTITY_FILES:
+            core_batches = _split_single_entity_by_layer(core, max_files)
+        else:
+            core_batches = [core]
 
     # web/sql 各自成批(web 多则按 max_files 分块);批序：core → web(引用控制器URL,放其后) → sql(独立,末)
     web_batches = [web[i:i + max_files] for i in range(0, len(web), max_files)] if web else []
