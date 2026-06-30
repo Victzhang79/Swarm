@@ -75,6 +75,13 @@ class _UsageRecorder(BaseCallbackHandler):
         self.provider_id = provider_id or ""
         self.model_name = model_name or ""
         self._starts: dict[Any, float] = {}  # run_id → 起始时刻（算单次调用耗时）
+        # run_id → [max_input, max_output]：流式逐 chunk usage 的【按字段取最大】。
+        # 治本【流式 usage 膨胀】：部分 OpenAI 兼容网关（实测云端 GLM）在【每个 chunk】都回
+        # 累计 usage（input 恒定、output 单调增），而 langchain 拼接 AIMessageChunk 时把各
+        # chunk 的 usage_metadata【逐字段求和】→ 末态 = Σ累计 ≈ N×真值（581 chunk → input 膨胀
+        # 581 倍）。标准 OpenAI/本地仅末 chunk 带 usage，无此问题。统一【取各字段跨 chunk 最大值】
+        # 即正解：累计型→max=末次累计=真总量；仅末chunk型→max=唯一值=真总量。两类网关都对。
+        self._usage: dict[Any, list[int]] = {}
 
     def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
         try:
@@ -82,12 +89,41 @@ class _UsageRecorder(BaseCallbackHandler):
         except Exception:  # noqa: BLE001
             pass
 
+    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        # 流式：逐 chunk 抓 usage_metadata，按字段累计【最大值】（不求和，避免累计型网关膨胀）。
+        try:
+            chunk = kwargs.get("chunk")
+            um = getattr(getattr(chunk, "message", None), "usage_metadata", None) \
+                or getattr(chunk, "usage_metadata", None)
+            if not um:
+                return
+            rid = kwargs.get("run_id")
+            slot = self._usage.get(rid)
+            if slot is None:
+                slot = [0, 0]
+                self._usage[rid] = slot
+            i = int(um.get("input_tokens", 0) or 0)
+            o = int(um.get("output_tokens", 0) or 0)
+            if i > slot[0]:
+                slot[0] = i
+            if o > slot[1]:
+                slot[1] = o
+        except Exception:  # noqa: BLE001
+            pass
+
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         try:
-            prompt_t, completion_t = _extract_token_usage(response)
+            rid = kwargs.get("run_id")
+            # 优先用流式逐 chunk 抓到的【字段最大值】（非 langchain 求和的膨胀末态）；
+            # 无流式 chunk usage（非流式调用）才回退 LLMResult 的 token_usage/usage_metadata。
+            tracked = self._usage.pop(rid, None)
+            if tracked and (tracked[0] > 0 or tracked[1] > 0):
+                prompt_t, completion_t = tracked[0], tracked[1]
+            else:
+                prompt_t, completion_t = _extract_token_usage(response)
             if prompt_t <= 0 and completion_t <= 0:
                 return
-            t0 = self._starts.pop(kwargs.get("run_id"), None)
+            t0 = self._starts.pop(rid, None)
             dur_ms = int((_monotonic() - t0) * 1000) if t0 is not None else 0
             from swarm.knowledge.service import get_worker_project_id
             from swarm.models import usage_tracker
@@ -97,6 +133,12 @@ class _UsageRecorder(BaseCallbackHandler):
             )
         except Exception:  # noqa: BLE001
             pass  # 统计绝不拖垮模型调用
+
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        # 调用失败：清理两个 per-run 字典，避免 run_id 泄漏累积（best-effort）。
+        rid = kwargs.get("run_id")
+        self._starts.pop(rid, None)
+        self._usage.pop(rid, None)
 
 
 def _extract_token_usage(response: Any) -> tuple[int, int]:

@@ -648,6 +648,14 @@ async def run_task(
     from swarm.logging_config import set_task_context
 
     set_task_context(task_id)
+    # 绑定 project 上下文：本协程内所有 brain 编排 LLM 调用（ANALYZE/TECH_DESIGN/plan/
+    # dispatch/HANDLE_FAILURE 等均 await llm.ainvoke）经 ContextVar 自动归属本项目，供
+    # token 用量统计按项目聚合。brain 全异步→ContextVar 沿 await 链 + gather 子任务(创建时
+    # copy_context)自然传播；每个 run_task 是独立 asyncio.Task，互不串项目。worker 侧另在
+    # executor 派发前各自设置（可能跨进程/线程，须显式）。
+    from swarm.knowledge.service import set_worker_context
+
+    set_worker_context(project_id or None)
     queue = register_task_queue(task_id)
     if task_id in _task_running:
         await _emit(queue, {"step": "error", "status": "error", "message": "任务已在执行中"})

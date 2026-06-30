@@ -51,6 +51,61 @@ def test_extract_usage_shapes():
     assert R._extract_token_usage(_Res()) == (0, 0)
 
 
+# ── 流式逐 chunk usage：累计型网关取 max 不求和（防膨胀）+ 并行不串号 ──
+def _chunk(um):
+    return type("C", (), {"message": type("M", (), {"usage_metadata": um})()})()
+
+
+def test_streaming_usage_takes_max_not_sum(monkeypatch):
+    """累计型网关每 chunk 回累计 usage（input 恒定/output 单调增）→ 必须取 max 不求和。"""
+    _clear()
+    monkeypatch.setattr(U, "_table_ready", True)
+    monkeypatch.setattr(U, "flush", lambda: None)  # 隔离后台 flusher：勿清缓冲/勿污染真库
+    rec = R._UsageRecorder("cloud", "prov", "GLM")
+    rec.on_llm_start({}, [], run_id="A")
+    # 模拟 4 个累计 chunk：input 恒 24，output 0→10→200→592（末次=真总量）
+    for out in (0, 10, 200, 592):
+        rec.on_llm_new_token("x", chunk=_chunk({"input_tokens": 24, "output_tokens": out}), run_id="A")
+    rec.on_llm_end(type("R", (), {"llm_output": None, "generations": []})(), run_id="A")
+    # 记录的是 max(24)/max(592)，绝非 sum(96)/sum(802)
+    slot = U._buffer[("", "cloud", "prov", "GLM")]
+    assert slot[0] == 24 and slot[1] == 592, f"应取 max 不求和, 实得 {slot}"
+    assert "A" not in rec._usage and "A" not in rec._starts, "run_id 状态应已清理"
+
+
+def test_streaming_usage_parallel_no_crosstalk(monkeypatch):
+    """并行两路调用（不同 run_id）各自独立取 max，互不串号。"""
+    _clear()
+    monkeypatch.setattr(U, "_table_ready", True)
+    monkeypatch.setattr(U, "flush", lambda: None)
+    rec = R._UsageRecorder("cloud", "prov", "GLM")
+    rec.on_llm_start({}, [], run_id="A")
+    rec.on_llm_start({}, [], run_id="B")
+    # 交错到达：A 与 B 的 chunk 穿插
+    rec.on_llm_new_token("x", chunk=_chunk({"input_tokens": 10, "output_tokens": 5}), run_id="A")
+    rec.on_llm_new_token("x", chunk=_chunk({"input_tokens": 99, "output_tokens": 7}), run_id="B")
+    rec.on_llm_new_token("x", chunk=_chunk({"input_tokens": 10, "output_tokens": 80}), run_id="A")
+    rec.on_llm_new_token("x", chunk=_chunk({"input_tokens": 99, "output_tokens": 300}), run_id="B")
+    rec.on_llm_end(type("R", (), {"llm_output": None, "generations": []})(), run_id="A")
+    rec.on_llm_end(type("R", (), {"llm_output": None, "generations": []})(), run_id="B")
+    # 聚合键相同(同 model)，calls=2，tokens = A(10,80) + B(99,300) 各自 max 后求和
+    slot = U._buffer[("", "cloud", "prov", "GLM")]
+    assert slot == [10 + 99, 80 + 300, 2, 0], f"两路各取 max 后累加, 实得 {slot}"
+
+
+def test_nonstreaming_falls_back_to_result(monkeypatch):
+    """非流式（无 chunk）→ 回退 LLMResult 的 token_usage。"""
+    _clear()
+    monkeypatch.setattr(U, "_table_ready", True)
+    monkeypatch.setattr(U, "flush", lambda: None)
+    rec = R._UsageRecorder("local", "prov", "M2")
+    rec.on_llm_start({}, [], run_id="Z")
+    res = type("R", (), {"llm_output": {"token_usage": {
+        "prompt_tokens": 40, "completion_tokens": 12}}, "generations": []})()
+    rec.on_llm_end(res, run_id="Z")
+    assert U._buffer[("", "local", "prov", "M2")][:2] == [40, 12]
+
+
 # ── flush upsert + 聚合读取（mock pool）──
 class _FakeCursor:
     def __init__(self, rows_by_call): self._rows = rows_by_call; self.executed = []; self.many = []; self._last = None
@@ -66,6 +121,10 @@ class _FakeCursor:
 
 def _clear():
     U._buffer.clear(); U._lat_buffer.clear()
+    # 复位 worker-context ContextVar：全量套件里前序测试（brain/executor 路径）可能遗留项目
+    # 归属，污染本文件依赖 get_worker_project_id() 的用例（致聚合键变 ('X',...) 而非 ('',...)）。
+    from swarm.knowledge.service import set_worker_context
+    set_worker_context(None)
 
 
 class _FakeConn:
