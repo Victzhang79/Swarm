@@ -135,6 +135,72 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
         logger.debug("[DISPATCH] 知识库回灌跳过(非致命): %s", exc)
 
 
+def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
+                                  max_concurrent, to_dispatch):
+    """主干B 不变量·DISPATCH 闸门：派发前确保每个工作单元【文件数≤上界】（预防式治本）。
+
+    根因：编排允许 oversized 子任务一路派到 worker，撞 900s 墙钟超时后才在恢复阶梯拆小——
+    那是"检测-补偿"（先浪费一个超时再补救）。这里在派发前就用确定性按文件拆小
+    （_split_oversized_by_files，非 LLM、快、收敛：每块≤MAX_FILES_PER_SUBTASK），就地改写
+    plan + dispatch_remaining，再重选批次，使超预算的大块【根本不会进 worker】。
+
+    收敛性：file-split 产出的子块文件数恒≤上界 → 下轮闸门对它们直接放行，幂等无循环。
+    拆不动的（单文件巨核等）原样放行并显式 log（不静默截断），交超时阶梯兜底。
+    返回 (plan_obj, dispatch_remaining, to_dispatch)（plan 可能被重建，调用方须回写 state）。
+    """
+    try:
+        from swarm.brain.planning_nodes import (
+            _oversized_by_files,
+            _rebuild_plan,
+            _remap_dependents,
+            _split_oversized_by_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[DISPATCH] 预算闸门：planning 辅助导入失败(跳过): %s", exc)
+        return plan_obj, dispatch_remaining, to_dispatch
+
+    oversized = [st for st in to_dispatch if _oversized_by_files(st)]
+    if not oversized:
+        return plan_obj, dispatch_remaining, to_dispatch
+
+    new_subtasks = list(plan_obj.subtasks)
+    remaining = list(dispatch_remaining)
+    changed = False
+    for st in oversized:
+        try:
+            children = _split_oversized_by_files(st)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[DISPATCH] 预算闸门拆小 %s 异常(放行): %s", st.id, exc)
+            continue
+        if not children or len(children) <= 1:
+            # 拆不动（单文件巨核）→ 原样放行，显式 log 不静默；交超时阶梯兜底。
+            logger.warning(
+                "[DISPATCH] 预算闸门：子任务 %s 超文件上界但确定性拆不动 → 原样派发"
+                "（交超时强制拆小阶梯兜底，不静默）", st.id,
+            )
+            continue
+        idx = next((i for i, x in enumerate(new_subtasks) if getattr(x, "id", None) == st.id), None)
+        if idx is None:
+            continue
+        new_subtasks[idx:idx + 1] = children
+        _remap_dependents(new_subtasks, st.id, children[-1].id)
+        if st.id in remaining:
+            remaining.remove(st.id)
+        for c in children:
+            if c.id not in remaining:
+                remaining.append(c.id)
+        changed = True
+        logger.info(
+            "[DISPATCH] 预算闸门：派发前把超文件上界子任务 %s 确定性拆为 %d 小块 %s（不让大块进 worker）",
+            st.id, len(children), [c.id for c in children],
+        )
+    if not changed:
+        return plan_obj, dispatch_remaining, to_dispatch
+    plan_obj = _rebuild_plan(plan_obj, new_subtasks)
+    to_dispatch = plan_obj.get_dispatch_batch(completed_ids, remaining, max_concurrent)
+    return plan_obj, remaining, to_dispatch
+
+
 async def dispatch(state: BrainState) -> dict:
     """DISPATCH 节点 — 将就绪的子任务派发给 Worker
 
@@ -175,6 +241,14 @@ async def dispatch(state: BrainState) -> dict:
         completed_ids, dispatch_remaining, max_concurrent
     )
 
+    # ── 主干B 不变量·DISPATCH 预算闸门：超文件上界的工作单元在派发前确定性拆小，
+    # 不让大块进 worker 撞 900s 超时（预防式治本，非超时后补偿）。plan 可能被重建 → 须回写 state。
+    _plan_before_gate = plan_obj
+    plan_obj, dispatch_remaining, to_dispatch = _enforce_dispatch_budget_gate(
+        plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch
+    )
+    _gate_split = plan_obj is not _plan_before_gate
+
     # ── 跨子任务上下文传递(B3 配套)：把【前序已完成依赖子任务】的产出注入后序子任务，
     # 让后序看到前序定义的真实接口签名/新建符号，避免接口对不上（依赖序拆分场景）。
     _inject_predecessor_context(to_dispatch, plan_obj, subtask_results)
@@ -185,10 +259,13 @@ async def dispatch(state: BrainState) -> dict:
     )
 
     if not to_dispatch:
-        return {
+        _empty: dict = {
             "subtask_results": subtask_results,
             "dispatch_remaining": dispatch_remaining,
         }
+        if _gate_split:
+            _empty["plan"] = plan_obj  # 闸门拆小后须回写新 plan，否则子块在旧 plan 找不到→孤儿
+        return _empty
 
     project_id = state.get("project_id", "")
     task_id = state.get("task_id", "")
@@ -306,6 +383,8 @@ async def dispatch(state: BrainState) -> dict:
         "dispatch_remaining": dispatch_remaining,
         **worker_ctx,
     }
+    if _gate_split:
+        result["plan"] = plan_obj  # 闸门拆小后须回写新 plan，否则子块在旧 plan 找不到→孤儿
     # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，
     # 若仅非空时返回，上一轮失败列表会残留 → gates 误拒真正成功的运行。
     result["failed_subtask_ids"] = failed_ids

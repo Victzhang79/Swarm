@@ -1945,6 +1945,32 @@ class WorkerExecutor:
             # 否则并发 worker 的 intent-to-add 互相泄漏进对方 diff、与他人 reset/diff 互踩。
             # 锁内只放这两条短命 git 命令；ls-files 探测（只读）与 diff 结果处理在锁外。
             with _ProjectGitFlock(root):
+                # ── 主干A 治本（并行子任务共享聚合态）──
+                # 根因：pull-back 把产物写回【共享】project_path 工作区（一任务一份，N 个并行
+                # worker 共用），而本路径取"工作区当前内容"作 diff 新值。多写者对同一聚合文件
+                # （根 pom / settings.gradle / Cargo.toml…）last-write-wins 互相覆盖 → 谁后写、
+                # 谁的内容进了别人的 diff，被覆盖者的 +<module>/+<dependency> 直接从 diff 丢失，
+                # 下游 MERGE 并集（Lever A）也救不回【从未被任何 diff 捕获】的成员。
+                # 不变量：worker 的 diff 必须是 (HEAD, 本 worker 自己 pull-back 的产出) 的纯函数，
+                # 与其他 worker 无关。锁内先用本 worker 的 _post_sync_contents 把自己的 scope 文件
+                # 重置回自己的产出，再 diff——把 diff 对【长生命周期共享工作区】的依赖切断，concurrent
+                # 写者无法在"重置→diff"这段持锁原子区内插进来。仅重置本 subtask owns 的 targets，
+                # 不碰他人文件；二进制(None)/删除(缺键)/未产出则保留工作区现状（退化为原行为）。
+                _own = getattr(self, "_post_sync_contents", None) or {}
+                for _f in targets:
+                    _txt = _own.get(_f)
+                    if not isinstance(_txt, str):
+                        continue
+                    try:
+                        _lp = _P(root) / _f
+                        _lp.parent.mkdir(parents=True, exist_ok=True)
+                        # _txt 来自 _post_sync_contents：其字节在 pull-back 时已过 _preserve_line_endings
+                        # （与本地/HEAD 同行尾），decode 成字符串后行尾已正确，直接 encode 写回即同源。
+                        # 【不再】二次对磁盘采样判 CRLF——持锁前磁盘可能是别的 worker 的覆盖版，采它会
+                        # 误判行尾、给本 worker 的 diff 引入伪 CRLF 噪声（评审 MEDIUM，治本：不依赖共享磁盘）。
+                        _lp.write_bytes(_txt.encode("utf-8"))
+                    except OSError as _wexc:
+                        self._log(f"主干A 自产出重置落盘失败 {_f}（退化读工作区现状）: {_wexc}")
                 if untracked:
                     _sp.run(["git", "-C", root, "add", "-N", *untracked],
                             capture_output=True, text=True, timeout=30)

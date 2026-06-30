@@ -112,6 +112,23 @@ def get_instance_id() -> str:
 
 MAX_SYNC_FILE_SIZE = 1_048_576  # 1 MiB
 
+# ── 主干A 治本：跨子任务共享的聚合清单（多并发 worker 共写，last-write-wins 互覆盖）──
+# 这些文件被 N 个并行 worker 各加不同 <module>/<dependency>/Project 条目；它们的 pull-back
+# 写盘必须与别的 worker 的"自产出重置→git diff"原子区串行（同一把 per-project flock），否则
+# 会在那段窗口里插入污染对方 diff，导致 +<module> 从 diff 丢失、下游 MERGE 并集也救不回。
+# 与 worker.workspace_manifest / brain.merge_engine._is_aggregate_manifest 覆盖的生态一致。
+_SHARED_MANIFEST_BASENAMES = frozenset({
+    "pom.xml", "settings.gradle", "settings.gradle.kts",
+    "build.gradle", "build.gradle.kts", "cargo.toml", "go.work",
+})
+
+
+def _is_shared_manifest(rel_posix: str) -> bool:
+    """聚合清单（多写者共享态）→ True。其 pull-back 写盘需 flock 守护，非清单文件各子任务独占免锁。"""
+    base = rel_posix.rsplit("/", 1)[-1].lower()
+    return base in _SHARED_MANIFEST_BASENAMES or base.endswith(".sln")
+
+
 _sidecar_initialized = False
 _sandbox_manager: "SandboxManager | None" = None
 
@@ -1230,7 +1247,18 @@ print(json.dumps(files))
                 # 保持行尾与 git HEAD 一致 → git diff 同源、apply 必成功。二进制/已是 LF 的不动。
                 data = self._preserve_line_endings(local_path, data)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                local_path.write_bytes(data)
+                if _is_shared_manifest(rel_posix):
+                    # 主干A：聚合清单写盘与 diff 用同一把 per-project flock 串行，杜绝并发 worker
+                    # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
+                    # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
+                    try:
+                        from swarm.worker.executor import _ProjectGitFlock
+                        with _ProjectGitFlock(local_root):
+                            local_path.write_bytes(data)
+                    except Exception:
+                        local_path.write_bytes(data)
+                else:
+                    local_path.write_bytes(data)
                 stats["downloaded"] += 1
                 try:
                     stats["contents"][rel_posix] = data.decode("utf-8")

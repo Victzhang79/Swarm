@@ -1807,6 +1807,110 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
     }
 
 
+# 主干B 治本：子任务【超时】= 工作单元对执行预算太大的确定性信号（非模型瞬时抖动）。
+# 这类失败的【第一恢复动作】必须是【确定性拆小】，而不是先换模型重试同样的大块——
+# round10 实证：大单实体 900s 超时，系统反复 retry/retry_alternate 同样的大块、拆小靠后，
+# 磨到用户取消。locating/coding 超时都源于"要做的活超出一个 worker 一次能干完的量"，拆小真
+# 有用；preparing 超时是沙箱基础设施（坏镜像/envd）非尺寸问题，交给瞬时/常规阶梯，不在此拆。
+_TIMEOUT_OVERSIZE_MARKERS = ("timeout_in_coding", "timeout_in_locating")
+
+
+def _is_timeout_oversize_failure(out: object) -> bool:
+    """子任务失败是否为【尺寸超预算】型超时（coding/locating）。preparing/infra 超时不算。"""
+    if isinstance(out, WorkerOutput):
+        details = out.l1_details or {}
+    elif isinstance(out, dict):
+        details = out.get("l1_details") or {}
+    else:
+        return False
+    err = str(details.get("error", "") or "")
+    return any(marker in err for marker in _TIMEOUT_OVERSIZE_MARKERS)
+
+
+async def _redecompose_timeout_subtasks(
+    state: BrainState, timeout_ids: list[str]
+) -> dict | None:
+    """主干B 不变量·超时→强制拆小作第一恢复动作。
+
+    把本批所有【可拆】的尺寸超时子任务一次性定点拆小、重派小块，保留成功兄弟与其余失败。
+    不可拆的（≤2 文件 / 已拆过 1 次）留在 failed_subtask_ids 交常规阶梯（换模型/升级），
+    绝不在此清空——清空会让失败子任务以 l1_passed=False 残留在 subtask_results 里被
+    `completed_ids = set(subtask_results.keys())` 当成"已完成"静默漏到 MERGE（silent-fail）。
+    全都不可拆 → 返回 None，交常规阶梯。每子任务最多拆 1 次（subtask_redecompose_count 熔断）。
+    """
+    plan_obj = state.get("plan")
+    if plan_obj is None or not timeout_ids:
+        return None
+    rd_counts = dict(state.get("subtask_redecompose_count", {}))
+    try:
+        from swarm.brain.planning_nodes import (
+            _oversized_by_files,
+            _rebuild_plan,
+            _remap_dependents,
+            _split_oversized_by_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[HANDLE_FAILURE] 超时拆小：planning 辅助导入失败(跳过): %s", exc)
+        return None
+    new_subtasks = list(plan_obj.subtasks)
+    split_children: dict[str, list] = {}  # failed_id -> [children]
+    for fid in timeout_ids:
+        if rd_counts.get(fid, 0) >= 1:
+            continue  # 已拆过一次 → 不再拆（防无限拆），交常规阶梯
+        st = next((s for s in new_subtasks if getattr(s, "id", None) == fid), None)
+        if st is None:
+            continue
+        # 本预占通道【纯确定性、零 LLM、先于策略】：仅对文件数超界(_oversized_by_files)的超时块
+        # 用确定性按文件/层拆（_split_oversized_by_files）。文件数未超界的超时（3-4 文件/单文件大
+        # token）确定性拆不动——【不在此调 LLM 拆】，留给常规阶梯 ladder-2(_targeted_redecompose
+        # 的 LLM 辅助拆)处理，避免在"先于 LLM"的预占通道里偷偷起 LLM（评审 HIGH：守不变量、不重复 LLM 路径）。
+        if not _oversized_by_files(st):
+            continue
+        try:
+            children = _split_oversized_by_files(st)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[HANDLE_FAILURE] 超时拆小 %s 异常(跳过): %s", fid, exc)
+            continue
+        if not children or len(children) <= 1:
+            continue  # 拆不动 → 交常规阶梯
+        idx = next((i for i, x in enumerate(new_subtasks) if getattr(x, "id", None) == fid), None)
+        if idx is None:
+            continue
+        new_subtasks[idx:idx + 1] = children
+        _remap_dependents(new_subtasks, fid, children[-1].id)
+        rd_counts[fid] = rd_counts.get(fid, 0) + 1
+        split_children[fid] = children
+    if not split_children:
+        return None  # 没有任何可拆的超时子任务 → 交常规阶梯
+    new_plan = _rebuild_plan(plan_obj, new_subtasks)
+    subtask_results = dict(state.get("subtask_results", {}))
+    dispatch_remaining = list(state.get("dispatch_remaining", []))
+    for fid, children in split_children.items():
+        subtask_results.pop(fid, None)
+        for c in children:
+            if c.id not in dispatch_remaining:
+                dispatch_remaining.append(c.id)
+    # 未拆的失败（不可拆超时 + 本批其它非超时失败）留在 failed_subtask_ids → 下一轮 handle_failure
+    # 走常规阶梯处理（绝不清空，否则被 completed_ids 静默吞掉）。
+    all_failed = list(state.get("failed_subtask_ids", []))
+    leftover = [fid for fid in all_failed if fid not in split_children]
+    logger.info(
+        "[HANDLE_FAILURE] 主干B·超时强制拆小（第一恢复动作）：拆小 %d 个尺寸超时子任务 %s，"
+        "保留成功兄弟、只重派小块；%d 个不可拆/其它失败 %s 交常规阶梯",
+        len(split_children), list(split_children.keys()), len(leftover), leftover,
+    )
+    return {
+        "plan": new_plan,
+        "subtask_results": subtask_results,
+        "dispatch_remaining": dispatch_remaining,
+        "failed_subtask_ids": leftover,
+        "failure_strategy": "retry",
+        "subtask_redecompose_count": rd_counts,
+        # state 无 reducer(last-write-wins)：显式清 verification_failure，防上轮验证态残留串到下轮路由。
+        "verification_failure": None,
+    }
+
+
 def _subtask_footprint(st) -> list[str]:
     """子任务在【本地树】可能留下的文件足迹（writable ∪ create_files），归一为相对 posix 路径。"""
     sc = getattr(st, "scope", None)
@@ -2211,6 +2315,17 @@ async def handle_failure(state: BrainState) -> dict:
             "use_alternate_model": forced_alternate,
             "subtask_retry_counts": {**retry_counts, **next_counts},
         }
+
+    # ── 主干B 不变量·超时→强制拆小作【第一恢复动作】（先于 LLM 策略 + 一切换模型重试）──
+    # 子任务 coding/locating 超时 = 工作单元对执行预算太大的确定性信号。先换模型重试同样的大块
+    # 只会再超时（round10 实证磨到取消）；确定性拆小才治本。可拆的立即拆小重派、保留成功兄弟，
+    # 不可拆的（≤2 文件/已拆过）落回常规阶梯。无任何可拆超时 → None → 继续常规分析。
+    _timeout_ids = [fid for fid in failed_ids
+                    if _is_timeout_oversize_failure(subtask_results.get(fid))]
+    if _timeout_ids:
+        _redecomp_timeout = await _redecompose_timeout_subtasks(state, _timeout_ids)
+        if _redecomp_timeout is not None:
+            return _redecomp_timeout
 
     # ── LLM 故障分析 ──
     # audit #17：strategy 必须在 try 前有确定默认值——否则 _get_brain_llm() 抛异常时
