@@ -235,6 +235,53 @@ def test_split_child_description_is_self_contained():
         assert len(d) > 300, f"{c.id} 描述仍像被截断的 stub: {len(d)} 字"
 
 
+# ── A1 治本(round11)：层拆下游批 readable 含上游批产物 → decouple 不误剥 + bootstrap 注入 ──
+def _layer_split_children():
+    """9 文件单实体 → 按层拆(数据批 + 逻辑批),逻辑批应能 import 数据批产出的 domain/mapper。"""
+    files = _entity_files("AlarmRule") + [
+        "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/vo/AlarmRuleVo.java",
+        "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/dto/AlarmRuleDto.java",
+        "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/vo/AlarmRuleListVo.java",
+    ]
+    st = SubTask(id="st-6", description="告警规则全栈(超大)", scope=FileScope(create_files=files))
+    return _split_oversized_by_files(st)
+
+
+def test_layer_split_downstream_readable_includes_upstream_creates():
+    """A1: 逻辑批(含 Controller, import domain) 的 readable 必含上游数据批产出文件。
+    这一处同治:① decouple 见文件重叠不误剥层间真依赖;② worker bootstrap 据 readable 把
+    兄弟 domain 产物注入本批沙箱,杜绝 round11 的 `package …domain does not exist` 空转。"""
+    children = _layer_split_children()
+    assert len(children) >= 2, "9 文件单实体应按层拆"
+    logic_idx = next(i for i, c in enumerate(children)
+                     if any("Controller" in f for f in c.scope.create_files))
+    assert logic_idx >= 1, "逻辑批应在数据批之后(数据→逻辑串行)"
+    upstream_creates = set()
+    for c in children[:logic_idx]:
+        upstream_creates |= set(c.scope.create_files)
+    readable = set(getattr(children[logic_idx].scope, "readable", []) or [])
+    assert upstream_creates, "应有上游数据批产物"
+    assert upstream_creates <= readable, \
+        f"逻辑批 readable 缺上游数据批产物(import 不到+沙箱注入不了): {upstream_creates - readable}"
+    # 数据批的 create_files 不应被污染成 readable(只下游加 readable)
+    assert not (getattr(children[0].scope, "readable", []) or []), "首批无上游,readable 应空"
+
+
+def test_layer_split_dep_survives_decouple():
+    """A1 根因回归:上游产物入 readable 后,_decouple_independent_subtasks 见文件重叠
+    不再把层间真依赖(逻辑批→数据批)当"零文件重叠"误剥(round11 wiring bug 根因)。"""
+    import types as _t
+    from swarm.brain.planning_nodes import _decouple_independent_subtasks
+    children = _layer_split_children()
+    assert len(children) >= 2
+    logic = children[-1]
+    upstream_id = children[-2].id
+    assert upstream_id in (logic.depends_on or []), "末批应串行依赖前批"
+    _decouple_independent_subtasks(_t.SimpleNamespace(subtasks=list(children)))
+    assert upstream_id in (logic.depends_on or []), \
+        "层间真依赖(逻辑批→数据批)不得被 decouple 误剥(A1 根因翻车点)"
+
+
 # ── 触发器：单文件守卫不误伤 ──
 def test_single_file_guard_still_holds():
     st = SubTask(id="st-1", description="改一个大文件",

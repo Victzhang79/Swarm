@@ -2297,10 +2297,20 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     base_desc = (getattr(st, "description", "") or "").strip()[:2000]
     n = len(norm_batches)
     children = []
+    _upstream_creates: list[str] = []   # 已拆出上游批的 create_files 累积(批序串行)
     for i, grp in enumerate(norm_batches):
         child_scope = scope.model_copy(deep=True)
         child_scope.create_files = [p for p, k in grp if k == "create"]
         child_scope.writable = [p for p, k in grp if k == "write"]
+        # ── A1 治本(round11)：下游批常 import 上游批产出的类型(数据层 domain/DTO/mapper →
+        # 逻辑层 service/impl/controller)。但层拆只设了 depends_on 串行链、没把上游产物列入本批
+        # readable → ① _decouple_independent_subtasks 见"零文件重叠"误剥这条真依赖；② worker
+        # bootstrap 据 readable(local≠HEAD)注入上游产物，缺它则本批沙箱看不到兄弟 domain →
+        # `package …domain does not exist` / internal_pkg_not_built 空转(round11 st-14/st-7 全栽)。
+        # 把上游批 create_files 并入本批 readable，一处同治【不误剥】+【兄弟产物注入】。
+        if _upstream_creates:
+            _existing_r = list(getattr(child_scope, "readable", []) or [])
+            child_scope.readable = list(dict.fromkeys(_existing_r + _upstream_creates))
         files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
         child_desc = (
             f"{base_desc}\n\n【按文件分批 · 第 {i + 1}/{n} 批】本子任务是上述父任务按文件分层"
@@ -2323,6 +2333,8 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             est_context_tokens=int((getattr(st, "est_context_tokens", 0) or 0) * len(grp) /
                                    max(1, len(creates) + len(writables))) or 1,
         ))
+        # 本批 create_files 入累积，供后续批 readable 引用(A1 治本，见上)
+        _upstream_creates += [p for p, k in grp if k == "create"]
     logger.info("[ELABORATE] 子任务 %s 文件数 %d → 分层/特性拆为 %d 批"
                 "(core:%d批+web:%d+sql:%d，Controller 锚点 %d，单特性java不拆穿)",
                 st.id, len(creates) + len(writables), n,
