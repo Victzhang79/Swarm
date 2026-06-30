@@ -76,6 +76,9 @@ function switchTopTab(topTab) {
     if (typeof loadCommandBlacklist === 'function') loadCommandBlacklist();
   } else if (topTab === 'system') {
     startSystemRefresh();
+  } else if (topTab === 'token-usage') {
+    stopSystemRefresh();
+    if (typeof loadTokenUsage === 'function') loadTokenUsage();
   } else if (topTab === 'settings') {
     stopSystemRefresh();
     if (typeof loadSettingsTab === 'function') loadSettingsTab();

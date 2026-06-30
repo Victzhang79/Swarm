@@ -86,6 +86,7 @@
             <button class="nav-tab nav-tab-top" data-toptab="observability" onclick="switchTopTab('observability')">📊 可观测</button>
             <button class="nav-tab nav-tab-top" data-toptab="sandboxes" onclick="switchTopTab('sandboxes')">🖥️ 沙箱</button>
             <button class="nav-tab nav-tab-top" data-toptab="system" data-admin-only="1" onclick="switchTopTab('system')">📈 系统</button>
+            <button class="nav-tab nav-tab-top" data-toptab="token-usage" data-admin-only="1" onclick="switchTopTab('token-usage')">💰 Token用量</button>
             <button class="nav-tab nav-tab-top" data-toptab="settings" data-admin-only="1" onclick="switchTopTab('settings')">⚙️ 设置</button>
           </nav>
 
@@ -757,6 +758,48 @@
                     <span style="font-size:12px;color:var(--text-secondary)">孤儿沙箱：<b id="orphan-count" style="color:var(--text-primary)">—</b> 个<span id="orphan-total" style="color:var(--text-muted)"></span></span>
                   </div>
                   <div id="pool-status-card" style="font-size:12px;color:var(--text-muted);padding:8px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:6px">加载中…</div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <!-- Token 用量 Tab（云端 vs 本地 + 总计 + 每项目，数据落 PG）-->
+          <div id="tab-token-usage" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="system-layout">
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>Token 用量 <span class="hint">云端大模型 vs 本地大模型 · 计费级累计（落库统计）</span></h3>
+                    <button class="btn btn-ghost btn-sm" onclick="loadTokenUsage()">刷新</button>
+                  </div>
+                  <div class="stats-grid stats-grid-token">
+                    <div class="stats-card stats-card-wide"><span class="stats-label">总计 Token</span><span class="stats-value stats-value-xl" id="tok-grand-total">—</span></div>
+                    <div class="stats-card stats-card-wide"><span class="stats-label">☁️ 云端 Token</span><span class="stats-value stats-value-xl" id="tok-cloud-total">—</span></div>
+                    <div class="stats-card stats-card-wide"><span class="stats-label">🖥️ 本地 Token</span><span class="stats-value stats-value-xl" id="tok-local-total">—</span></div>
+                    <div class="stats-card stats-card-wide"><span class="stats-label">总调用次数</span><span class="stats-value stats-value-xl" id="tok-grand-calls">—</span></div>
+                    <div class="stats-card stats-card-wide"><span class="stats-label">☁️ 云端 平均延迟</span><span class="stats-value stats-value-xl" id="tok-cloud-latency">—</span></div>
+                    <div class="stats-card stats-card-wide"><span class="stats-label">🖥️ 本地 平均延迟</span><span class="stats-value stats-value-xl" id="tok-local-latency">—</span></div>
+                    <div class="stats-card"><span class="stats-label">☁️ 云端 输入</span><span class="stats-value" id="tok-cloud-in">—</span></div>
+                    <div class="stats-card"><span class="stats-label">☁️ 云端 输出</span><span class="stats-value" id="tok-cloud-out">—</span></div>
+                    <div class="stats-card"><span class="stats-label">🖥️ 本地 输入</span><span class="stats-value" id="tok-local-in">—</span></div>
+                    <div class="stats-card"><span class="stats-label">🖥️ 本地 输出</span><span class="stats-value" id="tok-local-out">—</span></div>
+                  </div>
+                  <p class="hint" style="margin:6px 2px 0">Token 数自动按 K/M 显示（12.5M = 1250 万）。平均延迟为最近 200 次调用的平均耗时。云端指按用量计费的外部模型服务，本地指自部署模型。</p>
+                </section>
+                <section class="system-section system-section-compact">
+                  <div class="system-section-head">
+                    <h3>每项目用量 <span class="hint">按总 Token 降序</span></h3>
+                  </div>
+                  <table class="data-table" style="width:100%;font-size:13px">
+                    <thead><tr>
+                      <th style="text-align:left">项目</th>
+                      <th style="text-align:right">☁️ 云端</th>
+                      <th style="text-align:right">🖥️ 本地</th>
+                      <th style="text-align:right">合计</th>
+                      <th style="text-align:right">调用次数</th>
+                    </tr></thead>
+                    <tbody id="tok-project-rows"><tr><td colspan="5" style="color:var(--text-muted)">加载中…</td></tr></tbody>
+                  </table>
                 </section>
               </div>
             </div>

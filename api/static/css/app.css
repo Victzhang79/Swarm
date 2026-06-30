@@ -1216,6 +1216,24 @@ html, body {
   line-height: 1.2;
 }
 .stats-value-red { color: var(--red); }
+/* Token 用量页：值很大(可达千万级 M)，给更宽的卡片与更大的字号 */
+.stats-grid-token {
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px;
+}
+.stats-grid-token .stats-card-wide {
+  padding: 18px 20px;
+  min-height: 84px;
+  justify-content: center;
+}
+.stats-grid-token .stats-label { font-size: 12px; }
+.stats-value-xl {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.stats-grid-token .stats-card .stats-value { font-size: 22px; white-space: nowrap; }
 .stats-banner {
   margin-bottom: 10px;
   padding: 10px 12px;

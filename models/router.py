@@ -62,6 +62,63 @@ class ModelInvocationLogger(BaseCallbackHandler):
         )
 
 
+class _UsageRecorder(BaseCallbackHandler):
+    """在每次 LLM 调用结束时记录 token 用量（云端/本地 + 项目 + 模型）到 usage_tracker。
+
+    统一在 get_chat_model 挂一次（那里 provider.kind/id/model 全在手），覆盖所有 cloud+local、
+    brain+worker、primary+fallback 路径，且只挂一处=不重复计数。project_id 取自 worker/brain 调用
+    前 set_worker_context 推入的 ContextVar（无上下文的早期调用归 ''=无项目归属）。best-effort。
+    """
+
+    def __init__(self, kind: str, provider_id: str, model_name: str) -> None:
+        self.kind = (kind or "cloud").lower()
+        self.provider_id = provider_id or ""
+        self.model_name = model_name or ""
+        self._starts: dict[Any, float] = {}  # run_id → 起始时刻（算单次调用耗时）
+
+    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
+        try:
+            self._starts[kwargs.get("run_id")] = _monotonic()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        try:
+            prompt_t, completion_t = _extract_token_usage(response)
+            if prompt_t <= 0 and completion_t <= 0:
+                return
+            t0 = self._starts.pop(kwargs.get("run_id"), None)
+            dur_ms = int((_monotonic() - t0) * 1000) if t0 is not None else 0
+            from swarm.knowledge.service import get_worker_project_id
+            from swarm.models import usage_tracker
+            usage_tracker.record(
+                get_worker_project_id(), self.kind, self.provider_id, self.model_name,
+                prompt_t, completion_t, duration_ms=dur_ms,
+            )
+        except Exception:  # noqa: BLE001
+            pass  # 统计绝不拖垮模型调用
+
+
+def _extract_token_usage(response: Any) -> tuple[int, int]:
+    """从 LLMResult 取 (prompt_tokens, completion_tokens)：非流式走 llm_output.token_usage，
+    流式(stream_usage=True)走 generations[..].message.usage_metadata。"""
+    try:
+        tu = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
+        if tu:
+            return int(tu.get("prompt_tokens", 0) or 0), int(tu.get("completion_tokens", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for gens in (getattr(response, "generations", None) or []):
+            for g in gens:
+                um = getattr(getattr(g, "message", None), "usage_metadata", None) or {}
+                if um:
+                    return int(um.get("input_tokens", 0) or 0), int(um.get("output_tokens", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0
+
+
 @runtime_checkable
 class ModelProvider(Protocol):
     """模型提供者协议"""
@@ -191,6 +248,10 @@ class EndpointProvider:
         from langchain_openai import ChatOpenAI
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
         api_key: str = self.provider.api_key or "EMPTY"  # type: ignore[assignment]
+        # token 用量统计：在唯一 chokepoint 挂一个 _UsageRecorder（知 kind/provider/model），
+        # 覆盖全部 cloud+local、brain+worker、primary+fallback 路径且只挂一处=不重复计数。
+        _cbs = list(callbacks or [])
+        _cbs.append(_UsageRecorder(self.provider.kind, self.provider.id, model_name))
         _kwargs: dict = dict(
             model=model_name,
             base_url=self.provider.base_url,
@@ -198,10 +259,13 @@ class EndpointProvider:
             temperature=temperature,
             timeout=self.config.timeout_seconds,
             max_retries=self._resolve_retries(),
-            callbacks=callbacks,
+            callbacks=_cbs,
             # streaming=True：取消/断连时 httpx 关闭流式连接，推理服务端(vLLM)
             # 检测到 client disconnect 即 abort 解码，释放 GPU；非流式则会跑完整段。
             streaming=True,
+            # 计费级 token 统计：流式默认不回 usage，必须显式要 stream_options.include_usage，
+            # 否则 on_llm_end 拿不到 prompt/completion tokens（统计全 0）。
+            stream_usage=True,
             # langchain 内置单值看门狗：设为【宽】的 first_token_timeout，作为 sync 路径 + 兜底上限；
             # async 热路径的【紧】解码间隔由 _DualTimeoutChatOpenAI._astream 另行把关（治本 A）。
             stream_chunk_timeout=getattr(

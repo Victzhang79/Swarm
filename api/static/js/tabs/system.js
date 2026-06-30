@@ -119,6 +119,41 @@ async function loadGlobalStats() {
   } catch { /* ignore */ }
 }
 
+// Token 用量：调 /api/stats/token-usage（云端 vs 本地 + 总计 + 每项目，数据落 PG）。
+async function loadTokenUsage() {
+  try {
+    const resp = await fetch('/api/stats/token-usage');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+    const bk = data.by_kind || {}, cloud = bk.cloud || {}, local = bk.local || {}, gt = data.grand_total || {};
+    set('tok-grand-total', formatTokenCount(gt.total_tokens || 0));
+    set('tok-cloud-total', formatTokenCount(cloud.total_tokens || 0));
+    set('tok-local-total', formatTokenCount(local.total_tokens || 0));
+    set('tok-grand-calls', (gt.call_count ?? 0).toLocaleString());
+    const fmtMs = ms => { const v = Number(ms) || 0; return v <= 0 ? '—' : (v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms'); };
+    set('tok-cloud-latency', fmtMs(cloud.avg_latency_ms));
+    set('tok-local-latency', fmtMs(local.avg_latency_ms));
+    set('tok-cloud-in', formatTokenCount(cloud.prompt_tokens || 0));
+    set('tok-cloud-out', formatTokenCount(cloud.completion_tokens || 0));
+    set('tok-local-in', formatTokenCount(local.prompt_tokens || 0));
+    set('tok-local-out', formatTokenCount(local.completion_tokens || 0));
+    const tbody = $('tok-project-rows');
+    if (tbody) {
+      const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+        c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      const rows = data.per_project || [];
+      tbody.innerHTML = rows.length
+        ? rows.map(r => '<tr><td style="text-align:left">' + esc(r.project_name) + '</td>'
+            + '<td style="text-align:right">' + formatTokenCount(r.cloud_tokens || 0) + '</td>'
+            + '<td style="text-align:right">' + formatTokenCount(r.local_tokens || 0) + '</td>'
+            + '<td style="text-align:right">' + formatTokenCount(r.total_tokens || 0) + '</td>'
+            + '<td style="text-align:right">' + ((r.call_count ?? 0).toLocaleString()) + '</td></tr>').join('')
+        : '<tr><td colspan="5" style="color:var(--text-muted)">暂无数据</td></tr>';
+    }
+  } catch { /* ignore */ }
+}
+
 // 上层系统 tab 入口：全局统计 + 组件健康 + 全局沙箱运维。
 function loadGlobalSystemTab() {
   loadGlobalStats();

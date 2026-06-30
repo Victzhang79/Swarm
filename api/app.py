@@ -1227,6 +1227,19 @@ async def get_project_stats(project_id: str, request: Request):
     return stats
 
 
+@app.get("/api/stats/token-usage", tags=["系统"])
+async def get_token_usage(request: Request):
+    """LLM token 用量统计：云端 vs 本地分项 + 总计 + 每项目（数据落 PG，实时 flush 后读）。
+
+    让运维看清实际烧了多少 token、云端/本地各多少、每个项目多少。全局视图 → 认证用户可见。
+    """
+    from swarm.api._shared import _require_user
+    _require_user(request)
+    loop = asyncio.get_running_loop()
+    from swarm.models import usage_tracker
+    return await loop.run_in_executor(None, usage_tracker.get_token_usage_stats)
+
+
 @app.get("/api/notifications", tags=["系统"])
 async def get_notifications(
     request: Request,
