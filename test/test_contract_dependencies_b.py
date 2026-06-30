@@ -137,6 +137,51 @@ def test_rule5_lands_dependencies_into_pom_owner_acceptance():
     assert "lombok" in note and "spring-boot-starter-data-redis" in note
 
 
+# ── A5 治本(round11)：逻辑模块落进单物理模块 → 无独立 owner 的依赖归并到唯一 pom owner ──
+def test_a5_ownerless_logical_module_dep_reconciled_to_sole_owner():
+    p = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="脚手架",
+                scope=FileScope(create_files=["ruoyi-alarm/pom.xml", "ruoyi-alarm/src/App.java"])),
+        SubTask(id="st-2", description="robot",
+                scope=FileScope(create_files=["ruoyi-alarm/src/robot/Robot.java"]), depends_on=["st-1"]),
+    ], parallel_groups=[["st-1"]])
+    p.shared_contract = {"dependencies": [
+        {"module": "alarm-robot", "artifacts": ["com.squareup.okhttp3:okhttp"]}]}
+    normalize_plan_scopes(p, None)
+    st1 = next(s for s in p.subtasks if s.id == "st-1")
+    acs = st1.acceptance_criteria or []
+    assert any("okhttp" in c and "alarm-robot" in c for c in acs), \
+        "逻辑模块 alarm-robot 无独立 pom → 依赖应归并到唯一物理模块 owner st-1，不落空"
+
+
+def test_a5_multi_module_ambiguous_does_not_reconcile():
+    """多物理模块 pom owner(真多模块)→ 歧义 → 保守不归并(行为不变，只告警)。"""
+    p = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="mod-a 脚手架", scope=FileScope(create_files=["mod-a/pom.xml"])),
+        SubTask(id="st-2", description="mod-b 脚手架", scope=FileScope(create_files=["mod-b/pom.xml"])),
+    ], parallel_groups=[["st-1"], ["st-2"]])
+    p.shared_contract = {"dependencies": [
+        {"module": "ghost-module", "artifacts": ["g:art"]}]}
+    normalize_plan_scopes(p, None)
+    for s in p.subtasks:
+        assert not any("ghost-module" in c or "g:art" in c for c in (s.acceptance_criteria or [])), \
+            "多模块歧义时不得擅自把 ownerless 依赖归并到某个模块"
+
+
+def test_a5_direct_owner_unchanged_regression():
+    """契约模块有【直接】pom owner → 原行为：落进该模块 owner，不走归并分支。"""
+    p = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="alarm-robot 脚手架",
+                scope=FileScope(create_files=["alarm-robot/pom.xml"])),
+    ], parallel_groups=[["st-1"]])
+    p.shared_contract = {"dependencies": [
+        {"module": "alarm-robot", "artifacts": ["x:y"]}]}
+    normalize_plan_scopes(p, None)
+    st1 = p.subtasks[0]
+    assert any("alarm-robot/pom.xml 必须声明依赖" in c and "x:y" in c
+               for c in (st1.acceptance_criteria or [])), "直接 owner 应走原路径"
+
+
 if __name__ == "__main__":
     import sys
 

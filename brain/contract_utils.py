@@ -129,6 +129,26 @@ def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:
     return plan
 
 
+def _module_pom_owners(subtasks: list) -> dict[str, object]:
+    """{物理模块名: 拥有该模块 `<模块>/pom.xml` 写权的子任务}（不含根 pom）。
+
+    用于规则5 A5 归并：判断 plan 是否单物理模块（唯一 owner）。通用，不写死模块名。
+    """
+    owners: dict[str, object] = {}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        files = list(getattr(sc, "create_files", []) or []) + list(getattr(sc, "writable", []) or [])
+        for f in files:
+            ff = str(f).replace("\\", "/")
+            if ff.endswith("/pom.xml"):  # 模块 pom（有目录前缀），排除根 pom.xml
+                modname = ff[: -len("/pom.xml")].rsplit("/", 1)[-1]
+                if modname:
+                    owners.setdefault(modname, st)
+    return owners
+
+
 def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。
 
@@ -404,6 +424,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
     shared = getattr(plan, "shared_contract", None) or {}
     deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
     if isinstance(deps_spec, list) and deps_spec:
+        # A5 治本(round11)：契约常把【逻辑模块】(alarm-robot/template…)当物理 Maven 模块声明依赖，
+        # 但 plan 实际把它们的代码都落进【单个】物理模块(如 ruoyi-alarm)。此时 `alarm-robot/pom.xml`
+        # 无 owner → 原逻辑只告警、依赖落空 → 编译期缺依赖。修法：仅当全 plan 存在【唯一】物理模块
+        # pom owner(单模块项目，无歧义)时，把无独立 owner 的契约依赖确定性归并到它，杜绝落空 + 消除
+        # false-alarm。多 owner(真多模块)歧义 → 保守只告警(行为不变)。通用，不写死模块名。
+        _mod_owners = _module_pom_owners(subtasks)
+        _distinct = list({id(o): o for o in _mod_owners.values()}.values())
+        _sole_owner = _distinct[0] if len(_distinct) == 1 else None
         for entry in deps_spec:
             if not isinstance(entry, dict):
                 continue
@@ -422,15 +450,29 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
                 ),
                 None,
             )
+            reconciled = False
             if owner is None:
-                logger.warning(
-                    "[normalize] 规则5：模块 %s 的依赖契约无 pom owner 承接（%d 个 artifacts 落空）"
-                    "——编译期可能缺依赖，请确认有脚手架子任务建 %s",
-                    mod, len(arts), mod_pom,
-                )
-                continue
+                if _sole_owner is not None:
+                    owner = _sole_owner
+                    reconciled = True
+                    logger.info(
+                        "[normalize] 规则5：契约模块 %s 无独立 pom owner → 逻辑模块落进单物理模块，"
+                        "依赖确定性归并到唯一物理模块 pom owner %s（杜绝依赖落空+消除 false-alarm）",
+                        mod, getattr(_sole_owner, "id", "?"),
+                    )
+                else:
+                    logger.warning(
+                        "[normalize] 规则5：模块 %s 的依赖契约无 pom owner 承接（%d 个 artifacts 落空）"
+                        "——编译期可能缺依赖，请确认有脚手架子任务建 %s",
+                        mod, len(arts), mod_pom,
+                    )
+                    continue
             ac = list(getattr(owner, "acceptance_criteria", []) or [])
-            note = f"{mod}/pom.xml 必须声明依赖: {sorted(arts)}（缺一即整模块 mvn compile 失败）"
+            if reconciled:
+                note = (f"本模块 pom.xml 必须声明 {mod} 所需依赖: {sorted(arts)}"
+                        f"（{mod} 的代码落在本物理模块，缺一即 mvn compile 失败）")
+            else:
+                note = f"{mod}/pom.xml 必须声明依赖: {sorted(arts)}（缺一即整模块 mvn compile 失败）"
             if note not in ac:
                 ac.append(note)
                 owner.acceptance_criteria = ac
