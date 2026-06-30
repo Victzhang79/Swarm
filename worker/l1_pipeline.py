@@ -366,7 +366,7 @@ def _project_own_packages(project_path: str, timeout: int = 20) -> set[str]:
         "| sed -E 's/^[[:space:]]*package[[:space:]]+//' "
         "| awk -F. 'NF>=2{print $1\".\"$2}' | sort | uniq -c | sort -rn | head -10"
     )
-    _ec, out, _e = _run_check_split(cmd, project_path, timeout=timeout)
+    _ec, out, _e = _cached_scan(cmd, project_path, timeout=timeout)  # A7：只读全树扫描，按文件签名缓存
     groups: set[str] = set()
     for line in (out or "").splitlines():
         m = re.match(r"\s*(\d+)\s+([A-Za-z0-9_.]+)", line)
@@ -783,7 +783,7 @@ def _attempt_symbol_repair(
     mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
     mcmd = ("grep -rhoE '[A-Za-z_][A-Za-z0-9_]+' --include='*.java' --include='*.kt' . "
             "2>/dev/null | sort | uniq -c | sort -rn | head -4000")
-    _ec, gout, _e = _run_check_split(mcmd, project_path, timeout=min(timeout, 60))
+    _ec, gout, _e = _cached_scan(mcmd, project_path, timeout=min(timeout, 60))
     freq: dict[str, int] = {}
     for line in (gout or "").splitlines():
         m = re.match(r"\s*(\d+)\s+(\S+)", line)
@@ -1047,6 +1047,37 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
         return 124, "", "command timeout"
     except Exception as exc:  # noqa: BLE001
         return 1, "", str(exc)
+
+
+# A7(round11)：缓存只读的项目【符号/包】全树扫描。VERIFYING/PRODUCING 等多阶段会重跑同一条
+# 60-120s 的 `grep -r … --include='*.java'` 大扫描（取证：同一沙箱 4000-符号 grep 重复 3×，
+# 纯烧预算）。按【源文件 size+mtime 签名】缓存：任一 .java/.kt/.scala 变动→签名变→自动失效重扫，
+# 无陈旧风险（不会拿过期符号表去改代码）。通用于任何 JVM 栈，无正确性 trade-off。
+_SCAN_CACHE: dict[tuple[str, str], tuple[str, tuple[int, str, str]]] = {}
+_SCAN_SIG_CMD = (
+    "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
+    "| xargs -0 stat -c '%n|%s|%Y' 2>/dev/null | sort | cksum"
+)
+
+
+def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
+    """带文件状态签名失效的 _run_check_split 包装，专给只读全树符号/包扫描省重复预算（A7）。"""
+    try:
+        _sec, sig_out, _e = _run_check_split(_SCAN_SIG_CMD, project_path, timeout=min(timeout, 15))
+        sig = (sig_out or "").strip()
+    except Exception:  # noqa: BLE001
+        sig = ""  # 签名拿不到 → 不缓存，照常扫描（安全兜底，绝不返回可能陈旧的结果）
+    key = (project_path, scan_cmd)
+    if sig:
+        cached = _SCAN_CACHE.get(key)
+        if cached and cached[0] == sig:
+            return cached[1]
+    result = _run_check_split(scan_cmd, project_path, timeout=timeout)
+    if sig:
+        if len(_SCAN_CACHE) > 32:   # 有界，防长进程多沙箱累积
+            _SCAN_CACHE.clear()
+        _SCAN_CACHE[key] = (sig, result)
+    return result
 
 
 def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
