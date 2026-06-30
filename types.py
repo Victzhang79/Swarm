@@ -270,6 +270,11 @@ class SubTask(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list, description="依赖的子任务 ID")
     model_preference: str | None = None
+    retry_guidance: str = Field(
+        default="",
+        description="A4(round11)：重试时由 HANDLE_FAILURE 注入的 brain 失败诊断/硬约束，"
+        "worker prompt 渲染为'上次失败的诊断与约束'块，防换模型重试仍重蹈同类错误。每次重试覆写。",
+    )
     est_context_tokens: int = Field(
         default=0,
         description="Brain 预估本子任务执行时的输入上下文规模(tokens)；0=未估。"

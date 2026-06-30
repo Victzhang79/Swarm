@@ -246,9 +246,19 @@ def build_worker_prompt(
             user_profile=user_profile_prompt.strip(),
         )
 
+    # A4(round11)：重试时把 brain 失败诊断作为硬约束块前置到描述，防换模型重试仍重蹈同类错。
+    _desc = subtask.description
+    _rg = (getattr(subtask, "retry_guidance", "") or "").strip()
+    if _rg:
+        _desc = (
+            "⚠️【上次失败的诊断与硬约束 — 必须遵守，否则重蹈覆辙】\n"
+            f"{_rg}\n\n"
+            f"{_desc}"
+        )
+
     return SYSTEM_PROMPT_TEMPLATE.format(
         subtask_id=subtask.id,
-        subtask_description=subtask.description,
+        subtask_description=_desc,
         acceptance_criteria=criteria_lines,
         contract=contract_str,
         writable_files=writable_files,

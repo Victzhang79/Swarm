@@ -2346,6 +2346,7 @@ async def handle_failure(state: BrainState) -> dict:
     # audit #17：strategy 必须在 try 前有确定默认值——否则 _get_brain_llm() 抛异常时
     # except 分支用到 strategy 会 NameError。默认 "retry" 表示确定性回退（非 LLM 建议）。
     strategy = "retry"
+    _diagnosis = ""   # A4 治本(round11)：brain 失败诊断，注入重试 worker 提示防重蹈
     try:
         llm = _get_brain_llm()
         failure_details_dict: dict[str, dict] = {}
@@ -2373,6 +2374,7 @@ async def handle_failure(state: BrainState) -> dict:
         # （不让 LLM 吐的未知字符串静默穿过策略阶梯）。result 保留供下游读取 adjusted_subtasks 等。
         _fs = FailureStrategyResponse.model_validate(result)
         strategy = _fs.strategy
+        _diagnosis = (_fs.reasoning or "").strip()
         logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {_fs.reasoning}")
     except json.JSONDecodeError as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
@@ -2380,6 +2382,20 @@ async def handle_failure(state: BrainState) -> dict:
     except Exception as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 分析异常 → 确定性回退 retry（非 LLM 建议）: {e}")
         strategy = "retry"
+
+    # ── A4 治本(round11)：把 brain 诊断作为硬约束注入【重试 worker 提示】──
+    # round11: brain 明写"该 RuoYi 版本用 ShiroUtils 而非 SecurityUtils"却只 retry_alternate
+    # 换模型、不传 worker → 重试 worker 仍 import 不存在的 SecurityUtils。把诊断挂到失败子任务
+    # 的 retry_guidance(worker prompt 渲染为硬约束块)，所有 retry 分支(A2/常规阶梯)统一携带。
+    if _diagnosis and failed_ids:
+        _by_id = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
+        for _fid in failed_ids:
+            _st = _by_id.get(_fid)
+            if _st is not None:
+                try:
+                    _st.retry_guidance = _diagnosis[:800]
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
     # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
