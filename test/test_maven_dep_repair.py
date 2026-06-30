@@ -88,6 +88,34 @@ def test_orchestrator_injects_from_build_output():
     assert "quartz" in (Path(d) / "alarm" / "pom.xml").read_text().lower()
 
 
+# ── A2/A3 治本(round11)：internal 产物未就绪不该触发 A2 补依赖 ──
+def test_internal_pkg_not_built_excluded_from_a2():
+    """internal_pkg_not_built/upstream_module_broken = 项目内/上游产物未就绪(非缺外部 jar)，
+    其 build_output 含 'cannot find symbol' 会被 _MISSING_DEP_PATTERNS 误命中 → 须排除，否则
+    错进 A2 补无关坐标 + 重置重试计数空转(round11 ~16/33 沙箱白耗)。"""
+    res = {"st-7-2": {"l1_details": {
+        "pipeline_blocked": "internal_pkg_not_built",
+        "build_output": "cannot find symbol: class AlarmScheduleGroup",
+    }}}
+    assert N._is_missing_dependency_failure(res, ["st-7-2"]) is False, \
+        "internal_pkg_not_built 不该触发 A2(根因由 A1 plan 层 readable 修)"
+    res2 = {"st-x": {"l1_details": {
+        "pipeline_blocked": "upstream_module_broken",
+        "build_output": "程序包 com.ruoyi.alarm.domain 不存在",
+    }}}
+    assert N._is_missing_dependency_failure(res2, ["st-x"]) is False, \
+        "upstream_module_broken 同样不该触发 A2(待上游修好 transient 重试自消解)"
+
+
+def test_genuine_missing_jar_still_triggers_a2():
+    """回归保护：真·缺外部 jar(无 internal blocked 标记)仍触发 A2 定向恢复。"""
+    res = {"st-9": {"l1_details": {
+        "build_output": "程序包 org.quartz 不存在", "l1_2_1_build_ok": False,
+    }}}
+    assert N._is_missing_dependency_failure(res, ["st-9"]) is True, \
+        "真缺 jar 仍须走 A2(否则破坏 f9e38dae 既有治本)"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

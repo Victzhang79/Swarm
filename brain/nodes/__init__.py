@@ -1426,16 +1426,31 @@ _MISSING_DEP_PATTERNS = (
 )
 
 
+# A2/A3 治本(round11)：这些 pipeline_blocked 是【项目内/上游子任务产物尚未就绪】(非缺外部
+# jar)——L1 已标 BLOCKED 待生产者落地由 transient 重试自然消解。但其 build_output 含 "cannot
+# find symbol"/"程序包…不存在"，会被 _MISSING_DEP_PATTERNS 误命中 → 错进 A2 定向恢复(补无关
+# maven 坐标 + 重置重试计数致多轮空转, round11 ~16/33 沙箱白耗)。A2 只该治【真·缺外部 jar】，
+# 故这两类一律排除。根因(缺兄弟域产物注入)由 A1 在 plan 层 readable 修复。
+_INTERNAL_BLOCKED_KINDS = ("internal_pkg_not_built", "upstream_module_broken")
+
+
+def _det_of(out) -> dict:
+    """统一取 worker 失败结果的 l1_details(WorkerOutput / dict / 其它)。"""
+    if isinstance(out, WorkerOutput):
+        return out.l1_details or {}
+    if isinstance(out, dict):
+        return out.get("l1_details", {}) or {}
+    return {}
+
+
 def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> bool:
-    """失败详情里是否命中"缺符号/缺依赖"编译特征（确定性、零 LLM）。"""
+    """失败详情里是否命中"缺符号/缺依赖"编译特征（确定性、零 LLM）。
+    排除 internal_pkg_not_built/upstream_module_broken——那是【内部产物未就绪】非缺外部 jar，
+    走 A2 补依赖必空烧(见 _INTERNAL_BLOCKED_KINDS 注释)。"""
     for fid in failed_ids:
-        out = subtask_results.get(fid)
-        if isinstance(out, WorkerOutput):
-            det = out.l1_details or {}
-        elif isinstance(out, dict):
-            det = out.get("l1_details", {}) or {}
-        else:
-            det = {}
+        det = _det_of(subtask_results.get(fid))
+        if isinstance(det, dict) and det.get("pipeline_blocked") in _INTERNAL_BLOCKED_KINDS:
+            continue  # 内部/上游未就绪 → 不该触发 A2 maven 补依赖
         try:
             blob = json.dumps(det, ensure_ascii=False).lower()
         except (TypeError, ValueError):
