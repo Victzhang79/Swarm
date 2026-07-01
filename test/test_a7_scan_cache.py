@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-import worker.l1_pipeline as L
+from swarm.worker import l1_pipeline as L
 
 
 def test_cached_scan_reuses_when_files_unchanged(monkeypatch):
