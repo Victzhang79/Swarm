@@ -898,7 +898,11 @@ async def validate_plan(state: BrainState) -> dict:
     输入: plan, task_description, affected_files
     输出: plan_valid, plan_validation_issues
     """
-    from swarm.brain.plan_validator import validate_plan_structure
+    from swarm.brain.plan_validator import (
+        MAX_LLM_VALIDATION_PLAN_CHARS,
+        slim_plan_json_for_llm_validation,
+        validate_plan_structure,
+    )
 
     plan_obj = state.get("plan")
     task_description = state.get("task_description", "")
@@ -956,18 +960,32 @@ async def validate_plan(state: BrainState) -> dict:
     llm_valid = True
     llm_issues: list[str] = []
     try:
-        llm = _get_brain_llm()
-        plan_json = plan_obj.model_dump_json(indent=2)
-        prompt_user = VALIDATE_PLAN_USER.format(
-            task_description=task_description,
-            plan_json=plan_json,
-            user_profile=_brain_profile_prompt(state),
-        )
-        response = await llm.ainvoke([
-            {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
-            {"role": "user", "content": prompt_user},
-        ])
-        result = _parse_json_from_llm(response.content)
+        # P16-2 治本：喂给软校验 LLM 的是【瘦身 plan_json】（剥离每子任务约 42K 的 contract
+        # 副本 + 注入代码）。原 model_dump_json 达 ~1MB（~260K token），把推理模型 GLM-5.2
+        # 拖进 84K chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才放行，且结果软
+        # 建议被丢弃）→ 卡在到 DISPATCH 之前。结构确定性闸门已保证 DAG/scope/依赖，软校验无需
+        # 内联 contract 副本（契约完整性由 plan 级 shared_contract 一次性体现）。
+        plan_json = slim_plan_json_for_llm_validation(plan_obj)
+        if len(plan_json) > MAX_LLM_VALIDATION_PLAN_CHARS:
+            # 瘦身后仍超上限（异常巨 plan）→ 跳过 LLM 软建议：结构确定性闸门已放行，绝不把
+            # 超大 prompt 喂推理模型再次 wall-clock runaway。default 放行（软信号缺失=不阻断）。
+            logger.info(
+                "[VALIDATE_PLAN] 瘦身后 plan_json %d 字符 > %d 上限 → 跳过 LLM 软建议（结构已通过放行）",
+                len(plan_json), MAX_LLM_VALIDATION_PLAN_CHARS,
+            )
+            result = {"valid": True, "issues": []}
+        else:
+            llm = _get_brain_llm()
+            prompt_user = VALIDATE_PLAN_USER.format(
+                task_description=task_description,
+                plan_json=plan_json,
+                user_profile=_brain_profile_prompt(state),
+            )
+            response = await llm.ainvoke([
+                {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
+                {"role": "user", "content": prompt_user},
+            ])
+            result = _parse_json_from_llm(response.content)
         llm_says_valid = bool(result.get("valid", False))
         llm_issues = list(result.get("issues", []) or [])
         if not llm_says_valid:

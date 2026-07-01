@@ -2,9 +2,40 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from swarm.types import SubTask, TaskPlan
+
+# 喂给 VALIDATE_PLAN 软建议 LLM 的 plan_json 字符上限。超过则跳过 LLM 软建议（结构确定性闸门
+# 已放行），绝不把超大 prompt 喂推理模型。~120K 字符 ≈ 30K token，足够表达结构/依赖/scope。
+MAX_LLM_VALIDATION_PLAN_CHARS = 120_000
+
+# 软校验瘦身时剥离的重体积/冗余子任务字段（不参与 DAG/scope/依赖/完整性判断）。
+# contract：每子任务约 42K 字符且各子任务重复携带（round16 实测 24× → plan_json ~1MB）；
+# context_snippets：worker 免探索的注入代码，纯执行辅助，与计划结构无关。
+_SLIM_STRIP_SUBTASK_FIELDS = ("contract", "context_snippets")
+
+
+def slim_plan_json_for_llm_validation(plan: TaskPlan) -> str:
+    """构造喂给 VALIDATE_PLAN 软建议 LLM 的【瘦身 plan_json】。
+
+    背景（round16 实测）：`plan_obj.model_dump_json()` 把每个子任务约 42K 字符的 `contract`
+    副本（24 子任务重复 24×）+ 注入代码全序列化 → plan_json 达 ~1MB（~260K token），喂给
+    推理模型 GLM-5.2 触发 84K+ chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才
+    放行，且结果是软建议、被丢弃）→ 卡在到 DISPATCH 之前。
+
+    结构校验（validate_plan_structure）已确定性硬保证 DAG/scope/依赖可执行性；LLM 软校验只做
+    主观质量信号，无需每个子任务内联的 contract 副本——契约完整性由 plan 级 shared_contract
+    一次性体现。这里剥离每子任务的 contract/context_snippets（体积大且冗余），其余字段
+    （id/description/scope/depends_on/难度/验收标准/shared_contract）原样保留。
+    """
+    data = plan.model_dump()
+    for st in data.get("subtasks", []) or []:
+        if isinstance(st, dict):
+            for f in _SLIM_STRIP_SUBTASK_FIELDS:
+                st.pop(f, None)
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 # 单子任务可写文件数：软上限 = 一个垂直功能合理跨越的分层文件数（domain/controller/service/
 # impl/mapper+xml 等，RuoYi 这类分层框架一个功能天然 4-6 个文件）。软上限内不告警；

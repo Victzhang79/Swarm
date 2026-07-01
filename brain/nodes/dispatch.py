@@ -136,7 +136,8 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
 
 
 def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
-                                  max_concurrent, to_dispatch, abandoned=None):
+                                  max_concurrent, to_dispatch, abandoned=None,
+                                  deprioritized=None):
     """主干B 不变量·DISPATCH 闸门：派发前确保每个工作单元【文件数≤上界】（预防式治本）。
 
     根因：编排允许 oversized 子任务一路派到 worker，撞 900s 墙钟超时后才在恢复阶梯拆小——
@@ -197,7 +198,9 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
     if not changed:
         return plan_obj, dispatch_remaining, to_dispatch
     plan_obj = _rebuild_plan(plan_obj, new_subtasks)
-    to_dispatch = plan_obj.get_dispatch_batch(completed_ids, remaining, max_concurrent, abandoned)
+    to_dispatch = plan_obj.get_dispatch_batch(
+        completed_ids, remaining, max_concurrent, abandoned, deprioritized
+    )
     return plan_obj, remaining, to_dispatch
 
 
@@ -243,15 +246,26 @@ async def dispatch(state: BrainState) -> dict:
     config = get_config()
     max_concurrent = config.worker.max_concurrent
 
+    # ── Fix F·dispatch 前进保证（解 head-of-line 死锁）：正在重试中的失败子任务
+    # （subtask_retry_counts>0）在派发选批时【降优先级】——从未尝试的就绪生产者（新前沿）
+    # 先占并发槽，失败撮只填剩余槽。失败撮常撞 900s 超时且早序恒就绪，旧逻辑让它们每批霸占
+    # 全部槽位 → 生产者饿死 → 完成数冻结（15 轮无一到 MERGE 的真根因）。纯调度顺序改动，
+    # 不改放弃集/熔断/有界重试语义（失败仍在 remaining、仍会被处理，只是不再独占槽）。
+    _deprioritized = {
+        sid for sid, c in (state.get("subtask_retry_counts") or {}).items()
+        if isinstance(c, int) and c > 0
+    }
+
     to_dispatch = plan_obj.get_dispatch_batch(
-        completed_ids, dispatch_remaining, max_concurrent, _abandoned
+        completed_ids, dispatch_remaining, max_concurrent, _abandoned, _deprioritized
     )
 
     # ── 主干B 不变量·DISPATCH 预算闸门：超文件上界的工作单元在派发前确定性拆小，
     # 不让大块进 worker 撞 900s 超时（预防式治本，非超时后补偿）。plan 可能被重建 → 须回写 state。
     _plan_before_gate = plan_obj
     plan_obj, dispatch_remaining, to_dispatch = _enforce_dispatch_budget_gate(
-        plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch, _abandoned
+        plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch,
+        _abandoned, _deprioritized
     )
     _gate_split = plan_obj is not _plan_before_gate
 

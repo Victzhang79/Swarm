@@ -331,6 +331,7 @@ class TaskPlan(BaseModel):
         dispatch_remaining: list[str],
         max_concurrent: int,
         abandoned: set[str] | None = None,
+        deprioritized: set[str] | None = None,
     ) -> list[SubTask]:
         """选取下一批可并行派发的子任务。
 
@@ -340,11 +341,21 @@ class TaskPlan(BaseModel):
         截断），不受 LLM 过度保守分组的限制——只要 depends_on 满足就能并行。
 
         parallel_groups 仅作为「软提示」保留（向后兼容/可视化），不再用于阻断并行。
+
+        【Fix F·dispatch 前进保证（解 head-of-line 死锁）】`deprioritized` = 已尝试过并
+        失败、正在重试中的子任务集（由 dispatch 按 subtask_retry_counts>0 计算）。失败撮常
+        撞 900s worker 超时，且早序、恒就绪 → 旧 `ready[:max_concurrent]` 让它们每批霸占
+        并发槽，把「从未尝试的就绪生产者（新前沿）」饿死 → 完成数冻结（15 轮无一到 MERGE 的
+        真根因）。这里做**纯优先级重排（非丢弃、非跳过）**：fresh（新前沿）优先占槽，retry
+        仅填剩余槽位。生产者先跑→合并→失败子任务下轮重试即真恢复（round15 st-19-1 实证）。
+        稳定性：两组各自保持 self.subtasks 序 → 确定性；deprioritized 为空则完全等价旧行为。
+        不改放弃集/熔断语义：retry 仍在 remaining 且仍可派发，只是不再独占槽。
         """
         remaining = set(dispatch_remaining)
         if not remaining:
             return []
         _ab = abandoned or set()
+        _dp = deprioritized or set()
 
         def _is_ready(task: SubTask) -> bool:
             # 已放弃的子任务、或依赖了放弃项的下游 → 永不就绪（其依赖永远不会落地），
@@ -360,6 +371,12 @@ class TaskPlan(BaseModel):
             t for t in self.subtasks
             if t.id in remaining and _is_ready(t)
         ]
+        if _dp:
+            # Fix F：从未尝试的就绪子任务（新前沿/生产者）优先于失败重试中的子任务，
+            # 防失败撮霸占全部并发槽。纯重排，稳定序不变。
+            fresh = [t for t in ready if t.id not in _dp]
+            retry = [t for t in ready if t.id in _dp]
+            ready = fresh + retry
         return ready[:max_concurrent]
 
     def all_completed(self, completed_ids: set[str]) -> bool:
