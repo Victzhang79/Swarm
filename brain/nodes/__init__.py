@@ -2935,7 +2935,7 @@ def merge(state: BrainState) -> dict:
     输入: subtask_results
     输出: merged_diff, merge_conflicts (如有硬冲突), rebase_subtask_ids (如有 rebase)
     """
-    from swarm.brain.merge_engine import merge_diffs
+    from swarm.brain.merge_engine import merge_diffs, verify_merged_patch_applies
 
     subtask_results: dict = state.get("subtask_results", {})
 
@@ -2972,13 +2972,28 @@ def merge(state: BrainState) -> dict:
             result.rebase_subtask_ids,
         )
 
+    # ── Fix 1c·fail-closed 护栏：仅在【终局干净合并】（无冲突、无待 rebase → 即将进 VERIFY_L2）时，
+    # 对最终 merged_diff 跑 git apply --check，让 "success=True" 诚实反映"补丁真能落盘"。
+    # rebase 循环中的中间态不校验（文件将被重生成，避免假阴性）。校验失败＝确定性组装缺陷，
+    # 在 MERGE 出口就打醒目诊断（区别于 VERIFY_L2 的"集成失败"），不再靠 success=True 蒙混。
+    _apply_ok, _apply_err = True, ""
+    if result.success and not result.rebase_subtask_ids and result.merged_diff.strip():
+        _proj_path = _get_project_path(state.get("project_id") or "")
+        _apply_ok, _apply_err = verify_merged_patch_applies(_proj_path, result.merged_diff)
+        if not _apply_ok:
+            logger.error(
+                "[MERGE] ⚠️ 合并 patch 组装非法：git apply --check 失败 → %s"
+                "（确定性 diff 组装缺陷，非模型/非集成问题；VERIFY_L2 将阻断交付）",
+                _apply_err,
+            )
     logger.info(
-        "[MERGE] 合并完成, 总长度=%d, 冲突=%d, 自动消解=%d, rebase=%d, success=%s",
+        "[MERGE] 合并完成, 总长度=%d, 冲突=%d, 自动消解=%d, rebase=%d, success=%s, apply_ok=%s",
         len(result.merged_diff),
         len(result.conflicts),
         len(result.auto_resolved_files),
         len(result.rebase_subtask_ids),
         result.success,
+        _apply_ok,
     )
     merge_touch = touch_context(
         state,

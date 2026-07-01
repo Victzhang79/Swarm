@@ -76,7 +76,13 @@ def _recount_hunk_header(header_line: str, body_lines: list[str]) -> str:
             new_c += 1
         elif c == "-":
             old_c += 1
-        else:  # context（" " / "\" no-newline 标记按 context 计，与 git 一致）
+        elif c == "\\":
+            # `\ No newline at end of file` 是 git 对上一行的零宽注解，old/new 两侧【都不计】。
+            # 旧代码误按 context +1/+1：LLM 生成的 .java/.html 普遍无结尾换行 → 每个新文件 diff
+            # 都带此标记 → 头从 `@@ -0,0 +1,N @@` 被写成 `@@ -0,1 +1,N+1 @@`，`-0,1` 引用不存在
+            # 的旧行 0 → git apply 报"补丁损坏"（996db614 round16 实测 88 个新文件全中）。
+            continue
+        else:  # 真正的 context 行（" " 开头）：old/new 两侧各 +1
             old_c += 1
             new_c += 1
     tail = header_line[m.end():]  # @@ 后可选的 section heading（如 ' func foo()'）
@@ -503,21 +509,26 @@ def merge_insert_only_changes(
 def _lines_to_unified_diff(file_path: str, base: str, merged: str) -> str:
     import difflib
 
-    base_lines = base.splitlines(keepends=True)
-    merged_lines = merged.splitlines(keepends=True)
-    if base == merged:
+    # ── 关键治本(996db614 round16 第2289行损坏)：difflib unified_diff 的正确用法 ──
+    # 旧代码 `splitlines(keepends=True)`(内容行自带\n) + `lineterm=""` + `"\n".join` → 给本已
+    # 含\n的内容行再加\n（行尾翻倍），每行后多一个空行 → hunk 头声明行数与实际不符 → git 解析越界
+    # 撞下一个文件头 → "补丁损坏"。照搬 worker/executor.py:1870-1891 已验证的 normalize：先归一
+    # 行尾，keepends=True + lineterm="" + 逐元素补换行 + "".join（内容行用自带\n，头部行补\n）。
+    base_norm = base.replace("\r\n", "\n").replace("\r", "\n")
+    merged_norm = merged.replace("\r\n", "\n").replace("\r", "\n")
+    if base_norm == merged_norm:
         return ""
-    diff_lines = difflib.unified_diff(
-        base_lines,
-        merged_lines,
+    ud = difflib.unified_diff(
+        base_norm.splitlines(keepends=True),
+        merged_norm.splitlines(keepends=True),
         fromfile=f"a/{file_path}",
         tofile=f"b/{file_path}",
         lineterm="",
     )
-    body = list(diff_lines)
-    if not body:
-        return ""
-    return "\n".join(body)
+    # 逐元素规范化：hunk头/文件头(lineterm="" 故无换行)补\n；内容行(keepends 已含\n)不动 → 无行尾翻倍。
+    block = "".join(x if x.endswith("\n") else x + "\n" for x in ud)
+    block = block.rstrip("\n")
+    return block if block.strip() else ""
 
 
 def _try_three_way_resolve(
@@ -724,3 +735,32 @@ def merge_diffs(
         auto_resolved_files=auto_resolved_files,
         rebase_subtask_ids=list(dict.fromkeys(rebase_subtask_ids_all)),
     )
+
+
+def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> tuple[bool, str]:
+    """交付前 fail-closed 护栏：合并 patch 能否干净 `git apply --check` 到项目工作树。
+
+    返回 (ok, detail)。ok=False = merge 组装出了【不可 apply 的补丁】（确定性组装缺陷），绝不能
+    静默按 success 放行——round16 实测 88 个新文件 `@@ -0,1` + 行尾翻倍空行 → 补丁损坏，却仍
+    success=True 蒙混到 VERIFY_L2 才被拦、进而触发全量 replan。此护栏在 MERGE 出口就诚实标注。
+
+    空 diff / 无 git 工作树 → ok=True（无可校验、不误报）；校验器自身异常 → ok=True 但带 detail
+    （不冒充 patch 损坏、不制造假阻断，真正的交付阻断仍由 VERIFY_L2 兜）。
+    """
+    if not merged_diff.strip():
+        return True, ""
+    if not project_path or not Path(project_path, ".git").exists():
+        return True, ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=True) as tf:
+            tf.write(merged_diff if merged_diff.endswith("\n") else merged_diff + "\n")
+            tf.flush()
+            proc = subprocess.run(
+                ["git", "apply", "--check", tf.name],
+                cwd=project_path, capture_output=True, text=True, timeout=60,
+            )
+        if proc.returncode == 0:
+            return True, ""
+        return False, (proc.stderr or proc.stdout or "git apply --check failed").strip()
+    except Exception as exc:  # noqa: BLE001
+        return True, f"(apply-check 未能执行: {exc})"
