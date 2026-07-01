@@ -236,6 +236,30 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
         return "handle_failure"
 
     if dispatch_remaining:
+        # ── #R13-4 治本：派发面终态熔断（不可满足子任务集的派发面对偶）──
+        # 症状(round13 实测)：阶梯三 give-up-preserve 后，剩余子任务【全部依赖已 revert/放弃的
+        # 上游 → 永不就绪】，但 dispatch_remaining 非空。旧逻辑"剩余非空即 DISPATCH" → DISPATCH
+        # 的 get_dispatch_batch 返回空批、不排空 remaining → MONITOR→DISPATCH 紧致空转
+        # 撞 recursion_limit → 整任务 FAILED（而非诚实 PARTIAL）。
+        # 治本：DISPATCH 已 await 完本批、此刻无 worker 在飞 → 用【与 DISPATCH 完全相同的就绪
+        # 判定】探测；若无一可派发即为不可推进的死结 → 转 MERGE 诚实交付已完成成果(PARTIAL)，
+        # 绝不空转。与 HANDLE_FAILURE 侧"不再无界 replan"同源：不可满足集需单一终态出口。
+        plan_obj = state.get("plan")
+        if plan_obj is not None:
+            _completed = set(state.get("subtask_results", {}).keys())
+            _abandoned = (set(state.get("abandoned_subtask_ids") or [])
+                          | set(state.get("give_up_isolated_ids") or []))
+            _mc = get_config().worker.max_concurrent
+            _dispatchable = plan_obj.get_dispatch_batch(
+                _completed, dispatch_remaining, _mc, _abandoned
+            )
+            if not _dispatchable:
+                logger.warning(
+                    "[ROUTE] MONITOR → MERGE (%d 个剩余子任务全不可派发/依赖已放弃 → "
+                    "停止空转、PARTIAL 交付已完成成果；#R13-4 派发面终态熔断)",
+                    len(dispatch_remaining),
+                )
+                return "merge"
         logger.info(f"[ROUTE] MONITOR → DISPATCH ({len(dispatch_remaining)} 个剩余)")
         return "dispatch"
 

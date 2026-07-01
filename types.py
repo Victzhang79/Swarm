@@ -309,11 +309,20 @@ class TaskPlan(BaseModel):
         description="Brain 统一定义的跨子任务共享接口契约",
     )
 
-    def get_ready_tasks(self, completed_ids: set[str]) -> list[SubTask]:
-        """获取当前可执行的子任务（依赖已全部完成）"""
+    def get_ready_tasks(
+        self, completed_ids: set[str], abandoned: set[str] | None = None
+    ) -> list[SubTask]:
+        """获取当前可执行的子任务（依赖已全部完成）。
+
+        abandoned=【已永久放弃的子任务集】(阶梯三打桩/revert/连坐)：本身被放弃的、或依赖了
+        放弃项的子任务【永不就绪】，绝不再派发——杜绝"依赖永远不会落地的下游"被反复重派。
+        """
+        _ab = abandoned or set()
         return [
             t for t in self.subtasks
-            if t.id not in completed_ids and all(d in completed_ids for d in t.depends_on)
+            if t.id not in completed_ids and t.id not in _ab
+            and all(d in completed_ids for d in t.depends_on)
+            and not any(d in _ab for d in t.depends_on)
         ]
 
     def get_dispatch_batch(
@@ -321,6 +330,7 @@ class TaskPlan(BaseModel):
         completed_ids: set[str],
         dispatch_remaining: list[str],
         max_concurrent: int,
+        abandoned: set[str] | None = None,
     ) -> list[SubTask]:
         """选取下一批可并行派发的子任务。
 
@@ -334,8 +344,13 @@ class TaskPlan(BaseModel):
         remaining = set(dispatch_remaining)
         if not remaining:
             return []
+        _ab = abandoned or set()
 
         def _is_ready(task: SubTask) -> bool:
+            # 已放弃的子任务、或依赖了放弃项的下游 → 永不就绪（其依赖永远不会落地），
+            # 不再被选中派发，斩断 BLOCKED→replan→复活 的无界循环。
+            if task.id in _ab or any(d in _ab for d in task.depends_on):
+                return False
             return task.id not in completed_ids and all(
                 d in completed_ids for d in task.depends_on
             )

@@ -591,8 +591,11 @@ def _attempt_dependency_repair(
 
 def _build_blocked_on_unbuilt_internal(
     project_path: str, build_output: str, timeout: int
-) -> bool:
+) -> set[str]:
     """构建失败是否【全因引用了尚未建出的项目内部包】(②跨模块/跨子任务未就绪)。
+
+    返回【被阻断的内部缺包集合】：非空=是②类阻断（集合即缺的内部包，供 brain 反查生产者
+    子任务、判其是否已被永久放弃）；空集=非②类（照常 FAIL）。
 
     治本场景（996db614 实测 ~70/213）：子任务 A 引用 `com.ruoyi.alarm.sender.dto` 等【别的子任务
     还没建出的内部包】→ `package does not exist`。这不是 A 的能力问题，也无法由 A 修（包归别人建）；
@@ -606,19 +609,19 @@ def _build_blocked_on_unbuilt_internal(
     只要有一个缺包是第三方、或已在树里(=真编译错如包名拼错) → 返回 False，照常 FAIL。"""
     pairs = parse_missing_packages(build_output)
     if not pairs:
-        return False
+        return set()
     own = _project_own_packages(project_path, timeout)
     if not own:
-        return False
+        return set()
     internal_pkgs: set[str] = set()
     for _f, pkg in pairs:
         if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
-            return False  # JDK/servlet 命名空间问题，非②
+            return set()  # JDK/servlet 命名空间问题，非②
         if not any(pkg == g or pkg.startswith(g + ".") for g in own):
-            return False  # 有第三方缺包 → 交 dep-repair，不是纯②
+            return set()  # 有第三方缺包 → 交 dep-repair，不是纯②
         internal_pkgs.add(pkg)
     if not internal_pkgs:
-        return False
+        return set()
     for pkg in internal_pkgs:
         cmd = (
             f"grep -rlE '^[[:space:]]*package[[:space:]]+{re.escape(pkg)}[[:space:]]*;' "
@@ -626,8 +629,8 @@ def _build_blocked_on_unbuilt_internal(
         )
         _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
         if (out or "").strip():
-            return False  # 该内部包已在树里却报 does not exist → 真错(非未就绪)，照常 FAIL
-    return True
+            return set()  # 该内部包已在树里却报 does not exist → 真错(非未就绪)，照常 FAIL
+    return internal_pkgs
 
 
 def _tool_missing(out: str) -> bool:
@@ -2182,6 +2185,10 @@ def run_l1_pipeline(
                     details["build_blocked"] = build_cmd
                     details["pipeline_blocked"] = "upstream_module_broken"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    # 结构化吐【阻断在哪些上游模块/文件】，供 brain 反查生产者子任务：若生产者已被
+                    # 永久放弃(阶梯三打桩/revert)，则本下游不可恢复，应连坐放弃而非无限 replan。
+                    details["blocked_on_modules"] = sorted(_build_error_modules(b_out))
+                    details["blocked_on_files"] = sorted(_build_error_files(b_out))
                     logger.warning(
                         "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
                         "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
@@ -2192,11 +2199,15 @@ def run_l1_pipeline(
                 # 那些包。标 BLOCKED 退避，待生产者子任务落地（merge 进树）后由 transient 重试自然
                 # 消解，不烧本子任务修复轮 / 不误判 capability 换模型 / 不 escalate 清空已成功成果。
                 # 保守判据见 _build_blocked_on_unbuilt_internal（有第三方缺包/包已在树里→照常 FAIL）。
-                if _build_blocked_on_unbuilt_internal(project_path, b_out, timeout):
+                _blocked_pkgs = _build_blocked_on_unbuilt_internal(project_path, b_out, timeout)
+                if _blocked_pkgs:
                     details["l1_2_1_build_ok"] = None
                     details["build_blocked"] = build_cmd
                     details["pipeline_blocked"] = "internal_pkg_not_built"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
+                    # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
+                    details["blocked_on_packages"] = sorted(_blocked_pkgs)
                     logger.warning(
                         "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
                         "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],

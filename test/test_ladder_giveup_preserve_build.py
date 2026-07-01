@@ -187,6 +187,180 @@ def test_handle_failure_exhausted_single_file_giveup_not_escalate(tmp_path):
     assert not (repo / "Only.java").exists(), "卡死 X 坏文件清出本地树"
 
 
+# ── 治本 replan 死循环：helper 单元 ───────────────────────────────────────
+def test_transitive_abandon_closure():
+    subs = [_st("a"), _st("b", depends_on=["a"]), _st("c", depends_on=["b"]), _st("d")]
+    assert nodes._transitive_abandon(subs, {"a"}) == {"a", "b", "c"}
+    assert nodes._transitive_abandon(subs, {"d"}) == {"d"}
+    assert nodes._transitive_abandon(subs, set()) == set()
+
+
+def test_producers_of_module_and_package():
+    plan = TaskPlan(subtasks=[
+        _st("st-up", writable=["ruoyi-alarm-sdk/src/main/java/com/ruoyi/alarm/sdk/client/HttpClientUtils.java"]),
+        _st("st-other", writable=["ruoyi-common/src/main/java/com/ruoyi/common/X.java"]),
+    ])
+    assert nodes._producers_of(plan, [], ["ruoyi-alarm-sdk"]) == {"st-up"}            # 模块归属
+    assert nodes._producers_of(plan, ["com.ruoyi.alarm.sdk.client"], []) == {"st-up"}  # 包归属
+    assert nodes._producers_of(plan, ["com.nope"], ["nope-mod"]) == set()             # 无关
+
+
+# ── 治本 replan 死循环核心：上游∈放弃集的下游 BLOCKED → 直接连坐放弃，不 replan ──
+def test_handle_failure_downstream_of_abandoned_upstream_abandons_not_replan():
+    """round12 真因：st-up 被阶梯三放弃后，下游 st-down 永久 upstream_module_broken。
+    旧行为 LLM→replan→守卫降级 retry→重派→BLOCKED 无界循环；新行为直接传递放弃→PARTIAL。"""
+    plan = TaskPlan(subtasks=[
+        _st("st-up", writable=["modA/Up.java"]),
+        # st-down 跨模块 import modA（plan 期拿不到，depends_on 为空）→ 必须靠 runtime blocked_on 映射
+        _st("st-down", writable=["modB/Down.java"]),
+        _st("st-tail", writable=["modC/Tail.java"], depends_on=["st-down"]),  # 传递下游
+    ])
+    down_out = WorkerOutput(
+        subtask_id="st-down", diff="", summary="", l1_passed=False,
+        l1_details={"pipeline_blocked": "upstream_module_broken", "blocked_on_modules": ["modA"]},
+    )
+
+    class _ReplanLLM:  # 若 B 没短路，LLM 会让它 replan（断言 abandon 即证 B 先于 LLM 生效）
+        async def ainvoke(self, _m):
+            class _R:
+                content = '{"strategy":"replan","reasoning":"x"}'
+            return _R()
+
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": ["st-down"],
+        "subtask_results": {"st-up": _wo("st-up"), "st-down": down_out},
+        "give_up_isolated_ids": ["st-up"], "abandoned_subtask_ids": [],
+        "dispatch_remaining": ["st-down", "st-tail"],
+    }
+    with patch.object(nodes, "_get_brain_llm", lambda: _ReplanLLM()):
+        out = _run(nodes.handle_failure(state))
+    assert out["failure_strategy"] == "abandon", out.get("failure_strategy")
+    # st-down(blocked on 放弃模块) + st-tail(传递依赖) 一并放弃；不再 retry/replan
+    assert set(out["abandoned_subtask_ids"]) >= {"st-down", "st-tail"}
+    assert out["failed_subtask_ids"] == []
+    assert "st-down" not in out["subtask_results"]
+
+
+def test_handle_failure_downstream_via_depends_on_also_short_circuits():
+    """depends_on 显式声明命中放弃集（口径2）→ 同样直接放弃。"""
+    plan = TaskPlan(subtasks=[
+        _st("st-up", writable=["modA/Up.java"]),
+        _st("st-down", writable=["modB/Down.java"], depends_on=["st-up"]),
+    ])
+    down_out = WorkerOutput(
+        subtask_id="st-down", diff="", summary="", l1_passed=False,
+        l1_details={"pipeline_blocked": "internal_pkg_not_built", "blocked_on_packages": []},
+    )
+
+    class _ReplanLLM:
+        async def ainvoke(self, _m):
+            class _R:
+                content = '{"strategy":"replan"}'
+            return _R()
+
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": ["st-down"],
+        "subtask_results": {"st-up": _wo("st-up"), "st-down": down_out},
+        "give_up_isolated_ids": [], "abandoned_subtask_ids": ["st-up"],
+        "dispatch_remaining": ["st-down"],
+    }
+    with patch.object(nodes, "_get_brain_llm", lambda: _ReplanLLM()):
+        out = _run(nodes.handle_failure(state))
+    assert out["failure_strategy"] == "abandon"
+    assert "st-down" in out["abandoned_subtask_ids"]
+
+
+def test_handle_failure_blocked_but_upstream_not_abandoned_does_not_short_circuit():
+    """上游未被放弃(仍在重试中)→不短路：BLOCKED 走正常 transient 退避，等上游真落地。"""
+    plan = TaskPlan(subtasks=[
+        _st("st-up", writable=["modA/Up.java"]),
+        _st("st-down", writable=["modB/Down.java"]),
+    ])
+    down_out = WorkerOutput(
+        subtask_id="st-down", diff="", summary="", l1_passed=False,
+        l1_details={"pipeline_blocked": "upstream_module_broken", "blocked_on_modules": ["modA"],
+                    "failure_class": "transient"},
+    )
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": ["st-down"],
+        "subtask_results": {"st-down": down_out},
+        "give_up_isolated_ids": [], "abandoned_subtask_ids": [],  # 上游未放弃
+        "dispatch_remaining": ["st-down"], "subtask_transient_counts": {},
+    }
+    out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") != "abandon", "上游未放弃不应短路放弃下游"
+
+
+# ── #R13-2：臆造不存在的包(无生产者+基线不存在) → 硬失败连坐，不空烧 transient 阶梯 ──
+def _blocked_pkg_state(pkg):
+    """单个失败子任务 BLOCKED on 某包，无任何子任务生产该包；无预放弃集。"""
+    plan = TaskPlan(subtasks=[_st("st-solo", writable=["modB/Down.java"])])
+    out = WorkerOutput(
+        subtask_id="st-solo", diff="", summary="", l1_passed=False,
+        l1_details={"pipeline_blocked": "internal_pkg_not_built",
+                    "blocked_on_packages": [pkg], "failure_class": "transient"},
+    )
+    return {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": ["st-solo"],
+        "subtask_results": {"st-solo": out},
+        "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
+        "dispatch_remaining": ["st-solo"], "subtask_transient_counts": {},
+    }
+
+
+def test_handle_failure_hallucinated_pkg_no_producer_not_in_baseline_abandons():
+    """臆造包：无 plan 生产者 且 基线树无此包 → 判不可恢复、连坐放弃(不再 transient 空烧)。"""
+    state = _blocked_pkg_state("com.ruoyi.common.core.redis")
+    with patch.object(nodes, "_package_in_baseline", return_value=False):
+        out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") == "abandon", "臆造不存在的包应硬失败连坐放弃"
+    assert "st-solo" in (out.get("abandoned_subtask_ids") or [])
+
+
+def test_handle_failure_blocked_pkg_in_baseline_does_not_abandon():
+    """假阳性护栏：包【在基线树里】(仅沙箱漏同步) → 不判臆造，继续 transient 等待、不放弃。"""
+    state = _blocked_pkg_state("com.ruoyi.common.utils")
+    with patch.object(nodes, "_package_in_baseline", return_value=True):
+        out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") != "abandon", "基线已有的包不可硬失败(可能只是沙箱漏同步)"
+
+
+def test_handle_failure_blocked_pkg_has_producer_does_not_abandon():
+    """假阳性护栏：包由某【未放弃的】子任务生产 → 不判臆造，等它落地、不放弃。"""
+    plan = TaskPlan(subtasks=[
+        _st("st-solo", writable=["modB/Down.java"]),
+        _st("st-prod", writable=["modC/src/main/java/com/real/svc/Svc.java"]),
+    ])
+    out = WorkerOutput(
+        subtask_id="st-solo", diff="", summary="", l1_passed=False,
+        l1_details={"pipeline_blocked": "internal_pkg_not_built",
+                    "blocked_on_packages": ["com.real.svc"], "failure_class": "transient"},
+    )
+    state = {
+        "plan": plan, "project_id": "p1", "failed_subtask_ids": ["st-solo"],
+        "subtask_results": {"st-solo": out}, "give_up_isolated_ids": [],
+        "abandoned_subtask_ids": [], "dispatch_remaining": ["st-solo"],
+        "subtask_transient_counts": {},
+    }
+    # 即便基线无此包，只要有【未放弃的生产者】就不判臆造(等生产者落地)
+    with patch.object(nodes, "_package_in_baseline", return_value=False):
+        out2 = _run(nodes.handle_failure(state))
+    assert out2.get("failure_strategy") != "abandon", "有未放弃生产者的包不可判臆造"
+
+
+def test_package_in_baseline_detects_present_and_absent(tmp_path):
+    """_package_in_baseline 纯函数：存在的包→True，不存在→False，无路径→保守 True。"""
+    (tmp_path / "ruoyi-common/src/main/java/com/ruoyi/common/utils").mkdir(parents=True)
+    assert nodes._package_in_baseline(str(tmp_path), "com.ruoyi.common.utils") is True
+    assert nodes._package_in_baseline(str(tmp_path), "com.ruoyi.common.core.redis") is False
+    assert nodes._package_in_baseline(None, "com.x") is True  # 无路径→保守当存在，不误杀
+    assert nodes._package_in_baseline(str(tmp_path), "") is True
+
+
 if __name__ == "__main__":
     import sys
 

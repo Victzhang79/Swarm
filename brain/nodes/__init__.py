@@ -1443,6 +1443,76 @@ def _det_of(out) -> dict:
     return {}
 
 
+def _transitive_abandon(subtasks: list, abandoned: set[str]) -> set[str]:
+    """传递放弃闭包：把【依赖任一已放弃子任务】的子任务也并入放弃集（缺依赖永远跑不了）。
+
+    单一事实源，供 revert 连坐 / 部分交付 / 上游放弃短路三处共用，杜绝"只放弃直接失败者、
+    漏掉依赖链下游"致下游永留 remaining 被反复重派的无界循环。返回闭包后的放弃集（原地不改入参）。"""
+    closed = set(abandoned)
+    _changed = True
+    while _changed:
+        _changed = False
+        for s in subtasks:
+            if s.id in closed:
+                continue
+            if any(d in closed for d in (getattr(s, "depends_on", []) or [])):
+                closed.add(s.id)
+                _changed = True
+    return closed
+
+
+def _producers_of(plan_obj, packages, modules) -> set[str]:
+    """反查【生产某内部包/某模块的子任务 id】：按 plan 子任务 scope.writable 文件路径归属匹配。
+
+    治本 replan 死循环关键：下游因引用上游模块/包而 BLOCKED 时，跨模块 import 依赖的 depends_on
+    在 plan 期常拿不到（见 l1_pipeline 自注），无法靠 depends_on 反查上游。改用运行时 worker 吐出的
+    blocked_on_packages/modules，按【谁的 scope.writable 落在该模块目录 / 含该包目录段】归属到生产者
+    子任务。通用跨栈、非项目写死（纯路径归属，不含任何硬编码 FQN/模块名）。"""
+    out: set[str] = set()
+    pkg_paths = ["/".join(p.split(".")) for p in (packages or []) if p]
+    mods = {str(m).strip().strip("/") for m in (modules or []) if str(m).strip()}
+    for s in getattr(plan_obj, "subtasks", []):
+        scope = getattr(s, "scope", None)
+        writ = list(getattr(scope, "writable", []) or []) if scope else []
+        for f in writ:
+            fn = str(f).replace("\\", "/").lstrip("./")
+            top = fn.split("/", 1)[0]
+            if top in mods:
+                out.add(s.id)
+                break
+            if any(("/" + pp + "/") in ("/" + fn) for pp in pkg_paths):
+                out.add(s.id)
+                break
+    return out
+
+
+def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
+    """点分包名 pkg 是否已存在于【基线项目树】任一模块 src 下（确定性、零 LLM）。
+
+    #R13-2 治本关键：worker 臆造一个基线里根本不存在的包(如 com.ruoyi.common.core.redis)时，
+    L1 会误判 internal_pkg_not_built(transient，等一个【永不会来的生产者】)，白烧整条重试阶梯。
+    但"BLOCKED on X 且 plan 无生产者"不足以判臆造——X 可能是【基线已有、只是沙箱漏同步】的包，
+    那种应继续 transient 等待、绝不硬失败。故用本函数做【假阳性护栏】：只有 X 既无 plan 生产者、
+    【又不在基线树里】才判为臆造(永不可满足)。纯路径匹配、通用跨栈、非项目写死。
+    扫描失败/无路径 → 保守返回 True(当作【存在】→ 不硬失败)，宁可多等也不误杀。"""
+    if not project_path or not pkg:
+        return True  # 无从判定 → 保守当【存在】，不据此硬失败
+    rel = pkg.replace(".", "/").strip("/")
+    if not rel:
+        return True
+    try:
+        for root, dirs, _files in os.walk(project_path):
+            # 剪枝构建产物/VCS/依赖目录，控制开销
+            dirs[:] = [d for d in dirs
+                       if d not in (".git", "target", "build", "dist", "out",
+                                    "node_modules", ".gradle", ".idea")]
+            if root.replace(os.sep, "/").endswith("/" + rel):
+                return True
+    except OSError:
+        return True  # 扫描异常 → 保守当【存在】，避免误杀
+    return False
+
+
 def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> bool:
     """失败详情里是否命中"缺符号/缺依赖"编译特征（确定性、零 LLM）。
     排除 internal_pkg_not_built/upstream_module_broken——那是【内部产物未就绪】非缺外部 jar，
@@ -2137,18 +2207,13 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
             )
             # revert 路：X 被依赖 → 其下游缺依赖跑不了 → 传递放弃（清足迹防毒 + 出完成态）。
             if depended:
-                _changed = True
-                while _changed:
-                    _changed = False
-                    for s in subtasks:
-                        if s.id in abandoned or s.id in give_up:
-                            continue
-                        deps = getattr(s, "depends_on", []) or []
-                        if fid in deps or any(d in abandoned for d in deps):
-                            abandoned.add(s.id)
-                            _changed = True
-                            _local_tree_revert_subtask(project_path, s)
-                            subtask_results.pop(s.id, None)
+                _closed = _transitive_abandon(subtasks, abandoned | {fid})
+                for s in subtasks:
+                    if (s.id in _closed and s.id != fid
+                            and s.id not in abandoned and s.id not in give_up):
+                        abandoned.add(s.id)
+                        _local_tree_revert_subtask(project_path, s)
+                        subtask_results.pop(s.id, None)
         give_up.add(fid)
         handled.append((fid, mode))
 
@@ -2212,16 +2277,23 @@ async def handle_failure(state: BrainState) -> dict:
                 if sid not in failed_ids and _subtask_out_l1_passed(out)
             ]
             if succeeded_siblings:
+                # 治本 replan 死循环·E：内部包/上游模块未就绪类失败【不清零重试计数】——它非 L2 偶发，
+                # 是结构性不可满足；清零会让 _deepest 永不达 give_up 阈值，与 BLOCKED→replan 合谋成无界循环。
+                # 先于 pop 捕获其 pipeline_blocked。
+                _blocked_now = {fid for fid in failed_ids
+                                if _det_of(subtask_results.get(fid)).get("pipeline_blocked")
+                                in _INTERNAL_BLOCKED_KINDS}
                 dispatch_remaining = list(state.get("dispatch_remaining", []))
                 for fid in failed_ids:
                     subtask_results.pop(fid, None)
                     if fid not in dispatch_remaining:
                         dispatch_remaining.append(fid)
                 # L2 集成失败非这些子任务的 capability 失败（它们各自 L1 已过）→ 重置其重试计数，
-                # 不无谓烧 capability 配额；循环边界由 replan_count 熔断保证。
+                # 不无谓烧 capability 配额；循环边界由 replan_count 熔断保证。（结构性内部阻断除外，见上）
                 _rc = dict(state.get("subtask_retry_counts", {}))
                 for fid in failed_ids:
-                    _rc[fid] = 0
+                    if fid not in _blocked_now:
+                        _rc[fid] = 0
                 logger.info(
                     "[HANDLE_FAILURE] L2 定向恢复（第 %d/%d 次）：集成失败归因到 %s，"
                     "保留 %d 个成功兄弟 %s，仅重做归因子任务，不全量 replan",
@@ -2330,6 +2402,64 @@ async def handle_failure(state: BrainState) -> dict:
             "use_alternate_model": forced_alternate,
             "subtask_retry_counts": {**retry_counts, **next_counts},
         }
+
+    # ── 治本·replan 无界循环：上游已被永久放弃 → 下游不可恢复 → 直接连坐放弃（先于超时/LLM/一切重试）──
+    # 机制(round12 实证 churn 3h 才被人工取消)：阶梯三给某 upstream 打桩/revert 放弃后，依赖它的下游
+    # 会永久 BLOCKED(upstream_module_broken/internal_pkg_not_built，上游永不落地)。若仍走 LLM→replan
+    # 或退避重试 → BLOCKED→replan→守卫降级 retry→重派→BLOCKED 无界循环、且阻断任务级 MERGE=阻断交付。
+    # 此处在任何重试/replan 前拦截：把"依赖已放弃上游"的下游一并放弃(传递闭包)，run 自终 PARTIAL。
+    # 下游归属用【运行时 blocked_on 包/模块→生产者子任务】(跨模块 import 的 depends_on 不可靠) ∪ depends_on。
+    if plan_obj is not None:
+        _unsat = (set(state.get("give_up_isolated_ids") or [])
+                  | set(state.get("abandoned_subtask_ids") or []))
+        _proj_path = _get_project_path(state.get("project_id") or "")
+        _by_id = {s.id: s for s in plan_obj.subtasks}
+        _unrecoverable: set[str] = set()
+        for fid in failed_ids:
+            _det = _det_of(subtask_results.get(fid))
+            if _det.get("pipeline_blocked") not in _INTERNAL_BLOCKED_KINDS:
+                continue
+            _st = _by_id.get(fid)
+            _bpkgs = _det.get("blocked_on_packages") or []
+            _bmods = _det.get("blocked_on_modules") or []
+            _prods = _producers_of(plan_obj, _bpkgs, _bmods)
+            # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
+            _dep_hit = bool(set(getattr(_st, "depends_on", []) or []) & _unsat) if _st else False
+            _prod_hit = bool(_prods & _unsat)
+            # (#R13-2) 阻断在【无任何 plan 生产者 且 基线树里也不存在】的包 = 臆造不存在的包 →
+            # 在等一个永不会来的生产者，永不可满足。直接判不可恢复，免烧整条 transient 重试阶梯。
+            # 假阳性护栏 _package_in_baseline：基线已有(仅沙箱漏同步)的包 → 不判臆造、继续 transient 等待。
+            _hallucinated = (
+                bool(_bpkgs) and not _prods
+                and not any(_package_in_baseline(_proj_path, p) for p in _bpkgs)
+            )
+            if _dep_hit or _prod_hit or _hallucinated:
+                _unrecoverable.add(fid)
+        if _unrecoverable:
+            abandoned = _transitive_abandon(
+                plan_obj.subtasks,
+                set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
+            )
+            for _a in abandoned:
+                subtask_results.pop(_a, None)
+            _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
+            # 非不可恢复的其余失败放回重派（各自重试计数原样保留，下轮再进常规阶梯）
+            for fid in [f for f in failed_ids if f not in abandoned]:
+                subtask_results.pop(fid, None)
+                if fid not in _remaining:
+                    _remaining.append(fid)
+            logger.warning(
+                "[HANDLE_FAILURE] 不可恢复子任务 %s(+依赖闭包共 %d) → 连坐放弃、不再 retry/replan："
+                "上游已永久放弃 或 阻断在臆造/基线不存在且无生产者的包；终态 PARTIAL（诚实列明需人工补完）",
+                sorted(_unrecoverable), len(abandoned),
+            )
+            return {
+                "failure_strategy": "abandon",
+                "abandoned_subtask_ids": sorted(abandoned),
+                "failed_subtask_ids": [],
+                "dispatch_remaining": _remaining,
+                "subtask_results": subtask_results,
+            }
 
     # ── 主干B 不变量·超时→强制拆小作【第一恢复动作】（先于 LLM 策略 + 一切换模型重试）──
     # 子任务 coding/locating 超时 = 工作单元对执行预算太大的确定性信号。先换模型重试同样的大块
@@ -2680,17 +2810,8 @@ async def handle_failure(state: BrainState) -> dict:
                  if tid not in failed_ids and tid not in _abandoned_so_far]
         _allow_partial = getattr(get_config().worker, "allow_partial_delivery", True)
         if _allow_partial and _done and plan_obj is not None:
-            abandoned = _abandoned_so_far | set(failed_ids)
             # 传递放弃：依赖被放弃者的子任务也放弃(缺依赖跑不了)，避免它们永留 remaining 死循环
-            _changed = True
-            while _changed:
-                _changed = False
-                for _st in plan_obj.subtasks:
-                    if _st.id not in abandoned and any(
-                        d in abandoned for d in (getattr(_st, "depends_on", []) or [])
-                    ):
-                        abandoned.add(_st.id)
-                        _changed = True
+            abandoned = _transitive_abandon(plan_obj.subtasks, _abandoned_so_far | set(failed_ids))
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
             logger.warning(
                 "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",

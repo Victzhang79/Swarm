@@ -136,7 +136,7 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
 
 
 def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
-                                  max_concurrent, to_dispatch):
+                                  max_concurrent, to_dispatch, abandoned=None):
     """主干B 不变量·DISPATCH 闸门：派发前确保每个工作单元【文件数≤上界】（预防式治本）。
 
     根因：编排允许 oversized 子任务一路派到 worker，撞 900s 墙钟超时后才在恢复阶梯拆小——
@@ -197,7 +197,7 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
     if not changed:
         return plan_obj, dispatch_remaining, to_dispatch
     plan_obj = _rebuild_plan(plan_obj, new_subtasks)
-    to_dispatch = plan_obj.get_dispatch_batch(completed_ids, remaining, max_concurrent)
+    to_dispatch = plan_obj.get_dispatch_batch(completed_ids, remaining, max_concurrent, abandoned)
     return plan_obj, remaining, to_dispatch
 
 
@@ -223,9 +223,15 @@ async def dispatch(state: BrainState) -> dict:
     # audit #19：重入防护——dispatch_remaining 为空但仍有"既未完成、也不在 remaining"
     # 的子任务时（理论上不该出现，但 handle_failure/rebase 等异常路径可能造成），
     # 把这些遗漏子任务补回 remaining，避免直接跳过派发导致任务卡死/漏做。
+    # 永久放弃集（阶梯三打桩/revert/连坐）：派发层须感知，否则被放弃子任务在
+    # subtask_results.pop 后既不在 completed 也不在 remaining → 被孤儿回填当"漏做"复活，
+    # 与 BLOCKED→replan 合谋成无界循环。读 state 单一事实源，全程排除。
+    _abandoned = (set(state.get("abandoned_subtask_ids") or [])
+                  | set(state.get("give_up_isolated_ids") or []))
     _completed = set(subtask_results.keys())
     if not dispatch_remaining:
-        _orphaned = [t.id for t in plan_obj.subtasks if t.id not in _completed]
+        _orphaned = [t.id for t in plan_obj.subtasks
+                     if t.id not in _completed and t.id not in _abandoned]
         if _orphaned:
             logger.warning(
                 "[DISPATCH] 检测到 %d 个未完成但不在 remaining 的子任务，补回派发队列: %s",
@@ -238,14 +244,14 @@ async def dispatch(state: BrainState) -> dict:
     max_concurrent = config.worker.max_concurrent
 
     to_dispatch = plan_obj.get_dispatch_batch(
-        completed_ids, dispatch_remaining, max_concurrent
+        completed_ids, dispatch_remaining, max_concurrent, _abandoned
     )
 
     # ── 主干B 不变量·DISPATCH 预算闸门：超文件上界的工作单元在派发前确定性拆小，
     # 不让大块进 worker 撞 900s 超时（预防式治本，非超时后补偿）。plan 可能被重建 → 须回写 state。
     _plan_before_gate = plan_obj
     plan_obj, dispatch_remaining, to_dispatch = _enforce_dispatch_budget_gate(
-        plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch
+        plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch, _abandoned
     )
     _gate_split = plan_obj is not _plan_before_gate
 

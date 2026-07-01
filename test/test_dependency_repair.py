@@ -277,7 +277,7 @@ def test_thirdparty_group_in_pom_not_treated_as_own():
         assert "com.alibaba" not in own, f"第三方 com.alibaba(仅 pom 依赖,无源码)不应判自有: {own}"
         # 端到端：fastjson2 缺包 → 不被当内部包 BLOCKED，dep-repair 照常补
         build_out = f"[ERROR] {rel}:[2,20] package com.alibaba.fastjson2 does not exist\n"
-        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False, \
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) == set(), \
             "第三方 fastjson2 缺包不应被误判为②内部包未就绪"
         restore = _patch_network(("com.alibaba", "fastjson2"), ["2.0.51"])
         try:
@@ -322,8 +322,11 @@ def test_blocked_on_unbuilt_internal_pkg():
             "[ERROR] modA/src/main/java/com/example/a/Svc.java:[2,30] "
             "package com.example.b.sender.dto does not exist\n"
         )
-        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is True
-    print("  ✅ 内部包尚未建出 → BLOCKED（②退避待生产者）")
+        # 新：返回【被阻断的内部缺包集合】(非空即②)，供 brain 反查生产者子任务
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) == {
+            "com.example.b.sender.dto"
+        }
+    print("  ✅ 内部包尚未建出 → BLOCKED（②退避待生产者）+ 吐出缺包集")
 
 
 def test_not_blocked_when_internal_pkg_exists_in_tree():
@@ -336,7 +339,7 @@ def test_not_blocked_when_internal_pkg_exists_in_tree():
             "[ERROR] modA/src/main/java/com/example/a/Svc.java:[2,30] "
             "package com.example.a does not exist\n"
         )
-        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) == set()
     print("  ✅ 内部包已在树里 → 真错，不误标 BLOCKED")
 
 
@@ -351,7 +354,7 @@ def test_not_blocked_when_thirdparty_pkg_missing():
             "[ERROR] modA/src/main/java/com/example/a/Svc.java:[3,30] "
             "package io.jsonwebtoken does not exist\n"
         )
-        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) is False
+        assert l1._build_blocked_on_unbuilt_internal(str(d), build_out, 30) == set()
     print("  ✅ 含第三方缺包 → 交 dep-repair，不标 BLOCKED")
 
 
@@ -378,6 +381,8 @@ def test_run_l1_pipeline_blocks_on_unbuilt_internal():
             assert details.get("pipeline_blocked") == "internal_pkg_not_built", details
             assert details.get("not_run_kind") == NotRunKind.BLOCKED.value
             assert not details.get("build_failed"), "②未就绪不应记 capability FAIL"
+            # 结构化输出：吐出缺的内部包，供 brain 反查生产者子任务（治本 replan 死循环）
+            assert details.get("blocked_on_packages") == ["com.example.b.sender.dto"], details
         finally:
             l1._run_l1_command, l1._build_cmd_applicable = orig_run, orig_app
     print("  ✅ run_l1_pipeline：缺内部包 → BLOCKED（非 capability FAIL）")

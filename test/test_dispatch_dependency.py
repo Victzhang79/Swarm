@@ -77,6 +77,38 @@ def test_diamond_dag():
     print("  ✅ 钻石 DAG：fan-out 并发 + fan-in 等齐后串行")
 
 
+def test_abandoned_subtasks_never_dispatched():
+    """治本 replan 死循环：已放弃子任务、及依赖放弃项的下游 → 永不就绪/不被选中/不被复活。"""
+    plan = TaskPlan(subtasks=[
+        _sub("st-up"), _sub("st-down", deps=["st-up"]), _sub("st-free"),
+    ])
+    abandoned = {"st-up"}
+    # st-up 被放弃 → 自身不派发；st-down 依赖放弃项 → 永不就绪；st-free 独立 → 照常派发
+    batch = plan.get_dispatch_batch(
+        set(), ["st-up", "st-down", "st-free"], max_concurrent=4, abandoned=abandoned
+    )
+    ids = {t.id for t in batch}
+    assert ids == {"st-free"}, f"放弃项及其下游不应派发，仅 st-free，实际 {ids}"
+    # 即便上游被当"已完成"(stub 计入 completed)，依赖放弃项的下游仍不就绪(放弃优先)
+    batch2 = plan.get_dispatch_batch(
+        {"st-up"}, ["st-down"], max_concurrent=4, abandoned=abandoned
+    )
+    assert {t.id for t in batch2} == set(), "依赖放弃项的下游永不就绪（即使上游计入completed）"
+    # get_ready_tasks 同样排除
+    ready = plan.get_ready_tasks(set(), abandoned=abandoned)
+    assert {t.id for t in ready} == {"st-free"}
+    print("  ✅ 放弃集：放弃项及下游永不派发/就绪（斩断 replan 复活循环）")
+
+
+def test_backward_compat_no_abandoned_arg():
+    """不传 abandoned（旧调用）→ 行为不变，向后兼容。"""
+    plan = TaskPlan(subtasks=[_sub("st-1"), _sub("st-2", deps=["st-1"])])
+    batch = plan.get_dispatch_batch(set(), ["st-1", "st-2"], max_concurrent=4)
+    assert {t.id for t in batch} == {"st-1"}
+    assert {t.id for t in plan.get_ready_tasks(set())} == {"st-1"}
+    print("  ✅ 不传 abandoned → 向后兼容")
+
+
 if __name__ == "__main__":
     print("=" * 56)
     print("  dispatch 依赖驱动并行单测（批次③）")
