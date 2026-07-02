@@ -184,6 +184,86 @@ def apply_git_diff(
             pass
 
 
+def split_diff_by_file(diff: str) -> list[tuple[list[str], str]]:
+    """把 unified diff 按【文件段】拆成可独立 apply 的子 diff。
+
+    git 标准 diff 每文件段以 `diff --git a/… b/…` 起头，自包含(含 index/---/+++/@@ hunks)；
+    裸 unified diff(无 `diff --git`)退化为按 `--- `/`+++ ` 文件对边界拆。返回 [(files, sub_diff)]，
+    仅保留能提取到目标文件的段(空/前言段丢弃)。用于 apply_git_diff_resilient 的分文件落盘。
+    """
+    lines = diff.splitlines(keepends=True)
+    has_git_hdr = any(ln.startswith("diff --git ") for ln in lines)
+    sections: list[list[str]] = []
+    cur: list[str] = []
+    for i, ln in enumerate(lines):
+        if has_git_hdr:
+            boundary = ln.startswith("diff --git ")
+        else:
+            # 无 git 头：文件头对 `--- x` 紧跟 `+++ y` 才是新段开始。要求【下一行是 +++ 】，
+            # 避免把 hunk 内被删除的内容行(如 SQL `-- comment` 渲成 `--- comment`)误判成文件边界。
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            boundary = (
+                ln.startswith("--- ") and nxt.startswith("+++ ")
+                and any(x.startswith("+++ ") for x in cur)
+            )
+        if boundary and cur:
+            sections.append(cur)
+            cur = []
+        cur.append(ln)
+    if cur:
+        sections.append(cur)
+
+    out: list[tuple[list[str], str]] = []
+    for sec in sections:
+        text = "".join(sec)
+        files = files_from_unified_diff(text)
+        if text.strip() and files:
+            out.append((files, text))
+    return out
+
+
+def apply_git_diff_resilient(project_path: str, diff: str) -> dict[str, Any]:
+    """分文件鲁棒 apply：整块失败不连坐回滚好文件。
+
+    治本 round18 P0-C：一个坏 hunk 令整块 `git apply` 原子失败 → ~30 个正确 producer 一个没落盘。
+    先试整块 apply(全过则最优——顺序/rename 语义完整、单次调用)；失败则按【文件段】独立 apply，
+    好段照常落盘、坏段单独剔除记录。返回 {ok, stage, applied:[files], failed:[{files,stage,stderr}]}。
+    ok = 至少一个文件落盘。调用方据 applied 决定纳入 commit 的文件集、据 failed 交 owner 重修。
+    """
+    if not diff.strip():
+        return {"ok": False, "stage": "input", "stderr": "empty diff", "applied": [], "failed": []}
+
+    # 快路径：整块原子 apply 成功即最优
+    whole = apply_git_diff(project_path, diff, check_only=False)
+    if whole.get("ok"):
+        return {
+            "ok": True, "stage": "apply",
+            "applied": files_from_unified_diff(diff), "failed": [],
+            "message": whole.get("message", "整块 apply 成功"),
+        }
+
+    # 慢路径：按文件段独立 apply，好段保留、坏段剔除（杜绝连坐）
+    applied: list[str] = []
+    failed: list[dict[str, Any]] = []
+    for files, sub in split_diff_by_file(diff):
+        res = apply_git_diff(project_path, sub, check_only=False)
+        if res.get("ok"):
+            applied.extend(files)
+        else:
+            failed.append({
+                "files": files,
+                "stage": res.get("stage"),
+                "stderr": (res.get("stderr") or "")[:300],
+            })
+    return {
+        "ok": bool(applied),
+        "stage": "per_file",
+        "applied": applied,
+        "failed": failed,
+        "message": f"分文件落盘：成功 {len(applied)} 文件，剔除坏段 {len(failed)}",
+    }
+
+
 def commit_task_output(
     project_path: str,
     files: list[str],

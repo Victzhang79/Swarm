@@ -143,6 +143,17 @@ def validate_plan_structure(
         ids = list(dict.fromkeys(ids))  # 跨子任务再去重（保序）
         if len(ids) < 2:
             continue
+        joined = ", ".join(ids)
+        # D1 治本 backstop：Maven 根聚合 pom.xml 永远【单写者】。两份对 <modules>/
+        # <dependencyManagement> 的结构重写无法安全 3-way/union 合并（round18 P0-A 畸形 /
+        # rebase 循环→escalate→FAILED），即便依赖序也不行（各自整段重写、非加性）。
+        # normalize_plan_scopes 已收敛唯一 owner；此处硬失败仅在收敛失效时兜底（fail-closed）。
+        if fp.replace("\\", "/") == "pom.xml":
+            result.add(
+                f"根聚合 pom.xml 有 {len(ids)} 个写者: [{joined}]"
+                f"（必须收敛唯一 aggregator-owner；双写者=P0-A 畸形/rebase 循环根因）"
+            )
+            continue
         # 按文件【聚合】成一条，而非两两组合 O(n²) 刷屏（N 个子任务写同一文件原会打 N²/2 条）。
         # 只要存在一对【无依赖】争写者即硬失败（并行必冲突）；否则全为依赖序 → 告警。
         has_independent = any(
@@ -150,7 +161,6 @@ def validate_plan_structure(
             for i, a in enumerate(ids)
             for b in ids[i + 1 :]
         )
-        joined = ", ".join(ids)
         if has_independent:
             result.add(
                 f"{len(ids)} 个无依赖子任务同时写 {fp}: [{joined}]"

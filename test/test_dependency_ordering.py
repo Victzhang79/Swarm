@@ -170,7 +170,11 @@ def _mk2(sid, *, create=None, writable=None, deps=None):
 
 def _run18_dual_scaffold_root_pom_plan():
     """RUN18 现场：两个脚手架子任务(建各自 module pom)【同时】都写根 pom.xml 的 <modules> 注册，
-    外加一个 SQL 子任务也写根 pom。三者并发写同一根 pom → 必须串行化，否则 plan_validator 硬失败。
+    外加一个 SQL 子任务也写根 pom。三者写同一根 pom。
+
+    D1 治本后：根 pom 收敛【唯一 owner】(拓扑首写者 st-1)，st-16/st-24 的根 pom 写权 demote 为
+    readable + 依赖 owner。<modules> 由 reconcile_workspace_manifests 据磁盘 ground-truth 补齐、
+    版本由 D2 reconcile 兜底，故 demote 不丢注册。两份结构重写不再并存 → 无 P0-A 畸形/rebase 循环。
     """
     j = "ruoyi-alarm/src/main/java/com/ruoyi/alarm"
     return TaskPlan(subtasks=[
@@ -215,27 +219,32 @@ def test_run18_order_fix_dep_before_normalize_yields_valid():
     assert not pom_issues, f"根 pom 不应有并发写冲突，实得 {pom_issues}"
 
 
-def test_run18_old_order_normalize_before_fix_dep_regression():
-    """回归护栏：normalize 在 fix_dep 【之前】(旧序)→ fix_dep 的脚手架置根抹掉串行化依赖
-    → 多写者并发写根 pom → plan_validator 硬失败。锁死此序，防未来被改回。"""
+def test_run18_convergence_order_robust():
+    """D1 治本：根 pom 收敛唯一 owner【不依赖 pass 顺序】。旧序(normalize→fix_dep)曾因 fix_dep
+    脚手架置根抹掉串行化依赖 → 多写者并发写根 pom → 硬失败；收敛(demote 而非串行化)后，无论哪种
+    顺序都只剩单 owner → 合法。锁死此不变量：根 pom 写者数 == 1 且校验通过。"""
     from swarm.brain.plan_validator import validate_plan_structure
-    p = _run18_dual_scaffold_root_pom_plan()
-    _elaborate_passes(p, fix_dep_first=False, aggregate_root_pom=True)
-    r = validate_plan_structure(p)
-    pom_issues = [i for i in r.issues if "pom" in i]
-    assert pom_issues, "旧序(normalize→fix_dep)应复现根 pom 并发写硬失败（证明顺序要害）"
+    for fix_dep_first in (True, False):
+        p = _run18_dual_scaffold_root_pom_plan()
+        _elaborate_passes(p, fix_dep_first=fix_dep_first, aggregate_root_pom=True)
+        writers = [s.id for s in p.subtasks
+                   if "pom.xml" in (set(s.scope.writable or []) | set(s.scope.create_files or []))]
+        assert len(writers) == 1, f"fix_dep_first={fix_dep_first}: 根 pom 应收敛唯一 owner，实得 {writers}"
+        r = validate_plan_structure(p)
+        assert r.valid, f"fix_dep_first={fix_dep_first}: 收敛后应合法，issues={r.issues}"
 
 
 def test_run18_fix_preserves_fix_dep_duties():
-    """修复顺序不能破坏 fix_dep 本职：SQL 子任务仍依赖实体、脚手架(非共享写)仍可置根。"""
+    """修复不能破坏 fix_dep 本职：SQL 子任务仍依赖实体；被 demote 的根 pom 写者转 readable+依赖 owner。"""
     p = _run18_dual_scaffold_root_pom_plan()
     _elaborate_passes(p, fix_dep_first=True, aggregate_root_pom=True)
     st16 = next(s for s in p.subtasks if s.id == "st-16")
     assert "st-9" in (st16.depends_on or []), f"SQL 应仍依赖实体 st-9，实得 {st16.depends_on}"
-    # st-24(脚手架B)写根 pom → 被串行化到 st-1 之后(保留写权不丢 alarm-sdk 注册)
+    # st-24(脚手架B)写根 pom → D1 demote：写权移除、转 readable、依赖 owner st-1（注册由 reconcile 兜底）
     st24 = next(s for s in p.subtasks if s.id == "st-24")
-    assert "pom.xml" in (st24.scope.writable or []), "脚手架B 的根 pom 写权应保留(串行化而非删除)"
-    assert st24.depends_on, "脚手架B 应被串行化(有前序写者依赖)，而非裸置根并发写"
+    assert "pom.xml" not in (st24.scope.writable or []), "脚手架B 根 pom 写权应 demote(收敛唯一 owner)"
+    assert "pom.xml" in (st24.scope.readable or []), "脚手架B 应转 readable"
+    assert "st-1" in (st24.depends_on or []), "脚手架B 应依赖 owner st-1"
 
 
 def _mk_diff(sid, *, create=None, writable=None, difficulty=SubTaskDifficulty.TRIVIAL):

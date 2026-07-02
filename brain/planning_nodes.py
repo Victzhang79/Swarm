@@ -51,6 +51,19 @@ MAX_FILES_PER_SUBTASK = 4
 # 超此上界则【按层】拆(数据层 boilerplate 快 → 逻辑层 service/impl/controller 复杂,串行)：共享
 # 契约(CONTRACT_MODULE)已锚定接口/DTO 签名,按层拆+契约注入不致漂移。正常实体(≤此数)仍整批守 RUN14。
 MAX_SINGLE_ENTITY_FILES = 6
+# D4(a) 治本 round18 st-16：【同层平行独立实现】家族(策略/插件模式：N 个兄弟实现共享一个抽象、
+# 彼此无编译依赖，如 6 个渠道通知 impl)达此数即【一实现一子任务】。旧逻辑只按 Controller 锚点/单实体
+# 分层拆，纯 Service 兄弟(无 Controller)落进单实体分支→不拆穿→被迫串烧多套异构外部集成→迭代耗尽 +
+# 对某库 API 幻觉即拖垮整批。阈值≥3 避免 2 个也拆(2 个负担可控)。共享接口/抽象成前置上游批。
+MIN_PARALLEL_IMPL_SIBLINGS = 3
+# 约定的"实现/插件目录名"(平行独立实现常聚居于此)——纯路径信号，跨语言/跨栈通用不绑 Java。
+_IMPL_DIR_NAMES = frozenset({
+    "impl", "impls", "handler", "handlers", "channel", "channels",
+    "strategy", "strategies", "provider", "providers", "processor", "processors",
+    "adapter", "adapters", "filter", "filters", "listener", "listeners",
+    "sender", "senders", "notifier", "notifiers", "executor", "executors",
+    "plugin", "plugins", "connector", "connectors",
+})
 # 分层秩(数据模型→持久层→业务层→Web 层)：仅用于【批内文件排序】(描述里数据层在前读着自然)，
 # 不再作为拆分边界——拆分边界是实体词干(_entity_stem)。
 _LAYER_ORDER = {
@@ -1959,6 +1972,7 @@ async def elaborate(state: BrainState) -> dict:
         correct_misclassified_intent,
         enrich_context_snippets,
         enrich_java_package_readable,
+        inject_api_knowledge,
         resolve_plan_conflicts,
     )
     # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
@@ -2001,6 +2015,14 @@ async def elaborate(state: BrainState) -> dict:
             logger.info("[ELABORATE] 方案A: 已为子任务预注入 scope 文件代码片段（worker 免 cat 探索）")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ELABORATE] 上下文预注入失败（非致命，worker 仍可自行探索）: %s", exc)
+
+    # ── D4(b): 按 plan 声明依赖命中"常幻觉库→正确 API 签名"知识表，注入相关子任务 context_snippets，
+    # 消除本地小模型对第三方库(如 okhttp3.OkHttpClient)类名/方法名的幻觉退化死循环（round18 st-16）。
+    try:
+        if inject_api_knowledge(plan_obj):
+            logger.info("[ELABORATE] D4(b): 已按声明依赖注入外部库正确 API 签名（消库名幻觉）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[ELABORATE] 外部库 API 知识注入失败（非致命）: %s", exc)
 
     # ── Bug-1 根治：plan 成型后全局悬空依赖兜底（单一收口点）──
     # 二次拆分 + 多轮 replan 可能残留指向不存在子任务的 depends_on，
@@ -2218,6 +2240,132 @@ def _split_single_entity_by_layer(core: list[str], max_files: int) -> list[list[
     return batches
 
 
+def _basename_noext(f: str) -> str:
+    b = f.replace("\\", "/").rsplit("/", 1)[-1]
+    return b.rsplit(".", 1)[0] if "." in b else b
+
+
+def _parent_dir(f: str) -> str:
+    parts = f.replace("\\", "/").split("/")
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def _longest_common_suffix(strs: list[str]) -> str:
+    """一组字符串的最长公共后缀(用于识别 XxxHandler/XxxSender 这类同后缀兄弟)。"""
+    if not strs:
+        return ""
+    shortest = min(strs, key=len)
+    suf = ""
+    for i in range(1, len(shortest) + 1):
+        c = shortest[-i]
+        if all(len(s) >= i and s[-i] == c for s in strs):
+            suf = c + suf
+        else:
+            break
+    return suf
+
+
+def _is_interface_like(base: str) -> bool:
+    """Java 接口约定：I + 大写(INotifyService)。这类是共享抽象,不算平行实现。"""
+    return len(base) > 1 and base[0] == "I" and base[1].isupper()
+
+
+def _is_upstream_shared(base: str) -> bool:
+    """【共享抽象】——被各平行实现依赖，须【先建】(归上游首批,各 leaf readable 含它)。
+    含：接口(I 前缀)、抽象/基类(Abstract*/Base*/*Base/*Support)。对抗审计 #1 治本：基类若被当
+    平行兄弟拆到 leaf 批，前向 readable 不含它 → 子批 `cannot find symbol`。"""
+    return (
+        _is_interface_like(base)
+        or base.startswith(("Abstract", "Base"))
+        or base.endswith(("Base", "Support"))
+    )
+
+
+def _is_downstream_coordinator(base: str) -> bool:
+    """【协调者】——实例化/引用【全部实现】，须【后建】(归下游末批,readable 含全部 leaf)。
+    含：工厂/注册表/分发器/路由(*Factory/*Registry/*Dispatcher/*Router)。对抗审计 #1 治本：
+    工厂若被当平行兄弟拆，前向 readable 不含晚序 leaf → `cannot find symbol`。"""
+    return base.endswith(("Factory", "Registry", "Dispatcher", "Router"))
+
+
+def _detect_parallel_impls(core: list[str]) -> tuple[list[str], list[str], list[str]] | None:
+    """检测【同层平行独立实现家族】(策略/插件模式：N 个兄弟实现共享一个抽象、彼此无编译依赖)。
+
+    治本 round18 st-16：6 个渠道通知 impl(SlackNotifyService/DingTalkNotifyService/…)塞进一个
+    子任务 → worker 被迫在一个上下文里串烧 6 套异构外部集成(各自 HTTP 客户端)→ 迭代/预算耗尽 +
+    对某库 API 幻觉即拖垮整批。这类实现【彼此独立】(只共享接口，不互相引用)，天然可一实现一子任务。
+
+    判据(两信号任一，且【剥离共享抽象/协调者后】的 leaf 数 ≥ MIN_PARALLEL_IMPL_SIBLINGS)：
+      - 目录信号：同一约定实现目录(impl/handler/channel/strategy/sender/…)下 ≥N 个 leaf；或
+      - 命名信号：同目录 ≥N 个 leaf 基名共享 ≥4 字符公共后缀且前缀各异(XxxHandler/XxxSender…)。
+    返回 (leaves, upstream, downstream)：
+      - leaves    = 彼此独立的平行实现(各成一批,一实现一子任务)；
+      - upstream  = 共享抽象(接口/抽象/基类) + 家族目录外的其它 core(共享类型) → 首批(先建)；
+      - downstream= 协调者(工厂/注册表/…) → 末批(后建,读全部 leaf)。
+    不构成家族返回 None。纯路径+命名判据，跨语言/跨栈通用，不绑 Java、不写死项目/模块名。
+    """
+    from collections import defaultdict
+    by_dir: dict[str, list[str]] = defaultdict(list)
+    for f in core:
+        by_dir[_parent_dir(f).lower()].append(f)
+
+    best_files: list[str] = []
+    best_leaves: list[str] = []
+    for dirname, files in by_dir.items():
+        # 剥离共享抽象/协调者后，剩下的才是【平行 leaf】——据此判家族规模与命名信号
+        leaves = [
+            f for f in files
+            if not _is_upstream_shared(_basename_noext(f))
+            and not _is_downstream_coordinator(_basename_noext(f))
+        ]
+        if len(leaves) < MIN_PARALLEL_IMPL_SIBLINGS:
+            continue
+        bases = [_basename_noext(f) for f in leaves]
+        dir_sig = dirname in _IMPL_DIR_NAMES
+        suf = _longest_common_suffix(bases)
+        name_sig = (
+            len(suf) >= 4
+            and len(set(bases)) == len(bases)          # 各文件名互异
+            and all(len(b) > len(suf) for b in bases)   # 每个都有各自前缀(非纯后缀)
+        )
+        if (dir_sig or name_sig) and len(leaves) > len(best_leaves):
+            best_files, best_leaves = files, leaves
+    if len(best_leaves) < MIN_PARALLEL_IMPL_SIBLINGS:
+        return None
+
+    fam_dir = set(best_files)
+    leaves = list(best_leaves)
+    upstream = [f for f in best_files if _is_upstream_shared(_basename_noext(f))]
+    downstream = [f for f in best_files if _is_downstream_coordinator(_basename_noext(f))]
+    # 家族目录【外】的其它 core(接口/消息类等共享类型) 也归上游首批(先建,各 leaf 可读)
+    upstream = [f for f in core if f not in fam_dir] + upstream
+    return leaves, upstream, downstream
+
+
+def _split_parallel_impl_core(core: list[str]) -> list[list[str]] | None:
+    """把平行独立实现家族拆成【每个实现一批】。拆不出返回 None。
+
+    批序(串行链 + 前向累积 readable 天然保证编译序正确)：
+      共享抽象(upstream,先建) → 各 leaf 批(按词干稳定排序,彼此独立) → 协调者(downstream,后建,读全 leaf)。
+    leaf 内按实体词干归组(一个实现可含多文件，如 SlackNotifyService+SlackConfig 同词干同批)。
+    """
+    detected = _detect_parallel_impls(core)
+    if detected is None:
+        return None
+    leaves, upstream, downstream = detected
+    batches: list[list[str]] = []
+    if upstream:
+        batches.append(sorted(upstream, key=_layer_rank))     # 共享抽象/类型 → 首批(上游)
+    stem_groups: dict[str, list[str]] = {}
+    for f in sorted(leaves, key=_layer_rank):
+        stem_groups.setdefault(_entity_stem(f), []).append(f)
+    for stem in sorted(stem_groups):
+        batches.append(stem_groups[stem])                     # 各平行实现 → 独立一批
+    if downstream:
+        batches.append(sorted(downstream, key=_layer_rank))   # 协调者 → 末批(下游,读全 leaf)
+    return batches if len(batches) >= 2 else None
+
+
 def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> list:
     """确定性按【实体词干】把文件数超标的子任务拆成多个子任务(不调 LLM，可复现)。
 
@@ -2269,9 +2417,15 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             feat[next((a for a in anchors if s.startswith(a)), anchors[-1])].append(f)
         core_batches = [feat[a] for a in sorted(anchors, key=len) if feat[a]]
     elif core:
+        # D4(a) 治本 round18 st-16：先判【同层平行独立实现家族】(N 个渠道/handler/strategy 兄弟,
+        # 无 Controller 锚点、彼此无依赖)→ 一实现一子任务(共享接口成前置上游批)。这在单实体分层之前,
+        # 因这类兄弟各是【不同实体】(不同渠道),不该被当单实体整批。检测不中(None)才落回单实体逻辑。
+        parallel_batches = _split_parallel_impl_core(core)
+        if parallel_batches is not None:
+            core_batches = parallel_batches
         # round10 #3 治本：单实体 core 超文件数上界 → 按层拆(数据→逻辑,契约锚定不漂移)消除 900s
         # 超时；正常实体(≤上界)仍整批守 RUN14。
-        if len(core) > MAX_SINGLE_ENTITY_FILES:
+        elif len(core) > MAX_SINGLE_ENTITY_FILES:
             core_batches = _split_single_entity_by_layer(core, max_files)
         else:
             core_batches = [core]

@@ -55,8 +55,8 @@ def reconcile_workspace_manifests(
     hint = [str(m or "") for m in (modified or [])]
     modified_manifests: list[str] = []
     added: dict[str, list[str]] = {}
-    for fn in (_reconcile_maven, _reconcile_gradle, _reconcile_cargo,
-               _reconcile_dotnet_sln, _reconcile_go_work):
+    for fn in (_reconcile_maven, _reconcile_maven_dep_versions, _reconcile_gradle,
+               _reconcile_cargo, _reconcile_dotnet_sln, _reconcile_go_work):
         try:
             mods, adds = fn(root, hint)
         except Exception as exc:  # noqa: BLE001 —— 增益层：单生态失败不影响其它与主流程
@@ -152,6 +152,166 @@ def _reconcile_maven(root: Path, hint: list[str]) -> tuple[list[str], dict[str, 
         modified.append(rel)
         added[rel] = new_members
     return modified, added
+
+
+# ───────────────── Maven dependencyManagement 版本对账（D2）──────────────────
+def _tag(text: str, tag: str) -> str | None:
+    """抽首个 <tag>值</tag>（值非空、单行）。"""
+    m = re.search(rf"<{tag}>\s*([^<\s][^<]*?)\s*</{tag}>", text)
+    return m.group(1).strip() if m else None
+
+
+def _all_poms(root: Path) -> list[Path]:
+    out: list[Path] = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        pom = d / "pom.xml"
+        if pom.is_file():
+            out.append(pom)
+        stack.extend(_safe_subdirs(d))
+    return out
+
+
+def _maven_pom_coords(text: str) -> tuple[str, str, str] | None:
+    """模块【自身】坐标 (groupId, artifactId, version)——version/groupId 缺省时继承 <parent>。
+
+    先剥离 parent/dependencyManagement/dependencies/build 块，避免误取嵌套的 artifactId。
+    """
+    parent = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    pblock = parent.group(1) if parent else ""
+    body = (text[:parent.start()] + text[parent.end():]) if parent else text
+    body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
+    body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
+    body = re.sub(r"<build>.*?</build>", "", body, flags=re.S)
+    artifact = _tag(body, "artifactId")
+    if not artifact:
+        return None
+    group = _tag(body, "groupId") or _tag(pblock, "groupId")
+    version = _tag(body, "version") or _tag(pblock, "version")
+    if not (group and version):
+        return None
+    return (group, artifact, version)
+
+
+def _maven_direct_deps(text: str) -> list[tuple[str, str, bool]]:
+    """模块的【运行时依赖】(g, a, 是否带 version)——排除 parent/dependencyManagement/build。"""
+    t = re.sub(r"<parent>.*?</parent>", "", text, flags=re.S)
+    t = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", t, flags=re.S)
+    t = re.sub(r"<build>.*?</build>", "", t, flags=re.S)
+    out: list[tuple[str, str, bool]] = []
+    for dblock in re.findall(r"<dependencies>(.*?)</dependencies>", t, re.S):
+        for dep in re.findall(r"<dependency>(.*?)</dependency>", dblock, re.S):
+            g, a = _tag(dep, "groupId"), _tag(dep, "artifactId")
+            if g and a:
+                out.append((g, a, bool(_tag(dep, "version"))))
+    return out
+
+
+def _managed_pairs(text: str) -> set[tuple[str, str]]:
+    """该 pom 的 <dependencyManagement> 已管理的 (groupId, artifactId) 集合。"""
+    pairs: set[tuple[str, str]] = set()
+    dm = re.search(r"<dependencyManagement>(.*?)</dependencyManagement>", text, re.S)
+    if dm:
+        for dep in re.findall(r"<dependency>(.*?)</dependency>", dm.group(1), re.S):
+            g, a = _tag(dep, "groupId"), _tag(dep, "artifactId")
+            if g and a:
+                pairs.add((g, a))
+    return pairs
+
+
+def _reconcile_maven_dep_versions(root: Path, hint: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """把【本工程子模块】(声明 <parent>) 的 g:a:version 补进聚合器 root 的 <dependencyManagement>。
+
+    治本 round18 §3：模块间内部依赖常【缺省 version】(如 ruoyi-admin 依赖 ruoyi-alarm 不写版本)，
+    root dependencyManagement 又未声明其版本 → reactor 解析失败 → compile 失败，且无机制补回。
+    据磁盘 ground-truth 补版本(= 模块自身/继承的项目版本)，使任何版本缺省的内部依赖可解析。
+    保守：仅补进【已存在】的 <dependencyManagement><dependencies> 块，绝不臆造该块(无块交闸门 fail-closed)。
+    确定性、幂等(已管理的 g:a 跳过)、模型无关。
+    """
+    modified: list[str] = []
+    added: dict[str, list[str]] = {}
+    for agg in _maven_aggregators(root):
+        pom = agg / "pom.xml"
+        text = _read(pom)
+        if text is None:
+            continue
+        dm = re.search(
+            r"(<dependencyManagement>\s*<dependencies>)(.*?)(</dependencies>\s*</dependencyManagement>)",
+            text, re.S,
+        )
+        if not dm:
+            continue  # 无 depMgmt 块 → 保守跳过（不臆造结构）
+        managed = {
+            (g, a) for g, a in (
+                (_tag(d, "groupId"), _tag(d, "artifactId"))
+                for d in re.findall(r"<dependency>(.*?)</dependency>", dm.group(2), re.S)
+            ) if g and a
+        }
+        new_entries: list[tuple[str, str, str]] = []
+        for cpom in _all_poms(agg):
+            if cpom == pom:
+                continue
+            ctext = _read(cpom) or ""
+            if "<parent" not in ctext:  # 仅【本工程子模块】(独立工程不碰)
+                continue
+            coords = _maven_pom_coords(ctext)
+            if not coords:
+                continue
+            g, a, v = coords
+            if (g, a) in managed:
+                continue
+            managed.add((g, a))
+            new_entries.append((g, a, v))
+        if not new_entries:
+            continue
+        insert = "".join(
+            f"      <dependency>\n        <groupId>{g}</groupId>\n"
+            f"        <artifactId>{a}</artifactId>\n        <version>{v}</version>\n"
+            f"      </dependency>\n"
+            for g, a, v in new_entries
+        )
+        new_text = text[:dm.start(3)] + insert + text[dm.start(3):]
+        try:
+            pom.write_text(new_text, encoding="utf-8")
+        except OSError:
+            continue
+        rel = _rel(root, pom)
+        modified.append(rel)
+        added[rel] = [f"{g}:{a}:{v}" for g, a, v in new_entries]
+    return modified, added
+
+
+def missing_intra_project_module_versions(project_path: str) -> list[str]:
+    """交付前版本完整性闸门：返回【内部模块依赖但版本无处可得】的清单（非空 → fail-closed）。
+
+    内部模块依赖 = 某模块 pom 的运行时 <dependency> 的 (groupId, artifactId) 命中本工程另一模块坐标。
+    "版本无处可得" = 该 dependency 未写 <version> 且未被任一聚合器 dependencyManagement 覆盖
+    → reactor 解析必失败。仅管辖【内部模块】，外部依赖(版本策略交 BOM/用户)不碰。返回 "模块pom → g:a" 列表。
+    """
+    root = Path(project_path)
+    if not root.is_dir():
+        return []
+    poms = _all_poms(root)
+    internal: set[tuple[str, str]] = set()
+    managed: set[tuple[str, str]] = set()
+    for p in poms:
+        t = _read(p)
+        if t is None:
+            continue
+        c = _maven_pom_coords(t)
+        if c:
+            internal.add((c[0], c[1]))
+        managed |= _managed_pairs(t)
+    missing: list[str] = []
+    for p in poms:
+        t = _read(p)
+        if t is None:
+            continue
+        for g, a, has_v in _maven_direct_deps(t):
+            if (g, a) in internal and not has_v and (g, a) not in managed:
+                missing.append(f"{_rel(root, p)} → {g}:{a}")
+    return missing
 
 
 # ───────────────────────────── Gradle ─────────────────────────────

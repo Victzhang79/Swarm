@@ -176,13 +176,13 @@ def test_rule5_noop_without_dependencies():
 def test_validator_aggregates_conflicts():
     from swarm.brain.plan_validator import validate_plan_structure
 
-    # 5 个无依赖子任务都写 pom.xml
+    # 5 个子任务都写根 pom.xml → D1 backstop：硬失败且聚合成 1 条（不 O(n²) 刷屏）
     sts = [SubTask(id=f"st-{i}", description="d",
                    scope=FileScope(writable=["pom.xml"])) for i in range(1, 6)]
     res = validate_plan_structure(TaskPlan(subtasks=sts))
     pom_msgs = [m for m in res.issues if "pom.xml" in m]
     assert len(pom_msgs) == 1, f"应聚合成 1 条，实际 {len(pom_msgs)}: {pom_msgs}"
-    assert "5 个无依赖子任务" in pom_msgs[0]
+    assert "5 个写者" in pom_msgs[0] and "唯一 aggregator-owner" in pom_msgs[0]
 
 
 # ── 验证器：同一子任务文件双列(writable+create_files) 不报自冲突(st-N 与 st-N) ──

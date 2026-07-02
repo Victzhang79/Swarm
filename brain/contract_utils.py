@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 _MVN_PL_RE = re.compile(r"-pl\s+([^\s,]+)")
 
 
+def _is_root_pom(rel: str) -> bool:
+    """是否为 Maven 根聚合 pom（repo 根的 pom.xml，无目录前缀）。
+
+    D1 治本要害：根 pom 同时承载【加性 <modules> 注册】与【结构性 <dependencyManagement>
+    版本块】。两个子任务各自【整段结构重写】它时，3-way/union 合并无法收口（round18 P0-A：
+    畸形重复闭标签/斩头 dependency，或 rebase 循环→escalate→FAILED）。故根 pom 必须【单写者】。
+    模块 pom（<module>/pom.xml，有目录前缀）各自独立、无争用，不在此列。
+    """
+    return str(rel).replace("\\", "/") == "pom.xml"
+
+
 def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool]) -> bool:
     """文件是否已存在于项目 repo 基线（用于区分"聚合修改"vs"新建撞车"）。
 
@@ -269,6 +280,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
                     new_creates.append(f)
                 else:
                     new_writables.append(f)
+            elif _is_root_pom(f):
+                # D1 治本：根 pom 永远【单写者】(收敛唯一 aggregator-owner)。非首写者【一律 demote】
+                # 为 readable + 依赖 owner——不论是否同链/聚合。两份结构重写(<modules>/
+                # <dependencyManagement>)无法安全合并(round18 P0-A)。demote 不丢登记：根 <modules>
+                # 由 reconcile_workspace_manifests 据磁盘 ground-truth 确定性补齐(L1/L2/交付三处)，
+                # dependencyManagement 版本由 D2 reconcile 兜底。owner 侧由规则4 确保登记全部新模块。
+                demoted.append(f)
+                serialized_ids.add(st.id)  # 获依赖边 → 需清 parallel_groups(不与 owner 同组)
             elif writer is None or _on_same_serial_chain(st.id, writer):
                 # 串行链协作（或无主）：保留写权（create→writable 改首写者产物）。
                 if f not in new_writables:
@@ -297,10 +316,12 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
             scope.readable = readables
             changed = True
             deps = list(getattr(st, "depends_on", []) or [])
-            # 降级者（新建撞车）依赖首写者强制串行，杜绝并发物理冲突。
+            # 降级者（新建撞车 / 根 pom 非 owner）依赖首写者强制串行，杜绝并发物理冲突。
+            # 防环：owner 若已(传递)依赖本子任务，加反向边会成环 → 跳过(不加边，reconcile 兜底登记)。
             for f in demoted:
                 writer = first_writer.get(f)
-                if writer and writer != st.id and writer not in deps:
+                if (writer and writer != st.id and writer not in deps
+                        and not _depends_transitively(writer, st.id)):
                     deps.append(writer)
             # 聚合文件保留写权者：依赖前序写者，串行追加（bootstrap 传播 + MERGE 3-way/rebase 收口）。
             for prev in serialize_after.values():
@@ -317,27 +338,29 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
         plan.parallel_groups = []
         changed = True
 
-    # ── 规则 4：Maven 父 pom 单 owner 注册 backstop（治本"文件被争抢"之 Maven 专项）──
-    # 规则3 只补各模块【自己的】pom；父 `<modules>` 注册是 N 个新模块往同一文件追加。planner
-    # 通常已给一个脚手架子任务 own 根 pom（line76 不可重叠硬约束）；多 owner 情形交规则1 串行网。
-    # 唯一缺口：有新模块但【无人】own 根 pom → 模块永不被注册、`mvn -pl X` reactor not found。
-    # 本规则仅补这个缺口：指派单一 owner 登记全部新模块（additive，不动既有 owner）。
+    # ── 规则 4：Maven 根 pom 单 owner 登记全部新模块（D1 配套：owner 恒登记，非仅 unowned 时）──
+    # 规则3 只补各模块【自己的】pom；根 `<modules>` 注册是 N 个新模块往同一文件追加。规则1 已把
+    # 根 pom 收敛为【唯一 owner】(非首写者 demote)。本规则确保【那个 owner】(或无人 own 时指派一个)
+    # 登记全部新模块——包括被 demote 写者的模块，杜绝注册落空。additive、去重、带防环。
+    # 注：<modules> 最终仍由 reconcile_workspace_manifests 据磁盘 ground-truth 兜底补齐；此处
+    # 令 owner 显式登记是【计划意图】层的收口(worker 一次建全、验收可查)，与 reconcile 双保险。
     new_modules: set[str] = set()
-    pom_owned = False
+    root_pom_owner = None
     for st in subtasks:
         scope = getattr(st, "scope", None)
         if scope is None:
             continue
         creates = list(getattr(scope, "create_files", []) or [])
         writables = list(getattr(scope, "writable", []) or [])
-        if "pom.xml" in creates or "pom.xml" in writables:
-            pom_owned = True
+        if root_pom_owner is None and ("pom.xml" in creates or "pom.xml" in writables):
+            root_pom_owner = st  # 规则1 收敛后唯一 owner（列表序首个）
         for cf in creates:
             if cf.endswith("/pom.xml") and cf.count("/") == 1:
                 new_modules.add(cf.split("/", 1)[0])
-    # 仅当：有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）+ 当前无人 own 根 pom。
-    if new_modules and not pom_owned and _exists_in_repo(project_path, "pom.xml", _exist_cache):
-        owner = next(
+    # 有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）。
+    if new_modules and _exists_in_repo(project_path, "pom.xml", _exist_cache):
+        # owner = 已收敛的根 pom owner；无人 own 时 backstop 指派首个建模块 pom 的子任务。
+        owner = root_pom_owner or next(
             (
                 st for st in subtasks
                 if any(
@@ -349,7 +372,8 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
         )
         if owner is not None and getattr(owner, "scope", None) is not None:
             w = list(getattr(owner.scope, "writable", []) or [])
-            if "pom.xml" not in w:
+            _owner_creates = list(getattr(owner.scope, "create_files", []) or [])
+            if "pom.xml" not in w and "pom.xml" not in _owner_creates:
                 w.append("pom.xml")
                 owner.scope.writable = w
                 changed = True
@@ -802,6 +826,140 @@ def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
                 "无需再逐个 cat 探索）：\n\n" + "\n\n".join(parts)
             )
             changed = True
+    return changed
+
+
+# ── D4(b) 外部库 API 知识注入 ─────────────────────────────────────────────
+# 治本 round18 st-16：本地小模型对第三方库类名/方法名产生幻觉+退化死循环(把 okhttp3.OkHttpClient
+# 写成 OkHttp、方法名退化 executeecute)烧光 900s。通用治法(非硬编 okhttp=B 类 hack)：小型可扩展
+# 知识表(key=依赖 artifact 片段 / import 前缀，value=正确类名+关键方法签名)，按 plan 声明的依赖命中,
+# 把正确签名片段确定性注入【写源码且所在模块声明了该库】的子任务 context_snippets。表按需扩条即可,
+# 不绑定具体项目/模块名，跨栈可加(Go/TS 等)。
+_API_KNOWLEDGE: list[dict[str, Any]] = [
+    {
+        # OkHttp 3/4：小模型高频把客户端类 OkHttpClient 写成 OkHttp、方法名退化。
+        "artifacts": ["com.squareup.okhttp3:okhttp", "com.squareup.okhttp", "okhttp3"],
+        "title": "OkHttp (okhttp3) 正确 API",
+        "snippet": (
+            "import okhttp3.OkHttpClient;   // 客户端类名是 OkHttpClient（不是 OkHttp）\n"
+            "import okhttp3.Request;\n"
+            "import okhttp3.RequestBody;\n"
+            "import okhttp3.MediaType;\n"
+            "import okhttp3.Response;\n"
+            "\n"
+            "OkHttpClient client = new OkHttpClient();\n"
+            "MediaType JSON = MediaType.parse(\"application/json; charset=utf-8\");\n"
+            "RequestBody body = RequestBody.create(jsonString, JSON);   // okhttp 4.x\n"
+            "// okhttp 3.x 参数顺序相反: RequestBody.create(JSON, jsonString)\n"
+            "Request request = new Request.Builder().url(url).post(body).build();\n"
+            "try (Response response = client.newCall(request).execute()) {\n"
+            "    int code = response.code();\n"
+            "    String respBody = response.body() != null ? response.body().string() : \"\";\n"
+            "}\n"
+            "\n"
+            "// 若对第三方 HTTP 客户端 API 不确定，可改用 JDK 自带 java.net.http.HttpClient（无需额外依赖）:\n"
+            "//   HttpClient c = HttpClient.newHttpClient();\n"
+            "//   HttpRequest r = HttpRequest.newBuilder(URI.create(url))\n"
+            "//       .header(\"Content-Type\", \"application/json\")\n"
+            "//       .POST(HttpRequest.BodyPublishers.ofString(jsonString)).build();\n"
+            "//   HttpResponse<String> resp = c.send(r, HttpResponse.BodyHandlers.ofString());\n"
+        ),
+    },
+]
+
+_SOURCE_EXTS = frozenset({
+    "java", "kt", "kts", "scala", "groovy", "go", "py", "ts", "tsx", "js", "jsx",
+    "vue", "rs", "cs", "rb", "php", "swift", "cpp", "cc", "c", "h", "hpp",
+})
+
+
+def _is_source_file(rel: str) -> bool:
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    return ext in _SOURCE_EXTS
+
+
+def _module_of(rel: str) -> str:
+    """文件所属【物理模块顶层目录】(RuoYi: ruoyi-alarm/…/X.java → ruoyi-alarm)。"""
+    return rel.replace("\\", "/").split("/", 1)[0]
+
+
+def _artifact_hits(patterns: list[str], declared: set[str]) -> bool:
+    """知识表 entry 的任一 artifact 片段是否命中任一声明依赖(大小写不敏感子串)。"""
+    low = [d.lower() for d in declared]
+    return any(any(p.lower() in d for d in low) for p in patterns)
+
+
+def inject_api_knowledge(plan: TaskPlan) -> bool:
+    """按 plan 声明的依赖命中知识表，把正确外部库 API 签名注入相关子任务 context_snippets。
+
+    命中规则(确定性/幂等/零 LLM)：
+      - 子任务须【写源码文件】(纯 pom/注册子任务跳过——它们不调库 API)。
+      - 子任务所在物理模块声明了该库(shared_contract.dependencies)；契约常以【逻辑模块名】声明,
+        故当全 plan 仅一个物理模块时用其依赖并集 fallback(A5 同风格,杜绝逻辑↔物理错配落空)。
+    additive 叠加在已有 context_snippets 之后；重复注入按标题幂等(replan 安全)。返回是否注入。
+    """
+    shared = getattr(plan, "shared_contract", None) or {}
+    deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
+    if not isinstance(deps_spec, list) or not deps_spec:
+        return False
+
+    mod_arts: dict[str, set[str]] = {}
+    for entry in deps_spec:
+        if not isinstance(entry, dict):
+            continue
+        mod = (entry.get("module") or "").strip().rstrip("/")
+        for a in (entry.get("artifacts") or []):
+            if a:
+                mod_arts.setdefault(mod, set()).add(str(a))
+    if not mod_arts:
+        return False
+    all_arts: set[str] = set().union(*mod_arts.values())
+
+    subtasks = getattr(plan, "subtasks", []) or []
+    phys_modules = {
+        _module_of(f)
+        for st in subtasks
+        for f in (list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+                  + list(getattr(getattr(st, "scope", None), "writable", []) or []))
+        if f
+    }
+    sole_phys = len(phys_modules) == 1
+
+    changed = False
+    for st in subtasks:
+        scope = getattr(st, "scope", None)
+        if scope is None:
+            continue
+        srcs = [f for f in (list(getattr(scope, "create_files", []) or [])
+                            + list(getattr(scope, "writable", []) or []))
+                if _is_source_file(f)]
+        if not srcs:
+            continue  # 纯 pom/注册子任务 → 不注入库 API 片段
+        st_mod = _module_of(srcs[0])
+        arts = set(mod_arts.get(st_mod, set()))
+        if sole_phys:
+            arts |= all_arts   # 单物理模块：逻辑模块声明的依赖都落在它 → 用并集
+        if not arts:
+            continue
+
+        existing = getattr(st, "context_snippets", "") or ""
+        new_blocks: list[str] = []
+        for entry in _API_KNOWLEDGE:
+            if not _artifact_hits(entry["artifacts"], arts):
+                continue
+            header = f"### 外部库正确 API（照此签名调用，勿凭记忆臆造类名/方法）— {entry['title']}"
+            if header in existing:
+                continue  # 幂等：已注入过
+            new_blocks.append(f"{header}\n```\n{entry['snippet']}\n```")
+        if not new_blocks:
+            continue
+        st.context_snippets = (
+            existing + ("\n\n" if existing else "")
+            + "以下外部依赖库的 API 已为你校准（本地小模型对第三方库类名/方法名易产生幻觉，"
+              "请严格照此，不确定时优先用 JDK 自带等价物）：\n\n"
+            + "\n\n".join(new_blocks)
+        )
+        changed = True
     return changed
 
 

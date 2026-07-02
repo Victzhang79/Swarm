@@ -3492,7 +3492,7 @@ async def learn_success(state: BrainState) -> dict:
             proj_path = _get_project_path(state.get("project_id") or "")
             if proj_path:
                 from swarm.project.diff_apply import (
-                    apply_git_diff,
+                    apply_git_diff_resilient,
                     commit_task_output,
                     files_from_unified_diff,
                 )
@@ -3505,11 +3505,17 @@ async def learn_success(state: BrainState) -> dict:
                 missing = [f for f in out_files
                            if not _os2.path.isfile(_os2.path.join(proj_path, f))]
                 if missing:
+                    # D5(b) 治本 round18 P0-C：改用【分文件鲁棒 apply】——一个坏 hunk 令整块 git apply
+                    # 原子失败会连坐回滚全部好文件(~30 个正确 producer 一个没落盘)。resilient 分文件独立
+                    # 落盘，好段照常写入、坏段单独剔除，交付不再被单点坏块清零。
                     _ap = await _asyncio.to_thread(
-                        lambda: apply_git_diff(proj_path, merged_diff, check_only=False))
+                        lambda: apply_git_diff_resilient(proj_path, merged_diff))
                     if not _ap.get("ok"):
-                        logger.warning("[LEARN_SUCCESS] commit 前重新 apply(补缺失文件)失败(非致命): %s",
-                                       _ap.get("stderr", "")[:160])
+                        logger.warning("[LEARN_SUCCESS] commit 前重新 apply(补缺失文件)全失败(非致命): %s",
+                                       _ap.get("failed") or _ap.get("stderr", ""))
+                    elif _ap.get("failed"):
+                        logger.warning("[LEARN_SUCCESS] 分文件落盘：好文件已保留 %d，剔除坏段 %d(交 owner 重修)",
+                                       len(_ap.get("applied") or []), len(_ap.get("failed") or []))
                 # 通用治本(交付持久化收口)：所有产出文件已落工作区(ground truth)。对账聚合清单
                 # (Maven/Gradle/Cargo/.NET/Go)使其枚举真实存在的成员，并把被修正的清单【纳入本次
                 # commit 文件集】——否则并行子任务 pull-back 整文件覆盖把成员注册冲掉的残留会进入

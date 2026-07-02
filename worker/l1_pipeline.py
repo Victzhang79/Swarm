@@ -1927,8 +1927,9 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     modules = _maven_modules(project_path)
     if not modules:
         return command
+    registered = set(modules.values())
     # TD2606-C6：按【最长模块路径前缀】匹配改动文件 → 命中最深叶子模块（而非首段聚合器）。
-    paths = sorted(modules.values(), key=len, reverse=True)
+    paths = sorted(registered, key=len, reverse=True)
     hit: list[str] = []
     for f in modified:
         fp = str(f).strip().lstrip("/")
@@ -1937,11 +1938,43 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
                 if mp not in hit:
                     hit.append(mp)
                 break  # 命中最深模块即止（paths 已按长度降序）
-    if not hit:
-        return command
-    pl = ",".join(hit)
-    # 插到 mvn 之后：mvn <args> → mvn -pl <pl> -am <args>
-    return command.replace("mvn", f"mvn -pl {pl} -am", 1)
+    # D3 治本(Fix E)：改动落在【有自己 pom.xml 但未注册进 reactor】的孤儿模块 → 整仓 fallback
+    # 会静默跳过其 .java 编译 → L1/L2 双双假 PASS。显式并进 -pl，让 mvn 报 "not found in reactor"
+    # (fail-closed 暴露未注册)，而非静默放行。真·根级文件(无所属模块 pom)不受影响。
+    orphans: list[str] = []
+    for f in modified:
+        d = _owning_module_dir(project_path, str(f))
+        if d and d not in registered and d not in orphans:
+            orphans.append(d)
+    targets = hit + [o for o in orphans if o not in hit]
+    if not targets:
+        return command  # 无模块归属(根级文件) → 整仓 fallback 正确
+    pl = ",".join(targets)
+    # D5(a) 治本(修 f4c1a40 引入的 drag-down)：validate 是【模块级弱校验】——只校本模块 pom 结构 +
+    # parent 链，不需上游模块的编译产物。若加 -am 会连带构建上游 reactor，纯 pom 子任务就会因【无关
+    # sibling 的缺陷】被判 hard-FAIL(违背 P0-B"不连坐 sibling")。故 validate（及 clean/help 等不产
+    # 物、不依赖上游产物的目标）【不加 -am】；compile/test/package 等真需上游产物的目标保留 -am。
+    needs_upstream = bool(
+        re.search(r"\b(compile|test-compile|test|package|verify|install|deploy)\b", command)
+    )
+    am = " -am" if needs_upstream else ""
+    # 插到 mvn 之后：mvn <args> → mvn -pl <pl> [-am] <args>
+    return command.replace("mvn", f"mvn -pl {pl}{am}", 1)
+
+
+def _owning_module_dir(project_path: str, rel: str) -> str:
+    """改动文件 rel 的【最近所属模块目录】(含 pom.xml 的最近祖先目录，相对 project)。
+
+    从最深父目录向上找首个含 pom.xml 的目录；无(根级文件)→返回 ""。用于 D3 判断改动是否落在
+    某个模块内(据此判断该模块是否已注册进 reactor)。
+    """
+    from pathlib import Path as _P
+    parts = str(rel).strip("/").split("/")
+    for i in range(len(parts) - 1, 0, -1):
+        d = "/".join(parts[:i])
+        if (_P(project_path) / d / "pom.xml").is_file():
+            return d
+    return ""
 
 
 # ── P0-B/根因#3：构建错误归属判定（文件级——本子任务改动文件 vs 别人的文件）──

@@ -43,25 +43,25 @@ def _st(sid, *, writable=None, create=None, readable=None, depends=None):
     )
 
 
-# ── 1. 已存在父 pom，3 个独立子任务都写 → 全部保留写权 + 串行成链，不静默丢 ──
-def test_existing_parent_pom_serialized_not_dropped(tmp_path):
+# ── 1. 根 pom：3 个子任务都写 → D1 收敛唯一 owner，非首写者 demote（治 P0-A 双写者根因）──
+def test_root_pom_converges_to_single_owner(tmp_path):
     proj = _repo(tmp_path, {"pom.xml": "<modules></modules>\n",
                             "mod1/x": "", "mod2/x": "", "mod3/x": ""})
     sts = [_st(f"st-{i}", writable=["pom.xml"], create=[f"mod{i}/src/A.java"]) for i in (1, 2, 3)]
     plan = TaskPlan(subtasks=sts, parallel_groups=[["st-1", "st-2", "st-3"]])
     normalize_plan_scopes(plan, project_path=proj)
 
-    for st in plan.subtasks:
-        assert "pom.xml" in (st.scope.writable or []), f"{st.id} 丢失 pom 写权: {st.scope}"
-        assert "pom.xml" not in (st.scope.readable or []), f"{st.id} 不应被降级 readable"
-    # 非首写者被串行化（有依赖）
-    assert plan.subtasks[1].depends_on, "st-2 应串行化(依赖前序写者)"
-    assert plan.subtasks[2].depends_on, "st-3 应串行化(依赖前序写者)"
+    # 根 pom 收敛唯一 owner（拓扑首写者 st-1）；两份结构重写无法安全合并 → 单写者是唯一正解。
+    writers = [st.id for st in plan.subtasks if "pom.xml" in (st.scope.writable or [])]
+    assert writers == ["st-1"], f"根 pom 应收敛唯一 owner，实得 {writers}"
+    for sid in ("st-2", "st-3"):
+        st = next(s for s in plan.subtasks if s.id == sid)
+        assert "pom.xml" in (st.scope.readable or []), f"{sid} 应 demote 为 readable"
+        assert "st-1" in (st.depends_on or []), f"{sid} 应依赖 owner st-1"
     # parallel_groups 被清空（避免 validator parallel-group 同写硬 fail）
-    assert plan.parallel_groups == [], "串行化后 vestigial 的 parallel_groups 应清空"
-    # validator 通过（聚合同写串行后是依赖序 → warn 非 fail）
+    assert plan.parallel_groups == [], "收敛后 vestigial 的 parallel_groups 应清空"
     res = validate_plan_structure(plan)
-    assert res.valid, f"串行化后应通过校验, issues={res.issues}"
+    assert res.valid, f"收敛唯一 owner 后应通过校验, issues={res.issues}"
 
 
 # ── 2. 已存在路由/注册 index（非 pom 的聚合文件）多独立写者 → 串行不降级 ──
@@ -104,8 +104,8 @@ def test_existing_file_in_create_reclassified_modify(tmp_path):
     assert plan.subtasks[1].depends_on
 
 
-# ── 5. 防环：写者间已有反向依赖时不产生环 ──
-def test_serialize_cycle_guard(tmp_path):
+# ── 5. 防环：根 pom 写者间已有反向依赖时 demote 不产生环 ──
+def test_root_pom_demote_cycle_guard(tmp_path):
     proj = _repo(tmp_path, {"pom.xml": "<modules></modules>\n", "a": "", "b": ""})
     # st-1 已依赖 st-2（与写者序相反），两者都写已存在 pom
     sts = [_st("st-1", writable=["pom.xml"], depends=["st-2"]),
@@ -114,9 +114,9 @@ def test_serialize_cycle_guard(tmp_path):
     normalize_plan_scopes(plan, project_path=proj)
     res = validate_plan_structure(plan)
     assert "循环依赖" not in " ".join(res.issues), f"不应成环: {res.issues}"
-    # 仍保留各自写权（串行链协作）
-    assert "pom.xml" in plan.subtasks[0].scope.writable
-    assert "pom.xml" in plan.subtasks[1].scope.writable
+    # 收敛唯一 owner：st-1(首写者)保留写权，st-2 demote；防环下不给 st-2 加 st-1 依赖(会成环)
+    writers = [s.id for s in plan.subtasks if "pom.xml" in (s.scope.writable or [])]
+    assert writers == ["st-1"], f"应收敛唯一 owner，实得 {writers}"
 
 
 # ── 6. project_path=None → 退化为今日 demote 行为（向后兼容）──
@@ -161,34 +161,21 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", "-p", "no:warnings"]))
 
 
-def test_run9_writers_chained_to_first_but_mutually_parallel(tmp_path):
-    """RUN9 根 class(task 225b1c7e)：多写者各自【传递依赖到首写者】却【彼此并行】。
-
-    旧逻辑 normalize 只查"与首写者同链"→ 判这些写者"同链"保留写权，但漏了它们【彼此之间】
-    无依赖序 → plan_validator 判"N 个无依赖子任务同时写"硬失败 → auto_accept fail-fast（实证
-    RUN9：5 个子任务都写根 pom.xml）。串行流水化守卫须把全部写者串成【单一总序链】→ 校验通过。
-    无 project_path（复现 VALIDATE 路径 nodes/__init__.py:719），不依赖仓库感知。
-    """
+def test_run9_root_pom_writers_converge_single_owner(tmp_path):
+    """RUN9 根 class(task 225b1c7e)：多写者都写根 pom.xml。旧串行流水化把它们串成总序链
+    （多写者并存 → 后被 round18 证明两份结构重写无法安全合并=P0-A）。D1 治本：根 pom 收敛
+    【唯一 owner】(st-0)，其余写者 demote → 根本没有多写者可撞。无 project_path（复现 VALIDATE
+    路径 nodes/__init__.py:719），不依赖仓库感知。"""
     sts = [
-        _st("st-0", writable=["pom.xml"], create=["base/Base.java"]),                  # 首写者
+        _st("st-0", writable=["pom.xml"], create=["base/Base.java"]),                  # 首写者=owner
         _st("st-a1", create=["modA/A.java"], depends=["st-0"]),
-        _st("st-a2", writable=["pom.xml"], create=["modA/B.java"], depends=["st-a1"]),  # 链→st-0
+        _st("st-a2", writable=["pom.xml"], create=["modA/B.java"], depends=["st-a1"]),  # demote
         _st("st-b1", create=["modB/C.java"], depends=["st-0"]),
-        _st("st-b2", writable=["pom.xml"], create=["modB/D.java"], depends=["st-b1"]),  # 链→st-0，与 a2 并行
+        _st("st-b2", writable=["pom.xml"], create=["modB/D.java"], depends=["st-b1"]),  # demote
     ]
     plan = TaskPlan(subtasks=sts)
     normalize_plan_scopes(plan)  # 无 project_path
+    writers = [s.id for s in plan.subtasks if "pom.xml" in (s.scope.writable or [])]
+    assert writers == ["st-0"], f"根 pom 应收敛唯一 owner，实得 {writers}"
     res = validate_plan_structure(plan)
-    assert res.valid, f"串行流水化后校验应通过(全部 pom 写者串成总序、无独立并行): {res.issues}"
-    # 反向断言：a2 与 b2 必有依赖序（不再并行）
-    def _d(sid):
-        s = next(s for s in plan.subtasks if s.id == sid)
-        seen, stack = set(), list(s.depends_on or [])
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            stack.extend(next((t.depends_on for t in plan.subtasks if t.id == x), []) or [])
-        return seen
-    assert "st-a2" in _d("st-b2") or "st-b2" in _d("st-a2"), "a2/b2 必须串行（其一传递依赖另一）"
+    assert res.valid, f"收敛后校验应通过(单 owner 无并发写): {res.issues}"

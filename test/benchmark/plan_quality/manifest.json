@@ -16,10 +16,10 @@
       "file": "run19_scaffold_trivial.json",
       "run": "RUN19",
       "subtasks": 13,
-      "bug": "根脚手架 st-1(建模块 pom + 编辑庞大根 pom 注册)被 LLM 误判 difficulty=trivial → worker 走单发快速路径(封顶 30 步)单次塞不下读改大根 pom → 40B 吐 'Sorry, need more steps' 拒答 → 根脚手架失败 → 全依赖链卡死(3/13 被看守取消)。规划本身结构合法,故 before_valid=true。",
-      "fix": "bump_scaffold_difficulty 把脚手架/根 pom 写者 trivial→MEDIUM,走结构化多步路径。",
+      "bug": "根脚手架 st-1(建模块 pom + 编辑庞大根 pom 注册)被 LLM 误判 difficulty=trivial → worker 走单发快速路径(封顶 30 步)单次塞不下读改大根 pom → 40B 吐 'Sorry, need more steps' 拒答 → 根脚手架失败 → 全依赖链卡死(3/13 被看守取消)。此外原始 plan 有 3 个根 pom 写者(st-1/st-7/st-10)——D1 后属结构不合法(双写者=P0-A 根因),故 before_valid=false;resolve_plan_conflicts 收敛唯一 owner 后 after_valid=true。",
+      "fix": "bump_scaffold_difficulty 把脚手架/根 pom 写者 trivial→MEDIUM 走结构化多步路径;D1 normalize_plan_scopes 收敛根 pom 唯一 aggregator-owner。",
       "aggregate_files": ["pom.xml"],
-      "expect_before_valid": true,
+      "expect_before_valid": false,
       "expect_after_valid": true,
       "invariants": ["no_trivial_scaffold", "no_parallel_file_writers"]
     }

@@ -170,6 +170,20 @@ def run_integration_review(
                 logger.info("[integration_review] 集成构建前对账聚合清单成员: %s", _wm.get("added"))
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[integration_review] 聚合清单对账跳过(异常,不致命): %s", _exc)
+        # D2 版本完整性闸门：reconcile 后仍有【内部模块依赖版本无处可得】者 → reactor 解析必失败。
+        # 交付前确定性判死(fail-closed)，别等 900s 编译超时才现形。仅 Maven 内部模块，不碰外部依赖。
+        try:
+            from swarm.worker.workspace_manifest import missing_intra_project_module_versions
+            _missing_ver = missing_intra_project_module_versions(project_path)
+            if _missing_ver:
+                details["missing_intra_module_versions"] = _missing_ver
+                issues.append(
+                    "L2 pom 版本完整性: 内部模块依赖缺版本且无 dependencyManagement 兜底(reactor 解析必失败): "
+                    + "; ".join(_missing_ver[:8])
+                )
+                logger.warning("[integration_review] D2 版本闸门报缺: %s", _missing_ver[:8])
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("[integration_review] D2 版本闸门跳过(异常,不致命): %s", _exc)
         try:
             ok, out = _run_cmd(project_path, build_cmd, timeout=timeout)
             details["compile_ok"] = ok
