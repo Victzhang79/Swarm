@@ -290,9 +290,15 @@ def commit_task_output(
         )
         if chk.returncode != 0:
             return {"ok": True, "committed": False, "reason": "非 git 仓库"}
+        # 治本(D5b 配套)：只 add【磁盘真实存在】的文件——resilient apply 剔掉的坏段文件仍缺，
+        # 若混进 `git add` 会 pathspec 不匹配令【整批 add 失败 → 一个都不 commit】(好文件白落盘、
+        # 被后续 reset 冲掉，恰好没落地 D5b 想救的场景)。过滤后落盘啥就 commit 啥。
+        existing = [f for f in files if os.path.exists(os.path.join(project_path, f))]
+        if not existing:
+            return {"ok": True, "committed": False, "reason": "无落盘文件可提交"}
         # 只 add 本任务产出的文件（精准，不裹挟工作区其他改动）
         add = subprocess.run(
-            ["git", "-C", project_path, "add", "--", *files],
+            ["git", "-C", project_path, "add", "--", *existing],
             capture_output=True, text=True, timeout=30,
         )
         if add.returncode != 0:

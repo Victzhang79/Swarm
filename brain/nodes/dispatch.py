@@ -153,7 +153,7 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
         from swarm.brain.planning_nodes import (
             _oversized_by_files,
             _rebuild_plan,
-            _remap_dependents,
+            _remap_dependents_to_terminals,
             _split_oversized_by_files,
         )
     except Exception as exc:  # noqa: BLE001
@@ -184,7 +184,7 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
         if idx is None:
             continue
         new_subtasks[idx:idx + 1] = children
-        _remap_dependents(new_subtasks, st.id, children[-1].id)
+        _remap_dependents_to_terminals(new_subtasks, st.id, children)
         if st.id in remaining:
             remaining.remove(st.id)
         for c in children:

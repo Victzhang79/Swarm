@@ -144,6 +144,28 @@ def test_resilient_all_bad_reports_not_ok(tmp_path):
     assert res["applied"] == []
 
 
+# ── P1（D5b 配套）：commit 只 add 磁盘真实存在的文件，缺失文件不连坐令整批 commit 失败 ──
+def test_commit_skips_missing_files_and_commits_existing(tmp_path):
+    from swarm.project.diff_apply import commit_task_output
+    proj = _git_init(tmp_path)
+    (tmp_path / "good").mkdir()
+    (tmp_path / "good/A.java").write_text("class A {}")
+    (tmp_path / "good/B.java").write_text("class B {}")
+    # C.java 是 resilient apply 剔掉的坏段文件 → 不在磁盘
+    res = commit_task_output(proj, ["good/A.java", "good/B.java", "missing/C.java"], task_id="t1")
+    assert res["ok"] and res["committed"], f"缺失文件不应连坐令整批 commit 失败，实得 {res}"
+    tracked = subprocess.run(["git", "-C", proj, "ls-files"], capture_output=True, text=True).stdout
+    assert "good/A.java" in tracked and "good/B.java" in tracked, "好文件应已提交"
+    assert "missing/C.java" not in tracked
+
+
+def test_commit_all_missing_no_commit(tmp_path):
+    from swarm.project.diff_apply import commit_task_output
+    proj = _git_init(tmp_path)
+    res = commit_task_output(proj, ["missing/X.java"], task_id="t2")
+    assert res["ok"] and not res["committed"], "全缺失 → 不 commit 但不报错"
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path

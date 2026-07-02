@@ -1945,9 +1945,9 @@ async def elaborate(state: BrainState) -> dict:
                     # （如 st-2 depends_on st-1，st-1 被拆成 st-1-1/st-1-2 后 st-1 已不存在）。
                     # 必须把所有指向旧 id 的下游依赖重映射到子链尾节点（children[-1]），
                     # 否则 VALIDATE_PLAN 结构校验必报"依赖未知任务"，陷入规划死循环。
-                    # 选尾节点：子链内部已串行（见 _resplit_subtask），尾节点完成 ⇒ 全链完成，
-                    # 语义最简且不破坏依赖驱动调度的并行度判定。
-                    remapped = _remap_dependents(new_subtasks, st.id, children[-1].id)
+                    # 映射到【终端节点集】：串行链=尾节点；平行 fan-out=全部终端 leaf/协调者
+                    # （下游依赖父=依赖整批完成，取 children[-1] 会让平行拆下的下游提前 ready）。
+                    remapped = _remap_dependents_to_terminals(new_subtasks, st.id, children)
                     if remapped:
                         logger.info(
                             "[ELABORATE] 重映射 %d 条下游依赖: %s → %s（避免悬空依赖）",
@@ -2342,28 +2342,36 @@ def _detect_parallel_impls(core: list[str]) -> tuple[list[str], list[str], list[
     return leaves, upstream, downstream
 
 
-def _split_parallel_impl_core(core: list[str]) -> list[list[str]] | None:
+def _split_parallel_impl_core(core: list[str]) -> tuple[list[list[str]], int, int] | None:
     """把平行独立实现家族拆成【每个实现一批】。拆不出返回 None。
 
-    批序(串行链 + 前向累积 readable 天然保证编译序正确)：
-      共享抽象(upstream,先建) → 各 leaf 批(按词干稳定排序,彼此独立) → 协调者(downstream,后建,读全 leaf)。
-    leaf 内按实体词干归组(一个实现可含多文件，如 SlackNotifyService+SlackConfig 同词干同批)。
+    返回 (batches, n_upstream, n_downstream)：
+      批序 = 共享抽象(upstream,前 n_upstream 批,先建) → 各 leaf 批(彼此独立,fan-out 依赖上游) →
+             协调者(downstream,后 n_downstream 批,fan-in 依赖全 leaf,读全 leaf)。
+    调用方据 n_upstream/n_downstream 做 fan-out/fan-in 依赖布线（leaf 彼此不串行→一个卡住不连坐兄弟，
+    治本 round15 head-of-line）。leaf 内按实体词干归组(一实现可含多文件，同词干同批)。
     """
     detected = _detect_parallel_impls(core)
     if detected is None:
         return None
     leaves, upstream, downstream = detected
     batches: list[list[str]] = []
+    n_up = 0
     if upstream:
         batches.append(sorted(upstream, key=_layer_rank))     # 共享抽象/类型 → 首批(上游)
+        n_up = 1
     stem_groups: dict[str, list[str]] = {}
     for f in sorted(leaves, key=_layer_rank):
         stem_groups.setdefault(_entity_stem(f), []).append(f)
     for stem in sorted(stem_groups):
         batches.append(stem_groups[stem])                     # 各平行实现 → 独立一批
+    n_down = 0
     if downstream:
         batches.append(sorted(downstream, key=_layer_rank))   # 协调者 → 末批(下游,读全 leaf)
-    return batches if len(batches) >= 2 else None
+        n_down = 1
+    if len(batches) < 2:
+        return None
+    return batches, n_up, n_down
 
 
 def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> list:
@@ -2410,6 +2418,8 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     anchors = sorted({_entity_stem(f) for f in core
                       if _basename(f).rsplit(".", 1)[0].endswith("Controller")}, key=len, reverse=True)
     core_batches: list[list[str]] = []
+    parallel_core = False          # 平行独立实现拆分？(决定 fan-out/fan-in 而非串行链)
+    _p_up = _p_down = 0            # 平行拆分的上游/下游批数(共享抽象/协调者)
     if len(anchors) >= 2:
         feat: dict[str, list[str]] = {a: [] for a in anchors}
         for f in sorted(core, key=_layer_rank):
@@ -2420,9 +2430,10 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
         # D4(a) 治本 round18 st-16：先判【同层平行独立实现家族】(N 个渠道/handler/strategy 兄弟,
         # 无 Controller 锚点、彼此无依赖)→ 一实现一子任务(共享接口成前置上游批)。这在单实体分层之前,
         # 因这类兄弟各是【不同实体】(不同渠道),不该被当单实体整批。检测不中(None)才落回单实体逻辑。
-        parallel_batches = _split_parallel_impl_core(core)
-        if parallel_batches is not None:
-            core_batches = parallel_batches
+        parallel_meta = _split_parallel_impl_core(core)
+        if parallel_meta is not None:
+            core_batches, _p_up, _p_down = parallel_meta
+            parallel_core = True
         # round10 #3 治本：单实体 core 超文件数上界 → 按层拆(数据→逻辑,契约锚定不漂移)消除 900s
         # 超时；正常实体(≤上界)仍整批守 RUN14。
         elif len(core) > MAX_SINGLE_ENTITY_FILES:
@@ -2450,21 +2461,44 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     # 自洽描述：父描述全文 + 明确"本批负责哪些文件、其余批由兄弟完成、接口以共享契约为准"。
     base_desc = (getattr(st, "description", "") or "").strip()[:2000]
     n = len(norm_batches)
+    core_n = len(core_batches)
+
+    # ── 依赖布线：默认【串行链】(本批依赖上一批)——实体/分层拆的下游确需上游产物。
+    # 平行独立实现拆分(parallel_core)则改【fan-out/fan-in】：leaf 批各依赖【上游共享抽象批】、彼此
+    # 不串行（一个渠道卡住不再连坐放弃兄弟渠道，治本 round15 head-of-line）；协调者批 fan-in 依赖全 leaf。
+    # batch_dep[i] = 本批依赖的【批下标列表】(空=仅依赖父任务原 depends_on)。
+    _L = core_n - _p_up - _p_down          # leaf 批数
+    batch_dep: list[list[int]] = []
+    for i in range(n):
+        if parallel_core and i < core_n:
+            if i < _p_up:                                  # 上游共享抽象批：其间串行(通常仅 1 批)
+                batch_dep.append([i - 1] if i > 0 else [])
+            elif i < _p_up + _L:                           # leaf：fan-out 依赖最后一个上游批(或父)
+                batch_dep.append([_p_up - 1] if _p_up > 0 else [])
+            else:                                          # 协调者：fan-in 依赖全部 leaf
+                batch_dep.append(list(range(_p_up, _p_up + _L)))
+        else:
+            batch_dep.append([i - 1] if i > 0 else [])     # 串行(实体/分层/web/sql)
+
+    # 平行 leaf 批的 readable 只给【上游共享抽象产物】(不给并行兄弟——兄弟并发未落盘、且本就无引用)；
+    # 其余(串行批/协调者批)用【前向累积】上游产物(协调者末批据此读全 leaf)。
+    _shared_up_creates: list[str] = [p for b in all_batches[:_p_up] for p in b] if parallel_core else []
+
     children = []
-    _upstream_creates: list[str] = []   # 已拆出上游批的 create_files 累积(批序串行)
+    _upstream_creates: list[str] = []   # 已拆出上游批的 create_files 累积(供串行/协调者批 readable)
     for i, grp in enumerate(norm_batches):
         child_scope = scope.model_copy(deep=True)
         child_scope.create_files = [p for p, k in grp if k == "create"]
         child_scope.writable = [p for p, k in grp if k == "write"]
         # ── A1 治本(round11)：下游批常 import 上游批产出的类型(数据层 domain/DTO/mapper →
-        # 逻辑层 service/impl/controller)。但层拆只设了 depends_on 串行链、没把上游产物列入本批
-        # readable → ① _decouple_independent_subtasks 见"零文件重叠"误剥这条真依赖；② worker
-        # bootstrap 据 readable(local≠HEAD)注入上游产物，缺它则本批沙箱看不到兄弟 domain →
-        # `package …domain does not exist` / internal_pkg_not_built 空转(round11 st-14/st-7 全栽)。
-        # 把上游批 create_files 并入本批 readable，一处同治【不误剥】+【兄弟产物注入】。
-        if _upstream_creates:
+        # 逻辑层 service/impl/controller)。把上游 create_files 并入本批 readable，一处同治
+        # ① _decouple_independent_subtasks 不误剥真依赖 ② worker bootstrap 注入兄弟产物(杜绝
+        # `package …domain does not exist` 空转)。平行 leaf 只读共享抽象、协调者/串行读累积。
+        _is_parallel_leaf = parallel_core and _p_up <= i < _p_up + _L
+        _up_for_readable = _shared_up_creates if _is_parallel_leaf else _upstream_creates
+        if _up_for_readable:
             _existing_r = list(getattr(child_scope, "readable", []) or [])
-            child_scope.readable = list(dict.fromkeys(_existing_r + _upstream_creates))
+            child_scope.readable = list(dict.fromkeys(_existing_r + _up_for_readable))
         files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
         child_desc = (
             f"{base_desc}\n\n【按文件分批 · 第 {i + 1}/{n} 批】本子任务是上述父任务按文件分层"
@@ -2478,9 +2512,9 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
             difficulty=getattr(st, "difficulty", None) or SubTaskDifficulty.MEDIUM,
             modality=getattr(st, "modality", None) or SubTaskModality.TEXT,
             scope=child_scope,
-            depends_on=list(getattr(st, "depends_on", []) or []) + (
-                [f"{st.id}-{i}"] if i > 0 else []  # 串行：本批依赖上一批
-            ),
+            depends_on=list(getattr(st, "depends_on", []) or []) + [
+                f"{st.id}-{j + 1}" for j in batch_dep[i]  # fan-out/fan-in 或串行(见 batch_dep)
+            ],
             acceptance_criteria=[
                 f"本子任务 scope 内 {len(grp)} 个文件全部创建/修改完成，且模块可编译通过（mvn compile）",
             ],
@@ -2525,6 +2559,51 @@ def _remap_dependents(subtasks: list, old_id: str, new_id: str) -> int:
             if target not in seen:
                 seen.add(target)
                 rewritten.append(target)
+        st.depends_on = rewritten
+        remapped += 1
+    return remapped
+
+
+def _terminal_child_ids(children: list) -> list[str]:
+    """子拆分的【终端节点 id 集】——没有任何【同批子节点】依赖它们（下游重映射的正确目标）。
+
+    串行链 → [尾节点]（单个）；平行 fan-out 无协调者 → 全部 leaf；有协调者 fan-in → [协调者]。
+    下游依赖父任务=依赖"整批完成"，故须映射到终端集（全部无后继的子节点），不能只取 children[-1]
+    ——平行 fan-out 下 children[-1] 只是某个 leaf，取它会让下游在兄弟 leaf 未完成时就 ready。"""
+    ids = {getattr(c, "id", "") for c in children}
+    depended: set[str] = set()
+    for c in children:
+        for d in (getattr(c, "depends_on", []) or []):
+            if d in ids:
+                depended.add(d)
+    terminals = [getattr(c, "id", "") for c in children if getattr(c, "id", "") not in depended]
+    return terminals or [getattr(children[-1], "id", "")]
+
+
+def _remap_dependents_to_terminals(subtasks: list, old_id: str, children: list) -> int:
+    """把下游对 old_id 的依赖重映射到【被拆子集的终端节点集】(可能多个,见 _terminal_child_ids)。
+
+    统一收口 ELABORATE/dispatch/恢复阶梯的拆分后重映射：串行链退化为 [尾节点]（与旧
+    _remap_dependents(children[-1]) 行为一致）；平行 fan-out 则映射到全部终端 leaf/协调者，杜绝
+    下游提前 ready。原地修改，跳过被拆子节点自身，去重。"""
+    terminals = _terminal_child_ids(children)
+    child_ids = {getattr(c, "id", "") for c in children}
+    child_prefix = f"{old_id}-"
+    remapped = 0
+    for st in subtasks:
+        sid = getattr(st, "id", "")
+        if sid in child_ids or sid.startswith(child_prefix):
+            continue
+        deps = list(getattr(st, "depends_on", []) or [])
+        if old_id not in deps:
+            continue
+        rewritten: list[str] = []
+        seen: set[str] = set()
+        for d in deps:
+            for t in (terminals if d == old_id else [d]):
+                if t not in seen:
+                    seen.add(t)
+                    rewritten.append(t)
         st.depends_on = rewritten
         remapped += 1
     return remapped

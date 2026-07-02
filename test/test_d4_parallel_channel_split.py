@@ -18,8 +18,10 @@ from __future__ import annotations
 from swarm.brain.planning_nodes import (
     MIN_PARALLEL_IMPL_SIBLINGS,
     _detect_parallel_impls,
+    _remap_dependents_to_terminals,
     _split_oversized_by_files,
     _split_parallel_impl_core,
+    _terminal_child_ids,
 )
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 
@@ -152,12 +154,33 @@ def test_st16_impl_batches_read_interface_upstream():
         assert iface in readable, f"{c.id} readable 缺共享接口 {iface}: {readable}"
 
 
-def test_st16_serial_chain_and_deps():
+def test_st16_channels_fan_out_from_interface_not_serial():
+    """P2 治本 round15 head-of-line：各渠道批【fan-out 依赖接口批】，彼此【不串行】——
+    一个渠道卡住不再连坐放弃兄弟渠道。"""
     st = _notify_subtask()
     children = _split_oversized_by_files(st)
-    assert children[0].depends_on == ["st-1"], "首批继承父依赖"
-    for i in range(1, len(children)):
-        assert f"st-16-{i}" in children[i].depends_on, "后批串行依赖前批"
+    iface_id = children[0].id  # st-16-1 = 接口批
+    assert children[0].depends_on == ["st-1"], "接口批继承父依赖"
+    for c in children[1:]:
+        assert iface_id in c.depends_on, f"{c.id} 应 fan-out 依赖接口批 {iface_id}"
+        # 不依赖任何【兄弟渠道批】(彼此独立)
+        sibling_ids = {x.id for x in children[1:]} - {c.id}
+        assert not (set(c.depends_on) & sibling_ids), \
+            f"{c.id} 不应依赖兄弟渠道(head-of-line)，实得 {c.depends_on}"
+
+
+def test_factory_fans_in_all_leaves():
+    """协调者(工厂)批 fan-in 依赖【全部 leaf】——晚于全部渠道构建、可见全部渠道。"""
+    d = f"{_J}/impl"
+    channels = [f"{d}/SlackChannel.java", f"{d}/DingChannel.java",
+                f"{d}/EmailChannel.java", f"{d}/SmsChannel.java"]
+    core = channels + [f"{d}/NotifyChannelFactory.java"]
+    st = SubTask(id="st-11", description="渠道+工厂", scope=FileScope(create_files=core))
+    children = _split_oversized_by_files(st)
+    factory = children[-1]
+    leaf_ids = {c.id for c in children[:-1]}
+    assert set(factory.depends_on) >= leaf_ids, \
+        f"工厂应 fan-in 依赖全部 leaf {leaf_ids}，实得 {factory.depends_on}"
 
 
 def test_st16_no_file_loss():
@@ -215,6 +238,52 @@ def test_parallel_impls_cross_stack_go():
 
 def test_min_siblings_constant_sane():
     assert MIN_PARALLEL_IMPL_SIBLINGS >= 3, "阈值≥3，避免 2 个也拆"
+
+
+# ── P2：终端集重映射（下游依赖父任务 → 映射到终端节点集，不提前 ready）──
+def test_terminal_remap_parallel_no_coordinator_maps_to_all_leaves():
+    """平行 fan-out 无协调者：下游依赖 st-16 → 重映射到【全部渠道批】(不能只取某一个)。"""
+    st = _notify_subtask()
+    children = _split_oversized_by_files(st)
+    downstream = SubTask(id="st-40", description="接线告警触发",
+                         scope=FileScope(create_files=["x/Trigger.java"]), depends_on=["st-16"])
+    subtasks = list(children) + [downstream]
+    _remap_dependents_to_terminals(subtasks, "st-16", children)
+    leaf_ids = {c.id for c in children[1:]}  # 接口批不是终端(渠道依赖它)
+    assert "st-16" not in downstream.depends_on, "旧父 id 应被替换"
+    assert leaf_ids <= set(downstream.depends_on), \
+        f"下游应依赖全部终端渠道 {leaf_ids}，实得 {downstream.depends_on}"
+
+
+def test_terminal_remap_with_coordinator_maps_to_factory():
+    """有协调者(工厂)：终端集=[工厂]，下游只需依赖工厂(它已 fan-in 全 leaf)。"""
+    d = f"{_J}/impl"
+    core = [f"{d}/SlackChannel.java", f"{d}/DingChannel.java",
+            f"{d}/EmailChannel.java", f"{d}/SmsChannel.java", f"{d}/NotifyChannelFactory.java"]
+    st = SubTask(id="st-11", description="渠道+工厂", scope=FileScope(create_files=core))
+    children = _split_oversized_by_files(st)
+    factory_id = children[-1].id
+    assert _terminal_child_ids(children) == [factory_id], "工厂是唯一终端"
+    downstream = SubTask(id="st-50", description="用通知",
+                         scope=FileScope(create_files=["y/Use.java"]), depends_on=["st-11"])
+    subtasks = list(children) + [downstream]
+    _remap_dependents_to_terminals(subtasks, "st-11", children)
+    assert downstream.depends_on == [factory_id], f"下游应只依赖工厂，实得 {downstream.depends_on}"
+
+
+def test_terminal_child_ids_serial_chain_is_tail():
+    """串行链(实体/分层拆)终端集=[尾节点]——与旧 children[-1] 行为一致(不回归)。"""
+    j = "ruoyi-alarm/src/main/java/com/ruoyi/alarm"
+    files = [f"{j}/domain/AlarmRule.java", f"{j}/mapper/AlarmRuleMapper.java",
+             "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmRuleMapper.xml",
+             f"{j}/service/IAlarmRuleService.java", f"{j}/service/impl/AlarmRuleServiceImpl.java",
+             f"{j}/controller/AlarmRuleController.java",
+             f"{j}/domain/vo/AlarmRuleVo.java", f"{j}/domain/dto/AlarmRuleDto.java",
+             f"{j}/domain/vo/AlarmRuleListVo.java"]  # 9 文件单实体 → 按层串行拆
+    st = SubTask(id="st-6", description="告警规则全栈", scope=FileScope(create_files=files))
+    children = _split_oversized_by_files(st)
+    assert len(children) >= 2
+    assert _terminal_child_ids(children) == [children[-1].id], "串行链终端应为尾节点"
 
 
 if __name__ == "__main__":

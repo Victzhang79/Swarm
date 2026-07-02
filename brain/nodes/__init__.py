@@ -1868,7 +1868,7 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
             _context_budget,
             _oversized_by_files,
             _rebuild_plan,
-            _remap_dependents,
+            _remap_dependents_to_terminals,
             _resplit_subtask,
             _split_oversized_by_files,
         )
@@ -1887,7 +1887,7 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
     if idx is None:
         return None
     new_subtasks[idx:idx + 1] = children
-    _remap_dependents(new_subtasks, failed_id, children[-1].id)
+    _remap_dependents_to_terminals(new_subtasks, failed_id, children)
     new_plan = _rebuild_plan(plan_obj, new_subtasks)
     subtask_results = dict(state.get("subtask_results", {}))
     subtask_results.pop(failed_id, None)
@@ -1949,7 +1949,7 @@ async def _redecompose_timeout_subtasks(
         from swarm.brain.planning_nodes import (
             _oversized_by_files,
             _rebuild_plan,
-            _remap_dependents,
+            _remap_dependents_to_terminals,
             _split_oversized_by_files,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1980,7 +1980,7 @@ async def _redecompose_timeout_subtasks(
         if idx is None:
             continue
         new_subtasks[idx:idx + 1] = children
-        _remap_dependents(new_subtasks, fid, children[-1].id)
+        _remap_dependents_to_terminals(new_subtasks, fid, children)
         rd_counts[fid] = rd_counts.get(fid, 0) + 1
         split_children[fid] = children
     if not split_children:
