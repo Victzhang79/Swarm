@@ -570,6 +570,36 @@ def _lines_to_unified_diff(file_path: str, base: str, merged: str) -> str:
     return block if block.strip() else ""
 
 
+def _aggregate_merge_duplicated_singleton(
+    base: str, versions: list[str], merged: str
+) -> str | None:
+    """round18 P0-A 治本：检测聚合清单(根 pom)的 3-way/union 合并是否【伪造了重复的结构单例行】。
+
+    不变量：一行若在 base 与【每个】分支里都至多出现一次（结构单例，如 </modules>/
+    </dependencyManagement>/<packaging>pom</packaging>），合并结果里也绝不该出现 >1 次——出现
+    即线性 3-way 把两份【各自整段结构重写】的分支背靠背拼接了（对 EOF 前双插入的失败模式），
+    产出闭标签/<modules> 块重复的畸形 pom → git apply「补丁未应用」→ 整包连坐回滚（MERGE#2 现场，
+    dump merged_diff_996db614_1782973787.diff:57-98）。返回首个被重复的单例行(诊断用)，无则 None。
+
+    普通【可重复行】(</dependency>/</module>/空行/<groupId>…)合法多次出现、不在单例集，不受影响
+    → per-entry 并集(各加不同 <module>/<dependency>)不误伤。跨栈通用：纯行计数，无 pom/xml 写死。
+    """
+    from collections import Counter
+
+    def _counts(t: str) -> Counter:
+        return Counter(ln.strip() for ln in _split_lines(t) if ln.strip())
+
+    base_c = _counts(base)
+    branch_cs = [_counts(v) for v in versions]
+    merged_c = _counts(merged)
+    for line, m in merged_c.items():
+        if m <= 1:
+            continue
+        if base_c.get(line, 0) <= 1 and all(bc.get(line, 0) <= 1 for bc in branch_cs):
+            return line
+    return None
+
+
 def _try_three_way_resolve(
     file_path: str,
     conflict_hunks: list[_Hunk],
@@ -593,14 +623,19 @@ def _try_three_way_resolve(
     for sid, hunks in by_subtask.items():
         versions[sid] = apply_hunks_to_text(base_raw, hunks)
 
+    is_agg = _is_aggregate_manifest(file_path)
     combined = merge_insert_only_changes(
         base_raw, *versions.values(),
-        allow_anchor_union=_is_aggregate_manifest(file_path),
+        allow_anchor_union=is_agg,
     )
     if combined is not None and combined != base_raw:
-        diff = _lines_to_unified_diff(file_path, base_raw, combined)
-        if diff:
-            return diff, True
+        # round18 P0-A：并集也可能对【非纯插入】残片拼出重复单例；伪造重复 → 拒绝，落 rebase。
+        if not (is_agg and _aggregate_merge_duplicated_singleton(
+            base_raw, list(versions.values()), combined
+        )):
+            diff = _lines_to_unified_diff(file_path, base_raw, combined)
+            if diff:
+                return diff, True
 
     sid_a, sid_b = subtask_ids[0], subtask_ids[1]
     merged_text, ok = three_way_merge_text(base_raw, versions[sid_a], versions[sid_b])
@@ -620,6 +655,21 @@ def _try_three_way_resolve(
 
     if "<<<<<<" in merged_text or ">>>>>>>" in merged_text:
         return None, False
+
+    # round18 P0-A 治本：聚合清单 3-way 若伪造了重复的结构单例（两份整段结构重写背靠背拼接），
+    # 产出的是畸形 pom（git apply 必败、整包连坐）。拒绝此"假消解"→ 返回 (None,False) 让上层
+    # 落 rebase（保留拓扑上游写者的干净版、下游标记重生成，即 MERGE#1 成功的 rebase=5 路径）。
+    if is_agg:
+        dup = _aggregate_merge_duplicated_singleton(
+            base_raw, list(versions.values()), merged_text
+        )
+        if dup is not None:
+            logger.warning(
+                "[MERGE] 聚合清单 %s 3-way 合并伪造重复结构单例 %r（双写者整段重写拼接）"
+                "→ 拒绝自动消解，改走 rebase（保留上游写者干净版）",
+                file_path, dup,
+            )
+            return None, False
 
     diff = _lines_to_unified_diff(file_path, base_raw, merged_text)
     return diff, ok
