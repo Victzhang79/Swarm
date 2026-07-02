@@ -1189,6 +1189,16 @@ def _derive_full_build_command(
         return "cargo build -q"
     if ext(".ts", ".tsx") and has("tsconfig.json"):
         return "tsc --noEmit"
+    # round18 P2 治本：纯 pom/无可编译源码子任务——"无 Java 即判负"会返回 None→维持 prior 未通过
+    # →BLOCKED 空转（st-30 变体 5065fe04/st-29-2 现场，产物其实 mvn validate 通过）。改走
+    # `mvn validate` 给真确定性校验（pom 结构 + reactor 可解析性）——版本缺失/reactor 断裂会
+    # 如实 fail（fail-closed）。仅当【无任何可编译源码】且改动含 pom.xml 时兜底，不抢 compile。
+    if (
+        not ext(".java", ".kt", ".scala", ".go", ".rs", ".ts", ".tsx")
+        and any(f.replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml" for f in mods)
+        and (build == "maven" or has("pom.xml"))
+    ):
+        return "mvn -q validate"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
     return ""
 
 
