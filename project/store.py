@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS task_records (
     plan JSONB,
     subtask_count INTEGER DEFAULT 0,
     completed_subtasks INTEGER DEFAULT 0,
+    abandoned_subtasks INTEGER DEFAULT 0,
     human_decision TEXT,
     merged_diff TEXT,
     thread_id TEXT,
@@ -143,6 +144,8 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS auto_confirm_vision BOOLEAN DEFAULT FALSE",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS pooled BOOLEAN DEFAULT FALSE",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
+    # round18 P2：进度三本账（完成/放弃/剩余）——放弃单元数,让 web 进度不再误导"卡在 X/N"。
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS abandoned_subtasks INTEGER DEFAULT 0",
 ]
 
 _TASK_SELECT = """
@@ -152,7 +155,8 @@ _TASK_SELECT = """
     token_usage, duration_seconds,
     merge_conflicts, l3_result, created_by_user_id,
     created_at, updated_at,
-    uploaded_files, auto_confirm_vision, pooled, ingest_draft
+    uploaded_files, auto_confirm_vision, pooled, ingest_draft,
+    abandoned_subtasks
 """
 
 
@@ -627,6 +631,7 @@ def update_task(
     plan: dict[str, Any] | None = None,
     subtask_count: int | None = None,
     completed_subtasks: int | None = None,
+    abandoned_subtasks: int | None = None,
     human_decision: str | None = None,
     merged_diff: str | None = None,
     thread_id: str | None = None,
@@ -655,6 +660,9 @@ def update_task(
     if completed_subtasks is not None:
         sets.append("completed_subtasks = %s")
         params.append(completed_subtasks)
+    if abandoned_subtasks is not None:
+        sets.append("abandoned_subtasks = %s")
+        params.append(abandoned_subtasks)
     if human_decision is not None:
         sets.append("human_decision = %s")
         params.append(human_decision)
@@ -1450,6 +1458,13 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         "auto_confirm_vision": bool(row[19]) if len(row) > 19 else False,
         "pooled": bool(row[20]) if len(row) > 20 else False,
         "ingest_draft": (row[21] or "") if len(row) > 21 else "",
+        # round18 P2 三本账：完成/放弃/剩余。remaining 由三者派生（不落库,永非负）,
+        # 让 web 进度反映"已完成 X + 放弃 Y + 剩余 Z"而非只有 completed/count 误导卡死。
+        "abandoned_subtasks": (row[22] or 0) if len(row) > 22 else 0,
+        "remaining_subtasks": max(
+            0,
+            (row[6] or 0) - (row[7] or 0) - ((row[22] or 0) if len(row) > 22 else 0),
+        ),
     }
 
 

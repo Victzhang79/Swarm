@@ -256,6 +256,23 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
             done = _cnt  # 兜底夹紧：completed 永不超过 subtask_count
         updates["completed_subtasks"] = done
 
+        # round18 P2 治本（三本账：完成/放弃/剩余）：进度只显 completed/count 会误导
+        # "卡在 12/38"——实则放弃单元(重试耗尽 abandoned + 保 build 放弃 give_up)不计入,
+        # 与 MONITOR 口径不一致(round18 教训#3:三盯要三本账)。补 abandoned 计数(限当前 plan)。
+        _abandoned_ids = (
+            set(state.get("abandoned_subtask_ids") or [])
+            | set(state.get("give_up_isolated_ids") or [])
+        )
+        if plan_ids:
+            _ab = sum(1 for sid in _abandoned_ids if sid in plan_ids)
+        else:
+            _ab = len(_abandoned_ids)
+        # completed 与 abandoned 互斥(放弃者未 passed);夹紧使 completed+abandoned≤count,
+        # 保证派生的 remaining=count-completed-abandoned 永非负。
+        if isinstance(_cnt, int):
+            _ab = max(0, min(_ab, _cnt - done))
+        updates["abandoned_subtasks"] = _ab
+
     merged_diff = state.get("merged_diff")
     if merged_diff:
         updates["merged_diff"] = merged_diff
