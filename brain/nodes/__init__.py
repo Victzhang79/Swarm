@@ -2986,6 +2986,13 @@ def merge(state: BrainState) -> dict:
                 "（确定性 diff 组装缺陷，非模型/非集成问题；VERIFY_L2 将阻断交付）",
                 _apply_err,
             )
+            # Fix 0（round17 诊断落盘）：apply 失败时把 merged_diff 完整落盘供离线定位组装缺陷。
+            # verify_merged_patch_applies 用 delete=True 临时文件跑完即删 → 否则每轮只能靠 agent
+            # 逆推。fail-safe：helper 内吞异常返回 None，绝不影响主流程。
+            from swarm.brain.merge_engine import dump_merged_diff_for_diagnosis
+            _dump_path = dump_merged_diff_for_diagnosis(state.get("task_id") or "", result.merged_diff)
+            if _dump_path:
+                logger.error("[MERGE] merged_diff 已落盘供诊断: %s", _dump_path)
     logger.info(
         "[MERGE] 合并完成, 总长度=%d, 冲突=%d, 自动消解=%d, rebase=%d, success=%s, apply_ok=%s",
         len(result.merged_diff),

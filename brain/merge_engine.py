@@ -197,7 +197,43 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
     return _FilePatch(file_path=file_path, header_lines=header_lines, hunks=hunks)
 
 
-def _format_file_patch(file_path: str, header_lines: list[str], hunks: list[_Hunk]) -> str:
+def _new_side_lines(hunks: list[_Hunk]) -> list[str]:
+    """取所有 hunk 的【新侧】内容(context+addition，丢弃 deletion / @@ 头 / split 空产物 / marker)，
+    每行前缀 `+`。用于新文件重建（纯新增 hunk）与新文件多写者去重比对。"""
+    out: list[str] = []
+    for hunk in sorted(hunks, key=lambda h: h.old_start):
+        for raw in hunk.lines[1:]:              # 跳过 [0] 的 @@ 头
+            if raw == "" or raw.startswith("\\"):  # split 尾部产物 "" / `\ No newline` 标记
+                continue
+            tag, content = raw[0], raw[1:]
+            if tag == "-":                       # deletion 在新文件里无意义，丢弃
+                continue
+            out.append("+" + content)            # addition 原样；context 转新增（新文件里也是内容）
+    return out
+
+
+def _format_file_patch(
+    file_path: str, header_lines: list[str], hunks: list[_Hunk], is_new: bool = False
+) -> str:
+    if is_new:
+        # 新文件（merge base 无此文件，由调用方据 base_reader 权威判定）：必须输出【纯新建补丁】，
+        # git apply 据 `--- /dev/null` + `@@ -0,0 +1,N @@` 识别为创建。round17 根因②：新模块 pom 的头
+        # 被无条件重写成 `--- a/…` → No such file。且 worker 可能因沙箱 bootstrap 材化了该文件而发
+        # modify 风格 hunk(`@@ -1,N` + context) → 即便改了 --- /dev/null，git apply 仍报"新文件依赖旧
+        # 内容"。故这里【不保留原 hunk 头/行号】，而是把所有 hunk 的【新侧】(context+addition，丢弃
+        # deletion)按序取出作为文件内容，重建成单个 `@@ -0,0 +1,N @@` 纯新增块——对 worker 发 /dev/null
+        # 或 --- a/、`@@ -0,0` 或 `@@ -1,N` 全部成立（复现单测坐实）。
+        new_lines = _new_side_lines(hunks)
+        if not new_lines:
+            return ""
+        header = [
+            f"diff --git a/{file_path} b/{file_path}",
+            "new file mode 100644",
+            "--- /dev/null",
+            f"+++ b/{file_path}",
+            f"@@ -0,0 +1,{len(new_lines)} @@",
+        ]
+        return "\n".join(header + new_lines)
     if header_lines:
         header = list(header_lines)
         if header[0].startswith("--- "):
@@ -230,11 +266,14 @@ def _format_file_patch(file_path: str, header_lines: list[str], hunks: list[_Hun
     return "\n".join(header + body)
 
 
-def _format_conflict_hunks(file_path: str, hunks: list[_Hunk]) -> str:
+def _format_conflict_hunks(file_path: str, hunks: list[_Hunk], is_new: bool = False) -> str:
     subtask_ids = list(dict.fromkeys(h.subtask_id for h in hunks))
+    # 入口对称（防同类 sibling bug）：新文件冲突也用 /dev/null 头。冲突块含 <<<<< 标记本就不可
+    # apply（交人工/rebase），此处仅保持头一致，不改变冲突语义。
+    _minus = "--- /dev/null" if is_new else f"--- a/{file_path}"
     parts = [
         f"# ═══ MERGE CONFLICT: {file_path} (subtasks: {', '.join(subtask_ids)}) ═══",
-        f"--- a/{file_path}",
+        _minus,
         f"+++ b/{file_path}",
     ]
     for hunk in hunks:
@@ -635,6 +674,42 @@ def merge_diffs(
 
     for file_path in sorted(by_file.keys()):
         hunks = by_file[file_path]
+        # 新/旧由 merge base 权威判定（非 worker 头）：有 base_reader 且它读不到该文件 = 新文件。
+        # base_reader 缺省时保守判 modify（旧行为，不回归）。round17 根因②治本。
+        is_new_file = base_reader is not None and base_reader(file_path) is None
+
+        # ── 新文件专路（base 无此文件）──
+        # base 不存在 → 3-way/union/rebase 都无从谈起（都需读 base 内容）。多写者(同一新文件多个
+        # 子任务)若走下方通用路：非冲突会被 _format_file_patch 把两份内容【拼接翻倍】，冲突会 emit
+        # 【冲突标记】(不可 apply，毒化整包 → round17 sdk pom 多写者实测 apply 失败)。故这里专门处理：
+        #   内容一致 → 去重取一；不一致 → 确定性取拓扑最上游写者(同 rebase 选 base 逻辑)，其余记录丢弃。
+        # 绝不 emit 冲突标记（新文件无"冲突"可言）。单写者直接输出。
+        if is_new_file:
+            by_sid_new: dict[str, list[_Hunk]] = {}
+            for h in hunks:
+                by_sid_new.setdefault(h.subtask_id, []).append(h)
+            if len(by_sid_new) >= 2:
+                bodies = {sid: _new_side_lines(sh) for sid, sh in by_sid_new.items()}
+                distinct = list({tuple(v) for v in bodies.values()})
+                if len(distinct) == 1:
+                    chosen_sid = next(iter(by_sid_new))            # 全一致 → 取一
+                else:
+                    chosen_sid = min(                              # 不一致 → 拓扑最上游
+                        by_sid_new,
+                        key=lambda s: order_prio.get(s, len(order_prio) + list(by_sid_new).index(s)),
+                    )
+                    logger.warning(
+                        "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，丢弃 %s（避免冲突标记毒化整包）",
+                        file_path, chosen_sid, [s for s in by_sid_new if s != chosen_sid],
+                    )
+                chosen_hunks = by_sid_new[chosen_sid]
+            else:
+                chosen_hunks = hunks
+            merged_parts.append(
+                _format_file_patch(file_path, headers.get(file_path, []), chosen_hunks, is_new=True)
+            )
+            continue
+
         conflicting: set[int] = set()
 
         for i in range(len(hunks)):
@@ -654,12 +729,12 @@ def merge_diffs(
                 )
                 if resolved and resolved_diff:
                     auto_resolved_files.append(file_path)
+                    # resolved_diff（union）已含该文件【全部】子任务的插入（含非冲突锚点）——
+                    # 见 _try_three_way_resolve: by_subtask 建自 all_hunks，versions[sid]=base+该子任务
+                    # 全部 hunk，merge_insert_only_changes 并集所有 version。故此处【绝不能】再 append
+                    # non_conflicting：否则同一插入进两个块，git apply 累积应用 → 块2 用 base 原始行号
+                    # 在被块1 改过的镜像上错位 →「补丁未应用」(round17 pom.xml:215 根因①，复现坐实)。
                     merged_parts.append(resolved_diff)
-                    non_conflicting = [h for i, h in enumerate(hunks) if i not in conflicting]
-                    if non_conflicting:
-                        merged_parts.append(
-                            _format_file_patch(file_path, headers.get(file_path, []), non_conflicting)
-                        )
                     continue
 
             # ── Rebase 重生成策略（3-way 和硬冲突之间的中间档）──
@@ -690,7 +765,7 @@ def merge_diffs(
                 # 合并: base 方冲突 hunk + 非冲突 hunk
                 kept_hunks = non_conflicting + base_conflict_hunks
                 merged_parts.append(
-                    _format_file_patch(file_path, headers.get(file_path, []), kept_hunks)
+                    _format_file_patch(file_path, headers.get(file_path, []), kept_hunks, is_new_file)
                 )
                 # 记录 rebase 子任务
                 rebase_subtask_ids_all.extend(rebase_sids)
@@ -713,15 +788,15 @@ def merge_diffs(
                     message=f"overlapping hunks in {file_path} from {', '.join(subtask_ids)}",
                 )
             )
-            merged_parts.append(_format_conflict_hunks(file_path, conflict_hunks))
+            merged_parts.append(_format_conflict_hunks(file_path, conflict_hunks, is_new_file))
             non_conflicting = [h for i, h in enumerate(hunks) if i not in conflicting]
             if non_conflicting:
                 merged_parts.append(
-                    _format_file_patch(file_path, headers.get(file_path, []), non_conflicting)
+                    _format_file_patch(file_path, headers.get(file_path, []), non_conflicting, is_new_file)
                 )
         else:
             merged_parts.append(
-                _format_file_patch(file_path, headers.get(file_path, []), hunks)
+                _format_file_patch(file_path, headers.get(file_path, []), hunks, is_new_file)
             )
 
     merged_diff = "\n\n".join(p for p in merged_parts if p.strip())
@@ -735,6 +810,28 @@ def merge_diffs(
         auto_resolved_files=auto_resolved_files,
         rebase_subtask_ids=list(dict.fromkeys(rebase_subtask_ids_all)),
     )
+
+
+def dump_merged_diff_for_diagnosis(
+    task_id: str, merged_diff: str, dump_dir: str = "logs_archive/process", ts: int | None = None
+) -> str | None:
+    """Fix 0（round17）：apply 失败时把 merged_diff 完整落盘供离线定位组装缺陷。
+
+    verify_merged_patch_applies 用 delete=True 临时文件跑完即删，merged diff 从不落盘 → 每轮
+    只能靠 agent 逆推。此 helper 在 MERGE apply_ok=False 时被调用落盘。**fail-safe**：任何异常
+    都吞掉返回 None，绝不影响主流程。ts 可注入以便测试确定性。返回落盘路径或 None。
+    """
+    try:
+        import time as _time
+        tid8 = (task_id or "task")[:8]
+        stamp = ts if ts is not None else int(_time.time())
+        d = Path(dump_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"merged_diff_{tid8}_{stamp}.diff"
+        p.write_text(merged_diff, encoding="utf-8")
+        return str(p)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> tuple[bool, str]:
