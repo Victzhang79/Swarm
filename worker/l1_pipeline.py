@@ -1266,13 +1266,24 @@ def _scope_match(fp: str, w: str) -> bool:
     return False
 
 
-def _scope_violations(diff: str, scope: FileScope) -> list[str]:
+def _scope_violations(
+    diff: str, scope: FileScope, extra_allowed: set[str] | None = None
+) -> list[str]:
     modified = files_from_unified_diff(diff)
     # 可写权限 = writable + create_files + delete_files（FileScope 契约，见 is_writable）。
     # bug 修复(task 9da731ab)：原仅检查 writable，把【新建文件】(create_files)误判越权 →
     # tech_design file_plan 含新建文件的任务必然 L1 失败 → replan 死循环。create_files 是合法可写。
     allowed = set(scope.writable or []) | set(getattr(scope, "create_files", []) or []) \
         | set(getattr(scope, "delete_files", []) or [])
+    # round18 P0-B 治本：确定性修复机制(module-registration 自愈 / version-repair)合法触达的
+    # scope 外文件(典型：父/根 pom)由 executor._repaired_extra_paths 透传进来。它们【非 worker
+    # 越权写命令】——真机制见 test_l1_scope_repaired_paths_round18：VERIFYING 时 scope 复核先于
+    # 注册跑(3 文件 scope_ok=True)，但注册把 pom 记入 repaired → Phase4 的 _get_git_diff 把 pom
+    # 纳入 diff(4 文件) → 若不排除，Phase4 scope 复核见 pom 越 scope → 整份判死误杀有效产出。
+    # 故 scope 只按 worker 实际写命令判定，排除确定性修复触达的路径（fail-closed：worker 自己
+    # 越权的 scope 外文件不在 repaired 集合，仍被抓）。
+    if extra_allowed:
+        allowed |= {p for p in extra_allowed if p}
     if not allowed:
         return []
     violations = []
@@ -1998,6 +2009,7 @@ def run_l1_pipeline(
     timeout: int = 120,
     llm: BaseChatModel | None = None,
     project_stack: dict | None = None,
+    extra_writable_paths: set[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
@@ -2008,11 +2020,14 @@ def run_l1_pipeline(
         timeout: 各阶段超时秒数
         llm: 可选 LLM 句柄，用于 L1.4 自检阶段；不传则自检跳过
         project_stack: 权威栈画像（detect_stack 产）；驱动构建失败时的跨生态 repair adapter 选择
+        extra_writable_paths: round18 P0-B——确定性修复机制合法触达的 scope 外文件
+            (executor._repaired_extra_paths，如 module-registration 自愈改的父 pom)，
+            scope 复核时视为允许，避免把非 worker 越权写的修复文件误判越权整份判死。
     """
     details: dict[str, Any] = {"pipeline": "L1.1-L1.4"}
 
     # ── L1.1 scope 检查 ──
-    violations = _scope_violations(diff, subtask.scope)
+    violations = _scope_violations(diff, subtask.scope, extra_allowed=extra_writable_paths)
     details["l1_1_scope_ok"] = not violations
     details["scope_violations"] = violations
     if violations:

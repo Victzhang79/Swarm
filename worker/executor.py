@@ -1000,6 +1000,8 @@ class WorkerExecutor:
                     llm_ok, llm_details = run_l1_pipeline(
                         self.project_path, self.subtask, output.diff, llm=l1_llm,
                         project_stack=self._resolve_project_stack(),
+                        # round18 P0-B：与确定性闸门同口径，排除修复触达的 scope 外文件。
+                        extra_writable_paths=set(self._repaired_extra_paths),
                     )
                     l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
 
@@ -2704,6 +2706,9 @@ class WorkerExecutor:
             ok, details = run_l1_pipeline(
                 self.project_path, self.subtask, diff or "", llm=None,
                 project_stack=self._resolve_project_stack(),
+                # round18 P0-B：确定性修复触达的 scope 外文件(如 module-reg 自愈的父 pom)
+                # 不计入 scope 违规——见 _get_git_diff 把 _repaired_extra_paths 纳入 diff。
+                extra_writable_paths=set(self._repaired_extra_paths),
             )
             # TD2606-C9：登记本轮在沙箱里被确定性修复的文件，使其回传本地 + 计入 diff。
             self._record_repaired_paths(details)

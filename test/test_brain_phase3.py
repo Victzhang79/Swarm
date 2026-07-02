@@ -257,7 +257,11 @@ def test_merge_node_uses_merge_engine():
     print("  ✅ merge node — uses merge_engine")
 
 
-def test_merge_node_reports_conflicts():
+def test_merge_node_new_file_multiwriter_deterministic_resolve():
+    """round17 治本(commit ae01609)：base 无此文件时(merge 节点在测试环境读不到 x.py 基线)，
+    多写者同一【新文件】不再 emit 冲突标记(会毒化整包 → git apply 失败)，而是确定性取拓扑
+    最上游写者(st-a)、丢弃其余，绝不产生 merge_conflicts。冲突→handle_failure 的路由覆盖
+    仍由 test_after_merge_routes_to_handle_failure_on_conflicts 保证（合成 conflict 态）。"""
     state: BrainState = {
         "subtask_results": {
             "st-a": WorkerOutput(subtask_id="st-a", diff=DIFF_X_OVERLAP_A, summary="ok", l1_passed=True),
@@ -265,11 +269,13 @@ def test_merge_node_reports_conflicts():
         },
     }
     out = merge(state)
-    assert "merge_conflicts" in out
-    assert len(out["merge_conflicts"]) == 1
-    assert out["merge_conflicts"][0]["file_path"] == "x.py"
-    assert set(out["failed_subtask_ids"]) == {"st-a", "st-b"}
-    print("  ✅ merge node — reports merge_conflicts + failed_subtask_ids")
+    # 新文件多写者：确定性取 st-a、丢弃 st-b，不 emit 冲突标记（避免毒化整包）
+    assert not out.get("merge_conflicts"), out.get("merge_conflicts")
+    assert not out.get("failed_subtask_ids")
+    assert "from st-a" in out["merged_diff"]
+    assert "from st-b" not in out["merged_diff"]
+    assert "MERGE CONFLICT" not in out["merged_diff"]
+    print("  ✅ merge node — 新文件多写者确定性消解(不 emit 冲突标记)")
 
 
 def test_after_merge_routes_to_handle_failure_on_conflicts():
@@ -659,7 +665,7 @@ def main():
     test_merge_engine_overlap_rebase_on_same_line()
     test_merge_engine_overlap_hard_conflict_without_base()
     test_merge_node_uses_merge_engine()
-    test_merge_node_reports_conflicts()
+    test_merge_node_new_file_multiwriter_deterministic_resolve()
     test_after_merge_routes_to_handle_failure_on_conflicts()
     test_after_merge_routes_to_dispatch_on_rebase()
     test_merge_node_rebase_path()
