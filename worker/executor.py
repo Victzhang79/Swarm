@@ -117,6 +117,26 @@ class _ProjectGitFlock:
 # LOCATING 阶段步数硬上限（recursion_limit 计节点访问，agent+tool 各 1，故 ~20 ≈ 10 think-act
 # 循环）。定位只是"理解结构/确认落点"，有预读范例+契约时足够；逼模型少探索、把预算留给 CODING。
 _LOCATE_STEP_CAP = 20
+# #14 治本：定位预算硬顶（多文件弹性放宽的上界）。CODING 按 scope 文件数弹性(base+15/file)，
+# 而 LOCATING 原 flat-20 → 多文件子任务勘察不全全部落点→CODING 欠信息空烧。此处让 LOCATING 也
+# 弹性，但单文件/trivial 恒 20（不回归 RUN12 墙钟保护），多文件 +4/file、双重封顶不失控。
+_LOCATE_STEP_CAP_MAX = 40
+
+
+def _locate_step_cap(n_scope_files: int, max_iterations: int) -> int:
+    """LOCATING 阶段 recursion_limit：base 20 + 每多一个目标文件 +4，硬顶 40，且 ≤ max_iterations。
+
+    单文件/trivial(n≤1)→ 恒 20（与 RUN12 原行为逐字节一致，不回归墙钟保护）；多文件按需放宽以
+    勘察全部落点，避免 CODING 欠信息空烧。纯文件计数、跨栈、非项目写死；上界双重封顶不失控。"""
+    try:
+        n = max(0, int(n_scope_files or 0))
+    except (TypeError, ValueError):
+        n = 0
+    cap = _LOCATE_STEP_CAP + max(0, n - 1) * 4
+    cap = min(cap, _LOCATE_STEP_CAP_MAX)
+    if max_iterations and max_iterations > 0:
+        cap = min(cap, max_iterations)
+    return cap
 
 # 判 False，但 deterministic gate（diff 非空 + compile 恰好过）会翻盘判通过 → 幻觉 PASS。
 # 这类标记必须【硬否决整个 L1】，覆盖 deterministic gate——产出来源不可信时编译过也不算数。
@@ -375,6 +395,42 @@ def evaluate_l1(
         reason=f"prior fail 不可翻盘(source={prior.source}, sticky={prior.sticky})，维持未通过",
         sticky=prior.sticky, details=details,
     )
+
+
+def missing_seed_artifacts(artifacts: list[str], local_root: "Path") -> list[str]:
+    """#12 治本(B fail-closed seed)·纯函数：返回【上游产物里缺失于本地树】的相对路径（去重保序）。
+
+    upstream_artifacts 是 plan 标注的 provenance——本子任务 readable 里由上游/兄弟 create_files
+    传播来的产物。基线只读上下文不入此集，故【缺失即上游未就绪/被 revert】，无误判基线之虞。"""
+    out: list[str] = []
+    for rel in dict.fromkeys(artifacts or []):
+        r = str(rel).strip()
+        if not r:
+            continue
+        try:
+            if not (local_root / r).is_file():
+                out.append(r)
+        except OSError:
+            out.append(r)  # 无从判定 → 保守当缺失（fail-closed）
+    return out
+
+
+def packages_from_missing_artifacts(missing: list[str]) -> list[str]:
+    """从缺失的源文件路径反推【被阻断的内部包】（供 brain 反查生产者子任务）。去重保序。
+
+    仅对可识别包路径的源文件（file_path_to_fqn 命中 src 根）产出包；非源文件忽略。通用跨栈
+    的部分交 blocked_on_files 承载。"""
+    from swarm.worker.symbol_resolver import file_path_to_fqn
+    pkgs: list[str] = []
+    seen: set[str] = set()
+    for rel in missing or []:
+        fqn = file_path_to_fqn(str(rel))
+        if fqn and "." in fqn:
+            pkg = fqn.rsplit(".", 1)[0]
+            if pkg and pkg not in seen:
+                seen.add(pkg)
+                pkgs.append(pkg)
+    return pkgs
 
 
 class WorkerPhase(str, Enum):
@@ -754,6 +810,14 @@ class WorkerExecutor:
                     # 杜绝上一轮 pull-back 写回本地的改动跨子任务/重试累积叠加。
                     self._reset_scope_to_head()
                     await self._sync_to_sandbox("bootstrap")
+                    # #12 治本(B fail-closed seed)：bootstrap 后若【上游产物(provenance 标注)】缺失于
+                    # 本地树（上游未就绪 或 被放弃 revert 抹掉），沙箱 seed 必不含该包 → 本子任务注定
+                    # `package does not exist`。不把破工作区交 worker 空烧整条 locate/code/verify 预算，
+                    # 先判 BLOCKED（transient·等生产者）短路早返，与既有 internal_pkg_not_built 同分类，
+                    # 交 handle_failure 反查生产者（已就绪则重试自愈，已放弃则连坐放弃，杜绝白烧）。
+                    _early_blocked = self._precheck_upstream_seed()
+                    if _early_blocked is not None:
+                        return _early_blocked
                 except SandboxUnhealthyError as exc:
                     # 熔断：沙箱运行中连续失败达阈值 → 明确失败，不降级空转
                     self._log(f"沙箱熔断: {exc}")
@@ -790,6 +854,45 @@ class WorkerExecutor:
                 )
         return None
 
+    def _precheck_upstream_seed(self) -> WorkerOutput | None:
+        """#12 治本(B fail-closed seed)：bootstrap 后检查【上游产物 provenance】是否缺失于本地树。
+
+        缺失=上游未就绪 或 被放弃 revert 抹掉 → 沙箱 seed 必不含该包 → 本子任务注定
+        `package does not exist`。返回 BLOCKED WorkerOutput 短路早返（不空烧）；无缺失返回 None。
+        仅沙箱模式生效（本地模式无 seed 环节）。provenance 由 plan 标注，基线只读上下文不入，无误判。"""
+        if not self._sandbox:
+            return None
+        ua = list(getattr(getattr(self.subtask, "scope", None), "upstream_artifacts", []) or [])
+        if not ua:
+            return None
+        local_root = Path(self.project_path).resolve()
+        rels = [self._norm_rel(local_root, f) for f in ua]
+        missing = missing_seed_artifacts(rels, local_root)
+        if not missing:
+            return None
+        blocked_pkgs = packages_from_missing_artifacts(missing)
+        self._log(
+            f"[#12·seed闸门] 上游产物缺失于本地树 {missing[:5]}"
+            f"{' 等' + str(len(missing)) + ' 个' if len(missing) > 5 else ''} "
+            f"→ 沙箱 seed 缺包，判 BLOCKED 等生产者（不空烧 locate/code/verify）"
+        )
+        return self._make_output(
+            diff="",
+            summary=(
+                f"[#12·seed闸门] 依赖的上游产物未落本地树（{len(missing)} 个：{missing[:3]}…）"
+                "——上游未就绪或被放弃，工作区不完整，判 BLOCKED 退避等生产者，不空烧本子任务预算"
+            ),
+            confidence=Confidence.LOW,
+            l1_passed=False,
+            l1_details={
+                "pipeline_blocked": "internal_pkg_not_built",
+                "not_run_kind": NotRunKind.BLOCKED.value,
+                "blocked_on_files": sorted(missing),
+                "blocked_on_packages": sorted(blocked_pkgs),
+                "failure_class": "transient",
+            },
+        )
+
     async def _phase_locate(self) -> tuple[str, WorkerOutput | None]:
         """Phase 1：定位。返回 (locate_result, early_output)；early 非 None 即超时早返。"""
         # 硬砍 LOCATING 预算（治本 RUN12：预读注入了但模型仍探索 167-286s 烧光整体 600s 预算，
@@ -798,10 +901,14 @@ class WorkerExecutor:
         # 省下的预算留给真正干活的 CODING+VERIFY。把整体超时根因从"探索吃光预算"摁住。
         self.phase = WorkerPhase.LOCATING
         self._log("定位阶段：阅读代码，理解结构")
+        # #14 治本：定位预算按 scope 文件数弹性（与 CODING 对称）；单文件/trivial 恒 20 不回归。
+        _sc = getattr(self, "effective_scope", None) or getattr(self.subtask, "scope", None)
+        _nf = (len(list(getattr(_sc, "writable", []) or [])
+                   + list(getattr(_sc, "create_files", []) or [])) if _sc else 0)
         locate_result = await self._run_agent(
             self._build_locate_prompt(),
             step="locate",
-            max_steps=min(self.max_iterations, _LOCATE_STEP_CAP),
+            max_steps=_locate_step_cap(_nf, self.max_iterations),
         )
         self._log(f"定位完成: {locate_result[:200]}")
 
@@ -1711,6 +1818,36 @@ class WorkerExecutor:
             rel_files = list(dict.fromkeys(
                 rel_files + [self._norm_rel(local_root, p) for p in extra_repaired]
             ))
+        # ★H-exec1 治本(round21 假绿门)★：worker 常自建【未声明】的同包 helper/config/枚举/内部类——
+        # 在沙箱编过→L1 绿，但只回传【声明 scope】会漏掉它们→本地树缺→MERGE/集成期 cannot find symbol
+        # (L1 假绿+产物不落盘)。故在【声明文件的父目录】下按源扩展名枚举沙箱里【本地尚无】的新文件，
+        # 纳入回传。有界(仅子任务自己的包目录 + 只补本地缺失文件，不拉全仓/构建产物/不碰既有文件)。
+        if rel_files and not getattr(self.effective_scope, "allow_any", False):
+            try:
+                _decl_dirs = {
+                    str(Path(f).parent).replace("\\", "/")
+                    for f in rel_files if "/" in f.replace("\\", "/")
+                }
+                if _decl_dirs:
+                    _all_sb = await asyncio.to_thread(self._list_sandbox_workspace_files)
+                    _SRC_EXT = (".java", ".kt", ".kts", ".go", ".rs", ".ts", ".tsx",
+                                ".js", ".jsx", ".vue", ".py", ".xml", ".sql", ".proto")
+                    _rel_set = set(rel_files)
+                    _extra_new = [
+                        f for f in _all_sb
+                        if f not in _rel_set
+                        and f.lower().endswith(_SRC_EXT)
+                        and any(f.replace("\\", "/").startswith(d + "/") for d in _decl_dirs)
+                        and not (local_root / f).exists()  # 只补本地【尚无】的新文件，不碰既有
+                    ]
+                    if _extra_new:
+                        rel_files = list(dict.fromkeys(rel_files + _extra_new))
+                        self._log(
+                            f"{reason} H-exec1：纳入 {len(_extra_new)} 个未声明沙箱新建源文件"
+                            f"(同包，防 L1 绿但产物不落盘): {_extra_new[:5]}"
+                        )
+            except Exception as _hexc:  # noqa: BLE001
+                self._log(f"{reason} H-exec1 枚举沙箱新增文件失败(非致命): {_hexc}")
         if not rel_files:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return

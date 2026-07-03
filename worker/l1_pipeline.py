@@ -689,6 +689,17 @@ def _repair_rust(project_path: str, timeout: int) -> tuple[int, list[str]]:
         )
         if d_ec == 0:
             touched = [ln.strip() for ln in (d_out or "").splitlines() if ln.strip()][:100]
+        else:
+            # #13 治本·降级可观测：沙箱 /workspace 由 `git archive HEAD` 烤成→【无 .git】→
+            # `git diff` 非 0（"not a git repository"）。此时无法枚举 cargo fix 触达的【scope 外】
+            # 文件(Cargo.lock/同 crate 兄弟)→它们不会被 pull-back 强制回传。显式告警杜绝静默丢弃
+            # （crate 内 src 仍在 scope 内正常回传；cargo fix 幂等，下轮构建可重导）。
+            logger.warning(
+                "[L1.2.1·repair] Rust 触达清单枚举不可用（git diff 退出码 %s，沙箱无 .git）→ "
+                "cargo fix 的 scope 外改动(Cargo.lock/兄弟文件)本轮不强制回传；"
+                "如需可靠传播请把它们纳入子任务 scope",
+                d_ec,
+            )
     except Exception:  # noqa: BLE001 —— 取触达清单失败不致命，退化为空列表
         touched = []
     logger.info("[L1.2.1·repair] cargo fix 已尝试套用 rustc 建议（exit=%s, 触达 %d 文件）",
@@ -823,6 +834,165 @@ def _attempt_symbol_repair(
     return len(changed), sorted(changed)
 
 
+def plan_internal_import_drift_rewrites(
+    file_missing_imports: dict[str, list[tuple[str, str]]],
+    class_internal_packages: dict[str, set[str]],
+) -> list[tuple[str, str, str]]:
+    """#9 漂移 import 重写【纯规划器】(无 IO，易测)。
+
+    入参：
+      file_missing_imports: {出错文件: [(缺失内部包 P, 被引类 C), ...]}——每个 (P,C) 表示该文件
+        `import P.C;` 引了一个【树里不存在的内部包 P】。
+      class_internal_packages: {类名 C: {C 在项目树里真实声明所在的内部包集合}}。
+    出参：[(文件, "P.C", "R.C"), ...] 确定性重写指令。
+
+    判据（fail-closed）：候选 = C 的真实内部包 - {P}。**唯一**候选 R 才产出重写；
+    零候选（类真不存在=未就绪/臆造）或多候选（同名类多处=歧义）→ 不重写，交回 BLOCKED/快失败。
+    通用跨栈、非项目写死（纯集合运算，不含任何硬编码包名/FQN）。"""
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rel_file, imports in file_missing_imports.items():
+        for pkg, cls in imports:
+            cands = {r for r in class_internal_packages.get(cls, set()) if r and r != pkg}
+            if len(cands) != 1:
+                continue  # 零解/多解 → fail-closed
+            real = next(iter(cands))
+            key = (rel_file, f"{pkg}.{cls}", f"{real}.{cls}")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _imported_classes_from_pkg(
+    project_path: str, rel_file: str, pkg: str, timeout: int
+) -> list[str]:
+    """抽 rel_file 里【直接 import 缺失包 pkg 下的具体类名】（去重保序）。
+
+    只取 `import pkg.C;` / `import static pkg.C.X;` 里紧跟 pkg 的段 C 且【大写开头=类名】；
+    `import pkg.sub....`（小写子包）与 `import pkg.*;`（通配无具体类）都不取——无法精确定位。"""
+    pe = re.escape(pkg)
+    cmd = (
+        f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' '{rel_file}' "
+        f"2>/dev/null | head -20"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
+    classes: list[str] = []
+    seen: set[str] = set()
+    for line in (out or "").splitlines():
+        m = re.search(rf"import\s+(?:static\s+)?{pe}\.([A-Za-z_][A-Za-z0-9_]*)", line)
+        if m:
+            cls = m.group(1)
+            if cls and cls[0].isupper() and cls not in seen:
+                seen.add(cls)
+                classes.append(cls)
+    return classes
+
+
+def _internal_packages_declaring_class(
+    project_path: str, cls: str, own: set[str], timeout: int
+) -> set[str]:
+    """查【类 cls 在项目树里真实声明所在的内部包集合】（据 <cls>.java 路径反推包，排除测试树）。
+
+    RuoYi/Java 惯例：一公开类一文件、文件名=类名 → 路径即权威包。只保留【项目自有前缀】的包
+    （own），第三方/JDK 不算。多处声明 → 返回多元素集合，交规划器 fail-closed。"""
+    from swarm.worker.symbol_resolver import file_path_to_fqn
+    cmd = (
+        f"grep -rlE '(class|interface|enum|record)[[:space:]]+{re.escape(cls)}"
+        f"([^A-Za-z0-9_]|$)' --include='{cls}.java' . 2>/dev/null | head -20"
+    )
+    _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 30))
+    pkgs: set[str] = set()
+    for line in (out or "").splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        norm = path.replace("\\", "/")
+        if "/src/test/" in norm or "/test/java/" in norm:
+            continue  # 测试树的包不算生产包
+        fqn = file_path_to_fqn(norm)
+        if not fqn or "." not in fqn:
+            continue
+        pkg = fqn.rsplit(".", 1)[0]
+        if any(pkg == g or pkg.startswith(g + ".") for g in own):
+            pkgs.add(pkg)
+    return pkgs
+
+
+def _attempt_internal_import_drift_repair(
+    project_path: str, build_output: str, timeout: int
+) -> tuple[int, list[str]]:
+    """#9 治本（Candidate B）：跨 feature 包布局漂移 → 据类真实内部包确定性重写 import。
+
+    现象（round19 头号交付天花板）：脚手架/生产者把类落在【扁平】`com.ruoyi.alarm.domain`，
+    消费者独立猜成【嵌套】`com.ruoyi.alarm.robot.domain` → javac `package P does not exist`。
+    旧路径把它当 internal_pkg_not_built BLOCKED、等一个永不到来的生产者（#10 幽灵生产者），
+    慢磨整条 transient 阶梯才 abandon。这里在判 BLOCKED 前：对每个【自有前缀的缺失内部包 P】，
+    取出错文件里 `import P.C;` 的类 C，查 C 在树里的【真实内部包 R】，唯一解 → 重写 P.C→R.C，
+    交调用方重跑确认。零解（真未就绪/臆造）或多解（歧义）→ 不动，交回 BLOCKED/#10 快失败。
+
+    与 import/symbol-repair 同源：真理取自项目实际产出、无硬编码、跨 feature 通用、非项目写死；
+    只改【出错的消费者文件自身】（别人的文件交其 owner）。SWARM_WORKER_IMPORT_DRIFT_REPAIR=false 可关。
+    """
+    if os.environ.get(
+        "SWARM_WORKER_IMPORT_DRIFT_REPAIR", "true"
+    ).lower() in ("false", "0", "no"):
+        return 0, []
+    pairs = parse_missing_packages(build_output)
+    if not pairs:
+        return 0, []
+    own = _project_own_packages(project_path, timeout)
+    if not own:
+        return 0, []
+    # 1) 只保留【内部缺包】(自有前缀、非 JDK/servlet/第三方)，按出错文件归组
+    missing_by_file: dict[str, set[str]] = {}
+    for f, p in pairs:
+        if any(p == pre.rstrip(".") or p.startswith(pre) for pre in _DEP_REPAIR_SKIP_PREFIXES):
+            continue  # JDK/servlet 命名空间，交 jvm-namespace/import-repair
+        if not any(p == g or p.startswith(g + ".") for g in own):
+            continue  # 第三方缺包，交 dep-repair
+        missing_by_file.setdefault(_norm_src_path(f), set()).add(p)
+    if not missing_by_file:
+        return 0, []
+    # 2) 抽每个错文件里【引用缺包的 import 具体类】
+    file_missing_imports: dict[str, list[tuple[str, str]]] = {}
+    wanted: set[str] = set()
+    for rel, pkgs in missing_by_file.items():
+        imps: list[tuple[str, str]] = []
+        for pkg in sorted(pkgs):
+            for cls in _imported_classes_from_pkg(project_path, rel, pkg, timeout):
+                imps.append((pkg, cls))
+                wanted.add(cls)
+        if imps:
+            file_missing_imports[rel] = imps
+    if not wanted:
+        return 0, []
+    # 3) 查每个被引类的真实内部包
+    class_pkgs: dict[str, set[str]] = {
+        cls: _internal_packages_declaring_class(project_path, cls, own, timeout)
+        for cls in sorted(wanted)
+    }
+    # 4) 规划唯一解重写
+    rewrites = plan_internal_import_drift_rewrites(file_missing_imports, class_pkgs)
+    if not rewrites:
+        return 0, []
+    # 5) 沙箱优先应用 perl 全字替换 old_fqn→new_fqn（\Q..\E 转义点，\b 收尾防误伤更长类名）
+    changed: set[str] = set()
+    for rel, old, new in rewrites:
+        scmd = (
+            f"perl -i.bak -pe 's#\\Q{old}\\E\\b#{new}#g' '{rel}' && rm -f '{rel}.bak'"
+        )
+        ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
+        if ec2 == 0:
+            changed.add(rel)
+            logger.info(
+                "[L1.2.1·import-drift] %s: %s → %s（类真实内部包，据树实证，#9 漂移治本）",
+                rel, old, new,
+            )
+    return len(changed), sorted(changed)
+
+
 def _attempt_build_repair(
     project_path: str,
     build_output: str,
@@ -867,6 +1037,14 @@ def _attempt_build_repair(
             _accum(_attempt_import_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Java import-repair 异常(跳过): %s", exc)
+        # #9 治本：跨 feature 包布局漂移（import 嵌套/错内部包，类实际在别的内部包）→ 据类真实
+        # 内部包确定性重写 import。放在前缀 import-repair 之后、dep-repair 之前：先把【内部包漂移】
+        # 重定向到真实产出包，剩下真缺的第三方再交 dep-repair；避免漂移内部包被误当"未就绪"BLOCKED
+        # 等一个永不到来的生产者（#10 幽灵生产者）。唯一解才改、零解/歧义 fail-closed 交回 BLOCKED。
+        try:
+            _accum(_attempt_internal_import_drift_repair(project_path, build_output, timeout))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] Java import-drift-repair 异常(跳过): %s", exc)
         # 缺第三方依赖声明（import 了库但 module pom 没声明）→ 据 import 反查坐标补进 pom。
         # 放在 import 前缀修复之后、版本对账之前：先把"整个依赖没声明"补齐，版本问题再对账。
         # SWARM_WORKER_DEP_REPAIR=false 可关（仅此一类，留逃生阀）。
@@ -1016,6 +1194,49 @@ def _sandbox_ctx() -> tuple[Any, Any, str] | None:
     except Exception:  # noqa: BLE001
         remote = "/workspace"
     return sandbox, manager, remote
+
+
+def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
+    """把 reconcile 在【本地 project_path】改过的聚合清单推进【沙箱】，返回上传成功数。
+
+    治本 #11(b)（round18/19 实测头号交付卡点）：模块注册 reconcile 走纯 Python
+    `Path.write_text`，改的是本地 project_path 的 pom；而 build gate（`mvn -pl <mod>`）在
+    远端沙箱跑，读的是 bootstrap 上传的旧副本。两份在同一次 L1 内从不同步 → 注册对构建
+    【永久不可见】→ `Could not find the selected project in the reactor`（reconcile 明明
+    log 了"补注册"）。其它确定性 repair（import/version/goimports 全走 `_run_l1_command`
+    在沙箱内改）本就对构建可见；唯独 reconcile 是本地写的例外——这里把它对齐：推进沙箱。
+
+    无活跃沙箱（本地模式）→ build 直接读 project_path，无需 push，安全返回 0。
+    sync 失败（infra 瞬时）不致命：不推进则 build 会 reactor-not-found，交后续构建失败
+    分类（含 _is_infra_failure 退避）处理，不在此吞成假通过。
+    """
+    if not manifests:
+        return 0
+    ctx = _sandbox_ctx()
+    if ctx is None:
+        return 0
+    sandbox, manager, remote = ctx
+    if not hasattr(manager, "sync_files_to_sandbox"):
+        return 0
+    try:
+        from pathlib import Path as _P
+        rels = [m for m in manifests if (_P(project_path) / m).is_file()]
+        if not rels:
+            return 0
+        stats = manager.sync_files_to_sandbox(sandbox, project_path, rels, remote)
+        uploaded = int((stats or {}).get("uploaded", 0))
+        if uploaded:
+            logger.info(
+                "[L1.2.1·module-reg] 已把 reconcile 注册的聚合清单推进沙箱 %d 个"
+                "（令 -pl 当场可解析，杜绝 reactor not-found）: %s", uploaded, rels,
+            )
+        for _err in ((stats or {}).get("errors") or [])[:3]:
+            logger.warning("[L1.2.1·module-reg] 清单推进沙箱警告: %s", _err)
+        return uploaded
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[L1.2.1·module-reg] 清单推进沙箱失败(不致命,交 build 失败分类): %s", exc)
+        return 0
 
 
 def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -2145,6 +2366,12 @@ def run_l1_pipeline(
                 for _mf in _manifests:
                     if _mf not in _rfp:
                         _rfp.append(_mf)
+                # 治本 #11(b)：reconcile 改的是【本地】清单，但 build gate 在【远端沙箱】读
+                # bootstrap 上传的旧副本 → 注册对构建不可见（reactor not-found）。必须把改过的
+                # 清单推进沙箱（与 import/version repair 沙箱优先对齐），否则本地注册白改。
+                _pushed = _push_manifests_to_sandbox(project_path, _manifests)
+                if _pushed:
+                    details["module_registration_pushed"] = _pushed
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)

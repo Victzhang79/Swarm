@@ -186,7 +186,13 @@ async def analyze(state: BrainState) -> dict:
 
     recent_summaries = state.get("recent_task_summaries")
     if recent_summaries is None and project_id:
-        recent_summaries = await load_recent_task_summaries(project_id)
+        # 最终推演·连续性护栏(round21)：DB/store 抖动不应让 ANALYZE 早退 FAILED——近期任务摘要仅是
+        # 规划的软上下文，取不到降级空即可(与 retrieve_knowledge 的 N-12 护栏同口径),不中断主干。
+        try:
+            recent_summaries = await load_recent_task_summaries(project_id)
+        except Exception as _rtexc:  # noqa: BLE001
+            logger.warning("[ANALYZE] 近期任务摘要加载失败(降级空,不中断规划): %s", _rtexc)
+            recent_summaries = []
     recent_tasks_prompt = format_recent_tasks_for_brain(recent_summaries or [])
     session_meta = state.get("session_metadata") or {}
     session_prompt = json.dumps(session_meta, ensure_ascii=False, indent=2) if session_meta else "（无）"
@@ -1531,6 +1537,37 @@ def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
     return False
 
 
+def _blocked_pkg_unrecoverable(
+    blocked_pkgs, producers, unsat, completed_ok, pending, project_path, self_id,
+) -> bool:
+    """阻断在内部包的子任务，是否【永不可满足】= 全部生产者已终结 且 包仍不在工作树。
+
+    #10 治本（round19 st-38 慢磨 ~1h 的缺口）：快失败原判据只认【完全无生产者】(_hallucinated)，
+    但 `_producers_of` 按路径/模块松归属，会把一个【已完成、却产了别的包名(#9 漂移)】的子任务
+    误算作生产者 → 判"有生产者、transient 可恢复" → 白磨完整升级阶梯。此处把"无生产者"泛化为
+    【无 active 生产者】：生产者已 abandoned 或已成功完成(不再重派)即 settled；仍 pending/在飞/
+    未跑 = active、继续等（保住合法跨模块等待，不打地鼠松紧 _producers_of）。
+
+    active 生产者存在 → 返回 False（继续 transient 等待）。全部 settled 时，仅当【阻断包一个都
+    不在工作树】才判不可恢复 True——包在树(仅漏 seed，#12 域)→ False，交 #12 重 seed，杜绝越权
+    误 abandon。self_id 从生产者集剔除（阻断子任务自身不能自证 active）。纯路径、跨栈、非项目写死。"""
+    _prods = {p for p in (producers or set()) if p and p != self_id}
+    _pending = set(pending or set())
+    _done = set(completed_ok or set())
+    _unsat = set(unsat or set())
+
+    def _settled(p: str) -> bool:
+        if p in _unsat:                       # 已放弃 → 终结
+            return True
+        return p in _done and p not in _pending  # 已成功完成且不再重派 → 终结
+
+    if any(not _settled(p) for p in _prods):  # 仍有 active 生产者 → 该等，别误杀
+        return False
+    return bool(blocked_pkgs) and not any(
+        _package_in_baseline(project_path, p) for p in blocked_pkgs
+    )
+
+
 def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> bool:
     """失败详情里是否命中"缺符号/缺依赖"编译特征（确定性、零 LLM）。
     排除 internal_pkg_not_built/upstream_module_broken——那是【内部产物未就绪】非缺外部 jar，
@@ -2026,8 +2063,32 @@ def _subtask_footprint(st) -> list[str]:
     return out
 
 
-def _local_tree_revert_subtask(project_path: str | None, st) -> dict:
+def _files_owned_by_completed(subtasks, subtask_results: dict, exclude_ids: set) -> set[str]:
+    """【已完成(l1_passed)且保留】子任务的 writable∪create_files 归属集（归一化相对路径）。
+    供 revert 窄守卫：放弃子任务清足迹时，绝不删这些【兄弟有效产物】。"""
+    owned: set[str] = set()
+    for s in subtasks:
+        sid = getattr(s, "id", None)
+        if sid in exclude_ids:
+            continue
+        out = subtask_results.get(sid)
+        passed = (isinstance(out, WorkerOutput) and out.l1_passed) or (
+            isinstance(out, dict) and out.get("l1_passed"))
+        if not passed:
+            continue
+        sc = getattr(s, "scope", None)
+        for f in (list(getattr(sc, "writable", []) or [])
+                  + list(getattr(sc, "create_files", []) or [])):
+            owned.add(str(f).replace("\\", "/").lstrip("./"))
+    return owned
+
+
+def _local_tree_revert_subtask(project_path: str | None, st, protected_files: set | None = None) -> dict:
     """卡死子任务恢复阶梯·阶梯三(revert)：把子任务在【本地树】的足迹清干净。
+
+    protected_files（H-exec2 窄守卫，round21）：被【其它已完成子任务】拥有为有效产物的文件集——
+    即便落在本子任务 footprint 内也【跳过删除/回退】，杜绝放弃时误删兄弟已落盘产物(footprint 与兄弟
+    scope 重叠场景)。纯加性守卫，不重构 round15 红线的桩+级联恢复逻辑。
 
     必要性（第六轮 + L2 源码实证）：worker 的坏文件经 pull-back 已写回本地 project_path
     （新建文件为 untracked）。L2 `run_integration_review` 的 `_reset_worktree_to_head` 只
@@ -2038,14 +2099,19 @@ def _local_tree_revert_subtask(project_path: str | None, st) -> dict:
     - 已被 git 跟踪的文件 → `git checkout HEAD --`（还原提交版，撤销 pull-back 脏改动）。
     - 未跟踪（新建产物）→ 删除文件。
     通用：纯 git/文件操作，与语言无关。返回 {"reverted":[...], "removed":[...]}。"""
-    result: dict = {"reverted": [], "removed": []}
+    result: dict = {"reverted": [], "removed": [], "skipped_protected": []}
     if not project_path:
         return result
     import subprocess
     root = Path(project_path)
     if not (root / ".git").exists():
         return result
+    _protected = protected_files or set()
     for rel in _subtask_footprint(st):
+        # H-exec2 窄守卫：该 footprint 文件是【其它已完成子任务】的有效产物 → 跳过删除/回退。
+        if str(rel).replace("\\", "/").lstrip("./") in _protected:
+            result["skipped_protected"].append(rel)
+            continue
         try:
             tracked = subprocess.run(
                 ["git", "ls-files", "--error-unmatch", rel],
@@ -2212,7 +2278,9 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
                 confidence=Confidence.LOW,
             )
         else:
-            rev = _local_tree_revert_subtask(project_path, st)
+            # H-exec2：清 fid 足迹前，护住【其它已完成子任务】拥有的有效产物(footprint 重叠不误删)。
+            _prot = _files_owned_by_completed(subtasks, subtask_results, exclude_ids={fid})
+            rev = _local_tree_revert_subtask(project_path, st, protected_files=_prot)
             mode = "revert"
             subtask_results[fid] = WorkerOutput(
                 subtask_id=fid, diff="",
@@ -2230,7 +2298,10 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
                     if (s.id in _closed and s.id != fid
                             and s.id not in abandoned and s.id not in give_up):
                         abandoned.add(s.id)
-                        _local_tree_revert_subtask(project_path, s)
+                        # H-exec2：级联放弃下游清足迹时，同样护住其它已完成兄弟的有效产物。
+                        _prot_c = _files_owned_by_completed(
+                            subtasks, subtask_results, exclude_ids=_closed | {fid})
+                        _local_tree_revert_subtask(project_path, s, protected_files=_prot_c)
                         subtask_results.pop(s.id, None)
         give_up.add(fid)
         handled.append((fid, mode))
@@ -2432,6 +2503,10 @@ async def handle_failure(state: BrainState) -> dict:
                   | set(state.get("abandoned_subtask_ids") or []))
         _proj_path = _get_project_path(state.get("project_id") or "")
         _by_id = {s.id: s for s in plan_obj.subtasks}
+        # #10 治本所需：全局 settled 生产者判据的两个集合。
+        _completed_ok = {sid for sid, out in subtask_results.items()
+                         if sid not in failed_ids and _subtask_out_l1_passed(out)}
+        _pending_now = set(state.get("dispatch_remaining") or []) | set(failed_ids)
         _unrecoverable: set[str] = set()
         for fid in failed_ids:
             _det = _det_of(subtask_results.get(fid))
@@ -2444,14 +2519,17 @@ async def handle_failure(state: BrainState) -> dict:
             # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
             _dep_hit = bool(set(getattr(_st, "depends_on", []) or []) & _unsat) if _st else False
             _prod_hit = bool(_prods & _unsat)
-            # (#R13-2) 阻断在【无任何 plan 生产者 且 基线树里也不存在】的包 = 臆造不存在的包 →
-            # 在等一个永不会来的生产者，永不可满足。直接判不可恢复，免烧整条 transient 重试阶梯。
-            # 假阳性护栏 _package_in_baseline：基线已有(仅沙箱漏同步)的包 → 不判臆造、继续 transient 等待。
-            _hallucinated = (
-                bool(_bpkgs) and not _prods
-                and not any(_package_in_baseline(_proj_path, p) for p in _bpkgs)
+            # (#R13-2 → #10 泛化) 阻断在【全部生产者已终结(放弃/完成) 且 包仍不在工作树】的内部包 =
+            # 在等一个永不会来的产物，永不可满足。含两情形：(a) 完全无生产者=臆造(#R13-2 原语义)；
+            # (b) 有生产者但已完成却产了别的包名(#9 跨 feature 漂移，round19 st-38 慢磨 ~1h 的幽灵生产者)。
+            # 只要还有 active(pending/在飞/未跑)生产者 → 继续 transient 等待，绝不误杀合法跨模块等待。
+            # 假阳性护栏 _package_in_baseline(扫工作树)：包在树(仅漏 seed)→ 交 #12 重 seed，不据此硬失败。
+            _futile = _blocked_pkg_unrecoverable(
+                blocked_pkgs=_bpkgs, producers=_prods, unsat=_unsat,
+                completed_ok=_completed_ok, pending=_pending_now,
+                project_path=_proj_path, self_id=fid,
             )
-            if _dep_hit or _prod_hit or _hallucinated:
+            if _dep_hit or _prod_hit or _futile:
                 _unrecoverable.add(fid)
         if _unrecoverable:
             abandoned = _transitive_abandon(
@@ -2908,16 +2986,22 @@ async def handle_failure(state: BrainState) -> dict:
 
 
 def _make_base_reader(state: BrainState):
-    """从项目工作区读取 base 文件内容，供 3-way merge 使用。"""
+    """从项目【git HEAD 基线】读取 base 文件内容，供 3-way merge / is_new 权威判定。
+
+    ★round21 治本（apply_ok=False 真死因，Agent B 交付链路取证）★：原先读【工作区 project_path】，
+    但 pull-back 已把完成子任务产物 materialize 进工作区 → 新模块文件(ruoyi-alarm/pom.xml 等)被
+    base_reader 读到 → `is_new=False` → 发带 worker 沙箱相对 base 偏移的 modify hunk → 纯净 git HEAD
+    无此文件 → `git apply --check` 必失败(round19 merged diff 88 文件全 modify、0 create 的根因)。
+    worker 的 diff 本就相对 git HEAD 生成(executor `_snapshot_from_git_head`)，故 merge base 必须同源
+    读 HEAD 才能 3-way 对齐 + 让 HEAD 无的文件正确判 is_new→纯新建补丁。非 git 仓/git 异常→退回工作区
+    读(greenfield 与旧行为不回归)。纯读、通用跨栈、非项目写死。"""
+    import subprocess
+
     project_id = state.get("project_id") or ""
     project_path = _get_project_path(project_id)
+    _is_git = bool(project_path) and (Path(project_path) / ".git").exists()
 
-    def read(file_path: str) -> str | None:
-        if not project_path:
-            return None
-        rel = file_path.lstrip("/")
-        if rel.startswith("a/") or rel.startswith("b/"):
-            rel = rel[2:]
+    def _read_worktree(rel: str) -> str | None:
         full = Path(project_path) / rel
         try:
             if full.is_file():
@@ -2925,6 +3009,37 @@ def _make_base_reader(state: BrainState):
         except OSError as exc:
             logger.debug("[MERGE] read base %s: %s", full, exc)
         return None
+
+    _cache: dict[str, str | None] = {}  # 单次 merge 内 HEAD 稳定：memo 掉 88×git fork（对抗审计·perf）
+
+    def read(file_path: str) -> str | None:
+        if not project_path:
+            return None
+        rel = file_path.lstrip("/")
+        if rel.startswith("a/") or rel.startswith("b/"):
+            rel = rel[2:]
+        if rel in _cache:
+            return _cache[rel]
+        if _is_git:
+            try:
+                r = subprocess.run(
+                    ["git", "-C", str(project_path), "show", f"HEAD:{rel}"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=30,
+                )
+                # errors="replace"（对抗审计 round21 必修）：HEAD 里的二进制文件(favicon/.jar/图片)不会
+                # 抛 UnicodeDecodeError 崩 MERGE（原 text=True 默认 strict 解码会冒泡 ValueError 死整包交付，
+                # 原工作区读用 errors="replace" 从不崩）。returncode==0→HEAD 有此文件(返回提交版)；
+                # 非 0（"exists on disk, but not in HEAD"）→ HEAD 无=新文件→None→is_new=True→create 补丁。
+                val = r.stdout if r.returncode == 0 else None
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                # git 缺失/超时/解码等异常 → 退回工作区读（保守，不误判所有文件为新）。ValueError 兜底。
+                logger.debug("[MERGE] git show HEAD:%s 失败，退回工作区读: %s", rel, exc)
+                val = _read_worktree(rel)
+        else:
+            val = _read_worktree(rel)
+        _cache[rel] = val
+        return val
 
     return read
 
@@ -2935,7 +3050,11 @@ def merge(state: BrainState) -> dict:
     输入: subtask_results
     输出: merged_diff, merge_conflicts (如有硬冲突), rebase_subtask_ids (如有 rebase)
     """
-    from swarm.brain.merge_engine import merge_diffs, verify_merged_patch_applies
+    from swarm.brain.merge_engine import (
+        filter_orphan_module_patches,
+        merge_diffs,
+        verify_merged_patch_applies,
+    )
 
     subtask_results: dict = state.get("subtask_results", {})
 
@@ -2947,6 +3066,32 @@ def merge(state: BrainState) -> dict:
             subtask_diffs.append((subtask_id, output.diff or ""))
         elif isinstance(output, dict):
             subtask_diffs.append((subtask_id, output.get("diff", "") or ""))
+
+    # #11(c) 硬门控：module-defining 子任务(建 <dir>/pom.xml 等骨架)不在成功集时，剔除
+    # 引用该骨架缺失模块的兄弟补丁——否则合并 patch 有模块目录文件却无该模块骨架 →
+    # git apply/reactor 崩(No such file / Child module does not exist)，整包交付死于门口。
+    _merge_proj_path = _get_project_path(state.get("project_id") or "")
+
+    def _base_has_module(_dir: str) -> bool:
+        if not _merge_proj_path:
+            return False
+        for _mf in ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod"):
+            if (Path(_merge_proj_path) / _dir / _mf).is_file():
+                return True
+        _md = Path(_merge_proj_path) / _dir
+        return _md.is_dir() and any(_md.glob("*.csproj"))
+
+    # #11(c) 护栏(round21 对抗审计)：base 项目路径不可用时传 None → filter 跳过过滤，
+    # 绝不把既有模块误判孤儿→补丁全剔→误杀交付（真问题仍由 VERIFY_L2/apply 护栏兜）。
+    subtask_diffs, _dropped_orphans = filter_orphan_module_patches(
+        subtask_diffs,
+        base_module_exists=_base_has_module if _merge_proj_path else None)
+    if _dropped_orphans:
+        logger.error(
+            "[MERGE] ⚠️ 模块骨架缺失(module-defining 子任务未成功) → 剔除引用其的补丁，"
+            "保其余模块交付；缺骨架模块=%s（非模型问题，交付需该模块脚手架落盘）",
+            {d: sids for d, sids in _dropped_orphans.items()},
+        )
 
     # A-P1-26c：传入依赖拓扑序，让 rebase 策略以【上游子任务】为 base（非 hunk 出现序）。
     plan = state.get("plan")
@@ -3226,6 +3371,55 @@ if r.stderr:
                 logger.debug("[VERIFY_L2] 销毁沙箱失败: %s", exc)
 
 
+def _run_reactor_build_in_sandbox(
+    project_path: str,
+    project_id: str,
+    build_cmd: str,
+    *,
+    timeout: int = 600,
+) -> tuple[bool, bool, str]:
+    """在【项目沙箱】(按检测栈版本烤的工具链，见 image_builder._toolchain_install)跑全 reactor 集成
+    编译——治本 round21 的 L2 空气闸：brain host 无需装任何栈/版本，Java8/17/21·Go·Rust·Node 由沙箱
+    镜像各自正确。
+
+    契约：调用前 project_path 工作树【已 apply merged_diff】(run_integration_review 本地 apply)。这里把
+    该已应用工作树 sync 进沙箱后【直接跑 build_cmd】(不再沙箱内 git apply → 规避双重应用/脏基线)。
+    返回 (ran, ok, output)：ran=False = 沙箱不可用/异常 → 交调用方退回本机或 fail-loud。"""
+    if not _sandbox_available():
+        return False, False, ""
+    from pathlib import Path
+
+    from swarm.worker.sandbox import get_sandbox_manager
+
+    cfg = get_config().sandbox
+    workdir = cfg.sandbox_remote_workdir
+    manager = get_sandbox_manager()
+    run_command = getattr(manager, "run_command", None)
+    if run_command is None:
+        return False, False, ""
+    sandbox = None
+    try:
+        sandbox = manager.create(project_id=project_id or None, source="verify_l2_compile")
+        manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+        # 包 echo __RC__$? 取退出码，robust 不依赖 result 对象的 exit_code 字段形态。
+        result = run_command(
+            sandbox, f"cd {workdir} && ({build_cmd}); echo __RC__$?", timeout=timeout
+        )
+        out = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
+        ok = "__RC__0" in out
+        logger.info("[VERIFY_L2] 沙箱集成编译: %s (cmd=%s)", "通过" if ok else "未通过", build_cmd)
+        return True, ok, out[-3000:]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[VERIFY_L2] 沙箱集成编译异常(退回本机/fail-loud): %s", exc)
+        return False, False, ""
+    finally:
+        if sandbox is not None:
+            try:
+                manager.kill(sandbox.sandbox_id)
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug("[VERIFY_L2] 销毁编译沙箱失败: %s", _exc)
+
+
 def _try_l2_sandbox_verify(
     project_id: str,
     merged_diff: str,
@@ -3498,24 +3692,26 @@ async def learn_success(state: BrainState) -> dict:
                 )
                 out_files = files_from_unified_diff(merged_diff)
                 import asyncio as _asyncio
-                import os as _os2
-                # 仅当产出文件【在工作区缺失】时才重新 apply（VERIFY_L2 reset 删了新建文件的场景）。
-                # 若文件已在工作区（worker pull-back 已写入改好的内容），跳过 apply——
-                # 否则对 modify 文件会因"补丁基线已变"冲突报错（task 5dc6e634）。commit 直接收录工作区现状。
-                missing = [f for f in out_files
-                           if not _os2.path.isfile(_os2.path.join(proj_path, f))]
-                if missing:
-                    # D5(b) 治本 round18 P0-C：改用【分文件鲁棒 apply】——一个坏 hunk 令整块 git apply
-                    # 原子失败会连坐回滚全部好文件(~30 个正确 producer 一个没落盘)。resilient 分文件独立
-                    # 落盘，好段照常写入、坏段单独剔除，交付不再被单点坏块清零。
-                    _ap = await _asyncio.to_thread(
-                        lambda: apply_git_diff_resilient(proj_path, merged_diff))
-                    if not _ap.get("ok"):
-                        logger.warning("[LEARN_SUCCESS] commit 前重新 apply(补缺失文件)全失败(非致命): %s",
-                                       _ap.get("failed") or _ap.get("stderr", ""))
-                    elif _ap.get("failed"):
-                        logger.warning("[LEARN_SUCCESS] 分文件落盘：好文件已保留 %d，剔除坏段 %d(交 owner 重修)",
-                                       len(_ap.get("applied") or []), len(_ap.get("failed") or []))
+                # ★治本 round21 Blocker B（全流程推演·post-MERGE 从未触达路径的确定性缺陷）★：
+                # 原逻辑"仅补【磁盘缺失】文件"假设"文件还在=worker pull-back 的改好内容仍在"，但
+                # VERIFY_L2 的 `_reset_worktree_to_head`(integration_review:197 finally) 编译后已把
+                # 【MODIFY 型文件】checkout 回 HEAD(文件仍在、内容=HEAD 原版)→只补缺失会漏掉它们→
+                # 按 HEAD 原样 commit → worker 的修改【静默丢弃】。故不再看"是否缺失"，而是【先把
+                # merged_diff 涉及文件统一 reset 到 HEAD 干净基线，再 resilient apply】——HEAD-relative
+                # 补丁对干净 HEAD 必 apply，new+modify 全部正确落盘，且解决 task 5dc6e634 的"基线已变
+                # 冲突"(reset 已消除 pull-back 脏内容，不再冲突)。
+                from swarm.brain.integration_review import _reset_worktree_to_head
+                await _asyncio.to_thread(_reset_worktree_to_head, proj_path, merged_diff)
+                # D5(b) 治本 round18 P0-C：分文件鲁棒 apply——一个坏 hunk 令整块 git apply 原子失败会
+                # 连坐回滚全部好文件。resilient 分文件独立落盘，好段照常写入、坏段单独剔除。
+                _ap = await _asyncio.to_thread(
+                    lambda: apply_git_diff_resilient(proj_path, merged_diff))
+                if not _ap.get("ok"):
+                    logger.warning("[LEARN_SUCCESS] commit 前 reset+重放 merged_diff 全失败(非致命): %s",
+                                   _ap.get("failed") or _ap.get("stderr", ""))
+                elif _ap.get("failed"):
+                    logger.warning("[LEARN_SUCCESS] 分文件落盘：好文件已保留 %d，剔除坏段 %d(交 owner 重修)",
+                                   len(_ap.get("applied") or []), len(_ap.get("failed") or []))
                 # 通用治本(交付持久化收口)：所有产出文件已落工作区(ground truth)。对账聚合清单
                 # (Maven/Gradle/Cargo/.NET/Go)使其枚举真实存在的成员，并把被修正的清单【纳入本次
                 # commit 文件集】——否则并行子任务 pull-back 整文件覆盖把成员注册冲掉的残留会进入

@@ -40,3 +40,13 @@ workdir/*
 
 # ─── 内部开发日志（本地保留，不入库；GitHub README 用面向用户的版本）──
 DEVLOG.md
+
+# ─── 本地研发资料：界首 / 交接 / 就绪度 / 随跑日志（本地保留，不入库）──
+E2E_*.md
+*_HANDOFF.md
+*_KICKOFF.md
+*_TREATMENT_PLAN.md
+*_READINESS.md
+*_PROGRESS.md
+UPSTREAM_DOWNSTREAM_TREATMENT.md
+logs_archive/

@@ -2288,6 +2288,19 @@ def _is_downstream_coordinator(base: str) -> bool:
     return base.endswith(("Factory", "Registry", "Dispatcher", "Router"))
 
 
+def _is_downstream_consumer(base: str) -> bool:
+    """跨目录【消费者】——依赖(读取/调用)平行 leaf 实现的表现/协调层，须【后建】(归下游末批,
+    readable 含全部 leaf)。含协调者(工厂/注册表/分发/路由) + 表现层(Controller/Endpoint/Resource/
+    Facade/Aggregator/Gateway)。#7 治本：这类若被误当"共享上游类型"归首批→先于 leaf 编译→
+    cannot find symbol。fail-closed：消费者名即便非真消费者，归下游(后建、下游可读全部)也安全；
+    反向(真消费者归上游)必炸。纯命名判据、跨栈通用、不绑 Java/项目名。"""
+    return (
+        _is_downstream_coordinator(base)
+        or base.endswith(("Controller", "Endpoint", "Resource", "Facade",
+                          "Aggregator", "Gateway"))
+    )
+
+
 def _detect_parallel_impls(core: list[str]) -> tuple[list[str], list[str], list[str]] | None:
     """检测【同层平行独立实现家族】(策略/插件模式：N 个兄弟实现共享一个抽象、彼此无编译依赖)。
 
@@ -2337,8 +2350,19 @@ def _detect_parallel_impls(core: list[str]) -> tuple[list[str], list[str], list[
     leaves = list(best_leaves)
     upstream = [f for f in best_files if _is_upstream_shared(_basename_noext(f))]
     downstream = [f for f in best_files if _is_downstream_coordinator(_basename_noext(f))]
-    # 家族目录【外】的其它 core(接口/消息类等共享类型) 也归上游首批(先建,各 leaf 可读)
-    upstream = [f for f in core if f not in fam_dir] + upstream
+    # 家族目录【外】的其它 core 分两类(#7 治本)：① 共享类型(接口/DTO/消息类，leaf 依赖它们)→
+    # 上游首批先建；② 消费者(Controller/工厂等表现协调层，依赖 leaf)→下游末批后建(readable 含全 leaf)。
+    # 原码把②也塞进上游→消费者先于 leaf 编译→cannot find symbol。
+    _extra = [f for f in core if f not in fam_dir]
+    # round21 对抗审计修：共享抽象优先——名字以 Gateway/Resource/Facade 等消费者后缀结尾【但同时是
+    # 接口/Abstract*/Base*/*Support 共享抽象】的类(IPaymentGateway/AbstractGateway/BaseFacade)必须
+    # 归 upstream(leaf 依赖它先建)，绝不能因消费者后缀降到 downstream→leaf fan-out cannot find symbol。
+    _extra_consumers = [f for f in _extra
+                        if _is_downstream_consumer(_basename_noext(f))
+                        and not _is_upstream_shared(_basename_noext(f))]
+    _extra_shared = [f for f in _extra if f not in set(_extra_consumers)]
+    upstream = _extra_shared + upstream
+    downstream = downstream + _extra_consumers
     return leaves, upstream, downstream
 
 
@@ -2499,6 +2523,11 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
         if _up_for_readable:
             _existing_r = list(getattr(child_scope, "readable", []) or [])
             child_scope.readable = list(dict.fromkeys(_existing_r + _up_for_readable))
+            # #12 治本(B fail-closed seed)：记下【哪些 readable 是上游/兄弟产物】(provenance)，
+            # 供 worker bootstrap 判据——这些产物缺失于本地=上游未就绪/被 revert，不空烧交 worker。
+            # 只标 provenance，不改 readable 语义；基线只读上下文不入此集，杜绝误 BLOCKED。
+            _existing_ua = list(getattr(child_scope, "upstream_artifacts", []) or [])
+            child_scope.upstream_artifacts = list(dict.fromkeys(_existing_ua + _up_for_readable))
         files_label = "、".join(p.rsplit("/", 1)[-1] for p, _ in grp)
         child_desc = (
             f"{base_desc}\n\n【按文件分批 · 第 {i + 1}/{n} 批】本子任务是上述父任务按文件分层"

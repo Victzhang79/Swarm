@@ -71,6 +71,22 @@ def validate_plan_structure(
         result.add("计划无子任务")
         return result
 
+    # H1 治本(round21 假绿门)：整 plan 必须至少有一个子任务能【产出改动】(writable ∪ create_files
+    # 非空)。tech_design/plan 返回【空但合法】JSON(file_plan=[])时，所有子任务写 scope 皆空 → 只能
+    # 产空 diff → 在"DONE 零放弃"判据下沿 tech_design→plan→validate→confirm→dispatch 直穿判成功
+    # 交付(空交付假 DONE)。此处确定性 fail-closed 掐断该跨节点假绿链，根本不放空计划下去。
+    _writers = [
+        t for t in plan.subtasks
+        if (getattr(getattr(t, "scope", None), "writable", None)
+            or getattr(getattr(t, "scope", None), "create_files", None))
+    ]
+    if not _writers:
+        result.add(
+            "计划无任何可产出改动的子任务(所有子任务 writable+create_files 皆空)——"
+            "空计划只能产空 diff、会被误判成功交付(空 diff 假 DONE)，拒绝放行"
+        )
+        return result
+
     task_ids = {t.id for t in plan.subtasks}
     subtask_by_id = {t.id: t for t in plan.subtasks}
 

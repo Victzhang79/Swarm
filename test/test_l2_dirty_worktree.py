@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 from swarm.brain.integration_review import (
-    _detect_build_cmd,
+    _detect_build_cmd_generic,
     _reset_worktree_to_head,
     run_integration_review,
 )
@@ -90,16 +90,18 @@ def test_reset_worktree_preserves_unrelated_changes():
         "无关未跟踪文件不应被 clean 掉"
 
 
-def test_detect_build_cmd_skips_when_tool_missing():
-    """pom.xml 存在但本机无 mvn → 返回 None（跳过本机编译，不误判）。"""
+def test_detect_build_cmd_generic_returns_cmd_regardless_of_local_tool():
+    """治本 round21：`_detect_build_cmd_generic` 据构建文件出命令，【不】gate 本机工具可用性——
+    编译在项目沙箱按检测版本工具链跑，本机有没有 mvn 不影响"该不该编译"的判定。返回 None 仅当
+    真无构建文件(纯 docs)。杜绝旧行为"本机无 mvn→None→静默跳过编译→L2 假绿"。"""
     d = tempfile.mkdtemp()
     with open(os.path.join(d, "pom.xml"), "w") as f:
         f.write("<project></project>")
-    cmd = _detect_build_cmd(d)
-    if shutil.which("mvn"):
-        assert cmd and "mvn" in cmd
-    else:
-        assert cmd is None, "本机无 mvn 时应返回 None 而非 mvn 命令"
+    cmd = _detect_build_cmd_generic(d)
+    assert cmd and "mvn" in cmd, "有 pom.xml 即应返回 mvn 编译命令(与本机是否装 mvn 无关)"
+    # 真无构建文件 → None（合理跳过，非降级）
+    d2 = tempfile.mkdtemp()
+    assert _detect_build_cmd_generic(d2) is None
 
 
 def test_reset_worktree_removes_new_file_residue():

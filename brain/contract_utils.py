@@ -27,6 +27,18 @@ def _is_root_pom(rel: str) -> bool:
     return str(rel).replace("\\", "/") == "pom.xml"
 
 
+def _is_pom_file(rel: str) -> bool:
+    """是否为 Maven pom（根或模块 pom，basename == pom.xml）。
+
+    #11(a) 治本：任何 pom 都是【结构性全文件】——两个写者各自整段重写 <modules>/
+    <dependencyManagement>/<dependencies>，union/3-way 合并无法收口（round18 P0-A 根 pom
+    畸形闭标签 / round19 模块 pom 双 <project> 根拼接 → apply 后不可解析、交付死于门口）。
+    故【任何 pom】都须单写者，非首写者一律 demote+依赖 owner（不止根 pom）。不同模块的 pom
+    是不同文件（各有 first_writer），互不干扰——本判据只把"同一个 pom 的多写者"收敛。
+    """
+    return str(rel).replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml"
+
+
 def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool]) -> bool:
     """文件是否已存在于项目 repo 基线（用于区分"聚合修改"vs"新建撞车"）。
 
@@ -280,12 +292,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
                     new_creates.append(f)
                 else:
                     new_writables.append(f)
-            elif _is_root_pom(f):
-                # D1 治本：根 pom 永远【单写者】(收敛唯一 aggregator-owner)。非首写者【一律 demote】
-                # 为 readable + 依赖 owner——不论是否同链/聚合。两份结构重写(<modules>/
-                # <dependencyManagement>)无法安全合并(round18 P0-A)。demote 不丢登记：根 <modules>
-                # 由 reconcile_workspace_manifests 据磁盘 ground-truth 确定性补齐(L1/L2/交付三处)，
-                # dependencyManagement 版本由 D2 reconcile 兜底。owner 侧由规则4 确保登记全部新模块。
+            elif _is_pom_file(f):
+                # D1 治本(#11a 扩展到模块 pom)：任何 pom(根/模块)永远【单写者】(收敛唯一
+                # owner)。非首写者【一律 demote】为 readable + 依赖 owner——不论是否同链/聚合。
+                # 两份【整段结构重写】(<modules>/<dependencyManagement>/<dependencies>)无法安全
+                # 合并(round18 P0-A 根 pom 畸形闭标签 / round19 模块 pom 双 <project> 拼接)。
+                # demote 不丢登记：根 <modules> 由 reconcile_workspace_manifests 据磁盘
+                # ground-truth 补齐(L1/L2/交付三处)，dependencyManagement 版本由 D2 reconcile
+                # 兜底；模块 pom 自身由 owner 一次建全(脚手架职责)。owner 侧由规则4 确保登记全部新模块。
                 demoted.append(f)
                 serialized_ids.add(st.id)  # 获依赖边 → 需清 parallel_groups(不与 owner 同组)
             elif writer is None or _on_same_serial_chain(st.id, writer):

@@ -62,23 +62,38 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str) -> None:
         logger.warning("[L2] reset worktree to HEAD failed (非致命): %s", exc)
 
 
-def _detect_build_cmd(project_path: str) -> str | None:
-    # 检测构建文件 + 对应工具是否【本机实际可用】。L2 全量编译是在本机 project_path 跑，
-    # 若本机没装该工具（如未装 maven），不应因环境缺失而误判 L2 失败——L1 闸门已在沙箱里
-    # 用真实工具链编译验证过。工具不可用时返回 None → L2 跳过本机编译（task fdaa1932）。
-    import shutil
-    if os.path.isfile(os.path.join(project_path, "pom.xml")):
-        return "mvn compile -q -DskipTests" if shutil.which("mvn") else None
-    if os.path.isfile(os.path.join(project_path, "package.json")):
-        return (
-            "npm run build --if-present || npx tsc --noEmit --pretty false 2>/dev/null || true"
-            if shutil.which("npm") else None
-        )
-    if os.path.isfile(os.path.join(project_path, "pyproject.toml")) or os.path.isfile(
-        os.path.join(project_path, "setup.py")
+def _detect_build_cmd_generic(project_path: str) -> str | None:
+    """据构建文件确定【全量编译命令】——**不** gate 本机工具可用性（编译在项目沙箱按检测版本
+    工具链跑；本机是退回路径）。多栈通用。返回 None 仅当【无任何已知构建文件】(如纯 docs)→合理
+    跳过编译，非降级。治本 round21：原 `_detect_build_cmd` 把"本机没装工具"和"没有构建"混为一谈
+    都返 None → L2 静默跳过编译→假绿。现分离二者：有构建文件即返命令，工具在哪跑由调用方决定。"""
+    j = os.path.join
+    if os.path.isfile(j(project_path, "pom.xml")):
+        return "mvn -q -DskipTests compile"
+    if os.path.isfile(j(project_path, "build.gradle")) or os.path.isfile(
+        j(project_path, "build.gradle.kts")
     ):
-        return "python -m compileall -q ." if shutil.which("python") else None
+        return "./gradlew -q compileJava 2>/dev/null || gradle -q compileJava"
+    if os.path.isfile(j(project_path, "go.mod")):
+        return "go build ./..."
+    if os.path.isfile(j(project_path, "Cargo.toml")):
+        return "cargo build -q"
+    if os.path.isfile(j(project_path, "package.json")):
+        return "npm run build --if-present || npx tsc --noEmit --pretty false 2>/dev/null || true"
+    if os.path.isfile(j(project_path, "pyproject.toml")) or os.path.isfile(
+        j(project_path, "setup.py")
+    ):
+        return "python -m compileall -q ."
     return None
+
+
+def _local_tool_available(build_cmd: str) -> bool:
+    """build_cmd 的首个可执行(mvn/go/cargo/npm/python/gradle/./gradlew)是否在【本机】可用。"""
+    import shutil
+    first = (build_cmd or "").strip().split()[0] if build_cmd.strip() else ""
+    if first.startswith("./"):
+        return True  # ./gradlew 等项目内脚本，交由 shell 判定
+    return bool(first) and shutil.which(first) is not None
 
 
 def _run_cmd(project_path: str, cmd: str, *, timeout: int = 300) -> tuple[bool, str]:
@@ -120,9 +135,15 @@ def run_integration_review(
     merged_diff: str,
     shared_contract: dict[str, Any] | None = None,
     *,
-    timeout: int = 300,
+    timeout: int = 600,
+    compile_runner=None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
-    """L2.1 全量编译 + L2.3 契约一致性（确定性）。"""
+    """L2.1 全量编译 + L2.3 契约一致性（确定性）。
+
+    compile_runner(build_cmd) -> (ran: bool, ok: bool, output: str)：可选【沙箱编译器】。给定则优先在
+    项目沙箱(按检测栈版本烤的工具链)跑全 reactor 编译；沙箱不可用退回本机(仅当本机装了该栈工具)。
+    治本 round21：二者都不行 → **fail-loud 拒绝假绿**(不再像旧版本机缺 mvn 就静默跳过编译当通过)。
+    timeout 默认 600s(全 reactor 编译 + 首轮依赖解析,Blocker C)。"""
     details: dict[str, Any] = {"stage": "integration_review"}
     issues: list[str] = []
 
@@ -151,7 +172,7 @@ def run_integration_review(
         return False, issues, details
     details["apply_check"] = True
 
-    build_cmd = _detect_build_cmd(project_path)
+    build_cmd = _detect_build_cmd_generic(project_path)
     details["build_cmd"] = build_cmd
     if build_cmd:
         applied = apply_git_diff(project_path, merged_diff)
@@ -185,19 +206,45 @@ def run_integration_review(
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[integration_review] D2 版本闸门跳过(异常,不致命): %s", _exc)
         try:
-            ok, out = _run_cmd(project_path, build_cmd, timeout=timeout)
-            details["compile_ok"] = ok
-            details["compile_output"] = out
-            if not ok:
-                issues.append(f"L2.1 compile failed: {out[:300]}")
+            # 编译执行：优先【项目沙箱】(按检测栈版本烤的工具链,多栈/多版本自动正确)；沙箱不可用
+            # 退回【本机】(仅当本机装了该栈工具)。治本 round21：二者都不行 → fail-loud 拒绝假绿。
+            ran = False
+            ok = False
+            out = ""
+            if compile_runner is not None:
+                try:
+                    ran, ok, out = compile_runner(build_cmd)
+                except Exception as _cexc:  # noqa: BLE001
+                    logger.warning("[integration_review] 沙箱集成编译异常，尝试本机退回: %s", _cexc)
+                    ran = False
+                if ran:
+                    details["compile_env"] = "sandbox"
+            if not ran and _local_tool_available(build_cmd):
+                ok, out = _run_cmd(project_path, build_cmd, timeout=timeout)
+                ran = True
+                details["compile_env"] = "local"
+            if ran:
+                details["compile_ok"] = ok
+                details["compile_output"] = out
+                if not ok:
+                    issues.append(f"L2.1 集成编译失败: {out[:300]}")
+            else:
+                # 无沙箱 + 本机无该栈工具链 → 无法验证集成编译。绝不假绿放行(round19 死因之一：
+                # 本机缺 mvn→静默跳过编译→L2 假绿→把没编译过的代码当"生产级"交付)。
+                details["compile_ok"] = None
+                details["compile_unverified"] = True
+                issues.append(
+                    "L2 集成编译无法执行(沙箱不可用且本机缺该栈工具链)——拒绝假绿放行；"
+                    "请确保集成验证沙箱/宿主装有目标栈工具链(见 README 运行环境依赖)"
+                )
         finally:
             # R1：限定回滚到 merged_diff 涉及的文件（复用 _reset_worktree_to_head 的 scoped 逻辑：
             # 已跟踪→checkout HEAD，新建→删除），不再用整库 `checkout -- .` + `clean -fd`——
             # 后者会抹掉用户在该项目里无关的未提交改动/未跟踪文件。
             _reset_worktree_to_head(project_path, merged_diff)
     else:
-        details["compile_ok"] = None
-        logger.info("[integration_review] 未检测到构建文件，跳过全量编译")
+        details["compile_ok"] = None  # 真无构建文件(纯 docs/config) → 合理跳过，非降级
+        logger.info("[integration_review] 无构建文件(纯 docs/config)，跳过全量编译")
 
     modified = files_from_unified_diff(merged_diff)
     details["modified_files"] = modified

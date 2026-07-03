@@ -488,6 +488,103 @@ def _is_aggregate_manifest(file_path: str) -> bool:
     )
 
 
+def _is_module_manifest(rel: str) -> bool:
+    """<dir>/<manifest> 是否为【模块骨架清单】(定义一个可构建模块)。跨栈通用：
+    Maven pom.xml / Gradle build.gradle(.kts) / Cargo.toml / Go go.mod / .NET *.csproj 等。
+    与 _is_aggregate_manifest(根聚合清单)区分：此判据认【每模块】的构建清单。"""
+    base = rel.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return (
+        base == "pom.xml"
+        or base in ("build.gradle", "build.gradle.kts")
+        or base == "cargo.toml"
+        or base == "go.mod"
+        or base.endswith((".csproj", ".fsproj", ".vbproj"))
+    )
+
+
+def _diff_target_files(diff: str) -> list[str]:
+    """从 unified diff 抽 b/ 侧目标文件（相对路径，去 a//b/ 前缀）。"""
+    out: list[str] = []
+    for line in (diff or "").splitlines():
+        if line.startswith("+++ "):
+            p = line[4:].strip()
+            if p in ("/dev/null", ""):
+                continue
+            if p.startswith(("a/", "b/")):
+                p = p[2:]
+            out.append(p.replace("\\", "/").lstrip("/"))
+    return out
+
+
+def _top_module_dir(rel: str) -> str | None:
+    """相对路径的顶层模块目录：'ruoyi-alarm/src/..' → 'ruoyi-alarm'；根级文件 → None。"""
+    p = rel.replace("\\", "/").lstrip("/")
+    if "/" not in p:
+        return None
+    return p.split("/", 1)[0]
+
+
+def filter_orphan_module_patches(
+    subtask_diffs: list[tuple[str, str]],
+    base_module_exists,
+) -> tuple[list[tuple[str, str]], dict[str, list[str]]]:
+    """#11(c) MERGE 硬门控：剔除【引用了骨架缺失模块的补丁】。
+
+    module-defining 子任务(建 <dir> 的模块清单)不在成功集时，若仍纳入引用该模块的兄弟补丁
+    (<dir>/src/**)，合并 patch 会有模块目录文件却无该模块骨架 → git apply / reactor 崩
+    (No such file / Child module does not exist)，整包交付死于门口。
+
+    判据：一个顶层模块目录 <dir> 若在本次合并集里有任何补丁触达，但 <dir> 的模块清单
+    (pom.xml/build.gradle/Cargo.toml/go.mod/*.csproj) 【既不在本次合并集、也不在 repo base】
+    → 该 <dir> 骨架缺失 → 剔除 <dir> 下所有补丁(保其余模块正常交付)，显式记原因。
+    根级文件(无模块前缀)永不受影响。返回 (保留的 diffs, {缺失模块: [被剔子任务 id...]})。
+
+    base_module_exists(dir) -> bool：repo base 是否已含该模块骨架清单(历史模块)。
+    base_module_exists is None（round21 对抗审计护栏）＝base 路径不可用(project_id 缺失/store 抛错)，
+    无法区分【骨架缺失孤儿】与【既有模块】→【跳过过滤】(fail-safe：宁可不剔、由 VERIFY_L2/apply
+    护栏兜真问题，也不把既有模块误判孤儿→补丁全剔→误杀交付)。
+    """
+    if base_module_exists is None:
+        return subtask_diffs, {}
+    defined: set[str] = set()       # 本次合并集里骨架落盘的模块
+    referenced: set[str] = set()    # 被任何补丁触达的模块
+    files_by_sid: dict[str, list[str]] = {}
+    for sid, diff in subtask_diffs:
+        files = _diff_target_files(diff)
+        files_by_sid[sid] = files
+        for f in files:
+            d = _top_module_dir(f)
+            if d is None:
+                continue
+            referenced.add(d)
+            if _is_module_manifest(f):
+                defined.add(d)  # <dir>/pom.xml 等 → 骨架落盘
+    orphan_dirs: set[str] = set()
+    for d in referenced:
+        if d in defined:
+            continue
+        try:
+            if base_module_exists(d):
+                continue
+        except Exception:  # noqa: BLE001 —— base 探测失败保守视为不存在(fail-closed)
+            pass
+        orphan_dirs.add(d)
+    if not orphan_dirs:
+        return subtask_diffs, {}
+    filtered: list[tuple[str, str]] = []
+    dropped: dict[str, list[str]] = {}
+    for sid, diff in subtask_diffs:
+        files = files_by_sid.get(sid, [])
+        # 该补丁触达的孤儿模块（补丁全部文件都落在骨架缺失的模块目录 → 整条剔除）
+        hit = {d for f in files if (d := _top_module_dir(f)) in orphan_dirs}
+        if hit and all(_top_module_dir(f) in orphan_dirs for f in files):
+            for d in hit:
+                dropped.setdefault(d, []).append(sid)
+            continue
+        filtered.append((sid, diff))
+    return filtered, dropped
+
+
 def merge_insert_only_changes(
     base: str, *branches: str, allow_anchor_union: bool = False
 ) -> str | None:

@@ -106,6 +106,15 @@ class FileScope(BaseModel):
         default=False,
         description="放行任意路径读写（greenfield/从零创建 或 scope 无法预判时）",
     )
+    upstream_artifacts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "本子任务 readable 里【由上游/兄弟子任务 create_files 传播进来的产物】子集。"
+            "是 readable 的确定性 provenance 标记（区别于基线只读上下文），供 worker "
+            "bootstrap 做 fail-closed：这些产物缺失于本地=上游未就绪/被放弃 revert，"
+            "不把破工作区交 worker 空烧，先判 BLOCKED 等生产者。"
+        ),
+    )
 
     def is_writable(self, path: str) -> bool:
         if self.allow_any:

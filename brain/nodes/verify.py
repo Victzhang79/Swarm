@@ -76,11 +76,20 @@ async def verify_l2(state: BrainState) -> dict:
     if project_path and (merged_diff or "").strip():
         from swarm.brain.integration_review import run_integration_review
 
+        # 治本 round21：L2 全 reactor 编译优先在【项目沙箱】(按检测栈版本烤的工具链)跑——brain host
+        # 无需装 Java/Go/Rust/Node，多栈/多版本自动正确。沙箱不可用则 run_integration_review 退回本机
+        # (仅当本机装了该栈工具)；两者都不行 → fail-loud 拒绝假绿。
+        def _sandbox_compile_runner(build_cmd: str):
+            return nodes._run_reactor_build_in_sandbox(
+                project_path, project_id, build_cmd, timeout=600
+            )
+
         ir_ok, ir_issues, ir_details = run_integration_review(
             project_path,
             merged_diff,
             shared_contract or None,
-            timeout=300,
+            timeout=600,
+            compile_runner=_sandbox_compile_runner,
         )
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         if not ir_ok:

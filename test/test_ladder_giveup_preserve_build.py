@@ -75,7 +75,7 @@ def test_revert_removes_untracked_and_restores_tracked(tmp_path):
 def test_revert_noop_without_git(tmp_path):
     st = _st("st-x", create_files=["a.java"])
     res = _local_tree_revert_subtask(str(tmp_path), st)  # 非 git 仓库
-    assert res == {"reverted": [], "removed": []}
+    assert res == {"reverted": [], "removed": [], "skipped_protected": []}
 
 
 def test_subtask_footprint_union_dedup():

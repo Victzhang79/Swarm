@@ -203,6 +203,13 @@ def _set_workspace(project_id: str) -> None:
         logger.warning("[RUNNER] 设置 workspace 失败: %s", exc)
 
 
+# 进度/产物回写触发节点（on_chain_end）。#8 治本：补上 "elaborate"——PLAN 生成 N 子任务后，
+# ELABORATE 二次拆分把 N 放大(如 35→64)并 `out["plan"]` 回写 state，但原列表漏了 elaborate →
+# subtask_count 分母停在拆分前 N → WebUI 显示 0/N 假分母。_sync_task_from_state 收的是节点 output
+# 增量，dispatch 虽在列表但其 output 不含 "plan" 键，救不回分母；必须在 elaborate 结束即回写。
+_SYNC_ON_NODES = ("analyze", "plan", "elaborate", "merge", "verify_l3", "dispatch")
+
+
 def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
     """将 Brain 状态片段写回 task_records"""
     updates: dict[str, Any] = {}
@@ -366,7 +373,7 @@ async def _stream_brain_events(
         elif kind == "on_chain_end":
             name = event.get("name", "")
             output = (event.get("data") or {}).get("output") or {}
-            if name in ("analyze", "plan", "merge", "verify_l3", "dispatch") and isinstance(output, dict):
+            if name in _SYNC_ON_NODES and isinstance(output, dict):
                 _sync_task_from_state(task_id, output)
             if name in ("merge", "dispatch") and isinstance(output, dict):
                 fresh = store.get_task(task_id) or task_rec
