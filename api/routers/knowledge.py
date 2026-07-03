@@ -366,6 +366,15 @@ def _build_ingest_source(source_type: str, file_paths: list[str], source_config:
     if st == "local":
         if not file_paths:
             raise HTTPException(status_code=400, detail="source_type=local 需提供 file_paths（先调 POST /api/uploads 拿路径）")
+        # P1-17 LFI 防护（同 #5(b) 类）：file_paths 客户端可控，须落在 uploads 内，否则任意
+        # knowledge:write 用户可摄取服务器任意文件。复用 brain 层单一事实源。
+        from swarm.brain.ingest import path_is_within_uploads
+        _bad = [p for p in file_paths if not path_is_within_uploads(p)]
+        if _bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"file_paths 含越界路径（仅接受经 /api/uploads 上传的文件）: {_bad[:5]}",
+            )
         return _MultiLocalSource(file_paths)
     if st == "yuque":
         namespace = (cfg.get("namespace") or "").strip() or None

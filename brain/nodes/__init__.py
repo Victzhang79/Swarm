@@ -2427,7 +2427,12 @@ async def handle_failure(state: BrainState) -> dict:
         failed = list(state.get("failed_subtask_ids", [])) or list(
             (state.get("subtask_results") or {}).keys()
         )
-        failed = failed[:3]
+        # P1-4：旧 `failed[:3]` 硬截断 → 第 4 个起的失败子任务【静默永不重试】（每轮都取同样前 3 个）。
+        # 移除截断：每个子任务由 subtask_retry_counts + max_retries 各自封顶、总量由 recursion_limit
+        # 兜底，无需人为截断；截断只会漏修。>3 时记 warning 保留可观测（契约失败连坐面较宽，可见）。
+        if len(failed) > 3:
+            logger.warning("[HANDLE_FAILURE] 契约失败连坐 %d 个子任务重试（不再静默截断前 3）: %s",
+                           len(failed), failed[:8])
         _max_retries = get_config().model.max_retries  # 默认 2
         _retry_counts = dict(state.get("subtask_retry_counts", {}))
         _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed}

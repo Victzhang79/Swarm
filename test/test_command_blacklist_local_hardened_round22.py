@@ -58,8 +58,11 @@ def test_run_local_blocks_blacklisted():
 
 
 def test_run_local_allows_benign():
+    import tempfile
     build_tools.clear_sandbox_context()
-    out = build_tools._run("echo hello_round22")
+    # 显式传一个存在的 cwd —— 默认 _workspace_root()(=PROJECT_ROOT/workspace) 在 CI runner 上
+    # 不存在会令 subprocess FileNotFoundError（与黑名单无关，纯环境）。
+    out = build_tools._run("echo hello_round22", cwd=tempfile.mkdtemp())
     assert "hello_round22" in out, f"正常命令应正常执行；得到 {out[:80]}"
     print("  ✅ P0-4 本地正常命令不受影响")
 

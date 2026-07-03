@@ -21,7 +21,12 @@ _spec.loader.exec_module(_mod)
 
 
 def _write_sample(tmp_path: Path) -> str:
-    p = tmp_path / "sample.md"
+    # P1-17：KB ingest local 现要求 file_paths 落在 uploads 内（同 #5(b) LFI 防护，反映真实
+    # /api/uploads 契约）。样例写进 uploads 目录而非裸 tmp。
+    from swarm.api.routers.upload import _uploads_root
+    d = _uploads_root() / "test_ingest_round22"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "sample.md"
     p.write_text("# Title\n\nHello world. " * 50, encoding="utf-8")
     return str(p.resolve())
 

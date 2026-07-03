@@ -638,7 +638,9 @@ def _flush_block(
             end_line=start + line_offset + lines_in_chunk,
         ))
         offset += chunk_size - chunk_overlap
-        line_offset += lines_in_chunk
+        # P1-7：单行超长块 lines_in_chunk=0 → line_offset 不递增 → 相邻 chunk 同 (file,start_line)
+        # → uuid5 point ID 相同互相覆盖静默丢块。至少递增 1 保证 start_line 唯一。
+        line_offset += max(lines_in_chunk, 1)
         if offset >= len(text):
             break
 

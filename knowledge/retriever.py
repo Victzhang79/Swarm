@@ -532,8 +532,10 @@ class SwarmRetriever:
         - mistakes / successes 按 similarity 降序
         """
         if context.get("semantic"):
+            # P1-8：cross-encoder 精排写入 rerank_score，须优先按它排序，否则被原始 score 覆盖、
+            # rerank 形同无效。缺 rerank_score（未精排）时回退 score，不回归。
             context["semantic"].sort(
-                key=lambda x: x.get("score", 0.0), reverse=True
+                key=lambda x: x.get("rerank_score", x.get("score", 0.0)), reverse=True
             )
 
         if context.get("norms"):

@@ -27,6 +27,28 @@ router = APIRouter()
 
 
 @router.get("/api/config", tags=["配置"])
+def _is_local_or_private_host(url: str) -> bool:
+    """P1-20：判断 URL host 是否 localhost/私网（这些常用自签名证书，可跳过 TLS 校验）。
+
+    公网 host → 返回 False → 强制校验 TLS，防对云端 provider 的 MITM。无法解析 → 保守 False（强校验）。
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if not host:
+        return False
+    if host in ("localhost",) or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False  # 非 IP 的公网域名 → 强校验
+
+
 async def get_config_endpoint(request: Request):
     """返回当前配置（脱敏 API Key）"""
     _require_user(request)  # A-P0-7：配置读取需鉴权（泄露 provider/路由拓扑）
@@ -74,8 +96,11 @@ async def list_models(request: Request):
         root = base.removesuffix("/v1").removesuffix("/api")
         candidates = [f"{base}/models", f"{root}/v1/models", f"{root}/api/models", f"{root}/api/tags"]
         seen = set()
+        # P1-20：仅对 localhost/私网端点跳过 TLS 校验（本地自签名推理服务常见）；公网端点强制
+        # 校验，杜绝对云端 provider 的 MITM。
+        _verify_tls = not _is_local_or_private_host(base)
         try:
-            async with httpx.AsyncClient(timeout=15, verify=False) as client:
+            async with httpx.AsyncClient(timeout=15, verify=_verify_tls) as client:
                 for ep in candidates:
                     if ep in seen:
                         continue

@@ -95,15 +95,14 @@ def compress_context_log(
         # priority(可能就是 USER)→ USER 被静默逐出，违反"永不丢弃用户需求"契约。
         # 新规则：只在 priority>PRIORITY_USER 的事件里挑最旧的逐出；若没有可逐出者
         # （全是 USER），宁可超预算也 break，绝不动 USER。
-        rest.sort(key=lambda e: (e.get("priority", 3), 0))
-        victim_idx = None
-        for i, e in enumerate(rest):
-            if e.get("priority", PRIORITY_PROCESS) > PRIORITY_USER:
-                victim_idx = i
-                break
-        if victim_idx is None:
+        # P1-11 治本：数字大=价值低（USER=1 最珍贵永不逐出、WORKER=2 产出、PROCESS=3 中间过程）。
+        # 应先逐出【价值最低=priority 数字最大】的最旧事件。旧实现升序取 rest[0]>USER 反而先逐
+        # WORKER(2) 再 PROCESS(3)，方向反了。改：降序(数字大在前)、稳定排序保同级最旧在前。
+        rest.sort(key=lambda e: -e.get("priority", PRIORITY_PROCESS))
+        if rest and rest[0].get("priority", PRIORITY_PROCESS) > PRIORITY_USER:
+            evicted.append(rest.pop(0))
+        else:
             break  # 只剩 USER，拒绝逐出（接受预算溢出）
-        evicted.append(rest.pop(victim_idx))
 
     if evicted:
         chunk = _summarize_events(evicted)

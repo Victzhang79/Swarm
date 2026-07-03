@@ -46,7 +46,7 @@ def main():
         if st != (seen[-1] if seen else None):
             seen.append(st)
             print(f"[poll] status={st} subtasks={comp}/{total}", flush=True)
-        if st in ("DONE", "FAILED", "CANCELLED"):
+        if st in ("DONE", "FAILED", "CANCELLED", "PARTIAL"):  # PARTIAL 也是终态，否则等到超时才退
             print(f"[final] status={st}")
             print(f"[final] has_diff={bool(t.get('merged_diff'))}")
             if t.get("merged_diff"):

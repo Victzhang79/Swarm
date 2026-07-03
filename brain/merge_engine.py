@@ -988,8 +988,10 @@ def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> t
     静默按 success 放行——round16 实测 88 个新文件 `@@ -0,1` + 行尾翻倍空行 → 补丁损坏，却仍
     success=True 蒙混到 VERIFY_L2 才被拦、进而触发全量 replan。此护栏在 MERGE 出口就诚实标注。
 
-    空 diff / 无 git 工作树 → ok=True（无可校验、不误报）；校验器自身异常 → ok=True 但带 detail
-    （不冒充 patch 损坏、不制造假阻断，真正的交付阻断仍由 VERIFY_L2 兜）。
+    空 diff / 无 git 工作树 → ok=True（无可校验、不误报）。P1-2 治本：校验器【自身异常】过去
+    fail-open 返回 ok=True——但 #1(a) 起 `_apply_ok=False` 会升级人工，异常仍 True 等于"校验器崩了
+    却当补丁可 apply"，是纵深漏洞。改 fail-closed：无法完成 apply-check（异常/超时）→ ok=False，
+    宁可升级人工复核，绝不在【无法确认可落盘】时放行。detail 明确区分"未能执行"与"patch 损坏"。
     """
     if not merged_diff.strip():
         return True, ""
@@ -1007,4 +1009,5 @@ def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> t
             return True, ""
         return False, (proc.stderr or proc.stdout or "git apply --check failed").strip()
     except Exception as exc:  # noqa: BLE001
-        return True, f"(apply-check 未能执行: {exc})"
+        # fail-closed：无法执行校验 → 不冒充可 apply（避免 #1(a) escalate 被 fail-open 绕过）。
+        return False, f"apply-check 未能执行(fail-closed，无法确认可落盘): {exc}"
