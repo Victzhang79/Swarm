@@ -444,23 +444,38 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
             _save_dependency_graph, project_id, cg_result.edges
         )
 
+    # P1-25 对账：全量重索引后清除磁盘已不存在文件的残留符号(整文件删除的幽灵符号)。
+    await asyncio.to_thread(_prune_absent_files, project_id, project_path)
+
+    # P1-21：据 cg_result.ok 判终态。成功(含真空项目 0 符号)→ INDEXED；索引失败/部分
+    # (init/index 失败、db 缺失、解析异常)→ DEGRADED，据实反映，不把失败当完成。
+    cg_ok = getattr(cg_result, "ok", True)
     index_stats = {
         "symbols": cg_result.symbol_count,
         "edges": cg_result.edge_count,
         "time_ms": cg_result.time_ms,
+        "ok": cg_ok,
     }
+    if not cg_ok:
+        index_stats["error"] = getattr(cg_result, "error", None)
+    _status = "INDEXED" if cg_ok else "DEGRADED"
+    _msg = (
+        f"Index complete: {cg_result.symbol_count} symbols"
+        if cg_ok
+        else f"Index degraded: {getattr(cg_result, 'error', 'codegraph failed')}"
+    )
     await asyncio.to_thread(
         upsert_progress,
         project_id,
         phase="indexing",
         phase_progress=1.0,
-        message=f"Index complete: {cg_result.symbol_count} symbols",
+        message=_msg,
         index_stats=index_stats,
     )
     await asyncio.to_thread(
         update_project,
         project_id,
-        graph_status="INDEXED",
+        graph_status=_status,
         graph_progress=1.0,
         symbol_count=cg_result.symbol_count,
     )
@@ -561,6 +576,27 @@ async def _phase_embed(
         return {"vector_count": 0, "dim": 0, "skipped": True, "reason": reason}
 
     dim = len(vectors[0]) if vectors else 0
+
+    # P1-9：实际向量维度须与配置维度一致（也是 SemanticIndexer 建集合所用维度）。不符→
+    # fail-closed，标 degraded 跳过 upsert，绝不把错维向量写进共享集合（否则 Qdrant 拒/语义错乱）。
+    from swarm.config.settings import KnowledgeConfig
+    expected_dim = int(getattr(KnowledgeConfig(), "embed_dimension", 1024))
+    if dim and dim != expected_dim:
+        reason = f"embedding dim {dim} != configured {expected_dim}"
+        logger.error(
+            "[EMBED] skipping Qdrant upsert for project %s — %s（换 embedding 模型？"
+            "核对 SWARM_KB_EMBED_DIMENSION）", project_id, reason,
+        )
+        await asyncio.to_thread(
+            upsert_progress,
+            project_id,
+            phase="embedding",
+            phase_progress=1.0,
+            message=f"Embedding skipped: {reason}",
+            embed_stats={"vectors": 0, "dim": dim, "skipped": True, "reason": reason},
+        )
+        await asyncio.sleep(0.1)
+        return {"vector_count": 0, "dim": dim, "skipped": True, "reason": reason}
 
     def _embed_progress_cb(progress: float, message: str) -> None:
         upsert_progress(
@@ -926,8 +962,16 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
             )
             for sym in symbols
         ]
+        fresh_files = sorted({sym.file_path for sym in symbols})
         with sync_pool().connection() as conn:
             with conn.cursor() as cur:
+                # P1-25：本批重新索引的文件【先整体删旧符号，再插 fresh 集】(同事务原子)。
+                # 纯 upsert 只增不删——文件内被删除的符号会残留成幽灵符号；delete-then-insert
+                # 让每个重新索引的文件的符号集权威覆盖，清掉已移除的符号。
+                cur.execute(
+                    "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
+                    (project_id, fresh_files),
+                )
                 cur.executemany(
                     """
                     INSERT INTO kb_symbol_index
@@ -946,6 +990,57 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
                 )
     except Exception as exc:
         logger.warning("Failed to save symbol index: %s", exc)
+
+
+def _prune_absent_files(project_id: str, project_path: str) -> int:
+    """P1-25 对账：删除 kb_symbol_index / kb_dependency_graph 中工作区磁盘已不存在的文件行。
+
+    全量 preprocess 后调用，清理【整文件删除】残留的幽灵符号（delete-then-insert 只覆盖
+    仍产生符号的文件，删掉的文件不在 fresh 集里、需靠磁盘对账清）。
+    fail-closed：只删磁盘【确已不存在】的文件，绝不误伤仍存在的文件行；异常吞掉不阻断预处理。
+    file_path 相对/绝对均可：Path(base)/绝对路径 == 绝对路径，相对则落在项目下。
+    """
+    try:
+        from pathlib import Path
+
+        from swarm.infra.db import sync_pool
+        base = Path(project_path)
+        # fail-closed 破坏范围最小化：project_path 为空/不是现存目录（沙箱未挂载、目录被移走、
+        # 调用方传空/相对路径）时【绝不】对账——否则每个 file_path 都判"不存在"→整表被清空。
+        # 宁可漏清一次(下次正常预处理再对账)，也不能误删权威索引。
+        if not project_path or not base.is_dir():
+            logger.warning(
+                "[preprocess] P1-25 对账跳过：project_path 不是现存目录(%r)，避免误删整表索引",
+                project_path,
+            )
+            return 0
+        with sync_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT file_path FROM kb_symbol_index WHERE project_id = %s",
+                    (project_id,),
+                )
+                indexed = [r[0] for r in cur.fetchall()]
+                absent = [fp for fp in indexed if fp and not (base / fp).exists()]
+                if not absent:
+                    return 0
+                cur.execute(
+                    "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
+                    (project_id, absent),
+                )
+                cur.execute(
+                    "DELETE FROM kb_dependency_graph WHERE project_id = %s "
+                    "AND (source_file = ANY(%s) OR target_file = ANY(%s))",
+                    (project_id, absent, absent),
+                )
+        logger.info(
+            "[preprocess] P1-25 对账：从符号索引清除 %d 个磁盘已不存在的文件 (project=%s)",
+            len(absent), project_id,
+        )
+        return len(absent)
+    except Exception as exc:
+        logger.warning("Failed to prune absent files from symbol index: %s", exc)
+        return 0
 
 
 def _save_dependency_graph(project_id: str, edges: list) -> None:
@@ -1054,7 +1149,8 @@ def _embed_texts(texts: list[str]) -> list[list[float]] | None:
     优先级：专用 embed 服务(SWARM_KB_EMBED_BASE_URL) → sentence-transformers →
     本地 LLM 网关 → SiliconFlow。专用服务最稳(真 bge-m3,归一化向量)，放第一位。
     """
-    dim = 1024  # bge-m3 维度
+    from swarm.config.settings import KnowledgeConfig
+    dim = int(getattr(KnowledgeConfig(), "embed_dimension", 1024))  # 单一来源(bge-m3=1024)
 
     # 尝试 0: 专用 embedding 服务（统一客户端，OpenAI 兼容 /embeddings，ai.bit:8082）
     try:

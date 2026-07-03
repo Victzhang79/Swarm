@@ -101,13 +101,19 @@ class CodegraphEdge:
 
 @dataclass
 class CodegraphResult:
-    """索引结果"""
+    """索引结果。
+
+    P1-21：ok/error 区分【成功但空项目】(ok=True, 0 符号) 与【索引失败/部分】(ok=False)。
+    先前失败分支返回裸 CodegraphResult()(0 符号无标记)，与真空项目不可分 → 上游误标 INDEXED。
+    """
     symbols: list[CodegraphSymbol] = field(default_factory=list)
     edges: list[CodegraphEdge] = field(default_factory=list)
     symbol_count: int = 0
     edge_count: int = 0
     time_ms: int = 0
     db_path: str | None = None
+    ok: bool = True
+    error: str | None = None
 
 
 def is_codegraph_installed() -> bool:
@@ -201,19 +207,23 @@ def run_codegraph_full(project_path: str) -> CodegraphResult:
         init_result = run_codegraph_init(project_path)
         if init_result.returncode != 0:
             logger.error("codegraph init failed: %s", init_result.stderr)
-            return CodegraphResult()
+            return CodegraphResult(ok=False, error=f"init failed: {init_result.stderr[:500]}")
     else:
         index_result = run_codegraph_index(project_path)
         if index_result.returncode != 0:
             logger.error("codegraph index/sync failed: %s", index_result.stderr)
-            return CodegraphResult()
+            return CodegraphResult(
+                ok=False, error=f"index/sync failed: {index_result.stderr[:500]}"
+            )
 
     elapsed_ms = int((_time.monotonic() - t0) * 1000)
 
     db_path = find_codegraph_db(project_path)
     if db_path is None:
         logger.warning("codegraph database not found under %s", cg_dir)
-        return CodegraphResult(time_ms=elapsed_ms)
+        return CodegraphResult(
+            time_ms=elapsed_ms, ok=False, error="codegraph database not found after indexing"
+        )
 
     result = parse_codegraph_db(str(db_path))
     result.time_ms = elapsed_ms
@@ -225,6 +235,7 @@ def parse_codegraph_db(db_path: str) -> CodegraphResult:
     """解析 codegraph SQLite 数据库"""
     symbols: list[CodegraphSymbol] = []
     edges: list[CodegraphEdge] = []
+    parse_error: str | None = None
 
     try:
         conn = sqlite3.connect(db_path)
@@ -245,7 +256,9 @@ def parse_codegraph_db(db_path: str) -> CodegraphResult:
 
         conn.close()
     except sqlite3.Error as exc:
+        # P1-21：解析失败 → ok=False，避免部分/空结果被上游误标 INDEXED。
         logger.error("Failed to parse codegraph db %s: %s", db_path, exc)
+        parse_error = f"db parse failed: {exc}"
 
     return CodegraphResult(
         symbols=symbols,
@@ -253,6 +266,8 @@ def parse_codegraph_db(db_path: str) -> CodegraphResult:
         symbol_count=len(symbols),
         edge_count=len(edges),
         db_path=db_path,
+        ok=parse_error is None,
+        error=parse_error,
     )
 
 

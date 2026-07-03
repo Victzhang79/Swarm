@@ -26,11 +26,13 @@ from swarm.api._shared import (
 router = APIRouter()
 
 
-@router.get("/api/config", tags=["配置"])
 def _is_local_or_private_host(url: str) -> bool:
     """P1-20：判断 URL host 是否 localhost/私网（这些常用自签名证书，可跳过 TLS 校验）。
 
     公网 host → 返回 False → 强制校验 TLS，防对云端 provider 的 MITM。无法解析 → 保守 False（强校验）。
+
+    ⚠️ 本函数是普通辅助函数，【绝不能】置于任何 @router.* 装饰器之下——否则装饰器会误绑到它、
+    顶掉紧随其后的真实端点并绕过其鉴权（曾发生的 P0 回归）。放在装饰器上方。
     """
     import ipaddress
     from urllib.parse import urlparse
@@ -49,6 +51,7 @@ def _is_local_or_private_host(url: str) -> bool:
         return False  # 非 IP 的公网域名 → 强校验
 
 
+@router.get("/api/config", tags=["配置"])
 async def get_config_endpoint(request: Request):
     """返回当前配置（脱敏 API Key）"""
     _require_user(request)  # A-P0-7：配置读取需鉴权（泄露 provider/路由拓扑）

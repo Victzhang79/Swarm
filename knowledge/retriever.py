@@ -444,6 +444,12 @@ class SwarmRetriever:
                 seen_ids.add(rid)
                 deduped.append(r)
 
+        # P1-10：语义相似度阈值过滤（兑现 semantic_score_threshold 配置语义："向量相似度
+        # 低于此值丢弃，0=不过滤"）。按原始向量相似度 score 判（rerank 前的召回信号）。
+        threshold = float(getattr(self._kb_config, "semantic_score_threshold", 0.0) or 0.0)
+        if threshold > 0.0:
+            deduped = [r for r in deduped if float(r.get("score", 0.0) or 0.0) >= threshold]
+
         return deduped
 
     async def _retrieve_layer_c(

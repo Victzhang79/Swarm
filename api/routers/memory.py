@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 
 import swarm.api.app as _app
 from swarm.api._shared import (
-    _EMBEDDING_ZERO,
     _profile_storage_key,
     _require_perm,
 )
@@ -96,25 +95,40 @@ async def list_mistakes(project_id: str, request: Request):
 
 @router.post("/api/projects/{project_id}/memories/mistakes", tags=["记忆"])
 async def create_mistake(project_id: str, request: Request, req: MistakeCreateRequest):
-    """添加错题"""
+    """添加错题。
+
+    P1-14：经 MemoryStore.write_mistake 写入（内部 embed 真向量 + 零向量守卫），
+    不再裸插零向量占位（否则永远无法被语义召回、服务恢复也召不回）。
+    embedding 服务不可用(返回 -1)时 fail-closed 503，不静默写不可召回的垃圾行。
+    """
     _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
-    def _insert():
-        with _app._get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO mem_mistakes "
-                    "(project_id, task_id, error_type, description, context, fix_description, embedding) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                    (project_id, req.task_id or "", req.error_type, req.description,
-                     req.context, req.fix_description, _EMBEDDING_ZERO),
-                )
-                row = cur.fetchone()
-                return {"id": row[0]}
+    from swarm.memory.store import MemoryStore, MistakeEntry
 
-    return await loop.run_in_executor(None, _insert)
+    store = MemoryStore()
+    await store.connect()
+    try:
+        mid = await store.write_mistake(
+            project_id,
+            MistakeEntry(
+                error_type=req.error_type,
+                description=req.description,
+                context=req.context,
+                fix_description=req.fix_description,
+                task_id=req.task_id or "",  # mem_mistakes.task_id NOT NULL（沿用原端点空串）
+            ),
+        )
+    finally:
+        await store.close()
+
+    if mid == -1:
+        raise HTTPException(
+            status_code=503,
+            detail="embedding 服务不可用，错题未持久化（避免写入不可语义召回的占位行）；请稍后重试",
+        )
+    return {"id": mid}
 
 
 @router.get("/api/projects/{project_id}/memories/health", tags=["记忆"])
@@ -211,25 +225,39 @@ async def list_successes(project_id: str, request: Request):
 
 @router.post("/api/projects/{project_id}/memories/successes", tags=["记忆"])
 async def create_success(project_id: str, request: Request, req: SuccessCreateRequest):
-    """添加成功模式"""
+    """添加成功模式。
+
+    P1-14：经 MemoryStore.write_success 写入（内部 embed 真向量 + 零向量守卫），
+    不再裸插零向量占位。embedding 不可用(返回 -1)时 fail-closed 503。
+    """
     _require_perm(request, "memory:write", project_id)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _app._validate_project, project_id)
 
-    def _insert():
-        with _app._get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO mem_successes "
-                    "(project_id, task_id, pattern_name, description, approach, applicable_when, embedding) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                    (project_id, req.task_id or "", req.pattern_name, req.description,
-                     req.approach, req.applicable_when, _EMBEDDING_ZERO),
-                )
-                row = cur.fetchone()
-                return {"id": row[0]}
+    from swarm.memory.store import MemoryStore, SuccessEntry
 
-    return await loop.run_in_executor(None, _insert)
+    store = MemoryStore()
+    await store.connect()
+    try:
+        sid = await store.write_success(
+            project_id,
+            SuccessEntry(
+                pattern_name=req.pattern_name,
+                description=req.description or "",
+                approach=req.approach,
+                applicable_when=req.applicable_when,
+                task_id=req.task_id or "",  # mem_successes.task_id NOT NULL（沿用原端点空串）
+            ),
+        )
+    finally:
+        await store.close()
+
+    if sid == -1:
+        raise HTTPException(
+            status_code=503,
+            detail="embedding 服务不可用，成功模式未持久化（避免写入不可语义召回的占位行）；请稍后重试",
+        )
+    return {"id": sid}
 
 
 @router.delete("/api/projects/{project_id}/memories/successes/{sid}", tags=["记忆"])

@@ -550,6 +550,7 @@ class KnowledgeConfig(BaseSettings):
     rerank_top_k: int = 5
     # 检索调优（局域网 embed/rerank 服务，调用便宜但仍按需控量）
     embed_batch_size: int = 32           # 服务端 batch 上限（bge-m3=32），分批避 422
+    embed_dimension: int = 1024          # 向量维度（bge-m3=1024）——建 Qdrant 集合与写入前校验的单一来源
     rerank_score_threshold: float = 0.0  # rerank 分数低于此值的结果丢弃（0=不过滤）
     semantic_score_threshold: float = 0.0  # 向量相似度低于此值丢弃（0=不过滤）
     priority_file_top_k: int = 3         # priority 文件内每个取几条

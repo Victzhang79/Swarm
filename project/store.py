@@ -272,6 +272,7 @@ def create_project(
                 ON CONFLICT (path) DO UPDATE SET
                     name = EXCLUDED.name,
                     description = EXCLUDED.description,
+                    config = COALESCE(projects.config, '{}'::jsonb) || COALESCE(EXCLUDED.config, '{}'::jsonb),
                     updated_at = NOW()
                 RETURNING id, name, path, description, status, graph_status,
                           graph_progress, graph_error, file_count, symbol_count,
@@ -280,7 +281,18 @@ def create_project(
                 (project_id, name, path, description, Jsonb(config or {})),
             )
             row = cur.fetchone()
-    return _row_to_project(row)
+    result = _row_to_project(row)
+    # P1-23：path 是自然键——冲突时既存行的 id 无法重指（改 PK 会破坏 FK 引用），
+    # 返回既存 id。但调用方传的新 id 被替换是重要事实，须可观测（不静默丢）。
+    # config 已在 DO UPDATE 中 jsonb 并集合并（顶层键：新值覆盖同名、既存键保留）——
+    # 不再静默丢弃调用方新 config。注：|| 是【浅合并】，同名顶层键下的嵌套对象整体替换。
+    if result["id"] != project_id:
+        logger.warning(
+            "[project] create_project: path=%s 已存在(既存 id=%s)，传入的新 id=%s 被忽略、"
+            "复用既存项目；config 已并集合并（未丢弃调用方新值）。",
+            path, result["id"], project_id,
+        )
+    return result
 
 
 def get_project(project_id: str, conn_str: str | None = None) -> dict[str, Any] | None:

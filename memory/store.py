@@ -535,6 +535,7 @@ class MemoryStore:
                        occurrence_count, last_seen_at, {eff} AS effective_weight
                 FROM mem_mistakes
                 WHERE project_id = %s AND decay_weight > %s
+                  AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed', 'merged')
                 ORDER BY decay_weight DESC
                 """,
                 (L5_DECAY_FACTOR, as_of, project_id, min_weight),
@@ -759,6 +760,7 @@ class MemoryStore:
                        reuse_count, last_used_at, {eff} AS effective_weight
                 FROM mem_successes
                 WHERE project_id = %s AND decay_weight > %s
+                  AND COALESCE(metadata_json->>'status', '') NOT IN ('archived', 'dismissed', 'merged')
                 ORDER BY decay_weight DESC
                 """,
                 (L6_DECAY_FACTOR, as_of, project_id, min_weight),

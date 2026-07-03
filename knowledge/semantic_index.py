@@ -28,6 +28,11 @@ BGE_M3_DIMENSION = 1024
 class EmbeddingUnavailableError(RuntimeError):
     """embedding 服务不可用（返回零向量占位）→ 拒绝写入，避免污染检索/误删旧 chunk。"""
 
+
+class EmbeddingDimensionMismatchError(RuntimeError):
+    """P1-9：embedding 实际维度与配置/集合维度不符（如换了 embedding 模型）→ 拒绝写入，
+    避免写入维度错误的向量（Qdrant 会拒或语义错乱），fail-closed。"""
+
 # Qdrant payload 索引版本（12.4）：标记 payload 形态版本，便于排查"首次增量更新后
 # 向量库内容形态变化"。预处理全量(CodeGraph 符号嵌入)与增量(SemanticIndexer 语义分块)
 # 两条路径写入形态不同，靠 index_source 区分、index_version 标版本。
@@ -87,6 +92,8 @@ class SemanticIndexer:
         self._kb_config = kb_config or KnowledgeConfig()
         self._client: AsyncQdrantClient | None = None
         self._collection_name = self._db_config.qdrant_collection
+        # P1-9：向量维度单一来源（配置读取，默认 bge-m3=1024）。建集合与写入前校验共用。
+        self._dim = int(getattr(self._kb_config, "embed_dimension", BGE_M3_DIMENSION))
         # 占位 embedding 函数 — 实际部署时替换为真实模型调用
         self._embed_fn = self._default_embed
 
@@ -116,7 +123,7 @@ class SemanticIndexer:
             await self._client.create_collection(
                 collection_name=self._collection_name,
                 vectors_config=VectorParams(
-                    size=BGE_M3_DIMENSION,
+                    size=self._dim,
                     distance=Distance.COSINE,
                 ),
             )
@@ -292,6 +299,15 @@ class SemanticIndexer:
             if any(not any(v) for v in vectors):
                 raise EmbeddingUnavailableError(
                     "embedding 服务返回零向量占位，拒绝写入 Qdrant（避免污染检索/误删旧 chunk）"
+                )
+
+            # P1-9：维度校验——换 embedding 模型导致维度与集合不符时 fail-closed，
+            # 不写入错维向量（否则 Qdrant 拒或语义错乱）。
+            bad = next((len(v) for v in vectors if len(v) != self._dim), None)
+            if bad is not None:
+                raise EmbeddingDimensionMismatchError(
+                    f"embedding 维度 {bad} 与配置/集合维度 {self._dim} 不符，拒绝写入 Qdrant；"
+                    "请核对 embedding 模型与 SWARM_KB_EMBED_DIMENSION 配置"
                 )
 
             points = []

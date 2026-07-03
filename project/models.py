@@ -25,10 +25,11 @@ class ProjectStatus(str, Enum):
 
 class GraphStatus(str, Enum):
     """CodeGraph 索引状态"""
-    NONE = "NONE"        # 未索引
+    NONE = "NONE"          # 未索引
     INDEXING = "INDEXING"  # 正在索引
-    INDEXED = "INDEXED"   # 索引完成
-    ERROR = "ERROR"       # 索引失败
+    INDEXED = "INDEXED"    # 索引完成
+    DEGRADED = "DEGRADED"  # P1-21：索引失败/部分(init/index 失败、db 缺失、解析异常)，结果不可信但流程未崩
+    ERROR = "ERROR"        # 索引失败（异常终止）
 
 
 # ──────────────────────────────────────────────
