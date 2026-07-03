@@ -136,6 +136,13 @@ def _has_shell_injection(command: str) -> tuple[bool, str]:
 
 def _run_local(command: str, cwd: Path | None = None, timeout: int = 120) -> str:
     """本地执行 shell 命令"""
+    # P0-4：本地执行路径过去完全绕过命令黑名单（黑名单只在 sandbox.run_command 强制）。
+    # 无沙箱时 worker 命令落宿主机 shell=True 执行、又无沙箱隔离兜底 → 必须在此统一拦截。
+    # 用 hardened 入口（异常回退基线，#1(b) 同源），命中即拒绝执行、绝不落 subprocess。
+    from swarm.config import command_blacklist_store
+    _allowed, _reason = command_blacklist_store.check_command_hardened(command)
+    if not _allowed:
+        return f"❌ 命令被安全黑名单拦截（{_reason}）— 未执行"
     try:
         cfg = _worker_config()
         effective_timeout = min(timeout, cfg.max_execution_time)

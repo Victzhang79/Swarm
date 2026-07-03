@@ -13,10 +13,12 @@ SUCCESS_WRITE_MIN_COMPLEXITY = {Complexity.MEDIUM, Complexity.COMPLEX, Complexit
 
 
 def should_write_success(state: BrainState) -> bool:
-    # A-P1-05：部分交付(abandoned_subtask_ids 非空)= 任务【未完成】(终态 PARTIAL)，
-    # 绝不能把它当"成功模式"写进 L6——否则会把"放弃了若干子任务"的残缺执行提炼成
-    # 可复用成功经验，污染知识库并误导后续任务复用。单一事实源在此收口。
-    if state.get("abandoned_subtask_ids"):
+    # A-P1-05 / #3 round22：部分交付= 任务【未完成】(终态 PARTIAL)，绝不能把它当"成功模式"
+    # 写进 L6——否则会把"放弃了若干子任务"的残缺执行提炼成可复用成功经验，污染知识库。
+    # 单一事实源 is_partial_delivery = abandoned ∪ give_up（原只看 abandoned 漏 give_up →
+    # give_up-only PARTIAL 穿透此门被学成成功模式 + reuse_count++ 自毒化）。
+    from swarm.brain.gates import is_partial_delivery
+    if is_partial_delivery(state):
         return False
 
     # TD2606-C10：降级交付（degraded_reasons 非空：L2 未真测 l2_no_test_executed / ASSESS 跳过 /

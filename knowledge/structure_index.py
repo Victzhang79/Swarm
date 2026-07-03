@@ -439,6 +439,20 @@ class StructureIndexer:
 
     # ── 删除 ────────────────────────────────────
 
+    async def delete_symbols_by_file(self, project_id: str, file_path: str) -> None:
+        """#4(a)：删除某文件在符号表中的现有符号（增量 MODIFIED 前的 per-file 对账）。
+
+        upsert_symbols_batch 是纯 INSERT ON CONFLICT UPDATE，文件被改后某符号被删除时旧行永不清
+        → 幽灵符号累积、检索单调劣化。索引前先删本文件符号，实现 delete-then-insert（与
+        delete_outgoing_dependencies 的出边对账同构）。仅清 kb_symbol_index，不动 file/依赖行。
+        """
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = %s",
+                (project_id, file_path),
+            )
+
     async def delete_file(self, project_id: str, file_path: str) -> None:
         """删除文件及相关符号和依赖"""
         conn = self._conn_or_raise()

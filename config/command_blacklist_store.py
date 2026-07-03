@@ -181,6 +181,32 @@ def check_command(command: str, conn_str: str | None = None) -> tuple[bool, str]
     return True, ""
 
 
+def _baseline_check(command: str) -> tuple[bool, str]:
+    """仅用内置默认基线匹配（DB 无关，绝不放行已知危险模式）。"""
+    for _rid, pat, desc in _compile_default_rules():
+        try:
+            if re.search(pat, command):
+                return False, desc or pat
+        except re.error:
+            continue
+    return True, ""
+
+
+def check_command_hardened(command: str, conn_str: str | None = None) -> tuple[bool, str]:
+    """check_command 的 fail-closed 包装：#1(b) 治本。
+
+    check_command 内部对 DB 故障已回退基线，但调用方过去用 `except: allowed=True` 把【任何异常】
+    （import 失败/罕见错误）无条件放行 → rm -rf / 可漏网。这里统一：正常委托 check_command，
+    任何异常回退【内置基线】匹配，绝不无条件放行已知危险命令。P0-4/本地执行也复用此入口。
+    """
+    if not command:
+        return True, ""
+    try:
+        return check_command(command, conn_str)
+    except Exception:  # noqa: BLE001
+        return _baseline_check(command)
+
+
 def set_rule_enabled(rule_id: int, enabled: bool, conn_str: str | None = None) -> None:
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:

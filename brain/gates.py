@@ -21,6 +21,23 @@ from __future__ import annotations
 from typing import Any
 
 
+def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
+    """部分交付的子任务 ID（单一事实源，去重保序）。
+
+    终态 PARTIAL 判据 = abandoned（重试耗尽连坐放弃）∪ give_up（阶梯三保 build 放弃：
+    本地树已清/打桩）。runner 落库、learn 侧 outcome/L6 门槛、统计三处必须同口径读此函数，
+    杜绝历史上"learn 侧只看 abandoned 漏 give_up → give_up-only PARTIAL 被学成成功模式"。
+    """
+    _abandoned = state.get("abandoned_subtask_ids") or []
+    _given_up = state.get("give_up_isolated_ids") or []
+    return sorted(set(_abandoned) | set(_given_up))
+
+
+def is_partial_delivery(state: dict[str, Any]) -> bool:
+    """终态是否为部分交付（PARTIAL）。见 partial_delivery_ids。"""
+    return bool(partial_delivery_ids(state))
+
+
 def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
     """CONFIRM 阶段：auto_accept 是否可放行此计划。
 

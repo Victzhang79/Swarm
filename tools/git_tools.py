@@ -28,7 +28,10 @@ def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
     if sandbox is not None:
         cmd = "git " + " ".join(shlex.quote(a) for a in args)
         raw = _run_in_sandbox(cmd, timeout=60)
-        rc = 0 if "sandbox exit code 0" in raw else 1
+        # _run_in_sandbox 两条路径的成功串首行都以 ✅ 开头：主路径 "✅ (sandbox 0)"、
+        # 旧 Jupyter 兜底 "✅ (sandbox exit code 0)"；失败/infra-fail 首行以 ❌ 开头。
+        # 旧判据只认 "sandbox exit code 0" → 主路径成功恒误判 rc=1（degrade git 工具）。
+        rc = 0 if raw.lstrip().startswith("✅") else 1
         if "\n" in raw:
             output = raw.split("\n", 1)[1]
         else:

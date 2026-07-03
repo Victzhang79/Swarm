@@ -98,9 +98,12 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
 
     parsed = dict(parsed)
     parsed.setdefault("source", "learn_success")
-    # A-P1-05：部分交付(放弃了子任务)= 终态 PARTIAL，L2 摘要如实记 outcome=partial，
+    # A-P1-05 / #3 round22：部分交付(放弃了子任务)= 终态 PARTIAL，L2 摘要如实记 outcome=partial，
     # 不得标 success；should_write_success 已同源拦下 L6 成功模式的写入。
-    _outcome = "partial" if state.get("abandoned_subtask_ids") else "success"
+    # 单一事实源 is_partial_delivery = abandoned ∪ give_up（原只看 abandoned 漏 give_up →
+    # give_up-only PARTIAL 被误记 outcome=success）。
+    from swarm.brain.gates import is_partial_delivery
+    _outcome = "partial" if is_partial_delivery(state) else "success"
     l2 = build_l2_summary(state, outcome=_outcome, parsed=parsed)
     success_payload = build_success_payload(state, parsed)
 

@@ -827,11 +827,10 @@ class SandboxManager:
         # db 不可用时 fail-open（check_command 内部处理），不阻断业务——真正安全边界是
         # CubeSandbox 沙箱隔离（已实测：非 root / 网络封锁 / 资源限额）。
         if not _skip_blacklist:
-            try:
-                from swarm.config import command_blacklist_store
-                allowed, reason = command_blacklist_store.check_command(command)
-            except Exception:  # noqa: BLE001
-                allowed, reason = True, ""
+            # #1(b) fail-closed：用 hardened 入口——异常回退内置基线，绝不无条件放行
+            # （旧 `except: allowed=True` 会把 import 失败/罕见异常下的 rm -rf / 也放行）。
+            from swarm.config import command_blacklist_store
+            allowed, reason = command_blacklist_store.check_command_hardened(command)
             if not allowed:
                 logger.warning("[A2] 命令被黑名单拦截 sid=%s reason=%s cmd=%s", sid, reason, command[:120])
                 try:

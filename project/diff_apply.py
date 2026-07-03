@@ -11,6 +11,25 @@ from pathlib import Path
 from typing import Any
 
 
+def _rel_within_root(root: Path, rel: str) -> bool:
+    """P0-3：相对路径 resolve 后是否落在 root 内（防 diff 里 `../` 逃逸出工作区）。
+
+    自研快照/回滚链路独立于 git（git apply 自身对 ../ 有防护），故 备份/恢复/删除 前必须各自
+    复核归属，否则 diff 含 `../` 可读写删工作区外文件。fail-closed：无法判定一律判否。
+    """
+    try:
+        (root.resolve() / rel).resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def diff_paths_escape_root(project_path: str, diff: str) -> list[str]:
+    """返回 diff 中越界（逃出 project_path）的路径列表；空=全部合法。供 apply 前 fail-closed 预检。"""
+    root = Path(project_path)
+    return [rel for rel in files_from_unified_diff(diff) if not _rel_within_root(root, rel)]
+
+
 def files_from_unified_diff(diff: str) -> list[str]:
     """从 unified diff 提取变更文件路径（去重，保持顺序）。
 
@@ -54,6 +73,9 @@ def snapshot_files(project_path: str, files: list[str]) -> dict[str, Any]:
     root = Path(project_path)
     entries: dict[str, dict[str, Any]] = {}
     for rel in files:
+        # P0-3：越界路径绝不备份（防 diff `../` 让快照读工作区外文件）。
+        if not _rel_within_root(root, rel):
+            continue
         src = root / rel
         if src.is_file():
             dst = Path(backup_dir) / rel
@@ -81,6 +103,9 @@ def restore_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     root = Path(snapshot["project_path"])
     restored, deleted, failed = 0, 0, 0
     for rel, info in snapshot["entries"].items():
+        # P0-3：越界路径绝不 copy/unlink（防恶意/畸形快照回滚阶段删写工作区外真实文件）。
+        if not _rel_within_root(root, rel):
+            continue
         target = root / rel
         try:
             if info["existed"] and info.get("backup"):
@@ -119,6 +144,13 @@ def apply_git_diff(
     """
     if not diff.strip():
         return {"ok": False, "stage": "input", "stderr": "empty diff"}
+
+    # P0-3 fail-closed：apply 前预检 diff 所有目标路径落在 project_path 内，任一越界即整份拒绝
+    # （防 `../` 逃逸写工作区外；git apply 自身有防护，此为纵深 + 让越界诊断可见）。
+    _escaped = diff_paths_escape_root(project_path, diff)
+    if _escaped:
+        return {"ok": False, "stage": "boundary",
+                "stderr": f"diff 含越界路径(逃出工作区)，fail-closed 拒绝: {_escaped[:5]}"}
 
     # 关键(task bce82e96)：git apply 要求 patch 文件【以换行结尾】，否则最后一行 hunk 被判
     # "corrupt patch at line N"（末行截断）。worker git diff 经 rstrip("\n") 后末尾无换行，
@@ -232,6 +264,12 @@ def apply_git_diff_resilient(project_path: str, diff: str) -> dict[str, Any]:
     """
     if not diff.strip():
         return {"ok": False, "stage": "input", "stderr": "empty diff", "applied": [], "failed": []}
+
+    # P0-3 fail-closed：分文件 apply 前先整份预检，任一越界即整份拒绝（不逐段落盘越界文件）。
+    _escaped = diff_paths_escape_root(project_path, diff)
+    if _escaped:
+        return {"ok": False, "stage": "boundary", "applied": [], "failed": [],
+                "stderr": f"diff 含越界路径(逃出工作区)，fail-closed 拒绝: {_escaped[:5]}"}
 
     # 快路径：整块原子 apply 成功即最优
     whole = apply_git_diff(project_path, diff, check_only=False)

@@ -32,6 +32,10 @@ async def ingest(state: BrainState) -> dict:
         return {}
 
     uploaded = state.get("uploaded_files") or []
+    # #5(b) LFI 说明：untrusted 边界是 create_task（唯一接收客户端 uploaded_files 的 API 入口，
+    # 已在那里 fail-closed 复核 uploads 归属；retry 复用原已校验路径）。ingest_node 是内部节点，
+    # 设计上可摄取本地路径（单元/程序化调用），此处【不再】硬过滤，避免误伤合法本地文件摄取——
+    # 信任边界应设在不可信输入的入口，而非内部节点。
     if not uploaded:
         # 无上传文件 → no-op 直通（纯文字任务零影响）
         return {"ingest_done": True}

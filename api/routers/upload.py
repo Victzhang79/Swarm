@@ -54,6 +54,11 @@ def _uploads_root() -> Path:
     return root
 
 
+# #5(b) LFI 防护 helper 的单一事实源在 brain 层（避免 brain→api 反向依赖），此处 re-export
+# 供上传/建任务端点与测试沿用同一判据。
+from swarm.brain.ingest import path_is_within_uploads  # noqa: E402,F401
+
+
 def _sanitize_filename(name: str) -> str:
     """清洗文件名：去路径成分、替换危险字符，防 ../ 穿越。"""
     # 只取最后的文件名部分（去掉任何路径）

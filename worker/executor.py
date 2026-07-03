@@ -1111,6 +1111,15 @@ class WorkerExecutor:
                         extra_writable_paths=set(self._repaired_extra_paths),
                     )
                     l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
+                    # #1(c) 可观测：Phase-4 的 LLM 自检 pipeline 若 blocked，det_ok=True 仍据【本阶段
+                    # 刚跑的确定性闸门】(=run_l1_pipeline(llm=None)，同口径 compile/lint/test/scope)
+                    # 判 PASS——这是设计正确（确定性证据独立成立、evaluate_l1:384 视 None 为不反对），
+                    # 但过去 blocked 被静默吞掉。此处显式记录，杜绝"看似双证据、实为单证据"的隐形降级。
+                    if llm_details.get("pipeline_blocked"):
+                        self._log(
+                            "L1 自检 pipeline blocked（det_ok=%s，据确定性闸门裁决，LLM 自检未增值）"
+                            % det_ok
+                        )
 
                 # 单一仲裁器裁决。prior=循环内结论；翻盘仅限 prior 为可翻盘来源
                 # （empty_diff_transient / llm_self_report）且非 sticky。编译/lint/scope/

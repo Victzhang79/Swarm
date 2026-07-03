@@ -608,9 +608,10 @@ async def _handle_post_run(
     # 已完成子任务的真实产物照常落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃/桩项——绝不当
     # DONE 假成功。give_up_isolated_ids 是阶梯三保 build 放弃的子任务（本地树已清/打桩，build 未毒），
     # 与 abandoned（重试耗尽连坐放弃）合并判 PARTIAL。
+    from swarm.brain.gates import partial_delivery_ids
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
-    _partial_ids = sorted(set(_abandoned) | set(_given_up))
+    _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up（供下方 log 明细）
     _final_status = "PARTIAL" if _partial_ids else "DONE"
     store.update_task(
         task_id,

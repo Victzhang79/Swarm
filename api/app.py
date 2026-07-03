@@ -1328,13 +1328,27 @@ async def archive_all_notifications_endpoint(request: Request, project_id: str |
 @app.get("/api/milestones", tags=["系统"])
 async def list_milestones(request: Request, project_id: str | None = None, limit: int = 10):
     """Accept 率基准历史报告（P0）。"""
-    from swarm.api._shared import _require_user
-    _require_user(request)  # A-P1-27
+    from swarm.api._shared import _require_perm, _require_user
     loop = asyncio.get_running_loop()
-    reports = await loop.run_in_executor(
-        None,
-        lambda: store.get_latest_milestone_reports(project_id=project_id, limit=min(limit, 50)),
-    )
+    # #5(a)：无 project_id 时过去任意登录用户读全库里程碑（跨项目 accept-rate 越权）。治本：
+    #  - 指定 project_id → 校验该项目 task:read。
+    #  - 无 project_id → admin 全量、非 admin 限成员项目（get_latest_milestone_reports 支持 project_ids）。
+    if project_id:
+        _require_perm(request, "task:read", project_id)
+        reports = await loop.run_in_executor(
+            None,
+            lambda: store.get_latest_milestone_reports(project_id=project_id, limit=min(limit, 50)),
+        )
+    else:
+        user = _require_user(request)
+        from swarm.auth.rbac import Role
+        from swarm.auth.store import list_user_project_ids
+        _pids = None if getattr(user, "global_role", "") == Role.ADMIN.value \
+            else list(list_user_project_ids(user.id))
+        reports = await loop.run_in_executor(
+            None,
+            lambda: store.get_latest_milestone_reports(project_ids=_pids, limit=min(limit, 50)),
+        )
     return {"reports": reports}
 
 

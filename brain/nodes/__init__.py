@@ -3165,6 +3165,18 @@ def merge(state: BrainState) -> dict:
     # 仅在下方 rebase 路径命中时被覆盖为非空。
     out["rebase_subtask_ids"] = []
 
+    # #1(a) fail-closed：终局干净合并但 merged_diff `git apply --check` 失败＝确定性组装缺陷。
+    # 绝不能只诊断后默认落 VERIFY_L2（project_path 空时 L2 复核整块跳过 → 非法 patch 假绿放行）。
+    # 复用既有 escalate 路径（after_merge:285 → DELIVER 人工审核；交付 gate 拒绝放行、不学成成功）。
+    if not _apply_ok:
+        out["failure_escalated"] = True
+        out["failure_strategy"] = "escalate"
+        out["l2_passed"] = False
+        out["verification_failure"] = "merge_apply_invalid"
+        logger.warning(
+            "[MERGE] → 升级人工(escalate)：合并 patch 组装非法，fail-closed 阻断交付（不进 VERIFY_L2 假绿）"
+        )
+
     # ── 硬冲突路径（无 base_reader 可用或单子任务冲突）──
     if result.conflicts:
         out["merge_conflicts"] = [

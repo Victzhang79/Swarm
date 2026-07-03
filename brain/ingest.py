@@ -80,6 +80,23 @@ class IngestResult:
 # 安全校验（入口）
 # ──────────────────────────────────────────────
 
+def path_is_within_uploads(path: "str | Path") -> bool:
+    """#5(b) LFI 防护单一事实源（brain 层，供 api/upload 与 ingest_node 共用，避免反向依赖）。
+
+    uploaded_files 客户端可控，写入端清洗可被直接建任务绕过 → 消费前必须复核路径 resolve 后
+    落在 uploads 根内（防 ../ 与 symlink 逃逸）。fail-closed：空/相对/无法 resolve 一律判否。
+    """
+    if not path or not str(path).strip():
+        return False
+    try:
+        from swarm.config.settings import get_config
+        root = (Path(get_config().workspace_root) / "uploads").resolve()
+        target = Path(path).resolve()
+        return target == root or root in target.parents
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def validate_file(
     path: str | Path, max_bytes: int = DEFAULT_MAX_FILE_BYTES
 ) -> str | None:

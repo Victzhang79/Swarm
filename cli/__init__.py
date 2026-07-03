@@ -42,6 +42,33 @@ def _auth_headers(extra: dict | None = None) -> dict:
     return headers
 
 
+# #6 round22：sync httpx 调用统一包装——始终注入 _auth_headers()，401 时提示 login。
+# 过去多数命令裸调 httpx.get/post/... 漏带 token → RBAC 开启时 401（功能坏）。包装幂等：
+# 已显式传 headers 也会合并 Authorization，不冲突、不丢自定义头。
+def _http(method: str, url: str, **kw):
+    kw["headers"] = _auth_headers(kw.get("headers"))
+    resp = getattr(httpx, method)(url, **kw)
+    if getattr(resp, "status_code", None) == 401:
+        click.echo("⚠️  未授权（401）。请先执行 `swarm login` 获取 token。", err=True)
+    return resp
+
+
+def _hget(url: str, **kw):
+    return _http("get", url, **kw)
+
+
+def _hpost(url: str, **kw):
+    return _http("post", url, **kw)
+
+
+def _hput(url: str, **kw):
+    return _http("put", url, **kw)
+
+
+def _hdelete(url: str, **kw):
+    return _http("delete", url, **kw)
+
+
 @click.group()
 @click.version_option(version="0.9.8", prog_name="swarm")
 def main():
@@ -65,7 +92,7 @@ def login(username: str, password: str | None, api_url: str):
     if not password:
         password = click.prompt("密码", hide_input=True, default="", show_default=False)
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/auth/login",
             json={"username": username, "password": password},
             timeout=15.0,
@@ -114,7 +141,7 @@ async def _submit_via_api(
     auto_accept: bool,
     api_url: str,
 ) -> None:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), headers=_auth_headers()) as client:
         try:
             resp = await client.post(
                 f"{api_url}/api/projects/{project}/tasks",
@@ -144,7 +171,7 @@ async def _submit_via_api(
         console.print("[dim]订阅 SSE 进度流…[/dim]")
         stream_url = f"{api_url}/api/tasks/{task_id}/stream"
         try:
-            async with httpx.AsyncClient(timeout=None) as stream_client:
+            async with httpx.AsyncClient(timeout=None, headers=_auth_headers()) as stream_client:
                 async with stream_client.stream("GET", stream_url) as stream:
                     stream.raise_for_status()
                     event_type = "progress"
@@ -242,7 +269,7 @@ async def _worker_run_via_api(
         payload["writable"] = writable
     if readable:
         payload["readable"] = readable
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), headers=_auth_headers()) as client:
         try:
             resp = await client.post(
                 f"{api_url}/api/projects/{project}/worker/run",
@@ -266,7 +293,7 @@ async def _worker_run_via_api(
             return
 
         stream_url = f"{api_url}/api/worker/{run_id}/stream"
-        async with httpx.AsyncClient(timeout=None) as stream_client:
+        async with httpx.AsyncClient(timeout=None, headers=_auth_headers()) as stream_client:
             async with stream_client.stream("GET", stream_url) as stream:
                 stream.raise_for_status()
                 event_type = "progress"
@@ -321,7 +348,7 @@ def task_approve(task_id: str, apply_diff: bool, api_url: str):
     """审核通过任务"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/tasks/{task_id}/approve",
             json={"apply_diff": apply_diff},
             timeout=30.0,
@@ -347,7 +374,7 @@ def task_revise(task_id: str, feedback: str, api_url: str):
     """提交修订意见"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/tasks/{task_id}/revise",
             json={"feedback": feedback},
             timeout=30.0,
@@ -366,7 +393,7 @@ def task_reject(task_id: str, api_url: str):
     """拒绝任务"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(f"{api_url}/api/tasks/{task_id}/reject", timeout=30.0)
+        resp = _hpost(f"{api_url}/api/tasks/{task_id}/reject", timeout=30.0)
         resp.raise_for_status()
         console.print(f"[green]✅ {resp.json().get('message', '已拒绝')}[/]")
     except httpx.HTTPStatusError as exc:
@@ -381,7 +408,7 @@ def task_cancel(task_id: str, api_url: str):
     """取消运行中或 orphaned 任务"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(f"{api_url}/api/tasks/{task_id}/cancel", timeout=30.0)
+        resp = _hpost(f"{api_url}/api/tasks/{task_id}/cancel", timeout=30.0)
         resp.raise_for_status()
         console.print(f"[green]✅ {resp.json().get('message', '已取消')}[/]")
     except httpx.HTTPStatusError as exc:
@@ -401,7 +428,7 @@ def task_retry(task_id: str, auto_accept: bool, api_url: str):
     api_url = api_url.rstrip("/")
     body = {"auto_accept": True} if auto_accept else None
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/tasks/{task_id}/retry",
             json=body,
             timeout=30.0,
@@ -424,7 +451,7 @@ def task_apply_diff(task_id: str, check_only: bool, api_url: str):
     """将任务 merged_diff 应用到项目工作区"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/tasks/{task_id}/apply-diff",
             json={"check_only": check_only},
             timeout=60.0,
@@ -449,7 +476,7 @@ def status(project: str | None, api_url: str):
     table.add_column("说明")
 
     try:
-        resp = httpx.get(f"{api_url}/api/status", timeout=5.0)
+        resp = _hget(f"{api_url}/api/status", timeout=5.0)
         if resp.status_code == 200:
             data = resp.json()
             for name, info in (data.get("components") or {}).items():
@@ -465,7 +492,7 @@ def status(project: str | None, api_url: str):
 
     if project:
         try:
-            resp = httpx.get(f"{api_url}/api/projects/{project}", timeout=5.0)
+            resp = _hget(f"{api_url}/api/projects/{project}", timeout=5.0)
             if resp.status_code == 200:
                 proj = resp.json().get("project") or resp.json()
                 table.add_row(
@@ -546,7 +573,7 @@ def profile_show(project: str, api_url: str):
     """查看当前用户 L1 画像"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/memories/profile", timeout=15.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/memories/profile", timeout=15.0)
         resp.raise_for_status()
         data = resp.json()
         console.print_json(json.dumps(data.get("profile_json") or data, indent=2, ensure_ascii=False))
@@ -564,7 +591,7 @@ def profile_set(project: str, field: str, value: str, api_url: str):
     """更新 L1 画像字段（整字段覆盖）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/memories/profile", timeout=15.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/memories/profile", timeout=15.0)
         resp.raise_for_status()
         profile_json = resp.json().get("profile_json") or {}
         keys = field.split(".")
@@ -576,7 +603,7 @@ def profile_set(project: str, field: str, value: str, api_url: str):
         except json.JSONDecodeError:
             parsed_val = value
         node[keys[-1]] = parsed_val
-        put = httpx.put(
+        put = _hput(
             f"{api_url}/api/projects/{project}/memories/profile",
             json={"profile_json": profile_json},
             timeout=15.0,
@@ -601,7 +628,7 @@ def errors_list(project: str, api_url: str):
     """列出项目错题"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/memories/mistakes", timeout=15.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/memories/mistakes", timeout=15.0)
         resp.raise_for_status()
         mistakes = resp.json().get("mistakes") or []
         table = Table(title=f"错题集 — {project}")
@@ -630,7 +657,7 @@ def errors_dismiss(mistake_id: int, project: str, api_url: str):
     """标记错题为已修复/归档"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.post(
+        resp = _hpost(
             f"{api_url}/api/projects/{project}/memories/mistakes/{mistake_id}/dismiss",
             timeout=15.0,
         )
@@ -654,7 +681,7 @@ def patterns_list(project: str, api_url: str):
     """列出成功模式"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/memories/successes", timeout=15.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/memories/successes", timeout=15.0)
         resp.raise_for_status()
         items = resp.json().get("successes") or []
         table = Table(title=f"成功模式 — {project}")
@@ -689,7 +716,7 @@ def sandbox_list(project: str | None, api_url: str):
     api_url = api_url.rstrip("/")
     params = {"project_id": project} if project else {}
     try:
-        resp = httpx.get(f"{api_url}/api/sandbox/status", params=params, headers=_auth_headers(), timeout=20.0)
+        resp = _hget(f"{api_url}/api/sandbox/status", params=params, headers=_auth_headers(), timeout=20.0)
         resp.raise_for_status()
         data = resp.json()
         sandboxes = data.get("sandboxes") or []
@@ -738,7 +765,7 @@ def sandbox_create(project: str, template: str | None, api_url: str):
     if template:
         payload["template_id"] = template
     try:
-        resp = httpx.post(f"{api_url}/api/sandbox/create", json=payload, headers=_auth_headers(), timeout=60.0)
+        resp = _hpost(f"{api_url}/api/sandbox/create", json=payload, headers=_auth_headers(), timeout=60.0)
         resp.raise_for_status()
         data = resp.json()
         console.print(f"[green]✅ 沙箱已创建: {data.get('sandbox_id') or data.get('id') or data}[/]")
@@ -754,7 +781,7 @@ def sandbox_destroy(sandbox_id: str, api_url: str):
     """销毁指定沙箱"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.delete(f"{api_url}/api/sandbox/{sandbox_id}", headers=_auth_headers(), timeout=30.0)
+        resp = _hdelete(f"{api_url}/api/sandbox/{sandbox_id}", headers=_auth_headers(), timeout=30.0)
         resp.raise_for_status()
         console.print(f"[green]✅ 沙箱 {sandbox_id} 已销毁[/]")
     except httpx.HTTPStatusError as exc:
@@ -774,7 +801,7 @@ def config_show(api_url: str):
     """查看当前配置（API Key 已脱敏）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/config", headers=_auth_headers(), timeout=15.0)
+        resp = _hget(f"{api_url}/api/config", headers=_auth_headers(), timeout=15.0)
         resp.raise_for_status()
         data = resp.json()
         console.print_json(json.dumps(data.get("flat") or data.get("config") or data, indent=2, ensure_ascii=False))
@@ -795,7 +822,7 @@ def config_models(api_url: str):
     """列出可用模型（SiliconFlow + 本地）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/models", headers=_auth_headers(), timeout=30.0)
+        resp = _hget(f"{api_url}/api/models", headers=_auth_headers(), timeout=30.0)
         resp.raise_for_status()
         data = resp.json()
         for provider in ("siliconflow", "local"):
@@ -819,7 +846,7 @@ def config_routing(api_url: str):
     """查看 Worker 子任务模型路由表（trivial/medium/complex/multimodal）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/routing", headers=_auth_headers(), timeout=15.0)
+        resp = _hget(f"{api_url}/api/routing", headers=_auth_headers(), timeout=15.0)
         resp.raise_for_status()
         data = resp.json()
         routing = data.get("routing") or data
@@ -848,7 +875,7 @@ def kb_overview(project: str, api_url: str):
     """项目知识库概览（预处理结果 + 索引统计）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/knowledge/overview", headers=_auth_headers(), timeout=20.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/knowledge/overview", headers=_auth_headers(), timeout=20.0)
         resp.raise_for_status()
         data = resp.json()
         table = Table(title=f"知识库概览 — {project}")
@@ -878,7 +905,7 @@ def kb_norms(project: str, api_url: str):
     """列出项目规范（Layer C norms）"""
     api_url = api_url.rstrip("/")
     try:
-        resp = httpx.get(f"{api_url}/api/projects/{project}/knowledge/norms", headers=_auth_headers(), timeout=15.0)
+        resp = _hget(f"{api_url}/api/projects/{project}/knowledge/norms", headers=_auth_headers(), timeout=15.0)
         resp.raise_for_status()
         norms = resp.json().get("norms") or []
         table = Table(title=f"项目规范 — {project}")
@@ -906,7 +933,7 @@ def kb_symbols(project: str, query: str, api_url: str):
     api_url = api_url.rstrip("/")
     params = {"q": query} if query else {}
     try:
-        resp = httpx.get(
+        resp = _hget(
             f"{api_url}/api/projects/{project}/knowledge/symbols", params=params, headers=_auth_headers(), timeout=15.0
         )
         resp.raise_for_status()

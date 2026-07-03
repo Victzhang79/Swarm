@@ -115,7 +115,10 @@ def after_assess(state: BrainState) -> Literal["tech_design", "plan"]:
     - complex/ultra → TECH_DESIGN（出技术方案+评审）
     - simple/medium → PLAN（轻量直达）
     """
-    comp = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
+    # 复用 effective_complexity 归一：checkpoint resume 后该值会退化成字符串 "ultra"，
+    # 裸 `in (枚举,...)` 会漏判 → complex/ultra 误走轻量 PLAN，且 `.value` 抛 AttributeError
+    # （task 8537fa5e 同根因）。effective_complexity 统一返回 Complexity 枚举。
+    comp = effective_complexity(state)
     if comp in (Complexity.COMPLEX, Complexity.ULTRA):
         logger.info("[ROUTE] ASSESS → TECH_DESIGN (%s)", comp.value)
         return "tech_design"

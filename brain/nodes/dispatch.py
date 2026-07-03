@@ -78,6 +78,43 @@ def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) ->
             logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))
 
 
+def _changes_from_diff(diff: str) -> list:
+    """从 unified diff 提取 FileChange（ADDED/MODIFIED/DELETED）。纯函数、可测。
+
+    #4(a)：过去只 `^\\+\\+\\+ b/` 匹配 ADDED/MODIFIED，删除的 target 是 `+++ /dev/null` 匹配不到
+    → 从不发 DELETED → 任务交付删除的文件索引永不清。这里额外识别 `--- a/X` + `+++ /dev/null`
+    删除段发 DELETED，并去重（删除段的 `--- a/X` 不再被误当 MODIFIED 源端）。
+    """
+    import re
+
+    from swarm.knowledge.updater import ChangeType, FileChange
+
+    changes: list = []
+    seen: set[str] = set()
+    lines = diff.splitlines()
+    # ① 删除段：--- a/X 紧跟 +++ /dev/null
+    for i, line in enumerate(lines):
+        if line.startswith("+++ /dev/null") and i > 0 and lines[i - 1].startswith("--- a/"):
+            fpath = lines[i - 1][6:].strip()
+            if fpath and fpath not in seen:
+                seen.add(fpath)
+                changes.append(FileChange(file_path=fpath, change_type=ChangeType.DELETED))
+    # ② 新增/修改：+++ b/X（其源端是否 /dev/null 判 ADDED vs MODIFIED）
+    for m in re.finditer(r"^\+\+\+ b/(\S+)", diff, re.MULTILINE):
+        fpath = m.group(1)
+        if fpath in seen:
+            continue
+        seg_start = m.start()
+        prev = diff.rfind("--- ", 0, seg_start)
+        is_new = prev >= 0 and "/dev/null" in diff[prev:seg_start]
+        seen.add(fpath)
+        changes.append(FileChange(
+            file_path=fpath,
+            change_type=ChangeType.ADDED if is_new else ChangeType.MODIFIED,
+        ))
+    return changes
+
+
 def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
     """事实库回灌：子任务产出的变更文件 → knowledge updater 增量索引（best-effort，不阻塞）。
 
@@ -88,21 +125,9 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
     if not project_id:
         return
     try:
-        import re
+        from swarm.knowledge.updater import UpdateEvent
 
-        from swarm.knowledge.updater import ChangeType, FileChange, UpdateEvent
-
-        diff = worker_output.diff or ""
-        changes: list = []
-        for m in re.finditer(r"^\+\+\+ b/(\S+)", diff, re.MULTILINE):
-            fpath = m.group(1)
-            seg_start = m.start()
-            prev = diff.rfind("--- ", 0, seg_start)
-            is_new = prev >= 0 and "/dev/null" in diff[prev:seg_start]
-            changes.append(FileChange(
-                file_path=fpath,
-                change_type=ChangeType.ADDED if is_new else ChangeType.MODIFIED,
-            ))
+        changes = _changes_from_diff(worker_output.diff or "")
         if not changes:
             return
         event = UpdateEvent(

@@ -738,8 +738,15 @@ def list_task_audit(
     project_id: str | None = None,
     limit: int = 100,
     conn_str: str | None = None,
+    project_ids: "list[str] | None" = None,
 ) -> list[dict[str, Any]]:
-    """查询任务审计日志（按时间倒序）。"""
+    """查询任务审计日志（按时间倒序）。
+
+    #5(a)：project_ids 非 None 时把结果限定在这批项目内（成员项目 scope，非 admin 越权防护）。
+    空列表 = 无任何可见项目 → fail-closed 返回空（绝不因"无过滤"而泄露全库）。
+    """
+    if project_ids is not None and len(project_ids) == 0:
+        return []
     conditions: list[str] = []
     params: list[Any] = []
     if task_id:
@@ -748,6 +755,9 @@ def list_task_audit(
     if project_id:
         conditions.append("project_id = %s")
         params.append(project_id)
+    if project_ids is not None:
+        conditions.append("project_id = ANY(%s)")
+        params.append(list(project_ids))
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     params.append(limit)
     with _get_conn(conn_str) as conn:
@@ -787,7 +797,9 @@ def delete_task(task_id: str, conn_str: str | None = None) -> bool:
 # Task stats & notifications (Phase 5)
 # ──────────────────────────────────────────────
 
-_TERMINAL_STATUSES = ("DONE", "FAILED", "CANCELLED")
+# #3 round22：PARTIAL 是终态（任务已收敛不再推进），历史漏它 → 去重(:549)误当活跃任务、
+# 平均时长(:925)统计漏 PARTIAL。与 types.TaskStatus.is_terminal_status 同口径（含 PARTIAL）。
+_TERMINAL_STATUSES = ("DONE", "FAILED", "CANCELLED", "PARTIAL")
 _NOTIFY_STATUSES = ("DONE", "FAILED", "CONFIRMING", "DELIVERING")
 
 
@@ -904,6 +916,7 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
                     COUNT(*) FILTER (WHERE status = 'DONE') AS completed,
                     COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
                     COUNT(*) FILTER (WHERE status = 'CANCELLED') AS cancelled,
+                    COUNT(*) FILTER (WHERE status = 'PARTIAL') AS partial,
                     COUNT(*) FILTER (
                         WHERE status = 'DONE'
                           AND UPPER(COALESCE(human_decision, '')) = 'ACCEPT'
@@ -914,7 +927,7 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
                 params,
             )
             counts = cur.fetchone()
-            total, completed, failed, cancelled, approved = counts
+            total, completed, failed, cancelled, partial, approved = counts
 
             terminal_where = where
             terminal_params: list[Any] = list(params)
@@ -968,9 +981,10 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
             recent_rows = cur.fetchall()
 
     accept_rate = round(approved / completed, 4) if completed else None
-    # 合并率/成功率：DONE 占所有终态任务（DONE+FAILED+CANCELLED）的比例。
-    # 区别于 accept_rate（只在 DONE 内部算人工通过比例，分母不含失败 → 会误导）。
-    terminal_total = (completed or 0) + (failed or 0) + (cancelled or 0)
+    # 合并率/成功率：DONE 占所有终态任务的比例。#3 round22：PARTIAL 也是终态且【非成功】，
+    # 必须计入分母（否则部分交付被统计学"洗白"——既不进分子也不进分母，merge_rate 虚高）。
+    # partial 单列一个类目（既非 completed 也非 failed），如实反映"诚实未完成"占比。
+    terminal_total = (completed or 0) + (failed or 0) + (cancelled or 0) + (partial or 0)
     merge_rate = round(completed / terminal_total, 4) if terminal_total else None
 
     recent_tasks = [
@@ -993,6 +1007,7 @@ def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -
         "completed": completed,
         "failed": failed,
         "cancelled": cancelled,
+        "partial": partial,
         "approved": approved,
         "accept_rate": accept_rate,
         "merge_rate": merge_rate,
@@ -1544,7 +1559,11 @@ def get_latest_milestone_reports(
     project_id: str | None = None,
     limit: int = 10,
     conn_str: str | None = None,
+    project_ids: "list[str] | None" = None,
 ) -> list[dict[str, Any]]:
+    # #5(a)：project_ids 非 None 时限定成员项目 scope；空列表 → fail-closed 返回空。
+    if project_ids is not None and len(project_ids) == 0:
+        return []
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             if project_id:
@@ -1557,6 +1576,17 @@ def get_latest_milestone_reports(
                     LIMIT %s
                     """,
                     (project_id, limit),
+                )
+            elif project_ids is not None:
+                cur.execute(
+                    """
+                    SELECT id, project_id, phase, accept_rate, threshold, passed, report, created_at
+                    FROM milestone_reports
+                    WHERE project_id = ANY(%s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (list(project_ids), limit),
                 )
             else:
                 cur.execute(

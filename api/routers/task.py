@@ -74,6 +74,17 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
     # 后端兜底校验——前端校验可被绕过/直接调 API，这里是单一可信防线。
     if not (req.description or "").strip():
         raise HTTPException(status_code=400, detail="任务描述不能为空（附件只作补充，不能替代描述）")
+    # #5(b) LFI 防护：uploaded_files 客户端可控，写入端清洗可被直接建任务绕过 → 入口复核每个
+    # 路径落在 uploads 根内，否则任意 task:create 用户可读服务器任意文件（内容会并入描述回显）。
+    if req.uploaded_files:
+        from swarm.api.routers.upload import path_is_within_uploads
+        _bad = [p for p in req.uploaded_files if not path_is_within_uploads(p)]
+        if _bad:
+            _app.logger.warning("拒绝越界 uploaded_files（疑似 LFI）: %s", _bad[:5])
+            raise HTTPException(
+                status_code=400,
+                detail="附件路径非法：仅接受经 /api/uploads 上传的文件（拒绝越界路径）",
+            )
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
@@ -313,18 +324,52 @@ async def task_audit_endpoint(request: Request, task_id: str = "", project_id: s
 
     解决可追溯性：即使任务/项目被硬删，仍能在此查到它的创建/删除记录与描述。
     """
-    # P0-SEC-03：至少需认证；按 project_id 查询时校验该项目 task:read（防跨项目审计读）。
+    # P0-SEC-03 / #5(a)：跨项目审计读越权治本。
+    #  - limit 封顶（防 ?limit=999999 拖全库）。
+    #  - project_id 查询 → 校验该项目 task:read。
+    #  - task_id 查询 → 反查任务归属校验；已删除任务(get_task None)无法反查 → 非 admin 限成员项目。
+    #  - 无过滤 → admin 全量、非 admin 限成员项目（绝不再让任意登录用户读全库审计）。
+    limit = max(1, min(limit, 500))
+    loop = asyncio.get_running_loop()
+
+    def _member_scope(user) -> "list[str] | None":
+        from swarm.auth.rbac import Role
+        from swarm.auth.store import list_user_project_ids
+        if getattr(user, "global_role", "") == Role.ADMIN.value:
+            return None  # admin：不限 scope
+        return list(list_user_project_ids(user.id))
+
     if project_id:
         _require_perm(request, "task:read", project_id)
+        rows = await loop.run_in_executor(
+            None,
+            lambda: _app.store.list_task_audit(
+                task_id=task_id or None, project_id=project_id, limit=limit),
+        )
+    elif task_id:
+        user = _require_user(request)
+        task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+        if task and task.get("project_id"):
+            _require_perm(request, "task:read", task.get("project_id"))
+            rows = await loop.run_in_executor(
+                None,
+                lambda: _app.store.list_task_audit(
+                    task_id=task_id, project_id=task.get("project_id"), limit=limit),
+            )
+        else:  # 已删除任务：无法反查归属 → 非 admin 限成员项目
+            _pids = _member_scope(user)
+            rows = await loop.run_in_executor(
+                None,
+                lambda: _app.store.list_task_audit(
+                    task_id=task_id, limit=limit, project_ids=_pids),
+            )
     else:
-        _require_user(request)
-    loop = asyncio.get_running_loop()
-    rows = await loop.run_in_executor(
-        None,
-        lambda: _app.store.list_task_audit(
-            task_id=task_id or None, project_id=project_id or None, limit=limit
-        ),
-    )
+        user = _require_user(request)
+        _pids = _member_scope(user)
+        rows = await loop.run_in_executor(
+            None,
+            lambda: _app.store.list_task_audit(limit=limit, project_ids=_pids),
+        )
     return {"status": "ok", "audit": rows}
 
 
@@ -383,7 +428,7 @@ async def cancel_task_endpoint(task_id: str, request: Request):
 
     if not is_task_running(task_id) and not is_task_orphaned(task_id):
         status = task.get("status", "")
-        if status in ("CANCELLED", "FAILED", "DONE"):
+        if status in ("CANCELLED", "FAILED", "DONE", "PARTIAL"):  # #3：PARTIAL 也是终态
             return {"status": "ok", "task": task, "message": "任务已结束，无需取消"}
         raise HTTPException(status_code=409, detail=f"任务状态 {status} 不可取消")
 
@@ -494,7 +539,8 @@ async def stream_task_logs(task_id: str, request: Request):
 
     from swarm.logging_config import TaskLogPoller
 
-    _TERMINAL = {"DONE", "FAILED", "CANCELLED"}
+    # #3 round22：PARTIAL 也是终态，漏它 → PARTIAL 任务 SSE 永不 event:end、流悬挂。
+    _TERMINAL = {"DONE", "FAILED", "CANCELLED", "PARTIAL"}
 
     async def event_generator():
         poller = TaskLogPoller(task_id)

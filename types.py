@@ -44,6 +44,19 @@ class TaskStatus(str, Enum):
     PARTIAL = "PARTIAL"                 # 部分交付：部分子任务放弃，已完成的真实落盘（诚实未完成，非 DONE）
     DONE = "DONE"
 
+    # 终态分类单一事实源：PARTIAL 是终态（任务已收敛、不再推进）但【非成功】（诚实未完成）。
+    # 各处硬编码 ("DONE","FAILED","CANCELLED") 元组历史漏 PARTIAL → 统计洗白/SSE 悬挂/去重误判。
+    @classmethod
+    def is_terminal_status(cls, status: "str | TaskStatus") -> bool:
+        s = status.value if isinstance(status, cls) else str(status)
+        return s in (cls.DONE.value, cls.FAILED.value, cls.CANCELLED.value, cls.PARTIAL.value)
+
+    @classmethod
+    def is_successful_status(cls, status: "str | TaskStatus") -> bool:
+        """仅 DONE 算成功。PARTIAL/FAILED/CANCELLED 皆非成功。"""
+        s = status.value if isinstance(status, cls) else str(status)
+        return s == cls.DONE.value
+
 
 # ──────────────────────────────────────────────
 # 人工决策

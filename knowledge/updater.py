@@ -154,6 +154,12 @@ def hydrate_event_changes(event: UpdateEvent) -> UpdateEvent:
     """从 project_path 补全 ADDED/MODIFIED 的 content（队列回放用）。"""
     project_path = (event.metadata or {}).get("project_path")
     if not project_path:
+        # #4(b) 治本：Worker 回灌事件（dispatch._feedback_to_knowledge）常缺 metadata.project_path
+        # 且事件本就不带 content → 过去直接 return → content 永空 → _index_file 被跳过 → 回灌静默
+        # no-op（Layer A/B 一字不索引）。从 event.project_id 兜底解析工作区路径，一处覆盖所有缺
+        # project_path 的入队方（含未来新入口）。
+        project_path = _lookup_project_path(event.project_id) if event.project_id else None
+    if not project_path:
         return event
     root = Path(project_path)
     hydrated: list[FileChange] = []
@@ -386,6 +392,13 @@ class KnowledgeUpdater:
             symbols = _extract_symbols_simple(
                 change.content, change.file_path, change.language
             )
+            # #4(a) per-file 对账：先删本文件旧符号再写新符号（delete-then-insert）。upsert 纯
+            # INSERT ON CONFLICT 不会清掉本文件中已消失的符号 → 幽灵符号累积、检索单调劣化。
+            # 与下方 delete_outgoing_dependencies 出边对账同构。失败不拖垮 Layer A。
+            try:
+                await self._struct.delete_symbols_by_file(project_id, change.file_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Updater] 删除旧符号失败(忽略): %s (%s)", change.file_path, exc)
             await self._struct.upsert_symbols_batch(project_id, symbols)
 
             # 依赖图维护(K4-a): 删除该文件的旧出边。增量不重建依赖图，旧 import
