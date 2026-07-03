@@ -419,6 +419,12 @@ async def dispatch(state: BrainState) -> dict:
             if subtask.id not in failed_ids:
                 failed_ids.append(subtask.id)
         else:
+            # ★对抗复核 #3 治本★：子任务【重试后 L1 通过 + 有有效 diff】→ 从 failed_ids 移除。
+            # 此前只追加不移除 → contract retry 保留的 failed_subtask_ids 里，已成功重跑的 ID 残留 →
+            # after_monitor 优先看 failed_ids 又进 handle_failure，形成"已成功仍判失败"的空转直至
+            # 误 escalate/撞 recursion_limit。移除后该子任务不再被误判失败。
+            if subtask.id in failed_ids:
+                failed_ids.remove(subtask.id)
             # 事实库回灌（补滞后断裂）：子任务 L1 通过 + 有改动 → 把变更文件喂 knowledge updater
             # 增量索引，让后续子任务/任务的事实核验能看到最新产出（worker 不 git push，否则知识库永远不知）。
             _feedback_to_knowledge(state.get("project_id", ""), subtask, worker_output)

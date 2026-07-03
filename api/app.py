@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -79,6 +79,7 @@ from swarm.config.settings import (
     get_config,
     reload_config,
 )
+from swarm.infra.redis_client import get_redis, redis_enabled
 from swarm.project import store
 from swarm.tracing import configure_langsmith
 
@@ -608,6 +609,9 @@ app.add_middleware(SwarmAPIKeyMiddleware)
 async def on_startup():
     """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""
     _configure_app_logging()
+    # 破坏性误配 fail-fast（放最前，任何资源初始化前）：多 worker 与单进程架构不兼容 →
+    # 硬拦拒绝启动，而非带病运行到运行期 SSE/调度错乱才暴雷。
+    _warn_if_multiprocess()
     # 生产模式安全自检（fail-closed）：默认凭据/未设根密钥时拒绝启动，
     # 让误配的生产部署在启动期就快速失败，而非带病运行到运行期才暴雷。
     from swarm.config.settings import validate_production_security
@@ -650,6 +654,18 @@ async def on_startup():
         logger.info("Notification push hook registered")
     except Exception as e:
         logger.warning(f"Failed to register notification hook: {e}")
+    # P0-C：先跑版本化迁移（run_migrations 幂等：全新库跑 baseline DDL、既有库仅盖章
+    # schema_version），再逐个 ensure_tables。此前迁移只在 scripts/init_db.py 调，容器/直起
+    # 路径从不 stamp schema_version → 版本化迁移形同虚设、将来 ALTER 不自动应用 → schema 漂移。
+    # fail-fast（不 try/except 吞）：迁移是 schema 单一事实源，失败即抛让启动崩溃，杜绝带病运行；
+    # 区别于下方 ensure_tables 的 fail-open 容错。
+    from swarm.infra.migrations.runner import run_migrations
+
+    loop = asyncio.get_running_loop()
+    # conn_str=None → run_migrations 内部走 DatabaseConfig().postgres_uri（与 .env 同源），
+    # 且避免在 on_startup 里引用被下方局部 import 遮蔽的 get_config。
+    await loop.run_in_executor(None, run_migrations, None)
+    logger.info("DB migrations applied (schema_version stamped)")
     # 确保 project/task 表存在
     try:
         loop = asyncio.get_running_loop()
@@ -724,13 +740,14 @@ async def on_startup():
     except Exception as e:
         logger.warning(f"Failed to ensure auth tables: {e}")
     # A1 批1：初始化 PG checkpointer（多副本共享 + 跨副本 interrupt/resume）。
-    # 必须在 runner/调度器使用 graph 之前；失败自动降级 MemorySaver（单机不受影响）。
-    try:
-        from swarm.brain.graph import init_postgres_checkpointer
+    # 必须在 runner/调度器使用 graph 之前。
+    # P0-D fail-fast：init_postgres_checkpointer 仅在【要求强制 PG】（生产默认 / 显式
+    # SWARM_REQUIRE_PG_CHECKPOINTER）且初始化失败时 raise——此时【不得吞异常】，让启动崩溃，
+    # 杜绝生产带 MemorySaver 带病运行（重启即丢中断 checkpoint）。dev/非强制路径返回 False
+    # 静默降级、不抛，故此处不再包 try/except（与上方 run_migrations fail-fast 同规格）。
+    from swarm.brain.graph import init_postgres_checkpointer
 
-        await init_postgres_checkpointer()
-    except Exception as e:
-        logger.warning(f"PG checkpointer init skipped: {e}")
+    await init_postgres_checkpointer()
     # A1 批2：调度器选主——leader 副本跑全部后台调度器，非 leader 待命可接管。
     # 单进程/PG 不可用时降级为"本进程即 leader"（单机行为不变）。
     try:
@@ -743,7 +760,14 @@ async def on_startup():
     # 先清扫上一进程残留的孤儿沙箱，再启动池 reaper（顺序重要：清扫在池接管前）
     _sweep_startup_orphans()
     _start_sandbox_pool_reaper()
-    _warn_if_multiprocess()
+    # P0-A：启动对账——把上一进程残留的"进行中"任务按态分治恢复/失败（沙箱已由上方 sweep 清；
+    # schedulers 已 spawn，SUBMITTED 重入队项会被消费）。best-effort：对账失败不阻断启动。
+    try:
+        from swarm.brain.runner import reconcile_orphan_tasks
+
+        await reconcile_orphan_tasks()
+    except Exception as e:
+        logger.warning(f"启动对账跳过: {e}")
     logger.info("Swarm API started")
 
 
@@ -839,25 +863,32 @@ def _sweep_startup_orphans() -> None:
 
 
 def _warn_if_multiprocess():
-    """检测多 worker 误配置。
+    """检测多 worker 误配置并【硬拦】（fail-fast）。
 
-    当前架构为单进程模型：任务事件队列（SSE/WS 推送）、Brain 内存 checkpointer、
-    KB updater 均为进程内单例。若用 uvicorn --workers N>1 或 gunicorn 多 worker 启动，
-    会导致：任务在 A 进程跑、客户端 SSE 连到 B 进程收不到推送；resume 找不到 checkpointer。
-    这里检测并告警（不阻断，便于开发期单机调试）。
+    当前架构为单进程模型：任务事件队列（SSE/WS 推送）、调度器 leader、leader 内存队列 meta、
+    KB updater 均为进程内单例。若用 uvicorn --workers N>1 或 gunicorn 多 worker 启动，会导致：
+    任务在 A 进程跑、客户端 SSE 连到 B 进程收不到推送；调度/队列 meta 各进程各一份互不可见。
+
+    改为硬拦（原仅告警）：多 worker 是【会静默错乱】的破坏性误配，按 fail-closed 在启动期拒绝，
+    而非带病运行。逃生阀 SWARM_ALLOW_MULTIPROCESS=1：明确知道风险（如已外置队列/SSE）时降级为告警。
     """
+    web_concurrency = os.environ.get("WEB_CONCURRENCY")
     try:
-        # uvicorn --workers 会设置 WEB_CONCURRENCY
-        web_concurrency = os.environ.get("WEB_CONCURRENCY")
-        if web_concurrency and int(web_concurrency) > 1:
-            logger.warning(
-                "⚠️  检测到 WEB_CONCURRENCY=%s（多 worker）。当前架构为单进程模型，"
-                "多 worker 会导致 SSE/WS 推送错乱与 resume 失败。"
-                "多副本部署需先将任务队列/checkpointer 外置到 Redis/PG（见 README Roadmap）。",
-                web_concurrency,
-            )
-    except Exception:
-        pass
+        n = int(web_concurrency) if web_concurrency else 1
+    except ValueError:
+        n = 1
+    if n <= 1:
+        return
+    allow = os.environ.get("SWARM_ALLOW_MULTIPROCESS", "").strip().lower() in ("1", "true", "yes")
+    msg = (
+        f"检测到 WEB_CONCURRENCY={web_concurrency}（多 worker）。当前架构为单进程模型，"
+        "多 worker 会导致 SSE/WS 推送错乱、调度器/队列 meta 各进程割裂、resume 不可靠。"
+        "请以单 worker 启动；确需多副本须先外置队列/SSE（见 README Roadmap）。"
+    )
+    if allow:
+        logger.warning("⚠️  %s （SWARM_ALLOW_MULTIPROCESS 已设 → 仅告警，风险自负）", msg)
+        return
+    raise RuntimeError(msg + " 如确需绕过请设 SWARM_ALLOW_MULTIPROCESS=1。")
 
 
 async def _start_task_scheduler() -> None:
@@ -1034,6 +1065,7 @@ async def _run_schedulers_with_leadership() -> None:
             logger.info("[A1] 本副本成为调度器 leader，启动后台调度器")
             await _start_memory_decay_scheduler()
             await _start_kb_update_scheduler()
+            await _start_kb_prune_scheduler()  # P2-C：每日 KB 日志/共现清理
             await _start_consistency_scheduler()
             await _start_task_scheduler()
             return  # 启动完成（调度器各自常驻），leader 循环结束
@@ -1054,6 +1086,74 @@ async def _start_memory_decay_scheduler() -> None:
     except Exception as exc:
         logger.warning("Failed to start L5 memory decay scheduler: %s", exc)
 
+
+async def _start_kb_prune_scheduler() -> None:
+    """P2-C：启动每日 KB 修改日志/共现清理调度（防 kb_modification_log/kb_co_occurrence 无界）。
+
+    此前 behavior_store.prune_old_logs 零调用方 → 表只增不删。leader 独占（经 leader 启动链调用），
+    随 _spawn_bg 在 app 关闭时被取消。PG 不可用仅告警。"""
+    try:
+        _spawn_bg(_kb_prune_daily_loop())
+        logger.info("KB prune scheduler started (daily at 04:00)")
+    except Exception as exc:
+        logger.warning("Failed to start KB prune scheduler: %s", exc)
+
+
+async def _run_kb_prune_once(retention: int) -> None:
+    """跑一轮全库 KB 清理（供每日循环 wait_for 包裹，防单轮挂死拖垮整个调度）。"""
+    from swarm.knowledge.behavior_store import BehaviorStore
+
+    loop = asyncio.get_running_loop()
+    projects = await loop.run_in_executor(None, store.list_projects)
+    bstore = BehaviorStore()
+    try:
+        await bstore.connect()
+        total = 0
+        for p in projects:
+            pid = p.get("id")
+            if not pid:
+                continue
+            try:
+                total += await bstore.prune_old_logs(pid, retention_days=retention)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("KB prune 项目 %s 失败: %s", pid, exc)
+        logger.info("每日 KB 清理完成：删 %d 条日志，跨 %d 个项目（保留 %d 天）",
+                    total, len(projects), retention)
+    finally:
+        await bstore.close()
+
+
+async def _kb_prune_daily_loop(hour: int = 4) -> None:
+    """每日 hour 点清理全库项目的过旧 KB 修改日志 + 陈旧共现。SWARM_KB_LOG_RETENTION_DAYS 可调。
+
+    对抗复核 P2-C：BehaviorStore 用裸连接（不走 F2 池 connect_timeout），且 DELETE 无语句超时——
+    PG 不可达/锁冲突会把本协程挂在 await 上、后续每日轮全部静默跳过。故整轮用 asyncio.wait_for
+    硬性封顶（默认 300s），超时记警告并等下一天，绝不永久卡死调度。"""
+    from datetime import datetime, timedelta
+
+    try:
+        retention = int(os.environ.get("SWARM_KB_LOG_RETENTION_DAYS", "180"))
+    except ValueError:
+        retention = 180
+    try:
+        run_timeout = float(os.environ.get("SWARM_KB_PRUNE_TIMEOUT", "300"))
+    except ValueError:
+        run_timeout = 300.0
+    while True:
+        now = datetime.now()
+        nxt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
+        try:
+            await asyncio.wait_for(_run_kb_prune_once(retention), timeout=run_timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("每日 KB 清理超时（>%.0fs），本轮跳过，等下一天", run_timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("每日 KB 清理失败: %s", exc)
+
 _static_dir = Path(__file__).parent / "static"
 if _static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
@@ -1073,6 +1173,108 @@ async def health_check():
     except Exception:  # noqa: BLE001
         _ver = ""
     return {"status": "ok", "timestamp": time.time(), "version": _ver}
+
+
+# ─── 1b. 就绪探针依赖探测（供 /api/health/ready 复用；测试可 patch 这三只） ───
+# 设计：只回布尔 + 良性短 detail；失败仅回异常类名，绝不回显连接串/版本/密码
+# （/api/health/ready 经 _PUBLIC_PREFIXES 前缀公开可达，须防 #21 类信息泄漏）。
+
+
+async def _probe_pg_ready() -> tuple[bool, str]:
+    """PG 就绪：SELECT 1（2s connect 超时，跑线程避免阻塞事件循环）。"""
+    import psycopg
+
+    uri = get_config().db.postgres_uri
+
+    def _run() -> None:
+        with psycopg.connect(uri, autocommit=True, connect_timeout=2) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+
+    try:
+        await asyncio.to_thread(_run)
+        return True, "SELECT 1 ok"
+    except Exception as exc:  # noqa: BLE001
+        return False, type(exc).__name__
+
+
+async def _probe_redis_ready() -> tuple[bool, str]:
+    """Redis 就绪：get_redis() 内部已 ping，不可用返 None。仅在 redis_enabled() 时被调用。"""
+    try:
+        r = await asyncio.to_thread(get_redis)
+        return (True, "ping ok") if r is not None else (False, "unreachable")
+    except Exception as exc:  # noqa: BLE001
+        return False, type(exc).__name__
+
+
+def _is_local_qdrant(url: str) -> bool:
+    """qdrant_url 是否指向本地/环回地址（→ 才有资格用本地文件兜底判健康）。"""
+    from urllib.parse import urlparse
+
+    # 空 host（如误配 http:///... 或缺 host）不是环回地址——不得当本地，否则远端误配 +
+    # 宿主机陈旧 ~/.swarm/qdrant/meta.json 会假绿（对抗复核 P0-B 残留）。
+    host = (urlparse(url).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+async def _probe_qdrant_ready() -> tuple[bool, str]:
+    """Qdrant 就绪：GET /collections（2s）。
+
+    ★fail-closed 关键（P0-B 对抗复核 Finding-1）：本地文件模式兜底【只在 qdrant_url 指向本地】
+    时才算健康——server 模式（远端 URL）下服务器不可达=KB 真不可用，若用宿主机上一次本地跑
+    残留的 ~/.swarm/qdrant/meta.json 误判「local file mode」健康，就把「假绿」又给 Qdrant 放回来了。
+    """
+    import httpx
+
+    qdrant_url = get_config().db.qdrant_url
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            resp = await client.get(f"{qdrant_url}/collections")
+        if resp.status_code == 200:
+            n = len(resp.json().get("result", {}).get("collections", []))
+            return True, f"server online, {n} collections"
+        return False, f"HTTP {resp.status_code}"
+    except Exception as exc:  # noqa: BLE001
+        if _is_local_qdrant(qdrant_url):
+            storage_path = os.path.expanduser("~/.swarm/qdrant")
+            if os.path.exists(storage_path) and os.path.exists(os.path.join(storage_path, "meta.json")):
+                return True, "local file mode"
+        logger.debug("[qdrant probe] unreachable %s: %s", type(exc).__name__, exc)
+        return False, "unreachable"
+
+
+# ─── 1c. GET /api/health/ready ─────────────────────
+@app.get("/api/health/ready", tags=["系统"])
+async def health_ready():
+    """就绪探针 — 真实探测启用中的依赖，供容器 HEALTHCHECK / 编排就绪门使用。
+
+    PG 必查；Redis 仅在 SWARM_REDIS_ENABLED 时纳入判定（默认关→不因它失败）；
+    Qdrant 含本地文件兜底。任一【启用中】依赖不可达 → 503 + 每依赖 ok/detail 明细。
+    fail-closed：只对启用依赖判失败，且探测本身异常一律视为该依赖不可达。
+    """
+    checks: dict[str, dict] = {}
+    ok_all = True
+
+    pg_ok, pg_detail = await _probe_pg_ready()
+    checks["postgres"] = {"ok": pg_ok, "detail": pg_detail}
+    ok_all = ok_all and pg_ok
+
+    if redis_enabled():
+        redis_ok, redis_detail = await _probe_redis_ready()
+        checks["redis"] = {"ok": redis_ok, "detail": redis_detail}
+        ok_all = ok_all and redis_ok
+    else:
+        checks["redis"] = {"ok": True, "detail": "disabled"}
+
+    q_ok, q_detail = await _probe_qdrant_ready()
+    checks["qdrant"] = {"ok": q_ok, "detail": q_detail}
+    ok_all = ok_all and q_ok
+
+    body = {"status": "ok" if ok_all else "unavailable", "checks": checks}
+    if not ok_all:
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 # ─── Auth / RBAC ───────────────────────────────────

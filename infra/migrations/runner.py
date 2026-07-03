@@ -61,10 +61,35 @@ def _apply_baseline_ddl() -> None:
 # ── 迁移登记册（升序，append-only）──────────────────
 # 每项: (version, name, callable | None)。callable=None 表示「纯盖章」基线那种
 # 特殊情形在 run_migrations 内单独处理；常规迁移都带 callable。
+#
+# ★规范（P0-C 订立）：任何【改列型 / 加约束 / 加索引 / 数据回填】必须作为新版本条目
+# 追加到本登记册（version, name, callable），经 run_migrations 应用（on_startup 首启即跑）。
+# 禁止再在 ensure_tables 里 inline `ADD COLUMN IF NOT EXISTS` —— 那对已存在列静默跳过，
+# 造成「代码期望新型、库仍旧型」的 schema 漂移，且不写 schema_version 无版本可追。
+def _migration_v2_task_queue_meta(conn) -> None:
+    """v2（P0-A）：task_records 补队列执行 meta 两列，供 leader 重启后从 DB 重建。
+
+    既有库：ADD COLUMN IF NOT EXISTS（幂等）。新库由 TASK_RECORDS_DDL 的 CREATE TABLE 直接建，
+    此迁移对其为 no-op。走 versioned runner 而非 store 的 inline _TASK_RECORDS_MIGRATIONS，
+    以盖章 schema_version、可追溯（P0-C 规范）。
+
+    用 run_migrations 传入的【同一连接】跑 DDL：① 落在目标库（conn_str 指向哪就哪，不再
+    错跑默认库）；② 与 _stamp 同事务，要么全成要么回滚（对账复核 P0-A F1 治本）。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS auto_accept BOOLEAN DEFAULT FALSE"
+        )
+        cur.execute(
+            "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS queue_priority TEXT DEFAULT 'normal'"
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
+    (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
     # 未来迁移在此追加，例如:
-    # (2, "add_xxx_column", _migration_add_xxx_column),
+    # (3, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1
@@ -140,8 +165,11 @@ def run_migrations(conn_str: str | None = None) -> None:
             if fn is None:
                 continue
             logger.info("[migrations] 应用迁移 v%d (%s)", version, name)
+            # 常规迁移接收 run_migrations 的连接，DDL 与盖章同事务（原子）。
+            # 注：baseline(_apply_baseline_ddl) 走上方 current==0 分支直接调、不经本循环
+            # （它需多条独立连接建 pgvector/auth 等，无法共用单连接），故签名差异安全。
             with conn.transaction():
-                fn()  # type: ignore[operator]
+                fn(conn)  # type: ignore[operator]
                 with conn.cursor() as cur:
                     _stamp(cur, version, name)
             current = version

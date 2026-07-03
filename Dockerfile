@@ -58,10 +58,13 @@ USER swarm
 
 EXPOSE 8420
 
-# 健康检查：/api/health（公开端点，不需鉴权）。start-period 给足首启建表时间。
+# 健康检查：/api/health/ready（就绪探针，公开可达、真实探测 PG/Redis[启用时]/Qdrant）。
+# 不用 /api/health（纯存活，不探依赖→依赖宕机仍假绿）；不用 /api/status（需鉴权，#21）。
+# start-period 给足首启跑迁移+建表+连依赖的时间；依赖不可达时返 503→容器判 unhealthy。
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=6 \
-    CMD curl -fsS http://localhost:8420/api/health || exit 1
+    CMD curl -fsS http://localhost:8420/api/health/ready || exit 1
 
 # 启动：uvicorn 起 API（从 site-packages 加载 swarm 包，cwd=/srv 无源码遮蔽）；
-# app.py on_startup 钩子幂等建全部表（与 init_db 一致），无需单独 init_db step。
+# app.py on_startup 钩子先跑 run_migrations（幂等：stamp schema_version）再 ensure_tables
+# 建全部表（与 init_db 同一迁移+建表路径），无需单独 init_db step。
 CMD ["python", "-m", "uvicorn", "swarm.api.app:app", "--host", "0.0.0.0", "--port", "8420"]

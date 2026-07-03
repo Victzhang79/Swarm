@@ -87,13 +87,18 @@ jobs:
           docker compose logs --no-color swarm 2>&1 | tail -200
           exit 1
 
-      - name: 探活 /api/health（容器外部端口）
+      - name: 探活 /api/health（存活）+ /api/health/ready（就绪，真探 PG/Qdrant）
         run: |
           set -e
           body=$(curl -fsS http://localhost:8420/api/health)
           echo "health = $body"
           echo "$body" | grep -q '"status":"ok"'
           echo "✅ /api/health 返回 ok"
+          # 就绪探针必须真连通 PG/Qdrant（否则 compose 内依赖没连上就该红，别只看存活假绿）
+          ready=$(curl -fsS http://localhost:8420/api/health/ready)
+          echo "ready = $ready"
+          echo "$ready" | grep -q '"status":"ok"'
+          echo "✅ /api/health/ready 依赖全连通"
 
       - name: 验证建表（startup 钩子应已幂等建全表）
         run: |

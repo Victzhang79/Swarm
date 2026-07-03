@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from collections import deque
 from typing import Any
 
@@ -34,6 +35,47 @@ class TaskTokenLimitExceeded(Exception):
     def __init__(self, usage: dict[str, Any]):
         self.usage = usage
         super().__init__(f"token limit exceeded: {usage.get('total')}")
+
+
+class TaskLockLost(Exception):
+    """运行中模块锁在 Redis 侧丢失（续期返回 False）——防同模块并发写，fail-fast 中止（2nd#2）。"""
+
+    def __init__(self, lock_key: str):
+        self.lock_key = lock_key
+        super().__init__(f"模块锁丢失: {lock_key}")
+
+
+class TaskWallclockExceeded(Exception):
+    """单次 Brain 执行墙钟超时（P1-B）——防失控任务无上限占沙箱/GPU。
+
+    经 run_task/resume 的 `except Exception` 归一化为 FAILED，finally 释放锁/沙箱/_task_running。
+    """
+
+    def __init__(self, deadline_s: float, elapsed_s: float):
+        self.deadline_s = deadline_s
+        self.elapsed_s = elapsed_s
+        super().__init__(f"任务墙钟超时（已跑 {elapsed_s:.0f}s > 上限 {deadline_s:.0f}s）")
+
+
+def _effective_deadline_s(base_s: float, per_subtask_s: float, subtask_count: int | None) -> float:
+    """P1-B 弹性预算：有效墙钟上限 = base + per_subtask×子任务数。
+
+    ★防误杀大型任务★：base<=0 时返回 0（关闭）。否则随任务规模线性放宽——小任务只用 base，
+    大任务（多子任务）按比例获得更多时间（合法 E2E 大任务实测 7-8h，弹性后达 20h+ 不会被斩）。
+    subtask_count 在规划前未知（None→按 0 算，只用 base；规划揭示后由调用方动态重算放宽）。
+    """
+    if base_s <= 0:
+        return 0.0
+    n = subtask_count if (subtask_count and subtask_count > 0) else 0
+    return base_s + max(0.0, per_subtask_s) * n
+
+
+def _raise_if_wallclock_exceeded(start_monotonic: float, deadline_s: float) -> None:
+    """P1-B：单次执行段超（弹性）墙钟上限 → raise TaskWallclockExceeded。deadline_s<=0 关闭。"""
+    if deadline_s > 0:
+        elapsed = time.monotonic() - start_monotonic
+        if elapsed > deadline_s:
+            raise TaskWallclockExceeded(deadline_s, elapsed)
 
 class _FanoutTopic:
     """单 task 的进度事件【发布-订阅】主题（N-CW1/N-CW2 根因修复）。
@@ -83,24 +125,14 @@ _task_running: set[str] = set()
 # task_id → asyncio.Task 句柄（用于 cancel）
 _task_handles: dict[str, asyncio.Task] = {}
 
-# DB 中视为“进行中”的状态（API 重启后可能 orphaned）
-_ACTIVE_DB_STATUSES = frozenset({
-    "SUBMITTED",
-    "ANALYZING",
-    "PLANNING",
-    "VALIDATING_PLAN",
-    "CONFIRMING",
-    "DISPATCHING",
-    "MONITORING",
-    "HANDLING_FAILURE",
-    "MERGING",
-    "VERIFYING_L2",
-    "VERIFYING_L3",
-    "DELIVERING",
-    "IN_REVISION",
-    "LEARNING_SUCCESS",
-    "LEARNING_FAILURE",
-})
+# DB 中视为“进行中”的状态（API 重启后可能 orphaned）。
+# 单一事实源见 swarm/task_states.py：并集含 CLARIFYING/DESIGN_REVIEW（修 P0-D cancel 死区）。
+from swarm.task_states import (  # noqa: E402
+    ACTIVE_DB_STATUSES as _ACTIVE_DB_STATUSES,
+    ACTIVE_EXECUTION_STATES as _ACTIVE_EXECUTION_STATES,
+    INTERRUPT_SUSPENDED_STATES as _INTERRUPT_SUSPENDED_STATES,
+    TERMINAL_STATES as _TERMINAL_STATES,
+)
 
 # Brain 节点 → 任务状态 / UI 阶段
 _NODE_STATUS_MAP: dict[str, str] = {
@@ -340,6 +372,13 @@ async def _stream_brain_events(
         subtask_count=_subtask_n,
     )
     progress = 10
+    # P1-B：本次执行段墙钟起点 + 弹性预算。每个图事件循环顶检查；超【弹性】上限 → raise →
+    # 归一化 FAILED + 释放资源。★弹性随规划揭示的子任务数动态放宽，绝不误杀合法大型任务★。
+    _wc_cfg = get_config()
+    _wc_base_s = _wc_cfg.task_deadline_s
+    _wc_per_subtask_s = _wc_cfg.task_deadline_per_subtask_s
+    _wc_subtasks = _subtask_n or 0  # 规划前多为 0（只用 base）；下方循环见 plan 输出后放宽
+    _wc_start = time.monotonic()
 
     await _emit(queue, {
         "step": "brain_invoke",
@@ -350,10 +389,32 @@ async def _stream_brain_events(
     })
 
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
+        # P1-B：弹性墙钟闸门——失控任务（replan 空转/卡节点）到点中止，防无上限占沙箱/GPU。
+        # 有效上限按当前已知子任务数动态计算（规划揭示规模后自动放宽，不误杀大型任务）。
+        _wc_effective = _effective_deadline_s(_wc_base_s, _wc_per_subtask_s, _wc_subtasks)
+        try:
+            _raise_if_wallclock_exceeded(_wc_start, _wc_effective)
+        except TaskWallclockExceeded as _wc_exc:
+            await _emit(queue, {
+                "step": "wallclock_exceeded",
+                "status": "failed",
+                "message": str(_wc_exc) + f"（子任务 {_wc_subtasks}，弹性上限）；已中止并释放资源",
+                "mode": "brain",
+                "progress": 100,
+            })
+            raise
         # A-P1-14：搭车续期模块锁——build 跑得比 TTL 久时不至于静默失锁。
         # 无额外后台任务，进程处理每个图事件时顺带 renew（Redis 关闭时 no-op）。
-        if module_lock is not None:
-            module_lock.renew()
+        # ★对抗复核 2nd#2 治本★：renew 返回 False = 锁已在 Redis 侧丢失（另一任务可能已抢占同
+        # 模块并发写工作树）→ 不能再继续，fail-fast 中止本任务（经 except Exception → FAILED +
+        # finally 释放资源）。内存兜底/未启用 Redis 时 renew 恒 True，不触发（单进程无跨进程互斥意义）。
+        if module_lock is not None and not module_lock.renew():
+            await _emit(queue, {
+                "step": "lock_lost", "status": "failed",
+                "message": "模块锁已失效（TTL 超期/Redis 抖动），为防同模块并发写已中止任务",
+                "mode": "brain", "progress": 100,
+            })
+            raise TaskLockLost(getattr(module_lock, "key", "?"))
         kind = event.get("event", "")
         if kind == "on_chain_start":
             name = event.get("name", "")
@@ -375,6 +436,15 @@ async def _stream_brain_events(
             output = (event.get("data") or {}).get("output") or {}
             if name in _SYNC_ON_NODES and isinstance(output, dict):
                 _sync_task_from_state(task_id, output)
+                # P1-B：规划/拆分揭示子任务数 → 放宽弹性墙钟（只增不减，防大型任务被基线上限误杀）。
+                _plan_out = output.get("plan")
+                _subs = None
+                if hasattr(_plan_out, "subtasks"):
+                    _subs = getattr(_plan_out, "subtasks", None)
+                elif isinstance(_plan_out, dict):
+                    _subs = _plan_out.get("subtasks")
+                if isinstance(_subs, list) and len(_subs) > _wc_subtasks:
+                    _wc_subtasks = len(_subs)
             if name in ("merge", "dispatch") and isinstance(output, dict):
                 fresh = store.get_task(task_id) or task_rec
                 ok, usage = store.check_task_token_limit(
@@ -467,6 +537,40 @@ def _extract_interrupt_info(snapshot: Any, state: dict[str, Any]) -> dict[str, A
             if isinstance(val, dict):
                 return val
     return None
+
+
+async def _has_pending_checkpoint(task_id: str) -> bool:
+    """探测任务在 LangGraph checkpoint 里是否仍处于【挂起（有下一步/interrupt）】状态。
+
+    对账用（2nd#1）：区分"真挂起（可 resume）"与"DB 假挂起（checkpoint 丢失）"。
+    纯读、不推进图。异常/无快照/无 next → False（fail-closed：宁可判失败也不留假挂起）。
+    """
+    from swarm.tracing import brain_graph_config
+
+    try:
+        graph = get_compiled_brain_graph()
+        task_rec = store.get_task(task_id) or {}
+        thread_id = task_rec.get("thread_id") or task_id
+        config = brain_graph_config(
+            task_id=task_id,
+            project_id=task_rec.get("project_id") or "",
+            thread_id=thread_id,
+            resume=False,
+            description=(task_rec.get("description") or "")[:200],
+            complexity=task_rec.get("complexity"),
+            subtask_count=None,
+        )
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[RECONCILE] checkpoint 探测失败 task=%s: %s", task_id, exc)
+        return False
+    if snapshot is None:
+        return False
+    # 有 next（待执行节点）或有 interrupt 载荷 → 仍是可续跑的挂起点。
+    has_next = bool(getattr(snapshot, "next", None))
+    state = dict(snapshot.values) if getattr(snapshot, "values", None) else {}
+    has_interrupt = _extract_interrupt_info(snapshot, state) is not None
+    return has_next or has_interrupt
 
 
 async def get_pending_interrupt(task_id: str) -> dict[str, Any] | None:
@@ -805,14 +909,24 @@ async def resume_task(
     task_id: str,
     decision: str,
     feedback: str = "",
+    revert_status: str | None = None,
 ) -> None:
-    """恢复被 interrupt 暂停的任务"""
+    """恢复被 interrupt 暂停的任务。
+
+    revert_status（P1-A）：端点在原子认领时已把状态推出人工闸态（→ ANALYZING/IN_REVISION）；
+    若此处因【同项目模块锁被占用】这类瞬时原因未能真正开跑，须把状态【回滚到原审核态】，
+    否则任务卡在 ANALYZING 却无 resume 在跑、且用户无法再次点通过（认领 gate 已关）。
+    """
     from swarm.logging_config import set_task_context
 
     set_task_context(task_id)
     queue = _task_queues.get(task_id) or register_task_queue(task_id)
 
     if task_id in _task_running:
+        # 对抗复核 #2：认领已把状态推出人工闸态，此处并发早退须回滚，否则任务卡 ANALYZING/
+        # IN_REVISION 且用户无法再点审批（认领 gate 已关），只能等重启对账。
+        if revert_status:
+            store.update_task(task_id, status=revert_status)
         await _emit(queue, {"step": "error", "status": "error", "message": "任务正在执行，请稍候"})
         return
 
@@ -832,6 +946,9 @@ async def resume_task(
     TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():
+        # 瞬时锁占用 → 回滚认领状态，让用户可重试（否则卡 ANALYZING 无 resume）。
+        if revert_status:
+            store.update_task(task_id, status=revert_status)
         await _emit(queue, {
             "step": "error",
             "status": "error",
@@ -872,6 +989,16 @@ async def resume_task(
             module_lock=module_lock,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
+    except asyncio.CancelledError:
+        # F3：取消是 BaseException，不被 except Exception 捕获——须显式落 CANCELLED，
+        # 否则 resume 途中被 cancel_task 取消会把任务卡在 ANALYZING/IN_REVISION（认领已推进的态）
+        # 直到重启对账才转终态；与 run_task 的取消处理对齐。
+        logger.info("[RUNNER] 任务 %s resume 已取消", task_id)
+        store.update_task(task_id, status="CANCELLED")
+        await _emit(queue, {
+            "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
+        })
+        raise
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -885,9 +1012,19 @@ async def resume_task(
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # P1-B：兜底释放本任务沙箱（如 revise-resume 再派发过 worker）——墙钟/异常中止时不泄漏。
+        try:
+            from swarm.worker.sandbox import get_sandbox_manager
+            get_sandbox_manager().kill_by_task(task_id)
+        except Exception:  # noqa: BLE001
+            pass
 
 
-async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
+async def resume_planning(
+    task_id: str,
+    payload: dict[str, Any],
+    revert_status: str | None = None,
+) -> None:
     """恢复被规划子图 interrupt（clarify / review_design）暂停的任务。
 
     与 resume_task 区别：clarify/review 的 resume 是结构化 payload（透传原样给 graph），
@@ -901,6 +1038,9 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
 
     queue = _task_queues.get(task_id) or register_task_queue(task_id)
     if task_id in _task_running:
+        # 对抗复核 #2：与 resume_task 对齐——并发早退回滚认领态，防卡 ANALYZING 无法再审批。
+        if revert_status:
+            store.update_task(task_id, status=revert_status)
         await _emit(queue, {"step": "error", "status": "error", "message": "任务正在执行，请稍候"})
         return
     task = store.get_task(task_id)
@@ -918,6 +1058,9 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
     TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():
+        # 瞬时锁占用 → 回滚认领状态（回到 CLARIFYING/DESIGN_REVIEW），让用户可重试。
+        if revert_status:
+            store.update_task(task_id, status=revert_status)
         await _emit(queue, {
             "step": "error",
             "status": "error",
@@ -940,6 +1083,15 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
             module_lock=module_lock,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
+    except asyncio.CancelledError:
+        # F3：取消是 BaseException，须显式落 CANCELLED，否则规划 resume 途中被取消会卡在
+        # ANALYZING 直到重启对账；与 run_task/resume_task 对齐。
+        logger.info("[RUNNER] 任务 %s 规划 resume 已取消", task_id)
+        store.update_task(task_id, status="CANCELLED")
+        await _emit(queue, {
+            "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
+        })
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -948,17 +1100,29 @@ async def resume_planning(task_id: str, payload: dict[str, Any]) -> None:
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # P1-B：兜底释放本任务沙箱（规划恢复若再派发过 worker）——墙钟/异常中止时不泄漏。
+        try:
+            from swarm.worker.sandbox import get_sandbox_manager
+            get_sandbox_manager().kill_by_task(task_id)
+        except Exception:  # noqa: BLE001
+            pass
 
 
-def resume_planning_background(task_id: str, payload: dict[str, Any]) -> None:
+def resume_planning_background(
+    task_id: str, payload: dict[str, Any], revert_status: str | None = None
+) -> None:
     """在 FastAPI 后台 resume 规划 interrupt。"""
     async def _wrap() -> None:
         try:
             from swarm.logging_config import bind_task
             with bind_task(task_id):
-                await resume_planning(task_id, payload)
+                await resume_planning(task_id, payload, revert_status=revert_status)
         except Exception:  # noqa: BLE001
             logger.exception("[RUNNER] resume_planning_background 失败 task=%s", task_id)
+        finally:
+            # 对抗复核：与 resume_task_background/start_task_background 对齐——清句柄，
+            # 否则 cancel_task 可能 cancel 到过期句柄 + _task_handles 泄漏。
+            _task_handles.pop(task_id, None)
     _task_handles[task_id] = asyncio.create_task(_wrap())
 
 
@@ -975,6 +1139,110 @@ def is_task_orphaned(task_id: str) -> bool:
     return status in _ACTIVE_DB_STATUSES and task_id not in _task_running
 
 
+async def reconcile_orphan_tasks() -> dict[str, int]:
+    """P0-A 启动对账：把全库"进行中"任务按态类别分治恢复/失败（统一崩溃恢复协议）。
+
+    核心洞察：PG checkpoint 只存图状态、不存外部副作用态（沙箱/工作树/锁）。故不能一刀切
+    "有 checkpoint 就 resume"，必须按态类别分治：
+    - 中断挂起态（CONFIRMING/DELIVERING/CLARIFYING/DESIGN_REVIEW）：无在飞外部工作，
+      checkpoint 是安全续跑点 → 保留，等人工闸经 Command(resume) 继续（依赖 PG checkpointer）。
+    - SUBMITTED：已入队、尚未创建任何外部资源 → 重新入队自动恢复（无需 fail-closed）。
+    - 其余活跃执行态（ANALYZING…LEARNING_*）：外部资源已死、无中途续跑入口 →
+      fail-closed 标 FAILED(orphaned_on_restart) + 显式释放沙箱。
+
+    幂等：本进程在跑的任务（_task_running）跳过。沙箱通常已由 on_startup 的
+    _sweep_startup_orphans（按实例标签重扫服务端）清掉，此处 kill_by_task 为显式兜底。
+    """
+    loop = asyncio.get_running_loop()
+    stats = {"resumed_interrupt": 0, "requeued": 0, "failed": 0, "skipped_running": 0}
+    try:
+        candidates = await loop.run_in_executor(None, store.list_orphan_candidates)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RECONCILE] 读孤儿候选失败，跳过启动对账: %s", exc)
+        return stats
+
+    from swarm.brain.scheduler import is_task_claimed
+
+    for rec in candidates:
+        tid = rec.get("id")
+        status = rec.get("status", "")
+        if not tid:
+            continue
+        # 本进程已认领（在跑 or 已出队进并发槽）→ 非孤儿，跳过（含调度器刚出队 Redis 残留项的窗口）。
+        if is_task_claimed(tid):
+            stats["skipped_running"] += 1
+            continue
+
+        if status in _INTERRUPT_SUSPENDED_STATES:
+            # ★对抗复核 2nd#1 治本★：保留中断态前【探测 checkpoint 是否真的还在挂起点】。
+            # 若 checkpoint 丢失（MemorySaver 重启 / 表损坏 / 只含 task_records 的备份恢复）→
+            # DB 显示"待审"但 Command(resume) 无 snapshot 可续 → 用户点审批必 FAILED、上下文作废，
+            # 是"假挂起"权威分裂。探测无挂起 → fail-closed 标 FAILED(checkpoint_missing)，让用户重提交。
+            has_ckpt = await _has_pending_checkpoint(tid)
+            if has_ckpt:
+                stats["resumed_interrupt"] += 1
+                _audit_reconcile(tid, rec, "recovered_interrupt", status,
+                                 "API restart; interrupt-suspended task kept for human resume")
+                logger.info("[RECONCILE] 任务 %s 中断挂起态 %s 保留待人工 resume", tid, status)
+            else:
+                await loop.run_in_executor(
+                    None, lambda t=tid: store.update_task(t, status="FAILED")
+                )
+                _audit_reconcile(tid, rec, "checkpoint_missing", "FAILED",
+                                 "interrupt-suspended in DB but no checkpoint snapshot; cannot resume")
+                stats["failed"] += 1
+                logger.warning("[RECONCILE] 任务 %s 中断态 %s 但 checkpoint 丢失 → FAILED（假挂起，请重提交）",
+                               tid, status)
+
+        elif status == "SUBMITTED":
+            try:
+                from swarm.brain.scheduler import submit_task
+
+                submit_task(
+                    tid, rec["project_id"], rec["description"],
+                    auto_accept=bool(rec.get("auto_accept", False)),
+                    priority=rec.get("queue_priority") or "normal",
+                )
+                stats["requeued"] += 1
+                logger.info("[RECONCILE] 任务 %s SUBMITTED 重入队自动恢复", tid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[RECONCILE] 任务 %s 重入队失败: %s", tid, exc)
+
+        else:
+            # 活跃执行态 fail-closed
+            try:
+                await loop.run_in_executor(
+                    None, lambda t=tid: store.update_task(t, status="FAILED")
+                )
+                _audit_reconcile(tid, rec, "orphaned_on_restart", "FAILED",
+                                 "API restart; active-execution task failed-closed, resources released")
+                _task_running.discard(tid)
+                try:
+                    from swarm.worker.sandbox import get_sandbox_manager
+
+                    get_sandbox_manager().kill_by_task(tid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[RECONCILE] 任务 %s 释放沙箱兜底失败: %s", tid, exc)
+                stats["failed"] += 1
+                logger.info("[RECONCILE] 任务 %s 活跃执行态 %s → FAILED(orphaned_on_restart)", tid, status)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[RECONCILE] 任务 %s 标记 FAILED 失败: %s", tid, exc)
+
+    logger.info("[RECONCILE] 启动对账完成: %s", stats)
+    return stats
+
+
+def _audit_reconcile(task_id: str, rec: dict[str, Any], event: str, status: str, detail: str) -> None:
+    """对账留痕（append-only 审计），失败不阻断。"""
+    try:
+        store.append_task_audit(
+            task_id, event=event, project_id=rec.get("project_id"),
+            status=status, description=(rec.get("description") or "")[:200], detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[RECONCILE] 审计留痕失败 task=%s: %s", task_id, exc)
+
+
 def can_retry_task(task_id: str) -> tuple[bool, str]:
     """是否允许重跑任务"""
     task = store.get_task(task_id)
@@ -987,16 +1255,17 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
     status = task.get("status", "")
 
     # 人工审核态优先拦截：即使本进程未在跑（orphaned），这类任务也需要
-    # 先由人工 通过/修订/拒绝 决策，而不是直接重跑（否则丢失待审产出）。
-    if status in ("DELIVERING", "CONFIRMING"):
-        return False, "任务等待人工审核，请先通过/修订/拒绝"
+    # 先由人工 通过/修订/拒绝/答复 决策，而不是直接重跑（否则丢失待审产出/中断上下文）。
+    # P0-D：对称覆盖全部中断挂起态（补 CLARIFYING/DESIGN_REVIEW，与 cancel/resume 口径一致）。
+    if status in _INTERRUPT_SUSPENDED_STATES:
+        return False, "任务等待人工审核，请先通过/修订/拒绝/答复"
 
     if is_task_orphaned(task_id):
         return True, ""
 
     # PARTIAL（部分交付：部分子任务放弃/保 build 桩）也允许重跑——
     # 否则一旦进入部分交付终态就永久卡死，无法对放弃的子任务再尝试。
-    if status in ("FAILED", "CANCELLED", "DONE", "PARTIAL"):
+    if status in _TERMINAL_STATES:
         return True, ""
 
     if status in _ACTIVE_DB_STATUSES:
@@ -1151,14 +1420,16 @@ def start_task_background(
     _task_handles[task_id] = asyncio.create_task(_wrap())
 
 
-def resume_task_background(task_id: str, decision: str, feedback: str = "") -> None:
+def resume_task_background(
+    task_id: str, decision: str, feedback: str = "", revert_status: str | None = None
+) -> None:
     """在 FastAPI 后台 resume 任务"""
     async def _wrap() -> None:
         from swarm.logging_config import bind_task
 
         with bind_task(task_id):
             try:
-                await resume_task(task_id, decision, feedback)
+                await resume_task(task_id, decision, feedback, revert_status=revert_status)
             finally:
                 _task_handles.pop(task_id, None)
 

@@ -7,7 +7,7 @@ from swarm.project.store import _TASK_SELECT, _row_to_task
 
 
 def _row(subtask_count, completed, abandoned):
-    """按 _TASK_SELECT 顺序构造 23 列行（0..22）。"""
+    """按 _TASK_SELECT 顺序构造 25 列行（0..24）。"""
     now = datetime.datetime(2026, 7, 2)
     return (
         "t-1", "p-1", "desc", "RUNNING", "complex",  # 0-4
@@ -17,13 +17,16 @@ def _row(subtask_count, completed, abandoned):
         now, now,                                      # 16-17 created/updated
         [], False, False, "",                          # 18-21
         abandoned,                                     # 22 abandoned_subtasks
+        False, "normal",                               # 23 auto_accept,24 queue_priority
     )
 
 
-def test_select_has_23_columns():
+def test_select_has_25_columns():
     cols = [c.strip() for c in _TASK_SELECT.replace("\n", " ").split(",") if c.strip()]
-    assert cols[-1] == "abandoned_subtasks", cols
-    assert len(cols) == 23, cols
+    # P0-A：末尾追加队列执行 meta 两列（auto_accept, queue_priority）。
+    assert cols[-3] == "abandoned_subtasks", cols
+    assert cols[-2:] == ["auto_accept", "queue_priority"], cols
+    assert len(cols) == 25, cols
 
 
 def test_three_accounts_typical():

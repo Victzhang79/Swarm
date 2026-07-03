@@ -654,12 +654,38 @@ class SandboxManager:
             _meta["swarm_project"] = str(project_id)
         if task_id:
             _meta["swarm_task"] = str(task_id)
+        # F1（对抗复核跟进）：request_timeout = 建沙箱【HTTP 请求】超时，绑住 CubeMaster/E2B API
+        # 挂起（TCP 卡死不返回）——否则 create 走 asyncio.to_thread 会占死共享线程池一个线程直到
+        # 进程重启（reviewer 实证：4 任务并发 bootstrap 时可拖垮派发）。注意与 timeout(沙箱生命周期)
+        # 正交。SWARM_SANDBOX_REQUEST_TIMEOUT 可调（默认 60s），<=0 关闭。
         try:
-            sandbox = Sandbox.create(template=template, timeout=timeout, metadata=_meta)
-        except TypeError:
-            # 旧 SDK 不接受 metadata 参数 → 降级
-            logger.warning("[A1] Sandbox.create 不支持 metadata，降级无标签创建（实例隔离失效，回退开关清扫）")
-            sandbox = Sandbox.create(template=template, timeout=timeout)
+            _rt = float(os.environ.get("SWARM_SANDBOX_REQUEST_TIMEOUT", "60"))
+        except ValueError:
+            _rt = 60.0
+
+        def _do_create(**extra):
+            return Sandbox.create(template=template, timeout=timeout, **extra)
+
+        # 只对【不支持该 kwarg】的 TypeError 降级；SDK 内部的 TypeError（反序列化/断言等真错）
+        # 必须原样抛出，不能被误当"不支持参数"吞掉后带病创建（对抗复核 F1）。
+        def _is_unsupported_kwarg(exc: TypeError) -> bool:
+            return "unexpected keyword argument" in str(exc)
+
+        try:
+            sandbox = _do_create(metadata=_meta, **({"request_timeout": _rt} if _rt > 0 else {}))
+        except TypeError as _e1:
+            if not _is_unsupported_kwarg(_e1):
+                raise
+            # 旧 SDK 不支持 request_timeout → 保住 metadata（实例隔离），仅放弃请求超时。
+            try:
+                sandbox = _do_create(metadata=_meta)
+                logger.warning("[A1] Sandbox.create 不支持 request_timeout，降级（HTTP 请求超时失效）")
+            except TypeError as _e2:
+                if not _is_unsupported_kwarg(_e2):
+                    raise
+                # 更旧 SDK 连 metadata 也不支持 → 最小签名（实例隔离失效，回退开关清扫）。
+                logger.warning("[A1] Sandbox.create 不支持 metadata，降级无标签创建（实例隔离失效，回退开关清扫）")
+                sandbox = _do_create()
         self._instances[sandbox.sandbox_id] = sandbox
         self.register_sandbox_meta(
             sandbox.sandbox_id,

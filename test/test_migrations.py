@@ -110,26 +110,28 @@ def test_fresh_db_runs_baseline_then_stamps():
 
 # ───────────────────────── 幂等：已应用不重复 ─────────────────────────
 def test_idempotent_already_applied_does_nothing():
-    # schema_version 已有 version=1 → 不再决策基线、不再盖章
-    conn = _FakeConn(sentinel="public.projects", max_version=1)
+    # schema_version 已到最新版（当前 = v2 add_task_queue_meta）→ 不再决策基线、不再盖章。
+    _latest = runner._MIGRATIONS[-1][0]
+    conn = _FakeConn(sentinel="public.projects", max_version=_latest)
     with _patch_pool(conn):
         with patch.object(runner, "_apply_baseline_ddl") as ddl:
             runner.run_migrations("postgresql://x")
             ddl.assert_not_called()
-    assert conn.stamped == [], "已应用基线时不应再盖章"
+    assert conn.stamped == [], "已应用全部迁移时不应再盖章"
 
 
 def test_running_twice_does_not_reapply():
-    """连续两次：第一次盖章，第二次因 schema_version 非空而短路。"""
+    """连续两次：第一次盖章 baseline(1)+后续迁移，第二次因 schema_version 已到最新而短路。"""
+    all_versions = [v for v, _, _ in runner._MIGRATIONS]  # 当前 = [1, 2]
     conn = _FakeConn(sentinel="public.projects", max_version=0)
     with _patch_pool(conn):
         with patch.object(runner, "_apply_baseline_ddl") as ddl:
-            runner.run_migrations("postgresql://x")  # 第一次：盖章
+            runner.run_migrations("postgresql://x")  # 第一次：盖章全部
             stamped_after_first = list(conn.stamped)
-            runner.run_migrations("postgresql://x")  # 第二次：max_version 现为 1，短路
-            ddl.assert_not_called()
-    assert stamped_after_first == [1]
-    assert conn.stamped == [1], "第二次运行不应再盖章（幂等）"
+            runner.run_migrations("postgresql://x")  # 第二次：max_version 已到最新，短路
+            ddl.assert_not_called()  # 既有库基线只盖章不跑 DDL
+    assert stamped_after_first == all_versions
+    assert conn.stamped == all_versions, "第二次运行不应再盖章（幂等）"
 
 
 def test_schema_version_table_ensured():

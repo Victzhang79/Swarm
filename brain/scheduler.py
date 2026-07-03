@@ -78,6 +78,51 @@ def pending_count() -> int:
     return len(_pending_meta) + len(_inflight)
 
 
+def is_task_claimed(task_id: str) -> bool:
+    """task 是否已被本进程认领：在调度器并发槽（_inflight，已出队待/在跑）或 runner 在跑。
+
+    供启动对账（reconcile）用：仅查 runner._task_running 会漏掉"已出队进 _inflight 但
+    run_task 尚未把 task 加进 _task_running"的窗口 → 误判孤儿重入队（虽被本函数在 dequeue
+    侧兜住不会双跑，但会产生虚假恢复日志 + 冗余 Redis 项）。
+    """
+    from swarm.brain.runner import is_task_running
+
+    return task_id in _inflight or is_task_running(task_id)
+
+
+# 去重守卫（dequeue 侧）：语义同 is_task_claimed，保留旧名供 _loop 引用。
+_is_already_running = is_task_claimed
+
+
+def _resolve_exec_meta(task_id: str) -> dict | None:
+    """取任务执行 meta：优先进程内 _pending_meta，缺失则从 DB 重建（P0-A leader 重启恢复）。
+
+    返回 None = 该队列项应丢弃（DB 无记录 or 已终态——陈旧残留）。
+    重建成功会回填 _pending_meta，避免同任务后续再查库。
+    """
+    meta = _pending_meta.get(task_id)
+    if meta is not None:
+        return meta
+    from swarm.project import store
+
+    rec = store.get_task(task_id)
+    # fail-closed：队列的唯一合法待跑项是 **SUBMITTED**（已入队、尚未开跑、无 checkpoint）。
+    # ★对抗复核 P0 治本★：此前放行整个 ACTIVE_EXECUTION_STATES → 冷启动时 Redis 残留队列项
+    # 若指向一个【已开跑/审批认领后为 ANALYZING】的任务，会被凭空用【全新 initial_state】在同
+    # thread_id 上再跑一遍 run_task（非 Command(resume)）→ 与 PG checkpoint 里挂起的 interrupt/
+    # 半执行图状态双写互踩。故只认 SUBMITTED；任何非 SUBMITTED 的队列项一律丢弃（交对账处置）。
+    if rec is None or rec.get("status") != "SUBMITTED":
+        return None
+    meta = {
+        "project_id": rec["project_id"],
+        "description": rec["description"],
+        "auto_accept": bool(rec.get("auto_accept", False)),
+    }
+    _pending_meta[task_id] = meta
+    logger.info("[Scheduler] 任务 %s 从 DB 重建执行 meta（重启恢复）", task_id)
+    return meta
+
+
 def _project_ready_for_exec(project_id: str) -> bool:
     """准入闸门：项目是否可以启动任务执行。
 
@@ -121,10 +166,16 @@ async def start_task_scheduler() -> None:
                     item = TaskQueue.dequeue()
                     if item:
                         task_id = item["task_id"]
-                        meta = _pending_meta.get(task_id)
+                        # 去重守卫：同 task 已在跑/在飞（重入队 or 重启后 Redis 残留双份）→
+                        # 丢弃本次出队，绝不双跑（否则同任务两条执行链烧资源、状态互踩）。
+                        if _is_already_running(task_id):
+                            logger.info("[Scheduler] 任务 %s 已在执行，丢弃重复出队项", task_id)
+                            continue
+                        # P0-A：进程内 meta 缺失（leader 重启，Redis 队列存活但 _pending_meta 清零）
+                        # → 从 DB 重建（不再静默丢）；返回 None 表示陈旧项（无记录/已终态）应丢弃。
+                        meta = _resolve_exec_meta(task_id)
                         if meta is None:
-                            # 元数据丢失（如进程重启）→ 跳过，由 orphan 恢复逻辑处理
-                            logger.warning("[Scheduler] 任务 %s 缺执行元数据，跳过", task_id)
+                            logger.info("[Scheduler] 任务 %s 无有效记录或已终态，丢弃陈旧队列项", task_id)
                             continue
                         # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
                         # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）

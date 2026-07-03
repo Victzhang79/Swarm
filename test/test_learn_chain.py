@@ -31,12 +31,14 @@ def test_approve_resumes_brain_accept():
         mock_store.get_task.return_value = task
         mock_store.get_project.return_value = {"id": "p1", "path": "/tmp"}
         mock_store.update_task.return_value = task
+        # P1-A：approve 先原子认领（返回认领后的行），resume 带 revert_status=原审核态。
+        mock_store.claim_human_gate.return_value = task
         with patch("swarm.brain.runner.resume_task_background") as mock_resume:
             with patch("swarm.brain.runner.register_task_queue"):
                 client = TestClient(app)
                 resp = client.post("/api/tasks/task-1/approve")
                 assert resp.status_code == 200, resp.text
-                mock_resume.assert_called_once_with("task-1", "accept")
+                mock_resume.assert_called_once_with("task-1", "accept", revert_status="DELIVERING")
     print("  ✅ approve → resume_task_background(accept)")
 
 

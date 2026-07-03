@@ -102,8 +102,40 @@ def _mask_webhook_url(value: str) -> str:
     return f"{value[:20]}…{value[-6:]}"
 
 
+from urllib.parse import urlsplit, urlunsplit
+
+
+def _has_uri_credentials(v: str) -> bool:
+    try:
+        return bool(urlsplit(v).password)
+    except ValueError:
+        return False
+
+
+def _mask_uri_credentials(v: str) -> str:
+    """把 URI 里 user:password@ 的 password 段脱敏为 ***（对抗复核：postgres_uri/redis_uri
+    默认含 swarm:swarm，_mask_config_dict 原只掩键名漏了 *_uri 里的密码）。
+
+    用 urlsplit 正确解析（不用正则）——覆盖 Redis 空用户名 redis://:pass@ 且不被密码里的 @
+    截断（正则版会漏掩 p@ss 的 @ss 后缀，对抗复核 Finding 5）。无密码段则原样返回。
+    """
+    try:
+        parts = urlsplit(v)
+    except ValueError:
+        return v
+    if not parts.password:
+        return v
+    userinfo = ("%s:***" % parts.username) if parts.username else ":***"
+    # 重组 netloc：userinfo@host[:port]
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    netloc = f"{userinfo}@{host}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 def _mask_config_dict(cfg: dict) -> dict:
-    """递归脱敏配置中的 API Key / webhook_url 字段（token 即凭据）"""
+    """递归脱敏配置中的 API Key / webhook_url / URI 内嵌凭据 字段（token 即凭据）"""
     out: dict[str, Any] = {}
     for k, v in cfg.items():
         key_lower = k.lower()
@@ -111,6 +143,9 @@ def _mask_config_dict(cfg: dict) -> dict:
             p in key_lower for p in ("api_key", "apikey", "secret", "password")
         ):
             out[k] = _mask_api_key(v)
+        elif isinstance(v, str) and _has_uri_credentials(v):
+            # postgres_uri/redis_uri 等：掩掉内嵌密码，保留 host/db 供运维辨识。
+            out[k] = _mask_uri_credentials(v)
         elif isinstance(v, str) and _is_webhook_url(key_lower, v):
             out[k] = _mask_webhook_url(v)
         elif isinstance(v, dict):

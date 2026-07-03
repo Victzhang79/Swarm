@@ -1135,7 +1135,15 @@ def confirm_plan(state: BrainState) -> dict:
         human_decision = HumanDecision.REJECT
 
     logger.info(f"[CONFIRM] 人工决策: {human_decision.value}")
-    return {"human_decision": human_decision}
+    _patch_out: dict = {"human_decision": human_decision}
+    # ★对抗复核 3rd-P1a 治本★：REVISE 时把用户填写的修改意见带进 replan_feedback，供 PLAN 节点
+    # 定向重规划（plan 节点读 state["replan_feedback"]）。此前只取 decision 字段、丢弃 feedback →
+    # confirm 修订退化成"盲重规划"（与 DELIVER 修订链路不对称）。仅 REVISE 且有反馈时注入。
+    if human_decision == HumanDecision.REVISE and isinstance(decision, dict):
+        _fb = (decision.get("feedback") or "").strip()
+        if _fb:
+            _patch_out["replan_feedback"] = _fb
+    return _patch_out
 
 
 
@@ -3750,6 +3758,22 @@ async def learn_success(state: BrainState) -> dict:
                                 _c.get("commit_hash"), len(out_files))
                 elif not _c.get("ok"):
                     logger.warning("[LEARN_SUCCESS] 产出 commit 跳过(非致命): %s", _c.get("reason"))
+                # ★对抗复核 3rd#1 + Finding 2 治本★：KB 增量索引在此触发——磁盘=已 apply 的最终产出
+                # （非 L2 回滚后 HEAD 旧内容），覆盖 auto+manual accept 两条路径。触发条件用 `ok`（含
+                # "无改动可提交"的合法 no-op）而非 `committed`——否则 commit 报 no-op/nothing-to-commit
+                # 时会静默漏掉整任务 KB 更新（Finding 2 回归）。仅【真 commit 错误(ok=False)】才跳过。
+                if _c.get("ok"):
+                    try:
+                        from swarm.knowledge.hooks import schedule_incremental_update
+                        schedule_incremental_update(
+                            state.get("project_id") or "", proj_path, merged_diff,
+                            task_id=state.get("task_id"),
+                        )
+                    except Exception as _kbexc:  # noqa: BLE001
+                        logger.warning("[LEARN_SUCCESS] KB 增量索引触发失败(知识库本次未更新): %s", _kbexc)
+                else:
+                    logger.warning("[LEARN_SUCCESS] commit 失败 → KB 增量索引跳过（知识库本次未更新）: %s",
+                                   _c.get("reason"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[LEARN_SUCCESS] 产出 commit 异常(非致命): %s", exc)
 

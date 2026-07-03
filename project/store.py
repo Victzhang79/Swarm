@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS task_records (
     human_decision TEXT,
     merged_diff TEXT,
     thread_id TEXT,
+    auto_accept BOOLEAN DEFAULT FALSE,
+    queue_priority TEXT DEFAULT 'normal',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -156,7 +158,8 @@ _TASK_SELECT = """
     merge_conflicts, l3_result, created_by_user_id,
     created_at, updated_at,
     uploaded_files, auto_confirm_vision, pooled, ingest_draft,
-    abandoned_subtasks
+    abandoned_subtasks,
+    auto_accept, queue_priority
 """
 
 
@@ -635,6 +638,30 @@ def list_tasks(project_id: str, conn_str: str | None = None) -> list[dict[str, A
     return [_row_to_task(r) for r in rows]
 
 
+def list_orphan_candidates(conn_str: str | None = None) -> list[dict[str, Any]]:
+    """列出全库（跨项目）处于"进行中"（非终态、非 POOLED）的任务。
+
+    P0-A：API/leader 重启后，这些任务的进程内执行态已清零，可能 orphaned。
+    reconcile_orphan_tasks 据此按态类别分治（中断挂起态保留 / SUBMITTED 重入队 /
+    活跃执行态 fail-closed）。参数用 task_states.ACTIVE_DB_STATUSES 单一事实源。
+    """
+    from swarm.task_states import ACTIVE_DB_STATUSES
+
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_TASK_SELECT}
+                FROM task_records
+                WHERE status = ANY(%s)
+                ORDER BY created_at ASC
+                """,
+                (list(ACTIVE_DB_STATUSES),),
+            )
+            rows = cur.fetchall()
+    return [_row_to_task(r) for r in rows]
+
+
 def update_task(
     task_id: str,
     *,
@@ -651,6 +678,8 @@ def update_task(
     duration_seconds: float | None = None,
     merge_conflicts: list[dict[str, Any]] | None = None,
     l3_result: dict[str, Any] | None = None,
+    auto_accept: bool | None = None,
+    queue_priority: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新任务字段"""
@@ -696,6 +725,12 @@ def update_task(
     if l3_result is not None:
         sets.append("l3_result = %s")
         params.append(Jsonb(l3_result))
+    if auto_accept is not None:
+        sets.append("auto_accept = %s")
+        params.append(auto_accept)
+    if queue_priority is not None:
+        sets.append("queue_priority = %s")
+        params.append(queue_priority)
 
     if not sets:
         return get_task(task_id, conn_str)
@@ -709,6 +744,44 @@ def update_task(
                 f"""
                 UPDATE task_records SET {', '.join(sets)}
                 WHERE id = %s
+                RETURNING {_TASK_SELECT}
+                """,
+                params,
+            )
+            row = cur.fetchone()
+    return _row_to_task(row) if row else None
+
+
+def claim_human_gate(
+    task_id: str,
+    allowed_states: "frozenset[str] | set[str] | tuple[str, ...]",
+    new_status: str,
+    *,
+    human_decision: str | None = None,
+    conn_str: str | None = None,
+) -> dict[str, Any] | None:
+    """原子认领人工闸决策（P1-A 审批幂等 + 前置态校验）。
+
+    单条条件 UPDATE = 原子（PG 行锁）：仅当任务【当前处于 allowed_states 之一】才把状态推进到
+    new_status（并可选记 human_decision），返回更新后的行；否则（状态不匹配 / 已被并发认领离开该态 /
+    已终态）返回 None。
+
+    这解决双击/重复提交：第一次点击把状态推出人工闸态，第二次点击的同一 UPDATE 因 WHERE 不再匹配
+    → 0 行 → None → 端点走幂等无副作用分支（不重复 apply diff / 不重复触发 resume / 不发spurious）。
+    """
+    sets = ["status = %s", "updated_at = NOW()"]
+    params: list[Any] = [new_status]
+    if human_decision is not None:
+        sets.append("human_decision = %s")
+        params.append(human_decision)
+    params.append(task_id)
+    params.append(list(allowed_states))
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE task_records SET {', '.join(sets)}
+                WHERE id = %s AND status = ANY(%s)
                 RETURNING {_TASK_SELECT}
                 """,
                 params,
@@ -811,8 +884,15 @@ def delete_task(task_id: str, conn_str: str | None = None) -> bool:
 
 # #3 round22：PARTIAL 是终态（任务已收敛不再推进），历史漏它 → 去重(:549)误当活跃任务、
 # 平均时长(:925)统计漏 PARTIAL。与 types.TaskStatus.is_terminal_status 同口径（含 PARTIAL）。
-_TERMINAL_STATUSES = ("DONE", "FAILED", "CANCELLED", "PARTIAL")
-_NOTIFY_STATUSES = ("DONE", "FAILED", "CONFIRMING", "DELIVERING")
+# 单一事实源见 swarm/task_states.py（保 tuple 形态，下游 SQL list(...) 调用点不动）。
+from swarm.task_states import (  # noqa: E402
+    INTERRUPT_SUSPENDED_STATES as _INTERRUPT_SUSPENDED_STATES,
+    TERMINAL_STATES as _TERMINAL_STATES_SET,
+)
+_TERMINAL_STATUSES = tuple(sorted(_TERMINAL_STATES_SET))
+# 需通知的状态：完成/失败 + 全部人工闸中断挂起态（含 CLARIFYING/DESIGN_REVIEW）。
+# 单一事实源：否则新增的中断态用户收不到通知 → 人工闸静默死等（与 P0-D 死区同源）。
+_NOTIFY_STATUSES = ("DONE", "FAILED", *sorted(_INTERRUPT_SUSPENDED_STATES))
 
 
 def _task_event_type(status: str) -> str:
@@ -820,7 +900,7 @@ def _task_event_type(status: str) -> str:
         return "task_completed"
     if status == "FAILED":
         return "task_failed"
-    if status in ("CONFIRMING", "DELIVERING"):
+    if status in _INTERRUPT_SUSPENDED_STATES:
         return "waiting_review"
     return "task_updated"
 
@@ -1093,7 +1173,7 @@ def _notification_message(status: str, description: str) -> str:
         return f"任务已完成: {short}"
     if status == "FAILED":
         return f"任务失败: {short}"
-    if status in ("CONFIRMING", "DELIVERING"):
+    if status in _INTERRUPT_SUSPENDED_STATES:
         return f"待审核: {short}"
     return short
 
@@ -1492,6 +1572,9 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
             0,
             (row[6] or 0) - (row[7] or 0) - ((row[22] or 0) if len(row) > 22 else 0),
         ),
+        # 队列执行 meta（P0-A：leader 重启后从 DB 重建 _pending_meta）。
+        "auto_accept": bool(row[23]) if len(row) > 23 else False,
+        "queue_priority": (row[24] or "normal") if len(row) > 24 else "normal",
     }
 
 

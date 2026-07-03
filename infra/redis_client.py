@@ -49,6 +49,14 @@ def _reprobe_cooldown() -> float:
         return _REDIS_REPROBE_COOLDOWN_SEC
 
 
+def _renew_transient_threshold() -> int:
+    """ModuleLock.renew 连续瞬时失败到此阈值才判失锁（对抗复核 4a；默认 3，SWARM_LOCK_RENEW_TRANSIENT_MAX 可调）。"""
+    try:
+        return max(1, int(os.environ.get("SWARM_LOCK_RENEW_TRANSIENT_MAX", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
 def get_redis() -> Any | None:
     global _redis_client, _redis_unavailable_at
     # 已有可用连接：直接复用。
@@ -91,6 +99,9 @@ class ModuleLock:
         # 导致 B 能释放 A 持有的锁。uuid4 保证全局唯一。
         self.token = uuid.uuid4().hex
         self._held = False
+        # 对抗复核 4a：renew 连续【瞬时错误】计数。瞬时（Redis 抖动/超时）容忍到阈值才判失锁，
+        # 避免一次网络 blip 就杀掉多小时长任务；确认被抢（Lua 返回 0）则立即判失锁不容忍。
+        self._renew_transient_fails = 0
 
     def acquire(self) -> bool:
         r = get_redis()
@@ -124,11 +135,21 @@ class ModuleLock:
                 "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
             )
             ok = r.eval(_renew_lua, 1, self.key, self.token, self.ttl_sec)
+            self._renew_transient_fails = 0  # 成功通信 → 清零瞬时计数
+            # ok=1 续期成功；ok=0 = 锁已不是自己的（被抢/已过期）→ 确认失锁，立即判否。
+            if not bool(ok):
+                logger.warning("[ModuleLock] renew 确认失锁(锁=%s)：value 已非本 token（被抢/过期）", self.key)
             return bool(ok)
         except Exception as exc:  # noqa: BLE001
-            # 续期失败=降级信号：锁可能在持有期内静默过期 → 同模块并发写风险，
-            # 必须可见（带 key 定位是哪把锁）。
-            logger.warning("[ModuleLock] renew 失败(锁=%s)，可能静默失锁: %s", self.key, exc)
+            # 对抗复核 4a：这是【瞬时】通信错误（网络超时/连接池/Redis 重启），不等于确认失锁。
+            # 容忍到阈值前返回 True（不误杀长任务）；连续超阈值才判失锁（Redis 长时不可用=真降级）。
+            self._renew_transient_fails += 1
+            if self._renew_transient_fails < _renew_transient_threshold():
+                logger.warning("[ModuleLock] renew 瞬时失败(锁=%s，第 %d 次，阈值内容忍): %s",
+                               self.key, self._renew_transient_fails, exc)
+                return True
+            logger.warning("[ModuleLock] renew 连续瞬时失败 %d 次(锁=%s)，判失锁: %s",
+                           self._renew_transient_fails, self.key, exc)
             return False
 
     def release(self) -> None:

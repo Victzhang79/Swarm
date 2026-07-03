@@ -664,14 +664,24 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
         logger.info("[A1] PG checkpointer 已初始化（跨副本 interrupt/resume 就绪）")
         return True
     except Exception as exc:  # noqa: BLE001
-        # TD2606-B12：多副本部署下降级 MemorySaver 会破坏【跨副本 interrupt/resume】——人工 ACCEPT
-        # 路由到另一副本时找不到 checkpoint，任务永久孤儿在 CONFIRMING/DELIVERING。
-        # SWARM_REQUIRE_PG_CHECKPOINTER=1 时 fail-closed 拒绝静默降级（生产多副本应启用）。
+        # TD2606-B12 / P0-D：降级 MemorySaver 会破坏 interrupt/resume——单进程重启即丢中断
+        # checkpoint（任务永久卡 CONFIRMING/DELIVERING，Command(resume) 找不到 snapshot）；
+        # 多副本下人工 ACCEPT 路由到另一副本同样找不到 checkpoint。
+        # 默认策略：显式设 SWARM_REQUIRE_PG_CHECKPOINTER 则以其为准；未设时【生产环境默认 fail-fast】
+        # （单进程也必做），开发/测试保留降级以便无 PG 起服务。
         import os as _os
-        if _os.environ.get("SWARM_REQUIRE_PG_CHECKPOINTER", "").strip().lower() in ("1", "true", "yes"):
+        _raw = _os.environ.get("SWARM_REQUIRE_PG_CHECKPOINTER")
+        if _raw is not None:
+            require_pg = _raw.strip().lower() in ("1", "true", "yes")
+        else:
+            try:
+                require_pg = get_config().is_production()
+            except Exception:  # noqa: BLE001 — 配置读取失败按保守（非生产）默认，不因此二次崩
+                require_pg = False
+        if require_pg:
             logger.error(
-                "[A1] PG checkpointer 初始化失败且 SWARM_REQUIRE_PG_CHECKPOINTER 已启用——"
-                "拒绝降级 MemorySaver（多副本 resume 不可用）: %s", exc
+                "[A1] PG checkpointer 初始化失败且要求强制 PG（生产默认 / SWARM_REQUIRE_PG_CHECKPOINTER）——"
+                "拒绝降级 MemorySaver（重启后 interrupt/resume 不可用）: %s", exc
             )
             raise
         logger.warning(

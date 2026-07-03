@@ -661,6 +661,16 @@ class AppConfig(BaseSettings):
     # 遗留单 Key（非空且与 user token 匹配时视为 admin）
     api_key: str = ""
     max_task_tokens: int = 500_000  # 单任务 token 估算硬上限（P1）
+    # P1-B：单次 Brain 执行墙钟【弹性】上限，防失控任务（replan 空转/卡节点）无上限占沙箱/GPU。
+    # ★整体考虑：绝不误杀合法大型任务★——实测合法 E2E 大任务跑 7-8h（见 DEVLOG round9 7h45m）。
+    # 故用【弹性预算】：有效上限 = base + per_subtask×子任务数，随规划揭示的任务规模动态放宽
+    # （与 recursion_limit 弹性同理）。只是【最外层兜底】——单次 LLM 流由 brain_stream_wallclock_s
+    # (1500s) 兜、循环次数由 recursion_limit(≤300) 兜、沙箱由各自超时兜；本项斩的是这些都没兜住的
+    # 累积性真失控。计【单次 active 执行段】(run_task/每次 resume)，不含人工审核等待。
+    # base=0 关闭（不建议生产关）。SWARM_TASK_DEADLINE_S / SWARM_TASK_DEADLINE_PER_SUBTASK_S 可调。
+    # ge=0：负值必是误配，启动即 fail（否则负数会与 0 一样静默关闭保护，运维无感知）。
+    task_deadline_s: float = Field(21600.0, ge=0.0)            # 基线 6h（覆盖微/小/中任务，含慢本地端点余量）
+    task_deadline_per_subtask_s: float = Field(1200.0, ge=0.0)  # 每子任务 +20min（45 子任务→6h+15h=21h，远超合法 8h）
     context_max_tokens: int = 80_000   # L3 滑动窗口总预算
     context_reserve_tokens: int = 16_000  # 预留给模型输出
 
@@ -685,6 +695,10 @@ class AppConfig(BaseSettings):
 # 生产环境若仍是此值视为不安全，拒绝启动。
 _DEFAULT_BOOTSTRAP_ADMIN_PASSWORD = "swarm"
 
+# 公开默认 DB 弱凭据标记（DatabaseConfig.postgres_uri 默认 postgresql://swarm:swarm@...）。
+# 生产环境 postgres_uri 若仍含此 user:pass 段即视为不安全。
+_DEFAULT_DB_CREDENTIALS_MARKER = "swarm:swarm@"
+
 
 def validate_production_security(cfg: "AppConfig | None" = None) -> None:
     """生产模式启动期安全强校验（fail-closed）。
@@ -698,13 +712,22 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
     开发模式（默认）永不 raise，仅在发现弱配置时打 warning 提示。
     """
     cfg = cfg if cfg is not None else get_config()
-    # 镜像 secret_store._get_fernet 的判定：os.environ 取 SWARM_SECRET_KEY 再 strip
+    # 镜像 secret_store._get_fernet 的判定：os.environ 取 SWARM_SECRET_KEY 再 strip。
+    # 注：此项在生产 hard-fail → secret_store 的弱 KDF（DB 串 SHA256 派生根密钥）回退路径
+    # 在生产永不触发（本校验在 on_startup 早于任何 secret 访问），故弱 KDF 已被本项关闭。
     secret_key = _os.environ.get("SWARM_SECRET_KEY", "").strip()
     insecure_secret = not secret_key
     insecure_password = cfg.bootstrap_admin_password == _DEFAULT_BOOTSTRAP_ADMIN_PASSWORD
     # #8：生产禁用 RBAC = 所有请求按匿名 admin 放行（api/auth.py 的 rbac_enabled=False 分支），
     # 等于全站无鉴权。生产模式必须强制开启。
     insecure_rbac = not cfg.rbac_enabled
+    # P1-D：公开默认 DB 弱凭据 swarm:swarm —— 生产库若仍用它 = DB 可被任意猜测登录，
+    # 危害等同默认 admin 密码。用 cfg.db（与其余检查同源，不另建 DatabaseConfig）。
+    # 已知范围：只判嵌入 URI 的默认弱密码 swarm:swarm；swarm 用户无密码（依赖 .pgpass/trust）
+    # 不判——避免误伤 .pgpass/PGPASSWORD 的合法部署（密码不在 URI ≠ 不安全）。
+    insecure_db = _DEFAULT_DB_CREDENTIALS_MARKER in (cfg.db.postgres_uri or "")
+    # P1-D：token TTL=0 = 令牌永不过期（泄露即长期有效）。属硬化建议非致命洞，生产仅告警。
+    insecure_token_ttl = (getattr(cfg, "token_ttl_hours", 0) or 0) <= 0
 
     if not cfg.is_production():
         # 开发模式不拦截，但提醒弱配置
@@ -719,6 +742,10 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
         if insecure_rbac:
             _logger.warning(
                 "rbac_enabled=False（开发模式放行）；生产部署前必须开启 RBAC，否则全站匿名 admin 放行。"
+            )
+        if insecure_db:
+            _logger.warning(
+                "DB 仍用公开默认弱凭据 swarm:swarm（开发模式放行）；生产部署前必须改为强凭据。"
             )
         return
 
@@ -739,10 +766,29 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
             "rbac_enabled=False：生产环境禁用 RBAC 会让所有请求按匿名 admin 放行（全站无鉴权）。"
             "请开启 RBAC（移除 SWARM_RBAC_ENABLED=false 或设为 true）。"
         )
+    if insecure_db:
+        problems.append(
+            "DB 仍用公开默认弱凭据 swarm:swarm：生产数据库可被任意猜测登录。"
+            "请设置 SWARM_DB_POSTGRES_URI 为使用强凭据的连接串。"
+        )
     if problems:
         raise RuntimeError(
             "生产模式（SWARM_ENV=production）安全自检失败，拒绝启动：\n  - "
             + "\n  - ".join(problems)
+        )
+    # 非致命硬化建议（不阻断启动，仅告警）：
+    if insecure_token_ttl:
+        _logger.warning(
+            "生产环境 token_ttl_hours=0（令牌永不过期）：泄露的令牌将长期有效。"
+            "建议设 SWARM_TOKEN_TTL_HOURS 为合理值（如 24 或 168）以限制暴露窗口。"
+        )
+    # RBAC 开启时仍配 legacy SWARM_API_KEY = 一把静态 admin 万能钥匙，绕过用户/token
+    # 吊销与过期（对抗复核）。不硬拦（可能是有意的服务账号），但生产必须告警周知。
+    if cfg.rbac_enabled and (getattr(cfg, "api_key", "") or "").strip():
+        _logger.warning(
+            "生产环境 RBAC 已开但仍设置 legacy SWARM_API_KEY：该静态 key 等价全局 admin 且"
+            "【无法吊销/过期】，泄露即长期后门。建议清空 SWARM_API_KEY，改用可吊销的用户 token；"
+            "如确为服务账号需专用凭据，请评估降权。"
         )
 
 
@@ -759,7 +805,12 @@ def get_config() -> AppConfig:
 
 def reload_config() -> AppConfig:
     global _config
-    _config = AppConfig()
+    candidate = AppConfig()
+    # P1-D：先在【提交到全局 _config 之前】重跑生产安全门禁——否则运行期热更新可把生产配置改成
+    # 不安全（禁 RBAC / 默认凭据 / 清 SECRET_KEY）而启动期校验管不到。生产下违规 → raise，
+    # 且【不安装该不安全配置】（validate 在赋值 _config 之前，失败则 _config 保持旧安全值）。
+    validate_production_security(candidate)
+    _config = candidate
     # TD2606-C16：配置 reload 必须连带刷新依赖 .env 的下游 TTL 缓存（secret/sandbox/黑名单 store），
     # 否则新 base_url 配旧 key、旧沙箱模板等不一致最长可持续到各自 TTL 过期（~30s）。
     import importlib

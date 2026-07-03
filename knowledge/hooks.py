@@ -31,11 +31,20 @@ def _track_bg_task(task: asyncio.Task) -> None:
 
 
 def _build_changes(project_path: str, merged_diff: str) -> list[FileChange]:
+    """从 merged_diff 涉及文件构建 KB 变更集。
+
+    ★对抗复核 3rd#1 前提★：本函数读【磁盘当前内容】——必须在【产出已 apply+commit 之后】调用
+    （learn_success commit 后），否则读到的是 L2 回滚后的 HEAD 旧内容 → 知识库被旧代码覆盖。
+    删除文件（diff 里有、磁盘已不在）→ 发 DELETED 让 updater 清除旧向量，不再残留。
+    """
     root = Path(project_path)
     changes: list[FileChange] = []
     for rel in files_from_unified_diff(merged_diff):
+        rel_norm = rel.replace("\\", "/")
         full = root / rel
         if not full.is_file():
+            # 磁盘不存在 = 该文件被删除 → 显式 DELETED（清旧向量），不再静默跳过留残留。
+            changes.append(FileChange(file_path=rel_norm, change_type=ChangeType.DELETED))
             continue
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
@@ -44,7 +53,7 @@ def _build_changes(project_path: str, merged_diff: str) -> list[FileChange]:
             continue
         changes.append(
             FileChange(
-                file_path=rel.replace("\\", "/"),
+                file_path=rel_norm,
                 change_type=ChangeType.MODIFIED,
                 content=content,
                 diff=merged_diff,

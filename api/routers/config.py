@@ -285,6 +285,12 @@ async def update_config(request: Request):
         if k not in updated_keys:
             new_lines.append(f"{k}={v}")
 
+    # P1-D：先快照原值，reload 若被生产安全门禁拒绝（禁 RBAC / 默认凭据 / 清 SECRET_KEY）→
+    # 原子回滚 .env + os.environ，不留脏配置（否则 .env 脏 → 下次重启 fail-fast、os.environ 脏 →
+    # 后续所有 reload 都失败）。validate-before-commit 保证运行期 _config 本就未被污染。
+    _prev_env = {k: os.environ.get(k) for k in update_map}
+    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+
     # 写回 .env（A-P1-29：原子写）
     content = "\n".join(new_lines) + "\n"
     atomic_write_env(env_path, content)
@@ -294,8 +300,24 @@ async def update_config(request: Request):
         os.environ[k] = v
     _app.logger.info(f"Updated .env + os.environ with keys: {list(update_map.keys())}")
 
-    # 重新加载配置
-    _app.reload_config()
+    # 重新加载配置（生产安全门禁在此重跑；违规 → RuntimeError → 回滚并 400）
+    try:
+        _app.reload_config()
+    except RuntimeError as exc:
+        for _k, _prev in _prev_env.items():
+            if _prev is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _prev
+        if _prev_content is None:
+            try:
+                env_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            atomic_write_env(env_path, _prev_content)
+        _app.logger.warning("配置变更被生产安全门禁拒绝，已回滚 .env + os.environ: %s", exc)
+        raise HTTPException(status_code=400, detail=f"配置变更被生产安全门禁拒绝，已回滚：{exc}") from exc
     _app.configure_langsmith(reload=True)
     try:
         from swarm.worker.sandbox import reset_sandbox_manager
@@ -578,8 +600,9 @@ def _persist_env_updates(update_map: dict[str, str]) -> None:
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
 @router.get("/api/kb/embed-rerank/catalog", tags=["配置"])
-async def kb_embed_rerank_catalog():
+async def kb_embed_rerank_catalog(request: Request):
     """embed/rerank 预置接入点目录 —— 前端下拉用，选中自动填 base_url/model/format。"""
+    _require_user(request)  # A-P0-7：与其余 config 读端点对齐鉴权（缩 recon 面）
     from swarm.knowledge.embed_rerank_config import EMBED_CATALOG, RERANK_CATALOG
     return {"embed": EMBED_CATALOG, "rerank": RERANK_CATALOG}
 
@@ -725,11 +748,12 @@ async def update_kb_embed_rerank(request: Request):
 
 # ─── 4.8 GET /api/model-providers/catalog ────────────────────
 @router.get("/api/model-providers/catalog", tags=["配置"])
-async def model_providers_catalog():
+async def model_providers_catalog(request: Request):
     """预置云端接入点目录 —— 前端"添加接入点"下拉用，选中自动填 base_url/label/kind。
 
     base_url 来自 Hermes-Agent 源码的权威端点（OpenAI 兼容）。
     """
+    _require_user(request)  # A-P0-7：与其余 config 读端点对齐鉴权（缩 recon 面）
     from swarm.config.settings import KNOWN_PROVIDERS
     return {"catalog": KNOWN_PROVIDERS}
 

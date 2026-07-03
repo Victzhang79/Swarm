@@ -12,7 +12,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-2007%20passing-brightgreen.svg)](#-测试)
+[![Tests](https://img.shields.io/badge/tests-2107%20passing-brightgreen.svg)](#-测试)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -374,8 +374,12 @@ CLI 全走 HTTP、自动带 token（`swarm login` 后各命令复用 `~/.swarm/c
 - **模型下拉显示「配置 API Key」？** 接入点未配 Key/不可达，在「设置 → 模型接入点」填 Key 并刷新。
 - **Worker 代码在哪执行？** 未配 CubeSandbox 时本地执行（主机须自备目标栈工具链）；生产建议配隔离沙箱（镜像按栈自适应）。
 - **L2 集成编译一直不过 / 任务收敛成 PARTIAL？** 多为运行编译的环境缺目标项目栈工具链（或 Java 版本不匹配）——见上文「📦 环境依赖 → ⚠️ 目标项目的技术栈工具链」。
+- **`SWARM_ENV=production` 启动即报「安全自检失败」退出？** 生产模式 fail-closed 门禁：必须显式设 `SWARM_SECRET_KEY`（高熵根密钥）、`SWARM_BOOTSTRAP_ADMIN_PASSWORD`（非默认）、开启 RBAC、`SWARM_DB_POSTGRES_URI` 不得用公开默认弱凭据 `swarm:swarm`。按报错逐项设好即可。运行期通过设置面板热更新配置若把上述改成不安全，也会被门禁拒绝并原子回滚（返回 400），不落盘。另建议设 `SWARM_TOKEN_TTL_HOURS`（如 24/168）限制令牌暴露窗口。
+- **启动即报 `多 worker` 错误退出？** 当前为单进程架构（SSE/调度/队列 meta 均进程内），检测到 `WEB_CONCURRENCY>1` 会**硬拦拒绝启动**（fail-fast，防多 worker 下推送/调度静默错乱）。请以单 worker 启动。若在 Heroku/Railway/Render 等平台上 `WEB_CONCURRENCY` 是平台默认值、而你实际单进程运行（本项目 Dockerfile 的 uvicorn 未传 `--workers`），设 `SWARM_ALLOW_MULTIPROCESS=1` 降级为告警放行。
+- **任务会不会因为墙钟超时被中止？大型任务安全吗？** 有单次执行段墙钟兜底（防失控任务无上限占沙箱/GPU），但采用**弹性预算**：有效上限 = 基线 + 每子任务额外时长，随任务规模自动放宽（默认基线 6h + 20min/子任务，如 45 子任务→约 21h），**不会误杀合法大型任务**（实测大型 E2E 合法跑 7-8h 仍在余量内）。可用 `SWARM_TASK_DEADLINE_S` / `SWARM_TASK_DEADLINE_PER_SUBTASK_S` 调整，设 `SWARM_TASK_DEADLINE_S=0` 关闭（不建议生产关）。
 - **端口 8420 被占用？** `export SWARM_PORT=<port>` 后重启。
 - **数据库连不上？** 确认 PG16 启动、`swarm` 库存在、pgvector 已启用、`SWARM_DB_POSTGRES_URI` 正确，再 `python scripts/init_db.py`。
+- **重启后卡在「计划确认 / 结果审核 / 需求澄清 / 方案评审」的任务点「通过」没反应？** 这些人工闸态靠 Postgres checkpointer 保存续跑点。**开发环境**默认用内存 checkpointer（MemorySaver），进程一重启中断快照即丢失——启动对账会**保留**这些任务的状态、但已无法 `resume`，此时**只能取消（cancel）后重新发起**。这是本地开发的已知取舍。**生产环境**默认强制 Postgres checkpointer（`SWARM_REQUIRE_PG_CHECKPOINTER`，未显式设置时 `SWARM_ENV=production` 即启用），初始化失败会 fail-fast 拒绝启动，从而避免带病运行；生产下重启后人工闸态可正常 `resume`。
 
 ---
 
@@ -387,7 +391,7 @@ bash test/run_all.sh                                    # 全部测试
 .venv/bin/ruff check . --select E9,F63,F7,F82           # 关键 lint（CI 同款）
 ```
 
-CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2007 passed**）。
+CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2107 passed**）。
 
 ---
 

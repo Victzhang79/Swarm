@@ -75,3 +75,72 @@ def test_default_env_is_development(monkeypatch):
     cfg = AppConfig(bootstrap_admin_password="swarm")
     assert cfg.is_production() is False
     validate_production_security(cfg)  # 不抛出
+
+
+# ── P1-D：默认 DB 弱凭据 + reload 重校验 + token TTL ──────────────────
+
+
+def test_prod_default_db_credentials_raises(monkeypatch):
+    """生产 + DB 仍用公开默认弱凭据 swarm:swarm → fail-closed raise。"""
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    monkeypatch.setenv("SWARM_DB_POSTGRES_URI", "postgresql://swarm:swarm@localhost:5432/swarm")
+    cfg = _cfg("production", "a-strong-non-default-password")
+    with pytest.raises(RuntimeError) as ei:
+        validate_production_security(cfg)
+    assert "swarm:swarm" in str(ei.value)
+
+
+def test_prod_strong_db_credentials_ok(monkeypatch):
+    """生产 + DB 用强凭据 + 其余安全 → 放行。"""
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    monkeypatch.setenv("SWARM_DB_POSTGRES_URI", "postgresql://produser:Str0ng!pass@db.internal:5432/swarm")
+    cfg = _cfg("production", "a-strong-non-default-password")
+    validate_production_security(cfg)  # 不抛出
+
+
+def test_dev_default_db_credentials_only_warns(monkeypatch):
+    """开发模式即便默认 DB 弱凭据也放行（不 raise）。"""
+    monkeypatch.delenv("SWARM_SECRET_KEY", raising=False)
+    monkeypatch.setenv("SWARM_DB_POSTGRES_URI", "postgresql://swarm:swarm@localhost:5432/swarm")
+    cfg = _cfg("development", "swarm")
+    validate_production_security(cfg)  # 不抛出
+
+
+def test_reload_config_revalidates_in_production_and_does_not_install(monkeypatch):
+    """P1-D：生产下 reload 引入不安全配置（禁 RBAC）→ raise，且不安装该配置（_config 不被污染）。"""
+    import swarm.config.settings as settings
+
+    orig = settings._config  # 快照全局单例，测试结束原样恢复（不污染后续测试的 RBAC 基线）
+    try:
+        monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+        monkeypatch.setenv("SWARM_DB_POSTGRES_URI", "postgresql://u:p@db:5432/swarm")
+        monkeypatch.setenv("SWARM_ENV", "production")
+        monkeypatch.setenv("SWARM_BOOTSTRAP_ADMIN_PASSWORD", "a-strong-non-default-password")
+        monkeypatch.setenv("SWARM_RBAC_ENABLED", "true")
+        good = settings.reload_config()
+        assert good.rbac_enabled is True
+        # 现在热更新把 RBAC 关掉（不安全）→ reload 必须 raise 且不安装该候选
+        monkeypatch.setenv("SWARM_RBAC_ENABLED", "false")
+        with pytest.raises(RuntimeError):
+            settings.reload_config()
+        # 全局 _config 仍是刚才那个安全的（rbac=True），未被不安全候选污染
+        assert settings.get_config().rbac_enabled is True
+    finally:
+        settings._config = orig  # 恢复原单例（monkeypatch 自动还原 env）
+
+
+def test_prod_token_ttl_zero_warns_not_raises(monkeypatch):
+    """生产 + token_ttl_hours=0（永不过期）→ 仅告警不 raise（硬化建议非致命洞）。
+
+    直接断言 _logger.warning 被调用（不用 caplog——全量跑时 app 日志重配会断 propagation）。
+    """
+    import swarm.config.settings as settings
+
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    monkeypatch.setenv("SWARM_DB_POSTGRES_URI", "postgresql://u:p@db:5432/swarm")
+    cfg = AppConfig(env="production", bootstrap_admin_password="a-strong-non-default-password",
+                    rbac_enabled=True, token_ttl_hours=0)
+    warnings: list[str] = []
+    monkeypatch.setattr(settings._logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+    validate_production_security(cfg)  # 不抛出
+    assert any("token_ttl_hours" in w or "永不过期" in w for w in warnings)
