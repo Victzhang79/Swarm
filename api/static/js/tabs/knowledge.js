@@ -277,6 +277,63 @@ async function loadKnowledgeOverview(projectId) {
   }
 }
 
+// round22：索引一致性检查 + 对账修复（surface #4(a) 的陈旧符号/缺失对账到 WebUI）
+function renderConsistency(data) {
+  const el = $('knowledge-consistency');
+  if (!el) return;
+  if (data.ok === false) {
+    el.innerHTML = '<p style="font-size:12px;color:var(--red)">' + escapeHtml(data.error || '检查失败') + '</p>';
+    return;
+  }
+  const missing = data.missing_index || [];     // 工作区有、索引无
+  const stale = data.stale_files || [];         // 索引有、工作区已变/删（陈旧）
+  const clean = (!missing.length && !stale.length);
+  const head = '<p style="font-size:11px;color:var(--text-muted);margin:0 0 6px">已索引 '
+    + (data.indexed_count || 0) + ' · 检查 ' + (data.checked_files || 0) + ' 文件</p>';
+  if (clean) {
+    el.innerHTML = head + '<p style="font-size:12px;color:var(--green)">✅ 索引与工作区一致，无缺失/陈旧项</p>';
+    return;
+  }
+  const row = (label, arr, color) => arr.length
+    ? '<div style="margin-bottom:8px"><b style="color:' + color + '">' + label + ' (' + arr.length + ')</b>'
+      + '<div style="font-size:11px;color:var(--text-muted);max-height:120px;overflow:auto">'
+      + arr.slice(0, 50).map(x => escapeHtml(typeof x === 'string' ? x : (x.file_path || x.name || JSON.stringify(x)))).join('<br>')
+      + (arr.length > 50 ? '<br>… 其余 ' + (arr.length - 50) + ' 项' : '') + '</div></div>'
+    : '';
+  el.innerHTML = head
+    + row('缺失（工作区有、索引无）', missing, 'var(--amber)')
+    + row('陈旧（索引有、工作区已变/删）', stale, 'var(--amber)')
+    + '<p style="font-size:11px;color:var(--text-muted);margin-top:6px">点击“对账修复”入队重索引以清理。</p>';
+}
+
+async function loadKnowledgeConsistency(projectId) {
+  const el = $('knowledge-consistency');
+  if (!el || !projectId) { if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">请先选择项目</p>'; return; }
+  el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">检查中…</p>';
+  try {
+    const resp = await fetch('/api/projects/' + encodeURIComponent(projectId) + '/knowledge/consistency');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    renderConsistency(await resp.json());
+  } catch (e) {
+    el.innerHTML = '<p style="font-size:12px;color:var(--red)">检查失败: ' + escapeHtml(e.message || String(e)) + '</p>';
+  }
+}
+
+async function repairKnowledgeConsistency(projectId) {
+  const el = $('knowledge-consistency');
+  if (!el || !projectId) { if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">请先选择项目</p>'; return; }
+  el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">对账修复入队中…</p>';
+  try {
+    const resp = await fetch('/api/projects/' + encodeURIComponent(projectId) + '/knowledge/consistency?repair=true');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const queued = data.queued || data.repaired || data.enqueued || 0;
+    el.innerHTML = '<p style="font-size:12px;color:var(--green)">✅ 已入队对账修复（' + escapeHtml(String(queued)) + ' 项重索引），稍后自动生效</p>';
+  } catch (e) {
+    el.innerHTML = '<p style="font-size:12px;color:var(--red)">修复失败: ' + escapeHtml(e.message || String(e)) + '</p>';
+  }
+}
+
 function assessKnowledgeReadiness(data) {
   const pp = data.preprocess || {};
   const phase = String(pp.phase || '').toLowerCase();

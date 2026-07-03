@@ -366,6 +366,19 @@
                       <p style="font-size:12px;color:var(--text-muted);margin:0">选择项目后加载…</p>
                     </div>
                   </div>
+                  <div class="knowledge-block">
+                    <div class="knowledge-block-head">
+                      <h3>索引一致性 / 对账</h3>
+                      <span class="hint">比对工作区与 Layer A 索引：缺失/陈旧符号</span>
+                    </div>
+                    <div class="form-row" style="align-items:flex-end;gap:8px">
+                      <button class="btn btn-secondary btn-sm" onclick="loadKnowledgeConsistency(selectedProjectId)">检查一致性</button>
+                      <button class="btn btn-primary btn-sm" onclick="repairKnowledgeConsistency(selectedProjectId)">对账修复（入队重索引）</button>
+                    </div>
+                    <div id="knowledge-consistency" style="margin-top:12px">
+                      <p style="font-size:12px;color:var(--text-muted);margin:0">点击“检查一致性”查看缺失/陈旧项…</p>
+                    </div>
+                  </div>
                 </div>
                 <div class="knowledge-block">
                   <div class="knowledge-block-head">

@@ -985,5 +985,287 @@ def check():
         console.print(f"\n[green]✅ 全部 {len(checks)} 个模块导入成功[/]")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# round22 CLI 补全：项目生命周期 + 预处理 + 任务列表 + 用户/成员(RBAC) + KB 检索
+# 全部走 HTTP + 统一注入 token（_hget/_hpost/... 已带 _auth_headers）。
+# ══════════════════════════════════════════════════════════════════════════
+
+def _print_err(resp) -> None:
+    """统一打印 API 错误（含 401 提示已在 _http 里给）。"""
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except Exception:  # noqa: BLE001
+        detail = resp.text
+    console.print(f"[red]✗ HTTP {resp.status_code}: {detail}[/]")
+
+
+# ─── project：项目生命周期 ───────────────────────────────
+@main.group()
+def project():
+    """项目管理：list / create / show / delete / stats"""
+
+
+@project.command("list")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def project_list(api_url: str):
+    """列出当前用户可见的项目"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    projects = resp.json().get("projects", [])
+    if not projects:
+        console.print("[dim]（无项目）[/]"); return
+    table = Table(title="🐝 项目列表")
+    table.add_column("ID", style="cyan"); table.add_column("名称")
+    table.add_column("状态", style="green"); table.add_column("路径", style="dim")
+    for p in projects:
+        table.add_row(str(p.get("id", ""))[:12], p.get("name", ""),
+                      p.get("status", "?"), p.get("path", ""))
+    console.print(table)
+
+
+@project.command("create")
+@click.argument("name")
+@click.option("--path", default="", help="项目根目录绝对路径；留空+--greenfield 自动在 workspace 建")
+@click.option("--description", "-d", default="", help="项目描述")
+@click.option("--greenfield", is_flag=True, help="从零创建空项目")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def project_create(name: str, path: str, description: str, greenfield: bool, api_url: str):
+    """创建项目"""
+    api_url = api_url.rstrip("/")
+    body = {"name": name, "path": path, "description": description, "greenfield": greenfield}
+    try:
+        resp = _hpost(f"{api_url}/api/projects", json=body, timeout=30.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code not in (200, 201):
+        _print_err(resp); sys.exit(1)
+    proj = resp.json().get("project") or resp.json()
+    console.print(f"[green]✅ 项目已创建[/] id={proj.get('id')} name={proj.get('name')}")
+
+
+@project.command("show")
+@click.argument("project_id")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def project_show(project_id: str, api_url: str):
+    """查看项目详情"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects/{project_id}", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    proj = resp.json().get("project") or resp.json()
+    console.print(json.dumps(proj, indent=2, ensure_ascii=False, default=str))
+
+
+@project.command("delete")
+@click.argument("project_id")
+@click.option("--yes", "-y", is_flag=True, help="跳过确认")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def project_delete(project_id: str, yes: bool, api_url: str):
+    """删除项目"""
+    api_url = api_url.rstrip("/")
+    if not yes and not click.confirm(f"确认删除项目 {project_id}？"):
+        return
+    try:
+        resp = _hdelete(f"{api_url}/api/projects/{project_id}", timeout=30.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(f"[green]✅ 项目 {project_id} 已删除[/]")
+
+
+@project.command("stats")
+@click.argument("project_id")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def project_stats(project_id: str, api_url: str):
+    """查看项目统计（任务数/成功率/PARTIAL 等）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects/{project_id}/stats", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(json.dumps(resp.json(), indent=2, ensure_ascii=False, default=str))
+
+
+# ─── preprocess：项目预处理（KB 就绪）────────────────────
+@main.group()
+def preprocess():
+    """项目预处理（构建知识库）：run / status"""
+
+
+@preprocess.command("run")
+@click.argument("project_id")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def preprocess_run(project_id: str, api_url: str):
+    """触发/重跑项目预处理"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hpost(f"{api_url}/api/projects/{project_id}/preprocess", timeout=30.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code not in (200, 202):
+        _print_err(resp); sys.exit(1)
+    console.print(f"[green]✅ 已触发预处理[/] project={project_id}（用 `swarm preprocess status {project_id}` 跟踪）")
+
+
+@preprocess.command("status")
+@click.argument("project_id")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def preprocess_status(project_id: str, api_url: str):
+    """查看预处理进度/状态"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects/{project_id}/preprocess/status", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(json.dumps(resp.json(), indent=2, ensure_ascii=False, default=str))
+
+
+# ─── task list（补全任务生命周期）──────────────────────────
+@task.command("list")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def task_list(project: str, api_url: str):
+    """列出项目下的任务"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects/{project}/tasks", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    tasks = resp.json().get("tasks", resp.json() if isinstance(resp.json(), list) else [])
+    if not tasks:
+        console.print("[dim]（无任务）[/]"); return
+    table = Table(title=f"🐝 任务列表 · {project[:12]}")
+    table.add_column("ID", style="cyan"); table.add_column("状态", style="green")
+    table.add_column("描述", style="dim", max_width=50)
+    for t in tasks:
+        table.add_row(str(t.get("id", ""))[:12], t.get("status", "?"),
+                      (t.get("description") or "")[:50])
+    console.print(table)
+
+
+# ─── user + member：用户与项目成员（RBAC 管理）────────────
+@main.group()
+def user():
+    """用户管理（需 config:write）：list"""
+
+
+@user.command("list")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def user_list(api_url: str):
+    """列出全部用户（需管理员）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/users", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    users = resp.json().get("users", [])
+    table = Table(title="🐝 用户")
+    table.add_column("ID", style="cyan"); table.add_column("用户名")
+    table.add_column("全局角色", style="green")
+    for u in users:
+        table.add_row(str(u.get("id", ""))[:12], u.get("username", ""),
+                      u.get("global_role", "?"))
+    console.print(table)
+
+
+@main.group()
+def member():
+    """项目成员/RBAC：list / add / remove"""
+
+
+@member.command("list")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def member_list(project: str, api_url: str):
+    """列出项目成员及角色"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hget(f"{api_url}/api/projects/{project}/members", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    members = resp.json().get("members", [])
+    table = Table(title=f"🐝 成员 · {project[:12]}")
+    table.add_column("用户 ID", style="cyan"); table.add_column("角色", style="green")
+    for m in members:
+        table.add_row(str(m.get("user_id", m.get("id", ""))), m.get("role", "?"))
+    console.print(table)
+
+
+@member.command("add")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--user-id", "-u", required=True, help="用户 ID")
+@click.option("--role", "-r", default="developer", show_default=True,
+              help="角色：owner/developer/viewer 等")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def member_add(project: str, user_id: str, role: str, api_url: str):
+    """添加/设置项目成员角色（需 member:manage）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hput(f"{api_url}/api/projects/{project}/members",
+                     json={"user_id": user_id, "role": role}, timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(f"[green]✅ 成员已设置[/] {user_id} → {role} @ {project[:12]}")
+
+
+@member.command("remove")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--user-id", "-u", required=True, help="用户 ID")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def member_remove(project: str, user_id: str, api_url: str):
+    """移除项目成员（需 member:manage）"""
+    api_url = api_url.rstrip("/")
+    try:
+        resp = _hdelete(f"{api_url}/api/projects/{project}/members/{user_id}", timeout=15.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(f"[green]✅ 成员已移除[/] {user_id} @ {project[:12]}")
+
+
+# ─── kb retrieve（知识库检索预览）──────────────────────────
+@kb.command("retrieve")
+@click.argument("query")
+@click.option("--project", "-p", required=True, help="项目 ID")
+@click.option("--top-k", type=int, default=None, help="单层上限（可选）")
+@click.option("--api-url", default=DEFAULT_API_URL, show_default=True)
+def kb_retrieve(query: str, project: str, top_k: int | None, api_url: str):
+    """按任务描述检索知识库（预览 Brain 将注入的上下文）"""
+    api_url = api_url.rstrip("/")
+    body: dict = {"query": query}
+    if top_k is not None:
+        body["top_k"] = top_k
+    try:
+        resp = _hpost(f"{api_url}/api/projects/{project}/knowledge/retrieve",
+                      json=body, timeout=30.0)
+    except httpx.RequestError as exc:
+        console.print(f"[red]无法连接 API: {exc}[/]"); sys.exit(1)
+    if resp.status_code != 200:
+        _print_err(resp); sys.exit(1)
+    console.print(json.dumps(resp.json(), indent=2, ensure_ascii=False, default=str))
+
+
 if __name__ == "__main__":
     main()

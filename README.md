@@ -337,6 +337,22 @@ bash scripts/start-services.sh   # 5. 启动 Qdrant + API
 | `bash test/run_all.sh` | 运行全部测试 |
 | `swarm submit -p <project_id> --watch` | CLI 提交任务并跟踪 |
 
+### 🖥️ CLI 命令一览
+
+CLI 全走 HTTP、自动带 token（`swarm login` 后各命令复用 `~/.swarm/cli_token`），可端到端管理项目/任务/知识库/成员：
+
+| 组 | 命令 |
+|---|---|
+| 认证 | `swarm login` |
+| 项目 | `swarm project list / create / show / delete / stats` |
+| 预处理 | `swarm preprocess run <pid>` · `swarm preprocess status <pid>` |
+| 任务 | `swarm submit` · `swarm task list -p <pid>` · `swarm task approve/revise/reject/cancel/retry/apply-diff` |
+| 知识库 | `swarm kb overview/symbols/norms` · `swarm kb retrieve "<query>" -p <pid>` |
+| 成员/RBAC | `swarm user list` · `swarm member list/add/remove -p <pid>` |
+| 运维 | `swarm status` · `swarm config show/models/routing` · `swarm sandbox list/create/destroy` · `swarm check` |
+
+> 每个命令 `--help` 看参数；RBAC 开启时未登录会提示 `swarm login`。
+
 ---
 
 ## ⚙️ 配置
