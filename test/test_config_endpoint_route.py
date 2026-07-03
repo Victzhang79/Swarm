@@ -4,6 +4,10 @@
 背景：P1-20 曾把辅助函数 _is_local_or_private_host 插在 @router.get("/api/config")
 装饰器与 get_config_endpoint 之间，导致装饰器作用到辅助函数上——真正的端点未注册、
 且顶替函数无 _require_user 鉴权、还要求 ?url= 查询参数。此测试走路由级锁定，防复发。
+
+注：introspection 走【config 路由模块自身的 router.routes】（装饰器绑定的源头，单模块、
+不受其它测试对全局 app.routes 的状态污染影响）——比 app.routes 更稳（CI 上 app.routes
+曾被其它测试污染导致 flaky）。
 """
 
 from __future__ import annotations
@@ -12,9 +16,10 @@ from unittest.mock import MagicMock, patch
 
 
 def _config_get_route():
-    from swarm.api.app import app
+    """在 config 路由模块自身的 router 上找 GET /api/config 路由对象（源头，稳定）。"""
+    from swarm.api.routers import config as _cfg
 
-    for r in app.routes:
+    for r in _cfg.router.routes:
         if getattr(r, "path", None) == "/api/config" and "GET" in getattr(r, "methods", set()):
             return r
     return None
