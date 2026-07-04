@@ -738,7 +738,12 @@ async def on_startup():
             await loop.run_in_executor(None, backfill_legacy_project_members)
         logger.info("Auth/RBAC tables ensured")
     except Exception as e:
-        logger.warning(f"Failed to ensure auth tables: {e}")
+        # R23-7 治本：RBAC 开启时 auth 表初始化失败必须 fail-fast——否则鉴权/登录会在运行期(首个
+        # 请求)才暴雷，可能带病放行或全线 500。仅在 RBAC 关闭(无鉴权需求)时降级为 warning。
+        if get_config().rbac_enabled:
+            logger.error("RBAC 开启但 auth 表初始化失败，fail-fast 拒绝带病启动: %s", e)
+            raise
+        logger.warning(f"Failed to ensure auth tables (RBAC off, 忽略): {e}")
     # A1 批1：初始化 PG checkpointer（多副本共享 + 跨副本 interrupt/resume）。
     # 必须在 runner/调度器使用 graph 之前。
     # P0-D fail-fast：init_postgres_checkpointer 仅在【要求强制 PG】（生产默认 / 显式

@@ -785,10 +785,17 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
     # RBAC 开启时仍配 legacy SWARM_API_KEY = 一把静态 admin 万能钥匙，绕过用户/token
     # 吊销与过期（对抗复核）。不硬拦（可能是有意的服务账号），但生产必须告警周知。
     if cfg.rbac_enabled and (getattr(cfg, "api_key", "") or "").strip():
+        # R23-7 治本：静态 legacy key = 无法吊销/过期的全局 admin 后门。生产默认【硬拦】启动，
+        # 除非显式 SWARM_ALLOW_LEGACY_API_KEY=true（服务账号有意为之，自担风险）。原仅告警不阻断。
+        if _os.environ.get("SWARM_ALLOW_LEGACY_API_KEY", "").strip().lower() not in ("1", "true", "yes", "on"):
+            raise RuntimeError(
+                "生产环境 RBAC 开启但仍设 legacy SWARM_API_KEY（等价【不可吊销/过期】的全局 admin 后门）。"
+                "请清空 SWARM_API_KEY，改用可吊销的用户 token；如确为服务账号，显式设 "
+                "SWARM_ALLOW_LEGACY_API_KEY=true 自担风险后再启动。"
+            )
         _logger.warning(
-            "生产环境 RBAC 已开但仍设置 legacy SWARM_API_KEY：该静态 key 等价全局 admin 且"
-            "【无法吊销/过期】，泄露即长期后门。建议清空 SWARM_API_KEY，改用可吊销的用户 token；"
-            "如确为服务账号需专用凭据，请评估降权。"
+            "生产环境仍启用 legacy SWARM_API_KEY（已 SWARM_ALLOW_LEGACY_API_KEY opt-in，自担风险）："
+            "该静态 key 等价全局 admin 且无法吊销/过期，请尽快改用可吊销 token。"
         )
 
 

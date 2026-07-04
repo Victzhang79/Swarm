@@ -144,3 +144,29 @@ def test_prod_token_ttl_zero_warns_not_raises(monkeypatch):
     monkeypatch.setattr(settings._logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
     validate_production_security(cfg)  # 不抛出
     assert any("token_ttl_hours" in w or "永不过期" in w for w in warnings)
+
+
+# ── R23-7：legacy SWARM_API_KEY 生产硬拦（可 opt-in） ──
+def test_prod_legacy_api_key_raises(monkeypatch):
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    monkeypatch.delenv("SWARM_ALLOW_LEGACY_API_KEY", raising=False)
+    cfg = AppConfig(env="production", bootstrap_admin_password="a-strong-non-default-password",
+                    rbac_enabled=True, api_key="static-backdoor-key")
+    with pytest.raises(RuntimeError) as ei:
+        validate_production_security(cfg)
+    assert "SWARM_API_KEY" in str(ei.value)
+
+
+def test_prod_legacy_api_key_optin_ok(monkeypatch):
+    monkeypatch.setenv("SWARM_SECRET_KEY", "x" * 44)
+    monkeypatch.setenv("SWARM_ALLOW_LEGACY_API_KEY", "true")
+    cfg = AppConfig(env="production", bootstrap_admin_password="a-strong-non-default-password",
+                    rbac_enabled=True, api_key="static-backdoor-key")
+    validate_production_security(cfg)  # 显式 opt-in → 不抛
+
+
+def test_dev_legacy_api_key_ok(monkeypatch):
+    """开发模式永不因 legacy key raise（回归）。"""
+    monkeypatch.delenv("SWARM_ALLOW_LEGACY_API_KEY", raising=False)
+    cfg = AppConfig(env="dev", bootstrap_admin_password="swarm", rbac_enabled=True, api_key="k")
+    validate_production_security(cfg)

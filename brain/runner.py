@@ -836,6 +836,9 @@ async def run_task(
 
     set_worker_context(project_id or None)
     queue = register_task_queue(task_id)
+    # 复核 R23-6：check→add 之间【无 await】——单进程 asyncio 无抢占，此认领在目标拓扑(单 brain
+    # 进程)下即原子，同 task 不会双跑。多副本部署需跨进程认领(Redis/DB claim，scheduler.is_task_claimed
+    # 为其入口)，属已知架构边界。改动此块务必保持 check 与 add 之间不引入 await，否则重新出现 TOCTOU。
     if task_id in _task_running:
         await _emit(queue, {"step": "error", "status": "error", "message": "任务已在执行中"})
         return
