@@ -1580,8 +1580,16 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
                 # 都不含该串，旧代码会落到末尾 return True 静默假绿。rc!=0 且非 infra = 真失败。
                 return False, (combined.strip()[:1000] or f"tsc failed rc={rc}")
         except Exception as exc:
-            # audit #11：tsc 编译失败可能掩盖真实编译错误，从 debug 升 warning（生产可见）
-            logger.warning("[L1.2] tsc 编译跳过（异常）: %s", exc)
+            # R23-2 治本：tsc 执行【异常】旧代码只 log 后落到末尾 return True 假绿。区分：
+            # 明确 infra（npx/tsc 缺失、无网装 typescript）→ 跳过闸门(非能力失败)；其余(超时/意外崩溃)
+            # → fail-closed 判不过（超时可能掩盖真 hang，不能当编译通过）。
+            _exc_txt = f"{type(exc).__name__}: {exc}"
+            # FileNotFoundError=工具/命令缺失(npx/node 不在)=明确 infra；再叠加文本模式判定。
+            if isinstance(exc, FileNotFoundError) or _is_infra_failure(_exc_txt):
+                logger.warning("[L1.2] tsc 工具/基础设施异常，跳过编译闸门(非能力失败): %s", exc)
+            else:
+                logger.warning("[L1.2] tsc 执行异常(非 infra)，fail-closed 判未通过: %s", exc)
+                return False, f"tsc 执行异常: {_exc_txt}"[:1000]
 
     return True, "compile ok"
 

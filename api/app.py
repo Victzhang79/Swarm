@@ -1762,3 +1762,20 @@ app.include_router(_task_router.router)
 app.include_router(_upload_router.router)
 app.include_router(_config_router.router)
 app.include_router(_observability_router.router)
+
+
+def run() -> None:
+    """console_scripts 入口（swarm-web）：以 uvicorn 启动 API。
+
+    R23-8 治本：pyproject 的 `swarm-web` 原指向 ASGI 对象 `swarm.api.app:app`（非可调用入口），
+    安装后执行 `swarm-web` 会报错。console_scripts 必须指向【无参可调用】。此处提供该入口，
+    与 scripts/restart-api.sh 一致（uvicorn swarm.api.app:app，host/port 可 env 覆盖）。
+    """
+    import os
+    import uvicorn
+    uvicorn.run(
+        "swarm.api.app:app",
+        host=os.environ.get("SWARM_API_HOST", "0.0.0.0"),
+        port=int(os.environ.get("SWARM_PORT", os.environ.get("SWARM_API_PORT", "8420"))),
+        log_level=os.environ.get("SWARM_API_LOG_LEVEL", "info"),
+    )

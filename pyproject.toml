@@ -53,7 +53,7 @@ dev = [
 
 [project.scripts]
 swarm = "swarm.cli:main"
-swarm-web = "swarm.api.app:app"
+swarm-web = "swarm.api.app:run"
 
 [tool.setuptools]
 packages = [
