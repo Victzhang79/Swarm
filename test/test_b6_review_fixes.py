@@ -51,12 +51,26 @@ def test_learn_success_detects_uncommitted_and_unreachable():
 
 # ── #5：retry 清 base_commit → 重捕获 ─────────────
 
-def test_retry_clears_base_commit():
-    import inspect
-    from swarm.brain import runner
+async def test_retry_clears_base_commit(monkeypatch):
+    """行为测试(替原 getsource 守卫)：retry_task 实际以 base_commit='' 调 update_task，
+    令 run_task 重捕获当前 HEAD 为新基线。断言【可观测副作用】而非源码字符串。"""
+    import swarm.brain.runner as runner
+    from swarm.project import store
 
-    src = inspect.getsource(runner.retry_task)
-    assert 'base_commit=""' in src, "retry 未清 base_commit（#5 回归，会沿用旧 birth base）"
+    captured: dict = {}
+    monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
+    monkeypatch.setattr(store, "get_task", lambda tid: {"id": tid, "project_id": "p", "description": "d"})
+    monkeypatch.setattr(store, "update_task", lambda tid, **kw: captured.update(kw))
+    runner._task_running.clear()
+
+    async def _noop_run(*a, **k):
+        return None
+
+    monkeypatch.setattr(runner, "run_task", _noop_run)
+    ok = await runner.retry_task("t1")
+    assert ok is True
+    assert captured.get("base_commit") == "", "retry 必须清空 base_commit 触发重捕获（#5 行为回归）"
+    assert captured.get("status") == "SUBMITTED"
 
 
 # ── #6：探针瞬时故障 ≠ 无 checkpoint ─────────────
