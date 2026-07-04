@@ -5,6 +5,29 @@
 
 真实 LLM 调用 + mock fallback：每个节点优先调用 Brain LLM，
 失败时回退到原有 mock 逻辑。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只做去重/去环，未拆体）
+
+拆解【必须逐簇一次一个、每步全绿】，且守住两条硬约束，否则回归：
+  1. 可 patch 的有状态符号（_get_brain_llm/_dispatch_to_worker/_get_project_path/
+     _try_l2_*/_verify_l2_via_llm/_run_reactor_build_in_sandbox 等）**必须仍以
+     `swarm.brain.nodes.X` 可寻址**——移动后要在本 __init__ re-export，且测试 patch 的
+     是 __init__ 命名空间。移错位置→大批 patch 失效（本轮 A4/A6 已踩过两次）。
+  2. 抽出的模块**不得反向 import 本 __init__**（会重建 A6 刚破的环）；共享纯 helper 先下沉
+     到 nodes/shared.py（干净 sink），抽出模块只依赖 shared。
+
+已识别的内聚簇（建议拆出顺序，风险从低到高）：
+  A. 恢复/阻断分析簇（纯路径分析，近乎无状态）：_producers_of / _package_in_baseline /
+     _blocked_pkg_unrecoverable / _is_missing_dependency_failure。**协迁依赖**：_det_of、
+     常量 _INTERNAL_BLOCKED_KINDS（与该簇一起下沉 shared 或同迁新模块）。→ brain/nodes/recovery.py
+  B. pom/模块脚手架簇（就地改 plan）：_grant_module_pom_writable /
+     _widen_scope_for_compile_repair / _local_tree_revert_subtask。依赖 FileScope 与 plan 结构。
+  C. handle_failure 族（~660 行超长函数 + _handle_failure_impl）：先按 strategy 分支抽纯
+     决策函数（已部分参数化），再考虑整体迁 brain/nodes/failure.py。
+  D. audit/security orchestration（run_security_audit 等）。
+每簇拆前先补【行为测试】锁外部契约（禁 inspect.getsource 结构焊死），再迁移。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 from __future__ import annotations
