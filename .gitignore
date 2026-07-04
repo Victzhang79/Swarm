@@ -13,6 +13,7 @@ wheels/
 # ─── 密钥 / 环境（绝不入库）─────────────────
 .env
 .env.local
+.env.bak*
 *.key
 *.pem
 
@@ -50,3 +51,10 @@ E2E_*.md
 *_PROGRESS.md
 UPSTREAM_DOWNSTREAM_TREATMENT.md
 logs_archive/
+
+# ─── 内部工作文档（不上云端；本地保留）──────────────
+docs/archive/
+/DESIGN_*.md
+/PROJECT_STATUS.md
+/TECH_DEBT.md
+/WALKTHROUGH_REPORT.md
