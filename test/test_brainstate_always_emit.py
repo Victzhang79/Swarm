@@ -76,11 +76,28 @@ def test_validate_plan_emits_plan_valid():
 
 
 def test_handle_failure_emits_failure_strategy():
-    """handle_failure 必须显式 emit failure_strategy 路由控制键。"""
-    from swarm.brain.nodes import handle_failure
+    """行为契约：handle_failure 返回 dict 必含 failure_strategy 路由键。
 
-    src = inspect.getsource(handle_failure)
-    assert "failure_strategy" in src, "handle_failure 必须 emit failure_strategy"
+    round24 A4 后 handle_failure 拆为薄包装 + _handle_failure_impl，getsource 焊死会误挂
+    （本会话踩过的脆测试坑）→ 改行为断言：真调用一条确定性路径（L2 超限 escalate，早于
+    LLM 调用返回，无需 mock），断言返回含路由键。
+    """
+    import asyncio
+
+    from swarm.brain.nodes import handle_failure
+    from swarm.config.settings import get_config
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[SubTask(id="st-1", description="x", scope=FileScope(create_files=["a/A.java"]))])
+    state = {
+        "verification_failure": "l2",
+        "replan_count": get_config().model.max_retries + 5,  # 超限 → 确定性 escalate 分支
+        "failed_subtask_ids": [],
+        "subtask_results": {},
+        "plan": plan,
+    }
+    out = asyncio.run(handle_failure(state))
+    assert "failure_strategy" in out, "handle_failure 返回必含 failure_strategy 路由键"
 
 
 # ─────────────────── 注解装配验证 ───────────────────

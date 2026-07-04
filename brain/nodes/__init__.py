@@ -2335,10 +2335,29 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
 
 
 async def handle_failure(state: BrainState) -> dict:
-    """HANDLE_FAILURE 节点 — 处理子任务失败
+    """HANDLE_FAILURE 节点 — 处理子任务失败。
+
+    brain#3(round24 A4) 不可变持久化：_handle_failure_impl 会【就地修改】state["plan"]
+    的 SubTask（注入 retry_guidance、_grant_module_pom_writable 补 pom 写权、
+    _widen_scope_for_compile_repair 扩 scope）。这些就地改动只有在 plan channel 被【写回
+    返回 dict】时才随 LangGraph checkpoint 持久化；否则 resume 后 plan channel 回滚到改前
+    版本 → 诊断/写权/scope 全丢（原 8 个再派发返回里仅 2 个带 plan）。故：凡再派发失败子
+    任务(dispatch_remaining)的返回，统一回传当前 plan。plan 为 replace 语义、回传同一对象
+    幂等无副作用；已自带 plan 的返回(_targeted_redecompose 的 new_plan)不覆盖。
+    """
+    result = await _handle_failure_impl(state)
+    if isinstance(result, dict) and "dispatch_remaining" in result and "plan" not in result:
+        _p = state.get("plan")
+        if _p is not None:
+            result["plan"] = _p
+    return result
+
+
+async def _handle_failure_impl(state: BrainState) -> dict:
+    """HANDLE_FAILURE 核心逻辑（按 strategy 分支：retry / retry_alternate / replan / escalate）。
 
     输入: failed_subtask_ids, subtask_results, plan, merge_conflicts
-    输出: 按 strategy 分支更新状态（retry / retry_alternate / replan / escalate）
+    注意：就地改 plan 的持久化由外层 handle_failure 包装统一回传 plan 保证（brain#3）。
     """
     failed_ids = list(state.get("failed_subtask_ids", []))
     subtask_results = dict(state.get("subtask_results", {}))
@@ -2631,10 +2650,10 @@ async def handle_failure(state: BrainState) -> dict:
         for _fid in failed_ids:
             _st = _by_id.get(_fid)
             if _st is not None:
-                try:
-                    _st.retry_guidance = _diagnosis[:800]
-                except Exception:  # noqa: BLE001
-                    pass
+                # SubTask 是可变 pydantic BaseModel、retry_guidance 是声明的 str 字段 →
+                # 直接赋值不会抛（原 except:pass 是无谓的静默吞错，brain#3 一并去掉）。
+                # 就地改的持久化由外层 handle_failure 回传 plan 保证。
+                _st.retry_guidance = _diagnosis[:800]
 
     # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
     # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
