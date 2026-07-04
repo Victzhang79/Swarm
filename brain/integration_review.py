@@ -13,16 +13,28 @@ from swarm.project.diff_apply import apply_git_diff, files_from_unified_diff
 logger = logging.getLogger(__name__)
 
 
-def _reset_worktree_to_head(project_path: str, merged_diff: str) -> None:
+def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str | None = None) -> None:
     """把 merged_diff 涉及的文件 reset 到干净的补丁基线（清除 worker pull-back 写入的脏改动）。
 
     精准处理补丁涉及的文件（不动工作区其他文件）。非 git 仓库或失败时静默跳过。
-    - 【已跟踪文件】（HEAD 有）：checkout 回 HEAD 版本，撤销脏改动。
-    - 【新建文件】（HEAD 没有，但 worker pull-back 已写进工作区）：删除工作区残留——
+    - 【已跟踪文件】（base 有）：checkout 回 base 版本，撤销脏改动。
+    - 【新建文件】（base 没有，但 worker pull-back 已写进工作区）：删除工作区残留——
       否则 git apply 要新建该文件时报"文件已存在/补丁未应用"（task 691c1670 实证：
       6 文件 CRUD 全是新建，pull-back 写入后 checkout 无效残留 → apply --check 全失败）。
+
+    3rd#2：base_ref = 任务钉扎的 base commit（None → "HEAD"，零回归）。merged_diff 是【相对 base】
+    生成的补丁，故复位基线必须同源=base，否则运行期 HEAD 漂移后 reset 到 HEAD → 补丁基线不符 →
+    apply 失败或覆盖用户中途 commit。L2 与 learn_success 共用本函数，一处钉两处。
     """
     import os
+    from swarm.git_base import base_ref_exists, resolve_base_ref
+    _base = resolve_base_ref(base_ref)
+    # 对抗复核 H2：钉扎 base 若不可达（用户 reset --hard + GC 改写历史，罕见）→ 退回 HEAD，
+    # 否则 `cat-file -e base:f` 全失败会把【已跟踪文件】误判为"新建"→ os.remove 删掉用户文件。
+    # base 正常是 HEAD 祖先（只在其上追加 commit）恒可达，本守卫仅防历史被破坏性重写的极端场景。
+    if base_ref and _base != "HEAD" and not base_ref_exists(project_path, base_ref):
+        logger.warning("[L2] 钉扎 base %s 不可达(历史被重写/GC?)，reset 退回 HEAD 防误删跟踪文件", _base[:12])
+        _base = "HEAD"
     try:
         files = files_from_unified_diff(merged_diff) or []
         if not files:
@@ -34,15 +46,15 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str) -> None:
         if chk.returncode != 0:
             return
         for f in files:
-            # 判断该文件在 HEAD 是否存在（已跟踪 vs 新建）
+            # 判断该文件在 base 是否存在（已跟踪 vs 新建）
             in_head = subprocess.run(
-                ["git", "-C", project_path, "cat-file", "-e", f"HEAD:{f}"],
+                ["git", "-C", project_path, "cat-file", "-e", f"{_base}:{f}"],
                 capture_output=True, text=True, timeout=15,
             ).returncode == 0
             if in_head:
-                # 已跟踪 → reset 到 HEAD 版本
+                # 已跟踪 → reset 到 base 版本
                 subprocess.run(
-                    ["git", "-C", project_path, "checkout", "HEAD", "--", f],
+                    ["git", "-C", project_path, "checkout", _base, "--", f],
                     capture_output=True, text=True, timeout=15,
                 )
             else:
@@ -137,6 +149,7 @@ def run_integration_review(
     *,
     timeout: int = 600,
     compile_runner=None,
+    base_ref: str | None = None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """L2.1 全量编译 + L2.3 契约一致性（确定性）。
 
@@ -163,7 +176,7 @@ def run_integration_review(
     # git apply --check 会因 "改动已存在、context 已变" 报 "补丁未应用"（假阴性，task
     # fdaa1932 实测）。reset 到 HEAD 后工作区与补丁基线一致，check 才有意义。worker 的脏改动
     # 已被 merged_diff 完整捕获，reset 不丢信息（真正 apply 在下方 build_cmd 分支重新做）。
-    _reset_worktree_to_head(project_path, merged_diff)
+    _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
 
     apply_result = apply_git_diff(project_path, merged_diff, check_only=True)
     if not apply_result.get("ok"):
@@ -241,7 +254,7 @@ def run_integration_review(
             # R1：限定回滚到 merged_diff 涉及的文件（复用 _reset_worktree_to_head 的 scoped 逻辑：
             # 已跟踪→checkout HEAD，新建→删除），不再用整库 `checkout -- .` + `clean -fd`——
             # 后者会抹掉用户在该项目里无关的未提交改动/未跟踪文件。
-            _reset_worktree_to_head(project_path, merged_diff)
+            _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
     else:
         details["compile_ok"] = None  # 真无构建文件(纯 docs/config) → 合理跳过，非降级
         logger.info("[integration_review] 无构建文件(纯 docs/config)，跳过全量编译")

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from swarm.config.settings import get_config
+from swarm.git_base import resolve_base_ref
 from swarm.models.errors import TransientInfraError
 from swarm.tools.scope_guard import clear_scope
 from swarm.types import (
@@ -463,6 +464,7 @@ class WorkerExecutor:
         user_profile_prompt: str = "",
         shared_contract: dict | None = None,
         recursion_boost: int = 0,
+        base_ref: str | None = None,
     ):
         self.subtask = subtask
         self.effective_scope = scope or subtask.scope
@@ -474,6 +476,9 @@ class WorkerExecutor:
         self.task_id = task_id
         self.user_profile_prompt = user_profile_prompt
         self.project_path = project_path or str(get_config().workspace_root)
+        # 3rd#2：任务钉扎的 base commit（brain 经 dispatcher 透传）。worker 在本地仓算 diff 的
+        # 基线统一相对它，消除运行期 HEAD 漂移。None → resolve_base_ref 退回 "HEAD"（零回归）。
+        self.base_ref = base_ref
 
         config = get_config()
         self.max_execution_time = config.worker.max_execution_time
@@ -1479,7 +1484,7 @@ class WorkerExecutor:
         try:
             import subprocess
             proc = subprocess.run(
-                ["git", "show", f"HEAD:{rel}"],
+                ["git", "show", f"{resolve_base_ref(getattr(self, 'base_ref', None))}:{rel}"],
                 cwd=str(local_root), capture_output=True, text=True, timeout=15,
             )
             if proc.returncode == 0:
@@ -1575,11 +1580,11 @@ class WorkerExecutor:
         try:
             with _ProjectGitFlock(local_root):
                 r = subprocess.run(
-                    ["git", "checkout", "HEAD", "--", *tracked],
+                    ["git", "checkout", resolve_base_ref(getattr(self, 'base_ref', None)), "--", *tracked],
                     cwd=str(local_root), capture_output=True, text=True, timeout=30,
                 )
             if r.returncode == 0:
-                self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到 HEAD（防跨轮脏叠加）")
+                self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到钉扎 base（防跨轮脏叠加）")
                 return len(tracked)
             self._log(f"workspace reset 警告（git checkout 非零）: {r.stderr.strip()[:200]}")
             return 0
@@ -1624,13 +1629,13 @@ class WorkerExecutor:
                         continue
                     try:
                         in_head = _sp.run(
-                            ["git", "cat-file", "-e", f"HEAD:{rel}"],
+                            ["git", "cat-file", "-e", f"{resolve_base_ref(getattr(self, 'base_ref', None))}:{rel}"],
                             cwd=str(local_root), capture_output=True, timeout=10,
                         ).returncode == 0
                     except Exception:  # noqa: BLE001
                         continue
                     if not in_head:
-                        # 上游新建（HEAD 无、本地有，如脚手架建的模块 pom）→ 补传
+                        # 上游新建（base 无、本地有，如脚手架建的模块 pom）→ 补传
                         rel_files.append(rel)
                         _seen.add(rel)
                         _extra.append(rel)
@@ -1658,7 +1663,7 @@ class WorkerExecutor:
                 )
                 try:
                     _ch = _sp.run(
-                        ["git", "diff", "--name-only", "HEAD"],
+                        ["git", "diff", "--name-only", resolve_base_ref(getattr(self, 'base_ref', None))],
                         cwd=str(local_root), capture_output=True, text=True, timeout=15,
                     ).stdout.splitlines()
                     _ut = _sp.run(
@@ -2123,11 +2128,13 @@ class WorkerExecutor:
                     _sp.run(["git", "-C", root, "add", "-N", *untracked],
                             capture_output=True, text=True, timeout=30)
                 r = _sp.run(
-                    ["git", "-C", root, "diff", "--no-color", "--", *targets],
+                    ["git", "-C", root, "diff", "--no-color",
+                     resolve_base_ref(getattr(self, 'base_ref', None)), "--", *targets],
                     capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
                 )
 
-            # 生成 diff：HEAD 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
+            # 生成 diff：钉扎 base 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
+            # 3rd#2：显式相对 base（None→HEAD），与 merge base_reader 同源对齐，消除运行期 HEAD 漂移。
             # --no-color 防 ANSI；-- <files> 限定 scope，不带入无关变更。
             # 行尾一致性由 pull-back 的 _preserve_line_endings 保证（CRLF 项目写回仍 CRLF），
             # 工作区与 git HEAD 同行尾 → git diff 不会全文 churn、产出的 context 行带正确行尾，

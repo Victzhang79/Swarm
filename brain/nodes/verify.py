@@ -90,6 +90,7 @@ async def verify_l2(state: BrainState) -> dict:
             shared_contract or None,
             timeout=600,
             compile_runner=_sandbox_compile_runner,
+            base_ref=state.get("base_commit"),  # 3rd#2：L2 reset/apply-check 相对钉扎 base
         )
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         if not ir_ok:
@@ -120,7 +121,8 @@ async def verify_l2(state: BrainState) -> dict:
             return {"l2_passed": sandbox_result}
 
         local_result = nodes._try_l2_local_verify(
-            project_id, merged_diff, test_cmd, timeout=180
+            project_id, merged_diff, test_cmd, timeout=180,
+            base_ref=state.get("base_commit"),
         )
         if local_result is not None:
             logger.info("[VERIFY_L2] 本地结果: %s", "通过" if local_result else "未通过")

@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS task_records (
     thread_id TEXT,
     auto_accept BOOLEAN DEFAULT FALSE,
     queue_priority TEXT DEFAULT 'normal',
+    base_commit TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -159,7 +160,8 @@ _TASK_SELECT = """
     created_at, updated_at,
     uploaded_files, auto_confirm_vision, pooled, ingest_draft,
     abandoned_subtasks,
-    auto_accept, queue_priority
+    auto_accept, queue_priority,
+    base_commit
 """
 
 
@@ -680,6 +682,7 @@ def update_task(
     l3_result: dict[str, Any] | None = None,
     auto_accept: bool | None = None,
     queue_priority: str | None = None,
+    base_commit: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新任务字段"""
@@ -731,6 +734,9 @@ def update_task(
     if queue_priority is not None:
         sets.append("queue_priority = %s")
         params.append(queue_priority)
+    if base_commit is not None:
+        sets.append("base_commit = %s")
+        params.append(base_commit)
 
     if not sets:
         return get_task(task_id, conn_str)
@@ -1575,6 +1581,8 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         # 队列执行 meta（P0-A：leader 重启后从 DB 重建 _pending_meta）。
         "auto_accept": bool(row[23]) if len(row) > 23 else False,
         "queue_priority": (row[24] or "normal") if len(row) > 24 else "normal",
+        # 3rd#2：任务级钉扎 base commit（run_task 启动时捕获；resume 读回不重捕获）。
+        "base_commit": (row[25] or None) if len(row) > 25 else None,
     }
 
 

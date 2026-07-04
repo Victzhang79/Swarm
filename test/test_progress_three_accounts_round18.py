@@ -21,12 +21,12 @@ def _row(subtask_count, completed, abandoned):
     )
 
 
-def test_select_has_25_columns():
+def test_select_has_26_columns():
     cols = [c.strip() for c in _TASK_SELECT.replace("\n", " ").split(",") if c.strip()]
-    # P0-A：末尾追加队列执行 meta 两列（auto_accept, queue_priority）。
-    assert cols[-3] == "abandoned_subtasks", cols
-    assert cols[-2:] == ["auto_accept", "queue_priority"], cols
-    assert len(cols) == 25, cols
+    # P0-A：追加队列执行 meta 两列（auto_accept, queue_priority）；3rd#2：末尾追加 base_commit。
+    assert cols[-4] == "abandoned_subtasks", cols
+    assert cols[-3:] == ["auto_accept", "queue_priority", "base_commit"], cols
+    assert len(cols) == 26, cols
 
 
 def test_three_accounts_typical():

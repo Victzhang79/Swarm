@@ -844,6 +844,29 @@ async def run_task(
             project_path = proj.get("path")
     except Exception as exc:
         logger.debug("获取项目路径失败 project_id=%s: %s", project_id, exc)
+
+    # ── 3rd#2 治本：任务启动即钉住 base commit（git rev-parse HEAD）──
+    # 全交付链（worker diff / merge base / L2 reset / learn 复位）统一相对此 SHA，
+    # 消除运行期用户/兄弟任务 commit 推进 HEAD 造成的混基线。已钉扎（罕见的重跑同 task_id）
+    # 则沿用 DB 里的出生基线，绝不重捕获。非 git/greenfield → None → 各站点退回 HEAD（零回归）。
+    from swarm.git_base import capture_base_commit
+
+    base_commit = task_rec.get("base_commit") or capture_base_commit(project_path)
+    if base_commit:
+        initial_state["base_commit"] = base_commit
+        if not task_rec.get("base_commit"):
+            try:
+                store.update_task(task_id, base_commit=base_commit)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[BASE] 落库 base_commit 失败(非致命,内存态仍钉扎): %s", exc)
+    elif project_path and os.path.isdir(os.path.join(project_path, ".git")):
+        # 对抗复核 M1：git 项目却捕获不到 base（git 超时/不在 PATH/仓库损坏）→ 全链退回实时 HEAD，
+        # 运行期 HEAD 漂移不再受钉扎保护。必须【可观测】——否则运维看到交付异常却无线索。
+        logger.warning(
+            "[BASE] capture_base_commit 返回 None（git 不可用/仓库异常），任务 %s 回退 HEAD 行为，"
+            "运行期 HEAD 漂移不受钉扎保护: project_path=%s", task_id, project_path,
+        )
+
     from swarm.memory.session import build_session_metadata
 
     initial_state["session_metadata"] = build_session_metadata(

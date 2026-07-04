@@ -1280,6 +1280,7 @@ async def _dispatch_to_worker(
     shared_contract: dict | None = None,
     model_override: str | None = None,
     recursion_boost: int = 0,
+    base_ref: str | None = None,
 ) -> WorkerOutput:
     """将子任务派发给 Worker 执行 — 真实调用 WorkerExecutor"""
     from swarm.knowledge.service import compact_knowledge_context, set_worker_context
@@ -1361,6 +1362,7 @@ async def _dispatch_to_worker(
             user_profile_prompt=user_profile_prompt,
             shared_contract=shared_contract or {},
             recursion_boost=recursion_boost,
+            base_ref=base_ref,  # 3rd#2：worker diff 基线相对钉扎 base
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
         audit(
@@ -2091,8 +2093,12 @@ def _files_owned_by_completed(subtasks, subtask_results: dict, exclude_ids: set)
     return owned
 
 
-def _local_tree_revert_subtask(project_path: str | None, st, protected_files: set | None = None) -> dict:
+def _local_tree_revert_subtask(project_path: str | None, st, protected_files: set | None = None,
+                               base_ref: str | None = None) -> dict:
     """卡死子任务恢复阶梯·阶梯三(revert)：把子任务在【本地树】的足迹清干净。
+
+    3rd#2：已跟踪文件 checkout 回【钉扎 base】版（None→HEAD 零回归），与交付链其余站点同源——
+    避免运行期 HEAD 漂移后把文件复位到与 merged_diff 基线不符的版本。
 
     protected_files（H-exec2 窄守卫，round21）：被【其它已完成子任务】拥有为有效产物的文件集——
     即便落在本子任务 footprint 内也【跳过删除/回退】，杜绝放弃时误删兄弟已落盘产物(footprint 与兄弟
@@ -2111,6 +2117,8 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     if not project_path:
         return result
     import subprocess
+    from swarm.git_base import resolve_base_ref
+    _base = resolve_base_ref(base_ref)
     root = Path(project_path)
     if not (root / ".git").exists():
         return result
@@ -2130,7 +2138,7 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
         if tracked:
             try:
                 subprocess.run(
-                    ["git", "checkout", "HEAD", "--", rel],
+                    ["git", "checkout", _base, "--", rel],
                     cwd=str(root), capture_output=True, text=True, timeout=20,
                 )
                 result["reverted"].append(rel)
@@ -2147,18 +2155,21 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     return result
 
 
-def _git_diff_for_paths(project_path: str, rel_paths: list[str]) -> str:
-    """据本地树现状为给定文件生成 unified diff（相对 HEAD）。
+def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str | None = None) -> str:
+    """据本地树现状为给定文件生成 unified diff（相对钉扎 base，3rd#2）。
 
     新建文件用 `git add -N`（intent-to-add）让 `git diff` 能产出新增内容；产出后 `git reset`
-    撤销 intent-to-add（保留工作区文件本身）。通用、与语言无关。失败返回空串。"""
+    撤销 intent-to-add（保留工作区文件本身）。通用、与语言无关。失败返回空串。
+    base_ref=None → "HEAD"（零回归）；给定则相对钉扎 base，与 merge base_reader 同源对齐。"""
     import subprocess
+    from swarm.git_base import resolve_base_ref
+    _base = resolve_base_ref(base_ref)
     if not rel_paths:
         return ""
     try:
         subprocess.run(["git", "add", "-N", "--", *rel_paths],
                        cwd=project_path, capture_output=True, text=True, timeout=20)
-        proc = subprocess.run(["git", "diff", "HEAD", "--", *rel_paths],
+        proc = subprocess.run(["git", "diff", _base, "--", *rel_paths],
                               cwd=project_path, capture_output=True, text=True, timeout=30)
         subprocess.run(["git", "reset", "-q", "--", *rel_paths],
                        cwd=project_path, capture_output=True, text=True, timeout=20)
@@ -2231,10 +2242,10 @@ async def _generate_compile_stub(state: BrainState, st, project_path: str | None
             logger.debug("[阶梯三·桩] 写文件失败 %s: %s", rel_norm, exc)
     if not written:
         return None
-    diff = _git_diff_for_paths(project_path, written)
+    diff = _git_diff_for_paths(project_path, written, base_ref=state.get("base_commit"))
     if not diff.strip():
         # diff 生成失败 → 清掉刚写的桩（防污染本地树）后回退 revert。
-        _local_tree_revert_subtask(project_path, st)
+        _local_tree_revert_subtask(project_path, st, base_ref=state.get("base_commit"))
         return None
     logger.info("[阶梯三·桩] 为卡死子任务 %s 生成可编译桩 %s（下游可编译，需人工补完）",
                 getattr(st, "id", "?"), written)
@@ -2288,7 +2299,8 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
         else:
             # H-exec2：清 fid 足迹前，护住【其它已完成子任务】拥有的有效产物(footprint 重叠不误删)。
             _prot = _files_owned_by_completed(subtasks, subtask_results, exclude_ids={fid})
-            rev = _local_tree_revert_subtask(project_path, st, protected_files=_prot)
+            rev = _local_tree_revert_subtask(project_path, st, protected_files=_prot,
+                                             base_ref=state.get("base_commit"))
             mode = "revert"
             subtask_results[fid] = WorkerOutput(
                 subtask_id=fid, diff="",
@@ -2309,7 +2321,8 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
                         # H-exec2：级联放弃下游清足迹时，同样护住其它已完成兄弟的有效产物。
                         _prot_c = _files_owned_by_completed(
                             subtasks, subtask_results, exclude_ids=_closed | {fid})
-                        _local_tree_revert_subtask(project_path, s, protected_files=_prot_c)
+                        _local_tree_revert_subtask(project_path, s, protected_files=_prot_c,
+                                                   base_ref=state.get("base_commit"))
                         subtask_results.pop(s.id, None)
         give_up.add(fid)
         handled.append((fid, mode))
@@ -3013,6 +3026,11 @@ def _make_base_reader(state: BrainState):
     project_id = state.get("project_id") or ""
     project_path = _get_project_path(project_id)
     _is_git = bool(project_path) and (Path(project_path) / ".git").exists()
+    # 3rd#2：merge 3-way base 读【任务钉扎的 base commit】而非实时 HEAD——运行期 HEAD 若被
+    # 用户/兄弟任务推进，读 HEAD 会与 worker 相对 base 生成的 hunk 不同源→apply 失败。base=None
+    # （非 git/greenfield/未钉扎）→ "HEAD"（零回归）。
+    from swarm.git_base import resolve_base_ref
+    _base_ref = resolve_base_ref(state.get("base_commit"))
 
     def _read_worktree(rel: str) -> str | None:
         full = Path(project_path) / rel
@@ -3036,7 +3054,7 @@ def _make_base_reader(state: BrainState):
         if _is_git:
             try:
                 r = subprocess.run(
-                    ["git", "-C", str(project_path), "show", f"HEAD:{rel}"],
+                    ["git", "-C", str(project_path), "show", f"{_base_ref}:{rel}"],
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", timeout=30,
                 )
@@ -3278,7 +3296,8 @@ def _sandbox_available() -> bool:
     return bool(cfg.use_for_worker and cfg.api_url)
 
 
-def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout: int = 180) -> bool:
+def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout: int = 180,
+                  base_ref: str | None = None) -> bool:
     from swarm.project.diff_apply import apply_git_diff
 
     apply_result = apply_git_diff(project_path, merged_diff)
@@ -3321,7 +3340,7 @@ def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout
         # 不再用整库 `checkout -- .` + `clean -fd`——后者会抹掉用户在该项目里无关的未提交改动。
         try:
             from swarm.brain.integration_review import _reset_worktree_to_head
-            _reset_worktree_to_head(project_path, merged_diff)
+            _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[VERIFY_L2] 工作树回滚失败(非致命): %s", exc)
 
@@ -3474,13 +3493,14 @@ def _try_l2_local_verify(
     test_cmd: str,
     *,
     timeout: int = 180,
+    base_ref: str | None = None,
 ) -> bool | None:
     """Run L2 locally via git apply + subprocess. Returns None if no project path."""
     project_path = _get_project_path(project_id)
     if not project_path:
         return None
     logger.info("[VERIFY_L2] 本地 L2 验证: cmd=%s", test_cmd)
-    return _run_l2_local(project_path, merged_diff, test_cmd, timeout=timeout)
+    return _run_l2_local(project_path, merged_diff, test_cmd, timeout=timeout, base_ref=base_ref)
 
 
 async def _verify_l2_via_llm(
@@ -3725,8 +3745,43 @@ async def learn_success(state: BrainState) -> dict:
                 # merged_diff 涉及文件统一 reset 到 HEAD 干净基线，再 resilient apply】——HEAD-relative
                 # 补丁对干净 HEAD 必 apply，new+modify 全部正确落盘，且解决 task 5dc6e634 的"基线已变
                 # 冲突"(reset 已消除 pull-back 脏内容，不再冲突)。
+                # ★3rd-P1b 治本（与 base-pin 耦合）★：base-pin 后 reset 复位到【钉扎 base】，若运行期
+                # 用户/兄弟任务已把 merged_diff 涉及的同名文件 commit 过，reset 会确定性覆盖其改动。
+                # 覆盖不阻断交付（任务变更仍产出），但绝不能【静默】——loud 告警 + audit 记录受害文件，
+                # 让运维可感知并人工对账（完整 3-way 自动重放留后续增量）。
+                _base_commit = state.get("base_commit")
+                if _base_commit:
+                    try:
+                        from swarm.git_base import (
+                            files_changed_since_base,
+                            worktree_diverged_from_base,
+                        )
+                        _diverged, _head = worktree_diverged_from_base(proj_path, _base_commit)
+                        if _diverged:
+                            _victims = files_changed_since_base(proj_path, _base_commit, out_files)
+                            if _victims:
+                                logger.warning(
+                                    "[LEARN_SUCCESS] ⚠️交付基线偏移：HEAD(%s)≠钉扎 base(%s)，且以下交付文件"
+                                    "在此期间被中途 commit → reset 到 base 将覆盖其改动，请人工对账: %s",
+                                    (_head or "?")[:12], _base_commit[:12], _victims[:20],
+                                )
+                                try:
+                                    audit(
+                                        "delivery_baseline_diverged",
+                                        orchestrator="Brain",
+                                        task_id=state.get("task_id"),
+                                        base_commit=_base_commit[:12],
+                                        head=(_head or "")[:12],
+                                        clobbered_files=_victims[:50],
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                    except Exception as _dvexc:  # noqa: BLE001
+                        logger.debug("[LEARN_SUCCESS] 基线偏移检测跳过(非致命): %s", _dvexc)
+
                 from swarm.brain.integration_review import _reset_worktree_to_head
-                await _asyncio.to_thread(_reset_worktree_to_head, proj_path, merged_diff)
+                await _asyncio.to_thread(
+                    _reset_worktree_to_head, proj_path, merged_diff, _base_commit)
                 # D5(b) 治本 round18 P0-C：分文件鲁棒 apply——一个坏 hunk 令整块 git apply 原子失败会
                 # 连坐回滚全部好文件。resilient 分文件独立落盘，好段照常写入、坏段单独剔除。
                 _ap = await _asyncio.to_thread(

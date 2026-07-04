@@ -85,11 +85,24 @@ def _migration_v2_task_queue_meta(conn) -> None:
         )
 
 
+def _migration_v3_base_commit(conn) -> None:
+    """v3（3rd#2）：task_records 加 base_commit，钉住任务启动时的 git HEAD。
+
+    交付链读侧统一相对此 SHA，消除运行期 HEAD 漂移导致的混基线。既有库幂等 ADD COLUMN；
+    新库由 TASK_RECORDS_DDL 直建，此迁移 no-op。与 _stamp 同事务（同 P0-A F1 约定）。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS base_commit TEXT"
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
+    (3, "add_base_commit", _migration_v3_base_commit),
     # 未来迁移在此追加，例如:
-    # (3, "add_xxx_column", _migration_add_xxx_column),
+    # (4, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1

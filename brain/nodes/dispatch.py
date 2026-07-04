@@ -360,6 +360,7 @@ async def dispatch(state: BrainState) -> dict:
                 shared_contract=shared_contract,
                 model_override=_override,
                 recursion_boost=_boost,
+                base_ref=state.get("base_commit"),  # 3rd#2：钉扎 base 透传到 worker
             )
             return subtask, output
         except Exception as e:
