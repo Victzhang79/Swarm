@@ -318,7 +318,9 @@ class MemoryStore:
     ) -> None:
         """写入任务摘要(自动维护滚动窗口)"""
         conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
+        # 复核 storage(L2 window) 治本：INSERT + 滚动窗口 DELETE 原 autocommit 分开提交，并发下窗口
+        # 可能瞬时 >50 或误删。显式 conn.transaction() 让两句原子(嵌套调用即 savepoint，安全)。
+        async with conn.transaction(), conn.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO mem_task_summary

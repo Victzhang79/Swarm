@@ -964,15 +964,19 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
         ]
         fresh_files = sorted({sym.file_path for sym in symbols})
         with sync_pool().connection() as conn:
-            with conn.cursor() as cur:
-                # P1-25：本批重新索引的文件【先整体删旧符号，再插 fresh 集】(同事务原子)。
-                # 纯 upsert 只增不删——文件内被删除的符号会残留成幽灵符号；delete-then-insert
-                # 让每个重新索引的文件的符号集权威覆盖，清掉已移除的符号。
-                cur.execute(
-                    "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
-                    (project_id, fresh_files),
-                )
-                cur.executemany(
+            # 复核 storage#2 治本：sync_pool 连接是 autocommit，注释声称"同事务原子"实则 DELETE 与
+            # INSERT 各自提交——INSERT 失败会把该批文件符号清空。显式 conn.transaction() 让 DELETE+
+            # INSERT 真原子(全成或全回滚)，与 project/store.delete_project 一致。
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    # P1-25：本批重新索引的文件【先整体删旧符号，再插 fresh 集】(同事务原子)。
+                    # 纯 upsert 只增不删——文件内被删除的符号会残留成幽灵符号；delete-then-insert
+                    # 让每个重新索引的文件的符号集权威覆盖，清掉已移除的符号。
+                    cur.execute(
+                        "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
+                        (project_id, fresh_files),
+                    )
+                    cur.executemany(
                     """
                     INSERT INTO kb_symbol_index
                         (project_id, file_path, symbol_name, symbol_type,

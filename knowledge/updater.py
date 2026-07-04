@@ -295,6 +295,13 @@ class KnowledgeUpdater:
             await self._behavior.close()
         if self._conn:
             await self._conn.close()
+        # 复核 storage#1 治本：置空所有连接引用。connect() 的幂等守卫是 `if self._conn is not None:
+        # return`——close 后不置空则 _conn 仍指向【已关闭】连接，shutdown→close→再 connect 会复用
+        # 已关连接，后续 SQL 全落死连接。置空后 connect() 会重建全部组件。
+        self._conn = None
+        self._struct = None
+        self._semantic = None
+        self._behavior = None
 
     # ── 注入外部组件 ──────────────────────────
 
@@ -605,6 +612,18 @@ class KnowledgeUpdater:
                     except Exception:
                         content = None
                 if content is None:
+                    # 复核 storage#6 治本：文件读不到(删除/移动/工作区缺失)旧代码 continue → 既不成功也
+                    # 不 retry_count++ → 永久占坑，与"≥10 放弃"脱节。改为累加 retry_count(带 last_error)，
+                    # 达上限后不再被选中(可人工清理)，与下方 except 分支同源收敛，杜绝无限占坑。
+                    async with self._conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE kb_pending_embeddings
+                            SET retry_count = retry_count + 1, last_error = %s
+                            WHERE project_id=%s AND file_path=%s
+                            """,
+                            ("file unreadable/missing in workspace", pid, file_path),
+                        )
                     continue
                 try:
                     # write-then-prune（替代先删后索引）：index 失败保留旧 chunk 无空窗，
