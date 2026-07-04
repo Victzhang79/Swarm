@@ -103,6 +103,22 @@ elif [[ "$PKG_MGR" == "apt" ]]; then
     sudo apt-get install -y -qq "$PG_PKG" "postgresql-contrib-16" "postgresql-server-dev-16" 2>/dev/null || true
 fi
 
+# ── Redis（生产/长跑推荐；单机试用可跳过：SWARM_SKIP_REDIS=1）──────────────
+# 启用后跨进程模块锁 / 队列跨重启存活+自愈 / 锁续期墙钟保护 生效。装完仍需在 .env 设
+# SWARM_REDIS_ENABLED=true 才算启用（仅填 URI 不算，见 .env.example）。
+if [[ "${SWARM_SKIP_REDIS:-0}" != "1" ]]; then
+    if [[ "$PKG_MGR" == "brew" ]]; then
+        info "brew install redis（推荐，生产/长跑用）..."
+        brew install redis 2>/dev/null || true
+        brew services start redis 2>/dev/null || true
+    elif [[ "$PKG_MGR" == "apt" ]]; then
+        info "apt: 安装 redis-server..."
+        sudo apt-get install -y -qq redis-server 2>/dev/null || true
+        sudo systemctl enable --now redis-server 2>/dev/null || true
+    fi
+    info "★ 装好后记得在 .env 设 SWARM_REDIS_ENABLED=true（否则代码走内存降级，不具跨进程/跨重启保障）"
+fi
+
 # ═══════════════════════════════════════════════════════════════
 #  Step 2: pgvector 扩展
 # ═══════════════════════════════════════════════════════════════

@@ -242,10 +242,16 @@ flowchart LR
 | [CodeGraph CLI](https://github.com/colbymchenry/codegraph) | latest | ⬜ | 构建符号表/依赖图；缺失则跳过该阶段，不影响主链路 |
 | CubeSandbox / E2B | — | ⬜ | 隔离沙箱执行；留空则 Worker 本地执行 |
 | Embedding / Rerank 服务 | OpenAI 兼容 | ⬜ | 云端（SiliconFlow 等）或自建；缺失回退内置 fastembed |
-| Redis | ≥ 6 | ⬜ | 模块锁 / 任务队列；默认关闭 |
+| [Redis](https://redis.io/) | ≥ 6 | 生产推荐 | 跨进程模块锁 · 任务队列跨重启存活 · 长跑锁续期保护；单机试用可不装 |
 | [Docker](https://docs.docker.com/) + Compose v2 | — | ⬜ | 用 Docker 一键拉起时需要；裸机部署不需要 |
 
 **操作系统**：macOS（Apple Silicon）/ Ubuntu 22.04+ / Debian / RHEL 系（setup.sh 自动适配 brew / apt / dnf）。
+
+> **运行拓扑**：目标部署形态为 **单进程 + PostgreSQL + Redis**。PostgreSQL 持久化任务/项目/记忆并作为
+> LangGraph checkpoint 存储；Redis（生产推荐）提供跨进程模块互斥、任务队列的跨重启存活与自愈补漏、
+> 以及长跑任务的锁续期保护。**Redis 的启用开关是 `SWARM_REDIS_ENABLED=true`**（仅填连接串不算启用；
+> 未启用时系统安全降级为进程内实现，适合单机试用但不具备上述跨进程/跨重启保障）。生产另建议
+> `SWARM_REQUIRE_PG_CHECKPOINTER=1` 强制 PG checkpointer，确保重启后人工审核/澄清等中断态可续跑。
 
 ### ⚠️ 目标项目的技术栈工具链（重要）
 
