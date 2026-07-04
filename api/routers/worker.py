@@ -10,7 +10,9 @@ import asyncio
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from swarm.api.rate_limit import rate_limit  # C7
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -31,7 +33,8 @@ class WorkerRunRequest(BaseModel):
 
 
 # ─── Phase 0: POST /api/projects/{project_id}/worker/run ───
-@router.post("/api/projects/{project_id}/worker/run", tags=["Worker"])
+@router.post("/api/projects/{project_id}/worker/run", tags=["Worker"],
+             dependencies=[Depends(rate_limit("worker_run", capacity=10, rate=0.2))])  # C7
 async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Request):
     """单 Worker 直跑（不经 Brain），用于 Phase 0 验证 scope + L1 + diff"""
     _require_perm(request, "worker:run", project_id)  # P0-SEC-02：起 worker（owner/developer 均有 worker:run）

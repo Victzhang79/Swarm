@@ -11,7 +11,9 @@ import asyncio
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from swarm.api.rate_limit import rate_limit  # C7
 
 import swarm.api.app as _app
 from swarm.config.settings import atomic_write_env
@@ -167,7 +169,8 @@ async def list_models(request: Request):
     return result
 
 
-@router.post("/api/config/test", tags=["配置"])
+@router.post("/api/config/test", tags=["配置"],
+             dependencies=[Depends(rate_limit("config_test", capacity=10, rate=0.5))])  # C7
 async def test_config(request: Request):
     """测试 Brain / 本地 Worker / 云端 Worker 模型是否可调用"""
     _require_perm(request, "config:write")  # A-P0-7：触发出站模型探活=需写权限
@@ -894,7 +897,8 @@ def _provider_by_id(provider_id: str):
     return None
 
 
-@router.post("/api/models/probe", tags=["配置"])
+@router.post("/api/models/probe", tags=["配置"],
+             dependencies=[Depends(rate_limit("models_probe", capacity=10, rate=0.5))])  # C7
 async def probe_models(request: Request):
     """触发对某 provider 模型的能力探测（异步，立即返回 job）。
 

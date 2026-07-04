@@ -506,10 +506,22 @@ def status(project: str | None, api_url: str):
     console.print(table)
 
 
+def _demo_enabled() -> bool:
+    """C9：demo 直跑本地 Brain 完全绕过 API/RBAC/审计——生产默认禁用，须显式 env 开启。"""
+    import os
+    return os.environ.get("SWARM_DEMO_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @main.command()
 def demo():
-    """运行演示任务（本地 Brain，无需 API）"""
-    console.print(Panel("[bold]🐝 Swarm Demo — 本地 Brain 模式[/]"))
+    """运行演示任务（本地 Brain，无需 API）——【仅开发】，绕过 API/RBAC/审计。"""
+    if not _demo_enabled():
+        console.print(
+            "[red]demo 已禁用[/]：本地 Brain 直跑会绕过 API/RBAC/审计，生产环境默认关闭。\n"
+            "如确需在开发机运行，设 [bold]SWARM_DEMO_ENABLED=1[/] 后重试。"
+        )
+        raise SystemExit(2)
+    console.print(Panel("[bold]🐝 Swarm Demo — 本地 Brain 模式（dev-only）[/]"))
     asyncio.run(_run_demo())
 
 

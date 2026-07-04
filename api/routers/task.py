@@ -11,7 +11,9 @@ import json
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+
+from swarm.api.rate_limit import rate_limit  # C7
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -34,6 +36,18 @@ def _require_task_access(request, task, task_id: str, perm: str):
     if not task or not user_can_on_project(user, perm, (task or {}).get("project_id")):
         raise _HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return task
+
+
+def _stream_reauthorized(request, task, perm: str) -> bool:
+    """C6 治本：流连接建立后周期性重校——token 吊销/过期或成员被移除即返回 False（断流）。
+    旧代码仅在连接建立时鉴权一次，之后放任事件流至自然结束（失权后仍能观察敏感进度）。"""
+    try:
+        from swarm.api._shared import _require_user as _ru
+        from swarm.auth.store import user_can_on_project
+        user = _ru(request)  # 重读 token：get_user_by_token 过滤 token_revoked/expired
+        return bool(task) and user_can_on_project(user, perm, (task or {}).get("project_id"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class TaskCreateRequest(BaseModel):
@@ -80,7 +94,8 @@ async def list_tasks(project_id: str, request: Request):
 
 
 # ─── 8. POST /api/projects/{project_id}/tasks — 创建任务 ─
-@router.post("/api/projects/{project_id}/tasks", tags=["任务管理"])
+@router.post("/api/projects/{project_id}/tasks", tags=["任务管理"],
+             dependencies=[Depends(rate_limit("task_create", capacity=20, rate=0.5))])  # C7
 async def create_task(project_id: str, req: TaskCreateRequest, request: Request):
     """创建任务并后台启动 Brain 编排"""
     user = _require_perm(request, "task:create", project_id)
@@ -231,6 +246,11 @@ async def stream_task(task_id: str, request: Request):
                 try:
                     event_data = await asyncio.wait_for(queue.get(), timeout=30)
                 except asyncio.TimeoutError:
+                    # C6：每心跳(~30s)重校 token/成员——吊销/踢出即断流。
+                    if not _stream_reauthorized(request, task, "task:read"):
+                        yield {"event": "error",
+                               "data": json.dumps({"step": "error", "message": "认证已失效，连接关闭"})}
+                        break
                     yield {"event": "heartbeat", "data": ""}
                     continue
 
@@ -298,6 +318,12 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
             try:
                 event_data = await asyncio.wait_for(queue.get(), timeout=30)
             except asyncio.TimeoutError:
+                # C6：每心跳(~30s)重校 token/成员——吊销/踢出即断连（重跑 authenticate_ws 读新 token）。
+                _u = authenticate_ws(websocket)
+                if _u is None or not user_can_on_project(_u, "task:read", task.get("project_id")):
+                    await websocket.send_json({"event": "error", "data": {"detail": "认证已失效"}})
+                    await websocket.close(code=1008)
+                    break
                 # 心跳：防止连接空闲超时
                 await websocket.send_json({"event": "heartbeat", "data": ""})
                 continue

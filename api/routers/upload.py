@@ -18,10 +18,11 @@ import re
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm
+from swarm.api.rate_limit import rate_limit  # C8
 from swarm.brain import ingest as doc_ingest
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,8 @@ def _check_magic(ext: str, head: bytes) -> bool:
     return any(head.startswith(sig) for sig in expected)
 
 
-@router.post("/api/uploads", tags=["任务管理"])
+@router.post("/api/uploads", tags=["任务管理"],
+             dependencies=[Depends(rate_limit("uploads", capacity=10, rate=0.2))])  # C8
 async def upload_files(request: Request):
     """上传一批文件，返回隔离存储后的路径列表（供创建任务时引用）。
 

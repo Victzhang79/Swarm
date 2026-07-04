@@ -171,7 +171,8 @@ async def search_symbols(project_id: str, q: str, request: Request, limit: int =
     return {"symbols": await _search(), "query": q.strip(), "limit": cap}
 
 
-@router.get("/api/projects/{project_id}/knowledge/semantic", tags=["知识库"])
+@router.get("/api/projects/{project_id}/knowledge/semantic", tags=["知识库"],
+            dependencies=[Depends(rate_limit("kb_semantic", capacity=30, rate=1.0))])  # C7
 async def search_semantic_chunks(project_id: str, q: str, request: Request, limit: int = 20):
     """Layer B — 语义 chunk 检索（Qdrant）"""
     _require_perm(request, "project:read", project_id)  # P0-SEC-03

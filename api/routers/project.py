@@ -10,7 +10,9 @@ import asyncio
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from swarm.api.rate_limit import rate_limit  # C7
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -228,7 +230,8 @@ async def delete_project(project_id: str, request: Request):
 
 
 # ─── 5. POST /api/projects/{project_id}/preprocess — 手动触发预处理 ─
-@router.post("/api/projects/{project_id}/preprocess", tags=["项目管理"])
+@router.post("/api/projects/{project_id}/preprocess", tags=["项目管理"],
+             dependencies=[Depends(rate_limit("preprocess", capacity=10, rate=0.2))])  # C7
 async def trigger_preprocess(project_id: str, request: Request):
     """手动触发/重新触发项目预处理"""
     _require_perm(request, "project:write", project_id)  # P0-SEC-03
