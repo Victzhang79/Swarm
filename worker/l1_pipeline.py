@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from swarm.project.diff_apply import files_from_unified_diff
 from swarm.types import FileScope, NotRunKind, SubTask
+from swarm.worker.cmd_normalize import normalize_python_cmd
 from swarm.worker.output_compress import compress_tool_output
 
 if TYPE_CHECKING:
@@ -1173,7 +1174,7 @@ def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tupl
         return 126, f"命令被黑名单拦截(本地兜底不放行): {_reason}"
     try:
         proc = subprocess.run(
-            _normalize_python_cmd(command), cwd=project_path, shell=True,
+            normalize_python_cmd(command, py_bin=_python_bin()), cwd=project_path, shell=True,
             capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
@@ -1275,7 +1276,7 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
         return ec, out, err
     try:
         proc = subprocess.run(
-            _normalize_python_cmd(shell_cmd), cwd=project_path, shell=True,
+            normalize_python_cmd(shell_cmd, py_bin=_python_bin()), cwd=project_path, shell=True,
             capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
@@ -2093,21 +2094,6 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
     return None
 
 
-def _normalize_python_cmd(cmd: str) -> str:
-    """把命令里的裸 `python`/`python3` 归一到本机可用解释器。
-
-    Brain/LLM 生成的 harness 常写 `python ...`，但本机(确定性闸门运行处)可能只有
-    `python3`(macOS 常见)。沙箱里 python 存在，本地却 command not found —— 这类
-    环境漂移会让确定性验证误判。统一替换前缀。
-    """
-    if not cmd:
-        return cmd
-    py = _python_bin()
-    if py == "python":
-        return cmd
-    # 替换行首或 && / ; / | 后的裸 python（不动 python3 已正确的情况）
-    import re
-    return re.sub(r"(^|[\s;&|])python(?=\s)", lambda m: f"{m.group(1)}{py}", cmd)
 
 
 def _maven_modules(project_path: str) -> dict[str, str]:

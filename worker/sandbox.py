@@ -18,7 +18,6 @@ import base64
 import logging
 import os
 import posixpath
-import re as _re
 import shlex
 import sys
 import time
@@ -30,6 +29,7 @@ from pydantic import BaseModel
 
 from swarm.config.settings import SandboxConfig, get_config
 from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
+from swarm.worker.cmd_normalize import normalize_py_compile_cmd, normalize_python_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -56,66 +56,15 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-# 裸 `python` token（命令开头或管道/分隔符/&&/||/; 之后），但排除 python3 / pythonX。
-# 沙箱镜像 PATH 只有 python3，无 python 别名 → 裸 python 调用须规范化为 python3。
-_PYTHON_TOKEN_RE = _re.compile(r"(?<![\w./-])python(?![\w.-])")
-
-# `py_compile` 只接受【文件】参数，传目录（如 `.`）必报 [Errno 21] Is a directory，
-# exit=1 → L1 构建闸门假阴性（task d4f9db79 实证：trivial 成功却被判失败）。
-# 默认 harness build_command="python -m py_compile ." 一直不可执行，被 python→python3
-# 修复前的 127 错误掩盖。compileall 才接受目录并递归编译。在统一入口幂等规范化：
-# 当 py_compile 的参数含非 .py 路径（目录）时整体改 compileall。与 _normalize_python_cmd
-# 同源，沙箱/本地两条路径自动覆盖；LLM 即使再生成 py_compile <dir> 也被兜底改正。
-# 捕获 `-m py_compile <args...>`，args 直到命令分隔符（&& || ; | 换行）或行尾。
-_PY_COMPILE_RE = _re.compile(r"-m\s+py_compile\s+(?P<args>[^&|;\n]+)")
-
-
-def _normalize_py_compile_cmd(command: str) -> str:
-    """把 `py_compile <含目录参数>` 规范化为 `compileall <同参数>`（幂等）。
-
-    py_compile 仅接受文件；只要参数里出现任一非 .py 结尾的路径（典型是目录 `.`），
-    命令必失败。compileall 接受目录递归编译，是"编译整个项目"的正确工具。
-      - "python3 -m py_compile ."              → "python3 -m compileall ."         ✅
-      - "python -m py_compile src/"            → "python -m compileall src/"        ✅
-      - 'python3 -m py_compile "a.py" "b.py"'  → 不变（全是 .py 文件，py_compile 正确）✅
-      - "python3 -m compileall ."              → 不变（已是 compileall）             ✅
-    """
-    if not command or "py_compile" not in command:
-        return command
-
-    def _sub(m: "_re.Match[str]") -> str:
-        raw = m.group("args")
-        # 拆 token 检查：剥掉成对引号后，任一非 .py 结尾的 token 视为目录 → 需 compileall。
-        toks = [t.strip("'\"") for t in raw.split() if t.strip("'\"")]
-        # 仅看位置参数（跳过 -q/-f 等选项），任一不以 .py 结尾即判定含目录。
-        pos = [t for t in toks if not t.startswith("-")]
-        has_dir = any(not t.endswith(".py") for t in pos) if pos else True
-        if has_dir:
-            return m.group(0).replace("py_compile", "compileall", 1)
-        return m.group(0)
-
-    return _PY_COMPILE_RE.sub(_sub, command)
+# round24 A2：python 命令规范化统一到 worker/cmd_normalize（单一事实源，参数化目标解释器）。
+# 沙箱镜像 PATH 只有 python3，故沙箱路径固定 py_bin="python3"。下方 _normalize_* 为
+# 向后兼容别名（内部调用点 + test_sandbox_python_normalize 沿用）。
+_normalize_py_compile_cmd = normalize_py_compile_cmd
 
 
 def _normalize_python_cmd(command: str) -> str:
-    """把命令中独立的 `python` token 规范化为 `python3`（幂等）。
-
-    沙箱 python 镜像 PATH 只有 python3，无 python 别名。harness/trivial 生成的
-    "python -m py_compile" / "python -m pytest" 等会 exit=127 command not found，
-    导致 L1 误判失败（task a4988789 实证）。在沙箱命令执行统一入口规范化，单一事实源，
-    覆盖所有 harness/worker/trivial 命令，避免逐处改命令字符串"修一个漏一个"。
-
-    用负向断言只替换独立 token：
-      - "python -m pytest"   → "python3 -m pytest"   ✅
-      - "python3 -m pytest"  → 不变（python3 不匹配）  ✅
-      - "PYTHONPATH=. python" → "PYTHONPATH=. python3"（PYTHONPATH 不受影响）✅
-      - "/usr/bin/python"    → 不变（前面有 / ，不匹配）✅
-    """
-    if not command or "python" not in command:
-        return command
-    # 先 python→python3，再 py_compile <dir>→compileall <dir>（两道幂等规范化串联，单一事实源）
-    command = _PYTHON_TOKEN_RE.sub("python3", command)
-    return _normalize_py_compile_cmd(command)
+    """沙箱路径的 python 命令规范化（py_bin 固定 python3）。见 cmd_normalize.normalize_python_cmd。"""
+    return normalize_python_cmd(command, py_bin="python3")
 
 
 # A1 批3：进程级稳定实例 ID。多副本场景下，每个 swarm 进程有唯一 instance_id，
