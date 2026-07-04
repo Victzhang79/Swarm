@@ -102,6 +102,10 @@ class ModuleLock:
         # 对抗复核 4a：renew 连续【瞬时错误】计数。瞬时（Redis 抖动/超时）容忍到阈值才判失锁，
         # 避免一次网络 blip 就杀掉多小时长任务；确认被抢（Lua 返回 0）则立即判失锁不容忍。
         self._renew_transient_fails = 0
+        # ★复核 Item 1★：上次【确认续期成功】的单调时刻。瞬时容忍期间 Redis 的 TTL 仍在倒计——
+        # 若容忍跨越 ~TTL 秒，锁可能已在 Redis 过期而本进程仍自认持有 → 同进程另一同模块任务可
+        # acquire 成功 → 双写。故除计数外再加【墙钟闸】：容忍期超 TTL*0.8 一律判失锁。
+        self._last_ok_monotonic = 0.0
 
     def acquire(self) -> bool:
         r = get_redis()
@@ -113,6 +117,8 @@ class ModuleLock:
             return True
         ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         self._held = bool(ok)
+        if self._held:
+            self._last_ok_monotonic = time.monotonic()  # Item 1：墙钟基准
         return self._held
 
     def renew(self) -> bool:
@@ -139,11 +145,20 @@ class ModuleLock:
             # ok=1 续期成功；ok=0 = 锁已不是自己的（被抢/已过期）→ 确认失锁，立即判否。
             if not bool(ok):
                 logger.warning("[ModuleLock] renew 确认失锁(锁=%s)：value 已非本 token（被抢/过期）", self.key)
+            else:
+                self._last_ok_monotonic = time.monotonic()  # Item 1：刷新墙钟基准
             return bool(ok)
         except Exception as exc:  # noqa: BLE001
             # 对抗复核 4a：这是【瞬时】通信错误（网络超时/连接池/Redis 重启），不等于确认失锁。
             # 容忍到阈值前返回 True（不误杀长任务）；连续超阈值才判失锁（Redis 长时不可用=真降级）。
             self._renew_transient_fails += 1
+            # ★复核 Item 1★：墙钟闸——即便计数未到阈值，若距上次确认续期已 > TTL*0.8，Redis 侧锁
+            # 极可能已过期(另一同模块任务可 acquire→双写) → 立即判失锁，不再容忍（安全 > 长任务存活）。
+            _elapsed = time.monotonic() - self._last_ok_monotonic if self._last_ok_monotonic else 0.0
+            if _elapsed > self.ttl_sec * 0.8:
+                logger.warning("[ModuleLock] renew 瞬时失败且距上次续期 %.0fs > TTL*0.8(%ds)，锁恐已过期→判失锁: %s",
+                               _elapsed, self.ttl_sec, exc)
+                return False
             if self._renew_transient_fails < _renew_transient_threshold():
                 logger.warning("[ModuleLock] renew 瞬时失败(锁=%s，第 %d 次，阈值内容忍): %s",
                                self.key, self._renew_transient_fails, exc)

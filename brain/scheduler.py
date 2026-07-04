@@ -273,6 +273,10 @@ async def start_task_scheduler() -> None:
                     # 队列空 + 有空槽 → 2nd#3 自愈排水（节流）：DB 里 SUBMITTED 但队列已丢的陈滞项
                     # 重入队，不必等下次重启对账（Redis flap/内存队列清 后自修复）。
                     await _maybe_drain_stranded()
+                # ★复核 Item 3★：持续满负载下队列【永不空】→ 上面的排水分支永不触达 → 队列已丢的陈滞
+                # SUBMITTED 任务永久静默卡死(无日志/无告警)。故【无条件】再跑一次节流排水(30s 内幂等)——
+                # 去重守卫(_is_already_running)令重入队合法在队项无害(至多一次多余出队),代价可忽略。
+                await _maybe_drain_stranded()
                 # 队列空或并发已满 → 等唤醒或轮询
                 try:
                     if _wakeup is not None:

@@ -87,14 +87,11 @@ class _ProjectGitFlock:
             import fcntl
             import hashlib
             import tempfile as _tf
-            # ★B6 复核 #1★：锁键必须规范化——worker 传 Path.resolve() 路径、交付传 DB 原始串，
-            # 二者只要相对/绝对/尾斜杠/symlink(/tmp→/private/tmp) 有差就是两把锁 → 同项目 git 写
-            # 并行互踩。在【单一哈希点】统一 resolve，令所有 _ProjectGitFlock 使用者落同一把锁。
-            try:
-                _canon = str(Path(local_root).resolve())
-            except Exception:  # noqa: BLE001 — 异常路径退回原串（至少同实例内自洽）
-                _canon = str(local_root)
-            proj_hash = hashlib.sha1(_canon.encode()).hexdigest()[:16]
+            # ★B6 复核 #1/L-4★：锁键规范化【单一事实源】canon_path——worker 传 resolve() 路径、
+            # 交付传 DB 原始串，二者拼法差就是两把锁 → 同项目 git 写并行互踩。与交付 asyncio 锁字典
+            # 共用 canon_path，连 resolve() 异常 fallback 都同源，不再各处分裂。
+            from swarm.git_base import canon_path
+            proj_hash = hashlib.sha1(canon_path(local_root).encode()).hexdigest()[:16]
             lock_path = Path(_tf.gettempdir()) / f"swarm_git_{proj_hash}.lock"
             self._lock_f = open(lock_path, "w")  # noqa: SIM115
             self._fcntl = fcntl

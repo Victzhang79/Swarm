@@ -48,17 +48,36 @@ def test_slow_subscriber_does_not_block_others():
     assert slow.qsize() <= slow.maxsize
 
 
-def test_subscriber_soft_cap_warns(monkeypatch, caplog):
-    """订阅者数超软上限 → 告警（可观测），但不硬拒（SSE 仍可连）。"""
+def test_subscriber_soft_cap_warns(monkeypatch):
+    """订阅者数超软上限 → 告警（可观测），但不硬拒（SSE 仍可连）。
+
+    不用 caplog：全量套件里先跑的测试会触发 _configure_app_logging 把 swarm logger
+    设为不向 root 传播，caplog（挂 root）就收不到 → 顺序相关 flaky。直接在 runner
+    的 logger 上挂 handler 断言，不依赖传播链。
+    """
     import logging
     from swarm.brain import runner
 
     monkeypatch.setattr(runner, "_MAX_SUBS_PER_TASK", 2)
-    t = runner._FanoutTopic(history=0)
-    with caplog.at_level(logging.WARNING):
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    runner.logger.addHandler(handler)
+    old_level = runner.logger.level
+    runner.logger.setLevel(logging.WARNING)
+    try:
+        t = runner._FanoutTopic(history=0)
         for _ in range(4):
             t.subscribe()
-    assert any("订阅者" in r.message or "subscriber" in r.message.lower() for r in caplog.records)
+    finally:
+        runner.logger.removeHandler(handler)
+        runner.logger.setLevel(old_level)
+    msgs = [r.getMessage() for r in records]
+    assert any("订阅者" in m or "subscriber" in m.lower() for m in msgs), f"未捕获软上限告警: {msgs}"
 
 
 def test_late_subscriber_replays_most_recent_history(monkeypatch):

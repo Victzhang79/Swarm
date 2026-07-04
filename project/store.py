@@ -776,6 +776,8 @@ def update_task(
         sets.append("queue_priority = %s")
         params.append(queue_priority)
     if base_commit is not None:
+        # 复核 L-3：哨兵是【is not None】非 truthiness——retry_task 用 base_commit="" 清空以令 run_task
+        # 重捕获新基线；若改成 `if base_commit:` 会跳过空串写入 → retry 静默沿用旧 birth base。勿"优化"。
         sets.append("base_commit = %s")
         params.append(base_commit)
 

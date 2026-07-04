@@ -94,7 +94,10 @@ class BrainState(TypedDict, total=False):
     subtask_force_strong: dict[str, bool]  # FINDING-12：拒答/步数耗尽的子任务，重试强制走最强模型+更多步数
     abandoned_subtask_ids: list[str]    # 部分交付：重试耗尽被放弃的子任务（+其依赖者），任务终态 PARTIAL 而非灭全部
     give_up_isolated_ids: list[str]     # 卡死子任务恢复阶梯·阶梯三：保 build 放弃的子任务（本地树已 revert/打桩清干净，build 不被毒）——终态 PARTIAL，诚实列明需人工补完
-    merge_rebase_dropped: list[str]     # ★B6 #7★ merge rebase 达上限被丢弃 rebased 变更的子任务——纳入 partial_delivery_ids，终态 PARTIAL 而非静默 DONE
+    # ★B6 #7★ merge rebase 达上限被丢弃 rebased 变更的子任务——纳入 partial_delivery_ids，终态 PARTIAL
+    # 而非静默 DONE。复核 L-2：既已决定 PARTIAL-vs-DONE，用 append+dedup reducer（而非 last-writer-wins），
+    # 未来若有并行分支也写此键不会静默丢早先条目。
+    merge_rebase_dropped: Annotated[list[str], _merge_degraded_reasons]
     subtask_retry_counts: dict[str, int]  # 每个子任务的累计【capability】重试次数（换模型/升级阶梯）
     subtask_redecompose_count: dict[str, int]  # 卡死子任务恢复阶梯·阶梯二：定点拆小次数（有界，每子任务≤1）
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）

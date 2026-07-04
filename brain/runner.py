@@ -563,11 +563,15 @@ def _extract_interrupt_info(snapshot: Any, state: dict[str, Any]) -> dict[str, A
     return None
 
 
-async def _has_pending_checkpoint(task_id: str) -> bool:
+async def _has_pending_checkpoint(task_id: str) -> bool | None:
     """探测任务在 LangGraph checkpoint 里是否仍处于【挂起（有下一步/interrupt）】状态。
 
-    对账用（2nd#1）：区分"真挂起（可 resume）"与"DB 假挂起（checkpoint 丢失）"。
-    纯读、不推进图。异常/无快照/无 next → False（fail-closed：宁可判失败也不留假挂起）。
+    对账用（2nd#1 + 复核 #6/M-1）：三态区分——
+    - True：有快照且有 next/interrupt = 真挂起，可 resume。
+    - False：快照【确】不存在(aget_state 干净返 None) = DB 假挂起，判 FAILED。
+    - None：探测【本身失败】(PG 瞬时/持久故障) ≠ 无快照 → 调用方保守【保留但计数告警】，
+      不批量误杀，也不静默永卡（持续失败由调用方汇总 loud 告警）。
+    纯读、不推进图。
     """
     from swarm.tracing import brain_graph_config
 
@@ -586,11 +590,11 @@ async def _has_pending_checkpoint(task_id: str) -> bool:
         )
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001
-        # ★B6 复核 #6★：探测【本身失败】(PG 瞬时抖动/连接超时) ≠ "无 checkpoint"。原返 False 会让
-        # 对账把所有 CONFIRMING/DELIVERING 挂起任务批量误杀 FAILED。区分：探测失败 → 保守【保留】
-        # (返 True,不 kill;待 PG 恢复后仍可 resume)；只有探测成功但快照确不存在(下方 None)才判死。
-        logger.warning("[RECONCILE] checkpoint 探测失败(非「无快照」，保留任务待恢复) task=%s: %s", task_id, exc)
-        return True
+        # ★B6 复核 #6/M-1★：探测【本身失败】(PG 瞬时抖动/持久故障) ≠ "无 checkpoint"。返 None（非
+        # False）→ 对账保守【保留但计数】，既不批量误杀(旧 False 的坑)，也不静默永卡(旧改 True 的坑：
+        # 持久故障下任务永远 kept 无告警)。持续失败由对账循环汇总 loud 告警,ops 可介入。
+        logger.warning("[RECONCILE] checkpoint 探测失败(非「无快照」，保留待恢复) task=%s: %s", task_id, exc)
+        return None
     if snapshot is None:
         return False
     # 有 next（待执行节点）或有 interrupt 载荷 → 仍是可续跑的挂起点。
@@ -742,7 +746,8 @@ async def _handle_post_run(
     from swarm.brain.gates import partial_delivery_ids
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
-    _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up（供下方 log 明细）
+    _rebase_dropped = state.get("merge_rebase_dropped") or []  # 复核 H-1：rebase 超限丢弃的子任务
+    _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up ∪ rebase_dropped
     _final_status = "PARTIAL" if _partial_ids else "DONE"
     store.update_task(
         task_id,
@@ -753,12 +758,17 @@ async def _handle_post_run(
     _emit_task_notification(task_id, task_rec, _final_status)
     output_parts = _build_result_payload(state)
     if _partial_ids:
-        logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)",
-                       task_id, len(_abandoned), _abandoned, len(_given_up), _given_up)
+        logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)"
+                       " + rebase 超限丢弃 %d 个(%s)",
+                       task_id, len(_abandoned), _abandoned, len(_given_up), _given_up,
+                       len(_rebase_dropped), _rebase_dropped)
         _msg = (f"部分交付：已完成子任务真实落盘且可构建(已过 L2)；放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}"
                 if _abandoned else "部分交付：已完成子任务真实落盘且可构建(已过 L2)")
         if _given_up:
             _msg += f"；保 build 放弃 {len(_given_up)} 个(本地树已清/打桩，需人工补完)：{_given_up}"
+        if _rebase_dropped:
+            # 复核 H-1：否则 rebase-only PARTIAL 会显示"放弃 0 + 保 build 0"无解释。
+            _msg += f"；merge rebase 超限丢弃 {len(_rebase_dropped)} 个(rebased 变更未并入，需人工核验)：{_rebase_dropped}"
         await _emit(queue, {
             "step": "complete",
             "status": "partial",
@@ -1233,7 +1243,13 @@ async def reconcile_orphan_tasks() -> dict[str, int]:
             # DB 显示"待审"但 Command(resume) 无 snapshot 可续 → 用户点审批必 FAILED、上下文作废，
             # 是"假挂起"权威分裂。探测无挂起 → fail-closed 标 FAILED(checkpoint_missing)，让用户重提交。
             has_ckpt = await _has_pending_checkpoint(tid)
-            if has_ckpt:
+            if has_ckpt is None:
+                # ★复核 M-1★：探测失败(非"确无快照")→ 保守保留 + 计数,不误杀也不静默永卡。
+                stats["probe_failed"] = stats.get("probe_failed", 0) + 1
+                _audit_reconcile(tid, rec, "checkpoint_probe_failed", status,
+                                 "checkpointer probe failed; kept un-verified, verify manually")
+                logger.warning("[RECONCILE] 任务 %s 中断态 %s checkpoint 探测失败 → 保留待恢复(未核验)", tid, status)
+            elif has_ckpt:
                 stats["resumed_interrupt"] += 1
                 _audit_reconcile(tid, rec, "recovered_interrupt", status,
                                  "API restart; interrupt-suspended task kept for human resume")
@@ -1282,6 +1298,10 @@ async def reconcile_orphan_tasks() -> dict[str, int]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[RECONCILE] 任务 %s 标记 FAILED 失败: %s", tid, exc)
 
+    if stats.get("probe_failed"):
+        # ★复核 M-1★：持久探测失败不能静默——汇总 loud 告警，ops 据此排查 checkpointer 健康。
+        logger.warning("[RECONCILE] ⚠️ %d 个中断态任务因 checkpoint 探测失败被【保留未核验】，"
+                       "checkpointer 可能不健康，请人工排查并按需处置", stats["probe_failed"])
     logger.info("[RECONCILE] 启动对账完成: %s", stats)
     return stats
 

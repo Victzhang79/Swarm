@@ -813,7 +813,9 @@ async def plan(state: BrainState) -> dict:
     # T3：同文件写权唯一——消除"同一文件被多个子任务并发写"的冲突（写权保留首个，
     # 其余降级为 readable）+ 被依赖产物自动入域。防多 worker 同时编辑同一文件互相覆盖。
     from swarm.brain.contract_utils import normalize_plan_scopes
-    if normalize_plan_scopes(task_plan):
+    # 复核 L-1：与 elaborate 同源传 project_path+钉扎 base，aggregate-vs-新建撞车判定不读实时 HEAD。
+    if normalize_plan_scopes(task_plan, project_path=_get_project_path(state.get("project_id") or ""),
+                             base_ref=state.get("base_commit")):
         logger.info("[PLAN] T3 scope 归一：消除同文件并发写冲突（写权唯一化 + 依赖产物入域）")
 
     # harness 兜底：LLM 未给出 harness 的子任务，按语言推断一个，确保 Worker 有
@@ -3697,7 +3699,11 @@ async def revision(state: BrainState) -> dict:
     # 绝不能把返回值赋回 updated_plan（否则 plan 被替换成 dict，state["plan"] 损坏）。
     try:
         from swarm.brain.contract_utils import resolve_plan_conflicts
-        resolve_plan_conflicts(updated_plan)  # 原地变更；返回值(计数 dict)丢弃
+        # ★复核 H-2★：revision 路径也须传 project_path+钉扎 base，否则 aggregate-vs-新建撞车判定
+        # 因 project_path=None 短路成 False → base-pin 要防的 pom 多写者缺陷在 revision 期重开。
+        resolve_plan_conflicts(updated_plan,  # 原地变更；返回值(计数 dict)丢弃
+                               project_path=_get_project_path(state.get("project_id") or ""),
+                               base_ref=state.get("base_commit"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[REVISION] 计划冲突消解跳过(非致命): %s", exc)
 
@@ -3726,13 +3732,11 @@ async def _deliver_merged_diff_serialized(
     比拆 4 段前更糟）。锁内单次 to_thread 拉起同步交付；内层 _ProjectGitFlock 仍作【跨进程】
     兜底（多 leader 降级场景）。get/set 间无 await → 同一事件循环步内原子，不会各持不同锁。
 
-    ★B6 复核 #1★：字典键规范化（resolve）——与 _ProjectGitFlock 同源，否则同项目不同拼法的
-    proj_path 落不同 asyncio 锁，进程内串行化也分裂。"""
+    ★B6 复核 #1/L-4★：字典键用 canon_path（与 _ProjectGitFlock 同一函数），否则同项目不同拼法的
+    proj_path 落不同 asyncio 锁、连 resolve() 异常 fallback 都分裂，进程内串行化失效。"""
     import asyncio as _a
-    try:
-        _key = str(Path(proj_path).resolve())
-    except Exception:  # noqa: BLE001
-        _key = str(proj_path)
+    from swarm.git_base import canon_path
+    _key = canon_path(proj_path)
     lock = _project_delivery_locks.get(_key)
     if lock is None:
         lock = _a.Lock()
@@ -3784,6 +3788,7 @@ async def learn_success(state: BrainState) -> dict:
     plan_obj = state.get("plan")
     merged_diff = state.get("merged_diff", "")
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
+    _degraded: list[str] = []  # 复核 M-3：交付降级信号（如 base 不可达），并入 degraded_reasons 可观测
 
     # ── 第二批根因(选项A)：产出本地 git commit（单一收口点，覆盖 auto+人工 accept）──
     # accept 后必经 learn_success。worker pull-back 把产出写进工作区但【不 commit】，
@@ -3859,6 +3864,7 @@ async def learn_success(state: BrainState) -> dict:
                                 "[LEARN_SUCCESS] ⚠️钉扎 base %s 不可达(GC/历史重写)，merged_diff 相对旧 base "
                                 "生成 → 交付 apply 可能失败/不完整，请核验交付物", _base_commit[:12],
                             )
+                            _degraded.append("delivery_base_unreachable")  # M-3：并入终态可观测降级
                             try:
                                 audit("delivery_base_unreachable", orchestrator="Brain",
                                       task_id=state.get("task_id"), base_commit=_base_commit[:12])
@@ -3997,10 +4003,13 @@ async def learn_success(state: BrainState) -> dict:
     )
 
     logger.info("[LEARN_SUCCESS] 学习完成 (persisted=%s)", persist_meta.get("persisted"))
-    return {
+    _out: dict = {
         "learned": True,
         "learn_summary": learn_summary,
     }
+    if _degraded:
+        _out["degraded_reasons"] = _degraded  # reducer append+dedup，终态可观测（M-3）
+    return _out
 
 
 async def learn_failure(state: BrainState) -> dict:

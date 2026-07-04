@@ -16,6 +16,16 @@ from __future__ import annotations
 import subprocess
 
 
+def canon_path(p: object) -> str:
+    """规范化路径为锁/缓存键的【单一事实源】（复核 L-4/#1）：所有 _ProjectGitFlock 使用者与
+    交付 asyncio 锁字典共用它，杜绝 resolve() 异常时各处 fallback 不一致导致锁分裂。"""
+    from pathlib import Path as _Path
+    try:
+        return str(_Path(p).resolve())
+    except Exception:  # noqa: BLE001 — 异常路径(null 字节等)退回 str，二者同源仍自洽
+        return str(p)
+
+
 def resolve_base_ref(base_commit: str | None) -> str:
     """把钉扎的 base commit 解析为 git 命令可用的 ref。
 
@@ -115,8 +125,14 @@ def uncommitted_changed_files(project_path: str | None, files: list[str] | None)
         return []
     dirty: list[str] = []
     for ln in (proc.stdout or "").splitlines():
-        # porcelain 行格式: "XY <path>"（XY 为状态码）。取路径段。
-        path = ln[3:].strip() if len(ln) > 3 else ""
+        # porcelain 行格式: "XY <path>"（XY 为状态码）。复核 M-2：处理 rename("old -> new" 取 new)
+        # 与含空格被 git 引号包裹的路径("path with space" → 去引号)，避免 audit 记录进垃圾串。
+        if len(ln) <= 3:
+            continue
+        path = ln[3:]
+        if " -> " in path:  # rename/copy：取箭头后的新路径
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
         if path:
             dirty.append(path)
     return dirty
