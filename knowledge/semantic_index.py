@@ -394,6 +394,57 @@ class SemanticIndexer:
             ),
         )
 
+    async def reconcile_orphan_points(self, live_project_ids: set[str], batch: int = 512) -> int:
+        """P2-B：删除 Qdrant 里 project_id 已不在【存活集】的孤儿 points。
+
+        删项目时 Qdrant 清理是 best-effort（失败仅 warning）→ 残留孤儿向量长期占用、污染检索。
+        本 reconcile scroll 全集收集 payload.project_id，差集(Qdrant - 存活)即孤儿，逐 project 删。
+        供每日调度调用（off-peak）。返回清理的孤儿 project 数。异常 → 0（非致命，不阻断调度）。"""
+        try:
+            client = self._client_or_raise()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[KB reconcile] Qdrant 不可用，跳过孤儿对账: %s", exc)
+            return 0
+        live = set(live_project_ids)
+        seen: set[str] = set()
+        offset = None
+        try:
+            while True:
+                points, offset = await client.scroll(
+                    collection_name=self._collection_name,
+                    with_payload=["project_id"], with_vectors=False,
+                    limit=batch, offset=offset,
+                )
+                for p in points:
+                    pid = (getattr(p, "payload", None) or {}).get("project_id")
+                    if pid:
+                        seen.add(pid)
+                if offset is None:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[KB reconcile] scroll 失败，本轮跳过: %s", exc)
+            return 0
+        orphans = seen - live
+        cleaned = 0
+        for pid in orphans:
+            try:
+                await client.delete(
+                    collection_name=self._collection_name,
+                    points_selector=models.FilterSelector(
+                        filter=models.Filter(must=[
+                            models.FieldCondition(
+                                key="project_id", match=models.MatchValue(value=pid)),
+                        ])
+                    ),
+                )
+                cleaned += 1
+            except Exception as exc:  # noqa: BLE001 — 单项目删失败不弃其余
+                logger.warning("[KB reconcile] 删孤儿项目 %s 向量失败(跳过): %s", pid, exc)
+        if cleaned:
+            logger.info("[KB reconcile] 清理 %d 个已删项目的 Qdrant 孤儿向量: %s",
+                        cleaned, list(orphans)[:10])
+        return cleaned
+
     # ── 检索 ────────────────────────────────────
 
     async def search(

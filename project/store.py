@@ -488,9 +488,50 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                     "mem_successes",
                 ):
                     _delete_if_table_exists(cur, tbl, project_id)
+                # P2-A：此前遗漏的项目级作用域表 → 补齐级联，杜绝孤立行长期膨胀。
+                # （task_audit_log 【故意保留】：append-only 追溯"删了什么"，由 TTL purge 兜底。）
+                for tbl in (
+                    "milestone_reports",
+                    "notifications",
+                    "llm_token_usage",
+                ):
+                    _delete_if_table_exists(cur, tbl, project_id)
                 cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
                 deleted = cur.rowcount
     return deleted > 0
+
+
+def count_tasks_by_status(conn_str: str | None = None) -> dict[str, int]:
+    """P2-D：按 status 聚合任务数（供 /metrics 导出）。DB 不可用返回空 dict（非致命）。"""
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, COUNT(*) FROM task_records GROUP BY status")
+                return {str(row[0]): int(row[1]) for row in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[METRICS] count_tasks_by_status 失败(非致命): %s", exc)
+        return {}
+
+
+def purge_old_task_audit(retention_days: int = 180, conn_str: str | None = None) -> int:
+    """P2-A：裁剪 append-only 的 task_audit_log —— 保留最近 retention_days 天，删更早行。
+
+    task_audit_log 是纯 append（每 audit 事件一行 + delete_project 快照），无任何删除路径 →
+    生产长跑持续膨胀。保留窗口内（默认 180 天）足够追溯与合规，更早的按 TTL 裁掉。
+    retention_days<=0 视为关闭（返回 0，不删）。返回删除行数。幂等、可反复跑。"""
+    if retention_days <= 0:
+        return 0
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM task_audit_log WHERE at < NOW() - make_interval(days => %s)",
+                    (int(retention_days),),
+                )
+                return cur.rowcount or 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[PURGE] task_audit_log 裁剪失败(非致命): %s", exc)
+        return 0
 
 
 # ──────────────────────────────────────────────

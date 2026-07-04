@@ -77,6 +77,11 @@ def _raise_if_wallclock_exceeded(start_monotonic: float, deadline_s: float) -> N
         if elapsed > deadline_s:
             raise TaskWallclockExceeded(deadline_s, elapsed)
 
+# P2-F：SSE/WS fanout 有界参数（防慢/挂死客户端无界积压）。可经环境变量调。
+_SUB_QUEUE_MAXSIZE = max(64, int(os.environ.get("SWARM_SSE_SUB_QUEUE_MAX", "2000")))
+_MAX_SUBS_PER_TASK = max(1, int(os.environ.get("SWARM_SSE_MAX_SUBS_PER_TASK", "50")))
+
+
 class _FanoutTopic:
     """单 task 的进度事件【发布-订阅】主题（N-CW1/N-CW2 根因修复）。
 
@@ -95,9 +100,18 @@ class _FanoutTopic:
         self._history: deque[dict[str, Any]] = deque(maxlen=history)
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # P2-F：订阅者队列【有界】——慢/挂死的 SSE 客户端不再让队列无界增长撑爆内存。
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_SUB_QUEUE_MAXSIZE)
         for ev in self._history:  # 回放历史，late 订阅者也能看到先前进度
-            q.put_nowait(ev)
+            try:
+                q.put_nowait(ev)
+            except asyncio.QueueFull:  # 历史长于队列容量 → 停止回放（保最新那批历史）
+                break
+        # P2-F：订阅者数软上限——超限仅告警（可观测）不硬拒（SSE/WS 仍可连），
+        # 每队列已有界故总内存 = N×maxsize 受控；异常多订阅者=泄漏信号，需人工排查。
+        if len(self._subs) >= _MAX_SUBS_PER_TASK:
+            logger.warning("[FANOUT] 单 task 订阅者数达软上限 %d，疑似 SSE/WS 未注销泄漏",
+                           _MAX_SUBS_PER_TASK)
         self._subs.add(q)
         return q
 
@@ -109,8 +123,13 @@ class _FanoutTopic:
         for q in list(self._subs):  # 扇出到每个订阅者各自队列（put_nowait 不阻塞）
             try:
                 q.put_nowait(event)
-            except asyncio.QueueFull:  # 理论不会（无界队列），保险丢弃保护其它订阅者
-                pass
+            except asyncio.QueueFull:
+                # P2-F：队列满（慢消费者）→ drop-oldest 保最新进度，不阻塞、不 OOM、不误伤其它订阅者。
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
 
     def __bool__(self) -> bool:  # 兼容旧 `if queue:` 判断
         return True
@@ -776,7 +795,7 @@ async def run_task(
     # 放在 run_task 内可覆盖所有入口（调度器准入 / 后台 / 直接调用）。
     from swarm.logging_config import set_task_context
 
-    set_task_context(task_id)
+    set_task_context(task_id, project_id=project_id or "")  # P2-D：日志带 project_id
     # 绑定 project 上下文：本协程内所有 brain 编排 LLM 调用（ANALYZE/TECH_DESIGN/plan/
     # dispatch/HANDLE_FAILURE 等均 await llm.ainvoke）经 ContextVar 自动归属本项目，供
     # token 用量统计按项目聚合。brain 全异步→ContextVar 沿 await 链 + gather 子任务(创建时

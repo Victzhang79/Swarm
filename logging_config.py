@@ -27,6 +27,8 @@ from typing import Iterator
 # ── task 上下文（跨协程传播）─────────────────────────────
 _task_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("swarm_task_id", default="")
 _subtask_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("swarm_subtask_id", default="")
+# P2-D：project_id 上下文——JSON 日志带 project_id，运维可按项目聚合/过滤全链日志。
+_project_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("swarm_project_id", default="")
 
 _LOGGED_TEXT_FMT = "%(asctime)s [%(levelname)s] %(name)s%(task_suffix)s: %(message)s"
 
@@ -39,6 +41,7 @@ class _ContextFilter(logging.Filter):
         sid = _subtask_id_var.get("")
         record.task_id = tid
         record.subtask_id = sid
+        record.project_id = _project_id_var.get("")
         # 文本格式用的可读后缀，无 task 时为空
         if tid and sid:
             record.task_suffix = f" [task={tid[:8]} sub={sid}]"
@@ -63,6 +66,8 @@ class _JsonFormatter(logging.Formatter):
             payload["task_id"] = record.task_id
         if getattr(record, "subtask_id", ""):
             payload["subtask_id"] = record.subtask_id
+        if getattr(record, "project_id", ""):
+            payload["project_id"] = record.project_id
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
@@ -242,29 +247,34 @@ def setup_logging(*, force: bool = False, console: bool | None = None) -> None:
 
 
 @contextmanager
-def bind_task(task_id: str, subtask_id: str = "") -> Iterator[None]:
-    """在作用域内绑定 task_id（含 subtask_id），该域内所有 swarm 日志自动携带。
+def bind_task(task_id: str, subtask_id: str = "", project_id: str = "") -> Iterator[None]:
+    """在作用域内绑定 task_id（含 subtask_id/project_id），该域内所有 swarm 日志自动携带。
 
-    用 contextvars，跨 async 任务安全传播；退出作用域自动还原。
+    用 contextvars，跨 async 任务安全传播；退出作用域自动还原。project_id 可选（P2-D）。
     """
     t_token = _task_id_var.set(task_id or "")
     s_token = _subtask_id_var.set(subtask_id or "")
+    p_token = _project_id_var.set(project_id or "")
     try:
         yield
     finally:
         _task_id_var.reset(t_token)
         _subtask_id_var.reset(s_token)
+        _project_id_var.reset(p_token)
 
 
-def set_task_context(task_id: str, subtask_id: str = "") -> None:
-    """非上下文管理器形式绑定（如无法用 with 的回调里）。不会自动还原。"""
+def set_task_context(task_id: str, subtask_id: str = "", project_id: str = "") -> None:
+    """非上下文管理器形式绑定（如无法用 with 的回调里）。不会自动还原。project_id 可选（P2-D）。"""
     _task_id_var.set(task_id or "")
     _subtask_id_var.set(subtask_id or "")
+    if project_id:
+        _project_id_var.set(project_id)
 
 
 def clear_task_context() -> None:
     _task_id_var.set("")
     _subtask_id_var.set("")
+    _project_id_var.set("")
 
 
 def current_task_id() -> str:

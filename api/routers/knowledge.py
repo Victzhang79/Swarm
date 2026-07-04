@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from swarm.api.rate_limit import rate_limit
 from pydantic import BaseModel, Field
 
 import swarm.api.app as _app
@@ -215,7 +217,8 @@ class KnowledgeRetrieveRequest(BaseModel):
     top_k: int | None = Field(default=None, description="单层上限（可选，默认使用 Brain 配置）")
 
 
-@router.post("/api/projects/{project_id}/knowledge/retrieve", tags=["知识库"])
+@router.post("/api/projects/{project_id}/knowledge/retrieve", tags=["知识库"],
+             dependencies=[Depends(rate_limit("kb_retrieve", capacity=30, rate=1.0))])
 async def knowledge_retrieve_experiment(
     project_id: str,
     req: KnowledgeRetrieveRequest,
@@ -441,7 +444,8 @@ def _summarize_report(report) -> dict[str, Any]:
     }
 
 
-@router.post("/api/projects/{project_id}/knowledge/ingest", tags=["知识库"])
+@router.post("/api/projects/{project_id}/knowledge/ingest", tags=["知识库"],
+             dependencies=[Depends(rate_limit("kb_ingest", capacity=10, rate=0.2))])
 async def ingest_documents(project_id: str, request: Request, req: IngestRequest):
     """采集外部文档进项目知识库（语义层）。
 

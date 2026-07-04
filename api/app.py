@@ -1122,6 +1122,36 @@ async def _run_kb_prune_once(retention: int) -> None:
     finally:
         await bstore.close()
 
+    # P2-A：同轮裁剪 append-only 的 task_audit_log（纯增无删路径 → 长跑膨胀）。
+    # 独立 retention（审计合规窗口通常更长），复用同一每日调度 + wait_for 超时保护。
+    try:
+        audit_retention = int(os.environ.get("SWARM_AUDIT_RETENTION_DAYS", "365"))
+    except ValueError:
+        audit_retention = 365
+    try:
+        purged = await loop.run_in_executor(
+            None, lambda: store.purge_old_task_audit(audit_retention))
+        if purged:
+            logger.info("每日审计裁剪：删 task_audit_log %d 行（保留 %d 天）", purged, audit_retention)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("每日审计裁剪失败(非致命): %s", exc)
+
+    # P2-B：Qdrant 孤儿向量对账——删已不存在项目的残留 points（delete_project 时 best-effort
+    # Qdrant 清理失败的残留）。存活集 = DB 现存 project_id。同轮跑，异常不阻断。
+    try:
+        live_ids = {p.get("id") for p in (projects or []) if p.get("id")}
+        from swarm.knowledge.semantic_index import SemanticIndexer
+        idx = SemanticIndexer()
+        try:
+            await idx.connect()
+            cleaned = await idx.reconcile_orphan_points(live_ids)
+            if cleaned:
+                logger.info("每日 Qdrant 孤儿对账：清理 %d 个已删项目的残留向量", cleaned)
+        finally:
+            await idx.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("每日 Qdrant 孤儿对账失败(非致命): %s", exc)
+
 
 async def _kb_prune_daily_loop(hour: int = 4) -> None:
     """每日 hour 点清理全库项目的过旧 KB 修改日志 + 陈旧共现。SWARM_KB_LOG_RETENTION_DAYS 可调。
@@ -1173,6 +1203,42 @@ async def health_check():
     except Exception:  # noqa: BLE001
         _ver = ""
     return {"status": "ok", "timestamp": time.time(), "version": _ver}
+
+
+@app.get("/api/metrics", tags=["系统"])
+async def metrics(request: Request):
+    """P2-D：Prometheus 文本导出（任务态计数 + 调度器在飞/待跑 + Redis 开关）。
+
+    需鉴权（避免任务态计数信息泄漏）；无外部依赖（手写 exposition，不引 prometheus_client）。
+    DB 不可用时相应指标缺省为空段，端点仍 200（探针友好）。"""
+    from swarm.api._shared import _require_user
+    _require_user(request)
+
+    loop = asyncio.get_running_loop()
+    by_status = await loop.run_in_executor(None, store.count_tasks_by_status)
+    from swarm.brain.scheduler import queue_stats
+    qs = queue_stats()
+
+    lines: list[str] = []
+    lines.append("# HELP swarm_tasks_total Task count by status")
+    lines.append("# TYPE swarm_tasks_total gauge")
+    for st, n in sorted(by_status.items()):
+        safe = str(st).replace('"', "")
+        lines.append(f'swarm_tasks_total{{status="{safe}"}} {int(n)}')
+    lines.append("# HELP swarm_scheduler_inflight In-flight (running) tasks")
+    lines.append("# TYPE swarm_scheduler_inflight gauge")
+    lines.append(f"swarm_scheduler_inflight {int(qs['inflight'])}")
+    lines.append("# HELP swarm_scheduler_pending_meta Pending exec-meta in memory")
+    lines.append("# TYPE swarm_scheduler_pending_meta gauge")
+    lines.append(f"swarm_scheduler_pending_meta {int(qs['pending_meta'])}")
+    lines.append("# HELP swarm_scheduler_max_concurrent Concurrency cap")
+    lines.append("# TYPE swarm_scheduler_max_concurrent gauge")
+    lines.append(f"swarm_scheduler_max_concurrent {int(qs['max_concurrent'])}")
+    lines.append("# HELP swarm_redis_enabled Redis backend enabled (1/0)")
+    lines.append("# TYPE swarm_redis_enabled gauge")
+    lines.append(f"swarm_redis_enabled {1 if redis_enabled() else 0}")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 # ─── 1b. 就绪探针依赖探测（供 /api/health/ready 复用；测试可 patch 这三只） ───

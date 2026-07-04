@@ -24,21 +24,20 @@ def _setup(monkeypatch, cands, running=()):
     return sched, enq
 
 
-def test_drain_reenqueues_stranded_submitted(monkeypatch):
+async def test_drain_reenqueues_stranded_submitted(monkeypatch):
     cands = [
         {"id": "t1", "project_id": "p", "description": "d1", "status": "SUBMITTED",
          "queue_priority": "urgent", "auto_accept": True},
     ]
     sched, enq = _setup(monkeypatch, cands)
-    n = sched._drain_stranded_submitted()
+    n = await sched._drain_stranded_submitted()
     assert n == 1
     assert enq == [("t1", "p", "urgent")]
-    # 回填 meta 便于出队时无需再查库
-    assert sched._pending_meta["t1"]["description"] == "d1"
-    assert sched._pending_meta["t1"]["auto_accept"] is True
+    # F6：不回填 _pending_meta（出队时 _resolve_exec_meta 从 DB 重建，免泄漏）
+    assert "t1" not in sched._pending_meta
 
 
-def test_drain_skips_non_submitted(monkeypatch):
+async def test_drain_skips_non_submitted(monkeypatch):
     """非 SUBMITTED（已开跑/审批认领）绝不重入队——交对账/resume 处置，不凭空双跑。"""
     cands = [
         {"id": "a", "project_id": "p", "description": "d", "status": "ANALYZING",
@@ -49,31 +48,60 @@ def test_drain_skips_non_submitted(monkeypatch):
          "queue_priority": "normal"},
     ]
     sched, enq = _setup(monkeypatch, cands)
-    assert sched._drain_stranded_submitted() == 0
+    assert await sched._drain_stranded_submitted() == 0
     assert enq == []
 
 
-def test_drain_skips_already_running(monkeypatch):
+async def test_drain_skips_already_running(monkeypatch):
     """SUBMITTED 但已在飞/在跑（刚出队窗口）→ 跳过，不制造重复队列项。"""
     cands = [
         {"id": "t1", "project_id": "p", "description": "d", "status": "SUBMITTED",
          "queue_priority": "normal"},
     ]
     sched, enq = _setup(monkeypatch, cands, running={"t1"})
-    assert sched._drain_stranded_submitted() == 0
+    assert await sched._drain_stranded_submitted() == 0
     assert enq == []
 
 
-def test_maybe_drain_throttled(monkeypatch):
+async def test_drain_per_record_guard_continues_on_enqueue_error(monkeypatch):
+    """对抗复核 F2：某条 enqueue 抛错（Redis flap 中途）不弃其余陈滞项。"""
+    import swarm.brain.scheduler as sched
+    from swarm.project import store
+    from swarm.infra.redis_client import TaskQueue
+
+    cands = [
+        {"id": "bad", "project_id": "p", "description": "d", "status": "SUBMITTED", "queue_priority": "normal"},
+        {"id": "good", "project_id": "p", "description": "d", "status": "SUBMITTED", "queue_priority": "normal"},
+    ]
+    ok: list = []
+
+    def _enq(tid, pid, priority="normal"):
+        if tid == "bad":
+            raise ConnectionError("redis flap")
+        ok.append(tid)
+
+    monkeypatch.setattr(store, "list_orphan_candidates", lambda: cands)
+    monkeypatch.setattr(TaskQueue, "enqueue", staticmethod(_enq))
+    monkeypatch.setattr(sched, "_is_already_running", lambda tid: False)
+    sched._inflight.clear()
+    n = await sched._drain_stranded_submitted()
+    assert n == 1 and ok == ["good"], "bad 抛错后 good 仍被重入队（F2）"
+
+
+async def test_maybe_drain_throttled(monkeypatch):
     """节流：短间隔内二次调用不重复查库/排水。"""
     import swarm.brain.scheduler as sched
 
     calls = {"n": 0}
-    monkeypatch.setattr(sched, "_drain_stranded_submitted", lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    async def _fake():
+        calls["n"] += 1
+
+    monkeypatch.setattr(sched, "_drain_stranded_submitted", _fake)
     sched._last_drain_ts = 0.0
-    sched._maybe_drain_stranded()  # 首次触发
+    await sched._maybe_drain_stranded()  # 首次触发
     first = calls["n"]
-    sched._maybe_drain_stranded()  # 紧接第二次 → 被节流
+    await sched._maybe_drain_stranded()  # 紧接第二次 → 被节流
     assert calls["n"] == first == 1
 
 

@@ -128,18 +128,23 @@ _last_drain_ts: float = 0.0
 _DRAIN_INTERVAL_S = 30.0  # idle 节流：队列持续空时最多每 30s 查一次 DB 补漏
 
 
-def _drain_stranded_submitted() -> int:
+async def _drain_stranded_submitted() -> int:
     """DB 里 status=SUBMITTED 但既不在飞(_inflight)也不在跑、且此刻队列已空 → 判为【陈滞项】
     （Redis 后端切换/flap 丢了队列项，或内存队列被清），重入队。
 
-    使 DB 成为权威源、TaskQueue+_pending_meta 退化为【自修复的派生缓存】——不必等下次重启的
+    使 DB 成为权威源、TaskQueue 退化为【自修复的派生缓存】——不必等下次重启的
     reconcile_orphan_tasks。仅在【队列空 + 有空槽】的 idle tick 调用（见 _loop），故此刻
     SUBMITTED-not-inflight 必为陈滞（真排队项会让队列非空），无误重入队。fail-closed：只认
-    SUBMITTED（与 _resolve_exec_meta 同口径，非 SUBMITTED 交对账/resume 处置，不凭空双跑）。"""
+    SUBMITTED（与 _resolve_exec_meta 同口径，非 SUBMITTED 交对账/resume 处置，不凭空双跑）。
+
+    对抗复核修正：①DB 查询走 run_in_executor 不堵事件循环(F3)；②逐条 try/except——Redis flap
+    中途 enqueue 抛错不弃其余陈滞项(F2)；③不回填 _pending_meta——出队时 _resolve_exec_meta 从 DB
+    重建，免 drained-then-cancelled 的 meta 泄漏(F6)；④有恢复则 _wakeup.set() 立即消费(F4)。"""
     from swarm.project import store
 
+    loop = asyncio.get_running_loop()
     try:
-        cands = store.list_orphan_candidates()
+        cands = await loop.run_in_executor(None, store.list_orphan_candidates)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Scheduler] 自愈排水查询失败(非致命): %s", exc)
         return 0
@@ -150,20 +155,28 @@ def _drain_stranded_submitted() -> int:
         tid = rec["id"]
         if _is_already_running(tid):
             continue
-        priority = rec.get("queue_priority") or "normal"
-        TaskQueue.enqueue(tid, rec["project_id"], priority=priority)
-        _pending_meta.setdefault(tid, {
-            "project_id": rec["project_id"],
-            "description": rec["description"],
-            "auto_accept": bool(rec.get("auto_accept", False)),
-        })
-        n += 1
+        try:
+            TaskQueue.enqueue(tid, rec["project_id"], priority=rec.get("queue_priority") or "normal")
+            n += 1
+        except Exception as exc:  # noqa: BLE001 — 单条失败(Redis flap)不弃其余陈滞项
+            logger.warning("[Scheduler] 自愈排水：任务 %s 重入队失败(跳过,下轮再试): %s", tid, exc)
     if n:
         logger.info("[Scheduler] 自愈排水：重入队 %d 个陈滞 SUBMITTED 任务（队列丢失/Redis flap 恢复）", n)
+        if _wakeup is not None:
+            _wakeup.set()  # 唤醒消费循环立即取，不等 2s 轮询
     return n
 
 
-def _maybe_drain_stranded() -> None:
+def queue_stats() -> dict[str, int]:
+    """P2-D：调度器可观测快照——在飞并发数、进程内待跑 meta 数、并发上限。"""
+    return {
+        "inflight": len(_inflight),
+        "pending_meta": len(_pending_meta),
+        "max_concurrent": _max_concurrent(),
+    }
+
+
+async def _maybe_drain_stranded() -> None:
     """节流包装：队列持续空时按 _DRAIN_INTERVAL_S 触发排水，避免每个 idle tick 查库。"""
     global _last_drain_ts
     import time as _time
@@ -172,7 +185,7 @@ def _maybe_drain_stranded() -> None:
     if now - _last_drain_ts < _DRAIN_INTERVAL_S:
         return
     _last_drain_ts = now
-    _drain_stranded_submitted()
+    await _drain_stranded_submitted()
 
 
 def _project_ready_for_exec(project_id: str) -> bool:
@@ -200,11 +213,14 @@ def _project_ready_for_exec(project_id: str) -> bool:
 
 async def start_task_scheduler() -> None:
     """启动后台消费循环（API startup 调用，幂等）。"""
-    global _consumer_started, _wakeup
+    global _consumer_started, _wakeup, _last_drain_ts
     if _consumer_started:
         return
     _consumer_started = True
     _wakeup = asyncio.Event()
+    # F5：首个排水延后一个间隔，避开与启动期 reconcile_orphan_tasks 撞车重复入队（都无害去重，但省churn）。
+    import time as _time
+    _last_drain_ts = _time.monotonic()
 
     async def _loop() -> None:
         from swarm.brain.runner import start_task_background
@@ -256,7 +272,7 @@ async def start_task_scheduler() -> None:
                         continue  # 立即尝试下一个（填满并发额度）
                     # 队列空 + 有空槽 → 2nd#3 自愈排水（节流）：DB 里 SUBMITTED 但队列已丢的陈滞项
                     # 重入队，不必等下次重启对账（Redis flap/内存队列清 后自修复）。
-                    _maybe_drain_stranded()
+                    await _maybe_drain_stranded()
                 # 队列空或并发已满 → 等唤醒或轮询
                 try:
                     if _wakeup is not None:
