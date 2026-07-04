@@ -31,6 +31,7 @@ from typing import Any
 from swarm.config.settings import get_config
 from swarm.git_base import resolve_base_ref
 from swarm.models.errors import TransientInfraError
+from swarm.paths import is_within_root
 from swarm.tools.scope_guard import clear_scope
 from swarm.types import (
     Confidence,
@@ -1493,18 +1494,13 @@ class WorkerExecutor:
         """
         deleted: list[str] = []
         scope = self.effective_scope
-        root_resolved = local_root.resolve()
         for f in (getattr(scope, "delete_files", []) or []):
             rel = self._norm_rel(local_root, f)
             if not rel:
                 continue
             lp = local_root / rel
-            # CR-4：containment——解析后必须在 local_root 内，杜绝 `../x` 越界 unlink。
-            try:
-                resolved = lp.resolve()
-            except OSError:
-                continue
-            if resolved != root_resolved and root_resolved not in resolved.parents:
+            # CR-4：containment——解析后必须在 local_root 内，杜绝 `../x` 越界 unlink（A5 归一原语）。
+            if not is_within_root(local_root, rel, join=True):
                 self._log(f"删除路径越界（不在项目根内），拒删: {rel}")
                 continue
             if exists_in_sandbox(rel):

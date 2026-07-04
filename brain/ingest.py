@@ -88,13 +88,14 @@ def path_is_within_uploads(path: "str | Path") -> bool:
     """
     if not path or not str(path).strip():
         return False
+    from swarm.config.settings import get_config
+    from swarm.paths import is_within_root
+    # 归一到 A5 原语（内部 fail-closed：无法 resolve→False）；root 计算失败也判否。
     try:
-        from swarm.config.settings import get_config
-        root = (Path(get_config().workspace_root) / "uploads").resolve()
-        target = Path(path).resolve()
-        return target == root or root in target.parents
-    except (OSError, ValueError, RuntimeError):
+        root = Path(get_config().workspace_root) / "uploads"
+    except Exception:  # noqa: BLE001
         return False
+    return is_within_root(root, path, join=False)
 
 
 def validate_file(

@@ -10,18 +10,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from swarm.paths import is_within_root
+
 
 def _rel_within_root(root: Path, rel: str) -> bool:
     """P0-3：相对路径 resolve 后是否落在 root 内（防 diff 里 `../` 逃逸出工作区）。
 
     自研快照/回滚链路独立于 git（git apply 自身对 ../ 有防护），故 备份/恢复/删除 前必须各自
-    复核归属，否则 diff 含 `../` 可读写删工作区外文件。fail-closed：无法判定一律判否。
+    复核归属，否则 diff 含 `../` 可读写删工作区外文件。归一到 swarm.paths.is_within_root（A5）。
     """
-    try:
-        (root.resolve() / rel).resolve().relative_to(root.resolve())
-        return True
-    except (ValueError, OSError):
-        return False
+    return is_within_root(root, rel, join=True)
 
 
 def diff_paths_escape_root(project_path: str, diff: str) -> list[str]:

@@ -28,6 +28,7 @@ from typing import Any, Iterator
 from pydantic import BaseModel
 
 from swarm.config.settings import SandboxConfig, get_config
+from swarm.paths import is_within_root
 from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 from swarm.worker.cmd_normalize import normalize_py_compile_cmd, normalize_python_cmd
 
@@ -1159,10 +1160,8 @@ print(json.dumps(files))
             if not rel_posix:
                 continue
             local_path = (local_root / rel_posix).resolve()
-            # 防目录穿越：必须在 local_root 内
-            try:
-                local_path.relative_to(local_root)
-            except ValueError:
+            # 防目录穿越：必须在 local_root 内（A5 归一原语 is_within_root）
+            if not is_within_root(local_root, rel_posix, join=True):
                 stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
                 continue
             if not local_path.is_file():
@@ -1235,9 +1234,8 @@ print(json.dumps(files))
                     stats["skipped"] += 1
                     continue
                 local_path = (local_root / rel_posix).resolve()
-                try:
-                    local_path.relative_to(local_root)
-                except ValueError:
+                # 防目录穿越（A5 归一原语 is_within_root）
+                if not is_within_root(local_root, rel_posix, join=True):
                     stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
                     continue
                 # ── 行尾保留（task f20ea68d 根因·CRLF）──
