@@ -315,7 +315,7 @@ def _blocked_pkg_state(pkg):
 def test_handle_failure_hallucinated_pkg_no_producer_not_in_baseline_abandons():
     """臆造包：无 plan 生产者 且 基线树无此包 → 判不可恢复、连坐放弃(不再 transient 空烧)。"""
     state = _blocked_pkg_state("com.ruoyi.common.core.redis")
-    with patch.object(nodes, "_package_in_baseline", return_value=False):
+    with patch("swarm.brain.nodes.recovery._package_in_baseline", return_value=False):
         out = _run(nodes.handle_failure(state))
     assert out.get("failure_strategy") == "abandon", "臆造不存在的包应硬失败连坐放弃"
     assert "st-solo" in (out.get("abandoned_subtask_ids") or [])
@@ -324,7 +324,7 @@ def test_handle_failure_hallucinated_pkg_no_producer_not_in_baseline_abandons():
 def test_handle_failure_blocked_pkg_in_baseline_does_not_abandon():
     """假阳性护栏：包【在基线树里】(仅沙箱漏同步) → 不判臆造，继续 transient 等待、不放弃。"""
     state = _blocked_pkg_state("com.ruoyi.common.utils")
-    with patch.object(nodes, "_package_in_baseline", return_value=True):
+    with patch("swarm.brain.nodes.recovery._package_in_baseline", return_value=True):
         out = _run(nodes.handle_failure(state))
     assert out.get("failure_strategy") != "abandon", "基线已有的包不可硬失败(可能只是沙箱漏同步)"
 
@@ -347,7 +347,7 @@ def test_handle_failure_blocked_pkg_has_producer_does_not_abandon():
         "subtask_transient_counts": {},
     }
     # 即便基线无此包，只要有【未放弃的生产者】就不判臆造(等生产者落地)
-    with patch.object(nodes, "_package_in_baseline", return_value=False):
+    with patch("swarm.brain.nodes.recovery._package_in_baseline", return_value=False):
         out2 = _run(nodes.handle_failure(state))
     assert out2.get("failure_strategy") != "abandon", "有未放弃生产者的包不可判臆造"
 
