@@ -240,6 +240,15 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                 raise TransientInfraError(
                     f"stream {phase} 超时 {to:.0f}s (stream stall timeout) —— 基建瞬时，退避重试/fallback"
                 ) from exc
+            except asyncio.CancelledError:
+                # B1 治本(P0)：cancel_task→handle.cancel() 在此 __anext__ await 上抛 CancelledError。
+                # 旧代码无此分支 → agen 不关 → 底层 HTTP 流不断 → vLLM/Ollama 继续解码占 GPU 空烧。
+                # 与 TimeoutError 同处理：关底层流让推理端 abort 解码释放 GPU，再上抛（不吞取消语义）。
+                try:
+                    await agen.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             first = False
             n_chunks += 1
             now = _monotonic()

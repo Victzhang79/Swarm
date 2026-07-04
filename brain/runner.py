@@ -264,6 +264,13 @@ def _set_workspace(project_id: str) -> None:
 # subtask_count 分母停在拆分前 N → WebUI 显示 0/N 假分母。_sync_task_from_state 收的是节点 output
 # 增量，dispatch 虽在列表但其 output 不含 "plan" 键，救不回分母；必须在 elaborate 结束即回写。
 _SYNC_ON_NODES = ("analyze", "plan", "elaborate", "merge", "verify_l3", "dispatch")
+# B2 治本：token 硬上限闸门的检查节点。旧仅 merge/dispatch → analyze/plan/verify/handle_failure
+# 等大量 LLM 调用可绕过。扩到所有主 LLM 节点边界，每个节点 end 都据【真实累计+估算】判超，
+# 让 replan 空转/多轮 ReAct 的 runaway 成本在中途就被拦，而非跑到 merge 才发现。
+_TOKEN_GATE_NODES = (
+    "analyze", "plan", "elaborate", "dispatch", "merge",
+    "verify_l2", "verify_l3", "handle_failure", "revision",
+)
 
 
 def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
@@ -412,6 +419,12 @@ async def _stream_brain_events(
         "progress": progress,
     })
 
+    # B2：把本执行段内所有 LLM 用量归属到该 task（供 per-task 真实累计闸门）。
+    # 单进程拓扑下 astream_events 及其派生的 worker 子任务共享本上下文，record() 据此归属。
+    # 反注册/清理由 run_task 的 finally 统一做（覆盖正常/超限/锁丢/墙钟等所有退出路径）。
+    from swarm.models import usage_tracker as _usage_tracker
+    _usage_tracker.set_current_task(task_id)
+
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
         # P1-B：弹性墙钟闸门——失控任务（replan 空转/卡节点）到点中止，防无上限占沙箱/GPU。
         # 有效上限按当前已知子任务数动态计算（规划揭示规模后自动放宽，不误杀大型任务）。
@@ -469,7 +482,7 @@ async def _stream_brain_events(
                     _subs = _plan_out.get("subtasks")
                 if isinstance(_subs, list) and len(_subs) > _wc_subtasks:
                     _wc_subtasks = len(_subs)
-            if name in ("merge", "dispatch") and isinstance(output, dict):
+            if name in _TOKEN_GATE_NODES and isinstance(output, dict):
                 fresh = store.get_task(task_id) or task_rec
                 ok, usage = store.check_task_token_limit(
                     task_id,
@@ -956,6 +969,13 @@ async def run_task(
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # B2：清理 per-task token 归属与真实累计（覆盖正常/超限/异常所有退出路径）。
+        try:
+            from swarm.models import usage_tracker as _ut
+            _ut.set_current_task(None)
+            _ut.clear_task_total(task_id)
+        except Exception:
+            pass
         # 兜底：释放本任务残留的沙箱（正常路径 worker 已自清，此处防漏）
         try:
             from swarm.worker.sandbox import get_sandbox_manager

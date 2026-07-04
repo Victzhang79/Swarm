@@ -1776,8 +1776,20 @@ def check_task_token_limit(
         merged_diff=merged_diff,
         subtask_results=subtask_results,
     )
+    # B2 治本：用【真实累计】(usage_tracker per-task 记账) 与估算取 max——真实值主导，
+    # 估算作 floor 兜底（真实记账可能漏 embed/rerank 之外的边角，但主 LLM 用量已入账）。
+    est_total = int(usage.get("total") or 0)
+    try:
+        from swarm.models import usage_tracker
+        real_total = usage_tracker.get_task_total_tokens(task_id)
+    except Exception:  # noqa: BLE001
+        real_total = 0
+    total = max(est_total, real_total)
+    usage["estimate_total"] = est_total
+    usage["real_recorded"] = real_total
+    usage["total"] = total
+    usage["estimate"] = real_total <= est_total
     limit = get_config().max_task_tokens
-    total = int(usage.get("total") or 0)
     if limit > 0 and total > limit:
         update_task(
             task_id,

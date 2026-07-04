@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 # bge-m3 向量维度
 BGE_M3_DIMENSION = 1024
 
+
+def _validate_embed_dim(embedding: list[float]) -> None:
+    """B4 治本：写入前维度校验，对齐 KB(semantic_index)——换 embedding 模型致维度与
+    L5/L6 表 DDL(vector(1024)) 不符时 fail-loud 抛异常，不静默 persisted:False（旧行为：
+    PG 拒后被上层吞成"记忆丢失"无告警）。零向量占位本身是 1024 维，通过校验（另有零向量跳过逻辑）。"""
+    n = len(embedding or [])
+    if n != BGE_M3_DIMENSION:
+        from swarm.knowledge.semantic_index import EmbeddingDimensionMismatchError
+        raise EmbeddingDimensionMismatchError(
+            f"记忆 embedding 维度 {n} 与表维度 {BGE_M3_DIMENSION} 不符，拒绝写入；"
+            "请核对 embedding 模型与记忆表 DDL(BGE_M3_DIMENSION)"
+        )
+
 # ──────────────────────────────────────────────
 # L5/L6 惰性衰减参数（单一事实源；decay.py 复用作默认）
 # ──────────────────────────────────────────────
@@ -401,6 +414,8 @@ class MemoryStore:
         if _is_zero_vector(embedding):
             metadata["embedding_placeholder"] = True
 
+        # B4：写入前维度校验（fail-loud，不静默丢失）。零向量占位是 1024 维，通过。
+        _validate_embed_dim(embedding)
         vector_str = _vector_to_pg(embedding)
 
         async with conn.cursor() as cur:
@@ -581,6 +596,8 @@ class MemoryStore:
         if _is_zero_vector(vector):
             metadata["embedding_placeholder"] = True
 
+        # B4：写入前维度校验（fail-loud，不静默丢失）。
+        _validate_embed_dim(vector)
         vector_str = _vector_to_pg(vector)
 
         async with conn.cursor() as cur:

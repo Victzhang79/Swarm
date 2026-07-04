@@ -62,6 +62,18 @@ def rerank_documents(
     return _fallback_sort(documents, top_k)
 
 
+def _record_rerank_usage(ep, query: str, texts: list[str]) -> None:
+    """B3：rerank 记账（best-effort）。rerank API 一般不回 usage，用 len//4 估算 query+docs。"""
+    try:
+        from swarm.models import usage_tracker
+        pt = (len(query or "") + sum(len(t or "") for t in texts)) // 4
+        if pt > 0:
+            usage_tracker.record_embed(
+                getattr(ep, "model", "") or "rerank", getattr(ep, "url", ""), pt, op="rerank")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _rerank_simple(ep, query: str, texts: list[str], documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """自建格式：POST {query, texts} → [{index, score}] 或 {results:[...]}。"""
     headers = {"Content-Type": "application/json"}
@@ -71,6 +83,7 @@ def _rerank_simple(ep, query: str, texts: list[str], documents: list[dict[str, A
         resp = client.post(ep.url, json={"query": query, "texts": texts}, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+    _record_rerank_usage(ep, query, texts)
     items = data if isinstance(data, list) else (data.get("results") or data.get("data") or [])
     out: list[dict[str, Any]] = []
     for item in items:
@@ -100,6 +113,7 @@ def _rerank_openai(ep, query: str, texts: list[str], documents: list[dict[str, A
             return _rerank_via_embeddings_fallback(query, documents, top_k, client, base, ep.api_key)
         resp.raise_for_status()
         data = resp.json()
+    _record_rerank_usage(ep, query, texts)
     results = data.get("results") or data.get("data") or []
     out: list[dict[str, Any]] = []
     for item in results:
@@ -127,6 +141,7 @@ def _rerank_cohere(ep, query: str, texts: list[str], documents: list[dict[str, A
         })
         resp.raise_for_status()
         data = resp.json()
+    _record_rerank_usage(ep, query, texts)
     results = data.get("results") or []
     out: list[dict[str, Any]] = []
     for item in results:

@@ -30,6 +30,15 @@ def _endpoint() -> tuple[str, str, str, int] | None:
         return None
 
 
+def _record_embed_usage(model: str, base: str, batch: list[str], usage: dict | None) -> None:
+    """B3：embed 一批的 token 记账——优先响应真实 usage.prompt_tokens，否则 len//4 估算。"""
+    pt = int((usage or {}).get("prompt_tokens") or 0) or (sum(len(t or "") for t in batch) // 4)
+    if pt <= 0:
+        return
+    from swarm.models import usage_tracker
+    usage_tracker.record_embed(model, base, pt, op="embed")
+
+
 def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:
     """同步嵌入；专用服务不可用返回 None（调用方回退）。自动按 _MAX_BATCH 分批。"""
     ep = _endpoint()
@@ -53,11 +62,13 @@ def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:
             if resp.status_code != 200:
                 logger.warning("embed 服务返回异常 status=%s (batch %d)", resp.status_code, i // _MAX_BATCH)
                 return None
-            vecs = [d["embedding"] for d in resp.json().get("data", [])]
+            _payload = resp.json()
+            vecs = [d["embedding"] for d in _payload.get("data", [])]
             if len(vecs) != len(batch):
                 logger.warning("embed 返回数量不符: %d != %d", len(vecs), len(batch))
                 return None
             out.extend(vecs)
+            _record_embed_usage(model, base, batch, _payload.get("usage"))
         return out if out else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("embed 服务(sync)调用失败: %s", exc)
@@ -85,10 +96,12 @@ async def embed_texts_async(texts: list[str]) -> list[list[float]] | None:
                     headers=headers,
                 )
                 resp.raise_for_status()
-                vecs = [d["embedding"] for d in resp.json().get("data", [])]
+                _payload = resp.json()
+                vecs = [d["embedding"] for d in _payload.get("data", [])]
                 if len(vecs) != len(batch):
                     return None
                 out.extend(vecs)
+                _record_embed_usage(model, base, batch, _payload.get("usage"))
         return out if out else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("embed 服务(async)调用失败: %s", exc)

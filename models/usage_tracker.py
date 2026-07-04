@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
 import logging
 import threading
 
@@ -60,6 +61,36 @@ _lat_buffer: list[tuple[str, str, int]] = []   # 待落库延迟样本 (kind, mo
 _lock = threading.Lock()
 _flusher_started = False
 _table_ready = False
+
+# B2 治本：per-task 真实 token 累计（内存，best-effort）。llm_token_usage 表按
+# (project,kind,provider,model) 聚合、无 task_id，做高风险 schema 迁移不划算；单进程拓扑下
+# 用 ContextVar 把"当前 task"归属到 record()——runner 在执行段起点 set_current_task，worker
+# 子任务经 asyncio.gather 继承上下文，故其 LLM 用量也归属该 task。供 check_task_token_limit
+# 用【真实累计】而非仅 len//4 估算判超，且不再只在 merge/dispatch 查一次。
+_current_task_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "swarm_usage_task", default=None)
+_task_token_totals: dict[str, int] = {}
+
+
+def set_current_task(task_id: str | None) -> None:
+    """把后续本上下文内的 LLM 用量归属到该 task（供 per-task 真实累计闸门）。"""
+    _current_task_var.set(task_id or None)
+
+
+def get_task_total_tokens(task_id: str) -> int:
+    """该 task 本进程内已记账的真实 token 累计（prompt+completion）。无记录返回 0。"""
+    if not task_id:
+        return 0
+    with _lock:
+        return int(_task_token_totals.get(task_id, 0))
+
+
+def clear_task_total(task_id: str) -> None:
+    """任务执行段结束后清理 per-task 累计（防长进程内存累积）。"""
+    if not task_id:
+        return
+    with _lock:
+        _task_token_totals.pop(task_id, None)
 
 
 def _pool():
@@ -129,7 +160,32 @@ def record(project_id: str | None, kind: str, provider_id: str, model: str,
             slot[3] += d
         if d > 0:
             _lat_buffer.append((k, model or "", d))  # 逐次样本，供最近 N 次滑动平均
+        # B2：per-task 真实累计（若当前上下文归属了某 task）。
+        _tid = _current_task_var.get()
+        if _tid:
+            _task_token_totals[_tid] = _task_token_totals.get(_tid, 0) + p + c
     _start_flusher()
+
+
+_CLOUD_HOSTS = ("siliconflow", "openai.com", "dashscope", "cohere.ai", "cohere.com", "aliyuncs")
+
+
+def _infer_kind(url: str) -> str:
+    u = (url or "").lower()
+    return "cloud" if any(h in u for h in _CLOUD_HOSTS) else "local"
+
+
+def record_embed(model: str, url: str, prompt_tokens: int, *, op: str = "embed") -> None:
+    """B3：知识检索 embed/rerank 记账（best-effort，永不抛）。op=embed|rerank。
+
+    这些调用直连 HTTP、不经 _UsageRecorder，历史上完全不入 token 统计 → WebUI/DB 成本失真、
+    B2 per-task 真实累计也漏这块。此处补记；kind 据 url 推断，经 ContextVar 归属当前 task。
+    """
+    try:
+        record("", _infer_kind(url), f"knowledge-{op}", model or op,
+               prompt_tokens=int(prompt_tokens or 0), completion_tokens=0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def flush() -> None:
