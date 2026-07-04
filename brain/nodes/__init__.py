@@ -3713,6 +3713,40 @@ async def revision(state: BrainState) -> dict:
     }
 
 
+def _deliver_merged_diff_locked(
+    proj_path: str, merged_diff: str, base_commit: str | None,
+    out_files: list[str], task_id: str | None,
+) -> dict:
+    """3rd-P1d 治本：交付 git 写临界区（reset→resilient apply→清单对账→commit）在
+    per-project flock 内【原子】完成，串行化同项目跨模块并发任务的真仓写。
+
+    根因：plan 后 ModuleLock 从 (project,"default") 升级到 (project,module_key) 并释放 default →
+    同项目不同 module 的两任务可同时抵达 learn_success。原实现把 reset/apply/manifest/commit 拆成
+    4 段独立 to_thread，段间事件循环可切到另一任务的交付 → git index.lock 互踩 / 交错 commit /
+    交付损坏。整段收进 _ProjectGitFlock（跨进程 fcntl，按 project_path 哈希）后，同项目真仓写严格
+    串行，不同项目仍并行。同步执行（由调用方单次 to_thread 拉起，flock 在 worker 线程阻塞、不堵事件
+    循环）。返回 {ap, wm, commit, out_files}——日志/KB 触发在锁外由调用方按结果处理。"""
+    from swarm.brain.integration_review import _reset_worktree_to_head
+    from swarm.project.diff_apply import apply_git_diff_resilient, commit_task_output
+    from swarm.worker.executor import _ProjectGitFlock
+
+    result: dict = {"ap": {}, "wm": {}, "commit": {}, "out_files": list(out_files)}
+    with _ProjectGitFlock(proj_path):
+        _reset_worktree_to_head(proj_path, merged_diff, base_commit)
+        result["ap"] = apply_git_diff_resilient(proj_path, merged_diff)
+        try:
+            from swarm.worker.workspace_manifest import reconcile_workspace_manifests
+            _wm = reconcile_workspace_manifests(proj_path)
+            result["wm"] = _wm
+            for _mf in (_wm.get("modified_manifests") or []):
+                if _mf not in result["out_files"]:
+                    result["out_files"].append(_mf)
+        except Exception as _wmexc:  # noqa: BLE001
+            result["wm_error"] = str(_wmexc)
+        result["commit"] = commit_task_output(proj_path, result["out_files"], task_id=task_id)
+    return result
+
+
 async def learn_success(state: BrainState) -> dict:
     """LEARN_SUCCESS 节点 — 从成功任务中学习并写入 L6/L2"""
     from swarm.brain.learn_store import merge_persist_meta, persist_learn_success
@@ -3730,11 +3764,8 @@ async def learn_success(state: BrainState) -> dict:
         if merged_diff.strip():
             proj_path = _get_project_path(state.get("project_id") or "")
             if proj_path:
-                from swarm.project.diff_apply import (
-                    apply_git_diff_resilient,
-                    commit_task_output,
-                    files_from_unified_diff,
-                )
+                # apply/commit 已移入 _deliver_merged_diff_locked（P1d 原子交付）；此处仅需拆文件列表。
+                from swarm.project.diff_apply import files_from_unified_diff
                 out_files = files_from_unified_diff(merged_diff)
                 import asyncio as _asyncio
                 # ★治本 round21 Blocker B（全流程推演·post-MERGE 从未触达路径的确定性缺陷）★：
@@ -3779,35 +3810,24 @@ async def learn_success(state: BrainState) -> dict:
                     except Exception as _dvexc:  # noqa: BLE001
                         logger.debug("[LEARN_SUCCESS] 基线偏移检测跳过(非致命): %s", _dvexc)
 
-                from swarm.brain.integration_review import _reset_worktree_to_head
-                await _asyncio.to_thread(
-                    _reset_worktree_to_head, proj_path, merged_diff, _base_commit)
-                # D5(b) 治本 round18 P0-C：分文件鲁棒 apply——一个坏 hunk 令整块 git apply 原子失败会
-                # 连坐回滚全部好文件。resilient 分文件独立落盘，好段照常写入、坏段单独剔除。
-                _ap = await _asyncio.to_thread(
-                    lambda: apply_git_diff_resilient(proj_path, merged_diff))
+                # ★3rd-P1d 治本★：reset→resilient apply→清单对账→commit 收进单次 to_thread 内的
+                # per-project flock，原子完成——杜绝同项目跨模块并发任务在段间交错真仓写(index.lock
+                # 互踩/交错 commit/交付损坏)。resilient 分文件落盘、清单对账口径与原逐段实现逐字节一致。
+                _deliv = await _asyncio.to_thread(
+                    _deliver_merged_diff_locked, proj_path, merged_diff, _base_commit,
+                    out_files, state.get("task_id"))
+                _ap = _deliv["ap"]
+                out_files = _deliv["out_files"]
                 if not _ap.get("ok"):
                     logger.warning("[LEARN_SUCCESS] commit 前 reset+重放 merged_diff 全失败(非致命): %s",
                                    _ap.get("failed") or _ap.get("stderr", ""))
                 elif _ap.get("failed"):
                     logger.warning("[LEARN_SUCCESS] 分文件落盘：好文件已保留 %d，剔除坏段 %d(交 owner 重修)",
                                    len(_ap.get("applied") or []), len(_ap.get("failed") or []))
-                # 通用治本(交付持久化收口)：所有产出文件已落工作区(ground truth)。对账聚合清单
-                # (Maven/Gradle/Cargo/.NET/Go)使其枚举真实存在的成员，并把被修正的清单【纳入本次
-                # commit 文件集】——否则并行子任务 pull-back 整文件覆盖把成员注册冲掉的残留会进入
-                # 【交付产物】，导致交付物缺模块构建不了(L2 即便对账通过也只是验证态)。幂等、确定性。
-                try:
-                    from swarm.worker.workspace_manifest import reconcile_workspace_manifests
-                    _wm = await _asyncio.to_thread(reconcile_workspace_manifests, proj_path)
-                    for _mf in (_wm.get("modified_manifests") or []):
-                        if _mf not in out_files:
-                            out_files.append(_mf)
-                    if _wm.get("modified_manifests"):
-                        logger.info("[LEARN_SUCCESS] 交付前对账聚合清单成员并纳入提交: %s", _wm.get("added"))
-                except Exception as _wmexc:  # noqa: BLE001
-                    logger.debug("[LEARN_SUCCESS] 聚合清单对账跳过(异常,不致命): %s", _wmexc)
-                _c = await _asyncio.to_thread(
-                    commit_task_output, proj_path, out_files, task_id=state.get("task_id"))
+                if (_deliv.get("wm") or {}).get("modified_manifests"):
+                    logger.info("[LEARN_SUCCESS] 交付前对账聚合清单成员并纳入提交: %s",
+                                _deliv["wm"].get("added"))
+                _c = _deliv["commit"]
                 if _c.get("committed"):
                     logger.info("[LEARN_SUCCESS] 产出已本地 commit: %s (%d 文件)",
                                 _c.get("commit_hash"), len(out_files))
