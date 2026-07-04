@@ -3713,6 +3713,28 @@ async def revision(state: BrainState) -> dict:
     }
 
 
+_project_delivery_locks: dict[str, "object"] = {}
+
+
+async def _deliver_merged_diff_serialized(
+    proj_path: str, merged_diff: str, base_commit: str | None,
+    out_files: list[str], task_id: str | None,
+) -> dict:
+    """P1d 复核 Finding 1：用 per-project asyncio.Lock 在【事件循环层】序列化同进程交付——
+    等待中的同项目交付让出事件循环，不占 to_thread 线程池槽（否则 N 个同项目交付各占一个
+    blocked 在 fcntl.flock 的池槽 → 池耗尽 → pull-back/沙箱上传等其它 to_thread 饿死，
+    比拆 4 段前更糟）。锁内单次 to_thread 拉起同步交付；内层 _ProjectGitFlock 仍作【跨进程】
+    兜底（多 leader 降级场景）。get/set 间无 await → 同一事件循环步内原子，不会各持不同锁。"""
+    import asyncio as _a
+    lock = _project_delivery_locks.get(proj_path)
+    if lock is None:
+        lock = _a.Lock()
+        _project_delivery_locks[proj_path] = lock
+    async with lock:
+        return await _a.to_thread(
+            _deliver_merged_diff_locked, proj_path, merged_diff, base_commit, out_files, task_id)
+
+
 def _deliver_merged_diff_locked(
     proj_path: str, merged_diff: str, base_commit: str | None,
     out_files: list[str], task_id: str | None,
@@ -3813,11 +3835,14 @@ async def learn_success(state: BrainState) -> dict:
                 # ★3rd-P1d 治本★：reset→resilient apply→清单对账→commit 收进单次 to_thread 内的
                 # per-project flock，原子完成——杜绝同项目跨模块并发任务在段间交错真仓写(index.lock
                 # 互踩/交错 commit/交付损坏)。resilient 分文件落盘、清单对账口径与原逐段实现逐字节一致。
-                _deliv = await _asyncio.to_thread(
-                    _deliver_merged_diff_locked, proj_path, merged_diff, _base_commit,
-                    out_files, state.get("task_id"))
+                _deliv = await _deliver_merged_diff_serialized(
+                    proj_path, merged_diff, _base_commit, out_files, state.get("task_id"))
                 _ap = _deliv["ap"]
                 out_files = _deliv["out_files"]
+                if _deliv.get("wm_error"):
+                    # 复核 Finding 2：清单对账整体异常（如 /tmp 满 OSError）不再静默 → loud 可观测。
+                    logger.warning("[LEARN_SUCCESS] 清单对账异常(非致命,聚合清单可能不一致): %s",
+                                   _deliv["wm_error"])
                 if not _ap.get("ok"):
                     logger.warning("[LEARN_SUCCESS] commit 前 reset+重放 merged_diff 全失败(非致命): %s",
                                    _ap.get("failed") or _ap.get("stderr", ""))

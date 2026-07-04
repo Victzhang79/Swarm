@@ -62,13 +62,50 @@ def test_deliver_locked_acquires_project_flock():
     assert "with _ProjectGitFlock" in src
 
 
-def test_learn_success_uses_locked_delivery():
-    """learn_success 交付走 _deliver_merged_diff_locked 单次 to_thread（不再 4 段散 to_thread）。"""
+def test_learn_success_uses_serialized_delivery():
+    """learn_success 交付走 _deliver_merged_diff_serialized（asyncio.Lock 序列化，不再 4 段散 to_thread）。"""
     import inspect
     from swarm.brain import nodes
 
     src = inspect.getsource(nodes.learn_success)
-    assert "_deliver_merged_diff_locked" in src, "learn_success 未改用原子交付助手（P1d 回归）"
+    assert "_deliver_merged_diff_serialized" in src, "learn_success 未改用序列化交付（P1d 回归）"
+    # 复核 Finding 2：wm_error 必须 loud
+    assert "wm_error" in src, "learn_success 未记录清单对账异常（Finding 2 回归）"
+
+
+def test_serialized_delivery_uses_asyncio_lock_not_blocking_pool():
+    """复核 Finding 1：交付经 per-project asyncio.Lock 在事件循环层序列化，不让 N 个交付各占
+    一个 blocked 线程池槽。"""
+    import inspect
+    from swarm.brain import nodes
+
+    src = inspect.getsource(nodes._deliver_merged_diff_serialized)
+    assert "asyncio" in src.lower() and "Lock()" in src, "序列化未用 asyncio.Lock（Finding 1 回归）"
+    assert "_project_delivery_locks" in src, "缺 per-project 锁字典"
+    assert "to_thread" in src, "锁内仍需单次 to_thread 拉起同步交付"
+
+
+async def test_serialized_delivery_serializes_same_project(tmp_path):
+    """同一 project 的两次并发交付被 asyncio.Lock 串行（结果均正确落地，无交错损坏）。"""
+    import asyncio
+    from swarm.brain.nodes import _deliver_merged_diff_serialized, _project_delivery_locks
+
+    repo = _mkrepo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    _project_delivery_locks.clear()
+    diff = (
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n"
+        "@@ -1 +1 @@\n-base\n+delivered\n"
+    )
+    # 两次并发同项目交付
+    r1, r2 = await asyncio.gather(
+        _deliver_merged_diff_serialized(str(repo), diff, base, ["a.txt"], "t1"),
+        _deliver_merged_diff_serialized(str(repo), diff, base, ["a.txt"], "t2"),
+    )
+    # 两者都跑完且未崩；同 project 复用同一把锁（字典仅一条目）
+    assert r1["ap"].get("ok") and r2["ap"].get("ok")
+    assert len(_project_delivery_locks) == 1
+    assert (repo / "a.txt").read_text() == "delivered\n"
 
 
 if __name__ == "__main__":
