@@ -7,6 +7,7 @@ _diff_has_changes 已移到 shared.py。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -84,7 +85,11 @@ async def verify_l2(state: BrainState) -> dict:
                 project_path, project_id, build_cmd, timeout=600
             )
 
-        ir_ok, ir_issues, ir_details = run_integration_review(
+        # R23-1 治本：run_integration_review 是同步阻塞(内含 subprocess.run，timeout 可达 600s)，
+        # verify_l2 是 async 节点——直接调用会卡死整个 API 事件循环(SSE/心跳/并发任务)。放线程池
+        # 执行(asyncio.to_thread 会拷贝 contextvars，沙箱上下文照常可用)。
+        ir_ok, ir_issues, ir_details = await asyncio.to_thread(
+            run_integration_review,
             project_path,
             merged_diff,
             shared_contract or None,
@@ -206,8 +211,10 @@ async def verify_l3(state: BrainState) -> dict:
                     elif push_err:
                         logger.warning("[VERIFY_L3] L3 push 失败，回退默认 ref: %s", push_err)
 
-            l3_passed, l3_message = trigger_and_poll_pipeline(
-                task_id=task_id or "unknown", ref=ref
+            # R23-1 治本：trigger_and_poll_pipeline 内含 time.sleep 轮询(同步阻塞)，放线程池执行，
+            # 不卡 async 事件循环。
+            l3_passed, l3_message = await asyncio.to_thread(
+                trigger_and_poll_pipeline, task_id=task_id or "unknown", ref=ref
             )
             logger.info("[VERIFY_L3] GitLab: %s — %s", "通过" if l3_passed else "未通过", l3_message)
             if not l3_passed:
