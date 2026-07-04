@@ -12,7 +12,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-2107%20passing-brightgreen.svg)](#-测试)
+[![Tests](https://img.shields.io/badge/tests-2182%20passing-brightgreen.svg)](#-测试)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -391,7 +391,7 @@ bash test/run_all.sh                                    # 全部测试
 .venv/bin/ruff check . --select E9,F63,F7,F82           # 关键 lint（CI 同款）
 ```
 
-CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2107 passed**）。
+CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2182 passed**）。
 
 ---
 
