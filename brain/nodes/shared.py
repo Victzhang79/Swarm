@@ -41,6 +41,19 @@ _CREATE_HINTS = ("新建", "新增", "创建", "添加文件", "生成", "输出
 _DELETE_HINTS = ("删除", "移除", "去掉", "删掉", "delete", "remove")
 
 
+def l1_passed(out) -> bool:
+    """子任务输出 L1 是否通过 —— 单一事实源（round24 A1，替代 4 处副本）。
+
+    形态：WorkerOutput 或 dict 或 None。鸭子判超集（任意带 l1_passed 属性的对象
+    都识别，非仅 WorkerOutput 实例），对真实输入（WorkerOutput/dict/None）与原 4 处
+    副本等价。行为契约见 test/test_l1_verdict.py。
+    """
+    v = getattr(out, "l1_passed", None)
+    if v is None and isinstance(out, dict):
+        v = out.get("l1_passed")
+    return bool(v)
+
+
 def _guess_target_files(task_description: str) -> list[str]:
     """从需求中抠出 ASCII 文件名（中文不会粘连）。"""
     return list(dict.fromkeys(m.group(1) for m in _FILE_PAT.finditer(task_description)))

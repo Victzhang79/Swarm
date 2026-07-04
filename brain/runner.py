@@ -300,11 +300,7 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
         # len(subtask_results)——它累积了跨 replan/retry/rebase 的【全部】结果（含失败结果 +
         # st-N-2 重生成变体 + 已不在当前 plan 的旧 id），必然 > 当前 plan 的 subtask_count。
         # 正确语义 = 【在当前 plan 内 且 L1 通过】的子任务数；并夹紧到 subtask_count 兜底。
-        def _passed(out: Any) -> bool:
-            v = getattr(out, "l1_passed", None)
-            if v is None and isinstance(out, dict):
-                v = out.get("l1_passed")
-            return bool(v)
+        from swarm.brain.nodes.shared import l1_passed as _passed
 
         plan_ids: set | None = None
         _plan_obj = state.get("plan")

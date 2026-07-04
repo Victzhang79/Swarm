@@ -68,6 +68,7 @@ from swarm.brain.nodes.shared import (  # noqa: E402,F401
     _infer_intent,
     _l2_test_command_from_criteria,
     _match_files_by_description,
+    l1_passed,
     _parse_json_from_llm,
     _planning_triage,
     _worker_profile_prompt,
@@ -580,16 +581,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan) -> dict:
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
 
-    def _passed(out) -> bool:
-        if isinstance(out, WorkerOutput):
-            return bool(out.l1_passed)
-        if isinstance(out, dict):
-            return bool(out.get("l1_passed"))
-        return False
-
     preserved = {
         sid: out for sid, out in old_results.items()
-        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and _passed(out)
+        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and l1_passed(out)
     }
     logger.info(
         "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber",
@@ -1883,15 +1877,6 @@ def _serialize_pom_writers(plan_obj, pom_by_id: dict) -> None:
             _add_dep_safe(by_id, members[i], members[i - 1])
 
 
-def _subtask_out_l1_passed(out) -> bool:
-    """子任务输出 L1 是否通过（WorkerOutput 或 dict 两种形态）。供保留成功兄弟判定。"""
-    if isinstance(out, WorkerOutput):
-        return bool(out.l1_passed)
-    if isinstance(out, dict):
-        return bool(out.get("l1_passed"))
-    return False
-
-
 async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | None:
     """卡死子任务恢复阶梯·阶梯二：把【多文件】卡死子任务【定点拆小】（复用 _resplit_subtask），
     保留成功兄弟、只重派拆出的小块。每子任务最多 1 次。
@@ -2386,7 +2371,7 @@ async def handle_failure(state: BrainState) -> dict:
         if state.get("l2_targeted") and failed_ids:
             succeeded_siblings = [
                 sid for sid, out in subtask_results.items()
-                if sid not in failed_ids and _subtask_out_l1_passed(out)
+                if sid not in failed_ids and l1_passed(out)
             ]
             if succeeded_siblings:
                 # 治本 replan 死循环·E：内部包/上游模块未就绪类失败【不清零重试计数】——它非 L2 偶发，
@@ -2533,7 +2518,7 @@ async def handle_failure(state: BrainState) -> dict:
         _by_id = {s.id: s for s in plan_obj.subtasks}
         # #10 治本所需：全局 settled 生产者判据的两个集合。
         _completed_ok = {sid for sid, out in subtask_results.items()
-                         if sid not in failed_ids and _subtask_out_l1_passed(out)}
+                         if sid not in failed_ids and l1_passed(out)}
         _pending_now = set(state.get("dispatch_remaining") or []) | set(failed_ids)
         _unrecoverable: set[str] = set()
         for fid in failed_ids:
@@ -2720,16 +2705,9 @@ async def handle_failure(state: BrainState) -> dict:
         # L1 质量失败应只【重做失败子任务】，保留成功成果。
         # 守卫条件：本批失败是子任务级 L1 失败 + 存在已成功(L1 通过)的兄弟子任务 +
         #          失败子任务未达重试上限 → 降级为 retry（只重派失败的，不动成功的）。
-        def _is_l1_passed(out) -> bool:
-            if isinstance(out, WorkerOutput):
-                return bool(out.l1_passed)
-            if isinstance(out, dict):
-                return bool(out.get("l1_passed"))
-            return False
-
         succeeded_siblings = [
             sid for sid, out in subtask_results.items()
-            if sid not in failed_ids and _is_l1_passed(out)
+            if sid not in failed_ids and l1_passed(out)
         ]
         _retry_counts = dict(state.get("subtask_retry_counts", {}))
         _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed_ids}
