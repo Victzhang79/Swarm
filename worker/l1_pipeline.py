@@ -1393,7 +1393,10 @@ def _derive_full_build_command(
     build = ((project_stack or {}).get("build") or "").strip().lower()
 
     def has(*names: str) -> bool:
-        return any(os.path.isfile(os.path.join(project_path, n)) for n in names)
+        # A4 治本：沙箱模式本地树只有 pull-back 的可写文件，根 manifest(pom/go.mod/…)不在
+        # 本地——旧的 os.path.isfile(本地) 会漏判 → derive 返回 "" → build 闸门跳过 → 假绿。
+        # 改走沙箱优先的 _manifest_present（与 lint/_build_cmd_applicable 同源），跨栈一致。
+        return _manifest_present(tuple(names), project_path)
 
     def ext(*exts: str) -> bool:
         return any(f.endswith(exts) for f in mods)
@@ -1571,8 +1574,11 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
             # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
             if rc != 0 and _is_infra_failure(combined):
                 logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
-            elif rc != 0 and "error TS" in combined:
-                return False, combined.strip()[:1000]
+            elif rc != 0:
+                # A2 治本(fail-closed)：任何【非 infra】的 tsc 失败都判编译不过——
+                # 不再依赖字面 "error TS" 子串。解析错误/声明错误/本地化(中文)输出/自定义报错
+                # 都不含该串，旧代码会落到末尾 return True 静默假绿。rc!=0 且非 infra = 真失败。
+                return False, (combined.strip()[:1000] or f"tsc failed rc={rc}")
         except Exception as exc:
             # audit #11：tsc 编译失败可能掩盖真实编译错误，从 debug 升 warning（生产可见）
             logger.warning("[L1.2] tsc 编译跳过（异常）: %s", exc)

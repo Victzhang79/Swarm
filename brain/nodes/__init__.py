@@ -1964,7 +1964,7 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
 # round10 实证：大单实体 900s 超时，系统反复 retry/retry_alternate 同样的大块、拆小靠后，
 # 磨到用户取消。locating/coding 超时都源于"要做的活超出一个 worker 一次能干完的量"，拆小真
 # 有用；preparing 超时是沙箱基础设施（坏镜像/envd）非尺寸问题，交给瞬时/常规阶梯，不在此拆。
-_TIMEOUT_OVERSIZE_MARKERS = ("timeout_in_coding", "timeout_in_locating")
+_TIMEOUT_OVERSIZE_MARKERS = ("timeout_in_coding", "timeout_in_locating", "timeout_in_verifying")
 
 
 def _is_timeout_oversize_failure(out: object) -> bool:

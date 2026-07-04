@@ -380,9 +380,12 @@ def run_compile(language: str = "auto", target: str = "") -> str:
     if target:
         cmd = f"{cmd} {target}"
 
-    allowed, matched = _is_command_allowed(cmd, cfg.command_whitelist)
+    # A8 治本：与 run_command 对齐——并入 extra_whitelist（harness 下发的构建命令前缀），
+    # 否则 harness 合法命令被拒 → agent 自验失败空烧 fix 轮。
+    effective_whitelist = list(cfg.command_whitelist) + get_extra_whitelist()
+    allowed, matched = _is_command_allowed(cmd, effective_whitelist)
     if not allowed:
-        whitelist_str = "\n  - ".join(cfg.command_whitelist)
+        whitelist_str = "\n  - ".join(effective_whitelist)
         return (
             f"⛔ 编译命令被拒绝：'{cmd}' 不在白名单中。\n"
             f"允许的命令前缀：\n  - {whitelist_str}"
@@ -426,7 +429,8 @@ def run_tests(
     }
 
     if language == "auto":
-        whitelist = cfg.command_whitelist
+        # A8：auto 检测也并入 extra_whitelist，否则 harness-only 的构建命令检测不到。
+        whitelist = list(cfg.command_whitelist) + get_extra_whitelist()
         if any("mvn test" in w for w in whitelist):
             cmd = "mvn test"
         elif any("npm test" in w for w in whitelist):
@@ -443,9 +447,11 @@ def run_tests(
     if test_filter:
         cmd = f"{cmd} {test_filter}"
 
-    allowed, matched = _is_command_allowed(cmd, cfg.command_whitelist)
+    # A8 治本：与 run_command 对齐——并入 extra_whitelist。
+    effective_whitelist = list(cfg.command_whitelist) + get_extra_whitelist()
+    allowed, matched = _is_command_allowed(cmd, effective_whitelist)
     if not allowed:
-        whitelist_str = "\n  - ".join(cfg.command_whitelist)
+        whitelist_str = "\n  - ".join(effective_whitelist)
         return (
             f"⛔ 测试命令被拒绝：'{cmd}' 不在白名单中。\n"
             f"允许的命令前缀：\n  - {whitelist_str}"

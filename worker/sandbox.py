@@ -33,6 +33,29 @@ from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """A6 治本：原子写（同目录 temp + os.replace），杜绝并发/中断下的 torn-write（半截文件）。
+
+    dispatch 并发跑 worker 共享同一 project_path；非 manifest 源文件旧走裸 write_bytes，
+    两个 worker 若同时写【同一文件】可能读到半截字节。同目录建临时文件保证 os.replace 是
+    同一文件系统的原子 rename（POSIX 保证），失败清理临时文件不留垃圾。假定 parent 已存在
+    （调用方 sync_files_from_sandbox 已 mkdir）。deadlock-free：不涉及任何 flock。
+    """
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".swarm_tmp_", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # 裸 `python` token（命令开头或管道/分隔符/&&/||/; 之后），但排除 python3 / pythonX。
 # 沙箱镜像 PATH 只有 python3，无 python 别名 → 裸 python 调用须规范化为 python3。
 _PYTHON_TOKEN_RE = _re.compile(r"(?<![\w./-])python(?![\w.-])")
@@ -1276,14 +1299,16 @@ print(json.dumps(files))
                     # 主干A：聚合清单写盘与 diff 用同一把 per-project flock 串行，杜绝并发 worker
                     # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
                     # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
+                    # A6：写入本身用原子 temp+rename（即便持锁也无害），杜绝 torn-write。
                     try:
                         from swarm.worker.executor import _ProjectGitFlock
                         with _ProjectGitFlock(local_root):
-                            local_path.write_bytes(data)
+                            _atomic_write_bytes(local_path, data)
                     except Exception:
-                        local_path.write_bytes(data)
+                        _atomic_write_bytes(local_path, data)
                 else:
-                    local_path.write_bytes(data)
+                    # A6：非 manifest 文件不加锁（保持并行无开销），但原子写杜绝并发 torn-write。
+                    _atomic_write_bytes(local_path, data)
                 stats["downloaded"] += 1
                 try:
                     stats["contents"][rel_posix] = data.decode("utf-8")

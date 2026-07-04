@@ -535,6 +535,14 @@ class WorkerExecutor:
         # 本地模式由 _snapshot_scope_local 填充。__init__ 初始化避免本地模式下属性缺失。
         self._pre_sync_contents: dict[str, str | None] = {}
         self._post_sync_contents: dict[str, str | None] = {}
+        # A1：本轮真正在本地 unlink 掉的 delete_files（worker 已在沙箱删除并传播到本地），
+        # 供可观测/诊断；diff 由 _get_git_diff 的 delete targets 如实体现。
+        self._deleted_local_paths: set[str] = set()
+        # A3：最近一次 pull-back 的【完整性信号】。sync_files_from_sandbox 对 >1MiB 文件
+        # 静默 skip、对读失败文件记 errors 不中断——这些都是交付相关文件，缺一块则本地 diff
+        # 不完整。_deterministic_l1_gate 据此禁止在 pull-back 不完整时判 True（防沙箱绿本地缺）。
+        self._sync_skipped_count: int = 0
+        self._sync_error_rels: list[str] = []
         # TD2606-C9：L1 确定性闸门在沙箱里修复（version-repair / import-repair / goimports …）
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
@@ -1071,6 +1079,10 @@ class WorkerExecutor:
 
                 if self._check_timeout():
                     self._log("验证阶段超时")
+                    # A7 治本：写尺寸超时 marker，与 coding/locating 同源——verify 修不动到超时
+                    # 同样是"工作单元太大"信号，上游 _is_timeout_oversize_failure 据此拆小而非
+                    # 换模型重试同样的大块（主干B 不变量的派发面对偶）。
+                    l1_details["error"] = "timeout_in_verifying"
                     break
 
         return l1_passed, l1_details, verdict
@@ -1464,6 +1476,32 @@ class WorkerExecutor:
             if rel and rel not in out:
                 out.append(rel)
         return out
+
+    def _apply_local_deletions(self, local_root: Path, sandbox_files: set[str]) -> list[str]:
+        """A1 治本：把 worker 在沙箱里执行的删除【传播到本地工作树】。
+
+        delete_files 不在 _writable_files（不上传/不拉回），历史上也无任何机制把删除
+        落到本地 → git diff 永远看不到删除 → 交付漏删 + 纯删除子任务恒空 diff 假绿。
+        判据（纯函数化，便于测试）：scope 声明要删的文件，若【沙箱工作区里已不存在】
+        （worker 真删了）且【本地仍存在】→ 本地同步 unlink，使后续 git diff 如实显示删除。
+        沙箱里仍在 = worker 没删 → 保留本地（diff 空）→ 上游 expects_changes 判未完成。
+        fail-closed：只删【scope 明确声明 delete_files】且【沙箱已无】的文件，绝不误删他物。
+        """
+        deleted: list[str] = []
+        scope = self.effective_scope
+        for f in (getattr(scope, "delete_files", []) or []):
+            rel = self._norm_rel(local_root, f)
+            if not rel or rel in sandbox_files:
+                continue  # 沙箱里还在 → worker 没删 → 保留本地
+            lp = (local_root / rel)
+            try:
+                if lp.is_file():
+                    lp.unlink()
+                    self._deleted_local_paths.add(rel)
+                    deleted.append(rel)
+            except OSError as exc:
+                self._log(f"删除传播失败 {rel}（非致命，保留本地）: {exc}")
+        return deleted
 
     @staticmethod
     def _norm_rel(local_root: Path, f: str) -> str:
@@ -1866,6 +1904,15 @@ class WorkerExecutor:
                         )
             except Exception as _hexc:  # noqa: BLE001
                 self._log(f"{reason} H-exec1 枚举沙箱新增文件失败(非致命): {_hexc}")
+        # A1：删除传播——必须在 rel_files 空的 early-return 之前，纯删除 scope 才不被跳过。
+        if getattr(self.effective_scope, "delete_files", []):
+            try:
+                _sb_files = set(await asyncio.to_thread(self._list_sandbox_workspace_files))
+                _deleted = self._apply_local_deletions(local_root, _sb_files)
+                if _deleted:
+                    self._log(f"{reason} 删除传播：worker 已在沙箱删除 → 本地同步删除 {_deleted}")
+            except Exception as _dexc:  # noqa: BLE001
+                self._log(f"{reason} 删除传播枚举失败（非致命）: {_dexc}")
         if not rel_files:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
@@ -1878,6 +1925,9 @@ class WorkerExecutor:
                 cfg.sandbox.sandbox_remote_workdir,
             )
             self._post_sync_contents = sync_stats.get("contents") or {}
+            # A3：记录本轮 pull-back 完整性信号（skip/err），供 L1 闸门 fail-closed。
+            self._sync_skipped_count = int(sync_stats.get("skipped") or 0)
+            self._sync_error_rels = list(sync_stats.get("errors") or [])
             err_count = len(sync_stats.get("errors") or [])
             self._log(
                 f"{reason} 沙箱→本地精准 pull-back: "
@@ -2816,6 +2866,14 @@ class WorkerExecutor:
             (None, {...}) 表示无 diff 可检（跳过，交给 LLM 信号）
             (bool, details) 表示确定性结论。
         """
+        # A5 治本：worker 总预算闸。确定性 L1 同步路径(含 run_l1_pipeline 的 build-repair
+        # 循环，自带 900s 墙钟、与 worker 总预算解耦)过去无任何 _check_timeout——verify 撞
+        # max_execution_time 后 Phase4 仍能再起一整轮 repair runaway。已超时 → 不进 pipeline，
+        # 降 BLOCKED(交裁决器走退避，run() 随即因超时收尾)。
+        if self._check_timeout():
+            return None, {"deterministic_gate": "skipped: worker budget exhausted",
+                          "not_run_kind": NotRunKind.BLOCKED.value,
+                          "error": "timeout_in_verifying"}
         if not self.project_path:
             return None, {"deterministic_gate": "skipped: no project_path",
                           "not_run_kind": NotRunKind.BLOCKED.value}
@@ -2841,8 +2899,14 @@ class WorkerExecutor:
         # 实测：模型 "need more steps"/stall 后没改 StringUtils，diff 空但 L1 却通过 →
         # 任务假 DONE。空 diff + 期望有产出 → 确定性判失败，触发重试/换模型。
         scope = self.effective_scope
+        # A1 治本：delete_files 也是"期望产生变更"——删除必须体现为 diff（本地文件被
+        # unlink → git diff 显示删除）。漏算 delete_files 时，纯删除 scope 恒空 diff →
+        # 走下方 BENIGN → 回退 LLM 弱信号假绿（删除从未发生/未传播）。纳入后：删除已
+        # 传播成功 → diff 非空正常裁决；未传播/未执行 → 空 diff + expects → 判 False。
         expects_changes = bool(
-            (getattr(scope, "writable", []) or []) or (getattr(scope, "create_files", []) or [])
+            (getattr(scope, "writable", []) or [])
+            or (getattr(scope, "create_files", []) or [])
+            or (getattr(scope, "delete_files", []) or [])
         )
         if empty_diff and expects_changes:
             return False, {
@@ -2877,6 +2941,20 @@ class WorkerExecutor:
             if ok and details.get("pipeline_blocked"):
                 details["deterministic_gate"] = "skipped: pipeline blocked"
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
+                return None, details
+            # A3 治本(fail-closed)：沙箱内 pipeline 判 True，但本轮 pull-back 若有 skip(>1MiB)
+            # 或 err(读失败) → 本地工作区/diff 不完整，"沙箱绿"不代表"本地交付完整"。此时禁止
+            # 判 True → 降 None(BLOCKED) 走 transient 退避重试拉全，杜绝沙箱绿本地缺的静默假绿。
+            if ok and (self._sync_skipped_count > 0 or self._sync_error_rels):
+                logger.warning(
+                    "[L1] pull-back 不完整(skipped=%d, errors=%d)但沙箱 pipeline 判过 → "
+                    "拒绝判 PASS(降 BLOCKED 重试)，防沙箱绿本地 diff 缺改",
+                    self._sync_skipped_count, len(self._sync_error_rels),
+                )
+                details["deterministic_gate"] = "skipped: pull-back incomplete"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                details["pullback_skipped"] = self._sync_skipped_count
+                details["pullback_errors"] = len(self._sync_error_rels)
                 return None, details
             details["deterministic_gate"] = "pass" if ok else "fail"
             if empty_diff:

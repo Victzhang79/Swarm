@@ -51,4 +51,4 @@ if [ -d "$SBX_DIR" ]; then
   echo "[three-clean] ✓ ③ 沙箱 jsonl 已清（剩 ${left:-0}，备份在 $ARCH/sandbox_logs/）"
 fi
 
-echo "[three-clean] ✅ 三清完成 tag=$TAG。下一步: soak 探活 → restart-api → e2e_run.sh"
+echo "[three-clean] ✅ 三清完成 tag=${TAG}。下一步: soak 探活 → restart-api → e2e_run.sh"
