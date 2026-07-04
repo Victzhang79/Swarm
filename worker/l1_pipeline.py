@@ -133,9 +133,11 @@ def _attempt_import_repair(
         canonical = max(counts, key=lambda k: counts[k])
         for f in sorted(files):
             # -i.bak 形式在 GNU(沙箱 Linux) 与 BSD(本地 macOS) sed 上行为一致，改完删 .bak
+            import shlex
+            _qf = shlex.quote(f)  # R23-4：文件名安全引用（含 '/$()/; 不破坏引号边界）
             scmd = (
-                f"sed -i.bak 's#{first}\\.{suf_re}#{canonical}.{suffix}#g' '{f}' "
-                f"&& rm -f '{f}.bak'"
+                f"sed -i.bak 's#{first}\\.{suf_re}#{canonical}.{suffix}#g' {_qf} "
+                f"&& rm -f {shlex.quote(f + '.bak')}"
             )
             ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
             if ec2 == 0:

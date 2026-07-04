@@ -1527,11 +1527,13 @@ class WorkerExecutor:
         rc = getattr(self._sandbox_manager, "run_command", None)
         if rc is None:
             return True
+        import shlex
         remote = get_config().sandbox.sandbox_remote_workdir
-        safe = str(rel).replace("'", "").replace("\n", "")
+        # 复核 R23-4：shlex.quote 全路径（不再只剥 '/换行）——文件名含 $()/;/空格等不破坏引号边界。
+        _qp = shlex.quote(f"{remote}/{rel}")
         try:
             result = rc(self._sandbox,
-                        f"test -f '{remote}/{safe}' && echo __Y__ || echo __N__", timeout=15)
+                        f"test -f {_qp} && echo __Y__ || echo __N__", timeout=15)
             return "__Y__" in (getattr(result, "stdout", "") or "")
         except Exception:  # noqa: BLE001
             return True  # 探测失败 → 保守不删
@@ -2588,7 +2590,8 @@ class WorkerExecutor:
         if not self._sandbox or not files:
             return
         try:
-            quoted = " ".join(f"'{f}'" for f in files)
+            import shlex
+            quoted = " ".join(shlex.quote(f) for f in files)  # R23-4：安全引用，防文件名注入
             cmd = f"cd /workspace && git add {quoted} 2>/dev/null || true"
             run = getattr(self._sandbox, "commands", None)
             if run and hasattr(run, "run"):
