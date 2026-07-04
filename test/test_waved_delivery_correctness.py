@@ -99,7 +99,7 @@ def test_l2_no_test_command_sets_degraded_reason():
     #  - test_cmd 为空
     with patch.object(verify_mod, "effective_complexity", return_value=_C.MEDIUM), \
          patch.object(verify_mod, "_l2_test_command_from_criteria", return_value=""), \
-         patch.object(verify_mod.nodes, "_get_project_path", return_value="/tmp/proj"), \
+         patch("swarm.brain.nodes._get_project_path", return_value="/tmp/proj"), \
          patch("swarm.brain.integration_review.run_integration_review",
                return_value=(True, [], {})):
         out = asyncio.run(verify_mod.verify_l2(state))

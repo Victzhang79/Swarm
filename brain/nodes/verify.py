@@ -12,7 +12,6 @@ import json
 import logging
 import os
 
-from swarm.brain import nodes
 from swarm.brain.prompts import (
     VERIFY_L2_SYSTEM,
     VERIFY_L2_USER,
@@ -38,6 +37,9 @@ async def verify_l2(state: BrainState) -> dict:
     输入: merged_diff, plan, task_description
     输出: l2_passed
     """
+    # A6：惰性导入破 nodes↔verify eager 循环依赖（_get_project_path/_try_l2_*/_verify_l2_via_llm
+    # 是留在 __init__ 的可 patch 有状态符号；调用时 nodes 已初始化，patch 仍命中）。
+    from swarm.brain import nodes
     merged_diff = state.get("merged_diff", "")
     plan_obj = state.get("plan")
     task_description = state.get("task_description", "")
@@ -167,6 +169,7 @@ async def verify_l3(state: BrainState) -> dict:
     输入: merged_diff, complexity, task_description
     输出: l3_passed, l3_skipped, l3_message
     """
+    from swarm.brain import nodes  # A6：惰性导入破循环依赖（见 verify_l2）
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先，避免漏跑 L3
     merged_diff = (state.get("merged_diff") or "").strip()
     task_description = state.get("task_description", "")

@@ -10,7 +10,6 @@ import asyncio
 import logging
 
 from swarm.audit import audit
-from swarm.brain import nodes
 from swarm.brain.context_log import touch_context
 from swarm.brain.nodes.shared import _diff_has_changes, _worker_profile_prompt
 from swarm.brain.state import BrainState
@@ -348,6 +347,9 @@ async def dispatch(state: BrainState) -> dict:
     _force_strong = state.get("subtask_force_strong") or {}  # FINDING-12
 
     async def _run_one(subtask: SubTask, idx: int = 0) -> tuple[SubTask, WorkerOutput | Exception]:
+        # A6：惰性导入破 nodes↔dispatch eager 循环依赖（_dispatch_to_worker 是留在 __init__ 的
+        # 可 patch 有状态符号；调用时 nodes 已完成初始化，patch("swarm.brain.nodes.X") 仍命中）。
+        from swarm.brain import nodes
         # FINDING-12：拒答/步数耗尽子任务强制走【最强模型】(routing_complex=40B 256k)，不走 alternate
         # 也不走轮转池——小模型 agent 循环不收敛，最强模型最能在步数内完成。
         _fs = bool(_force_strong.get(subtask.id))
