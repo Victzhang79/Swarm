@@ -1464,13 +1464,18 @@ async def get_stats(request: Request, project_id: str | None = None):
     from swarm.api._shared import _require_perm, _require_user
     if project_id:
         _require_perm(request, "project:read", project_id)
+        _scope_ids = None
     else:
-        _require_user(request)
+        user = _require_user(request)
+        # C2 治本：无 project_id → 限定到成员项目白名单（admin 返回 None=全量），杜绝跨项目
+        # 任务元数据(description/token_usage/最近 10 条)泄露。对齐 /api/milestones 的 #5(a) 处理。
+        _scope_ids = _accessible_project_ids_or_none(user, None, request)
     loop = asyncio.get_running_loop()
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
 
-    stats = await loop.run_in_executor(None, lambda: store.get_task_stats(project_id))
+    stats = await loop.run_in_executor(
+        None, lambda: store.get_task_stats(project_id, project_ids=_scope_ids))
     if project_id:
         stats["project_id"] = project_id
         # 项目级定制沙箱：附带当前项目专属模板 ID（系统配置好的，供项目统计页展示）。
@@ -1506,10 +1511,13 @@ async def get_token_usage(request: Request):
     让运维看清实际烧了多少 token、云端/本地各多少、每个项目多少。全局视图 → 认证用户可见。
     """
     from swarm.api._shared import _require_user
-    _require_user(request)
+    user = _require_user(request)
+    # C3 治本：非 admin 限定到成员项目白名单，杜绝跨项目 token 用量泄露。
+    _scope_ids = _accessible_project_ids_or_none(user, None, request)
     loop = asyncio.get_running_loop()
     from swarm.models import usage_tracker
-    return await loop.run_in_executor(None, usage_tracker.get_token_usage_stats)
+    return await loop.run_in_executor(
+        None, lambda: usage_tracker.get_token_usage_stats(project_ids=_scope_ids))
 
 
 @app.get("/api/notifications", tags=["系统"])

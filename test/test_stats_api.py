@@ -85,7 +85,8 @@ def test_stats_endpoint_returns_expected_keys():
         assert data["avg_tokens"] == 4000.0
         assert len(data["recent_tasks"]) == 1
         assert data["recent_tasks"][0]["token_usage"]["total"] == 4000
-        mock_store.get_task_stats.assert_called_once_with(None)
+        # C2：无 project_id 时按成员项目白名单限定（admin/dev 默认用户 → project_ids=None 全量）。
+        mock_store.get_task_stats.assert_called_once_with(None, project_ids=None)
     print("  ✅ GET /api/stats returns expected keys")
 
 
@@ -101,7 +102,7 @@ def test_stats_scoped_to_project():
         client = TestClient(app)
         resp = client.get("/api/stats?project_id=p1")
         assert resp.status_code == 200, resp.text
-        mock_store.get_task_stats.assert_called_once_with("p1")
+        mock_store.get_task_stats.assert_called_once_with("p1", project_ids=None)
 
         resp2 = client.get("/api/projects/p1/stats")
         assert resp2.status_code == 200, resp2.text

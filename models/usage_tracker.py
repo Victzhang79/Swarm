@@ -253,8 +253,12 @@ def _remerge(snapshot: dict, lat_snapshot: list | None = None) -> None:
             _lat_buffer.extend(lat_snapshot)
 
 
-def get_token_usage_stats(conn_str: str | None = None) -> dict:
-    """聚合统计：云端/本地分项 + 总计 + 每项目。读前先 flush，保证页面看到的是最新值。"""
+def get_token_usage_stats(conn_str: str | None = None, *, project_ids: "set[str] | None" = None) -> dict:
+    """聚合统计：云端/本地分项 + 总计 + 每项目。读前先 flush，保证页面看到的是最新值。
+
+    C3 治本：project_ids=None → 不限（admin/全局）；给定集合 → 只统计成员项目（by_kind/grand_total/
+    per_project 全部限定），杜绝任意登录用户读全项目 token 用量。延迟样本无项目维度，保持全局。
+    """
     try:
         flush()
     except Exception:  # noqa: BLE001
@@ -269,12 +273,17 @@ def get_token_usage_stats(conn_str: str | None = None) -> dict:
     try:
         with _pool().connection() as conn:
             with conn.cursor() as cur:
+                # C3：非 admin 时按成员项目白名单过滤（空集 → 命中 0 行 → 全 0）。
+                _pf1 = "WHERE project_id = ANY(%s)" if project_ids is not None else ""
+                _pf2 = "WHERE u.project_id = ANY(%s)" if project_ids is not None else ""
+                _pf_params: tuple = (list(project_ids),) if project_ids is not None else ()
                 # 云端 vs 本地分项
                 cur.execute(
                     "SELECT kind, COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
                     "COALESCE(SUM(total_tokens),0), COALESCE(SUM(call_count),0), "
                     "COALESCE(SUM(total_duration_ms),0) "
-                    "FROM llm_token_usage GROUP BY kind"
+                    f"FROM llm_token_usage {_pf1} GROUP BY kind",
+                    _pf_params,
                 )
                 for kind, p, c, t, n, dur in cur.fetchall():
                     b = _bucket(p, c, t, n, dur)
@@ -288,7 +297,8 @@ def get_token_usage_stats(conn_str: str | None = None) -> dict:
                     "  COALESCE(SUM(CASE WHEN u.kind='local' THEN u.total_tokens ELSE 0 END),0), "
                     "  COALESCE(SUM(u.total_tokens),0), COALESCE(SUM(u.call_count),0) "
                     "FROM llm_token_usage u LEFT JOIN projects p ON p.id = u.project_id "
-                    "GROUP BY u.project_id, p.name ORDER BY SUM(u.total_tokens) DESC"
+                    f"{_pf2} GROUP BY u.project_id, p.name ORDER BY SUM(u.total_tokens) DESC",
+                    _pf_params,
                 )
                 for pid, name, cloud_t, local_t, total_t, n in cur.fetchall():
                     out["per_project"].append({

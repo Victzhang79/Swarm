@@ -22,6 +22,20 @@ from swarm.api._shared import ApplyDiffRequest, _require_perm, _require_user
 router = APIRouter()
 
 
+def _require_task_access(request, task, task_id: str, perm: str):
+    """C5 治本：任务鉴权统一口径——【不存在】与【无权】返回同一 generic 404，防 task_id 存在性
+    枚举（旧代码 not-found→404、有但无权→403 可区分）。对齐 WS 端点已有的通用拒绝。
+    认证失败(无 token)仍由 _require_user 抛 401（与任务是否存在无关，不泄露存在性）。
+    """
+    from swarm.api._shared import _require_user as _ru
+    from swarm.auth.store import user_can_on_project
+    from fastapi import HTTPException as _HTTPException
+    user = _ru(request)
+    if not task or not user_can_on_project(user, perm, (task or {}).get("project_id")):
+        raise _HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return task
+
+
 class TaskCreateRequest(BaseModel):
     """创建任务请求"""
     description: str = Field(description="任务描述")
@@ -205,10 +219,8 @@ async def stream_task(task_id: str, request: Request):
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    # P0-SEC-03：进度流也需 task:read 授权（防已认证用户跨项目订阅任意任务执行流）。
-    _require_perm(request, "task:read", task.get("project_id"))
+    # P0-SEC-03/C5：进度流需 task:read 授权；不存在与无权统一 404（防跨项目订阅 + 存在性枚举）。
+    _require_task_access(request, task, task_id, "task:read")
 
     # N-CW1/N-CW2：每个连接订阅【自己的】队列（多端互不抢事件），断开时注销回收。
     topic, queue = subscribe_task(task_id)
@@ -384,9 +396,7 @@ async def get_task(task_id: str, request: Request):
     """获取任务详情"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:read", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:read")
     return {"task": jsonable_encoder(task)}
 
 
@@ -402,9 +412,7 @@ async def delete_task_endpoint(task_id: str, request: Request, force: bool = Fal
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:cancel", task.get("project_id"))  # 删除=终止性操作，owner/developer 可
+    _require_task_access(request, task, task_id, "task:cancel")  # 删除=终止性操作，owner/developer 可
 
     status = task.get("status", "")
     if is_task_running(task_id):
@@ -428,9 +436,7 @@ async def cancel_task_endpoint(task_id: str, request: Request):
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:cancel", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:cancel")
 
     if not is_task_running(task_id) and not is_task_orphaned(task_id):
         from swarm.task_states import TERMINAL_STATES
@@ -452,9 +458,7 @@ async def retry_task_endpoint(task_id: str, request: Request, req: TaskRetryRequ
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:create", task.get("project_id"))  # 重跑=重新发起执行
+    _require_task_access(request, task, task_id, "task:create")  # 重跑=重新发起执行
 
     allowed, reason = can_retry_task(task_id)
     if not allowed:
@@ -476,9 +480,7 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:create", task.get("project_id"))  # 起跑需求池=发起执行
+    _require_task_access(request, task, task_id, "task:create")  # 起跑需求池=发起执行
     if task.get("status") != "POOLED":
         raise HTTPException(
             status_code=409,
@@ -514,9 +516,7 @@ async def get_task_logs(task_id: str, request: Request, limit: int = 500):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:read", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:read")
 
     from swarm.logging_config import read_task_logs, resolve_log_path
 
@@ -544,9 +544,7 @@ async def stream_task_logs(task_id: str, request: Request):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:read", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:read")
 
     from swarm.logging_config import TaskLogPoller
 
@@ -587,9 +585,7 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
     """审核通过 — 可选 apply diff + 增量知识更新，然后 resume Brain"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:approve", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:approve")
 
     # P1-A 原子认领：仅当任务处于【计划确认/结果审核】态才推进（一次成功）。双击/重复提交时
     # 第二次的同一条件 UPDATE 匹配 0 行 → None → 走幂等无副作用分支（不重复 apply diff / 触发 resume）。
@@ -674,10 +670,8 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
     """Phase 1 — 将 merged_diff 应用到项目 git 工作区（git apply）"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    # P0-SEC-02：写盘端点须授权 + 成员资格。应用产出=审核接受类操作 → task:approve（owner/developer 可）。
-    _require_perm(request, "task:approve", task.get("project_id"))
+    # P0-SEC-02/C5：写盘端点须授权 + 成员资格；不存在与无权统一 404（防存在性枚举）。task:approve。
+    _require_task_access(request, task, task_id, "task:approve")
 
     project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
     if not project or not project.get("path"):
@@ -725,9 +719,7 @@ async def revise_task(task_id: str, request: Request, req: TaskReviseRequest):
     """审核修订 — resume Brain (revise + feedback)"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:approve", task.get("project_id"))  # 审核修订=审批决策
+    _require_task_access(request, task, task_id, "task:approve")  # 审核修订=审批决策
 
     # P1-A 原子认领：仅审核态放行，双击第二次 → None → 幂等不重复 resume。
     from swarm.task_states import PLAN_RESULT_REVIEW_STATES
@@ -768,9 +760,7 @@ async def reject_task(task_id: str, request: Request):
     """审核拒绝 — resume Brain (reject)"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:approve", task.get("project_id"))  # 审核拒绝=审批决策
+    _require_task_access(request, task, task_id, "task:approve")  # 审核拒绝=审批决策
 
     # P1-A 原子认领：仅审核态放行，双击第二次 → None → 幂等不重复 resume。
     from swarm.task_states import PLAN_RESULT_REVIEW_STATES
@@ -813,9 +803,7 @@ async def get_task_planning(task_id: str, request: Request):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:read", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:read")
     artifacts = await loop.run_in_executor(
         None, lambda: _app.store.get_planning_artifacts(task_id)
     )
@@ -832,9 +820,7 @@ async def get_task_pending(task_id: str, request: Request):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:read", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:read")
     from swarm.brain.runner import get_pending_interrupt
 
     pending = await get_pending_interrupt(task_id)
@@ -850,9 +836,7 @@ async def submit_clarify(task_id: str, request: Request):
     # P0-SEC-03：澄清答复会推进任务规划，须 task:approve（审批/规划决策）+ 成员资格。
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:approve", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:approve")
     body = await request.json()
     if body.get("action") == "skip":
         payload: dict = {"action": "skip"}
@@ -883,9 +867,7 @@ async def submit_design_review(task_id: str, request: Request):
     # P0-SEC-03：评审决策推进规划，须 task:approve（审批/规划决策）+ 成员资格。
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _require_perm(request, "task:approve", task.get("project_id"))
+    _require_task_access(request, task, task_id, "task:approve")
     body = await request.json()
     decision = body.get("decision")
     if decision not in ("approve", "reject"):

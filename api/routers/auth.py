@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm, _require_user
@@ -77,6 +77,19 @@ class CreateUserRequest(BaseModel):
 class MemberRequest(BaseModel):
     user_id: str
     role: str = "developer"
+
+    @field_validator("role")
+    @classmethod
+    def _validate_project_role(cls, v: str) -> str:
+        # C1 治本：项目成员角色必须在【项目级可分配角色】白名单内。旧代码不校验 → owner 可写
+        # role="admin"（或任意 ROLE_PERMISSIONS 键），effective_project_role 采信 member_role、
+        # admin 的 "*" 通配符恒真 → 项目级通配符提权。排除 admin（全局角色，不经成员接口授予）。
+        from swarm.auth.rbac import PROJECT_ASSIGNABLE_ROLES
+        if v not in PROJECT_ASSIGNABLE_ROLES:
+            raise ValueError(
+                f"非法项目角色 '{v}'，仅允许 {sorted(PROJECT_ASSIGNABLE_ROLES)}（admin 为全局角色，不可经成员接口授予）"
+            )
+        return v
 
 
 @router.post("/api/auth/login", tags=["认证"])

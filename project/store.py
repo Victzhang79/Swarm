@@ -1043,10 +1043,23 @@ def _get_learning_effectiveness(
     }
 
 
-def get_task_stats(project_id: str | None = None, conn_str: str | None = None) -> dict[str, Any]:
-    """聚合任务统计；可选按 project_id 过滤"""
-    where = "WHERE project_id = %s" if project_id else ""
-    params: tuple[Any, ...] = (project_id,) if project_id else ()
+def get_task_stats(project_id: str | None = None, conn_str: str | None = None,
+                   *, project_ids: "set[str] | None" = None) -> dict[str, Any]:
+    """聚合任务统计；可选按 project_id（单项目）或 project_ids（成员项目白名单）过滤。
+
+    C2 治本：无 project_id 时旧代码聚合【全库】任务（含最近 10 条跨项目 description/token_usage）→
+    任意登录用户跨项目泄露。调用方(get_stats)对非 admin 传 project_ids=成员项目集，此处限定范围；
+    空集 → ANY('{}') 命中 0 行 → 全 0（无可见项目，如实空）。project_ids=None 表示不限（admin/单项目）。
+    """
+    if project_id:
+        where = "WHERE project_id = %s"
+        params: tuple[Any, ...] = (project_id,)
+    elif project_ids is not None:
+        where = "WHERE project_id = ANY(%s)"
+        params = (list(project_ids),)
+    else:
+        where = ""
+        params = ()
 
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:

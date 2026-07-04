@@ -31,6 +31,12 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     }),
 }
 
+# C1：项目级【可经成员接口分配】的角色白名单。排除 ADMIN——admin 是全局角色，其 "*" 通配符
+# 不应经 PUT /members 授予（否则任意 owner 可把自己/他人提为项目级 admin 拿全权）。
+PROJECT_ASSIGNABLE_ROLES: frozenset[str] = frozenset({
+    Role.OWNER.value, Role.DEVELOPER.value, Role.VIEWER.value,
+})
+
 
 def role_permissions(role: str) -> frozenset[str]:
     return ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS[Role.VIEWER.value])

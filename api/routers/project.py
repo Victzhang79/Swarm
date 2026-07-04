@@ -48,6 +48,33 @@ async def list_projects(request: Request):
 
 
 # ─── 2. POST /api/projects — 创建项目 ─────────────
+def _env_allow_external_project_path() -> bool:
+    """C4：是否允许把项目根指向 workspace 之外的本机已有目录。默认 true。"""
+    import os
+    return os.environ.get("SWARM_ALLOW_EXTERNAL_PROJECT_PATH", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _enforce_project_path_containment(resolved_path: str, project_root: str, allow_external: bool) -> None:
+    """C4 治本：可选把项目根限制在 workspace 内（防多租户共享宿主机下的路径级 IDOR + 摄取）。
+
+    默认 allow_external=true → 不限制（不破坏"指向本机已有外部项目"的合法工作流，如 E2E 的
+    e2e-projects/RuoYi）。SWARM_ALLOW_EXTERNAL_PROJECT_PATH=false 时强制 containment 到
+    project_root，越界拒绝。与黑名单 _reject_sensitive 互补（黑名单永远生效，containment 可选加严）。
+    """
+    if allow_external or not resolved_path:
+        return
+    import os
+    norm = os.path.realpath(os.path.abspath(resolved_path))
+    root = os.path.realpath(os.path.abspath(project_root))
+    if norm != root and not norm.startswith(root + os.sep):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"项目根必须在 workspace({root}) 内："
+                    f"SWARM_ALLOW_EXTERNAL_PROJECT_PATH=false 已禁止外部路径（多租户加固）"),
+        )
+
+
 @router.post("/api/projects", tags=["项目管理"])
 async def create_project(req: ProjectCreateRequest, request: Request):
     """创建项目并自动启动预处理
@@ -87,11 +114,14 @@ async def create_project(req: ProjectCreateRequest, request: Request):
                 )
 
     _reject_sensitive(resolved_path)
+    _allow_external = _env_allow_external_project_path()
+    _enforce_project_path_containment(resolved_path, str(PROJECT_ROOT), _allow_external)
     if req.greenfield:
         if not resolved_path:
             safe = _re.sub(r"[^A-Za-z0-9_.-]+", "-", req.name).strip("-") or project_id[:8]
             resolved_path = str((PROJECT_ROOT / "workdir" / safe).resolve())
         _reject_sensitive(resolved_path)
+        _enforce_project_path_containment(resolved_path, str(PROJECT_ROOT), _allow_external)
         try:
             os.makedirs(resolved_path, exist_ok=True)
         except OSError as e:

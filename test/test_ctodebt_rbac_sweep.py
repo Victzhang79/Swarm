@@ -15,24 +15,30 @@ def _src(func) -> str:
     return inspect.getsource(func)
 
 
+def _gated_on(src: str, perm: str) -> bool:
+    """C5 后：端点可经 _require_perm 或统一 404 的 _require_task_access 施加同一权限。
+    只校验【该端点对该 perm 有闸门】，不焊死具体调用形态（防脆·反重构）。"""
+    return (f'"{perm}"' in src) and ("_require_perm" in src or "_require_task_access" in src)
+
+
 def test_task_endpoints_gated():
-    """task 生命周期端点改用细粒度【已存在】权限（task:write 词汇缺口已修，owner/developer 生效）。"""
+    """task 生命周期端点用细粒度【已存在】权限闸门（C5：部分改走 _require_task_access 统一 404）。"""
     from swarm.api.routers import task
 
     assert '_require_perm(request, "task:read", project_id)' in _src(task.list_tasks)
     # 重跑/起跑 = 发起执行 → task:create
-    assert '_require_perm(request, "task:create"' in _src(task.retry_task_endpoint)
-    assert '_require_perm(request, "task:create"' in _src(task.execute_pooled_task)
+    assert _gated_on(_src(task.retry_task_endpoint), "task:create")
+    assert _gated_on(_src(task.execute_pooled_task), "task:create")
     # 审批/规划决策 → task:approve
-    assert '_require_perm(request, "task:approve"' in _src(task.revise_task)
-    assert '_require_perm(request, "task:approve"' in _src(task.reject_task)
-    assert '_require_perm(request, "task:approve"' in _src(task.approve_task)
-    assert '_require_perm(request, "task:approve"' in _src(task.apply_task_diff)
-    assert '_require_perm(request, "task:approve"' in _src(task.submit_clarify)
-    assert '_require_perm(request, "task:approve"' in _src(task.submit_design_review)
+    assert _gated_on(_src(task.revise_task), "task:approve")
+    assert _gated_on(_src(task.reject_task), "task:approve")
+    assert _gated_on(_src(task.approve_task), "task:approve")
+    assert _gated_on(_src(task.apply_task_diff), "task:approve")
+    assert _gated_on(_src(task.submit_clarify), "task:approve")
+    assert _gated_on(_src(task.submit_design_review), "task:approve")
     # 取消/删除 = 终止性 → task:cancel
-    assert '_require_perm(request, "task:cancel"' in _src(task.cancel_task_endpoint)
-    assert '_require_perm(request, "task:cancel"' in _src(task.delete_task_endpoint)
+    assert _gated_on(_src(task.cancel_task_endpoint), "task:cancel")
+    assert _gated_on(_src(task.delete_task_endpoint), "task:cancel")
     assert "_require_perm" in _src(task.task_audit_endpoint) or "_require_user" in _src(task.task_audit_endpoint)
 
 
