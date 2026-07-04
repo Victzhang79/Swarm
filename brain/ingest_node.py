@@ -82,9 +82,8 @@ async def _run_ingest(state: BrainState, uploaded: list[str]) -> dict:
         if not path:
             errors.append(f"{doc.filename}: 找不到原始文件路径")
             continue
-        vresult = await asyncio.to_thread(
-            vision_ingest.understand_file, path, doc.kind,
-        )
+        # B6：走异步版——LLM 调用 await ainvoke 可被 cancel_task 中断（不再 to_thread 里跑到结束占 GPU）。
+        vresult = await vision_ingest.understand_file_async(path, doc.kind)
         if vresult.ok:
             # 防幻觉：标 confirmed（auto_confirm 时直接确认，否则待 clarify）
             confirmed = auto_confirm

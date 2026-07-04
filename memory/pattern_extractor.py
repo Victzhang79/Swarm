@@ -50,7 +50,13 @@ def should_write_success(state: BrainState) -> bool:
         try:
             complexity = Complexity(complexity)
         except ValueError:
-            return True
+            # B9 治本(fail-closed)：非法 complexity 字符串（typo/污染 state）旧代码 return True →
+            # 绕过 SUCCESS_WRITE_MIN_COMPLEXITY(MEDIUM+) 门槛、让 TRIVIAL/未知任务也写 L6 污染知识库。
+            # 改 fail-closed：非法值不写（宁漏学不毒化，与上方"漏一个真成功也不学毒模式"同哲学）。
+            import logging
+            logging.getLogger(__name__).warning(
+                "[LEARN] 非法 complexity=%r，跳过 L6 成功模式写入（fail-closed 防污染）", complexity)
+            return False
     return complexity in SUCCESS_WRITE_MIN_COMPLEXITY
 
 

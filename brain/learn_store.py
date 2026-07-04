@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -23,6 +24,15 @@ logger = logging.getLogger(__name__)
 # 完全失效。阈值取偏高余弦相似度，确保只对【确属同一条】记录强化，避免误并不同记录。
 # 注：query_* 在 embedding 不可用(零向量)时返回 []，此时自动跳过强化、退回插新行(优雅降级)。
 _REINFORCE_SIMILARITY = 0.92
+
+# B7 治本：learn 落库的"检查幂等 → 写入(含 reinforce 读改写)"临界区序列化锁。
+# TOCTOU 根因：_already_persisted 检查在事务外，并发同键 learn 都通过检查后各写一条 →
+# 重复 L2 + 双计 reuse/occurrence。目标拓扑=单 brain 进程(单 asyncio)，故一把进程级 async 锁
+# 把临界区串行化即【原子】闭合：同键 learn 第二个进锁时必见首个已写的键 → 幂等命中跳过；
+# reinforce 的 query→insert 也在锁内 → 两个相似 learn 不再各插一行(计数虚高)。learn 频次极低
+# (每任务终态一次)，全局串行开销可忽略。cross-process 硬化(唯一约束迁移)因需处理存量重复行、
+# 且当前非多进程拓扑，留作显式后续项(见交接)。
+_persist_lock = asyncio.Lock()
 
 
 def _idempotency_key(task_id: str, outcome: str, content: str) -> str:
@@ -111,6 +121,8 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
 
     store = MemoryStore()
     await store.connect()
+    # B7：整个"检查幂等 → 写入(含 reinforce 读改写)"临界区在进程级锁内串行，原子闭合 TOCTOU/竞态。
+    await _persist_lock.acquire()
     try:
         # WS4 幂等：learn 重放(成功后重试)若已落过同键 → 跳过，避免二次写 L2 + 二次 reuse_count++。
         if await _already_persisted(store, project_id, idem_key):
@@ -174,6 +186,7 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
         logger.exception("[LEARN_STORE] 成功模式落库失败: %s", exc)
         return {"persisted": False, "error": str(exc)}
     finally:
+        _persist_lock.release()
         await store.close()
 
 
@@ -205,6 +218,8 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
 
     store = MemoryStore()
     await store.connect()
+    # B7：整个"检查幂等 → 写入(含 reinforce 读改写)"临界区在进程级锁内串行，原子闭合 TOCTOU/竞态。
+    await _persist_lock.acquire()
     try:
         # WS4 幂等：learn 重放若已落过同键 → 跳过，避免二次写 L5 + 二次 occurrence_count++。
         if await _already_persisted(store, project_id, idem_key):
@@ -248,6 +263,7 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
         logger.exception("[LEARN_STORE] 错题落库失败: %s", exc)
         return {"persisted": False, "error": str(exc)}
     finally:
+        _persist_lock.release()
         await store.close()
 
 

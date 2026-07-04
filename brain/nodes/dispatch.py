@@ -229,6 +229,22 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
     return plan_obj, remaining, to_dispatch
 
 
+def _select_pool_override(difficulty, idx, pool, use_alternate_effective, force_strong, routing_complex):
+    """B10 治本（纯函数，便于测试）：并行池 model_override 决策。
+
+    - force_strong（拒答/步数耗尽）或【complex 子任务】→ routing_complex(最强)，绕过轮转：
+      别让轮转把硬子任务分到池里较弱模型(如 MiniMax)先降质跑一轮，再靠 force_strong 补救；
+    - 否则池非空且非 alternate → 轮转 pool[idx%len]（同能力主力分散负载）；
+    - 池空/alternate → None（按 difficulty 路由，保持既有兜底）。
+    """
+    d = str(getattr(difficulty, "value", None) or difficulty or "").lower()
+    if force_strong or d in ("complex", "ultra"):
+        return routing_complex
+    if pool and not use_alternate_effective:
+        return pool[idx % len(pool)]
+    return None
+
+
 async def dispatch(state: BrainState) -> dict:
     """DISPATCH 节点 — 将就绪的子任务派发给 Worker
 
@@ -340,12 +356,16 @@ async def dispatch(state: BrainState) -> dict:
         # 无"备选"可换，重试改给 recursion_boost 助收敛，而非换更弱模型。
         _single = len(_pool) == 1
         _ua = use_alternate and not _fs and not _single
-        _override = _pool[idx % len(_pool)] if (_pool and not _ua) else None
+        # B10：override 决策抽为纯函数——force_strong 或 complex 子任务绕过轮转直取最强模型，
+        # 否则池非空非 alternate 走轮转，池空/alternate 按 difficulty 路由。
+        _override = _select_pool_override(
+            getattr(subtask, "difficulty", None), idx, _pool, _ua, _fs,
+            config.model.routing_complex,
+        )
         # FINDING-12：拒答/步数耗尽子任务重试时，换最强模型 + 加步数(trivial 30→60)。
         # 只换 40B 不抬 recursion_limit，多步任务照样撞 `Sorry, need more steps`(RUN5 实证)。
         _boost = 0
         if _fs:
-            _override = config.model.routing_complex
             _boost = 30
         elif _single and use_alternate:
             _boost = 30  # 单模型重试：留在唯一模型 + 加步数助收敛(不降级)

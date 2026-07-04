@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -86,7 +86,7 @@ def test_ingest_image_records_vision_pending(tmp_path):
         def ok(self):
             return True
 
-    with patch("swarm.brain.vision_ingest.understand_file", return_value=_VR()):
+    with patch("swarm.brain.vision_ingest.understand_file_async", new=AsyncMock(return_value=_VR())):
         with patch("swarm.brain.vision_ingest.annotate_for_draft",
                    return_value="【文件: ui.png】（AI理解,待确认）登录界面截图"):
             out = asyncio.run(ingest({
@@ -118,7 +118,7 @@ def test_ingest_auto_confirm_vision_skips_pending(tmp_path):
         def ok(self):
             return True
 
-    with patch("swarm.brain.vision_ingest.understand_file", return_value=_VR()):
+    with patch("swarm.brain.vision_ingest.understand_file_async", new=AsyncMock(return_value=_VR())):
         with patch("swarm.brain.vision_ingest.annotate_for_draft", return_value="理解内容"):
             out = asyncio.run(ingest({
                 "task_description": "做个登录页",

@@ -140,6 +140,67 @@ def _invoke_vision(model_name: str, data_urls: list[str], prompt: str = _VISION_
     return str(text).strip()
 
 
+async def _ainvoke_vision(model_name: str, data_urls: list[str], prompt: str = _VISION_PROMPT) -> str:
+    """_invoke_vision 的异步版：await ainvoke，取消(cancel_task)可中断底层流，不空烧 GPU（B6）。"""
+    from swarm.models.router import ModelRouter
+
+    router = ModelRouter()
+    llm = router.get_model_by_name(model_name, temperature=0.1)
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for url in data_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    resp = await llm.ainvoke([{"role": "user", "content": content}])
+    text = resp.content
+    if isinstance(text, list):
+        text = " ".join(p if isinstance(p, str) else p.get("text", "") for p in text)
+    return str(text).strip()
+
+
+async def understand_file_async(
+    path: str | Path,
+    kind: str,
+    *,
+    model_name: str | None = None,
+) -> VisionResult:
+    """understand_file 的异步版（B6 治本）：LLM 调用走 await ainvoke，cancel_task 可中断——
+    不再像同步 invoke+to_thread 那样线程内跑到结束、取消后仍占 GPU。渲染(本地 CPU)放线程池
+    不阻塞事件循环。语义与 understand_file 一致，仅可取消性不同。
+    """
+    import asyncio as _aio
+
+    p = Path(path)
+    result = VisionResult(filename=p.name)
+    model = model_name or select_vision_model()
+    if not model:
+        result.error = "无可用多模态模型（请在设置里配置/探测多模态模型）"
+        return result
+    result.model_used = model
+    try:
+        if kind == "image":
+            data_urls = await _aio.to_thread(lambda: [_image_to_data_url(p)])
+        elif kind == "pdf":
+            pngs = await _aio.to_thread(_render_pdf_pages_to_pngs, p)
+            if not pngs:
+                result.error = "扫描 PDF 渲染失败：无页面"
+                return result
+            data_urls = [_png_bytes_to_data_url(b) for b in pngs]
+        else:
+            result.error = f"不支持的多模态类型: {kind}"
+            return result
+
+        understanding = await _ainvoke_vision(model, data_urls)
+        if not understanding:
+            result.error = "多模态模型返回空内容"
+            return result
+        result.understanding = understanding
+    except _aio.CancelledError:
+        raise  # 取消向上传播（别吞成 error），让上层 finally 清理资源
+    except Exception as exc:  # noqa: BLE001
+        result.error = f"多模态理解失败: {exc}"
+        logger.warning("理解文件 %s 失败: %s", p.name, exc)
+    return result
+
+
 def understand_file(
     path: str | Path,
     kind: str,

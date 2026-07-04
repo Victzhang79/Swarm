@@ -587,6 +587,14 @@ class ModelRouter:
             "medium": (self.config.routing_medium, self.config.routing_medium_fallback),
             "complex": (self.config.routing_complex, self.config.routing_complex_fallback),
         }
+        if difficulty not in route_map:
+            # B8 治本(fail-loud)：拼写错误/新增 enum/plan 输出非法 difficulty(如 "ultra")旧代码
+            # 静默降 medium → 复杂任务被发到弱模型、无告警。显式记名回退，可观测（保留 medium 兜底
+            # 不崩，但把"未知档"暴露出来供排查/校准，而非静默降质）。
+            logger.warning(
+                "[ROUTER] 未知 difficulty=%r（不在 trivial/medium/complex），回退 medium 路由——"
+                "疑似 typo/新增档未接线，请核对 plan 输出与路由表", difficulty,
+            )
         return route_map.get(
             difficulty,
             (self.config.routing_medium, self.config.routing_medium_fallback),
@@ -604,6 +612,20 @@ class ModelRouter:
 
             rows = cap.list_capabilities()
             mm = [r for r in rows if r.get("supports_multimodal")]
+            # B5 治本：只保留【本地 provider】的多模态模型——worker 全本地策略，绝不因能力库里
+            # 探到/import 了云端 VL 模型就把多模态子任务静默路由到云端（成本/延迟/数据路径越界）。
+            # 仍保留 A.5 的自动发现（本地探测出的 VL 模型照常可用，不强制在静态 in_use 清单里）。
+            # 过滤后为空 → 返回 None，调用方回退写死 routing_multimodal（显式配置权威兜底）。
+            def _is_local(mid: str | None) -> bool:
+                if not mid:
+                    return False
+                try:
+                    prov = self.config.provider_for_model(mid)
+                    return bool(prov) and getattr(prov, "kind", "") == "local"
+                except Exception:  # noqa: BLE001
+                    return False
+
+            mm = [r for r in mm if _is_local(r.get("model_id"))]
             if not mm:
                 return None
 
