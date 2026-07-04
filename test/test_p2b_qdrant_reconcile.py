@@ -59,6 +59,14 @@ async def test_reconcile_noop_when_all_live():
     assert cleaned == 0 and client.deleted == []
 
 
+async def test_reconcile_empty_live_set_refuses_mass_delete():
+    """★数据安全★：存活集为空(DB 读失败)→ 拒绝对账，绝不误删全量向量。"""
+    client = _FakeClient([([_Pt("p1"), _Pt("p2")], None)])
+    idx = _make_indexer(client)
+    cleaned = await idx.reconcile_orphan_points(set())
+    assert cleaned == 0 and client.deleted == [], "空存活集必须拒绝删除（防灾难）"
+
+
 async def test_reconcile_scroll_failure_nonfatal():
     class _Boom:
         async def scroll(self, **kw):
@@ -75,6 +83,8 @@ def test_reconcile_wired_into_daily_scheduler():
 
     src = inspect.getsource(appmod._run_kb_prune_once)
     assert "reconcile_orphan_points" in src, "Qdrant 孤儿对账未接入每日调度（P2-B 回归）"
+    # 复核 F1（TOCTOU）：reconcile 前就地重取 live 集，不用陈旧快照
+    assert "fresh_projects" in src, "reconcile 前未重取 live 集（F1 TOCTOU 回归）"
 
 
 if __name__ == "__main__":

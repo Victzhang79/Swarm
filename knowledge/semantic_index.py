@@ -400,12 +400,17 @@ class SemanticIndexer:
         删项目时 Qdrant 清理是 best-effort（失败仅 warning）→ 残留孤儿向量长期占用、污染检索。
         本 reconcile scroll 全集收集 payload.project_id，差集(Qdrant - 存活)即孤儿，逐 project 删。
         供每日调度调用（off-peak）。返回清理的孤儿 project 数。异常 → 0（非致命，不阻断调度）。"""
+        live = set(live_project_ids)
+        # ★数据安全闸★：存活集为空 = 几乎必是 list_projects 读失败/空返回，绝非"该删光全部向量"。
+        # 若不挡，seen - {} = 全部 → 误删整库 KB 向量。空集一律拒绝对账（fail-closed 防灾难删除）。
+        if not live:
+            logger.warning("[KB reconcile] 存活项目集为空(疑似 DB 读失败)，跳过孤儿对账防误删全量向量")
+            return 0
         try:
             client = self._client_or_raise()
         except Exception as exc:  # noqa: BLE001
             logger.debug("[KB reconcile] Qdrant 不可用，跳过孤儿对账: %s", exc)
             return 0
-        live = set(live_project_ids)
         seen: set[str] = set()
         offset = None
         try:

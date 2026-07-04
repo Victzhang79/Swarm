@@ -1139,7 +1139,10 @@ async def _run_kb_prune_once(retention: int) -> None:
     # P2-B：Qdrant 孤儿向量对账——删已不存在项目的残留 points（delete_project 时 best-effort
     # Qdrant 清理失败的残留）。存活集 = DB 现存 project_id。同轮跑，异常不阻断。
     try:
-        live_ids = {p.get("id") for p in (projects or []) if p.get("id")}
+        # 复核 F1（TOCTOU）：live 集必须【此刻新取】——上面 KB prune 循环可能已跑数十秒，
+        # 期间新建并已索引的项目若用旧快照会被当孤儿误删。就地重取把窗口压到近 0。
+        fresh_projects = await loop.run_in_executor(None, store.list_projects)
+        live_ids = {p.get("id") for p in (fresh_projects or []) if p.get("id")}
         from swarm.knowledge.semantic_index import SemanticIndexer
         idx = SemanticIndexer()
         try:
@@ -1223,7 +1226,8 @@ async def metrics(request: Request):
     lines.append("# HELP swarm_tasks_total Task count by status")
     lines.append("# TYPE swarm_tasks_total gauge")
     for st, n in sorted(by_status.items()):
-        safe = str(st).replace('"', "")
+        # 复核 F5：Prometheus label value 正确转义（\ → \\，换行 → \n，" → \"），非仅剥引号。
+        safe = str(st).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
         lines.append(f'swarm_tasks_total{{status="{safe}"}} {int(n)}')
     lines.append("# HELP swarm_scheduler_inflight In-flight (running) tasks")
     lines.append("# TYPE swarm_scheduler_inflight gauge")

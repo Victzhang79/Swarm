@@ -37,6 +37,11 @@ class _TokenBucket:
         return False, retry_after
 
 
+# 复核 F4：桶字典上限——防 IP 轮转(尤其 IPv6 /64)刷爆内存拖垮进程。超限时清扫【已满桶】
+# （tokens 已回填到 capacity = 自上次使用起闲置足够久，重建等价、删之无害）。
+_MAX_BUCKETS = max(1000, int(__import__("os").environ.get("SWARM_RATELIMIT_MAX_BUCKETS", "50000")))
+
+
 class RateLimiter:
     """按 key 维护独立令牌桶。key = f"{scope}:{subject}"（端点+主体）。"""
 
@@ -44,9 +49,20 @@ class RateLimiter:
         self._buckets: dict[str, _TokenBucket] = {}
         self._lock = threading.Lock()
 
+    def _evict_idle(self, now: float) -> None:
+        """删除已回填至满的闲置桶（不持任何限流状态，重建行为一致）。在锁内调用。"""
+        stale = [
+            k for k, b in self._buckets.items()
+            if min(b.capacity, b._tokens + max(0.0, now - b._last) * b.rate) >= b.capacity
+        ]
+        for k in stale:
+            del self._buckets[k]
+
     def check(self, key: str, capacity: float, rate: float) -> tuple[bool, float]:
         now = time.monotonic()
         with self._lock:
+            if len(self._buckets) >= _MAX_BUCKETS and key not in self._buckets:
+                self._evict_idle(now)
             b = self._buckets.get(key)
             if b is None:
                 b = _TokenBucket(capacity, rate)

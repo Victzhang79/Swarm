@@ -110,6 +110,46 @@ def test_rate_limit_disabled_env(monkeypatch):
     dep(_Req()); dep(_Req()); dep(_Req())  # 全放行（限流关闭），不抛
 
 
+def test_rate_limiter_evicts_idle_buckets_under_cap(monkeypatch):
+    """复核 F4：桶数达上限时清扫已满(闲置)桶，防 IP 轮转刷爆内存。
+
+    IP 轮转真实场景：旧 IP 用一次即弃 → 桶经 capacity/rate 秒回填满 → 可回收。这里把旧桶
+    _last 老化到过去以模拟闲置（回填公式判其满），第 4 个新主体触发清扫回收它们。"""
+    import swarm.api.rate_limit as rl
+
+    monkeypatch.setattr(rl, "_MAX_BUCKETS", 3)
+    limiter = rl.RateLimiter()
+    for i in range(3):
+        limiter.check(f"s:ip{i}", capacity=5, rate=1000.0)
+    # 老化：把 3 个旧桶 _last 拨到很久以前 → 下次清扫按回填公式判其满(闲置)可删
+    for b in limiter._buckets.values():
+        b._last = 0.0
+    limiter.check("s:ip_new", capacity=5, rate=1000.0)
+    assert len(limiter._buckets) == 1, "达上限应清扫已满闲置桶只留新桶（F4 回归）"
+
+
+def test_metrics_label_value_escaped():
+    """复核 F5：Prometheus label value 三重转义（反斜杠/换行/引号），非仅剥引号。"""
+    import sys
+    import inspect
+    import swarm.api.app  # noqa: F401
+    appmod = sys.modules["swarm.api.app"]
+    src = inspect.getsource(appmod.metrics)
+    # 源码应含三个 .replace（反斜杠、换行、引号），不再是单个剥引号
+    assert src.count(".replace(") >= 3, "label 未做三重转义（F5 回归）"
+    assert "F5" in src
+
+
+def test_resume_binds_project_id_in_logs():
+    """复核 F6：resume_task/resume_planning 也把 project_id 绑进日志上下文。"""
+    import inspect
+    from swarm.brain import runner
+
+    for fn in (runner.resume_task, runner.resume_planning):
+        src = inspect.getsource(fn)
+        assert "project_id=_resume_project_id" in src, f"{fn.__name__} resume 日志缺 project_id（F6）"
+
+
 def test_kb_endpoints_have_rate_limit():
     import inspect as _i
     from swarm.api.routers import knowledge

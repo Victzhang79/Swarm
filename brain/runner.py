@@ -102,10 +102,15 @@ class _FanoutTopic:
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         # P2-F：订阅者队列【有界】——慢/挂死的 SSE 客户端不再让队列无界增长撑爆内存。
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_SUB_QUEUE_MAXSIZE)
-        for ev in self._history:  # 回放历史，late 订阅者也能看到先前进度
+        # 复核 F3：history 长于队列容量时，回放【最近 maxsize 条】而非最旧那批——否则 late 订阅者
+        # 填满队列的全是陈旧事件、错过重建当前状态所需的最新进度。deque 为旧→新，取尾部切片。
+        hist = list(self._history)
+        if q.maxsize and len(hist) > q.maxsize:
+            hist = hist[-q.maxsize:]
+        for ev in hist:  # 回放历史，late 订阅者也能看到先前进度
             try:
                 q.put_nowait(ev)
-            except asyncio.QueueFull:  # 历史长于队列容量 → 停止回放（保最新那批历史）
+            except asyncio.QueueFull:
                 break
         # P2-F：订阅者数软上限——超限仅告警（可观测）不硬拒（SSE/WS 仍可连），
         # 每队列已有界故总内存 = N×maxsize 受控；异常多订阅者=泄漏信号，需人工排查。
@@ -985,6 +990,8 @@ async def resume_task(
     from swarm.infra.redis_client import ModuleLock, TaskQueue
 
     _resume_project_id = task.get("project_id", "")
+    if _resume_project_id:
+        set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
     TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():
@@ -1097,6 +1104,8 @@ async def resume_planning(
     from swarm.infra.redis_client import ModuleLock, TaskQueue
 
     _resume_project_id = task.get("project_id", "")
+    if _resume_project_id:
+        set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
     TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():

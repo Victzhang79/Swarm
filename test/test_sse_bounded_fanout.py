@@ -61,6 +61,21 @@ def test_subscriber_soft_cap_warns(monkeypatch, caplog):
     assert any("订阅者" in r.message or "subscriber" in r.message.lower() for r in caplog.records)
 
 
+def test_late_subscriber_replays_most_recent_history(monkeypatch):
+    """复核 F3：history 长于队列容量时，late 订阅者回放【最近 maxsize 条】而非最旧那批。"""
+    from swarm.brain import runner
+
+    monkeypatch.setattr(runner, "_SUB_QUEUE_MAXSIZE", 3)
+    t = runner._FanoutTopic(history=100)
+    for i in range(10):
+        t.publish({"seq": i})
+    q = t.subscribe()  # late 订阅者：容量 3 → 应拿最近 3 条 (7,8,9)
+    got = []
+    while not q.empty():
+        got.append(q.get_nowait()["seq"])
+    assert got == [7, 8, 9], f"应回放最新 3 条，实际 {got}"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
