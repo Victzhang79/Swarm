@@ -12,13 +12,31 @@ appmod = importlib.import_module("swarm.api.app")
 app = appmod.app
 
 
+def _uses_rate_limit(call):
+    return call is not None and (
+        getattr(call, "__module__", "") == "swarm.api.rate_limit"
+        or "rate_limit" in getattr(call, "__qualname__", "")
+    )
+
+
+def _collect_dep_calls(dependant):
+    calls = []
+    for d in getattr(dependant, "dependencies", []) or []:
+        calls.append(getattr(d, "call", None))
+        calls.extend(_collect_dep_calls(d))
+    return calls
+
+
 def _has_rate_limit(path, method):
+    # CI 修正：查已解析的 dependant 树(跨 FastAPI 版本稳定) + raw route.dependencies。
     for r in app.routes:
         if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or set()):
             for d in getattr(r, "dependencies", []) or []:
-                dep = getattr(d, "dependency", None)
-                if getattr(dep, "__name__", "") == "_dep" and "rate_limit" in getattr(dep, "__qualname__", ""):
+                if _uses_rate_limit(getattr(d, "dependency", None)):
                     return True
+            dep = getattr(r, "dependant", None)
+            if dep and any(_uses_rate_limit(c) for c in _collect_dep_calls(dep)):
+                return True
     return False
 
 

@@ -14,14 +14,34 @@ appmod = importlib.import_module("swarm.api.app")
 app = appmod.app
 
 
+def _uses_rate_limit(call) -> bool:
+    """rate_limit 工厂产出的依赖识别：按【模块】(最稳)或 qualname，跨 FastAPI 版本鲁棒。"""
+    return call is not None and (
+        getattr(call, "__module__", "") == "swarm.api.rate_limit"
+        or "rate_limit" in getattr(call, "__qualname__", "")
+    )
+
+
+def _collect_dep_calls(dependant) -> list:
+    """递归收集 dependant 树里所有依赖的 .call（装饰器级 dependencies 会被 FastAPI 解析进此树）。"""
+    calls = []
+    for d in getattr(dependant, "dependencies", []) or []:
+        calls.append(getattr(d, "call", None))
+        calls.extend(_collect_dep_calls(d))
+    return calls
+
+
 def _route_deps_have_rate_limit(path: str, method: str) -> bool:
+    # 复核/CI 修正：不再只看版本相关的 raw route.dependencies；查【已解析的 dependant 树】(核心解析，
+    # 各 FastAPI 版本都填充) + raw，按模块/qualname 匹配 → 跨版本稳定。
     for r in app.routes:
         if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or set()):
-            # 路由级 dependencies 里应含 rate_limit 工厂产出的 _dep
             for d in getattr(r, "dependencies", []) or []:
-                dep = getattr(d, "dependency", None)
-                if getattr(dep, "__name__", "") == "_dep" and "rate_limit" in getattr(dep, "__qualname__", ""):
+                if _uses_rate_limit(getattr(d, "dependency", None)):
                     return True
+            dep = getattr(r, "dependant", None)
+            if dep and any(_uses_rate_limit(c) for c in _collect_dep_calls(dep)):
+                return True
     return False
 
 
