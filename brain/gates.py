@@ -25,12 +25,19 @@ def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
     """部分交付的子任务 ID（单一事实源，去重保序）。
 
     终态 PARTIAL 判据 = abandoned（重试耗尽连坐放弃）∪ give_up（阶梯三保 build 放弃：
-    本地树已清/打桩）。runner 落库、learn 侧 outcome/L6 门槛、统计三处必须同口径读此函数，
-    杜绝历史上"learn 侧只看 abandoned 漏 give_up → give_up-only PARTIAL 被学成成功模式"。
+    本地树已清/打桩）∪ rebase_dropped（★B6 复核 #7★：merge rebase 达上限被丢弃的子任务——其
+    rebased 变更未并入 merged_diff）。runner 落库、learn 侧 outcome/L6 门槛、统计三处必须同口径
+    读此函数，杜绝历史上"learn 侧只看 abandoned 漏 give_up → give_up-only PARTIAL 被学成成功模式"。
+
+    ★#7 治本★：merge_rebase_dropped 此前写进 state 但全仓无消费点 → rebase 超限丢弃的子任务变更
+    不进部分交付判据、任务仍标 DONE（静默成功）。纳入此处：即便聚合清单成员由 post-pass reconcile
+    据 ground-truth 兜底(多数场景无损)，终态也诚实反映"有 rebased 变更被丢弃,需人工核验"，宁可
+    过报 PARTIAL 不可静默 DONE 丢工作。
     """
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
-    return sorted(set(_abandoned) | set(_given_up))
+    _rebase_dropped = state.get("merge_rebase_dropped") or []
+    return sorted(set(_abandoned) | set(_given_up) | set(_rebase_dropped))
 
 
 def is_partial_delivery(state: dict[str, Any]) -> bool:

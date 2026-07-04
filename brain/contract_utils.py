@@ -39,16 +39,19 @@ def _is_pom_file(rel: str) -> bool:
     return str(rel).replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml"
 
 
-def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool]) -> bool:
+def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool],
+                    base_ref: str | None = None) -> bool:
     """文件是否已存在于项目 repo 基线（用于区分"聚合修改"vs"新建撞车"）。
 
     争抢分流的事实依据：已存在文件被多个独立子任务写 = 聚合/注册类共享文件
     （父 pom/settings.gradle/路由 index/DI 注册表…），必须保留各自写权（串行）不可
     静默降级丢贡献；不存在 = 真·新建撞车，独占首写者即可。
 
-    git repo → 以 HEAD 为权威基线（`git cat-file -e HEAD:<rel>`，整洁排除未跟踪残留）；
-    非 git → 退化 os.path.isfile。project_path 为空 → 一律 False（退化为今日 demote 行为，
-    向后兼容）。结果按 rel 缓存，避免对同一文件重复 fork git。
+    ★B6 复核 #2★：git repo 以【任务钉扎 base】为权威基线（`git cat-file -e <base>:<rel>`）——
+    ELABORATE 会在 replan/resplit 时重跑，此刻 HEAD 可能已被用户/兄弟任务推进；若这里读实时 HEAD
+    而 merge/worker/L2 全链读 base，会把"base 时新建、HEAD 时已存在"的文件误判为 aggregate，
+    错留多写者/串行化策略。base_ref=None → "HEAD"（零回归，与全链一致）。
+    非 git → 退化 os.path.isfile。project_path 为空 → 一律 False（向后兼容）。结果按 rel 缓存。
     """
     if not project_path or not rel:
         return False
@@ -57,11 +60,13 @@ def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool]) 
     import os
     import subprocess
 
+    from swarm.git_base import resolve_base_ref
+    _base = resolve_base_ref(base_ref)
     result = False
     try:
         if os.path.isdir(os.path.join(project_path, ".git")):
             r = subprocess.run(
-                ["git", "-C", project_path, "cat-file", "-e", f"HEAD:{rel}"],
+                ["git", "-C", project_path, "cat-file", "-e", f"{_base}:{rel}"],
                 capture_output=True,
                 timeout=10,
             )
@@ -172,7 +177,8 @@ def _module_pom_owners(subtasks: list) -> dict[str, object]:
     return owners
 
 
-def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bool:
+def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
+                          base_ref: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。
 
     task 0f93f1fc 现场：st-1-1 把 NumberUtilsTest.java 放进 create_files，st-1-2 想改它
@@ -244,7 +250,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
     _exist_cache: dict[str, bool] = {}
     aggregate_files: set[str] = {
         f for f, ids in writers_by_file.items()
-        if len(ids) >= 2 and _exists_in_repo(project_path, f, _exist_cache)
+        if len(ids) >= 2 and _exists_in_repo(project_path, f, _exist_cache, base_ref)
     }
 
     def _prev_safe_writer(f: str, me: str) -> str | None:
@@ -372,7 +378,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None) -> bo
             if cf.endswith("/pom.xml") and cf.count("/") == 1:
                 new_modules.add(cf.split("/", 1)[0])
     # 有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）。
-    if new_modules and _exists_in_repo(project_path, "pom.xml", _exist_cache):
+    if new_modules and _exists_in_repo(project_path, "pom.xml", _exist_cache, base_ref):
         # owner = 已收敛的根 pom owner；无人 own 时 backstop 指派首个建模块 pom 的子任务。
         owner = root_pom_owner or next(
             (
@@ -1022,7 +1028,8 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     return bumped
 
 
-def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None) -> dict[str, int]:
+def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
+                           base_ref: str | None = None) -> dict[str, int]:
     """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
 
     顺序是治本要害(RUN18 实证：两 pass 互撤 → 0 交付)，做成单一函数杜绝调用点各写一份导致漂移：
@@ -1042,7 +1049,7 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None) -> d
     return {
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
-        "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path)),
+        "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),
         "difficulty_bumped": bump_scaffold_difficulty(plan),
     }
 

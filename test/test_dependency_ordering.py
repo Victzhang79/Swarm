@@ -195,7 +195,7 @@ def _elaborate_passes(plan, *, fix_dep_first, aggregate_root_pom):
     import swarm.brain.contract_utils as cu
     orig = cu._exists_in_repo
     if aggregate_root_pom:
-        cu._exists_in_repo = lambda pp, rel, cache: rel == "pom.xml"
+        cu._exists_in_repo = lambda pp, rel, cache, base_ref=None: rel == "pom.xml"
     try:
         dedupe_module_scaffolds(plan)
         if fix_dep_first:

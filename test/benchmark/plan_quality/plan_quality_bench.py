@@ -97,7 +97,7 @@ def run_fixture(entry: dict) -> FixtureResult:
     agg = set(entry.get("aggregate_files") or [])
     orig = cu._exists_in_repo
     if agg:
-        cu._exists_in_repo = lambda pp, rel, cache, _a=agg: rel in _a
+        cu._exists_in_repo = lambda pp, rel, cache, base_ref=None, _a=agg: rel in _a
     try:
         counts = cu.resolve_plan_conflicts(plan, project_path="/fixture/repo" if agg else None)
     finally:

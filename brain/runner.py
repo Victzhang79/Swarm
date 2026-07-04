@@ -586,8 +586,11 @@ async def _has_pending_checkpoint(task_id: str) -> bool:
         )
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[RECONCILE] checkpoint 探测失败 task=%s: %s", task_id, exc)
-        return False
+        # ★B6 复核 #6★：探测【本身失败】(PG 瞬时抖动/连接超时) ≠ "无 checkpoint"。原返 False 会让
+        # 对账把所有 CONFIRMING/DELIVERING 挂起任务批量误杀 FAILED。区分：探测失败 → 保守【保留】
+        # (返 True,不 kill;待 PG 恢复后仍可 resume)；只有探测成功但快照确不存在(下方 None)才判死。
+        logger.warning("[RECONCILE] checkpoint 探测失败(非「无快照」，保留任务待恢复) task=%s: %s", task_id, exc)
+        return True
     if snapshot is None:
         return False
     # 有 next（待执行节点）或有 interrupt 载荷 → 仍是可续跑的挂起点。
@@ -1439,6 +1442,8 @@ async def retry_task(task_id: str, auto_accept: bool | None = None) -> bool:
         completed_subtasks=0,
         human_decision="",
         thread_id=new_thread_id,
+        base_commit="",  # ★B6 复核 #5★：retry=全新 thread/清空 plan → 清 base_commit 令 run_task
+                         # 重捕获【当前仓库 HEAD】为新基线（retry 语义=对最新仓库重跑，非沿用旧 birth base）。
     )
 
     await run_task(

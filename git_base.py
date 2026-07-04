@@ -95,6 +95,33 @@ def files_changed_since_base(
     return [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
 
 
+def uncommitted_changed_files(project_path: str | None, files: list[str] | None) -> list[str]:
+    """交付涉及文件里，哪些有【未提交】的本地改动（工作区/暂存区脏，HEAD 未动也算）。
+
+    ★B6 复核 #3★：worktree_diverged_from_base 只比 HEAD SHA，漏了"用户改了但没 commit"的场景——
+    _reset_worktree_to_head 的 `checkout base -- file` 会静默抹掉这些未提交编辑。用 git status
+    --porcelain 探测,供交付前 loud 告警(不再给"偏移已可观测"的错觉)。空/非 git → []。只读。
+    """
+    if not project_path or not files:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_path), "status", "--porcelain", "--", *files],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    dirty: list[str] = []
+    for ln in (proc.stdout or "").splitlines():
+        # porcelain 行格式: "XY <path>"（XY 为状态码）。取路径段。
+        path = ln[3:].strip() if len(ln) > 3 else ""
+        if path:
+            dirty.append(path)
+    return dirty
+
+
 def base_ref_exists(project_path: str | None, base_commit: str | None) -> bool:
     """探测钉扎的 base commit 在仓库里仍可达（未被 GC / reset --hard 删除）。
 

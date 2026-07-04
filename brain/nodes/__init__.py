@@ -3724,12 +3724,19 @@ async def _deliver_merged_diff_serialized(
     等待中的同项目交付让出事件循环，不占 to_thread 线程池槽（否则 N 个同项目交付各占一个
     blocked 在 fcntl.flock 的池槽 → 池耗尽 → pull-back/沙箱上传等其它 to_thread 饿死，
     比拆 4 段前更糟）。锁内单次 to_thread 拉起同步交付；内层 _ProjectGitFlock 仍作【跨进程】
-    兜底（多 leader 降级场景）。get/set 间无 await → 同一事件循环步内原子，不会各持不同锁。"""
+    兜底（多 leader 降级场景）。get/set 间无 await → 同一事件循环步内原子，不会各持不同锁。
+
+    ★B6 复核 #1★：字典键规范化（resolve）——与 _ProjectGitFlock 同源，否则同项目不同拼法的
+    proj_path 落不同 asyncio 锁，进程内串行化也分裂。"""
     import asyncio as _a
-    lock = _project_delivery_locks.get(proj_path)
+    try:
+        _key = str(Path(proj_path).resolve())
+    except Exception:  # noqa: BLE001
+        _key = str(proj_path)
+    lock = _project_delivery_locks.get(_key)
     if lock is None:
         lock = _a.Lock()
-        _project_delivery_locks[proj_path] = lock
+        _project_delivery_locks[_key] = lock
     async with lock:
         return await _a.to_thread(
             _deliver_merged_diff_locked, proj_path, merged_diff, base_commit, out_files, task_id)
@@ -3806,9 +3813,12 @@ async def learn_success(state: BrainState) -> dict:
                 if _base_commit:
                     try:
                         from swarm.git_base import (
+                            base_ref_exists,
                             files_changed_since_base,
+                            uncommitted_changed_files,
                             worktree_diverged_from_base,
                         )
+                        # ① 已提交偏移：HEAD≠base 且交付文件在 base..HEAD 被中途 commit → reset 覆盖其改动。
                         _diverged, _head = worktree_diverged_from_base(proj_path, _base_commit)
                         if _diverged:
                             _victims = files_changed_since_base(proj_path, _base_commit, out_files)
@@ -3829,6 +3839,31 @@ async def learn_success(state: BrainState) -> dict:
                                     )
                                 except Exception:  # noqa: BLE001
                                     pass
+                        # ② ★B6 #3★ 未提交脏改：HEAD 未动也可能有用户未 commit 的编辑，reset 会静默抹掉。
+                        # 先前只比 SHA 漏了此类；此处补探 git status --porcelain 并 loud 告警(非静默)。
+                        _dirty = uncommitted_changed_files(proj_path, out_files)
+                        if _dirty:
+                            logger.warning(
+                                "[LEARN_SUCCESS] ⚠️交付文件有【未提交】本地改动，reset 到 base 将丢弃它们，"
+                                "请人工对账/先 commit: %s", _dirty[:20],
+                            )
+                            try:
+                                audit("delivery_uncommitted_overwrite", orchestrator="Brain",
+                                      task_id=state.get("task_id"), dirty_files=_dirty[:50])
+                            except Exception:  # noqa: BLE001
+                                pass
+                        # ③ ★B6 #4★ 钉扎 base 不可达(GC/历史重写)：merged_diff 相对旧 base 生成,apply 必失败,
+                        # 交付基线已损。loud 告警 + audit,让运维知晓本次交付基线可疑(非静默假成功)。
+                        if _base_commit != "HEAD" and not base_ref_exists(proj_path, _base_commit):
+                            logger.warning(
+                                "[LEARN_SUCCESS] ⚠️钉扎 base %s 不可达(GC/历史重写)，merged_diff 相对旧 base "
+                                "生成 → 交付 apply 可能失败/不完整，请核验交付物", _base_commit[:12],
+                            )
+                            try:
+                                audit("delivery_base_unreachable", orchestrator="Brain",
+                                      task_id=state.get("task_id"), base_commit=_base_commit[:12])
+                            except Exception:  # noqa: BLE001
+                                pass
                     except Exception as _dvexc:  # noqa: BLE001
                         logger.debug("[LEARN_SUCCESS] 基线偏移检测跳过(非致命): %s", _dvexc)
 
