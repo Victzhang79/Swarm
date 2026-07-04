@@ -58,3 +58,9 @@ docs/archive/
 /PROJECT_STATUS.md
 /TECH_DEBT.md
 /WALKTHROUGH_REPORT.md
+
+# ─── 内部设计文档树（不上云端；保留 docs/TEAM_TRIAL.md 对外）──
+docs/*.md
+docs/**/*.md
+!docs/TEAM_TRIAL.md
+cube-templates/NODE_ENVD_FIX.md
