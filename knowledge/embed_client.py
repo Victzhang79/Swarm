@@ -31,12 +31,20 @@ def _endpoint() -> tuple[str, str, str, int] | None:
 
 
 def _record_embed_usage(model: str, base: str, batch: list[str], usage: dict | None) -> None:
-    """B3：embed 一批的 token 记账——优先响应真实 usage.prompt_tokens，否则 len//4 估算。"""
-    pt = int((usage or {}).get("prompt_tokens") or 0) or (sum(len(t or "") for t in batch) // 4)
-    if pt <= 0:
-        return
-    from swarm.models import usage_tracker
-    usage_tracker.record_embed(model, base, pt, op="embed")
+    """B3：embed 一批的 token 记账——优先响应真实 usage.prompt_tokens，否则 len//4 估算。
+
+    ★复核 SF-1 修正：整体 try/except——本函数在 embed_texts_* 的外层 try 内被调用，若这里抛
+    (如 usage.prompt_tokens 为 float 触发 int() ValueError)，异常会被外层 `except: return None`
+    捕获 → 丢弃【已成功计算的 embeddings】致检索静默降级。记账失败绝不能拖垮 embed 主结果。
+    """
+    try:
+        pt = int(float((usage or {}).get("prompt_tokens") or 0)) or (sum(len(t or "") for t in batch) // 4)
+        if pt <= 0:
+            return
+        from swarm.models import usage_tracker
+        usage_tracker.record_embed(model, base, pt, op="embed")
+    except Exception:  # noqa: BLE001 — 记账 best-effort，永不影响 embed 主结果
+        pass
 
 
 def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:

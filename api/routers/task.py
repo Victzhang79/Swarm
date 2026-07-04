@@ -46,7 +46,13 @@ def _stream_reauthorized(request, task, perm: str) -> bool:
         from swarm.auth.store import user_can_on_project
         user = _ru(request)  # 重读 token：get_user_by_token 过滤 token_revoked/expired
         return bool(task) and user_can_on_project(user, perm, (task or {}).get("project_id"))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # 复核 SF-2：DB 瞬时抖动也进这里——记 warning 便于区分【真实吊销】vs【基础设施噪声】，
+        # 仍 fail-closed 断流(SSE 客户端会自动重连，重连时在连接口重新鉴权，安全)。
+        try:
+            _app.logger.warning("[stream] 连接后重鉴权异常(疑 DB 瞬时)，按失权断流: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
 

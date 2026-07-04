@@ -82,8 +82,8 @@ def test_apply_local_deletions_unlinks_when_worker_deleted(tmp_path):
     target = tmp_path / "com" / "x" / "Old.java"
     target.parent.mkdir(parents=True)
     target.write_text("legacy")
-    # 沙箱文件集不含该文件 → worker 已删
-    deleted = ex._apply_local_deletions(tmp_path, sandbox_files=set())
+    # 逐文件探测：沙箱里已无 → worker 已删
+    deleted = ex._apply_local_deletions(tmp_path, exists_in_sandbox=lambda rel: False)
     assert not target.exists(), "worker 删掉的文件应在本地 unlink"
     assert "com/x/Old.java" in deleted
 
@@ -95,8 +95,35 @@ def test_apply_local_deletions_keeps_when_worker_did_not_delete(tmp_path):
     target = tmp_path / "com" / "x" / "Old.java"
     target.parent.mkdir(parents=True)
     target.write_text("legacy")
-    deleted = ex._apply_local_deletions(tmp_path, sandbox_files={"com/x/Old.java"})
+    deleted = ex._apply_local_deletions(tmp_path, exists_in_sandbox=lambda rel: True)
     assert target.exists(), "worker 未删的文件不应被本地误删"
+    assert deleted == []
+
+
+def test_apply_local_deletions_per_file_probe_not_truncated(tmp_path):
+    """★复核 CR-2 回归：即便沙箱有海量文件，探测是【逐文件】的——仍在的文件(probe True)绝不误删。
+    模拟"该 delete 文件其实还在沙箱(位次可能 >200)"：probe 返回 True → 保留，不因截断误删。"""
+    scope = FileScope(delete_files=["com/x/StillThere.java"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    target = tmp_path / "com" / "x" / "StillThere.java"
+    target.parent.mkdir(parents=True)
+    target.write_text("still here")
+    # 逐文件精确探测该文件仍在（worker 没删它）→ 必须保留
+    deleted = ex._apply_local_deletions(tmp_path, exists_in_sandbox=lambda rel: rel == "com/x/StillThere.java")
+    assert target.exists(), "沙箱里仍在的文件（逐文件探测 True）绝不能被误删（CR-2 数据丢失回归）"
+    assert deleted == []
+
+
+def test_apply_local_deletions_rejects_path_traversal(tmp_path):
+    """★复核 CR-4 回归：delete_files 含 `..` 越界路径 → 拒删（unlink 不可逆，不得越出项目根）。"""
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not delete me")
+    scope = FileScope(delete_files=["../outside.txt"])
+    ex = _mk_executor(scope, project_path=str(project))
+    deleted = ex._apply_local_deletions(project, exists_in_sandbox=lambda rel: False)
+    assert outside.exists(), "越界 `..` 路径必须拒删（不得 unlink 项目根外文件）"
     assert deleted == []
 
 

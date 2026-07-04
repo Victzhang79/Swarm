@@ -1477,31 +1477,64 @@ class WorkerExecutor:
                 out.append(rel)
         return out
 
-    def _apply_local_deletions(self, local_root: Path, sandbox_files: set[str]) -> list[str]:
+    def _apply_local_deletions(self, local_root: Path, exists_in_sandbox) -> list[str]:
         """A1 治本：把 worker 在沙箱里执行的删除【传播到本地工作树】。
 
-        delete_files 不在 _writable_files（不上传/不拉回），历史上也无任何机制把删除
-        落到本地 → git diff 永远看不到删除 → 交付漏删 + 纯删除子任务恒空 diff 假绿。
-        判据（纯函数化，便于测试）：scope 声明要删的文件，若【沙箱工作区里已不存在】
-        （worker 真删了）且【本地仍存在】→ 本地同步 unlink，使后续 git diff 如实显示删除。
-        沙箱里仍在 = worker 没删 → 保留本地（diff 空）→ 上游 expects_changes 判未完成。
-        fail-closed：只删【scope 明确声明 delete_files】且【沙箱已无】的文件，绝不误删他物。
+        delete_files 不在 _writable_files（不上传/不拉回），历史上无任何机制把删除落到本地 →
+        git diff 永远看不到删除 → 交付漏删 + 纯删除子任务恒空 diff 假绿。判据：scope 声明要删的
+        文件，若【沙箱里已不存在】(worker 真删了)且【本地仍存在】→ 本地 unlink，使 git diff 如实
+        显示删除；沙箱里仍在 = worker 没删 → 保留本地(diff 空)→ 上游 expects_changes 判未完成。
+
+        exists_in_sandbox(rel)->bool 是【逐文件精确探测】(见 _sandbox_file_exists 的 test -f)。
+        ★复核 CR-2 修正：绝不用 head-200 截断的全量列举比对——否则沙箱 >200 文件时位次 201+ 的
+          文件虽仍在却被判"已删"→ 误 unlink 数据丢失(RuoYi 数百文件必触发)。
+        ★复核 CR-4 修正：unlink 前强制 containment 到 local_root，`..` 越界路径拒删(unlink 不可逆)。
+        探测失败保守视为"仍在"(不删)——删除是不可逆方向，宁可漏删触发重试，绝不误删。
         """
         deleted: list[str] = []
         scope = self.effective_scope
+        root_resolved = local_root.resolve()
         for f in (getattr(scope, "delete_files", []) or []):
             rel = self._norm_rel(local_root, f)
-            if not rel or rel in sandbox_files:
+            if not rel:
+                continue
+            lp = local_root / rel
+            # CR-4：containment——解析后必须在 local_root 内，杜绝 `../x` 越界 unlink。
+            try:
+                resolved = lp.resolve()
+            except OSError:
+                continue
+            if resolved != root_resolved and root_resolved not in resolved.parents:
+                self._log(f"删除路径越界（不在项目根内），拒删: {rel}")
+                continue
+            if exists_in_sandbox(rel):
                 continue  # 沙箱里还在 → worker 没删 → 保留本地
-            lp = (local_root / rel)
             try:
                 if lp.is_file():
                     lp.unlink()
                     self._deleted_local_paths.add(rel)
                     deleted.append(rel)
             except OSError as exc:
-                self._log(f"删除传播失败 {rel}（非致命，保留本地）: {exc}")
+                logger.warning(
+                    "删除传播失败 %s（保留本地，需核查权限/占用）: %s", rel, exc, exc_info=True)
         return deleted
+
+    def _sandbox_file_exists(self, rel: str) -> bool:
+        """A1(复核 CR-2)：逐文件精确探测沙箱是否仍有该文件(test -f)，替代 head-200 截断全量列举。
+        无沙箱/探测失败 → 保守返回 True(视为仍在→不删)，绝不因抖动/截断误删本地文件。"""
+        if not self._sandbox or not self._sandbox_manager:
+            return True
+        rc = getattr(self._sandbox_manager, "run_command", None)
+        if rc is None:
+            return True
+        remote = get_config().sandbox.sandbox_remote_workdir
+        safe = str(rel).replace("'", "").replace("\n", "")
+        try:
+            result = rc(self._sandbox,
+                        f"test -f '{remote}/{safe}' && echo __Y__ || echo __N__", timeout=15)
+            return "__Y__" in (getattr(result, "stdout", "") or "")
+        except Exception:  # noqa: BLE001
+            return True  # 探测失败 → 保守不删
 
     @staticmethod
     def _norm_rel(local_root: Path, f: str) -> str:
@@ -1905,14 +1938,15 @@ class WorkerExecutor:
             except Exception as _hexc:  # noqa: BLE001
                 self._log(f"{reason} H-exec1 枚举沙箱新增文件失败(非致命): {_hexc}")
         # A1：删除传播——必须在 rel_files 空的 early-return 之前，纯删除 scope 才不被跳过。
+        # 复核 CR-2 修正：逐文件 test -f 精确探测(不再 head-200 截断全量列举比对，杜绝误删)。
         if getattr(self.effective_scope, "delete_files", []):
             try:
-                _sb_files = set(await asyncio.to_thread(self._list_sandbox_workspace_files))
-                _deleted = self._apply_local_deletions(local_root, _sb_files)
+                _deleted = await asyncio.to_thread(
+                    self._apply_local_deletions, local_root, self._sandbox_file_exists)
                 if _deleted:
                     self._log(f"{reason} 删除传播：worker 已在沙箱删除 → 本地同步删除 {_deleted}")
             except Exception as _dexc:  # noqa: BLE001
-                self._log(f"{reason} 删除传播枚举失败（非致命）: {_dexc}")
+                self._log(f"{reason} 删除传播失败（非致命）: {_dexc}")
         if not rel_files:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return

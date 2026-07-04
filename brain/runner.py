@@ -1094,6 +1094,14 @@ async def resume_task(
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # 复核 CR-1：resume 也经 _stream_brain_events→set_current_task，必须同样清理 per-task
+        # token 归属+累计（否则 resume 后计数残留、retry 时被 max(真实,估算) 误判超限 + 内存泄漏）。
+        try:
+            from swarm.models import usage_tracker as _ut
+            _ut.set_current_task(None)
+            _ut.clear_task_total(task_id)
+        except Exception:
+            pass
         # P1-B：兜底释放本任务沙箱（如 revise-resume 再派发过 worker）——墙钟/异常中止时不泄漏。
         try:
             from swarm.worker.sandbox import get_sandbox_manager
@@ -1184,6 +1192,13 @@ async def resume_planning(
     finally:
         module_lock.release()
         _task_running.discard(task_id)
+        # 复核 CR-1：规划 resume 同样 set_current_task，需清理 per-task token 归属+累计。
+        try:
+            from swarm.models import usage_tracker as _ut
+            _ut.set_current_task(None)
+            _ut.clear_task_total(task_id)
+        except Exception:
+            pass
         # P1-B：兜底释放本任务沙箱（规划恢复若再派发过 worker）——墙钟/异常中止时不泄漏。
         try:
             from swarm.worker.sandbox import get_sandbox_manager

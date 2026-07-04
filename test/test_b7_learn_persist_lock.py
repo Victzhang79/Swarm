@@ -64,6 +64,8 @@ def test_concurrent_same_key_learn_dedups_to_one_write():
         return {"summary": "SAME-SUMMARY", "lessons_learned": "", "metadata": {}}
 
     async def _run():
+        # _persist_lock 绑定首个使用它的事件循环；测试各自 asyncio.run 是新循环，故重绑当前循环。
+        learn_store._persist_lock = asyncio.Lock()
         with patch.object(learn_store, "MemoryStore", _FakeStore), \
              patch.object(learn_store, "build_mistake_payload", _fake_mistake), \
              patch.object(learn_store, "build_l2_summary", _fake_l2):

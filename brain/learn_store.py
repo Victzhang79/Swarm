@@ -119,11 +119,13 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
 
     idem_key = _idempotency_key(task_id, _outcome, l2["summary"])
 
-    store = MemoryStore()
-    await store.connect()
-    # B7：整个"检查幂等 → 写入(含 reinforce 读改写)"临界区在进程级锁内串行，原子闭合 TOCTOU/竞态。
+    # B7 + 复核 CR-3：先 acquire 再【在 try 内】建连接——cancel 若发生在 acquire 等待期，try 未
+    # 进入、连接未建，无泄漏；acquire 成功后无 await 直接进 try，finally 保证 release + close。
+    # 临界区(检查幂等 → 写入含 reinforce)在进程级锁内串行，原子闭合 TOCTOU/竞态。
     await _persist_lock.acquire()
     try:
+        store = MemoryStore()
+        await store.connect()
         # WS4 幂等：learn 重放(成功后重试)若已落过同键 → 跳过，避免二次写 L2 + 二次 reuse_count++。
         if await _already_persisted(store, project_id, idem_key):
             logger.info("[LEARN_STORE] 幂等命中(重放)，跳过成功落库 key=%s", idem_key)
@@ -216,11 +218,13 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
 
     idem_key = _idempotency_key(task_id, "failure", l2["summary"])
 
-    store = MemoryStore()
-    await store.connect()
-    # B7：整个"检查幂等 → 写入(含 reinforce 读改写)"临界区在进程级锁内串行，原子闭合 TOCTOU/竞态。
+    # B7 + 复核 CR-3：先 acquire 再【在 try 内】建连接——cancel 若发生在 acquire 等待期，try 未
+    # 进入、连接未建，无泄漏；acquire 成功后无 await 直接进 try，finally 保证 release + close。
+    # 临界区(检查幂等 → 写入含 reinforce)在进程级锁内串行，原子闭合 TOCTOU/竞态。
     await _persist_lock.acquire()
     try:
+        store = MemoryStore()
+        await store.connect()
         # WS4 幂等：learn 重放若已落过同键 → 跳过，避免二次写 L5 + 二次 occurrence_count++。
         if await _already_persisted(store, project_id, idem_key):
             logger.info("[LEARN_STORE] 幂等命中(重放)，跳过错题落库 key=%s", idem_key)
