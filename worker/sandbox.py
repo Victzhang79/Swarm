@@ -1271,7 +1271,13 @@ print(json.dumps(files))
             rel_posix = Path(rel).as_posix().lstrip("/")
             if not rel_posix:
                 continue
-            remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
+            # 复核 R23-3 治本：远端路径与上传(sync_files_to_sandbox)对称，走 sandbox_path 归一化 +
+            # containment——防 `..` 在【本地 relative_to 校验之前】就从沙箱读到 workspace 外文件。
+            try:
+                remote_path = sandbox_path(rel_posix, remote_root or "/workspace")
+            except ValueError as _ve:
+                stats["errors"].append(f"{rel_posix}: 远端路径越界，跳过 ({_ve})")
+                continue
             try:
                 data = read_file_from_sandbox(sandbox, remote_path, manager=self)
                 if isinstance(data, str):

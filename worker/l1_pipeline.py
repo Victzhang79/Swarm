@@ -1161,6 +1161,16 @@ def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tupl
         return ec, out + (f"\n{cr.error}" if cr.error else "")
 
     # 本地兜底
+    # 复核 R23-3 治本：本地兜底在【宿主机 shell】跑 Brain 下发命令，必须过命令黑名单(与
+    # build_tools._run_local 对称)，否则沙箱降级/ContextVar 丢失时隔离边界消失。黑名单本身
+    # fail-closed 回退内置基线；此处不可用/被拦 → 直接判失败(126)，不裸跑到宿主机。
+    try:
+        from swarm.config import command_blacklist_store
+        _allowed, _reason = command_blacklist_store.check_command_hardened(command)
+    except Exception as _bexc:  # noqa: BLE001
+        return 126, f"命令黑名单校验失败，本地兜底拒绝执行(fail-closed): {_bexc}"
+    if not _allowed:
+        return 126, f"命令被黑名单拦截(本地兜底不放行): {_reason}"
     try:
         proc = subprocess.run(
             _normalize_python_cmd(command), cwd=project_path, shell=True,
