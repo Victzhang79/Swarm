@@ -18,11 +18,14 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
      到 nodes/shared.py（干净 sink），抽出模块只依赖 shared。
 
 已识别的内聚簇（建议拆出顺序，风险从低到高）：
-  A. 恢复/阻断分析簇（纯路径分析，近乎无状态）：_producers_of / _package_in_baseline /
-     _blocked_pkg_unrecoverable / _is_missing_dependency_failure。**协迁依赖**：_det_of、
-     常量 _INTERNAL_BLOCKED_KINDS（与该簇一起下沉 shared 或同迁新模块）。→ brain/nodes/recovery.py
-  B. pom/模块脚手架簇（就地改 plan）：_grant_module_pom_writable /
-     _widen_scope_for_compile_repair / _local_tree_revert_subtask。依赖 FileScope 与 plan 结构。
+  A. ✅[已拆] 恢复/阻断分析簇 → brain/nodes/recovery.py（_producers_of / _package_in_baseline /
+     _blocked_pkg_unrecoverable / _is_missing_dependency_failure + _det_of / _INTERNAL_BLOCKED_KINDS）。
+  B-1. ✅[已拆] Maven 缺失依赖补全簇（纯 pom/path，未被 patch）→ brain/nodes/maven_repair.py
+     （_pkg_match_tokens / _extract_missing_pkgs / _iter_project_poms / _find_maven_dep_for_pkg /
+     _inject_dep_into_pom / _inject_missing_maven_deps + 5 个 maven 正则常量）。
+  B-2. [待拆] pom/模块脚手架簇（就地改 plan）：_grant_module_pom_writable /
+     _widen_scope_for_compile_repair / _local_tree_revert_subtask。依赖 FileScope 与 plan 结构，
+     且就地改 plan（更entangled，需先补行为测试锁 plan 变更契约再迁）。
   C. handle_failure 族（~660 行超长函数 + _handle_failure_impl）：先按 strategy 分支抽纯
      决策函数（已部分参数化），再考虑整体迁 brain/nodes/failure.py。
   D. audit/security orchestration（run_security_audit 等）。
@@ -106,6 +109,20 @@ from swarm.brain.nodes.recovery import (  # noqa: E402,F401
     _is_missing_dependency_failure,
     _package_in_baseline,
     _producers_of,
+)
+# god-file 簇B-1：re-export Maven 缺失依赖补全簇（保 swarm.brain.nodes.X 可寻址；未被 patch）
+from swarm.brain.nodes.maven_repair import (  # noqa: E402,F401
+    _ARTIFACT_RE,
+    _DEP_BLOCK_RE,
+    _GROUP_RE,
+    _MAVEN_GENERIC_SEG,
+    _MISSING_PKG_BRAIN_RE,
+    _extract_missing_pkgs,
+    _find_maven_dep_for_pkg,
+    _inject_dep_into_pom,
+    _inject_missing_maven_deps,
+    _iter_project_poms,
+    _pkg_match_tokens,
 )
 from swarm.brain.llm_schemas import (  # noqa: E402
     ComplexityAssessmentResponse,
@@ -1567,115 +1584,6 @@ def _add_dep_safe(by_id: dict, dependent: str, dep: str) -> bool:
 
 
 # ── 治本 A2：缺依赖确定性补全（据项目自身 pom 自证坐标，不靠小模型、不臆造） ──
-# 定向恢复给了失败子任务模块 pom 写权，但小模型仍常不会把缺的依赖加进去（实测 RuoYi st-31：
-# 用 org.quartz 但 ruoyi-alarm/pom.xml 没声明 → 2 次定向恢复耗尽 → 落全量 replan 砸掉 30 个成功）。
-# 这里在【授权后立即】确定性补：从编译错误取缺失包 → 在项目【其它 pom】里找声明了它的 <dependency>
-# 块（项目自己用过=权威坐标）→ 注入失败模块 pom。项目从没用过该包 → 查无、不动（不臆造坐标）。
-_MAVEN_GENERIC_SEG = {"org", "com", "net", "io", "cn", "www", "java", "javax",
-                      "jakarta", "apache", "springframework", "google"}
-_MISSING_PKG_BRAIN_RE = re.compile(
-    r"(?:程序包|package)\s+([\w.]+)\s+(?:不存在|does not exist)", re.I)
-_DEP_BLOCK_RE = re.compile(r"<dependency>([\s\S]*?)</dependency>", re.I)
-_ARTIFACT_RE = re.compile(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", re.I)
-_GROUP_RE = re.compile(r"<groupId>\s*([^<\s]+)\s*</groupId>", re.I)
-
-
-def _pkg_match_tokens(pkg: str) -> list[str]:
-    """从缺失包名提取可匹配 Maven artifactId/groupId 的辨识 token（去通用段、去数字后缀变体）。
-    org.quartz→['quartz']；okhttp3.x→['okhttp3','okhttp']；com.fasterxml.jackson.databind→['fasterxml','jackson','databind']。"""
-    toks: list[str] = []
-    for s in [s for s in pkg.split(".") if s]:
-        if s in _MAVEN_GENERIC_SEG or len(s) <= 2:
-            continue
-        if s not in toks:
-            toks.append(s)
-        st = s.rstrip("0123456789")
-        if st and st != s and st not in toks:
-            toks.append(st)
-    return toks
-
-
-def _extract_missing_pkgs(blob: str) -> list[str]:
-    """从编译错误文本解析缺失包名（确定性）。"""
-    seen: set = set()
-    out: list[str] = []
-    for m in _MISSING_PKG_BRAIN_RE.finditer(blob or ""):
-        p = m.group(1)
-        # 不强求含 "."：okhttp3 这类单段包名也是合法缺失包（实测 st-17）。正则上下文
-        # （程序包 X 不存在）已足够特定，X 必是包名。
-        if p and len(p) >= 3 and p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-def _iter_project_poms(project_path: str, limit: int = 80) -> list:
-    skip = {"target", "node_modules", ".git", "build", "dist", ".gradle", ".idea"}
-    out: list = []
-    try:
-        for p in Path(project_path).rglob("pom.xml"):
-            if any(part in skip for part in p.relative_to(project_path).parts):
-                continue
-            out.append(p)
-            if len(out) >= limit:
-                break
-    except OSError:
-        pass
-    return out
-
-
-def _find_maven_dep_for_pkg(project_path: str, pkg: str, exclude_pom_rel: str) -> str | None:
-    """在项目【其它 pom】找声明了能提供该缺失包的 <dependency> 块（项目自证坐标，不臆造）。
-    辨识 token 命中 artifactId/groupId；多命中取 artifactId 最短（最贴近）。返回 <dependency> 块文本或 None。"""
-    toks = _pkg_match_tokens(pkg)
-    if not toks:
-        return None
-    try:
-        excl = (Path(project_path) / exclude_pom_rel).resolve() if exclude_pom_rel else None
-    except OSError:
-        excl = None
-    cands: list[tuple[int, str]] = []
-    for pom in _iter_project_poms(project_path):
-        try:
-            if excl and pom.resolve() == excl:
-                continue
-            text = pom.read_text("utf-8", errors="ignore")
-        except OSError:
-            continue
-        for m in _DEP_BLOCK_RE.finditer(text):
-            block = m.group(0)
-            aid = _ARTIFACT_RE.search(block)
-            gid = _GROUP_RE.search(block)
-            hay = f"{gid.group(1) if gid else ''} {aid.group(1) if aid else ''}".lower()
-            if aid and any(t.lower() in hay for t in toks):
-                cands.append((len(aid.group(1)), block.strip()))
-    if not cands:
-        return None
-    cands.sort(key=lambda x: x[0])
-    return cands[0][1]
-
-
-def _inject_dep_into_pom(pom_path: Path, dep_block: str) -> bool:
-    """把 <dependency> 块注入 pom 最后一个 <dependencies>（模块项目级，通常在 dependencyManagement 之后）。
-    已声明同 artifactId 则跳过。无 <dependencies> 段则保守不动（不新建段，免破坏结构）。返回是否改动。"""
-    try:
-        text = pom_path.read_text("utf-8", errors="ignore")
-    except OSError:
-        return False
-    aid_m = _ARTIFACT_RE.search(dep_block)
-    if aid_m and re.search(r"<artifactId>\s*" + re.escape(aid_m.group(1)) + r"\s*</artifactId>", text):
-        return False
-    idx = text.rfind("</dependencies>")
-    if idx == -1:
-        return False
-    inject = "        " + dep_block.strip() + "\n    "
-    try:
-        pom_path.write_text(text[:idx] + inject + text[idx:], encoding="utf-8")
-        return True
-    except OSError:
-        return False
-
-
 def _proj_path_from_state(state) -> str | None:
     pid = state.get("project_id") if isinstance(state, dict) else None
     if not pid:
@@ -1686,39 +1594,6 @@ def _proj_path_from_state(state) -> str | None:
         return proj.get("path") if proj else None
     except Exception:  # noqa: BLE001
         return None
-
-
-def _inject_missing_maven_deps(project_path: str | None, granted: dict, subtask_results: dict) -> dict:
-    """治本 A2：授权后据项目自身 pom 把缺失包对应的 <dependency> 直接补进失败模块 pom。
-    返回 {sid: [已补 artifactId]}。让重派的 worker 直接编过，不再耗尽定向恢复配额→不触发全量 replan。"""
-    if not project_path:
-        return {}
-    injected: dict = {}
-    for sid, mod_pom in (granted or {}).items():
-        out = (subtask_results or {}).get(sid)
-        if isinstance(out, WorkerOutput):
-            det = out.l1_details or {}
-        elif isinstance(out, dict):
-            det = out.get("l1_details", {}) or {}
-        else:
-            det = {}
-        blob = det.get("build_output") if isinstance(det.get("build_output"), str) else ""
-        if not blob:
-            try:
-                blob = json.dumps(det, ensure_ascii=False)
-            except (TypeError, ValueError):
-                blob = str(det)
-        added: list = []
-        for pkg in _extract_missing_pkgs(blob):
-            dep = _find_maven_dep_for_pkg(project_path, pkg, mod_pom)
-            if not dep:
-                continue
-            if _inject_dep_into_pom(Path(project_path) / mod_pom, dep):
-                a = _ARTIFACT_RE.search(dep)
-                added.append(a.group(1) if a else pkg)
-        if added:
-            injected[sid] = added
-    return injected
 
 
 def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
