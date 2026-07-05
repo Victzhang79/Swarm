@@ -37,9 +37,9 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
      (_proj_path_from_state/_generate_compile_stub) 在 planning_core 命名空间解析——patch 目标已迁
      planning_core（见 test_ladder_giveup_preserve_build）。
   D. ✅[已拆] AUDIT 安全审计节点（叶，未被 patch）→ brain/nodes/audit.py（_run_security_audit）。
-  C. handle_failure 族（~660 行超长函数 + _handle_failure_impl，仍在本 __init__）：调用点已经
-     planning_core re-export 绑定解析；后续可按 strategy 分支抽纯决策函数，再考虑整体迁
-     brain/nodes/failure.py（届时注意与 planning_core 的调用方向）。
+  C. ✅[已拆·round26] handle_failure 族 → brain/nodes/failure.py：_handle_failure_impl（~660 行）
+     + _l1_details_of 已外置；薄包装 handle_failure 仍留本 __init__（round24 A4 plan 持久化 seam），
+     其 bare 调用 + patch("swarm.brain.nodes._handle_failure_impl") 经底部 re-export 解析保可寻址。
   后续候选：把 dispatch/verify/audit/planning_core 之外的其余节点助手按【叶簇优先】继续下沉。
 每簇拆前先补【行为测试】锁外部契约（禁 inspect.getsource 结构焊死），再迁移。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
