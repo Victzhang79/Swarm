@@ -340,24 +340,11 @@ async def update_config(request: Request):
         os.environ[k] = v
     _app.logger.info(f"Updated .env + os.environ with keys: {list(update_map.keys())}")
 
-    # 重新加载配置（生产安全门禁在此重跑；违规 → RuntimeError → 回滚并 400）
-    try:
-        _app.reload_config()
-    except RuntimeError as exc:
-        for _k, _prev in _prev_env.items():
-            if _prev is None:
-                os.environ.pop(_k, None)
-            else:
-                os.environ[_k] = _prev
-        if _prev_content is None:
-            try:
-                env_path.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            atomic_write_env(env_path, _prev_content)
-        _app.logger.warning("配置变更被生产安全门禁拒绝，已回滚 .env + os.environ: %s", exc)
-        raise HTTPException(status_code=400, detail=f"配置变更被生产安全门禁拒绝，已回滚：{exc}") from exc
+    # 重新加载配置（D3：失败回滚 .env + os.environ，与 PUT /api/routing、_persist_env_updates
+    # 同源）。原内联块只挡 RuntimeError 且 400 detail 泄漏原始 {exc}——非门禁失败（如畸形 env
+    # 致 pydantic ValidationError）不回滚、留脏 .env+os.environ。_reload_with_rollback 广捕
+    # Exception + 泛化文案不泄漏 exc + 门禁 400／其余 500。
+    _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
     _app.configure_langsmith(reload=True)
     try:
         from swarm.worker.sandbox import reset_sandbox_manager
