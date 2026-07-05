@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time as _time
@@ -285,8 +286,8 @@ def _attempt_maven_version_repair(
         for pom in poms:
             # 只在含 'version' 的标签行替换 >bad<→>good<，避免误改同值的非版本标签
             scmd = (
-                f"sed -i.bak -E '/[Vv]ersion>/ s#>{bv}<#>{good_ver}<#g' '{pom}' "
-                f"&& rm -f '{pom}.bak'"
+                f"sed -i.bak -E '/[Vv]ersion>/ s#>{bv}<#>{good_ver}<#g' {shlex.quote(pom)} "
+                f"&& rm -f {shlex.quote(pom + '.bak')}"
             )
             ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
             if ec2 == 0:
@@ -312,7 +313,7 @@ def _attempt_maven_version_repair(
             # 只在【无 dependencyManagement 的模块 pom】注入：父 pom 的受管块本就带版本，
             # 误插会造双 version。模块 pom 里该 artifactId 唯一，插在其后安全。
             _gc, gmgmt, _ge = _run_check_split(
-                f"grep -c '<dependencyManagement>' '{pom}'", project_path, timeout=10
+                f"grep -c '<dependencyManagement>' {shlex.quote(pom)}", project_path, timeout=10
             )
             if (gmgmt or "").strip() not in ("", "0"):
                 continue
@@ -321,7 +322,7 @@ def _attempt_maven_version_repair(
             scmd = (
                 f"perl -i.bak -pe "
                 f"'s#(<artifactId>\\Q{artifact}\\E</artifactId>)#$1\\n            "
-                f"<version>{good_ver}</version>#' '{pom}' && rm -f '{pom}.bak'"
+                f"<version>{good_ver}</version>#' {shlex.quote(pom)} && rm -f {shlex.quote(pom + '.bak')}"
             )
             ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
             if ec2 == 0:
@@ -452,7 +453,7 @@ def _module_pom_for_file(project_path: str, rel_file: str, timeout: int) -> str 
 
 def _pom_declares_artifact(project_path: str, pom: str, artifact: str, timeout: int) -> bool:
     """module pom 是否已声明该 artifactId（避免重复注入）。"""
-    cmd = f"grep -c '<artifactId>{re.escape(artifact)}</artifactId>' '{pom}' 2>/dev/null"
+    cmd = f"grep -c '<artifactId>{re.escape(artifact)}</artifactId>' {shlex.quote(pom)} 2>/dev/null"
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 10))
     return (out or "").strip() not in ("", "0")
 
@@ -519,9 +520,9 @@ def _inject_dependency(
     )
     # 贪婪匹配到最后一个 </dependencies>，在其前插入；无 </dependencies> 则不改（返回非0→跳过）
     cmd = (
-        f"grep -q '</dependencies>' '{pom}' && perl -0777 -i.bak -pe "
-        f"'s#(.*)</dependencies>#$1    {block}\\n    </dependencies>#s' '{pom}' "
-        f"&& rm -f '{pom}.bak'"
+        f"grep -q '</dependencies>' {shlex.quote(pom)} && perl -0777 -i.bak -pe "
+        f"'s#(.*)</dependencies>#$1    {block}\\n    </dependencies>#s' {shlex.quote(pom)} "
+        f"&& rm -f {shlex.quote(pom + '.bak')}"
     )
     ec, _o = _run_l1_command(cmd, project_path, timeout=min(timeout, 20))
     return ec == 0
@@ -662,7 +663,7 @@ def _repair_go(project_path: str, go_files: list[str], timeout: int) -> tuple[in
     if not go_files:
         return 0, []
     touched = list(go_files[:50])
-    files = " ".join(f"'{f}'" for f in touched)
+    files = " ".join(shlex.quote(f) for f in touched)
     ec, out = _run_l1_command(f"goimports -w {files}", project_path, timeout=min(timeout, 120))
     if ec != 0 and _tool_missing(out):
         logger.info("[L1.2.1·repair] goimports 不可用，跳过 Go import 修复")
@@ -717,7 +718,7 @@ def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> tuple[in
     if not ts_files:
         return 0, []
     touched = list(ts_files[:60])
-    files = " ".join(f"'{f}'" for f in touched)
+    files = " ".join(shlex.quote(f) for f in touched)
     # --no-install：只用项目本地 eslint，绝不联网装；缺失则报错→识别为工具缺失跳过
     ec, out = _run_l1_command(
         f"npx --no-install eslint --fix {files} 2>&1", project_path, timeout=min(timeout, 180)
@@ -827,8 +828,8 @@ def _attempt_symbol_repair(
         if len(top) != 1:
             continue  # 歧义近邻，不赌
         good = top[0]
-        scmd = (f"perl -i.bak -pe 's#\\b{re.escape(name)}\\b#{good}#g' '{rel}' "
-                f"&& rm -f '{rel}.bak'")
+        scmd = (f"perl -i.bak -pe 's#\\b{re.escape(name)}\\b#{good}#g' {shlex.quote(rel)} "
+                f"&& rm -f {shlex.quote(rel + '.bak')}")
         ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
         if ec2 == 0:
             changed.add(rel)
@@ -984,7 +985,7 @@ def _attempt_internal_import_drift_repair(
     changed: set[str] = set()
     for rel, old, new in rewrites:
         scmd = (
-            f"perl -i.bak -pe 's#\\Q{old}\\E\\b#{new}#g' '{rel}' && rm -f '{rel}.bak'"
+            f"perl -i.bak -pe 's#\\Q{old}\\E\\b#{new}#g' {shlex.quote(rel)} && rm -f {shlex.quote(rel + '.bak')}"
         )
         ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
         if ec2 == 0:
@@ -1274,9 +1275,22 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
         if cr.error and not err:
             err = cr.error
         return ec, out, err
+    # 本地兜底
+    # 复核 R23-3 治本(对称补齐)：本地兜底同样在【宿主机 shell】跑 Brain 下发的检查命令
+    # (tsc/eslint/go vet…)，必须过命令黑名单(与 _run_l1_command / build_tools._run_local
+    # 对称)，否则沙箱降级/ContextVar 丢失时隔离边界消失。normalize 可能改写命令，故对
+    # 【真正传给 shell 的命令串】校验(消除 check/run 口径漂移)；不可用/被拦 → fail-closed 126。
+    exec_cmd = normalize_python_cmd(shell_cmd, py_bin=_python_bin())
+    try:
+        from swarm.config import command_blacklist_store
+        _allowed, _reason = command_blacklist_store.check_command_hardened(exec_cmd)
+    except Exception as _bexc:  # noqa: BLE001
+        return 126, "", f"命令黑名单校验失败，本地兜底拒绝执行(fail-closed): {_bexc}"
+    if not _allowed:
+        return 126, "", f"命令被黑名单拦截(本地兜底不放行): {_reason}"
     try:
         proc = subprocess.run(
-            normalize_python_cmd(shell_cmd, py_bin=_python_bin()), cwd=project_path, shell=True,
+            exec_cmd, cwd=project_path, shell=True,
             capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
@@ -1560,7 +1574,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
     py_files = [f for f in files if f.endswith(".py")]
     if py_files:
         py_bin = _python_bin()
-        cmd = f"{py_bin} -m py_compile " + " ".join(f'"{f}"' for f in _cap_files(py_files, "py_compile"))
+        cmd = f"{py_bin} -m py_compile " + " ".join(shlex.quote(f) for f in _cap_files(py_files, "py_compile"))
         try:
             proc = subprocess.run(
                 cmd,
@@ -1713,7 +1727,7 @@ def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tu
 
     try:
         rc, out, err = _run_check_split(
-            "npx eslint --format json " + " ".join(f'"{f}"' for f in _cap_files(js_ts, "eslint")),
+            "npx eslint --format json " + " ".join(shlex.quote(f) for f in _cap_files(js_ts, "eslint")),
             project_path,
             timeout=timeout,
         )
@@ -1880,7 +1894,7 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
             entry["line"] = int(m.group(2))
         return entry
 
-    cmd = "checkstyle " + " ".join(f'"{f}"' for f in _cap_files(java_files, "checkstyle"))
+    cmd = "checkstyle " + " ".join(shlex.quote(f) for f in _cap_files(java_files, "checkstyle"))
     return _lint_line_based(
         project_path, tool="checkstyle", lang="Java", label="checkstyle", command=cmd,
         timeout=timeout, parse_line=_parse, sandbox_precheck=True,
