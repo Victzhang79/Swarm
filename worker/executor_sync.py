@@ -36,6 +36,30 @@ from swarm.worker.git_flock import _ProjectGitFlock
 logger = logging.getLogger(__name__)
 
 
+
+def _git_tracked_set(local_root: Path, rels: list[str]) -> set[str]:
+    """一次 `git ls-files -z -- <paths>` 批量判定哪些相对路径【被 git 跟踪】。
+
+    round27 perf：替代逐文件 `git ls-files --error-unmatch`（N 个文件 = N 次进程
+    spawn，30 并发 worker bootstrap 时事件环/系统被进程风暴拖垮）。判定谓词与
+    逐文件版完全一致（ls-files 命中 = tracked）。失败 fail-safe 返回空集
+    （调用方语义 = 全部按 untracked 处理，与逐文件版异常分支一致）。
+    模块级函数（非 mixin 方法）：测试用 SimpleNamespace stub 绑定 mixin 方法，
+    self 上取不到兄弟新方法。"""
+    import subprocess
+    if not rels:
+        return set()
+    try:
+        r = subprocess.run(
+            ["git", "ls-files", "-z", "--", *rels],
+            cwd=str(local_root), capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return set()
+        return {p for p in r.stdout.split("\0") if p}
+    except Exception:  # noqa: BLE001
+        return set()
+
 class _SandboxSyncMixin:
     """WorkerExecutor 的沙箱同步 / git / scope 方法簇（见模块 docstring）。
 
@@ -365,18 +389,8 @@ class _SandboxSyncMixin:
         if not candidates:
             return 0
 
-        # 只保留 git 跟踪的文件（ls-files --error-unmatch 逐个判定）
-        tracked = []
-        for rel in candidates:
-            try:
-                r = subprocess.run(
-                    ["git", "ls-files", "--error-unmatch", rel],
-                    cwd=str(local_root), capture_output=True, text=True, timeout=10,
-                )
-                if r.returncode == 0:
-                    tracked.append(rel)
-            except Exception:  # noqa: BLE001
-                continue
+        # 只保留 git 跟踪的文件（round27 perf：单次 ls-files 批量判定，替代逐文件 N 进程）
+        tracked = sorted(_git_tracked_set(local_root, sorted(candidates)))
         if not tracked:
             return 0
 
@@ -425,20 +439,32 @@ class _SandboxSyncMixin:
             _extra: list[str] = []
             if (local_root / ".git").exists():
                 import subprocess as _sp
+                # round27 perf：readable 的"在不在 base"判定从逐文件 `git cat-file -e`
+                # （N 文件=N 进程）批量为单次 `git ls-tree -r --name-only <base> -- <paths>`
+                # （谓词等价：路径在 base tree 中出现 = cat-file -e 命中；批量失败 fail-safe
+                # 空集 = 全按"不在 base"走补传分支，与逐文件版异常 continue 相比更保守但只多传不漏传）。
+                _readable_rels = []
                 for f in (getattr(self.effective_scope, "readable", []) or []):
                     rel = self._norm_rel(local_root, f)
-                    if rel in _seen:
-                        continue
+                    if rel not in _seen and (local_root / rel).is_file():
+                        _readable_rels.append(rel)
+                _in_head_set: set[str] = set()
+                if _readable_rels:
+                    try:
+                        _lt = _sp.run(
+                            ["git", "ls-tree", "-r", "--name-only", "-z",
+                             resolve_base_ref(getattr(self, 'base_ref', None)), "--", *_readable_rels],
+                            cwd=str(local_root), capture_output=True, text=True, timeout=30,
+                        )
+                        if _lt.returncode == 0:
+                            _in_head_set = {p for p in _lt.stdout.split("\0") if p}
+                    except Exception:  # noqa: BLE001
+                        _in_head_set = set()
+                for rel in _readable_rels:
                     abs_p = local_root / rel
                     if not abs_p.is_file():
                         continue
-                    try:
-                        in_head = _sp.run(
-                            ["git", "cat-file", "-e", f"{resolve_base_ref(getattr(self, 'base_ref', None))}:{rel}"],
-                            cwd=str(local_root), capture_output=True, timeout=10,
-                        ).returncode == 0
-                    except Exception:  # noqa: BLE001
-                        continue
+                    in_head = rel in _in_head_set
                     if not in_head:
                         # 上游新建（base 无、本地有，如脚手架建的模块 pom）→ 补传
                         rel_files.append(rel)
@@ -496,7 +522,11 @@ class _SandboxSyncMixin:
                 f"{reason} 专属沙箱自带源码 → 上传 {len(rel_files)} 个文件（改动 + 上游产物）"
             )
         else:
-            rel_files = [self._norm_rel(local_root, f) for f in self._scope_files()]
+            # round27 perf：_scope_files 内含全树 rglob（构建清单发现 + 模块源码树枚举，
+            # 大 monorepo 数十 ms 同步文件 IO）→ 卸线程池；不做缓存——脚手架子任务会
+            # 【任务中途新建】模块 pom，缓存会漏新清单（FINDING-11 同类回归风险）。
+            _sf = await asyncio.to_thread(self._scope_files)
+            rel_files = [self._norm_rel(local_root, f) for f in _sf]
         if not rel_files:
             self._log(f"{reason} scope 为空，跳过文件上传（无目标文件）")
             return
@@ -539,22 +569,16 @@ class _SandboxSyncMixin:
                 staging_dir = tempfile.mkdtemp(prefix="swarm_clean_upload_")
                 staging_root = Path(staging_dir)
                 cleaned = 0
+                # 仅当 rel 是 writable 且【确实被 git 跟踪】时用 HEAD 版。
+                # 用 ls-files 显式判定，区分 "tracked"（含空文件）与 "untracked/新建"
+                # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
+                # round27 perf：单次批量判定（谓词同逐文件版），替代循环内 N 次进程 spawn。
+                _tracked_writables = _git_tracked_set(
+                    local_root, sorted(r for r in rel_files if r in writable_set))
                 for rel in rel_files:
                     dst = staging_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    # 仅当 rel 是 writable 且【确实被 git 跟踪】时用 HEAD 版。
-                    # 用 ls-files 显式判定，区分 "tracked"（含空文件）与 "untracked/新建"
-                    # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
-                    is_tracked = False
-                    if rel in writable_set:
-                        try:
-                            _r = _sp.run(
-                                ["git", "ls-files", "--error-unmatch", rel],
-                                cwd=str(local_root), capture_output=True, text=True, timeout=10,
-                            )
-                            is_tracked = _r.returncode == 0
-                        except Exception:  # noqa: BLE001
-                            is_tracked = False
+                    is_tracked = rel in _tracked_writables
                     git_text = self._git_baseline_text(local_root, rel) if is_tracked else None
                     if git_text is not None:
                         # writable 且 git 跟踪 → 用 HEAD 干净版（杜绝脏磁盘叠加）

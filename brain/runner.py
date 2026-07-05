@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import secrets
@@ -455,7 +456,9 @@ async def _stream_brain_events(
                 progress = min(progress + 4, 90)
                 status = _NODE_STATUS_MAP.get(name)
                 if status:
-                    store.update_task(task_id, status=status)
+                    # round27 perf：本函数是每图事件的热路径，psycopg 同步调用会卡整个事件环
+                    # （并发任务+SSE+API 全部陪等）→ 卸线程池。顺序语义不变（await 保序）。
+                    await asyncio.to_thread(store.update_task, task_id, status=status)
                 await _emit(queue, {
                     "step": "brain_node",
                     "status": "running",
@@ -468,7 +471,8 @@ async def _stream_brain_events(
             name = event.get("name", "")
             output = (event.get("data") or {}).get("output") or {}
             if name in _SYNC_ON_NODES and isinstance(output, dict):
-                _sync_task_from_state(task_id, output)
+                # round27 perf：同上，DB 回写卸线程池，不卡事件环。
+                await asyncio.to_thread(_sync_task_from_state, task_id, output)
                 # P1-B：规划/拆分揭示子任务数 → 放宽弹性墙钟（只增不减，防大型任务被基线上限误杀）。
                 _plan_out = output.get("plan")
                 _subs = None
@@ -479,14 +483,18 @@ async def _stream_brain_events(
                 if isinstance(_subs, list) and len(_subs) > _wc_subtasks:
                     _wc_subtasks = len(_subs)
             if name in _TOKEN_GATE_NODES and isinstance(output, dict):
-                fresh = store.get_task(task_id) or task_rec
-                ok, usage = store.check_task_token_limit(
-                    task_id,
-                    description=fresh.get("description") or "",
-                    merged_diff=output.get("merged_diff") or fresh.get("merged_diff") or "",
-                    subtask_results=output.get("subtask_results"),
-                    # round27 弹性预算：复用墙钟维护的子任务数（规划揭示后放宽，与 P1-B 同理）
-                    subtask_count=_wc_subtasks,
+                # round27 perf：get_task + 闸门检查（内含估算与可能的 DB 落 FAILED）卸线程池。
+                fresh = (await asyncio.to_thread(store.get_task, task_id)) or task_rec
+                ok, usage = await asyncio.to_thread(
+                    functools.partial(
+                        store.check_task_token_limit,
+                        task_id,
+                        description=fresh.get("description") or "",
+                        merged_diff=output.get("merged_diff") or fresh.get("merged_diff") or "",
+                        subtask_results=output.get("subtask_results"),
+                        # round27 弹性预算：复用墙钟维护的子任务数（规划揭示后放宽，与 P1-B 同理）
+                        subtask_count=_wc_subtasks,
+                    )
                 )
                 if not ok:
                     await _emit(queue, {

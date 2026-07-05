@@ -465,7 +465,8 @@ class WorkerExecutor(
                     set_sandbox_context(self._sandbox, self._sandbox_manager)
                     # 批次2-B：bootstrap 上传前先把 scope 内 tracked 文件 reset 到 HEAD，
                     # 杜绝上一轮 pull-back 写回本地的改动跨子任务/重试累积叠加。
-                    self._reset_scope_to_head()
+                    # round27 perf：git 进程 + flock 属阻塞 IO，卸线程池防并发 bootstrap 卡事件环。
+                    await asyncio.to_thread(self._reset_scope_to_head)
                     await self._sync_to_sandbox("bootstrap")
                     # #12 治本(B fail-closed seed)：bootstrap 后若【上游产物(provenance 标注)】缺失于
                     # 本地树（上游未就绪 或 被放弃 revert 抹掉），沙箱 seed 必不含该包 → 本子任务注定

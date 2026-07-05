@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -89,7 +90,9 @@ async def _post_webhook(url: str, payload: dict[str, Any], *, tag: str = "") -> 
     """POST 一个 webhook，成功返回 True。异常/非 2xx 返回 False（不抛出）。"""
     if not url:
         return False
-    _reason = _ssrf_unsafe_reason(url)
+    # round27 perf：_ssrf_unsafe_reason 内含同步 DNS 解析（getaddrinfo 无超时，慢 DNS 可
+    # 卡事件环数秒）→ 卸线程池。判定逻辑不变。
+    _reason = await asyncio.to_thread(_ssrf_unsafe_reason, url)
     if _reason:
         logger.warning("Webhook 被 SSRF 防护拦截 %s: %s (url=%s)", tag, _reason, url[:80])
         return False
