@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -295,6 +296,11 @@ async def update_config(request: Request):
         if "***" in str_val or (str_val.count("...") == 1 and len(str_val) < 30):
             continue
         env_key = _resolve_key(key.strip())
+        # round27 防御纵深：key/value 含换行会在写 .env 时裂成多行 → 注入 _SHORT_KEY_MAP 之外的
+        # 任意 env 行（admin 本有 config:write 权限，非提权，但闸门要对称）。key 白名单格式校验，
+        # value 拒绝内嵌换行；不合法直接跳过（与"脱敏值忽略"同一宽松语义，不整单拒绝）。
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key) or "\n" in str_val or "\r" in str_val:
+            continue
         update_map[env_key] = str_val
 
     if not update_map:

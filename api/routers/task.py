@@ -598,6 +598,11 @@ async def stream_task_logs(task_id: str, request: Request):
                 # 无新行：心跳，并检查任务是否已终态
                 yield {"event": "heartbeat", "data": ""}
                 cur = await loop.run_in_executor(None, _app.store.get_task, task_id)
+                # round27（C6 同族补漏）：日志流含代码/构建输出等敏感内容，与 stream_task 一致
+                # 周期性重校——token 吊销/成员被移除即断流，不再"连上后失权仍可看到任务终态"。
+                if not _stream_reauthorized(request, cur or task, "task:read"):
+                    yield {"event": "end", "data": "auth_revoked"}
+                    break
                 if cur and cur.get("status") in _TERMINAL:
                     terminal_idle += 1
                     # 终态后再多轮询一次确保尾部日志吐完，然后收尾

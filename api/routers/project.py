@@ -301,8 +301,19 @@ async def stream_preprocess_progress(project_id: str, request: Request):
         last_phase = None
         last_progress = -1.0
         idle_count = 0
+        reauth_tick = 0
 
         while True:
+            # round27（C6 同族补漏）：大项目预处理可持续数分钟，每 ~10s 重校一次授权——
+            # token 吊销/成员被移除即断流（复用 task.py 的 _stream_reauthorized 模板）。
+            reauth_tick += 1
+            if reauth_tick >= 20:
+                reauth_tick = 0
+                from swarm.api.routers.task import _stream_reauthorized
+                if not _stream_reauthorized(request, {"project_id": project_id}, "project:read"):
+                    yield {"event": "progress", "data": json.dumps(
+                        {"phase": "error", "message": "auth_revoked", "error": "auth_revoked"})}
+                    return
             loop = asyncio.get_running_loop()
             progress = await loop.run_in_executor(None, _app.store.get_progress, project_id)
 

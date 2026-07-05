@@ -83,6 +83,12 @@ async def stream_worker_run(run_id: str, request: Request):
                 try:
                     event_data = await asyncio.wait_for(queue.get(), timeout=30)
                 except asyncio.TimeoutError:
+                    # round27（C6 同族补漏）：worker 直跑可持续数分钟，心跳窗重校鉴权——
+                    # token 吊销/成员被移除即断流（与 task.py _stream_reauthorized 同模板）。
+                    from swarm.api.routers.task import _stream_reauthorized
+                    if not _stream_reauthorized(request, {"project_id": project_id}, "task:read"):
+                        yield {"event": "end", "data": "auth_revoked"}
+                        break
                     yield {"event": "heartbeat", "data": ""}
                     continue
 

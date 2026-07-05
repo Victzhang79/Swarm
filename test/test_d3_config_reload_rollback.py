@@ -124,3 +124,25 @@ def test_commit_on_success(tmp_path, monkeypatch):
     cfgmod._persist_env_updates({"SWARM_OKKEY": "v1"})
     assert "SWARM_OKKEY=v1" in env.read_text(encoding="utf-8")
     assert os.environ["SWARM_OKKEY"] == "v1"
+
+
+def test_put_config_rejects_newline_injection(tmp_path, monkeypatch):
+    """round27 防御纵深：key/value 内嵌换行会把一条配置写裂成多行 .env → 注入
+    _SHORT_KEY_MAP 之外的任意 env 行。合法项照常写入，带换行的整项被跳过。"""
+    env = tmp_path / ".env"
+    env.write_text("EXISTING=1\n", encoding="utf-8")
+    monkeypatch.setattr(cfgmod._app, "_PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("SWARM_GOODKEY", "seed")
+    monkeypatch.setattr(cfgmod, "_require_perm", lambda *a, **k: None)
+    monkeypatch.setattr(cfgmod._app, "reload_config", lambda: None)
+
+    body = {"config": {
+        "SWARM_GOODKEY": "ok",
+        "SWARM_BAD\nSWARM_INJECTED_KEY": "x",
+        "SWARM_VALKEY": "val\nSWARM_INJECTED_VAL=1",
+    }}
+    asyncio.run(cfgmod.update_config(_FakeRequest(body)))
+    text = env.read_text(encoding="utf-8")
+    assert "SWARM_GOODKEY=ok" in text, "合法项应照常写入"
+    assert "SWARM_INJECTED_KEY" not in text, "key 换行注入必须被拒"
+    assert "SWARM_INJECTED_VAL" not in text, "value 换行注入必须被拒"

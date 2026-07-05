@@ -148,8 +148,11 @@ function connectPreprocessSSE(projectId) {
     preprocessSSE.addEventListener('progress', handleProgress);
     // 不用 addEventListener('error') — 会与 EventSource 原生连接错误冲突
     preprocessSSE.onerror = () => {
+      // round27：CLOSED（浏览器已放弃重连）时进度条会永久冻结在最后状态——必须给用户可见提示，
+      // 否则"停在 60%"与"进行中"无法区分（CONNECTING 状态是自动重连，不打扰）。
       if (preprocessSSE && preprocessSSE.readyState === EventSource.CLOSED) {
         preprocessSSE = null;
+        if (typeof showToast === 'function') showToast('预处理进度连接已断开，请刷新页面或重新触发', 'warning');
       }
     };
   } catch { /* ignore */ }
