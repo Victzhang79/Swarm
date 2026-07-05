@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -238,23 +239,23 @@ def parse_codegraph_db(db_path: str) -> CodegraphResult:
     parse_error: str | None = None
 
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        # C4：contextlib.closing 保证任一解析分支抛异常也 close 连接（原 conn.close() 在
+        # try 内解析之后，解析中途 raise 则被跳过 → SQLite 连接泄漏）。
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
 
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row["name"] for row in cur.fetchall()}
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row["name"] for row in cur.fetchall()}
 
-        if "nodes" in tables:
-            symbols = _parse_colbymchenry_nodes(cur)
-            if "edges" in tables:
-                edges = _parse_colbymchenry_edges(cur)
-        elif "symbols" in tables:
-            symbols = _parse_symbols_table(cur)
-            if "references" in tables:
-                edges = _parse_references_table(cur)
-
-        conn.close()
+            if "nodes" in tables:
+                symbols = _parse_colbymchenry_nodes(cur)
+                if "edges" in tables:
+                    edges = _parse_colbymchenry_edges(cur)
+            elif "symbols" in tables:
+                symbols = _parse_symbols_table(cur)
+                if "references" in tables:
+                    edges = _parse_references_table(cur)
     except sqlite3.Error as exc:
         # P1-21：解析失败 → ok=False，避免部分/空结果被上游误标 INDEXED。
         logger.error("Failed to parse codegraph db %s: %s", db_path, exc)

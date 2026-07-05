@@ -397,7 +397,10 @@ def update_project(
         sets.append("language_breakdown = %s")
         params.append(Jsonb(language_breakdown))
     if config is not None:
-        sets.append("config = %s")
+        # C4：与 create 的 jsonb || 语义一致——顶层键并集(新值覆盖同名、其余既存键保留)，
+        # 不整列覆盖(原 config = %s 会清掉未在本次传入的既存键)。SQL 级合并且原子，免调用方
+        # 读-改-写(planning_nodes DETECT_STACK 缓存即此场景，有 lost-update 竞态)。
+        sets.append("config = COALESCE(config, '{}'::jsonb) || %s")
         params.append(Jsonb(config))
 
     if not sets:
