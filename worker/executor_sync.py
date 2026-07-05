@@ -55,9 +55,19 @@ def _git_tracked_set(local_root: Path, rels: list[str]) -> set[str]:
             cwd=str(local_root), capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
+            # 批量版一次失败 = 调用方整个护栏（reset 防脏/clean_upload 防脏叠加）按
+            # "全 untracked"降级——必须可观测，否则与"真没有 tracked 文件"不可区分。
+            logger.warning(
+                "[git_tracked_set] git ls-files 非零(rc=%d, %d 路径, cwd=%s)，按全 untracked 降级: %s",
+                r.returncode, len(rels), local_root, (r.stderr or "").strip()[:200],
+            )
             return set()
         return {p for p in r.stdout.split("\0") if p}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[git_tracked_set] git ls-files 异常(%d 路径, cwd=%s)，按全 untracked 降级: %s",
+            len(rels), local_root, exc,
+        )
         return set()
 
 class _SandboxSyncMixin:
@@ -458,7 +468,17 @@ class _SandboxSyncMixin:
                         )
                         if _lt.returncode == 0:
                             _in_head_set = {p for p in _lt.stdout.split("\0") if p}
-                    except Exception:  # noqa: BLE001
+                        else:
+                            self._log(
+                                f"[WARN] {reason} ls-tree 非零(rc={_lt.returncode})，"
+                                f"{len(_readable_rels)} 个 readable 全量按补传降级（多传不漏传）: "
+                                f"{(_lt.stderr or '').strip()[:120]}"
+                            )
+                    except Exception as _lt_exc:  # noqa: BLE001
+                        self._log(
+                            f"[WARN] {reason} ls-tree 异常，{len(_readable_rels)} 个 readable "
+                            f"全量按补传降级（多传不漏传）: {_lt_exc}"
+                        )
                         _in_head_set = set()
                 for rel in _readable_rels:
                     abs_p = local_root / rel
@@ -573,8 +593,17 @@ class _SandboxSyncMixin:
                 # 用 ls-files 显式判定，区分 "tracked"（含空文件）与 "untracked/新建"
                 # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
                 # round27 perf：单次批量判定（谓词同逐文件版），替代循环内 N 次进程 spawn。
-                _tracked_writables = _git_tracked_set(
-                    local_root, sorted(r for r in rel_files if r in writable_set))
+                _writable_candidates = sorted(r for r in rel_files if r in writable_set)
+                _tracked_writables = _git_tracked_set(local_root, _writable_candidates)
+                if _writable_candidates and not _tracked_writables:
+                    # hunter round27 HIGH：批量判定失败 = 整个 clean_upload 防脏叠加机制
+                    # 按"全 untracked→copy 脏磁盘"静默失效（旧逐文件版单文件失败只影响单文件）。
+                    # 无法区分"真全 untracked"与"git 故障"，但两者都值得在上传日志里留痕。
+                    self._log(
+                        f"[WARN] {reason} clean_upload: tracked 判定空集"
+                        f"（git 故障/超时或确实全新建）→ {len(_writable_candidates)} 个 "
+                        f"writable 按脏磁盘上传，防脏叠加护栏未生效"
+                    )
                 for rel in rel_files:
                     dst = staging_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
