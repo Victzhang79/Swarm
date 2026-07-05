@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator
 
 import swarm.api.app as _app
@@ -93,8 +93,12 @@ class MemberRequest(BaseModel):
 
 
 @router.post("/api/auth/login", tags=["认证"])
-async def auth_login(req: LoginRequest, request: Request):
-    """用户名密码登录，返回 api_token（Bearer / X-Swarm-Token）。"""
+async def auth_login(req: LoginRequest, request: Request, response: Response):
+    """用户名密码登录，返回 api_token（Bearer / X-Swarm-Token）。
+
+    D1：同时以 HttpOnly Cookie 下发 token，供 SSE(EventSource)同源自动携带，避免把 token
+    放进 ?token= URL(会进 access log/Referer/浏览器历史 → 多用户下跨用户凭据泄漏)。
+    """
     from swarm.auth.store import authenticate, get_must_change_password
 
     # M8 修复：登录限流/锁定，防默认账户暴力破解。按 用户名+客户端IP 计失败次数，
@@ -128,6 +132,17 @@ async def auth_login(req: LoginRequest, request: Request):
     ttl_hours = get_config().token_ttl_hours
     expires_at = await loop.run_in_executor(
         None, lambda: set_token_expiry(user.id, ttl_hours)
+    )
+    # D1：HttpOnly Cookie 下发 token（JS 读不到 → 不受 XSS 窃取、不进 URL）。secure 仅在
+    # HTTPS 下置(内网 HTTP 部署置 secure 会致 Cookie 不发)；SameSite=Lax 允许同源 SSE GET。
+    response.set_cookie(
+        key="swarm_token",
+        value=user.api_token,
+        httponly=True,
+        samesite="lax",
+        secure=(request.url.scheme == "https"),
+        max_age=(ttl_hours * 3600 if ttl_hours and ttl_hours > 0 else None),
+        path="/",
     )
     return {
         "token": user.api_token,

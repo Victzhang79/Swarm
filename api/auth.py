@@ -40,8 +40,13 @@ def _extract_token(request: Request) -> str:
         auth = request.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
-    # 兜底：浏览器原生 EventSource(SSE) 无法携带自定义请求头，
-    # 故 SSE 端点通过 query param ?token= 传递（header 优先级更高）。
+    # D1：HttpOnly Cookie（/api/auth/login 下发）。浏览器 EventSource(SSE) 同源自动带 Cookie，
+    # 故 Cookie 认证的 SSE【无需】把 token 放进 ?token= URL（避免进 access log/Referer/浏览器
+    # 历史致跨用户凭据泄漏）。优先级：显式 header > HttpOnly Cookie > ?token=(遗留兜底)。
+    if not provided:
+        provided = request.cookies.get("swarm_token") or ""
+    # 遗留兜底：浏览器原生 EventSource 无法携带自定义请求头且未走 Cookie 时，
+    # 仍支持 query param ?token=（安全性最弱，前端迁移到 Cookie 后可弃用）。
     if not provided:
         provided = request.query_params.get("token") or ""
     return provided.strip()
