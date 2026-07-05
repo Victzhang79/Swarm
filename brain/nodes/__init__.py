@@ -32,8 +32,9 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
      lazy import(不解耦只搬运)。★正确前置：先把【规划/replan 子系统】设计成独立模块(planning_core，
      把 _rebuild_plan/_resplit_subtask/_split_oversized_by_files/_targeted_redecompose/_serialize_
      pom_writers 等一起下沉)，B-2 再随之外置★。这是独立的大设计,非快速簇移。
-  下一个【可直接拆的叶簇】候选：D 段 audit/security orchestration（若为叶）——比 B-2 更适合作
-     增量下一步；B-2 须等 planning_core 先行。
+  D. ✅[已拆] AUDIT 安全审计节点（叶，未被 patch）→ brain/nodes/audit.py（_run_security_audit）。
+  后续候选：把 dispatch/verify/audit 之外的其余节点助手按【叶簇优先】继续下沉；非叶的规划核心
+     (B-2 依赖的 _serialize_pom_writers/_rebuild_plan/... )须先成 planning_core 独立模块再动。
   C. handle_failure 族（~660 行超长函数 + _handle_failure_impl）：先按 strategy 分支抽纯
      决策函数（已部分参数化），再考虑整体迁 brain/nodes/failure.py。
   D. audit/security orchestration（run_security_audit 等）。
@@ -132,6 +133,8 @@ from swarm.brain.nodes.maven_repair import (  # noqa: E402,F401
     _iter_project_poms,
     _pkg_match_tokens,
 )
+# god-file 簇D：re-export AUDIT 安全审计节点（保 swarm.brain.nodes.X 可寻址；未被 patch）
+from swarm.brain.nodes.audit import _run_security_audit  # noqa: E402,F401
 from swarm.brain.llm_schemas import (  # noqa: E402
     ComplexityAssessmentResponse,
     FailureStrategyResponse,
@@ -1204,125 +1207,6 @@ def confirm_plan(state: BrainState) -> dict:
 
 
 
-
-
-async def _run_security_audit(
-    subtask: SubTask,
-    project_path: str | None,
-    *,
-    project_id: str = "",
-    task_id: str = "",
-) -> WorkerOutput:
-    """AUDIT 意图执行分支：跑安全扫描，产结构化报告(不产 diff)。
-
-    阻断/仅报告双模式由 WorkerConfig.security_block_severity 控制：
-    - critical/high：发现该级别漏洞 → should_block → l1_passed=False(阻断交付)
-    - none：仅报告，永不阻断(l1_passed=True)
-    """
-    import asyncio as _asyncio
-
-    from swarm.config.settings import get_config
-
-    lang = getattr(getattr(subtask, "harness", None), "language", "") or ""
-    block_severity = get_config().worker.security_block_severity
-
-    audit(
-        "security_audit_start",
-        orchestrator="Brain",
-        executor="Worker",
-        task_id=task_id,
-        subtask_id=subtask.id,
-        language=lang,
-        block_severity=block_severity,
-    )
-
-    # N-01 fail-closed 判据：仅用于【扫描器崩溃】路径——我们【有】东西可扫但扫挂了，
-    # 在阻断模式(block_severity != "none")下"扫不了"绝不能与"真·零漏洞"混同放行。
-    # report-only(none)模式是运维明示"永不阻断"，此时保持不阻断(可观测性不误杀)。
-    # 注意：无 project_path 是【编排未提供可扫对象】(非攻击面/非扫描失败)，按既有契约安全跳过。
-    _audit_fail_closed = block_severity != "none"
-
-    if not project_path:
-        logger.warning("[AUDIT] 子任务 %s 无项目路径，安全审计跳过", subtask.id)
-        return WorkerOutput(
-            subtask_id=subtask.id,
-            diff="",
-            summary="安全审计跳过：无项目路径",
-            confidence=Confidence.LOW,
-            l1_passed=True,  # 无路径=无可扫对象，安全跳过不误杀（既有契约）
-            l1_details={"mode": "audit", "skipped": "no_project_path"},
-            audit_findings=[],
-        )
-
-    def _scan() -> tuple[list, bool]:
-        from swarm.worker.security_scan import run_security_scan
-
-        scope_files = list(
-            getattr(subtask.scope, "writable", []) or []
-        ) + list(getattr(subtask.scope, "readable", []) or [])
-        return run_security_scan(
-            project_path,
-            lang,
-            files=scope_files or None,
-            block_severity=block_severity,
-        )
-
-    try:
-        findings, should_block = await _asyncio.get_running_loop().run_in_executor(None, _scan)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("[AUDIT] 安全扫描失败: %s (fail_closed=%s)", exc, _audit_fail_closed)
-        return WorkerOutput(
-            subtask_id=subtask.id,
-            diff="",
-            summary=f"安全审计执行失败: {exc}",
-            confidence=Confidence.LOW,
-            # N-01：阻断模式下扫描器崩溃→fail-closed(不可与"真零漏洞"混同)；none 模式不阻断
-            l1_passed=not _audit_fail_closed,
-            l1_details={
-                "mode": "audit",
-                "error": str(exc),
-                "fail_closed": _audit_fail_closed,
-                "block_severity": block_severity,
-            },
-            audit_findings=[],
-        )
-
-    by_sev: dict[str, int] = {}
-    for f in findings:
-        sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
-        by_sev[sev] = by_sev.get(sev, 0) + 1
-    summary = (
-        f"安全审计完成：{len(findings)} 项发现 "
-        f"({', '.join(f'{k}={v}' for k, v in sorted(by_sev.items())) or '无'})"
-        f"；block_severity={block_severity} → {'阻断交付' if should_block else '通过'}"
-    )
-    audit(
-        "security_audit_done",
-        orchestrator="Brain",
-        executor="Worker",
-        task_id=task_id,
-        subtask_id=subtask.id,
-        findings=len(findings),
-        should_block=should_block,
-        by_severity=by_sev,
-    )
-    logger.info("[AUDIT] %s | %s", subtask.id, summary)
-    return WorkerOutput(
-        subtask_id=subtask.id,
-        diff="",  # 审计不产 diff
-        summary=summary,
-        confidence=Confidence.HIGH,
-        l1_passed=not should_block,  # 阻断模式下有高危发现即 L1 不通过
-        l1_details={
-            "mode": "audit",
-            "l1_decision_source": "deterministic",
-            "findings_total": len(findings),
-            "by_severity": by_sev,
-            "block_severity": block_severity,
-            "should_block": should_block,
-        },
-        audit_findings=findings,
-    )
 
 
 async def _dispatch_to_worker(
