@@ -594,10 +594,28 @@ def _get_sandbox_manager() -> Any:
 # FastAPI 应用
 # ═══════════════════════════════════════════════════
 
+from contextlib import asynccontextmanager  # noqa: E402
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """F3：FastAPI lifespan（替代弃用的 @app.on_event startup/shutdown）。
+
+    启动/关闭逻辑仍在下方 on_startup()/on_shutdown()（保留函数名，既有 getsource/集成测试
+    不回归）；此处只编排：yield 前跑 startup、yield 后(finally)跑 shutdown。
+    """
+    await on_startup()
+    try:
+        yield
+    finally:
+        await on_shutdown()
+
+
 app = FastAPI(
     title="Swarm API",
     version="0.9.11",
     description="Swarm Web 后端 API",
+    lifespan=_lifespan,
 )
 
 from swarm.api.auth import SwarmAPIKeyMiddleware  # noqa: E402
@@ -605,7 +623,6 @@ from swarm.api.auth import SwarmAPIKeyMiddleware  # noqa: E402
 app.add_middleware(SwarmAPIKeyMiddleware)
 
 
-@app.on_event("startup")
 async def on_startup():
     """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""
     _configure_app_logging()
@@ -906,7 +923,6 @@ async def _start_task_scheduler() -> None:
         logger.warning("Failed to start task scheduler: %s", exc)
 
 
-@app.on_event("shutdown")
 async def on_shutdown():
     """应用关闭钩子：优雅关闭数据库连接池 + 排空热沙箱池。
 
