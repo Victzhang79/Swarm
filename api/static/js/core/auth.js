@@ -206,7 +206,21 @@ async function forceChangePassword() {
   }
 }
 
-function logoutUser() {
+async function logoutUser() {
+  // D1 治本：先请服务端清 HttpOnly swarm_token Cookie（仅清 localStorage 会伪退出——
+  // 同源请求仍带 Cookie，后端 _extract_token 回退 Cookie 会继续鉴权通过）。
+  let cookieCleared = false;
+  try {
+    const r = await fetch('/api/auth/logout', { method: 'POST' });
+    cookieCleared = r.ok;
+  } catch (_e) {
+    cookieCleared = false;
+  }
+  // 网络/服务端失败 → delete_cookie 未送达，Cookie 可能仍存活（同源请求会继续带凭据鉴权）。
+  // 显式告警，别让用户误以为已彻底登出（否则是静默的伪退出/凭据残留）。
+  if (!cookieCleared) {
+    showToast('退出请求未送达，登录 Cookie 可能未清除，请关闭浏览器以确保彻底登出', 'warning');
+  }
   localStorage.removeItem(AUTH_TOKEN_KEY);
   localStorage.removeItem(AUTH_EXPIRES_KEY);
   currentUser = null;

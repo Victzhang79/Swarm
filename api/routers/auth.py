@@ -158,6 +158,29 @@ async def auth_login(req: LoginRequest, request: Request, response: Response):
     }
 
 
+@router.post("/api/auth/logout", tags=["认证"])
+async def auth_logout(request: Request, response: Response):
+    """登出：清除 HttpOnly swarm_token Cookie。
+
+    D1 治本（伪退出/auth bypass）：登录时 set_cookie 下发了 HttpOnly Cookie，但前端 logoutUser()
+    只清 localStorage → 退出后同源请求仍带 swarm_token Cookie，_extract_token 在 header 为空时
+    回退 Cookie 会继续鉴权通过。故必须在服务端 delete_cookie 把凭据从浏览器清掉。
+
+    不要求已鉴权：清 Cookie 幂等、恒成功（即便 token 已失效也要把 Cookie 清干净）。参数须与
+    /api/auth/login 的 set_cookie 对齐（key/path/samesite/secure/httponly），否则浏览器不认作
+    同一 Cookie、不会删除。注：api_token 是持久 API 凭据（Bearer 复用），此处只清传输层 Cookie，
+    不轮换 token（避免连坐失效该用户其它 Bearer 会话）。
+    """
+    response.delete_cookie(
+        key="swarm_token",
+        path="/",
+        samesite="lax",
+        secure=(request.url.scheme == "https"),
+        httponly=True,
+    )
+    return {"status": "ok"}
+
+
 class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
