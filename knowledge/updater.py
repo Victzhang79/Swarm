@@ -487,7 +487,7 @@ class KnowledgeUpdater:
                 is_codegraph_installed,
                 run_codegraph_full,
             )
-            from swarm.project.preprocess import _save_dependency_graph
+            from swarm.project.preprocess import _replace_dependency_graph
 
             loop = asyncio.get_running_loop()
             proj = await loop.run_in_executor(
@@ -511,20 +511,15 @@ class KnowledgeUpdater:
             if not edges:
                 logger.info("[Updater] 依赖图重建：%s 无依赖边，跳过", project_id)
                 return
-            # 删本项目旧边后整体重写（_save_dependency_graph 是 upsert，先清避免残留）。
-            if self._struct:
-                try:
-                    conn = self._struct._conn_or_raise()
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "DELETE FROM kb_dependency_graph WHERE project_id = %s",
-                            (project_id,),
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[Updater] 清旧依赖边失败(继续 upsert): %s", exc)
-            await loop.run_in_executor(
-                None, _save_dependency_graph, project_id, edges
-            )
+            # C1 治本：DELETE 旧边(原走 async 连接) + INSERT 新边(原走 sync 池)跨连接非原子，
+            # 中途崩溃只删不写 → 依赖图空。合到 _replace_dependency_graph 的单 sync 事务(原子)。
+            # self._lock 串行化并发重建任务（重建是 fire-and-forget，可能多个项目/多轮重叠 DELETE-
+            # all+INSERT-all 互相中间可见）；调用点未持锁，无重入死锁。注：与 _index_file 的逐文件
+            # 增量依赖写非同锁——那类交错由全量重建(每 N 变更)自愈，故不为其加重锁拖慢索引。
+            async with self._lock:
+                await loop.run_in_executor(
+                    None, _replace_dependency_graph, project_id, edges
+                )
             logger.info(
                 "[Updater] 项目 %s 依赖图重建完成(%d 边)", project_id, len(edges)
             )

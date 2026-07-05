@@ -1047,33 +1047,59 @@ def _prune_absent_files(project_id: str, project_path: str) -> int:
         return 0
 
 
+_DEP_INSERT_SQL = """
+INSERT INTO kb_dependency_graph (project_id, source_file, target_file, import_type, metadata_json)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (project_id, source_file, target_file) DO UPDATE SET
+    import_type = EXCLUDED.import_type,
+    metadata_json = EXCLUDED.metadata_json
+"""
+
+
+def _dep_edge_rows(project_id: str, edges: list) -> list:
+    """把 codegraph edges 展平为 kb_dependency_graph 行（单一事实源，供 save/replace 共用）。"""
+    import psycopg
+    return [
+        (project_id, edge.source_file, edge.target_file, edge.import_type,
+         psycopg.types.json.Jsonb({}))
+        for edge in edges
+    ]
+
+
 def _save_dependency_graph(project_id: str, edges: list) -> None:
-    """将 codegraph 依赖写入 kb_dependency_graph（A-P1-22：池 + executemany）"""
+    """将 codegraph 依赖写入 kb_dependency_graph（A-P1-22：池 + executemany；纯 upsert，不删旧边）。"""
     if not edges:
         return
     try:
-        import psycopg
-
         from swarm.infra.db import sync_pool
-        rows = [
-            (project_id, edge.source_file, edge.target_file, edge.import_type,
-             psycopg.types.json.Jsonb({}))
-            for edge in edges
-        ]
         with sync_pool().connection() as conn:
             with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO kb_dependency_graph (project_id, source_file, target_file, import_type, metadata_json)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (project_id, source_file, target_file) DO UPDATE SET
-                        import_type = EXCLUDED.import_type,
-                        metadata_json = EXCLUDED.metadata_json
-                    """,
-                    rows,
-                )
+                cur.executemany(_DEP_INSERT_SQL, _dep_edge_rows(project_id, edges))
     except Exception as exc:
         logger.warning("Failed to save dependency graph: %s", exc)
+
+
+def _replace_dependency_graph(project_id: str, edges: list) -> None:
+    """C1 治本：在【同一 sync 事务】内 DELETE 旧边 + INSERT 新边，原子替换某项目依赖图。
+
+    原 updater 重建把 DELETE 走 async 连接、INSERT 走本 sync 池 → 跨连接非原子，中途崩溃
+    只删不写 → 依赖图空、检索劣化。合到单事务：任一步失败整体回滚，绝不留空/半图。
+    edges 空也执行 DELETE（显式清空该项目依赖图，语义正确；调用方按需在空时早返回）。
+    """
+    try:
+        from swarm.infra.db import sync_pool
+        rows = _dep_edge_rows(project_id, edges)
+        with sync_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM kb_dependency_graph WHERE project_id = %s",
+                        (project_id,),
+                    )
+                    if rows:
+                        cur.executemany(_DEP_INSERT_SQL, rows)
+    except Exception as exc:
+        logger.warning("Failed to replace dependency graph: %s", exc)
 
 
 def _read_symbols_for_embed(project_id: str) -> list[dict[str, Any]]:
