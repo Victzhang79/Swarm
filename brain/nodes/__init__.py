@@ -23,9 +23,17 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
   B-1. ✅[已拆] Maven 缺失依赖补全簇（纯 pom/path，未被 patch）→ brain/nodes/maven_repair.py
      （_pkg_match_tokens / _extract_missing_pkgs / _iter_project_poms / _find_maven_dep_for_pkg /
      _inject_dep_into_pom / _inject_missing_maven_deps + 5 个 maven 正则常量）。
-  B-2. [待拆] pom/模块脚手架簇（就地改 plan）：_grant_module_pom_writable /
-     _widen_scope_for_compile_repair / _local_tree_revert_subtask。依赖 FileScope 与 plan 结构，
-     且就地改 plan（更entangled，需先补行为测试锁 plan 变更契约再迁）。
+  B-2. [阻塞·取证结论=非叶簇，不宜直接拆] pom/模块脚手架簇：_grant_module_pom_writable /
+     _widen_scope_for_compile_repair / _local_tree_revert_subtask。取证发现这 3 个都是【非叶】——
+     依赖闭包深入【规划/replan 核心】：_grant→_serialize_pom_writers→_rebuild_plan/_resplit_subtask/
+     _split_oversized_by_files/_targeted_redecompose/_remap_dependents_to_terminals/_context_budget；
+     _local_tree_revert→_git_diff_for_paths→~30 核心 helper。直接抽会违反本清单约束②（抽出模块
+     不得反向 import __init__）——要么把半个 __init__(规划子系统)一起挪、要么给每个函数塞 ~10 个
+     lazy import(不解耦只搬运)。★正确前置：先把【规划/replan 子系统】设计成独立模块(planning_core，
+     把 _rebuild_plan/_resplit_subtask/_split_oversized_by_files/_targeted_redecompose/_serialize_
+     pom_writers 等一起下沉)，B-2 再随之外置★。这是独立的大设计,非快速簇移。
+  下一个【可直接拆的叶簇】候选：D 段 audit/security orchestration（若为叶）——比 B-2 更适合作
+     增量下一步；B-2 须等 planning_core 先行。
   C. handle_failure 族（~660 行超长函数 + _handle_failure_impl）：先按 strategy 分支抽纯
      决策函数（已部分参数化），再考虑整体迁 brain/nodes/failure.py。
   D. audit/security orchestration（run_security_audit 等）。
