@@ -104,7 +104,9 @@ async function loadProjectOptions() {
         return `<option value="${escapeHtml(String(pid))}">${escapeHtml(String(name))}</option>`;
       }).join('');
     if (cur) sel.value = cur;
-  } catch { /* ignore */ }
+  } catch {
+    if (typeof showToast === 'function') showToast('项目下拉加载失败（后端不可达？）', 'error');
+  }
 }
 
 async function loadProjectMembers() {

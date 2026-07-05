@@ -78,7 +78,10 @@ async function loadPreprocessStatus(projectId) {
     if (data.project_status === 'PREPROCESSING' && !preprocessSSE) {
       connectPreprocessSSE(projectId);
     }
-  } catch { /* ignore */ }
+  } catch {
+    // 网络/解析故障 = 后端不可达（!resp.ok 的 404「暂无预处理」属正常，已在上面静默 return）。
+    if (typeof showToast === 'function') showToast('预处理状态加载失败（后端不可达？）', 'error');
+  }
 }
 
 function renderPreprocessPipeline(currentPhase) {

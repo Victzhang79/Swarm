@@ -460,7 +460,15 @@ function restorePipelineFromStatus(task) {
 function updateSubtaskList(subtasks) {
   if (!subtasks || !subtasks.length) return;
   const container = $('overview-subtasks');
-  container.innerHTML = subtasks.map(st => `
+  // 运行中 SSE tick 也要带【分母表头】——此前只重渲列表、把 renderOverviewSubtasks 的
+  // "子任务进度 X/Y" 表头整个覆盖丢掉，导致跑动过程中分母消失、直到选中/完成才回来。
+  // 据本批 subtasks 的状态实时算 done/total（终态计入完成）。
+  const _DONE = ['done', 'completed', 'success', 'merged'];
+  const done = subtasks.filter(st => _DONE.includes(String(st.status || '').toLowerCase())).length;
+  const total = subtasks.length;
+  container.innerHTML =
+    `<div style="margin-bottom:8px;font-size:12px;color:var(--text-muted)">子任务进度 ${done}/${total}</div>` +
+    subtasks.map(st => `
     <div class="subtask-row">
       <span class="subtask-dot ${st.status || 'pending'}"></span>
       <span class="subtask-desc">${escapeHtml(st.description || st.id)}</span>

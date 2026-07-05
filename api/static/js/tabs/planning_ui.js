@@ -232,7 +232,9 @@ async function loadPlanningArtifacts(taskId) {
           ${p.design_review ? `<div class="hint">评审：${escapeHtml(p.design_review.decision || '')}（打回 ${p.design_review.reject_count || 0} 次）</div>` : ''}
         </div>
       </details>`;
-  } catch { /* ignore */ }
+  } catch {
+    if (typeof showToast === 'function') showToast('规划产物加载失败（后端不可达？）', 'error');
+  }
 }
 
 // 向后兼容垫片：旧代码/SSE 处理可能直接调这些名字 → 统一转交单一控制器。
