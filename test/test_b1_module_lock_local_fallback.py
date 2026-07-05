@@ -47,6 +47,54 @@ def test_release_idempotent_when_redis_down(monkeypatch):
     b.release()
 
 
+class _FakeRedis:
+    """够用的假 Redis：SET NX 恒成功、Lua eval(释放/续期)返回 1。"""
+
+    def set(self, *a, **k):
+        return True
+
+    def eval(self, *a, **k):
+        return 1
+
+
+def test_redis_acquired_release_when_redis_down_doesnt_touch_local(monkeypatch):
+    # R1 复核(核心 bug)：A 经 Redis 获取；Redis 宕机后 B 拿到同 key 进程内锁；A.release() 此刻
+    # Redis 不可用，绝不能去释放 B 持有的进程内锁（threading.Lock 不校验属主→会误放→双写）。
+    pid = f"_b1_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(rc, "get_redis", lambda: _FakeRedis())
+    a = rc.ModuleLock(pid, "mod")
+    assert a.acquire() is True  # 经 Redis，_local_held=False
+
+    monkeypatch.setattr(rc, "get_redis", lambda: None)  # Redis 宕机
+    b = rc.ModuleLock(pid, "mod")
+    assert b.acquire() is True  # B 拿进程内锁
+
+    a.release()  # A 是 Redis 锁；此刻 Redis 挂 → 不得碰 B 的进程内锁
+
+    c = rc.ModuleLock(pid, "mod")
+    assert c.acquire() is False, "A(Redis锁)的 release 误放了 B 持有的进程内锁 → 双写"
+    b.release()
+    assert c.acquire() is True
+    c.release()
+
+
+def test_local_acquired_release_when_redis_back_up(monkeypatch):
+    # 对偶：A 经进程内锁获取(Redis 挂)；Redis 恢复后 release 必须释放【进程内锁】而非走 Redis 分支
+    # （否则本地锁永不释放 → 该 key 死锁）。
+    pid = f"_b1_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(rc, "get_redis", lambda: None)
+    a = rc.ModuleLock(pid, "mod")
+    assert a.acquire() is True  # 进程内，_local_held=True
+
+    monkeypatch.setattr(rc, "get_redis", lambda: _FakeRedis())  # Redis 恢复
+    a.release()  # 必须释放进程内锁
+
+    monkeypatch.setattr(rc, "get_redis", lambda: None)
+    b = rc.ModuleLock(pid, "mod")
+    assert b.acquire() is True, "进程内锁 release 后同 key 应可再获取（未死锁）"
+    b.release()
+
+
 def test_renew_noop_true_when_redis_down(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: None)
     pid = f"_b1_{uuid.uuid4().hex[:8]}"

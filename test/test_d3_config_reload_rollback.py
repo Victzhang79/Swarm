@@ -50,6 +50,26 @@ def test_rollback_removes_newly_added_key(tmp_path, monkeypatch):
     assert "SWARM_BRANDNEW" not in env.read_text(encoding="utf-8")
 
 
+def test_rollback_on_non_runtimeerror(tmp_path, monkeypatch):
+    # R1 复核：非 RuntimeError(如 env 畸形致 pydantic ValidationError)也须回滚+500，不留脏 .env
+    env = tmp_path / ".env"
+    env.write_text("EXISTING=1\nSWARM_TESTKEY=old\n", encoding="utf-8")
+    monkeypatch.setattr(cfgmod._app, "_PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("SWARM_TESTKEY", "old")
+
+    def _boom_value():
+        raise ValueError("malformed SWARM_NOTIFY_CHANNELS json")
+
+    monkeypatch.setattr("swarm.config.settings.reload_config", _boom_value)
+
+    with pytest.raises(HTTPException) as ei:
+        cfgmod._persist_env_updates({"SWARM_TESTKEY": "new"})
+    assert ei.value.status_code == 500, "非门禁失败应 500（门禁 RuntimeError 才 400）"
+    # 仍回滚
+    assert "SWARM_TESTKEY=old" in env.read_text(encoding="utf-8")
+    assert os.environ["SWARM_TESTKEY"] == "old"
+
+
 def test_commit_on_success(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("EXISTING=1\n", encoding="utf-8")

@@ -230,21 +230,32 @@ def _reload_with_rollback(env_path, prev_content, prev_env: dict, reload_fn) -> 
     """
     try:
         reload_fn()
-    except RuntimeError as exc:
+    except Exception as exc:  # noqa: BLE001
+        # R1 复核(MEDIUM)：任何 reload 失败都回滚，不只 RuntimeError——reload_config 先 new
+        # AppConfig()，环境变量(如 SWARM_NOTIFY_CHANNELS 的 JSON)畸形会抛 pydantic ValidationError
+        # (非 RuntimeError)；原只挡 RuntimeError → 这类失败留脏 .env+os.environ、重启 fail-fast。
         for _k, _prev in prev_env.items():
             if _prev is None:
                 os.environ.pop(_k, None)
             else:
                 os.environ[_k] = _prev
-        if prev_content is None:
-            try:
-                env_path.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            atomic_write_env(env_path, prev_content)
-        _app.logger.warning("配置热更被生产安全门禁拒绝，已回滚 .env + os.environ: %s", exc)
-        raise HTTPException(status_code=400, detail="配置变更被生产安全门禁拒绝，已回滚") from exc
+        try:
+            if prev_content is None:
+                try:
+                    env_path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                atomic_write_env(env_path, prev_content)
+        except Exception as _rb:  # noqa: BLE001
+            # R1 复核：回滚写盘二次失败(磁盘满/权限)——os.environ 已复原，.env 可能残留；
+            # 显式记【原异常 + 回滚异常】，不静默丢失原因。
+            _app.logger.error("配置热更回滚写 .env 失败（原异常=%s；回滚异常=%s）", exc, _rb)
+        if isinstance(exc, RuntimeError):
+            _app.logger.warning("配置热更被生产安全门禁拒绝，已回滚 .env + os.environ: %s", exc)
+            raise HTTPException(status_code=400, detail="配置变更被生产安全门禁拒绝，已回滚") from exc
+        _app.logger.error("配置热更 reload 失败（非门禁），已回滚 .env + os.environ: %s", exc)
+        raise HTTPException(status_code=500, detail="配置变更失败，已回滚") from exc
 
 
 # ─── 4. PUT /api/config ────────────────────────────

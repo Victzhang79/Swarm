@@ -33,9 +33,9 @@ def _warn_lock_fail_open_once() -> None:
     if not _lock_fail_open_warned:
         _lock_fail_open_warned = True
         logger.warning(
-            "[ModuleLock] Redis 不可用 → 模块锁降级为进程内 no-op（无跨进程互斥）。"
-            "单进程部署可忽略；多进程/多副本部署存在同模块并发写 split-brain 风险，"
-            "请启用 Redis（SWARM_REDIS_ENABLED=true）。"
+            "[ModuleLock] Redis 不可用 → 模块锁降级为【进程内 threading 锁】（B1：非原 no-op；"
+            "同进程内同 key 仍互斥，但无跨进程互斥）。单进程部署安全；多进程/多副本部署存在同模块"
+            "并发写 split-brain 风险，请启用 Redis（SWARM_REDIS_ENABLED=true）。"
         )
 
 
@@ -117,6 +117,11 @@ class ModuleLock:
         # 导致 B 能释放 A 持有的锁。uuid4 保证全局唯一。
         self.token = uuid.uuid4().hex
         self._held = False
+        # B1(R1 复核)：本锁是【经进程内 threading 锁】获取(acquire 时 Redis 不可用)还是【经 Redis】
+        # 获取。release 必须按【获取方式】释放，不能看 release 当刻的 Redis 状态——否则 Redis 在
+        # acquire 后 release 前宕机时，会去 release 一把本实例从未持有的进程内锁(threading.Lock 不
+        # 校验属主 → 可能误放【别的任务】持有的同 key 锁 → 双写)。
+        self._local_held = False
         # 对抗复核 4a：renew 连续【瞬时错误】计数。瞬时（Redis 抖动/超时）容忍到阈值才判失锁，
         # 避免一次网络 blip 就杀掉多小时长任务；确认被抢（Lua 返回 0）则立即判失锁不容忍。
         self._renew_transient_fails = 0
@@ -134,9 +139,11 @@ class ModuleLock:
             _warn_lock_fail_open_once()
             got = _local_lock_for(self.key).acquire(blocking=False)
             self._held = got
+            self._local_held = got  # 经进程内锁获取 → release 也走进程内锁
             return got
         ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         self._held = bool(ok)
+        self._local_held = False  # 经 Redis 获取 → release 走 Redis(即便届时 Redis 挂也不碰本地锁)
         if self._held:
             self._last_ok_monotonic = time.monotonic()  # Item 1：墙钟基准
         return self._held
@@ -190,13 +197,25 @@ class ModuleLock:
     def release(self) -> None:
         if not self._held:
             return
-        r = get_redis()
-        if r is None:
-            # B1：释放进程内回退锁（与 acquire 的 _local_lock_for 对称）。
+        # B1(R1 复核)：按【获取方式】释放，不看当刻 Redis 状态。
+        if self._local_held:
+            # 经进程内锁获取 → 释放同一把进程内锁（即便此刻 Redis 已恢复也不能走 Redis 分支，
+            # 否则本地锁永不释放 → 该 key 死锁）。
             try:
                 _local_lock_for(self.key).release()
-            except RuntimeError:
-                pass  # 理论上 _held=True 必持有；防御性吞未持有错
+            except RuntimeError as exc:
+                logger.warning("[ModuleLock] 进程内锁释放异常(锁=%s，疑重复释放): %s", self.key, exc)
+            self._local_held = False
+            self._held = False
+            return
+        r = get_redis()
+        if r is None:
+            # 经 Redis 获取但 release 时 Redis 挂 → 无法主动删 Redis key，靠 TTL 过期回收（不去碰
+            # 进程内锁——那可能是别的任务在本次 Redis 宕机窗口里持有的同 key 锁，误放会双写）。
+            logger.warning(
+                "[ModuleLock] release 时 Redis 不可用，锁 %s 无法主动释放，将靠 TTL(%ds)过期回收",
+                self.key, self.ttl_sec,
+            )
             self._held = False
             return
         try:

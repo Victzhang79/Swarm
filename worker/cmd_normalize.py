@@ -17,6 +17,9 @@ import re
 # 裸 python token：前后均无 word/./-，故 python3 / python3.11 / /usr/bin/python /
 # my-python / pythonista 均不误伤。比旧 l1_pipeline 的 `(^|[\s;&|])python(?=\s)` 更全
 # （能覆盖命令末尾的 python，且不依赖尾随空格）。
+# R1 复核注记：因不要求前置分隔符，引号内的裸 python 也会被替换（如 grep "python" →
+# grep "python3"）——与沙箱侧既有正则一致(此为有意收敛)。L1/build 命令极少含引号 python 字面量，
+# 实际影响可忽略；若将来需保护引号内容，再加引号感知。
 _PYTHON_TOKEN_RE = re.compile(r"(?<![\w./-])python(?![\w.-])")
 
 # 捕获 `-m py_compile <args...>`，args 直到命令分隔符（&& || ; | 换行）或行尾。
