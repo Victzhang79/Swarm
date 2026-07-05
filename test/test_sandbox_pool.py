@@ -28,7 +28,12 @@ class CodeResult:
 
 
 class FakeSandbox:
-    """模拟 E2B Sandbox 对象。"""
+    """模拟 E2B Sandbox 对象。
+
+    真实 E2B Sandbox【没有】template_id 属性——create 只把 template 用于日志/audit，
+    从不写回对象。这里刻意【不设】template_id，以免掩盖 release 桶键退化的生产 bug
+    （旧测试在此设了 template_id，让 getattr 反推桶键侥幸成功，掩盖了真实缺陷）。
+    """
     _counter = 0
 
     def __init__(self, sid=None):
@@ -36,7 +41,6 @@ class FakeSandbox:
             FakeSandbox._counter += 1
             sid = f"sbx-{FakeSandbox._counter}"
         self.sandbox_id = sid
-        self.template_id = None  # 可由测试覆写
 
 
 class FakeManager:
@@ -59,7 +63,7 @@ class FakeManager:
     def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual"):
         self._next_id += 1
         sbx = FakeSandbox(f"sbx-{self._next_id}")
-        sbx.template_id = template_id
+        # 刻意不设 sbx.template_id：真实 E2B 对象无此属性（见 FakeSandbox docstring）。
         self._created.append(sbx)
         self._meta[sbx.sandbox_id] = {
             "project_id": project_id,
@@ -628,6 +632,35 @@ def test_forget_borrowed_decrements_counter():
     print("  ✅ [回归] forget 借出态沙箱回退 borrowed 计数")
 
 
+def test_release_bucket_key_survives_missing_template_attr():
+    """[回归·桶键退化] 真实 E2B Sandbox 对象无 template_id 属性。
+
+    锁行为：acquire(tpl) 后 release 必须把沙箱归还到与 acquire【相同】的 (tpl) 桶，
+    而不是退化到空桶 ""；随后同 template acquire 能复用同一沙箱（不新建）。
+    这是生产 bug 的直接复现——旧 release 用 getattr(sandbox,"template_id") 恒得 None
+    → 归还进空桶 → 复用失效。前提断言假沙箱确实无该属性，防再被 mock 掩盖。
+    """
+    mgr = FakeManager()
+    pool = _make_pool(mgr)
+    sbx = pool.acquire("tpl-x")
+    assert not hasattr(sbx, "template_id"), (
+        "测试前提：假沙箱须无 template_id 属性（模拟真实 E2B），否则会掩盖桶键退化 bug"
+    )
+    pool.release(sbx, reusable=True)
+
+    st = pool.stats()
+    assert st["idle_by_template"].get("tpl-x") == 1, (
+        f"应归还到 tpl-x 桶，实际: {st['idle_by_template']}"
+    )
+    assert "" not in st["idle_by_template"], "退化到空桶 '' 即为 bug 复现"
+
+    # 同 template 再 acquire 必须复用同一沙箱（证明桶键两侧一致）
+    sbx2 = pool.acquire("tpl-x")
+    assert sbx2.sandbox_id == sbx.sandbox_id, "同 template 应复用同一沙箱"
+    assert len(mgr._created) == 1, "复用不应新建"
+    print("  ✅ [回归] release 桶键在沙箱无 template_id 属性时仍与 acquire 一致")
+
+
 def test_forget_idle_removes_from_pool():
     """[回归] forget 一个 idle 池内沙箱：从池桶移除死引用，不误减 borrowed。"""
     mgr = FakeManager()
@@ -673,6 +706,7 @@ def main():
         test_release_clean_failure_kills_instead_of_pooling,
         test_acquire_cleans_reused_sandbox,
         test_forget_borrowed_decrements_counter,
+        test_release_bucket_key_survives_missing_template_attr,
         test_forget_idle_removes_from_pool,
     ]
     passed = failed = 0

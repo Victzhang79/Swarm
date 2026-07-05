@@ -72,6 +72,10 @@ class HotSandboxPool:
         self._temp_sids: set[str] = set()
         # sandbox_id -> 首次创建时间(跨多次 acquire/release 保持，用于 TTL 判定)
         self._created_at: dict[str, float] = {}
+        # sandbox_id -> 借出时使用的 template_id。release 据此还原桶键，杜绝桶键退化：
+        # 真实 E2B Sandbox 对象没有 template_id 属性，不能靠 getattr(sandbox,"template_id")
+        # 反推桶键（恒 None → 退化到空桶，破坏 per-template/per-project 复用与隔离）。
+        self._template_by_sid: dict[str, str] = {}
 
         self._lock = threading.Lock()
 
@@ -187,6 +191,7 @@ class HotSandboxPool:
             self._kill_one(sid)
             with self._lock:
                 self._created_at.pop(sid, None)
+                self._template_by_sid.pop(sid, None)
 
         if candidate_entry is not None:
             sandbox = candidate_entry.sandbox
@@ -200,6 +205,7 @@ class HotSandboxPool:
                     self._kill_one(sandbox.sandbox_id)
                     with self._lock:
                         self._created_at.pop(sandbox.sandbox_id, None)
+                        self._template_by_sid.pop(sandbox.sandbox_id, None)
                     return self._create_and_return(template_id, project_id, task_id, key)
                 # 探针+清理成功：更新 meta 并返回
                 try:
@@ -212,6 +218,8 @@ class HotSandboxPool:
                 except Exception:
                     logger.warning("register_sandbox_meta failed for %s", sandbox.sandbox_id, exc_info=True)
                 with self._lock:
+                    # 记下本次借出使用的 template（release 据此还原桶键，两侧对称）
+                    self._template_by_sid[sandbox.sandbox_id] = template_id or ""
                     self._borrowed += 1
                 return sandbox
             else:
@@ -220,6 +228,7 @@ class HotSandboxPool:
                 self._kill_one(sandbox.sandbox_id)
                 with self._lock:
                     self._created_at.pop(sandbox.sandbox_id, None)
+                    self._template_by_sid.pop(sandbox.sandbox_id, None)
                 return self._create_and_return(template_id, project_id, task_id, key)
 
         # ── 池空，创建新沙箱 ──
@@ -252,6 +261,8 @@ class HotSandboxPool:
                 self._created_total += 1
                 # 记录首次创建时间（跨 acquire/release 保持，TTL 据此判定）
                 self._created_at[sandbox.sandbox_id] = time.monotonic()
+                # 记下 template（release 据此还原桶键，与 acquire 桶键对称）
+                self._template_by_sid[sandbox.sandbox_id] = template_id or ""
                 if not is_temp:
                     self._borrowed += 1
                 # 标记临时沙箱（release 时自动 kill）
@@ -297,7 +308,14 @@ class HotSandboxPool:
             _proj = _meta.get("project_id")
         except Exception:  # noqa: BLE001
             pass
-        key = self._bucket_key(getattr(sandbox, "template_id", None) or "", _proj)
+        # 桶键退化修复：不能用 getattr(sandbox,"template_id")——真实 E2B Sandbox 对象没有
+        # 该属性（create 只把 template 用于日志/audit，从不写回对象；register_sandbox_meta
+        # 也只存 project/task/source）。旧代码恒得 None → 归还退化到空桶 ""，与 acquire 用的
+        # 真实 template 桶不一致 → 复用失效 + 破坏隔离。改从 acquire 时记下的 _template_by_sid
+        # 取回，保持 _bucket_key(template, project) 两侧对称。
+        with self._lock:
+            _tpl = self._template_by_sid.get(sid, "")
+        key = self._bucket_key(_tpl, _proj)
 
         # 检查是否临时沙箱
         with self._lock:
@@ -310,6 +328,7 @@ class HotSandboxPool:
             self._kill_one(sid)
             with self._lock:
                 self._created_at.pop(sid, None)
+                self._template_by_sid.pop(sid, None)
             return
 
         should_kill = False
@@ -359,6 +378,7 @@ class HotSandboxPool:
             self._kill_one(sid)
             with self._lock:
                 self._created_at.pop(sid, None)
+                self._template_by_sid.pop(sid, None)
 
     def _server_alive_ids(self) -> set[str] | None:
         """拉 CubeSandbox 服务端权威存活沙箱 id 集合（用于清幽灵）。
@@ -423,6 +443,7 @@ class HotSandboxPool:
         with self._lock:
             for sid in to_kill + ghost_sids:
                 self._created_at.pop(sid, None)
+                self._template_by_sid.pop(sid, None)
         if ghost_sids:
             logger.info("reap 清理幽灵 idle 条目（服务端已消失）: %d 个", len(ghost_sids))
 
@@ -442,6 +463,7 @@ class HotSandboxPool:
         with self._lock:
             for sid in all_sids:
                 self._created_at.pop(sid, None)
+                self._template_by_sid.pop(sid, None)
 
     def forget(self, sandbox_id: str, *, was_borrowed: bool | None = None) -> bool:
         """从池账本中【剔除】一个 sid（外部已 kill，如 cancel_task / kill_by_task）。
@@ -468,6 +490,7 @@ class HotSandboxPool:
             # 2) borrowed 计数回退：若不在 idle 池里、且曾登记过 created_at，多半是借出态
             known = sandbox_id in self._created_at
             self._created_at.pop(sandbox_id, None)
+            self._template_by_sid.pop(sandbox_id, None)
             self._temp_sids.discard(sandbox_id)
             decr = was_borrowed if was_borrowed is not None else (known and not in_idle)
             if decr and self._borrowed > 0:
