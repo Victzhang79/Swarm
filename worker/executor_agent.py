@@ -1,0 +1,170 @@
+"""Worker Agent 循环 / 栈画像混入 —— 从 worker/executor.py 抽出（round26 god-file 治理 Step4）。
+
+AGENT 连通分量（4 方法）：worker agent 构建（_create_agent）、技术栈画像解析+进程级缓存
+（_resolve_project_stack）、剩余墙钟预算（_remaining_seconds）、单次 agent 运行（_run_agent，
+含 cancel/超时透传）。跨簇仅调 self._log（核心类，MRO 解析）；禁 eager import worker.executor
+（防 A6 环）——create_worker_agent/set_worker_context/stack_detect/tracing 等保持方法内 lazy。
+进程级栈画像缓存 _PROJECT_STACK_CACHE 只被 _resolve_project_stack 使用，随本簇迁入。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+# 进程级技术栈画像缓存（按 project_path/project_id）：避免每个子任务重复扫盘探测栈。
+_PROJECT_STACK_CACHE: dict[str, dict | None] = {}
+
+
+class _AgentLoopMixin:
+    """WorkerExecutor 的 agent 构建/运行 + 栈画像方法簇（见模块 docstring）。不持有自身状态。"""
+
+    def _create_agent(self) -> dict:
+        """创建 Worker Agent（延迟导入避免循环依赖）"""
+        from swarm.knowledge.service import set_worker_context
+        from swarm.worker.agent import create_worker_agent
+
+        set_worker_context(self.project_id)
+        return create_worker_agent(
+            subtask=self.subtask,
+            scope=self.effective_scope,
+            model_name=self.model_name,
+            model_strategy=self.model_strategy,
+            knowledge=self.knowledge,
+            project_id=self.project_id,
+            user_profile_prompt=self.user_profile_prompt,
+            shared_contract=self.shared_contract,
+            project_stack=self._resolve_project_stack(),
+        )
+
+    def _resolve_project_stack(self) -> dict | None:
+        """解析本项目技术栈画像，喂给 worker prompt（jakarta/javax 命名空间等硬前提）。
+
+        单一权威事实复用：优先取 detect_stack 已缓存到 projects.config 的画像；该画像若是
+        本次改动【新增 jvm 字段】前的旧缓存（无 servlet_namespace），或无 project record
+        （ad-hoc 运行），则当场对磁盘做一次确定性探测兜底——保证命名空间事实始终在场。
+        结果按 project_path 进程级缓存，避免每个子任务重复扫盘。
+        """
+        key = self.project_path or self.project_id or ""
+        if key in _PROJECT_STACK_CACHE:
+            return _PROJECT_STACK_CACHE[key]
+        profile: dict | None = None
+        # ① projects.config 缓存（detect_stack 产出的权威画像）
+        if self.project_id:
+            try:
+                from swarm.project import store as _pstore
+                rec = _pstore.get_project(self.project_id)
+                cached = (rec or {}).get("config", {}).get("project_stack")
+                if isinstance(cached, dict):
+                    profile = cached
+            except Exception:  # noqa: BLE001
+                profile = None
+        # ② 重探触发：旧缓存缺 jvm 命名空间 / 无 record / 【指纹漂移=栈已变更】。
+        # TD2606-B20：原仅在 servlet_namespace 缺失时兜底，盲信缓存的前后端裁决——栈迁移
+        # （javax→jakarta、加 JS 前端等）但 detect_stack 未重跑时，旧画像会当硬前提喂错 worker。
+        # 这里用廉价 compute_repo_fingerprint 比对缓存指纹，漂移则【整画像重探】（每进程每 key 仅一次）。
+        cur_fp = ""
+        if self.project_path:
+            try:
+                from swarm.brain.stack_detect import compute_repo_fingerprint
+                cur_fp = compute_repo_fingerprint(self.project_path)
+            except Exception:  # noqa: BLE001
+                cur_fp = ""
+        fp_drifted = bool(
+            profile and cur_fp and profile.get("fingerprint") and cur_fp != profile.get("fingerprint")
+        )
+        if fp_drifted:
+            logger.info("[STACK] 缓存技术栈指纹漂移(%s→%s)，整画像重探（B20）",
+                        profile.get("fingerprint"), cur_fp)
+        need_disk = fp_drifted or not profile or not (
+            (profile.get("jvm") or {}).get("servlet_namespace")
+        )
+        if need_disk and self.project_path:
+            try:
+                from swarm.brain.stack_detect import detect_stack_deterministic
+                fresh = detect_stack_deterministic(self.project_path)
+                if fp_drifted:
+                    profile = fresh  # 指纹漂移 → 整画像重取，不保留旧前后端裁决
+                    if cur_fp:
+                        profile["fingerprint"] = cur_fp
+                elif profile and (fresh.get("jvm") or {}).get("servlet_namespace"):
+                    # 保留权威画像其它字段，仅补 jvm（前后端裁决以缓存为准）
+                    profile = {**profile, "jvm": fresh["jvm"]}
+                else:
+                    profile = profile or fresh
+            except Exception:  # noqa: BLE001
+                pass
+        _PROJECT_STACK_CACHE[key] = profile
+        return profile
+
+    def _remaining_seconds(self) -> float:
+        if not self.start_time:
+            return float(self.max_execution_time)
+        return max(0.0, self.max_execution_time - (time.monotonic() - self.start_time))
+
+    async def _run_agent(self, human_message: str, *, step: str = "react",
+                         max_steps: int | None = None) -> str:
+        """调用 Agent 执行一步并返回结果（受总执行时间预算约束）。
+
+        max_steps：本步专属 recursion_limit 上限（默认用整体 max_iterations）。LOCATING 等
+        "理解/定位"阶段用更紧的 cap，逼模型少探索直接产出（RUN12 实证：预读注入了但模型仍
+        探索 167-286s 烧光预算）。撞 cap 非硬失败——下方 GraphRecursionError 优雅返回，交 CODING。
+        """
+        if self._agent is None:
+            return "❌ Agent 未创建"
+
+        remaining = self._remaining_seconds()
+        if remaining <= 1:
+            return f"❌ 执行超时（预算 {self.max_execution_time}s 已用尽）"
+
+        from swarm.tracing import merge_invoke_config, worker_agent_config
+
+        agent = self._agent["agent"]
+        source = "dispatch" if self.task_id else "standalone"
+        trace_cfg = worker_agent_config(
+            run_id=self.subtask.id,
+            project_id=self.project_id,
+            task_id=self.task_id,
+            subtask_id=self.subtask.id,
+            difficulty=self.subtask.difficulty.value
+            if hasattr(self.subtask.difficulty, "value")
+            else str(self.subtask.difficulty),
+            worker_phase=self.phase.value,
+            step=step,
+            source=source,
+        )
+        _limit = max_steps if (max_steps and max_steps > 0) else self.max_iterations
+        invoke_config = merge_invoke_config(
+            {"recursion_limit": _limit},
+            trace_cfg,
+        )
+        try:
+            result = await asyncio.wait_for(
+                agent.ainvoke(
+                    {"messages": [("human", human_message)]},
+                    config=invoke_config,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            self._log(f"Agent 调用超时（剩余预算 {remaining:.0f}s）")
+            return f"❌ Agent 调用超时（预算 {self.max_execution_time}s）"
+        except Exception as exc:
+            # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
+            # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
+            # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。
+            cls = type(exc).__name__
+            if "Recursion" in cls or "recursion" in str(exc).lower():
+                self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
+                return f"⚠️ Agent 达到迭代上限（{_limit}），已做改动交由确定性 L1 验证"
+            raise
+
+        # 提取最后一条 AI 消息
+        messages = result.get("messages", [])
+        if messages:
+            last = messages[-1]
+            return getattr(last, "content", str(last))
+        return "(Agent 无输出)"
