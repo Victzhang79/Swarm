@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Any
@@ -87,6 +88,23 @@ def get_redis() -> Any | None:
         return None
 
 
+# B1：Redis 不可用(禁用 or 宕机)时的【进程内】锁回退注册表。原 fail-open 让并发任务都
+# "持锁"→ 进程内双写；改退进程内锁：同 key 仍互斥(未持有者 acquire 返回 False，调用方优雅
+# 延后)，且不破坏 Redis 禁用的单进程模式(无争用即刻拿到)。跨进程互斥在无 Redis 下无法保证——
+# 多副本部署须启 Redis(见 B2)。key 有界(项目×模块)，不清理无碍。
+_LOCAL_LOCKS: dict[str, threading.Lock] = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
+
+
+def _local_lock_for(key: str) -> threading.Lock:
+    with _LOCAL_LOCKS_GUARD:
+        lk = _LOCAL_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _LOCAL_LOCKS[key] = lk
+        return lk
+
+
 class ModuleLock:
     """同项目同模块互斥锁（Redis SET NX + TTL）。"""
 
@@ -110,11 +128,13 @@ class ModuleLock:
     def acquire(self) -> bool:
         r = get_redis()
         if r is None:
-            # #14：Redis 不可用 → 锁降级为进程内 no-op（单进程默认有意行为）。
-            # 但多进程/多副本部署下这意味着【无跨进程互斥】，须可观测。首次降级打一次 WARNING。
+            # B1：Redis 不可用 → 退【进程内锁】(非原 fail-open no-op：那让并发任务都"持锁"→
+            # 进程内双写)。同 key 已被本进程另一任务持有 → 非阻塞 acquire 返回 False，调用方优雅
+            # 延后("模块锁被占用请稍后重试")。首次降级打一次 WARNING(多副本下无跨进程互斥,须可观测)。
             _warn_lock_fail_open_once()
-            self._held = True
-            return True
+            got = _local_lock_for(self.key).acquire(blocking=False)
+            self._held = got
+            return got
         ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         self._held = bool(ok)
         if self._held:
@@ -172,6 +192,11 @@ class ModuleLock:
             return
         r = get_redis()
         if r is None:
+            # B1：释放进程内回退锁（与 acquire 的 _local_lock_for 对称）。
+            try:
+                _local_lock_for(self.key).release()
+            except RuntimeError:
+                pass  # 理论上 _held=True 必持有；防御性吞未持有错
             self._held = False
             return
         try:
