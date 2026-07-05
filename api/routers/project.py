@@ -165,7 +165,7 @@ async def create_project(req: ProjectCreateRequest, request: Request):
         except Exception as e:
             _app.logger.error(f"Preprocessing failed for project {project_id}: {e}")
 
-    asyncio.create_task(_run_preprocess())
+    _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
 
     return {"status": "ok", "project": project}
 
@@ -265,7 +265,7 @@ async def trigger_preprocess(project_id: str, request: Request):
         except Exception:
             _app.logger.exception("Preprocessing failed for project %s", project_id)
 
-    asyncio.create_task(_run_preprocess())
+    _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
     _app.logger.info("Preprocess queued for project %s path=%s", project_id, project_path)
 
     return {"status": "ok", "message": f"Preprocessing started for project {project_id}"}

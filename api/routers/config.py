@@ -996,7 +996,7 @@ async def probe_models(request: Request):
             job["error"] = str(exc)
             _app.logger.exception("模型能力探测失败 provider=%s", provider_id)
 
-    asyncio.create_task(_run_probe())
+    _app._spawn_bg(_run_probe())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
     return {"status": "started", "job": job}
 
 
