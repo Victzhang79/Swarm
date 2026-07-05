@@ -118,8 +118,11 @@ async def verify_l2(state: BrainState) -> dict:
             )
 
     if (merged_diff or "").strip() and test_cmd.strip():
-        sandbox_result = nodes._try_l2_sandbox_verify(
-            project_id, merged_diff, test_cmd, timeout=180
+        # R23-1 续（round25 #10）：_try_l2_sandbox_verify/_try_l2_local_verify 内含 subprocess.run
+        # (timeout 180s)，是同步阻塞；verify_l2 是 async 节点——直接调用会卡死事件循环(SSE/心跳/并发)。
+        # 与主路径 run_integration_review 同样卸到线程池(asyncio.to_thread 拷贝 contextvars，沙箱上下文照常)。
+        sandbox_result = await asyncio.to_thread(
+            nodes._try_l2_sandbox_verify, project_id, merged_diff, test_cmd, timeout=180
         )
         if sandbox_result is not None:
             logger.info("[VERIFY_L2] 沙箱结果: %s", "通过" if sandbox_result else "未通过")
@@ -127,7 +130,8 @@ async def verify_l2(state: BrainState) -> dict:
                 return _l2_failure_state(subtask_results)
             return {"l2_passed": sandbox_result}
 
-        local_result = nodes._try_l2_local_verify(
+        local_result = await asyncio.to_thread(
+            nodes._try_l2_local_verify,
             project_id, merged_diff, test_cmd, timeout=180,
             base_ref=state.get("base_commit"),
         )
@@ -205,7 +209,10 @@ async def verify_l3(state: BrainState) -> dict:
             if l3_push_enabled():
                 project_path = nodes._get_project_path(project_id)
                 if project_path:
-                    branch, push_err = push_merged_diff_branch(
+                    # R23-1 续（round25 #10）：push_merged_diff_branch 内含 git fetch/push(timeout 可达
+                    # 300s)，同步阻塞；verify_l3 是 async 节点 → 卸线程池，与下方 trigger_and_poll 同样处理。
+                    branch, push_err = await asyncio.to_thread(
+                        push_merged_diff_branch,
                         project_path, merged_diff, task_id or "unknown", base_ref=ref
                     )
                     if branch:
