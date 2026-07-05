@@ -1078,6 +1078,22 @@ def _attempt_build_repair(
                 _accum(fn())
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[L1.2.1·repair] %s adapter 异常(跳过): %s", lang, exc)
+
+    # 治本 A2 多栈：从项目【自身兄弟 manifest】找缺失依赖的权威坐标注入到缺它的 manifest
+    # （Go/npm/Cargo 等价 Maven brain 侧 _inject_missing_maven_deps）。与上面工具级 adapter
+    # （goimports/cargo fix/eslint）互补：那些解决"import 写法/格式"，这里解决"整个依赖没声明"。
+    # 只用项目自证坐标、绝不臆造版本、非项目写死；触达 manifest 经 (count,paths) 回传(C9)。
+    # 同 SWARM_WORKER_DEP_REPAIR 逃生阀（与 Java 侧 dependency-repair 同闸）。
+    if os.environ.get("SWARM_WORKER_DEP_REPAIR", "true").lower() not in ("false", "0", "no"):
+        from swarm.worker.sibling_dep_repair import repair_from_sibling_manifests
+        _sib_stack = {"ts": "npm", "rust": "cargo", "go": "go"}
+        for lang, file_signal, _fn in adapters:
+            stack_key = _sib_stack.get(lang)
+            if stack_key and eligible(lang, file_signal):
+                try:
+                    _accum(repair_from_sibling_manifests(project_path, build_output, mods, stack_key))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[L1.2.1·repair] A2 %s sibling-dep 异常(跳过): %s", stack_key, exc)
     return total, paths
 
 
