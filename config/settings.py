@@ -660,7 +660,13 @@ class AppConfig(BaseSettings):
     token_ttl_hours: int = 0  # SWARM_TOKEN_TTL_HOURS
     # 遗留单 Key（非空且与 user token 匹配时视为 admin）
     api_key: str = ""
-    max_task_tokens: int = 500_000  # 单任务 token 估算硬上限（P1）
+    max_task_tokens: int = 500_000  # 单任务 token 硬上限【基线】（P1；0=关闭闸门）
+    # round27：token 上限对齐下方墙钟的【弹性预算】= base + per_subtask×子任务数。
+    # 原 flat 500k 标定于 P1 的估算语义（description/diff 尺寸 sanity）；round26 B2 换成
+    # 真实 LLM 累计主导后，ULTRA 任务仅规划期即 >800k（round27 E2E 86d24aa0 实测 826k 被
+    # 误杀）——弹性随规划揭示的任务规模放宽，与墙钟同理【绝不误杀合法大型任务】，
+    # 真失控仍由 base（规划前）与弹性上限（规划后）兜。0=弹性项关闭（退回 flat base）。
+    max_task_tokens_per_subtask: int = Field(150_000, ge=0)
     # P1-B：单次 Brain 执行墙钟【弹性】上限，防失控任务（replan 空转/卡节点）无上限占沙箱/GPU。
     # ★整体考虑：绝不误杀合法大型任务★——实测合法 E2E 大任务跑 7-8h（见 DEVLOG round9 7h45m）。
     # 故用【弹性预算】：有效上限 = base + per_subtask×子任务数，随规划揭示的任务规模动态放宽

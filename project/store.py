@@ -1794,9 +1794,14 @@ def check_task_token_limit(
     description: str = "",
     merged_diff: str = "",
     subtask_results: dict[str, Any] | None = None,
+    subtask_count: int | None = None,
     conn_str: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """返回 (within_limit, token_usage_estimate)。"""
+    """返回 (within_limit, token_usage_estimate)。
+
+    round27 弹性预算：有效上限 = max_task_tokens + max_task_tokens_per_subtask×subtask_count
+    （与墙钟 P1-B 同理，随规划揭示的任务规模放宽；规划前 count 为 None/0 只用 base，
+    防规划自身失控）。base=0 维持既有"关闭闸门"语义。"""
     from swarm.config.settings import get_config
 
     usage = estimate_token_usage(
@@ -1817,7 +1822,13 @@ def check_task_token_limit(
     usage["real_recorded"] = real_total
     usage["total"] = total
     usage["estimate"] = real_total <= est_total
-    limit = get_config().max_task_tokens
+    _cfg = get_config()
+    limit = _cfg.max_task_tokens
+    if limit > 0 and subtask_count:
+        per = int(getattr(_cfg, "max_task_tokens_per_subtask", 0) or 0)
+        if per > 0:
+            limit = limit + per * int(subtask_count)
+    usage["limit_effective"] = limit
     if limit > 0 and total > limit:
         update_task(
             task_id,

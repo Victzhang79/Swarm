@@ -485,14 +485,17 @@ async def _stream_brain_events(
                     description=fresh.get("description") or "",
                     merged_diff=output.get("merged_diff") or fresh.get("merged_diff") or "",
                     subtask_results=output.get("subtask_results"),
+                    # round27 弹性预算：复用墙钟维护的子任务数（规划揭示后放宽，与 P1-B 同理）
+                    subtask_count=_wc_subtasks,
                 )
                 if not ok:
                     await _emit(queue, {
                         "step": "token_limit",
                         "status": "failed",
                         "message": (
-                            f"单任务 token 估算超限 ({usage.get('total')}/"
-                            f"{get_config().max_task_tokens})"
+                            f"单任务 token 超限 ({usage.get('total')}/"
+                            f"{usage.get('limit_effective', get_config().max_task_tokens)}"
+                            f"，弹性上限=base+per_subtask×{_wc_subtasks})"
                         ),
                         "mode": "brain",
                         "progress": 100,

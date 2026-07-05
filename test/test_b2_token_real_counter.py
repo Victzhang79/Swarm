@@ -70,3 +70,45 @@ def test_limit_falls_back_to_estimate_when_no_real(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q", "-p", "no:warnings"]))
+
+def test_limit_elastic_per_subtask(monkeypatch):
+    """round27（E2E 实测 86d24aa0 误杀）：B2 换真实累计主导后，flat 500k 在 ULTRA 规划期
+    即被合法消耗打穿（58 子任务规划真实 ~826k）→ 与墙钟 P1-B 同法改弹性预算：
+    有效上限 = base + per_subtask×子任务数。规划前（subtask_count=0/None）退回 base。"""
+    usage_tracker.clear_task_total("t-b2e")
+    with usage_tracker._lock:
+        usage_tracker._task_token_totals["t-b2e"] = 826_413  # 实测规划期真实累计
+    monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
+    fake_cfg = MagicMock()
+    fake_cfg.max_task_tokens = 500_000
+    fake_cfg.max_task_tokens_per_subtask = 150_000
+    monkeypatch.setattr("swarm.config.settings.get_config", lambda: fake_cfg)
+    try:
+        # 58 子任务 → 500k + 8.7M：合法大任务不被误杀
+        ok, usage = store.check_task_token_limit("t-b2e", description="x", subtask_count=58)
+        assert ok is True, usage
+        # 规划前（count=None）→ 只有 base：826k > 500k 仍拦（防规划自身失控）
+        ok2, _ = store.check_task_token_limit("t-b2e", description="x")
+        assert ok2 is False
+        # 真失控（超弹性上限）仍拦：2 子任务 → 500k+300k=800k < 826k
+        ok3, _ = store.check_task_token_limit("t-b2e", description="x", subtask_count=2)
+        assert ok3 is False
+    finally:
+        usage_tracker.clear_task_total("t-b2e")
+
+
+def test_limit_zero_base_disables_gate(monkeypatch):
+    """base=0 维持既有"关闭闸门"语义（弹性项不改变该开关）。"""
+    usage_tracker.clear_task_total("t-b2f")
+    with usage_tracker._lock:
+        usage_tracker._task_token_totals["t-b2f"] = 99_999_999
+    monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
+    fake_cfg = MagicMock()
+    fake_cfg.max_task_tokens = 0
+    fake_cfg.max_task_tokens_per_subtask = 150_000
+    monkeypatch.setattr("swarm.config.settings.get_config", lambda: fake_cfg)
+    try:
+        ok, _ = store.check_task_token_limit("t-b2f", description="x", subtask_count=58)
+        assert ok is True
+    finally:
+        usage_tracker.clear_task_total("t-b2f")

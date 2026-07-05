@@ -36,7 +36,7 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
      re-export 保可寻址。测试 patch 陷阱：_give_up_preserve_build 内部同簇互调
      (_proj_path_from_state/_generate_compile_stub) 在 planning_core 命名空间解析——patch 目标已迁
      planning_core（见 test_ladder_giveup_preserve_build）。
-  D. ✅[已拆] AUDIT 安全审计节点（叶，未被 patch）→ brain/nodes/audit.py（_run_security_audit）。
+  D. ✅[已拆] AUDIT 安全审计节点（叶，未被 patch）→ brain/nodes/audit_node.py（_run_security_audit；round27 改名——audit.py 子模块会遮蔽父包的 audit 函数绑定致 6 处调用点 TypeError）。
   C. ✅[已拆·round26] handle_failure 族 → brain/nodes/failure.py：_handle_failure_impl（~660 行）
      + _l1_details_of 已外置；薄包装 handle_failure 仍留本 __init__（round24 A4 plan 持久化 seam），
      其 bare 调用 + patch("swarm.brain.nodes._handle_failure_impl") 经底部 re-export 解析保可寻址。
@@ -134,7 +134,7 @@ from swarm.brain.nodes.maven_repair import (  # noqa: E402,F401
     _pkg_match_tokens,
 )
 # god-file 簇D：re-export AUDIT 安全审计节点（保 swarm.brain.nodes.X 可寻址；未被 patch）
-from swarm.brain.nodes.audit import _run_security_audit  # noqa: E402,F401
+from swarm.brain.nodes.audit_node import _run_security_audit  # noqa: E402,F401
 # god-file 主线1：re-export 规划/恢复核心簇（恢复阶梯 + B-2 pom 脚手架连通分量）。
 # 保 swarm.brain.nodes.X 可寻址；__init__ 内调用点(handle_failure/_handle_failure_impl)以此绑定解析，
 # patch(swarm.brain.nodes.X) 对其生效。planning_core 内部同簇互调须 patch planning_core 命名空间。
