@@ -221,6 +221,32 @@ async def test_config(request: Request):
     return results
 
 
+def _reload_with_rollback(env_path, prev_content, prev_env: dict, reload_fn) -> None:
+    """D3：reload 若因生产安全门禁 RuntimeError 拒绝 → 原子回滚 .env + os.environ 并抛 400。
+
+    热更端点(routing/model-providers/notify)原直接 write+reload 无回滚：reload 失败会留下
+    脏 .env(下次重启 fail-fast)+脏 os.environ(后续所有 reload 都失败)。与 /api/config 的
+    P1-D 回滚同源。快照(prev_content/prev_env)须在写盘前取；prev_env=本次变更键的原 os.environ 值。
+    """
+    try:
+        reload_fn()
+    except RuntimeError as exc:
+        for _k, _prev in prev_env.items():
+            if _prev is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _prev
+        if prev_content is None:
+            try:
+                env_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            atomic_write_env(env_path, prev_content)
+        _app.logger.warning("配置热更被生产安全门禁拒绝，已回滚 .env + os.environ: %s", exc)
+        raise HTTPException(status_code=400, detail="配置变更被生产安全门禁拒绝，已回滚") from exc
+
+
 # ─── 4. PUT /api/config ────────────────────────────
 @router.put("/api/config", tags=["配置"])
 async def update_config(request: Request):
@@ -407,15 +433,17 @@ async def update_routing(request: Request):
         router = ModelRouter()
         return {"status": "no_changes", "message": "未检测到有效变更", **router.get_routing_table()}
 
+    # D3：写盘前快照，供 reload 被生产安全门禁拒绝时原子回滚。
+    env_path = _app._PROJECT_ROOT / ".env"
+    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+    _prev_env = {k: os.environ.get(k) for k in update_map}
+
     # 更新 os.environ
     for k, v in update_map.items():
         os.environ[k] = v
 
     # 写入 .env 文件
-    env_path = _app._PROJECT_ROOT / ".env"
-    existing_lines: list[str] = []
-    if env_path.exists():
-        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+    existing_lines = _prev_content.splitlines() if _prev_content is not None else []
 
     updated_keys: set[str] = set()
     new_lines: list[str] = []
@@ -441,8 +469,8 @@ async def update_routing(request: Request):
 
     _app.logger.info(f"Updated routing .env + os.environ with keys: {list(update_map.keys())}")
 
-    # 重新加载配置
-    _app.reload_config()
+    # 重新加载配置（D3：失败回滚 .env + os.environ）
+    _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
     _app.logger.info("Config reloaded after routing update")
 
     from swarm.models.router import ModelRouter
@@ -542,29 +570,8 @@ async def update_model_providers(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 providers/model_providers/model_sizes 字段")
 
-    # 写 .env + 同步 os.environ
-    env_path = _app._PROJECT_ROOT / ".env"
-    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    updated_keys: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s:
-            k = s.partition("=")[0].strip().upper()
-            if k in update_map:
-                new_lines.append(f"{k}={update_map[k]}")
-                updated_keys.add(k)
-                continue
-        new_lines.append(line)
-    for k, v in update_map.items():
-        if k not in updated_keys:
-            new_lines.append(f"{k}={v}")
-    atomic_write_env(env_path, "\n".join(new_lines) + "\n")
-    for k, v in update_map.items():
-        os.environ[k] = v
-
-    from swarm.config.settings import reload_config as _reload_config
-    _reload_config()
+    # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
+    _persist_env_updates(update_map)
     try:
         from swarm.config import secret_store
         secret_store.invalidate_cache()
@@ -577,9 +584,15 @@ async def update_model_providers(request: Request):
 
 
 def _persist_env_updates(update_map: dict[str, str]) -> None:
-    """写 .env + 同步 os.environ + reload_config（抽取自 update_model_providers，供 kb 端点等复用）。"""
+    """写 .env + 同步 os.environ + reload_config（供 model-providers/notify/kb 端点复用）。
+
+    D3：reload 被生产安全门禁拒绝(RuntimeError)→ 原子回滚 .env + os.environ（原直接 reload
+    无回滚，失败留脏 .env 致重启 fail-fast、脏 os.environ 致后续 reload 全失败）。
+    """
     env_path = _app._PROJECT_ROOT / ".env"
-    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+    prev_env = {k: os.environ.get(k) for k in update_map}
+    existing_lines = prev_content.splitlines() if prev_content is not None else []
     updated_keys: set[str] = set()
     new_lines: list[str] = []
     for line in existing_lines:
@@ -598,7 +611,7 @@ def _persist_env_updates(update_map: dict[str, str]) -> None:
     for k, v in update_map.items():
         os.environ[k] = v
     from swarm.config.settings import reload_config as _reload_config
-    _reload_config()
+    _reload_with_rollback(env_path, prev_content, prev_env, _reload_config)
 
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
@@ -825,26 +838,9 @@ async def update_notify_channels(request: Request):
             "events": events,
         })
 
-    env_path = _app._PROJECT_ROOT / ".env"
-    env_key = "SWARM_NOTIFY_CHANNELS"
+    # 写 .env + os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     val = _json.dumps(clean, ensure_ascii=False)
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    found = False
-    out: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s and s.partition("=")[0].strip().upper() == env_key:
-            out.append(f"{env_key}={val}")
-            found = True
-        else:
-            out.append(line)
-    if not found:
-        out.append(f"{env_key}={val}")
-    atomic_write_env(env_path, "\n".join(out) + "\n")
-    os.environ[env_key] = val
-
-    from swarm.config.settings import reload_config as _reload_config
-    _reload_config()
+    _persist_env_updates({"SWARM_NOTIFY_CHANNELS": val})
     _app.logger.info("Updated notify channels: %d 个", len(clean))
     return {"status": "ok", "count": len(clean)}
 
