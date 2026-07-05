@@ -1246,6 +1246,14 @@ async def metrics(request: Request):
     lines.append("# HELP swarm_redis_enabled Redis backend enabled (1/0)")
     lines.append("# TYPE swarm_redis_enabled gauge")
     lines.append(f"swarm_redis_enabled {1 if redis_enabled() else 0}")
+    # E1：降级路径分类计数——运维据此分清"预期降级"vs"某路径被高频触发的真 bug"。
+    from swarm.infra.degrade import degrade_counts
+    _dg = degrade_counts()
+    lines.append("# HELP swarm_degrade_total Fail-soft degrade events by category")
+    lines.append("# TYPE swarm_degrade_total counter")
+    for _cat, _n in sorted(_dg.items()):
+        _safe = str(_cat).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        lines.append(f'swarm_degrade_total{{category="{_safe}"}} {int(_n)}')
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 

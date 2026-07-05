@@ -525,6 +525,8 @@ class KnowledgeUpdater:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[Updater] 依赖图重建失败(忽略): %s (%s)", project_id, exc)
+            from swarm.infra.degrade import record_degrade
+            record_degrade("knowledge.depgraph_rebuild")  # E1
 
     async def _defer_embedding_retry(
         self, project_id: str, change: FileChange

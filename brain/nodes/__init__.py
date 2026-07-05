@@ -226,6 +226,8 @@ async def analyze(state: BrainState) -> dict:
             recent_summaries = await load_recent_task_summaries(project_id)
         except Exception as _rtexc:  # noqa: BLE001
             logger.warning("[ANALYZE] 近期任务摘要加载失败(降级空,不中断规划): %s", _rtexc)
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.analyze.summary_load")  # E1
             recent_summaries = []
     recent_tasks_prompt = format_recent_tasks_for_brain(recent_summaries or [])
     session_meta = state.get("session_metadata") or {}
@@ -2540,9 +2542,13 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {_fs.reasoning}")
     except json.JSONDecodeError as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.handle_failure.llm_fallback")  # E1
         strategy = "retry"
     except Exception as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 分析异常 → 确定性回退 retry（非 LLM 建议）: {e}")
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.handle_failure.llm_fallback")  # E1
         strategy = "retry"
 
     # ── A4 治本(round11)：把 brain 诊断作为硬约束注入【重试 worker 提示】──
