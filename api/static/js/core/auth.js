@@ -216,16 +216,17 @@ async function logoutUser() {
   } catch (_e) {
     cookieCleared = false;
   }
-  // 网络/服务端失败 → delete_cookie 未送达，Cookie 可能仍存活（同源请求会继续带凭据鉴权）。
-  // 显式告警，别让用户误以为已彻底登出（否则是静默的伪退出/凭据残留）。
-  if (!cookieCleared) {
-    showToast('退出请求未送达，登录 Cookie 可能未清除，请关闭浏览器以确保彻底登出', 'warning');
-  }
+  // 本地态清理【无条件先行】：不依赖后面的 UI 调用成功（showToast 若抛异常也不能吞掉登出清理）。
   localStorage.removeItem(AUTH_TOKEN_KEY);
   localStorage.removeItem(AUTH_EXPIRES_KEY);
   currentUser = null;
   updateAuthUI();
   showLoginModal();
+  // 网络/服务端失败 → delete_cookie 未送达，Cookie 可能仍存活（同源请求会继续带凭据鉴权）。
+  // 本地态已清干净后再显式告警，别让用户误以为已彻底登出（否则是静默的伪退出/凭据残留）。
+  if (!cookieCleared) {
+    showToast('退出请求未送达，登录 Cookie 可能未清除，请关闭浏览器以确保彻底登出', 'warning');
+  }
 }
 
 async function refreshCurrentUser() {
