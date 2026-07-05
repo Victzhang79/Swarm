@@ -78,6 +78,12 @@ packages = [
     "swarm.worker",
 ]
 
+# round24 F4（评估结论=WONTFIX）：`"swarm"="."` 让仓库根即 swarm 包根（顶层 brain/worker/
+# api/... 直接是 swarm.brain/...）。此少见布局是 [tool.pyright] reportMissingImports="none"
+# 的根源（pyright 跟不上该映射）。规整到标准 src/swarm/ 布局需把所有顶层包挪进 swarm/ 并同步
+# CI/Docker/scripts/package-data 的路径引用——大面积机械改动，收益仅"去掉一个 pyright 变通"，
+# 对已跑通系统风险≫收益。故不动，文档标注；未来若做 src-layout 迁移，import(已是 swarm.X)不变、
+# 只需搬目录 + 改本处映射为 "swarm"="src/swarm"。
 [tool.setuptools.package-dir]
 "swarm" = "."
 
