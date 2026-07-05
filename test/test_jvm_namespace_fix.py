@@ -406,7 +406,6 @@ from swarm.worker.l1_pipeline import _derive_full_build_command
 
 
 def test_derive_build_is_stack_general():
-    import os
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         # Java/maven

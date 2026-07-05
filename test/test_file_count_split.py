@@ -25,7 +25,7 @@ from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 
 def _entity_files(entity: str):
     """一个实体的典型 RuoYi 全栈 6 文件。"""
-    j = f"ruoyi-alarm/src/main/java/com/ruoyi/alarm"
+    j = "ruoyi-alarm/src/main/java/com/ruoyi/alarm"
     return [
         f"{j}/domain/{entity}.java",
         f"{j}/mapper/{entity}Mapper.java",

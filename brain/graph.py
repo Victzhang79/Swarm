@@ -165,7 +165,7 @@ def after_tech_design(state: BrainState) -> Literal["clarify", "review_design"]:
                  if isinstance(fi, dict) and fi.get("verdict") == "false" and not fi.get("grounded")]
     logger.info(
         "[ROUTE] TECH_DESIGN → REVIEW_DESIGN (无确定性坐实虚假前提%s)",
-        f"；%d 个未坐实 verdict=false 降级 advisory 不阻断" % len(_advisory) if _advisory else "",
+        "；%d 个未坐实 verdict=false 降级 advisory 不阻断" % len(_advisory) if _advisory else "",
     )
     return "review_design"
 
