@@ -249,7 +249,9 @@ def test_contract_retry_has_counter_and_ceiling():
     """契约失败分支应有 subtask_retry_counts 计数 + 上限 + 超限升级。"""
     from swarm.brain import nodes
 
-    src = inspect.getsource(nodes)
+    # round26：_handle_failure_impl 已外置 brain/nodes/failure.py（re-export 保 nodes.* 可寻址）。
+    # getsource 目标随之指向该函数本身（比 getsource(整个 nodes 模块) 更精准、不随其它节点搬动而抖）。
+    src = inspect.getsource(nodes._handle_failure_impl)
     # 定位契约分支
     idx = src.index('verification_failure") == "contract"')
     window = src[idx: idx + 1400]

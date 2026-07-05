@@ -47,7 +47,6 @@ Theme A / A7 — god-file 拆解后续清单（本文件 ~4000 行，round24 只
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -62,8 +61,6 @@ from swarm.brain.context_log import init_task_context, sliding_context_prompt, t
 from swarm.brain.prompts import (
     ANALYZE_SYSTEM,
     ANALYZE_USER,
-    HANDLE_FAILURE_SYSTEM,
-    HANDLE_FAILURE_USER,
     LEARN_FAILURE_SYSTEM,
     LEARN_FAILURE_USER,
     LEARN_SUCCESS_SYSTEM,
@@ -163,7 +160,6 @@ from swarm.brain.nodes.planning_core import (  # noqa: E402,F401
 )
 from swarm.brain.llm_schemas import (  # noqa: E402
     ComplexityAssessmentResponse,
-    FailureStrategyResponse,
 )
 from swarm.types import (
     Complexity,
@@ -191,24 +187,8 @@ logger = logging.getLogger(__name__)
 # 操作意图关键词
 
 
-
-
-
-
-
-
 # 子任务 writable 文件数告警阈值：超过则疑似规划过度圈定(把整个模块塞进 scope)。
 _SCOPE_WRITABLE_WARN_THRESHOLD = 20
-
-
-
-
-
-
-
-
-
-
 
 
 # ══════════════════════════════════════════════
@@ -232,19 +212,9 @@ def _get_brain_llm():
     return llm
 
 
-
-
-
-
 # ══════════════════════════════════════════════
 # 节点函数
 # ══════════════════════════════════════════════
-
-
-
-
-
-
 
 
 async def analyze(state: BrainState) -> dict:
@@ -1231,10 +1201,6 @@ def confirm_plan(state: BrainState) -> dict:
     return _patch_out
 
 
-
-
-
-
 async def _dispatch_to_worker(
     subtask: SubTask,
     knowledge_context: KnowledgeContext,
@@ -1356,18 +1322,6 @@ async def _dispatch_to_worker(
         )
 
 
-
-
-def _l1_details_of(subtask_results: dict, fid: str) -> dict:
-    """取子任务的 L1 详情(含 build_output/编译标志),WorkerOutput / dict 两种形态兼容。"""
-    out = subtask_results.get(fid)
-    if isinstance(out, WorkerOutput):
-        return out.l1_details or {}
-    if isinstance(out, dict):
-        return out.get("l1_details", {}) or {}
-    return {}
-
-
 # god-file 主线1：恢复阶梯 + B-2 pom 脚手架连通分量(18 函数 + 3 常量)已抽出 →
 # brain/nodes/planning_core.py（re-export 见文件顶部；调用点仍以 swarm.brain.nodes.X 解析）。
 
@@ -1391,665 +1345,13 @@ async def handle_failure(state: BrainState) -> dict:
     return result
 
 
-async def _handle_failure_impl(state: BrainState) -> dict:
-    """HANDLE_FAILURE 核心逻辑（按 strategy 分支：retry / retry_alternate / replan / escalate）。
-
-    输入: failed_subtask_ids, subtask_results, plan, merge_conflicts
-    注意：就地改 plan 的持久化由外层 handle_failure 包装统一回传 plan 保证（brain#3）。
-    """
-    failed_ids = list(state.get("failed_subtask_ids", []))
-    subtask_results = dict(state.get("subtask_results", {}))
-    plan_obj = state.get("plan")
-    strategy = "retry"
-
-    logger.info(f"[HANDLE_FAILURE] 处理 {len(failed_ids)} 个失败子任务")
-
-    if state.get("verification_failure") == "l2":
-        # H2 修复：L2 失败 replan 也要走 replan_count 计数/上限，否则绕过熔断可无限重规划
-        # （原直接 return replan 不自增计数，仅靠 recursion_limit=50 兜底，违背承诺）。
-        _l2_replan = state.get("replan_count", 0) + 1
-        _l2_max = get_config().model.max_retries
-        if _l2_replan > _l2_max:
-            logger.warning(
-                "[HANDLE_FAILURE] L2 集成验证失败且 replan 已达上限(%d 次) → 升级人工审核",
-                _l2_max,
-            )
-            return {
-                "failure_strategy": "escalate",
-                "failed_subtask_ids": failed_ids,
-                "failure_escalated": True,
-                "verification_failure": None,
-                "l2_passed": False,
-                "replan_count": _l2_replan,
-            }
-        # TD2606-B8：L2 失败已归因到具体子任务（verify_l2 设 l2_targeted）+ 存在成功兄弟
-        # → 定向恢复：只重做归因到的子任务、保留成功成果，不全量推倒重来。replan_count 仍
-        # 自增（与全量 replan 共用熔断，上面已判上限），杜绝定向重试→L2→定向重试无限循环。
-        if state.get("l2_targeted") and failed_ids:
-            succeeded_siblings = [
-                sid for sid, out in subtask_results.items()
-                if sid not in failed_ids and l1_passed(out)
-            ]
-            if succeeded_siblings:
-                # 治本 replan 死循环·E：内部包/上游模块未就绪类失败【不清零重试计数】——它非 L2 偶发，
-                # 是结构性不可满足；清零会让 _deepest 永不达 give_up 阈值，与 BLOCKED→replan 合谋成无界循环。
-                # 先于 pop 捕获其 pipeline_blocked。
-                _blocked_now = {fid for fid in failed_ids
-                                if _det_of(subtask_results.get(fid)).get("pipeline_blocked")
-                                in _INTERNAL_BLOCKED_KINDS}
-                dispatch_remaining = list(state.get("dispatch_remaining", []))
-                for fid in failed_ids:
-                    subtask_results.pop(fid, None)
-                    if fid not in dispatch_remaining:
-                        dispatch_remaining.append(fid)
-                # L2 集成失败非这些子任务的 capability 失败（它们各自 L1 已过）→ 重置其重试计数，
-                # 不无谓烧 capability 配额；循环边界由 replan_count 熔断保证。（结构性内部阻断除外，见上）
-                _rc = dict(state.get("subtask_retry_counts", {}))
-                for fid in failed_ids:
-                    if fid not in _blocked_now:
-                        _rc[fid] = 0
-                logger.info(
-                    "[HANDLE_FAILURE] L2 定向恢复（第 %d/%d 次）：集成失败归因到 %s，"
-                    "保留 %d 个成功兄弟 %s，仅重做归因子任务，不全量 replan",
-                    _l2_replan, _l2_max, failed_ids, len(succeeded_siblings), succeeded_siblings,
-                )
-                return {
-                    "subtask_results": subtask_results,
-                    "dispatch_remaining": dispatch_remaining,
-                    "failed_subtask_ids": [],
-                    "failure_strategy": "retry",
-                    "verification_failure": None,
-                    "l2_passed": False,
-                    "l2_targeted": False,
-                    "replan_count": _l2_replan,
-                    "subtask_retry_counts": _rc,
-                    "targeted_recovery": True,
-                }
-
-        logger.info("[HANDLE_FAILURE] L2 集成验证失败 — 触发 replan (第 %d/%d 次)",
-                    _l2_replan, _l2_max)
-        return {
-            "failure_strategy": "replan",
-            "failed_subtask_ids": [],
-            "verification_failure": None,
-            "l2_passed": False,
-            "replan_count": _l2_replan,
-        }
-
-    if state.get("verification_failure") == "l3":
-        logger.info("[HANDLE_FAILURE] L3 预发/CI 验证失败 — 升级人工审核")
-        return {
-            "failure_strategy": "escalate",
-            "failed_subtask_ids": [],
-            "verification_failure": None,
-            "l3_passed": False,
-        }
-
-    if state.get("verification_failure") == "contract":
-        # audit A-P1-03：契约偏离重试必须计数+设上限，否则与能力分支不同——
-        # 可无限 retry→contract→retry 至 recursion_limit。复用 subtask_retry_counts
-        # 与 max_retries 上限（与 capability/SIMPLE 路径一致），超限升级人工。
-        failed = list(state.get("failed_subtask_ids", [])) or list(
-            (state.get("subtask_results") or {}).keys()
-        )
-        # P1-4：旧 `failed[:3]` 硬截断 → 第 4 个起的失败子任务【静默永不重试】（每轮都取同样前 3 个）。
-        # 移除截断：每个子任务由 subtask_retry_counts + max_retries 各自封顶、总量由 recursion_limit
-        # 兜底，无需人为截断；截断只会漏修。>3 时记 warning 保留可观测（契约失败连坐面较宽，可见）。
-        if len(failed) > 3:
-            logger.warning("[HANDLE_FAILURE] 契约失败连坐 %d 个子任务重试（不再静默截断前 3）: %s",
-                           len(failed), failed[:8])
-        _max_retries = get_config().model.max_retries  # 默认 2
-        _retry_counts = dict(state.get("subtask_retry_counts", {}))
-        _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed}
-        _deepest = max(_next_counts.values(), default=0)
-        if _deepest > _max_retries + 1:
-            logger.warning(
-                "[HANDLE_FAILURE] 契约偏离重试达上限(%d+alternate)，升级人工: %s",
-                _max_retries, failed,
-            )
-            return {
-                "failure_escalated": True,
-                "failure_strategy": "escalate",
-                "failed_subtask_ids": failed,
-                "verification_failure": None,
-                "subtask_retry_counts": {**_retry_counts, **_next_counts},
-            }
-        logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务(第 %d 次)", _deepest)
-        return {
-            "failure_strategy": "retry",
-            "failed_subtask_ids": failed,
-            "verification_failure": None,
-            "subtask_retry_counts": {**_retry_counts, **_next_counts},
-        }
-
-    if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
-        # 确定性重试上限（与复杂路径一致，防止 SIMPLE 任务无限重试死循环）。
-        # 历史 bug：SIMPLE 分支原先无条件 retry，遇到"L1 通过但 diff 收集为空"
-        # (如重试时本地文件已被上一轮改过→difflib 基线已含变更→diff=空→被判失败)
-        # 会无限循环。这里引入与复杂路径相同的 subtask_retry_counts 硬上限。
-        max_retries = get_config().model.max_retries  # 默认 2
-        retry_counts = dict(state.get("subtask_retry_counts", {}))
-        next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
-        deepest = max(next_counts.values(), default=0)
-        if deepest > max_retries + 1:
-            logger.warning(
-                "[HANDLE_FAILURE] SIMPLE 子任务重试达上限(%d+alternate)，升级人工: %s",
-                max_retries, failed_ids,
-            )
-            return {
-                "failure_escalated": True,
-                "failure_strategy": "escalate",
-                "l2_passed": False,
-                "failed_subtask_ids": failed_ids,
-                "subtask_retry_counts": {**retry_counts, **next_counts},
-            }
-        dispatch_remaining = list(state.get("dispatch_remaining", []))
-        for fid in failed_ids:
-            subtask_results.pop(fid, None)
-            if fid not in dispatch_remaining:
-                dispatch_remaining.append(fid)
-        forced_alternate = deepest > max_retries
-        logger.info(
-            "[HANDLE_FAILURE] SIMPLE 快速路径 — 重试失败子任务(第 %d 次%s)",
-            deepest, "，换备选模型" if forced_alternate else "",
-        )
-        return {
-            "subtask_results": subtask_results,
-            "dispatch_remaining": dispatch_remaining,
-            "failed_subtask_ids": [],
-            "failure_strategy": "retry_alternate" if forced_alternate else "retry",
-            "use_alternate_model": forced_alternate,
-            "subtask_retry_counts": {**retry_counts, **next_counts},
-        }
-
-    # ── 治本·replan 无界循环：上游已被永久放弃 → 下游不可恢复 → 直接连坐放弃（先于超时/LLM/一切重试）──
-    # 机制(round12 实证 churn 3h 才被人工取消)：阶梯三给某 upstream 打桩/revert 放弃后，依赖它的下游
-    # 会永久 BLOCKED(upstream_module_broken/internal_pkg_not_built，上游永不落地)。若仍走 LLM→replan
-    # 或退避重试 → BLOCKED→replan→守卫降级 retry→重派→BLOCKED 无界循环、且阻断任务级 MERGE=阻断交付。
-    # 此处在任何重试/replan 前拦截：把"依赖已放弃上游"的下游一并放弃(传递闭包)，run 自终 PARTIAL。
-    # 下游归属用【运行时 blocked_on 包/模块→生产者子任务】(跨模块 import 的 depends_on 不可靠) ∪ depends_on。
-    if plan_obj is not None:
-        _unsat = (set(state.get("give_up_isolated_ids") or [])
-                  | set(state.get("abandoned_subtask_ids") or []))
-        _proj_path = _get_project_path(state.get("project_id") or "")
-        _by_id = {s.id: s for s in plan_obj.subtasks}
-        # #10 治本所需：全局 settled 生产者判据的两个集合。
-        _completed_ok = {sid for sid, out in subtask_results.items()
-                         if sid not in failed_ids and l1_passed(out)}
-        _pending_now = set(state.get("dispatch_remaining") or []) | set(failed_ids)
-        _unrecoverable: set[str] = set()
-        for fid in failed_ids:
-            _det = _det_of(subtask_results.get(fid))
-            if _det.get("pipeline_blocked") not in _INTERNAL_BLOCKED_KINDS:
-                continue
-            _st = _by_id.get(fid)
-            _bpkgs = _det.get("blocked_on_packages") or []
-            _bmods = _det.get("blocked_on_modules") or []
-            _prods = _producers_of(plan_obj, _bpkgs, _bmods)
-            # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
-            _dep_hit = bool(set(getattr(_st, "depends_on", []) or []) & _unsat) if _st else False
-            _prod_hit = bool(_prods & _unsat)
-            # (#R13-2 → #10 泛化) 阻断在【全部生产者已终结(放弃/完成) 且 包仍不在工作树】的内部包 =
-            # 在等一个永不会来的产物，永不可满足。含两情形：(a) 完全无生产者=臆造(#R13-2 原语义)；
-            # (b) 有生产者但已完成却产了别的包名(#9 跨 feature 漂移，round19 st-38 慢磨 ~1h 的幽灵生产者)。
-            # 只要还有 active(pending/在飞/未跑)生产者 → 继续 transient 等待，绝不误杀合法跨模块等待。
-            # 假阳性护栏 _package_in_baseline(扫工作树)：包在树(仅漏 seed)→ 交 #12 重 seed，不据此硬失败。
-            _futile = _blocked_pkg_unrecoverable(
-                blocked_pkgs=_bpkgs, producers=_prods, unsat=_unsat,
-                completed_ok=_completed_ok, pending=_pending_now,
-                project_path=_proj_path, self_id=fid,
-            )
-            if _dep_hit or _prod_hit or _futile:
-                _unrecoverable.add(fid)
-        if _unrecoverable:
-            abandoned = _transitive_abandon(
-                plan_obj.subtasks,
-                set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
-            )
-            for _a in abandoned:
-                subtask_results.pop(_a, None)
-            _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
-            # 非不可恢复的其余失败放回重派（各自重试计数原样保留，下轮再进常规阶梯）
-            for fid in [f for f in failed_ids if f not in abandoned]:
-                subtask_results.pop(fid, None)
-                if fid not in _remaining:
-                    _remaining.append(fid)
-            logger.warning(
-                "[HANDLE_FAILURE] 不可恢复子任务 %s(+依赖闭包共 %d) → 连坐放弃、不再 retry/replan："
-                "上游已永久放弃 或 阻断在臆造/基线不存在且无生产者的包；终态 PARTIAL（诚实列明需人工补完）",
-                sorted(_unrecoverable), len(abandoned),
-            )
-            return {
-                "failure_strategy": "abandon",
-                "abandoned_subtask_ids": sorted(abandoned),
-                "failed_subtask_ids": [],
-                "dispatch_remaining": _remaining,
-                "subtask_results": subtask_results,
-            }
-
-    # ── 主干B 不变量·超时→强制拆小作【第一恢复动作】（先于 LLM 策略 + 一切换模型重试）──
-    # 子任务 coding/locating 超时 = 工作单元对执行预算太大的确定性信号。先换模型重试同样的大块
-    # 只会再超时（round10 实证磨到取消）；确定性拆小才治本。可拆的立即拆小重派、保留成功兄弟，
-    # 不可拆的（≤2 文件/已拆过）落回常规阶梯。无任何可拆超时 → None → 继续常规分析。
-    _timeout_ids = [fid for fid in failed_ids
-                    if _is_timeout_oversize_failure(subtask_results.get(fid))]
-    if _timeout_ids:
-        _redecomp_timeout = await _redecompose_timeout_subtasks(state, _timeout_ids)
-        if _redecomp_timeout is not None:
-            return _redecomp_timeout
-
-    # ── LLM 故障分析 ──
-    # audit #17：strategy 必须在 try 前有确定默认值——否则 _get_brain_llm() 抛异常时
-    # except 分支用到 strategy 会 NameError。默认 "retry" 表示确定性回退（非 LLM 建议）。
-    strategy = "retry"
-    _diagnosis = ""   # A4 治本(round11)：brain 失败诊断，注入重试 worker 提示防重蹈
-    try:
-        llm = _get_brain_llm()
-        failure_details_dict: dict[str, dict] = {}
-        for fid in failed_ids:
-            out = subtask_results.get(fid)
-            if isinstance(out, WorkerOutput):
-                failure_details_dict[fid] = out.l1_details
-            elif isinstance(out, dict):
-                failure_details_dict[fid] = out.get("l1_details", {})
-            else:
-                failure_details_dict[fid] = {}
-        failure_details = json.dumps(failure_details_dict, ensure_ascii=False)
-        plan_json = plan_obj.model_dump_json(indent=2) if plan_obj and hasattr(plan_obj, "model_dump_json") else "{}"
-        prompt_user = HANDLE_FAILURE_USER.format(
-            failed_subtask_ids=failed_ids,
-            failure_details=failure_details,
-            plan_json=plan_json,
-        )
-        response = await llm.ainvoke([
-            {"role": "system", "content": HANDLE_FAILURE_SYSTEM},
-            {"role": "user", "content": prompt_user},
-        ])
-        result = _parse_json_from_llm(response.content)
-        # Wave 1/TD2606-B1：策略走类型边界。未知策略 → ValidationError → 下方 except 确定性回退 retry
-        # （不让 LLM 吐的未知字符串静默穿过策略阶梯）。result 保留供下游读取 adjusted_subtasks 等。
-        _fs = FailureStrategyResponse.model_validate(result)
-        strategy = _fs.strategy
-        _diagnosis = (_fs.reasoning or "").strip()
-        logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {_fs.reasoning}")
-    except json.JSONDecodeError as e:
-        logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
-        from swarm.infra.degrade import record_degrade
-        record_degrade("brain.handle_failure.llm_fallback")  # E1
-        strategy = "retry"
-    except Exception as e:
-        logger.warning(f"[HANDLE_FAILURE] LLM 分析异常 → 确定性回退 retry（非 LLM 建议）: {e}")
-        from swarm.infra.degrade import record_degrade
-        record_degrade("brain.handle_failure.llm_fallback")  # E1
-        strategy = "retry"
-
-    # ── A4 治本(round11)：把 brain 诊断作为硬约束注入【重试 worker 提示】──
-    # round11: brain 明写"该 RuoYi 版本用 ShiroUtils 而非 SecurityUtils"却只 retry_alternate
-    # 换模型、不传 worker → 重试 worker 仍 import 不存在的 SecurityUtils。把诊断挂到失败子任务
-    # 的 retry_guidance(worker prompt 渲染为硬约束块)，所有 retry 分支(A2/常规阶梯)统一携带。
-    if _diagnosis and failed_ids:
-        _by_id = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
-        for _fid in failed_ids:
-            _st = _by_id.get(_fid)
-            if _st is not None:
-                # SubTask 是可变 pydantic BaseModel、retry_guidance 是声明的 str 字段 →
-                # 直接赋值不会抛（原 except:pass 是无谓的静默吞错，brain#3 一并去掉）。
-                # 就地改的持久化由外层 handle_failure 回传 plan 保证。
-                _st.retry_guidance = _diagnosis[:800]
-
-    # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
-    # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
-    # 选 retry 还是 replan，都先走定向恢复：补模块 pom 写权 + 重置徒劳的重试计数 + 只重派失败
-    # 子任务（保留成功兄弟、不进 PLAN、不清完成态全表）。targeted_recovery_count 熔断防死循环。
-    if _is_missing_dependency_failure(subtask_results, failed_ids) and failed_ids:
-        _tr = state.get("targeted_recovery_count", 0) + 1
-        _tr_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
-        if _tr > _tr_max:
-            # 熔断：达上限仍缺依赖 → 不再 mutate plan，落常规 strategy 兜底（HIGH-3：先判上限再改 plan）。
-            logger.warning(
-                "[HANDLE_FAILURE] 定向恢复已达上限(%d 次)仍缺依赖 → 落常规 %s 兜底",
-                _tr_max, strategy,
-            )
-        else:
-            # 仅在配额内才 mutate plan（补 pom 写权 + 串 owner 依赖），杜绝兜底路径留下孤儿 scope 改动。
-            granted = _grant_module_pom_writable(plan_obj, failed_ids)
-            if granted:
-                # 治本 A2：授权后【确定性】据项目自身 pom 把缺失依赖补进失败模块 pom，
-                # 不再指望小模型自己加（实测它加不上 → 耗尽配额 → 全量 replan 砸成功子任务）。
-                _dep_injected = _inject_missing_maven_deps(
-                    _proj_path_from_state(state), granted, subtask_results)
-                if _dep_injected:
-                    logger.info(
-                        "[HANDLE_FAILURE] 确定性补依赖（治本 A2，据项目自身 pom 自证坐标，"
-                        "重派 worker 直接编过、不再耗配额）：%s", _dep_injected,
-                    )
-                _serialize_pom_writers(plan_obj, granted)
-                dispatch_remaining = list(state.get("dispatch_remaining", []))
-                for fid in failed_ids:
-                    subtask_results.pop(fid, None)
-                    if fid not in dispatch_remaining:
-                        dispatch_remaining.append(fid)
-                # 之前的重试因 scope 不可满足而徒劳，不计入配额——重置失败子任务重试计数。
-                _rc = dict(state.get("subtask_retry_counts", {}))
-                for fid in failed_ids:
-                    _rc[fid] = 0
-                _kept = [sid for sid in subtask_results if sid not in failed_ids]
-                logger.info(
-                    "[HANDLE_FAILURE] 定向恢复（第 %d/%d 次）：缺符号/缺依赖编译失败 → 给失败子任务 "
-                    "补模块 pom 写权 %s + 重置重试计数，仅重派失败子任务 %s（保留 %d 个完成态），"
-                    "换备选模型，不进 PLAN、不清完成态全表",
-                    _tr, _tr_max, granted, failed_ids, len(_kept),
-                )
-                return {
-                    "plan": plan_obj,
-                    "subtask_results": subtask_results,
-                    "dispatch_remaining": dispatch_remaining,
-                    "failed_subtask_ids": [],
-                    "failure_strategy": "retry_alternate",
-                    "use_alternate_model": True,
-                    "subtask_retry_counts": _rc,
-                    "targeted_recovery_count": _tr,
-                    "targeted_recovery": True,
-                }
-            # granted 为空（推不出模块 pom）→ 不 mutate、不自增计数，落常规 strategy（其自带
-            # replan_count 熔断会兜底升级），不会在此空转（MEDIUM-2）。
-            logger.info(
-                "[HANDLE_FAILURE] 缺依赖失败但推不出可补的模块 pom（失败子任务无模块路径）→ 落常规 %s",
-                strategy,
-            )
-
-    if strategy == "replan":
-        # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──
-        # 背景(task dab669bb)：medium 任务拆成 st-1(实现)+st-2(测试)，st-1 成功 DONE、
-        # st-2 因写错 JUnit L1 失败 → LLM 选 replan → 清空【含成功的 st-1】全部重新规划 ~10min →
-        # 循环。replan 只该用于【计划本身有结构性问题】(拆分错/依赖悬空)，单个子任务的
-        # L1 质量失败应只【重做失败子任务】，保留成功成果。
-        # 守卫条件：本批失败是子任务级 L1 失败 + 存在已成功(L1 通过)的兄弟子任务 +
-        #          失败子任务未达重试上限 → 降级为 retry（只重派失败的，不动成功的）。
-        succeeded_siblings = [
-            sid for sid, out in subtask_results.items()
-            if sid not in failed_ids and l1_passed(out)
-        ]
-        _retry_counts = dict(state.get("subtask_retry_counts", {}))
-        _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed_ids}
-        _deepest = max(_next_counts.values(), default=0)
-        _max_retries = get_config().model.max_retries  # 默认 2
-        # R1a（治本，996db614 实测主失控）：**只要存在已成功兄弟子任务，就绝不全量 replan-clobber**。
-        # 旧守卫仅在【未烧光重试配额】时拦截，一旦失败子任务耗尽重试(_deepest>max+1)就落到下方全量
-        # replan→PLAN 清空完成态→把 34 个已完成全丢弃从头重跑（实测 剩余0/完成34→剩余47/完成1，再撞
-        # 同一幻觉 escalate→FAILED）。但 replan(重生成 plan) 治不了 worker 臆造方法/能力失败——只会重生成
-        # 同样的 plan 再失败。故：有成功兄弟时——还有重试预算→只重做失败的(retry/retry_alternate)；
-        # 已耗尽→escalate【失败子任务】并【完整保留成功成果】，绝不清空。
-        if succeeded_siblings and failed_ids:
-            if _deepest <= _max_retries + 1:
-                dispatch_remaining = list(state.get("dispatch_remaining", []))
-                for fid in failed_ids:
-                    subtask_results.pop(fid, None)
-                    if fid not in dispatch_remaining:
-                        dispatch_remaining.append(fid)
-                forced_alternate = _deepest > _max_retries
-                logger.info(
-                    "[HANDLE_FAILURE] replan 守卫生效 — 保留 %d 个成功子任务 %s，"
-                    "仅重做失败子任务 %s（第 %d 次%s），不全量重规划",
-                    len(succeeded_siblings), succeeded_siblings, failed_ids, _deepest,
-                    "，换备选模型" if forced_alternate else "",
-                )
-                return {
-                    "subtask_results": subtask_results,
-                    "dispatch_remaining": dispatch_remaining,
-                    "failed_subtask_ids": [],
-                    "failure_strategy": "retry_alternate" if forced_alternate else "retry",
-                    "use_alternate_model": forced_alternate,
-                    "subtask_retry_counts": {**_retry_counts, **_next_counts},
-                }
-            # 卡死子任务恢复阶梯·阶梯二：escalate 前先试【定点拆小】（仅单个失败子任务时）。
-            # 多文件卡死多因子任务太大，拆小后小块各自更易成功，保留成功兄弟、只重派小块。
-            if len(failed_ids) == 1:
-                _redecomp = await _targeted_redecompose(state, failed_ids[0])
-                if _redecomp is not None:
-                    return _redecomp
-            # 卡死子任务恢复阶梯·阶梯三：escalate(全盘 FAILED) 前先试【保 build 放弃】——
-            # 清本地树足迹防 -am reactor 中毒，被依赖→打可编译桩(救下游)、不被依赖→revert(只丢 X)，
-            # 给 X 终态计入 completed，run 继续 merge→L2，终态 PARTIAL 诚实交付而非整任务 FAILED。
-            _giveup = await _give_up_preserve_build(state, failed_ids)
-            if _giveup is not None:
-                return _giveup
-            # 阶梯三也无法保 build 放弃（无 plan/无足迹）→ 兜底 escalate 失败子任务、【保留全部成功
-            # 成果】，绝不全量 replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
-            logger.warning(
-                "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个成功兄弟 → escalate 失败子任务、"
-                "完整保留成果，绝不全量 replan 清空（治本：局部能力失败不推倒全盘）",
-                failed_ids, len(succeeded_siblings),
-            )
-            return {
-                "subtask_results": subtask_results,
-                "failed_subtask_ids": failed_ids,
-                "failure_escalated": True,
-                "failure_strategy": "escalate",
-                "l2_passed": False,
-                "replan_count": state.get("replan_count", 0),
-            }
-
-        for fid in failed_ids:
-            subtask_results.pop(fid, None)
-        # P0-2 熔断：replan 不能无限重入。每次 replan 计数，超过上限直接升级人工，
-        # 而非继续 PLAN→ELABORATE→（可能同样的坏计划）→再失败，最终撞穿 recursion_limit
-        # （见 task 0f93f1fc：replan 后又拆出同样的悬空依赖）。
-        replan_count = state.get("replan_count", 0) + 1
-        max_replan = get_config().model.max_retries  # 复用 max_retries（默认 2）
-        if replan_count > max_replan:
-            logger.warning(
-                "[HANDLE_FAILURE] replan 已达上限(%d 次)仍失败 → 升级人工审核（避免无限重规划）",
-                max_replan,
-            )
-            return {
-                "subtask_results": subtask_results,
-                "failed_subtask_ids": failed_ids,
-                "failure_escalated": True,
-                "failure_strategy": "escalate",
-                "l2_passed": False,
-                "replan_count": replan_count,
-            }
-        # P0-2 携带失败原因：把本轮失败详情注入 state，供 PLAN 重新规划时参考，
-        # 避免 LLM 看不到失败原因而原样重生成同一个坏计划。
-        replan_feedback = (result.get("reasoning") or "").strip()
-        logger.info(
-            "[HANDLE_FAILURE] 策略=replan（第 %d/%d 次）— 清除失败结果，触发重新规划%s",
-            replan_count, max_replan,
-            "（已携带失败原因供 PLAN 参考）" if replan_feedback else "",
-        )
-        return {
-            "subtask_results": subtask_results,
-            "failed_subtask_ids": [],
-            "plan_valid": False,
-            "failure_strategy": "replan",
-            "replan_count": replan_count,
-            "replan_feedback": replan_feedback,
-        }
-
-    if strategy == "escalate":
-        logger.info("[HANDLE_FAILURE] 策略=escalate — 上报人工审核")
-        return {
-            "failure_escalated": True,
-            "failure_strategy": "escalate",
-            "l2_passed": False,
-            "failed_subtask_ids": failed_ids,
-        }
-
-    # ── P2：瞬时(transient)失败优先走退避重试，与 capability 配额隔离 ──
-    # 背景(task 37460a5b)：Connection error/Internal Server Error 等基础设施抖动，过去与
-    # 拒答/空 diff 等能力问题混在同一条 retry 阶梯，0.8s 内连撞两次烧光配额直接 escalate。
-    # 现在：本批若【全部】是 transient 失败 → 走带指数退避的轻量重试(独立计数器，上限 3)，
-    # 不消耗 capability 的 subtask_retry_counts。一旦混入 capability 失败，则交给下方阶梯
-    # (capability 才是该换模型/升级的真问题，不能被 transient 掩盖)。
-    from swarm.models.errors import TRANSIENT, classify_failure, backoff_seconds
-
-    def _failure_class_of(fid: str) -> str | None:
-        out = subtask_results.get(fid)
-        details: dict = {}
-        summary = ""
-        if isinstance(out, WorkerOutput):
-            details = out.l1_details or {}
-            summary = out.summary or ""
-        elif isinstance(out, dict):
-            details = out.get("l1_details", {}) or {}
-            summary = out.get("summary", "") or ""
-        fc = details.get("failure_class")
-        if fc:
-            return fc
-        # 兜底：summary/error 文本再分类一次（worker 未显式标注时）
-        return classify_failure(summary or details.get("error"))
-
-    failure_classes = {fid: _failure_class_of(fid) for fid in failed_ids}
-    transient_ids = [fid for fid, fc in failure_classes.items() if fc == TRANSIENT]
-    MAX_TRANSIENT_RETRY = 3
-
-    # 仅当本批失败【全部】为 transient 时才走退避快路（混入 capability 则不抢占阶梯）。
-    if transient_ids and len(transient_ids) == len(failed_ids):
-        transient_counts = dict(state.get("subtask_transient_counts", {}))
-        next_tcounts = {fid: transient_counts.get(fid, 0) + 1 for fid in transient_ids}
-        deepest_t = max(next_tcounts.values(), default=0)
-        if deepest_t <= MAX_TRANSIENT_RETRY:
-            # 治本 C：流式 stall（模型服务并发拥塞）立即重试会撞同一拥塞 → 给【更长退避】让拥塞散去
-            # （8/16/32s）；普通 transient（连接抖动/5xx）恢复快，沿用短退避（2/4/8s）。两者都【不换模型】
-            # （use_alternate_model=False）——是基建瞬时不是模型弱。
-            _stall = _has_stream_stall(subtask_results, transient_ids)
-            delay = backoff_seconds(deepest_t, base=8.0, cap=60.0) if _stall else backoff_seconds(deepest_t)
-            logger.info(
-                "[HANDLE_FAILURE] 策略=retry(transient%s 退避，第 %d/%d 次，sleep %.1fs，不换模型/不计 capability 配额): %s",
-                "·流式stall" if _stall else "", deepest_t, MAX_TRANSIENT_RETRY, delay, transient_ids,
-            )
-            await asyncio.sleep(delay)
-            dispatch_remaining = list(state.get("dispatch_remaining", []))
-            for fid in transient_ids:
-                subtask_results.pop(fid, None)
-                if fid not in dispatch_remaining:
-                    dispatch_remaining.append(fid)
-            return {
-                "dispatch_remaining": dispatch_remaining,
-                "failed_subtask_ids": [],
-                "subtask_results": subtask_results,
-                "failure_strategy": "retry",
-                "use_alternate_model": False,
-                "subtask_transient_counts": {**transient_counts, **next_tcounts},
-            }
-        # transient 退避也用尽 → 落入下方 capability 阶梯（基础设施持续不可用，升级人工）
-        logger.warning(
-            "[HANDLE_FAILURE] transient 退避重试已达上限(%d 次)仍失败，转入 capability 阶梯: %s",
-            MAX_TRANSIENT_RETRY, transient_ids,
-        )
-
-    # retry / retry_alternate — 确定性递进升级（覆盖 LLM 决策，防止无限重试）
-    #
-    # 设计文档要求"重试最多 2 次 → 换模型 → 上报人工"，但原实现完全依赖 LLM 单次
-    # 决策，LLM 可能持续输出 retry 导致死循环。这里引入每子任务的确定性重试计数器，
-    # 强制执行升级阶梯：
-    #   retry_count < max_retries        → retry        (普通重试)
-    #   retry_count == max_retries       → retry_alternate (换备选模型)
-    #   retry_count > max_retries        → escalate     (上报人工)
-    # LLM 仍可主动选择 replan/escalate（上面已处理），但 retry 类不会突破硬上限。
-    max_retries = get_config().model.max_retries  # 默认 2
-    retry_counts = dict(state.get("subtask_retry_counts", {}))
-
-    # 计算本批失败子任务里"最深"的重试次数，决定整批升级档位
-    next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
-    deepest = max(next_counts.values(), default=0)
-
-    # FINDING-12：拒答/步数耗尽(refusal_hard_fail)的子任务，重试强制走【最强模型】(40B 256k)，
-    # 而非更弱 fallback——步数耗尽是小模型 agent 循环不收敛，换更弱只会更糟。
-    force_strong = dict(state.get("subtask_force_strong", {}))
-    for _fid in failed_ids:
-        _res = subtask_results.get(_fid)
-        _src = (getattr(_res, "l1_details", {}) or {}).get("l1_decision_source") if _res else None
-        if _src == "refusal_hard_fail":
-            force_strong[_fid] = True
-
-    if deepest > max_retries + 1:
-        # 重试耗尽。【部分交付】：已有完成子任务 + 开启 partial → 放弃 failed(+传递依赖者)，
-        # 继续交付其余，终态 PARTIAL(非 DONE，诚实未完成)。否则(0 完成 / 关闭 partial) →
-        # 维持 escalate(整任务失败)，避免无产出却假成功。
-        _abandoned_so_far = set(state.get("abandoned_subtask_ids") or [])
-        _done = [tid for tid in subtask_results
-                 if tid not in failed_ids and tid not in _abandoned_so_far]
-        _allow_partial = getattr(get_config().worker, "allow_partial_delivery", True)
-        if _allow_partial and _done and plan_obj is not None:
-            # 传递放弃：依赖被放弃者的子任务也放弃(缺依赖跑不了)，避免它们永留 remaining 死循环
-            abandoned = _transitive_abandon(plan_obj.subtasks, _abandoned_so_far | set(failed_ids))
-            _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
-            logger.warning(
-                "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",
-                failed_ids, len(abandoned), len(_remaining),
-            )
-            return {
-                "failure_strategy": "abandon",
-                "abandoned_subtask_ids": sorted(abandoned),
-                "failed_subtask_ids": [],
-                "dispatch_remaining": _remaining,
-                "subtask_force_strong": force_strong,
-                "subtask_retry_counts": {**retry_counts, **next_counts},
-            }
-        # 已用尽 retry + alternate 且无可交付/关闭 partial → 升级人工(整任务失败)
-        logger.warning(
-            "[HANDLE_FAILURE] 子任务重试已达上限（retry %d + alternate 1），升级人工审核: %s",
-            max_retries, failed_ids,
-        )
-        return {
-            "failure_escalated": True,
-            "failure_strategy": "escalate",
-            "l2_passed": False,
-            "failed_subtask_ids": failed_ids,
-            "subtask_retry_counts": {**retry_counts, **next_counts},
-        }
-
-    # 将失败子任务重新加入 dispatch_remaining
-    dispatch_remaining = list(state.get("dispatch_remaining", []))
-    for fid in failed_ids:
-        subtask_results.pop(fid, None)
-        if fid not in dispatch_remaining:
-            dispatch_remaining.append(fid)
-
-    # 确定性档位：超过 max_retries 次普通重试后切换备选模型
-    forced_alternate = deepest > max_retries
-    effective_strategy = "retry_alternate" if forced_alternate else "retry"
-    # 若 LLM 主动要求 retry_alternate 且尚未到 alternate 档，也尊重它（提前换模型）
-    if strategy == "retry_alternate":
-        effective_strategy = "retry_alternate"
-
-    # ── 治本：编译失败根因在 scope 外(缺 pom 依赖/上游文件)→ 加宽 scope 让重试能真正修 ──
-    _scope_widened = False
-    if plan_obj is not None:
-        for fid in failed_ids:
-            new_files = _widen_scope_for_compile_repair(plan_obj, fid, _l1_details_of(subtask_results, fid))
-            if new_files:
-                _scope_widened = True
-                logger.info(
-                    "[HANDLE_FAILURE] 编译修复加宽 scope：子任务 %s 纳入 %s（治根因在 scope 外的编译失败，使重试可改 pom/上游）",
-                    fid, new_files,
-                )
-
-    out: dict = {
-        "dispatch_remaining": dispatch_remaining,
-        "failed_subtask_ids": [],
-        "subtask_results": subtask_results,
-        "failure_strategy": effective_strategy,
-        "subtask_retry_counts": {**retry_counts, **next_counts},
-        "subtask_force_strong": force_strong,  # FINDING-12：拒答子任务重试走最强模型
-    }
-    if _scope_widened:
-        out["plan"] = plan_obj  # 回写加宽后的 scope，dispatch 重试用
-    if effective_strategy == "retry_alternate":
-        out["use_alternate_model"] = True
-        logger.info(
-            "[HANDLE_FAILURE] 策略=retry_alternate（第 %d 次，换备选模型）: %s",
-            deepest, failed_ids,
-        )
-    else:
-        out["use_alternate_model"] = False
-        logger.info(
-            "[HANDLE_FAILURE] 策略=retry（第 %d/%d 次）: %s",
-            deepest, max_retries, failed_ids,
-        )
-    return out
+# round26 god-file 治理：_handle_failure_impl(~660行)+_l1_details_of 已外置 brain/nodes/failure.py。
+# re-export 回本命名空间：上面薄包装 handle_failure 的 bare 调用与
+# patch("swarm.brain.nodes._handle_failure_impl") 的 seam 契约均经此解析。
+from swarm.brain.nodes.failure import (  # noqa: E402,F401
+    _handle_failure_impl,
+    _l1_details_of,
+)
 
 
 def _make_base_reader(state: BrainState):
@@ -2314,10 +1616,6 @@ def merge(state: BrainState) -> dict:
     return out
 
 
-
-
-
-
 def _get_project_path(project_id: str) -> str | None:
     if not project_id:
         return None
@@ -2575,16 +1873,6 @@ async def _verify_l2_via_llm(
     except Exception as e:
         logger.warning(f"[VERIFY_L2] LLM 验证异常，默认未通过: {e}")
         return False
-
-
-
-
-
-
-
-
-
-
 
 
 def deliver(state: BrainState) -> dict:
