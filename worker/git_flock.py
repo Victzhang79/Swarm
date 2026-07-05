@@ -2,8 +2,8 @@
 
 自足叶模块：只依赖 stdlib（fcntl/hashlib/tempfile，__init__ 内 lazy import）与
 `swarm.git_base.canon_path`（同样 lazy）。executor.py re-export `_ProjectGitFlock`
-（内部 _reset_scope_to_head / _try_local_git_diff 用）与 `_warn_git_flock_fail_open_once`，
-保持既有测试（from swarm.worker.executor import _ProjectGitFlock）可寻址不变。行为逐字节等价。
+与 `_warn_git_flock_fail_open_once`，使既有代码/测试仍可经 executor 命名空间导入
+`_ProjectGitFlock`（sandbox.py / brain.nodes / test_wave3_gitlock）可寻址不变。行为逐字节等价。
 """
 
 from __future__ import annotations

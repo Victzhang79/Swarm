@@ -6,9 +6,9 @@
     - LOCATING 阶段步数预算（_locate_step_cap）
     - seed 产物缺失/反推包（missing_seed_artifacts / packages_from_missing_artifacts）
 
-executor.py 顶部 `from swarm.worker.l1_verdict import (...)` 把这些名字 re-export 回
-`swarm.worker.executor` 命名空间，保持内部调用与既有测试（`from swarm.worker.executor
-import evaluate_l1 ...`）的可寻址性不变。行为逐字节等价，纯 move。
+executor.py 顶部 re-export 本模块符号回 `swarm.worker.executor` 命名空间，保持内部调用
+与既有测试经 executor 命名空间导入（evaluate_l1 / L1Verdict / _locate_step_cap ...）的
+可寻址性不变。行为逐字节等价，纯 move。
 """
 
 from __future__ import annotations
