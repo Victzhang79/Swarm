@@ -14,11 +14,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 import swarm.brain.nodes as nodes
+import swarm.brain.nodes.planning_core as pc
 from swarm.brain.nodes import (
     _give_up_preserve_build,
     _local_tree_revert_subtask,
     _subtask_footprint,
 )
+
+# god-file 主线1：恢复阶梯簇已抽出到 planning_core。_give_up_preserve_build 内部对
+# _proj_path_from_state / _generate_compile_stub 的【同簇互调】在 planning_core 命名空间解析，
+# 故这些内部调用的 patch 目标须为 pc（patch nodes 命名空间只对 __init__ 内的调用点生效）。
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan, WorkerOutput
 
 
@@ -97,7 +102,7 @@ def test_giveup_not_depended_reverts_only_x(tmp_path):
         "give_up_isolated_ids": [],
         "abandoned_subtask_ids": [],
     }
-    with patch.object(nodes, "_proj_path_from_state", return_value=str(repo)):
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)):
         out = _run(_give_up_preserve_build(state, ["st-x"]))
     assert out is not None
     assert out["failure_strategy"] == "give_up_preserve"
@@ -121,8 +126,8 @@ def test_giveup_depended_stub_saves_dependents(tmp_path):
         "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
     }
     fake_diff = "diff --git a/X.java b/X.java\n+stub"
-    with patch.object(nodes, "_proj_path_from_state", return_value="/tmp/fake"), \
-         patch.object(nodes, "_generate_compile_stub", new=_async_return(fake_diff)):
+    with patch.object(pc, "_proj_path_from_state", return_value="/tmp/fake"), \
+         patch.object(pc, "_generate_compile_stub", new=_async_return(fake_diff)):
         out = _run(_give_up_preserve_build(state, ["st-x"]))
     assert out["give_up_isolated_ids"] == ["st-x"]
     assert out["abandoned_subtask_ids"] == [], "桩成功 → 下游 st-2 不被连坐放弃"
@@ -145,8 +150,8 @@ def test_giveup_depended_stub_fail_falls_back_revert_and_abandons_dependents(tmp
         "subtask_results": {"st-x": _wo("st-x", ok=False), "st-2": _wo("st-2"), "st-3": _wo("st-3")},
         "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
     }
-    with patch.object(nodes, "_proj_path_from_state", return_value=str(repo)), \
-         patch.object(nodes, "_generate_compile_stub", new=_async_return(None)):
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_generate_compile_stub", new=_async_return(None)):
         out = _run(_give_up_preserve_build(state, ["st-x"]))
     assert out["give_up_isolated_ids"] == ["st-x"]
     # 桩失败 revert → 下游 st-2 及传递依赖 st-3 缺依赖跑不了 → 连坐放弃
@@ -177,8 +182,10 @@ def test_handle_failure_exhausted_single_file_giveup_not_escalate(tmp_path):
         "subtask_retry_counts": {"st-x": cap + 2},  # 耗尽
         "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
     }
+    # _get_brain_llm 被 __init__ 内的 handle_failure 策略调用 → patch nodes；_proj_path_from_state
+    # 被 planning_core 内的 _give_up_preserve_build 调用 → patch pc。
     with patch.object(nodes, "_get_brain_llm", lambda: _L()), \
-         patch.object(nodes, "_proj_path_from_state", return_value=str(repo)):
+         patch.object(pc, "_proj_path_from_state", return_value=str(repo)):
         out = _run(nodes.handle_failure(state))
     assert out.get("failure_strategy") == "give_up_preserve", out.get("failure_strategy")
     assert out.get("failure_escalated") is not True, "阶梯三消化 → 不再整任务 escalate FAILED"
