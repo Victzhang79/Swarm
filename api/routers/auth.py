@@ -218,9 +218,19 @@ async def list_users_api(request: Request):
 @router.post("/api/users", tags=["认证"])
 async def create_user_api(request: Request, req: CreateUserRequest):
     caller = _require_perm(request, "config:write")
+    # D5：global_role 白名单——只接受已知角色，拒绝任意字符串(未知角色 RBAC 行为未定义/
+    # 可能默认放行，是提权面)。
+    from swarm.auth.rbac import Role
+    _valid_roles = {r.value for r in Role}
+    _role = str(req.global_role).lower().strip()
+    if _role not in _valid_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效 global_role：{req.global_role}（合法值：{sorted(_valid_roles)}）",
+        )
     # 防提权：铸造特权角色（admin/owner）要求调用方本身是全局 admin。
     # 否则仅有 config:write 的 OWNER 可凭空造出全局 admin（越权升级）。
-    if str(req.global_role).lower() in ("admin", "owner") and \
+    if _role in ("admin", "owner") and \
             str(getattr(caller, "global_role", "")).lower() != "admin":
         raise HTTPException(
             status_code=403,

@@ -1075,7 +1075,9 @@ async def delete_capability_endpoint(request: Request, provider_id: str, model_i
 @router.get("/api/secrets/status", tags=["配置"])
 async def secrets_status(request: Request):
     """敏感信息存储状态：哪些 key 已加密入 db、根密钥来源。"""
-    _require_user(request)
+    # D5：密钥名枚举 + 根密钥来源属敏感配置面，收敛到 config:write（admin/owner），
+    # 不再任意登录用户(viewer/developer)可枚举。
+    _require_perm(request, "config:write")
     from swarm.config import secret_store
 
     loop = asyncio.get_running_loop()
