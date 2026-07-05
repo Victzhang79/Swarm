@@ -1356,7 +1356,7 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     ctx = _sandbox_ctx()
     if ctx is not None:
         sandbox, manager, remote = ctx
-        names = " -o ".join(f"-name {m!r}" for m in manifests)
+        names = " -o ".join(f"-name {shlex.quote(m)}" for m in manifests)
         try:
             cr = manager.run_command(
                 sandbox,
@@ -1496,7 +1496,7 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
         except Exception:  # noqa: BLE001
             remote = "/workspace"
         # 任一 manifest 在 workspace 下存在即视为适用
-        names = " -o ".join(f"-name {m!r}" for m in manifests)
+        names = " -o ".join(f"-name {shlex.quote(m)}" for m in manifests)
         cr = manager.run_command(
             sandbox,
             f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",

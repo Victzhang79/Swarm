@@ -46,7 +46,7 @@ async def test_plan_batch_retries_on_timeout():
             '"acceptance_criteria":["mvn -pl modA compile"]}]}')
     llm = _flaky_llm(1, subs, calls)  # 第 1 次 timeout，第 2 次成功
     plan = await nodes._plan_ultra_batched(
-        llm, _state(), "建预警平台", "ultra", {}, "", "", "", "", _file_plan(),
+        llm, _state(), "建预警平台", {}, "", _file_plan(),
     )
     assert calls["n"] == 2, f"应重试(旧代码 1 次即丢),实际 {calls['n']}"
     # 模块子任务被抢救（非降级成单空 fallback 子任务）
@@ -63,7 +63,7 @@ async def test_plan_batch_exhausts_then_drops():
     # 绕过该标记 → auto_accept 下空计划被放行 → worker 无文件可写假失败。
     with pytest.raises(RuntimeError):
         await nodes._plan_ultra_batched(
-            llm, _state(), "建预警平台", "ultra", {}, "", "", "", "", _file_plan(),
+            llm, _state(), "建预警平台", {}, "", _file_plan(),
         )
     assert calls["n"] == nodes_plan_batch_attempts(), f"应有界重试,实际 {calls['n']}"
 

@@ -169,6 +169,9 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
 {task_description}
 
+## 任务上下文（L3 滑动窗口；若含"上轮规划失败根因"，务必规避同样的拆分/依赖/scope 错误）
+{sliding_context}
+
 ## 本批要拆解的文件清单（第 {batch_idx}/{total_batches} 批，只拆这些）
 {batch_file_plan}
 

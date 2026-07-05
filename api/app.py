@@ -264,7 +264,7 @@ async def _check_component(name: str) -> dict[str, Any]:
                             return [col.name for col in cols.collections]
                         coll_names = await asyncio.to_thread(_check_local_qdrant_kb)
                         details.append(f"qdrant local file, {len(coll_names)} collections")
-                        qdrant_ok = True  # noqa: F841
+                        qdrant_ok = True
                     else:
                         details.append(f"qdrant unreachable: {type(e).__name__}")
                 except Exception:
@@ -314,7 +314,9 @@ async def _check_component(name: str) -> dict[str, Any]:
                 # KB 检索仍可用（降级为 BM25 关键词检索），但语义召回质量下降
                 details.append("embedding: no local model, no remote endpoint (KB 检索降级为 BM25)")
 
-            qdrant_ok_flag = any("qdrant" in d for d in details)
+            # 用真实探测结果——子串启发式 any("qdrant" in d) 在失败文案
+            # "qdrant unreachable: X" 上同样命中 → Qdrant 全挂仍报健康（假绿）
+            qdrant_ok_flag = qdrant_ok
             embed_ok_flag = embed_ok  # 用显式探测结果，不靠脆弱的字符串匹配（降级文案也含 "embedding:"）
             if qdrant_ok_flag and embed_ok_flag:
                 status["status"] = "running"

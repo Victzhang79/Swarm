@@ -964,7 +964,9 @@ class SandboxManager:
         if hasattr(self, "run_command"):
             cr = self.run_command(
                 sandbox,
-                f"cd {path!r} 2>/dev/null && ls -lAp --time-style=+ 2>/dev/null || echo __LS_FAIL__",
+                # P0-SEC-05(b) 同款：shell 上下文必须 shlex.quote（{path!r} 是 Python repr，
+                # 含单引号的路径 repr 换双引号包裹，$/`` 在 shell 双引号里仍会展开执行）
+                f"cd {shlex.quote(path)} 2>/dev/null && ls -lAp --time-style=+ 2>/dev/null || echo __LS_FAIL__",
                 timeout=30,
             )
             out = (cr.stdout or "").strip()

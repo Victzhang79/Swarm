@@ -432,8 +432,7 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
 
 
 async def _plan_ultra_batched(
-    llm, state, task_description, complexity, routing_table,
-    knowledge_context, knowledge_prompt, recent_tasks_prompt, sliding_ctx, file_plan,
+    llm, state, task_description, knowledge_context, sliding_ctx, file_plan,
 ):
     """ultra 超大需求【按模块分批】拆解（DESIGN 第九节治本 P1-P6）。
 
@@ -468,6 +467,9 @@ async def _plan_ultra_batched(
         ensure_ascii=False,
     )[:3000]
     proj_struct = _format_project_structure(knowledge_context)
+    # sliding_ctx 头部带 plan() 注入的"上轮 replan 失败根因"——此前分批路径把它静默丢弃，
+    # ULTRA replan 退化为盲重规划（反复产同样的坏计划）。反馈在头部，截尾不丢根因。
+    sliding_ctx_text = (sliding_ctx or "").strip()[:2000] or "（无）"
 
     # P5：分批前全局去重同名文件
     _before = len(file_plan)
@@ -535,13 +537,24 @@ async def _plan_ultra_batched(
                 f"项目中尚不存在。请在本批【第一个子任务】先创建该模块的基础设施"
                 f"（如 Maven 模块的 pom.xml 并注册到父 pom 的 <modules>、基础目录结构），"
                 f"该模块其他子任务 depends_on 这个脚手架子任务。")
-        prompt_user = PLAN_BATCH_USER.format(
-            task_description=task_description[:2000],
-            batch_idx=i, total_batches=total,
-            batch_file_plan=f"模块 '{mod_name}'：\n{batch_fp_text}{scaffold_hint}",
-            project_structure=proj_struct,
-            tech_design_extra=tech_design_extra,
-        )
+        try:
+            prompt_user = PLAN_BATCH_USER.format(
+                task_description=task_description[:2000],
+                sliding_context=sliding_ctx_text,
+                batch_idx=i, total_batches=total,
+                batch_file_plan=f"模块 '{mod_name}'：\n{batch_fp_text}{scaffold_hint}",
+                project_structure=proj_struct,
+                tech_design_extra=tech_design_extra,
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            # 模板占位符与传参漂移是确定性代码 bug：重试无意义，按"批失败"降级并高可见
+            # 记录；不让 KeyError 裸穿 gather 炸掉全部批（外层 except 会把它伪装成一次
+            # 普通 LLM 失败，排障方向全错）。全批失败仍由下方 RuntimeError 兜底。
+            logger.error(
+                "[PLAN-BATCH] 模块'%s' prompt 模板占位符与传参不匹配（代码 bug，非 LLM 故障）：%r",
+                mod_name, exc,
+            )
+            return ("error", i, mod_name, exc, None, len(batch))
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
@@ -763,8 +776,7 @@ async def plan(state: BrainState) -> dict:
             )
         if complexity == Complexity.ULTRA and len(_file_plan) > _BATCH_TRIGGER:
             task_plan = await _plan_ultra_batched(
-                llm, state, task_description, complexity, routing_table,
-                knowledge_context, knowledge_prompt, recent_tasks_prompt,
+                llm, state, task_description, knowledge_context,
                 sliding_ctx, _file_plan,
             )
         else:

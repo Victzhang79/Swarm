@@ -125,7 +125,7 @@ def test_plan_ultra_batched_all_failed_raises():
                   "responsibility": "A"}]
     with pytest.raises(RuntimeError):
         asyncio.run(_plan_ultra_batched(
-            _BoomLLM(), {}, "任务", Complexity.ULTRA, {}, {}, "", "", "", file_plan,
+            _BoomLLM(), {}, "任务", {}, "", file_plan,
         ))
 
 
