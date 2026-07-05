@@ -80,7 +80,26 @@ def test_revert_removes_untracked_and_restores_tracked(tmp_path):
 def test_revert_noop_without_git(tmp_path):
     st = _st("st-x", create_files=["a.java"])
     res = _local_tree_revert_subtask(str(tmp_path), st)  # 非 git 仓库
-    assert res == {"reverted": [], "removed": [], "skipped_protected": []}
+    assert res == {"reverted": [], "removed": [], "revert_failed": [], "skipped_protected": []}
+
+
+def test_revert_checkout_failure_not_marked_reverted(tmp_path):
+    """E2 治本：git checkout rc!=0（未还原）绝不记 reverted——否则"放弃保 build"静默失效，
+    脏改动仍毒 -am。用不存在的 base_ref 强制 checkout 失败，断言文件进 revert_failed 且内容未变。"""
+    repo = _git_repo(tmp_path)
+    tracked = repo / "Keep.java"
+    tracked.write_text("ORIG", encoding="utf-8")
+    subprocess.run(["git", "add", "Keep.java"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    tracked.write_text("DIRTY", encoding="utf-8")
+
+    st = _st("st-x", writable=["Keep.java"])
+    # base_ref = 不存在的 40-hex SHA → git checkout <bad> -- Keep.java 必 rc!=0（invalid reference）。
+    res = _local_tree_revert_subtask(str(repo), st, base_ref="0" * 40)
+
+    assert "Keep.java" not in res["reverted"], "checkout 失败绝不能记 reverted（假装已清）"
+    assert "Keep.java" in res["revert_failed"], "checkout 失败应如实记入 revert_failed"
+    assert tracked.read_text() == "DIRTY", "checkout 失败 → 文件确实未被还原（脏改动仍在）"
 
 
 def test_subtask_footprint_union_dedup():

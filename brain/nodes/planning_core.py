@@ -458,7 +458,7 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     - 已被 git 跟踪的文件 → `git checkout HEAD --`（还原提交版，撤销 pull-back 脏改动）。
     - 未跟踪（新建产物）→ 删除文件。
     通用：纯 git/文件操作，与语言无关。返回 {"reverted":[...], "removed":[...]}。"""
-    result: dict = {"reverted": [], "removed": [], "skipped_protected": []}
+    result: dict = {"reverted": [], "removed": [], "revert_failed": [], "skipped_protected": []}
     if not project_path:
         return result
     import subprocess
@@ -482,21 +482,37 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
             tracked = False
         if tracked:
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     ["git", "checkout", _base, "--", rel],
                     cwd=str(root), capture_output=True, text=True, timeout=20,
                 )
-                result["reverted"].append(rel)
-            except Exception:  # noqa: BLE001
-                pass
+                if proc.returncode == 0:
+                    result["reverted"].append(rel)
+                else:
+                    # E2 治本：checkout rc!=0 = 文件【未】还原，脏改动仍留本地树 → 下游 mvn `-am`
+                    # 整 reactor 仍会带上中毒。绝不能记 reverted 假装已清（否则"放弃保 build"静默失效、
+                    # 上游误判足迹已净）。记 revert_failed + 可观测，让调用方/诊断看得见真状态。
+                    result["revert_failed"].append(rel)
+                    logger.warning(
+                        "[revert] git checkout 失败(rc=%s) 未还原 %s，脏改动仍在本地树"
+                        "（下游 build 可能仍中毒）: %s",
+                        proc.returncode, rel, (proc.stderr or "").strip()[:200],
+                    )
+            except Exception as exc:  # noqa: BLE001
+                result["revert_failed"].append(rel)
+                logger.warning("[revert] git checkout %s 异常，未还原（脏改动仍在树）: %s", rel, exc)
         else:
             abs_f = root / rel
             try:
                 if abs_f.is_file():
                     abs_f.unlink()
                     result["removed"].append(rel)
-            except OSError:
-                pass
+            except OSError as exc:
+                # 对称硬化：unlink 失败 = 未跟踪坏文件仍留本地树，与 checkout rc!=0 同类（足迹未清
+                # → 毒 -am）。同样记 revert_failed + 可观测，不静默吞。
+                result["revert_failed"].append(rel)
+                logger.warning(
+                    "[revert] 删除未跟踪足迹 %s 失败，仍在本地树（下游 build 可能仍中毒）: %s", rel, exc)
     return result
 
 
