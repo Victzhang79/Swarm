@@ -23,15 +23,11 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from swarm.config.settings import get_config
-from swarm.git_base import resolve_base_ref
-from swarm.models.errors import TransientInfraError
-from swarm.paths import is_within_root
 from swarm.tools.scope_guard import clear_scope
 from swarm.types import (
     Confidence,
@@ -48,7 +44,9 @@ logger = logging.getLogger(__name__)
 # round26 god-file 治理：L1 裁决纯函数簇已外置 worker/l1_verdict.py。
 # 这里 re-export 回本命名空间，保持内部调用与既有测试
 # （from swarm.worker.executor import evaluate_l1 / L1Verdict / ...）可寻址不变。
-from swarm.worker.l1_verdict import (  # noqa: E402
+# F401 抑制：部分符号仅供【外部/测试】经本命名空间导入（如 _LOCATE_STEP_CAP、_det_fail_source），
+# 本文件内部不用但必须保留可寻址——勿被 ruff --fix 当未用导入删除（会断测试导入）。
+from swarm.worker.l1_verdict import (  # noqa: E402,F401
     _FLIPPABLE_SOURCES,
     _LOCATE_STEP_CAP,
     _LOCATE_STEP_CAP_MAX,
@@ -63,8 +61,9 @@ from swarm.worker.l1_verdict import (  # noqa: E402
 )
 
 # round26 god-file 治理：per-project git 文件锁已外置 worker/git_flock.py。
-# re-export 供内部（_reset_scope_to_head / _try_local_git_diff）与既有测试可寻址。
-from swarm.worker.git_flock import (  # noqa: E402
+# re-export 供【外部/测试】经本命名空间导入（sandbox.py / nodes / test_wave3_gitlock）——
+# SYNC 簇外置后本文件内部已不用，仅作向后兼容 shim，勿被 ruff --fix 删除。
+from swarm.worker.git_flock import (  # noqa: E402,F401
     _ProjectGitFlock,
     _warn_git_flock_fail_open_once,
 )
