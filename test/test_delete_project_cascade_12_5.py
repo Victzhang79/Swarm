@@ -98,11 +98,82 @@ def test_delete_project_cascades_kb_mem():
                         pass
 
 
+def test_delete_project_cascades_user_profile_by_composite_key():
+    """mem_user_profile 按【复合键尾段】级联删（治「名存实亡」）。
+
+    治本前：delete_project 按恒空的 project_id 列删 → 匹配 0 行（该项目用户画像永不清理）。
+    治本后：mem_user_profile.user_id = f"{user}:{project_id}"（全局用 ":__global__"），按尾段删。
+    断言：本项目的每用户 L1 画像行被清；同用户的全局画像 + 其它项目的画像行保留。
+    仅用 _test_ 前缀 user/project 隔离，try/finally 兜底，绝不碰真实数据。需本地 PG。
+    """
+    ensure_tables()
+    try:
+        from swarm.memory.store import MemoryStore  # noqa: F401
+    except Exception:
+        pass
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if not _table_exists(cur, "mem_user_profile"):
+                import pytest
+                pytest.skip("mem_user_profile 表不存在（memory 迁移未跑）")
+
+    other_pid = f"{_TEST_PROJECT_ID}_other"
+    user = "_test_prof_user"
+    key_proj = f"{user}:{_TEST_PROJECT_ID}"       # 本项目画像 → 应删
+    key_global = f"{user}:__global__"              # 全局画像 → 应留
+    key_other = f"{user}:{other_pid}"              # 其它项目画像 → 应留
+    seeded_keys = [key_proj, key_global, key_other]
+
+    def _profile_exists(cur, k):
+        cur.execute("SELECT 1 FROM mem_user_profile WHERE user_id = %s", (k,))
+        return cur.fetchone() is not None
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO projects (id, name, path) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (_TEST_PROJECT_ID, "test-profile-cascade", "/tmp/_test_profile"),
+                )
+                for k in seeded_keys:
+                    cur.execute(
+                        "INSERT INTO mem_user_profile (user_id, profile_json) VALUES (%s, '{}'::jsonb) "
+                        "ON CONFLICT (user_id) DO NOTHING",
+                        (k,),
+                    )
+
+        ok = delete_project(_TEST_PROJECT_ID)
+        assert ok is True, "delete_project 应返回 True（含 profile 复合键删也不炸事务）"
+
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                assert not _profile_exists(cur, key_proj), "本项目用户画像应被清（复合键尾段删）"
+                assert _profile_exists(cur, key_global), "全局画像 :__global__ 不应被删"
+                assert _profile_exists(cur, key_other), "其它项目的画像不应被误删"
+    finally:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                for k in seeded_keys:
+                    try:
+                        cur.execute("DELETE FROM mem_user_profile WHERE user_id = %s", (k,))
+                    except Exception:
+                        pass
+                for pid in (_TEST_PROJECT_ID, other_pid):
+                    try:
+                        cur.execute("DELETE FROM projects WHERE id = %s", (pid,))
+                    except Exception:
+                        pass
+
+
 if __name__ == "__main__":
     try:
         test_delete_project_cascades_kb_mem()
         print("  ✅ test_delete_project_cascades_kb_mem")
-        print("\n=== 12.5 cascade delete: 1/1 passed ===")
+        test_delete_project_cascades_user_profile_by_composite_key()
+        print("  ✅ test_delete_project_cascades_user_profile_by_composite_key")
+        print("\n=== 12.5 cascade delete: 2/2 passed ===")
     except AssertionError as e:
         print(f"  ❌ {e}")
         raise

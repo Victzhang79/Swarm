@@ -483,14 +483,26 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                     "kb_pending_embeddings",
                 ):
                     _delete_if_table_exists(cur, tbl, project_id)
-                # 记忆 L1/L2/L5/L6（向量随行一并删）
+                # 记忆 L2/L5/L6（向量随行一并删；按 project_id 列）
                 for tbl in (
-                    "mem_user_profile",
                     "mem_task_summary",
                     "mem_mistakes",
                     "mem_successes",
                 ):
                     _delete_if_table_exists(cur, tbl, project_id)
+                # L1 用户画像 mem_user_profile 特殊：PRIMARY KEY 是 user_id，项目维度编码在【复合键】
+                # user_id = f"{user}:{project_id}"（全局画像用 "{user}:__global__"，见 auth.profile_key）。
+                # auth 迁移 ALTER 加的 project_id 列 4 处写入全不填(恒 '')——按它删既【匹配 0 行】(级联名存
+                # 实亡)、又在【迁移未跑=列不存在时 undefined_column 回滚整个级联事务→项目根本删不掉】。故不碰
+                # 那个列，改按复合键尾段删：清该项目下每用户的 L1 画像行；":__global__" 全局画像尾段不同→不
+                # 匹配→保留。用 right() 精确尾段比较（非 LIKE），project_id 内含 %/_ 也不会误伤。
+                cur.execute("SELECT to_regclass('mem_user_profile')")
+                _r = cur.fetchone()
+                if _r and _r[0] is not None and project_id:
+                    cur.execute(
+                        "DELETE FROM mem_user_profile WHERE right(user_id, %s) = %s",
+                        (len(project_id) + 1, f":{project_id}"),
+                    )
                 # P2-A：此前遗漏的项目级作用域表 → 补齐级联，杜绝孤立行长期膨胀。
                 # （task_audit_log 【故意保留】：append-only 追溯"删了什么"，由 TTL purge 兜底。）
                 for tbl in (
