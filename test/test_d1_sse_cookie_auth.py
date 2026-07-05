@@ -90,3 +90,48 @@ def test_logout_is_idempotent_without_session():
     client = TestClient(app)
     lr = client.post("/api/auth/logout")
     assert lr.status_code == 200, lr.text
+
+
+def test_issue_token_cookie_single_source_of_truth():
+    """D1 边界治本：登录与 /api/auth/me 引导共用的单一事实源 _issue_token_cookie 契约。
+
+    /me 用它在 boot/自动登录路径续发 Cookie，使 SSE cookie 鉴权在浏览器重启丢失【会话
+    Cookie】(ttl=0)后仍可用。这里直接锁 helper 的 Cookie 属性（不依赖 RBAC/登录态，确定性）。
+    """
+    from starlette.responses import Response as _Resp
+
+    from swarm.api.routers.auth import _issue_token_cookie
+
+    class _UrlHTTP:
+        scheme = "http"
+
+    class _ReqHTTP:
+        url = _UrlHTTP()
+
+    resp = _Resp()
+    _issue_token_cookie(resp, _ReqHTTP(), "tok-abc")
+    sc = resp.headers.get("set-cookie", "")
+    low = sc.replace(" ", "").lower()
+    assert "swarm_token=tok-abc" in sc, sc
+    assert "httponly" in low, "Cookie 必须 HttpOnly（防 XSS 读取）"
+    assert "path=/" in low, sc
+    assert "samesite=lax" in low, "SameSite=Lax 允许同源 SSE GET"
+    # 内网 HTTP（scheme=http）下不置 secure（否则 Cookie 不发）。
+    assert "secure" not in low, "HTTP 下不应置 Secure（会致 Cookie 不发）"
+
+
+def test_issue_token_cookie_sets_secure_on_https():
+    """HTTPS 部署下应置 Secure。"""
+    from starlette.responses import Response as _Resp
+
+    from swarm.api.routers.auth import _issue_token_cookie
+
+    class _UrlHTTPS:
+        scheme = "https"
+
+    class _ReqHTTPS:
+        url = _UrlHTTPS()
+
+    resp = _Resp()
+    _issue_token_cookie(resp, _ReqHTTPS(), "tok-xyz")
+    assert "secure" in resp.headers.get("set-cookie", "").lower()

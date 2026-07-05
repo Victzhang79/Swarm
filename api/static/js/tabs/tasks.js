@@ -62,13 +62,18 @@ function submitReviseFromModal() {
 async function loadTasks(projectId) {
   try {
     const resp = await fetch('/api/projects/' + encodeURIComponent(projectId) + '/tasks');
-    if (!resp.ok) throw new Error('fetch failed');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     tasks = Array.isArray(data) ? data : (data.tasks || []);
     renderTaskList();
-  } catch {
+  } catch (e) {
     tasks = [];
     renderTaskList();
+    // 断链/后端故障要显式提示——否则空列表被误当"暂无任务"，用户无从区分故障与真空。
+    // 401 已由 installAuthFetch 全局弹登录框，此处跳过避免重复提示。
+    if (!/HTTP 401/.test(String(e && e.message)) && typeof showToast === 'function') {
+      showToast('任务列表加载失败（后端不可达或异常）', 'error');
+    }
   }
 }
 

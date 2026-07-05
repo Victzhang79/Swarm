@@ -148,14 +148,18 @@ function showProjectView(show) {
 async function loadProjects() {
   try {
     const resp = await fetch('/api/projects');
-    if (!resp.ok) throw new Error('fetch failed');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     projects = Array.isArray(data) ? data : (data.projects || []);
     renderProjectList();
     restoreSelectedProject();
-  } catch {
+  } catch (e) {
     projects = [];
     renderProjectList();
+    // 断链/后端故障显式提示——否则空项目列表被误当"暂无项目"。401 由全局登录框处理，跳过。
+    if (!/HTTP 401/.test(String(e && e.message)) && typeof showToast === 'function') {
+      showToast('项目列表加载失败（后端不可达或异常）', 'error');
+    }
   }
 }
 

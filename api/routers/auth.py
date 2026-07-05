@@ -17,6 +17,28 @@ from swarm.api._shared import _require_perm, _require_user
 router = APIRouter()
 
 
+def _issue_token_cookie(response: Response, request: Request, token: str) -> None:
+    """把 token 以 HttpOnly Cookie 下发/续期 —— 登录与 /api/auth/me 引导【共用单一事实源】。
+
+    D1：供浏览器原生 EventSource(SSE) 同源【自动携带】鉴权，无需把 token 放进 ?token= URL
+    （会进 access log/Referer/浏览器历史 → 多用户下跨用户凭据泄漏）。
+    参数须与 /api/auth/logout 的 delete_cookie 对齐（key/path/samesite/secure/httponly），否则
+    浏览器不认作同一 Cookie → 清不掉/续不上。token_ttl_hours=0/None → 会话 Cookie（max_age=None）。
+    """
+    from swarm.config.settings import get_config
+
+    ttl_hours = get_config().token_ttl_hours
+    response.set_cookie(
+        key="swarm_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=(request.url.scheme == "https"),
+        max_age=(ttl_hours * 3600 if ttl_hours and ttl_hours > 0 else None),
+        path="/",
+    )
+
+
 class _LoginThrottle:
     """M8：登录失败限流/锁定（进程内内存，多副本部署可后续换 Redis）。
 
@@ -133,17 +155,8 @@ async def auth_login(req: LoginRequest, request: Request, response: Response):
     expires_at = await loop.run_in_executor(
         None, lambda: set_token_expiry(user.id, ttl_hours)
     )
-    # D1：HttpOnly Cookie 下发 token（JS 读不到 → 不受 XSS 窃取、不进 URL）。secure 仅在
-    # HTTPS 下置(内网 HTTP 部署置 secure 会致 Cookie 不发)；SameSite=Lax 允许同源 SSE GET。
-    response.set_cookie(
-        key="swarm_token",
-        value=user.api_token,
-        httponly=True,
-        samesite="lax",
-        secure=(request.url.scheme == "https"),
-        max_age=(ttl_hours * 3600 if ttl_hours and ttl_hours > 0 else None),
-        path="/",
-    )
+    # D1：HttpOnly Cookie 下发 token（JS 读不到 → 不受 XSS 窃取、不进 URL）。见 _issue_token_cookie。
+    _issue_token_cookie(response, request, user.api_token)
     return {
         "token": user.api_token,
         "must_change_password": must_change,
@@ -218,8 +231,15 @@ async def auth_change_password(request: Request, req: ChangePasswordRequest):
 
 
 @router.get("/api/auth/me", tags=["认证"])
-async def auth_me(request: Request):
+async def auth_me(request: Request, response: Response):
     user = _require_user(request)
+    # D1：boot/自动登录路径（前端启动即调 /api/auth/me 校验 localStorage token）顺带【续发】
+    # HttpOnly Cookie，使 SSE cookie 鉴权在浏览器重启丢失【会话 Cookie】(ttl=0)后仍可用——否则
+    # localStorage token 永不过期但会话 Cookie 已失效 → SSE 401、REST 却仍靠 header 通，割裂。
+    # 仅对持 api_token 的真实用户续发；legacy/无 token 用户跳过（其经 header 鉴权，无需 Cookie）。
+    _tok = getattr(user, "api_token", "") or ""
+    if _tok:
+        _issue_token_cookie(response, request, _tok)
     return {
         "id": user.id,
         "username": user.username,

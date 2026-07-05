@@ -43,12 +43,12 @@ function authHeaders(extra) {
   return h;
 }
 
-// SSE 专用：浏览器原生 EventSource 无法携带自定义请求头，
-// 故把 token 作为 query param 附加到 URL（后端 _extract_token 兜底解析）。
+// SSE 专用：浏览器原生 EventSource 无法携带自定义请求头，但【同源会自动携带 HttpOnly Cookie】
+// (swarm_token；由 /api/auth/login 下发、boot 时 /api/auth/me 续发)。故 SSE 鉴权走 Cookie，
+// D1 治本：token 不再拼进 ?token= URL —— 避免 bearer 泄进 access log / Referer / 浏览器历史
+// （多用户内网下 = 跨用户凭据泄漏）。后端 _extract_token 仍保留 ?token= 兜底以兼容旧客户端。
 function sseUrl(path) {
-  const t = getAuthToken();
-  if (!t) return path;
-  return path + (path.indexOf('?') === -1 ? '?' : '&') + 'token=' + encodeURIComponent(t);
+  return path;
 }
 
 function installAuthFetch() {
