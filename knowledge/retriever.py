@@ -273,13 +273,11 @@ class SwarmRetriever:
         import asyncio
 
         def _query() -> dict[str, Any]:
-            import psycopg
-
-            from swarm.config.settings import DatabaseConfig
-            cfg = DatabaseConfig()
-            conn = psycopg.connect(cfg.postgres_uri, autocommit=True)
+            # C3：每次 brain 检索都会调用 → 走连接池而非每次裸 psycopg.connect（原每检索一开一
+            # 关，连接膨胀）。只读，池连接退出即归还。
+            from swarm.infra.db import sync_pool
             meta: dict[str, Any] = {}
-            try:
+            with sync_pool().connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT description FROM projects WHERE id = %s",
@@ -303,8 +301,6 @@ class SwarmRetriever:
                             "embed": prow[2] if isinstance(prow[2], dict) else {},
                             "analysis": prow[3] if isinstance(prow[3], dict) else {},
                         }
-            finally:
-                conn.close()
             return meta
 
         return await asyncio.to_thread(_query)
