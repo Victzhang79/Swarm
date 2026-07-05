@@ -107,6 +107,14 @@ function startWorkerSSE(runId) {
   workerEventSource.addEventListener('progress', ev => handle(ev, 'progress'));
   workerEventSource.addEventListener('result', ev => handle(ev, 'result'));
   workerEventSource.addEventListener('error', ev => { if (ev.data) handle(ev, 'error'); });
+  // round27：后端失权断流发 event:end（C6 重鉴权）——无监听器时 EventSource 会对已断权的
+  // 端点无限自动重连（每次 403），面板冻在"运行中"无任何提示。收到即关闭并明示。
+  workerEventSource.addEventListener('end', () => {
+    closeWorkerSSE();
+    const statusEl = $('worker-run-status');
+    if (statusEl) statusEl.textContent = '连接已断开';
+    if (typeof showToast === 'function') showToast('Worker 进度流已断开（权限撤销或会话失效）', 'warning');
+  });
   workerEventSource.onmessage = ev => handle(ev, 'progress');
   workerEventSource.onerror = () => {
     /* EventSource 会自动重连；完成时由 complete 事件关闭 */
