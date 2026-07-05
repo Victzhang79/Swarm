@@ -253,7 +253,7 @@ def test_merge_node_uses_merge_engine():
     out = merge(state)
     assert "added by a" in out["merged_diff"]
     assert "added by b" in out["merged_diff"]
-    assert "merge_conflicts" not in out
+    assert out.get("merge_conflicts") == []  # round27: clean/rebase 路径显式清空(H3 同族),防上轮冲突残留
     print("  ✅ merge node — uses merge_engine")
 
 
@@ -341,7 +341,7 @@ def test_merge_node_rebase_path():
             out = merge(state)
 
         # rebase 路径: 无硬冲突
-        assert "merge_conflicts" not in out
+        assert out.get("merge_conflicts") == []  # round27: clean/rebase 路径显式清空(H3 同族),防上轮冲突残留
         # st-a 的 diff 被保留
         assert "from-replace-a" in out["merged_diff"]
         # st-b 被标记为 rebase

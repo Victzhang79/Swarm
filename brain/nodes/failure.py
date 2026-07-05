@@ -674,6 +674,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         }
 
     # 将失败子任务重新加入 dispatch_remaining
+    # round27：pop 前先留存 L1 详情——下方 _widen_scope_for_compile_repair 需要 build_output/
+    # 编译标志判"根因在 scope 外"。旧序是先 pop 再取 → 恒空 dict → 加宽自引入以来从未生效
+    # （RUN16 st-20 类死循环治本实际未通电）。
+    saved_l1_details = {fid: _l1_details_of(subtask_results, fid) for fid in failed_ids}
     dispatch_remaining = list(state.get("dispatch_remaining", []))
     for fid in failed_ids:
         subtask_results.pop(fid, None)
@@ -691,7 +695,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     _scope_widened = False
     if plan_obj is not None:
         for fid in failed_ids:
-            new_files = _widen_scope_for_compile_repair(plan_obj, fid, _l1_details_of(subtask_results, fid))
+            new_files = _widen_scope_for_compile_repair(plan_obj, fid, saved_l1_details.get(fid, {}))
             if new_files:
                 _scope_widened = True
                 logger.info(

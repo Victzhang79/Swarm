@@ -58,12 +58,14 @@ async def test_plan_batch_retries_on_timeout():
 async def test_plan_batch_exhausts_then_drops():
     calls = {"n": 0}
     llm = _flaky_llm(99, "{}", calls)  # 永远 timeout
-    plan = await nodes._plan_ultra_batched(
-        llm, _state(), "建预警平台", "ultra", {}, "", "", "", "", _file_plan(),
-    )
+    # round27 F5：全部批次失败必须【抛出】，由 plan() 的 except 映射为 plan_generation_failed
+    # 降级（can_auto_accept_plan fail-fast 拦下）。旧契约"静默返回单 fallback 空 scope 子任务"
+    # 绕过该标记 → auto_accept 下空计划被放行 → worker 无文件可写假失败。
+    with pytest.raises(RuntimeError):
+        await nodes._plan_ultra_batched(
+            llm, _state(), "建预警平台", "ultra", {}, "", "", "", "", _file_plan(),
+        )
     assert calls["n"] == nodes_plan_batch_attempts(), f"应有界重试,实际 {calls['n']}"
-    # 全失败 → 降级单 fallback 子任务（不崩）
-    assert len(plan.subtasks) >= 1
 
 
 def nodes_plan_batch_attempts():

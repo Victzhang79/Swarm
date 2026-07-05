@@ -855,75 +855,79 @@ async def run_task(
         _task_running.discard(task_id)
         return
 
-    if auto_accept is None:
-        auto_accept = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
-
-    task_rec = store.get_task(task_id) or {}
-    user_id = task_rec.get("created_by_user_id") or ""
-    from swarm.memory.profile import load_profile_prompts
-
-    profile, brain_prompt, worker_prompt = load_profile_prompts(
-        user_id or None,
-        project_id,
-    )
-
-    initial_state: BrainState = {
-        "task_id": task_id,
-        "task_description": description,
-        "project_id": project_id,
-        "user_id": user_id,
-        "user_profile": profile,
-        "user_profile_prompt_brain": brain_prompt,
-        "user_profile_prompt_worker": worker_prompt,
-        "auto_accept": auto_accept,
-    }
-
-    # B 部分：透传上传文件给摄取节点（存在 task_records.uploaded_files）。
-    # 无文件时 ingest 节点 no-op 直通，对纯文字任务零影响。
-    _uploaded = task_rec.get("uploaded_files") or []
-    if _uploaded:
-        initial_state["uploaded_files"] = list(_uploaded)
-    if task_rec.get("auto_confirm_vision"):
-        initial_state["auto_confirm_vision"] = True
-
-    project_path = None
+    # round27 F1：锁获取到旧 try 之间的初始化段（store.get_task / load_profile_prompts /
+    # build_session_metadata 等均可抛）原先【不在】下方 try/finally 保护内——异常直接泄漏模块锁
+    # （Redis 路径靠 1h TTL 自愈；Redis 不可用退进程内 threading 锁的兜底路径【永久】泄漏到重启）
+    # + _task_running 残留。try 前移到紧贴 acquire，让一切失败路径统一 FAILED 落库 + finally 释放。
     try:
-        proj = store.get_project(project_id)
-        if proj:
-            project_path = proj.get("path")
-    except Exception as exc:
-        logger.debug("获取项目路径失败 project_id=%s: %s", project_id, exc)
+        if auto_accept is None:
+            auto_accept = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
 
-    # ── 3rd#2 治本：任务启动即钉住 base commit（git rev-parse HEAD）──
-    # 全交付链（worker diff / merge base / L2 reset / learn 复位）统一相对此 SHA，
-    # 消除运行期用户/兄弟任务 commit 推进 HEAD 造成的混基线。已钉扎（罕见的重跑同 task_id）
-    # 则沿用 DB 里的出生基线，绝不重捕获。非 git/greenfield → None → 各站点退回 HEAD（零回归）。
-    from swarm.git_base import capture_base_commit
+        task_rec = store.get_task(task_id) or {}
+        user_id = task_rec.get("created_by_user_id") or ""
+        from swarm.memory.profile import load_profile_prompts
 
-    base_commit = task_rec.get("base_commit") or capture_base_commit(project_path)
-    if base_commit:
-        initial_state["base_commit"] = base_commit
-        if not task_rec.get("base_commit"):
-            try:
-                store.update_task(task_id, base_commit=base_commit)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[BASE] 落库 base_commit 失败(非致命,内存态仍钉扎): %s", exc)
-    elif project_path and os.path.isdir(os.path.join(project_path, ".git")):
-        # 对抗复核 M1：git 项目却捕获不到 base（git 超时/不在 PATH/仓库损坏）→ 全链退回实时 HEAD，
-        # 运行期 HEAD 漂移不再受钉扎保护。必须【可观测】——否则运维看到交付异常却无线索。
-        logger.warning(
-            "[BASE] capture_base_commit 返回 None（git 不可用/仓库异常），任务 %s 回退 HEAD 行为，"
-            "运行期 HEAD 漂移不受钉扎保护: project_path=%s", task_id, project_path,
+        profile, brain_prompt, worker_prompt = load_profile_prompts(
+            user_id or None,
+            project_id,
         )
 
-    from swarm.memory.session import build_session_metadata
+        initial_state: BrainState = {
+            "task_id": task_id,
+            "task_description": description,
+            "project_id": project_id,
+            "user_id": user_id,
+            "user_profile": profile,
+            "user_profile_prompt_brain": brain_prompt,
+            "user_profile_prompt_worker": worker_prompt,
+            "auto_accept": auto_accept,
+        }
 
-    initial_state["session_metadata"] = build_session_metadata(
-        project_path=project_path,
-        client="api",
-    )
+        # B 部分：透传上传文件给摄取节点（存在 task_records.uploaded_files）。
+        # 无文件时 ingest 节点 no-op 直通，对纯文字任务零影响。
+        _uploaded = task_rec.get("uploaded_files") or []
+        if _uploaded:
+            initial_state["uploaded_files"] = list(_uploaded)
+        if task_rec.get("auto_confirm_vision"):
+            initial_state["auto_confirm_vision"] = True
 
-    try:
+        project_path = None
+        try:
+            proj = store.get_project(project_id)
+            if proj:
+                project_path = proj.get("path")
+        except Exception as exc:
+            logger.debug("获取项目路径失败 project_id=%s: %s", project_id, exc)
+
+        # ── 3rd#2 治本：任务启动即钉住 base commit（git rev-parse HEAD）──
+        # 全交付链（worker diff / merge base / L2 reset / learn 复位）统一相对此 SHA，
+        # 消除运行期用户/兄弟任务 commit 推进 HEAD 造成的混基线。已钉扎（罕见的重跑同 task_id）
+        # 则沿用 DB 里的出生基线，绝不重捕获。非 git/greenfield → None → 各站点退回 HEAD（零回归）。
+        from swarm.git_base import capture_base_commit
+
+        base_commit = task_rec.get("base_commit") or capture_base_commit(project_path)
+        if base_commit:
+            initial_state["base_commit"] = base_commit
+            if not task_rec.get("base_commit"):
+                try:
+                    store.update_task(task_id, base_commit=base_commit)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[BASE] 落库 base_commit 失败(非致命,内存态仍钉扎): %s", exc)
+        elif project_path and os.path.isdir(os.path.join(project_path, ".git")):
+            # 对抗复核 M1：git 项目却捕获不到 base（git 超时/不在 PATH/仓库损坏）→ 全链退回实时 HEAD，
+            # 运行期 HEAD 漂移不再受钉扎保护。必须【可观测】——否则运维看到交付异常却无线索。
+            logger.warning(
+                "[BASE] capture_base_commit 返回 None（git 不可用/仓库异常），任务 %s 回退 HEAD 行为，"
+                "运行期 HEAD 漂移不受钉扎保护: project_path=%s", task_id, project_path,
+            )
+
+        from swarm.memory.session import build_session_metadata
+
+        initial_state["session_metadata"] = build_session_metadata(
+            project_path=project_path,
+            client="api",
+        )
+
         thread_id = task_rec.get("thread_id") or task_id
         store.update_task(task_id, status="ANALYZING", thread_id=thread_id)
         audit(
@@ -937,12 +941,13 @@ async def run_task(
             task_id, initial_state, queue, project_id=project_id, module_lock=module_lock,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
+        _final_rec = store.get_task(task_id)
         audit(
             "task_complete",
             orchestrator="Brain",
             task_id=task_id,
             project_id=project_id,
-            status=store.get_task(task_id).get("status") if store.get_task(task_id) else "UNKNOWN",
+            status=_final_rec.get("status") if _final_rec else "UNKNOWN",
         )
     except asyncio.CancelledError:
         logger.info("[RUNNER] 任务 %s 已取消", task_id)
@@ -1038,23 +1043,25 @@ async def resume_task(
         _task_running.discard(task_id)
         return
 
-    decision_norm = decision.lower().strip()
-    if decision_norm in ("approved", "approve", "accept"):
-        decision_norm = HumanDecision.ACCEPT.value
-    elif decision_norm in ("revised", "revise"):
-        decision_norm = HumanDecision.REVISE.value
-    elif decision_norm in ("rejected", "reject"):
-        decision_norm = HumanDecision.REJECT.value
-
-    store.update_task(
-        task_id,
-        human_decision=decision_norm.upper(),
-        status="IN_REVISION" if decision_norm == HumanDecision.REVISE.value else "ANALYZING",
-    )
-
-    resume_payload: dict[str, Any] = {"decision": decision_norm, "feedback": feedback}
-
+    # round27 F1：与 run_task 同理——acquire 到旧 try 之间的 store.update_task 可抛，
+    # 异常会泄漏模块锁（进程内锁兜底路径永久泄漏）。try 前移到紧贴 acquire。
     try:
+        decision_norm = decision.lower().strip()
+        if decision_norm in ("approved", "approve", "accept"):
+            decision_norm = HumanDecision.ACCEPT.value
+        elif decision_norm in ("revised", "revise"):
+            decision_norm = HumanDecision.REVISE.value
+        elif decision_norm in ("rejected", "reject"):
+            decision_norm = HumanDecision.REJECT.value
+
+        store.update_task(
+            task_id,
+            human_decision=decision_norm.upper(),
+            status="IN_REVISION" if decision_norm == HumanDecision.REVISE.value else "ANALYZING",
+        )
+
+        resume_payload: dict[str, Any] = {"decision": decision_norm, "feedback": feedback}
+
         await _emit(queue, {
             "step": "resume",
             "status": "running",
@@ -1160,8 +1167,9 @@ async def resume_planning(
         _task_running.discard(task_id)
         return
 
-    store.update_task(task_id, status="ANALYZING")
+    # round27 F1：与 run_task/resume_task 同族——update_task 移入 try，防 acquire 后异常泄漏模块锁。
     try:
+        store.update_task(task_id, status="ANALYZING")
         await _emit(queue, {
             "step": "resume", "status": "running",
             "message": "恢复规划（澄清/方案评审已提交）", "mode": "brain", "progress": 30,

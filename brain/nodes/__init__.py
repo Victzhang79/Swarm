@@ -608,11 +608,12 @@ async def _plan_ultra_batched(
         total - failed_batches, total, len(merged), failed_batches,
     )
     if not merged:
-        return TaskPlan(subtasks=[SubTask(
-            id="st-1", description=task_description,
-            difficulty=SubTaskDifficulty.MEDIUM, modality=SubTaskModality.TEXT,
-            scope=FileScope(writable=[], readable=[]), contract={},
-        )])
+        # round27：全部批次失败时绝不静默返回空 scope 兜底计划——那会绕过 plan_generation_failed
+        # 标记（TD2606-A5），在 auto_accept 下被 confirm_plan 放行 → worker 无文件可写 → 假失败。
+        # 抛出让 plan() 的 except Exception 走与单发路径同构的 _plan_degraded 降级
+        # （兜底计划 + plan_generation_failed=True，can_auto_accept_plan fail-fast 拦下）。
+        raise RuntimeError(
+            f"ultra 分批拆解全部 {total} 批失败（LLM 超时/异常），无可用子任务")
     # N-03 兼容：万一 LLM 仍吐旧键 acceptance（SubTask 字段是 acceptance_criteria，
     # extra=ignore 会静默丢弃致验收恒空），重映射后再构造。
     for st in merged:
@@ -1538,6 +1539,12 @@ def merge(state: BrainState) -> dict:
     # 误判仍需 rebase → MERGE→DISPATCH 死循环至 recursion_limit。
     # 仅在下方 rebase 路径命中时被覆盖为非空。
     out["rebase_subtask_ids"] = []
+    # round27 同族补漏：merge_conflicts 与 failed_subtask_ids 也是"仅冲突路径写、无人清"的
+    # 粘滞键——第 1 轮冲突 → HANDLE_FAILURE 重试成功 → 第 2 轮 clean merge 不回写 → after_merge
+    # 读到上轮残留冲突再次路由 HANDLE_FAILURE（空失败集喂 LLM，可能 escalate 把已成功任务判
+    # FAILED / replan 推倒重来）。与 H3 同法：每轮 merge 先清，仅冲突路径覆盖为非空。
+    out["merge_conflicts"] = []
+    out["failed_subtask_ids"] = []
 
     # #1(a) fail-closed：终局干净合并但 merged_diff `git apply --check` 失败＝确定性组装缺陷。
     # 绝不能只诊断后默认落 VERIFY_L2（project_path 空时 L2 复核整块跳过 → 非法 patch 假绿放行）。

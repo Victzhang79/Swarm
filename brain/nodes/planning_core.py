@@ -539,7 +539,10 @@ def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str |
         return ""
 
 
-async def _generate_compile_stub(state: BrainState, st, project_path: str | None) -> str | None:
+async def _generate_compile_stub(
+    state: BrainState, st, project_path: str | None,
+    protected_files: set[str] | None = None,
+) -> str | None:
     """卡死子任务恢复阶梯·阶梯三(stub)：为【被依赖】的卡死子任务生成可编译桩。
 
     聚焦 LLM 调用：据 X 的描述/契约/目标文件，生成各文件的【可编译桩】——保留 public 类型/
@@ -611,7 +614,10 @@ async def _generate_compile_stub(state: BrainState, st, project_path: str | None
     diff = _git_diff_for_paths(project_path, written, base_ref=state.get("base_commit"))
     if not diff.strip():
         # diff 生成失败 → 清掉刚写的桩（防污染本地树）后回退 revert。
-        _local_tree_revert_subtask(project_path, st, base_ref=state.get("base_commit"))
+        # round27：revert 按 st 全足迹清，必须带 H-exec2 护栏 protected_files——否则足迹与
+        # 已完成兄弟重叠时（normalize 后 _grant_module_pom_writable 等可引入重叠）误删其有效产物。
+        _local_tree_revert_subtask(project_path, st, protected_files=protected_files or set(),
+                                   base_ref=state.get("base_commit"))
         return None
     logger.info("[阶梯三·桩] 为卡死子任务 %s 生成可编译桩 %s（下游可编译，需人工补完）",
                 getattr(st, "id", "?"), written)
@@ -651,7 +657,10 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
         depended = any(fid in (getattr(s, "depends_on", []) or []) for s in subtasks)
         stub_diff = None
         if depended:
-            stub_diff = await _generate_compile_stub(state, st, project_path)
+            # round27：桩生成内部的 diff 失败清理路径也按 H-exec2 护住已完成兄弟产物。
+            _prot_stub = _files_owned_by_completed(subtasks, subtask_results, exclude_ids={fid})
+            stub_diff = await _generate_compile_stub(state, st, project_path,
+                                                     protected_files=_prot_stub)
         if stub_diff:
             mode = "stub"
             subtask_results[fid] = WorkerOutput(
