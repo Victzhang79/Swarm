@@ -67,6 +67,21 @@ def test_compile_files_py_quotes_metachar_filename():
     assert "a b$;.py" in shlex.split(cmd), f"py 文件名未被安全引用: {cmd}"
 
 
+def test_module_pom_finder_quotes_metachar_dir():
+    """round25 全局扫尾续：_module_pom_for_file 的 d="{d}" shell 变量赋值也须 shlex.quote。"""
+    captured = {}
+
+    def _fake(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return 0, "", ""
+
+    with patch.object(l1, "_run_check_split", _fake):
+        l1._module_pom_for_file("/tmp/proj", "a b$;/Foo.java", timeout=15)
+    cmd = captured["cmd"]
+    # 目录段含空格/$/; → d= 赋值必须安全引用（不再是裸 d="a b$;"，否则 $;、空格破坏 shell 赋值）
+    assert shlex.quote("a b$;") in cmd, f"module pom finder 的 d= 未安全引用: {cmd}"
+
+
 if __name__ == "__main__":
     import sys
 

@@ -397,7 +397,7 @@ bash test/run_all.sh                                    # 全部测试
 .venv/bin/ruff check . --select E9,F63,F7,F82           # 关键 lint（CI 同款）
 ```
 
-CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2410 passed**）。
+CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **2411 passed**）。
 
 ---
 

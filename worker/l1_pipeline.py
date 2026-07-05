@@ -225,7 +225,7 @@ def _fetch_maven_versions(group: str, artifact: str, project_path: str, timeout:
         f"https://repo1.maven.org/maven2/{gpath}/{artifact}/maven-metadata.xml",
     ]
     for url in urls:
-        cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+        cmd = f"curl -s -m 15 {shlex.quote(url)} 2>/dev/null || wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null"
         _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
         if _tool_missing(out):
             continue
@@ -387,7 +387,7 @@ def _fqcn_for_missing_pkg(project_path: str, rel_file: str, pkg: str, timeout: i
 
     通配 `import P.*;` 无具体类 → 返回 None（无法精确反查，交契约/其它防线）。"""
     pe = re.escape(pkg)
-    cmd = f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' '{rel_file}' 2>/dev/null | head -4"
+    cmd = f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' {shlex.quote(rel_file)} 2>/dev/null | head -4"
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
     for line in (out or "").splitlines():
         m = re.search(rf"import\s+(?:static\s+)?({pe}\.[A-Za-z_][A-Za-z0-9_.]*)", line)
@@ -410,7 +410,7 @@ def _resolve_artifact_via_central(
         "https://search.maven.org/solrsearch/select?"
         f"q=fc:{fqcn}&rows=15&wt=json"
     )
-    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    cmd = f"curl -s -m 15 {shlex.quote(url)} 2>/dev/null || wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null"
     _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
     if _tool_missing(out) or not (out or "").strip():
         return None
@@ -439,7 +439,7 @@ def _module_pom_for_file(project_path: str, rel_file: str, timeout: int) -> str 
     """从出错文件向上找最近的 module pom.xml（归一化模块相对路径）。"""
     d = rel_file.rsplit("/", 1)[0] if "/" in rel_file else "."
     cmd = (
-        f'd="{d}"; while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do '
+        f'd={shlex.quote(d)}; while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do '
         f'[ -f "$d/pom.xml" ] && echo "$d/pom.xml" && break; d=$(dirname "$d"); done; '
         f'[ -f "./pom.xml" ] && [ -z "$d" -o "$d" = "." ] && echo "pom.xml"'
     )
@@ -491,7 +491,7 @@ def _resolve_artifact_family(
     if base == primary:
         return []
     url = f"https://search.maven.org/solrsearch/select?q=g:%22{group}%22&rows=40&wt=json"
-    cmd = f"curl -s -m 15 '{url}' 2>/dev/null || wget -qO- -T 15 '{url}' 2>/dev/null"
+    cmd = f"curl -s -m 15 {shlex.quote(url)} 2>/dev/null || wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null"
     _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
     if _tool_missing(out) or not (out or "").strip():
         return []
@@ -878,7 +878,7 @@ def _imported_classes_from_pkg(
     `import pkg.sub....`（小写子包）与 `import pkg.*;`（通配无具体类）都不取——无法精确定位。"""
     pe = re.escape(pkg)
     cmd = (
-        f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' '{rel_file}' "
+        f"grep -hoE 'import +(static +)?{pe}\\.[A-Za-z_][A-Za-z0-9_.]*' {shlex.quote(rel_file)} "
         f"2>/dev/null | head -20"
     )
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 20))
@@ -904,7 +904,7 @@ def _internal_packages_declaring_class(
     from swarm.worker.symbol_resolver import file_path_to_fqn
     cmd = (
         f"grep -rlE '(class|interface|enum|record)[[:space:]]+{re.escape(cls)}"
-        f"([^A-Za-z0-9_]|$)' --include='{cls}.java' . 2>/dev/null | head -20"
+        f"([^A-Za-z0-9_]|$)' --include={shlex.quote(cls + '.java')} . 2>/dev/null | head -20"
     )
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 30))
     pkgs: set[str] = set()

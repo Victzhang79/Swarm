@@ -2733,10 +2733,11 @@ class WorkerExecutor:
                     continue
                 seen_classes.add(klass)
                 bin_name = to_javap_class_name(klass)
+                import shlex
                 cmd = (
-                    f"cd {remote} 2>/dev/null && "
+                    f"cd {shlex.quote(remote)} 2>/dev/null && "
                     f"javap -cp \"$(cat /tmp/swarm_javap_cp.txt 2>/dev/null).\" "
-                    f"-public '{bin_name}' 2>/dev/null | head -80"
+                    f"-public {shlex.quote(bin_name)} 2>/dev/null | head -80"
                 )
                 result = rc(self._sandbox, cmd, timeout=30)
                 methods = parse_javap_methods(getattr(result, "stdout", "") or "")
