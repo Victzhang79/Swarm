@@ -13,6 +13,17 @@
     边界:
     - 仍是单进程模型。多 API 副本需要外置队列（见 README Roadmap）。
     - resume（审核后恢复）不走队列，直接执行（已在审核态，不占新并发额度）。
+
+    ── round24 B2：多副本协调 = WONTFIX（当前部署=内网多用户多项目【单进程】）──
+    目标部署为单进程，下列进程内全局态在单进程下【正确】（内存即全局事实源），故本轮不搬
+    到 Redis/PG，标 WONTFIX 并留【多副本迁移清单】备将来水平扩容时按此逐项外置：
+      1. brain/runner：_task_running / _task_queues / _task_handles（在飞/队列/句柄）
+      2. brain/scheduler：_inflight / _pending_meta（本模块并发计数与待跑元数据）
+      3. api 限流器 _limiter（令牌桶）· 登录节流 _LoginThrottle（失败锁定）
+      4. brain/graph：编译图 / checkpointer 单例
+    迁移事实源统一走 Redis/PG；跨进程任务认领的现成入口是 scheduler.is_task_claimed
+    （已有 Redis SET NX 语义，B1 的 ModuleLock 亦然）。resume 绕过并发上限在单进程可控；
+    多副本下需一并纳入外置准入。启用多副本前：模块锁必启 Redis（否则仅进程内互斥，见 B1）。
 """
 
 from __future__ import annotations
