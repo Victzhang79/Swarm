@@ -506,9 +506,14 @@ async def ingest_documents(project_id: str, request: Request, req: IngestRequest
         msg = str(e)
         if msg.startswith("[yuque]") or "语雀" in msg:
             raise HTTPException(status_code=400, detail=msg)
-        raise HTTPException(status_code=500, detail=f"采集失败: {e}")
+        # D2：500 是服务端错误，原始异常只进日志、不回显客户端（多用户防内部细节泄漏）。
+        import logging as _logging
+        _logging.getLogger("swarm.api.knowledge").error("知识采集失败(500): %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="采集失败，请稍后重试或联系管理员") from e
     except Exception as e:  # noqa: BLE001 - 兜底，绝不 500 裸抛
-        raise HTTPException(status_code=500, detail=f"采集失败: {e}")
+        import logging as _logging
+        _logging.getLogger("swarm.api.knowledge").error("知识采集异常(500): %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="采集失败，请稍后重试或联系管理员") from e
 
 
 @router.get("/api/projects/{project_id}/knowledge/behavior-hotspots", tags=["知识库"])

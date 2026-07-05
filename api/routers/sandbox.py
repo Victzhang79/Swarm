@@ -521,7 +521,9 @@ async def destroy_sandbox(sandbox_id: str, request: Request):
             sb.kill()
             return {"status": "ok", "message": f"Sandbox {sandbox_id} destroyed via server"}
         except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found: {e}")
+            # D2：泛化客户端文案，原始异常只进服务端日志（多用户下防内部细节跨用户泄漏）。
+            _app.logger.warning("Sandbox connect/kill fallback failed %s: %s", sandbox_id, e)
+            raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found") from e
     try:
         manager.kill(sandbox_id)
         return {"status": "ok", "message": f"Sandbox {sandbox_id} destroyed"}
@@ -555,16 +557,15 @@ async def sandbox_files(sandbox_id: str, request: Request, path: str = "/"):
             "files": files,
         }
     except Exception as e:
-        _app.logger.error("Failed to list files in sandbox %s: %s", sandbox_id, e)
+        # D2：泛化客户端文案；原始异常 + proxy 排障提示只进服务端日志（proxy 地址属内部
+        # 基础设施细节，多用户下不外泄）。
         proxy = _app.get_config().sandbox.proxy_base
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"无法访问沙箱文件系统: {e}. "
-                f"请确认 CubeProxy 可达 (SWARM_SANDBOX_PROXY_BASE={proxy})，"
-                "且 dev_sidecar 未被错误指向 127.0.0.1:11443。"
-            ),
+        _app.logger.error(
+            "Failed to list files in sandbox %s: %s (确认 CubeProxy 可达 "
+            "SWARM_SANDBOX_PROXY_BASE=%s，dev_sidecar 未错指 127.0.0.1:11443)",
+            sandbox_id, e, proxy,
         )
+        raise HTTPException(status_code=502, detail="无法访问沙箱文件系统")
 
 
 # ─── 11. GET /api/sandbox/{sandbox_id}/files/content ─
@@ -610,7 +611,7 @@ async def sandbox_file_content(sandbox_id: str, path: str, request: Request):
         }
     except Exception as e:
         _app.logger.error("Failed to read file in sandbox %s path=%s: %s", sandbox_id, path, e)
-        raise HTTPException(status_code=502, detail=f"无法读取沙箱文件: {e}")
+        raise HTTPException(status_code=502, detail="无法读取沙箱文件")  # D2：泛化，异常只进日志
 
 
 @router.get("/api/sandbox/{sandbox_id}/logs", tags=["沙箱"])
