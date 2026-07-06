@@ -350,70 +350,8 @@ def test_5_build_tools_sandbox_mode():
     print("  ✅ TEST 5 PASSED")
 
 
-@requires_code_interpreter
-def test_6_executor_sandbox_integration():
-    """测试 6: WorkerExecutor 与沙箱的完整集成"""
-    separator("TEST 6: WorkerExecutor + Sandbox 集成")
-
-    from swarm.types import FileScope, SubTask
-    from swarm.worker.executor import WorkerExecutor
-
-    subtask = SubTask(
-        id="test-sandbox-001",
-        description="验证沙箱集成",
-        scope=FileScope(writable=["test.py"], readable=["test.py"]),
-    )
-
-    executor = WorkerExecutor(subtask=subtask)
-
-    try:
-        # 创建沙箱
-        print("  [6.1] WorkerExecutor 创建远程沙箱...")
-        sandbox = executor.create_sandbox()
-        print(f"  ✅ 创建成功: {sandbox.sandbox_id}")
-
-        # 在沙箱中执行代码
-        print("  [6.2] 通过 run_in_sandbox 执行代码...")
-        output = executor.run_in_sandbox("print('Hello from WorkerExecutor sandbox!')")
-        print(f"  output: {output[:200]}")
-        assert "Hello from WorkerExecutor sandbox!" in output
-
-        # 执行计算
-        print("  [6.3] 沙箱内计算...")
-        output = executor.run_in_sandbox("import math; print(f'pi={math.pi:.2f}')")
-        print(f"  output: {output}")
-        assert "pi=3.14" in output
-
-        # 执行文件操作
-        print("  [6.4] 沙箱内文件操作...")
-        output = executor.run_in_sandbox("""
-with open('/tmp/worker_test.txt', 'w') as f:
-    f.write('worker output')
-with open('/tmp/worker_test.txt', 'r') as f:
-    print(f.read())
-""")
-        print(f"  output: {output}")
-        assert "worker output" in output
-
-        # 执行进程命令
-        print("  [6.5] 沙箱内 subprocess...")
-        output = executor.run_in_sandbox("""
-import subprocess
-r = subprocess.run(['python3', '-c', 'print(2+3)'], capture_output=True, text=True)
-print(r.stdout)
-""")
-        print(f"  output: {output}")
-        assert "5" in output
-
-        # 销毁沙箱
-        print("  [6.6] 销毁沙箱...")
-        executor.kill_sandbox()
-        print("  ✅ 沙箱已销毁")
-
-        print("  ✅ TEST 6 PASSED")
-    except Exception:
-        executor.kill_sandbox()
-        raise
+# 批5：test_6（WorkerExecutor.create_sandbox/run_in_sandbox 遗留集成路径）随死代码一并删除——
+# 生产主流程 prepare 直连沙箱池/manager（run_command），run_code 仅语言镜像 502 的 Jupyter 遗留。
 
 
 @requires_code_interpreter
@@ -538,7 +476,6 @@ def main():
         ("远程文件操作", test_3_remote_file_operations),
         ("远程进程执行", test_4_sandbox_process_execution),
         ("build_tools 沙箱模式", test_5_build_tools_sandbox_mode),
-        ("WorkerExecutor + Sandbox 集成", test_6_executor_sandbox_integration),
         ("错误处理与极端场景", test_7_error_and_edge_cases),
         ("全模块 re-import", test_8_smoke_reimport),
     ]

@@ -141,24 +141,5 @@ function tryShowLearnNotice(data) {
 
 // ─── Pipeline & Logs ───────────────────────────────────────
 
-async function maybeShowBrowserNotifications(items) {
-  if (!items.length || !document.hidden) return;
-  if (!('Notification' in window)) return;
-  let perm = Notification.permission;
-  if (perm === 'default') {
-    try {
-      perm = await Notification.requestPermission();
-    } catch {
-      return;
-    }
-  }
-  if (perm !== 'granted') return;
-  for (const n of items.slice(0, 3)) {
-    try {
-      new Notification('Swarm', {
-        body: n.message || n.description || '任务状态更新',
-        tag: n.task_id || undefined,
-      });
-    } catch { /* ignore */ }
-  }
-}
+// 批5：maybeShowBrowserNotifications 已删（全仓无调用者的死函数）
+

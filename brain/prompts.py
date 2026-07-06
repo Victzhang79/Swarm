@@ -75,7 +75,7 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
    - 子任务间用 depends_on 串成【严格串行】依赖序（后序依赖前序），后序子任务能看到前序产出的真实接口签名，避免接口对不上。
    - 【硬约束：子任务之间 writable/create 文件【绝对不可重叠】】——每个文件只能属于一个子任务，否则 MERGE 必冲突。
    - 【聚合/注册类共享文件例外】：父 `pom.xml` 的 `<modules>`、`settings.gradle`、路由 `index` 表、DI 容器注册、i18n bundle 这类【需多处登记】的文件，指定【单一 owner 子任务】统一登记所有条目（如脚手架子任务一次注册全部新模块），其余子任务 depends_on 该 owner 并把该文件放 readable，【绝不】各自写——多写者必争抢。
-   - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个 maven/gradle 模块时，建该模块 `pom.xml` 的脚手架子任务【必须】在 pom 里一次性声明【本计划里该模块任何子任务会用到、而父 pom 未传递】的全部依赖（如 lombok、spring-boot-starter-data-redis、各 starter/web/validation 等）。后续写代码的子任务【碰不到 pom】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架 pom 多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"pom 声明全部所需依赖且 mvn compile 通过"。
+   - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个 maven/gradle 模块时，建该模块 `pom.xml` 的脚手架子任务【必须】在 pom 里一次性声明【本计划里该模块任何子任务会用到、而父 pom 未传递】的全部依赖（如 lombok、spring-boot-starter-data-redis、各 starter/web/validation 等）。后续写代码的子任务【碰不到 pom】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架 pom 多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"构建清单声明全部所需依赖且对应构建命令通过（如 Maven `mvn compile`、Gradle `gradle build`、npm `npm run build`）"。
    - 每个子功能子任务自身仍是垂直切片（自洽、可验证）。
    - ⚠️ 不满足"≥7文件或多组件"的功能【不要】用此拆分——4-6 文件的普通功能（如单个导出接口）仍是【一个】子任务，由一个 worker 一次改完（worker 内部会自动分阶段写，不需你拆）。
 默认倾向【少拆/不拆】：能一个子任务做完的功能就不要拆。拆分的代价（依赖/合并/失败面）通常高于收益。
@@ -149,15 +149,17 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 【你这一批只负责一个功能模块的文件】，不要管其他模块。
 
 【核心原则-P1 垂直切片】（最重要，违反会导致接口对不上）：
-- 一个【完整功能】= 一个子任务，包含它的 Entity + Mapper + Service + ServiceImpl + Controller + XML。
-- 【绝对禁止】按技术层水平拆（禁止"st-1仅Entity / st-2仅Mapper / st-3仅Service"这种）——
+- 一个【完整功能】= 一个子任务，包含该功能的全部纵向分层——按项目实际技术栈：
+  后端如 Entity/Mapper/Service/Controller（Java）、model/handler/service（Go）、
+  router/service/schema（Python）；前端如组件+状态+接口层。
+- 【绝对禁止】按技术层水平拆（如"st-1 仅实体 / st-2 仅数据访问 / st-3 仅服务层"）——
   那会制造大量人为跨子任务依赖和接口对齐风险。
 - 同一个功能的纵向所有层放进【同一个子任务】的 scope，让一个 worker 一次写完整个功能。
 - 一个模块通常拆成 1-4 个垂直功能子任务（按功能点，不按层）。
 
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
 【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile），或具体测试命令；不要给非本项目栈的命令。
-【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块 `pom.xml`，建 pom 的子任务【必须】一次性声明本模块全部子任务会用到、而父 pom 未传递的依赖（lombok、spring-boot-starter-data-redis、各 starter 等）——写代码的子任务碰不到 pom，缺一个依赖即整模块编译失败。宁多勿漏。
+【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖（Java 如 lombok/各 starter，Node 如运行时+类型依赖）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
 
 规则：
 - 只为【本批模块文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
@@ -294,28 +296,6 @@ VALIDATE_PLAN_USER = """## 任务描述
 # ──────────────────────────────────────────────
 # MONITOR 节点: 执行监控 & 故障分析
 # ──────────────────────────────────────────────
-MONITOR_SYSTEM = """你是一个执行监控专家。你需要分析 Worker 的执行结果，判断任务是否成功完成，
-以及是否需要重试或调整策略。"""
-
-MONITOR_USER = """## 派发剩余
-{dispatch_remaining}
-
-## 已完成结果
-{completed_results}
-
-## 失败子任务
-{failed_subtask_ids}
-
-请分析当前执行状态，以 JSON 格式输出:
-```json
-{{
-  "all_done": true|false,
-  "has_failures": true|false,
-  "failure_analysis": "失败原因分析（如有）",
-  "retry_suggestion": "重试建议（如有）"
-}}
-```"""
-
 # ──────────────────────────────────────────────
 # HANDLE_FAILURE 节点: 故障处理
 # ──────────────────────────────────────────────
@@ -521,29 +501,3 @@ CONFIRM_PROMPT = """## 任务描述
 # ──────────────────────────────────────────────
 # DISPATCH 节点辅助: Worker 指令生成
 # ──────────────────────────────────────────────
-DISPATCH_SYSTEM = """你是一个任务派发专家。你需要将子任务描述转换为 Worker 可执行的详细指令。"""
-
-DISPATCH_USER = """## 子任务定义
-{subtask_description}
-
-## 文件范围
-{scope}
-
-## 契约
-{contract}
-
-## 验收标准
-{acceptance_criteria}
-
-## 知识上下文（按任务检索的相关片段，非全库）
-{knowledge_context}
-
-请生成 Worker 执行指令，以 JSON 格式输出:
-```json
-{{
-  "instruction": "详细的执行指令",
-  "context_files": ["需要读取的上下文文件"],
-  "expected_output": "预期输出描述",
-  "quality_checks": ["质量检查项"]
-}}
-```"""

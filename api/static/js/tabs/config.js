@@ -622,10 +622,6 @@ function renderRoutingTable(data) {
   }).join('');
 }
 
-async function saveRouting() {
-  /* 已合并到 saveConfig */
-}
-
 // 仅保存 Worker 路由（trivial/medium/complex/multimodal）——只 PUT /api/routing 的
 // routing_* 字段，【不传 brain_*、不传 langsmith/tier】，避免点底部"保存配置"时把
 // Brain 模型/LangSmith/分级开关等无关配置一并覆盖（用户反馈：很多不该更新的被更新了）。

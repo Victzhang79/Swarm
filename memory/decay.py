@@ -1,13 +1,13 @@
 """L5 错题集 / L6 成功模式 衰减机制 — 指数衰减，每日调用
 
 衰减策略:
-- L5 错题集: 每日调用 decay_l5() 执行指数衰减
+- L5 错题集: 每日调用 decay_l5_batch_sql() 执行指数衰减
   - decay_weight *= decay_factor (默认 0.9)
   - 多次出现的错题衰减更慢: effective_factor = decay_factor ^ (1 / occurrence_count)
   - decay_weight 低于 threshold 时删除
   - 重复遇到的错题会重振权重(increment_mistake_occurrence)
 
-- L6 成功模式集: 每日调用 decay_l6() 执行指数衰减(比 L5 更温和)
+- L6 成功模式集: 每日调用 decay_l6_batch_sql() 执行指数衰减(比 L5 更温和)
   - decay_weight *= l6_decay_factor (默认 0.95，比 L5 的 0.9 慢)
   - 高复用次数的衰减更慢: effective_factor = l6_decay_factor ^ (1 / (reuse_count + 1))
   - decay_weight 低于 threshold 时删除
@@ -37,8 +37,8 @@ class MemoryDecay:
     使用方式:
         decay = MemoryDecay(memory_store)
         await decay.connect()
-        await decay.decay_l5()                   # 执行一次 L5 衰减
-        await decay.decay_l6()                   # 执行一次 L6 衰减
+        await decay.decay_l5_batch_sql()         # 执行一次 L5 衰减
+        await decay.decay_l6_batch_sql()         # 执行一次 L6 衰减
         await decay.start_daily_decay()          # 启动每日自动衰减(L5+L6)
     """
 
@@ -83,92 +83,6 @@ class MemoryDecay:
         await self._store.close()
 
     # ── L5 错题集衰减 ──────────────────────────
-
-    async def decay_l5(self, project_id: str | None = None) -> dict[str, Any]:
-        """对 L5 错题集执行一次指数衰减
-
-        流程:
-        1. 获取所有 decay_weight > 0 的错题
-        2. 对每条计算新的 decay_weight
-        3. 更新数据库
-        4. 删除低于阈值的错题
-
-        Args:
-            project_id: 指定项目(为 None 则衰减所有项目 — 全表批量)
-
-        Returns:
-            统计信息 dict
-        """
-        # #7：WS1 起 L5 改用【读时惰性衰减】(effective_weight 按 last_seen_at 实时算)，
-        # 日常调度走 purge_expired()。此写时乘减衰减已非主路径——手动调用会与读时衰减【叠加】
-        # 造成 double-decay。保留仅为兼容/手动运维，调用即告警。
-        logger.warning(
-            "[decay] decay_l5() 是 WS1 前的写时乘减路径，与读时惰性衰减叠加会 double-decay；"
-            "日常衰减应由 purge_expired() 负责。确认是有意的手动运维再使用。"
-        )
-        stats: dict[str, Any] = {
-            "total_processed": 0,
-            "total_updated": 0,
-            "total_deleted": 0,
-            "errors": [],
-        }
-
-        if project_id is None:
-            # 全项目衰减: 使用批量 SQL(高效，直接全表扫描)
-            return await self.decay_l5_batch_sql()
-
-        # 指定项目: 逐条衰减(未来可按需改为 batch)
-        mistakes = await self._store.get_all_mistakes(project_id, min_weight=0.0)
-        stats["total_processed"] = len(mistakes)
-
-        for m in mistakes:
-            try:
-                old_weight = m["decay_weight"]
-                occurrence_count = m.get("occurrence_count", 1)
-
-                # 计算有效衰减因子
-                if self.occurrence_boost and occurrence_count > 1:
-                    # 多次出现的错题衰减更慢
-                    effective_factor = self.decay_factor ** (1.0 / occurrence_count)
-                else:
-                    effective_factor = self.decay_factor
-
-                new_weight = old_weight * effective_factor
-
-                if new_weight < self.delete_threshold:
-                    await self._store.update_mistake_decay_weight(m["id"], 0.0)
-                    stats["total_deleted"] += 1
-                else:
-                    await self._store.update_mistake_decay_weight(m["id"], new_weight)
-                    stats["total_updated"] += 1
-
-            except Exception as e:
-                logger.exception("Error decaying mistake %d", m.get("id"))
-                stats["errors"].append({"id": m.get("id"), "error": str(e)})
-
-        # 清理极低权重的错题
-        try:
-            deleted_count = await self._store.delete_expired_mistakes(
-                min_weight=self.delete_threshold
-            )
-            stats["total_deleted"] += deleted_count
-        except Exception as e:
-            logger.exception("Error cleaning expired mistakes")
-            stats["errors"].append({"phase": "cleanup", "error": str(e)})
-
-        self._last_decay_at = datetime.now()
-        self._total_decayed += stats["total_updated"]
-        self._total_deleted += stats["total_deleted"]
-
-        logger.info(
-            "decay_l5: processed=%d updated=%d deleted=%d errors=%d",
-            stats["total_processed"],
-            stats["total_updated"],
-            stats["total_deleted"],
-            len(stats["errors"]),
-        )
-
-        return stats
 
     async def decay_l5_batch_sql(self) -> dict[str, Any]:
         """使用 SQL 批量衰减 L5(高效，直接在 DB 层执行)
@@ -228,82 +142,6 @@ class MemoryDecay:
         return stats
 
     # ── L6 成功模式衰减 ──────────────────────────
-
-    async def decay_l6(self, project_id: str | None = None) -> dict[str, Any]:
-        """对 L6 成功模式集执行一次指数衰减
-
-        衰减公式: decay_weight *= l6_decay_factor ^ (1 / (reuse_count + 1))
-        即 reuse_count 越高衰减越慢，成功模式比错题衰减更温和。
-
-        Args:
-            project_id: 指定项目(为 None 则衰减所有项目 — 全表批量)
-
-        Returns:
-            统计信息 dict
-        """
-        # #7：同 decay_l5——WS1 后为非主路径，手动调用会与读时惰性衰减叠加 double-decay。
-        logger.warning(
-            "[decay] decay_l6() 是 WS1 前的写时乘减路径，与读时惰性衰减叠加会 double-decay；"
-            "日常衰减应由 purge_expired() 负责。确认是有意的手动运维再使用。"
-        )
-        stats: dict[str, Any] = {
-            "total_processed": 0,
-            "total_updated": 0,
-            "total_deleted": 0,
-            "errors": [],
-        }
-
-        if project_id is None:
-            # 全项目衰减: 使用批量 SQL
-            return await self.decay_l6_batch_sql()
-
-        # 指定项目: 逐条衰减
-        successes = await self._store.get_all_successes(project_id, min_weight=0.0)
-        stats["total_processed"] = len(successes)
-
-        for s in successes:
-            try:
-                old_weight = s["decay_weight"]
-                reuse_count = s.get("reuse_count", 0)
-
-                # reuse_count 高的衰减更慢
-                effective_factor = self.l6_decay_factor ** (1.0 / (reuse_count + 1))
-                new_weight = old_weight * effective_factor
-
-                if new_weight < self.delete_threshold:
-                    await self._store.update_success_decay_weight(s["id"], 0.0)
-                    stats["total_deleted"] += 1
-                else:
-                    await self._store.update_success_decay_weight(s["id"], new_weight)
-                    stats["total_updated"] += 1
-
-            except Exception as e:
-                logger.exception("Error decaying success %d", s.get("id"))
-                stats["errors"].append({"id": s.get("id"), "error": str(e)})
-
-        # 清理极低权重的成功模式
-        try:
-            deleted_count = await self._store.delete_expired_successes(
-                min_weight=self.delete_threshold
-            )
-            stats["total_deleted"] += deleted_count
-        except Exception as e:
-            logger.exception("Error cleaning expired successes")
-            stats["errors"].append({"phase": "cleanup", "error": str(e)})
-
-        self._last_decay_at = datetime.now()
-        self._total_decayed += stats["total_updated"]
-        self._total_deleted += stats["total_deleted"]
-
-        logger.info(
-            "decay_l6: processed=%d updated=%d deleted=%d errors=%d",
-            stats["total_processed"],
-            stats["total_updated"],
-            stats["total_deleted"],
-            len(stats["errors"]),
-        )
-
-        return stats
 
     async def decay_l6_batch_sql(self) -> dict[str, Any]:
         """使用 SQL 批量衰减 L6 成功模式(高效，直接在 DB 层执行)

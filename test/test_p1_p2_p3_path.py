@@ -54,17 +54,8 @@ def test_after_verify_l3_gate():
     assert after_verify_l3({"l3_passed": True}) == "deliver"
 
 
-def test_hybrid_fusion():
-    import asyncio
-
-    r = SwarmRetriever()
-    ctx = {
-        "struct": [{"file_path": "main.py"}],
-        "semantic": [{"file_path": "main.py", "score": 0.9}, {"file_path": "util.py", "score": 0.7}],
-    }
-    # _apply_hybrid_fusion 现为 async（时间权重/共现过滤需查 PG，均优雅降级）
-    out = asyncio.run(r._apply_hybrid_fusion(ctx))
-    assert out["hybrid_ranked_files"][0] == "main.py"
+# 批5：test_hybrid_fusion 已删——_apply_hybrid_fusion 为写者无读者（产出仅本测试消费，
+# Brain/planner 不读），随生产代码一并移除。
 
 
 def test_module_lock_memory_fallback():
@@ -151,7 +142,6 @@ if __name__ == "__main__":
     test_shared_contract_enrich()
     test_contract_symbols_in_diff()
     test_after_verify_l3_gate()
-    test_hybrid_fusion()
     test_module_lock_memory_fallback()
     test_task_queue_memory()
     test_task_queue_priority_order()

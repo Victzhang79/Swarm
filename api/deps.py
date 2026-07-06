@@ -25,16 +25,3 @@ def get_current_user(request: Request) -> SwarmUser:
     return user
 
 
-def require_permission(permission: str, project_id: str | None = None):
-    """返回 FastAPI 依赖：校验当前用户对 project 的权限。"""
-
-    def _dep(request: Request) -> SwarmUser:
-        user = get_current_user(request)
-        pid = project_id
-        if pid is None:
-            pid = request.path_params.get("project_id")
-        if not user_can_on_project(user, permission, pid):
-            raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
-        return user
-
-    return _dep

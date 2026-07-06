@@ -94,35 +94,6 @@ def _infer_group_from_path(path: str) -> str:
     return parts[0]
 
 
-def compute_batches(file_plan: list[dict], ratio: float = 0.1, min_batch: int = 1) -> list[list[dict]]:
-    """按比例分批（Q2：每批 ceil(N*ratio) 个，约 10 批 + 余数）。
-
-    保持分组内聚：先 group_file_plan，再把组按【组间排序】展平，最后按 batch_size 切片。
-    这样同模块文件尽量落同一批，组间顺序遵循依赖。
-    """
-    if not file_plan:
-        return []
-    ordered = order_groups_flatten(file_plan)
-    n = len(ordered)
-    batch_size = max(min_batch, math.ceil(n * ratio))
-    return [ordered[i:i + batch_size] for i in range(0, n, batch_size)]
-
-
-def order_groups_flatten(file_plan: list[dict]) -> list[dict]:
-    """组间排序后展平（Q3：depends_on 拓扑序优先，回退分层序）。
-
-    返回扁平的 file_plan 列表，顺序 = 组按依赖/分层排序 → 组内保持原序。
-    """
-    groups = group_file_plan(file_plan)
-    if not groups:
-        return list(file_plan)
-    ordered_group_names = _order_groups(groups)
-    out: list[dict] = []
-    for g in ordered_group_names:
-        out.extend(groups[g])
-    return out
-
-
 def group_into_module_batches(file_plan: list[dict],
                               module_deps: dict[str, list[str]] | None = None,
                               ) -> list[tuple[str, list[dict]]]:

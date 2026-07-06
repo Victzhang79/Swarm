@@ -3,10 +3,8 @@ import math
 
 from swarm.brain.plan_batch import (
     batch_progress_line,
-    compute_batches,
     group_file_plan,
     merge_subtask_batches,
-    order_groups_flatten,
 )
 
 
@@ -51,48 +49,6 @@ def test_grouping_no_loss_no_dup():
         for x in items:
             assert x["path"] not in seen
             seen.add(x["path"])
-
-
-def test_compute_batches_10pct():
-    """125 文件按 10% 分批 → 每批 13(ceil(12.5)) → 约 10 批。"""
-    fp = [_fp(f"m{i % 5}/F{i}.java", module=f"m{i % 5}") for i in range(125)]
-    batches = compute_batches(fp, ratio=0.1)
-    bs = math.ceil(125 * 0.1)  # 13
-    assert all(len(b) <= bs for b in batches), [len(b) for b in batches]
-    # 总文件守恒
-    assert sum(len(b) for b in batches) == 125
-    # 批数 ≈ ceil(125/13) = 10
-    assert len(batches) == math.ceil(125 / bs)
-
-
-def test_compute_batches_small_single():
-    """小 file_plan(如 5 文件) → 单批即全部(等价原路径)。"""
-    fp = [_fp(f"m/F{i}.java", module="m") for i in range(5)]
-    batches = compute_batches(fp, ratio=0.1)
-    assert sum(len(b) for b in batches) == 5
-
-
-def test_order_groups_depends_on_topo():
-    """depends_on 跨组依赖 → 被依赖组排前。"""
-    fp = [
-        _fp("svc/AlarmService.java", module="service", depends_on=["dao/AlarmMapper.java"]),
-        _fp("dao/AlarmMapper.java", module="dao", depends_on=["entity/Alarm.java"]),
-        _fp("entity/Alarm.java", module="entity"),
-    ]
-    flat = order_groups_flatten(fp)
-    paths = [x["path"] for x in flat]
-    # entity 必须在 dao 之前，dao 在 service 之前
-    assert paths.index("entity/Alarm.java") < paths.index("dao/AlarmMapper.java")
-    assert paths.index("dao/AlarmMapper.java") < paths.index("svc/AlarmService.java")
-
-
-def test_order_groups_layer_fallback():
-    """无 depends_on → 按分层序(entity 先于 controller)。"""
-    fp = [_fp("c/FooController.java", module="controller"),
-          _fp("e/Foo.java", module="entity")]
-    flat = order_groups_flatten(fp)
-    paths = [x["path"] for x in flat]
-    assert paths.index("e/Foo.java") < paths.index("c/FooController.java")
 
 
 def test_merge_global_unique_ids_and_serial_dep():

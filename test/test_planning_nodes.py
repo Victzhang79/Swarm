@@ -173,27 +173,7 @@ def test_elaborate_invest_counts_missing_acceptance():
 
 
 # ── P0-1: 二次拆分后下游依赖重映射（复现 task 0f93f1fc 规划死循环）──
-def test_remap_dependents_basic():
-    # st-1 拆成 st-1-1/st-1-2 后，st-2 depends_on st-1 应重映射到尾节点 st-1-2
-    subs = [_real_sub("st-1-1"), _real_sub("st-1-2", deps=["st-1-1"]),
-            _real_sub("st-2", deps=["st-1"])]
-    n = P._remap_dependents(subs, "st-1", "st-1-2")
-    assert n == 1, f"应重映射 1 个下游，实际 {n}"
-    st2 = next(s for s in subs if s.id == "st-2")
-    assert st2.depends_on == ["st-1-2"], f"st-2 依赖应重映射到 st-1-2，实际 {st2.depends_on}"
-    # 子链尾节点自身不被改（st-1-2 仍依赖 st-1-1，未被重映射成自指）
-    st12 = next(s for s in subs if s.id == "st-1-2")
-    assert st12.depends_on == ["st-1-1"], "子链内部串行不应被破坏"
-    print("  ✅ _remap_dependents: 下游依赖重映射到子链尾节点，子链内部串行保留")
-
-
-def test_remap_dependents_dedup():
-    # 下游已同时依赖 st-1 和 st-1-2 → 重映射后去重，不产生重复 st-1-2
-    subs = [_real_sub("st-1-2", deps=["st-1-1"]), _real_sub("st-3", deps=["st-1", "st-1-2"])]
-    P._remap_dependents(subs, "st-1", "st-1-2")
-    st3 = next(s for s in subs if s.id == "st-3")
-    assert st3.depends_on == ["st-1-2"], f"应去重为单个 st-1-2，实际 {st3.depends_on}"
-    print("  ✅ _remap_dependents: 重映射后去重")
+# 批5：_remap_dependents（死代码，生产用 _remap_dependents_to_terminals）随两条结构测试一并删除。
 
 
 def test_needs_resplit_single_file_guard():
@@ -278,7 +258,6 @@ if __name__ == "__main__":
         test_review_auto_approves, test_review_reject_cap_forces_approve,
         test_elaborate_resplits_oversized, test_elaborate_normal_no_resplit,
         test_elaborate_invest_counts_missing_acceptance,
-        test_remap_dependents_basic, test_remap_dependents_dedup,
         test_elaborate_resplit_no_dangling_dependency,
     ]
     for t in tests:

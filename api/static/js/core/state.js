@@ -99,7 +99,6 @@ let workerRunId = null;
 
 let preprocessSSE = null;
 
-let eventSource = null;
 
 let originalConfig = {};
 

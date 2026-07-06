@@ -253,7 +253,8 @@ class SwarmRetriever:
 
         # ── Rerank: 简单分数合并 ──────────────
         context = self._rerank(context, task_desc)
-        context = await self._apply_hybrid_fusion(context, project_id)
+        # 批5：_apply_hybrid_fusion 已删——其产出 hybrid_ranked_files/hybrid_scores
+        # 全仓仅测试断言、Brain/planner 不读，每次检索白跑两轮 DB 查询（时间权重+共现）。
 
         logger.info(
             "retrieve_for_brain complete: struct=%d semantic=%d norms=%d "
@@ -597,40 +598,6 @@ class SwarmRetriever:
         except Exception as exc:  # noqa: BLE001
             logger.warning("L5/L6 rerank 失败(回退原序): %s", exc)
             return items[:top_k]
-
-    async def _apply_hybrid_fusion(
-        self, context: KnowledgeContext, project_id: str = ""
-    ) -> KnowledgeContext:
-        """Layer A + B 融合打分 — 精确定位与语义扩展联合排序。
-
-        增强逻辑(优雅降级):
-        - 时间权重: 最近修改的文件得分更高
-        - 共现交叉过滤: 与高分文件共现频繁的文件提升权重
-        """
-        scores: dict[str, float] = {}
-        for r in context.get("struct", []):
-            fp = r.get("file_path", "")
-            if fp:
-                scores[fp] = scores.get(fp, 0.0) + 2.0
-        for r in context.get("semantic", []):
-            fp = r.get("file_path", "")
-            if fp:
-                scores[fp] = scores.get(fp, 0.0) + float(
-                    r.get("score", r.get("rerank_score", 0.5))
-                )
-
-        # ── 时间权重: 文件越新得分越高 ──
-        file_times = await self._load_file_mod_times(list(scores.keys()), project_id)
-        if file_times:
-            scores = _apply_time_decay(scores, file_times)
-
-        # ── 共现交叉过滤: 与高分文件共现频繁 → 提升权重 ──
-        scores = await self._apply_co_occurrence_boost(scores, project_id)
-
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        context["hybrid_ranked_files"] = [fp for fp, _ in ranked[:20]]
-        context["hybrid_scores"] = dict(ranked[:20])
-        return context
 
     async def _load_file_mod_times(
         self, file_paths: list[str], project_id: str = ""

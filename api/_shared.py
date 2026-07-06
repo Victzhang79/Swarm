@@ -54,9 +54,6 @@ _SHORT_KEY_MAP = {
     "sandbox_use_for_worker": "SWARM_SANDBOX_USE_FOR_WORKER",
 }
 
-_EMBEDDING_ZERO = [0.0] * 1024  # 零向量占位，维度与 bge-m3 一致
-
-
 # ─── API Key 脱敏 ─────────────────────────────────────────
 
 def _mask_api_key(value: str) -> str:
@@ -223,21 +220,6 @@ def _profile_storage_key(user_id: str, project_id: str) -> str:
 
 
 # ─── 查询参数 ─────────────────────────────────────────
-
-def _parse_since_param(since: str | None) -> datetime | None:
-    """解析 ?since= ISO8601 时间戳"""
-    if not since:
-        return None
-    from datetime import datetime
-
-    text = since.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid since timestamp: {since}") from exc
-
 
 # ─── 跨域共享 Pydantic 模型 ───────────────────────
 class ApplyDiffRequest(BaseModel):

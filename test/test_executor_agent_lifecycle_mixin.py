@@ -38,5 +38,5 @@ def test_agent_and_lifecycle_methods_addressable_on_class():
     """外置的方法经 MRO 仍可从 WorkerExecutor 类寻址（patch.object / getsource 前提）。"""
     for m in ("_run_agent", "_create_agent", "_resolve_project_stack", "_remaining_seconds"):
         assert callable(getattr(WorkerExecutor, m)), m
-    for m in ("create_sandbox", "run_in_sandbox", "kill_sandbox"):
+    for m in ("kill_sandbox",):  # 批5：create/run_in_sandbox 死代码已删（主流程直连池）
         assert callable(getattr(WorkerExecutor, m)), m

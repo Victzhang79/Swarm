@@ -116,23 +116,6 @@ class BehaviorStore:
 
     # ── 写入: 修改日志 ──────────────────────────
 
-    async def log_modification(
-        self, project_id: str, record: ModificationRecord
-    ) -> None:
-        """记录一条文件修改"""
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO kb_modification_log
-                    (project_id, task_id, file_path, change_type, commit_hash, author, metadata_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (project_id, record.task_id, record.file_path, record.change_type,
-                 record.commit_hash, record.author,
-                 psycopg.types.json.Jsonb(record.metadata)),
-            )
-
     async def log_modifications_batch(
         self, project_id: str, records: list[ModificationRecord]
     ) -> None:
@@ -269,35 +252,6 @@ class BehaviorStore:
         ]
 
     # ── 查询: 修改历史 ──────────────────────────
-
-    async def get_file_history(
-        self, project_id: str, file_path: str, limit: int = 50
-    ) -> list[dict[str, Any]]:
-        """查询单文件的修改历史"""
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT task_id, change_type, commit_hash, author, modified_at, metadata_json
-                FROM kb_modification_log
-                WHERE project_id = %s AND file_path = %s
-                ORDER BY modified_at DESC
-                LIMIT %s
-                """,
-                (project_id, file_path, limit),
-            )
-            rows = await cur.fetchall()
-        return [
-            {
-                "task_id": r[0],
-                "change_type": r[1],
-                "commit_hash": r[2],
-                "author": r[3],
-                "modified_at": r[4],
-                "metadata": r[5],
-            }
-            for r in rows
-        ]
 
     # ── 清理 ────────────────────────────────────
 

@@ -16,38 +16,6 @@ logger = logging.getLogger(__name__)
 class _SandboxLifecycleMixin:
     """WorkerExecutor 的沙箱生命周期方法簇（见模块 docstring）。不持有自身状态。"""
 
-    def create_sandbox(self) -> Any:
-        """创建远程 CubeSandbox 实例（用于沙箱内代码执行和编译验证）"""
-        from swarm.worker.sandbox import get_sandbox_manager
-
-        manager = get_sandbox_manager()
-        # 传 task_id/project_id，使 cancel_task 能按任务 kill_by_task 释放资源
-        sandbox = manager.create(
-            project_id=self.project_id,
-            task_id=self.task_id,
-            source="worker",
-        )
-        self._sandbox = sandbox
-        self._sandbox_manager = manager
-        self._log(f"远程沙箱已创建: {sandbox.sandbox_id}")
-        return sandbox
-
-    def run_in_sandbox(self, code: str, timeout: int = 30) -> str:
-        """在远程沙箱中执行 Python 代码并返回输出"""
-        if not hasattr(self, "_sandbox") or self._sandbox is None:
-            self.create_sandbox()
-        result = self._sandbox_manager.run_code(self._sandbox, code, timeout)
-        output_parts = []
-        if result.stdout:
-            output_parts.append(result.stdout)
-        if result.text:
-            output_parts.append(f"→ {result.text}")
-        if result.stderr:
-            output_parts.append(f"STDERR: {result.stderr}")
-        if result.error:
-            output_parts.append(f"ERROR: {result.error}")
-        return "\n".join(output_parts)
-
     def kill_sandbox(self) -> None:
         """释放远程沙箱：热池借来的归还(健康则回池)，否则销毁。"""
         if hasattr(self, "_sandbox") and self._sandbox is not None:

@@ -2565,40 +2565,6 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
     return children
 
 
-def _remap_dependents(subtasks: list, old_id: str, new_id: str) -> int:
-    """把所有子任务 depends_on 中指向 old_id 的项重映射到 new_id（原地修改）。
-
-    用于 ELABORATE 二次拆分后修复悬空依赖：st-1 被拆成 st-1-1/st-1-2 后，
-    原先 depends_on=[st-1] 的下游 st-2 需改为 depends_on=[st-1-2]（子链尾节点）。
-
-    跳过被拆出的子节点自身（它们 id 以 old_id 为前缀，内部串行已由
-    _resplit_subtask 建好，不应再被重映射到自己的尾节点造成自依赖/环）。
-
-    返回重映射的依赖条数（去重后按"涉及的子任务数"计，便于日志可读）。
-    """
-    remapped = 0
-    child_prefix = f"{old_id}-"
-    for st in subtasks:
-        sid = getattr(st, "id", "")
-        # 被拆出的子节点自身不参与重映射（避免 st-1-2 depends_on st-1 → 自指）
-        if sid == new_id or sid.startswith(child_prefix):
-            continue
-        deps = list(getattr(st, "depends_on", []) or [])
-        if old_id not in deps:
-            continue
-        # 替换 old_id → new_id，并去重（防止已存在 new_id 造成重复）
-        rewritten = []
-        seen = set()
-        for d in deps:
-            target = new_id if d == old_id else d
-            if target not in seen:
-                seen.add(target)
-                rewritten.append(target)
-        st.depends_on = rewritten
-        remapped += 1
-    return remapped
-
-
 def _terminal_child_ids(children: list) -> list[str]:
     """子拆分的【终端节点 id 集】——没有任何【同批子节点】依赖它们（下游重映射的正确目标）。
 

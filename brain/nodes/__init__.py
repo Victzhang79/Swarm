@@ -2343,16 +2343,8 @@ async def learn_success(state: BrainState) -> dict:
             elif mr_err:
                 logger.warning("[LEARN_SUCCESS] MR 创建失败: %s", mr_err)
 
-    from swarm.knowledge.event_bus import publish_kb_event
-
-    publish_kb_event(
-        "learn_success",
-        {
-            "project_id": state.get("project_id"),
-            "task_id": state.get("task_id"),
-            "mr_url": mr_url,
-        },
-    )
+    # 批5：event_bus.publish_kb_event 已删——Redis stream swarm:kb_events 全仓无
+    # xread 消费者，纯写黑洞（知识增量真正的驱动是 PG kb_update_events 队列）。
 
     logger.info("[LEARN_SUCCESS] 学习完成 (persisted=%s)", persist_meta.get("persisted"))
     _out: dict = {

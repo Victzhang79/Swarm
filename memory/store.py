@@ -725,22 +725,6 @@ class MemoryStore:
             )
             return cur.rowcount > 0
 
-    async def mark_success_core(self, project_id: str, success_id: int, *, core: bool = True) -> bool:
-        """标记成功模式为核心规则（metadata.core_rule）。"""
-        conn = self._conn_or_raise()
-        flag = "true" if core else "false"
-        async with conn.cursor() as cur:
-            await cur.execute(
-                f"""
-                UPDATE mem_successes
-                SET metadata_json = COALESCE(metadata_json, '{{}}'::jsonb)
-                    || '{{"core_rule": {flag}}}'::jsonb
-                WHERE project_id = %s AND id = %s
-                """,
-                (project_id, success_id),
-            )
-            return cur.rowcount > 0
-
     # ── 通用: 更新衰减权重(L5) ──────────────────
 
     async def update_mistake_decay_weight(

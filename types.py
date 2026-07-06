@@ -514,8 +514,7 @@ class KnowledgeContext(TypedDict, total=False):
     project_summary: str     # 预处理 ANALYZE 生成的项目摘要
     preprocess_stats: dict   # 预处理各阶段统计
     affected_files: list[str]       # Layer A 定位 + 依赖扩展的文件集
-    hybrid_ranked_files: list[str]     # A+B 融合排序文件
-    hybrid_scores: dict[str, float]  # 融合分数
+    # 批5：hybrid_ranked_files/hybrid_scores 已删（产出方 _apply_hybrid_fusion 无生产读者）
 
 
 # ──────────────────────────────────────────────
