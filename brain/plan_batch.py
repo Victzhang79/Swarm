@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any
 
 # Java/前端典型分层顺序（depends_on 缺失时的组间排序兜底，Q3）。
@@ -57,16 +58,36 @@ def _infer_group_from_path(path: str) -> str:
     parts = [p for p in norm.split("/") if p and p not in (".", "..")]
     if not parts:
         return "misc"
-    # 通用层/脚手架目录段（不作为业务分组标识）
+    # 通用层/脚手架目录段（不作为业务分组标识）。CODEWALK 根因C：原硬编 ruoyi/ruoyi-system
+    # 等项目专名——换成两条【通用规律】，RuoYi 分组行为经由规律不变，其它项目同等受益：
+    # ① `<前缀>-<通用后缀>` 形态的聚合模块目录名（xxx-system/xxx-common/... 任意项目通用）
+    # ② Java 包根(com/org/net/io/cn)之后的一段是 groupId（公司/项目名，非业务语义）
     _generic = {
-        "src", "main", "java", "resources", "com", "org", "net", "ruoyi",
+        "src", "main", "java", "resources",
         "controller", "service", "mapper", "dao", "domain", "entity", "model",
         "impl", "vo", "dto", "po", "bo", "config", "util", "common", "web",
         "api", "rest", "test", "webapp", "static", "assets", "views", "components",
-        "ruoyi-system", "ruoyi-admin", "ruoyi-framework", "ruoyi-common", "ruoyi-ui",
     }
+    _pkg_roots = {"com", "org", "net", "io", "cn"}
+    # 仅聚合模块的典型后缀——刻意【不含】service/api/app/biz/web：那些是微服务【业务名】
+    # 常用后缀（payment-service），吞进来会把整个服务名当脚手架段（hunter 抓）。
+    _module_suffix = re.compile(
+        r"^[\w.]+-(system|admin|framework|common|core|ui|starter|parent|bom)$"
+    )
+
+    def _is_generic(i: int, p: str) -> bool:
+        low = p.lower()
+        if low in _generic or low in _pkg_roots:
+            return True
+        # 聚合模块目录名只出现在路径根级（Maven 多模块布局）；深层同形名多为业务目录
+        if i == 0 and _module_suffix.match(low):
+            return True
+        # 包根后一段=groupId（…/java/com/ruoyi/…）。包根若在路径首段（如业务目录恰叫
+        # io/cn），不按 Java 源树处理，避免把其子目录误判成 groupId。
+        return i > 1 and parts[i - 1].lower() in _pkg_roots
+
     # 找业务语义段（连续 1-2 段非通用目录），优先靠后的（更接近功能名）
-    biz = [p for p in parts[:-1] if p.lower() not in _generic]
+    biz = [p for i, p in enumerate(parts[:-1]) if not _is_generic(i, p)]
     if biz:
         return "/".join(biz[-2:]) if len(biz) >= 2 else biz[-1]
     # 全是通用目录 → 用顶层模块目录

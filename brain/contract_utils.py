@@ -702,6 +702,26 @@ def _infer_create_layer(rel: str) -> tuple[str, str] | None:
     low = rel.replace("\\", "/").lower()
     if low.endswith(".xml") and "mapper" in low:
         return ("mapperxml", "**/resources/mapper/**/*.xml")
+    # ── 非 Java 生态常见分层（CODEWALK 根因C：原仅 Java/MyBatis，其余栈拿不到模板
+    # 只能全项目探索烧预算；识别不了的类型仍 fail-safe 返回 None 走探索）──
+    if low.endswith(".vue"):
+        if "/views/" in low:
+            return ("vue_view", "**/views/**/*.vue")
+        if "/components/" in low:
+            return ("vue_component", "**/components/**/*.vue")
+        return ("vue", "**/*.vue")
+    if low.endswith((".ts", ".js")) and "/api/" in low:
+        return ("api_client", "**/api/**/*.[tj]s")
+    if low.endswith(".go"):
+        if "/handler/" in low or "/handlers/" in low:
+            return ("go_handler", "**/handler*/*.go")
+        if "/service/" in low:
+            return ("go_service", "**/service/*.go")
+        return None
+    if low.endswith(".py"):
+        if "/routers/" in low or "/router/" in low:
+            return ("py_router", "**/router*/*.py")
+        return None
     if not low.endswith(".java"):
         return None
     if "/controller/" in low:
@@ -835,7 +855,7 @@ def enrich_context_snippets(plan: TaskPlan, project_path: str | None) -> bool:
             body = txt if len(txt) <= _MAX_SNIPPET_CHARS_PER_FILE else _extract_signatures(txt, ext)
             if not body.strip():
                 continue
-            block = (f"### 同类既有范例（照此 RuoYi 写法实现 {rel} 这一层，无需再探索项目）: {ref}\n"
+            block = (f"### 同类既有范例（照此项目既有写法实现 {rel} 这一层，无需再探索项目）: {ref}\n"
                      f"```\n{body[:_MAX_SNIPPET_CHARS_PER_FILE]}\n```")
             parts.append(block)
             total += len(block)
