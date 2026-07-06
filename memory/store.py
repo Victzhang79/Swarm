@@ -271,46 +271,6 @@ class MemoryStore:
             row = await cur.fetchone()
         return row[0] if row else {}
 
-    async def set_user_profile(self, user_id: str, profile: dict[str, Any]) -> None:
-        """整体【覆盖】写入 L1 画像(替换全部字段)。部分增量更新请用 merge_user_profile。"""
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO mem_user_profile (user_id, profile_json, updated_at)
-                VALUES (%s, %s, now())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    profile_json = EXCLUDED.profile_json,
-                    updated_at   = now()
-                """,
-                (user_id, psycopg.types.json.Jsonb(profile)),
-            )
-
-    async def merge_user_profile(
-        self, user_id: str, partial: dict[str, Any]
-    ) -> dict[str, Any]:
-        """WS4 一致性：【合并】写入 L1 画像——顶层键浅合并(partial 覆盖同名键，其余保留)。
-
-        覆盖(set) vs 合并(merge) 策略明确分流：set 用于整表替换，merge 用于"只更新我给的几个字段"
-        而不抹掉历史画像。用 jsonb `||` 在 DB 端原子合并(读改写无竞态)。返回合并后的完整画像。
-        """
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO mem_user_profile (user_id, profile_json, updated_at)
-                VALUES (%s, %s, now())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    profile_json = COALESCE(mem_user_profile.profile_json, '{}'::jsonb)
-                                   || EXCLUDED.profile_json,
-                    updated_at   = now()
-                RETURNING profile_json
-                """,
-                (user_id, psycopg.types.json.Jsonb(partial)),
-            )
-            row = await cur.fetchone()
-        return row[0] if row and isinstance(row[0], dict) else partial
-
     # ── L2: 任务摘要 ────────────────────────────
 
     async def write_task_summary(

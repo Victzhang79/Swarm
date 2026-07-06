@@ -50,13 +50,9 @@ from swarm.brain.nodes.planning_core import (
 from swarm.brain.nodes.shared import _parse_json_from_llm, l1_passed
 
 def _l1_details_of(subtask_results: dict, fid: str) -> dict:
-    """取子任务的 L1 详情(含 build_output/编译标志),WorkerOutput / dict 两种形态兼容。"""
-    out = subtask_results.get(fid)
-    if isinstance(out, WorkerOutput):
-        return out.l1_details or {}
-    if isinstance(out, dict):
-        return out.get("l1_details", {}) or {}
-    return {}
+    """取子任务的 L1 详情（§3.2：委托 shared.l1_details_of 单一实现，本地名保 seam）。"""
+    from swarm.brain.nodes.shared import l1_details_of
+    return l1_details_of(subtask_results.get(fid))
 
 
 async def _handle_failure_impl(state: BrainState) -> dict:

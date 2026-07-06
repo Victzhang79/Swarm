@@ -170,9 +170,9 @@ _TASK_SELECT = """
 # ──────────────────────────────────────────────
 
 def _get_conn_str(db_config: DatabaseConfig | None = None) -> str:
-    """获取 PG 连接字符串"""
-    cfg = db_config or DatabaseConfig()
-    return cfg.postgres_uri
+    """获取 PG 连接字符串（§3.2：委托 infra.db 单一来源，本地名保 seam）"""
+    from swarm.infra.db import pg_conn_str
+    return pg_conn_str(db_config)
 
 
 def ensure_tables(conn_str: str | None = None) -> None:

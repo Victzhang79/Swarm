@@ -334,7 +334,11 @@ async def toggle_sandbox_pool(request: Request):
     env_path = Path(__file__).resolve().parent.parent.parent / ".env"
     env_key = "SWARM_SANDBOX_POOL_ENABLED"
     val = "true" if enabled else "false"
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    # §3.2 收敛（.env 写回×4 唯一无回滚者）：写盘前快照，reload 失败原子回滚
+    # （对齐 config 路由 D3 _reload_with_rollback 约定，否则失败留脏 .env+os.environ）。
+    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+    _prev_env = {env_key: os.environ.get(env_key)}
+    lines = _prev_content.splitlines() if _prev_content is not None else []
     found = False
     out_lines = []
     for line in lines:
@@ -350,9 +354,10 @@ async def toggle_sandbox_pool(request: Request):
     atomic_write_env(env_path, "\n".join(out_lines) + "\n")  # A-P1-29：原子写
     os.environ[env_key] = val
 
-    # 2. reload config 让 SandboxConfig.pool_enabled 反映新值
+    # 2. reload config 让 SandboxConfig.pool_enabled 反映新值（失败原子回滚 .env+os.environ）
+    from swarm.api.routers.config import _reload_with_rollback
     from swarm.config.settings import reload_config as _reload_config
-    _reload_config()
+    _reload_with_rollback(env_path, _prev_content, _prev_env, _reload_config)
 
     # 3. 实时启停 reaper（运行时尽量生效，避免必须重启）
     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled

@@ -74,8 +74,8 @@ class SwarmUser:
 
 
 def _conn_str(db_config: DatabaseConfig | None = None) -> str:
-    cfg = db_config or DatabaseConfig()
-    return cfg.postgres_uri
+    from swarm.infra.db import pg_conn_str  # §3.2：单一来源，本地名保 seam
+    return pg_conn_str(db_config)
 
 
 def _pooled_conn(conn_str: str | None = None):

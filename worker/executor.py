@@ -233,9 +233,13 @@ class WorkerExecutor(
         # 约束，此处为硬兜底）。测试文件常本地不存在(bootstrap errors=1)、徒增失败面。
         # 仅当子任务描述【明确要求】测试时才保留；否则从 writable/create_files 剔除测试路径。
         desc = (getattr(self.subtask, "description", "") or "")
-        _wants_test = any(kw in desc for kw in (
-            "测试", "单测", "test", "Test", "覆盖", "coverage", "用例",
-        ))
+        # §3.4：英文词按词界匹配——裸子串 "test" 被 "latest"/"attestation" 误命中，
+        # 会把无关任务当"要求写测试"放行测试文件。中文关键词无词界问题保持子串。
+        import re as _re
+        _wants_test = (
+            any(kw in desc for kw in ("测试", "单测", "覆盖", "用例"))
+            or bool(_re.search(r"\b(unit[- ]?tests?|tests?|testing|coverage)\b", desc, _re.IGNORECASE))
+        )
         if not _wants_test:
             def _is_test_path(p: str) -> bool:
                 pl = str(p).replace("\\", "/").lower()

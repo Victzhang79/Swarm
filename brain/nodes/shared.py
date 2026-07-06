@@ -822,3 +822,15 @@ def attribute_l2_failure(plan, l2_details: dict | None, subtask_results: dict) -
     if failed and set(failed) < all_ids:
         return failed
     return None
+
+
+def l1_details_of(out) -> dict:
+    """统一取 worker 结果的 l1_details（WorkerOutput / dict / 其它）——CODEWALK §3.2 收敛：
+    此前 recovery._det_of / failure._l1_details_of / failure·maven_repair 内联共 4 份同义实现。"""
+    from swarm.types import WorkerOutput as _WO
+
+    if isinstance(out, _WO):
+        return out.l1_details or {}
+    if isinstance(out, dict):
+        return out.get("l1_details", {}) or {}
+    return {}

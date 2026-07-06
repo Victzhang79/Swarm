@@ -227,3 +227,13 @@ async def close_async_pools() -> None:
 
 # 进程退出时优雅关闭同步池（避免后台 worker 线程在解释器关闭时报错）
 atexit.register(close_sync_pools)
+
+
+def pg_conn_str(db_config=None) -> str:
+    """PG DSN 单一来源（CODEWALK §3.2 收敛：此前 6 个 store 各自实现同义 `_conn_str`
+    ——"修一处漏 sibling"的漂移温床）。各 store 保留本地名做一行委托（保测试 patch 位）。
+    显式传入 DatabaseConfig 优先，否则按当前环境构造（与各 store 原语义一致）。"""
+    from swarm.config.settings import DatabaseConfig as _DC
+
+    cfg = db_config or _DC()
+    return cfg.postgres_uri

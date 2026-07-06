@@ -519,7 +519,10 @@ class SwarmRetriever:
         from swarm.knowledge.mr_history import MR_HISTORY_DDL, query_mr_history_for_files
 
         async with conn.cursor() as cur:
-            await cur.execute(MR_HISTORY_DDL)
+            # §3.4：DDL 每实例只执行一次（幂等 CREATE IF NOT EXISTS，但没必要每次检索都发 DDL）
+            if not getattr(self, "_mr_ddl_done", False):
+                await cur.execute(MR_HISTORY_DDL)
+                self._mr_ddl_done = True
             return await query_mr_history_for_files(cur, project_id, files, top_k=5)
 
     # ── Rerank ──────────────────────────────────

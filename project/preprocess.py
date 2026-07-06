@@ -321,21 +321,15 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
     scan_result = await asyncio.to_thread(_scan_sync, project_path)
 
     total = scan_result["file_count"]
-    # 模拟逐步进度（每 100 个文件更新一次）
-    files = scan_result["files"]
-    batch_size = max(100, total // 10) if total > 0 else 100
-
-    for i in range(0, len(files), batch_size):
-        progress = min((i + batch_size) / max(total, 1), 1.0)
-        msg = f"Scanning {min(i + batch_size, total)}/{total} files..."
-        await asyncio.to_thread(
-            upsert_progress,
-            project_id,
-            phase="scanning",
-            phase_progress=round(progress, 3),
-            message=msg,
-        )
-        await asyncio.sleep(0.1)
+    # §3.4 假动作治理：扫描此刻已真实完成——原"模拟逐步进度"循环（分批写进度+sleep）
+    # 是纯表演动画（白占 ~1s + N 次 DB 写）。诚实上报一次完成态。
+    await asyncio.to_thread(
+        upsert_progress,
+        project_id,
+        phase="scanning",
+        phase_progress=1.0,
+        message=f"Scanned {total}/{total} files",
+    )
 
     # 保存扫描结果到 kb_file_index
     await asyncio.to_thread(

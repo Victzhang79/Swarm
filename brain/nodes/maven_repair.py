@@ -130,13 +130,8 @@ def _inject_missing_maven_deps(project_path: str | None, granted: dict, subtask_
         return {}
     injected: dict = {}
     for sid, mod_pom in (granted or {}).items():
-        out = (subtask_results or {}).get(sid)
-        if isinstance(out, WorkerOutput):
-            det = out.l1_details or {}
-        elif isinstance(out, dict):
-            det = out.get("l1_details", {}) or {}
-        else:
-            det = {}
+        from swarm.brain.nodes.shared import l1_details_of
+        det = l1_details_of((subtask_results or {}).get(sid))  # §3.2 收敛
         blob = det.get("build_output") if isinstance(det.get("build_output"), str) else ""
         if not blob:
             try:

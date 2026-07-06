@@ -35,12 +35,9 @@ _INTERNAL_BLOCKED_KINDS = ("internal_pkg_not_built", "upstream_module_broken")
 
 
 def _det_of(out) -> dict:
-    """统一取 worker 失败结果的 l1_details(WorkerOutput / dict / 其它)。"""
-    if isinstance(out, WorkerOutput):
-        return out.l1_details or {}
-    if isinstance(out, dict):
-        return out.get("l1_details", {}) or {}
-    return {}
+    """统一取 worker 失败结果的 l1_details（§3.2：委托 shared.l1_details_of 单一实现，本地名保 seam）。"""
+    from swarm.brain.nodes.shared import l1_details_of
+    return l1_details_of(out)
 
 
 def _producers_of(plan_obj, packages, modules) -> set[str]:

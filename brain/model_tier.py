@@ -56,7 +56,7 @@ _STRONG_PATTERNS = [
     r"glm-?5",                                  # glm-5 / GLM-5.1
     r"gemini.*(?:2\.5|3)",                      # gemini-2.5 / gemini-3
     r"deepseek.*(?:v3|r1)",                     # deepseek-v3 / r1
-    r"o3|o4",                                    # openai o3/o4 推理模型
+    r"\bo[34]\b",                                # openai o3/o4 推理模型（词界防 "turbo3"/"yolo3" 误判 strong）
     r"grok-?[34]",                              # grok-3/4
     r"kimi-?k2",                                 # kimi k2
     r"minimax-?m2",                              # minimax m2

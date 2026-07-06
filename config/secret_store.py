@@ -104,7 +104,8 @@ def decrypt(ciphertext: str) -> str:
 # ──────────────────────────────────────────────
 
 def _conn_str() -> str:
-    return DatabaseConfig().postgres_uri
+    from swarm.infra.db import pg_conn_str  # §3.2：单一来源，本地名保 seam
+    return pg_conn_str()
 
 
 def ensure_tables(conn_str: str | None = None) -> None:
