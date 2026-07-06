@@ -27,6 +27,14 @@ from swarm.types import (
 )
 
 
+_DIFF_A = """--- a/a.py
++++ b/a.py
+@@ -1,1 +1,2 @@
+ x = 1
++a = 1
+"""
+
+
 class _Resp:
     def __init__(self, content):
         self.content = content
@@ -96,6 +104,42 @@ def test_revision_clears_stale_escalated():
         out = asyncio.run(nodes.revision(state))
     assert out.get("failure_escalated") is False, \
         "修订=重新开始，必须清历史 escalate 粘滞"
+
+
+def test_plan_simple_path_clears_stale_escalated():
+    """R2-1：PLAN 是新一轮规划起点，须无条件清历史 escalate 粘滞——堵"首次 REVISE→PLAN
+    （无 old_results，_surgical_replan_reset 返回空）"漏清线。SIMPLE 快速路径无 LLM 依赖。"""
+    state = {
+        "task_description": "改一行配置",
+        "complexity": Complexity.SIMPLE,
+        "affected_files": ["conf.py"],
+        "failure_escalated": True,  # 上一轮残留
+        "failure_strategy": "escalate",
+    }
+    out = asyncio.run(nodes.plan(state))
+    assert out.get("failure_escalated") is False
+
+
+def test_after_merge_routing_with_stale_strategy_residue():
+    """R2-1 图级：merge 干净轮清零后，即便 failure_strategy 仍残留 "escalate"，
+    after_merge 也必须路由 VERIFY_L2 而非把干净合并送 DELIVER（A6 条件需两键同真）。"""
+    from swarm.brain.graph import after_merge
+
+    state = {
+        "failure_escalated": True,
+        "failure_strategy": "escalate",
+        "merge_conflicts": [],
+        "failed_subtask_ids": [],
+        "rebase_subtask_ids": [],
+        "subtask_results": {
+            "st-a": WorkerOutput(subtask_id="st-a", diff=_DIFF_A, summary="", l1_passed=True),
+        },
+    }
+    out = nodes.merge(state)
+    state.update(out)
+    assert state.get("failure_escalated") is False
+    assert after_merge(state) == "verify_l2", \
+        "干净合并 + 残留 strategy=escalate 不得被 after_merge 送 DELIVER"
 
 
 def test_gates_semantics_around_escalated_flag():

@@ -11,7 +11,7 @@ load_dotenv()
 
 from swarm.config import get_config
 
-__version__ = "0.9.15"
+__version__ = "0.9.16"
 
 # get_config 作为包级公共 API 显式 re-export（保留意图，避免 F401 误删）
 __all__ = ["get_config", "__version__"]

@@ -24,7 +24,7 @@ QDRANT_URL="${SWARM_DB_QDRANT_URL:-http://localhost:6333}"
 SANDBOX_URL="${SWARM_SANDBOX_API_URL:-}"
 REDIS_ON="$(echo "${SWARM_REDIS_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
 REQ_PG_CKPT="$(echo "${SWARM_REQUIRE_PG_CHECKPOINTER:-}" | tr '[:upper:]' '[:lower:]')"
-API_PORT="${SWARM_API_PORT:-8420}"
+API_PORT="${SWARM_PORT:-${SWARM_API_PORT:-8420}}"  # R2-5：与 restart-api.sh 的 SWARM_PORT 对齐（旧名保兼容）
 REDIS_CLI="$(command -v redis-cli || echo /opt/homebrew/opt/redis/bin/redis-cli)"
 
 echo "== E2E 环境自检 =="

@@ -61,6 +61,41 @@ def test_status_remote_qdrant_down_stale_local_dir_not_green(monkeypatch):
     )
 
 
+def test_status_standalone_qdrant_component_no_false_green(monkeypatch):
+    """发版级 hunter：/api/status 的独立 "Qdrant" 组件（与"知识库"分开）曾是同一假绿
+    模式的最后 sibling——远端挂+陈旧本地目录不得报 ready，必须与 /ready 同源判定。"""
+    import importlib
+
+    app_mod = importlib.import_module("swarm.api.app")
+    import httpx
+
+    class _BoomClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            raise ConnectionError("remote down")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _BoomClient)
+    monkeypatch.setattr(
+        app_mod, "get_config",
+        lambda: SimpleNamespace(db=SimpleNamespace(qdrant_url="http://qdrant.internal:6333")),
+    )
+    real_exists = os.path.exists
+    monkeypatch.setattr(os.path, "exists",
+                        lambda p: True if "qdrant" in str(p) else real_exists(p))
+
+    status = asyncio.run(app_mod._check_component("Qdrant"))
+    assert status["status"] != "running" and status["status"] != "ready", status
+    assert "unreachable" in status["detail"], status
+
+
 # ── ② merge 干净轮 / replan 重入清 escalated ────────────────────────────────
 
 _DIFF_A = """--- a/a.py

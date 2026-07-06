@@ -893,7 +893,14 @@ class SandboxManager:
             return CodeResult(stdout=stdout, stderr=stderr, error=err, success=False)
 
     def run_code(self, sandbox: Any, code: str, timeout: int = 30) -> "CodeResult":
-        """在沙箱中执行代码（捕获 SDK/代理异常，不向上抛 HTTP 500）"""
+        """在沙箱中执行代码（捕获 SDK/代理异常，不向上抛 HTTP 500）
+
+        ★信任边界（P2-4 有意不在此加命令黑名单）：run_command 的黑名单挡的是【LLM agent
+        生成的 shell 命令】；run_code 的调用方是本系统自有代码拼的确定性 Python 模板
+        （文件传输/listdir 兜底等），不直接接收模型自由文本。唯一承载 agent 命令的
+        build_tools 旧路径兜底已在调用侧过同一黑名单（check_command_hardened）。
+        真正的安全边界是 CubeSandbox 容器隔离（非 root/网络封锁/资源限额）；若未来把
+        run_code 暴露给 agent 工具面，必须先在调用侧补等价管控。"""
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
         logger.debug("Running code in sandbox %s: %s...", sid, code[:80])
         try:

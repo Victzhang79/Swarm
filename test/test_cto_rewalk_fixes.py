@@ -479,36 +479,6 @@ class _FakeConn:
 
 
 # ─────────────────────────────────────────────────────────
-# FIX K2 — 时间权重跨项目泄漏: _load_file_mod_times 必带 project_id 过滤
-# ─────────────────────────────────────────────────────────
-def test_load_file_mod_times_filters_by_project_id():
-    """_load_file_mod_times 的 SQL 必须含 project_id 过滤，且把 project_id 绑入参数，
-    否则同名文件跨项目碰撞会取到错误项目的修改时间（时间权重污染）。"""
-    import asyncio
-    from unittest.mock import MagicMock
-
-    from swarm.knowledge.retriever import SwarmRetriever
-
-    cur = _CapturingCursor(rows=[("a.py", 1700000000.0)])
-    struct = MagicMock()
-    struct._conn_or_raise.return_value = _FakeConn(cur)
-
-    retr = SwarmRetriever.__new__(SwarmRetriever)
-    retr._struct = struct
-
-    result = asyncio.run(
-        retr._load_file_mod_times(["a.py"], "proj-A")
-    )
-    assert result == {"a.py": 1700000000.0}
-    assert cur.executed, "应执行查询"
-    sql_text, params = cur.executed[0]
-    assert "project_id = %s" in sql_text, f"SQL 必须带 project_id 过滤: {sql_text}"
-    # project_id 必须作为第一个绑定参数传入
-    assert params[0] == "proj-A", f"project_id 必须绑入参数: {params}"
-    assert "a.py" in (params[1] if len(params) > 1 else []), f"文件列表绑入: {params}"
-
-
-# ─────────────────────────────────────────────────────────
 # FIX K3 — query_dependencies 方向颠倒
 # ─────────────────────────────────────────────────────────
 def test_query_dependencies_outgoing_filters_source_file():

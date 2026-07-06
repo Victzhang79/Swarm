@@ -719,6 +719,9 @@ async def plan(state: BrainState) -> dict:
         return {
             "plan": task_plan,
             "shared_contract": task_plan.shared_contract or {},
+            # R2-1：PLAN=新一轮规划起点，无条件清历史 escalate 粘滞（与 merge 干净轮对称；
+            # 堵"首次 REVISE→PLAN 无 old_results 时 _surgical_replan_reset 返回空"的漏清线）
+            "failure_escalated": False,
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
             **plan_touch,
         }
@@ -933,6 +936,8 @@ async def plan(state: BrainState) -> dict:
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
         "plan_generation_failed": _plan_degraded is not None,
+        # R2-1：同 SIMPLE 路径——PLAN 起点无条件清历史 escalate 粘滞
+        "failure_escalated": False,
         **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
         **plan_touch,
     }

@@ -208,7 +208,13 @@ def _run_in_sandbox(command: str, timeout: int = 120) -> str:
             body = body.strip()[:4000]
         return f"{status} (sandbox {exit_hint})\n{body}"
 
-    # 兜底(旧路径)：manager 无 run_command 时用 Jupyter 包 subprocess
+    # 兜底(旧路径)：manager 无 run_command 时用 Jupyter 包 subprocess。
+    # R2-3：此路径承载的是【agent 生成的命令】，必须过与 run_command 同一黑名单——
+    # 否则该兜底成为绕过口（实践中 SandboxManager 恒有 run_command 不可达，但边界不靠巧合）。
+    from swarm.config import command_blacklist_store as _cbs
+    _allowed, _reason = _cbs.check_command_hardened(sandbox_command)
+    if not _allowed:
+        return f"⛔ 命令被安全黑名单拦截：{_reason}"
     code = f"""
 import subprocess
 _sbx_proc = subprocess.run({sandbox_command!r}, shell=True, capture_output=True, text=True, timeout={timeout})

@@ -237,44 +237,14 @@ async def _check_component(name: str) -> dict[str, Any]:
         # ─── 知识库 ────────────────────────────────────
         elif name == "知识库":
             cfg = get_config()
-            qdrant_url = cfg.db.qdrant_url
             details: list[str] = []
 
-            # 1) 检查 Qdrant 是否在线
-            qdrant_ok = False
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    resp = await client.get(f"{qdrant_url}/collections")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        collections = data.get("result", {}).get("collections", [])
-                        details.append(f"qdrant online, {len(collections)} collections")
-                        qdrant_ok = True
-                    else:
-                        details.append(f"qdrant HTTP {resp.status_code}")
-            except Exception as e:
-                # fallback 本地文件模式——对齐 _probe_qdrant_ready 的 fail-closed 判定
-                # （外部复核 P0-2 残口）：只有 qdrant_url 指向本地时，宿主机 ~/.swarm/qdrant
-                # （且有 meta.json）才有资格作健康证据；远端配置全挂 + 陈旧本地目录 ≠ 健康，
-                # 否则 /api/status 与 /api/health/ready 两处探活漂移、前者假绿。
-                try:
-                    storage_path = os.path.expanduser("~/.swarm/qdrant")
-                    if (_is_local_qdrant(qdrant_url)
-                            and os.path.exists(storage_path)
-                            and os.path.exists(os.path.join(storage_path, "meta.json"))):
-                        from qdrant_client import QdrantClient
-
-                        def _check_local_qdrant_kb():
-                            c = QdrantClient(path=storage_path)
-                            cols = c.get_collections()
-                            return [col.name for col in cols.collections]
-                        coll_names = await asyncio.to_thread(_check_local_qdrant_kb)
-                        details.append(f"qdrant local file, {len(coll_names)} collections")
-                        qdrant_ok = True
-                    else:
-                        details.append(f"qdrant unreachable: {type(e).__name__}")
-                except Exception:
-                    details.append(f"qdrant unreachable: {type(e).__name__}")
+            # 1) 检查 Qdrant 是否在线——R2-4：直接复用 /api/health/ready 的
+            # _probe_qdrant_ready（fail-closed：远端挂+陈旧本地目录不算健康、本地文件模式
+            # 需 _is_local_qdrant+meta.json；探测目标取同一 config）。
+            # 上一版是"逻辑对齐"的第二份实现，改为复用消除再漂移。
+            qdrant_ok, _q_detail = await _probe_qdrant_ready()
+            details.append(f"qdrant {_q_detail}" if qdrant_ok else f"qdrant unreachable: {_q_detail}")
 
             # 2) 检查 embedding 模型可用性
             embed_ok = False
@@ -512,30 +482,12 @@ async def _check_component(name: str) -> dict[str, Any]:
 
         # ─── Qdrant ────────────────────────────────────
         elif name == "Qdrant":
-            cfg = get_config()
-            qdrant_url = cfg.db.qdrant_url
-            # 优先检测远程 server
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    resp = await client.get(f"{qdrant_url}/collections")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        collections = data.get("result", {}).get("collections", [])
-                        coll_names = [c.get("name", "?") for c in collections]
-                        status["status"] = "running"
-                        status["detail"] = f"server online, collections: {coll_names or 'none'}"
-                    else:
-                        status["status"] = "error"
-                        status["detail"] = f"HTTP {resp.status_code}"
-            except Exception:
-                # 远程不可达，检查本地文件是否存在（不打开，避免和知识库检测锁冲突）
-                storage_path = os.path.expanduser("~/.swarm/qdrant")
-                if os.path.exists(storage_path) and os.path.exists(os.path.join(storage_path, "meta.json")):
-                    status["status"] = "ready"
-                    status["detail"] = "local file mode (verified by 知识库 check)"
-                else:
-                    status["status"] = "error"
-                    status["detail"] = f"server unreachable, no local storage at {storage_path}"
+            # 发版级 hunter CONFIRMED：本分支曾是探活假绿的最后一个 sibling——自有内联实现
+            # 缺 _is_local_qdrant 守卫（远端挂+陈旧 ~/.swarm/qdrant 报 ready）。与"知识库"
+            # 分量同法：直接复用 /ready 的 _probe_qdrant_ready，全系统 Qdrant 探活单一实现。
+            q_ok, q_detail = await _probe_qdrant_ready()
+            status["status"] = "running" if q_ok else "error"
+            status["detail"] = q_detail if q_ok else f"unreachable: {q_detail}"
 
         else:
             status["status"] = "unknown"
@@ -621,7 +573,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Swarm API",
-    version="0.9.15",
+    version="0.9.16",
     description="Swarm Web 后端 API",
     lifespan=_lifespan,
 )

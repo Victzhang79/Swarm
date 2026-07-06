@@ -1,7 +1,7 @@
 """Worker 沙箱生命周期混入 —— 从 worker/executor.py 抽出（round26 god-file 治理 Step4）。
 
-LIFECYCLE 连通分量（3 方法）：远程沙箱创建/在沙箱内执行/销毁（create_sandbox/run_in_sandbox/
-kill_sandbox）。跨簇仅调 self._log（核心类，MRO 解析）；禁 eager import worker.executor
+LIFECYCLE 连通分量：沙箱销毁 kill_sandbox（批5 删除了零调用的遗留 create_sandbox/
+run_in_sandbox——主流程 prepare 直连沙箱池/manager）。跨簇仅调 self._log（核心类，MRO 解析）；禁 eager import worker.executor
 （防 A6 环）——get_sandbox_manager 保持方法内 lazy import。
 """
 
