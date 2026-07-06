@@ -1,71 +1,87 @@
 #!/usr/bin/env bash
-# 在 CubeSandbox 集群侧（能 docker build 且 registry 集群可达的机器）执行：
-#   构建 5 个依赖预热镜像 → 推送 → cubemastercli tpl create-from-image → 打印新 template_id
+# 在 CubeSandbox 集群侧（能 docker build + cubemastercli 的节点）执行：
+#   构建 5 语言依赖预热镜像 → push 本地 registry → create-from-image 建 exec(2c2g)+verify(4c4g)
+#   两套模板 → watch 到 READY → 打印 10 个 template_id（回填 Swarm sandbox_templates 配置）。
 #
-# 前置：
-#   - docker 可用；已 docker login 到 REGISTRY
-#   - cubemastercli 可用且已指向你的 Cube Master
-#   - 网络能拉 ghcr.io/tencentcloud/cubesandbox-base（或先手动 pull 到本地/私服）
+# ★2026-07-06 更新（CubeSandbox 0.5.0 适配，与 worker/image_builder.py 同治本）★：
+#   - REGISTRY 改本地 registry（localhost:5000）：0.5.0 的 create-from-image 只从 registry 拉、
+#     不再读本地 docker 镜像；本地 registry 由 swarm-registry 容器提供，节点内闭环不出网。
+#   - docker build 加 --provenance=false：出单 v2s2 manifest（buildkit 默认 OCI index 被 registry 拒）。
+#   - create-from-image 加 --node（钉单节点，防多节点 rootfs 竞态）+ --with-cube-ca=true
+#     （0.4.0+ CubeEgress MITM，沙箱须信任根 CA 否则 HTTPS 出网全断）+ --allow-internet-access。
+#   - exec/verify 双变体：exec 默认 2c2g（写代码轻量），verify --cpu 4000 --memory 4000（4c4g，重编译）。
 set -euo pipefail
 
-# ─── 改这里 ───────────────────────────────────────────
-REGISTRY="${REGISTRY:-your-registry.example.com/swarm}"   # 集群可达的镜像仓库前缀
-TAG="${TAG:-v1}"
-WRITABLE_LAYER="${WRITABLE_LAYER:-2G}"   # 沙箱可写层大小（编译产物用，Java 建议≥2G）
+# ─── 配置（可用环境变量覆盖）───────────────────────────────
+REGISTRY="${REGISTRY:-localhost:5000}"          # 本地 registry（swarm-registry 容器）
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-ccr.ccs.tencentyun.com/library/registry:2}"  # 自启用
+NODE="${NODE:?必须指定 --node 钉的健康节点 IP（= swarm SSH 的那台），如 NODE=10.0.0.x}"  # 环境变量必传，勿硬编码入库
+TAG="${TAG:-v2}"
+WRITABLE_LAYER="${WRITABLE_LAYER:-2G}"
 # ──────────────────────────────────────────────────────
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DF_DIR="$HERE/dockerfiles"
 LANGS=(python node java go rust)
 
-declare -A NEW_TPL
-
+declare -A EXEC_TPL VERIFY_TPL
 log() { echo -e "\033[36m[cube-tpl]\033[0m $*"; }
+
+# 0) 按需自启本地 registry（幂等）
+if [[ "$REGISTRY" == localhost:* || "$REGISTRY" == 127.0.0.1:* ]]; then
+  port="${REGISTRY##*:}"
+  docker inspect swarm-registry >/dev/null 2>&1 || \
+    docker run -d -p "${port}:5000" --restart=always --name swarm-registry "$REGISTRY_IMAGE" >/dev/null 2>&1 || true
+  curl -sS -m5 -o /dev/null -w '[cube-tpl] 本地 registry /v2 = %{http_code}\n' "http://${REGISTRY}/v2/" || true
+fi
+
+# create-from-image 公共参数（0.4.0+ 必带）
+COMMON_OPTS=(--node "$NODE" --with-cube-ca=true --allow-internet-access
+             --writable-layer-size "$WRITABLE_LAYER" --expose-port 49983 --probe 49983 --probe-path /health)
+
+# 提交 create-from-image，回显 template_id 与 job_id（v0.5.0 输出 job_id=xxx）
+create_tpl() {  # $1=image  $2..=额外参数(如 --cpu/--memory)
+  local img="$1"; shift
+  local out; out="$(cubemastercli template create-from-image --image "$img" "${COMMON_OPTS[@]}" "$@" 2>&1)"
+  echo "$out" >&2
+  local tpl job; tpl="$(echo "$out" | grep -oE 'tpl-[0-9a-f]+' | head -1 || true)"
+  job="$(echo "$out" | grep -oE 'job_id[:=][[:space:]]*[0-9a-f-]+' | head -1 | grep -oE '[0-9a-f-]{8,}' || true)"
+  # watch 到 READY（有 job_id 用 watch，否则轮询 tpl list）
+  if [[ -n "$job" ]]; then
+    cubemastercli template watch --job-id "$job" >&2 2>&1 || true
+  fi
+  local st; st="$(cubemastercli template list 2>/dev/null | grep "$tpl" | awk '{print $2}' | head -1)"
+  if [[ "$st" == "READY" ]]; then echo "$tpl"; else echo "<${tpl:-建失败}:status=${st:-?}>"; fi
+}
 
 for lang in "${LANGS[@]}"; do
   img="$REGISTRY/sandbox-$lang:$TAG"
-  log "==== 构建 $lang → $img ===="
-  docker build -f "$DF_DIR/Dockerfile.$lang" -t "$img" "$DF_DIR"
+  log "==== [$lang] docker build --provenance=false → $img ===="
+  docker build --provenance=false -f "$DF_DIR/Dockerfile.$lang" -t "$img" "$DF_DIR"
 
-  # 构建后自测：envd /health（防 node 那种 envd 故障发布坏模板）
-  log "envd 健康自测 $lang ..."
-  cid="$(docker run -d -p 49983:49983 "$img" 2>/dev/null || true)"
-  if [ -n "$cid" ]; then
+  # envd /health 自测（防发布坏模板，见 NODE_ENVD_FIX.md）
+  cid="$(docker run -d -P "$img" 2>/dev/null || true)"
+  if [[ -n "$cid" ]]; then
     sleep 5
-    if curl -fsS localhost:49983/health >/dev/null 2>&1; then
-      log "✅ $lang envd /health 通过"
-    else
-      log "❌ $lang envd /health 不通 —— 镜像 envd 故障，跳过 create-from-image！（见 NODE_ENVD_FIX.md）"
-      docker rm -f "$cid" >/dev/null 2>&1 || true
-      NEW_TPL[$lang]="<envd自测失败,未创建模板>"
-      continue
-    fi
+    hp="$(docker port "$cid" 49983/tcp 2>/dev/null | head -1 | cut -d: -f2)"
+    if curl -fsS -m5 "localhost:${hp}/health" >/dev/null 2>&1; then log "✅ [$lang] envd /health 通过"
+    else log "❌ [$lang] envd /health 不通，跳过"; docker rm -f "$cid" >/dev/null 2>&1 || true
+         EXEC_TPL[$lang]="<envd自测失败>"; VERIFY_TPL[$lang]="<envd自测失败>"; continue; fi
     docker rm -f "$cid" >/dev/null 2>&1 || true
-  else
-    log "⚠️ $lang 无法本地启动自测（端口占用?），跳过自测继续"
   fi
 
-  log "推送 $img"
+  log "[$lang] push → $img"
   docker push "$img"
 
-  log "创建模板 (create-from-image) ..."
-  # 输出含 template_id，抓出来
-  out="$(cubemastercli tpl create-from-image \
-        --image "$img" \
-        --writable-layer-size "$WRITABLE_LAYER" \
-        --expose-port 49983 \
-        --probe 49983 \
-        --probe-path /health 2>&1)"
-  echo "$out"
-  tpl="$(echo "$out" | grep -oE 'tpl-[0-9a-f]+' | head -1 || true)"
-  NEW_TPL[$lang]="${tpl:-<解析失败,看上面输出>}"
+  log "[$lang] create exec 模板 (2c2g) ..."
+  EXEC_TPL[$lang]="$(create_tpl "$img")"
+  log "[$lang] create verify 模板 (4c4g) ..."
+  VERIFY_TPL[$lang]="$(create_tpl "$img" --cpu 4000 --memory 4000)"
+  log "[$lang] exec=${EXEC_TPL[$lang]}  verify=${VERIFY_TPL[$lang]}"
 done
 
 echo ""
-log "================  完成。回填 Swarm 的 .env  ================"
-echo "SWARM_SANDBOX_TEMPLATE_PYTHON=${NEW_TPL[python]}"
-echo "SWARM_SANDBOX_TEMPLATE_NODE=${NEW_TPL[node]}"
-echo "SWARM_SANDBOX_TEMPLATE_JAVA=${NEW_TPL[java]}"
-echo "SWARM_SANDBOX_TEMPLATE_GO=${NEW_TPL[go]}"
-echo "SWARM_SANDBOX_TEMPLATE_RUST=${NEW_TPL[rust]}"
-log "填入后重启 Swarm API：SWARM_SANDBOX_POOL_ENABLED=true bash scripts/restart-api.sh"
+log "================  完成。以下为新模板（exec / verify）================"
+for lang in "${LANGS[@]}"; do
+  echo "RESULT ${lang} exec=${EXEC_TPL[$lang]} verify=${VERIFY_TPL[$lang]}"
+done
