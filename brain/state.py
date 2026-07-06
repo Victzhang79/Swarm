@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from swarm.types import (
     Complexity,
@@ -167,6 +167,13 @@ class BrainState(TypedDict, total=False):
     # ─── 上下文预算 + INVEST 自检(Q7/A)───
     oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）
     invest_fail_count: int              # INVEST 自检未过被打回再拆的次数
+
+    # ═══ schema 补全（CODEWALK 根因A：以下键早已是实际通道，此前未声明、靠 LangGraph
+    # 对未声明键的宽容存活——补声明使 TypedDict 重新成为事实源）═══
+    base_commit: str                    # runner 任务启动时记录的项目基线 commit（merge/rebase/worker base_ref 锚点）
+    plan_generation_failed: bool        # PLAN LLM 拆解失败走兜底计划的标记 → can_auto_accept_plan fail-fast 拦截
+    deliver_auto_reject_reason: str     # DELIVER 自动拒绝原因（runner 读取回写任务态/前端展示）
+    l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
 
     # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
     uploaded_files: list[str]           # 任务创建时上传的文件路径（绝对路径，任务专属目录）

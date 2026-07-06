@@ -2289,6 +2289,14 @@ def run_l1_pipeline(
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
+    ★契约——勿裸用 bool 返回值（CODEWALK 根因B）：所有 BLOCKED 路径（malformed_diff_zero_files /
+    build_infra_failure / upstream_module_broken / internal_pkg_not_built / build_manifest_missing /
+    test_infra_failure / verify_infra_failure）都返回 ok=True 且 details["pipeline_blocked"] 置位——
+    语义是"跑通了能跑的、但该验证的环节被阻塞"，不是 PASS。调用方【必须】复核
+    details.get("pipeline_blocked")（executor 侧 _deterministic_l1_gate 把 ok∧blocked 降级为
+    None/BLOCKED 走 transient 重试）。新调用方裸用返回值即假绿。契约由
+    test_l1_pipeline_blocked_contract.py 锁定。
+
     Args:
         project_path: 项目根目录
         subtask: 子任务定义

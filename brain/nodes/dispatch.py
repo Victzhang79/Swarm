@@ -255,8 +255,10 @@ async def dispatch(state: BrainState) -> dict:
         logger.error("[DISPATCH] 没有执行计划")
         return {"dispatch_remaining": []}
 
-    subtask_results: dict = state.get("subtask_results", {})
-    dispatch_remaining: list = state.get("dispatch_remaining", [])
+    # CODEWALK 根因A纪律③：拷贝后再改（对齐 failure.py 惯例）。直接 mutate 共享 state
+    # 对象会在 checkpoint 写盘前原地污染（LangGraph last-write-wins 通道的隐式契约）。
+    subtask_results: dict = dict(state.get("subtask_results", {}))
+    dispatch_remaining: list = list(state.get("dispatch_remaining", []))
     knowledge_context = state.get("knowledge_context", {})
 
     # 如果是首次进入 dispatch，初始化 dispatch_remaining

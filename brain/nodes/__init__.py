@@ -676,16 +676,9 @@ async def plan(state: BrainState) -> dict:
     输出: plan
     """
     task_description = state.get("task_description", "")
-    # 优先用澄清后定级(assess)，回退 analyze 初判
-    complexity = state.get("assessed_complexity") or state.get("complexity", Complexity.MEDIUM)
-    # checkpoint resume 后枚举会反序列化成字符串("ultra")——这里统一归一为 Complexity 枚举，
-    # 否则下游 complexity.value / == Complexity.X 触发 AttributeError（task 8537fa5e 真因，
-    # 与 ASSESS 308cd191 同类：interrupt→resume 路径上状态枚举退化为 str）。
-    if not isinstance(complexity, Complexity):
-        try:
-            complexity = Complexity(str(complexity).lower())
-        except ValueError:
-            complexity = Complexity.MEDIUM
+    # 复杂度走单一真值入口（assess 优先→analyze 初判→MEDIUM 兜底 + resume 字符串归一枚举，
+    # task 8537fa5e）。CODEWALK 根因A纪律②：此处原为手写内联版，绕开入口即漂移温床。
+    complexity = effective_complexity(state)
     knowledge_context = state.get("knowledge_context", {})
 
     # I3 防 premature victory：检测 replan 重入——若 state 已有 subtask_results（说明这是
