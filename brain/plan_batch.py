@@ -131,14 +131,27 @@ def group_into_module_batches(file_plan: list[dict],
 def _order_groups(groups: dict[str, list[dict]]) -> list[str]:
     """对组排序：先尝试 depends_on 跨组拓扑序，无有效依赖则用分层序兜底。"""
     names = list(groups.keys())
-    # 构建文件路径 → 组 的映射
+    # 构建文件路径 → 组 的映射。basename 兜底映射只登记【全计划无歧义】的名字：
+    # P1-6 后同名清单文件（moduleA/pom.xml + moduleB/pom.xml）多份共存，last-writer-wins
+    # 会把裸 basename 依赖("pom.xml")错连到最后登记的组 → 伪边污染组间拓扑序（hunter 抓）。
+    # 歧义 basename 不参与解析（裸名依赖本就无法确定指向，宁缺勿错连）。
     path_to_group: dict[str, str] = {}
+    base_group: dict[str, str] = {}
+    base_ambiguous: set[str] = set()
     for g, items in groups.items():
         for fp in items:
             p = (fp.get("path") or "").replace("\\", "/").strip("/")
-            if p:
-                path_to_group[p] = g
-                path_to_group[os.path.basename(p)] = g
+            if not p:
+                continue
+            path_to_group[p] = g
+            b = os.path.basename(p)
+            if b in base_group and base_group[b] != g:
+                base_ambiguous.add(b)
+            else:
+                base_group.setdefault(b, g)
+    for b, g in base_group.items():
+        if b not in base_ambiguous:
+            path_to_group.setdefault(b, g)
 
     # 跨组依赖边：组 X 依赖组 Y（X 的某文件 depends_on Y 的某文件）
     edges: dict[str, set[str]] = {g: set() for g in names}
@@ -195,12 +208,26 @@ def _toposort(names: list[str], edges: dict[str, set[str]]) -> list[str] | None:
     return out
 
 
+# CODEWALK P1-6：这些文件名是"每模块一份"的生态惯例（构建清单/配置/桶文件）——
+# basename 去重会把 moduleB/pom.xml 静默丢掉（与 contract_utils 规则3"每模块 pom
+# 各自独立"矛盾 → 多模块脚手架残缺）。白名单内只按完全路径去重；
+# 源码文件保持 basename 去重（P5：防 LLM 在两模块重复建同名类）。
+_PER_MODULE_FILENAMES = frozenset({
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    "package.json", "tsconfig.json", "vite.config.ts", "vite.config.js",
+    "go.mod", "go.sum", "cargo.toml",
+    "application.yml", "application.yaml", "application.properties", "bootstrap.yml",
+    "index.ts", "index.js", "__init__.py", "readme.md", ".gitignore", "dockerfile", "makefile",
+})
+
+
 def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
     """P5：同名文件去重（全局符号表）。
 
     分批/分模块拆解时，不同模块可能各建一个同名文件（如 INotifyService.java
     被 channel 和 engine 各建一次，路径不同）→ 语义冲突 + 编译重复定义。
     按 basename 去重：保留首个，丢弃后续同名（保留先出现的，通常是更基础的模块）。
+    例外（P1-6）：_PER_MODULE_FILENAMES 内的模块惯例文件只按完全路径去重。
     路径完全相同的也去重。返回去重后的 file_plan + 记录被去重项数。
     """
     seen_base: dict[str, str] = {}  # basename(lower) -> 已保留的 path
@@ -214,7 +241,7 @@ def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
         base = os.path.basename(path).lower()
         if path in seen_path:
             continue  # 完全同路径，跳过
-        if base in seen_base and seen_base[base] != path:
+        if base in seen_base and seen_base[base] != path and base not in _PER_MODULE_FILENAMES:
             # 同名不同路径 → 疑似重复创建，跳过后者（保留先出现的）
             continue
         seen_path.add(path)
