@@ -239,6 +239,10 @@ _PER_MODULE_FILENAMES = frozenset({
     "go.mod", "go.sum", "cargo.toml",
     "application.yml", "application.yaml", "application.properties", "bootstrap.yml",
     "index.ts", "index.js", "__init__.py", "readme.md", ".gitignore", "dockerfile", "makefile",
+    # 外部复核补遗：其它生态"每模块一份"的清单/配置/入口
+    "pyproject.toml", "setup.py", "requirements.txt", "conftest.py",
+    "cmakelists.txt", "main.go",
+    "jest.config.js", "jest.config.ts", "webpack.config.js", "rollup.config.js",
 })
 
 

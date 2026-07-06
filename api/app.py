@@ -253,11 +253,17 @@ async def _check_component(name: str) -> dict[str, Any]:
                     else:
                         details.append(f"qdrant HTTP {resp.status_code}")
             except Exception as e:
-                # fallback 本地文件模式
+                # fallback 本地文件模式——对齐 _probe_qdrant_ready 的 fail-closed 判定
+                # （外部复核 P0-2 残口）：只有 qdrant_url 指向本地时，宿主机 ~/.swarm/qdrant
+                # （且有 meta.json）才有资格作健康证据；远端配置全挂 + 陈旧本地目录 ≠ 健康，
+                # 否则 /api/status 与 /api/health/ready 两处探活漂移、前者假绿。
                 try:
-                    from qdrant_client import QdrantClient
                     storage_path = os.path.expanduser("~/.swarm/qdrant")
-                    if os.path.exists(storage_path):
+                    if (_is_local_qdrant(qdrant_url)
+                            and os.path.exists(storage_path)
+                            and os.path.exists(os.path.join(storage_path, "meta.json"))):
+                        from qdrant_client import QdrantClient
+
                         def _check_local_qdrant_kb():
                             c = QdrantClient(path=storage_path)
                             cols = c.get_collections()

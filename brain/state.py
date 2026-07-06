@@ -168,8 +168,11 @@ class BrainState(TypedDict, total=False):
     oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）
     invest_fail_count: int              # INVEST 自检未过被打回再拆的次数
 
-    # ═══ schema 补全（CODEWALK 根因A：以下键早已是实际通道，此前未声明、靠 LangGraph
-    # 对未声明键的宽容存活——补声明使 TypedDict 重新成为事实源）═══
+    # ═══ schema 补全（CODEWALK 根因A）：以下键早已是实际读写通道但此前未声明——实证
+    # （批4a toy StateGraph）LangGraph 对未声明键是【静默丢弃】而非宽容存活：节点返回与
+    # initial_state 两路都建不了 channel → 这些链路整体失活（base_commit 恒 None 走回退、
+    # plan_generation_failed 闸门死代码、deliver_auto_reject_reason 永不触发）。
+    # 补声明=激活链路；一致性由 test_brain_state_schema.py AST 扫描锁定。═══
     base_commit: str                    # runner 任务启动时记录的项目基线 commit（merge/rebase/worker base_ref 锚点）
     plan_generation_failed: bool        # PLAN LLM 拆解失败走兜底计划的标记 → can_auto_accept_plan fail-fast 拦截
     deliver_auto_reject_reason: str     # DELIVER 自动拒绝原因（runner 读取回写任务态/前端展示）

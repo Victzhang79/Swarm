@@ -67,9 +67,15 @@ class _ProjectGitFlock:
 
     def __exit__(self, *exc: object) -> bool:
         if self._lock_f is not None and self._fcntl is not None:
+            # P2-3：unlock 与 close 各自护栏——unlock 抛异常不得跳过 close（句柄泄漏；
+            # 进程退出前锁本身随 fd 关闭释放，close 是兜底的资源边界）
             try:
                 self._fcntl.flock(self._lock_f, self._fcntl.LOCK_UN)
-                self._lock_f.close()
             except Exception:  # noqa: BLE001
                 pass
+            finally:
+                try:
+                    self._lock_f.close()
+                except Exception:  # noqa: BLE001
+                    pass
         return False

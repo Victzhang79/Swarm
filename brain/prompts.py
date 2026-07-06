@@ -156,7 +156,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 - 一个模块通常拆成 1-4 个垂直功能子任务（按功能点，不按层）。
 
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
-【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选可确定性验证的 `mvn compile` 或具体编译/测试命令。
+【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile），或具体测试命令；不要给非本项目栈的命令。
 【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块 `pom.xml`，建 pom 的子任务【必须】一次性声明本模块全部子任务会用到、而父 pom 未传递的依赖（lombok、spring-boot-starter-data-redis、各 starter 等）——写代码的子任务碰不到 pom，缺一个依赖即整模块编译失败。宁多勿漏。
 
 规则：
@@ -164,7 +164,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 - 子任务 depends_on 只引用【本批内】的其他子任务 id（跨模块依赖由系统按模块顺序处理）。
 - 子任务 id 本批内唯一即可（系统会全局重编号）。
 
-严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance_criteria":["mvn -pl <module> -am compile"],"contract":{}}]}"""
+严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance_criteria":["<本模块的确定性编译/构建命令>"],"contract":{}}]}"""
 
 PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
 {task_description}

@@ -23,10 +23,17 @@ def test_per_module_manifests_all_kept():
         _fp("admin/package.json"),
         _fp("svcA/src/main/resources/application.yml"),
         _fp("svcB/src/main/resources/application.yml"),
+        # 外部复核补遗：Python/C++/Go/前端工具链的每模块清单
+        _fp("pkgA/pyproject.toml"),
+        _fp("pkgB/pyproject.toml"),
+        _fp("libA/CMakeLists.txt"),
+        _fp("libB/CMakeLists.txt"),
+        _fp("cmd/serverA/main.go"),
+        _fp("cmd/serverB/main.go"),
     ]
     out = dedupe_file_plan(fp)
     paths = [x["path"] for x in out]
-    assert len(out) == 6, f"每模块清单/配置不得被 basename 去重丢弃: {paths}"
+    assert len(out) == 12, f"每模块清单/配置不得被 basename 去重丢弃: {paths}"
 
 
 def test_duplicate_source_class_still_deduped():

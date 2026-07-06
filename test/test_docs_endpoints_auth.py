@@ -64,6 +64,13 @@ def test_docs_env_override_opens_in_production(monkeypatch):
     assert resp.status_code == 200, "SWARM_DOCS_PUBLIC=true 应显式放开"
 
 
+def test_docs_env_override_closes_in_dev(monkeypatch):
+    """外部复核补测：SWARM_DOCS_PUBLIC=false 在非生产也强制收权（双向覆盖的另一半）。"""
+    monkeypatch.setenv("SWARM_DOCS_PUBLIC", "false")
+    resp = _dispatch("/openapi.json", prod=False)
+    assert resp.status_code == 401, "SWARM_DOCS_PUBLIC=false 应在非生产也收权"
+
+
 def test_docs_with_valid_token_in_production(monkeypatch):
     monkeypatch.delenv("SWARM_DOCS_PUBLIC", raising=False)
     with patch.object(auth_mod, "resolve_user", lambda t: auth_mod._LEGACY_USER):

@@ -666,6 +666,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan) -> dict:
         "subtask_results": preserved,
         "dispatch_remaining": [],
         "failed_subtask_ids": [],
+        # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
+        # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
+        "failure_escalated": False,
     }
 
 
@@ -1550,6 +1553,10 @@ def merge(state: BrainState) -> dict:
     # FAILED / replan 推倒重来）。与 H3 同法：每轮 merge 先清，仅冲突路径覆盖为非空。
     out["merge_conflicts"] = []
     out["failed_subtask_ids"] = []
+    # 批4c 补漏（外部复核）：failure_escalated 同为"仅条件写"粘滞键——干净轮显式清，
+    # 本函数下方 apply-check 失败 / rebase 超限硬冲突两条 escalate 路径在同一 out 覆盖为
+    # True（A6 每轮独立判定，语义不变）。与上面 merge_conflicts 的 round27 修法对称。
+    out["failure_escalated"] = False
 
     # #1(a) fail-closed：终局干净合并但 merged_diff `git apply --check` 失败＝确定性组装缺陷。
     # 绝不能只诊断后默认落 VERIFY_L2（project_path 空时 L2 复核整块跳过 → 非法 patch 假绿放行）。
@@ -1638,7 +1645,9 @@ def _get_project_path(project_id: str) -> str | None:
         if proj and proj.get("path"):
             return proj["path"]
     except Exception as exc:
-        logger.warning("[VERIFY_L2] 获取项目路径失败: %s", exc)
+        # P2-5：本函数被 PLAN/MERGE/DISPATCH/VERIFY_L2/HANDLE_FAILURE 全线共用，
+        # 前缀不得写死单一节点名误导排障
+        logger.warning("[PROJECT] 获取项目路径失败: %s", exc)
     return None
 
 

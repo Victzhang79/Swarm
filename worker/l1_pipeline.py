@@ -1914,6 +1914,10 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
     return _lint_line_based(
         project_path, tool="checkstyle", lang="Java", label="checkstyle", command=cmd,
         timeout=timeout, parse_line=_parse, sandbox_precheck=True,
+        # P2-1：命令未带 -c 配置时 CLI 必非 0 退出——only_error_if_issues=False 会把
+        # "工具自身跑不起来"当代码硬阻断（误杀，此前靠多数环境没装 checkstyle 掩盖）。
+        # True=只有真解析出 issue 才算错，工具故障走不阻断路径。
+        only_error_if_issues=True,
     )
 
 

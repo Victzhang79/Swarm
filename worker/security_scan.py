@@ -851,13 +851,14 @@ def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) ->
     if rc not in (0, 1):
         logger.warning("Secret scan: gitleaks execution failed (rc=%d): %s", rc, stderr)
         return None
-    _mark_ran(ctx)  # gitleaks 已成功执行
-
     try:
         data = json.loads(Path(report_path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Secret scan: gitleaks report parse failed: %s", exc)
+        # P2-2：报告解析失败不再"已扫过+零发现"（fail-open）——不置 _mark_ran，让上游
+        # fail-closed 哨兵按"未扫"处理（与工具没跑同等对待），杜绝解析坏=漏洞清零假绿。
+        logger.warning("Secret scan: gitleaks report parse failed（按未扫处理，fail-closed）: %s", exc)
         return []
+    _mark_ran(ctx)  # gitleaks 已成功执行且报告可解析
 
     findings: list[SecurityFinding] = []
     if isinstance(data, list):
