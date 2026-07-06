@@ -77,6 +77,10 @@ def _check_magic(ext: str, head: bytes) -> bool:
     expected = _MAGIC_BYTES.get(ext)
     if not expected:
         return True  # 文本类等无魔数要求
+    # F13：WebP 是 RIFF 容器族——仅校验 `RIFF` 前缀会放行任意 wav/avi/其它 RIFF 文件。真正的 WebP
+    # 头是 `RIFF`(0..4) + 4字节长度 + `WEBP`(8..12)。须同时校验 form-type，防伪装绕过。
+    if ext == ".webp":
+        return head.startswith(b"RIFF") and head[8:12] == b"WEBP"
     return any(head.startswith(sig) for sig in expected)
 
 

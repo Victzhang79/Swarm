@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 
 class _TokenBucket:
@@ -104,7 +107,10 @@ def rate_limit(scope: str, capacity: int = 30, rate: float = 1.0):
         try:
             key = f"{scope}:{_subject(request)}"
             allowed, retry_after = _limiter.check(key, capacity, rate)
-        except Exception:  # noqa: BLE001 — 限流器故障绝不阻断业务
+        except Exception as exc:  # noqa: BLE001 — 限流器故障绝不阻断业务（可用性优先）
+            # F9：fail-open 保留（可用性优先），但不再【静默】——限流器坏了=保护面失效，必须可观测，
+            # 否则 login/重型端点在限流失效期被打爆也无人知晓。loud warning 供告警/排障。
+            logger.warning("[RATE_LIMIT] 限流器异常，本次 fail-open 放行 scope=%s: %s", scope, exc)
             return
         if not allowed:
             raise HTTPException(

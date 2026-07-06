@@ -175,6 +175,7 @@ class BrainState(TypedDict, total=False):
     # 补声明=激活链路；一致性由 test_brain_state_schema.py AST 扫描锁定。═══
     base_commit: str                    # runner 任务启动时记录的项目基线 commit（merge/rebase/worker base_ref 锚点）
     plan_generation_failed: bool        # PLAN LLM 拆解失败走兜底计划的标记 → can_auto_accept_plan fail-fast 拦截
+    tech_design_generation_failed: bool  # F7(round28)：tech_design 整体 LLM 失败→file_plan 为空/方案占位的 fail-fast 标记 → can_auto_accept_plan(gates.py:66) 拦下升级人工。此前未声明→LangGraph 静默丢→闸门死代码（与 plan_generation_failed 同类，AST 测试原 glob 只扫 brain/nodes/ 漏了 brain/planning_nodes.py 才放过）
     deliver_auto_reject_reason: str     # DELIVER 自动拒绝原因（runner 读取回写任务态/前端展示）
     l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
 

@@ -2244,9 +2244,14 @@ async def learn_success(state: BrainState) -> dict:
                 if not _ap.get("ok"):
                     logger.warning("[LEARN_SUCCESS] commit 前 reset+重放 merged_diff 全失败(非致命): %s",
                                    _ap.get("failed") or _ap.get("stderr", ""))
+                    # F5：交付 apply 全失败 = 产物没真正落到本地仓 → 绝不能学成成功模式（下方并入
+                    # state.degraded_reasons，should_write_success 据此跳过 L6 写入，防毒化知识库）。
+                    _degraded.append("delivery_apply_failed")
                 elif _ap.get("failed"):
                     logger.warning("[LEARN_SUCCESS] 分文件落盘：好文件已保留 %d，剔除坏段 %d(交 owner 重修)",
                                    len(_ap.get("applied") or []), len(_ap.get("failed") or []))
+                    # F5：部分文件未落（坏段被剔）= 交付不完整 → 同样降级，不作可复用成功模式。
+                    _degraded.append("delivery_apply_incomplete")
                 if (_deliv.get("wm") or {}).get("modified_manifests"):
                     logger.info("[LEARN_SUCCESS] 交付前对账聚合清单成员并纳入提交: %s",
                                 _deliv["wm"].get("added"))
@@ -2256,6 +2261,9 @@ async def learn_success(state: BrainState) -> dict:
                                 _c.get("commit_hash"), len(out_files))
                 elif not _c.get("ok"):
                     logger.warning("[LEARN_SUCCESS] 产出 commit 跳过(非致命): %s", _c.get("reason"))
+                    # F5：真 commit 错误(ok=False，区别于 committed=False 的 no-op/无改动)= 产物未固化
+                    # 到本地仓历史 → 降级，不学成成功模式（no-op/nothing-to-commit 不算，ok=True 不入此支）。
+                    _degraded.append("delivery_commit_failed")
                 # ★对抗复核 3rd#1 + Finding 2 治本★：KB 增量索引在此触发——磁盘=已 apply 的最终产出
                 # （非 L2 回滚后 HEAD 旧内容），覆盖 auto+manual accept 两条路径。触发条件用 `ok`（含
                 # "无改动可提交"的合法 no-op）而非 `committed`——否则 commit 报 no-op/nothing-to-commit
@@ -2317,6 +2325,12 @@ async def learn_success(state: BrainState) -> dict:
             }
             learn_summary = json.dumps(parsed, ensure_ascii=False)
 
+    # F5 治本：本节点内交付阶段探到的降级（base 不可达 / apply 全失败 / apply 不完整 / commit
+    # 失败）必须在 persist 之前并入 state.degraded_reasons——否则 should_write_success 只看 state
+    # 里【进本节点前】的旧 degraded，本轮交付真出问题却仍被学成 L6 成功模式（记忆毒化）。原 _degraded
+    # 只在 2359 并入返回值(终态可观测)，晚于此处 persist，对成功判据是死信号。就地并入供守卫读取。
+    if _degraded:
+        state["degraded_reasons"] = list(state.get("degraded_reasons") or []) + _degraded
     persist_meta = await persist_learn_success(state, parsed)
     learn_summary = merge_persist_meta(learn_summary, persist_meta)
 

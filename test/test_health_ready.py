@@ -128,6 +128,34 @@ def test_ready_redis_enabled_up_returns_200():
     print("  ✅ Redis 启用+up → 200")
 
 
+def test_ready_rbac_on_hides_topology():
+    """F4：RBAC 开（生产）时，匿名 /ready 只回状态位，不泄露 per-component 拓扑（checks）。
+
+    探针只需 200/503；组件明细收敛到需鉴权的 /api/status。RBAC 关（dev/CI）仍带 checks（上方用例）。
+    """
+    from unittest.mock import MagicMock
+    cfg = MagicMock()
+    cfg.rbac_enabled = True
+    with patch("swarm.api.app._probe_pg_ready", _pg_ok), \
+         patch("swarm.api.app._probe_qdrant_ready", _qdrant_ok), \
+         patch("swarm.api.app.redis_enabled", return_value=False), \
+         patch("swarm.api.app.get_config", return_value=cfg):
+        resp = _client().get("/api/health/ready")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "checks" not in body, "RBAC 开启时匿名 /ready 不得泄露组件拓扑"
+    # 503 路径同样只回状态位
+    with patch("swarm.api.app._probe_pg_ready", _pg_fail), \
+         patch("swarm.api.app._probe_qdrant_ready", _qdrant_ok), \
+         patch("swarm.api.app.redis_enabled", return_value=False), \
+         patch("swarm.api.app.get_config", return_value=cfg):
+        resp2 = _client().get("/api/health/ready")
+    assert resp2.status_code == 503
+    assert "checks" not in resp2.json()
+    print("  ✅ RBAC 开→匿名 /ready 隐藏拓扑（200/503 均只回状态）")
+
+
 def test_liveness_health_unchanged():
     """/api/health 仍是纯存活：200 + 不含依赖探测字段。"""
     resp = _client().get("/api/health")

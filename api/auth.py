@@ -60,14 +60,12 @@ def _extract_token(request: Request) -> str:
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
     # D1：HttpOnly Cookie（/api/auth/login 下发）。浏览器 EventSource(SSE) 同源自动带 Cookie，
-    # 故 Cookie 认证的 SSE【无需】把 token 放进 ?token= URL（避免进 access log/Referer/浏览器
-    # 历史致跨用户凭据泄漏）。优先级：显式 header > HttpOnly Cookie > ?token=(遗留兜底)。
+    # 故 Cookie 认证的 SSE【无需】把 token 放进 ?token= URL。优先级：显式 header > HttpOnly Cookie。
     if not provided:
         provided = request.cookies.get("swarm_token") or ""
-    # 遗留兜底：浏览器原生 EventSource 无法携带自定义请求头且未走 Cookie 时，
-    # 仍支持 query param ?token=（安全性最弱，前端迁移到 Cookie 后可弃用）。
-    if not provided:
-        provided = request.query_params.get("token") or ""
+    # F1：★已关闭 ?token= URL 兜底★——token 进 URL 会落 access log/Referer/浏览器历史，多用户下
+    # 是跨用户凭据泄漏面。浏览器 EventSource/SSE 走 HttpOnly Cookie（同源自动携带），CLI/程序走
+    # Bearer/X-Swarm-Token header，两路已全覆盖，无需 URL 兜底。
     return provided.strip()
 
 
@@ -85,7 +83,12 @@ def resolve_user(token: str) -> SwarmUser | None:
 
 
 def _extract_token_ws(websocket) -> str:
-    """从 WebSocket 提取 token（header 优先，其次 ?token= query）。"""
+    """从 WebSocket 提取 token。优先级：显式 header > HttpOnly Cookie > ?token=(遗留兜底)。
+
+    F13-WS：补上 HttpOnly Cookie 读取——浏览器 WebSocket 握手是同源 HTTP GET upgrade，会【自动
+    携带】同源 Cookie（含 HttpOnly），故浏览器 WS 无需再把 token 塞进 ?token= URL（与 SSE 同源
+    自动带 Cookie 同理）。?token= 仅为无 Cookie/无 header 的程序化 WS 客户端保留的最弱兜底。
+    """
     provided = (
         websocket.headers.get("x-swarm-token")
         or websocket.headers.get("x-swarm-key")
@@ -95,6 +98,8 @@ def _extract_token_ws(websocket) -> str:
         auth = websocket.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
+    if not provided:
+        provided = websocket.cookies.get("swarm_token") or ""
     if not provided:
         provided = websocket.query_params.get("token") or ""
     return provided.strip()

@@ -573,7 +573,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Swarm API",
-    version="0.9.16",
+    version="0.9.17",
     description="Swarm Web 后端 API",
     lifespan=_lifespan,
 )
@@ -1330,7 +1330,17 @@ async def health_ready():
     checks["qdrant"] = {"ok": q_ok, "detail": q_detail}
     ok_all = ok_all and q_ok
 
-    body = {"status": "ok" if ok_all else "unavailable", "checks": checks}
+    # F4：/ready 经 _PUBLIC_PREFIXES【匿名可达】(容器 HEALTHCHECK/编排就绪门无 token)。生产(RBAC
+    # 开)下若把 per-component up/down+detail 直接返给匿名调用方 = 基建拓扑信息泄漏(#21 同类)。探针
+    # 只需 200/503 状态位；拓扑明细收敛到【需鉴权】的 /api/status。非生产(RBAC 关，dev/CI)保留 checks
+    # 便于本地排障。读配置失败 → fail-closed 不暴露明细。
+    _expose_detail = False
+    try:
+        _expose_detail = not get_config().rbac_enabled
+    except Exception:  # noqa: BLE001
+        _expose_detail = False
+    body = ({"status": "ok" if ok_all else "unavailable", "checks": checks}
+            if _expose_detail else {"status": "ok" if ok_all else "unavailable"})
     if not ok_all:
         return JSONResponse(status_code=503, content=body)
     return body

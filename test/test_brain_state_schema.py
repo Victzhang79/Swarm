@@ -26,7 +26,10 @@ _ALLOWLIST = {"reasoning", "subtasks"}
 def test_previously_undeclared_channels_now_in_schema():
     ann = BrainState.__annotations__
     for key in ("base_commit", "plan_generation_failed",
-                "deliver_auto_reject_reason", "l2_details"):
+                "deliver_auto_reject_reason", "l2_details",
+                # F7(round28)：tech_design 节点在 brain/planning_nodes.py（旧 glob 只扫 brain/nodes/
+                # 漏了它），写此闸门标记却未声明 → 被静默丢 → gates.py:66 死代码。
+                "tech_design_generation_failed"):
         assert key in ann, f"实际通道 {key} 必须在 BrainState 声明（未声明=LangGraph 静默丢弃）"
 
 
@@ -41,12 +44,45 @@ def _registered_node_fn_names() -> set[str]:
     return names
 
 
+def _node_written_keys(fn: ast.AST) -> set[str]:
+    """收集节点函数【自身作用域】写入的 state patch 键：`return {字面量}` 与
+    `out/_patch/patch/update/result[...] =`。★不下钻嵌套 helper 函数体★——否则内层
+    per-module 结果 dict（如 contract_design 内 `return {"idx","name","slice","error"}`）
+    会被误当成外层节点的 state patch（F7 扩 glob 到 planning_nodes.py 时实测的假阳性）。
+    """
+    keys: set[str] = set()
+
+    def _visit(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            # 嵌套函数（inner helper / 闭包）自成作用域，其返回不是本节点的 state patch → 不下钻。
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Return) and isinstance(child.value, ast.Dict):
+                keys.update(k.value for k in child.value.keys
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str))
+            if isinstance(child, ast.Assign):
+                for tgt in child.targets:
+                    if (isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id in ("out", "_patch", "patch", "update", "result")
+                            and isinstance(tgt.slice, ast.Constant)
+                            and isinstance(tgt.slice.value, str)):
+                        keys.add(tgt.slice.value)
+            _visit(child)
+
+    _visit(fn)
+    return keys
+
+
 def test_node_written_state_keys_are_declared():
     declared = set(BrainState.__annotations__)
     node_fns = _registered_node_fn_names()
     assert node_fns, "graph.py 应能解析出注册节点"
     offenders: dict[str, set[str]] = {}
-    for f in list((_BRAIN / "nodes").glob("*.py")) + [_BRAIN / "runner.py"]:
+    # F7(round28)：旧 glob 只扫 brain/nodes/*.py + runner.py，漏了直属 brain/ 的
+    # planning_nodes.py——tech_design/plan/contract_design 等注册节点就在那里，其写出的
+    # 未声明键（tech_design_generation_failed）被静默丢成死代码却无人拦。扩到 brain/*.py。
+    scanned = list(_BRAIN.glob("*.py")) + list((_BRAIN / "nodes").glob("*.py"))
+    for f in scanned:
         try:
             tree = ast.parse(f.read_text())
         except SyntaxError:
@@ -54,19 +90,7 @@ def test_node_written_state_keys_are_declared():
         for fn in ast.walk(tree):
             if not (isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in node_fns):
                 continue
-            keys: set[str] = set()
-            for x in ast.walk(fn):
-                if isinstance(x, ast.Return) and isinstance(x.value, ast.Dict):
-                    keys.update(k.value for k in x.value.keys
-                                if isinstance(k, ast.Constant) and isinstance(k.value, str))
-                if isinstance(x, ast.Assign):
-                    for tgt in x.targets:
-                        if (isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name)
-                                and tgt.value.id in ("out", "_patch", "patch", "update", "result")
-                                and isinstance(tgt.slice, ast.Constant)
-                                and isinstance(tgt.slice.value, str)):
-                            keys.add(tgt.slice.value)
-            missing = keys - declared - _ALLOWLIST
+            missing = _node_written_keys(fn) - declared - _ALLOWLIST
             if missing:
                 offenders[f"{f.name}:{fn.name}"] = missing
     assert not offenders, (

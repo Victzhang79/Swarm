@@ -70,6 +70,12 @@ _table_ready = False
 _current_task_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "swarm_usage_task", default=None)
 _task_token_totals: dict[str, int] = {}
+# round28：per-task【云端(付费)】token 累计，独立于上面的全量累计。
+# 单任务 token 闸门（store.check_task_token_limit）只该拦【真金白银的云端 $ 消耗】——
+# 本地模型 token = 自建算力(时间)，已由墙钟(task_deadline 21h)+recursion_limit(≤300) 兜住 runaway，
+# 拿它当"任务规模闸门"是把付费成本模型错套到本地(round28 E2E dd7c3489 实测：本地 13.35M 合法消耗
+# 在 4/55 完成度被误杀)。故闸门改读本值(云端专计)，全量值仅留作可观测。
+_task_cloud_totals: dict[str, int] = {}
 
 
 def set_current_task(task_id: str | None) -> None:
@@ -78,19 +84,33 @@ def set_current_task(task_id: str | None) -> None:
 
 
 def get_task_total_tokens(task_id: str) -> int:
-    """该 task 本进程内已记账的真实 token 累计（prompt+completion）。无记录返回 0。"""
+    """该 task 本进程内已记账的真实 token 累计（prompt+completion，含本地+云端）。无记录返回 0。
+
+    用途：可观测/调试的【全量】口径。★token 闸门请用 get_task_cloud_tokens（云端专计）★——
+    见 _task_cloud_totals 注释：本地 token 不该触发 $ 成本闸门。"""
     if not task_id:
         return 0
     with _lock:
         return int(_task_token_totals.get(task_id, 0))
 
 
+def get_task_cloud_tokens(task_id: str) -> int:
+    """该 task 本进程内【云端(付费)】token 累计。无记录返回 0。
+
+    单任务 token 硬上限闸门的唯一依据：只有云端消耗是真金白银，本地消耗(自建算力)由墙钟兜底。"""
+    if not task_id:
+        return 0
+    with _lock:
+        return int(_task_cloud_totals.get(task_id, 0))
+
+
 def clear_task_total(task_id: str) -> None:
-    """任务执行段结束后清理 per-task 累计（防长进程内存累积）。"""
+    """任务执行段结束后清理 per-task 累计（防长进程内存累积）。全量与云端两本账一并清。"""
     if not task_id:
         return
     with _lock:
         _task_token_totals.pop(task_id, None)
+        _task_cloud_totals.pop(task_id, None)
 
 
 def _pool():
@@ -164,6 +184,9 @@ def record(project_id: str | None, kind: str, provider_id: str, model: str,
         _tid = _current_task_var.get()
         if _tid:
             _task_token_totals[_tid] = _task_token_totals.get(_tid, 0) + p + c
+            # round28：云端(付费)专计——单任务 token 闸门只拦真金白银的 $ 消耗，本地算力不计。
+            if k == "cloud":
+                _task_cloud_totals[_tid] = _task_cloud_totals.get(_tid, 0) + p + c
     _start_flusher()
 
 

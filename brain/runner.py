@@ -274,6 +274,41 @@ _TOKEN_GATE_NODES = (
 )
 
 
+def _plan_subtask_ids(state: dict[str, Any]) -> set | None:
+    """当前 plan 的子任务 id 集合（plan 对象或 dict 两态）。无 plan/无子任务返回 None。"""
+    _plan_obj = state.get("plan")
+    if _plan_obj is None:
+        return None
+    _subs = getattr(_plan_obj, "subtasks", None)
+    if _subs is None and isinstance(_plan_obj, dict):
+        _subs = _plan_obj.get("subtasks")
+    if not _subs:
+        return None
+    return {
+        (getattr(s, "id", None) if not isinstance(s, dict) else s.get("id"))
+        for s in _subs
+    }
+
+
+def _count_completed_in_plan(state: dict[str, Any]) -> int:
+    """当前 plan 内且 L1 通过的已完成子任务数 —— completed 语义单一事实源。
+
+    治本(task 1bc867a1)：不能用 len(subtask_results)——它累积跨 replan/retry/rebase 的全部
+    结果（含失败 + 重生成变体 + 已不在当前 plan 的旧 id），必然 > 当前 plan 的 subtask_count。
+    正确语义 = 【在当前 plan 内 且 L1 通过】。_sync_task_from_state（进度分母）与 T-B token 超限
+    抢救（判 PARTIAL vs FAILED）共用此口径，杜绝两处对"已完成多少"的判断漂移。
+    """
+    subtask_results = state.get("subtask_results")
+    if not isinstance(subtask_results, dict):
+        return 0
+    from swarm.brain.nodes.shared import l1_passed as _passed
+
+    plan_ids = _plan_subtask_ids(state)
+    if plan_ids:
+        return sum(1 for sid, out in subtask_results.items() if sid in plan_ids and _passed(out))
+    return sum(1 for out in subtask_results.values() if _passed(out))
+
+
 def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
     """将 Brain 状态片段写回 task_records"""
     updates: dict[str, Any] = {}
@@ -295,29 +330,9 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
             subtasks = plan_dict.get("subtasks") or []
             updates["subtask_count"] = len(subtasks)
 
-    subtask_results = state.get("subtask_results")
-    if isinstance(subtask_results, dict):
-        # 治本(task 1bc867a1：concept 概览 completed 35 > count 34)：completed 不能用
-        # len(subtask_results)——它累积了跨 replan/retry/rebase 的【全部】结果（含失败结果 +
-        # st-N-2 重生成变体 + 已不在当前 plan 的旧 id），必然 > 当前 plan 的 subtask_count。
-        # 正确语义 = 【在当前 plan 内 且 L1 通过】的子任务数；并夹紧到 subtask_count 兜底。
-        from swarm.brain.nodes.shared import l1_passed as _passed
-
-        plan_ids: set | None = None
-        _plan_obj = state.get("plan")
-        if _plan_obj is not None:
-            _subs = getattr(_plan_obj, "subtasks", None)
-            if _subs is None and isinstance(_plan_obj, dict):
-                _subs = _plan_obj.get("subtasks")
-            if _subs:
-                plan_ids = {
-                    (getattr(s, "id", None) if not isinstance(s, dict) else s.get("id"))
-                    for s in _subs
-                }
-        if plan_ids:
-            done = sum(1 for sid, out in subtask_results.items() if sid in plan_ids and _passed(out))
-        else:
-            done = sum(1 for out in subtask_results.values() if _passed(out))
+    if isinstance(state.get("subtask_results"), dict):
+        # completed 语义单一事实源见 _count_completed_in_plan（当前 plan 内且 L1 通过）。
+        done = _count_completed_in_plan(state)
         _cnt = updates.get("subtask_count")
         if isinstance(_cnt, int) and done > _cnt:
             done = _cnt  # 兜底夹紧：completed 永不超过 subtask_count
@@ -330,6 +345,7 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
             set(state.get("abandoned_subtask_ids") or [])
             | set(state.get("give_up_isolated_ids") or [])
         )
+        plan_ids = _plan_subtask_ids(state)
         if plan_ids:
             _ab = sum(1 for sid in _abandoned_ids if sid in plan_ids)
         else:
@@ -822,6 +838,135 @@ def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     return output_parts
 
 
+async def _load_state_snapshot(task_id: str) -> dict[str, Any] | None:
+    """读任务 LangGraph 实时快照的 state values（纯读，不推进图）。取不到返回 None。
+
+    与 get_pending_interrupt 同构：token 超限从 dispatch/merge 等节点 end raise 时，该节点已
+    完成并被 checkpoint → 此处能取回含已完成子任务产物的 state，供 PARTIAL 抢救判定。
+    """
+    from swarm.tracing import brain_graph_config
+
+    graph = get_compiled_brain_graph()
+    task_rec = store.get_task(task_id) or {}
+    thread_id = task_rec.get("thread_id") or task_id
+    _plan_rec = task_rec.get("plan")
+    _subtask_n = None
+    if isinstance(_plan_rec, dict):
+        _subs = _plan_rec.get("subtasks")
+        _subtask_n = len(_subs) if isinstance(_subs, list) else None
+    config = brain_graph_config(
+        task_id=task_id,
+        project_id=task_rec.get("project_id") or "",
+        thread_id=thread_id,
+        resume=False,
+        description=(task_rec.get("description") or "")[:200],
+        complexity=task_rec.get("complexity"),
+        subtask_count=_subtask_n,
+    )
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — 读快照失败按"取不到"处理，退回 FAILED 兜底
+        logger.warning("[RUNNER] 任务 %s 读 checkpoint 快照失败: %s", task_id, exc)
+        return None
+    if not snapshot or not getattr(snapshot, "values", None):
+        return None
+    return dict(snapshot.values)
+
+
+async def _finalize_governor_partial(
+    task_id: str,
+    state: dict[str, Any],
+    queue: _FanoutTopic,
+    *,
+    reason_code: str,
+    reason_msg: str,
+) -> str:
+    """资源护栏（token 预算/…）中止后的终态归一化：有已完成产物→PARTIAL 抢救，无→FAILED。
+
+    T-B（round28）：token 闸门在 dispatch/merge 等 9 个节点 end raise TaskTokenLimitExceeded，
+    旧路径冒泡到泛 except → 无脑 FAILED，跳过 PARTIAL 组装 → 已 L1 通过、真实落盘/合并的子任务
+    产物被整单丢弃（round28 实测 4/55 撞闸丢完整 ruoyi-alarm 模块）。云端预算是【成本护栏】而非
+    交付失败，绝不该连坐丢已产出工作。判据 = 当前 plan 内 L1 通过的完成数（单一事实源
+    _count_completed_in_plan）：>0 → 诚实 PARTIAL（列明因预算中止、余下需重跑续做，可 retry）；
+    =0 → 仍 FAILED（无可抢救产物，不伪造 PARTIAL）。返回最终 status。
+    """
+    _rec = store.get_task(task_id) or {}
+    # 先持久化已推进的 plan/completed 计数（与正常路径同源，保证 WebUI 分母/进度不回退）。
+    try:
+        _sync_task_from_state(task_id, state)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RUNNER] 任务 %s 抢救前回写 state 失败（不阻断终态判定）: %s", task_id, exc)
+
+    completed = _count_completed_in_plan(state)
+    if completed <= 0:
+        store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, _rec, "FAILED")
+        audit("task_failed", orchestrator="Brain", task_id=task_id,
+              project_id=_rec.get("project_id"), error=f"{reason_code}: 无已完成子任务可交付"[:300])
+        await _emit(queue, {
+            "step": "error", "status": "error",
+            "message": f"{reason_msg}；无已完成子任务可交付，任务失败",
+            "mode": "brain", "progress": -1,
+        })
+        return "FAILED"
+
+    token_usage = store.estimate_token_usage(
+        description=_rec.get("description") or state.get("task_description") or "",
+        merged_diff=state.get("merged_diff") or "",
+        subtask_results=state.get("subtask_results"),
+    )
+    duration = store.compute_task_duration_seconds(_rec)
+    store.update_task(
+        task_id,
+        status="PARTIAL",
+        token_usage=token_usage,
+        duration_seconds=round(duration, 2) if duration is not None else None,
+    )
+    _emit_task_notification(task_id, _rec, "PARTIAL")
+    audit("task_partial", orchestrator="Brain", task_id=task_id,
+          project_id=_rec.get("project_id"),
+          error=f"{reason_code}: 抢救 {completed} 个已完成子任务为部分交付"[:300])
+    logger.warning("[RUNNER] 任务 %s %s → 抢救 %d 个已完成子任务为 PARTIAL（余下未完成，可重跑续做）",
+                   task_id, reason_code, completed)
+    await _emit(queue, {
+        "step": "complete", "status": "partial",
+        "message": (f"{reason_msg}；已抢救 {completed} 个已完成子任务(真实落盘)为部分交付，"
+                    f"余下未完成，重跑可续做"),
+        "mode": "brain", "progress": 100,
+    })
+    await _emit(queue, {"step": "result", "mode": "brain", "result": _build_result_payload(state)})
+    return "PARTIAL"
+
+
+async def _salvage_partial_from_checkpoint(
+    task_id: str,
+    queue: _FanoutTopic,
+    *,
+    reason_code: str,
+    reason_msg: str,
+) -> None:
+    """资源护栏中止的统一抢救入口：取 checkpoint state → _finalize_governor_partial。
+
+    checkpoint 取不到（PG 抖动/无快照）→ 退回 FAILED（不比旧路径更差，但绝不静默 DONE）。
+    """
+    state = await _load_state_snapshot(task_id)
+    if not state:
+        _rec = store.get_task(task_id) or {}
+        store.update_task(task_id, status="FAILED")
+        _emit_task_notification(task_id, _rec, "FAILED")
+        audit("task_failed", orchestrator="Brain", task_id=task_id,
+              project_id=_rec.get("project_id"), error=f"{reason_code}: checkpoint 不可读"[:300])
+        await _emit(queue, {
+            "step": "error", "status": "error",
+            "message": f"{reason_msg}；无法读取执行快照抢救产物，任务失败",
+            "mode": "brain", "progress": -1,
+        })
+        return
+    await _finalize_governor_partial(
+        task_id, state, queue, reason_code=reason_code, reason_msg=reason_msg,
+    )
+
+
 async def run_task(
     task_id: str,
     project_id: str,
@@ -970,6 +1115,15 @@ async def run_task(
             "message": "任务已取消",
             "progress": -1,
         })
+    except TaskTokenLimitExceeded as _tok_exc:
+        # T-B：撞【云端 token 预算】护栏 ≠ 交付失败 → 抢救已完成子任务为 PARTIAL，不整单丢产物。
+        logger.warning("[RUNNER] 任务 %s 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
+        await _salvage_partial_from_checkpoint(
+            task_id, queue,
+            reason_code="token_budget_exceeded",
+            reason_msg=(f"云端 token 预算超限 "
+                        f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
+        )
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1098,6 +1252,15 @@ async def resume_task(
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
         raise
+    except TaskTokenLimitExceeded as _tok_exc:
+        # T-B：resume 途中撞云端 token 预算护栏同样抢救 PARTIAL（与 run_task 对齐）。
+        logger.warning("[RUNNER] 任务 %s resume 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
+        await _salvage_partial_from_checkpoint(
+            task_id, queue,
+            reason_code="token_budget_exceeded",
+            reason_msg=(f"云端 token 预算超限 "
+                        f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
+        )
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1202,6 +1365,16 @@ async def resume_planning(
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
         raise
+    except TaskTokenLimitExceeded as _tok_exc:
+        # T-B：规划 resume 撞云端 token 预算护栏——规划期多无完成子任务 → 抢救逻辑自然落 FAILED，
+        # 若已有完成产物（少见）则同样保为 PARTIAL。与 run_task/resume_task 对齐，不走裸 FAILED。
+        logger.warning("[RUNNER] 任务 %s 规划 resume 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
+        await _salvage_partial_from_checkpoint(
+            task_id, queue,
+            reason_code="token_budget_exceeded",
+            reason_msg=(f"云端 token 预算超限 "
+                        f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
         store.update_task(task_id, status="FAILED")

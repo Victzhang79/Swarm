@@ -97,12 +97,45 @@ def _migration_v3_base_commit(conn) -> None:
         )
 
 
+def _migration_v4_token_hash(conn) -> None:
+    """v4（F1，round28 安全 P1）：swarm_users.api_token 明文 → SHA256 at-rest 哈希。
+
+    根因：明文存库 + `WHERE api_token=%s` 查——DB 转储即全体长期凭据泄露。治本：加 token_hash
+    列（UNIQUE 查找键，只对非空建【部分唯一索引】以容忍回填期/新铸的多个 NULL），把既有明文
+    回填为 SHA256 并【清空 api_token 明文】。既有 token 不失效——中间层 get_user_by_token 改为
+    先 hash 再查，回填后原明文经同一 hash 仍命中。回填在 Python 侧算 SHA256（不依赖 pgcrypto）。
+    与 _stamp 同事务（runner 保证），全成或回滚。
+    """
+    from swarm.auth.passwords import hash_token
+
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS token_hash TEXT")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_swarm_users_token_hash "
+            "ON swarm_users(token_hash) WHERE token_hash IS NOT NULL"
+        )
+        # 回填既有明文行：token_hash 为空且 api_token 非空。
+        cur.execute(
+            "SELECT id, api_token FROM swarm_users "
+            "WHERE api_token IS NOT NULL AND token_hash IS NULL"
+        )
+        rows = cur.fetchall()
+        for uid, plaintext in rows:
+            cur.execute(
+                "UPDATE swarm_users SET token_hash=%s, api_token=NULL WHERE id=%s",
+                (hash_token(plaintext), uid),
+            )
+    if rows:
+        logger.info("[migrations] v4：回填 %d 个明文 token 为 SHA256 并清空明文", len(rows))
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
     (3, "add_base_commit", _migration_v3_base_commit),
+    (4, "hash_api_tokens", _migration_v4_token_hash),
     # 未来迁移在此追加，例如:
-    # (4, "add_xxx_column", _migration_add_xxx_column),
+    # (5, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1

@@ -25,3 +25,16 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def generate_api_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def hash_token(token: str) -> str:
+    """API token 的 at-rest 哈希（F1，round28）。
+
+    token 由 generate_api_token() 产 = secrets.token_urlsafe(32) = 256bit 高熵随机，
+    暴力枚举不可行 → 用快速 SHA256（不需要 PBKDF2 那种抗爆破慢哈希，那是给低熵口令的）。
+    存 hash 而非明文：DB 转储/泄露不再等同长期凭据泄露；服务端只在【铸造时】见明文一次。
+    十六进制定长 64 字符，作 token_hash 列（UNIQUE）查找键。空 token → 空串（调用方须先判空）。
+    """
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

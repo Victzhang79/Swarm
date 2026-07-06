@@ -1,7 +1,7 @@
 """D1：SSE 凭据经 HttpOnly Cookie（避免 ?token= 进 URL 致跨用户泄漏）。
 
-行为测试：_extract_token 的优先级(header > cookie > ?token=)，与 /api/auth/login 下发
-HttpOnly Cookie。
+行为测试：_extract_token 的优先级(header > cookie；F1 起 ?token= 已关闭)，与
+/api/auth/login 下发 HttpOnly Cookie。
 """
 from __future__ import annotations
 
@@ -26,14 +26,16 @@ def test_header_beats_cookie():
     assert _extract_token(r) == "hdr"
 
 
-def test_cookie_beats_query_token():
-    # Cookie(HttpOnly,不进 URL)优先于遗留 ?token=(进 access log/历史)
+def test_cookie_used_over_query_token():
+    # F1：?token= 已关闭，即便同时给 query，也只认 Cookie。
     r = _Req(cookies={"swarm_token": "cookie-tok"}, query={"token": "qtok"})
     assert _extract_token(r) == "cookie-tok"
 
 
-def test_query_token_still_fallback():
-    assert _extract_token(_Req(query={"token": "qtok"})) == "qtok"
+def test_query_token_no_longer_honored():
+    # F1 治本：?token= URL 兜底已移除（进 access log/Referer/历史 = 跨用户凭据泄漏面）。
+    # 只有 query token 而无 header/cookie → 视为无凭据（空串），中间件将判 401。
+    assert _extract_token(_Req(query={"token": "qtok"})) == ""
 
 
 def test_bearer_header_beats_all():

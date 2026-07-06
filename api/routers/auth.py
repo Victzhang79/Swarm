@@ -146,19 +146,22 @@ async def auth_login(req: LoginRequest, request: Request, response: Response):
     must_change = await loop.run_in_executor(
         None, lambda: get_must_change_password(user.id)
     )
-    # W3.1：按配置 TTL 刷新 token 有效期（滑动续期），并回传 expires_at 供前端到期提示。
-    # token_ttl_hours=0 时返回 None（永不过期），保持既有行为。
-    from swarm.auth.store import set_token_expiry
+    # F1：token hash-at-rest 后服务端不再存明文，登录必须【铸造新 token】才能把明文交给客户端。
+    # 轮换即产生新明文（旧 token 随之失效——安全正向），下发 Cookie/响应体的都是这个新明文。
+    from swarm.auth.store import rotate_user_token, set_token_expiry
     from swarm.config.settings import get_config
 
+    new_token = await loop.run_in_executor(None, lambda: rotate_user_token(user.id))
+    # W3.1：按配置 TTL 刷新 token 有效期（滑动续期），并回传 expires_at 供前端到期提示。
+    # token_ttl_hours=0 时返回 None（永不过期），保持既有行为。轮换已清 revoked，此处设 expiry。
     ttl_hours = get_config().token_ttl_hours
     expires_at = await loop.run_in_executor(
         None, lambda: set_token_expiry(user.id, ttl_hours)
     )
     # D1：HttpOnly Cookie 下发 token（JS 读不到 → 不受 XSS 窃取、不进 URL）。见 _issue_token_cookie。
-    _issue_token_cookie(response, request, user.api_token)
+    _issue_token_cookie(response, request, new_token)
     return {
-        "token": user.api_token,
+        "token": new_token,
         "must_change_password": must_change,
         "expires_at": expires_at,  # ISO8601 或 null(永不过期)
         "token_ttl_hours": ttl_hours,
@@ -236,8 +239,11 @@ async def auth_me(request: Request, response: Response):
     # D1：boot/自动登录路径（前端启动即调 /api/auth/me 校验 localStorage token）顺带【续发】
     # HttpOnly Cookie，使 SSE cookie 鉴权在浏览器重启丢失【会话 Cookie】(ttl=0)后仍可用——否则
     # localStorage token 永不过期但会话 Cookie 已失效 → SSE 401、REST 却仍靠 header 通，割裂。
-    # 仅对持 api_token 的真实用户续发；legacy/无 token 用户跳过（其经 header 鉴权，无需 Cookie）。
-    _tok = getattr(user, "api_token", "") or ""
+    # F1：token hash-at-rest 后 user.api_token 恒 NULL（服务端不再存明文）。改从【本次请求携带的
+    # token】续发 Cookie——客户端已持有明文（Bearer header 或既有 Cookie），此处只是刷新 Cookie
+    # 传输层，不铸新、不触碰库。无 token（legacy api-key/无凭据）则跳过。
+    from swarm.api.auth import _extract_token
+    _tok = _extract_token(request)
     if _tok:
         _issue_token_cookie(response, request, _tok)
     return {
@@ -304,6 +310,26 @@ async def create_user_api(request: Request, req: CreateUserRequest):
         "global_role": user.global_role,
         "token": user.api_token,
     }
+
+
+@router.post("/api/users/{user_id}/revoke-token", tags=["认证"])
+async def revoke_token_api(user_id: str, request: Request):
+    """F9：吊销指定用户的 API token（泄露应急）。需全局 admin。
+
+    `revoke_user_token`（auth/store.py）此前已实现但无路由触发——补上端点让"泄露即失效"能力可用。
+    吊销后该 token 立即认证失败；合法用户重新登录会轮换出新 token（F1）并自动清除 revoked 标志。
+    """
+    caller = _require_perm(request, "config:write")
+    # 吊销他人凭据是高权操作：要求调用方本身是全局 admin（与铸造特权用户同规格）。
+    if str(getattr(caller, "global_role", "")).lower() != "admin":
+        raise HTTPException(status_code=403, detail="Only a global admin may revoke tokens")
+    from swarm.auth.store import revoke_user_token
+
+    loop = asyncio.get_running_loop()
+    revoked = await loop.run_in_executor(None, lambda: revoke_user_token(user_id))
+    if not revoked:
+        raise HTTPException(status_code=404, detail="用户不存在或无可吊销的 token")
+    return {"user_id": user_id, "revoked": True}
 
 
 @router.get("/api/projects/{project_id}/members", tags=["认证"])

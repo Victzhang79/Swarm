@@ -31,10 +31,11 @@ def test_record_increments_per_task_counter():
 
 
 def test_limit_uses_real_recorded_over_estimate(monkeypatch):
-    """真实累计 >> 估算且超限 → 判超（不再被 len//4 低估绕过）。"""
+    """真实【云端】累计 >> 估算且超限 → 判超（不再被 len//4 低估绕过）。
+    round28：闸门依据从全量累计改为云端(付费)专计——本测试相应把桩数据置于云端本账。"""
     usage_tracker.clear_task_total("t-b2")
     with usage_tracker._lock:
-        usage_tracker._task_token_totals["t-b2"] = 999_999
+        usage_tracker._task_cloud_totals["t-b2"] = 999_999
     monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
     fake_cfg = MagicMock(); fake_cfg.max_task_tokens = 1000
     monkeypatch.setattr("swarm.config.settings.get_config", lambda: fake_cfg)
@@ -45,6 +46,51 @@ def test_limit_uses_real_recorded_over_estimate(monkeypatch):
         assert usage.get("total") == 999_999, usage
     finally:
         usage_tracker.clear_task_total("t-b2")
+
+
+def test_local_tokens_do_not_gate(monkeypatch):
+    """round28 治本回归：本地模型 token=自建算力(时间)，不该触发付费成本闸门。
+    实测 dd7c3489 本地 13.35M 合法消耗在 4/55 完成度被误杀——此后本地累计不参与判定，
+    云端本账为 0 → 即便远超 base 也放行（runaway 由墙钟/recursion 兜）。"""
+    usage_tracker.clear_task_total("t-b2-local")
+    usage_tracker.set_current_task("t-b2-local")
+    try:
+        # 记 13.35M 纯本地 token（复现 round28 用量量级）
+        usage_tracker.record("p", "local", "prov", "m",
+                             prompt_tokens=13_000_000, completion_tokens=350_000)
+        monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
+        fake_cfg = MagicMock()
+        fake_cfg.max_task_tokens = 500_000
+        fake_cfg.max_task_tokens_per_subtask = 150_000
+        monkeypatch.setattr("swarm.config.settings.get_config", lambda: fake_cfg)
+        ok, usage = store.check_task_token_limit("t-b2-local", description="x", subtask_count=55)
+        assert ok is True, usage                          # 不再误杀
+        assert usage.get("real_recorded") == 0, usage     # 云端本账为 0
+        assert usage.get("real_recorded_all") == 13_350_000, usage  # 全量可观测仍在
+    finally:
+        usage_tracker.set_current_task(None)
+        usage_tracker.clear_task_total("t-b2-local")
+
+
+def test_cloud_tokens_do_gate(monkeypatch):
+    """对偶：云端(付费)真实消耗超限仍拦——$ 成本闸门对云端 fallback 有效。"""
+    usage_tracker.clear_task_total("t-b2-cloud")
+    usage_tracker.set_current_task("t-b2-cloud")
+    try:
+        usage_tracker.record("p", "cloud", "siliconflow", "m",
+                             prompt_tokens=900_000, completion_tokens=200_000)
+        monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
+        fake_cfg = MagicMock()
+        fake_cfg.max_task_tokens = 500_000
+        fake_cfg.max_task_tokens_per_subtask = 150_000
+        monkeypatch.setattr("swarm.config.settings.get_config", lambda: fake_cfg)
+        # 2 子任务 → 500k+300k=800k < 1.1M 云端真实 → 拦
+        ok, usage = store.check_task_token_limit("t-b2-cloud", description="x", subtask_count=2)
+        assert ok is False, usage
+        assert usage.get("real_recorded") == 1_100_000, usage
+    finally:
+        usage_tracker.set_current_task(None)
+        usage_tracker.clear_task_total("t-b2-cloud")
 
 
 def test_limit_ok_when_under(monkeypatch):
@@ -77,7 +123,7 @@ def test_limit_elastic_per_subtask(monkeypatch):
     有效上限 = base + per_subtask×子任务数。规划前（subtask_count=0/None）退回 base。"""
     usage_tracker.clear_task_total("t-b2e")
     with usage_tracker._lock:
-        usage_tracker._task_token_totals["t-b2e"] = 826_413  # 实测规划期真实累计
+        usage_tracker._task_cloud_totals["t-b2e"] = 826_413  # 实测规划期真实【云端】累计
     monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
     fake_cfg = MagicMock()
     fake_cfg.max_task_tokens = 500_000
@@ -101,7 +147,7 @@ def test_limit_zero_base_disables_gate(monkeypatch):
     """base=0 维持既有"关闭闸门"语义（弹性项不改变该开关）。"""
     usage_tracker.clear_task_total("t-b2f")
     with usage_tracker._lock:
-        usage_tracker._task_token_totals["t-b2f"] = 99_999_999
+        usage_tracker._task_cloud_totals["t-b2f"] = 99_999_999
     monkeypatch.setattr(store, "update_task", lambda *a, **k: None)
     fake_cfg = MagicMock()
     fake_cfg.max_task_tokens = 0

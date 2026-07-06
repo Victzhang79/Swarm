@@ -7,11 +7,20 @@
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 # 服务端 batch 上限（ai.bit:8082 bge-m3 = 32）。超过需分批，否则 422。
 _MAX_BATCH = 32
+
+# F10c：批级重试次数。契约 len(out)==len(texts) 要求全对齐，故任一批永久失败仍须整次放弃(return
+# None)；但【transient 抖动】(网络瞬断/服务 5xx)不该让已成功的前若干批全部作废重算——先就地重试。
+_BATCH_RETRIES = 3
+
+
+def _batch_backoff_sleep(attempt: int) -> None:
+    time.sleep(0.5 * (attempt + 1))
 
 
 def _endpoint() -> tuple[str, str, str, int] | None:
@@ -61,22 +70,36 @@ def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:
         out: list[list[float]] = []
         for i in range(0, len(texts), max_batch):
             batch = texts[i: i + max_batch]
-            resp = requests.post(
-                f"{base}/embeddings",
-                json={"model": model, "input": batch},
-                headers=headers,
-                timeout=120,
-            )
-            if resp.status_code != 200:
-                logger.warning("embed 服务返回异常 status=%s (batch %d)", resp.status_code, i // _MAX_BATCH)
-                return None
-            _payload = resp.json()
-            vecs = [d["embedding"] for d in _payload.get("data", [])]
-            if len(vecs) != len(batch):
-                logger.warning("embed 返回数量不符: %d != %d", len(vecs), len(batch))
+            vecs = None
+            last_err = ""
+            for attempt in range(_BATCH_RETRIES):
+                try:
+                    resp = requests.post(
+                        f"{base}/embeddings",
+                        json={"model": model, "input": batch},
+                        headers=headers,
+                        timeout=120,
+                    )
+                    if resp.status_code != 200:
+                        last_err = f"status={resp.status_code}"
+                    else:
+                        _payload = resp.json()
+                        cand = [d["embedding"] for d in _payload.get("data", [])]
+                        if len(cand) == len(batch):
+                            vecs = cand
+                            _record_embed_usage(model, base, batch, _payload.get("usage"))
+                            break
+                        last_err = f"数量不符 {len(cand)}!={len(batch)}"
+                except Exception as exc:  # noqa: BLE001 — 批内瞬时错误，进入重试
+                    last_err = str(exc)
+                if attempt < _BATCH_RETRIES - 1:
+                    _batch_backoff_sleep(attempt)
+            if vecs is None:
+                # F10c：批级重试耗尽才放弃整次（契约 len==len 需全对齐）；transient 抖动不再丢弃已成功批。
+                logger.warning("embed 批 %d 重试 %d 次仍失败，放弃整次: %s",
+                               i // max_batch, _BATCH_RETRIES, last_err)
                 return None
             out.extend(vecs)
-            _record_embed_usage(model, base, batch, _payload.get("usage"))
         return out if out else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("embed 服务(sync)调用失败: %s", exc)
@@ -94,22 +117,38 @@ async def embed_texts_async(texts: list[str]) -> list[list[float]] | None:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        import asyncio
         out: list[list[float]] = []
         async with httpx.AsyncClient(timeout=60.0) as client:
             for i in range(0, len(texts), max_batch):
                 batch = texts[i: i + max_batch]
-                resp = await client.post(
-                    f"{base}/embeddings",
-                    json={"model": model, "input": batch},
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                _payload = resp.json()
-                vecs = [d["embedding"] for d in _payload.get("data", [])]
-                if len(vecs) != len(batch):
+                vecs = None
+                last_err = ""
+                for attempt in range(_BATCH_RETRIES):
+                    try:
+                        resp = await client.post(
+                            f"{base}/embeddings",
+                            json={"model": model, "input": batch},
+                            headers=headers,
+                        )
+                        resp.raise_for_status()
+                        _payload = resp.json()
+                        cand = [d["embedding"] for d in _payload.get("data", [])]
+                        if len(cand) == len(batch):
+                            vecs = cand
+                            _record_embed_usage(model, base, batch, _payload.get("usage"))
+                            break
+                        last_err = f"数量不符 {len(cand)}!={len(batch)}"
+                    except Exception as exc:  # noqa: BLE001 — 批内瞬时错误，进入重试
+                        last_err = str(exc)
+                    if attempt < _BATCH_RETRIES - 1:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                if vecs is None:
+                    # F10c：批级重试耗尽才放弃整次；transient 抖动不再丢弃已成功批。
+                    logger.warning("embed(async) 批 %d 重试 %d 次仍失败，放弃整次: %s",
+                                   i // max_batch, _BATCH_RETRIES, last_err)
                     return None
                 out.extend(vecs)
-                _record_embed_usage(model, base, batch, _payload.get("usage"))
         return out if out else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("embed 服务(async)调用失败: %s", exc)

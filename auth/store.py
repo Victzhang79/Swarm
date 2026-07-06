@@ -10,7 +10,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from swarm.auth.passwords import generate_api_token, hash_password, verify_password
+from swarm.auth.passwords import generate_api_token, hash_password, hash_token, verify_password
 from swarm.auth.rbac import Role, can, effective_project_role
 from swarm.config.settings import DatabaseConfig
 
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS swarm_users (
     username        TEXT UNIQUE NOT NULL,
     display_name    TEXT,
     password_hash   TEXT,
-    api_token       TEXT UNIQUE,
+    api_token       TEXT UNIQUE,          -- F1：已弃用明文列（新库恒 NULL）；查找改走 token_hash
+    token_hash      TEXT,                 -- F1：SHA256(api_token) at-rest 哈希，唯一性由 idx_swarm_users_token_hash 部分唯一索引保证（迁移 v4 建）
     global_role     TEXT NOT NULL DEFAULT 'developer',
     must_change_password BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ DEFAULT now(),
@@ -235,23 +236,27 @@ def create_user(
     user_id = str(uuid.uuid4())
     token = api_token or generate_api_token()
     pwd_hash = hash_password(password) if password else None
+    # F1：只存 SHA256(token)，明文 api_token 列写 NULL（不落盘）。明文仅经返回值给调用方一次。
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO swarm_users (id, username, display_name, password_hash, api_token, global_role, must_change_password)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO swarm_users (id, username, display_name, password_hash, api_token, token_hash, global_role, must_change_password)
+                VALUES (%s, %s, %s, %s, NULL, %s, %s, %s)
                 RETURNING id, username, display_name, global_role, api_token, must_change_password
                 """,
-                (user_id, username, display_name, pwd_hash, token, global_role, must_change_password),
+                (user_id, username, display_name, pwd_hash, hash_token(token), global_role, must_change_password),
             )
             row = cur.fetchone()
-    return _row_to_user(row)
+    user = _row_to_user(row)      # row 的 api_token 为 NULL
+    user.api_token = token         # 一次性明文交给调用方（登录/创建响应），此后不再可得
+    return user
 
 
 def get_user_by_token(token: str, conn_str: str | None = None) -> SwarmUser | None:
     if not token:
         return None
+    # F1：按 SHA256(token) 查（不再明文比对）——明文只在传输层（Bearer/Cookie）出现，库里存 hash。
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:
             # P0-SEC-01：吊销/过期的 token 不予认证（expires_at IS NULL = 永不过期，兼容既有 token）。
@@ -259,14 +264,33 @@ def get_user_by_token(token: str, conn_str: str | None = None) -> SwarmUser | No
                 """
                 SELECT id, username, display_name, global_role, api_token, must_change_password
                 FROM swarm_users
-                WHERE api_token = %s
+                WHERE token_hash = %s
                   AND token_revoked = false
                   AND (token_expires_at IS NULL OR token_expires_at > now())
                 """,
-                (token,),
+                (hash_token(token),),
             )
             row = cur.fetchone()
     return _row_to_user(row) if row else None
+
+
+def rotate_user_token(user_id: str, conn_str: str | None = None) -> str:
+    """F1：为用户铸造新 API token（登录时调用），只落 SHA256，返回一次性明文。
+
+    单 token 模型下登录必须轮换——因为明文不再存库、服务端无法再"取回"旧 token 交给客户端。
+    代价：同一用户在别处已缓存的旧 token 随之失效（安全正向，旧会话被切断；CLI 重新 login 自动
+    重缓存）。顺带清 token_revoked（重新登录成功即恢复该用户 token 可用性）。
+    """
+    token = generate_api_token()
+    with _pooled_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE swarm_users SET token_hash = %s, api_token = NULL, "
+                "token_revoked = false, updated_at = now() WHERE id = %s",
+                (hash_token(token), user_id),
+            )
+        conn.commit()
+    return token
 
 
 def set_token_expiry(

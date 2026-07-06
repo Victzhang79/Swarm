@@ -1811,15 +1811,21 @@ def check_task_token_limit(
     )
     # B2 治本：用【真实累计】(usage_tracker per-task 记账) 与估算取 max——真实值主导，
     # 估算作 floor 兜底（真实记账可能漏 embed/rerank 之外的边角，但主 LLM 用量已入账）。
+    # round28 治本：闸门只拦【云端(付费)】真实消耗——本地模型 token=自建算力(时间)，已由墙钟
+    # (task_deadline 21h)+recursion_limit(≤300) 兜住 runaway；把付费成本闸门套到本地是错配
+    # (E2E dd7c3489 实测本地 13.35M 合法消耗在 4/55 完成度被误杀)。全量值仅留作可观测。
     est_total = int(usage.get("total") or 0)
     try:
         from swarm.models import usage_tracker
-        real_total = usage_tracker.get_task_total_tokens(task_id)
+        real_total = usage_tracker.get_task_cloud_tokens(task_id)      # 云端专计=闸门依据
+        real_all = usage_tracker.get_task_total_tokens(task_id)        # 全量(含本地)=可观测
     except Exception:  # noqa: BLE001
         real_total = 0
+        real_all = 0
     total = max(est_total, real_total)
     usage["estimate_total"] = est_total
-    usage["real_recorded"] = real_total
+    usage["real_recorded"] = real_total          # 云端(付费)累计——闸门依据
+    usage["real_recorded_all"] = real_all        # 全量(本地+云端)——仅可观测，不参与判定
     usage["total"] = total
     usage["estimate"] = real_total <= est_total
     _cfg = get_config()

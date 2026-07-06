@@ -1339,12 +1339,19 @@ def _store_vectors_qdrant(
 
     # #2：prune——全部新向量落盘后，删本项目【非本代际】的残留旧向量。
     # 仅在新数据就位后执行，故检索全程有数据（无空窗）；崩在 upsert 中途则不 prune，
-    # 留待下次全量重建幂等收敛。symbols 为空(total=0)时本删除即清空本项目向量（符合"重建为空"语义）。
+    # 留待下次全量重建幂等收敛。symbols 为空(total=0)时本删除即清空本项目【CodeGraph 代际】向量。
+    # ★F2 治本★：prune 必须限定 index_source=CODEGRAPH——否则"project_id 且 非本代际"会连带删掉
+    # 【增量语义路径(semantic)刚写入的 chunk】(它们代际不同、index_source 不同)，造成增量索引被
+    # 全量重建静默清空（并发/交错时尤甚）。限定来源后，全量重建只回收自己这一路的旧代际残留，
+    # 与增量路径在同集合内井水不犯河水（两路 make_point_id 一致仍可互相幂等去重）。
     client.delete(
         collection_name=collection_name,
         points_selector=FilterSelector(
             filter=Filter(
-                must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))],
+                must=[
+                    FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+                    FieldCondition(key="index_source", match=MatchValue(value=INDEX_SOURCE_CODEGRAPH)),
+                ],
                 must_not=[FieldCondition(
                     key="index_generation", match=MatchValue(value=_index_generation)
                 )],

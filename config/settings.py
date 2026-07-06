@@ -660,7 +660,10 @@ class AppConfig(BaseSettings):
     token_ttl_hours: int = 0  # SWARM_TOKEN_TTL_HOURS
     # 遗留单 Key（非空且与 user token 匹配时视为 admin）
     api_key: str = ""
-    max_task_tokens: int = 500_000  # 单任务 token 硬上限【基线】（P1；0=关闭闸门）
+    # round28：本闸门只拦【云端(付费)】真实消耗（store.check_task_token_limit 读 usage_tracker
+    # 云端专计）——本地模型 token=自建算力(时间)，runaway 由墙钟(下方 task_deadline)+recursion_limit
+    # 兜底，不计入本预算（实测本地 13.35M 合法消耗曾被误杀）。故下列数值现为【云端 $ 预算】口径。
+    max_task_tokens: int = 500_000  # 单任务【云端】token 硬上限【基线】（P1；0=关闭闸门）
     # round27：token 上限对齐下方墙钟的【弹性预算】= base + per_subtask×子任务数。
     # 原 flat 500k 标定于 P1 的估算语义（description/diff 尺寸 sanity）；round26 B2 换成
     # 真实 LLM 累计主导后，ULTRA 任务仅规划期即 >800k（round27 E2E 86d24aa0 实测 826k 被

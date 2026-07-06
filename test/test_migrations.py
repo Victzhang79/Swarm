@@ -43,6 +43,10 @@ class _FakeCursor:
     def fetchone(self):
         return self._last_result
 
+    def fetchall(self):
+        # v4(F1) 回填读 swarm_users 明文行——fake 空库无行可回填，返回空列表。
+        return []
+
     def __enter__(self):
         return self
 
