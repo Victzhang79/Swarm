@@ -89,6 +89,10 @@ let pollersStarted = false;
 
 let taskEventSource = null;
 
+// taskEventSource 当前所属 task id（P1-4：双活跃任务切换须按"流所属任务"判断重开/关闭，
+// 仅判 truthy 会让旧任务的流继续往共享面板写造成跨任务串扰）
+let taskSSETaskId = null;
+
 let workerEventSource = null;
 
 let workerRunId = null;

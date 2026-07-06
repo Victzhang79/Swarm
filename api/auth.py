@@ -20,10 +20,29 @@ _PUBLIC_PREFIXES = (
     # 移出公开前缀 → 走鉴权(前端轮询本就持 token)。存活探针只留 /api/health(无组件细节)。
     "/api/auth/login",
     "/static",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
 )
+
+# CODEWALK P1-3：docs 类端点暴露【全量 API schema】——生产+RBAC 下不应匿名可读（与 #21
+# 收 /api/status 同一动机）。非生产保持公开（本地开发调试零摩擦）；生产默认纳入鉴权
+#（持 token 仍可访问，非一刀切禁用）；SWARM_DOCS_PUBLIC=true/false 显式覆盖两个方向。
+_DOCS_PREFIXES = ("/docs", "/openapi.json", "/redoc")
+
+
+def _docs_public() -> bool:
+    import os
+
+    v = (os.environ.get("SWARM_DOCS_PUBLIC") or "").strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    try:
+        return not get_config().is_production()
+    except Exception:  # noqa: BLE001
+        # 配置读取失败不许把安全判定炸成 500（非 401 非 200 的 fail-undefined）——
+        # fail-closed：当生产处理（docs 落入常规鉴权），并留可诊断日志。
+        logger.warning("_docs_public: get_config() 失败，按生产收权处理（fail-closed）")
+        return False
 
 _LEGACY_USER = SwarmUser(
     id="legacy-api-key",
@@ -108,6 +127,11 @@ class SwarmAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         if path == "/" or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+            request.state.user = None
+            return await call_next(request)
+
+        # docs 类端点：非生产（或显式放开）才匿名公开；生产默认落入下方常规鉴权
+        if any(path.startswith(p) for p in _DOCS_PREFIXES) and _docs_public():
             request.state.user = None
             return await call_next(request)
 

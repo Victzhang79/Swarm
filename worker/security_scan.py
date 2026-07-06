@@ -312,7 +312,7 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
             rule_id=r.get("check_id", ""),
             title=r.get("extra", {}).get("message", "semgrep finding"),
             file=r.get("path", ""),
-            line=r.get("start", {}).get("col", 0) if isinstance(r.get("start"), dict) else 0,
+            line=r.get("start", {}).get("line", 0) if isinstance(r.get("start"), dict) else 0,
             tool="semgrep",
             recommendation=r.get("extra", {}).get("fix", ""),
         ))
@@ -602,35 +602,75 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
         return []
     _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
-    # govulncheck JSONL 格式: 每行一个 JSON 对象
+    # govulncheck -json 是 JSONL 流。现代格式（golang.org/x/vuln v1+）每行是
+    # {"config":..}/{"progress":..}/{"osv":..}/{"finding":{"osv","fixed_version","trace":[..]}}；
+    # 此前只认旧格式顶层 OSV 键 → 现代输出恒 0 发现且 _mark_ran 已置位（伪装"扫过没漏洞"，
+    # 安全扫描 fail-open）。双格式解析，旧格式保留兼容。
     findings: list[SecurityFinding] = []
+    by_osv: dict[str, SecurityFinding] = {}  # 现代格式：同 OSV 按 module/package/function 多层各发一条 → 去重
     for line in stdout.splitlines():
         data = _safe_json_parse(line.strip())
         if data is None or not isinstance(data, dict):
             continue
-        # 只关注 "finding" 类型的记录
-        if data.get("config") is not None:
-            continue  # 配置行，跳过
+        if data.get("config") is not None or data.get("progress") is not None:
+            continue  # 元信息行；"osv" 行是漏洞全文，坐标在 finding 行，此处跳过
+        f = data.get("finding")
+        if isinstance(f, dict):
+            osv = f.get("osv") or ""
+            if not osv:
+                continue
+            trace = f.get("trace") or []
+            pos: dict = {}
+            if isinstance(trace, list) and trace and isinstance(trace[0], dict):
+                pos = trace[0].get("position") or {}
+            if not isinstance(pos, dict):
+                pos = {}  # 畸形 position（非 dict truthy）不许炸整个扫描（_mark_ran 已置位=fail-open）
+            try:
+                line_no = int(pos.get("line") or 0)
+            except (TypeError, ValueError):
+                line_no = 0
+            fixed = f.get("fixed_version") or ""
+            fnd = SecurityFinding(
+                # 现代 finding 行不带 severity（在 osv 条目里且常缺）→ 保守 MEDIUM
+                severity=_map_vuln_severity(""),
+                category="dependency",
+                rule_id=osv,
+                title=f"Go vulnerability: {osv}",
+                file=str(pos.get("filename") or ""),
+                line=line_no,
+                tool="govulncheck",
+                recommendation=(f"Upgrade to {fixed} (affected by {osv})"
+                                if fixed else f"Upgrade module affected by {osv}"),
+            )
+            prev = by_osv.get(osv)
+            if prev is None or (not prev.file and fnd.file):
+                by_osv[osv] = fnd  # 保留带源码位置的最具体一条
+            continue
+        # 旧格式：顶层 OSV / vuln 键
         osv = data.get("OSV", "")
         if not osv:
-            # 尝试其他字段格式
             if "vuln" in data:
                 osv = data.get("vuln", "")
         if not osv:
             continue
         sev_str = data.get("severity", "medium")
         sev = _map_vuln_severity(sev_str)
+        # hunter #1：trace 键存在但为 [] 时旧写法 [{}] 默认值不生效 → IndexError 炸扫描
+        # （被 audit_node 捕获但报文无上下文，且已收集的 SAST 发现全被连坐丢弃）
+        _trace = data.get("trace")
+        _first = (_trace[0] if isinstance(_trace, list) and _trace
+                  and isinstance(_trace[0], dict) else {})
         findings.append(SecurityFinding(
             severity=sev,
             category="dependency",
             rule_id=osv,
             title=f"Go vulnerability: {osv}",
-            file=data.get("trace", [{}])[0].get("filename", "") if isinstance(data.get("trace"), list) else "",
-            line=data.get("trace", [{}])[0].get("line", 0) if isinstance(data.get("trace"), list) else 0,
+            file=_first.get("filename", ""),
+            line=_first.get("line", 0),
             tool="govulncheck",
             recommendation=f"Upgrade module affected by {osv}",
         ))
-    return findings
+    return list(by_osv.values()) + findings
 
 
 def _map_vuln_severity(sev: str) -> Severity:

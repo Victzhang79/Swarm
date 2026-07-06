@@ -144,8 +144,13 @@ async function selectTask(taskId) {
       return;
     }
 
-    if (isTaskActive(selectedTaskDetail.status) && !taskEventSource) {
-      startTaskSSE(taskId);
+    // CODEWALK P1-4：旧守卫 `!taskEventSource` 在双活跃任务间切换时既不关旧流也不开新流
+    // → 旧任务 SSE 持续往共享 log-panel/pipeline 写（跨任务串扰）。改按"流所属任务"判断：
+    // 目标任务变了就重开（startTaskSSE 内部先 closeTaskSSE）；切到非活跃任务则关掉别人的流。
+    if (isTaskActive(selectedTaskDetail.status)) {
+      if (!taskEventSource || taskSSETaskId !== taskId) startTaskSSE(taskId);
+    } else if (taskEventSource && taskSSETaskId !== taskId) {
+      closeTaskSSE();
     }
   } catch (e) {
     showToast('加载任务详情失败: ' + e.message, 'error');
@@ -791,6 +796,7 @@ async function executePooledTask(taskId) {
 function startTaskSSE(taskId) {
   closeTaskSSE();
   selectedTaskId = taskId;
+  taskSSETaskId = taskId;
 
   try {
     const url = '/api/tasks/' + encodeURIComponent(taskId) + '/stream';
@@ -870,6 +876,7 @@ function startTaskSSE(taskId) {
 
 function closeTaskSSE() {
   if (taskEventSource) { taskEventSource.close(); taskEventSource = null; }
+  taskSSETaskId = null;
 }
 
 async function applyTaskDiff() {
