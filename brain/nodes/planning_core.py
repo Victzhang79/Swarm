@@ -298,6 +298,7 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
         "dispatch_remaining": dispatch_remaining,
         "failed_subtask_ids": [],
         "failure_strategy": "retry",
+        "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
         "subtask_redecompose_count": rd_counts,
     }
 
@@ -400,6 +401,7 @@ async def _redecompose_timeout_subtasks(
         "dispatch_remaining": dispatch_remaining,
         "failed_subtask_ids": leftover,
         "failure_strategy": "retry",
+        "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
         "subtask_redecompose_count": rd_counts,
         # state 无 reducer(last-write-wins)：显式清 verification_failure，防上轮验证态残留串到下轮路由。
         "verification_failure": None,

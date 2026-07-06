@@ -130,6 +130,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "dispatch_remaining": dispatch_remaining,
                     "failed_subtask_ids": [],
                     "failure_strategy": "retry",
+                    "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                     "verification_failure": None,
                     "l2_passed": False,
                     "l2_targeted": False,
@@ -142,6 +143,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     _l2_replan, _l2_max)
         return {
             "failure_strategy": "replan",
+            "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
             "failed_subtask_ids": [],
             "verification_failure": None,
             "l2_passed": False,
@@ -189,6 +191,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务(第 %d 次)", _deepest)
         return {
             "failure_strategy": "retry",
+            "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
             "failed_subtask_ids": failed,
             "verification_failure": None,
             "subtask_retry_counts": {**_retry_counts, **_next_counts},
@@ -230,6 +233,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "dispatch_remaining": dispatch_remaining,
             "failed_subtask_ids": [],
             "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+            "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
             "use_alternate_model": forced_alternate,
             "subtask_retry_counts": {**retry_counts, **next_counts},
         }
@@ -293,6 +297,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             )
             return {
                 "failure_strategy": "abandon",
+                "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
                 "failed_subtask_ids": [],
                 "dispatch_remaining": _remaining,
@@ -418,6 +423,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "dispatch_remaining": dispatch_remaining,
                     "failed_subtask_ids": [],
                     "failure_strategy": "retry_alternate",
+                    "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                     "use_alternate_model": True,
                     "subtask_retry_counts": _rc,
                     "targeted_recovery_count": _tr,
@@ -471,6 +477,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "dispatch_remaining": dispatch_remaining,
                     "failed_subtask_ids": [],
                     "failure_strategy": "retry_alternate" if forced_alternate else "retry",
+                    "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                     "use_alternate_model": forced_alternate,
                     "subtask_retry_counts": {**_retry_counts, **_next_counts},
                 }
@@ -535,6 +542,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "failed_subtask_ids": [],
             "plan_valid": False,
             "failure_strategy": "replan",
+            "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
             "replan_count": replan_count,
             "replan_feedback": replan_feedback,
         }
@@ -602,6 +610,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "failed_subtask_ids": [],
                 "subtask_results": subtask_results,
                 "failure_strategy": "retry",
+                "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "use_alternate_model": False,
                 "subtask_transient_counts": {**transient_counts, **next_tcounts},
             }
@@ -654,6 +663,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             )
             return {
                 "failure_strategy": "abandon",
+                "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
                 "failed_subtask_ids": [],
                 "dispatch_remaining": _remaining,
@@ -710,6 +720,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         "failure_strategy": effective_strategy,
         "subtask_retry_counts": {**retry_counts, **next_counts},
         "subtask_force_strong": force_strong,  # FINDING-12：拒答子任务重试走最强模型
+        # 批4c：本返回 strategy 恒为 retry/retry_alternate（escalate 在上方早返回），
+        # 非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
+        "failure_escalated": False,
     }
     if _scope_widened:
         out["plan"] = plan_obj  # 回写加宽后的 scope，dispatch 重试用

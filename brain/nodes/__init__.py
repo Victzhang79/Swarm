@@ -2055,6 +2055,10 @@ async def revision(state: BrainState) -> dict:
         "subtask_results": preserved_results,
         "failed_subtask_ids": [],
         "subtask_retry_counts": {},  # 修订是新一轮，重置重试计数
+        # 批4c：修订=重新开始，清历史 escalate 粘滞标记——否则 gates.py:112 对修订成功的
+        # 交付永拒 auto_accept、after_merge:285 残留条件把干净合并再送人工
+        # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。
+        "failure_escalated": False,
     }
 
 
