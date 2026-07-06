@@ -25,6 +25,7 @@ wheels/
 # ─── 固化的运维流程（本地操作参考，不入远端；见用户指示 2026-07-06）────
 # 发布/E2E 流程手册 + 脚本 + 每轮工作台账 = 本地操作工具，非交付产物，保留本地不 push。
 scripts/release.sh
+scripts/e2e_login.sh
 docs/RELEASE_RUNBOOK.md
 docs/E2E_RUNBOOK.md
 docs/ROUND28_FINDINGS_TRIAGE.md

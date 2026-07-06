@@ -129,11 +129,27 @@ def _migration_v4_token_hash(conn) -> None:
         logger.info("[migrations] v4：回填 %d 个明文 token 为 SHA256 并清空明文", len(rows))
 
 
+def _migration_v5_kb_file_index_last_modified(conn) -> None:
+    """v5：kb_file_index 补 last_modified 列（旧库缺列 → 预处理 upsert 报
+    `column "last_modified" does not exist`，文件索引静默存不进，实测 2026-07-06）。
+
+    根因：structure_index.py 的 CREATE TABLE 早已声明 last_modified，但 `CREATE TABLE
+    IF NOT EXISTS` 对【已存在的旧表】不补新列——升级前建的库缺这列。既有库幂等 ADD COLUMN；
+    新库由 STRUCTURE_INDEX_DDL 直建，此迁移 no-op。DEFAULT now() 与建表 DDL 一致。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE kb_file_index ADD COLUMN IF NOT EXISTS "
+            "last_modified TIMESTAMPTZ DEFAULT now()"
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
     (3, "add_base_commit", _migration_v3_base_commit),
     (4, "hash_api_tokens", _migration_v4_token_hash),
+    (5, "kb_file_index_last_modified", _migration_v5_kb_file_index_last_modified),
     # 未来迁移在此追加，例如:
     # (5, "add_xxx_column", _migration_add_xxx_column),
 ]

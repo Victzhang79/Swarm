@@ -146,6 +146,23 @@ def test_schema_version_table_ensured():
     assert "create table if not exists schema_version" in sqls.lower()
 
 
+# ─────────────── v5：kb_file_index 补 last_modified 列 ───────────────
+def test_v5_adds_kb_file_index_last_modified():
+    """既有旧库（缺 last_modified 列）跑迁移应 ADD COLUMN IF NOT EXISTS，幂等补列。
+
+    根因（实测 2026-07-06）：CREATE TABLE IF NOT EXISTS 不给已存在旧表补新列 → 预处理
+    upsert 报 `column "last_modified" does not exist`，文件索引静默存不进。
+    """
+    conn = _FakeConn(sentinel="public.projects", max_version=4)  # 停在 v4，只差 v5
+    with _patch_pool(conn):
+        with patch.object(runner, "_apply_baseline_ddl"):
+            runner.run_migrations("postgresql://x")
+    sqls = " | ".join(s for s, _ in conn.executed).lower()
+    assert "alter table kb_file_index add column if not exists last_modified" in sqls, \
+        "v5 迁移必须给 kb_file_index 幂等补 last_modified 列"
+    assert 5 in conn.stamped, "v5 迁移应被盖章"
+
+
 # ───────────────────────── delete_project 原子性 ─────────────────────────
 def test_delete_project_uses_transaction():
     """A-P1-23：级联删除必须包在 conn.transaction() 内（autocommit 池连接下才原子）。"""

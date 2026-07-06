@@ -468,6 +468,15 @@ class SandboxConfig(BaseSettings):
     # 构建专属沙箱）。需沙箱机 SSH 凭据在 secret_store；无凭据/构建失败自动回退通用池。
     # 设 False 可全局关闭，所有项目用旧通用池。
     project_scoped_enabled: bool = True
+    # 专属镜像构建后 push 到的本地 registry（CubeSandbox 0.5.0 起 create-from-image 只从
+    # registry 拉镜像、不再读本地 dockerd → 必须经 registry 中转，见 2026-07-06 治本）。
+    # 留空=旧行为（直接用本地 docker tag，仅 ≤0.4.0 有效）。默认 localhost:5000（沙箱机本地
+    # registry，CubeMaster 解析 localhost 不出网、绕开被墙的 Docker Hub）。build_project_image
+    # 会在沙箱机上按需自启该 registry（用 build_registry_image）。
+    build_registry: str = "localhost:5000"
+    # 自启本地 registry 用的镜像（须沙箱机本地已有或可达 mirror 拉取；Docker Hub 被墙环境
+    # 用腾讯/阿里公共 mirror 的 registry:2）。
+    build_registry_image: str = "ccr.ccs.tencentyun.com/library/registry:2"
     # 启动时清扫"残留孤儿沙箱"（12.2）。默认 True 保持单机部署行为（启动这一刻远端
     # 任何存活沙箱都是上一进程残留，安全清扫）。⚠️ 共享 CubeSandbox 集群部署务必设
     # False：本实例无差别 kill 服务器上所有沙箱会误杀其他实例/用户的沙箱。

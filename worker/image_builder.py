@@ -78,6 +78,66 @@ def template_exists_in_cubemaster(template_id: str) -> bool | None:
         return None
 
 
+# 沙箱创建失败信息里【模板悬空/过期】的 ground-truth 标记。
+# 背景（2026-07-06 实证）：CubeSandbox 升级后旧 v2 模板节点侧变 stale/needs-redo（130409），
+# 但 CubeMaster /templates 列表级 status 仍报 "READY"（过时元数据）→ template_exists_in_cubemaster
+# 只查注册表存在性会误判可用、preprocess 误复用不重建。唯一可靠信号是 worker 创建沙箱时的报错。
+# 130404=template not found（被 TTL/清理回收）；130409=stale/needs-redo（升级后待重建）。
+_TEMPLATE_STALE_MARKERS = (
+    "130404",
+    "130409",
+    "template not found",
+    "template_not_found",
+    "not ready on any healthy node",
+    "is stale",
+    "needs redo",
+    "needs to redo",
+)
+
+
+def error_indicates_stale_template(error_str: str) -> bool:
+    """错误信息是否表明【项目专属模板悬空/过期，需重建】（130404 / 130409 / stale / needs redo）。"""
+    if not error_str:
+        return False
+    low = str(error_str).lower()
+    return any(m in low for m in _TEMPLATE_STALE_MARKERS)
+
+
+def invalidate_project_template_on_stale(project_id: str | None, error_str: str) -> bool:
+    """worker 撞【模板悬空/过期】错误时反向作废项目沙箱指纹，令下次 preprocess 自愈重建。
+
+    治本背景：preprocess 复用判据 = `sandbox_template 存在 且 sandbox_deps_hash == 当前指纹`，
+    存在性探活（template_exists_in_cubemaster）对 130409 stale 盲（列表 status 仍 READY）→ 误复用。
+    这里在 ground-truth 失败点（worker create 报错）反向清 **sandbox_deps_hash**（仅指纹，
+    不动 sandbox_template 指针）→ 下次 preprocess 指纹失配 → 走重建分支重烤新模板并回写。
+
+    只清指纹不清指针的理由：本次已在飞的兄弟子任务仍读到旧 template 指针、沙箱选择行为不变
+    （避免 mid-task 清指针致回退通用镜像的降级意外）；重建只发生在下一次 preprocess。
+
+    返回：True=已作废指纹；False=非 stale 错误/无 project_id/无既有指纹（无操作，幂等）。
+    """
+    if not project_id or not error_indicates_stale_template(error_str):
+        return False
+    try:
+        from swarm.project.store import get_project, update_project
+
+        proj = get_project(project_id) or {}
+        cfg = dict(proj.get("config") or {})
+        if not cfg.get("sandbox_deps_hash"):
+            return False  # 本就没指纹可作废（已被清或从未建过），幂等返回
+        cfg["sandbox_deps_hash"] = ""  # 指纹失配 → 下次 preprocess 重建；保留 sandbox_template 指针
+        update_project(project_id, config=cfg)
+        logger.warning(
+            "项目 %s 沙箱模板经 worker 创建报错坐实为悬空/过期（%s）→ 已作废复用指纹，"
+            "下次预处理将重建专属模板（swarm preprocess run %s）",
+            project_id, str(error_str)[:120], project_id,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — 作废失败不阻断主失败路径
+        logger.warning("invalidate_project_template_on_stale(%s) 失败（不阻断）: %s", project_id, exc)
+        return False
+
+
 @dataclass
 class SSHConfig:
     host: str
@@ -687,8 +747,12 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
                 return BuildResult(False, image_tag=tag, message=f"源码解包失败(exit={code}): {(out + err)[-300:]}")
             logger.info("项目 %s 源码已传入 build context: %s", spec.project_id, out.strip()[-80:])
             # 4) docker build
+            # --provenance=false：buildkit 默认产 OCI image index（含 provenance/attestation 子
+            #   manifest）。push 到 registry:2 时 index 被拒（400 manifest invalid，2026-07-06 实证）
+            #   → create-from-image 拉不到 → 建模板失败。关掉 provenance 出【单 v2s2 manifest】，
+            #   push 干净。（CubeSandbox 0.5.0 起 create-from-image 只从 registry 拉，见第 6 步。）
             logger.info("沙箱机构建镜像 %s (project=%s)", tag, spec.project_id)
-            code, out, err = r.run(f"cd {shlex.quote(remote_dir)} && docker build -t {shlex.quote(tag)} . 2>&1", timeout=2400)
+            code, out, err = r.run(f"cd {shlex.quote(remote_dir)} && docker build --provenance=false -t {shlex.quote(tag)} . 2>&1", timeout=2400)
             if code != 0:
                 return BuildResult(False, image_tag=tag, message=f"docker build 失败(exit={code}): {(out + err)[-500:]}")
             # 5) envd /health 自测（官方模板发布的唯一硬闸门：tpl create-from-image
@@ -716,7 +780,39 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
             compile_diag = "COMPILE_OK" if "COMPILE_OK" in out else (
                 "COMPILE_DIAG_FAIL(联网兜底)" if selftest else "no-selftest")
             logger.info("项目 %s 镜像自测: HEALTH_OK, 离线编译诊断=%s", spec.project_id, compile_diag)
-            # 6) create-from-image
+            # 5.5) push 到本地 registry（CubeSandbox 0.5.0 治本，2026-07-06 实证）
+            # 背景：0.5.0 的 create-from-image「native export」只从 registry 拉镜像、不再读本地
+            # dockerd（裸 tag 被当 docker.io 引用→被墙的 Docker Hub 超时 FAILED）。治本=build 后
+            # push 到沙箱机本地 registry，create-from-image 用 registry ref（CubeMaster 解析
+            # localhost 不出网）。留空 build_registry=旧行为（直接用本地 tag，仅 ≤0.4.0 有效）。
+            try:
+                from swarm.config import get_config as _get_cfg
+                _reg = (getattr(_get_cfg().sandbox, "build_registry", "") or "").strip().rstrip("/")
+                _reg_img = (getattr(_get_cfg().sandbox, "build_registry_image", "") or "").strip()
+            except Exception:  # noqa: BLE001 — 读配置失败退回旧行为
+                _reg, _reg_img = "", ""
+            image_ref = tag  # 默认（无 registry）：直接用本地 tag（旧路径）
+            if _reg:
+                image_ref = f"{_reg}/{tag}"
+                # 按需自启本地 registry（幂等：已在跑则 docker run 失败无妨，随后 /v2/ 探活为准）
+                if _reg_img and _reg.startswith(("localhost", "127.0.0.1")):
+                    _port = _reg.split(":")[-1] if ":" in _reg else "5000"
+                    r.run(
+                        f"docker inspect swarm-registry >/dev/null 2>&1 || "
+                        f"docker run -d -p {shlex.quote(_port)}:5000 --restart=always "
+                        f"--name swarm-registry {shlex.quote(_reg_img)} >/dev/null 2>&1 || true",
+                        timeout=120,
+                    )
+                # push（--provenance=false 已保证是单 v2s2 manifest，registry:2 收）
+                logger.info("项目 %s push 镜像到本地 registry %s", spec.project_id, image_ref)
+                code, out, err = r.run(
+                    f"docker tag {shlex.quote(tag)} {shlex.quote(image_ref)} && "
+                    f"docker push {shlex.quote(image_ref)} 2>&1", timeout=600)
+                if code != 0 or "manifest invalid" in (out + err).lower():
+                    return BuildResult(
+                        False, image_tag=tag,
+                        message=f"push 到 registry {image_ref} 失败(exit={code}): {(out + err)[-400:]}")
+            # 6) create-from-image（用 image_ref：有 registry 时=registry 引用，否则=本地 tag）
             # 关键：带 --node 把模板【钉死在 swarm 访问的单一节点】(ssh.host = cube-proxy host_ip)。
             # 不带 --node 时 CubeMaster 会往【所有节点】派构建任务——双网卡机器(.30 有线/.60 无线)
             # 被注册成两个节点，两节点抢同一 cubebox_os_image 磁盘目录 → rootfs rename 竞态 →
@@ -734,7 +830,7 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
             #   保证 worker 能联网补拉构建依赖(mvn/npm/go/pip)。
             _v040_opts = "--with-cube-ca=true --allow-internet-access "
             code, out, err = r.run(
-                f"cubemastercli tpl create-from-image --image {shlex.quote(tag)} "
+                f"cubemastercli tpl create-from-image --image {shlex.quote(image_ref)} "
                 f"{_node_opt}{_v040_opts}"
                 f"--writable-layer-size 2G --expose-port 49983 --probe 49983 --probe-path /health 2>&1",
                 timeout=300,
@@ -744,7 +840,9 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
             if not m:
                 return BuildResult(False, image_tag=tag, message=f"create-from-image 未返回 template_id: {out[-300:]}")
             template_id = m.group(1)
-            job_m = re.search(r"job_id:\s*([0-9a-f-]+)", out)
+            # v0.4.0 输出 `job_id: xxx`（冒号），v0.5.0 改成 `job_id=xxx`（等号）——兼容两者，
+            # 否则解析失败退回轮询兜底（round29 实证 job=None 即此故）。
+            job_m = re.search(r"job_id[:=]\s*([0-9a-f-]+)", out)
             job_id = job_m.group(1) if job_m else None
             logger.info("项目 %s 模板创建任务已提交: tpl=%s job=%s（异步，watch 等 READY）",
                         spec.project_id, template_id, job_id)

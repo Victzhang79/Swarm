@@ -494,6 +494,15 @@ class WorkerExecutor(
                     # 明确抛错（提示重建项目镜像），而非降级到注定失败的本地空跑。
                     if getattr(self, "_sandbox_has_source", False):
                         self._log(f"沙箱创建失败且任务依赖项目专属镜像源码，fail-closed 不降级本地: {exc}")
+                        # 治本（2026-07-06）：若报错坐实【专属模板悬空/过期】(130404/130409/stale/
+                        # needs redo)，反向作废项目沙箱指纹→下次 preprocess 自愈重建（template_exists
+                        # 探活对 130409 stale 盲，列表 status 仍 READY，只清指纹不清指针，不改本次在飞行为）。
+                        try:
+                            from swarm.worker.image_builder import invalidate_project_template_on_stale
+                            if invalidate_project_template_on_stale(self.project_id, str(exc)):
+                                self._log("已作废项目沙箱复用指纹，下次预处理将重建专属模板")
+                        except Exception:  # noqa: BLE001 — 作废失败不阻断 fail-closed 主路径
+                            pass
                         raise RuntimeError(
                             f"项目专属沙箱镜像不可用（{exc}）——镜像可能已过期/被清理。"
                             f"本地无项目源码，拒绝降级空跑。请重建该项目沙箱模板后重试。"
