@@ -508,7 +508,18 @@ async def _plan_ultra_batched(
     # stage2 单模块 500s 超时同构。否则 brain 模型(GLM-5.2)某批失控持续生成时,无 chunk 看门狗抓不到、
     # read-timeout 不管总时长 → PLAN 单批挂死整个任务(实测挂 16min)。超时按已有 except 分支降级跳过。
     import asyncio as _asyncio
-    _PLAN_BATCH_TIMEOUT = 300.0  # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
+    # round29 真因4 配套：墙钟 env 可调（默认 300s 不变）——原硬码使降级路径无法被行为测试覆盖。
+    # 复核 A：非法配置值（如 "abc"）不得裸穿被外层 except 误诊成"LLM 调用失败"（系统级配置错
+    # 会打挂每一个 ULTRA 任务，排障方向全错）——显式按配置错误归因，ERROR 留痕后回退默认。
+    try:
+        _PLAN_BATCH_TIMEOUT = float(os.environ.get("SWARM_PLAN_BATCH_TIMEOUT", "300") or "300")
+    except ValueError:
+        logger.error(
+            "[PLAN-BATCH] SWARM_PLAN_BATCH_TIMEOUT 配置非法(%r)——系统级配置错误请修 env，"
+            "本次回退默认 300s", os.environ.get("SWARM_PLAN_BATCH_TIMEOUT"),
+        )
+        _PLAN_BATCH_TIMEOUT = 300.0
+    # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
     # P6a（治本，996db614 实测 2/9 模块批分解失败→那俩模块零子任务永不构建→交付残缺）：批分解
     # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 GLM-5.2 瞬时 timeout，1 次
     # 重试大概率恢复（镜像骨架/Stage B 成熟模式）。耗尽才计 failed_batches。env 可调。
@@ -596,22 +607,39 @@ async def _plan_ultra_batched(
         _decompose_batch(i, mod_name, batch)
         for i, (mod_name, batch) in enumerate(module_batches, start=1)
     ])
+    # round29 真因4 治本：失败模块【结构化记账】而非只计数——d37a52a3 实测 'system-enhance'
+    # 14 文件两次 timeout 被降级跳过后无任何 state 痕迹，任务其余成功则记 DONE 但交付物静默缺
+    # 整模块 + LEARN_SUCCESS 学成成功模式（伪装成功）。记账供 plan 节点落 state
+    # （plan_batch_failed_modules）→ can_auto_accept_plan fail-fast 升人工 + degraded_reasons
+    # 拦 L6 假成功学习。降级容错语义不变（幸存批照常合并）。
+    plan_batch_failed_modules: list[dict] = []
     for kind, i, mod_name, payload, _dt, _nfiles in _outcomes:
         if kind == "ok" and payload:
+            # 复核 B：给每个子任务 dict 打模块标记（merge 的 {**st} 拷贝保留额外键），使末端
+            # SubTask 构造失败能按模块归因记账，而非裸穿外层 except 连坐丢弃全部记账。
+            for _st in payload:
+                if isinstance(_st, dict):
+                    _st["_plan_batch_module"] = mod_name
             batch_results.append(payload)
             logger.info("%s 模块'%s' 拆出 %d 个子任务",
                         batch_progress_line(i, total, _nfiles, _dt), mod_name, len(payload))
         elif kind == "ok":
             failed_batches += 1
+            plan_batch_failed_modules.append(
+                {"name": mod_name, "files": _nfiles, "reason": "empty"})
             logger.warning("%s 模块'%s' 未拆出子任务（降级跳过）",
                            batch_progress_line(i, total, _nfiles, _dt), mod_name)
         elif kind == "timeout":
             failed_batches += 1
+            plan_batch_failed_modules.append(
+                {"name": mod_name, "files": _nfiles, "reason": "timeout"})
             logger.warning(
                 "%s 模块'%s' LLM 调用超时 >%.0fs（降级跳过，防 PLAN 无限挂 — FINDING-10）",
                 batch_progress_line(i, total, _nfiles), mod_name, _PLAN_BATCH_TIMEOUT)
         else:
             failed_batches += 1
+            plan_batch_failed_modules.append(
+                {"name": mod_name, "files": _nfiles, "reason": f"error: {payload!r}"[:200]})
             logger.warning("%s 模块'%s' 拆解异常（降级跳过）: %s",
                            batch_progress_line(i, total, _nfiles), mod_name, payload)
 
@@ -632,7 +660,30 @@ async def _plan_ultra_batched(
     for st in merged:
         if isinstance(st, dict) and "acceptance" in st and "acceptance_criteria" not in st:
             st["acceptance_criteria"] = st.pop("acceptance")
-    return TaskPlan(subtasks=[SubTask(**st) for st in merged])
+    # 复核 B：逐子任务构造——个别字段畸形（pydantic ValidationError）不得裸穿外层通用 except
+    # 把【全部】记账与幸存模块产出连坐丢弃（归因退化成"LLM 调用失败"）。畸形子任务按模块
+    # 记入 plan_batch_failed_modules（reason=真实校验错误）+ WARNING，其余照常交付。
+    _subtasks: list[SubTask] = []
+    _invalid_by_module: dict[str, list[str]] = {}
+    for st in merged:
+        _mod = st.pop("_plan_batch_module", None) if isinstance(st, dict) else None
+        try:
+            _subtasks.append(SubTask(**st))
+        except Exception as exc:  # noqa: BLE001  pydantic ValidationError 及同类构造错误
+            _invalid_by_module.setdefault(str(_mod or "?"), []).append(f"{st.get('id', '?')}: {exc}")
+            logger.warning(
+                "[PLAN-BATCH] 模块'%s' 子任务 %s 字段畸形被剔除（记账不静默）: %s",
+                _mod or "?", st.get("id", "?") if isinstance(st, dict) else "?", exc,
+            )
+    for _mod, _errs in _invalid_by_module.items():
+        plan_batch_failed_modules.append({
+            "name": _mod, "files": 0,
+            "reason": f"invalid_subtasks({len(_errs)}): {_errs[0][:150]}",
+        })
+    if not _subtasks:
+        raise RuntimeError("ultra 分批拆解合并后子任务全部构造失败（字段畸形），无可用子任务")
+    # round29 真因4：失败模块清单随 plan 一起返回（调用方落 state + 闸门消费），不再只留日志。
+    return TaskPlan(subtasks=_subtasks), plan_batch_failed_modules
 
 
 def _subtask_signature(st) -> tuple:
@@ -722,6 +773,8 @@ async def plan(state: BrainState) -> dict:
             # R2-1：PLAN=新一轮规划起点，无条件清历史 escalate 粘滞（与 merge 干净轮对称；
             # 堵"首次 REVISE→PLAN 无 old_results 时 _surgical_replan_reset 返回空"的漏清线）
             "failure_escalated": False,
+            # round29 真因4 always-emit（复核 LOW）：SIMPLE 路径不走分批，恒发 []，保不变量字面自洽。
+            "plan_batch_failed_modules": [],
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
             **plan_touch,
         }
@@ -736,6 +789,9 @@ async def plan(state: BrainState) -> dict:
         state.get("recent_task_summaries") or []
     )
     _plan_degraded: str | None = None  # LLM 降级原因（audit #13），非降级保持 None
+    # round29 真因4：分批拆解失败模块清单。always-emit（非分批/全成功路径发 []）——last-write-wins
+    # 使 replan 成功后自动清空，不粘滞（「仅条件写无人清」是历史 bug 模式）。
+    _plan_batch_failed: list[dict] = []
     sliding_ctx = sliding_context_prompt(state)
 
     # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
@@ -774,7 +830,7 @@ async def plan(state: BrainState) -> dict:
                 len(_file_plan), _SERIAL_MASTER_TRIGGER,
             )
         if complexity == Complexity.ULTRA and len(_file_plan) > _BATCH_TRIGGER:
-            task_plan = await _plan_ultra_batched(
+            task_plan, _plan_batch_failed = await _plan_ultra_batched(
                 llm, state, task_description, knowledge_context,
                 sliding_ctx, _file_plan,
             )
@@ -931,7 +987,14 @@ async def plan(state: BrainState) -> dict:
         "shared_contract": task_plan.shared_contract or {},
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
+        ) + (
+            # round29 真因4：丢模块=交付范围残缺，必须进 degraded（should_write_success 据此
+            # 拦 L6 假成功学习；人工 accept 放行后终态仍诚实带痕）。reducer 追加去重。
+            [f"plan_batch_module_dropped:{','.join(m.get('name', '?') for m in _plan_batch_failed)}"]
+            if _plan_batch_failed else []
         ),
+        # round29 真因4：always-emit（空也发）——防粘滞 + 供 can_auto_accept_plan 闸门消费。
+        "plan_batch_failed_modules": _plan_batch_failed,
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
@@ -1188,6 +1251,9 @@ def confirm_plan(state: BrainState) -> dict:
             "plan_validation_issues": state.get("plan_validation_issues") or [],
             # W1.1：把失败模块/降级原因带进 interrupt，人工审核时能看到"设计不完整"
             "tech_design_failed_modules": state.get("tech_design_failed_modules") or [],
+            # round29 真因4（复核 C，与 W1.1 对称）：人工审核须看到结构化的丢失模块明细
+            # （name/files/reason），不只 degraded_reasons 里的压缩字符串。
+            "plan_batch_failed_modules": state.get("plan_batch_failed_modules") or [],
             "degraded_reasons": state.get("degraded_reasons") or [],
             "message": _msg,
         }

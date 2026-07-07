@@ -83,6 +83,19 @@ def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
             f"tech_design_incomplete: {len(failed_modules)} 个模块设计生成失败 {names}"
             "——file_plan 不完整，不得静默 auto_accept，须人工介入"
         )
+
+    # round29 真因4（W1.1 的 PLAN-BATCH 对等物）：分批拆解有模块失败 → 该模块子任务整体蒸发、
+    # 交付范围残缺（d37a52a3 'system-enhance' 14 文件+已生成契约悬空实证），且规则5 契约无
+    # owner 承接=编译期引信。绝不能静默 auto_accept 当完整计划，须人工审残缺范围后显式放行
+    # （放行后 degraded_reasons 仍带痕，L6 不学成成功）。
+    plan_batch_failed = state.get("plan_batch_failed_modules") or []
+    if plan_batch_failed:
+        _pb_names = [m.get("name", "?") for m in plan_batch_failed if isinstance(m, dict)]
+        _pb_files = sum(int(m.get("files") or 0) for m in plan_batch_failed if isinstance(m, dict))
+        return False, (
+            f"plan_batch_failed: {len(plan_batch_failed)} 个模块分解失败 {_pb_names}"
+            f"（共 {_pb_files} 个规划文件未纳入计划）——计划范围残缺，不得静默 auto_accept，须人工介入"
+        )
     return True, ""
 
 
