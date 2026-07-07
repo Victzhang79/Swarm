@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -975,18 +976,101 @@ def dump_merged_diff_for_diagnosis(
         d = Path(dump_dir)
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"merged_diff_{tid8}_{stamp}.diff"
+        # round29 反误诊：git 要求补丁文件以换行结尾，否则末行报 "corrupt patch at line N"。
+        # 生产两条 apply 路径(verify_merged_patch_applies / project.diff_apply)都在写临时文件时补尾
+        # 换行，但 merged_diff 本体("\n".join 组装)不带——dump 原样落盘会让离线手工 `git apply` 在
+        # EOF 假报损坏（task d37a52a3 实证：79 段补丁被误诊为"组装畸形"，实际补尾换行即干净 apply）。
+        # 落盘对齐生产 apply 的真实输入，dump 文件开箱即可复现。
+        if merged_diff and not merged_diff.endswith("\n"):
+            merged_diff += "\n"
         p.write_text(merged_diff, encoding="utf-8")
         return str(p)
     except Exception:  # noqa: BLE001
         return None
 
 
-def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> tuple[bool, str]:
-    """交付前 fail-closed 护栏：合并 patch 能否干净 `git apply --check` 到项目工作树。
+def _apply_check_against_base(project_path: str, diff_path: str, base_ref: str) -> tuple[bool, str]:
+    """把 merged_diff `git apply --check` 到【纯净 base 树】而非脏工作树。
+
+    ★round29 治本（task d37a52a3 实测，77 文件全中）★：pull-back 把已完成子任务产物 materialize
+    进工作区后，工作树里已有 merged_diff 中本应"新建"的文件（ruoyi-alarm/**）。原先直接
+    `git apply --check`（默认校验【工作树】）→ create 补丁撞"already exists in working directory"
+    → apply_ok=False → fail-closed 升级人工 → 本应 PARTIAL 的任务被打成 FAILED。但 merged_diff 由
+    base_reader 相对 git HEAD/钉扎 base 生成（round21，nodes:1371）——生成基线与校验基线分了叉才是
+    真死因。治本：校验必须与生成同源，对 base 树校验。
+
+    做法：用【临时 index】从 base_ref `read-tree` 载入基线树，再 `git apply --check --cached` 只对该
+    index 校验，完全不碰工作树/暂存区（GIT_INDEX_FILE 指向临时文件，真 index 零改动）。这样：
+    · create 补丁 → base 树无此文件 → 通过（工作树是否已有由 pull-back 决定，与"补丁是否合法"无关）；
+    · modify 补丁 → context 对 base blob 校验（与 worker 相对 base 生成的 hunk 同源），工作树脏不误判；
+    · 畸形补丁 → 仍 well-formed 校验失败（fail-closed 不放水）。
+
+    base_ref 不可达（GC/坏 SHA）→ 退回 HEAD 树；HEAD 也 read-tree 失败（极端损坏仓）→ 退回旧的工作树
+    `git apply --check`（不回归 greenfield，宁可保守）。
+    """
+    with tempfile.TemporaryDirectory(prefix="mergeidx_") as _td:
+        idx = os.path.join(_td, "index")
+        env = {**os.environ, "GIT_INDEX_FILE": idx}
+        # 临时 index 载入 base 树（不动真 index/工作树）。base_ref 坏 → 退回 HEAD。
+        loaded = base_ref
+        rt = subprocess.run(
+            ["git", "read-tree", base_ref], cwd=project_path, env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        _readtree_err = (rt.stderr or "").strip()  # 保住首次 read-tree 失败真因（供 finding2 诊断）
+        if rt.returncode != 0 and base_ref != "HEAD":
+            # 复核 finding1（观测·降级可观测红线）：钉扎 base 不可达退回 HEAD 是【换了校验基线】。
+            # 若同时 HEAD 已漂移（worktree_diverged_from_base / 3rd-P1b 担心的场景），成功路径也会对
+            # 【与 diff 不同源的树】判 ok=True——必须在替换发生的当下 loud，否则成功轮完全无痕迹。
+            logger.warning(
+                "[MERGE] apply-check 钉扎 base %s 不可达(GC/坏 ref?)，退回 HEAD 校验——"
+                "若 HEAD 已漂移则校验基线与 diff 生成基线不同源: %s",
+                base_ref[:12], _readtree_err or "read-tree 非零退出",
+            )
+            loaded = "HEAD"
+            rt = subprocess.run(
+                ["git", "read-tree", "HEAD"], cwd=project_path, env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            _readtree_err = (rt.stderr or "").strip() or _readtree_err
+        # --ignore-whitespace：与真实交付 apply(project/diff_apply.apply_git_diff:168) 同旗标——RuoYi 等
+        # 项目源文件 CRLF、worker 产出 diff LF，不忽略行尾差异会让 check 因 context CRLF↔LF 不匹配假失败、
+        # 而真 apply 却能过 → check 必须与真 apply 同源，才是忠实预测器(不假红误升级、不假绿放行)。
+        if rt.returncode != 0:
+            # 连 HEAD 都载不进（空仓/损坏）→ 退回旧的工作树校验，绝不假绿放行。复核 finding2：带上
+            # read-tree 失败真因，否则升级人工只看到下游"already exists"症状、误判是补丁问题而非坏 base。
+            proc = subprocess.run(
+                ["git", "apply", "--check", "--ignore-whitespace", diff_path],
+                cwd=project_path, capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0:
+                return True, ""
+            _apply_err = (proc.stderr or proc.stdout or "git apply --check failed").strip()
+            _prefix = f"[base 树 read-tree 失败: {_readtree_err}] " if _readtree_err else ""
+            return False, f"{_prefix}{_apply_err}"
+
+        proc = subprocess.run(
+            ["git", "apply", "--check", "--cached", "--ignore-whitespace", diff_path],
+            cwd=project_path, env=env, capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        _err = (proc.stderr or proc.stdout or "git apply --check --cached failed").strip()
+        return False, f"[base={loaded}] {_err}"
+
+
+def verify_merged_patch_applies(
+    project_path: str | None, merged_diff: str, base_ref: str = "HEAD",
+) -> tuple[bool, str]:
+    """交付前 fail-closed 护栏：合并 patch 能否干净 apply 到项目【纯净 base 树】（非脏工作树）。
 
     返回 (ok, detail)。ok=False = merge 组装出了【不可 apply 的补丁】（确定性组装缺陷），绝不能
     静默按 success 放行——round16 实测 88 个新文件 `@@ -0,1` + 行尾翻倍空行 → 补丁损坏，却仍
     success=True 蒙混到 VERIFY_L2 才被拦、进而触发全量 replan。此护栏在 MERGE 出口就诚实标注。
+
+    base_ref＝任务钉扎的 base commit（resolve_base_ref 解析，默认 "HEAD"）。校验对齐 diff 的生成基线
+    （round29 治本，见 _apply_check_against_base），避免 pull-back 污染工作树后 create 补丁被误判
+    "already exists"。老调用点不传 base_ref → 默认 HEAD，同样受益于 base 树校验、零回归。
 
     空 diff / 无 git 工作树 → ok=True（无可校验、不误报）。P1-2 治本：校验器【自身异常】过去
     fail-open 返回 ok=True——但 #1(a) 起 `_apply_ok=False` 会升级人工，异常仍 True 等于"校验器崩了
@@ -1001,13 +1085,7 @@ def verify_merged_patch_applies(project_path: str | None, merged_diff: str) -> t
         with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=True) as tf:
             tf.write(merged_diff if merged_diff.endswith("\n") else merged_diff + "\n")
             tf.flush()
-            proc = subprocess.run(
-                ["git", "apply", "--check", tf.name],
-                cwd=project_path, capture_output=True, text=True, timeout=60,
-            )
-        if proc.returncode == 0:
-            return True, ""
-        return False, (proc.stderr or proc.stdout or "git apply --check failed").strip()
+            return _apply_check_against_base(project_path, tf.name, base_ref or "HEAD")
     except Exception as exc:  # noqa: BLE001
         # fail-closed：无法执行校验 → 不冒充可 apply（避免 #1(a) escalate 被 fail-open 绕过）。
         return False, f"apply-check 未能执行(fail-closed，无法确认可落盘): {exc}"

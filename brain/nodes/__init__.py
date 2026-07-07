@@ -1512,7 +1512,12 @@ def merge(state: BrainState) -> dict:
     _apply_ok, _apply_err = True, ""
     if result.success and not result.rebase_subtask_ids and result.merged_diff.strip():
         _proj_path = _get_project_path(state.get("project_id") or "")
-        _apply_ok, _apply_err = verify_merged_patch_applies(_proj_path, result.merged_diff)
+        # round29 治本：校验对齐 diff 生成基线（base_reader 读钉扎 base commit）——否则 pull-back
+        # 污染工作树后，本应新建的文件被 `git apply --check` 误判 "already exists" → 假 apply_ok=False
+        # → 本应 PARTIAL 的任务被 escalate 成 FAILED（task d37a52a3 实测 77 文件全中）。
+        from swarm.git_base import resolve_base_ref
+        _base_ref = resolve_base_ref(state.get("base_commit"))
+        _apply_ok, _apply_err = verify_merged_patch_applies(_proj_path, result.merged_diff, _base_ref)
         if not _apply_ok:
             logger.error(
                 "[MERGE] ⚠️ 合并 patch 组装非法：git apply --check 失败 → %s"
