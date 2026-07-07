@@ -886,6 +886,50 @@ def attribute_l2_failure(plan, l2_details: dict | None, subtask_results: dict) -
     return None
 
 
+# ── S1-6：运行时冒烟失败证据结构化 + 归因（复用 attribute_l2_failure 机制，勿复制）──
+def runtime_failure_evidence(details: dict | None) -> str:
+    """从 runtime_smoke_details 提取归因证据文本（纯函数，栈无关：只拼文本不解析栈帧）。
+
+    只取【应用自身输出】面：log_tail（启动日志尾部）+ code_error_hits（三分类命中的错误
+    形态）+ migration* 键族（S1-5 migration_failed 同族：SQL/migration 错误输出按键名前缀
+    契约消费）。绝不掺 derivation_evidence/sandbox 等【基础设施留痕】——它们含配置/构建
+    文件路径（application.yml、rebuild_output 里的源文件名），入证据面会把这些文件的写者
+    子任务【每轮】误归因成失败源。
+    """
+    d = details or {}
+    parts: list[str] = []
+    log_tail = str(d.get("log_tail") or "").strip()
+    if log_tail:
+        parts.append(log_tail)
+    for hit in d.get("code_error_hits") or []:
+        parts.append(str(hit))
+    for key in sorted(d):
+        if key.startswith("migration") and d[key]:
+            val = d[key]
+            if isinstance(val, (list, tuple)):
+                parts.extend(str(v) for v in val if v)
+            else:
+                parts.append(str(val))
+    return "\n".join(p for p in parts if p).strip()
+
+
+def attribute_runtime_failure(
+    plan, runtime_details: dict | None, subtask_results: dict
+) -> list[str] | None:
+    """运行时冒烟失败 → 写者子任务归因（S1-6）。
+
+    复用 attribute_l2_failure 的「证据文本内文件路径/basename → scope 写权反查」机制
+    （运行时 stack trace / migration 错误同样含源文件引用，路径形态匹配天然栈无关）；
+    喂形＝把冒烟证据装进其 compile_output 席位。归因不出返回 None（调用方退 replan 阶梯），
+    继承其「非真子集才定向」护栏——绝不因误归因连坐成功兄弟。
+    """
+    blob = runtime_failure_evidence(runtime_details)
+    if not blob:
+        return None
+    return attribute_l2_failure(
+        plan, {"integration_review": {"compile_output": blob}}, subtask_results)
+
+
 def l1_details_of(out) -> dict:
     """统一取 worker 结果的 l1_details（WorkerOutput / dict / 其它）——CODEWALK §3.2 收敛：
     此前 recovery._det_of / failure._l1_details_of / failure·maven_repair 内联共 4 份同义实现。"""

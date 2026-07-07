@@ -5,7 +5,7 @@
     [CONFIRM (ultra)] → DISPATCH → MONITOR →
       [HAS_FAILURE → HANDLE_FAILURE → DISPATCH |
        HAS_MORE → DISPATCH |
-       ALL_DONE → MERGE → VERIFY_L2 → [L2 gate] VERIFY_L3 → DELIVER →
+       ALL_DONE → MERGE → VERIFY_L2 → [L2 gate] VERIFY_RUNTIME → [runtime gate] VERIFY_L3 → DELIVER →
          [ACCEPT → LEARN_SUCCESS |
           REVISE  → REVISION → DISPATCH |
           REJECT  → LEARN_FAILURE] → DONE]
@@ -15,7 +15,8 @@
   - after_confirm: human_decision? → DISPATCH(accept) / DONE(reject)
   - after_monitor: has_failures? → HANDLE_FAILURE / has_more? → DISPATCH / MERGE
   - after_merge: merge_conflicts? → HANDLE_FAILURE / VERIFY_L2
-  - after_verify_l2: l2_passed? → VERIFY_L3 / HANDLE_FAILURE
+  - after_verify_l2: l2_passed? → VERIFY_RUNTIME / HANDLE_FAILURE
+  - after_verify_runtime: runtime_smoke_passed? → VERIFY_L3(True/None=skipped) / HANDLE_FAILURE(False)
   - after_verify_l3: l3_passed? → DELIVER / HANDLE_FAILURE
   - after_handle_failure: strategy? → DISPATCH(retry) / PLAN(replan) / DELIVER(escalate)
   - after_deliver: human_decision? → LEARN_SUCCESS/REVISION/LEARN_FAILURE
@@ -45,6 +46,10 @@ from swarm.brain.nodes import (
     verify_l2,
     verify_l3,
 )
+
+# S1-4：verify_runtime 直连模块导入（不经 __init__ re-export——延活转交批对 __init__ 的
+# 改动面收敛在 _run_reactor_build_in_sandbox 两处，不动其导出面）。
+from swarm.brain.nodes.verify import verify_runtime
 from swarm.brain.planning_nodes import (
     assess,
     clarify,
@@ -312,15 +317,33 @@ def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "di
 def after_verify_l2(state: BrainState) -> Literal["verify_l3", "handle_failure"]:
     """VERIFY_L2 后的路由（P0 L2 gate）:
 
-    - l2_passed=True → VERIFY_L3
+    - l2_passed=True → 通过出口（标签 "verify_l3"；S1-4 起接线目标是 VERIFY_RUNTIME，
+      见 add_conditional_edges 的映射——标签语义=「L2 通过继续验证链」，保持不变以稳住
+      既有单测契约 test_p0_path，真实拓扑由 wiring 测试锁定）
     - l2_passed=False → HANDLE_FAILURE（禁止进入 deliver）
     """
     if state.get("l2_passed", False):
-        logger.info("[ROUTE] VERIFY_L2 → VERIFY_L3 (L2 通过)")
+        logger.info("[ROUTE] VERIFY_L2 → VERIFY_RUNTIME (L2 通过，先过运行时冒烟)")
         return "verify_l3"
 
     logger.warning("[ROUTE] VERIFY_L2 → HANDLE_FAILURE (L2 未通过，阻断交付)")
     return "handle_failure"
+
+
+def after_verify_runtime(state: BrainState) -> Literal["verify_l3", "handle_failure"]:
+    """VERIFY_RUNTIME 后的路由（S1-4 运行时冒烟 gate，三态对齐 after_verify_l3 的 P1-12 语义）:
+
+    - runtime_smoke_passed=False → HANDLE_FAILURE（verification_failure="runtime_smoke" 专类归因）
+    - True（通过）/ None（skipped，已入 degraded_reasons 可观测留痕）→ VERIFY_L3
+    """
+    if state.get("runtime_smoke_passed") is False:
+        logger.warning("[ROUTE] VERIFY_RUNTIME → HANDLE_FAILURE (运行时冒烟未通过，阻断交付)")
+        return "handle_failure"
+    if state.get("runtime_smoke_skipped"):
+        logger.info("[ROUTE] VERIFY_RUNTIME → VERIFY_L3 (冒烟跳过，degraded 留痕)")
+        return "verify_l3"
+    logger.info("[ROUTE] VERIFY_RUNTIME → VERIFY_L3 (冒烟通过)")
+    return "verify_l3"
 
 
 def after_verify_l3(state: BrainState) -> Literal["deliver", "handle_failure"]:
@@ -421,6 +444,7 @@ def build_brain_graph() -> StateGraph:
     graph.add_node("handle_failure", handle_failure)
     graph.add_node("merge", merge)
     graph.add_node("verify_l2", verify_l2)
+    graph.add_node("verify_runtime", verify_runtime)  # S1-4：运行时冒烟闸门（L2 与 L3 之间）
     graph.add_node("verify_l3", verify_l3)
     graph.add_node("deliver", deliver)
     graph.add_node("revision", revision)
@@ -531,10 +555,25 @@ def build_brain_graph() -> StateGraph:
         },
     )
 
-    # VERIFY_L2 → VERIFY_L3 / HANDLE_FAILURE (L2 gate)
+    # VERIFY_L2 → VERIFY_RUNTIME / HANDLE_FAILURE (L2 gate)
     graph.add_conditional_edges(
         "verify_l2",
         after_verify_l2,
+        {
+            # S1-4：标签 "verify_l3"（=「L2 通过继续验证链」）的目标改指 verify_runtime——
+            # L2 通过后先过运行时冒烟，再进 L3。标签名保持不变见 after_verify_l2 docstring。
+            "verify_l3": "verify_runtime",
+            "handle_failure": "handle_failure",
+        },
+    )
+
+    # VERIFY_RUNTIME → VERIFY_L3 / HANDLE_FAILURE (runtime gate，S1-4)
+    # ⚠️ 与 confirm 同款不变量：verify_runtime 出口【只】由本条件边决定，绝不可再加
+    # add_edge("verify_runtime", ...) 静态边（fan-out 血案，见 confirm 处注释；
+    # test_verify_runtime_wiring_s1_4.py 拓扑断言守护）。
+    graph.add_conditional_edges(
+        "verify_runtime",
+        after_verify_runtime,
         {
             "verify_l3": "verify_l3",
             "handle_failure": "handle_failure",

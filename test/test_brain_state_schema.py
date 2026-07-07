@@ -33,6 +33,19 @@ def test_previously_undeclared_channels_now_in_schema():
         assert key in ann, f"实际通道 {key} 必须在 BrainState 声明（未声明=LangGraph 静默丢弃）"
 
 
+def test_runtime_smoke_keys_declared():
+    """S1-4（task#18）：verify_runtime 三态/详情/转交 sid + migration 验证键必须声明。
+
+    不声明 → verify_runtime 写的结论被 LangGraph 静默丢弃：after_verify_runtime 路由
+    永远读 None（失败也放行 L3=假绿）、failed 的归因详情蒸发（task#20 回灌成死功能）。
+    """
+    ann = BrainState.__annotations__
+    for key in ("runtime_smoke_passed", "runtime_smoke_skipped", "runtime_smoke_message",
+                "runtime_smoke_details", "runtime_smoke_sandbox_id",
+                "migration_verify_passed", "migration_verify_details"):
+        assert key in ann, f"S1-4 键 {key} 必须在 BrainState 声明（未声明=LangGraph 静默丢弃）"
+
+
 def _registered_node_fn_names() -> set[str]:
     tree = ast.parse((_BRAIN / "graph.py").read_text())
     names: set[str] = set()

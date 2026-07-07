@@ -112,6 +112,7 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
       - failed_subtask_ids 非空：仍有未恢复的失败子任务
       - l2_passed 为假：L2 集成验证未通过
       - l3_passed 显式为 False：L3 预发验证失败（None=跳过，不算失败）
+      - runtime_smoke_passed 显式为 False：运行时冒烟失败（None=跳过，不算失败；S1-6）
       - verification_failure 非空：存在已记录的验证失败来源
 
     返回 (allow, reason)。reason 同时用作 verification_failure 的归因值。
@@ -141,6 +142,14 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
     l3 = state.get("l3_passed", None)
     if l3 is False:
         return False, "l3_failed: L3 预发验证失败"
+
+    # S1-6：runtime 冒烟三态（对齐 l3 语义 + 上方 :119 "专类先判、如实归因"先例）：
+    # 仅显式 False 阻断——失败已定性为「应用启动/探活失败」，专类文案不得冒充 l2/l3；
+    # None=跳过不算失败（skipped 已由 degraded_reasons 可观测，should_write_success
+    # 据 degraded 另拦 L6，不会学成成功模式）；True=通过不阻断。
+    rt = state.get("runtime_smoke_passed", None)
+    if rt is False:
+        return False, "runtime_smoke_failed: 运行时冒烟未通过（应用启动/探活失败，非 L2 编译失败）"
 
     vf = state.get("verification_failure")
     if vf:

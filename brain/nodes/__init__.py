@@ -1964,22 +1964,56 @@ def _run_l2_in_sandbox(
                 logger.debug("[VERIFY_L2] 销毁沙箱失败: %s", exc)
 
 
+def _try_handoff_compile_sandbox_for_smoke(manager, sandbox) -> str | None:
+    """S1-4：L2 编译沙箱 → 冒烟延活转交（设计 §2.2/§2.3）。仅在编译成功后调用。
+
+    冒烟开启且 try_extend_lifetime(冒烟预算+缓冲) 成功 → 返回 sandbox_id（对象留在
+    manager._instances 进程内 registry，state 只存 sid 字符串——沙箱对象不可序列化进
+    PG checkpoint）；开关关/续期失败/异常 → None（调用方照旧 finally kill，转交不成立，
+    verify_runtime 走回退自建）。"""
+    try:
+        from swarm.brain.nodes.runtime_smoke import (
+            RUN_TIMEOUT_BUFFER_SEC,
+            resolve_prepare_timeout_sec,
+            resolve_smoke_timeout_sec,
+        )
+        from swarm.brain.nodes.verify import _runtime_smoke_enabled
+
+        if not _runtime_smoke_enabled():
+            return None
+        # F1：与 verify_runtime 的预算公式同口径。转交时冒烟推导尚未发生（prepare_cmd 未知），
+        # 保守恒加 prepare 预算——多续的寿命由 verify_runtime finally 必杀兜底，无泄漏代价；
+        # 少续则转交沙箱在增量 package（prepare）中途到期，白白废掉快路径。
+        budget = (resolve_smoke_timeout_sec() + RUN_TIMEOUT_BUFFER_SEC + 120
+                  + resolve_prepare_timeout_sec())
+        if manager.try_extend_lifetime(sandbox, budget):
+            logger.info("[VERIFY_L2] 编译沙箱 %s 延活转交冒烟(+%ds)", sandbox.sandbox_id, budget)
+            return sandbox.sandbox_id
+        logger.info("[VERIFY_L2] 冒烟转交续期失败 → 照旧销毁编译沙箱（verify_runtime 自建兜底）")
+        return None
+    except Exception as exc:  # noqa: BLE001 — 转交是优化路径，任何异常都退回"照旧 kill"
+        logger.debug("[VERIFY_L2] 冒烟转交尝试异常，照旧销毁: %s", exc)
+        return None
+
+
 def _run_reactor_build_in_sandbox(
     project_path: str,
     project_id: str,
     build_cmd: str,
     *,
     timeout: int = 600,
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, str, str | None]:
     """在【项目沙箱】(按检测栈版本烤的工具链，见 image_builder._toolchain_install)跑全 reactor 集成
     编译——治本 round21 的 L2 空气闸：brain host 无需装任何栈/版本，Java8/17/21·Go·Rust·Node 由沙箱
     镜像各自正确。
 
     契约：调用前 project_path 工作树【已 apply merged_diff】(run_integration_review 本地 apply)。这里把
     该已应用工作树 sync 进沙箱后【直接跑 build_cmd】(不再沙箱内 git apply → 规避双重应用/脏基线)。
-    返回 (ran, ok, output)：ran=False = 沙箱不可用/异常 → 交调用方退回本机或 fail-loud。"""
+    返回 (ran, ok, output, smoke_handoff_sid)：ran=False = 沙箱不可用/异常 → 交调用方退回本机或
+    fail-loud。smoke_handoff_sid（S1-4）=编译成功且冒烟延活转交成立时的沙箱 id（该沙箱【未被 kill】，
+    处置责任移交调用方→verify_runtime）；其余一切路径 None 且沙箱照旧 finally kill。"""
     if not _sandbox_available():
-        return False, False, ""
+        return False, False, "", None
     from pathlib import Path
 
     from swarm.worker.sandbox import get_sandbox_manager
@@ -1989,8 +2023,9 @@ def _run_reactor_build_in_sandbox(
     manager = get_sandbox_manager()
     run_command = getattr(manager, "run_command", None)
     if run_command is None:
-        return False, False, ""
+        return False, False, "", None
     sandbox = None
+    handed_off = False
     try:
         sandbox = manager.create(project_id=project_id or None, source="verify_l2_compile")
         manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
@@ -2001,12 +2036,19 @@ def _run_reactor_build_in_sandbox(
         out = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
         ok = "__RC__0" in out
         logger.info("[VERIFY_L2] 沙箱集成编译: %s (cmd=%s)", "通过" if ok else "未通过", build_cmd)
-        return True, ok, out[-3000:]
+        smoke_sid: str | None = None
+        if ok:
+            # S1-4 延活转交：仅编译成功时尝试；成立则 finally 不 kill（编译产物留给冒烟复用，
+            # 省一次 create+sync+全量重编译）。泄漏兜底=远端 900s 自动到期+启动清扫，
+            # 但 verify_runtime 的 finally kill 是第一责任人。
+            smoke_sid = _try_handoff_compile_sandbox_for_smoke(manager, sandbox)
+            handed_off = smoke_sid is not None
+        return True, ok, out[-3000:], smoke_sid
     except Exception as exc:  # noqa: BLE001
         logger.warning("[VERIFY_L2] 沙箱集成编译异常(退回本机/fail-loud): %s", exc)
-        return False, False, ""
+        return False, False, "", None
     finally:
-        if sandbox is not None:
+        if sandbox is not None and not handed_off:
             try:
                 manager.kill(sandbox.sandbox_id)
             except Exception as _exc:  # noqa: BLE001

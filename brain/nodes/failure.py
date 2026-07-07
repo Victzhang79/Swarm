@@ -50,7 +50,12 @@ from swarm.brain.nodes.planning_core import (
     _transitive_abandon,
     _widen_scope_for_compile_repair,
 )
-from swarm.brain.nodes.shared import _parse_json_from_llm, l1_passed
+from swarm.brain.nodes.shared import (
+    _parse_json_from_llm,
+    attribute_runtime_failure,
+    l1_passed,
+    runtime_failure_evidence,
+)
 
 def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     """取子任务的 L1 详情（§3.2：委托 shared.l1_details_of 单一实现，本地名保 seam）。"""
@@ -74,6 +79,121 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     strategy = "retry"
 
     logger.info(f"[HANDLE_FAILURE] 处理 {len(failed_ids)} 个失败子任务")
+
+    if state.get("verification_failure") == "runtime_smoke":
+        # ── S1-6 运行时失败证据回灌（替换 S1-4 占位）──
+        # 专类分支：运行时冒烟失败（含 S1-5 migration_failed 同族——同经 verification_failure=
+        # "runtime_smoke" 进入，details 含 SQL/migration 错误输出，证据面同源消费）绝不落下方
+        # "l2" 分支：l2 归因链建立在编译输出格式上，对运行时启动日志无效（8bec098 专类教训）。
+        # 有界性双闸（绝不给 runtime 单开无界通道）：
+        #   ① replan_count 与 L2 共用【同一】熔断计数器——定向/replan 每轮自增，超限 escalate；
+        #   ② 定向恢复按子任务配额 targeted_recovery_counts（round29 遗漏项#2 先例，与 A2 缺
+        #      依赖/序修复阶梯共用表），配额耗尽 escalate（镜像 "l3" 人工终点，保底不无界）。
+        # 环境类（env_missing/timeout/inconclusive）在 verify_runtime 即 skipped+degraded，
+        # 不产生 verification_failure，永不进本分支（环境类不进失败通道）。
+        _rt_details = dict(state.get("runtime_smoke_details") or {})
+        _rt_class = str(_rt_details.get("classification") or "code_error")
+        _rt_replan = state.get("replan_count", 0) + 1
+        _rt_max = get_config().model.max_retries
+        if _rt_replan > _rt_max:
+            logger.warning(
+                "[HANDLE_FAILURE] 运行时冒烟失败(%s)且 replan 已达上限(%d 次) → 升级人工审核",
+                _rt_class, _rt_max,
+            )
+            return {
+                "failure_strategy": "escalate",
+                "failure_escalated": True,
+                "failed_subtask_ids": failed_ids,
+                "verification_failure": None,
+                "runtime_smoke_passed": False,
+                "replan_count": _rt_replan,
+            }
+        # 归因：启动日志/迁移错误里的源文件引用 → scope 写权反查写者子任务
+        #（复用 attribute_l2_failure 路径匹配机制，栈无关；见 shared.attribute_runtime_failure）
+        _rt_attributed = attribute_runtime_failure(plan_obj, _rt_details, subtask_results)
+        if _rt_attributed:
+            _rt_trc = dict(state.get("targeted_recovery_counts") or {})
+            _rt_eligible = [fid for fid in _rt_attributed if _rt_trc.get(fid, 0) < _rt_max]
+            # hunter：配额【部分】耗尽时，被排除的归因子任务绝不静默丢弃——WARN 留痕
+            # （列出 fid 与已耗配额），行为不变（仅重派 eligible 者）。全员耗尽走下方 escalate。
+            _rt_excluded = [fid for fid in _rt_attributed if fid not in _rt_eligible]
+            if _rt_excluded and _rt_eligible:
+                logger.warning(
+                    "[HANDLE_FAILURE] 运行时冒烟失败归因到 %s，其中 %s 因定向恢复配额耗尽被本轮"
+                    "排除(已耗 %s / 上限 %d)，仅重派 %s",
+                    _rt_attributed, _rt_excluded,
+                    {fid: _rt_trc.get(fid, 0) for fid in _rt_excluded}, _rt_max, _rt_eligible,
+                )
+            if not _rt_eligible:
+                logger.warning(
+                    "[HANDLE_FAILURE] 运行时冒烟失败归因到 %s 但各自定向恢复配额均已耗尽(上限 %d)"
+                    " → 升级人工审核（绝不无限定向重做）", _rt_attributed, _rt_max,
+                )
+                return {
+                    "failure_strategy": "escalate",
+                    "failure_escalated": True,
+                    "failed_subtask_ids": _rt_attributed,
+                    "verification_failure": None,
+                    "runtime_smoke_passed": False,
+                    "replan_count": _rt_replan,
+                }
+            # 证据注入：走既有 retry_guidance 通道（A4 round11，worker/prompts.py 渲染为
+            # 硬约束块），重派 worker 直接看到启动日志证据 + 机制说明（运行时失败非编译失败）。
+            _rt_evidence = runtime_failure_evidence(_rt_details)
+            _rt_guidance = (
+                "运行时启动失败（非编译失败）：本子任务产出已通过编译与 L2 集成验证，但应用在"
+                f"启动/探活冒烟阶段失败（classification={_rt_class}）。请依据下方启动期证据修复"
+                "启动失败根因，勿无谓改动与证据无关的编译面。\n启动失败证据：\n" + _rt_evidence
+            )[:1600]
+            _rt_by_id = {s.id: s for s in getattr(plan_obj, "subtasks", []) or []}
+            for fid in _rt_eligible:
+                _rt_st = _rt_by_id.get(fid)
+                if _rt_st is not None:
+                    _rt_st.retry_guidance = _rt_guidance
+            dispatch_remaining = list(state.get("dispatch_remaining", []))
+            _rt_rc = dict(state.get("subtask_retry_counts", {}))
+            for fid in _rt_eligible:
+                subtask_results.pop(fid, None)
+                if fid not in dispatch_remaining:
+                    dispatch_remaining.append(fid)
+                # 运行时失败非其 L1 能力失败（各自 L1 已过）→ 不烧能力配额；
+                # 循环边界由 ①replan_count + ②targeted_recovery_counts 双闸保证。
+                _rt_rc[fid] = 0
+                _rt_trc[fid] = _rt_trc.get(fid, 0) + 1
+            logger.info(
+                "[HANDLE_FAILURE] 运行时冒烟失败(%s)定向恢复（第 %d/%d 次，按子任务配额 %s）："
+                "归因到写者子任务 %s，注入启动日志证据重派，保留 %d 个成功兄弟，不全量 replan",
+                _rt_class, _rt_replan, _rt_max, {k: _rt_trc[k] for k in _rt_eligible},
+                _rt_eligible, len(subtask_results),
+            )
+            return {
+                "plan": plan_obj,
+                "subtask_results": subtask_results,
+                "dispatch_remaining": dispatch_remaining,
+                "failed_subtask_ids": [],
+                "failure_strategy": "retry",
+                "failure_escalated": False,
+                "verification_failure": None,
+                "runtime_smoke_passed": False,
+                "replan_count": _rt_replan,
+                "subtask_retry_counts": _rt_rc,
+                "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
+                "targeted_recovery_counts": _rt_trc,
+                "targeted_recovery": True,
+            }
+        # 归因不出 → 退 replan 阶梯（共用 replan_count，上面已判上限，绝不另起无界通道）
+        logger.info(
+            "[HANDLE_FAILURE] 运行时冒烟失败(%s)证据归因不出写者子任务 — 触发 replan (第 %d/%d 次)",
+            _rt_class, _rt_replan, _rt_max,
+        )
+        return {
+            "failure_strategy": "replan",
+            "failure_escalated": False,
+            "failed_subtask_ids": [],
+            "verification_failure": None,
+            "runtime_smoke_passed": False,
+            "replan_count": _rt_replan,
+        }
 
     if state.get("verification_failure") == "l2":
         # H2 修复：L2 失败 replan 也要走 replan_count 计数/上限，否则绕过熔断可无限重规划

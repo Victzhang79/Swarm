@@ -38,6 +38,7 @@ class TaskStatus(str, Enum):
     HANDLING_FAILURE = "HANDLING_FAILURE"
     MERGING = "MERGING"
     VERIFYING_L2 = "VERIFYING_L2"
+    VERIFYING_RUNTIME = "VERIFYING_RUNTIME"  # S1-4 运行时冒烟闸门（D59 不变量：TaskStatus 须覆盖 SSOT=task_states.py）
     VERIFYING_L3 = "VERIFYING_L3"      # L3 GitLab CI 验证（D59 补全，SSOT=task_states.py）
     DELIVERING = "DELIVERING"
     IN_REVISION = "IN_REVISION"

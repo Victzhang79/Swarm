@@ -170,6 +170,7 @@ _NODE_STATUS_MAP: dict[str, str] = {
     "handle_failure": "HANDLING_FAILURE",
     "merge": "MERGING",
     "verify_l2": "VERIFYING_L2",
+    "verify_runtime": "VERIFYING_RUNTIME",  # S1-4：运行时冒烟闸门（on_chain_start 自动发事件/写状态）
     "verify_l3": "VERIFYING_L3",
     "deliver": "DELIVERING",
     "revision": "IN_REVISION",

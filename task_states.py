@@ -29,6 +29,7 @@ ACTIVE_EXECUTION_STATES = frozenset({
     "HANDLING_FAILURE",
     "MERGING",
     "VERIFYING_L2",
+    "VERIFYING_RUNTIME",  # S1-4 运行时冒烟闸门：活跃执行态（占沙箱），崩溃恢复 fail-closed
     "VERIFYING_L3",
     "IN_REVISION",
     "LEARNING_SUCCESS",

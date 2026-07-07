@@ -129,7 +129,20 @@ class BrainState(TypedDict, total=False):
     l3_skipped: bool                    # L3 是否跳过
     l3_message: str                     # L3 验证说明
     l3_branch: str                      # N-04：verify_l3 实际推送的分支，供 learn_success MR 指向正确分支
-    verification_failure: str | None    # l2 / l3 等验证失败来源
+    verification_failure: str | None    # l2 / l3 / runtime_smoke 等验证失败来源（handle_failure 专类分支据此归因）
+
+    # ═══ S1-4 运行时冒烟闸门（VERIFY_RUNTIME，docs/RUNTIME_SMOKE_DESIGN.md §4）═══
+    # 为什么必须声明：LangGraph 未声明键=【静默丢弃】（本文件下方 schema 补全段实证）——不声明则
+    # verify_runtime 写的三态结论全部蒸发，after_verify_runtime 路由永远读 None、失败回灌成死功能。
+    # 为什么全部 last-write-wins 无 reducer（本文件顶部原则）：replan/重试重入 verify_runtime 时
+    # 必须【整体替换】上一轮结论而非累积合并——加 reducer 会让旧轮失败结论粘滞误导路由。
+    runtime_smoke_passed: bool | None   # 三态路由键（None=跳过≠失败，对齐 l3_passed 语义）：仅 False 进 handle_failure
+    runtime_smoke_skipped: bool         # skipped 可观测锚点：gates/交付摘要据此区分「没跑」和「跑过没过」，绝不静默
+    runtime_smoke_message: str          # 如实说明（通过/失败形态/为何跳过），透传 deliver/通知/学习
+    runtime_smoke_details: dict[str, Any]  # 三分类判据留痕（classification/log_tail/探活序列）：task#20 失败归因回灌 + UI 排障的数据源
+    runtime_smoke_sandbox_id: str       # L2 编译沙箱延活转交的 sid（进程内 manager._instances registry 查键；仅诊断留痕不作恢复依据——沙箱对象不可序列化进 PG checkpoint）；verify_runtime 消费后清空防跨轮粘滞
+    migration_verify_passed: bool | None   # migration 执行验证三态（task#21 写入；先声明——否则未来节点写它会被静默丢成死功能）
+    migration_verify_details: dict[str, Any]  # migration 验证细节留痕（同上，声明先行）
 
     # ─── L3 滑动窗口（任务执行期上下文）───
     context_log: list[dict]             # 上下文事件 log

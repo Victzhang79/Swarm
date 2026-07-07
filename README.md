@@ -13,7 +13,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-2500%2B%20passing-brightgreen.svg)](#-测试)
-[![Version](https://img.shields.io/badge/version-0.9.21-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.22-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -112,7 +112,9 @@ flowchart TB
     R --> W1
     LR --> L2{L2 集成闸门<br/>全工程真编译}
     L2 -->|不过| PT[诚实收敛<br/>PARTIAL]
-    L2 -->|通过| HM{人工 accept?}
+    L2 -->|通过| RT{运行时冒烟<br/>真启动 + 探活}
+    RT -->|启动失败·证据回灌| B3
+    RT -->|通过 / 环境受限如实跳过| HM{人工 accept?}
     HM -->|返工：清旧完成态| B3
     HM -->|通过| CM[(git commit<br/>本地仓库落盘)]
     CM --> MEM[(记忆 L0–L6<br/>错题集 / 成功模式)]
@@ -143,17 +145,20 @@ flowchart LR
     L1 -->|通过| LR[LLM 审查]
     LR --> L2{L2 集成闸门<br/>全工程真编译}
     L2 -->|不过·拒绝假绿| PT[PARTIAL]
-    L2 -->|通过| HM{人工 accept}
+    L2 -->|通过| RT{运行时冒烟<br/>真启动·探活·migration}
+    RT -->|启动失败·日志证据回灌| W
+    RT -->|通过 / 如实跳过| HM{人工 accept}
     HM -->|返工·清旧完成态| W
     HM -->|通过| L3[L3 staging<br/>可选 GitLab MR]
     L3 --> GIT[(git commit 落盘)]
 
     classDef gate fill:#0f766e,stroke:#0d9488,color:#fff;
-    class L1,L2 gate;
+    class L1,L2,RT gate;
 ```
 
 - **确定性闸门优先**：产物先过 L1 硬闸门（编译/测试/lint），**再**走 LLM 审查，最后人工 accept。修复轮用真实编译/lint 证据驱动，返工时清空旧完成态、防"提前宣告完成"。
 - **集成级不假绿**：L2 对全工程做真编译（Java 多模块 reactor / 各栈对应构建）；工具链缺失时**拒绝放行而非静默跳过**，绝不把"没验证"当"验证通过"。纯 docs/config、无构建文件的子任务合理跳过编译（`compile_ok=None`，非假绿）。
+- **运行时冒烟闸门**（v0.9.22）：编译通过不等于跑得起来——L2 后在沙箱**真启动应用**（manifest 证据推导启动命令/端口，多栈对称）+ TCP/HTTP 探活 + migration 执行验证。启动失败按证据三分类：代码错误→启动日志回灌定向修复（有界）；环境缺失（沙箱无外部 DB 等）→**如实跳过绝不冤枉代码**；分类不明→保守跳过。所有跳过带原因进交付报告（`degraded_reasons`），跳过轮不写入成功记忆。
 - **事实核验前置**：规划前先核对需求点名的文件/类/表是否**真实存在**——虚假前提强制转人工澄清而非硬跑。存在性同时查**工作区磁盘**与 **git 已跟踪**两个 ground truth，不依赖可能滞后的索引。
 
 **失败不是"全有或全无"——它走一条逐级消化的恢复阶梯：**
