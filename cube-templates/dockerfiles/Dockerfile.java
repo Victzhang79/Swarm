@@ -37,3 +37,8 @@ RUN java -version && mvn -v || true
 
 # envd 由 cube-entrypoint.sh 在后台拉起（base 镜像已配）；无前台 CMD 时 envd 为前台。
 # 构建后请按 cube-templates/README 用 build.sh 做 envd /health 自测再 create-from-image。
+
+# 沙箱工作目录（worker bootstrap/L1/agent bash 均假定 /workspace 存在——v2 镜像缺此目录
+# 致 bare 沙箱 cd /workspace 必挂，2026-07-07 运维项实测）
+RUN mkdir -p /workspace
+WORKDIR /workspace

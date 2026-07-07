@@ -27,3 +27,8 @@ RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@v0.24.0 || 
 
 RUN go version || true
 RUN command -v goimports >/dev/null 2>&1 && echo "goimports OK" || echo "goimports MISSING"
+
+# 沙箱工作目录（worker bootstrap/L1/agent bash 均假定 /workspace 存在——v2 镜像缺此目录
+# 致 bare 沙箱 cd /workspace 必挂，2026-07-07 运维项实测）
+RUN mkdir -p /workspace
+WORKDIR /workspace

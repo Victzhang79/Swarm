@@ -15,3 +15,8 @@ COPY warmup/requirements.txt /opt/warmup/requirements.txt
 RUN pip3 install --no-cache-dir -r /opt/warmup/requirements.txt || true
 
 RUN python3 --version && pip3 --version || true
+
+# 沙箱工作目录（worker bootstrap/L1/agent bash 均假定 /workspace 存在——v2 镜像缺此目录
+# 致 bare 沙箱 cd /workspace 必挂，2026-07-07 运维项实测）
+RUN mkdir -p /workspace
+WORKDIR /workspace
