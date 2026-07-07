@@ -143,6 +143,13 @@ def create_worker_agent(
         tools=tools,
         prompt=system_prompt,
         pre_model_hook=_make_pre_model_hook(_budget),
+        # round29 遗漏项#1 治本（d37a52a3 st-26 实证）：worker agent 在 brain 图 dispatch 节点内
+        # ainvoke，LangGraph 会经 config 传播把【父图的 PG checkpointer】自动继承给子图 →
+        # worker 每步 messages（AIMessage）都被序列化入库（DB 实证 checkpoint_ns='dispatch:…|N'）
+        # → 模型返回带不可 msgpack 序列化负载时 MsgpackEncodeError 炸掉整轮执行 + 海量无用
+        # checkpoint 写入。worker agent 是无状态一次性执行体（失败恢复靠 brain 重派整个子任务，
+        # 从不 resume agent 内部状态），checkpointer=False 显式阻断继承（官方语义）。
+        checkpointer=False,
     )
 
     return {
