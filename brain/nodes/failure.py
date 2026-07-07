@@ -376,19 +376,25 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
     # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
     # 选 retry 还是 replan，都先走定向恢复：补模块 pom 写权 + 重置徒劳的重试计数 + 只重派失败
-    # 子任务（保留成功兄弟、不进 PLAN、不清完成态全表）。targeted_recovery_count 熔断防死循环。
+    # 子任务（保留成功兄弟、不进 PLAN、不清完成态全表）。targeted_recovery_counts【按子任务】熔断防死循环（遗漏项#2）。
     if _is_missing_dependency_failure(subtask_results, failed_ids) and failed_ids:
-        _tr = state.get("targeted_recovery_count", 0) + 1
         _tr_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
-        if _tr > _tr_max:
-            # 熔断：达上限仍缺依赖 → 不再 mutate plan，落常规 strategy 兜底（HIGH-3：先判上限再改 plan）。
+        # round29 遗漏项#2 治本：熔断改【按子任务】计（targeted_recovery_counts）——旧任务级
+        # 全局计数会被先失败的子任务用光、饿死后续同类受害者（d37a52a3 st-25 实证：配额被
+        # st-4-1 波耗尽，st-25 从未拿到 pom 写权即"已达上限"落兜底 → 迭代上限/900s 空烧 →
+        # +24 abandon 波主推手）。同子任务 grant→fail→grant 环安全语义不变（每 fid ≤ _tr_max）。
+        _trc = dict(state.get("targeted_recovery_counts") or {})
+        _eligible = [fid for fid in failed_ids if _trc.get(fid, 0) < _tr_max]
+        if not _eligible:
+            # 熔断：全部失败子任务各自达上限仍缺依赖 → 不再 mutate plan，落常规 strategy 兜底
+            #（HIGH-3：先判上限再改 plan）。
             logger.warning(
-                "[HANDLE_FAILURE] 定向恢复已达上限(%d 次)仍缺依赖 → 落常规 %s 兜底",
-                _tr_max, strategy,
+                "[HANDLE_FAILURE] 失败子任务 %s 各自定向恢复均已达上限(%d 次)仍缺依赖 → 落常规 %s 兜底",
+                failed_ids, _tr_max, strategy,
             )
         else:
             # 仅在配额内才 mutate plan（补 pom 写权 + 串 owner 依赖），杜绝兜底路径留下孤儿 scope 改动。
-            granted = _grant_module_pom_writable(plan_obj, failed_ids)
+            granted = _grant_module_pom_writable(plan_obj, _eligible)
             if granted:
                 # 治本 A2：授权后【确定性】据项目自身 pom 把缺失依赖补进失败模块 pom，
                 # 不再指望小模型自己加（实测它加不上 → 耗尽配额 → 全量 replan 砸成功子任务）。
@@ -405,16 +411,21 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     subtask_results.pop(fid, None)
                     if fid not in dispatch_remaining:
                         dispatch_remaining.append(fid)
-                # 之前的重试因 scope 不可满足而徒劳，不计入配额——重置失败子任务重试计数。
+                # 之前的重试因 scope 不可满足而徒劳，不计入配额——重置【获授权】子任务重试计数
+                #（未获授权的搭车重派者保留计数，防其经反复重置绕过常规熔断）。
                 _rc = dict(state.get("subtask_retry_counts", {}))
-                for fid in failed_ids:
+                for fid in granted:
                     _rc[fid] = 0
+                # 配额按子任务消费：只给真正获 pom 授权者记账（遗漏项#2）。
+                for fid in granted:
+                    _trc[fid] = _trc.get(fid, 0) + 1
                 _kept = [sid for sid in subtask_results if sid not in failed_ids]
+                _riders = [f for f in failed_ids if f not in granted]
                 logger.info(
-                    "[HANDLE_FAILURE] 定向恢复（第 %d/%d 次）：缺符号/缺依赖编译失败 → 给失败子任务 "
-                    "补模块 pom 写权 %s + 重置重试计数，仅重派失败子任务 %s（保留 %d 个完成态），"
-                    "换备选模型，不进 PLAN、不清完成态全表",
-                    _tr, _tr_max, granted, failed_ids, len(_kept),
+                    "[HANDLE_FAILURE] 定向恢复（按子任务配额 %s / 上限 %d）：缺符号/缺依赖编译失败 → "
+                    "给失败子任务 补模块 pom 写权 %s + 重置重试计数，仅重派失败子任务 %s"
+                    "（保留 %d 个完成态；搭车重派/未计配额未重置计数=%s），换备选模型，不进 PLAN、不清完成态全表",
+                    {k: _trc[k] for k in granted}, _tr_max, granted, failed_ids, len(_kept), _riders,
                 )
                 return {
                     "plan": plan_obj,
@@ -425,7 +436,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                     "use_alternate_model": True,
                     "subtask_retry_counts": _rc,
-                    "targeted_recovery_count": _tr,
+                    "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
+                    "targeted_recovery_counts": _trc,
                     "targeted_recovery": True,
                 }
             # granted 为空（推不出模块 pom）→ 不 mutate、不自增计数，落常规 strategy（其自带
@@ -438,16 +450,19 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # ── round29 A(b)：模块「注册先于脚手架」依赖序定点重排（先于 replan 守卫拦截）──
     # worker 分类器坐实症状（清单注册的模块在树里不存在=plan 期边连反的确定性后果），重试/换模型/
     # replan 都治不了。定点插「registrant-after-scaffold」规范边（planning_core 删反向直边+传递防环）
-    # + 只重派失败子任务、保成功兄弟、重置徒劳重试计数；targeted_recovery_count 断路器（与 A2
+    # + 只重派失败子任务、保成功兄弟、重置徒劳重试计数；targeted_recovery_counts【按子任务】断路器（与 A2
     # 缺依赖阶梯共用配额）防死循环。掐断 d37a52a3 的「守卫堵死→阶梯三 revert→级联 abandon」死路。
     _order_mods = _module_order_violation_modules(subtask_results, failed_ids)
     if _order_mods and plan_obj is not None and failed_ids:
-        _tro = state.get("targeted_recovery_count", 0) + 1
         _tro_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
-        if _tro > _tro_max:
+        # 遗漏项#2：与 A2 同表按【子任务】计配额（targeted_recovery_counts），不再共用任务级
+        # 全局计数互相挤兑（round29-A 复核 #7 注记的正解）。
+        _trc_o = dict(state.get("targeted_recovery_counts") or {})
+        _eligible_o = [fid for fid in failed_ids if _trc_o.get(fid, 0) < _tro_max]
+        if not _eligible_o:
             logger.warning(
-                "[HANDLE_FAILURE] 序修复已达上限(%d 次)仍撞「注册先于脚手架」→ 落常规 %s 兜底",
-                _tro_max, strategy,
+                "[HANDLE_FAILURE] 失败子任务 %s 各自序修复配额均已达上限(%d 次)仍撞"
+                "「注册先于脚手架」→ 落常规 %s 兜底", failed_ids, _tro_max, strategy,
             )
         else:
             from swarm.brain.nodes.planning_core import _add_dep_safe, _insert_module_order_edge
@@ -482,15 +497,19 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     subtask_results.pop(fid, None)
                     if fid not in dispatch_remaining:
                         dispatch_remaining.append(fid)
-                # 结构性序问题上的既往重试是徒劳，不计能力配额；循环边界由 targeted_recovery_count 保证。
+                # 结构性序问题上的既往重试是徒劳，不计能力配额（仅限【本次消费配额】的 eligible
+                # 子任务，搭车者保留计数防绕过常规熔断）；循环边界由按子任务配额保证。
                 _rco = dict(state.get("subtask_retry_counts", {}))
-                for fid in failed_ids:
+                for fid in _eligible_o:
                     _rco[fid] = 0
+                    _trc_o[fid] = _trc_o.get(fid, 0) + 1
                 logger.info(
-                    "[HANDLE_FAILURE] 序修复（第 %d/%d 次）：清单注册的模块 %s 在树里不存在 → 插"
-                    "「注册后于脚手架」规范边 %s + 仅重派失败子任务 %s（保留 %d 个完成态），不进 PLAN",
-                    _tro, _tro_max, sorted(_order_mods), _edges, failed_ids,
-                    len([s for s in subtask_results if s not in failed_ids]),
+                    "[HANDLE_FAILURE] 序修复（按子任务配额 %s / 上限 %d）：清单注册的模块 %s 在树里"
+                    "不存在 → 插「注册后于脚手架」规范边 %s + 仅重派失败子任务 %s（保留 %d 个完成态；"
+                    "搭车重派/未计配额=%s），不进 PLAN",
+                    {k: _trc_o[k] for k in _eligible_o}, _tro_max, sorted(_order_mods), _edges,
+                    failed_ids, len([s for s in subtask_results if s not in failed_ids]),
+                    [f for f in failed_ids if f not in _eligible_o],
                 )
                 return {
                     "plan": plan_obj,
@@ -500,7 +519,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "failure_strategy": "retry",
                     "failure_escalated": False,
                     "subtask_retry_counts": _rco,
-                    "targeted_recovery_count": _tro,
+                    "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
+                    "targeted_recovery_counts": _trc_o,
                     "targeted_recovery": True,
                 }
             logger.warning(

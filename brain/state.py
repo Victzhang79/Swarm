@@ -103,7 +103,8 @@ class BrainState(TypedDict, total=False):
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
     replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
-    targeted_recovery_count: int        # P0-B(f9e38dae)：定向恢复次数熔断（防死循环）。共享配额：A2 缺依赖恢复 + round29 序修复阶梯（注册先于脚手架）
+    targeted_recovery_count: int        # P0-B(f9e38dae)：定向恢复累计次数——round29 遗漏项#2 起仅作遥测，熔断改用 targeted_recovery_counts（按子任务）
+    targeted_recovery_counts: dict[str, int]  # round29 遗漏项#2：定向恢复次数【按子任务】熔断 {sid: n}——旧任务级全局计数会被先失败者用光、饿死后续同类受害者（d37a52a3 st-25 从未拿到 pom 写权即"已达上限"空烧）。A2 缺依赖 + 序修复阶梯共用此表，同子任务环安全语义不变
     targeted_recovery: bool             # P0-B：本轮走了定向恢复（补 pom 写权+只重派失败，不进 PLAN/不清全表）
     confirm_reason: str                 # P0-3：confirm 进入原因(validation_failed|ultra|manual_confirm)
 

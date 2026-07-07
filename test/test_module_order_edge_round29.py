@@ -252,7 +252,7 @@ def _wo(sid, l1_passed, details=None):
     )
 
 
-def _order_violation_state(targeted_recovery_count=0):
+def _order_violation_state(targeted_recovery_count=0, targeted_recovery_counts=None):
     st_reg = _st("st-reg", writable=["pom.xml"])
     st_scaf = _st("st-scaf", create=["M/pom.xml"])
     st_dl = _st("st-dl", create=["M/src/main/java/D.java"])
@@ -273,6 +273,7 @@ def _order_violation_state(targeted_recovery_count=0):
         "subtask_retry_counts": {"st-dl": 3},
         "dispatch_remaining": [],
         "targeted_recovery_count": targeted_recovery_count,
+        "targeted_recovery_counts": dict(targeted_recovery_counts or {}),
     }
 
 
@@ -314,14 +315,15 @@ def test_order_violation_targeted_reorder():
 
 
 def test_order_violation_breaker_falls_through():
-    """targeted_recovery_count 达上限 → 不再 mutate plan，落常规兜底（不无限循环）。"""
+    """本子任务配额达上限 → 不再 mutate plan，落常规兜底（不无限循环）。
+    遗漏项#2 起熔断按【子任务】计（targeted_recovery_counts），全局计数仅遥测。"""
     from swarm.config.settings import get_config
 
     cap = get_config().model.max_retries
-    state = _order_violation_state(targeted_recovery_count=cap)
+    state = _order_violation_state(targeted_recovery_counts={"st-dl": cap})
     result = _run_handle_failure(state)
-    # 达上限后不该再走定点重排（要么常规守卫 retry 要么 escalate，但绝不再自增 targeted_recovery_count）
-    assert result.get("targeted_recovery_count", cap) <= cap + 1
+    counts = result.get("targeted_recovery_counts") or state["targeted_recovery_counts"]
+    assert counts.get("st-dl") == cap, "耗尽后不得再自增"
     plan = result.get("plan") or state["plan"]
     reg = next(s for s in plan.subtasks if s.id == "st-reg")
     # 上限后不 mutate plan（防兜底路径留孤儿边）

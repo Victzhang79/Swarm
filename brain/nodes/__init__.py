@@ -694,29 +694,41 @@ def _subtask_signature(st) -> tuple:
     return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
 
 
-def _surgical_replan_reset(old_results: dict, old_plan, new_plan) -> dict:
+def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
+                           old_recovery_counts: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
     （dispatch 据 completed_ids 自动跳过、不重跑）；新增/变更/失败 的清空重派。premature victory 由
-    "签名完全一致才保留"杜绝（旧 id 语义变=签名变→不保留→重派）。无旧完成态→空 reset（首规划）。"""
-    if not old_results:
+    "签名完全一致才保留"杜绝（旧 id 语义变=签名变→不保留→重派）。无旧完成态→空 reset（首规划）。
+
+    遗漏项#2 复核 MEDIUM：targeted_recovery_counts 同签名纪律修剪——replan 分批重编号使 id 复用
+    是【默认情形】（merge_subtask_batches 顺序重编 st-N），旧 id 的耗尽配额若粘滞会饿死语义全新的
+    同名子任务（把 round29 治的"被别人用量饿死"换个形态复发）。签名完全一致才保留配额记账。"""
+    if not old_results and not old_recovery_counts:
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
 
     preserved = {
-        sid: out for sid, out in old_results.items()
+        sid: out for sid, out in (old_results or {}).items()
         if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and l1_passed(out)
     }
+    pruned_counts = {
+        sid: n for sid, n in (old_recovery_counts or {}).items()
+        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid)
+    }
     logger.info(
-        "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber",
-        len(preserved), len(old_results),
+        "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber"
+        "；定向恢复配额记账保留 %d/%d 条（签名不一致=语义新子任务，不继承旧配额）",
+        len(preserved), len(old_results or {}),
+        len(pruned_counts), len(old_recovery_counts or {}),
     )
     return {
         "subtask_results": preserved,
         "dispatch_remaining": [],
         "failed_subtask_ids": [],
+        "targeted_recovery_counts": pruned_counts,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -775,7 +787,8 @@ async def plan(state: BrainState) -> dict:
             "failure_escalated": False,
             # round29 真因4 always-emit（复核 LOW）：SIMPLE 路径不走分批，恒发 []，保不变量字面自洽。
             "plan_batch_failed_modules": [],
-            **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
+            **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
+                                 old_recovery_counts=state.get("targeted_recovery_counts")),
             **plan_touch,
         }
 
@@ -1001,7 +1014,8 @@ async def plan(state: BrainState) -> dict:
         "plan_generation_failed": _plan_degraded is not None,
         # R2-1：同 SIMPLE 路径——PLAN 起点无条件清历史 escalate 粘滞
         "failure_escalated": False,
-        **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan),
+        **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
+                                 old_recovery_counts=state.get("targeted_recovery_counts")),
         **plan_touch,
     }
 

@@ -179,8 +179,11 @@ def test_targeted_recovery_circuit_breaks_then_giveup_preserves_build():
     （996db614 主失控：为 1 个修不动的子任务清空 34 个完成。阶梯三让其降级为诚实部分交付。）"""
     from swarm.config.settings import get_config
     cap = get_config().model.max_retries
+    # round29 遗漏项#2：熔断改按【子任务】计（targeted_recovery_counts），全局计数仅遥测——
+    # 本测语义不变（同子任务耗尽 → 阶梯三），只是配额键随之更新。
     with patch.object(nodes, "_get_brain_llm", _fake_llm("replan")):
-        out = asyncio.run(nodes.handle_failure(_state(targeted_recovery_count=cap)))
+        out = asyncio.run(nodes.handle_failure(
+            _state(targeted_recovery_counts={"st-24": cap})))
     # 定向恢复熔断 + 有成功兄弟 → 阶梯二(单文件拆不动)→阶梯三 give_up_preserve（非全盘 escalate）
     assert out.get("failure_strategy") == "give_up_preserve", out.get("failure_strategy")
     assert out.get("failure_escalated") is not True, "阶梯三消化 → 不再整任务 escalate FAILED"
