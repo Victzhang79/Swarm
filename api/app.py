@@ -750,6 +750,23 @@ async def on_startup():
         await reconcile_orphan_tasks()
     except Exception as e:
         logger.warning(f"启动对账跳过: {e}")
+
+    # round29 运维项：checkpoint 三表 GC（终态 TTL + 孤儿线程 + worker 子图 ns 残留，实测
+    # 无清理机制累积 14.4GB）。放对账之后（对账可能把孤儿任务标 FAILED→本轮即可清其过期项）；
+    # 后台执行不阻断启动（大库首清可能分钟级），自身 fail-safe。
+    async def _checkpoint_gc_bg() -> None:
+        # 纵深防御（hunter#2）：_spawn_bg 的 done-callback 不取 exception → 任何裸穿异常只会
+        # 延迟落 asyncio 的通用 "never retrieved" 告警（无上下文、时机不定）。此处自兜自记。
+        try:
+            import asyncio as _aio
+
+            from swarm.infra.checkpoint_gc import sweep_stale_checkpoints
+
+            await _aio.get_running_loop().run_in_executor(None, sweep_stale_checkpoints)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[checkpoint-gc] 后台任务异常（不影响服务）: %s", exc)
+
+    _spawn_bg(_checkpoint_gc_bg())
     logger.info("Swarm API started")
 
 
