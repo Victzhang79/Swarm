@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -72,6 +73,67 @@ def _sanitize_filename(name: str) -> str:
     return cleaned[:120]  # 限长
 
 
+def _max_body_bytes() -> int:
+    """D46：全局请求 body 上限（字节）。env SWARM_UPLOAD_MAX_BODY_BYTES，非法值回退默认
+    = 批次总大小上限 + 8MB multipart 封包余量；钳制下限 1KB。"""
+    default = MAX_TOTAL_BYTES + 8 * 1024 * 1024
+    raw = os.environ.get("SWARM_UPLOAD_MAX_BODY_BYTES", "")
+    try:
+        val = int(raw) if raw else default
+    except ValueError:
+        val = default
+    return max(1024, val)
+
+
+def _enforce_body_limit(request) -> None:
+    """D46 治本：在 request.form()（解析完整 multipart 进内存/磁盘）之前预检 body 大小。
+
+    - Content-Length 超上限 → 413（解析前即拒，DoS 面收敛到一个 header 比较）；
+    - 无 Content-Length（chunked）→ 411 fail-closed 拒绝。取舍：浏览器/httpx/curl 的
+      multipart 上传总是带 Content-Length；支持无长度流式上传需换流式 parser 带增量配额，
+      当前上传面（PRD/附件，≤60MB/批）不值得该复杂度，宁可显式拒绝也不承担无界解析。
+    Content-Length 由 HTTP 服务器（uvicorn）强制执行，客户端谎报小值只会被截断，不构成绕过。
+    """
+    cl = request.headers.get("content-length")
+    if cl is None:
+        raise HTTPException(status_code=411, detail="缺少 Content-Length：不支持 chunked 上传")
+    try:
+        n = int(cl)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="非法 Content-Length") from None
+    limit = _max_body_bytes()
+    if n > limit:
+        raise HTTPException(status_code=413, detail=f"请求体过大：{n} > {limit} 字节")
+
+
+async def _read_upload_limited(item, per_file_cap: int, remaining_batch: int):
+    """D46：分块读上传文件并【增量】校验大小，超限立即停读。
+
+    返回 (content, overflow)：overflow=True 表示超过单文件上限或批次剩余额度（content=None，
+    不再继续消费流）。旧码在 size 缺失时先 read() 整个文件进内存后才判 60MB——谎报/缺失
+    size 的巨型文件构成内存放大面。read 不支持带参（非 UploadFile 鸭子对象）时退化为
+    整读后判限（仍有上限兜底，只失去增量性）。
+    """
+    cap = min(per_file_cap, remaining_batch)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = await item.read(1024 * 1024)
+        except TypeError:
+            data = await item.read()
+            if len(data) > cap:
+                return None, True
+            return data, False
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            return None, True
+        chunks.append(chunk)
+    return b"".join(chunks), False
+
+
 def _check_magic(ext: str, head: bytes) -> bool:
     """文件头魔数校验。文本类（无魔数定义）直接通过。"""
     expected = _MAGIC_BYTES.get(ext)
@@ -93,6 +155,9 @@ async def upload_files(request: Request):
     返回 {batch_id, dir, files:[{filename, path, kind, size, error}]}。
     """
     _require_perm(request, "task:create")
+
+    # D46：解析 multipart 之前先做全局 body 上限预检（413/411），见 _enforce_body_limit。
+    _enforce_body_limit(request)
 
     form = await request.form()
     upload_files_list = form.getlist("files")
@@ -136,8 +201,13 @@ async def upload_files(request: Request):
                 results.append({"filename": raw_name, "error": "批次总大小超限"})
                 continue
 
-        # 读内容（一次性；上方已据 declared size 预拦超限文件）
-        content = await item.read()
+        # 读内容——D46：分块读 + 增量校验（declared 缺失/谎报防线），超限即断不再消费流。
+        content, _overflow = await _read_upload_limited(
+            item, doc_ingest.DEFAULT_MAX_FILE_BYTES, MAX_TOTAL_BYTES - total_bytes,
+        )
+        if _overflow:
+            results.append({"filename": raw_name, "error": "文件过大或批次总大小超限（增量校验截断）"})
+            continue
         size = len(content)
         total_bytes += size
 

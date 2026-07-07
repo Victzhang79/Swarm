@@ -88,7 +88,10 @@ def _pooled_conn(conn_str: str | None = None):
 
 def ensure_auth_tables(conn_str: str | None = None) -> None:
     conn_str = conn_str or _conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(AUTH_DDL)
             # _PROFILE_MIGRATION 是对 memory 层的 mem_user_profile 表做 ALTER。
@@ -154,11 +157,19 @@ def ensure_bootstrap_admin(
 
 
 def update_user_password(user_id: str, password: str, conn_str: str | None = None) -> None:
+    """改密并【吊销现有 token】（D19）。
+
+    改密的典型动机是凭据疑似泄露——若不触 token，被盗 token 改密后仍永久有效。
+    复用既有 P0-SEC-01 吊销机制（token_revoked，get_user_by_token 已过滤）；同一 UPDATE
+    原子完成，覆盖所有调用方（本人改密 / 管理员重置 / bootstrap 同步）。合法会话经
+    重新登录（rotate_user_token 铸新 token 并清 revoked）或改密端点返回的新 token 恢复。
+    """
     pwd_hash = hash_password(password)
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE swarm_users SET password_hash = %s, updated_at = now() WHERE id = %s",
+                "UPDATE swarm_users SET password_hash = %s, token_revoked = true, "
+                "updated_at = now() WHERE id = %s",
                 (pwd_hash, user_id),
             )
 

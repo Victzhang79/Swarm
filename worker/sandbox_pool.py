@@ -148,6 +148,55 @@ class HotSandboxPool:
         """必须持锁调用。"""
         return len(self._pool.get(key, []))
 
+    # ── D28：借出前保证剩余远端寿命 ≥ 子任务预算 ─────────
+
+    @staticmethod
+    def _required_remote_lifetime() -> float:
+        """子任务预算（秒）= 沙箱借出后至少要活这么久。与 SandboxManager.create 的默认
+        生命周期同源（max(worker.max_execution_time, 120)），config 不可用回退 600。"""
+        try:
+            from swarm.config.settings import get_config
+            return float(max(int(get_config().worker.max_execution_time), 120))
+        except Exception:  # noqa: BLE001
+            return 600.0
+
+    def _ensure_remote_lifetime(self, sandbox: Any) -> bool:
+        """锁外调用：复用借出前保证剩余远端寿命 ≥ 子任务预算。
+
+        D28 根因：沙箱远端生命周期锚定 create 时刻（默认 900s）从不续期，而 pool_ttl 600s
+        允许借出创建后 599s 的沙箱 → 剩余 ~300s 撞子任务 900s 预算 → 构建中途被远端拆卸、
+        run_command 连环 5xx 熔断。策略（组合）：
+          ① 优先续期（manager.try_extend_lifetime → SDK set_timeout 重置倒计时）；
+          ② 续期不可用/失败 → 校验 manager.remaining_lifetime，不足则 False（弃用新建）；
+          ③ manager 无寿命记账（旧版/mock/非本进程创建）→ 维持原行为放行（不误杀）。
+        """
+        required = self._required_remote_lifetime()
+        mgr = self._manager
+        extend = getattr(mgr, "try_extend_lifetime", None)
+        if callable(extend):
+            try:
+                if extend(sandbox, int(required)):
+                    return True
+            except Exception:  # noqa: BLE001 — 续期路径异常 → 回退剩余寿命校验
+                logger.warning("pool 续期调用异常，回退剩余寿命校验", exc_info=True)
+        remaining_fn = getattr(mgr, "remaining_lifetime", None)
+        if not callable(remaining_fn):
+            return True  # ③ 无寿命接口 → 原行为
+        try:
+            remaining = remaining_fn(getattr(sandbox, "sandbox_id", "") or "")
+        except Exception:  # noqa: BLE001
+            remaining = None
+        if remaining is None:
+            return True  # ③ 未记账 → 原行为
+        if remaining < required:
+            logger.warning(
+                "复用沙箱 %s 剩余远端寿命 %.0fs < 子任务预算 %.0fs 且续期不可用 → 弃用新建"
+                "（D28：防构建中途远端拆卸连环 5xx）",
+                getattr(sandbox, "sandbox_id", "?"), remaining, required,
+            )
+            return False
+        return True
+
     # ── 公开接口 ──────────────────────────────────────
 
     def acquire(
@@ -198,6 +247,14 @@ class HotSandboxPool:
             # 锁外做健康探针
             healthy = self._health_check(sandbox)
             if healthy:
+                # D28：借出前保证剩余远端寿命 ≥ 子任务预算（先试续期，失败校验剩余寿命）。
+                # 不足则弃用新建——绝不把"看着健康、马上被远端拆卸"的沙箱交给任务。
+                if not self._ensure_remote_lifetime(sandbox):
+                    self._kill_one(sandbox.sandbox_id)
+                    with self._lock:
+                        self._created_at.pop(sandbox.sandbox_id, None)
+                        self._template_by_sid.pop(sandbox.sandbox_id, None)
+                    return self._create_and_return(template_id, project_id, task_id, key)
                 # 取用前再清一次 workspace（双保险：防归还清理失败的残留）。
                 # 清理失败则弃用该沙箱、新建，绝不把脏沙箱交给任务。
                 if not self._clean_workspace(sandbox):
@@ -218,8 +275,10 @@ class HotSandboxPool:
                 except Exception:
                     logger.warning("register_sandbox_meta failed for %s", sandbox.sandbox_id, exc_info=True)
                 with self._lock:
-                    # 记下本次借出使用的 template（release 据此还原桶键，两侧对称）
-                    self._template_by_sid[sandbox.sandbox_id] = template_id or ""
+                    # D29：复用借出【不得】用请求 template_id 改写记账——该 sid 在 create 时
+                    # 已记下 _resolve_template 的实际解析镜像（可能与请求漂移），改写会让下次
+                    # 归还回错桶。仅在缺失时兜底补请求值。
+                    self._template_by_sid.setdefault(sandbox.sandbox_id, template_id or "")
                     self._borrowed += 1
                 return sandbox
             else:
@@ -254,6 +313,25 @@ class HotSandboxPool:
 
         sandbox = self._create_sandbox(template_id, project_id=project_id, task_id=task_id)
 
+        # D29：读回 create 时 _resolve_template 的【实际】解析结果作为桶键记账值。配置模板被
+        # 回收时 create 会自愈落到任意 READY 镜像（可能异语言）——桶键若仍用请求 template_id，
+        # 后续同请求的子任务会复用到错语言镜像（java 复用无 JDK 镜像 → mvn 127）。桶键用实际
+        # 镜像后：漂移镜像挂真实桶，java 请求匹配不上 → 新建（fail-closed），不误配。
+        actual_tpl = None
+        try:
+            getter = getattr(self._manager, "get_resolved_template", None)
+            if callable(getter):
+                actual_tpl = getter(sandbox.sandbox_id)
+        except Exception:  # noqa: BLE001 — 读不到实际值 → 退回请求值（原行为）
+            actual_tpl = None
+        requested_tpl = template_id or ""
+        if actual_tpl and requested_tpl and actual_tpl != requested_tpl:
+            logger.warning(
+                "[D29] 沙箱 %s 模板漂移：请求 %s → 实际解析 %s；池桶键用实际镜像，"
+                "防后续同模板请求复用到错语言镜像",
+                sandbox.sandbox_id, requested_tpl, actual_tpl,
+            )
+
         # TD2606-C7：create 成功后的记账/注册若抛异常，调用方拿不到 sandbox、它也未入池 →
         # 远端孤儿永不会被 release/kill。包 try/except，记账失败立即 kill 刚建的沙箱再抛。
         try:
@@ -261,8 +339,9 @@ class HotSandboxPool:
                 self._created_total += 1
                 # 记录首次创建时间（跨 acquire/release 保持，TTL 据此判定）
                 self._created_at[sandbox.sandbox_id] = time.monotonic()
-                # 记下 template（release 据此还原桶键，与 acquire 桶键对称）
-                self._template_by_sid[sandbox.sandbox_id] = template_id or ""
+                # 记下 template（release 据此还原桶键，与 acquire 桶键对称）；
+                # D29：优先实际解析镜像，读不到才退回请求值。
+                self._template_by_sid[sandbox.sandbox_id] = actual_tpl or requested_tpl
                 if not is_temp:
                     self._borrowed += 1
                 # 标记临时沙箱（release 时自动 kill）
@@ -390,19 +469,51 @@ class HotSandboxPool:
         try:
             from e2b_code_interpreter import Sandbox as _Sandbox
             alive: set[str] = set()
+
+            def _collect(items) -> None:
+                for sb in (items or []):
+                    sid = getattr(sb, "sandbox_id", None) or getattr(sb, "id", None)
+                    if sid:
+                        alive.add(sid)
+
             paginator = _Sandbox.list()
             items = getattr(paginator, "sandboxes", None)
-            if items is None and hasattr(paginator, "next_items"):
-                # 分页 API：取首页即可（池规模小）
-                items = paginator.next_items()
-            for sb in (items or []):
-                sid = getattr(sb, "sandbox_id", None) or getattr(sb, "id", None)
-                if sid:
-                    alive.add(sid)
+            if items is not None:
+                _collect(items)
+                return alive
+            if hasattr(paginator, "next_items"):
+                # D42 治本：分页 API 必须拉【全量】——只取首页时，落在后页的 idle 条目会被
+                # 误判幽灵剔账本且不 kill（远端活沙箱无人管吃配额，池退化持续新建）。
+                # 页数安全上限防 SDK 分页异常导致死循环；达上限仍未穷尽 → fail-closed：
+                # 返回 None（本轮跳过幽灵清理）+ WARN，绝不拿半截列表去误清。
+                max_pages = self._list_max_pages()
+                pages = 0
+                while getattr(paginator, "has_next", False) and pages < max_pages:
+                    _collect(paginator.next_items())
+                    pages += 1
+                if getattr(paginator, "has_next", False):
+                    logger.warning(
+                        "服务端沙箱列表分页超过安全上限 %d 页仍未穷尽，"
+                        "本轮跳过幽灵清理（fail-closed，防半截列表误清存活沙箱）",
+                        max_pages,
+                    )
+                    return None
             return alive
         except Exception:  # noqa: BLE001 — 拉取失败返回 None，调用方跳过幽灵清理
             logger.debug("拉取服务端沙箱列表失败，跳过幽灵清理", exc_info=True)
             return None
+
+    @staticmethod
+    def _list_max_pages() -> int:
+        """D42：分页拉取安全上限（页）。env SWARM_POOL_LIST_MAX_PAGES，非法值回退默认 50，
+        钳制 [1, 1000]。"""
+        import os as _os
+        raw = _os.environ.get("SWARM_POOL_LIST_MAX_PAGES", "")
+        try:
+            val = int(raw) if raw else 50
+        except ValueError:
+            val = 50
+        return min(1000, max(1, val))
 
     def reap(self) -> dict:
         """回收超 TTL / 空闲 / 不健康 / 服务端已消失（幽灵）的沙箱。

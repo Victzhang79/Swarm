@@ -170,7 +170,10 @@ def _get_conn_str(db_config: DatabaseConfig | None = None) -> str:
 def ensure_tables(conn_str: str | None = None) -> None:
     """同步建表（幂等）。由 scripts/init_db.py 与 app on_startup 统一调用。"""
     conn_str = conn_str or _get_conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             for ddl in ALL_DDL:
                 cur.execute(ddl)

@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from swarm.types import FileScope, KnowledgeContext, SubTask
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_TEMPLATE = """\
 你是 Swarm Worker Agent — 一个专业的代码实现智能体。
@@ -160,11 +163,33 @@ def build_worker_prompt(
         criteria_lines = "  （无明确验收标准，按子任务描述自行判断）"
 
     # 契约格式化（Brain shared_contract + 子任务 contract）
+    # D51：子任务完整契约改在【派发/构建 prompt 时】合成——shared 打底 + 子任务字段覆盖，
+    # 与旧 plan 期 enrich_plan_with_shared_contract 的 merge 语义（dict(shared) 后
+    # update(st.contract)）逐字节一致。plan 不再为每个子任务内联一份 shared 副本
+    # （50+ 子任务 × ~42K ≈ MB 级 plan，每次 checkpoint 序列化都被展开）。
+    # 旧 checkpoint 兼容：恢复出的 subtask.contract 已含 shared（旧 enrich 产物）时，
+    # 此处再合成是幂等的（同键同值覆盖），worker 可见契约不变。
     contract_payload: dict = {}
     if shared_contract:
         contract_payload["shared_contract"] = shared_contract
-    if subtask.contract:
-        contract_payload["subtask_contract"] = subtask.contract
+    _merged_contract: dict = dict(shared_contract or {})
+    _merged_contract.update(subtask.contract or {})
+    if _merged_contract:
+        contract_payload["subtask_contract"] = _merged_contract
+        # hunter#2 防御性可观测：子任务 contract 覆盖了 shared 同名键且值不同——要么是
+        # 合法的子任务级 override（by design 子任务字段优先），要么是旧 checkpoint 里
+        # plan 期 enrich 烤进去的【过期 shared 副本】在 replan 更新 shared 后遮蔽新值
+        # （无 provenance 无法区分）。记 info 留痕，漂移可排查，不改行为。
+        _shadowed = [
+            k for k, v in (subtask.contract or {}).items()
+            if k in (shared_contract or {}) and (shared_contract or {}).get(k) != v
+        ]
+        if _shadowed:
+            logger.info(
+                "[PROMPT] 子任务 %s contract 覆盖 shared_contract 同名键(值不同): %s"
+                "（合法 override 或旧 checkpoint 过期 shared 遮蔽，如怀疑后者请核对 replan 历史）",
+                getattr(subtask, "id", "?"), sorted(_shadowed)[:10],
+            )
     if contract_payload:
         try:
             contract_str = json.dumps(contract_payload, indent=2, ensure_ascii=False)

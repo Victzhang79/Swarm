@@ -23,6 +23,58 @@ def _batch_backoff_sleep(attempt: int) -> None:
     time.sleep(0.5 * (attempt + 1))
 
 
+# ── D54：HTTP 客户端复用 ──────────────────────────────────────────────
+# 旧行为：sync 路径每次 requests.post 裸调（每请求新建连接/TLS）、async 路径每次
+# embed_texts_async 新建 AsyncClient。改为：sync 用进程级 requests.Session（线程安全，
+# 连接池复用）；async 用【按事件循环】缓存的 AsyncClient（httpx AsyncClient 的连接池
+# 绑定创建它的 loop，跨 loop 复用会炸——测试/脚本多次 asyncio.run 是常态，故按 loop 键控，
+# loop 已关闭的条目惰性清理）。任一环节异常 → 回退一次性客户端（fail-closed 不丢功能）。
+_SYNC_SESSION = None
+_SYNC_SESSION_LOCK = None
+
+
+def _sync_session():
+    """进程级 requests.Session（惰性单例）；构造失败返回 None，调用方回退裸 requests。"""
+    global _SYNC_SESSION, _SYNC_SESSION_LOCK
+    if _SYNC_SESSION is not None:
+        return _SYNC_SESSION
+    try:
+        import threading
+        if _SYNC_SESSION_LOCK is None:
+            _SYNC_SESSION_LOCK = threading.Lock()
+        import requests
+        with _SYNC_SESSION_LOCK:
+            if _SYNC_SESSION is None:
+                _SYNC_SESSION = requests.Session()
+        return _SYNC_SESSION
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_ASYNC_CLIENTS: dict = {}  # id(loop) -> (loop, httpx.AsyncClient)
+
+
+def _async_client():
+    """当前事件循环的共享 AsyncClient；获取失败返回 None（调用方回退一次性 client）。"""
+    try:
+        import asyncio
+
+        import httpx
+        loop = asyncio.get_running_loop()
+        # 惰性清理已关闭 loop 的条目（防长期进程里 loop 轮换累积）
+        dead = [k for k, (lp, _c) in _ASYNC_CLIENTS.items() if lp.is_closed()]
+        for k in dead:
+            _ASYNC_CLIENTS.pop(k, None)
+        entry = _ASYNC_CLIENTS.get(id(loop))
+        if entry is not None and entry[0] is loop:
+            return entry[1]
+        client = httpx.AsyncClient(timeout=60.0)
+        _ASYNC_CLIENTS[id(loop)] = (loop, client)
+        return client
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _endpoint() -> tuple[str, str, str, int] | None:
     """返回 (base_url, api_key, model, batch_size) 或 None（未配置）。
 
@@ -74,7 +126,13 @@ def embed_texts_sync(texts: list[str]) -> list[list[float]] | None:
             last_err = ""
             for attempt in range(_BATCH_RETRIES):
                 try:
-                    resp = requests.post(
+                    # D54：优先复用进程级 Session（连接池），失败回退裸 requests（行为不变）。
+                    # requests.post 被 patch（单测 seam）时也走裸调，保 mock 可注入。
+                    _sess = _sync_session()
+                    _patched = requests.post is not getattr(
+                        getattr(requests, "api", None), "post", requests.post)
+                    _poster = _sess.post if (_sess is not None and not _patched) else requests.post
+                    resp = _poster(
                         f"{base}/embeddings",
                         json={"model": model, "input": batch},
                         headers=headers,
@@ -118,8 +176,14 @@ async def embed_texts_async(texts: list[str]) -> list[list[float]] | None:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         import asyncio
+        import contextlib
         out: list[list[float]] = []
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # D54：复用本 loop 的共享 AsyncClient（nullcontext 包装=不随 with 关闭）；
+        # 获取失败回退旧的一次性 client（fail-closed）。
+        _shared = _async_client()
+        _client_cm = (contextlib.nullcontext(_shared) if _shared is not None
+                      else httpx.AsyncClient(timeout=60.0))
+        async with _client_cm as client:
             for i in range(0, len(texts), max_batch):
                 batch = texts[i: i + max_batch]
                 vecs = None

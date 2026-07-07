@@ -216,7 +216,8 @@ def test_app_notification_milestone_endpoints_gated():
         "async def list_milestones(",
     ):
         assert marker in text
-    # 这些函数体都应含 _require_user(request)
+    # 这些函数体都应含 _require_user(request) 或其 async 等价（D48：热面鉴权卸线程，
+    # await _require_user_async(request) 语义与同步版逐字节一致，闸门不变）
     for fn_name in (
         "get_notifications",
         "get_unread_count",
@@ -225,7 +226,9 @@ def test_app_notification_milestone_endpoints_gated():
         "list_milestones",
     ):
         fn = getattr(mod, fn_name)
-        assert "_require_user(request)" in inspect.getsource(fn), f"{fn_name} 未鉴权"
+        src = inspect.getsource(fn)
+        assert ("_require_user(request)" in src
+                or "await _require_user_async(request)" in src), f"{fn_name} 未鉴权"
     # POST /api/milestones → 写权限
     assert '_require_perm(request, "config:write")' in inspect.getsource(mod.post_milestone_report)
 

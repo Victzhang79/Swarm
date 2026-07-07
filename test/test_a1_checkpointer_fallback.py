@@ -22,8 +22,13 @@ def test_fallback_to_memory_when_no_pg():
     assert compiled is not None
 
 
-def test_init_pg_returns_false_on_bad_uri():
-    """PG 连不上 → init 返回 False 并降级（不抛异常）。"""
+def test_init_pg_returns_false_on_bad_uri(monkeypatch):
+    """PG 连不上 → init 返回 False 并降级（不抛异常）。
+
+    次序隔离：本测钉的是【未显式要求强制 PG】时的降级路径。全量套件下先跑的测试
+    可能经 load_dotenv 把 .env 的 SWARM_REQUIRE_PG_CHECKPOINTER=1 灌进 os.environ，
+    令 init 走 fail-fast raise（by design 的另一条路径）——显式摘掉该变量隔离。"""
+    monkeypatch.delenv("SWARM_REQUIRE_PG_CHECKPOINTER", raising=False)
     g._pg_checkpointer = None
     g._pg_checkpointer_cm = None
     ok = asyncio.run(g.init_postgres_checkpointer("postgresql://nohost:1/nodb"))

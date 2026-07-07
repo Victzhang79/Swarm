@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -60,7 +61,10 @@ async def sync_mr_history_from_gitlab(
 
     try:
         try:
-            resp = client.get(
+            # D55：同步 httpx 卸线程——本函数被事件循环 await 直调，旧实现最多 1+limit(100+)
+            # 次同步 HTTP 全程冻结事件循环（SSE/worker/看守心跳停摆）。行为不变，仅卸载。
+            resp = await asyncio.to_thread(
+                client.get,
                 url,
                 headers=headers,
                 params={"state": "merged", "order_by": "updated_at", "sort": "desc", "per_page": limit},
@@ -83,7 +87,8 @@ async def sync_mr_history_from_gitlab(
                     changed: list[str] = []
                     try:
                         ch_url = f"{base}/api/v4/projects/{encoded}/merge_requests/{iid}/changes"
-                        cr = client.get(ch_url, headers=headers, timeout=20.0)
+                        # D55：每 MR 一次的同步 HTTP 同样卸线程（热点主体）
+                        cr = await asyncio.to_thread(client.get, ch_url, headers=headers, timeout=20.0)
                         # 非 200（429 限流 / 401 鉴权失败 / 5xx）→ 记录失败并跳过本 MR 的
                         # changed_files 更新，绝不把空列表当"真实无变更"静默写库。
                         cr.raise_for_status()

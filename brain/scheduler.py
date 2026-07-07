@@ -45,6 +45,13 @@ _pending_meta: dict[str, dict] = {}
 _admission_retries: dict[str, int] = {}
 # 超过此次数仍未就绪 → 放弃留池，强制放行交由 runner 兜底（executor 选通用池模板）
 _MAX_ADMISSION_RETRIES = 200  # ×3s ≈ 10min，覆盖最长沙箱构建耗时
+# D58：准入等待改【按任务记 next-retry】——旧实现留池后全局 sleep(3.0) 在消费循环内，
+# 一个项目沙箱未就绪会把整条队列（其它就绪项目的任务）一起卡 3s（队头阻塞）。
+# task_id → monotonic 时刻，未到期的留池任务出队即回队尾、不做就绪检查也不计重试。
+_admission_next_retry: dict[str, float] = {}
+_ADMISSION_RETRY_DELAY_S = 3.0  # 与旧 sleep(3.0) 同节奏：同一任务两次就绪检查间隔 ≥3s
+# 防热旋：一轮内第二次见到同一未到期任务 = 队列里只剩等待项 → 短睡让出循环
+_deferred_cycle: set[str] = set()
 
 _consumer_started = False
 _inflight: set[str] = set()
@@ -105,25 +112,43 @@ def is_task_claimed(task_id: str) -> bool:
 _is_already_running = is_task_claimed
 
 
-def _resolve_exec_meta(task_id: str) -> dict | None:
-    """取任务执行 meta：优先进程内 _pending_meta，缺失则从 DB 重建（P0-A leader 重启恢复）。
+def is_consumer_running() -> bool:
+    """D41：调度器消费循环是否在跑。retry_task 据此决定走统一准入（submit_task 入队）
+    还是直跑兜底（CLI/测试等无调度器环境，入队无人消费会静默丢任务）。"""
+    return _consumer_task is not None and not _consumer_task.done()
 
-    返回 None = 该队列项应丢弃（DB 无记录 or 已终态——陈旧残留）。
+
+def _resolve_exec_meta(task_id: str) -> dict | None:
+    """取任务执行 meta：进程内 _pending_meta 补全参数，DB status 复核准入（P0-A + D40）。
+
+    返回 None = 该队列项应丢弃（DB 无记录 / 非 SUBMITTED / 状态复核失败——fail-closed）。
     重建成功会回填 _pending_meta，避免同任务后续再查库。
     """
     meta = _pending_meta.get(task_id)
-    if meta is not None:
-        return meta
     from swarm.project import store
 
-    rec = store.get_task(task_id)
     # fail-closed：队列的唯一合法待跑项是 **SUBMITTED**（已入队、尚未开跑、无 checkpoint）。
     # ★对抗复核 P0 治本★：此前放行整个 ACTIVE_EXECUTION_STATES → 冷启动时 Redis 残留队列项
     # 若指向一个【已开跑/审批认领后为 ANALYZING】的任务，会被凭空用【全新 initial_state】在同
     # thread_id 上再跑一遍 run_task（非 Command(resume)）→ 与 PG checkpoint 里挂起的 interrupt/
     # 半执行图状态双写互踩。故只认 SUBMITTED；任何非 SUBMITTED 的队列项一律丢弃（交对账处置）。
-    if rec is None or rec.get("status") != "SUBMITTED":
+    # ★D40 治本★：状态复核对【缓存命中】路径同样生效——排队期任务可能被 cancel/终态化
+    # （DB 已 CANCELLED 而缓存 meta 仍在），旧口径缓存命中直接放行 → 已取消任务照常 run_task。
+    # DB 读失败也拒绝本次出队（任务仍是 SUBMITTED，自愈排水/重启对账会补），绝不盲放。
+    try:
+        rec = store.get_task(task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[Scheduler] 任务 %s 出队状态复核读库失败，fail-closed 丢弃本次出队（排水会补）: %s",
+            task_id, exc,
+        )
         return None
+    if rec is None or rec.get("status") != "SUBMITTED":
+        # 终态/取消/已开跑任务的陈旧 meta 一并清理，不泄漏
+        _pending_meta.pop(task_id, None)
+        return None
+    if meta is not None:
+        return meta
     meta = {
         "project_id": rec["project_id"],
         "description": rec["description"],
@@ -238,11 +263,23 @@ async def start_task_scheduler() -> None:
 
         # N-09：每次迭代包 try/except 保活——单次出队/准入/派发异常绝不能杀死整个消费
         # 循环（否则后续所有任务永久卡队列且无告警）。CancelledError 须放行以支持优雅停止。
+        import time as _t
+
         while True:
             try:
+                # D58：Redis 模式下 BLPOP 已充当"等待"（enqueue 即刻唤醒）；本轮是否已在
+                # 出队处阻塞等待过，决定尾部是否还需要 _wakeup 轮询等待。
+                _waited_in_dequeue = False
                 # 并发未满则尝试出队
                 if len(_inflight) < _max_concurrent():
-                    item = TaskQueue.dequeue()
+                    if TaskQueue.supports_blocking():
+                        # D58：BLPOP 三 key 一次往返、队列空时事件化等待 ≤2s（替代每 2s
+                        # tick 3 个 LPOP 轮询）。阻塞发生在 Redis 连接上，故必须卸线程——
+                        # 事件循环保持存活；2s 上限保证 stop/失主停调度器及时生效。
+                        item = await asyncio.to_thread(TaskQueue.dequeue_blocking, 2.0)
+                        _waited_in_dequeue = True
+                    else:
+                        item = TaskQueue.dequeue()
                     if item:
                         task_id = item["task_id"]
                         # 去重守卫：同 task 已在跑/在飞（重入队 or 重启后 Redis 残留双份）→
@@ -256,6 +293,20 @@ async def start_task_scheduler() -> None:
                         if meta is None:
                             logger.info("[Scheduler] 任务 %s 无有效记录或已终态，丢弃陈旧队列项", task_id)
                             continue
+                        # D58：留池任务未到 next-retry → 直接回队尾（不做就绪检查、不计重试、
+                        # 不 sleep），后队的就绪任务照常流动（去队头阻塞）。
+                        _nr = _admission_next_retry.get(task_id)
+                        if _nr is not None and _t.monotonic() < _nr:
+                            TaskQueue.enqueue(task_id, meta["project_id"],
+                                              priority=item.get("priority", "normal"))
+                            if task_id in _deferred_cycle:
+                                # 一轮内第二次遇到同一未到期任务 → 队列里只剩等待项，短睡防热旋
+                                _deferred_cycle.clear()
+                                await asyncio.sleep(0.5)
+                            else:
+                                _deferred_cycle.add(task_id)
+                            continue
+                        _deferred_cycle.discard(task_id)
                         # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
                         # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）
                         if not _project_ready_for_exec(meta["project_id"]):
@@ -268,33 +319,40 @@ async def start_task_scheduler() -> None:
                                 # normal/background 抢先出队执行（高优先级被饿死）。
                                 orig_priority = item.get("priority", "normal")
                                 TaskQueue.enqueue(task_id, meta["project_id"], priority=orig_priority)
+                                # D58：全局 sleep(3.0) 改按任务 next-retry——同一任务的就绪检查
+                                # 节奏不变（≥3s 一次），但不再把整条队列卡住 3s。
+                                _admission_next_retry[task_id] = _t.monotonic() + _ADMISSION_RETRY_DELAY_S
                                 if n == 1 or n % 20 == 0:
                                     logger.info("[Scheduler] 任务 %s 等待项目 %s 沙箱就绪，留池中（第 %d 次）",
                                                 task_id, meta["project_id"], n)
-                                await asyncio.sleep(3.0)
                                 continue
                             # 超上限：放弃留池，强制放行交由 runner/executor 兜底（通用池模板）
                             logger.warning("[Scheduler] 任务 %s 等待沙箱就绪超 %d 次，强制放行（executor 兜底选模板）",
                                            task_id, _MAX_ADMISSION_RETRIES)
                         _admission_retries.pop(task_id, None)
+                        _admission_next_retry.pop(task_id, None)
+                        _deferred_cycle.clear()  # 有任务真正派发 = 新一轮，等待项重新计
                         _pending_meta.pop(task_id, None)
                         _inflight.add(task_id)
                         _run_with_slot(task_id, meta, start_task_background)
                         continue  # 立即尝试下一个（填满并发额度）
                     # 队列空 + 有空槽 → 2nd#3 自愈排水（节流）：DB 里 SUBMITTED 但队列已丢的陈滞项
                     # 重入队，不必等下次重启对账（Redis flap/内存队列清 后自修复）。
+                    _deferred_cycle.clear()  # 队列已空 = 一轮结束
                     await _maybe_drain_stranded()
                 # ★复核 Item 3★：持续满负载下队列【永不空】→ 上面的排水分支永不触达 → 队列已丢的陈滞
                 # SUBMITTED 任务永久静默卡死(无日志/无告警)。故【无条件】再跑一次节流排水(30s 内幂等)——
                 # 去重守卫(_is_already_running)令重入队合法在队项无害(至多一次多余出队),代价可忽略。
                 await _maybe_drain_stranded()
-                # 队列空或并发已满 → 等唤醒或轮询
-                try:
-                    if _wakeup is not None:
-                        await asyncio.wait_for(_wakeup.wait(), timeout=2.0)
-                        _wakeup.clear()
-                except asyncio.TimeoutError:
-                    pass
+                # 队列空或并发已满 → 等唤醒或轮询。D58：BLPOP 路径本轮已在出队处等待过 2s，
+                # 不再叠加 _wakeup 等待（否则空闲延迟翻倍且 BLPOP 之外的窗口听不到唤醒）。
+                if not _waited_in_dequeue:
+                    try:
+                        if _wakeup is not None:
+                            await asyncio.wait_for(_wakeup.wait(), timeout=2.0)
+                            _wakeup.clear()
+                    except asyncio.TimeoutError:
+                        pass
             except asyncio.CancelledError:
                 logger.info("[Scheduler] 消费循环被取消，退出")
                 raise

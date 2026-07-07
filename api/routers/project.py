@@ -77,6 +77,25 @@ def _enforce_project_path_containment(resolved_path: str, project_root: str, all
         )
 
 
+def _caller_may_reuse_existing_project(user, existing_id: str) -> bool:
+    """D16：path 已被既存项目占用时，调用者可否幂等复用（不改写）该项目。
+
+    仅 全局 admin 或 该项目成员 可复用；成员查询失败 fail-closed 拒绝——
+    否则任何持 project:create 者提交受害者 path 即可拿到完整项目行（跨用户泄露/劫持）。
+    """
+    from swarm.auth.rbac import Role
+
+    if getattr(user, "global_role", None) == Role.ADMIN.value:
+        return True
+    if not existing_id:
+        return False
+    try:
+        import swarm.auth.store as _auth_store
+        return _auth_store.get_project_member_role(existing_id, user.id) is not None
+    except Exception:  # noqa: BLE001 — DB 抖动等：默认拒绝
+        return False
+
+
 @router.post("/api/projects", tags=["项目管理"])
 async def create_project(req: ProjectCreateRequest, request: Request):
     """创建项目并自动启动预处理
@@ -138,6 +157,8 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             )
 
     # 创建项目记录
+    from swarm.project.store import ProjectPathConflictError
+
     try:
         project = await loop.run_in_executor(
             None,
@@ -148,24 +169,98 @@ async def create_project(req: ProjectCreateRequest, request: Request):
                 description=req.description,
             ),
         )
-        if user.global_role != Role.ADMIN.value:
-            await loop.run_in_executor(
-                None,
-                lambda: set_project_member(project_id, user.id, Role.OWNER.value),
-            )
+    except ProjectPathConflictError as conflict:
+        # D16：path 已被既存项目占用 → 绝不改写。成员（或 admin）按幂等语义返回既有
+        # 项目（不触发预处理、不动成员表——重复添加同路径的合法场景）；其他人 409 拒绝，
+        # 响应不携带既存项目任何字段（防跨用户信息泄露）。
+        existing = conflict.existing or {}
+        allowed = await loop.run_in_executor(
+            None, lambda: _caller_may_reuse_existing_project(user, existing.get("id") or ""),
+        )
+        if not allowed or not existing.get("id"):
+            raise HTTPException(
+                status_code=409,
+                detail="该路径已被其他项目占用",
+            ) from None
+        _app.logger.info(
+            "create_project: path=%s 已存在(id=%s)，成员 %s 幂等复用（不改写）",
+            resolved_path, existing.get("id"), user.id,
+        )
+        return {"status": "ok", "project": existing, "existing": True}
     except Exception as e:
         _app.logger.error("Failed to create project: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="创建项目失败，请稍后重试或联系管理员") from e
 
-    # 后台启动预处理（不阻塞响应）
+    if user.global_role != Role.ADMIN.value:
+        # D16③：成员行必须挂在【store 返回的真实项目 id】上（勿用本地 uuid——
+        # 任何 id 改写都会让成员行成为不存在项目的永久孤儿）。
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: set_project_member(project["id"], user.id, Role.OWNER.value),
+            )
+        except Exception as e:
+            # D22 治本：项目行与成员行非原子——成员写入失败会留下【创建者自己都看不到】的
+            # 孤儿项目（不在 list_user_project_ids 白名单）。补偿删除刚建项目，不留孤儿；
+            # 补偿失败必须 error 留痕（可观测，运维可按 id 清理），两种情况都对外报错。
+            _app.logger.error(
+                "create_project: 成员授权写入失败 project=%s user=%s，补偿删除刚建项目: %s",
+                project["id"], user.id, e, exc_info=True,
+            )
+            try:
+                removed = await loop.run_in_executor(
+                    None, lambda: _app.store.delete_project(project["id"]),
+                )
+                if not removed:
+                    _app.logger.error(
+                        "create_project: 补偿删除未生效（孤儿项目残留，需人工清理）project=%s",
+                        project["id"],
+                    )
+            except Exception:  # noqa: BLE001 — 补偿失败不掩盖主错误，但必须留痕
+                _app.logger.error(
+                    "create_project: 补偿删除失败（孤儿项目残留，需人工清理）project=%s",
+                    project["id"], exc_info=True,
+                )
+            raise HTTPException(
+                status_code=500, detail="创建项目失败（成员授权写入失败，已回滚）",
+            ) from e
+
+    # 后台启动预处理（不阻塞响应）。D16③：一律用 store 返回的真实 id/path。
+    real_project_id = project["id"]
+    real_project_path = project.get("path") or resolved_path
+
+    # D20：创建路径同样先认领 in-flight 守卫（与 trigger_preprocess 同一 CAS），
+    # 堵住"创建后立刻手动 trigger"窗口内的并发双跑。认领失败=已有执行者，跳过 spawn。
+    from swarm.project.preprocess import _preprocess_timeout_sec as _pp_timeout_sec
+    try:
+        _pp_claimed = await loop.run_in_executor(
+            None,
+            lambda: _app.store.claim_preprocess_slot(
+                real_project_id, stale_after_sec=_pp_timeout_sec() + 600),
+        )
+    except Exception:  # noqa: BLE001 — 守卫自身故障不阻断创建；preprocess 可手动重触发
+        _app.logger.exception("claim_preprocess_slot failed for %s（跳过自动预处理）", real_project_id)
+        _pp_claimed = False
+
     async def _run_preprocess():
         try:
             from swarm.project.preprocess import preprocess_project
-            await preprocess_project(project_id, resolved_path)
+            await preprocess_project(real_project_id, real_project_path)
         except Exception as e:
-            _app.logger.error(f"Preprocessing failed for project {project_id}: {e}")
+            _app.logger.error(f"Preprocessing failed for project {real_project_id}: {e}")
+            # D20：preprocess_project 入口前的意外失败会让项目卡 PREPROCESSING——
+            # best-effort 置 ERROR 释放 in-flight 守卫。
+            try:
+                await loop.run_in_executor(
+                    None, lambda: _app.store.update_project(real_project_id, status="ERROR"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
-    _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
+    if _pp_claimed:
+        _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
+    else:
+        _app.logger.info("项目 %s 预处理已有执行者/守卫未认领，跳过自动 spawn", real_project_id)
 
     return {"status": "ok", "project": project}
 
@@ -247,15 +342,25 @@ async def trigger_preprocess(project_id: str, request: Request):
 
     project_path = project["path"]
 
+    # D20：in-flight 守卫——DB CAS 原子认领（含同事务进度重置），并发双触发只有一个
+    # 拿到执行权，杜绝两个 preprocess 并发交错互删 kb_symbol_index / Qdrant 代际向量。
+    # stale 判定：正常运行由 preprocess 总超时（wait_for）兜底必在窗口内落终态并 bump
+    # updated_at；PREPROCESSING 且超过【总超时+10min】未动 = 崩溃残留，允许重入（不永拒）。
+    from swarm.project.preprocess import _preprocess_timeout_sec
+    stale_after = _preprocess_timeout_sec() + 600
     try:
-        await loop.run_in_executor(None, _app.store.reset_preprocess_progress, project_id)
-        await loop.run_in_executor(
+        claimed = await loop.run_in_executor(
             None,
-            lambda: _app.store.update_project(project_id, status="PREPROCESSING"),
+            lambda: _app.store.claim_preprocess_slot(project_id, stale_after_sec=stale_after),
         )
     except Exception as e:
-        _app.logger.exception("Failed to reset preprocess state for %s", project_id)
+        _app.logger.exception("Failed to claim preprocess slot for %s", project_id)
         raise HTTPException(status_code=500, detail="启动预处理失败，请稍后重试") from e
+    if not claimed:
+        raise HTTPException(
+            status_code=409,
+            detail="该项目已在预处理中，请等待完成后再触发",
+        )
 
     # 后台启动预处理
     async def _run_preprocess():
@@ -264,6 +369,13 @@ async def trigger_preprocess(project_id: str, request: Request):
             await preprocess_project(project_id, project_path)
         except Exception:
             _app.logger.exception("Preprocessing failed for project %s", project_id)
+            # D20：入口前意外失败会让项目卡 PREPROCESSING——best-effort 置 ERROR 释放守卫。
+            try:
+                await loop.run_in_executor(
+                    None, lambda: _app.store.update_project(project_id, status="ERROR"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
     _app.logger.info("Preprocess queued for project %s path=%s", project_id, project_path)

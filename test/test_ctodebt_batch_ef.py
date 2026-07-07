@@ -12,13 +12,15 @@ import inspect
 def test_make_point_id_stable_and_shared():
     from swarm.knowledge.semantic_index import make_point_id
 
-    a = make_point_id("pkg/m.py", 10, "def foo(): return 1")
-    b = make_point_id("pkg/m.py", 10, "def foo(): return 1")
-    assert a == b, "同 (file,line) 必须产同一 ID"
-    assert a != make_point_id("pkg/m.py", 11, "def foo(): return 1")  # 行不同→不同
-    # A-P1-19：ID 只按 (file,line)，content 不参与 → 同 (file,line) 不同内容产同一 ID，
+    a = make_point_id("p1", "pkg/m.py", 10, "def foo(): return 1")
+    b = make_point_id("p1", "pkg/m.py", 10, "def foo(): return 1")
+    assert a == b, "同 (project,file,line) 必须产同一 ID"
+    assert a != make_point_id("p1", "pkg/m.py", 11, "def foo(): return 1")  # 行不同→不同
+    # A-P1-19：ID 按 (project,file,line)，content 不参与 → 同键不同内容产同一 ID，
     # 这才让 codegraph(签名|文档|名) 与 semantic(分块原文) 两路径对同一逻辑 chunk 真正去重。
-    assert a == make_point_id("pkg/m.py", 10, "def bar(): return 2")  # 内容不同→仍同 ID
+    assert a == make_point_id("p1", "pkg/m.py", 10, "def bar(): return 2")  # 内容不同→仍同 ID
+    # D13：project_id 参与 key → 跨项目同 (file,line) 不同 ID（不互相覆盖）
+    assert a != make_point_id("p2", "pkg/m.py", 10, "def foo(): return 1")
     assert isinstance(a, str) and len(a) == 36  # uuid5 字符串
 
 
@@ -28,8 +30,8 @@ def test_make_point_id_cross_path_same_chunk():
 
     codegraph_content = "def foo(a, b): ... | 计算两数之和 | foo"   # 签名|文档|名
     semantic_content = "def foo(a, b):\n    return a + b\n"        # 分块原文
-    assert make_point_id("svc/x.py", 42, codegraph_content) == make_point_id(
-        "svc/x.py", 42, semantic_content
+    assert make_point_id("p1", "svc/x.py", 42, codegraph_content) == make_point_id(
+        "p1", "svc/x.py", 42, semantic_content
     )
 
 

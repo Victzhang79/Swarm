@@ -73,7 +73,10 @@ def _conn_str() -> str:
 def ensure_tables(conn_str: str | None = None) -> None:
     """建 command_blacklist 表（幂等）+ seed 内置默认规则。由 init_db/startup 调用。"""
     conn_str = conn_str or _conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(COMMAND_BLACKLIST_DDL)
             # seed 内置规则（仅当表内无 builtin 规则时，避免重复 seed / 覆盖用户删除）

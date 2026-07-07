@@ -45,7 +45,10 @@ def check_project_consistency(
         return {"ok": False, "error": "project path not found", "stale_files": [], "missing_index": []}
 
     indexed: dict[str, datetime | None] = {}
-    with psycopg.connect(_conn_str()) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout（不加 autocommit，保持原事务语义）。
+    with psycopg.connect(_conn_str(), **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """

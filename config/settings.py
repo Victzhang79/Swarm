@@ -46,6 +46,33 @@ import threading as _threading
 _ENV_WRITE_LOCK = _threading.Lock()
 
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def env_file_lock(env_path: "Path | str"):
+    """D47c：.env【读-改-写】全程互斥锁（fcntl.flock 于 <env>.lock sidecar 文件）。
+
+    atomic_write_env 只保证单次【写】原子；读改写序列无锁时两个写者读到同一旧内容、
+    后写覆盖前写（last-write-wins 丢键）。写者跨线程（async 端点在事件循环、密钥迁移在
+    executor 线程），threading 锁不够语义清晰且不防多进程——flock 跨线程/跨进程通用。
+    锁 sidecar 而非 .env 本身：atomic_write_env 用 os.replace 换 inode，锁旧 inode 会失效。
+    所有 .env RMW 调用点（PUT /api/config、PUT /api/routing、_persist_env_updates、
+    密钥迁移清明文、sandbox pool toggle）须在本锁内完成 读→改→写（→失败回滚）。
+    """
+    env_path = Path(env_path)
+    lock_path = env_path.with_name(env_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
+
+    with open(lock_path, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def atomic_write_env(env_path: "Path | str", content: str) -> None:
     """原子写 .env：同目录写 tmp → fsync → os.replace 改名；全局锁串行化并发写。
 
@@ -81,7 +108,10 @@ class DatabaseConfig(BaseSettings):
         extra="ignore",
     )
 
-    postgres_uri: str = "postgresql://swarm:swarm@localhost:5432/swarm"
+    # D15：默认 DSN 自带 connect_timeout（libpq URI 参数）——兜住未显式传 kwargs 的直连点
+    # （scripts/checkpointer 等）。显式 kwargs（infra.db.pg_connect_timeout_kwargs）优先级更高；
+    # 用户经 SWARM_DB_POSTGRES_URI 覆盖 DSN 时建议同样带上 connect_timeout。
+    postgres_uri: str = "postgresql://swarm:swarm@localhost:5432/swarm?connect_timeout=10"
     redis_uri: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "swarm_kb"
@@ -386,8 +416,9 @@ class WorkerConfig(BaseSettings):
                                       # PLAN 端按层拆分(每子任务≤4文件)双管：拆分治本、预算兜底。
     max_iterations: int = 50          # Agent 最大 Tool 调用轮次
     max_fix_rounds: int = 3           # 编码内循环最大修复轮次
-    memory_limit: str = "2g"
-    disk_limit: str = "5g"
+    # D59：原 memory_limit/disk_limit 定义即终点（全仓零消费者，从未接进 sandbox create）。
+    # e2b/CubeMaster 的 Sandbox.create 参数面只有 template/timeout/metadata/request_timeout，
+    # 不支持每沙箱资源上限（资源规格烤在模板镜像里）→ 无法接线，删除装饰性定义防误导运维。
     command_whitelist: list[str] = Field(default_factory=lambda: [
         "mvn compile", "mvn test", "npm build", "npm test",
         "python -m py_compile", "python -m pytest",
@@ -569,7 +600,8 @@ class KnowledgeConfig(BaseSettings):
     # 0 = 关闭（默认，仅靠增量 + 手动触发）；>0 = 每 N 小时检查一次 stale 项目并重跑。
     auto_reprocess_hours: float = 0.0
     auto_reprocess_check_interval: int = 1800   # 调度器检查间隔（秒，默认 30 分钟）
-    index_update_timeout: int = 30    # 秒
+    # D59：原 index_update_timeout 定义即终点（全仓零消费者）→ 删除装饰性定义。增量索引
+    # 的超时由各调用点显式传参/自身默认值控制，从未读过此配置。
     # 增量更新累计 N 次文件变更后，后台触发一次依赖图重建（kb_dependency_graph
     # 只在全量 preprocess 时才建，增量更新只删自身出边兜底；累积漂移到阈值后
     # 触发真重建以纠正缺边）。<=0 关闭自动重建（仅删出边 + 阈值日志）。

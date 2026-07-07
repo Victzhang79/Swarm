@@ -123,6 +123,9 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
     # 进入、连接未建，无泄漏；acquire 成功后无 await 直接进 try，finally 保证 release + close。
     # 临界区(检查幂等 → 写入含 reinforce)在进程级锁内串行，原子闭合 TOCTOU/竞态。
     await _persist_lock.acquire()
+    # D60：store 先绑定 None——若 MemoryStore() 构造即抛，finally 里 close 引用未绑定名会抛
+    # NameError/UnboundLocalError【顶替原始异常】（except 已如实返回的 error dict 也被吞掉）。
+    store: MemoryStore | None = None
     try:
         store = MemoryStore()
         await store.connect()
@@ -189,7 +192,8 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
         return {"persisted": False, "error": str(exc)}
     finally:
         _persist_lock.release()
-        await store.close()
+        if store is not None:
+            await store.close()
 
 
 async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +226,7 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
     # 进入、连接未建，无泄漏；acquire 成功后无 await 直接进 try，finally 保证 release + close。
     # 临界区(检查幂等 → 写入含 reinforce)在进程级锁内串行，原子闭合 TOCTOU/竞态。
     await _persist_lock.acquire()
+    store: MemoryStore | None = None  # D60：防构造抛异常时 finally close NameError 顶替原异常
     try:
         store = MemoryStore()
         await store.connect()
@@ -268,7 +273,8 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
         return {"persisted": False, "error": str(exc)}
     finally:
         _persist_lock.release()
-        await store.close()
+        if store is not None:
+            await store.close()
 
 
 def merge_persist_meta(learn_summary: str, persist_meta: dict[str, Any]) -> str:

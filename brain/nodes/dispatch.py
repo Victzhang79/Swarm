@@ -11,7 +11,11 @@ import logging
 
 from swarm.audit import audit
 from swarm.brain.context_log import touch_context
-from swarm.brain.nodes.shared import _diff_has_changes, _worker_profile_prompt
+from swarm.brain.nodes.shared import (
+    _subtask_produced_expected,
+    _worker_profile_prompt,
+    completed_l1_ids,
+)
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.memory.sliding_window import PRIORITY_WORKER
@@ -284,7 +288,9 @@ async def dispatch(state: BrainState) -> dict:
             )
             dispatch_remaining = _orphaned
 
-    completed_ids = set(subtask_results.keys())
+    # 治本 D23：依赖闸门只把【L1 通过】的结果当"已完成"。滞留的 L1 未通过失败结果不得满足
+    # 下游 depends_on（否则上游从未真正成功、下游提前派发空烧）。消费 l1_passed 单一事实源。
+    completed_ids = completed_l1_ids(subtask_results)
     config = get_config()
     max_concurrent = config.worker.max_concurrent
 
@@ -324,6 +330,10 @@ async def dispatch(state: BrainState) -> dict:
         _empty: dict = {
             "subtask_results": subtask_results,
             "dispatch_remaining": dispatch_remaining,
+            # 治本 D24：早退分支也遵守 always-emit 契约，始终回填 failed_subtask_ids（空也回填）。
+            # 否则 last-write-wins 通道残留上一轮（如 contract 失败）的 failed 列表 → monitor 误读
+            # 残留失败再进 handle_failure，此时 verification_failure 已清 → 走常规能力阶梯误全量重跑。
+            "failed_subtask_ids": list(state.get("failed_subtask_ids", [])),
         }
         if _gate_split:
             _empty["plan"] = plan_obj  # 闸门拆小后须回写新 plan，否则子块在旧 plan 找不到→孤儿
@@ -440,7 +450,10 @@ async def dispatch(state: BrainState) -> dict:
             f"(L1={'通过' if worker_output.l1_passed else '未通过'}, "
             f"diff={len(worker_output.diff or '')} chars)"
         )
-        if not _diff_has_changes(worker_output.diff or "") or not worker_output.l1_passed:
+        # 治本 D01：成功判据 = L1 通过 且 产出符合【该 intent/scope 预期的变更形态】。
+        # 旧判据 `_diff_has_changes`（只认 `+` 行）把 AUDIT（空 diff 合法）与纯删除子任务
+        # （只有 `-` 行 + `+++ /dev/null`）结构性判失败 → 反复重试至 abandon、审计意图无成功终态。
+        if not worker_output.l1_passed or not _subtask_produced_expected(worker_output, subtask):
             if subtask.id not in failed_ids:
                 failed_ids.append(subtask.id)
         else:

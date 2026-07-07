@@ -213,6 +213,22 @@ def _require_perm(request: Request, permission: str, project_id: str | None = No
         raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
     return user
 
+# ── D48：鉴权 PG 查询卸线程（async 端点在事件循环上做同步 PG 查询，DB 延迟抖动 ×
+# 数十活跃连接会冻结事件循环 → 单进程全站故障）。收口在这两个 async 包装：高频轮询
+# 端点（任务列表/沙箱状态/通知/metrics/SSE 建流与重认证）统一 await 这里；语义与同步
+# 版逐字节一致（同一函数，仅执行线程不同），HTTPException 原样穿透 to_thread。
+async def _require_user_async(request: Request):
+    import asyncio
+
+    return await asyncio.to_thread(_require_user, request)
+
+
+async def _require_perm_async(request: Request, permission: str, project_id: str | None = None):
+    import asyncio
+
+    return await asyncio.to_thread(_require_perm, request, permission, project_id)
+
+
 def _profile_storage_key(user_id: str, project_id: str) -> str:
     from swarm.auth.store import profile_key
 

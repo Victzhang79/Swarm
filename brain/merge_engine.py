@@ -59,9 +59,44 @@ class _FilePatch:
     file_path: str
     header_lines: list[str]
     hunks: list[_Hunk]
+    # D03：`+++ /dev/null`（或 `deleted file mode`）→ 该段是【删除】意图，输出须表达为
+    # `+++ /dev/null` + 全 `-` 行，而非被伪路径归并成新文件后丢掉 `-` 行蒸发。
+    is_deletion: bool = False
+    # D06：rename / copy / 二进制段无法字符级合并（无 _Hunk 表示），必须【整段透传】保留原文，
+    # 绝不静默丢弃。passthrough 非空时 merge_diffs 原样 emit 该段、跳过 hunk 合并。
+    passthrough: str | None = None
 
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _strip_diff_path(raw_path: str) -> str:
+    """从 `--- `/`+++ `/rename 行的路径值提取干净相对路径。
+
+    D03 根因治本：旧代码 `plus[6:]` 硬假定前缀恒为 `+++ b/`（6 字符）→ 对 `+++ /dev/null`
+    切成 "ev/null"。正确做法：调用方已剥 `--- `/`+++ ` 前缀（4 字符），此处只负责识别
+    `/dev/null` 哨兵、剥 `a/`|`b/` 前缀、去掉可选的 `\t 时间戳` 后缀。
+    """
+    p = raw_path.strip()
+    if "\t" in p:  # `+++ b/foo\t2024-...` 形式的时间戳后缀
+        p = p.split("\t", 1)[0].strip()
+    if p == "/dev/null":
+        return "/dev/null"
+    if p.startswith(("a/", "b/")):
+        p = p[2:]
+    return p
+
+
+def _parse_git_header_paths(line: str) -> tuple[str, str]:
+    """从 `diff --git a/PATH b/PATH` 抽 (old, new) 相对路径（best-effort，含空格路径尽力而为）。"""
+    rest = line[len("diff --git "):]
+    if rest.startswith("a/") and " b/" in rest:
+        a_part, b_part = rest.split(" b/", 1)
+        return a_part[2:], b_part
+    parts = rest.split()
+    if len(parts) == 2:
+        return _strip_diff_path(parts[0]), _strip_diff_path(parts[1])
+    return "", ""
 
 
 def _recount_hunk_header(header_line: str, body_lines: list[str]) -> str:
@@ -112,9 +147,14 @@ def _split_raw_diffs(diff: str) -> list[str]:
     chunks: list[list[str]] = []
     current: list[str] = []
 
-    for line in lines:
+    for idx, line in enumerate(lines):
+        # D05 治本：`--- ` 只有在【下一行是 `+++ `】时才是真文件边界。否则 hunk 体内以 `--- `
+        # 开头的删除行（如删 SQL/Lua 注释 `-- comment` → diff 行 `--- comment`）会被误当边界、
+        # 把文件段从 hunk 中间切开。与 project/diff_apply.split_diff_by_file 的守卫对齐。
+        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
         is_new_file = line.startswith("diff --git ") or (
-            line.startswith("--- ") and current and any(l.startswith("+++ ") for l in current)
+            line.startswith("--- ") and nxt.startswith("+++ ")
+            and current and any(l.startswith("+++ ") for l in current)
         )
         if is_new_file and current:
             chunks.append(current)
@@ -144,6 +184,43 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
     if not lines or (len(lines) == 1 and lines[0] == ""):
         return None
 
+    # ── 先扫非-hunk 元数据行判段类型（D06：rename/copy/binary，D03：deletion 提示）──
+    # rename/copy 段可能【无 hunk】、二进制段【无法字符级合并】——都必须整段透传保留而非丢弃。
+    # 元数据行(diff --git/rename/copy/GIT binary/Binary files/deleted file mode)恒【无前缀字符】，
+    # 而 diff 内容行(context/add/del)恒带 ` `/`+`/`-` 前缀，故 startswith 无前缀匹配不会误伤内容行。
+    is_rename = is_binary = is_deletion = False
+    rename_old = rename_new = ""
+    git_a = git_b = ""
+    for ln in lines:
+        if ln.startswith("diff --git "):
+            ap, bp = _parse_git_header_paths(ln)
+            if ap:
+                git_a = ap
+            if bp:
+                git_b = bp
+        elif ln.startswith("rename from "):
+            is_rename = True
+            rename_old = _strip_diff_path(ln[len("rename from "):])
+        elif ln.startswith("rename to "):
+            is_rename = True
+            rename_new = _strip_diff_path(ln[len("rename to "):])
+        elif ln.startswith("copy from "):
+            is_rename = True
+            rename_old = _strip_diff_path(ln[len("copy from "):])
+        elif ln.startswith("copy to "):
+            is_rename = True
+            rename_new = _strip_diff_path(ln[len("copy to "):])
+        elif ln.startswith("GIT binary patch") or ln.startswith("Binary files "):
+            is_binary = True
+        elif ln.startswith("deleted file mode"):
+            is_deletion = True
+
+    # D06：rename/copy/binary 无法安全字符级合并 → 整段透传（fail-closed：最差是 apply 冲突【可见】，
+    # 远优于静默丢内容）。file_path 仍解析出来供上层做冲突去重键与诊断。
+    if is_rename or is_binary:
+        fp = rename_new or git_b or rename_old or git_a or "unknown"
+        return _FilePatch(file_path=fp, header_lines=[], hunks=[], passthrough=raw)
+
     file_path = ""
     header_lines: list[str] = []
     hunks: list[_Hunk] = []
@@ -151,26 +228,39 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
 
     while i < len(lines):
         line = lines[i]
-        if line.startswith("--- "):
+        # 文件头对：`--- OLD` 紧跟 `+++ NEW`。要求相邻的 `+++ `，才不会把 hunk 体内被删除的
+        # `--- comment` 行（D05）误当文件头。
+        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
             header_lines.append(line)
-            i += 1
-            if i < len(lines) and lines[i].startswith("+++ "):
-                plus = lines[i]
-                header_lines.append(plus)
-                path = plus[6:].strip()
-                if path.startswith("b/"):
-                    path = path[2:]
-                if path and path != "/dev/null":
-                    file_path = path
-                i += 1
+            old_path = _strip_diff_path(line[4:])
+            plus = lines[i + 1]
+            header_lines.append(plus)
+            new_path = _strip_diff_path(plus[4:])  # D03：剥 4 字符前缀，正确识别 /dev/null
+            i += 2
+            if new_path == "/dev/null":
+                # 删除：目标是 /dev/null，真实路径在 `--- OLD` 侧。
+                is_deletion = True
+                if old_path and old_path != "/dev/null":
+                    file_path = old_path
+            elif new_path:
+                file_path = new_path
+            elif old_path and old_path != "/dev/null":
+                file_path = old_path
             continue
 
         match = _HUNK_RE.match(line)
         if match:
             hunk_lines = [line]
             i += 1
-            while i < len(lines) and not lines[i].startswith("@@ ") and not lines[i].startswith("--- "):
-                hunk_lines.append(lines[i])
+            # D05：hunk body 收集在遇到下一个 `@@ ` / `diff --git ` / 【真】文件边界(`--- ` 紧跟
+            # `+++ `) 时才终止。裸 `--- ` 删除行不再截断 hunk。
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.startswith("@@ ") or nxt.startswith("diff --git "):
+                    break
+                if nxt.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                    break
+                hunk_lines.append(nxt)
                 i += 1
             hunks.append(
                 _Hunk(
@@ -193,9 +283,11 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
     if not file_path and not hunks:
         return None
     if not file_path and hunks:
-        file_path = "unknown"
+        file_path = git_b or git_a or "unknown"
 
-    return _FilePatch(file_path=file_path, header_lines=header_lines, hunks=hunks)
+    return _FilePatch(
+        file_path=file_path, header_lines=header_lines, hunks=hunks, is_deletion=is_deletion
+    )
 
 
 def _new_side_lines(hunks: list[_Hunk]) -> list[str]:
@@ -293,6 +385,37 @@ def _format_file_patch(
         else:  # 非标准 hunk（无 @@ 头）：保守原样
             body.append(hdr)
             body.extend(hbody)
+    return "\n".join(header + body)
+
+
+def _format_deletion_patch(file_path: str, hunks: list[_Hunk]) -> str:
+    """D03：输出【删除补丁】——`deleted file mode` + `--- a/path` + `+++ /dev/null` + 全 `-` 行。
+
+    删除的 hunk 形如 `@@ -1,N +0,0 @@`（全 `-` 行）。逐 hunk 规范化 body 并重算 @@ 头（复用
+    _recount_hunk_header，保头体一致），git apply 据 `+++ /dev/null` 识别为删除。空文件删除
+    （无 hunk）→ 仅输出头四行，git 亦能删除 0 字节文件。
+    """
+    body: list[str] = []
+    for hunk in sorted(hunks, key=lambda h: h.old_start):
+        hlines = list(hunk.lines)
+        if not hlines:
+            continue
+        hdr, hbody = hlines[0], hlines[1:]
+        while hbody and hbody[-1] == "":          # 丢尾部 split 产物 ""
+            hbody.pop()
+        hbody = [(" " if ln == "" else ln) for ln in hbody]  # 中间空行 → " " context
+        if _HUNK_RE.match(hdr):
+            body.append(_recount_hunk_header(hdr, hbody))
+            body.extend(hbody)
+        else:
+            body.append(hdr)
+            body.extend(hbody)
+    header = [
+        f"diff --git a/{file_path} b/{file_path}",
+        "deleted file mode 100644",
+        f"--- a/{file_path}",
+        "+++ /dev/null",
+    ]
     return "\n".join(header + body)
 
 
@@ -750,9 +873,14 @@ def _try_three_way_resolve(
     for h in all_hunks:
         by_subtask.setdefault(h.subtask_id, []).append(h)
 
-    subtask_ids = list(dict.fromkeys(h.subtask_id for h in conflict_hunks))
-    if len(subtask_ids) < 2:
+    conflict_ids = list(dict.fromkeys(h.subtask_id for h in conflict_hunks))
+    if len(conflict_ids) < 2:
         return None, False
+
+    # D04 治本：3-way 折叠必须覆盖该文件【全部】写者（含只在非冲突锚点改动的第三写者 C），
+    # 而非只折叠冲突参与者 {A,B}——否则 C 的 hunk 被静默丢弃（well-formed 骗过 apply/L2）。
+    # all_ids 取自 all_hunks（=该文件所有 hunk），按出现序（子任务派发序）确定性排列。
+    subtask_ids = list(dict.fromkeys(h.subtask_id for h in all_hunks))
 
     versions: dict[str, str] = {}
     for sid, hunks in by_subtask.items():
@@ -836,6 +964,9 @@ def merge_diffs(
 
     by_file: dict[str, list[_Hunk]] = {}
     headers: dict[str, list[str]] = {}
+    deletion_files: set[str] = set()               # D03：整段删除意图的文件
+    passthrough_parts: list[str] = []              # D06：rename/binary 段原样透传
+    seen_passthrough: set[tuple[str, str]] = set()  # (file_path, raw) 去重相同透传段
 
     for subtask_id, diff in subtask_diffs:
         if not (diff or "").strip():
@@ -844,12 +975,25 @@ def merge_diffs(
             patch = _parse_file_patch(raw_chunk, subtask_id)
             if patch is None:
                 continue
+            # D06：rename/binary 无法字符级合并 → 整段透传（去重相同段避免重复 apply）。
+            if patch.passthrough is not None:
+                key = (patch.file_path, patch.passthrough)
+                if key not in seen_passthrough:
+                    seen_passthrough.add(key)
+                    passthrough_parts.append(patch.passthrough)
+                    logger.info(
+                        "[MERGE] 段透传保留（rename/binary，不可字符级合并）: %s（子任务 %s）",
+                        patch.file_path, subtask_id,
+                    )
+                continue
             by_file.setdefault(patch.file_path, [])
             if patch.file_path not in headers and patch.header_lines:
                 headers[patch.file_path] = patch.header_lines
             by_file[patch.file_path].extend(patch.hunks)
+            if patch.is_deletion:
+                deletion_files.add(patch.file_path)  # D03：标记删除意图
 
-    if not by_file:
+    if not by_file and not passthrough_parts:
         return MergeResult(merged_diff="", conflicts=[], success=True)
 
     conflicts: list[MergeConflict] = []
@@ -859,6 +1003,83 @@ def merge_diffs(
 
     for file_path in sorted(by_file.keys()):
         hunks = by_file[file_path]
+
+        # ── D03 删除专路（最先判定）──
+        # 删除段的 hunk 是全 `-` 行；须输出 `+++ /dev/null` 删除补丁而非被当 modify/新文件蒸发。
+        # hunter#1 复核整改：专路不得对多写者盲拼 hunks——那会绕过整个冲突机制：
+        #   (a) 双删除（良性一致意图）拼出重复删除 hunk → git apply 必败；
+        #   (b) 删除 vs 修改（真协同冲突）把 `+` 行拼进 `+++ /dev/null` 段
+        #       → `removed file still has content`，且被误标"组装缺陷"误导排障。
+        if file_path in deletion_files:
+            # 按 hunk 形态划分：纯删除 hunk（body 全 `-`）vs 修改 hunk（含 `+`/context）。
+            del_hunks: list[_Hunk] = []
+            mod_hunks: list[_Hunk] = []
+            for h in hunks:
+                body = [ln for ln in (h.lines[1:] if h.lines else []) if ln != ""]
+                if body and all(ln.startswith("-") for ln in body):
+                    del_hunks.append(h)
+                else:
+                    mod_hunks.append(h)
+            if mod_hunks:
+                # 真实 delete-vs-modify 协同冲突：如实上报 MergeConflict 交下游冲突机制
+                # （rebase/replan/人工），绝不产非法补丁、绝不静默偏袒任一方。
+                all_writers = sorted({h.subtask_id for h in hunks})
+                logger.warning(
+                    "[MERGE] delete-vs-modify 冲突: 文件 %s 同时被删除(%s)与修改(%s)，"
+                    "如实上报冲突（不拼接非法删除补丁）",
+                    file_path,
+                    sorted({h.subtask_id for h in del_hunks}),
+                    sorted({h.subtask_id for h in mod_hunks}),
+                )
+                conflicts.append(
+                    MergeConflict(
+                        file_path=file_path,
+                        subtask_ids=all_writers,
+                        message=(
+                            f"delete-vs-modify conflict in {file_path}: "
+                            f"deleted by {sorted({h.subtask_id for h in del_hunks})}, "
+                            f"modified by {sorted({h.subtask_id for h in mod_hunks})}"
+                        ),
+                    )
+                )
+                continue
+            # 全部为删除意图：按 (old_start, body) 去重——N 个子任务一致删除同一文件是
+            # 良性共识，合成单份删除补丁；不同 range 的删除 hunk（分段删除）保留各自一份。
+            seen_del: set[tuple[int, tuple[str, ...]]] = set()
+            uniq_del: list[_Hunk] = []
+            for h in sorted(del_hunks, key=lambda h: h.old_start):
+                key = (h.old_start, tuple(h.lines[1:] if h.lines else []))
+                if key in seen_del:
+                    continue
+                seen_del.add(key)
+                uniq_del.append(h)
+            # 同 old_start 不同 body = 两写者对同一文件内容认知不一致（基线分叉），
+            # 去重救不了（重复 range 补丁仍非法）→ 如实报冲突，fail-closed。
+            starts = [h.old_start for h in uniq_del]
+            if len(starts) != len(set(starts)):
+                all_writers = sorted({h.subtask_id for h in del_hunks})
+                logger.warning(
+                    "[MERGE] 删除文件 %s 多写者 %s 的删除 hunk 同 range 不同内容"
+                    "（基线认知分叉），如实上报冲突", file_path, all_writers,
+                )
+                conflicts.append(
+                    MergeConflict(
+                        file_path=file_path,
+                        subtask_ids=all_writers,
+                        message=(f"divergent deletion hunks for {file_path} "
+                                 f"from {', '.join(all_writers)}"),
+                    )
+                )
+                continue
+            writers = sorted({h.subtask_id for h in del_hunks})
+            if len(writers) > 1:
+                logger.info(
+                    "[MERGE] 删除文件 %s 多写者 %s 意图一致，删除 hunk 去重合成单份补丁",
+                    file_path, writers,
+                )
+            merged_parts.append(_format_deletion_patch(file_path, uniq_del))
+            continue
+
         # 新/旧由 merge base 权威判定（非 worker 头）：有 base_reader 且它读不到该文件 = 新文件。
         # base_reader 缺省时保守判 modify（旧行为，不回归）。round17 根因②治本。
         is_new_file = base_reader is not None and base_reader(file_path) is None
@@ -988,6 +1209,8 @@ def merge_diffs(
                                        base_known=base_reader is not None)
             )
 
+    # D06：rename/binary 透传段追加到输出末尾（每段自带 `diff --git` 头，头数==段数不变量成立）。
+    merged_parts.extend(passthrough_parts)
     merged_diff = "\n\n".join(p for p in merged_parts if p.strip())
     # 有 rebase 子任务时不算硬冲突成功，但也不走硬冲突路径
     # success = True 允许继续走 verify_l2; rebase 子任务会被 merge() 节点

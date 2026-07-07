@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock
 
 from swarm.worker.sandbox_pool import HotSandboxPool
@@ -63,7 +62,9 @@ def test_clean_workspace_command_covers_tmp_home():
     assert "/workspace" in cmd
     assert "/tmp" in cmd
     assert "$HOME" in cmd
-    assert ".cache" in cmd and ".npm" in cmd  # 缓存目录
+    # D27 后：只清可再生派生缓存；.npm/.cargo/go 等工具链/warmup 资产已移入绝不删清单
+    assert ".cache" in cmd and "node_modules" in cmd  # 可再生缓存目录
+    assert ".npm" not in cmd and ".cargo" not in cmd and "go/pkg" not in cmd
     # 不应删除 shell 配置
     assert ".bashrc" not in cmd
 

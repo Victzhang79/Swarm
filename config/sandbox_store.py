@@ -49,7 +49,10 @@ def _conn_str() -> str:
 def ensure_tables(conn_str: str | None = None) -> None:
     """建 sandbox_templates 表（幂等）。由 init_db / app on_startup 调用。"""
     conn_str = conn_str or _conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(SANDBOX_TEMPLATES_DDL)
     logger.info("sandbox_templates table ensured")

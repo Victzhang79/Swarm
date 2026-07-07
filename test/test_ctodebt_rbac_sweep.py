@@ -25,7 +25,8 @@ def test_task_endpoints_gated():
     """task 生命周期端点用细粒度【已存在】权限闸门（C5：部分改走 _require_task_access 统一 404）。"""
     from swarm.api.routers import task
 
-    assert '_require_perm(request, "task:read", project_id)' in _src(task.list_tasks)
+    # D48 后鉴权经 _require_perm_async 卸线程（同一 _require_perm 语义），闸门仍在。
+    assert _gated_on(_src(task.list_tasks), "task:read")
     # 重跑/起跑 = 发起执行 → task:create
     assert _gated_on(_src(task.retry_task_endpoint), "task:create")
     assert _gated_on(_src(task.execute_pooled_task), "task:create")

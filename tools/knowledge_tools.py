@@ -51,7 +51,12 @@ def query_knowledge_base(
     if not project_id:
         return "❌ 未设置 project_id，无法检索知识库（Worker 上下文缺失）"
 
-    context, stats = retrieve_knowledge_sync(query, project_id)
+    try:
+        context, stats = retrieve_knowledge_sync(query, project_id)
+    except TimeoutError as exc:
+        # D15：KB loop 有界等待超时（服务层已 fail-fast 抛明确异常并取消挂起任务）。
+        # 工具层转为显式失败文本——与下方 stats.error 路径同一降级契约，可观测、不静默装成功。
+        return f"⚠️ 知识检索超时（知识库后端可能挂起）：{exc}"
     if stats.get("error"):
         return f"⚠️ 知识检索部分失败: {stats['error']}"
 

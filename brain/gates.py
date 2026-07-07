@@ -26,7 +26,8 @@ def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
 
     终态 PARTIAL 判据 = abandoned（重试耗尽连坐放弃）∪ give_up（阶梯三保 build 放弃：
     本地树已清/打桩）∪ rebase_dropped（★B6 复核 #7★：merge rebase 达上限被丢弃的子任务——其
-    rebased 变更未并入 merged_diff）。runner 落库、learn 侧 outcome/L6 门槛、统计三处必须同口径
+    rebased 变更未并入 merged_diff）∪ dispatch_remaining（★D25★：悬空依赖/不可派发子任务经
+    #R13-4 熔断进 MERGE，从未执行）。runner 落库、learn 侧 outcome/L6 门槛、统计三处必须同口径
     读此函数，杜绝历史上"learn 侧只看 abandoned 漏 give_up → give_up-only PARTIAL 被学成成功模式"。
 
     ★#7 治本★：merge_rebase_dropped 此前写进 state 但全仓无消费点 → rebase 超限丢弃的子任务变更
@@ -37,7 +38,11 @@ def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
     _rebase_dropped = state.get("merge_rebase_dropped") or []
-    return sorted(set(_abandoned) | set(_given_up) | set(_rebase_dropped))
+    # ★治本 D25★：dispatch_remaining 在终态非空 = 悬空依赖/不可派发子任务经 #R13-4 熔断进 MERGE，
+    # 从未执行却被静默吞掉。本函数只在终态（runner 落库 / learn outcome）被消费，正常 DONE 时
+    # remaining 已排空；此处纳入判据 → 有滞留未执行子任务 → 终态 PARTIAL（不静默 DONE / 不学成成功）。
+    _remaining = state.get("dispatch_remaining") or []
+    return sorted(set(_abandoned) | set(_given_up) | set(_rebase_dropped) | set(_remaining))
 
 
 def is_partial_delivery(state: dict[str, Any]) -> bool:

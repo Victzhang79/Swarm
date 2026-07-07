@@ -273,6 +273,17 @@ def evaluate_l1(
             return L1Verdict(passed=False, source=prior.source,
                              reason="无确定性证据(det=None)，维持 prior 的未通过结论",
                              sticky=prior.sticky, details=details)
+        if prior is not None and prior.passed is True:
+            # D12 治本：det_ok=None 表示【本轮没重新做确定性判定】（预算耗尽 / diff 异常 /
+            # pipeline 异常 / pull-back skip 等），并非【否定】。若上一轮（循环内）已用确定性证据
+            # 坐实 PASS，则不应把它翻成失败——否则典型链路「验证循环确定性通过 → Phase-4 produce
+            # 超预算(det=None)」会落到 verification_not_run(passed=False)+timeout marker → brain
+            # 的 _TIMEOUT_OVERSIZE_MARKERS 当 oversize 把整份已完成工作拆小重做（diff 已回传却作废）。
+            # 与 prior.passed is False 分支对称：det=None 一律【维持】prior 已坐实的结论，不主动翻盘。
+            details["l1_decision_source"] = "verification_not_run_keep_prior_pass"
+            return L1Verdict(passed=True, source=prior.source,
+                             reason="无确定性证据(det=None)，保留 prior 已坐实的通过结论（不翻转）",
+                             sticky=prior.sticky, details=details)
         if kind == NotRunKind.BENIGN.value:
             details["l1_decision_source"] = "no_op_benign"
             return L1Verdict(passed=bool(llm_ok), source="no_op_benign",

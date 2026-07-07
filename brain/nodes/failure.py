@@ -188,10 +188,21 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "subtask_retry_counts": {**_retry_counts, **_next_counts},
             }
         logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务(第 %d 次)", _deepest)
+        # 治本 D24：与其它 retry 分支对称——pop 相关 subtask_results 并加回 dispatch_remaining，
+        # 否则该分支只自增计数、既不清结果也不重排队 → 下轮 dispatch 见这些 id 仍在 completed →
+        # to_dispatch 空 → 早退 → monitor 读残留 failed 再进 handle_failure，此时 verification_failure
+        # 已清 None → 落常规能力阶梯，把 L1 全过的输出误诊断 pop 全部全量重跑。
+        _dispatch_remaining = list(state.get("dispatch_remaining", []))
+        for fid in failed:
+            subtask_results.pop(fid, None)
+            if fid not in _dispatch_remaining:
+                _dispatch_remaining.append(fid)
         return {
+            "subtask_results": subtask_results,
+            "dispatch_remaining": _dispatch_remaining,
             "failure_strategy": "retry",
             "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
-            "failed_subtask_ids": failed,
+            "failed_subtask_ids": [],
             "verification_failure": None,
             "subtask_retry_counts": {**_retry_counts, **_next_counts},
         }
@@ -331,7 +342,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             else:
                 failure_details_dict[fid] = {}
         failure_details = json.dumps(failure_details_dict, ensure_ascii=False)
-        plan_json = plan_obj.model_dump_json(indent=2) if plan_obj and hasattr(plan_obj, "model_dump_json") else "{}"
+        # D50：瘦身 plan（剥每子任务 contract/context_snippets 副本）——旧全量 dump 把
+        # ~1MB plan_json 注入失败分析 prompt（validate_plan 已改 slim，此处漏改）。
+        from swarm.brain.plan_validator import slim_plan_json_or_empty
+        plan_json = slim_plan_json_or_empty(plan_obj)
         prompt_user = HANDLE_FAILURE_USER.format(
             failed_subtask_ids=failed_ids,
             failure_details=failure_details,

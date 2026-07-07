@@ -26,8 +26,11 @@ class Complexity(str, Enum):
 # ──────────────────────────────────────────────
 class TaskStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
+    POOLED = "POOLED"                  # 需求池：仅登记不执行，等手动触发（D59 补全）
     ANALYZING = "ANALYZING"
     PLANNING = "PLANNING"
+    CLARIFYING = "CLARIFYING"          # 澄清问答人工闸（D59 补全，SSOT=task_states.py）
+    DESIGN_REVIEW = "DESIGN_REVIEW"    # 技术方案评审人工闸（D59 补全，SSOT=task_states.py）
     VALIDATING_PLAN = "VALIDATING_PLAN"
     CONFIRMING = "CONFIRMING"          # 等人工确认
     DISPATCHING = "DISPATCHING"
@@ -35,6 +38,7 @@ class TaskStatus(str, Enum):
     HANDLING_FAILURE = "HANDLING_FAILURE"
     MERGING = "MERGING"
     VERIFYING_L2 = "VERIFYING_L2"
+    VERIFYING_L3 = "VERIFYING_L3"      # L3 GitLab CI 验证（D59 补全，SSOT=task_states.py）
     DELIVERING = "DELIVERING"
     IN_REVISION = "IN_REVISION"
     LEARNING_SUCCESS = "LEARNING_SUCCESS"

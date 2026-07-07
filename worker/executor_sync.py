@@ -36,6 +36,24 @@ from swarm.worker.git_flock import _ProjectGitFlock
 logger = logging.getLogger(__name__)
 
 
+def _workspace_list_cap() -> int:
+    """沙箱文件枚举上限（D37 治本：原硬编码 head-200 会静默丢产物）。
+
+    默认 5000（远超正常项目文件数），达上限即 warning 可观测。SWARM_WORKSPACE_LIST_CAP 可调。
+    钳 [200, 100000] 防误配（过小复现 D37、过大 shell 内存/耗时失控）。"""
+    try:
+        v = int(os.environ.get("SWARM_WORKSPACE_LIST_CAP", "5000"))
+    except (TypeError, ValueError):
+        v = 5000
+    return min(max(v, 200), 100000)
+
+
+_WORKSPACE_LIST_CAP = _workspace_list_cap()
+
+# D36：bootstrap 上传完成时刻标记文件名（沙箱 remote_workdir 根）。pull-back 的全量枚举须排除它，
+# 否则 allow_any 模式会把这个内部标记当产物拉回本地。
+_BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
+
 
 def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> set[str]:
     """一次 `git ls-tree -r --name-only <ref> -- <paths>` 批量判定哪些相对路径
@@ -731,12 +749,16 @@ class _SandboxSyncMixin:
                     for f in rel_files if "/" in f.replace("\\", "/")
                 }
                 if _decl_dirs:
-                    _all_sb = await asyncio.to_thread(self._list_sandbox_workspace_files)
+                    # D37(b) 治本：只在声明文件的父目录内精确枚举（-maxdepth 1），不再全树
+                    # find|head-200——烤源沙箱 /workspace 数千文件下新建文件常轮不到前 200，
+                    # 补捞近似随机失效。目标只是"同包 helper/config/枚举/内部类"，就在这些目录本层。
+                    _sb_under = await asyncio.to_thread(
+                        self._list_sandbox_files_under, sorted(_decl_dirs))
                     _SRC_EXT = (".java", ".kt", ".kts", ".go", ".rs", ".ts", ".tsx",
                                 ".js", ".jsx", ".vue", ".py", ".xml", ".sql", ".proto")
                     _rel_set = set(rel_files)
                     _extra_new = [
-                        f for f in _all_sb
+                        f for f in _sb_under
                         if f not in _rel_set
                         and f.lower().endswith(_SRC_EXT)
                         and any(f.replace("\\", "/").startswith(d + "/") for d in _decl_dirs)
@@ -750,6 +772,36 @@ class _SandboxSyncMixin:
                         )
             except Exception as _hexc:  # noqa: BLE001
                 self._log(f"{reason} H-exec1 枚举沙箱新增文件失败(非致命): {_hexc}")
+        # ★D36 治本（改既有 readable/兄弟文件不回传→集成期 cannot find symbol）★：
+        # worker 常经 run_command(sed) 改【上下文集内的既有文件】(readable/整模块源码里的兄弟类)
+        # 让沙箱编过→L1 沙箱裁绿，但这些改动既不在 writable 也非"本地尚无的新文件"(H-exec1 只补
+        # 新建)→不回传、不进 diff→集成期真仓缺该改动秒炸。用 bootstrap 标记 + `find -newer` 圈出
+        # 沙箱里被改的文件（栈无关、mtime、不依赖 .git），与【上下文集】求交（只纳合法兄弟改动，
+        # 不误拉全仓无关改动），并入 _repaired_extra_paths→回传+进 diff+scope 闸门放行。allow_any
+        # 已全量枚举、无需再算。
+        if (
+            self._bootstrap_marker
+            and not getattr(self.effective_scope, "allow_any", False)
+        ):
+            try:
+                _modified = await asyncio.to_thread(
+                    self._list_sandbox_modified_files, self._bootstrap_marker)
+                # _context_sibling_rels 内含整模块源码 rglob（大 monorepo 数十 ms 同步 IO）→ 卸线程池。
+                _ctx = await asyncio.to_thread(self._context_sibling_rels, local_root)
+                _rel_now = set(rel_files)
+                _sib_mods = [
+                    f for f in _modified
+                    if f in _ctx and f not in _rel_now
+                ]
+                if _sib_mods:
+                    self._repaired_extra_paths.update(_sib_mods)
+                    rel_files = list(dict.fromkeys(rel_files + _sib_mods))
+                    self._log(
+                        f"{reason} D36：纳入 {len(_sib_mods)} 个被 worker 改动的上下文兄弟文件"
+                        f"(回传+进 diff，防沙箱绿但改动不落盘→cannot find symbol): {_sib_mods[:5]}"
+                    )
+            except Exception as _d36exc:  # noqa: BLE001
+                self._log(f"{reason} D36 改动兄弟文件枚举失败(非致命): {_d36exc}")
         # A1：删除传播——必须在 rel_files 空的 early-return 之前，纯删除 scope 才不被跳过。
         # 复核 CR-2 修正：逐文件 test -f 精确探测(不再 head-200 截断全量列举比对，杜绝误删)。
         if getattr(self.effective_scope, "delete_files", []):
@@ -775,6 +827,8 @@ class _SandboxSyncMixin:
             # A3：记录本轮 pull-back 完整性信号（skip/err），供 L1 闸门 fail-closed。
             self._sync_skipped_count = int(sync_stats.get("skipped") or 0)
             self._sync_error_rels = list(sync_stats.get("errors") or [])
+            # D30：确定性尺寸 skip 单独入账（L1 闸门判确定性失败，不当 transient 重试）。
+            self._sync_oversize_rels = list(sync_stats.get("oversize_rels") or [])
             err_count = len(sync_stats.get("errors") or [])
             self._log(
                 f"{reason} 沙箱→本地精准 pull-back: "
@@ -865,12 +919,15 @@ class _SandboxSyncMixin:
             return []
         cfg = get_config()
         remote = cfg.sandbox.sandbox_remote_workdir
-        # find 排除噪声目录 + 限 2MB；-printf 输出相对路径
+        # D37(a) 治本：原 `head -200` 会在 allow_any/greenfield pull-back 场景下静默丢弃第
+        # 201+ 个产物（>200 文件的项目模板一次生成即触发）。上限大幅提高至 _WORKSPACE_LIST_CAP，
+        # 且【截断即 warning】可观测——不再"看似枚举全了实则丢一半"。find 排除噪声目录 + 限 2MB。
         prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name .pytest_cache \)"
+        # +1 用于探测是否发生截断（拿到 cap+1 行即说明真实文件数 > cap）。
         cmd = (
             f"cd {remote} 2>/dev/null && "
             f"find . {prune} -prune -o -type f -size -2000k -print 2>/dev/null "
-            f"| sed 's|^\\./||' | head -200"
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
         )
         rc = getattr(self._sandbox_manager, "run_command", None)
         if rc is None:
@@ -881,7 +938,130 @@ class _SandboxSyncMixin:
         out = (result.stdout or "").strip()
         if not out:
             return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        files = [
+            line.strip() for line in out.splitlines()
+            if line.strip() and line.strip() != _BOOTSTRAP_MARKER_NAME
+        ]
+        if len(files) > _WORKSPACE_LIST_CAP:
+            # 截断：真实产物数超过上限 → 第 cap+1 起被丢弃。必须留痕（否则与"恰好 cap 个"
+            # 不可区分），提示可能有产物未回传。返回前 cap 个（去掉探测多取的那一个）。
+            self._log(
+                f"[WARN] 沙箱 workspace 文件枚举达上限 {_WORKSPACE_LIST_CAP}（真实数更多）→ "
+                f"超出部分未纳入 pull-back，可能漏产物；如常触发请调大 SWARM_WORKSPACE_LIST_CAP"
+            )
+            files = files[:_WORKSPACE_LIST_CAP]
+        return files
+
+    def _touch_bootstrap_marker(self) -> None:
+        """D36：在沙箱 remote_workdir 内 touch 一个标记文件，记录【bootstrap 上传完成时刻】。
+
+        之后 worker 对沙箱里任何文件的改动 mtime 都晚于它，pull-back 用 `find -newer <marker>`
+        精确圈出被改动文件。用沙箱【自己的时钟】touch（非本地时钟），规避本地/沙箱时钟偏移。
+        栈无关、不依赖 .git。失败仅置空 marker（D36 增强降级为 no-op，不阻断主链）。"""
+        self._bootstrap_marker = ""
+        if not self._sandbox or not self._sandbox_manager:
+            return
+        rc = getattr(self._sandbox_manager, "run_command", None)
+        if rc is None:
+            return
+        cfg = get_config()
+        remote = cfg.sandbox.sandbox_remote_workdir
+        marker = _BOOTSTRAP_MARKER_NAME
+        try:
+            result = rc(self._sandbox, f"cd {remote} 2>/dev/null && touch {marker}", timeout=15)
+            if getattr(result, "error", None) and getattr(result, "error"):
+                self._log(f"[WARN] D36 bootstrap 标记创建失败（改动兄弟文件回传降级为 no-op）: {result.error}")
+                return
+            self._bootstrap_marker = marker
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[WARN] D36 bootstrap 标记创建异常（改动兄弟文件回传降级为 no-op）: {exc}")
+
+    def _context_sibling_rels(self, local_root: Path) -> set[str]:
+        """D36：本子任务【上下文集】= readable ∪ 整模块源码，减去 writable/create（已单独回传）。
+
+        worker 对【这个集合内】文件的沙箱改动是"为让本模块编过而动的兄弟/依赖文件"，属合法且
+        必须落盘的产出；对集合【外】文件的改动才算真正越界（交 scope 闸门，D36 不静默纳入）。
+        以此为界，既治"改兄弟不回传→cannot find symbol"，又不把全仓无关改动误拉进 diff。"""
+        scope = self.effective_scope
+        writable = {self._norm_rel(local_root, f) for f in (getattr(scope, "writable", []) or [])}
+        create = {self._norm_rel(local_root, f) for f in (getattr(scope, "create_files", []) or [])}
+        ctx: set[str] = set()
+        for f in (getattr(scope, "readable", []) or []):
+            ctx.add(self._norm_rel(local_root, f))
+        for rel in self._module_source_files():
+            ctx.add(self._norm_rel(local_root, rel))
+        return {r for r in ctx if r and r not in writable and r not in create}
+
+    def _list_sandbox_files_under(self, dirs: list[str]) -> list[str]:
+        """D37(b) 治本：只在【指定目录】下（-maxdepth 1）精确枚举沙箱文件，返回相对 remote_workdir
+        的路径。用于 H-exec1 未声明新文件补捞——原实现走全树 find | head-200，在烤源沙箱
+        （/workspace 数千文件）下新建文件常轮不到前 200 → 假绿门补丁近似随机失效。改为只查
+        子任务声明文件所在的少数包目录，规模与全仓无关、可靠命中新建同包文件。"""
+        if not self._sandbox or not self._sandbox_manager or not dirs:
+            return []
+        rc = getattr(self._sandbox_manager, "run_command", None)
+        if rc is None:
+            return []
+        import shlex
+        cfg = get_config()
+        remote = cfg.sandbox.sandbox_remote_workdir
+        # 每个声明目录只查其【本层】文件（-maxdepth 1）——同包 helper/config/枚举/内部类即在此层。
+        # 目录路径经 shlex.quote 防注入/空格；不存在的目录 find 自行跳过（2>/dev/null）。
+        quoted = " ".join(shlex.quote(d) for d in dirs if d)
+        if not quoted:
+            return []
+        cmd = (
+            f"cd {remote} 2>/dev/null && "
+            f"find {quoted} -maxdepth 1 -type f -size -2000k 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
+        )
+        result = rc(self._sandbox, cmd, timeout=30)
+        if getattr(result, "error", None) and not getattr(result, "stdout", ""):
+            return []
+        out = (result.stdout or "").strip()
+        if not out:
+            return []
+        files = [line.strip() for line in out.splitlines() if line.strip()]
+        if len(files) > _WORKSPACE_LIST_CAP:
+            self._log(
+                f"[WARN] H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件"
+            )
+            files = files[:_WORKSPACE_LIST_CAP]
+        return files
+
+    def _list_sandbox_modified_files(self, marker_rel: str) -> list[str]:
+        """D36 治本：列出沙箱内 mtime 【晚于 bootstrap 上传标记】的文件（相对 remote_workdir）。
+
+        标记文件在 bootstrap 上传完成后 touch（见 executor._phase_prepare），故 `find -newer <marker>`
+        精确圈出【worker 在沙箱里改过/新建的】文件——栈无关（纯 mtime，不依赖 .git；烤源
+        /workspace 无 .git，git diff 不可用）。调用方负责把结果与【本子任务上下文集】(readable ∪
+        module_source) 求交，只回传"被改的上下文兄弟文件"，不误纳全仓无关改动。截断记 warning。"""
+        if not self._sandbox or not self._sandbox_manager or not marker_rel:
+            return []
+        rc = getattr(self._sandbox_manager, "run_command", None)
+        if rc is None:
+            return []
+        import shlex
+        cfg = get_config()
+        remote = cfg.sandbox.sandbox_remote_workdir
+        prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name target -o -name .pytest_cache \)"
+        mq = shlex.quote(marker_rel)
+        cmd = (
+            f"cd {remote} 2>/dev/null && "
+            f"find . {prune} -prune -o -type f -newer {mq} -size -2000k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
+        )
+        result = rc(self._sandbox, cmd, timeout=30)
+        if getattr(result, "error", None) and not getattr(result, "stdout", ""):
+            return []
+        out = (result.stdout or "").strip()
+        if not out:
+            return []
+        files = [line.strip() for line in out.splitlines() if line.strip() and line.strip() != marker_rel]
+        if len(files) > _WORKSPACE_LIST_CAP:
+            self._log(f"[WARN] 沙箱改动文件枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏改动")
+            files = files[:_WORKSPACE_LIST_CAP]
+        return files
 
     def _get_git_diff(self) -> str:
         """生成子任务改动的 unified diff。
@@ -991,8 +1171,9 @@ class _SandboxSyncMixin:
                 p = _P(root) / f
                 if p.is_file():
                     # 是否已跟踪
+                    # D53：补 timeout——原无超时，git 挂死（NFS/锁竞争）会占死一个线程/环
                     r = _sp.run(["git", "-C", root, "ls-files", "--error-unmatch", f],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, timeout=30)
                     if r.returncode != 0:
                         untracked.append(f)
             # TD2606-B5/C5/M5：add -N（改共享 index）+ diff 必须在同一 per-project 锁内原子完成，
@@ -1028,18 +1209,25 @@ class _SandboxSyncMixin:
                 if untracked:
                     _sp.run(["git", "-C", root, "add", "-N", *untracked],
                             capture_output=True, text=True, timeout=30)
-                r = _sp.run(
-                    ["git", "-C", root, "diff", "--no-color",
-                     resolve_base_ref(getattr(self, 'base_ref', None)), "--", *targets],
-                    capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
-                )
-                # 遗漏项#3 复核（hunter#1，入口对称）：add -N 占位只为让上面这一条 diff 看见新文件，
-                # diff 拿到后立即对称清理——否则占位永久残留共享真仓 index（实测 81 条累积），
-                # 污染 git status/stash 等消费者；交付路径的 rm --cached 清理只覆盖【进 merged_diff】
-                # 的文件，abandoned/重试子任务的占位无人清。仍在同一把 flock 内，原子。
-                if untracked:
-                    _sp.run(["git", "-C", root, "restore", "--staged", "--", *untracked],
-                            capture_output=True, text=True, timeout=30)
+                try:
+                    r = _sp.run(
+                        ["git", "-C", root, "diff", "--no-color",
+                         resolve_base_ref(getattr(self, 'base_ref', None)), "--", *targets],
+                        capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
+                    )
+                finally:
+                    # 遗漏项#3 复核（hunter#1，入口对称）：add -N 占位只为让上面这一条 diff 看见
+                    # 新文件，diff 拿到后立即对称清理——否则占位永久残留共享真仓 index（实测 81 条
+                    # 累积），污染 git status/stash 等消费者；交付路径的 rm --cached 清理只覆盖
+                    # 【进 merged_diff】的文件，abandoned/重试子任务的占位无人清。仍在同一把
+                    # flock 内，原子。★D44 治本★：清理放 finally——diff 抛异常（TimeoutExpired 等）
+                    # 会落外层 except 返回 None，裸写顺序下 restore 被跳过，占位照样残留。
+                    if untracked:
+                        try:
+                            _sp.run(["git", "-C", root, "restore", "--staged", "--", *untracked],
+                                    capture_output=True, text=True, timeout=30)
+                        except Exception as _cexc:  # noqa: BLE001 — 清理失败可观测，不吞主异常
+                            self._log(f"[WARN] D44 add -N 占位清理失败（index 可能残留）: {_cexc}")
 
             # 生成 diff：钉扎 base 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
             # 3rd#2：显式相对 base（None→HEAD），与 merge base_reader 同源对齐，消除运行期 HEAD 漂移。

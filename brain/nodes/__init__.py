@@ -695,7 +695,11 @@ def _subtask_signature(st) -> tuple:
 
 
 def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
-                           old_recovery_counts: dict | None = None) -> dict:
+                           old_recovery_counts: dict | None = None,
+                           old_retry_counts: dict | None = None,
+                           old_redecompose_counts: dict | None = None,
+                           old_abandoned_ids: list | None = None,
+                           old_give_up_ids: list | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -704,31 +708,63 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
 
     遗漏项#2 复核 MEDIUM：targeted_recovery_counts 同签名纪律修剪——replan 分批重编号使 id 复用
     是【默认情形】（merge_subtask_batches 顺序重编 st-N），旧 id 的耗尽配额若粘滞会饿死语义全新的
-    同名子任务（把 round29 治的"被别人用量饿死"换个形态复发）。签名完全一致才保留配额记账。"""
-    if not old_results and not old_recovery_counts:
+    同名子任务（把 round29 治的"被别人用量饿死"换个形态复发）。签名完全一致才保留配额记账。
+
+    D08（治本）：同签名纪律扩到【全部 replan 敏感记账表】——此前只清 subtask_results/
+    targeted_recovery_counts，漏了 subtask_retry_counts / subtask_redecompose_count /
+    abandoned_subtask_ids / give_up_isolated_ids。id 复用是默认情形，粘滞的旧账会：
+      · 陈旧 retry_counts → 新 st-N 首败即 `_next>max_retries` 跳过重试直接 escalate；
+      · 陈旧 redecompose_count>=1 → 阶梯二对语义全新的子任务永拒（拆小预算=0）；
+      · 陈旧 abandoned/give_up id 命中新子任务 → get_dispatch_batch 排除 → 永不派发 →
+        after_monitor 判"全不可派发"提前 MERGE = 假 PARTIAL。
+    dict 记账（retry/redecompose/recovery）按签名一致保留，list 放弃标记（abandoned/give_up）
+    只保留在新 plan 且签名一致者——签名变=语义新子任务，绝不继承旧放弃/旧配额。"""
+    if not any((old_results, old_recovery_counts, old_retry_counts,
+                old_redecompose_counts, old_abandoned_ids, old_give_up_ids)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
 
+    def _sig_unchanged(sid: str) -> bool:
+        """签名完全一致（且在新 plan）——唯一可继承旧记账/旧放弃的条件。"""
+        return sid in new_sig and old_sig.get(sid) == new_sig.get(sid)
+
     preserved = {
         sid: out for sid, out in (old_results or {}).items()
-        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid) and l1_passed(out)
+        if _sig_unchanged(sid) and l1_passed(out)
     }
     pruned_counts = {
-        sid: n for sid, n in (old_recovery_counts or {}).items()
-        if sid in new_sig and old_sig.get(sid) == new_sig.get(sid)
+        sid: n for sid, n in (old_recovery_counts or {}).items() if _sig_unchanged(sid)
     }
+    pruned_retry = {
+        sid: n for sid, n in (old_retry_counts or {}).items() if _sig_unchanged(sid)
+    }
+    pruned_redecompose = {
+        sid: n for sid, n in (old_redecompose_counts or {}).items() if _sig_unchanged(sid)
+    }
+    pruned_abandoned = [sid for sid in (old_abandoned_ids or []) if _sig_unchanged(sid)]
+    pruned_give_up = [sid for sid in (old_give_up_ids or []) if _sig_unchanged(sid)]
     logger.info(
         "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber"
-        "；定向恢复配额记账保留 %d/%d 条（签名不一致=语义新子任务，不继承旧配额）",
+        "；记账保留 recovery=%d/%d retry=%d/%d redecompose=%d/%d；放弃标记保留 abandoned=%d/%d "
+        "give_up=%d/%d（签名不一致=语义新子任务，清空旧账不饿死）",
         len(preserved), len(old_results or {}),
         len(pruned_counts), len(old_recovery_counts or {}),
+        len(pruned_retry), len(old_retry_counts or {}),
+        len(pruned_redecompose), len(old_redecompose_counts or {}),
+        len(pruned_abandoned), len(old_abandoned_ids or []),
+        len(pruned_give_up), len(old_give_up_ids or []),
     )
     return {
         "subtask_results": preserved,
         "dispatch_remaining": [],
         "failed_subtask_ids": [],
         "targeted_recovery_counts": pruned_counts,
+        # D08：补清余下三张 replan 敏感记账/放弃表（同签名纪律，防旧账饿死/误弃新子任务）
+        "subtask_retry_counts": pruned_retry,
+        "subtask_redecompose_count": pruned_redecompose,
+        "abandoned_subtask_ids": pruned_abandoned,
+        "give_up_isolated_ids": pruned_give_up,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -768,9 +804,9 @@ async def plan(state: BrainState) -> dict:
             "[PLAN] SIMPLE 快速路径 — 1 个 trivial 子任务 (scope=%d 文件)",
             len(affected_files),
         )
-        from swarm.brain.contract_utils import enrich_plan_with_shared_contract
-
-        task_plan = enrich_plan_with_shared_contract(task_plan)
+        # D51：不再把 shared_contract enrich 进每个子任务（plan 体积病灶——N 份 ~42K 内联
+        # 副本随每次 checkpoint 序列化）。完整契约在派发面 build_worker_prompt 合成，
+        # worker 可见契约与旧行为逐字节一致。
         # 测试剔除（同主路径，task 744316e7）：SIMPLE 路径也防 Brain 塞测试
         from swarm.brain.nodes.shared import _strip_unrequested_tests
         task_plan = _strip_unrequested_tests(task_plan, task_description)
@@ -788,7 +824,11 @@ async def plan(state: BrainState) -> dict:
             # round29 真因4 always-emit（复核 LOW）：SIMPLE 路径不走分批，恒发 []，保不变量字面自洽。
             "plan_batch_failed_modules": [],
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
-                                 old_recovery_counts=state.get("targeted_recovery_counts")),
+                                 old_recovery_counts=state.get("targeted_recovery_counts"),
+                                 old_retry_counts=state.get("subtask_retry_counts"),
+                                 old_redecompose_counts=state.get("subtask_redecompose_count"),
+                                 old_abandoned_ids=state.get("abandoned_subtask_ids"),
+                                 old_give_up_ids=state.get("give_up_isolated_ids")),
             **plan_touch,
         }
 
@@ -818,6 +858,18 @@ async def plan(state: BrainState) -> dict:
             + (sliding_ctx or "")
         )
         logger.info("[PLAN] replan 重入 — 已注入上轮失败原因供 LLM 规避")
+
+    # D09：VALIDATE_PLAN 失败原因回灌——after_validate 失败→increment_retry→plan 是重试循环，
+    # 上轮校验（结构/P6b 完整性）为何被否绝不能对 LLM 隐藏，否则盲重生成同样坏计划烧光重试预算。
+    _validation_feedback = (state.get("plan_validation_feedback") or "").strip()
+    if _validation_feedback:
+        sliding_ctx = (
+            f"⚠️ 上一轮生成的执行计划【校验未通过】（第 {state.get('plan_retry_count', 1)} 次重试）。\n"
+            f"校验失败的具体问题（本次务必逐条修正，不要重复同样的结构/依赖/缺功能错误）：\n"
+            f"{_validation_feedback}\n\n"
+            + (sliding_ctx or "")
+        )
+        logger.info("[PLAN] 校验失败重试 — 已注入上轮校验 issues 供 LLM 修正")
 
     # ── LLM 任务拆解 ──
     try:
@@ -877,8 +929,14 @@ async def plan(state: BrainState) -> dict:
                 # TD2606-B17：create-signature 去重（dedupe_subtasks）此前只在批量 ultra 路径
                 # （merge_subtask_batches）跑。单发 plan 路径同样可能 LLM 吐重复脚手架子任务
                 # （RUN6 根因类）→ 在此对单发路径也做去重，使去重成为全路径不变量。
-                from swarm.brain.plan_batch import dedupe_subtasks
+                from swarm.brain.plan_batch import dedupe_subtasks, prune_parallel_groups
                 result["subtasks"] = dedupe_subtasks(result.get("subtasks", []) or [])
+                # D10：去重删子任务后同步 parallel_groups（否则悬空引用 → plan_validator 硬失败
+                # → 叠加 D09 盲重试死循环）。valid_ids = 去重后存活子任务 id。
+                if result.get("parallel_groups"):
+                    _valid_ids = {st.get("id") for st in result["subtasks"] if isinstance(st, dict)}
+                    result["parallel_groups"] = prune_parallel_groups(
+                        result.get("parallel_groups"), _valid_ids)
             task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
@@ -929,10 +987,10 @@ async def plan(state: BrainState) -> dict:
     from swarm.brain.nodes.shared import _merge_horizontal_subtasks
     task_plan = _merge_horizontal_subtasks(task_plan)
 
-    from swarm.brain.contract_utils import enrich_plan_with_shared_contract
-
-    # T1：把 contract_design 节点产出的全局共享契约(state.shared_contract_draft)注入 plan，
-    # 再 enrich 进每个子任务的 contract → worker 执行时看到统一契约，避免各写各的接口对不上。
+    # T1：把 contract_design 节点产出的全局共享契约(state.shared_contract_draft)注入 plan。
+    # D51：不再 enrich 进每个子任务 contract（N 份 ~42K 内联副本 = plan/checkpoint 体积病灶）；
+    # worker 可见的完整契约由派发面 build_worker_prompt 以同一 merge 语义（shared 打底 +
+    # 子任务覆盖）现场合成，行为等价。
     _contract = state.get("shared_contract_draft") or {}
     if _contract and not (task_plan.shared_contract or {}):
         task_plan.shared_contract = _contract
@@ -942,7 +1000,6 @@ async def plan(state: BrainState) -> dict:
         # 绝不能被丢——草案有、plan 自身没有时补进去（其余键以 plan 自身为准，不动）。
         if _contract.get("dependencies") and not task_plan.shared_contract.get("dependencies"):
             task_plan.shared_contract["dependencies"] = _contract["dependencies"]
-    task_plan = enrich_plan_with_shared_contract(task_plan)
 
     # T3：同文件写权唯一——消除"同一文件被多个子任务并发写"的冲突（写权保留首个，
     # 其余降级为 readable）+ 被依赖产物自动入域。防多 worker 同时编辑同一文件互相覆盖。
@@ -1015,7 +1072,11 @@ async def plan(state: BrainState) -> dict:
         # R2-1：同 SIMPLE 路径——PLAN 起点无条件清历史 escalate 粘滞
         "failure_escalated": False,
         **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
-                                 old_recovery_counts=state.get("targeted_recovery_counts")),
+                                 old_recovery_counts=state.get("targeted_recovery_counts"),
+                                 old_retry_counts=state.get("subtask_retry_counts"),
+                                 old_redecompose_counts=state.get("subtask_redecompose_count"),
+                                 old_abandoned_ids=state.get("abandoned_subtask_ids"),
+                                 old_give_up_ids=state.get("give_up_isolated_ids")),
         **plan_touch,
     }
 
@@ -1044,11 +1105,25 @@ def _filter_completeness_missing(llm_issues: list) -> list:
     ]
 
 
+def _format_validation_feedback(issues: list) -> str:
+    """D09：把校验 issues 列表压成回灌 PLAN 的简明反馈文本（逐条 bullet，去空/去重保序）。
+
+    空 issues → 空串（PLAN 侧据此不注入，不产生"莫名警告"噪声）。"""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for it in (issues or []):
+        s = str(it).strip()
+        if s and s not in seen:
+            seen.add(s)
+            lines.append(f"- {s}")
+    return "\n".join(lines)
+
+
 async def validate_plan(state: BrainState) -> dict:
     """VALIDATE_PLAN 节点 — PlanValidator 硬校验 + 可选 LLM 补充
 
     输入: plan, task_description, affected_files
-    输出: plan_valid, plan_validation_issues
+    输出: plan_valid, plan_validation_issues, plan_validation_feedback（失败原因回灌 PLAN，D09）
     """
     from swarm.brain.plan_validator import (
         MAX_LLM_VALIDATION_PLAN_CHARS,
@@ -1068,6 +1143,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": ["计划为空"],
+            "plan_validation_feedback": "- 计划为空（PLAN 未产出任何子任务，请重新生成完整的子任务 DAG）",
         }
 
     struct_result = validate_plan_structure(
@@ -1086,6 +1162,8 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": struct_result.issues,
+            # D09：结构校验失败原因回灌 PLAN（悬空依赖/环/parallel_groups 悬空引用等）供重试修正
+            "plan_validation_feedback": _format_validation_feedback(struct_result.issues),
         }
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
@@ -1094,6 +1172,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": True,
             "plan_retry_count": retry_count,
             "plan_validation_issues": [],
+            "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
         }
 
     # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
@@ -1177,10 +1256,13 @@ async def validate_plan(state: BrainState) -> dict:
         f"[VALIDATE_PLAN] 结果: {'通过' if plan_valid else '未通过'} "
         f"(LLM门={'硬否决' if llm_gate_hard else '软建议'})"
     )
+    _final_issues = [] if plan_valid else (llm_issues or ["LLM 计划验证未通过"])
     return {
         "plan_valid": plan_valid,
         "plan_retry_count": retry_count,
-        "plan_validation_issues": [] if plan_valid else (llm_issues or ["LLM 计划验证未通过"]),
+        "plan_validation_issues": _final_issues,
+        # D09：LLM/P6b 完整性校验失败原因回灌 PLAN（通过则清空，防跨轮粘滞）
+        "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues),
     }
 
 
@@ -1806,15 +1888,25 @@ def _run_l2_in_sandbox(
     *,
     project_id: str = "",
     timeout: int = 180,
-) -> bool:
-    import base64
+) -> bool | None:
+    """沙箱 L2 功能测试。返回 True/False=测试【真跑了】的结论；None=infra 失败（沙箱不可用/
+    命令没跑成），交调用方走既有降级路径（本地 L2 → LLM 兜底），绝不误判为测试失败。
+
+    D31 治本：改走 run_command（shell 端点，所有镜像通用）——旧实现用 run_code 打 Jupyter
+    kernel 端点，自建语言镜像无 kernel 必 502，且 502 被当测试失败误杀整任务。对齐
+    _run_reactor_build_in_sandbox 的 ran/ok 区分与 __RC__ 退出码口径；create 与 reactor 版
+    同款传 project_id（_resolve_template 据此匹配项目专属镜像模板）。
+    """
     from pathlib import Path
 
-    from swarm.worker.sandbox import get_sandbox_manager
+    from swarm.worker.sandbox import get_sandbox_manager, write_file_to_sandbox
 
     cfg = get_config().sandbox
     workdir = cfg.sandbox_remote_workdir
     manager = get_sandbox_manager()
+    run_command = getattr(manager, "run_command", None)
+    if run_command is None:
+        return None
     sandbox = None
 
     try:
@@ -1824,43 +1916,46 @@ def _run_l2_in_sandbox(
         )
         manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
 
-        patch_b64 = base64.b64encode(merged_diff.encode()).decode()
-        apply_code = f"""
-import base64, subprocess, tempfile, os
-patch = base64.b64decode({patch_b64!r}).decode()
-with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tf:
-    tf.write(patch)
-    patch_path = tf.name
-try:
-    r = subprocess.run(['git', 'apply', patch_path], cwd={workdir!r}, capture_output=True, text=True, timeout=60)
-    print('APPLY_RC', r.returncode)
-    if r.stderr:
-        print('APPLY_ERR', r.stderr)
-finally:
-    os.unlink(patch_path)
-"""
-        apply_result = manager.run_code(sandbox, apply_code, timeout=90)
-        if apply_result.error or "APPLY_RC 0" not in (apply_result.stdout or ""):
+        # patch 走 envd 文件端点写入（不依赖 Jupyter kernel，也不受 shell 命令行长度限制）
+        patch_path = "/tmp/__swarm_l2_merged.patch"
+        write_file_to_sandbox(sandbox, patch_path, merged_diff, manager=manager)
+
+        apply_result = run_command(
+            sandbox,
+            f"cd {workdir} && git apply {patch_path}; echo __APPLY_RC__$?",
+            timeout=90,
+        )
+        apply_out = (getattr(apply_result, "stdout", "") or "") + (getattr(apply_result, "stderr", "") or "")
+        if "__APPLY_RC__" not in apply_out:
+            # 命令没跑成（网关 5xx/沙箱死）= infra 失败 → None 降级，不判测试失败
             logger.warning(
-                "[VERIFY_L2] 沙箱 git apply 失败: %s",
-                apply_result.error or apply_result.stdout or apply_result.stderr,
+                "[VERIFY_L2] 沙箱 git apply 未执行(infra，降级本地/LLM): %s",
+                (getattr(apply_result, "error", None) or apply_out)[:300],
             )
+            return None
+        if "__APPLY_RC__0" not in apply_out:
+            logger.warning("[VERIFY_L2] 沙箱 git apply 失败: %s", apply_out[:500])
             return False
 
-        test_code = f"""
-import subprocess
-r = subprocess.run({test_cmd!r}, cwd={workdir!r}, shell=True, capture_output=True, text=True, timeout={timeout})
-print('TEST_RC', r.returncode)
-if r.stdout:
-    print(r.stdout[-4000:])
-if r.stderr:
-    print(r.stderr[-2000:], end='')
-"""
-        test_result = manager.run_code(sandbox, test_code, timeout=timeout + 30)
-        if test_result.error:
-            logger.warning("[VERIFY_L2] 沙箱测试执行失败: %s", test_result.error)
-            return False
-        return "TEST_RC 0" in (test_result.stdout or "")
+        test_result = run_command(
+            sandbox,
+            f"cd {workdir} && ({test_cmd}); echo __RC__$?",
+            timeout=timeout + 30,
+        )
+        test_out = (getattr(test_result, "stdout", "") or "") + (getattr(test_result, "stderr", "") or "")
+        if "__RC__" not in test_out:
+            logger.warning(
+                "[VERIFY_L2] 沙箱测试未执行(infra，不判测试失败，降级本地/LLM): %s",
+                (getattr(test_result, "error", None) or test_out)[:300],
+            )
+            return None
+        ok = "__RC__0" in test_out
+        if not ok:
+            logger.warning("[VERIFY_L2] 沙箱测试未通过: %s", test_out[-1000:])
+        return ok
+    except Exception as exc:  # noqa: BLE001 — infra 异常 → 降级，不误判失败也不炸 verify 节点
+        logger.warning("[VERIFY_L2] 沙箱 L2 验证异常(infra，降级本地/LLM): %s", exc)
+        return None
     finally:
         if sandbox is not None:
             try:
@@ -1925,7 +2020,8 @@ def _try_l2_sandbox_verify(
     *,
     timeout: int = 180,
 ) -> bool | None:
-    """Run L2 in sandbox. Returns None if sandbox unavailable."""
+    """Run L2 in sandbox. Returns None if sandbox unavailable **or** infra 失败
+    (命令没跑成，见 _run_l2_in_sandbox D31)——调用方据 None 降级本地/LLM，不判测试失败。"""
     if not _sandbox_available():
         return None
     project_path = _get_project_path(project_id)
@@ -2386,7 +2482,9 @@ async def learn_success(state: BrainState) -> dict:
         # ── LLM 成功模式提炼 ──
         try:
             llm = _get_brain_llm()
-            plan_json = plan_obj.model_dump_json(indent=2) if plan_obj and hasattr(plan_obj, "model_dump_json") else "{}"
+            # D50：瘦身 plan 注入（剥子任务 contract/context_snippets），同 validate_plan 口径。
+            from swarm.brain.plan_validator import slim_plan_json_or_empty
+            plan_json = slim_plan_json_or_empty(plan_obj)
             prompt_user = LEARN_SUCCESS_USER.format(
                 task_description=task_description,
                 plan_json=plan_json,
@@ -2479,7 +2577,9 @@ async def learn_failure(state: BrainState) -> dict:
     # ── LLM 错误模式提炼 ──
     try:
         llm = _get_brain_llm()
-        plan_json = plan_obj.model_dump_json(indent=2) if plan_obj and hasattr(plan_obj, "model_dump_json") else "{}"
+        # D50：瘦身 plan 注入（剥子任务 contract/context_snippets），同 validate_plan 口径。
+        from swarm.brain.plan_validator import slim_plan_json_or_empty
+        plan_json = slim_plan_json_or_empty(plan_obj)
         prompt_user = LEARN_FAILURE_USER.format(
             task_description=task_description,
             plan_json=plan_json,

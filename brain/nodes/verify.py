@@ -208,18 +208,44 @@ async def verify_l3(state: BrainState) -> dict:
             ref = os.environ.get("SWARM_GITLAB_REF", "main")
             if l3_push_enabled():
                 project_path = nodes._get_project_path(project_id)
-                if project_path:
-                    # R23-1 续（round25 #10）：push_merged_diff_branch 内含 git fetch/push(timeout 可达
-                    # 300s)，同步阻塞；verify_l3 是 async 节点 → 卸线程池，与下方 trigger_and_poll 同样处理。
-                    branch, push_err = await asyncio.to_thread(
-                        push_merged_diff_branch,
-                        project_path, merged_diff, task_id or "unknown", base_ref=ref
+                if not project_path:
+                    # D34 fail-closed：push 开启但项目路径不可得 → 不能退回在默认 ref 上跑
+                    # pipeline（merged_diff 根本不在那上面，绿=什么都没验证的假绿）。
+                    logger.error(
+                        "[VERIFY_L3] L3 push 已开启但项目路径不可得(project_id=%s) → "
+                        "fail-closed 跳过 L3，不在默认 ref 上假绿", project_id,
                     )
-                    if branch:
-                        ref = branch
-                        logger.info("[VERIFY_L3] 已推送 L3 分支: %s", branch)
-                    elif push_err:
-                        logger.warning("[VERIFY_L3] L3 push 失败，回退默认 ref: %s", push_err)
+                    return {
+                        "l3_passed": None,
+                        "l3_skipped": True,
+                        "l3_message": "L3 push enabled but project path unavailable "
+                                      "(fail-closed skip, not verified)",
+                    }
+                # R23-1 续（round25 #10）：push_merged_diff_branch 内含 git fetch/push(timeout 可达
+                # 300s)，同步阻塞；verify_l3 是 async 节点 → 卸线程池，与下方 trigger_and_poll 同样处理。
+                # base_commit＝任务钉扎基线：L3 apply 与 merged_diff 生成基线同源（round29 口径）。
+                branch, push_err = await asyncio.to_thread(
+                    push_merged_diff_branch,
+                    project_path, merged_diff, task_id or "unknown",
+                    base_ref=ref, base_commit=state.get("base_commit") or None,
+                )
+                if not branch:
+                    # D34 fail-closed：push 失败绝不回退默认 ref——pipeline(默认 ref) 本来就绿，
+                    # 等于未测任何变更的假绿。push 失败是 infra/基线问题而非代码验证失败，按
+                    # "未执行"上报（l3_passed=None+skipped，gates/graph 均视为跳过），不伪装成
+                    # False 误触发 HANDLE_FAILURE 把 infra 归因成验证失败。
+                    logger.error(
+                        "[VERIFY_L3] L3 push 失败 → fail-closed 跳过 L3"
+                        "(不回退默认 ref 假绿): %s", push_err,
+                    )
+                    return {
+                        "l3_passed": None,
+                        "l3_skipped": True,
+                        "l3_message": "L3 push failed, fail-closed skip (infra, not "
+                                      f"verified): {push_err or 'unknown push failure'}",
+                    }
+                ref = branch
+                logger.info("[VERIFY_L3] 已推送 L3 分支: %s", branch)
 
             # R23-1 治本：trigger_and_poll_pipeline 内含 time.sleep 轮询(同步阻塞)，放线程池执行，
             # 不卡 async 事件循环。

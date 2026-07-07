@@ -439,17 +439,34 @@ def _resolve_project_path(state: BrainState) -> str | None:
         return None
 
 
+# D57：tech_design 事实采集/点名文件核验的短 TTL memo——tech_design 主调 + review×3 +
+# replan 重入会在短窗内对同一项目树反复整树 os.walk（每调两遍）。规划期项目树静态
+# （dispatch 前无 worker 写盘），短 TTL 内复用安全；TTL 过期自动重扫，绝不永久缓存。
+# facts（LLM 参考事实，advisory）用较长 TTL；verify（可触发澄清的存在性判定，correctness-
+# relevant）用短 TTL，把 stale 误判窗压到复审突发之内。
+_FACTS_MEMO_TTL_S = 120.0
+_VERIFY_MEMO_TTL_S = 30.0
+_FACTS_MEMO: dict[tuple, tuple[float, str]] = {}
+_VERIFY_MEMO: dict[tuple, tuple[float, list]] = {}
+
+
 def _gather_project_facts(project_path: str | None, max_dirs: int = 60) -> str:
     """采集项目真实结构事实供 tech_design 核验【事实依据】（ground truth=磁盘，不靠可能滞后的索引）。
 
     产出：① 顶层目录树（前若干层，识别分层规范如 RuoYi 的 controller/service/mapper/domain）；
     ② 各典型层下的样例文件名（让 LLM 学到命名/路径规律，设计新文件路径时照此推导）。
     这样 tech_design 能核验"需求点名的文件是否真实存在"+ 据真实结构设计新文件路径。
+    D57：结果按 (project_path, max_dirs) 做 120s TTL memo（review×3/replan 短窗重入不重扫）。
     """
     if not project_path:
         return "（无项目路径，无法核验文件事实——方案中的文件存在性需 worker 沙箱实地确认）"
     import os
+    import time as _time
     from collections import Counter
+    _memo_key = (str(project_path), int(max_dirs))
+    _hit = _FACTS_MEMO.get(_memo_key)
+    if _hit is not None and (_time.monotonic() - _hit[0]) < _FACTS_MEMO_TTL_S:
+        return _hit[1]
     try:
         lines: list[str] = []
         # 识别典型分层目录的样例文件（帮 LLM 学命名规律，语言/框架无关）
@@ -539,7 +556,9 @@ def _gather_project_facts(project_path: str | None, max_dirs: int = 60) -> str:
             "并严格按该实际栈与既有约定推导 file_plan 的路径与文件形态；需求文档若假定了与磁盘"
             "不同的框架/技术，一律以磁盘事实为准（适配落地，不算虚假前提）。"
         )
-        return "\n".join(lines)
+        _out = "\n".join(lines)
+        _FACTS_MEMO[_memo_key] = (_time.monotonic(), _out)  # D57：成功才缓存，异常不缓存
+        return _out
     except Exception as exc:  # noqa: BLE001
         return f"（项目结构扫描失败：{exc}；文件存在性需 worker 沙箱实地确认）"
 
@@ -561,6 +580,13 @@ def _verify_named_files_exist(task_description: str, project_path: str | None) -
     import os
     import re
     import subprocess
+    import time as _time
+    # D57：短 TTL memo（30s）——review×3/replan 短窗重入不重复整树 walk + git ls-files。
+    # 规划期项目树静态；30s 窗把"apply 后新文件被 stale 判不存在"的误判窗压到复审突发内。
+    _memo_key = (str(project_path), hash(task_description or ""))
+    _hit = _VERIFY_MEMO.get(_memo_key)
+    if _hit is not None and (_time.monotonic() - _hit[0]) < _VERIFY_MEMO_TTL_S:
+        return [dict(r) for r in _hit[1]]  # 浅拷贝防调用方原地改缓存
     named = re.findall(r"\b([A-Za-z_][\w./-]*\.[A-Za-z]{1,5})\b", task_description or "")
     if not named:
         return []
@@ -647,6 +673,7 @@ def _verify_named_files_exist(task_description: str, project_path: str | None) -
                 "file": token, "exists": False, "confidence": "high",
                 "sources": [], "candidates": cands,
             })
+    _VERIFY_MEMO[_memo_key] = (_time.monotonic(), [dict(r) for r in results])  # D57
     return results
 
 
@@ -2246,11 +2273,6 @@ def _basename_noext(f: str) -> str:
     return b.rsplit(".", 1)[0] if "." in b else b
 
 
-def _parent_dir(f: str) -> str:
-    parts = f.replace("\\", "/").split("/")
-    return parts[-2] if len(parts) >= 2 else ""
-
-
 def _longest_common_suffix(strs: list[str]) -> str:
     """一组字符串的最长公共后缀(用于识别 XxxHandler/XxxSender 这类同后缀兄弟)。"""
     if not strs:
@@ -2271,13 +2293,24 @@ def _is_interface_like(base: str) -> bool:
     return len(base) > 1 and base[0] == "I" and base[1].isupper()
 
 
+def _has_camel_word_prefix(base: str, prefix: str) -> bool:
+    """base 是否以【完整 CamelCase 词】prefix 开头。D35 治本：裸 startswith 会把
+    BaseballXxx 当 Base*、Abstraction 当 Abstract* 误判成共享抽象——prefix 命中后
+    必须正好结束或紧跟大写字母（新词边界）才算。跨栈通用纯命名判据。"""
+    if not base.startswith(prefix):
+        return False
+    return len(base) == len(prefix) or base[len(prefix)].isupper()
+
+
 def _is_upstream_shared(base: str) -> bool:
     """【共享抽象】——被各平行实现依赖，须【先建】(归上游首批,各 leaf readable 含它)。
     含：接口(I 前缀)、抽象/基类(Abstract*/Base*/*Base/*Support)。对抗审计 #1 治本：基类若被当
-    平行兄弟拆到 leaf 批，前向 readable 不含它 → 子批 `cannot find symbol`。"""
+    平行兄弟拆到 leaf 批，前向 readable 不含它 → 子批 `cannot find symbol`。
+    D35：前缀按 CamelCase 词边界匹配（BaseballScoreService/Abstraction 不是基类）。"""
     return (
         _is_interface_like(base)
-        or base.startswith(("Abstract", "Base"))
+        or _has_camel_word_prefix(base, "Abstract")
+        or _has_camel_word_prefix(base, "Base")
         or base.endswith(("Base", "Support"))
     )
 
@@ -2319,13 +2352,19 @@ def _detect_parallel_impls(core: list[str]) -> tuple[list[str], list[str], list[
     不构成家族返回 None。纯路径+命名判据，跨语言/跨栈通用，不绑 Java、不写死项目/模块名。
     """
     from collections import defaultdict
+    # D35：分组键 = 【完整父目录路径】而非目录 basename——只按 basename 分组会把
+    # a/impl 与 b/impl 两个互不相干的目录并成一个假家族（跨目录 leaf 被错连成兄弟批）。
+    # 目录信号(_IMPL_DIR_NAMES)仍只看最后一段目录名，语义不变。
     by_dir: dict[str, list[str]] = defaultdict(list)
     for f in core:
-        by_dir[_parent_dir(f).lower()].append(f)
+        norm = f.replace("\\", "/")
+        parent_path = norm.rsplit("/", 1)[0].lower() if "/" in norm else ""
+        by_dir[parent_path].append(f)
 
     best_files: list[str] = []
     best_leaves: list[str] = []
-    for dirname, files in by_dir.items():
+    for dirpath, files in by_dir.items():
+        dirname = dirpath.rsplit("/", 1)[-1]
         # 剥离共享抽象/协调者后，剩下的才是【平行 leaf】——据此判家族规模与命名信号
         leaves = [
             f for f in files

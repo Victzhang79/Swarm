@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -77,7 +78,8 @@ def resolve_user(token: str) -> SwarmUser | None:
     if user:
         return user
     legacy = (cfg.api_key or "").strip()
-    if legacy and token == legacy:
+    # D47a：常量时间比较——`==` 短路于首个不等字节，攻击者可按响应时延逐字节爆破 legacy key。
+    if legacy and hmac.compare_digest(token.encode("utf-8"), legacy.encode("utf-8")):
         return _LEGACY_USER
     return None
 

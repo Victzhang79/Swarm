@@ -31,6 +31,42 @@ def _preprocess_timeout_sec() -> int:
 
 
 # ──────────────────────────────────────────────
+# D20：预处理取消标志（超时/失败后让 to_thread 内的同步阶段自查退出）
+#
+# asyncio.wait_for 超时只取消【协程】——正在 to_thread 里跑的同步函数
+# （如 _store_vectors_qdrant 的 Qdrant 批量写，含进度回调）会继续跑，
+# 在项目已置 ERROR 后把 phase 写回"embedding"（状态回魂）。治本：按
+# project_id 注册 threading.Event，超时/异常时置位；同步阶段在边界自查。
+# ──────────────────────────────────────────────
+
+import threading  # noqa: E402
+
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_CANCEL_EVENTS_LOCK = threading.Lock()
+
+
+def _register_cancel_event(project_id: str) -> threading.Event:
+    ev = threading.Event()
+    with _CANCEL_EVENTS_LOCK:
+        _CANCEL_EVENTS[project_id] = ev
+    return ev
+
+
+def _unregister_cancel_event(project_id: str, ev: threading.Event) -> None:
+    """只清自己注册的那个事件（身份比对，防误清并发新一轮的事件）。"""
+    with _CANCEL_EVENTS_LOCK:
+        if _CANCEL_EVENTS.get(project_id) is ev:
+            del _CANCEL_EVENTS[project_id]
+
+
+def _get_cancel_event(project_id: str) -> "threading.Event | None":
+    """同步阶段【入口处捕获一次】事件对象并全程持有——注册表在 preprocess_project
+    结束时清理（finally），若每次都查注册表，清理后残余线程会误判"未取消"继续回写。"""
+    with _CANCEL_EVENTS_LOCK:
+        return _CANCEL_EVENTS.get(project_id)
+
+
+# ──────────────────────────────────────────────
 # 排除目录和文件
 # ──────────────────────────────────────────────
 
@@ -178,6 +214,9 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         await _phase_build_sandbox(project_id, project_path)
         return scan_result, index_result, embed_result
 
+    # D20：注册取消事件——超时/异常时置位，让仍在 to_thread 里跑的同步阶段自查退出，
+    # 不再在项目置 ERROR 后回写进度（状态回魂）。finally 保证注册表不泄漏。
+    _cancel_ev = _register_cancel_event(project_id)
     try:
         # P2：整段预处理设总超时（默认 3600s，可配 SWARM_PREPROCESS_TIMEOUT_SEC）。
         # 任一阶段挂死(如 embedding/沙箱构建端点 hang)→ TimeoutError → 下方 except 置 ERROR，
@@ -206,6 +245,9 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         logger.info("Preprocessing complete for project %s", project_id)
 
     except (TimeoutError, asyncio.TimeoutError):
+        # D20：先置取消标志——wait_for 只取消协程，to_thread 里的同步阶段仍在跑，
+        # 置位后它们在边界自查退出、不再写 upsert_progress 回魂。
+        _cancel_ev.set()
         msg = f"预处理超时(>{_preprocess_timeout_sec()}s)，置 ERROR 避免永卡 PREPROCESSING"
         logger.error("Preprocessing TIMEOUT for project %s: %s", project_id, msg)
         await asyncio.to_thread(
@@ -215,6 +257,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         await asyncio.to_thread(update_project, project_id, status="ERROR")
         return
     except Exception as exc:
+        _cancel_ev.set()  # D20：同上，异常路径也要止住残余线程的进度回写
         logger.exception("Preprocessing failed for project %s", project_id)
         await asyncio.to_thread(
             upsert_progress,
@@ -229,6 +272,8 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
             project_id,
             status="ERROR",
         )
+    finally:
+        _unregister_cancel_event(project_id, _cancel_ev)
 
 
 # ──────────────────────────────────────────────
@@ -1261,6 +1306,17 @@ def _store_vectors_qdrant(
     progress_callback=None,
 ) -> None:
     """将向量存入 Qdrant 统一集合 swarm_kb（与 SemanticIndexer 检索对齐）"""
+    # D20：入口捕获本轮取消事件（超时后 wait_for 只取消协程，本函数在 to_thread 线程里
+    # 继续跑——批边界自查退出，不再触 Qdrant/回写进度）。
+    _cancel_ev = _get_cancel_event(project_id)
+
+    def _cancelled() -> bool:
+        return _cancel_ev is not None and _cancel_ev.is_set()
+
+    if _cancelled():
+        logger.warning("[EMBED] 预处理已取消(超时/失败)，跳过 Qdrant 写入 project=%s", project_id)
+        return
+
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -1268,6 +1324,14 @@ def _store_vectors_qdrant(
         INDEX_SOURCE_CODEGRAPH,
         INDEX_VERSION,
     )
+
+    # D13 fail-closed：project_id 缺失/为空 → 拒绝写入（在建集合/upsert 之前）。
+    # 与 SemanticIndexer.index_chunks 对称——绝不静默落进无项目隔离的 ID 空间。
+    if not (isinstance(project_id, str) and project_id.strip()):
+        logger.warning("_store_vectors_qdrant: project_id 缺失/为空，拒绝写入（fail-closed）")
+        raise ValueError(
+            "_store_vectors_qdrant requires a non-empty project_id (D13 fail-closed)"
+        )
 
     cfg = DatabaseConfig()
     collection_name = cfg.qdrant_collection
@@ -1290,6 +1354,14 @@ def _store_vectors_qdrant(
     batch_size = 100
     total = len(symbols)
     for i in range(0, total, batch_size):
+        if _cancelled():
+            # D20：中途取消——已 upsert 的新代际向量留存（稳定 ID 幂等，下次重建覆盖），
+            # 【不 prune】：部分写入时按代际 prune 会删掉尚未被替换的旧向量（数据丢失）。
+            logger.warning(
+                "[EMBED] 预处理已取消，中止 Qdrant 写入（%d/%d 批已写，不执行 prune）project=%s",
+                i // batch_size, (total + batch_size - 1) // batch_size, project_id,
+            )
+            return
         batch_symbols = symbols[i : i + batch_size]
         batch_vectors = vectors[i : i + batch_size]
 
@@ -1318,11 +1390,12 @@ def _store_vectors_qdrant(
                 "index_generation": _index_generation,
             }
             # P1-DEBT-04：与增量(semantic)路径共用同一 ID 方案（make_point_id），
-            # 同一 (file,line,content) 产同一 point ID → 两路径可互相 upsert 去重，
+            # 同一 (project,file,line) 产同一 point ID → 两路径可互相 upsert 去重，
             # 不再因 int/uuid 双方案不相交导致同集合内召回漂移。
+            # D13：project_id 参与 key——跨项目同路径 chunk 不再互相覆盖。
             from swarm.knowledge.semantic_index import make_point_id
             stable_id = make_point_id(
-                sym.get("file_path", ""), sym.get("start_line", 0), content
+                project_id, sym.get("file_path", ""), sym.get("start_line", 0), content
             )
             points.append(
                 PointStruct(id=stable_id, vector=vec, payload=payload)
@@ -1330,12 +1403,18 @@ def _store_vectors_qdrant(
 
         client.upsert(collection_name=collection_name, points=points)
 
-        if progress_callback:
+        # D20：取消后不得再写进度（项目可能已置 ERROR，回写会把 phase 复活成 embedding）
+        if progress_callback and not _cancelled():
             progress = min((i + batch_size) / max(total, 1), 1.0)
             progress_callback(
                 progress,
                 f"Storing vectors {min(i + batch_size, total)}/{total}...",
             )
+
+    # D20：prune 前最后一道取消自查（与"崩在 upsert 中途则不 prune"同一恢复语义）。
+    if _cancelled():
+        logger.warning("[EMBED] 预处理已取消，跳过代际 prune project=%s", project_id)
+        return
 
     # #2：prune——全部新向量落盘后，删本项目【非本代际】的残留旧向量。
     # 仅在新数据就位后执行，故检索全程有数据（无空窗）；崩在 upsert 中途则不 prune，
@@ -1431,7 +1510,7 @@ def _build_directory_tree(root: Path, max_depth: int = 3, prefix: str = "") -> s
 
 
 def _call_local_llm(analysis_input: dict[str, Any]) -> str:
-    """调本地 MiniMax-M2.7-Pro 生成项目摘要"""
+    """调本地路由配置模型（ModelConfig.worker_primary）生成项目摘要"""
     from swarm.tracing import PHASE_2, is_langsmith_active
 
     if is_langsmith_active():
@@ -1479,6 +1558,8 @@ Please provide:
 """
 
     # 尝试 OpenAI-compatible API 调用本地模型
+    # D47d：模型名走路由配置（worker_primary=本地槽），不写死——写死会无视用户在
+    # .env/WebUI 配置的路由，本地机型更换后此处静默打向不存在的模型。
     try:
         from openai import OpenAI
         client = OpenAI(
@@ -1486,7 +1567,7 @@ Please provide:
             api_key=model_config.local_api_key or "dummy",
         )
         response = client.chat.completions.create(
-            model="MiniMax-M2.7-Pro",
+            model=model_config.worker_primary,
             messages=[
                 {"role": "system", "content": "You are a software architecture analyst. Provide concise, structured project analysis."},
                 {"role": "user", "content": prompt},
@@ -1500,7 +1581,8 @@ Please provide:
     except Exception as exc:
         logger.warning("Local LLM API call failed: %s", exc)
 
-    # 回退: 尝试 SiliconFlow API
+    # 回退: 尝试云端 API——D47d：模型名走路由配置（brain_primary=云端槽），不写死。
+    # 旧硬编码 "Pro/zai-org/GLM-5.1" 已与配置默认（GLM-5.2）脱节，正是无视路由的实证。
     try:
         from openai import OpenAI
         client = OpenAI(
@@ -1508,7 +1590,7 @@ Please provide:
             api_key=model_config.siliconflow_api_key,
         )
         response = client.chat.completions.create(
-            model="Pro/zai-org/GLM-5.1",
+            model=model_config.brain_primary,
             messages=[
                 {"role": "system", "content": "You are a software architecture analyst. Provide concise, structured project analysis."},
                 {"role": "user", "content": prompt},

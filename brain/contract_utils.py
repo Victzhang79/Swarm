@@ -145,7 +145,12 @@ def _ensure_maven_module_build_scope(subtasks: list) -> bool:
 
 
 def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:
-    """将 plan.shared_contract 合并进各子任务 contract（子任务字段优先）。"""
+    """将 plan.shared_contract 合并进各子任务 contract（子任务字段优先）。
+
+    D51：plan 节点已【不再调用】本函数——每子任务内联一份 ~42K shared 副本是 plan/
+    checkpoint 体积病灶（slim_plan_json_for_llm_validation 就是为对冲它而生的补丁）。
+    完整契约改由派发面 worker/prompts.build_worker_prompt 以同一 merge 语义现场合成。
+    函数保留：merge 语义的单一参照实现 + 既有测试消费者 + 兼容外部调用。"""
     shared = plan.shared_contract or {}
     if not shared:
         return plan
@@ -1191,6 +1196,12 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
     for s in plan.subtasks:
         s.depends_on = sorted({drop_to_canon.get(d, d) for d in (getattr(s, "depends_on", []) or [])
                                if drop_to_canon.get(d, d) != s.id})
+    # D10：删掉重复脚手架子任务后同步 parallel_groups——剔除悬空引用+清空空组，
+    # 否则 plan_validator "parallel_groups 含未知子任务" 硬失败，叠加 D09 盲重试死循环。
+    if getattr(plan, "parallel_groups", None):
+        from swarm.brain.plan_batch import prune_parallel_groups
+        plan.parallel_groups = prune_parallel_groups(
+            plan.parallel_groups, {s.id for s in plan.subtasks})
     logger.info("[ELABORATE] 重复模块脚手架合并：%d 个重复脚手架并入 canonical(杜绝冗余地基,治严重文件冲突)",
                 merged)
     return merged

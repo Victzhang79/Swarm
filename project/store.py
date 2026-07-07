@@ -11,6 +11,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -178,7 +179,10 @@ def _get_conn_str(db_config: DatabaseConfig | None = None) -> str:
 def ensure_tables(conn_str: str | None = None) -> None:
     """同步建表（幂等）"""
     conn_str = conn_str or _get_conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             for ddl in ALL_DDL:
                 cur.execute(ddl)
@@ -259,6 +263,22 @@ def compute_task_duration_seconds(task: dict[str, Any]) -> float | None:
 # Project CRUD
 # ──────────────────────────────────────────────
 
+class ProjectPathConflictError(Exception):
+    """D16：create_project 的 path 已被既存项目占用。
+
+    store 层只上报事实（携带既存行），【不做】任何静默 UPDATE——旧的
+    ON CONFLICT DO UPDATE 让任何持 project:create 者提交已存在 path 即可改写
+    受害项目 name/description/config 并拿到完整项目行（跨用户项目劫持）。
+    成员资格校验/幂等复用是授权决策，归路由层（api/routers/project.py）。
+    """
+
+    def __init__(self, existing: dict[str, Any]):
+        self.existing = existing
+        super().__init__(
+            f"project path already exists (existing id={existing.get('id')})"
+        )
+
+
 def create_project(
     project_id: str,
     name: str,
@@ -267,18 +287,19 @@ def create_project(
     config: dict[str, Any] | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
-    """创建项目，返回完整行"""
+    """创建项目，返回完整行。
+
+    D16（默认拒绝）：path 冲突不再静默 UPDATE 既存项目（原 DO UPDATE 是跨用户
+    项目劫持破口，P1-23 的"冲突合并 config"语义随之废止）。存在即抛
+    ProjectPathConflictError(existing)，由调用方（路由）决定幂等复用或拒绝。
+    """
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO projects (id, name, path, description, config)
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (path) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    description = EXCLUDED.description,
-                    config = COALESCE(projects.config, '{}'::jsonb) || COALESCE(EXCLUDED.config, '{}'::jsonb),
-                    updated_at = NOW()
+                ON CONFLICT (path) DO NOTHING
                 RETURNING id, name, path, description, status, graph_status,
                           graph_progress, graph_error, file_count, symbol_count,
                           language_breakdown, config, created_at, updated_at
@@ -286,18 +307,19 @@ def create_project(
                 (project_id, name, path, description, Jsonb(config or {})),
             )
             row = cur.fetchone()
-    result = _row_to_project(row)
-    # P1-23：path 是自然键——冲突时既存行的 id 无法重指（改 PK 会破坏 FK 引用），
-    # 返回既存 id。但调用方传的新 id 被替换是重要事实，须可观测（不静默丢）。
-    # config 已在 DO UPDATE 中 jsonb 并集合并（顶层键：新值覆盖同名、既存键保留）——
-    # 不再静默丢弃调用方新 config。注：|| 是【浅合并】，同名顶层键下的嵌套对象整体替换。
-    if result["id"] != project_id:
+    if row is None:
+        existing = get_project_by_path(path, conn_str)
+        if existing is None:
+            # 竞态窗口：冲突行在读取前又被删——按"路径被占用"处理仍是安全侧
+            # （调用方可重试）；绝不在此回退为 UPDATE。
+            raise ProjectPathConflictError({"id": None, "path": path})
         logger.warning(
-            "[project] create_project: path=%s 已存在(既存 id=%s)，传入的新 id=%s 被忽略、"
-            "复用既存项目；config 已并集合并（未丢弃调用方新值）。",
-            path, result["id"], project_id,
+            "[project] create_project: path=%s 已被既存项目占用(id=%s)，拒绝改写"
+            "（D16 默认拒绝，由路由决定成员幂等/403）。",
+            path, existing.get("id"),
         )
-    return result
+        raise ProjectPathConflictError(existing)
+    return _row_to_project(row)
 
 
 def get_project(project_id: str, conn_str: str | None = None) -> dict[str, Any] | None:
@@ -444,9 +466,14 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
     删除前把该项目所有任务写入 append-only 审计日志，保证可追溯（避免再次发生
     "任务被删后无任何痕迹、无法回答删了什么"的问题）。
     """
-    # 先快照所有任务写审计
+    # 先快照所有任务（审计留痕 + D21 收集 uploads 路径供删除后清理）
+    _task_snapshots: list[dict[str, Any]] = []
     try:
-        for t in list_tasks(project_id, conn_str):
+        _task_snapshots = list_tasks(project_id, conn_str)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("删除项目 %s 前快照任务失败: %s", project_id, exc)
+    try:
+        for t in _task_snapshots:
             append_task_audit(
                 t.get("id"),
                 event="deleted_with_project",
@@ -511,8 +538,27 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                     "llm_token_usage",
                 ):
                     _delete_if_table_exists(cur, tbl, project_id)
+                # D21：此前遗漏的两张项目级作用域表——
+                # swarm_project_members：成员行残留会永久污染 list_user_project_ids
+                # 白名单（被删项目 id 一直出现在用户可见集）；kb_mr_history：MR 历史
+                # 按 project_id 作用域，同属项目生命周期。
+                for tbl in (
+                    "swarm_project_members",
+                    "kb_mr_history",
+                ):
+                    _delete_if_table_exists(cur, tbl, project_id)
                 cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
                 deleted = cur.rowcount
+    # D21：DB 级联提交成功后清理该项目所有任务的 uploads 文件（事务外 best-effort，
+    # 路径校验 + 引用复核在 _cleanup_upload_files 内；失败仅告警，孤儿由周期 GC 兜底）。
+    if deleted > 0 and _task_snapshots:
+        try:
+            _cleanup_upload_files(
+                [p for t in _task_snapshots for p in (t.get("uploaded_files") or [])],
+                conn_str,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除项目 %s 后清理 uploads 失败(交周期 GC 兜底): %s", project_id, exc)
     return deleted > 0
 
 
@@ -561,6 +607,10 @@ def create_task(
     uploaded_files: list[str] | None = None,
     auto_confirm_vision: bool = False,
     pooled: bool = False,
+    status: str | None = None,
+    thread_id: str | None = None,
+    auto_accept: bool | None = None,
+    queue_priority: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
     """创建任务记录。
@@ -568,20 +618,28 @@ def create_task(
     uploaded_files: B 部分上传的文件路径（任务专属目录，绝对路径）。
     auto_confirm_vision: 用户勾选「模型自行确认」→ 跳过图片理解人工确认。
     pooled: True=仅入需求池（不立即执行），False=立即执行。
+    status/thread_id/auto_accept/queue_priority: D22 治本——初始执行 meta 随同一条 INSERT
+    原子落库（None=沿用 DDL 默认）。旧链路是 create_task + update_task 两条 autocommit，
+    第二条失败会留下缺 meta 的 SUBMITTED 残行（未入调度队列，长稳进程永久卡死至重启对账）。
     """
+    cols = ["id", "project_id", "description", "created_by_user_id",
+            "uploaded_files", "auto_confirm_vision", "pooled"]
+    vals: list[Any] = [task_id, project_id, description, created_by_user_id,
+                       Jsonb(uploaded_files or []), auto_confirm_vision, pooled]
+    for col, val in (("status", status), ("thread_id", thread_id),
+                     ("auto_accept", auto_accept), ("queue_priority", queue_priority)):
+        if val is not None:
+            cols.append(col)
+            vals.append(val)
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                INSERT INTO task_records (
-                    id, project_id, description, created_by_user_id,
-                    uploaded_files, auto_confirm_vision, pooled
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO task_records ({", ".join(cols)})
+                VALUES ({", ".join(["%s"] * len(cols))})
                 RETURNING {_TASK_SELECT}
                 """,
-                (task_id, project_id, description, created_by_user_id,
-                 Jsonb(uploaded_files or []), auto_confirm_vision, pooled),
+                vals,
             )
             row = cur.fetchone()
     task = _row_to_task(row)
@@ -694,6 +752,98 @@ def list_tasks(project_id: str, conn_str: str | None = None) -> list[dict[str, A
             )
             rows = cur.fetchall()
     return [_row_to_task(r) for r in rows]
+
+
+# D49：列表视图轻量列——剔除 MB 级重字段（plan/merged_diff/token_usage/merge_conflicts/
+# l3_result/ingest_draft），其余字段与 _TASK_SELECT 同名同序义。取证：列表消费者（web
+# tasks.js / project.js / cli task_list / runner 级联取消 / delete_project 快照）只用
+# id/status/description/complexity/uploaded_files 等轻字段；重字段一律走 get_task 详情。
+_TASK_SELECT_LIGHT = """
+    id, project_id, description, status, complexity,
+    subtask_count, completed_subtasks,
+    human_decision, thread_id, duration_seconds,
+    created_by_user_id, created_at, updated_at,
+    uploaded_files, auto_confirm_vision, pooled,
+    abandoned_subtasks, auto_accept, queue_priority, base_commit
+"""
+
+
+def _row_to_task_light(row: tuple) -> dict[str, Any]:
+    """_TASK_SELECT_LIGHT 行 → dict。键名/解析口径与 _row_to_task 完全一致，仅缺重字段。"""
+    return {
+        "id": row[0],
+        "project_id": row[1],
+        "description": row[2],
+        "status": row[3],
+        "complexity": row[4],
+        "subtask_count": row[5],
+        "completed_subtasks": row[6],
+        "human_decision": row[7],
+        "thread_id": row[8],
+        "duration_seconds": float(row[9]) if row[9] is not None else None,
+        "created_by_user_id": row[10],
+        "created_at": row[11],
+        "updated_at": row[12],
+        "uploaded_files": _parse_json_list(row[13]),
+        "auto_confirm_vision": bool(row[14]),
+        "pooled": bool(row[15]),
+        "abandoned_subtasks": row[16] or 0,
+        "remaining_subtasks": max(0, (row[5] or 0) - (row[6] or 0) - (row[16] or 0)),
+        "auto_accept": bool(row[17]),
+        "queue_priority": row[18] or "normal",
+        "base_commit": row[19] or None,
+    }
+
+
+def list_tasks_light(
+    project_id: str,
+    conn_str: str | None = None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """列出项目任务（轻量列 + 可选分页，D49）。
+
+    列表/轮询面专用：不选 merged_diff（MB 级）/plan/l3_result/token_usage 等重字段——
+    长寿项目每次轮询把全部历史 diff 搬进内存再丢弃是热点病灶。limit=None 保持全量
+    （内部调用者语义不变）。
+    """
+    sql = f"""
+        SELECT {_TASK_SELECT_LIGHT}
+        FROM task_records
+        WHERE project_id = %s
+        ORDER BY created_at DESC
+    """
+    params: list[Any] = [project_id]
+    if limit is not None:
+        sql += " LIMIT %s OFFSET %s"
+        params.extend([int(limit), max(0, int(offset))])
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    return [_row_to_task_light(r) for r in rows]
+
+
+def get_task_creators(
+    task_ids: "list[str]", conn_str: str | None = None
+) -> dict[str, str | None]:
+    """批量查任务创建者（D49：sandbox_status 可见性过滤原每沙箱一条 get_task 全行 N+1）。
+
+    返回 {task_id: created_by_user_id}；不存在的 id 不在结果里。失败上抛，调用方
+    fail-closed 回退逐个旧路径。
+    """
+    ids = [t for t in (task_ids or []) if t]
+    if not ids:
+        return {}
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, created_by_user_id FROM task_records WHERE id = ANY(%s)",
+                (ids,),
+            )
+            rows = cur.fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 def list_orphan_candidates(conn_str: str | None = None) -> list[dict[str, Any]]:
@@ -939,7 +1089,167 @@ def delete_task(task_id: str, conn_str: str | None = None) -> bool:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM task_records WHERE id = %s", (task_id,))
             deleted = cur.rowcount
+    # D21：行删除后清理其 uploads 文件（best-effort；路径校验 + 仍被其它任务引用则跳过）。
+    if deleted > 0 and snap is not None and snap.get("uploaded_files"):
+        try:
+            _cleanup_upload_files(snap["uploaded_files"], conn_str)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除任务 %s 后清理 uploads 失败(交周期 GC 兜底): %s", task_id, exc)
     return deleted > 0
+
+
+# ──────────────────────────────────────────────
+# D21：uploads 文件清理 + 孤儿批次 GC
+# ──────────────────────────────────────────────
+
+def _uploads_root_path() -> "Path | None":
+    """uploads 根目录（workspace/uploads，与 api/routers/upload.py 同源）。
+
+    读不到配置时返回 None → 调用方一律跳过删除（fail-closed：宁留不误删）。
+    测试经 monkeypatch 此 seam 注入临时根。
+    """
+    from pathlib import Path
+
+    try:
+        from swarm.config.settings import get_config
+        return Path(get_config().workspace_root) / "uploads"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _upload_path_referenced(path: str, conn_str: str | None = None) -> bool:
+    """是否仍有任务引用该上传路径（jsonb 数组包含判定）。查询失败按"被引用"处理（不删）。"""
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM task_records WHERE uploaded_files @> %s::jsonb LIMIT 1",
+                    (json.dumps([path]),),
+                )
+                return cur.fetchone() is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[uploads-gc] 引用复核失败，按被引用保留 %s: %s", path, exc)
+        return True
+
+
+def _cleanup_upload_files(paths: "Iterable[str]", conn_str: str | None = None) -> int:
+    """删除一批 uploads 文件（任务/项目删除后的收尾）。返回删除文件数。
+
+    安全铁律（D21）：
+    - 只删 resolve 后落在 workspace/uploads 根内的路径（swarm.paths.is_within_root，
+      fail-closed 防 ../ 与 symlink 穿越）；越界一律告警跳过。
+    - 仍被其它 task_records 引用的文件跳过（同一上传批次可被多任务引用，最小破坏面）。
+    - 文件删净后仅 rmdir【空的】批次目录（uploads 根的直接子目录）；根目录自身绝不删。
+    """
+    from pathlib import Path
+
+    from swarm.paths import is_within_root
+
+    root = _uploads_root_path()
+    if root is None:
+        return 0
+    removed = 0
+    batch_dirs: set = set()
+    for raw in paths or []:
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        if not is_within_root(root, p, join=False):
+            logger.warning("[uploads] 跳过越界路径（拒绝删除 uploads 根之外）: %s", p)
+            continue
+        if _upload_path_referenced(p, conn_str):
+            continue
+        try:
+            fp = Path(p)
+            if fp.is_file():
+                fp.unlink()
+                removed += 1
+            batch_dirs.add(fp.parent)
+        except OSError as exc:
+            logger.warning("[uploads] 删除文件失败 %s: %s", p, exc)
+    # 清空的批次目录（只处理 uploads 根的直接子目录；rmdir 只删空目录，非空自动保留）
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return removed
+    for d in batch_dirs:
+        try:
+            dr = d.resolve()
+            if dr != root_resolved and dr.parent == root_resolved:
+                d.rmdir()
+        except OSError:
+            pass  # 非空/已删/权限 → 保留，交周期 GC
+    return removed
+
+
+def gc_orphan_upload_batches(
+    max_age_days: int | None = None, conn_str: str | None = None
+) -> int:
+    """D21：清理 uploads 根下【无任何 task_records 引用且超龄】的孤儿批次目录。
+
+    历史缺口：workspace/uploads/<batch>/ 全仓无删除路径（上传后不建任务、或旧版删除
+    不清文件）→ 无限累积。默认保留 SWARM_UPLOADS_GC_DAYS（7）天；<=0 关闭。
+    只删 uploads 根的直接子目录；symlink 不追（拒绝穿越）；引用判定同时按原始路径与
+    resolve 路径前缀比对（宁留不误删）。返回删除目录数。fail-safe：单目录异常跳过。
+    """
+    import shutil
+    import time as _time
+
+    if max_age_days is None:
+        try:
+            max_age_days = int(os.environ.get("SWARM_UPLOADS_GC_DAYS", "7"))
+        except ValueError:
+            max_age_days = 7
+    if max_age_days <= 0:
+        return 0
+    root = _uploads_root_path()
+    if root is None or not root.is_dir():
+        return 0
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return 0
+    cutoff = _time.time() - max_age_days * 86400
+    removed = 0
+    for child in sorted(root.iterdir()):
+        try:
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if child.stat().st_mtime >= cutoff:
+                continue  # 未超龄：可能是"已上传、任务尚未创建"的窗口，保留
+            # 引用复核：任一任务的 uploaded_files 含该批次目录下路径 → 保留。
+            prefixes = {str(child) + os.sep, str(child.resolve()) + os.sep}
+            referenced = False
+            with _get_conn(conn_str) as conn:
+                with conn.cursor() as cur:
+                    for prefix in prefixes:
+                        cur.execute(
+                            """
+                            SELECT 1 FROM task_records t
+                            WHERE EXISTS (
+                                SELECT 1 FROM jsonb_array_elements_text(
+                                    COALESCE(t.uploaded_files, '[]'::jsonb)) AS f(p)
+                                WHERE left(f.p, %s) = %s
+                            ) LIMIT 1
+                            """,
+                            (len(prefix), prefix),
+                        )
+                        if cur.fetchone() is not None:
+                            referenced = True
+                            break
+            if referenced:
+                continue
+            # 归属复校（删除前最后一道）：必须仍是 uploads 根的直接子目录
+            cr = child.resolve()
+            if cr == root_resolved or cr.parent != root_resolved:
+                logger.warning("[uploads-gc] 跳过异常归属目录: %s", child)
+                continue
+            shutil.rmtree(child)
+            removed += 1
+            logger.info("[uploads-gc] 清理孤儿上传批次: %s", child)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[uploads-gc] 处理 %s 失败(跳过): %s", child, exc)
+    return removed
 
 
 # ──────────────────────────────────────────────
@@ -954,9 +1264,11 @@ from swarm.task_states import (  # noqa: E402
     TERMINAL_STATES as _TERMINAL_STATES_SET,
 )
 _TERMINAL_STATUSES = tuple(sorted(_TERMINAL_STATES_SET))
-# 需通知的状态：完成/失败 + 全部人工闸中断挂起态（含 CLARIFYING/DESIGN_REVIEW）。
+# 需通知的状态：全部终态 + 全部人工闸中断挂起态（含 CLARIFYING/DESIGN_REVIEW）。
 # 单一事实源：否则新增的中断态用户收不到通知 → 人工闸静默死等（与 P0-D 死区同源）。
-_NOTIFY_STATUSES = ("DONE", "FAILED", *sorted(_INTERRUPT_SUSPENDED_STATES))
+# D59：旧值 ("DONE","FAILED",…) 漏 PARTIAL/CANCELLED 两终态 → 部分交付/取消完全无通知，
+# 改为从 task_states.TERMINAL_STATES 派生，终态集合演进时不再漂移。
+_NOTIFY_STATUSES = (*_TERMINAL_STATUSES, *sorted(_INTERRUPT_SUSPENDED_STATES))
 
 
 def _task_event_type(status: str) -> str:
@@ -964,6 +1276,10 @@ def _task_event_type(status: str) -> str:
         return "task_completed"
     if status == "FAILED":
         return "task_failed"
+    if status == "PARTIAL":
+        return "task_partial"      # D59：部分交付如实通知（非成功、非失败的诚实终态）
+    if status == "CANCELLED":
+        return "task_cancelled"    # D59：取消也是用户关心的终局
     if status in _INTERRUPT_SUSPENDED_STATES:
         return "waiting_review"
     return "task_updated"
@@ -1460,6 +1776,65 @@ def _row_to_notification(row: Any) -> dict[str, Any]:
 # ──────────────────────────────────────────────
 # PreprocessProgress CRUD
 # ──────────────────────────────────────────────
+
+def claim_preprocess_slot(
+    project_id: str,
+    *,
+    stale_after_sec: float,
+    conn_str: str | None = None,
+) -> bool:
+    """D20：原子认领预处理执行权（in-flight 守卫，防并发预处理互删 KB/Qdrant 向量）。
+
+    单事务内：
+    1) CAS 条件 UPDATE projects → status='PREPROCESSING'。仅当【当前非 PREPROCESSING】
+       或【PREPROCESSING 但 updated_at 早于 stale_after_sec】（崩溃残留——正常运行由
+       wait_for 总超时兜底必在该窗口内落 ERROR/READY 并 bump updated_at，超窗即残留，
+       可重入不永拒）才命中。并发双触发在同一行上串行，输家重评估条件时看到赢家刚写的
+       status+updated_at → 0 行 → False（守卫依据全在同一 projects 行，无快照错位）。
+    2) 同事务重置 preprocess_progress（started_at=NOW()），关闭"认领后、重置前"的窗口。
+
+    返回是否认领成功；项目不存在 → False（fail-closed）。
+    """
+    with _get_conn(conn_str) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE projects SET status = 'PREPROCESSING', updated_at = NOW()
+                    WHERE id = %s
+                      AND (
+                        status IS DISTINCT FROM 'PREPROCESSING'
+                        OR updated_at < NOW() - make_interval(secs => %s)
+                      )
+                    RETURNING id
+                    """,
+                    (project_id, float(stale_after_sec)),
+                )
+                if cur.fetchone() is None:
+                    return False
+                cur.execute(
+                    """
+                    INSERT INTO preprocess_progress
+                        (project_id, phase, phase_progress, message, error, completed_at,
+                         scan_stats, index_stats, embed_stats, analysis_stats, started_at)
+                    VALUES (%s, 'idle', 0.0, 'Preprocessing queued...', NULL, NULL,
+                            '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, NOW())
+                    ON CONFLICT (project_id) DO UPDATE SET
+                        phase = 'idle',
+                        phase_progress = 0.0,
+                        message = 'Preprocessing queued...',
+                        error = NULL,
+                        completed_at = NULL,
+                        scan_stats = '{}'::jsonb,
+                        index_stats = '{}'::jsonb,
+                        embed_stats = '{}'::jsonb,
+                        analysis_stats = '{}'::jsonb,
+                        started_at = NOW()
+                    """,
+                    (project_id,),
+                )
+    return True
+
 
 def reset_preprocess_progress(project_id: str, conn_str: str | None = None) -> dict[str, Any]:
     """重置预处理进度（重新触发前清除旧的 complete/error 状态）"""

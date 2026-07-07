@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -208,6 +209,11 @@ CREATE TABLE IF NOT EXISTS kb_update_events (
 CREATE INDEX IF NOT EXISTS idx_event_status   ON kb_update_events(status);
 CREATE INDEX IF NOT EXISTS idx_event_project  ON kb_update_events(project_id);
 
+-- D39：卡死恢复所需列（幂等迁移）。claimed_at=出队认领时刻（staleness 按处理时长而非入队龄）；
+-- retry_count=stale-processing 重置/failed 重试的有界计数（防毒事件无限崩溃循环）。
+ALTER TABLE kb_update_events ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
+ALTER TABLE kb_update_events ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+
 -- Layer B embedding 重试队列：embedding 服务不可用时暂存，恢复后补处理
 CREATE TABLE IF NOT EXISTS kb_pending_embeddings (
     project_id    TEXT        NOT NULL,
@@ -265,8 +271,11 @@ class KnowledgeUpdater:
         """连接所有组件"""
         if self._conn is not None:
             return  # TD2606-B16：幂等守卫——重复 connect 不再丢弃旧连接造成泄漏
+        from swarm.infra.db import pg_connect_timeout_kwargs
+
+        # D15：直连（不走池）补 connect_timeout——PG 网络黑洞时有界快失败，不无限挂。
         self._conn = await psycopg.AsyncConnection.connect(
-            self._db_config.postgres_uri, autocommit=True
+            self._db_config.postgres_uri, autocommit=True, **pg_connect_timeout_kwargs()
         )
         async with self._conn.cursor() as cur:
             await cur.execute(EVENT_QUEUE_DDL)
@@ -701,6 +710,109 @@ class KnowledgeUpdater:
                 row = await cur.fetchone()
         return row[0]
 
+    # ── D39：卡死事件对账（stale processing / failed 有界重放）────────
+
+    @staticmethod
+    def _stale_processing_seconds() -> int:
+        """stale processing 判定阈值（秒）。env SWARM_KB_STALE_PROCESSING_SEC，
+        非法值回退默认 300，钳制 [1, 86400]。"""
+        raw = os.environ.get("SWARM_KB_STALE_PROCESSING_SEC", "")
+        try:
+            val = int(raw) if raw else 300
+        except ValueError:
+            val = 300
+        return min(86400, max(1, val))
+
+    @staticmethod
+    def _failed_max_retries() -> int:
+        """failed/stale-processing 重放的有界重试上限。env SWARM_KB_FAILED_MAX_RETRIES，
+        非法值回退默认 3，钳制 [0, 100]（0=不重试，只把 stale processing 显式转 failed）。"""
+        raw = os.environ.get("SWARM_KB_FAILED_MAX_RETRIES", "")
+        try:
+            val = int(raw) if raw else 3
+        except ValueError:
+            val = 3
+        return min(100, max(0, val))
+
+    async def _maybe_reconcile_stuck(self) -> None:
+        """节流包装：每 60s 至多对账一次（首次调用立即跑=startup 对账）。"""
+        import time as _time
+
+        now = _time.monotonic()
+        last = getattr(self, "_last_stuck_reconcile_ts", 0.0)
+        if last and now - last < 60.0:
+            return
+        self._last_stuck_reconcile_ts = now
+        await self.reconcile_stuck_events()
+
+    async def reconcile_stuck_events(self) -> dict:
+        """D39 治本：恢复卡死的 kb_update_events，知识增量不再静默丢失。
+
+        - 出队即置 processing、进程崩溃 → 行永停 processing 无人对账（全仓原无此恢复面）；
+        - failed 无重试 → 单次抖动即永久丢增量。
+        处置（事件为幂等重放安全的索引操作）：
+          1) processing 且 claimed_at（缺则 created_at）超阈值、重试额度未尽 → 重置 pending
+             并 retry_count+1（有界：防毒事件反复崩进程的无限循环）；
+          2) 同上但重试耗尽 → 显式转 failed + error_message（可观测终态，不再空转）；
+          3) failed 且额度未尽、上次处置已过阈值 → 重置 pending 重放（有界重试）；
+             耗尽的保持 failed（可观测，人工介入面）。
+        阈值/上限走 env（_stale_processing_seconds/_failed_max_retries）。返回各类计数。
+        """
+        assert self._conn
+        stale_s = self._stale_processing_seconds()
+        max_retries = self._failed_max_retries()
+        stats = {"processing_reset": 0, "processing_exhausted": 0, "failed_retried": 0}
+        async with self._lock:
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE kb_update_events
+                    SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
+                    WHERE status = 'processing'
+                      AND COALESCE(claimed_at, created_at) < now() - make_interval(secs => %s)
+                      AND COALESCE(retry_count, 0) < %s
+                    RETURNING id
+                    """,
+                    (stale_s, max_retries),
+                )
+                stats["processing_reset"] = len(await cur.fetchall())
+                await cur.execute(
+                    """
+                    UPDATE kb_update_events
+                    SET status = 'failed',
+                        error_message = left(COALESCE(error_message, '')
+                                             || ' [stale processing: retries exhausted]', 800),
+                        processed_at = now()
+                    WHERE status = 'processing'
+                      AND COALESCE(claimed_at, created_at) < now() - make_interval(secs => %s)
+                      AND COALESCE(retry_count, 0) >= %s
+                    RETURNING id
+                    """,
+                    (stale_s, max_retries),
+                )
+                stats["processing_exhausted"] = len(await cur.fetchall())
+                await cur.execute(
+                    """
+                    UPDATE kb_update_events
+                    SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
+                    WHERE status = 'failed'
+                      AND COALESCE(processed_at, claimed_at, created_at)
+                          < now() - make_interval(secs => %s)
+                      AND COALESCE(retry_count, 0) < %s
+                    RETURNING id
+                    """,
+                    (stale_s, max_retries),
+                )
+                stats["failed_retried"] = len(await cur.fetchall())
+        if any(stats.values()):
+            logger.warning(
+                "[Updater] D39 卡死事件对账：stale processing 重置 %d、耗尽转 failed %d、"
+                "failed 有界重试 %d（阈值 %ds，上限 %d 次）",
+                stats["processing_reset"], stats["processing_exhausted"],
+                stats["failed_retried"], stale_s, max_retries,
+            )
+        return stats
+
     async def process_pending_events(self, batch_size: int = 10) -> int:
         """处理队列中的待处理事件（~5s 窗口批量合并）。
 
@@ -711,12 +823,20 @@ class KnowledgeUpdater:
         assert self._conn
         processed = 0
 
+        # D39：先跑（节流的）卡死对账——进程崩溃留下的 stale processing / failed 事件
+        # 有界重放，否则知识增量静默永久丢失。首次调用（startup 后第一轮）必跑。
+        try:
+            await self._maybe_reconcile_stuck()
+        except Exception as exc:  # noqa: BLE001 — 对账失败不阻断正常消费
+            logger.warning("[Updater] D39 卡死事件对账失败（跳过本轮，不阻断消费）: %s", exc)
+
         # 串行化：与 enqueue_event 共享同一 AsyncConnection，不能并发查询
         async with self._lock:
             async with self._conn.cursor() as cur:
                 await cur.execute(
                     """
-                    UPDATE kb_update_events SET status = 'processing'
+                    UPDATE kb_update_events
+                    SET status = 'processing', claimed_at = now()
                     WHERE id IN (
                         SELECT id FROM kb_update_events
                         WHERE status = 'pending'

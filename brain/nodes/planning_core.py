@@ -565,10 +565,15 @@ def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str |
     try:
         subprocess.run(["git", "add", "-N", "--", *rel_paths],
                        cwd=project_path, capture_output=True, text=True, timeout=20)
-        proc = subprocess.run(["git", "diff", _base, "--", *rel_paths],
-                              cwd=project_path, capture_output=True, text=True, timeout=30)
-        subprocess.run(["git", "reset", "-q", "--", *rel_paths],
-                       cwd=project_path, capture_output=True, text=True, timeout=20)
+        # ★D44 sibling 治本★：reset 撤销 intent-to-add 放 finally——diff 抛异常（超时等）
+        # 落外层 except 返回 ""，裸写顺序下 reset 被跳过，占位残留真仓 index 污染
+        # git status/stash 消费者（与 executor_sync._try_local_git_diff 同类同修）。
+        try:
+            proc = subprocess.run(["git", "diff", _base, "--", *rel_paths],
+                                  cwd=project_path, capture_output=True, text=True, timeout=30)
+        finally:
+            subprocess.run(["git", "reset", "-q", "--", *rel_paths],
+                           cwd=project_path, capture_output=True, text=True, timeout=20)
         return proc.stdout if proc.returncode == 0 else ""
     except Exception:  # noqa: BLE001
         return ""

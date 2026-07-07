@@ -249,7 +249,10 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
         # 绝不空转。与 HANDLE_FAILURE 侧"不再无界 replan"同源：不可满足集需单一终态出口。
         plan_obj = state.get("plan")
         if plan_obj is not None:
-            _completed = set(state.get("subtask_results", {}).keys())
+            # 治本 D23：与 DISPATCH 同口径——依赖就绪只认 L1 通过的完成态，
+            # 滞留失败结果不得让下游误判可派发。
+            from swarm.brain.nodes.shared import completed_l1_ids
+            _completed = completed_l1_ids(state.get("subtask_results", {}))
             _abandoned = (set(state.get("abandoned_subtask_ids") or [])
                           | set(state.get("give_up_isolated_ids") or []))
             _mc = get_config().worker.max_concurrent

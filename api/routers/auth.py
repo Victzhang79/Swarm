@@ -203,8 +203,13 @@ class ChangePasswordRequest(BaseModel):
 
 
 @router.post("/api/auth/change-password", tags=["认证"])
-async def auth_change_password(request: Request, req: ChangePasswordRequest):
-    """当前登录用户修改自己的密码（12.19）：校验旧密码→更新→清除强制改密标志。"""
+async def auth_change_password(request: Request, req: ChangePasswordRequest, response: Response):
+    """当前登录用户修改自己的密码（12.19）：校验旧密码→更新→清除强制改密标志。
+
+    D19：改密即吊销该用户既有 token（update_user_password 内原子完成）——被盗 token
+    改密后立即失效。当前会话语义与登录一致（F1 登录必轮换）：改密成功后轮换出新 token，
+    经响应体 + HttpOnly Cookie 下发，本会话无缝续用；其它已缓存旧 token 的会话失效需重登录。
+    """
     user = _require_user(request)
     if not req.new_password or len(req.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
@@ -214,8 +219,11 @@ async def auth_change_password(request: Request, req: ChangePasswordRequest):
     from swarm.auth.store import (
         authenticate,
         clear_must_change_password,
+        rotate_user_token,
+        set_token_expiry,
         update_user_password,
     )
+    from swarm.config.settings import get_config
 
     loop = asyncio.get_running_loop()
     # 用旧密码校验身份（authenticate 按用户名+密码）
@@ -225,12 +233,17 @@ async def auth_change_password(request: Request, req: ChangePasswordRequest):
     if verified is None:
         raise HTTPException(status_code=401, detail="旧密码不正确")
 
-    def _apply() -> None:
-        update_user_password(user.id, req.new_password)
+    def _apply() -> str:
+        update_user_password(user.id, req.new_password)   # D19：内含 token_revoked=true
         clear_must_change_password(user.id)
+        # 与登录同语义：铸新 token（旧 hash 被替换、revoked 清除），本会话续命。
+        new_token = rotate_user_token(user.id)
+        set_token_expiry(user.id, get_config().token_ttl_hours)
+        return new_token
 
-    await loop.run_in_executor(None, _apply)
-    return {"ok": True}
+    new_token = await loop.run_in_executor(None, _apply)
+    _issue_token_cookie(response, request, new_token)
+    return {"ok": True, "token": new_token}
 
 
 @router.get("/api/auth/me", tags=["认证"])

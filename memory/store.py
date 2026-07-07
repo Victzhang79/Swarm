@@ -201,8 +201,11 @@ class MemoryStore:
     async def connect(self) -> None:
         if self._conn is not None:
             return  # TD2606-B16：幂等守卫——重复 connect 不再丢弃旧连接造成泄漏
+        from swarm.infra.db import pg_connect_timeout_kwargs
+
+        # D15：直连（不走池）补 connect_timeout——PG 网络黑洞时有界快失败，不无限挂。
         self._conn = await psycopg.AsyncConnection.connect(
-            self._db_config.postgres_uri, autocommit=True
+            self._db_config.postgres_uri, autocommit=True, **pg_connect_timeout_kwargs()
         )
         await self.ensure_tables()
 

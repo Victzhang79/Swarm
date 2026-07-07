@@ -131,6 +131,39 @@ def _root_manifest_registrants(plan_obj) -> list:
     return out
 
 
+# D56：项目树目录索引 memo——handle_failure 每轮每失败子任务每 blocked 包都调
+# _package_in_baseline，旧实现每次 os.walk 整棵项目树（大仓 + 多失败 = 显著热点，且在
+# async 节点调用链上）。改为一次 walk 建目录索引、按包名后缀匹配查询。
+# 失效策略：短 TTL（apply/merge 会改项目树，宁可短 TTL 重扫也绝不永久缓存错判）；
+# walk 抛 OSError 时【不缓存】，调用方照旧保守返回 True。
+_BASELINE_INDEX_TTL_S = 30.0
+# 阴性判定（包不在树 → 可能触发 abandon）容忍的最大索引年龄：同一 handle_failure 轮内的
+# 突发查询共享一次 walk，跨轮/跨秒的阴性必须新扫确认——stale 缓存漏看刚 apply 落地的包
+# 会把"该等"误判成"臆造"，方向性危险；阳性（存在 → 继续等）本就是保守方向，可吃 TTL 缓存。
+_BASELINE_NEG_FRESH_S = 1.0
+# project_path -> (built_monotonic, 全部目录的 posix 规范化绝对路径集合)
+_BASELINE_DIR_INDEX: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def _baseline_dir_roots(project_path: str, *, max_age_s: float) -> frozenset[str]:
+    """walk 项目树收集全部目录路径（与旧 walk 同剪枝口径）；max_age_s 内 memo。OSError 上抛。"""
+    import time
+    now = time.monotonic()
+    cached = _BASELINE_DIR_INDEX.get(project_path)
+    if cached is not None and (now - cached[0]) < max_age_s:
+        return cached[1]
+    roots: set[str] = set()
+    for root, dirs, _files in os.walk(project_path):
+        # 剪枝构建产物/VCS/依赖目录，控制开销（与旧实现完全同口径）
+        dirs[:] = [d for d in dirs
+                   if d not in (".git", "target", "build", "dist", "out",
+                                "node_modules", ".gradle", ".idea")]
+        roots.add(root.replace(os.sep, "/"))
+    frozen = frozenset(roots)
+    _BASELINE_DIR_INDEX[project_path] = (now, frozen)
+    return frozen
+
+
 def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
     """点分包名 pkg 是否已存在于【基线项目树】任一模块 src 下（确定性、零 LLM）。
 
@@ -139,23 +172,24 @@ def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
     但"BLOCKED on X 且 plan 无生产者"不足以判臆造——X 可能是【基线已有、只是沙箱漏同步】的包，
     那种应继续 transient 等待、绝不硬失败。故用本函数做【假阳性护栏】：只有 X 既无 plan 生产者、
     【又不在基线树里】才判为臆造(永不可满足)。纯路径匹配、通用跨栈、非项目写死。
-    扫描失败/无路径 → 保守返回 True(当作【存在】→ 不硬失败)，宁可多等也不误杀。"""
+    扫描失败/无路径 → 保守返回 True(当作【存在】→ 不硬失败)，宁可多等也不误杀。
+    D56：目录集合经 _baseline_dir_roots 一次 walk + 短 TTL memo，判定谓词与旧逐次 walk
+    完全等价（同剪枝、同 endswith 后缀匹配）。"""
     if not project_path or not pkg:
         return True  # 无从判定 → 保守当【存在】，不据此硬失败
     rel = pkg.replace(".", "/").strip("/")
     if not rel:
         return True
+    suffix = "/" + rel
     try:
-        for root, dirs, _files in os.walk(project_path):
-            # 剪枝构建产物/VCS/依赖目录，控制开销
-            dirs[:] = [d for d in dirs
-                       if d not in (".git", "target", "build", "dist", "out",
-                                    "node_modules", ".gradle", ".idea")]
-            if root.replace(os.sep, "/").endswith("/" + rel):
-                return True
+        roots = _baseline_dir_roots(project_path, max_age_s=_BASELINE_INDEX_TTL_S)
+        if any(r.endswith(suffix) for r in roots):
+            return True  # 阳性=继续等，保守方向，允许吃 TTL 缓存
+        # 阴性可能触发 abandon → 必须以【新鲜】索引确认（≤1s 视为同轮突发共享）
+        roots = _baseline_dir_roots(project_path, max_age_s=_BASELINE_NEG_FRESH_S)
     except OSError:
-        return True  # 扫描异常 → 保守当【存在】，避免误杀
-    return False
+        return True  # 扫描异常 → 保守当【存在】，避免误杀（不缓存，下次重试）
+    return any(r.endswith(suffix) for r in roots)
 
 
 def _blocked_pkg_unrecoverable(

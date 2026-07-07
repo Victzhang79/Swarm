@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from swarm.config.settings import get_config
+from swarm.models.errors import TransientInfraError
 from swarm.tools.scope_guard import clear_scope
 from swarm.types import (
     Confidence,
@@ -183,10 +184,18 @@ class WorkerExecutor(
         # 不完整。_deterministic_l1_gate 据此禁止在 pull-back 不完整时判 True（防沙箱绿本地缺）。
         self._sync_skipped_count: int = 0
         self._sync_error_rels: list[str] = []
+        # D30：最近一次 pull-back 因超过 MAX_SYNC_FILE_SIZE 被【确定性】skip 的文件。与上面
+        # transient 信号分账——重试不可恢复，L1 闸门对它判确定性失败（走失败阶梯），
+        # 绝不当 BLOCKED transient 无限重试（旧行为：package-lock.json >1MiB 永久活锁）。
+        self._sync_oversize_rels: list[str] = []
         # TD2606-C9：L1 确定性闸门在沙箱里修复（version-repair / import-repair / goimports …）
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
         self._repaired_extra_paths: set[str] = set()
+        # D36：bootstrap 上传完成后在沙箱 touch 的标记文件相对路径。pull-back 时据其 mtime
+        # 用 `find -newer` 圈出 worker 在沙箱改过的【上下文兄弟文件】（readable/整模块源码里被
+        # sed 改的），并入回传+diff——否则 sandbox 编过绿、改动不落盘→集成期 cannot find symbol。
+        self._bootstrap_marker: str = ""
         # P1-D：fix 循环 no-progress 早停——记上一轮确定性失败签名 + 连同次数。
         self._last_fail_sig: str = ""
         self._same_fail_streak: int = 0
@@ -241,13 +250,12 @@ class WorkerExecutor(
             or bool(_re.search(r"\b(unit[- ]?tests?|tests?|testing|coverage)\b", desc, _re.IGNORECASE))
         )
         if not _wants_test:
-            def _is_test_path(p: str) -> bool:
-                pl = str(p).replace("\\", "/").lower()
-                return ("/test/" in pl or "/tests/" in pl
-                        or pl.endswith("test.java") or pl.endswith("tests.java")
-                        or "test_" in pl.rsplit("/", 1)[-1]
-                        or pl.endswith("_test.py") or pl.endswith(".test.js")
-                        or pl.endswith(".spec.ts") or pl.endswith(".test.ts"))
+            # D43 治本：与 brain 侧统一单一事实源判据（shared._is_test_file_path，basename
+            # startswith("test_") 路径段精确匹配）。旧本地副本用裸子串 `"test_" in 文件名`，
+            # 误伤 latest_/contest_/greatest_ 等普通文件 → 被剔出 writable/create 无权写 →
+            # 交付静默不完整；且与 brain 口径分叉。worker 已有多处 lazy import brain 先例
+            # （stack_detect/planning_nodes），同进程运行时 brain 必已加载，无环无额外开销。
+            from swarm.brain.nodes.shared import _is_test_file_path as _is_test_path
             try:
                 w2 = [f for f in (getattr(scope, "writable", []) or []) if not _is_test_path(f)]
                 c2 = [f for f in (getattr(scope, "create_files", []) or []) if not _is_test_path(f)]
@@ -472,6 +480,9 @@ class WorkerExecutor(
                     # round27 perf：git 进程 + flock 属阻塞 IO，卸线程池防并发 bootstrap 卡事件环。
                     await asyncio.to_thread(self._reset_scope_to_head)
                     await self._sync_to_sandbox("bootstrap")
+                    # D36：bootstrap 上传【完成后】在沙箱内打时间标记——之后 worker 对沙箱里
+                    # 任何文件的改动 mtime 都晚于它，pull-back 据此圈出被改的兄弟/readable 文件。
+                    self._touch_bootstrap_marker()
                     # #12 治本(B fail-closed seed)：bootstrap 后若【上游产物(provenance 标注)】缺失于
                     # 本地树（上游未就绪 或 被放弃 revert 抹掉），沙箱 seed 必不含该包 → 本子任务注定
                     # `package does not exist`。不把破工作区交 worker 空烧整条 locate/code/verify 预算，
@@ -483,6 +494,16 @@ class WorkerExecutor(
                 except SandboxUnhealthyError as exc:
                     # 熔断：沙箱运行中连续失败达阈值 → 明确失败，不降级空转
                     self._log(f"沙箱熔断: {exc}")
+                    raise
+                except TransientInfraError:
+                    # D11 治本（N-06 补全）：bootstrap 上传（/ pull-back / seed 预检）抛的
+                    # TransientInfraError 是【基础设施瞬时失败】信号，必须向上传播——run() 的
+                    # except 归类 classify_failure=transient → handle_failure 退避重试【同模型】自愈。
+                    # 绝不能落到下面的宽 except 被吞成"降级本地"：此时 set_sandbox_context 已在上面
+                    # 生效、self._sandbox 非 None，一旦降级，agent/L1/sync 会全部打到【bootstrap
+                    # 不完整】的缺文件沙箱空跑 → 空 diff → 被误判 capability 换模型（正是要防的反模式）。
+                    # 与 pull-back 侧 A3 pull-back-incomplete fail-closed 闸门对称。
+                    self._log("bootstrap/同步瞬时基础设施失败，向上传播为 transient（退避重试，不降级本地空跑）")
                     raise
                 except Exception as exc:
                     # fail-closed（治本，对齐 P0-SEC-08 精神）：若任务依赖【项目专属镜像自带源码】
@@ -642,7 +663,10 @@ class WorkerExecutor(
                 #    故沙箱模式下：闸门前先把沙箱改动 pull-back 刷新本地，使 diff 反映真实改动。
                 if self._sandbox and self._sandbox_manager:
                     await self._sync_from_sandbox(f"verify-{fix_round} 闸门前同步")
-                det_ok, det_details = self._deterministic_l1_gate()
+                # D53：确定性闸门（run_l1_pipeline 同步 HTTP + git 子进程 + flock，build
+                # timeout 可达 900s）卸线程——旧直调会把全部并发 worker/brain/SSE/看守心跳
+                # 一起冻结在事件循环上。flock 获取/释放在同一线程内完成，互斥语义不变。
+                det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
                 # W1.2：单一仲裁器裁决（refusal → det False → det None → det True）。
                 # 循环内不传 prior（每轮独立裁决），翻盘逻辑只在 Phase-4 生效。
                 # llm_ok 语义对齐契约：det_ok=None 时用 LLM 弱自报作为唯一信号；
@@ -755,7 +779,9 @@ class WorkerExecutor(
                 step="produce",
             )
 
-            output = self._parse_produce_result(produce_result, l1_passed, l1_details)
+            # D53：_parse_produce_result 内含 _get_git_diff（git 子进程 + per-project flock），卸线程
+            output = await asyncio.to_thread(
+                self._parse_produce_result, produce_result, l1_passed, l1_details)
 
             # ── Phase 4 最终复核：与 Phase3 循环(L374)、trivial 通道(L1121)同源 ──
             # 关键修复(task 37460a5b)：此处过去裸调 run_l1_pipeline()，绕过了
@@ -763,7 +789,8 @@ class WorkerExecutor(
             # 导致占位/空 diff 被 run_l1_pipeline 当 "no diff changes" 返回 True → 翻盘为通过。
             # 现统一走确定性闸门拿三态，再以 LLM 自检作为 Phase4 增值，杜绝 "skip 当 pass"。
             if self.project_path:
-                det_ok, det_details = self._deterministic_l1_gate()
+                # D53：卸线程（同 Phase-3 循环内闸门，见上）
+                det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
                 l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok,
                               "l1_phase": "phase4_final"}
 
@@ -779,7 +806,9 @@ class WorkerExecutor(
                         l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
                     except Exception as exc:  # noqa: BLE001
                         self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
-                    llm_ok, llm_details = run_l1_pipeline(
+                    # D53：带 LLM 自检的 pipeline（同步 HTTP，可长跑）同样卸线程
+                    llm_ok, llm_details = await asyncio.to_thread(
+                        run_l1_pipeline,
                         self.project_path, self.subtask, output.diff, llm=l1_llm,
                         project_stack=self._resolve_project_stack(),
                         # round18 P0-B：与确定性闸门同口径，排除修复触达的 scope 外文件。
@@ -942,7 +971,8 @@ class WorkerExecutor(
             self.phase = WorkerPhase.PRODUCING
             await self._sync_from_sandbox("产出")
             produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
-            output = self._parse_produce_result(produce_result, False, l1_details)
+            # D53：git diff 子进程 + flock 卸线程
+            output = await asyncio.to_thread(self._parse_produce_result, produce_result, False, l1_details)
             self.phase = WorkerPhase.DONE
             self._l1_passed_flag = False
             self._log(f"trivial 快速路径完成（拒答否决），置信度: {output.confidence.value}")
@@ -956,7 +986,8 @@ class WorkerExecutor(
         # 确定性 L1 闸门：trivial 路径过去仅靠 LLM 文本里有无 "fail" 判定（纯自报，
         # 曾让 "Sorry, need more steps" 也被判通过）。pull-back 后文件已在本地，
         # 用 harness 真跑 compile/test/verify 覆盖自报，杜绝幻觉 PASS。
-        det_ok, det_details = self._deterministic_l1_gate()
+        # D53：卸线程（同步 build/git/flock 不冻结事件循环）
+        det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
         # W1.2 commit②：trivial 也走单一仲裁器。此处 combined 已确认非 refusal（上方
         # refusal 分支已早返），故 verify_result=None 避免重复 refusal 检测；llm_ok 语义
         # 同 Phase-3：det_ok=None 时用弱自报，det_ok 非 None 时 llm_ok=True 让确定性权威。
@@ -984,7 +1015,8 @@ class WorkerExecutor(
             pass
 
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
-        output = self._parse_produce_result(produce_result, l1_passed, l1_details)
+        # D53：git diff 子进程 + flock 卸线程
+        output = await asyncio.to_thread(self._parse_produce_result, produce_result, l1_passed, l1_details)
         self.phase = WorkerPhase.DONE
         # 记录 L1 结果供 kill_sandbox 决定 reusable（脏沙箱不回池）。
         # trivial 快速路径直接 return，不经过 run() 末尾的 _l1_passed_flag 赋值，

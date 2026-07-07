@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from swarm.api.rate_limit import rate_limit  # C7
 
 import swarm.api.app as _app
-from swarm.config.settings import atomic_write_env
+from swarm.config.settings import atomic_write_env, env_file_lock
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -278,12 +278,7 @@ async def update_config(request: Request):
 
     env_path = _app._PROJECT_ROOT / ".env"
 
-    # 读取现有 .env 内容
-    existing_lines: list[str] = []
-    if env_path.exists():
-        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
-
-    # 构建更新映射（支持短名自动转换）
+    # 构建更新映射（支持短名自动转换）——不依赖 .env 内容，放锁外
     update_map: dict[str, str] = {}
     for key, value in raw_items.items():
         if not isinstance(key, str) or not isinstance(value, (str, int, float, bool)):
@@ -310,47 +305,60 @@ async def update_config(request: Request):
         masked = _mask_config_dict(raw)
         return {"status": "no_changes", "message": "未检测到有效变更（脱敏值已忽略）", "config": masked}
 
-    # 更新或追加行
-    updated_keys: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            k, _, _ = stripped.partition("=")
-            k = k.strip().upper()
-            if k in update_map:
-                new_lines.append(f"{k}={update_map[k]}")
-                updated_keys.add(k)
-            else:
-                new_lines.append(line)
-        else:
-            new_lines.append(line)
+    # ★D47c★：.env 读→改→写→（失败回滚）全程持 env_file_lock——原读改写无锁，
+    # 与其它写者（executor 线程的密钥迁移 / 其它端点）并发时 last-write-wins 丢键。
+    # D48：整段（持锁等待 + 文件 IO + reload）卸线程执行，逻辑不变——锁被其它写者持有时
+    # 在事件循环上同步等锁/写盘会冻结全站（本端点 async，直跑即阻塞）。
+    def _apply_env_updates():
+        with env_file_lock(env_path):
+            # 读取现有 .env 内容（必须在锁内读，读到的才是当前事实）
+            existing_lines: list[str] = []
+            if env_path.exists():
+                existing_lines = env_path.read_text(encoding="utf-8").splitlines()
 
-    # 追加新键
-    for k, v in update_map.items():
-        if k not in updated_keys:
-            new_lines.append(f"{k}={v}")
+            # 更新或追加行
+            updated_keys: set[str] = set()
+            new_lines: list[str] = []
+            for line in existing_lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, _ = stripped.partition("=")
+                    k = k.strip().upper()
+                    if k in update_map:
+                        new_lines.append(f"{k}={update_map[k]}")
+                        updated_keys.add(k)
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
 
-    # P1-D：先快照原值，reload 若被生产安全门禁拒绝（禁 RBAC / 默认凭据 / 清 SECRET_KEY）→
-    # 原子回滚 .env + os.environ，不留脏配置（否则 .env 脏 → 下次重启 fail-fast、os.environ 脏 →
-    # 后续所有 reload 都失败）。validate-before-commit 保证运行期 _config 本就未被污染。
-    _prev_env = {k: os.environ.get(k) for k in update_map}
-    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+            # 追加新键
+            for k, v in update_map.items():
+                if k not in updated_keys:
+                    new_lines.append(f"{k}={v}")
 
-    # 写回 .env（A-P1-29：原子写）
-    content = "\n".join(new_lines) + "\n"
-    atomic_write_env(env_path, content)
+            # P1-D：先快照原值，reload 若被生产安全门禁拒绝（禁 RBAC / 默认凭据 / 清 SECRET_KEY）→
+            # 原子回滚 .env + os.environ，不留脏配置（否则 .env 脏 → 下次重启 fail-fast、os.environ 脏 →
+            # 后续所有 reload 都失败）。validate-before-commit 保证运行期 _config 本就未被污染。
+            _prev_env = {k: os.environ.get(k) for k in update_map}
+            _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
 
-    # 同步更新 os.environ（让 _app.reload_config 新建的 BaseSettings 能读到新值）
-    for k, v in update_map.items():
-        os.environ[k] = v
-    _app.logger.info(f"Updated .env + os.environ with keys: {list(update_map.keys())}")
+            # 写回 .env（A-P1-29：原子写）
+            content = "\n".join(new_lines) + "\n"
+            atomic_write_env(env_path, content)
 
-    # 重新加载配置（D3：失败回滚 .env + os.environ，与 PUT /api/routing、_persist_env_updates
-    # 同源）。原内联块只挡 RuntimeError 且 400 detail 泄漏原始 {exc}——非门禁失败（如畸形 env
-    # 致 pydantic ValidationError）不回滚、留脏 .env+os.environ。_reload_with_rollback 广捕
-    # Exception + 泛化文案不泄漏 exc + 门禁 400／其余 500。
-    _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
+            # 同步更新 os.environ（让 _app.reload_config 新建的 BaseSettings 能读到新值）
+            for k, v in update_map.items():
+                os.environ[k] = v
+            _app.logger.info(f"Updated .env + os.environ with keys: {list(update_map.keys())}")
+
+            # 重新加载配置（D3：失败回滚 .env + os.environ，与 PUT /api/routing、_persist_env_updates
+            # 同源）。原内联块只挡 RuntimeError 且 400 detail 泄漏原始 {exc}——非门禁失败（如畸形 env
+            # 致 pydantic ValidationError）不回滚、留脏 .env+os.environ。_reload_with_rollback 广捕
+            # Exception + 泛化文案不泄漏 exc + 门禁 400／其余 500。回滚写在锁内，防插队写被回滚覆盖。
+            _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
+
+    await asyncio.to_thread(_apply_env_updates)
     _app.configure_langsmith(reload=True)
     try:
         from swarm.worker.sandbox import reset_sandbox_manager
@@ -438,43 +446,45 @@ async def update_routing(request: Request):
         return {"status": "no_changes", "message": "未检测到有效变更", **router.get_routing_table()}
 
     # D3：写盘前快照，供 reload 被生产安全门禁拒绝时原子回滚。
+    # ★D47c★：读→改→写→回滚全程持 env_file_lock（与 PUT /api/config 同口径，防丢键）。
     env_path = _app._PROJECT_ROOT / ".env"
-    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-    _prev_env = {k: os.environ.get(k) for k in update_map}
+    with env_file_lock(env_path):
+        _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+        _prev_env = {k: os.environ.get(k) for k in update_map}
 
-    # 更新 os.environ
-    for k, v in update_map.items():
-        os.environ[k] = v
+        # 更新 os.environ
+        for k, v in update_map.items():
+            os.environ[k] = v
 
-    # 写入 .env 文件
-    existing_lines = _prev_content.splitlines() if _prev_content is not None else []
+        # 写入 .env 文件
+        existing_lines = _prev_content.splitlines() if _prev_content is not None else []
 
-    updated_keys: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            k, _, _ = stripped.partition("=")
-            k = k.strip().upper()
-            if k in update_map:
-                new_lines.append(f"{k}={update_map[k]}")
-                updated_keys.add(k)
+        updated_keys: set[str] = set()
+        new_lines: list[str] = []
+        for line in existing_lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k, _, _ = stripped.partition("=")
+                k = k.strip().upper()
+                if k in update_map:
+                    new_lines.append(f"{k}={update_map[k]}")
+                    updated_keys.add(k)
+                else:
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
-        else:
-            new_lines.append(line)
 
-    for k, v in update_map.items():
-        if k not in updated_keys:
-            new_lines.append(f"{k}={v}")
+        for k, v in update_map.items():
+            if k not in updated_keys:
+                new_lines.append(f"{k}={v}")
 
-    content = "\n".join(new_lines) + "\n"
-    atomic_write_env(env_path, content)
+        content = "\n".join(new_lines) + "\n"
+        atomic_write_env(env_path, content)
 
-    _app.logger.info(f"Updated routing .env + os.environ with keys: {list(update_map.keys())}")
+        _app.logger.info(f"Updated routing .env + os.environ with keys: {list(update_map.keys())}")
 
-    # 重新加载配置（D3：失败回滚 .env + os.environ）
-    _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
+        # 重新加载配置（D3：失败回滚 .env + os.environ）
+        _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
     _app.logger.info("Config reloaded after routing update")
 
     from swarm.models.router import ModelRouter
@@ -544,11 +554,15 @@ async def update_model_providers(request: Request):
         try:
             from swarm.config import secret_store
 
-            for entry in clean:
-                key_val = entry.get("api_key", "")
-                if key_val:
-                    secret_store.set_secret(f"provider_api_key:{entry['id']}", key_val)
-                    entry["api_key"] = ""  # .env 里不留明文
+            # D48：secret_store 写（同步 PG）卸线程，不再阻塞事件循环
+            def _store_provider_keys():
+                for entry in clean:
+                    key_val = entry.get("api_key", "")
+                    if key_val:
+                        secret_store.set_secret(f"provider_api_key:{entry['id']}", key_val)
+                        entry["api_key"] = ""  # .env 里不留明文
+
+            await asyncio.to_thread(_store_provider_keys)
             _app.logger.info("provider api_keys 已加密存入 secret_store")
         except Exception as exc:  # noqa: BLE001
             _app.logger.warning("secret_store 写入失败，回退明文 .env: %s", exc)
@@ -575,7 +589,8 @@ async def update_model_providers(request: Request):
         raise HTTPException(status_code=400, detail="无 providers/model_providers/model_sizes 字段")
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
-    _persist_env_updates(update_map)
+    # D48：持锁文件 IO + reload 卸线程
+    await asyncio.to_thread(_persist_env_updates, update_map)
     try:
         from swarm.config import secret_store
         secret_store.invalidate_cache()
@@ -594,28 +609,30 @@ def _persist_env_updates(update_map: dict[str, str]) -> None:
     无回滚，失败留脏 .env 致重启 fail-fast、脏 os.environ 致后续 reload 全失败）。
     """
     env_path = _app._PROJECT_ROOT / ".env"
-    prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-    prev_env = {k: os.environ.get(k) for k in update_map}
-    existing_lines = prev_content.splitlines() if prev_content is not None else []
-    updated_keys: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s:
-            k = s.partition("=")[0].strip().upper()
-            if k in update_map:
-                new_lines.append(f"{k}={update_map[k]}")
-                updated_keys.add(k)
-                continue
-        new_lines.append(line)
-    for k, v in update_map.items():
-        if k not in updated_keys:
-            new_lines.append(f"{k}={v}")
-    atomic_write_env(env_path, "\n".join(new_lines) + "\n")
-    for k, v in update_map.items():
-        os.environ[k] = v
-    from swarm.config.settings import reload_config as _reload_config
-    _reload_with_rollback(env_path, prev_content, prev_env, _reload_config)
+    # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与其它写者并发丢键）。
+    with env_file_lock(env_path):
+        prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+        prev_env = {k: os.environ.get(k) for k in update_map}
+        existing_lines = prev_content.splitlines() if prev_content is not None else []
+        updated_keys: set[str] = set()
+        new_lines: list[str] = []
+        for line in existing_lines:
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s:
+                k = s.partition("=")[0].strip().upper()
+                if k in update_map:
+                    new_lines.append(f"{k}={update_map[k]}")
+                    updated_keys.add(k)
+                    continue
+            new_lines.append(line)
+        for k, v in update_map.items():
+            if k not in updated_keys:
+                new_lines.append(f"{k}={v}")
+        atomic_write_env(env_path, "\n".join(new_lines) + "\n")
+        for k, v in update_map.items():
+            os.environ[k] = v
+        from swarm.config.settings import reload_config as _reload_config
+        _reload_with_rollback(env_path, prev_content, prev_env, _reload_config)
 
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
@@ -698,7 +715,8 @@ async def update_kb_embed_rerank(request: Request):
             update_map["SWARM_KB_EMBED_BATCH_SIZE"] = str(int(emb["batch_size"]))
         ekey = str(emb.get("api_key", "") or "")
         if ekey and "***" not in ekey:
-            secret_store.set_secret(SECRET_EMBED_KEY, ekey)
+            # D48：同步 PG 写卸线程
+            await asyncio.to_thread(secret_store.set_secret, SECRET_EMBED_KEY, ekey)
             update_map["SWARM_KB_EMBED_API_KEY"] = ""  # 不留明文
 
     rk = body.get("rerank") or {}
@@ -714,7 +732,8 @@ async def update_kb_embed_rerank(request: Request):
             update_map["SWARM_KB_RERANK_SCORE_THRESHOLD"] = str(float(rk["score_threshold"]))
         rkey = str(rk.get("api_key", "") or "")
         if rkey and "***" not in rkey:
-            secret_store.set_secret(SECRET_RERANK_KEY, rkey)
+            # D48：同步 PG 写卸线程
+            await asyncio.to_thread(secret_store.set_secret, SECRET_RERANK_KEY, rkey)
             update_map["SWARM_KB_RERANK_API_KEY"] = ""
 
     # 检索调优参数（top_k / 阈值 / 切块）—— 整型/浮点，带范围保护防误填
@@ -751,7 +770,7 @@ async def update_kb_embed_rerank(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
 
-    _persist_env_updates(update_map)
+    await asyncio.to_thread(_persist_env_updates, update_map)  # D48：卸线程
     try:
         secret_store.invalidate_cache()
     except Exception:  # noqa: BLE001
@@ -843,8 +862,9 @@ async def update_notify_channels(request: Request):
         })
 
     # 写 .env + os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
+    # D48：卸线程
     val = _json.dumps(clean, ensure_ascii=False)
-    _persist_env_updates({"SWARM_NOTIFY_CHANNELS": val})
+    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val})
     _app.logger.info("Updated notify channels: %d 个", len(clean))
     return {"status": "ok", "count": len(clean)}
 
@@ -1143,11 +1163,18 @@ async def migrate_secrets_to_db(request: Request):
 
 def _clear_plaintext_keys_from_env() -> list[str]:
     """把 .env 里的明文 API key 字段清空（迁移到 db 后）。返回被清的字段名。"""
-    import json as _json
-
     env_path = _app._PROJECT_ROOT / ".env"
     if not env_path.exists():
         return []
+    # ★D47c★：本函数在 executor 线程执行（密钥迁移），与事件循环上的 config 端点是
+    # 真跨线程并发写者——读改写全程持 env_file_lock。
+    with env_file_lock(env_path):
+        return _clear_plaintext_keys_locked(env_path)
+
+
+def _clear_plaintext_keys_locked(env_path) -> list[str]:
+    import json as _json
+
     cleared: list[str] = []
     lines = env_path.read_text(encoding="utf-8").splitlines()
     out: list[str] = []

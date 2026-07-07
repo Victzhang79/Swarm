@@ -126,9 +126,9 @@ async def sandbox_status(request: Request, project_id: str | None = None):
     - 项目管理员（owner）：其项目内所有沙箱
     - 项目成员：仅自己创建任务的沙箱
     """
-    from swarm.api._shared import _require_user
+    from swarm.api._shared import _require_user_async
     from swarm.auth.rbac import Role
-    user = _require_user(request)
+    user = await _require_user_async(request)  # D48：鉴权 PG 查询卸线程（15s 轮询面）
     is_admin = user.global_role == Role.ADMIN.value
 
     loop = asyncio.get_running_loop()
@@ -176,41 +176,73 @@ async def sandbox_status(request: Request, project_id: str | None = None):
         def _sb_tid(sb: dict) -> str | None:
             return sb.get("task_id") or (sb.get("metadata") or {}).get("swarm_task")
 
-        # 预取用户在各项目的角色（避免每沙箱重复查）
+        # D48+D49：角色与任务创建者【一次线程内批量预取】——旧实现每沙箱一条同步
+        # get_task 全行查询（N+1）直接跑在事件循环上。creator 批量查失败 → fail-closed
+        # 回退旧的逐沙箱 _task_creator（绝不静默把成员沙箱判不可见方向以外的结果）。
         from swarm.auth.store import get_project_member_role
-        role_cache: dict[str, str | None] = {}
+
+        _pids = {p for p in (_sb_pid(sb) for sb in sandboxes) if p}
+        _tids = list({t for t in (_sb_tid(sb) for sb in sandboxes) if t})
+
+        def _prefetch_visibility():
+            roles: dict[str, str | None] = {}
+            for pid in _pids:
+                try:
+                    roles[pid] = get_project_member_role(pid, user.id)
+                except Exception:  # noqa: BLE001
+                    roles[pid] = None
+            try:
+                from swarm.project import store as _pstore
+                creators: dict[str, str | None] | None = _pstore.get_task_creators(_tids)
+            except Exception:  # noqa: BLE001
+                creators = None  # 批量失败 → _visible 回退逐个旧路径
+            return roles, creators
+
+        role_cache, _creators = await loop.run_in_executor(None, _prefetch_visibility)
 
         def _visible(sb: dict) -> bool:
             pid = _sb_pid(sb)
             if not pid:
                 return False
-            if pid not in role_cache:
-                try:
-                    role_cache[pid] = get_project_member_role(pid, user.id)
-                except Exception:  # noqa: BLE001
-                    role_cache[pid] = None
-            role = role_cache[pid]
+            role = role_cache.get(pid)
             if role is None:
                 return False
             if role == Role.OWNER.value:
                 return True  # 项目管理员看项目内全部
             # 项目成员：仅自建任务沙箱
-            creator = _task_creator(_sb_tid(sb))
+            tid = _sb_tid(sb)
+            if _creators is None:
+                creator = _task_creator(tid)  # fail-closed：批量失败回退原逐个查询
+            else:
+                creator = _creators.get(tid) if tid else None
             return bool(creator) and creator == user.id
 
         sandboxes = [sb for sb in sandboxes if _visible(sb)]
 
+    # D47b：内部基建坐标（api_url/proxy_base/default_template）只给 admin——旧码对任意认证
+    # 用户（含 viewer）全量返回，与"proxy 内部基建不外泄"矛盾（recon 面）。非 admin 只给
+    # 布尔/脱敏状态（是否配置了各项 + use_for_worker 开关），前端状态展示不受影响。
+    _sb_cfg = _app.get_config().sandbox
+    if is_admin:
+        _cfg_view = {
+            "api_url": _sb_cfg.api_url,
+            "proxy_base": _sb_cfg.proxy_base,
+            "default_template": _sb_cfg.default_template,
+            "use_for_worker": _sb_cfg.use_for_worker,
+        }
+    else:
+        _cfg_view = {
+            "api_url_configured": bool(_sb_cfg.api_url),
+            "proxy_configured": bool(_sb_cfg.proxy_base),
+            "default_template_configured": bool(_sb_cfg.default_template),
+            "use_for_worker": _sb_cfg.use_for_worker,
+        }
     return {
         "active_count": len(sandboxes),
         "sandboxes": sandboxes,
         "project_id": project_id,
         "viewer_role": "admin" if is_admin else "member",
-        "config": {
-            "api_url": _app.get_config().sandbox.api_url,
-            "proxy_base": _app.get_config().sandbox.proxy_base,
-            "default_template": _app.get_config().sandbox.default_template,
-            "use_for_worker": _app.get_config().sandbox.use_for_worker,
-        },
+        "config": _cfg_view,
     }
 
 
@@ -336,28 +368,36 @@ async def toggle_sandbox_pool(request: Request):
     val = "true" if enabled else "false"
     # §3.2 收敛（.env 写回×4 唯一无回滚者）：写盘前快照，reload 失败原子回滚
     # （对齐 config 路由 D3 _reload_with_rollback 约定，否则失败留脏 .env+os.environ）。
-    _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-    _prev_env = {env_key: os.environ.get(env_key)}
-    lines = _prev_content.splitlines() if _prev_content is not None else []
-    found = False
-    out_lines = []
-    for line in lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s and s.partition("=")[0].strip().upper() == env_key:
-            out_lines.append(f"{env_key}={val}")
-            found = True
-        else:
-            out_lines.append(line)
-    if not found:
-        out_lines.append(f"{env_key}={val}")
-    from swarm.config.settings import atomic_write_env
-    atomic_write_env(env_path, "\n".join(out_lines) + "\n")  # A-P1-29：原子写
-    os.environ[env_key] = val
+    # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与 config 端点/密钥迁移并发丢键）。
+    from swarm.config.settings import atomic_write_env, env_file_lock
 
-    # 2. reload config 让 SandboxConfig.pool_enabled 反映新值（失败原子回滚 .env+os.environ）
-    from swarm.api.routers.config import _reload_with_rollback
-    from swarm.config.settings import reload_config as _reload_config
-    _reload_with_rollback(env_path, _prev_content, _prev_env, _reload_config)
+    # D48：.env 读改写 + reload 是持文件锁的同步 IO，卸线程执行——锁被其它写者（executor
+    # 线程密钥迁移/config 端点）持有时，这里在事件循环上同步等锁会冻结全站。逻辑不变。
+    def _persist_toggle():
+        with env_file_lock(env_path):
+            _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+            _prev_env = {env_key: os.environ.get(env_key)}
+            lines = _prev_content.splitlines() if _prev_content is not None else []
+            found = False
+            out_lines = []
+            for line in lines:
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s and s.partition("=")[0].strip().upper() == env_key:
+                    out_lines.append(f"{env_key}={val}")
+                    found = True
+                else:
+                    out_lines.append(line)
+            if not found:
+                out_lines.append(f"{env_key}={val}")
+            atomic_write_env(env_path, "\n".join(out_lines) + "\n")  # A-P1-29：原子写
+            os.environ[env_key] = val
+
+            # 2. reload config 让 SandboxConfig.pool_enabled 反映新值（失败原子回滚 .env+os.environ）
+            from swarm.api.routers.config import _reload_with_rollback
+            from swarm.config.settings import reload_config as _reload_config
+            _reload_with_rollback(env_path, _prev_content, _prev_env, _reload_config)
+
+    await asyncio.to_thread(_persist_toggle)
 
     # 3. 实时启停 reaper（运行时尽量生效，避免必须重启）
     from swarm.worker.sandbox_pool import get_sandbox_pool, pool_enabled

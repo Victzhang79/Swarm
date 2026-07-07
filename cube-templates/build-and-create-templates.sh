@@ -24,7 +24,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DF_DIR="$HERE/dockerfiles"
 LANGS=(python node java go rust)
 
-declare -A EXEC_TPL VERIFY_TPL
+# D45：普通索引数组（按 LANGS 下标对齐）——declare -A 需 bash4+，macOS 自带 bash3.2 直接语法崩；
+# 索引数组 bash3.2+ 通用，行为等价。
+EXEC_TPL=()
+VERIFY_TPL=()
 log() { echo -e "\033[36m[cube-tpl]\033[0m $*"; }
 
 # 0) 按需自启本地 registry（幂等）
@@ -46,42 +49,51 @@ create_tpl() {  # $1=image  $2..=额外参数(如 --cpu/--memory)
   echo "$out" >&2
   local tpl job; tpl="$(echo "$out" | grep -oE 'tpl-[0-9a-f]+' | head -1 || true)"
   job="$(echo "$out" | grep -oE 'job_id[:=][[:space:]]*[0-9a-f-]+' | head -1 | grep -oE '[0-9a-f-]{8,}' || true)"
+  # D45：tpl 为空（create 输出解析不到 template_id）→ 直接判失败返回。
+  # 旧码继续 `template list | grep "$tpl"`——grep 空模式匹配【所有行】，撞上任意 READY
+  # 模板即误报成功、输出空 template_id（下游拿空串回填配置，静默坏）。
+  if [[ -z "$tpl" ]]; then echo "<建失败:no-template-id>"; return 0; fi
   # watch 到 READY（有 job_id 用 watch，否则轮询 tpl list）
   if [[ -n "$job" ]]; then
     cubemastercli template watch --job-id "$job" >&2 2>&1 || true
   fi
   local st; st="$(cubemastercli template list 2>/dev/null | grep "$tpl" | awk '{print $2}' | head -1)"
-  if [[ "$st" == "READY" ]]; then echo "$tpl"; else echo "<${tpl:-建失败}:status=${st:-?}>"; fi
+  if [[ "$st" == "READY" ]]; then echo "$tpl"; else echo "<${tpl}:status=${st:-?}>"; fi
 }
 
-for lang in "${LANGS[@]}"; do
+for i in "${!LANGS[@]}"; do
+  lang="${LANGS[$i]}"
   img="$REGISTRY/sandbox-$lang:$TAG"
   log "==== [$lang] docker build --provenance=false → $img ===="
   docker build --provenance=false -f "$DF_DIR/Dockerfile.$lang" -t "$img" "$DF_DIR"
 
   # envd /health 自测（防发布坏模板，见 NODE_ENVD_FIX.md）
+  # D45：cid 为空（docker run 失败/entrypoint 秒崩）是【最坏信号】，必须视为 health FAIL
+  # 拒发——旧码此时整体跳过 /health 直接 push+create，坏镜像照发（fail-open）。
   cid="$(docker run -d -P "$img" 2>/dev/null || true)"
-  if [[ -n "$cid" ]]; then
-    sleep 5
-    hp="$(docker port "$cid" 49983/tcp 2>/dev/null | head -1 | cut -d: -f2)"
-    if curl -fsS -m5 "localhost:${hp}/health" >/dev/null 2>&1; then log "✅ [$lang] envd /health 通过"
-    else log "❌ [$lang] envd /health 不通，跳过"; docker rm -f "$cid" >/dev/null 2>&1 || true
-         EXEC_TPL[$lang]="<envd自测失败>"; VERIFY_TPL[$lang]="<envd自测失败>"; continue; fi
-    docker rm -f "$cid" >/dev/null 2>&1 || true
+  if [[ -z "$cid" ]]; then
+    log "❌ [$lang] 容器起不来（docker run 失败），视为 health FAIL，拒发"
+    EXEC_TPL[$i]="<envd自测失败:容器未启动>"; VERIFY_TPL[$i]="<envd自测失败:容器未启动>"; continue
   fi
+  sleep 5
+  hp="$(docker port "$cid" 49983/tcp 2>/dev/null | head -1 | cut -d: -f2)"
+  if curl -fsS -m5 "localhost:${hp}/health" >/dev/null 2>&1; then log "✅ [$lang] envd /health 通过"
+  else log "❌ [$lang] envd /health 不通，跳过"; docker rm -f "$cid" >/dev/null 2>&1 || true
+       EXEC_TPL[$i]="<envd自测失败>"; VERIFY_TPL[$i]="<envd自测失败>"; continue; fi
+  docker rm -f "$cid" >/dev/null 2>&1 || true
 
   log "[$lang] push → $img"
   docker push "$img"
 
   log "[$lang] create exec 模板 (2c2g) ..."
-  EXEC_TPL[$lang]="$(create_tpl "$img")"
+  EXEC_TPL[$i]="$(create_tpl "$img")"
   log "[$lang] create verify 模板 (4c4g) ..."
-  VERIFY_TPL[$lang]="$(create_tpl "$img" --cpu 4000 --memory 4000)"
-  log "[$lang] exec=${EXEC_TPL[$lang]}  verify=${VERIFY_TPL[$lang]}"
+  VERIFY_TPL[$i]="$(create_tpl "$img" --cpu 4000 --memory 4000)"
+  log "[$lang] exec=${EXEC_TPL[$i]}  verify=${VERIFY_TPL[$i]}"
 done
 
 echo ""
 log "================  完成。以下为新模板（exec / verify）================"
-for lang in "${LANGS[@]}"; do
-  echo "RESULT ${lang} exec=${EXEC_TPL[$lang]} verify=${VERIFY_TPL[$lang]}"
+for i in "${!LANGS[@]}"; do
+  echo "RESULT ${LANGS[$i]} exec=${EXEC_TPL[$i]} verify=${VERIFY_TPL[$i]}"
 done

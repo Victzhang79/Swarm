@@ -48,6 +48,14 @@ class CoordinationBackend(ABC):
     async def is_held(self, key: str) -> bool:
         """本后端当前是否持有该 key 的 leadership。"""
 
+    async def verify_leadership(self, key: str) -> bool:
+        """D38：主动校验 leadership 仍然有效（含底层会话/连接真实存活探测）。
+
+        默认实现退化为 is_held（内存型后端够用）；有真实会话语义的后端（PG advisory
+        lock）必须覆写为带探活查询的版本——连接对象自称 open 但服务端已断（半开连接）
+        时须判失主。供 leader 心跳看门狗调用。"""
+        return await self.is_held(key)
+
     @abstractmethod
     async def close(self) -> None:
         """关闭后端（释放所有锁 + 连接）。"""
@@ -77,13 +85,22 @@ class PgCoordinationBackend(CoordinationBackend):
 
             from swarm.config.settings import DatabaseConfig
 
+            from swarm.infra.db import pg_connect_timeout_kwargs
+
             uri = self._uri or DatabaseConfig().postgres_uri
             # autocommit：advisory lock 立即生效，不被事务边界影响
-            self._conn = await psycopg.AsyncConnection.connect(uri, autocommit=True)
+            # D15：直连补 connect_timeout——PG 网络黑洞时有界快失败，不无限挂。
+            self._conn = await psycopg.AsyncConnection.connect(
+                uri, autocommit=True, **pg_connect_timeout_kwargs()
+            )
         return self._conn
 
     async def try_acquire_leadership(self, key: str) -> bool:
-        if key in self._held:
+        # D38：早退必须以【连接存活】为前提——连接断开意味着会话级 advisory lock 已被
+        # PG 服务端释放，本地 _held 是失效标记；此前 is_held 修了这个早退、这里没修，
+        # PG 重启后旧 leader 凭旧标记恒 True 谎报仍持锁 → 与新 leader 双跑（脑裂）。
+        # 连接断时落到 _ensure_conn：它会清空 _held、重连并在【新会话】上真正重新抢锁。
+        if key in self._held and self._conn is not None and not self._conn.closed:
             return True
         try:
             conn = await self._ensure_conn()
@@ -118,6 +135,31 @@ class PgCoordinationBackend(CoordinationBackend):
         if self._conn is None or self._conn.closed:
             if self._held:
                 self._held.clear()
+            return False
+        return key in self._held
+
+    async def verify_leadership(self, key: str) -> bool:
+        """D38：leader 心跳探活。会话级 advisory lock 与 PG 会话同生死——
+        只要【真实会话存活】且本地持锁标记在，即仍是 leader；探活查询失败
+        （半开连接：对象自称 open 但服务端已断/重启）→ 锁已被服务端释放，判失主，
+        清空本地标记并弃掉死连接（下次 try_acquire 经 _ensure_conn 重连重新竞选）。"""
+        if key not in self._held:
+            return False
+        if self._conn is None or self._conn.closed:
+            self._held.clear()
+            return False
+        try:
+            async with self._conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                await cur.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[coordination] verify_leadership(%s) 探活失败，判定失主: %s", key, exc)
+            self._held.clear()
+            try:
+                await self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
             return False
         return key in self._held
 

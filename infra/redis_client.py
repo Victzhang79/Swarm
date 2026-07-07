@@ -27,6 +27,28 @@ _REDIS_REPROBE_COOLDOWN_SEC = 30.0
 # split-brain 风险，须可观测。仅首次降级打一次 WARNING（避免每次 acquire 刷屏）。
 _lock_fail_open_warned = False
 
+# D14：Redis socket 超时安全默认（秒）。默认 None=无限等 → 网络黑洞（丢包挂起非 refused）
+# 时 r.eval/ping 无限阻塞，会把调用方（brain 事件循环搭车的同步调用）整个卡死。
+# 可经环境变量覆盖，但 <=0/非法一律回退安全默认——绝不允许配置回到无限等（fail-closed）。
+_REDIS_SOCKET_CONNECT_TIMEOUT_SEC = 2.0
+_REDIS_SOCKET_TIMEOUT_SEC = 3.0
+
+
+def _redis_socket_connect_timeout() -> float:
+    try:
+        v = float(os.environ.get("SWARM_REDIS_SOCKET_CONNECT_TIMEOUT_SEC", _REDIS_SOCKET_CONNECT_TIMEOUT_SEC))
+        return v if v > 0 else _REDIS_SOCKET_CONNECT_TIMEOUT_SEC
+    except (TypeError, ValueError):
+        return _REDIS_SOCKET_CONNECT_TIMEOUT_SEC
+
+
+def _redis_socket_timeout() -> float:
+    try:
+        v = float(os.environ.get("SWARM_REDIS_SOCKET_TIMEOUT_SEC", _REDIS_SOCKET_TIMEOUT_SEC))
+        return v if v > 0 else _REDIS_SOCKET_TIMEOUT_SEC
+    except (TypeError, ValueError):
+        return _REDIS_SOCKET_TIMEOUT_SEC
+
 
 def _warn_lock_fail_open_once() -> None:
     global _lock_fail_open_warned
@@ -75,7 +97,14 @@ def get_redis() -> Any | None:
 
         from swarm.config.settings import get_config
 
-        client = redis.from_url(get_config().db.redis_uri, decode_responses=True)
+        # D14：所有同步 Redis IO（acquire/renew/release/rpush/lpop/ping）都靠这两个超时兜底，
+        # 网络黑洞时秒级快失败（走各调用点既有的"Redis 不可用"降级路径），不再无限阻塞。
+        client = redis.from_url(
+            get_config().db.redis_uri,
+            decode_responses=True,
+            socket_connect_timeout=_redis_socket_connect_timeout(),
+            socket_timeout=_redis_socket_timeout(),
+        )
         client.ping()
         _redis_client = client
         _redis_unavailable_at = None
@@ -231,6 +260,52 @@ class ModuleLock:
         self._held = False
 
 
+# D14：renew 降频间隔 = TTL 的该比例（默认 1/10）。依据：ModuleLock 默认 TTL=3600s →
+# 每 360s 续期一次已绰绰有余；renew() 自身的瞬时容忍（连续 3 次失败才判失锁）在此间隔下
+# 最多消耗 0.3×TTL，仍远在其墙钟闸 TTL*0.8 之内——既有失锁判定语义完整保留。
+_LOCK_RENEW_INTERVAL_FRACTION = 0.1
+
+
+def renew_interval_sec(ttl_sec: int) -> float:
+    """renew 降频间隔（秒）。SWARM_LOCK_RENEW_INTERVAL_SEC 可覆盖（>0 才生效）；
+    默认 TTL/10，下限 1s（防超小 TTL 退化为每事件 renew 空转）。"""
+    raw = os.environ.get("SWARM_LOCK_RENEW_INTERVAL_SEC")
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return max(1.0, float(ttl_sec) * _LOCK_RENEW_INTERVAL_FRACTION)
+
+
+class RenewPacer:
+    """D14：ModuleLock renew 降频器——brain 事件循环每个图事件都会经过 renew 搭车点，
+    旧实现每事件同步 renew 一次 Redis IO；本类把它降到"距上次不足 renew_interval_sec 则跳过"。
+
+    不变量：
+    - 首次见到某把锁（刚 acquire / plan 后升级换锁对象）→ 重置计时并跳过——新锁 acquire
+      即满 TTL，无需立刻续期；
+    - due() 返回 True 同时推进计时（调用方随后必须真正调 renew）。
+    """
+
+    def __init__(self) -> None:
+        self._lock_ref: Any = None
+        self._last_ts: float = 0.0
+
+    def due(self, lock: Any, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        if lock is not self._lock_ref:
+            self._lock_ref = lock
+            self._last_ts = now
+            return False
+        if (now - self._last_ts) >= renew_interval_sec(getattr(lock, "ttl_sec", 3600)):
+            self._last_ts = now
+            return True
+        return False
+
+
 def upgrade_module_lock(
     lock: ModuleLock,
     project_id: str,
@@ -310,6 +385,36 @@ class TaskQueue:
             if TaskQueue._memory[p]:
                 return json.loads(TaskQueue._memory[p].pop(0))
         return None
+
+    @staticmethod
+    def supports_blocking() -> bool:
+        """Redis 后端在场时支持阻塞式出队（BLPOP 事件化）；内存 fallback 不支持。"""
+        return get_redis() is not None
+
+    @staticmethod
+    def dequeue_blocking(timeout: float = 2.0) -> dict[str, str] | None:
+        """D58：阻塞式出队——BLPOP 三个优先级 key 一次往返（按 key 顺序即优先级顺序），
+        队列空时在 Redis 侧等待 ≤timeout 秒，enqueue 即刻唤醒（事件化，替代 2s 轮询
+        每 tick 3 个 LPOP）。
+
+        约束（调用方须知）：BLPOP 会占住一条连接直到超时/有数据——必须在线程池里调
+        （asyncio.to_thread），且 timeout 取小值（≤2s）保持消费循环可中断（stop 信号/
+        失主停调度器在一个 timeout 内生效，绝不闷死 P1-13 的失主停机）。
+        fail-closed：Redis 异常/不可用 → 回退非阻塞 dequeue()（原逐 key LPOP/内存逻辑）。
+        """
+        r = get_redis()
+        if r is None:
+            return TaskQueue.dequeue()
+        try:
+            keys = [f"swarm:task_queue:{p}" for p in TaskQueue._PRIORITIES]
+            got = r.blpop(keys, timeout=max(1, int(timeout)))
+            if not got:
+                return None
+            _key, raw = got
+            return json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[TaskQueue] BLPOP 失败，回退非阻塞出队: %s", exc)
+            return TaskQueue.dequeue()
 
     @staticmethod
     def _clear_memory() -> None:

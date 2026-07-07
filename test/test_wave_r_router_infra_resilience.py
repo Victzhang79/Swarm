@@ -34,7 +34,7 @@ def test_redis_reprobe_after_cooldown(monkeypatch):
 
     class _FakeRedisModule:
         @staticmethod
-        def from_url(uri, decode_responses=True):
+        def from_url(uri, decode_responses=True, **kwargs):  # D14 后带 socket 超时 kwargs
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ConnectionError("transient blip")
@@ -66,7 +66,7 @@ def test_redis_unavailable_latched_within_cooldown(monkeypatch):
 
     class _FakeRedisModule:
         @staticmethod
-        def from_url(uri, decode_responses=True):
+        def from_url(uri, decode_responses=True, **kwargs):  # D14 后带 socket 超时 kwargs
             calls["n"] += 1
             raise ConnectionError("down")
 

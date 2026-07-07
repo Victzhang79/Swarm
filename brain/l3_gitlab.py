@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from swarm.project.diff_apply import apply_git_diff
+from swarm.project.diff_apply import diff_paths_escape_root
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ def _run_git(
     args: list[str],
     *,
     timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -88,7 +90,24 @@ def _run_git(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
+
+
+def _resolve_l3_base(
+    project_path: str, base_ref: str, base_commit: str | None
+) -> tuple[str | None, str]:
+    """解析 L3 apply 的基线 commit（round29 口径：优先与 merged_diff 生成同源的钉扎 base）。
+
+    顺序：钉扎 base_commit → origin/<base_ref> → <base_ref>。返回 (sha, 使用的引用名)。
+    """
+    candidates = ([base_commit] if base_commit else []) + [f"origin/{base_ref}", base_ref]
+    for cand in candidates:
+        rp = _run_git(project_path, ["rev-parse", "--verify", f"{cand}^{{commit}}"], timeout=30)
+        sha = (rp.stdout or "").strip()
+        if rp.returncode == 0 and sha:
+            return sha, cand
+    return None, ""
 
 
 def push_merged_diff_branch(
@@ -97,8 +116,18 @@ def push_merged_diff_branch(
     task_id: str,
     *,
     base_ref: str | None = None,
+    base_commit: str | None = None,
 ) -> tuple[str | None, str]:
-    """在临时分支应用 merged_diff 并 push 到 GitLab。
+    """把 merged_diff 应用到【纯净 base 树】烤成提交并 push 到 GitLab——完全不碰工作树。
+
+    D34 治本（round29 merge_engine._apply_check_against_base 同口径）：旧实现在真实工作树
+    `checkout -B` 后 apply——pull-back 已把 merged_diff 要"新建"的文件材化进工作树（untracked，
+    checkout 不清）→ create 补丁撞 "already exists" apply 必败，而 verify_l3 旧逻辑随后回退
+    默认 ref 跑 pipeline 假绿。现改为 git 底层管道：`read-tree <base>` 进【临时 index】→
+    `git apply --cached --ignore-whitespace`（对 base 树校验+应用，与 diff 生成基线同源）→
+    `write-tree`/`commit-tree` → push 该提交。工作树/真 index/当前分支零改动，untracked
+    脏文件与"补丁是否合法"彻底解耦。base_commit＝任务钉扎基线（BrainState.base_commit），
+    优先于 origin/<base_ref>，保证应用基线与 merged_diff 生成基线同源。
 
     Returns:
         (branch_name, error_message) — 成功时 error 为空字符串。
@@ -114,6 +143,11 @@ def push_merged_diff_branch(
     if not remote_url:
         return None, "GitLab push URL 未配置（需 SWARM_GITLAB_URL/TOKEN/PROJECT_ID）"
 
+    # fail-closed 越界预检：不再经 apply_git_diff（其内建边界检查随之失效），此处补回对称防线。
+    _escaped = diff_paths_escape_root(project_path, merged_diff)
+    if _escaped:
+        return None, f"merged_diff 含越界路径(逃出工作区)，fail-closed 拒绝: {_escaped[:5]}"
+
     base_ref = base_ref or os.environ.get("SWARM_GITLAB_REF", "main")
     safe_id = "".join(c if c.isalnum() or c in "-_" else "-" for c in task_id)[:24]
     branch = f"swarm/l3-{safe_id or 'task'}"
@@ -123,56 +157,77 @@ def push_merged_diff_branch(
         if fetch.returncode != 0:
             logger.debug("[L3 push] fetch origin/%s: %s", base_ref, fetch.stderr.strip())
 
-        checkout = _run_git(
-            project_path,
-            ["checkout", "-B", branch, f"origin/{base_ref}"],
-            timeout=60,
-        )
-        if checkout.returncode != 0:
-            checkout = _run_git(project_path, ["checkout", "-B", branch, base_ref], timeout=60)
-        if checkout.returncode != 0:
-            return None, f"git checkout failed: {checkout.stderr.strip()}"
-
-        apply_result = apply_git_diff(project_path, merged_diff)
-        if not apply_result.get("ok"):
-            _run_git(project_path, ["checkout", "-"], timeout=30)
-            return None, f"git apply failed: {apply_result.get('stderr', apply_result)}"
-
-        status = _run_git(project_path, ["status", "--porcelain"], timeout=30)
-        if status.returncode != 0:
-            return None, f"git status failed: {status.stderr.strip()}"
-
-        if not (status.stdout or "").strip():
-            logger.info("[L3 push] diff 应用后无变更，仍推送分支 %s", branch)
-        else:
-            _run_git(project_path, ["add", "-A"], timeout=60)
-            commit = _run_git(
-                project_path,
-                ["commit", "-m", f"swarm: L3 verify {task_id}"],
-                timeout=60,
+        base_sha, base_used = _resolve_l3_base(project_path, base_ref, base_commit)
+        if not base_sha:
+            return None, (
+                f"cannot resolve L3 base (tried base_commit={base_commit or '-'}, "
+                f"origin/{base_ref}, {base_ref})"
             )
-            if commit.returncode != 0:
-                return None, f"git commit failed: {commit.stderr.strip()}"
 
+        with tempfile.TemporaryDirectory(prefix="l3idx_") as td:
+            idx = os.path.join(td, "index")
+            env = {
+                **os.environ,
+                "GIT_INDEX_FILE": idx,
+                # commit-tree 需要身份；L3 验证分支是 swarm 自有 scratch 产物，固定身份即可。
+                "GIT_AUTHOR_NAME": "swarm", "GIT_AUTHOR_EMAIL": "swarm@localhost",
+                "GIT_COMMITTER_NAME": "swarm", "GIT_COMMITTER_EMAIL": "swarm@localhost",
+            }
+            rt = _run_git(project_path, ["read-tree", base_sha], timeout=60, env=env)
+            if rt.returncode != 0:
+                return None, f"git read-tree {base_sha[:12]} failed: {rt.stderr.strip()}"
+
+            # git 要求补丁以换行结尾（否则末行判 corrupt patch）；bytes 写避免改写 CRLF。
+            patch_path = os.path.join(td, "l3.patch")
+            patch_bytes = merged_diff.encode("utf-8")
+            if not patch_bytes.endswith(b"\n"):
+                patch_bytes += b"\n"
+            with open(patch_path, "wb") as pf:
+                pf.write(patch_bytes)
+
+            # --ignore-whitespace 与真实交付 apply(project/diff_apply)同旗标（CRLF 项目↔LF diff）。
+            ap = _run_git(
+                project_path,
+                ["apply", "--cached", "--ignore-whitespace", patch_path],
+                timeout=120, env=env,
+            )
+            if ap.returncode != 0:
+                return None, f"git apply (cached, base={base_used}) failed: {ap.stderr.strip()}"
+
+            wt = _run_git(project_path, ["write-tree"], timeout=60, env=env)
+            if wt.returncode != 0:
+                return None, f"git write-tree failed: {wt.stderr.strip()}"
+            tree = (wt.stdout or "").strip()
+
+            ct = _run_git(
+                project_path,
+                ["commit-tree", tree, "-p", base_sha, "-m", f"swarm: L3 verify {task_id}"],
+                timeout=60, env=env,
+            )
+            if ct.returncode != 0:
+                return None, f"git commit-tree failed: {ct.stderr.strip()}"
+            commit_sha = (ct.stdout or "").strip()
+
+        # --force：swarm/l3-* 是任务专属 scratch 验证分支；重试/replan 产生的新提交不与上次
+        # 同链（都直接基于 base），非 FF 拒绝会让重跑 L3 永久失败——覆盖推送是此分支的语义。
         push = _run_git(
             project_path,
-            [*_gitlab_auth_header_args(), "push", remote_url, f"HEAD:{branch}"],
+            [*_gitlab_auth_header_args(), "push", "--force", remote_url,
+             f"{commit_sha}:refs/heads/{branch}"],
             timeout=300,
         )
         if push.returncode != 0:
             return None, f"git push failed: {_redact_secrets(push.stderr.strip())}"
 
-        logger.info("[L3 push] 分支 %s 已推送 (base=%s)", branch, base_ref)
+        logger.info(
+            "[L3 push] 分支 %s 已推送 (base=%s@%s, 临时 index base 树口径，工作树零改动)",
+            branch, base_used, base_sha[:12],
+        )
         return branch, ""
     except subprocess.TimeoutExpired:
         return None, "git operation timeout"
     except Exception as exc:
         return None, _redact_secrets(str(exc))
-    finally:
-        try:
-            _run_git(project_path, ["checkout", "-"], timeout=30)
-        except Exception:
-            pass
 
 
 def trigger_and_poll_pipeline(

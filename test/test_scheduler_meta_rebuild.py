@@ -18,8 +18,14 @@ def _reset():
     sched._inflight.clear()
 
 
-def test_resolve_uses_in_memory_meta_when_present():
+def test_resolve_uses_in_memory_meta_when_present(monkeypatch):
+    """D40 后语义：缓存命中返回缓存 meta，但 DB status 复核（只认 SUBMITTED）对缓存路径同样生效。"""
     _reset()
+    from swarm.project import store
+
+    monkeypatch.setattr(store, "get_task", lambda tid: {
+        "id": tid, "project_id": "p1", "description": "d", "status": "SUBMITTED",
+    })
     sched._pending_meta["t1"] = {"project_id": "p1", "description": "d", "auto_accept": True}
     meta = sched._resolve_exec_meta("t1")
     assert meta == {"project_id": "p1", "description": "d", "auto_accept": True}

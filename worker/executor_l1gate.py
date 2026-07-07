@@ -226,6 +226,24 @@ class _L1GateMixin:
                 details["deterministic_gate"] = "skipped: pipeline blocked"
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
                 return None, details
+            # D30 治本：pull-back 因超过 MAX_SYNC_FILE_SIZE 的【确定性】skip 单独归类——
+            # 每次重试同样超限，当 transient BLOCKED 退避就是活锁（旧行为：package-lock.json
+            # >1MiB 永久 BLOCKED 至配额耗尽）；判 PASS 又是静默丢产物（本地 diff 缺该文件）。
+            # → 确定性 FAIL 走既有失败阶梯（重试换法/拆分/放弃），可观测且不空烧。
+            if ok and self._sync_oversize_rels:
+                logger.warning(
+                    "[L1] pull-back 有超限文件确定性 skip(%d 个: %s) → 判确定性 FAIL"
+                    "(非 transient，重试不可恢复；上限 SWARM_SANDBOX_MAX_SYNC_FILE_SIZE 可调)",
+                    len(self._sync_oversize_rels), self._sync_oversize_rels[:5],
+                )
+                details["deterministic_gate"] = "fail"
+                details["reason"] = "pullback_oversize_deterministic_skip"
+                details["oversize_files"] = list(self._sync_oversize_rels)
+                details["note"] = (
+                    "产物超过单文件同步上限被确定性跳过，本地交付 diff 不完整；"
+                    "可调大 SWARM_SANDBOX_MAX_SYNC_FILE_SIZE 或缩小产物"
+                )
+                return False, details
             # A3 治本(fail-closed)：沙箱内 pipeline 判 True，但本轮 pull-back 若有 skip(>1MiB)
             # 或 err(读失败) → 本地工作区/diff 不完整，"沙箱绿"不代表"本地交付完整"。此时禁止
             # 判 True → 降 None(BLOCKED) 走 transient 退避重试拉全，杜绝沙箱绿本地缺的静默假绿。

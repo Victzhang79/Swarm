@@ -160,7 +160,9 @@ def test_stream_loop_aborts_on_lock_lost():
     from swarm.brain import runner
 
     src = inspect.getsource(runner._stream_brain_events)
-    assert "not module_lock.renew()" in src, "renew 失败未被检查（2nd#2 回归）"
+    # D14 后 renew 经 RenewPacer 降频 + asyncio.to_thread 卸线程池，但"renew False → TaskLockLost"
+    # 的 fail-fast 语义必须保留。
+    assert "module_lock.renew" in src, "renew 失败未被检查（2nd#2 回归）"
     assert "TaskLockLost" in src
     assert issubclass(runner.TaskLockLost, Exception)
 

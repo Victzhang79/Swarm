@@ -311,8 +311,11 @@ async def _check_component(name: str) -> dict[str, Any]:
 
             def _check_memory() -> dict[str, Any]:
                 """同步检测记忆系统（在线程中执行）"""
+                from swarm.infra.db import pg_connect_timeout_kwargs
+
                 result: dict[str, Any] = {}
-                with psycopg.connect(uri, autocommit=True) as conn:
+                # D15：直连补 connect_timeout——PG 黑洞时健康检查有界快失败，不泄漏挂起线程。
+                with psycopg.connect(uri, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
                     # 检查连接
                     with conn.cursor() as cur:
                         cur.execute("SELECT 1")
@@ -466,8 +469,11 @@ async def _check_component(name: str) -> dict[str, Any]:
 
             def _check_pg() -> dict[str, Any]:
                 """同步检测 PostgreSQL（在线程中执行）"""
+                from swarm.infra.db import pg_connect_timeout_kwargs
+
                 result: dict[str, Any] = {}
-                with psycopg.connect(uri, autocommit=True) as conn:
+                # D15：直连补 connect_timeout——PG 黑洞时健康检查有界快失败，不泄漏挂起线程。
+                with psycopg.connect(uri, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
                     with conn.cursor() as cur:
                         cur.execute("SELECT version()")
                         ver = cur.fetchone()[0]
@@ -573,7 +579,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Swarm API",
-    version="0.9.20",
+    version="0.9.21",
     description="Swarm Web 后端 API",
     lifespan=_lifespan,
 )
@@ -1025,7 +1031,12 @@ async def _sync_mr_history_all_projects() -> None:
     cfg = get_config()
 
     async def _get_conn():
-        conn = await psycopg.AsyncConnection.connect(cfg.db.postgres_uri, autocommit=True)
+        from swarm.infra.db import pg_connect_timeout_kwargs
+
+        # D15：直连补 connect_timeout——PG 黑洞时有界快失败，不无限挂。
+        conn = await psycopg.AsyncConnection.connect(
+            cfg.db.postgres_uri, autocommit=True, **pg_connect_timeout_kwargs()
+        )
         async with conn.cursor() as cur:
             await cur.execute(MR_HISTORY_DDL)
         return conn
@@ -1048,26 +1059,94 @@ async def _sync_mr_history_all_projects() -> None:
             logger.warning("[MR history] project=%s failed: %s", pid, exc)
 
 
+def _leader_heartbeat_seconds() -> float:
+    """D38：leader 心跳间隔（秒）。env SWARM_LEADER_HEARTBEAT_SEC，非法值回退默认 30，
+    钳制 [0.05, 3600]（下限放宽到 0.05 供测试注入短心跳）。"""
+    raw = os.environ.get("SWARM_LEADER_HEARTBEAT_SEC", "")
+    try:
+        val = float(raw) if raw else 30.0
+    except ValueError:
+        val = 30.0
+    return min(3600.0, max(0.05, val))
+
+
+async def _stop_leader_schedulers(sched_tasks: list) -> None:
+    """D38：失主时停止本副本全部后台调度器（对齐 on_shutdown 的调度器段）。
+
+    task/KB 调度器有干净停止面（stop_task_scheduler/shutdown_kb_scheduler，均幂等且
+    停止后可重启）；decay/consistency/kb-prune 等 _spawn_bg 循环无独立停止面，用启动
+    前后 _APP_BG_TASKS 快照差集精确 cancel（不误伤其它后台任务）。"""
+    try:
+        from swarm.brain.scheduler import stop_task_scheduler
+
+        await stop_task_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[D38] 失主停任务准入调度器失败: %s", exc)
+    try:
+        from swarm.knowledge.scheduler import shutdown_kb_scheduler
+
+        await shutdown_kb_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[D38] 失主停 KB 调度器失败: %s", exc)
+    pending = [t for t in sched_tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    logger.info("[D38] 失主清理完成：已停止调度器 + 取消 %d 个调度后台循环", len(pending))
+
+
 async def _run_schedulers_with_leadership() -> None:
     """A1 批2：仅 leader 副本启动全部后台调度器，非 leader 待命并周期重试抢主。
 
     4 个调度器内部各自是常驻 loop（每日/每5s），故 leader 只需启动一次。
     非 leader 每 30s 重试；原 leader 挂掉（连接断→advisory lock 释放）后接管。
     单进程/PG 不可用时 try_become_leader 恒为 True（降级单机不变）。
+
+    ★D38 治本★：启动调度器后【不再 return】——原码抢主即返回，此后永不验主：PG 重启/
+    闪断使 advisory lock 服务端释放，副本 B 接管后 A 仍在跑（永久双 leader 双消费）。
+    现改为 leader 心跳看门狗：周期 verify_leadership（校验 PG 会话真实存活），失主 →
+    logger.critical + 停调度器（任务/KB 有干净停止面，其余按 bg-task 差集 cancel）→
+    回候选循环重新竞选。单机降级（无协调后端）保持原行为：恒 leader、无看门狗。
     """
-    from swarm.infra.scheduler_leadership import make_leadership
+    from swarm.infra.scheduler_leadership import get_coordination_backend, make_leadership
 
     lead = make_leadership("scheduler:all")
     while True:
-        if await lead.try_become_leader():
-            logger.info("[A1] 本副本成为调度器 leader，启动后台调度器")
-            await _start_memory_decay_scheduler()
-            await _start_kb_update_scheduler()
-            await _start_kb_prune_scheduler()  # P2-C：每日 KB 日志/共现清理
-            await _start_consistency_scheduler()
-            await _start_task_scheduler()
-            return  # 启动完成（调度器各自常驻），leader 循环结束
-        await asyncio.sleep(30)
+        if not await lead.try_become_leader():
+            await asyncio.sleep(30)
+            continue
+        logger.info("[A1] 本副本成为调度器 leader，启动后台调度器")
+        _before = set(_APP_BG_TASKS)
+        await _start_memory_decay_scheduler()
+        await _start_kb_update_scheduler()
+        await _start_kb_prune_scheduler()  # P2-C：每日 KB 日志/共现清理
+        await _start_consistency_scheduler()
+        await _start_task_scheduler()
+        if get_coordination_backend() is None:
+            # 单进程降级：无协调后端 → 本进程恒为 leader，无失主可言（原行为不变）
+            return
+        _sched_tasks = [t for t in _APP_BG_TASKS if t not in _before]
+        hb = _leader_heartbeat_seconds()
+        while True:
+            await asyncio.sleep(hb)
+            try:
+                still = await lead.still_leader()
+            except Exception as exc:  # noqa: BLE001
+                # fail-closed：心跳自身异常按失主处理（宁可停下重新竞选，绝不带病双跑）
+                logger.warning("[D38] leader 心跳校验异常，按失主处理: %s", exc)
+                still = False
+            if not still:
+                break
+        logger.critical(
+            "[D38] 调度器 leadership 丢失（PG 会话断/锁被其它副本接管）——"
+            "停止本副本后台调度器防双跑，回候选循环重新竞选"
+        )
+        await _stop_leader_schedulers(_sched_tasks)
+        try:
+            await lead.release()  # 幂等：清本地态（锁本身已随会话释放）
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _start_memory_decay_scheduler() -> None:
@@ -1133,6 +1212,16 @@ async def _run_kb_prune_once(retention: int) -> None:
             logger.info("每日审计裁剪：删 task_audit_log %d 行（保留 %d 天）", purged, audit_retention)
     except Exception as exc:  # noqa: BLE001
         logger.warning("每日审计裁剪失败(非致命): %s", exc)
+
+    # D21：uploads 孤儿批次 GC——workspace/uploads/<batch>/ 此前全仓无删除路径（上传后
+    # 不建任务/旧版删除不清文件 → 无限累积）。只删【无任何 task_records 引用且超龄】的
+    # 批次目录（SWARM_UPLOADS_GC_DAYS，默认 7 天；路径归属复校防穿越），同轮跑、异常不阻断。
+    try:
+        removed_uploads = await loop.run_in_executor(None, store.gc_orphan_upload_batches)
+        if removed_uploads:
+            logger.info("每日 uploads 孤儿批次 GC：清理 %d 个目录", removed_uploads)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("每日 uploads 孤儿批次 GC 失败(非致命): %s", exc)
 
     # P2-B：Qdrant 孤儿向量对账——删已不存在项目的残留 points（delete_project 时 best-effort
     # Qdrant 清理失败的残留）。存活集 = DB 现存 project_id。同轮跑，异常不阻断。
@@ -1212,8 +1301,8 @@ async def metrics(request: Request):
 
     需鉴权（避免任务态计数信息泄漏）；无外部依赖（手写 exposition，不引 prometheus_client）。
     DB 不可用时相应指标缺省为空段，端点仍 200（探针友好）。"""
-    from swarm.api._shared import _require_user
-    _require_user(request)
+    from swarm.api._shared import _require_user_async
+    await _require_user_async(request)  # D48：鉴权 PG 查询卸线程（Prometheus 抓取面）
 
     loop = asyncio.get_running_loop()
     by_status = await loop.run_in_executor(None, store.count_tasks_by_status)
@@ -1544,11 +1633,11 @@ async def get_notifications(
     limit: int = 50,
 ):
     """应用内通知列表（持久化、可归档）。默认只返回未归档。"""
-    from swarm.api._shared import _require_perm, _require_user
-    user = _require_user(request)  # A-P1-27：通知含任务/项目信息，需鉴权
+    from swarm.api._shared import _require_user_async
+    user = await _require_user_async(request)  # A-P1-27：通知含任务/项目信息，需鉴权（D48 卸线程）
     # #19：防跨项目 IDOR。指定 project_id → 必须有该项目 project:read；未指定 → 限定到
-    # 用户可访问项目集（admin 不受限，project_ids=None 表示全量）。
-    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)
+    # 用户可访问项目集（admin 不受限，project_ids=None 表示全量）。D48：内部两条 PG 查询卸线程。
+    _scope_ids = await asyncio.to_thread(_accessible_project_ids_or_none, user, project_id, request)
     loop = asyncio.get_running_loop()
     if project_id:
         await loop.run_in_executor(None, _validate_project, project_id)
@@ -1571,9 +1660,9 @@ async def get_notifications(
 @app.get("/api/notifications/unread_count", tags=["系统"])
 async def get_unread_count(request: Request, project_id: str | None = None):
     """未归档通知数（铃铛绿点轮询用，轻量）。"""
-    from swarm.api._shared import _require_user
-    user = _require_user(request)  # A-P1-27
-    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)  # #19
+    from swarm.api._shared import _require_user_async
+    user = await _require_user_async(request)  # A-P1-27（D48：15s 轮询面，卸线程）
+    _scope_ids = await asyncio.to_thread(_accessible_project_ids_or_none, user, project_id, request)  # #19
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,
@@ -1610,9 +1699,9 @@ async def archive_notification_endpoint(notification_id: int, request: Request):
 @app.post("/api/notifications/archive_all", tags=["系统"])
 async def archive_all_notifications_endpoint(request: Request, project_id: str | None = None):
     """归档全部未读通知（可选按项目过滤）。"""
-    from swarm.api._shared import _require_user
-    user = _require_user(request)  # A-P1-27
-    _scope_ids = _accessible_project_ids_or_none(user, project_id, request)  # #19
+    from swarm.api._shared import _require_user_async
+    user = await _require_user_async(request)  # A-P1-27（D48 卸线程）
+    _scope_ids = await asyncio.to_thread(_accessible_project_ids_or_none, user, project_id, request)  # #19
     loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(
         None,

@@ -38,6 +38,26 @@ def _require_task_access(request, task, task_id: str, perm: str):
     return task
 
 
+async def _require_task_access_async(request, task, task_id: str, perm: str):
+    """D48：_require_task_access 的卸线程版（鉴权两条 PG 查询不再冻结事件循环）。
+    语义与同步版一致（同一函数经 to_thread），HTTPException 原样穿透。"""
+    return await asyncio.to_thread(_require_task_access, request, task, task_id, perm)
+
+
+def _sse_reauth_interval_s() -> float:
+    """D48：SSE 连接后周期重认证间隔（秒），env 可配降频。
+
+    默认 30s（stream_task 心跳既有节奏）；stream_task_logs 原每 5s 重校一次（每客户端每次
+    都是同步 get_user_by_token+成员查询打在事件循环上），统一降频到本间隔。下限 5s 防误配。
+    """
+    import os
+    try:
+        v = float(os.environ.get("SWARM_SSE_REAUTH_INTERVAL_S", "30"))
+    except ValueError:
+        v = 30.0
+    return max(5.0, v)
+
+
 def _stream_reauthorized(request, task, perm: str) -> bool:
     """C6 治本：流连接建立后周期性重校——token 吊销/过期或成员被移除即返回 False（断流）。
     旧代码仅在连接建立时鉴权一次，之后放任事件流至自然结束（失权后仍能观察敏感进度）。"""
@@ -86,17 +106,49 @@ class ApproveTaskRequest(BaseModel):
     )
 
 
+def _task_list_default_limit() -> int:
+    """D49：任务列表默认分页上限（env 可配）。
+
+    取证（api/static/js/tabs/tasks.js / core/project.js / cli task_list）：全部消费者只读
+    id/status/description/complexity 且无分页参数、期待"项目内全部任务"。默认取大（500）
+    保住现有 UI/CLI 的全量列表预期——超过 500 条历史任务的长寿项目从此每次轮询只搬最近
+    500 条（并记 WARN），而不是无上限搬全库。下限钳 1。
+    """
+    import os
+    try:
+        v = int(os.environ.get("SWARM_TASK_LIST_DEFAULT_LIMIT", "500"))
+    except ValueError:
+        v = 500
+    return max(1, v)
+
+
 @router.get("/api/projects/{project_id}/tasks", tags=["任务管理"])
-async def list_tasks(project_id: str, request: Request):
-    """获取项目下的所有任务"""
-    _require_perm(request, "task:read", project_id)  # P0-SEC-03：防跨项目读任务列表
+async def list_tasks(project_id: str, request: Request,
+                     limit: int | None = None, offset: int = 0):
+    """获取项目下的任务列表（轻量列，D49）。
+
+    - 分页：limit/offset 可选；缺省 limit=SWARM_TASK_LIST_DEFAULT_LIMIT（默认 500）。
+    - 列表视图不再携带 merged_diff/plan/l3_result/token_usage 等重字段（MB 级 diff 每次
+      轮询全量搬运是热点病灶）；详情仍走 GET /api/tasks/{id} 全量。
+    """
+    from swarm.api._shared import _require_perm_async
+    await _require_perm_async(request, "task:read", project_id)  # P0-SEC-03 + D48 卸线程
     loop = asyncio.get_running_loop()
     # 确认项目存在
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-    tasks = await loop.run_in_executor(None, _app.store.list_tasks, project_id)
-    return {"tasks": tasks}
+    eff_limit = limit if (limit is not None and limit > 0) else _task_list_default_limit()
+    eff_offset = max(0, offset)
+    tasks = await loop.run_in_executor(
+        None, lambda: _app.store.list_tasks_light(project_id, limit=eff_limit, offset=eff_offset)
+    )
+    if limit is None and len(tasks) >= eff_limit:
+        _app.logger.warning(
+            "[list_tasks] project=%s 任务数达到默认分页上限 %d，列表被截断（消费者可传 limit/offset 翻页）",
+            project_id, eff_limit,
+        )
+    return {"tasks": tasks, "limit": eff_limit, "offset": eff_offset}
 
 
 # ─── 8. POST /api/projects/{project_id}/tasks — 创建任务 ─
@@ -160,7 +212,15 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
             }
 
     task_id = str(uuid.uuid4())
+    # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
+    initial_status = "POOLED" if req.pooled else "SUBMITTED"
+    # P0-A：队列执行 meta（auto_accept + priority）随初始状态一并落库，
+    # 供 leader 重启后从 DB 重建 _pending_meta（否则出队缺 meta → 静默丢）。
+    priority = getattr(req, "priority", "normal") or "normal"
     try:
+        # D22 治本：初始状态 + 执行 meta 随 create_task【同一条 INSERT】原子落库。
+        # 旧链路 create_task + update_task 两条 autocommit：第二条失败 → SUBMITTED 行
+        # 残留且缺 meta、未入调度队列 → 长稳进程该任务永久卡死至重启对账。
         task = await loop.run_in_executor(
             None,
             lambda: _app.store.create_task(
@@ -171,18 +231,10 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 uploaded_files=req.uploaded_files or [],
                 auto_confirm_vision=req.auto_confirm_vision,
                 pooled=req.pooled,
-            ),
-        )
-        # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
-        initial_status = "POOLED" if req.pooled else "SUBMITTED"
-        # P0-A：队列执行 meta（auto_accept + priority）随初始状态一并落库，
-        # 供 leader 重启后从 DB 重建 _pending_meta（否则出队缺 meta → 静默丢）。
-        priority = getattr(req, "priority", "normal") or "normal"
-        await loop.run_in_executor(
-            None,
-            lambda: _app.store.update_task(
-                task_id, status=initial_status, thread_id=task_id,
-                auto_accept=bool(req.auto_accept), queue_priority=priority,
+                status=initial_status,
+                thread_id=task_id,
+                auto_accept=bool(req.auto_accept),
+                queue_priority=priority,
             ),
         )
     except Exception as e:
@@ -241,7 +293,8 @@ async def stream_task(task_id: str, request: Request):
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     # P0-SEC-03/C5：进度流需 task:read 授权；不存在与无权统一 404（防跨项目订阅 + 存在性枚举）。
-    _require_task_access(request, task, task_id, "task:read")
+    # D48：鉴权 PG 查询卸线程。
+    await _require_task_access_async(request, task, task_id, "task:read")
 
     # N-CW1/N-CW2：每个连接订阅【自己的】队列（多端互不抢事件），断开时注销回收。
     topic, queue = subscribe_task(task_id)
@@ -250,10 +303,11 @@ async def stream_task(task_id: str, request: Request):
         try:
             while True:
                 try:
-                    event_data = await asyncio.wait_for(queue.get(), timeout=30)
+                    event_data = await asyncio.wait_for(queue.get(), timeout=_sse_reauth_interval_s())
                 except asyncio.TimeoutError:
-                    # C6：每心跳(~30s)重校 token/成员——吊销/踢出即断流。
-                    if not _stream_reauthorized(request, task, "task:read"):
+                    # C6：每心跳(默认~30s，env 可配)重校 token/成员——吊销/踢出即断流。
+                    # D48：重认证的两条同步 PG 查询卸线程（每连接每心跳都打在事件循环上是系统性冻结源）。
+                    if not await asyncio.to_thread(_stream_reauthorized, request, task, "task:read"):
                         yield {"event": "error",
                                "data": json.dumps({"step": "error", "message": "认证已失效，连接关闭"})}
                         break
@@ -261,10 +315,10 @@ async def stream_task(task_id: str, request: Request):
                     continue
 
                 step = event_data.get("step", "")
+                # D18：step:"result" 死协议已废——终态载荷并入 complete 事件（runner._handle_post_run），
+                # 此处不再有 result 事件类型映射。
                 event_type = "progress"
-                if step == "result":
-                    event_type = "result"
-                elif step == "error":
+                if step == "error":
                     event_type = "error"
                 elif step == "awaiting_review":
                     event_type = "awaiting_review"
@@ -274,7 +328,8 @@ async def stream_task(task_id: str, request: Request):
                     "data": json.dumps(event_data, ensure_ascii=False, default=str),
                 }
 
-                if step in ("complete", "error", "awaiting_review"):
+                # D18：cancelled 也是终止事件——旧 break 集合漏它 → cancel 后流永久挂起（每 30s 心跳）。
+                if step in ("complete", "error", "awaiting_review", "cancelled"):
                     break
         except asyncio.CancelledError:
             pass
@@ -335,10 +390,9 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
                 continue
 
             step = event_data.get("step", "")
+            # D18：step:"result" 死协议已废——终态载荷并入 complete 事件（与 SSE 对称）。
             event_type = "progress"
-            if step == "result":
-                event_type = "result"
-            elif step == "error":
+            if step == "error":
                 event_type = "error"
             elif step == "awaiting_review":
                 event_type = "awaiting_review"
@@ -348,8 +402,8 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
                 "data": event_data,
             })
 
-            # 终止事件
-            if step in ("complete", "error", "awaiting_review"):
+            # 终止事件（D18：cancelled 也终止，与 SSE 对称——否则 cancel 后 WS 永久挂起）
+            if step in ("complete", "error", "awaiting_review", "cancelled"):
                 break
     except WebSocketDisconnect:
         # 客户端断开连接 — 优雅退出
@@ -428,7 +482,7 @@ async def get_task(task_id: str, request: Request):
     """获取任务详情"""
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    _require_task_access(request, task, task_id, "task:read")
+    await _require_task_access_async(request, task, task_id, "task:read")  # D48：卸线程
     return {"task": jsonable_encoder(task)}
 
 
@@ -548,7 +602,7 @@ async def get_task_logs(task_id: str, request: Request, limit: int = 500):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    _require_task_access(request, task, task_id, "task:read")
+    await _require_task_access_async(request, task, task_id, "task:read")  # D48：卸线程
 
     from swarm.logging_config import read_task_logs, resolve_log_path
 
@@ -576,7 +630,7 @@ async def stream_task_logs(task_id: str, request: Request):
     """
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
-    _require_task_access(request, task, task_id, "task:read")
+    await _require_task_access_async(request, task, task_id, "task:read")  # D48：卸线程
 
     from swarm.logging_config import TaskLogPoller
 
@@ -587,6 +641,10 @@ async def stream_task_logs(task_id: str, request: Request):
         poller = TaskLogPoller(task_id)
         terminal_idle = 0
         db_tick = 0
+        # D48：重认证降频——旧节奏每 5s 一次（每客户端两条同步 PG 查询），降到与 stream_task
+        # 同源的 env 可配间隔（默认 30s）。终态检查仍每 5 拍（收尾延迟语义不变）。
+        reauth_every_ticks = max(1, int(_sse_reauth_interval_s() / 5.0))
+        reauth_tick = 0
         try:
             while True:
                 batch = await loop.run_in_executor(None, poller.poll)
@@ -606,9 +664,15 @@ async def stream_task_logs(task_id: str, request: Request):
                     cur = await loop.run_in_executor(None, _app.store.get_task, task_id)
                     # round27（C6 同族补漏）：日志流含代码/构建输出等敏感内容，与 stream_task 一致
                     # 周期性重校——token 吊销/成员被移除即断流，不再"连上后失权仍可看到任务终态"。
-                    if not _stream_reauthorized(request, cur or task, "task:read"):
-                        yield {"event": "end", "data": "auth_revoked"}
-                        break
+                    # D48：卸线程 + 按 SWARM_SSE_REAUTH_INTERVAL_S 降频（失权断流延迟上限=该间隔）。
+                    reauth_tick += 1
+                    if reauth_tick >= reauth_every_ticks:
+                        reauth_tick = 0
+                        if not await asyncio.to_thread(
+                            _stream_reauthorized, request, cur or task, "task:read"
+                        ):
+                            yield {"event": "end", "data": "auth_revoked"}
+                            break
                     if cur and cur.get("status") in _TERMINAL:
                         terminal_idle += 1
                         # 终态后再多轮询一次确保尾部日志吐完，然后收尾
@@ -666,8 +730,12 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
             None,
             lambda: apply_git_diff(project["path"], merged_diff, check_only=False),
         )
-        if apply_diff_flag and apply_result and not apply_result.get("ok"):
-            # 显式 apply 失败 → 回滚认领状态（恢复审核态），避免任务卡 ANALYZING 却无 resume。
+        if apply_result and not apply_result.get("ok"):
+            # D17 治本：apply 失败【无论显式/隐式】一律阻断 accept 推进。旧逻辑只在
+            # apply_diff_flag 为真时 422，隐式 apply（非 sandbox_first）失败被吞——
+            # resume("accept") 照常推进 DONE 而工作区无变更（假交付，唯一线索是响应体
+            # apply_diff.ok=false）。统一沿用显式路径既有的 422/回滚语义：
+            # 回滚认领状态（恢复审核态），任务留在可重试/待人工状态，避免卡 ANALYZING 却无 resume。
             # status 认领 → 只需还原 status（human_decision 无关，留原值无害）；best-effort 不掩盖 422。
             try:
                 await loop.run_in_executor(

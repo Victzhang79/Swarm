@@ -48,6 +48,15 @@ class SchedulerLeadership:
     def is_leader(self) -> bool:
         return self._is_leader
 
+    async def still_leader(self) -> bool:
+        """D38：心跳校验 leadership 仍有效（backend 缺失=单机降级恒 leader）。
+        失主时同步翻转 is_leader，供看门狗停调度器。"""
+        if self._backend is None:
+            return self._is_leader
+        ok = await self._backend.verify_leadership(self._key)
+        self._is_leader = bool(ok)
+        return self._is_leader
+
     async def release(self) -> None:
         if self._backend is not None:
             await self._backend.release_leadership(self._key)

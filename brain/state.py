@@ -82,7 +82,15 @@ class BrainState(TypedDict, total=False):
     plan_valid: bool                    # 计划验证结果
     plan_retry_count: int               # 计划重试次数
     plan_validation_issues: list[str]   # PlanValidator 问题列表
+    # D09：VALIDATE_PLAN 失败原因回灌 PLAN——校验失败时写入本轮 issues 摘要，PLAN 重试时读它注入
+    # LLM prompt（否则 after_validate 失败→increment_retry→plan 是【盲重试】，LLM 看不到上轮为何被否
+    # →原样重生成同样坏计划→烧光 MAX_PLAN_RETRY→confirm/REJECT）。校验通过时清空，防跨轮粘滞。
+    plan_validation_feedback: str
     shared_contract: dict               # Brain 级共享契约（来自 plan）
+    # D10：PLAN 节点对 plan.parallel_groups 剔除悬空引用后，把修剪结果同步写回 state 顶层
+    # （dedupe/replan 改了 subtasks 集合时 groups 必须跟着改）。LangGraph 未声明键会被静默
+    # 丢弃——不声明则修剪结果蒸发，plan_validator 仍读到悬空组硬失败。
+    parallel_groups: list[list[str]]
 
     # ─── 执行阶段 ───
     subtask_results: dict[str, WorkerOutput]  # 已完成的子任务输出，key=subtask_id

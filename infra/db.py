@@ -105,13 +105,21 @@ _POOL_MAX_LIFETIME_SEC = _pool_max_lifetime()
 _CONNECT_TIMEOUT_SEC = _connect_timeout()
 
 
-def _conn_kwargs() -> dict:
-    """连接级 kwargs：autocommit + connect_timeout（>0 时）。"""
-    kw: dict = {"autocommit": True}
+def pg_connect_timeout_kwargs() -> dict:
+    """D15：给【绕过连接池】的直连 psycopg.connect / AsyncConnection.connect 补 connect_timeout
+    的唯一取值点——与池共用 SWARM_DB_CONNECT_TIMEOUT（默认 10s，<=0 关闭）。
+    PG 网络黑洞（丢包挂起非 refused）时直连方（知识层/coordination/健康检查等）有界快失败，
+    不再无限阻塞 KB loop / worker 线程 / 事件循环。"""
+    kw: dict = {}
     if _CONNECT_TIMEOUT_SEC > 0:
         # libpq connect_timeout 要求【十进制整数】秒（"10.0" 部分 libpq 版本会拒）→ 转 int。
         kw["connect_timeout"] = max(1, int(_CONNECT_TIMEOUT_SEC))
     return kw
+
+
+def _conn_kwargs() -> dict:
+    """连接级 kwargs：autocommit + connect_timeout（>0 时）。"""
+    return {"autocommit": True, **pg_connect_timeout_kwargs()}
 
 
 def _default_conn_str() -> str:

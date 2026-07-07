@@ -293,7 +293,8 @@ def test_yuque_list_documents_parses_data_array(monkeypatch):
         }
         return _FakeResp(json.dumps(payload).encode("utf-8"))
 
-    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(  # D60 后生产走局部 opener，seam=_guarded_open
+        srcmod, "_guarded_open", lambda opener, req, timeout=None: fake_urlopen(req, timeout))
     src = _yuque_src(monkeypatch)
     refs = src.list_documents()
 
@@ -318,7 +319,8 @@ def test_yuque_fetch_returns_markdown_body(monkeypatch):
         payload = {"data": {"title": "介绍", "body": "# 标题\n\n正文 hello-yuque。"}}
         return _FakeResp(json.dumps(payload).encode("utf-8"))
 
-    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(  # D60 后生产走局部 opener，seam=_guarded_open
+        srcmod, "_guarded_open", lambda opener, req, timeout=None: fake_urlopen(req, timeout))
     src = _yuque_src(monkeypatch)
     fetched = src.fetch("intro")
 
@@ -344,7 +346,8 @@ def test_yuque_custom_base_and_namespace_override(monkeypatch):
         captured["url"] = req.full_url
         return _FakeResp(json.dumps({"data": []}).encode("utf-8"))
 
-    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(  # D60 后生产走局部 opener，seam=_guarded_open
+        srcmod, "_guarded_open", lambda opener, req, timeout=None: fake_urlopen(req, timeout))
     src = YuqueSource(namespace="arg/ns")  # 显式 namespace 覆盖 env
     src.list_documents()
     assert captured["url"] == "https://yuque.corp.local/api/v2/repos/arg/ns/docs"
@@ -360,7 +363,8 @@ def test_yuque_http_error_raises_with_status_code(monkeypatch):
             fp=io.BytesIO(b'{"message":"Token Invalid"}'),
         )
 
-    monkeypatch.setattr(srcmod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(  # D60 后生产走局部 opener，seam=_guarded_open
+        srcmod, "_guarded_open", lambda opener, req, timeout=None: fake_urlopen(req, timeout))
     src = _yuque_src(monkeypatch)
     with pytest.raises(RuntimeError) as ei:
         src.list_documents()

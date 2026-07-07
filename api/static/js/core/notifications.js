@@ -11,6 +11,8 @@ function notifEventLabel(eventType) {
     case 'task_created': return '建立';
     case 'task_completed': return '完成';
     case 'task_failed': return '失败';
+    case 'task_partial': return '部分交付';
+    case 'task_cancelled': return '取消';
     case 'waiting_review': return '待审';
     default: return '通知';
   }
@@ -21,6 +23,8 @@ function notifEventPill(eventType) {
     case 'task_created': return 'pill-blue';
     case 'task_completed': return 'pill-green';
     case 'task_failed': return 'pill-red';
+    case 'task_partial': return 'pill-amber';
+    case 'task_cancelled': return 'pill-gray';
     case 'waiting_review': return 'pill-amber';
     default: return 'pill-gray';
   }

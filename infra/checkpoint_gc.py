@@ -61,7 +61,11 @@ def sweep_stale_checkpoints(ttl_days: int | None = None,
             from swarm.config.settings import get_config
             conn_str = get_config().db.postgres_uri
         import psycopg
-        with psycopg.connect(conn_str) as conn:
+
+        from swarm.infra.db import pg_connect_timeout_kwargs
+
+        # D15：直连补 connect_timeout（不加 autocommit，保持原事务语义）。
+        with psycopg.connect(conn_str, **pg_connect_timeout_kwargs()) as conn:
             # 1) 终态 + TTL 过期线程
             # ★复核 CRITICAL 整改★：checkpoint 的 thread 键是 task_records.thread_id
             # （retry_task 会改写为 "{id}-r-xxxx"，runner 以该列起图），不是 id——原 join 用

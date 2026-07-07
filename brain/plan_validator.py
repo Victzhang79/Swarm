@@ -37,6 +37,25 @@ def slim_plan_json_for_llm_validation(plan: TaskPlan) -> str:
                 st.pop(f, None)
     return json.dumps(data, ensure_ascii=False, indent=2)
 
+
+def slim_plan_json_or_empty(plan_obj) -> str:
+    """None 安全的瘦身 plan 序列化（D50：handle_failure / learn_success / learn_failure 提示词）。
+
+    这三处原用 `plan_obj.model_dump_json(indent=2)` 全量注入 LLM prompt——含每子任务 ~42K
+    的 contract 内联副本（validate_plan 早已用 slim 瘦身，此三处漏改，handle_failure 还是
+    失败循环高频节点）。统一走 slim；瘦身路径本身异常时 fail-closed 回退旧全量序列化
+    （宁可 prompt 大也不丢失败分析输入），再不行才 "{}" 。
+    """
+    if plan_obj is None or not hasattr(plan_obj, "model_dump"):
+        return "{}"
+    try:
+        return slim_plan_json_for_llm_validation(plan_obj)
+    except Exception:
+        try:
+            return plan_obj.model_dump_json(indent=2)
+        except Exception:
+            return "{}"
+
 # 单子任务可写文件数：软上限 = 一个垂直功能合理跨越的分层文件数（domain/controller/service/
 # impl/mapper+xml 等，RuoYi 这类分层框架一个功能天然 4-6 个文件）。软上限内不告警；
 # 软~硬之间仅 warning（不阻断，尊重垂直切片：一个完整功能即使跨多文件也归一个子任务）；

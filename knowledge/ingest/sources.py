@@ -256,6 +256,15 @@ class TencentDocSource(RemoteSourceStub):
 # ── 语雀 ──────────────────────────────────────────────────────────────
 
 
+def _guarded_open(opener: urllib.request.OpenerDirector, req, *, timeout=None):
+    """局部 opener 的 open 调用 seam（D60）。
+
+    生产：opener 带"拒绝跨 host 重定向"handler，作用域仅限本次请求，不污染进程全局
+    默认 opener。单测：monkeypatch 本函数注入假响应（等价旧 urlopen patch 面）。
+    """
+    return opener.open(req, timeout=timeout)
+
+
 class YuqueSource:
     """语雀来源 — 真实现(标准库 urllib,Token 走 Header,无 OAuth,无第三方依赖)。
 
@@ -368,16 +377,18 @@ class YuqueSource:
                     )
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-        # 安装带"拒绝跨 host 重定向"的 opener 为默认，再走 urllib.request.urlopen——
-        # 这样既启用了 redirect 防护(生产)，又让测试对 urlopen 的 monkeypatch 仍生效。
-        urllib.request.install_opener(urllib.request.build_opener(_NoCrossHostRedirect))
+        # D60：用【局部 opener】启用"拒绝跨 host 重定向"防护——绝不 install_opener 改写
+        # 进程全局默认 opener（旧实现装全局后，进程内任何无关 urllib 调用的【合法】跨 host
+        # 30x 都会被本类的 host 白名单拒绝，属全局副作用泄漏）。单测经 _guarded_open seam
+        # 注入假响应（等价旧的 urlopen monkeypatch 面）。
+        opener = urllib.request.build_opener(_NoCrossHostRedirect)
         req = urllib.request.Request(
             url,
             headers={"X-Auth-Token": self.token or "", "User-Agent": "swarm-kb-ingest"},
             method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+            with _guarded_open(opener, req, timeout=self.TIMEOUT) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             body = ""

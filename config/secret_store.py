@@ -48,41 +48,60 @@ _fernet_lock = threading.Lock()
 # 加密引擎（Fernet）
 # ──────────────────────────────────────────────
 
-def _derive_key_from_db() -> str:
-    """无 SWARM_SECRET_KEY 时，从 db 连接串派生一个稳定根密钥（弱保护兜底）。"""
-    seed = DatabaseConfig().postgres_uri or "swarm-default-seed"
-    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+def _derive_key_seeds_from_db() -> list[str]:
+    """无 SWARM_SECRET_KEY 时，从 db 连接串派生根密钥种子（弱保护兜底）。
+
+    复核整改（reviewer MEDIUM）：主种子取【URI 去 query 的归一形态】——DSN 的化妆性
+    改动（如 D15 默认值补 ?connect_timeout=10）不得轮换根密钥，否则升级即静默解不开
+    全部已存密文（get_secret 回退 .env，已配置密钥"消失"）。历史部署可能以【含 query
+    的完整 URI】为种子加密过（旧派生逻辑）→ 该形态作第二种子保留（仅解密回退，
+    新加密一律走归一主种子）。
+    """
+    uri = DatabaseConfig().postgres_uri or "swarm-default-seed"
+    base = uri.split("?", 1)[0]
+    seeds = [hashlib.sha256(base.encode("utf-8")).hexdigest()]
+    if uri != base:
+        seeds.append(hashlib.sha256(uri.encode("utf-8")).hexdigest())
+    return seeds
 
 
 def _get_fernet():
-    """惰性构造 Fernet 实例。根密钥优先 env SWARM_SECRET_KEY，否则 db 派生。"""
+    """惰性构造 Fernet 实例。根密钥优先 env SWARM_SECRET_KEY，否则 db 派生。
+
+    db 派生路径返回 MultiFernet（密钥轮换语义）：首密钥（归一种子）用于加密，
+    旧完整 URI 种子仅参与解密——两代密文都解得开。
+    """
     global _fernet
     if _fernet is not None:
         return _fernet
     with _fernet_lock:
         if _fernet is not None:
             return _fernet
-        from cryptography.fernet import Fernet
+        from cryptography.fernet import Fernet, MultiFernet
+
+        def _to_fernet(raw: str) -> Fernet:
+            # Fernet 需要 32 字节 urlsafe base64 key —— 用 sha256 归一化任意输入
+            digest = hashlib.sha256(raw.encode("utf-8")).digest()
+            return Fernet(base64.urlsafe_b64encode(digest))
 
         raw = os.environ.get("SWARM_SECRET_KEY", "").strip()
-        if not raw:
-            # H5 修复：DB 派生根密钥是弱保护（DB dump + 本仓库即可解密所有存储 key）。
-            # 生产环境应显式设 SWARM_SECRET_KEY；置 SWARM_REQUIRE_SECRET_KEY=1 时强制拒绝派生回退。
-            if os.environ.get("SWARM_REQUIRE_SECRET_KEY", "").strip().lower() in ("1", "true", "yes"):
-                raise RuntimeError(
-                    "SWARM_REQUIRE_SECRET_KEY 已启用但未设置 SWARM_SECRET_KEY。"
-                    "生产环境必须显式提供高熵根密钥（32 字节 base64），拒绝用 DB 连接串派生的弱回退。"
-                )
-            raw = _derive_key_from_db()
-            logger.warning(
-                "【安全风险】未设置 SWARM_SECRET_KEY，回退到 DB 连接串派生的弱根密钥加密敏感信息——"
-                "拿到 DB dump + 本仓库即可解密所有存储的 API key。生产环境请显式设置 "
-                "SWARM_SECRET_KEY（32 字节 base64），并置 SWARM_REQUIRE_SECRET_KEY=1 强制校验。"
+        if raw:
+            _fernet = _to_fernet(raw)
+            return _fernet
+        # H5 修复：DB 派生根密钥是弱保护（DB dump + 本仓库即可解密所有存储 key）。
+        # 生产环境应显式设 SWARM_SECRET_KEY；置 SWARM_REQUIRE_SECRET_KEY=1 时强制拒绝派生回退。
+        if os.environ.get("SWARM_REQUIRE_SECRET_KEY", "").strip().lower() in ("1", "true", "yes"):
+            raise RuntimeError(
+                "SWARM_REQUIRE_SECRET_KEY 已启用但未设置 SWARM_SECRET_KEY。"
+                "生产环境必须显式提供高熵根密钥（32 字节 base64），拒绝用 DB 连接串派生的弱回退。"
             )
-        # Fernet 需要 32 字节 urlsafe base64 key —— 用 sha256 归一化任意输入
-        digest = hashlib.sha256(raw.encode("utf-8")).digest()
-        fkey = base64.urlsafe_b64encode(digest)
-        _fernet = Fernet(fkey)
+        logger.warning(
+            "【安全风险】未设置 SWARM_SECRET_KEY，回退到 DB 连接串派生的弱根密钥加密敏感信息——"
+            "拿到 DB dump + 本仓库即可解密所有存储的 API key。生产环境请显式设置 "
+            "SWARM_SECRET_KEY（32 字节 base64），并置 SWARM_REQUIRE_SECRET_KEY=1 强制校验。"
+        )
+        fernets = [_to_fernet(s) for s in _derive_key_seeds_from_db()]
+        _fernet = fernets[0] if len(fernets) == 1 else MultiFernet(fernets)
         return _fernet
 
 
@@ -111,7 +130,10 @@ def _conn_str() -> str:
 def ensure_tables(conn_str: str | None = None) -> None:
     """建 secret_store 表（幂等）。由 init_db / app on_startup 调用。"""
     conn_str = conn_str or _conn_str()
-    with psycopg.connect(conn_str, autocommit=True) as conn:
+    from swarm.infra.db import pg_connect_timeout_kwargs
+
+    # D15：直连补 connect_timeout——PG 黑洞时启动建表有界快失败，不无限挂。
+    with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(SECRET_STORE_DDL)
     logger.info("secret_store table ensured")

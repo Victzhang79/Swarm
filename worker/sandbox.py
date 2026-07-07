@@ -83,7 +83,51 @@ def get_instance_id() -> str:
         _INSTANCE_ID = os.environ.get("SWARM_INSTANCE_ID") or f"swarm-{uuid.uuid4().hex[:12]}"
     return _INSTANCE_ID
 
-MAX_SYNC_FILE_SIZE = 1_048_576  # 1 MiB
+_DEFAULT_MAX_SYNC_FILE_SIZE = 8 * 1024 * 1024  # 8 MiB
+
+
+def _env_max_sync_file_size() -> int:
+    """D30：单文件同步上限，SWARM_SANDBOX_MAX_SYNC_FILE_SIZE 可配，坏值/非正回退默认。"""
+    raw = os.environ.get("SWARM_SANDBOX_MAX_SYNC_FILE_SIZE", "")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_SYNC_FILE_SIZE
+    return v if v > 0 else _DEFAULT_MAX_SYNC_FILE_SIZE
+
+
+# D30 治本：默认从 1 MiB 提到 8 MiB。旧 1 MiB 会把 package-lock.json、生成的 SQL/数据文件等
+# 合法产物【确定性】skip，且被 L1 闸门当 transient BLOCKED 无限重试（活锁）。依据：传输走
+# envd files 端点 / download_url 直读（60s 超时，8 MiB 秒级完成）；最慢兜底路径 run_code+base64
+# 膨胀 4/3 ≈ 11 MiB 字符串，仍在其 60s 超时承受内。上传（_iter_sync_candidates/项目全量推送）
+# 与下载（sync_*_from_sandbox / sync_sandbox_to_local）共用本常量，两侧对称。
+MAX_SYNC_FILE_SIZE = _env_max_sync_file_size()
+
+# ── D27 治本：clean_workspace 的"绝不删/可清"两张 $HOME 目录清单（各栈对称）──
+# 通用判据（非逐语言特赦）：
+#   绝不删 = 工具链安装/配置目录 + 镜像构建期 warmup 烤入的依赖缓存资产。
+#            删了 → 工具可执行 127 直接坏（如 rm .cargo 删掉 cargo/rustc），或 warmup 白做、
+#            每次编译全量在线重下（.m2 特赦的同一理由，各栈对称补齐）。
+#   可清   = 运行期再生的派生缓存/项目残留。清了只损失少量本地重算，无在线重下成本，
+#            且可能携带跨项目污染。
+# 各栈真实路径依据 cube-templates/dockerfiles/Dockerfile.*（沙箱 $HOME=/root）：
+#   Rust:   rustup 装 /root/.cargo（cargo/rustc 可执行 bin/ + 镜像源 config.toml + warmup
+#           预热 registry，Dockerfile.rust CARGO_HOME=/root/.cargo）、/root/.rustup（toolchain 本体）
+#   Go:     go 本体在 /usr/local/go（不在 $HOME）；GOPATH=/root/go —— go/bin（已装工具）
+#           + go/pkg/mod（warmup 预热 GOMODCACHE，Dockerfile.go）
+#   Java:   /root/.m2（settings.xml 镜像源 + warmup 预热依赖，Dockerfile.java）；.gradle 同理
+#   Node:   node/npm 由 apt 装 /usr/bin（不在 $HOME）；/root/.npm = warmup 填充的下载缓存
+#   Python: 解释器/site-packages 在系统路径（不在 $HOME）；.config 是 pip 等工具配置（配置非缓存）
+SANDBOX_PRESERVE_HOME_DIRS = frozenset({
+    ".cargo", ".rustup",   # Rust 工具链 + registry 资产
+    "go",                  # Go GOPATH（go/bin 工具 + go/pkg/mod 预热模块缓存）
+    ".m2", ".gradle",      # Java 预热依赖 + 构建配置
+    ".npm",                # Node warmup 下载缓存
+    ".config",             # 通用工具配置（pip 镜像源等）
+})
+SANDBOX_CLEANABLE_HOME_DIRS = (
+    ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules",
+)
 
 # ── 主干A 治本：跨子任务共享的聚合清单（多并发 worker 共写，last-write-wins 互覆盖）──
 # 这些文件被 N 个并行 worker 各加不同 <module>/<dependency>/Project 条目；它们的 pull-back
@@ -170,6 +214,24 @@ def sandbox_path(local_rel: str, remote_root: str = "/workspace") -> str:
     return normalized
 
 
+# D52：download_url 直读的 SSL context 复用（verify / no-verify 各一份；ssl.SSLContext
+# 线程安全可共享）。构造失败时上抛，由调用方既有 except 走 files.read/run_command 兜底。
+_SHARED_SSL_CTX: dict = {}
+
+
+def _shared_ssl_context(verify: bool):
+    import ssl
+
+    ctx = _SHARED_SSL_CTX.get(verify)
+    if ctx is None:
+        ctx = ssl.create_default_context()
+        if not verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        _SHARED_SSL_CTX[verify] = ctx
+    return ctx
+
+
 def write_file_to_sandbox(
     sandbox: Any,
     remote_path: str,
@@ -204,7 +266,6 @@ def read_file_from_sandbox(
 
     if hasattr(sandbox, "download_url"):
         try:
-            import ssl
             import urllib.error
             import urllib.request
 
@@ -212,12 +273,9 @@ def read_file_from_sandbox(
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 raise ValueError(f"invalid download_url: {url!r}")
             req = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
-            if cfg.verify_ssl:
-                ctx = ssl.create_default_context()
-            else:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+            # D52：SSL context 进程级复用——原每文件 GET 都 create_default_context()
+            # （加载系统 CA 是磁盘+解析开销，整模块拉回 ≤800 文件 = 800 次重建）。
+            ctx = _shared_ssl_context(bool(cfg.verify_ssl))
             with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
                 return resp.read()
         except Exception as exc:
@@ -337,6 +395,12 @@ class SandboxManager:
         # N-CW3：用 deque(maxlen) —— append+越界丢弃是 GIL 下单原子操作，杜绝
         # reaper 线程×并发 worker 交错 append+del 损坏列表。
         self._sandbox_activity: dict[str, deque[dict[str, Any]]] = {}
+        # D29：sid → create 时 _resolve_template 的【实际】解析结果（配置漂移自愈可能与请求
+        # template_id 不同）。热池桶键/复用匹配据此用实际镜像，杜绝 java 请求复用到 python 镜像。
+        self._resolved_templates: dict[str, str] = {}
+        # D28：sid → 远端生命周期 deadline（monotonic，create 时刻 + timeout 秒，保守取请求
+        # 发起时刻起算）。热池借出前据此校验剩余寿命 ≥ 子任务预算。
+        self._sandbox_deadlines: dict[str, float] = {}
         self._setup_env()
         self._init_sidecar()
 
@@ -479,6 +543,39 @@ class SandboxManager:
     def unregister_sandbox_meta(self, sandbox_id: str) -> None:
         self._sandbox_meta.pop(sandbox_id, None)
         self._sandbox_activity.pop(sandbox_id, None)
+        self._resolved_templates.pop(sandbox_id, None)
+        self._sandbox_deadlines.pop(sandbox_id, None)
+
+    def get_resolved_template(self, sandbox_id: str) -> str | None:
+        """D29：返回该沙箱 create 时的实际解析模板（漂移自愈后的真实镜像 id）。未知返回 None。"""
+        return self._resolved_templates.get(sandbox_id)
+
+    def remaining_lifetime(self, sandbox_id: str) -> float | None:
+        """D28：返回沙箱剩余远端寿命（秒，可为负=已到期）。未记账（非本进程创建）返回 None。"""
+        deadline = self._sandbox_deadlines.get(sandbox_id)
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
+
+    def try_extend_lifetime(self, sandbox: Any, seconds: int) -> bool:
+        """D28：尝试把沙箱远端生命周期续期为【从现在起】seconds 秒（SDK set_timeout 语义=重置倒计时）。
+
+        成功返回 True 并刷新 deadline 记账；SDK 无此方法/服务端不支持（异常）返回 False——
+        调用方（热池）回退"剩余寿命校验，不足不复用"，绝不臆造续期成功。
+        """
+        sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
+        fn = getattr(sandbox, "set_timeout", None)
+        if not callable(fn):
+            return False
+        try:
+            fn(int(seconds))
+        except Exception as exc:  # noqa: BLE001 — 服务端不支持/网络失败 → 如实回退寿命校验
+            logger.info("[D28] 沙箱 %s 续期不可用(set_timeout 失败)，回退剩余寿命校验: %s",
+                        sid, str(exc)[:160])
+            return False
+        self._sandbox_deadlines[sid] = time.monotonic() + float(seconds)
+        logger.debug("[D28] 沙箱 %s 续期至 +%ds", sid, seconds)
+        return True
 
     def append_activity(
         self,
@@ -660,6 +757,9 @@ class SandboxManager:
                 logger.warning("[A1] Sandbox.create 不支持 metadata，降级无标签创建（实例隔离失效，回退开关清扫）")
                 sandbox = _do_create()
         self._instances[sandbox.sandbox_id] = sandbox
+        # D29：回写实际解析模板；D28：记远端寿命 deadline（t0 起算，比远端真实到期略早=保守安全）。
+        self._resolved_templates[sandbox.sandbox_id] = template
+        self._sandbox_deadlines[sandbox.sandbox_id] = t0 + float(timeout)
         self.register_sandbox_meta(
             sandbox.sandbox_id,
             project_id=project_id,
@@ -728,12 +828,16 @@ class SandboxManager:
         sid = getattr(sandbox, "sandbox_id", None) or str(sandbox)
         # 1) 清 workdir 内容（保留目录本身）
         # 2) 清 /tmp 内容
-        # 3) 清 $HOME 下常见缓存，保留 shell 配置
-        # ⚠️ 关键：绝不清 .m2/.gradle —— 这是项目专属模板（方案 B）warmup 预热的依赖缓存，
-        #    是宝贵资产。误删会导致 worker 跑 mvn/gradle 时重新在线下载几十个 jar（实测
-        #    清 .m2 后沙箱每次编译下载 60+ 依赖，warmup 白做）。依赖按 GAV 坐标隔离、是只读
-        #    下载物、不含项目源码，跨同语言项目复用反而加速，无泄漏风险，故保留。
-        cache_dirs = ".cache .npm .cargo go/pkg .config/pip __pycache__ .pytest_cache .mypy_cache node_modules"
+        # 3) 清 $HOME 下可再生派生缓存，保留 shell 配置
+        # ⚠️ D27 治本：$HOME 清理只走 SANDBOX_CLEANABLE_HOME_DIRS，绝不触碰
+        #    SANDBOX_PRESERVE_HOME_DIRS（各栈工具链安装/配置 + warmup 依赖缓存资产，
+        #    判据与依据见清单定义处）。旧清单删 .cargo/go/pkg/.npm 会把 rustup/cargo 可执行、
+        #    预热 GOMODCACHE/npm 缓存一并抹掉——复用沙箱 cargo 127 / go 全量重下，坏沙箱烧预算。
+        #    防御性过滤：即便未来误往可清清单加了受保护根目录，也在此拦下。
+        cache_dirs = " ".join(
+            d for d in SANDBOX_CLEANABLE_HOME_DIRS
+            if d.split("/", 1)[0] not in SANDBOX_PRESERVE_HOME_DIRS
+        )
         cmd = (
             f"mkdir -p {workdir} && "
             f"find {workdir} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
@@ -1016,13 +1120,78 @@ print(json.dumps(items))
             files = _json.loads(result.stdout.strip().split("\n")[-1])
         return files
 
+    # ── D52：tar 批量上传 ─────────────────────────────────────────
+    # 逐文件同步是最大热点：每文件 ≥2 次往返（_ensure_remote_dir + files.write），整模块
+    # ≤800 文件 ≈1600 串行 HTTPS 往返。tar 路径 = 本地打包一次上传 + 沙箱内解包 + 逐条
+    # 清单在场校验，O(N)→O(1) 往返。fail-closed：任何一步失败（沙箱无 tar/解包错/校验
+    # 缺文件/异常）→ 返回 False，调用方回退原逐文件路径；SWARM_SANDBOX_TAR_SYNC=false
+    # 可整体关闭（杀开关）。
+    _TAR_SYNC_MIN_FILES = 4  # 文件数少时逐文件更省（tar+解包+校验固定开销 3 次往返）
+
+    @staticmethod
+    def _tar_sync_enabled() -> bool:
+        return os.environ.get("SWARM_SANDBOX_TAR_SYNC", "true").strip().lower() not in (
+            "false", "0", "no", "off")
+
+    def _tar_batch_upload(
+        self, sandbox: Any, remote_root: str, entries: "list[tuple[str, Path]]",
+    ) -> bool:
+        """把 entries=[(rel_posix, local_path)] 一次 tar 上传到 remote_root 并解包校验。
+
+        True=全部落位（清单逐条 -e 校验通过）；False=失败（调用方必须回退逐文件路径）。
+        """
+        if not entries or not hasattr(self, "run_command"):
+            return False
+        try:
+            import io
+            import tarfile
+            import uuid as _uuid
+
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+                for rel, lp in entries:
+                    tf.add(str(lp), arcname=rel, recursive=False)
+            payload = buf.getvalue()
+            tmp_remote = f"/tmp/.swarm_sync_{_uuid.uuid4().hex}.tar.gz"
+            write_file_to_sandbox(sandbox, tmp_remote, payload, manager=self)
+            qroot = shlex.quote(remote_root.rstrip("/") or "/")
+            qtmp = shlex.quote(tmp_remote)
+            # 解包后按 tar 清单逐条 -e 校验（O(1) 往返内完成）；MISSING 非空 = 部分未落位。
+            cmd = (
+                f"mkdir -p {qroot} && tar -xzf {qtmp} -C {qroot} && "
+                f"tar -tzf {qtmp} | while read -r f; do "
+                f"[ -e {qroot}/\"$f\" ] || echo \"MISSING:$f\"; done"
+            )
+            r = self.run_command(sandbox, cmd, timeout=180, _skip_blacklist=True)
+            out = (getattr(r, "stdout", "") or "")
+            failed = bool(getattr(r, "error", None)) or ("MISSING:" in out)
+            # 临时包清理 best-effort（失败仅告警，不影响结论）
+            try:
+                self.run_command(sandbox, f"rm -f {qtmp}", timeout=15, _skip_blacklist=True)
+            except Exception:  # noqa: BLE001
+                pass
+            if failed:
+                logger.warning(
+                    "[D52] tar 批量上传校验失败(err=%s missing=%s)，回退逐文件",
+                    getattr(r, "error", None),
+                    [ln for ln in out.splitlines() if ln.startswith("MISSING:")][:5],
+                )
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[D52] tar 批量上传异常，回退逐文件: %s", exc)
+            return False
+
     def sync_project_to_sandbox(
         self,
         sandbox: Any,
         local_root: Path,
         remote_root: str | None = None,
     ) -> dict[str, Any]:
-        """将本地项目推送到沙箱 remote_root（默认 /workspace）。"""
+        """将本地项目推送到沙箱 remote_root（默认 /workspace）。
+
+        D52：默认 tar 批量路径（一次上传+解包+清单校验）；失败/关闭时回退原逐文件。
+        """
         remote_root = remote_root or self.config.sandbox_remote_workdir
         stats: dict[str, Any] = {"uploaded": 0, "skipped": 0, "errors": []}
         local_root = Path(local_root).resolve()
@@ -1035,12 +1204,25 @@ print(json.dumps(items))
         use_files_api = hasattr(sandbox, "files") and hasattr(sandbox.files, "write")
         self._ensure_remote_dir(sandbox, remote_root, use_files_api)
 
+        # 候选收集（skip 记账与旧行为一致），再选批量/逐文件通道
+        entries: list[tuple[str, Path]] = []
         for path, rel, status in _iter_sync_candidates(local_root):
             if status == "large":
                 stats["skipped"] += 1
                 continue
+            entries.append((rel.as_posix(), path))
 
-            remote_path = f"{remote_root.rstrip('/')}/{rel.as_posix()}"
+        if (self._tar_sync_enabled() and len(entries) >= self._TAR_SYNC_MIN_FILES
+                and self._tar_batch_upload(sandbox, remote_root, entries)):
+            stats["uploaded"] = len(entries)
+            logger.info(
+                "Project sync to sandbox %s: uploaded=%d skipped=%d errors=%d (tar batch)",
+                sandbox.sandbox_id, stats["uploaded"], stats["skipped"], len(stats["errors"]),
+            )
+            return stats
+
+        for rel_posix, path in entries:
+            remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
                 data = path.read_bytes()
                 if use_files_api:
@@ -1049,7 +1231,7 @@ print(json.dumps(items))
                     self._write_file_via_code(sandbox, remote_path, data)
                 stats["uploaded"] += 1
             except Exception as exc:
-                msg = f"{rel.as_posix()}: {exc}"
+                msg = f"{rel_posix}: {exc}"
                 stats["errors"].append(msg)
                 logger.warning("Project sync file failed: %s", msg)
 
@@ -1121,7 +1303,13 @@ print(json.dumps(files))
                 if isinstance(data, str):
                     data = data.encode("utf-8")
                 if len(data) > MAX_SYNC_FILE_SIZE:
-                    stats["skipped"] += 1
+                    # D30：与 sync_files_from_sandbox 对称——超限确定性 skip 单独记账+可观测。
+                    stats["skipped_oversize"] = stats.get("skipped_oversize", 0) + 1
+                    stats.setdefault("oversize_rels", []).append(rel)
+                    logger.warning(
+                        "Sandbox pull-back 超限跳过(确定性): %s size=%d > %d",
+                        rel, len(data), MAX_SYNC_FILE_SIZE,
+                    )
                     continue
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 local_path.write_bytes(data)
@@ -1164,6 +1352,9 @@ print(json.dumps(files))
         use_files_api = hasattr(sandbox, "files") and hasattr(sandbox.files, "write")
         self._ensure_remote_dir(sandbox, remote_root, use_files_api)
 
+        # D52：先做与旧逐文件路径完全同口径的校验（越界/缺失照旧记 errors），
+        # 合法条目再选批量/逐文件上传通道。
+        entries: list[tuple[str, Path]] = []
         for rel in rel_files:
             rel_posix = Path(rel).as_posix().lstrip("/")
             if not rel_posix:
@@ -1176,6 +1367,20 @@ print(json.dumps(files))
             if not local_path.is_file():
                 stats["errors"].append(f"{rel_posix}: 本地文件不存在")
                 continue
+            entries.append((rel_posix, local_path))
+
+        if (self._tar_sync_enabled() and len(entries) >= self._TAR_SYNC_MIN_FILES
+                and self._tar_batch_upload(sandbox, remote_root, entries)):
+            stats["uploaded"] = len(entries)
+            stats["files"] = [rel for rel, _ in entries]
+            self._record_sandbox_success(sandbox.sandbox_id)
+            logger.info(
+                "Targeted sync to sandbox %s: uploaded=%d errors=%d (tar batch)",
+                sandbox.sandbox_id, stats["uploaded"], len(stats["errors"]),
+            )
+            return stats
+
+        for rel_posix, local_path in entries:
             remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
                 data = local_path.read_bytes()
@@ -1220,7 +1425,10 @@ print(json.dumps(files))
         """
         remote_root = remote_root or self.config.sandbox_remote_workdir
         stats: dict[str, Any] = {
-            "downloaded": 0, "skipped": 0, "errors": [], "contents": {}
+            "downloaded": 0, "skipped": 0, "errors": [], "contents": {},
+            # D30：确定性尺寸 skip 与 transient skip/err 分账（重试不可恢复，L1 闸门据此
+            # 判确定性失败而非 BLOCKED transient 无限重试）。
+            "skipped_oversize": 0, "oversize_rels": [],
         }
         local_root = Path(local_root).resolve()
 
@@ -1240,7 +1448,15 @@ print(json.dumps(files))
                 if isinstance(data, str):
                     data = data.encode("utf-8")
                 if len(data) > MAX_SYNC_FILE_SIZE:
-                    stats["skipped"] += 1
+                    # D30：超限是【确定性】skip（重试同样超限），单独记账、不混入 transient
+                    # skipped——否则 L1 闸门当 BLOCKED transient 每轮重试同 skip 直到配额耗尽。
+                    stats["skipped_oversize"] += 1
+                    stats["oversize_rels"].append(rel_posix)
+                    logger.warning(
+                        "Targeted pull-back 超限跳过(确定性): %s size=%d > %d"
+                        "（SWARM_SANDBOX_MAX_SYNC_FILE_SIZE 可调）",
+                        rel_posix, len(data), MAX_SYNC_FILE_SIZE,
+                    )
                     continue
                 local_path = (local_root / rel_posix).resolve()
                 # 防目录穿越（A5 归一原语 is_within_root）

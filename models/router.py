@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Protocol, runtime_checkable
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -274,6 +275,41 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             yield chunk
 
 
+# ── D54：ChatModel 实例缓存 ─────────────────────────────────────────────
+# 旧行为：每次 get_chat_model 都 new 一个 ChatOpenAI（内含新 httpx 连接池）——brain/worker
+# 每次 LLM 调用都重建客户端、重做 TLS 握手、连接池零复用。改为按【全部影响行为的参数】
+# 值缓存实例（langchain ChatModel 无每调用可变状态，跨并发调用共享安全；_UsageRecorder /
+# ModelInvocationLogger 均按 run_id 或无状态设计）。
+# 失效语义：缓存键直接由 base_url/api_key/超时/温度/model 等【值】构成——PUT /api/routing
+# 等热更改了任何行为参数，键即不同、自然取到新实例（值键化 = 语义级失效，无需 reload 钩子）。
+# fail-closed：callbacks 含无法值指纹化的外部回调 → 跳过缓存走原路径（绝不错共享）。
+_CHAT_MODEL_CACHE: "dict[tuple, BaseChatModel]" = {}
+_CHAT_MODEL_CACHE_LOCK = threading.Lock()
+_CHAT_MODEL_CACHE_MAX = 64  # 防配置频繁变更下无界增长；超限整体清空重建
+
+
+def clear_chat_model_cache() -> None:
+    """清空 ChatModel 实例缓存（运维/测试钩子；正常热更靠值键化自然失效）。"""
+    with _CHAT_MODEL_CACHE_LOCK:
+        _CHAT_MODEL_CACHE.clear()
+
+
+def _callbacks_cache_token(callbacks: list | None) -> "tuple | None":
+    """把 callbacks 列表转为值指纹；含未知回调类型 → None（该次调用不缓存）。
+
+    仓内两类回调都是按构造参数确定行为：ModelInvocationLogger（无状态）与内部
+    _UsageRecorder（get_chat_model 内部追加，不经此处）。外部/测试注入的任意回调
+    无法值指纹化，宁可不缓存也不错共享。
+    """
+    tokens: list[tuple] = []
+    for cb in callbacks or []:
+        if isinstance(cb, ModelInvocationLogger):
+            tokens.append(("MIL", cb.role, cb.model_name, cb.provider_id))
+        else:
+            return None
+    return tuple(tokens)
+
+
 class EndpointProvider:
     """通用接入点提供者 —— 按 ProviderConfig 构建 OpenAI 兼容 ChatModel。
 
@@ -299,6 +335,24 @@ class EndpointProvider:
         from langchain_openai import ChatOpenAI
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
         api_key: str = self.provider.api_key or "EMPTY"  # type: ignore[assignment]
+        # D54：值键化实例缓存——键覆盖全部影响行为的参数（含超时族/重试/kind 推导的
+        # extra_body 分支/回调指纹）。指纹化失败（外部回调）→ _cache_key=None 走原路径。
+        _cb_token = _callbacks_cache_token(callbacks)
+        _cache_key: tuple | None = None
+        if _cb_token is not None:
+            _cache_key = (
+                self.provider.id, self.provider.kind, self.provider.base_url, api_key,
+                self._resolve_retries(), model_name, float(temperature),
+                int(max_tokens or 0), float(wallclock_budget or 0.0),
+                float(self.config.timeout_seconds),
+                float(getattr(self.config, "first_token_timeout", self.config.stream_chunk_timeout)),
+                float(getattr(self.config, "inter_chunk_timeout", 30.0)),
+                _cb_token,
+            )
+            with _CHAT_MODEL_CACHE_LOCK:
+                cached = _CHAT_MODEL_CACHE.get(_cache_key)
+            if cached is not None:
+                return cached
         # token 用量统计：在唯一 chokepoint 挂一个 _UsageRecorder（知 kind/provider/model），
         # 覆盖全部 cloud+local、brain+worker、primary+fallback 路径且只挂一处=不重复计数。
         _cbs = list(callbacks or [])
@@ -339,7 +393,13 @@ class EndpointProvider:
         _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
         # 治本（第三条腿）：总时长看门狗。由调用方按角色传入（brain 开/worker 默认关），0=关闭。
         _kwargs["swarm_wallclock_budget"] = float(wallclock_budget or 0.0)
-        return _DualTimeoutChatOpenAI(**_kwargs)
+        model = _DualTimeoutChatOpenAI(**_kwargs)
+        if _cache_key is not None:
+            with _CHAT_MODEL_CACHE_LOCK:
+                if len(_CHAT_MODEL_CACHE) >= _CHAT_MODEL_CACHE_MAX:
+                    _CHAT_MODEL_CACHE.clear()  # 罕见（配置频繁变更）；清空重建防无界增长
+                _CHAT_MODEL_CACHE[_cache_key] = model
+        return model
 
 
 # ── 向后兼容别名 ─────────────────────────────────────────────

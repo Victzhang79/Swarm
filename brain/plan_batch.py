@@ -269,6 +269,24 @@ def _fresh_deliverable_signature(st: dict, global_creates: frozenset[str]) -> fr
     return frozenset((_norm_paths(st, "create_files", "writable")) & global_creates)
 
 
+def prune_parallel_groups(groups, valid_ids) -> list:
+    """D10（治本）：从 parallel_groups 剔除不在 valid_ids 的子任务 id，删除成员变空的组。
+
+    任何【重建 subtasks 的确定性路径】（单发 dedupe_subtasks / dedupe_module_scaffolds）删掉子任务后，
+    parallel_groups 会残留悬空引用 → plan_validator "parallel_groups[i] 含未知子任务 <id>" 硬失败 →
+    叠加 D09 盲重试成死循环。本函数同步收敛 groups，成员全被删的组整组删除（不留空组）。
+    不 mutate 入参，返回新列表。groups 为空/None → 返回 []。"""
+    if not groups:
+        return []
+    valid = set(valid_ids or [])
+    pruned: list = []
+    for g in groups:
+        kept = [tid for tid in (g or []) if tid in valid]
+        if kept:
+            pruned.append(kept)
+    return pruned
+
+
 def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
     """跨批重复子任务去重（治本 RUN6：分批分解把地基活每批各拆一遍）。
 

@@ -74,12 +74,43 @@ def _record_rerank_usage(ep, query: str, texts: list[str]) -> None:
         pass
 
 
+
+# ── D54：进程级共享 httpx.Client（线程安全，连接池复用）────────────────────
+# 旧行为：每次 rerank 每种格式函数都 `with httpx.Client(...)` 新建再关闭（每请求新建
+# 连接/TLS）。改为模块级单例 + nullcontext 包装（不随 with 关闭）；构造失败回退旧的
+# 一次性 client（fail-closed 不丢功能）。
+_SHARED_CLIENT: "httpx.Client | None" = None
+_SHARED_CLIENT_LOCK = None
+# 模块导入时捕获真实类：单测 monkeypatch reranker.httpx.Client 注入假 client 时，
+# 走一次性构造（等价旧行为），mock 可注入且不污染共享单例。
+_REAL_HTTPX_CLIENT_CLS = httpx.Client
+
+
+def _client_cm():
+    """返回可用于 `with` 的 client 上下文：共享单例（nullcontext）或一次性回退。"""
+    import contextlib
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOCK
+    if httpx.Client is not _REAL_HTTPX_CLIENT_CLS:
+        return httpx.Client(timeout=30.0)  # 测试 seam / 运行时替换：按旧行为逐次构造
+    try:
+        if _SHARED_CLIENT is None:
+            import threading
+            if _SHARED_CLIENT_LOCK is None:
+                _SHARED_CLIENT_LOCK = threading.Lock()
+            with _SHARED_CLIENT_LOCK:
+                if _SHARED_CLIENT is None:
+                    _SHARED_CLIENT = httpx.Client(timeout=30.0)
+        return contextlib.nullcontext(_SHARED_CLIENT)
+    except Exception:  # noqa: BLE001
+        return httpx.Client(timeout=30.0)
+
+
 def _rerank_simple(ep, query: str, texts: list[str], documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """自建格式：POST {query, texts} → [{index, score}] 或 {results:[...]}。"""
     headers = {"Content-Type": "application/json"}
     if ep.api_key:
         headers["Authorization"] = f"Bearer {ep.api_key}"
-    with httpx.Client(timeout=30.0) as client:
+    with _client_cm() as client:  # D54：共享连接池，失败回退一次性 client
         resp = client.post(ep.url, json={"query": query, "texts": texts}, headers=headers)
         resp.raise_for_status()
         data = resp.json()
@@ -104,7 +135,7 @@ def _rerank_openai(ep, query: str, texts: list[str], documents: list[dict[str, A
         headers["Authorization"] = f"Bearer {ep.api_key}"
     base = ep.url.rstrip("/")
     url = base if base.endswith("/rerank") else f"{base}/rerank"
-    with httpx.Client(timeout=30.0) as client:
+    with _client_cm() as client:  # D54：共享连接池，失败回退一次性 client
         resp = client.post(url, headers=headers, json={
             "model": ep.model, "query": query, "documents": texts,
             "top_n": min(top_k, len(texts)),
@@ -134,7 +165,7 @@ def _rerank_cohere(ep, query: str, texts: list[str], documents: list[dict[str, A
         headers["Authorization"] = f"Bearer {ep.api_key}"
     base = ep.url.rstrip("/")
     url = base if base.endswith("/rerank") else f"{base}/rerank"
-    with httpx.Client(timeout=30.0) as client:
+    with _client_cm() as client:  # D54：共享连接池，失败回退一次性 client
         resp = client.post(url, headers=headers, json={
             "model": ep.model, "query": query, "documents": texts,
             "top_n": min(top_k, len(texts)),

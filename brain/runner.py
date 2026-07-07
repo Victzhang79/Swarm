@@ -360,8 +360,13 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
     if merged_diff:
         updates["merged_diff"] = merged_diff
 
+    # D07 治本：merge_conflicts 改 `is not None` 下发（含空列表清空）。brain merge 节点每轮
+    # 已把 state.merge_conflicts 清成 []（第 1 轮冲突入库、恢复后第 2 轮干净合并），store.update_task
+    # 用 `is not None` 本支持用 [] 清空 DB；旧 truthiness `if merge_conflicts:` 令空列表永不下发，
+    # 致 DB 永久残留首轮冲突 → 任务 DONE 但 /apply-diff 永久 409。终态 _handle_post_run 走同一函数
+    # 天然覆盖。★仅当 state 确带该键才下发（None=本次增量/快照未触及该字段，保留 DB 现值）。
     merge_conflicts = state.get("merge_conflicts")
-    if merge_conflicts:
+    if merge_conflicts is not None:
         updates["merge_conflicts"] = merge_conflicts
 
     l3_fields: dict[str, Any] = {}
@@ -389,10 +394,23 @@ async def _stream_brain_events(
     queue: asyncio.Queue[dict[str, Any]],
     *,
     project_id: str = "",
-    module_lock: Any | None = None,
-) -> tuple[dict[str, Any], Any, Any | None]:
-    """执行 Brain 并流式推送节点事件，返回 (state values, snapshot)"""
+    lock_holder: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """执行 Brain 并流式推送节点事件，返回 (state values, snapshot)。
+
+    D02 修复：模块锁经【可变容器】lock_holder 传引用，而非局部变量+返回值传回。
+    plan 节点升级锁后原地写回 lock_holder["lock"]，使调用方 finally 无论本函数正常
+    返回还是中途抛异常（GraphRecursionError/TaskWallclockExceeded/TaskLockLost/节点异常）
+    都能释放到【当前实际持有的锁】——旧实现下升级后的新锁只存在于本函数局部变量，
+    异常退出不 return 时调用方仍持已被 release 的旧锁 → 新锁无人释放泄漏死锁。
+    """
     from swarm.tracing import brain_graph_config
+
+    # 当前持有的模块锁（从容器取初值；升级后写回容器 + 本地同步，供 renew 用最新锁）。
+    module_lock = lock_holder.get("lock") if lock_holder is not None else None
+    # D14：renew 降频器（进入循环前初始化；首见锁=刚 acquire → 跳过首个间隔）。
+    from swarm.infra.redis_client import RenewPacer
+    _renew_pacer = RenewPacer()
 
     graph = get_compiled_brain_graph()
     task_rec = store.get_task(task_id) or {}
@@ -424,6 +442,24 @@ async def _stream_brain_events(
     _wc_subtasks = _subtask_n or 0  # 规划前多为 0（只用 base）；下方循环见 plan 输出后放宽
     _wc_start = time.monotonic()
 
+    # D26 治本：节点 on_chain_end 的 output 是【增量 patch】（只含本节点写出的键），而
+    # _sync_task_from_state 按【全量 state】记三本账（completed/abandoned/plan）。直接喂增量
+    # 会系统性错账：
+    #  (a) dispatch 的 output 恒含 subtask_results 但从不含 abandoned_subtask_ids/give_up_isolated_ids
+    #      （那是 handle_failure 的键）→ 每次 dispatch 同步都算 abandoned=0 写库，把 handle_failure
+    #      刚放弃的 N 个清零；
+    #  (b) dispatch/merge output 通常不含 plan → _plan_subtask_ids 为 None → completed 退化为数全部
+    #      累积结果（含 replan 后已不在当前 plan 的旧 id）且夹紧失效 → DB completed > subtask_count。
+    # 修法：维护跨事件累积的全量快照。BrainState 记账键（plan/subtask_results/abandoned_subtask_ids/
+    # give_up_isolated_ids/merge_conflicts…）均为默认 last-write-wins 通道——每次写出的即该键全量值，
+    # 故 .update() 累积得到当前真全量。同步据【累积快照】而非裸增量 output，保住不变量：abandoned/
+    # completed 只被"真知当前全量值"的写入更新，绝不被不含该键的增量覆盖成 0；同时保留中途进度可见性
+    # （每个 _SYNC_ON_NODES 节点结束仍即时下发累积快照）。resume 时用 DB 已存 plan 播种，令 completed
+    # 过滤在 plan 节点不重跑的情形下仍有分母。
+    _accumulated_state: dict[str, Any] = {}
+    if isinstance(_plan_rec, dict) and _plan_rec:
+        _accumulated_state["plan"] = _plan_rec
+
     await _emit(queue, {
         "step": "brain_invoke",
         "status": "running",
@@ -454,11 +490,17 @@ async def _stream_brain_events(
             })
             raise
         # A-P1-14：搭车续期模块锁——build 跑得比 TTL 久时不至于静默失锁。
-        # 无额外后台任务，进程处理每个图事件时顺带 renew（Redis 关闭时 no-op）。
+        # 无额外后台任务，进程处理图事件时顺带 renew（Redis 关闭时 no-op）。
+        # D14 治本：renew 是同步 Redis IO——①降频（RenewPacer：距上次不足 TTL/10 跳过；锁升级
+        # 换对象时重置计时不补 renew，新锁刚 acquire 即满 TTL），不再每事件一次；②卸线程池
+        # （asyncio.to_thread）——即便 Redis 网络黑洞，socket 超时内的阻塞也只占工作线程，
+        # 事件循环/其它任务/SSE/API 不陪等。renew() 自身吞通信异常只返 bool，to_thread 不改变
+        # 异常传播语义（renew 内部未捕获的意外异常仍照旧经 except Exception → FAILED）。
         # ★对抗复核 2nd#2 治本★：renew 返回 False = 锁已在 Redis 侧丢失（另一任务可能已抢占同
         # 模块并发写工作树）→ 不能再继续，fail-fast 中止本任务（经 except Exception → FAILED +
         # finally 释放资源）。内存兜底/未启用 Redis 时 renew 恒 True，不触发（单进程无跨进程互斥意义）。
-        if module_lock is not None and not module_lock.renew():
+        if module_lock is not None and _renew_pacer.due(module_lock) \
+                and not await asyncio.to_thread(module_lock.renew):
             await _emit(queue, {
                 "step": "lock_lost", "status": "failed",
                 "message": "模块锁已失效（TTL 超期/Redis 抖动），为防同模块并发写已中止任务",
@@ -486,9 +528,14 @@ async def _stream_brain_events(
         elif kind == "on_chain_end":
             name = event.get("name", "")
             output = (event.get("data") or {}).get("output") or {}
+            # D26：先把本节点增量 output 并入累积全量快照（含 handle_failure 等不在 _SYNC_ON_NODES
+            # 的节点——其放弃 id 需在后续 dispatch 同步时可见，不被清零）。
+            if isinstance(output, dict):
+                _accumulated_state.update(output)
             if name in _SYNC_ON_NODES and isinstance(output, dict):
                 # round27 perf：同上，DB 回写卸线程池，不卡事件环。
-                await asyncio.to_thread(_sync_task_from_state, task_id, output)
+                # D26：喂【累积全量快照】而非裸增量 output——记账（completed/abandoned/plan）方正确。
+                await asyncio.to_thread(_sync_task_from_state, task_id, dict(_accumulated_state))
                 # P1-B：规划/拆分揭示子任务数 → 放宽弹性墙钟（只增不减，防大型任务被基线上限误杀）。
                 _plan_out = output.get("plan")
                 _subs = None
@@ -572,10 +619,14 @@ async def _stream_brain_events(
                         plan_dict = None
                     if plan_dict is not None:
                         module_lock = upgrade_module_lock(module_lock, pid, plan_dict)
+                        # D02：升级后的新锁立即写回容器——此后任何异常退出，调用方 finally
+                        # 都能经 lock_holder 释放到新锁（旧锁已在 upgrade 内 release）。
+                        if lock_holder is not None:
+                            lock_holder["lock"] = module_lock
 
     snapshot = await graph.aget_state(config)
     final_state = dict(snapshot.values) if snapshot and snapshot.values else {}
-    return final_state, snapshot, module_lock
+    return final_state, snapshot
 
 
 def _extract_interrupt_info(snapshot: Any, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -805,12 +856,17 @@ async def _handle_post_run(
         if _rebase_dropped:
             # 复核 H-1：否则 rebase-only PARTIAL 会显示"放弃 0 + 保 build 0"无解释。
             _msg += f"；merge rebase 超限丢弃 {len(_rebase_dropped)} 个(rebased 变更未并入，需人工核验)：{_rebase_dropped}"
+        # D18：终态载荷并入 complete 事件。旧协议 complete 后再发 step:"result"，但 SSE/WS
+        # 订阅端在 complete 即 break → result（merged_diff/l3 等）永远送不到（死协议）。
+        # CLI 原生消费 complete 事件内的 result 键（cli/__init__.py），WebUI 靠 complete 后
+        # REST 重载详情——并入 complete 对下游零破坏且载荷真正可达。
         await _emit(queue, {
             "step": "complete",
             "status": "partial",
             "message": _msg,
             "mode": "brain",
             "progress": 100,
+            "result": output_parts,
         })
     else:
         await _emit(queue, {
@@ -819,8 +875,8 @@ async def _handle_post_run(
             "message": "任务执行完成",
             "mode": "brain",
             "progress": 100,
+            "result": output_parts,
         })
-    await _emit(queue, {"step": "result", "mode": "brain", "result": output_parts})
 
 
 def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
@@ -928,13 +984,14 @@ async def _finalize_governor_partial(
           error=f"{reason_code}: 抢救 {completed} 个已完成子任务为部分交付"[:300])
     logger.warning("[RUNNER] 任务 %s %s → 抢救 %d 个已完成子任务为 PARTIAL（余下未完成，可重跑续做）",
                    task_id, reason_code, completed)
+    # D18：终态载荷并入 complete（与 _handle_post_run 正常终态同协议，独立 result 事件已废）。
     await _emit(queue, {
         "step": "complete", "status": "partial",
         "message": (f"{reason_msg}；已抢救 {completed} 个已完成子任务(真实落盘)为部分交付，"
                     f"余下未完成，重跑可续做"),
         "mode": "brain", "progress": 100,
+        "result": _build_result_payload(state),
     })
-    await _emit(queue, {"step": "result", "mode": "brain", "result": _build_result_payload(state)})
     return "PARTIAL"
 
 
@@ -1015,6 +1072,8 @@ async def run_task(
     # build_session_metadata 等均可抛）原先【不在】下方 try/finally 保护内——异常直接泄漏模块锁
     # （Redis 路径靠 1h TTL 自愈；Redis 不可用退进程内 threading 锁的兜底路径【永久】泄漏到重启）
     # + _task_running 残留。try 前移到紧贴 acquire，让一切失败路径统一 FAILED 落库 + finally 释放。
+    # D02：锁经可变容器传入 _stream_brain_events，plan 升级锁后原地写回，finally 始终释放【当前】锁。
+    lock_holder: dict[str, Any] = {"lock": module_lock}
     try:
         if auto_accept is None:
             auto_accept = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
@@ -1093,8 +1152,8 @@ async def run_task(
             project_id=project_id,
             description=description[:200],
         )
-        state, snapshot, module_lock = await _stream_brain_events(
-            task_id, initial_state, queue, project_id=project_id, module_lock=module_lock,
+        state, snapshot = await _stream_brain_events(
+            task_id, initial_state, queue, project_id=project_id, lock_holder=lock_holder,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
         _final_rec = store.get_task(task_id)
@@ -1136,7 +1195,7 @@ async def run_task(
             "progress": -1,
         })
     finally:
-        module_lock.release()
+        lock_holder["lock"].release()
         _task_running.discard(task_id)
         # B2：清理 per-task token 归属与真实累计（覆盖正常/超限/异常所有退出路径）。
         try:
@@ -1210,6 +1269,8 @@ async def resume_task(
 
     # round27 F1：与 run_task 同理——acquire 到旧 try 之间的 store.update_task 可抛，
     # 异常会泄漏模块锁（进程内锁兜底路径永久泄漏）。try 前移到紧贴 acquire。
+    # D02：锁经可变容器传入 _stream_brain_events，plan 升级锁后原地写回，finally 始终释放【当前】锁。
+    lock_holder: dict[str, Any] = {"lock": module_lock}
     try:
         decision_norm = decision.lower().strip()
         if decision_norm in ("approved", "approve", "accept"):
@@ -1234,12 +1295,12 @@ async def resume_task(
             "mode": "brain",
             "progress": 50,
         })
-        state, snapshot, module_lock = await _stream_brain_events(
+        state, snapshot = await _stream_brain_events(
             task_id,
             Command(resume=resume_payload),
             queue,
             project_id=_resume_project_id,
-            module_lock=module_lock,
+            lock_holder=lock_holder,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
@@ -1272,7 +1333,7 @@ async def resume_task(
             "progress": -1,
         })
     finally:
-        module_lock.release()
+        lock_holder["lock"].release()
         _task_running.discard(task_id)
         # 复核 CR-1：resume 也经 _stream_brain_events→set_current_task，必须同样清理 per-task
         # token 归属+累计（否则 resume 后计数残留、retry 时被 max(真实,估算) 误判超限 + 内存泄漏）。
@@ -1342,18 +1403,20 @@ async def resume_planning(
         return
 
     # round27 F1：与 run_task/resume_task 同族——update_task 移入 try，防 acquire 后异常泄漏模块锁。
+    # D02：锁经可变容器传入 _stream_brain_events，plan 升级锁后原地写回，finally 始终释放【当前】锁。
+    lock_holder: dict[str, Any] = {"lock": module_lock}
     try:
         store.update_task(task_id, status="ANALYZING")
         await _emit(queue, {
             "step": "resume", "status": "running",
             "message": "恢复规划（澄清/方案评审已提交）", "mode": "brain", "progress": 30,
         })
-        state, snapshot, module_lock = await _stream_brain_events(
+        state, snapshot = await _stream_brain_events(
             task_id,
             Command(resume=payload),
             queue,
             project_id=_resume_project_id,
-            module_lock=module_lock,
+            lock_holder=lock_holder,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
@@ -1381,7 +1444,7 @@ async def resume_planning(
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:
-        module_lock.release()
+        lock_holder["lock"].release()
         _task_running.discard(task_id)
         # 复核 CR-1：规划 resume 同样 set_current_task，需清理 per-task token 归属+累计。
         try:
@@ -1686,11 +1749,34 @@ async def retry_task(task_id: str, auto_accept: bool | None = None) -> bool:
         merged_diff="",
         subtask_count=0,
         completed_subtasks=0,
+        abandoned_subtasks=0,   # D07：retry=全新 thread/清空 plan，放弃计数须归零，否则旧账残留误导进度三本账
+        merge_conflicts=[],     # D07：清残留冲突，否则重跑继承旧冲突致 /apply-diff 永久 409（store 用 is not None，[] 生效清空）
         human_decision="",
         thread_id=new_thread_id,
         base_commit="",  # ★B6 复核 #5★：retry=全新 thread/清空 plan → 清 base_commit 令 run_task
                          # 重捕获【当前仓库 HEAD】为新基线（retry 语义=对最新仓库重跑，非沿用旧 birth base）。
     )
+
+    # ★D41 治本★：retry 走 scheduler.submit_task 统一准入——旧口径直跑 run_task 不占
+    # _inflight 槽、绕过 MAX_CONCURRENT_TASKS 与项目沙箱就绪闸门（批量重跑=无界并发超卖），
+    # 与 reconcile 走 submit_task 的口径分叉。调用方（API retry_task_background）本就
+    # fire-and-forget，不依赖同步等待结果，入队语义兼容。调度器消费循环未运行
+    # （CLI/测试/未启动）时保留直跑兜底——那些环境本无准入面，入队无人消费会静默丢任务。
+    from swarm.brain import scheduler as _scheduler
+
+    if _scheduler.is_consumer_running():
+        resolved_auto = auto_accept
+        if resolved_auto is None:
+            # 与 run_task 对 None 的解析口径一致（env SWARM_AUTO_ACCEPT）
+            resolved_auto = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+        _scheduler.submit_task(
+            task_id,
+            task["project_id"],
+            task["description"],
+            auto_accept=bool(resolved_auto),
+            priority=(task.get("queue_priority") or "normal"),
+        )
+        return True
 
     await run_task(
         task_id,

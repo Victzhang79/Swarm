@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from contextvars import ContextVar
 from typing import Any
@@ -87,15 +88,58 @@ def _get_kb_loop() -> asyncio.AbstractEventLoop:
         return _kb_loop
 
 
-def _run_on_kb_loop(coro):
+# D15：KB loop 同步桥接的有界等待默认值（秒）。取值依据：稳态检索为毫秒~秒级；上界要
+# 覆盖【首次冷启动】——connect_all（≤6 个 PG/Qdrant 连接，各自已有 connect_timeout=10s）
+# + 建表 DDL + embedding 服务首查预热，故给 300s 宽裕上界而非拍脑袋小值。可经
+# SWARM_KB_SYNC_TIMEOUT_SEC 覆盖；<=0/非法回退默认——绝不允许配置回到无限等（fail-closed）。
+_KB_SYNC_TIMEOUT_DEFAULT_SEC = 300.0
+# D15：get_retriever 内 connect_all 的有界预算（秒）。须 < 同步桥接超时，让锁内挂起先于
+# 外层超时暴露并释放锁。每个直连已有 connect_timeout=10s，60s 覆盖 6 个串行连接的最坏情形。
+_KB_CONNECT_ALL_TIMEOUT_DEFAULT_SEC = 60.0
+
+
+def _kb_sync_timeout_sec() -> float:
+    try:
+        v = float(os.environ.get("SWARM_KB_SYNC_TIMEOUT_SEC", _KB_SYNC_TIMEOUT_DEFAULT_SEC))
+        return v if v > 0 else _KB_SYNC_TIMEOUT_DEFAULT_SEC
+    except (TypeError, ValueError):
+        return _KB_SYNC_TIMEOUT_DEFAULT_SEC
+
+
+def _kb_connect_all_timeout_sec() -> float:
+    try:
+        v = float(os.environ.get("SWARM_KB_CONNECT_ALL_TIMEOUT_SEC", _KB_CONNECT_ALL_TIMEOUT_DEFAULT_SEC))
+        return v if v > 0 else _KB_CONNECT_ALL_TIMEOUT_DEFAULT_SEC
+    except (TypeError, ValueError):
+        return _KB_CONNECT_ALL_TIMEOUT_DEFAULT_SEC
+
+
+def _run_on_kb_loop(coro, timeout: float | None = None):
     """把协程提交到专用 KB loop 并阻塞等待结果（线程安全）。
 
     无论调用方处于哪个 loop / 线程，retriever 的连接操作都在同一个 loop 上执行，
     彻底规避跨 loop 复用 asyncio 原语的问题。
+
+    D15：fut.result 有界等待（默认 _KB_SYNC_TIMEOUT_DEFAULT_SEC）。超时行为：
+    ① cancel KB loop 上仍在跑的任务（CancelledError 会传播进协程——不留不可观测僵尸）；
+    ② 抛出带明确原因的 TimeoutError fail-fast——绝不静默返 None，调用方按自身语义降级
+    （resolve_symbols_sync 吞掉返空串=纯增益层；knowledge tool 转显式失败文本）。
     """
     loop = _get_kb_loop()
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result()
+    eff = timeout if timeout is not None else _kb_sync_timeout_sec()
+    try:
+        return fut.result(timeout=eff)
+    except TimeoutError:
+        # 注意：fut 已完成时的 TimeoutError 来自协程自身（如 connect_all 的 wait_for）——原样透传；
+        # 只有 fut 未完成（真·等待超时）才 cancel + 换成 KB-loop 语境的明确错误。
+        if fut.done():
+            raise
+        fut.cancel()
+        logger.warning("[knowledge] KB loop 调用超时（%.0fs）已取消挂起任务: %r", eff, coro)
+        raise TimeoutError(
+            f"knowledge KB-loop 调用超时（{eff:.0f}s）——PG/Qdrant/embedding 后端可能挂起"
+        ) from None
 
 
 async def get_retriever() -> SwarmRetriever:
@@ -105,15 +149,29 @@ async def get_retriever() -> SwarmRetriever:
         _retriever_async_lock = asyncio.Lock()  # 在 _kb_loop 首次运行时创建，归属该 loop
     async with _retriever_async_lock:
         if _retriever is None:
-            _retriever = SwarmRetriever()
-            await _retriever.connect_all()
-            if _retriever._semantic:
-                from swarm.project.preprocess import _embed_texts
+            # D15：①connect_all 有界（wait_for；各 PG 直连另有 connect_timeout 兜底）——后端
+            # 挂起时锁内不再无限持锁，超时异常沿 async with 正常释放锁，后续检索不排队死等；
+            # ②先连成功再发布单例（旧实现先赋值 _retriever 再 connect，半初始化对象会被后续
+            # 调用当已就绪复用）；失败回收半连接组件并保持 _retriever=None，下次调用重试。
+            candidate = SwarmRetriever()
+            try:
+                await asyncio.wait_for(
+                    candidate.connect_all(), timeout=_kb_connect_all_timeout_sec()
+                )
+                if candidate._semantic:
+                    from swarm.project.preprocess import _embed_texts
 
-                async def _shared_embed(texts: list[str]) -> list[list[float]]:
-                    return await asyncio.to_thread(_embed_texts, texts)
+                    async def _shared_embed(texts: list[str]) -> list[list[float]]:
+                        return await asyncio.to_thread(_embed_texts, texts)
 
-                _retriever._semantic.set_embed_fn(_shared_embed)
+                    candidate._semantic.set_embed_fn(_shared_embed)
+                _retriever = candidate
+            except BaseException:
+                try:
+                    await asyncio.wait_for(candidate.close_all(), timeout=5)
+                except BaseException:  # noqa: BLE001 —— 回收尽力而为，绝不吞主异常
+                    pass
+                raise
         return _retriever
 
 

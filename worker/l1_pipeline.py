@@ -245,6 +245,88 @@ def _choose_valid_version(bad: str, available: list[str]) -> str | None:
     return pick if pick != bad else None
 
 
+# ── D32 治本：版本校正只允许发生在【声明目标 artifactId 的 <dependency> 块】内 ──
+# 旧实现对"含该版本字符串的任何 pom"的所有含 version 字样的行做 `s#>bad<#>good<#g` 全局串
+# 替换——模型给第三方依赖顺手写了项目自身版本号时，根/模块 pom 的 project/parent <version>
+# 会被连坐改成第三方版本 → reactor 内部依赖解析崩，且损坏经 repaired_file_paths 持久化。
+# 现改为纯函数块级重写：<dependency>…</dependency>（含 dependencyManagement 内嵌套的同名块）
+# 且声明该 artifactId 的块内的字面 <version> 才改；版本经 ${prop} 属性引用 → 返回属性名由调
+# 用方去【属性定义标签】处校正（仅该标签）；Maven 保留属性（project.*/parent.*/revision 等
+# =项目自身版本）绝不校正（fail-closed）。
+_DEP_BLOCK_RE = re.compile(r"<dependency>.*?</dependency>", re.DOTALL)
+_DEP_VERSION_PROP_RE = re.compile(r"<version>\s*\$\{([^}]+)\}\s*</version>")
+# CI-friendly versions（revision/sha1/changelist）与 project.*/parent.*/pom.* 都指向项目自身
+# 版本坐标——校正它们等于改项目版本，属 D32 要杜绝的越界。
+_MAVEN_RESERVED_PROP_PREFIXES = ("project.", "parent.", "pom.")
+_MAVEN_RESERVED_PROPS = frozenset({"revision", "sha1", "changelist", "version"})
+
+
+def _is_reserved_maven_property(prop: str) -> bool:
+    p = (prop or "").strip()
+    return p.startswith(_MAVEN_RESERVED_PROP_PREFIXES) or p in _MAVEN_RESERVED_PROPS
+
+
+def rewrite_dependency_version(
+    pom_text: str, artifact: str, bad_ver: str, good_ver: str
+) -> tuple[str, list[str]]:
+    """在 pom 文本内做【块级】版本校正（纯函数，可单测）。
+
+    只有声明 `artifact` 的 <dependency> 块内的字面 <version>bad</version> 被改成 good；
+    project/parent/其它依赖的 version 标签一个字符不动。块内版本写作 ${prop} → 不改块本身，
+    把属性名收进返回值交调用方去属性定义处校正；保留属性（项目自身版本）不返回。
+    返回 (新文本, 需要在属性定义处校正的属性名列表)。
+    """
+    props: list[str] = []
+    art_re = re.compile(r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>")
+    ver_re = re.compile(r"(<version>\s*)" + re.escape(bad_ver) + r"(\s*</version>)")
+
+    def _sub(m: re.Match) -> str:
+        block = m.group(0)
+        if not art_re.search(block):
+            return block
+        pm = _DEP_VERSION_PROP_RE.search(block)
+        if pm:
+            prop = pm.group(1).strip()
+            if _is_reserved_maven_property(prop):
+                # ${project.version}/${revision} 等 = 项目自身版本，绝不校正（fail-closed）
+                logger.warning(
+                    "[L1.2.1·version-repair] 依赖 %s 的版本引用 Maven 保留属性 ${%s}"
+                    "（项目自身版本坐标）→ 拒绝校正，交上层防线处理", artifact, prop,
+                )
+            else:
+                props.append(prop)
+            return block
+        return ver_re.sub(lambda vm: vm.group(1) + good_ver + vm.group(2), block)
+
+    return _DEP_BLOCK_RE.sub(_sub, pom_text), props
+
+
+def rewrite_property_version(pom_text: str, prop: str, bad_ver: str, good_ver: str) -> str:
+    """把 <prop>bad</prop> 属性定义校正为 good——只碰这个属性标签（纯函数，可单测）。"""
+    tag = re.escape(prop)
+    pat = re.compile(rf"(<{tag}>\s*){re.escape(bad_ver)}(\s*</{tag}>)")
+    return pat.sub(lambda m: m.group(1) + good_ver + m.group(2), pom_text)
+
+
+def _read_project_file(project_path: str, rel: str, timeout: int = 20) -> str | None:
+    """读项目内文件文本（沙箱优先，与其它确定性检查同通道）。失败返回 None。"""
+    ec, out, _err = _run_check_split(f"cat {shlex.quote(rel)}", project_path, timeout=timeout)
+    return out if ec == 0 else None
+
+
+def _write_project_file(project_path: str, rel: str, content: str, timeout: int = 20) -> bool:
+    """写项目内文件文本（沙箱优先）。base64 管道传内容，杜绝 shell 转义/换行损坏。"""
+    import base64 as _b64
+    b64 = _b64.b64encode(content.encode("utf-8")).decode("ascii")
+    ec, out = _run_l1_command(
+        f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(rel)}",
+        project_path, timeout=timeout,
+    )
+    if ec != 0:
+        logger.warning("[L1.2.1·version-repair] 写回 %s 失败(ec=%s): %s", rel, ec, (out or "")[:200])
+    return ec == 0
+
+
 def _attempt_maven_version_repair(
     project_path: str, build_output: str, timeout: int
 ) -> tuple[int, list[str]]:
@@ -273,29 +355,48 @@ def _attempt_maven_version_repair(
         good_ver = _choose_valid_version(bad_ver, available)
         if not good_ver:
             continue  # 版本其实存在（别的网络问题）或查不到可用版本 → 不动，绝不误修
-        # 定位声明该 artifact 的 pom + 持有该版本号的属性 pom（可能是父 pom）
+        # D32 治本：候选只取【声明该 artifactId】的 pom；替换只发生在该 <dependency> 块内。
+        # （旧实现把"含该版本字符串的任何 pom"也列为候选并做含 version 行的全局串替换——模型
+        # 顺手写项目自身版本号时 project/parent <version> 被连坐改写，reactor 解析崩。）
         gcmd = (
-            f"grep -rl '<artifactId>{re.escape(artifact)}</artifactId>' --include=pom.xml . 2>/dev/null; "
-            f"grep -rlE '<[^>]*[Vv]ersion>{re.escape(bad_ver)}</[^>]*[Vv]ersion>' --include=pom.xml . 2>/dev/null"
+            f"grep -rl '<artifactId>{re.escape(artifact)}</artifactId>' --include=pom.xml . 2>/dev/null"
         )
         _ec, gout, _err = _run_check_split(gcmd, project_path, timeout=30)
         poms = sorted({line.strip() for line in (gout or "").splitlines() if line.strip()})
         if not poms:
             continue
-        bv = bad_ver.replace(".", r"\.")
+        prop_names: set[str] = set()
         for pom in poms:
-            # 只在含 'version' 的标签行替换 >bad<→>good<，避免误改同值的非版本标签
-            scmd = (
-                f"sed -i.bak -E '/[Vv]ersion>/ s#>{bv}<#>{good_ver}<#g' {shlex.quote(pom)} "
-                f"&& rm -f {shlex.quote(pom + '.bak')}"
-            )
-            ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
-            if ec2 == 0:
+            text = _read_project_file(project_path, pom, timeout=20)
+            if text is None:
+                logger.warning("[L1.2.1·version-repair] 读取 %s 失败，跳过该 pom（不盲改）", pom)
+                continue
+            new_text, props = rewrite_dependency_version(text, artifact, bad_ver, good_ver)
+            prop_names.update(props)
+            if new_text != text and _write_project_file(project_path, pom, new_text, timeout=20):
                 changed.add(pom)
+        # 版本经 ${prop} 属性引用 → 去【定义该属性】的 pom（常为父 pom）校正该属性标签本身。
+        # 只改这一个标签；保留属性(项目自身版本)已在 rewrite_dependency_version 内拒绝。
+        for prop in sorted(prop_names):
+            if not re.fullmatch(r"[A-Za-z0-9_.\-]+", prop):
+                logger.warning(
+                    "[L1.2.1·version-repair] 属性名 %r 含意外字符 → fail-closed 跳过", prop)
+                continue
+            pcmd = f"grep -rl '<{prop}>' --include=pom.xml . 2>/dev/null"
+            _pc, pout, _pe = _run_check_split(pcmd, project_path, timeout=30)
+            for ppom in sorted({ln.strip() for ln in (pout or "").splitlines() if ln.strip()}):
+                text = _read_project_file(project_path, ppom, timeout=20)
+                if text is None:
+                    continue
+                new_text = rewrite_property_version(text, prop, bad_ver, good_ver)
+                if new_text != text and _write_project_file(project_path, ppom, new_text, timeout=20):
+                    changed.add(ppom)
         logger.info(
-            "[L1.2.1·version-repair] %s:%s 版本 %s 不存在（仓库可用最高=%s）→ 校正为 %s（%d pom）",
+            "[L1.2.1·version-repair] %s:%s 版本 %s 不存在（仓库可用最高=%s）→ 校正为 %s"
+            "（声明 pom %d 个，属性引用 %s，仅依赖块/属性定义标签，项目自身版本不碰）",
             group, artifact, bad_ver,
             max(available, key=_ver_key) if available else "?", good_ver, len(poms),
+            sorted(prop_names) or "-",
         )
     # ── ② 缺 <version> 元素 → 注入有效版本 ──
     for group, artifact in missing_versions[:8]:
@@ -1256,6 +1357,8 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
         stats = manager.sync_files_to_sandbox(sandbox, project_path, rels, remote)
         uploaded = int((stats or {}).get("uploaded", 0))
         if uploaded:
+            # D57：沙箱清单集变化（本函数是 L1 中途唯一新增清单的路径）→ 失效在场性缓存
+            _invalidate_manifest_cache()
             logger.info(
                 "[L1.2.1·module-reg] 已把 reconcile 注册的聚合清单推进沙箱 %d 个"
                 "（令 -pl 当场可解析，杜绝 reactor not-found）: %s", uploaded, rels,
@@ -1347,15 +1450,34 @@ def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[i
     return result
 
 
+# D57：manifest 在场性【单次 L1 run 内】缓存——单次 run_l1_pipeline 会对多组 manifest
+# 做 5-8 趟沙箱 find（每趟一次远端往返）。代号（generation）在 run_l1_pipeline 入口与
+# _push_manifests_to_sandbox（唯一会在 L1 中途新增沙箱清单的路径）处自增失效；探测异常
+# 不缓存（保持旧的保守 False 且下次重探）。本地路径 os.path.isfile 极廉，不缓存。
+_MANIFEST_CACHE_GEN = 0
+_MANIFEST_PRESENT_CACHE: dict[tuple, bool] = {}
+
+
+def _invalidate_manifest_cache() -> None:
+    global _MANIFEST_CACHE_GEN
+    _MANIFEST_CACHE_GEN += 1
+    _MANIFEST_PRESENT_CACHE.clear()
+
+
 def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     """工程 manifest(go.mod/Cargo.toml/package.json…)是否存在，沙箱优先。
 
     沙箱模式下本地只有可写文件，manifest 多半不在本地——旧的 os.path.isfile(本地)
     会误判"无 manifest 而跳过 lint"。沙箱里在远程工作目录(深度 3 内)查。
+    D57：同一次 L1 run 内同 (sandbox, manifests) 探测结果缓存（见 _invalidate_manifest_cache）。
     """
     ctx = _sandbox_ctx()
     if ctx is not None:
         sandbox, manager, remote = ctx
+        _key = (_MANIFEST_CACHE_GEN, getattr(sandbox, "sandbox_id", id(sandbox)), tuple(manifests))
+        cached = _MANIFEST_PRESENT_CACHE.get(_key)
+        if cached is not None:
+            return cached
         names = " -o ".join(f"-name {shlex.quote(m)}" for m in manifests)
         try:
             cr = manager.run_command(
@@ -1363,9 +1485,11 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
                 f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",
                 timeout=20,
             )
-            return bool((cr.stdout or "").strip())
+            present = bool((cr.stdout or "").strip())
+            _MANIFEST_PRESENT_CACHE[_key] = present
+            return present
         except Exception:  # noqa: BLE001
-            return False
+            return False  # 异常不缓存：保守 False 且下次重探（与旧行为一致）
     return any(os.path.isfile(os.path.join(project_path, m)) for m in manifests)
 
 
@@ -1869,7 +1993,23 @@ def _lint_go(project_path: str, go_files: list[str], *, timeout: int = 60) -> tu
 
 def _lint_rust(project_path: str, rs_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
     """Rust: cargo clippy -- -D warnings（clippy 把 warning 当 error）。"""
+    # D33：clippy 人类输出是多行体——"error: …" 行不带路径，定位在后续 "--> src/x.rs:5:9"
+    # 行。不回填 file 则 Rust 的 lint 归属判定永远无路可依（整树 clippy 的兄弟/存量问题
+    # 无法与本子任务区分）。闭包保存最近一条 issue 引用，遇 --> 行就地回填。
+    _last: list[dict | None] = [None]
+    _arrow_re = re.compile(r"^-+>\s*([^\s:]+):(\d+)")
+
     def _parse(line: str) -> dict | None:
+        am = _arrow_re.match(line)
+        if am:
+            last = _last[0]
+            if last is not None and not last.get("file"):
+                last["file"] = am.group(1)
+                try:
+                    last["line"] = int(am.group(2))
+                except ValueError:
+                    pass
+            return None
         # 跳过摘要行
         if line.startswith("warning: generated") or line.startswith("error: aborting"):
             return None
@@ -1889,6 +2029,7 @@ def _lint_rust(project_path: str, rs_files: list[str], *, timeout: int = 60) -> 
                         break
                     except ValueError:
                         continue
+            _last[0] = entry
             return entry
         return None
 
@@ -1998,6 +2139,54 @@ def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tu
 
     summary = "; ".join(messages) if messages else "lint ok"
     return has_error, summary, issues
+
+
+# ── D33 治本：lint error 归属划分（跨栈统一，不做五份复制粘贴）──
+# go vet ./... / cargo clippy 是【整树】检查：沙箱树里任何兄弟子任务的坏代码、基线存量
+# warning（clippy -D warnings 下几乎必有）都会让本子任务 lint 硬 FAIL → capability 误判换
+# 模型 / Rust 项目所有子任务永久 lint 死锁。build 闸门早有 upstream/internal 归属阶梯，
+# lint 一条没有。这里对齐：各栈 linter 产出的 issue 统一带 file 字段（ruff/eslint/checkstyle
+# 按传入文件、go vet 按 file:line 前缀、clippy 按 --> 定位行回填），闸门只对【归属本子任务
+# 改动文件】的 error 硬阻断；scope 外（兄弟/存量）与无法归属（配置错/输出异常）的降级为
+# 告警记录——可观测、绝不静默丢，也绝不连坐。
+
+def _normalize_lint_path(p: str, project_path: str) -> str:
+    """归一 lint issue 的文件路径：去本地项目前缀 / ./ 前缀 / 反斜杠，便于跨栈比对。"""
+    q = (p or "").strip().replace("\\", "/")
+    if not q:
+        return ""
+    pp = (project_path or "").rstrip("/")
+    if pp and q.startswith(pp + "/"):
+        q = q[len(pp) + 1:]
+    while q.startswith("./"):
+        q = q[2:]
+    return q
+
+
+def _split_lint_errors_by_scope(
+    error_issues: list[dict], modified: list[str], project_path: str
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """把 lint error 按归属划成 (scope 内, scope 外, 无法归属)。
+
+    匹配语义：归一后相等，或一侧是另一侧的【路径后缀】（容忍 eslint 吐绝对路径/沙箱
+    远程前缀、以及子目录内跑的 linter 吐相对模块路径）。歧义偏向 scope 内（fail-closed：
+    宁可阻断自己也不放走真错误）。
+    """
+    mods = {m for m in (_normalize_lint_path(m, project_path) for m in (modified or [])) if m}
+    in_scope: list[dict] = []
+    out_scope: list[dict] = []
+    unattributed: list[dict] = []
+    for it in error_issues:
+        f = _normalize_lint_path(str(it.get("file") or ""), project_path)
+        if not f:
+            unattributed.append(it)
+            continue
+        hit = any(
+            f == m or f.endswith("/" + m) or m.endswith("/" + f)
+            for m in mods
+        )
+        (in_scope if hit else out_scope).append(it)
+    return in_scope, out_scope, unattributed
 
 
 # ── L1.4 LLM 自检阶段 ──
@@ -2376,6 +2565,10 @@ def run_l1_pipeline(
     """
     details: dict[str, Any] = {"pipeline": "L1.1-L1.4"}
 
+    # D57：新一次 L1 run = 新一代 manifest 在场性缓存（run 内 5-8 趟沙箱 find 收敛为
+    # 每组 manifests 至多一趟；跨 run 不留 stale）。
+    _invalidate_manifest_cache()
+
     # ── L1.1 scope 检查 ──
     violations = _scope_violations(diff, subtask.scope, extra_allowed=extra_writable_paths)
     details["l1_1_scope_ok"] = not violations
@@ -2681,9 +2874,37 @@ def run_l1_pipeline(
             error_issues = [i for i in lint_issues if i.get("severity") == "error"]
             details["lint"]["error_issues"] = error_issues
             if gate_enabled:
-                details["lint"]["note"] = "lint 语法级 error 硬阻断流水线"
-                details["lint"]["gated"] = True
-                return False, details
+                # D33 治本：整树 lint(go vet/clippy)会把兄弟子任务/基线存量问题算到本子任务
+                # 头上。按归属划分：只有 error 落在本子任务改动文件上才硬阻断；scope 外与
+                # 无法归属的（配置错/工具输出异常）降级为告警——可观测，绝不静默丢、绝不连坐。
+                in_scope, out_scope, unattributed = _split_lint_errors_by_scope(
+                    error_issues, modified, project_path)
+                details["lint"]["error_issues_in_scope"] = in_scope
+                details["lint"]["error_issues_out_of_scope"] = out_scope
+                details["lint"]["error_issues_unattributed"] = unattributed
+                if in_scope:
+                    details["lint"]["note"] = "lint 语法级 error(归属本子任务改动文件)硬阻断流水线"
+                    details["lint"]["gated"] = True
+                    if out_scope or unattributed:
+                        logger.warning(
+                            "[L1.2.5] lint 阻断之外另有 scope 外 error %d 条 / 无法归属 %d 条"
+                            "（兄弟/存量/配置问题，不计入本子任务）",
+                            len(out_scope), len(unattributed),
+                        )
+                    return False, details
+                details["lint"]["gated"] = False
+                details["lint"]["note"] = (
+                    "lint error 均不归属本子任务改动文件(兄弟/存量/无法归属) → 降级告警不阻断(D33)"
+                )
+                logger.warning(
+                    "[L1.2.5] lint error %d 条均在本子任务改动文件之外"
+                    "(scope 外=%d, 无法归属=%d) → 不连坐阻断，降级告警。样例: %s",
+                    len(error_issues), len(out_scope), len(unattributed),
+                    [
+                        f"{i.get('file') or '?'}: {str(i.get('message') or '')[:80]}"
+                        for i in (out_scope + unattributed)[:3]
+                    ],
+                )
             else:
                 details["lint"]["note"] = "lint error 仅作警告（SWARM_WORKER_L1_LINT_GATE=false）"
                 details["lint"]["gated"] = False

@@ -102,11 +102,15 @@ def test_completed_subtasks_salvaged_as_partial():
     assert calls["status"] == "PARTIAL"
     steps = [e.get("step") for e in events]
     assert "complete" in steps, steps
-    assert "result" in steps, steps
     # partial 事件须点明因预算中止 + 抢救数
     partial_evt = next(e for e in events if e.get("step") == "complete")
     assert partial_evt.get("status") == "partial"
     assert "token" in partial_evt.get("message", "").lower() or "预算" in partial_evt.get("message", "")
+    # D18（P1-11）：独立 step:"result" 是死协议（订阅端 complete 即 break 收不到）——
+    # 终态载荷改并入 complete 事件，此处钉新语义。
+    assert "result" not in steps, steps
+    assert (partial_evt.get("result") or {}).get("merged_diff"), \
+        "终态载荷（merged_diff）须并入 complete 事件"
     print("  ✅ 有完成子任务→PARTIAL 抢救+结果 payload")
 
 

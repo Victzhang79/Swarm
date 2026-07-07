@@ -568,6 +568,68 @@ def _diff_has_changes(diff: str) -> bool:
     )
 
 
+def _diff_has_deletions(diff: str) -> bool:
+    """diff 是否表达【删除】——纯删除子任务的产出形态。
+
+    删除补丁只有 `-` 内容行（不含 `---` 文件头）与 `+++ /dev/null` 哨兵，无 `+` 内容行，
+    故 `_diff_has_changes` 恒 False。这里以删除侧信号判定"确有删除产物"。栈/后缀无关。
+    """
+    for line in (diff or "").splitlines():
+        if line.strip() == "+++ /dev/null":
+            return True
+        if line.startswith("-") and not line.startswith("---"):
+            return True
+    return False
+
+
+def _is_pure_delete_scope(scope) -> bool:
+    """子任务 scope 是否【纯删除】：只声明 delete_files，无 writable/create_files/allow_any。
+
+    纯删除子任务的合法产出是"删除段"（无 `+` 行）。据 scope 意图判定，绝不硬编码语言/后缀/项目。
+    """
+    if scope is None:
+        return False
+    return (
+        bool(getattr(scope, "delete_files", None))
+        and not getattr(scope, "writable", None)
+        and not getattr(scope, "create_files", None)
+        and not getattr(scope, "allow_any", False)
+    )
+
+
+def _subtask_produced_expected(worker_output, subtask) -> bool:
+    """子任务是否产出了【该 intent/scope 下预期的变更形态】——dispatch 成功判据的一半。
+
+    治本 D01：旧判据 `_diff_has_changes`（只认 `+` 行）对两类合法产出结构性误判失败——
+      · AUDIT 意图：产结构化审计报告而非 diff，空 diff 合法（交付有效性由 l1_passed 表达）；
+      · 纯删除子任务：diff 只有 `-` 行 + `+++ /dev/null`，无 `+` 行。
+    这里按【预期变更类型】而非"存在 + 行"判定。栈/后缀/项目无关，fail-closed：
+    非 AUDIT、非纯删除的普通子任务仍要求有真实 `+` 变更（空产出=失败）。
+
+    注：本函数只回答"形态是否符合预期"，是否通过质量闸门仍由调用侧的 l1_passed 独立把关。
+    """
+    from swarm.types import TaskIntent
+    if getattr(subtask, "intent", None) == TaskIntent.AUDIT:
+        # AUDIT 不产 diff；空 diff 是预期形态，有效性交由 l1_passed（should_block 反转）判定
+        return True
+    scope = getattr(subtask, "scope", None)
+    diff = getattr(worker_output, "diff", None) or ""
+    if _is_pure_delete_scope(scope):
+        # 纯删除：删除段即有效产出；若同时含新增行（罕见）也算有产出
+        return _diff_has_deletions(diff) or _diff_has_changes(diff)
+    return _diff_has_changes(diff)
+
+
+def completed_l1_ids(subtask_results: dict) -> set:
+    """L1 通过的已完成子任务 ID 集——依赖闸门的单一事实源（治本 D23）。
+
+    旧口径 `set(subtask_results.keys())` 把【L1 未通过的滞留失败结果】也当"已完成"，下游据此
+    误判依赖满足而提前派发（上游从未真正成功）→ BLOCKED/编译失败空烧。这里只计 l1_passed 为真者，
+    消费 WorkerOutput.l1_passed 单一事实源（见本模块 l1_passed()）。
+    """
+    return {sid for sid, out in (subtask_results or {}).items() if l1_passed(out)}
+
+
 def _is_test_file_path(p: str) -> bool:
     """判定是否测试文件路径（跨语言：java/py/js/ts/go）。"""
     pl = str(p or "").replace("\\", "/").lower()
