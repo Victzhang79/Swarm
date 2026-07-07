@@ -202,20 +202,43 @@ def _new_side_lines(hunks: list[_Hunk]) -> list[str]:
     """取所有 hunk 的【新侧】内容(context+addition，丢弃 deletion / @@ 头 / split 空产物 / marker)，
     每行前缀 `+`。用于新文件重建（纯新增 hunk）与新文件多写者去重比对。"""
     out: list[str] = []
+    dropped_del = 0
     for hunk in sorted(hunks, key=lambda h: h.old_start):
         for raw in hunk.lines[1:]:              # 跳过 [0] 的 @@ 头
             if raw == "" or raw.startswith("\\"):  # split 尾部产物 "" / `\ No newline` 标记
                 continue
             tag, content = raw[0], raw[1:]
             if tag == "-":                       # deletion 在新文件里无意义，丢弃
+                dropped_del += 1
                 continue
             out.append("+" + content)            # addition 原样；context 转新增（新文件里也是内容）
+    if dropped_del:
+        # 降级可观测（round29 双复核）：头声明纯新建却带 deletion 行=自相矛盾的 hunk（worker 幻觉/
+        # 上游解析边角），内容被丢必须留痕，不得静默蒸发。
+        logger.warning(
+            "[MERGE] 新文件重建丢弃 %d 行 deletion（-0,0 纯新建 hunk 不应含 `-` 行，子任务 %s）",
+            dropped_del, sorted({h.subtask_id for h in hunks}),
+        )
     return out
 
 
 def _format_file_patch(
-    file_path: str, header_lines: list[str], hunks: list[_Hunk], is_new: bool = False
+    file_path: str, header_lines: list[str], hunks: list[_Hunk], is_new: bool = False,
+    base_known: bool = False,
 ) -> str:
+    # round29 B：creation 形状（全部 hunk `@@ -0,0`=纯新建）却被判 modify → 提升为纯新建补丁。
+    # ★只在 base_known=False（调用方无 base_reader、保守判 modify）时触发★：旧裸传统格式靠 git
+    # 对 `-0,0` 的创建启发式侥幸通过，补 `diff --git` 头后需 `new file mode` 语义才对。若调用方有
+    # 权威 base 判定（base_known=True）说文件【已存在】（如 base 里的空文件被填充，`-0,0` 是
+    # "旧侧空"的合法 modify 形状），绝不能提升——`new file mode` 打已存在文件必报 already exists
+    # （双复核 Finding 1 实证回归；git 对带 `diff --git` 头的 `-0,0` modify 本就能干净 apply）。
+    if (not is_new and not base_known and hunks
+            and all(h.old_start == 0 and h.old_count == 0 for h in hunks)):
+        logger.warning(
+            "[MERGE] %s 无 base 权威判定且全 hunk 为 -0,0 创建形状 → 按新建补丁输出（子任务 %s）",
+            file_path, sorted({h.subtask_id for h in hunks}),
+        )
+        is_new = True
     if is_new:
         # 新文件（merge base 无此文件，由调用方据 base_reader 权威判定）：必须输出【纯新建补丁】，
         # git apply 据 `--- /dev/null` + `@@ -0,0 +1,N @@` 识别为创建。round17 根因②：新模块 pom 的头
@@ -243,6 +266,12 @@ def _format_file_patch(
             header[1] = f"+++ b/{file_path}"
     else:
         header = [f"--- a/{file_path}", f"+++ b/{file_path}"]
+    # round29 B 治本：modify 段也必须带 `diff --git` 头（不带 new file mode，那是新建专属）。
+    # merged_diff 混排【git 格式 new-file 段 + 裸传统 modify 段】时，git 进入 git 格式解析模式后
+    # 无法为裸块建立文件上下文 → desync 消费到 EOF →「corrupt patch」（task d37a52a3：77 头 79 段，
+    # 报第 9208 行=EOF 损坏）。不变量：每个文件段自带 diff --git 头，头数==段数。
+    if not header or not header[0].startswith("diff --git "):
+        header.insert(0, f"diff --git a/{file_path} b/{file_path}")
 
     # ── 逐 hunk 规范化 body + 【重算 @@ 头行数】（task 3adfeca5/f20ea68d + 996db614 merge 损坏）──
     # 关键治本：规范化（丢尾部 split 产物 "" / 中间空行 "" 还原为 " "）会改变 hunk body 行数，
@@ -272,7 +301,11 @@ def _format_conflict_hunks(file_path: str, hunks: list[_Hunk], is_new: bool = Fa
     # 入口对称（防同类 sibling bug）：新文件冲突也用 /dev/null 头。冲突块含 <<<<< 标记本就不可
     # apply（交人工/rebase），此处仅保持头一致，不改变冲突语义。
     _minus = "--- /dev/null" if is_new else f"--- a/{file_path}"
+    # round29 B（复核 MEDIUM）：冲突段同样带 `diff --git` 头，让「头数==段数」不变量无条件成立——
+    # 否则混排时 split_diff_by_file 的 git-头边界启发式会把无头冲突段粘连进前一文件段。
+    # 头不改变冲突语义（<<<<<<< 标记仍使其不可 apply，照旧交人工/rebase）。
     parts = [
+        f"diff --git a/{file_path} b/{file_path}",  # 段首（边界启发式按此切段，注释行不得在其前）
         f"# ═══ MERGE CONFLICT: {file_path} (subtasks: {', '.join(subtask_ids)}) ═══",
         _minus,
         f"+++ b/{file_path}",
@@ -665,7 +698,11 @@ def _lines_to_unified_diff(file_path: str, base: str, merged: str) -> str:
     # 逐元素规范化：hunk头/文件头(lineterm="" 故无换行)补\n；内容行(keepends 已含\n)不动 → 无行尾翻倍。
     block = "".join(x if x.endswith("\n") else x + "\n" for x in ud)
     block = block.rstrip("\n")
-    return block if block.strip() else ""
+    if not block.strip():
+        return ""
+    # round29 B 治本：union/3-way 消解出的 modify 段同样必须带 `diff --git` 头（同 _format_file_patch
+    # 非新建分支），否则混排进 git 格式 new-file 段之间会使 git 解析 desync（见该处注释）。
+    return f"diff --git a/{file_path} b/{file_path}\n{block}"
 
 
 def _aggregate_merge_duplicated_singleton(
@@ -854,7 +891,8 @@ def merge_diffs(
             else:
                 chosen_hunks = hunks
             merged_parts.append(
-                _format_file_patch(file_path, headers.get(file_path, []), chosen_hunks, is_new=True)
+                _format_file_patch(file_path, headers.get(file_path, []), chosen_hunks, is_new=True,
+                                   base_known=base_reader is not None)
             )
             continue
 
@@ -913,7 +951,8 @@ def merge_diffs(
                 # 合并: base 方冲突 hunk + 非冲突 hunk
                 kept_hunks = non_conflicting + base_conflict_hunks
                 merged_parts.append(
-                    _format_file_patch(file_path, headers.get(file_path, []), kept_hunks, is_new_file)
+                    _format_file_patch(file_path, headers.get(file_path, []), kept_hunks, is_new_file,
+                                       base_known=base_reader is not None)
                 )
                 # 记录 rebase 子任务
                 rebase_subtask_ids_all.extend(rebase_sids)
@@ -940,11 +979,13 @@ def merge_diffs(
             non_conflicting = [h for i, h in enumerate(hunks) if i not in conflicting]
             if non_conflicting:
                 merged_parts.append(
-                    _format_file_patch(file_path, headers.get(file_path, []), non_conflicting, is_new_file)
+                    _format_file_patch(file_path, headers.get(file_path, []), non_conflicting, is_new_file,
+                                       base_known=base_reader is not None)
                 )
         else:
             merged_parts.append(
-                _format_file_patch(file_path, headers.get(file_path, []), hunks, is_new_file)
+                _format_file_patch(file_path, headers.get(file_path, []), hunks, is_new_file,
+                                       base_known=base_reader is not None)
             )
 
     merged_diff = "\n\n".join(p for p in merged_parts if p.strip())
