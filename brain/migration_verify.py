@@ -30,14 +30,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # 复用勿复制：backend 画像解析/配置键读取的单一权威在 smoke_derive（S1-2 纯函数层）
-from brain.smoke_derive import (
+from swarm.brain.smoke_derive import (
     _env_lookup,
     _properties_lookup,
     _read,
     _split_backend,
     _yaml_lookup,
 )
-from brain.stack_detect import _NOISE_DIRS
+from swarm.brain.stack_detect import _NOISE_DIRS
 
 logger = logging.getLogger(__name__)
 

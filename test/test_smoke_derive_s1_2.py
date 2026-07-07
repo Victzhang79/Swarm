@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from brain.smoke_derive import (
+from swarm.brain.smoke_derive import (
     SmokeDerivation,
     derive_runtime_smoke,
     detect_migration_kind,

@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # 复用勿复制：栈清单/框架 marker 的单一权威在 stack_detect（设计文档 §5.1 点名可 import）
-from brain.stack_detect import _BACKEND_FRAMEWORK_MARKERS, _MANIFEST_BACKEND, _NOISE_DIRS
+from swarm.brain.stack_detect import _BACKEND_FRAMEWORK_MARKERS, _MANIFEST_BACKEND, _NOISE_DIRS
 
 # ══════════════════════════════ 数据表（唯一允许含栈词汇的地方）══════════════════════════════
 
