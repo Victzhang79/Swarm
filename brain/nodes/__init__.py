@@ -1236,6 +1236,10 @@ def confirm_plan(state: BrainState) -> dict:
                 _vf = "tech_design_incomplete"
             elif reason.startswith("plan_generation_failed"):
                 _vf = "plan_generation_failed"  # TD2606-A5
+            elif reason.startswith("plan_batch_failed"):
+                # round29 真因4 归因补漏：PLAN-BATCH 丢模块≠计划非法——误标 plan_invalid 会
+                # 污染 L5 错题归因（与 tech_design_incomplete 单列同理）。
+                _vf = "plan_batch_failed"
             else:
                 _vf = "plan_invalid"
             _patch = {
@@ -1243,9 +1247,9 @@ def confirm_plan(state: BrainState) -> dict:
                 "confirm_reason": _reason,
                 "verification_failure": _vf,
             }
-            # tech_design 残缺 / 规划生成失败 → 升级人工(escalate)，与"计划非法"一样 fail-fast
-            # 但归因区分，绝不静默成功。
-            if _vf in ("tech_design_incomplete", "plan_generation_failed"):
+            # tech_design 残缺 / 规划生成失败 / PLAN-BATCH 丢模块 → 升级人工(escalate)，
+            # 与"计划非法"一样 fail-fast 但归因区分，绝不静默成功。
+            if _vf in ("tech_design_incomplete", "plan_generation_failed", "plan_batch_failed"):
                 _patch["failure_escalated"] = True
                 _patch["failure_strategy"] = "escalate"
             return _patch

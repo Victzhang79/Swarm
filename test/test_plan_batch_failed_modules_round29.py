@@ -171,6 +171,26 @@ def test_gate_rejects_plan_batch_failed_modules():
     assert "plan_batch" in reason or "分解失败" in reason, reason
 
 
+# ═════════ 2b. CONFIRM 归因（复盘补漏）：auto_accept 撞闸门 → fail-fast REJECT +
+# verification_failure="plan_batch_failed"（专类归因，不得误标 plan_invalid 污染 L5）═════════
+def test_confirm_auto_accept_rejects_with_dedicated_attribution():
+    from swarm.brain.nodes import confirm_plan
+    from swarm.brain.state import Complexity, HumanDecision
+
+    state = {
+        "auto_accept": True,
+        "plan_valid": True,
+        "complexity": Complexity.ULTRA,
+        "plan_batch_failed_modules": [{"name": "system-enhance", "files": 14, "reason": "timeout"}],
+    }
+    out = confirm_plan(state)
+    assert out["human_decision"] == HumanDecision.REJECT, "丢模块计划绝不能 auto-ACCEPT"
+    assert out.get("verification_failure") == "plan_batch_failed", (
+        f"须专类归因（非 plan_invalid），实际 {out.get('verification_failure')}"
+    )
+    assert out.get("failure_escalated") is True, "须升级人工（与 tech_design_incomplete 同格）"
+
+
 # ═════════ 3. BrainState 声明（防 LangGraph 未声明键静默丢）═════════
 def test_brainstate_declares_plan_batch_failed_modules():
     from swarm.brain.state import BrainState
