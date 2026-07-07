@@ -139,7 +139,10 @@ def test_maven_parent_pom_owner_backstop(tmp_path):
     assert owners == ["st-1"], f"应指派单一 owner(首个建模块 pom 的子任务), 实际 {owners}"
     ac = " ".join(plan.subtasks[0].acceptance_criteria or [])
     assert "alarm-app" in ac and "alarm-api" in ac, f"owner 应登记全部新模块: {ac}"
-    assert "st-1" in (plan.subtasks[1].depends_on or []), "另一模块子任务依赖 owner"
+    # round29 A(c) 方向反正：st-2 是【脚手架】(建 alarm-api/pom.xml)，规范不变量=「注册后于
+    # 脚手架」→ owner(注册者 st-1) 依赖 st-2，而非旧的 st-2 依赖 owner（注册先行=级联根因）。
+    assert "st-2" in (plan.subtasks[0].depends_on or []), "owner(注册者)应依赖 scaffold"
+    assert "st-1" not in (plan.subtasks[1].depends_on or []), "不得留反向(注册先行)边"
 
 
 # ── 8. backstop 不动既有 owner：已有人 own 根 pom 时不重复指派 ──

@@ -240,11 +240,15 @@ def test_run18_fix_preserves_fix_dep_duties():
     _elaborate_passes(p, fix_dep_first=True, aggregate_root_pom=True)
     st16 = next(s for s in p.subtasks if s.id == "st-16")
     assert "st-9" in (st16.depends_on or []), f"SQL 应仍依赖实体 st-9，实得 {st16.depends_on}"
-    # st-24(脚手架B)写根 pom → D1 demote：写权移除、转 readable、依赖 owner st-1（注册由 reconcile 兜底）
+    # st-24(脚手架B)写根 pom → D1 demote：写权移除、转 readable（注册由 reconcile 兜底）
     st24 = next(s for s in p.subtasks if s.id == "st-24")
     assert "pom.xml" not in (st24.scope.writable or []), "脚手架B 根 pom 写权应 demote(收敛唯一 owner)"
     assert "pom.xml" in (st24.scope.readable or []), "脚手架B 应转 readable"
-    assert "st-1" in (st24.depends_on or []), "脚手架B 应依赖 owner st-1"
+    # round29 A(c) 方向反正：规范不变量=「注册后于脚手架」——owner(注册者 st-1) 依赖脚手架B
+    # (st-24)，旧反向边（脚手架依赖 owner=注册先行）正是 Child-module-does-not-exist 级联根因。
+    st1 = next(s for s in p.subtasks if s.id == "st-1")
+    assert "st-24" in (st1.depends_on or []), f"owner(注册者)应依赖脚手架B，实得 {st1.depends_on}"
+    assert "st-1" not in (st24.depends_on or []), "不得留反向(注册先行)边"
 
 
 def _mk_diff(sid, *, create=None, writable=None, difficulty=SubTaskDifficulty.TRIVIAL):

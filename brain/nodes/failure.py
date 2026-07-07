@@ -33,7 +33,10 @@ from swarm.brain.nodes.recovery import (
     _blocked_pkg_unrecoverable,
     _det_of,
     _is_missing_dependency_failure,
+    _module_order_violation_modules,
     _producers_of,
+    _root_manifest_registrants,
+    _scaffold_subtask_of_module,
 )
 from swarm.brain.nodes.planning_core import (
     _give_up_preserve_build,
@@ -430,6 +433,79 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             logger.info(
                 "[HANDLE_FAILURE] 缺依赖失败但推不出可补的模块 pom（失败子任务无模块路径）→ 落常规 %s",
                 strategy,
+            )
+
+    # ── round29 A(b)：模块「注册先于脚手架」依赖序定点重排（先于 replan 守卫拦截）──
+    # worker 分类器坐实症状（清单注册的模块在树里不存在=plan 期边连反的确定性后果），重试/换模型/
+    # replan 都治不了。定点插「registrant-after-scaffold」规范边（planning_core 删反向直边+传递防环）
+    # + 只重派失败子任务、保成功兄弟、重置徒劳重试计数；targeted_recovery_count 断路器（与 A2
+    # 缺依赖阶梯共用配额）防死循环。掐断 d37a52a3 的「守卫堵死→阶梯三 revert→级联 abandon」死路。
+    _order_mods = _module_order_violation_modules(subtask_results, failed_ids)
+    if _order_mods and plan_obj is not None and failed_ids:
+        _tro = state.get("targeted_recovery_count", 0) + 1
+        _tro_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
+        if _tro > _tro_max:
+            logger.warning(
+                "[HANDLE_FAILURE] 序修复已达上限(%d 次)仍撞「注册先于脚手架」→ 落常规 %s 兜底",
+                _tro_max, strategy,
+            )
+        else:
+            from swarm.brain.nodes.planning_core import _add_dep_safe, _insert_module_order_edge
+            _edges: list[tuple[str, str]] = []
+            _unlocated: list[str] = []
+            _regs = _root_manifest_registrants(plan_obj)
+            _by_id_all = {s.id: s for s in getattr(plan_obj, "subtasks", []) or []}
+            for _mod in sorted(_order_mods):
+                _scaf = _scaffold_subtask_of_module(plan_obj, _mod)
+                if _scaf is None:
+                    _unlocated.append(_mod)  # 定位不到脚手架（模块臆造/plan 外/归一化差异）
+                    continue
+                for _reg in _regs:
+                    if _reg.id != _scaf.id and _insert_module_order_edge(plan_obj, _reg.id, _scaf.id):
+                        _edges.append((_reg.id, _scaf.id))
+                # 复核整改（reviewer#6）：失败子任务本身也补「等脚手架」边——否则 scaffold 尚未跑完时
+                # 重派会立刻再撞同一 reactor 错。_add_dep_safe 传递防环；scaffold 已完成则边天然满足。
+                for fid in failed_ids:
+                    if fid != _scaf.id and _add_dep_safe(_by_id_all, fid, _scaf.id):
+                        _edges.append((fid, _scaf.id))
+            if _unlocated:
+                # 猎人#2：定位失败=本阶梯对这些模块失效（将退回常规阶梯直至 abandon）。必须 WARNING
+                # 级留痕，运维/复盘才能第一时间看出「序修复未激活」而非普通空转。
+                logger.warning(
+                    "[HANDLE_FAILURE] 撞「注册先于脚手架」但定位不到模块 %s 的脚手架子任务"
+                    "（模块臆造/plan 外/路径归一化差异）→ 这些模块的序修复未激活，退回常规阶梯",
+                    _unlocated,
+                )
+            if _edges:
+                dispatch_remaining = list(state.get("dispatch_remaining", []))
+                for fid in failed_ids:
+                    subtask_results.pop(fid, None)
+                    if fid not in dispatch_remaining:
+                        dispatch_remaining.append(fid)
+                # 结构性序问题上的既往重试是徒劳，不计能力配额；循环边界由 targeted_recovery_count 保证。
+                _rco = dict(state.get("subtask_retry_counts", {}))
+                for fid in failed_ids:
+                    _rco[fid] = 0
+                logger.info(
+                    "[HANDLE_FAILURE] 序修复（第 %d/%d 次）：清单注册的模块 %s 在树里不存在 → 插"
+                    "「注册后于脚手架」规范边 %s + 仅重派失败子任务 %s（保留 %d 个完成态），不进 PLAN",
+                    _tro, _tro_max, sorted(_order_mods), _edges, failed_ids,
+                    len([s for s in subtask_results if s not in failed_ids]),
+                )
+                return {
+                    "plan": plan_obj,
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": dispatch_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry",
+                    "failure_escalated": False,
+                    "subtask_retry_counts": _rco,
+                    "targeted_recovery_count": _tro,
+                    "targeted_recovery": True,
+                }
+            logger.warning(
+                "[HANDLE_FAILURE] 撞「注册先于脚手架」但无一条序边可安全成立（脚手架全定位不到/"
+                "插边成环）→ 序修复未激活，落常规 %s", strategy,
             )
 
     if strategy == "replan":

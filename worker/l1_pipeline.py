@@ -2261,6 +2261,68 @@ def _build_error_files(build_output: str) -> set[str]:
     return out
 
 
+_RX_MAVEN_CHILD_MODULE = re.compile(
+    r"Child module\s+(\S+?)(?:/pom\.xml)?\s+of\s+\S+\s+does not exist", re.I)
+# 捕获整行余部（可含逗号分隔的多模块列表——`-pl dirA,dirB` 双缺时 Maven 一行列全；
+# 猎人#3：窄字符类只抓首个会静默丢其余模块）。`@` 是 Maven 错误行尾锚，先截掉。
+_RX_MAVEN_REACTOR_NOT_FOUND = re.compile(
+    r"Could not find the selected project in the reactor:?\s*([^\n@]+)", re.I)
+_RX_GRADLE_PROJECT_DIR = re.compile(r"Project directory\s+'([^']+)'\s+does not exist", re.I)
+_RX_CARGO_WS_MEMBER = re.compile(
+    r"failed to load manifest for workspace member\s+`([^`]+?)`", re.I)
+# 宽松取 directory 后首 token：go 措辞既有 "directory X does not exist" 也有
+# "directory X listed in go.work does not exist"（token 与 does-not-exist 不相邻）。
+_RX_GO_DIR_MISSING = re.compile(r"directory\s+(\S+)", re.I)
+_RX_MODULE_TOKEN = re.compile(r"[\w./:\\-]+")
+
+
+def _build_error_is_reactor_missing_module(build_output: str | None) -> set[str]:
+    """构建错是否【工作区清单注册了不存在的模块】（注册先于脚手架落地，round29 A 症状类）。
+
+    返回缺失模块的【项目相对目录】集合（空集=非此症状）。这是结构性依赖序问题（plan 期
+    registrant/scaffold 边向），非本子任务能力问题——调用方标 BLOCKED + 结构化
+    blocked_on_modules，交 brain 定点重排（failure.py 序修复阶梯）。跨栈通用、非项目写死。
+    """
+    if not build_output:
+        return set()
+    out: set[str] = set()
+
+    def _norm_add(raw: str) -> None:
+        raw = (raw or "").strip().strip(",;").rstrip("/")
+        if not raw or not _RX_MODULE_TOKEN.fullmatch(raw):
+            return
+        if ":" in raw and "/" not in raw:
+            raw = raw.split(":")[-1]          # maven 坐标 groupId:artifactId → artifactId
+        for prefix in ("/workspace/", "/repo/", "./"):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+        raw = raw.replace("\\", "/").lstrip("/")
+        for mf in ("/pom.xml", "/Cargo.toml", "/build.gradle", "/go.mod"):
+            if raw.endswith(mf):
+                raw = raw[: -len(mf)]
+        if raw and raw not in (".", ".."):
+            out.add(raw)
+
+    for m in _RX_MAVEN_CHILD_MODULE.finditer(build_output):
+        _norm_add(m.group(1))
+    for m in _RX_MAVEN_REACTOR_NOT_FOUND.finditer(build_output):
+        for item in re.split(r"[,\s]+", m.group(1)):   # 多模块列表逐个收，不丢第二个及以后
+            _norm_add(item)
+    for m in _RX_GRADLE_PROJECT_DIR.finditer(build_output):
+        _norm_add(m.group(1))
+    for m in _RX_CARGO_WS_MEMBER.finditer(build_output):
+        _norm_add(m.group(1))
+    # Go workspace：行内同现 go.work 与 does not exist 即判（顺序无关——复核#8：措辞里
+    # go.work 常在 does not exist 之前，单向 .* 正则会静默永不匹配）。
+    for line in build_output.splitlines():
+        low = line.lower()
+        if "go.work" in low and "does not exist" in low:
+            m = _RX_GO_DIR_MISSING.search(line)
+            if m:
+                _norm_add(m.group(1))
+    return out
+
+
 def _build_error_is_upstream(build_output: str, build_cmd: str,
                              modified: list[str] | None = None) -> bool:
     """构建错是否【非本子任务写的代码造成】（→ 标 BLOCKED 交 owner 修，不连坐本子任务）。
@@ -2483,6 +2545,25 @@ def run_l1_pipeline(
                     logger.warning(
                         "[L1.2.1] 构建命中 infra 瞬时故障，标 BLOCKED 转 transient 重试: %s",
                         (b_out or "")[:200],
+                    )
+                    return True, details
+                # round29 A：工作区清单注册了【树里不存在的模块】（Child module … does not exist /
+                # reactor not found）= plan 期「注册先于脚手架」依赖序连反的确定性症状，非本子任务
+                # 能力问题（重试/换模型都治不了）。标 BLOCKED + 结构化 blocked_on_modules，交 brain
+                # 定点重排（failure.py 序修复阶梯插 registrant-after-scaffold 规范边后重派）。
+                # 置于 upstream 归属判定之前：本症状特征串无歧义，且 upstream 判定可能因报错文件
+                # 全在别处而抢先吞掉它、丢失结构化模块信息。
+                _missing_mods = _build_error_is_reactor_missing_module(b_out)
+                if _missing_mods:
+                    details["l1_2_1_build_ok"] = None
+                    details["build_blocked"] = build_cmd
+                    details["pipeline_blocked"] = "module_registered_before_scaffold"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    details["blocked_on_modules"] = sorted(_missing_mods)
+                    logger.warning(
+                        "[L1.2.1] 清单注册的模块在树里不存在（注册先于脚手架，依赖序问题）→ 标 "
+                        "BLOCKED 交 brain 定点重排: %s | %s",
+                        sorted(_missing_mods), (b_out or "")[:200],
                     )
                     return True, details
                 # P0-B：错误归属——构建错若【全在本子任务模块之外的上游模块】（如 -pl ruoyi-alarm

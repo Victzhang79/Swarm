@@ -31,7 +31,10 @@ _MISSING_DEP_PATTERNS = (
 # find symbol"/"程序包…不存在"，会被 _MISSING_DEP_PATTERNS 误命中 → 错进 A2 定向恢复(补无关
 # maven 坐标 + 重置重试计数致多轮空转, round11 ~16/33 沙箱白耗)。A2 只该治【真·缺外部 jar】，
 # 故这两类一律排除。根因(缺兄弟域产物注入)由 A1 在 plan 层 readable 修复。
-_INTERNAL_BLOCKED_KINDS = ("internal_pkg_not_built", "upstream_module_broken")
+# round29 A 补第三类：module_registered_before_scaffold（清单注册的模块目录尚不存在=依赖序
+# 结构问题），同理由排除出 A2（补外部 jar 治不了；由 failure.py 序修复阶梯定点重排处理）。
+_INTERNAL_BLOCKED_KINDS = ("internal_pkg_not_built", "upstream_module_broken",
+                           "module_registered_before_scaffold")
 
 
 def _det_of(out) -> dict:
@@ -62,6 +65,69 @@ def _producers_of(plan_obj, packages, modules) -> set[str]:
             if any(("/" + pp + "/") in ("/" + fn) for pp in pkg_paths):
                 out.add(s.id)
                 break
+    return out
+
+
+# ── round29 A：模块「注册先于脚手架」依赖序症状（worker l1_pipeline 分类器发出）──
+_MODULE_ORDER_BLOCKED_KIND = "module_registered_before_scaffold"
+
+# 工作区级注册清单（模块注册落在这些文件里）。跨栈通用、非项目写死。
+_ROOT_MANIFESTS = ("pom.xml", "settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work")
+
+# 模块自身的清单文件名（脚手架子任务 = 创建 <module>/<manifest> 者）。
+_MODULE_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod",
+                     "package.json")
+_MODULE_MANIFESTS_LOWER = tuple(m.lower() for m in _MODULE_MANIFESTS)
+
+
+def _module_order_violation_modules(subtask_results: dict, failed_ids: list) -> set[str]:
+    """失败集里被 worker 标为「注册先于脚手架」的缺失模块目录并集（空集=非此症状）。"""
+    mods: set[str] = set()
+    for fid in failed_ids or []:
+        det = _det_of(subtask_results.get(fid))
+        if det.get("pipeline_blocked") == _MODULE_ORDER_BLOCKED_KIND:
+            mods.update(
+                str(m).replace("\\", "/").strip().strip("/")
+                for m in (det.get("blocked_on_modules") or []) if str(m).strip()
+            )
+    return {m for m in mods if m}
+
+
+def _scaffold_subtask_of_module(plan_obj, module: str):
+    """定位模块 <module> 的脚手架子任务（create_files 含 <module>/<清单>），无则 None。
+
+    归一化鲁棒（猎人#2 整改）：大小写不敏感 + 目录【后缀】互相匹配——worker 报的模块目录相对
+    构建 cwd（如 "crates/util"），plan 里可能带更深前缀（"backend/crates/util"），反之亦然。
+    """
+    mod = module.rstrip("/").lower()
+    if not mod:
+        return None
+    for s in getattr(plan_obj, "subtasks", []) or []:
+        scope = getattr(s, "scope", None)
+        creates = list(getattr(scope, "create_files", []) or []) if scope else []
+        for cf in creates:
+            fn = str(cf).replace("\\", "/").lstrip("./").lower()
+            if "/" not in fn:
+                continue
+            d, base = fn.rsplit("/", 1)
+            if base not in _MODULE_MANIFESTS_LOWER:   # fn 已整体 lower，清单集需同口径
+                continue
+            if d == mod or d.endswith("/" + mod) or mod.endswith("/" + d):
+                return s
+    return None
+
+
+def _root_manifest_registrants(plan_obj) -> list:
+    """定位【工作区根清单】写者（注册模块的子任务）：writable/create 含根清单文件。"""
+    out = []
+    for s in getattr(plan_obj, "subtasks", []) or []:
+        scope = getattr(s, "scope", None)
+        if scope is None:
+            continue
+        w = (set(getattr(scope, "writable", []) or [])
+             | set(getattr(scope, "create_files", []) or []))
+        if any(str(f).replace("\\", "/").lstrip("./") in _ROOT_MANIFESTS for f in w):
+            out.append(s)
     return out
 
 

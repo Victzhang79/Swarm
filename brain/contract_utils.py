@@ -366,6 +366,17 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
     # 令 owner 显式登记是【计划意图】层的收口(worker 一次建全、验收可查)，与 reconcile 双保险。
     new_modules: set[str] = set()
     root_pom_owner = None
+
+    def _module_dir_of_pom(rel: str) -> str | None:
+        """rel 若是模块 pom（任意嵌套深度的 <dir>/pom.xml，根 pom 不算）→ 返回模块目录。
+        round29 复核整改（猎人#5）：旧判定 count("/")==1 使嵌套模块（backend/svc-a/pom.xml）
+        对规则 4 完全不可见 → 零序约束，d37a52a3 类 reactor 中毒在 monorepo 布局原样复现。"""
+        fn = str(rel).replace("\\", "/").lstrip("./")
+        if "/" not in fn:
+            return None
+        d, base = fn.rsplit("/", 1)
+        return d if base == "pom.xml" and d else None
+
     for st in subtasks:
         scope = getattr(st, "scope", None)
         if scope is None:
@@ -375,8 +386,16 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         if root_pom_owner is None and ("pom.xml" in creates or "pom.xml" in writables):
             root_pom_owner = st  # 规则1 收敛后唯一 owner（列表序首个）
         for cf in creates:
-            if cf.endswith("/pom.xml") and cf.count("/") == 1:
-                new_modules.add(cf.split("/", 1)[0])
+            d = _module_dir_of_pom(cf)
+            if d:
+                new_modules.add(d)
+        # 复核整改（reviewer#3）：LLM 可能把新模块 pom 误标进 writable（目录已有部分文件）——
+        # 以 repo 基线真值兜底判新（基线无此 pom = 真新建），口径与 builds_new_module 一致。
+        for wf in writables:
+            d = _module_dir_of_pom(wf)
+            if d and not _exists_in_repo(
+                    project_path, str(wf).replace("\\", "/").lstrip("./"), _exist_cache, base_ref):
+                new_modules.add(d)
     # 有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）。
     if new_modules and _exists_in_repo(project_path, "pom.xml", _exist_cache, base_ref):
         # owner = 已收敛的根 pom owner；无人 own 时 backstop 指派首个建模块 pom 的子任务。
@@ -384,7 +403,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             (
                 st for st in subtasks
                 if any(
-                    cf.endswith("/pom.xml") and cf.count("/") == 1
+                    _module_dir_of_pom(cf)
                     for cf in (getattr(getattr(st, "scope", None), "create_files", []) or [])
                 )
             ),
@@ -403,21 +422,63 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                 ac.append(note)
                 owner.acceptance_criteria = ac
                 changed = True
-            # 其余构建新模块的子任务依赖 owner（确保注册已就位再 mvn -pl），带防环守卫。
+            # round29 A(c) 治本：依赖序方向反正——单一规范不变量「注册后于脚手架」。
+            # 旧边（scaffold depends_on owner=注册先行）使注册先落地而模块目录不存在 →
+            # Maven `Child module … does not exist` 毒化全 reactor → 级联 abandon
+            # （task d37a52a3 真根因）。新序：
+            #   · owner(registrant) depends_on 每个【脚手架】（建 <module>/pom.xml 者），
+            #     并删除既有反向直边（不叠边，防 2-cycle 被环卫随机断）；
+            #   · 模块【内容】子任务（不建新模块 pom）仍依赖 owner（内容 -pl 构建需注册在位，
+            #     链式 content→owner→scaffold 传递保序）。
+            # 脚手架自身的 -pl 构建不需注册先行：清单 reconcile 在沙箱内自愈注册
+            # （l1_pipeline._push_manifests_to_sandbox），两向均带 _depends_transitively 防环。
+            _owner_scope = getattr(owner, "scope", None)
+            _owner_other_files = {
+                str(f).replace("\\", "/").lstrip("./")
+                for f in (list(getattr(_owner_scope, "writable", []) or [])
+                          + list(getattr(_owner_scope, "create_files", []) or []))
+            } - {"pom.xml"}
             for st in subtasks:
                 if st.id == owner.id:
                     continue
                 scope = getattr(st, "scope", None)
                 if scope is None:
                     continue
-                builds_new_module = any(
-                    "/" in cf and cf.split("/", 1)[0] in new_modules
-                    for cf in (
-                        list(getattr(scope, "create_files", []) or [])
-                        + list(getattr(scope, "writable", []) or [])
-                    )
+                creates = list(getattr(scope, "create_files", []) or [])
+                writables = list(getattr(scope, "writable", []) or [])
+                _st_norm = {str(f).replace("\\", "/").lstrip("./") for f in creates + writables}
+                # 脚手架=建任意新模块的 pom（嵌套深度不限；writable 里的新模块 pom 已并入 new_modules）
+                is_scaffold = any(
+                    (_module_dir_of_pom(cf) or "") in new_modules
+                    for cf in creates + writables if _module_dir_of_pom(cf)
                 )
-                if builds_new_module and not _depends_transitively(owner.id, st.id):
+                builds_new_module = any(
+                    fn.startswith(m + "/") for fn in _st_norm for m in new_modules
+                )
+                if is_scaffold:
+                    # 复核护栏（reviewer#2）：st 与 owner 还共享【其它非根 pom 文件】的写序时，
+                    # 既有 demote/串行边可能承载那份文件的物理写序——保守跳过规范化（不删不加），
+                    # 该模块的注册序交 reconcile/运行期序修复阶梯兜底。
+                    if _owner_other_files & (_st_norm - {"pom.xml"}):
+                        logger.info(
+                            "[contract] 规则4 跳过 %s↔%s 序规范化：两者共享其它文件写序（%s），"
+                            "保守保留既有边，注册序交 reconcile/运行期阶梯兜底",
+                            owner.id, st.id,
+                            sorted(_owner_other_files & (_st_norm - {"pom.xml"}))[:3],
+                        )
+                        continue
+                    deps_st = list(getattr(st, "depends_on", []) or [])
+                    if owner.id in deps_st:
+                        deps_st.remove(owner.id)   # 删反向直边：只留单一规范方向
+                        st.depends_on = deps_st
+                        changed = True
+                    if not _depends_transitively(st.id, owner.id):
+                        odeps = list(getattr(owner, "depends_on", []) or [])
+                        if st.id not in odeps:
+                            odeps.append(st.id)
+                            owner.depends_on = odeps
+                            changed = True
+                elif builds_new_module and not _depends_transitively(owner.id, st.id):
                     deps = list(getattr(st, "depends_on", []) or [])
                     if owner.id not in deps:
                         deps.append(owner.id)

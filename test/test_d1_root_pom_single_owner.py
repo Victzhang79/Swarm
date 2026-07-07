@@ -92,7 +92,12 @@ def test_round18_double_pom_writer_converges_to_single_owner(tmp_path):
     )
     st30_after = next(s for s in plan.subtasks if s.id == "st-30")
     assert "pom.xml" in (st30_after.scope.readable or []), "非 owner 应 demote 为 readable"
-    assert "st-1" in (st30_after.depends_on or []), "非 owner 应依赖 owner(串行到注册就位)"
+    # round29 A(c) 方向反正：st-30 是【脚手架】(建 ruoyi-alarm-sdk/pom.xml)，规范不变量=
+    # 「注册后于脚手架」——owner(注册者 st-1) 依赖 scaffold(st-30)，旧的反向 demote 边
+    # (st-30→st-1「注册就位先行」) 正是 d37a52a3 Child-module-does-not-exist 级联根因，须删。
+    st1_after = next(s for s in plan.subtasks if s.id == "st-1")
+    assert "st-30" in (st1_after.depends_on or []), "owner(注册者)应依赖 scaffold(注册后于脚手架)"
+    assert "st-1" not in (st30_after.depends_on or []), "反向边(注册先行)必须被删，防 2-cycle"
     # 各自的【模块 pom】(不同文件)不受影响，仍各自创建 → 供 reconcile 据磁盘登记
     assert "ruoyi-alarm-sdk/pom.xml" in (st30_after.scope.create_files or [])
 

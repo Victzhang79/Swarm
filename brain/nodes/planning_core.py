@@ -235,6 +235,39 @@ def _serialize_pom_writers(plan_obj, pom_by_id: dict) -> None:
             _add_dep_safe(by_id, members[i], members[i - 1])
 
 
+def _insert_module_order_edge(plan_obj, registrant_id: str, scaffold_id: str) -> bool:
+    """round29 A(b)：插「注册后于脚手架」规范边 registrant.depends_on += scaffold_id。
+
+    先删既有【反向直边】（scaffold.depends_on 含 registrant——正是 d37a52a3 的病边，删它本身
+    就是规范化），再经 _add_dep_safe 传递防环加正边。返回 True=规范边已在位（新加或本就有）；
+    False=无法安全成立（id 缺失/自指/删直边后仍存在间接反向依赖，插边会成环 → fail-safe 跳过）。
+    """
+    if plan_obj is None or registrant_id == scaffold_id:
+        return False
+    by_id = {st.id: st for st in getattr(plan_obj, "subtasks", []) or []}
+    reg, scaf = by_id.get(registrant_id), by_id.get(scaffold_id)
+    if reg is None or scaf is None:
+        return False
+    deps_scaf = list(getattr(scaf, "depends_on", []) or [])
+    _removed_reverse = False
+    if registrant_id in deps_scaf:
+        deps_scaf.remove(registrant_id)   # 单一规范方向：删反向直边（不叠边防 2-cycle）
+        scaf.depends_on = deps_scaf
+        _removed_reverse = True
+    if scaffold_id in (getattr(reg, "depends_on", []) or []):
+        return True                        # 幂等：规范边已在位
+    if _add_dep_safe(by_id, registrant_id, scaffold_id):
+        return True
+    if _removed_reverse:
+        # 猎人#1 观测缺口：删了反向直边、正向边却因【独立的间接反向路径】加不上（数学上该
+        # 间接路径仍强制同一偏序，删直边无害=冗余边），但 plan 发生了 mutate 必须留痕可回放。
+        logger.warning(
+            "[HANDLE_FAILURE] 序边规范化部分生效：已删 %s→%s 反向直边，但正向边因间接反向"
+            "路径未插入（既有间接路径仍保序，删除的是冗余边）", scaffold_id, registrant_id,
+        )
+    return False                           # 间接反向依赖仍在（加边成环）→ 跳过交常规阶梯
+
+
 async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | None:
     """卡死子任务恢复阶梯·阶梯二：把【多文件】卡死子任务【定点拆小】（复用 _resplit_subtask），
     保留成功兄弟、只重派拆出的小块。每子任务最多 1 次。
