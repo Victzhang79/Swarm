@@ -37,35 +37,41 @@ logger = logging.getLogger(__name__)
 
 
 
-def _git_tracked_set(local_root: Path, rels: list[str]) -> set[str]:
-    """一次 `git ls-files -z -- <paths>` 批量判定哪些相对路径【被 git 跟踪】。
+def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> set[str]:
+    """一次 `git ls-tree -r --name-only <ref> -- <paths>` 批量判定哪些相对路径
+    【真实存在于钉扎 base 树】。
 
-    round27 perf：替代逐文件 `git ls-files --error-unmatch`（N 个文件 = N 次进程
-    spawn，30 并发 worker bootstrap 时事件环/系统被进程风暴拖垮）。判定谓词与
-    逐文件版完全一致（ls-files 命中 = tracked）。失败 fail-safe 返回空集
-    （调用方语义 = 全部按 untracked 处理，与逐文件版异常分支一致）。
-    模块级函数（非 mixin 方法）：测试用 SimpleNamespace stub 绑定 mixin 方法，
-    self 上取不到兄弟新方法。"""
+    round29 遗漏项#3 口径修正：原用 `git ls-files`（**index 口径**）——pull-back/diff 收集
+    对 untracked 新文件跑 `git add -N`（intent-to-add）后，占位文件进 index 被误判 tracked，
+    但 base 树里没有 → 两个调用方双双中毒（d37a52a3 实证，7 沙箱 × ~15min 空烧）：
+      · clean_upload 用"HEAD 版"上传 → 取到空串 → 0 字节 pom 进沙箱（mvn input contained no data）；
+      · workspace reset `git checkout <ref> -- <paths>` 一个 pathspec 不在 ref 即整条拒绝执行
+        → 防脏叠加护栏对【全部】文件静默失效（现场 pathspec 警告即此）。
+    两个调用方要的语义都是「存在于 base 树」→ ls-tree（对象树口径，locale 无关）。
+
+    round27 perf 语义保留：单次批量判定替代 N 次进程 spawn。失败 fail-safe 返回空集
+    （调用方语义 = 全部按 untracked 处理）。模块级函数（非 mixin 方法）：测试用
+    SimpleNamespace stub 绑定 mixin 方法，self 上取不到兄弟新方法。"""
     import subprocess
     if not rels:
         return set()
     try:
         r = subprocess.run(
-            ["git", "ls-files", "-z", "--", *rels],
+            ["git", "ls-tree", "-r", "-z", "--name-only", ref, "--", *rels],
             cwd=str(local_root), capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
             # 批量版一次失败 = 调用方整个护栏（reset 防脏/clean_upload 防脏叠加）按
             # "全 untracked"降级——必须可观测，否则与"真没有 tracked 文件"不可区分。
             logger.warning(
-                "[git_tracked_set] git ls-files 非零(rc=%d, %d 路径, cwd=%s)，按全 untracked 降级: %s",
+                "[git_tracked_set] git ls-tree 非零(rc=%d, %d 路径, cwd=%s)，按全 untracked 降级: %s",
                 r.returncode, len(rels), local_root, (r.stderr or "").strip()[:200],
             )
             return set()
         return {p for p in r.stdout.split("\0") if p}
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[git_tracked_set] git ls-files 异常(%d 路径, cwd=%s)，按全 untracked 降级: %s",
+            "[git_tracked_set] git ls-tree 异常(%d 路径, cwd=%s)，按全 untracked 降级: %s",
             len(rels), local_root, exc,
         )
         return set()
@@ -322,14 +328,23 @@ class _SandboxSyncMixin:
         """
         try:
             import subprocess
+            _ref = resolve_base_ref(getattr(self, 'base_ref', None))
             proc = subprocess.run(
-                ["git", "show", f"{resolve_base_ref(getattr(self, 'base_ref', None))}:{rel}"],
+                ["git", "show", f"{_ref}:{rel}"],
                 cwd=str(local_root), capture_output=True, text=True, timeout=15,
             )
             if proc.returncode == 0:
                 return proc.stdout
-            # 文件在 HEAD 不存在(新建文件)→ 基线为空串
-            if "exists on disk, but not in" in proc.stderr or "does not exist" in proc.stderr or "fatal: path" in proc.stderr:
+            # round29 遗漏项#3 sibling：原按【英文 stderr 文案】判"文件在 HEAD 不存在"——中文等
+            # 非英文 locale 下匹配不到 → 新建文件基线错回 None（diff 基线退化回脏工作副本，
+            # c592c562 空 diff 病根在非英文环境复发）。改 locale 无关的判定：
+            # `git ls-tree <ref> -- <rel>` rc=0 且输出为空 = 基线树无此路径（新建文件 → 基线
+            # 空串）；rc!=0（非 git 仓/坏 ref）→ None（调用方回退本地工作副本）。
+            probe = subprocess.run(
+                ["git", "ls-tree", _ref, "--", rel],
+                cwd=str(local_root), capture_output=True, text=True, timeout=15,
+            )
+            if probe.returncode == 0 and not probe.stdout.strip():
                 return ""
             return None
         except Exception:
@@ -400,8 +415,16 @@ class _SandboxSyncMixin:
             return 0
 
         # 只保留 git 跟踪的文件（round27 perf：单次 ls-files 批量判定，替代逐文件 N 进程）
-        tracked = sorted(_git_tracked_set(local_root, sorted(candidates)))
+        tracked = sorted(_git_tracked_set(
+            local_root, sorted(candidates), resolve_base_ref(getattr(self, 'base_ref', None))))
         if not tracked:
+            # 遗漏项#3 复核（hunter#2）：候选非空却全不在 base 树（坏 ref/git 故障降级）时，
+            # 防脏叠加 reset 整体失效——任务级留痕（与 clean_upload 侧告警对称），不只进程日志。
+            if candidates:
+                self._log(
+                    f"[WARN] workspace reset: {len(candidates)} 个 writable 均不在 base 树"
+                    f"（全新建 或 git/ref 故障降级）→ 本轮防脏叠加 reset 未生效"
+                )
             return 0
 
         # TD2606-B5/C5：reset 与 diff/add-N 共用同一 per-project 锁（_ProjectGitFlock），
@@ -594,7 +617,9 @@ class _SandboxSyncMixin:
                 # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
                 # round27 perf：单次批量判定（谓词同逐文件版），替代循环内 N 次进程 spawn。
                 _writable_candidates = sorted(r for r in rel_files if r in writable_set)
-                _tracked_writables = _git_tracked_set(local_root, _writable_candidates)
+                _tracked_writables = _git_tracked_set(
+                    local_root, _writable_candidates,
+                    resolve_base_ref(getattr(self, 'base_ref', None)))
                 if _writable_candidates and not _tracked_writables:
                     # hunter round27 HIGH：批量判定失败 = 整个 clean_upload 防脏叠加机制
                     # 按"全 untracked→copy 脏磁盘"静默失效（旧逐文件版单文件失败只影响单文件）。
@@ -609,6 +634,11 @@ class _SandboxSyncMixin:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     is_tracked = rel in _tracked_writables
                     git_text = self._git_baseline_text(local_root, rel) if is_tracked else None
+                    if is_tracked and git_text is None:
+                        # 遗漏项#3 复核（hunter#3）：base 树确认存在却取不到基线（git 瞬时故障）
+                        # → 单文件退化脏磁盘上传，防脏叠加对该文件失效——必须留痕，不得静默。
+                        self._log(f"[WARN] clean_upload: {rel} 在 base 树但基线读取失败，"
+                                  f"退化脏磁盘上传（防脏叠加对该文件未生效）")
                     if git_text is not None:
                         # writable 且 git 跟踪 → 用 HEAD 干净版（杜绝脏磁盘叠加）
                         dst.write_text(git_text, encoding="utf-8")
@@ -1003,6 +1033,13 @@ class _SandboxSyncMixin:
                      resolve_base_ref(getattr(self, 'base_ref', None)), "--", *targets],
                     capture_output=True, timeout=60,  # 注意：不传 text=True，拿原始 bytes
                 )
+                # 遗漏项#3 复核（hunter#1，入口对称）：add -N 占位只为让上面这一条 diff 看见新文件，
+                # diff 拿到后立即对称清理——否则占位永久残留共享真仓 index（实测 81 条累积），
+                # 污染 git status/stash 等消费者；交付路径的 rm --cached 清理只覆盖【进 merged_diff】
+                # 的文件，abandoned/重试子任务的占位无人清。仍在同一把 flock 内，原子。
+                if untracked:
+                    _sp.run(["git", "-C", root, "restore", "--staged", "--", *untracked],
+                            capture_output=True, text=True, timeout=30)
 
             # 生成 diff：钉扎 base 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
             # 3rd#2：显式相对 base（None→HEAD），与 merge base_reader 同源对齐，消除运行期 HEAD 漂移。
