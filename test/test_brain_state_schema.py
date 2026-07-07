@@ -46,6 +46,19 @@ def test_runtime_smoke_keys_declared():
         assert key in ann, f"S1-4 键 {key} 必须在 BrainState 声明（未声明=LangGraph 静默丢弃）"
 
 
+def test_s2_acceptance_keys_declared():
+    """S2（task S2-2）：需求条目/验收断言四键必须声明（声明先行，migration 键先例）。
+
+    requirement_items 由 extract_requirements 节点本批写入；acceptance_assertions/
+    acceptance_passed/acceptance_details 由 task#25/26 写入——先声明，否则届时写入
+    会被 LangGraph 静默丢弃成死功能（覆盖校验/auto-accept 闸门读到恒 None）。
+    """
+    ann = BrainState.__annotations__
+    for key in ("requirement_items", "acceptance_assertions",
+                "acceptance_passed", "acceptance_details"):
+        assert key in ann, f"S2 键 {key} 必须在 BrainState 声明（未声明=LangGraph 静默丢弃）"
+
+
 def _registered_node_fn_names() -> set[str]:
     tree = ast.parse((_BRAIN / "graph.py").read_text())
     names: set[str] = set()

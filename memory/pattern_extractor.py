@@ -11,6 +11,31 @@ from swarm.types import Complexity, TaskPlan
 # 低于此复杂度的成功任务不写入 L6（仍写 L2 摘要）
 SUCCESS_WRITE_MIN_COMPLEXITY = {Complexity.MEDIUM, Complexity.COMPLEX, Complexity.ULTRA}
 
+# S2 复核 F2：degraded_reasons 里的【信息性留痕】前缀白名单——不阻断 L6 成功学习。
+# 论证：这三类是校验器【按设计拒收/跳过】的计数留痕，非任何验证面被降级：
+#   - requirements_extract:rejected=N —— 防幻觉校验剔除了 LLM 的噪声条目（校验器
+#     正常工作的证据，剩余条目全部真实回指原文）；
+#   - acceptance_generation:rejected=N —— 断言 schema/grounding 校验剔除/降级了
+#     不合格条目（同上，剩余断言全部通过确定性校验）；
+#   - plan_coverage:skipped(no_requirement_items) —— 老任务/抽取降级时覆盖校验
+#     如实跳过（抽取失败本身另有 requirements_extract:empty 留痕，仍阻断）。
+# 真实项目几乎每轮都会带其中一两条；照旧全量阻断会把 L6 成功学习通道永久掐死。
+# 【验证面降级维持阻断】（不在白名单）：runtime_smoke_skipped:*/migration_verify_skipped:*/
+# acceptance_skipped:*（阶段1 README"跳过轮不写入成功记忆"的既有承诺，不放松）、
+# requirements_extract:empty/source_truncated、acceptance_generation:empty、
+# plan_coverage:skipped(disabled)（运维关闸=验证面缺失）等。
+INFORMATIONAL_DEGRADED_PREFIXES = (
+    "requirements_extract:rejected=",
+    "acceptance_generation:rejected=",
+    "plan_coverage:skipped(no_requirement_items)",
+)
+
+
+def blocking_degraded_reasons(reasons) -> list:
+    """degraded_reasons 中【阻断 L6】的子集（剔除信息性留痕，见白名单论证）。"""
+    return [r for r in (reasons or [])
+            if not str(r).startswith(INFORMATIONAL_DEGRADED_PREFIXES)]
+
 
 def should_write_success(state: BrainState) -> bool:
     # A-P1-05 / #3 round22：部分交付= 任务【未完成】(终态 PARTIAL)，绝不能把它当"成功模式"
@@ -24,11 +49,14 @@ def should_write_success(state: BrainState) -> bool:
     # TD2606-C10：降级交付（degraded_reasons 非空：L2 未真测 l2_no_test_executed / ASSESS 跳过 /
     # 规划降级等）"看起来成功"但缺确定性证据。不【阻断】交付本身（避免误伤无测试的 docs/config
     # 任务），但绝不把它学成【可复用成功模式】写 L6（与 A7 同向防毒化；degraded 仅记录、可见）。
-    if state.get("degraded_reasons"):
+    # S2 复核 F2：仅【阻断性】降级才拦——信息性留痕（rejected=N 计数等，见白名单论证）
+    # 是校验器设计行为，常态每轮都有，照旧全拦会掐死 L6 成功学习通道。
+    _blocking = blocking_degraded_reasons(state.get("degraded_reasons"))
+    if _blocking:
         import logging
         logging.getLogger(__name__).info(
-            "[LEARN] 交付带 degraded_reasons=%s，跳过 L6 成功模式写入（C10 防降级污染）",
-            state.get("degraded_reasons"))
+            "[LEARN] 交付带阻断性 degraded_reasons=%s，跳过 L6 成功模式写入（C10 防降级污染）",
+            _blocking)
         return False
 
     # TD2606-A7（记忆毒化回路根治）：learn_success 在 human_decision==ACCEPT 时触发，但【人工

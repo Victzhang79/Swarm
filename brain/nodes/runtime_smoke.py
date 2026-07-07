@@ -57,6 +57,12 @@ MARK_LOG_BEGIN = "__SMOKE_LOG_TAIL_BEGIN__"
 MARK_LOG_END = "__SMOKE_LOG_TAIL_END__"
 MARK_DONE = "__SMOKE_DONE__"
 MARK_PROBE_TOOL_MISSING = "PROBE_TOOL_MISSING"  # 环境缺探活工具 → 上层判 skipped
+# S2-5：assert 段执行工具缺失标记（断言片段是 curl 形态——acceptance_spec 契约；curl 缺失
+# 时脚本如实输出本标记，phase 侧判 skipped:assert_tool_missing，环境缺失绝不伪装断言失败）
+MARK_ACCEPT_TOOL_MISSING = "__ACCEPT_TOOL_MISSING__"
+# S2-5：accept 标记行透传令牌——executor 只按此令牌原样透传断言证据行（不解析；解析由
+# acceptance_spec.parse_probe_output 在 verify_runtime accept phase 侧做）
+ACCEPT_MARK_TOKEN = "__ACCEPT_"
 
 
 # ═══════════════ 三分类正则数据表（仅此处含栈词汇，按语言 keyed） ═══════════════
@@ -367,16 +373,24 @@ def build_smoke_script(
     timeout_sec: int | None = None,
     workdir: str = "/workspace",
     log_tail_lines: int = DEFAULT_LOG_TAIL_LINES,
+    assert_cmds: list[str] | None = None,
 ) -> str:
     """生成自包含 bash 冒烟脚本（纯函数，可单测）。
 
     形态：单次 run_command 内 —— [F4 端口预检（已有 listener → PORT_BUSY 提前退出，
     不起应用）] → [F1 prepare（构建产物命令，独立日志；非 0 → PREPARE_RC + prepare
     日志尾 + 完整收尾标记后提前退出，不起应用）] → 起后台(记 PID) → 轮询探活(2s)
-    → 收割日志尾部 → trap EXIT 必杀进程组（kill -- -PID + pkill -P 兜底）→ 结构化标记输出。
+    → [S2-5 assert 段（仅探活 ok 才执行）] → 收割日志尾部 → trap EXIT 必杀进程组
+    （kill -- -PID + pkill -P 兜底）→ 结构化标记输出。
 
     探活工具运行时自适应：curl → bash /dev/tcp → python3 socket → PROBE_TOOL_MISSING
     （环境缺失绝不伪装代码失败，上层判 skipped）。
+
+    assert_cmds（S2-5）：验收断言自包含 curl 片段列表（acceptance_spec.assertion_to_probe_cmd
+    产出，含 __ACCEPT_* 标记输出）。插在探活 ok 之后、收割/必杀之前——应用确认活着断言才有
+    意义；探活未 ok（timeout/exited）则整段跳过（断言证据缺失由 phase 侧按跟随 skip 处理）。
+    单条失败不提前退出（跑完收全证据）；curl 缺失如实输出 MARK_ACCEPT_TOOL_MISSING。
+    缺省 None/空 → 生成脚本与既有行为逐字节一致。
     """
     window = timeout_sec if (isinstance(timeout_sec, int) and timeout_sec > 0) \
         else resolve_smoke_timeout_sec()
@@ -405,6 +419,19 @@ if [ "$SMOKE_PREPARE_RC" != "0" ]; then
   echo "{MARK_LOG_END}"
   echo "{MARK_DONE}"
   exit 0
+fi
+"""
+    accept_block = ""
+    accept_cmds = [str(c) for c in (assert_cmds or []) if str(c).strip()]
+    if accept_cmds:
+        joined_asserts = "\n".join(accept_cmds)
+        accept_block = f"""if [ "$SMOKE_OK" = "1" ]; then
+  echo "{MARK_PHASE}accept"
+  if command -v curl >/dev/null 2>&1; then
+{joined_asserts}
+  else
+    echo "{MARK_ACCEPT_TOOL_MISSING}"
+  fi
 fi
 """
     return f"""set +e
@@ -481,7 +508,7 @@ if [ -n "$PROBE_TOOL" ]; then
     echo "{MARK_PROBE}timeout"
   fi
 fi
-echo "{MARK_PHASE}collect"
+{accept_block}echo "{MARK_PHASE}collect"
 if kill -0 "$SMOKE_PID" 2>/dev/null; then
   echo "{MARK_APP_RC}alive"
 else
@@ -676,17 +703,24 @@ async def run_runtime_smoke(
     prepare_timeout_sec: int | None = None,
     project_symbols: dict[str, Any] | None = None,
     probe_port: int | None = None,
+    accept_budget_sec: int | None = None,
 ) -> RuntimeSmokeResult:
     """在沙箱内执行冒烟脚本并三分类（唯一通道 manager.run_command，禁 run_code）。
 
     infra 失败 ≠ 冒烟失败：run_command 异常 / __SMOKE_DONE__ 缺失 / envd 5xx →
     返 not_executed（skipped 语义，对齐 D31 ran/ok 区分）。
     prepare_timeout_sec（F1）：脚本含 prepare 阶段时的额外预算，计入 run_command timeout。
+    accept_budget_sec（S2-5）：脚本含 assert 段时的断言执行预算（N 条 × 单条 max-time），
+    计入 run_command timeout；缺省 None → 行为与现状一致。
+    S2-5 透传契约：输出中含 `__ACCEPT_` 令牌的标记行【原样】收进 details.accept_output
+    （本执行器不解析——解析/判定由 acceptance_spec 在 verify_runtime accept phase 侧做）。
     """
     window = timeout_sec if (isinstance(timeout_sec, int) and timeout_sec > 0) \
         else resolve_smoke_timeout_sec()
     prepare_budget = prepare_timeout_sec \
         if (isinstance(prepare_timeout_sec, int) and prepare_timeout_sec > 0) else 0
+    accept_budget = accept_budget_sec \
+        if (isinstance(accept_budget_sec, int) and accept_budget_sec > 0) else 0
     run_command = getattr(manager, "run_command", None)
     if run_command is None or sandbox is None:
         return RuntimeSmokeResult(
@@ -697,7 +731,7 @@ async def run_runtime_smoke(
         # contextvars 拷贝，沙箱上下文照常）。timeout = 探活窗口 + 收尾缓冲 + prepare 预算。
         result = await asyncio.to_thread(
             run_command, sandbox, script,
-            timeout=window + RUN_TIMEOUT_BUFFER_SEC + prepare_budget,
+            timeout=window + RUN_TIMEOUT_BUFFER_SEC + prepare_budget + accept_budget,
             _skip_blacklist=True,
         )
     except Exception as exc:  # noqa: BLE001 — infra 异常一律未执行，不误判冒烟失败
@@ -710,6 +744,9 @@ async def run_runtime_smoke(
 
     out = (getattr(result, "stdout", "") or "") + "\n" + (getattr(result, "stderr", "") or "")
     parsed = parse_smoke_markers(out)
+    # S2-5：accept 标记行原样透传（只按令牌过滤行，不解析结构——phase 侧 parse_probe_output）
+    accept_output = "\n".join(
+        ln for ln in out.splitlines() if ACCEPT_MARK_TOKEN in ln)
 
     if parsed["probe_tool_missing"]:
         return RuntimeSmokeResult(
@@ -761,4 +798,7 @@ async def run_runtime_smoke(
     })
     if prepare_rc is not None:
         res.details["prepare_rc"] = prepare_rc  # F1：prepare 成功也留痕（rc=0）
+    if accept_output:
+        # S2-5：断言证据原文透传（assert 段只在探活 ok 后执行，故只会出现在本路径）
+        res.details["accept_output"] = accept_output
     return res

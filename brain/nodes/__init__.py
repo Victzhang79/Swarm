@@ -431,6 +431,45 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
+def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = False) -> str:
+    """S2-3（task#24）：PLAN prompt 的需求条目清单 + covers 声明纪律注入块。
+
+    加法式注入（不改 PLAN_USER/PLAN_BATCH_USER 模板本体）：requirement_items 缺失/空
+    → 返回 ""，拼接后 prompt 与老行为【一字不差】（抽取降级/老任务零变化）。
+    非空 → 追加条目清单（id+kind+text）与"每个条目必须被至少一个子任务 covers"纪律，
+    供 validate_plan 的覆盖矩阵确定性对账（plan_validator.validate_requirement_coverage）。
+    batched=True（ultra 分批路径）：单批只见部分文件，追加"本批只声明相关条目"说明——
+    全覆盖由 merge 后的整体校验兜底。通用多栈多领域：块内无任何语言/框架/领域词汇。
+    """
+    items = [
+        it for it in (requirement_items or [])
+        if isinstance(it, dict) and str(it.get("id") or "").strip()
+    ]
+    if not items:
+        return ""
+    lines = [
+        f"- {str(it['id']).strip()} [{it.get('kind', 'other')}] {str(it.get('text') or '')[:200]}"
+        for it in items
+    ]
+    batch_note = (
+        "\n- 分批拆解提示：本批只为与【本批文件清单】相关的条目声明 covers，"
+        "无关条目留给其他批次（系统会在所有批次合并后整体校验全覆盖）。"
+        if batched else ""
+    )
+    return (
+        "\n\n## 需求条目清单（PRD 覆盖矩阵 —— 覆盖声明为硬性要求）\n"
+        "以下是从需求文本确定性抽取的结构化需求条目。每个子任务的 JSON 对象必须包含 "
+        "\"covers\" 字段（字符串列表），声明该子任务负责实现哪些需求条目 ID，例如 "
+        "\"covers\": [\"req-xxxxxxxx\"]：\n"
+        + "\n".join(lines)
+        + "\n\n覆盖声明纪律：\n"
+        "- 每个需求条目必须被至少一个子任务的 covers 覆盖——未覆盖的条目会被计划校验拒绝并要求重新规划；\n"
+        "- covers 只能引用上面清单中存在的 ID，绝不编造 ID；\n"
+        "- 一个子任务可以覆盖多个条目；与该子任务无关的条目不要写进它的 covers。"
+        + batch_note
+    )
+
+
 async def _plan_ultra_batched(
     llm, state, task_description, knowledge_context, sliding_ctx, file_plan,
 ):
@@ -470,6 +509,10 @@ async def _plan_ultra_batched(
     # sliding_ctx 头部带 plan() 注入的"上轮 replan 失败根因"——此前分批路径把它静默丢弃，
     # ULTRA replan 退化为盲重规划（反复产同样的坏计划）。反馈在头部，截尾不丢根因。
     sliding_ctx_text = (sliding_ctx or "").strip()[:2000] or "（无）"
+    # S2-3：分批路径同样注入需求条目清单（items 空=一字不加）。batched=True 提示本批只
+    # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
+    _cov_block = _requirement_coverage_prompt_block(
+        state.get("requirement_items"), batched=True)
 
     # P5：分批前全局去重同名文件
     _before = len(file_plan)
@@ -566,6 +609,8 @@ async def _plan_ultra_batched(
                 mod_name, exc,
             )
             return ("error", i, mod_name, exc, None, len(batch))
+        # S2-3：追加需求条目清单 + covers 纪律（items 空时 _cov_block=""，一字不加）
+        prompt_user += _cov_block
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
@@ -911,6 +956,8 @@ async def plan(state: BrainState) -> dict:
                 sliding_context=sliding_ctx,
                 tech_design_plan=tech_design_plan,
             )
+            # S2-3：需求条目清单 + covers 声明纪律（加法式注入；items 空=一字不加，老行为零变化）
+            prompt_user += _requirement_coverage_prompt_block(state.get("requirement_items"))
             response = await llm.ainvoke([
                 {"role": "system", "content": PLAN_SYSTEM},
                 {"role": "user", "content": prompt_user},
@@ -1129,6 +1176,7 @@ async def validate_plan(state: BrainState) -> dict:
         MAX_LLM_VALIDATION_PLAN_CHARS,
         slim_plan_json_for_llm_validation,
         validate_plan_structure,
+        validate_requirement_coverage,
     )
 
     plan_obj = state.get("plan")
@@ -1174,6 +1222,47 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": [],
             "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
         }
+
+    # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
+    # 接缝：结构校验后、SIMPLE 早退后（单 trivial 子任务自证覆盖，强校验只会误伤）、
+    # LLM 软校验前。requirement_items 缺失/空（抽取降级/老 checkpoint）→ 跳过校验 +
+    # degraded 留痕（诚实降级，绝不阻塞主链）；未覆盖条目/悬空 covers → plan_valid=False
+    # 走现成 D09 回灌通道（feedback 逐条列条目 id+text，PLAN 重试 :864-872 注入 LLM）。
+    # 熔断复用 plan_retry_count/MAX_PLAN_RETRY（graph.after_validate），绝不另起计数器；
+    # 覆盖失败即返回、不再跑 LLM 软校验（§2.3：与 P6b 共用重试预算，不各自烧一轮）。
+    _coverage_degraded: list[str] = []
+    _req_items = state.get("requirement_items") or []
+    # S2 复核 S2：覆盖闸门杀开关（对照 SWARM_RUNTIME_SMOKE_ENABLED 先例）——covers 是
+    # 新上线的确定性硬闸，存量任务/抽取噪声导致 LLM 反复不服从时，运维需要一个不改代码
+    # 的泄压阀（否则一条坏条目烧光 MAX_PLAN_RETRY 必进人工）。默认 "1"=闸门全开；
+    # 关闭走跳过+degraded 留痕，绝不静默。
+    _coverage_gate_on = os.environ.get(
+        "SWARM_PLAN_COVERAGE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
+    if not _coverage_gate_on:
+        logger.info("[VALIDATE_PLAN] SWARM_PLAN_COVERAGE_GATE 关闭 — 跳过覆盖矩阵校验（degraded 留痕）")
+        _coverage_degraded = ["plan_coverage:skipped(disabled)"]
+    elif not _req_items:
+        logger.info("[VALIDATE_PLAN] requirement_items 缺失/空 — 跳过覆盖矩阵校验（degraded 留痕）")
+        _coverage_degraded = ["plan_coverage:skipped(no_requirement_items)"]
+    else:
+        cov_result = validate_requirement_coverage(plan_obj, _req_items)
+        for w in cov_result.warnings:
+            logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)
+        if not cov_result.valid:
+            logger.warning(
+                "[VALIDATE_PLAN] 覆盖矩阵校验未通过（%d 条 issue）: %s",
+                len(cov_result.issues), "; ".join(cov_result.issues),
+            )
+            return {
+                "plan_valid": False,
+                "plan_retry_count": retry_count,
+                "plan_validation_issues": cov_result.issues,
+                # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划
+                "plan_validation_feedback": _format_validation_feedback(cov_result.issues),
+            }
+        logger.info(
+            "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被子任务覆盖", len(_req_items),
+        )
 
     # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
     # Bug-2 根治（task 92ff8a71/70543ea2/37460a5b 实证）：过去 llm_valid =
@@ -1263,6 +1352,9 @@ async def validate_plan(state: BrainState) -> dict:
         "plan_validation_issues": _final_issues,
         # D09：LLM/P6b 完整性校验失败原因回灌 PLAN（通过则清空，防跨轮粘滞）
         "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues),
+        # S2-3：覆盖矩阵因 items 缺失被跳过时诚实留痕（degraded_reasons 是 reducer 键，
+        # 追加去重；无跳过时不发键，零噪声）。
+        **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
     }
 
 
@@ -2128,6 +2220,99 @@ async def _verify_l2_via_llm(
         return False
 
 
+# S2-6：deliver 人工闸 payload 的逐条断言 verdict 限量（体积节制——merged_diff[:2000] 同款
+# 纪律：payload 走 SSE/checkpoint，绝不塞全量 details；超出部分以计数如实呈现）。
+_DELIVER_ASSERT_ROWS_MAX = 20
+
+
+def _deliver_review_payload(state: BrainState) -> dict:
+    """S2-6：deliver 人工闸审核 payload 补全（纯函数，全部从 state 读、缺键容错）。
+
+    S2-1 取证：payload 此前只有 merged_diff[:2000]+l2_passed——runtime/migration/acceptance
+    结论与需求覆盖矩阵根本不进人工审核视野，人工审核是盲的。本函数加法补齐：
+      - runtime_smoke：三态结论 + skipped/message/classification（state 键 S1-4/S1-6）
+      - migration_verify：三态结论 + kind（S1-5）
+      - acceptance：三态结论 + 逐条断言 verdict 摘要（限量 _DELIVER_ASSERT_ROWS_MAX 条 +
+        总数/省略数）+ manual 清单（auth≠none 不自动执行的"N 条需人工验证"，设计 §5.3）
+      - coverage：build_coverage_matrix 现算（矩阵是派生数据不进 state，防两份事实漂移）
+      - degraded_reasons：降级留痕全量（reducer 已去重，体积可控）
+    旧 checkpoint 无新键 → 各段返回 None/空缺省，绝不抛（deliver 是 interrupt 锚点，
+    payload 组装失败=人工闸打不开）。消费面（runner._extract_interrupt_info → SSE 事件 /
+    get_pending_interrupt API）对 payload dict 整体透传无键白名单，加法安全。
+    """
+    rt_details = state.get("runtime_smoke_details") or {}
+    if not isinstance(rt_details, dict):
+        rt_details = {}
+    mig_details = state.get("migration_verify_details") or {}
+    if not isinstance(mig_details, dict):
+        mig_details = {}
+    acc_details = state.get("acceptance_details") or {}
+    if not isinstance(acc_details, dict):
+        acc_details = {}
+
+    rows = [r for r in (acc_details.get("assertions") or []) if isinstance(r, dict)]
+    row_summaries: list[dict] = []
+    for r in rows[:_DELIVER_ASSERT_ROWS_MAX]:
+        req = r.get("request") if isinstance(r.get("request"), dict) else {}
+        row_summaries.append({
+            "id": r.get("id"),
+            "req_id": r.get("req_id"),
+            "verdict": r.get("verdict"),
+            "method": req.get("method"),
+            "path": req.get("path"),
+            "http_code": r.get("http_code"),
+            "reason": str(r.get("reason") or "")[:160],
+        })
+    manual_rows = [
+        {"id": r.get("id"), "req_id": r.get("req_id"), "kind": r.get("kind")}
+        for r in rows if r.get("verdict") == "skipped_manual"
+    ][:_DELIVER_ASSERT_ROWS_MAX]
+
+    try:
+        from swarm.brain.plan_validator import build_coverage_matrix
+        matrix = build_coverage_matrix(
+            state.get("plan"), state.get("requirement_items"))
+        coverage = {
+            "total": matrix["total_items"],
+            "covered": matrix["covered_items"],
+            "uncovered": [
+                {"id": u.get("id"), "text": str(u.get("text") or "")[:120]}
+                for u in matrix["uncovered"][:_DELIVER_ASSERT_ROWS_MAX]
+            ],
+            "uncovered_count": len(matrix["uncovered"]),
+        }
+    except Exception as exc:  # noqa: BLE001 — 矩阵现算失败绝不挡人工闸，如实留痕
+        logger.warning("[DELIVER] 覆盖矩阵现算失败(payload 降级为空): %s", exc)
+        coverage = {"total": 0, "covered": 0, "uncovered": [], "uncovered_count": 0,
+                    "error": str(exc)[:200]}
+
+    return {
+        "runtime_smoke": {
+            "passed": state.get("runtime_smoke_passed", None),
+            "skipped": state.get("runtime_smoke_skipped", None),
+            "message": str(state.get("runtime_smoke_message") or "")[:400],
+            "classification": rt_details.get("classification"),
+        },
+        "migration_verify": {
+            "passed": state.get("migration_verify_passed", None),
+            "kind": mig_details.get("kind"),
+        },
+        "acceptance": {
+            "passed": state.get("acceptance_passed", None),
+            "reason": acc_details.get("reason"),
+            "total": acc_details.get("total"),
+            "manual_count": acc_details.get("manual_count"),
+            "failed_count": acc_details.get("failed_count"),
+            "assertions": row_summaries,
+            "assertions_total": len(rows),
+            "assertions_omitted": max(0, len(rows) - _DELIVER_ASSERT_ROWS_MAX),
+            "manual": manual_rows,
+        },
+        "coverage": coverage,
+        "degraded_reasons": list(state.get("degraded_reasons") or []),
+    }
+
+
 def deliver(state: BrainState) -> dict:
     """DELIVER 节点 — 交付结果，等待人工决策
 
@@ -2163,6 +2348,8 @@ def deliver(state: BrainState) -> dict:
         return {"human_decision": HumanDecision.ACCEPT}
 
     # interrupt 暂停图执行，等待外部输入
+    # S2-6：payload 加法补齐 runtime/migration/acceptance/coverage/degraded 审核视野
+    # （_deliver_review_payload，旧键一个不动——消费面兼容）。
     decision = interrupt(
         {
             "type": "deliver",
@@ -2170,6 +2357,7 @@ def deliver(state: BrainState) -> dict:
             "task_description": state.get("task_description"),
             "merged_diff": state.get("merged_diff", "")[:2000],
             "l2_passed": state.get("l2_passed", False),
+            **_deliver_review_payload(state),
             "message": "任务执行完成，请审核结果并决定: accept(接受) / revise(修订) / reject(拒绝)",
         }
     )
@@ -2300,6 +2488,15 @@ async def revision(state: BrainState) -> dict:
         # 交付永拒 auto_accept、after_merge:285 残留条件把干净合并再送人工
         # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。
         "failure_escalated": False,
+        # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订
+        # （verify_runtime 的幂等复用对已存在 assertions 直接跳过重生成，"reused_existing"）。
+        # 清空三键让下一轮 verify_runtime 按修订后的 design/merged_diff 重新生成断言。
+        # requirement_items 不动（需求源文本未变，条目 ID 内容 hash 稳定；把修订反馈并入
+        # 抽取语料是后续项）。replan（handle_failure）路径【不清】——代码级重做不改需求，
+        # 断言挂 requirement item 级，复用省 LLM（幂等复用逻辑只对"本轮已生成"成立）。
+        "acceptance_assertions": [],
+        "acceptance_passed": None,
+        "acceptance_details": {},
     }
 
 

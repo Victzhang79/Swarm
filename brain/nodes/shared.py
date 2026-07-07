@@ -790,6 +790,13 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
             for c in (getattr(st, "acceptance_criteria", []) or []):
                 if c and c not in ac:
                     ac.append(c)
+        # S2-3（task#24 必改点）：covers 并集去重——需求条目覆盖声明绝不因水平合并丢失。
+        # 丢了会让 validate_plan 的覆盖矩阵把已实现的条目误判"未覆盖"→白烧 plan 重试预算。
+        cov: list[str] = []
+        for st in group:
+            for r in (getattr(st, "covers", []) or []):
+                if r and r not in cov:
+                    cov.append(r)
         # difficulty 取最高
         hardest = max(
             group,
@@ -806,6 +813,7 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
             scope=merged_scope,
             contract=base.contract or {},
             acceptance_criteria=ac,
+            covers=cov,
             depends_on=[],
             harness=base.harness,
         )
@@ -892,19 +900,27 @@ def runtime_failure_evidence(details: dict | None) -> str:
 
     只取【应用自身输出】面：log_tail（启动日志尾部）+ code_error_hits（三分类命中的错误
     形态）+ migration* 键族（S1-5 migration_failed 同族：SQL/migration 错误输出按键名前缀
-    契约消费）。绝不掺 derivation_evidence/sandbox 等【基础设施留痕】——它们含配置/构建
+    契约消费）+ acceptance* 键族（S2-6：验收断言失败证据同前缀契约——verify.py
+    _acceptance_evidence_keys 写入 acceptance_evidence/acceptance_failures/
+    acceptance_failed_count，含请求路径与响应 body 头部，路径/栈帧文件名能命中写者子任务）。
+    绝不掺 derivation_evidence/sandbox 等【基础设施留痕】——它们含配置/构建
     文件路径（application.yml、rebuild_output 里的源文件名），入证据面会把这些文件的写者
     子任务【每轮】误归因成失败源。
+    S2 复核 F4：classification=acceptance_failed 时【不收 log_tail】——此时探活已过、
+    应用健康启动，log_tail 是纯启动日志噪声（其中打印的配置/资源文件名会把无辜写者
+    每轮定向重派，与上述 infra 留痕同一误归因模式）；只收 acceptance/migration 前缀族
+    + code_error_hits。其余分类（code_error/启动失败等）log_tail 照收——那是失败现场。
     """
     d = details or {}
     parts: list[str] = []
-    log_tail = str(d.get("log_tail") or "").strip()
-    if log_tail:
-        parts.append(log_tail)
+    if str(d.get("classification") or "") != "acceptance_failed":
+        log_tail = str(d.get("log_tail") or "").strip()
+        if log_tail:
+            parts.append(log_tail)
     for hit in d.get("code_error_hits") or []:
         parts.append(str(hit))
     for key in sorted(d):
-        if key.startswith("migration") and d[key]:
+        if (key.startswith("migration") or key.startswith("acceptance")) and d[key]:
             val = d[key]
             if isinstance(val, (list, tuple)):
                 parts.extend(str(v) for v in val if v)

@@ -144,6 +144,15 @@ class BrainState(TypedDict, total=False):
     migration_verify_passed: bool | None   # migration 执行验证三态（task#21 写入；先声明——否则未来节点写它会被静默丢成死功能）
     migration_verify_details: dict[str, Any]  # migration 验证细节留痕（同上，声明先行）
 
+    # ═══ S2 验收断言与需求条目（docs/ACCEPTANCE_DESIGN.md BrainState 新键清单）═══
+    # 声明先行铁律（S1 migration 键先例）：LangGraph 未声明键=静默丢弃。四键全部
+    # last-write-wins 无 reducer（均非累积事实：replan/design 重做需整体替换，加 reducer
+    # 会让旧轮结论粘滞误导路由）。skipped/降级可观测走现成 degraded_reasons reducer。
+    requirement_items: list[dict]       # S2-2：结构化需求条目 [{id: req-<sha1[:8]>, text, kind, source_quote, source, source_truncated?}]，extract_requirements 节点写（contract_design→plan 之间）；防幻觉=source_quote 回指原文确定性校验，抽取失败如实降级 []
+    acceptance_assertions: list[dict]   # S2：任务级验收断言 spec [{id, req_id, kind:"http_probe", request, expect, auth}]（task#25 acceptance_spec 写入；声明先行）
+    acceptance_passed: bool | None      # S2：验收断言三态结论（None=跳过≠失败，对齐 l3_passed/migration_verify_passed）——verify_runtime accept phase 写入（task#25/26），本批只声明不写入
+    acceptance_details: dict[str, Any]  # S2：断言逐条 verdict+证据留痕（deliver 展示/失败回灌数据源）——同上，本批只声明不写入
+
     # ─── L3 滑动窗口（任务执行期上下文）───
     context_log: list[dict]             # 上下文事件 log
     context_summary: str                # 被压缩掉的历史摘要

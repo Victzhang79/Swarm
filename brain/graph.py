@@ -60,6 +60,7 @@ from swarm.brain.planning_nodes import (
     tech_design,
 )
 from swarm.brain.ingest_node import ingest
+from swarm.brain.requirements_extract import extract_requirements
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.types import Complexity, HumanDecision
@@ -434,6 +435,11 @@ def build_brain_graph() -> StateGraph:
     graph.add_node("assess", assess)
     graph.add_node("tech_design", tech_design)
     graph.add_node("contract_design", contract_design)  # T1：多模块共享契约（Brain 大模型）
+    # S2-2：需求条目结构化（contract_design→plan 之间的轻量纯计算节点）。对称面裁决：
+    # 不进 runner._NODE_STATUS_MAP（与 clarify/assess/tech_design/contract_design/elaborate
+    # 等规划子图节点同先例——不写任务状态，仍有 brain_node 事件）；非 interrupt、非活跃
+    # 执行态之间，checkpoint 风险与 S1-4 结论同级（ACCEPTANCE_DESIGN §4.3）。
+    graph.add_node("extract_requirements", extract_requirements)
     graph.add_node("review_design", review_design)
     graph.add_node("elaborate", elaborate)
     graph.add_node("plan", plan)
@@ -502,8 +508,15 @@ def build_brain_graph() -> StateGraph:
         after_review,
         {"tech_design": "tech_design", "plan": "contract_design"},
     )
-    # T1：CONTRACT_DESIGN → PLAN（多模块共享契约设计后进入拆解；非多模块直通空契约）
-    graph.add_edge("contract_design", "plan")
+    # T1/S2-2：CONTRACT_DESIGN → EXTRACT_REQUIREMENTS → PLAN（契约设计后先做需求条目
+    # 结构化再拆解）。此处是所有规划路径的必经汇合点（含 assess simple/medium 绕过
+    # tech_design 的路径），故抽取节点挂这里而非 tech_design 之后。⚠️ 禁双边：绝不能
+    # 保留旧 add_edge("contract_design", "plan")——静态双边会 fan-out 并行触发
+    # （confirm 血案同款，test_requirements_extract_s2_2.py 拓扑断言守护）。
+    # replan 环（handle_failure→plan / confirm REVISE→plan）不经过本节点 →
+    # requirement_items 不会每轮重抽（ACCEPTANCE_DESIGN §6.4）。
+    graph.add_edge("contract_design", "extract_requirements")
+    graph.add_edge("extract_requirements", "plan")
 
     # ── 条件边 ──
 

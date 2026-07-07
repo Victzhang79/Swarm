@@ -2199,6 +2199,9 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                     [f"{st.id}-{i}"] if i > 0 else []  # 子任务间默认串行(保守，避免同 scope 并行写冲突)
                 ),
                 acceptance_criteria=s.get("acceptance_criteria", []) or [],
+                # S2-5：covers 继承——父任务的需求覆盖声明复制到拆出子任务，防 elaborate
+                # 拆分丢 covers 白烧覆盖矩阵校验重试（task#24 覆盖校验按 subtask.covers 对账）
+                covers=list(getattr(st, "covers", []) or []),
                 est_context_tokens=int(s.get("est_context_tokens", budget // 2) or budget // 2),
             ))
         return children
@@ -2592,6 +2595,8 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
                 f"本子任务 scope 内 {len(grp)} 个文件全部创建/修改完成，且模块可编译/构建通过"
                 + (f"（{_split_build_cmd}）" if _split_build_cmd else ""),
             ],
+            # S2-5：covers 继承（同 _resplit_subtask——elaborate 两条拆分路径都不丢覆盖声明）
+            covers=list(getattr(st, "covers", []) or []),
             est_context_tokens=int((getattr(st, "est_context_tokens", 0) or 0) * len(grp) /
                                    max(1, len(creates) + len(writables))) or 1,
         ))

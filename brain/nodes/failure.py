@@ -139,12 +139,25 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 }
             # 证据注入：走既有 retry_guidance 通道（A4 round11，worker/prompts.py 渲染为
             # 硬约束块），重派 worker 直接看到启动日志证据 + 机制说明（运行时失败非编译失败）。
+            # S2-6：classification=acceptance_failed 专类定性——应用【已启动、探活已过】，
+            # 失败的是对运行中应用的 HTTP 验收断言（证据=逐条断言 verdict，含请求方法/路径/
+            # 期待与实得），沿用"启动失败"文案会误导 worker 去查启动面。证据同源
+            # runtime_failure_evidence（acceptance 前缀键族，shared.py F3 同款契约）。
             _rt_evidence = runtime_failure_evidence(_rt_details)
-            _rt_guidance = (
-                "运行时启动失败（非编译失败）：本子任务产出已通过编译与 L2 集成验证，但应用在"
-                f"启动/探活冒烟阶段失败（classification={_rt_class}）。请依据下方启动期证据修复"
-                "启动失败根因，勿无谓改动与证据无关的编译面。\n启动失败证据：\n" + _rt_evidence
-            )[:1600]
+            if _rt_class == "acceptance_failed":
+                _rt_guidance = (
+                    "验收断言失败（应用已启动但接口行为不符预期）：本子任务产出已通过编译、"
+                    "L2 集成验证与启动探活，但对运行中应用的验收断言未通过"
+                    f"（classification={_rt_class}）。请依据下方逐条断言 verdict 证据"
+                    "（含请求方法/路径、期待与实得响应）修复接口行为，勿无谓改动与证据"
+                    "无关的编译/启动面。\n断言失败证据：\n" + _rt_evidence
+                )[:1600]
+            else:
+                _rt_guidance = (
+                    "运行时启动失败（非编译失败）：本子任务产出已通过编译与 L2 集成验证，但应用在"
+                    f"启动/探活冒烟阶段失败（classification={_rt_class}）。请依据下方启动期证据修复"
+                    "启动失败根因，勿无谓改动与证据无关的编译面。\n启动失败证据：\n" + _rt_evidence
+                )[:1600]
             _rt_by_id = {s.id: s for s in getattr(plan_obj, "subtasks", []) or []}
             for fid in _rt_eligible:
                 _rt_st = _rt_by_id.get(fid)

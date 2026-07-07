@@ -236,6 +236,99 @@ def validate_plan_structure(
     return result
 
 
+# ── S2-3 PRD 覆盖矩阵（task#24，ACCEPTANCE_DESIGN 定案3/§2.5）──────────────
+# 通用多栈多领域：只对账 req_id 与 covers 的映射结构，不含任何语言/框架/领域词汇。
+
+def build_coverage_matrix(plan, requirement_items) -> dict:
+    """覆盖矩阵 = 从 plan.subtasks[].covers 现算的【派生数据】。
+
+    定案（ACCEPTANCE_DESIGN 新键清单）：矩阵绝不进 state——它完全由 plan 与
+    requirement_items 派生，落两份事实必漂移。纯函数零 LLM，供 validate_requirement_coverage
+    与交付报告展示（task#26/#27）复用同一口径。
+
+    返回：
+      {
+        "total_items": int,                     # 合法需求条目数
+        "covered_items": int,                   # 至少被一个子任务 covers 的条目数
+        "items": [{"id","text","kind","covered_by":[subtask_id,...]}],
+        "uncovered": [{"id","text"}],           # 未被任何子任务覆盖的条目
+        "dangling_covers": {subtask_id: [req_id,...]},  # 悬空引用（指向不存在的条目 ID）
+      }
+
+    容错口径：requirement_items 缺失/空 → 空矩阵（total_items=0，调用方按
+    "跳过校验+degraded"处理）；非 dict/无 id 条目跳过（上游 requirements_extract
+    已确定性清洗，此处纯防御）。
+    """
+    valid_items = [
+        it for it in (requirement_items or [])
+        if isinstance(it, dict) and str(it.get("id") or "").strip()
+    ]
+    covered_by: dict[str, list[str]] = {str(it["id"]).strip(): [] for it in valid_items}
+    dangling: dict[str, list[str]] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        st_id = str(getattr(st, "id", "") or "?")
+        for rid in (getattr(st, "covers", None) or []):
+            rid = str(rid).strip()
+            if not rid:
+                continue
+            if rid in covered_by:
+                if st_id not in covered_by[rid]:
+                    covered_by[rid].append(st_id)
+            else:
+                bucket = dangling.setdefault(st_id, [])
+                if rid not in bucket:
+                    bucket.append(rid)
+    items_out: list[dict] = []
+    uncovered: list[dict] = []
+    for it in valid_items:
+        rid = str(it["id"]).strip()
+        text = str(it.get("text") or "")
+        items_out.append({
+            "id": rid,
+            "text": text,
+            "kind": str(it.get("kind") or "other"),
+            "covered_by": covered_by[rid],
+        })
+        if not covered_by[rid]:
+            uncovered.append({"id": rid, "text": text})
+    return {
+        "total_items": len(items_out),
+        "covered_items": len(items_out) - len(uncovered),
+        "items": items_out,
+        "uncovered": uncovered,
+        "dangling_covers": dangling,
+    }
+
+
+def validate_requirement_coverage(plan, requirement_items) -> PlanValidationResult:
+    """S2-3 确定性覆盖校验维度（validate_plan 内、结构校验+SIMPLE 早退之后调用）。
+
+    规则（全确定性，零 LLM）：
+      ① 每个 requirement item 至少被一个子任务的 covers 引用（未覆盖 → issue）；
+      ② covers 无悬空引用（指向不存在的 req_id → issue）。
+    requirement_items 缺失/空的"跳过+degraded"是 state 侧决策，由调用方（validate_plan）
+    负责——本函数对空 items 如实返回 valid（无可对账项）。
+
+    诚实边界（定案3）：确定性面只能校验"映射结构合法"，挡不住 LLM 谎称 cover——
+    语义真覆盖由 ACCEPT 运行时断言兜底（task#25+），两层合成闭环。
+    失败 issues 逐条带条目 id+text：D09 回灌反馈的具体性决定 PLAN LLM 能否修对。
+    """
+    result = PlanValidationResult(valid=True)
+    matrix = build_coverage_matrix(plan, requirement_items)
+    for item in matrix["uncovered"]:
+        result.add(
+            f"需求条目未被任何子任务覆盖: {item['id']} — {item['text'][:120]}"
+            f"（请把该需求分配给某个子任务实现，并在该子任务的 covers 字段声明此条目 ID）"
+        )
+    for st_id in sorted(matrix["dangling_covers"]):
+        bad = matrix["dangling_covers"][st_id]
+        result.add(
+            f"子任务 {st_id} 的 covers 引用不存在的需求条目 ID: {', '.join(bad)}"
+            f"（covers 只能引用需求条目清单中给出的 ID，不得编造）"
+        )
+    return result
+
+
 def _depends(
     id_a: str,
     id_b: str,

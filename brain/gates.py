@@ -113,6 +113,7 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
       - l2_passed 为假：L2 集成验证未通过
       - l3_passed 显式为 False：L3 预发验证失败（None=跳过，不算失败）
       - runtime_smoke_passed 显式为 False：运行时冒烟失败（None=跳过，不算失败；S1-6）
+      - acceptance_passed 显式为 False：验收断言失败（None=跳过，不算失败；S2-6）
       - verification_failure 非空：存在已记录的验证失败来源
 
     返回 (allow, reason)。reason 同时用作 verification_failure 的归因值。
@@ -144,12 +145,43 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
         return False, "l3_failed: L3 预发验证失败"
 
     # S1-6：runtime 冒烟三态（对齐 l3 语义 + 上方 :119 "专类先判、如实归因"先例）：
-    # 仅显式 False 阻断——失败已定性为「应用启动/探活失败」，专类文案不得冒充 l2/l3；
-    # None=跳过不算失败（skipped 已由 degraded_reasons 可观测，should_write_success
-    # 据 degraded 另拦 L6，不会学成成功模式）；True=通过不阻断。
+    # 仅显式 False 阻断；None=跳过不算失败（skipped 已由 degraded_reasons 可观测，
+    # should_write_success 据 degraded 另拦 L6，不会学成成功模式）；True=通过不阻断。
+    # S2 复核 F5：runtime 失败通道是复用面——verify 的 acceptance/migration 失败也走
+    # _runtime_failure_state 置 runtime_smoke_passed=False（ACCEPTANCE_DESIGN 定案4）。
+    # 拒因文案必须按 runtime_smoke_details.classification 分型如实归因：断言失败时
+    # 应用【明明已启动】，谎称"启动/探活失败"会把人工审核/学习面引向错误根因。
     rt = state.get("runtime_smoke_passed", None)
     if rt is False:
+        _rt_details = state.get("runtime_smoke_details")
+        _rt_class = str(_rt_details.get("classification") or "") \
+            if isinstance(_rt_details, dict) else ""
+        if _rt_class == "acceptance_failed":
+            return False, (
+                "acceptance_failed: 验收断言未通过（应用已启动，接口行为不符预期，"
+                "非启动/探活失败）"
+            )
+        if _rt_class == "migration_failed":
+            return False, (
+                "migration_failed: migration 验证未通过（确定性 SQL/migration 执行失败，"
+                "非启动/探活失败）"
+            )
         return False, "runtime_smoke_failed: 运行时冒烟未通过（应用启动/探活失败，非 L2 编译失败）"
+
+    # S2-6：acceptance 三态（镜像上方 runtime 三态先例，判序=runtime 之后、verification_failure
+    # 兜底之前）：仅显式 False 阻断；None=跳过不算失败（all_manual/tool_missing 等 skipped
+    # 已由 degraded_reasons 可观测，should_write_success 据 degraded 另拦 L6）；
+    # True=通过不阻断；旧 checkpoint 缺键=未接线，不阻断。
+    # F5 复核注：常态下不可达——verify 的 acceptance 失败路径同时置 runtime_smoke_passed=False，
+    # 上方 rt 分支已按 classification 给出 acceptance 专类文案。本分支保留作纵深防御：
+    # 仅在 acceptance_passed=False 而 runtime_smoke_passed 缺失/非 False 的异常形态
+    # （手工构造 state/未来新写者）下兜底，杜绝断言失败被静默放行。
+    acc = state.get("acceptance_passed", None)
+    if acc is False:
+        return False, (
+            "acceptance_failed: 验收断言未通过（应用已启动但接口行为不符预期，"
+            "非启动/探活失败）"
+        )
 
     vf = state.get("verification_failure")
     if vf:

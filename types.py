@@ -295,6 +295,12 @@ class SubTask(BaseModel):
     scope: FileScope
     contract: dict[str, Any] = Field(default_factory=dict, description="共享接口契约")
     acceptance_criteria: list[str] = Field(default_factory=list)
+    covers: list[str] = Field(
+        default_factory=list,
+        description="S2-2：本子任务覆盖的需求条目 ID（req-<sha1[:8]>，见 state.requirement_items）。"
+        "PLAN LLM 声明、plan validator 覆盖矩阵校验消费（task#24）。加法兼容字段："
+        "旧 checkpoint/旧 LLM 输出无此键=默认空列表，绝不影响既有链路。",
+    )
     depends_on: list[str] = Field(default_factory=list, description="依赖的子任务 ID")
     model_preference: str | None = None
     retry_guidance: str = Field(

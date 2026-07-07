@@ -287,6 +287,24 @@ def prune_parallel_groups(groups, valid_ids) -> list:
     return pruned
 
 
+def _merge_dropped_into_survivor(keep: dict, drop: dict) -> dict:
+    """keep-first 去重的守恒面（S2 复核 F1）：被丢弃者的 covers（需求覆盖声明）与
+    acceptance_criteria（验收标准，含 contract_utils 机器写入的依赖/登记声明）以
+    【并集去重、survivor 在前】并入 survivor。丢了 covers 会让 validate_plan 的覆盖
+    矩阵把已实现条目误判"未覆盖"白烧 plan 重试预算；丢了 criteria 会让机器写入的
+    构建约定（依赖声明/根 pom 登记）随重复副本蒸发。比照 shared._merge_horizontal_subtasks
+    的并集口径（此处是 LLM 原始 dict 形态，非 SubTask 对象）。不 mutate 入参。"""
+    merged = dict(keep)
+    for key in ("covers", "acceptance_criteria"):
+        seen: list = [v for v in (keep.get(key) or []) if v]
+        for v in (drop.get(key) or []):
+            if v and v not in seen:
+                seen.append(v)
+        if seen:
+            merged[key] = seen
+    return merged
+
+
 def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
     """跨批重复子任务去重（治本 RUN6：分批分解把地基活每批各拆一遍）。
 
@@ -295,12 +313,20 @@ def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
     崩。判据：新建交付物签名（见 _fresh_deliverable_signature，零生态特判）非空且相等 → 同一
     桩活。保留依赖更少者（更地基，避免保留依赖倒置的副本）；位次相同保留先出现者。被丢弃者
     id 重映射到保留者，所有 depends_on 改指保留者。与 contract_utils"同文件写权唯一"同源。
+    S2 复核 F1：被丢弃者的 covers/acceptance_criteria 并入 survivor（见
+    _merge_dropped_into_survivor）——去重只消灭重复的【活】，不消灭覆盖声明/验收约定。
     """
     global_creates = frozenset().union(
         *[_norm_paths(st, "create_files") for st in subtasks]
     ) if subtasks else frozenset()
     keep_by_sig: dict[frozenset[str], dict] = {}
     drop_remap: dict[str, str] = {}  # 被丢弃 id -> 保留 id
+
+    def _replace_in_order(order_list: list[dict], old: dict, new: dict) -> None:
+        # 按对象身份替换（dict 相等性可能撞同内容子任务，identity 才唯一）
+        idx = next(i for i, o in enumerate(order_list) if o is old)
+        order_list[idx] = new
+
     order: list[dict] = []
     for st in subtasks:
         sig = _fresh_deliverable_signature(st, global_creates)
@@ -313,12 +339,17 @@ def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
             order.append(st)
             continue
         # 同签名重复：保留依赖更少者（更地基）。当前更地基则顶替 prev。
+        # 两个方向都把被丢弃者的 covers/criteria 并入 survivor（F1 守恒面）。
         if len(st.get("depends_on") or []) < len(prev.get("depends_on") or []):
             drop_remap[prev["id"]] = st["id"]
-            order[order.index(prev)] = st
-            keep_by_sig[sig] = st
+            survivor = _merge_dropped_into_survivor(st, prev)
+            _replace_in_order(order, prev, survivor)
+            keep_by_sig[sig] = survivor
         else:
             drop_remap[st["id"]] = prev["id"]
+            survivor = _merge_dropped_into_survivor(prev, st)
+            _replace_in_order(order, prev, survivor)
+            keep_by_sig[sig] = survivor
     if not drop_remap:
         return subtasks
     out: list[dict] = []

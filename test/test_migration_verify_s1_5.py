@@ -552,7 +552,10 @@ def test_node_smoke_inconclusive_flyway_failure_blocks(wired):
     from swarm.brain.gates import can_auto_accept_delivery
     allow, reason = can_auto_accept_delivery({"l2_passed": True, **out})
     assert allow is False
-    assert "runtime" in reason
+    # S2 复核 F5 语义适配：gates 现按 classification 分型文案——migration 失败如实说
+    # "migration_failed"（不再冒充"应用启动/探活失败"的 runtime 泛化文案）。
+    # 原意图（gates 端到端阻断 + 归因可读）保留且更精确。
+    assert reason.startswith("migration_failed")
 
 
 # ── F3：直接执行通道失败的证据也要进 runtime_smoke_details（migration 前缀键契约）──

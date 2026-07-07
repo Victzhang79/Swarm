@@ -13,7 +13,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-2500%2B%20passing-brightgreen.svg)](#-测试)
-[![Version](https://img.shields.io/badge/version-0.9.22-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.23-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -159,6 +159,7 @@ flowchart LR
 - **确定性闸门优先**：产物先过 L1 硬闸门（编译/测试/lint），**再**走 LLM 审查，最后人工 accept。修复轮用真实编译/lint 证据驱动，返工时清空旧完成态、防"提前宣告完成"。
 - **集成级不假绿**：L2 对全工程做真编译（Java 多模块 reactor / 各栈对应构建）；工具链缺失时**拒绝放行而非静默跳过**，绝不把"没验证"当"验证通过"。纯 docs/config、无构建文件的子任务合理跳过编译（`compile_ok=None`，非假绿）。
 - **运行时冒烟闸门**（v0.9.22）：编译通过不等于跑得起来——L2 后在沙箱**真启动应用**（manifest 证据推导启动命令/端口，多栈对称）+ TCP/HTTP 探活 + migration 执行验证。启动失败按证据三分类：代码错误→启动日志回灌定向修复（有界）；环境缺失（沙箱无外部 DB 等）→**如实跳过绝不冤枉代码**；分类不明→保守跳过。所有跳过带原因进交付报告（`degraded_reasons`），跳过轮不写入成功记忆。
+- **PRD 覆盖矩阵 + 验收断言**（v0.9.23）：需求先结构化为条目清单（每条**回指原文引文**确定性校验，防 LLM 幻觉需求）；计划期每个子任务声明覆盖哪些条目，**未覆盖的需求→拒绝计划回灌重规划**（有界）；条目再生成可执行验收断言（如 `POST /api/xxx → 201`），冒烟阶段对**真启动的应用**逐条执行——接口行为不符预期按断言证据回灌定向修复；推不出可自动验证形态的（如需登录态）如实标 manual 交人工。人工审核 payload 完整呈现覆盖矩阵+断言结果+冒烟/migration 结论。
 - **事实核验前置**：规划前先核对需求点名的文件/类/表是否**真实存在**——虚假前提强制转人工澄清而非硬跑。存在性同时查**工作区磁盘**与 **git 已跟踪**两个 ground truth，不依赖可能滞后的索引。
 
 **失败不是"全有或全无"——它走一条逐级消化的恢复阶梯：**

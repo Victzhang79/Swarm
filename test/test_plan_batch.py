@@ -168,6 +168,54 @@ def test_dedupe_is_ecosystem_agnostic():
     assert {s["id"] for s in out} == {"g1"}, "go.mod 生态同样判重，证明零生态特判"
 
 
+def test_dedupe_merges_covers_and_criteria_into_survivor():
+    """S2 复核 F1：keep-first 去重的守恒面——被丢弃者的 covers（需求覆盖声明）与
+    acceptance_criteria（含机器写入的依赖/登记声明）并集并入 survivor；丢了 covers
+    覆盖矩阵会误判"未覆盖"白烧 plan 重试，丢了 criteria 机器约定随副本蒸发。"""
+    from swarm.brain.plan_batch import dedupe_subtasks
+    a = {"id": "st-1", "scope": {"create_files": ["m/App.java"]}, "depends_on": [],
+         "covers": ["req-aaaa1111"],
+         "acceptance_criteria": ["模块可编译", "pom 必须声明依赖 [x]"]}
+    b = {"id": "st-7", "scope": {"create_files": ["m/App.java"]}, "depends_on": ["st-6"],
+         "covers": ["req-bbbb2222", "req-aaaa1111"],
+         "acceptance_criteria": ["模块可编译", "在根 pom.xml <modules> 登记全部新模块"]}
+    out = dedupe_subtasks([a, b])
+    assert [s["id"] for s in out] == ["st-1"], "同签名去重保留更地基者（既有行为）"
+    surv = out[0]
+    assert surv["covers"] == ["req-aaaa1111", "req-bbbb2222"], "covers 并集去重、survivor 在前"
+    assert surv["acceptance_criteria"] == [
+        "模块可编译", "pom 必须声明依赖 [x]", "在根 pom.xml <modules> 登记全部新模块",
+    ], "criteria 并集去重，机器写入声明不蒸发"
+
+
+def test_dedupe_merges_when_later_subtask_is_more_foundational():
+    """F1 对称面：后到者更地基（顶替 prev）方向同样并入被丢弃者的 covers/criteria。"""
+    from swarm.brain.plan_batch import dedupe_subtasks
+    first = {"id": "st-2", "scope": {"create_files": ["m/App.java"]},
+             "depends_on": ["st-1"], "covers": ["req-cccc3333"],
+             "acceptance_criteria": ["约定甲"]}
+    later_foundational = {"id": "st-5", "scope": {"create_files": ["m/App.java"]},
+                          "depends_on": [], "covers": ["req-dddd4444"],
+                          "acceptance_criteria": ["约定乙"]}
+    out = dedupe_subtasks([first, later_foundational])
+    assert [s["id"] for s in out] == ["st-5"], "依赖更少者顶替（既有行为）"
+    assert out[0]["covers"] == ["req-dddd4444", "req-cccc3333"]
+    assert out[0]["acceptance_criteria"] == ["约定乙", "约定甲"]
+
+
+def test_merge_subtask_batches_end_to_end_preserves_dropped_covers():
+    """F1 端到端：跨批同签名去重穿过 merge_subtask_batches（重编号+串行门控）后，
+    survivor 兼具两批的覆盖声明。"""
+    from swarm.brain.plan_batch import merge_subtask_batches
+    batch1 = [{"id": "st-1", "scope": {"create_files": ["m/App.java"]},
+               "depends_on": [], "covers": ["req-aaaa1111"]}]
+    batch2 = [{"id": "st-1", "scope": {"create_files": ["m/App.java"]},
+               "depends_on": [], "covers": ["req-bbbb2222"]}]
+    merged = merge_subtask_batches([batch1, batch2])
+    assert len(merged) == 1, "跨批重复脚手架应去重"
+    assert merged[0]["covers"] == ["req-aaaa1111", "req-bbbb2222"]
+
+
 def test_break_dependency_cycles_and_dangling():
     from swarm.brain.plan_batch import break_dependency_cycles
     subs = [

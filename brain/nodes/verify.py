@@ -440,11 +440,31 @@ async def verify_runtime(state: BrainState) -> dict:
             _migration_not_run_patch(derivation),
         )
 
+    # S2-5：验收断言生成（accept phase 前、建箱前——LLM 延迟不烧沙箱寿命）。
+    # 生成失败如实降级 assertions=[]（degraded 已在返回值里），绝不阻塞冒烟。
+    assertions, accept_gen_degraded, accept_gen_info = \
+        await _generate_acceptance_assertions(state, derivation)
+    assert_cmds: list[str] = []
+    if assertions:
+        from swarm.brain.acceptance_spec import assertion_to_probe_cmd
+        for spec in assertions:
+            # 只对 auth=="none" 且 kind=="http_probe" 生成执行片段；manual 绝不进脚本
+            if spec.get("kind") == "http_probe" and spec.get("auth") == "none":
+                try:
+                    assert_cmds.append(assertion_to_probe_cmd(spec, derivation.port))
+                except Exception as exc:  # noqa: BLE001 — 单条生成失败跳过该条，不阻断
+                    logger.warning("[VERIFY_RUNTIME] 断言 %s 执行片段生成失败(跳过该条): %s",
+                                   spec.get("id"), exc)
+
     # 冒烟预算 = 探活窗口 + run_command 收尾缓冲 + 节点内建箱/重建余量（与 L2 侧转交续期同口径）
     # F1：prepare_cmd 存在时加 prepare 预算（构建产物命令，JVM package 可到数分钟）
+    # S2-5：assert 段预算 = N 条 × (单条 curl max-time + 缓冲)，无断言时为 0（行为不变）
+    from swarm.brain.acceptance_spec import DEFAULT_PROBE_MAX_TIME_SEC
     smoke_window = resolve_smoke_timeout_sec()
     prepare_budget = resolve_prepare_timeout_sec() if derivation.prepare_cmd else 0
-    budget = smoke_window + RUN_TIMEOUT_BUFFER_SEC + 120 + prepare_budget
+    accept_budget = len(assert_cmds) * (
+        DEFAULT_PROBE_MAX_TIME_SEC + ACCEPT_PER_ASSERT_BUFFER_SEC)
+    budget = smoke_window + RUN_TIMEOUT_BUFFER_SEC + 120 + prepare_budget + accept_budget
 
     from swarm.worker.sandbox import get_sandbox_manager
     manager = get_sandbox_manager()
@@ -457,7 +477,7 @@ async def verify_runtime(state: BrainState) -> dict:
             _acquire_smoke_sandbox, manager, handoff_sid, project_id, project_path, budget,
         )
         if sandbox is None:
-            return _apply_migration_patch(
+            out = _apply_migration_patch(
                 _runtime_skipped_state(
                     skip_reason or "sandbox_unavailable",
                     f"冒烟沙箱不可得({skip_reason})，未执行（环境问题非代码失败）",
@@ -465,6 +485,11 @@ async def verify_runtime(state: BrainState) -> dict:
                 ),
                 _migration_not_run_patch(derivation),
             )
+            # S2-5：断言跟随 skip（冒烟未执行）+生成侧 degraded 留痕
+            out = _apply_migration_patch(
+                out, _run_accept_phase(assertions, accept_gen_info, None, ""))
+            out["acceptance_assertions"] = list(assertions)
+            return _append_degraded(out, accept_gen_degraded)
         # d. 探针执行（run_runtime_smoke 内部自带 to_thread + infra≠失败三分类）
         # F2：项目内符号索引（import 缺失归属判定）——建不出=None，分类器保守 dependency_missing
         try:
@@ -478,6 +503,9 @@ async def verify_runtime(state: BrainState) -> dict:
             prepare_cmd=derivation.prepare_cmd,
             timeout_sec=smoke_window,
             workdir=get_config().sandbox.sandbox_remote_workdir,
+            # S2-5：断言片段进冒烟脚本本体（探活 ok 后、收割/必杀前执行）——唯一不重启动
+            # 应用的执行路径（应用进程只活在单次 run_command 内，ACCEPTANCE_DESIGN 定案1）
+            assert_cmds=assert_cmds or None,
         )
         res = await run_runtime_smoke(
             manager, sandbox, script,
@@ -486,6 +514,7 @@ async def verify_runtime(state: BrainState) -> dict:
             prepare_timeout_sec=prepare_budget or None,
             project_symbols=project_symbols,
             probe_port=derivation.port,
+            accept_budget_sec=accept_budget or None,
         )
         # d2. S1-5：migration phase——必须在 finally 杀箱【之前】（直接执行通道复用同一
         #     沙箱）。_run_migration_phase 承诺不抛，绝不把冒烟结论污染成 node_exception。
@@ -494,7 +523,7 @@ async def verify_runtime(state: BrainState) -> dict:
         )
     except Exception as exc:  # noqa: BLE001 — infra 异常≠冒烟失败（D31 口径），如实 skipped
         logger.warning("[VERIFY_RUNTIME] 冒烟执行异常(infra) → skipped: %s", exc)
-        return _apply_migration_patch(
+        out = _apply_migration_patch(
             _runtime_skipped_state(
                 "node_exception",
                 f"冒烟节点异常(infra)，未执行: {str(exc)[:200]}",
@@ -502,6 +531,11 @@ async def verify_runtime(state: BrainState) -> dict:
             ),
             _migration_not_run_patch(derivation),
         )
+        # S2-5：断言跟随 skip（冒烟未执行）+生成侧 degraded 留痕
+        out = _apply_migration_patch(
+            out, _run_accept_phase(assertions, accept_gen_info, None, ""))
+        out["acceptance_assertions"] = list(assertions)
+        return _append_degraded(out, accept_gen_degraded)
     finally:
         # e. finally 必杀：转交/自建一视同仁；转交不成立时旧 sid 也一并处置（幂等）。
         used_sid = str(getattr(sandbox, "sandbox_id", "") or "")
@@ -519,6 +553,15 @@ async def verify_runtime(state: BrainState) -> dict:
     # S1-5：migration phase 结论并入（`_` 前缀是节点内部信号，绝不写进 state）
     mig_keys = {k: v for k, v in migration_patch.items() if not k.startswith("_")}
     mig_degraded = [migration_patch["_degraded"]] if migration_patch.get("_degraded") else []
+    # S2-5：accept phase 判定（纯函数——证据已随冒烟输出收割，杀箱后判定安全）
+    accept_patch = _run_accept_phase(
+        assertions, accept_gen_info, res.status,
+        str((res.details or {}).get("accept_output") or ""))
+    accept_keys = {k: v for k, v in accept_patch.items() if not k.startswith("_")}
+    accept_keys["acceptance_assertions"] = list(assertions)
+    accept_degraded = (
+        [accept_patch["_degraded"]] if accept_patch.get("_degraded") else []
+    ) + list(accept_gen_degraded)
 
     if migration_patch.get("_failed"):
         # migration 确定性 SQL 失败 → 并入 runtime 失败通道（task#20 的归因回灌统一消费）。
@@ -542,19 +585,46 @@ async def verify_runtime(state: BrainState) -> dict:
         mig_cmd = mig_ev.get("command") or mig_channel.get("command")
         if mig_cmd:
             mig_evidence_keys["migration_command"] = str(mig_cmd)
-        return {
+        return _append_degraded({
             **_runtime_failure_state(),
             "runtime_smoke_message": f"migration 验证失败: {migration_patch.get('_message') or ''}".strip(),
             "runtime_smoke_details": {
                 **details,
                 **mig_evidence_keys,
+                # S2 复核（审MED）：migration 与 acceptance 同轮双失败时，验收断言证据键
+                # 同样并入——runtime_failure_evidence 按前缀契约同时消费 migration*/acceptance*
+                # 两族，归因面不因"migration 通道优先定分类"而丢掉断言侧证据。
+                # accept 未失败时 _acceptance_evidence_keys 返回 {}（零行为差）。
+                **_acceptance_evidence_keys(accept_patch),
                 "classification": "migration_failed",
                 "smoke_status": res.status,
                 "smoke_classification": res.classification,
             },
             "runtime_smoke_sandbox_id": "",
             **mig_keys,
-        }
+            # S2-5：accept 结论如实并入（migration 失败通道优先，acceptance 键仅留痕）
+            **accept_keys,
+        }, accept_degraded)
+    if accept_patch.get("_failed"):
+        # S2-5：断言确定性失败 → 并入 runtime 失败通道（migration_failed 完全同构：
+        # classification=acceptance_failed 专类 + acceptance 前缀证据键，task#27 回灌消费）
+        logger.warning("[VERIFY_RUNTIME] 验收断言失败(确定性 HTTP 证据) → runtime 失败通道: %s",
+                       accept_patch.get("_message", ""))
+        return _append_degraded({
+            **_runtime_failure_state(),
+            "runtime_smoke_message":
+                f"验收断言失败: {accept_patch.get('_message') or ''}".strip(),
+            "runtime_smoke_details": {
+                **details,
+                **_acceptance_evidence_keys(accept_patch),
+                "classification": "acceptance_failed",
+                "smoke_status": res.status,
+                "smoke_classification": res.classification,
+            },
+            "runtime_smoke_sandbox_id": "",
+            **mig_keys,
+            **accept_keys,
+        }, mig_degraded + accept_degraded)
     if res.status == "passed":
         logger.info("[VERIFY_RUNTIME] 冒烟通过: %s", res.message)
         out = {
@@ -564,10 +634,9 @@ async def verify_runtime(state: BrainState) -> dict:
             "runtime_smoke_details": details,
             "runtime_smoke_sandbox_id": "",
             **mig_keys,
+            **accept_keys,
         }
-        if mig_degraded:
-            out["degraded_reasons"] = mig_degraded
-        return out
+        return _append_degraded(out, mig_degraded + accept_degraded)
     if res.status == "failed":
         logger.warning("[VERIFY_RUNTIME] 冒烟失败(%s): %s", res.classification, res.message)
         out = {
@@ -576,13 +645,14 @@ async def verify_runtime(state: BrainState) -> dict:
             "runtime_smoke_details": details,
             "runtime_smoke_sandbox_id": "",
             **mig_keys,
+            **accept_keys,
         }
-        if mig_degraded:
-            out["degraded_reasons"] = mig_degraded
-        return out
+        return _append_degraded(out, mig_degraded + accept_degraded)
     logger.info("[VERIFY_RUNTIME] 冒烟跳过(%s): %s", res.classification, res.message)
-    return _apply_migration_patch(
+    out = _apply_migration_patch(
         _runtime_skipped_state(res.classification, res.message, details), migration_patch)
+    out.update(accept_keys)
+    return _append_degraded(out, accept_degraded)
 
 
 def _acquire_smoke_sandbox(
@@ -685,6 +755,10 @@ def _runtime_skipped_state(reason: str, message: str, details: dict) -> dict:
         # 有真实 migration phase 结果时由 _apply_migration_patch 覆盖）
         "migration_verify_passed": None,
         "migration_verify_details": {"reason": "smoke_not_executed"},
+        # S2-5：acceptance 结论默认=未验证（同上早退防粘滞；有真实 accept phase 结果
+        # 时由调用方以 accept patch 覆盖）
+        "acceptance_passed": None,
+        "acceptance_details": {"reason": "smoke_not_executed"},
         "degraded_reasons": [f"runtime_smoke_skipped:{reason}"],
     }
 
@@ -785,6 +859,276 @@ async def _run_migration_phase(manager, sandbox, derivation, project_stack,
                 "migration_verify_details": {"reason": "migration_phase_error",
                                              "kind": kind, "error": str(exc)[:300]},
                 "_degraded": "migration_verify_skipped:migration_phase_error"}
+
+
+# ═══════════════ S2-5：ACCEPT 验收断言（生成 + phase 判定） ═══════════════
+
+# 断言生成有界重试（对齐 requirements_extract.MAX_EXTRACT_RETRIES 口径：首发 + 2 次）
+MAX_ACCEPT_GEN_RETRIES = 2
+# 单条断言的执行预算余量（curl --max-time 之外的进程起停/文件 IO 缓冲）
+ACCEPT_PER_ASSERT_BUFFER_SEC = 2
+
+
+def _accept_design_context(state: BrainState, derivation) -> str:
+    """断言生成 prompt 的设计/接口上下文（有界截断）。
+
+    verify 期生成的证据优势：设计/plan 已定型、merged_diff 含真实路由/接口定义、
+    冒烟推导已给出 port/health 证据——断言路径的防臆造纪律（acceptance_spec prompt
+    纪律2 evidence 回指）有最全的语料可回指。
+    """
+    parts: list[str] = []
+    if derivation is not None:
+        parts.append(
+            f"运行时推导证据: port={getattr(derivation, 'port', None)}, "
+            f"health_path={getattr(derivation, 'health_path', None) or '/'}")
+    td = state.get("tech_design")
+    if isinstance(td, dict) and td:
+        try:
+            parts.append("技术方案(节选): " + json.dumps(td, ensure_ascii=False)[:3000])
+        except Exception:  # noqa: BLE001 — 上下文是增强面，序列化失败不阻断
+            pass
+    diff = (state.get("merged_diff") or "").strip()
+    if diff:
+        # VERIFY_L3 merged_diff[:4000] 截断先例：diff 含真实接口/路由定义，是断言路径最强证据
+        parts.append("合并 diff(节选，含真实接口/路由定义):\n" + diff[:4000])
+    return "\n\n".join(parts)
+
+
+async def _generate_acceptance_assertions(
+    state: BrainState, derivation,
+) -> tuple[list[dict], list[str], dict]:
+    """验收断言生成 → (assertions, degraded_reasons, gen_info)。承诺不抛。
+
+    生成点裁决（ACCEPTANCE_DESIGN 定的"与 requirement 抽取同节点"与前批产物冲突——
+    extract_requirements 已冻结且不产断言）：落 verify_runtime 内、accept phase 前。
+    幂等：state.acceptance_assertions 已存在（replan 重入/resume）→ 复用不重烧 LLM
+    （断言挂 requirement item 级，replan 不改 items，复用语义安全）。
+    fail-closed：requirement_items 空 → 跳过生成（常态非降级）；LLM 失败/全被
+    validate_assertions 剔除 → 有界重试后如实降级 assertions=[] + degraded，绝不阻塞冒烟。
+    """
+    try:
+        existing = state.get("acceptance_assertions")
+        if existing:
+            return list(existing), [], {"reason": "reused_existing"}
+        items = state.get("requirement_items") or []
+        if not items:
+            return [], [], {"reason": "no_requirement_items"}
+
+        from swarm.brain.acceptance_spec import (
+            build_assertion_generation_prompt,
+            validate_assertions,
+        )
+        design_context = _accept_design_context(state, derivation)
+        prompt = build_assertion_generation_prompt(items, design_context)
+
+        valid: list[dict] = []
+        rejected: list[dict] = []
+        feedback = ""
+        llm_error: str | None = None
+        for attempt in range(1 + MAX_ACCEPT_GEN_RETRIES):
+            try:
+                # lazy import：可 patch 的有状态符号从 nodes 命名空间取（A6 防环先例）
+                from swarm.brain import nodes as _nodes
+                llm = _nodes._get_brain_llm()
+                resp = await llm.ainvoke([{"role": "user", "content": prompt + feedback}])
+                raw = _nodes._parse_json_from_llm(resp.content)
+            except Exception as exc:  # noqa: BLE001
+                llm_error = str(exc)[:120]
+                logger.warning("[VERIFY_RUNTIME] 断言生成 LLM 调用/解析失败（第 %d 次）: %s",
+                               attempt + 1, llm_error)
+                feedback = "\n【上一轮输出无法解析为规定 JSON 数组，请严格只输出 JSON 数组】"
+                continue
+            if isinstance(raw, dict):
+                # 容错：{"assertions": [...]}/{"items": [...]} 包装形态
+                raw = raw.get("assertions") or raw.get("items") or raw
+            # S2 复核 F7：把生成时用的 design_context 作为 grounding 语料传入——
+            # http_probe 断言的 evidence 必须回指该语料（防臆造 API 路径），
+            # 回指不上的条目被确定性降级 manual（保留人工可见，不静默丢）。
+            valid, rejected = validate_assertions(
+                raw, items, context_text=design_context)
+            if valid:
+                break
+            logger.warning("[VERIFY_RUNTIME] 第 %d 次断言生成零合法条目（rejected=%d）",
+                           attempt + 1, len(rejected))
+            feedback = (
+                f"\n【上一轮输出全部被确定性校验剔除（{len(rejected)} 条）："
+                "id/req_id/kind/path/expect 必须严格符合 schema，req_id 必须逐字回指条目 id。"
+                "请重新生成，只输出 JSON 数组】"
+            )
+
+        degraded: list[str] = []
+        info: dict = {"generated": len(valid), "rejected": len(rejected)}
+        if rejected:
+            # 被拒条目不静默丢（"仅条件写无人清"历史 bug 模式）：计数入 degraded + 原因入 info
+            degraded.append(f"acceptance_generation:rejected={len(rejected)}")
+            info["rejected_reasons"] = [str(r.get("reason", ""))[:120] for r in rejected[:10]]
+        if not valid:
+            reason = f"llm_failed:{llm_error}" if llm_error and not rejected \
+                else "all_rejected_or_empty"
+            degraded.append(f"acceptance_generation:empty({reason})")
+            info["reason"] = "generation_degraded"
+        logger.info("[VERIFY_RUNTIME] 断言生成完成：%d 条合法，%d 条被拒",
+                    len(valid), len(rejected))
+        return valid, degraded, info
+    except Exception as exc:  # noqa: BLE001 — 生成是增强面，任何异常绝不阻塞冒烟
+        logger.warning("[VERIFY_RUNTIME] 断言生成异常 → 降级 assertions=[]: %s", exc)
+        return [], [f"acceptance_generation:empty(error:{str(exc)[:120]})"], \
+            {"reason": "generation_degraded"}
+
+
+def _run_accept_phase(
+    assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
+) -> dict:
+    """S2-5 accept phase 判定（纯函数，无沙箱 IO——证据已随冒烟输出收割，杀箱后判定安全）。
+
+    镜像 _run_migration_phase 契约：承诺不抛；返回 patch 片段 = state 键
+    acceptance_passed/acceptance_details + 内部信号 `_failed`（断言确定性失败 →
+    调用方并入 runtime 失败通道）/`_degraded`/`_message`（`_` 前缀绝不写进 state）。
+    """
+    try:
+        return _accept_phase_verdict(assertions, gen_info, smoke_status, accept_output)
+    except Exception as exc:  # noqa: BLE001 — accept phase 异常绝不污染冒烟结论
+        logger.warning("[VERIFY_RUNTIME] accept phase 异常 → skipped: %s", exc)
+        return {"acceptance_passed": None,
+                "acceptance_details": {"reason": "accept_phase_error",
+                                       "error": str(exc)[:300]},
+                "_degraded": "acceptance_skipped:accept_phase_error"}
+
+
+def _accept_phase_verdict(
+    assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
+) -> dict:
+    from swarm.brain.acceptance_spec import evaluate_probe_result, parse_probe_output
+    from swarm.brain.nodes.runtime_smoke import MARK_ACCEPT_TOOL_MISSING
+
+    specs = [a for a in (assertions or []) if isinstance(a, dict)]
+    executable = [a for a in specs
+                  if a.get("kind") == "http_probe" and a.get("auth") == "none"]
+    manual = [a for a in specs
+              if not (a.get("kind") == "http_probe" and a.get("auth") == "none")]
+    base: dict = {"total": len(specs), "manual_count": len(manual)}
+    manual_rows = [{"id": a.get("id"), "req_id": a.get("req_id"), "kind": a.get("kind"),
+                    "auth": a.get("auth"), "verdict": "skipped_manual"} for a in manual]
+
+    if not specs:
+        # 未生成（items 空=常态 / 生成降级=生成侧已 degraded）→ None，不重复记降级
+        return {"acceptance_passed": None,
+                "acceptance_details": {
+                    **base, "reason": str(gen_info.get("reason") or "no_assertions")}}
+
+    if smoke_status != "passed":
+        # 冒烟本身 failed/skipped/未执行 → 断言未执行，跟随 skip（migration phase 同语义）
+        reason = f"smoke_{smoke_status or 'not_executed'}"
+        patch: dict = {"acceptance_passed": None,
+                       "acceptance_details": {**base, "reason": reason,
+                                              "assertions": manual_rows}}
+        if executable:
+            patch["_degraded"] = f"acceptance_skipped:{reason}"
+        return patch
+
+    if not executable:
+        # 全 manual：阶段2 不自动执行（鉴权边界，ACCEPTANCE_DESIGN §5.3），可观测降级
+        return {"acceptance_passed": None,
+                "acceptance_details": {**base, "reason": "all_manual",
+                                       "assertions": manual_rows},
+                "_degraded": "acceptance_skipped:all_manual"}
+
+    if MARK_ACCEPT_TOOL_MISSING in (accept_output or ""):
+        # 断言执行工具（curl）缺失：环境缺失绝不伪装断言失败（probe_tool_missing 同口径）
+        return {"acceptance_passed": None,
+                "acceptance_details": {**base, "reason": "assert_tool_missing",
+                                       "assertions": manual_rows},
+                "_degraded": "acceptance_skipped:assert_tool_missing"}
+
+    parsed = parse_probe_output(accept_output or "")
+    rows: list[dict] = []
+    fail_count = 0
+    not_executed = 0
+    inconclusive = 0
+    for spec in executable:
+        sid = str(spec.get("id"))
+        req = spec.get("request") or {}
+        row: dict = {"id": sid, "req_id": spec.get("req_id"),
+                     "request": {"method": req.get("method"), "path": req.get("path")},
+                     "expect": dict(spec.get("expect") or {})}
+        entry = parsed.get(sid)
+        if entry is None:
+            # 标记缺失=脚本没跑到/输出被截（infra）→ 不判失败也绝不判通过
+            row.update({"verdict": "not_executed",
+                        "reason": "断言标记缺失（infra/输出截断），未执行"})
+            not_executed += 1
+        else:
+            verdict = evaluate_probe_result(spec, entry.get("http_code"),
+                                            entry.get("body_text"))
+            passed = verdict.get("passed")
+            # S2 复核 F6：evaluate 三值——None=inconclusive（000/超时/无应答，infra
+            # 不确定），绝不计入 fail_count（infra≠断言失败，不冤枉写者子任务）。
+            if passed is None:
+                row_verdict = "inconclusive"
+                inconclusive += 1
+            elif passed:
+                row_verdict = "pass"
+            else:
+                row_verdict = "fail"
+                fail_count += 1
+            row.update({"http_code": entry.get("http_code"),
+                        "body_excerpt": (entry.get("body_text") or "")[:200],
+                        "verdict": row_verdict,
+                        "reason": str(verdict.get("reason") or "")})
+        rows.append(row)
+    rows.extend(manual_rows)
+    details = {**base, "assertions": rows, "executable_count": len(executable),
+               "failed_count": fail_count, "not_executed_count": not_executed,
+               "inconclusive_count": inconclusive}
+
+    if fail_count:
+        # 任一【结论性 fail】→ False（拿到了真实 HTTP 应答且不符期待，确定性证据）
+        fails = [r for r in rows if r.get("verdict") == "fail"]
+        msg = "；".join(
+            f"[{r['id']}] {(r.get('request') or {}).get('method')} "
+            f"{(r.get('request') or {}).get('path')} → {r.get('reason')}"
+            for r in fails[:3])
+        return {"acceptance_passed": False,
+                "acceptance_details": {**details, "reason": "assertion_failed"},
+                "_failed": True, "_message": msg}
+    if not_executed:
+        # 部分/全部断言无证据（infra）→ 不能担保 True，也不冤枉成 False
+        return {"acceptance_passed": None,
+                "acceptance_details": {**details, "reason": "markers_missing"},
+                "_degraded": "acceptance_skipped:markers_missing"}
+    if inconclusive:
+        # S2 复核 F6：无 fail 但有 inconclusive（000/超时）→ 诚实不确定 None + degraded
+        # （不假绿也不冤枉——连接失败可能是应用瞬时抖动/HEAD 干等等 infra 形态）
+        return {"acceptance_passed": None,
+                "acceptance_details": {**details, "reason": "inconclusive"},
+                "_degraded": f"acceptance_skipped:inconclusive={inconclusive}"}
+    return {"acceptance_passed": True,
+            "acceptance_details": {**details, "reason": "all_passed"}}
+
+
+def _acceptance_evidence_keys(accept_patch: dict) -> dict:
+    """断言失败证据以 `acceptance` 前缀键并入 runtime_smoke_details——镜像 migration F3
+    契约（shared.runtime_failure_evidence 按键名前缀消费，task#27 接线读侧）。"""
+    rows = (accept_patch.get("acceptance_details") or {}).get("assertions") or []
+    fails = [r for r in rows if r.get("verdict") == "fail"]
+    if not fails:
+        return {}
+    evidence = "\n".join(
+        f"[{r.get('id')}] req={r.get('req_id')} "
+        f"{(r.get('request') or {}).get('method')} {(r.get('request') or {}).get('path')} "
+        f"→ {r.get('reason')}；实得 http_code={r.get('http_code')}；"
+        f"body 头部: {r.get('body_excerpt', '')}"
+        for r in fails)
+    return {"acceptance_evidence": evidence,
+            "acceptance_failed_count": len(fails),
+            "acceptance_failures": fails}
+
+
+def _append_degraded(out: dict, reasons: list[str]) -> dict:
+    """degraded_reasons 追加不覆盖（_apply_migration_patch 同口径的列表版）。"""
+    if reasons:
+        out["degraded_reasons"] = list(out.get("degraded_reasons") or []) + list(reasons)
+    return out
 
 
 def _runtime_failure_state() -> dict:
