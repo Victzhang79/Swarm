@@ -140,7 +140,17 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                 if _sc:
                     _ab_files += list(getattr(_sc, "writable", []) or [])
                     _ab_files += list(getattr(_sc, "create_files", []) or [])
-            _ab_files = sorted({f for f in _ab_files if f})
+            # 复核 MEDIUM：绝不清理【存活子任务】scope 内的文件——单写者不变量下本不重叠，但
+            # 路径巧合(共享 VO/DTO 包)时防误删存活子任务的真产出(git clean 只删 untracked)。
+            _alive_files: set[str] = set()
+            for _s in plan_obj.subtasks:
+                if _s.id in _ab_ids:
+                    continue
+                _asc = getattr(_s, "scope", None)
+                if _asc:
+                    _alive_files |= set(getattr(_asc, "writable", []) or [])
+                    _alive_files |= set(getattr(_asc, "create_files", []) or [])
+            _ab_files = sorted({f for f in _ab_files if f and f not in _alive_files})
             if _ab_files:
                 try:
                     import subprocess as _sp

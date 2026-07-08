@@ -63,6 +63,41 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     return l1_details_of(subtask_results.get(fid))
 
 
+def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str) -> list:
+    """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
+    推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built（本就 JVM 包语义）；推不出→空
+    （调用方回落连坐放弃，绝不空烧自愈预算）。★把文件加进 create_files（而非 allow_any）：既让
+    scope 闸门放行 worker 新建，又使 _writable_files 把它拉回本地（allow_any 在非空声明 scope 下
+    拉不回=复核 HIGH#2），且放弃时 #7 purge 也认得它★。"""
+    import re
+    _MARKERS = ("/src/main/java/", "/src/test/java/",
+                "/src/main/kotlin/", "/src/test/kotlin/")
+    srcroot = None
+    for f in scope_files:
+        fn = str(f).replace("\\", "/")
+        for mk in _MARKERS:
+            i = fn.find(mk)
+            if i >= 0:
+                srcroot = fn[:i + len(mk)]
+                break
+        if srcroot:
+            break
+    if not srcroot or not blocked_pkgs:
+        return []
+    # 缺失类名：javac "cannot find symbol ... symbol: class X"（首字母大写=类型名，滤掉方法/变量）
+    classes = {c for c in re.findall(r"symbol:\s*class\s+([A-Za-z_]\w*)", build_output or "")
+               if c[:1].isupper()}
+    if not classes:
+        return []
+    ext = ".kt" if "kotlin" in srcroot else ".java"
+    out: list[str] = []
+    for pkg in blocked_pkgs:
+        pkgpath = str(pkg).strip().replace(".", "/")
+        for cls in sorted(classes):
+            out.append(f"{srcroot}{pkgpath}/{cls}{ext}")
+    return sorted(set(out))
+
+
 async def _handle_failure_impl(state: BrainState) -> dict:
     """HANDLE_FAILURE 核心逻辑（按 strategy 分支：retry / retry_alternate / replan / escalate）。
 
@@ -450,30 +485,55 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     _unrecoverable.add(fid)  # 自愈预算耗尽 → 回落连坐放弃
                     continue
                 _st = _by_id.get(fid)
-                _bpkgs = (_det_of(subtask_results.get(fid)).get("blocked_on_packages") or [])
-                _st.scope.allow_any = True
+                _det2 = _det_of(subtask_results.get(fid))
+                _bpkgs = _det2.get("blocked_on_packages") or []
+                _sc = _st.scope
+                _decl = (list(getattr(_sc, "writable", []) or [])
+                         + list(getattr(_sc, "create_files", []) or []))
+                _new_files = _derive_missing_type_files(
+                    _decl, _bpkgs, _det2.get("build_output") or "")
+                if not _new_files:
+                    # 推不出该建哪个文件 → 自愈无从下手 → 回落连坐放弃(不空烧预算、不假装能修)
+                    _unrecoverable.add(fid)
+                    continue
+                _cf = list(getattr(_sc, "create_files", []) or [])
+                for _nf in _new_files:
+                    if _nf not in _cf:
+                        _cf.append(_nf)
+                _sc.create_files = _cf  # ★纳入 create_files：scope 放行新建 + _writable_files 拉回本地★
                 _st.retry_guidance = (
-                    f"你的代码引用了项目内不存在、且无任何子任务负责生产的内部类型/包 {_bpkgs}"
-                    f"（编译报 package does not exist / cannot find symbol）。这些是本功能自身需要的"
-                    f"类型（如 VO/DTO/枚举/请求响应对象等），请在本模块内【一并新建】这些被引用的类型"
-                    f"使编译通过，而不是假设它们已存在。"
+                    f"你的代码引用了项目内不存在、且无任何子任务负责生产的内部类型 {_bpkgs}"
+                    f"（编译报 package does not exist / cannot find symbol）。这是本功能自身需要的类型，"
+                    f"已把待建文件 {[p.rsplit('/', 1)[-1] for p in _new_files][:6]} 纳入你的可写范围——"
+                    f"请在本模块内【新建】它们（VO/DTO/枚举/请求响应对象等）使编译通过，而非假设已存在。"
                 )[:800]
                 _sh_trc[fid] = _sh_trc.get(fid, 0) + 1
                 _healed.append(fid)
             if _healed:
+                # 复核 HIGH#1（混批）：真死上游 _unrecoverable 在同一 return 里【照常连坐放弃】，
+                # 绝不因存在自愈项就拖着不放弃；只重派【已愈】项，放弃/未愈项不重派。
+                _ab = _transitive_abandon(
+                    plan_obj.subtasks,
+                    set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
+                ) if _unrecoverable else set()
+                for _a in _ab:
+                    subtask_results.pop(_a, None)
                 _sh_rc = dict(state.get("subtask_retry_counts", {}))
                 for fid in _healed:
                     _sh_rc[fid] = 0  # 因 scope 不可满足而徒劳的重试不计入常规配额
-                _sh_remaining = list(state.get("dispatch_remaining") or [])
-                for fid in failed_ids:  # 已愈 + 混批中未愈的失败项都放回，未愈者下轮再判/放弃
+                _sh_remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in _ab]
+                for fid in _healed:
+                    if fid in _ab:  # 已愈但落在放弃闭包(依赖真死上游)→随闭包放弃，不重派
+                        continue
                     subtask_results.pop(fid, None)
                     if fid not in _sh_remaining:
                         _sh_remaining.append(fid)
                 logger.warning(
-                    "[HANDLE_FAILURE] round36 P0 自愈：无生产者内部包(worker 自造引用) %s → 授 allow_any"
-                    " + 提示本模块补建被引类型 + 重派(按子任务熔断 %s/%d)，避免一个自造引用连坐放弃依赖闭包",
-                    _healed, {k: _sh_trc[k] for k in _healed}, _sh_max)
-                return {
+                    "[HANDLE_FAILURE] round36 P0 自愈：无生产者内部类型(worker 自造引用) → 把待建类型文件"
+                    "纳入 create_files 让消费者本模块补建 + 重派(按子任务熔断 %s/%d)；同批真死上游 %s "
+                    "照常连坐放弃 %d",
+                    {k: _sh_trc[k] for k in _healed}, _sh_max, sorted(_unrecoverable), len(_ab))
+                _ret = {
                     "plan": plan_obj,
                     "subtask_results": subtask_results,
                     "dispatch_remaining": _sh_remaining,
@@ -483,6 +543,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "targeted_recovery_counts": _sh_trc,
                     "subtask_retry_counts": _sh_rc,
                 }
+                if _ab:
+                    _ret["abandoned_subtask_ids"] = sorted(_ab)
+                return _ret
         if _unrecoverable:
             abandoned = _transitive_abandon(
                 plan_obj.subtasks,
