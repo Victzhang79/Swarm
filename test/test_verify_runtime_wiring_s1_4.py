@@ -56,7 +56,7 @@ class _StubManager:
     def remaining_lifetime(self, sandbox_id):
         return self.remaining
 
-    def create(self, project_id=None, source=""):
+    def create(self, project_id=None, source="", template_id=None):
         self.created.append(source)
         sb = _StubSandbox("sb-selfbuilt")
         self._instances[sb.sandbox_id] = sb

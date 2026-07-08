@@ -2460,8 +2460,24 @@ def _run_reactor_build_in_sandbox(
         return False, False, "", None
     sandbox = None
     handed_off = False
+    # R34-7 根因治本（沙箱机实测坐实）：默认模板 tpl-c0ff5c0d=sandbox-python:v3，本就无
+    # Maven——L2 集成编译撞 "mvn: command not found" 的真因是【选错模板】非模板缺装。
+    # worker（executor.py:404）读项目专属烤源模板 project.config.sandbox_template
+    # （=Java+Maven+源码全烤的 sandbox-proj-<id> 镜像）显式传 create；L2 探针此前裸调
+    # create 落到默认 python 模板。这里镜像 worker 同一解析：优先项目专属模板，无则回退
+    # 默认（多栈通用——项目模板由 image_builder 按真实栈烤，Python/Go/JS 项目各自适配）。
+    _l2_tpl = ""
+    if project_id:
+        try:
+            from swarm.project.store import get_project
+            _proj = get_project(project_id)
+            _l2_tpl = ((_proj or {}).get("config") or {}).get("sandbox_template", "") or ""
+        except Exception as _exc:  # noqa: BLE001 — 读失败回退默认，不阻断
+            logger.debug("[VERIFY_L2] 读项目专属模板失败，回退默认: %s", _exc)
     try:
-        sandbox = manager.create(project_id=project_id or None, source="verify_l2_compile")
+        sandbox = manager.create(
+            template_id=_l2_tpl or None,
+            project_id=project_id or None, source="verify_l2_compile")
         manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
         # 包 echo __RC__$? 取退出码，robust 不依赖 result 对象的 exit_code 字段形态。
         result = run_command(

@@ -321,6 +321,50 @@ def test_l2_tool_missing_classified_as_sandbox_unavailable(monkeypatch, tmp_path
     assert killed == ["s1"], "探针沙箱必须被清理（finally 必杀不因早退漏杀）"
 
 
+def test_l2_uses_project_baked_template(monkeypatch, tmp_path):
+    """R34-7 根因：L2 探针必须读项目专属烤源模板（Java+Maven 全烤）传 create，
+    而非裸调落默认 python 模板（沙箱机实测 tpl-c0ff5c0d=python:v3 无 mvn）。"""
+    from swarm.brain import nodes as nodes_mod
+
+    class _Res:
+        stdout = "BUILD SUCCESS\n__RC__0\n"
+        stderr = ""
+
+    class _Sb:
+        sandbox_id = "s1"
+
+    seen = {}
+
+    class _Mgr:
+        def create(self, template_id=None, **kw):
+            seen["template_id"] = template_id
+            return _Sb()
+
+        def sync_project_to_sandbox(self, *a, **kw):
+            pass
+
+        def run_command(self, sandbox, cmd, timeout=600):
+            return _Res()
+
+        def kill(self, sid):
+            pass
+
+    import swarm.worker.sandbox as sbx
+    import swarm.project.store as pstore
+    monkeypatch.setattr(sbx, "get_sandbox_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        pstore, "get_project",
+        lambda pid: {"config": {"sandbox_template": "tpl-proj-java"}},
+        raising=False)
+    monkeypatch.setattr(nodes_mod, "_try_handoff_compile_sandbox_for_smoke",
+                        lambda *a, **k: None, raising=False)
+    ran, ok, _out, _sid = nodes_mod._run_reactor_build_in_sandbox(
+        str(tmp_path), "5d0e9db8", "mvn -q compile", timeout=60)
+    assert ran is True and ok is True
+    assert seen["template_id"] == "tpl-proj-java", \
+        "L2 必须用项目专属烤源模板（与 worker 同源），不落默认 python"
+
+
 # ─────────────── G7/R34-3: 覆盖增量日志 ───────────────
 
 async def test_coverage_delta_logged_across_attempts(monkeypatch):
