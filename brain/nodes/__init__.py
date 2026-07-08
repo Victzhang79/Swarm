@@ -764,6 +764,11 @@ async def _plan_ultra_batched(
     # 执行失败，缓存批必须带 replan 教训真跑（宁慢勿错，回退 pre-U2 行为）。
     _repair_retry = bool(state.get("plan_batch_failed_modules")) and not (
         state.get("replan_feedback") or "").strip()
+    # R35-C 前向回退护栏启用条件（round35 坐实：attempt0 全成 12/12→纯覆盖重试丢弃该轮缓存
+    # 全量重拆→burst 压垮 SiliconFlow→attempt0 成功的批反超时被丢→11/12 残缺 fail-fast）。
+    # 与 _repair_retry 正交：护栏在【纯覆盖重试】(failed=[]、上一轮全成) 也生效——只要非执行
+    # 失败 replan 轮（replan_feedback 空，守 F-3：replan 轮必须带教训真跑，绝不回放被否决旧子任务）。
+    _allow_cache_fallback = not (state.get("replan_feedback") or "").strip()
     _batch_cache_new: dict = {}
 
     async def _decompose_batch(i: int, mod_name: str, batch: list) -> tuple:
@@ -891,6 +896,31 @@ async def _plan_ultra_batched(
                         mod_name, _attempt, _PLAN_BATCH_MAX_ATTEMPTS, last_fail[0],
                     )
                     await _asyncio.sleep(min(2.0 * _attempt, 8.0))
+            # R35-C 前向回退护栏：耗尽仍失败(timeout/error/空) 且【非 replan 轮】(守 F-3)，若
+            # 上一轮该批已成功缓存(非 bisect 哨兵)→回放子任务而非丢模块。仅纯覆盖重试等回炉轮
+            # 生效——本轮先真跑 LLM 争新 covers，失败才回放，故对覆盖/完整度都不劣于旧行为；
+            # 有界(MAX_PLAN_RETRY=3→CONFIRM)。回放件是上一轮【已校验成功】的子任务=合法完整
+            # 交付，非失败伪装：不计 plan_batch_failed_modules（那会误触 fail-fast 拒完整计划）。
+            # 副效：跳过该批 bisect 整批重烧，削减回炉轮 token 浪费。缓存持久化见 plan()/validate_plan。
+            if _allow_cache_fallback and (
+                    last_fail[0] in ("timeout", "error")
+                    or (last_fail[0] == "ok" and not last_fail[3])):
+                _fb_hit = _batch_cache_prev.get(_sig)
+                if (_fb_hit and not _fb_hit.get("bisected")
+                        and (_fb_hit.get("subtasks") or [])):
+                    _fb_subs = json.loads(json.dumps(_fb_hit.get("subtasks") or []))
+                    _fb_bl = list(_fb_hit.get("baseline") or [])
+                    if _fb_bl:
+                        _baseline_decls.extend(_fb_bl)
+                    _batch_cache_new[_sig] = {
+                        "module": mod_name,
+                        "subtasks": _fb_hit.get("subtasks") or [],
+                        "baseline": _fb_bl}
+                    logger.warning(
+                        "[PLAN-BATCH] R35-C 模块'%s' 本轮分解失败(%s)→回放上一轮成功缓存 "
+                        "%d 子任务（防纯覆盖重试完整度回退，免整批重烧；非 replan 轮）",
+                        mod_name, last_fail[0], len(_fb_subs))
+                    return ("ok", i, mod_name, _fb_subs, 0.0, len(batch))
             return last_fail
 
     # gather 按输入顺序返回 → 保持 module_batches(模块依赖序)的批次顺序
@@ -1456,10 +1486,12 @@ async def plan(state: BrainState) -> dict:
         "plan_batch_failed_modules": _plan_batch_failed,
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
-        # R32-1 U2 always-emit：本轮成功批缓存（补齐型重试复用；非分批/降级路径恒 {}）。
-        # 复核 F-4：批全成时缓存按自身规则永远无人消费——落 {} 不把数十 KB 死重灌进
-        # 每次 checkpoint（D51 plan 体积病灶同族）。
-        "plan_batch_cache": _plan_batch_cache if _plan_batch_failed else {},
+        # R32-1 U2 + R35-C always-emit：本轮成功批缓存（非分批/降级路径恒 {}）。
+        # ★R35-C（round35 坐实）：全成轮【也】落缓存——纯覆盖重试轮(上一轮全成)靠它做前向
+        # 回退护栏（某批本轮失败→回放上轮成功子任务，防完整度回退）。这推翻了 F-4"全成轮缓存
+        # 无人消费落 {}"的前提（现在有人消费=护栏）。F-4 的 checkpoint 膨胀顾虑改由
+        # validate_plan 覆盖+校验【通过】时清空缓存兜住（仅驻留 PLAN 回炉窗口，过闸即清）。★
+        "plan_batch_cache": _plan_batch_cache or {},
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
@@ -1598,6 +1630,9 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_retry_count": retry_count,
             "plan_validation_issues": [],
             "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
+            # R35-C 复核（hunter #3）：SIMPLE 通过路径也显式清缓存——结构对称，绝不依赖上游
+            # plan() 同轮 SIMPLE 分支的顺带清理（跨节点隐式不变量正是横切盲区，见记忆）。
+            "plan_batch_cache": {},
         }
 
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
@@ -1744,6 +1779,10 @@ async def validate_plan(state: BrainState) -> dict:
         "plan_validation_issues": _final_issues,
         # D09：LLM/P6b 完整性校验失败原因回灌 PLAN（通过则清空，防跨轮粘滞）
         "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues),
+        # R35-C 配套（F-4 膨胀兜底）：校验【通过】即清空 plan-batch 缓存——过闸后进 CONFIRM/
+        # DISPATCH 无更多 PLAN 回炉轮，缓存无人再消费，清掉不让数十 KB 死重随后续 checkpoint
+        # 长途漂流（D51 病灶同族）。未通过(回炉 PLAN)不清=下一轮护栏要用。
+        **({"plan_batch_cache": {}} if plan_valid else {}),
         # S2-3：覆盖矩阵因 items 缺失被跳过时诚实留痕（degraded_reasons 是 reducer 键，
         # 追加去重；无跳过时不发键，零噪声）。
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),

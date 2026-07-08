@@ -246,6 +246,131 @@ async def test_replan_feedback_disables_cache(monkeypatch):
     assert llm2.calls.get("ok") == 1, "replan 路径缓存必须禁用"
 
 
+# ═══════════ R35-C：纯覆盖重试前向回退护栏（round35 坐实治本）═══════════
+# 坐实：attempt0 全成 12/12→纯覆盖重试丢弃该轮缓存全量重拆→burst 压垮 SiliconFlow→
+# attempt0 成功的批反超时被丢→11/12 残缺 fail-fast。治=全成轮也落缓存(site-1)+纯覆盖重试
+# 轮某批失败回放上轮成功子任务(护栏,守 F-3 replan 轮不回放)+校验通过清缓存(site-2 兜 F-4)。
+
+async def test_coverage_retry_replays_prev_cache_on_timeout(monkeypatch):
+    """护栏：纯覆盖重试(上一轮全成 failed=[])某批本轮 timeout→回放上轮成功缓存不丢模块。
+    先真跑争新 covers，仅失败才回放；回放件是已校验成功子任务=合法完整交付不计 failed。"""
+    file_plan = [_fp("ok/ok_main.txt")]
+    llm1 = _CountingLLM({"ok": _payload("ok")})
+    _p1, failed1, _b1, cache1 = await _run(llm1, _state(), file_plan, monkeypatch)
+    assert failed1 == [] and len(cache1) == 1
+    llm2 = _CountingLLM({"ok": _payload("ok")}, timeout_mods={"ok"})
+    state2 = _state({"plan_batch_failed_modules": [], "plan_batch_cache": cache1})
+    plan2, failed2, _b2, cache2 = await _run(llm2, state2, file_plan, monkeypatch)
+    assert llm2.calls.get("ok") == 1, "先真跑 LLM 争新 covers（非顶部快路径跳过）"
+    assert failed2 == [], "超时批回放上轮缓存，模块不丢（不计 failed）"
+    assert len(plan2.subtasks) == 1 and len(cache2) == 1
+
+
+async def test_replan_feedback_round_does_not_replay_cache(monkeypatch):
+    """守 F-3（复核 HIGH 修复锚）：执行失败 replan 轮(replan_feedback 非空)绝不回放缓存——
+    须带教训真跑，绝不重灌被反馈否决的旧子任务。批失败→照常记账，护栏不介入。"""
+    file_plan = [_fp("ok/ok_main.txt")]
+    llm1 = _CountingLLM({"ok": _payload("ok")})
+    _p1, _f1, _b1, cache1 = await _run(llm1, _state(), file_plan, monkeypatch)
+    llm2 = _CountingLLM({"ok": _payload("ok")}, timeout_mods={"ok"})
+    state2 = _state({"plan_batch_failed_modules": [], "plan_batch_cache": cache1,
+                     "replan_feedback": "上轮执行失败根因（须真跑修）"})
+    import pytest
+    with pytest.raises(RuntimeError, match="全部"):
+        await _run(llm2, state2, file_plan, monkeypatch)
+
+
+async def test_coverage_retry_sentinel_not_replayed(monkeypatch):
+    """护栏：上一轮 bisect 哨兵(无 subtasks)不当兜底回放——无真子任务可补，须照常失败记账。"""
+    monkeypatch.setenv("SWARM_PLAN_BATCH_BISECT", "0")
+    file_plan = [_fp("ok/a.txt"), _fp("ok/b.txt")]
+    llm1 = _CountingLLM({"ok": _payload("ok", 2)})
+    _p1, _f1, _b1, cache1 = await _run(llm1, _state(), file_plan, monkeypatch)
+    sig = next(iter(cache1))
+    cache1[sig] = {"module": "ok", "bisected": True}
+    llm2 = _CountingLLM({"ok": _payload("ok", 2)}, timeout_mods={"ok"})
+    state2 = _state({"plan_batch_failed_modules": [], "plan_batch_cache": cache1})
+    import pytest
+    with pytest.raises(RuntimeError, match="全部"):
+        await _run(llm2, state2, file_plan, monkeypatch)
+
+
+async def test_first_round_timeout_without_cache_still_fails(monkeypatch):
+    """无上一轮缓存（首轮/全新模块）→无兜底，失败照常记账，护栏绝不伪装成功。"""
+    file_plan = [_fp("ok/ok_main.txt")]
+    llm = _CountingLLM({"ok": _payload("ok")}, timeout_mods={"ok"})
+    import pytest
+    with pytest.raises(RuntimeError, match="全部"):
+        await _run(llm, _state(), file_plan, monkeypatch)
+
+
+async def test_plan_persists_cache_on_all_success_ultra(monkeypatch):
+    """R35-C site-1（推翻 F-4 no-op 病灶，复核 HIGH 修复锚）：ULTRA 全成轮(failed=[])也把
+    缓存落 state 供纯覆盖重试护栏消费。此前 `if _plan_batch_failed else {}` 使全成轮缓存恒
+    {}→护栏在其设计场景 no-op。"""
+    from swarm.brain.nodes import plan as plan_node
+    from swarm.types import Complexity, TaskPlan, SubTask
+    import swarm.brain.nodes as nodes
+
+    _CACHE = {"sig1": {"module": "m", "subtasks": [{"id": "st-1"}], "baseline": []}}
+
+    async def _fake_ultra(llm, state, desc, kctx, sctx, fp):
+        return (TaskPlan(subtasks=[SubTask(
+            id="st-1", description="x", scope={"writable": ["a"], "readable": []})]),
+            [], [], dict(_CACHE))   # failed=[] 全成
+
+    monkeypatch.setattr(nodes, "_get_brain_llm", lambda: object())
+    monkeypatch.setattr(nodes, "_plan_ultra_batched", _fake_ultra)
+    out = await plan_node({
+        "task_description": "t", "complexity": Complexity.ULTRA,
+        "tech_design_file_plan": [{"path": f"f{i}"} for i in range(40)],
+    })
+    assert out.get("plan_batch_cache") == _CACHE, "全成轮必须落缓存(非 {})，否则护栏 no-op"
+
+
+async def test_validate_plan_clears_cache_on_pass(monkeypatch):
+    """R35-C site-2（F-4 膨胀兜底）：覆盖+校验【通过】→清空 plan_batch_cache，不让死重随后续
+    checkpoint 长途漂流（过闸进 CONFIRM/DISPATCH 无更多 PLAN 回炉轮，缓存无人再消费）。"""
+    from swarm.brain.nodes import validate_plan
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+    import swarm.brain.nodes as nodes
+
+    class _OkLLM:
+        async def ainvoke(self, m):
+            return type("R", (), {"content": '{"valid": true, "issues": []}'})()
+
+    monkeypatch.setattr(nodes, "_get_brain_llm", lambda: _OkLLM())
+    st = SubTask(id="st-1", description="x", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["a"], readable=[]), covers=[REQ_A])
+    out = await validate_plan({
+        "plan": TaskPlan(subtasks=[st], parallel_groups=[["st-1"]]),
+        "task_description": "t", "complexity": "medium", "plan_retry_count": 0,
+        "requirement_items": [{"id": REQ_A, "text": "甲", "kind": "functional",
+                               "source_quote": "甲", "source": "description"}],
+        "plan_batch_cache": {"sig1": {"module": "m", "subtasks": [{"id": "x"}]}},
+    })
+    assert out.get("plan_valid") is True, "覆盖+软门应通过"
+    assert out.get("plan_batch_cache") == {}, "通过必须清空缓存(F-4 膨胀兜底)"
+
+
+async def test_validate_plan_keeps_cache_on_coverage_fail(monkeypatch):
+    """site-2 对称：覆盖未通过(回炉 PLAN)→返回不含该键→state 缓存原样保留，供下一轮护栏消费。"""
+    from swarm.brain.nodes import validate_plan
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+
+    st = SubTask(id="st-1", description="x", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["a"], readable=[]), covers=[])  # 不覆盖任何需求
+    out = await validate_plan({
+        "plan": TaskPlan(subtasks=[st], parallel_groups=[["st-1"]]),
+        "task_description": "t", "complexity": "medium", "plan_retry_count": 0,
+        "requirement_items": [{"id": REQ_A, "text": "甲", "kind": "functional",
+                               "source_quote": "甲", "source": "description"}],
+        "plan_batch_cache": {"sig1": {"module": "m"}},
+    })
+    assert out.get("plan_valid") is False, "REQ_A 未覆盖应回炉"
+    assert "plan_batch_cache" not in out, "覆盖失败返回不含该键→state 缓存保留（护栏下轮要用）"
+
+
 async def test_plan_emits_empty_cache_when_all_batches_succeed(monkeypatch):
     """F-4 [L]：批全成轮按自身规则缓存永远无人消费——plan() 落 state 应为 {}，
     不把数十 KB 死重灌进每次 checkpoint（D51 plan 体积病灶同族）。"""
