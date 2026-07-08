@@ -41,9 +41,13 @@ def test_plan_batch_has_wall_clock_timeout():
     import swarm.brain.nodes as _n
     src = open(_n.__file__, encoding="utf-8").read()
     assert "_PLAN_BATCH_TIMEOUT" in src, "PLAN-BATCH 应定义总时长上限常量"
-    assert "wait_for(" in src, "PLAN-BATCH 的 ainvoke 应被 asyncio.wait_for 包裹"
     assert "PLAN_BATCH_SYSTEM" in src
-    assert "timeout=_PLAN_BATCH_TIMEOUT" in src, "wait_for 应使用 _PLAN_BATCH_TIMEOUT 常量做总时长上限"
+    # R34-1 G3 后墙钟收口在 _invoke_llm_abortable（流式=deadline 看门狗；无 astream
+    # 回退 wait_for(ainvoke, total_timeout)）——守卫意图不变：批调用必有总墙钟上限。
+    assert "_invoke_llm_abortable(" in src, "PLAN-BATCH 的 LLM 调用应走带墙钟的 helper"
+    assert "_PLAN_BATCH_TIMEOUT," in src or "timeout=_PLAN_BATCH_TIMEOUT" in src, \
+        "批调用必须传 _PLAN_BATCH_TIMEOUT 总时长上限"
+    assert "wait_for(" in src, "无流式回退路径应保留 asyncio.wait_for 包裹"
 
 
 if __name__ == "__main__":

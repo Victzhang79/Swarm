@@ -2372,7 +2372,45 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
         d = _owning_module_dir(project_path, str(f))
         if d and d not in registered and d not in orphans:
             orphans.append(d)
+    # R34-6 治本：D3 Fix E（孤儿强制 -pl 曝光未注册）与 round29 A(c)（注册后于脚手架）
+    # 在【脚手架子任务自建新模块】窗口期结构性互斥——本子任务正创建的模块此时未注册
+    # 是设计使然（registrant owner 依赖脚手架，注册在后），Fix E 却判它 reactor 必死
+    # → 4 沙箱同因耗尽 escalate（round34 实证致死）。判据（确定性）：模块自己的清单
+    # 在本次 modified 集里 = 本子任务就是该模块脚手架 → 用清单本地构建
+    # （mvn -f <mod>/pom.xml，不进 reactor 无需注册）。修改【既有】未注册模块（清单
+    # 不在 modified）的孤儿 Fix E 语义原样保留（fail-closed 曝光真漏注册）。
+    # 判据边界（复核 LOW#B 澄清）："模块 pom ∈ modified" 涵盖【新建模块 pom】与
+    # 【直接编辑既有孤儿 pom】两种——两者都改用 -f 直接构建该模块（前者是脚手架窗口，
+    # 后者本就在改该 pom，-f 直验比 Fix E 的"曝光未注册"更贴切）；仅【pom 未被触碰的
+    # 既有孤儿】仍走 -pl fail-closed。通用不变量=自建/自改模块的验证不得依赖"他人稍后
+    # 才提供"的注册状态，各栈命令推导处同理。
+    _modified_norm = {str(f).strip().lstrip("/") for f in modified}
+    self_scaffold = [o for o in orphans if f"{o}/pom.xml" in _modified_norm]
+    orphans = [o for o in orphans if o not in self_scaffold]
     targets = hit + [o for o in orphans if o not in hit]
+    if self_scaffold and not targets:
+        # 纯脚手架子任务：清单本地构建（多新模块极罕见取首个，其余由各自验证轮兜底）。
+        # ★hunter 实证 Death B：-f 丢 -am，自建模块若依赖 sibling(com.<proj>:*)，新沙箱
+        # .m2 未装这些产物 → "Could not resolve dependencies" 换个死法。脚手架的验证契约
+        # 是"模块良构可注册"，validate 校验 pom 结构+parent 链解析、不解析 <dependencies>、
+        # 不需 sibling 产物——正是脚手架该验的范围（模块代码真编译由注册后的内容子任务经
+        # reactor -pl -am 拉齐 sibling 完成，round34 计划 acceptance 本就用 `mvn validate -f`）。
+        # 故需上游产物的目标(compile/test/package/…)降级 validate；validate/clean 等原样。★
+        scoped = command.replace("mvn", f"mvn -f {self_scaffold[0]}/pom.xml", 1)
+        if re.search(r"\b(compile|test-compile|test|package|verify|install|deploy)\b", scoped):
+            scoped = re.sub(
+                r"\b(compile|test-compile|test|package|verify|install|deploy)\b",
+                "validate", scoped, count=1)
+        return scoped
+    if self_scaffold and targets:
+        # 复核 LOW#A：混合子任务（自建新模块 + 改既有注册模块）——单条 mvn 命令无法既
+        # -pl reactor 又 -f 本地。保留 reactor 验注册模块，但自建模块【不静默排除】：
+        # 高可见 WARNING 留痕（fail-loud，杜绝其 .java 未验证却读作 PASS）。此形态罕见
+        # （脚手架子任务通常隔离，R34-6 前提），命中即提示计划拆分应把脚手架独立成子任务。
+        logger.warning(
+            "[L1] 混合子任务同时自建模块 %s 与改动注册模块 %s——本轮 reactor 只验后者，"
+            "自建模块的独立编译未纳入本命令（建议 plan 将脚手架拆为独立子任务）",
+            self_scaffold, targets)
     if not targets:
         return command  # 无模块归属(根级文件) → 整仓 fallback 正确
     pl = ",".join(targets)

@@ -431,6 +431,66 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
+async def _invoke_llm_abortable(llm, messages, total_timeout: float):
+    """R34-1：流式优先 LLM 调用——僵尸生成缓解（token 黑洞治本客户端侧杠杆）。
+
+    非流式 ainvoke 被 wait_for 取消后，网关/后端可能继续整段生成（僵尸占 GPU →
+    越烧越慢死亡螺旋，round34 规划期 ~71 次 300s 超时实证形态）。流式请求客户端
+    断开时主流推理后端会 abort 生成；且 chunk 间隔看门狗在停滞早期即断连，不干等
+    总超时。llm 无 astream（测试桩/不支持流）→ 原 wait_for(ainvoke) 行为逐字节不变。
+    chunk 间隔上限 SWARM_PLAN_BATCH_CHUNK_GAP（默认 120s，非法回退）。超时统一抛
+    asyncio.TimeoutError（调用方按既有 timeout 分支处理）。
+    """
+    import asyncio as _aio
+    astream = getattr(llm, "astream", None)
+    if astream is None:
+        return await _aio.wait_for(llm.ainvoke(messages), timeout=total_timeout)
+    try:
+        _gap = float(os.environ.get("SWARM_PLAN_BATCH_CHUNK_GAP", "120") or "120")
+    except ValueError:
+        logger.error("[PLAN-BATCH] SWARM_PLAN_BATCH_CHUNK_GAP 配置非法(%r)——回退默认 120",
+                     os.environ.get("SWARM_PLAN_BATCH_CHUNK_GAP"))
+        _gap = 120.0
+    parts: list[str] = []
+    loop = _aio.get_running_loop()  # 协程内惯用法（复核 INFO：避 get_event_loop 弃用面）
+    deadline = loop.time() + total_timeout
+    agen = astream(messages)
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _aio.TimeoutError()
+            try:
+                chunk = await _aio.wait_for(
+                    agen.__anext__(), timeout=min(_gap, remaining))
+            except StopAsyncIteration:
+                break
+            # hunter CONFIRMED：list content-block（部分 provider 流式形态）绝不能 str()
+            # ——那产出 Python repr 污染 JSON。按 langchain 口径抽取 text 分片。
+            c = getattr(chunk, "content", None)
+            if isinstance(c, str):
+                if c:
+                    parts.append(c)
+            elif isinstance(c, list):
+                for _blk in c:
+                    if isinstance(_blk, str) and _blk:
+                        parts.append(_blk)
+                    elif isinstance(_blk, dict):
+                        _t = _blk.get("text") or _blk.get("content") or ""
+                        if isinstance(_t, str) and _t:
+                            parts.append(_t)
+    finally:
+        # 断连即弃：aclose 促使传输层关闭，流式后端据此 abort 生成（僵尸源头治理）
+        _aclose = getattr(agen, "aclose", None)
+        if _aclose is not None:
+            try:
+                # 复核 INFO：aclose 本身有界（饱和态传输 wedge 时不无限干等，5s 足够本地关流）
+                await _aio.wait_for(_aclose(), timeout=5.0)
+            except Exception:  # noqa: BLE001 — 关闭失败/超时不掩盖主结果/主异常
+                pass
+    return type("R", (), {"content": "".join(parts)})()
+
+
 def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
     """R31-3 T3：D09 重试的增量修补块——上一版 plan 摘要 + 修补纪律。
 
@@ -503,6 +563,9 @@ def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = Fal
         "改在计划 JSON 顶层用 baseline_covered 字段申报，例如 "
         "\"baseline_covered\": [{\"id\": \"req-xxxxxxxx\", \"reason\": \"现有代码何处/如何已满足（简要依据）\"}]；\n"
         "- baseline_covered 同样只能引用清单中的 ID，且 reason 必填非空；\n"
+        "- ★baseline_covered 仅指仓库中【当前已存在】的代码——本计划将要新建的模块/"
+        "由其他子任务或其他批次实现的功能【绝不】申报（那属于对应子任务的 covers）；"
+        "reason 必须指向可在现有代码中核实的位置★；\n"
         "- 申报是对现状的承诺：交付前会对需求条目做运行时验收核查——可自动执行的断言若与"
         "申报不符会导致验收失败并回灌整改；无法自动核实的申报（如需鉴权的能力）会被降级"
         "标记并呈报人工审核。只申报你能从现有代码中确认的能力。"
@@ -655,6 +718,14 @@ async def _plan_ultra_batched(
         _sig = batch_signature(mod_name, batch)
         if _repair_retry and _sig in _batch_cache_prev:
             _hit = _batch_cache_prev[_sig]
+            # R34-2 哨兵：上一轮已证实确定性超时并 bisect 过的批 → 直接判 timeout 触发
+            # 切分（半批各自缓存命中/真跑），省掉每 attempt 整批重烧 600s（round34 实证
+            # 4 慢批×4 attempt ≈40min 纯重复）。哨兵随轮重写防陈旧。
+            if _hit.get("bisected") and len(batch) >= 2:
+                _batch_cache_new[_sig] = {"module": mod_name, "bisected": True}
+                logger.info("[PLAN-BATCH] U2 哨兵命中：批'%s'已知确定性超时 → 直接切分",
+                            mod_name)
+                return ("timeout", i, mod_name, None, 0.0, len(batch))
             _cached_subs = json.loads(json.dumps(_hit.get("subtasks") or []))
             _cached_bl = list(_hit.get("baseline") or [])
             if _cached_subs:
@@ -714,12 +785,14 @@ async def _plan_ultra_batched(
             for _attempt in range(1, _PLAN_BATCH_MAX_ATTEMPTS + 1):
                 _t0 = _time.monotonic()
                 try:
-                    response = await _asyncio.wait_for(
-                        llm.ainvoke([
+                    # R34-1：流式+chunk 看门狗（无 astream 的桩/客户端=原 wait_for 行为）
+                    response = await _invoke_llm_abortable(
+                        llm,
+                        [
                             {"role": "system", "content": PLAN_BATCH_SYSTEM},
                             {"role": "user", "content": prompt_user},
-                        ]),
-                        timeout=_PLAN_BATCH_TIMEOUT,
+                        ],
+                        _PLAN_BATCH_TIMEOUT,
                     )
                     _dt = _time.monotonic() - _t0
                     result = _parse_json_from_llm(response.content)
@@ -788,9 +861,20 @@ async def _plan_ultra_batched(
             logger.warning(
                 "[PLAN-BATCH] U3 批'%s'超时耗尽重试 → 对半切分重试（%d+%d 文件）",
                 _name, _mid, len(_files) - _mid)
+            # R34-2：整批签名落哨兵入本轮缓存（下一 attempt 免整批重烧）
+            _batch_cache_new[batch_signature(_name, _files)] = {
+                "module": _name, "bisected": True}
             for _suf, _part in (("~a", _files[:_mid]), ("~b", _files[_mid:])):
                 _batch_files[_name + _suf] = _part
                 _specs.append((_idx, _oc[1], _name + _suf, _part))
+        # R34-1 退避：超时批 bisect 前给饱和后端冷却窗（env 可调，0=关）
+        try:
+            _cooldown = float(os.environ.get(
+                "SWARM_PLAN_BATCH_TIMEOUT_COOLDOWN", "15") or "15")
+        except ValueError:
+            _cooldown = 15.0
+        if _cooldown > 0:
+            await _asyncio.sleep(_cooldown)
         _half_ocs = await _asyncio.gather(*[
             _decompose_batch(_i, _hname, _part)
             for (_x, _i, _hname, _part) in _specs
@@ -1280,6 +1364,22 @@ async def plan(state: BrainState) -> dict:
     from swarm.brain.nodes.shared import _strip_unrequested_tests
     task_plan = _strip_unrequested_tests(task_plan, task_description)
 
+    # R34-8 确定性无害化：申报与 covers 重叠的条目丢申报保 covers——分批 LLM 会把
+    # "本计划其他批实现"误当"存量已满足"申报（round34 实证 31 条批间推卸型申报）。
+    # 兄弟批真用 covers 声明了的重叠项无害化；仅申报无 covers 的（真基线或真漏洞）
+    # 留给验收断言+人工闸裁决。放在全部 plan 变异（merge/strip）之后保对账一致。
+    if _baseline_covered:
+        _covered_ids = {rid for st in task_plan.subtasks
+                        for rid in (getattr(st, "covers", None) or [])}
+        _overlap = [e for e in _baseline_covered if e.get("id") in _covered_ids]
+        if _overlap:
+            logger.info(
+                "[PLAN] baseline 申报与子任务 covers 重叠 %d 条 → 丢申报保 covers"
+                "（R34-8 批间推卸无害化）: %s",
+                len(_overlap), ",".join(e.get("id", "?") for e in _overlap[:10]))
+            _baseline_covered = [
+                e for e in _baseline_covered if e.get("id") not in _covered_ids]
+
     plan_touch = touch_context(
         state,
         "plan",
@@ -1475,6 +1575,17 @@ async def validate_plan(state: BrainState) -> dict:
                 "[VALIDATE_PLAN] 覆盖矩阵校验未通过（%d 条 issue）: %s",
                 len(cov_result.issues), "; ".join(cov_result.issues),
             )
+            # R34-3 观测面：跨 attempt 覆盖集增量（round34 实证 18→12→18 震荡无人可见）
+            _prev_ids = set(re.findall(
+                r"req-[0-9a-f]{8}",
+                " ".join(str(i) for i in (state.get("plan_validation_issues") or []))))
+            _cur_ids = set(re.findall(
+                r"req-[0-9a-f]{8}", " ".join(cov_result.issues)))
+            if _prev_ids and _prev_ids != _cur_ids:
+                logger.info(
+                    "[VALIDATE_PLAN] 覆盖增量：本轮新增未覆盖 %s；较上轮已修复 %s",
+                    sorted(_cur_ids - _prev_ids) or "无",
+                    sorted(_prev_ids - _cur_ids) or "无")
             return {
                 "plan_valid": False,
                 "plan_retry_count": retry_count,
@@ -2358,6 +2469,18 @@ def _run_reactor_build_in_sandbox(
         )
         out = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
         ok = "__RC__0" in out
+        # R34-7：探针沙箱缺构建工具（round34 实证 verify_l2_compile 模板无 mvn，RC=127
+        # "command not found"）→ 这是 infra 非代码失败。ran=False 走"沙箱不可用"退路
+        # （本机兜底/如实 fail-loud），绝不把环境缺陷记成集成编译失败误导归因/修复循环。
+        # hunter LOW：收紧判据——只认【构建驱动本身】的 command not found 串（bash/dash
+        # 两种措辞），不再用宽 __RC__127（构建插件 shell 出缺失二进制也 127，宽判会把真
+        # 构建失败误标 infra 掩盖）。驱动缺失=infra，插件内 127=真失败，须分开。
+        _tool = (build_cmd.split() or [""])[0]
+        if not ok and (f"{_tool}: command not found" in out or f"{_tool}: not found" in out):
+            logger.error(
+                "[VERIFY_L2] 探针沙箱缺构建工具 %r（模板装配问题，非代码失败）——"
+                "按沙箱不可用处理，请核查 verify_l2_compile 模板", _tool)
+            return False, False, "", None
         logger.info("[VERIFY_L2] 沙箱集成编译: %s (cmd=%s)", "通过" if ok else "未通过", build_cmd)
         smoke_sid: str | None = None
         if ok:
