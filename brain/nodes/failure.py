@@ -280,6 +280,12 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "verification_failure": None,
             "l2_passed": False,
             "replan_count": _l2_replan,
+            # round36 #9 治本：L2 触发的 replan 是【新规划目标】(修 L2 集成缺陷)，须给它一份【全新的
+            # plan 校验重试预算】——否则复用早前覆盖重试已耗到 2 的 plan_retry_count → 只剩 1 轮即
+            # 3/3 耗尽 CONFIRM reject（round36 实证 replan 从没派发就死在规划）。replan 总次数另由
+            # replan_count(独立熔断,默认 2)封顶，故此处清零安全、不会无界。
+            "plan_retry_count": 0,
+            "plan_validation_feedback": "",  # 同清跨轮校验粘滞，防旧覆盖 issue 污染新规划
         }
 
     if state.get("verification_failure") == "l3":
@@ -397,6 +403,12 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                          if sid not in failed_ids and l1_passed(out)}
         _pending_now = set(state.get("dispatch_remaining") or []) | set(failed_ids)
         _unrecoverable: set[str] = set()
+        # round36 P0 治本：区分两类"阻断在无产物的内部包"——(1)【真死上游】有生产者但已放弃/
+        # 依赖已放弃上游(dep_hit/prod_hit) → 连坐放弃正确；(2)【worker 自造引用】完全无生产者
+        # (_prods 空、非 dep_hit)=消费者自己在编码时引用了一个全场没人生产的类型(round36 实证：
+        # st-12-1 引用 TwoFactorSetupVO，全计划无 owner→连坐炸 62/64)。第(2)类不该直接连坐放弃——
+        # 那类型本就该由消费者自己在本模块建出，先给一次 scope 自愈(allow_any)+提示重试机会。
+        _selfheal: set[str] = set()
         for fid in failed_ids:
             _det = _det_of(subtask_results.get(fid))
             if _det.get("pipeline_blocked") not in _INTERNAL_BLOCKED_KINDS:
@@ -419,7 +431,58 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 project_path=_proj_path, self_id=fid,
             )
             if _dep_hit or _prod_hit or _futile:
-                _unrecoverable.add(fid)
+                # round36 P0：完全无生产者(_prods 空) 且 非依赖已放弃上游(非 dep_hit) 且 有 scope
+                # → worker 自造引用，走 scope 自愈；其余(真死上游)照旧连坐放弃。
+                if _futile and not _prods and not _dep_hit and _st is not None \
+                        and getattr(_st, "scope", None) is not None:
+                    _selfheal.add(fid)
+                else:
+                    _unrecoverable.add(fid)
+        # round36 P0 自愈：无生产者内部包(worker 自造引用) → 授消费者 allow_any + 提示本模块补建被引
+        # 类型 + 重派(按子任务 targeted_recovery_counts 熔断，与 A2 缺依赖恢复同预算)。耗尽预算才回落
+        # 连坐放弃(原行为)。这把"一个自造引用炸 62 子任务"降为"消费者补建它自己引用的类型"。
+        if _selfheal:
+            _sh_max = get_config().model.max_retries
+            _sh_trc = dict(state.get("targeted_recovery_counts") or {})
+            _healed: list[str] = []
+            for fid in sorted(_selfheal):
+                if _sh_trc.get(fid, 0) >= _sh_max:
+                    _unrecoverable.add(fid)  # 自愈预算耗尽 → 回落连坐放弃
+                    continue
+                _st = _by_id.get(fid)
+                _bpkgs = (_det_of(subtask_results.get(fid)).get("blocked_on_packages") or [])
+                _st.scope.allow_any = True
+                _st.retry_guidance = (
+                    f"你的代码引用了项目内不存在、且无任何子任务负责生产的内部类型/包 {_bpkgs}"
+                    f"（编译报 package does not exist / cannot find symbol）。这些是本功能自身需要的"
+                    f"类型（如 VO/DTO/枚举/请求响应对象等），请在本模块内【一并新建】这些被引用的类型"
+                    f"使编译通过，而不是假设它们已存在。"
+                )[:800]
+                _sh_trc[fid] = _sh_trc.get(fid, 0) + 1
+                _healed.append(fid)
+            if _healed:
+                _sh_rc = dict(state.get("subtask_retry_counts", {}))
+                for fid in _healed:
+                    _sh_rc[fid] = 0  # 因 scope 不可满足而徒劳的重试不计入常规配额
+                _sh_remaining = list(state.get("dispatch_remaining") or [])
+                for fid in failed_ids:  # 已愈 + 混批中未愈的失败项都放回，未愈者下轮再判/放弃
+                    subtask_results.pop(fid, None)
+                    if fid not in _sh_remaining:
+                        _sh_remaining.append(fid)
+                logger.warning(
+                    "[HANDLE_FAILURE] round36 P0 自愈：无生产者内部包(worker 自造引用) %s → 授 allow_any"
+                    " + 提示本模块补建被引类型 + 重派(按子任务熔断 %s/%d)，避免一个自造引用连坐放弃依赖闭包",
+                    _healed, {k: _sh_trc[k] for k in _healed}, _sh_max)
+                return {
+                    "plan": plan_obj,
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": _sh_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry_alternate",
+                    "failure_escalated": False,
+                    "targeted_recovery_counts": _sh_trc,
+                    "subtask_retry_counts": _sh_rc,
+                }
         if _unrecoverable:
             abandoned = _transitive_abandon(
                 plan_obj.subtasks,
@@ -784,6 +847,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
             "replan_count": replan_count,
             "replan_feedback": replan_feedback,
+            # round36 #9 治本：执行失败 replan 同理给全新 plan 校验重试预算（清零 plan_retry_count），
+            # 别继承覆盖重试已耗尽的额度。replan_count(独立熔断)封顶总次数。
+            "plan_retry_count": 0,
         }
 
     if strategy == "escalate":

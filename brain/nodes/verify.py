@@ -124,6 +124,35 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
     # L2 确定性集成审查（编译 + 契约）
     project_path = nodes._get_project_path(project_id)
     if project_path and (merged_diff or "").strip():
+        # round36 #7 治本：放弃/give_up 子任务的半成品文件随 pull-back 落进本地树(pull-back 不判
+        # 成败)，又被 L2 全项目同步扫进沙箱编译→污染 L2 信号(round36 实证：st-12-1 被放弃但其
+        # untracked SysUser2FAServiceImpl.java 让 L2 在 getTwoFactorEnabled 上假失败，同根但机制独立)。
+        # L2 编译前把放弃子任务【新建(untracked)】文件从工作树清掉——git clean 只删 untracked，绝不
+        # 碰已交付的 tracked 改动(merged_diff 承载的交付内容)，故安全。tracked-改动残留另记 follow-up。
+        _ab_ids = (set(state.get("abandoned_subtask_ids") or [])
+                   | set(state.get("give_up_isolated_ids") or []))
+        if _ab_ids and plan_obj is not None:
+            _by_id = {s.id: s for s in plan_obj.subtasks}
+            _ab_files: list[str] = []
+            for _aid in _ab_ids:
+                _ast = _by_id.get(_aid)
+                _sc = getattr(_ast, "scope", None) if _ast else None
+                if _sc:
+                    _ab_files += list(getattr(_sc, "writable", []) or [])
+                    _ab_files += list(getattr(_sc, "create_files", []) or [])
+            _ab_files = sorted({f for f in _ab_files if f})
+            if _ab_files:
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run(["git", "-C", project_path, "clean", "-f", "--", *_ab_files],
+                                 capture_output=True, text=True, timeout=30)
+                    _purged = [ln for ln in (_r.stdout or "").splitlines() if ln.strip()]
+                    if _purged:
+                        logger.warning(
+                            "[VERIFY_L2] round36 #7：清除 %d 个放弃子任务 untracked 半成品文件"
+                            "（防污染集成编译）: %s", len(_purged), _purged[:5])
+                except Exception as _exc:  # noqa: BLE001 清理失败不致命，继续 L2
+                    logger.warning("[VERIFY_L2] 放弃文件清理失败（非致命，继续 L2）: %s", _exc)
         from swarm.brain.integration_review import run_integration_review
 
         # 治本 round21：L2 全 reactor 编译优先在【项目沙箱】(按检测栈版本烤的工具链)跑——brain host

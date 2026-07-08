@@ -10,7 +10,9 @@
 #
 # 三面镜像（各自常驻 daemon，持续 append 到独立文件）:
 #   ①swarm_mirror.log    —— swarm.log 的相位/路由/异常/高信号关键词行镜像（tail -F 过滤）
-#   ②sandbox_mirror.log  —— 每沙箱 jsonl 事件计数时序（30s 采样，只记增量：新沙箱/新事件）
+#   ②sandbox_mirror.log  —— 每子任务沙箱执行相位/L1/BLOCKED/错误明细（镜像 swarm.log 的
+#                            Worker(st-xxx) 行）。★round36 教训：远程热池沙箱(192.168.60.106:3000)
+#                            执行明细写 swarm.log 不落本地 jsonl；旧版只轮询本地 jsonl→全程盲(显 0)★
 #   ③artifact_mirror.log —— RuoYi 工作树变更文件快照（45s，只记变化：产物落盘真相非"跑没跑"）
 # 外加 journal.md —— 随跑日志（人手写：每次哨兵唤醒→三面交叉核对→追加一段）
 #
@@ -58,27 +60,15 @@ cat > "$MDIR/mirror_swarm.sh" <<EOF
 tail -n0 -F "$SWARMLOG" 2>/dev/null | grep --line-buffered -E '$KW' >> "$MDIR/swarm_mirror.log"
 EOF
 
-# ---- Mirror ②: 沙箱 jsonl 事件时序（只记增量）----
+# ---- Mirror ②: 沙箱执行明细（镜像 swarm.log 的 Worker(...) 行）----
+# 远程热池沙箱不落本地 jsonl，执行真相在 swarm.log 的 Worker(st-xxx): [Ns][PHASE] 行（相位机/
+# L1 结果/BLOCKED/沙箱错误/pull-back）。与 Mirror ① 同 tail -F|grep 结构（pkill 一致可停）。
+# 本地沙箱轮的 jsonl(若有)其事件也经 executor 打进 swarm.log，故单源即可，不再脆弱轮询本地 jsonl。
 cat > "$MDIR/mirror_sandbox.sh" <<EOF
 #!/bin/bash
-declare -A seen
-while true; do
-  ts=\$(date '+%H:%M:%S')
-  for f in "$SBDIR"/*.jsonl; do
-    [ -f "\$f" ] || continue
-    sid=\$(basename "\$f" .jsonl)
-    n=\$(wc -l < "\$f" 2>/dev/null | tr -d ' ')
-    if [ "\${seen[\$sid]:-0}" != "\$n" ]; then
-      last=\$(tail -n1 "\$f" 2>/dev/null | python3 -c 'import sys,json
-try:
- d=json.load(sys.stdin); print(str(d.get("event",d.get("type","?")))[:60], str(d.get("message",d.get("msg","")))[:140])
-except: print("(parse)")' 2>/dev/null)
-      echo "[\$ts] \${sid:0:12} ev=\$n | \$last" >> "$MDIR/sandbox_mirror.log"
-      seen[\$sid]=\$n
-    fi
-  done
-  sleep 30
-done
+tail -n0 -F "$SWARMLOG" 2>/dev/null | grep --line-buffered -E \
+  'Worker\(|远程沙箱|镜像 worker|pull-back|internal_pkg_not_built|blocked_on|L1 验证结果|沙箱集成编译|沙箱镜像选择' \
+  >> "$MDIR/sandbox_mirror.log"
 EOF
 
 # ---- Mirror ③: 产物快照（只记变化）----
