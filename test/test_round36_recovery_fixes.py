@@ -159,3 +159,76 @@ def test_fix9_l2_replan_resets_plan_retry_count():
     r = _run(state)
     assert r["failure_strategy"] == "replan", r.get("failure_strategy")
     assert r["plan_retry_count"] == 0, "L2-replan 必须重置 plan 校验重试预算(否则几乎必死)"
+
+
+# ── #8：replan 按 scope 文件身份保留已完成产出(id 被重编号也不白重做) ──
+
+def test_fix8_replan_preserves_completed_by_scope_when_id_churns():
+    from swarm.brain.nodes import _surgical_replan_reset
+    old_plan = TaskPlan(subtasks=[
+        SubTask(id="st-24", description="模板", scope=FileScope(create_files=["a/A.java"])),
+        SubTask(id="st-43", description="SDK", scope=FileScope(create_files=["b/B.java"]))])
+    new_plan = TaskPlan(subtasks=[  # replan 重编号 id，scope 文件不变
+        SubTask(id="st-1", description="模板(改述)", scope=FileScope(create_files=["a/A.java"])),
+        SubTask(id="st-2", description="SDK(改述)", scope=FileScope(create_files=["b/B.java"]))])
+    old_results = {
+        "st-24": WorkerOutput(subtask_id="st-24", diff="d", summary="", l1_passed=True,
+                              confidence="high"),
+        "st-43": WorkerOutput(subtask_id="st-43", diff="d", summary="", l1_passed=True,
+                              confidence="high")}
+    out = _surgical_replan_reset(old_results, old_plan, new_plan)
+    preserved = out["subtask_results"]
+    assert "st-1" in preserved and "st-2" in preserved, list(preserved.keys())
+    assert preserved["st-1"].subtask_id == "st-24", "旧产物认领到新 id"
+    assert preserved["st-2"].subtask_id == "st-43"
+
+
+def test_fix8_ambiguous_scope_not_preserved():
+    """scope-key 不唯一(两子任务同 scope，如共享聚合文件)→不认领(防碰撞误保)。"""
+    from swarm.brain.nodes import _surgical_replan_reset
+    old_plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="x", scope=FileScope(writable=["pom.xml"])),
+        SubTask(id="st-2", description="y", scope=FileScope(writable=["pom.xml"]))])
+    new_plan = TaskPlan(subtasks=[
+        SubTask(id="st-9", description="x2", scope=FileScope(writable=["pom.xml"]))])
+    old_results = {"st-1": WorkerOutput(subtask_id="st-1", diff="d", summary="",
+                                        l1_passed=True, confidence="high")}
+    out = _surgical_replan_reset(old_results, old_plan, new_plan)
+    assert not out["subtask_results"], "scope 不唯一不得认领"
+
+
+# ── #6：覆盖单调化——按 scope 身份并回上一轮合法 covers，防重拆丢覆盖(打地鼠→收敛) ──
+
+def _sub(sid, files, covers):
+    return SubTask(id=sid, description="d", scope=FileScope(create_files=files), covers=covers)
+
+
+def test_fix6_covers_merged_monotonic_by_scope():
+    """本轮重拆丢了 req-1(上一轮同 scope 子任务覆盖过)→按 scope 身份并回，覆盖只增不减。"""
+    from swarm.brain.nodes import _merge_prior_covers_by_scope
+    old_plan = TaskPlan(subtasks=[_sub("st-24", ["a/A.java"], ["req-1", "req-2"])])
+    new_plan = TaskPlan(subtasks=[_sub("st-1", ["a/A.java"], ["req-2"])])  # 丢了 req-1
+    n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2", "req-3"})
+    assert n == 1
+    assert set(new_plan.subtasks[0].covers) == {"req-1", "req-2"}, new_plan.subtasks[0].covers
+
+
+def test_fix6_hallucinated_covers_not_merged():
+    """只并 valid_req_ids 内的 covers——臆造/悬空 covers(req-BOGUS)绝不重引入。"""
+    from swarm.brain.nodes import _merge_prior_covers_by_scope
+    old_plan = TaskPlan(subtasks=[_sub("st-24", ["a/A.java"], ["req-1", "req-BOGUS"])])
+    new_plan = TaskPlan(subtasks=[_sub("st-1", ["a/A.java"], [])])
+    n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2"})
+    assert n == 1 and set(new_plan.subtasks[0].covers) == {"req-1"}, "臆造不并回"
+
+
+def test_fix6_ambiguous_scope_covers_not_merged():
+    """scope 不唯一(共享聚合文件)→不并(防碰撞误并)。"""
+    from swarm.brain.nodes import _merge_prior_covers_by_scope
+    old_plan = TaskPlan(subtasks=[
+        SubTask(id="st-A", description="d", scope=FileScope(writable=["pom.xml"]), covers=["req-1"]),
+        SubTask(id="st-B", description="d", scope=FileScope(writable=["pom.xml"]), covers=["req-2"])])
+    new_plan = TaskPlan(subtasks=[
+        SubTask(id="st-9", description="d", scope=FileScope(writable=["pom.xml"]), covers=[])])
+    n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2"})
+    assert n == 0, "scope 不唯一不并"

@@ -1070,6 +1070,47 @@ def _subtask_signature(st) -> tuple:
     return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
 
 
+def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> int:
+    """round36 #6 治本：覆盖重试/replan 全量重拆使 LLM 每轮重发 covers → 随机丢【已覆盖】条目
+    (覆盖打地鼠不收敛，round31 issue 13→15→12→14 震荡 / round36 attempt0→retry1 换漏实证)。
+    按 scope 文件身份(单写者不变量下唯一)把【上一轮 plan 的合法 covers】并回 new_plan 同 scope
+    子任务 → 覆盖【单调只增不减】→ MAX_PLAN_RETRY 内确定性收敛(不再靠掷骰子撞运气)。
+    只并【valid_req_ids 内】的 covers（不重引入臆造/悬空 covers）。scope-key 唯一性护栏同 #8：
+    仅旧/新 plan 各自唯一且非空的 scope 才并（防聚合文件多写者/空 scope 碰撞误并）。返回并回条目数。"""
+    old_subs = list(getattr(old_plan, "subtasks", []) or [])
+    new_subs = list(getattr(new_plan, "subtasks", []) or [])
+    if not old_subs or not new_subs or not valid_req_ids:
+        return 0
+
+    def _sk(st) -> tuple:
+        sc = getattr(st, "scope", None)
+        w = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
+        c = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
+        return (w, c)
+
+    from collections import Counter as _Counter
+    _oc = _Counter(_sk(s) for s in old_subs)
+    _nc = _Counter(_sk(s) for s in new_subs)
+    _old_by_sk: dict = {}
+    for s in old_subs:
+        _old_by_sk.setdefault(_sk(s), s)
+    merged = 0
+    for ns in new_subs:
+        sk = _sk(ns)
+        if sk == ((), ()) or _oc.get(sk) != 1 or _nc.get(sk) != 1:
+            continue
+        _os = _old_by_sk.get(sk)
+        if _os is None:
+            continue
+        _prior = [c for c in (getattr(_os, "covers", None) or []) if c in valid_req_ids]
+        _cur = list(getattr(ns, "covers", None) or [])
+        _add = [c for c in _prior if c not in _cur]
+        if _add:
+            ns.covers = _cur + _add
+            merged += len(_add)
+    return merged
+
+
 def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_recovery_counts: dict | None = None,
                            old_retry_counts: dict | None = None,
@@ -1109,6 +1150,41 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         sid: out for sid, out in (old_results or {}).items()
         if _sig_unchanged(sid) and l1_passed(out)
     }
+    # round36 #8 治本：replan 分批【重编号 id】(merge_subtask_batches 顺序重排 st-N)使上面按 id 的
+    # 签名匹配对【已完成】子任务几乎恒 0 命中 → 白重做 L1 已通过的真产出(round36 实证 st-24/st-43
+    # 被清)。补【scope 文件身份】保留：单写者不变量下子任务的 (writable,create_files) 集唯一(除纯
+    # 聚合注册文件子任务)，故按此集把旧完成态认领到 new_plan 的同 scope 子任务(新 id)。唯一性护栏：
+    # 仅当该 scope-key 在旧、新 plan 各自都【唯一且非空】才认领——防聚合文件多写者/空 scope 碰撞误保。
+    def _scope_key(st) -> tuple:
+        sc = getattr(st, "scope", None)
+        w = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
+        c = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
+        return (w, c)
+    _old_subs = list(getattr(old_plan, "subtasks", []) or [])
+    _new_subs = list(getattr(new_plan, "subtasks", []) or [])
+    from collections import Counter as _Counter
+    _old_sk_cnt = _Counter(_scope_key(st) for st in _old_subs)
+    _new_sk_cnt = _Counter(_scope_key(st) for st in _new_subs)
+    _new_by_sk = {_scope_key(st): st.id for st in _new_subs}
+    _scope_claimed = 0
+    for _ost in _old_subs:
+        _oid = getattr(_ost, "id", "")
+        if _oid in preserved:  # 已按 id 签名保留
+            continue
+        _out = (old_results or {}).get(_oid)
+        if not (_out and l1_passed(_out)):
+            continue
+        _sk = _scope_key(_ost)
+        if _sk == ((), ()):  # 空 scope 不作身份键
+            continue
+        if _old_sk_cnt[_sk] == 1 and _new_sk_cnt.get(_sk) == 1:
+            _nid = _new_by_sk[_sk]
+            if _nid not in preserved:
+                preserved[_nid] = _out  # 旧完成态认领到 new_plan 同 scope 子任务(新 id)，免白重做
+                _scope_claimed += 1
+    if _scope_claimed:
+        logger.info("[PLAN] replan 重入 #8：另按 scope 文件身份认领 %d 个已完成子任务产物"
+                    "（id 被重编号但 scope 唯一一致），免白重做真产出", _scope_claimed)
     pruned_counts = {
         sid: n for sid, n in (old_recovery_counts or {}).items() if _sig_unchanged(sid)
     }
@@ -1449,6 +1525,22 @@ async def plan(state: BrainState) -> dict:
     # 测试类编译失败 → mvn compile 过了却被 L1 判死 + worker 修 junit 绕圈"病根链。
     from swarm.brain.nodes.shared import _strip_unrequested_tests
     task_plan = _strip_unrequested_tests(task_plan, task_description)
+
+    # round36 #6 治本：覆盖单调化——仅在【重试/replan】轮(有 validation/replan feedback)，把上一轮
+    # plan 的合法 covers 按 scope 身份并回本轮 plan，防全量重拆随机丢已覆盖条目(打地鼠不收敛)。
+    # 首规划(无 feedback)不并。放在全部 plan 变异(merge/normalize/strip)之后、baseline 对账之前，
+    # 保 covers 口径一致。
+    _prior_plan = state.get("plan")
+    if _prior_plan is not None and (
+            (state.get("plan_validation_feedback") or "").strip()
+            or (state.get("replan_feedback") or "").strip()):
+        _valid_req_ids = {str(it.get("id")) for it in (state.get("requirement_items") or [])
+                          if isinstance(it, dict) and it.get("id")}
+        _cm = _merge_prior_covers_by_scope(task_plan, _prior_plan, _valid_req_ids)
+        if _cm:
+            logger.info(
+                "[PLAN] #6 覆盖单调化：按 scope 身份并回上一轮 %d 条合法 covers（防重拆丢覆盖，"
+                "促 MAX_PLAN_RETRY 内收敛）", _cm)
 
     # R34-8 确定性无害化：申报与 covers 重叠的条目丢申报保 covers——分批 LLM 会把
     # "本计划其他批实现"误当"存量已满足"申报（round34 实证 31 条批间推卸型申报）。
