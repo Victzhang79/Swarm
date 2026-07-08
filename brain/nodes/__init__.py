@@ -1165,7 +1165,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     from collections import Counter as _Counter
     _old_sk_cnt = _Counter(_scope_key(st) for st in _old_subs)
     _new_sk_cnt = _Counter(_scope_key(st) for st in _new_subs)
-    _new_by_sk = {_scope_key(st): st.id for st in _new_subs}
+    _new_by_sk = {_scope_key(st): st for st in _new_subs}
     _scope_claimed = 0
     for _ost in _old_subs:
         _oid = getattr(_ost, "id", "")
@@ -1178,9 +1178,16 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         if _sk == ((), ()):  # 空 scope 不作身份键
             continue
         if _old_sk_cnt[_sk] == 1 and _new_sk_cnt.get(_sk) == 1:
-            _nid = _new_by_sk[_sk]
-            if _nid not in preserved:
-                preserved[_nid] = _out  # 旧完成态认领到 new_plan 同 scope 子任务(新 id)，免白重做
+            _nst = _new_by_sk[_sk]
+            _nid = getattr(_nst, "id", "")
+            # 复核 HIGH：仅 scope 相同不够——REVISE/执行 replan 会【改同文件子任务的语义】(描述变
+            # =意图变)。要求【描述也一致】(只 id 被重编号=真同一工作)才认领；描述变则不认领(可能是
+            # 被要求改写的工作，绝不用旧产物静默跳过用户/失败反馈要的改动)。等价于 id-签名去掉 id。
+            if (getattr(_ost, "description", "") or "").strip() != (
+                    getattr(_nst, "description", "") or "").strip():
+                continue
+            if _nid and _nid not in preserved:
+                preserved[_nid] = _out  # 旧完成态认领到 new_plan 同 scope+同描述子任务(新 id)，免白重做
                 _scope_claimed += 1
     if _scope_claimed:
         logger.info("[PLAN] replan 重入 #8：另按 scope 文件身份认领 %d 个已完成子任务产物"
@@ -1530,10 +1537,13 @@ async def plan(state: BrainState) -> dict:
     # plan 的合法 covers 按 scope 身份并回本轮 plan，防全量重拆随机丢已覆盖条目(打地鼠不收敛)。
     # 首规划(无 feedback)不并。放在全部 plan 变异(merge/normalize/strip)之后、baseline 对账之前，
     # 保 covers 口径一致。
+    # 复核 MEDIUM/LOW：仅【覆盖/校验重试】(plan_validation_feedback)才并回——那时子任务尚未执行、
+    # 工作未变(只是重拆丢了 covers)，并回安全。执行失败/REVISE replan(replan_feedback)会改子任务
+    # 语义，同 scope 未必仍覆盖该 req，并回会掩盖被改掉的需求→排除。replan_feedback 是粘滞标记，
+    # 排除它也顺带收窄"一旦 replan 过就每轮并"的过宽窗口。
     _prior_plan = state.get("plan")
-    if _prior_plan is not None and (
-            (state.get("plan_validation_feedback") or "").strip()
-            or (state.get("replan_feedback") or "").strip()):
+    if _prior_plan is not None and (state.get("plan_validation_feedback") or "").strip() \
+            and not (state.get("replan_feedback") or "").strip():
         _valid_req_ids = {str(it.get("id")) for it in (state.get("requirement_items") or [])
                           if isinstance(it, dict) and it.get("id")}
         _cm = _merge_prior_covers_by_scope(task_plan, _prior_plan, _valid_req_ids)

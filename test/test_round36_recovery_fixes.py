@@ -164,13 +164,14 @@ def test_fix9_l2_replan_resets_plan_retry_count():
 # ── #8：replan 按 scope 文件身份保留已完成产出(id 被重编号也不白重做) ──
 
 def test_fix8_replan_preserves_completed_by_scope_when_id_churns():
+    """真同一工作(描述+scope 一致，只 id 被 merge 重编号)→认领旧产物，免白重做。"""
     from swarm.brain.nodes import _surgical_replan_reset
     old_plan = TaskPlan(subtasks=[
         SubTask(id="st-24", description="模板", scope=FileScope(create_files=["a/A.java"])),
         SubTask(id="st-43", description="SDK", scope=FileScope(create_files=["b/B.java"]))])
-    new_plan = TaskPlan(subtasks=[  # replan 重编号 id，scope 文件不变
-        SubTask(id="st-1", description="模板(改述)", scope=FileScope(create_files=["a/A.java"])),
-        SubTask(id="st-2", description="SDK(改述)", scope=FileScope(create_files=["b/B.java"]))])
+    new_plan = TaskPlan(subtasks=[  # replan 重编号 id，描述+scope 不变
+        SubTask(id="st-1", description="模板", scope=FileScope(create_files=["a/A.java"])),
+        SubTask(id="st-2", description="SDK", scope=FileScope(create_files=["b/B.java"]))])
     old_results = {
         "st-24": WorkerOutput(subtask_id="st-24", diff="d", summary="", l1_passed=True,
                               confidence="high"),
@@ -181,6 +182,19 @@ def test_fix8_replan_preserves_completed_by_scope_when_id_churns():
     assert "st-1" in preserved and "st-2" in preserved, list(preserved.keys())
     assert preserved["st-1"].subtask_id == "st-24", "旧产物认领到新 id"
     assert preserved["st-2"].subtask_id == "st-43"
+
+
+def test_fix8_description_change_same_scope_not_preserved():
+    """复核 HIGH：REVISE/replan 改同文件子任务语义(描述变=意图变)→绝不认领旧产物静默跳过改动。"""
+    from swarm.brain.nodes import _surgical_replan_reset
+    old_plan = TaskPlan(subtasks=[
+        SubTask(id="st-5", description="实现校验 A", scope=FileScope(writable=["UserService.java"]))])
+    new_plan = TaskPlan(subtasks=[  # 同文件，但描述=意图变了
+        SubTask(id="st-1", description="实现校验 B", scope=FileScope(writable=["UserService.java"]))])
+    old_results = {"st-5": WorkerOutput(subtask_id="st-5", diff="d", summary="",
+                                        l1_passed=True, confidence="high")}
+    out = _surgical_replan_reset(old_results, old_plan, new_plan)
+    assert not out["subtask_results"], "描述变(意图变)绝不用旧产物跳过——须真跑新工作"
 
 
 def test_fix8_ambiguous_scope_not_preserved():
