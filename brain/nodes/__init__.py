@@ -678,6 +678,9 @@ async def _plan_ultra_batched(
         # 一份脚手架时，通用去重网兜不住非 Maven 栈（dedupe_module_scaffolds 只认 pom.xml）。
         if "#" in mod_name and not mod_name.split("#", 1)[1].startswith("1/"):
             new_module_dirs = []
+        # R33-1 U3 同理：bisect 半批只有纯 ~a 链保留脚手架（~b 及其后代不重复触发）
+        if "~" in mod_name and any(p != "a" for p in mod_name.split("~")[1:]):
+            new_module_dirs = []
         scaffold_hint = ""
         if new_module_dirs:
             scaffold_hint = (
@@ -766,6 +769,40 @@ async def _plan_ultra_batched(
         _decompose_batch(i, mod_name, batch)
         for i, (mod_name, batch) in enumerate(module_batches, start=1)
     ])
+    # R33-1 U3：bisect-on-timeout——确定性慢批（内容特异性生成失控，非纯体量：round33
+    # 实证 12 文件批也超时 4 次）对半切分重试，有界两轮（最小 1/4 批，1 文件不再切）。
+    # 半批 ~a/~b 后缀命名：独立签名入 U2 缓存、独立失败记账、按原位置替换保批间序。
+    _batch_files: dict[str, list] = {n: f for n, f in module_batches}
+    # 泄压阀（对照 SWARM_PLAN_COVERAGE_GATE 先例）：默认开；关闭回退整批记账旧行为。
+    _bisect_on = os.environ.get("SWARM_PLAN_BATCH_BISECT", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+    for _bisect_round in range(2 if _bisect_on else 0):
+        _to_split = [(idx, oc) for idx, oc in enumerate(_outcomes)
+                     if oc[0] == "timeout" and len(_batch_files.get(oc[2]) or []) >= 2]
+        if not _to_split:
+            break
+        _specs = []
+        for _idx, _oc in _to_split:
+            _name, _files = _oc[2], _batch_files[_oc[2]]
+            _mid = (len(_files) + 1) // 2
+            logger.warning(
+                "[PLAN-BATCH] U3 批'%s'超时耗尽重试 → 对半切分重试（%d+%d 文件）",
+                _name, _mid, len(_files) - _mid)
+            for _suf, _part in (("~a", _files[:_mid]), ("~b", _files[_mid:])):
+                _batch_files[_name + _suf] = _part
+                _specs.append((_idx, _oc[1], _name + _suf, _part))
+        _half_ocs = await _asyncio.gather(*[
+            _decompose_batch(_i, _hname, _part)
+            for (_x, _i, _hname, _part) in _specs
+        ])
+        _replace: dict[int, list] = {}
+        for (_idx, _i, _hname, _part), _hoc in zip(_specs, _half_ocs):
+            _replace.setdefault(_idx, []).append(_hoc)
+        _outcomes = [
+            _o for idx, oc in enumerate(_outcomes)
+            for _o in (_replace.get(idx) or [oc])
+        ]
+
     # round29 真因4 治本：失败模块【结构化记账】而非只计数——d37a52a3 实测 'system-enhance'
     # 14 文件两次 timeout 被降级跳过后无任何 state 痕迹，任务其余成功则记 DONE 但交付物静默缺
     # 整模块 + LEARN_SUCCESS 学成成功模式（伪装成功）。记账供 plan 节点落 state

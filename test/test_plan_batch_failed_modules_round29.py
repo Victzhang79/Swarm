@@ -88,10 +88,13 @@ def _run_batched(llm, monkeypatch):
 
 # ═════════ 1. 结构化记账：timeout 模块必须进 failed 列表（修前红：返回值不是二元组）═════════
 def test_batched_planner_records_timeout_module(monkeypatch):
+    # R33 U3 后语义演进：超时批被对半切分重试（本夹具 hang 判据恰好只随 scaffold 提示
+    # 命中 ~a 半批），恢复的半批不再算丢失；★意图不变：仍失败的部分逐个结构化记账，
+    # 绝不静默蒸发★（round29 真因4）。
     plan, failed, _bl, _c = _run_batched(_FakeLLM(hang_module="system-enhance"), monkeypatch)
-    assert [m["name"] for m in failed] == ["system-enhance"], failed
-    assert failed[0]["reason"] == "timeout"
-    assert failed[0]["files"] == 2, "必须记录丢失的文件数（14 文件蒸发这类量级要可见）"
+    assert failed and all(m["name"].startswith("system-enhance") for m in failed), failed
+    assert all(m["reason"] == "timeout" for m in failed)
+    assert sum(m["files"] for m in failed) >= 1, "仍失败半批的文件数必须可见"
     # 幸存模块照常拆出（降级容错语义不回归）
     assert plan.subtasks and any("alarm-sdk" in (f or "")
                                  for st in plan.subtasks

@@ -36,13 +36,37 @@ logger = logging.getLogger(__name__)
 TRUNCATION_MARKER = "…（文档过长，中间内容已省略）…"
 
 MAX_EXTRACT_RETRIES = 2       # LLM 抽取有界重试：首发 + 2 次重试后如实降级
-MAX_ITEMS = 60                # 超量=抽取失控（ACCEPTANCE_DESIGN §6.2），超出部分拒收
+MAX_ITEMS = 100               # 抽取失控熔断阀（ACCEPTANCE_DESIGN §6.2）。R32-4 用户拍板：
+                              # 旧值 60 基于"正常 PRD<60 条"设计假设，三轮 E2E 实测合格
+                              # 74/96/88 条证伪——切的是真需求。env SWARM_EXTRACT_MAX_ITEMS
+                              # 可调；超限截断按 kind 优先级非到达序（_KIND_PRIORITY）。
 MAX_ITEM_TEXT_CHARS = 500     # 单条超长=段落而非条目
 MIN_QUOTE_CHARS = 4           # 归一化后过短的 quote 无回指力（如单个词），拒收
 
 # kind 枚举（功能/数据/接口/页面/其他）。存储用英文标识（下游 acceptance_assertions 的
 # kind="http_probe" 同风格），LLM 输出中英文同义词都归一。
 REQUIREMENT_KINDS = ("functional", "data", "api", "page", "other")
+
+# R32-4：超限截断的 kind 优先级（值小优先收留）——功能/接口/数据承载覆盖矩阵与断言
+# 的主干，页面/其他先截。
+_KIND_PRIORITY = {"functional": 0, "api": 1, "data": 2, "page": 3, "other": 4}
+
+
+def _max_items_limit() -> int:
+    """R32-4：抽取上限 env 可调（非法值 WARNING 回退默认，配置错不冒充运行时故障）。"""
+    import os
+    raw = os.environ.get("SWARM_EXTRACT_MAX_ITEMS", "") or ""
+    try:
+        val = int(raw) if raw.strip() else MAX_ITEMS
+        if val <= 0:
+            logger.warning("[EXTRACT_REQ] SWARM_EXTRACT_MAX_ITEMS 非正数(%r)——回退默认 %d",
+                           raw, MAX_ITEMS)
+            return MAX_ITEMS
+        return val
+    except ValueError:
+        logger.warning("[EXTRACT_REQ] SWARM_EXTRACT_MAX_ITEMS 配置非法(%r)——回退默认 %d",
+                       raw, MAX_ITEMS)
+        return MAX_ITEMS
 _KIND_ALIASES = {
     "functional": "functional", "function": "functional", "feature": "functional",
     "功能": "functional",
@@ -178,9 +202,6 @@ def validate_requirement_items(
         if item_id in seen_ids:
             rejected.append({"reason": "duplicate", "text_head": text[:80]})
             continue
-        if len(items) >= MAX_ITEMS:
-            rejected.append({"reason": "over_limit", "text_head": text[:80]})
-            continue
         kind = _KIND_ALIASES.get(str(raw.get("kind") or "").strip().casefold(), "other")
         source = raw.get("source")
         if source not in _ALLOWED_SOURCES:
@@ -193,6 +214,16 @@ def validate_requirement_items(
             "source_quote": quote,
             "source": source,
         })
+    # R32-4：超限截断两阶段化——先全量校验，再按 kind 优先级选留（functional/api/data
+    # 优先于 page/other，同优先级保到达序），被截条目记 over_limit。未超限=零行为变化。
+    limit = _max_items_limit()
+    if len(items) > limit:
+        order = sorted(range(len(items)),
+                       key=lambda i: (_KIND_PRIORITY.get(items[i]["kind"], 9), i))
+        keep = set(order[:limit])
+        rejected.extend({"reason": "over_limit", "text_head": items[i]["text"][:80]}
+                        for i in range(len(items)) if i not in keep)
+        items = [items[i] for i in range(len(items)) if i in keep]
     return items, rejected
 
 
