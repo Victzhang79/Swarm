@@ -489,7 +489,9 @@ async def verify_runtime(state: BrainState) -> dict:
             out = _apply_migration_patch(
                 out, _run_accept_phase(assertions, accept_gen_info, None, ""))
             out["acceptance_assertions"] = list(assertions)
-            return _append_degraded(out, accept_gen_degraded)
+            # hunter F1：冒烟未执行=申报条目零验证证据，如实留痕
+            return _append_degraded(
+                out, accept_gen_degraded + _baseline_unverified_degraded(state, out))
         # d. 探针执行（run_runtime_smoke 内部自带 to_thread + infra≠失败三分类）
         # F2：项目内符号索引（import 缺失归属判定）——建不出=None，分类器保守 dependency_missing
         try:
@@ -535,7 +537,9 @@ async def verify_runtime(state: BrainState) -> dict:
         out = _apply_migration_patch(
             out, _run_accept_phase(assertions, accept_gen_info, None, ""))
         out["acceptance_assertions"] = list(assertions)
-        return _append_degraded(out, accept_gen_degraded)
+        # hunter F1：节点异常=申报条目零验证证据，如实留痕
+        return _append_degraded(
+            out, accept_gen_degraded + _baseline_unverified_degraded(state, out))
     finally:
         # e. finally 必杀：转交/自建一视同仁；转交不成立时旧 sid 也一并处置（幂等）。
         used_sid = str(getattr(sandbox, "sandbox_id", "") or "")
@@ -561,7 +565,7 @@ async def verify_runtime(state: BrainState) -> dict:
     accept_keys["acceptance_assertions"] = list(assertions)
     accept_degraded = (
         [accept_patch["_degraded"]] if accept_patch.get("_degraded") else []
-    ) + list(accept_gen_degraded)
+    ) + list(accept_gen_degraded) + _baseline_unverified_degraded(state, accept_patch)
 
     if migration_patch.get("_failed"):
         # migration 确定性 SQL 失败 → 并入 runtime 失败通道（task#20 的归因回灌统一消费）。
@@ -974,6 +978,36 @@ async def _generate_acceptance_assertions(
         logger.warning("[VERIFY_RUNTIME] 断言生成异常 → 降级 assertions=[]: %s", exc)
         return [], [f"acceptance_generation:empty(error:{str(exc)[:120]})"], \
             {"reason": "generation_degraded"}
+
+
+def _baseline_unverified_degraded(state: BrainState, accept_patch: dict) -> list[str]:
+    """R31 hunter F1（CONFIRMED P1）：baseline_covered 申报的"运行时验收兜底"在
+    manual/skip 形态下不成立——鉴权类断言恒 manual 不执行、冒烟 skip 时断言跟随 skip，
+    acceptance_passed=None 一路放行 gates（None=跳过≠失败语义本身正确）。假申报最有
+    动机的场景（round31 的 JWT/2FA 真漏拆）恰好全程无人拦。
+
+    治法（诚实降级非阻断）：申报条目若无【已执行且 pass】的断言证据 → degraded 留痕：
+    ①should_write_success 既有双闸挡 L6 假成功学习 ②deliver payload/人工闸可见
+    ③SWARM_BASELINE_STRICT_GATE 收紧阀（gates 侧）消费同一留痕可升级为拒绝 auto_accept。
+    纯函数承诺不抛（增强面绝不污染冒烟结论）。
+    """
+    try:
+        from swarm.brain.plan_validator import normalize_baseline_covered
+        declared = [d["id"] for d in normalize_baseline_covered(
+            state.get("baseline_covered")) if d.get("reason")]
+        if not declared:
+            return []
+        details = accept_patch.get("acceptance_details")
+        rows = (details.get("assertions") if isinstance(details, dict) else None) or []
+        passed = {str(r.get("req_id")) for r in rows if r.get("verdict") == "pass"}
+        unverified = [i for i in declared if i not in passed]
+        if not unverified:
+            return []
+        head = ",".join(unverified[:8]) + ("…" if len(unverified) > 8 else "")
+        return [f"baseline_covered:unverified({len(unverified)}:{head})"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[VERIFY_RUNTIME] baseline 申报核验留痕失败(跳过): %s", exc)
+        return []
 
 
 def _run_accept_phase(

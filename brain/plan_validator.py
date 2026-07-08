@@ -239,7 +239,65 @@ def validate_plan_structure(
 # ── S2-3 PRD 覆盖矩阵（task#24，ACCEPTANCE_DESIGN 定案3/§2.5）──────────────
 # 通用多栈多领域：只对账 req_id 与 covers 的映射结构，不含任何语言/框架/领域词汇。
 
-def build_coverage_matrix(plan, requirement_items) -> dict:
+def normalize_baseline_covered(raw) -> list[dict]:
+    """R31-1 T1：baseline_covered 申报的确定性清洗。纯函数零 LLM。
+
+    输入是 PLAN LLM 顶层输出（或 state 键回读），形态不可信：
+    dict{id,reason} / 裸字符串（补空 reason，交由覆盖校验拒"缺理由"）/ 垃圾类型（丢弃）。
+    按 id 去重【保优】（带 reason 的胜过空 reason——复核 L-3：保首会让先到的空申报
+    多烧一轮"缺理由"重试）；reason 有界 300 字符、总条数有界 100（复核 F3：LLM 失控吐
+    数百条假 ID 时 state 键/feedback/下一轮 prompt 三处联动膨胀，P16-2 家族）。
+    非 list 整体 → []。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    index: dict[str, int] = {}
+    for entry in raw:
+        if isinstance(entry, dict):
+            rid = str(entry.get("id") or "").strip()
+            reason = str(entry.get("reason") or "").strip()[:300]
+        elif isinstance(entry, str):
+            rid, reason = entry.strip(), ""
+        else:
+            continue
+        if not rid:
+            continue
+        if rid in index:
+            if reason and not out[index[rid]]["reason"]:
+                out[index[rid]]["reason"] = reason
+            continue
+        if len(out) >= 100:
+            break
+        index[rid] = len(out)
+        out.append({"id": rid, "reason": reason})
+    return out
+
+
+# R31-2 T2 近邻判据：与真实 ID 共享的最短前缀长度。ID 形态 req-<sha1[:8]>，
+# 共享"req-"+6 位 hash 前缀的随机碰撞率 ≈16^-6/对（可忽略）——比相似度阈值可靠：
+# hunter F4 仿真坐实 difflib cutoff 0.75 在 60 条随机 ID 下有 ~9.5% 概率把纯臆造 ID
+# 指向无关真实条目（SequenceMatcher 非连续块匹配远比直觉宽松），而 round31 实证对
+# （req-72fd9811 vs req-72fd98fb）ratio 仅 0.833，提高 cutoff 到 0.85 又会漏掉动机
+# 案例。前缀规则两者兼得；代价=前段 typo 无提示（fail-closed：宁缺勿误导）。
+_NEAR_MISS_PREFIX = 10  # len("req-") + 6
+
+
+def _near_miss_hint(bad_id: str, known_ids) -> str:
+    """R31-2 T2：臆造 ID 的确定性近邻提示（绝不自动改写，只在 issue 文案点名候选）。
+
+    round31 实证：LLM 写 req-72fd9811（真实为 req-72fd98fb），D09 纯文字"不得编造"
+    四轮不自愈。判据=唯一共享 ≥10 字符前缀的真实 ID；候选不唯一/不存在 → 不提示
+    （误导比不提示更糟，hunter F4）。
+    """
+    if len(bad_id) < _NEAR_MISS_PREFIX:
+        return ""
+    prefix = bad_id[:_NEAR_MISS_PREFIX]
+    matches = [k for k in known_ids if k[:_NEAR_MISS_PREFIX] == prefix and k != bad_id]
+    return f"（可能想引用 {matches[0]}？）" if len(matches) == 1 else ""
+
+
+def build_coverage_matrix(plan, requirement_items, baseline_covered=None) -> dict:
     """覆盖矩阵 = 从 plan.subtasks[].covers 现算的【派生数据】。
 
     定案（ACCEPTANCE_DESIGN 新键清单）：矩阵绝不进 state——它完全由 plan 与
@@ -253,7 +311,13 @@ def build_coverage_matrix(plan, requirement_items) -> dict:
         "items": [{"id","text","kind","covered_by":[subtask_id,...]}],
         "uncovered": [{"id","text"}],           # 未被任何子任务覆盖的条目
         "dangling_covers": {subtask_id: [req_id,...]},  # 悬空引用（指向不存在的条目 ID）
+        "baseline_covered": [{"id","reason"}],  # R31-1 T1：合法的"存量已满足"申报（reason 非空）
+        "dangling_baseline": [req_id,...],      # 申报了清单外 ID（臆造，校验拒绝）
       }
+
+    R31-1 T1 覆盖口径：条目"被覆盖" = 被子任务 covers 引用 ∪ 被合法 baseline 申报
+    （id 在清单内且 reason 非空——fail-closed，无依据申报不算覆盖）。
+    baseline_covered=None/缺省 → 全部既有调用点行为逐字节不变（新键恒空）。
 
     容错口径：requirement_items 缺失/空 → 空矩阵（total_items=0，调用方按
     "跳过校验+degraded"处理）；非 dict/无 id 条目跳过（上游 requirements_extract
@@ -278,6 +342,18 @@ def build_coverage_matrix(plan, requirement_items) -> dict:
                 bucket = dangling.setdefault(st_id, [])
                 if rid not in bucket:
                     bucket.append(rid)
+    # R31-1 T1：baseline 申报分拣——清单内且带理由=合法覆盖；清单外=dangling（臆造）。
+    # 空 reason 的申报既不算覆盖也不进 baseline 桶（validate 层对它出专项 issue）。
+    baseline_norm = normalize_baseline_covered(baseline_covered)
+    baseline_valid: list[dict] = []
+    dangling_baseline: list[str] = []
+    baseline_ids: set[str] = set()
+    for entry in baseline_norm:
+        if entry["id"] not in covered_by:
+            dangling_baseline.append(entry["id"])
+        elif entry["reason"]:
+            baseline_valid.append(entry)
+            baseline_ids.add(entry["id"])
     items_out: list[dict] = []
     uncovered: list[dict] = []
     for it in valid_items:
@@ -289,7 +365,7 @@ def build_coverage_matrix(plan, requirement_items) -> dict:
             "kind": str(it.get("kind") or "other"),
             "covered_by": covered_by[rid],
         })
-        if not covered_by[rid]:
+        if not covered_by[rid] and rid not in baseline_ids:
             uncovered.append({"id": rid, "text": text})
     return {
         "total_items": len(items_out),
@@ -297,10 +373,14 @@ def build_coverage_matrix(plan, requirement_items) -> dict:
         "items": items_out,
         "uncovered": uncovered,
         "dangling_covers": dangling,
+        "baseline_covered": baseline_valid,
+        "dangling_baseline": dangling_baseline,
     }
 
 
-def validate_requirement_coverage(plan, requirement_items) -> PlanValidationResult:
+def validate_requirement_coverage(
+    plan, requirement_items, baseline_covered=None,
+) -> PlanValidationResult:
     """S2-3 确定性覆盖校验维度（validate_plan 内、结构校验+SIMPLE 早退之后调用）。
 
     规则（全确定性，零 LLM）：
@@ -314,17 +394,39 @@ def validate_requirement_coverage(plan, requirement_items) -> PlanValidationResu
     失败 issues 逐条带条目 id+text：D09 回灌反馈的具体性决定 PLAN LLM 能否修对。
     """
     result = PlanValidationResult(valid=True)
-    matrix = build_coverage_matrix(plan, requirement_items)
+    matrix = build_coverage_matrix(plan, requirement_items, baseline_covered)
+    known_ids = [row["id"] for row in matrix["items"]]
     for item in matrix["uncovered"]:
+        # R31-1：文案必须教申报通道——round31 实证 PLAN 拒绝为存量已有能力造子任务
+        # （工程判断合理），不给出口=确定性死锁烧光重试。
         result.add(
             f"需求条目未被任何子任务覆盖: {item['id']} — {item['text'][:120]}"
-            f"（请把该需求分配给某个子任务实现，并在该子任务的 covers 字段声明此条目 ID）"
+            f"（若需新实现：分配给某个子任务并在其 covers 声明此 ID；"
+            f"若现有代码已完整满足该需求、本任务无需改动：在计划 JSON 顶层的 "
+            f"baseline_covered 列表申报此 ID 并给出 reason 依据）"
         )
     for st_id in sorted(matrix["dangling_covers"]):
         bad = matrix["dangling_covers"][st_id]
+        # 复核 L-2：提示逐 ID 归属（多坏 ID 时串尾拼接会让 LLM 猜配对）
+        listed = ", ".join(f"{b}{_near_miss_hint(b, known_ids)}" for b in bad)
         result.add(
-            f"子任务 {st_id} 的 covers 引用不存在的需求条目 ID: {', '.join(bad)}"
+            f"子任务 {st_id} 的 covers 引用不存在的需求条目 ID: {listed}"
             f"（covers 只能引用需求条目清单中给出的 ID，不得编造）"
+        )
+    for bad in matrix["dangling_baseline"]:
+        result.add(
+            f"baseline_covered 申报了不存在的需求条目 ID: {bad}{_near_miss_hint(bad, known_ids)}"
+            f"（只能申报需求条目清单中给出的 ID，不得编造）"
+        )
+    # 缺理由申报：normalize 保留了它但矩阵不算覆盖——这里出专项 issue（D09 可修性：
+    # 点名到条目，LLM 补 reason 即过，绝不让"未覆盖"泛化文案掩盖真实动作项。
+    _declared_valid = {e["id"] for e in matrix["baseline_covered"]}
+    for entry in normalize_baseline_covered(baseline_covered):
+        if entry["id"] in _declared_valid or entry["id"] in matrix["dangling_baseline"]:
+            continue
+        result.add(
+            f"baseline_covered 申报 {entry['id']} 缺少 reason 理由"
+            f"（申报存量已满足必须给出依据：现有代码何处/如何满足该需求）"
         )
     return result
 

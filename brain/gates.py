@@ -183,6 +183,21 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             "非启动/探活失败）"
         )
 
+    # R31 hunter F1 收紧阀（默认关，开启需运维/用户拍板）：baseline_covered 申报存在
+    # 未经【已执行且 pass】断言验证的条目（鉴权类断言恒 manual / 冒烟 skip 均属此形态）
+    # → 拒绝 auto_accept 交人工。消费 verify 写入的同一条 degraded 留痕（不另算一份事实）。
+    # 默认关的权衡：棕地任务的诚实申报常无法自动核实（鉴权墙），默认硬拦会把合法交付
+    # 全数打失败——默认走"degraded 挡 L6 假学习 + deliver/confirm payload 人工可见"通道。
+    import os as _os
+    if _os.environ.get("SWARM_BASELINE_STRICT_GATE", "0").strip().lower() in (
+            "1", "true", "yes", "on"):
+        _unv = [str(d) for d in (state.get("degraded_reasons") or [])
+                if str(d).startswith("baseline_covered:unverified")]
+        if _unv:
+            return False, (
+                f"baseline_unverified: 存量申报未经运行时验证（严格闸开启）：{_unv[0][:200]}"
+            )
+
     vf = state.get("verification_failure")
     if vf:
         return False, f"verification_failure: {vf}"

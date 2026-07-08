@@ -149,6 +149,7 @@ class BrainState(TypedDict, total=False):
     # last-write-wins 无 reducer（均非累积事实：replan/design 重做需整体替换，加 reducer
     # 会让旧轮结论粘滞误导路由）。skipped/降级可观测走现成 degraded_reasons reducer。
     requirement_items: list[dict]       # S2-2：结构化需求条目 [{id: req-<sha1[:8]>, text, kind, source_quote, source, source_truncated?}]，extract_requirements 节点写（contract_design→plan 之间）；防幻觉=source_quote 回指原文确定性校验，抽取失败如实降级 []
+    baseline_covered: list[dict]        # R31-1 T1：PLAN 申报的"存量已满足"条目 [{id, reason}]，plan 节点 always-emit（未申报=[]，last-write-wins 防跨重试粘滞）；★独立键绝不挂 TaskPlan 字段——plan 变异重构造路径（batched/resplit/revision/水平合并）天然碰不到，结构性防 v0.9.23 F1"变异路径丢字段"类复发★；覆盖校验=covers∪合法申报，申报条目仍生成验收断言（假申报→acceptance_failed 兜底）
     acceptance_assertions: list[dict]   # S2：任务级验收断言 spec [{id, req_id, kind:"http_probe", request, expect, auth}]（task#25 acceptance_spec 写入；声明先行）
     acceptance_passed: bool | None      # S2：验收断言三态结论（None=跳过≠失败，对齐 l3_passed/migration_verify_passed）——verify_runtime accept phase 写入（task#25/26），本批只声明不写入
     acceptance_details: dict[str, Any]  # S2：断言逐条 verdict+证据留痕（deliver 展示/失败回灌数据源）——同上，本批只声明不写入

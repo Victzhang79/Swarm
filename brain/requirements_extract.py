@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import unicodedata
 from typing import Any
@@ -311,6 +312,18 @@ async def extract_requirements(state: BrainState) -> dict:
         out["degraded_reasons"] = degraded
     logger.info("[EXTRACT_REQ] 完成：%d 条合法条目，%d 条被拒%s",
                 len(items), len(rejected), "，源文本经截断" if truncated else "")
+    if rejected:
+        # R31-4 T4：被拒明细有界落 INFO——quote_not_in_source 的"正确防幻觉击杀 vs
+        # 格式差异误杀"必须可事后审计（round31 实证 17 条被拒但 state 只存汇总计数，
+        # 误杀率无从判读）。text_head 上游已截 80 字符，再封条数与总量上限。
+        # hunter nit：整串尾截断会切碎 JSON 使审计行不可机器解析——按条回退到预算内
+        _detail_rows = rejected[:40]
+        _detail = json.dumps(_detail_rows, ensure_ascii=False)
+        while len(_detail) > 4000 and _detail_rows:
+            _detail_rows = _detail_rows[:-1]
+            _detail = json.dumps(_detail_rows, ensure_ascii=False)
+        logger.info("[EXTRACT_REQ] 被拒明细(误杀审计，%d/%d 条): %s",
+                    len(_detail_rows), len(rejected), _detail)
     return out
 
 

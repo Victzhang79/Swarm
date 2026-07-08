@@ -431,6 +431,39 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
+def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
+    """R31-3 T3：D09 重试的增量修补块——上一版 plan 摘要 + 修补纪律。
+
+    round31 实证：feedback 只列 issue 时 PLAN 每轮全量重拆，issue 集合 13→15→12→14
+    震荡不收敛（第 2 轮把第 1 轮已覆盖条目又随机丢了）。给出上一版摘要并显式要求
+    "保留已通过部分"，把重试从重掷骰子变成定向修补。prev_plan 缺失/畸形 → ""（首次
+    规划/降级路径零注入）。有界：每子任务一行 desc[:60]，总量 6000 字符封顶。
+    """
+    subtasks = getattr(prev_plan, "subtasks", None) or []
+    if not subtasks:
+        return ""
+    lines = []
+    for st in subtasks:
+        desc = (getattr(st, "description", "") or "").replace("\n", " ")[:60]
+        covers = getattr(st, "covers", None) or []
+        lines.append(f"  {getattr(st, 'id', '?')}: {desc} covers={list(covers)}")
+    bl = [f"{e.get('id')}({str(e.get('reason') or '')[:40]})"
+          for e in (prev_baseline or []) if isinstance(e, dict)]
+    full = "\n".join(lines)
+    body = full[:6000]
+    if len(full) > 6000:
+        # 复核 L-4：截断必须自述——否则"保留未点名子任务"指令会反向诱导 LLM 丢掉未展示的
+        body += "\n  （摘要已截断：未列出的子任务同样存在且需保留）"
+    _bl_text = ", ".join(bl)[:1200]  # hunter F3：申报摘要独立定界（拼在 body 截断之后）
+    return (
+        "\n上一版计划摘要（子任务 → covers 声明）：\n" + body
+        + (f"\nbaseline_covered 申报: {_bl_text}" if _bl_text else "")
+        + "\n\n增量修补纪律：以上一版计划为基础定向修补——保留校验未点名问题的子任务拆分、"
+        "covers 声明与 baseline_covered 申报，只修正上面点名的问题；"
+        "不要全量重拆（重拆会把已覆盖的条目再次随机丢失，白烧重试预算）。\n"
+    )
+
+
 def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = False) -> str:
     """S2-3（task#24）：PLAN prompt 的需求条目清单 + covers 声明纪律注入块。
 
@@ -465,7 +498,14 @@ def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = Fal
         + "\n\n覆盖声明纪律：\n"
         "- 每个需求条目必须被至少一个子任务的 covers 覆盖——未覆盖的条目会被计划校验拒绝并要求重新规划；\n"
         "- covers 只能引用上面清单中存在的 ID，绝不编造 ID；\n"
-        "- 一个子任务可以覆盖多个条目；与该子任务无关的条目不要写进它的 covers。"
+        "- 一个子任务可以覆盖多个条目；与该子任务无关的条目不要写进它的 covers。\n"
+        "- R31：若某条目已被【现有代码】完整满足、本任务无需为它做任何改动，不要硬造子任务——"
+        "改在计划 JSON 顶层用 baseline_covered 字段申报，例如 "
+        "\"baseline_covered\": [{\"id\": \"req-xxxxxxxx\", \"reason\": \"现有代码何处/如何已满足（简要依据）\"}]；\n"
+        "- baseline_covered 同样只能引用清单中的 ID，且 reason 必填非空；\n"
+        "- 申报是对现状的承诺：交付前会对需求条目做运行时验收核查——可自动执行的断言若与"
+        "申报不符会导致验收失败并回灌整改；无法自动核实的申报（如需鉴权的能力）会被降级"
+        "标记并呈报人工审核。只申报你能从现有代码中确认的能力。"
         + batch_note
     )
 
@@ -506,9 +546,13 @@ async def _plan_ultra_batched(
         ensure_ascii=False,
     )[:3000]
     proj_struct = _format_project_structure(knowledge_context)
-    # sliding_ctx 头部带 plan() 注入的"上轮 replan 失败根因"——此前分批路径把它静默丢弃，
-    # ULTRA replan 退化为盲重规划（反复产同样的坏计划）。反馈在头部，截尾不丢根因。
-    sliding_ctx_text = (sliding_ctx or "").strip()[:2000] or "（无）"
+    # sliding_ctx 头部带 plan() 注入的"上轮 replan/校验失败根因 + R31-3 增量修补块"——
+    # 此前分批路径把它静默丢弃，ULTRA replan 退化为盲重规划（反复产同样的坏计划）。
+    # 复核 H-1：原 [:2000] 在 D09 覆盖 issues（round31 量级 12-15 条 ≈3000+ 字符）+
+    # 修补块（≤6.2K，拼在 issues 之后）下会把修补块整块截没——T3 为 ULTRA 分批而生
+    # 却到不了主战场。上界放到 14000（feedback 8K 帽 + 修补块 6.2K 帽，两处上游已
+    # 各自定界，此处仅兜底）。
+    sliding_ctx_text = (sliding_ctx or "").strip()[:14000] or "（无）"
     # S2-3：分批路径同样注入需求条目清单（items 空=一字不加）。batched=True 提示本批只
     # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
     _cov_block = _requirement_coverage_prompt_block(
@@ -574,6 +618,8 @@ async def _plan_ultra_batched(
     # 串行 11 批 ~20min → 并发4 ~5min。gather 保序：结果按 module_batches 顺序收集，merge 全局
     # 编号与串行版一致。逐批超时/异常降级与原行为逐字节一致(返回标记，主循环统一计 failed_batches)。
     _plan_sem = _asyncio.Semaphore(4)
+    # R31-1 T1：各批 LLM 顶层 baseline_covered 申报的收集器（成功批才收，闭包单线程安全）
+    _baseline_decls: list = []
 
     async def _decompose_batch(i: int, mod_name: str, batch: list) -> tuple:
         batch_fp_text = "\n".join(
@@ -633,7 +679,19 @@ async def _plan_ultra_batched(
                                 if _opt in _st and _st[_opt] is None:
                                     _st.pop(_opt)
                     if subs:
+                        # R31-1 T1：本批的 baseline_covered 申报进闭包收集（gather 单线程安全），
+                        # merge 后统一 normalize 去重——批间重复申报同一条目保首即可。
+                        _bl = result.get("baseline_covered") if isinstance(result, dict) else None
+                        if isinstance(_bl, list) and _bl:
+                            _baseline_decls.extend(_bl)
                         return ("ok", i, mod_name, subs, _dt, len(batch))
+                    # 复核 L-1：空子任务批的 baseline 申报不收（批失败面），申报蒸发须留痕
+                    # ——信号未失联（该模块进 failed 记账→fail-fast 闸），但审计要能看见。
+                    _bl_lost = result.get("baseline_covered") if isinstance(result, dict) else None
+                    if isinstance(_bl_lost, list) and _bl_lost:
+                        logger.warning(
+                            "[PLAN-BATCH] 模块'%s' 批无子任务但含 %d 条 baseline 申报——"
+                            "失败批申报不收（未覆盖条目将走覆盖校验重试）", mod_name, len(_bl_lost))
                     last_fail = ("ok", i, mod_name, [], _dt, len(batch))  # 空 → 可重试
                 except _asyncio.TimeoutError:
                     last_fail = ("timeout", i, mod_name, None, None, len(batch))
@@ -728,7 +786,11 @@ async def _plan_ultra_batched(
     if not _subtasks:
         raise RuntimeError("ultra 分批拆解合并后子任务全部构造失败（字段畸形），无可用子任务")
     # round29 真因4：失败模块清单随 plan 一起返回（调用方落 state + 闸门消费），不再只留日志。
-    return TaskPlan(subtasks=_subtasks), plan_batch_failed_modules
+    # R31-1 T1：baseline 申报并集第三元返回——绝不挂 TaskPlan 字段（结构性防"变异路径丢字段"，
+    # v0.9.23 F1 同类教训），由 plan() 落独立 state 键。
+    from swarm.brain.plan_validator import normalize_baseline_covered
+    return (TaskPlan(subtasks=_subtasks), plan_batch_failed_modules,
+            normalize_baseline_covered(_baseline_decls))
 
 
 def _subtask_signature(st) -> tuple:
@@ -868,6 +930,8 @@ async def plan(state: BrainState) -> dict:
             "failure_escalated": False,
             # round29 真因4 always-emit（复核 LOW）：SIMPLE 路径不走分批，恒发 []，保不变量字面自洽。
             "plan_batch_failed_modules": [],
+            # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
+            "baseline_covered": [],
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
                                  old_recovery_counts=state.get("targeted_recovery_counts"),
                                  old_retry_counts=state.get("subtask_retry_counts"),
@@ -890,6 +954,9 @@ async def plan(state: BrainState) -> dict:
     # round29 真因4：分批拆解失败模块清单。always-emit（非分批/全成功路径发 []）——last-write-wins
     # 使 replan 成功后自动清空，不粘滞（「仅条件写无人清」是历史 bug 模式）。
     _plan_batch_failed: list[dict] = []
+    # R31-1 T1：本轮 baseline_covered 申报（独立 state 键 always-emit——LLM 未申报/降级
+    # 兜底路径恒 []，last-write-wins 刷掉上一轮申报防跨重试粘滞）
+    _baseline_covered: list[dict] = []
     sliding_ctx = sliding_context_prompt(state)
 
     # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
@@ -899,10 +966,16 @@ async def plan(state: BrainState) -> dict:
         sliding_ctx = (
             f"⚠️ 上一轮规划执行失败，本次为重新规划（第 {state.get('replan_count', 1)} 次）。\n"
             f"上轮失败根因（务必规避，不要重复同样的拆分/依赖/scope 错误）：\n"
-            f"{_replan_feedback}\n\n"
+            f"{_replan_feedback}\n"
+            # 复核 M-1：replan 分支与校验重试分支对称注入上一版摘要——否则 replan LLM
+            # 看不到"上一版已通过的 covers/baseline 申报"，always-emit 会用漏申报的新
+            # 输出覆写 state，覆盖闸门重新失败白烧 D09 重试（最坏复现 round31 式烧光）。
+            + _previous_plan_repair_block(
+                state.get("plan"), state.get("baseline_covered"))
+            + "\n"
             + (sliding_ctx or "")
         )
-        logger.info("[PLAN] replan 重入 — 已注入上轮失败原因供 LLM 规避")
+        logger.info("[PLAN] replan 重入 — 已注入上轮失败原因+上一版计划摘要供 LLM 规避")
 
     # D09：VALIDATE_PLAN 失败原因回灌——after_validate 失败→increment_retry→plan 是重试循环，
     # 上轮校验（结构/P6b 完整性）为何被否绝不能对 LLM 隐藏，否则盲重生成同样坏计划烧光重试预算。
@@ -911,7 +984,11 @@ async def plan(state: BrainState) -> dict:
         sliding_ctx = (
             f"⚠️ 上一轮生成的执行计划【校验未通过】（第 {state.get('plan_retry_count', 1)} 次重试）。\n"
             f"校验失败的具体问题（本次务必逐条修正，不要重复同样的结构/依赖/缺功能错误）：\n"
-            f"{_validation_feedback}\n\n"
+            f"{_validation_feedback}\n"
+            # R31-3 T3：上一版摘要 + 增量修补纪律（治全量重拆掷骰子不收敛）
+            + _previous_plan_repair_block(
+                state.get("plan"), state.get("baseline_covered"))
+            + "\n"
             + (sliding_ctx or "")
         )
         logger.info("[PLAN] 校验失败重试 — 已注入上轮校验 issues 供 LLM 修正")
@@ -940,7 +1017,7 @@ async def plan(state: BrainState) -> dict:
                 len(_file_plan), _SERIAL_MASTER_TRIGGER,
             )
         if complexity == Complexity.ULTRA and len(_file_plan) > _BATCH_TRIGGER:
-            task_plan, _plan_batch_failed = await _plan_ultra_batched(
+            task_plan, _plan_batch_failed, _baseline_covered = await _plan_ultra_batched(
                 llm, state, task_description, knowledge_context,
                 sliding_ctx, _file_plan,
             )
@@ -984,6 +1061,11 @@ async def plan(state: BrainState) -> dict:
                     _valid_ids = {st.get("id") for st in result["subtasks"] if isinstance(st, dict)}
                     result["parallel_groups"] = prune_parallel_groups(
                         result.get("parallel_groups"), _valid_ids)
+                # R31-1 T1：顶层 baseline_covered 摘出走独立 state 键（绝不进 TaskPlan——
+                # 变异重构造路径 merge/resplit/revision 天然碰不到，结构性防丢字段）
+                from swarm.brain.plan_validator import normalize_baseline_covered
+                _baseline_covered = normalize_baseline_covered(
+                    result.pop("baseline_covered", None))
             task_plan = TaskPlan(**result)
     except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
@@ -1112,6 +1194,8 @@ async def plan(state: BrainState) -> dict:
         ),
         # round29 真因4：always-emit（空也发）——防粘滞 + 供 can_auto_accept_plan 闸门消费。
         "plan_batch_failed_modules": _plan_batch_failed,
+        # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
+        "baseline_covered": _baseline_covered,
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
@@ -1152,6 +1236,28 @@ def _filter_completeness_missing(llm_issues: list) -> list:
     ]
 
 
+def _confirm_coverage_summary(state: BrainState) -> dict:
+    """hunter F5：PLAN 人工闸的覆盖对账摘要（现算派生，承诺不抛——闸 payload 增强面，
+    矩阵算失败绝不挡人工闸本体）。"""
+    try:
+        from swarm.brain.plan_validator import build_coverage_matrix
+        matrix = build_coverage_matrix(
+            state.get("plan"), state.get("requirement_items"),
+            state.get("baseline_covered"))
+        return {
+            "total": matrix["total_items"],
+            "covered": matrix["covered_items"],
+            "uncovered": [
+                {"id": u.get("id"), "text": str(u.get("text") or "")[:120]}
+                for u in matrix["uncovered"][:30]
+            ],
+            "baseline_covered_count": len(matrix["baseline_covered"]),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[CONFIRM] 覆盖摘要现算失败(payload 降级为空): %s", exc)
+        return {}
+
+
 def _format_validation_feedback(issues: list) -> str:
     """D09：把校验 issues 列表压成回灌 PLAN 的简明反馈文本（逐条 bullet，去空/去重保序）。
 
@@ -1163,7 +1269,14 @@ def _format_validation_feedback(issues: list) -> str:
         if s and s not in seen:
             seen.add(s)
             lines.append(f"- {s}")
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    if len(out) > 8000:
+        # 复核 L-5/hunter F3：feedback 无界会随条目数放大（60 条 ≈15K）并联动
+        # 下一轮 prompt/分批 sliding_ctx 膨胀——定界并自述截断（不静默）
+        kept = out[:8000].rsplit("\n", 1)[0]
+        dropped = len(lines) - kept.count("\n") - 1
+        out = kept + f"\n- （反馈已截断，另有 {dropped} 条同类问题未列出）"
+    return out
 
 
 async def validate_plan(state: BrainState) -> dict:
@@ -1245,7 +1358,8 @@ async def validate_plan(state: BrainState) -> dict:
         logger.info("[VALIDATE_PLAN] requirement_items 缺失/空 — 跳过覆盖矩阵校验（degraded 留痕）")
         _coverage_degraded = ["plan_coverage:skipped(no_requirement_items)"]
     else:
-        cov_result = validate_requirement_coverage(plan_obj, _req_items)
+        cov_result = validate_requirement_coverage(
+            plan_obj, _req_items, state.get("baseline_covered"))
         for w in cov_result.warnings:
             logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)
         if not cov_result.valid:
@@ -1260,8 +1374,11 @@ async def validate_plan(state: BrainState) -> dict:
                 # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划
                 "plan_validation_feedback": _format_validation_feedback(cov_result.issues),
             }
+        _bl_n = len([e for e in (state.get("baseline_covered") or [])
+                     if isinstance(e, dict) and str(e.get("reason") or "").strip()])
         logger.info(
-            "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被子任务覆盖", len(_req_items),
+            "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被覆盖"
+            "（含 baseline_covered 申报 %d 条）", len(_req_items), _bl_n,
         )
 
     # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
@@ -1447,6 +1564,12 @@ def confirm_plan(state: BrainState) -> dict:
             # （name/files/reason），不只 degraded_reasons 里的压缩字符串。
             "plan_batch_failed_modules": state.get("plan_batch_failed_modules") or [],
             "degraded_reasons": state.get("degraded_reasons") or [],
+            # hunter F5：baseline 申报刻意不挂 TaskPlan（防变异丢字段）的副作用是
+            # plan.model_dump() 里没有它——PLAN 人工闸是最廉价的否决点，审核者必须
+            # 看到"PLAN 声称哪些条目存量已有"及覆盖对账，否则失明到 DELIVER（全量
+            # 执行成本之后）。矩阵现算不进 state（两份事实必漂移先例）。
+            "baseline_covered": state.get("baseline_covered") or [],
+            "coverage_matrix": _confirm_coverage_summary(state),
             "message": _msg,
         }
     )
@@ -2271,7 +2394,8 @@ def _deliver_review_payload(state: BrainState) -> dict:
     try:
         from swarm.brain.plan_validator import build_coverage_matrix
         matrix = build_coverage_matrix(
-            state.get("plan"), state.get("requirement_items"))
+            state.get("plan"), state.get("requirement_items"),
+            state.get("baseline_covered"))
         coverage = {
             "total": matrix["total_items"],
             "covered": matrix["covered_items"],
@@ -2280,6 +2404,13 @@ def _deliver_review_payload(state: BrainState) -> dict:
                 for u in matrix["uncovered"][:_DELIVER_ASSERT_ROWS_MAX]
             ],
             "uncovered_count": len(matrix["uncovered"]),
+            # R31-1 T1：存量申报对人工闸可见（申报≠实现，验收断言兜底；人工要能看到
+            # "哪些条目是 PLAN 声称基线已有"来行使否决）
+            "baseline_covered": [
+                {"id": b.get("id"), "reason": str(b.get("reason") or "")[:120]}
+                for b in matrix["baseline_covered"][:_DELIVER_ASSERT_ROWS_MAX]
+            ],
+            "baseline_covered_count": len(matrix["baseline_covered"]),
         }
     except Exception as exc:  # noqa: BLE001 — 矩阵现算失败绝不挡人工闸，如实留痕
         logger.warning("[DELIVER] 覆盖矩阵现算失败(payload 降级为空): %s", exc)

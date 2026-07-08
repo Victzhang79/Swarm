@@ -88,7 +88,7 @@ def _run_batched(llm, monkeypatch):
 
 # ═════════ 1. 结构化记账：timeout 模块必须进 failed 列表（修前红：返回值不是二元组）═════════
 def test_batched_planner_records_timeout_module(monkeypatch):
-    plan, failed = _run_batched(_FakeLLM(hang_module="system-enhance"), monkeypatch)
+    plan, failed, _bl = _run_batched(_FakeLLM(hang_module="system-enhance"), monkeypatch)
     assert [m["name"] for m in failed] == ["system-enhance"], failed
     assert failed[0]["reason"] == "timeout"
     assert failed[0]["files"] == 2, "必须记录丢失的文件数（14 文件蒸发这类量级要可见）"
@@ -99,14 +99,14 @@ def test_batched_planner_records_timeout_module(monkeypatch):
 
 
 def test_batched_planner_all_ok_returns_empty_failed(monkeypatch):
-    plan, failed = _run_batched(_FakeLLM(), monkeypatch)
+    plan, failed, _bl = _run_batched(_FakeLLM(), monkeypatch)
     assert failed == []
     assert plan.subtasks
 
 
 def test_batched_planner_records_empty_module(monkeypatch):
     """重试耗尽仍拆出 0 子任务的模块 = 同样静默丢，必须记账（reason=empty）。"""
-    _plan, failed = _run_batched(_FakeLLM(empty_module="system-enhance"), monkeypatch)
+    _plan, failed, _bl = _run_batched(_FakeLLM(empty_module="system-enhance"), monkeypatch)
     assert [m["name"] for m in failed] == ["system-enhance"]
     assert failed[0]["reason"] == "empty"
 
@@ -118,7 +118,7 @@ def test_invalid_timeout_env_falls_back_with_config_attribution(monkeypatch):
     from swarm.brain.nodes import _plan_ultra_batched
 
     # 不抛 ValueError（回退默认 300s），全模块正常拆出
-    plan, failed = asyncio.run(_plan_ultra_batched(
+    plan, failed, _bl = asyncio.run(_plan_ultra_batched(
         _FakeLLM(), _state(), "需求描述", {}, "", list(_FILE_PLAN),
     ))
     assert failed == []
@@ -143,7 +143,7 @@ def test_invalid_subtask_recorded_not_cascading(monkeypatch):
                 }]})
             return R()
 
-    plan, failed = _run_batched(_BadFieldLLM(), monkeypatch)
+    plan, failed, _bl = _run_batched(_BadFieldLLM(), monkeypatch)
     # 幸存模块产出保留（不连坐）
     assert plan.subtasks and any("alarm-sdk" in (f or "")
                                  for st in plan.subtasks
