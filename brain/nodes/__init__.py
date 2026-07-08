@@ -212,6 +212,27 @@ def _get_brain_llm():
     return llm
 
 
+def _get_brain_fallback_llm():
+    """R35-A：Brain 备用模型（brain_fallback，默认 Kimi）——PLAN-BATCH 外层墙钟超时后
+    显式切备（见 _invoke_llm_abortable）。可 patch 符号。取用失败/未配置返回 None，
+    调用方降级为无切备的原行为（绝不因备用取用失败打挂整个规划）。"""
+    try:
+        router = ModelRouter()
+        _cfg = getattr(router, "config", None)
+        # 复核可观测：备==主时切备只是换回同一（饱和的）模型，制造"已切备"假信心——直接跳过。
+        if _cfg is not None and getattr(_cfg, "brain_fallback", "") == getattr(
+                _cfg, "brain_primary", ""):
+            logger.warning(
+                "[PLAN-BATCH] R35-A brain_fallback==brain_primary(%r)——切备等于换回同模型，"
+                "本轮跳过切备（配置应设不同备用模型）", getattr(_cfg, "brain_primary", ""))
+            return None
+        return router.get_brain_fallback_llm()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[PLAN-BATCH] R35-A 备用模型取用失败(%s)——本轮无切备（退化原行为）", exc)
+        return None
+
+
 # ══════════════════════════════════════════════
 # 节点函数
 # ══════════════════════════════════════════════
@@ -431,7 +452,7 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
-async def _invoke_llm_abortable(llm, messages, total_timeout: float):
+async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_llm=None):
     """R34-1：流式优先 LLM 调用——僵尸生成缓解（token 黑洞治本客户端侧杠杆）。
 
     非流式 ainvoke 被 wait_for 取消后，网关/后端可能继续整段生成（僵尸占 GPU →
@@ -440,55 +461,85 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float):
     总超时。llm 无 astream（测试桩/不支持流）→ 原 wait_for(ainvoke) 行为逐字节不变。
     chunk 间隔上限 SWARM_PLAN_BATCH_CHUNK_GAP（默认 120s，非法回退）。超时统一抛
     asyncio.TimeoutError（调用方按既有 timeout 分支处理）。
+
+    R35-A：外层墙钟/chunk-gap 超时在【消费者帧】抛 asyncio.TimeoutError，绕过
+    primary.with_fallbacks（那只兜 primary 于流【内】抛的异常）。故传 fallback_llm 时，
+    primary 外层超时后【显式切备用模型】(Kimi) 再跑一遍(fresh 预算)——round35 实证
+    SiliconFlow 饱和 GLM 稳定慢产 >300s 时同模型空重试仍超时。备用仍超时/无备用才抛给
+    调用方（按既有 timeout 分支降级记账）。备用切换/双超时/救回均留日志可观测。
     """
     import asyncio as _aio
-    astream = getattr(llm, "astream", None)
-    if astream is None:
-        return await _aio.wait_for(llm.ainvoke(messages), timeout=total_timeout)
     try:
         _gap = float(os.environ.get("SWARM_PLAN_BATCH_CHUNK_GAP", "120") or "120")
     except ValueError:
         logger.error("[PLAN-BATCH] SWARM_PLAN_BATCH_CHUNK_GAP 配置非法(%r)——回退默认 120",
                      os.environ.get("SWARM_PLAN_BATCH_CHUNK_GAP"))
         _gap = 120.0
-    parts: list[str] = []
-    loop = _aio.get_running_loop()  # 协程内惯用法（复核 INFO：避 get_event_loop 弃用面）
-    deadline = loop.time() + total_timeout
-    agen = astream(messages)
+
+    async def _stream_once(_llm):
+        astream = getattr(_llm, "astream", None)
+        if astream is None:
+            return await _aio.wait_for(_llm.ainvoke(messages), timeout=total_timeout)
+        parts: list[str] = []
+        loop = _aio.get_running_loop()  # 协程内惯用法（复核 INFO：避 get_event_loop 弃用面）
+        deadline = loop.time() + total_timeout
+        agen = astream(messages)
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise _aio.TimeoutError()
+                try:
+                    chunk = await _aio.wait_for(
+                        agen.__anext__(), timeout=min(_gap, remaining))
+                except StopAsyncIteration:
+                    break
+                # hunter CONFIRMED：list content-block（部分 provider 流式形态）绝不能 str()
+                # ——那产出 Python repr 污染 JSON。按 langchain 口径抽取 text 分片。
+                c = getattr(chunk, "content", None)
+                if isinstance(c, str):
+                    if c:
+                        parts.append(c)
+                elif isinstance(c, list):
+                    for _blk in c:
+                        if isinstance(_blk, str) and _blk:
+                            parts.append(_blk)
+                        elif isinstance(_blk, dict):
+                            _t = _blk.get("text") or _blk.get("content") or ""
+                            if isinstance(_t, str) and _t:
+                                parts.append(_t)
+        finally:
+            # 断连即弃：aclose 促使传输层关闭，流式后端据此 abort 生成（僵尸源头治理）
+            _aclose = getattr(agen, "aclose", None)
+            if _aclose is not None:
+                try:
+                    # 复核 INFO：aclose 本身有界（饱和态传输 wedge 时不无限干等，5s 足够本地关流）
+                    await _aio.wait_for(_aclose(), timeout=5.0)
+                except Exception:  # noqa: BLE001 — 关闭失败/超时不掩盖主结果/主异常
+                    pass
+        return type("R", (), {"content": "".join(parts)})()
+
     try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise _aio.TimeoutError()
-            try:
-                chunk = await _aio.wait_for(
-                    agen.__anext__(), timeout=min(_gap, remaining))
-            except StopAsyncIteration:
-                break
-            # hunter CONFIRMED：list content-block（部分 provider 流式形态）绝不能 str()
-            # ——那产出 Python repr 污染 JSON。按 langchain 口径抽取 text 分片。
-            c = getattr(chunk, "content", None)
-            if isinstance(c, str):
-                if c:
-                    parts.append(c)
-            elif isinstance(c, list):
-                for _blk in c:
-                    if isinstance(_blk, str) and _blk:
-                        parts.append(_blk)
-                    elif isinstance(_blk, dict):
-                        _t = _blk.get("text") or _blk.get("content") or ""
-                        if isinstance(_t, str) and _t:
-                            parts.append(_t)
-    finally:
-        # 断连即弃：aclose 促使传输层关闭，流式后端据此 abort 生成（僵尸源头治理）
-        _aclose = getattr(agen, "aclose", None)
-        if _aclose is not None:
-            try:
-                # 复核 INFO：aclose 本身有界（饱和态传输 wedge 时不无限干等，5s 足够本地关流）
-                await _aio.wait_for(_aclose(), timeout=5.0)
-            except Exception:  # noqa: BLE001 — 关闭失败/超时不掩盖主结果/主异常
-                pass
-    return type("R", (), {"content": "".join(parts)})()
+        return await _stream_once(llm)
+    except _aio.TimeoutError:
+        if fallback_llm is None:
+            raise
+        logger.warning(
+            "[PLAN-BATCH] R35-A primary 外层超时 %.0fs → 显式切备用模型重试"
+            "（with_fallbacks 只兜流内异常，外层墙钟超时须主动切备）", total_timeout)
+        try:
+            # 备用 fresh 预算
+            _r = await _stream_once(fallback_llm)
+            logger.info(
+                "[PLAN-BATCH] R35-A 备用模型救回本批（primary 超时后切备成功）")
+            return _r
+        except _aio.TimeoutError:
+            # 复核可观测：主备【双超时】须与单模型超时区分，否则日志分不清是 primary 独坏
+            # 还是备用也坏（切备诊断价值全失）。原样抛给调用方 timeout 分支。
+            logger.warning(
+                "[PLAN-BATCH] R35-A 备用模型【也】外层超时 %.0fs——主备双超时"
+                "（均未在预算内返回，本批判 timeout；provider 侧疑整体饱和）", total_timeout)
+            raise
 
 
 def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
@@ -698,6 +749,9 @@ async def _plan_ultra_batched(
     # 串行 11 批 ~20min → 并发4 ~5min。gather 保序：结果按 module_batches 顺序收集，merge 全局
     # 编号与串行版一致。逐批超时/异常降级与原行为逐字节一致(返回标记，主循环统一计 failed_batches)。
     _plan_sem = _asyncio.Semaphore(4)
+    # R35-A：备用模型（Kimi）一次性取用——某批 primary 外层墙钟超时后显式切备（见
+    # _invoke_llm_abortable）。取用失败=None→退化为无切备原行为。全批共用同一实例。
+    _batch_fallback_llm = _get_brain_fallback_llm()
     # R31-1 T1：各批 LLM 顶层 baseline_covered 申报的收集器（成功批才收，闭包单线程安全）
     _baseline_decls: list = []
     # R32-1 U2：成功批缓存。★只在"上一轮有失败批"的补齐型重试复用（round32 证据：覆盖
@@ -786,6 +840,7 @@ async def _plan_ultra_batched(
                 _t0 = _time.monotonic()
                 try:
                     # R34-1：流式+chunk 看门狗（无 astream 的桩/客户端=原 wait_for 行为）
+                    # R35-A：primary 外层墙钟超时→显式切备用模型(Kimi)重试
                     response = await _invoke_llm_abortable(
                         llm,
                         [
@@ -793,6 +848,7 @@ async def _plan_ultra_batched(
                             {"role": "user", "content": prompt_user},
                         ],
                         _PLAN_BATCH_TIMEOUT,
+                        _batch_fallback_llm,
                     )
                     _dt = _time.monotonic() - _t0
                     result = _parse_json_from_llm(response.content)

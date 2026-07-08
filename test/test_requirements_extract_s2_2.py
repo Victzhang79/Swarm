@@ -101,6 +101,88 @@ def test_quote_hallucination_still_rejected_after_punct_fold():
     assert rejected[0]["reason"] == "quote_not_in_source"
 
 
+# ── R35-B：表格/结构化源的误杀治本（源料平铺接地 Tier2）──
+# 离线实测坐实：被拒 quote 每片都是源逐字内容，只是被 markdown `|` 与跨行切断连续性。
+_TABLE_SOURCE = (
+    "### 预警发送接口\n"
+    "| 接口 | 说明 | 场景 |\n"
+    "| `/notify/simple` | 简化预警 | 传入任务ID+参数，自动编排发送 |\n"
+    "| `/notify/recover` | 恢复提醒 | 预警解除后发送恢复通知 |\n"
+    "### 通知用户\n"
+    "| 企业微信 ID | 企业微信用户标识 |\n"
+    "| 邮箱 | 邮箱地址 |\n"
+    "| VoIP ID | VoIP 推送设备标识 |\n"
+)
+
+
+def test_table_row_cells_joined_grounded():
+    """R35-B①表格竖线打断：LLM 把一行多个单元格拼成一句 quote，源里单元格间有
+    markdown `|`→连续 substring 不中，但每个单元格都是源逐字内容→Tier2 平铺救回。"""
+    q = "/notify/simple 简化预警 传入任务ID+参数，自动编排发送"
+    items, rejected = validate_requirement_items(
+        [_raw("提供 /notify/simple 简化预警接口", q)], _TABLE_SOURCE)
+    assert rejected == [], f"表格行拼接应接地放行，实际被拒 {rejected}"
+    assert len(items) == 1
+
+
+def test_cross_row_field_list_grounded():
+    """R35-B②跨行拼接：LLM 把分散在多行的字段名拼成清单，各片都在源只是不连续→Tier2 救回。"""
+    q = "企业微信 ID、邮箱、VoIP ID"
+    items, rejected = validate_requirement_items(
+        [_raw("通知用户支持配置企微/邮箱/VoIP ID", q)], _TABLE_SOURCE)
+    assert rejected == [], f"跨行字段拼接应接地放行，实际被拒 {rejected}"
+    assert len(items) == 1
+
+
+def test_partial_fabrication_still_rejected():
+    """R35-B 防幻觉底线：真前缀 + 源里没有的编造尾 → 内容覆盖率不达标仍拒（防"半真半假"蒙混）。"""
+    q = "传入任务ID+参数，自动编排发送并永久加密上传至海外云端灾备节点"
+    items, rejected = validate_requirement_items([_raw("编造需求", q)], _TABLE_SOURCE)
+    assert items == []
+    assert rejected[0]["reason"] == "quote_not_in_source"
+
+
+# 散文源：真词汇散落各处、各主题句顺序固定——用于验证"乱序重拼"编造被前向单调拒。
+_PROSE_SOURCE = (
+    "用户可以通过手机号码注册账号；注册时系统发送验证码到用户手机完成校验。"
+    "登录后，用户可在个人中心修改邮箱与密码。"
+    "管理员可以查看用户列表并导出报表。"
+    "订单模块记录用户的下单与支付信息。"
+)
+
+
+def test_stitched_hallucination_rejected():
+    """R35-B 双复核收紧（防幻觉回归锚）：把散落各处的真词汇【乱序重拼】成源里不存在的新
+    主张（"管理员通过邮箱改用户密码"——源里管理员只"查看用户列表"、改密码的是用户本人），
+    前向单调平铺因片顺序对不上而覆盖塌 → 必须仍判 quote_not_in_source。此前非单调贪心平铺
+    会把散点 2-gram 凑到 ~0.85 蒙混过闸（复核双方独立复现）。"""
+    q = "管理员可以通过邮箱修改用户密码并发送验证码通知手机号码"
+    items, rejected = validate_requirement_items(
+        [_raw("编造管理员改密", q)], _PROSE_SOURCE)
+    assert items == [], "乱序重拼的编造 quote 必须被拒（防幻觉底线）"
+    assert rejected and rejected[0]["reason"] == "quote_not_in_source"
+
+
+def test_in_order_prose_multiclause_still_grounded():
+    """对照：真实按源顺序的多子句拼接（去标点接缝）仍应前向平铺接地——证明收紧只砍乱序编造，
+    不误伤"按序去接缝"的真 quote。"""
+    q = "用户可以通过手机号码注册账号 系统发送验证码到用户手机完成校验"
+    items, rejected = validate_requirement_items(
+        [_raw("手机号注册+验证码校验", q)], _PROSE_SOURCE)
+    assert rejected == [], f"按源顺序的真拼接应接地放行，实际被拒 {rejected}"
+    assert len(items) == 1
+
+
+def test_grounding_min_tile_env_tunable(monkeypatch):
+    """接地阈值 env 可调（非硬编码，配置面可运维）：min_tile 调到极大→无片可平铺→
+    表格拼接被判不接地而拒，证明参数真接线到判定。"""
+    monkeypatch.setenv("SWARM_QUOTE_MIN_TILE_CHARS", "30")
+    q = "企业微信 ID、邮箱、VoIP ID"
+    items, rejected = validate_requirement_items(
+        [_raw("通知用户配置", q)], _TABLE_SOURCE)
+    assert rejected and rejected[0]["reason"] == "quote_not_in_source"
+
+
 def test_empty_text_and_empty_quote_rejected():
     items, rejected = validate_requirement_items(
         [

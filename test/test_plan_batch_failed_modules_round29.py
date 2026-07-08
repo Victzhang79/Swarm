@@ -80,6 +80,9 @@ def _run_batched(llm, monkeypatch):
     monkeypatch.setenv("SWARM_PLAN_BATCH_TIMEOUT", "0.2")
     monkeypatch.setenv("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "1")
     from swarm.brain.nodes import _plan_ultra_batched
+    # R35-A：本组测 timeout 记账，与切备正交——禁用切备（见 test_llm_abortable_failover_r35a）。
+    import swarm.brain.nodes as _nodes
+    monkeypatch.setattr(_nodes, "_get_brain_fallback_llm", lambda: None)
 
     return asyncio.run(_plan_ultra_batched(
         llm, _state(), "需求描述", {}, "", list(_FILE_PLAN),

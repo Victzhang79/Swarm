@@ -56,6 +56,10 @@ async def _run(llm, state, file_plan, monkeypatch):
     monkeypatch.setenv("SWARM_PLAN_BATCH_TIMEOUT", "2")
     monkeypatch.setenv("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "1")
     monkeypatch.setenv("SWARM_PLAN_BATCH_MAX_FILES", "20")
+    # R35-A：本组测 bisect/timeout 记账，与切备正交——禁用切备（否则超时后切真 Kimi
+    # 端点报错→归类 error 非 timeout，掩盖 bisect 路径）。切备本身另见 test_llm_abortable_failover_r35a。
+    import swarm.brain.nodes as _nodes
+    monkeypatch.setattr(_nodes, "_get_brain_fallback_llm", lambda: None)
     return await _plan_ultra_batched(llm, state, "需求", {}, "", file_plan)
 
 

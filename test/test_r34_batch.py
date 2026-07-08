@@ -219,6 +219,9 @@ async def _run(llm, state, file_plan, monkeypatch):
     monkeypatch.setenv("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "1")
     monkeypatch.setenv("SWARM_PLAN_BATCH_MAX_FILES", "20")
     monkeypatch.setenv("SWARM_PLAN_BATCH_TIMEOUT_COOLDOWN", "0")
+    # R35-A：本组测 bisect/timeout，与切备正交——禁用切备（见 test_llm_abortable_failover_r35a）。
+    import swarm.brain.nodes as _nodes
+    monkeypatch.setattr(_nodes, "_get_brain_fallback_llm", lambda: None)
     return await _plan_ultra_batched(llm, state, "需求", {}, "", file_plan)
 
 

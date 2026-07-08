@@ -532,6 +532,20 @@ class ModelRouter:
         )
         return primary.with_fallbacks([fallback])
 
+    def get_brain_fallback_llm(self) -> BaseChatModel:
+        """R35-A：Brain 备用模型（brain_fallback，默认 Kimi）单独取用——供调用方在【外层
+        墙钟超时】后【显式切备】。get_brain_llm 的 with_fallbacks 仅在 primary 于流【内】抛
+        异常时触发；而 _invoke_llm_abortable 的外层 wait_for 总超时在【消费者帧】抛
+        asyncio.TimeoutError，绕过 with_fallbacks（round35 实证：SiliconFlow 饱和时 GLM-5.2
+        稳定慢产 >300s→外层墙钟掐断→不切 Kimi→同模型空重试仍超时）。故备用模型须单独暴露，
+        由调用方在外层超时后主动切一次（备用 fresh 预算）。与 get_brain_llm 同构造（同看门狗）。"""
+        _bmt = getattr(self.config, "brain_max_tokens", 0) or None
+        _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
+        return self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
+            self.config.brain_fallback, temperature=self.config.brain_temperature,
+            max_tokens=_bmt, wallclock_budget=_wc,
+        )
+
     def get_llm_for_subtask(self, difficulty: str, modality: str = "text") -> Runnable:
         """根据子任务难度和模态动态选择模型。
 

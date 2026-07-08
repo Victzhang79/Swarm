@@ -150,6 +150,85 @@ def _fold_for_quote_match(text: str) -> str:
         ch for ch in str(text).translate(_PUNCT_FOLD_TABLE) if not ch.isspace())
 
 
+# R35-B：quote 回指接地阈值（env 可调，配置非法回退默认）。表格竖线打断/跨行拼接的
+# 结构性误杀经离线实测坐实：被拒 quote 每片都是源【逐字内容】，只是被 markdown `|` 与
+# 跨行切断连续性（非幻觉、非复述）。连续 substring 假设对表格型需求破产 → 加源料平铺 Tier2。
+_QUOTE_MIN_TILE_CHARS = 2   # 源子串平铺最小片长（防单字碰巧；2 容纳"邮箱/ID"等短单元格）
+_QUOTE_COVER_MIN = 0.85     # quote 内容字符被源片覆盖占比阈值（防"真前缀+编造尾"蒙混过闸）
+# R35-B 双复核收紧：Tier2 平铺【前向单调】——源片必须在源中【顺序出现】（上一片之后）。
+# 真表格误杀=源单元格【按序】去分隔符拼接（片在源中顺序不变）；而编造 quote 是把散落各处的
+# 真词汇【乱序重拼】成源里不存在的新主张（复核双方独立复现："管理员通过邮箱改用户密码"
+# 从 4 句不同主题的源里 2-gram 散点凑到 0.85 蒙混过闸）。前向单调即要求"源子序列（含小接缝）"
+# 而非"散点词袋"，编造的乱序拼接无法前向平铺 → 覆盖塌 → 仍拒（防幻觉底线复位）。
+_QUOTE_MAX_LEN = 600        # Tier2 平铺 quote 长度上限（源 quote 本应 ≤80 字；超长=异常，
+#                             退 Tier1 严格判定：既有界化 O(n²·L) 成本，又不给超长编造蒙混空间
+
+
+def _quote_grounding_params() -> tuple[int, float]:
+    """接地阈值 env 覆盖（非法值 WARNING 回退默认，配置错不冒充运行时故障）。
+    复核 LOW：越界值（cover_min∉[0,1] / min_tile<1）会把防幻觉闸变near-no-op，钳回默认+WARNING。"""
+    import os
+
+    def _one(env: str, default, cast, lo=None, hi=None):
+        raw = os.environ.get(env, "") or ""
+        try:
+            val = cast(raw) if raw.strip() else default
+        except (ValueError, TypeError):
+            logger.warning("[EXTRACT_REQ] %s 配置非法(%r)——回退默认 %r", env, raw, default)
+            return default
+        if (lo is not None and val < lo) or (hi is not None and val > hi):
+            logger.warning("[EXTRACT_REQ] %s 越界(%r，须∈[%r,%r])——回退默认 %r",
+                           env, val, lo, hi, default)
+            return default
+        return val
+
+    return (_one("SWARM_QUOTE_MIN_TILE_CHARS", _QUOTE_MIN_TILE_CHARS, int, lo=1),
+            _one("SWARM_QUOTE_COVER_MIN", _QUOTE_COVER_MIN, float, lo=0.0, hi=1.0))
+
+
+def _quote_is_grounded(nq: str, nsrc: str) -> bool:
+    """quote 回指接地判定（零 LLM、确定性、无模糊匹配、不认语言/框架/格式）。
+
+    Tier1 连续 substring（散文/单元格逐字，行为不变，高置信直通）；不中则 Tier2 源料【前向
+    单调】贪心平铺——用源在【游标之后】的最长子串逐段平铺 nq，被 ≥min_tile 长源子串覆盖的
+    【内容字符(alnum)】占比 ≥ cover_min 即接地。治本：表格 markdown `|` 打断 / 跨行按序拼接的
+    结构性误杀（被拼的每片仍是源逐字内容且【顺序不变】，覆盖≈全）；编造 quote=散落真词汇
+    【乱序重拼】成源里不存在的主张——无法前向平铺（片顺序对不上）→ 覆盖低 → 仍拒（防幻觉
+    底线，双复核复现坐实）。`|`/空白/连接标点在平铺中当【可跳过的接缝】，不计入覆盖分母。
+    超长 quote（>_QUOTE_MAX_LEN，异常形态）退 Tier1 严判：有界成本 + 不给超长编造蒙混。
+    """
+    if not nq or not nsrc:
+        return False
+    if nq in nsrc:                      # Tier1：连续 substring，行为不变
+        return True
+    if len(nq) > _QUOTE_MAX_LEN:        # 异常超长：只认 Tier1（有界 + 防蒙混）
+        return False
+    min_tile, cover_min = _quote_grounding_params()
+    n = len(nq)
+    i = 0
+    covered = 0
+    src_cursor = 0                      # 前向单调游标：下一源片须在上一片之后
+    while i < n:                        # Tier2：源最长子串【前向】贪心平铺
+        best = 0
+        best_pos = -1
+        j = i + 1
+        while j <= n:
+            pos = nsrc.find(nq[i:j], src_cursor)
+            if pos < 0:                 # 该长度在游标之后无匹配 → 更长必更无 → 停
+                break
+            best = j - i
+            best_pos = pos
+            j += 1
+        if best >= min_tile:
+            covered += sum(1 for ch in nq[i:i + best] if ch.isalnum())
+            src_cursor = best_pos + best   # 前向推进：后续片只能在本片之后
+            i += best
+        else:
+            i += 1                      # 跳过一个接缝/连接符/单字碰巧
+    total = sum(1 for ch in nq if ch.isalnum())
+    return total > 0 and covered / total >= cover_min
+
+
 def source_is_truncated(source_text: str) -> bool:
     """需求源文本是否经过 ingest 预算截断（中段省略）——漏抽条目的第一确定性来源。"""
     return TRUNCATION_MARKER in (source_text or "")
@@ -162,8 +241,9 @@ def validate_requirement_items(
 
     每条合法条目：{id, text, kind, source_quote, source}。逐条剔除（拒单条不拒全量）：
       not_object / empty_text / too_long / empty_quote / quote_too_short /
-      quote_not_in_source（防幻觉核心：空白归一+全半角标点折叠后 quote 必须是
-      原文 substring，见 _fold_for_quote_match）/
+      quote_not_in_source（防幻觉核心：空白归一+全半角标点折叠后 quote 须【接地】——
+      连续 substring 或源料贪心平铺覆盖 ≥ 阈值，见 _quote_is_grounded；R35-B 治表格竖线/
+      跨行拼接的结构性误杀，防幻觉底线不塌）/
       duplicate（归一化内容 hash 相同，keep-first）/ over_limit（超 MAX_ITEMS=抽取失控）。
     被拒条目不静默丢：返回 [{"reason", "text_head"}] 供调用方入 degraded 可观测。
     """
@@ -194,8 +274,9 @@ def validate_requirement_items(
         if len(normalized_quote) < MIN_QUOTE_CHARS:
             rejected.append({"reason": "quote_too_short", "text_head": text[:80]})
             continue
-        if normalized_quote not in normalized_source:
-            # 防幻觉核心：给不出真出处的条目一律拒收（grounded 坐实先例同构）
+        if not _quote_is_grounded(normalized_quote, normalized_source):
+            # 防幻觉核心：给不出真出处（连续 substring 或源料平铺接地）的条目一律拒收。
+            # R35-B：表格竖线/跨行拼接的结构性误杀由 Tier2 源料平铺救回（见 _quote_is_grounded）。
             rejected.append({"reason": "quote_not_in_source", "text_head": text[:80]})
             continue
         item_id = requirement_id(text)
