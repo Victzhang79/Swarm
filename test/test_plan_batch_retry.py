@@ -46,7 +46,7 @@ async def test_plan_batch_retries_on_timeout():
             '"acceptance_criteria":["mvn -pl modA compile"]}]}')
     llm = _flaky_llm(1, subs, calls)  # 第 1 次 timeout，第 2 次成功
     # round29 真因4：返回 (plan, 失败模块清单)——重试成功 → 清单必须为空（不残留假失败记账）
-    plan, failed_modules, _bl = await nodes._plan_ultra_batched(
+    plan, failed_modules, _bl, _c = await nodes._plan_ultra_batched(
         llm, _state(), "建预警平台", {}, "", _file_plan(),
     )
     assert calls["n"] == 2, f"应重试(旧代码 1 次即丢),实际 {calls['n']}"

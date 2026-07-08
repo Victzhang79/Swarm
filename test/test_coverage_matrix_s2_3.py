@@ -361,7 +361,7 @@ async def test_plan_batched_prompt_injects_and_covers_survive_merge():
         "requirement_items": _items(),
     }
     file_plan = [{"path": "m/a.txt", "action": "create", "responsibility": "x"}]
-    task_plan, failed, _baseline = await _plan_ultra_batched(
+    task_plan, failed, _baseline, _cache = await _plan_ultra_batched(
         fake, state, "总需求", {}, "", file_plan)
     assert failed == []
     prompt = fake.captured[0]

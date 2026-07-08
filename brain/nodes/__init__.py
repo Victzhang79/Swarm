@@ -527,9 +527,11 @@ async def _plan_ultra_batched(
 
     from swarm.brain.plan_batch import (
         batch_progress_line,
+        batch_signature,
         dedupe_file_plan,
         group_into_module_batches,
         merge_subtask_batches,
+        split_oversized_batches,
     )
     from swarm.brain.prompts import PLAN_BATCH_SYSTEM, PLAN_BATCH_USER
 
@@ -573,6 +575,21 @@ async def _plan_ultra_batched(
 
     # P1/P2：按模块分批（每模块一批，批间依赖序）
     module_batches = group_into_module_batches(file_plan, module_deps or None)
+    # R32-2 U1：超大模块批二次切分（round32：大批 4 轮 16 次确定性超时 >300s，小批全成；
+    # FINDING-10 降级只兜底不治"批太大"）。子批保原序，串行门控沿用 merge 既有机制。
+    try:
+        _PLAN_BATCH_MAX_FILES = int(
+            os.environ.get("SWARM_PLAN_BATCH_MAX_FILES", "20") or "20")
+    except ValueError:
+        logger.error(
+            "[PLAN-BATCH] SWARM_PLAN_BATCH_MAX_FILES 配置非法(%r)——回退默认 20",
+            os.environ.get("SWARM_PLAN_BATCH_MAX_FILES"))
+        _PLAN_BATCH_MAX_FILES = 20
+    _before_split = len(module_batches)
+    module_batches = split_oversized_batches(module_batches, _PLAN_BATCH_MAX_FILES)
+    if len(module_batches) > _before_split:
+        logger.info("[PLAN-BATCH] U1 超大批切分：%d → %d 批（单批 ≤%d 文件）",
+                    _before_split, len(module_batches), _PLAN_BATCH_MAX_FILES)
     total = len(module_batches)
     logger.info(
         "[PLAN-BATCH] 按模块分批拆解启动：%d 文件 → %d 个模块批（垂直切片，非机械10%%切）",
@@ -620,8 +637,35 @@ async def _plan_ultra_batched(
     _plan_sem = _asyncio.Semaphore(4)
     # R31-1 T1：各批 LLM 顶层 baseline_covered 申报的收集器（成功批才收，闭包单线程安全）
     _baseline_decls: list = []
+    # R32-1 U2：成功批缓存。★只在"上一轮有失败批"的补齐型重试复用（round32 证据：覆盖
+    # issue 集合与批失败集合同构）；上一轮批全成的纯覆盖分歧重试（round31 形态）绝不吃
+    # 缓存——复用=产出同一 plan，T3 增量修补/baseline 申报永远无法生效★。签名不吃
+    # feedback（正要跨 feedback 复用）；file_plan 变更签名天然不同。缓存整体重建
+    # （last-write-wins：本轮成功批集合），不增量累积防陈旧条目滚雪球。
+    _batch_cache_prev: dict = state.get("plan_batch_cache") or {}
+    # 复核 F-3：执行失败 replan（replan_feedback 非空）禁用缓存——人工闸放行残缺计划后
+    # 执行失败，缓存批必须带 replan 教训真跑（宁慢勿错，回退 pre-U2 行为）。
+    _repair_retry = bool(state.get("plan_batch_failed_modules")) and not (
+        state.get("replan_feedback") or "").strip()
+    _batch_cache_new: dict = {}
 
     async def _decompose_batch(i: int, mod_name: str, batch: list) -> tuple:
+        # R32-1 U2：补齐型重试的缓存命中——签名一致的成功批直接回放（零 LLM/零信号量），
+        # 申报随缓存回放（不丢）；回放件重新入本轮缓存（下轮重试仍可用）。
+        _sig = batch_signature(mod_name, batch)
+        if _repair_retry and _sig in _batch_cache_prev:
+            _hit = _batch_cache_prev[_sig]
+            _cached_subs = json.loads(json.dumps(_hit.get("subtasks") or []))
+            _cached_bl = list(_hit.get("baseline") or [])
+            if _cached_subs:
+                if _cached_bl:
+                    _baseline_decls.extend(_cached_bl)
+                _batch_cache_new[_sig] = {"module": mod_name,
+                                          "subtasks": _hit.get("subtasks") or [],
+                                          "baseline": _cached_bl}
+                logger.info("[PLAN-BATCH] U2 缓存命中：模块'%s'（%d 子任务，跳过 LLM 分解）",
+                            mod_name, len(_cached_subs))
+                return ("ok", i, mod_name, _cached_subs, 0.0, len(batch))
         batch_fp_text = "\n".join(
             f"  - {fp.get('path')} [{fp.get('action', 'create')}] {fp.get('responsibility', '')}"
             for fp in batch
@@ -630,6 +674,10 @@ async def _plan_ultra_batched(
         top_dirs = {(fp.get("path") or "").replace("\\", "/").split("/")[0]
                     for fp in batch if fp.get("path")}
         new_module_dirs = [d for d in top_dirs if d and d not in existing_dirs]
+        # 复核 F-2：U1 切分后的非首子批（mod#i/k, i>1）不触发脚手架提示——每子批各造
+        # 一份脚手架时，通用去重网兜不住非 Maven 栈（dedupe_module_scaffolds 只认 pom.xml）。
+        if "#" in mod_name and not mod_name.split("#", 1)[1].startswith("1/"):
+            new_module_dirs = []
         scaffold_hint = ""
         if new_module_dirs:
             scaffold_hint = (
@@ -684,6 +732,14 @@ async def _plan_ultra_batched(
                         _bl = result.get("baseline_covered") if isinstance(result, dict) else None
                         if isinstance(_bl, list) and _bl:
                             _baseline_decls.extend(_bl)
+                        # R32-1 U2：成功批入缓存（深拷贝——下游 merge/模块标记会变异 subs；
+                        # 复核 F-5c：baseline 同深拷贝，不赌 normalize 不变异入参的实现细节）
+                        _batch_cache_new[_sig] = {
+                            "module": mod_name,
+                            "subtasks": json.loads(json.dumps(subs)),
+                            "baseline": json.loads(json.dumps(_bl))
+                            if isinstance(_bl, list) else [],
+                        }
                         return ("ok", i, mod_name, subs, _dt, len(batch))
                     # 复核 L-1：空子任务批的 baseline 申报不收（批失败面），申报蒸发须留痕
                     # ——信号未失联（该模块进 failed 记账→fail-fast 闸），但审计要能看见。
@@ -783,14 +839,20 @@ async def _plan_ultra_batched(
             "name": _mod, "files": 0,
             "reason": f"invalid_subtasks({len(_errs)}): {_errs[0][:150]}",
         })
+    if _invalid_by_module:
+        # 复核 F-1 [M]：畸形批逐出缓存——否则补齐重试签名命中确定性回放同一畸形产物，
+        # LLM 永远不被重问（U2 前重试有自愈机会，绝不让缓存把瞬时错误变成死局）。
+        _batch_cache_new = {k: v for k, v in _batch_cache_new.items()
+                            if v.get("module") not in _invalid_by_module}
     if not _subtasks:
         raise RuntimeError("ultra 分批拆解合并后子任务全部构造失败（字段畸形），无可用子任务")
     # round29 真因4：失败模块清单随 plan 一起返回（调用方落 state + 闸门消费），不再只留日志。
     # R31-1 T1：baseline 申报并集第三元返回——绝不挂 TaskPlan 字段（结构性防"变异路径丢字段"，
     # v0.9.23 F1 同类教训），由 plan() 落独立 state 键。
+    # R32-1 U2：本轮成功批缓存第四元返回，plan() 落 state 供补齐型重试复用。
     from swarm.brain.plan_validator import normalize_baseline_covered
     return (TaskPlan(subtasks=_subtasks), plan_batch_failed_modules,
-            normalize_baseline_covered(_baseline_decls))
+            normalize_baseline_covered(_baseline_decls), _batch_cache_new)
 
 
 def _subtask_signature(st) -> tuple:
@@ -932,6 +994,8 @@ async def plan(state: BrainState) -> dict:
             "plan_batch_failed_modules": [],
             # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
             "baseline_covered": [],
+            # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
+            "plan_batch_cache": {},
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
                                  old_recovery_counts=state.get("targeted_recovery_counts"),
                                  old_retry_counts=state.get("subtask_retry_counts"),
@@ -957,6 +1021,8 @@ async def plan(state: BrainState) -> dict:
     # R31-1 T1：本轮 baseline_covered 申报（独立 state 键 always-emit——LLM 未申报/降级
     # 兜底路径恒 []，last-write-wins 刷掉上一轮申报防跨重试粘滞）
     _baseline_covered: list[dict] = []
+    # R32-1 U2：本轮成功批缓存（非分批路径恒 {}——last-write-wins 覆写防陈旧）
+    _plan_batch_cache: dict = {}
     sliding_ctx = sliding_context_prompt(state)
 
     # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
@@ -1017,7 +1083,8 @@ async def plan(state: BrainState) -> dict:
                 len(_file_plan), _SERIAL_MASTER_TRIGGER,
             )
         if complexity == Complexity.ULTRA and len(_file_plan) > _BATCH_TRIGGER:
-            task_plan, _plan_batch_failed, _baseline_covered = await _plan_ultra_batched(
+            (task_plan, _plan_batch_failed, _baseline_covered,
+             _plan_batch_cache) = await _plan_ultra_batched(
                 llm, state, task_description, knowledge_context,
                 sliding_ctx, _file_plan,
             )
@@ -1196,6 +1263,10 @@ async def plan(state: BrainState) -> dict:
         "plan_batch_failed_modules": _plan_batch_failed,
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
+        # R32-1 U2 always-emit：本轮成功批缓存（补齐型重试复用；非分批/降级路径恒 {}）。
+        # 复核 F-4：批全成时缓存按自身规则永远无人消费——落 {} 不把数十 KB 死重灌进
+        # 每次 checkpoint（D51 plan 体积病灶同族）。
+        "plan_batch_cache": _plan_batch_cache if _plan_batch_failed else {},
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）

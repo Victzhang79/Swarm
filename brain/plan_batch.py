@@ -94,6 +94,44 @@ def _infer_group_from_path(path: str) -> str:
     return parts[0]
 
 
+def split_oversized_batches(
+    batches: list[tuple[str, list[dict]]], max_files: int,
+) -> list[tuple[str, list[dict]]]:
+    """R32-2 U1：超大模块批二次切分——单批文件数上限，超限模块按原序切成 mod#i/k 子批。
+
+    取证（round32）：大模块批 LLM 分解确定性超时 >300s（4 轮 16 次，小批几乎全成），
+    FINDING-10 降级只兜底不治"批太大"。子批保持文件原序（组内已按依赖/分层排好），
+    批间串行门控沿用 merge_subtask_batches 既有机制（后批首子任务依赖前批末尾），
+    子批天然串行不破坏依赖。max_files<=0 视为不限制（配置容错，不切）。
+    """
+    if max_files <= 0:
+        return batches
+    out: list[tuple[str, list[dict]]] = []
+    for name, files in batches:
+        if len(files) <= max_files:
+            out.append((name, files))
+            continue
+        total = math.ceil(len(files) / max_files)
+        for i in range(total):
+            out.append((f"{name}#{i + 1}/{total}",
+                        files[i * max_files:(i + 1) * max_files]))
+    return out
+
+
+def batch_signature(name: str, files: list[dict]) -> str:
+    """R32-1 U2：模块批内容签名（缓存键）——模块名 + 批内文件 path/action/responsibility。
+
+    签名只吃影响分解产物的输入；feedback/sliding_ctx 刻意不参与（补齐型重试正要跨
+    feedback 复用成功批）。file_plan 变更（replan/新 tech_design）→ 签名天然不同不复用。
+    """
+    import hashlib
+    payload = name + "\x00" + "\x00".join(
+        f"{f.get('path')}\x01{f.get('action')}\x01{f.get('responsibility')}"
+        for f in files
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def group_into_module_batches(file_plan: list[dict],
                               module_deps: dict[str, list[str]] | None = None,
                               ) -> list[tuple[str, list[dict]]]:
@@ -250,6 +288,11 @@ def _norm_paths(st: dict, *keys: str) -> set[str]:
     """取子任务 scope 中若干键的归一化路径集合。"""
     sc = st.get("scope") or {}
     out: set[str] = set()
+    if not isinstance(sc, dict):
+        # R32 复核附带：LLM 吐 scope 为字符串等畸形时，此处裸 .get 会炸掉整个 merge
+        # （连坐全部批，比"复核 B"构造期隔离更早）——按空 scope 处理，让畸形子任务
+        # 活到 SubTask 构造期被逐个剔除记账（invalid_subtasks），不连坐。
+        return out
     for key in keys:
         for f in (sc.get(key) or []):
             if isinstance(f, str) and f.strip():

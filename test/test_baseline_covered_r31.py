@@ -296,7 +296,7 @@ async def test_plan_batched_unions_baseline_declarations():
         "requirement_items": _items(),
     }
     file_plan = [{"path": "m/a.txt", "action": "create", "responsibility": "x"}]
-    task_plan, failed, baseline = await _plan_ultra_batched(
+    task_plan, failed, baseline, _cache = await _plan_ultra_batched(
         fake, state, "总需求", {}, "", file_plan)
     assert failed == []
     assert baseline == [{"id": REQ_B, "reason": "存量模块已有"}]
