@@ -484,11 +484,27 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
             return await _aio.wait_for(_llm.ainvoke(messages), timeout=total_timeout)
         parts: list[str] = []
         loop = _aio.get_running_loop()  # 协程内惯用法（复核 INFO：避 get_event_loop 弃用面）
-        deadline = loop.time() + total_timeout
+        # B5（阶段2.3，登记册 §三）：progress-aware 双限——软限=total_timeout（无进展即杀，
+        # 原语义）；已有 chunk 到达的活跃流（间隔由 _gap 看门狗把守）延长至硬顶=软限×倍数
+        # （SWARM_STREAM_PROGRESS_HARD_MULT，默认 3，≤1=回原行为）。杀活跃流=已付 token
+        # 全废+重付 input 双倍浪费（round34 实证 1.5万 chunk 未 stall 被 300s 硬杀）；费用
+        # 由阶段1 ledger 预留-结算兜底，时间由硬顶封 runaway。
+        try:
+            _hard_mult = float(os.environ.get(
+                "SWARM_STREAM_PROGRESS_HARD_MULT", "3") or "3")
+        except ValueError:
+            _hard_mult = 3.0
+        _t0 = loop.time()
+        _deadline_soft = _t0 + total_timeout
+        _deadline_hard = _t0 + total_timeout * max(1.0, _hard_mult)
+        _n_chunks = 0
+        _ext_logged = False
         agen = astream(messages)
         try:
             while True:
-                remaining = deadline - loop.time()
+                _now = loop.time()
+                _limit = _deadline_hard if _n_chunks > 0 else _deadline_soft
+                remaining = _limit - _now
                 if remaining <= 0:
                     raise _aio.TimeoutError()
                 try:
@@ -496,6 +512,13 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
                         agen.__anext__(), timeout=min(_gap, remaining))
                 except StopAsyncIteration:
                     break
+                _n_chunks += 1
+                if not _ext_logged and loop.time() >= _deadline_soft:
+                    _ext_logged = True
+                    logger.info(
+                        "[PLAN-BATCH] B5 progress-aware：流仍在出 chunk（已 %d 个）超软限 "
+                        "%.0fs → 延长至硬顶 %.0fs（不硬杀活跃流）",
+                        _n_chunks, total_timeout, total_timeout * max(1.0, _hard_mult))
                 # hunter CONFIRMED：list content-block（部分 provider 流式形态）绝不能 str()
                 # ——那产出 Python repr 污染 JSON。按 langchain 口径抽取 text 分片。
                 c = getattr(chunk, "content", None)
@@ -521,33 +544,57 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
                     pass
         return type("R", (), {"content": "".join(parts)})()
 
-    try:
-        return await _stream_once(llm)
-    except _aio.TimeoutError:
-        if fallback_llm is None:
-            raise
-        # §九 阶段1.5：主备切换是重试层——切备前查 ledger 余额，耗尽则确定性抛
-        # TaskTokenLimitExceeded（runner salvage→PARTIAL），不再对备用烧一整轮全款。
-        from swarm.models import ledger as _ledger_mod
-        from swarm.models import usage_tracker as _ut_mod
-        _ledger_mod.ensure_budget(_ut_mod.get_current_task() or "",
-                                  min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
+    from swarm.models import breaker as _breaker
+    from swarm.models.errors import TransientInfraError as _TIE
+    _pkey = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
+    # B3（阶段2.2，登记册 §三）：primary 已熔断且有备可走 → 直接走备，不再对已知死掉的
+    # 模型烧满墙钟全款。无备时不熔（唯一出路不能关，fail-open 对称）。
+    _skip_primary = fallback_llm is not None and bool(_pkey) and not _breaker.allow(_pkey)
+    if _skip_primary:
         logger.warning(
-            "[PLAN-BATCH] R35-A primary 外层超时 %.0fs → 显式切备用模型重试"
-            "（with_fallbacks 只兜流内异常，外层墙钟超时须主动切备）", total_timeout)
+            "[PLAN-BATCH] B3 模型 %s 熔断开启（连续超时/stall）→ 本次直接走备用模型", _pkey)
+    else:
         try:
-            # 备用 fresh 预算
-            _r = await _stream_once(fallback_llm)
-            logger.info(
-                "[PLAN-BATCH] R35-A 备用模型救回本批（primary 超时后切备成功）")
+            _r = await _stream_once(llm)
+            if _pkey:
+                _breaker.record_success(_pkey)
             return _r
-        except _aio.TimeoutError:
-            # 复核可观测：主备【双超时】须与单模型超时区分，否则日志分不清是 primary 独坏
-            # 还是备用也坏（切备诊断价值全失）。原样抛给调用方 timeout 分支。
+        except (_aio.TimeoutError, _TIE) as _p_exc:
+            # B2（阶段2.1，登记册 §三）：流中 stall/runaway 抛 TransientInfraError，与外层
+            # 墙钟超时同等切备——饱和最常见形态=生成中途 stall，原先只能同模型空转。
+            if _pkey:
+                _breaker.record_failure(_pkey)
+            if fallback_llm is None:
+                raise
+            # §九 阶段1.5：主备切换是重试层——切备前查 ledger 余额，耗尽则确定性抛
+            # TaskTokenLimitExceeded（runner salvage→PARTIAL），不再对备用烧一整轮全款。
+            from swarm.models import ledger as _ledger_mod
+            from swarm.models import usage_tracker as _ut_mod
+            _ledger_mod.ensure_budget(_ut_mod.get_current_task() or "",
+                                      min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
             logger.warning(
-                "[PLAN-BATCH] R35-A 备用模型【也】外层超时 %.0fs——主备双超时"
-                "（均未在预算内返回，本批判 timeout；provider 侧疑整体饱和）", total_timeout)
-            raise
+                "[PLAN-BATCH] R35-A/B2 primary %s 墙钟超时或流中 stall → 显式切备用模型重试"
+                "（with_fallbacks 只兜流内错误，超时/stall 须主动切备）: %s",
+                _pkey or "?", _p_exc)
+    _fkey = str(getattr(fallback_llm, "model_name", "")
+                or getattr(fallback_llm, "model", "") or "")
+    try:
+        # 备用 fresh 预算
+        _r = await _stream_once(fallback_llm)
+        if _fkey:
+            _breaker.record_success(_fkey)
+        logger.info(
+            "[PLAN-BATCH] R35-A 备用模型救回本批（primary 超时/stall 后切备成功）")
+        return _r
+    except (_aio.TimeoutError, _TIE):
+        # 复核可观测：主备【双失败】须与单模型失败区分，否则日志分不清是 primary 独坏
+        # 还是备用也坏（切备诊断价值全失）。原样抛给调用方既有分支。
+        if _fkey:
+            _breaker.record_failure(_fkey)
+        logger.warning(
+            "[PLAN-BATCH] R35-A 备用模型【也】超时/stall（预算 %.0fs）——主备双失败"
+            "（均未在预算内返回；provider 侧疑整体饱和）", total_timeout)
+        raise
 
 
 def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:

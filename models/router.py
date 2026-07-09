@@ -301,6 +301,50 @@ def _extract_token_usage(response: Any) -> tuple[int, int]:
     return 0, 0
 
 
+# B6：provider 并发槽位池。asyncio.Semaphore 绑定事件循环，按 (provider_id, loop_id)
+# 键控（测试/多循环环境各自独立；单进程 uvicorn 单循环=天然全局闸）。有界：循环销毁后
+# 条目残留无害（同 id 不复用），超 64 条清理一次。
+import asyncio as _b6_asyncio
+
+_PROVIDER_SLOTS: dict[tuple[str, int], "_b6_asyncio.Semaphore"] = {}
+_PROVIDER_SLOTS_LOCK = threading.Lock()
+
+
+def _provider_slot(provider_id: str, limit: int):
+    if not provider_id or limit <= 0:
+        return None
+    try:
+        loop = _b6_asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (provider_id, id(loop))
+    with _PROVIDER_SLOTS_LOCK:
+        sem = _PROVIDER_SLOTS.get(key)
+        if sem is None:
+            if len(_PROVIDER_SLOTS) > 64:
+                _PROVIDER_SLOTS.clear()
+            sem = _b6_asyncio.Semaphore(limit)
+            _PROVIDER_SLOTS[key] = sem
+        return sem
+
+
+def _resolve_provider_concurrency(provider) -> int:
+    explicit = getattr(provider, "max_concurrency", None)
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except (TypeError, ValueError):
+            return 0
+    if getattr(provider, "kind", "") != "cloud":
+        return 0
+    import os as _os
+    try:
+        return max(0, int(_os.environ.get(
+            "SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY", "6") or "6"))
+    except ValueError:
+        return 6
+
+
 @runtime_checkable
 class ModelProvider(Protocol):
     """模型提供者协议"""
@@ -338,8 +382,24 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     swarm_heartbeat_every: float = 30.0
     # 总时长看门狗：单次流式累计超此秒数即判 runaway 抛 transient。0=关闭（默认，worker 热路径不动）。
     swarm_wallclock_budget: float = 0.0
+    # B6（阶段2.4，登记册 §三）：provider 级进程并发闸。每任务 Semaphore(4)×多任务×
+    # tech_design(3)×contract 并发可达十几路，系统自己把云端打饱和（饱和→超时→重试→更
+    # 饱和自激振荡）。同 provider 的所有流式调用共享一个进程级槽位池，持有整个流期间。
+    # 0=不闸（本地默认：只有时间成本，vLLM 自身排队）。
+    swarm_provider_id: str = ""
+    swarm_provider_concurrency: int = 0
 
     async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        _sem = _provider_slot(self.swarm_provider_id, self.swarm_provider_concurrency)
+        if _sem is None:
+            async for chunk in self._astream_inner(*args, **kwargs):
+                yield chunk
+            return
+        async with _sem:
+            async for chunk in self._astream_inner(*args, **kwargs):
+                yield chunk
+
+    async def _astream_inner(self, *args: Any, **kwargs: Any):
         import asyncio
 
         from swarm.models.errors import TransientInfraError
@@ -496,6 +556,7 @@ class EndpointProvider:
                 float(self.config.timeout_seconds),
                 float(getattr(self.config, "first_token_timeout", self.config.stream_chunk_timeout)),
                 float(getattr(self.config, "inter_chunk_timeout", 30.0)),
+                _resolve_provider_concurrency(self.provider),  # B6：并发闸参数入缓存键
                 _cb_token,
             )
             with _CHAT_MODEL_CACHE_LOCK:
@@ -544,6 +605,10 @@ class EndpointProvider:
         _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
         # 治本（第三条腿）：总时长看门狗。由调用方按角色传入（brain 开/worker 默认关），0=关闭。
         _kwargs["swarm_wallclock_budget"] = float(wallclock_budget or 0.0)
+        # B6：provider 并发闸参数——provider 显式 max_concurrency 优先；云端缺省走
+        # SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY（默认 6）；本地缺省 0=不闸（时间成本口径）。
+        _kwargs["swarm_provider_id"] = self.provider.id
+        _kwargs["swarm_provider_concurrency"] = _resolve_provider_concurrency(self.provider)
         model = _DualTimeoutChatOpenAI(**_kwargs)
         if _cache_key is not None:
             with _CHAT_MODEL_CACHE_LOCK:

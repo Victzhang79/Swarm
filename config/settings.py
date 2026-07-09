@@ -236,7 +236,11 @@ class ModelConfig(BaseSettings):
     brain_temperature: float = 0.1
     worker_temperature: float = 0.2
     max_retries: int = 2
-    timeout_seconds: int = 120
+    # B9（2026-07-09 登记册）语义澄清：本值传给 openai 客户端的 timeout——对【流式】调用
+    # （本系统恒 streaming=True）它是【连接/字节间隔超时】而非总时长；总时长由
+    # progress-aware 双限（软限+硬顶，_invoke_llm_abortable）与 swarm_wallclock_budget
+    # （模型级第三腿）另行把守。改大本值不会放宽总预算，改小会误杀慢首包。
+    timeout_seconds: int = 120  # SWARM_MODEL_TIMEOUT_SECONDS（流式=字节间隔，非总超时）
     # worker 单次响应输出上限（token）。防止 worker 改大文件时全文重写输出撑爆 context
     # （实测 Qwen3.5-122B 改 877 行 StringUtils 时输出 38086 token，叠加输入 27451 超 65536
     # 上下文上限 → 400 报错 → 子任务失败）。worker 应用 patch_file 做最小改动，输出本不该
