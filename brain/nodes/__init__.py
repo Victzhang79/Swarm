@@ -499,6 +499,13 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
         _deadline_hard = _t0 + total_timeout * max(1.0, _hard_mult)
         _n_chunks = 0
         _ext_logged = False
+        # 阶段2 复核 F-B：清上一轮槽位观测（本调用若经 B6 并发闸，router 会写入
+        # queued_at/acquired_at；桩/本地无闸=保持 None）。
+        try:
+            from swarm.models.router import slot_wait_reset as _slot_reset
+            _slot_reset()
+        except Exception:  # noqa: BLE001 — 观测面绝不拖垮调用
+            pass
         agen = astream(messages)
         try:
             while True:
@@ -507,9 +514,14 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
                 remaining = _limit - _now
                 if remaining <= 0:
                     raise _aio.TimeoutError()
+                # 阶段2 复核 F-B：首 chunk 等待（含 B6 槽位排队+prefill）由软限把守，
+                # 不受 chunk-gap 钳制——gap 只管【解码中途】两 chunk 间隔（原 min(_gap,·)
+                # 会在饱和排队 >gap 时 120s 就杀，杀完切备又排同一池=双倍白烧）。真实路径
+                # 首 token 另有 router 内层 swarm_first_token_timeout（180s，槽位获得后
+                # 起算）把守，僵死流不靠本层 gap 早杀。
+                _to = remaining if _n_chunks == 0 else min(_gap, remaining)
                 try:
-                    chunk = await _aio.wait_for(
-                        agen.__anext__(), timeout=min(_gap, remaining))
+                    chunk = await _aio.wait_for(agen.__anext__(), timeout=_to)
                 except StopAsyncIteration:
                     break
                 _n_chunks += 1
@@ -546,6 +558,28 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
 
     from swarm.models import breaker as _breaker
     from swarm.models.errors import TransientInfraError as _TIE
+
+    def _slot_starved() -> bool:
+        """阶段2 复核 F-B：本次超时是否整段耗在 B6 槽位排队（acquired_at 为 None）。
+        自致拥塞不是模型失败——喂 record_failure 会把健康模型熔断，饱和自激放大。"""
+        try:
+            from swarm.models import router as _router_mod
+            _st = _router_mod.slot_wait_state()
+            return bool(_st and _st.get("acquired_at") is None)
+        except Exception:  # noqa: BLE001 — 观测面缺失=按真失败保守处理
+            return False
+
+    def _feed_breaker_failure(_key: str) -> None:
+        if not _key:
+            return
+        if _slot_starved():
+            _breaker.release_probe(_key)  # 若这次恰是探针，归还不计成败
+            logger.warning(
+                "[PLAN-BATCH] B6 模型 %s 本次超时整段耗在 provider 槽位排队（进程内自致"
+                "拥塞，未触达 provider）→ 不计入熔断失败", _key)
+        else:
+            _breaker.record_failure(_key)
+
     _pkey = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
     # B3（阶段2.2，登记册 §三）：primary 已熔断且有备可走 → 直接走备，不再对已知死掉的
     # 模型烧满墙钟全款。无备时不熔（唯一出路不能关，fail-open 对称）。
@@ -553,6 +587,12 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
     if _skip_primary:
         logger.warning(
             "[PLAN-BATCH] B3 模型 %s 熔断开启（连续超时/stall）→ 本次直接走备用模型", _pkey)
+        # 阶段2 复核 F-E：跳过 primary 直走备也是切备重试层——与其他切备点同样先查
+        # 头寸（router _LedgerGuard 的 reserve 硬闸仍在，此处补对称的显式预检）。
+        from swarm.models import ledger as _ledger_mod
+        from swarm.models import usage_tracker as _ut_mod
+        _ledger_mod.ensure_budget(_ut_mod.get_current_task() or "",
+                                  min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
     else:
         try:
             _r = await _stream_once(llm)
@@ -562,8 +602,7 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
         except (_aio.TimeoutError, _TIE) as _p_exc:
             # B2（阶段2.1，登记册 §三）：流中 stall/runaway 抛 TransientInfraError，与外层
             # 墙钟超时同等切备——饱和最常见形态=生成中途 stall，原先只能同模型空转。
-            if _pkey:
-                _breaker.record_failure(_pkey)
+            _feed_breaker_failure(_pkey)
             if fallback_llm is None:
                 raise
             # §九 阶段1.5：主备切换是重试层——切备前查 ledger 余额，耗尽则确定性抛
@@ -576,6 +615,13 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
                 "[PLAN-BATCH] R35-A/B2 primary %s 墙钟超时或流中 stall → 显式切备用模型重试"
                 "（with_fallbacks 只兜流内错误，超时/stall 须主动切备）: %s",
                 _pkey or "?", _p_exc)
+        except BaseException:
+            # 阶段2 复核 F-A（CRITICAL）：探针期间的非超时类异常（CancelledError 兄弟取消/
+            # TaskTokenLimitExceeded/API 错误）必须归还探针——否则 probing 永久 True=该
+            # 模型被静默永久禁用（进程级）。归还不计成败（结果未知），异常原样上抛。
+            if _pkey:
+                _breaker.release_probe(_pkey)
+            raise
     _fkey = str(getattr(fallback_llm, "model_name", "")
                 or getattr(fallback_llm, "model", "") or "")
     try:
@@ -589,11 +635,15 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
     except (_aio.TimeoutError, _TIE):
         # 复核可观测：主备【双失败】须与单模型失败区分，否则日志分不清是 primary 独坏
         # 还是备用也坏（切备诊断价值全失）。原样抛给调用方既有分支。
-        if _fkey:
-            _breaker.record_failure(_fkey)
+        _feed_breaker_failure(_fkey)
         logger.warning(
             "[PLAN-BATCH] R35-A 备用模型【也】超时/stall（预算 %.0fs）——主备双失败"
             "（均未在预算内返回；provider 侧疑整体饱和）", total_timeout)
+        raise
+    except BaseException:
+        # F-A 对称：备用侧探针同样归还（备用模型也可能处于半开探针态）。
+        if _fkey:
+            _breaker.release_probe(_fkey)
         raise
 
 
@@ -917,6 +967,7 @@ async def _plan_ultra_batched(
                 # 上抛（绝不吞成"模块失败"记账：预算耗尽是任务级事实，须 salvage 而非
                 # 降级跳过后继续烧兄弟批）。
                 from swarm.models.errors import TaskTokenLimitExceeded as _TTLE
+                from swarm.models.errors import TransientInfraError as _TIE_b
                 from swarm.models import ledger as _ledger_mod
                 _ledger_mod.ensure_budget(state.get("task_id") or "",
                                           min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
@@ -964,7 +1015,10 @@ async def _plan_ultra_batched(
                             "[PLAN-BATCH] 模块'%s' 批无子任务但含 %d 条 baseline 申报——"
                             "失败批申报不收（未覆盖条目将走覆盖校验重试）", mod_name, len(_bl_lost))
                     last_fail = ("ok", i, mod_name, [], _dt, len(batch))  # 空 → 可重试
-                except _asyncio.TimeoutError:
+                except (_asyncio.TimeoutError, _TIE_b):
+                    # 阶段2 复核 F-C（双复核独立命中）：主备双 stall 终态抛 TransientInfraError
+                    # ——落 "error" 桶会让 U3 bisect（只认 oc[0]=="timeout"）对 stall（本阶段
+                    # 立项要治的形态）静默失效。stall 操作语义=超时，与 TimeoutError 同桶。
                     last_fail = ("timeout", i, mod_name, None, None, len(batch))
                 except _TTLE:
                     raise  # §九 阶段1.5：预算耗尽绝不吞成模块 error（任务级 salvage）

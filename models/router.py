@@ -301,13 +301,44 @@ def _extract_token_usage(response: Any) -> tuple[int, int]:
     return 0, 0
 
 
-# B6：provider 并发槽位池。asyncio.Semaphore 绑定事件循环，按 (provider_id, loop_id)
-# 键控（测试/多循环环境各自独立；单进程 uvicorn 单循环=天然全局闸）。有界：循环销毁后
-# 条目残留无害（同 id 不复用），超 64 条清理一次。
+# B6：provider 并发槽位池。asyncio.Semaphore 绑定事件循环，按 (provider_id, loop_id,
+# limit) 键控（测试/多循环环境各自独立；单进程 uvicorn 单循环=天然全局闸；键含 limit
+# ——阶段2 复核 F-D：并发上限热变更须拿到新池，不得被最先建的旧池静默吞，与 D54 缓存键
+# 含 concurrency 的意图对齐）。有界：循环销毁/旧 limit 池残留无害（不再被取用），超 64
+# 条清理一次。
 import asyncio as _b6_asyncio
+import contextvars as _b6_cv
 
-_PROVIDER_SLOTS: dict[tuple[str, int], "_b6_asyncio.Semaphore"] = {}
+_PROVIDER_SLOTS: dict[tuple[str, int, int], "_b6_asyncio.Semaphore"] = {}
 _PROVIDER_SLOTS_LOCK = threading.Lock()
+
+# 阶段2 复核 F-B：本次流式调用的槽位等待观测（contextvar——async 生成器体在消费者任务
+# 上下文中执行，消费侧 _invoke_llm_abortable 可据此区分"整段超时耗在排队（进程内自致
+# 拥塞）"与"provider 真失败"，前者绝不喂熔断。None=本调用无槽位参与（本地/无闸/桩）。
+_SLOT_WAIT_CV: "_b6_cv.ContextVar[dict | None]" = _b6_cv.ContextVar(
+    "swarm_slot_wait", default=None)
+
+
+def slot_wait_reset() -> None:
+    """新一次流式调用开始前清上一轮观测（消费侧 _stream_once 调）。"""
+    _SLOT_WAIT_CV.set(None)
+
+
+def slot_wait_state() -> "dict | None":
+    """{'queued_at': t, 'acquired_at': t|None}；acquired_at is None=仍在排队中被杀。"""
+    return _SLOT_WAIT_CV.get()
+
+
+def _slot_wait_cap_s() -> float:
+    """槽位等待上界（泄漏保险丝）：超界 WARNING + fail-open 放行。0=不设界。
+    释放依赖生成器 finalize（GC 钩子异步发生，非同步保证）——泄漏时此界让系统
+    可观测降级而非静默越锁越死。"""
+    import os as _os
+    try:
+        v = float(_os.environ.get("SWARM_PROVIDER_SLOT_WAIT_S", "600") or "600")
+        return max(0.0, v)
+    except ValueError:
+        return 600.0
 
 
 def _provider_slot(provider_id: str, limit: int):
@@ -317,7 +348,7 @@ def _provider_slot(provider_id: str, limit: int):
         loop = _b6_asyncio.get_running_loop()
     except RuntimeError:
         return None
-    key = (provider_id, id(loop))
+    key = (provider_id, id(loop), int(limit))
     with _PROVIDER_SLOTS_LOCK:
         sem = _PROVIDER_SLOTS.get(key)
         if sem is None:
@@ -395,9 +426,44 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             async for chunk in self._astream_inner(*args, **kwargs):
                 yield chunk
             return
-        async with _sem:
+        # 阶段2 复核 F-B：①排队观测进 contextvar（消费侧据此免把自致拥塞喂熔断）；
+        # ②acquire 有界（SWARM_PROVIDER_SLOT_WAIT_S，泄漏保险丝）——释放依赖生成器
+        # finalize（外层 astream 被弃时经 GC 钩子异步发生，无同步保证），槽位被占死时
+        # 无界 acquire=静默越锁越死零日志；超界 WARNING + fail-open 放行（并发闸是抗
+        # 自饱和的优化而非正确性闸，与"无备不熔"同一 fail-open 对称原则）。
+        _wait = _SLOT_WAIT_CV.get()
+        if _wait is None:
+            _wait = {"queued_at": _monotonic(), "acquired_at": None}
+            _SLOT_WAIT_CV.set(_wait)
+        else:  # 消费侧已 reset 过则复用；异常残留也在此被覆盖
+            _wait["queued_at"] = _monotonic()
+            _wait["acquired_at"] = None
+        _cap = _slot_wait_cap_s()
+        _acquired = False
+        try:
+            if _cap > 0:
+                try:
+                    await _b6_asyncio.wait_for(_sem.acquire(), timeout=_cap)
+                    _acquired = True
+                except _b6_asyncio.TimeoutError:
+                    logger.warning(
+                        "[router] B6 provider '%s' 槽位等待超 %.0fs——fail-open 本次不闸"
+                        "放行（若持续出现：疑槽位泄漏或并发上限过低，检查 "
+                        "SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY/持有流是否挂死）",
+                        self.swarm_provider_id, _cap)
+            else:
+                await _sem.acquire()
+                _acquired = True
+            _wait["acquired_at"] = _monotonic()
+            _q_s = _wait["acquired_at"] - _wait["queued_at"]
+            if _q_s >= 30.0:
+                logger.info("[router] B6 provider '%s' 槽位排队 %.0fs 后获得（并发闸生效中）",
+                            self.swarm_provider_id, _q_s)
             async for chunk in self._astream_inner(*args, **kwargs):
                 yield chunk
+        finally:
+            if _acquired:
+                _sem.release()
 
     async def _astream_inner(self, *args: Any, **kwargs: Any):
         import asyncio

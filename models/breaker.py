@@ -15,7 +15,12 @@
 
 进程级内存态（重启清零=自然半开）；线程安全；env 可调：
   SWARM_BREAKER_THRESHOLD（连续失败阈值，默认 3；0=禁用熔断）
-  SWARM_BREAKER_COOLDOWN_S（冷却秒，默认 120）
+  SWARM_BREAKER_COOLDOWN_S（冷却秒，默认 120；也是半开探针悬挂 TTL）
+
+★作用域（阶段2 复核 F-F）：当前仅 brain 规划面接线（_invoke_llm_abortable 三个调用点：
+分批规划/单发规划/对抗复核）。worker 面走 with_fallbacks 不经此处——健康信号只反映
+规划流量，snapshot() 不含 worker 证据；若将来接观测面板，须区分"验证过健康"与
+"近期无证据"（worker 接线留给阶段4 时间账单遍化统一做）。★
 """
 
 from __future__ import annotations
@@ -45,12 +50,13 @@ def _cooldown_s() -> float:
 
 
 class _BState:
-    __slots__ = ("consecutive_failures", "opened_at", "probing")
+    __slots__ = ("consecutive_failures", "opened_at", "probing", "probe_started_at")
 
     def __init__(self) -> None:
         self.consecutive_failures = 0
         self.opened_at: float | None = None  # None=closed
         self.probing = False  # half-open 探针在飞
+        self.probe_started_at = 0.0  # 探针放行时刻（TTL 自愈用）
 
 
 _lock = threading.Lock()
@@ -71,11 +77,22 @@ def allow(key: str) -> bool:
         st = _states.get(key)
         if st is None or st.opened_at is None:
             return True
-        if time.monotonic() - st.opened_at < _cooldown_s():
+        now = time.monotonic()
+        if now - st.opened_at < _cooldown_s():
             return False
         if st.probing:
-            return False  # 半开只放一个探针
+            # 阶段2 复核 F-A（CRITICAL）：探针生命周期只靠 record_success/record_failure
+            # 归还——调用方在非超时类异常（CancelledError 兄弟取消/TaskTokenLimitExceeded/
+            # API 错误）下两者都不触发，probing 裸 bool 无人清=该模型静默永久禁用。
+            # 纵深防御：探针悬挂超过一个冷却期 → TTL 自愈，重新放行（调用侧另有归还，见
+            # _invoke_llm_abortable 的 release_probe；此处兜调用侧失职/未来新调用面）。
+            if now - st.probe_started_at < _cooldown_s():
+                return False  # 半开只放一个探针
+            logger.warning(
+                "[breaker] 模型 %s 半开探针悬挂超冷却期（%.0fs）未归还——TTL 自愈重新放行"
+                "（探针方大概率被取消/异常中断）", key, _cooldown_s())
         st.probing = True
+        st.probe_started_at = now
         logger.info("[breaker] 模型 %s 冷却期满 → half-open 放行探针", key)
         return True
 
@@ -92,6 +109,21 @@ def record_success(key: str) -> None:
         st.consecutive_failures = 0
         st.opened_at = None
         st.probing = False
+
+
+def release_probe(key: str) -> None:
+    """归还探针但【不计成败】（阶段2 复核 F-A）：探针调用被取消/预算耗尽/非超时类异常
+    中断时，结果未知——既不该 record_failure（把取消当模型失败会误延冷却），更不能不管
+    （probing 卡 True=永久禁用）。归还后 opened_at 不动：冷却已满则下一次 allow() 立即
+    放行新探针。closed 态/无状态时为无害 no-op（调用方在任意异常路径统一调用）。"""
+    if not key:
+        return
+    with _lock:
+        st = _states.get(key)
+        if st is None or not st.probing:
+            return
+        st.probing = False
+        logger.info("[breaker] 模型 %s 探针中断（取消/非超时类异常）→ 归还探针不计成败", key)
 
 
 def record_failure(key: str) -> None:
