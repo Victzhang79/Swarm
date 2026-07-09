@@ -15,10 +15,12 @@ from swarm.brain.nodes.shared import (
     _subtask_produced_expected,
     _worker_profile_prompt,
     completed_l1_ids,
+    gather_cancel_on_error,
 )
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.memory.sliding_window import PRIORITY_WORKER
+from swarm.models.errors import TaskTokenLimitExceeded
 from swarm.types import Confidence, SubTask, WorkerOutput
 
 logger = logging.getLogger(__name__)
@@ -397,10 +399,17 @@ async def dispatch(state: BrainState) -> dict:
                 base_ref=state.get("base_commit"),  # 3rd#2：钉扎 base 透传到 worker
             )
             return subtask, output
+        except TaskTokenLimitExceeded:
+            # 复核 H2（阶段1）：预算耗尽是任务级事实，原样上抛（runner salvage→PARTIAL），
+            # 不吞成 (subtask, exc) 普通失败对（那会烧重试阶梯 + 污染 L5 归因）。
+            raise
         except Exception as e:
             return subtask, e
 
-    outcomes = await asyncio.gather(*[_run_one(st, i) for i, st in enumerate(to_dispatch)])
+    # 复核 H1b（阶段1）：任务级异常逃逸时取消兄弟 worker（裸 gather 不取消，兄弟继续烧钱
+    # 且结算落在 detach 后形成幽灵账目）。
+    outcomes = await gather_cancel_on_error(
+        [_run_one(st, i) for i, st in enumerate(to_dispatch)])
 
     def _worker_batch_context() -> dict:
         lines: list[str] = []

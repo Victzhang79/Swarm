@@ -187,7 +187,8 @@ class _LedgerGuard(BaseCallbackHandler):
         task_id = usage_tracker.get_current_task()
         if not task_id:
             return  # 无任务归属（预处理/探测）→ 不预留不闸
-        est_in = sum(len(p or "") for p in (prompts or [])) // 3 + 64
+        # 复核 H4：与结算共用 CJK 感知估算器（原 //3 对 CJK 低估 2 倍）。
+        est_in = sum(ledger.estimate_tokens_text(p or "") for p in (prompts or [])) + 64
         est_out = self.max_tokens or self._DEFAULT_OUT_RESERVE
         # reserve 余额不足抛 TaskTokenLimitExceeded → raise_error=True 传播 → 调用被拒绝发起
         rid = ledger.reserve(task_id, est_in=est_in, est_out=est_out, kind=self.kind)
@@ -229,16 +230,26 @@ class _LedgerGuard(BaseCallbackHandler):
             else:
                 real_in, real_out = _extract_token_usage(response)
             if real_in <= 0 and real_out <= 0:
-                # 网关不回 usage → 按估算结算（input 全额 + output 按响应文本估），
-                # 宁可高估不让预算失明。
-                real_in, real_out = 0, _estimate_output_tokens(response)
-                from swarm.models import ledger as _l  # settle_error 取 max(chunk, 预留 est_in)
-                _l.settle_error(rid, chunk_in=0, chunk_out=real_out)
+                # 网关不回 usage → 按估算结算（input 全额=预留估 + output 按响应文本估），
+                # 宁可高估不让预算失明。复核 H4：每任务一次 WARNING（可观测，双账本
+                # usage_tracker 此形态记 0，读数会分叉——账本以 ledger 为权威）。
+                _out_est = _estimate_output_tokens(response)
+                from swarm.models import usage_tracker as _ut
+                _tid = _ut.get_current_task() or ""
+                if _tid and _tid not in _NO_USAGE_WARNED:
+                    if len(_NO_USAGE_WARNED) > 1000:
+                        _NO_USAGE_WARNED.clear()
+                    _NO_USAGE_WARNED.add(_tid)
+                    logger.warning(
+                        "[ledger] 模型 %s 未回报 usage——ledger 按估算结算（input=预留估/"
+                        "output=响应文本估），usage_tracker 此类调用记 0，两账本将分叉"
+                        "（本任务仅提示一次）", self.model_name)
+                ledger.settle_error(rid, chunk_in=0, chunk_out=_out_est)
                 return
             ledger.settle(rid, real_in=real_in, real_out=real_out)
-        except Exception:  # noqa: BLE001
-            # 结算失败绝不拖垮调用结果；预留由 detach 兜底清理
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 复核 H6：结算失败必须留痕——预留将挂到 TTL 过期/detach 才释放，期间余额虚低。
+            logger.warning("[ledger] on_llm_end 结算失败（预留挂到 TTL/detach 才释放）: %s", exc)
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
         try:
@@ -250,18 +261,22 @@ class _LedgerGuard(BaseCallbackHandler):
             from swarm.models import ledger
             # B4 治本：中止/超时/掐流按已收 chunk 估算结算（input 取 max(chunk,预留)宁可高估）
             ledger.settle_error(rid, chunk_in=tracked[0], chunk_out=tracked[1])
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ledger] on_llm_error 结算失败（预留挂到 TTL/detach 才释放）: %s", exc)
+
+
+_NO_USAGE_WARNED: set = set()  # 复核 H4：无 usage 网关的每任务一次告警（有界防涨）
 
 
 def _estimate_output_tokens(response: Any) -> int:
-    """无 usage 回报时按响应文本长度估算 output token（//3，与预留口径一致）。"""
+    """无 usage 回报时按响应文本长度估算 output token（与预留共用 CJK 感知口径）。"""
     try:
+        from swarm.models import ledger
         n = 0
         for gens in (getattr(response, "generations", None) or []):
             for g in gens:
-                n += len(getattr(g, "text", "") or "")
-        return n // 3
+                n += ledger.estimate_tokens_text(getattr(g, "text", "") or "")
+        return n
     except Exception:  # noqa: BLE001
         return 0
 
@@ -365,7 +380,7 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                 raise TransientInfraError(
                     f"stream {phase} 超时 {to:.0f}s (stream stall timeout) —— 基建瞬时，退避重试/fallback"
                 ) from exc
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as _cexc:
                 # B1 治本(P0)：cancel_task→handle.cancel() 在此 __anext__ await 上抛 CancelledError。
                 # 旧代码无此分支 → agen 不关 → 底层 HTTP 流不断 → vLLM/Ollama 继续解码占 GPU 空烧。
                 # 与 TimeoutError 同处理：关底层流让推理端 abort 解码释放 GPU，再上抛（不吞取消语义）。
@@ -373,6 +388,16 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                     await agen.aclose()
                 except Exception:  # noqa: BLE001
                     pass
+                # 复核 F1 辅修（阶段1）：ainvoke(streaming=True) 内部走本生成器，但被取消时
+                # langchain 的 agenerate 不会触发 on_llm_error（gather 取消直接穿透，实测
+                # langchain-core 1.4.0）→ _LedgerGuard 预留泄漏。此处主动补发（幂等：guard
+                # 按 rid pop 一次；langchain 若后续再发则二次调用为 no-op）。TTL 兜底其余管道。
+                _rm = kwargs.get("run_manager")
+                if _rm is not None:
+                    try:
+                        await _rm.on_llm_error(_cexc, response=None)
+                    except Exception:  # noqa: BLE001 — 补发失败不掩盖取消语义
+                        pass
                 raise
             first = False
             n_chunks += 1

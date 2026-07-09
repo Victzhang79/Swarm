@@ -957,7 +957,10 @@ async def _plan_ultra_batched(
             return last_fail
 
     # gather 按输入顺序返回 → 保持 module_batches(模块依赖序)的批次顺序
-    _outcomes = await _asyncio.gather(*[
+    # 复核 H1b（阶段1）：TaskTokenLimitExceeded 逃逸时取消兄弟批（裸 gather 不取消，
+    # 兄弟各跑满 300s 继续烧钱 + 结算落在 detach 后形成幽灵条目覆盖 DB 真值）。
+    from swarm.brain.nodes.shared import gather_cancel_on_error as _gather_coe
+    _outcomes = await _gather_coe([
         _decompose_batch(i, mod_name, batch)
         for i, (mod_name, batch) in enumerate(module_batches, start=1)
     ])
@@ -994,7 +997,7 @@ async def _plan_ultra_batched(
             _cooldown = 15.0
         if _cooldown > 0:
             await _asyncio.sleep(_cooldown)
-        _half_ocs = await _asyncio.gather(*[
+        _half_ocs = await _gather_coe([
             _decompose_batch(_i, _hname, _part)
             for (_x, _i, _hname, _part) in _specs
         ])
@@ -1357,11 +1360,15 @@ async def _targeted_coverage_topup(
         ]
         try:
             _resp = await llm.ainvoke(_messages)
+        except TaskTokenLimitExceeded:
+            raise  # 复核 H5（阶段1）：预算耗尽绝不吞成"LLM 失败"回退全量重拆（更贵且归因误导）
         except Exception as exc:  # noqa: BLE001 — 主模型失败尝试备用，仍失败则回退全量重拆
             if fallback_llm is not None:
                 try:
                     _resp = await fallback_llm.ainvoke(_messages)
                     logger.info("[PLAN] P1 外科补齐 primary 失败→备用模型救回")
+                except TaskTokenLimitExceeded:
+                    raise  # 复核 H5：备用同判
                 except Exception as exc2:  # noqa: BLE001
                     logger.warning(
                         "[PLAN] P1 外科补齐主备均失败(%s / %s)→回退全量重拆", exc, exc2)
@@ -2446,6 +2453,11 @@ async def _dispatch_to_worker(
             confidence=output.confidence.value if hasattr(output.confidence, "value") else str(output.confidence),
         )
         return output
+    except TaskTokenLimitExceeded:
+        # 复核 H2（阶段1）：预算耗尽是任务级事实——吞成普通子任务失败会把"没钱了"
+        # 错标成该子任务/模型的能力缺陷（污染 L5 错题 + classify_failure 判 None），
+        # 且审计面零结构化信号。原样上抛走 runner salvage→PARTIAL。
+        raise
     except Exception as e:
         logger.error(f"[DISPATCH] Worker 执行异常: {e}")
         return WorkerOutput(

@@ -996,6 +996,15 @@ async def _finalize_governor_partial(
         merged_diff=state.get("merged_diff") or "",
         subtask_results=state.get("subtask_results"),
     )
+    # 复核 H3（阶段1）：check_task_token_limit 先写的 limit_exceeded/limit 诊断标记
+    # 不被本次 token_usage 覆盖丢失；并补 salvage 归因，终态记录可机读区分
+    # "预算闸 PARTIAL"与其他抢救原因（原来只剩自由文本日志）。
+    _prev_tu = _rec.get("token_usage") or {}
+    if isinstance(_prev_tu, dict):
+        for _k in ("limit_exceeded", "limit"):
+            if _k in _prev_tu:
+                token_usage[_k] = _prev_tu[_k]
+    token_usage["salvage_reason"] = reason_code
     duration = store.compute_task_duration_seconds(_rec)
     store.update_task(
         task_id,

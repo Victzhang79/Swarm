@@ -71,6 +71,31 @@ def stage_for_node(node_name: str) -> str | None:
 # 确定性 salvage→PARTIAL 保产物）。与 _LedgerGuard 预留口径同数量级。
 RETRY_MIN_HEADROOM = 4096
 
+
+def _reservation_ttl_s() -> float:
+    """复核 F1（阶段1，CRITICAL）：预留 TTL 兜底。langchain 对被取消的 ainvoke()
+    【不触发 on_llm_error】（复核用最小脚本实测 langchain-core 1.4.0 坐实）——worker
+    单步 wait_for 掐断（生产高频）后预留永不释放，虚高预留把预算充裕的任务误拒成
+    PARTIAL。超过最大合法单次调用时长（brain 流墙钟 1500s）+ 余量的在飞预留视为
+    泄漏，惰性按 settle_error 语义结算（input 全额宁可高估——服务端已处理 prompt）。"""
+    import os
+    try:
+        v = float(os.environ.get("SWARM_LEDGER_RESERVATION_TTL_S", "1800") or "1800")
+        return v if v > 0 else 1800.0
+    except ValueError:
+        return 1800.0
+
+
+def estimate_tokens_text(text: str) -> int:
+    """复核 H4（阶段1）：预留/无 usage 结算共用的估算器（guard 与 output 估算同口径）。
+    CJK ~1.7 char/tok（本仓主语言），其余 ~3.5 char/tok——原一刀切 //3 对 CJK 低估
+    2 倍，把"宁可高估"的结算口径反转成低估。"""
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    other = len(text) - cjk
+    return int(cjk / 1.7 + other / 3.5) + 1
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS task_ledger (
     task_id          TEXT PRIMARY KEY,
@@ -96,7 +121,7 @@ class _Entry:
         "budget_total", "local_budget", "stage_ratios", "stage",
         "cloud_in", "cloud_out", "local", "llm_calls", "wall_ms",
         "replan_rounds", "stage_spent", "reserved_cloud", "reserved_local",
-        "stage_reserved", "dirty", "seg_t0",
+        "stage_reserved", "dirty", "seg_t0", "attached",
     )
 
     def __init__(self) -> None:
@@ -116,12 +141,17 @@ class _Entry:
         self.stage_reserved: dict[str, int] = {}
         self.dirty = False
         self.seg_t0: float | None = None  # 本执行段起点（attach 置位，detach 结算 wall_ms）
+        # 复核 H1a（阶段1）：只有 attach 过的条目才允许落库——detach 后迟到的 worker
+        # 结算会经 _get_or_create 再造条目，若可 flush 则全量 upsert 把 DB 真值覆盖成
+        # 近空幽灵行（budget=0/stage_spent={}），毁掉 resume 延续。track-only 条目
+        # （未 attach/幽灵）永不写 DB，flush 周期顺带清理其中无在飞预留者。
+        self.attached = False
 
 
 _lock = threading.Lock()
 _entries: dict[str, _Entry] = {}
-# reservation_id → (task_id, stage, kind, est_in, est_out)
-_reservations: dict[str, tuple[str, str | None, str, int, int]] = {}
+# reservation_id → (task_id, stage, kind, est_in, est_out, ts_monotonic)
+_reservations: dict[str, tuple[str, str | None, str, int, int, float]] = {}
 _flusher_started = False
 _table_ready = False
 
@@ -221,11 +251,21 @@ def _flush_row(task_id: str, row: dict) -> bool:
 
 
 def flush() -> None:
-    """把 dirty 任务全量写穿 DB（best-effort，永不抛）。"""
+    """把 dirty 任务全量写穿 DB（best-effort，永不抛）。
+
+    复核 H1a（阶段1）：只 flush attached 条目——detach 后迟到结算再造的幽灵条目
+    绝不落库（全量 upsert 会把 DB 真值覆盖成近空行）；顺带清理无在飞预留的幽灵/
+    track-only 条目（内存卫生）。"""
     with _lock:
-        dirty = {tid: _snapshot_locked(tid) for tid, e in _entries.items() if e.dirty}
+        dirty = {tid: _snapshot_locked(tid)
+                 for tid, e in _entries.items() if e.dirty and e.attached}
         for tid in dirty:
             _entries[tid].dirty = False
+        _live_res_tasks = {tid for (tid, *_r) in _reservations.values()}
+        _ghosts = [tid for tid, e in _entries.items()
+                   if not e.attached and tid not in _live_res_tasks]
+        for tid in _ghosts:
+            _entries.pop(tid, None)
     for tid, row in dirty.items():
         if not _flush_row(tid, row):
             with _lock:
@@ -291,6 +331,7 @@ def attach(task_id: str, budget_total: int, *, local_budget: int = 0,
         if entry.seg_t0 is None:  # 每执行段一次（重复 attach 不重置段起点）
             import time as _time
             entry.seg_t0 = _time.monotonic()
+        entry.attached = True  # H1a：唯一授予落库资格的地方
         entry.dirty = True
     _start_flusher()
 
@@ -374,16 +415,43 @@ def _usage_locked(task_id: str, e: _Entry, *, stage: str | None = None,
     return u
 
 
+def _expire_stale_reservations_locked() -> None:
+    """复核 F1（阶段1，CRITICAL）：泄漏预留惰性过期。被取消的 ainvoke() 不触发
+    on_llm_error（langchain-core 1.4.0 实测），预留会挂到 detach——超 TTL 的在飞预留
+    按 settle_error 语义就地结算（input 全额宁可高估，output 0），自愈不依赖回调管道。"""
+    import time as _time
+    now = _time.monotonic()
+    ttl = _reservation_ttl_s()
+    stale = [rid for rid, res in _reservations.items() if now - res[5] > ttl]
+    for rid in stale:
+        task_id, stage, kind, est_in, est_out, ts = _reservations.pop(rid)
+        e = _get_or_create(task_id)
+        _release_locked(e, stage, kind, max(0, est_in) + max(0, est_out))
+        if kind == "cloud":
+            e.cloud_in += max(0, est_in)
+            if stage is not None and est_in > 0:
+                e.stage_spent[stage] = e.stage_spent.get(stage, 0) + max(0, est_in)
+        else:
+            e.local += max(0, est_in)
+        e.llm_calls += 1
+        e.dirty = True
+        logger.warning(
+            "[ledger] 任务 %s 预留 %s 超 TTL(%.0fs) 未结算（疑被取消的调用泄漏）→ "
+            "按 input 估算 %d 全额结算并释放（宁可高估）", task_id, rid[:8], ttl, est_in)
+
+
 def reserve(task_id: str, *, est_in: int, est_out: int, kind: str = "cloud") -> str:
     """调用发起前预留额度。余额不足抛 TaskTokenLimitExceeded（拒绝发起，不烧钱）。
 
     云端：查总预算 + 当前 stage 子预算（在飞预留计入占用）。
     本地：独立闸值（local_budget，默认 0=不闸）；绝不消耗云端额度。
     """
+    import time as _time
     est = max(0, int(est_in or 0)) + max(0, int(est_out or 0))
     k = (kind or "cloud").lower()
     rid = uuid.uuid4().hex
     with _lock:
+        _expire_stale_reservations_locked()
         e = _get_or_create(task_id or "")
         if k == "cloud":
             if e.budget_total > 0:
@@ -408,7 +476,8 @@ def reserve(task_id: str, *, est_in: int, est_out: int, kind: str = "cloud") -> 
                 u["total"] = e.local
                 raise TaskTokenLimitExceeded(u)
             e.reserved_local += est
-        _reservations[rid] = (task_id or "", e.stage if k == "cloud" else None, k, est_in, est_out)
+        _reservations[rid] = (task_id or "", e.stage if k == "cloud" else None, k,
+                              est_in, est_out, _time.monotonic())
     return rid
 
 
@@ -426,7 +495,7 @@ def _settle_impl(rid: str, in_tokens: int, out_tokens: int) -> None:
         res = _reservations.pop(rid, None)
         if res is None:
             return  # 已结算/未知预留（幂等）
-        task_id, stage, kind, est_in, est_out = res
+        task_id, stage, kind, est_in, est_out, _ts = res
         e = _get_or_create(task_id)
         _release_locked(e, stage, kind, max(0, est_in) + max(0, est_out))
         total = max(0, int(in_tokens)) + max(0, int(out_tokens))
@@ -453,7 +522,7 @@ def settle_error(rid: str, *, chunk_in: int, chunk_out: int) -> None:
         res = _reservations.get(rid)
     if res is None:
         return
-    _task_id, _stage, _kind, est_in, _est_out = res
+    _task_id, _stage, _kind, est_in, _est_out, _ts = res
     _settle_impl(rid, max(int(chunk_in or 0), int(est_in or 0)), int(chunk_out or 0))
 
 
@@ -463,7 +532,7 @@ def cancel(rid: str) -> None:
         res = _reservations.pop(rid, None)
         if res is None:
             return
-        task_id, stage, kind, est_in, est_out = res
+        task_id, stage, kind, est_in, est_out, _ts = res
         e = _get_or_create(task_id)
         _release_locked(e, stage, kind, max(0, est_in) + max(0, est_out))
 
@@ -485,6 +554,7 @@ def ensure_budget(task_id: str, *, min_tokens: int = 0, stage: str | None = None
     if not task_id:
         return
     with _lock:
+        _expire_stale_reservations_locked()
         e = _entries.get(task_id)
         if e is None or e.budget_total <= 0:
             return

@@ -956,3 +956,23 @@ def l1_details_of(out) -> dict:
     if isinstance(out, dict):
         return out.get("l1_details", {}) or {}
     return {}
+
+
+async def gather_cancel_on_error(coros):
+    """§九 阶段1 复核 H1b：gather 兄弟取消——默认 gather 首异常即抛但【不取消】其余在飞
+    任务，TaskTokenLimitExceeded 逃逸后兄弟批/兄弟 worker 继续烧钱（每个可跑满各自超时），
+    且其预留/结算落在 detach 之后形成幽灵条目。此处：任一任务抛 → 取消全部未完成兄弟并
+    等其收尾（吞被取消者的 CancelledError，防 "exception was never retrieved" 噪声），
+    再原样上抛首异常。语义：成功路径与裸 gather 逐字节一致。
+    """
+    import asyncio as _aio
+
+    tasks = [_aio.ensure_future(c) for c in coros]
+    try:
+        return await _aio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await _aio.gather(*tasks, return_exceptions=True)
+        raise
