@@ -51,7 +51,9 @@ def _budget_chars_for(text: str, max_tokens: int) -> int:
     """按 CJK 占比加权的字符预算（纯函数）。全 ASCII=max_tokens×4；全 CJK=×1.5。"""
     if not text:
         return max_tokens * _CHARS_PER_TOKEN
-    sample = text[:20000]
+    # 6.9-Rp11：全文统计（O(n) 纯计数，代价可忽略）——只采样前 20000 字符会在
+    # "英文头+中文体"的 PRD 上低估 CJK 占比 → 预算偏松、截断仍超 token。
+    sample = text
     cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
     ratio = cjk / len(sample)
     per_token = _CHARS_PER_TOKEN * (1 - ratio) + _CJK_CHARS_PER_TOKEN * ratio

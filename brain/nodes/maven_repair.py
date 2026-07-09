@@ -168,12 +168,21 @@ _DEP_REPAIR_DRIVERS = {
 def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
                                   granted: dict, subtask_results: dict) -> dict:
     """按项目栈分发缺依赖确定性补全 driver。未覆盖栈返回 {}（loud，不静默）。"""
+    # 6.9-RF3：detect_stack 真实画像字段是 build（值=maven/gradle/pip/go/cargo…，
+    # _MANIFEST_BACKEND 口径）——旧键列表 ("build_system","backend","primary") 没有一个
+    # 存在于真实 schema，正常 E2E（画像必在）时 A2 治本被静默关闭、只有无画像才恢复
+    # 旧行为，与设计意图恰好相反（复核活体实证）。build_system 保留兼容测试/外部注入。
     _keys = []
     if isinstance(project_stack, dict):
-        for k in ("build_system", "backend", "primary"):
+        for k in ("build", "build_system"):
             v = str(project_stack.get(k) or "").strip().lower()
             if v:
                 _keys.append(v)
+        # backend 值是自由文本（如 "Spring Boot 2.x (java)"）——不能整串当键，
+        # 按 driver 键做子串探测兜底（"maven" in backend 之类），仍是确定性分发。
+        _backend = str(project_stack.get("backend") or "").strip().lower()
+        if _backend:
+            _keys.extend(dk for dk in _DEP_REPAIR_DRIVERS if dk in _backend)
     if not _keys:
         _keys = ["maven"]  # 无画像时保留旧行为（Maven 是既有唯一实现）
     for k in _keys:

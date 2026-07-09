@@ -36,6 +36,10 @@ class MergeResult:
     rebase_subtask_ids: list[str] = field(default_factory=list)
     # D11：硬冲突的标记渲染（诊断专用）——merged_diff 保持可 apply，毒标记绝不下行
     conflict_render: str = ""
+    # 6.9-HF3：rebase 来源标记（sid → "new_file"|"three_way"）。over_limit 终点按来源分流：
+    # new_file=选中版已在 merged_diff（丢的是落选写者版本）→ D7 口径 abandoned+PARTIAL 继续
+    # 交付；three_way=真源码 hunk 被丢 → escalate。缺省视作 three_way（fail-closed）。
+    rebase_origin: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -474,18 +478,25 @@ def apply_hunk(lines: list[str], hunk: _Hunk) -> list[str]:
     result = lines[:idx]
     src_idx = idx
     for raw in hunk.lines[1:]:
-        if not raw:
-            continue
         if raw.startswith("\\ No newline"):
             continue
+        if not raw:
+            # 6.9-RF4①：空串=空白 context 行（LLM 常见产出形态，与 _format_file_patch 的
+            # ""→" " 归一对齐）。旧行为跳过且不推进 src_idx → 游标错位，后续第一条
+            # context/删除行必误抛 HunkContextMismatch（干净 3-way 被假阳性打落 rebase）。
+            raw = " "
         tag = raw[0]
         content = raw[1:] if len(raw) > 1 else ""
         if tag in (" ", "-"):
             _base_line = lines[src_idx] if src_idx < len(lines) else None
-            if _base_line is None or _base_line.rstrip("\n") != content.rstrip("\n"):
+            # 6.9-RF4②：比对剥 \r\n（CRLF base × LF diff 混合行尾是真实形态非漂移）；
+            # 异常消息与比对同口径（旧消息 rstrip() 全剥，误判时打出两个"相同"串无法排障）。
+            _exp = content.rstrip("\r\n")
+            _got = _base_line.rstrip("\r\n") if _base_line is not None else None
+            if _got is None or _got != _exp:
                 raise HunkContextMismatch(
                     f"hunk@{hunk.old_start} {'context' if tag == ' ' else 'delete'} 行与 base 不符: "
-                    f"expect={content.rstrip()!r} got={(_base_line or '<EOF>').rstrip()!r}")
+                    f"expect={_exp!r} got={('<EOF>' if _got is None else _got)!r}")
         if tag == " ":
             result.append(content if content.endswith("\n") else content + "\n" if content else "\n")
             src_idx += 1
@@ -1024,6 +1035,7 @@ def merge_diffs(
     conflicts: list[MergeConflict] = []
     auto_resolved_files: list[str] = []
     rebase_subtask_ids_all: list[str] = []   # 全局累加需要 rebase 重生成的子任务 ID
+    rebase_origin_all: dict[str, str] = {}   # 6.9-HF3：sid → "new_file"|"three_way"（终点分流）
     conflict_render_parts: list[str] = []    # D11：硬冲突渲染（诊断专用，绝不进 merged_diff）
     merged_parts: list[str] = []
 
@@ -1134,6 +1146,9 @@ def merge_diffs(
                     # D2（阶段6，登记册 §五）：非选中写者不再静默丢——并入 rebase 通道
                     # （merge 后该文件已在树，重派 worker 在其上重生成；账面不再假成功）。
                     rebase_subtask_ids_all.extend(_dropped_new_sids)
+                    # 6.9-HF3：标记来源=new_file（选中版已交付，超限终点走 abandoned 非 escalate）
+                    for _ds in _dropped_new_sids:
+                        rebase_origin_all.setdefault(_ds, "new_file")
                     logger.warning(
                         "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，其余 %s 进 rebase"
                         "重生成（D2：不再静默丢弃）",
@@ -1208,6 +1223,8 @@ def merge_diffs(
                 )
                 # 记录 rebase 子任务
                 rebase_subtask_ids_all.extend(rebase_sids)
+                for _rs in rebase_sids:  # 6.9-HF3：真源码 hunk 被丢 → three_way（超限走 escalate）
+                    rebase_origin_all[_rs] = "three_way"
                 logger.info(
                     "[MERGE] rebase 策略: 文件 %s, 保留 %s 的 diff, 标记 %s 待 rebase 重生成",
                     file_path, base_sid, rebase_sids,
@@ -1257,6 +1274,7 @@ def merge_diffs(
         auto_resolved_files=auto_resolved_files,
         rebase_subtask_ids=list(dict.fromkeys(rebase_subtask_ids_all)),
         conflict_render="\n\n".join(conflict_render_parts),
+        rebase_origin=dict(rebase_origin_all),
     )
 
 

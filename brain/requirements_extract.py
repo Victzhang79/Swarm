@@ -389,6 +389,8 @@ async def extract_requirements(state: BrainState) -> dict:
 
     items: list[dict] = []
     rejected: list[dict] = []
+    best_items: list[dict] = []       # 6.9-HF4：历史最优轮（跨轮单调保优）
+    best_rejected: list[dict] = []
     retry_feedback = ""
     llm_error: str | None = None
 
@@ -417,6 +419,11 @@ async def extract_requirements(state: BrainState) -> dict:
 
         raw_items = raw.get("items") if isinstance(raw, dict) else raw
         items, rejected = validate_requirement_items(raw_items, source_text)
+        # 6.9-HF4：跨轮保优——F5 重抽轮可能比上一轮更差（更少条目甚至零合法），旧行为
+        # 直接覆盖=好轮次被坏轮次 clobber（首轮 8 条真需求可被末轮空清单整体蒸发，
+        # 下游覆盖闸对空 items 整体跳过）。收尾采用最优轮，保证结果对轮次单调不减。
+        if len(items) > len(best_items):
+            best_items, best_rejected = items, rejected
         if items:
             # F5（阶段6，登记册 §七）：轮级质量闸——旧行为首轮非空即收，抽 3 条也过
             # （PRD 万字только 3 条=明显漏抽，下游覆盖闸对着残缺清单空转）。启发式下限=
@@ -445,6 +452,12 @@ async def extract_requirements(state: BrainState) -> dict:
             f"{_rejected_summary(rejected) or '空清单'}。"
             "source_quote 必须从需求文本逐字复制，请重新抽取】\n"
         )
+
+    if len(best_items) > len(items):
+        logger.warning(
+            "[EXTRACT_REQ] 6.9-HF4 末轮（%d 条）劣于历史最优轮（%d 条）→ 采用最优轮结果",
+            len(items), len(best_items))
+        items, rejected = best_items, best_rejected
 
     if truncated:
         for it in items:

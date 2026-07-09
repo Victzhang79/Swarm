@@ -63,8 +63,11 @@ _BODY_MARK_RE = re.compile(
 
 # ═══════════════════════ schema 校验（纯函数） ═══════════════════════
 
-def _reject(rejected: list[dict[str, Any]], item: Any, reason: str) -> None:
-    rejected.append({"spec": item, "reason": reason})
+def _reject(rejected: list[dict[str, Any]], item: Any, reason: str,
+            category: str = "quality") -> None:
+    # 6.9-HF10：category 区分【质量拒绝】（schema 非法/悬空 req_id——真生成失控信号）
+    # 与【政策性截断】（超帽轮转截断——生成合法只是装不下），degraded 只对 quality 记。
+    rejected.append({"spec": item, "reason": reason, "category": category})
 
 
 def _validate_path(path: Any) -> str | None:
@@ -320,7 +323,8 @@ def validate_assertions(
         _dropped = [it for lst in _by_req.values() for it in lst]
         for it in _dropped:
             _reject(rejected, it,
-                    f"超出断言总帽 MAX_ASSERTIONS={MAX_ASSERTIONS}（req 分桶轮转后截断）")
+                    f"超出断言总帽 MAX_ASSERTIONS={MAX_ASSERTIONS}（req 分桶轮转后截断）",
+                    category="truncated")
         valid = _selected
     return valid, rejected
 
@@ -548,7 +552,10 @@ def smoke_login_cmd() -> str | None:
     """D8①：冒烟内登录取 token 的 shell 片段（运维显式配置才启用，未配置返回 None）。
 
     env：SWARM_SMOKE_LOGIN_PATH（如 /api/auth/login）、SWARM_SMOKE_LOGIN_BODY_JSON
-    （登录凭据 JSON，绝不入库/日志只进沙箱进程环境）、SWARM_SMOKE_TOKEN_FIELD
+    （登录凭据 JSON；6.9-RF6 如实说明：凭据经 shlex.quote 内联进脚本文本随 run_command
+    下发——沙箱 SDK 无 env 注入通道，沙箱侧命令日志/ps 可见该串。故此处只应配【冒烟
+    专用一次性账号】，绝不配生产凭据；本仓侧不落库、不打印脚本、token 本体不回显）、
+    SWARM_SMOKE_TOKEN_FIELD
     （响应 JSON 提字段路径，点号分隔，默认 "token"）。片段把 token export 为
     SWARM_SMOKE_TOKEN 供 bearer 断言的 Authorization 头引用；登录失败 export 空串
     （bearer 断言将得 401/000 → 判定侧如实 fail/infra，不假绿）。"""

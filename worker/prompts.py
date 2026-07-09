@@ -288,6 +288,10 @@ def build_worker_prompt(
     # A4(round11)：重试时把 brain 失败诊断作为硬约束块前置到描述，防换模型重试仍重蹈同类错。
     _desc = subtask.description
     _rg = (getattr(subtask, "retry_guidance", "") or "").strip()
+    # 6.9-Rp5：渲染侧封顶——最大写者是 D4 rebase 注入（≤8000 字符），failure 各分支自律
+    # 截断但此处是最后闸口；小模型 prefill 被诊断块挤爆比丢尾部更伤。
+    if len(_rg) > 6000:
+        _rg = _rg[:6000] + "\n…（诊断块超长已截断）"
     if _rg:
         _desc = (
             "⚠️【上次失败的诊断与硬约束 — 必须遵守，否则重蹈覆辙】\n"

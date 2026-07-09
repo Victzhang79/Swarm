@@ -1320,7 +1320,11 @@ def _subtask_signature(st) -> tuple:
     sc = getattr(st, "scope", None)
     writable = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
     creates = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
-    return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
+    # 6.9-HF9：剥离 dedupe_module_scaffolds 的机器追加段（[MERGED-DUP] 定界符之后）——
+    # 它随每轮 LLM dup 集漂移，混进签名会把语义未变的子任务误判"变了"→完成态被外科剪掉。
+    from swarm.brain.contract_utils import MERGED_DUP_DELIM as _MD
+    _desc = (getattr(st, "description", "") or "").split(_MD, 1)[0].strip()
+    return (getattr(st, "id", ""), _desc, writable, creates)
 
 
 def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> dict[str, set]:
@@ -3317,6 +3321,15 @@ def merge(state: BrainState) -> dict:
             # D3（阶段6，登记册 §五）：clean-accept 的前提论证只对【聚合/模块清单】成立
             # （post-pass reconcile 只兜清单 ground-truth）——普通源文件被丢 hunk 没有任何
             # 兜底，接受=静默丢源码。逐 sid 检查其触碰文件，含非清单文件则不接受走 escalate。
+            # 6.9-F1：subtask_diffs 是 list[tuple[sid,diff]]（非 dict）——按 sid 查须先建索引，
+            # 否则 .get 直接 AttributeError（D3 分支无 try 保护=节点崩溃出图）。
+            _diffs_by_sid = dict(subtask_diffs)
+            # 6.9-HF3：按 rebase 来源分流终点。new_file=选中写者版本已在 merged_diff，丢的
+            # 只是本 sid 的落选版本 → D7 口径 abandoned+PARTIAL 继续交付（旧行为静默丢但交付，
+            # D2 后若一律 escalate 反而把可交付任务判死）；three_way=真源码 hunk 被丢，才配
+            # 走 D3 判定（清单 clean-accept / 非清单 escalate）。缺省按 three_way fail-closed。
+            _origin = getattr(result, "rebase_origin", None) or {}
+            _ol_newfile = [s for s in over_limit if _origin.get(s) == "new_file"]
             _d3_non_manifest: dict[str, list[str]] = {}
             if not result.conflicts and result.merged_diff.strip():
                 from swarm.brain.merge_engine import (
@@ -3325,7 +3338,9 @@ def merge(state: BrainState) -> dict:
                 )
                 from swarm.project.diff_apply import files_from_unified_diff as _d3_files
                 for _sid in over_limit:
-                    _fs = _d3_files(subtask_diffs.get(_sid) or "")
+                    if _sid in _ol_newfile:
+                        continue  # 6.9-HF3：new_file 来源不参与 D3 非清单判死
+                    _fs = _d3_files(_diffs_by_sid.get(_sid) or "")
                     _bad = [f for f in _fs
                             if not (_is_aggregate_manifest(f) or _is_module_manifest(f))]
                     if _bad:
@@ -3339,6 +3354,17 @@ def merge(state: BrainState) -> dict:
                 )
                 out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
                 out["merge_rebase_dropped"] = over_limit
+                if _ol_newfile:
+                    # 6.9-HF3：new_file 来源超限——本 sid 落选版本被丢（选中版已交付）→
+                    # abandoned+pop（终态诚实 PARTIAL 列明），账面不再假 DONE。
+                    out["abandoned_subtask_ids"] = sorted(
+                        set(state.get("abandoned_subtask_ids") or [])
+                        | set(out.get("abandoned_subtask_ids") or [])
+                        | set(_ol_newfile))
+                    _sr_after_nf = dict(out.get("subtask_results") or subtask_results)
+                    for _nf_sid in _ol_newfile:
+                        _sr_after_nf.pop(_nf_sid, None)
+                    out["subtask_results"] = _sr_after_nf
                 # rebase_subtask_ids 维持 [](上方默认)、不设 failure_escalated → after_merge 路由 VERIFY_L2
                 # hunter F1 治本：这是【另一个终局交付出口】——接受 base 版干净 merged_diff 直交 VERIFY_L2，
                 # 文件【不会】被重生成，故必须与上方主干等同地扫密钥；命中 CRITICAL→escalate 覆盖本"接受"
@@ -3375,7 +3401,8 @@ def merge(state: BrainState) -> dict:
             if _st is None:
                 continue
             try:
-                _touched = set(_d4_files(subtask_diffs.get(sid) or ""))
+                # 6.9-F2：同 F1——list 上 .get 必抛，且旧 except pass 静默吞掉=D4 整体死代码。
+                _touched = set(_d4_files(dict(subtask_diffs).get(sid) or ""))
                 _kept_segs = [
                     seg for seg in ("diff --git " + p_
                                     for p_ in (result.merged_diff or "").split("diff --git ")[1:])
@@ -3388,8 +3415,9 @@ def merge(state: BrainState) -> dict:
                         "请把你的改动叠加其上，绝不回退/覆盖这些已保留变更：\n"
                         + "\n".join(_kept_segs)[:6000]
                     )[:8000]
-            except Exception:  # noqa: BLE001 — 注入是增益，失败不阻断重派
-                pass
+            except Exception as _d4_e:  # noqa: BLE001 — 注入是增益，失败不阻断重派
+                # 6.9-F2：增益失败必须可观测——旧裸 pass 把 D4 整体哑死 0 留痕（复核实证）。
+                logger.warning("[MERGE] D4 retry_guidance 注入失败（sid=%s）：%s", sid, _d4_e)
         out["subtask_results"] = remaining_results
         out["dispatch_remaining"] = dispatch_remaining
 
@@ -3843,7 +3871,26 @@ def _deliver_review_payload(state: BrainState) -> dict:
         },
         "coverage": coverage,
         "degraded_reasons": list(state.get("degraded_reasons") or []),
+        # 6.9-HF5：C4 needs_review 接线——l1_pipeline 写进 l1_details 后此前全仓零消费
+        # （死键，3.8 教训重演）。聚合"非空 diff 但零 test/verify 命令=语义正确性零覆盖"
+        # 的子任务清单进人工闸视野；缺键/旧 checkpoint → []（加法安全）。
+        "needs_review": _collect_needs_review(state),
     }
+
+
+def _collect_needs_review(state: BrainState) -> list[dict]:
+    """C4：从 subtask_results 聚合 l1_details.needs_review 标记（缺键容错，限量）。"""
+    try:
+        from swarm.brain.nodes.shared import l1_details_of
+        out: list[dict] = []
+        for sid, res in (state.get("subtask_results") or {}).items():
+            _reason = (l1_details_of(res) or {}).get("needs_review")
+            if _reason:
+                out.append({"subtask_id": sid, "reason": str(_reason)[:120]})
+        return out[:_DELIVER_ASSERT_ROWS_MAX]
+    except Exception as exc:  # noqa: BLE001 — payload 组装失败=人工闸打不开，绝不抛
+        logger.warning("[DELIVER] needs_review 聚合失败(降级为空): %s", exc)
+        return []
 
 
 def deliver(state: BrainState) -> dict:

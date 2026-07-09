@@ -1635,10 +1635,12 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
                     _intra_module_dups[f"{_base_mod}:{name}"] = \
                         _intra_module_dups.get(f"{_base_mod}:{name}", 0) + 1
                 elif changed:
+                    # 6.9-Rp7：D10 后本分支仅 ""-桶（双方缺 module 字段的兜底并集）可达，
+                    # 措辞如实（跨模块同名已各自独立成条，不再进这里）。
                     logger.info(
-                        "[CONTRACT_MERGE] %s '%s' 同名多版 → 并集合并(不丢方法/字段)："
-                        "首版 module=%s 并入 module=%s",
-                        key_label, name, _base_mod, _item_mod,
+                        "[CONTRACT_MERGE] %s '%s' 无 module 归属的同名多版 → ""桶并集合并"
+                        "(不丢方法/字段，兜底旧全局语义)",
+                        key_label, name,
                     )
         if _intra_module_dups:
             _total = sum(_intra_module_dups.values())

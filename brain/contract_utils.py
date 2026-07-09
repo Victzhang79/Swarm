@@ -1140,6 +1140,10 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
     }
 
 
+# 6.9-HF9：dedupe_module_scaffolds 机器追加段的固定定界符（签名剥离锚点，勿改措辞）
+MERGED_DUP_DELIM = "\n[MERGED-DUP]；（并入重复脚手架语义）"
+
+
 def _union_keep_order(*lists) -> list:
     seen: set = set()
     out: list = []
@@ -1203,8 +1207,11 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
                 canon.acceptance_criteria = _ac
             _dd = (getattr(dup, "description", "") or "").strip()
             if _dd and _dd not in (getattr(canon, "description", "") or ""):
+                # 6.9-HF9：机器追加段用固定定界符——_subtask_signature 含 description 全文，
+                # 两轮 replan 的 dup 集不同（常态）会使 canon 描述串漂移 → 签名不等 →
+                # 外科 reset 把已完成态/配额表误剪（白重跑）。签名侧按定界符剥机器段。
                 canon.description = ((getattr(canon, "description", "") or "")
-                                     + f"；（并入重复脚手架语义）{_dd}")[:2000]
+                                     + f"{MERGED_DUP_DELIM}{_dd}")[:2000]
             drop_to_canon[dup.id] = canon.id
             merged += 1
     if not merged:
@@ -1223,6 +1230,34 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
     logger.info("[ELABORATE] 重复模块脚手架合并：%d 个重复脚手架并入 canonical(杜绝冗余地基,治严重文件冲突)",
                 merged)
     return merged
+
+
+def _graph_has_cycle(graph: dict) -> bool:
+    """迭代三色 DFS 判环（只走 graph 内节点；确定性，无递归深度风险）。"""
+    white, gray, black = 0, 1, 2
+    color = dict.fromkeys(graph, white)
+    for root in graph:
+        if color[root] != white:
+            continue
+        stack = [(root, iter(graph[root]))]
+        color[root] = gray
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                if nxt not in graph:
+                    continue
+                if color[nxt] == gray:
+                    return True
+                if color[nxt] == white:
+                    color[nxt] = gray
+                    stack.append((nxt, iter(graph[nxt])))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = black
+                stack.pop()
+    return False
 
 
 def fix_dependency_ordering(plan: TaskPlan) -> bool:
@@ -1271,6 +1306,29 @@ def fix_dependency_ordering(plan: TaskPlan) -> bool:
             if _kept_deps != _deps:
                 st.depends_on = _kept_deps
                 changed = True
+
+    # 6.9-HF8：D15 保留 scaffold→scaffold 边 + dedupe_module_scaffolds 的 depends_on 并集
+    # 可能【新造环】；旧规则2 的无条件清空恰是天然破环器，D15 拆掉后环会存活到
+    # plan_validator 硬失败 → replan（LLM 大概率复现同环）→ 熔断烧钱。此处确定性破环：
+    # 仅在脚手架子图真成环时，按子任务原序剥【后向边】（与 plan_batch 的
+    # break_dependency_cycles 同法）；无环时一条不动（D15 语义零回归）。
+    if scaffold_ids:
+        _pos = {st.id: i for i, st in enumerate(subs)}
+        _sg = {st.id: [d for d in (getattr(st, "depends_on", None) or []) if d in scaffold_ids]
+               for st in subs if st.id in scaffold_ids}
+        if _graph_has_cycle(_sg):
+            for st in subs:
+                if st.id not in scaffold_ids:
+                    continue
+                _deps = list(getattr(st, "depends_on", None) or [])
+                _nd = [d for d in _deps
+                       if not (d in scaffold_ids and _pos.get(d, -1) > _pos[st.id])]
+                if _nd != _deps:
+                    logger.warning(
+                        "[PLAN-NORM] 6.9-HF8 脚手架依赖成环，确定性剥后向边：%s 剥 %s",
+                        st.id, sorted(set(_deps) - set(_nd)))
+                    st.depends_on = _nd
+                    changed = True
 
     # 规则 3：SQL 依赖所有实体(无 java 则兜底依赖脚手架),并纳入实体 readable
     target = java_ids or sorted(scaffold_ids)

@@ -220,20 +220,13 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     _dl = (merged_diff or "").lower()
                     _missing = [x for x in _csyms(_sc) if x.lower() not in _dl]
                     if _missing and plan_obj is not None:
-                        _owners = sorted({
-                            st.id for st in plan_obj.subtasks
-                            if st.id in subtask_results and any(
-                                _sym.lower() in (
-                                    (getattr(st, "description", "") or "") + " "
-                                    + " ".join(getattr(st, "acceptance_criteria", None) or [])
-                                    + " " + _json.dumps(getattr(st, "contract", None) or {},
-                                                        ensure_ascii=False)
-                                ).lower()
-                                for _sym in _missing)})
+                        _owners, _sym_owners = _d5_attribute_owners(
+                            _missing, plan_obj, subtask_results)
                         if _owners:
                             logger.info(
-                                "[VERIFY_L2] D5 契约缺失符号归因 owner=%s（缺失 %s）——"
-                                "定向重派替代全员连坐", _owners, _missing[:10])
+                                "[VERIFY_L2] D5 契约缺失符号归因 owner=%s（symbol→owner=%s）——"
+                                "定向重派替代全员连坐", _owners,
+                                {k: v[:3] for k, v in list(_sym_owners.items())[:10]})
                             _ctr_failed = _owners
                 except Exception as _exc:  # noqa: BLE001 — 归因失败回退全员，绝不漏修
                     logger.warning("[VERIFY_L2] D5 契约归因失败回退全员: %s", _exc)
@@ -995,10 +988,13 @@ def _accept_design_context(state: BrainState, derivation) -> str:
         # 优先抽【路由承载段】：按 diff 段过滤含端点/路由特征行（@RequestMapping/@app.route/
         # router./URL 字面量等，栈无关关键词面）的文件段，配额内拼接；无命中回退旧节选。
         _segs = ["diff --git " + p_ for p_ in diff.split("diff --git ")[1:]] or [diff]
+        # 6.9-HF11：补前端路由定义 marker（Vue Router 的 createRouter({routes:[{path:'/x'}]})
+        # 零命中会使后端段命中后前端路由段被排除出 evidence，页面断言无据可指）。
         _route_markers = ("mapping(", "@getmapping", "@postmapping", "@putmapping",
                           "@deletemapping", "@requestmapping", "@app.route", "@router",
                           "router.", "app.get(", "app.post(", "app.use(", "urlpatterns",
-                          "@controller", "@restcontroller", "path(", "route(")
+                          "@controller", "@restcontroller", "path(", "route(",
+                          "createrouter(", "routes:", "path:")
         _route_segs = [g for g in _segs if any(k in g.lower() for k in _route_markers)]
         _budget = 6000
         _picked: list[str] = []
@@ -1078,11 +1074,19 @@ async def _generate_acceptance_assertions(
             )
 
         degraded: list[str] = []
-        info: dict = {"generated": len(valid), "rejected": len(rejected)}
-        if rejected:
+        # 6.9-HF10：分列【质量拒绝】与【政策性截断】——旧行为混计使人工闸/L6 把
+        # "分桶截断 N 条"误读成"生成失控 N 条"（政策截断非质量信号）。
+        _quality = [r for r in rejected if r.get("category", "quality") != "truncated"]
+        _truncated = [r for r in rejected if r.get("category") == "truncated"]
+        info: dict = {"generated": len(valid), "rejected": len(_quality),
+                      "truncated": len(_truncated)}
+        if _truncated:
+            info["truncated_reasons"] = [str(r.get("reason", ""))[:120]
+                                         for r in _truncated[:5]]
+        if _quality:
             # 被拒条目不静默丢（"仅条件写无人清"历史 bug 模式）：计数入 degraded + 原因入 info
-            degraded.append(f"acceptance_generation:rejected={len(rejected)}")
-            info["rejected_reasons"] = [str(r.get("reason", ""))[:120] for r in rejected[:10]]
+            degraded.append(f"acceptance_generation:rejected={len(_quality)}")
+            info["rejected_reasons"] = [str(r.get("reason", ""))[:120] for r in _quality[:10]]
         if not valid:
             reason = f"llm_failed:{llm_error}" if llm_error and not rejected \
                 else "all_rejected_or_empty"
@@ -1146,6 +1150,43 @@ def _run_accept_phase(
                 "_degraded": "acceptance_skipped:accept_phase_error"}
 
 
+def _d5_attribute_owners(missing: list, plan_obj, subtask_results: dict) -> tuple:
+    """6.9-HF7/RF5：契约缺失符号 → owner 逐符号词边界归因。
+
+    裸子串匹配会让 URL 末段泛词（"list"/"add"）误命中 "blacklist"/"listener" 描述；
+    更险的是真 owner 描述没写符号 → owners 非空但不含真 owner → 定向重派永不修复 →
+    contract_retry 打满 escalate（旧全员连坐反而能自愈）。词边界=非字母数字下划线邻接；
+    任一符号归因不出 → 整体回退全员认领 + loud 留痕（无主符号绝不静默无人修）。
+    返回 (owners, symbol→owners 映射)。"""
+    import json as _json
+    import re as _re
+    corpus = {
+        st.id: (
+            (getattr(st, "description", "") or "") + " "
+            + " ".join(getattr(st, "acceptance_criteria", None) or [])
+            + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
+        ).lower()
+        for st in plan_obj.subtasks if st.id in subtask_results
+    }
+    sym_owners: dict = {}
+    unattributed: list = []
+    for sym in missing:
+        pat = _re.compile(
+            r"(?<![0-9A-Za-z_])" + _re.escape(str(sym).lower()) + r"(?![0-9A-Za-z_])")
+        hit = sorted(sid for sid, txt in corpus.items() if pat.search(txt))
+        if hit:
+            sym_owners[sym] = hit
+        else:
+            unattributed.append(sym)
+    owners = sorted({sid for v in sym_owners.values() for sid in v})
+    if unattributed:
+        logger.warning(
+            "[VERIFY_L2] D5 缺失符号 %s 归因不到任何 owner → 回退全员认领"
+            "（无主符号绝不静默无人修）", unattributed[:10])
+        owners = sorted(corpus.keys())
+    return owners, sym_owners
+
+
 def _accept_phase_verdict(
     assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
 ) -> dict:
@@ -1197,6 +1238,11 @@ def _accept_phase_verdict(
                 "_degraded": "acceptance_skipped:assert_tool_missing"}
 
     parsed = parse_probe_output(accept_output or "")
+    # 6.9-HF6：登录段标记消费——token 空（登录路径 404/凭据过期/字段配错/无 python3）
+    # 是【infra 失败】：bearer 断言裸打拿到 401 是结论性应答，但登录坏≠产品坏，判 fail
+    # 会把失败归因到写者子任务白烧重试。该形态下 bearer 行改判 inconclusive（三态先例
+    # MARK_ACCEPT_TOOL_MISSING/S2-F6 同口径），auth=none 行照常判。
+    _login_failed = "__ACCEPT_LOGIN__:empty" in (accept_output or "")
     rows: list[dict] = []
     fail_count = 0
     not_executed = 0
@@ -1213,6 +1259,12 @@ def _accept_phase_verdict(
             row.update({"verdict": "not_executed",
                         "reason": "断言标记缺失（infra/输出截断），未执行"})
             not_executed += 1
+        elif _login_failed and spec.get("auth") == "bearer":
+            row.update({"http_code": entry.get("http_code"),
+                        "verdict": "inconclusive",
+                        "reason": "登录 infra 失败（__ACCEPT_LOGIN__:empty，token 空）——"
+                                  "bearer 断言不判 fail（登录坏≠产品坏）"})
+            inconclusive += 1
         else:
             verdict = evaluate_probe_result(spec, entry.get("http_code"),
                                             entry.get("body_text"))
@@ -1255,9 +1307,10 @@ def _accept_phase_verdict(
     if inconclusive:
         # S2 复核 F6：无 fail 但有 inconclusive（000/超时）→ 诚实不确定 None + degraded
         # （不假绿也不冤枉——连接失败可能是应用瞬时抖动/HEAD 干等等 infra 形态）
+        _inc_reason = ("login_failed" if _login_failed else f"inconclusive={inconclusive}")
         return {"acceptance_passed": None,
                 "acceptance_details": {**details, "reason": "inconclusive"},
-                "_degraded": f"acceptance_skipped:inconclusive={inconclusive}"}
+                "_degraded": f"acceptance_skipped:{_inc_reason}"}
     return {"acceptance_passed": True,
             "acceptance_details": {**details, "reason": "all_passed"}}
 
