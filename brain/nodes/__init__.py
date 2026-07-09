@@ -647,13 +647,17 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
         raise
 
 
-def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
+def _previous_plan_repair_block(prev_plan, prev_baseline, done_cover_ids=None) -> str:
     """R31-3 T3：D09 重试的增量修补块——上一版 plan 摘要 + 修补纪律。
 
     round31 实证：feedback 只列 issue 时 PLAN 每轮全量重拆，issue 集合 13→15→12→14
     震荡不收敛（第 2 轮把第 1 轮已覆盖条目又随机丢了）。给出上一版摘要并显式要求
     "保留已通过部分"，把重试从重掷骰子变成定向修补。prev_plan 缺失/畸形 → ""（首次
     规划/降级路径零注入）。有界：每子任务一行 desc[:60]，总量 6000 字符封顶。
+
+    D1（阶段3.2，2026-07-09 登记册）：done_cover_ids=已由【完成且 L1 通过】子任务覆盖的
+    req id——以硬约束语义注入（这些覆盖背后是真产出，丢了=白烧已付工作；round37 覆盖
+    16→2 的载体正是全量 replan 无保留约束）。None/空=零注入（首次规划不变）。
     """
     subtasks = getattr(prev_plan, "subtasks", None) or []
     if not subtasks:
@@ -677,13 +681,38 @@ def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
     if len(_bl_text) > 1200:
         _bl_text = _bl_text[:1200] + (
             f"…（申报摘要已截断：共 {len(bl)} 条申报，未列出的同样有效且需全部保留）")
+    # D1：已完成(L1 通过)子任务的 covers=硬约束段（有界 3000 字符，超帽自述）
+    _done_text = ""
+    _done = sorted({str(c) for c in (done_cover_ids or []) if str(c).strip()})
+    if _done:
+        _ids_line = ", ".join(_done)
+        if len(_ids_line) > 3000:
+            _ids_line = _ids_line[:3000] + f"…（已截断：共 {len(_done)} 条，未列出的同样是硬约束）"
+        _done_text = (
+            "\n\n【硬约束——已完成工作的覆盖绝不允许丢失】以下需求条目已由【执行完成且 L1 "
+            "校验通过】的子任务覆盖（背后是真实已产出的代码）。新计划必须为每一条保留等价"
+            "子任务（尽量原样保留其 scope 与描述，系统会自动认领已完成产出、不会重跑），"
+            f"或（若确为存量已满足）列入 baseline_covered 申报：\n  {_ids_line}\n")
     return (
         "\n上一版计划摘要（子任务 → covers 声明）：\n" + body
         + (f"\nbaseline_covered 申报: {_bl_text}" if _bl_text else "")
+        + _done_text
         + "\n\n增量修补纪律：以上一版计划为基础定向修补——保留校验未点名问题的子任务拆分、"
         "covers 声明与 baseline_covered 申报，只修正上面点名的问题；"
         "不要全量重拆（重拆会把已覆盖的条目再次随机丢失，白烧重试预算）。\n"
     )
+
+
+def _done_cover_ids_from_state(state) -> list[str]:
+    """D1：当前 plan 中【已完成且 L1 通过】子任务覆盖的 req id 集（排序去重）。
+    pre-dispatch（subtask_results 空）恒 []=注入零变化。"""
+    results = state.get("subtask_results") or {}
+    ids: set[str] = set()
+    for st in (getattr(state.get("plan"), "subtasks", None) or []):
+        out = results.get(getattr(st, "id", "") or "")
+        if out is not None and l1_passed(out):
+            ids.update(str(c) for c in (getattr(st, "covers", None) or []) if str(c).strip())
+    return sorted(ids)
 
 
 def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = False) -> str:
@@ -1318,11 +1347,32 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
             _nst = _new_by_sk[_sk]
             _nid = getattr(_nst, "id", "")
             # 复核 HIGH：仅 scope 相同不够——REVISE/执行 replan 会【改同文件子任务的语义】(描述变
-            # =意图变)。要求【描述也一致】(只 id 被重编号=真同一工作)才认领；描述变则不认领(可能是
-            # 被要求改写的工作，绝不用旧产物静默跳过用户/失败反馈要的改动)。等价于 id-签名去掉 id。
-            if (getattr(_ost, "description", "") or "").strip() != (
-                    getattr(_nst, "description", "") or "").strip():
-                continue
+            # =意图变)。A11（阶段3.2，2026-07-09 登记册）：原判据要求描述【逐字一致】——LLM 重拆
+            # 措辞漂移是默认情形(round37 实证保留率趋近零，L1 已过产出被白重烧)。放宽为三通道，
+            # 意图变护栏不回归（低相似且 covers 不同=意图变，仍拒绝认领）：
+            #   ① 描述逐字一致（原判据）；② covers 集一致且非空（同 scope+同需求=同一工作，
+            #   确定性最强）；③ 描述相似度≥SWARM_REPLAN_CLAIM_DESC_SIM（默认 0.9，纯措辞微调）。
+            _od = (getattr(_ost, "description", "") or "").strip()
+            _nd = (getattr(_nst, "description", "") or "").strip()
+            if _od != _nd:
+                _ocov = {str(c) for c in (getattr(_ost, "covers", None) or [])}
+                _ncov = {str(c) for c in (getattr(_nst, "covers", None) or [])}
+                if _ocov and _ocov == _ncov:
+                    _claim_basis = "covers 集一致"
+                else:
+                    try:
+                        _thr = float(os.environ.get(
+                            "SWARM_REPLAN_CLAIM_DESC_SIM", "0.9") or "0.9")
+                    except ValueError:
+                        _thr = 0.9
+                    import difflib as _difflib
+                    if not (_od and _nd and _difflib.SequenceMatcher(
+                            None, _od, _nd).ratio() >= _thr):
+                        continue
+                    _claim_basis = f"描述相似度≥{_thr}"
+                logger.info(
+                    "[PLAN] A11 认领：'%s'→'%s' scope 唯一一致+%s（措辞漂移不白重烧 L1 产出）",
+                    _oid, _nid, _claim_basis)
             if _nid and _nid not in preserved:
                 preserved[_nid] = _out  # 旧完成态认领到 new_plan 同 scope+同描述子任务(新 id)，免白重做
                 _scope_claimed += 1
@@ -1674,7 +1724,9 @@ async def plan(state: BrainState) -> dict:
             # 看不到"上一版已通过的 covers/baseline 申报"，always-emit 会用漏申报的新
             # 输出覆写 state，覆盖闸门重新失败白烧 D09 重试（最坏复现 round31 式烧光）。
             + _previous_plan_repair_block(
-                state.get("plan"), state.get("baseline_covered"))
+                state.get("plan"), state.get("baseline_covered"),
+                # D1：已完成(L1 过)子任务的 covers 以硬约束注入——replan 绝不丢已付工作的覆盖
+                done_cover_ids=_done_cover_ids_from_state(state))
             + "\n"
             + (sliding_ctx or "")
         )
@@ -1690,7 +1742,9 @@ async def plan(state: BrainState) -> dict:
             f"{_validation_feedback}\n"
             # R31-3 T3：上一版摘要 + 增量修补纪律（治全量重拆掷骰子不收敛）
             + _previous_plan_repair_block(
-                state.get("plan"), state.get("baseline_covered"))
+                state.get("plan"), state.get("baseline_covered"),
+                # D1 对称：校验重试轮通常 pre-dispatch（results 空=零注入）；执行后回炉时同样受保
+                done_cover_ids=_done_cover_ids_from_state(state))
             + "\n"
             + (sliding_ctx or "")
         )
@@ -2187,11 +2241,56 @@ async def validate_plan(state: BrainState) -> dict:
     elif not _req_items:
         logger.info("[VALIDATE_PLAN] requirement_items 缺失/空 — 跳过覆盖矩阵校验（degraded 留痕）")
         _coverage_degraded = ["plan_coverage:skipped(no_requirement_items)"]
+    # 阶段3.1 单调合同：本轮覆盖集（跳过覆盖闸的轮 =None 不写水位——无口径可对账）
+    _wm_cov_ids: list[str] | None = None
+    _wm_lost: list[dict] = []
+    if _coverage_gate_on and _req_items:
+        from swarm.brain.plan_validator import build_coverage_matrix, covered_req_ids
+        _wm_matrix = build_coverage_matrix(plan_obj, _req_items, state.get("baseline_covered"))
+        _wm_cov_ids = covered_req_ids(_wm_matrix)
+        # 相对水位的丢失（与当前清单求交——陈旧 id 过滤，永不误杀）
+        _known_ids = {str(it.get("id") or "").strip() for it in _req_items
+                      if isinstance(it, dict)}
+        _lost_ids = (set(str(x) for x in (state.get("coverage_watermark") or []))
+                     & _known_ids) - set(_wm_cov_ids)
+        if _lost_ids:
+            _txt_by_id = {it["id"]: it["text"] for it in _wm_matrix["items"]}
+            _wm_lost = [{"id": rid, "text": _txt_by_id.get(rid, "")}
+                        for rid in sorted(_lost_ids)]
+
+    def _wm_loss_feedback() -> str:
+        """水位丢失的结构化回灌块（round37 覆盖 16→2 的震荡此前只有 log 可见）——
+        LLM 必须知道这是【倒退】（先前轮已达成），区别于"一直没做"的普通 uncovered。"""
+        if not _wm_lost:
+            return ""
+        _rows = "\n".join(f"  - {e['id']}: {e['text'][:120]}" for e in _wm_lost[:50])
+        _more = f"\n  …另有 {len(_wm_lost) - 50} 条（同样必须恢复）" if len(_wm_lost) > 50 else ""
+        return (
+            f"\n⚠️ 覆盖单调合同违约：以下 {len(_wm_lost)} 条需求在【先前规划轮已达成覆盖】，"
+            "本轮丢失（覆盖绝不允许倒退）。必须恢复等价子任务的 covers 声明，"
+            f"或（若确为存量已满足）以 baseline_covered 重新申报：\n{_rows}{_more}\n")
+
+    if not _coverage_gate_on or not _req_items:
+        pass  # 上方已按跳过分支留痕
     else:
         cov_result = validate_requirement_coverage(
             plan_obj, _req_items, state.get("baseline_covered"))
         for w in cov_result.warnings:
             logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)
+        if cov_result.valid and _wm_lost:
+            # 防御闸（今日全有全无闸下不可达；A6 degraded 放行后 load-bearing）：
+            # 覆盖闸放行但相对水位倒退 → 硬 invalid（单调合同 fail-loud）。
+            logger.warning(
+                "[VALIDATE_PLAN] 单调合同违约：覆盖闸放行但较水位丢失 %d 条（%s）→ 拒绝",
+                len(_wm_lost), [e["id"] for e in _wm_lost[:10]])
+            return {
+                "plan_valid": False,
+                "plan_retry_count": retry_count,
+                "plan_validation_issues": [
+                    f"coverage_watermark 倒退：丢失 {len(_wm_lost)} 条已达成覆盖"],
+                "plan_validation_feedback": _wm_loss_feedback(),
+                "coverage_watermark": _wm_cov_ids,
+            }
         if not cov_result.valid:
             logger.warning(
                 "[VALIDATE_PLAN] 覆盖矩阵校验未通过（%d 条 issue）: %s",
@@ -2212,8 +2311,14 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_valid": False,
                 "plan_retry_count": retry_count,
                 "plan_validation_issues": cov_result.issues,
-                # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划
-                "plan_validation_feedback": _format_validation_feedback(cov_result.issues),
+                # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划；
+                # 阶段3.1：相对水位的丢失以单调合同名义结构化前置（倒退≠一直没做）。
+                "plan_validation_feedback": (
+                    _wm_loss_feedback()
+                    + _format_validation_feedback(cov_result.issues)),
+                # 阶段3.1：失败 attempt 已达成的覆盖也入水位（round37 震荡发生在多轮
+                # attempt 之间——不记则下一轮丢了它无人知晓）。reducer 并集，绝不缩水。
+                "coverage_watermark": _wm_cov_ids,
             }
         _bl_n = len([e for e in (state.get("baseline_covered") or [])
                      if isinstance(e, dict) and str(e.get("reason") or "").strip()])
@@ -2317,6 +2422,8 @@ async def validate_plan(state: BrainState) -> dict:
         # S2-3：覆盖矩阵因 items 缺失被跳过时诚实留痕（degraded_reasons 是 reducer 键，
         # 追加去重；无跳过时不发键，零噪声）。
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
+        # 阶段3.1：本轮覆盖集入水位（跳过覆盖闸的轮不发键——无口径可对账）
+        **({"coverage_watermark": _wm_cov_ids} if _wm_cov_ids is not None else {}),
     }
 
 

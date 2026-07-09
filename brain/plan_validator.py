@@ -400,6 +400,14 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None) -> dic
     }
 
 
+def covered_req_ids(matrix: dict) -> list[str]:
+    """阶段3.1 单调合同：从覆盖矩阵取【本轮已覆盖】req id 集（covers∪合法 baseline），
+    排序去重——coverage_watermark 的唯一口径（与 build_coverage_matrix 同源，防两份事实）。"""
+    ids = {it["id"] for it in (matrix.get("items") or []) if it.get("covered_by")}
+    ids.update(e["id"] for e in (matrix.get("baseline_covered") or []))
+    return sorted(ids)
+
+
 def validate_requirement_coverage(
     plan, requirement_items, baseline_covered=None,
 ) -> PlanValidationResult:

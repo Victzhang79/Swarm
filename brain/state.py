@@ -152,6 +152,13 @@ class BrainState(TypedDict, total=False):
     requirement_items: list[dict]       # S2-2：结构化需求条目 [{id: req-<sha1[:8]>, text, kind, source_quote, source, source_truncated?}]，extract_requirements 节点写（contract_design→plan 之间）；防幻觉=source_quote 回指原文确定性校验，抽取失败如实降级 []
     plan_batch_cache: dict              # R32-1 U2：ULTRA 分批的成功批缓存 {签名: {module, subtasks, baseline}}，plan 节点 always-emit（非分批路径恒 {}，last-write-wins 覆写防陈旧）；只在"上一轮有失败批"的补齐型重试复用——上一轮批全成的纯覆盖分歧重试绝不吃缓存（否则 T3 增量修补/申报永远无法生效）
     baseline_covered: list[dict]        # R31-1 T1：PLAN 申报的"存量已满足"条目 [{id, reason}]，plan 节点 always-emit（未申报=[]，last-write-wins 防跨重试粘滞）；★独立键绝不挂 TaskPlan 字段——plan 变异重构造路径（batched/resplit/revision/水平合并）天然碰不到，结构性防 v0.9.23 F1"变异路径丢字段"类复发★；覆盖校验=covers∪合法申报，申报条目仍生成验收断言（假申报→acceptance_failed 兜底）
+    # 阶段3.1 单调合同脊柱（登记册 §八 阶段3，2026-07-09）：曾在【任意】规划轮达成覆盖的
+    # req id 全集（covers∪合法 baseline 申报，validate_plan 每轮 emit 本轮覆盖集）。
+    # reducer=append+dedup ——【结构性单调不减】：节点 emit 子集也不会让水位缩水（round37
+    # 实证覆盖 16→2 的倒退此前只有 log 可见）。消费：validate_plan 相对水位丢失→结构化
+    # 回灌 D09 feedback + 覆盖闸通过仍倒退时硬 invalid（A6 degraded 放行后 load-bearing
+    # 硬地板）。陈旧 id（清单外）在比对时被过滤，永不误杀；本键绝不需要清空（任务级单调）。
+    coverage_watermark: Annotated[list[str], _merge_degraded_reasons]
     acceptance_assertions: list[dict]   # S2：任务级验收断言 spec [{id, req_id, kind:"http_probe", request, expect, auth}]（task#25 acceptance_spec 写入；声明先行）
     acceptance_passed: bool | None      # S2：验收断言三态结论（None=跳过≠失败，对齐 l3_passed/migration_verify_passed）——verify_runtime accept phase 写入（task#25/26），本批只声明不写入
     acceptance_details: dict[str, Any]  # S2：断言逐条 verdict+证据留痕（deliver 展示/失败回灌数据源）——同上，本批只声明不写入
