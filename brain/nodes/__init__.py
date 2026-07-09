@@ -881,6 +881,41 @@ async def _plan_ultra_batched(
         logger.info("[PLAN-BATCH] U1 超大批切分：%d → %d 批（单批 ≤%d 文件）",
                     _before_split, len(module_batches), _PLAN_BATCH_MAX_FILES)
     total = len(module_batches)
+    # F8+A10②（阶段3.6）：需求条目按模块批确定性预分桶——每批只注入【本批亲和子集+
+    # 横切条目】，治全量注入的 prompt 双线性膨胀（500 条×12 批×重试轮=饱和推手）。
+    # 横切条目（0 亲和）注入所有批并明示可任务级认领（NFR 无文件归属的申报出口）；
+    # 不变量=任一条目至少出现在一个批；分桶失败/无条目 → 回退全量块（零回归）。
+    _cov_blocks_by_module: dict[str, str] = {}
+    try:
+        from swarm.brain.plan_batch import _base_module as _f8_base
+        from swarm.brain.plan_batch import bucket_requirement_items as _f8_bucket
+        _f8_items = state.get("requirement_items") or []
+        if _f8_items:
+            _f8_by_mod, _f8_cross = _f8_bucket(_f8_items, module_batches)
+            _f8_cross_note = ""
+            if _f8_cross:
+                _f8_cross_note = (
+                    "\n- 横切条目提示：清单中 "
+                    + ", ".join(str(c.get("id")) for c in _f8_cross[:50])
+                    + " 为横切需求（无明确模块归属，已注入所有批次）——若本批子任务"
+                    "天然承担（如安全/日志/幂等/性能约束），请在其 covers 中声明；"
+                    "否则留给其他批次或整体校验后的定向补齐。")
+            for _mn, _bf in module_batches:
+                _b = _f8_base(_mn)
+                if _b in _cov_blocks_by_module:
+                    continue
+                _sel = list(_f8_by_mod.get(_b, [])) + list(_f8_cross)
+                _cov_blocks_by_module[_b] = (
+                    _requirement_coverage_prompt_block(_sel, batched=True)
+                    + _f8_cross_note)
+            _f8_sizes = {b: len(v) for b, v in _f8_by_mod.items()}
+            logger.info(
+                "[PLAN-BATCH] F8 需求预分桶：%d 条 → 按模块 %s + 横切 %d 条"
+                "（每批只注入亲和子集，替代全量 %d 条注入）",
+                len(_f8_items), _f8_sizes, len(_f8_cross), len(_f8_items))
+    except Exception as _f8_exc:  # noqa: BLE001 — 分桶 advisory，失败回退全量注入
+        logger.warning("[PLAN-BATCH] F8 预分桶失败回退全量注入: %s", _f8_exc)
+        _cov_blocks_by_module = {}
     logger.info(
         "[PLAN-BATCH] 按模块分批拆解启动：%d 文件 → %d 个模块批（垂直切片，非机械10%%切）",
         len(file_plan), total,
@@ -1013,7 +1048,9 @@ async def _plan_ultra_batched(
             )
             return ("error", i, mod_name, exc, None, len(batch))
         # S2-3：追加需求条目清单 + covers 纪律（items 空时 _cov_block=""，一字不加）
-        prompt_user += _cov_block
+        # F8：优先本批分桶子集块；无分桶（条目空/分桶失败）回退全量块（零回归）
+        from swarm.brain.plan_batch import _base_module as _f8_base_in
+        prompt_user += _cov_blocks_by_module.get(_f8_base_in(mod_name), _cov_block)
         if _skills_blk_batched:
             prompt_user += "\n\n" + _skills_blk_batched
         async with _plan_sem:

@@ -449,6 +449,60 @@ def _base_module(name: str) -> str:
     return str(name or "").split("~")[0].split("#")[0]
 
 
+def _item_module_affinity(text: str, base_name: str, files: list) -> int:
+    """F8（阶段3.6）：需求条目文本 ↔ 模块批的确定性亲和度。
+    模块名整串子串命中=3（中文模块名天然可路由）；模块名分段（-_/ 切）命中各+1；
+    批内文件名 stem（≥4 字符）命中各+2。0=与本批无关。"""
+    low = str(text or "").lower()
+    if not low:
+        return 0
+    score = 0
+    b = str(base_name or "").lower()
+    if len(b) >= 2 and b in low:
+        score += 3
+    import re as _re
+    for part in _re.split(r"[-_/]", b):
+        if len(part) >= 3 and part in low:
+            score += 1
+    for f in (files or []):
+        p = f.get("path") if isinstance(f, dict) else str(f)
+        stem = str(p or "").replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        if len(stem) >= 4 and stem in low:
+            score += 2
+    return score
+
+
+def bucket_requirement_items(
+    items: list[dict], module_batches: list[tuple[str, list]],
+) -> tuple[dict[str, list[dict]], list[dict]]:
+    """F8+A10②（阶段3.6，2026-07-09 登记册）：需求条目按模块批确定性预分桶。
+
+    返回 (by_module, cross)：by_module={base 模块: [亲和条目]}（条目可属多模块）；
+    cross=对【所有】批 0 亲和的横切/不可路由条目——注入所有批并明示可任务级认领
+    （NFR 无文件归属→无批 covers 的 A10 死角出口）。不变量：任一条目至少出现在
+    一个批（cross 进全部批）；module_batches 空=全部按 cross 处理（安全回退=等效
+    原全量注入行为）。治 prompt 双线性膨胀：每批只注入本批亲和子集+横切。"""
+    valid = [it for it in (items or [])
+             if isinstance(it, dict) and str(it.get("id") or "").strip()]
+    if not valid:
+        return {}, []
+    if not module_batches:
+        return {}, list(valid)
+    bases = [( _base_module(n), f) for n, f in module_batches]
+    by_module: dict[str, list[dict]] = {}
+    cross: list[dict] = []
+    for it in valid:
+        text = str(it.get("text") or "")
+        routed = False
+        for base, files in bases:
+            if _item_module_affinity(text, base, files) > 0:
+                by_module.setdefault(base, []).append(it)
+                routed = True
+        if not routed:
+            cross.append(it)
+    return by_module, cross
+
+
 def merge_subtask_batches(batch_results: list[list[dict]],
                           batch_modules: list[str] | None = None,
                           module_deps: dict[str, list[str]] | None = None) -> list[dict]:
