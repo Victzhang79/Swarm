@@ -1000,8 +1000,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         fc = details.get("failure_class")
         if fc:
             return fc
-        # 兜底：summary/error 文本再分类一次（worker 未显式标注时）
-        return classify_failure(summary or details.get("error"))
+        # 兜底：文本再分类（worker 未显式标注时）。B8（2026-07-09 登记册）：error 是原始
+        # 异常文本（最可靠）优先判，判不出再退叙述性 summary——原 `summary or error` 让
+        # 非空叙述遮蔽 error 里的真 transient 特征，误入 capability 阶梯。
+        return classify_failure(details.get("error")) or classify_failure(summary)
 
     failure_classes = {fid: _failure_class_of(fid) for fid in failed_ids}
     transient_ids = [fid for fid, fc in failure_classes.items() if fc == TRANSIENT]
