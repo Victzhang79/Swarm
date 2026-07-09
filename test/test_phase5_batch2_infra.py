@@ -191,3 +191,16 @@ def test_e13_fresh_suspended_not_notified(monkeypatch):
          patch.object(runner, "_emit_task_notification", MagicMock()):
         n = asyncio.run(runner.check_suspended_ttl())
     assert n == 0, "TTL 内的合法人工等待绝不打扰（不强杀是拍板口径）"
+
+
+# ─────────────── 5.9 猎手 F1（CRITICAL）：进度派生对无 plan 状态安全 ───────────────
+
+def test_f1_progress_derivation_survives_no_plan():
+    """_plan_subtask_ids 无 plan 返回 None——len(None) 曾让每个 fresh/retry 任务在
+    首个节点事件 TypeError 整单 FAILED（测试盲区：批1 只测了 dispatch 回写面）。"""
+    from swarm.brain.runner import _plan_subtask_ids
+    _p_ids = _plan_subtask_ids({})          # fresh submit / retry 清空 plan 的形态
+    _p_total = len(_p_ids) if _p_ids else 0  # 修后表达式（与 runner 同款）
+    assert _p_total == 0
+    assert _plan_subtask_ids({"plan": {}}) is None
+    assert _plan_subtask_ids({"plan": {"subtasks": []}}) is None

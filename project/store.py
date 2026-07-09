@@ -983,6 +983,18 @@ def update_task(
                 params,
             )
             row = cur.fetchone()
+    if row is None and status is not None and not allow_terminal_transition:
+        # 5.9 猎手 F4：CAS 丢写必须可观测——合法晚到写被丢是设计行为，但零日志会让
+        # "任务为什么卡在旧态/token 账没了"无从排查。一次回读留痕（best-effort）。
+        try:
+            _cur_rec = get_task(task_id, conn_str)
+            logger.warning(
+                "[E2] update_task CAS 拒绝：task=%s 想写 status=%s，当前=%s（终态守卫，"
+                "晚到写被丢；若同批携带 token_usage/duration 等字段也一并未写入）",
+                task_id, status, (_cur_rec or {}).get("status"))
+        except Exception:  # noqa: BLE001
+            logger.warning("[E2] update_task CAS 拒绝：task=%s 想写 status=%s（回读失败）",
+                           task_id, status)
     return _row_to_task(row) if row else None
 
 

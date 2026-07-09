@@ -122,12 +122,26 @@ async def apply_project_diff(project_id: str, req: ApplyDiffRequest, request: Re
     if not project or not project.get("path"):
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
+    from swarm.infra.redis_client import ModuleLock
     from swarm.project.diff_apply import apply_git_diff
 
-    result = await loop.run_in_executor(
-        None,
-        lambda: apply_git_diff(project["path"], req.diff or "", check_only=req.check_only),
-    )
+    # 5.9 复核 #10（HIGH）：锁外直写树 sibling——真写须持 runner 同把模块锁（同 E9）。
+    _lk = None
+    if not req.check_only:
+        _lk = ModuleLock(project_id, "default")
+        if not await loop.run_in_executor(None, _lk.acquire):
+            raise HTTPException(
+                status_code=409,
+                detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试",
+            )
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: apply_git_diff(project["path"], req.diff or "", check_only=req.check_only),
+        )
+    finally:
+        if _lk is not None:
+            await loop.run_in_executor(None, _lk.release)
     if not result.get("ok"):
         raise HTTPException(
             status_code=422,

@@ -830,12 +830,27 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
         }
 
     check_only = req.check_only if req else False
+    from swarm.infra.redis_client import ModuleLock
     from swarm.project.diff_apply import apply_git_diff
 
-    result = await loop.run_in_executor(
-        None,
-        lambda: apply_git_diff(project["path"], diff, check_only=check_only),
-    )
+    # 5.9 复核 #10（HIGH）：与 approve 同型的锁外直写树——真写（check_only=False）须持
+    # runner 同把模块锁；check_only 只读校验不加锁。竞争 409（幂等可重试）。
+    _lk = None
+    if not check_only:
+        _lk = ModuleLock(task["project_id"], "default")
+        if not await loop.run_in_executor(None, _lk.acquire):
+            raise HTTPException(
+                status_code=409,
+                detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试",
+            )
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: apply_git_diff(project["path"], diff, check_only=check_only),
+        )
+    finally:
+        if _lk is not None:
+            await loop.run_in_executor(None, _lk.release)
     if not result.get("ok"):
         raise HTTPException(
             status_code=422,

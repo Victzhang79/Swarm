@@ -784,12 +784,23 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
         cm = None
         try:
             from psycopg_pool import AsyncConnectionPool
-            _pool = AsyncConnectionPool(
-                uri, min_size=1, max_size=4, open=False,
-                kwargs={"autocommit": True, "prepare_threshold": 0},
-                check=AsyncConnectionPool.check_connection,
-            )
-            await _pool.open(wait=True, timeout=30)
+            _pool = None
+            try:
+                _pool = AsyncConnectionPool(
+                    uri, min_size=1, max_size=4, open=False,
+                    kwargs={"autocommit": True, "prepare_threshold": 0},
+                    check=AsyncConnectionPool.check_connection,
+                )
+                await _pool.open(wait=True, timeout=30)
+            except Exception:
+                # 5.9 猎手 F6：open 失败的 pool 不自动关闭——后台 worker 无限重连风暴。
+                # best-effort close 后原样上抛（外层按 require_pg 决定 fail-fast/降级）。
+                if _pool is not None:
+                    try:
+                        await _pool.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise
             checkpointer = AsyncPostgresSaver(_pool)
             cm = _pool  # close 侧统一处理（pool.close() / cm.__aexit__ 二选一）
             logger.info("[E6] PG checkpointer 使用连接池（min=1,max=4,check=探活自愈）")
@@ -848,9 +859,11 @@ async def close_postgres_checkpointer() -> None:
     if cm is not None:
         try:
             # E6：pool 形态（AsyncConnectionPool）用 close()；单连接形态用 cm.__aexit__
-            if hasattr(cm, "close") and not hasattr(cm, "__aexit__"):
-                await cm.close()
-            elif hasattr(cm, "close") and cm.__class__.__name__ == "AsyncConnectionPool":
+            try:
+                from psycopg_pool import AsyncConnectionPool as _ACP
+            except ImportError:
+                _ACP = ()  # type: ignore[assignment]
+            if _ACP and isinstance(cm, _ACP):
                 await cm.close()
             else:
                 await cm.__aexit__(None, None, None)

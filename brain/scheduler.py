@@ -333,9 +333,19 @@ async def start_task_scheduler() -> None:
                                 "任务 fail-fast 标 FAILED（修复项目后可 retry）",
                                 task_id, meta["project_id"])
                             try:
+                                from swarm.audit import audit as _audit
+                                from swarm.brain.runner import (
+                                    _emit_task_notification as _notify,
+                                )
                                 from swarm.project import store as _store
                                 await asyncio.to_thread(
                                     _store.update_task, task_id, status="FAILED")
+                                # 5.9 猎手 F8：其余 FAILED 路径都有通知+审计——这条不能静默
+                                _rec = await asyncio.to_thread(_store.get_task, task_id) or {}
+                                _notify(task_id, _rec, "FAILED")
+                                _audit("task_failed", orchestrator="Scheduler",
+                                       task_id=task_id, project_id=meta["project_id"],
+                                       error="project_error_failfast")
                             except Exception as _exc:  # noqa: BLE001
                                 logger.warning("[Scheduler] ERROR 项目任务标 FAILED 失败: %s", _exc)
                             _admission_retries.pop(task_id, None)

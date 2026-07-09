@@ -75,6 +75,9 @@ def _run_finalize(state):
         calls.setdefault("status", kw.get("status"))
         if "status" in kw:
             calls["status"] = kw["status"]
+        # 语义演进（5.9 复核 #4残留①）：update_task 返回更新后的行；None=CAS 拒绝
+        # （salvage 据此跳过假通知）。桩返回真值表示写入成功。
+        return {"id": tid, **kw}
 
     with patch.object(runner.store, "get_task", return_value={"description": "x", "project_id": "p"}), \
          patch.object(runner.store, "update_task", side_effect=fake_update), \

@@ -78,10 +78,18 @@ def sweep_stale_checkpoints(ttl_days: int | None = None,
                      AND updated_at < now() - make_interval(days => %s)""",
                 (list(_TERMINAL_STATUSES), ttl_days)).fetchall()]
             # 2) 孤儿线程（无任何 task_records 行以【当前 thread 键】认领）。
+            # 5.9 猎手 F2（HIGH）：E1 打破了"旧 thread 永不 resume"前提——retry_prev_thread_id
+            # 指向的旧 thread 是 run_task 播种（保留已 L1 通过产物）的数据源；重启 GC 若先删，
+            # 播种静默归零（E1 在"重启后消费 retry 队列"这个最常见场景失效）。豁免：任一
+            # 【非终态】任务的播种指针仍引用的 thread 不算孤儿（指针在 run_task 一次性消费
+            # 清空后，下轮 GC 照常回收）。
             orphans = [r[0] for r in conn.execute(
                 """SELECT DISTINCT c.thread_id FROM checkpoints c
                    LEFT JOIN task_records t ON COALESCE(t.thread_id, t.id) = c.thread_id
-                   WHERE t.id IS NULL""").fetchall()]
+                   LEFT JOIN task_records t2 ON t2.retry_prev_thread_id = c.thread_id
+                        AND NOT (t2.status = ANY(%s))
+                   WHERE t.id IS NULL AND t2.id IS NULL""",
+                (list(_TERMINAL_STATUSES),)).fetchall()]
             doomed = sorted(set(stale) | set(orphans))
             stats["stale_threads"] = len(stale)
             stats["orphan_threads"] = len(orphans)

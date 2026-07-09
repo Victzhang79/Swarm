@@ -184,11 +184,11 @@ async def _maybe_salvage_watchdog_abort(task_id: str, queue) -> bool:
              else "module_lock_lost")
     logger.warning("[RUNNER] 任务 %s 被 watchdog 护栏中止（%s），尝试抢救已完成产物",
                    task_id, _kind)
-    await _salvage_partial_from_checkpoint(
+    await asyncio.shield(_salvage_partial_from_checkpoint(
         task_id, queue,
         reason_code=_kind,
         reason_msg=f"watchdog 护栏中止（{_kind}）: {str(_wd_exc)[:200]}",
-    )
+    ))
     return True
 
 # task_id → asyncio.Task 句柄（用于 cancel）
@@ -479,6 +479,7 @@ async def _stream_brain_events(
         subtask_count=_subtask_n,
     )
     progress = 10
+    _progress_plan_gen: int | None = None  # F5：进度单调的计划代际界
     # P1-B：本次执行段墙钟起点 + 弹性预算。每个图事件循环顶检查；超【弹性】上限 → raise →
     # 归一化 FAILED + 释放资源。★弹性随规划揭示的子任务数动态放宽，绝不误杀合法大型任务★。
     _wc_cfg = get_config()
@@ -536,7 +537,13 @@ async def _stream_brain_events(
         try:
             while True:
                 await asyncio.sleep(15.0)
-                _eff = _effective_deadline_s(_wc_base_s, _wc_per_subtask_s, _wc_subtasks)
+                # 5.9 猎手 F3（MEDIUM）：tick 内任何非预期异常（renew 未吞的意外/配置读取）
+                # 绝不让 watchdog 静默死亡——护栏死了=E4 要治的"静默失锁"换形态回归。
+                try:
+                    _eff = _effective_deadline_s(_wc_base_s, _wc_per_subtask_s, _wc_subtasks)
+                except Exception as _wd_tick_exc:  # noqa: BLE001
+                    logger.error("[E4] watchdog tick 异常（护栏继续跑，下轮重试）: %s", _wd_tick_exc)
+                    continue
                 try:
                     _raise_if_wallclock_exceeded(_wc_start, _eff)
                 except TaskWallclockExceeded as _exc:
@@ -545,18 +552,31 @@ async def _stream_brain_events(
                     if _consumer_task is not None and not _consumer_task.done():
                         _consumer_task.cancel()
                     return
-                _lk = (lock_holder or {}).get("lock") or module_lock
-                if _lk is not None and _renew_pacer.due(_lk)                         and not await asyncio.to_thread(_lk.renew):
-                    logger.warning("[E4] watchdog：任务 %s 模块锁续期失败（防并发写树）→ 取消执行走 salvage", task_id)
-                    _watchdog_abort[task_id] = TaskLockLost(getattr(_lk, "key", str(_lk)))
-                    if _consumer_task is not None and not _consumer_task.done():
-                        _consumer_task.cancel()
-                    return
+                try:
+                    _lk = (lock_holder or {}).get("lock") or module_lock
+                    if _lk is not None and _renew_pacer.due(_lk) \
+                            and not await asyncio.to_thread(_lk.renew):
+                        logger.warning("[E4] watchdog：任务 %s 模块锁续期失败（防并发写树）→ 取消执行走 salvage", task_id)
+                        _watchdog_abort[task_id] = TaskLockLost(getattr(_lk, "key", str(_lk)))
+                        if _consumer_task is not None and not _consumer_task.done():
+                            _consumer_task.cancel()
+                        return
+                except Exception as _wd_renew_exc:  # noqa: BLE001 — F3：意外异常不杀护栏
+                    logger.error("[E4] watchdog 锁续期段异常（护栏继续跑）: %s", _wd_renew_exc)
         except asyncio.CancelledError:
             return
 
     _stop_watchdog(task_id)  # 防上次残留（resume 复用同 task_id）
-    _watchdog_tasks[task_id] = asyncio.create_task(_guard_watchdog())
+    _wd_t = asyncio.create_task(_guard_watchdog())
+
+    def _wd_done(t: "asyncio.Task") -> None:
+        # F3：非取消退出必须 loud（fire-and-forget 的 "never retrieved" 只在 GC 时才响）
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("[E4] watchdog 异常终结（任务 %s 失去墙钟/锁续期护栏）: %s",
+                         task_id, t.exception())
+
+    _wd_t.add_done_callback(_wd_done)
+    _watchdog_tasks[task_id] = _wd_t
 
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
         # P1-B：弹性墙钟闸门——失控任务（replan 空转/卡节点）到点中止，防无上限占沙箱/GPU。
@@ -602,8 +622,18 @@ async def _stream_brain_events(
                 # E10（阶段5，登记册 §六）：进度由 completed/count 派生——旧 min(+4,90)
                 # 与完成度无关（几个节点后恒 90% 挂满全程）。规划期（plan 未知）按节点
                 # 缓慢爬坡帽 25；执行期=15+75×完成占比（单调不回退，帽 90 留给交付段）。
-                _p_total = len(_plan_subtask_ids(_accumulated_state))
+                # 5.9 猎手 F1（CRITICAL）：_plan_subtask_ids 无 plan 返回 None——len(None)
+                # 会让每个 fresh/retry 任务在首个节点事件 TypeError 整单 FAILED。
+                _p_ids = _plan_subtask_ids(_accumulated_state)
+                _p_total = len(_p_ids) if _p_ids else 0
                 if _p_total:
+                    # 5.9 猎手 F5：单调约束以【计划代际】为界——replan 换代（子任务 id 集变）
+                    # 时允许基线重置，否则 max() 把进度钉死在旧高位（用户看 90% 卡死，
+                    # 实际在重做；DB completed 却在掉=两信号打架）。代内保持单调。
+                    _p_gen = hash(frozenset(_p_ids))
+                    if _p_gen != _progress_plan_gen:
+                        _progress_plan_gen = _p_gen
+                        progress = min(progress, 25)  # 换代=回执行起跑线（可观测的诚实回退）
                     _p_done = _count_completed_in_plan(_accumulated_state)
                     progress = max(progress, min(15 + int(75 * _p_done / _p_total), 90))
                 else:
@@ -939,12 +969,14 @@ async def _handle_post_run(
     _rebase_dropped = state.get("merge_rebase_dropped") or []  # 复核 H-1：rebase 超限丢弃的子任务
     _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up ∪ rebase_dropped
     _final_status = "PARTIAL" if _partial_ids else "DONE"
+    # 5.9 猎手 F4：终态写拆两步——记账字段先落（不受 E2 CAS 限制），status 再 CAS。
+    # 否则收尾窗口撞 cancel/reconcile 时整行被拒，token/duration 记账连坐蒸发（§九账本口径受损）。
     store.update_task(
         task_id,
-        status=_final_status,
         token_usage=token_usage,
         duration_seconds=round(duration, 2) if duration is not None else None,
     )
+    store.update_task(task_id, status=_final_status)
     _emit_task_notification(task_id, task_rec, _final_status)
     output_parts = _build_result_payload(state)
     if _partial_ids:
@@ -1084,12 +1116,18 @@ async def _finalize_governor_partial(
                 token_usage[_k] = _prev_tu[_k]
     token_usage["salvage_reason"] = reason_code
     duration = store.compute_task_duration_seconds(_rec)
+    # F4 同款拆两步：记账先落，status 再 CAS
     store.update_task(
         task_id,
-        status="PARTIAL",
         token_usage=token_usage,
         duration_seconds=round(duration, 2) if duration is not None else None,
     )
+    _partial_row = store.update_task(task_id, status="PARTIAL")
+    if _partial_row is None:
+        # 5.9 复核 #4残留①：CAS 拒绝（任务已被 cancel 等推入终态）——不发"部分交付"
+        # 假通知（DB=CANCELLED 而用户收到 PARTIAL=观测面自相矛盾）。
+        logger.warning("[RUNNER] 任务 %s salvage PARTIAL 写被终态守卫拒绝（已是终态），跳过通知", task_id)
+        return
     _emit_task_notification(task_id, _rec, "PARTIAL")
     audit("task_partial", orchestrator="Brain", task_id=task_id,
           project_id=_rec.get("project_id"),
@@ -1118,6 +1156,9 @@ async def _salvage_partial_from_checkpoint(
 
     checkpoint 取不到（PG 抖动/无快照）→ 退回 FAILED（不比旧路径更差，但绝不静默 DONE）。
     """
+    # 5.9 复核 新发现A：先停 watchdog——inline 护栏 raise 后 watchdog 仍活着，
+    # 下一 tick 对"墙钟已超"恒真 → cancel 打进 salvage 中途 → 任务留非终态丢产物。
+    _stop_watchdog(task_id)
     state = await _load_state_snapshot(task_id)
     if not state:
         _rec = store.get_task(task_id) or {}
@@ -1269,10 +1310,20 @@ async def run_task(
                 _prev_state = await _load_state_snapshot(task_id, thread_id=_prev_thread)
                 _prev_results = (_prev_state or {}).get("subtask_results") or {}
                 _kept = {sid: out for sid, out in _prev_results.items() if _e1_l1p(out)}
+                # 5.9 复核 #6：requirement_items 一起播种——extract 节点幂等跳过使
+                # req-id（内容 hash of LLM 复述文本）逐字延续，否则重抽措辞漂移=
+                # id 换代，水位单调合同跨 retry 形同虚设（求交后被静默滤掉）。
+                _ri = (_prev_state or {}).get("requirement_items")
                 _wm = (_prev_state or {}).get("coverage_watermark")
+                if not _kept or (_prev_state or {}).get("plan") is None:
+                    logger.info(
+                        "[E1] retry 播种：上一执行段（thread=%s）无可播种产物"
+                        "（可能被 checkpoint GC 清理/无 L1 通过产物）→ 从零重跑", _prev_thread)
                 if _kept and (_prev_state or {}).get("plan") is not None:
                     initial_state["plan"] = _prev_state["plan"]
                     initial_state["subtask_results"] = _kept
+                    if _ri:
+                        initial_state["requirement_items"] = list(_ri)
                     if _wm:
                         initial_state["coverage_watermark"] = list(_wm)
                     logger.info(
@@ -1328,7 +1379,7 @@ async def run_task(
         _tok_stage = _tok_exc.usage.get("stage")
         logger.warning("[RUNNER] 任务 %s 撞云端 token 预算护栏%s，尝试抢救已完成产物",
                        task_id, f"（阶段={_tok_stage}）" if _tok_stage else "")
-        await _salvage_partial_from_checkpoint(
+        await asyncio.shield(_salvage_partial_from_checkpoint(
             task_id, queue,
             reason_code="token_budget_exceeded",
             reason_msg=(f"云端 token 预算超限 "
@@ -1336,7 +1387,7 @@ async def run_task(
                         + (f"，阶段 {_tok_stage} 子预算烧穿"
                            f"({_tok_exc.usage.get('stage_spent')}/{_tok_exc.usage.get('stage_limit')})"
                            if _tok_stage else "")),
-        )
+        ))
     except (TaskWallclockExceeded, TaskLockLost) as _guard_exc:
         # E5（阶段5，登记册 §六）：墙钟/失锁与 TokenLimit 同属【资源护栏中止】——任务
         # 不是"交付失败"而是"被护栏叫停"，已完成子任务是真产物。此前只有 TokenLimit
@@ -1347,11 +1398,11 @@ async def run_task(
                  else "module_lock_lost")
         logger.warning("[RUNNER] 任务 %s 撞资源护栏（%s），尝试抢救已完成产物: %s",
                        task_id, _kind, _guard_exc)
-        await _salvage_partial_from_checkpoint(
+        await asyncio.shield(_salvage_partial_from_checkpoint(
             task_id, queue,
             reason_code=_kind,
             reason_msg=f"资源护栏中止（{_kind}）: {str(_guard_exc)[:200]}",
-        )
+        ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1496,12 +1547,12 @@ async def resume_task(
     except TaskTokenLimitExceeded as _tok_exc:
         # T-B：resume 途中撞云端 token 预算护栏同样抢救 PARTIAL（与 run_task 对齐）。
         logger.warning("[RUNNER] 任务 %s resume 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
-        await _salvage_partial_from_checkpoint(
+        await asyncio.shield(_salvage_partial_from_checkpoint(
             task_id, queue,
             reason_code="token_budget_exceeded",
             reason_msg=(f"云端 token 预算超限 "
                         f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
-        )
+        ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1623,12 +1674,12 @@ async def resume_planning(
         # T-B：规划 resume 撞云端 token 预算护栏——规划期多无完成子任务 → 抢救逻辑自然落 FAILED，
         # 若已有完成产物（少见）则同样保为 PARTIAL。与 run_task/resume_task 对齐，不走裸 FAILED。
         logger.warning("[RUNNER] 任务 %s 规划 resume 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
-        await _salvage_partial_from_checkpoint(
+        await asyncio.shield(_salvage_partial_from_checkpoint(
             task_id, queue,
             reason_code="token_budget_exceeded",
             reason_msg=(f"云端 token 预算超限 "
                         f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1773,6 +1824,27 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
                 logger.warning("[RECONCILE] 任务 %s 重入队失败: %s", tid, exc)
 
         else:
+            # 5.9 复核 #9（HIGH·CONFIRMED）：approve claim→resume 起跑（含 E9 持锁 apply，
+            # 可达数秒）窗口内任务 DB=活跃态但尚未进 _task_running——周期对账命中即误杀
+            # FAILED+杀沙箱，且 E2 CAS 让后续 resume 的一切状态写被静默拒绝（误杀不可逆）。
+            # 宽限窗：periodic 模式下 updated_at 在 2×对账间隔内的活跃任务视为"有心跳"跳过
+            # （claim/节点态推进都刷新 updated_at=天然跨进程心跳）；真孤儿（进程死了没人
+            # 再写）会超窗被下一轮收走。启动模式不设窗（进程刚重启，活跃态必为孤儿）。
+            if periodic:
+                import datetime as _dt
+                try:
+                    _grace_s = float(os.environ.get(
+                        "SWARM_RECONCILE_ACTIVE_GRACE_S", "1200") or "1200")
+                except ValueError:
+                    _grace_s = 1200.0
+                _upd = rec.get("updated_at")
+                if _upd is not None:
+                    if getattr(_upd, "tzinfo", None) is None:
+                        _upd = _upd.replace(tzinfo=_dt.timezone.utc)
+                    _age = (_dt.datetime.now(_dt.timezone.utc) - _upd).total_seconds()
+                    if _age < _grace_s:
+                        stats["skipped_running"] += 1
+                        continue
             # 活跃执行态 fail-closed
             try:
                 await loop.run_in_executor(
@@ -1828,6 +1900,10 @@ async def check_suspended_ttl() -> int:
     now_dt = _dt.datetime.now(_dt.timezone.utc)
     now_mono = time.monotonic()
     notified = 0
+    # 5.9 猎手 F9（LOW）：任务被审批/终态后从候选消失，提醒条目差集清理防慢泄漏。
+    _live_ids = {r.get("id") for r in candidates if r.get("id")}
+    for _stale in [k for k in _ttl_notified if k not in _live_ids]:
+        _ttl_notified.pop(_stale, None)
     for rec in candidates:
         tid = rec.get("id")
         if not tid or rec.get("status") not in _INTERRUPT_SUSPENDED_STATES:
