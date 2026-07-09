@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 
 from swarm.types import SubTask, TaskPlan
+
+logger = logging.getLogger(__name__)
 
 # 喂给 VALIDATE_PLAN 软建议 LLM 的 plan_json 字符上限。超过则跳过 LLM 软建议（结构确定性闸门
 # 已放行），绝不把超大 prompt 喂推理模型。~120K 字符 ≈ 30K token，足够表达结构/依赖/scope。
@@ -251,14 +254,20 @@ def normalize_baseline_covered(raw) -> list[dict]:
     输入是 PLAN LLM 顶层输出（或 state 键回读），形态不可信：
     dict{id,reason} / 裸字符串（补空 reason，交由覆盖校验拒"缺理由"）/ 垃圾类型（丢弃）。
     按 id 去重【保优】（带 reason 的胜过空 reason——复核 L-3：保首会让先到的空申报
-    多烧一轮"缺理由"重试）；reason 有界 300 字符、总条数有界 100（复核 F3：LLM 失控吐
-    数百条假 ID 时 state 键/feedback/下一轮 prompt 三处联动膨胀，P16-2 家族）。
+    多烧一轮"缺理由"重试）；reason 有界 300 字符、总条数有界=抽取硬顶（A8 同源，超帽
+    WARNING 留痕——LLM 失控吐数百条假 ID 时 state 键/feedback/prompt 三处联动膨胀仍有界）。
     非 list 整体 → []。
     """
     if not isinstance(raw, list):
         return []
+    # A8（2026-07-09 登记册）：申报帽与抽取条目硬顶【同源】（requirements_extract 单一事实源）。
+    # 原硬帽 100 vs 抽取硬顶 500：棕地底座 >100 条时诚实申报第 101 条起被静默砍→回到
+    # uncovered→覆盖闸死（申报越诚实越完整越死）。同源后申报数结构上不可能超帽（申报⊆抽取
+    # 条目）；仍超帽=LLM 失控吐假 ID，有界截断 + WARNING 留痕不再静默。
+    from swarm.brain.requirements_extract import _HARD_MAX_ITEMS
     out: list[dict] = []
     index: dict[str, int] = {}
+    _dropped = 0
     for entry in raw:
         if isinstance(entry, dict):
             rid = str(entry.get("id") or "").strip()
@@ -273,10 +282,17 @@ def normalize_baseline_covered(raw) -> list[dict]:
             if reason and not out[index[rid]]["reason"]:
                 out[index[rid]]["reason"] = reason
             continue
-        if len(out) >= 100:
-            break
+        if len(out) >= _HARD_MAX_ITEMS:
+            _dropped += 1
+            continue
         index[rid] = len(out)
         out.append({"id": rid, "reason": reason})
+    if _dropped:
+        logger.warning(
+            "[PLAN-VALIDATE] baseline_covered 申报超同源硬顶 %d，丢弃 %d 条"
+            "（申报⊆抽取条目结构上不可能超帽——此形态=LLM 失控吐假 ID，留痕不静默）",
+            _HARD_MAX_ITEMS, _dropped,
+        )
     return out
 
 

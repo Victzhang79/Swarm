@@ -483,9 +483,10 @@ def test_normalize_keeps_best_reason_on_duplicate():
 
 
 def test_normalize_caps_total_entries():
-    """hunter F3：LLM 失控吐数百条唯一 ID → 条数帽（state/feedback/prompt 三处联动膨胀）。"""
-    raw = [{"id": f"req-{i:08x}", "reason": "r"} for i in range(500)]
-    assert len(normalize_baseline_covered(raw)) == 100
+    """hunter F3 有界性仍在：条数帽=抽取硬顶（A8 同源，原 100 会静默砍诚实棕地申报）。"""
+    from swarm.brain.requirements_extract import _HARD_MAX_ITEMS
+    raw = [{"id": f"req-{i:08x}", "reason": "r"} for i in range(_HARD_MAX_ITEMS + 100)]
+    assert len(normalize_baseline_covered(raw)) == _HARD_MAX_ITEMS
 
 
 def test_feedback_formatter_bounded_and_self_describing():
