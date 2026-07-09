@@ -1,6 +1,7 @@
 ---
 id: springboot-patterns
 title: Spring Boot 惯用写法与最佳实践
+description: "当你在写 Spring Boot 分层代码（Controller/Service/Repository、构造器注入、@Transactional 事务边界、jakarta/javax 包名一致性、DTO 与 JPA 实体分离）时调用，返回惯用规则清单。"
 applies_to_stacks: ["java"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

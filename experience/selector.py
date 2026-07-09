@@ -137,9 +137,19 @@ def select_skills(
         and _match_one(s.applies_to_intents, intent)
         and _match_one(s.applies_to_phases, phase)
     ]
-    cands.sort(key=lambda s: (-s.priority, s.id))
+    # G3（阶段E）：栈特化（非'*'）先于 priority——旧键 (-priority, id) 在截断点按字母序丢
+    # 栈特化技能（实测 Vue 项目丢 vue-patterns(48) 留 mysql(48)+postgres(50) 双通配）。
+    cands.sort(key=lambda s: (0 if "*" in s.applies_to_stacks else -1, -s.priority, s.id))
 
     picked = _budget_pick(cands, budget_chars=budget_chars, max_k=max_k)
+    if len(picked) < len(cands):
+        # G3：截断必须可观测——静默 drop 让"配了但从未生效"与"没配"在日志上不可分。
+        _picked_ids = {s.id for s in picked}
+        logger.debug(
+            "[skills] 候选 %d 条截断至 %d（target=%s intent=%s）；dropped=%s",
+            len(cands), len(picked), target, intent,
+            [s.id for s in cands if s.id not in _picked_ids],
+        )
 
     if rerank_fn is not None and len(cands) > max_k:
         try:

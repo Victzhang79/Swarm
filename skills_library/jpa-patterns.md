@@ -1,6 +1,7 @@
 ---
 id: jpa-patterns
 title: JPA/Hibernate 持久化模式
+description: "当你在写 JPA/Hibernate 实体与 Repository、治理 N+1（LAZY 关联+JOIN FETCH/DTO 投影）、配 @Transactional 事务或 Flyway 迁移时调用，返回持久化模式速查。"
 applies_to_stacks: ["java"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

@@ -1,6 +1,7 @@
 ---
 id: django-security
 title: Django 安全最佳实践
+description: "当你在配置 Django 生产安全项（DEBUG/ALLOWED_HOSTS/HSTS）、DRF 权限与限流、防 SQL 注入/XSS/CSRF 或校验文件上传时调用，返回逐项安全设置清单。"
 applies_to_stacks: ["python"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

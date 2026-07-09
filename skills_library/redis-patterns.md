@@ -1,6 +1,7 @@
 ---
 id: redis-patterns
 title: Redis 缓存/数据结构模式
+description: "当你在用 Redis 做缓存（Cache-Aside/TTL/击穿防惊群）、INCR 或滑动窗口限流、SET NX 分布式锁、Streams 消费组队列时调用，返回数据结构选型表与反模式清单（如生产禁 KEYS *）。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

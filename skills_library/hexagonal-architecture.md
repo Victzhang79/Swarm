@@ -1,6 +1,7 @@
 ---
 id: hexagonal-architecture
 title: 六边形架构（端口与适配器）
+description: "当你在做六边形架构（端口与适配器）设计、隔离 Domain 与 ORM/框架依赖、定义 inbound/outbound 端口或渐进迁移遗留代码时调用，返回分层规则与按边界测试策略。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "refactor"]
 applies_to_phases: ["plan", "code"]

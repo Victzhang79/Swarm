@@ -1,6 +1,7 @@
 ---
 id: springboot-security
 title: Spring Boot 安全最佳实践
+description: "当你在给 Spring Boot 加 JWT 认证、@PreAuthorize 方法级授权、@Valid 输入校验、BCrypt 口令哈希或配置 CSRF/CORS/安全响应头时调用，返回逐项安全配置规则清单。"
 applies_to_stacks: ["java"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

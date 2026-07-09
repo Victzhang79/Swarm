@@ -1,6 +1,7 @@
 ---
 id: tdd-workflow-guide
 title: 测试驱动工作法（指南形态）
+description: "当你要实现新功能或修 bug、需要先写失败测试再实现（红绿重构循环、bug 先复现为失败用例、测行为非实现）时调用，返回覆盖边界与异常路径的 TDD 工作法要点。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

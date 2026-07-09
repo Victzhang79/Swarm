@@ -1,6 +1,7 @@
 ---
 id: coding-standards-core
 title: 通用编码规范（栈无关）
+description: "当你在写或重构任意语言代码、需要 fail-closed 默认拒绝、资源配对释放、边界一次校验、降级留 WARNING 等工程纪律时调用，返回栈无关的编码底线清单。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify", "refactor"]
 applies_to_phases: ["code", "produce"]

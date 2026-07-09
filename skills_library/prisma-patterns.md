@@ -1,6 +1,7 @@
 ---
 id: prisma-patterns
 title: Prisma ORM 模式（Schema/查询/迁移）
+description: "当你在用 Prisma ORM 设计 schema 索引、写 select/include 查询、$transaction 事务、migrate deploy 迁移或处理 P2002 等错误码时调用，返回查询/迁移规则与高危反模式清单。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

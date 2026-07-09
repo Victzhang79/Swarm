@@ -632,12 +632,13 @@ class SkillsConfig(BaseSettings):
     dir: str = "skills_library"
     planner_budget_chars: int = 1500   # planner【全文注入】字符预算（planner 无工具调用能力，只能 push）
     max_k: int = 5                     # planner 全文注入的技能数上限（进 prefill，故保守）
-    # 混合式 push+pull（用户拍板 2026-07-09，"像 ECC 一样多个工具，小模型自己选，5 太少"）：
-    # 选择器按 栈×意图×阶段 收窄候选，每条注册成一个离散工具 experience__<id>，由小模型自己
-    # 决定调哪个（或不调）。因为是【pull】——每个可用工具只在 prefill 里花一行 description（正文
-    # 按需才拉），故可放宽：worker_max_tools 给足选择空间（默认 15，对齐"读写代码常十几个工具"）。
-    # 0 = 不挂经验工具。tool_body_max_chars = 单个经验工具返回正文的上限。
-    worker_max_tools: int = 15
+    # 混合式 push+pull：选择器按 栈×意图×阶段 收窄候选，每条注册成一个离散工具
+    # experience__<id>，由小模型自己决定调哪个（或不调）。
+    # G2（阶段E 止血，2026-07-10）：15 使工具面常态满额（基础 12+15=27，实测 Java 候选 21/
+    # 双栈 28/栈探测失败也满挂 15 条纯通配）——是 C10 处方红线（经验≤3）的 5 倍、复读死循环
+    # 土壤。收紧默认 3（对齐 G8 拍板 pull ≤3）；0 = 不挂经验工具。
+    # tool_body_max_chars = 单个经验工具返回正文的上限。
+    worker_max_tools: int = 3
     tool_body_max_chars: int = 4000
     rerank: bool = False               # 可选 LLM rerank；默认关（确定性优先）
     # 导入准入闸的 LLM 一致性裁判（标题/描述 vs 正文意图）。默认开=严格；LLM 不可用时自动降级

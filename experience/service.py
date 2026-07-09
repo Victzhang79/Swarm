@@ -165,7 +165,8 @@ def build_worker_experience_tools(subtask, project_stack: dict | None = None):
         if not skills:
             return []
         return build_experience_tools(
-            skills, max_chars=get_config().skills.tool_body_max_chars
+            skills, max_chars=get_config().skills.tool_body_max_chars,
+            subtask_id=str(getattr(subtask, "id", "") or ""),  # G4：遥测 join 键
         )
     except Exception as e:  # noqa: BLE001 — 绝不拖垮 worker agent 创建
         logger.warning("[skills] 构建 worker 经验工具失败，降级为空：%s", e)

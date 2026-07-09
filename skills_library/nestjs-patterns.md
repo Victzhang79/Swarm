@@ -1,6 +1,7 @@
 ---
 id: nestjs-patterns
 title: NestJS 模式（模块/依赖注入/守卫）
+description: "当你在写 NestJS 的 feature module/薄控制器/服务分层、全局 ValidationPipe、class-validator DTO、JwtAuthGuard+RolesGuard 守卫与异常过滤器时调用，返回分层规则与生产默认配置清单。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

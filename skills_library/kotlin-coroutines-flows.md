@@ -1,6 +1,7 @@
 ---
 id: kotlin-coroutines-flows
 title: Kotlin 协程与 Flow（异步/并发）
+description: "当你在写 Kotlin 协程/Flow 异步代码（viewModelScope 结构化并发、StateFlow stateIn、SharedFlow 一次性事件、debounce 搜索、协作取消）时调用，返回并发与 Flow 算子规则及 GlobalScope 等反模式对照。"
 applies_to_stacks: ["kotlin"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

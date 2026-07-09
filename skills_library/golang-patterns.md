@@ -1,6 +1,7 @@
 ---
 id: golang-patterns
 title: Go 惯用写法与最佳实践
+description: "当你在写 Go 代码、涉及 errors.Is/As 与 %w 包裹错误、context 超时取消、errgroup 并发防泄漏或 functional options 时调用，返回 Go 惯用法与工具闸清单。"
 applies_to_stacks: ["go"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

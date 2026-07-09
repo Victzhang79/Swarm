@@ -1,6 +1,7 @@
 ---
 id: python-testing
 title: Python 测试（pytest·fixture·TDD）
+description: "当你在用 pytest 写 Python 测试（fixture/conftest、parametrize 参数化、patch mock、pytest.raises 异常断言、TDD 先红后绿）时调用，返回测试写法规则与常用命令速查。"
 applies_to_stacks: ["python"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

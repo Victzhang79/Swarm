@@ -19,6 +19,23 @@ def experience_tool_name(skill_id: str) -> str:
     return f"experience__{safe}"[:64]
 
 
+# G11（阶段E）：imported（第三方 drop-in，未声明路由）默认 priority 低于 native 默认 50——
+# 宽默认（stacks/intents/phases 全 '*'）+ 高优先级会让任何 drop-in 挤占策展技能的工具位。
+IMPORTED_DEFAULT_PRIORITY = 40
+
+
+def cap_text(text: str, max_chars: int) -> str:
+    """按 max_chars 截断（尽量整行、留痕后缀）。G12：截断算法单源——注入路径
+    （SkillDoc.capped_body）与工具返回路径（tools._cap）共用，防双实现漂移。"""
+    if max_chars > 0 and len(text) > max_chars:
+        cut = text[:max_chars]
+        nl = cut.rfind("\n")
+        if nl > max_chars * 0.6:  # 尽量整行截断，不切半行
+            cut = cut[:nl]
+        return cut.rstrip() + "\n…（经验预算裁剪）"
+    return text
+
+
 @dataclass(frozen=True)
 class SkillDoc:
     """单个策展经验技能。
@@ -53,10 +70,4 @@ class SkillDoc:
         导入的第三方技能常远超预算（ECC 单篇达 16KB），截断到 max_chars 只取开头；
         精炼版应由作者（见 handoff 附录 A2）产出，本层不臆改内容。
         """
-        if self.max_chars > 0 and len(self.body) > self.max_chars:
-            cut = self.body[: self.max_chars]
-            nl = cut.rfind("\n")
-            if nl > self.max_chars * 0.6:  # 尽量整行截断，不切半行
-                cut = cut[:nl]
-            return cut.rstrip() + "\n…（经验预算裁剪）"
-        return self.body
+        return cap_text(self.body, self.max_chars)  # G12：截断单源

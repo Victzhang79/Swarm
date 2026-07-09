@@ -1,6 +1,7 @@
 ---
 id: rust-patterns
 title: Rust 惯用写法与最佳实践
+description: "当你在写 Rust 涉及所有权借用（&T/Cow 免 clone）、thiserror/anyhow 错误处理、enum+newtype 类型建模、Arc<Mutex>/mpsc 并发、tokio 异步时调用，返回惯用写法规则与禁项（如禁 unwrap）。"
 applies_to_stacks: ["rust"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

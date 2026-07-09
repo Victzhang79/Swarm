@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from swarm.experience.models import DEFAULT_TARGET, SkillDoc
+from swarm.experience.models import DEFAULT_TARGET, IMPORTED_DEFAULT_PRIORITY, SkillDoc
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,14 @@ def parse_skill_text(
     # 路由字段：native 显式声明则用之；全缺 = imported（宽默认 + 标记）。
     _routing_keys = ("applies_to_stacks", "applies_to_intents", "applies_to_phases", "target")
     has_routing = any(k in meta for k in _routing_keys)
+    # G11（阶段E）：imported 收窄——无 description 的第三方 drop-in 是不可判别的全局候选
+    # （宽默认+工具 desc 退化），loud 跳过（ECC/Claude Code SKILL.md 规范本就必带
+    # description，正常导入零影响）。
+    if not has_routing and not description:
+        logger.warning(
+            "[skills] 跳过 %s（id=%s）：imported 技能缺 description（G11 收窄——"
+            "无判别依据的宽默认候选不放行）", where, skill_id)
+        return None
     stacks = _as_str_tuple(meta.get("applies_to_stacks")) or ("*",)
     intents = _as_str_tuple(meta.get("applies_to_intents")) or ("*",)
     phases = _as_str_tuple(meta.get("applies_to_phases")) or ("*",)
@@ -126,7 +134,10 @@ def parse_skill_text(
         applies_to_stacks=stacks,
         applies_to_intents=intents,
         applies_to_phases=phases,
-        priority=_as_int(meta.get("priority"), 50, field="priority", where=where),
+        # G11：imported 默认 priority 低于 native 默认 50——宽匹配不该再占高位
+        priority=_as_int(meta.get("priority"),
+                         (50 if has_routing else IMPORTED_DEFAULT_PRIORITY),
+                         field="priority", where=where),
         max_chars=_as_int(meta.get("max_chars"), 1200, field="max_chars", where=where),
         summary=description,
         tags=_as_str_tuple(meta.get("tags")),

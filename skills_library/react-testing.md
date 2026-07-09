@@ -1,6 +1,7 @@
 ---
 id: react-testing
 title: React 测试（Testing Library/行为断言）
+description: "当你在用 Testing Library 测 React 组件（getByRole 可访问查询、userEvent 交互、MSW 网络 mock、renderHook 测 hook）时调用，返回行为断言规则、查询优先级与反模式清单。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

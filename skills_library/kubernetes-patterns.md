@@ -1,6 +1,7 @@
 ---
 id: kubernetes-patterns
 title: Kubernetes 部署与编排模式
+description: "当你在编写或审查 K8s Deployment/Job YAML，配置 liveness/readiness/startupProbe、requests/limits、securityContext、RBAC 最小权限时调用，返回生产级配置要点与 kubectl 排障速查。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["plan", "code"]

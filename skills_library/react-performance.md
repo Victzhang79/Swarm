@@ -1,6 +1,7 @@
 ---
 id: react-performance
 title: React 性能优化（重渲染/记忆化/懒加载）
+description: "当你在优化 React/Next.js 性能：消除请求 waterfall、砍包体积（barrel import/dynamic()）、React.cache 去重、memo/useDeferredValue 治重渲染时调用，返回按优先级排查的优化清单。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["modify", "refactor"]
 applies_to_phases: ["code", "produce"]

@@ -1,6 +1,7 @@
 ---
 id: backend-patterns
 title: 后端架构与 API/数据/缓存模式（栈无关）
+description: "当你在实现后端 Controller/Service/Repository 分层、资源式 URL、Cache-Aside 缓存、消灭 SQL N+1 或 Redis 限流与 RBAC 鉴权时调用，返回各环节模式与反例对照。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

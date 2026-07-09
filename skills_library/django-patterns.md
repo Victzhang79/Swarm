@@ -1,6 +1,7 @@
 ---
 id: django-patterns
 title: Django 模式（模型/视图/ORM/DRF）
+description: "当你在写 Django 模型/自定义 QuerySet/DRF Serializer、用 select_related/prefetch_related 防 N+1 或拆 settings 多环境时调用，返回生产级 Django 模式速查。"
 applies_to_stacks: ["python"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

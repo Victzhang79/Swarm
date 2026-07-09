@@ -1,6 +1,7 @@
 ---
 id: laravel-patterns
 title: Laravel 架构模式
+description: "当你在写 Laravel（PHP）的 Controller/Service/Action 分层、Eloquent with 预加载防 N+1、Form Request 校验、队列任务与缓存失效时调用，返回架构分层规则与代码范例。"
 applies_to_stacks: ["php"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

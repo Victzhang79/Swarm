@@ -1,6 +1,7 @@
 ---
 id: error-handling
 title: 错误处理与健壮性模式（栈无关）
+description: "当你在设计异常分层（AppError 带 code/status）、统一错误响应信封、做指数退避加抖动重试或排查静默吞错时调用，返回错误处理规则与自查 Checklist。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify", "debug"]
 applies_to_phases: ["code", "produce"]

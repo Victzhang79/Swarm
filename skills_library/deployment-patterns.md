@@ -1,6 +1,7 @@
 ---
 id: deployment-patterns
 title: 部署与发布模式（CI/CD·健康检查·回滚）
+description: "当你在配置 CI/CD 流水线、选滚动/蓝绿/金丝雀发布、写 /health 健康检查与 liveness/readiness 探针或设计回滚预案时调用，返回发布策略对比与上线前检查清单。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["plan", "code"]

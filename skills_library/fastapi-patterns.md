@@ -1,6 +1,7 @@
 ---
 id: fastapi-patterns
 title: FastAPI 模式（依赖注入/Pydantic/异步）
+description: "当你在写 FastAPI 路由、Pydantic v2 schema、Annotated Depends 依赖注入、async 事务边界或 httpx AsyncClient 测试时调用，返回分层模式与反例对照。"
 applies_to_stacks: ["python"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

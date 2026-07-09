@@ -1,6 +1,7 @@
 ---
 id: frontend-patterns
 title: 前端开发模式（React/Next.js/组件化）
+description: "当你在写 React/Next.js 组件、自定义 Hook（useDebounce/useCallback 依赖陷阱）、useReducer 状态管理或做懒加载与列表虚拟化时调用，返回前端模式与反模式清单。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

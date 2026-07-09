@@ -1,6 +1,7 @@
 ---
 id: database-migrations
 title: 数据库迁移与 Schema 变更（栈无关）
+description: "当你在改数据库 schema、写版本化迁移脚本、给大表加非空列/索引或做扩展-收缩式破坏性变更时调用，返回可回滚迁移、在线 DDL 与幂等回填的规则清单。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["plan", "code"]

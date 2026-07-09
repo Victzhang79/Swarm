@@ -1,6 +1,7 @@
 ---
 id: cpp-coding-standards
 title: C++ 编码规范（Core Guidelines）
+description: "当你在写 C++17/20/23 代码、涉及 unique_ptr/RAII 资源管理、Rule of Five、enum class 或 scoped_lock 并发加锁时调用，返回 Core Guidelines 六大主线的规则速查。"
 applies_to_stacks: ["cpp"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

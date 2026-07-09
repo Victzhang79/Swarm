@@ -1,6 +1,7 @@
 ---
 id: rust-testing
 title: Rust 测试（单元/集成/文档测试）
+description: "当你在写 Rust 测试（#[cfg(test)] 单元测试、tests/ 集成测试、#[tokio::test] 异步、rstest 参数化、proptest 属性测试、mockall）时调用，返回 TDD 红绿流程与断言规则速查。"
 applies_to_stacks: ["rust"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

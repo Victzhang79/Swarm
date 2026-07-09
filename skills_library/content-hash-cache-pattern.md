@@ -1,6 +1,7 @@
 ---
 id: content-hash-cache-pattern
 title: 内容哈希缓存模式（SHA-256）
+description: "当你在为 PDF 解析、OCR、文本抽取等昂贵处理加缓存、想用文件内容 SHA-256 而非路径当缓存键时调用，返回分块哈希、按哈希存 JSON 与损坏优雅降级的实现模板。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code"]

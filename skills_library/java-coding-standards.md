@@ -1,6 +1,7 @@
 ---
 id: java-coding-standards
 title: Java 编码规范
+description: "当你在写 Java 17+ 服务代码、涉及构造器注入、record DTO、Optional.orElseThrow 或 @RestControllerAdvice 集中异常处理时调用，返回 Spring/Quarkus 通用编码规范。"
 applies_to_stacks: ["java"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

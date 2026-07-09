@@ -1,6 +1,7 @@
 ---
 id: react-patterns
 title: React 开发模式（Hooks/组件/状态）
+description: "当你在写 React 组件涉及 Hooks 纪律、状态放置（useState/Context/Zustand/TanStack Query）、RSC Server/Client 边界、Suspense 与 form actions 时调用，返回组件设计规则与反模式对照。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

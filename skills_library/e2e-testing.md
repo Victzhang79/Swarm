@@ -1,6 +1,7 @@
 ---
 id: e2e-testing
 title: 端到端测试模式（Playwright·页面对象）
+description: "当你在用 Playwright 写端到端测试、建页面对象 POM、用 waitForResponse 替代定时等待消除 flaky 或配 trace/截图失败产物时调用，返回稳定 E2E 的配置与写法速查。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

@@ -197,7 +197,15 @@ def validate_skill_doc(
     elif len(doc.title) > 120:
         errors.append("title 过长(>120)")
     if not doc.summary.strip():
-        warnings.append("缺 description——建议补上(模型据此判断是否调用本技能,也是意图校验依据)")
+        # G1（阶段E）：worker 技能的 description 是小模型选工具的唯一判别依据——缺失时工具
+        # desc 退化为标题复读，15 个工具语义同构。worker 升 error 拒绝；planner 是 push 全文
+        # 注入（description 非选中依据），保持 warning 不误杀。
+        if "worker" in doc.target:
+            errors.append(
+                "缺 description(worker 技能必填:模型据此判断何时调用,"
+                "建议『当你在做 X 时调用:返回…』触发条件格式)")
+        else:
+            warnings.append("缺 description——建议补上(模型据此判断是否调用本技能,也是意图校验依据)")
     bad_stacks = set(doc.applies_to_stacks) - _OK_STACKS
     if bad_stacks:
         errors.append(f"applies_to_stacks 含未知栈:{sorted(bad_stacks)}")

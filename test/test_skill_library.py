@@ -92,14 +92,21 @@ def test_id_from_fallback_when_no_id_or_name():
 
 
 def test_defaults_when_routing_absent():
-    text = "---\nid: a\ntitle: A\n---\n- x\n"
+    # G11（阶段E 语义演进）：imported 必须带 description（缺=不可判别的宽默认候选，
+    # loud 跳过）；默认 priority 降 40（低于 native 50，宽匹配不占高位）。
+    text = "---\nid: a\ntitle: A\ndescription: 当你在做 X 时调用\n---\n- x\n"
     doc = parse_skill_text(text)
     assert doc is not None
     assert doc.applies_to_stacks == ("*",)
     assert doc.applies_to_intents == ("*",)
     assert doc.applies_to_phases == ("*",)
-    assert doc.priority == 50 and doc.max_chars == 1200
+    assert doc.priority == 40 and doc.max_chars == 1200
     assert doc.imported is True  # 无任何路由字段声明
+
+
+def test_g11_imported_without_description_skipped():
+    # G11：ECC/Claude Code SKILL.md 规范必带 description——缺失的 drop-in 不放行
+    assert parse_skill_text("---\nid: a\ntitle: A\n---\n- x\n") is None
 
 
 def test_numeric_coercion_bad_values_fall_back():
@@ -128,7 +135,9 @@ def test_frontmatter_not_a_mapping_skipped():
 
 
 def test_capped_body_truncates():
-    text = "---\nid: a\ntitle: A\nmax_chars: 20\n---\n" + ("x" * 200) + "\n"
+    # G11 语义演进：imported 形态需带 description 才放行（本测试标的是截断非准入）
+    text = ("---\nid: a\ntitle: A\ndescription: 当你在做 X 时调用\nmax_chars: 20\n---\n"
+            + ("x" * 200) + "\n")
     doc = parse_skill_text(text)
     assert doc is not None
     capped = doc.capped_body()

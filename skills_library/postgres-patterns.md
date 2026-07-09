@@ -1,6 +1,7 @@
 ---
 id: postgres-patterns
 title: PostgreSQL 查询/索引/Schema 最佳实践
+description: "当你在为 PostgreSQL 选索引（B-tree/GIN/BRIN/部分/覆盖索引）、选字段类型（timestamptz/text/numeric）、写 ON CONFLICT 上插或游标分页、排查慢查询时调用，返回索引选型表与高价值写法。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

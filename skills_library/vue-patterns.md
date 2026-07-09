@@ -1,6 +1,7 @@
 ---
 id: vue-patterns
 title: Vue 开发模式（Composition API/响应式）
+description: "当你在写 Vue 3 组件（script setup、defineProps/defineModel、composable 副作用清理、Pinia Setup Store、v-for :key 与 v-show 性能）时调用，返回组件规范与反模式清单（如 v-html XSS）。"
 applies_to_stacks: ["node"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

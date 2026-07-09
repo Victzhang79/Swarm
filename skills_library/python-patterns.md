@@ -1,6 +1,7 @@
 ---
 id: python-patterns
 title: Python 惯用写法与最佳实践
+description: "当你在写 Python 业务代码涉及类型注解、可变默认参数陷阱、EAFP 精确异常捕获、with 资源管理、dataclass/pathlib 建模时调用，返回惯用写法规则清单与禁项。"
 applies_to_stacks: ["python"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]

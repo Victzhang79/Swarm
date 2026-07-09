@@ -1,6 +1,7 @@
 ---
 id: docker-patterns
 title: Docker 容器化与编排模式
+description: "当你在写 Dockerfile 多阶段构建、配 Compose 的 depends_on/healthcheck 依赖就绪、划分容器网络或做非 root 等安全加固时调用，返回容器化要点与反模式对照。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

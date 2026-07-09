@@ -1,6 +1,7 @@
 ---
 id: golang-testing
 title: Go 测试模式（表驱动·TDD·基准）
+description: "当你在写 Go 表驱动测试、跑 TDD 红绿循环、用 httptest 测 handler、t.Cleanup/t.TempDir 清理或做基准与模糊测试时调用，返回 Go 测试标准姿势速查。"
 applies_to_stacks: ["go"]
 applies_to_intents: ["create", "debug"]
 applies_to_phases: ["code"]

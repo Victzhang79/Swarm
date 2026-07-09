@@ -1,6 +1,7 @@
 ---
 id: api-design
 title: API 设计要点（栈无关）
+description: "当你在设计对外 REST 接口、定 HTTP 状态码与错误体结构、做分页过滤参数或接口版本化兼容演进时调用，返回资源命名、幂等键与乐观锁等设计规则清单。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["plan", "code"]

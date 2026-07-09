@@ -1,6 +1,7 @@
 ---
 id: security-review-checklist
 title: 安全自查清单（栈无关·清单形态）
+description: "当你在写涉及外部输入进 SQL/命令/模板、鉴权越权（IDOR）、密钥管理、SSRF/路径穿越、输出编码防 XSS 的代码时调用，返回栈无关的逐条安全自查清单（注入/加密/依赖）。"
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]

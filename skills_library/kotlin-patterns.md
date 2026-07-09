@@ -1,6 +1,7 @@
 ---
 id: kotlin-patterns
 title: Kotlin 惯用写法与最佳实践
+description: "当你在写 Kotlin 业务代码涉及 null 安全（?./?:、禁 !!）、data/sealed/value class 类型建模、作用域函数、runCatching/Result 错误处理时调用，返回惯用写法速查与反模式清单。"
 applies_to_stacks: ["kotlin"]
 applies_to_intents: ["*"]
 applies_to_phases: ["code", "produce"]
