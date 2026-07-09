@@ -113,6 +113,23 @@ def validate_skill(request: Request, payload: ValidatePayload) -> dict:
     return _result_payload(r)
 
 
+@router.post("/api/skills/preview", tags=["技能"])
+def preview_skill(request: Request, payload: ValidatePayload) -> dict:
+    """G9：挂载预览（干跑，不落库不调 LLM）——展示该技能会出现在哪些 栈×意图 面及排位。"""
+    _require_user(request)
+    from swarm.experience.service import preview_mount_surfaces
+    if payload.skill is not None:
+        doc = _payload_to_doc(payload.skill)
+    elif payload.text.strip():
+        from swarm.experience.library import parse_skill_text
+        doc = parse_skill_text(payload.text, source_path="<preview>")
+        if doc is None:
+            raise HTTPException(status_code=400, detail="文本无法解析为技能")
+    else:
+        raise HTTPException(status_code=400, detail="需提供 text 或 skill 之一")
+    return preview_mount_surfaces(doc)
+
+
 def _admit_and_store(request: Request, doc_result, *, enabled: bool, source: str) -> dict:
     """准入闸通过则落库,否则 422 带 errors。调用方须已做 _require_perm(见下 3 个写端点)。"""
     if not doc_result.ok:

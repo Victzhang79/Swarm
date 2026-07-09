@@ -225,6 +225,11 @@ def validate_skill_doc(
         errors.append(f"target 非法:{sorted(set(doc.target) - _OK_TARGETS)}")
     if not (0 <= doc.priority <= 100):
         errors.append(f"priority 越界:{doc.priority}(须 0-100)")
+    elif doc.priority > 80:
+        # G9（阶段E）：>80 会占各匹配面的头位（挤掉策展技能）——warning 供前端二次确认
+        warnings.append(
+            f"priority={doc.priority} 过高:将占据所有匹配面的头位并挤掉内置策展技能,"
+            "请确认这是有意为之(建议 ≤80)")
     if not (_MIN_MAX_CHARS <= doc.max_chars <= _MAX_MAX_CHARS):
         errors.append(f"max_chars 越界:{doc.max_chars}(须 {_MIN_MAX_CHARS}-{_MAX_MAX_CHARS})")
 

@@ -217,6 +217,55 @@ def build_worker_experience_tools(subtask, project_stack: dict | None = None):
         return []
 
 
+def preview_mount_surfaces(doc: SkillDoc) -> dict:
+    """G9（阶段E）：挂载预览——该技能会出现在哪些【栈×意图】的注入面/工具面及排位。
+
+    保存前展示影响面（质量闸从"只挡恶意"补到"可见平庸的代价"）：worker 侧模拟
+    push/pull 分离排位；planner 侧模拟全文注入选择。纯确定性干跑，不落库不调 LLM。
+    """
+    from swarm.config.settings import get_config
+
+    cfg = get_config().skills
+    others = [d for d in _merged_skills(cfg.dir_list()) if d.id != doc.id]
+    pool = others + [doc]
+    rep_stacks = (list(doc.applies_to_stacks) if "*" not in doc.applies_to_stacks
+                  else ["java", "python", "node", "go"])
+    rep_intents = (list(doc.applies_to_intents) if "*" not in doc.applies_to_intents
+                   else ["create", "modify"])
+    surfaces: list[dict] = []
+    for st_tag in rep_stacks:
+        for it in rep_intents:
+            if "worker" in doc.target:
+                picked = select_skills(
+                    pool, stack_langs={st_tag}, intent=it, phase="code",
+                    target="worker", budget_chars=10**9,
+                    max_k=max(cfg.worker_max_tools, 0) + 1)
+                ids = [x.id for x in picked]
+                rank = ids.index(doc.id) if doc.id in ids else -1
+                mode = ""
+                if rank == 0 and picked and "*" not in picked[0].applies_to_stacks:
+                    mode = "push"
+                elif rank >= 0:
+                    mode = "pull"
+                surfaces.append({"stack": st_tag, "intent": it, "target": "worker",
+                                 "mounted": rank >= 0, "rank": rank, "mode": mode,
+                                 "displaces": ids[-1] if (rank >= 0 and len(ids) >
+                                                          max(cfg.worker_max_tools, 0))
+                                 else ""})
+            if "planner" in doc.target:
+                picked_p = select_skills(
+                    pool, stack_langs={st_tag}, intent="*", phase="plan",
+                    target="planner", budget_chars=cfg.planner_budget_chars,
+                    max_k=cfg.max_k)
+                ids_p = [x.id for x in picked_p]
+                rank_p = ids_p.index(doc.id) if doc.id in ids_p else -1
+                surfaces.append({"stack": st_tag, "intent": "*", "target": "planner",
+                                 "mounted": rank_p >= 0, "rank": rank_p,
+                                 "mode": "planner_push" if rank_p >= 0 else "",
+                                 "displaces": ""})
+    return {"surfaces": surfaces}
+
+
 def planner_skills_block(project_stack: dict | None = None) -> str:
     """为 Planner（plan 节点）生成技能注入块。空/禁用/异常 → ""。
 

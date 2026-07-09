@@ -111,7 +111,9 @@ function skillEditDb(id) {
 }
 function skillCloneBuiltin(id) {
   const s = (_skillsData.builtin || []).find(x => x.id === id);
-  if (s) _fillForm({ ...s, id: s.id + '-custom' }, false);
+  // G9：克隆保持同 id——DB 同 id 覆盖内置(_merged_skills 语义)=真 override 只挂一份；
+  // 旧行为给 id 加 -custom 后缀，会与原件双份各占一个工具位。
+  if (s) _fillForm({ ...s }, false);
 }
 
 function _skillFromForm() {
@@ -140,6 +142,31 @@ function _renderResult(r, prefixOk) {
   el.innerHTML = h;
 }
 
+async function skillPreview() {
+  // G9：挂载预览——保存前展示会出现在哪些 栈×意图 的注入面/工具面及排位
+  try {
+    const body = (_skillMode === 'md')
+      ? { text: _skVal('sk-md') }
+      : { skill: _skillFromForm() };
+    const resp = await fetch('/api/skills/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    const box = document.getElementById('skill-result');
+    if (!resp.ok) { if (box) box.innerHTML = '<div class="text-error">预览失败：' + _skEsc(JSON.stringify(data.detail || data)) + '</div>'; return; }
+    const rows = (data.surfaces || []).map(s =>
+      '<tr><td>' + _skEsc(s.stack) + '</td><td>' + _skEsc(s.intent) + '</td><td>' + _skEsc(s.target)
+      + '</td><td>' + (s.mounted ? ('✓ ' + _skEsc(s.mode) + ' #' + (s.rank + 1)) : '—')
+      + '</td></tr>').join('');
+    if (box) box.innerHTML = '<div><b>挂载预览</b>（✓=会进该面）<table class="table"><thead><tr>'
+      + '<th>栈</th><th>意图</th><th>面</th><th>挂载</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  } catch (e) {
+    const box = document.getElementById('skill-result');
+    if (box) box.innerHTML = '<div class="text-error">预览异常：' + _skEsc(String(e)) + '</div>';
+  }
+}
+
 async function skillValidate() {
   const useLlm = !!(document.getElementById('sk-llm-judge') || {}).checked;
   const payload = (_skillMode === 'md')
@@ -156,6 +183,11 @@ async function skillValidate() {
 
 async function skillSave() {
   const useLlm = !!(document.getElementById('sk-llm-judge') || {}).checked;
+  // G9：priority>80 会占所有匹配面头位挤掉策展技能——保存前二次确认
+  if (_skillMode !== 'md') {
+    const pr = parseInt(_skVal('sk-priority') || '50', 10);
+    if (pr > 80 && !confirm('priority=' + pr + ' 将占据所有匹配面的头位并挤掉内置策展技能，确认继续？')) return;
+  }
   let url, method, body;
   if (_skillMode === 'md') {
     url = '/api/skills/import'; method = 'POST';
