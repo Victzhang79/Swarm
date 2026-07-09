@@ -60,6 +60,23 @@ _TEST_USER_PATTERNS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _swarm_logger_propagates():
+    """测试基建：保证 "swarm" logger 向 root 传播（caplog 依赖 root handler）。
+
+    生产 setup_logging 故意置 propagate=False（自管文件 handler，防双写）；任一测试
+    触发它（如 import api.app）后，后续所有 caplog 断言 swarm.* 日志的测试都会静默
+    落空（2026-07-10 全量回归实证：顺序依赖 flake，单跑绿组合红）。逐测恢复传播。"""
+    import logging as _logging
+    lg = _logging.getLogger("swarm")
+    prev = lg.propagate
+    lg.propagate = True
+    try:
+        yield
+    finally:
+        lg.propagate = prev
+
+
 def _purge_test_users() -> None:
     try:
         import psycopg
