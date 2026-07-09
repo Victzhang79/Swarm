@@ -1499,6 +1499,10 @@ async def plan(state: BrainState) -> dict:
             "baseline_covered": [],
             # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
             "plan_batch_cache": {},
+            # A1（2026-07-09 登记册）：replan_feedback 是一次性消费键，PLAN 成功产出即清空。
+            # 全仓原无清空点→一次 replan 后 P1 外科补齐/#6 覆盖单调化/U2 缓存/R35-C 回放
+            # 四套保护永久关闭。SIMPLE 为确定性构造，恒清。
+            "replan_feedback": "",
             **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
                                  old_recovery_counts=state.get("targeted_recovery_counts"),
                                  old_retry_counts=state.get("subtask_retry_counts"),
@@ -1857,6 +1861,12 @@ async def plan(state: BrainState) -> dict:
         "plan_generation_failed": _plan_degraded is not None,
         # R2-1：同 SIMPLE 路径——PLAN 起点无条件清历史 escalate 粘滞
         "failure_escalated": False,
+        # A1（2026-07-09 登记册）：replan_feedback 一次性消费——本轮已把失败根因注入 prompt，
+        # 成功产出新计划后清空；否则永久粘滞把 P1 外科补齐(1413)/#6 覆盖单调化(1803)/
+        # U2 缓存(774)/R35-C 回放(780) 四套保护整体架空（round37b P1/P3 被架空的机制载体）。
+        # LLM 降级兜底轮（_plan_degraded 非 None=空 scope 假计划）不清：下一轮真规划仍需看到根因。
+        "replan_feedback": "" if _plan_degraded is None else (
+            state.get("replan_feedback") or ""),
         **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
                                  old_recovery_counts=state.get("targeted_recovery_counts"),
                                  old_retry_counts=state.get("subtask_retry_counts"),
