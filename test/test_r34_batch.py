@@ -318,6 +318,9 @@ def test_l2_tool_missing_classified_as_sandbox_unavailable(monkeypatch, tmp_path
 
     import swarm.worker.sandbox as sbx
     monkeypatch.setattr(sbx, "get_sandbox_manager", lambda: _Mgr())
+    # 无沙箱环境(CI)下 _sandbox_available() 真网探测返回 False→提前 return(ran=False/不建沙箱)，
+    # 本测试要验的是【沙箱可用后】的模板/清理逻辑，故显式令可用，使其环境无关（否则本机沙箱可达才过）。
+    monkeypatch.setattr(nodes_mod, "_sandbox_available", lambda: True)
     ran, ok, out, sid = nodes_mod._run_reactor_build_in_sandbox(
         str(tmp_path), "p1", "mvn -q compile", timeout=60)
     assert ran is False and ok is False, "工具缺失=infra，按沙箱不可用处理"
@@ -355,6 +358,8 @@ def test_l2_uses_project_baked_template(monkeypatch, tmp_path):
     import swarm.worker.sandbox as sbx
     import swarm.project.store as pstore
     monkeypatch.setattr(sbx, "get_sandbox_manager", lambda: _Mgr())
+    # 同上：CI 无沙箱时 _sandbox_available()=False 会提前 return，令其可用以验模板选择逻辑（环境无关）。
+    monkeypatch.setattr(nodes_mod, "_sandbox_available", lambda: True)
     monkeypatch.setattr(
         pstore, "get_project",
         lambda pid: {"config": {"sandbox_template": "tpl-proj-java"}},
