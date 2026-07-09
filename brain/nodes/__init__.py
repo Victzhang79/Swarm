@@ -3134,12 +3134,18 @@ def merge(state: BrainState) -> dict:
     subtask_diffs, _dropped_orphans = filter_orphan_module_patches(
         subtask_diffs,
         base_module_exists=_base_has_module if _merge_proj_path else None)
+    _orphan_abandoned: list[str] = []
     if _dropped_orphans:
         logger.error(
             "[MERGE] ⚠️ 模块骨架缺失(module-defining 子任务未成功) → 剔除引用其的补丁，"
             "保其余模块交付；缺骨架模块=%s（非模型问题，交付需该模块脚手架落盘）",
             {d: sids for d, sids in _dropped_orphans.items()},
         )
+        # D7（阶段6，登记册 §五）：被剔 sid 此前只进日志——subtask_results 仍视其 DONE、
+        # 终态账面照旧（跑完也白跑却显示成功）。并入 abandoned（partial_delivery_ids 口径，
+        # 终态诚实 PARTIAL 列明需人工补完）。
+        _orphan_abandoned = sorted({
+            sid for sids in _dropped_orphans.values() for sid in sids})
 
     # A-P1-26c：传入依赖拓扑序，让 rebase 策略以【上游子任务】为 base（非 hunk 出现序）。
     plan = state.get("plan")
@@ -3158,6 +3164,14 @@ def merge(state: BrainState) -> dict:
                 conflict.file_path,
                 conflict.message,
             )
+        # D11（阶段6）：硬冲突标记已从 merged_diff 剥离（merge_engine.conflict_render）——
+        # 单独落诊断件供离线定位，merged_diff 保持可 apply。
+        if getattr(result, "conflict_render", ""):
+            from swarm.brain.merge_engine import dump_merged_diff_for_diagnosis
+            _cr_path = dump_merged_diff_for_diagnosis(
+                (state.get("task_id") or "") + "-conflicts", result.conflict_render)
+            if _cr_path:
+                logger.error("[MERGE] 硬冲突渲染已落诊断件: %s", _cr_path)
 
     if result.rebase_subtask_ids:
         logger.info(
@@ -3211,6 +3225,15 @@ def merge(state: BrainState) -> dict:
         ),
     )
     out: dict = {"merged_diff": result.merged_diff, **merge_touch}
+    if _orphan_abandoned:
+        # D7：被剔孤儿 sid 并入 abandoned（终态诚实 PARTIAL）+ pop 完成态（不再算 DONE）
+        out["abandoned_subtask_ids"] = sorted(
+            set(state.get("abandoned_subtask_ids") or []) | set(_orphan_abandoned))
+        _sr_after_orphan = dict(subtask_results)
+        for _sid in _orphan_abandoned:
+            _sr_after_orphan.pop(_sid, None)
+        out["subtask_results"] = _sr_after_orphan
+        subtask_results = _sr_after_orphan
 
     # H3 纪律：BrainState 无 reducer（last-write-wins），clean merge 必须显式回写
     # rebase_subtask_ids=[]，否则上一轮的非空 rebase 列表会残留，导致 after_merge
@@ -3281,10 +3304,27 @@ def merge(state: BrainState) -> dict:
             # 兜底补回(如缺失的 <module> 注册)。仅当存在【真硬冲突】时才升级人工 fail-fast(原行为)。
             # round9 实测：35 子任务/失败 0/冲突 0/360KB 干净合并，仅因 st-30 根 pom rebase 超限被误判
             # FAILED——本支挽回。
+            # D3（阶段6，登记册 §五）：clean-accept 的前提论证只对【聚合/模块清单】成立
+            # （post-pass reconcile 只兜清单 ground-truth）——普通源文件被丢 hunk 没有任何
+            # 兜底，接受=静默丢源码。逐 sid 检查其触碰文件，含非清单文件则不接受走 escalate。
+            _d3_non_manifest: dict[str, list[str]] = {}
             if not result.conflicts and result.merged_diff.strip():
+                from swarm.brain.merge_engine import (
+                    _is_aggregate_manifest,
+                    _is_module_manifest,
+                )
+                from swarm.project.diff_apply import files_from_unified_diff as _d3_files
+                for _sid in over_limit:
+                    _fs = _d3_files(subtask_diffs.get(_sid) or "")
+                    _bad = [f for f in _fs
+                            if not (_is_aggregate_manifest(f) or _is_module_manifest(f))]
+                    if _bad:
+                        _d3_non_manifest[_sid] = _bad[:5]
+            if not result.conflicts and result.merged_diff.strip() and not _d3_non_manifest:
                 logger.warning(
-                    "[MERGE] rebase 达上限(%d) 但整体合并干净(冲突=0) → 接受 base 版干净合并继续交付，"
-                    "超限聚合清单加性变更交 post-pass reconcile 据 ground-truth 兜底，不整体判 FAILED: %s",
+                    "[MERGE] rebase 达上限(%d) 但整体合并干净(冲突=0)且超限方仅碰聚合/模块清单 → "
+                    "接受 base 版干净合并继续交付，清单加性变更交 post-pass reconcile 据 "
+                    "ground-truth 兜底，不整体判 FAILED: %s",
                     max_rebase, over_limit,
                 )
                 out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
@@ -3295,9 +3335,13 @@ def merge(state: BrainState) -> dict:
                 # 决定（含密钥的交付宁可 escalate 人工，也不放行）。缺此调用则 rebase-over-limit 路径漏扫。
                 _scan_merged_diff_for_secrets(out, result.merged_diff)
                 return out
-            # rebase 已达上限【且有真硬冲突】→ 升级人工，不再无限重生成
+            # rebase 已达上限【且有真硬冲突/超限方碰普通源文件】→ 升级人工，不再无限重生成
             logger.warning(
-                "[MERGE] 子任务 rebase 达上限(%d)且存在硬冲突，升级人工: %s", max_rebase, over_limit,
+                "[MERGE] 子任务 rebase 达上限(%d)且%s，升级人工: %s",
+                max_rebase,
+                (f"超限方碰非清单源文件 {_d3_non_manifest}（D3：接受=静默丢源码）"
+                 if _d3_non_manifest else "存在硬冲突"),
+                over_limit,
             )
             out["failure_escalated"] = True
             out["failure_strategy"] = "escalate"
@@ -3308,10 +3352,34 @@ def merge(state: BrainState) -> dict:
         out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
         dispatch_remaining = list(state.get("dispatch_remaining", []))
         remaining_results = dict(subtask_results)
+        # D4（阶段6，登记册 §五）：重派注入【已保留方最新内容】——旧行为 worker 在同一
+        # 钉扎 base 重生成同形 diff，3 轮必再撞同冲突落 D3。把 merged_diff 中该 sid 触碰
+        # 文件的保留版本节选进 retry_guidance（worker prompt 渲染为硬约束块）。
+        _plan_by_id = {st.id: st for st in (getattr(plan, "subtasks", None) or [])}
+        from swarm.project.diff_apply import files_from_unified_diff as _d4_files
         for sid in result.rebase_subtask_ids:
             remaining_results.pop(sid, None)
             if sid not in dispatch_remaining:
                 dispatch_remaining.append(sid)
+            _st = _plan_by_id.get(sid)
+            if _st is None:
+                continue
+            try:
+                _touched = set(_d4_files(subtask_diffs.get(sid) or ""))
+                _kept_segs = [
+                    seg for seg in ("diff --git " + p_
+                                    for p_ in (result.merged_diff or "").split("diff --git ")[1:])
+                    if any(f in seg[:200] for f in _touched)
+                ]
+                if _kept_segs:
+                    _st.retry_guidance = (
+                        "你的上一版变更在合并时与并行子任务冲突，已被要求基于【保留方的最新"
+                        "内容】重生成。以下是相关文件在当前合并结果中的最新形态（节选）——"
+                        "请把你的改动叠加其上，绝不回退/覆盖这些已保留变更：\n"
+                        + "\n".join(_kept_segs)[:6000]
+                    )[:8000]
+            except Exception:  # noqa: BLE001 — 注入是增益，失败不阻断重派
+                pass
         out["subtask_results"] = remaining_results
         out["dispatch_remaining"] = dispatch_remaining
 

@@ -34,6 +34,8 @@ class MergeResult:
     success: bool = True
     auto_resolved_files: list[str] = field(default_factory=list)
     rebase_subtask_ids: list[str] = field(default_factory=list)
+    # D11：硬冲突的标记渲染（诊断专用）——merged_diff 保持可 apply，毒标记绝不下行
+    conflict_render: str = ""
 
 
 @dataclass
@@ -456,8 +458,18 @@ def _join_lines(lines: list[str]) -> str:
     return "".join(lines)
 
 
+class HunkContextMismatch(Exception):
+    """D9（阶段6，登记册 §五）：hunk 的 context/删除行与 base 实文本不符（基线漂移）。
+
+    旧行为静默消费 tag 不比对——错位时产出语义损坏的"干净"合并（3-way 输入被污染，
+    well-formed 骗过 apply/L2）。fail-closed：调用方捕获后放弃 3-way，落冲突/rebase。"""
+
+
 def apply_hunk(lines: list[str], hunk: _Hunk) -> list[str]:
-    """Apply one unified hunk to line list (1-indexed old_start)."""
+    """Apply one unified hunk to line list (1-indexed old_start)。
+
+    D9：context(" ")/删除("-")行与 base 逐行比对（忽略行尾换行差异），不符即抛
+    HunkContextMismatch——绝不静默产出错位文本。"""
     idx = max(hunk.old_start - 1, 0)
     result = lines[:idx]
     src_idx = idx
@@ -468,6 +480,12 @@ def apply_hunk(lines: list[str], hunk: _Hunk) -> list[str]:
             continue
         tag = raw[0]
         content = raw[1:] if len(raw) > 1 else ""
+        if tag in (" ", "-"):
+            _base_line = lines[src_idx] if src_idx < len(lines) else None
+            if _base_line is None or _base_line.rstrip("\n") != content.rstrip("\n"):
+                raise HunkContextMismatch(
+                    f"hunk@{hunk.old_start} {'context' if tag == ' ' else 'delete'} 行与 base 不符: "
+                    f"expect={content.rstrip()!r} got={(_base_line or '<EOF>').rstrip()!r}")
         if tag == " ":
             result.append(content if content.endswith("\n") else content + "\n" if content else "\n")
             src_idx += 1
@@ -884,7 +902,14 @@ def _try_three_way_resolve(
 
     versions: dict[str, str] = {}
     for sid, hunks in by_subtask.items():
-        versions[sid] = apply_hunks_to_text(base_raw, hunks)
+        try:
+            versions[sid] = apply_hunks_to_text(base_raw, hunks)
+        except HunkContextMismatch as exc:
+            # D9 fail-closed：基线漂移的 hunk 绝不喂 3-way（会产语义损坏的"干净"合并）——
+            # 放弃自动折叠，调用方落冲突/rebase 重生成。
+            logger.warning("[MERGE] D9 hunk 基线漂移（%s，sid=%s）→ 放弃 3-way 落冲突/rebase: %s",
+                           file_path, sid, exc)
+            return None, False
 
     is_agg = _is_aggregate_manifest(file_path)
     combined = merge_insert_only_changes(
@@ -999,6 +1024,7 @@ def merge_diffs(
     conflicts: list[MergeConflict] = []
     auto_resolved_files: list[str] = []
     rebase_subtask_ids_all: list[str] = []   # 全局累加需要 rebase 重生成的子任务 ID
+    conflict_render_parts: list[str] = []    # D11：硬冲突渲染（诊断专用，绝不进 merged_diff）
     merged_parts: list[str] = []
 
     for file_path in sorted(by_file.keys()):
@@ -1104,9 +1130,14 @@ def merge_diffs(
                         by_sid_new,
                         key=lambda s: order_prio.get(s, len(order_prio) + list(by_sid_new).index(s)),
                     )
+                    _dropped_new_sids = [s for s in by_sid_new if s != chosen_sid]
+                    # D2（阶段6，登记册 §五）：非选中写者不再静默丢——并入 rebase 通道
+                    # （merge 后该文件已在树，重派 worker 在其上重生成；账面不再假成功）。
+                    rebase_subtask_ids_all.extend(_dropped_new_sids)
                     logger.warning(
-                        "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，丢弃 %s（避免冲突标记毒化整包）",
-                        file_path, chosen_sid, [s for s in by_sid_new if s != chosen_sid],
+                        "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，其余 %s 进 rebase"
+                        "重生成（D2：不再静默丢弃）",
+                        file_path, chosen_sid, _dropped_new_sids,
                     )
                 chosen_hunks = by_sid_new[chosen_sid]
             else:
@@ -1196,7 +1227,11 @@ def merge_diffs(
                     message=f"overlapping hunks in {file_path} from {', '.join(subtask_ids)}",
                 )
             )
-            merged_parts.append(_format_conflict_hunks(file_path, conflict_hunks, is_new_file))
+            # D11（阶段6，登记册 §五）：冲突标记（<<<<<<<）绝不写进 merged_diff——
+            # 毒 diff 不可 apply 且与同文件非冲突段双段互踩；单独落 conflict_render
+            # 供诊断件（merge 节点 dump），merged_diff 保持可 apply。
+            conflict_render_parts.append(
+                _format_conflict_hunks(file_path, conflict_hunks, is_new_file))
             non_conflicting = [h for i, h in enumerate(hunks) if i not in conflicting]
             if non_conflicting:
                 merged_parts.append(
@@ -1221,6 +1256,7 @@ def merge_diffs(
         success=len(conflicts) == 0,
         auto_resolved_files=auto_resolved_files,
         rebase_subtask_ids=list(dict.fromkeys(rebase_subtask_ids_all)),
+        conflict_render="\n\n".join(conflict_render_parts),
     )
 
 
