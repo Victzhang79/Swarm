@@ -94,15 +94,21 @@ def validate_plan_structure(
     # 非空)。tech_design/plan 返回【空但合法】JSON(file_plan=[])时，所有子任务写 scope 皆空 → 只能
     # 产空 diff → 在"DONE 零放弃"判据下沿 tech_design→plan→validate→confirm→dispatch 直穿判成功
     # 交付(空交付假 DONE)。此处确定性 fail-closed 掐断该跨节点假绿链，根本不放空计划下去。
+    # A5（2026-07-09 登记册）：allow_any=True 的子任务【能】写任意路径（_build_simple_plan
+    # 开放式需求形态），纯删除子任务（仅 delete_files）产出真实删除 diff——两者都有产出能力，
+    # 纳入 writers 判定。原只看 writable/create_files → SIMPLE allow_any 计划被确定性拒绝，
+    # 确定性构造重试重建同一计划=三连败任务死。
     _writers = [
         t for t in plan.subtasks
         if (getattr(getattr(t, "scope", None), "writable", None)
-            or getattr(getattr(t, "scope", None), "create_files", None))
+            or getattr(getattr(t, "scope", None), "create_files", None)
+            or getattr(getattr(t, "scope", None), "delete_files", None)
+            or getattr(getattr(t, "scope", None), "allow_any", False))
     ]
     if not _writers:
         result.add(
-            "计划无任何可产出改动的子任务(所有子任务 writable+create_files 皆空)——"
-            "空计划只能产空 diff、会被误判成功交付(空 diff 假 DONE)，拒绝放行"
+            "计划无任何可产出改动的子任务(所有子任务 writable+create_files+delete_files 皆空"
+            "且无 allow_any)——空计划只能产空 diff、会被误判成功交付(空 diff 假 DONE)，拒绝放行"
         )
         return result
 
