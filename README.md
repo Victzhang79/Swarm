@@ -13,7 +13,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-2500%2B%20passing-brightgreen.svg)](#-测试)
-[![Version](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.27-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -232,6 +232,16 @@ flowchart LR
 - **代码知识库**：符号表 + 向量检索（embedding + rerank，可配云端或自建），为每个任务精准注入相关代码；Worker 还可 just-in-time 即时检索。多语言语法感知切分 + 多源资料采集（PDF/Word/HTML/图片 + 语雀）。
 - **分层记忆 L0–L6**：每次审核反馈沉淀为记忆，影响后续编排与生成。**时间感知衰减**让半年前的坏案例自动淡出、新鲜教训优先；**近因融合排序** + **cross-encoder 精排**提升召回精度；**批量碎片整合**自动合并近义重复，库越用越干净。
 - **可观测**：记忆健康度端点暴露规模 / 有效权重分布 / 去重率，写入幂等防重放双计数。
+
+### 🧩 经验拔插层：把"成功经验"按上下文喂到模型跟前（v0.9.27）
+
+小模型胜任的关键，不只是检索项目知识，还要有一层**人工策展的成功经验**（惯用法 / 模式 / 清单 / 规范）按需注入——这是**固化闸之外的另一半**：固化闸（对抗验证 / 密钥扫描 / 红绿闸 / 覆盖闸）裁决"能不能交付"、模型无权跳过；经验层提供"怎么做更好"、**advisory 永不阻断交付**，任何异常 fail-open。
+
+- **一个 `.md` 即一个技能，零代码**：技能带 `applies_to_stacks/intents/phases` 标签，选择器按 **栈×意图×阶段** 预筛 → 优先级+预算截断。**内置 43 个种子**（覆盖 python/java/node/go/rust/kotlin/php/cpp + 栈无关的架构/数据库/缓存/部署/容器/K8s/错误处理/API/测试/安全等）。
+- **worker 侧是"工具"，小模型自己选**：命中的每条经验挂成一个离散工具 `experience__<id>`，模型按需调用取全文（不确定怎么做更好时优先查）；提示词只挂轻量目录，省 prefill。planner 侧则直接全文注入。
+- **系统级编写 / 导入（跨项目）**：WebUI 管理员「🧩 技能」页可**结构化编写**或**粘贴 `.md` 导入**（支持第三方 `SKILL.md` 零编辑导入），落库对所有项目生效。
+- **严格准入闸**：每次入库都过校验——schema / 密钥扫描 / 提示注入与危险指令拦截 / **标题↔正文意图一致性**（LLM 裁判专抓"标题说读、正文却写"这类不一致），不合格即拒绝，绝不让乱七八糟或意图不明的技能进库。
+- 配置 `SWARM_SKILLS_*`（可挂多目录 `SWARM_SKILLS_DIR=skills_library,/你的技能目录`，靠前优先覆盖内置）。
 
 ### 🌐 多技术栈支持：不是"支持 Java 顺带其它"，而是栈无关设计
 

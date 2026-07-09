@@ -608,6 +608,43 @@ class KnowledgeConfig(BaseSettings):
     depgraph_rebuild_threshold: int = 50
 
 
+class SkillsConfig(BaseSettings):
+    """经验拔插层配置（swarm/experience）。house style：SWARM_SKILLS_* 前缀。
+
+    本层是 advisory 知识注入（"怎么做更好"），永不阻断交付；任何异常 fail-open 到空串。
+    总开关 SWARM_SKILLS_ENABLED=0 = 整层旁路（不加载、不注入）。
+    """
+    model_config = SettingsConfigDict(
+        env_prefix="SWARM_SKILLS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = True
+    # 技能库目录。相对路径以包根(PROJECT_ROOT)解析；绝对路径原样。逗号分隔可挂多目录
+    # （靠前优先）：内置库 + 用户导入库（如 ECC / 自有技能包的 <name>/SKILL.md 目录），
+    # 让"既有内置"与"用户可导入"并存——先出现目录的同 id 技能覆盖后者。
+    dir: str = "skills_library"
+    planner_budget_chars: int = 1500   # planner【全文注入】字符预算（planner 无工具调用能力，只能 push）
+    max_k: int = 5                     # planner 全文注入的技能数上限（进 prefill，故保守）
+    # 混合式 push+pull（用户拍板 2026-07-09，"像 ECC 一样多个工具，小模型自己选，5 太少"）：
+    # 选择器按 栈×意图×阶段 收窄候选，每条注册成一个离散工具 experience__<id>，由小模型自己
+    # 决定调哪个（或不调）。因为是【pull】——每个可用工具只在 prefill 里花一行 description（正文
+    # 按需才拉），故可放宽：worker_max_tools 给足选择空间（默认 15，对齐"读写代码常十几个工具"）。
+    # 0 = 不挂经验工具。tool_body_max_chars = 单个经验工具返回正文的上限。
+    worker_max_tools: int = 15
+    tool_body_max_chars: int = 4000
+    rerank: bool = False               # 可选 LLM rerank；默认关（确定性优先）
+    # 导入准入闸的 LLM 一致性裁判（标题/描述 vs 正文意图）。默认开=严格；LLM 不可用时自动降级
+    # 为仅确定性校验(不硬拦)。SWARM_SKILLS_ADMIT_LLM_JUDGE=0 可关(纯确定性准入)。
+    admit_llm_judge: bool = True
+
+    def dir_list(self) -> list[str]:
+        """把逗号分隔的 dir 解析成去空目录列表（保序）。"""
+        return [p.strip() for p in (self.dir or "").split(",") if p.strip()]
+
+
 class ObservabilityConfig(BaseSettings):
     """OpenLIT/ClickHouse 可观测数据源（LLM/embed/rerank 调用 trace）。"""
     model_config = SettingsConfigDict(
@@ -735,6 +772,7 @@ class AppConfig(BaseSettings):
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     def is_production(self) -> bool:
         """运行在生产环境（SWARM_ENV=production/prod）。"""
@@ -875,9 +913,13 @@ def reload_config() -> AppConfig:
         "swarm.config.secret_store",
         "swarm.config.sandbox_store",
         "swarm.config.command_blacklist_store",
+        "swarm.config.skill_store",  # DB 系统级技能缓存
+        "swarm.experience.service",  # 技能库缓存随 SWARM_SKILLS_DIR 等变更失效
     ):
         try:
             importlib.import_module(_mod_name).invalidate_cache()
-        except Exception:  # noqa: BLE001 — 某 store 未加载/无缓存时不阻断 reload
-            pass
+        except Exception as e:  # noqa: BLE001 — 某 store 未加载/无缓存时不阻断 reload
+            # 不阻断 reload，但留痕：静默 pass 会让"invalidate_cache 改名/真 bug/模块 import
+            # 回归"导致缓存未刷新（配 stale）无迹可循。debug 级——多数是模块未加载的良性缺失。
+            _logger.debug("[reload_config] 刷新缓存失败于 %s（缓存可能未刷新）：%s", _mod_name, e)
     return _config

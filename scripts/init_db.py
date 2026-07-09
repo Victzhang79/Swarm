@@ -74,6 +74,10 @@ def _ensure_sync_tables() -> None:
 
     ensure_cmd_blacklist_tables()
     print("  ✅ command_blacklist（命令安全黑名单 + 内置默认规则）")
+    from swarm.config.skill_store import ensure_tables as ensure_skill_tables
+
+    ensure_skill_tables()
+    print("  ✅ experience_skills（经验拔插层系统级用户技能）")
 
 
 def _ensure_auth_tables() -> None:

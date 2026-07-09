@@ -674,6 +674,14 @@ async def _plan_ultra_batched(
     # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
     _cov_block = _requirement_coverage_prompt_block(
         state.get("requirement_items"), batched=True)
+    # 经验拔插层（advisory）：分批路径同样注入 planner 经验（按 栈×plan），计算一次每批复用。
+    # ULTRA 大任务最受益于策展经验，不应因走批处理而漏掉；禁用/无命中/异常 → 空串（fail-open）。
+    _skills_blk_batched = ""
+    try:
+        from swarm.experience.service import planner_skills_block
+        _skills_blk_batched = planner_skills_block(state.get("project_stack"))
+    except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮规划
+        logger.warning("[skills] planner(分批) 经验注入失败，降级为空：%s", e)
 
     # P5：分批前全局去重同名文件
     _before = len(file_plan)
@@ -839,6 +847,8 @@ async def _plan_ultra_batched(
             return ("error", i, mod_name, exc, None, len(batch))
         # S2-3：追加需求条目清单 + covers 纪律（items 空时 _cov_block=""，一字不加）
         prompt_user += _cov_block
+        if _skills_blk_batched:
+            prompt_user += "\n\n" + _skills_blk_batched
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
@@ -1613,6 +1623,15 @@ async def plan(state: BrainState) -> dict:
             )
             # S2-3：需求条目清单 + covers 声明纪律（加法式注入；items 空=一字不加，老行为零变化）
             prompt_user += _requirement_coverage_prompt_block(state.get("requirement_items"))
+            # 经验拔插层（advisory）：按 栈×plan 选策展经验追加到规划提示。加法式、永不阻断；
+            # 禁用/无命中/异常 → 空串（fail-open，老行为零变化）。
+            try:
+                from swarm.experience.service import planner_skills_block
+                _skills_blk = planner_skills_block(state.get("project_stack"))
+                if _skills_blk:
+                    prompt_user += "\n\n" + _skills_blk
+            except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮规划
+                logger.warning("[skills] planner 经验注入调用失败（含 import），降级为空：%s", e)
             # P5（round37b，ECC §G）：单次规划路径也走 _invoke_llm_abortable——流式+chunk 看门狗
             # + 墙钟超时【显式切备用模型】。此前单发只有 llm.with_fallbacks（仅兜流内错误，"慢"
             # 不切）：GLM 饱和稳定慢产 >timeout 时干等超时降级空兜底。扩到单发后"慢→切 Kimi"，

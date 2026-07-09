@@ -47,6 +47,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 
 {coding_standards_section}
 
+{skills_block}
 {debug_section}
 
 ## 🔄 工作流程
@@ -213,6 +214,18 @@ def build_worker_prompt(
     from swarm.worker.coding_standards import build_coding_standards_section
     coding_standards_section = build_coding_standards_section(subtask)
 
+    # 经验拔插层（advisory）——worker 侧是 pull 模型：按 栈×意图×阶段 选相关经验，各挂成离散
+    # 工具 experience__<id>（见 agent.py），本块只拼一份【工具目录】（标题+摘要）提示这些工具
+    # 存在，正文由模型按需调用工具拉取。与固化闸无关、永不阻断；禁用/无命中/异常 → 空串。
+    try:
+        from swarm.experience.service import worker_skills_block
+        skills_block = worker_skills_block(subtask, project_stack)
+    except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮 prompt 构建
+        # 留痕本边界：service 内部异常已各自 warning，但【import 失败】发生在进入内层
+        # try 之前——不在此记一笔，整层被代码 bug 打死时会静默变空、与"无技能"不可分。
+        logger.warning("[skills] worker 经验注入调用失败（含 import），降级为空：%s", e)
+        skills_block = ""
+
     # 知识段落（错题/成功模式）
     knowledge_section = ""
     if knowledge:
@@ -292,6 +305,7 @@ def build_worker_prompt(
         harness_section=harness_section,
         debug_section=debug_section,
         coding_standards_section=coding_standards_section,
+        skills_block=skills_block,
         max_fix_rounds=config.worker.max_fix_rounds,
         max_iterations=config.worker.max_iterations,
         max_execution_time=config.worker.max_execution_time,

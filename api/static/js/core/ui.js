@@ -82,6 +82,9 @@ function switchTopTab(topTab) {
   } else if (topTab === 'settings') {
     stopSystemRefresh();
     if (typeof loadSettingsTab === 'function') loadSettingsTab();
+  } else if (topTab === 'skills') {
+    stopSystemRefresh();
+    if (typeof loadSkills === 'function') loadSkills();
   }
 }
 

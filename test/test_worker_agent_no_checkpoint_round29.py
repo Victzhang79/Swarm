@@ -51,8 +51,11 @@ def _make_worker_agent(reply: AIMessage):
     from swarm.worker import agent as agent_mod
 
     fake_llm = GenericFakeChatModel(messages=iter([reply]))
+    # 也 mock 掉经验拔插层的离散工具（本测试要的是【无工具】agent + 不支持 bind_tools 的
+    # 假模型；经验层默认开启会挂上真实种子技能工具，与本测试关注的 checkpointer 继承无关）。
     with patch.object(agent_mod, "ModelRouter") as mock_router, \
-         patch.object(agent_mod, "_get_worker_tools", return_value=[]):
+         patch.object(agent_mod, "_get_worker_tools", return_value=[]), \
+         patch("swarm.experience.service.build_worker_experience_tools", return_value=[]):
         mock_router.return_value.get_worker_llm.return_value = fake_llm
         bundle = agent_mod.create_worker_agent(subtask=_subtask())
     return bundle["agent"]

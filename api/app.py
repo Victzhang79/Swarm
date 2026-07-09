@@ -579,7 +579,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Swarm API",
-    version="0.9.26",
+    version="0.9.27",
     description="Swarm Web 后端 API",
     lifespan=_lifespan,
 )
@@ -691,6 +691,14 @@ async def on_startup():
         logger.info("command_blacklist table ensured")
     except Exception as e:
         logger.warning(f"Failed to ensure command_blacklist table: {e}")
+    try:
+        from swarm.config import skill_store
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, skill_store.ensure_tables)
+        logger.info("experience_skills table ensured")
+    except Exception as e:
+        logger.warning(f"Failed to ensure experience_skills table: {e}")
     try:
         from swarm.auth.store import (
             backfill_legacy_project_members,
@@ -1853,6 +1861,7 @@ from swarm.api.routers import memory as _memory_router  # noqa: E402
 from swarm.api.routers import observability as _observability_router  # noqa: E402
 from swarm.api.routers import project as _project_router  # noqa: E402
 from swarm.api.routers import sandbox as _sandbox_router  # noqa: E402
+from swarm.api.routers import skills as _skills_router  # noqa: E402
 from swarm.api.routers import task as _task_router  # noqa: E402
 from swarm.api.routers import upload as _upload_router  # noqa: E402
 from swarm.api.routers import worker as _worker_router  # noqa: E402
@@ -1866,6 +1875,7 @@ app.include_router(_project_router.router)
 app.include_router(_task_router.router)
 app.include_router(_upload_router.router)
 app.include_router(_config_router.router)
+app.include_router(_skills_router.router)
 app.include_router(_observability_router.router)
 
 

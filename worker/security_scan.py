@@ -843,6 +843,22 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
 ]
 
 
+def scan_text_for_secrets(text: str) -> list[tuple[str, str]]:
+    """在任意文本里检出泄露密钥（复用 _SECRET_PATTERNS，栈无关）。
+
+    返回 [(pattern_name, 脱敏后的命中片段), ...]；无命中 → []。供经验技能【导入准入闸】
+    校验技能正文不得内嵌密钥（与 diff 扫描同一 20+ pattern 源）。
+    """
+    out: list[tuple[str, str]] = []
+    if not text:
+        return out
+    for name, pat, _sev in _SECRET_PATTERNS:
+        m = pat.search(text)
+        if m:
+            out.append((name, _redact_secret(m.group(0))))
+    return out
+
+
 def _redact_secret(value: str) -> str:
     """脱敏：只保留前 4 字符 + '…'（ECC 铁律：绝不在日志/报告里显示密钥全文）。"""
     v = value or ""

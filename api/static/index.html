@@ -87,6 +87,7 @@
             <button class="nav-tab nav-tab-top" data-toptab="sandboxes" onclick="switchTopTab('sandboxes')">🖥️ 沙箱</button>
             <button class="nav-tab nav-tab-top" data-toptab="system" data-admin-only="1" onclick="switchTopTab('system')">📈 系统</button>
             <button class="nav-tab nav-tab-top" data-toptab="token-usage" data-admin-only="1" onclick="switchTopTab('token-usage')">💰 Token用量</button>
+            <button class="nav-tab nav-tab-top" data-toptab="skills" data-admin-only="1" onclick="switchTopTab('skills')">🧩 技能</button>
             <button class="nav-tab nav-tab-top" data-toptab="settings" data-admin-only="1" onclick="switchTopTab('settings')">⚙️ 设置</button>
           </nav>
 
@@ -906,6 +907,61 @@
             </div>
           </div>
 
+          <!-- Skills Tab（上层系统级：经验技能编写/导入 + 准入校验，仅管理员）-->
+          <div id="tab-skills" class="tab-panel">
+            <div class="tab-scroll">
+              <div class="settings-panel">
+                <h3 style="font-size:13px;margin:0 0 6px;color:var(--text-secondary)">🧩 经验技能 <span class="hint">系统级 · 跨项目 · worker 按需调用的 experience__ 工具</span></h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:0 0 10px">内置种子只读；此处编写/导入的技能<b>落库、对所有项目生效</b>。每次保存都过<b>准入校验</b>（schema / 密钥 / 提示注入与危险指令 / 标题↔正文意图一致性），不合格即拒绝入库。</p>
+                <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+                  <div style="flex:1 1 320px;min-width:280px">
+                    <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
+                      <button class="btn btn-ghost btn-sm" onclick="loadSkills()">刷新</button>
+                      <button class="btn btn-primary btn-sm" onclick="skillNew()">+ 新建</button>
+                      <span id="skills-count" class="hint"></span>
+                    </div>
+                    <div id="skills-list" style="font-size:12px">加载中…</div>
+                  </div>
+                  <div style="flex:1 1 400px;min-width:320px">
+                    <div style="display:flex;gap:6px;margin-bottom:8px">
+                      <button class="btn btn-ghost btn-sm" id="skill-mode-form" onclick="skillSetMode('form')">结构化编写</button>
+                      <button class="btn btn-ghost btn-sm" id="skill-mode-md" onclick="skillSetMode('md')">粘贴 .md 导入</button>
+                    </div>
+                    <div id="skill-form-mode">
+                      <div class="form-group"><label class="form-label">id（唯一 slug，小写字母/数字/连字符）</label><input id="sk-id" class="form-input" placeholder="my-skill"></div>
+                      <div class="form-group"><label class="form-label">标题</label><input id="sk-title" class="form-input"></div>
+                      <div class="form-group"><label class="form-label">描述（模型据此判断是否调用；意图校验依据）</label><input id="sk-desc" class="form-input"></div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">栈（逗号；* 或 python,java…）</label><input id="sk-stacks" class="form-input" value="*"></div>
+                        <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">意图</label><input id="sk-intents" class="form-input" value="*"></div>
+                      </div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">阶段</label><input id="sk-phases" class="form-input" value="*"></div>
+                        <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">target</label><input id="sk-target" class="form-input" value="worker"></div>
+                      </div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">priority</label><input id="sk-priority" class="form-input" type="number" value="50"></div>
+                        <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">max_chars</label><input id="sk-maxchars" class="form-input" type="number" value="1200"></div>
+                        <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">tags（逗号）</label><input id="sk-tags" class="form-input"></div>
+                      </div>
+                      <div class="form-group"><label class="form-label">正文（调用即返回此内容）</label><textarea id="sk-body" class="form-textarea" rows="8" placeholder="- 可执行的经验条目，讲清怎么做更好以及为什么。"></textarea></div>
+                    </div>
+                    <div id="skill-md-mode" style="display:none">
+                      <div class="form-group"><label class="form-label">粘贴带 frontmatter 的 .md（支持第三方 SKILL.md）</label><textarea id="sk-md" class="form-textarea" rows="16" placeholder="---&#10;id: my-skill&#10;title: 标题&#10;description: 描述&#10;target: [worker]&#10;applies_to_stacks: [python]&#10;---&#10;- 正文经验条目…"></textarea></div>
+                    </div>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);margin:4px 0"><input type="checkbox" id="sk-llm-judge" checked> 校验时启用 LLM 一致性裁判（抓"标题说读、正文却写"这类不一致）</label>
+                    <div style="display:flex;gap:8px;margin-top:6px;align-items:center;flex-wrap:wrap">
+                      <button class="btn btn-secondary btn-sm" onclick="skillValidate()">校验</button>
+                      <button class="btn btn-primary btn-sm" onclick="skillSave()">保存 / 导入</button>
+                      <span id="skill-editing-id" class="hint"></span>
+                    </div>
+                    <div id="skill-result" style="margin-top:8px;font-size:12px"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- Settings Tab（上层系统级：模型 / 路由 / LangSmith 配置）-->
           <div id="tab-settings" class="tab-panel">
             <div class="tab-scroll">
@@ -1160,6 +1216,7 @@
   <script src="/static/js/tabs/sandboxes.js"></script>
   <script src="/static/js/tabs/user_admin.js"></script>
   <script src="/static/js/tabs/config.js"></script>
+  <script src="/static/js/tabs/skills.js"></script>
   <script src="/static/js/tabs/notify.js"></script>
   <!-- 应用入口 -->
   <script src="/static/js/app.js"></script>

@@ -116,8 +116,20 @@ def create_worker_agent(
     else:
         llm = router.get_worker_llm(strategy=model_strategy)
 
-    # 获取 Tool 集
+    # 获取 Tool 集（基础工具 + 经验拔插层按上下文挂的离散经验工具 experience__<id>）。
+    # 经验工具 advisory·可选：小模型自己决定调哪个（或不调）。fail-open：任何异常都退回
+    # 纯基础工具，绝不因经验层拖垮 worker 创建。
     tools = _get_worker_tools()
+    try:
+        from swarm.experience.service import build_worker_experience_tools
+        _exp_tools = build_worker_experience_tools(subtask, project_stack)
+        if _exp_tools:
+            tools = tools + _exp_tools
+    except Exception:  # noqa: BLE001 — 经验工具绝不拖垮 worker
+        import logging
+        logging.getLogger(__name__).warning(
+            "[skills] 挂载 worker 经验工具失败，退回纯基础工具", exc_info=True
+        )
 
     # 构建系统提示词（注入 Brain 检索到的错题/成功范例）
     system_prompt = build_worker_prompt(

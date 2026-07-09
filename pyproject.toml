@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarm"
-version = "0.9.26"
+version = "0.9.27"
 description = "蜂群 AI 编程智能体系统"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -65,6 +65,7 @@ packages = [
     "swarm.brain.nodes",
     "swarm.cli",
     "swarm.config",
+    "swarm.experience",
     "swarm.infra",
     "swarm.infra.migrations",
     "swarm.knowledge",
@@ -91,6 +92,9 @@ packages = [
 # （正式 install，非 editable）Web 界面 404。scripts 同理供运行时引用。
 [tool.setuptools.package-data]
 "swarm.api" = ["static/**/*", "static/*"]
+# 经验拔插层内置种子技能（drop-in .md）必须随包安装，否则正式 install（非 editable）
+# 下 skills_library/ 为空 → 经验层降级无内置技能（fail-open 但丢 43 个种子）。
+"swarm" = ["skills_library/*.md", "skills_library/**/*.md"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["__pycache__/*", "*.pyc"]
