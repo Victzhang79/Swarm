@@ -365,7 +365,10 @@ async def adversarial_verify(state: BrainState) -> dict:
     if not naughty:
         out: dict = {
             "adversarial_verify_passed": True,
-            "adversarial_verify_round": cur_round,
+            # 3.8 生命周期收敛（矩阵疑似粘滞 TOP-2）：收敛=本次对抗战役结束，round 归零——
+            # 原回传 cur_round 使计数跨战役累计，后期失败批进场即撞 MAX_ROUNDS 短路
+            # degraded 放行=复核洞（round 语义是"单次战役内不收敛熔断"，非任务级总量）。
+            "adversarial_verify_round": 0,
             "adversarial_verified_ids": new_verified,
             "adversarial_verify_message":
                 f"对抗验证通过：{len(passed)} 个子任务经 {len(verdict_tables)} 个独立 reviewer 复核均 PASS"

@@ -267,7 +267,6 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "subtask_retry_counts": _rt_rc,
                 "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
                 "targeted_recovery_counts": _rt_trc,
-                "targeted_recovery": True,
                 "runtime_smoke_last_signature": _rt_signature,  # T4 跨轮 plateau 比对基准
             }
         # 归因不出 → 退 replan 阶梯（共用 replan_count，上面已判上限，绝不另起无界通道）
@@ -353,8 +352,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "l2_targeted": False,
                     "replan_count": _l2_replan,
                     "subtask_retry_counts": _rc,
-                    "targeted_recovery": True,
-                }
+                    }
 
         logger.info("[HANDLE_FAILURE] L2 集成验证失败 — 触发 replan (第 %d/%d 次)",
                     _l2_replan, _l2_max)
@@ -764,8 +762,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "subtask_retry_counts": _rc,
                     "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
                     "targeted_recovery_counts": _trc,
-                    "targeted_recovery": True,
-                }
+                    }
             # granted 为空（推不出模块 pom）→ 不 mutate、不自增计数，落常规 strategy（其自带
             # replan_count 熔断会兜底升级），不会在此空转（MEDIUM-2）。
             logger.info(
@@ -847,8 +844,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "subtask_retry_counts": _rco,
                     "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
                     "targeted_recovery_counts": _trc_o,
-                    "targeted_recovery": True,
-                }
+                    }
             logger.warning(
                 "[HANDLE_FAILURE] 撞「注册先于脚手架」但无一条序边可安全成立（脚手架全定位不到/"
                 "插边成环）→ 序修复未激活，落常规 %s", strategy,

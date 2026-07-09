@@ -113,7 +113,8 @@ def test_first_runtime_failure_stores_signature_no_plateau():
 def test_attributed_signature_includes_blamed_subtasks():
     """归因到写者 → 定向 retry，签名含 fid（classification|st-a）。"""
     result = _run(_attributed_state(blame="st-a", last_signature=""))
-    assert result.get("targeted_recovery") is True, (
+    # 3.8 语义演进：targeted_recovery 死键已删——定向 retry 由 strategy+签名共同证明。
+    assert result.get("failure_strategy") == "retry", (
         f"应归因到 st-a 走定向 retry；实际 strategy={result.get('failure_strategy')}"
     )
     assert result.get("runtime_smoke_last_signature") == "code_error|st-a"

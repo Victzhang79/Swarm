@@ -123,7 +123,9 @@ def test_handle_failure_l2_targeted_preserves_siblings():
     assert "st-2" not in result["subtask_results"], "归因到的 st-2 应被移除待重做"
     assert "st-2" in result["dispatch_remaining"]
     assert result["replan_count"] == 1, "定向恢复仍自增 replan_count（共用熔断）"
-    assert result["targeted_recovery"] is True
+    # 3.8 语义演进：targeted_recovery 死键已删（全仓零读点）——定向路径由
+    # strategy=retry + 归因移除/保留兄弟 + replan_count 自增共同证明（上方已断言）。
+    assert "targeted_recovery" not in result
 
 
 def test_handle_failure_l2_blanket_replan_when_not_targeted():

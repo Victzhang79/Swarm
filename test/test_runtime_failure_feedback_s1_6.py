@@ -92,7 +92,7 @@ def test_attribution_hit_targeted_recovery_and_evidence_injection():
     assert "st-1" in out["dispatch_remaining"]
     assert "st-2" not in out["dispatch_remaining"]
     assert out["failed_subtask_ids"] == []
-    assert out["targeted_recovery"] is True
+    assert "targeted_recovery" not in out  # 3.8 死键已删；定向形态由上方断言证明
 
     # 证据注入：既有 retry_guidance 通道（A4 round11 机制），重派 worker 可见启动日志证据
     by_id = {s.id: s for s in out["plan"].subtasks}

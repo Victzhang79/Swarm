@@ -486,6 +486,12 @@ async def dispatch(state: BrainState) -> dict:
     # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，
     # 若仅非空时返回，上一轮失败列表会残留 → gates 误拒真正成功的运行。
     result["failed_subtask_ids"] = failed_ids
+    # 3.8 生命周期收敛（矩阵疑似粘滞 TOP-1）：use_alternate_model 是【本轮派发】的路由
+    # 决策，消费即清——handle_failure 仅 retry/retry_alternate 两出口对称写该键，定向
+    # 恢复/L2 定向/阶梯二三/replan 出口都不发键，粘滞 True 会让后续所有轮全部子任务
+    # 永走备选模型（单次 alternate 决策劫持全局路由）。消费点收口=单 choke point，
+    # 下一轮要换模型须由 handle_failure 重新显式决策。
+    result["use_alternate_model"] = False
     return result
 
 

@@ -173,7 +173,7 @@ def test_acceptance_failed_attribution_hit_targeted_with_specific_guidance():
     assert "st-1" in out["dispatch_remaining"]
     assert "st-2" not in out["dispatch_remaining"]
     assert "st-2" in out["subtask_results"], "成功兄弟不可被清空"
-    assert out["targeted_recovery"] is True
+    assert "targeted_recovery" not in out  # 3.8 死键已删；定向形态由上方断言证明
     assert out["verification_failure"] is None, "清专类，不粘滞下一轮"
     assert "l2_passed" not in out, "绝不落 l2 分支（8bec098 专类教训）"
 

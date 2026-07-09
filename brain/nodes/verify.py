@@ -676,6 +676,9 @@ async def verify_runtime(state: BrainState) -> dict:
             "runtime_smoke_message": res.message,
             "runtime_smoke_details": details,
             "runtime_smoke_sandbox_id": "",
+            # 3.8 生命周期收敛：冒烟【通过】=失败链断开，清 plateau 签名——否则旧失败签名
+            # 跨"失败→修好→再失败"存留，与新失败巧合同签即被 strict 模式误判 plateau。
+            "runtime_smoke_last_signature": "",
             **mig_keys,
             **accept_keys,
         }

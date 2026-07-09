@@ -1352,7 +1352,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_retry_counts: dict | None = None,
                            old_redecompose_counts: dict | None = None,
                            old_abandoned_ids: list | None = None,
-                           old_give_up_ids: list | None = None) -> dict:
+                           old_give_up_ids: list | None = None,
+                           old_transient_counts: dict | None = None,
+                           old_force_strong: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -1373,7 +1375,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     dict 记账（retry/redecompose/recovery）按签名一致保留，list 放弃标记（abandoned/give_up）
     只保留在新 plan 且签名一致者——签名变=语义新子任务，绝不继承旧放弃/旧配额。"""
     if not any((old_results, old_recovery_counts, old_retry_counts,
-                old_redecompose_counts, old_abandoned_ids, old_give_up_ids)):
+                old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
+                old_transient_counts, old_force_strong)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -1455,6 +1458,15 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     pruned_retry = {
         sid: n for sid, n in (old_retry_counts or {}).items() if _sig_unchanged(sid)
     }
+    # 3.8 生命周期收敛（矩阵疑似粘滞 TOP-3/4）：瞬时配额表与强模型标记同签名纪律——
+    # 缺席剪枝时 replan 后同 id 语义全新的子任务继承旧瞬时配额（提前 escalate）/
+    # 永久强模型（成本粘滞），与其余五张表纪律不一致。
+    pruned_transient = {
+        sid: n for sid, n in (old_transient_counts or {}).items() if _sig_unchanged(sid)
+    }
+    pruned_force_strong = {
+        sid: v for sid, v in (old_force_strong or {}).items() if _sig_unchanged(sid)
+    }
     pruned_redecompose = {
         sid: n for sid, n in (old_redecompose_counts or {}).items() if _sig_unchanged(sid)
     }
@@ -1481,6 +1493,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         "subtask_redecompose_count": pruned_redecompose,
         "abandoned_subtask_ids": pruned_abandoned,
         "give_up_isolated_ids": pruned_give_up,
+        # 3.8：瞬时配额/强模型标记同签名剪枝（此前缺席=旧账饿死/成本粘滞）
+        "subtask_transient_counts": pruned_transient,
+        "subtask_force_strong": pruned_force_strong,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -1758,7 +1773,9 @@ async def plan(state: BrainState) -> dict:
                                  old_retry_counts=state.get("subtask_retry_counts"),
                                  old_redecompose_counts=state.get("subtask_redecompose_count"),
                                  old_abandoned_ids=state.get("abandoned_subtask_ids"),
-                                 old_give_up_ids=state.get("give_up_isolated_ids")),
+                                 old_give_up_ids=state.get("give_up_isolated_ids"),
+                                 old_transient_counts=state.get("subtask_transient_counts"),
+                                 old_force_strong=state.get("subtask_force_strong")),
             **plan_touch,
         }
 
@@ -2135,7 +2152,9 @@ async def plan(state: BrainState) -> dict:
                                  old_retry_counts=state.get("subtask_retry_counts"),
                                  old_redecompose_counts=state.get("subtask_redecompose_count"),
                                  old_abandoned_ids=state.get("abandoned_subtask_ids"),
-                                 old_give_up_ids=state.get("give_up_isolated_ids")),
+                                 old_give_up_ids=state.get("give_up_isolated_ids"),
+                                 old_transient_counts=state.get("subtask_transient_counts"),
+                                 old_force_strong=state.get("subtask_force_strong")),
         **plan_touch,
     }
 
@@ -3862,6 +3881,15 @@ async def revision(state: BrainState) -> dict:
         # 交付永拒 auto_accept、after_merge:285 残留条件把干净合并再送人工
         # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。
         "failure_escalated": False,
+        # 3.8 生命周期收敛：修订=新一轮，同族记账/路由/归因键对称重置——瞬时配额与强模型
+        # 标记（与 retry_counts 同纪律）；use_alternate_model 粘滞 True 会让 rev-* 子任务
+        # 无端走备选模型；confirm_reason/deliver_auto_reject_reason 陈旧值污染下一轮终态
+        # 归因（runner 兜底归因链读它们）。
+        "subtask_transient_counts": {},
+        "subtask_force_strong": {},
+        "use_alternate_model": False,
+        "confirm_reason": "",
+        "deliver_auto_reject_reason": "",
         # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订
         # （verify_runtime 的幂等复用对已存在 assertions 直接跳过重生成，"reused_existing"）。
         # 清空三键让下一轮 verify_runtime 按修订后的 design/merged_diff 重新生成断言。

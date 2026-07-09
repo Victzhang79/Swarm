@@ -116,8 +116,9 @@ class BrainState(TypedDict, total=False):
     replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
     targeted_recovery_count: int        # P0-B(f9e38dae)：定向恢复累计次数——round29 遗漏项#2 起仅作遥测，熔断改用 targeted_recovery_counts（按子任务）
     targeted_recovery_counts: dict[str, int]  # round29 遗漏项#2：定向恢复次数【按子任务】熔断 {sid: n}——旧任务级全局计数会被先失败者用光、饿死后续同类受害者（d37a52a3 st-25 从未拿到 pom 写权即"已达上限"空烧）。A2 缺依赖 + 序修复阶梯共用此表，同子任务环安全语义不变
-    targeted_recovery: bool             # P0-B：本轮走了定向恢复（补 pom 写权+只重派失败，不进 PLAN/不清全表）
-    confirm_reason: str                 # P0-3：confirm 进入原因(validation_failed|ultra|manual_confirm)
+    # （3.8 生命周期收敛删除 targeted_recovery：写后全仓零读点零清点的死键——一次定向恢复后
+    #  永久 True 纯误导；遥测由 targeted_recovery_count/counts 承担。）
+    confirm_reason: str                 # P0-3：confirm 进入原因(validation_failed|ultra|manual_confirm)；REVISE 开新轮时由 revision 清空（防终态归因读到陈旧进闸原因）
 
     # ─── 合并 & 验证 ───
     merged_diff: str                    # 合并后的完整 diff
@@ -240,6 +241,70 @@ class BrainState(TypedDict, total=False):
     ingest_done: bool                   # 摄取是否已完成（幂等：避免重复摄取）
     ingest_errors: list[str]            # 摄取过程中的非致命错误（单文件失败等）
     auto_confirm_vision: bool           # 用户勾选「模型自行确认」→ 跳过图片理解的人工确认（B.2）
+
+
+# ─────────────────────────────────────────────────────────────
+# 阶段3.8（2026-07-09 登记册 §八）：记账键生命周期登记表——单一事实源。
+# 历史 bug 类=「仅条件写、无人清」的粘滞键（replan_feedback/failure_escalated/
+# l2_targeted/merge_conflicts/use_alternate_model/adversarial_verify_round…同一族）。
+# 登记表把每个记账/控制键的生命周期显式化，test_phase3_state_lifecycle.py 锁定：
+# 新增记账键必须登记，登记键必须有对应类别的清点/重置纪律。
+#
+# 类别：
+#   oneshot   一次性消费键：写→指定消费点消费后必须清（例：replan_feedback 由 PLAN
+#             成功产出清；l2_targeted 由 handle_failure l2 三出口清）。
+#   round     轮次键：每轮/每决策必须整体替换或 always-emit（不靠残留；例：
+#             failure_strategy 每次 handle_failure 整体替换；use_alternate_model 由
+#             dispatch 消费后本轮清零）。
+#   monotonic 单调累积键：只增不减（reducer 或语义保证；per-subtask dict 账表须在
+#             replan 时按签名剪枝——D08 纪律，见 _surgical_replan_reset）。
+#   terminal  任务级常量/终态键：写一次不清合法（终态归因/锚点）。
+# ─────────────────────────────────────────────────────────────
+ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
+    # 规划闸
+    "plan_retry_count": "round",
+    "plan_validation_issues": "round",
+    "plan_validation_feedback": "oneshot",
+    "plan_batch_cache": "round",
+    "plan_batch_failed_modules": "round",
+    "baseline_covered": "round",
+    "coverage_watermark": "monotonic",
+    "plan_soft_review_sig": "round",
+    "plan_generation_failed": "round",
+    "oversized_subtask_ids": "round",
+    "invest_fail_count": "round",
+    # 失败/重试
+    "replan_count": "monotonic",
+    "replan_feedback": "oneshot",
+    "failed_subtask_ids": "round",
+    "failure_strategy": "round",
+    "use_alternate_model": "round",     # dispatch 消费后本轮清零（3.8 修）
+    "failure_escalated": "round",
+    "subtask_force_strong": "monotonic",   # D08 签名剪枝（3.8 补）
+    "subtask_retry_counts": "monotonic",   # D08 签名剪枝
+    "subtask_redecompose_count": "monotonic",  # D08 签名剪枝
+    "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）
+    "targeted_recovery_count": "monotonic",
+    "targeted_recovery_counts": "monotonic",   # D08 签名剪枝
+    "abandoned_subtask_ids": "monotonic",      # D08 签名剪枝
+    "give_up_isolated_ids": "monotonic",       # D08 签名剪枝
+    "confirm_reason": "oneshot",        # REVISE 开新轮由 revision 清（3.8 修）
+    "dispatch_remaining": "round",
+    # 合并/验证
+    "merge_conflicts": "round",
+    "rebase_subtask_ids": "round",
+    "subtask_rebase_counts": "monotonic",
+    "merge_rebase_dropped": "monotonic",
+    "l2_targeted": "oneshot",
+    "verification_failure": "oneshot",
+    "runtime_smoke_sandbox_id": "oneshot",
+    "runtime_smoke_last_signature": "oneshot",  # 冒烟通过断链清（3.8 修）
+    "adversarial_verify_round": "round",        # 收敛归零（3.8 修）
+    "adversarial_verified_ids": "monotonic",    # token=sid@diff_sig 内容绑定自失效
+    # 终态归因
+    "deliver_auto_reject_reason": "oneshot",    # REVISE 开新轮由 revision 清（3.8 修）
+    "base_commit": "terminal",
+}
 
 
 # ─────────────────────────────────────────────────────────────
