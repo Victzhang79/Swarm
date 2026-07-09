@@ -30,12 +30,9 @@ from swarm.types import HumanDecision
 logger = logging.getLogger(__name__)
 
 
-class TaskTokenLimitExceeded(Exception):
-    """单任务 token 估算超过 SWARM_MAX_TASK_TOKENS。"""
-
-    def __init__(self, usage: dict[str, Any]):
-        self.usage = usage
-        super().__init__(f"token limit exceeded: {usage.get('total')}")
+# 阶段1（§九 TaskLedger）：异常迁至 models/errors.py（ledger 单点闸也要抛它，models 层
+# 不能反向 import brain）。此处 re-export 保既有 import 路径兼容。
+from swarm.models.errors import TaskTokenLimitExceeded  # noqa: E402,F401
 
 
 class TaskLockLost(Exception):

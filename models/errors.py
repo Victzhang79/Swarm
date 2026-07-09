@@ -18,6 +18,20 @@ TRANSIENT = "transient"
 CAPABILITY = "capability"
 
 
+class TaskTokenLimitExceeded(Exception):
+    """单任务 token 预算耗尽（§九 TaskLedger 单点闸/节点边界闸共用）。
+
+    阶段1 自 brain/runner.py 迁入（runner re-export 保兼容）：ledger 在 models 层
+    预留失败时抛出，不能反向 import brain。usage dict 带归因：task_id/total/
+    limit_effective/reserved，阶段烧穿另带 stage/stage_spent/stage_limit。
+    runner 捕获后走 salvage→PARTIAL（E5 语义接口）。
+    """
+
+    def __init__(self, usage: dict):
+        self.usage = usage or {}
+        super().__init__(f"token limit exceeded: {self.usage.get('total')}")
+
+
 class TransientInfraError(Exception):
     """基础设施瞬时失败（沙箱上传/拉回失败、网络抖动等）。
 
