@@ -246,3 +246,23 @@ def test_fix6_ambiguous_scope_covers_not_merged():
         SubTask(id="st-9", description="d", scope=FileScope(writable=["pom.xml"]), covers=[])])
     n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2"})
     assert n == 0, "scope 不唯一不并"
+
+
+# ── #12：checkpointer serde 登记 swarm.types(消未注册警告+防未来版本拒绝反序列化破坏 resume) ──
+
+def test_fix12_serde_registers_swarm_types_and_roundtrips():
+    from swarm.brain.graph import _make_checkpoint_serde
+    serde = _make_checkpoint_serde()
+    assert serde is not None, "应构造出带 swarm.types 允许列表的 serde"
+    allowed = serde._allowed_msgpack_modules
+    assert ("swarm.types", "TaskPlan") in allowed and ("swarm.types", "SubTask") in allowed, \
+        "swarm.types 核心类型必须在允许列表(否则未来版本拒绝反序列化破坏 resume)"
+    # 含 TaskPlan/SubTask/枚举的状态经该 serde 往返不报错、不丢
+    tp = TaskPlan(subtasks=[SubTask(id="st-1", description="d",
+                                    scope=FileScope(create_files=["a/A.java"]))])
+    _typ, _blob = serde.dumps_typed(tp)
+    back = serde.loads_typed((_typ, _blob))
+    assert getattr(back, "subtasks", None) and back.subtasks[0].id == "st-1"
+    # builtins 仍走 SAFE_MSGPACK_TYPES 恒放行，不被窄允许列表误拦
+    _t2, _b2 = serde.dumps_typed({"a": [1, 2], "b": "x"})
+    assert serde.loads_typed((_t2, _b2)) == {"a": [1, 2], "b": "x"}

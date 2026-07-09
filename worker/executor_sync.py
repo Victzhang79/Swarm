@@ -436,12 +436,18 @@ class _SandboxSyncMixin:
         tracked = sorted(_git_tracked_set(
             local_root, sorted(candidates), resolve_base_ref(getattr(self, 'base_ref', None))))
         if not tracked:
-            # 遗漏项#3 复核（hunter#2）：候选非空却全不在 base 树（坏 ref/git 故障降级）时，
-            # 防脏叠加 reset 整体失效——任务级留痕（与 clean_upload 侧告警对称），不只进程日志。
-            if candidates:
+            # 遗漏项#3 复核（hunter#2）：候选非空却全不在 base 树时防脏叠加 reset 失效——任务级留痕。
+            # round36 #12 治本：区分【良性全新建】(候选全是 create_files，本就不在 base、无需 reset)
+            # 与【真降级】(声明为 writable 的【既有】文件却不在 base=坏 ref/git 故障)。只对后者 WARN，
+            # 前者静默——否则每个纯新建子任务都刷一条无意义告警(round36 实证噪声)，稀释真降级信号。
+            _sc = self.effective_scope
+            _writable_only = {self._norm_rel(local_root, f)
+                              for f in (list(getattr(_sc, "writable", []) or []))}
+            _missing_writable = sorted(c for c in candidates if c in _writable_only)
+            if _missing_writable:
                 self._log(
-                    f"[WARN] workspace reset: {len(candidates)} 个 writable 均不在 base 树"
-                    f"（全新建 或 git/ref 故障降级）→ 本轮防脏叠加 reset 未生效"
+                    f"[WARN] workspace reset: {len(_missing_writable)} 个【writable 既有文件】不在 base 树"
+                    f"（坏 ref/git 故障降级）→ 本轮防脏叠加 reset 未生效: {_missing_writable[:5]}"
                 )
             return 0
 

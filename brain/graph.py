@@ -79,6 +79,33 @@ _pg_checkpointer = None
 _pg_checkpointer_cm = None  # AsyncPostgresSaver.from_conn_string(...) 的 cm，shutdown 时 __aexit__
 
 
+def _make_checkpoint_serde():
+    """round36 #12：给 checkpointer serde 显式登记 swarm.types.* 到 allowed_msgpack_modules。
+    否则 LangGraph 反序列化 checkpoint 里的 TaskPlan/SubTask/枚举刷"unregistered type … will be
+    blocked in a future version"警告，且未来版本会【直接拒绝反序列化】→ 破坏 interrupt/resume 崩溃
+    恢复。动态收集 swarm.types 全部 pydantic/枚举类(自动含未来新增，不写死清单)。取用失败返回 None
+    →调用方保留默认 serde(绝不因此破坏 checkpointer 构造)。★证据：round36 全程 unregistered 警告仅
+    swarm.types.*（BrainState schema 固定），故显式允许 swarm.types 即完备；builtins/常见类型走 langgraph
+    SAFE_MSGPACK_TYPES 恒放行，不会被本允许列表误拦★。"""
+    try:
+        import enum as _enum
+        import inspect as _inspect
+        import swarm.types as _stypes
+        from pydantic import BaseModel as _BaseModel
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        _classes = [
+            _o for _o in vars(_stypes).values()
+            if _inspect.isclass(_o) and getattr(_o, "__module__", "") == "swarm.types"
+            and (issubclass(_o, _BaseModel) or issubclass(_o, _enum.Enum))
+        ]
+        if not _classes:
+            return None
+        return JsonPlusSerializer(allowed_msgpack_modules=_classes)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("[graph] #12 构造 swarm.types serde 允许列表失败(%s)——保留默认 serde", _exc)
+        return None
+
+
 # ══════════════════════════════════════════════
 # 条件边函数
 # ══════════════════════════════════════════════
@@ -662,6 +689,9 @@ def compile_brain_graph(checkpointer: AsyncPostgresSaver | None = None):
         global _memory_checkpointer
         if _memory_checkpointer is None:
             _memory_checkpointer = MemorySaver()
+            _serde = _make_checkpoint_serde()  # #12：同 PG 路径登记 swarm.types
+            if _serde is not None:
+                _memory_checkpointer.serde = _serde
         compiled = graph.compile(
             checkpointer=_memory_checkpointer,
         )
@@ -714,6 +744,11 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
         await checkpointer.setup()  # 幂等创建 checkpoint 表
         _pg_checkpointer_cm = cm
         _pg_checkpointer = checkpointer
+        # round36 #12：登记 swarm.types 到 serde 允许列表（消 unregistered 警告 + 防未来版本拒绝
+        # 反序列化 checkpoint 破坏 resume）。取用失败保留默认 serde，不破坏已就绪的 checkpointer。
+        _serde = _make_checkpoint_serde()
+        if _serde is not None:
+            checkpointer.serde = _serde
         # 让已编译单例（若已用 MemorySaver 建过）失效，下次取用 PG 版
         _compiled_brain_graph = None
         logger.info("[A1] PG checkpointer 已初始化（跨副本 interrupt/resume 就绪）")
