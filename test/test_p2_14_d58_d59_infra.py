@@ -90,6 +90,10 @@ def test_d58_not_ready_project_does_not_block_ready_task(monkeypatch):
     from swarm.brain import scheduler as sch
     from swarm.infra.redis_client import TaskQueue
 
+    # 全套件乱序鲁棒：其它测试把 redis_client._redis_client 全局置为已连接客户端后，
+    # TaskQueue 走 redis 分支而本测试设计为内存 fallback（_clear_memory 只清内存）→ 队列失灵。
+    # 强制 get_redis()→None 复现隔离态（隔离下本就 None → 全绿）。
+    monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
     TaskQueue._clear_memory()
     dispatched: list[tuple[str, float]] = []
 

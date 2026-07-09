@@ -27,6 +27,17 @@ from swarm.infra.redis_client import (
 )
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _force_memory_backend(monkeypatch):
+    """全套件乱序鲁棒：其它测试会把 redis_client._redis_client 全局置为已连接客户端，
+    使 TaskQueue/ModuleLock 走 redis 分支——本文件设计为【内存 fallback】（见模块 docstring），
+    _clear_memory 只清内存故失灵。强制 get_redis()→None，确定性复现隔离态（隔离下本就 None → 全绿）。"""
+    monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
+
+
 def _reset_queue():
     TaskQueue._clear_memory()
 
