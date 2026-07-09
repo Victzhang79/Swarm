@@ -2004,6 +2004,31 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_batch_cache": {},
         }
 
+    # ── A4（2026-07-09 登记册）：整模块分解失败 → 打回 PLAN 走 U2 补齐型重试 ──
+    # 此前 validate 对 plan_batch_failed_modules 视而不见：plan_valid=True 直进 CONFIRM
+    # 被 can_auto_accept_plan fail-fast 终结（11/12 成功也整任务死）。U2 补齐型重试机器
+    # （_repair_retry：成功批缓存回放、只重烧失败模块）造好了却没有入口。此处打回给足
+    # 回炉机会；熔断复用 plan_retry_count/MAX_PLAN_RETRY（after_validate），耗尽仍失败
+    # → confirm fail-fast 升人工（原终局保留）。不 emit plan_batch_cache——回炉靠它回放。
+    _pb_failed = state.get("plan_batch_failed_modules") or []
+    if _pb_failed:
+        _pb_issues = [
+            f"整模块分解失败({m.get('reason', '?')}): {m.get('name', '?')}"
+            f"（{m.get('files', 0)} 文件）——该模块的子任务未进入计划，交付范围残缺"
+            for m in _pb_failed if isinstance(m, dict)
+        ]
+        logger.warning(
+            "[VALIDATE_PLAN] %d 个模块分解失败 → 打回 PLAN 补齐型重试"
+            "（U2 缓存回放成功批、只重烧失败模块）: %s",
+            len(_pb_failed),
+            [m.get("name", "?") for m in _pb_failed if isinstance(m, dict)])
+        return {
+            "plan_valid": False,
+            "plan_retry_count": retry_count,
+            "plan_validation_issues": _pb_issues,
+            "plan_validation_feedback": _format_validation_feedback(_pb_issues),
+        }
+
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
     # 接缝：结构校验后、SIMPLE 早退后（单 trivial 子任务自证覆盖，强校验只会误伤）、
     # LLM 软校验前。requirement_items 缺失/空（抽取降级/老 checkpoint）→ 跳过校验 +
@@ -2220,6 +2245,10 @@ def confirm_plan(state: BrainState) -> dict:
                 "human_decision": HumanDecision.REJECT,
                 "confirm_reason": _reason,
                 "verification_failure": _vf,
+                # A4（2026-07-09 登记册）：真实死因进 runner 终态归因链（issues >
+                # deliver_auto_reject_reason > confirm_reason）——此前前两位皆空时终态
+                # 只报 "rejected: ultra"（confirm_reason 是进入原因非死因）。分开上报。
+                "deliver_auto_reject_reason": f"confirm fail-fast[{_vf}]: {reason}"[:500],
             }
             # tech_design 残缺 / 规划生成失败 / PLAN-BATCH 丢模块 → 升级人工(escalate)，
             # 与"计划非法"一样 fail-fast 但归因区分，绝不静默成功。
