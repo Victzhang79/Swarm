@@ -63,6 +63,9 @@ class SkillDoc:
     tags: tuple[str, ...] = field(default_factory=tuple)
     source_path: str = ""
     imported: bool = False  # True=从第三方 SKILL.md 导入（未声明路由标签，宽匹配）
+    # G5/G6（阶段E）：文件级拔插开关。False=解析保留（前端/审计可见）但选择器排除
+    # （绝不进注入面/工具面）。用于下架死件/矛盾件/niche 通配而不删文件。
+    enabled: bool = True
 
     def capped_body(self) -> str:
         """按本技能 max_chars 截断正文（防单条挤爆注入预算）。

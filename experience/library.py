@@ -141,6 +141,7 @@ def parse_skill_text(
         max_chars=_as_int(meta.get("max_chars"), 1200, field="max_chars", where=where),
         summary=description,
         tags=_as_str_tuple(meta.get("tags")),
+        enabled=str(meta.get("enabled", True)).strip().lower() not in ("false", "0", "no"),
         source_path=source_path,
         imported=not has_routing,
     )

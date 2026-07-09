@@ -16,7 +16,11 @@ _LIB = PROJECT_ROOT / "skills_library"
 _OK_INTENTS = {"*", "create", "modify", "debug", "audit", "refactor"}
 _OK_PHASES = {"*", "plan", "code", "produce"}
 _OK_TARGETS = {"worker", "planner"}
-_OK_STACKS = {"*", "python", "node", "java", "kotlin", "go", "rust", "cpp", "php", "ruby", "csharp"}
+_OK_STACKS = {"*", "python", "node", "java", "kotlin", "go", "rust", "cpp", "php", "ruby",
+              "csharp",
+              # G6（阶段E）：DB 面标签（与 selector._DB_SUBSTRINGS 键对齐）——画像文本
+              # 探出对应 DB 才挂，探不出都不挂（互斥，防双通配双挂吃错库建议）
+              "mysql", "postgres"}
 
 # 禁止出现在正文里的 ECC 工具/机制/厂商/激活散文字样（导入时必须已剥离）。
 _FORBIDDEN = [

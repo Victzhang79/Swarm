@@ -33,6 +33,12 @@ _LANG_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     "php": ("php", "laravel", "composer", "symfony"),
     "ruby": ("ruby", "rails", "gemfile"),
 }
+# G6（阶段E）：DB 面词表——画像文本（frontend/backend/build/evidence 拼串）提及才挂
+# 对应 DB 技能（互斥）；探不出都不挂（宁缺勿错，错库建议是负资产）。词表对称扩展。
+_DB_SUBSTRINGS: dict[str, tuple[str, ...]] = {
+    "mysql": ("mysql", "mariadb"),
+    "postgres": ("postgres", "postgresql", "pgsql"),
+}
 # 需按【词边界】判定的语言（子串会误伤：'java' ⊂ 'javascript'，'go' ⊂ 'mongo'）。
 _LANG_WORDS: dict[str, tuple[str, ...]] = {
     "python": ("py",),
@@ -63,6 +69,9 @@ def stack_langs_from_project_stack(project_stack: dict | None) -> set[str]:
     for lang, words in _LANG_WORDS.items():
         if any(re.search(rf"\b{re.escape(w)}\b", text) for w in words):
             langs.add(lang)
+    for db, subs in _DB_SUBSTRINGS.items():  # G6：DB 互斥挂载信号
+        if any(sub in text for sub in subs):
+            langs.add(db)
     return langs
 
 
@@ -132,7 +141,8 @@ def select_skills(
     cands = [
         s
         for s in skills
-        if target in s.target
+        if getattr(s, "enabled", True)  # G5/G6：disabled 绝不进任何注入面/工具面
+        and target in s.target
         and _match_stacks(s.applies_to_stacks, stack_langs)
         and _match_one(s.applies_to_intents, intent)
         and _match_one(s.applies_to_phases, phase)

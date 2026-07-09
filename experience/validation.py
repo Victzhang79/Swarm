@@ -27,7 +27,11 @@ logger = logging.getLogger(__name__)
 _OK_INTENTS = {"*", "create", "modify", "debug", "audit", "refactor"}
 _OK_PHASES = {"*", "plan", "code", "produce"}
 _OK_TARGETS = {"worker", "planner"}
-_OK_STACKS = {"*", "python", "node", "java", "kotlin", "go", "rust", "cpp", "php", "ruby", "csharp"}
+_OK_STACKS = {"*", "python", "node", "java", "kotlin", "go", "rust", "cpp", "php", "ruby",
+              "csharp",
+              # G6（阶段E）：DB 面标签（与 selector._DB_SUBSTRINGS 键对齐）——画像文本
+              # 探出对应 DB 才挂，探不出都不挂（互斥，防双通配双挂吃错库建议）
+              "mysql", "postgres"}
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 

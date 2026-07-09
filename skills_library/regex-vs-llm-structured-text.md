@@ -2,6 +2,7 @@
 id: regex-vs-llm-structured-text
 title: 结构化文本解析：正则 vs LLM 选型
 description: "当你要解析格式重复的结构化文本（表单/发票/题库）并纠结用正则还是 LLM 抽取时调用，返回「正则抽取+置信度打分+LLM 兜底」三段管线的选型决策与落地要点。"
+enabled: false  # 阶段E 下架：niche 通配稀释选择面（G6）
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code"]

@@ -2,7 +2,7 @@
 id: mysql-patterns
 title: MySQL 查询/索引/Schema 最佳实践
 description: "当你在设计 MySQL/MariaDB 表结构、复合索引、EXPLAIN 调优、ON DUPLICATE KEY 上插、keyset 分页或处理 InnoDB 死锁时调用，返回 Schema/索引/事务规则与反模式清单。"
-applies_to_stacks: ["*"]
+applies_to_stacks: ["mysql"]  # G6：画像文本探出 mysql 才挂（互斥，探不出都不挂）
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["code", "produce"]
 target: ["worker"]

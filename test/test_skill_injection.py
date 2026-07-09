@@ -187,9 +187,12 @@ def test_selector_exception_fails_open(monkeypatch):
 
 
 def test_none_stack_still_returns_stack_agnostic():
-    # 无 project_stack：仍应命中栈无关技能（coding-standards-core 等）
+    # 无 project_stack：仍应命中栈无关技能。
+    # G2/G7 语义演进（阶段E）：工具面收敛 max_k=3 且 coding-standards-core 让位
+    # priority 45——不再断言特定技能必入前 3，只断言目录非空且有界。
     out = worker_skills_block(_sub(), None)
-    assert out and "编码规范" in out
+    assert out and "experience__" in out
+    assert out.count("- experience__") <= 3, "G2：worker 工具目录收敛 ≤3"
 
 
 # ── 接线：build_worker_prompt ──

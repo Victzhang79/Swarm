@@ -2,6 +2,7 @@
 id: git-workflow
 title: Git 工作流与提交规范
 description: "当你在选分支策略（GitHub Flow/GitFlow）、写 Conventional Commits 提交、纠结 merge 还是 rebase、解冲突标记或打 SemVer tag 发版时调用，返回 Git 全流程规范速查。"
+enabled: false  # 阶段E 下架：内容(push/tag/PR)与无 .git 沙箱矛盾且 phases=produce 永不选中（G5）
 applies_to_stacks: ["*"]
 applies_to_intents: ["*"]
 applies_to_phases: ["produce"]

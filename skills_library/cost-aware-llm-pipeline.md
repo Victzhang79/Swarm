@@ -2,6 +2,7 @@
 id: cost-aware-llm-pipeline
 title: LLM 成本优化与模型路由
 description: "当你在搭建 LLM 调用管线、需要按复杂度路由便宜/强模型、设预算上限 fail-fast、只对限流 5xx 窄重试或做提示缓存时调用，返回四件套代码骨架与反模式清单。"
+enabled: false  # 阶段E 下架：niche 通配稀释选择面（G6）
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "modify"]
 applies_to_phases: ["plan", "code"]
