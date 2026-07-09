@@ -581,16 +581,26 @@ def _label_grounded_fact_issues(fact_issues: list | None, file_checks: list,
     for fi in fact_issues:
         if isinstance(fi, dict):
             fi.pop("grounded", None)  # LLM 自由文本无权坐实，防绕过豁免直接 block
-    _planned_create_bases = {
-        _os.path.basename(str(fp.get("path", ""))).lower()
+    _planned_create_paths = {
+        str(fp.get("path", "")).lower().lstrip("./")
         for fp in (file_plan if isinstance(file_plan, list) else [])
         if isinstance(fp, dict) and fp.get("path")
         and str(fp.get("action") or "create").lower() == "create"
     }
+    _planned_create_bases = {p.rsplit("/", 1)[-1] for p in _planned_create_paths}
+
+    def _is_planned_create(fname: str) -> bool:
+        # 复核 H3（2026-07-09）：路径形态的点名（含 /）按【后缀】匹配——跨目录同名
+        # （com/b/X vs 计划新建 com/a/X）不得误豁免（round37 同名接口爆炸是本仓已证实
+        # 模式）。裸文件名保持 basename 口径（PRD 常只写类文件名）。
+        f = fname.lower().lstrip("./")
+        if "/" in f:
+            return any(p == f or p.endswith("/" + f) for p in _planned_create_paths)
+        return f in _planned_create_bases
+
     det_false = [
         fc for fc in file_checks
-        if not fc.get("exists")
-        and _os.path.basename(str(fc.get("file", ""))).lower() not in _planned_create_bases
+        if not fc.get("exists") and not _is_planned_create(str(fc.get("file", "")))
     ]
     det_missing = {str(fc.get("file", "")).strip() for fc in det_false if fc.get("file")}
     det_missing_bases = {f.rsplit("/", 1)[-1] for f in det_missing if f}

@@ -63,11 +63,11 @@ _TRANSIENT_MARKERS = (
     "连接被重置",
     "服务不可用",
     "暂时不可用",
-    "服务繁忙",
     "限流",
     "请求过多",
     "网关错误",
-    "稍后重试",
+    # 复核 H4：不收"稍后重试/服务繁忙"——它们是叙述性客套话，free-form summary 兜底
+    # 分类会把确定性 capability 失败误判 transient；只收具体故障特征词。
 )
 
 
@@ -100,7 +100,10 @@ def classify_failure(err: BaseException | str | None) -> str | None:
 
     # 1) 异常对象：isinstance 优先
     if isinstance(err, BaseException):
-        if isinstance(err, TransientInfraError) or _is_transient_instance(err):
+        # 阶段0 复核 H2（2026-07-09）：裸 TimeoutError/asyncio.TimeoutError 的 str() 为空，
+        # 文本特征全绕过 → 最典型的超时形态被判 None。TimeoutError 天然是基建瞬时
+        # （asyncio.TimeoutError/socket.timeout 自 3.10 起均为其别名/子类）。
+        if isinstance(err, (TransientInfraError, TimeoutError)) or _is_transient_instance(err):
             return TRANSIENT
         text = str(err)
     else:

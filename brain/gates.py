@@ -74,6 +74,18 @@ def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
             "file_plan 为空、方案为占位，不得静默 auto_accept，须人工介入"
         )
 
+    # 阶段0 复核 R1（2026-07-09）：plan_batch_failed 专属归因必须先于通用 plan_invalid——
+    # A4 让失败模块轮 plan_valid=False，重试耗尽进 confirm 时若先撞通用分支，round29 专门
+    # 建的归因（"误标 plan_invalid 会污染 L5 错题"）被架空、escalate 标记丢失。
+    plan_batch_failed = state.get("plan_batch_failed_modules") or []
+    if plan_batch_failed:
+        _pb_names = [m.get("name", "?") for m in plan_batch_failed if isinstance(m, dict)]
+        _pb_files = sum(int(m.get("files") or 0) for m in plan_batch_failed if isinstance(m, dict))
+        return False, (
+            f"plan_batch_failed: {len(plan_batch_failed)} 个模块分解失败 {_pb_names}"
+            f"（共 {_pb_files} 个规划文件未纳入计划）——计划范围残缺，不得静默 auto_accept，须人工介入"
+        )
+
     # #6：纵深防御——plan_valid 缺省判 False（validate 节点正常总会显式置位；缺失=未经校验，
     # 保守拒绝放行，不假定合法）。
     if not state.get("plan_valid", False):
@@ -89,18 +101,7 @@ def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
             "——file_plan 不完整，不得静默 auto_accept，须人工介入"
         )
 
-    # round29 真因4（W1.1 的 PLAN-BATCH 对等物）：分批拆解有模块失败 → 该模块子任务整体蒸发、
-    # 交付范围残缺（d37a52a3 'system-enhance' 14 文件+已生成契约悬空实证），且规则5 契约无
-    # owner 承接=编译期引信。绝不能静默 auto_accept 当完整计划，须人工审残缺范围后显式放行
-    # （放行后 degraded_reasons 仍带痕，L6 不学成成功）。
-    plan_batch_failed = state.get("plan_batch_failed_modules") or []
-    if plan_batch_failed:
-        _pb_names = [m.get("name", "?") for m in plan_batch_failed if isinstance(m, dict)]
-        _pb_files = sum(int(m.get("files") or 0) for m in plan_batch_failed if isinstance(m, dict))
-        return False, (
-            f"plan_batch_failed: {len(plan_batch_failed)} 个模块分解失败 {_pb_names}"
-            f"（共 {_pb_files} 个规划文件未纳入计划）——计划范围残缺，不得静默 auto_accept，须人工介入"
-        )
+    # round29 真因4（W1.1 的 PLAN-BATCH 对等物）判定已上移到 plan_valid 之前（复核 R1）。
     return True, ""
 
 

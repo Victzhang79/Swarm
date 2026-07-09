@@ -566,7 +566,13 @@ def _previous_plan_repair_block(prev_plan, prev_baseline) -> str:
     if len(full) > 6000:
         # 复核 L-4：截断必须自述——否则"保留未点名子任务"指令会反向诱导 LLM 丢掉未展示的
         body += "\n  （摘要已截断：未列出的子任务同样存在且需保留）"
-    _bl_text = ", ".join(bl)[:1200]  # hunter F3：申报摘要独立定界（拼在 body 截断之后）
+    # hunter F3：申报摘要独立定界（拼在 body 截断之后）。阶段0 复核 H1（2026-07-09）：
+    # 截断必须自述——下方"保留 baseline_covered 申报"指令会反向诱导 LLM 丢未展示条目
+    # （A8 帽升 500 后触发面变大，>~21 条即触发）。
+    _bl_text = ", ".join(bl)
+    if len(_bl_text) > 1200:
+        _bl_text = _bl_text[:1200] + (
+            f"…（申报摘要已截断：共 {len(bl)} 条申报，未列出的同样有效且需全部保留）")
     return (
         "\n上一版计划摘要（子任务 → covers 声明）：\n" + body
         + (f"\nbaseline_covered 申报: {_bl_text}" if _bl_text else "")
@@ -1865,7 +1871,10 @@ async def plan(state: BrainState) -> dict:
         # 成功产出新计划后清空；否则永久粘滞把 P1 外科补齐(1413)/#6 覆盖单调化(1803)/
         # U2 缓存(774)/R35-C 回放(780) 四套保护整体架空（round37b P1/P3 被架空的机制载体）。
         # LLM 降级兜底轮（_plan_degraded 非 None=空 scope 假计划）不清：下一轮真规划仍需看到根因。
-        "replan_feedback": "" if _plan_degraded is None else (
+        # 复核 R2（A1×A4 组合断裂，双复核 CONFIRMED）：ULTRA 分批【部分失败】轮也不清——
+        # A4 会把该轮打回补齐重试，失败模块届时要真重拆，其 prompt 仍需最初执行失败根因；
+        # 清了则 U2 回放成功批没问题、唯独失败模块的重拆丢教训（F-3 被跨提交击穿）。
+        "replan_feedback": "" if (_plan_degraded is None and not _plan_batch_failed) else (
             state.get("replan_feedback") or ""),
         **_surgical_replan_reset(_replan_old_results, _replan_old_plan, task_plan,
                                  old_recovery_counts=state.get("targeted_recovery_counts"),
