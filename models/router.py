@@ -136,10 +136,134 @@ class _UsageRecorder(BaseCallbackHandler):
             pass  # 统计绝不拖垮模型调用
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
-        # 调用失败：清理两个 per-run 字典，避免 run_id 泄漏累积（best-effort）。
+        # B4（2026-07-09 登记册·阶段1）：中止/超时/掐流的调用【已收 chunk 的 usage 必须入账】——
+        # 原直接 pop 丢弃 → token 硬顶对最烧钱的饱和形态（流中途被杀）失明。现按逐 chunk
+        # 跟踪的字段最大值照常 record（best-effort，绝不拖垮错误传播）。
         rid = kwargs.get("run_id")
-        self._starts.pop(rid, None)
-        self._usage.pop(rid, None)
+        t0 = self._starts.pop(rid, None)
+        tracked = self._usage.pop(rid, None)
+        try:
+            if tracked and (tracked[0] > 0 or tracked[1] > 0):
+                dur_ms = int((_monotonic() - t0) * 1000) if t0 is not None else 0
+                from swarm.knowledge.service import get_worker_project_id
+                from swarm.models import usage_tracker
+                usage_tracker.record(
+                    get_worker_project_id(), self.kind, self.provider_id, self.model_name,
+                    tracked[0], tracked[1], duration_ms=dur_ms,
+                )
+        except Exception:  # noqa: BLE001
+            pass  # 统计绝不拖垮错误传播
+
+
+class _LedgerGuard(BaseCallbackHandler):
+    """§九 TaskLedger 单点闸（阶段1.3）：LLM 调用发起前预留额度、结束按真实结算、
+    error/中止按已收 chunk 结算——挂在 get_chat_model 唯一 chokepoint，覆盖全部
+    cloud+local、brain+worker、primary+fallback 路径。
+
+    raise_error=True：on_llm_start 预留失败抛 TaskTokenLimitExceeded 必须【中止调用】
+    （拒绝发起，不再发出必然烧钱的请求）——这是"闸门查得晚"（原只在节点边界查）的治本。
+    task 归属取 usage_tracker 的 ContextVar（调用发起点上下文）；未 attach 的任务
+    在 ledger 侧是 track-only（budget=0 不闸），预处理/无任务上下文调用零影响。
+    模型实例带回调被 D54 缓存跨任务复用 → 本类状态只按 run_id 键控、task 按调用时解析。
+    """
+
+    raise_error = True  # 预留失败必须传播中止调用（langchain 默认吞回调异常）
+
+    # 预留估算参数：input 按 prompt 字符 //3（CJK ~1.7 char/tok 与 EN ~4 char/tok 折中，
+    # 结算按真实 usage 校正）；output 无显式 max_tokens 时的保守预留（brain 不设上限，
+    # 若按 brain_max_tokens=32768 预留会在预算尾段大面积误拒——预留是准入控制，
+    # 低估的暴露面有界=单次调用真实输出，由 settle 立即校正）。
+    _DEFAULT_OUT_RESERVE = 4096
+
+    def __init__(self, kind: str, model_name: str, max_tokens: int | None) -> None:
+        self.kind = (kind or "cloud").lower()
+        self.model_name = model_name or ""
+        self.max_tokens = int(max_tokens) if max_tokens and max_tokens > 0 else 0
+        self._rids: dict[Any, str] = {}          # run_id → reservation_id
+        self._usage: dict[Any, list[int]] = {}   # run_id → [max_in, max_out]（同 _UsageRecorder 口径）
+
+    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
+        from swarm.models import ledger, usage_tracker
+        task_id = usage_tracker.get_current_task()
+        if not task_id:
+            return  # 无任务归属（预处理/探测）→ 不预留不闸
+        est_in = sum(len(p or "") for p in (prompts or [])) // 3 + 64
+        est_out = self.max_tokens or self._DEFAULT_OUT_RESERVE
+        # reserve 余额不足抛 TaskTokenLimitExceeded → raise_error=True 传播 → 调用被拒绝发起
+        rid = ledger.reserve(task_id, est_in=est_in, est_out=est_out, kind=self.kind)
+        self._rids[kwargs.get("run_id")] = rid
+
+    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        # 逐 chunk 抓 usage（字段取最大，累计型网关口径，见 _UsageRecorder 注释）——
+        # error/中止结算的依据。
+        try:
+            chunk = kwargs.get("chunk")
+            um = getattr(getattr(chunk, "message", None), "usage_metadata", None) \
+                or getattr(chunk, "usage_metadata", None)
+            if not um:
+                return
+            rid = kwargs.get("run_id")
+            slot = self._usage.get(rid)
+            if slot is None:
+                slot = [0, 0]
+                self._usage[rid] = slot
+            i = int(um.get("input_tokens", 0) or 0)
+            o = int(um.get("output_tokens", 0) or 0)
+            if i > slot[0]:
+                slot[0] = i
+            if o > slot[1]:
+                slot[1] = o
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        try:
+            run_id = kwargs.get("run_id")
+            rid = self._rids.pop(run_id, None)
+            tracked = self._usage.pop(run_id, None)
+            if rid is None:
+                return
+            from swarm.models import ledger
+            if tracked and (tracked[0] > 0 or tracked[1] > 0):
+                real_in, real_out = tracked[0], tracked[1]
+            else:
+                real_in, real_out = _extract_token_usage(response)
+            if real_in <= 0 and real_out <= 0:
+                # 网关不回 usage → 按估算结算（input 全额 + output 按响应文本估），
+                # 宁可高估不让预算失明。
+                real_in, real_out = 0, _estimate_output_tokens(response)
+                from swarm.models import ledger as _l  # settle_error 取 max(chunk, 预留 est_in)
+                _l.settle_error(rid, chunk_in=0, chunk_out=real_out)
+                return
+            ledger.settle(rid, real_in=real_in, real_out=real_out)
+        except Exception:  # noqa: BLE001
+            # 结算失败绝不拖垮调用结果；预留由 detach 兜底清理
+            pass
+
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        try:
+            run_id = kwargs.get("run_id")
+            rid = self._rids.pop(run_id, None)
+            tracked = self._usage.pop(run_id, None) or [0, 0]
+            if rid is None:
+                return
+            from swarm.models import ledger
+            # B4 治本：中止/超时/掐流按已收 chunk 估算结算（input 取 max(chunk,预留)宁可高估）
+            ledger.settle_error(rid, chunk_in=tracked[0], chunk_out=tracked[1])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _estimate_output_tokens(response: Any) -> int:
+    """无 usage 回报时按响应文本长度估算 output token（//3，与预留口径一致）。"""
+    try:
+        n = 0
+        for gens in (getattr(response, "generations", None) or []):
+            for g in gens:
+                n += len(getattr(g, "text", "") or "")
+        return n // 3
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _extract_token_usage(response: Any) -> tuple[int, int]:
@@ -357,6 +481,8 @@ class EndpointProvider:
         # 覆盖全部 cloud+local、brain+worker、primary+fallback 路径且只挂一处=不重复计数。
         _cbs = list(callbacks or [])
         _cbs.append(_UsageRecorder(self.provider.kind, self.provider.id, model_name))
+        # §九 阶段1.3：TaskLedger 单点闸——同一 chokepoint 挂一次，预留-结算全路径覆盖。
+        _cbs.append(_LedgerGuard(self.provider.kind, model_name, max_tokens))
         _kwargs: dict = dict(
             model=model_name,
             base_url=self.provider.base_url,

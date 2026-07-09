@@ -83,6 +83,11 @@ def set_current_task(task_id: str | None) -> None:
     _current_task_var.set(task_id or None)
 
 
+def get_current_task() -> str | None:
+    """当前上下文归属的 task_id（阶段1 TaskLedger 单点闸在调用发起时取归属）。"""
+    return _current_task_var.get()
+
+
 def get_task_total_tokens(task_id: str) -> int:
     """该 task 本进程内已记账的真实 token 累计（prompt+completion，含本地+云端）。无记录返回 0。
 
