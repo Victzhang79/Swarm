@@ -1378,6 +1378,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_transient_counts: dict | None = None,
                            old_force_strong: dict | None = None,
                            old_use_alternate: dict | None = None,
+                           old_contract_counts: dict | None = None,
                            merged_cover_injections: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
@@ -1400,7 +1401,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     只保留在新 plan 且签名一致者——签名变=语义新子任务，绝不继承旧放弃/旧配额。"""
     if not any((old_results, old_recovery_counts, old_retry_counts,
                 old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
-                old_transient_counts, old_force_strong, old_use_alternate)):
+                old_transient_counts, old_force_strong, old_use_alternate,
+                old_contract_counts)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -1503,6 +1505,10 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     pruned_use_alternate = {
         sid: v for sid, v in (old_use_alternate or {}).items() if _sig_unchanged(sid)
     }
+    # D13：契约重试独立表同签名纪律
+    pruned_contract = {
+        sid: n for sid, n in (old_contract_counts or {}).items() if _sig_unchanged(sid)
+    }
     pruned_redecompose = {
         sid: n for sid, n in (old_redecompose_counts or {}).items() if _sig_unchanged(sid)
     }
@@ -1534,6 +1540,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         "subtask_force_strong": pruned_force_strong,
         # 3.9 H-F7：alternate 标记表同签名剪枝
         "subtask_use_alternate": pruned_use_alternate,
+        # D13：契约重试表同签名剪枝
+        "contract_retry_counts": pruned_contract,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -1814,7 +1822,8 @@ async def plan(state: BrainState) -> dict:
                                  old_give_up_ids=state.get("give_up_isolated_ids"),
                                  old_transient_counts=state.get("subtask_transient_counts"),
                                  old_force_strong=state.get("subtask_force_strong"),
-                                 old_use_alternate=state.get("subtask_use_alternate")),
+                                 old_use_alternate=state.get("subtask_use_alternate"),
+                                 old_contract_counts=state.get("contract_retry_counts")),
             **plan_touch,
         }
 
@@ -2199,6 +2208,7 @@ async def plan(state: BrainState) -> dict:
                                  old_transient_counts=state.get("subtask_transient_counts"),
                                  old_force_strong=state.get("subtask_force_strong"),
                                  old_use_alternate=state.get("subtask_use_alternate"),
+                                 old_contract_counts=state.get("contract_retry_counts"),
                                  # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
                                  merged_cover_injections=_cover_injections),
         **plan_touch,

@@ -52,9 +52,11 @@ def test_merge_same_name_unions_signatures_no_method_loss():
     旧行为是 keep-first 丢弃 → 被丢版独有的方法在共享契约里缺失 → 下游 cannot-find-method。
     """
     skeleton = {"conventions": [], "constants": []}
+    # 语义演进（阶段6 D10）：跨模块同名=不同契约，各自独立成条（round37 实测裸 name
+    # 全局自并=168→148 接口爆炸来源）。"不丢方法"意图保留——改为同模块两片验证并集。
     slices = [
         {"interfaces": [{"name": "INotify", "module": "ch", "signature": "send(A):B"}]},
-        {"interfaces": [{"name": "INotify", "module": "eng", "signature": "retry(X):Y"}]},
+        {"interfaces": [{"name": "INotify", "module": "ch", "signature": "retry(X):Y"}]},
     ]
     # 直接挂 handler 到具名 logger 抓 info（并集合并打 info，不再是 warning 丢弃）
     logging.disable(logging.NOTSET)
@@ -77,16 +79,18 @@ def test_merge_same_name_unions_signatures_no_method_loss():
     ifs = [i for i in m["interfaces"] if i["name"] == "INotify"]
     assert len(ifs) == 1
     assert "send(A):B" in ifs[0]["signature"] and "retry(X):Y" in ifs[0]["signature"]
-    assert any("并集合并" in mm for mm in msgs)
+    # 语义演进（D10）：同模块并集走 P6 聚合告警（"边界重叠"WARNING），非逐条 INFO
+    assert any(("并集合并" in mm) or ("边界重叠" in mm) for mm in msgs)
     assert not any("丢弃" in mm for mm in msgs)
 
 
 def test_merge_same_name_exact_dup_is_silent():
     """同名且签名完全相同 → 静默去重，不告警、不重复。"""
     skeleton = {"conventions": [], "constants": []}
+    # 语义演进（阶段6 D10）：同模块完全重复才静默去重；跨模块同名各自成条。
     slices = [
         {"interfaces": [{"name": "ISvc", "module": "a", "signature": "f():v"}]},
-        {"interfaces": [{"name": "ISvc", "module": "b", "signature": "f():v"}]},
+        {"interfaces": [{"name": "ISvc", "module": "a", "signature": "f():v"}]},
     ]
     m = _merge_module_contracts(skeleton, slices)
     ifs = [i for i in m["interfaces"] if i["name"] == "ISvc"]
@@ -96,9 +100,10 @@ def test_merge_same_name_exact_dup_is_silent():
 def test_merge_dto_fields_unioned():
     """同名 DTO 跨模块字段不同 → fields 并集（保序去重），不丢字段。"""
     skeleton = {"conventions": [], "constants": []}
+    # 语义演进（阶段6 D10）：同模块两片 DTO 并集；跨模块同名 DTO 各自成条不合体。
     slices = [
         {"dtos": [{"name": "UserDTO", "module": "a", "fields": ["String name", "Long id"]}]},
-        {"dtos": [{"name": "UserDTO", "module": "b", "fields": ["Long id", "Integer age"]}]},
+        {"dtos": [{"name": "UserDTO", "module": "a", "fields": ["Long id", "Integer age"]}]},
     ]
     m = _merge_module_contracts(skeleton, slices)
     dto = [d for d in m["dtos"] if d["name"] == "UserDTO"]

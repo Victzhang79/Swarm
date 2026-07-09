@@ -1185,8 +1185,26 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
                 cs.create_files = _union_keep_order(cs.create_files, ds.create_files)
                 cs.writable = _union_keep_order(cs.writable, ds.writable)
                 cs.readable = _union_keep_order(cs.readable, ds.readable)
+                # D14（阶段6，登记册 §五）：dup 其余 scope 成员不再丢弃——delete_files/
+                # create_dirs 也并集（此前只并 3 字段，dup 的删除/建目录意图静默蒸发）。
+                for _fld in ("delete_files", "create_dirs"):
+                    if hasattr(cs, _fld) or hasattr(ds, _fld):
+                        setattr(cs, _fld, _union_keep_order(
+                            list(getattr(cs, _fld, None) or []),
+                            list(getattr(ds, _fld, None) or [])))
             canon.depends_on = _union_keep_order(getattr(canon, "depends_on", []),
                                                  getattr(dup, "depends_on", []))
+            # D14：验收标准/描述并集——dup 独有的 acceptance_criteria 丢弃=验收面缩水；
+            # description 追加（去重）保住 dup 语义供 worker prompt。
+            _ac = _union_keep_order(
+                list(getattr(canon, "acceptance_criteria", None) or []),
+                list(getattr(dup, "acceptance_criteria", None) or []))
+            if _ac:
+                canon.acceptance_criteria = _ac
+            _dd = (getattr(dup, "description", "") or "").strip()
+            if _dd and _dd not in (getattr(canon, "description", "") or ""):
+                canon.description = ((getattr(canon, "description", "") or "")
+                                     + f"；（并入重复脚手架语义）{_dd}")[:2000]
             drop_to_canon[dup.id] = canon.id
             merged += 1
     if not merged:
@@ -1242,11 +1260,17 @@ def fix_dependency_ordering(plan: TaskPlan) -> bool:
             st.depends_on = nd
             changed = True
 
-    # 规则 2：脚手架置根
+    # 规则 2：脚手架置根——D15（阶段6，登记册 §五）：不再无条件清空。脚手架间的
+    # 真实依赖（父 pom 先于子模块清单、根 workspace 先于成员）是合法上游序，抹平
+    # 置根会让 greenfield 并行建清单撞 reactor 时序错误且无回补。只剥指向【非脚手架】
+    # 的依赖（那才是规则2 要治的"脚手架被业务代码倒挂"）。
     for st in subs:
-        if st.id in scaffold_ids and (getattr(st, "depends_on", None) or []):
-            st.depends_on = []
-            changed = True
+        _deps = list(getattr(st, "depends_on", None) or [])
+        if st.id in scaffold_ids and _deps:
+            _kept_deps = [d for d in _deps if d in scaffold_ids]
+            if _kept_deps != _deps:
+                st.depends_on = _kept_deps
+                changed = True
 
     # 规则 3：SQL 依赖所有实体(无 java 则兜底依赖脚手架),并纳入实体 readable
     target = java_ids or sorted(scaffold_ids)

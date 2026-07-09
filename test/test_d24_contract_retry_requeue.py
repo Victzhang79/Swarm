@@ -64,7 +64,8 @@ def test_contract_retry_requeues_and_clears():
     # failed 清空（下轮 monitor 走 dispatch 而非再进 handle_failure）
     assert out["failed_subtask_ids"] == []
     # 重试计数自增
-    assert out["subtask_retry_counts"].get("st-2") == 1
+    # 语义演进（阶段6 D13）：契约重试记独立表，不再挤兑 capability 配额
+    assert out["contract_retry_counts"].get("st-2") == 1
     print("  ✅ 契约 retry：pop 结果 + 加回 remaining + 清 failed + 计数自增")
 
 

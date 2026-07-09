@@ -114,6 +114,7 @@ class BrainState(TypedDict, total=False):
     # 未来若有并行分支也写此键不会静默丢早先条目。
     merge_rebase_dropped: Annotated[list[str], _merge_degraded_reasons]
     subtask_retry_counts: dict[str, int]  # 每个子任务的累计【capability】重试次数（换模型/升级阶梯）
+    contract_retry_counts: dict[str, int]  # D13（阶段6）：契约偏离重试独立表——横切集成面失败不挤兑个体 capability 配额
     subtask_redecompose_count: dict[str, int]  # 卡死子任务恢复阶梯·阶梯二：定点拆小次数（有界，每子任务≤1）
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
@@ -293,6 +294,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "failure_escalated": "round",
     "subtask_force_strong": "monotonic",   # D08 签名剪枝（3.8 补）
     "subtask_retry_counts": "monotonic",   # D08 签名剪枝
+    "contract_retry_counts": "monotonic",  # D08 签名剪枝（D13 独立契约表）
     "subtask_redecompose_count": "monotonic",  # D08 签名剪枝
     "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）
     "targeted_recovery_count": "monotonic",

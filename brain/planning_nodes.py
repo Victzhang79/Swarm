@@ -1611,12 +1611,17 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
                 if not name:
                     out.append(item)  # 无名项不去重，直接并入
                     continue
-                if name not in seen:
+                # D10（阶段6，登记册 §五）：合并键改 (module, name)——旧裸 name 键把
+                # 跨模块同名接口强行合体（module 归属取首版，round37 实测 168→148 的
+                # 来源）。同模块同名（bisect/边界重叠）照旧并集；跨模块同名=不同契约，
+                # 各自独立成条（无 module 字段归入 "" 桶=保留旧全局并集语义兜底）。
+                _key = (str(item.get("module") or "").strip(), name)
+                if _key not in seen:
                     merged = dict(item)
-                    seen[name] = merged
+                    seen[_key] = merged
                     out.append(merged)  # out 与 seen 共享同一引用，后续并集就地生效
                     continue
-                base = seen[name]
+                base = seen[_key]
                 _base_mod = str(base.get("module") or "").strip()
                 _item_mod = str(item.get("module") or "").strip()
                 _intra = _base_mod and _item_mod and _base_mod == _item_mod

@@ -3084,6 +3084,14 @@ def run_l1_pipeline(
                 return False, details
         details["verify_commands"] = verify_results
 
+    # C4（阶段6，登记册 §五）：非空 diff 但既无 test_command 也无 verify_commands 的
+    # 子任务——确定性验证面只剩编译（test skip 判过），语义正确性零覆盖。打 needs_review
+    # 标记（deliver/人工闸可见；阻断语义由 det+llm conflict 分支承担——Phase-4 自检判
+    # False 时 evaluate_l1 已 fail，见 deterministic_llm_conflict）。
+    if modified and not (getattr(harness, "test_command", "") if harness else "") \
+            and not (list(getattr(harness, "verify_commands", []) or []) if harness else []):
+        details["needs_review"] = "no_test_or_verify_commands"
+
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = os.environ.get("SWARM_WORKER_L1_SELF_REVIEW", "true").lower() not in ("false", "0", "no")
     # C1：自检是 advisory——预算耗尽只跳过自检（不 BLOCKED 整个已通过的确定性结论）

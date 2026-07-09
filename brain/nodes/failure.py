@@ -427,7 +427,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             logger.warning("[HANDLE_FAILURE] 契约失败连坐 %d 个子任务重试（不再静默截断前 3）: %s",
                            len(failed), failed[:8])
         _max_retries = get_config().model.max_retries  # 默认 2
-        _retry_counts = dict(state.get("subtask_retry_counts", {}))
+        # D13（阶段6，登记册 §五）：契约重试改独立表 contract_retry_counts——旧实现
+        # 复用 subtask_retry_counts（capability 配额），契约反复=交叉挤兑个体能力配额
+        # （契约是横切集成面失败，非个体胜任性问题）。
+        _retry_counts = dict(state.get("contract_retry_counts", {}))
         _next_counts = {fid: _retry_counts.get(fid, 0) + 1 for fid in failed}
         _deepest = max(_next_counts.values(), default=0)
         if _deepest > _max_retries + 1:
@@ -440,7 +443,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "failure_strategy": "escalate",
                 "failed_subtask_ids": failed,
                 "verification_failure": None,
-                "subtask_retry_counts": {**_retry_counts, **_next_counts},
+                "contract_retry_counts": {**_retry_counts, **_next_counts},
             }
         logger.info("[HANDLE_FAILURE] 契约偏离 — 重试相关子任务(第 %d 次)", _deepest)
         # 治本 D24：与其它 retry 分支对称——pop 相关 subtask_results 并加回 dispatch_remaining，
@@ -457,9 +460,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "dispatch_remaining": _dispatch_remaining,
             "failure_strategy": "retry",
             "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
+            "contract_retry_counts": {**_retry_counts, **_next_counts},  # D13 独立表
             "failed_subtask_ids": [],
             "verification_failure": None,
-            "subtask_retry_counts": {**_retry_counts, **_next_counts},
         }
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先

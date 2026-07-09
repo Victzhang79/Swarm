@@ -40,15 +40,18 @@ def test_intra_module_union_preserves_all_methods():
 
 
 def test_cross_module_same_name_still_unions():
-    """跨模块同名（真多版）→ 照常并集为一条，两模块方法都在。"""
+    """语义演进（阶段6 D10）：跨模块同名=不同契约，各自独立成条（合并键 (module,name)）——
+    旧全局并集把跨模块同名接口强行合体（module 归属取首版），round37 实测 168→148
+    接口爆炸自并来源。两模块方法都在（各自条目内），不丢方法的意图保留。"""
     slices = [
         {"interfaces": [_iface("ISvc", "core", "a()")]},
         {"interfaces": [_iface("ISvc", "web", "b()")]},   # 跨模块
     ]
     merged = _merge_module_contracts({}, slices)
     ifaces = [i for i in merged["interfaces"] if i["name"] == "ISvc"]
-    assert len(ifaces) == 1
-    assert "a()" in ifaces[0]["signature"] and "b()" in ifaces[0]["signature"]
+    assert len(ifaces) == 2
+    _sigs = " ".join(str(i.get("signature")) for i in ifaces)
+    assert "a()" in _sigs and "b()" in _sigs
 
 
 def test_intra_module_boundary_overlap_warning():

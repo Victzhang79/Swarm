@@ -131,14 +131,31 @@ def check_contract_in_diff(
     merged_diff: str,
     shared_contract: dict[str, Any] | None,
 ) -> tuple[bool, list[str]]:
-    """检查共享契约中的符号是否出现在变更 diff 中（启发式）。"""
+    """检查共享契约中的符号是否出现在变更 diff 中（启发式）。
+
+    D5（阶段6，登记册 §五）：旧判定二态皆坏——【全部】符号缺失才 fail（缺 90% 也放行=
+    形同虚设），且 issue 不带逐符号明细无从归因。改缺失率阈值（默认 0.4，
+    SWARM_CONTRACT_MISSING_RATIO 可调；0=任一缺失即 fail，1=回退旧全缺语义），
+    issue 首条带全部缺失符号清单（供 verify 侧按符号归因 owner 定向重派）。
+    仍为启发式子串匹配（存量语义，防误杀由阈值+归因收窄兜）。"""
     symbols = contract_symbols(shared_contract)
     if not symbols:
         return True, []
     diff_lower = (merged_diff or "").lower()
     missing = [s for s in symbols if s.lower() not in diff_lower]
-    if missing and len(missing) == len(symbols):
-        return False, [f"契约符号未在 merged_diff 中出现: {missing[:5]}"]
+    if not missing:
+        return True, []
+    import os
+    try:
+        _ratio = float(os.environ.get("SWARM_CONTRACT_MISSING_RATIO", "0.4") or "0.4")
+    except ValueError:
+        _ratio = 0.4
+    if len(missing) / len(symbols) > _ratio:
+        return False, [
+            f"契约符号缺失率 {len(missing)}/{len(symbols)} 超阈值({_ratio:.0%})，"
+            f"缺失清单: {missing[:20]}"]
+    logger.info("[CONTRACT] 契约符号缺失 %d/%d（≤阈值 %.0f%%，放行）: %s",
+                len(missing), len(symbols), _ratio * 100, missing[:10])
     return True, []
 
 

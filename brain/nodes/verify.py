@@ -197,11 +197,41 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         if not ir_ok:
             if any("契约" in i for i in ir_issues):
+                # D5（阶段6，登记册 §五）：契约失败不再全员连坐——按缺失符号归因 owner
+                # （描述/验收标准/契约文本命中缺失符号的子任务）定向重派；归因不出回退
+                # 全员（旧行为，绝不漏修）。
+                _ctr_failed = list(subtask_results.keys())
+                try:
+                    import json as _json
+
+                    from swarm.brain.contract_utils import contract_symbols as _csyms
+                    _sc = state.get("shared_contract") or (
+                        plan_obj.shared_contract if plan_obj else {})
+                    _dl = (merged_diff or "").lower()
+                    _missing = [x for x in _csyms(_sc) if x.lower() not in _dl]
+                    if _missing and plan_obj is not None:
+                        _owners = sorted({
+                            st.id for st in plan_obj.subtasks
+                            if st.id in subtask_results and any(
+                                _sym.lower() in (
+                                    (getattr(st, "description", "") or "") + " "
+                                    + " ".join(getattr(st, "acceptance_criteria", None) or [])
+                                    + " " + _json.dumps(getattr(st, "contract", None) or {},
+                                                        ensure_ascii=False)
+                                ).lower()
+                                for _sym in _missing)})
+                        if _owners:
+                            logger.info(
+                                "[VERIFY_L2] D5 契约缺失符号归因 owner=%s（缺失 %s）——"
+                                "定向重派替代全员连坐", _owners, _missing[:10])
+                            _ctr_failed = _owners
+                except Exception as _exc:  # noqa: BLE001 — 归因失败回退全员，绝不漏修
+                    logger.warning("[VERIFY_L2] D5 契约归因失败回退全员: %s", _exc)
                 return {
                     "l2_passed": False,
                     "verification_failure": "contract",
                     "failure_strategy": "retry",
-                    "failed_subtask_ids": list(subtask_results.keys()),
+                    "failed_subtask_ids": _ctr_failed,
                     "l2_details": {"integration_review": ir_details, "issues": ir_issues},
                 }
             # TD2606-B8：把集成编译失败归因到具体子任务（编译输出已含出错文件路径），
