@@ -1056,9 +1056,11 @@ async def run_task(
     _task_running.add(task_id)
     _set_workspace(project_id)
 
-    from swarm.infra.redis_client import ModuleLock, TaskQueue
+    # E11（2026-07-09 登记册）：run_task 本身就是执行入口（调度器 dequeue 后调用/直调），
+    # 原此处把自己再入队=幽灵队列项，调度器稍后 dequeue 到时任务已在跑/已终态，全靠三层
+    # 去重兜底。DB 是权威源（reconcile 把 PENDING 重新入队），删除不丢工作信号。
+    from swarm.infra.redis_client import ModuleLock
 
-    TaskQueue.enqueue(task_id, project_id)
     module_lock = ModuleLock(project_id, "default")
     if not module_lock.acquire():
         await _emit(queue, {
@@ -1249,12 +1251,12 @@ async def resume_task(
 
     # 与 run_task 一致：resume 也要持同项目模块锁，否则两个 resume / resume+run_task
     # 并发改同一项目工作树会互相踩（无串行化）。
-    from swarm.infra.redis_client import ModuleLock, TaskQueue
+    # E11（2026-07-09 登记册）：resume 是执行入口，不自我 enqueue（幽灵队列项，见 run_task 同注）。
+    from swarm.infra.redis_client import ModuleLock
 
     _resume_project_id = task.get("project_id", "")
     if _resume_project_id:
         set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
-    TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():
         # 瞬时锁占用 → 回滚认领状态，让用户可重试（否则卡 ANALYZING 无 resume）。
@@ -1384,12 +1386,12 @@ async def resume_planning(
     _set_workspace(task["project_id"])
 
     # 与 run_task / resume_task 一致：持同项目模块锁串行化工作树访问。
-    from swarm.infra.redis_client import ModuleLock, TaskQueue
+    # E11（2026-07-09 登记册）：执行入口不自我 enqueue（幽灵队列项，见 run_task 同注）。
+    from swarm.infra.redis_client import ModuleLock
 
     _resume_project_id = task.get("project_id", "")
     if _resume_project_id:
         set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
-    TaskQueue.enqueue(task_id, _resume_project_id)
     module_lock = ModuleLock(_resume_project_id, "default")
     if not module_lock.acquire():
         # 瞬时锁占用 → 回滚认领状态（回到 CLARIFYING/DESIGN_REVIEW），让用户可重试。
