@@ -1483,6 +1483,15 @@ def _invalidate_manifest_cache() -> None:
     _MANIFEST_PRESENT_CACHE.clear()
 
 
+def _prune_manifest_cache_negatives() -> None:
+    """C11（阶段4，登记册 §四）：run 入口只清【负缓存】——presence=True 在沙箱生命周期
+    内不会自发失效（manifest 不会被删；key 已含 sandbox_id，换沙箱天然隔离），跨 run
+    复用省每 run 5-8 趟沙箱 find；False 可能因脚手架/补注册在 run 间落盘而过期，逐 run
+    重探（D57 的防负缓存 stale 语义原样保留）。"""
+    global _MANIFEST_PRESENT_CACHE
+    _MANIFEST_PRESENT_CACHE = {k: v for k, v in _MANIFEST_PRESENT_CACHE.items() if v}
+
+
 def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     """工程 manifest(go.mod/Cargo.toml/package.json…)是否存在，沙箱优先。
 
@@ -2638,9 +2647,9 @@ def run_l1_pipeline(
     if _deadline_blocked("entry"):
         return True, details
 
-    # D57：新一次 L1 run = 新一代 manifest 在场性缓存（run 内 5-8 趟沙箱 find 收敛为
-    # 每组 manifests 至多一趟；跨 run 不留 stale）。
-    _invalidate_manifest_cache()
+    # D57+C11：新一次 L1 run 只清负缓存（True 在同沙箱生命周期内恒真，跨 run 复用；
+    # False 可能过期逐 run 重探）——同沙箱多 run 不再每次重付 5-8 趟沙箱 find。
+    _prune_manifest_cache_negatives()
 
     # ── L1.1 scope 检查 ──
     violations = _scope_violations(diff, subtask.scope, extra_allowed=extra_writable_paths)

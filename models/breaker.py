@@ -97,6 +97,21 @@ def allow(key: str) -> bool:
         return True
 
 
+def is_open(key: str) -> bool:
+    """只读探询：open 且冷却未满 → True（【不】预约探针）。
+
+    F-F（阶段4，登记册 §三/§四）：worker 面 with_fallbacks 链组装用——open 中的模型排到
+    链尾（不删除：全 open 时仍按序尝试），健康 fallback 先上。half-open 探针语义仍归
+    allow()（brain 面 _invoke_llm_abortable 专用），此处绝不占探针名额。"""
+    if not key or _threshold() <= 0:
+        return False
+    with _lock:
+        st = _states.get(key)
+        if st is None or st.opened_at is None:
+            return False
+        return (time.monotonic() - st.opened_at) < _cooldown_s()
+
+
 def record_success(key: str) -> None:
     if not key:
         return

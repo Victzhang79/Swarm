@@ -64,6 +64,22 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     return l1_details_of(subtask_results.get(fid))
 
 
+def _depends_reaches(plan_obj, src: str, dst: str) -> bool:
+    """C9（阶段4）：depends_on 图上 src 是否可达 dst（动态补边前的环安全护栏）。"""
+    by_id = {s.id: s for s in (getattr(plan_obj, "subtasks", None) or [])}
+    seen: set[str] = set()
+    stack = [src]
+    while stack:
+        cur = stack.pop()
+        if cur == dst:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(getattr(by_id.get(cur), "depends_on", None) or [])
+    return False
+
+
 def _alt_map_update(state: dict, wave_ids, use_alternate: bool) -> dict[str, bool]:
     """阶段3.9 H-F7/R-F1：alternate 决策按子任务记账（替代全局 bool）。
 
@@ -493,6 +509,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 或退避重试 → BLOCKED→replan→守卫降级 retry→重派→BLOCKED 无界循环、且阻断任务级 MERGE=阻断交付。
     # 此处在任何重试/replan 前拦截：把"依赖已放弃上游"的下游一并放弃(传递闭包)，run 自终 PARTIAL。
     # 下游归属用【运行时 blocked_on 包/模块→生产者子任务】(跨模块 import 的 depends_on 不可靠) ∪ depends_on。
+    # C9（阶段4）：本轮为「合法跨模块等待」补的动态依赖边 {消费者: [pending 生产者]}——
+    # 非空时各 return 路径须回写 plan（in-place 补边后 LangGraph 需要显式 emit 才持久化）。
+    _c9_edges: dict[str, list[str]] = {}
     if plan_obj is not None:
         _unsat = (set(state.get("give_up_isolated_ids") or [])
                   | set(state.get("abandoned_subtask_ids") or []))
@@ -538,9 +557,29 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     _selfheal.add(fid)
                 else:
                     _unrecoverable.add(fid)
+            elif _prods and _st is not None:
+                # C9（阶段4，登记册 §四）：还有 active(pending) 生产者的合法跨模块等待——
+                # 旧路径=transient 退避重试，每轮整条 locate/code/verify 白跑才撞同一
+                # BLOCKED。治=给消费者补【动态 depends_on 边】(fid→pending 生产者)，
+                # dispatch 依赖闸(D23 只认 L1 通过)自然扣住它到生产者真完成再派——
+                # 廉价、确定性、零白跑。环护栏：生产者可达 fid 则不补（防依赖环死锁）。
+                _pending_prods = sorted(
+                    p for p in _prods
+                    if p != fid and p in _pending_now
+                    and not _depends_reaches(plan_obj, p, fid))
+                if _pending_prods:
+                    _deps_now = list(getattr(_st, "depends_on", []) or [])
+                    _added = [p for p in _pending_prods if p not in _deps_now]
+                    if _added:
+                        _st.depends_on = _deps_now + _added
+                        _c9_edges[fid] = _added
         # round36 P0 自愈：无生产者内部包(worker 自造引用) → 授消费者 allow_any + 提示本模块补建被引
         # 类型 + 重派(按子任务 targeted_recovery_counts 熔断，与 A2 缺依赖恢复同预算)。耗尽预算才回落
         # 连坐放弃(原行为)。这把"一个自造引用炸 62 子任务"降为"消费者补建它自己引用的类型"。
+        if _c9_edges:
+            logger.info(
+                "[HANDLE_FAILURE] C9 合法跨模块等待 → 补动态依赖边（消费者扣在依赖闸，"
+                "生产者 L1 过再派，替代 transient 白跑）: %s", _c9_edges)
         if _selfheal:
             _sh_max = get_config().model.max_retries
             _sh_trc = dict(state.get("targeted_recovery_counts") or {})
@@ -1048,6 +1087,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "subtask_use_alternate": _alt_map_update(state, transient_ids, False),
                 "subtask_transient_counts": {**transient_counts, **next_tcounts},
+                # C9：补了动态依赖边必须回写 plan（dispatch 依赖闸消费）
+                **({"plan": plan_obj} if _c9_edges else {}),
             }
         # transient 退避也用尽 → 落入下方 capability 阶梯（基础设施持续不可用，升级人工）
         logger.warning(
@@ -1159,8 +1200,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # 非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
         "failure_escalated": False,
     }
-    if _scope_widened:
-        out["plan"] = plan_obj  # 回写加宽后的 scope，dispatch 重试用
+    if _scope_widened or _c9_edges:
+        out["plan"] = plan_obj  # 回写加宽后的 scope / C9 动态依赖边，dispatch 重试用
     if effective_strategy == "retry_alternate":
         out["subtask_use_alternate"] = _alt_map_update(state, failed_ids, True)
         logger.info(

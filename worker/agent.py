@@ -50,9 +50,19 @@ def _make_pre_model_hook(max_input_tokens: int):
     return _hook
 
 
-def _get_worker_tools() -> list[BaseTool]:
-    """获取 Worker 可用的所有 Tool 列表"""
-    return [
+def _get_worker_tools(scope: FileScope | None = None,
+                      intent: str = "") -> list[BaseTool]:
+    """获取 Worker 可用的 Tool 列表——C10（阶段4，登记册 §四）按 scope/intent 确定性裁剪。
+
+    12 个全集对小模型是复读死循环土壤（工具越多选择面越糊）。裁剪规则（通用多栈，
+    不看语言）：
+      · 只读 scope（无 writable/create/delete 且非 allow_any）→ 去 write_file/patch_file
+        （审计/纯分析任务给写工具=诱导越权+噪声）；
+      · git_log/git_blame 只给 debug/audit 意图（历史考古工具；普通编码子任务用不上，
+        且沙箱常无 .git——round20#13）；
+    不传参=旧全集（legacy 调用方零回归）。典型编码子任务 12→10 个。
+    """
+    tools: list[BaseTool] = [
         # 文件操作
         read_file,
         write_file,
@@ -70,6 +80,18 @@ def _get_worker_tools() -> list[BaseTool]:
         # 知识检索
         query_knowledge_base,
     ]
+    if scope is None and not intent:
+        return tools
+    _intent = str(intent or "").strip().lower()
+    if _intent not in ("debug", "audit"):
+        tools = [t for t in tools if t not in (git_log, git_blame)]
+    if scope is not None and not getattr(scope, "allow_any", False):
+        _writes = (list(getattr(scope, "writable", []) or [])
+                   + list(getattr(scope, "create_files", []) or [])
+                   + list(getattr(scope, "delete_files", []) or []))
+        if not _writes:
+            tools = [t for t in tools if t not in (write_file, patch_file)]
+    return tools
 
 
 def create_worker_agent(
@@ -116,10 +138,11 @@ def create_worker_agent(
     else:
         llm = router.get_worker_llm(strategy=model_strategy)
 
-    # 获取 Tool 集（基础工具 + 经验拔插层按上下文挂的离散经验工具 experience__<id>）。
-    # 经验工具 advisory·可选：小模型自己决定调哪个（或不调）。fail-open：任何异常都退回
-    # 纯基础工具，绝不因经验层拖垮 worker 创建。
-    tools = _get_worker_tools()
+    # 获取 Tool 集（基础工具按 scope/intent 裁剪 + 经验拔插层按上下文挂的离散经验工具
+    # experience__<id>）。经验工具 advisory·可选：小模型自己决定调哪个（或不调）。
+    # fail-open：任何异常都退回纯基础工具，绝不因经验层拖垮 worker 创建。
+    tools = _get_worker_tools(
+        effective_scope, str(getattr(subtask, "intent", "") or ""))
     try:
         from swarm.experience.service import build_worker_experience_tools
         _exp_tools = build_worker_experience_tools(subtask, project_stack)

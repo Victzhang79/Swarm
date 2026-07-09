@@ -828,6 +828,52 @@ class ModelRouter:
             max_tokens=_bmt, wallclock_budget=_wc,
         )
 
+    @staticmethod
+    def _assemble_worker_chain(named: list[tuple[str, "Runnable"]]) -> "Runnable":
+        """F-F（阶段4）：worker 面 fallback 链组装——接 breaker 健康信号。
+
+        此前 worker 纯靠 with_fallbacks 顺序兜底：primary 反复超时仍每次先撞 primary
+        （每次白付一整个超时窗才降级）。现按 breaker.is_open 只读探询把 open 中的模型
+        排到链尾（不删除——全 open 时仍按序尝试，绝不无模型可用）；并给每个模型挂
+        listeners 回灌成败证据（成功→record_success 复位；超时/连接类错误→record_failure，
+        capability 错误不喂——与 breaker 契约一致）。brain 面的 allow() 探针语义不动。
+        """
+        from swarm.models import breaker as _breaker
+
+        def _listened(name: str, llm: "Runnable") -> "Runnable":
+            def _on_end(run_obj) -> None:
+                try:
+                    _breaker.record_success(name)
+                except Exception:  # noqa: BLE001 — 记账绝不拖垮调用
+                    pass
+
+            def _on_error(run_obj) -> None:
+                try:
+                    _err = str(getattr(run_obj, "error", "") or "").lower()
+                    if any(k in _err for k in (
+                            "timeout", "timed out", "connect", "stall",
+                            "unavailable", "502", "503", "504")):
+                        _breaker.record_failure(name)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                return llm.with_listeners(on_end=_on_end, on_error=_on_error)
+            except Exception:  # noqa: BLE001 — 老版本 Runnable 无 with_listeners 时裸用
+                return llm
+
+        healthy = [(n, m) for n, m in named if not _breaker.is_open(n)]
+        opened = [(n, m) for n, m in named if _breaker.is_open(n)]
+        if opened:
+            logger.warning(
+                "[router] F-F worker 链健康重排：熔断中的模型 %s 移到链尾（健康优先 %s）",
+                [n for n, _ in opened], [n for n, _ in healthy])
+        ordered = (healthy + opened) or named
+        chained = [_listened(n, m) for n, m in ordered]
+        if len(chained) > 1:
+            return chained[0].with_fallbacks(chained[1:])
+        return chained[0]
+
     def get_llm_for_subtask(self, difficulty: str, modality: str = "text") -> Runnable:
         """根据子任务难度和模态动态选择模型。
 
@@ -856,9 +902,11 @@ class ModelRouter:
                 callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
                 max_tokens=_wmax,
             ))
-        if fallback_llms:
-            return primary.with_fallbacks(fallback_llms)
-        return primary
+        # F-F（阶段4）：接 breaker 健康重排 + 成败记账（见 _assemble_worker_chain）
+        _named = [(primary_name, primary)] + [
+            (n, m) for n, m in zip(
+                [fb for fb in fallback_names if fb], fallback_llms)]
+        return self._assemble_worker_chain(_named)
 
     def get_llm_by_name(self, model_name: str, difficulty: str = "medium") -> Runnable:
         """按指定模型名取 worker LLM（用于主力并行轮转 override），带该难度的 fallback 链兜底。
@@ -888,9 +936,10 @@ class ModelRouter:
                 callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
                 max_tokens=_wmax,
             ))
-        if fallback_llms:
-            return primary.with_fallbacks(fallback_llms)
-        return primary
+        # F-F（阶段4）：同 get_llm_for_subtask——健康重排 + 记账
+        _fb_named = [fb for fb in fallback_names if fb and fb != model_name]
+        _named = [(model_name, primary)] + list(zip(_fb_named, fallback_llms))
+        return self._assemble_worker_chain(_named)
 
     def get_alternate_llm_for_subtask(
         self, difficulty: str, modality: str = "text"

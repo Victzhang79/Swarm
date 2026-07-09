@@ -310,6 +310,11 @@ class WorkerExecutor(
         """
         self.start_time = time.monotonic()
         self._log(f"开始执行子任务: {self.subtask.id}")
+        # C8（阶段4）：worker 总预算 deadline 进 contextvar——工具执行入口据此做
+        # 收尾哨兵（预算尽=命令不发）+ 超时钳（不冲破 deadline），治 agent 超时后
+        # 孤儿同步线程对已销毁沙箱烧请求到自身超时。
+        from swarm.tools.build_tools import set_worker_deadline
+        set_worker_deadline(self.start_time + self.max_execution_time)
 
         from swarm.tools.build_tools import (
             clear_extra_whitelist,
@@ -359,8 +364,12 @@ class WorkerExecutor(
                 l1_details={"error": str(e), "failure_class": failure_class},
             )
         finally:
-            from swarm.tools.build_tools import clear_sandbox_context
+            from swarm.tools.build_tools import (
+                clear_sandbox_context,
+                clear_worker_deadline,
+            )
             clear_sandbox_context()
+            clear_worker_deadline()  # C8：对称清除（contextvar 按 task 隔离，防串扰）
             clear_scope()
             clear_extra_whitelist()
             self.kill_sandbox()
@@ -1106,19 +1115,18 @@ class WorkerExecutor(
         return " | ".join(results)
 
     async def _sandbox_checkpoint(self, files: list[str]) -> None:
-        """B2：在沙箱里 git add 指定文件，锁定阶段进度（best-effort，失败不致命）。"""
+        """B2 阶段进度记录（C12 阶段4 治虚假 git add，登记册 §四）。
+
+        旧实现在沙箱里 `git add … || true`——沙箱【无 .git】是 by design（round20#13），
+        命令静默 no-op 却无条件日志"已锁定进度"=纯剧场：真正的进度保护本就来自
+        ①文件持久在沙箱文件系统②pull-back 按内容同步（与 git index 无关）。
+        改为只做诚实的进度日志（保留 seam：分批编码的进度可观测点），不再发假命令。
+        """
         if not self._sandbox or not files:
             return
-        try:
-            import shlex
-            quoted = " ".join(shlex.quote(f) for f in files)  # R23-4：安全引用，防文件名注入
-            cmd = f"cd /workspace && git add {quoted} 2>/dev/null || true"
-            run = getattr(self._sandbox, "commands", None)
-            if run and hasattr(run, "run"):
-                await asyncio.to_thread(run.run, cmd)
-            self._log(f"B2 checkpoint：已 git add {len(files)} 个文件锁定进度")
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"B2 checkpoint 跳过（非致命）: {exc}")
+        self._log(
+            f"B2 checkpoint：批内 {len(files)} 个文件已写入沙箱文件系统"
+            "（pull-back 按内容同步，后续批次撞上限也不丢）")
 
 
     def _make_output(

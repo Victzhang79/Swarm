@@ -55,6 +55,27 @@ def clear_extra_whitelist() -> None:
     _extra_whitelist_var.set([])
 
 
+_worker_deadline_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "swarm_worker_deadline", default=None)
+
+
+def set_worker_deadline(deadline: float | None) -> None:
+    """C8（阶段4，登记册 §四）：登记当前 worker 的总预算 deadline（monotonic 绝对时刻）。
+
+    WorkerExecutor 在 run() 起点设置、finally 清除；contextvars 随 to_thread/run_in_executor
+    拷贝传播——agent 超时后成为孤儿的同步工具线程，其【下一次】工具调用在 _run 入口撞
+    哨兵立即返回（不再对已销毁沙箱烧请求到自身超时），在飞调用的超时也被钳到剩余预算。"""
+    _worker_deadline_var.set(deadline)
+
+
+def get_worker_deadline() -> float | None:
+    return _worker_deadline_var.get()
+
+
+def clear_worker_deadline() -> None:
+    _worker_deadline_var.set(None)
+
+
 def set_sandbox_context(sandbox: Any, manager: Any) -> None:
     """设置沙箱上下文（WorkerExecutor 调用，按 asyncio task 隔离）"""
     _sandbox_var.set(sandbox)
@@ -245,8 +266,26 @@ print(f"EXIT_CODE:{{_sbx_proc.returncode}}")
     return f"{status} (sandbox exit code {exit_code})\n{output}"
 
 
+def _clamp_to_worker_deadline(timeout: int) -> tuple[int, bool]:
+    """C8：工具超时钳到 worker 剩余预算。返回 (有效超时, 预算已尽)。"""
+    dl = _worker_deadline_var.get()
+    if dl is None:
+        return timeout, False
+    import time as _t
+    remaining = dl - _t.monotonic()
+    if remaining <= 1:
+        return 0, True
+    return max(5, min(int(timeout), int(remaining))), False
+
+
 def _run(command: str, cwd: Path | None = None, timeout: int = 120) -> str:
     """智能选择执行模式：有沙箱用沙箱，否则本地执行"""
+    # C8（阶段4）：收尾哨兵+超时钳——worker 预算耗尽后，孤儿工具线程（agent 已被
+    # wait_for 取消，同步线程杀不死）的后续命令在此立即返回，不再对已销毁沙箱烧
+    # 请求到自身超时；未耗尽时工具超时钳到剩余预算（不冲破 worker deadline）。
+    timeout, _exhausted = _clamp_to_worker_deadline(timeout)
+    if _exhausted:
+        return "❌ worker 预算已耗尽，命令未执行（收尾哨兵拦截）"
     sandbox, _ = get_sandbox_context()
     if sandbox is not None:
         return _run_in_sandbox(command, timeout)
