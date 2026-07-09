@@ -66,7 +66,9 @@ def test_module_lock_memory_fallback():
 
 
 def test_task_queue_memory():
-    with patch("swarm.infra.redis_client.redis_enabled", return_value=False):
+    # 全套件乱序鲁棒（d58 同款）：其它测试可能把 _redis_client 置为已连接客户端
+    with patch("swarm.infra.redis_client.redis_enabled", return_value=False), \
+         patch("swarm.infra.redis_client.get_redis", return_value=None):
         TaskQueue._clear_memory()
         TaskQueue.enqueue("t1", "p1")
         item = TaskQueue.dequeue()
@@ -76,7 +78,8 @@ def test_task_queue_memory():
 
 def test_task_queue_priority_order():
     """优先级队列：urgent 先于 normal 先于 background 出队。"""
-    with patch("swarm.infra.redis_client.redis_enabled", return_value=False):
+    with patch("swarm.infra.redis_client.redis_enabled", return_value=False), \
+         patch("swarm.infra.redis_client.get_redis", return_value=None):
         TaskQueue._clear_memory()
         # 按 normal → background → urgent 顺序入队
         TaskQueue.enqueue("t_normal", "p1")
@@ -99,7 +102,8 @@ def test_task_queue_priority_order():
 
 def test_task_queue_backward_compat():
     """向后兼容：不传 priority 时默认 normal。"""
-    with patch("swarm.infra.redis_client.redis_enabled", return_value=False):
+    with patch("swarm.infra.redis_client.redis_enabled", return_value=False), \
+         patch("swarm.infra.redis_client.get_redis", return_value=None):
         TaskQueue._clear_memory()
         TaskQueue.enqueue("t1", "p1")
         item = TaskQueue.dequeue()

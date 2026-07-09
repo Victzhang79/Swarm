@@ -184,10 +184,11 @@ def test_c10_debug_keeps_archaeology_readonly_drops_writes():
 def test_c11_prune_keeps_positive_entries():
     from swarm.worker import l1_pipeline as lp
     lp._MANIFEST_PRESENT_CACHE.clear()
-    lp._MANIFEST_PRESENT_CACHE[(0, "sb-1", ("pom.xml",))] = True
-    lp._MANIFEST_PRESENT_CACHE[(0, "sb-1", ("go.mod",))] = False
+    _gen = lp._MANIFEST_CACHE_GEN  # 全套件乱序鲁棒：其它测试可 bump GEN，勿硬编码 0
+    lp._MANIFEST_PRESENT_CACHE[(_gen, "sb-1", ("pom.xml",))] = True
+    lp._MANIFEST_PRESENT_CACHE[(_gen, "sb-1", ("go.mod",))] = False
     lp._prune_manifest_cache_negatives()
-    assert lp._MANIFEST_PRESENT_CACHE == {(0, "sb-1", ("pom.xml",)): True}, (
+    assert lp._MANIFEST_PRESENT_CACHE == {(_gen, "sb-1", ("pom.xml",)): True}, (
         "True 同沙箱生命周期恒真（跨 run 复用省沙箱 find）；False 可能过期必须逐 run 重探")
     lp._MANIFEST_PRESENT_CACHE.clear()
 
