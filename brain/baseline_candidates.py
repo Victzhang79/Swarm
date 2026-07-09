@@ -129,11 +129,17 @@ def build_baseline_candidates(
     return out
 
 
-def baseline_candidates_prompt_block(candidates: list[dict]) -> str:
+def baseline_candidates_prompt_block(candidates: list[dict], *,
+                                     truncated: bool = False) -> str:
     """候选申报清单 → PLAN prompt 注入块。空=空串（零噪声）。
 
-    纪律：只许申报清单内条目；reason 必须指向清单列出的可对账文件（validate 侧
-    baseline 接地校验据此可查证）；现有实现不满足则照常拆子任务，绝不推卸。
+    纪律：只许申报清单内条目；reason 必须指向清单列出的可对账文件；现有实现不满足
+    则照常拆子任务，绝不推卸。truncated=True（索引清单达 4000/8000 上界被截断，
+    阶段3.9 复核 F4）：「清单外不要申报」会把大仓的合法存量申报从"少提示"升级为
+    "主动禁止"——改为自述截断并放开（申报仍须给可核实位置，validate 接地校验兜底）。
+
+    措辞如实（复核 R-F9）：validate 侧现只校验 id∈需求清单+reason 非空，reason→文件
+    的接地核验尚未实现（阶段6 D8 验收有牙补）——不再声称"系统会对账核验"。
     """
     if not candidates:
         return ""
@@ -143,13 +149,20 @@ def baseline_candidates_prompt_block(candidates: list[dict]) -> str:
             f"{d['file']}" + (f"（{d['symbol']}）" if d.get("symbol") else "")
             for d in (c.get("candidates") or []))
         lines.append(f"- {c['id']} {c.get('text', '')} → 存量疑似: {refs}")
+    if truncated:
+        _outside = (
+            "注意：代码索引清单已达上界被截断——清单外的条目【允许】申报"
+            " baseline_covered，但 reason 必须给出可核实的具体文件路径+满足方式，"
+            "不确定就照常拆子任务。\n")
+    else:
+        _outside = "清单外的条目不要凭空申报 baseline_covered。\n"
     return (
         "\n\n## 存量候选对账清单（确定性代码索引检索所得——棕地申报通道）\n"
         "以下需求条目在现有代码索引中检索到疑似已实现的存量位置。请逐条核对：\n"
         "(a) 现有实现【确已满足】该需求 → 将其列入顶层 \"baseline_covered\"："
         "[{\"id\": \"req-xxxxxxxx\", \"reason\": \"<指向下面列出的具体文件+如何满足>\"}]，"
-        "reason 必须引用清单中的文件路径（系统会对账核验）；\n"
+        "reason 必须引用清单中的文件路径；\n"
         "(b) 现有实现不满足/仅部分满足 → 照常拆子任务实现并 covers 该条目，绝不因"
         "存在相似代码就跳过实现。\n"
-        "清单外的条目不要凭空申报 baseline_covered。\n"
+        + _outside
         + "\n".join(lines) + "\n")

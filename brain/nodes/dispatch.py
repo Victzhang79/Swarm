@@ -350,7 +350,10 @@ async def dispatch(state: BrainState) -> dict:
     # 而真正的 worker 走 executor 的 create 路径，从不 acquire 这个池。
     # 预热既无收益又泄漏，直接移除。如需预热，应由长生命周期的单例池统一管理。
 
-    use_alternate = bool(state.get("use_alternate_model", False))
+    # 阶段3.9 H-F7/R-F1（CONFIRMED）：alternate 决策按子任务记账——全局 bool 在"失败撮
+    # 被降优先级错开到后续批"（本函数下方 _deprioritized 正是这么做的）时，首批消费即清
+    # 会把 alternate 路由送给无关新前沿、真正重试者反拿主力模型。
+    _alt_map = dict(state.get("subtask_use_alternate") or {})
     shared_contract = state.get("shared_contract") or (
         plan_obj.shared_contract if plan_obj else {}
     )
@@ -371,7 +374,8 @@ async def dispatch(state: BrainState) -> dict:
         # RUN10 实证：单模型下 st-5 重试走 use_alternate → 落到更弱 Saka，破坏"单模型一致性"本意。
         # 无"备选"可换，重试改给 recursion_boost 助收敛，而非换更弱模型。
         _single = len(_pool) == 1
-        _ua = use_alternate and not _fs and not _single
+        _sid_alt = bool(_alt_map.get(subtask.id))
+        _ua = _sid_alt and not _fs and not _single
         # B10：override 决策抽为纯函数——force_strong 或 complex 子任务绕过轮转直取最强模型，
         # 否则池非空非 alternate 走轮转，池空/alternate 按 difficulty 路由。
         _override = _select_pool_override(
@@ -383,7 +387,7 @@ async def dispatch(state: BrainState) -> dict:
         _boost = 0
         if _fs:
             _boost = 30
-        elif _single and use_alternate:
+        elif _single and _sid_alt:
             _boost = 30  # 单模型重试：留在唯一模型 + 加步数助收敛(不降级)
         try:
             output = await nodes._dispatch_to_worker(
@@ -486,12 +490,12 @@ async def dispatch(state: BrainState) -> dict:
     # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，
     # 若仅非空时返回，上一轮失败列表会残留 → gates 误拒真正成功的运行。
     result["failed_subtask_ids"] = failed_ids
-    # 3.8 生命周期收敛（矩阵疑似粘滞 TOP-1）：use_alternate_model 是【本轮派发】的路由
-    # 决策，消费即清——handle_failure 仅 retry/retry_alternate 两出口对称写该键，定向
-    # 恢复/L2 定向/阶梯二三/replan 出口都不发键，粘滞 True 会让后续所有轮全部子任务
-    # 永走备选模型（单次 alternate 决策劫持全局路由）。消费点收口=单 choke point，
-    # 下一轮要换模型须由 handle_failure 重新显式决策。
-    result["use_alternate_model"] = False
+    # 3.8 生命周期收敛 TOP-1 + 3.9 H-F7/R-F1 升级：alternate 标记【按子任务】消费——
+    # 本批真派出的 sid 从表中清除（消费即清，防粘滞劫持路由）；未派出的（被降优先级
+    # 错开的失败撮）保留给后续批。空批早退分支不发键=零消费零清（语义自洽，不漂移）。
+    _dispatched_ids = {t.id for t in to_dispatch}
+    result["subtask_use_alternate"] = {
+        k: v for k, v in _alt_map.items() if k not in _dispatched_ids}
     return result
 
 

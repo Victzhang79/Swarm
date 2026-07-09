@@ -715,14 +715,19 @@ async def _baseline_candidates_block_for(state) -> str:
             baseline_candidates_prompt_block,
             build_baseline_candidates,
         )
-        from swarm.knowledge.service import fetch_structure_inventory
-        files, symbols = await fetch_structure_inventory(_pid)
+        from swarm.knowledge import service as _ksvc
+        _max_files, _max_symbols = 4000, 8000
+        files, symbols = await _ksvc.fetch_structure_inventory(
+            _pid, _max_files, _max_symbols)
         cands = build_baseline_candidates(_req_items, files, symbols)
         if cands:
             logger.info(
                 "[PLAN] A7 存量候选对账清单：%d/%d 条需求检索到确定性存量疑似位置",
                 len(cands), len(_req_items))
-        return baseline_candidates_prompt_block(cands)
+        # 复核 F4：达上界=清单被确定性截断（路径序），>上界文件永不产候选——「清单外
+        # 不要申报」对大仓从少提示升级为主动禁止合法申报，必须自述并放开。
+        _truncated = len(files) >= _max_files or len(symbols) >= _max_symbols
+        return baseline_candidates_prompt_block(cands, truncated=_truncated)
     except Exception as e:  # noqa: BLE001 — 候选通道 advisory，绝不阻断
         logger.warning("[PLAN] A7 存量候选通道降级为空（不阻断）：%s", e)
         return ""
@@ -829,18 +834,24 @@ async def _plan_ultra_batched(
     proj_struct = _format_project_structure(knowledge_context)
     # sliding_ctx 头部带 plan() 注入的"上轮 replan/校验失败根因 + R31-3 增量修补块"——
     # 此前分批路径把它静默丢弃，ULTRA replan 退化为盲重规划（反复产同样的坏计划）。
-    # 复核 H-1：原 [:2000] 在 D09 覆盖 issues（round31 量级 12-15 条 ≈3000+ 字符）+
-    # 修补块（≤6.2K，拼在 issues 之后）下会把修补块整块截没——T3 为 ULTRA 分批而生
-    # 却到不了主战场。上界放到 14000（feedback 8K 帽 + 修补块 6.2K 帽，两处上游已
-    # 各自定界，此处仅兜底）。
-    sliding_ctx_text = (sliding_ctx or "").strip()[:14000] or "（无）"
+    # 复核 H-1：原 [:2000] 会把修补块整块截没。阶段3.9 复核 F3（CONFIRMED·实证）：
+    # 阶段3 自己把头部撑爆了 14000——分页 feedback 7.5K + 水位丢失块 7.1K（前置拼接，
+    # 不受 8K 分页帽约束）+ 修补块 9.2K（新增 D1 done 段）≈ 24K，修补纪律/D1 硬约束
+    # 从 offset ~14.7K 起=整块被截没 → 重试轮 LLM 看不到"不要全量重拆" → 全量重拆 →
+    # 水位闸硬拒 → 白烧 MAX_PLAN_RETRY（round31 H-1 同族回归，结构性烧钱环）。
+    # 上界放到 32000：三段各自已定界（wm 50 条帽/feedback 分页/修补块分段帽，合计
+    # ≤25K），32K 保证结构块全存活 + 余量给 sliding 原文，截断只落在原文尾部。
+    sliding_ctx_text = (sliding_ctx or "").strip()[:32000] or "（无）"
     # S2-3：分批路径同样注入需求条目清单（items 空=一字不加）。batched=True 提示本批只
     # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
-    _cov_block = _requirement_coverage_prompt_block(
-        state.get("requirement_items"), batched=True)
     # A7（阶段3.5）：确定性存量候选对账清单（kb 索引检索，计算一次每批复用）——棕地底座
     # 需求的申报出口；索引缺失/异常=空串 fail-open。
-    _cov_block += await _baseline_candidates_block_for(state)
+    # 阶段3.9 复核 F1/R-F2（CONFIRMED）：A7 块必须独立成变量——F8 分桶成功时每模块块
+    # 经 .get() 命中，带 A7 的 _cov_block 只剩 fallback 永不使用，A7 在它为之而生的
+    # ULTRA 分批路径（round37 RuoYi 棕地场景）成死代码。每模块块同样拼接 _a7_block。
+    _a7_block = await _baseline_candidates_block_for(state)
+    _cov_block = _requirement_coverage_prompt_block(
+        state.get("requirement_items"), batched=True) + _a7_block
     # 经验拔插层（advisory）：分批路径同样注入 planner 经验（按 栈×plan），计算一次每批复用。
     # ULTRA 大任务最受益于策展经验，不应因走批处理而漏掉；禁用/无命中/异常 → 空串（fail-open）。
     _skills_blk_batched = ""
@@ -897,6 +908,10 @@ async def _plan_ultra_batched(
                 _f8_cross_note = (
                     "\n- 横切条目提示：清单中 "
                     + ", ".join(str(c.get("id")) for c in _f8_cross[:50])
+                    # 复核 H-F8：截断必自述（本仓纪律）——第 51+ 条拿不到任务级认领
+                    # 提示又不自述 → NFR 认领率静默下降白烧重试。
+                    + (f"（另有 {len(_f8_cross) - 50} 条同为横切，未逐一列出但同样"
+                       "可任务级认领）" if len(_f8_cross) > 50 else "")
                     + " 为横切需求（无明确模块归属，已注入所有批次）——若本批子任务"
                     "天然承担（如安全/日志/幂等/性能约束），请在其 covers 中声明；"
                     "否则留给其他批次或整体校验后的定向补齐。")
@@ -905,9 +920,11 @@ async def _plan_ultra_batched(
                 if _b in _cov_blocks_by_module:
                     continue
                 _sel = list(_f8_by_mod.get(_b, [])) + list(_f8_cross)
+                # 复核 F1/R-F2：每模块块必须带 A7 候选清单（与 fallback _cov_block 对称），
+                # 否则分桶成功=A7 死代码（棕地申报出口在主战场被静默拆除）。
                 _cov_blocks_by_module[_b] = (
                     _requirement_coverage_prompt_block(_sel, batched=True)
-                    + _f8_cross_note)
+                    + _f8_cross_note + _a7_block)
             _f8_sizes = {b: len(v) for b, v in _f8_by_mod.items()}
             logger.info(
                 "[PLAN-BATCH] F8 需求预分桶：%d 条 → 按模块 %s + 横切 %d 条"
@@ -1306,17 +1323,22 @@ def _subtask_signature(st) -> tuple:
     return (getattr(st, "id", ""), (getattr(st, "description", "") or "").strip(), writable, creates)
 
 
-def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> int:
+def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> dict[str, set]:
     """round36 #6 治本：覆盖重试/replan 全量重拆使 LLM 每轮重发 covers → 随机丢【已覆盖】条目
     (覆盖打地鼠不收敛，round31 issue 13→15→12→14 震荡 / round36 attempt0→retry1 换漏实证)。
     按 scope 文件身份(单写者不变量下唯一)把【上一轮 plan 的合法 covers】并回 new_plan 同 scope
     子任务 → 覆盖【单调只增不减】→ MAX_PLAN_RETRY 内确定性收敛(不再靠掷骰子撞运气)。
     只并【valid_req_ids 内】的 covers（不重引入臆造/悬空 covers）。scope-key 唯一性护栏同 #8：
-    仅旧/新 plan 各自唯一且非空的 scope 才并（防聚合文件多写者/空 scope 碰撞误并）。返回并回条目数。"""
+    仅旧/新 plan 各自唯一且非空的 scope 才并（防聚合文件多写者/空 scope 碰撞误并）。
+
+    返回注入映射 {new_subtask_id: {注入的 req_id}}（阶段3.9 复核 R-F3 CONFIRMED：此前只返
+    计数，A11 ②通道拿被并回污染后的 covers 判等——凡"同 scope 唯一+新 covers⊆旧"，并回必使
+    两集相等 → 无论描述改成什么都认领旧 L1 产出，意图变护栏被击穿。_surgical_replan_reset
+    据此映射剔除注入项、用 LLM【原始申报】比较）。"""
     old_subs = list(getattr(old_plan, "subtasks", []) or [])
     new_subs = list(getattr(new_plan, "subtasks", []) or [])
     if not old_subs or not new_subs or not valid_req_ids:
-        return 0
+        return {}
 
     def _sk(st) -> tuple:
         sc = getattr(st, "scope", None)
@@ -1330,7 +1352,7 @@ def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> int:
     _old_by_sk: dict = {}
     for s in old_subs:
         _old_by_sk.setdefault(_sk(s), s)
-    merged = 0
+    injected: dict[str, set] = {}
     for ns in new_subs:
         sk = _sk(ns)
         if sk == ((), ()) or _oc.get(sk) != 1 or _nc.get(sk) != 1:
@@ -1343,8 +1365,8 @@ def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> int:
         _add = [c for c in _prior if c not in _cur]
         if _add:
             ns.covers = _cur + _add
-            merged += len(_add)
-    return merged
+            injected[getattr(ns, "id", "")] = set(_add)
+    return injected
 
 
 def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
@@ -1354,7 +1376,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_abandoned_ids: list | None = None,
                            old_give_up_ids: list | None = None,
                            old_transient_counts: dict | None = None,
-                           old_force_strong: dict | None = None) -> dict:
+                           old_force_strong: dict | None = None,
+                           old_use_alternate: dict | None = None,
+                           merged_cover_injections: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -1376,7 +1400,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     只保留在新 plan 且签名一致者——签名变=语义新子任务，绝不继承旧放弃/旧配额。"""
     if not any((old_results, old_recovery_counts, old_retry_counts,
                 old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
-                old_transient_counts, old_force_strong)):
+                old_transient_counts, old_force_strong, old_use_alternate)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -1430,7 +1454,14 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
             if _od != _nd:
                 _ocov = {str(c) for c in (getattr(_ost, "covers", None) or [])}
                 _ncov = {str(c) for c in (getattr(_nst, "covers", None) or [])}
-                if _ocov and _ocov == _ncov:
+                # 阶段3.9 复核 R-F3（CONFIRMED）：#6 覆盖单调化并回发生在本函数之前且
+                # 变异 new_plan 的 covers——凡"同 scope 唯一+新申报⊆旧"，并回必使两集相等，
+                # ②通道变成无条件认领（描述改成什么都认领旧产出=意图变护栏被击穿；典型：
+                # P6b 要求补 2FA，同 scope 子任务被旧登录 diff 顶掉永不实现）。剔除注入项、
+                # 用 LLM【原始申报】判等；纯注入所致的相等落到 ③相似度通道正常拒绝。
+                _ncov_orig = _ncov - {
+                    str(c) for c in (merged_cover_injections or {}).get(_nid, set())}
+                if _ocov and _ocov == _ncov_orig:
                     _claim_basis = "covers 集一致"
                 else:
                     try:
@@ -1467,6 +1498,11 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     pruned_force_strong = {
         sid: v for sid, v in (old_force_strong or {}).items() if _sig_unchanged(sid)
     }
+    # 3.9 H-F7：alternate 标记表同签名纪律——replan 重编号使 id 复用是默认情形，
+    # 旧 sid 的 alternate 标记粘滞会让语义全新的同名子任务无端走备选模型。
+    pruned_use_alternate = {
+        sid: v for sid, v in (old_use_alternate or {}).items() if _sig_unchanged(sid)
+    }
     pruned_redecompose = {
         sid: n for sid, n in (old_redecompose_counts or {}).items() if _sig_unchanged(sid)
     }
@@ -1496,6 +1532,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         # 3.8：瞬时配额/强模型标记同签名剪枝（此前缺席=旧账饿死/成本粘滞）
         "subtask_transient_counts": pruned_transient,
         "subtask_force_strong": pruned_force_strong,
+        # 3.9 H-F7：alternate 标记表同签名剪枝
+        "subtask_use_alternate": pruned_use_alternate,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -1775,7 +1813,8 @@ async def plan(state: BrainState) -> dict:
                                  old_abandoned_ids=state.get("abandoned_subtask_ids"),
                                  old_give_up_ids=state.get("give_up_isolated_ids"),
                                  old_transient_counts=state.get("subtask_transient_counts"),
-                                 old_force_strong=state.get("subtask_force_strong")),
+                                 old_force_strong=state.get("subtask_force_strong"),
+                                 old_use_alternate=state.get("subtask_use_alternate")),
             **plan_touch,
         }
 
@@ -2080,15 +2119,19 @@ async def plan(state: BrainState) -> dict:
     # 语义，同 scope 未必仍覆盖该 req，并回会掩盖被改掉的需求→排除。replan_feedback 是粘滞标记，
     # 排除它也顺带收窄"一旦 replan 过就每轮并"的过宽窗口。
     _prior_plan = state.get("plan")
+    # R-F3：注入映射透传给 _surgical_replan_reset——A11 ②通道须用 LLM 原始申报判等
+    _cover_injections: dict = {}
     if _prior_plan is not None and (state.get("plan_validation_feedback") or "").strip() \
             and not (state.get("replan_feedback") or "").strip():
         _valid_req_ids = {str(it.get("id")) for it in (state.get("requirement_items") or [])
                           if isinstance(it, dict) and it.get("id")}
-        _cm = _merge_prior_covers_by_scope(task_plan, _prior_plan, _valid_req_ids)
-        if _cm:
+        _cover_injections = _merge_prior_covers_by_scope(
+            task_plan, _prior_plan, _valid_req_ids)
+        if _cover_injections:
             logger.info(
                 "[PLAN] #6 覆盖单调化：按 scope 身份并回上一轮 %d 条合法 covers（防重拆丢覆盖，"
-                "促 MAX_PLAN_RETRY 内收敛）", _cm)
+                "促 MAX_PLAN_RETRY 内收敛）",
+                sum(len(v) for v in _cover_injections.values()))
 
     # R34-8 确定性无害化：申报与 covers 重叠的条目丢申报保 covers——分批 LLM 会把
     # "本计划其他批实现"误当"存量已满足"申报（round34 实证 31 条批间推卸型申报）。
@@ -2154,7 +2197,10 @@ async def plan(state: BrainState) -> dict:
                                  old_abandoned_ids=state.get("abandoned_subtask_ids"),
                                  old_give_up_ids=state.get("give_up_isolated_ids"),
                                  old_transient_counts=state.get("subtask_transient_counts"),
-                                 old_force_strong=state.get("subtask_force_strong")),
+                                 old_force_strong=state.get("subtask_force_strong"),
+                                 old_use_alternate=state.get("subtask_use_alternate"),
+                                 # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
+                                 merged_cover_injections=_cover_injections),
         **plan_touch,
     }
 
@@ -2382,6 +2428,9 @@ async def validate_plan(state: BrainState) -> dict:
     # 阶段3.1 单调合同：本轮覆盖集（跳过覆盖闸的轮 =None 不写水位——无口径可对账）
     _wm_cov_ids: list[str] | None = None
     _wm_lost: list[dict] = []
+    # H-F5：A6 缺口残差（last-write-wins 键 coverage_gap_residual 的本轮值）——
+    # None=本轮未做覆盖裁决不发键；[]=全覆盖清空；非空=gap 放行残差。
+    _gap_residual: list[str] | None = None
     if _coverage_gate_on and _req_items:
         from swarm.brain.plan_validator import build_coverage_matrix, covered_req_ids
         _wm_matrix = build_coverage_matrix(plan_obj, _req_items, state.get("baseline_covered"))
@@ -2433,8 +2482,9 @@ async def validate_plan(state: BrainState) -> dict:
         # （round37 实证 2/108 未覆盖=整任务 REJECT）。放行条件全部满足：①已给过≥1 轮
         # 修补机会（P1 topup/D09 先真修）；②纯缺口——无悬空 covers/臆造 baseline（臆造
         # 信号绝不放行）且无水位倒退（缺口只许是"从未覆盖"，不许是"倒退出来的"，3.1
-        # 硬地板）；③缺口 ≤ max(GAP_MAX, total×RATIO)。残差进 degraded_reasons（阻断
-        # L6 假成功学习）+ deliver 覆盖矩阵可观测面，绝不静默。
+        # 硬地板）；③缺口 ≤ max(GAP_MAX, total×RATIO)。残差进 coverage_gap_residual
+        # （last-write-wins：拦 L6 假成功学习 + deliver 覆盖矩阵可观测，全覆盖过闸即清
+        # ——3.9 H-F5 从 append-only degraded 迁出，那里无人能清成过期事实），绝不静默。
         _gap_allowed_pass = False
         if not cov_result.valid:
             _gap_items = _wm_matrix["uncovered"]
@@ -2479,11 +2529,13 @@ async def validate_plan(state: BrainState) -> dict:
             _gap_ids = [u["id"] for u in _wm_matrix["uncovered"]]
             logger.warning(
                 "[VALIDATE_PLAN] A6 覆盖缺口 degraded 放行：%d/%d 未覆盖（≤阈值，已给 "
-                "%d 轮修补机会）——残差进 deliver 覆盖矩阵+degraded 留痕: %s",
+                "%d 轮修补机会）——残差进 coverage_gap_residual（deliver+L6 消费）: %s",
                 len(_gap_ids), len(_req_items), retry_count, _gap_ids[:20])
-            _coverage_degraded.append(
-                f"plan_coverage:gap_allowed({len(_gap_ids)}/{len(_req_items)}): "
-                + ", ".join(_gap_ids[:20]) + ("…" if len(_gap_ids) > 20 else ""))
+            # 阶段3.9 复核 H-F5（CONFIRMED）：残差不再进 append-only degraded_reasons
+            # （reducer 无人能清——缺口后来被补齐仍永久拦 L6+deliver 展示陈旧缺口；
+            # 硬门否决轮还会留下"没发生过的放行"）。改独立 last-write-wins 键：
+            # 全覆盖过闸清空、gap 放行覆写；should_write_success/deliver 消费该键。
+            _gap_residual = sorted(_gap_ids)
         else:
             _bl_n = len([e for e in (state.get("baseline_covered") or [])
                          if isinstance(e, dict) and str(e.get("reason") or "").strip()])
@@ -2491,6 +2543,8 @@ async def validate_plan(state: BrainState) -> dict:
                 "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被覆盖"
                 "（含 baseline_covered 申报 %d 条）", len(_req_items), _bl_n,
             )
+            # H-F5：全覆盖过闸=残差清空（缺口已被后续轮补齐，不再拦 L6/污染 deliver）
+            _gap_residual = []
 
     # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
     # Bug-2 根治（task 92ff8a71/70543ea2/37460a5b 实证）：过去 llm_valid =
@@ -2608,8 +2662,16 @@ async def validate_plan(state: BrainState) -> dict:
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
         # 阶段3.1：本轮覆盖集入水位（跳过覆盖闸的轮不发键——无口径可对账）
         **({"coverage_watermark": _wm_cov_ids} if _wm_cov_ids is not None else {}),
-        # F10：结构签名 last-write-wins（重试轮据此跳过未变结构的软校验）
-        "plan_soft_review_sig": _soft_sig,
+        # H-F5：A6 缺口残差（last-write-wins）——只在【本轮计划真放行】时发：gap 放行=
+        # 覆写残差，全覆盖=清空；否决轮不发（残差语义只对最终生效的计划成立，deliver/L6
+        # 只会在有效计划之后消费）。
+        **({"coverage_gap_residual": _gap_residual}
+           if (plan_valid and _gap_residual is not None) else {}),
+        # F10：结构签名 last-write-wins（重试轮据此跳过未变结构的软校验）。
+        # 阶段3.9 复核 H-F6/R-F5（CONFIRMED）：只在真放行时 emit——否决轮也发签名会让
+        # 下一轮结构相同的计划命中 _soft_skip 直接 valid（硬 LLM 门被静默转放行；
+        # 完整性预算>1 时 P6b 重查被跳过）。否决轮发空串=下一轮必重跑软校验。
+        "plan_soft_review_sig": _soft_sig if plan_valid else "",
     }
 
 
@@ -3669,10 +3731,14 @@ def _deliver_review_payload(state: BrainState) -> dict:
                 for b in matrix["baseline_covered"][:_DELIVER_ASSERT_ROWS_MAX]
             ],
             "baseline_covered_count": len(matrix["baseline_covered"]),
+            # 3.9 H-F5：A6 gap 放行的残差（last-write-wins，全覆盖过闸即清）——人工闸
+            # 必须看到"最终计划是带着哪些未覆盖需求 degraded 放行的"（非陈旧快照）。
+            "gap_residual": list(state.get("coverage_gap_residual") or []),
         }
     except Exception as exc:  # noqa: BLE001 — 矩阵现算失败绝不挡人工闸，如实留痕
         logger.warning("[DELIVER] 覆盖矩阵现算失败(payload 降级为空): %s", exc)
         coverage = {"total": 0, "covered": 0, "uncovered": [], "uncovered_count": 0,
+                    "gap_residual": list(state.get("coverage_gap_residual") or []),
                     "error": str(exc)[:200]}
 
     return {
@@ -3882,12 +3948,12 @@ async def revision(state: BrainState) -> dict:
         # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。
         "failure_escalated": False,
         # 3.8 生命周期收敛：修订=新一轮，同族记账/路由/归因键对称重置——瞬时配额与强模型
-        # 标记（与 retry_counts 同纪律）；use_alternate_model 粘滞 True 会让 rev-* 子任务
+        # 标记（与 retry_counts 同纪律）；alternate 标记粘滞会让 rev-* 子任务
         # 无端走备选模型；confirm_reason/deliver_auto_reject_reason 陈旧值污染下一轮终态
-        # 归因（runner 兜底归因链读它们）。
+        # 归因（runner 兜底归因链读它们）。（3.9 H-F7：use_alternate_model→按子任务映射）
         "subtask_transient_counts": {},
         "subtask_force_strong": {},
-        "use_alternate_model": False,
+        "subtask_use_alternate": {},
         "confirm_reason": "",
         "deliver_auto_reject_reason": "",
         # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订

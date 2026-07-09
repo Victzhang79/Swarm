@@ -212,13 +212,32 @@ async def fetch_structure_inventory(
     project_id: str, max_files: int = 4000, max_symbols: int = 8000,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """A7（阶段3.5）：项目结构全量清单（有界）——确定性 baseline 候选通道。
-    索引未建/连接失败 → ([], [])（fail-open，调用方零注入）。"""
-    try:
+    索引未建/连接失败/超时 → ([], [])（fail-open，调用方零注入）。
+
+    阶段3.9 复核 F2（CONFIRMED）：此前是本文件【唯一】直连 get_retriever 的入口——
+    在调用方（brain）loop 上触碰归属 KB loop 的 psycopg 连接（跨线程），与 worker 侧
+    resolve_symbols_sync/knowledge tool 并发时间歇性 RuntimeError（被吞成零候选=通道
+    哑火），且无超时包装——kb 连接半死（TCP 黑洞不抛）时 plan 节点无限期挂死（此处在
+    LLM 调用之前，_invoke_llm_abortable 看门狗管不到）。对齐 retrieve_knowledge 惯例：
+    run_coroutine_threadsafe 派发到 KB loop + wrap_future 桥接 + wait_for 有界等待。"""
+
+    async def _impl() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         r = await get_retriever()
         idx = getattr(r, "_struct", None)
         if idx is None:
+            # 复核 F4：零日志时「预处理没跑/索引建失败」与「绿地真没存量」不可区分，
+            # 棕地任务回到 round37 的无出口状态而运维零感知——降级可观测纪律。
+            logger.warning(
+                "[knowledge] A7 结构索引未建（project=%s）——候选通道降级为空；"
+                "棕地项目请确认预处理/索引流水线已跑", project_id)
             return [], []
         return await idx.list_inventory(project_id, max_files, max_symbols)
+
+    try:
+        loop = _get_kb_loop()
+        cfut = asyncio.run_coroutine_threadsafe(_impl(), loop)
+        return await asyncio.wait_for(
+            asyncio.wrap_future(cfut), timeout=_kb_sync_timeout_sec())
     except Exception as e:  # noqa: BLE001 — 候选通道绝不拖垮规划
         logger.warning("[knowledge] A7 结构清单获取失败（降级为空候选）：%s", e)
         return [], []

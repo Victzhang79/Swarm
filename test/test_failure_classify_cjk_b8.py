@@ -86,4 +86,5 @@ def test_narrative_summary_does_not_mask_transient_error_field():
         out = asyncio.run(nodes.handle_failure(state))
     assert out.get("subtask_transient_counts", {}).get("st-1") == 1, (
         "error 字段的真 transient 特征被叙述性 summary 遮蔽——误入 capability 阶梯烧配额")
-    assert out.get("use_alternate_model") is False
+    # 语义演进（阶段3.9 H-F7）：全局 bool → 按子任务映射；意图不变=transient 不换模型
+    assert not out.get("subtask_use_alternate", {}).get("st-1")

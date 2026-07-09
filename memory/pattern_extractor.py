@@ -59,6 +59,18 @@ def should_write_success(state: BrainState) -> bool:
             _blocking)
         return False
 
+    # 阶段3.9 H-F5：A6 覆盖缺口残差（coverage_gap_residual，last-write-wins——全覆盖过闸
+    # 会清空）。非空=最终计划真带未覆盖需求交付，绝不学成"成功模式"；空/缺失=缺口已补齐
+    # 或从未放行，不拦。阻断语义从 append-only degraded 迁到本键（那里无人能清，缺口
+    # 后来补齐仍被陈旧留痕永久拦——与"宁不学"哲学无关，纯粹是过期事实）。
+    _gap_residual = state.get("coverage_gap_residual") or []
+    if _gap_residual:
+        import logging
+        logging.getLogger(__name__).info(
+            "[LEARN] 交付带覆盖缺口残差 %s，跳过 L6 成功模式写入（A6 gap 放行非全量成功）",
+            _gap_residual)
+        return False
+
     # TD2606-A7（记忆毒化回路根治）：learn_success 在 human_decision==ACCEPT 时触发，但【人工
     # 可 ACCEPT-override 一个 L2 未过/升级人工/仍有失败子任务的残缺交付】。若仍写 L6 成功模式，
     # 会把错误执行学成可复用经验，且被复用越多 reuse_count 越高、衰减越慢 → 自毒化无解药。

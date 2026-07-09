@@ -68,7 +68,8 @@ def test_simple_failure_switches_to_alternate_model():
     }
     out = _run(handle_failure(state))
     assert out.get("failure_strategy") == "retry_alternate", f"应换备选模型，实际 {out.get('failure_strategy')}"
-    assert out.get("use_alternate_model") is True
+    # 语义演进（阶段3.9 H-F7）：全局 bool → 按子任务映射；意图不变=失败子任务吃 alternate
+    assert out.get("subtask_use_alternate", {}).get("st-1") is True
     print("  ✅ SIMPLE 超 max_retries 次 → 切换备选模型")
 
 

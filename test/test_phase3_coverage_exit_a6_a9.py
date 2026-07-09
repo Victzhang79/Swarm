@@ -69,9 +69,10 @@ async def _run(plan, retry=1, watermark=None, items=None):
 async def test_gap_within_threshold_degraded_pass_after_retry():
     out = await _run(_plan_covering(REQS[:9]), retry=1)  # 1/10 缺口 ≤ 阈值(2)
     assert out["plan_valid"] is True, "缺口≤阈值且已给修补机会→degraded 放行（替代全有全无）"
-    assert any("gap_allowed" in d for d in out.get("degraded_reasons") or []), (
-        "残差必须 degraded 留痕（阻断假成功学习+deliver 可观测）")
-    assert REQS[9] in " ".join(out.get("degraded_reasons") or []), "残差 id 必须可见"
+    # 语义演进（阶段3.9 H-F5）：残差从 append-only degraded_reasons（无人能清→缺口
+    # 补齐后仍永久拦 L6）迁到独立 last-write-wins 键。意图不变：拦 L6+deliver 可见。
+    assert out.get("coverage_gap_residual") == [REQS[9]], (
+        "残差必须留痕（阻断假成功学习+deliver 可观测），且 id 可见")
     assert out["plan_validation_feedback"] == ""
     assert sorted(out.get("coverage_watermark") or []) == sorted(REQS[:9])
 

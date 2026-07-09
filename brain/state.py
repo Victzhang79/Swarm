@@ -100,7 +100,11 @@ class BrainState(TypedDict, total=False):
     dispatch_remaining: list[str]       # 尚未派发/等待中的子任务 ID 列表
     failed_subtask_ids: list[str]       # 失败的子任务 ID 列表
     failure_strategy: str               # handle_failure 决策: retry|retry_alternate|replan|escalate
-    use_alternate_model: bool           # retry_alternate 时使用备选模型
+    # 阶段3.9 复核 H-F7/R-F1（CONFIRMED）：替代全局 bool use_alternate_model——决策针对
+    # 【失败撮】却记全局，dispatch 对失败子任务降优先级使首批大概率是无关新前沿，
+    # 消费即清把 alternate 路由送给无关批、真正重试者反拿主力模型。按子任务记账：
+    # handle_failure 写 {sid: True}，dispatch 逐子任务消费（派出即从表中清除）。
+    subtask_use_alternate: dict[str, bool]
     failure_escalated: bool             # escalate 时标记需人工介入
     subtask_force_strong: dict[str, bool]  # FINDING-12：拒答/步数耗尽的子任务，重试强制走最强模型+更多步数
     abandoned_subtask_ids: list[str]    # 部分交付：重试耗尽被放弃的子任务（+其依赖者），任务终态 PARTIAL 而非灭全部
@@ -163,6 +167,12 @@ class BrainState(TypedDict, total=False):
     # 回灌 D09 feedback + 覆盖闸通过仍倒退时硬 invalid（A6 degraded 放行后 load-bearing
     # 硬地板）。陈旧 id（清单外）在比对时被过滤，永不误杀；本键绝不需要清空（任务级单调）。
     coverage_watermark: Annotated[list[str], _merge_degraded_reasons]
+    # 阶段3.9 复核 H-F5（CONFIRMED）：A6 缺口 degraded 放行的残差 req id——独立
+    # last-write-wins 键（不进 append-only degraded_reasons：那里无人能清，缺口后来被
+    # 补齐仍永久拦 L6+deliver 展示陈旧缺口）。validate_plan 真放行时 emit：gap 放行=
+    # 残差覆写、全覆盖=[] 清空。消费：should_write_success（非空拦 L6 假成功学习）+
+    # deliver payload（人工可见）。
+    coverage_gap_residual: list[str]
     acceptance_assertions: list[dict]   # S2：任务级验收断言 spec [{id, req_id, kind:"http_probe", request, expect, auth}]（task#25 acceptance_spec 写入；声明先行）
     acceptance_passed: bool | None      # S2：验收断言三态结论（None=跳过≠失败，对齐 l3_passed/migration_verify_passed）——verify_runtime accept phase 写入（task#25/26），本批只声明不写入
     acceptance_details: dict[str, Any]  # S2：断言逐条 verdict+证据留痕（deliver 展示/失败回灌数据源）——同上，本批只声明不写入
@@ -254,8 +264,8 @@ class BrainState(TypedDict, total=False):
 #   oneshot   一次性消费键：写→指定消费点消费后必须清（例：replan_feedback 由 PLAN
 #             成功产出清；l2_targeted 由 handle_failure l2 三出口清）。
 #   round     轮次键：每轮/每决策必须整体替换或 always-emit（不靠残留；例：
-#             failure_strategy 每次 handle_failure 整体替换；use_alternate_model 由
-#             dispatch 消费后本轮清零）。
+#             failure_strategy 每次 handle_failure 整体替换；subtask_use_alternate 由
+#             dispatch 按子任务消费——派出即清该 sid）。
 #   monotonic 单调累积键：只增不减（reducer 或语义保证；per-subtask dict 账表须在
 #             replan 时按签名剪枝——D08 纪律，见 _surgical_replan_reset）。
 #   terminal  任务级常量/终态键：写一次不清合法（终态归因/锚点）。
@@ -269,7 +279,8 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "plan_batch_failed_modules": "round",
     "baseline_covered": "round",
     "coverage_watermark": "monotonic",
-    "plan_soft_review_sig": "round",
+    "coverage_gap_residual": "round",   # A6 残差 last-write-wins：gap 放行覆写/全覆盖清空（3.9 H-F5）
+    "plan_soft_review_sig": "round",    # 只在真放行时 emit，否决轮发空串（3.9 H-F6/R-F5）
     "plan_generation_failed": "round",
     "oversized_subtask_ids": "round",
     "invest_fail_count": "round",
@@ -278,7 +289,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "replan_feedback": "oneshot",
     "failed_subtask_ids": "round",
     "failure_strategy": "round",
-    "use_alternate_model": "round",     # dispatch 消费后本轮清零（3.8 修）
+    "subtask_use_alternate": "round",   # 按子任务消费：派出即清该 sid（3.9 H-F7/R-F1，替代全局 bool）
     "failure_escalated": "round",
     "subtask_force_strong": "monotonic",   # D08 签名剪枝（3.8 补）
     "subtask_retry_counts": "monotonic",   # D08 签名剪枝

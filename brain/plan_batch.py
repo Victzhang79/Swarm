@@ -8,10 +8,13 @@
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Java/前端典型分层顺序（depends_on 缺失时的组间排序兜底，Q3）。
 # 数字越小越先执行（被依赖者先做）。
@@ -493,12 +496,16 @@ def bucket_requirement_items(
     cross: list[dict] = []
     for it in valid:
         text = str(it.get("text") or "")
-        routed = False
+        # R-F7（阶段3.9 复核 CONFIRMED）：容量/bisect 子批（mod#i/k、mod~a）归一同 base 后，
+        # 条目对多个子批亲和会被重复 append → 需求清单块重复行。按 base 去重。
+        routed_bases: set[str] = set()
         for base, files in bases:
+            if base in routed_bases:
+                continue
             if _item_module_affinity(text, base, files) > 0:
                 by_module.setdefault(base, []).append(it)
-                routed = True
-        if not routed:
+                routed_bases.add(base)
+        if not routed_bases:
             cross.append(it)
     return by_module, cross
 
@@ -526,6 +533,20 @@ def merge_subtask_batches(batch_results: list[list[dict]],
     if _true_deps:
         for m, ds in (module_deps or {}).items():
             _deps_by_base[_base_module(m)] = [_base_module(d) for d in (ds or [])]
+        # R-F4（阶段3.9 复核 CONFIRMED）：module_deps 键=tech_design modules[].name，批名=
+        # file_plan module 字段/路径推断——两套口径从未被校验对齐。依赖表【非空但对批名
+        # 零命中】=对齐失败，真依赖模式会产出零跨批边=全并行，而旧串行链在依赖情报劣化时
+        # 恰恰最保守 → 回退 legacy 串行门控并留痕。注意：deps 表为空（tech_design 未声明
+        # 依赖）不回退——"无真实依赖=并行"是 A12 已拍板语义（3.3 测试锁定），validate
+        # 覆盖闸/L1 兜底；本护栏只治"有情报但名字对不上"的静默丢边。
+        _batch_bases = {_base_module(m) for m in (batch_modules or [])}
+        if (_deps_by_base and len(_batch_bases) > 1
+                and not (_batch_bases & set(_deps_by_base.keys()))):
+            logger.warning(
+                "[PLAN-BATCH] A12 依赖表对批名零命中（deps键=%s vs 批base=%s）——"
+                "口径不对齐，回退 legacy 串行门控（最保守），不赌全并行",
+                sorted(_deps_by_base.keys())[:8], sorted(_batch_bases)[:8])
+            _true_deps = False
     merged: list[dict] = []
     seq = 0
     prev_batch_last_id: str | None = None

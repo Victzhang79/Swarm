@@ -56,13 +56,17 @@ def test_registry_keys_all_declared_and_dead_key_removed():
 
 
 def test_registry_covers_new_stage3_keys():
-    for k in ("coverage_watermark", "plan_soft_review_sig", "use_alternate_model",
-              "subtask_transient_counts", "subtask_force_strong",
+    # 语义演进（阶段3.9 H-F7/H-F5）：use_alternate_model → subtask_use_alternate（按子任务）；
+    # 新增 coverage_gap_residual（A6 残差 last-write-wins）。
+    for k in ("coverage_watermark", "plan_soft_review_sig", "subtask_use_alternate",
+              "coverage_gap_residual", "subtask_transient_counts", "subtask_force_strong",
               "adversarial_verify_round", "runtime_smoke_last_signature"):
         assert k in ACCOUNTING_KEY_LIFECYCLE, f"记账键 {k} 必须登记生命周期"
 
 
-# ─────────────── T1：use_alternate_model 消费点收口 ───────────────
+# ─────────────── T1：alternate 标记按子任务消费（3.9 H-F7 语义演进）───────────────
+# 3.8 原修法=全局 bool 消费即清；3.9 复核坐实"失败撮被降优先级错开到后续批"时消费即清
+# 会把路由送错人 → 升级为按子任务映射。意图不变：派出即清（不粘滞劫持路由）。
 
 async def test_dispatch_consumes_alternate_flag():
     plan = TaskPlan(subtasks=[_sub("st-1")], parallel_groups=[["st-1"]])
@@ -74,13 +78,13 @@ async def test_dispatch_consumes_alternate_flag():
         "task_id": "t1", "project_id": "p1", "plan": plan,
         "subtask_results": {}, "dispatch_remaining": ["st-1"],
         "failed_subtask_ids": [], "knowledge_context": {},
-        "use_alternate_model": True,  # 上一轮 retry_alternate 决策
+        "subtask_use_alternate": {"st-1": True},  # 上一轮 retry_alternate 决策
     }
     from swarm.brain.nodes.dispatch import dispatch
     with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker):
         out = await dispatch(state)
-    assert out.get("use_alternate_model") is False, (
-        "派发消费后必须清——否则单次 alternate 决策劫持后续所有轮全部子任务的模型路由")
+    assert out.get("subtask_use_alternate") == {}, (
+        "派出的子任务标记必须消费即清——否则单次 alternate 决策劫持后续轮的模型路由")
 
 
 # ─────────────── T2：adversarial round 收敛归零 ───────────────
@@ -155,7 +159,8 @@ async def test_revision_clears_lifecycle_keys(monkeypatch):
         "plan": TaskPlan(subtasks=[_sub("st-1")], parallel_groups=[["st-1"]]),
         "subtask_results": {"st-1": _wo("st-1")}, "project_id": "",
     })
+    # 语义演进（3.9 H-F7）：use_alternate_model→subtask_use_alternate，重置值 False→{}
     for k, v in (("subtask_transient_counts", {}), ("subtask_force_strong", {}),
-                 ("use_alternate_model", False), ("confirm_reason", ""),
+                 ("subtask_use_alternate", {}), ("confirm_reason", ""),
                  ("deliver_auto_reject_reason", "")):
         assert out.get(k) == v, f"REVISE=新一轮，{k} 必须对称重置（陈旧值污染路由/归因）"

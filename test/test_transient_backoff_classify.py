@@ -111,7 +111,8 @@ def test_transient_failure_uses_backoff_not_capability_quota():
     )
     res = _run_handle({"subtask_results": {"st-1-1": out}})
     assert res["failure_strategy"] == "retry"
-    assert res.get("use_alternate_model") is False
+    # 语义演进（阶段3.9 H-F7）：全局 bool → 按子任务映射；意图不变=transient 不换模型
+    assert not res.get("subtask_use_alternate", {}).get("st-1-1")
     # transient 计数 +1，capability 配额未动
     assert res["subtask_transient_counts"]["st-1-1"] == 1
     assert "subtask_retry_counts" not in res or res.get("subtask_retry_counts", {}).get("st-1-1", 0) == 0

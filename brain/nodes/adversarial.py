@@ -242,7 +242,11 @@ async def adversarial_verify(state: BrainState) -> dict:
     if cur_round >= max_rounds:
         logger.warning("[ADVERSARIAL] 已达 %d 轮仍未收敛 → 升人工（degraded 放行，绝不静默/绝不再打回）",
                        max_rounds)
-        return _skip(cur_round, verified,
+        # 阶段3.9 复核 R-F6（CONFIRMED）：cap 短路=本战役终结，round 必须归零（与全 NICE
+        # 收敛分支对齐，3.8 只修了收敛分支）——否则一次 unconverged 后，任务余生每个新战役
+        # （失败修复重做件/rebase 重生成件）进场即撞 cap 免复核，复核信号面永久失效。
+        # degraded 留痕单调不清，auto_accept 仍被硬拦（gates 消费），人工兜底不放松。
+        return _skip(0, verified,
                      f"对抗验证 {max_rounds} 轮未收敛，升人工复核（degraded 放行）",
                      degraded=f"adversarial_verify_unconverged:round_cap_{max_rounds}")
 

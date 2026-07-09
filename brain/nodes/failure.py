@@ -64,6 +64,20 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     return l1_details_of(subtask_results.get(fid))
 
 
+def _alt_map_update(state: dict, wave_ids, use_alternate: bool) -> dict[str, bool]:
+    """阶段3.9 H-F7/R-F1：alternate 决策按子任务记账（替代全局 bool）。
+
+    本次决策覆盖 wave_ids：alternate=True → 标记这些 sid；False（普通 retry/transient
+    退避）→ 清掉这些 sid 的旧标记（决策被替换）。其余子任务的既有标记原样保留——
+    dispatch 对失败撮降优先级会把重试者错开到后续批，标记必须活到它真被派出。"""
+    _wave = set(wave_ids or [])
+    out = {k: v for k, v in (state.get("subtask_use_alternate") or {}).items()
+           if k not in _wave}
+    if use_alternate:
+        out.update({sid: True for sid in _wave})
+    return out
+
+
 def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str) -> list:
     """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
     推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built（本就 JVM 包语义）；推不出→空
@@ -469,7 +483,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "failed_subtask_ids": [],
             "failure_strategy": "retry_alternate" if forced_alternate else "retry",
             "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
-            "use_alternate_model": forced_alternate,
+            "subtask_use_alternate": _alt_map_update(state, failed_ids, forced_alternate),
             "subtask_retry_counts": {**retry_counts, **next_counts},
         }
 
@@ -758,7 +772,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "failed_subtask_ids": [],
                     "failure_strategy": "retry_alternate",
                     "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
-                    "use_alternate_model": True,
+                    "subtask_use_alternate": _alt_map_update(state, failed_ids, True),
                     "subtask_retry_counts": _rc,
                     "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
                     "targeted_recovery_counts": _trc,
@@ -892,7 +906,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "failed_subtask_ids": [],
                     "failure_strategy": "retry_alternate" if forced_alternate else "retry",
                     "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
-                    "use_alternate_model": forced_alternate,
+                    "subtask_use_alternate": _alt_map_update(state, failed_ids, forced_alternate),
                     "subtask_retry_counts": {**_retry_counts, **_next_counts},
                 }
             # 卡死子任务恢复阶梯·阶梯二：escalate 前先试【定点拆小】（仅单个失败子任务时）。
@@ -1032,7 +1046,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "subtask_results": subtask_results,
                 "failure_strategy": "retry",
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
-                "use_alternate_model": False,
+                "subtask_use_alternate": _alt_map_update(state, transient_ids, False),
                 "subtask_transient_counts": {**transient_counts, **next_tcounts},
             }
         # transient 退避也用尽 → 落入下方 capability 阶梯（基础设施持续不可用，升级人工）
@@ -1148,13 +1162,13 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     if _scope_widened:
         out["plan"] = plan_obj  # 回写加宽后的 scope，dispatch 重试用
     if effective_strategy == "retry_alternate":
-        out["use_alternate_model"] = True
+        out["subtask_use_alternate"] = _alt_map_update(state, failed_ids, True)
         logger.info(
             "[HANDLE_FAILURE] 策略=retry_alternate（第 %d 次，换备选模型）: %s",
             deepest, failed_ids,
         )
     else:
-        out["use_alternate_model"] = False
+        out["subtask_use_alternate"] = _alt_map_update(state, failed_ids, False)
         logger.info(
             "[HANDLE_FAILURE] 策略=retry（第 %d/%d 次）: %s",
             deepest, max_retries, failed_ids,
