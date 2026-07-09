@@ -79,6 +79,7 @@ from swarm.brain.prompts import (
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.memory.sliding_window import PRIORITY_WORKER
+from swarm.models.errors import TaskTokenLimitExceeded
 from swarm.models.router import ModelRouter
 
 # B1 批3: dispatch/verify 域已抽出；re-export 节点保 swarm.brain.nodes.X 路径不变。
@@ -525,6 +526,12 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
     except _aio.TimeoutError:
         if fallback_llm is None:
             raise
+        # §九 阶段1.5：主备切换是重试层——切备前查 ledger 余额，耗尽则确定性抛
+        # TaskTokenLimitExceeded（runner salvage→PARTIAL），不再对备用烧一整轮全款。
+        from swarm.models import ledger as _ledger_mod
+        from swarm.models import usage_tracker as _ut_mod
+        _ledger_mod.ensure_budget(_ut_mod.get_current_task() or "",
+                                  min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
         logger.warning(
             "[PLAN-BATCH] R35-A primary 外层超时 %.0fs → 显式切备用模型重试"
             "（with_fallbacks 只兜流内异常，外层墙钟超时须主动切备）", total_timeout)
@@ -859,6 +866,13 @@ async def _plan_ultra_batched(
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
             for _attempt in range(1, _PLAN_BATCH_MAX_ATTEMPTS + 1):
+                # §九 阶段1.5：每 attempt 是重试层——发起前查 ledger 余额，耗尽即确定性
+                # 上抛（绝不吞成"模块失败"记账：预算耗尽是任务级事实，须 salvage 而非
+                # 降级跳过后继续烧兄弟批）。
+                from swarm.models.errors import TaskTokenLimitExceeded as _TTLE
+                from swarm.models import ledger as _ledger_mod
+                _ledger_mod.ensure_budget(state.get("task_id") or "",
+                                          min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
                 _t0 = _time.monotonic()
                 try:
                     # R34-1：流式+chunk 看门狗（无 astream 的桩/客户端=原 wait_for 行为）
@@ -905,6 +919,8 @@ async def _plan_ultra_batched(
                     last_fail = ("ok", i, mod_name, [], _dt, len(batch))  # 空 → 可重试
                 except _asyncio.TimeoutError:
                     last_fail = ("timeout", i, mod_name, None, None, len(batch))
+                except _TTLE:
+                    raise  # §九 阶段1.5：预算耗尽绝不吞成模块 error（任务级 salvage）
                 except Exception as exc:  # noqa: BLE001
                     last_fail = ("error", i, mod_name, exc, None, len(batch))
                 if _attempt < _PLAN_BATCH_MAX_ATTEMPTS:
@@ -1691,6 +1707,10 @@ async def plan(state: BrainState) -> dict:
                 _baseline_covered = normalize_baseline_covered(
                     result.pop("baseline_covered", None))
             task_plan = TaskPlan(**result)
+      except TaskTokenLimitExceeded:
+        # §九 阶段1.5：预算耗尽绝不降级成兜底假计划（那会把"没钱了"伪装成"规划失败"
+        # 继续走 confirm/人工）——原样上抛，runner 确定性 salvage→PARTIAL 保产物。
+        raise
       except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
         _plan_degraded = f"plan LLM 输出解析失败，产出空 scope 兜底计划（Worker 大概率失败，需人工关注）（{e}）"
@@ -2453,6 +2473,12 @@ async def handle_failure(state: BrainState) -> dict:
     任务(dispatch_remaining)的返回，统一回传当前 plan。plan 为 replace 语义、回传同一对象
     幂等无副作用；已自带 plan 的返回(_targeted_redecompose 的 new_plan)不覆盖。
     """
+    # §九 阶段1.5：重试阶梯统一从 ledger 扣减——预算耗尽时不再开任何新恢复轮
+    # （retry/换模型/replan 都要烧钱），直接抛给 runner 走 salvage→PARTIAL 保产物。
+    # 旧计数表（subtask_retry_counts/replan_count/…）保留为轮次上限，钱由 ledger 管。
+    from swarm.models import ledger as _ledger_mod
+    _ledger_mod.ensure_budget(state.get("task_id") or "",
+                              min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
     result = await _handle_failure_impl(state)
     if isinstance(result, dict) and "dispatch_remaining" in result and "plan" not in result:
         _p = state.get("plan")

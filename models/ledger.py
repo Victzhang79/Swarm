@@ -66,6 +66,11 @@ STAGE_BY_NODE: dict[str, str] = {
 def stage_for_node(node_name: str) -> str | None:
     return STAGE_BY_NODE.get(node_name or "")
 
+
+# 阶段1.5：重试层发起前的最小余量（低于此还开新一轮重试=必然中途烧穿，宁可现在
+# 确定性 salvage→PARTIAL 保产物）。与 _LedgerGuard 预留口径同数量级。
+RETRY_MIN_HEADROOM = 4096
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS task_ledger (
     task_id          TEXT PRIMARY KEY,
