@@ -208,6 +208,22 @@ def resolve_symbols_sync(
         return ""
 
 
+async def fetch_structure_inventory(
+    project_id: str, max_files: int = 4000, max_symbols: int = 8000,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """A7（阶段3.5）：项目结构全量清单（有界）——确定性 baseline 候选通道。
+    索引未建/连接失败 → ([], [])（fail-open，调用方零注入）。"""
+    try:
+        r = await get_retriever()
+        idx = getattr(r, "_struct", None)
+        if idx is None:
+            return [], []
+        return await idx.list_inventory(project_id, max_files, max_symbols)
+    except Exception as e:  # noqa: BLE001 — 候选通道绝不拖垮规划
+        logger.warning("[knowledge] A7 结构清单获取失败（降级为空候选）：%s", e)
+        return [], []
+
+
 @swarm_traceable(
     "knowledge/retrieve-brain",
     phase=PHASE_2,

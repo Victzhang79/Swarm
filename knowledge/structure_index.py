@@ -338,6 +338,38 @@ class StructureIndexer:
             rows = await cur.fetchall()
         return [self._row_to_symbol_dict(r) for r in rows]
 
+    async def list_inventory(
+        self, project_id: str, max_files: int = 4000, max_symbols: int = 8000,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """A7（阶段3.5，2026-07-09 登记册）：项目结构全量清单（有界）——确定性 baseline
+        候选通道数据源。此前覆盖闸唯一存量依据=语义检索 top-12 文件，本索引从不喂给
+        覆盖闸（棕地底座需求结构上无申报出口）。按路径序确定性截断防大仓撑爆。"""
+        conn = self._conn_or_raise()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT file_path, module_name, language FROM kb_file_index
+                WHERE project_id = %s ORDER BY file_path LIMIT %s
+                """,
+                (project_id, int(max_files)),
+            )
+            frows = await cur.fetchall()
+            await cur.execute(
+                """
+                SELECT file_path, symbol_name, symbol_type, class_name
+                FROM kb_symbol_index
+                WHERE project_id = %s ORDER BY file_path, symbol_name LIMIT %s
+                """,
+                (project_id, int(max_symbols)),
+            )
+            srows = await cur.fetchall()
+        files = [{"file_path": r[0], "module_name": r[1] or "", "language": r[2] or ""}
+                 for r in frows]
+        symbols = [{"file_path": r[0], "symbol_name": r[1] or "",
+                    "symbol_type": r[2] or "", "class_name": r[3] or ""}
+                   for r in srows]
+        return files, symbols
+
     async def query_symbols_by_file(
         self, project_id: str, file_path: str
     ) -> list[dict[str, Any]]:

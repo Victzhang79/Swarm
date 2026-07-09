@@ -703,6 +703,31 @@ def _previous_plan_repair_block(prev_plan, prev_baseline, done_cover_ids=None) -
     )
 
 
+async def _baseline_candidates_block_for(state) -> str:
+    """A7（阶段3.5）：确定性 baseline 候选清单 prompt 块。requirement_items/project_id
+    缺失、索引未建、任何异常 → ""（fail-open 零注入，绝不拖垮规划）。"""
+    try:
+        _req_items = state.get("requirement_items") or []
+        _pid = str(state.get("project_id") or "").strip()
+        if not _req_items or not _pid:
+            return ""
+        from swarm.brain.baseline_candidates import (
+            baseline_candidates_prompt_block,
+            build_baseline_candidates,
+        )
+        from swarm.knowledge.service import fetch_structure_inventory
+        files, symbols = await fetch_structure_inventory(_pid)
+        cands = build_baseline_candidates(_req_items, files, symbols)
+        if cands:
+            logger.info(
+                "[PLAN] A7 存量候选对账清单：%d/%d 条需求检索到确定性存量疑似位置",
+                len(cands), len(_req_items))
+        return baseline_candidates_prompt_block(cands)
+    except Exception as e:  # noqa: BLE001 — 候选通道 advisory，绝不阻断
+        logger.warning("[PLAN] A7 存量候选通道降级为空（不阻断）：%s", e)
+        return ""
+
+
 def _done_cover_ids_from_state(state) -> list[str]:
     """D1：当前 plan 中【已完成且 L1 通过】子任务覆盖的 req id 集（排序去重）。
     pre-dispatch（subtask_results 空）恒 []=注入零变化。"""
@@ -813,6 +838,9 @@ async def _plan_ultra_batched(
     # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
     _cov_block = _requirement_coverage_prompt_block(
         state.get("requirement_items"), batched=True)
+    # A7（阶段3.5）：确定性存量候选对账清单（kb 索引检索，计算一次每批复用）——棕地底座
+    # 需求的申报出口；索引缺失/异常=空串 fail-open。
+    _cov_block += await _baseline_candidates_block_for(state)
     # 经验拔插层（advisory）：分批路径同样注入 planner 经验（按 栈×plan），计算一次每批复用。
     # ULTRA 大任务最受益于策展经验，不应因走批处理而漏掉；禁用/无命中/异常 → 空串（fail-open）。
     _skills_blk_batched = ""
@@ -1816,6 +1844,8 @@ async def plan(state: BrainState) -> dict:
             )
             # S2-3：需求条目清单 + covers 声明纪律（加法式注入；items 空=一字不加，老行为零变化）
             prompt_user += _requirement_coverage_prompt_block(state.get("requirement_items"))
+            # A7（阶段3.5）：确定性存量候选对账清单（棕地申报出口；缺索引/异常=空串 fail-open）
+            prompt_user += await _baseline_candidates_block_for(state)
             # 经验拔插层（advisory）：按 栈×plan 选策展经验追加到规划提示。加法式、永不阻断；
             # 禁用/无命中/异常 → 空串（fail-open，老行为零变化）。
             try:
