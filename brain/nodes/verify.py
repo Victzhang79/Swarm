@@ -123,6 +123,16 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
     # L2 确定性集成审查（编译 + 契约）
     project_path = nodes._get_project_path(project_id)
+    # D6（阶段6，登记册 §五）：project_path 取不到时旧行为【静默】跳过整块确定性集成
+    # 审查直落纯 LLM 判定——未编译产物假绿直通交付，且零留痕。对齐 L3 同场景的
+    # fail-closed 惯例：degraded 留痕（拦 L6 假成功学习 + deliver 可见），LLM 判定
+    # 照跑（fail-open 主链不断，但绝不再无痕）。
+    _l2_unverified_degraded: list[str] = []
+    if not project_path and (merged_diff or "").strip():
+        logger.warning(
+            "[VERIFY_L2] project_path 不可得（project_id=%s）——确定性集成审查（编译+契约）"
+            "被跳过，交付未经编译核验（degraded 留痕 l2_compile_unverified）", project_id)
+        _l2_unverified_degraded = ["l2_compile_unverified:no_project_path"]
     if project_path and (merged_diff or "").strip():
         # round36 #7 治本：放弃/give_up 子任务的半成品文件随 pull-back 落进本地树(pull-back 不判
         # 成败)，又被 L2 全项目同步扫进沙箱编译→污染 L2 信号(round36 实证：st-12-1 被放弃但其
@@ -289,6 +299,9 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
     logger.info(f"[VERIFY_L2] 结果: {'通过' if l2_passed else '未通过'}")
     if not l2_passed:
         return _l2_failure_state(subtask_results)
+    # D6：纯 LLM 放行 + 确定性审查被跳过 → degraded 留痕（reducer 追加去重）
+    if _l2_unverified_degraded:
+        return {"l2_passed": l2_passed, "degraded_reasons": _l2_unverified_degraded}
     return {"l2_passed": l2_passed}
 
 
@@ -515,15 +528,27 @@ async def verify_runtime(state: BrainState) -> dict:
         await _generate_acceptance_assertions(state, derivation)
     assert_cmds: list[str] = []
     if assertions:
-        from swarm.brain.acceptance_spec import assertion_to_probe_cmd
+        from swarm.brain.acceptance_spec import assertion_to_probe_cmd, smoke_login_cmd
+
+        # D8①（阶段6）：冒烟内登录取凭据——运维配置 SWARM_SMOKE_LOGIN_* 后，bearer
+        # 鉴权断言可执行（旧行为 auth!=none 全 manual=鉴权系统行为验证结构性为零）。
+        _login_cmd = smoke_login_cmd()
+        accept_gen_info["auth_login_available"] = bool(_login_cmd)
+        _need_login = False
         for spec in assertions:
-            # 只对 auth=="none" 且 kind=="http_probe" 生成执行片段；manual 绝不进脚本
-            if spec.get("kind") == "http_probe" and spec.get("auth") == "none":
+            _auth = spec.get("auth")
+            _exec_ok = spec.get("kind") == "http_probe" and (
+                _auth == "none" or (_auth == "bearer" and _login_cmd))
+            if _exec_ok:
                 try:
                     assert_cmds.append(assertion_to_probe_cmd(spec, derivation.port))
+                    if _auth == "bearer":
+                        _need_login = True
                 except Exception as exc:  # noqa: BLE001 — 单条生成失败跳过该条，不阻断
                     logger.warning("[VERIFY_RUNTIME] 断言 %s 执行片段生成失败(跳过该条): %s",
                                    spec.get("id"), exc)
+        if _need_login and _login_cmd:
+            assert_cmds.insert(0, _login_cmd)
 
     # 冒烟预算 = 探活窗口 + run_command 收尾缓冲 + 节点内建箱/重建余量（与 L2 侧转交续期同口径）
     # F1：prepare_cmd 存在时加 prepare 预算（构建产物命令，JVM package 可到数分钟）
@@ -965,8 +990,28 @@ def _accept_design_context(state: BrainState, derivation) -> str:
             pass
     diff = (state.get("merged_diff") or "").strip()
     if diff:
-        # VERIFY_L3 merged_diff[:4000] 截断先例：diff 含真实接口/路由定义，是断言路径最强证据
-        parts.append("合并 diff(节选，含真实接口/路由定义):\n" + diff[:4000])
+        # D8③（阶段6，登记册 §五）：evidence 语料不再盲切 diff[:4000]（大 diff 时路由/
+        # 控制器定义多在 4000 字符之外=断言 evidence 只能回指头部文件→防臆造纪律空转）。
+        # 优先抽【路由承载段】：按 diff 段过滤含端点/路由特征行（@RequestMapping/@app.route/
+        # router./URL 字面量等，栈无关关键词面）的文件段，配额内拼接；无命中回退旧节选。
+        _segs = ["diff --git " + p_ for p_ in diff.split("diff --git ")[1:]] or [diff]
+        _route_markers = ("mapping(", "@getmapping", "@postmapping", "@putmapping",
+                          "@deletemapping", "@requestmapping", "@app.route", "@router",
+                          "router.", "app.get(", "app.post(", "app.use(", "urlpatterns",
+                          "@controller", "@restcontroller", "path(", "route(")
+        _route_segs = [g for g in _segs if any(k in g.lower() for k in _route_markers)]
+        _budget = 6000
+        _picked: list[str] = []
+        for g in _route_segs:
+            if _budget <= 0:
+                break
+            _picked.append(g[:min(len(g), _budget, 2000)])
+            _budget -= len(_picked[-1])
+        if _picked:
+            parts.append("合并 diff(路由/接口承载段优选，evidence 请回指这些真实定义):\n"
+                         + "\n".join(_picked))
+        else:
+            parts.append("合并 diff(节选，含真实接口/路由定义):\n" + diff[:4000])
     return "\n\n".join(parts)
 
 
@@ -1108,10 +1153,15 @@ def _accept_phase_verdict(
     from swarm.brain.nodes.runtime_smoke import MARK_ACCEPT_TOOL_MISSING
 
     specs = [a for a in (assertions or []) if isinstance(a, dict)]
-    executable = [a for a in specs
-                  if a.get("kind") == "http_probe" and a.get("auth") == "none"]
-    manual = [a for a in specs
-              if not (a.get("kind") == "http_probe" and a.get("auth") == "none")]
+    # D8①：登录可用时 bearer 断言进 executable 集（与脚本生成侧同口径，gen_info 透传）
+    _login_ok = bool((gen_info or {}).get("auth_login_available"))
+
+    def _is_exec(a: dict) -> bool:
+        return a.get("kind") == "http_probe" and (
+            a.get("auth") == "none" or (a.get("auth") == "bearer" and _login_ok))
+
+    executable = [a for a in specs if _is_exec(a)]
+    manual = [a for a in specs if not _is_exec(a)]
     base: dict = {"total": len(specs), "manual_count": len(manual)}
     manual_rows = [{"id": a.get("id"), "req_id": a.get("req_id"), "kind": a.get("kind"),
                     "auth": a.get("auth"), "verdict": "skipped_manual"} for a in manual]

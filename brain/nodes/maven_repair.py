@@ -18,6 +18,10 @@ from pathlib import Path
 
 from swarm.types import WorkerOutput
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 _MAVEN_GENERIC_SEG = {"org", "com", "net", "io", "cn", "www", "java", "javax",
                       "jakarta", "apache", "springframework", "google"}
 _MISSING_PKG_BRAIN_RE = re.compile(
@@ -149,3 +153,34 @@ def _inject_missing_maven_deps(project_path: str | None, granted: dict, subtask_
         if added:
             injected[sid] = added
     return injected
+
+
+# ── F9（阶段6，登记册 §七）：缺依赖确定性补全 per-stack driver 化 ──
+# 恢复阶梯主体（planning_core 拆小/revert/stub）本就栈无关；唯【缺依赖注入】这层
+# 此前 Maven 写死。抽分发面：按 stack_detect 画像选 driver；未覆盖栈显式留痕
+# no-op（可观测缺口，非静默），新增栈=注册一个 driver 函数，不改调用方。
+_DEP_REPAIR_DRIVERS = {
+    # stack key（stack_detect 画像的 build_system/backend 口径）→ driver
+    "maven": _inject_missing_maven_deps,
+}
+
+
+def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
+                                  granted: dict, subtask_results: dict) -> dict:
+    """按项目栈分发缺依赖确定性补全 driver。未覆盖栈返回 {}（loud，不静默）。"""
+    _keys = []
+    if isinstance(project_stack, dict):
+        for k in ("build_system", "backend", "primary"):
+            v = str(project_stack.get(k) or "").strip().lower()
+            if v:
+                _keys.append(v)
+    if not _keys:
+        _keys = ["maven"]  # 无画像时保留旧行为（Maven 是既有唯一实现）
+    for k in _keys:
+        drv = _DEP_REPAIR_DRIVERS.get(k)
+        if drv is not None:
+            return drv(project_path, granted, subtask_results)
+    logger.warning(
+        "[DEP-REPAIR] F9 栈 %s 暂无缺依赖补全 driver（Maven-only 现状），跳过确定性注入"
+        "（可观测缺口，缺依赖交常规重试阶梯）", _keys[:3])
+    return {}

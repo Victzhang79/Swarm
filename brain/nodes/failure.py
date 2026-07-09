@@ -28,7 +28,7 @@ from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.types import Complexity, WorkerOutput
 
-from swarm.brain.nodes.maven_repair import _inject_missing_maven_deps
+from swarm.brain.nodes.maven_repair import inject_missing_deps_for_stack
 from swarm.brain.nodes.recovery import (
     _INTERNAL_BLOCKED_KINDS,
     _blocked_pkg_unrecoverable,
@@ -781,7 +781,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             if granted:
                 # 治本 A2：授权后【确定性】据项目自身 pom 把缺失依赖补进失败模块 pom，
                 # 不再指望小模型自己加（实测它加不上 → 耗尽配额 → 全量 replan 砸成功子任务）。
-                _dep_injected = _inject_missing_maven_deps(
+                # F9：经 per-stack driver 分发（Maven=既有 driver；未覆盖栈 loud no-op）
+                _dep_injected = inject_missing_deps_for_stack(
+                    state.get("project_stack"),
                     _proj_path_from_state(state), granted, subtask_results)
                 if _dep_injected:
                     logger.info(

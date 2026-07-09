@@ -42,6 +42,20 @@ DEFAULT_PARSE_TIMEOUT = 30                    # 单文件解析超时（秒）
 
 # ~4 chars/token 粗估（与 project/store.py 一致；精确计算是后续债）
 _CHARS_PER_TOKEN = 4
+# F4（阶段6，登记册 §七）：CJK 实际 ~1.5 char/token——按 4 估算把中文 PRD 的预算
+# 高估 ~2.7 倍（欠切爆预算）。按文本 CJK 占比加权估算字符预算。
+_CJK_CHARS_PER_TOKEN = 1.5
+
+
+def _budget_chars_for(text: str, max_tokens: int) -> int:
+    """按 CJK 占比加权的字符预算（纯函数）。全 ASCII=max_tokens×4；全 CJK=×1.5。"""
+    if not text:
+        return max_tokens * _CHARS_PER_TOKEN
+    sample = text[:20000]
+    cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
+    ratio = cjk / len(sample)
+    per_token = _CHARS_PER_TOKEN * (1 - ratio) + _CJK_CHARS_PER_TOKEN * ratio
+    return max(1000, int(max_tokens * per_token))
 
 
 @dataclass
@@ -301,7 +315,8 @@ def summarize_to_budget(text: str, max_tokens: int) -> tuple[str, bool]:
     """
     if max_tokens <= 0:
         return text, False
-    budget_chars = max_tokens * _CHARS_PER_TOKEN
+    # F4（阶段6）：CJK 占比加权预算——中文 PRD 按 4 char/token 高估 ~2.7 倍必爆预算
+    budget_chars = _budget_chars_for(text, max_tokens)
     if len(text) <= budget_chars:
         return text, False
     # 头部留 70%、尾部留 30%（保留开头的目标陈述 + 结尾的验收/约束）

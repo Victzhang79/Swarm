@@ -111,8 +111,12 @@ def test_auth_missing_defaults_to_manual():
 
 
 def test_auth_unknown_value_coerced_to_manual():
+    # 语义演进（阶段6 D8①）：bearer 成为合法 auth（冒烟登录取 token 可执行）；
+    # 未知值仍 fail-closed 降 manual。
     valid, _ = validate_assertions([_valid_spec(auth="bearer")], REQ_ITEMS)
-    assert valid[0]["auth"] == "manual"
+    assert valid[0]["auth"] == "bearer"
+    valid2, _ = validate_assertions([_valid_spec(auth="kerberos")], REQ_ITEMS)
+    assert valid2[0]["auth"] == "manual"
 
 
 def test_dangling_req_id_rejected_with_reason():
@@ -435,7 +439,8 @@ def test_assertion_count_capped_with_trace():
     valid, rejected = validate_assertions(raws, REQ_ITEMS)
     assert len(valid) == MAX_ASSERTIONS, "超量截断"
     assert len(rejected) == 5
-    assert all("上限" in r["reason"] for r in rejected), "截断必须留痕"
+    # 语义演进（阶段6 D8②）：截断改分桶轮转，留痕措辞随之更新（"总帽…分桶轮转"）
+    assert all(("上限" in r["reason"]) or ("总帽" in r["reason"]) for r in rejected), "截断必须留痕"
 
 
 def test_oversized_body_json_coerced_to_manual():

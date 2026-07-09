@@ -1458,12 +1458,23 @@ def _build_analysis_input(project_path: str, scan_result: dict[str, Any]) -> dic
             break
 
     # 核心文件（入口文件、配置文件等）
-    key_files: list[str] = []
-    for pattern in [
+    # F7（阶段6，登记册 §七）：内联硬编码表缺 pom.xml/build.gradle/*.csproj——Maven/
+    # Gradle/.NET 项目探不到核心清单。改与 stack_detect/smoke_derive 的统一表求并集
+    # （单一事实源，清单演进不再漂移）。
+    _key_patterns = [
         "main.py", "app.py", "manage.py", "setup.py", "pyproject.toml",
         "package.json", "Cargo.toml", "go.mod", "Makefile", "Dockerfile",
         "docker-compose.yml", "docker-compose.yaml",
-    ]:
+    ]
+    try:
+        from swarm.brain.stack_detect import _MANIFEST_BACKEND as _sd_manifests
+        for _m in _sd_manifests:
+            if _m not in _key_patterns:
+                _key_patterns.append(_m)
+    except Exception:  # noqa: BLE001 — 表取不到退回内联（不阻断预处理）
+        pass
+    key_files: list[str] = []
+    for pattern in _key_patterns:
         p = root / pattern
         if p.exists():
             key_files.append(pattern)

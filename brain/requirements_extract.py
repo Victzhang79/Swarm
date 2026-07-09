@@ -418,7 +418,25 @@ async def extract_requirements(state: BrainState) -> dict:
         raw_items = raw.get("items") if isinstance(raw, dict) else raw
         items, rejected = validate_requirement_items(raw_items, source_text)
         if items:
-            break
+            # F5（阶段6，登记册 §七）：轮级质量闸——旧行为首轮非空即收，抽 3 条也过
+            # （PRD 万字только 3 条=明显漏抽，下游覆盖闸对着残缺清单空转）。启发式下限=
+            # 每 3000 字符至少 1 条（钳 [1,20]），不足且还有重试额度 → 带反馈重抽。
+            _min_expect = min(20, max(1, len(source_text) // 3000))
+            if len(items) >= _min_expect or attempt >= MAX_EXTRACT_RETRIES:
+                if len(items) < _min_expect:
+                    logger.warning(
+                        "[EXTRACT_REQ] F5 抽取量偏低（%d 条 < 期望下限 %d，源 %d 字符）"
+                        "重试额度已尽，如实收下", len(items), _min_expect, len(source_text))
+                break
+            logger.warning(
+                "[EXTRACT_REQ] F5 轮级质量闸：第 %d 轮仅抽 %d 条（期望≥%d，源 %d 字符）"
+                "→ 带反馈重抽", attempt + 1, len(items), _min_expect, len(source_text))
+            retry_feedback = (
+                f"\n【上一轮仅抽取 {len(items)} 条，明显低于文档规模（{len(source_text)}"
+                f" 字符）应有的条目数。请逐段通读全文，完整穷举功能/接口/约束/验收需求，"
+                "绝不要只摘开头几条】\n"
+            )
+            continue
         # schema 过了但零合法条目（全幻觉/全空）→ 有界重试，把确定性拒因回灌给 LLM
         logger.warning("[EXTRACT_REQ] 第 %d 次抽取零合法条目（rejected: %s）",
                        attempt + 1, _rejected_summary(rejected) or "无输出")
