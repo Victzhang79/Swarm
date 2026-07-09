@@ -116,13 +116,16 @@ def get_all(conn_str: str | None = None) -> list[dict]:
 
 
 def get_enabled_docs(conn_str: str | None = None) -> list:
-    """返回 enabled 技能的 SkillDoc 列表，供 loader 合并。db 空/错误 → []。"""
+    """返回 DB 技能的 SkillDoc 列表（含 disabled 行，enabled 字段如实），供 loader 合并。
+
+    E9-8（阶段E 复核 HF5）：旧行为直接过滤 disabled 行 → 该 id 的 DB 覆盖件消失 →
+    同 id 内置种子重新出场（"禁用了但内置仍生效"的不对称 fail-open）。改为携带
+    enabled=False 的 doc【遮蔽】同 id 内置，选择器统一按 enabled 排除。db 空/错误 → []。
+    """
     from swarm.experience.models import SkillDoc
 
     docs = []
     for row in get_all(conn_str):
-        if not row.get("enabled", True):
-            continue
         try:
             docs.append(SkillDoc(
                 id=row["id"], title=row["title"] or row["id"], body=row["body"],
@@ -133,6 +136,7 @@ def get_enabled_docs(conn_str: str | None = None) -> list:
                 priority=int(row["priority"]), max_chars=int(row["max_chars"]),
                 summary=row.get("description", ""), tags=tuple(row.get("tags", [])),
                 source_path=f"db:{row['id']}", imported=False,
+                enabled=bool(row.get("enabled", True)),
             ))
         except Exception as exc:  # noqa: BLE001 — 单条坏行不拖垮整体
             logger.warning("[skills] DB 技能 %s 转 SkillDoc 失败,跳过: %s", row.get("id"), exc)

@@ -60,7 +60,7 @@ function _renderSkillsList() {
     <div style="border:1px solid var(--border,#2a2a2a);border-radius:6px;padding:6px 8px;margin-bottom:4px">
       <div>${_skEsc(s.title || s.id)} ${s.overridden ? '<span class="hint">(被自定义覆盖)</span>' : ''}</div>
       <div class="hint">${_skEsc(s.id)}</div>
-      <div>${_chips(s.applies_to_stacks)}</div>
+      <div>${_chips(s.applies_to_stacks)}${s.enabled === false ? ' <span class="hint">已策展下架</span>' : ''}</div>
       <button class="btn btn-ghost btn-sm" style="margin-top:4px" onclick="skillCloneBuiltin('${s.id}')">复制为自定义</button>
     </div>`).join('');
   el.innerHTML = html;
@@ -100,7 +100,7 @@ function _fillForm(s, editing) {
   _skSet('sk-tags', (s.tags || []).join(','));
   _skillEditingId = editing ? s.id : null;
   const eid = document.getElementById('skill-editing-id');
-  if (eid) eid.textContent = editing ? ('编辑中: ' + s.id) : '（复制自内置，另存为新技能）';
+  if (eid) eid.textContent = editing ? ('编辑中: ' + s.id) : '（复制自内置，保存后以同 id 覆盖内置版本）';
   const res = document.getElementById('skill-result'); if (res) res.innerHTML = '';
   skillSetMode('form');
 }
@@ -111,9 +111,13 @@ function skillEditDb(id) {
 }
 function skillCloneBuiltin(id) {
   const s = (_skillsData.builtin || []).find(x => x.id === id);
+  if (!s) return;
+  // E9-12：克隆已下架（enabled=false）的内置技能=以同 id 覆盖后复活——必须显式确认，
+  // 防静默绕过策展下架（G5 的 7 条矛盾件）。
+  if (s.enabled === false && !confirm('该内置技能已被策展下架（' + s.id + '）。以同 id 覆盖保存会使其重新挂载，确认继续？')) return;
   // G9：克隆保持同 id——DB 同 id 覆盖内置(_merged_skills 语义)=真 override 只挂一份；
   // 旧行为给 id 加 -custom 后缀，会与原件双份各占一个工具位。
-  if (s) _fillForm({ ...s }, false);
+  _fillForm({ ...s }, false);
 }
 
 function _skillFromForm() {

@@ -31,7 +31,10 @@ def test_get_enabled_docs_filters_and_converts(monkeypatch):
     ]
     monkeypatch.setattr(store, "get_all", lambda *a, **k: rows)
     docs = store.get_enabled_docs()
-    assert [d.id for d in docs] == ["a"]          # disabled 被过滤
+    # E9-8 语义演进（复核 HF5）：disabled 行不再被过滤——携带 enabled=False 的 doc
+    # 【遮蔽】同 id 内置（旧过滤=禁用 override 后内置静默复活），选择器统一按 enabled 排除。
+    assert [d.id for d in docs] == ["a", "b"]
+    assert docs[0].enabled is True and docs[1].enabled is False
     assert docs[0].applies_to_stacks == ("python",) and docs[0].summary == "da"
 
 

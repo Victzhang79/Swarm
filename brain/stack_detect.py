@@ -40,6 +40,14 @@ _MANIFEST_BACKEND = {
 }
 
 # 后端框架 marker：在清单文件内容里出现即判定（substring 匹配，小写）
+# E9-2：DB 引擎依赖词表（清单文本 ground truth；多栈对称：Java/Python/Node/Go/Ruby 驱动坐标）
+_DB_DEP_MARKERS: dict[str, tuple[str, ...]] = {
+    "mysql": ("mysql-connector", "mariadb-java-client", "pymysql", "mysqlclient",
+              "mysql2", "go-sql-driver/mysql", "jdbc:mysql"),
+    "postgres": ("org.postgresql", "postgresql</artifactId>", "psycopg", "asyncpg",
+                 "node-postgres", "\"pg\"", "jackc/pgx", "jdbc:postgresql"),
+}
+
 _BACKEND_FRAMEWORK_MARKERS = {
     "spring-boot": "Spring Boot",
     "spring-webmvc": "Spring MVC",
@@ -381,6 +389,13 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         if marker in all_manifest_text:
             backend_fw = fw
             break
+    # E9-2（阶段E 复核 F2/RF1）：确定性 DB 面——依赖坐标/驱动名是 ground truth
+    # （RuoYi 的 mysql-connector-java 就在 pom 里），此前信号在手边却被整体丢弃，
+    # 导致 DB 特化技能（mysql/postgres-patterns）主路径永不挂载。通用词表可对称扩展。
+    db_engines: list[str] = []
+    for _db, _markers in _DB_DEP_MARKERS.items():
+        if any(m in all_manifest_text for m in _markers):
+            db_engines.append(_db)
     if manifests:
         evidence.append(f"构建/清单文件: {', '.join(sorted(set(manifests))[:6])}")
     if ext_counts:
@@ -489,6 +504,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         "infra_symbols": infra_symbols,
         "confidence": round(confidence, 2),
         "evidence": evidence,
+        "db": db_engines,
         "signals": {
             "manifests": sorted(set(manifests))[:8],
             "server_template_files": real_server_tmpl,

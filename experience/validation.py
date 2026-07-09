@@ -101,6 +101,12 @@ def _diagnose_parse_failure(text: str) -> str:
         return "缺 id(或 name)——技能必须有唯一标识"
     if not (body or "").strip():
         return "正文为空"
+    _routing = ("applies_to_stacks", "applies_to_intents", "applies_to_phases", "target")
+    if not any(k in (meta or {}) for k in _routing) \
+            and not str((meta or {}).get("description") or "").strip():
+        # E9-9：G11 收窄的新拒因必须能被诊断出来——否则用户拿到"未知解析错误"
+        return ("imported 技能缺 description(G11 收窄:无判别依据的宽默认候选不放行;"
+                "请在 frontmatter 补 description 或显式声明路由字段)")
     return "未知解析错误"
 
 
@@ -200,6 +206,9 @@ def validate_skill_doc(
         errors.append("缺 title")
     elif len(doc.title) > 120:
         errors.append("title 过长(>120)")
+    if len(doc.summary or "") > 300:
+        errors.append(f"description 过长({len(doc.summary)}>300):它会逐字进工具 desc 与"
+                      "目录行,超长=挤爆选择面;请压缩成一句触发条件")
     if not doc.summary.strip():
         # G1（阶段E）：worker 技能的 description 是小模型选工具的唯一判别依据——缺失时工具
         # desc 退化为标题复读，15 个工具语义同构。worker 升 error 拒绝；planner 是 push 全文

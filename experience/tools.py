@@ -45,14 +45,17 @@ def build_experience_tools(
         # 回退标题}"=标题复读两遍，15 个工具语义同构，小模型无从判别。缺 description 的
         # 技能（准入闸已升 error，仅剩历史存量）回退旧格式。
         if summary:
-            desc = f"{summary}（advisory 参考·非强制）"[:1024]
+            # E9-10（HF10）：先钳 summary 再拼后缀——整串 [:1024] 会把"（advisory…）"
+            # 后缀截丢且触发条件断在半句。
+            desc = f"{summary[:900]}（advisory 参考·非强制）"
         else:
             desc = f"获取「{s.title}」的完整最佳实践经验（advisory 参考·非强制）。"[:1024]
 
         def _make(_body: str, _sid: str):
             def _fn() -> str:
-                # G4（阶段E）：结构化遥测——零留痕时"加分/减分"在数据上不可证伪。
-                # 任务终态可按 (skill_id, subtask_id) join 出调用→子任务通过率。
+                # G4（阶段E）：结构化遥测【发射端】——零留痕时"加分/减分"在数据上
+                # 不可证伪。join 侧（按 (skill_id,subtask_id) 关联子任务通过率）尚未
+                # 实现：E2E 判读期先 grep "skills-telemetry" 人工汇总（E.9 复核 HF7 存照）。
                 logger.info("[skills-telemetry] experience_tool_called skill_id=%s "
                             "subtask_id=%s", _sid_skill, _sid or "-")
                 return _body

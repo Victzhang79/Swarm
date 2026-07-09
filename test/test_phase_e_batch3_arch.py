@@ -107,12 +107,13 @@ def test_g8_catalog_wording_is_trigger_based():
 # ─────────────── G10：ULTRA 注入卫生 ───────────────
 
 
-def test_g10_batched_planner_block_first_batch_only():
-    from swarm.brain.plan_batch import skills_block_for_batch
-    blk = "──经验块──"
-    assert skills_block_for_batch(blk, 0) != ""
-    assert skills_block_for_batch(blk, 1) == "" and skills_block_for_batch(blk, 11) == "", (
-        "ULTRA 分批每批重复注入 planner 块=round37 实测 12 批≈10KB 纯重复 prefill")
+def test_g10_per_batch_injection_restored():
+    # E.9 更正（复核 HF1+RF6）：各批是独立 LLM 调用（独立 messages），"只注首批"会让
+    # 其余批裸奔规划，且调用点 enumerate(start=1) 使首批注入实为零注入（off-by-one）。
+    # 拍板恢复每批注入（成本有界=planner 预算 1500 字符/批）；helper 删除防再误用
+    # （不写 getsource 守卫——默认行为测试纪律；接线正确性由 E2E 判读 planner prompt）。
+    import swarm.brain.plan_batch as pb
+    assert not hasattr(pb, "skills_block_for_batch")
 
 
 def test_g10_no_structurally_dead_planner_skills():

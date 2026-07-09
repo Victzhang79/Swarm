@@ -95,9 +95,10 @@ def test_build_experience_tools_body_capped():
 
 
 def test_select_worker_skills_bounded_by_max_tools():
+    # E9-7 语义演进：旧入口收编为 push/pull 兼容壳——上界 = pull(max_tools) + push(≤1)
     with _skills_cfg(worker_max_tools=2):
         picked = select_worker_skills(_sub(), _JAVA_STACK)
-    assert len(picked) <= 2
+    assert len(picked) <= 3
 
 
 def test_build_worker_experience_tools_from_seed():

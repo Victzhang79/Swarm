@@ -33,8 +33,9 @@ _LANG_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     "php": ("php", "laravel", "composer", "symfony"),
     "ruby": ("ruby", "rails", "gemfile"),
 }
-# G6（阶段E）：DB 面词表——画像文本（frontend/backend/build/evidence 拼串）提及才挂
-# 对应 DB 技能（互斥）；探不出都不挂（宁缺勿错，错库建议是负资产）。词表对称扩展。
+# G6（阶段E，E9-2 更正）：DB 面主信号 = detect_stack 的 db 字段（依赖坐标 ground
+# truth，见 stack_detect._DB_DEP_MARKERS）；下方子串词表只作 frontend/backend/build
+# 文本的兜底（LLM 裁决画像可能把 "MySQL" 写进 backend 串）。探不出都不挂（宁缺勿错）。
 _DB_SUBSTRINGS: dict[str, tuple[str, ...]] = {
     "mysql": ("mysql", "mariadb"),
     "postgres": ("postgres", "postgresql", "pgsql"),
@@ -69,10 +70,26 @@ def stack_langs_from_project_stack(project_stack: dict | None) -> set[str]:
     for lang, words in _LANG_WORDS.items():
         if any(re.search(rf"\b{re.escape(w)}\b", text) for w in words):
             langs.add(lang)
-    for db, subs in _DB_SUBSTRINGS.items():  # G6：DB 互斥挂载信号
+    for db, subs in _DB_SUBSTRINGS.items():  # G6：DB 互斥挂载信号（文本兜底）
         if any(sub in text for sub in subs):
             langs.add(db)
+    # E9-2：detect_stack 确定性 db 面（依赖坐标 ground truth）——主通道
+    for eng in (project_stack.get("db") or []):
+        e = str(eng).strip().lower()
+        if e:
+            langs.add(e)
     return langs
+
+
+def profile_terms_from_project_stack(project_stack: dict | None) -> set[str]:
+    """E9-3（复核 RF2/RF3）：从画像文本抽【框架级】词元（fastapi/django/vue/react/
+    spring…），供技能相关性提权——语言级栈轴分不出"FastAPI 项目别推 Django 安全"。
+    纯词元切分，不含框架写死清单（技能 id/tags 命中即提权，通用多栈）。"""
+    if not isinstance(project_stack, dict):
+        return set()
+    text = " ".join(str(project_stack.get(k) or "")
+                    for k in ("frontend", "backend", "build")).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", text) if len(t) >= 3}
 
 
 def _match_stacks(skill_stacks: Sequence[str], stack_langs: set[str]) -> bool:
@@ -116,6 +133,22 @@ def _budget_pick(
     return picked
 
 
+def _fw_hit(s: SkillDoc, terms: set[str]) -> int:
+    """技能与画像的框架级相关性（id 词元/tags 与画像词元双向前缀命中 → 1）。
+
+    前缀而非全等：真实画像是 "Vue3"/"SpringBoot 2.x" 形态，词元切出 "vue3"/
+    "springboot"，须命中技能词元 "vue"/"springboot"。词元 <3 字符不参与（防噪声）。"""
+    if not terms:
+        return 0
+    toks = {t for t in (set(s.id.lower().split("-"))
+                        | {str(t).lower() for t in (s.tags or ())}) if len(t) >= 3}
+    for tok in toks:
+        for term in terms:
+            if tok.startswith(term) or term.startswith(tok):
+                return 1
+    return 0
+
+
 def select_skills(
     skills: Iterable[SkillDoc],
     *,
@@ -126,6 +159,7 @@ def select_skills(
     budget_chars: int,
     max_k: int,
     rerank_fn: RerankFn | None = None,
+    profile_terms: set[str] | None = None,
 ) -> list[SkillDoc]:
     """选出注入用技能（handoff §5 混合算法）。
 
@@ -147,11 +181,23 @@ def select_skills(
         and _match_one(s.applies_to_intents, intent)
         and _match_one(s.applies_to_phases, phase)
     ]
-    # G3（阶段E）：栈特化（非'*'）先于 priority——旧键 (-priority, id) 在截断点按字母序丢
-    # 栈特化技能（实测 Vue 项目丢 vue-patterns(48) 留 mysql(48)+postgres(50) 双通配）。
-    cands.sort(key=lambda s: (0 if "*" in s.applies_to_stacks else -1, -s.priority, s.id))
+    # G3（阶段E）+E9-3：排序 = 栈特化 > 框架相关性 > priority > id。
+    # 旧键 (-priority, id) 在截断点按字母序丢栈特化技能；语言级栈轴又分不出框架
+    # （复核实证：FastAPI 项目 push django-security、Vue 项目挂 react-patterns 丢
+    # vue-patterns）——框架词元命中提权，确定性无 LLM。
+    _terms = profile_terms or set()
+    cands.sort(key=lambda s: (0 if "*" in s.applies_to_stacks else -1,
+                              -_fw_hit(s, _terms), -s.priority, s.id))
 
     picked = _budget_pick(cands, budget_chars=budget_chars, max_k=max_k)
+    # E9-4（复核 RF14）：通配层保底——G2（3 个位）×G3（特化绝对优先）乘积效应会让
+    # 主流栈项目的通配技能（error-handling/api-design/imported）一条都进不了。
+    # 特化占满且存在通配候选时，末位让给最优通配（保横切经验可达）。
+    if (max_k >= 2 and len(picked) == max_k
+            and all("*" not in x.applies_to_stacks for x in picked)):
+        _wild = next((c for c in cands if "*" in c.applies_to_stacks), None)
+        if _wild is not None:
+            picked = picked[:-1] + [_wild]
     if len(picked) < len(cands):
         # G3：截断必须可观测——静默 drop 让"配了但从未生效"与"没配"在日志上不可分。
         _picked_ids = {s.id for s in picked}

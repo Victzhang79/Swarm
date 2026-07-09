@@ -31,14 +31,6 @@ _LAYER_ORDER = [
 ]
 
 
-def skills_block_for_batch(block: str, batch_idx: int) -> str:
-    """G10（阶段E）：ULTRA 分批只在【首批】注入 planner 经验块。
-
-    旧行为每批都拼同一块（round37 实测 12 批≈10KB 纯重复 prefill）；经验是横切建议
-    非批相关约束，注一次足够。"""
-    return block if batch_idx == 0 else ""
-
-
 def group_file_plan(file_plan: list[dict]) -> dict[str, list[dict]]:
     """把 file_plan 分组（Q1：module 字段优先，缺失回退路径前缀）。
 

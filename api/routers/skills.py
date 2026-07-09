@@ -52,6 +52,7 @@ def _payload_to_doc(p: SkillPayload) -> SkillDoc:
         applies_to_intents=tuple(p.applies_to_intents),
         applies_to_phases=tuple(p.applies_to_phases),
         priority=p.priority, max_chars=p.max_chars, summary=p.description,
+        enabled=bool(getattr(p, "enabled", True)),  # E9-12：preview 对 disabled 保存如实
         tags=tuple(p.tags),
     )
 
@@ -89,7 +90,7 @@ def list_skills(request: Request) -> dict:
             "tags": list(d.tags), "source": source, "editable": editable, "enabled": enabled,
         }
 
-    builtin = [_view(d, "builtin", False, True)
+    builtin = [_view(d, "builtin", False, bool(getattr(d, "enabled", True)))  # E9-12：下架如实透出
                for d in load_skills(PROJECT_ROOT / "skills_library")]
     db_rows = skill_store.get_all()
     db_ids = {r["id"] for r in db_rows}

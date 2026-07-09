@@ -20,7 +20,11 @@ from swarm.experience.injector import (
 )
 from swarm.experience.library import load_skills_from
 from swarm.experience.models import SkillDoc
-from swarm.experience.selector import select_skills, stack_langs_from_project_stack
+from swarm.experience.selector import (
+    profile_terms_from_project_stack,
+    select_skills,
+    stack_langs_from_project_stack,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,32 +118,10 @@ def select_worker_skills(subtask, project_stack: dict | None = None) -> list[Ski
     选择逻辑，保证"提示里的工具目录"与"实际挂上的工具"一一对应。字符预算给足（工具候选由
     worker_max_tools 封顶，不靠字符裁剪），正文按需 pull 才计费。
     """
-    try:
-        from swarm.config.settings import get_config
-
-        cfg = get_config().skills
-        if not cfg.enabled:
-            return []
-        skills = _merged_skills(cfg.dir_list())
-        if not skills:
-            return []
-        intent = str(
-            getattr(getattr(subtask, "intent", ""), "value", getattr(subtask, "intent", "")) or ""
-        ).lower()
-        stack_langs = stack_langs_from_project_stack(project_stack)
-        return select_skills(
-            skills,
-            stack_langs=stack_langs,
-            intent=intent,
-            phase="code",
-            target="worker",
-            budget_chars=10**9,  # 工具候选不靠字符预算裁剪，只受 worker_max_tools 封顶
-            max_k=cfg.worker_max_tools,
-            rerank_fn=None,
-        )
-    except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮主流程
-        logger.warning("[skills] worker 技能选择失败，降级为空：%s", e)
-        return []
+    # E9-7（复核 HF8/RF15）：生产零调用的旧入口收编为 push/pull 的兼容壳——避免
+    # "两套选择逻辑并存"的未来误用面（docstring 曾承诺与目录同源，已不再成立）。
+    push, pull = select_worker_push_pull(subtask, project_stack)
+    return ([push] if push is not None else []) + list(pull)
 
 
 def select_worker_push_pull(subtask, project_stack: dict | None = None):
@@ -159,21 +141,32 @@ def select_worker_push_pull(subtask, project_stack: dict | None = None):
         skills = _merged_skills(cfg.dir_list())
         if not skills:
             return None, []
+        if cfg.worker_max_tools <= 0:
+            # E9-5（复核 RF5）：0 = worker 侧经验全关（push 也关）——否则"0=不挂经验
+            # 工具"的配置承诺静默漂移成"只关 pull"。
+            return None, []
         intent = str(
             getattr(getattr(subtask, "intent", ""), "value", getattr(subtask, "intent", "")) or ""
         ).lower()
         stack_langs = stack_langs_from_project_stack(project_stack)
+        terms = profile_terms_from_project_stack(project_stack)
         picked = select_skills(
             skills, stack_langs=stack_langs, intent=intent, phase="code",
             target="worker", budget_chars=10**9,
-            max_k=max(cfg.worker_max_tools, 0) + 1,  # +1：top-1 归 push，其余归 pull
-            rerank_fn=None,
+            max_k=cfg.worker_max_tools + 1,  # +1：top-1 归 push，其余归 pull
+            rerank_fn=None, profile_terms=terms,
         )
         if not picked:
             return None, []
-        if "*" not in picked[0].applies_to_stacks:
-            return picked[0], picked[1:]
-        return None, picked[:max(cfg.worker_max_tools, 0)]
+        _top = picked[0]
+        # E9-3（复核 RF2）：push 门槛收紧——仅当 top 栈特化且【与画像框架级相关】
+        # （框架词元命中，或 id 语言前缀 ∈ 探出语言集，如 java-coding-standards）。
+        # 否则"任意栈特化即 push"会把 django-security 全文塞给 FastAPI 项目。
+        from swarm.experience.selector import _fw_hit
+        _lang_prefix = _top.id.split("-", 1)[0].lower() in stack_langs
+        if "*" not in _top.applies_to_stacks and (_fw_hit(_top, terms) or _lang_prefix):
+            return _top, picked[1:]
+        return None, picked[:cfg.worker_max_tools]
     except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮主流程
         logger.warning("[skills] worker push/pull 选择失败，降级为空：%s", e)
         return None, []
@@ -228,9 +221,10 @@ def preview_mount_surfaces(doc: SkillDoc) -> dict:
     cfg = get_config().skills
     others = [d for d in _merged_skills(cfg.dir_list()) if d.id != doc.id]
     pool = others + [doc]
-    rep_stacks = (list(doc.applies_to_stacks) if "*" not in doc.applies_to_stacks
+    # E9-6（复核 HF6/RF7）：输入钳制（防 authenticated CPU DoS：面数=栈×意图全库选择）
+    rep_stacks = (list(doc.applies_to_stacks)[:8] if "*" not in doc.applies_to_stacks
                   else ["java", "python", "node", "go"])
-    rep_intents = (list(doc.applies_to_intents) if "*" not in doc.applies_to_intents
+    rep_intents = (list(doc.applies_to_intents)[:5] if "*" not in doc.applies_to_intents
                    else ["create", "modify"])
     surfaces: list[dict] = []
     for st_tag in rep_stacks:
@@ -248,10 +242,7 @@ def preview_mount_surfaces(doc: SkillDoc) -> dict:
                 elif rank >= 0:
                     mode = "pull"
                 surfaces.append({"stack": st_tag, "intent": it, "target": "worker",
-                                 "mounted": rank >= 0, "rank": rank, "mode": mode,
-                                 "displaces": ids[-1] if (rank >= 0 and len(ids) >
-                                                          max(cfg.worker_max_tools, 0))
-                                 else ""})
+                                 "mounted": rank >= 0, "rank": rank, "mode": mode})
             if "planner" in doc.target:
                 picked_p = select_skills(
                     pool, stack_langs={st_tag}, intent="*", phase="plan",
@@ -261,9 +252,14 @@ def preview_mount_surfaces(doc: SkillDoc) -> dict:
                 rank_p = ids_p.index(doc.id) if doc.id in ids_p else -1
                 surfaces.append({"stack": st_tag, "intent": "*", "target": "planner",
                                  "mounted": rank_p >= 0, "rank": rank_p,
-                                 "mode": "planner_push" if rank_p >= 0 else "",
-                                 "displaces": ""})
-    return {"surfaces": surfaces}
+                                 "mode": "planner_push" if rank_p >= 0 else ""})
+    # E9-6：预览诚实化——层开关关/技能本身 disabled/库空 与"真不匹配"必须可区分；
+    # 单栈模拟排位在多栈真项目会更靠后，明示防乐观误导（复核 RF4）。
+    return {"surfaces": surfaces,
+            "layer_enabled": bool(cfg.enabled),
+            "doc_enabled": bool(getattr(doc, "enabled", True)),
+            "pool_size": len(pool),
+            "note": "单栈理想面模拟；多栈项目候选更多、实际排位可能更靠后"}
 
 
 def planner_skills_block(project_stack: dict | None = None) -> str:

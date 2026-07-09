@@ -141,7 +141,10 @@ def parse_skill_text(
         max_chars=_as_int(meta.get("max_chars"), 1200, field="max_chars", where=where),
         summary=description,
         tags=_as_str_tuple(meta.get("tags")),
-        enabled=str(meta.get("enabled", True)).strip().lower() not in ("false", "0", "no"),
+        # E9-11（复核 RF10）：拔插开关 fail-closed——只认显式启用值；带引号的 "off"/
+        # "disabled" 等未知值一律按 disabled（旧黑名单会把手滑加引号的下架件悄悄放回）。
+        enabled=(True if "enabled" not in meta
+                 else str(meta.get("enabled")).strip().lower() in ("true", "1", "yes", "on")),
         source_path=source_path,
         imported=not has_routing,
     )

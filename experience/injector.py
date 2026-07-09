@@ -46,7 +46,7 @@ def render_experience_tool_catalog(skills: Sequence[SkillDoc]) -> str:
         return ""
     parts: list[str] = [_HEADER, _TOOLS_INTRO, ""]
     for s in skills:
-        summary = (s.summary or "").strip()
+        summary = (s.summary or "").strip()[:200]  # E9-10：目录行钳制（历史存量可能超长）
         line = f"- {experience_tool_name(s.id)}：【{s.title}】"
         if summary:
             line += f" {summary}"
