@@ -563,6 +563,59 @@ def _gather_project_facts(project_path: str | None, max_dirs: int = 60) -> str:
         return f"（项目结构扫描失败：{exc}；文件存在性需 worker 沙箱实地确认）"
 
 
+def _label_grounded_fact_issues(fact_issues: list | None, file_checks: list,
+                                file_plan) -> list:
+    """给 verdict=false 的 fact_issues 标 grounded（确定性坐实才 True）——纯函数，供单测。
+
+    grounded=True  ← 磁盘坐实"需求点名文件缺失"且【无人计划创建它】（真虚假前提，
+                     after_tech_design 据此 block）
+    grounded=False ← 纯 LLM 判定无磁盘佐证（框架/栈差异、语义臆测）→ advisory 不阻断
+
+    A2（2026-07-09 登记册）：file_plan 中 action=create（含缺省，与路径校正同口径）的路径
+    按 basename 豁免——计划新建的文件磁盘必然不存在，那是工作本身不是虚假前提；否则 PRD
+    点名任何待创建文件都会 grounded→auto 模式 CLARIFY 阻断→DELIVER 拒绝→任务死，零重试。
+    附带封堵：grounded 只能由本函数授予，LLM 输出自带的 grounded 字段一律剥除重判。
+    """
+    import os as _os
+    fact_issues = [fi for fi in (fact_issues or [])]
+    for fi in fact_issues:
+        if isinstance(fi, dict):
+            fi.pop("grounded", None)  # LLM 自由文本无权坐实，防绕过豁免直接 block
+    _planned_create_bases = {
+        _os.path.basename(str(fp.get("path", ""))).lower()
+        for fp in (file_plan if isinstance(file_plan, list) else [])
+        if isinstance(fp, dict) and fp.get("path")
+        and str(fp.get("action") or "create").lower() == "create"
+    }
+    det_false = [
+        fc for fc in file_checks
+        if not fc.get("exists")
+        and _os.path.basename(str(fc.get("file", ""))).lower() not in _planned_create_bases
+    ]
+    det_missing = {str(fc.get("file", "")).strip() for fc in det_false if fc.get("file")}
+    det_missing_bases = {f.rsplit("/", 1)[-1] for f in det_missing if f}
+    # 磁盘坐实的缺失文件【始终】作为 grounded 虚假前提在场（不再依赖 LLM 是否标了）
+    _seen_text = " ".join(
+        f"{fi.get('claim', '')}{fi.get('detail', '')}" for fi in fact_issues if isinstance(fi, dict)
+    )
+    for fc in det_false:
+        f = str(fc.get("file", "")).strip()
+        if f and f not in _seen_text:
+            fact_issues.append({
+                "claim": f"需求点名文件 {f}", "verdict": "false", "grounded": True,
+                "detail": "磁盘核验：该文件在项目中不存在",
+                "suggestion": f"近似候选：{fc['candidates']}" if fc.get("candidates") else "无近似文件",
+            })
+    # 标注既有 verdict=false 的 grounded：引用了磁盘确认缺失的文件名 且 非栈/框架差异 → 坐实
+    for fi in fact_issues:
+        if not isinstance(fi, dict) or fi.get("verdict") != "false" or "grounded" in fi:
+            continue
+        _t = f"{fi.get('claim', '')} {fi.get('detail', '')}"
+        _refs_missing = any(b and b in _t for b in det_missing_bases)
+        fi["grounded"] = bool(_refs_missing and not _is_stack_mismatch_issue(fi))
+    return fact_issues
+
+
 def _verify_named_files_exist(task_description: str, project_path: str | None) -> list[dict]:
     """事实核验（多源仲裁 + 可信度）：从需求提取被点名文件，多源核实是否存在。
 
@@ -1282,29 +1335,9 @@ async def tech_design(state: BrainState) -> dict:
         # 绝不能因 LLM 自由文本而 block。故给每条 verdict=false 标 grounded：
         #   grounded=True  ← 磁盘坐实点名文件缺失（真虚假前提，after_tech_design 据此 block）
         #   grounded=False ← 纯 LLM 判定无磁盘佐证（框架/栈差异、语义臆测）→ advisory，不阻断
-        fact_issues = fact_issues or []
-        det_false = [fc for fc in file_checks if not fc.get("exists")]
-        det_missing = {str(fc.get("file", "")).strip() for fc in det_false if fc.get("file")}
-        det_missing_bases = {f.rsplit("/", 1)[-1] for f in det_missing if f}
-        # 磁盘坐实的缺失文件【始终】作为 grounded 虚假前提在场（不再依赖 LLM 是否标了）
-        _seen_text = " ".join(
-            f"{fi.get('claim', '')}{fi.get('detail', '')}" for fi in fact_issues if isinstance(fi, dict)
-        )
-        for fc in det_false:
-            f = str(fc.get("file", "")).strip()
-            if f and f not in _seen_text:
-                fact_issues.append({
-                    "claim": f"需求点名文件 {f}", "verdict": "false", "grounded": True,
-                    "detail": "磁盘核验：该文件在项目中不存在",
-                    "suggestion": f"近似候选：{fc['candidates']}" if fc.get("candidates") else "无近似文件",
-                })
-        # 标注既有 verdict=false 的 grounded：引用了磁盘确认缺失的文件名 且 非栈/框架差异 → 坐实
-        for fi in fact_issues:
-            if not isinstance(fi, dict) or fi.get("verdict") != "false" or "grounded" in fi:
-                continue
-            _t = f"{fi.get('claim', '')} {fi.get('detail', '')}"
-            _refs_missing = any(b and b in _t for b in det_missing_bases)
-            fi["grounded"] = bool(_refs_missing and not _is_stack_mismatch_issue(fi))
+        # A2（2026-07-09 登记册）：grounded 判定抽出纯函数 + 豁免 file_plan action=create
+        # 的计划新建文件（磁盘不存在是工作本身，不是虚假前提）。
+        fact_issues = _label_grounded_fact_issues(fact_issues, file_checks, file_plan)
         _advisory = [fi for fi in fact_issues
                      if isinstance(fi, dict) and fi.get("verdict") == "false" and not fi.get("grounded")]
         if _advisory:
