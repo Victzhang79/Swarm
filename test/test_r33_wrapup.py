@@ -153,21 +153,22 @@ def test_max_items_env_override(monkeypatch):
     assert len(items2) == 8
 
 
-def test_over_limit_drops_low_priority_kinds_first(monkeypatch):
-    """截断按 kind 优先级：functional/api/data 优先收留，page/other 先被截。"""
+def test_over_limit_truncates_arrival_order_kind_neutral(monkeypatch):
+    """P4（round37b 用户拍板改写 R32-4）：超限按【到达序 keep-first】截断，kind 中性——
+    NFR/other 不再被 kind 优先级最先砍（原按 functional/api/data 优先，漏 6 条真 NFR）。"""
     monkeypatch.setenv("SWARM_EXTRACT_MAX_ITEMS", "3")
     raw = [
         _raw("页面乙条目", "page", "系统需要页面乙"),
         _raw("功能甲条目", "functional", "系统需要功能甲"),
-        _raw("其他戊条目", "other", "系统需要其他戊"),
+        _raw("其他戊条目", "other", "系统需要其他戊"),   # NFR：到达序第3，不被贬砍
         _raw("接口丙条目", "api", "系统需要接口丙"),
         _raw("数据丁条目", "data", "系统需要数据丁"),
     ]
     items, rejected = validate_requirement_items(raw, _SRC)
-    kinds = [i["kind"] for i in items]
-    assert sorted(kinds) == ["api", "data", "functional"], f"高优先 kind 必须收留: {kinds}"
+    assert [i["text"] for i in items] == ["页面乙条目", "功能甲条目", "其他戊条目"], \
+        "到达序 keep-first：保留 PRD 自身前段，NFR/other 不被系统性砍"
     dropped = {r["text_head"] for r in rejected if r["reason"] == "over_limit"}
-    assert dropped == {"页面乙条目", "其他戊条目"}
+    assert dropped == {"接口丙条目", "数据丁条目"}
 
 
 def test_within_limit_preserves_arrival_order(monkeypatch):

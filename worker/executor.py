@@ -618,6 +618,10 @@ class WorkerExecutor(
         """Phase 2：编码（B2 多文件分阶段执行）。超时早返 WorkerOutput，否则 None。"""
         self.phase = WorkerPhase.CODING
         self._log("编码阶段：实现变更")
+        # T3·TDD 红绿闸（ECC §C）：编码前在 HEAD 基线取 RED（DEBUG 意图），供 Phase4 红绿裁决。
+        # 内部已按 intent/env/failing_cmd 自守卫（非 DEBUG 即廉价 no-op）；卸线程池防 git/subprocess
+        # 阻塞 IO 卡事件环（与 bootstrap reset 同法）。
+        await asyncio.to_thread(self._maybe_capture_tdd_red_baseline)
         code_result = await self._run_coding_phase(locate_result)
         self._log(f"编码完成: {code_result[:200]}")
 
@@ -868,16 +872,44 @@ class WorkerExecutor(
                     l1_details["debug_failing_test_command"] = failing_cmd
                     l1_details["debug_failing_test_passed"] = debug_l1_ok
                     l1_details["debug_failing_test_detail"] = debug_l1_detail
+                    # T3·红绿闸（ECC §C）：并入编码前基线 RED 三态证据，综合裁决"无红不算绿"。
+                    _red_ec = getattr(self, "_tdd_red_exit_code", None)
+                    l1_details["tdd_red_exit_code"] = _red_ec
+                    l1_details["tdd_red_detail"] = getattr(self, "_tdd_red_detail", "")
+                    l1_details["tdd_red_proven"] = None if _red_ec is None else _red_ec != 0
+                    # strict 泄压阀（默认关=观测优先，见 _tdd_red_green_verdict 对抗复核 F1/F2 论证）——
+                    # 命名/解析与本仓 SWARM_WORKER_* 惯例一致。
+                    _tdd_strict = os.environ.get(
+                        "SWARM_WORKER_TDD_RED_STRICT", "false").lower() in ("true", "1", "yes", "on")
+                    debug_l1_ok, _tdd_reason = self._tdd_red_green_verdict(
+                        debug_l1_ok, _red_ec, strict=_tdd_strict)
+                    l1_details["tdd_gate"] = _tdd_reason
                     if not debug_l1_ok:
                         l1_passed = False
-                        output = output.model_copy(
-                            update={"l1_passed": False, "l1_details": l1_details}
-                        )
+                        if _tdd_reason == "red_not_proven_failclosed":
+                            self._log(
+                                "TDD 红绿闸(strict): failing_test 基线(未修)就通过=不复现 bug，修复信号"
+                                f"不可信 → fail-closed ❌ | {debug_l1_detail}"
+                            )
+                        else:
+                            self._log(
+                                "DEBUG L1: failing_test_command 仍失败，判定为未修复 ❌ | "
+                                f"{debug_l1_detail}"
+                            )
+                    elif _tdd_reason == "red_not_proven_observed":
                         self._log(
-                            f"DEBUG L1: failing_test_command 仍失败，判定为未修复 ❌ | {debug_l1_detail}"
+                            "TDD 红绿闸: ⚠️ failing_test 基线就通过=红证不成立（仅观测不阻断，非 strict）；"
+                            f"判 bug 已修但存疑，证据入 provenance | {debug_l1_detail}"
                         )
                     else:
-                        self._log("DEBUG L1: failing_test_command 通过，bug 已修复 ✅")
+                        self._log(
+                            f"DEBUG L1: failing_test_command 通过且红证={_tdd_reason}，bug 已修复 ✅"
+                        )
+                    # P3(对抗复核)：成功/失败两路都显式回写 output，杜绝依赖 dict 别名隐式传播 tdd_red_*
+                    # 证据（否则未来有人在本块前 rebind l1_details，证据会静默从最终 WorkerOutput 蒸发）。
+                    output = output.model_copy(
+                        update={"l1_passed": l1_passed, "l1_details": l1_details}
+                    )
                 else:
                     self._log("DEBUG L1: harness.failing_test_command 为空，跳过专属校验")
             # 非 DEBUG 意图完全不受影响

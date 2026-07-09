@@ -141,6 +141,7 @@ class BrainState(TypedDict, total=False):
     runtime_smoke_message: str          # 如实说明（通过/失败形态/为何跳过），透传 deliver/通知/学习
     runtime_smoke_details: dict[str, Any]  # 三分类判据留痕（classification/log_tail/探活序列）：task#20 失败归因回灌 + UI 排障的数据源
     runtime_smoke_sandbox_id: str       # L2 编译沙箱延活转交的 sid（进程内 manager._instances registry 查键；仅诊断留痕不作恢复依据——沙箱对象不可序列化进 PG checkpoint）；verify_runtime 消费后清空防跨轮粘滞
+    runtime_smoke_last_signature: str    # T4 无进展 plateau 检测（ECC §D）：上一轮 runtime 冒烟失败签名(classification|归因子任务集排序)，handle_failure 跨轮比对——连续两轮同签名=无进展；默认仅观测留痕，SWARM_RUNTIME_SMOKE_PLATEAU_STRICT=1 才短路提前 escalate。last-write-wins（每轮整体替换上轮签名，绝不累积）
     migration_verify_passed: bool | None   # migration 执行验证三态（task#21 写入；先声明——否则未来节点写它会被静默丢成死功能）
     migration_verify_details: dict[str, Any]  # migration 验证细节留痕（同上，声明先行）
 
@@ -154,6 +155,15 @@ class BrainState(TypedDict, total=False):
     acceptance_assertions: list[dict]   # S2：任务级验收断言 spec [{id, req_id, kind:"http_probe", request, expect, auth}]（task#25 acceptance_spec 写入；声明先行）
     acceptance_passed: bool | None      # S2：验收断言三态结论（None=跳过≠失败，对齐 l3_passed/migration_verify_passed）——verify_runtime accept phase 写入（task#25/26），本批只声明不写入
     acceptance_details: dict[str, Any]  # S2：断言逐条 verdict+证据留痕（deliver 展示/失败回灌数据源）——同上，本批只声明不写入
+
+    # ═══ T1 对抗验证 stage（ADVERSARIAL_VERIFY，ECC §B santa-method 移植；MONITOR 全完成→此→MERGE）═══
+    # 声明先行铁律（同 S1/S2 键）：LangGraph 未声明键=静默丢弃。全部 last-write-wins 无 reducer
+    # （非累积事实：每轮整体替换上轮结论，加 reducer 会让旧轮结论粘滞误导路由）。降级走现成 degraded_reasons。
+    adversarial_verify_passed: bool | None  # 三态路由键：False→handle_failure(打回)；True(都过)/None(跳过/降级/升人工)→merge。对齐 runtime_smoke_passed 语义
+    adversarial_verify_round: int       # 不收敛熔断计数（santa MAX_ITER）：NAUGHTY 打回一次+1，达 SWARM_ADVERSARIAL_MAX_ROUNDS 短路 escalate，绝不无界烧 token；always-emit
+    adversarial_verified_ids: list[str]  # 已过独立双复核的子任务 ID（下轮跳过不重审=省成本）；always-emit（跳过路径回传原值防跨轮粘滞）
+    adversarial_verify_details: dict[str, Any]  # NAUGHTY 逐子任务评语留痕（failure_scenario 集）：deliver 展示/失败回灌数据源
+    adversarial_verify_message: str     # 如实说明（通过/打回/为何跳过/升人工），透传 deliver/通知，绝不静默
 
     # ─── L3 滑动窗口（任务执行期上下文）───
     context_log: list[dict]             # 上下文事件 log

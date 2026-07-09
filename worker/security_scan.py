@@ -802,12 +802,38 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
 # ──────────────────────────────────────────────
 
 # 内置正则兜底 — 常见密钥模式
+# T2(ECC §A 移植)：在既有表基础上补齐 ECC opensource-sanitizer 的高置信 provider token
+# （JWT/DB 连接串/GitHub fine-grained PAT/Google OAuth/Slack webhook/SendGrid/Mailgun/AWS 临时
+# 凭证 ASIA）。判据：结构化 provider token=CRITICAL(误报率低、进交付即真泄露)；通用赋值/宽松式=HIGH
+# (默认 block_severity=critical 不阻断，仅留痕)。全部栈无关、只匹配文本，绝不写死语言/框架。
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
     ("OpenAI API key", re.compile(r"sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), Severity.CRITICAL),
-    ("AWS Access Key ID", re.compile(r"AKIA[0-9A-Z]{16}"), Severity.CRITICAL),
+    # AWS 长期(AKIA)+临时(ASIA)凭证 ID
+    ("AWS Access Key ID", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"), Severity.CRITICAL),
     ("AWS Secret Access Key", re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{40}"), Severity.CRITICAL),
     ("GitHub PAT", re.compile(r"ghp_[a-zA-Z0-9]{36}"), Severity.CRITICAL),
+    # GitHub fine-grained PAT + oauth/server/user-to-server/refresh token
+    ("GitHub fine-grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{22,}"), Severity.CRITICAL),
+    ("GitHub OAuth/Server Token", re.compile(r"gh[ousr]_[A-Za-z0-9_]{36,}"), Severity.CRITICAL),
     ("Private Key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----"), Severity.CRITICAL),
+    # JWT（三段 header.payload.signature，前两段各 ≥20，排除随手拼的短串）
+    ("JWT", re.compile(r"eyJ[A-Za-z0-9_-]{18,}\.eyJ[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]+"), Severity.CRITICAL),
+    # 带账密的数据库/消息队列连接串 [user]:pass@host（协议无关列举，非写死单一栈）。
+    # 用户名可空——`redis://:password@host`（requirepass 无用户名）是 Redis/mongodb/amqp 的
+    # 常见默认认证形态，故 user 段用 `*`（对抗复核 reviewer F1：原 `+` 要求非空用户名会漏报此式）。
+    ("DB Connection String with Credentials", re.compile(
+        r"(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@\s/]*:[^@\s/]+@[^\s'\"]+"
+    ), Severity.CRITICAL),
+    # Google OAuth client secret
+    ("Google OAuth Client Secret", re.compile(r"GOCSPX-[A-Za-z0-9_-]{10,}"), Severity.CRITICAL),
+    # Slack incoming webhook（完整 URL）
+    ("Slack Webhook", re.compile(
+        r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"
+    ), Severity.CRITICAL),
+    # SendGrid API key（固定 22.43 结构）
+    ("SendGrid API Key", re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"), Severity.CRITICAL),
+    # Mailgun API key（key- + 32 hex）
+    ("Mailgun API Key", re.compile(r"\bkey-[0-9a-f]{32}\b"), Severity.CRITICAL),
     ("Slack Token", re.compile(r"xox[bposa]-[0-9a-zA-Z-]{10,}"), Severity.HIGH),
     ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}"), Severity.HIGH),
     ("Stripe Key", re.compile(r"(?:sk|pk)_(?:test|live)_[0-9a-zA-Z]{24,}"), Severity.HIGH),
@@ -815,6 +841,99 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
         r"""(?i)(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)\s*[=:]\s*['"][^'"]{8,}['"]"""
     ), Severity.HIGH),
 ]
+
+
+def _redact_secret(value: str) -> str:
+    """脱敏：只保留前 4 字符 + '…'（ECC 铁律：绝不在日志/报告里显示密钥全文）。"""
+    v = value or ""
+    if len(v) <= 4:
+        return "****"
+    return v[:4] + "…"
+
+
+def _parse_diff_new_path(header_line: str) -> str:
+    """从 `+++ b/path`（或 `+++ path`）头行抽出文件路径；`/dev/null` → 空。"""
+    raw = header_line[4:].strip()  # 去掉 "+++ "
+    # 去掉尾部可能的 tab+timestamp（POSIX diff 格式）
+    raw = raw.split("\t", 1)[0].strip()
+    if raw == "/dev/null":
+        return ""
+    if raw.startswith(("a/", "b/")):
+        raw = raw[2:]
+    return raw
+
+
+_HUNK_NEW_START = re.compile(r"@@\s+-\d+(?:,\d+)?\s+\+(\d+)")
+
+
+def _parse_hunk_new_start(hunk_line: str) -> int:
+    """从 `@@ -a,b +c,d @@` 抽出新文件侧起始行号 c；解析失败回退 0。"""
+    m = _HUNK_NEW_START.search(hunk_line)
+    return int(m.group(1)) if m else 0
+
+
+def scan_diff_for_secrets(
+    diff: str, *, block_severity: str = "critical"
+) -> tuple[list[SecurityFinding], bool]:
+    """扫描 unified diff 的【新增行】，复用 _SECRET_PATTERNS 检出泄露密钥。
+
+    T2(ECC §A) — 交付前确定性硬闸的核心：MERGE 出口对 merged_diff 调用本函数，命中
+    >= block_severity 的密钥即阻断交付。设计要点：
+
+      - **栈无关**：只解析 diff 文本 + 正则，绝不依赖语言/落盘/外部工具（与 _secret_builtin_regex
+        同源正则表，但数据源是 diff 新增行而非磁盘文件）。
+      - **只扫新增行**（`+` 前缀、排除 `+++` 文件头）：删除密钥(`-`)与上下文行(' ')不算——
+        删掉一条硬编码密钥是好事，绝不因此阻断。
+      - **文件+行号归因**：跟踪 `+++ b/<file>` 头与 `@@ +c` hunk 起点，逐新增行推进行号。
+      - **脱敏**：finding 不含密钥原文，只放脱敏首 4 字符（杜绝日志/交付报告二次泄露）。
+      - **宁误报不漏报**：调用方(MERGE)对命中走 escalate 人工复核(非硬丢)，误报由人一眼放行，
+        漏报=密钥进交付。故这里不做激进白名单。
+
+    Returns (findings, should_block)：should_block=True 表示存在 >= block_severity 的发现。
+    """
+    findings: list[SecurityFinding] = []
+    current_file = ""
+    new_line_no = 0  # 新文件侧行号（hunk 起点 + 新增/上下文行递推）
+
+    for raw in (diff or "").splitlines():
+        # 文件头 `+++ ` 必须先于 `+` 判定（前者以 `+` 起）
+        if raw.startswith("+++ "):
+            current_file = _parse_diff_new_path(raw)
+            continue
+        if raw.startswith("--- ") or raw.startswith("diff ") or raw.startswith("index "):
+            continue
+        if raw.startswith("@@"):
+            new_line_no = _parse_hunk_new_start(raw)
+            continue
+        if raw.startswith("+"):
+            content = raw[1:]
+            for label, pattern, sev in _SECRET_PATTERNS:
+                m = pattern.search(content)
+                if m:
+                    findings.append(SecurityFinding(
+                        severity=sev,
+                        category="secret",
+                        rule_id=f"builtin-secret-{label.lower().replace(' ', '-')}",
+                        title=f"Potential {label} in delivery diff (redacted: {_redact_secret(m.group(0))})",
+                        file=current_file,
+                        line=new_line_no,
+                        tool="builtin-regex-diff",
+                        recommendation=(
+                            "Remove the hardcoded secret from the delivery, rotate it, "
+                            "and load it from an environment variable / secrets manager"
+                        ),
+                    ))
+                    break  # 一行只报一个最强匹配
+            new_line_no += 1
+        elif raw.startswith("-"):
+            # 删除行：不计入新文件行号、不扫描
+            continue
+        else:
+            # 上下文行（' ' 前缀或空行）：推进新文件行号、不扫描
+            new_line_no += 1
+
+    should_block = any(_severity_gte(f.severity, block_severity) for f in findings)
+    return findings, should_block
 
 
 def _run_secret_scan(

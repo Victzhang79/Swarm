@@ -17,6 +17,7 @@ run_l1_pipeline/_run_l1_command/compress_tool_output/hashlib 保持方法内 laz
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 from pathlib import Path
@@ -265,6 +266,84 @@ class _L1GateMixin:
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: pipeline error {exc}",
                           "not_run_kind": NotRunKind.BLOCKED.value}
+
+    def _maybe_capture_tdd_red_baseline(self) -> None:
+        """T3·TDD 红绿闸（ECC §C 移植）：DEBUG 意图在【编码前 HEAD 基线】跑一次 failing_test_command
+        取 RED 证据——此刻沙箱/本地树=HEAD=bug 未修，failing_test 应【失败】(exit≠0)=RED 成立。
+
+        三态存 self._tdd_red_exit_code（对齐 l3/runtime_smoke 三态语义，None≠False）：
+          - exit≠0 → RED 成立（failing_test 在未修代码上确实失败，bug 复现）。
+          - exit==0 → failing_test 在未修代码上就通过=【不复现 bug】（测试恒绿/平凡通过）→ 后续
+            "修复后通过"是假信号，Phase4 DEBUG 闸据此 fail-closed（ECC 红绿铁律：无红不算绿）。
+          - None → 跳过（非 DEBUG/无 failing_cmd/env 关）或基线跑不动（异常）→ 不阻断、仅可观测，
+            绝不把"基线跑不动"误判成红证证伪而误伤合法修复。
+
+        默认开，泄压阀 SWARM_WORKER_TDD_RED_GATE=0 关（改动的是既有 DEBUG 绿闸判据，留逃生口）。
+        栈无关：只读 harness.failing_test_command，复用 _run_l1_command（沙箱优先+本地兜底）。
+        """
+        self._tdd_red_exit_code: int | None = None
+        self._tdd_red_detail: str = ""
+        # 泄压阀（与本仓 SWARM_WORKER_* 惯例一致：默认 true，关闭集 false/0/no）。
+        if os.environ.get("SWARM_WORKER_TDD_RED_GATE", "true").lower() in ("false", "0", "no"):
+            return
+        if getattr(self.subtask, "intent", None) != "debug" or not self.project_path:
+            return
+        harness = getattr(self.subtask, "harness", None)
+        failing_cmd = getattr(harness, "failing_test_command", "") if harness else ""
+        if not failing_cmd:
+            return
+        from swarm.worker.l1_pipeline import _run_l1_command
+        from swarm.worker.output_compress import compress_tool_output
+        try:
+            # F5(对抗复核)：基线只需证明"失败"，用较短超时(45s)，避免 hang-bug 的基线跑满 120s
+            # 吞掉子任务【共享】墙钟预算（LOCATING+CODING+VERIFY+PRODUCE 同一时钟）。
+            ec, out = _run_l1_command(failing_cmd, self.project_path, timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            # 理论兜底：_run_l1_command 内部已吞异常统一返回 (int,str)，此分支实际少走；仍保守置 None。
+            self._tdd_red_exit_code = None
+            self._tdd_red_detail = f"baseline capture error (skip, non-blocking): {exc}"
+            self._log(f"TDD 红绿闸: 基线红证采集异常，三态置 None 不阻断: {exc}")
+            return
+        # F3(对抗复核)：_run_l1_command 把基础设施失败塌成非零退出码——命令被黑名单拒=126、
+        # 超时=124（沙箱/网络抖动或 hang）。这些【非真测试断言失败】不能冒充红证 → 归三态 None
+        # (未知，不计红证)：诚实审计 + 对齐"扫不动≠证成立"；observe-only 默认下 false-RED 本就低危，此处再去噪。
+        if ec in (124, 126):
+            self._tdd_red_exit_code = None
+            self._tdd_red_detail = f"baseline infra/timeout (non-blocking, not counted as red), raw exit={ec}"
+            self._log(f"TDD 红绿闸: 基线疑似基础设施失败/超时(exit={ec})，三态置 None 不计红证")
+            return
+        self._tdd_red_exit_code = ec
+        self._tdd_red_detail = (
+            f"baseline exit_code={ec}, output={compress_tool_output(out or '', max_chars=600)}"
+        )
+        if ec == 0:
+            self._log(
+                "TDD 红绿闸: ⚠️ failing_test 在 HEAD 基线(未修)就通过=红证不成立"
+                f"（默认仅观测不阻断；strict 模式才 fail-closed）| {failing_cmd}"
+            )
+        else:
+            self._log(f"TDD 红绿闸: 基线 RED 成立(exit={ec})，failing_test 复现 bug ✅")
+
+    def _tdd_red_green_verdict(
+        self, debug_green_ok: bool, red_exit_code: int | None, *, strict: bool = False
+    ) -> tuple[bool, str]:
+        """T3·红绿闸裁决（纯函数，易测）：综合 GREEN(修复后 failing_test 通过) + RED(基线未修时失败)。
+
+          - GREEN 未过 → (False, "green_failed")：修复后测试仍失败=未修复（既有行为）。
+          - GREEN 过 + RED 证伪(red_exit_code==0=基线未修就绿=不复现 bug)：
+              · strict(SWARM_WORKER_TDD_RED_STRICT=1) → (False, "red_not_proven_failclosed")。
+              · 默认非 strict → (True, "red_not_proven_observed")：只观测留痕【不阻断】。
+                对抗复核 F1/F2：硬 fail-closed 会误伤 ①间歇/竞态 bug(基线偶然通过) ②修复中【新写】
+                复现测试、而 runner(go test -run / maven failIfNoTests)对无匹配测试 exit 0 的合法修复。
+                默认观测优先（北极星"绝不误杀"+"通用多栈"）；strict 留给"复现测试窄且确定"的运维显式开。
+          - GREEN 过 + RED 成立(red≠0) → (True, "green_after_red")：真红转绿。
+          - GREEN 过 + RED 未知(None=基线跳过/跑不动/基础设施噪声) → (True, "green_red_unknown")：None≠False。
+        """
+        if not debug_green_ok:
+            return False, "green_failed"
+        if red_exit_code == 0:
+            return (False, "red_not_proven_failclosed") if strict else (True, "red_not_proven_observed")
+        return True, ("green_after_red" if red_exit_code is not None else "green_red_unknown")
 
     def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool, str]:
         """DEBUG 意图专属 L1 闸门：确定性执行 failing_test_command，验证修复后该命令通过。

@@ -1554,6 +1554,12 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
         """
         out: list[dict] = []
         seen: dict[str, dict] = {}
+        # P6（round37b）：同模块自并计数——U1/U3 bisect 把一个模块拆成 ~a/~b 子批，各自生成该
+        # 模块的共享接口 → 同名同模块重复（round37 实证 IAlarmTaskService "alarm-core 并入
+        # alarm-core" 并 8 次）。这不是"跨模块同名多版冲突"而是模块边界重叠/bisect 产物：仍并集
+        # 保方法（安全），但按【同模块 vs 跨模块】分流日志——同模块聚合成一条边界重叠告警（surface
+        # 真信号、去 churn），跨模块才是真多版 INFO。栈无关：只比 module 字段，不含任何框架词汇。
+        _intra_module_dups: dict[str, int] = {}
         for group in groups:
             for item in (group or []):
                 if not isinstance(item, dict):
@@ -1568,16 +1574,32 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
                     out.append(merged)  # out 与 seen 共享同一引用，后续并集就地生效
                     continue
                 base = seen[name]
+                _base_mod = str(base.get("module") or "").strip()
+                _item_mod = str(item.get("module") or "").strip()
+                _intra = _base_mod and _item_mod and _base_mod == _item_mod
                 merged_val, changed = _union_contract_member(
                     base.get(sig_field), item.get(sig_field)
                 )
                 if changed:
                     base[sig_field] = merged_val
+                if _intra:
+                    # 同模块自并（边界重叠/bisect）：聚合计数，循环后出一条告警，不逐次 churn
+                    _intra_module_dups[f"{_base_mod}:{name}"] = \
+                        _intra_module_dups.get(f"{_base_mod}:{name}", 0) + 1
+                elif changed:
                     logger.info(
                         "[CONTRACT_MERGE] %s '%s' 同名多版 → 并集合并(不丢方法/字段)："
                         "首版 module=%s 并入 module=%s",
-                        key_label, name, base.get("module"), item.get("module"),
+                        key_label, name, _base_mod, _item_mod,
                     )
+        if _intra_module_dups:
+            _total = sum(_intra_module_dups.values())
+            _top = sorted(_intra_module_dups.items(), key=lambda kv: -kv[1])[:5]
+            logger.warning(
+                "[CONTRACT_MERGE] P6 模块边界重叠：%s 出现 %d 处【同模块同名】自并去重"
+                "（bisect 子批/边界重叠使一个模块的接口被多片重复生成，已并集保方法）"
+                "，Top: %s", key_label, _total,
+                ", ".join(f"{k}×{v + 1}" for k, v in _top))
         return out
 
     interfaces = _merge_named([s.get("interfaces") for s in slices], "interfaces", "signature")

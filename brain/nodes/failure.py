@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 # 复用 __init__ 的 logger 名 "swarm.brain.nodes"（非 __name__），使 [HANDLE_FAILURE] 策略日志的
 # logger 名与外置前逐字节一致（这些是运维关键日志，避免 name 漂移影响既有日志过滤/聚合配置）。
@@ -146,6 +147,45 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # 归因：启动日志/迁移错误里的源文件引用 → scope 写权反查写者子任务
         #（复用 attribute_l2_failure 路径匹配机制，栈无关；见 shared.attribute_runtime_failure）
         _rt_attributed = attribute_runtime_failure(plan_obj, _rt_details, subtask_results)
+        # ── T4 无进展 plateau 检测（ECC §D "plateau" 半环；max-iteration 半环=上方 replan_count）──
+        # 缺口（取证坐实）：既有轮次计数只按【次数】封顶，从不比对【连续两轮是否同一失败形态】。一个
+        # 反复以完全相同 classification + 归因子任务集失败的冒烟，会白烧满 replan 预算才停（token 黑洞）。
+        # 签名=classification|归因子任务集(排序)；跨轮与上一轮 handle_failure 存的签名比对，一致=无进展。
+        # 默认仅【观测留痕】(控制流不变，轮次计数仍兜底，绝不误伤"隐性收敛中"的修复)；strict opt-in
+        # (SWARM_RUNTIME_SMOKE_PLATEAU_STRICT=1) 才短路提前 escalate（省无谓重试）。镜像 T3 观测/strict 二态。
+        _rt_signature = f"{_rt_class}|{','.join(sorted(_rt_attributed or []))}"
+        _rt_prev_sig = str(state.get("runtime_smoke_last_signature") or "")
+        if _rt_prev_sig and _rt_signature == _rt_prev_sig:
+            # 复核 A（已知粒度权衡·刻意如此）：签名粒度=classification|归因子任务集，【不含】错误
+            # 文本指纹。故"同一子任务修好 bug1 又暴露同分类 bug2"会同签名=被判 plateau。之所以不掺
+            # log_tail 指纹：启动日志含时间戳/pid/路径抖动，掺入会让签名【永不复现】→ 检测器变哑
+            # （比误判更坏的失效模式）。strict 下此权衡的最坏后果=提前【一轮】升级【人工审核】
+            #（非静默判过、绝不发坏码），人工可 REVISE 续修，可恢复；且默认 observe 永不误伤——
+            # 仅显式 opt-in 的操作者以"省重试费"换"偶发早一轮转人工"。故记为文档化权衡而非缺陷。
+            _rt_plateau_strict = os.environ.get(
+                "SWARM_RUNTIME_SMOKE_PLATEAU_STRICT", "false"
+            ).lower() in ("true", "1", "yes", "on")
+            if _rt_plateau_strict:
+                logger.warning(
+                    "[HANDLE_FAILURE] 运行时冒烟连续两轮同签名(%s)无进展 → strict 短路升级人工审核"
+                    "（省无谓重试烧费；默认关，SWARM_RUNTIME_SMOKE_PLATEAU_STRICT=1 开）",
+                    _rt_signature,
+                )
+                return {
+                    "failure_strategy": "escalate",
+                    "failure_escalated": True,
+                    "failed_subtask_ids": _rt_attributed or failed_ids,
+                    "verification_failure": None,
+                    "runtime_smoke_passed": False,
+                    "replan_count": _rt_replan,
+                    "runtime_smoke_last_signature": _rt_signature,
+                    "degraded_reasons": [f"runtime_smoke_plateau:{_rt_class}"],
+                }
+            logger.warning(
+                "[HANDLE_FAILURE] 运行时冒烟连续两轮同签名(%s)无进展（上一轮定向/replan 未改变失败"
+                "形态）→ 观测留痕，控制流不变（轮次计数兜底；strict 模式可短路提前 escalate）",
+                _rt_signature,
+            )
         if _rt_attributed:
             _rt_trc = dict(state.get("targeted_recovery_counts") or {})
             _rt_eligible = [fid for fid in _rt_attributed if _rt_trc.get(fid, 0) < _rt_max]
@@ -228,6 +268,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "targeted_recovery_count": state.get("targeted_recovery_count", 0) + 1,  # 遥测保留
                 "targeted_recovery_counts": _rt_trc,
                 "targeted_recovery": True,
+                "runtime_smoke_last_signature": _rt_signature,  # T4 跨轮 plateau 比对基准
             }
         # 归因不出 → 退 replan 阶梯（共用 replan_count，上面已判上限，绝不另起无界通道）
         logger.info(
@@ -241,6 +282,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "verification_failure": None,
             "runtime_smoke_passed": False,
             "replan_count": _rt_replan,
+            "runtime_smoke_last_signature": _rt_signature,  # T4 跨轮 plateau 比对基准
         }
 
     if state.get("verification_failure") == "l2":

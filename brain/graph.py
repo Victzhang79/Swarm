@@ -30,6 +30,7 @@ from typing import Literal
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, StateGraph
 
+from swarm.brain.ingest_node import ingest
 from swarm.brain.nodes import (
     analyze,
     confirm_plan,
@@ -47,6 +48,9 @@ from swarm.brain.nodes import (
     verify_l3,
 )
 
+# T1：对抗验证节点直连模块导入（同 verify_runtime 先例，不经 __init__ re-export）
+from swarm.brain.nodes.adversarial import adversarial_verify
+
 # S1-4：verify_runtime 直连模块导入（不经 __init__ re-export——延活转交批对 __init__ 的
 # 改动面收敛在 _run_reactor_build_in_sandbox 两处，不动其导出面）。
 from swarm.brain.nodes.verify import verify_runtime
@@ -59,7 +63,6 @@ from swarm.brain.planning_nodes import (
     review_design,
     tech_design,
 )
-from swarm.brain.ingest_node import ingest
 from swarm.brain.requirements_extract import extract_requirements
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
@@ -90,9 +93,11 @@ def _make_checkpoint_serde():
     try:
         import enum as _enum
         import inspect as _inspect
-        import swarm.types as _stypes
-        from pydantic import BaseModel as _BaseModel
+
         from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        from pydantic import BaseModel as _BaseModel
+
+        import swarm.types as _stypes
         _classes = [
             _o for _o in vars(_stypes).values()
             if _inspect.isclass(_o) and getattr(_o, "__module__", "") == "swarm.types"
@@ -306,6 +311,21 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
     return "merge"
 
 
+def after_adversarial_verify(state: BrainState) -> Literal["merge", "handle_failure"]:
+    """ADVERSARIAL_VERIFY 后的路由（T1 对抗验证 gate，三态对齐 after_verify_runtime）:
+
+    - adversarial_verify_passed=False → HANDLE_FAILURE（NAUGHTY 子任务已置 l1_passed=False +
+      入 failed_subtask_ids，复用既有重试预算重做——双界收敛：subtask_retry_counts abandon +
+      本节点 MAX_ROUNDS 早熔断）
+    - True（都过独立双复核）/ None（跳过/降级/升人工，已入 degraded_reasons 可观测）→ MERGE
+    """
+    if state.get("adversarial_verify_passed") is False:
+        logger.warning("[ROUTE] ADVERSARIAL_VERIFY → HANDLE_FAILURE (子任务未过对抗复核，打回重做)")
+        return "handle_failure"
+    logger.info("[ROUTE] ADVERSARIAL_VERIFY → MERGE (对抗复核通过/跳过)")
+    return "merge"
+
+
 def after_merge(state: BrainState) -> Literal["handle_failure", "verify_l2", "dispatch", "deliver"]:
     """MERGE 后的路由:
 
@@ -474,6 +494,7 @@ def build_brain_graph() -> StateGraph:
     graph.add_node("confirm", confirm_plan)
     graph.add_node("dispatch", dispatch)
     graph.add_node("monitor", monitor)
+    graph.add_node("adversarial_verify", adversarial_verify)  # T1：对抗验证 stage（MONITOR 全完成→此→MERGE）
     graph.add_node("handle_failure", handle_failure)
     graph.add_node("merge", merge)
     graph.add_node("verify_l2", verify_l2)
@@ -572,14 +593,31 @@ def build_brain_graph() -> StateGraph:
         },
     )
 
-    # MONITOR → HANDLE_FAILURE / DISPATCH / MERGE
+    # MONITOR → HANDLE_FAILURE / DISPATCH / ADVERSARIAL_VERIFY(全完成成功路径)
+    # T1：标签 "merge"（=「全完成，进交付链」）的目标重指 adversarial_verify——全完成后先过
+    # 对抗验证复核"声称成功"，再进 merge。标签名保持不变以稳住 after_monitor 语义（含
+    # #R13-4 PARTIAL 熔断也返回 "merge"→同经此节点，节点内识别 dispatch_remaining 非空即跳过，
+    # 不扰动部分交付）；test_after_monitor_dispatch_fuse.py 断言 after_monitor 返回值不变仍绿。
     graph.add_conditional_edges(
         "monitor",
         after_monitor,
         {
             "handle_failure": "handle_failure",
             "dispatch": "dispatch",
+            "merge": "adversarial_verify",
+        },
+    )
+
+    # ADVERSARIAL_VERIFY → MERGE / HANDLE_FAILURE (T1 对抗验证 gate)
+    # ⚠️ 与 confirm/verify_runtime 同款不变量：出口【只】由本条件边决定，绝不可再加
+    # add_edge("adversarial_verify", ...) 静态边（fan-out 血案，见 confirm 处注释；
+    # test_adversarial_verify_t1.py 拓扑断言守护）。
+    graph.add_conditional_edges(
+        "adversarial_verify",
+        after_adversarial_verify,
+        {
             "merge": "merge",
+            "handle_failure": "handle_failure",
         },
     )
 

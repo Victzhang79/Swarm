@@ -167,6 +167,7 @@ from swarm.types import (
     FileScope,
     HumanDecision,
     KnowledgeContext,
+    Severity,
     SubTask,
     SubTaskDifficulty,
     SubTaskModality,
@@ -1230,6 +1231,208 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     }
 
 
+# ── P1（round37 龙头）外科补丁：覆盖未过闸时【只补缺 covers 不全量重拆】────────────
+# round37 黑洞真因（memory/swarm-e2e-round37-postmortem）：VALIDATE 判"未覆盖"→ 唯一下一步
+# 是回 PLAN 全量重拆（_plan_ultra_batched 从恒定 tech_design_file_plan 重拆所有模块），covers
+# 由 LLM 每批现生成→非单调丢弃→Round0 只差 2 条也全量重拆丢 16 条底座→3 轮内不收敛=费用黑洞。
+# #6 _merge_prior_covers_by_scope 只能"保住已声明的 covers"，对"从未被任何子任务声明的底座
+# 需求"够不着。治本=在全量重拆【之前】拦一道：纯覆盖重试时不重拆，从上一版 plan 深拷贝 +
+# 确定性剥离悬空 covers + 对 uncovered 子集一次廉价定向补覆盖（挂现有子任务 / baseline 申报）。
+
+PLAN_COVERAGE_TOPUP_SYSTEM = (
+    "你是需求覆盖【定向补齐】助手。任务已生成执行计划但有少数需求条目未被覆盖。"
+    "你【只】做最小补齐，绝不新增子任务、绝不重拆、绝不改动现有子任务的 scope 或描述。"
+)
+
+
+async def _targeted_coverage_topup(
+    llm, prior_plan, uncovered_items, valid_req_ids,
+    prior_baseline=None, fallback_llm=None, project_structure="",
+):
+    """P1 外科补丁核心：对 uncovered 子集做一次定向补覆盖，绝不重拆/新增子任务。
+
+    确定性动作（零 LLM 也做）：从上一版 plan 深拷贝并剥离悬空 covers（指向 valid_req_ids
+    之外的 req）。LLM 动作：每条 uncovered req 二选一——(a) 挂到某个【现有】子任务的 covers；
+    (b) baseline_covered 申报（存量已满足，附可核实 reason）。臆造/越权（未知 subtask_id、
+    集外 req、顶层 subtasks 越权字段、指向已覆盖 req）一律忽略。
+
+    返回 (augmented_plan, baseline_declarations)——绝不原地改 prior_plan（深拷贝）；
+    baseline = prior_baseline ∪ 本轮申报（单调保留，绝不丢已申报）。
+    无任何有效增量（LLM 失败/空/全被忽略且无悬空可剥）→ 返回 None：调用方回退全量重拆，
+    零回归（宁可重拆也不返回原地踏步的空补丁把一轮重试白烧在没进展的计划上）。
+    """
+    from swarm.brain.plan_validator import normalize_baseline_covered
+
+    _valid = set(valid_req_ids or ())
+    _uncov_ids = {str(it.get("id")) for it in (uncovered_items or [])
+                  if isinstance(it, dict) and it.get("id")}
+    new_plan = prior_plan.model_copy(deep=True)
+
+    # ── 确定性净化：剥离悬空 covers（指向 valid 之外的 req）──
+    _stripped = 0
+    for st in new_plan.subtasks:
+        _cur = list(getattr(st, "covers", None) or [])
+        _keep = [c for c in _cur if c in _valid]
+        if len(_keep) != len(_cur):
+            _stripped += len(_cur) - len(_keep)
+            st.covers = _keep
+
+    _applied = _stripped
+    _new_baseline_decls: list[dict] = []
+
+    # ── LLM 定向补齐：仅在有 uncovered 时（纯悬空场景零 LLM）──
+    if _uncov_ids:
+        _sub_lines = "\n".join(
+            f"- {st.id}: {(getattr(st, 'description', '') or '')[:100]} "
+            f"| writable={list(getattr(getattr(st, 'scope', None), 'writable', []) or [])[:6]}"
+            for st in new_plan.subtasks
+        )
+        _uncov_lines = "\n".join(
+            f"- {it['id']} [{it.get('kind', 'other')}] {str(it.get('text') or '')[:200]}"
+            for it in uncovered_items if isinstance(it, dict) and it.get("id")
+        )
+        # P3：棕地存量采纳——注入【现有项目结构】作 baseline 申报的接地依据。棕地项目（在
+        # 现有代码库上迭代）的基础/通用能力常已由存量代码满足，LLM 从需求文本无从得知→
+        # baseline 申报恒 0→底座需求结构上永不覆盖（round37 实证 16 条）。给出真实文件清单后，
+        # LLM 可对照存量代码为"已满足"的未覆盖需求申报 baseline 并指向具体现有文件。栈无关：
+        # 只给真实结构，不写死任何框架/领域词汇。
+        _struct = (project_structure or "").strip()
+        _brownfield_block = (
+            "\n## 现有项目结构（存量代码——baseline 申报的接地依据）\n" + _struct + "\n"
+            "\n★棕地提示：本项目在【现有代码库】上迭代。若某条未覆盖需求所要的能力，"
+            "对照上方现有项目结构判断【已由存量代码满足】、本任务无需再改动，就用 baseline "
+            "申报并让 reason 指向上方真实存在的文件/模块（交付前会做运行时验收核查，"
+            "无法自动核实的申报会降级呈报人工，故只申报你能从现有结构确认的能力）。\n"
+            if _struct else ""
+        )
+        _user = (
+            "以下执行计划已生成但有若干需求条目【未被任何子任务覆盖】。请【只针对未覆盖条目】"
+            "做最小补齐，对每条未覆盖需求二选一：\n"
+            "(a) 若某个【现有子任务】的职责本就应涵盖它 → assign 到该子任务（把该 req 加入其 covers）；\n"
+            "(b) 若该需求已由【仓库现有代码】完整满足、本任务无需改动 → baseline 申报并给出"
+            "可在现有代码中核实的 reason（何处/如何满足）。\n"
+            "绝不新增子任务、绝不改动现有子任务的 scope/描述；subtask_id 只能引用下面清单中的现有 ID。\n\n"
+            f"## 现有子任务\n{_sub_lines}\n"
+            f"{_brownfield_block}\n"
+            f"## 未覆盖需求条目\n{_uncov_lines}\n\n"
+            "只输出 JSON（不要多余文字）：\n"
+            '{"assignments":[{"req_id":"req-xxxxxxxx","subtask_id":"st-N"}],'
+            '"baseline_covered":[{"id":"req-xxxxxxxx","reason":"现有代码何处/如何满足"}]}'
+        )
+        _messages = [
+            {"role": "system", "content": PLAN_COVERAGE_TOPUP_SYSTEM},
+            {"role": "user", "content": _user},
+        ]
+        try:
+            _resp = await llm.ainvoke(_messages)
+        except Exception as exc:  # noqa: BLE001 — 主模型失败尝试备用，仍失败则回退全量重拆
+            if fallback_llm is not None:
+                try:
+                    _resp = await fallback_llm.ainvoke(_messages)
+                    logger.info("[PLAN] P1 外科补齐 primary 失败→备用模型救回")
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning(
+                        "[PLAN] P1 外科补齐主备均失败(%s / %s)→回退全量重拆", exc, exc2)
+                    return None
+            else:
+                logger.warning("[PLAN] P1 外科补齐 LLM 失败(%s)→回退全量重拆", exc)
+                return None
+
+        _result = _parse_json_from_llm(_resp.content)
+        if not isinstance(_result, dict):
+            _result = {}
+        _sub_by_id = {st.id: st for st in new_plan.subtasks}
+        _resolved: set[str] = set()
+        # (a) assign 到现有子任务 covers（越权/臆造一律忽略）
+        for _a in (_result.get("assignments") or []):
+            if not isinstance(_a, dict):
+                continue
+            _rid = str(_a.get("req_id") or "").strip()
+            _sid = str(_a.get("subtask_id") or "").strip()
+            if _rid not in _uncov_ids or _rid not in _valid:
+                continue
+            _target = _sub_by_id.get(_sid)
+            if _target is None:  # 未知 subtask_id：无处可挂，绝不新建
+                continue
+            if _rid not in (_target.covers or []):
+                _target.covers = list(_target.covers or []) + [_rid]
+                _applied += 1
+                _resolved.add(_rid)
+        # (b) baseline 申报（仅未被 assign 解决的 uncovered，且带 reason）
+        for _b in (_result.get("baseline_covered") or []):
+            if not isinstance(_b, dict):
+                continue
+            _rid = str(_b.get("id") or "").strip()
+            _reason = str(_b.get("reason") or "").strip()
+            if (_rid in _uncov_ids and _rid in _valid
+                    and _rid not in _resolved and _reason):
+                _new_baseline_decls.append({"id": _rid, "reason": _reason})
+                _applied += 1
+                _resolved.add(_rid)
+
+    if not _applied:
+        # 无任何进展（既没剥悬空也没补上一条）→ 回退全量重拆，别白烧一轮重试
+        return None
+
+    _baseline = normalize_baseline_covered(
+        list(prior_baseline or []) + _new_baseline_decls)
+    logger.info(
+        "[PLAN] P1 外科补齐：不重拆，剥悬空 %d 条 + 定向补覆盖 %d 条（挂现有子任务/baseline 申报），"
+        "子任务数 %d 不变", _stripped, _applied - _stripped, len(new_plan.subtasks))
+    return new_plan, _baseline
+
+
+async def _maybe_surgical_coverage_topup(state):
+    """P1 闸门：判定是否走外科补齐路径（替代全量重拆）。返回 (plan, baseline) 或 None。
+
+    仅在【纯覆盖/校验重试】启用：plan_validation_feedback 非空 & replan_feedback 空（执行失败
+    replan 必须真跑，守 F-3）& 上一版 plan 结构已合法（结构失败补覆盖救不了）& 有 uncovered
+    或悬空 covers 可修。任一不满足 → None（回退常规全量重拆路径）。泄压阀
+    SWARM_PLAN_COVERAGE_TOPUP（对照 SWARM_PLAN_COVERAGE_GATE 先例，默认开）。
+    """
+    if os.environ.get("SWARM_PLAN_COVERAGE_TOPUP", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    # 收窄到 ULTRA：黑洞是 ULTRA 分批全量重拆（11 模块 × TECH_DESIGN/CONTRACT/PLAN-BATCH
+    # 每轮重烧）。MEDIUM/SIMPLE 的"重拆"只是一次廉价单发调用且 #T3 增量修补块已保收敛，
+    # 不属黑洞——保持既有路径不变、零回归。
+    if effective_complexity(state) != Complexity.ULTRA:
+        return None
+    if not (state.get("plan_validation_feedback") or "").strip():
+        return None
+    if (state.get("replan_feedback") or "").strip():
+        return None
+    prior_plan = state.get("plan")
+    if prior_plan is None or not getattr(prior_plan, "subtasks", None):
+        return None
+    # 复核 CONFIRMED#1：上一轮有【整模块分解失败】(plan_batch_failed_modules 非空)时绝不走
+    # 外科补齐——缺的是真模块，补 covers/baseline 救不了（还会诱导给缺失模块编造 baseline 申报，
+    # R34-8 推卸型病理）；必须回退全量重拆真跑那些失败模块，且保住 round29 真因4 的 fail-fast 信号。
+    if state.get("plan_batch_failed_modules"):
+        return None
+    _req_items = state.get("requirement_items") or []
+    if not _req_items:
+        return None
+    from swarm.brain.plan_validator import (
+        build_coverage_matrix,
+        validate_plan_structure,
+    )
+    if not validate_plan_structure(prior_plan).valid:
+        return None
+    _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"))
+    if not _matrix["uncovered"] and not _matrix["dangling_covers"]:
+        return None  # 覆盖已满足——失败来自别处，回退常规路径
+    _valid_ids = {row["id"] for row in _matrix["items"]}
+    # P3：注入现有项目结构作 baseline 申报接地依据（棕地存量采纳）
+    _proj_struct = _format_project_structure(state.get("knowledge_context"))
+    return await _targeted_coverage_topup(
+        _get_brain_llm(), prior_plan, _matrix["uncovered"], _valid_ids,
+        prior_baseline=state.get("baseline_covered"),
+        fallback_llm=_get_brain_fallback_llm(),
+        project_structure=_proj_struct,
+    )
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -1349,8 +1552,26 @@ async def plan(state: BrainState) -> dict:
         )
         logger.info("[PLAN] 校验失败重试 — 已注入上轮校验 issues 供 LLM 修正")
 
+    # ── P1 外科补丁：纯覆盖重试时【不全量重拆】，只对 uncovered 子集定向补覆盖 ──
+    # 拦在全量重拆之前（治 round37 黑洞：Round0 只差 2 条也全量重拆丢 16 条底座→不收敛）。
+    # 命中→用上一版 plan + 定向补齐产出的 task_plan，跳过 _plan_ultra_batched/单发重拆；
+    # 未命中/补齐失败→task_plan 仍为 None，走下方常规全量重拆（零回归）。
+    task_plan = None
+    _topup = await _maybe_surgical_coverage_topup(state)
+    if _topup is not None:
+        task_plan, _baseline_covered = _topup
+        # 复核 CONFIRMED#1/#2：topup 不触碰分批记账/缓存——原样带走 state 值，绝不用本地
+        # 恒空 []/{}覆盖（否则抹掉 round29 真因4 fail-fast 信号 + R35-C 前向回退护栏缓存）。
+        # 闸门已保证命中 topup 时 plan_batch_failed_modules 为空，此处 carry-forward 属纵深防御。
+        _plan_batch_failed = list(state.get("plan_batch_failed_modules") or [])
+        _plan_batch_cache = dict(state.get("plan_batch_cache") or {})
+        logger.info(
+            "[PLAN] P1 命中外科补齐路径：跳过全量重拆，复用上一版 %d 子任务定向补覆盖",
+            len(task_plan.subtasks))
+
     # ── LLM 任务拆解 ──
-    try:
+    if task_plan is None:
+      try:
         llm = _get_brain_llm()
         router = ModelRouter()
         routing_table = router.get_routing_table()
@@ -1392,10 +1613,27 @@ async def plan(state: BrainState) -> dict:
             )
             # S2-3：需求条目清单 + covers 声明纪律（加法式注入；items 空=一字不加，老行为零变化）
             prompt_user += _requirement_coverage_prompt_block(state.get("requirement_items"))
-            response = await llm.ainvoke([
-                {"role": "system", "content": PLAN_SYSTEM},
-                {"role": "user", "content": prompt_user},
-            ])
+            # P5（round37b，ECC §G）：单次规划路径也走 _invoke_llm_abortable——流式+chunk 看门狗
+            # + 墙钟超时【显式切备用模型】。此前单发只有 llm.with_fallbacks（仅兜流内错误，"慢"
+            # 不切）：GLM 饱和稳定慢产 >timeout 时干等超时降级空兜底。扩到单发后"慢→切 Kimi"，
+            # 与 R35-A 分批路径同构。无 astream 的桩=原 wait_for(ainvoke) 行为不变。env 可调。
+            try:
+                _single_timeout = float(
+                    os.environ.get("SWARM_PLAN_SINGLE_TIMEOUT", "300") or "300")
+            except ValueError:
+                logger.error(
+                    "[PLAN] SWARM_PLAN_SINGLE_TIMEOUT 配置非法(%r)——回退默认 300s",
+                    os.environ.get("SWARM_PLAN_SINGLE_TIMEOUT"))
+                _single_timeout = 300.0
+            response = await _invoke_llm_abortable(
+                llm,
+                [
+                    {"role": "system", "content": PLAN_SYSTEM},
+                    {"role": "user", "content": prompt_user},
+                ],
+                _single_timeout,
+                _get_brain_fallback_llm(),
+            )
             result = _parse_json_from_llm(response.content)
             # 健壮性(task 88d69519)：LLM 可能输出 "harness": null / "model_preference" 等可选字段为
             # null。SubTask.harness 类型是 TaskHarness（非 Optional，靠 default_factory），显式传
@@ -1424,7 +1662,7 @@ async def plan(state: BrainState) -> dict:
                 _baseline_covered = normalize_baseline_covered(
                     result.pop("baseline_covered", None))
             task_plan = TaskPlan(**result)
-    except json.JSONDecodeError as e:
+      except json.JSONDecodeError as e:
         logger.error(f"[PLAN] LLM 输出 JSON 解析失败，使用空 scope 兜底 plan（Worker 可能失败）: {e}")
         _plan_degraded = f"plan LLM 输出解析失败，产出空 scope 兜底计划（Worker 大概率失败，需人工关注）（{e}）"
         task_plan = TaskPlan(
@@ -1443,7 +1681,7 @@ async def plan(state: BrainState) -> dict:
             ],
             parallel_groups=[["st-1"]],
         )
-    except Exception as e:
+      except Exception as e:
         logger.error(f"[PLAN] LLM 调用失败: {e}")
         _plan_degraded = f"plan LLM 调用失败，产出最简空验证兜底计划（Worker 大概率失败，需人工关注）（{e}）"
         # 创建最简单的回退计划
@@ -2229,6 +2467,70 @@ def _make_base_reader(state: BrainState):
     return read
 
 
+def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
+    """T2·secret 硬闸（ECC §A 移植）：对终局交付 merged_diff 的【新增行】跑确定性密钥扫描，
+    就地改写 out。
+
+    必须在【每个把 merged_diff 交给 VERIFY_L2/交付的终局出口】前调用（含 rebase 达上限的
+    clean-accept 分支）——单一入口杜绝"某条 return 绕过扫描"的漏扫。对抗复核（silent-failure-hunter）
+    实测：rebase-over-limit 接受分支（`not result.rebase_subtask_ids` 守卫之外）曾【完全绕过】本闸，
+    密钥直达交付且零 escalate/零 degraded 痕迹——本函数把扫描收敛到单点，两个终局出口都调用。
+
+      - CRITICAL 命中 → escalate 人工 fail-closed 阻断交付（failure_escalated/verification_failure），
+        can_auto_accept 拒放行、should_write_success 不学成功。
+      - 仅 HIGH 命中 → 不阻断交付（默认阈值 critical），但 logger.warning + degraded 留痕，绝不静默
+        丢弃（hunter F2：HIGH 命中原先无任何可观测痕迹，人工/L6 都看不见）。
+      - 扫描器自身异常 → fail-closed escalate（对齐本仓 gitleaks 报告解析失败 / audit_node N-01
+        "扫不了绝不与真·零漏洞混同放行" house style；F3：绝不 fail-open 假绿）。
+
+    栈无关：只解析 diff 文本。宁误报不漏报——escalate 是人工复核(非硬丢)，误报由人一眼放行。
+    """
+    if not (merged_diff or "").strip():
+        return
+    try:
+        from swarm.worker.security_scan import scan_diff_for_secrets
+        findings, _block = scan_diff_for_secrets(merged_diff)
+    except Exception as exc:
+        # fail-closed：安全闸"扫不动"绝不等同"零密钥"——escalate 人工，与 apply-invalid/审计 N-01 一致。
+        logger.error(
+            "[MERGE] secret 扫描异常 → fail-closed escalate 阻断交付（不假绿放行，对齐 audit N-01）: %s",
+            exc,
+        )
+        out["failure_escalated"] = True
+        out["failure_strategy"] = "escalate"
+        out["l2_passed"] = False
+        out["verification_failure"] = "merge_secret_scan_error"
+        out["degraded_reasons"] = ["merge_secret_scan_error"]
+        return
+    if not findings:
+        return
+    crit = [f for f in findings if f.severity == Severity.CRITICAL]
+    if crit:
+        out["failure_escalated"] = True
+        out["failure_strategy"] = "escalate"
+        out["l2_passed"] = False
+        out["verification_failure"] = "merge_secret_detected"
+        # degraded 留痕：observability + L6 抑制（前缀不在 INFORMATIONAL 白名单→自动挡假学习）。
+        _summary = sorted({f"{f.rule_id}@{f.file}:{f.line}" for f in crit})
+        out["degraded_reasons"] = [f"merge_secret_detected:{s}" for s in _summary[:20]]
+        logger.error(
+            "[MERGE] ⚠️ 交付 diff 检出密钥泄露(CRITICAL %d 处) → escalate 人工 fail-closed 阻断交付；"
+            "命中(已脱敏)=%s",
+            len(crit),
+            [f.title for f in crit][:20],
+        )
+        return
+    # 仅 HIGH（Slack token/Google API key/Stripe/通用赋值）：不阻断交付但必须留痕可审计——
+    # 否则"扫过=干净"的假象会让 HIGH 密钥静默随交付蒸发（hunter F2）。degraded 前缀同样不在
+    # INFORMATIONAL 白名单→挡 L6 假学习（含疑似密钥的交付不该被学成金标准成功模式）。
+    _high_summary = sorted({f"{f.severity.value}:{f.rule_id}@{f.file}:{f.line}" for f in findings})
+    out["degraded_reasons"] = [f"merge_secret_reported:{s}" for s in _high_summary[:20]]
+    logger.warning(
+        "[MERGE] 交付 diff 检出疑似密钥(HIGH，不阻断但留痕可审计)；命中(已脱敏)=%s",
+        [f.title for f in findings][:20],
+    )
+
+
 def merge(state: BrainState) -> dict:
     """MERGE 节点 — 合并所有子任务的 diff
 
@@ -2377,6 +2679,15 @@ def merge(state: BrainState) -> dict:
             "[MERGE] → 升级人工(escalate)：合并 patch 组装非法，fail-closed 阻断交付（不进 VERIFY_L2 假绿）"
         )
 
+    # ── T2·secret 硬闸（ECC §A 移植）：终局干净合并交付前扫密钥 ──
+    # 交付 diff 里出现凭据(AWS/JWT/私钥/DB 连接串/GitHub token/Google OAuth/Slack webhook/SendGrid…)
+    # ＝确定性泄露，绝不能靠模型自觉。扫描逻辑收敛在 _scan_merged_diff_for_secrets（单点，杜绝漏扫）：
+    # CRITICAL→escalate 人工 fail-closed 阻断；HIGH→留痕不阻断；扫描异常→fail-closed escalate。
+    # 本处守卫=终局干净合并（rebase/冲突中间态的 diff 将被重生成，不在此判）；rebase 达上限的
+    # clean-accept 分支是【另一个终局出口】，在其 return 前另调一次（见下方）。
+    if _apply_ok and result.success and not result.rebase_subtask_ids and result.merged_diff.strip():
+        _scan_merged_diff_for_secrets(out, result.merged_diff)
+
     # ── 硬冲突路径（无 base_reader 可用或单子任务冲突）──
     if result.conflicts:
         out["merge_conflicts"] = [
@@ -2418,6 +2729,10 @@ def merge(state: BrainState) -> dict:
                 out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
                 out["merge_rebase_dropped"] = over_limit
                 # rebase_subtask_ids 维持 [](上方默认)、不设 failure_escalated → after_merge 路由 VERIFY_L2
+                # hunter F1 治本：这是【另一个终局交付出口】——接受 base 版干净 merged_diff 直交 VERIFY_L2，
+                # 文件【不会】被重生成，故必须与上方主干等同地扫密钥；命中 CRITICAL→escalate 覆盖本"接受"
+                # 决定（含密钥的交付宁可 escalate 人工，也不放行）。缺此调用则 rebase-over-limit 路径漏扫。
+                _scan_merged_diff_for_secrets(out, result.merged_diff)
                 return out
             # rebase 已达上限【且有真硬冲突】→ 升级人工，不再无限重生成
             logger.warning(
@@ -3059,6 +3374,10 @@ async def revision(state: BrainState) -> dict:
         "subtask_results": preserved_results,
         "failed_subtask_ids": [],
         "subtask_retry_counts": {},  # 修订是新一轮，重置重试计数
+        # T4 复核 B：修订=人工 REVISE 开启全新一轮，清运行时冒烟 plateau 签名——否则上一轮
+        # 终态遗留的 last_signature 会被 last-write-wins 带进新轮，若新轮首个 runtime 失败签名
+        # 与之巧合相同，strict 模式会把"全新第一轮"误判成 plateau 提前 escalate（跨轮 staleness）。
+        "runtime_smoke_last_signature": "",
         # 批4c：修订=重新开始，清历史 escalate 粘滞标记——否则 gates.py:112 对修订成功的
         # 交付永拒 auto_accept、after_merge:285 残留条件把干净合并再送人工
         # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。

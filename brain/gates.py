@@ -198,6 +198,20 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
                 f"baseline_unverified: 存量申报未经运行时验证（严格闸开启）：{_unv[0][:200]}"
             )
 
+    # T1 对抗验证（hunter F1 整改）：对抗复核【不收敛达上限】= 有负面证据未解决（子任务
+    # 反复被独立复核判 FAIL 却修不好）→ 硬拦 auto_accept 交人工。与 runtime/acceptance 的
+    # "显式失败即拦"同构。注意【只拦 unconverged】：reviewer 不可用/漏审覆盖不全（缺复核、
+    # 无负面证据）走 degraded+挡 L6 通道（should_write_success 已据 blocking_degraded_reasons
+    # 拦 L6 假学习），不在此硬拦——否则 provider 挂时会 strand 全部交付（对齐 runtime_smoke
+    # skip 不硬拦的既有哲学，adversarial.py 节点 docstring 有分型论证）。
+    _adv = [str(d) for d in (state.get("degraded_reasons") or [])
+            if str(d).startswith("adversarial_verify_unconverged")]
+    if _adv:
+        return False, (
+            f"adversarial_verify_unconverged: 对抗复核多轮未收敛（子任务反复未过独立复核），"
+            f"需人工介入：{_adv[0][:200]}"
+        )
+
     vf = state.get("verification_failure")
     if vf:
         return False, f"verification_failure: {vf}"
