@@ -86,6 +86,9 @@ class BrainState(TypedDict, total=False):
     # LLM prompt（否则 after_validate 失败→increment_retry→plan 是【盲重试】，LLM 看不到上轮为何被否
     # →原样重生成同样坏计划→烧光 MAX_PLAN_RETRY→confirm/REJECT）。校验通过时清空，防跨轮粘滞。
     plan_validation_feedback: str
+    # F10（阶段3.7）：validate LLM 软校验的 plan 结构签名（不含 id）——重试轮签名一致
+    # 则跳过软校验（此前每轮必烧 ~120K 字符且结果丢弃）。last-write-wins 每轮整体替换。
+    plan_soft_review_sig: str
     shared_contract: dict               # Brain 级共享契约（来自 plan）
     # D10：PLAN 节点对 plan.parallel_groups 剔除悬空引用后，把修剪结果同步写回 state 顶层
     # （dedupe/replan 改了 subtasks 集合时 groups 必须跟着改）。LangGraph 未声明键会被静默

@@ -2186,6 +2186,21 @@ def _confirm_coverage_summary(state: BrainState) -> dict:
         return {}
 
 
+def _plan_soft_signature(plan_obj) -> str:
+    """F10（阶段3.7）：plan 结构签名——(desc, writable, create_files) 集合 sha1。
+    id 不进签名（replan 重编号是默认情形）；签名同=结构未变，重试轮跳过 LLM 软校验。"""
+    import hashlib
+    rows = []
+    for st in (getattr(plan_obj, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        rows.append((
+            (getattr(st, "description", "") or "").strip(),
+            tuple(sorted(getattr(sc, "writable", []) or [])) if sc else (),
+            tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else (),
+        ))
+    return hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest()
+
+
 def _coverage_gap_allowance(total: int) -> int:
     """A6：degraded 放行的缺口阈值 = max(SWARM_PLAN_COVERAGE_GAP_MAX(2),
     total×SWARM_PLAN_COVERAGE_GAP_RATIO(0.03))。两者归零=回到全有全无（运维泄压阀）。"""
@@ -2473,33 +2488,52 @@ async def validate_plan(state: BrainState) -> dict:
     ).lower() in ("true", "1", "yes")
     llm_valid = True
     llm_issues: list[str] = []
+    # F10（阶段3.7）：软校验只在【首轮或结构变化】时跑——此前每轮必烧（~120K 字符
+    # prompt）且结果默认丢弃；结构签名不含 id（replan 重编号是默认情形）。
+    _soft_sig = _plan_soft_signature(plan_obj)
+    _prev_soft_sig = str(state.get("plan_soft_review_sig") or "")
+    _soft_skip = retry_count > 0 and bool(_prev_soft_sig) and _prev_soft_sig == _soft_sig
+    if _soft_skip:
+        logger.info(
+            "[VALIDATE_PLAN] F10 重试轮结构未变（签名一致）→ 跳过 LLM 软校验"
+            "（每轮必烧+结果丢弃=纯浪费；确定性闸门已保证结构）")
     try:
-        # P16-2 治本：喂给软校验 LLM 的是【瘦身 plan_json】（剥离每子任务约 42K 的 contract
-        # 副本 + 注入代码）。原 model_dump_json 达 ~1MB（~260K token），把推理模型 GLM-5.2
-        # 拖进 84K chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才放行，且结果软
-        # 建议被丢弃）→ 卡在到 DISPATCH 之前。结构确定性闸门已保证 DAG/scope/依赖，软校验无需
-        # 内联 contract 副本（契约完整性由 plan 级 shared_contract 一次性体现）。
-        plan_json = slim_plan_json_for_llm_validation(plan_obj)
-        if len(plan_json) > MAX_LLM_VALIDATION_PLAN_CHARS:
-            # 瘦身后仍超上限（异常巨 plan）→ 跳过 LLM 软建议：结构确定性闸门已放行，绝不把
-            # 超大 prompt 喂推理模型再次 wall-clock runaway。default 放行（软信号缺失=不阻断）。
-            logger.info(
-                "[VALIDATE_PLAN] 瘦身后 plan_json %d 字符 > %d 上限 → 跳过 LLM 软建议（结构已通过放行）",
-                len(plan_json), MAX_LLM_VALIDATION_PLAN_CHARS,
-            )
+        if _soft_skip:
             result = {"valid": True, "issues": []}
         else:
-            llm = _get_brain_llm()
-            prompt_user = VALIDATE_PLAN_USER.format(
-                task_description=task_description,
-                plan_json=plan_json,
-                user_profile=_brain_profile_prompt(state),
-            )
-            response = await llm.ainvoke([
-                {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
-                {"role": "user", "content": prompt_user},
-            ])
-            result = _parse_json_from_llm(response.content)
+            # P16-2 治本：喂给软校验 LLM 的是【瘦身 plan_json】（剥离每子任务约 42K 的 contract
+            # 副本 + 注入代码）。原 model_dump_json 达 ~1MB（~260K token），把推理模型 GLM-5.2
+            # 拖进 84K chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才放行，且结果软
+            # 建议被丢弃）→ 卡在到 DISPATCH 之前。结构确定性闸门已保证 DAG/scope/依赖，软校验无需
+            # 内联 contract 副本（契约完整性由 plan 级 shared_contract 一次性体现）。
+            plan_json = slim_plan_json_for_llm_validation(plan_obj)
+            if len(plan_json) > MAX_LLM_VALIDATION_PLAN_CHARS:
+                # 瘦身后仍超上限（异常巨 plan）→ 跳过 LLM 软建议：结构确定性闸门已放行，绝不把
+                # 超大 prompt 喂推理模型再次 wall-clock runaway。default 放行（软信号缺失=不阻断）。
+                logger.info(
+                    "[VALIDATE_PLAN] 瘦身后 plan_json %d 字符 > %d 上限 → 跳过 LLM 软建议（结构已通过放行）",
+                    len(plan_json), MAX_LLM_VALIDATION_PLAN_CHARS,
+                )
+                result = {"valid": True, "issues": []}
+            else:
+                llm = _get_brain_llm()
+                prompt_user = VALIDATE_PLAN_USER.format(
+                    task_description=task_description,
+                    plan_json=plan_json,
+                    user_profile=_brain_profile_prompt(state),
+                )
+                # F10：软校验走 _invoke_llm_abortable（流式看门狗+软硬双限）——此前裸
+                # ainvoke 无外层超时包装，推理模型 runaway 只能靠 router 内层 wallclock 兜。
+                try:
+                    _soft_to = float(os.environ.get(
+                        "SWARM_VALIDATE_PLAN_SOFT_TIMEOUT", "300") or "300")
+                except ValueError:
+                    _soft_to = 300.0
+                response = await _invoke_llm_abortable(llm, [
+                    {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
+                    {"role": "user", "content": prompt_user},
+                ], _soft_to, None)
+                result = _parse_json_from_llm(response.content)
         llm_says_valid = bool(result.get("valid", False))
         llm_issues = list(result.get("issues", []) or [])
         if not llm_says_valid:
@@ -2555,6 +2589,8 @@ async def validate_plan(state: BrainState) -> dict:
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
         # 阶段3.1：本轮覆盖集入水位（跳过覆盖闸的轮不发键——无口径可对账）
         **({"coverage_watermark": _wm_cov_ids} if _wm_cov_ids is not None else {}),
+        # F10：结构签名 last-write-wins（重试轮据此跳过未变结构的软校验）
+        "plan_soft_review_sig": _soft_sig,
     }
 
 
