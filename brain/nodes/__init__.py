@@ -1145,6 +1145,7 @@ async def _plan_ultra_batched(
     # （plan_batch_failed_modules）→ can_auto_accept_plan fail-fast 升人工 + degraded_reasons
     # 拦 L6 假成功学习。降级容错语义不变（幸存批照常合并）。
     plan_batch_failed_modules: list[dict] = []
+    _batch_modules: list[str] = []  # A12：与 batch_results 对齐的模块名（供真实依赖连边）
     for kind, i, mod_name, payload, _dt, _nfiles in _outcomes:
         if kind == "ok" and payload:
             # 复核 B：给每个子任务 dict 打模块标记（merge 的 {**st} 拷贝保留额外键），使末端
@@ -1153,6 +1154,7 @@ async def _plan_ultra_batched(
                 if isinstance(_st, dict):
                     _st["_plan_batch_module"] = mod_name
             batch_results.append(payload)
+            _batch_modules.append(str(mod_name))
             logger.info("%s 模块'%s' 拆出 %d 个子任务",
                         batch_progress_line(i, total, _nfiles, _dt), mod_name, len(payload))
         elif kind == "ok":
@@ -1175,7 +1177,10 @@ async def _plan_ultra_batched(
             logger.warning("%s 模块'%s' 拆解异常（降级跳过）: %s",
                            batch_progress_line(i, total, _nfiles), mod_name, payload)
 
-    merged = merge_subtask_batches(batch_results)
+    # A12（阶段3.3）：批间只按真实 module_deps 连边——人造串行链使并行度塌缩≈1
+    # 且早批放弃沿链连坐全部后续模块（同 base 模块的容量/bisect 子批仍模块内串行）。
+    merged = merge_subtask_batches(batch_results, batch_modules=_batch_modules,
+                                   module_deps=module_deps or {})
     logger.info(
         "[PLAN-BATCH] 按模块分批完成：%d/%d 模块成功，合并出 %d 个子任务（失败 %d）",
         total - failed_batches, total, len(merged), failed_batches,

@@ -444,18 +444,39 @@ def break_dependency_cycles(subtasks: list[dict]) -> list[dict]:
     ]
 
 
-def merge_subtask_batches(batch_results: list[list[dict]]) -> list[dict]:
+def _base_module(name: str) -> str:
+    """批名归一到 base 模块名：容量子批 mod#i/k 与 bisect 半批 mod~a 都归 mod。"""
+    return str(name or "").split("~")[0].split("#")[0]
+
+
+def merge_subtask_batches(batch_results: list[list[dict]],
+                          batch_modules: list[str] | None = None,
+                          module_deps: dict[str, list[str]] | None = None) -> list[dict]:
     """合并各批拆出的子任务，重编全局唯一 id（Q：组前缀+序号），保留批内 depends_on。
 
     batch_results: [[subtask_dict, ...], ...]（每批 LLM 拆出的子任务列表）
-    返回扁平 subtasks 列表，id 重写为 st-<全局序号>，并建立批间串行依赖（后批依赖前批末尾）。
+    返回扁平 subtasks 列表，id 重写为 st-<全局序号>。
     合并后做跨批去重（dedupe_subtasks）+ 环打断（break_dependency_cycles）以治本分批重复/倒置。
+
+    批间连边（A12，阶段3.3，2026-07-09 登记册）：
+    - 传 batch_modules（与 batch_results 对齐的模块名，可含 #i/k、~a 子批后缀）时，
+      跨批边【只按真实 module_deps 连】：批首任务 → 各前置模块最后一批的末任务。
+      同 base 模块的多个子批保持模块内串行（容量切分/bisect 的既有安全语义）。
+      此前无条件"后批首挂前批末"的人造串行链使并行度塌缩≈1，且早批放弃沿链连坐
+      全部后续模块、elaborate 假依赖剥离对这条边行为不可预测。
+    - 不传（legacy 调用方/测试）→ 原串行门控逐字节不变（零回归）。
     """
+    _true_deps = (batch_modules is not None
+                  and len(batch_modules) == len(batch_results))
+    _deps_by_base: dict[str, list[str]] = {}
+    if _true_deps:
+        for m, ds in (module_deps or {}).items():
+            _deps_by_base[_base_module(m)] = [_base_module(d) for d in (ds or [])]
     merged: list[dict] = []
     seq = 0
     prev_batch_last_id: str | None = None
+    _last_by_module: dict[str, str] = {}  # base 模块 → 该模块最新一批的末任务 id
     for bi, batch in enumerate(batch_results):
-        first_in_batch: str | None = None
         id_remap: dict[str, str] = {}
         # 先分配新 id
         local_ids = []
@@ -469,18 +490,30 @@ def merge_subtask_batches(batch_results: list[list[dict]]) -> list[dict]:
                 id_remap[old_id] = new_id
             st = {**st, "id": new_id}
             local_ids.append(st)
-        # 再修正 depends_on（批内旧 id → 新 id），并把批首挂到上一批末尾（串行门控）
+        # 本批首任务的跨批边
+        _gate_ids: list[str] = []
+        if _true_deps:
+            _mod = _base_module(batch_modules[bi])
+            if _mod in _last_by_module:
+                _gate_ids.append(_last_by_module[_mod])  # 同模块子批串行
+            for _dep in _deps_by_base.get(_mod, []):
+                if _dep != _mod and _dep in _last_by_module:
+                    _gate_ids.append(_last_by_module[_dep])  # 真实模块依赖
+        elif prev_batch_last_id:
+            _gate_ids.append(prev_batch_last_id)  # legacy 串行门控
+        # 再修正 depends_on（批内旧 id → 新 id），批首追加跨批边
         for idx, st in enumerate(local_ids):
             deps = [id_remap.get(d, d) for d in (st.get("depends_on") or [])]
-            if idx == 0 and prev_batch_last_id:
-                if prev_batch_last_id not in deps:
-                    deps.append(prev_batch_last_id)
+            if idx == 0:
+                for g in _gate_ids:
+                    if g not in deps:
+                        deps.append(g)
             st["depends_on"] = deps
-            if first_in_batch is None:
-                first_in_batch = st["id"]
             merged.append(st)
         if local_ids:
             prev_batch_last_id = local_ids[-1]["id"]
+            if _true_deps:
+                _last_by_module[_base_module(batch_modules[bi])] = local_ids[-1]["id"]
     # 跨批去重（地基活每批各拆一遍）+ 环/悬空依赖打断，治本 RUN6 崩溃。
     merged = dedupe_subtasks(merged)
     merged = break_dependency_cycles(merged)
