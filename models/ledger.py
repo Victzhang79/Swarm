@@ -47,6 +47,25 @@ DEFAULT_STAGE_RATIOS: dict[str, float] = {
     "verify": 0.15,
 }
 
+# 阶段1.4：brain 图节点 → 预算阶段（runner 事件循环 on_chain_start 时设置）。
+# 未列出/未知节点返回 None=保持上一阶段（ChannelWrite 等框架噪声不重置）。
+STAGE_BY_NODE: dict[str, str] = {
+    "ingest": "extract", "extract_requirements": "extract",
+    "analyze": "plan", "detect_stack": "plan", "clarify": "plan", "assess": "plan",
+    "tech_design": "plan", "contract_design": "plan", "review_design": "plan",
+    "elaborate": "plan", "plan": "plan", "validate_plan": "plan", "confirm": "plan",
+    "increment_retry": "plan",
+    "dispatch": "execute", "monitor": "execute", "handle_failure": "execute",
+    "merge": "execute", "revision": "execute",
+    "adversarial_verify": "verify", "verify_l2": "verify", "verify_runtime": "verify",
+    "verify_l3": "verify", "deliver": "verify",
+    "learn_success": "verify", "learn_failure": "verify",
+}
+
+
+def stage_for_node(node_name: str) -> str | None:
+    return STAGE_BY_NODE.get(node_name or "")
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS task_ledger (
     task_id          TEXT PRIMARY KEY,
@@ -72,7 +91,7 @@ class _Entry:
         "budget_total", "local_budget", "stage_ratios", "stage",
         "cloud_in", "cloud_out", "local", "llm_calls", "wall_ms",
         "replan_rounds", "stage_spent", "reserved_cloud", "reserved_local",
-        "stage_reserved", "dirty",
+        "stage_reserved", "dirty", "seg_t0",
     )
 
     def __init__(self) -> None:
@@ -91,6 +110,7 @@ class _Entry:
         self.reserved_local = 0
         self.stage_reserved: dict[str, int] = {}
         self.dirty = False
+        self.seg_t0: float | None = None  # 本执行段起点（attach 置位，detach 结算 wall_ms）
 
 
 _lock = threading.Lock()
@@ -263,12 +283,22 @@ def attach(task_id: str, budget_total: int, *, local_budget: int = 0,
         entry.local_budget = max(0, int(local_budget or 0))
         if stage_ratios:
             entry.stage_ratios = {str(k): float(v) for k, v in stage_ratios.items()}
+        if entry.seg_t0 is None:  # 每执行段一次（重复 attach 不重置段起点）
+            import time as _time
+            entry.seg_t0 = _time.monotonic()
         entry.dirty = True
     _start_flusher()
 
 
 def detach(task_id: str) -> None:
-    """执行段结束：写穿后移出内存（终态账目仍在 DB 可查）。"""
+    """执行段结束：结算段墙钟 → 写穿 → 移出内存（终态账目仍在 DB 可查）。"""
+    with _lock:
+        e = _entries.get(task_id)
+        if e is not None and e.seg_t0 is not None:
+            import time as _time
+            e.wall_ms += max(0, int((_time.monotonic() - e.seg_t0) * 1000))
+            e.seg_t0 = None
+            e.dirty = True
     try:
         flush()
     except Exception:  # noqa: BLE001
@@ -472,6 +502,19 @@ def note_replan(task_id: str) -> None:
         e = _get_or_create(task_id)
         e.replan_rounds += 1
         e.dirty = True
+
+
+def set_replan_rounds(task_id: str, rounds: int) -> None:
+    """按 state.replan_count 绝对值同步（runner 事件循环消费节点输出，防重复累加；
+    只增不减——resume 恢复的历史值不被更小的新轮覆盖）。"""
+    if not task_id:
+        return
+    with _lock:
+        e = _get_or_create(task_id)
+        r = int(rounds or 0)
+        if r > e.replan_rounds:
+            e.replan_rounds = r
+            e.dirty = True
 
 
 def add_wall_ms(task_id: str, ms: int) -> None:

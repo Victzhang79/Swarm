@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 from swarm.models.errors import TaskTokenLimitExceeded  # noqa: E402,F401
 
 
+def _ledger_effective_budget(cfg, subtask_count: int) -> int:
+    """§九：ledger 云端预算=与 token 闸同源的弹性口径（base+per_subtask×子任务数）。
+    base=0 保持既有关闸语义（ledger track-only）。"""
+    base = int(getattr(cfg, "max_task_tokens", 0) or 0)
+    if base <= 0:
+        return 0
+    per = int(getattr(cfg, "max_task_tokens_per_subtask", 0) or 0)
+    n = int(subtask_count or 0)
+    return base + per * n if (per > 0 and n > 0) else base
+
+
 class TaskLockLost(Exception):
     """运行中模块锁在 Redis 侧丢失（续期返回 False）——防同模块并发写，fail-fast 中止（2nd#2）。"""
 
@@ -472,6 +483,12 @@ async def _stream_brain_events(
     from swarm.models import usage_tracker as _usage_tracker
     _usage_tracker.set_current_task(task_id)
 
+    # §九 阶段1.4：预算脊柱登记——执行段起点 attach（resume/重启由 attach 从 DB 恢复已
+    # 结算额度延续）；预算=云端弹性口径（base+per_subtask×已知子任务数，与 token 闸同源），
+    # base=0 保持既有关闸语义（track-only）。stage 随下方 on_chain_start 节点名流转。
+    from swarm.models import ledger as _ledger
+    _ledger.attach(task_id, budget_total=_ledger_effective_budget(_wc_cfg, _wc_subtasks))
+
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
         # P1-B：弹性墙钟闸门——失控任务（replan 空转/卡节点）到点中止，防无上限占沙箱/GPU。
         # 有效上限按当前已知子任务数动态计算（规划揭示规模后自动放宽，不误杀大型任务）。
@@ -508,6 +525,10 @@ async def _stream_brain_events(
         kind = event.get("event", "")
         if kind == "on_chain_start":
             name = event.get("name", "")
+            # §九 阶段1.4：预算阶段随节点流转（未知节点保持上一阶段，不重置）。
+            _stg = _ledger.stage_for_node(name)
+            if _stg:
+                _ledger.set_stage(task_id, _stg)
             if name and name not in ("LangGraph", "ChannelWrite", "increment_retry"):
                 progress = min(progress + 4, 90)
                 status = _NODE_STATUS_MAP.get(name)
@@ -543,6 +564,12 @@ async def _stream_brain_events(
                     _subs = _plan_out.get("subtasks")
                 if isinstance(_subs, list) and len(_subs) > _wc_subtasks:
                     _wc_subtasks = len(_subs)
+                    # §九 阶段1.4：弹性预算随规划揭示的规模放宽（与墙钟/token 闸同步）。
+                    _ledger.set_budget(
+                        task_id, _ledger_effective_budget(_wc_cfg, _wc_subtasks))
+            # §九 阶段1.4：replan 轮次入账（按 state 绝对值同步，防重复累加）。
+            if isinstance(output, dict) and isinstance(output.get("replan_count"), int):
+                _ledger.set_replan_rounds(task_id, output["replan_count"])
             if name in _TOKEN_GATE_NODES and isinstance(output, dict):
                 # round27 perf：get_task + 闸门检查（内含估算与可能的 DB 落 FAILED）卸线程池。
                 fresh = (await asyncio.to_thread(store.get_task, task_id)) or task_rec
@@ -1176,12 +1203,18 @@ async def run_task(
         })
     except TaskTokenLimitExceeded as _tok_exc:
         # T-B：撞【云端 token 预算】护栏 ≠ 交付失败 → 抢救已完成子任务为 PARTIAL，不整单丢产物。
-        logger.warning("[RUNNER] 任务 %s 撞云端 token 预算护栏，尝试抢救已完成产物", task_id)
+        # §九 阶段1.4：ledger 阶段闸带 stage 归因（阶段烧穿=该阶段 escalate，消息如实报阶段）。
+        _tok_stage = _tok_exc.usage.get("stage")
+        logger.warning("[RUNNER] 任务 %s 撞云端 token 预算护栏%s，尝试抢救已完成产物",
+                       task_id, f"（阶段={_tok_stage}）" if _tok_stage else "")
         await _salvage_partial_from_checkpoint(
             task_id, queue,
             reason_code="token_budget_exceeded",
             reason_msg=(f"云端 token 预算超限 "
-                        f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
+                        f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"
+                        + (f"，阶段 {_tok_stage} 子预算烧穿"
+                           f"({_tok_exc.usage.get('stage_spent')}/{_tok_exc.usage.get('stage_limit')})"
+                           if _tok_stage else "")),
         )
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
@@ -1202,6 +1235,12 @@ async def run_task(
             from swarm.models import usage_tracker as _ut
             _ut.set_current_task(None)
             _ut.clear_task_total(task_id)
+        except Exception:
+            pass
+        # §九 阶段1.4：账本段结算（wall_ms）+写穿+出内存（DB 留档，resume 再 attach 恢复）。
+        try:
+            from swarm.models import ledger as _lg
+            _lg.detach(task_id)
         except Exception:
             pass
         # 兜底：释放本任务残留的沙箱（正常路径 worker 已自清，此处防漏）
@@ -1343,6 +1382,12 @@ async def resume_task(
             _ut.clear_task_total(task_id)
         except Exception:
             pass
+        # §九 阶段1.4：resume 段账本结算+写穿+出内存（下次 attach 自 DB 恢复延续）。
+        try:
+            from swarm.models import ledger as _lg
+            _lg.detach(task_id)
+        except Exception:
+            pass
         # P1-B：兜底释放本任务沙箱（如 revise-resume 再派发过 worker）——墙钟/异常中止时不泄漏。
         try:
             from swarm.worker.sandbox import get_sandbox_manager
@@ -1451,6 +1496,12 @@ async def resume_planning(
             from swarm.models import usage_tracker as _ut
             _ut.set_current_task(None)
             _ut.clear_task_total(task_id)
+        except Exception:
+            pass
+        # §九 阶段1.4：规划 resume 段账本结算+写穿+出内存。
+        try:
+            from swarm.models import ledger as _lg
+            _lg.detach(task_id)
         except Exception:
             pass
         # P1-B：兜底释放本任务沙箱（规划恢复若再派发过 worker）——墙钟/异常中止时不泄漏。
