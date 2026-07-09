@@ -993,14 +993,25 @@ class SandboxManager:
             # 语义，错误处方随机落 capability/transient。合成本地 subprocess 同款
             # exit_code=124（_run_l1_command 的解析器现成认识），不计 infra 失败。
             _exc_name = type(exc).__name__.lower()
-            if "timeout" in _exc_name or "timed out" in str(exc).lower():
+            _exc_msg = str(exc).lower()
+            # 4.9 复核 T2（CONFIRMED）：e2b TimeoutException 承载四种语义——只有
+            # deadline_exceeded（进程超时）才是「命令真跑了只是慢」；unavailable（沙箱
+            # 本体过期，D28 追踪的真实场景）/canceled（request 超时，命令没送达 envd）
+            # 是沙箱级死亡信号，合成 124+清零会把 5 次弃沙箱熔断彻底缴械（半死沙箱
+            # 每条命令烧满超时窗慢磨到 worker deadline）。
+            _sandbox_dead = any(k in _exc_msg for k in (
+                "sandbox was not found", "sandbox unavailable", "unavailable",
+                "sandbox timeout", "request timeout", "canceled", "cancelled"))
+            if (("timeout" in _exc_name or "timed out" in _exc_msg)
+                    and not _sandbox_dead):
                 logger.warning(
-                    "Sandbox run_command 超时(%ss) → 合成 exit_code=124（不计 infra 失败）: %s",
-                    timeout, command[:120])
+                    "Sandbox run_command 进程超时(%ss) → 合成 exit_code=124（中性：不计 infra"
+                    " 失败也不清零计数）: %s", timeout, command[:120])
                 self.append_activity(
                     sid, "exec", f"run_command 超时({timeout}s)→exit_code=124 — {command[:120]}",
                     stdout=stdout, stderr=stderr, code=command, error="exit_code=124")
-                self._record_sandbox_success(sid)  # 命令真跑了=envd 健康，清零失败计数
+                # 中性证据：不 record_success（清零会让「infra 失败/超时交替」的真抖动
+                # 沙箱永远攒不满阈值）也不 record_failure（命令慢≠沙箱坏）。
                 return CodeResult(stdout=stdout, stderr=stderr,
                                   error="exit_code=124", success=False)
             err = f"{type(exc).__name__}: {exc}"

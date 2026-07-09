@@ -148,6 +148,19 @@ class _PromptBuildingMixin:
         bo = (l1_details.get("build_output") or "").strip()
         if bo and l1_details.get("l1_2_1_build_ok") is False:
             parts.append(f"[构建失败]\n{bo}")
+        # 4.9 复核 T9（CONFIRMED）：C5 跳过 verify 步后 fix 证据全靠本 digest——
+        # 原实现不含 test/验收命令失败分支，scoped test 挂掉时修复 agent 拿空串盲修。
+        to = (l1_details.get("test_output") or "").strip()
+        if to and l1_details.get("l1_3_test_ok") is False:
+            parts.append(f"[测试失败]\n{to}")
+        vf = l1_details.get("verify_failed")
+        if vf:
+            _vout = ""
+            for vr in (l1_details.get("verify_commands") or []):
+                if isinstance(vr, dict) and not vr.get("ok"):
+                    _vout = str(vr.get("output") or "")
+                    break
+            parts.append(f"[验收命令失败] {vf}\n{_vout}".strip())
         reason = l1_details.get("reason")
         if reason and not parts:
             parts.append(f"[确定性闸门] {reason}: {l1_details.get('note', '')}")

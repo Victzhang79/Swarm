@@ -172,11 +172,20 @@ class _L1GateMixin:
         import hashlib as _hashlib
         _gate_diff_sig = _hashlib.sha1(
             (diff or "").encode("utf-8", "replace")).hexdigest()
-        if (_gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
+        # 4.9 复核 T3（CONFIRMED·HIGH）：命中还须【本次同步计数干净】——D30/A3 的
+        # fail-closed 闸读的是 live 计数器（oversize/skip/err 反映最近一次 pull-back），
+        # 缓存只证明缓存那一刻干净；Phase-4 同步新出错时命中=绕闸，「沙箱绿本地 diff
+        # 缺产物」的静默假绿复活。
+        _sync_clean = (getattr(self, "_sync_skipped_count", 0) == 0
+                       and not getattr(self, "_sync_error_rels", None)
+                       and not getattr(self, "_sync_oversize_rels", None))
+        if (_sync_clean
+                and _gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
                 and getattr(self, "_last_gate_details", None) is not None):
-            _cached = dict(self._last_gate_details)
+            import copy as _copy
+            _cached = _copy.deepcopy(self._last_gate_details)  # R-F2：防嵌套共享变异
             _cached["reused_deterministic_gate"] = True
-            self._log("L1 确定性闸门：diff 未变+上次 PASS → 复用结果（省一遍全量 pipeline）")
+            self._log("L1 确定性闸门：diff 未变+上次 PASS+同步干净 → 复用结果（省一遍全量 pipeline）")
             return True, _cached
         # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
         # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"

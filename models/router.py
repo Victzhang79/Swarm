@@ -33,6 +33,24 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+
+def _breaker_error_transient(err: str) -> bool:
+    """F-F（4.9 复核 T8）：判断 Runnable on_error 的错误串是否为可喂 breaker 的
+    transient 基建形态（超时/连接/网关类）。
+
+    langchain Run.error = repr(exc)+完整 traceback——在整段上做子串匹配会被行号
+    （"502"命中 line 5021）与框架路径（"connect"命中 connectionpool.py 帧）假阳性，
+    把 capability 错误误喂 breaker 熔断健康模型。只取首行（repr(exc) 部分）匹配；
+    数字网关码要求词边界。capability（model_not_found/400 类）绝不喂。
+    """
+    first = (err or "").splitlines()[0].lower() if err else ""
+    if not first:
+        return False
+    if any(k in first for k in ("timeout", "timed out", "connect", "stall", "unavailable")):
+        return True
+    import re as _re
+    return bool(_re.search(r"\b50[234]\b", first))
+
 class ModelInvocationLogger(BaseCallbackHandler):
     """记录【实际被调用】的模型 + endpoint，并在 fallback 触发时显式告警。
 
@@ -849,10 +867,8 @@ class ModelRouter:
 
             def _on_error(run_obj) -> None:
                 try:
-                    _err = str(getattr(run_obj, "error", "") or "").lower()
-                    if any(k in _err for k in (
-                            "timeout", "timed out", "connect", "stall",
-                            "unavailable", "502", "503", "504")):
+                    if _breaker_error_transient(
+                            str(getattr(run_obj, "error", "") or "")):
                         _breaker.record_failure(name)
                 except Exception:  # noqa: BLE001
                     pass

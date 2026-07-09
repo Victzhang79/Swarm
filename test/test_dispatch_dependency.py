@@ -89,11 +89,16 @@ def test_abandoned_subtasks_never_dispatched():
     )
     ids = {t.id for t in batch}
     assert ids == {"st-free"}, f"放弃项及其下游不应派发，仅 st-free，实际 {ids}"
-    # 即便上游被当"已完成"(stub 计入 completed)，依赖放弃项的下游仍不就绪(放弃优先)
+    # 语义演进（阶段4.9 复核 R-F5）：completed 优先于放弃集——阶梯三【打桩路】的生产者
+    # 同时在 give_up 与 completed（桩 l1_passed=True），planning_core 设计记录明确
+    # "下游可编译集成，需人工补完"；旧"放弃优先"把带依赖边的下游永久扣死→被 #R13-4
+    # 静默划进 PARTIAL（交付面缩水）。revert 路（下游被传递放弃）由 task.id in _ab
+    # 直接排除，语义不变。
     batch2 = plan.get_dispatch_batch(
         {"st-up"}, ["st-down"], max_concurrent=4, abandoned=abandoned
     )
-    assert {t.id for t in batch2} == set(), "依赖放弃项的下游永不就绪（即使上游计入completed）"
+    assert {t.id for t in batch2} == {"st-down"}, (
+        "打桩上游已 settle（completed 含桩产出）→ 下游照常推进（桩设计意图）")
     # get_ready_tasks 同样排除
     ready = plan.get_ready_tasks(set(), abandoned=abandoned)
     assert {t.id for t in ready} == {"st-free"}

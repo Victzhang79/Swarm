@@ -82,7 +82,10 @@ def _get_worker_tools(scope: FileScope | None = None,
     ]
     if scope is None and not intent:
         return tools
-    _intent = str(intent or "").strip().lower()
+    # 4.9 复核 T1（CONFIRMED·实证）：str(TaskIntent.DEBUG)=='TaskIntent.DEBUG'——
+    # (str,Enum) 混入的 __str__ 是类名前缀形态，闸门恒 miss=DEBUG/AUDIT 被静默剥夺
+    # 考古工具。对枚举/字符串双输入自愈（.value 优先）。
+    _intent = str(getattr(intent, "value", intent) or "").strip().lower()
     if _intent not in ("debug", "audit"):
         tools = [t for t in tools if t not in (git_log, git_blame)]
     if scope is not None and not getattr(scope, "allow_any", False):

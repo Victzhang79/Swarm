@@ -1489,7 +1489,11 @@ def _prune_manifest_cache_negatives() -> None:
     复用省每 run 5-8 趟沙箱 find；False 可能因脚手架/补注册在 run 间落盘而过期，逐 run
     重探（D57 的防负缓存 stale 语义原样保留）。"""
     global _MANIFEST_PRESENT_CACHE
-    _MANIFEST_PRESENT_CACHE = {k: v for k, v in _MANIFEST_PRESENT_CACHE.items() if v}
+    # 4.9 复核 T10：顺带丢弃非当前 GEN 的键——中途 invalidate 后旧 GEN 正项永不命中
+    # （key 含 GEN），保留=纯泄漏。
+    _MANIFEST_PRESENT_CACHE = {
+        k: v for k, v in _MANIFEST_PRESENT_CACHE.items()
+        if v and k[0] == _MANIFEST_CACHE_GEN}
 
 
 def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
@@ -2640,6 +2644,9 @@ def run_l1_pipeline(
             details["pipeline_blocked"] = "worker_deadline_exhausted"
             details["not_run_kind"] = NotRunKind.BLOCKED.value
             details["deadline_stage"] = stage
+            # 4.9 复核 T7：oversize 拆小信号（_is_timeout_oversize_failure 消费）在
+            # 产生处落 marker——不靠 Phase-4 A5 布尔快照的偶然对齐续命。
+            details.setdefault("error", "timeout_in_verifying")
             logger.warning("[L1] worker 预算耗尽（阶段=%s）→ BLOCKED，不再白跑", stage)
             return True
         return False
@@ -2683,6 +2690,10 @@ def run_l1_pipeline(
         return True, details
 
     # ── L1.2 编译(语法) ──
+    # 4.9 复核 T6（CONFIRMED）：compile/lint 段此前无查点——deadline 在 entry 后过期
+    # 仍可越线跑 5-10 分钟（整树 lint 240s+/逐文件 30s×20）。
+    if _deadline_blocked("compile"):
+        return True, details
     compile_ok, compile_msg = _compile_files(project_path, modified, timeout=timeout)
     details["l1_2_compile_ok"] = compile_ok
     details["compile_message"] = compile_msg
@@ -3027,7 +3038,7 @@ def run_l1_pipeline(
         details["test_skipped"] = f"工程文件缺失，跳过测试: {test_cmd}"
         logger.info("[L1.3] 跳过测试(无对应工程文件): %s", test_cmd)
     else:
-        t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=timeout)
+        t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=_stage_timeout(timeout, deadline))
         test_ok = t_ec == 0
         details["l1_3_test_ok"] = test_ok
         # 智能压缩：提取关键失败信号行（FAILED/Error/Traceback/assert），

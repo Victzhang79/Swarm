@@ -669,6 +669,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 sorted(_unrecoverable), len(abandoned),
             )
             return {
+                # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+                # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+                **({"plan": plan_obj} if _c9_edges else {}),
                 "failure_strategy": "abandon",
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
@@ -940,6 +943,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "，换备选模型" if forced_alternate else "",
                 )
                 return {
+                    # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+                    # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+                    **({"plan": plan_obj} if _c9_edges else {}),
                     "subtask_results": subtask_results,
                     "dispatch_remaining": dispatch_remaining,
                     "failed_subtask_ids": [],
@@ -968,6 +974,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 failed_ids, len(succeeded_siblings),
             )
             return {
+                # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+                # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+                **({"plan": plan_obj} if _c9_edges else {}),
                 "subtask_results": subtask_results,
                 "failed_subtask_ids": failed_ids,
                 "failure_escalated": True,
@@ -989,6 +998,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 max_replan,
             )
             return {
+                # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+                # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+                **({"plan": plan_obj} if _c9_edges else {}),
                 "subtask_results": subtask_results,
                 "failed_subtask_ids": failed_ids,
                 "failure_escalated": True,
@@ -1005,6 +1017,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "（已携带失败原因供 PLAN 参考）" if replan_feedback else "",
         )
         return {
+            # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+            # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+            **({"plan": plan_obj} if _c9_edges else {}),
             "subtask_results": subtask_results,
             "failed_subtask_ids": [],
             "plan_valid": False,
@@ -1022,6 +1037,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     if strategy == "escalate":
         logger.info("[HANDLE_FAILURE] 策略=escalate — 上报人工审核")
         return {
+            # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+            # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+            **({"plan": plan_obj} if _c9_edges else {}),
             "failure_escalated": True,
             "failure_strategy": "escalate",
             "l2_passed": False,
@@ -1138,6 +1156,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 failed_ids, len(abandoned), len(_remaining),
             )
             return {
+                # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+                # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+                **({"plan": plan_obj} if _c9_edges else {}),
                 "failure_strategy": "abandon",
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
@@ -1152,6 +1173,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             max_retries, failed_ids,
         )
         return {
+            # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
+            # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
+            **({"plan": plan_obj} if _c9_edges else {}),
             "failure_escalated": True,
             "failure_strategy": "escalate",
             "l2_passed": False,

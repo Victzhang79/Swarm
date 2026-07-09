@@ -391,9 +391,15 @@ class TaskPlan(BaseModel):
         _dp = deprioritized or set()
 
         def _is_ready(task: SubTask) -> bool:
-            # 已放弃的子任务、或依赖了放弃项的下游 → 永不就绪（其依赖永远不会落地），
-            # 不再被选中派发，斩断 BLOCKED→replan→复活 的无界循环。
-            if task.id in _ab or any(d in _ab for d in task.depends_on):
+            # 已放弃的子任务、或依赖了【无产出】放弃项的下游 → 永不就绪（其依赖永远
+            # 不会落地），不再被选中派发，斩断 BLOCKED→replan→复活 的无界循环。
+            # 4.9 复核 T5（CONFIRMED）：completed 优先于放弃集——阶梯三【打桩路】的
+            # 生产者同时在 give_up 与 completed（桩产出 l1_passed=True），设计意图=让
+            # 下游对可编译桩照常推进；先查放弃集会把带依赖边的下游永久扣死→被
+            # #R13-4 静默划进 PARTIAL。revert 路（无产出）不在 completed，语义不变。
+            if task.id in _ab:
+                return False
+            if any(d in _ab and d not in completed_ids for d in task.depends_on):
                 return False
             return task.id not in completed_ids and all(
                 d in completed_ids for d in task.depends_on
