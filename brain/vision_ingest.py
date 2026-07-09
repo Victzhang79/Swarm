@@ -118,42 +118,83 @@ def select_vision_model() -> str | None:
 # 多模态理解（单图 / 多图）
 # ──────────────────────────────────────────────
 
+# F12（2026-07-09 登记册）：多模态调用瞬时错误的有界重试参数。
+# 处方经取证更正：get_llm_by_name 的 fallback 链是【文本难度】链——文本模型看不见图片，
+# fallback 只会臆造描述（虚假前提进 PRD），比 loud 失败更糟。正确弹性=同模型对 transient
+# （连接抖动/5xx/超时，classify_failure 判定）退避重试；capability 类（图太大/拒答）立抛。
+_VISION_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE = 2.0
+
+
+def _vision_messages(data_urls: list[str], prompt: str) -> list[dict]:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for url in data_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return [{"role": "user", "content": content}]
+
+
+def _normalize_vision_text(text) -> str:
+    if isinstance(text, list):
+        # 某些模型返回分段内容
+        text = " ".join(p if isinstance(p, str) else p.get("text", "") for p in text)
+    return str(text).strip()
+
+
+def _should_retry_vision(exc: Exception, attempt: int) -> bool:
+    """仅 transient 且未耗尽额度才重试（capability 重试必然同败，不烧钱）。"""
+    from swarm.models.errors import TRANSIENT, classify_failure
+
+    return attempt < _VISION_MAX_ATTEMPTS and classify_failure(exc) == TRANSIENT
+
+
 def _invoke_vision(model_name: str, data_urls: list[str], prompt: str = _VISION_PROMPT) -> str:
-    """调多模态模型理解一张或多张图，返回文本。失败抛异常（由上层捕获）。"""
+    """调多模态模型理解一张或多张图，返回文本。失败抛异常（由上层捕获）。
+
+    F12：transient 错误同模型有界重试——原裸模型零重试，一次连接抖动=整附件理解丢失
+    （上层降级 result.error，PRD 图片/扫描件内容静默缺失）。
+    """
+    import time as _time
+
     from swarm.models.router import ModelRouter
 
     router = ModelRouter()
     llm = router.get_model_by_name(model_name, temperature=0.1)
-
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    for url in data_urls:
-        content.append({"type": "image_url", "image_url": {"url": url}})
-
-    resp = llm.invoke([{"role": "user", "content": content}])
-    text = resp.content
-    if isinstance(text, list):
-        # 某些模型返回分段内容
-        text = " ".join(
-            p if isinstance(p, str) else p.get("text", "")
-            for p in text
-        )
-    return str(text).strip()
+    messages = _vision_messages(data_urls, prompt)
+    for attempt in range(1, _VISION_MAX_ATTEMPTS + 1):
+        try:
+            return _normalize_vision_text(llm.invoke(messages).content)
+        except Exception as exc:  # noqa: BLE001 — 仅 transient 重试，其余原样上抛
+            if not _should_retry_vision(exc, attempt):
+                raise
+            logger.warning(
+                "[VISION] 模型 %s 瞬时失败（第 %d/%d 次），退避重试: %s",
+                model_name, attempt, _VISION_MAX_ATTEMPTS, exc)
+            _time.sleep(_RETRY_BACKOFF_BASE * attempt)
+    raise RuntimeError("unreachable")  # for 循环内必 return 或 raise
 
 
 async def _ainvoke_vision(model_name: str, data_urls: list[str], prompt: str = _VISION_PROMPT) -> str:
-    """_invoke_vision 的异步版：await ainvoke，取消(cancel_task)可中断底层流，不空烧 GPU（B6）。"""
+    """_invoke_vision 的异步版：await ainvoke，取消(cancel_task)可中断底层流，不空烧 GPU（B6）。
+    F12：与同步版同构的 transient 有界重试。"""
+    import asyncio as _aio
+
     from swarm.models.router import ModelRouter
 
     router = ModelRouter()
     llm = router.get_model_by_name(model_name, temperature=0.1)
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    for url in data_urls:
-        content.append({"type": "image_url", "image_url": {"url": url}})
-    resp = await llm.ainvoke([{"role": "user", "content": content}])
-    text = resp.content
-    if isinstance(text, list):
-        text = " ".join(p if isinstance(p, str) else p.get("text", "") for p in text)
-    return str(text).strip()
+    messages = _vision_messages(data_urls, prompt)
+    for attempt in range(1, _VISION_MAX_ATTEMPTS + 1):
+        try:
+            resp = await llm.ainvoke(messages)
+            return _normalize_vision_text(resp.content)
+        except Exception as exc:  # noqa: BLE001 — 仅 transient 重试，其余原样上抛
+            if not _should_retry_vision(exc, attempt):
+                raise
+            logger.warning(
+                "[VISION] 模型 %s 瞬时失败（第 %d/%d 次），退避重试: %s",
+                model_name, attempt, _VISION_MAX_ATTEMPTS, exc)
+            await _aio.sleep(_RETRY_BACKOFF_BASE * attempt)
+    raise RuntimeError("unreachable")
 
 
 async def understand_file_async(
