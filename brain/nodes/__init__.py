@@ -1588,10 +1588,10 @@ async def _maybe_surgical_coverage_topup(state):
     if os.environ.get("SWARM_PLAN_COVERAGE_TOPUP", "1").strip().lower() in (
             "0", "false", "no", "off"):
         return None
-    # 收窄到 ULTRA：黑洞是 ULTRA 分批全量重拆（11 模块 × TECH_DESIGN/CONTRACT/PLAN-BATCH
-    # 每轮重烧）。MEDIUM/SIMPLE 的"重拆"只是一次廉价单发调用且 #T3 增量修补块已保收敛，
-    # 不属黑洞——保持既有路径不变、零回归。
-    if effective_complexity(state) != Complexity.ULTRA:
+    # A9-2（阶段3.4，2026-07-09 登记册）：外科补齐从 ULTRA-only 放开到 MEDIUM/COMPLEX
+    # ——纯覆盖重试的定向补齐严格便宜于任何一次全量重拆（哪怕单发），且天然保单调
+    # （不重掷骰子丢已覆盖条目）。仅 SIMPLE 除外（微任务无覆盖矩阵负担，保持原路径）。
+    if effective_complexity(state) == Complexity.SIMPLE:
         return None
     if not (state.get("plan_validation_feedback") or "").strip():
         return None
@@ -2119,10 +2119,29 @@ def _confirm_coverage_summary(state: BrainState) -> dict:
         return {}
 
 
-def _format_validation_feedback(issues: list) -> str:
+def _coverage_gap_allowance(total: int) -> int:
+    """A6：degraded 放行的缺口阈值 = max(SWARM_PLAN_COVERAGE_GAP_MAX(2),
+    total×SWARM_PLAN_COVERAGE_GAP_RATIO(0.03))。两者归零=回到全有全无（运维泄压阀）。"""
+    try:
+        _max = int(os.environ.get("SWARM_PLAN_COVERAGE_GAP_MAX", "2") or "2")
+    except ValueError:
+        _max = 2
+    try:
+        _ratio = float(os.environ.get("SWARM_PLAN_COVERAGE_GAP_RATIO", "0.03") or "0.03")
+    except ValueError:
+        _ratio = 0.03
+    return max(max(0, _max), int(max(0, total) * max(0.0, _ratio)))
+
+
+def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
     """D09：把校验 issues 列表压成回灌 PLAN 的简明反馈文本（逐条 bullet，去空/去重保序）。
 
-    空 issues → 空串（PLAN 侧据此不注入，不产生"莫名警告"噪声）。"""
+    空 issues → 空串（PLAN 侧据此不注入，不产生"莫名警告"噪声）。
+
+    A9（阶段3.4，2026-07-09 登记册）：超帽时【分页轮转】而非固定截断头部——固定截断使
+    LLM 永远修不了看不见的条目，每轮暴露另一批（round34 实证 uncovered 18→12→18 震荡）。
+    rotate（调用方传 plan_retry_count）决定本轮展示哪一页；页头自述"未列出≠已解决"。
+    未超帽（≤8000 字符）时 rotate 无效、输出零变化。"""
     seen: set[str] = set()
     lines: list[str] = []
     for it in (issues or []):
@@ -2131,13 +2150,26 @@ def _format_validation_feedback(issues: list) -> str:
             seen.add(s)
             lines.append(f"- {s}")
     out = "\n".join(lines)
-    if len(out) > 8000:
-        # 复核 L-5/hunter F3：feedback 无界会随条目数放大（60 条 ≈15K）并联动
-        # 下一轮 prompt/分批 sliding_ctx 膨胀——定界并自述截断（不静默）
-        kept = out[:8000].rsplit("\n", 1)[0]
-        dropped = len(lines) - kept.count("\n") - 1
-        out = kept + f"\n- （反馈已截断，另有 {dropped} 条同类问题未列出）"
-    return out
+    if len(out) <= 8000:
+        return out
+    # 按字符预算切页（每页 ~7500，留页头余量）
+    pages: list[list[str]] = []
+    cur: list[str] = []
+    cur_len = 0
+    for ln in lines:
+        if cur and cur_len + len(ln) + 1 > 7500:
+            pages.append(cur)
+            cur, cur_len = [], 0
+        cur.append(ln)
+        cur_len += len(ln) + 1
+    if cur:
+        pages.append(cur)
+    pi = int(rotate) % len(pages)
+    body = "\n".join(pages[pi])
+    return (
+        f"（反馈分页轮转 第{pi + 1}/{len(pages)}页：共 {len(lines)} 条问题，本页列 "
+        f"{len(pages[pi])} 条；其余页在后续重试轮轮转展示——未列出的问题【同样存在且未解决】，"
+        "已修好的条目不要回退）\n" + body)
 
 
 async def validate_plan(state: BrainState) -> dict:
@@ -2185,7 +2217,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_retry_count": retry_count,
             "plan_validation_issues": struct_result.issues,
             # D09：结构校验失败原因回灌 PLAN（悬空依赖/环/parallel_groups 悬空引用等）供重试修正
-            "plan_validation_feedback": _format_validation_feedback(struct_result.issues),
+            "plan_validation_feedback": _format_validation_feedback(struct_result.issues, rotate=retry_count),
         }
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
@@ -2222,7 +2254,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": _pb_issues,
-            "plan_validation_feedback": _format_validation_feedback(_pb_issues),
+            "plan_validation_feedback": _format_validation_feedback(_pb_issues, rotate=retry_count),
         }
 
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
@@ -2296,7 +2328,23 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_validation_feedback": _wm_loss_feedback(),
                 "coverage_watermark": _wm_cov_ids,
             }
+        # A6（阶段3.4，2026-07-09 登记册）：覆盖缺口≤阈值 degraded 放行——替代全有全无
+        # （round37 实证 2/108 未覆盖=整任务 REJECT）。放行条件全部满足：①已给过≥1 轮
+        # 修补机会（P1 topup/D09 先真修）；②纯缺口——无悬空 covers/臆造 baseline（臆造
+        # 信号绝不放行）且无水位倒退（缺口只许是"从未覆盖"，不许是"倒退出来的"，3.1
+        # 硬地板）；③缺口 ≤ max(GAP_MAX, total×RATIO)。残差进 degraded_reasons（阻断
+        # L6 假成功学习）+ deliver 覆盖矩阵可观测面，绝不静默。
+        _gap_allowed_pass = False
         if not cov_result.valid:
+            _gap_items = _wm_matrix["uncovered"]
+            _gap_allowed_pass = (
+                retry_count >= 1
+                and not _wm_lost
+                and not _wm_matrix["dangling_covers"]
+                and not _wm_matrix["dangling_baseline"]
+                and 0 < len(_gap_items) <= _coverage_gap_allowance(len(_req_items))
+            )
+        if not cov_result.valid and not _gap_allowed_pass:
             logger.warning(
                 "[VALIDATE_PLAN] 覆盖矩阵校验未通过（%d 条 issue）: %s",
                 len(cov_result.issues), "; ".join(cov_result.issues),
@@ -2317,20 +2365,31 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_retry_count": retry_count,
                 "plan_validation_issues": cov_result.issues,
                 # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划；
-                # 阶段3.1：相对水位的丢失以单调合同名义结构化前置（倒退≠一直没做）。
+                # 阶段3.1：相对水位的丢失以单调合同名义结构化前置（倒退≠一直没做）；
+                # A9：超帽按 retry 轮分页轮转（LLM 修不了看不见的条目）。
                 "plan_validation_feedback": (
                     _wm_loss_feedback()
-                    + _format_validation_feedback(cov_result.issues)),
+                    + _format_validation_feedback(cov_result.issues, rotate=retry_count)),
                 # 阶段3.1：失败 attempt 已达成的覆盖也入水位（round37 震荡发生在多轮
                 # attempt 之间——不记则下一轮丢了它无人知晓）。reducer 并集，绝不缩水。
                 "coverage_watermark": _wm_cov_ids,
             }
-        _bl_n = len([e for e in (state.get("baseline_covered") or [])
-                     if isinstance(e, dict) and str(e.get("reason") or "").strip()])
-        logger.info(
-            "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被覆盖"
-            "（含 baseline_covered 申报 %d 条）", len(_req_items), _bl_n,
-        )
+        if _gap_allowed_pass:
+            _gap_ids = [u["id"] for u in _wm_matrix["uncovered"]]
+            logger.warning(
+                "[VALIDATE_PLAN] A6 覆盖缺口 degraded 放行：%d/%d 未覆盖（≤阈值，已给 "
+                "%d 轮修补机会）——残差进 deliver 覆盖矩阵+degraded 留痕: %s",
+                len(_gap_ids), len(_req_items), retry_count, _gap_ids[:20])
+            _coverage_degraded.append(
+                f"plan_coverage:gap_allowed({len(_gap_ids)}/{len(_req_items)}): "
+                + ", ".join(_gap_ids[:20]) + ("…" if len(_gap_ids) > 20 else ""))
+        else:
+            _bl_n = len([e for e in (state.get("baseline_covered") or [])
+                         if isinstance(e, dict) and str(e.get("reason") or "").strip()])
+            logger.info(
+                "[VALIDATE_PLAN] 覆盖矩阵校验通过：%d 个需求条目全部被覆盖"
+                "（含 baseline_covered 申报 %d 条）", len(_req_items), _bl_n,
+            )
 
     # ── LLM 计划验证（结构已通过后的【软建议】，不阻断）──
     # Bug-2 根治（task 92ff8a71/70543ea2/37460a5b 实证）：过去 llm_valid =
@@ -2419,7 +2478,7 @@ async def validate_plan(state: BrainState) -> dict:
         "plan_retry_count": retry_count,
         "plan_validation_issues": _final_issues,
         # D09：LLM/P6b 完整性校验失败原因回灌 PLAN（通过则清空，防跨轮粘滞）
-        "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues),
+        "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues, rotate=retry_count),
         # R35-C 配套（F-4 膨胀兜底）：校验【通过】即清空 plan-batch 缓存——过闸后进 CONFIRM/
         # DISPATCH 无更多 PLAN 回炉轮，缓存无人再消费，清掉不让数十 KB 死重随后续 checkpoint
         # 长途漂流（D51 病灶同族）。未通过(回炉 PLAN)不清=下一轮护栏要用。

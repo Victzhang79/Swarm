@@ -342,8 +342,11 @@ async def test_validate_plan_baseline_empty_reason_fails_with_feedback(monkeypat
 # ─────────────── T3: D09 回灌增量修补 ───────────────
 
 async def test_plan_retry_injects_previous_plan_summary(monkeypatch):
-    """校验失败重试 → prompt 含上一版 plan 摘要（子任务 id+covers）+ 增量修补纪律。"""
+    """校验失败重试 → prompt 含上一版 plan 摘要（子任务 id+covers）+ 增量修补纪律。
+    A9-2（阶段3.4）后 MEDIUM 纯覆盖重试默认先走 P1 外科补齐——本测试验证的是【全量
+    重拆路径】的修补块注入（topup 未命中/关闭时仍是主路径），故显式关 topup。"""
     _clean_env()
+    monkeypatch.setenv("SWARM_PLAN_COVERAGE_TOPUP", "0")
     fake = _FakeLLM(
         '{"subtasks":[{"id":"st-1","description":"x",'
         '"scope":{"writable":["a"],"readable":[]},"covers":["%s"]}],'
@@ -490,13 +493,15 @@ def test_normalize_caps_total_entries():
 
 
 def test_feedback_formatter_bounded_and_self_describing():
-    """复核 L-5：60 条 issue ≈15K 字符无界 → 8K 定界且截断自述（不静默）。"""
+    """复核 L-5：60 条 issue ≈15K 字符无界 → 8K 定界且自述（不静默）。
+    A9（阶段3.4）语义演进：固定截断改分页轮转（LLM 修不了看不见的条目），
+    ★意图不变：有界 + 明示"未列出的问题同样存在"★。"""
     from swarm.brain.nodes import _format_validation_feedback
     issues = [f"需求条目未被任何子任务覆盖: req-{i:08x} — " + "描述" * 60
               for i in range(60)]
     out = _format_validation_feedback(issues)
     assert len(out) < 8500
-    assert "已截断" in out and "未列出" in out
+    assert "轮转" in out and "未列出" in out
 
 
 def test_near_miss_ambiguous_prefix_no_hint():
