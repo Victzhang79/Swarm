@@ -122,8 +122,10 @@ def test_merge_engine_overlapping_conflict():
     assert len(result.conflicts) == 1
     assert result.conflicts[0].file_path == "x.py"
     assert set(result.conflicts[0].subtask_ids) == {"st-a", "st-b"}
-    assert "MERGE CONFLICT" in result.merged_diff
-    assert "<<<<<<< st-a" in result.merged_diff
+    # D11（阶段6）语义演进：冲突标记绝不进 merged_diff（毒 diff 不可 apply）——落 conflict_render
+    assert "<<<<<<<" not in (result.merged_diff or "")
+    assert "st-a" in (result.conflict_render or "") and "st-b" in result.conflict_render
+    assert "<<<<<<< st-a" in result.conflict_render
     print("  ✅ merge_engine — overlapping same-file diffs detected")
 
 

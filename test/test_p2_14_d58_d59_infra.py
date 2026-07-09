@@ -101,8 +101,9 @@ def test_d58_not_ready_project_does_not_block_ready_task(monkeypatch):
     monkeypatch.setattr(sch, "_resolve_exec_meta",
                         lambda tid: {"project_id": f"proj-{tid}", "description": "d",
                                      "auto_accept": False})
-    monkeypatch.setattr(sch, "_project_ready_for_exec",
-                        lambda pid: pid != "proj-waiting")
+    # E12（阶段5）语义演进：消费循环改调三态 _project_exec_admission（E8 且经 to_thread）
+    monkeypatch.setattr(sch, "_project_exec_admission",
+                        lambda pid: "wait" if pid == "proj-waiting" else "ready")
     monkeypatch.setattr(sch, "_run_with_slot",
                         lambda tid, meta, fn: dispatched.append((tid, time.monotonic())))
 

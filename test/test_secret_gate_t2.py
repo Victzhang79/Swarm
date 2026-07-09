@@ -305,6 +305,20 @@ def test_db_url_without_credentials_not_flagged():
 # 6b. merge 硬闸——rebase-over-limit clean-accept 终局出口不得漏扫（hunter F1 治本）
 # ─────────────────────────────────────────────────────────────
 
+def _added_manifest(*lines: str) -> str:
+    """D3（阶段6）语义演进：over_limit clean-accept 只对【聚合/模块清单】成立（超限方
+    碰普通源文件=接受即静默丢源码 → escalate）。本 harness 的秘钥闸标的是 clean-accept
+    出口本身，故构造 pom.xml（清单）diff 走进该出口。"""
+    body = "".join(f"+{ln}\n" for ln in lines)
+    return (
+        "diff --git a/pom.xml b/pom.xml\n"
+        "index 000000..111111 100644\n"
+        "--- a/pom.xml\n"
+        "+++ b/pom.xml\n"
+        f"@@ -1,0 +1,{len(lines)} @@\n" + body
+    )
+
+
 def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
     """构造 rebase 达上限但整体干净的接受分支（另一个终局交付出口），验证其不绕过 secret 闸。"""
     from swarm.brain import merge_engine
@@ -339,7 +353,7 @@ def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
 
 
 def test_merge_rebase_over_limit_accept_still_scans_secret(monkeypatch):
-    diff = _added('AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"')
+    diff = _added_manifest('<aws.key>AKIAIOSFODNN7EXAMPLE</aws.key>')
     out = _run_merge_rebase_over_limit(monkeypatch, diff)
     # 关键回归：该终局出口曾完全绕过密钥闸，密钥直达交付；现必须 escalate。
     assert out.get("failure_escalated") is True
@@ -349,7 +363,7 @@ def test_merge_rebase_over_limit_accept_still_scans_secret(monkeypatch):
 
 def test_merge_rebase_over_limit_accept_clean_diff_proceeds(monkeypatch):
     """无密钥时该分支照常接受交付（不因扫描误伤）。"""
-    diff = _added("def add(a, b):", "    return a + b")
+    diff = _added_manifest("<module>alarm</module>")
     out = _run_merge_rebase_over_limit(monkeypatch, diff)
     assert out.get("failure_escalated") is False
     assert out.get("merge_rebase_dropped") == ["st-1"]

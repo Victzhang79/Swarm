@@ -27,8 +27,11 @@ def test_building_sandbox_held():
 
 
 def test_error_project_held():
+    # E12（阶段5）语义演进：ERROR 项目不再"留池等待"（旧口径 200 次×3s 后强制放行=
+    # 注定失败的白烧）——三态准入返回 "error"，消费循环 fail-fast 标任务 FAILED。
     with patch("swarm.project.store.get_project", return_value={"status": "ERROR"}):
-        assert scheduler._project_ready_for_exec("p1") is False
+        assert scheduler._project_exec_admission("p1") == "error"
+        assert scheduler._project_ready_for_exec("p1") is True  # 不留池（fail-fast 由调用侧执行）
 
 
 def test_missing_project_conservatively_admitted():

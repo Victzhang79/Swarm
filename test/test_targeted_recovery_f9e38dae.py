@@ -159,7 +159,8 @@ def test_targeted_recovery_fires_even_with_exhausted_budget():
     with patch.object(nodes, "_get_brain_llm", _fake_llm("replan")):
         out = asyncio.run(nodes.handle_failure(_state()))
     assert out.get("failure_strategy") == "retry_alternate", out.get("failure_strategy")
-    assert out.get("targeted_recovery") is True
+    # 3.8 语义演进：targeted_recovery 布尔死键已删（写后零读点）——活信号=按子任务配额表
+    assert out.get("targeted_recovery_counts", {}).get("st-24", 0) >= 1
     assert out.get("targeted_recovery_count") == 1
     # 保留成功兄弟 st-1
     assert "st-1" in out.get("subtask_results", {})

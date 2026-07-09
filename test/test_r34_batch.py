@@ -376,6 +376,10 @@ def test_l2_uses_project_baked_template(monkeypatch, tmp_path):
 # ─────────────── G7/R34-3: 覆盖增量日志 ───────────────
 
 async def test_coverage_delta_logged_across_attempts(monkeypatch):
+    # A6（阶段3.4）语义演进：小缺口默认 degraded 放行不再走否决分支——本测试标的是
+    # 【否决分支的跨轮增量日志】，用泄压阀归零复现全有全无路径。
+    monkeypatch.setenv("SWARM_PLAN_COVERAGE_GAP_MAX", "0")
+    monkeypatch.setenv("SWARM_PLAN_COVERAGE_GAP_RATIO", "0")
     from swarm.brain.nodes import validate_plan
     import swarm.brain.nodes as nodes
     from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan

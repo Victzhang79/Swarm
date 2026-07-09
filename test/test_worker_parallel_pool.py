@@ -71,7 +71,8 @@ def test_override_model_carries_fallback_chain(monkeypatch):
 
     monkeypatch.setattr(wa, "ModelRouter", _FakeRouter)
     monkeypatch.setattr(wa, "create_react_agent", lambda **kw: MagicMock(name="agent"))
-    monkeypatch.setattr(wa, "_get_worker_tools", lambda: [])
+    # C10（阶段4）语义演进：_get_worker_tools 按 (scope, intent) 裁剪——桩随签名
+    monkeypatch.setattr(wa, "_get_worker_tools", lambda *a, **k: [])
     monkeypatch.setattr(wa, "build_worker_prompt", lambda **kw: "SYS")
 
     st = SubTask(id="st-1", description="d", difficulty=SubTaskDifficulty.COMPLEX,

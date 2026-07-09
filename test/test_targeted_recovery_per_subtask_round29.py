@@ -91,7 +91,7 @@ def _run(state, strategy="retry"):
 def test_new_victim_gets_recovery_despite_global_exhaustion():
     state = _missing_dep_state(counts={"st-a": 2}, failed=["st-25"])
     result = _run(state)
-    assert result.get("targeted_recovery") is True, (
+    assert result.get("targeted_recovery_counts"), (  # 3.8 演进：布尔死键已删，看配额表
         f"st-25 从未用过定向恢复配额，不得被其它子任务的用量饿死；实际 strategy="
         f"{result.get('failure_strategy')}"
     )
@@ -118,7 +118,7 @@ def test_same_subtask_loop_safety_preserved():
 def test_mixed_batch_grants_only_fresh_victims():
     state = _missing_dep_state(counts={"st-a": 2}, failed=["st-a", "st-25"])
     result = _run(state)
-    assert result.get("targeted_recovery") is True
+    assert result.get("targeted_recovery_counts")  # 3.8 演进：布尔死键已删，看配额表
     counts = result.get("targeted_recovery_counts") or {}
     assert counts.get("st-25") == 1
     assert counts.get("st-a") == 2, "已耗尽者不得再自增"

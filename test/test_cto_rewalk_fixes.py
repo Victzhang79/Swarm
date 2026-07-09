@@ -257,7 +257,7 @@ def test_contract_retry_has_counter_and_ceiling():
     src = inspect.getsource(nodes._handle_failure_impl)
     # 定位契约分支
     idx = src.index('verification_failure") == "contract"')
-    window = src[idx: idx + 1400]
+    window = src[idx: idx + 2200]  # D13（阶段6）契约独立表注释加长，窗口相应加宽
     assert "subtask_retry_counts" in window
     assert "max_retries" in window
     assert "failure_escalated" in window

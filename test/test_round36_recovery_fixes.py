@@ -223,7 +223,8 @@ def test_fix6_covers_merged_monotonic_by_scope():
     old_plan = TaskPlan(subtasks=[_sub("st-24", ["a/A.java"], ["req-1", "req-2"])])
     new_plan = TaskPlan(subtasks=[_sub("st-1", ["a/A.java"], ["req-2"])])  # 丢了 req-1
     n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2", "req-3"})
-    assert n == 1
+    # 3.9 R-F3 语义演进：返回【注入映射】sid→并回 req 集（A11 ② 剔除注入判等原始申报用）
+    assert n == {"st-1": {"req-1"}}
     assert set(new_plan.subtasks[0].covers) == {"req-1", "req-2"}, new_plan.subtasks[0].covers
 
 
@@ -233,7 +234,7 @@ def test_fix6_hallucinated_covers_not_merged():
     old_plan = TaskPlan(subtasks=[_sub("st-24", ["a/A.java"], ["req-1", "req-BOGUS"])])
     new_plan = TaskPlan(subtasks=[_sub("st-1", ["a/A.java"], [])])
     n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2"})
-    assert n == 1 and set(new_plan.subtasks[0].covers) == {"req-1"}, "臆造不并回"
+    assert n == {"st-1": {"req-1"}} and set(new_plan.subtasks[0].covers) == {"req-1"}, "臆造不并回"
 
 
 def test_fix6_ambiguous_scope_covers_not_merged():
@@ -245,7 +246,7 @@ def test_fix6_ambiguous_scope_covers_not_merged():
     new_plan = TaskPlan(subtasks=[
         SubTask(id="st-9", description="d", scope=FileScope(writable=["pom.xml"]), covers=[])])
     n = _merge_prior_covers_by_scope(new_plan, old_plan, {"req-1", "req-2"})
-    assert n == 0, "scope 不唯一不并"
+    assert n == {}, "scope 不唯一不并（3.9 R-F3：空注入映射）"
 
 
 # ── #12：checkpointer serde 登记 swarm.types(消未注册警告+防未来版本拒绝反序列化破坏 resume) ──

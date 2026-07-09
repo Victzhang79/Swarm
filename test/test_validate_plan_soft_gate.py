@@ -38,6 +38,20 @@ def _state():
     }
 
 
+class _StreamFake:
+    """3.7-F10 语义演进：软校验走 abortable astream——AsyncMock.ainvoke 桩不再被消费
+    （旧桩使校验异常 fail-open，测试假绿方向反转为假红）。"""
+
+    def __init__(self, content: str):
+        self._content = content
+
+    async def astream(self, messages):
+        yield type("C", (), {"content": self._content})()
+
+    async def ainvoke(self, messages):
+        return type("R", (), {"content": self._content})()
+
+
 class _Resp:
     def __init__(self, content):
         self.content = content
@@ -46,8 +60,7 @@ class _Resp:
 def test_llm_says_invalid_but_soft_gate_passes():
     """LLM 返回 valid:false 且 issue 非完整性缺陷（粒度偏大）→ 软建议放行 plan_valid=True。"""
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)  # 默认软建议
-    fake_llm = AsyncMock()
-    fake_llm.ainvoke = AsyncMock(return_value=_Resp('{"valid": false, "issues": ["粒度偏大"]}'))
+    fake_llm = _StreamFake('{"valid": false, "issues": ["粒度偏大"]}')
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(_state()))
     assert out["plan_valid"] is True, "非完整性软建议不应阻断"
@@ -59,9 +72,7 @@ def test_missing_core_subtasks_triggers_replan_first_pass():
     """issue 含"缺失核心功能子任务" + retry=0 → plan_valid=False（触发重规划补齐）。"""
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
     os.environ.pop("SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", None)
-    fake_llm = AsyncMock()
-    fake_llm.ainvoke = AsyncMock(return_value=_Resp(
-        '{"valid": false, "issues": ["缺失核心功能子任务：预警引擎（幂等收敛、免提醒）"]}'))
+    fake_llm = _StreamFake('{"valid": false, "issues": ["缺失核心功能子任务：预警引擎（幂等收敛、免提醒）"]}')
     st = dict(_state()); st["plan_retry_count"] = 0
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(st))
@@ -74,9 +85,7 @@ def test_missing_core_subtasks_proceeds_after_budget_exhausted():
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
     os.environ.pop("SWARM_VALIDATE_PLAN_COMPLETENESS_GATE", None)
     os.environ.pop("SWARM_PLAN_COMPLETENESS_RETRIES", None)  # 默认 1
-    fake_llm = AsyncMock()
-    fake_llm.ainvoke = AsyncMock(return_value=_Resp(
-        '{"valid": false, "issues": ["缺失核心功能子任务：预警引擎"]}'))
+    fake_llm = _StreamFake('{"valid": false, "issues": ["缺失核心功能子任务：预警引擎"]}')
     st = dict(_state()); st["plan_retry_count"] = 1  # 已用完完整性预算
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(st))
@@ -86,8 +95,7 @@ def test_missing_core_subtasks_proceeds_after_budget_exhausted():
 def test_llm_malformed_json_passes():
     """LLM 返回截断/畸形 JSON（流超时典型）→ 结构已过则放行。"""
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
-    fake_llm = AsyncMock()
-    fake_llm.ainvoke = AsyncMock(return_value=_Resp('{"valid": tr'))  # 截断
+    fake_llm = _StreamFake('{"valid": tr')  # 截断
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(_state()))
     assert out["plan_valid"] is True, "畸形 JSON 不应卡死规划"
@@ -97,8 +105,7 @@ def test_hard_gate_env_restores_old_behavior():
     """SWARM_VALIDATE_PLAN_LLM_GATE=true 恢复硬否决。"""
     os.environ["SWARM_VALIDATE_PLAN_LLM_GATE"] = "true"
     try:
-        fake_llm = AsyncMock()
-        fake_llm.ainvoke = AsyncMock(return_value=_Resp('{"valid": false, "issues": ["x"]}'))
+        fake_llm = _StreamFake('{"valid": false, "issues": ["x"]}')
         with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
             out = asyncio.run(validate_plan(_state()))
         assert out["plan_valid"] is False, "硬门模式下 valid=false 应否决"
@@ -108,8 +115,7 @@ def test_hard_gate_env_restores_old_behavior():
 
 def test_llm_valid_true_passes():
     os.environ.pop("SWARM_VALIDATE_PLAN_LLM_GATE", None)
-    fake_llm = AsyncMock()
-    fake_llm.ainvoke = AsyncMock(return_value=_Resp('{"valid": true, "issues": []}'))
+    fake_llm = _StreamFake('{"valid": true, "issues": []}')
     with patch("swarm.brain.nodes._get_brain_llm", return_value=fake_llm):
         out = asyncio.run(validate_plan(_state()))
     assert out["plan_valid"] is True
