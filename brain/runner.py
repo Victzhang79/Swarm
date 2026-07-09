@@ -57,7 +57,9 @@ class TaskLockLost(Exception):
 class TaskWallclockExceeded(Exception):
     """单次 Brain 执行墙钟超时（P1-B）——防失控任务无上限占沙箱/GPU。
 
-    经 run_task/resume 的 `except Exception` 归一化为 FAILED，finally 释放锁/沙箱/_task_running。
+    E5（阶段5）：与 TaskLockLost/TaskTokenLimitExceeded 同走资源护栏专用 except →
+    _salvage_partial_from_checkpoint（有产物 PARTIAL/无产物 FAILED），不再落泛
+    except 裸 FAILED 丢产物；finally 照旧释放锁/沙箱/_task_running。
     """
 
     def __init__(self, deadline_s: float, elapsed_s: float):
@@ -154,6 +156,40 @@ _task_queues: dict[str, _FanoutTopic] = {}
 
 # task_id → 是否正在执行（防止重复 resume）
 _task_running: set[str] = set()
+
+# E4（阶段5，登记册 §六）：watchdog 中止登记——独立看门狗取消消费任务后，
+# run_task/resume 的 CancelledError 处理据此区分「护栏中止」（→salvage）与
+# 「真人工取消」（→原 CANCELLED 语义）。
+_watchdog_abort: dict[str, Exception] = {}
+_watchdog_tasks: dict[str, "asyncio.Task"] = {}
+
+
+def _stop_watchdog(task_id: str) -> None:
+    """E4：停掉任务的护栏看门狗（幂等；三入口 finally 与 stream 正常尾统一调用）。"""
+    t = _watchdog_tasks.pop(task_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+
+
+async def _maybe_salvage_watchdog_abort(task_id: str, queue) -> bool:
+    """E4：CancelledError 到达时查登记——watchdog 护栏中止 → salvage 并返回 True；
+    真人工取消 → False（调用方原样 raise，语义不变）。"""
+    _wd_exc = _watchdog_abort.pop(task_id, None)
+    if _wd_exc is None:
+        return False
+    _t = asyncio.current_task()
+    if _t is not None and hasattr(_t, "uncancel"):
+        _t.uncancel()  # 3.11+：消化本次取消，后续 await（salvage 落库）不被再打断
+    _kind = ("wallclock_exceeded" if isinstance(_wd_exc, TaskWallclockExceeded)
+             else "module_lock_lost")
+    logger.warning("[RUNNER] 任务 %s 被 watchdog 护栏中止（%s），尝试抢救已完成产物",
+                   task_id, _kind)
+    await _salvage_partial_from_checkpoint(
+        task_id, queue,
+        reason_code=_kind,
+        reason_msg=f"watchdog 护栏中止（{_kind}）: {str(_wd_exc)[:200]}",
+    )
+    return True
 
 # task_id → asyncio.Task 句柄（用于 cancel）
 _task_handles: dict[str, asyncio.Task] = {}
@@ -489,6 +525,39 @@ async def _stream_brain_events(
     from swarm.models import ledger as _ledger
     _ledger.attach(task_id, budget_total=_ledger_effective_budget(_wc_cfg, _wc_subtasks))
 
+    # E4（阶段5）：独立护栏看门狗——旧行为墙钟/锁续期全挂在图事件循环顶（事件驱动），
+    # 节点内单个 await 悬挂（LLM 黑洞/沙箱死连接）= 无事件 = 零保护 + 锁静默过期。
+    # 看门狗按时钟驱动（15s 周期）：超墙钟/锁续期失败 → 登记护栏异常 + 取消消费任务，
+    # run_task 的 CancelledError 分支据登记走 salvage（与 E5 同终点）。循环内既有搭车
+    # 检查保留（belt-and-suspenders；RenewPacer 共享去重，不会双 renew）。
+    _consumer_task = asyncio.current_task()
+
+    async def _guard_watchdog() -> None:
+        try:
+            while True:
+                await asyncio.sleep(15.0)
+                _eff = _effective_deadline_s(_wc_base_s, _wc_per_subtask_s, _wc_subtasks)
+                try:
+                    _raise_if_wallclock_exceeded(_wc_start, _eff)
+                except TaskWallclockExceeded as _exc:
+                    logger.warning("[E4] watchdog：任务 %s 超弹性墙钟（事件循环可能悬挂）→ 取消执行走 salvage", task_id)
+                    _watchdog_abort[task_id] = _exc
+                    if _consumer_task is not None and not _consumer_task.done():
+                        _consumer_task.cancel()
+                    return
+                _lk = (lock_holder or {}).get("lock") or module_lock
+                if _lk is not None and _renew_pacer.due(_lk)                         and not await asyncio.to_thread(_lk.renew):
+                    logger.warning("[E4] watchdog：任务 %s 模块锁续期失败（防并发写树）→ 取消执行走 salvage", task_id)
+                    _watchdog_abort[task_id] = TaskLockLost(getattr(_lk, "key", str(_lk)))
+                    if _consumer_task is not None and not _consumer_task.done():
+                        _consumer_task.cancel()
+                    return
+        except asyncio.CancelledError:
+            return
+
+    _stop_watchdog(task_id)  # 防上次残留（resume 复用同 task_id）
+    _watchdog_tasks[task_id] = asyncio.create_task(_guard_watchdog())
+
     async for event in graph.astream_events(graph_input, config=config, version="v2"):
         # P1-B：弹性墙钟闸门——失控任务（replan 空转/卡节点）到点中止，防无上限占沙箱/GPU。
         # 有效上限按当前已知子任务数动态计算（规划揭示规模后自动放宽，不误杀大型任务）。
@@ -530,7 +599,15 @@ async def _stream_brain_events(
             if _stg:
                 _ledger.set_stage(task_id, _stg)
             if name and name not in ("LangGraph", "ChannelWrite", "increment_retry"):
-                progress = min(progress + 4, 90)
+                # E10（阶段5，登记册 §六）：进度由 completed/count 派生——旧 min(+4,90)
+                # 与完成度无关（几个节点后恒 90% 挂满全程）。规划期（plan 未知）按节点
+                # 缓慢爬坡帽 25；执行期=15+75×完成占比（单调不回退，帽 90 留给交付段）。
+                _p_total = len(_plan_subtask_ids(_accumulated_state))
+                if _p_total:
+                    _p_done = _count_completed_in_plan(_accumulated_state)
+                    progress = max(progress, min(15 + int(75 * _p_done / _p_total), 90))
+                else:
+                    progress = min(progress + 4, 25)
                 status = _NODE_STATUS_MAP.get(name)
                 if status:
                     # round27 perf：本函数是每图事件的热路径，psycopg 同步调用会卡整个事件环
@@ -649,6 +726,7 @@ async def _stream_brain_events(
                         if lock_holder is not None:
                             lock_holder["lock"] = module_lock
 
+    _stop_watchdog(task_id)  # E4：正常收尾即停（异常路径由三入口 finally 兜底）
     snapshot = await graph.aget_state(config)
     final_state = dict(snapshot.values) if snapshot and snapshot.values else {}
     return final_state, snapshot
@@ -919,7 +997,7 @@ def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     return output_parts
 
 
-async def _load_state_snapshot(task_id: str) -> dict[str, Any] | None:
+async def _load_state_snapshot(task_id: str, thread_id: str | None = None) -> dict[str, Any] | None:
     """读任务 LangGraph 实时快照的 state values（纯读，不推进图）。取不到返回 None。
 
     与 get_pending_interrupt 同构：token 超限从 dispatch/merge 等节点 end raise 时，该节点已
@@ -929,7 +1007,7 @@ async def _load_state_snapshot(task_id: str) -> dict[str, Any] | None:
 
     graph = get_compiled_brain_graph()
     task_rec = store.get_task(task_id) or {}
-    thread_id = task_rec.get("thread_id") or task_id
+    thread_id = thread_id or task_rec.get("thread_id") or task_id  # E1：可指定历史 thread
     _plan_rec = task_rec.get("plan")
     _subtask_n = None
     if isinstance(_plan_rec, dict):
@@ -1179,6 +1257,35 @@ async def run_task(
             client="api",
         )
 
+        # E1（阶段5，登记册 §六）：retry 播种——旧行为 retry 换 thread 从零重跑，已
+        # L1 通过的真产物整批作废（checkpoint 只服务人工闸 resume）。这里读【上一执行
+        # 段】checkpoint，把 plan+L1 通过产物+覆盖水位 seed 进 initial_state：plan 节点
+        # 的 replan 保留机制（签名一致/A11 scope 认领）自然免重做已付工作，覆盖单调
+        # 合同跨 retry 延续。播种失败=纯增益降级（从零重跑=旧行为）；指针一次性消费。
+        _prev_thread = str(task_rec.get("retry_prev_thread_id") or "").strip()
+        if _prev_thread:
+            try:
+                from swarm.brain.nodes.shared import l1_passed as _e1_l1p
+                _prev_state = await _load_state_snapshot(task_id, thread_id=_prev_thread)
+                _prev_results = (_prev_state or {}).get("subtask_results") or {}
+                _kept = {sid: out for sid, out in _prev_results.items() if _e1_l1p(out)}
+                _wm = (_prev_state or {}).get("coverage_watermark")
+                if _kept and (_prev_state or {}).get("plan") is not None:
+                    initial_state["plan"] = _prev_state["plan"]
+                    initial_state["subtask_results"] = _kept
+                    if _wm:
+                        initial_state["coverage_watermark"] = list(_wm)
+                    logger.info(
+                        "[E1] retry 播种：携带上一执行段 %d 个已 L1 通过产物 + 覆盖水位 %d 条"
+                        "（新计划经签名/scope 认领免重做）", len(_kept), len(_wm or []))
+            except Exception as exc:  # noqa: BLE001 — 播种是增益，失败降级从零重跑
+                logger.warning("[E1] retry 播种失败（降级从零重跑，行为=旧版）: %s", exc)
+            finally:
+                try:
+                    store.update_task(task_id, retry_prev_thread_id="")
+                except Exception:  # noqa: BLE001
+                    pass
+
         thread_id = task_rec.get("thread_id") or task_id
         store.update_task(task_id, status="ANALYZING", thread_id=thread_id)
         audit(
@@ -1201,15 +1308,20 @@ async def run_task(
             status=_final_rec.get("status") if _final_rec else "UNKNOWN",
         )
     except asyncio.CancelledError:
-        logger.info("[RUNNER] 任务 %s 已取消", task_id)
-        store.update_task(task_id, status="CANCELLED")
-        audit("task_cancelled", orchestrator="Brain", task_id=task_id, project_id=project_id)
-        await _emit(queue, {
-            "step": "cancelled",
-            "status": "cancelled",
-            "message": "任务已取消",
-            "progress": -1,
-        })
+        # E4：watchdog 护栏中止也表现为 CancelledError——先查登记，护栏中止走
+        # salvage→PARTIAL（与 E5/TokenLimit 同终点）；真人工取消照旧 CANCELLED。
+        if await _maybe_salvage_watchdog_abort(task_id, queue):
+            pass
+        else:
+            logger.info("[RUNNER] 任务 %s 已取消", task_id)
+            store.update_task(task_id, status="CANCELLED")
+            audit("task_cancelled", orchestrator="Brain", task_id=task_id, project_id=project_id)
+            await _emit(queue, {
+                "step": "cancelled",
+                "status": "cancelled",
+                "message": "任务已取消",
+                "progress": -1,
+            })
     except TaskTokenLimitExceeded as _tok_exc:
         # T-B：撞【云端 token 预算】护栏 ≠ 交付失败 → 抢救已完成子任务为 PARTIAL，不整单丢产物。
         # §九 阶段1.4：ledger 阶段闸带 stage 归因（阶段烧穿=该阶段 escalate，消息如实报阶段）。
@@ -1225,6 +1337,21 @@ async def run_task(
                            f"({_tok_exc.usage.get('stage_spent')}/{_tok_exc.usage.get('stage_limit')})"
                            if _tok_stage else "")),
         )
+    except (TaskWallclockExceeded, TaskLockLost) as _guard_exc:
+        # E5（阶段5，登记册 §六）：墙钟/失锁与 TokenLimit 同属【资源护栏中止】——任务
+        # 不是"交付失败"而是"被护栏叫停"，已完成子任务是真产物。此前只有 TokenLimit
+        # 走 salvage，其余落泛 except 裸 FAILED 整单丢产物（round37 91min 规划烧穿若
+        # 叠加墙钟=全丢）。统一 salvage→PARTIAL；checkpoint 取不到时 salvage 内部退回
+        # FAILED（不比旧路径差，绝不静默 DONE）。
+        _kind = ("wallclock_exceeded" if isinstance(_guard_exc, TaskWallclockExceeded)
+                 else "module_lock_lost")
+        logger.warning("[RUNNER] 任务 %s 撞资源护栏（%s），尝试抢救已完成产物: %s",
+                       task_id, _kind, _guard_exc)
+        await _salvage_partial_from_checkpoint(
+            task_id, queue,
+            reason_code=_kind,
+            reason_msg=f"资源护栏中止（{_kind}）: {str(_guard_exc)[:200]}",
+        )
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
         store.update_task(task_id, status="FAILED")
@@ -1237,6 +1364,8 @@ async def run_task(
             "progress": -1,
         })
     finally:
+        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
+        _watchdog_abort.pop(task_id, None)
         lock_holder["lock"].release()
         _task_running.discard(task_id)
         # B2：清理 per-task token 归属与真实累计（覆盖正常/超限/异常所有退出路径）。
@@ -1352,6 +1481,9 @@ async def resume_task(
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
+        # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
+        if await _maybe_salvage_watchdog_abort(task_id, queue):
+            return
         # F3：取消是 BaseException，不被 except Exception 捕获——须显式落 CANCELLED，
         # 否则 resume 途中被 cancel_task 取消会把任务卡在 ANALYZING/IN_REVISION（认领已推进的态）
         # 直到重启对账才转终态；与 run_task 的取消处理对齐。
@@ -1381,6 +1513,8 @@ async def resume_task(
             "progress": -1,
         })
     finally:
+        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
+        _watchdog_abort.pop(task_id, None)
         lock_holder["lock"].release()
         _task_running.discard(task_id)
         # 复核 CR-1：resume 也经 _stream_brain_events→set_current_task，必须同样清理 per-task
@@ -1474,6 +1608,9 @@ async def resume_planning(
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
+        # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
+        if await _maybe_salvage_watchdog_abort(task_id, queue):
+            return
         # F3：取消是 BaseException，须显式落 CANCELLED，否则规划 resume 途中被取消会卡在
         # ANALYZING 直到重启对账；与 run_task/resume_task 对齐。
         logger.info("[RUNNER] 任务 %s 规划 resume 已取消", task_id)
@@ -1498,6 +1635,8 @@ async def resume_planning(
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:
+        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
+        _watchdog_abort.pop(task_id, None)
         lock_holder["lock"].release()
         _task_running.discard(task_id)
         # 复核 CR-1：规划 resume 同样 set_current_task，需清理 per-task token 归属+累计。
@@ -1552,7 +1691,7 @@ def is_task_orphaned(task_id: str) -> bool:
     return status in _ACTIVE_DB_STATUSES and task_id not in _task_running
 
 
-async def reconcile_orphan_tasks() -> dict[str, int]:
+async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
     """P0-A 启动对账：把全库"进行中"任务按态类别分治恢复/失败（统一崩溃恢复协议）。
 
     核心洞察：PG checkpoint 只存图状态、不存外部副作用态（沙箱/工作树/锁）。故不能一刀切
@@ -1614,6 +1753,12 @@ async def reconcile_orphan_tasks() -> dict[str, int]:
                                tid, status)
 
         elif status == "SUBMITTED":
+            # E7（阶段5）：周期模式跳过 SUBMITTED 重入队——队列/调度器本就持有它们，
+            # TaskQueue.enqueue 无去重，周期重入队=队列膨胀。启动模式照旧（Redis 可能
+            # 被清空，重入队是丢失信号的唯一恢复通道）。
+            if periodic:
+                stats["skipped_running"] += 1
+                continue
             try:
                 from swarm.brain.scheduler import submit_task
 
@@ -1651,8 +1796,65 @@ async def reconcile_orphan_tasks() -> dict[str, int]:
         # ★复核 M-1★：持久探测失败不能静默——汇总 loud 告警，ops 据此排查 checkpointer 健康。
         logger.warning("[RECONCILE] ⚠️ %d 个中断态任务因 checkpoint 探测失败被【保留未核验】，"
                        "checkpointer 可能不健康，请人工排查并按需处置", stats["probe_failed"])
-    logger.info("[RECONCILE] 启动对账完成: %s", stats)
+    logger.info("[RECONCILE] %s对账完成: %s", "周期" if periodic else "启动", stats)
     return stats
+
+
+# E13（阶段5，登记册 §六）：挂起态 TTL 提醒去重表 {task_id: monotonic 上次提醒时刻}
+_ttl_notified: dict[str, float] = {}
+
+
+async def check_suspended_ttl() -> int:
+    """E13：中断挂起态（CONFIRMING/DELIVERING/CLARIFYING/DESIGN_REVIEW）超 TTL →
+    升级通知（应用内 notification + loud 日志）。
+
+    不强杀：人工闸挂起是【合法等待人工】，TTL 强 FAIL 会丢真工作——登记册拍板口径
+    是"可配 TTL+升级通知"。默认 24h 提醒、每 TTL 周期至多重提醒一次；
+    SWARM_INTERRUPT_TTL_NOTIFY_H<=0 关闭。返回本轮提醒条数。"""
+    try:
+        ttl_h = float(os.environ.get("SWARM_INTERRUPT_TTL_NOTIFY_H", "24") or "24")
+    except ValueError:
+        ttl_h = 24.0
+    if ttl_h <= 0:
+        return 0
+    ttl_s = ttl_h * 3600.0
+    loop = asyncio.get_running_loop()
+    try:
+        candidates = await loop.run_in_executor(None, store.list_orphan_candidates)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[E13] 读挂起态候选失败，本轮跳过: %s", exc)
+        return 0
+    import datetime as _dt
+    now_dt = _dt.datetime.now(_dt.timezone.utc)
+    now_mono = time.monotonic()
+    notified = 0
+    for rec in candidates:
+        tid = rec.get("id")
+        if not tid or rec.get("status") not in _INTERRUPT_SUSPENDED_STATES:
+            continue
+        upd = rec.get("updated_at")
+        if upd is None:
+            continue
+        if getattr(upd, "tzinfo", None) is None:
+            upd = upd.replace(tzinfo=_dt.timezone.utc)
+        age_s = (now_dt - upd).total_seconds()
+        if age_s < ttl_s:
+            _ttl_notified.pop(tid, None)  # 状态有推进（updated_at 刷新）→ 重置提醒
+            continue
+        _last = _ttl_notified.get(tid)
+        if _last is not None and (now_mono - _last) < ttl_s:
+            continue  # 每 TTL 周期至多提醒一次
+        _ttl_notified[tid] = now_mono
+        notified += 1
+        logger.warning(
+            "[E13] ⚠️ 任务 %s 挂起在 %s 已 %.1fh（超 TTL %.0fh）——等待人工处置："
+            "审批/拒绝或 retry；漏配 auto_accept 会无限等待",
+            tid, rec.get("status"), age_s / 3600.0, ttl_h)
+        try:
+            _emit_task_notification(tid, rec, str(rec.get("status")))
+        except Exception:  # noqa: BLE001
+            pass
+    return notified
 
 
 def _audit_reconcile(task_id: str, rec: dict[str, Any], event: str, status: str, detail: str) -> None:
@@ -1805,6 +2007,10 @@ async def retry_task(task_id: str, auto_accept: bool | None = None) -> bool:
     store.update_task(
         task_id,
         status="SUBMITTED",
+        # E2：retry 是唯一合法的【终态→活跃态】穿越（PARTIAL/DONE/FAILED → SUBMITTED），
+        # 显式声明绕过 CAS 终态守卫；其余一切改状态写默认被守卫拒绝（晚到写复活终态）。
+        allow_terminal_transition=True,
+        retry_prev_thread_id=(task.get("thread_id") or task_id),  # E1：留给 run_task 播种
         plan={},
         merged_diff="",
         subtask_count=0,

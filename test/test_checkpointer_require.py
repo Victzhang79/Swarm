@@ -21,7 +21,19 @@ class _BoomSaver:
         raise RuntimeError("simulated PG down")
 
 
+class _BoomPool:
+    check_connection = staticmethod(lambda conn: None)  # 构造参数求值先取此属性
+
+    def __init__(self, *a, **k):
+        raise RuntimeError("simulated PG down")
+
+
 def _force_init_failure(monkeypatch, *, env_var, is_prod):
+    # 语义演进（阶段5 E6）：init 主路径改 AsyncConnectionPool（运行期自愈），
+    # from_conn_string 只剩 psycopg_pool 缺席的回退——注入点跟随主路径，双双拍死
+    # 防任一分支打到真 PG。
+    import psycopg_pool
+    monkeypatch.setattr(psycopg_pool, "AsyncConnectionPool", _BoomPool)
     monkeypatch.setattr(graph, "AsyncPostgresSaver", _BoomSaver)
     graph._pg_checkpointer = None
     graph._pg_checkpointer_cm = None

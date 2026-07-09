@@ -235,16 +235,30 @@ def _project_ready_for_exec(project_id: str) -> bool:
 
     读项目失败时保守放行（避免因 DB 抖动卡死所有任务；执行端 executor 仍会兜底选模板）。
     """
+    return _project_exec_admission(project_id) != "wait"
+
+
+def _project_exec_admission(project_id: str) -> str:
+    """E12（阶段5，登记册 §六）：三态准入——"ready"放行 / "wait"留池 / "error" fail-fast。
+
+    旧口径 ERROR 项目与 BUILDING 同判"留池"，200 次×3s 重试后【强制放行】——预处理
+    已明确失败的项目根本没有可用沙箱/索引，放行=注定失败的执行白烧 10 分钟等待+一整轮
+    worker。ERROR → 直接 fail-fast（调用侧标任务 FAILED，可 retry 等项目修复后重跑）。
+    读项目失败/记录缺失保守 "ready"（原语义：DB 抖动不卡死队列，executor 兜底）。"""
     try:
         from swarm.project.store import get_project
         proj = get_project(project_id)
         if not proj:
-            return True  # 项目记录缺失，保守放行交由 runner 处理
+            return "ready"  # 项目记录缺失，保守放行交由 runner 处理
         status = (proj.get("status") or "").upper()
-        return status == "READY"
+        if status == "READY":
+            return "ready"
+        if status == "ERROR":
+            return "error"
+        return "wait"
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Scheduler] 准入检查读项目失败，保守放行 %s: %s", project_id, exc)
-        return True
+        return "ready"
 
 
 async def start_task_scheduler() -> None:
@@ -289,7 +303,8 @@ async def start_task_scheduler() -> None:
                             continue
                         # P0-A：进程内 meta 缺失（leader 重启，Redis 队列存活但 _pending_meta 清零）
                         # → 从 DB 重建（不再静默丢）；返回 None 表示陈旧项（无记录/已终态）应丢弃。
-                        meta = _resolve_exec_meta(task_id)
+                        # E8（阶段5）：同步 PG 查询卸线程——DB 慢时不再冻结整个事件循环
+                        meta = await asyncio.to_thread(_resolve_exec_meta, task_id)
                         if meta is None:
                             logger.info("[Scheduler] 任务 %s 无有效记录或已终态，丢弃陈旧队列项", task_id)
                             continue
@@ -309,7 +324,25 @@ async def start_task_scheduler() -> None:
                         _deferred_cycle.discard(task_id)
                         # ── 准入闸门：项目专属沙箱未就绪 → 任务留池等待，不启动执行 ──
                         # （docs/DESIGN_project_sandbox_prebake_source.md §5.1：构建期间任务仅入池）
-                        if not _project_ready_for_exec(meta["project_id"]):
+                        _adm = await asyncio.to_thread(
+                            _project_exec_admission, meta["project_id"])  # E8：卸线程
+                        if _adm == "error":
+                            # E12：项目预处理已 ERROR——留池/强制放行都是白烧，fail-fast
+                            logger.warning(
+                                "[Scheduler] 任务 %s 所属项目 %s 处于 ERROR（预处理失败）→ "
+                                "任务 fail-fast 标 FAILED（修复项目后可 retry）",
+                                task_id, meta["project_id"])
+                            try:
+                                from swarm.project import store as _store
+                                await asyncio.to_thread(
+                                    _store.update_task, task_id, status="FAILED")
+                            except Exception as _exc:  # noqa: BLE001
+                                logger.warning("[Scheduler] ERROR 项目任务标 FAILED 失败: %s", _exc)
+                            _admission_retries.pop(task_id, None)
+                            _admission_next_retry.pop(task_id, None)
+                            _pending_meta.pop(task_id, None)
+                            continue
+                        if _adm != "ready":
                             n = _admission_retries.get(task_id, 0) + 1
                             _admission_retries[task_id] = n
                             if n <= _MAX_ADMISSION_RETRIES:

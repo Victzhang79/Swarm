@@ -724,12 +724,32 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
     apply_result: dict[str, Any] | None = None
 
     if should_apply and merged_diff.strip() and project and project.get("path"):
+        from swarm.infra.redis_client import ModuleLock
         from swarm.project.diff_apply import apply_git_diff
 
-        apply_result = await loop.run_in_executor(
-            None,
-            lambda: apply_git_diff(project["path"], merged_diff, check_only=False),
-        )
+        # E9（阶段5，登记册 §六）：apply 直写项目工作树此前【不持模块锁】——同项目另一
+        # 任务的 runner 正持锁写树（merge/L2 reset），两写并发=树污染。与 runner 同一
+        # 把锁（project:default）；拿不到=有任务在写，回滚认领并 409（稍后重试，幂等）。
+        _apply_lock = ModuleLock(task["project_id"], "default")
+        _got_lock = await loop.run_in_executor(None, _apply_lock.acquire)
+        if not _got_lock:
+            try:
+                await loop.run_in_executor(
+                    None, lambda: _app.store.update_task(task_id, status=orig_status),
+                )
+            except Exception:  # noqa: BLE001
+                _app.logger.warning("approve 锁竞争回滚认领状态失败 task=%s", task_id, exc_info=True)
+            raise HTTPException(
+                status_code=409,
+                detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试审批",
+            )
+        try:
+            apply_result = await loop.run_in_executor(
+                None,
+                lambda: apply_git_diff(project["path"], merged_diff, check_only=False),
+            )
+        finally:
+            await loop.run_in_executor(None, _apply_lock.release)
         if apply_result and not apply_result.get("ok"):
             # D17 治本：apply 失败【无论显式/隐式】一律阻断 accept 推进。旧逻辑只在
             # apply_diff_flag 为真时 422，隐式 apply（非 sandbox_first）失败被吞——

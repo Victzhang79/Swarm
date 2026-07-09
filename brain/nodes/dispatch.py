@@ -412,8 +412,30 @@ async def dispatch(state: BrainState) -> dict:
 
     # 复核 H1b（阶段1）：任务级异常逃逸时取消兄弟 worker（裸 gather 不取消，兄弟继续烧钱
     # 且结算落在 detach 后形成幽灵账目）。
-    outcomes = await gather_cancel_on_error(
-        [_run_one(st, i) for i, st in enumerate(to_dispatch)])
+    # E4+E10（阶段5）：as_completed 去屏障——先完成者立即回写 completed_subtasks
+    # （批内进度不再冻结到最慢者）；异常时取消未完成兄弟并原样上抛（保 H1b 语义）。
+    # 结果的语义处理（failed 记账/知识回灌）仍在收齐后统一做（顺序无关，不改行为）。
+    _base_done = len(completed_l1_ids(subtask_results))
+    _futs = [asyncio.ensure_future(_run_one(st, i)) for i, st in enumerate(to_dispatch)]
+    outcomes = []
+    try:
+        for _fut in asyncio.as_completed(_futs):
+            _st, _oc = await _fut
+            outcomes.append((_st, _oc))
+            if task_id and isinstance(_oc, WorkerOutput) and _oc.l1_passed:
+                _base_done += 1
+                try:
+                    from swarm.project import store as _store
+                    await asyncio.to_thread(
+                        _store.update_task, task_id, completed_subtasks=_base_done)
+                except Exception:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
+                    pass
+    except BaseException:
+        for _t in _futs:
+            if not _t.done():
+                _t.cancel()
+        await asyncio.gather(*_futs, return_exceptions=True)
+        raise
 
     def _worker_batch_context() -> dict:
         lines: list[str] = []
@@ -479,6 +501,8 @@ async def dispatch(state: BrainState) -> dict:
             # 事实库回灌（补滞后断裂）：子任务 L1 通过 + 有改动 → 把变更文件喂 knowledge updater
             # 增量索引，让后续子任务/任务的事实核验能看到最新产出（worker 不 git push，否则知识库永远不知）。
             _feedback_to_knowledge(state.get("project_id", ""), subtask, worker_output)
+            # E10（阶段5）：completed_subtasks 即时回写已上移到 as_completed 循环
+            # （单个完成即回写，不等最慢兄弟），此处不再重复。
 
     result: dict = {
         "subtask_results": subtask_results,

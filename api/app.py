@@ -1131,6 +1131,7 @@ async def _run_schedulers_with_leadership() -> None:
         await _start_kb_prune_scheduler()  # P2-C：每日 KB 日志/共现清理
         await _start_consistency_scheduler()
         await _start_task_scheduler()
+        await _start_periodic_reconcile()  # E7+E13（阶段5）：leader 专属周期对账+挂起 TTL
         if get_coordination_backend() is None:
             # 单进程降级：无协调后端 → 本进程恒为 leader，无失主可言（原行为不变）
             return
@@ -1155,6 +1156,40 @@ async def _run_schedulers_with_leadership() -> None:
             await lead.release()  # 幂等：清本地态（锁本身已随会话释放）
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _start_periodic_reconcile() -> None:
+    """E7+E13（阶段5，登记册 §六）：周期孤儿对账 + 挂起态 TTL 升级通知。
+
+    旧行为对账只在 lifespan startup 跑一次——运行期出现的孤儿（FAILED 落库失败即
+    永久"进行中"、进程内执行态与 DB 漂移）无人再看。leader 专属（随 leadership 停启，
+    进 _sched_tasks 差集在失主时被 cancel）；periodic=True 跳过 SUBMITTED 重入队
+    （防队列膨胀），活跃孤儿判定沿用 is_task_claimed（本进程在跑的绝不误杀）。
+    SWARM_RECONCILE_INTERVAL_S<=0 关闭（默认 600s）。"""
+    import os as _os
+    try:
+        interval = float(_os.environ.get("SWARM_RECONCILE_INTERVAL_S", "600") or "600")
+    except ValueError:
+        interval = 600.0
+    if interval <= 0:
+        logger.info("[E7] 周期对账关闭（SWARM_RECONCILE_INTERVAL_S<=0）")
+        return
+
+    async def _loop() -> None:
+        from swarm.brain.runner import check_suspended_ttl, reconcile_orphan_tasks
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await reconcile_orphan_tasks(periodic=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[E7] 周期对账异常（下轮再试）: %s", exc)
+            try:
+                await check_suspended_ttl()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[E13] 挂起态 TTL 检查异常（下轮再试）: %s", exc)
+
+    _spawn_bg(_loop())
+    logger.info("[E7] 周期对账已启动（每 %.0fs，含 E13 挂起态 TTL 提醒）", interval)
 
 
 async def _start_memory_decay_scheduler() -> None:

@@ -145,6 +145,9 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS planning_artifacts JSONB DEFAULT '{}'",
     # B 部分：多模态摄取 —— 上传文件路径 + 「模型自行确认」选项 + 需求池模式
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS uploaded_files JSONB DEFAULT '[]'",
+    # E1（阶段5，登记册 §六）：retry 保留已 L1 通过产物——记录上一执行段的 thread_id，
+    # run_task 一次性消费（读旧 checkpoint 播种 plan/subtask_results，A11/签名认领免重做）。
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS retry_prev_thread_id TEXT",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS auto_confirm_vision BOOLEAN DEFAULT FALSE",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS pooled BOOLEAN DEFAULT FALSE",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
@@ -162,7 +165,7 @@ _TASK_SELECT = """
     uploaded_files, auto_confirm_vision, pooled, ingest_draft,
     abandoned_subtasks,
     auto_accept, queue_priority,
-    base_commit
+    base_commit, retry_prev_thread_id
 """
 
 
@@ -874,6 +877,7 @@ def update_task(
     task_id: str,
     *,
     status: str | None = None,
+    allow_terminal_transition: bool = False,
     complexity: str | None = None,
     plan: dict[str, Any] | None = None,
     subtask_count: int | None = None,
@@ -889,6 +893,7 @@ def update_task(
     auto_accept: bool | None = None,
     queue_priority: str | None = None,
     base_commit: str | None = None,
+    retry_prev_thread_id: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新任务字段"""
@@ -945,6 +950,10 @@ def update_task(
         # 重捕获新基线；若改成 `if base_commit:` 会跳过空串写入 → retry 静默沿用旧 birth base。勿"优化"。
         sets.append("base_commit = %s")
         params.append(base_commit)
+    if retry_prev_thread_id is not None:
+        # E1：同 base_commit 哨兵语义——"" 用于一次性消费后清空。
+        sets.append("retry_prev_thread_id = %s")
+        params.append(retry_prev_thread_id)
 
     if not sets:
         return get_task(task_id, conn_str)
@@ -952,12 +961,23 @@ def update_task(
     sets.append("updated_at = NOW()")
     params.append(task_id)
 
+    # E2（阶段5，登记册 §六）：状态列 CAS 终态守卫——线程池晚到写（进度回写/节点态推进）
+    # 可把 CANCELLED/FAILED 复活成活跃态 → 永久孤儿（无 runner 在跑却显示进行中）。
+    # 改状态时默认拒绝改写已终态的行（0 行更新=晚到写被丢弃，返回 None）；合法的
+    # 终态→非终态穿越（retry 把 PARTIAL/DONE 置回 SUBMITTED）显式传
+    # allow_terminal_transition=True。不改状态的字段级更新不受限（终态后回填
+    # token_usage/duration 合法）。
+    _where = "WHERE id = %s"
+    if status is not None and not allow_terminal_transition:
+        _where += " AND NOT (status = ANY(%s))"
+        params.append(list(_TERMINAL_STATUSES))
+
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 UPDATE task_records SET {', '.join(sets)}
-                WHERE id = %s
+                {_where}
                 RETURNING {_TASK_SELECT}
                 """,
                 params,
@@ -2029,6 +2049,8 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         "queue_priority": (row[24] or "normal") if len(row) > 24 else "normal",
         # 3rd#2：任务级钉扎 base commit（run_task 启动时捕获；resume 读回不重捕获）。
         "base_commit": (row[25] or None) if len(row) > 25 else None,
+        # E1：retry 播种指针（一次性消费；空串/缺列=无播种）
+        "retry_prev_thread_id": (row[26] or "") if len(row) > 26 else "",
     }
 
 

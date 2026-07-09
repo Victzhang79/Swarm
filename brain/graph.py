@@ -777,8 +777,25 @@ async def init_postgres_checkpointer(postgres_uri: str | None = None) -> bool:
     try:
         config = get_config()
         uri = postgres_uri or config.db.postgres_uri
-        cm = AsyncPostgresSaver.from_conn_string(uri)
-        checkpointer = await cm.__aenter__()
+        # E6（阶段5，登记册 §六）：from_conn_string=单连接（生命周期=app）——PG 闪断后
+        # 该连接死透，所有任务的 checkpoint 读写连环失败直到重启。改 AsyncConnectionPool
+        # （check=可用性探活+自动重建坏连接，min 1/max 4），运行期自愈；psycopg_pool
+        # 不可用时回退旧单连接（行为=旧版，不新增依赖硬要求）。
+        cm = None
+        try:
+            from psycopg_pool import AsyncConnectionPool
+            _pool = AsyncConnectionPool(
+                uri, min_size=1, max_size=4, open=False,
+                kwargs={"autocommit": True, "prepare_threshold": 0},
+                check=AsyncConnectionPool.check_connection,
+            )
+            await _pool.open(wait=True, timeout=30)
+            checkpointer = AsyncPostgresSaver(_pool)
+            cm = _pool  # close 侧统一处理（pool.close() / cm.__aexit__ 二选一）
+            logger.info("[E6] PG checkpointer 使用连接池（min=1,max=4,check=探活自愈）")
+        except ImportError:
+            cm = AsyncPostgresSaver.from_conn_string(uri)
+            checkpointer = await cm.__aenter__()
         await checkpointer.setup()  # 幂等创建 checkpoint 表
         _pg_checkpointer_cm = cm
         _pg_checkpointer = checkpointer
@@ -830,7 +847,13 @@ async def close_postgres_checkpointer() -> None:
     _compiled_brain_graph = None
     if cm is not None:
         try:
-            await cm.__aexit__(None, None, None)
+            # E6：pool 形态（AsyncConnectionPool）用 close()；单连接形态用 cm.__aexit__
+            if hasattr(cm, "close") and not hasattr(cm, "__aexit__"):
+                await cm.close()
+            elif hasattr(cm, "close") and cm.__class__.__name__ == "AsyncConnectionPool":
+                await cm.close()
+            else:
+                await cm.__aexit__(None, None, None)
             logger.info("[A1] PG checkpointer 连接已关闭")
         except Exception as exc:  # noqa: BLE001
             logger.warning("[A1] 关闭 PG checkpointer 失败: %s", exc)
