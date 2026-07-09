@@ -139,6 +139,10 @@ _FLIPPABLE_SOURCES = frozenset({
     # 循环内「验证没跑成」(BLOCKED)是无确定性证据的非 sticky fail——Phase-4 pull-back 后
     # 若确定性闸门真跑通，应允许翻盘为通过（与 llm_self_report 同类）。
     "verification_not_run",
+    # C5（阶段4）：verify 步拒答/截断是验证通道 artifact（provider 截断/沙箱限制），非对
+    # 编码产出的否证——Phase-4 确定性+LLM 双证据到位时可翻盘（旧 sticky=True 让一次
+    # provider 截断永久判死好产出）。
+    "refusal_hard_fail",
 })
 
 
@@ -244,8 +248,14 @@ def evaluate_l1(
         details["l1_decision_source"] = "refusal_hard_fail"
         return L1Verdict(
             passed=False, source="refusal_hard_fail",
-            reason="agent 回复为拒答/截断/不可用（产出不可信，覆盖确定性闸门）",
-            sticky=True, details=details,
+            reason="verify 步拒答/截断且无确定性通过证据——当前判失败；"
+                   "拒答发生在验证通道（编码产出经 det 闸门另行裁决），后续确定性证据可翻盘",
+            # C5（阶段4，登记册 §四）：sticky True→False。verify_result 只来自 verify agent
+            # 步——拒答/截断是【验证通道】artifact（provider 截断/沙箱限制），不是对编码产出
+            # 的否证（编码没产出会被 det 闸门 empty_diff 抓）。旧 sticky=True 让 provider
+            # 一次截断永久判死好产出（Phase-4 pull-back 后 det 证据也无法接管）。
+            # source 名保留：brain FINDING-12 据它强制强模型重试（处方合理，不动路由）。
+            sticky=False, details=details,
         )
 
     # ② det_ok is False → 确定性失败

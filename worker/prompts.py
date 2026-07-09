@@ -66,9 +66,10 @@ SYSTEM_PROMPT_TEMPLATE = """\
 3. 保持代码风格一致
 
 ### Phase 3: L1 验证（目标 10-120s）
-1. 运行编译（run_compile）确认无语法错误
-2. 运行测试（run_tests）确认功能正确
-3. 如验证失败，分析原因并修复（最多 {max_fix_rounds} 轮）
+1. 验证由【系统确定性 L1 闸门】统一负责（真实 compile/lint/test，不靠自报）——
+   编码阶段（Phase 2）禁止运行重型构建/测试，把验证留给本阶段与系统闸门
+2. 仅当系统要求你自行验证时才运行 run_compile/run_tests
+3. 如验证失败，按错误信息分析原因并修复（最多 {max_fix_rounds} 轮）
 
 ### Phase 4: 产出
 1. 使用 git_diff 查看你的变更
@@ -334,8 +335,12 @@ def _format_harness_section(harness) -> str:
             lines.append(f"- 验收: `{vc}`")
     if not lines:
         return "（无特定 harness，请用 run_compile/run_tests 做基本验证）"
+    # C6（阶段4，登记册 §四）：旧文案「完成编码后必须实际运行上述命令」与编码阶段
+    # prompt「禁止运行重型构建」（executor_prompts）双 bind 自相矛盾——小模型无所适从。
+    # 统一口径：验证归系统确定性 L1 闸门；命令列表仅供理解验收面与失败时定位。
     lines.append(
-        "完成编码后**必须实际运行上述命令**确认通过，不要仅凭阅读代码就声称验证通过。"
+        "以上命令由系统确定性 L1 闸门统一执行并裁决——你无需（也不要）在编码阶段抢跑"
+        "重型构建；绝不要仅凭阅读代码就声称验证通过。"
     )
     return "\n".join(lines)
 

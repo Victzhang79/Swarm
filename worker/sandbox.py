@@ -988,6 +988,21 @@ class SandboxManager:
                                      stdout=stdout, stderr=stderr, code=command, error=cr.error)
                 self._record_sandbox_success(sid)  # envd 通了（命令真跑了），清零基础设施失败计数
                 return cr
+            # C3（阶段4，登记册 §四）：SDK 超时 ≠ 沙箱坏——envd 通着、命令真跑了只是
+            # 超过 timeout。塌进 infra 路径会①计入 5 次熔断误弃好沙箱②上层拿不到超时
+            # 语义，错误处方随机落 capability/transient。合成本地 subprocess 同款
+            # exit_code=124（_run_l1_command 的解析器现成认识），不计 infra 失败。
+            _exc_name = type(exc).__name__.lower()
+            if "timeout" in _exc_name or "timed out" in str(exc).lower():
+                logger.warning(
+                    "Sandbox run_command 超时(%ss) → 合成 exit_code=124（不计 infra 失败）: %s",
+                    timeout, command[:120])
+                self.append_activity(
+                    sid, "exec", f"run_command 超时({timeout}s)→exit_code=124 — {command[:120]}",
+                    stdout=stdout, stderr=stderr, code=command, error="exit_code=124")
+                self._record_sandbox_success(sid)  # 命令真跑了=envd 健康，清零失败计数
+                return CodeResult(stdout=stdout, stderr=stderr,
+                                  error="exit_code=124", success=False)
             err = f"{type(exc).__name__}: {exc}"
             logger.warning("Sandbox run_command failed for %s: %s", sid, str(exc)[:200])
             self.append_activity(sid, "exec", f"run_command 失败 — {err}", code=command, error=err)

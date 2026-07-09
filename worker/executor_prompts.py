@@ -247,12 +247,30 @@ class _PromptBuildingMixin:
         # 路径1 治本：编译报 cannot find symbol 时，附 codegraph 解析的真实 FQN，
         # 让 worker 照真实位置改 import，而非再猜包名（RUN20 主导缺陷类）。
         grounding = f"\n\n{symbol_hint}" if symbol_hint else ""
+        # C7（阶段4，登记册 §四）：fix 轮带修改记忆——每轮 _run_agent 是全新单条 human
+        # 消息（无对话累积），模型看不到自己已改过什么 → 重复勘察烧步数/把同一 typo
+        # 反复写回（996db614 实证）。确定性拼进已改文件清单+关键新增行（数据源=当前
+        # git diff，含确定性修复触达的 scope 外文件）；失败绝不拖垮 fix 轮（空块降级）。
+        changed_block = ""
+        try:
+            _diff = self._get_git_diff()
+            from swarm.project.diff_apply import files_from_unified_diff
+            _files = files_from_unified_diff(_diff or "")
+            if _files:
+                from swarm.memory.pattern_extractor import extract_key_lines
+                _key = extract_key_lines(_diff or "", max_lines=15)
+                changed_block = (
+                    "\n\n【你在本子任务已修改的文件（勿重复勘察，改动已生效）】\n- "
+                    + "\n- ".join(_files[:20])
+                    + (f"\n最近关键新增行（节选）：\n{_key}" if _key else ""))
+        except Exception:  # noqa: BLE001 — 记忆块是增益，绝不阻断修复
+            changed_block = ""
         return (
-            f"L1 验证未通过，确定性失败证据：\n{evidence}{grounding}\n\n"
+            f"L1 验证未通过，确定性失败证据：\n{evidence}{grounding}{changed_block}\n\n"
             "请分析失败原因并修复代码：\n"
             "1. 仔细阅读上面的错误信息（这是真实的编译/lint/scope 检查结果）\n"
             "2. 定位问题根因（若有【符号接地提示】，照其给出的真实 FQN 修正引用，勿臆造包名）\n"
-            "3. 使用 patch_file 修复\n"
+            "3. 使用 patch_file 修复（已修改文件清单里的改动无需重做）\n"
             "完成后请再次运行验证。"
         )
 

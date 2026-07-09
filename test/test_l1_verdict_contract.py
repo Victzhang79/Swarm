@@ -46,15 +46,20 @@ def test_chinese_refusal_with_det_true_is_self_review():
 
 # ── 规则 1b：refusal + det 非 True → refusal_hard_fail（永不翻盘）──
 def test_refusal_with_det_none_is_hard_fail():
+    # 语义演进（阶段4 C5）：sticky True→False——verify 步拒答是验证通道 artifact
+    # （provider 截断/沙箱限制），Phase-4 确定性证据到位可翻盘；判败与 FINDING-12
+    # 强模型路由（source 名）不变。
     v = evaluate_l1(det_ok=None, det_details={}, verify_result="Sorry, need more steps to process",
                     llm_ok=True, prior=None, phase="x")
-    assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is True
+    assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is False
 
 
 def test_refusal_with_det_false_is_hard_fail():
+    # 语义演进（阶段4 C5）：同上——det False 的真错误由 det 通道自身 sticky 兜底，
+    # refusal 层不再叠加永久判死。
     v = evaluate_l1(det_ok=False, det_details={"l1_2_compile_ok": False},
                     verify_result="我无法完成这个任务", llm_ok=True, prior=None, phase="x")
-    assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is True
+    assert v.passed is False and v.source == "refusal_hard_fail" and v.sticky is False
 
 
 # ── 规则 2：det False 各原因映射 + sticky ──

@@ -167,6 +167,17 @@ class _L1GateMixin:
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: diff error {exc}",
                           "not_run_kind": NotRunKind.BLOCKED.value}
+        # C2（阶段4）：diff 内容签名——与上次【确定性 PASS】一致则复用结果（pipeline 对
+        # 同一 diff 是确定性的；Phase-4 无条件整遍重跑=happy-path 白烧两遍全量构建）。
+        import hashlib as _hashlib
+        _gate_diff_sig = _hashlib.sha1(
+            (diff or "").encode("utf-8", "replace")).hexdigest()
+        if (_gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
+                and getattr(self, "_last_gate_details", None) is not None):
+            _cached = dict(self._last_gate_details)
+            _cached["reused_deterministic_gate"] = True
+            self._log("L1 确定性闸门：diff 未变+上次 PASS → 复用结果（省一遍全量 pipeline）")
+            return True, _cached
         # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
         # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"
         # 送进 pipeline → 解析出 0 文件 → "no diff changes → True" → 空 diff 漏判通过。
@@ -215,6 +226,10 @@ class _L1GateMixin:
                 # round18 P0-B：确定性修复触达的 scope 外文件(如 module-reg 自愈的父 pom)
                 # 不计入 scope 违规——见 _get_git_diff 把 _repaired_extra_paths 纳入 diff。
                 extra_writable_paths=set(self._repaired_extra_paths),
+                # C1（阶段4）：worker 总预算贯穿 pipeline——A5 的入口布尔快照只拦"进门时
+                # 已超时"，进门后 build+repair 900s 墙钟与预算解耦（最坏 ~35min runaway）。
+                deadline=(self.start_time + self.max_execution_time
+                          if getattr(self, "start_time", 0) else None),
             )
             # TD2606-C9：登记本轮在沙箱里被确定性修复的文件，使其回传本地 + 计入 diff。
             self._record_repaired_paths(details)
@@ -262,6 +277,12 @@ class _L1GateMixin:
             details["deterministic_gate"] = "pass" if ok else "fail"
             if empty_diff:
                 details["note"] = "empty diff，仅靠 harness 命令验证"
+            # C2（阶段4）：只缓存【确定性 PASS】——diff 内容签名未变时 Phase-4 复用，
+            # 不再整遍重跑（happy-path 每子任务 ≥3 次全量 L1 的主推手）。FAIL/BLOCKED
+            # 绝不缓存：修复动作会改沙箱态，同 diff 重验是修复回路既有语义。
+            if ok:
+                self._last_gate_diff_sig = _gate_diff_sig
+                self._last_gate_details = dict(details)
             return ok, details
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: pipeline error {exc}",

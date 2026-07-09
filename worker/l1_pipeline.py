@@ -1231,6 +1231,25 @@ def _max_build_repair_seconds() -> float:
         return 900.0
 
 
+def _repair_loop_budget(deadline: float | None) -> float:
+    """C1（阶段4，登记册 §四）：repair 收敛循环墙钟 = min(独立墙钟上界, worker 剩余预算)。
+
+    此前独立 900s 与 worker 总预算解耦——A5 只在闸门入口查一次布尔快照，进门后
+    build 300s + repair 900s×每轮全量重跑可达 ~35min，预算无从中途打断。"""
+    cap = _max_build_repair_seconds()
+    if deadline is None:
+        return cap
+    return max(0.0, min(cap, deadline - _time.monotonic()))
+
+
+def _stage_timeout(base: int, deadline: float | None) -> int:
+    """C1：阶段命令超时钳到剩余预算（不再 max(timeout,300) 冲破 deadline）。
+    下限 60s 保命令本身可用；deadline 已过的情形由各阶段前置检查拦截，不到这里。"""
+    if deadline is None:
+        return int(base)
+    return max(60, min(int(base), int(deadline - _time.monotonic())))
+
+
 def _cap_files(files: list[str], kind: str) -> list[str]:
     """按上限截断文件列表；截断时告警（避免静默遗漏后续文件的检查）。"""
     cap = _max_files_per_check()
@@ -2579,6 +2598,7 @@ def run_l1_pipeline(
     llm: BaseChatModel | None = None,
     project_stack: dict | None = None,
     extra_writable_paths: set[str] | None = None,
+    deadline: float | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
@@ -2602,6 +2622,21 @@ def run_l1_pipeline(
             scope 复核时视为允许，避免把非 worker 越权写的修复文件误判越权整份判死。
     """
     details: dict[str, Any] = {"pipeline": "L1.1-L1.4"}
+
+    # C1（阶段4）：worker 总预算 deadline（monotonic 绝对时刻）——每个昂贵阶段前查剩余，
+    # 耗尽即走既有 BLOCKED 契约（ok=True + pipeline_blocked，executor 侧降 None/BLOCKED
+    # 走重试），绝不白跑 35min 也绝不假 PASS。deadline=None=legacy 调用方零回归。
+    def _deadline_blocked(stage: str) -> bool:
+        if deadline is not None and _time.monotonic() >= deadline:
+            details["pipeline_blocked"] = "worker_deadline_exhausted"
+            details["not_run_kind"] = NotRunKind.BLOCKED.value
+            details["deadline_stage"] = stage
+            logger.warning("[L1] worker 预算耗尽（阶段=%s）→ BLOCKED，不再白跑", stage)
+            return True
+        return False
+
+    if _deadline_blocked("entry"):
+        return True, details
 
     # D57：新一次 L1 run = 新一代 manifest 在场性缓存（run 内 5-8 趟沙箱 find 收敛为
     # 每组 manifests 至多一趟；跨 run 不留 stale）。
@@ -2693,8 +2728,11 @@ def run_l1_pipeline(
             logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
+        if _deadline_blocked("build"):
+            return True, details
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
-        b_ec, b_out = _run_l1_command(build_cmd, project_path, timeout=max(timeout, 300))
+        b_ec, b_out = _run_l1_command(
+            build_cmd, project_path, timeout=_stage_timeout(max(timeout, 300), deadline))
         build_ok = b_ec == 0
         details["l1_2_1_build_ok"] = build_ok
         details["build_command"] = build_cmd
@@ -2719,7 +2757,8 @@ def run_l1_pipeline(
             repaired_paths: list[str] = []
             if repair_on:
                 _loop_t0 = _time.monotonic()
-                _loop_budget = _max_build_repair_seconds()
+                # C1：repair 墙钟钳到 worker 剩余预算（独立 900s 是 35min runaway 主推手）
+                _loop_budget = _repair_loop_budget(deadline)
                 for _rr in range(_max_build_repair_rounds()):
                     if _time.monotonic() - _loop_t0 >= _loop_budget:
                         logger.warning(
@@ -2743,7 +2782,8 @@ def run_l1_pipeline(
                         "[L1.2.1] 确定性修复第 %d 轮触达 %d 文件，重跑构建闸门", _rr + 1, n_round
                     )
                     b_ec, b_out = _run_l1_command(
-                        build_cmd, project_path, timeout=max(timeout, 300)
+                        build_cmd, project_path,
+                        timeout=_stage_timeout(max(timeout, 300), deadline)
                     )
                     build_ok = b_ec == 0
                     if build_ok:
@@ -2959,6 +2999,8 @@ def run_l1_pipeline(
         logger.warning("[L1.2.5] L1 lint 已禁用(SWARM_WORKER_L1_LINT=false) — 确定性 lint 校验不生效")
 
     # ── L1.3 scoped test ──
+    if _deadline_blocked("test"):
+        return True, details
     # 优先用 Brain 编排的 harness.test_command（精心编写、确定性）；
     # 没有 harness 时才回退到启发式 _guess_test_cmd。（harness 已在上方取得）
     harness_test = getattr(harness, "test_command", "") if harness else ""
@@ -3000,9 +3042,12 @@ def run_l1_pipeline(
     # 确定性证据，杜绝 LLM 口头自报合格。
     verify_cmds = list(getattr(harness, "verify_commands", []) or []) if harness else []
     if verify_cmds:
+        if _deadline_blocked("verify_commands"):
+            return True, details
         verify_results = []
         for vc in verify_cmds:
-            v_ec, v_out = _run_l1_command(vc, project_path, timeout=timeout)
+            v_ec, v_out = _run_l1_command(
+                vc, project_path, timeout=_stage_timeout(timeout, deadline))
             ok = v_ec == 0
             verify_results.append({
                 "cmd": vc, "ok": ok,
@@ -3021,6 +3066,10 @@ def run_l1_pipeline(
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = os.environ.get("SWARM_WORKER_L1_SELF_REVIEW", "true").lower() not in ("false", "0", "no")
+    # C1：自检是 advisory——预算耗尽只跳过自检（不 BLOCKED 整个已通过的确定性结论）
+    if deadline is not None and _time.monotonic() >= deadline:
+        self_review_enabled = False
+        details["self_review"] = {"skipped": True, "reason": "worker_deadline_exhausted"}
     if self_review_enabled and llm is not None:
         review_result = _run_self_review(llm, subtask, diff, timeout=timeout)
         details["self_review"] = review_result

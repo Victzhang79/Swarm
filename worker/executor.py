@@ -652,14 +652,6 @@ class WorkerExecutor(
                 self.fix_rounds = fix_round
                 self._log(f"L1 验证轮次 {fix_round + 1}/{self.max_fix_rounds + 1}")
 
-                verify_result = await self._run_agent(
-                    self._build_verify_prompt(),
-                    step=f"verify-{fix_round}",
-                )
-                llm_passed, l1_details = self._parse_l1_result(verify_result)
-
-                # 确定性闸门优先：用真实 compile/lint/scope 结果覆盖 LLM 自报。
-                # 借鉴 ECC —— 确定性断言驱动修复循环，杜绝 LLM 幻觉 PASS 提前 break。
                 # ── 关键修复：循环内确定性闸门查的是本地 difflib diff（_post_sync_contents），
                 #    但 worker 在【沙箱】里改文件，循环内若不先 pull-back，本地 diff 恒空 →
                 #    `empty_diff_but_changes_expected` 每轮必 fail（medium/complex 子任务白跑满
@@ -671,6 +663,21 @@ class WorkerExecutor(
                 # timeout 可达 900s）卸线程——旧直调会把全部并发 worker/brain/SSE/看守心跳
                 # 一起冻结在事件循环上。flock 获取/释放在同一线程内完成，互斥语义不变。
                 det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
+                # C5（阶段4，登记册 §四）：确定性闸门【先行】，verify agent 步（每 fix_round
+                # 一整轮带工具 agent，高成本）只在 det_ok=None（无确定性证据、需要 LLM 弱
+                # 自报兜底）时才跑——det 已有结论时它的 llm_ok 恒被仲裁器强制 True（近零价值），
+                # 而其拒答/截断反而会误杀好产出（refusal 通道 artifact）。
+                # SWARM_WORKER_VERIFY_AGENT_STEP: auto(默认)=仅 det None｜always=旧行为｜never=禁用。
+                _verify_mode = os.environ.get(
+                    "SWARM_WORKER_VERIFY_AGENT_STEP", "auto").strip().lower()
+                verify_result: str | None = None
+                llm_passed, l1_details = True, {}
+                if _verify_mode == "always" or (_verify_mode != "never" and det_ok is None):
+                    verify_result = await self._run_agent(
+                        self._build_verify_prompt(),
+                        step=f"verify-{fix_round}",
+                    )
+                    llm_passed, l1_details = self._parse_l1_result(verify_result)
                 # W1.2：单一仲裁器裁决（refusal → det False → det None → det True）。
                 # 循环内不传 prior（每轮独立裁决），翻盘逻辑只在 Phase-4 生效。
                 # llm_ok 语义对齐契约：det_ok=None 时用 LLM 弱自报作为唯一信号；
@@ -752,9 +759,11 @@ class WorkerExecutor(
 
                 if fix_round < self.max_fix_rounds:
                     self._log(f"修复尝试 {fix_round + 1}/{self.max_fix_rounds}")
-                    symbol_hint = await self._symbol_grounding_hint(verify_result, l1_details)
+                    # C5：verify 步可能被跳过（det 已有结论）——fix 证据以确定性 digest 为主
+                    symbol_hint = await self._symbol_grounding_hint(
+                        verify_result or "", l1_details)
                     fix_result = await self._run_agent(
-                        self._build_fix_prompt(verify_result, l1_details, symbol_hint),
+                        self._build_fix_prompt(verify_result or "", l1_details, symbol_hint),
                         step=f"fix-{fix_round}",
                     )
                     self._log(f"修复完成: {fix_result[:200]}")
@@ -817,6 +826,9 @@ class WorkerExecutor(
                         project_stack=self._resolve_project_stack(),
                         # round18 P0-B：与确定性闸门同口径，排除修复触达的 scope 外文件。
                         extra_writable_paths=set(self._repaired_extra_paths),
+                        # C1（阶段4）：Phase-4 自检 pipeline 同样受 worker 总预算贯穿约束
+                        deadline=(self.start_time + self.max_execution_time
+                                  if self.start_time else None),
                     )
                     l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
                     # #1(c) 可观测：Phase-4 的 LLM 自检 pipeline 若 blocked，det_ok=True 仍据【本阶段

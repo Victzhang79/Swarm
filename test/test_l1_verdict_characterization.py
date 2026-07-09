@@ -208,14 +208,14 @@ def test_evaluate_l1_refusal_with_det_true_is_self_review():
 
 
 def test_evaluate_l1_refusal_with_det_none_is_hard_fail():
-    """无确定性证据时 refusal 仍 → refusal_hard_fail sticky=True。"""
+    """语义演进（阶段4 C5）：refusal → refusal_hard_fail 但 sticky=False（可翻盘）。"""
     v = evaluate_l1(
         det_ok=None, det_details={},
         verify_result=_REFUSAL_TEXT, llm_ok=None, prior=None, phase="loop",
     )
     assert v.passed is False
     assert v.source == "refusal_hard_fail"
-    assert v.sticky is True
+    assert v.sticky is False
 
 
 def test_evaluate_l1_refusal_with_det_false_is_hard_fail():
@@ -226,7 +226,8 @@ def test_evaluate_l1_refusal_with_det_false_is_hard_fail():
     )
     assert v.passed is False
     assert v.source == "refusal_hard_fail"
-    assert v.sticky is True
+    # 语义演进（阶段4 C5）：sticky True→False，见 contract 测试同名说明
+    assert v.sticky is False
 
 
 def test_evaluate_l1_refusal_in_self_review_is_flippable_by_phase4():
