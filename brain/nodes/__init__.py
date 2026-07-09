@@ -1068,8 +1068,10 @@ async def _plan_ultra_batched(
         # F8：优先本批分桶子集块；无分桶（条目空/分桶失败）回退全量块（零回归）
         from swarm.brain.plan_batch import _base_module as _f8_base_in
         prompt_user += _cov_blocks_by_module.get(_f8_base_in(mod_name), _cov_block)
-        if _skills_blk_batched:
-            prompt_user += "\n\n" + _skills_blk_batched
+        from swarm.brain.plan_batch import skills_block_for_batch as _sbfb
+        _skills_blk_i = _sbfb(_skills_blk_batched, i)  # G10：只注首批，防批间纯重复
+        if _skills_blk_i:
+            prompt_user += "\n\n" + _skills_blk_i
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))

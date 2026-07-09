@@ -7,7 +7,7 @@ applies_to_intents: ["create", "refactor"]
 applies_to_phases: ["plan", "code"]
 target: ["worker", "planner"]
 priority: 45
-max_chars: 1800
+max_chars: 1400  # G10：≤ planner_budget_chars(1500)，否则填缝永进不去=死配置
 tags: ["architecture", "ddd", "ports-adapters"]
 ---
 

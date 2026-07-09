@@ -142,14 +142,58 @@ def select_worker_skills(subtask, project_stack: dict | None = None) -> list[Ski
         return []
 
 
-def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
-    """为 Worker 系统提示生成【经验工具目录】（轻量：工具名+标题+摘要，不含正文）。
+def select_worker_push_pull(subtask, project_stack: dict | None = None):
+    """G8（阶段E 拍板）：push top-1 栈特化 + pull ≤worker_max_tools 的混合分离。
 
-    正文由离散 experience__<id> 工具按需 pull；本目录只提示这些工具存在、各管什么。
-    空/禁用/异常 → ""。
+    离散 pull 把选择负担压给最弱环节（小模型）；最相关的一条【栈特化】技能改为全文
+    push 进 prompt（零迭代成本），其余候选仍走按需 pull 工具。top 候选是通配技能时
+    不 push（泛化建议不值得无条件占 prefill）。返回 (push_skill|None, pull_skills)。
+    push 与 pull 不重叠（已 push 全文的技能不再占工具位）。fail-open → (None, [])。
     """
     try:
-        return render_experience_tool_catalog(select_worker_skills(subtask, project_stack))
+        from swarm.config.settings import get_config
+
+        cfg = get_config().skills
+        if not cfg.enabled:
+            return None, []
+        skills = _merged_skills(cfg.dir_list())
+        if not skills:
+            return None, []
+        intent = str(
+            getattr(getattr(subtask, "intent", ""), "value", getattr(subtask, "intent", "")) or ""
+        ).lower()
+        stack_langs = stack_langs_from_project_stack(project_stack)
+        picked = select_skills(
+            skills, stack_langs=stack_langs, intent=intent, phase="code",
+            target="worker", budget_chars=10**9,
+            max_k=max(cfg.worker_max_tools, 0) + 1,  # +1：top-1 归 push，其余归 pull
+            rerank_fn=None,
+        )
+        if not picked:
+            return None, []
+        if "*" not in picked[0].applies_to_stacks:
+            return picked[0], picked[1:]
+        return None, picked[:max(cfg.worker_max_tools, 0)]
+    except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮主流程
+        logger.warning("[skills] worker push/pull 选择失败，降级为空：%s", e)
+        return None, []
+
+
+def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
+    """为 Worker 系统提示生成经验块：push 技能【全文】+ pull 工具目录（G8 混合）。
+
+    与 build_worker_experience_tools 用同一 select_worker_push_pull，保证"目录里的
+    工具"与"实际挂上的工具"一一对应。空/禁用/异常 → ""。
+    """
+    try:
+        push, pull = select_worker_push_pull(subtask, project_stack)
+        parts = []
+        if push is not None:
+            parts.append(render_skills_block([push]))
+        catalog = render_experience_tool_catalog(pull)
+        if catalog:
+            parts.append(catalog)
+        return "\n".join(p for p in parts if p)
     except Exception as e:  # noqa: BLE001
         logger.warning("[skills] worker 目录渲染失败，降级为空：%s", e)
         return ""
@@ -161,7 +205,7 @@ def build_worker_experience_tools(subtask, project_stack: dict | None = None):
         from swarm.config.settings import get_config
         from swarm.experience.tools import build_experience_tools
 
-        skills = select_worker_skills(subtask, project_stack)
+        _, skills = select_worker_push_pull(subtask, project_stack)  # G8：只挂 pull 侧
         if not skills:
             return []
         return build_experience_tools(
