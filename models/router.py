@@ -625,7 +625,6 @@ class EndpointProvider:
         self, model_name: str, temperature: float = 0.2, callbacks: list | None = None,
         max_tokens: int | None = None, wallclock_budget: float | None = None,
     ) -> BaseChatModel:
-        from langchain_openai import ChatOpenAI
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
         api_key: str = self.provider.api_key or "EMPTY"  # type: ignore[assignment]
         # D54：值键化实例缓存——键覆盖全部影响行为的参数（含超时族/重试/kind 推导的

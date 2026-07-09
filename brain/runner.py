@@ -1014,6 +1014,19 @@ async def _handle_post_run(
         })
 
 
+def build_degraded_summary(degraded_reasons) -> dict[str, int]:
+    """F2（阶段7）：degraded 留痕 → 机读汇总（按前缀聚合计数）。
+
+    E2E 判读脚本直接读 result.degraded_summary 即可回答"这轮降级了什么、各多少次"，
+    不再从日志考古。前缀 = 第一个 ':' 之前（约定俗成的机制名，如
+    requirements_extract / acceptance_skipped / merge_secret_reported）。"""
+    out: dict[str, int] = {}
+    for r in (degraded_reasons or []):
+        prefix = str(r).split(":", 1)[0].strip() or "(empty)"
+        out[prefix] = out.get(prefix, 0) + 1
+    return out
+
+
 def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     output_parts: dict[str, Any] = {}
     for key in ("merged_diff", "l2_passed", "learn_summary", "complexity", "plan", "subtask_results", "human_decision", "learned", "knowledge_context", "merge_conflicts", "l3_passed", "l3_skipped", "l3_message", "plan_validation_issues", "shared_contract", "verification_failure"):
@@ -1026,6 +1039,11 @@ def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
             output_parts[key] = val
         else:
             output_parts[key] = str(val) if not isinstance(val, (bool, int, float)) else val
+    # F2（阶段7）：degraded 全量留痕 + 机读汇总双出——判读脚本读 summary，人工看明细
+    _dg = list(state.get("degraded_reasons") or [])
+    if _dg:
+        output_parts["degraded_reasons"] = _dg
+        output_parts["degraded_summary"] = build_degraded_summary(_dg)
     return output_parts
 
 
