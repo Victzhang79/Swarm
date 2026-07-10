@@ -268,6 +268,14 @@ class ModelConfig(BaseSettings):
     # 重跑）可调低，但更优解是从源头限 reasoning（reasoning_effort/关 thinking）。0=关闭。worker 热路径不开
     # （已有 stall+worker_max_tokens=8192 双重兜底）。
     brain_stream_wallclock_s: float = 1500.0
+    # E2（round38c 主题E，register #32）：worker 单次流式调用总墙钟。R35-A/round38c 实证
+    # 存在「单调用挂满 900s 总预算」形态（stall 看门狗可被 provider 心跳空 chunk 重置、
+    # B6 槽位排队不计入 stall），届时整个 agent 被外层 cancel，无任何本步换备。开 wallclock
+    # 后超时抛 TransientInfraError → with_fallbacks 链内即刻切备模型，900s 预算至少能试 2 个。
+    # 取值：worker_max_tokens=8192 @ 高负载 ~20tok/s ≈ 410s 是合法慢调用下限 → 420s 不误杀；
+    # 误杀后果也只是提前切备重试（非丢工作）。0=关闭（回退旧行为）。
+    # env: SWARM_MODEL_WORKER_STREAM_WALLCLOCK_S
+    worker_stream_wallclock_s: float = 420.0
 
     # ── I1 模型能力分级（Brain 编排约束随模型能力调整）──────────────
     # tier_enabled 默认 False = 永远 standard = 现有硬编码约束上限，行为零变化（安全闸门）。

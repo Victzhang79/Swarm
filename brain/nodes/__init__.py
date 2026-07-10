@@ -3128,7 +3128,19 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
         return
     try:
         from swarm.worker.security_scan import scan_diff_for_secrets
-        findings, _block = scan_diff_for_secrets(merged_diff)
+        # E6③（round38c 主题E）：阻断阈值接线 security_block_severity（settings.py 既有
+        # 开关，此前只被 AUDIT 路径消费、本闸丢弃返回的 should_block 硬编码 CRITICAL）
+        # ——配 "high" 即 HIGH 密钥也 escalate 人工，默认 "critical" 行为不变。
+        # 复核 C-2（CONFIRMED）：归一大小写/空白；"none"（文档化的仅报告模式）必须显式
+        # 短路——scan_diff_for_secrets 的 _severity_gte(any, "none")=恒真，原样透传会把
+        # 「仅报告」反转成「逢密钥必 escalate」。
+        _thr = str(getattr(get_config().worker, "security_block_severity", None)
+                   or "critical").strip().lower()
+        findings, _block = scan_diff_for_secrets(
+            merged_diff,
+            block_severity=("critical" if _thr == "none" else _thr))
+        if _thr == "none":
+            _block = False  # 仅报告模式：留痕不阻断（与 AUDIT 路径 run_security_scan 同语义）
     except Exception as exc:
         # fail-closed：安全闸"扫不动"绝不等同"零密钥"——escalate 人工，与 apply-invalid/审计 N-01 一致。
         logger.error(
@@ -3143,20 +3155,25 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
         return
     if not findings:
         return
-    crit = [f for f in findings if f.severity == Severity.CRITICAL]
-    if crit:
+    if _block:
+        # E6③：scan 按 block_severity 判 should_block（默认 critical=原行为；配 high 时
+        # HIGH 命中同样 fail-closed）——不再在本函数重复硬编码 CRITICAL 判定。
+        # 复核 C-2：_blocking 与 scan 用同一 _severity_gte 判据（二套逻辑会在非常规
+        # 阈值下产生「escalate 却零留痕」——degraded/日志空砸掉 observability）。
+        from swarm.worker.security_scan import _severity_gte
+        _blocking = [f for f in findings if _severity_gte(f.severity, _thr)] or findings
         out["failure_escalated"] = True
         out["failure_strategy"] = "escalate"
         out["l2_passed"] = False
         out["verification_failure"] = "merge_secret_detected"
         # degraded 留痕：observability + L6 抑制（前缀不在 INFORMATIONAL 白名单→自动挡假学习）。
-        _summary = sorted({f"{f.rule_id}@{f.file}:{f.line}" for f in crit})
+        _summary = sorted({f"{f.rule_id}@{f.file}:{f.line}" for f in _blocking})
         out["degraded_reasons"] = [f"merge_secret_detected:{s}" for s in _summary[:20]]
         logger.error(
-            "[MERGE] ⚠️ 交付 diff 检出密钥泄露(CRITICAL %d 处) → escalate 人工 fail-closed 阻断交付；"
+            "[MERGE] ⚠️ 交付 diff 检出密钥泄露(≥%s %d 处) → escalate 人工 fail-closed 阻断交付；"
             "命中(已脱敏)=%s",
-            len(crit),
-            [f.title for f in crit][:20],
+            _thr, len(_blocking),
+            [f.title for f in _blocking][:20],
         )
         return
     # 仅 HIGH（Slack token/Google API key/Stripe/通用赋值）：不阻断交付但必须留痕可审计——

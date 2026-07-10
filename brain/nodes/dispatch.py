@@ -288,7 +288,7 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
 
 def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
                                   max_concurrent, to_dispatch, abandoned=None,
-                                  deprioritized=None):
+                                  deprioritized=None, force_strong_out=None):
     """主干B 不变量·DISPATCH 闸门：派发前确保每个工作单元【文件数≤上界】（预防式治本）。
 
     根因：编排允许 oversized 子任务一路派到 worker，撞 900s 墙钟超时后才在恢复阶梯拆小——
@@ -326,9 +326,14 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
             continue
         if not children or len(children) <= 1:
             # 拆不动（单文件巨核）→ 原样放行，显式 log 不静默；交超时阶梯兜底。
+            # E5（round38c 主题E）：同时直接标 force_strong——旧行为是先白烧 1×900s
+            # 超时 + 2-3 轮重试（E1 修复前还全是同模型空转）才由 FINDING-12 补最强
+            # 模型；大块既然确定拆不动，第一轮就上最强模型+boost（浪费型死点提前止损）。
+            if force_strong_out is not None:
+                force_strong_out[st.id] = True
             logger.warning(
                 "[DISPATCH] 预算闸门：子任务 %s 超文件上界但确定性拆不动 → 原样派发"
-                "（交超时强制拆小阶梯兜底，不静默）", st.id,
+                "（E5：首轮即 force_strong 最强模型；交超时强制拆小阶梯兜底，不静默）", st.id,
             )
             continue
         idx = next((i for i, x in enumerate(new_subtasks) if getattr(x, "id", None) == st.id), None)
@@ -353,6 +358,18 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
         completed_ids, remaining, max_concurrent, abandoned, deprioritized
     )
     return plan_obj, remaining, to_dispatch
+
+
+def _has_hetero_alternate(difficulty) -> bool:
+    """E1（round38c 主题E）：该难度路由是否存在异构备选（retry_alternate 兑现判据）。
+
+    惰性 import 防循环依赖；判据异常按无备选处理（回退 boost 路径，不炸派发）。"""
+    try:
+        from swarm.models.router import ModelRouter
+        d = difficulty.value if hasattr(difficulty, "value") else str(difficulty or "medium")
+        return ModelRouter().has_alternate_for_subtask(d)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _select_pool_override(difficulty, idx, pool, use_alternate_effective, force_strong, routing_complex):
@@ -434,9 +451,11 @@ async def dispatch(state: BrainState) -> dict:
     # ── 主干B 不变量·DISPATCH 预算闸门：超文件上界的工作单元在派发前确定性拆小，
     # 不让大块进 worker 撞 900s 超时（预防式治本，非超时后补偿）。plan 可能被重建 → 须回写 state。
     _plan_before_gate = plan_obj
+    # E5：拆不动的大块由闸门直接标 force_strong（首轮即最强模型，省 1×900s 白烧）
+    _gate_force_strong = dict(state.get("subtask_force_strong") or {})
     plan_obj, dispatch_remaining, to_dispatch = _enforce_dispatch_budget_gate(
         plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch,
-        _abandoned, _deprioritized
+        _abandoned, _deprioritized, force_strong_out=_gate_force_strong
     )
     _gate_split = plan_obj is not _plan_before_gate
 
@@ -490,7 +509,8 @@ async def dispatch(state: BrainState) -> dict:
     # 让两个能力相当的本地主力(Qwen3.6-40B-Claude/MiniMax)同时干、分散负载、产出更快。
     # 轮转不覆盖 alternate(失败重试)；池空则不轮转(按 difficulty 路由)。
     _pool = list(getattr(config.worker, "worker_parallel_pool", []) or [])
-    _force_strong = state.get("subtask_force_strong") or {}  # FINDING-12
+    # FINDING-12 + E5：闸门对拆不动大块的首轮 force_strong 标记已合并进 _gate_force_strong
+    _force_strong = _gate_force_strong
 
     async def _run_one(subtask: SubTask, idx: int = 0) -> tuple[SubTask, WorkerOutput | Exception]:
         # A6：惰性导入破 nodes↔dispatch eager 循环依赖（_dispatch_to_worker 是留在 __init__ 的
@@ -499,12 +519,20 @@ async def dispatch(state: BrainState) -> dict:
         # FINDING-12：拒答/步数耗尽子任务强制走【最强模型】(routing_complex=40B 256k)，不走 alternate
         # 也不走轮转池——小模型 agent 循环不收敛，最强模型最能在步数内完成。
         _fs = bool(_force_strong.get(subtask.id))
-        # 单模型模式(池只 1 个)：一切(含失败重试)都留在唯一模型，绝不降级到 difficulty fallback。
-        # RUN10 实证：单模型下 st-5 重试走 use_alternate → 落到更弱 Saka，破坏"单模型一致性"本意。
-        # 无"备选"可换，重试改给 recursion_boost 助收敛，而非换更弱模型。
-        _single = len(_pool) == 1
+        # E1（round38c 主题E 复核 CONFIRMED）：旧判据 len(_pool)==1 把「池长」当「无备选」
+        # ——池 1 模型但 difficulty fallback 链有异构备选时，retry_alternate 被静默改写成
+        # 同模型+boost，failure 侧「换备选」日志与实派模型永久不符（register #26：9 次换备
+        # 全空转）。改按 router 真相：无异构备选才回退 boost。RUN10「单模型不降级」诉求由
+        # 配置表达（fallback 链配空/全 primary 即单模型模式），机制不再焊死。
+        _single = not _has_hetero_alternate(getattr(subtask, "difficulty", None))
         _sid_alt = bool(_alt_map.get(subtask.id))
-        _ua = _sid_alt and not _fs and not _single
+        # 复核 C-4（CONFIRMED）：complex/ultra 子任务禁用 alternate——它们已派最强模型
+        # （_select_pool_override 恒 routing_complex），任何「换备选」都是降级；且
+        # _dispatch_to_worker 的 use_alternate 分支优先于 model_override，不禁用则
+        # override 算出最强又被丢弃。complex 重试走 boost 路径（同模型+加步数）。
+        _d = str(getattr(getattr(subtask, "difficulty", None), "value", None)
+                 or getattr(subtask, "difficulty", None) or "").lower()
+        _ua = _sid_alt and not _fs and not _single and _d not in ("complex", "ultra")
         # B10：override 决策抽为纯函数——force_strong 或 complex 子任务绕过轮转直取最强模型，
         # 否则池非空非 alternate 走轮转，池空/alternate 按 difficulty 路由。
         _override = _select_pool_override(
@@ -516,8 +544,10 @@ async def dispatch(state: BrainState) -> dict:
         _boost = 0
         if _fs:
             _boost = 30
-        elif _single and _sid_alt:
-            _boost = 30  # 单模型重试：留在唯一模型 + 加步数助收敛(不降级)
+        elif _sid_alt and not _ua:
+            # alternate 请求未兑现（无异构备选 / complex-ultra 禁降级）→ 同模型+加步数
+            # 助收敛（C-4：条件从 `_single and _sid_alt` 放宽，complex 禁用面也要拿 boost）
+            _boost = 30
         try:
             output = await nodes._dispatch_to_worker(
                 subtask,
@@ -659,6 +689,9 @@ async def dispatch(state: BrainState) -> dict:
         "dispatch_remaining": dispatch_remaining,
         **worker_ctx,
     }
+    if _gate_force_strong != (state.get("subtask_force_strong") or {}):
+        # E5：闸门新标的拆不动大块 force_strong 必须显式 emit（in-place 捎带是被禁模式）
+        result["subtask_force_strong"] = _gate_force_strong
     if _gate_split or _ua_changed:
         # B1 对抗复核#1：注入 mutate 了 scope.upstream_artifacts——in-place 变异靠
         # checkpoint 捎带是被禁模式（C9 同纪律），显式 emit 否则重启恢复即丢注入。

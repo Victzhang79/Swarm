@@ -334,7 +334,21 @@ class _SandboxSyncMixin:
             try:
                 return p.resolve().relative_to(local_root).as_posix()
             except ValueError:
-                return p.name  # 越界则退化为文件名
+                pass
+            # E7①（round38c 主题E）：沙箱内绝对路径（L1 修复族 sed/grep 产出形态）剥
+            # remote_workdir 前缀归一——否则登记进 _repaired_extra_paths / 拼进
+            # git diff targets 时 `git diff -- /workspace/...` rc=128 连坐【整个 diff】
+            # 回退 difflib，repaired/兄弟改动从交付蒸发（D36 兄弟回传失败真身之一）。
+            try:
+                _remote = (get_config().sandbox.sandbox_remote_workdir
+                           or "/workspace").rstrip("/") + "/"
+            except Exception:  # noqa: BLE001
+                _remote = "/workspace/"
+            _s = p.as_posix()
+            if _s.startswith(_remote):
+                return _s[len(_remote):]
+            logger.warning("[SYNC] 路径越界无法归一（退化 basename，历史行为）: %s", f)
+            return p.name  # 越界则退化为文件名
         return p.as_posix().lstrip("/")
 
     def _git_baseline_text(self, local_root: Path, rel: str) -> str | None:
@@ -1176,7 +1190,13 @@ class _SandboxSyncMixin:
         # TD2606-C9：把闸门在沙箱里修复的文件（含 scope 外，如父 pom）纳入 diff，
         # 否则修复进了本地工作区却因不在 scope 而被 `-- <files>` 过滤掉 → merged_diff 缺失。
         repaired = [f for f in sorted(self._repaired_extra_paths) if f]
-        targets = list(dict.fromkeys(modify + create + delete + repaired))
+        # E7①：targets 统一过 _norm_rel（幂等）——任何一条绝对/带前缀路径混进
+        # `git diff -- <targets>` 都会 rc=128 连坐整个 diff 回退 difflib。经类引用调
+        # staticmethod（部分测试用 SimpleNamespace 假对象调本方法，不带 mixin 全量属性）。
+        _root_p = _P(root)
+        targets = list(dict.fromkeys(
+            t for t in (_SandboxSyncMixin._norm_rel(_root_p, f)
+                        for f in (modify + create + delete + repaired) if f) if t))
         if not targets:
             return None
 

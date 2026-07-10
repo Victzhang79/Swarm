@@ -63,12 +63,19 @@ def test_resolve_route_returns_list_fallback():
 
 
 def test_alternate_picks_first_non_primary():
-    """retry 换备选取 fallback 链上【首个≠primary】的模型(FINDING-8)。用户编排下 complex
-    primary=40B、链首=27B-Saka → alternate=27B-Saka(大模型挂了先上小的兜底)。"""
+    """retry 换备选取 fallback 链上首个 ≠primary【且非 trivial 档 primary】的模型。
+
+    语义演进（round38c 主题E 复核 C-4）：FINDING-8 原语义「首个≠primary」在三档链统一
+    trivial 档居首的编排下，把 medium/complex 失败重试全派到最弱模型（Saka 112K）——
+    RUN10「换模型=降级」顾虑成真。现 alternate 候选排除 trivial 档 primary：complex
+    (primary=Qwopus) 的 alternate=MiniMax（medium 档）而非 Saka。"""
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     _, model_name = r.get_alternate_llm_for_subtask("complex", "text")
-    assert "Saka" in model_name, f"complex(primary=40B) 挂了 alternate 应先上 27B-Saka: {model_name}"
+    assert "Saka" not in model_name, (
+        f"非 trivial 难度的 alternate 不得落到 trivial 档最弱模型: {model_name}")
+    _trivial = getattr(r.config, "routing_trivial", "")
+    assert model_name != _trivial and model_name, f"alternate 应为非 trivial 异构备选: {model_name}"
 
 
 def test_alternate_skips_primary_duplicate():

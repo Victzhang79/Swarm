@@ -1790,7 +1790,98 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
                 logger.warning("[L1.2] tsc 执行异常(非 infra)，fail-closed 判未通过: %s", exc)
                 return False, f"tsc 执行异常: {_exc_txt}"[:1000]
 
+    # E3（round38c 主题E，register #31）：非编译数据文件确定性语法校验。此前只产
+    # .md/.sql/.yml/.properties/.html 的子任务除 L1.1 scope 检查外零确定性面（本函数
+    # fall-through 恒 True）＝结构性假绿通道。v1 补 json/yaml/xml 三类纯 parse 校验
+    # （stdlib/PyYAML，栈无关零外部工具）；.sql/.properties/.html 无普适确定性 parser，
+    # 诚实登记为边界（靠 L2/验收面兜）。文件不在本地/解析器缺失按 infra 口径跳过。
+    _data_ok, _data_msg = _validate_data_files(project_path, files)
+    if not _data_ok:
+        return False, _data_msg
+
     return True, "compile ok"
+
+
+def _validate_downgrade_unverified_sources(build_cmd: str, modified: list) -> list[str]:
+    """D3c：命中「脚手架 validate 降级」形态（mvn -f <mod>/pom.xml … validate）且
+    modified 含 JVM 源码 → 返回本轮未经编译的源码清单（空=无降级/无源码）。"""
+    if not ("validate" in (build_cmd or "") and " -f " in f" {build_cmd} "):
+        return []
+    return [str(f) for f in (modified or [])
+            if str(f).endswith((".java", ".kt", ".scala"))]
+
+
+_PKG_DECL_RE = re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*)\s*;")
+
+
+def _package_decl_mismatches(diff: str) -> list[dict]:
+    """E6①：diff 内【新建 .java】的包声明与 src/main|test/java 路径反推包比对。
+
+    返回不符清单 [{file, declared, expected}]。路径不含 java 源根标记（file_path_to_fqn
+    返回 None）或抽不到声明行 → 跳过（保守，不误杀非常规布局）。纯文本零外部工具。"""
+    out: list[dict] = []
+    try:
+        from swarm.project.diff_apply import split_diff_by_file
+        from swarm.worker.symbol_resolver import file_path_to_fqn
+        for files, text in split_diff_by_file(diff or ""):
+            if "--- /dev/null" not in text and "new file mode" not in text:
+                continue
+            for f in files:
+                if not f.endswith(".java"):
+                    continue
+                fqn = file_path_to_fqn(f)
+                if not fqn or "." not in fqn:
+                    continue
+                expected = fqn.rsplit(".", 1)[0]
+                declared = None
+                for ln in text.splitlines():
+                    m = _PKG_DECL_RE.match(ln)
+                    if m:
+                        declared = m.group(1)
+                        break
+                if declared and declared != expected:
+                    out.append({"file": f, "declared": declared, "expected": expected})
+    except Exception as exc:  # noqa: BLE001 — 对账是增强闸，异常不阻断 L1 主链
+        logger.debug("[L1.1b] 包声明对账异常(跳过): %s", exc)
+    return out
+
+
+def _validate_data_files(project_path: str, files: list[str]) -> tuple[bool, str]:
+    """json/yaml/xml 语法确定性校验（E3）。失败返回 (False, 归因文本)。"""
+    import json as _json
+    from pathlib import Path as _P
+    for f in files:
+        lf = _P(project_path) / f
+        if not lf.is_file():
+            continue  # 沙箱模式未 pull-back 等 → 跳过（非能力失败口径）
+        try:
+            text = lf.read_text("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        try:
+            if f.endswith(".json"):
+                # 复核 C-1 次级面：JSONC 家族（tsconfig*/jsconfig/.eslintrc.json/.jsonc）
+                # 合法含注释与尾逗号，json.loads 必炸——已知家族豁免（保守不误杀）
+                _base = f.rsplit("/", 1)[-1]
+                if (_base.startswith(("tsconfig", "jsconfig"))
+                        or _base == ".eslintrc.json" or f.endswith(".jsonc")):
+                    continue
+                _json.loads(text or "null")
+            elif f.endswith((".yml", ".yaml")):
+                try:
+                    import yaml as _yaml
+                except ImportError:
+                    continue  # 解析器缺失=infra，跳过闸门（loud 由上层日志承担）
+                # 复核 C-1（CONFIRMED）：Spring Boot application.yml 的 `---` 多文档
+                # profile 是标准写法，safe_load 单文档必炸=确定性误杀、fix 循环会教
+                # 模型删掉合法 `---` 过闸——必须 safe_load_all
+                list(_yaml.safe_load_all(text))
+            elif f.endswith(".xml"):
+                import xml.etree.ElementTree as _ET
+                _ET.fromstring(text.encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — parse 失败即语法坏
+            return False, f"数据文件语法校验失败 {f}: {type(exc).__name__}: {str(exc)[:300]}"
+    return True, "data files ok"
 
 
 # ── L1.2.5 lint 阶段 ──
@@ -2665,6 +2756,24 @@ def run_l1_pipeline(
     if violations:
         return False, details
 
+    # ── L1.1b 包声明↔目录对账（E6①，round38c 主题E）──
+    # 新建 .java 的 `package X;` 与 src/main/java 路径反推包不符时，maven-compiler
+    # 不报错（class 落错包），毒发在下游子任务 import 时（producer-gate 不对称——
+    # 既有机制全在 import 消费侧修复）。确定性闸：不符即 fail，worker 当轮改对。
+    _pkg_mis = _package_decl_mismatches(diff)
+    details["l1_1b_package_decl_ok"] = not _pkg_mis
+    if _pkg_mis:
+        details["package_decl_mismatches"] = _pkg_mis
+        # 复核 C-3（CONFIRMED）：必须设 reason——_l1_failure_digest 经 `[确定性闸门]
+        # {reason}: {note}` 出口把证据带进重试 prompt，且 reason 在 _failure_signature
+        # 键集内（no-progress 早停可触发）；只写 note 则 worker 全盲+签名恒空=盲烧
+        # 满 fix 轮再被 brain 重派确定性复死。
+        details["reason"] = "package_decl_mismatch"
+        details["note"] = "; ".join(
+            f"{m['file']}: 声明 package {m['declared']} ≠ 路径推定 {m['expected']}"
+            for m in _pkg_mis[:5])
+        return False, details
+
     modified = files_from_unified_diff(diff)
     details["modified_files"] = modified
 
@@ -2747,6 +2856,19 @@ def run_l1_pipeline(
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
         build_cmd = _scope_maven_command(build_cmd, project_path, modified)
+        # D3c（round38c 主题D 分流）：脚手架窗口 validate 降级【可见性】——validate 不编译
+        # 源码，scaffold 子任务同批新建 .java 时这些源码零编译即 l1_passed=True。降级本身
+        # 是 R34-6/Death B 的故意治法（脚手架契约=模块良构可注册；真编译由 L2 reactor
+        # compile 兜，D1 注册合成后必含该模块），但此前无任何机读痕迹——补标记供
+        # evaluate/L2/复盘消费，杜绝「validate PASS」被读作「编译 PASS」。
+        _src_unverified = _validate_downgrade_unverified_sources(build_cmd, modified)
+        if _src_unverified:
+            details["build_cmd_downgraded_to_validate"] = True
+            details["validate_unverified_sources"] = _src_unverified[:20]
+            logger.warning(
+                "[L1.2.1] D3c 脚手架 validate 降级：%d 个源码文件本轮未经编译"
+                "（真编译由注册后的 L2 reactor compile 兜）: %s",
+                len(_src_unverified), _src_unverified[:5])
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         if _deadline_blocked("build"):
             return True, details

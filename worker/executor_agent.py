@@ -15,6 +15,15 @@ import time
 
 logger = logging.getLogger(__name__)
 
+
+def _budget_banner(limit: int, remaining_s: float) -> str:
+    """E4：本次调用的步数/时间预算横幅（拼在 human_message 头部）。
+
+    静态劝诫（executor_prompts「省步数预算」）对模型不可见具体数字——预算数字化
+    可见才能让模型自己收敛探索（register #34：定位期 22 次必撞 cap）。纯文本零状态。"""
+    return (f"【预算】本次调用迭代上限 {int(limit)} 步、剩余时间 {remaining_s:.0f}s。"
+            "预算内完不成宁可先交部分产出；勿重复浏览已读文件。\n\n")
+
 # 进程级技术栈画像缓存（按 project_path/project_id）：避免每个子任务重复扫盘探测栈。
 _PROJECT_STACK_CACHE: dict[str, dict | None] = {}
 
@@ -141,6 +150,9 @@ class _AgentLoopMixin:
             {"recursion_limit": _limit},
             trace_cfg,
         )
+        # E4（round38c 主题E，register #34）：预算动态注入——此前只有静态「省步数」劝诫，
+        # 模型对具体预算不可见（定位期 22 次必撞 cap）。数字可见让模型自己收敛探索。
+        human_message = _budget_banner(_limit, remaining) + human_message
         try:
             result = await asyncio.wait_for(
                 agent.ainvoke(

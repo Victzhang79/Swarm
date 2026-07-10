@@ -119,6 +119,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_MODEL_WORKER_FALLBACK": "api/_shared.py:33",
     "SWARM_MODEL_WORKER_LOCAL": "api/_shared.py:32",
     "SWARM_MODEL_WORKER_PRIMARY": "api/_shared.py:31",
+    "SWARM_MODEL_WORKER_STREAM_WALLCLOCK_S": "config/settings.py:278",
     "SWARM_MODEL_WORKER_TEMPERATURE": "api/_shared.py:35",
     "SWARM_NOTIFY_CHANNELS": "api/routers/config.py:236",
     "SWARM_NOTIFY_FORMAT": "api/notify.py:7",

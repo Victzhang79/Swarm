@@ -123,7 +123,15 @@ class _L1GateMixin:
         local_root = Path(self.project_path) if self.project_path else None
         for raw in paths:
             rel = str(raw or "").strip()
-            if rel.startswith("./"):
+            if not rel:
+                continue
+            # E7①（round38c 主题E）：登记单点完全归一——修复族产出形态有裸相对/./
+            # 前缀/沙箱绝对（/workspace/...）三种，旧实现只剥 ./，绝对路径原样入表
+            # 后在 git diff targets 处 rc=128 连坐整个 diff。统一走 _norm_rel（含
+            # 沙箱前缀剥离）；无 local_root 时保留旧剥 ./ 行为。
+            if local_root is not None:
+                rel = self._norm_rel(local_root, rel)
+            elif rel.startswith("./"):
                 rel = rel[2:]
             if not rel:
                 continue

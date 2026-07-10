@@ -554,8 +554,11 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                 except Exception:  # noqa: BLE001
                     pass
                 raise TransientInfraError(
-                    f"stream 总时长 {now - t0:.0f}s 超预算 {self.swarm_wallclock_budget:.0f}s "
-                    f"(wall-clock runaway，已收 {n_chunks} chunk 仍未收尾) —— 基建瞬时，退避/fallback"
+                    # 复核 P-1：首行含 "timeout" 供 _breaker_error_transient 关键词判定
+                    # ——否则 F-F 健康重排学不到 runaway，惯性超时的 primary 永远排链头
+                    f"stream wallclock timeout: 总时长 {now - t0:.0f}s 超预算 "
+                    f"{self.swarm_wallclock_budget:.0f}s (runaway，已收 {n_chunks} chunk "
+                    f"仍未收尾) —— 基建瞬时，退避/fallback"
                 )
             # 自静默心跳：超过 after 且距上次心跳≥every 才记一行，证明长调用仍在吐 token（非挂死）。
             if now - t0 >= self.swarm_heartbeat_after and now - last_beat >= self.swarm_heartbeat_every:
@@ -899,12 +902,15 @@ class ModelRouter:
 
         role = f"worker/{difficulty}"
         _wmax = getattr(self.config, "worker_max_tokens", 0) or None
+        # E2（round38c 主题E）：worker 单流总墙钟——超时抛 TransientInfraError，
+        # with_fallbacks 链内即刻切备（治「单调用挂满 900s 总预算无本步换备」）
+        _wwc = float(getattr(self.config, "worker_stream_wallclock_s", 0.0) or 0.0)
         p_prov = self._get_provider_for_model(primary_name)
         primary = p_prov.get_chat_model(
             primary_name,
             temperature=self.config.worker_temperature,
             callbacks=[ModelInvocationLogger(role, primary_name, p_prov.provider.id)],
-            max_tokens=_wmax,
+            max_tokens=_wmax, wallclock_budget=_wwc,
         )
         fallback_llms = []
         for i, fb_name in enumerate(fallback_names):
@@ -915,7 +921,7 @@ class ModelRouter:
                 fb_name,
                 temperature=self.config.worker_temperature,
                 callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
-                max_tokens=_wmax,
+                max_tokens=_wmax, wallclock_budget=_wwc,
             ))
         # F-F（阶段4）：接 breaker 健康重排 + 成败记账（见 _assemble_worker_chain）
         _named = [(primary_name, primary)] + [
@@ -931,12 +937,15 @@ class ModelRouter:
         """
         role = f"worker/{difficulty}"
         _wmax = getattr(self.config, "worker_max_tokens", 0) or None
+        # E2（round38c 主题E）：worker 单流总墙钟——超时抛 TransientInfraError，
+        # with_fallbacks 链内即刻切备（治「单调用挂满 900s 总预算无本步换备」）
+        _wwc = float(getattr(self.config, "worker_stream_wallclock_s", 0.0) or 0.0)
         p_prov = self._get_provider_for_model(model_name)
         primary = p_prov.get_chat_model(
             model_name,
             temperature=self.config.worker_temperature,
             callbacks=[ModelInvocationLogger(role, model_name, p_prov.provider.id)],
-            max_tokens=_wmax,
+            max_tokens=_wmax, wallclock_budget=_wwc,
         )
         # 复用该难度的 fallback 链（排除掉 override 模型自己，避免重复）
         _, fallback_names = self._resolve_route(difficulty, "text")
@@ -949,12 +958,38 @@ class ModelRouter:
                 fb_name,
                 temperature=self.config.worker_temperature,
                 callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id)],
-                max_tokens=_wmax,
+                max_tokens=_wmax, wallclock_budget=_wwc,
             ))
         # F-F（阶段4）：同 get_llm_for_subtask——健康重排 + 记账
         _fb_named = [fb for fb in fallback_names if fb and fb != model_name]
         _named = [(model_name, primary)] + list(zip(_fb_named, fallback_llms))
         return self._assemble_worker_chain(_named)
+
+    def _alternate_candidates(self, difficulty: str, modality: str = "text") -> list[str]:
+        """E1+复核 C-4：alternate 候选=fallback 链中 ≠primary 且【非 trivial 档 primary】
+        的模型（难度本身为 trivial 除外）。
+
+        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 Saka 112K 最弱）居首
+        时，「第一个 ≠primary」会把 medium/complex 的失败重试派到最弱模型=RUN10 顾虑成真。
+        排除 trivial 档 primary 后，medium 的 alternate 自然落到更强档，「换模型」不再
+        意味着「降级」。"""
+        primary_name, fallback_names = self._resolve_route(difficulty, modality)
+        _trivial = (getattr(self.config, "routing_trivial", None)
+                    if str(difficulty).lower() != "trivial" else None)
+        return [f for f in (fallback_names or [])
+                if f and f != primary_name and f != _trivial]
+
+    def has_alternate_for_subtask(self, difficulty: str, modality: str = "text") -> bool:
+        """E1（round38c 主题E）：该难度是否存在 ≠primary 的异构备选。
+
+        retry_alternate 兑现判据的唯一事实源——轻量只查路由表，不构造 LLM。dispatch 旧判据
+        `len(worker_parallel_pool)==1` 把「池长」当「无备选」，池 1 模型但 fallback 链有异构
+        备选时 alternate 被静默改写为同模型+boost（register #26：换备日志 9 次、实派恒主力）。
+        """
+        try:
+            return bool(self._alternate_candidates(difficulty, modality))
+        except Exception:  # noqa: BLE001 — 判据失败按无备选处理（回退 boost 路径，不炸派发）
+            return False
 
     def get_alternate_llm_for_subtask(
         self, difficulty: str, modality: str = "text"
@@ -969,7 +1004,9 @@ class ModelRouter:
         无真异构备选时(如 COMPLEX 只配单模型)回退 primary 并告警(可观测，不静默)。
         """
         primary_name, fallback_names = self._resolve_route(difficulty, modality)
-        alt = next((f for f in (fallback_names or []) if f and f != primary_name), None)
+        # 复核 C-4：与 has_alternate_for_subtask 同源候选（排除 trivial 档 primary，
+        # 「换模型」不再意味着「降到最弱档」）
+        alt = next(iter(self._alternate_candidates(difficulty, modality)), None)
         if not alt:
             logger.warning(
                 "[ROUTER] %s/%s 无异构备选模型(fallback 链为空或全=primary '%s')，"
@@ -984,6 +1021,8 @@ class ModelRouter:
             temperature=self.config.worker_temperature,
             callbacks=[ModelInvocationLogger(role, model_name, prov.provider.id)],
             max_tokens=(getattr(self.config, "worker_max_tokens", 0) or None),
+            wallclock_budget=float(
+                getattr(self.config, "worker_stream_wallclock_s", 0.0) or 0.0),
         )
         return llm, model_name
 
