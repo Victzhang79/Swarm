@@ -81,6 +81,8 @@ SYSTEM_PROMPT_TEMPLATE = """\
 - 超时限制 {max_execution_time} 秒
 - 不允许修改 Scope 外的文件
 - 不允许执行白名单外的命令
+- 沙箱工作区【没有 git 仓库】（by design）：不要运行 git status/log/diff 等 shell git
+  命令（必失败白烧步数）；查看自己的变更只用 git_diff 工具（系统在宿主机侧代跑）
 
 ## 📝 输出格式
 完成所有修改后，在最终回复中包含：

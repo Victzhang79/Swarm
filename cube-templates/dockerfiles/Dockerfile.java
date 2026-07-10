@@ -32,6 +32,26 @@ RUN cd /tmp/warmup \
         || echo "⚠️ warmup 离线编译失败：部分依赖未命中缓存，检查 settings.xml 镜像源是否覆盖 SB4.x/Shiro/yauaa 等") \
     && rm -rf /tmp/warmup/target
 
+# F2（round38c 主题F，register #18/#35 后半）：补 lint/formatter——L1 lint 层的
+# checkstyle 与 format 层的 google-java-format 此前在沙箱恒缺席（round38c 实证
+# 52/52 lint/format 全 skipped=L1 实为 3 层，可观测性降级）。装上闸门才有牙。
+# jar 走阿里云 Maven 镜像（对齐 settings.xml 国内源；GitHub release 内网不稳）。
+# checkstyle wrapper 内置 -c /google_checks.xml（jar classpath 自带配置——L1 的
+# _lint_java 裸跑不带 -c，无默认配置时 CLI 必非 0 被 only_error_if_issues 静默跳过）。
+RUN apt-get update && apt-get install -y --no-install-recommends wget \
+    && mkdir -p /opt/lint \
+    && wget -q -O /opt/lint/checkstyle.jar \
+        https://maven.aliyun.com/repository/public/com/puppycrawl/tools/checkstyle/10.17.0/checkstyle-10.17.0-all.jar \
+    && wget -q -O /opt/lint/google-java-format.jar \
+        https://maven.aliyun.com/repository/public/com/google/googlejavaformat/google-java-format/1.22.0/google-java-format-1.22.0-all-deps.jar \
+    && printf '#!/bin/sh\nexec java -jar /opt/lint/checkstyle.jar -c /google_checks.xml "$@"\n' \
+        > /usr/local/bin/checkstyle \
+    && printf '#!/bin/sh\nexec java -jar /opt/lint/google-java-format.jar "$@"\n' \
+        > /usr/local/bin/google-java-format \
+    && chmod +x /usr/local/bin/checkstyle /usr/local/bin/google-java-format \
+    && rm -rf /var/lib/apt/lists/* \
+    && (checkstyle --version && google-java-format --version || true)
+
 # 校验工具链（不阻断构建）
 RUN java -version && mvn -v || true
 
