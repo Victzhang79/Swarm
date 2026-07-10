@@ -758,9 +758,11 @@ class AppConfig(BaseSettings):
     # round38 实测 7/9 模块设计被预算闸拒绝（总花费才 27k）；round27 实测 ULTRA 仅规划期
     # 云端 >800k。故 TECH_DESIGN-STAGE1 揭示模块数后立即按 base+per_module×模块数 放宽
     # （ledger.widen_budget 单调只增不减，与墙钟 P1-B"规划揭示后动态重算"同模式）。
-    # 标定：单模块规划成本 ≈ 设计 13k+契约 26k+摊派 ≈50k，经 plan_ratio 0.25 折算 → 200k。
-    # 0=关闭模块弹性（退回 flat base）。SWARM_MAX_TASK_TOKENS_PER_MODULE 可调。
-    max_task_tokens_per_module: int = Field(200_000, ge=0)
+    # 标定（R38b-1 ③ 上修 200k→300k）：round38b 实测 10 模块规划期 ~750k（506k 上游
+    # +13 拆批），round27 实测 826k——经 plan_ratio 0.35 折算单模块 ≈75k/0.35/n → 300k
+    # 让常态不触发阶段借位（借位是安全阀非常态）。0=关闭模块弹性（退回 flat base）。
+    # SWARM_MAX_TASK_TOKENS_PER_MODULE 可调。
+    max_task_tokens_per_module: int = Field(300_000, ge=0)
     # P1-B：单次 Brain 执行墙钟【弹性】上限，防失控任务（replan 空转/卡节点）无上限占沙箱/GPU。
     # ★整体考虑：绝不误杀合法大型任务★——实测合法 E2E 大任务跑 7-8h（见 DEVLOG round9 7h45m）。
     # 故用【弹性预算】：有效上限 = base + per_subtask×子任务数，随规划揭示的任务规模动态放宽

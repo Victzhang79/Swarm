@@ -42,10 +42,16 @@ logger = logging.getLogger(__name__)
 # §九 示例比例（可配比例而非绝对值）；未列出的 stage 不设子预算（只受总闸）。
 DEFAULT_STAGE_RATIOS: dict[str, float] = {
     "extract": 0.05,
-    "plan": 0.25,
+    # R38b-1 ③：0.25→0.35——ultra 规划期实测（round27 826k / round38b ~750k）占比
+    # 结构性高于四分之一；比例是【上限】非分配，各阶段之和不必为 1。
+    "plan": 0.35,
     "execute": 0.55,
     "verify": 0.15,
 }
+
+# R38b-1 ①：阶段借位顶格倍数——总预算余量充足时阶段有效上限 ≤ 1.5×基线；
+# 超出=真失控照拦（失控主防线是覆盖单调合同/replan 水位闸，阶段闸不必兼任）。
+_STAGE_BORROW_CAP = 1.5
 
 # 阶段1.4：brain 图节点 → 预算阶段（runner 事件循环 on_chain_start 时设置）。
 # 未列出/未知节点返回 None=保持上一阶段（ChannelWrite 等框架噪声不重置）。
@@ -121,7 +127,7 @@ class _Entry:
         "budget_total", "local_budget", "stage_ratios", "stage",
         "cloud_in", "cloud_out", "local", "llm_calls", "wall_ms",
         "replan_rounds", "stage_spent", "reserved_cloud", "reserved_local",
-        "stage_reserved", "dirty", "seg_t0", "attached",
+        "stage_reserved", "stage_borrow", "dirty", "seg_t0", "attached",
     )
 
     def __init__(self) -> None:
@@ -139,6 +145,9 @@ class _Entry:
         self.reserved_cloud = 0
         self.reserved_local = 0
         self.stage_reserved: dict[str, int] = {}
+        # R38b-1 ①：阶段借位账（stage → 已借额度）。总预算余量充足时阶段可有界借位
+        # （有效上限 ≤ _STAGE_BORROW_CAP×基线），round38b 实证阶段闸杀死总剩 79% 的健康任务。
+        self.stage_borrow: dict[str, int] = {}
         self.dirty = False
         self.seg_t0: float | None = None  # 本执行段起点（attach 置位，detach 结算 wall_ms）
         # 复核 H1a（阶段1）：只有 attach 过的条目才允许落库——detach 后迟到的 worker
@@ -503,12 +512,29 @@ def reserve(task_id: str, *, est_in: int, est_out: int, kind: str = "cloud") -> 
                 stage = e.stage
                 if stage is not None:
                     limit = _stage_limit_locked(e, stage)
-                    if limit is not None and (
-                            e.stage_spent.get(stage, 0)
-                            + e.stage_reserved.get(stage, 0) + est > limit):
-                        u = _usage_locked(task_id, e, stage=stage, stage_limit=limit)
-                        u["requested_est"] = est
-                        raise TaskTokenLimitExceeded(u)
+                    if limit is not None:
+                        need = (e.stage_spent.get(stage, 0)
+                                + e.stage_reserved.get(stage, 0) + est)
+                        eff = limit + e.stage_borrow.get(stage, 0)
+                        if need > eff:
+                            # R38b-1 ①：阶段借位——总闸已过（上方）=总预算余量充足；
+                            # 有界放宽本阶段（≤1.5×基线）而非杀死健康任务（round38b：
+                            # 总剩 79% 被阶段闸打 FAILED）。借位入账+WARNING fail-loud。
+                            cap = int(limit * _STAGE_BORROW_CAP)
+                            if need <= cap:
+                                e.stage_borrow[stage] = need - limit
+                                e.dirty = True
+                                logger.warning(
+                                    "[ledger] 任务 %s 阶段 %s 借位：需求 %d > 基线 %d，"
+                                    "总预算余量充足 → 有效上限放宽至 %d（顶格 %d）",
+                                    task_id, stage, need, limit,
+                                    e.stage_borrow[stage] + limit, cap)
+                            else:
+                                u = _usage_locked(task_id, e, stage=stage,
+                                                  stage_limit=limit)
+                                u["requested_est"] = est
+                                u["stage_borrow_cap"] = cap
+                                raise TaskTokenLimitExceeded(u)
             e.reserved_cloud += est
             if e.stage is not None:
                 e.stage_reserved[e.stage] = e.stage_reserved.get(e.stage, 0) + est
@@ -553,10 +579,12 @@ def admission_probe(task_id: str, est: int, kind: str = "cloud") -> str:
         if stage is not None:
             limit = _stage_limit_locked(e, stage)
             if limit is not None:
+                # R38b-1 ①：镜像 reserve 的借位语义——真顶 = 1.5×基线（借位自动发生）。
+                cap = int(limit * _STAGE_BORROW_CAP)
                 ss = e.stage_spent.get(stage, 0)
-                if ss + est > limit:
+                if ss + est > cap:
                     return "hopeless"
-                if ss + e.stage_reserved.get(stage, 0) + est > limit:
+                if ss + e.stage_reserved.get(stage, 0) + est > cap:
                     verdict = "wait"
         return verdict
 
@@ -647,8 +675,11 @@ def ensure_budget(task_id: str, *, min_tokens: int = 0, stage: str | None = None
         st = stage or e.stage
         if st is not None:
             limit = _stage_limit_locked(e, st)
+            # R38b-1 ①：镜像 reserve 的借位顶格（1.5×基线）——否则 probe 说 fit、
+            # ensure_budget 却按基线拒，准入等待会对着永不改变的判定空转。
             if limit is not None and (
-                    limit - e.stage_spent.get(st, 0) - e.stage_reserved.get(st, 0)
+                    int(limit * _STAGE_BORROW_CAP)
+                    - e.stage_spent.get(st, 0) - e.stage_reserved.get(st, 0)
             ) < min_tokens:
                 u = _usage_locked(task_id, e, stage=st, stage_limit=limit)
                 u["requested_est"] = max(0, int(min_tokens))
@@ -699,6 +730,8 @@ def _snapshot_locked(task_id: str) -> dict:
         "budget_total": e.budget_total,
         "reserved": e.reserved_cloud,
         "stage": e.stage,
+        # R38b-1 ①：借位账透出（机读账/FAILED token_usage 可见"哪个阶段借了多少"）
+        "stage_borrow": dict(e.stage_borrow),
     }
 
 

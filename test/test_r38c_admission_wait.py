@@ -44,41 +44,41 @@ def test_reserve_denial_carries_requested_est_total_gate():
 
 
 def test_reserve_denial_carries_requested_est_stage_gate():
-    ledger.attach("c2", budget_total=1000)
-    ledger.set_stage("c2", "plan")  # plan 子预算 = 250
+    ledger.attach("c2", budget_total=1000, stage_ratios={"plan": 0.25})
+    ledger.set_stage("c2", "plan")  # 基线 250，借位顶格 375
     with pytest.raises(TaskTokenLimitExceeded) as ei:
-        ledger.reserve("c2", est_in=200, est_out=100, kind="cloud")
+        ledger.reserve("c2", est_in=400, est_out=200, kind="cloud")  # 600 > 375
     u = ei.value.usage
-    assert u.get("stage") == "plan" and u.get("requested_est") == 300
+    assert u.get("stage") == "plan" and u.get("requested_est") == 600
 
 
 def test_ensure_budget_denial_carries_requested_est():
     """复核 F4：ensure_budget 与 reserve 对齐带 requested_est——缺它准入等待会无信息放行。"""
-    ledger.attach("c2b", budget_total=1000)
+    ledger.attach("c2b", budget_total=1000, stage_ratios={"plan": 0.25})
     with pytest.raises(TaskTokenLimitExceeded) as ei:
         ledger.ensure_budget("c2b", min_tokens=5000)
     assert ei.value.usage.get("requested_est") == 5000
-    ledger.set_stage("c2b", "plan")  # 子预算 250
+    ledger.set_stage("c2b", "plan")  # 基线 250，借位顶格 375
     with pytest.raises(TaskTokenLimitExceeded) as ei2:
-        ledger.ensure_budget("c2b", min_tokens=300)
-    assert ei2.value.usage.get("requested_est") == 300
+        ledger.ensure_budget("c2b", min_tokens=400)  # 400 > 375
+    assert ei2.value.usage.get("requested_est") == 400
 
 
 # ─────────────────── admission_probe 三态 ───────────────────
 
 def test_admission_probe_three_states():
-    ledger.attach("c3", budget_total=1000)
-    ledger.set_stage("c3", "plan")  # 子预算 250
-    # fit：无占用，est 100 ≤ 250
+    ledger.attach("c3", budget_total=1000, stage_ratios={"plan": 0.25})
+    ledger.set_stage("c3", "plan")  # 基线 250，借位顶格 375
+    # fit：无占用，est 100 ≤ 顶格
     assert ledger.admission_probe("c3", 100) == "fit"
-    # wait：在飞预留 200 占满，est 100 现在不进（200+100>250）但释放后进（0+100≤250）
+    # wait：在飞 200 + est 200 = 400 > 375 顶格；释放后 200 ≤ 375
     rid = ledger.reserve("c3", est_in=150, est_out=50, kind="cloud")
-    assert ledger.admission_probe("c3", 100) == "wait"
+    assert ledger.admission_probe("c3", 200) == "wait"
     # 释放后 fit
     ledger.settle(rid, real_in=10, real_out=10)  # spent=20
-    assert ledger.admission_probe("c3", 100) == "fit"
-    # hopeless：est 300 > 250-20 —— 全释放也不够
-    assert ledger.admission_probe("c3", 300) == "hopeless"
+    assert ledger.admission_probe("c3", 200) == "fit"
+    # hopeless：est 400 → 20+400 > 375 顶格 —— 连借位也不够
+    assert ledger.admission_probe("c3", 400) == "hopeless"
 
 
 def test_admission_probe_trackonly_always_fit():
@@ -92,7 +92,7 @@ def test_await_admission_waits_for_settle():
     """在飞 settle 释放后准入返回 True（round38 正解：等 103-408s 的 settle 而非 33ms 烧完）。"""
     from swarm.brain import planning_nodes as pn
 
-    ledger.attach("c5", budget_total=1000)
+    ledger.attach("c5", budget_total=1000, stage_ratios={"plan": 0.25})
     ledger.set_stage("c5", "plan")
     rid = ledger.reserve("c5", est_in=150, est_out=50, kind="cloud")  # 在飞占满
 
@@ -102,7 +102,7 @@ def test_await_admission_waits_for_settle():
             ledger.settle(rid, real_in=10, real_out=10)
         t = asyncio.ensure_future(_settle_later())
         ok = await pn._await_token_admission(
-            "c5", {"requested_est": 100}, max_wait_s=5.0, poll_s=0.05)
+            "c5", {"requested_est": 200}, max_wait_s=5.0, poll_s=0.05)
         await t
         return ok
 
@@ -112,8 +112,8 @@ def test_await_admission_waits_for_settle():
 def test_await_admission_hopeless_returns_false_fast():
     from swarm.brain import planning_nodes as pn
 
-    ledger.attach("c6", budget_total=1000)
-    ledger.set_stage("c6", "plan")  # 子预算 250
+    ledger.attach("c6", budget_total=1000, stage_ratios={"plan": 0.25})
+    ledger.set_stage("c6", "plan")  # 基线 250，借位顶格 375
 
     async def _run():
         import time as _t
@@ -130,13 +130,13 @@ def test_await_admission_hopeless_returns_false_fast():
 def test_await_admission_timeout_returns_false():
     from swarm.brain import planning_nodes as pn
 
-    ledger.attach("c7", budget_total=1000)
+    ledger.attach("c7", budget_total=1000, stage_ratios={"plan": 0.25})
     ledger.set_stage("c7", "plan")
     ledger.reserve("c7", est_in=150, est_out=50, kind="cloud")  # 在飞永不结算
 
     async def _run():
         return await pn._await_token_admission(
-            "c7", {"requested_est": 100}, max_wait_s=0.2, poll_s=0.05)
+            "c7", {"requested_est": 200}, max_wait_s=0.2, poll_s=0.05)
 
     assert asyncio.run(_run()) is False
 

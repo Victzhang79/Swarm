@@ -1076,18 +1076,25 @@ async def _plan_ultra_batched(
             prompt_user += "\n\n" + _skills_blk_batched
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
+            # R38b-1 ②：token 拒绝走准入等待（在飞 settle 后有余量→重试不占能力配额，
+            # 上批 sibling 漏网致 round38b 异常直接冒泡）；hopeless/超时 → 保持任务级
+            # 上抛语义（salvage），绝不吞成模块 error。
             last_fail: tuple = ("error", i, mod_name, None, None, len(batch))
-            for _attempt in range(1, _PLAN_BATCH_MAX_ATTEMPTS + 1):
+            _attempt = 0
+            _adm_retries = 0
+            from swarm.brain.planning_nodes import (
+                _ADMISSION_RETRY_MAX as _ADM_MAX, _await_token_admission)
+            while _attempt < _PLAN_BATCH_MAX_ATTEMPTS and _adm_retries <= _ADM_MAX:
                 # §九 阶段1.5：每 attempt 是重试层——发起前查 ledger 余额，耗尽即确定性
                 # 上抛（绝不吞成"模块失败"记账：预算耗尽是任务级事实，须 salvage 而非
                 # 降级跳过后继续烧兄弟批）。
                 from swarm.models.errors import TaskTokenLimitExceeded as _TTLE
                 from swarm.models.errors import TransientInfraError as _TIE_b
                 from swarm.models import ledger as _ledger_mod
-                _ledger_mod.ensure_budget(state.get("task_id") or "",
-                                          min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
                 _t0 = _time.monotonic()
                 try:
+                    _ledger_mod.ensure_budget(state.get("task_id") or "",
+                                              min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
                     # R34-1：流式+chunk 看门狗（无 astream 的桩/客户端=原 wait_for 行为）
                     # R35-A：primary 外层墙钟超时→显式切备用模型(Kimi)重试
                     response = await _invoke_llm_abortable(
@@ -1135,10 +1142,18 @@ async def _plan_ultra_batched(
                     # ——落 "error" 桶会让 U3 bisect（只认 oc[0]=="timeout"）对 stall（本阶段
                     # 立项要治的形态）静默失效。stall 操作语义=超时，与 TimeoutError 同桶。
                     last_fail = ("timeout", i, mod_name, None, None, len(batch))
-                except _TTLE:
+                except _TTLE as _tt_exc:
+                    # R38b-1 ②：可等待的预留紧张 → 等在飞结算再重试（不占能力配额）；
+                    # hopeless/超时 → 上抛保持任务级 salvage 语义（绝不吞成模块 error）。
+                    if _adm_retries < _ADM_MAX and await _await_token_admission(
+                            state.get("task_id"), getattr(_tt_exc, "usage", None) or {},
+                            max_wait_s=_PLAN_BATCH_TIMEOUT):
+                        _adm_retries += 1
+                        continue
                     raise  # §九 阶段1.5：预算耗尽绝不吞成模块 error（任务级 salvage）
                 except Exception as exc:  # noqa: BLE001
                     last_fail = ("error", i, mod_name, exc, None, len(batch))
+                _attempt += 1
                 if _attempt < _PLAN_BATCH_MAX_ATTEMPTS:
                     logger.warning(
                         "[PLAN-BATCH] 模块'%s' 第 %d/%d 次分解失败(%s)，退避重试",

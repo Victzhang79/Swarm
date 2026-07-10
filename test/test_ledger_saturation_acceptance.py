@@ -86,10 +86,12 @@ def test_saturated_provider_deterministic_escalate_within_stage_budget():
     billed = provider.billed_in + provider.billed_out
     # ② 账本读数 ≥ 真实计费 90%
     assert settled >= 0.9 * billed, f"账本 {settled} < 90% × 计费 {billed}"
-    # ③ 花费钉死在阶段子预算内（余量 ≤ 单次调用预留：最后一笔在飞的天然上界）
+    # ③ 花费钉死在阶段【借位顶格】内（R38b-1：总预算余量足时阶段可借位至 1.5×基线，
+    # 顶格才是硬上界；余量 ≤ 单次调用预留：最后一笔在飞的天然上界）
     per_call_reserve = len(prompt) // 3 + 64 + guard._DEFAULT_OUT_RESERVE
-    assert settled <= stage_limit + per_call_reserve, (
-        f"阶段花费 {settled} 超出子预算 {stage_limit} 逾单次预留 {per_call_reserve}")
+    _hard_cap = int(stage_limit * ledger._STAGE_BORROW_CAP)
+    assert settled <= _hard_cap + per_call_reserve, (
+        f"阶段花费 {settled} 超出借位顶格 {_hard_cap} 逾单次预留 {per_call_reserve}")
     # 拒绝发起的调用一分钱不烧：provider 实际被调次数 = 账本 llm_calls
     assert provider.calls == snap["llm_calls"]
 

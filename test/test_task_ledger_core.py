@@ -120,20 +120,22 @@ def test_local_budget_gates_when_configured():
 # ─────────────────── 阶段子预算 ───────────────────
 
 def test_stage_budget_derives_from_ratio_and_gates():
-    ledger.attach("t9", budget_total=1000)  # 默认 plan=25% → 250
+    # R38b-1：钉 ratio（默认已 0.35）；借位顶格 1.5×250=375，超顶格才拒
+    ledger.attach("t9", budget_total=1000, stage_ratios={"plan": 0.25})
     ledger.set_stage("t9", "plan")
     with pytest.raises(TaskTokenLimitExceeded) as ei:
-        ledger.reserve("t9", est_in=200, est_out=100, kind="cloud")  # 300 > 250
+        ledger.reserve("t9", est_in=400, est_out=200, kind="cloud")  # 600 > 375
     assert ei.value.usage.get("stage") == "plan", "阶段烧穿必须带 stage 归因"
 
 
 def test_stage_exhaustion_does_not_eat_sibling_stage():
-    ledger.attach("t10", budget_total=1000)
+    # R38b-1：钉 ratio；借位顶格 375——需超顶格才拒（240+200=440 > 375）
+    ledger.attach("t10", budget_total=1000, stage_ratios={"plan": 0.25})
     ledger.set_stage("t10", "plan")
     rid = ledger.reserve("t10", est_in=100, est_out=100, kind="cloud")
     ledger.settle(rid, real_in=240, real_out=0)  # plan 几乎烧穿(240/250)
     with pytest.raises(TaskTokenLimitExceeded):
-        ledger.reserve("t10", est_in=100, est_out=0, kind="cloud")
+        ledger.reserve("t10", est_in=200, est_out=0, kind="cloud")
     ledger.set_stage("t10", "execute")  # execute=55% → 550，兄弟份不受 plan 影响
     rid2 = ledger.reserve("t10", est_in=300, est_out=100, kind="cloud")
     ledger.settle(rid2, real_in=300, real_out=100)
@@ -184,11 +186,11 @@ def test_resume_restores_settled_from_db(monkeypatch):
         "llm_calls": 7, "replan_rounds": 1, "stage_spent": {"plan": 400},
     } if task_id == "t15" else None)
     monkeypatch.setattr(ledger, "_flush_row", lambda *a, **k: True)
-    ledger.attach("t15", budget_total=1000)
+    ledger.attach("t15", budget_total=1000, stage_ratios={"plan": 0.25})
     snap = ledger.snapshot("t15")
     assert snap["cloud_tokens_in"] == 300 and snap["llm_calls"] == 7
     assert ledger.remaining("t15") == 1000 - 400
-    ledger.set_stage("t15", "plan")  # plan 已花 400 > 250 份额 → 立即闸住
+    ledger.set_stage("t15", "plan")  # plan 已花 400 > 借位顶格 375 → 立即闸住
     with pytest.raises(TaskTokenLimitExceeded):
         ledger.reserve("t15", est_in=10, est_out=0, kind="cloud")
 

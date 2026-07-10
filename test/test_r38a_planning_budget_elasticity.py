@@ -97,23 +97,25 @@ def test_widened_budget_survives_db_reload(monkeypatch):
 def test_round38_stage2_concurrency_survives_after_module_widen():
     """round38 死点复现：plan 阶段 spent≈25k + 并发 3×大预留在 125k 子预算下第 3 个必拒；
     按模块数放宽后（base+9×per_module=2.3M → plan 子预算 575k）三个并发预留全部放行。"""
-    ledger.attach("t38", budget_total=500_000)
+    # R38b-1 后语义：钉 ratio 0.25（不随默认 0.35 漂移）；借位顶格=1.5×125k=187.5k，
+    # 拒绝需求需超顶格（round38 现场的"第 3 个必拒"在借位下变为"超顶格才拒"——更优）。
+    ledger.attach("t38", budget_total=500_000, stage_ratios={"plan": 0.25})
     ledger.set_stage("t38", "plan")
     # STAGE1 已花 ~25k（plan 阶段）
     rid = ledger.reserve("t38", est_in=20_000, est_out=5_000, kind="cloud")
     ledger.settle(rid, real_in=20_000, real_out=5_000)
 
-    # 未放宽（round38 现场）：第 3 个并发预留撞 plan 子预算 125k
-    ledger.reserve("t38", est_in=36_000, est_out=4_096, kind="cloud")
-    ledger.reserve("t38", est_in=36_000, est_out=4_096, kind="cloud")
+    # 未放宽：两笔 70k 预留（第 2 笔触发借位 165k≤187.5k），第 3 笔 235k 超借位顶格 → 拒
+    ledger.reserve("t38", est_in=66_000, est_out=4_000, kind="cloud")
+    ledger.reserve("t38", est_in=66_000, est_out=4_000, kind="cloud")
     with pytest.raises(TaskTokenLimitExceeded) as ei:
-        ledger.reserve("t38", est_in=36_000, est_out=4_096, kind="cloud")
+        ledger.reserve("t38", est_in=66_000, est_out=4_000, kind="cloud")
     assert ei.value.usage.get("stage") == "plan"
 
-    # STAGE1 揭示 9 模块 → 放宽 base + 9×200k
+    # STAGE1 揭示 9 模块 → 放宽 base + 9×200k → plan 基线 575k
     ledger.widen_budget("t38", 500_000 + 9 * 200_000)
     # 此前被拒的同规格预留现在放行
-    ledger.reserve("t38", est_in=36_000, est_out=4_096, kind="cloud")
+    ledger.reserve("t38", est_in=66_000, est_out=4_000, kind="cloud")
 
 
 # ─────────────────── 配置面 ───────────────────

@@ -34,8 +34,15 @@ def test_stage_map_covers_all_graph_nodes():
     assert missing == set(), f"图节点缺阶段映射: {missing}"
 
 
-def test_stage_ratios_sum_at_most_one():
-    assert sum(ledger.DEFAULT_STAGE_RATIOS.values()) <= 1.0 + 1e-9
+def test_stage_ratios_are_independent_caps():
+    """R38b-1 ③ 语义演进：比例是各阶段【独立上限】（各自 ×budget_total），非分配份额
+    ——守恒由总闸负责，允许重叠（plan 0.25→0.35 后总和 1.10）。上限仍须各自 ≤1 且 >0。"""
+    for k, v in ledger.DEFAULT_STAGE_RATIOS.items():
+        assert 0 < v <= 1.0, f"stage {k} ratio {v} 越界"
+    # 借位顶格后单阶段有效上限也不得超过总预算
+    for k, v in ledger.DEFAULT_STAGE_RATIOS.items():
+        assert v * ledger._STAGE_BORROW_CAP <= 1.0 + 1e-9, (
+            f"stage {k}: ratio {v} × 借位顶格 {ledger._STAGE_BORROW_CAP} 超过总预算")
 
 
 def test_effective_budget_math():
