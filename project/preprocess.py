@@ -1639,10 +1639,15 @@ def _clean_llm_summary(text: str) -> str:
 
 
 def _save_analysis_summary(project_id: str, summary: str) -> None:
-    """保存分析摘要到项目描述"""
+    """保存分析摘要（F6，登记册 §七）：落独立字段 analysis_summary——旧行为静默覆写
+    用户项目 description（用户手写的项目说明被 LLM 摘要吃掉且不可逆）。description
+    仅在【原本为空】时顺带填充（便利不越权）。"""
     try:
-        from swarm.project.store import update_project
-        cleaned = _clean_llm_summary(summary)
-        update_project(project_id, description=cleaned[:4000])
+        from swarm.project.store import get_project, update_project
+        cleaned = _clean_llm_summary(summary)[:4000]
+        update_project(project_id, analysis_summary=cleaned)
+        proj = get_project(project_id) or {}
+        if not (proj.get("description") or "").strip():
+            update_project(project_id, description=cleaned)
     except Exception as exc:
         logger.warning("Failed to save analysis summary: %s", exc)

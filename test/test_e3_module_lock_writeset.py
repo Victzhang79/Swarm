@@ -108,3 +108,34 @@ def test_e3_upgrade_success_swaps_to_writeset_lock(monkeypatch):
     probe = ModuleLock("proj-5", "default")
     assert probe.acquire() is True
     probe.release(); new_lock.release()
+
+
+# ─────────────── F6（同批补漏）：LLM 摘要不覆写用户 description ───────────────
+
+
+def test_f6_analysis_summary_saved_to_own_field_not_description(monkeypatch):
+    import swarm.project.preprocess as pp
+    calls = []
+
+    def _upd(project_id, **kw):
+        calls.append(kw)
+
+    monkeypatch.setattr("swarm.project.store.update_project", _upd)
+    monkeypatch.setattr("swarm.project.store.get_project",
+                        lambda pid: {"description": "用户手写的项目说明"})
+    pp._save_analysis_summary("p-1", "LLM 生成的分析摘要")
+    assert any("analysis_summary" in kw for kw in calls), "摘要必须落独立字段"
+    assert not any("description" in kw for kw in calls), (
+        "F6：用户手写 description 非空时绝不被 LLM 摘要静默覆写（旧行为不可逆吃掉）")
+
+
+def test_f6_empty_description_gets_convenience_fill(monkeypatch):
+    import swarm.project.preprocess as pp
+    calls = []
+    monkeypatch.setattr("swarm.project.store.update_project",
+                        lambda project_id, **kw: calls.append(kw))
+    monkeypatch.setattr("swarm.project.store.get_project",
+                        lambda pid: {"description": ""})
+    pp._save_analysis_summary("p-2", "摘要内容")
+    assert any(kw.get("description") == "摘要内容" for kw in calls), (
+        "description 原本为空时顺带填充（便利不越权）")

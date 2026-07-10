@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS projects (
     symbol_count INTEGER DEFAULT 0,
     language_breakdown JSONB DEFAULT '{}',
     config JSONB DEFAULT '{}',
+    analysis_summary TEXT DEFAULT '',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -153,6 +154,8 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
     # round18 P2：进度三本账（完成/放弃/剩余）——放弃单元数,让 web 进度不再误导"卡在 X/N"。
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS abandoned_subtasks INTEGER DEFAULT 0",
+    # F6（阶段6 补漏，发版回查）：预处理 LLM 摘要落独立字段，绝不静默覆写用户 description
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS analysis_summary TEXT DEFAULT ''",
 ]
 
 _TASK_SELECT = """
@@ -305,7 +308,7 @@ def create_project(
                 ON CONFLICT (path) DO NOTHING
                 RETURNING id, name, path, description, status, graph_status,
                           graph_progress, graph_error, file_count, symbol_count,
-                          language_breakdown, config, created_at, updated_at
+                          language_breakdown, config, analysis_summary, created_at, updated_at
                 """,
                 (project_id, name, path, description, Jsonb(config or {})),
             )
@@ -333,7 +336,7 @@ def get_project(project_id: str, conn_str: str | None = None) -> dict[str, Any] 
                 """
                 SELECT id, name, path, description, status, graph_status,
                        graph_progress, graph_error, file_count, symbol_count,
-                       language_breakdown, config, created_at, updated_at
+                       language_breakdown, config, analysis_summary, created_at, updated_at
                 FROM projects WHERE id = %s
                 """,
                 (project_id,),
@@ -350,7 +353,7 @@ def get_project_by_path(path: str, conn_str: str | None = None) -> dict[str, Any
                 """
                 SELECT id, name, path, description, status, graph_status,
                        graph_progress, graph_error, file_count, symbol_count,
-                       language_breakdown, config, created_at, updated_at
+                       language_breakdown, config, analysis_summary, created_at, updated_at
                 FROM projects WHERE path = %s
                 """,
                 (path,),
@@ -367,7 +370,7 @@ def list_projects(conn_str: str | None = None) -> list[dict[str, Any]]:
                 """
                 SELECT id, name, path, description, status, graph_status,
                        graph_progress, graph_error, file_count, symbol_count,
-                       language_breakdown, config, created_at, updated_at
+                       language_breakdown, config, analysis_summary, created_at, updated_at
                 FROM projects ORDER BY created_at DESC
                 """
             )
@@ -388,12 +391,16 @@ def update_project(
     symbol_count: int | None = None,
     language_breakdown: dict[str, int] | None = None,
     config: dict[str, Any] | None = None,
+    analysis_summary: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新项目字段"""
     sets: list[str] = []
     params: list[Any] = []
 
+    if analysis_summary is not None:
+        sets.append("analysis_summary = %s")
+        params.append(analysis_summary)
     if name is not None:
         sets.append("name = %s")
         params.append(name)
@@ -442,7 +449,7 @@ def update_project(
                 WHERE id = %s
                 RETURNING id, name, path, description, status, graph_status,
                           graph_progress, graph_error, file_count, symbol_count,
-                          language_breakdown, config, created_at, updated_at
+                          language_breakdown, config, analysis_summary, created_at, updated_at
                 """,
                 params,
             )
@@ -2006,8 +2013,9 @@ def _row_to_project(row: tuple) -> dict[str, Any]:
         "symbol_count": row[9],
         "language_breakdown": row[10] if isinstance(row[10], dict) else (json.loads(row[10]) if row[10] else {}),
         "config": row[11] if isinstance(row[11], dict) else (json.loads(row[11]) if row[11] else {}),
-        "created_at": row[12],
-        "updated_at": row[13],
+        "analysis_summary": row[12] or "",
+        "created_at": row[13],
+        "updated_at": row[14],
     }
 
 
