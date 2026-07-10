@@ -989,6 +989,7 @@ async def _handle_post_run(
         merged_diff=state.get("merged_diff") or "",
         subtask_results=state.get("subtask_results"),
     )
+    _attach_observability_account(token_usage, state)  # G3-1：DONE 终态机读键不再 API 全盲
     duration = store.compute_task_duration_seconds(task_rec)
     # 部分交付：有子任务被放弃(重试耗尽)或保 build 放弃(阶梯三 revert/桩)→ 终态 PARTIAL(非 DONE)。
     # 已完成子任务的真实产物照常落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃/桩项——绝不当
@@ -1113,6 +1114,36 @@ async def _load_state_snapshot(task_id: str, thread_id: str | None = None) -> di
     return dict(snapshot.values)
 
 
+def _attach_observability_account(token_usage: dict[str, Any],
+                                  state: dict[str, Any] | None) -> dict[str, Any]:
+    """G3-1（round38c 主题G P0）：round38 机读键并进 token_usage jsonb 槽——三终态统一。
+
+    此前 degraded_summary 只进 SSE result payload 与 PARTIAL/FAILED 账，DONE 终态
+    API 全盲；contract_failed_modules/l2_details/validate 降级标记只活在 LangGraph
+    state（SSE+API 双盲）——round38 造这些键就是给盯跑脚本的，DONE 路径必须读得到。
+    与 R38-E 机读账同槽同口径，零迁移。"""
+    st = state or {}
+    _dg = list(st.get("degraded_reasons") or [])
+    if _dg:
+        token_usage["degraded_summary"] = build_degraded_summary(_dg)
+        token_usage.setdefault("degraded_reasons", _dg[:50])
+    _cfm = st.get("contract_failed_modules")
+    if _cfm:
+        token_usage["contract_failed_modules"] = list(_cfm)[:30]
+    _l2d = st.get("l2_details")
+    if isinstance(_l2d, dict) and _l2d.get("issues"):
+        token_usage["l2_issues_head"] = [str(i)[:300] for i in _l2d["issues"][:5]]
+    try:
+        _vd = sorted(
+            sid for sid, wo in (st.get("subtask_results") or {}).items()
+            if (getattr(wo, "l1_details", None) or {}).get("build_cmd_downgraded_to_validate"))
+        if _vd:
+            token_usage["validate_downgraded_subtasks"] = _vd[:30]
+    except Exception:  # noqa: BLE001 — 观测账增强面，绝不阻断终态写
+        pass
+    return token_usage
+
+
 def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                             reason_code: str) -> dict[str, Any]:
     """R38-E：FAILED 终态的机读账（复用 token_usage jsonb 槽，与 PARTIAL 对称）。
@@ -1150,6 +1181,7 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                     tu[_k] = _prev[_k]
     except Exception:  # noqa: BLE001 — 诊断键补齐失败不阻断终态账
         pass
+    _attach_observability_account(tu, state)  # G3-1：FAILED 同享机读键（幂等）
     return tu
 
 
@@ -1209,6 +1241,7 @@ async def _finalize_governor_partial(
             if _k in _prev_tu:
                 token_usage[_k] = _prev_tu[_k]
     token_usage["salvage_reason"] = reason_code
+    _attach_observability_account(token_usage, state)  # G3-1：三终态统一机读键
     duration = store.compute_task_duration_seconds(_rec)
     # F4 同款拆两步：记账先落，status 再 CAS
     store.update_task(

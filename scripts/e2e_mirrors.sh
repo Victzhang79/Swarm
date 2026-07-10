@@ -39,7 +39,9 @@ MDIR="$PKG_DIR/logs_archive/process/${TAG}_mirrors"
 mkdir -p "$MDIR"
 
 # 高信号相位/异常关键词（通用多栈，勿写死语言）——覆盖相位机、恢复阶梯、编译/脚手架/覆盖/申报面
-KW='阶段|PLAN|DISPATCH|CONFIRM|VERIFY|MERGE|DELIVER|ACCEPT|LEARN|escalate|BLOCKED|give_up|covers|申报|baseline|超时|timeout|bisect|哨兵|normalize|pom owner|__RC__|command not found|mvn |migration|skipped|unverified|recursion|replan|apply_ok|stall|reactor|scaffold|脚手架|scope|writable'
+# G2-3（round38c 主题G P0）：补 skills-telemetry/模型调用/breaker/ledger——round38
+# 判读面明说 grep skills-telemetry，旧 KW 却滤掉该行=镜像失明误判"0 调用"
+KW='阶段|PLAN|DISPATCH|CONFIRM|VERIFY|MERGE|DELIVER|ACCEPT|LEARN|escalate|BLOCKED|give_up|covers|申报|baseline|超时|timeout|bisect|哨兵|normalize|pom owner|__RC__|command not found|mvn |migration|skipped|unverified|recursion|replan|apply_ok|stall|reactor|scaffold|脚手架|scope|writable|skills-telemetry|模型调用|breaker|ledger|MANIFEST-SYNTH|wallclock'
 
 # ---- 随跑日志（若不存在才建，避免重跑覆盖）----
 JOURNAL="$MDIR/journal.md"

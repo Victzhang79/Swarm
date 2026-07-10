@@ -461,9 +461,16 @@ class _SandboxSyncMixin:
                               for f in (list(getattr(_sc, "writable", []) or []))}
             _missing_writable = sorted(c for c in candidates if c in _writable_only)
             if _missing_writable:
+                # G1-1a（round38c 主题G P0·F1 裁决分流）：round38c 48/48 条此警告全是
+                # 【本轮新建/上游产物文件被规划器声明为 writable-modify】的定义使然形态
+                # （真 git 故障有独立信号 [git_tracked_set] WARNING，两镜像 0 次）。旧文案
+                # 「坏 ref/git 故障降级」把定义使然读作故障，盯跑者 48 次被误导——中性
+                # 文案+指向两种成因；真故障判据=伴随 [git_tracked_set] 故障行。
                 self._log(
-                    f"[WARN] workspace reset: {len(_missing_writable)} 个【writable 既有文件】不在 base 树"
-                    f"（坏 ref/git 故障降级）→ 本轮防脏叠加 reset 未生效: {_missing_writable[:5]}"
+                    f"workspace reset: {len(_missing_writable)} 个 writable 文件不在钉扎 base 树"
+                    f"→ 本轮防脏叠加 reset 对其未生效: {_missing_writable[:5]}"
+                    "（常见=新建/上游产物被声明为 writable-modify，定义使然非故障；"
+                    "若伴随 [git_tracked_set] 故障 WARNING 才疑 git 面）"
                 )
             return 0
 
