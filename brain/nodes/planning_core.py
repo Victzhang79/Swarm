@@ -218,21 +218,36 @@ def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
     return granted
 
 
-def _serialize_pom_writers(plan_obj, pom_by_id: dict) -> None:
+def _serialize_pom_writers(plan_obj, pom_by_id: dict,
+                           exclude_ids: set | None = None) -> None:
     """同一模块 pom 的多个失败写者按 id 序串成依赖链，杜绝并发写同一 pom 争抢。
 
     传递防环（HIGH-4）：经 _add_dep_safe 检查传递可达性，不止看直接边。
+    exclude_ids（D2 复核 CONFIRMED）：无产出放弃者（abandoned/give_up-revert，已不在
+    subtask_results）绝不入链——_is_ready 对该类依赖永不就绪，入链=把刚授权重派的
+    任务用自己新加的边永久扣死。give_up 打桩路有 l1_passed 产出在 completed 集，
+    依赖它无害，不在此列。本批 members 不受 exclude 影响（全员即将重派）。
     """
     if plan_obj is None or not hasattr(plan_obj, "subtasks"):
         return
     by_id = {st.id: st for st in plan_obj.subtasks}
+    _excl = set(exclude_ids or ())
     groups: dict = {}
     for sid, pom in pom_by_id.items():
         groups.setdefault(pom, []).append(sid)
     for _pom, members in groups.items():
-        members = sorted(members)
-        for i in range(1, len(members)):
-            _add_dep_safe(by_id, members[i], members[i - 1])
+        # D2（round38c 主题D）：跨批串链——旧实现只串【本批 granted】，而 failure 每次
+        # handle_failure 只传当次授权者（round38c 16:39/17:06/17:40/18:11 四批独立授权）
+        # → 批间写者零依赖边天然并发竞写=20:23/22:08 rebase 冲突来源。改按全 plan 该
+        # pom 的【全体现任写者】（writable∪create_files 命中，减无产出放弃者）∪ 本批
+        # 成链，历史批/原生写者一并纳入顺序边。_add_dep_safe 传递防环，重复边幂等。
+        _all_writers = sorted(({
+            st.id for st in plan_obj.subtasks
+            if _pom in (list(getattr(getattr(st, "scope", None), "writable", None) or [])
+                        + list(getattr(getattr(st, "scope", None), "create_files", None) or []))
+        } - _excl) | set(members))
+        for i in range(1, len(_all_writers)):
+            _add_dep_safe(by_id, _all_writers[i], _all_writers[i - 1])
 
 
 def _insert_module_order_edge(plan_obj, registrant_id: str, scaffold_id: str) -> bool:

@@ -493,6 +493,18 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 _blocked_now = {fid for fid in failed_ids
                                 if _det_of(subtask_results.get(fid)).get("pipeline_blocked")
                                 in _INTERNAL_BLOCKED_KINDS}
+                # D3b-①（round38c 主题D 复核 CONFIRMED）：L2 定向恢复此前【全程无证据
+                # 注入】——重派 worker 同 prompt 同条件大概率复产同缺陷、盲烧 replan 预算。
+                # verify_l2 可在 l2_details.retry_guidance 携带定向指引（如 stub 指纹红线
+                # 的"禁止假实现桩"），经既有 retry_guidance 通道（A4 round11，worker/
+                # prompts.py 渲染为硬约束块）注入被归因子任务；无指引时行为不变。
+                _l2_guidance = (state.get("l2_details") or {}).get("retry_guidance") or ""
+                if _l2_guidance:
+                    _l2_by_id = {s.id: s for s in getattr(plan_obj, "subtasks", []) or []}
+                    for fid in failed_ids:
+                        _l2_st = _l2_by_id.get(fid)
+                        if _l2_st is not None:
+                            _l2_st.retry_guidance = _l2_guidance[:1600]
                 dispatch_remaining = list(state.get("dispatch_remaining", []))
                 for fid in failed_ids:
                     subtask_results.pop(fid, None)
@@ -987,7 +999,15 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                         "[HANDLE_FAILURE] 确定性补依赖（治本 A2，据项目自身 pom 自证坐标，"
                         "重派 worker 直接编过、不再耗配额）：%s", _dep_injected,
                     )
-                _serialize_pom_writers(plan_obj, granted)
+                # D2 复核 CONFIRMED：无产出放弃者（revert 路，已 pop 出 subtask_results）
+                # 不得入链——_is_ready 对其永不就绪，入链=新授权任务被自己刚加的边扣死
+                _no_output_abandoned = {
+                    sid for sid in (set(state.get("abandoned_subtask_ids") or [])
+                                    | set(state.get("give_up_isolated_ids") or []))
+                    if sid not in subtask_results
+                }
+                _serialize_pom_writers(plan_obj, granted,
+                                       exclude_ids=_no_output_abandoned)
                 dispatch_remaining = list(state.get("dispatch_remaining", []))
                 for fid in failed_ids:
                     subtask_results.pop(fid, None)

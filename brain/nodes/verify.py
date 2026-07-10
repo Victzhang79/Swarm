@@ -173,6 +173,30 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                             "（防污染集成编译）: %s", len(_purged), _purged[:5])
                 except Exception as _exc:  # noqa: BLE001 清理失败不致命，继续 L2
                     logger.warning("[VERIFY_L2] 放弃文件清理失败（非致命，继续 L2）: %s", _exc)
+        # ── D3b（round38c 主题D）：worker 自产 stub 指纹红线——阶梯三桩模板串出现在
+        # 【非 give_up】子任务的文件=假实现混入交付（AppSecretAuthInterceptor 三方法全
+        # throw"TODO: 子任务未完成"被合入实证）。阶梯三桩（give_up_isolated_ids）是
+        # 诚实 PARTIAL 的设计行为豁免；其余 → 定向重派 owner（复用 TD2606-B8 l2_targeted
+        # 定向恢复：保留成功兄弟只重做假实现者）。
+        _stub_owners = _stub_fingerprint_owner_ids(state, merged_diff, plan_obj, subtask_results)
+        if _stub_owners:
+            return _l2_failure_state(
+                subtask_results, attributed_ids=_stub_owners,
+                l2_details={
+                    "issues": [
+                        f"stub_fingerprint: 子任务 {sid} 交付含阶梯三桩模板串的自产假实现"
+                        for sid in _stub_owners],
+                    # 复核 CONFIRMED（D3b-①）：不注指引=重派 worker 同 prompt 同条件
+                    # 大概率复产同 stub，replan 预算全烧在盲重试上。经 l2_targeted
+                    # 定向恢复通道渲染为 retry_guidance（failure.py 注入）。
+                    "retry_guidance": (
+                        "交付被拒：你上一次的产出含未实现的假实现桩——方法体 throw "
+                        "UnsupportedOperationException(\"TODO: 子任务未完成\") 或同模板"
+                        "占位。该模板串是系统内部'放弃打桩'专用标记，worker 产出中出现"
+                        "=假完成，确定性红线拒绝。本次必须提供真实完整的业务实现：实现"
+                        "全部方法体逻辑，不留任何 TODO 占位/空壳抛异常。"),
+                })
+
         from swarm.brain.integration_review import run_integration_review
 
         # 治本 round21：L2 全 reactor 编译优先在【项目沙箱】(按检测栈版本烤的工具链)跑——brain host
@@ -1362,6 +1386,71 @@ def _runtime_failure_state() -> dict:
         # S1-4 占位与 failure.py 占位分支对齐（有界 escalate）；task#20 完整归因替换。
         "failure_strategy": "escalate",
     }
+
+
+_STUB_MARKERS = ("TODO: 子任务未完成",)
+
+
+def _diff_has_stub_line(diff_text: str, target_file: str | None = None) -> bool:
+    """diff 新增行含阶梯三桩模板串；target_file 非 None 时只看该文件段。"""
+    from swarm.project.diff_apply import split_diff_by_file
+    for files, text in split_diff_by_file(diff_text or ""):
+        if target_file is not None and target_file not in files:
+            continue
+        for ln in text.splitlines():
+            if ln.startswith("+") and not ln.startswith("+++") \
+                    and any(m in ln for m in _STUB_MARKERS):
+                return True
+    return False
+
+
+def _stub_fingerprint_owner_ids(state, merged_diff, plan_obj, subtask_results) -> list[str]:
+    """D3b（round38c 主题D）：merged_diff 新增行含阶梯三桩模板串（planning_core.
+    _generate_compile_stub 的 prompt 模板）且【行作者】不在 give_up_isolated_ids
+    =worker 自产假实现（借模板串装"诚实桩"混过闸）。返回应定向重派的作者列表。
+
+    归因按【谁的 diff 贡献了该 stub 新增行】而非 scope 声明（复核 CONFIRMED：
+    give_up 打桩者的行已合入 merged_diff 且本人豁免，按 scope 归因会把共享该文件
+    writable 的无辜存活者定向重派——它重做也消不掉别人合入的行 → 每轮复中烧完
+    replan 上限 escalate）。阶梯三真桩豁免（作者在 give_up 集，终态 PARTIAL 如实
+    列明，且不嫁祸他人）；无作者可归（D36 兄弟回传等）只 loud 不定向。纯确定性零 LLM。"""
+    if not (merged_diff or "").strip() or plan_obj is None:
+        return []
+    try:
+        from swarm.project.diff_apply import split_diff_by_file
+        hit_files: list[str] = []
+        for files, text in split_diff_by_file(merged_diff):
+            for ln in text.splitlines():
+                if ln.startswith("+") and not ln.startswith("+++") \
+                        and any(m in ln for m in _STUB_MARKERS):
+                    hit_files.extend(files)
+                    break
+        if not hit_files:
+            return []
+        give_up = set(state.get("give_up_isolated_ids") or [])
+        owners: set[str] = set()
+        unowned: list[str] = []
+        for f in hit_files:
+            _author_found = False
+            for sid, wo in (subtask_results or {}).items():
+                if _diff_has_stub_line(getattr(wo, "diff", "") or "", target_file=f):
+                    _author_found = True
+                    if sid not in give_up:
+                        owners.add(sid)
+            if not _author_found:
+                unowned.append(f)
+        if unowned:
+            logger.warning("[VERIFY_L2] D3b stub 指纹命中但无作者可归（只留痕）: %s",
+                           unowned[:5])
+        if owners:
+            logger.warning(
+                "[VERIFY_L2] D3b stub 指纹红线：%d 个子任务交付含自产假实现"
+                "（阶梯三桩模板串、owner 不在 give_up 集）→ 定向重派: %s",
+                len(owners), sorted(owners))
+        return sorted(owners)
+    except Exception as exc:  # noqa: BLE001 — 指纹是红线增强，异常不阻断 L2 主链
+        logger.warning("[VERIFY_L2] D3b stub 指纹检查异常（跳过）: %s", exc)
+        return []
 
 
 def _l2_failure_state(

@@ -3348,6 +3348,21 @@ def merge(state: BrainState) -> dict:
     # 本处守卫=终局干净合并（rebase/冲突中间态的 diff 将被重生成，不在此判）；rebase 达上限的
     # clean-accept 分支是【另一个终局出口】，在其 return 前另调一次（见下方）。
     if _apply_ok and result.success and not result.rebase_subtask_ids and result.merged_diff.strip():
+        # ── D1（round38c 主题D）：聚合清单确定性合成——diff 内把新建模块 pom 的
+        # <module> 注册折进根 pom 段（root pom <modules> 终态=diff 内新模块集合的
+        # 确定性函数，退出 LLM 竞写面；不依赖任务活到 learn_success 的交付期兜底）。
+        # round38c：ruoyi-alarm 66 文件主模块未注册成死代码。失败 fail-open 原 diff。
+        try:
+            from swarm.brain.manifest_synth import base_root_pom_text, fold_module_registrations
+            _d1_diff, _d1_regs = fold_module_registrations(
+                result.merged_diff,
+                base_root_pom_text(_get_project_path(state.get("project_id") or ""),
+                                   state.get("base_commit")))
+            if _d1_regs:
+                result.merged_diff = _d1_diff
+                out["merged_diff"] = _d1_diff
+        except Exception as _d1_exc:  # noqa: BLE001
+            logger.error("[MERGE] D1 聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
         _scan_merged_diff_for_secrets(out, result.merged_diff)
 
     # ── 硬冲突路径（无 base_reader 可用或单子任务冲突）──
@@ -3433,6 +3448,23 @@ def merge(state: BrainState) -> dict:
                 # hunter F1 治本：这是【另一个终局交付出口】——接受 base 版干净 merged_diff 直交 VERIFY_L2，
                 # 文件【不会】被重生成，故必须与上方主干等同地扫密钥；命中 CRITICAL→escalate 覆盖本"接受"
                 # 决定（含密钥的交付宁可 escalate 人工，也不放行）。缺此调用则 rebase-over-limit 路径漏扫。
+                # D1（round38c）：温和出口正是"清单加性变更被丢"的现场——本出口必须同样
+                # 合成模块注册（旧注释声称交 post-pass reconcile 兜底=只在 learn_success
+                # 兑现，任务死在中途即落空，ruoyi-alarm 未注册实证）。
+                try:
+                    from swarm.brain.manifest_synth import (
+                        base_root_pom_text,
+                        fold_module_registrations,
+                    )
+                    _d1_diff, _d1_regs = fold_module_registrations(
+                        result.merged_diff,
+                        base_root_pom_text(_get_project_path(state.get("project_id") or ""),
+                                           state.get("base_commit")))
+                    if _d1_regs:
+                        result.merged_diff = _d1_diff
+                        out["merged_diff"] = _d1_diff
+                except Exception as _d1_exc:  # noqa: BLE001
+                    logger.error("[MERGE] D1 温和出口聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
                 _scan_merged_diff_for_secrets(out, result.merged_diff)
                 return out
             # rebase 已达上限【且有真硬冲突/超限方碰普通源文件】→ 升级人工，不再无限重生成
