@@ -196,7 +196,8 @@ def _load_row(task_id: str) -> dict | None:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT cloud_tokens_in, cloud_tokens_out, local_tokens, llm_calls, "
-                    "wall_ms, replan_rounds, stage_spent FROM task_ledger WHERE task_id=%s",
+                    "wall_ms, replan_rounds, stage_spent, budget_total "
+                    "FROM task_ledger WHERE task_id=%s",
                     (task_id,),
                 )
                 row = cur.fetchone()
@@ -209,6 +210,8 @@ def _load_row(task_id: str) -> dict | None:
             "local_tokens": int(row[2]), "llm_calls": int(row[3]),
             "wall_ms": int(row[4]), "replan_rounds": int(row[5]),
             "stage_spent": {str(k): int(v) for k, v in (ss or {}).items()},
+            # R38-A 复核：回读已放宽预算——重启后 attach(base) 不缩水已 widen 的弹性
+            "budget_total": int(row[7] or 0),
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ledger] 读取账本失败（按空账继续，宁可少限不误杀）: %s", exc)
@@ -324,7 +327,15 @@ def attach(task_id: str, budget_total: int, *, local_budget: int = 0,
                 logger.info(
                     "[ledger] 任务 %s 账本自 DB 恢复：cloud=%d+%d local=%d calls=%d（延续不归零）",
                     task_id, entry.cloud_in, entry.cloud_out, entry.local, entry.llm_calls)
-        entry.budget_total = max(0, int(budget_total or 0))
+        # R38-A 复核：弹性只增不减跨执行段成立——resume/重复 attach 传入的 base
+        # （规划期 subtasks=0）不得把 STAGE1 已 widen 的预算缩回去（内存既有值与
+        # DB 回读值都算）；显式关闸（budget<=0）例外，运维决策优先。
+        _new_budget = max(0, int(budget_total or 0))
+        _persisted_budget = int((persisted or {}).get("budget_total") or 0)
+        if _new_budget > 0:
+            entry.budget_total = max(_new_budget, entry.budget_total, _persisted_budget)
+        else:
+            entry.budget_total = 0
         entry.local_budget = max(0, int(local_budget or 0))
         if stage_ratios:
             entry.stage_ratios = {str(k): float(v) for k, v in stage_ratios.items()}
@@ -365,13 +376,41 @@ def _get_or_create(task_id: str) -> _Entry:
 
 
 def set_budget(task_id: str, budget_total: int) -> None:
-    """弹性预算更新（规划揭示子任务数后放宽，与墙钟 P1-B 同理）。"""
+    """预算显式覆写（含收窄能力——生产弹性路径请用 widen_budget）。
+
+    R38 复核 F1：收窄时 fail-loud 记 warning——widen_budget（STAGE1 按模块）与
+    set_budget（PLAN 后按子任务）是同字段的两套公式，静默收缩会把已放宽的安全余量
+    悄悄收回（生产唯一调用点 runner 已改走 widen_budget，本函数保留给显式重置/测试）。"""
     if not task_id:
         return
     with _lock:
         e = _get_or_create(task_id)
-        e.budget_total = max(0, int(budget_total or 0))
+        new = max(0, int(budget_total or 0))
+        if 0 < new < e.budget_total:
+            logger.warning(
+                "[ledger] 任务 %s 预算被显式收窄 %d → %d（弹性路径应走 widen_budget，"
+                "收窄可能掐死已按更宽预算花费的阶段）", task_id, e.budget_total, new)
+        e.budget_total = new
         e.dirty = True
+
+
+def widen_budget(task_id: str, budget_total: int) -> None:
+    """R38-A：弹性放宽原语——单调只增不减（set_budget 的收窄能力对"规模揭示"场景是
+    坑：后到的小值会把已放宽预算收缩回去）。budget_total<=0 或任务处于 track-only
+    （budget=0=显式关闸）时 no-op：弹性放宽绝不把关着的闸意外打开。
+
+    用途：TECH_DESIGN-STAGE1 揭示模块数后按 base+per_module×n 放宽（round38 死点：
+    per_subtask 弹性在规划期恒 0——子任务数是规划的输出，plan 子预算 125k 掐死
+    ultra 规划流水线；round27 实测 ULTRA 仅规划期云端 >800k）。"""
+    if not task_id or int(budget_total or 0) <= 0:
+        return
+    with _lock:
+        e = _get_or_create(task_id)
+        if e.budget_total <= 0:  # track-only/关闸语义保持
+            return
+        if int(budget_total) > e.budget_total:
+            e.budget_total = int(budget_total)
+            e.dirty = True
 
 
 def set_stage(task_id: str, stage: str | None) -> None:
@@ -455,16 +494,21 @@ def reserve(task_id: str, *, est_in: int, est_out: int, kind: str = "cloud") -> 
         e = _get_or_create(task_id or "")
         if k == "cloud":
             if e.budget_total > 0:
+                # R38-C：拒绝 usage 带 requested_est——等待方据此判断"在飞全释放后是否
+                # 够"（admission_probe），区分可等待的暂时性紧张 vs 等待无意义的真不够。
                 if e.cloud_in + e.cloud_out + e.reserved_cloud + est > e.budget_total:
-                    raise TaskTokenLimitExceeded(_usage_locked(task_id, e))
+                    u = _usage_locked(task_id, e)
+                    u["requested_est"] = est
+                    raise TaskTokenLimitExceeded(u)
                 stage = e.stage
                 if stage is not None:
                     limit = _stage_limit_locked(e, stage)
                     if limit is not None and (
                             e.stage_spent.get(stage, 0)
                             + e.stage_reserved.get(stage, 0) + est > limit):
-                        raise TaskTokenLimitExceeded(
-                            _usage_locked(task_id, e, stage=stage, stage_limit=limit))
+                        u = _usage_locked(task_id, e, stage=stage, stage_limit=limit)
+                        u["requested_est"] = est
+                        raise TaskTokenLimitExceeded(u)
             e.reserved_cloud += est
             if e.stage is not None:
                 e.stage_reserved[e.stage] = e.stage_reserved.get(e.stage, 0) + est
@@ -479,6 +523,42 @@ def reserve(task_id: str, *, est_in: int, est_out: int, kind: str = "cloud") -> 
         _reservations[rid] = (task_id or "", e.stage if k == "cloud" else None, k,
                               est_in, est_out, _time.monotonic())
     return rid
+
+
+def admission_probe(task_id: str, est: int, kind: str = "cloud") -> str:
+    """R38-C：拒后恢复的三态探针（无副作用，不预留）。
+
+    - "fit"：现在就能预留（含 track-only/闸关：恒 fit）。
+    - "wait"：现在不够，但当前在飞预留全部释放后够——值得等 settle。
+    - "hopeless"：在飞全释放也不够（est > limit - spent）——等待无意义，
+      调用方应立即确定性放弃（真出路是 widen_budget/escalate，不是重试）。
+
+    总闸与阶段子闸都过才 fit；任一 hopeless 即 hopeless。仅 cloud 有阶段闸。"""
+    est = max(0, int(est or 0))
+    with _lock:
+        e = _entries.get(task_id or "")
+        if e is None or e.budget_total <= 0:
+            return "fit"  # 未 attach/track-only：reserve 不闸
+        if kind != "cloud":
+            if e.local_budget <= 0:
+                return "fit"
+            if e.local + e.reserved_local + est <= e.local_budget:
+                return "fit"
+            return "wait" if e.local + est <= e.local_budget else "hopeless"
+        spent = e.cloud_in + e.cloud_out
+        if spent + est > e.budget_total:
+            return "hopeless"
+        verdict = "fit" if spent + e.reserved_cloud + est <= e.budget_total else "wait"
+        stage = e.stage
+        if stage is not None:
+            limit = _stage_limit_locked(e, stage)
+            if limit is not None:
+                ss = e.stage_spent.get(stage, 0)
+                if ss + est > limit:
+                    return "hopeless"
+                if ss + e.stage_reserved.get(stage, 0) + est > limit:
+                    verdict = "wait"
+        return verdict
 
 
 def _release_locked(e: _Entry, stage: str | None, kind: str, est_total: int) -> None:
@@ -558,16 +638,21 @@ def ensure_budget(task_id: str, *, min_tokens: int = 0, stage: str | None = None
         e = _entries.get(task_id)
         if e is None or e.budget_total <= 0:
             return
+        # R38 复核 F4：与 reserve() 对齐带 requested_est——缺它的 TaskTokenLimitExceeded
+        # 会让 _await_token_admission 走无信息放行（退回空转重试），准入等待失效。
         if (e.budget_total - e.cloud_in - e.cloud_out - e.reserved_cloud) < min_tokens:
-            raise TaskTokenLimitExceeded(_usage_locked(task_id, e))
+            u = _usage_locked(task_id, e)
+            u["requested_est"] = max(0, int(min_tokens))
+            raise TaskTokenLimitExceeded(u)
         st = stage or e.stage
         if st is not None:
             limit = _stage_limit_locked(e, st)
             if limit is not None and (
                     limit - e.stage_spent.get(st, 0) - e.stage_reserved.get(st, 0)
             ) < min_tokens:
-                raise TaskTokenLimitExceeded(
-                    _usage_locked(task_id, e, stage=st, stage_limit=limit))
+                u = _usage_locked(task_id, e, stage=st, stage_limit=limit)
+                u["requested_est"] = max(0, int(min_tokens))
+                raise TaskTokenLimitExceeded(u)
 
 
 def note_replan(task_id: str) -> None:

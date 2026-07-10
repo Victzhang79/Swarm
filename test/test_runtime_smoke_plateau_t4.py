@@ -124,8 +124,10 @@ def test_attributed_signature_includes_blamed_subtasks():
 # 2. plateau 观测（默认）— 控制流不变
 # ─────────────────────────────────────────────────────────────
 
-def test_plateau_observed_default_keeps_normal_flow():
-    """连续两轮同签名、非 strict → 仅观测：控制流不变（仍 replan，不提前 escalate）。"""
+def test_plateau_observed_default_keeps_normal_flow(monkeypatch):
+    """连续两轮同签名、非 strict → 仅观测：控制流不变（仍 replan，不提前 escalate）。
+    钉住 env：不受宿主 .env（e2e profile 的 PLATEAU_STRICT=1）污染。"""
+    monkeypatch.delenv("SWARM_RUNTIME_SMOKE_PLATEAU_STRICT", raising=False)
     result = _run(_unattributed_state(last_signature="code_error|"))
     assert result.get("failure_strategy") == "replan"
     assert result.get("failure_escalated") is False

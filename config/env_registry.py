@@ -91,6 +91,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_LOCK_RENEW_TRANSIENT_MAX": "infra/redis_client.py:76",
     "SWARM_MAX_ACTIVE_PROJECTS": "infra/redis_client.py:430",
     "SWARM_MAX_CONCURRENT_TASKS": "brain/scheduler.py:10",
+    "SWARM_MAX_TASK_TOKENS_PER_MODULE": "config/settings.py:762",
     "SWARM_MILESTONE_REPORTS_KEEP": "project/store.py:2086",
     "SWARM_MODEL_": "api/app.py:518",
     "SWARM_MODEL_BRAIN_FALLBACK": "api/_shared.py:30",

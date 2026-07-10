@@ -1100,45 +1100,132 @@ TECH_DESIGN_STAGE2_USER = """总需求（背景）：{task_description}
 只为这个模块产出 file_plan（完整路径），module 字段统一填 "{mod_name}"。"""
 
 
+def _is_token_limit_error(exc: BaseException) -> bool:
+    """R38-C：识别账本拒绝（isinstance 优先 + 字符串兜底——langchain/fallback 链路
+    有时把异常包成普通 Exception 只剩 message，对齐 models/errors.py 双保险模式）。"""
+    from swarm.models.errors import TaskTokenLimitExceeded as _TTLE
+    return isinstance(exc, _TTLE) or "token limit exceeded" in str(exc)
+
+
+_ADMISSION_POLL_S = 2.0  # R38-C：等待在飞结算的轮询间隔
+# R38 复核 F8：准入等待后的重试独立配额（probe→reserve 竞态输家不烧能力配额），有界防死循环
+_ADMISSION_RETRY_MAX = 5
+
+
+async def _await_token_admission(task_id: str | None, usage: dict | None, *,
+                                 max_wait_s: float, poll_s: float | None = None) -> bool:
+    """R38-C：账本拒绝后的准入等待——替代"固定次数/固定退避"空转重试。
+
+    round38 实测：STAGE2 零退避 33ms 烧完 3 次重试、CONTRACT 退避 2s/4s，而在飞调用
+    settle 要 103-408s——结构上等不到预留释放，"暂时性预留紧张"被固化为模块永久丢失。
+
+    轮询 ledger.admission_probe：fit→True（可重试）；hopeless（在飞全释放也不够，
+    等待无意义——真出路是 widen_budget/escalate）或超时→False（调用方立即确定性放弃）。
+    usage 缺 requested_est（异常被包装）→ 放行 True，退回既有重试路径不误杀。
+    ★必须在并发信号量外调用——等待不占并发槽★"""
+    import asyncio as _aio
+    import time as _time
+    est = int((usage or {}).get("requested_est") or 0)
+    if not task_id or est <= 0:
+        # R38 复核 F2：无信息放行必须可观测——退回旧的立即重试路径，运维要能从日志
+        # 看出准入等待被跳过（异常被包装丢 usage 是真实链路，非纯防御）。
+        if task_id:
+            logger.warning(
+                "[LEDGER-ADMISSION] 任务 %s 的 token 拒绝缺 requested_est（异常被包装？）"
+                "→ 跳过准入等待放行既有重试", task_id)
+        return True
+    from swarm.models import ledger as _adm_ledger
+    _poll = _ADMISSION_POLL_S if poll_s is None else poll_s
+    deadline = _time.monotonic() + max(0.0, float(max_wait_s))
+    while True:
+        verdict = _adm_ledger.admission_probe(task_id, est)
+        if verdict == "fit":
+            return True
+        if verdict == "hopeless":
+            logger.warning(
+                "[LEDGER-ADMISSION] 任务 %s 预留 est=%d 在飞全释放也不够（hopeless）"
+                "→ 立即放弃等待（出路是预算放宽/escalate，非重试）", task_id, est)
+            return False
+        if _time.monotonic() >= deadline:
+            logger.warning(
+                "[LEDGER-ADMISSION] 任务 %s 预留 est=%d 等待在飞结算超时(%.0fs) → 放弃",
+                task_id, est, max_wait_s)
+            return False
+        await _aio.sleep(_poll)
+
+
 async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
-                              project_facts, file_verification, review_feedback):
+                              project_facts, file_verification, review_feedback,
+                              preset_stage1: dict | None = None):
     """ultra 超大需求两阶段 tech_design（DESIGN 第八节 A+B）。
 
     阶段1：LLM 出模块清单+数据模型+架构（短输出）。
     阶段2：按模块逐个 LLM 出该模块 file_plan（每次短输出）→ 合并。
     每阶段短输出，规避单次生成上百文件超长 JSON 卡死。
     返回 (result_dict, file_plan, fact_issues, contract)，与单次路径同结构供后续复用。
+
+    R38-F：preset_stage1 非空 = 外科补齐模式——跳过 STAGE1 重生成，用给定的
+    architecture/data_model/modules（通常只含缺失模块子集）直接进 STAGE2，
+    绝不全量重拆已成模块（P1 外科补丁先例）。
     """
     import time as _time
 
-    # ── 阶段1：顶层方案（模块清单 + 数据模型 + 架构）──
     _t0 = _time.monotonic()
-    resp1 = await llm.ainvoke([
-        {"role": "system", "content": TECH_DESIGN_STAGE1_SYSTEM},
-        {"role": "user", "content": TECH_DESIGN_STAGE1_USER.format(
-            task_description=task_desc,
-            clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
-            complexity=comp_str, greenfield="是" if greenfield else "否",
-            knowledge=_format_knowledge(state),
-            project_facts=project_facts, file_verification=file_verification,
-            review_feedback=review_feedback,
-        )},
-    ])
-    stage1 = _parse_json_from_llm(resp1.content)
-    if not isinstance(stage1, dict):
-        stage1 = {}
-    modules = stage1.get("modules", []) or []
-    architecture = stage1.get("architecture", "")
-    data_model = stage1.get("data_model", "")
-    fact_issues = stage1.get("fact_issues", []) or []
-    contract = stage1.pop("shared_contract", {}) if isinstance(stage1, dict) else {}
-    logger.info(
-        "[TECH_DESIGN-STAGE1] 顶层方案：%d 个模块，数据模型 %d 字，耗时 %.1fs",
-        len(modules), len(str(data_model)), _time.monotonic() - _t0,
-    )
+    if preset_stage1 is not None:
+        stage1 = dict(preset_stage1)
+        modules = stage1.get("modules", []) or []
+        architecture = stage1.get("architecture", "")
+        data_model = stage1.get("data_model", "")
+        fact_issues = stage1.get("fact_issues", []) or []
+        contract = {}  # 补齐模式不动契约草案（节点层保留 state 既有值）
+        logger.info(
+            "[TECH_DESIGN-STAGE1] 外科补齐模式：跳过顶层方案重生成，仅补 %d 个模块",
+            len(modules))
+    else:
+        # ── 阶段1：顶层方案（模块清单 + 数据模型 + 架构）──
+        resp1 = await llm.ainvoke([
+            {"role": "system", "content": TECH_DESIGN_STAGE1_SYSTEM},
+            {"role": "user", "content": TECH_DESIGN_STAGE1_USER.format(
+                task_description=task_desc,
+                clarify_summary=state.get("clarify_summary", "") or "（无澄清）",
+                complexity=comp_str, greenfield="是" if greenfield else "否",
+                knowledge=_format_knowledge(state),
+                project_facts=project_facts, file_verification=file_verification,
+                review_feedback=review_feedback,
+            )},
+        ])
+        stage1 = _parse_json_from_llm(resp1.content)
+        if not isinstance(stage1, dict):
+            stage1 = {}
+        modules = stage1.get("modules", []) or []
+        architecture = stage1.get("architecture", "")
+        data_model = stage1.get("data_model", "")
+        fact_issues = stage1.get("fact_issues", []) or []
+        contract = stage1.pop("shared_contract", {}) if isinstance(stage1, dict) else {}
+        logger.info(
+            "[TECH_DESIGN-STAGE1] 顶层方案：%d 个模块，数据模型 %d 字，耗时 %.1fs",
+            len(modules), len(str(data_model)), _time.monotonic() - _t0,
+        )
     if not modules:
         # 阶段1 没给模块 → 退回单次（小需求或 LLM 没按格式）
         return stage1, validate_file_plan(stage1.get("file_plan", [])), fact_issues, contract
+
+    # R38-A：模块数是规划期第一个规模信号——立即按 base+per_module×n 放宽 ledger 预算
+    # （runner 的 on_chain_end 弹性钩子在节点结束才触发，救不了本节点内的阶段2；per_subtask
+    # 弹性在规划期恒 0）。widen_budget 单调只增不减，且对 track-only（闸关）任务 no-op。
+    _r38_task_id = state.get("task_id")
+    if _r38_task_id:
+        _r38_cfg = get_config()
+        _r38_base = int(getattr(_r38_cfg, "max_task_tokens", 0) or 0)
+        _r38_per_mod = int(getattr(_r38_cfg, "max_task_tokens_per_module", 0) or 0)
+        if _r38_base > 0 and _r38_per_mod > 0:
+            from swarm.models import ledger as _r38_ledger
+            _r38_budget = _r38_base + _r38_per_mod * len(modules)
+            _r38_ledger.widen_budget(_r38_task_id, _r38_budget)
+            logger.info(
+                "[TECH_DESIGN-STAGE1] 预算弹性：%d 模块 → widen_budget(base %d + %d×%d = %d)",
+                len(modules), _r38_base, _r38_per_mod, len(modules), _r38_budget,
+            )
 
     # ── 阶段2：按模块并行产出 file_plan（每次短输出）──
     # P1-DEBT-12 修复（并行 + 双护栏）：
@@ -1160,11 +1247,17 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                               # (RUN12 实证 alarm-config 'Expecting value: char0' 空响应 → 整模块丢失 → 欠 PRD)
 
     async def _gen_one_module(mi: int, mod: dict) -> dict:
-        """产出单个模块的 file_plan，失败重试至多 _STAGE2_MAX_ATTEMPTS 次。返回 {idx,name,file_plan,error}。"""
+        """产出单个模块的 file_plan，失败重试至多 _STAGE2_MAX_ATTEMPTS 次。返回 {idx,name,file_plan,error}。
+
+        R38 复核 F8：token 拒绝后等到准入的重试不占能力配额（admission_probe 无副作用，
+        probe→reserve 竞态输家不该烧配额），独立计数有界（_ADMISSION_RETRY_MAX）防死循环。"""
         mod_name = mod.get("name") or f"module-{mi}"
         _last_err = "unknown"
-        for _attempt in range(1, _STAGE2_MAX_ATTEMPTS + 1):
+        _attempt = 0        # 能力/瞬时失败次数（旧语义配额）
+        _adm_retries = 0    # 准入等待后的重试次数（不占能力配额）
+        while _attempt < _STAGE2_MAX_ATTEMPTS and _adm_retries <= _ADMISSION_RETRY_MAX:
             _tm = _time.monotonic()
+            _token_denied: dict | None = None  # R38-C：账本拒绝时带 usage，信号量外等准入
             async with _sem:
                 try:
                     resp2 = await _asyncio.wait_for(
@@ -1190,24 +1283,40 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                         r2.get("file_plan", []) if isinstance(r2, dict) else [], module=mod_name)
                     if not fp:
                         raise ValueError("file_plan 为空或全为无效项（模块未产出有效文件）")  # 触发重试
+                    _n_calls = _attempt + _adm_retries + 1
                     logger.info(
                         "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs%s",
                         mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
-                        f"（第 {_attempt} 次成功）" if _attempt > 1 else "",
+                        f"（第 {_n_calls} 次调用成功）" if _n_calls > 1 else "",
                     )
                     return {"idx": mi, "name": mod_name, "file_plan": fp, "error": None}
                 except _asyncio.TimeoutError:
                     _last_err = "timeout"
                 except Exception as exc:  # noqa: BLE001
                     _last_err = str(exc)[:200]
+                    if _is_token_limit_error(exc):
+                        _token_denied = getattr(exc, "usage", None) or {}
+            # R38-C：账本拒绝 → 信号量外等在飞结算释放预留再重试（不占能力配额）；
+            # hopeless/超时 → 立即确定性放弃（round38 实测 33ms 空转 3 次 vs settle 103-408s）。
+            if _token_denied is not None:
+                if not await _await_token_admission(
+                        state.get("task_id"), _token_denied,
+                        max_wait_s=_STAGE2_MODULE_TIMEOUT):
+                    _last_err = f"admission_denied:{_last_err}"
+                    break
+                _adm_retries += 1
+                continue
+            _attempt += 1
             if _attempt < _STAGE2_MAX_ATTEMPTS:
                 logger.warning(
                     "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试",
                     mi, mod_total, mod_name, _attempt, _last_err,
                 )
+        # R38 复核 F3：报真实次数与放弃原因（早退时旧日志谎报"重试 MAX 次"误导排障）
         logger.error(
-            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 重试 %d 次仍失败（硬告警，该模块文件丢失）: %s",
-            mi, mod_total, mod_name, _STAGE2_MAX_ATTEMPTS, _last_err,
+            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 失败放弃（能力重试 %d/%d，准入重试 %d，"
+            "硬告警，该模块文件丢失）: %s",
+            mi, mod_total, mod_name, _attempt, _STAGE2_MAX_ATTEMPTS, _adm_retries, _last_err,
         )
         return {"idx": mi, "name": mod_name, "file_plan": [], "error": _last_err}
 
@@ -1243,6 +1352,32 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         mod_total, len(failed_modules), _STAGE2_CONCURRENCY, len(all_file_plan),
     )
     return result, all_file_plan, fact_issues, contract
+
+
+def _package_tech_design_output(state: "BrainState", result, file_plan,
+                                fact_issues, contract) -> dict:
+    """tech_design 终段打包（全量/R38-F 外科补齐两路径共用）。
+
+    W1.1：ultra 两阶段产出里 phase-2 失败的模块（文件丢失）必须被下游看见——
+    既写入专用 state 字段（confirm 闸门据此阻断静默 auto_accept；R38-F review_design
+    自动模式据此打回外科补齐），又追加到 degraded_reasons（透传交付/通知）。"""
+    _failed_mods = (result.get("stage2_failed_modules") or []) if isinstance(result, dict) else []
+    _out: dict = {
+        "tech_design": result,
+        "shared_contract_draft": contract or {},
+        "tech_design_fact_issues": fact_issues or [],
+        "tech_design_file_plan": file_plan or [],
+        "tech_design_failed_modules": _failed_mods,
+    }
+    if _failed_mods:
+        _names = [m.get("name", "?") for m in _failed_mods if isinstance(m, dict)]
+        _reason = (
+            f"tech_design 阶段 {len(_failed_mods)} 个模块设计生成失败 {_names}"
+            "——这些模块的文件未进入 file_plan，交付不完整，需人工介入"
+        )
+        logger.error("[TECH_DESIGN] %s", _reason)
+        _out["degraded_reasons"] = list(state.get("degraded_reasons") or []) + [_reason]
+    return _out
 
 
 async def tech_design(state: BrainState) -> dict:
@@ -1289,6 +1424,45 @@ async def tech_design(state: BrainState) -> dict:
 
     try:
         llm = _get_brain_llm()
+        # ── R38-F 外科补齐：review_design 对账打回（repair_only）→ 只重生成缺失模块，
+        # 与已成模块的 file_plan 合并，绝不全量重拆（round37 R35-C 全量重拆=费用黑洞教训；
+        # 人工 reject 无 repair_only 标记 → 保留下方全量重做语义）。──
+        _prior_td = state.get("tech_design")
+        _prior_failed = state.get("tech_design_failed_modules") or []
+        if (prev_review.get("repair_only") and _prior_failed
+                and isinstance(_prior_td, dict) and _prior_td.get("modules")):
+            _failed_names = {str(m.get("name")) for m in _prior_failed
+                             if isinstance(m, dict)}
+            _retry_mods = [m for m in (_prior_td.get("modules") or [])
+                           if isinstance(m, dict) and str(m.get("name")) in _failed_names]
+            if _retry_mods:
+                _r2, _fp2, _fi2, _c2 = await _tech_design_staged(
+                    llm, task_desc, comp_str, greenfield, state,
+                    project_facts, file_verification, review_feedback,
+                    preset_stage1={
+                        "modules": _retry_mods,
+                        "architecture": _prior_td.get("architecture", ""),
+                        "data_model": _prior_td.get("data_model", ""),
+                    },
+                )
+                _kept_fp = list(state.get("tech_design_file_plan")
+                                or _prior_td.get("file_plan") or [])
+                _residual = (_r2.get("stage2_failed_modules") or []) \
+                    if isinstance(_r2, dict) else []
+                result = dict(_prior_td)
+                result["file_plan"] = _kept_fp + list(_fp2 or [])
+                result["stage2_failed_modules"] = _residual
+                file_plan = result["file_plan"]
+                fact_issues = list(state.get("tech_design_fact_issues") or [])
+                contract = state.get("shared_contract_draft") or {}
+                logger.info(
+                    "[TECH_DESIGN] R38-F 外科补齐：%d 缺失模块补回 %d 个（残余 %d），"
+                    "file_plan %d → %d 文件（已成模块未重拆）",
+                    len(_retry_mods), len(_retry_mods) - len(_residual),
+                    len(_residual), len(_kept_fp), len(file_plan),
+                )
+                return _package_tech_design_output(state, result, file_plan,
+                                                   fact_issues, contract)
         # ── ultra 超大需求走两阶段产出（规避单次生成上百文件超长 JSON 卡死）──
         if comp == Complexity.ULTRA or comp_str == "ultra":
             result, file_plan, fact_issues, contract = await _tech_design_staged(
@@ -1362,26 +1536,7 @@ async def tech_design(state: BrainState) -> dict:
             "[TECH_DESIGN] 技术方案已产出 (file_plan=%d 文件, fact_issues=%d)",
             len(file_plan or []), len(fact_issues or []),
         )
-        # W1.1：ultra 两阶段产出里 phase-2 失败的模块（文件丢失）必须被下游看见——
-        # 既写入专用 state 字段（confirm 闸门据此阻断静默 auto_accept），又追加到
-        # degraded_reasons（透传到交付/通知，人工审核可见"本任务交付不完整"）。
-        _failed_mods = (result.get("stage2_failed_modules") or []) if isinstance(result, dict) else []
-        _out: dict = {
-            "tech_design": result,
-            "shared_contract_draft": contract or {},
-            "tech_design_fact_issues": fact_issues or [],
-            "tech_design_file_plan": file_plan or [],
-            "tech_design_failed_modules": _failed_mods,
-        }
-        if _failed_mods:
-            _names = [m.get("name", "?") for m in _failed_mods if isinstance(m, dict)]
-            _reason = (
-                f"tech_design 阶段 {len(_failed_mods)} 个模块设计生成失败 {_names}"
-                "——这些模块的文件未进入 file_plan，交付不完整，需人工介入"
-            )
-            logger.error("[TECH_DESIGN] %s", _reason)
-            _out["degraded_reasons"] = list(state.get("degraded_reasons") or []) + [_reason]
-        return _out
+        return _package_tech_design_output(state, result, file_plan, fact_issues, contract)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[TECH_DESIGN] LLM 失败，产出空方案安全继续: %s", exc)
         # LLM 失败仍保留确定性磁盘核验结果（虚假前提不能因 LLM 挂了就漏过）
@@ -1758,6 +1913,14 @@ async def contract_design(state: BrainState) -> dict:
             _skel_err = f"超时 {_CONTRACT_SKELETON_TIMEOUT:.0f}s（模型可能仍在生成被墙钟掐断）"
         except Exception as exc:  # noqa: BLE001
             _skel_err = f"{type(exc).__name__}: {str(exc)[:200]}"
+            # R38-C：账本拒绝 → 等在飞结算再重试；hopeless/超时 → 立即降级（不空转）。
+            if _is_token_limit_error(exc):
+                if not await _await_token_admission(
+                        state.get("task_id"), getattr(exc, "usage", None) or {},
+                        max_wait_s=_CONTRACT_SKELETON_TIMEOUT):
+                    _skel_err = f"admission_denied:{_skel_err}"
+                    break
+                continue
         if _attempt < _CONTRACT_SKELETON_MAX_ATTEMPTS:
             logger.warning(
                 "[CONTRACT_SKELETON] 第 %d/%d 次失败(%s)，退避重试（耗时 %.1fs）",
@@ -1767,9 +1930,10 @@ async def contract_design(state: BrainState) -> dict:
     if not _skel_ok:
         # consumer_map 丢失 = ② 跨模块 depends_on 无从确定性连线（靠 worker `_build_blocked_on_
         # unbuilt_internal` BLOCKED 退避兜症状）。记 error 级（非 warning）+ 明确错因，别再静默空消息。
+        # R38 复核 F3：报真实尝试数（admission hopeless 早退时旧日志谎报"重试 MAX 次"）
         logger.error(
-            "[CONTRACT_SKELETON] 重试 %d 次仍失败，降级沿用 tech_design draft（consumer_map 丢失"
-            "→跨模块依赖靠 worker BLOCKED 退避兜底）: %s", _CONTRACT_SKELETON_MAX_ATTEMPTS, _skel_err,
+            "[CONTRACT_SKELETON] %d 次尝试后失败放弃，降级沿用 tech_design draft（consumer_map 丢失"
+            "→跨模块依赖靠 worker BLOCKED 退避兜底）: %s", _attempt, _skel_err,
         )
         return {}
     cmap: dict[str, dict] = {}
@@ -1786,11 +1950,15 @@ async def contract_design(state: BrainState) -> dict:
     _sem = _asyncio.Semaphore(_CONTRACT_CONCURRENCY)
 
     async def _gen_one_module_contract(mi: int, mod: dict) -> dict:
+        # R38 复核 F8：与 STAGE2 同款——准入重试不占能力配额，独立有界。
         mod_name = mod.get("name") or f"module-{mi}"
         cm = cmap.get(mod_name.strip(), {})
         _last_err = "unknown"
-        for _attempt in range(1, _CONTRACT_MAX_ATTEMPTS + 1):
+        _attempt = 0
+        _adm_retries = 0
+        while _attempt < _CONTRACT_MAX_ATTEMPTS and _adm_retries <= _ADMISSION_RETRY_MAX:
             _tm = _time.monotonic()
+            _token_denied: dict | None = None  # R38-C：账本拒绝时带 usage，信号量外等准入
             async with _sem:
                 try:
                     resp = await _asyncio.wait_for(llm.ainvoke([
@@ -1821,13 +1989,27 @@ async def contract_design(state: BrainState) -> dict:
                         mi, mod_total, mod_name, len(r.get("interfaces") or []),
                         len(r.get("dtos") or []), len(r.get("apis") or []),
                         len(r.get("dependencies") or []), _time.monotonic() - _tm,
-                        f"（第 {_attempt} 次成功）" if _attempt > 1 else "",
+                        f"（第 {_attempt + _adm_retries + 1} 次调用成功）"
+                        if (_attempt + _adm_retries) else "",
                     )
                     return {"idx": mi, "name": mod_name, "slice": r, "error": None}
                 except _asyncio.TimeoutError:
                     _last_err = "timeout"
                 except Exception as exc:  # noqa: BLE001
                     _last_err = str(exc)[:200]
+                    if _is_token_limit_error(exc):
+                        _token_denied = getattr(exc, "usage", None) or {}
+            # R38-C：账本拒绝 → 等在飞结算释放预留再重试（固定退避 2s/4s 等不到 408s 的
+            # settle，且不占能力配额）；hopeless/超时 → 立即确定性放弃。
+            if _token_denied is not None:
+                if not await _await_token_admission(
+                        state.get("task_id"), _token_denied,
+                        max_wait_s=_CONTRACT_STAGE_TIMEOUT):
+                    _last_err = f"admission_denied:{_last_err}"
+                    break
+                _adm_retries += 1
+                continue  # 已按准入等待，跳过固定退避直接重试
+            _attempt += 1
             if _attempt < _CONTRACT_MAX_ATTEMPTS:
                 logger.warning(
                     "[CONTRACT_MODULE] 模块 %d/%d '%s' 第 %d 次失败(%s)，退避重试",
@@ -1835,9 +2017,11 @@ async def contract_design(state: BrainState) -> dict:
                 )
                 # P1-E：退避——超时/瞬时拥塞多因端点争抢，给它喘息再试（指数，封顶 10s）。
                 await _asyncio.sleep(min(2.0 * _attempt, 10.0))
+        # R38 复核 F3：报真实次数与放弃原因（早退时旧日志谎报"重试 MAX 次"误导排障）
         logger.error(
-            "[CONTRACT_MODULE] 模块 %d/%d '%s' 重试 %d 次仍失败（该模块契约片丢失）: %s",
-            mi, mod_total, mod_name, _CONTRACT_MAX_ATTEMPTS, _last_err,
+            "[CONTRACT_MODULE] 模块 %d/%d '%s' 失败放弃（能力重试 %d/%d，准入重试 %d，"
+            "该模块契约片丢失）: %s",
+            mi, mod_total, mod_name, _attempt, _CONTRACT_MAX_ATTEMPTS, _adm_retries, _last_err,
         )
         return {"idx": mi, "name": mod_name, "slice": {}, "error": _last_err}
 
@@ -1897,6 +2081,24 @@ async def review_design(state: BrainState) -> dict:
     reject_count = int(prev.get("reject_count", 0))
 
     if _auto_mode(state):
+        # R38-F：自动通过前对账 tech_design 失败清单——round38 实测 7/9 模块设计丢失后
+        # 2ms"方案通过"，残缺 file_plan 静默流向 PLAN。非空 → 打回外科补齐（repair_only
+        # 标记让 tech_design 只补缺失模块，绝不全量重拆）；受 design_rejects 上限约束，
+        # 到顶带 degraded（TECH_DESIGN 已写）强制继续，不死循环。
+        _failed = state.get("tech_design_failed_modules") or []
+        if _failed and reject_count < _tier_limits()["design_rejects"]:
+            _names = [m.get("name", "?") for m in _failed if isinstance(m, dict)]
+            _fb = (f"tech_design {len(_failed)} 个模块设计缺失 {_names}"
+                   "——只补齐缺失模块的 file_plan，勿全量重拆已成模块")
+            logger.warning("[REVIEW_DESIGN] R38-F 对账：%s → 打回外科补齐（第 %d 次）",
+                           _fb, reject_count + 1)
+            return {"design_review": {"decision": "reject", "feedback": _fb,
+                                      "reject_count": reject_count + 1,
+                                      "repair_only": True}}
+        if _failed:
+            logger.error(
+                "[REVIEW_DESIGN] R38-F：外科补齐 %d 次后仍缺 %d 模块，带 degraded 强制继续"
+                "（交付/通知可见不完整）", reject_count, len(_failed))
         return {"design_review": {"decision": "approve", "feedback": "自动化模式自动通过", "reject_count": reject_count}}
 
     if reject_count >= _tier_limits()["design_rejects"]:

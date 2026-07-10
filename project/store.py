@@ -142,6 +142,8 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS merge_conflicts JSONB DEFAULT '[]'",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS l3_result JSONB DEFAULT '{}'",
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS created_by_user_id TEXT",
+    # R38-E：FAILED 终态机读账——error 串落任务记录（round38 实测 audit 有账但任务没有）
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS error TEXT",
     # Q4 规划子图：澄清/技术方案/评审产物（可追溯回看）
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS planning_artifacts JSONB DEFAULT '{}'",
     # B 部分：多模态摄取 —— 上传文件路径 + 「模型自行确认」选项 + 需求池模式
@@ -168,7 +170,8 @@ _TASK_SELECT = """
     uploaded_files, auto_confirm_vision, pooled, ingest_draft,
     abandoned_subtasks,
     auto_accept, queue_priority,
-    base_commit, retry_prev_thread_id
+    base_commit, retry_prev_thread_id,
+    error
 """
 
 
@@ -774,7 +777,8 @@ _TASK_SELECT_LIGHT = """
     human_decision, thread_id, duration_seconds,
     created_by_user_id, created_at, updated_at,
     uploaded_files, auto_confirm_vision, pooled,
-    abandoned_subtasks, auto_accept, queue_priority, base_commit
+    abandoned_subtasks, auto_accept, queue_priority, base_commit,
+    error
 """
 
 
@@ -802,6 +806,9 @@ def _row_to_task_light(row: tuple) -> dict[str, Any]:
         "auto_accept": bool(row[17]),
         "queue_priority": row[18] or "normal",
         "base_commit": row[19] or None,
+        # R38-E 复核 F5：任务列表（运维主观察面）同样透出 FAILED 机读账的 error 串
+        # ——短 TEXT 非重字段，缺它则列表见 FAILED 无原因，还得点进详情
+        "error": row[20] if len(row) > 20 else None,
     }
 
 
@@ -901,6 +908,7 @@ def update_task(
     queue_priority: str | None = None,
     base_commit: str | None = None,
     retry_prev_thread_id: str | None = None,
+    error: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新任务字段"""
@@ -910,6 +918,10 @@ def update_task(
     if status is not None:
         sets.append("status = %s")
         params.append(status)
+    if error is not None:
+        # R38-E：FAILED 终态机读账（error 串与 status 同写，audit 不再是唯一去处）
+        sets.append("error = %s")
+        params.append(error[:1000])
     if complexity is not None:
         sets.append("complexity = %s")
         params.append(complexity)
@@ -2071,6 +2083,8 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         "base_commit": (row[25] or None) if len(row) > 25 else None,
         # E1：retry 播种指针（一次性消费；空串/缺列=无播种）
         "retry_prev_thread_id": (row[26] or "") if len(row) > 26 else "",
+        # R38-E：FAILED 终态机读账（error 串；DONE/PARTIAL 为 None）
+        "error": row[27] if len(row) > 27 else None,
     }
 
 

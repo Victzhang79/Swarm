@@ -20,7 +20,12 @@ from swarm.brain.state import BrainState
 _BRAIN = pathlib.Path(__file__).resolve().parent.parent / "brain"
 
 # LLM 结果 dict 的键（result["..."]= / mock 返回体），非 state patch——已人工核实的误报
-_ALLOWLIST = {"reasoning", "subtasks"}
+_ALLOWLIST = {
+    "reasoning", "subtasks",
+    # R38-F 外科补齐：tech_design 对局部 result dict 赋值（result["file_plan"]=…），
+    # 非 state patch——state 侧同名通道是 tech_design_file_plan/tech_design_failed_modules。
+    "file_plan", "stage2_failed_modules",
+}
 
 
 def test_previously_undeclared_channels_now_in_schema():

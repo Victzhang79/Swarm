@@ -79,7 +79,9 @@ def test_review_auto_approves():
     print("  ✅ review: 自动化模式自动通过")
 
 
-def test_review_reject_cap_forces_approve():
+def test_review_reject_cap_forces_approve(monkeypatch):
+    # 钉住 env：非 auto 的强制通过路径不受宿主 .env（SWARM_AUTO_ACCEPT=1）污染
+    monkeypatch.delenv("SWARM_AUTO_ACCEPT", raising=False)
     out = asyncio.run(P.review_design({
         "design_review": {"reject_count": P.MAX_DESIGN_REJECTS},
         "tech_design": {},
@@ -90,7 +92,9 @@ def test_review_reject_cap_forces_approve():
 
 
 def _review_with_decision(monkeypatch, decision_payload):
-    """非 auto、未达上限 → 走 interrupt；patch interrupt 直接返回 resume payload。"""
+    """非 auto、未达上限 → 走 interrupt；patch interrupt 直接返回 resume payload。
+    钉住 env：默认行为测试不受宿主 .env（e2e profile 的 SWARM_AUTO_ACCEPT=1）污染。"""
+    monkeypatch.delenv("SWARM_AUTO_ACCEPT", raising=False)
     monkeypatch.setattr(P, "interrupt", lambda _payload: decision_payload)
     return asyncio.run(P.review_design({"auto_accept": False, "tech_design": {}}))
 

@@ -47,8 +47,10 @@ def test_confirm_invalid_plan_auto_failfast():
     print("  ✅ confirm: 非法计划 auto_accept 降级 fail-fast(REJECT)，不放行（task 0f93f1fc 闸门）")
 
 
-def test_confirm_invalid_plan_interrupts_for_human():
-    """非法计划 + 非 auto_accept（有人监听）→ interrupt 等人工。"""
+def test_confirm_invalid_plan_interrupts_for_human(monkeypatch):
+    """非法计划 + 非 auto_accept（有人监听）→ interrupt 等人工。
+    钉住 env：不受宿主 .env（e2e profile 的 SWARM_AUTO_ACCEPT=1）污染。"""
+    monkeypatch.delenv("SWARM_AUTO_ACCEPT", raising=False)
     # interrupt() 在无 checkpointer 上下文会抛 GraphInterrupt（或类似），
     # 我们只验证它确实尝试中断（不返回 ACCEPT），而非静默放行。
     raised = False

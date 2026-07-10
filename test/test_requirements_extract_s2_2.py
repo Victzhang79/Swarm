@@ -368,12 +368,14 @@ def test_node_retries_exhausted_degrades_to_empty_never_hallucinates(monkeypatch
     assert any("requirements_extract" in r for r in out["degraded_reasons"])
 
 
-def test_node_llm_unavailable_degrades_to_empty(monkeypatch):
+def test_node_llm_unavailable_raises_failloud(monkeypatch):
+    """R38-D 行为变更（round38 拍板）：LLM 全挂 + 源非空 → raise fail-loud，
+    不再静默降级空清单（需求分母清零=覆盖闸失去牙，会带 0 需求"全覆盖"交付）。
+    旧契约"degrades_to_empty"仅保留给空源/全被拒两类（见 test_r38d_extract_failloud）。"""
     stub = _StubLLM([RuntimeError("llm down")] * (1 + MAX_EXTRACT_RETRIES))
     _wire_llm(monkeypatch, stub)
-    out = _run({"task_description": _SOURCE})
-    assert out["requirement_items"] == []
-    assert any("requirements_extract" in r for r in out["degraded_reasons"])
+    with pytest.raises(RuntimeError, match="EXTRACT_REQ"):
+        _run({"task_description": _SOURCE})
 
 
 def test_node_idempotent_skip_when_items_exist(monkeypatch):

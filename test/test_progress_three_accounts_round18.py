@@ -23,12 +23,13 @@ def _row(subtask_count, completed, abandoned):
 
 def test_select_has_26_columns():
     cols = [c.strip() for c in _TASK_SELECT.replace("\n", " ").split(",") if c.strip()]
-    # P0-A：追加队列执行 meta 两列（auto_accept, queue_priority）；3rd#2：末尾追加 base_commit。
-    # E1（阶段5）语义演进：末尾追加 retry_prev_thread_id（重试续跑锚点）→ 27 列
-    assert cols[-5] == "abandoned_subtasks", cols
-    assert cols[-4:] == ["auto_accept", "queue_priority", "base_commit",
-                         "retry_prev_thread_id"], cols
-    assert len(cols) == 27, cols
+    # P0-A：追加队列执行 meta 两列（auto_accept, queue_priority)；3rd#2：末尾追加 base_commit。
+    # E1（阶段5）语义演进：末尾追加 retry_prev_thread_id（重试续跑锚点）→ 27 列。
+    # R38-E：末尾追加 error（FAILED 终态机读账）→ 28 列。
+    assert cols[-6] == "abandoned_subtasks", cols
+    assert cols[-5:] == ["auto_accept", "queue_priority", "base_commit",
+                         "retry_prev_thread_id", "error"], cols
+    assert len(cols) == 28, cols
 
 
 def test_three_accounts_typical():

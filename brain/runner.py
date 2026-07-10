@@ -672,7 +672,10 @@ async def _stream_brain_events(
                 if isinstance(_subs, list) and len(_subs) > _wc_subtasks:
                     _wc_subtasks = len(_subs)
                     # §九 阶段1.4：弹性预算随规划揭示的规模放宽（与墙钟/token 闸同步）。
-                    _ledger.set_budget(
+                    # R38 复核 F1：改 widen_budget（单调只增）——per_subtask×n 可能小于
+                    # STAGE1 已按 per_module×n 放宽的值（模块粗、子任务少时），set_budget
+                    # 覆写会在同一执行段内把安全余量收缩回去，复现 round38 死点。
+                    _ledger.widen_budget(
                         task_id, _ledger_effective_budget(_wc_cfg, _wc_subtasks))
             # §九 阶段1.4：replan 轮次入账（按 state 绝对值同步，防重复累加）。
             if isinstance(output, dict) and isinstance(output.get("replan_count"), int):
@@ -940,7 +943,9 @@ async def _handle_post_run(
         )
         logger.warning("[RUNNER] 任务 %s REJECT/非法终态 fail-fast: %s", task_id, reason)
         _rec = store.get_task(task_id) or {}
-        store.update_task(task_id, status="FAILED")
+        # R38-E 复核 F7：所有 FAILED 写入都带机读账（error+ledger 快照），audit 不再是唯一去处
+        store.update_task(task_id, status="FAILED", error=f"rejected: {reason}"[:300],
+                          token_usage=_failed_machine_account(task_id, state, "rejected"))
         _emit_task_notification(task_id, _rec, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
               project_id=_rec.get("project_id"),
@@ -962,7 +967,10 @@ async def _handle_post_run(
         if not _allow:
             logger.warning("[RUNNER] 任务 %s 终态非成功（gates 复核）: %s", task_id, _reason)
             _rec = store.get_task(task_id) or {}
-            store.update_task(task_id, status="FAILED")
+            store.update_task(
+                task_id, status="FAILED",
+                error=f"delivery_not_accepted: {_reason}"[:300],
+                token_usage=_failed_machine_account(task_id, state, "delivery_not_accepted"))
             _emit_task_notification(task_id, _rec, "FAILED")
             audit("task_failed", orchestrator="Brain", task_id=task_id,
                   project_id=_rec.get("project_id"),
@@ -1105,6 +1113,35 @@ async def _load_state_snapshot(task_id: str, thread_id: str | None = None) -> di
     return dict(snapshot.values)
 
 
+def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
+                            reason_code: str) -> dict[str, Any]:
+    """R38-E：FAILED 终态的机读账（复用 token_usage jsonb 槽，与 PARTIAL 对称）。
+
+    ledger.snapshot 是权威真账（cloud in/out/llm_calls/stage_spent）——salvage 时
+    entry 尚在内存（detach 在 run_task finally）；取不到（极端时序）则空账不阻断。
+    degraded_summary 与 deliver payload 同口径（build_degraded_summary）。"""
+    tu: dict[str, Any] = {"salvage_reason": reason_code}
+    try:
+        from swarm.models import ledger as _fma_ledger
+        snap = _fma_ledger.snapshot(task_id) or {}
+        if not snap:
+            # R38 复核 F6：entry 已 detach（非异常路径）同样可观测——空账≠没花钱
+            logger.warning("[RUNNER] 任务 %s FAILED 机读账：ledger 无在内存条目（已 detach？）"
+                           "→ 仅带 salvage_reason 空账", task_id)
+        for k in ("cloud_tokens_in", "cloud_tokens_out", "local_tokens",
+                  "llm_calls", "stage_spent", "budget_total"):
+            if k in snap:
+                tu[k] = snap[k]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RUNNER] 任务 %s FAILED 机读账取 ledger 快照失败（空账继续）: %s",
+                       task_id, exc)
+    _dg = (state or {}).get("degraded_reasons") or []
+    if _dg:
+        tu["degraded_summary"] = build_degraded_summary(_dg)
+        tu["degraded_reasons"] = list(_dg)[:50]
+    return tu
+
+
 async def _finalize_governor_partial(
     task_id: str,
     state: dict[str, Any],
@@ -1131,10 +1168,15 @@ async def _finalize_governor_partial(
 
     completed = _count_completed_in_plan(state)
     if completed <= 0:
-        store.update_task(task_id, status="FAILED")
+        # R38-E：FAILED 终态也带机读账——error 串 + ledger 权威快照 + degraded_summary
+        # 落任务记录（round38 实测：audit 有账但 API task.error=None/token_usage={}，
+        # 违背 runbook §6"收尾第一步先读机读账"）。
+        _err = f"{reason_code}: 无已完成子任务可交付"[:300]
+        _tu = _failed_machine_account(task_id, state, reason_code)
+        store.update_task(task_id, status="FAILED", error=_err, token_usage=_tu)
         _emit_task_notification(task_id, _rec, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
-              project_id=_rec.get("project_id"), error=f"{reason_code}: 无已完成子任务可交付"[:300])
+              project_id=_rec.get("project_id"), error=_err)
         await _emit(queue, {
             "step": "error", "status": "error",
             "message": f"{reason_msg}；无已完成子任务可交付，任务失败",
@@ -1203,10 +1245,13 @@ async def _salvage_partial_from_checkpoint(
     state = await _load_state_snapshot(task_id)
     if not state:
         _rec = store.get_task(task_id) or {}
-        store.update_task(task_id, status="FAILED")
+        # R38-E：兜底 FAILED 同样落机读账（error + ledger 快照），不留裸 FAILED。
+        _err = f"{reason_code}: checkpoint 不可读"[:300]
+        store.update_task(task_id, status="FAILED", error=_err,
+                          token_usage=_failed_machine_account(task_id, None, reason_code))
         _emit_task_notification(task_id, _rec, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
-              project_id=_rec.get("project_id"), error=f"{reason_code}: checkpoint 不可读"[:300])
+              project_id=_rec.get("project_id"), error=_err)
         await _emit(queue, {
             "step": "error", "status": "error",
             "message": f"{reason_msg}；无法读取执行快照抢救产物，任务失败",
@@ -1446,7 +1491,9 @@ async def run_task(
         ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
-        store.update_task(task_id, status="FAILED")
+        # R38-E 复核 F7：泛 except 是 R38-D fail-loud RuntimeError 的必经之路——同样落机读账
+        store.update_task(task_id, status="FAILED", error=str(exc)[:300],
+                          token_usage=_failed_machine_account(task_id, None, "unhandled_exception"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id, project_id=project_id, error=str(exc)[:300])
         await _emit(queue, {
@@ -1596,7 +1643,8 @@ async def resume_task(
         ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
-        store.update_task(task_id, status="FAILED")
+        store.update_task(task_id, status="FAILED", error=f"resume_failed: {exc}"[:300],
+                          token_usage=_failed_machine_account(task_id, None, "resume_failed"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {
             "step": "error",
@@ -1723,7 +1771,8 @@ async def resume_planning(
         ))
     except Exception as exc:  # noqa: BLE001
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
-        store.update_task(task_id, status="FAILED")
+        store.update_task(task_id, status="FAILED", error=f"resume_planning_failed: {exc}"[:300],
+                          token_usage=_failed_machine_account(task_id, None, "resume_planning_failed"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:

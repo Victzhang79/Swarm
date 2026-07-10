@@ -393,6 +393,7 @@ async def extract_requirements(state: BrainState) -> dict:
     best_rejected: list[dict] = []
     retry_feedback = ""
     llm_error: str | None = None
+    got_llm_output = False  # R38-D：是否至少一次拿到可解析输出（区分 infra 死 vs 能力差）
 
     for attempt in range(1 + MAX_EXTRACT_RETRIES):
         try:
@@ -414,9 +415,19 @@ async def extract_requirements(state: BrainState) -> dict:
             llm_error = str(exc)[:120]
             logger.warning("[EXTRACT_REQ] LLM 调用/解析失败（第 %d 次）: %s",
                            attempt + 1, llm_error)
+            # R38-C sibling：账本拒绝 → 等在飞结算释放预留再重试（33ms 空转重试等不到
+            # 103-408s 的 settle）；hopeless/超时 → 立即放弃（下方 fail-loud 兜）。
+            from swarm.brain.planning_nodes import (
+                _await_token_admission, _is_token_limit_error)
+            if _is_token_limit_error(exc):
+                if not await _await_token_admission(
+                        state.get("task_id"), getattr(exc, "usage", None) or {},
+                        max_wait_s=600.0):
+                    break
             retry_feedback = "\n【上一轮输出无法解析为规定 JSON，请严格按 schema 仅输出 JSON】\n"
             continue
 
+        got_llm_output = True  # R38-D：模型可达且输出可解析（后续 0 条属能力面非 infra 面）
         raw_items = raw.get("items") if isinstance(raw, dict) else raw
         items, rejected = validate_requirement_items(raw_items, source_text)
         # 6.9-HF4：跨轮保优——F5 重抽轮可能比上一轮更差（更少条目甚至零合法），旧行为
@@ -462,6 +473,16 @@ async def extract_requirements(state: BrainState) -> dict:
     if truncated:
         for it in items:
             it["source_truncated"] = True
+
+    # R38-D fail-loud：全部尝试从未拿到可解析输出（infra/预算面死亡）且源文本非空 →
+    # 绝不打"完成：0 条"继续走。round38 实测：3 连拒后静默清零需求分母，
+    # PLAN_COVERAGE_GATE 对空 items 整体跳过=覆盖闸失去牙，会带 0 需求"全覆盖"交付。
+    # 模型可达但 0 合法条目（全被防幻觉拒）仍走既有 degraded 降级（能力 artifact，
+    # 既有闸门兜，先例#1c 不加修复）。
+    if not items and not got_llm_output and llm_error:
+        raise RuntimeError(
+            f"EXTRACT_REQ 全部 {1 + MAX_EXTRACT_RETRIES} 次 LLM 调用失败（{llm_error}）"
+            "——需求分母无从建立，拒绝以空需求清单继续（覆盖闸会失去分母静默放行）")
 
     out: dict = {"requirement_items": items}
     degraded: list[str] = []
