@@ -72,3 +72,11 @@ docs/*.md
 docs/**/*.md
 !docs/TEAM_TRIAL.md
 cube-templates/NODE_ENVD_FIX.md
+
+# 内部排查/审计/交接文档（本地工作件，绝不上传）
+DEEP_READ_REGISTER_*.md
+EXCEPT_AUDIT_*.md
+PRODUCTION_READINESS_REGISTER.md
+*_HANDOFF.md
+E2E_ROUND*.md
+UPSTREAM_DOWNSTREAM_TREATMENT.md
