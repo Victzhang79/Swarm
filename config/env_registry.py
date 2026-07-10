@@ -100,6 +100,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_MODEL_LOCAL_BASE_URL": "api/_shared.py:28",
     "SWARM_MODEL_MODEL_PROVIDERS": "api/routers/config.py:505",
     "SWARM_MODEL_MODEL_SIZES": "api/routers/config.py:505",
+    "SWARM_MODULE_LOCK_UPGRADE_WAIT_S": "brain/runner.py:760",
     "SWARM_MODEL_PROVIDERS": "api/routers/config.py:504",
     "SWARM_MODEL_ROUTING_COMPLEX": "api/_shared.py:42",
     "SWARM_MODEL_ROUTING_COMPLEX_FALLBACK": "api/_shared.py:43",
