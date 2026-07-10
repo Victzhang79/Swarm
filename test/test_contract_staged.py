@@ -222,8 +222,8 @@ def test_contract_design_bypass_non_ultra(monkeypatch):
     assert asyncio.run(contract_design({
         "assessed_complexity": "complex",
         "tech_design": {"modules": [{"name": "a"}, {"name": "b"}]},
-    })) == {}
-    assert asyncio.run(contract_design(_state([{"name": "only"}]))) == {}
+    })) == {"contract_failed_modules": []}  # C4-8：非 ultra 早退 always-emit 清空
+    assert asyncio.run(contract_design(_state([{"name": "only"}]))) == {"contract_failed_modules": []}
 
 
 if __name__ == "__main__":

@@ -119,6 +119,7 @@ class BrainState(TypedDict, total=False):
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     subtask_block_signatures: dict[str, dict]  # B2（round38c）：BLOCKED 失败指纹 {sid: {"sig": str, "count": int}}——同签名重派短路（禁同输入白跑整条阶梯）
     subtask_scope_amend_counts: dict[str, int]  # B3-2/B4-2（round38c）：外科 scope 修正次数（补 create_files/异议改名，每子任务≤1，防修正震荡）
+    contract_failed_modules: list[str]  # C4-8（round38c）：共享契约缺片模块名（CONTRACT_MODULE 放弃后机读可见；成功路径清空）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
     replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
     targeted_recovery_count: int        # P0-B(f9e38dae)：定向恢复累计次数——round29 遗漏项#2 起仅作遥测，熔断改用 targeted_recovery_counts（按子任务）

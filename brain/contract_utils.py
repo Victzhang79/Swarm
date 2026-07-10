@@ -182,6 +182,58 @@ def _module_pom_owners(subtasks: list) -> dict[str, object]:
     return owners
 
 
+def _base_tree_listing(project_path: str | None, base_ref: str | None) -> list[str] | None:
+    """规则0：base 树全量文件清单（单次 git ls-tree，失败/非 git → None=跳过规则0）。"""
+    if not project_path:
+        return None
+    import os
+    import subprocess
+
+    from swarm.git_base import resolve_base_ref
+    if not os.path.isdir(os.path.join(project_path, ".git")):
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_path, "ls-tree", "-r", "--name-only", "-z",
+             resolve_base_ref(base_ref)],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        return [p for p in r.stdout.split("\0") if p]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def unclaimed_contract_deps(plan) -> list[dict]:
+    """C1/规则5 机读面（round38c：98 条 artifacts 落空纯 log 无消费）：返回无 pom owner
+    承接且无法归并（多物理模块歧义）的契约依赖 entries [{module, artifacts}]，供
+    VALIDATE_PLAN 升 warn 可观测。单物理模块场景规则5 已确定性归并 → 恒空。"""
+    shared = getattr(plan, "shared_contract", None) or {}
+    deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
+    if not (isinstance(deps_spec, list) and deps_spec):
+        return []
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    _mod_owners = _module_pom_owners(subtasks)
+    _distinct = list({id(o): o for o in _mod_owners.values()}.values())
+    if len(_distinct) == 1:
+        return []
+    out: list[dict] = []
+    for entry in deps_spec:
+        if not isinstance(entry, dict):
+            continue
+        mod = (entry.get("module") or "").strip().rstrip("/")
+        arts = [a for a in (entry.get("artifacts") or []) if a]
+        if not mod or not arts:
+            continue
+        mod_pom = f"{mod}/pom.xml"
+        owner = next((st for st in subtasks if mod_pom in (
+            list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+            + list(getattr(getattr(st, "scope", None), "writable", []) or []))), None)
+        if owner is None:
+            out.append({"module": mod, "artifacts": arts})
+    return out
+
+
 def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                           base_ref: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。
@@ -208,6 +260,78 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
     if not subtasks:
         return False
     changed = False
+
+    # ── 规则 0（round38c F1 裁决分流，先于一切规则跑）：writable 存在性核对 ──
+    # F1 取证实锤：SysUser.java 被声明在 ruoyi-system/.../domain/（基线真身在
+    # ruoyi-common/.../entity/），worker 对着幻觉路径建重复实体或不改。writable 语义=
+    # 修改既有文件，必须 ∈ base 树 ∪ 全 plan create_files：
+    #   · basename 在 base 树唯一命中 → 确定性重定位（指向真身）；
+    #   · 无命中 → 真新文件，挪入本子任务 create_files；
+    #   · 多义命中 → 保守告警不动（B4-2 异议通道兜底）。
+    # 对抗复核 CONFIRMED 修正：①本规则必须跑在规则1/1.5/3/4 之前——重定位可能造出
+    # 跨子任务同文件多写者，交给下游写权归一/串行化收敛（原插在规则5 前=收敛全部
+    # 跑完，双写者直通 plan_validator 硬失败）；②构建清单 basename（pom.xml 等）
+    # 一律不重定位——新模块 pom 被误标 writable 是 LLM 常见形态（规则4 注释自证），
+    # 按 basename 撞根 pom=击穿 D1 单写者+脚手架蒸发，一律走"挪 create_files"；
+    # ③目录上下文：writable 所在目录有本 plan 的 create_files 兄弟=新目录新文件
+    # （合法同名分层复制），不重定位。非 git/清单失败 → 整条跳过（greenfield 不误伤）。
+    _RULE0_MANIFESTS = {"pom.xml", "build.gradle", "build.gradle.kts",
+                        "settings.gradle", "settings.gradle.kts",
+                        "package.json", "go.mod", "cargo.toml"}
+    _tree = _base_tree_listing(project_path, base_ref)
+    if _tree:
+        _tree_set = set(_tree)
+        _by_base: dict[str, list[str]] = {}
+        for _p in _tree:
+            _by_base.setdefault(_p.rsplit("/", 1)[-1], []).append(_p)
+        _all_creates = {str(f).replace("\\", "/") for st in subtasks
+                        for f in (getattr(getattr(st, "scope", None), "create_files", None) or [])}
+        _create_dirs = {c.rsplit("/", 1)[0] for c in _all_creates if "/" in c}
+        for st in subtasks:
+            _sc0 = getattr(st, "scope", None)
+            if _sc0 is None:
+                continue
+            _w = list(getattr(_sc0, "writable", None) or [])
+            _new_w: list = []
+            _moved: list = []
+            for f in _w:
+                fn = str(f).replace("\\", "/")
+                fn = fn[2:] if fn.startswith("./") else fn
+                if fn in _tree_set or fn in _all_creates:
+                    _new_w.append(f)
+                    continue
+                _base_name = fn.rsplit("/", 1)[-1]
+                _dir = fn.rsplit("/", 1)[0] if "/" in fn else ""
+                _hits = _by_base.get(_base_name) or []
+                _is_manifest = _base_name.lower() in _RULE0_MANIFESTS
+                _dir_is_new = bool(_dir) and _dir in _create_dirs
+                if _hits and len(_hits) == 1 and not _is_manifest and not _dir_is_new:
+                    logger.warning(
+                        "[normalize] 规则0：%s 的 writable %s 不在 base 树，basename 唯一命中 "
+                        "%s → 确定性重定位（幻觉路径治本 F1）", st.id, fn, _hits[0])
+                    if _hits[0] not in _new_w:
+                        _new_w.append(_hits[0])
+                    changed = True
+                elif not _hits or _is_manifest or _dir_is_new:
+                    logger.warning(
+                        "[normalize] 规则0：%s 的 writable %s 不在 base 树（%s）→ "
+                        "视为新建挪入 create_files", st.id, fn,
+                        "构建清单不重定位" if _is_manifest and _hits else (
+                            "新目录上下文" if _dir_is_new and _hits else "无同名文件"))
+                    _moved.append(fn)
+                    changed = True
+                else:
+                    logger.warning(
+                        "[normalize] 规则0：%s 的 writable %s 不在 base 树，basename 多义命中 "
+                        "%d 处 → 保守保留（worker 异议通道兜底）", st.id, fn, len(_hits))
+                    _new_w.append(f)
+            if _moved:
+                _sc0.create_files = list(dict.fromkeys(
+                    list(getattr(_sc0, "create_files", None) or []) + _moved))
+                _all_creates.update(_moved)
+                _create_dirs.update(c.rsplit("/", 1)[0] for c in _moved if "/" in c)
+            if _new_w != _w:
+                _sc0.writable = _new_w
 
     # ── 规则 3（先于规则1跑）：Maven 新模块构建闸门可满足性补全（治本 task 69d34b1b）。
     # 放规则1前，使补进来的 pom 也受"同文件写权唯一"去重/串行化（多模块子任务不并发抢写根 pom）。
@@ -652,7 +776,9 @@ def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
         return tok.group(0) if tok else ""
 
     symbols: list[str] = []
-    for key in ("interfaces", "types", "apis", "fields", "methods"):
+    # C1 复核补漏：ULTRA 合并契约的 DTO 落在 "dtos" 键（CONTRACT_MODULE schema），
+    # 旧列表只读 "types" → DTO 名对 C1 规划期对账 / L2 契约核验双盲。
+    for key in ("interfaces", "types", "dtos", "apis", "fields", "methods"):
         val = shared_contract.get(key)
         if isinstance(val, list):
             for item in val:

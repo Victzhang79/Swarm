@@ -86,7 +86,12 @@ def test_skeleton_exhausts_retries_then_degrades_with_visible_error():
         pn.logger.removeHandler(h)
     assert calls["skeleton"] == pn._CONTRACT_SKELETON_MAX_ATTEMPTS, (
         f"应有界重试 {pn._CONTRACT_SKELETON_MAX_ATTEMPTS} 次，实际 {calls['skeleton']}")
-    assert out == {}, f"彻底失败应优雅降级沿用 tech_design draft，实际 {out!r}"
+    # C4-8 语义演进：骨架失败=全部模块契约片丢失（最坏场景）必须带机读账——
+    # 旧 return {} 恰在最坏场景无账（对抗复核 CONFIRMED 补漏）。降级语义不变（无 shared_contract）。
+    assert "shared_contract" not in out, "彻底失败仍优雅降级沿用 tech_design draft"
+    assert set(out.get("contract_failed_modules") or []) == {"ruoyi-alarm", "ruoyi-alarm-api"}, \
+        f"骨架失败应把全部模块入机读账，实际 {out!r}"
+    assert any("骨架生成失败" in r for r in out.get("degraded_reasons") or [])
     msgs = " ".join(m for m in cap if "CONTRACT_SKELETON" in m)
     assert "超时" in msgs, f"A：超时错因必须可见(旧代码空消息)，日志={msgs!r}"
     print("  ✅ A+B：永远超时→有界重试→优雅降级 + 错因'超时'可见（非空）")
@@ -117,7 +122,9 @@ def test_skeleton_non_timeout_error_logged_with_type():
             out = asyncio.run(pn.contract_design(_ultra_state()))
         finally:
             pn.logger.removeHandler(h)
-    assert out == {}
+    # C4-8 语义演进：同上，骨架失败带机读账（降级语义不变）
+    assert "shared_contract" not in out and set(out.get("contract_failed_modules") or []) \
+        == {"ruoyi-alarm", "ruoyi-alarm-api"}
     joined = " ".join(m for m in cap if "CONTRACT_SKELETON" in m)
     assert "ValueError" in joined and "boom-xyz" in joined, f"非超时异常应记 type+msg: {joined!r}"
     print("  ✅ A：非超时异常记 type 名+消息（非空盲点）")

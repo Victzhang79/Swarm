@@ -172,6 +172,38 @@ def _inject_upstream_products(to_dispatch, subtask_results: dict,
     return _changed
 
 
+def _c2_missing_symbols(subtask, shared_contract: dict, diff: str) -> list[str]:
+    """C2（round38c 主题C）：本子任务【归属】的 shared_contract 符号中未出现在其 diff
+    的清单。归属口径与 C1 validate_contract_ownership/verify D5 同源：子任务
+    description/acceptance_criteria/contract 词边界命中，或 create_files/writable
+    文件名 <Symbol>.<ext> 命中。纯函数可测。"""
+    import json as _json
+    import re as _re
+
+    from swarm.brain.contract_utils import contract_symbols
+    symbols = contract_symbols(shared_contract or {})
+    if not symbols:
+        return []
+    sc = getattr(subtask, "scope", None)
+    corpus = (
+        (getattr(subtask, "description", "") or "") + " "
+        + " ".join(getattr(subtask, "acceptance_criteria", None) or [])
+        + " " + _json.dumps(getattr(subtask, "contract", None) or {}, ensure_ascii=False)
+    ).lower()
+    basenames = [str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
+                 for f in (list(getattr(sc, "create_files", None) or [])
+                           + list(getattr(sc, "writable", None) or []))]
+    dl = (diff or "").lower()
+    missing: list[str] = []
+    for sym in symbols:
+        s = str(sym).lower()
+        pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
+        owned = bool(pat.search(corpus)) or any(b.startswith(s + ".") for b in basenames)
+        if owned and s not in dl:
+            missing.append(str(sym))
+    return sorted(missing)
+
+
 def _changes_from_diff(diff: str) -> list:
     """从 unified diff 提取 FileChange（ADDED/MODIFIED/DELETED）。纯函数、可测。
 
@@ -582,6 +614,27 @@ async def dispatch(state: BrainState) -> dict:
             f"(L1={'通过' if worker_output.l1_passed else '未通过'}, "
             f"diff={len(worker_output.diff or '')} chars)"
         )
+        # ── C2（round38c 主题C，对抗复核 CONFIRMED 修正）：收货侧遵约确定性对账。
+        # 初版按 st.contract 抽符号=恒空（主线 contract 形状是 {"input","output"} 描述，
+        # contract_symbols 读不到）——改按【shared_contract 中归属本子任务的符号】
+        # （C1 同口径：描述/AC/contract 词边界 + create_files/writable 文件名命中）对
+        # diff 核对。warn 级+机读键（l1_details.contract_missing_symbols）：不硬拒
+        # （符号可能已存在于既有文件），供 L2 D5/交付对账/journal 提前 8h 看见。
+        if worker_output.l1_passed and shared_contract:
+            try:
+                _c2_missing = _c2_missing_symbols(
+                    subtask, shared_contract, worker_output.diff or "")
+                if _c2_missing:
+                    worker_output.l1_details = {
+                        **(worker_output.l1_details or {}),
+                        "contract_missing_symbols": _c2_missing[:20],
+                    }
+                    logger.warning(
+                        "[DISPATCH] C2 遵约对账：%s 归属的契约符号 %d 个未出现在其 diff：%s"
+                        "（可能已存在于既有文件；L2 D5 将全局复核）",
+                        subtask.id, len(_c2_missing), _c2_missing[:5])
+            except Exception as _c2_exc:  # noqa: BLE001 — 对账是观测增强，绝不阻断收货
+                logger.warning("[DISPATCH] C2 遵约对账异常（跳过）: %s", _c2_exc)
         # 治本 D01：成功判据 = L1 通过 且 产出符合【该 intent/scope 预期的变更形态】。
         # 旧判据 `_diff_has_changes`（只认 `+` 行）把 AUDIT（空 diff 合法）与纯删除子任务
         # （只有 `-` 行 + `+++ /dev/null`）结构性判失败 → 反复重试至 abandon、审计意图无成功终态。

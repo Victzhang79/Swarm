@@ -55,7 +55,8 @@ async def test_contract_design_skips_non_ultra():
         "complexity": "medium", "tech_design": {"modules": [{"name": "m1"}]},
         "tech_design_file_plan": [],
     })
-    assert out == {}
+    # C4-8 语义演进（round38c 主题C）：非 ultra 早退 always-emit 清空机读键防跨轮粘滞
+    assert out == {"contract_failed_modules": []}
 
 
 @pytest.mark.asyncio

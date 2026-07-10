@@ -408,6 +408,70 @@ def covered_req_ids(matrix: dict) -> list[str]:
     return sorted(ids)
 
 
+def validate_contract_ownership(plan, shared_contract) -> PlanValidationResult:
+    """C1（round38c 主题C）：契约符号→owner 确定性对账——D5 从 VERIFY_L2 前移到 PLAN 期。
+
+    round38c 死因链头：24 个契约接口从未进任何子任务语料，规划期两张皮，8 小时后
+    L2 才第一次对账爆缺失 16/24 → 全员清零（A1 已封死清零，本函数掐断"两张皮"本身）。
+    规则（零 LLM）：每个 shared_contract 符号必须有 owner——某子任务的
+    description/acceptance_criteria/contract 词边界命中（与 verify._d5_attribute_owners
+    同口径），或 create_files/writable 文件名命中（<Symbol>.<ext>）。
+    无主符号占比 > SWARM_CONTRACT_UNOWNED_RATIO（默认 0.4，与 L2 缺失阈值同源）→
+    invalid 走 D09 回灌打回（feedback 教 PLAN 怎么修）；否则逐条 warn（可观测不烧重试）。
+    规则5 落空依赖（unclaimed_contract_deps）并入 warnings（旧纯 log 无人消费）。"""
+    import json as _json
+    import os as _os
+    import re as _re
+
+    from swarm.brain.contract_utils import contract_symbols, unclaimed_contract_deps
+    result = PlanValidationResult(valid=True)
+    symbols = contract_symbols(shared_contract or {})
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    if symbols and subtasks:
+        corpus: dict[str, str] = {}
+        files_by_st: dict[str, list[str]] = {}
+        for st in subtasks:
+            sc = getattr(st, "scope", None)
+            corpus[st.id] = (
+                (getattr(st, "description", "") or "") + " "
+                + " ".join(getattr(st, "acceptance_criteria", None) or [])
+                + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
+            ).lower()
+            files_by_st[st.id] = [
+                str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
+                for f in (list(getattr(sc, "create_files", None) or [])
+                          + list(getattr(sc, "writable", None) or []))]
+        unowned: list[str] = []
+        for sym in symbols:
+            s = str(sym).lower()
+            pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
+            hit = any(pat.search(txt) for txt in corpus.values()) or any(
+                b.startswith(s + ".") for bl in files_by_st.values() for b in bl)
+            if not hit:
+                unowned.append(str(sym))
+        if unowned:
+            try:
+                ratio_cap = float(_os.environ.get("SWARM_CONTRACT_UNOWNED_RATIO", "0.4"))
+            except (TypeError, ValueError):
+                ratio_cap = 0.4
+            ratio = len(unowned) / max(len(symbols), 1)
+            if ratio > ratio_cap:
+                result.add(
+                    f"契约符号无 owner 子任务承接 {len(unowned)}/{len(symbols)}"
+                    f"（占比 {ratio:.0%} 超阈值 {ratio_cap:.0%}）: {', '.join(unowned[:12])}"
+                    "——每个契约符号必须由某个子任务负责产出：在该子任务的 description/"
+                    "contract 中点名符号，或在其 create_files 安排 <符号名>.<扩展名> 文件")
+            else:
+                for sym in unowned[:20]:
+                    result.warn(f"契约符号 {sym} 无 owner 子任务（L2 将按 D5 归因定向重派，"
+                                "建议规划期即安排 owner）")
+    for entry in unclaimed_contract_deps(plan):
+        result.warn(
+            f"规则5：模块 {entry['module']} 的 {len(entry['artifacts'])} 个依赖契约"
+            "无 pom owner 承接（编译期可能缺依赖）")
+    return result
+
+
 def validate_requirement_coverage(
     plan, requirement_items, baseline_covered=None,
 ) -> PlanValidationResult:

@@ -2455,6 +2455,33 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_feedback": _format_validation_feedback(_pb_issues, rotate=retry_count),
         }
 
+    # ── C1（round38c 主题C）：契约符号→owner 确定性对账（D5 前移到 PLAN 期）──
+    # round38c：契约↔计划两张皮到 VERIFY_L2 才第一次对账（8h 后爆缺失 16/24）；
+    # 规则5 落空 98 条 artifacts 旧纯 log 无消费——一并升 warn 可观测。
+    # 无主符号占比超阈值 → 打回 PLAN（D09 回灌，熔断共用 plan_retry_count）。
+    from swarm.brain.plan_validator import validate_contract_ownership as _vco
+    _sc_own = state.get("shared_contract") or (getattr(plan_obj, "shared_contract", None) or {})
+    _co_result = _vco(plan_obj, _sc_own)
+    for w in _co_result.warnings:
+        logger.warning("[VALIDATE_PLAN] C1 契约对账: %s", w)
+    # C4-8（round38c alarm-engine 契约片 3×600s 丢失后静默少片）：契约缺片机读可见。
+    _cf_mods = state.get("contract_failed_modules") or []
+    if _cf_mods:
+        logger.warning(
+            "[VALIDATE_PLAN] C4 共享契约缺片（%d 模块：%s）——这些模块接口未进契约，"
+            "C1 对账/L2 D5 对其不可见，交付验收以 degraded_summary 如实呈现",
+            len(_cf_mods), _cf_mods[:5])
+    if not _co_result.valid:
+        logger.warning("[VALIDATE_PLAN] C1 契约符号对账未通过 → 打回 PLAN: %s",
+                       _co_result.issues[:3])
+        return {
+            "plan_valid": False,
+            "plan_retry_count": retry_count,
+            "plan_validation_issues": _co_result.issues,
+            "plan_validation_feedback": _format_validation_feedback(
+                _co_result.issues, rotate=retry_count),
+        }
+
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
     # 接缝：结构校验后、SIMPLE 早退后（单 trivial 子任务自证覆盖，强校验只会误伤）、
     # LLM 软校验前。requirement_items 缺失/空（抽取降级/老 checkpoint）→ 跳过校验 +
