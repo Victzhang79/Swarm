@@ -266,7 +266,14 @@ async def clarify(state: BrainState) -> dict:
                 "clarify_round": int(state.get("clarify_round", 0)) + 1,
                 "tech_design_fact_issues": [],
             }
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            # I1-#15（round38c 主题I·外部深审）：interrupt() 靠抛 GraphInterrupt 让
+            # runtime 暂停图等人工 resume——宽捕获把它吞掉=首次调用即落本分支，交互
+            # 模式的虚假前提人工澄清闸【从未真正暂停过】（全仓其余 4 处 interrupt 均
+            # 裸调用，唯此处被包）。GraphInterrupt 族必须重抛。
+            _cls = type(_exc).__name__
+            if "Interrupt" in _cls or "interrupt" in _cls:
+                raise
             return {
                 "clarify_done": True,
                 "clarify_blocked_by_facts": True,

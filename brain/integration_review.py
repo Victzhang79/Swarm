@@ -91,7 +91,21 @@ def _detect_build_cmd_generic(project_path: str) -> str | None:
     if os.path.isfile(j(project_path, "Cargo.toml")):
         return "cargo build -q"
     if os.path.isfile(j(project_path, "package.json")):
-        return "npm run build --if-present || npx tsc --noEmit --pretty false 2>/dev/null || true"
+        # I1-#13（round38c 主题I·外部深审）：旧命令尾部 `|| true` 把 Node 真编译失败
+        # 全部吞成 exit 0=L2 假绿假 DONE。改确定性选择：有 build script 用 npm run
+        # build；否则有 tsconfig 用 tsc；两者皆无=纯 JS 无确定性编译面，诚实返回
+        # None（合理跳过，与"强制成功"有本质区别）。
+        try:
+            import json as _json
+            with open(j(project_path, "package.json"), encoding="utf-8") as _f:
+                _pkg = _json.loads(_f.read() or "{}")
+            if (_pkg.get("scripts") or {}).get("build"):
+                return "npm run build"
+        except Exception:  # noqa: BLE001 — package.json 坏 → 按无 build script 处理
+            pass
+        if os.path.isfile(j(project_path, "tsconfig.json")):
+            return "npx tsc --noEmit --pretty false"
+        return None
     if os.path.isfile(j(project_path, "pyproject.toml")) or os.path.isfile(
         j(project_path, "setup.py")
     ):
