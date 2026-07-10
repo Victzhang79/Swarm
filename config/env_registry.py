@@ -168,6 +168,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_SANDBOX_PROXY_BASE": "api/_shared.py:51",
     "SWARM_SANDBOX_REQUEST_TIMEOUT": "worker/sandbox.py:730",
     "SWARM_SANDBOX_TAR_SYNC": "brain/nodes/verify.py:35",
+    "SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK": "config/settings.py:476",
     "SWARM_SANDBOX_USE_FOR_WORKER": "api/_shared.py:54",
     "SWARM_SANDBOX_VERIFY_SSL": "config/settings.py:458",
     "SWARM_SECRET_KEY": "api/routers/config.py:1109",

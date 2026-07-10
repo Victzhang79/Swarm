@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -77,6 +78,19 @@ def _enforce_project_path_containment(resolved_path: str, project_root: str, all
         )
 
 
+def _canonicalize_project_path(raw: str | None) -> str:
+    """I-SEC-1（round38c 主题I·外部深审 CRITICAL）：项目路径 alias 归一。
+
+    项目唯一性靠 PG ON CONFLICT (path) 的【字符串】比较——尾斜杠/./​段/symlink 等
+    alias 形态可把同一物理目录注册成多个项目，绕过 D16 冲突检测与成员授权模型
+    （他人项目目录经 alias 注册为"自己的"项目=多租户越权读写）。入口统一 realpath
+    归一，落库即规范物理路径。历史非规范存量行不迁移（诚实边界，登记册记录）。"""
+    p = (raw or "").strip()
+    if not p:
+        return ""
+    return os.path.realpath(os.path.abspath(p))
+
+
 def _caller_may_reuse_existing_project(user, existing_id: str) -> bool:
     """D16：path 已被既存项目占用时，调用者可否幂等复用（不改写）该项目。
 
@@ -116,7 +130,7 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     import re as _re
     from swarm.config.settings import PROJECT_ROOT
 
-    resolved_path = (req.path or "").strip()
+    resolved_path = _canonicalize_project_path(req.path)
 
     # M7 修复：拒绝把项目根指向系统敏感目录（后续 apply-diff 会写入该目录）。
     # 不强制 containment 到 workspace（用户合法用例就是指向本机已有项目），

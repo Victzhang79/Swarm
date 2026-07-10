@@ -468,6 +468,12 @@ class SandboxConfig(BaseSettings):
     default_template: str = ""
     dev_sidecar_path: str = "test/sandbox/dev_sidecar.py"
     use_for_worker: bool = True
+    # I-SEC-2（round38c 主题I·外部深审 CRITICAL）：沙箱【启用但创建失败】时是否允许
+    # 降级到宿主机执行。默认 False=fail-closed——LLM 产的任意命令本该在沙箱隔离，
+    # 静默降级=命令逃出隔离直接跑在 brain 宿主机（安全边界破坏）。单机开发无沙箱
+    # 场景用 use_for_worker=False（显式本地模式）而非依赖此降级。
+    # env: SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK
+    allow_local_fallback: bool = False
     sandbox_first: bool = True
     sandbox_remote_workdir: str = "/workspace"
     # 按语言预建的沙箱模板 ID（各装好对应工具链，避免运行时 setup 慢/脆）。

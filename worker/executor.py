@@ -537,8 +537,20 @@ class WorkerExecutor(
                             f"项目专属沙箱镜像不可用（{exc}）——镜像可能已过期/被清理。"
                             f"本地无项目源码，拒绝降级空跑。请重建该项目沙箱模板后重试。"
                         ) from exc
-                    # 通用镜像/无源码依赖（纯文字等）→ 降级本地合法
-                    self._log(f"沙箱创建失败，降级本地执行: {exc}")
+                    # I-SEC-2（round38c 主题I·外部深审 CRITICAL）：默认 fail-closed——
+                    # 沙箱启用但创建失败时静默降级=LLM 任意命令逃出隔离直接跑在
+                    # brain 宿主机。显式 SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK=true 才
+                    # 保留旧降级（单机开发本地模式请用 use_for_worker=false）。
+                    if getattr(cfg.sandbox, "allow_local_fallback", False):
+                        self._log(f"沙箱创建失败，降级本地执行（ALLOW_LOCAL_FALLBACK 显式开启）: {exc}")
+                    else:
+                        self._log(f"沙箱创建失败，fail-closed 拒绝降级宿主机执行: {exc}")
+                        raise RuntimeError(
+                            f"沙箱创建失败（{exc}）——fail-closed 拒绝把 worker 命令降级到"
+                            "宿主机执行（安全边界）。修复沙箱服务，或单机开发场景显式设 "
+                            "SWARM_SANDBOX_USE_FOR_WORKER=false / "
+                            "SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK=true。"
+                        ) from exc
             else:
                 self._log("沙箱未启用，文件与命令将在本地执行")
 
