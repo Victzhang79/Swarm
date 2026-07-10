@@ -750,7 +750,30 @@ async def _stream_brain_events(
                     else:
                         plan_dict = None
                     if plan_dict is not None:
-                        module_lock = upgrade_module_lock(module_lock, pid, plan_dict)
+                        # E3（登记册 §六）：升级失败=目标模块被其它任务持有——有界等待
+                        # 重试（对方释放即升级成功），绝不保留旧锁照跑（旧"default"与
+                        # 他人模块键零互斥=纸面锁，两任务并发写同一 git 树）。耗尽预算
+                        # fail-loud（重试经 E1 播种低成本续跑）。await 节拍不冻结事件循环。
+                        from swarm.infra.redis_client import ModuleLockUpgradeConflict
+                        try:
+                            _lk_wait = float(os.environ.get(
+                                "SWARM_MODULE_LOCK_UPGRADE_WAIT_S", "300") or "300")
+                        except ValueError:
+                            _lk_wait = 300.0
+                        _lk_deadline = asyncio.get_running_loop().time() + _lk_wait
+                        while True:
+                            try:
+                                module_lock = upgrade_module_lock(module_lock, pid, plan_dict)
+                                break
+                            except ModuleLockUpgradeConflict as _lk_exc:
+                                if asyncio.get_running_loop().time() >= _lk_deadline:
+                                    logger.error(
+                                        "[ModuleLock] E3 升级冲突等待超预算(%.0fs)仍未解: %s"
+                                        "——fail-loud（绝不纸面互斥照跑），任务可 retry 续跑",
+                                        _lk_wait, _lk_exc)
+                                    raise
+                                logger.info("[ModuleLock] E3 升级冲突，%s——3s 后重试", _lk_exc)
+                                await asyncio.sleep(3)
                         # D02：升级后的新锁立即写回容器——此后任何异常退出，调用方 finally
                         # 都能经 lock_holder 释放到新锁（旧锁已在 upgrade 内 release）。
                         if lock_holder is not None:

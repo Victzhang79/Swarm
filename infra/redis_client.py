@@ -307,39 +307,103 @@ class RenewPacer:
 
 
 def upgrade_module_lock(
-    lock: ModuleLock,
+    lock,
     project_id: str,
     plan: dict[str, Any] | None,
-) -> ModuleLock:
-    """plan 产出后升级为模块级锁（失败则保留原锁）。"""
-    new_key = module_key_from_plan(plan)
+):
+    """plan 产出后升级为【全部写集】的组合模块锁（E3，登记册 §六）。
+
+    旧行为两处纸面互斥：①目标键只取 paths[0]（写 x+y 只锁 x）；②升级失败保留旧锁
+    照跑——旧"default"与他人模块键不同串=零互斥，两任务并发写同一 git 树。
+    新行为：目标=写集全部顶层目录的组合锁；获取失败抛 ModuleLockUpgradeConflict
+    （调用方有界等待重试，绝不静默照跑）。单次尝试、不阻塞（本函数在事件循环内被
+    同步调用，等待由调用方 await 节拍执行）。"""
+    new_keys = module_keys_from_plan(plan)
+    new_key = "+".join(new_keys)
     if new_key == lock.module_key:
         return lock
-    new_lock = ModuleLock(project_id, new_key, ttl_sec=lock.ttl_sec)
+    new_lock = MultiModuleLock(project_id, new_keys, ttl_sec=lock.ttl_sec)
     if not new_lock.acquire():
-        logger.info(
-            "[ModuleLock] keep %s (upgrade to %s unavailable)",
-            lock.module_key,
-            new_key,
-        )
-        return lock
+        raise ModuleLockUpgradeConflict(
+            f"模块锁升级冲突：{lock.module_key} → {new_key}（目标键被其它任务持有）")
     lock.release()
     logger.info("[ModuleLock] upgraded %s → %s", lock.module_key, new_key)
     return new_lock
 
 
-def module_key_from_plan(plan: dict[str, Any] | None) -> str:
+def module_keys_from_plan(plan: dict[str, Any] | None) -> list[str]:
+    """E3（登记册 §六）：从计划【全部写集】（writable ∪ create_files）derive 顶层模块键。
+
+    旧 module_key_from_plan 只取 paths[0]——计划写 x+y 两模块却只锁 x，另一任务锁 y
+    后双方在对方"没锁的那半"并发写同一 git 树（纸面互斥）。返回排序去重列表；无写集
+    → ["default"]（整项目宽锁，安全侧）。"""
     if not plan:
-        return "default"
+        return ["default"]
     paths: list[str] = []
     for st in plan.get("subtasks") or []:
         scope = st.get("scope") or {}
         paths.extend(scope.get("writable") or [])
-    if not paths:
-        return "default"
-    first = paths[0].replace("\\", "/")
-    parts = first.split("/")
-    return parts[0] if len(parts) > 1 else "root"
+        paths.extend(scope.get("create_files") or [])
+    keys: set[str] = set()
+    for p_ in paths:
+        p_ = str(p_).replace("\\", "/").lstrip("/")
+        if not p_:
+            continue
+        parts = p_.split("/")
+        keys.add(parts[0] if len(parts) > 1 else "root")
+    return sorted(keys) or ["default"]
+
+
+def module_key_from_plan(plan: dict[str, Any] | None) -> str:
+    """兼容入口：单键展示口径（E3 后仅用于日志/展示；互斥请用 module_keys_from_plan）。"""
+    return "+".join(module_keys_from_plan(plan))
+
+
+class ModuleLockUpgradeConflict(Exception):
+    """E3：锁升级目标键被其它任务持有——绝不保留窄/旧锁照跑（那是纸面互斥）。
+
+    调用方应有界等待重试（对方任务释放后即可升级）；耗尽预算按锁冲突 fail-loud，
+    重试经 E1 播种低成本续跑。"""
+
+
+class MultiModuleLock:
+    """E3：多模块键组合锁——按排序键序 all-or-nothing 获取（有序=无死锁），任一失败
+    回滚已获取部分。对外镜像 ModuleLock 接口（acquire/release/renew/module_key/ttl_sec），
+    runner 的续期/释放/日志零改动消费。"""
+
+    def __init__(self, project_id: str, keys: list[str], *, ttl_sec: int = 3600):
+        _uniq = sorted(set(keys)) or ["default"]
+        self.project_id = project_id
+        self.module_key = "+".join(_uniq)
+        self.ttl_sec = ttl_sec
+        self._locks = [ModuleLock(project_id, k, ttl_sec=ttl_sec) for k in _uniq]
+
+    def acquire(self) -> bool:
+        got: list[ModuleLock] = []
+        for lk in self._locks:
+            if lk.acquire():
+                got.append(lk)
+                continue
+            for g in reversed(got):  # 回滚，绝不半持
+                try:
+                    g.release()
+                except Exception:  # noqa: BLE001 — 回滚失败留痕不掩盖 acquire 失败
+                    logger.warning("[ModuleLock] E3 组合锁回滚释放 %s 失败", g.module_key)
+            return False
+        return True
+
+    def release(self) -> None:
+        for lk in reversed(self._locks):
+            try:
+                lk.release()
+            except Exception:  # noqa: BLE001 — 单键释放失败不挡其余（TTL 兜底）
+                logger.warning("[ModuleLock] E3 组合锁释放 %s 失败（TTL 兜底）", lk.module_key)
+
+    def renew(self) -> bool:
+        ok = True
+        for lk in self._locks:
+            ok = lk.renew() and ok  # 全续；任一失败=失锁（与单锁语义一致 fail-closed）
+        return ok
 
 
 class TaskQueue:

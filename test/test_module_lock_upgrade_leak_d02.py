@@ -93,14 +93,18 @@ def test_upgraded_module_lock_released_on_exception_after_plan():
         assert old_local.acquire(blocking=False) is True
         old_local.release()
 
-        # 升级后新锁此刻仍被持有（进程内锁不可再获取）——否则不是"持锁中"无从谈泄漏。
-        new_local = _local_lock_for(current.key)
-        assert new_local.acquire(blocking=False) is False
+        # E3 语义演进：升级产物是【全部写集】组合锁 MultiModuleLock——逐子键探持有性。
+        _sub_keys = [lk.key for lk in current._locks]
+        for _k in _sub_keys:
+            _probe = _local_lock_for(_k)
+            assert _probe.acquire(blocking=False) is False, f"{_k} 应持有中"
 
         # 模拟调用方 finally：释放 holder 里的【当前】锁（治本后 finally 走 lock_holder["lock"]）。
         current.release()
 
         # 治本核心断言 2：升级后的新锁被释放 → 进程内锁重新可获取，同项目后续任务不再被永久拒。
-        assert new_local.acquire(blocking=False) is True, \
-            "升级后的模块锁在异常路径必须被释放（D02 泄漏已治本）"
-        new_local.release()
+        for _k in _sub_keys:
+            _probe = _local_lock_for(_k)
+            assert _probe.acquire(blocking=False) is True, \
+                "升级后的模块锁在异常路径必须被释放（D02 泄漏已治本）"
+            _probe.release()
