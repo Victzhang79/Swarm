@@ -323,7 +323,8 @@ HANDLE_FAILURE_USER = """## 失败子任务
 {{
   "strategy": "retry|retry_alternate|replan|escalate",
   "reasoning": "策略选择理由",
-  "adjusted_subtasks": ["需要调整的子任务ID"]
+  "adjusted_subtasks": ["需要调整的子任务ID"],
+  "missing_files": ["仅当失败根因是【计划中没有任何子任务创建某个被依赖的文件】时，列出这些文件的项目相对路径（如 module/src/main/java/com/x/vo/FooVO.java）；其他情况留空数组"]
 }}
 ```"""
 

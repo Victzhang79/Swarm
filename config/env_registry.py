@@ -191,6 +191,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_TASK_LIST_DEFAULT_LIMIT": "api/routers/task.py:119",
     "SWARM_TOKEN_TTL_HOURS": "config/settings.py:743",
     "SWARM_UPLOADS_GC_DAYS": "project/store.py:1223",
+    "SWARM_UPSTREAM_PRODUCTS_CAP": "brain/nodes/dispatch.py:120",
     "SWARM_UPLOAD_MAX_BODY_BYTES": "api/routers/upload.py:77",
     "SWARM_VALIDATE_PLAN_COMPLETENESS_GATE": "brain/nodes/__init__.py:2640",
     "SWARM_VALIDATE_PLAN_LLM_GATE": "brain/nodes/__init__.py:2574",

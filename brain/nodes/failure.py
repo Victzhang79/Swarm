@@ -94,6 +94,121 @@ def _alt_map_update(state: dict, wave_ids, use_alternate: bool) -> dict[str, boo
     return out
 
 
+def _planned_producers_exist(plan_obj, files: list) -> bool:
+    """B3（round38c）：这些文件在全 plan 是否已有生产者（create_files/writable 命中，
+    basename 宽容匹配——LLM 给的路径与计划声明可能差目录前缀）。"""
+    if plan_obj is None or not files:
+        return False
+    declared: set[str] = set()
+    basenames: set[str] = set()
+    for st in (getattr(plan_obj, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            fn = str(f).replace("\\", "/")
+            fn = fn[2:] if fn.startswith("./") else fn
+            declared.add(fn)
+            basenames.add(fn.rsplit("/", 1)[-1])
+    for f in files:
+        fn = str(f).replace("\\", "/")
+        fn = fn[2:] if fn.startswith("./") else fn
+        if fn in declared or fn.rsplit("/", 1)[-1] in basenames:
+            return True
+    return False
+
+
+def _amend_scope_with_missing_files(plan_obj, failed_ids, missing_files, state,
+                                    project_path: str | None = None) -> dict | None:
+    """B3-2 外科出口（round38c TwoFactorBindVO 类计划级缺陷）：把 LLM 点名且全 plan
+    无 owner 的缺失文件补进失败子任务的 create_files——"给现有子任务补一个 create_files"
+    这一最小计划修正动作此前全决策面无合法通道（全量 replan 被守卫拦/降级 retry 治不了
+    计划缺口，forensics_B3B4_code.md）。
+    防毒校验（scope 毒教训，缺陷4）：相对路径/无 ../有扩展名/不与既有生产者重复；
+    每子任务限 1 次（subtask_scope_amend_counts）。全不过校验或配额耗尽 → None。"""
+    if plan_obj is None or not missing_files or not failed_ids:
+        return None
+    _amend_counts = dict(state.get("subtask_scope_amend_counts") or {})
+    fid = failed_ids[0]
+    if _amend_counts.get(fid, 0) >= 1:
+        return None
+    _by_id = {s.id: s for s in (getattr(plan_obj, "subtasks", None) or [])}
+    st = _by_id.get(fid)
+    sc = getattr(st, "scope", None) if st is not None else None
+    if sc is None:
+        return None
+    valid: list[str] = []
+    for f in missing_files:
+        fn = str(f).replace("\\", "/").strip()
+        if fn.startswith("./"):
+            fn = fn[2:]
+        if (not fn or fn.startswith("/") or ".." in fn.split("/")
+                or "." not in fn.rsplit("/", 1)[-1]):
+            continue
+        if _planned_producers_exist(plan_obj, [fn]):
+            continue
+        # 对抗复核#5：本地树已存在的文件≠"没人创建"——是同步/seed 问题（B1 面），
+        # 补进 create_files 会让 worker 从零重写覆掉基线/上游内容。
+        if project_path:
+            try:
+                from pathlib import Path as _P
+                if (_P(project_path) / fn).is_file():
+                    logger.warning(
+                        "[HANDLE_FAILURE] B3-2 缺失文件 %s 实际已在本地树 → 非计划缺口"
+                        "（疑似同步/seed 问题），不补 create_files", fn)
+                    continue
+            except Exception:  # noqa: BLE001 — 存在性判定失败按缺失继续（原语义）
+                pass
+        valid.append(fn)
+    if not valid:
+        return None
+    sc.create_files = list(dict.fromkeys(list(sc.create_files or []) + valid))
+    _amend_counts[fid] = _amend_counts.get(fid, 0) + 1
+    return {"applied": valid, "counts": _amend_counts}
+
+
+def _apply_scope_objection(plan_obj, subtask_results: dict, failed_ids: list, state) -> dict | None:
+    """B4-2：消费 worker 结构化 scope 异议（SCOPE_OBJECTION 行协议 → WorkerOutput.
+    scope_objection）。file 在该子任务 create_files 且 suggested 过防毒校验（相对路径/
+    无 ../有扩展名）→ 替换条目（与 B3-2 共用 subtask_scope_amend_counts，每子任务≤1）。
+    治 18:07 "这可能是一个错误"只能落 notes 散文无人读、8 轮穷举框架类名的死通道
+    （forensics_B3B4 缺陷4）。无可应用异议 → None。"""
+    if plan_obj is None or not failed_ids:
+        return None
+    _amend_counts = dict(state.get("subtask_scope_amend_counts") or {})
+    _by_id = {s.id: s for s in (getattr(plan_obj, "subtasks", None) or [])}
+    applied: dict[str, list] = {}
+    for fid in failed_ids:
+        obj = getattr(subtask_results.get(fid), "scope_objection", None) or {}
+        f = str(obj.get("file") or "").replace("\\", "/").strip()
+        s = str(obj.get("suggested") or "").replace("\\", "/").strip()
+        if not f or not s or _amend_counts.get(fid, 0) >= 1:
+            continue
+        st = _by_id.get(fid)
+        sc = getattr(st, "scope", None) if st is not None else None
+        if sc is None:
+            continue
+        cf = list(getattr(sc, "create_files", None) or [])
+        if f not in cf:
+            continue
+        if s.startswith("./"):
+            s = s[2:]
+        if s.startswith("/") or ".." in s.split("/") or "." not in s.rsplit("/", 1)[-1]:
+            logger.warning("[HANDLE_FAILURE] B4-2 scope 异议 suggested 未过防毒校验，忽略: %s → %s",
+                           f, s)
+            continue
+        # 对抗复核#7：suggested 撞其他子任务的 create_files/writable=破单写者不变量
+        # （合并期两写者冲突）——有 owner 即拒绝应用。
+        if _planned_producers_exist(plan_obj, [s]):
+            logger.warning("[HANDLE_FAILURE] B4-2 scope 异议 suggested %s 已有生产者，忽略（防双写者）", s)
+            continue
+        sc.create_files = [s if x == f else x for x in cf]
+        _amend_counts[fid] = _amend_counts.get(fid, 0) + 1
+        applied[fid] = [f, s]
+    if not applied:
+        return None
+    return {"applied": applied, "counts": _amend_counts}
+
+
 def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str) -> list:
     """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
     推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built（本就 JVM 包语义）；推不出→空
@@ -115,18 +230,41 @@ def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_outp
             break
     if not srcroot or not blocked_pkgs:
         return []
-    # 缺失类名：javac "cannot find symbol ... symbol: class X"（首字母大写=类型名，滤掉方法/变量）
-    classes = {c for c in re.findall(r"symbol:\s*class\s+([A-Za-z_]\w*)", build_output or "")
-               if c[:1].isupper()}
-    if not classes:
-        return []
+    # B4-1（round38c scope 毒治本，forensics_B3B4 缺陷4）：旧推导把 build_output 里
+    # 【所有】`symbol: class X`（含缺 classpath 依赖时的框架类，如 SqlSessionTemplate）
+    # 与 blocked_pkgs 做全叉积种进项目包路径 → 框架类名进 create_files 锁死 worker
+    # 在"public 类名=文件名"硬约束里穷举 8 轮。改为【证据配对】三层（不写死框架黑名单，
+    # 通用铁律）：
+    # ①import 证据：`import <pkg>.<Class>` 明示类的真属包——属 blocked 包则配对；属
+    #   非 blocked 包（框架/三方，如 org.mybatis.spring）则该类整体出局；
+    # ②symbol/location 邻近共现：错误块内提到 blocked 包 → 配对；
+    # ③无任何 import 证据的缺失类（未导入的同包引用/worker 自造类型，javac 只给
+    #   `location: var …`）→ 保留旧回退配对全部 blocked 包——round36 self-heal 的
+    #   真自造引用恰是这种形态（全量回归 2 用例坐实），误配残余由 B4-2 异议通道兜底。
+    txt = build_output or ""
     ext = ".kt" if "kotlin" in srcroot else ".java"
-    out: list[str] = []
-    for pkg in blocked_pkgs:
-        pkgpath = str(pkg).strip().replace(".", "/")
-        for cls in sorted(classes):
-            out.append(f"{srcroot}{pkgpath}/{cls}{ext}")
-    return sorted(set(out))
+    evidenced: dict[str, set[str]] = {}
+    for m in re.finditer(r"import\s+(?:static\s+)?([A-Za-z_][\w.]*)\.([A-Z]\w*)", txt):
+        evidenced.setdefault(m.group(2), set()).add(m.group(1))
+    blocked = [str(p).strip() for p in blocked_pkgs if str(p).strip()]
+    pairs: set[tuple[str, str]] = set()
+    for p in blocked:
+        _pq = re.escape(p)
+        for m in re.finditer(
+                r"symbol:\s*class\s+([A-Z]\w*)(?:[^\n]*\n){0,3}?[^\n]*" + _pq, txt):
+            pairs.add((p, m.group(1)))
+    for cls, pkgs in evidenced.items():
+        for p in blocked:
+            if p in pkgs:
+                pairs.add((p, cls))
+    paired_cls = {c for _, c in pairs}
+    for cls in set(re.findall(r"symbol:\s*class\s+([A-Z]\w*)", txt)):
+        if cls not in paired_cls and not evidenced.get(cls):
+            for p in blocked:
+                pairs.add((p, cls))
+    if not pairs:
+        return []
+    return sorted({f"{srcroot}{p.replace('.', '/')}/{c}{ext}" for p, c in pairs})
 
 
 async def _handle_failure_impl(state: BrainState) -> dict:
@@ -742,6 +880,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # except 分支用到 strategy 会 NameError。默认 "retry" 表示确定性回退（非 LLM 建议）。
     strategy = "retry"
     _diagnosis = ""   # A4 治本(round11)：brain 失败诊断，注入重试 worker 提示防重蹈
+    _llm_missing_files: list[str] = []  # B3-3：LLM 点名"计划无人创建"的文件（结构化载荷）
     try:
         llm = _get_brain_llm()
         failure_details_dict: dict[str, dict] = {}
@@ -773,6 +912,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         _fs = FailureStrategyResponse.model_validate(result)
         strategy = _fs.strategy
         _diagnosis = (_fs.reasoning or "").strip()
+        # B3-3：结构化载荷真消费（旧 extra:"ignore" 把 LLM 点名的缺失文件当散文丢弃）
+        _llm_missing_files = [str(x).strip() for x in (_fs.missing_files or [])
+                              if str(x).strip()][:10]
         logger.info(f"[HANDLE_FAILURE] LLM 策略: {strategy} — {_fs.reasoning}")
     except json.JSONDecodeError as e:
         logger.warning(f"[HANDLE_FAILURE] LLM 输出解析失败 → 确定性回退 retry（非 LLM 建议）: {e}")
@@ -803,7 +945,19 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
     # 选 retry 还是 replan，都先走定向恢复：补模块 pom 写权 + 重置徒劳的重试计数 + 只重派失败
     # 子任务（保留成功兄弟、不进 PLAN、不清完成态全表）。targeted_recovery_counts【按子任务】熔断防死循环（遗漏项#2）。
-    if _is_missing_dependency_failure(subtask_results, failed_ids) and failed_ids:
+    # B3-1（round38c 缺陷3）：缺依赖拦截让位"计划缺口"信号——LLM 判 replan 且点名的
+    # 缺失文件在全 plan 无 owner 时，"缺符号"的根因是【计划缺 create_files】而非
+    # scope 不可满足：补 pom/换模型对此零效（17:06 实证 LLM 判对被本拦截覆盖，
+    # TwoFactorBindVO 拖 3-5h）。放行到 replan 分支走 B3-2 外科修正。
+    _plan_gap = bool(strategy == "replan" and _llm_missing_files
+                     and plan_obj is not None
+                     and not _planned_producers_exist(plan_obj, _llm_missing_files))
+    if _plan_gap:
+        logger.info(
+            "[HANDLE_FAILURE] B3-1 计划缺口信号：LLM 点名缺失文件 %s 全 plan 无 owner → "
+            "跳过缺依赖定向恢复（补 pom 治不了计划缺口），交 replan 分支外科修正",
+            _llm_missing_files[:5])
+    if _is_missing_dependency_failure(subtask_results, failed_ids) and failed_ids and not _plan_gap:
         _tr_max = get_config().model.max_retries  # 复用 max_retries（默认 2）
         # round29 遗漏项#2 治本：熔断改【按子任务】计（targeted_recovery_counts）——旧任务级
         # 全局计数会被先失败的子任务用光、饿死后续同类受害者（d37a52a3 st-25 实证：配额被
@@ -954,6 +1108,27 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "插边成环）→ 序修复未激活，落常规 %s", strategy,
             )
 
+    # ── B4-2（round38c 缺陷4）：worker 结构化 scope 异议消费——scope 文件名/路径本身
+    # 错误（撞框架类名等）时替换条目重派，不再原样锁死让 worker 在"类名=文件名"里穷举 ──
+    _obj = _apply_scope_objection(plan_obj, subtask_results, failed_ids, state)
+    if _obj is not None:
+        _obj_remaining = list(state.get("dispatch_remaining", []))
+        for fid in failed_ids:
+            subtask_results.pop(fid, None)
+            if fid not in _obj_remaining:
+                _obj_remaining.append(fid)
+        logger.info("[HANDLE_FAILURE] B4-2 scope 异议应用：%s → 替换 create_files 条目后重派",
+                    _obj["applied"])
+        return {
+            "plan": plan_obj,
+            "subtask_results": subtask_results,
+            "dispatch_remaining": _obj_remaining,
+            "failed_subtask_ids": [],
+            "failure_strategy": "retry",
+            "failure_escalated": False,
+            "subtask_scope_amend_counts": _obj["counts"],
+        }
+
     if strategy == "replan":
         # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──
         # 背景(task dab669bb)：medium 任务拆成 st-1(实现)+st-2(测试)，st-1 成功 DONE、
@@ -977,6 +1152,32 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # 同样的 plan 再失败。故：有成功兄弟时——还有重试预算→只重做失败的(retry/retry_alternate)；
         # 已耗尽→escalate【失败子任务】并【完整保留成功成果】，绝不清空。
         if succeeded_siblings and failed_ids:
+            # B3-2 外科出口：LLM 点名的缺失文件全 plan 无 owner=计划级缺陷——守卫降级
+            # retry 前先补 create_files（每子任务限 1 次+防毒校验），使 replan 判决落地为
+            # 最小计划修正而非被降级白跑（round38c LLM 判对 10+ 次全被覆盖的治本面）。
+            if _llm_missing_files and not _planned_producers_exist(plan_obj, _llm_missing_files):
+                _amend = _amend_scope_with_missing_files(
+                    plan_obj, failed_ids, _llm_missing_files, state,
+                    project_path=_proj_path_from_state(state))
+                if _amend:
+                    dispatch_remaining = list(state.get("dispatch_remaining", []))
+                    for fid in failed_ids:
+                        subtask_results.pop(fid, None)
+                        if fid not in dispatch_remaining:
+                            dispatch_remaining.append(fid)
+                    logger.info(
+                        "[HANDLE_FAILURE] B3-2 外科计划修正：缺失文件 %s 补进 %s 的 "
+                        "create_files（全 plan 无 owner，replan 判决转外科），仅重派失败子任务",
+                        _amend["applied"], failed_ids[0])
+                    return {
+                        "plan": plan_obj,
+                        "subtask_results": subtask_results,
+                        "dispatch_remaining": dispatch_remaining,
+                        "failed_subtask_ids": [],
+                        "failure_strategy": "retry",
+                        "failure_escalated": False,
+                        "subtask_scope_amend_counts": _amend["counts"],
+                    }
             if _deepest <= _max_retries + 1:
                 dispatch_remaining = list(state.get("dispatch_remaining", []))
                 for fid in failed_ids:
@@ -1059,6 +1260,12 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # P0-2 携带失败原因：把本轮失败详情注入 state，供 PLAN 重新规划时参考，
         # 避免 LLM 看不到失败原因而原样重生成同一个坏计划。
         replan_feedback = (result.get("reasoning") or "").strip()
+        if _llm_missing_files:
+            # B3-3 对抗复核 minor：真 replan 时把结构化缺失文件清单显式带给 PLAN
+            # （不靠 LLM reasoning 散文复述）——新计划必须给这些文件安排 owner。
+            replan_feedback = (replan_feedback + "\n[结构化缺口] 以下文件在旧计划中无人创建，"
+                               "新计划必须为其安排 create_files owner: "
+                               + ", ".join(_llm_missing_files)).strip()
         logger.info(
             "[HANDLE_FAILURE] 策略=replan（第 %d/%d 次）— 清除失败结果，触发重新规划%s",
             replan_count, max_replan,
@@ -1124,12 +1331,45 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     transient_ids = [fid for fid, fc in failure_classes.items() if fc == TRANSIENT]
     MAX_TRANSIENT_RETRY = 3
 
+    # B2（round38c st-3-1 七轮同输入白跑治本）：BLOCKED 失败指纹。pipeline_blocked 类
+    # transient 是确定性构建闸的产物——同签名（同阻断类型+同缺失文件/包集合）重派=
+    # 同输入必然同结果。B1 派发注入使"上游 owner 后续完成"时签名自然变化（产物进
+    # seed）；全批 blocked 且两连不变=阻断源未解 → 跳过 transient 退避直落 capability
+    # 阶梯；三连不变 → 视同重试耗尽进阶梯终局分支（部分交付/abandon 优先于 escalate，
+    # 对抗复核 4b：直接 escalate 会抢占 PARTIAL 出口把终态硬化）。
+    # 精化（对抗复核 4a）：短路条件=【全部】transient 都是 blocked 且各自连击达标——
+    # 混入网络抖动/流式 stall 的批绝不连坐（同输入重试正是其正确语义）。
+    _blk_sigs = dict(state.get("subtask_block_signatures", {}))
+    _blk_counts: dict[str, int] = {}
+    for fid in transient_ids:
+        _bd = _det_of(subtask_results.get(fid))
+        _pb = _bd.get("pipeline_blocked")
+        if not _pb:
+            continue
+        _sig = str(_pb) + "|" + ",".join(sorted(
+            [str(x) for x in (_bd.get("blocked_on_files") or [])]
+            + [str(x) for x in (_bd.get("blocked_on_packages") or [])]
+            + [str(x) for x in (_bd.get("blocked_on_modules") or [])]))
+        _prev = _blk_sigs.get(fid) or {}
+        _cnt = int(_prev.get("count", 0)) + 1 if _prev.get("sig") == _sig else 1
+        _blk_sigs[fid] = {"sig": _sig, "count": _cnt}
+        _blk_counts[fid] = _cnt
+    _all_blocked = bool(transient_ids) and set(_blk_counts) == set(transient_ids)
+    _sig_skip = _all_blocked and min(_blk_counts.values()) >= 2
+    _sig_exhausted = _all_blocked and min(_blk_counts.values()) >= 3 \
+        and len(transient_ids) == len(failed_ids)
+
     # 仅当本批失败【全部】为 transient 时才走退避快路（混入 capability 则不抢占阶梯）。
-    if transient_ids and len(transient_ids) == len(failed_ids):
+    if transient_ids and len(transient_ids) == len(failed_ids) and not _sig_exhausted:
         transient_counts = dict(state.get("subtask_transient_counts", {}))
         next_tcounts = {fid: transient_counts.get(fid, 0) + 1 for fid in transient_ids}
         deepest_t = max(next_tcounts.values(), default=0)
-        if deepest_t <= MAX_TRANSIENT_RETRY:
+        if _sig_skip:
+            # B2：全批 blocked 同签名二连——transient 退避对同输入无意义，直落 capability 阶梯
+            logger.warning(
+                "[HANDLE_FAILURE] B2 失败指纹二连不变（全批 blocked）→ 跳过 transient 退避，"
+                "直落 capability 阶梯: %s", transient_ids)
+        elif deepest_t <= MAX_TRANSIENT_RETRY:
             # 治本 C：流式 stall（模型服务并发拥塞）立即重试会撞同一拥塞 → 给【更长退避】让拥塞散去
             # （8/16/32s）；普通 transient（连接抖动/5xx）恢复快，沿用短退避（2/4/8s）。两者都【不换模型】
             # （use_alternate_model=False）——是基建瞬时不是模型弱。
@@ -1153,6 +1393,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "subtask_use_alternate": _alt_map_update(state, transient_ids, False),
                 "subtask_transient_counts": {**transient_counts, **next_tcounts},
+                "subtask_block_signatures": _blk_sigs,  # B2：指纹持久化（同签名连击跨轮计数）
                 # C9：补了动态依赖边必须回写 plan（dispatch 依赖闸消费）
                 **({"plan": plan_obj} if _c9_edges else {}),
             }
@@ -1177,6 +1418,14 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 计算本批失败子任务里"最深"的重试次数，决定整批升级档位
     next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
     deepest = max(next_counts.values(), default=0)
+    if _sig_exhausted:
+        # B2 三连不变：确定性阻断对同输入已白跑 transient+阶梯——视同重试耗尽进终局
+        # 分支（下方 deepest>max+1：有完成产物 → abandon+PARTIAL 部分交付；无 → escalate）。
+        # 不直接 escalate：那会抢占部分交付出口把本可 PARTIAL 的终态硬化（对抗复核 4b）。
+        logger.warning(
+            "[HANDLE_FAILURE] B2 失败指纹三连不变（transient+阶梯均对同输入白跑）→ "
+            "视同重试耗尽进终局分支: %s", failed_ids)
+        deepest = max(deepest, max_retries + 2)
 
     # FINDING-12：拒答/步数耗尽(refusal_hard_fail)的子任务，重试强制走【最强模型】(40B 256k)，
     # 而非更弱 fallback——步数耗尽是小模型 agent 循环不收敛，换更弱只会更糟。
@@ -1268,6 +1517,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         "failure_strategy": effective_strategy,
         "subtask_retry_counts": {**retry_counts, **next_counts},
         "subtask_force_strong": force_strong,  # FINDING-12：拒答子任务重试走最强模型
+        "subtask_block_signatures": _blk_sigs,  # B2：指纹持久化（阶梯路径也计连击，三连升级）
         # 批4c：本返回 strategy 恒为 retry/retry_alternate（escalate 在上方早返回），
         # 非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
         "failure_escalated": False,

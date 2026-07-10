@@ -299,5 +299,10 @@ class _PromptBuildingMixin:
             "SUMMARY: (变更摘要)\n"
             "CONFIDENCE: (high/medium/low)\n"
             "NOTES: (需要人工审查的部分，如无则写 无)\n"
-            "```"
+            "```\n\n"
+            "特殊情况：若你确认【需新建文件】清单里某个文件名/路径本身就是错误的"
+            "（如撞了框架/依赖库的类名、包路径与项目结构不符），不要硬凑实现，"
+            "在上述格式后追加一行结构化异议（单行 JSON）：\n"
+            'SCOPE_OBJECTION: {"file": "清单里的原路径", "reason": "为何错误", '
+            '"suggested": "建议的正确相对路径"}'
         )

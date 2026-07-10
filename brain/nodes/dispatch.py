@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from swarm.audit import audit
 from swarm.brain.context_log import touch_context
@@ -81,6 +82,94 @@ def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) ->
         if pred_blocks:
             st.context_snippets = (getattr(st, "context_snippets", "") or "") + marker + "\n\n".join(pred_blocks)
             logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))
+
+
+def _inject_upstream_products(to_dispatch, subtask_results: dict,
+                              project_path: str | None = None) -> bool:
+    """B1（round38c 主题B 治本）：派发时把【全体 L1 通过子任务】的产物文件清单注入
+    本批子任务的 scope.upstream_artifacts——跨沙箱同步按"完成态 diff 全集"为源，
+    替代四处声明驱动启发式（同父 A1 累积/同包补齐/readable 补传/模块树，全部够不着
+    越包/跨父文件，st-13-2 八轮缺 VO 与 st-3 链漏传的根因，forensics_B1B2_code.md）。
+
+    - 只取完成态（l1_passed）diff：被弃半成品绝不播毒（本地树 _ch∪_ut 方案的否决理由）。
+    - 只取 ADDED/MODIFIED（_changes_from_diff）：删除态入清单会让 seed 闸误判
+      missing → 假 BLOCKED。
+    - 注入 upstream_artifacts 而非 readable：readable 全量渲染进 worker prompt
+      （prompts.py:206），百文件级会撑爆上下文；upstream_artifacts 零 prompt 渲染，
+      消费方=seed 闸（executor._precheck_upstream_seed）+ bootstrap 补传
+      （executor_sync 扫 readable∪upstream_artifacts，本批配套改）。
+    - BLOCKED 重派也经本注入（transient 回队 → 再进 dispatch）→ owner 完成后产物
+      自然进来=输入真变化，"重开完成态 owner 的重 seed"由此覆盖，无需 failure 侧第三臂。
+    - 对抗复核 CONFIRMED#2/#3 治理：①跨 diff 终态归并——后续完成者删除/重命名的旧路径
+      从全集剔除（单 diff 内跳过 DELETED 不够：st-A 创建、st-B 删除时 A 的贡献残留 →
+      seed 闸判缺 → 全体待派子任务假 BLOCKED，与 B2 指纹合谋成任务死刑）；②本地树
+      存在性过滤——注入源语义=已 pull-back 落本地树的完成态产物，不存在即陈旧
+      （merge 期清理/用户删除），绝不进 seed 闸。
+    幂等去重；cap 可观测（SWARM_UPSTREAM_PRODUCTS_CAP，默认 800）。
+    返回是否发生注入变更（调用方据此显式 emit plan——in-place 变异靠 checkpoint
+    捎带是本仓被禁模式，重启即丢）。
+    """
+    product_files: list[str] = []
+    _seen: set[str] = set()
+    _removed: set[str] = set()
+    for _sid, _out in (subtask_results or {}).items():
+        if not getattr(_out, "l1_passed", False):
+            continue
+        for _chg in _changes_from_diff(getattr(_out, "diff", "") or ""):
+            _ct = getattr(_chg, "change_type", None)
+            _p = getattr(_chg, "file_path", "") or ""
+            if not _p:
+                continue
+            if getattr(_ct, "value", _ct) == "deleted":
+                _removed.add(_p)
+                continue
+            if _p not in _seen:
+                _seen.add(_p)
+                product_files.append(_p)
+    # 跨 diff 终态归并：任一完成态 diff 删除过的路径从全集剔除（删除者必然后于创建者
+    # 看到该文件，终态=已删）。
+    if _removed:
+        product_files = [p for p in product_files if p not in _removed]
+    # 本地树存在性过滤：pull-back 未落盘/已被清理的路径绝不进 seed 闸（假 BLOCKED 源）。
+    if project_path:
+        try:
+            from pathlib import Path as _Path
+            _root = _Path(project_path)
+            _before = len(product_files)
+            product_files = [p for p in product_files if (_root / p).is_file()]
+            if len(product_files) != _before:
+                logger.info(
+                    "[DISPATCH] B1 存在性过滤剔除 %d 个不在本地树的陈旧产物路径（防假 BLOCKED）",
+                    _before - len(product_files))
+        except Exception as _exc:  # noqa: BLE001 — 过滤失败按未过滤继续（seed 闸仍有 transient 兜底）
+            logger.warning("[DISPATCH] B1 存在性过滤异常（跳过过滤）: %s", _exc)
+    if not product_files:
+        return False
+    try:
+        _cap = int(os.environ.get("SWARM_UPSTREAM_PRODUCTS_CAP", "800"))
+    except (TypeError, ValueError):
+        _cap = 800
+    if len(product_files) > _cap:
+        logger.warning(
+            "[DISPATCH] B1 完成态产物全集 %d 个超 cap=%d，截断注入（超出部分不进 seed 闸，"
+            "可调 SWARM_UPSTREAM_PRODUCTS_CAP）", len(product_files), _cap)
+        product_files = product_files[:_cap]
+    _changed = False
+    for st in to_dispatch:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        _own = set(getattr(sc, "writable", None) or []) | set(getattr(sc, "create_files", None) or [])
+        _add = [p for p in product_files if p not in _own]
+        if not _add:
+            continue
+        _merged = list(dict.fromkeys(list(getattr(sc, "upstream_artifacts", None) or []) + _add))
+        if _merged != list(getattr(sc, "upstream_artifacts", None) or []):
+            sc.upstream_artifacts = _merged
+            _changed = True
+            logger.info("[DISPATCH] B1 注入完成态产物全集 → %s upstream_artifacts=%d 个",
+                        st.id, len(_merged))
+    return _changed
 
 
 def _changes_from_diff(diff: str) -> list:
@@ -322,6 +411,14 @@ async def dispatch(state: BrainState) -> dict:
     # ── 跨子任务上下文传递(B3 配套)：把【前序已完成依赖子任务】的产出注入后序子任务，
     # 让后序看到前序定义的真实接口签名/新建符号，避免接口对不上（依赖序拆分场景）。
     _inject_predecessor_context(to_dispatch, plan_obj, subtask_results)
+    # B1：完成态产物全集注入（seed 闸复明 + bootstrap 补传扩源，含 BLOCKED 重派重 seed）。
+    # project_path 供存在性过滤（陈旧路径防假 BLOCKED，对抗复核 CONFIRMED#3）。
+    from swarm.brain import nodes as _nodes_mod
+    try:
+        _b1_proj_path = _nodes_mod._get_project_path(state.get("project_id") or "")
+    except Exception:  # noqa: BLE001 — 取不到路径按未过滤注入（seed 闸 transient 兜底）
+        _b1_proj_path = None
+    _ua_changed = _inject_upstream_products(to_dispatch, subtask_results, _b1_proj_path)
 
     logger.info(
         f"[DISPATCH] 派发 {len(to_dispatch)} 个子任务（并行批次） "
@@ -509,8 +606,10 @@ async def dispatch(state: BrainState) -> dict:
         "dispatch_remaining": dispatch_remaining,
         **worker_ctx,
     }
-    if _gate_split:
-        result["plan"] = plan_obj  # 闸门拆小后须回写新 plan，否则子块在旧 plan 找不到→孤儿
+    if _gate_split or _ua_changed:
+        # B1 对抗复核#1：注入 mutate 了 scope.upstream_artifacts——in-place 变异靠
+        # checkpoint 捎带是被禁模式（C9 同纪律），显式 emit 否则重启恢复即丢注入。
+        result["plan"] = plan_obj
     # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，
     # 若仅非空时返回，上一轮失败列表会残留 → gates 误拒真正成功的运行。
     result["failed_subtask_ids"] = failed_ids

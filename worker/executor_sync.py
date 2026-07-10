@@ -150,7 +150,9 @@ class _SandboxSyncMixin:
         scope = self.effective_scope
         changed = (list(getattr(scope, "writable", []) or [])
                    + list(getattr(scope, "create_files", []) or [])
-                   + list(getattr(scope, "readable", []) or []))
+                   + list(getattr(scope, "readable", []) or [])
+                   # B1：上游产物所在模块也纳入模块树收集（越模块的上游 VO 此前收不到）
+                   + list(getattr(scope, "upstream_artifacts", []) or []))
         module_roots: set[Path] = set()
         for f in changed:
             cur = (root / str(f).strip()).resolve().parent
@@ -500,9 +502,18 @@ class _SandboxSyncMixin:
                 # （N 文件=N 进程）批量为单次 `git ls-tree -r --name-only <base> -- <paths>`
                 # （谓词等价：路径在 base tree 中出现 = cat-file -e 命中；批量失败 fail-safe
                 # 空集 = 全按"不在 base"走补传分支，与逐文件版异常 continue 相比更保守但只多传不漏传）。
+                # B1（round38c 主题B）：补传候选=readable ∪ upstream_artifacts——
+                # dispatch 侧把"完成态产物全集"注入 upstream_artifacts（不进 readable，
+                # 防 prompt 全量渲染撑爆），本循环是它的上传消费端：越包/跨父的上游
+                # 产物由此进沙箱（st-13-2 八轮缺 VO 的治本落点）。
                 _readable_rels = []
-                for f in (getattr(self.effective_scope, "readable", []) or []):
+                _rr_seen: set[str] = set()
+                for f in (list(getattr(self.effective_scope, "readable", []) or [])
+                          + list(getattr(self.effective_scope, "upstream_artifacts", []) or [])):
                     rel = self._norm_rel(local_root, f)
+                    if rel in _rr_seen:
+                        continue
+                    _rr_seen.add(rel)
                     if rel not in _seen and (local_root / rel).is_file():
                         _readable_rels.append(rel)
                 _in_head_set: set[str] = set()

@@ -511,6 +511,14 @@ class WorkerOutput(BaseModel):
     l1_details: dict[str, Any] = Field(default_factory=dict)
     execution_log: str = ""
     notes: str = Field(default="", description="需人工审查的部分（Worker 自报，供审批/学习节点参考）")
+    scope_objection: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "B4-2（round38c）：worker 对 scope 的结构化异议 {file, reason, suggested}——"
+            "认定 create_files 里某文件名/路径本身错误（撞框架类名/包路径不符）时上抛，"
+            "HANDLE_FAILURE 消费（校验后替换 scope 条目），替代 notes 散文无人读的死通道"
+        ),
+    )
     audit_findings: list[SecurityFinding] = Field(
         default_factory=list,
         description="AUDIT 意图产出：安全审计发现列表(此类任务通常不产 diff)",

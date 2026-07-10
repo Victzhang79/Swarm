@@ -1402,6 +1402,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_force_strong: dict | None = None,
                            old_use_alternate: dict | None = None,
                            old_contract_counts: dict | None = None,
+                           old_block_signatures: dict | None = None,
+                           old_scope_amend_counts: dict | None = None,
                            merged_cover_injections: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
@@ -1425,7 +1427,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     if not any((old_results, old_recovery_counts, old_retry_counts,
                 old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
                 old_transient_counts, old_force_strong, old_use_alternate,
-                old_contract_counts)):
+                old_contract_counts, old_block_signatures, old_scope_amend_counts)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -1537,6 +1539,15 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     }
     pruned_abandoned = [sid for sid in (old_abandoned_ids or []) if _sig_unchanged(sid)]
     pruned_give_up = [sid for sid in (old_give_up_ids or []) if _sig_unchanged(sid)]
+    # B2/B3（round38c 对抗复核#7）：失败指纹与外科修正配额同签名纪律——replan 重编号
+    # 使 id 复用是默认情形，粘滞的旧指纹 count=2 会让语义全新的子任务首个 BLOCKED
+    # 直接三连终局（零重试杀新计划）；粘滞 amend=1 让新子任务永拒外科修正。
+    pruned_block_sigs = {
+        sid: v for sid, v in (old_block_signatures or {}).items() if _sig_unchanged(sid)
+    }
+    pruned_scope_amend = {
+        sid: n for sid, n in (old_scope_amend_counts or {}).items() if _sig_unchanged(sid)
+    }
     logger.info(
         "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber"
         "；记账保留 recovery=%d/%d retry=%d/%d redecompose=%d/%d；放弃标记保留 abandoned=%d/%d "
@@ -1565,6 +1576,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         "subtask_use_alternate": pruned_use_alternate,
         # D13：契约重试表同签名剪枝
         "contract_retry_counts": pruned_contract,
+        # B2/B3（round38c）：失败指纹/外科修正配额同签名剪枝
+        "subtask_block_signatures": pruned_block_sigs,
+        "subtask_scope_amend_counts": pruned_scope_amend,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -1846,7 +1860,9 @@ async def plan(state: BrainState) -> dict:
                                  old_transient_counts=state.get("subtask_transient_counts"),
                                  old_force_strong=state.get("subtask_force_strong"),
                                  old_use_alternate=state.get("subtask_use_alternate"),
-                                 old_contract_counts=state.get("contract_retry_counts")),
+                                 old_contract_counts=state.get("contract_retry_counts"),
+                                 old_block_signatures=state.get("subtask_block_signatures"),
+                                 old_scope_amend_counts=state.get("subtask_scope_amend_counts")),
             **plan_touch,
         }
 
@@ -2232,6 +2248,8 @@ async def plan(state: BrainState) -> dict:
                                  old_force_strong=state.get("subtask_force_strong"),
                                  old_use_alternate=state.get("subtask_use_alternate"),
                                  old_contract_counts=state.get("contract_retry_counts"),
+                                 old_block_signatures=state.get("subtask_block_signatures"),
+                                 old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
                                  # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
                                  merged_cover_injections=_cover_injections),
         **plan_touch,
@@ -4098,6 +4116,9 @@ async def revision(state: BrainState) -> dict:
         "subtask_transient_counts": {},
         "subtask_force_strong": {},
         "subtask_use_alternate": {},
+        # B2/B3（round38c）：修订=新一轮，失败指纹与外科修正配额同纪律重置
+        "subtask_block_signatures": {},
+        "subtask_scope_amend_counts": {},
         "confirm_reason": "",
         "deliver_auto_reject_reason": "",
         # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订

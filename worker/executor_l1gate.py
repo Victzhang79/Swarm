@@ -411,6 +411,7 @@ class _L1GateMixin:
         summary = ""
         confidence = Confidence.MEDIUM
         notes = ""
+        scope_objection = None
 
         # 尝试从输出中提取结构化字段
         lines = produce_result.split("\n")
@@ -422,6 +423,16 @@ class _L1GateMixin:
                 confidence = Confidence(conf_str) if conf_str in ("high", "medium", "low") else Confidence.MEDIUM
             elif line.startswith("NOTES:"):
                 notes = line[len("NOTES:"):].strip()
+            elif line.startswith("SCOPE_OBJECTION:"):
+                # B4-2：worker 对 scope 的结构化异议（单行 JSON）。解析失败按无异议——
+                # 通道是增强面，绝不因坏 JSON 阻断产出解析。
+                import json as _json
+                try:
+                    _obj = _json.loads(line[len("SCOPE_OBJECTION:"):].strip())
+                    if isinstance(_obj, dict) and _obj.get("file"):
+                        scope_objection = _obj
+                except Exception:  # noqa: BLE001
+                    self._log(f"[WARN] SCOPE_OBJECTION 行解析失败（按无异议处理）: {line[:120]}")
 
         if not summary:
             summary = produce_result[:500]
@@ -437,4 +448,5 @@ class _L1GateMixin:
             l1_details=l1_details,
             execution_log="\n".join(self.execution_log),
             notes=notes,
+            scope_objection=scope_objection,
         )

@@ -77,6 +77,12 @@ class FailureStrategyResponse(BaseModel):
 
     strategy: Literal["retry", "retry_alternate", "replan", "escalate"]
     reasoning: str = ""
+    # B3-3（round38c）：结构化载荷。prompt 一直在要 adjusted_subtasks 但 extra:"ignore"
+    # 丢弃、全仓零消费——LLM 点名"文件 X 从未被任何子任务创建"当散文扔掉（TwoFactorBindVO
+    # 拖 3-5h 的机制之一）。missing_files=LLM 判定计划里无人创建的文件相对路径，供
+    # replan 守卫走外科 scope 修正（补 create_files）而非降级 retry 白跑。
+    missing_files: list[str] = Field(default_factory=list)
+    adjusted_subtasks: list[str] = Field(default_factory=list)
 
     @field_validator("strategy", mode="before")
     @classmethod
