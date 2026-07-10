@@ -1061,7 +1061,7 @@ def build_degraded_summary(degraded_reasons) -> dict[str, int]:
 
 def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     output_parts: dict[str, Any] = {}
-    for key in ("merged_diff", "l2_passed", "learn_summary", "complexity", "plan", "subtask_results", "human_decision", "learned", "knowledge_context", "merge_conflicts", "l3_passed", "l3_skipped", "l3_message", "plan_validation_issues", "shared_contract", "verification_failure"):
+    for key in ("merged_diff", "l2_passed", "learn_summary", "complexity", "plan", "subtask_results", "human_decision", "learned", "knowledge_context", "merge_conflicts", "l3_passed", "l3_skipped", "l3_message", "plan_validation_issues", "plan_validation_warnings", "shared_contract", "verification_failure"):
         val = state.get(key)
         if val is None or val == "" or val == {}:
             continue

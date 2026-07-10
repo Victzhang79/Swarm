@@ -243,7 +243,27 @@ def setup_logging(*, force: bool = False, console: bool | None = None) -> None:
         ):
             uvicorn_logger.addHandler(h)
 
+    # G1/G4-1（round38c 主题G）：uvicorn.access 轮询降噪——健康/状态探活与任务列表
+    # 轮询占 round38c swarm.log 52%（GET /api/health×926 /api/status×919 …），纯噪声
+    # 淹没关键跃迁。挂 filter drop 掉这些高频只读探活路径，保留其余业务请求 access
+    # log（POST/错误请求仍可见），比 --no-access-log 全关更精细。
+    logging.getLogger("uvicorn.access").addFilter(_AccessPollFilter())
+
     _configured = True
+
+
+class _AccessPollFilter(logging.Filter):
+    """drop 健康/状态/列表轮询的 access log 行（GET 高频只读探活）；其余放行。"""
+    _POLL_PATHS = ("/api/health", "/api/status", "/health", "/api/tasks ", "/api/projects ")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return True
+        if '"GET ' not in msg:
+            return True  # 非 GET（POST/PUT/DELETE 等业务写）一律保留
+        return not any(p in msg for p in self._POLL_PATHS)
 
 
 @contextmanager

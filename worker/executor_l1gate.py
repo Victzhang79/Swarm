@@ -440,7 +440,8 @@ class _L1GateMixin:
                     if isinstance(_obj, dict) and _obj.get("file"):
                         scope_objection = _obj
                 except Exception:  # noqa: BLE001
-                    self._log(f"[WARN] SCOPE_OBJECTION 行解析失败（按无异议处理）: {line[:120]}")
+                    self._log(f"SCOPE_OBJECTION 行解析失败（按无异议处理）: {line[:120]}",
+                              level="warning")  # G1-4：假级别 [WARN]-in-INFO → 真 warning
 
         if not summary:
             summary = produce_result[:500]

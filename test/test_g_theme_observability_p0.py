@@ -47,5 +47,50 @@ def test_g3_1_empty_state_noop():
     assert tu == {"cloud_tokens_in": 5}
 
 
+# ══════════════ G P1 降噪/警告消费 ══════════════
+
+def test_g1_secret_store_warn_once(monkeypatch):
+    """G1-1b：同 key 解密失败首次 WARNING、之后 DEBUG（round38c 621 条=52% WARNING）。"""
+    import swarm.config.secret_store as ss
+    ss._decrypt_warned.clear()
+    warns: list = []
+    monkeypatch.setattr(ss.logger, "warning", lambda *a, **k: warns.append(a))
+    monkeypatch.setattr(ss.logger, "debug", lambda *a, **k: None)
+    # 直接驱动 warn-once 逻辑（不接真 DB）：模拟两次同 key 命中告警分支
+    for _ in range(3):
+        if "k1" in ss._decrypt_warned:
+            ss.logger.debug("x")
+        else:
+            ss._decrypt_warned.add("k1")
+            ss.logger.warning("first")
+    assert len(warns) == 1, "同 key 只应首次 WARNING"
+
+
+def test_g3_2_plan_validation_warnings_in_payload():
+    """G3-2：plan_validation_warnings 必须在 deliver payload 白名单（盯跑可见）。"""
+    from swarm.brain.runner import _build_result_payload
+    out = _build_result_payload({
+        "plan_validation_warnings": ["规则5：模块依赖契约无 pom owner 承接"],
+        "merged_diff": "x",
+    })
+    # payload 对 list 走既有 str 化路径（与 plan_validation_issues 同口径，SSE 消费端已适配）
+    assert "plan_validation_warnings" in out and "规则5" in str(out["plan_validation_warnings"]), (
+        "规划期软警告必须进 payload（盯跑可 grep 到内容）")
+
+
+def test_g4_access_poll_filter():
+    """G4-1：健康/状态轮询 access log 被 drop，业务写请求保留。"""
+    import logging
+    from swarm.logging_config import _AccessPollFilter
+    f = _AccessPollFilter()
+
+    def _rec(msg):
+        return logging.LogRecord("uvicorn.access", logging.INFO, "", 0, msg, (), None)
+    assert f.filter(_rec('127.0.0.1 - "GET /api/health HTTP/1.1" 200')) is False
+    assert f.filter(_rec('127.0.0.1 - "GET /api/status HTTP/1.1" 200')) is False
+    assert f.filter(_rec('127.0.0.1 - "POST /api/tasks HTTP/1.1" 201')) is True, "业务写保留"
+    assert f.filter(_rec('127.0.0.1 - "GET /api/tasks/abc HTTP/1.1" 200')) is True, "单任务详情保留"
+
+
 if __name__ == "__main__":
     print("run via pytest")

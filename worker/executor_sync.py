@@ -693,8 +693,9 @@ class _SandboxSyncMixin:
                     if is_tracked and git_text is None:
                         # 遗漏项#3 复核（hunter#3）：base 树确认存在却取不到基线（git 瞬时故障）
                         # → 单文件退化脏磁盘上传，防脏叠加对该文件失效——必须留痕，不得静默。
-                        self._log(f"[WARN] clean_upload: {rel} 在 base 树但基线读取失败，"
-                                  f"退化脏磁盘上传（防脏叠加对该文件未生效）")
+                        self._log(f"clean_upload: {rel} 在 base 树但基线读取失败，"
+                                  f"退化脏磁盘上传（防脏叠加对该文件未生效）",
+                                  level="warning")  # G1-4：假级别 [WARN]-in-INFO → 真 warning
                     if git_text is not None:
                         # writable 且 git 跟踪 → 用 HEAD 干净版（杜绝脏磁盘叠加）
                         dst.write_text(git_text, encoding="utf-8")

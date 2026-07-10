@@ -18,6 +18,10 @@ from typing import Any
 from swarm.types import SecurityFinding, Severity
 
 logger = logging.getLogger(__name__)
+# G1-1d（round38c 主题G）：report-only 覆盖率缺口告警 warn-once（按 language）——每个
+# AUDIT 子任务都打、同一栈重复刷屏（round38c ×9+5+3）；finding 注入已保证可观测，
+# 日志仅运维提示，首次一条足矣。block-mode 的 fail-closed 决策日志不在此列（每次留痕）。
+_scanner_absent_warned: set[str] = set()
 
 # ──────────────────────────────────────────────
 # 严重度排序辅助
@@ -103,11 +107,14 @@ def run_security_scan(
         # A-P0-2 report-mode 可见性：即便不阻断，也绝不让"根本没扫"伪装成"扫过且干净"。
         # 注入一条 INFO 级（rank 0，永不触发任何阈值）发现 + WARNING 日志，使覆盖率缺口可观测。
         if not ctx.scanner_ran:
-            logger.warning(
-                "Security scan: no real scanner executed for language '%s' in report-only mode "
-                "(block_severity=none) — 0 coverage, NOT clean. Install scanners for real signal.",
-                language,
-            )
+            if language not in _scanner_absent_warned:
+                _scanner_absent_warned.add(language)
+                logger.warning(
+                    "Security scan: no real scanner executed for language '%s' in report-only "
+                    "mode (block_severity=none) — 0 coverage, NOT clean. Install scanners for "
+                    "real signal.（同栈后续静默，覆盖率缺口仍以 finding 落库）",
+                    language,
+                )
             findings.append(SecurityFinding(
                 severity=Severity.INFO,
                 category="sast",

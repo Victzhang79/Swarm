@@ -2389,6 +2389,10 @@ async def validate_plan(state: BrainState) -> dict:
     affected_files = state.get("affected_files") or []
 
     logger.info(f"[VALIDATE_PLAN] 验证计划 (重试次数={retry_count})")
+    # G3-2（round38c 主题G）：规则5 落空/C1 契约无主符号等 warnings 此前只 logger 无
+    # state 键=API/盯跑不可见。累积进 plan_validation_warnings（成功 return 带上，进
+    # payload 白名单）——让规划期软警告对盯跑脚本可见。
+    _vp_warnings: list[str] = []
 
     if plan_obj is None:
         return {
@@ -2403,6 +2407,7 @@ async def validate_plan(state: BrainState) -> dict:
         affected_files=affected_files if affected_files else None,
     )
     for w in struct_result.warnings:
+        _vp_warnings.append(str(w))
         logger.info("[VALIDATE_PLAN] 警告: %s", w)
 
     if not struct_result.valid:
@@ -2463,6 +2468,7 @@ async def validate_plan(state: BrainState) -> dict:
     _sc_own = state.get("shared_contract") or (getattr(plan_obj, "shared_contract", None) or {})
     _co_result = _vco(plan_obj, _sc_own)
     for w in _co_result.warnings:
+        _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] C1 契约对账: %s", w)
     # C4-8（round38c alarm-engine 契约片 3×600s 丢失后静默少片）：契约缺片机读可见。
     _cf_mods = state.get("contract_failed_modules") or []
@@ -2541,6 +2547,7 @@ async def validate_plan(state: BrainState) -> dict:
         cov_result = validate_requirement_coverage(
             plan_obj, _req_items, state.get("baseline_covered"))
         for w in cov_result.warnings:
+            _vp_warnings.append(str(w))
             logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)
         if cov_result.valid and _wm_lost:
             # 防御闸（今日全有全无闸下不可达；A6 degraded 放行后 load-bearing）：
@@ -2738,6 +2745,8 @@ async def validate_plan(state: BrainState) -> dict:
         # S2-3：覆盖矩阵因 items 缺失被跳过时诚实留痕（degraded_reasons 是 reducer 键，
         # 追加去重；无跳过时不发键，零噪声）。
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
+        # G3-2：规划期软警告（规则5 落空/C1 无主符号等）机读可见（无警告不发键）
+        **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
         # 阶段3.1：本轮覆盖集入水位（跳过覆盖闸的轮不发键——无口径可对账）
         **({"coverage_watermark": _wm_cov_ids} if _wm_cov_ids is not None else {}),
         # H-F5：A6 缺口残差（last-write-wins）——只在【本轮计划真放行】时发：gap 放行=

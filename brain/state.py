@@ -82,6 +82,7 @@ class BrainState(TypedDict, total=False):
     plan_valid: bool                    # 计划验证结果
     plan_retry_count: int               # 计划重试次数
     plan_validation_issues: list[str]   # PlanValidator 问题列表
+    plan_validation_warnings: list[str]  # G3-2：规划期软警告（规则5 落空/C1 无主符号）机读面
     # D09：VALIDATE_PLAN 失败原因回灌 PLAN——校验失败时写入本轮 issues 摘要，PLAN 重试时读它注入
     # LLM prompt（否则 after_validate 失败→increment_retry→plan 是【盲重试】，LLM 看不到上轮为何被否
     # →原样重生成同样坏计划→烧光 MAX_PLAN_RETRY→confirm/REJECT）。校验通过时清空，防跨轮粘滞。
@@ -278,6 +279,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     # 规划闸
     "plan_retry_count": "round",
     "plan_validation_issues": "round",
+    "plan_validation_warnings": "round",  # G3-2：last-write-wins（每轮重算）
     "plan_validation_feedback": "oneshot",
     "plan_batch_cache": "round",
     "plan_batch_failed_modules": "round",

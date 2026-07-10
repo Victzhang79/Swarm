@@ -815,6 +815,8 @@ _DEFAULT_BOOTSTRAP_ADMIN_PASSWORD = "swarm"
 # 公开默认 DB 弱凭据标记（DatabaseConfig.postgres_uri 默认 postgresql://swarm:swarm@...）。
 # 生产环境 postgres_uri 若仍含此 user:pass 段即视为不安全。
 _DEFAULT_DB_CREDENTIALS_MARKER = "swarm:swarm@"
+# G1-1c：开发模式生产就绪提醒 warn-once（每次 reload_config 都调 validate → 重复刷屏）
+_dev_security_warned: set[str] = set()
 
 
 def validate_production_security(cfg: "AppConfig | None" = None) -> None:
@@ -847,23 +849,18 @@ def validate_production_security(cfg: "AppConfig | None" = None) -> None:
     insecure_token_ttl = (getattr(cfg, "token_ttl_hours", 0) or 0) <= 0
 
     if not cfg.is_production():
-        # 开发模式不拦截，但提醒弱配置
-        if insecure_secret:
-            _logger.warning(
-                "未设置 SWARM_SECRET_KEY（开发模式放行）；生产部署前必须显式设置高熵根密钥。"
-            )
-        if insecure_password:
-            _logger.warning(
-                "bootstrap_admin_password 仍为默认值（开发模式放行）；生产部署前必须改为非默认强密码。"
-            )
-        if insecure_rbac:
-            _logger.warning(
-                "rbac_enabled=False（开发模式放行）；生产部署前必须开启 RBAC，否则全站匿名 admin 放行。"
-            )
-        if insecure_db:
-            _logger.warning(
-                "DB 仍用公开默认弱凭据 swarm:swarm（开发模式放行）；生产部署前必须改为强凭据。"
-            )
+        # 开发模式不拦截，但提醒弱配置。G1-1c（round38c 主题G）：每次 reload_config 都
+        # 调本函数 → round38c 里 bootstrap×18/rbac×14 重复刷屏。开发提醒首次有价值、
+        # 重复是噪声——进程内 warn-once（按问题类型），之后同类静默。
+        for _flag, _msg in (
+            (insecure_secret, "未设置 SWARM_SECRET_KEY（开发模式放行）；生产部署前必须显式设置高熵根密钥。"),
+            (insecure_password, "bootstrap_admin_password 仍为默认值（开发模式放行）；生产部署前必须改为非默认强密码。"),
+            (insecure_rbac, "rbac_enabled=False（开发模式放行）；生产部署前必须开启 RBAC，否则全站匿名 admin 放行。"),
+            (insecure_db, "DB 仍用公开默认弱凭据 swarm:swarm（开发模式放行）；生产部署前必须改为强凭据。"),
+        ):
+            if _flag and _msg not in _dev_security_warned:
+                _dev_security_warned.add(_msg)
+                _logger.warning(_msg)
         return
 
     problems: list[str] = []

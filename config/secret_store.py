@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS secret_store (
 _CACHE_TTL = 30.0
 _cache: dict[str, tuple[str, float]] = {}   # key_name -> (plaintext, cached_at)
 _cache_lock = threading.Lock()
+# G1-1b（round38c 主题G）：解密失败 warn-once——同 key 同因每次读取都重打（round38c
+# 621 条=52% 全部 WARNING）。首次 WARNING（真运维信号保留），之后同 key 降 DEBUG。
+_decrypt_warned: set[str] = set()
 _fernet = None
 _fernet_lock = threading.Lock()
 
@@ -196,10 +199,15 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
             # M5 修复：decrypt 失败（key 轮换/密文损坏）与 miss 是两回事——
             # 此时 DB 里【有】密文却解不开，静默回退 .env 旧值会让 key 轮换问题极难排查。
             # 升级为 warning 显式告警，便于运维定位。
-            logger.warning(
-                "secret %s 解密失败（可能 SWARM_SECRET_KEY 轮换或密文损坏），回退 .env: %s",
-                key_name, dec_exc,
-            )
+            if key_name in _decrypt_warned:
+                logger.debug("secret %s 解密失败（已告警过，回退 .env）: %s", key_name, dec_exc)
+            else:
+                _decrypt_warned.add(key_name)
+                logger.warning(
+                    "secret %s 解密失败（可能 SWARM_SECRET_KEY 轮换或密文损坏），回退 .env"
+                    "（同 key 后续降 DEBUG）: %s",
+                    key_name, dec_exc,
+                )
             return None
     except Exception as exc:  # noqa: BLE001
         # DB 连接/查询失败（非解密问题）→ debug 即可

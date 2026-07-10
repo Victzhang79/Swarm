@@ -269,12 +269,18 @@ class WorkerExecutor(
             except Exception:  # noqa: BLE001
                 pass
 
-    def _log(self, message: str) -> None:
-        """记录执行日志"""
+    def _log(self, message: str, level: str = "info") -> None:
+        """记录执行日志。
+
+        G1-4（round38c 主题G）：level 参数——旧实现恒 logger.info，真警告语义的行只能
+        在【消息文本里内嵌 `[WARN]`】表达，导致 `grep WARNING`/按 level 过滤全部漏抓
+        （观测硬伤）。真警告用 level="warning" 走真 logger.warning。
+        """
         elapsed = time.monotonic() - self.start_time if self.start_time else 0
         entry = f"[{elapsed:.1f}s][{self.phase.value}] {message}"
         self.execution_log.append(entry)
-        logger.info(f"Worker({self.subtask.id}): {entry}")
+        (logger.warning if level == "warning" else logger.info)(
+            f"Worker({self.subtask.id}): {entry}")
         if self._sandbox and self._sandbox_manager:
             sid = getattr(self._sandbox, "sandbox_id", None)
             if sid:
