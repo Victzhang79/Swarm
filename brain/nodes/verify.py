@@ -207,10 +207,13 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         if not ir_ok:
             if any("契约" in i for i in ir_issues):
-                # D5（阶段6，登记册 §五）：契约失败不再全员连坐——按缺失符号归因 owner
-                # （描述/验收标准/契约文本命中缺失符号的子任务）定向重派；归因不出回退
-                # 全员（旧行为，绝不漏修）。
-                _ctr_failed = list(subtask_results.keys())
+                # D5（阶段6）+ A1 单调守卫（round38c P0，用户拍板 a+b）：契约失败按缺失
+                # 符号归因 owner 定向重派（语料=全 plan，命中被弃者由 HANDLE_FAILURE 复活）；
+                # 归因不出/归因异常一律 failed=[] 携机读 unattributed 走升级——已完成且
+                # diff 已稳定合并者绝不因启发式失败被全员列入重跑清单。
+                _ctr_failed: list = []
+                _missing: list = []
+                _unattributed: list = []
                 try:
                     import json as _json
 
@@ -220,7 +223,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     _dl = (merged_diff or "").lower()
                     _missing = [x for x in _csyms(_sc) if x.lower() not in _dl]
                     if _missing and plan_obj is not None:
-                        _owners, _sym_owners = _d5_attribute_owners(
+                        _owners, _sym_owners, _unattributed = _d5_attribute_owners(
                             _missing, plan_obj, subtask_results)
                         if _owners:
                             logger.info(
@@ -228,14 +231,19 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                                 "定向重派替代全员连坐", _owners,
                                 {k: v[:3] for k, v in list(_sym_owners.items())[:10]})
                             _ctr_failed = _owners
-                except Exception as _exc:  # noqa: BLE001 — 归因失败回退全员，绝不漏修
-                    logger.warning("[VERIFY_L2] D5 契约归因失败回退全员: %s", _exc)
+                except Exception as _exc:  # noqa: BLE001 — 归因异常走升级，绝不全员清零
+                    logger.warning("[VERIFY_L2] D5 契约归因异常 → 携机读账升级: %s", _exc)
+                    _unattributed = _unattributed or _missing
+                _l2d = {"integration_review": ir_details, "issues": ir_issues}
+                if _unattributed or not _ctr_failed:
+                    # 机读账：无主符号清单落 l2_details（state 声明键），供升级/PARTIAL 对账
+                    _l2d["contract_unattributed"] = list(_unattributed or _missing)
                 return {
                     "l2_passed": False,
                     "verification_failure": "contract",
-                    "failure_strategy": "retry",
+                    "failure_strategy": "retry" if _ctr_failed else "escalate",
                     "failed_subtask_ids": _ctr_failed,
-                    "l2_details": {"integration_review": ir_details, "issues": ir_issues},
+                    "l2_details": _l2d,
                 }
             # TD2606-B8：把集成编译失败归因到具体子任务（编译输出已含出错文件路径），
             # 能定位则只重做相关子任务、保留成功兄弟；定位不了回退现状（全量 replan）。
@@ -1151,13 +1159,18 @@ def _run_accept_phase(
 
 
 def _d5_attribute_owners(missing: list, plan_obj, subtask_results: dict) -> tuple:
-    """6.9-HF7/RF5：契约缺失符号 → owner 逐符号词边界归因。
+    """6.9-HF7/RF5 + A1（round38c P0）：契约缺失符号 → owner 逐符号词边界归因。
 
-    裸子串匹配会让 URL 末段泛词（"list"/"add"）误命中 "blacklist"/"listener" 描述；
-    更险的是真 owner 描述没写符号 → owners 非空但不含真 owner → 定向重派永不修复 →
-    contract_retry 打满 escalate（旧全员连坐反而能自愈）。词边界=非字母数字下划线邻接；
-    任一符号归因不出 → 整体回退全员认领 + loud 留痕（无主符号绝不静默无人修）。
-    返回 (owners, symbol→owners 映射)。"""
+    裸子串匹配会让 URL 末段泛词（"list"/"add"）误命中 "blacklist"/"listener" 描述，
+    词边界=非字母数字下划线邻接。
+    A1 语义演进（round38c 取证 forensics_A Q1，用户拍板 a+b 守卫）：
+    ① 语料覆盖全 plan 子任务（含被弃/失败者，subtask_results 仅作参考不再过滤）——
+      缺失符号真 owner 是被弃者时旧过滤使归因结构性不可能命中；命中被弃 owner 由
+      HANDLE_FAILURE 契约分支定向复活。
+    ② 归因不出绝不回退全员认领——旧回退在 owner 不在语料时退化成全员连坐清零
+      （37 个完成态 7ms 重置=本轮 P0）。空归因由调用方携机读 unattributed 走升级
+      通道（诚实 PARTIAL），破坏性重跑绝不由启发式失败触发。
+    返回 (owners, symbol→owners 映射, unattributed)。"""
     import json as _json
     import re as _re
     corpus = {
@@ -1166,7 +1179,7 @@ def _d5_attribute_owners(missing: list, plan_obj, subtask_results: dict) -> tupl
             + " ".join(getattr(st, "acceptance_criteria", None) or [])
             + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
         ).lower()
-        for st in plan_obj.subtasks if st.id in subtask_results
+        for st in plan_obj.subtasks
     }
     sym_owners: dict = {}
     unattributed: list = []
@@ -1181,10 +1194,9 @@ def _d5_attribute_owners(missing: list, plan_obj, subtask_results: dict) -> tupl
     owners = sorted({sid for v in sym_owners.values() for sid in v})
     if unattributed:
         logger.warning(
-            "[VERIFY_L2] D5 缺失符号 %s 归因不到任何 owner → 回退全员认领"
-            "（无主符号绝不静默无人修）", unattributed[:10])
-        owners = sorted(corpus.keys())
-    return owners, sym_owners
+            "[VERIFY_L2] D5 缺失符号 %s 归因不到任何 owner（全 plan 语料）→ 携机读账"
+            "走升级通道，绝不回退全员清零", unattributed[:10])
+    return owners, sym_owners, unattributed
 
 
 def _accept_phase_verdict(

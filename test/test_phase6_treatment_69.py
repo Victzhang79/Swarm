@@ -232,14 +232,17 @@ def test_69_hf7_word_boundary_no_false_owner_and_unattributed_falls_back_all():
     ], parallel_groups=[["st-a", "st-b"]])
     results = {"st-a": object(), "st-b": object()}
 
-    owners, sym_owners = _d5_attribute_owners(["list"], plan, results)
+    owners, sym_owners, _un = _d5_attribute_owners(["list"], plan, results)
     assert sym_owners.get("list") == ["st-b"], "词边界归因：blacklist 不算命中 list"
     assert owners == ["st-b"]
 
-    owners2, _ = _d5_attribute_owners(["IWholeNewService"], plan, results)
-    assert set(owners2) == {"st-a", "st-b"}, (
-        "无主符号必须回退全员认领——owners 非空但漏真 owner 时定向重派永不修复，"
-        "contract_retry 打满 escalate（旧全员连坐反而自愈）")
+    # A1 语义演进（round38c P0，用户拍板）：无主符号不再回退全员认领——旧回退在
+    # owner 不在语料（被弃者）时退化成全员连坐清零。现返回空 owners + 机读
+    # unattributed，由 verify/HANDLE_FAILURE 双侧守卫走升级通道（诚实 PARTIAL）。
+    # 详见 test_a1_contract_attribution_monotonic.py。
+    owners2, _, un2 = _d5_attribute_owners(["IWholeNewService"], plan, results)
+    assert owners2 == [], "归因不出绝不回退全员（A1 单调守卫）"
+    assert un2 == ["IWholeNewService"]
 
 
 # ─────────────── HF6：登录 infra 三态 ───────────────

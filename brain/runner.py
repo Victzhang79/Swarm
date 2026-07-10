@@ -1139,6 +1139,17 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
     if _dg:
         tu["degraded_summary"] = build_degraded_summary(_dg)
         tu["degraded_reasons"] = list(_dg)[:50]
+    # A2 复核残留：token 闸预写的 limit_exceeded/limit 诊断键不被本账覆写丢失——
+    # H3 合并原来只在 PARTIAL 分支生效，FAILED 分支整体覆写会抹掉"因预算闸而死"
+    # 的机读归因（与 PARTIAL 对称补齐）。
+    try:
+        _prev = (store.get_task(task_id) or {}).get("token_usage") or {}
+        if isinstance(_prev, dict):
+            for _k in ("limit_exceeded", "limit"):
+                if _k in _prev:
+                    tu[_k] = _prev[_k]
+    except Exception:  # noqa: BLE001 — 诊断键补齐失败不阻断终态账
+        pass
     return tu
 
 

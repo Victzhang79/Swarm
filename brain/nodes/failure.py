@@ -417,9 +417,21 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # audit A-P1-03：契约偏离重试必须计数+设上限，否则与能力分支不同——
         # 可无限 retry→contract→retry 至 recursion_limit。复用 subtask_retry_counts
         # 与 max_retries 上限（与 capability/SIMPLE 路径一致），超限升级人工。
-        failed = list(state.get("failed_subtask_ids", [])) or list(
-            (state.get("subtask_results") or {}).keys()
-        )
+        failed = list(state.get("failed_subtask_ids", []))
+        if not failed:
+            # A1 入口守卫（round38c P0）：旧回填 `or subtask_results.keys()` 是第二个
+            # 全员清零源——verify 归因空时把全体完成态列入重跑。空 failed=归因启发式
+            # 失败，升级人工携机读账（诚实 PARTIAL），完成态一个不动。
+            logger.warning(
+                "[HANDLE_FAILURE] 契约失败无归因 owner → 升级人工，绝不全员清零；"
+                "unattributed=%s",
+                (state.get("l2_details") or {}).get("contract_unattributed"))
+            return {
+                "failure_escalated": True,
+                "failure_strategy": "escalate",
+                "failed_subtask_ids": [],
+                "verification_failure": None,
+            }
         # P1-4：旧 `failed[:3]` 硬截断 → 第 4 个起的失败子任务【静默永不重试】（每轮都取同样前 3 个）。
         # 移除截断：每个子任务由 subtask_retry_counts + max_retries 各自封顶、总量由 recursion_limit
         # 兜底，无需人为截断；截断只会漏修。>3 时记 warning 保留可观测（契约失败连坐面较宽，可见）。
@@ -455,7 +467,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             subtask_results.pop(fid, None)
             if fid not in _dispatch_remaining:
                 _dispatch_remaining.append(fid)
-        return {
+        _ret = {
             "subtask_results": subtask_results,
             "dispatch_remaining": _dispatch_remaining,
             "failure_strategy": "retry",
@@ -464,6 +476,37 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "failed_subtask_ids": [],
             "verification_failure": None,
         }
+        # A1 定向复活（对抗复核#4 补强为传递闭包）：D5 全 plan 归因可命中被弃/打桩
+        # owner（round38c 引擎符号真 owner 全在被弃 14 个里）。两点缺一不可：
+        # ①派发面过滤 abandoned|give_up 双集（dispatch.py:280-281）——只摘 abandoned
+        #  则阶梯三打桩 owner 复活后永不可派；②owner 的传递上游若仍被弃则依赖永不
+        #  就绪——复活退化为 #R13-4 熔断前的有界空转（每轮白烧一次全 reactor 编译）。
+        # 故复活集=归因 owner + 其传递 depends_on 中处于双集且未完成者，一并摘出双集
+        # 并入重派队列（上游复活者不入 contract_retry_counts——非归因对象不受罚）。
+        _abandoned = set(state.get("abandoned_subtask_ids") or [])
+        _give_up = set(state.get("give_up_isolated_ids") or [])
+        _dead = _abandoned | _give_up
+        _revive = {fid for fid in failed if fid in _dead}
+        if _revive and plan_obj is not None and getattr(plan_obj, "subtasks", None):
+            _by_id = {st.id: st for st in plan_obj.subtasks}
+            _walk = list(_revive)
+            while _walk:
+                _st = _by_id.get(_walk.pop())
+                for _dep in (getattr(_st, "depends_on", None) or []) if _st else []:
+                    if _dep in _dead and _dep not in _revive and _dep not in subtask_results:
+                        _revive.add(_dep)
+                        _walk.append(_dep)
+        if _revive:
+            logger.info("[HANDLE_FAILURE] 契约归因命中被弃/打桩 owner → 定向复活传递闭包 %s"
+                        "（摘出 abandoned/give_up 双集）", sorted(_revive))
+            for fid in sorted(_revive):
+                if fid not in _dispatch_remaining:
+                    _dispatch_remaining.append(fid)
+            if _abandoned & _revive:
+                _ret["abandoned_subtask_ids"] = sorted(_abandoned - _revive)
+            if _give_up & _revive:
+                _ret["give_up_isolated_ids"] = sorted(_give_up - _revive)
+        return _ret
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
         # 确定性重试上限（与复杂路径一致，防止 SIMPLE 任务无限重试死循环）。

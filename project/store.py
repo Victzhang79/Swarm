@@ -2267,9 +2267,13 @@ def check_task_token_limit(
             limit = limit + per * int(subtask_count)
     usage["limit_effective"] = limit
     if limit > 0 and total > limit:
+        # A2（round38c 外部深审#14 P0）：估算闸只报超限不写终态——旧预写 status=FAILED
+        # 使 runner salvage 的 PARTIAL 写被终态 CAS 拒（runner._finalize_resource_guard
+        # `_partial_row is None` 分支），执行期撞闸即丢全部已完成子任务（round28 T-B 经
+        # 路径顺序复活）。诊断标记（limit_exceeded/limit）照落 token_usage 供 salvage
+        # 归因（runner H3 复核依赖）；终态由 salvage 单点裁决（有产物 PARTIAL/无产物 FAILED）。
         update_task(
             task_id,
-            status="FAILED",
             token_usage={**usage, "limit_exceeded": True, "limit": limit},
             conn_str=conn_str,
         )
