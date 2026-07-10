@@ -98,11 +98,11 @@ A requirement flows through **Brain orchestration → difficulty routing → san
 
 ```mermaid
 flowchart TB
-    U([Product-level requirement<br/>"device management feature"]) --> B1
+    U(["Product-level requirement<br/>'device management feature'"]) --> B1
 
     subgraph Brain["🧠 Brain · LangGraph state machine"]
         direction TB
-        B1[Requirement itemization<br/>quote-grounded · anti-hallucination] --> B2{Fact check:<br/>do named files/classes/tables<br/>actually exist?}
+        B1[Requirement itemization<br/>quote-grounded · anti-hallucination] --> B2{"Fact check:<br/>do named files/classes/tables<br/>actually exist?"}
         B2 -->|false premise| HC[[Forced human clarification]]
         B2 -->|pass| B3[Decompose into subtasks<br/>dependency DAG · vertical slices · global contract<br/>coverage matrix: every item owned]
     end
@@ -111,7 +111,7 @@ flowchart TB
 
     subgraph Worker["🛠️ Worker · isolated sandbox"]
         direction TB
-        W1[ReAct: write code / run builds] --> G{L1 deterministic gate<br/>compile · test · lint}
+        W1["ReAct: write code / run builds"] --> G{L1 deterministic gate<br/>compile · test · lint}
         G -->|fail → evidence-driven repair| W1
         G -->|pass| LR[LLM review]
     end
