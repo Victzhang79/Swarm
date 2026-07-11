@@ -654,6 +654,23 @@ def _task_requests_tests(task_description: str) -> bool:
     ))
 
 
+def bootstrap_subtask_harness(st, task_description: str) -> None:
+    """H1（主题H·测试门复活）：为子任务补齐 harness，就地修改 st.harness。
+
+    PLAN_USER 让 LLM【只出 harness.verify_commands】（验收断言），build/test/lint 工具链由
+    系统按语言推断。旧判据把"只有 verify_commands"的 harness 当完整→跳过推断→丢掉编译门
+    （回归：verify 门在、编译门无）。此处不看 verify：只要缺 build/test/whitelist 就推断
+    工具链，再把 LLM 的 verify_commands 叠加回去（推断 harness 默认 verify_commands 为空，
+    叠加去重不覆盖）。LLM 若给了完整 harness（batch 路径）则原样尊重。"""
+    h = getattr(st, "harness", None)
+    _llm_verify = list(getattr(h, "verify_commands", []) or []) if h is not None else []
+    if h is None or not (h.build_command or h.test_command or h.extra_whitelist):
+        st.harness = _infer_harness(st.description or task_description, st.scope)
+        if _llm_verify:
+            _base_v = list(getattr(st.harness, "verify_commands", []) or [])
+            st.harness.verify_commands = list(dict.fromkeys([*_base_v, *_llm_verify]))
+
+
 def _strip_unrequested_tests(plan: TaskPlan, task_description: str) -> TaskPlan:
     """源头剔除未被要求的测试（task 744316e7 根因·单一事实源）。
 

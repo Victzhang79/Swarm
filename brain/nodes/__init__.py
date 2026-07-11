@@ -97,6 +97,7 @@ from swarm.brain.nodes.shared import (  # noqa: E402,F401
     _brain_profile_prompt,
     _build_simple_plan,
     _classify_file_ops,
+    bootstrap_subtask_harness,
     _complexity_str,
     _format_project_structure,
     _guess_target_files,
@@ -2144,9 +2145,9 @@ async def plan(state: BrainState) -> dict:
     # harness 兜底：LLM 未给出 harness 的子任务，按语言推断一个，确保 Worker 有
     # 项目特定的构建/测试命令 + 命令白名单可用（否则又退化成"口头自报通过"）。
     for st in task_plan.subtasks:
-        h = getattr(st, "harness", None)
-        if h is None or not (h.build_command or h.test_command or h.verify_commands or h.extra_whitelist):
-            st.harness = _infer_harness(st.description or task_description, st.scope)
+        # H1（主题H·测试门复活）：LLM 只出 verify_commands 时也要补齐推断的 build/lint 门
+        # 并叠加回 verify_commands（单一事实源见 shared.bootstrap_subtask_harness）。
+        bootstrap_subtask_harness(st, task_description)
         # intent 兜底：LLM 未显式给出(默认 MODIFY) 时按描述启发式推断，
         # 让 AUDIT/DEBUG/REFACTOR 等差异化意图也能在 LLM 漏标时被识别。
         if st.intent == TaskIntent.MODIFY:

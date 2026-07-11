@@ -118,16 +118,15 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
 9. 需要看图/UI的任务标记为 modality=multimodal
 10. 若提供了「项目结构」，scope 里的文件路径必须引用真实存在的文件（修改/删除时），
     新建文件则给出合理的新路径；不要凭空臆造不存在的文件名
-11. 【harness 验证工程，必填且精心编写】每个子任务必须给出 harness，告诉 Worker
-    【如何验证产出合格】。这是质量闸门的依据，绝不能马虎：
-    - language: 按项目/任务真实语言填（python/node/java/go/rust）
-    - build_command: 该语言的编译或语法检查命令（解释型语言用语法检查，如
-      python -m py_compile）
-    - test_command: 真实可跑的测试命令（如 python -m pytest -q）；若任务要求写
-      测试，这里要能跑到新写的测试
-    - verify_commands: 针对验收标准的烟雾测试/断言命令，让"合格"可被确定性验证
-    - extra_whitelist: 上述命令所需放行的命令前缀（否则 Worker 因白名单拒绝跑不了）
-    harness 必须与 acceptance_criteria 对应：每条验收标准都应有命令能验证它。
+11. 【验收可被确定性验证】build/test/lint 工具链由系统按项目主导语言自动推断，你【不必】
+    输出 build_command/lint_command。你唯一要精心编写的是 harness.verify_commands——为每条
+    【行为类】验收标准给出能确定性验证它的烟雾断言命令，这是质量闸门依据，绝不能马虎：
+    - verify_commands: 针对验收标准的断言命令，让"合格"可被机读证据坐实（如 grep 新方法/
+      接口是否落地、编译后跑一条最小校验、curl 健康检查返回码），杜绝口头自报合格。
+      这【不是】单元测试文件、不受"不主动加测试"约束。每条行为验收标准都应有一条能验证它。
+    - test_command: 仅当任务【明确要求写/跑测试】时才给（如 python -m pytest -q，要能跑到
+      新写的测试）；否则留空，默认不强制跑单测。
+    - extra_whitelist: verify_commands 所需放行的命令前缀（否则 Worker 因白名单拒绝跑不了）。
 12. 【混编项目按技术栈拆分】若任务横跨多种语言/技术栈（如前端 Vue/React +
     后端 Java/Go + 脚本 Python/Shell），必须【按技术栈拆成独立子任务】，每个
     子任务只含【单一语言】，理由：
@@ -158,7 +157,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 - 一个模块通常拆成 1-4 个垂直功能子任务（按功能点，不按层）。
 
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
-【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile），或具体测试命令；不要给非本项目栈的命令。
+【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile）。构建/lint 工具链系统会自动推断，但【每条行为类验收标准都要能被确定性验证】：在 harness.verify_commands 里给出针对该标准的烟雾断言命令（如 grep 新接口/实体字段是否落地、编译后跑一条最小校验），这【不是】单元测试、也不受"不主动加测试"约束，是"产出是否合格"的机读证据。单元 test_command 仅任务明确要求测试时才给。
 【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖（Java 如 lombok/各 starter，Node 如运行时+类型依赖）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
 
 规则：
@@ -166,7 +165,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 - 子任务 depends_on 只引用【本批内】的其他子任务 id（跨模块依赖由系统按模块顺序处理）。
 - 子任务 id 本批内唯一即可（系统会全局重编号）。
 
-严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance_criteria":["<本模块的确定性编译/构建命令>"],"contract":{}}]}"""
+严格输出 JSON：{"subtasks": [{"id","description","difficulty":"trivial|medium|complex","modality":"text","scope":{"writable":[],"create_files":[],"readable":[]},"depends_on":[],"acceptance_criteria":["<本模块的确定性编译/构建命令>"],"harness":{"verify_commands":["<针对行为验收标准的烟雾断言命令，如 grep 新接口是否落地>"]},"contract":{}}]}"""
 
 PLAN_BATCH_USER = """## 总需求描述（背景，仅供理解）
 {task_description}
@@ -251,8 +250,13 @@ PLAN_USER = """## 任务描述
 
 注意：
 - 文件路径/扩展名必须匹配【项目实际技术栈】（Java 项目用 .java、前端用 .ts/.vue 等），切勿默认 Python/.py。
-- 【不要】输出 harness 字段：系统会按项目主导语言自动推断 build/lint/工具链。
-- 仅当任务【明确要求跑测试】时，才在 acceptance_criteria 写出具体测试命令（如 "mvn -q test -pl xxx"），否则不写——默认不强制跑测试。
+- 【构建/测试/lint 工具链】由系统按项目主导语言自动推断，不用你输出 build_command/lint_command。
+- 但【每条行为类验收标准都要能被确定性验证】：在 harness.verify_commands 里给出针对该标准的
+  烟雾断言命令（如 grep 新方法/接口是否落地、编译后跑一条最小校验、curl 健康检查返回码）。
+  这【不是】单元测试文件、也【不受"不主动加测试"约束】——它是"产出是否合格"的机读证据，
+  杜绝口头自报合格。示例：{{"verify_commands": ["grep -q 'public String trimToNull' src/.../StringUtils.java"]}}
+- 单元【测试命令】(test_command，如 "mvn -q test -pl xxx") 仅当任务【明确要求写/跑测试】时才需要；
+  否则不写（默认不强制跑单测）。verify_commands 与它无关，行为类标准应尽量给 verify_commands。
 
 难度判定规则:
 - trivial: 改CSS/修typo/加日志/加注释/简单配置变更
