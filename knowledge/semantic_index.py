@@ -739,7 +739,10 @@ def _flush_block(
             start_line=start + line_offset,
             end_line=start + line_offset + lines_in_chunk,
         ))
-        offset += chunk_size - chunk_overlap
+        # X-4（外部深审）：步进保底 ≥1——chunk_overlap ≥ chunk_size 时 (size-overlap)≤0 会让
+        # offset 不进/倒退 → while 死循环（无进展）。max(1,·) 是与配置校验无关的确定性 fail-safe，
+        # 覆盖构造器直传/默认值等绕过 API 校验的入口。坏配置下切块退化但绝不挂死。
+        offset += max(1, chunk_size - chunk_overlap)
         # P1-7：单行超长块 lines_in_chunk=0 → line_offset 不递增 → 相邻 chunk 同 (file,start_line)
         # → uuid5 point ID 相同互相覆盖静默丢块。至少递增 1 保证 start_line 唯一。
         line_offset += max(lines_in_chunk, 1)

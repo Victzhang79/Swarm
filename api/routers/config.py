@@ -766,6 +766,20 @@ async def update_kb_embed_rerank(request: Request):
         _pint("max_priority_files", "SWARM_KB_MAX_PRIORITY_FILES", 0, 50)
         _pint("chunk_size", "SWARM_KB_CHUNK_SIZE", 64, 4096)
         _pint("chunk_overlap", "SWARM_KB_CHUNK_OVERLAP", 0, 1024)
+        # X-4（外部深审）：两字段独立上下界会放行 overlap(≤1024) ≥ size(≥64) 的坏组合 →
+        # 切块 offset 步进 ≤0 → 死循环。补交叉校验（fail-loud）：用生效值（本次未改的字段取
+        # 当前配置）判 overlap < size。semantic_index 另有 max(1,·) 步进保底作 fail-safe。
+        _eff_size = rt.get("chunk_size")
+        _eff_ovl = rt.get("chunk_overlap")
+        if _eff_size is not None or _eff_ovl is not None:
+            from swarm.config.settings import KnowledgeConfig as _KC
+            _cur = _KC()
+            _size = int(_eff_size) if _eff_size is not None else _cur.chunk_size
+            _ovl = int(_eff_ovl) if _eff_ovl is not None else _cur.chunk_overlap
+            if _ovl >= _size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"chunk_overlap({_ovl}) 必须 < chunk_size({_size})（否则切块无法向前推进）")
 
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
