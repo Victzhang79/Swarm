@@ -342,6 +342,31 @@ def slot_wait_reset() -> None:
     _SLOT_WAIT_CV.set(None)
 
 
+# G2-1（主题G·归因面，#9-B）：当前 LLM 调用的 brain 节点/阶段标签——[stream] 心跳/收尾/
+# 排队日志此前只记 model_name，看门狗一行分不清是 plan_batch 还是 validate_plan 在长流/
+# runaway（用户三次点名"节点不清"）。contextvar 挂在 _invoke_llm_abortable 入口，随 astream
+# 生成器同任务上下文传播到 _astream_inner 的日志点，零参数穿透。
+_LLM_NODE_CV: "_b6_cv.ContextVar[str]" = _b6_cv.ContextVar("swarm_llm_node", default="")
+
+
+def set_llm_node(label: str) -> object:
+    """绑定当前 LLM 调用的节点/阶段标签（返回 token 供 reset_llm_node 还原）。"""
+    return _LLM_NODE_CV.set(label or "")
+
+
+def reset_llm_node(token: object) -> None:
+    try:
+        _LLM_NODE_CV.reset(token)  # type: ignore[arg-type]
+    except (ValueError, LookupError, TypeError):  # 跨任务/已重置/非 Token：忽略（观测面绝不抛）
+        pass
+
+
+def _llm_node_tag() -> str:
+    """归因前缀：'[plan_batch] ' 或 ''（未绑定）。供 [stream] 日志拼接。"""
+    n = _LLM_NODE_CV.get()
+    return f"[{n}] " if n else ""
+
+
 def slot_wait_state() -> "dict | None":
     """{'queued_at': t, 'acquired_at': t|None}；acquired_at is None=仍在排队中被杀。"""
     return _SLOT_WAIT_CV.get()
@@ -475,8 +500,8 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             _wait["acquired_at"] = _monotonic()
             _q_s = _wait["acquired_at"] - _wait["queued_at"]
             if _q_s >= 30.0:
-                logger.info("[router] B6 provider '%s' 槽位排队 %.0fs 后获得（并发闸生效中）",
-                            self.swarm_provider_id, _q_s)
+                logger.info("[router] B6 %sprovider '%s' 槽位排队 %.0fs 后获得（并发闸生效中）",
+                            _llm_node_tag(), self.swarm_provider_id, _q_s)
             async for chunk in self._astream_inner(*args, **kwargs):
                 yield chunk
         finally:
@@ -511,8 +536,9 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                     except Exception:  # noqa: BLE001
                         pass
                     logger.info(
-                        "[stream] %s 流式完成 %.0fs（共 %d chunk，finish_reason=%s）",
-                        getattr(self, "model_name", None) or "model", elapsed, n_chunks, fr,
+                        "[stream] %s%s 流式完成 %.0fs（共 %d chunk，finish_reason=%s）",
+                        _llm_node_tag(), getattr(self, "model_name", None) or "model",
+                        elapsed, n_chunks, fr,
                     )
                 return
             except asyncio.TimeoutError as exc:
@@ -564,8 +590,9 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             if now - t0 >= self.swarm_heartbeat_after and now - last_beat >= self.swarm_heartbeat_every:
                 last_beat = now
                 logger.info(
-                    "[stream] %s 流式生成中 %.0fs（已收 %d chunk，未 stall）",
-                    getattr(self, "model_name", None) or "model", now - t0, n_chunks,
+                    "[stream] %s%s 流式生成中 %.0fs（已收 %d chunk，未 stall）",
+                    _llm_node_tag(), getattr(self, "model_name", None) or "model",
+                    now - t0, n_chunks,
                 )
             last_chunk = chunk
             yield chunk

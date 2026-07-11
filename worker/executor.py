@@ -1156,6 +1156,17 @@ class WorkerExecutor(
         l1_details: dict,
     ) -> WorkerOutput:
         """快速构造 WorkerOutput"""
+        # G2-2（主题G·工具观测面）：把累计的工具调用遥测挂进 l1_details（机读通道，进
+        # subtask_results；experience__ 工具含在内=技能→子任务成败可事后 join）。无调用则不塞。
+        _tel = getattr(self, "_tool_telemetry", None)
+        if _tel and _tel.get("calls") and isinstance(l1_details, dict) \
+                and "tool_telemetry" not in l1_details:
+            # hunter F3：快照拷贝而非挂 live 引用——防未来非终态多次 _make_output 时已返回的
+            # WorkerOutput.l1_details 被后续 agent 步静默改写（当前调用图不触发，廉价保险）。
+            l1_details = {**l1_details, "tool_telemetry": {
+                "calls": dict(_tel.get("calls") or {}),
+                "errors": dict(_tel.get("errors") or {}),
+            }}
         return WorkerOutput(
             subtask_id=self.subtask.id,
             diff=diff,

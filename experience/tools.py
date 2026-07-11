@@ -54,8 +54,10 @@ def build_experience_tools(
         def _make(_body: str, _sid: str):
             def _fn() -> str:
                 # G4（阶段E）：结构化遥测【发射端】——零留痕时"加分/减分"在数据上
-                # 不可证伪。join 侧（按 (skill_id,subtask_id) 关联子任务通过率）尚未
-                # 实现：E2E 判读期先 grep "skills-telemetry" 人工汇总（E.9 复核 HF7 存照）。
+                # 不可证伪。join 侧已由 G2-2（worker executor 工具遥测）落地：experience__<id>
+                # 作为 worker 工具，其调用被 _record_tool_telemetry 计入 l1_details.tool_telemetry
+                # → 随 subtask_results 落库，可事后按 (skill_id,subtask_id) 关联子任务成败。
+                # 本行保留为【即时逐次】留痕（沙箱侧无 LangGraph 工具可见性时的兜底）。
                 logger.info("[skills-telemetry] experience_tool_called skill_id=%s "
                             "subtask_id=%s", _sid_skill, _sid or "-")
                 return _body

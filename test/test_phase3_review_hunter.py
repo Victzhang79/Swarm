@@ -267,7 +267,7 @@ async def test_f6_no_sig_on_hard_gate_reject(monkeypatch):
         async def ainvoke(self, msgs):
             return _R('{"valid": false, "issues": ["质量差"]}')
 
-    async def _fake_abortable(llm, msgs, timeout, ledger):
+    async def _fake_abortable(llm, msgs, timeout, ledger, node_label=""):
         return await llm.ainvoke(msgs)
 
     monkeypatch.setattr(nodes, "_get_brain_llm", lambda: _RejectLLM())

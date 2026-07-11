@@ -454,7 +454,8 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
-async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_llm=None):
+async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_llm=None,
+                                node_label: str = ""):
     """R34-1：流式优先 LLM 调用——僵尸生成缓解（token 黑洞治本客户端侧杠杆）。
 
     非流式 ainvoke 被 wait_for 取消后，网关/后端可能继续整段生成（僵尸占 GPU →
@@ -506,8 +507,20 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
             _slot_reset()
         except Exception:  # noqa: BLE001 — 观测面绝不拖垮调用
             pass
-        agen = astream(messages)
+        # G2-1（主题G·归因面）：绑定节点标签，供 router [stream] 心跳/收尾/排队日志归因；
+        # 在 finally 精确还原（只覆盖本次流式区间，绝不泄漏到同任务后续 worker 流）。hunter
+        # F1：set_llm_node 与 astream() 都必须在 finally 守护的 try 内——否则 astream() 若同步
+        # 抛（未来别样 provider/Mock 双），标签泄漏且 ContextVar.reset 会把后续还原回该脏值
+        # （sticky，不自愈）。agen 置 None 供 finally 安全 aclose。
+        _ntok = None
+        agen = None
         try:
+            try:
+                from swarm.models.router import set_llm_node as _set_node
+                _ntok = _set_node(node_label)
+            except Exception:  # noqa: BLE001
+                _ntok = None
+            agen = astream(messages)
             while True:
                 _now = loop.time()
                 _limit = _deadline_hard if _n_chunks > 0 else _deadline_soft
@@ -553,6 +566,12 @@ async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_ll
                     # 复核 INFO：aclose 本身有界（饱和态传输 wedge 时不无限干等，5s 足够本地关流）
                     await _aio.wait_for(_aclose(), timeout=5.0)
                 except Exception:  # noqa: BLE001 — 关闭失败/超时不掩盖主结果/主异常
+                    pass
+            if _ntok is not None:
+                try:
+                    from swarm.models.router import reset_llm_node as _reset_node
+                    _reset_node(_ntok)
+                except Exception:  # noqa: BLE001
                     pass
         return type("R", (), {"content": "".join(parts)})()
 
@@ -1105,6 +1124,7 @@ async def _plan_ultra_batched(
                         ],
                         _PLAN_BATCH_TIMEOUT,
                         _batch_fallback_llm,
+                        node_label="plan_batch",
                     )
                     _dt = _time.monotonic() - _t0
                     result = _parse_json_from_llm(response.content)
@@ -2016,6 +2036,7 @@ async def plan(state: BrainState) -> dict:
                 ],
                 _single_timeout,
                 _get_brain_fallback_llm(),
+                node_label="plan_single",
             )
             result = _parse_json_from_llm(response.content)
             # 健壮性(task 88d69519)：LLM 可能输出 "harness": null / "model_preference" 等可选字段为
@@ -2690,7 +2711,7 @@ async def validate_plan(state: BrainState) -> dict:
                 response = await _invoke_llm_abortable(llm, [
                     {"role": "system", "content": VALIDATE_PLAN_SYSTEM},
                     {"role": "user", "content": prompt_user},
-                ], _soft_to, None)
+                ], _soft_to, None, node_label="validate_plan")
                 result = _parse_json_from_llm(response.content)
         llm_says_valid = bool(result.get("valid", False))
         llm_issues = list(result.get("issues", []) or [])

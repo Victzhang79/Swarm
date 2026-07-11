@@ -184,7 +184,8 @@ async def _run_one_reviewer(llm, messages, tag: str) -> dict[str, tuple[str, str
     """跑一个 reviewer，返回其 verdict 表；基建异常（超时/挂）→ None（不可用，不误判）。"""
     from swarm.brain import nodes
     try:
-        resp = await nodes._invoke_llm_abortable(llm, messages, _review_timeout())
+        resp = await nodes._invoke_llm_abortable(
+            llm, messages, _review_timeout(), node_label=f"review:{tag}")
     except Exception as exc:  # noqa: BLE001 — 任何基建异常都归"该 reviewer 不可用"
         logger.warning("[ADVERSARIAL] reviewer %s 调用失败(%s)——本 reviewer 不可用", tag, exc)
         return None

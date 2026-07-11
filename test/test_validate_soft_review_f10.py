@@ -37,7 +37,7 @@ def _abortable_recorder(monkeypatch):
     import swarm.brain.nodes as nodes
     calls = []
 
-    async def _fake_abortable(llm, messages, timeout, fallback=None):
+    async def _fake_abortable(llm, messages, timeout, fallback=None, node_label=""):
         calls.append({"timeout": timeout})
         return _Resp('{"valid": true, "issues": []}')
 

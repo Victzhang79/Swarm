@@ -176,7 +176,41 @@ class _AgentLoopMixin:
 
         # 提取最后一条 AI 消息
         messages = result.get("messages", [])
+        self._record_tool_telemetry(messages, step)
         if messages:
             last = messages[-1]
             return getattr(last, "content", str(last))
         return "(Agent 无输出)"
+
+    def _record_tool_telemetry(self, messages, step: str) -> None:
+        """G2-2（主题G·工具观测面，#9-C）：从 agent 返回 messages 确定性统计工具调用。
+
+        沙箱 jsonl 只见 exec/shell，write_file/experience__<id> 等 LangGraph 工具零留痕
+        → 分不清某工具「没挂载」还是「挂了模型没用」。此处按 AIMessage.tool_calls 归因
+        调用数、ToolMessage.status=='error' 归因错误数，累计进 self._tool_telemetry（_make_output
+        注入 l1_details 供机读）+发一行结构化 [tool-telemetry]（含 experience__ 前缀=技能遥测
+        join 的落库端，取代 tools.py 只发不 join 的 skills-telemetry grep）。观测面 fail-open。
+        """
+        try:
+            tel = getattr(self, "_tool_telemetry", None)
+            if tel is None:
+                tel = {"calls": {}, "errors": {}}
+                self._tool_telemetry = tel
+            calls_this: dict[str, int] = {}
+            for m in messages or []:
+                tcs = getattr(m, "tool_calls", None)
+                if tcs:
+                    for tc in tcs:
+                        name = (tc.get("name") if isinstance(tc, dict)
+                                else getattr(tc, "name", None)) or "?"
+                        tel["calls"][name] = tel["calls"].get(name, 0) + 1
+                        calls_this[name] = calls_this.get(name, 0) + 1
+                # ToolMessage（type=='tool'）执行失败：langchain 置 status=='error'
+                if getattr(m, "type", None) == "tool" and getattr(m, "status", None) == "error":
+                    nm = getattr(m, "name", None) or "?"
+                    tel["errors"][nm] = tel["errors"].get(nm, 0) + 1
+            if calls_this:
+                logger.info("[tool-telemetry] subtask=%s step=%s tools=%s",
+                            self.subtask.id, step, dict(sorted(calls_this.items())))
+        except Exception:  # noqa: BLE001 — 观测面绝不拖垮执行
+            pass
