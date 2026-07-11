@@ -77,6 +77,26 @@ def _swarm_logger_propagates():
         lg.propagate = prev
 
 
+@pytest.fixture(autouse=True)
+def _isolate_swarm_env():
+    """H2（主题H·测试隔离）：每测试快照+还原 SWARM_* 环境变量。
+
+    根治顺序依赖 flake：21 个测试文件直接 `os.environ["SWARM_X"] = ...`（非 monkeypatch）
+    不还原→污染后续用例（单跑绿、组合红，如 test_15_graph_interrupt 曾被遗留 SWARM_AUTO_ACCEPT
+    误导走 auto 早退）。monkeypatch.setenv 本已自还原，此 fixture 是所有【裸赋值/del】的兜底。
+    只管 SWARM_ 前缀=污染域，不碰 PATH/PYTEST 等基建 env。"""
+    _snap = {k: v for k, v in os.environ.items() if k.startswith("SWARM_")}
+    try:
+        yield
+    finally:
+        for k in [k for k in os.environ if k.startswith("SWARM_")]:
+            if k not in _snap:
+                del os.environ[k]
+        for k, v in _snap.items():
+            if os.environ.get(k) != v:
+                os.environ[k] = v
+
+
 def _purge_test_users() -> None:
     try:
         import psycopg
