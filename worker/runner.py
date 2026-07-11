@@ -122,11 +122,55 @@ async def run_standalone_worker(
         project_path=project_path,
     )
 
+    # H-4（外部深审 HIGH）：Standalone Worker 本地模式 agent 直改 project_path、沙箱模式 pull-back
+    # 也写回本地树——此前【绝不持模块锁】→ 可与 Brain runner(持模块锁写树)/审批 apply(持 default)/
+    # 另一 standalone run 并发写【同一 git 树】=树污染。治：与 Brain 同源，按 writable 派生项目锁
+    # （whole-project→default 写者；否则按顶层目录→模块读者），经 H-3 读写门与全体写树者互斥。
+    # 拿不到=同项目有任务在写工作树 → fail-loud 让位（非阻塞，绝不静默并发写）。
+    from swarm.infra.redis_client import (
+        ModuleLock,
+        MultiModuleLock,
+        RenewPacer,
+        module_keys_from_plan,
+    )
+    _lock_plan = {"subtasks": [{"scope": {"writable": writable or [], "create_files": []}}]}
+    _lock_keys = module_keys_from_plan(_lock_plan)
+    module_lock = (
+        ModuleLock(project_id, "default") if _lock_keys == ["default"]
+        else MultiModuleLock(project_id, _lock_keys)
+    )
+    # hunter F2：同步 acquire（与 Brain runner:1359 一致，acquire 非阻塞契约）——绝不用
+    # asyncio.to_thread 包：那会在【acquire 已成功但 CancelledError 送达】的窗口里孤儿泄漏锁
+    # （内存兜底路径的 threading 锁永不过期=永久泄漏到重启）。
+    if not module_lock.acquire():
+        await _emit(queue, {
+            "step": "error",
+            "status": "error",
+            "message": "同项目有任务正在写工作树（模块锁被占用），请稍后重试",
+            "mode": "worker",
+        })
+        _worker_running.discard(run_id)
+        return
+
     log_task: asyncio.Task | None = None
+    _renew_pacer = RenewPacer()
+    _lock_lost = asyncio.Event()
 
     async def _stream_logs() -> None:
         last = 0
         while run_id in _worker_running:
+            # H-4：搭车续项目锁 TTL（standalone 可持续数分钟，防长跑 > TTL 静默失锁→他人冒进写树）。
+            # hunter F1：renew 返回 False = 确认丢锁（被抢/过期）→ 绝不静默续跑（那正是 H-4 要防的
+            # 并发写树）；与 Brain runner:596-613 同源 fail-fast：置事件让主流程中止 executor 写树。
+            if _renew_pacer.due(module_lock):
+                if not await asyncio.to_thread(module_lock.renew):
+                    await _emit(queue, {
+                        "step": "log", "status": "running",
+                        "message": "[WARN] 运行期丢失项目锁 → 中止写树（防并发污染）",
+                        "phase": executor.phase.value,
+                    })
+                    _lock_lost.set()
+                    return
             logs = executor.execution_log
             if len(logs) > last:
                 for line in logs[last:]:
@@ -148,7 +192,21 @@ async def run_standalone_worker(
             "project_id": project_id,
         })
         log_task = asyncio.create_task(_stream_logs())
-        output: WorkerOutput = await executor.run()
+        # hunter F1：executor.run() 与【丢锁事件】赛跑——丢锁先到则取消 run（中止写树）并 fail-loud。
+        run_task = asyncio.ensure_future(executor.run())
+        lost_waiter = asyncio.ensure_future(_lock_lost.wait())
+        try:
+            await asyncio.wait({run_task, lost_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            lost_waiter.cancel()
+        if _lock_lost.is_set():
+            run_task.cancel()
+            try:
+                await run_task
+            except BaseException:  # noqa: BLE001 — 取消/异常均吞掉，已判丢锁 fail-loud
+                pass
+            raise RuntimeError("standalone worker 运行期丢失项目锁（中止执行，防并发写树）")
+        output: WorkerOutput = run_task.result()
         await _emit(queue, {
             "step": "result",
             "status": "done",
@@ -178,6 +236,12 @@ async def run_standalone_worker(
                 await log_task
             except asyncio.CancelledError:
                 pass
+        # H-4：始终释放项目锁（含读写门）——异常/正常/取消路径统一由此 finally 兜底。同步 release
+        # （非阻塞契约）避免 to_thread 在取消期把 release 的 await 打断成孤儿锁。
+        try:
+            module_lock.release()
+        except Exception:  # noqa: BLE001 — 释放失败留痕不掩盖主流程（Redis 路径靠 TTL 兜底）
+            logger.warning("[WORKER] standalone %s 释放项目锁失败", run_id, exc_info=True)
 
 
 def start_standalone_worker_background(
