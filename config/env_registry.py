@@ -143,6 +143,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_PROVIDER_SLOT_WAIT_S": "models/router.py:356",
     "SWARM_QUOTE_COVER_MIN": "brain/requirements_extract.py:207",
     "SWARM_RESUME_SLOT_WAIT_S": "brain/scheduler.py:_slot_wait_cap_s",
+    "SWARM_SCHEDULER_STOP_DRAIN_S": "brain/scheduler.py:_stop_drain_wait_s",
     "SWARM_QUOTE_MIN_TILE_CHARS": "brain/requirements_extract.py:206",
     "SWARM_RATELIMIT_DISABLED": "api/rate_limit.py:100",
     "SWARM_RATELIMIT_MAX_BUCKETS": "api/rate_limit.py:45",

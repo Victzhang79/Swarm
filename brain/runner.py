@@ -194,6 +194,24 @@ async def _maybe_salvage_watchdog_abort(task_id: str, queue) -> bool:
 # task_id → asyncio.Task 句柄（用于 cancel）
 _task_handles: dict[str, asyncio.Task] = {}
 
+# M-2（外部深审）：调度器【停机/失主】主动中止的 task_id 集。区别于人工 cancel_task：停机中止
+# 绝不能写终态 CANCELLED（CANCELLED ∈ TERMINAL_STATES → 永久出对账视野 = 假终态、丢在飞工作），
+# 须保留当前活跃态并 re-raise，交对账（本副本重竞选/他副本 reconcile）恢复重派。执行 CancelledError
+# 处理器据此在【停机中止】与【人工取消】间分流（对抗复核 M-2 Finding A）。
+_shutdown_aborting: set[str] = set()
+
+
+def mark_shutdown_abort(task_id: str) -> None:
+    _shutdown_aborting.add(task_id)
+
+
+def clear_shutdown_abort(task_id: str) -> None:
+    _shutdown_aborting.discard(task_id)
+
+
+def is_shutdown_abort(task_id: str) -> bool:
+    return task_id in _shutdown_aborting
+
 # DB 中视为“进行中”的状态（API 重启后可能 orphaned）。
 # 单一事实源见 swarm/task_states.py：并集含 CLARIFYING/DESIGN_REVIEW（修 P0-D cancel 死区）。
 from swarm.task_states import (  # noqa: E402
@@ -1501,6 +1519,11 @@ async def run_task(
             status=_final_rec.get("status") if _final_rec else "UNKNOWN",
         )
     except asyncio.CancelledError:
+        # M-2（对抗复核 Finding A）：调度器停机/失主主动中止——绝不写终态 CANCELLED（假终态会
+        # 让任务永久出对账视野=丢在飞工作），保留当前活跃态并 re-raise，交对账恢复重派。
+        if is_shutdown_abort(task_id):
+            logger.info("[RUNNER] 任务 %s 因调度器停机/失主中止——保留活跃态待对账恢复（不写终态）", task_id)
+            raise
         # E4：watchdog 护栏中止也表现为 CancelledError——先查登记，护栏中止走
         # salvage→PARTIAL（与 E5/TokenLimit 同终点）；真人工取消照旧 CANCELLED。
         if await _maybe_salvage_watchdog_abort(task_id, queue):
@@ -1676,6 +1699,10 @@ async def resume_task(
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
+        # M-2（对抗复核 Finding A）：调度器停机/失主中止 → 保留活跃态、绝不写终态、re-raise 交对账。
+        if is_shutdown_abort(task_id):
+            logger.info("[RUNNER] 任务 %s resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
+            raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
         if await _maybe_salvage_watchdog_abort(task_id, queue):
             return
@@ -1804,6 +1831,10 @@ async def resume_planning(
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
+        # M-2（对抗复核 Finding A）：调度器停机/失主中止 → 保留活跃态、绝不写终态、re-raise 交对账。
+        if is_shutdown_abort(task_id):
+            logger.info("[RUNNER] 任务 %s 规划 resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
+            raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
         if await _maybe_salvage_watchdog_abort(task_id, queue):
             return

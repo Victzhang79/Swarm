@@ -56,6 +56,9 @@ _deferred_cycle: set[str] = set()
 _consumer_started = False
 _inflight: set[str] = set()
 _wakeup: asyncio.Event | None = None
+# M-2（对抗复核 Finding B）：停机/失主进行中标志。await_execution_slot 据此立即停等放行 resume
+# 的准入轮询（不再在 _inflight 被清后误抢空槽起新执行）；start 时复位。
+_stopping = False
 # N-09：持引用保存消费循环 task，供 stop_task_scheduler 取消（否则 fire-and-forget
 # 可被 GC、且无法停止）。
 _consumer_task: asyncio.Task | None = None
@@ -263,10 +266,11 @@ def _project_exec_admission(project_id: str) -> str:
 
 async def start_task_scheduler() -> None:
     """启动后台消费循环（API startup 调用，幂等）。"""
-    global _consumer_started, _wakeup, _last_drain_ts
+    global _consumer_started, _wakeup, _last_drain_ts, _stopping
     if _consumer_started:
         return
     _consumer_started = True
+    _stopping = False  # M-2：重启复位停机标志
     _wakeup = asyncio.Event()
     # F5：首个排水延后一个间隔，避开与启动期 reconcile_orphan_tasks 撞车重复入队（都无害去重，但省churn）。
     import time as _time
@@ -408,15 +412,78 @@ async def start_task_scheduler() -> None:
     logger.info("[Scheduler] 任务准入调度器已启动 (max_concurrent=%d)", _max_concurrent())
 
 
+def _stop_drain_wait_s() -> float:
+    """M-2：停机时等在飞任务取消收尾的上界（秒）。SWARM_SCHEDULER_STOP_DRAIN_S 覆盖（≥0 生效），
+    默认 10s；0=不等（只 cancel 不 await）。防某任务吞 CancelledError 时把停机/失主无限拖住。"""
+    import os as _os
+    raw = _os.environ.get("SWARM_SCHEDULER_STOP_DRAIN_S")
+    if raw:
+        try:
+            v = float(raw)
+            if v >= 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return 10.0
+
+
+async def _cancel_inflight_dispatched() -> None:
+    """M-2（外部深审）：取消本副本【已派发的在飞任务】(_run_with_slot handle，_inflight 计数)。
+
+    只停消费循环不够——失主(D38 failover)时若在飞任务继续跑，新 leader 副本 reconcile 会重新
+    派发同任务 → 双跑（正是 leadership "防双跑" 要杜绝的）。故失主/停机必须一并中断在飞执行；
+    DB 非终态由对账在（本副本重竞选或他副本）恢复，绝不留假终态。有界等待收尾防吞取消者拖死停机。
+
+    对抗复核 Finding A：cancel 前先 mark_shutdown_abort——runner 的 CancelledError 处理器据此
+    区分【停机中止】(保活跃态待对账)与【人工 cancel】(写 CANCELLED 终态)，绝不把在飞工作写成假终态。
+    对抗复核 Finding B：只 discard【已收尾】的 tid，仍在跑的 straggler 保留在 _inflight（其 finally
+    自会 discard），保持额度账真实——绝不无条件 clear() 让并发位在 straggler 未尽时被误判空闲。"""
+    from swarm.brain.runner import (
+        _task_handles,
+        clear_shutdown_abort,
+        mark_shutdown_abort,
+    )
+    tids = list(_inflight)
+    handles = []
+    for tid in tids:
+        h = _task_handles.get(tid)
+        if h is not None and not h.done():
+            mark_shutdown_abort(tid)  # Finding A：告知 runner 这是停机中止，勿写 CANCELLED 假终态
+            h.cancel()
+            handles.append((tid, h))
+    try:
+        if handles:
+            _cap = _stop_drain_wait_s()
+            if _cap > 0:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*(h for _, h in handles), return_exceptions=True),
+                        timeout=_cap)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Scheduler] M-2：等在飞任务取消收尾超 %.0fs 仍未尽，继续停机（句柄均已 cancel）", _cap)
+            logger.info("[Scheduler] M-2：失主/停机已中断 %d 个在飞任务（防跨副本双跑）", len(handles))
+    finally:
+        # Finding B：只清【确已收尾】的额度；straggler 留账由其 finally 归还，防误判并发位空闲。
+        for tid in tids:
+            h = _task_handles.get(tid)
+            if h is None or h.done():
+                _inflight.discard(tid)
+            clear_shutdown_abort(tid)
+
+
 async def stop_task_scheduler() -> None:
-    """停止后台消费循环（应用关闭调用，幂等）。N-09：取消并清理状态以便重启。"""
-    global _consumer_started, _consumer_task, _wakeup
+    """停止后台消费循环（应用关闭/失主调用，幂等）。N-09：取消并清理状态以便重启。
+    M-2：一并中断在飞派发任务（失主时防新 leader 重派同任务双跑）。"""
+    global _consumer_started, _consumer_task, _wakeup, _stopping
+    _stopping = True  # M-2 Finding B：即刻挡住 resume 准入轮询抢空槽起新执行
     if _consumer_task is not None and not _consumer_task.done():
         _consumer_task.cancel()
         try:
             await _consumer_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+    await _cancel_inflight_dispatched()
     _consumer_task = None
     _consumer_started = False
     _wakeup = None
@@ -433,6 +500,11 @@ async def await_execution_slot(task_id: str) -> bool:
     保险：等待超上界仍放行（防某槽泄漏使人工触发的 resume 永久挂死），留 WARNING 可观测。"""
     if not is_consumer_running():
         return False
+    # M-2 Finding B：停机/失主进行中 → 不再进入准入轮询（否则 _inflight 被清后误抢空槽起新执行，
+    # 与 straggler/新 leader reconcile 抢跑）。返回 False=不门控（与"消费循环未运行"同路径，调用方
+    # 的 _task_running 早退/H-3 模块锁兜住跨副本写树串行化）。
+    if _stopping:
+        return False
     # hunter F1：_inflight 是 set 非 refcount——同 task_id 的重复并发 resume 若都"占位"，后完成
     # 者 release 会误删仍在跑者的槽位（欠计）。故只在【本次调用真正新增】时返回 True（调用方据此
     # 决定是否 release）。等待前/等待后各查一次：本 task 已在账（被 claim_human_gate 上游挡掉的
@@ -443,6 +515,8 @@ async def await_execution_slot(task_id: str) -> bool:
     _t0 = _t.monotonic()
     _cap = _slot_wait_cap_s()
     while len(_inflight) >= _max_concurrent():
+        if _stopping:  # M-2 Finding B：等待期间进入停机 → 立即停等不占位（交对账/重启恢复）
+            return False
         if _cap > 0 and (_t.monotonic() - _t0) >= _cap:
             logger.warning(
                 "[Scheduler] resume 等并发额度超 %.0fs 仍未空（疑槽泄漏）→ fail-open 放行 task=%s",
