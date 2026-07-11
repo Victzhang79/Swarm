@@ -57,6 +57,7 @@ def test_h1_renew_invalidates_on_error_without_breaking_tolerance(monkeypatch):
     lock = rc.ModuleLock(pid, "mod")
     lock._held = True
     lock._local_held = False
+    lock._redis_held = True  # H-2 后：只有 _redis_held 的锁 renew 才走 Redis Lua（否则 no-op）
     lock._last_ok_monotonic = 0.0  # 无墙钟基准 → _elapsed=0，不触发墙钟闸
     monkeypatch.setattr(rc, "get_redis", lambda: _BrokenClient())
     ok = lock.renew()

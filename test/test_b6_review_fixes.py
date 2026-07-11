@@ -130,6 +130,7 @@ def test_renew_wallclock_gate_aborts_when_ttl_elapsed(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: _Boom())
     lock = rc.ModuleLock("p", "m", ttl_sec=10)
     lock._held = True
+    lock._redis_held = True  # H-2 后：只有 Redis-held 锁 renew 才走 Lua（纯本地锁 no-op）
     lock._last_ok_monotonic = time.monotonic() - 9  # 距上次续期 9s > 10*0.8=8
     assert lock.renew() is False, "距上次续期超 TTL*0.8 必须判失锁（Item 1）"
 
@@ -147,6 +148,7 @@ def test_renew_wallclock_gate_tolerates_within_window(monkeypatch):
     monkeypatch.setenv("SWARM_LOCK_RENEW_TRANSIENT_MAX", "3")
     lock = rc.ModuleLock("p", "m", ttl_sec=100)
     lock._held = True
+    lock._redis_held = True  # H-2 后：只有 Redis-held 锁 renew 才走 Lua（纯本地锁 no-op）
     lock._last_ok_monotonic = time.monotonic() - 1  # 才 1s，远在窗口内
     assert lock.renew() is True
 

@@ -57,24 +57,22 @@ class _FakeRedis:
         return 1
 
 
-def test_redis_acquired_release_when_redis_down_doesnt_touch_local(monkeypatch):
-    # R1 复核(核心 bug)：A 经 Redis 获取；Redis 宕机后 B 拿到同 key 进程内锁；A.release() 此刻
-    # Redis 不可用，绝不能去释放 B 持有的进程内锁（threading.Lock 不校验属主→会误放→双写）。
+def test_redis_acquired_also_holds_local_authoritative(monkeypatch):
+    # H-2 治本（原 R1 复核场景已被结构性消除）：A 经 Redis 获取时【同时持进程级本地锁】作为
+    # 权威互斥。故 Redis 宕机后 B 请求同 key 会被 A 的本地锁直接挡下（return False）——旧设计
+    # 里"B 拿到进程内锁 + A 持 Redis"的双域窗口不复存在（更强的正确性）。
     pid = f"_b1_{uuid.uuid4().hex[:8]}"
     monkeypatch.setattr(rc, "get_redis", lambda: _FakeRedis())
     a = rc.ModuleLock(pid, "mod")
-    assert a.acquire() is True  # 经 Redis，_local_held=False
+    assert a.acquire() is True and a._local_held is True and a._redis_held is True
 
     monkeypatch.setattr(rc, "get_redis", lambda: None)  # Redis 宕机
     b = rc.ModuleLock(pid, "mod")
-    assert b.acquire() is True  # B 拿进程内锁
+    assert b.acquire() is False, "A 持进程级权威锁 → Redis 宕机也挡住 B（无双域）"
 
-    a.release()  # A 是 Redis 锁；此刻 Redis 挂 → 不得碰 B 的进程内锁
-
+    a.release()  # 释放两层：Redis 挂→key 靠 TTL 回收；进程级本地锁正常释放
     c = rc.ModuleLock(pid, "mod")
-    assert c.acquire() is False, "A(Redis锁)的 release 误放了 B 持有的进程内锁 → 双写"
-    b.release()
-    assert c.acquire() is True
+    assert c.acquire() is True, "A 释放后同 key 可再获取（未死锁）"
     c.release()
 
 

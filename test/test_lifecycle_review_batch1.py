@@ -181,6 +181,7 @@ def test_renew_tolerates_transient_then_aborts(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: _BoomRedis())
     lock = rc.ModuleLock("p", "m")
     lock._held = True
+    lock._redis_held = True  # H-2 后：只有 Redis-held 锁 renew 才走 Lua/瞬时容忍逻辑
     # 前 2 次瞬时失败 → 容忍（True）；第 3 次达阈值 → 判失锁（False）
     assert lock.renew() is True
     assert lock.renew() is True
@@ -198,6 +199,7 @@ def test_renew_confirmed_loss_aborts_immediately(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: _StolenRedis())
     lock = rc.ModuleLock("p", "m")
     lock._held = True
+    lock._redis_held = True  # H-2 后：只有 Redis-held 锁 renew 才走 Lua（确认失锁判定）
     assert lock.renew() is False  # 立即，不容忍
 
 

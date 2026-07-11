@@ -162,6 +162,9 @@ class ModuleLock:
         # acquire 后 release 前宕机时，会去 release 一把本实例从未持有的进程内锁(threading.Lock 不
         # 校验属主 → 可能误放【别的任务】持有的同 key 锁 → 双写)。
         self._local_held = False
+        # H-2 治本：是否【经 Redis】持有（叠加在本地锁之上的跨进程互斥层）。release 据此决定
+        # 是否删 Redis key；renew 据此决定是否续 Redis TTL（纯本地锁不过期，renew 直接 no-op）。
+        self._redis_held = False
         # 对抗复核 4a：renew 连续【瞬时错误】计数。瞬时（Redis 抖动/超时）容忍到阈值才判失锁，
         # 避免一次网络 blip 就杀掉多小时长任务；确认被抢（Lua 返回 0）则立即判失锁不容忍。
         self._renew_transient_fails = 0
@@ -171,33 +174,53 @@ class ModuleLock:
         self._last_ok_monotonic = 0.0
 
     def acquire(self) -> bool:
+        # H-2 治本（外部深审 HIGH，对抗复核 F3 收口）：进程内 threading 锁作为【进程级权威
+        # 互斥】始终【先】获取——它是唯一能同步 Redis 路径与 fallback 路径的同进程同 key 仲裁者。
+        # 旧实现两条路径各持不同域（Redis 宕机期持本地、恢复期持 Redis），check-then-act 无论
+        # 正探还是反探都留 TOCTOU 双域窗口。现统一：先拿本地锁（原子，拿不到=本进程已有持有者
+        # 直接让位）；Redis 可用再叠加 SET NX 作【跨进程】互斥层，SET 失败（他进程经 Redis 持有）
+        # 则回退本地锁并让位。release/renew 按 _local_held/_redis_held 对称处理。
+        # hunter F1：幂等再获取——本实例已持有则直接返回 True，绝不二次 acquire threading.Lock
+        # （非重入锁会失败→把 _held 置 False 却留 _local_held=True→release 早退→本地锁永久孤儿
+        # 死锁）。与 release() 的 `if not self._held: return` 幂等语义对称。
+        if self._held:
+            return True
+        if not _local_lock_for(self.key).acquire(blocking=False):
+            # 同进程已有同 key 持有者（无论其经 Redis 还是纯本地）——非阻塞让位，调用方优雅延后。
+            self._held = False
+            return False
+        self._local_held = True  # 已持进程级锁 → release 必释放它
         r = get_redis()
         if r is None:
-            # B1：Redis 不可用 → 退【进程内锁】(非原 fail-open no-op：那让并发任务都"持锁"→
-            # 进程内双写)。同 key 已被本进程另一任务持有 → 非阻塞 acquire 返回 False，调用方优雅
-            # 延后("模块锁被占用请稍后重试")。首次降级打一次 WARNING(多副本下无跨进程互斥,须可观测)。
+            # B1：Redis 不可用 → 仅进程内互斥（多副本无跨进程互斥=split-brain 风险，首次 WARN）。
             _warn_lock_fail_open_once()
-            got = _local_lock_for(self.key).acquire(blocking=False)
-            self._held = got
-            self._local_held = got  # 经进程内锁获取 → release 也走进程内锁
-            return got
+            self._held = True
+            self._redis_held = False
+            return True
         try:
             ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         except Exception as exc:  # noqa: BLE001
-            # H-1（外部深审）：SET 抛异常（缓存 client 已坏）绝不外泄——runner acquire 在
-            # try 外，泄漏会残留 _task_running 使 task_id 永久死锁。作废坏 client + 转本地
-            # 锁 fallback（与 r is None 同路径），契约=acquire 永不抛，只返回 bool。
+            # H-1：SET 抛异常（缓存 client 已坏）绝不外泄——作废坏 client，本次退化为纯进程内锁
+            # （本地锁已持），契约=acquire 永不抛只返 bool。
             _invalidate_redis(exc)
             _warn_lock_fail_open_once()
-            got = _local_lock_for(self.key).acquire(blocking=False)
-            self._held = got
-            self._local_held = got
-            return got
-        self._held = bool(ok)
-        self._local_held = False  # 经 Redis 获取 → release 走 Redis(即便届时 Redis 挂也不碰本地锁)
-        if self._held:
+            self._held = True
+            self._redis_held = False
+            return True
+        if ok:
+            self._held = True
+            self._redis_held = True  # 叠加跨进程互斥层
             self._last_ok_monotonic = time.monotonic()  # Item 1：墙钟基准
-        return self._held
+            return True
+        # 他进程经 Redis 持有该 key → 释放已拿的本地锁并让位（不留孤儿本地锁）。
+        try:
+            _local_lock_for(self.key).release()
+        except RuntimeError:
+            pass
+        self._local_held = False
+        self._held = False
+        self._redis_held = False
+        return False
 
     def renew(self) -> bool:
         """续期持有中的锁 TTL（原子比对+EXPIRE，仅当 value==自己的 token）。
@@ -210,6 +233,11 @@ class ModuleLock:
         """
         if not self._held:
             return False
+        # H-2：纯进程内锁（Redis 宕机期获取或未叠加 Redis 层）不过期，renew 直接 no-op。否则
+        # renew 会对一把【从未 SET 进 Redis】的 key 跑 Lua GET → 恒返回 0 → 误判失锁（Redis
+        # 恢复后尤甚）。只有 _redis_held 的锁才需续 Redis TTL。
+        if not self._redis_held:
+            return True
         r = get_redis()
         if r is None:
             return True
@@ -250,39 +278,34 @@ class ModuleLock:
     def release(self) -> None:
         if not self._held:
             return
-        # B1(R1 复核)：按【获取方式】释放，不看当刻 Redis 状态。
+        # H-2 治本：对称释放【两层】——始终释放已持的进程级本地锁；若还叠加了 Redis 层则再
+        # 原子删 Redis key。顺序无关（两层各自权威）；本地锁的释放不看当刻 Redis 状态（B1）。
+        if self._redis_held:
+            r = get_redis()
+            if r is None:
+                # release 时 Redis 挂 → 无法主动删 key，靠 TTL 过期回收（本地锁下面照常释放）。
+                logger.warning(
+                    "[ModuleLock] release 时 Redis 不可用，锁 %s 的 Redis key 靠 TTL(%ds)过期回收",
+                    self.key, self.ttl_sec,
+                )
+            else:
+                try:
+                    # H8：get-then-del 非原子→Lua 原子比对+删除，仅当 value==自己的 token 才删。
+                    _release_lua = (
+                        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                        "return redis.call('del', KEYS[1]) else return 0 end"
+                    )
+                    r.eval(_release_lua, 1, self.key, self.token)
+                except Exception as exc:
+                    _invalidate_redis(exc)  # H-1：坏 client 作废重探（key 靠 TTL 回收）
+                    logger.debug("[ModuleLock] release: %s", exc)
+            self._redis_held = False
         if self._local_held:
-            # 经进程内锁获取 → 释放同一把进程内锁（即便此刻 Redis 已恢复也不能走 Redis 分支，
-            # 否则本地锁永不释放 → 该 key 死锁）。
             try:
                 _local_lock_for(self.key).release()
             except RuntimeError as exc:
                 logger.warning("[ModuleLock] 进程内锁释放异常(锁=%s，疑重复释放): %s", self.key, exc)
             self._local_held = False
-            self._held = False
-            return
-        r = get_redis()
-        if r is None:
-            # 经 Redis 获取但 release 时 Redis 挂 → 无法主动删 Redis key，靠 TTL 过期回收（不去碰
-            # 进程内锁——那可能是别的任务在本次 Redis 宕机窗口里持有的同 key 锁，误放会双写）。
-            logger.warning(
-                "[ModuleLock] release 时 Redis 不可用，锁 %s 无法主动释放，将靠 TTL(%ds)过期回收",
-                self.key, self.ttl_sec,
-            )
-            self._held = False
-            return
-        try:
-            # H8 修复：get-then-del 非原子（两步间锁可能过期被他人获取，误删他人锁）。
-            # 用 Lua 脚本原子比对+删除：仅当 value==自己的 token 才删。
-            _release_lua = (
-                "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                "return redis.call('del', KEYS[1]) else return 0 end"
-            )
-            r.eval(_release_lua, 1, self.key, self.token)
-        except Exception as exc:
-            # H-1：作废坏 client（release 失败靠 TTL 回收，但坏 client 须重探）
-            _invalidate_redis(exc)
-            logger.debug("[ModuleLock] release: %s", exc)
         self._held = False
 
 

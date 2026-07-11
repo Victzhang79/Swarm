@@ -115,6 +115,7 @@ def test_module_lock_renew_uses_atomic_expire(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: _FakeRedis())
     lock = rc.ModuleLock("p1", "m1", ttl_sec=123)
     lock._held = True
+    lock._redis_held = True  # H-2 后：只有 Redis-held 锁 renew 才走 Lua expire
     assert lock.renew() is True
     assert len(evals) == 1
     # token 与 ttl 作为 ARGV 传入。
