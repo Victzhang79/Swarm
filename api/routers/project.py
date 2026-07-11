@@ -91,6 +91,36 @@ def _canonicalize_project_path(raw: str | None) -> str:
     return os.path.realpath(os.path.abspath(p))
 
 
+# H-5（round38c 主题I·外部深审 HIGH）：系统敏感目录黑名单——【必须含 realpath 后的形态】。
+# macOS 上 /etc→/private/etc、/var→/private/var、/tmp→/private/tmp（firmlink/symlink），
+# 而 _reject_sensitive 先 realpath 再比对；旧黑名单只有字面 "/etc" → norm("/private/etc") 既
+# 不 ==「/etc」也不 startswith「/etc/」→ 绕过（可把项目根指向 /private/etc 等宿主敏感目录）。
+# 治：黑名单条目本身也过 realpath 并入集（Linux 上 realpath(/etc)==/etc 无变化，平台通用）。
+_SENSITIVE_DIRS_RAW = ("/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev",
+                       "/boot", "/var/run", "/lib", "/lib64", "/root")
+
+
+def _sensitive_dir_set() -> tuple[str, ...]:
+    """字面 + realpath 归一形态并集（去重、稳定序）。"""
+    out: list[str] = []
+    for s in _SENSITIVE_DIRS_RAW:
+        for form in (s, os.path.realpath(s)):
+            if form and form not in out:
+                out.append(form)
+    return tuple(out)
+
+
+def _path_is_sensitive(p: str) -> bool:
+    """归一后的路径 p 是否落在（或等于）任一系统敏感目录。p 应已 realpath。"""
+    if not p:
+        return False
+    norm = os.path.realpath(os.path.abspath(p))
+    for s in _sensitive_dir_set():
+        if norm == s or norm.startswith(s + "/"):
+            return True
+    return False
+
+
 def _caller_may_reuse_existing_project(user, existing_id: str) -> bool:
     """D16：path 已被既存项目占用时，调用者可否幂等复用（不改写）该项目。
 
@@ -136,17 +166,12 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     # 不强制 containment 到 workspace（用户合法用例就是指向本机已有项目），
     # 但黑名单系统关键目录，避免误指/恶意指向 /etc /usr /bin 等。
     def _reject_sensitive(p: str) -> None:
-        if not p:
-            return
-        norm = os.path.realpath(os.path.abspath(p))
-        sensitive = ("/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev",
-                     "/boot", "/var/run", "/lib", "/lib64", "/root")
-        for s in sensitive:
-            if norm == s or norm.startswith(s + "/"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"拒绝将项目根指向系统敏感目录: {norm}",
-                )
+        # H-5：黑名单含 realpath 归一形态（macOS /etc→/private/etc 绕过），见 _path_is_sensitive。
+        if _path_is_sensitive(p):
+            raise HTTPException(
+                status_code=400,
+                detail=f"拒绝将项目根指向系统敏感目录: {os.path.realpath(os.path.abspath(p))}",
+            )
 
     _reject_sensitive(resolved_path)
     _allow_external = _env_allow_external_project_path()
