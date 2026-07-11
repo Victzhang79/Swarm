@@ -470,6 +470,17 @@ class TaskQueue:
     _memory: dict[str, list[str]] = {p: [] for p in _PRIORITIES}
 
     @staticmethod
+    def _drain_memory_to_redis(r) -> None:
+        """M-1（外部深审）：Redis 恢复后把【停机期堆积的内存条目】冲回 Redis（保优先级+FIFO），
+        杜绝内存 fallback 条目在 Redis 恢复后永久滞留不可达。在 enqueue/dequeue 的 Redis 路径
+        开头调——双源合一到 Redis。rpush 成功才 pop（抛异常则该条留内存，由外层 except 兜底）。"""
+        for p in TaskQueue._PRIORITIES:
+            mem = TaskQueue._memory[p]
+            while mem:
+                r.rpush(f"swarm:task_queue:{p}", mem[0])
+                mem.pop(0)
+
+    @staticmethod
     def enqueue(task_id: str, project_id: str, priority: str = "normal") -> None:
         """入队，priority 可选 urgent/normal/background，默认 normal。"""
         if priority not in TaskQueue._PRIORITIES:
@@ -477,23 +488,34 @@ class TaskQueue:
             priority = "normal"
         r = get_redis()
         payload = json.dumps({"task_id": task_id, "project_id": project_id, "priority": priority})
-        if r:
-            r.rpush(f"swarm:task_queue:{priority}", payload)
-        else:
-            TaskQueue._memory[priority].append(payload)
+        if r is not None:
+            # M-1：RPush 无 try 时，缓存 client 已坏会抛异常外泄（submit_task 之上无兜底）→ 任务
+            # 入队失败静默丢。包 try：先冲内存残留再入本条；异常转内存兜底 + 作废坏 client 重探。
+            try:
+                TaskQueue._drain_memory_to_redis(r)
+                r.rpush(f"swarm:task_queue:{priority}", payload)
+                return
+            except Exception as exc:  # noqa: BLE001
+                _invalidate_redis(exc)
+        TaskQueue._memory[priority].append(payload)
 
     @staticmethod
     def dequeue() -> dict[str, str] | None:
         """按 urgent → normal → background 顺序出队。"""
         r = get_redis()
-        if r:
-            # 按优先级依次检查三个 List
-            for p in TaskQueue._PRIORITIES:
-                raw = r.lpop(f"swarm:task_queue:{p}")
-                if raw:
-                    return json.loads(raw)
-            return None
-        # 内存 fallback：同逻辑
+        if r is not None:
+            # M-1：LPop 无 try 时坏 client 抛异常外泄消费循环；且恢复后内存残留不可达。包 try：
+            # 先冲内存残留进 Redis 再统一按优先级出（双源合一保序）；异常→作废坏 client + 落内存出队。
+            try:
+                TaskQueue._drain_memory_to_redis(r)
+                for p in TaskQueue._PRIORITIES:
+                    raw = r.lpop(f"swarm:task_queue:{p}")
+                    if raw:
+                        return json.loads(raw)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                _invalidate_redis(exc)
+        # 内存 fallback（Redis 不可用/本次 IO 失败）：同优先级逻辑
         for p in TaskQueue._PRIORITIES:
             if TaskQueue._memory[p]:
                 return json.loads(TaskQueue._memory[p].pop(0))
@@ -526,7 +548,10 @@ class TaskQueue:
             _key, raw = got
             return json.loads(raw)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[TaskQueue] BLPOP 失败，回退非阻塞出队: %s", exc)
+            # M-1：BLPOP 失败若不作废坏 client，回退的 dequeue() 会再用同一坏 client 二次抛
+            # （dequeue 现自带 try 兜底，但此处直接作废可省一次无谓往返、加速重探）。
+            _invalidate_redis(exc)
+            logger.debug("[TaskQueue] BLPOP 失败，作废坏 client 并回退非阻塞出队: %s", exc)
             return TaskQueue.dequeue()
 
     @staticmethod
