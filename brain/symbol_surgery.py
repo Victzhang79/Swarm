@@ -139,6 +139,106 @@ def surgical_symbol_attach(
 # C1/规则5 打回文案的符号类指纹（与 plan_validator 消息同源；改文案两处同改）
 _SYMBOL_ISSUE_MARKERS = ("契约符号无 owner", "规则5")
 
+# R40-1 缺件类指纹（与 validate_file_plan_ownership 消息同源）
+_FILEPLAN_ISSUE_MARKER = "file_plan 文件无 owner"
+
+
+def maybe_file_plan_repair(state, project_path: str | None = None):
+    """R40-1(b)：file_plan 缺件类校验失败 → 确定性挂靠修复，不全量重拆。
+
+    round40 死因：批拆丢 3 件（两个 ServiceImpl+DDL）规划期无校验。修复规则
+    （零 LLM）：deepcopy 上一版 plan，每个缺件挂到【同顶层模块 + 共享路径前缀
+    最深】的子任务 create_files（构建清单-only 脚手架不作候选，同 R39 CRITICAL
+    教训）；全部挂上且闸复核通过才放行；有缺件挂不上如实 None 回退全量重拆。
+    守卫与 maybe_symbol_repair 同族（F-3/缺模块让位；泄压阀共用
+    SWARM_PLAN_SYMBOL_SURGERY——同为"规划期确定性外科"面）。
+    """
+    import os
+
+    if not (state.get("plan_validation_feedback") or "").strip():
+        return None
+    _blob = " ".join(str(i) for i in (state.get("plan_validation_issues") or [])) \
+        + " " + (state.get("plan_validation_feedback") or "")
+    if _FILEPLAN_ISSUE_MARKER not in _blob:
+        return None
+    if os.environ.get("SWARM_PLAN_SYMBOL_SURGERY", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        logger.info("[FILEPLAN-SURGERY] 泄压阀 off → 旧行为全量重拆")
+        return None
+    if (state.get("replan_feedback") or "").strip():
+        logger.info("[FILEPLAN-SURGERY] 存在执行失败 replan_feedback（F-3）→ 让位")
+        return None
+    if state.get("plan_batch_failed_modules"):
+        logger.info("[FILEPLAN-SURGERY] 整模块分解失败 → 让位全量重拆")
+        return None
+    prior = state.get("plan")
+    from swarm.brain.plan_validator import normalized_file_plan_paths
+    file_plan = normalized_file_plan_paths(state.get("tech_design_file_plan"))
+    if prior is None or not getattr(prior, "subtasks", None) or not file_plan:
+        logger.warning("[FILEPLAN-SURGERY] 缺件类失败但无上一版 plan/file_plan → 全量重拆")
+        return None
+    from swarm.brain.plan_validator import (
+        validate_file_plan_ownership,
+        validate_plan_structure,
+    )
+    if not validate_plan_structure(prior).valid:
+        logger.warning("[FILEPLAN-SURGERY] 上一版结构不合法 → 结构失败归全量重拆")
+        return None
+    verdict0 = validate_file_plan_ownership(prior, file_plan)
+    if verdict0.valid:
+        return None  # 缺件已不存在（别的维度失败），不越权
+    candidate = prior.model_copy(deep=True)
+    owned = set()
+    for st in candidate.subtasks:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            owned.add(str(f).replace("\\", "/").lstrip("/"))
+    missing = [f for f in file_plan
+               if f.replace("\\", "/").lstrip("/") not in owned]
+
+    def _prefix_depth(a: str, b: str) -> int:
+        pa, pb = a.split("/"), b.split("/")
+        n = 0
+        for x, y in zip(pa, pb):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    attached = 0
+    for f in missing:
+        # 口径同源（复核 HIGH 修）：file_plan 已过 P5 权威去重，走到这的全是真缺件
+        # ——绝不再按 basename 豁免（自造豁免会静默放行"不同模块同名各建"的合法缺件）
+        p = f.replace("\\", "/").lstrip("/")
+        mod = p.split("/", 1)[0] if "/" in p else ""
+        best, best_key = None, (-1, -1)
+        for st in candidate.subtasks:
+            mods = _subtask_modules(st)
+            if not mod or mod not in mods:
+                continue
+            sc = st.scope
+            depth = max((_prefix_depth(p, str(w).replace("\\", "/").lstrip("/"))
+                         for w in (list(sc.create_files) + list(sc.writable))),
+                        default=0)
+            key = (depth, mods[mod])
+            if key > best_key:
+                best, best_key = st, key
+        if best is None:
+            logger.warning("[FILEPLAN-SURGERY] 缺件 %s 无同模块候选 → 回退全量重拆", f)
+            return None
+        if p not in best.scope.create_files:
+            best.scope.create_files.append(p)
+        owned.add(p)
+        attached += 1
+    verdict = validate_file_plan_ownership(candidate, file_plan)
+    if not verdict.valid:
+        logger.warning("[FILEPLAN-SURGERY] 修后闸仍未过 → 回退全量重拆")
+        return None
+    logger.info("[PLAN] R40-1 命中缺件外科路径：%d 个 file_plan 缺件确定性挂靠，"
+                "复用上一版 %d 子任务不重拆", attached, len(candidate.subtasks))
+    return candidate
+
 
 def maybe_symbol_repair(state, project_path: str | None = None):
     """R39-5 分流闸门：符号类校验失败重试 → 确定性外科修复，不全量重拆。

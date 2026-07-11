@@ -102,12 +102,13 @@ def test_select_worker_skills_bounded_by_max_tools():
 
 
 def test_build_worker_experience_tools_from_seed():
-    tools = build_worker_experience_tools(_sub(TaskIntent.CREATE), _JAVA_STACK)
-    names = {t.name for t in tools}
-    assert any(n.startswith("experience__") for n in names)
-    # java 栈应挂上 springboot 经验工具、不挂 python
-    assert "experience__springboot-patterns" in names
-    assert "experience__python-patterns" not in names
+    # R40-3：pull 默认关（两轮实证 experience__ 调用恒 0）→ 默认零工具；开关回退
+    assert build_worker_experience_tools(_sub(TaskIntent.CREATE), _JAVA_STACK) == []
+    with _skills_cfg(worker_pull_enabled=True):
+        tools = build_worker_experience_tools(_sub(TaskIntent.CREATE), _JAVA_STACK)
+        names = {t.name for t in tools}
+        assert any(n.startswith("experience__") for n in names)
+        assert "experience__python-patterns" not in names  # java 栈不挂 python
 
 
 def test_worker_experience_tools_wired_into_agent(monkeypatch):
@@ -126,10 +127,16 @@ def test_worker_experience_tools_wired_into_agent(monkeypatch):
 
     monkeypatch.setattr(agent_mod, "create_react_agent", _spy)
     monkeypatch.setattr(agent_mod, "ModelRouter", _FakeRouter)
+    # R40-3 默认：经验走 push 全文进 prompt，不再占工具槽
     agent_mod.create_worker_agent(_sub(TaskIntent.CREATE), project_stack=_JAVA_STACK)
     tool_names = {getattr(t, "name", "") for t in captured["tools"]}
     assert "patch_file" in tool_names                       # 基础工具仍在
-    assert any(n.startswith("experience__") for n in tool_names)  # 经验工具已挂
+    assert not any(n.startswith("experience__") for n in tool_names), (
+        "pull 默认关：经验不再占 worker 工具槽")
+    with _skills_cfg(worker_pull_enabled=True):
+        agent_mod.create_worker_agent(_sub(TaskIntent.CREATE), project_stack=_JAVA_STACK)
+        tool_names = {getattr(t, "name", "") for t in captured["tools"]}
+        assert any(n.startswith("experience__") for n in tool_names)  # 回退阀恢复挂载
 
 
 # ── catalog nudge ──
@@ -143,17 +150,20 @@ def test_render_experience_tool_catalog():
 
 
 # ── service happy path ──
-def test_worker_block_is_tool_catalog_not_bodies():
+def test_worker_block_push_fulltext_no_catalog_by_default():
+    # R40-3：默认 push top-K 全文（不再是目录+按需 pull）；pull 开时目录恢复
     out = worker_skills_block(_sub(TaskIntent.CREATE), _JAVA_STACK)
     assert out and "相关经验" in out
-    # 目录列工具名，不含技能正文（正文按需 pull）
-    assert "experience__" in out
-    assert "默认拒绝 / fail-closed" not in out   # coding-standards-core 正文不应出现在目录里
+    assert "experience__" not in out, "pull 关时无工具目录（目录与工具一一对应）"
+    with _skills_cfg(worker_pull_enabled=True):
+        out2 = worker_skills_block(_sub(TaskIntent.CREATE), _JAVA_STACK)
+        assert "experience__" in out2, "回退阀开=目录恢复"
 
 
 def test_worker_block_stack_specific_swap():
-    java = worker_skills_block(_sub(), _JAVA_STACK)
-    py = worker_skills_block(_sub(), _PY_STACK)
+    with _skills_cfg(worker_pull_enabled=True):
+        java = worker_skills_block(_sub(), _JAVA_STACK)
+        py = worker_skills_block(_sub(), _PY_STACK)
     # java 栈应含 springboot 段而非 python-patterns；python 栈相反
     assert ("Spring Boot" in java) and ("Spring Boot" not in py)
     assert ("Python 惯用" in py) and ("Python 惯用" not in java)
@@ -188,12 +198,13 @@ def test_selector_exception_fails_open(monkeypatch):
 
 
 def test_none_stack_still_returns_stack_agnostic():
-    # 无 project_stack：仍应命中栈无关技能。
-    # G2/G7 语义演进（阶段E）：工具面收敛 max_k=3 且 coding-standards-core 让位
-    # priority 45——不再断言特定技能必入前 3，只断言目录非空且有界。
-    out = worker_skills_block(_sub(), None)
-    assert out and "experience__" in out
-    assert out.count("- experience__") <= 3, "G2：worker 工具目录收敛 ≤3"
+    # 无 project_stack：通配技能不 push（E9-3）且 pull 默认关 → 默认空块=诚实
+    # （pull 通道两轮实证死渠道，删掉不算丢功能）；回退阀开时目录恢复且有界。
+    assert worker_skills_block(_sub(), None) == "", "默认无栈=无 push 无 pull=空块"
+    with _skills_cfg(worker_pull_enabled=True):
+        out = worker_skills_block(_sub(), None)
+        assert out and "experience__" in out
+        assert out.count("- experience__") <= 3, "G2：worker 工具目录收敛 ≤3"
 
 
 # ── 接线：build_worker_prompt ──

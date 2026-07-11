@@ -525,6 +525,58 @@ def validate_contract_ownership(
     return result
 
 
+def validate_file_plan_ownership(plan, file_plan) -> PlanValidationResult:
+    """R40-1(a)：file_plan 归属确定性闸——tech_design 规划的文件必须有 owner 子任务。
+
+    round40 PARTIAL 直接死因：file_plan 43 文件里 3 个（含两个 ServiceImpl=BLOCKED
+    "无生产者的包"核心实现类 + DDL）无任何子任务认领，批拆丢件规划期零校验，执行期
+    才以 BLOCKED→连坐放弃形态爆发。规则（零 LLM）：
+    - 先过与批拆同一个 P5 dedupe_file_plan（口径同源：同名去重由权威函数裁决，
+      被 P5 丢弃的孪生件本就不该被要求 owner——复核 HIGH：自造 basename 豁免会
+      静默放行真缺件，_PER_MODULE_FILENAMES 内每模块一份的文件按全路径各自硬性）；
+    - 去重后仍无 owner 的每个文件【逐条】issue 打回（一条一 bullet 让 D09 A9
+      分页轮转生效，防"固定截断头部永远修不到看不见的条目"；上限 60 防爆炸）；
+    - 单子任务计划（SIMPLE 面自证）/空 file_plan → 跳过。
+    """
+    result = PlanValidationResult(valid=True)
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    files = normalized_file_plan_paths(file_plan)
+    if len(subtasks) <= 1 or not files:
+        return result
+    owned_paths: set[str] = set()
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            owned_paths.add(str(f).replace("\\", "/").lstrip("/"))
+    missing = [f for f in files if f not in owned_paths]
+    for f in missing[:60]:
+        result.add(
+            f"file_plan 文件无 owner 子任务: {f} ——把它加入同模块子任务的"
+            " create_files，或为其新建子任务（缺实现类=下游 BLOCKED 无生产者必死）")
+    if len(missing) > 60:
+        result.add(f"file_plan 缺件共 {len(missing)} 个（仅列前 60，逐轮分页轮转其余）")
+    return result
+
+
+def normalized_file_plan_paths(file_plan) -> list[str]:
+    """R40-1 口径适配：原始 file_plan（str 或 {path} dict 混合）→ P5 去重后的归一路径列表。
+
+    与 plan 批拆消费同一 dedupe_file_plan（单一事实源）——被 P5 按 basename 丢弃的
+    同名件不进校验分母，validate/repair 两侧共用本函数防口径分叉。"""
+    from swarm.brain.plan_batch import dedupe_file_plan
+    entries = []
+    for f in (file_plan or []):
+        if isinstance(f, dict):
+            if str(f.get("path") or "").strip():
+                entries.append(f)
+        elif str(f or "").strip():
+            entries.append({"path": str(f)})
+    deduped = dedupe_file_plan(entries)
+    return [str(e["path"]).replace("\\", "/").strip("/")
+            for e in deduped if isinstance(e, dict) and e.get("path")]
+
+
 def validate_requirement_coverage(
     plan, requirement_items, baseline_covered=None,
 ) -> PlanValidationResult:

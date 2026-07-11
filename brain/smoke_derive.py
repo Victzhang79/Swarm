@@ -328,9 +328,25 @@ def derive_port(project_stack: Any, project_path: str,
 # ══════════════════════════════ entrypoint 推导（按语言 keyed）══════════════════════════════
 
 def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str) -> tuple[str | None, str | None]:
-    # Maven：声明 spring-boot-maven-plugin 的 pom → 可执行 jar 证据（多模块取声明模块）
+    # Maven：声明 spring-boot-maven-plugin 的 pom → 可执行 jar 证据（多模块取声明模块）。
+    # R40-4 消歧（round40：RuoYi 根聚合器 pom 直接声明插件+ruoyi-admin 双命中 → 歧义
+    # 护栏误判 → 冒烟常年 skipped）：①<packaging>pom</packaging> 聚合器结构上产不出
+    # 可执行 jar → 排除；②只在 <pluginManagement> 提及=版本钉子非可执行声明 → 剥掉
+    # 再搜。消歧后仍多命中=真歧义照旧 None（fail-closed 不拔）。
+    import re as _re
+
+    def _executable_boot_pom(rp: str) -> bool:
+        text = _read(project_path, rp, limit=120_000)
+        if "spring-boot-maven-plugin" not in text:
+            return False
+        if _re.search(r"<packaging>\s*pom\s*</packaging>", text):
+            return False  # 聚合器
+        stripped = _re.sub(r"<pluginManagement>.*?</pluginManagement>", "",
+                           text, flags=_re.S)
+        return "spring-boot-maven-plugin" in stripped
+
     boot_poms = [rp for rp in idx.files_by_name.get("pom.xml", [])
-                 if "spring-boot-maven-plugin" in _read(project_path, rp, limit=120_000)]
+                 if _executable_boot_pom(rp)]
     if len(boot_poms) == 1:
         moddir = os.path.dirname(boot_poms[0]).replace(os.sep, "/")
         prefix = f"{moddir}/" if moddir else ""

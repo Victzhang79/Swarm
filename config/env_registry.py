@@ -180,6 +180,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_SECRET_KEY": "api/routers/config.py:1109",
     "SWARM_SKILLS_": "config/settings.py:616",
     "SWARM_SKILLS_ADMIT_LLM_JUDGE": "config/settings.py:645",
+    "SWARM_SKILLS_WORKER_PULL_ENABLED": "config/settings.py:663",
     "SWARM_SKILLS_DIR": "config/settings.py:922",
     "SWARM_SKILLS_ENABLED": "config/settings.py:619",
     "SWARM_SMOKE_LOGIN_": "brain/acceptance_spec.py:43",

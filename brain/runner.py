@@ -1173,8 +1173,22 @@ def _attach_observability_account(token_usage: dict[str, Any],
     此前 degraded_summary 只进 SSE result payload 与 PARTIAL/FAILED 账，DONE 终态
     API 全盲；contract_failed_modules/l2_details/validate 降级标记只活在 LangGraph
     state（SSE+API 双盲）——round38 造这些键就是给盯跑脚本的，DONE 路径必须读得到。
-    与 R38-E 机读账同槽同口径，零迁移。"""
+    与 R38-E 机读账同槽同口径，零迁移。
+    R40-2（round40 实证）：ledger 权威账（stage_spent/llm_calls/cloud in-out）此前只在
+    FAILED 路径合并（_failed_machine_account），PARTIAL/DONE 终态这些键全缺——本函数
+    是三终态唯一共同出口，快照合并收编到这里（只补缺失键绝不覆写，FAILED 先填不冲突）。"""
     st = state or {}
+    _tid = str(st.get("task_id") or "").strip()
+    if _tid:
+        try:
+            from swarm.models import ledger as _att_ledger
+            _snap = _att_ledger.snapshot(_tid) or {}
+            for _k in ("cloud_tokens_in", "cloud_tokens_out", "local_tokens",
+                       "llm_calls", "stage_spent", "budget_total"):
+                if _k in _snap and _k not in token_usage:
+                    token_usage[_k] = _snap[_k]
+        except Exception as _snap_exc:  # noqa: BLE001 — 观测账增强面，绝不阻断终态写
+            logger.warning("[RUNNER] 终态账 ledger 快照合并失败（跳过）: %s", _snap_exc)
     _dg = list(st.get("degraded_reasons") or [])
     if _dg:
         token_usage["degraded_summary"] = build_degraded_summary(_dg)

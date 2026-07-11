@@ -64,11 +64,12 @@ def test_e9_push_framework_hit_beats_alphabetical():
         class _Sub:
             id = "st-1"
             intent = "create"
-        push, pull = svc.select_worker_push_pull(
+        pushes, pulls = svc.select_worker_push_pull(
             _Sub(), {"frontend": "", "backend": "FastAPI (python)", "build": "pip"})
     finally:
         svc._merged_skills = orig
-    assert push is not None and push.id == "fastapi-patterns", (
+    assert pushes and pushes[0].id == "fastapi-patterns" and \
+        "django-security" not in {p.id for p in pushes}, (
         "语言级栈轴 + id 字母序 tiebreak 会把 django-security 全文 push 给 FastAPI"
         "项目（复核 RF2 实证）——框架词元命中必须先于字母序")
 
@@ -117,9 +118,9 @@ def test_e9_zero_max_tools_disables_push_too(monkeypatch):
     class _Sub:
         id = "st-1"
         intent = "create"
-    push, pull = svc.select_worker_push_pull(
+    pushes, pulls = svc.select_worker_push_pull(
         _Sub(), {"frontend": "", "backend": "Spring (java)", "build": "maven"})
-    assert push is None and pull == [], (
+    assert pushes == [] and pulls == [], (
         "『0 = 不挂经验工具』的配置承诺不能静默漂移成『只关 pull』（复核 RF5）")
 
 

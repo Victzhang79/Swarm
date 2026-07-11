@@ -38,13 +38,15 @@ def test_g8_stack_specialized_top1_pushed_rest_pulled(monkeypatch):
         id = "st-1"
         intent = "create"
 
-    push, pull = select_worker_push_pull(
+    # R40-3：push 扩 top-K 列表、pull 默认关（两轮实证 pull 调用恒 0）；本测开 pull 验旧混合契约
+    from swarm.config.settings import get_config
+    monkeypatch.setattr(get_config().skills, "worker_pull_enabled", True)
+    pushes, pulls = select_worker_push_pull(
         _Sub(), {"frontend": "Vue3", "backend": "Node (javascript)", "build": "npm"})
-    assert push is not None and "*" not in push.applies_to_stacks, (
-        "push top-1 必须是栈特化技能（全文零迭代成本进 prompt，最相关经验不靠小模型"
-        "自己想起来去调工具）")
-    assert push.id not in {s.id for s in pull}, "已 push 全文的技能不再占 pull 工具位"
-    assert len(pull) <= 3, "pull ≤3（G2/G8 拍板）"
+    assert pushes and all("*" not in p.applies_to_stacks for p in pushes), (
+        "push 必须全是栈特化技能（全文零迭代成本进 prompt）")
+    assert not ({p.id for p in pushes} & {s.id for s in pulls}), "已 push 全文的技能不再占 pull 工具位"
+    assert len(pulls) <= 3, "pull ≤3（G2/G8 拍板）"
 
 
 def test_g8_wildcard_only_candidates_push_nothing(monkeypatch):
@@ -56,10 +58,12 @@ def test_g8_wildcard_only_candidates_push_nothing(monkeypatch):
         id = "st-1"
         intent = "create"
 
-    push, pull = select_worker_push_pull(_Sub(), None)
-    assert push is None, (
+    from swarm.config.settings import get_config
+    monkeypatch.setattr(get_config().skills, "worker_pull_enabled", True)
+    pushes, pulls = select_worker_push_pull(_Sub(), None)
+    assert pushes == [], (
         "无栈特化候选时不 push（通配技能是泛化建议，不值得无条件占 prefill）")
-    assert 0 < len(pull) <= 3
+    assert 0 < len(pulls) <= 3
 
 
 def test_g8_worker_block_contains_push_fulltext(monkeypatch):
@@ -73,10 +77,12 @@ def test_g8_worker_block_contains_push_fulltext(monkeypatch):
         id = "st-1"
         intent = "create"
 
+    from swarm.config.settings import get_config
+    monkeypatch.setattr(get_config().skills, "worker_pull_enabled", True)
     blk = svc.worker_skills_block(_Sub(), {"frontend": "Vue3", "backend": "",
                                            "build": "npm"})
     assert "UNIQUE-VUE-RULE-LINE" in blk, "push 技能【全文】进 prompt（非仅目录行）"
-    assert "experience__error-handling" in blk, "pull 工具目录仍在（按需深度）"
+    assert "experience__error-handling" in blk, "pull 开时工具目录仍在（按需深度）"
     assert "experience__vue-patterns" not in blk, "push 技能不再出现在工具目录"
 
 
@@ -90,6 +96,8 @@ def test_g8_tools_built_only_for_pull(monkeypatch):
         id = "st-1"
         intent = "create"
 
+    from swarm.config.settings import get_config
+    monkeypatch.setattr(get_config().skills, "worker_pull_enabled", True)
     tools = svc.build_worker_experience_tools(
         _Sub(), {"frontend": "Vue3", "backend": "", "build": "npm"})
     names = {t.name for t in tools}

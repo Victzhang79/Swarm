@@ -654,6 +654,12 @@ class SkillsConfig(BaseSettings):
     # tool_body_max_chars = 单个经验工具返回正文的上限。
     worker_max_tools: int = 3
     tool_body_max_chars: int = 4000
+    # R40-3（round40 定案）：两轮 tool-telemetry 实证 experience__ pull 调用恒 0
+    # （小模型不接可选离散工具，纯占工具槽）→ push 从 top-1 扩到 top-K 全文注入，
+    # pull 工具默认关（SWARM_SKILLS_WORKER_PULL_ENABLED=1 回退旧混合行为）。
+    # E9-3 push 门槛（栈特化+框架相关）逐条保留；E9-5（worker_max_tools=0 全关）不变。
+    worker_push_k: int = 2
+    worker_pull_enabled: bool = False
     rerank: bool = False               # 可选 LLM rerank；默认关（确定性优先）
     # 导入准入闸的 LLM 一致性裁判（标题/描述 vs 正文意图）。默认开=严格；LLM 不可用时自动降级
     # 为仅确定性校验(不硬拦)。SWARM_SKILLS_ADMIT_LLM_JUDGE=0 可关(纯确定性准入)。

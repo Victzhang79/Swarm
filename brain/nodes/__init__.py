@@ -1986,6 +1986,24 @@ async def plan(state: BrainState) -> dict:
             _plan_batch_failed = list(state.get("plan_batch_failed_modules") or [])
             _plan_batch_cache = dict(state.get("plan_batch_cache") or {})
 
+    # ── R40-1 缺件外科通道：file_plan 归属类校验失败时【不全量重拆】──
+    if task_plan is None:
+        _fp_plan = None
+        try:
+            import asyncio as _fp_aio
+
+            from swarm.brain.symbol_surgery import maybe_file_plan_repair
+            _fp_plan = await _fp_aio.to_thread(
+                maybe_file_plan_repair,
+                state, project_path=_get_project_path(state.get("project_id") or ""))
+        except ImportError as _fp_ie:
+            logger.warning("[PLAN] R40-1 缺件外科不可用(%s) → 回退常规路径", _fp_ie)
+        if _fp_plan is not None:
+            task_plan = _fp_plan
+            _baseline_covered = state.get("baseline_covered")
+            _plan_batch_failed = list(state.get("plan_batch_failed_modules") or [])
+            _plan_batch_cache = dict(state.get("plan_batch_cache") or {})
+
     # ── LLM 任务拆解 ──
     if task_plan is None:
       try:
@@ -2534,6 +2552,26 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": _co_result.issues,
             "plan_validation_feedback": _format_validation_feedback(
                 _co_result.issues, rotate=retry_count),
+        }
+
+    # ── R40-1 file_plan 归属确定性闸：规划文件必须有 owner 子任务 ──
+    # round40 PARTIAL 直接死因：批拆丢 3 件（两个 ServiceImpl+DDL）零校验，执行期
+    # 才以 BLOCKED"无生产者的包"→连坐放弃爆发。打回带具体缺件清单（D09），plan
+    # 侧 maybe_file_plan_repair 优先确定性挂靠不重拆。
+    from swarm.brain.plan_validator import validate_file_plan_ownership as _vfpo
+    _fp_result = _vfpo(plan_obj, state.get("tech_design_file_plan") or [])
+    for w in _fp_result.warnings:
+        _vp_warnings.append(str(w))
+        logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属: %s", w)
+    if not _fp_result.valid:
+        logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属未通过 → 打回 PLAN: %s",
+                       _fp_result.issues[:3])
+        return {
+            "plan_valid": False,
+            "plan_retry_count": retry_count,
+            "plan_validation_issues": _fp_result.issues,
+            "plan_validation_feedback": _format_validation_feedback(
+                _fp_result.issues, rotate=retry_count),
         }
 
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──

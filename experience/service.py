@@ -120,31 +120,40 @@ def select_worker_skills(subtask, project_stack: dict | None = None) -> list[Ski
     """
     # E9-7（复核 HF8/RF15）：生产零调用的旧入口收编为 push/pull 的兼容壳——避免
     # "两套选择逻辑并存"的未来误用面（docstring 曾承诺与目录同源，已不再成立）。
-    push, pull = select_worker_push_pull(subtask, project_stack)
-    return ([push] if push is not None else []) + list(pull)
+    pushes, pulls = select_worker_push_pull(subtask, project_stack)
+    return list(pushes) + list(pulls)
 
 
 def select_worker_push_pull(subtask, project_stack: dict | None = None):
-    """G8（阶段E 拍板）：push top-1 栈特化 + pull ≤worker_max_tools 的混合分离。
+    """R40-3（round40 定案重塑 G8）：push top-K 栈特化全文 + pull 默认关。
 
-    离散 pull 把选择负担压给最弱环节（小模型）；最相关的一条【栈特化】技能改为全文
-    push 进 prompt（零迭代成本），其余候选仍走按需 pull 工具。top 候选是通配技能时
-    不 push（泛化建议不值得无条件占 prefill）。返回 (push_skill|None, pull_skills)。
-    push 与 pull 不重叠（已 push 全文的技能不再占工具位）。fail-open → (None, [])。
+    round39/40 两轮 tool-telemetry 实证：experience__ pull 工具调用恒 0（round40
+    36 条遥测零命中，query_knowledge_base 正常用）——离散 pull 把选择负担压给最弱
+    环节（小模型）被证伪为死重量，还占 worker 工具槽。改：
+    - push 扩到 top-K（cfg.worker_push_k，默认 2），E9-3 门槛逐条保留（栈特化且
+      框架词元命中/语言前缀命中；通配泛化建议不 push）；
+    - pull 默认关（cfg.worker_pull_enabled=False），开=回退旧混合行为；
+    - E9-5 承诺不变：worker_max_tools<=0 = worker 侧经验全关。
+    返回 (push_skills, pull_skills) 两列表，互不重叠。fail-open → ([], [])。
     """
     try:
         from swarm.config.settings import get_config
 
         cfg = get_config().skills
         if not cfg.enabled:
-            return None, []
+            return [], []
         skills = _merged_skills(cfg.dir_list())
         if not skills:
-            return None, []
+            return [], []
         if cfg.worker_max_tools <= 0:
             # E9-5（复核 RF5）：0 = worker 侧经验全关（push 也关）——否则"0=不挂经验
             # 工具"的配置承诺静默漂移成"只关 pull"。
-            return None, []
+            return [], []
+        push_k = max(int(getattr(cfg, "worker_push_k", 2)), 0)
+        pull_budget = cfg.worker_max_tools if getattr(
+            cfg, "worker_pull_enabled", False) else 0
+        if push_k <= 0 and pull_budget <= 0:
+            return [], []
         intent = str(
             getattr(getattr(subtask, "intent", ""), "value", getattr(subtask, "intent", "")) or ""
         ).lower()
@@ -153,23 +162,31 @@ def select_worker_push_pull(subtask, project_stack: dict | None = None):
         picked = select_skills(
             skills, stack_langs=stack_langs, intent=intent, phase="code",
             target="worker", budget_chars=10**9,
-            max_k=cfg.worker_max_tools + 1,  # +1：top-1 归 push，其余归 pull
+            # +1：RF14 通配保底会占末位一槽，不留余量会把第 K 条栈特化挤出候选
+            max_k=push_k + max(pull_budget, 0) + 1,
             rerank_fn=None, profile_terms=terms,
         )
         if not picked:
-            return None, []
-        _top = picked[0]
-        # E9-3（复核 RF2）：push 门槛收紧——仅当 top 栈特化且【与画像框架级相关】
+            return [], []
+        # E9-3（复核 RF2）：push 门槛逐条适用——栈特化且【与画像框架级相关】
         # （框架词元命中，或 id 语言前缀 ∈ 探出语言集，如 java-coding-standards）。
         # 否则"任意栈特化即 push"会把 django-security 全文塞给 FastAPI 项目。
         from swarm.experience.selector import _fw_hit
-        _lang_prefix = _top.id.split("-", 1)[0].lower() in stack_langs
-        if "*" not in _top.applies_to_stacks and (_fw_hit(_top, terms) or _lang_prefix):
-            return _top, picked[1:]
-        return None, picked[:cfg.worker_max_tools]
+
+        def _pushable(doc) -> bool:
+            if "*" in doc.applies_to_stacks:
+                return False
+            _lang_prefix = doc.id.split("-", 1)[0].lower() in stack_langs
+            return _fw_hit(doc, terms) or _lang_prefix
+
+        pushes = [d for d in picked if _pushable(d)][:push_k]
+        _pushed_ids = {d.id for d in pushes}
+        pulls = ([d for d in picked if d.id not in _pushed_ids][:pull_budget]
+                 if pull_budget > 0 else [])
+        return pushes, pulls
     except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮主流程
         logger.warning("[skills] worker push/pull 选择失败，降级为空：%s", e)
-        return None, []
+        return [], []
 
 
 def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
@@ -179,11 +196,11 @@ def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
     工具"与"实际挂上的工具"一一对应。空/禁用/异常 → ""。
     """
     try:
-        push, pull = select_worker_push_pull(subtask, project_stack)
+        pushes, pulls = select_worker_push_pull(subtask, project_stack)
         parts = []
-        if push is not None:
-            parts.append(render_skills_block([push]))
-        catalog = render_experience_tool_catalog(pull)
+        if pushes:
+            parts.append(render_skills_block(list(pushes)))
+        catalog = render_experience_tool_catalog(pulls)
         if catalog:
             parts.append(catalog)
         return "\n".join(p for p in parts if p)
@@ -198,7 +215,7 @@ def build_worker_experience_tools(subtask, project_stack: dict | None = None):
         from swarm.config.settings import get_config
         from swarm.experience.tools import build_experience_tools
 
-        _, skills = select_worker_push_pull(subtask, project_stack)  # G8：只挂 pull 侧
+        _, skills = select_worker_push_pull(subtask, project_stack)  # R40-3：pull 默认关=[]
         if not skills:
             return []
         return build_experience_tools(
@@ -230,19 +247,22 @@ def preview_mount_surfaces(doc: SkillDoc) -> dict:
     for st_tag in rep_stacks:
         for it in rep_intents:
             if "worker" in doc.target:
+                _push_k = max(int(getattr(cfg, "worker_push_k", 2)), 0)
+                _pull_on = bool(getattr(cfg, "worker_pull_enabled", False))
                 picked = select_skills(
                     pool, stack_langs={st_tag}, intent=it, phase="code",
                     target="worker", budget_chars=10**9,
-                    max_k=max(cfg.worker_max_tools, 0) + 1)
+                    max_k=_push_k + (max(cfg.worker_max_tools, 0) if _pull_on else 0))
                 ids = [x.id for x in picked]
                 rank = ids.index(doc.id) if doc.id in ids else -1
                 mode = ""
-                if rank == 0 and picked and "*" not in picked[0].applies_to_stacks:
+                # R40-3 近似预览：前 push_k 内且栈特化 → push；其余仅在 pull 开时挂
+                if 0 <= rank < _push_k and "*" not in doc.applies_to_stacks:
                     mode = "push"
-                elif rank >= 0:
+                elif rank >= 0 and _pull_on:
                     mode = "pull"
                 surfaces.append({"stack": st_tag, "intent": it, "target": "worker",
-                                 "mounted": rank >= 0, "rank": rank, "mode": mode})
+                                 "mounted": bool(mode), "rank": rank, "mode": mode})
             if "planner" in doc.target:
                 picked_p = select_skills(
                     pool, stack_langs={st_tag}, intent="*", phase="plan",
