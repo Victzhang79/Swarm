@@ -995,12 +995,15 @@ async def _handle_post_run(
     # 已完成子任务的真实产物照常落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃/桩项——绝不当
     # DONE 假成功。give_up_isolated_ids 是阶梯三保 build 放弃的子任务（本地树已清/打桩，build 未毒），
     # 与 abandoned（重试耗尽连坐放弃）合并判 PARTIAL。
-    from swarm.brain.gates import partial_delivery_ids
+    from swarm.brain.gates import delivery_incomplete, partial_delivery_ids, terminal_status
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
     _rebase_dropped = state.get("merge_rebase_dropped") or []  # 复核 H-1：rebase 超限丢弃的子任务
     _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up ∪ rebase_dropped
-    _final_status = "PARTIAL" if _partial_ids else "DONE"
+    # X-1 残留（外部深审）：交付 apply 全失败/不完整 = merged_diff 没（全部）落到项目树——subtask
+    # 都成功但产物没进用户项目，绝不能报 DONE 假成功。这是子任务之外的【任务级】交付失败信号。
+    _delivery_incomplete = delivery_incomplete(state)
+    _final_status = terminal_status(state)  # 单一裁决：_partial_ids ∪ 交付失败 → PARTIAL
     # 5.9 猎手 F4：终态写拆两步——记账字段先落（不受 E2 CAS 限制），status 再 CAS。
     # 否则收尾窗口撞 cancel/reconcile 时整行被拒，token/duration 记账连坐蒸发（§九账本口径受损）。
     store.update_task(
@@ -1011,18 +1014,27 @@ async def _handle_post_run(
     store.update_task(task_id, status=_final_status)
     _emit_task_notification(task_id, task_rec, _final_status)
     output_parts = _build_result_payload(state)
-    if _partial_ids:
+    if _final_status == "PARTIAL":
         logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)"
-                       " + rebase 超限丢弃 %d 个(%s)",
+                       " + rebase 超限丢弃 %d 个(%s) + 交付未落盘=%s",
                        task_id, len(_abandoned), _abandoned, len(_given_up), _given_up,
-                       len(_rebase_dropped), _rebase_dropped)
-        _msg = (f"部分交付：已完成子任务真实落盘且可构建(已过 L2)；放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}"
-                if _abandoned else "部分交付：已完成子任务真实落盘且可构建(已过 L2)")
+                       len(_rebase_dropped), _rebase_dropped, _delivery_incomplete)
+        # hunter F3：交付失败为唯一 PARTIAL 成因时，别用"已完成子任务真实落盘"打头（那指 worker
+        # 工作区，与"产物未落项目树"读来矛盾）——改用交付面开场，避免误导。
+        if _delivery_incomplete and not (_abandoned or _given_up or _rebase_dropped):
+            _msg = "部分交付：子任务已完成且过 L2，但合并产物未（全部）落入项目工作树"
+        elif _abandoned:
+            _msg = f"部分交付：已完成子任务真实落盘且可构建(已过 L2)；放弃 {len(_abandoned)} 个(重试耗尽)：{_abandoned}"
+        else:
+            _msg = "部分交付：已完成子任务真实落盘且可构建(已过 L2)"
         if _given_up:
             _msg += f"；保 build 放弃 {len(_given_up)} 个(本地树已清/打桩，需人工补完)：{_given_up}"
         if _rebase_dropped:
             # 复核 H-1：否则 rebase-only PARTIAL 会显示"放弃 0 + 保 build 0"无解释。
             _msg += f"；merge rebase 超限丢弃 {len(_rebase_dropped)} 个(rebased 变更未并入，需人工核验)：{_rebase_dropped}"
+        if _delivery_incomplete:
+            # X-1 残留：交付 apply 失败=产物没（全部）落到项目树，须显式说明（否则 PARTIAL 无解释）。
+            _msg += "；⚠️交付 apply 失败：合并产物未（全部）落入项目工作树，需人工核验/重新交付（详见 degraded_reasons）"
         # D18：终态载荷并入 complete 事件。旧协议 complete 后再发 step:"result"，但 SSE/WS
         # 订阅端在 complete 即 break → result（merged_diff/l3 等）永远送不到（死协议）。
         # CLI 原生消费 complete 事件内的 result 键（cli/__init__.py），WebUI 靠 complete 后

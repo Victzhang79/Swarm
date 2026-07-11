@@ -50,6 +50,26 @@ def is_partial_delivery(state: dict[str, Any]) -> bool:
     return bool(partial_delivery_ids(state))
 
 
+def delivery_incomplete(state: dict[str, Any]) -> bool:
+    """X-1 残留（外部深审）：交付 apply 全失败/不完整——merged_diff 没（全部）落到项目树 →
+    项目实际没拿到本任务的（全部）变更。这是 subtask-id 之外的【任务级】交付失败信号（deliver
+    节点写 degraded_reasons），终态判据须纳入，绝不静默 DONE 假成功（DONE 铁律）。
+
+    诚实边界：delivery_commit_failed 【不】入此判据——那种情形 apply 已成功、变更已在工作树
+    落盘，只是未提交进 git 历史（/apply-diff、人工 commit 可补），交付本身已达成、非假成功。"""
+    _dg = state.get("degraded_reasons") or []
+    return any(r in ("delivery_apply_failed", "delivery_apply_incomplete") for r in _dg)
+
+
+def terminal_status(state: dict[str, Any]) -> str:
+    """终态状态单一裁决：有部分交付子任务 或 任务级交付失败 → PARTIAL，否则 DONE。
+
+    单一事实源，runner 落库据此判 DONE/PARTIAL。X-1 残留治本把【任务级交付失败】
+    （delivery_incomplete，apply 没落进项目树）与既有【子任务级部分交付】（partial_delivery_ids）
+    并入同一判据，杜绝"子任务全成功但产物没交付 → 静默 DONE 假成功"。"""
+    return "PARTIAL" if (partial_delivery_ids(state) or delivery_incomplete(state)) else "DONE"
+
+
 def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
     """CONFIRM 阶段：auto_accept 是否可放行此计划。
 
