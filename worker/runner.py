@@ -26,6 +26,32 @@ _worker_run_project: dict[str, str] = {}
 _worker_tasks: dict[str, asyncio.Task] = {}
 
 
+def _worker_run_queue_max() -> int:
+    """M-3：单跑事件队列上界（防无订阅者时无界堆积）。SWARM_WORKER_RUN_QUEUE_MAX 覆盖，默认 2000。"""
+    try:
+        return max(16, int(os.environ.get("SWARM_WORKER_RUN_QUEUE_MAX", "2000")))
+    except (TypeError, ValueError):
+        return 2000
+
+
+def _worker_run_retention_s() -> float:
+    """M-3：单跑完成后事件队列/归属映射的保留期（秒），到期回收。给 SSE 订阅者留窗读完终态事件。
+    SWARM_WORKER_RUN_RETENTION_S 覆盖，默认 300s。"""
+    try:
+        v = float(os.environ.get("SWARM_WORKER_RUN_RETENTION_S", "300"))
+        return v if v >= 0 else 300.0
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _worker_run_max_retained() -> int:
+    """M-3：进程内保留的 run 上界（硬兜底，防保留期内海量单跑撑爆内存）。默认 1000。"""
+    try:
+        return max(16, int(os.environ.get("SWARM_WORKER_RUN_MAX_RETAINED", "1000")))
+    except (TypeError, ValueError):
+        return 1000
+
+
 def cancel_standalone_worker(run_id: str) -> bool:
     """外部取消一个卡死/失控的后台单跑 worker。返回是否实际发起取消。TD2606-B14。"""
     task = _worker_tasks.get(run_id)
@@ -50,10 +76,48 @@ def get_worker_run_project(run_id: str) -> str | None:
     return _worker_run_project.get(run_id)
 
 
+def _evict_stale_runs() -> None:
+    """M-3：硬兜底——保留的 run 超上界时，按插入序驱逐【已不在跑】的最旧项（queue+项目映射），
+    绝不驱逐在跑的 run。保留期 TTL 是常态回收，此处仅防保留期内海量单跑撑爆内存。"""
+    cap = _worker_run_max_retained()
+    if len(_worker_queues) <= cap:
+        return
+    for rid in list(_worker_queues.keys()):
+        if len(_worker_queues) <= cap:
+            break
+        if rid in _worker_running:
+            continue  # 绝不驱逐在跑的
+        _worker_queues.pop(rid, None)
+        _worker_run_project.pop(rid, None)
+
+
 def register_worker_queue(run_id: str) -> asyncio.Queue[dict[str, Any]]:
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    # M-3：有界队列（无订阅者时不无界堆积）；_emit 满则丢最旧（保最新，含终态事件）。
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_worker_run_queue_max())
     _worker_queues[run_id] = queue
+    _evict_stale_runs()
     return queue
+
+
+def _cleanup_worker_run(run_id: str) -> None:
+    """M-3：单跑完成后（保留期到）回收事件队列 + 归属映射，绝不永久滞留（治"历史结果长期驻留"）。"""
+    _worker_queues.pop(run_id, None)
+    _worker_run_project.pop(run_id, None)
+    _worker_tasks.pop(run_id, None)
+
+
+def _schedule_worker_run_cleanup(run_id: str) -> None:
+    """M-3：单跑收尾后延迟回收——留 _worker_run_retention_s 窗口供 SSE 订阅者读完终态事件再清。"""
+    delay = _worker_run_retention_s()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _cleanup_worker_run(run_id)  # 无运行 loop（极少）→ 直接清
+        return
+    if delay <= 0:
+        _cleanup_worker_run(run_id)
+    else:
+        loop.call_later(delay, _cleanup_worker_run, run_id)
 
 
 def is_worker_running(run_id: str) -> bool:
@@ -61,7 +125,19 @@ def is_worker_running(run_id: str) -> bool:
 
 
 async def _emit(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
-    await queue.put(event)
+    # M-3：有界队列——满（无订阅者/慢订阅者）则丢【最旧】腾位，绝不阻塞 worker 主流程。丢最旧保
+    # 最新（终态 complete/result 恒在队尾被保留），迟到订阅者读到的仍是含终态的尾部事件。
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        try:
+            queue.get_nowait()  # 丢最旧
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            pass  # 极端并发下仍满 → 丢本条（best-effort，不阻塞）
 
 
 def _set_workspace(project_id: str) -> str | None:
@@ -260,10 +336,12 @@ def start_standalone_worker_background(
         _worker_tasks[run_id] = task
 
         def _on_done(t: asyncio.Task, _rid: str = run_id) -> None:
-            _worker_tasks.pop(_rid, None)
             if not t.cancelled():
                 exc = t.exception()
                 if exc is not None:
                     logger.error("[WORKER] 后台单跑任务异常退出 run_id=%s: %s", _rid, exc, exc_info=exc)
+            # M-3：单跑收尾 → 延迟回收事件队列 + 归属映射 + 句柄（保留期供 SSE 读完终态事件），
+            # 绝不永久滞留（治"完成后只清 task handle、queue/project map 长期驻留"的内存泄漏）。
+            _schedule_worker_run_cleanup(_rid)
 
         task.add_done_callback(_on_done)
