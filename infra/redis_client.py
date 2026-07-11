@@ -134,6 +134,139 @@ def _local_lock_for(key: str) -> threading.Lock:
         return lk
 
 
+# ── H-3（外部深审 HIGH）：项目级【读写门】——default↔模块锁的层级仲裁 ──────────────
+# 病根：`default`(整项目宽锁)与模块键(root/src/…)是【平级不同 Redis key】，SET NX 只让同名键
+# 互斥 → `default` 只排除另一个 `default`，绝不排除模块 holder；升级后释放 default，apply 直写
+# 入口(api/routers/task.py)又取 `default` → 与正持模块锁写树的 runner 并发 = 同一 git 树双写污染。
+# 治：把 default↔模块 建成【读写门】——default=写者(排他:排除所有模块读者+另一写者)，模块键=读者
+# (共享:不同模块并行=E3 本意；同模块仍靠各自 key 互斥)。写者在场读者不可入、读者在场写者不可入。
+# 进程内 threading 层作【权威】仲裁(与 H-2 一致，单进程部署即完全正确)；Redis Lua 层叠加跨进程。
+# 诚实边界：runner 规划前的占位 default 现也排他于模块写者(过保守但绝不错——升级到模块锁后即释放
+# 写者、恢复并行)；acquire 失败=非阻塞让位，调用方(runner reconcile/apply 409)优雅延后重试。
+class _ProjectGate:
+    """单项目进程内读写门（非阻塞）。writer 排他、多 reader 共存、writer↔reader 互斥。
+
+    对抗复核 F5：读写槽均按【owner token】记账（reader 集 / writer token），release 校验属主——
+    绝不因某个未来的重复 release 静默清掉【别的 holder】的合法读/写态（与 Redis Lua 层的 token
+    纪律对齐）。"""
+
+    def __init__(self) -> None:
+        self._m = threading.Lock()
+        self._readers: set[str] = set()
+        self._writer: str | None = None
+
+    def acquire_shared(self, token: str) -> bool:
+        with self._m:
+            if self._writer is not None:
+                return False
+            self._readers.add(token)
+            return True
+
+    def release_shared(self, token: str) -> None:
+        with self._m:
+            self._readers.discard(token)
+
+    def acquire_exclusive(self, token: str) -> bool:
+        with self._m:
+            if self._writer is not None or self._readers:
+                return False
+            self._writer = token
+            return True
+
+    def release_exclusive(self, token: str) -> None:
+        with self._m:
+            if self._writer == token:
+                self._writer = None
+
+    def downgrade(self, writer_token: str, reader_tokens: list[str]) -> bool:
+        """原子降级：writer → N readers（同一临界区，绝不空窗）。仅当 writer 是本 token 才降。"""
+        with self._m:
+            if self._writer != writer_token:
+                return False
+            self._writer = None
+            self._readers.update(reader_tokens)
+            return True
+
+
+_PROJECT_GATES: dict[str, _ProjectGate] = {}
+_PROJECT_GATES_GUARD = threading.Lock()
+
+
+def _project_gate_for(project_id: str) -> _ProjectGate:
+    with _PROJECT_GATES_GUARD:
+        g = _PROJECT_GATES.get(project_id)
+        if g is None:
+            g = _ProjectGate()
+            _PROJECT_GATES[project_id] = g
+        return g
+
+
+def _reset_project_gates() -> None:
+    """测试隔离用——清空进程内项目门注册表。"""
+    with _PROJECT_GATES_GUARD:
+        _PROJECT_GATES.clear()
+
+
+def _pgate_key(project_id: str) -> str:
+    return f"swarm:pgate:{project_id}"
+
+
+def _pgate_readers_key(project_id: str) -> str:
+    return f"swarm:pgate:{project_id}:r"
+
+
+# Redis 跨进程读写门（Lua 原子，KEYS[1]=hash 存 writer token，KEYS[2]=zset 存 reader token→到期时刻）。
+# 对抗复核 F4：readers 改用【按 token 各自到期】的 sorted-set（score=server TIME+ttl）而非单一
+# 计数——每次 acquire/renew 先 ZREMRANGEBYSCORE 清掉已过期(含 crash 未 release)的 reader，杜绝
+# 幽灵 +1 永久堵死 writer。writer 侧仍以 hash key TTL 兜底 crash（写者持锁期无人能并发刷 TTL）。
+# renew：reader 只刷【自己】那条 score（并 fail-closed 校验无 writer 冒进）；writer 仅在仍持 token
+# 时续 hash TTL。ARGV[1]=token、ARGV[2]=ttl。
+_PGATE_ACQ_SHARED_LUA = (
+    "local now = tonumber(redis.call('TIME')[1]) "
+    "redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now) "
+    "if redis.call('hget', KEYS[1], 'w') then return 0 end "
+    "redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[1]) "
+    "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]) * 2) return 1"
+)
+_PGATE_ACQ_EXCL_LUA = (
+    "local now = tonumber(redis.call('TIME')[1]) "
+    "redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now) "
+    "if redis.call('hget', KEYS[1], 'w') then return 0 end "
+    "if redis.call('ZCARD', KEYS[2]) > 0 then return 0 end "
+    "redis.call('hset', KEYS[1], 'w', ARGV[1]) "
+    "redis.call('expire', KEYS[1], ARGV[2]) return 1"
+)
+_PGATE_REL_SHARED_LUA = "redis.call('ZREM', KEYS[2], ARGV[1]) return 1"
+_PGATE_REL_EXCL_LUA = (
+    "if redis.call('hget', KEYS[1], 'w') == ARGV[1] then redis.call('hdel', KEYS[1], 'w') end return 1"
+)
+# renew 搭车续期。reader：先确认无 writer 冒进（fail-closed 返 0=已丢门），再刷自己那条 score。
+# writer：仅在 hash w 仍是自己的 token 时续 TTL（不误延他人）；否则返 0=已被替换（丢门）。
+_PGATE_RENEW_SHARED_LUA = (
+    "if redis.call('hget', KEYS[1], 'w') then return 0 end "
+    "local now = tonumber(redis.call('TIME')[1]) "
+    "redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[1]) "
+    "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]) * 2) return 1"
+)
+_PGATE_RENEW_EXCL_LUA = (
+    "if redis.call('hget', KEYS[1], 'w') == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) end return 0"
+)
+# 原子降级：整项目写者(ARGV[1]=旧 writer token) → N 个模块读者(ARGV[3..]=reader tokens)。一次
+# eval 内删写者+ZADD 全部读者=门态绝不空窗（无 pounce）。仅当写者仍是本 token 才降（防误改）。
+_PGATE_DOWNGRADE_LUA = (
+    "if redis.call('hget', KEYS[1], 'w') ~= ARGV[1] then return 0 end "
+    "redis.call('hdel', KEYS[1], 'w') "
+    "local now = tonumber(redis.call('TIME')[1]) "
+    "for i=3,#ARGV do redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[i]) end "
+    "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]) * 2) return 1"
+)
+# 模块 key 释放（H8：原子比对+删，仅当 value==自己的 token）——release / _release_key_only 共用。
+_LOCK_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
 def _invalidate_redis(exc: Exception) -> None:
     """H-1（外部深审）：缓存 client 操作抛异常（Redis 连上后故障/连接断）→ 作废缓存并
     进冷却，下次 get_redis 重探。get_redis 一旦连上就缓存 client（第 86 行）从不重探，
@@ -148,7 +281,8 @@ def _invalidate_redis(exc: Exception) -> None:
 class ModuleLock:
     """同项目同模块互斥锁（Redis SET NX + TTL）。"""
 
-    def __init__(self, project_id: str, module_key: str, *, ttl_sec: int = 3600):
+    def __init__(self, project_id: str, module_key: str, *, ttl_sec: int = 3600,
+                 project_wide: bool | None = None):
         self.project_id = project_id
         self.module_key = module_key
         self.key = f"swarm:lock:{project_id}:{module_key}"
@@ -172,6 +306,15 @@ class ModuleLock:
         # 若容忍跨越 ~TTL 秒，锁可能已在 Redis 过期而本进程仍自认持有 → 同进程另一同模块任务可
         # acquire 成功 → 双写。故除计数外再加【墙钟闸】：容忍期超 TTL*0.8 一律判失锁。
         self._last_ok_monotonic = 0.0
+        # H-3：项目读写门角色。default=写者(整项目排他)，其余模块键=读者(共享)。门是 default↔模块
+        # 唯一层级仲裁点。_gate_held=进程内门槽已持；_gate_redis_held=Redis 跨进程门层已叠加。
+        # 对抗复核 F3：role 优先用【显式 project_wide】而非 `module_key=="default"` 字符串比对——
+        # 否则写集里真有名为 `default` 的顶层目录时(module_keys_from_plan 派生出键 "default")会被
+        # 误判成整项目写者，与同组合锁内其它模块读者在同一门上写↔读自撞 → 该组合锁 100% 永远拿不到。
+        # MultiModuleLock 的子锁一律显式传 project_wide=False（它们永远是模块读者）。
+        self._is_project_wide = (module_key == "default") if project_wide is None else bool(project_wide)
+        self._gate_held = False
+        self._gate_redis_held = False
 
     def acquire(self) -> bool:
         # H-2 治本（外部深审 HIGH，对抗复核 F3 收口）：进程内 threading 锁作为【进程级权威
@@ -185,30 +328,41 @@ class ModuleLock:
         # 死锁）。与 release() 的 `if not self._held: return` 幂等语义对称。
         if self._held:
             return True
-        if not _local_lock_for(self.key).acquire(blocking=False):
-            # 同进程已有同 key 持有者（无论其经 Redis 还是纯本地）——非阻塞让位，调用方优雅延后。
+        # H-3：先过【项目读写门】——default=写者排他(排除所有模块读者+另一写者)，模块键=读者共享。
+        # 门是 default↔模块 唯一层级仲裁点；拿不到=有互斥角色在写整项目/本项目宽锁，非阻塞让位。
+        if not self._acquire_gate():
             self._held = False
             return False
-        self._local_held = True  # 已持进程级锁 → release 必释放它
+        if not self._acquire_key_only():
+            # 他进程经 Redis / 同进程经本地持有该 key → 释放门并让位（不留孤儿门槽）。
+            self._release_gate()
+            self._held = False
+            return False
+        self._held = True
+        return True
+
+    def _acquire_key_only(self) -> bool:
+        """获取 per-key 层（进程内 key 锁 + Redis SET NX），【不碰门】。用于 acquire 与降级取模块
+        key（降级时写者独占保护下调用，无争用）。不设 _held（由调用方/降级接管）。契约=永不抛只返 bool。"""
+        if not _local_lock_for(self.key).acquire(blocking=False):
+            # 同进程已有同 key 持有者（无论其经 Redis 还是纯本地）——非阻塞让位。
+            return False
+        self._local_held = True
         r = get_redis()
         if r is None:
             # B1：Redis 不可用 → 仅进程内互斥（多副本无跨进程互斥=split-brain 风险，首次 WARN）。
             _warn_lock_fail_open_once()
-            self._held = True
             self._redis_held = False
             return True
         try:
             ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
         except Exception as exc:  # noqa: BLE001
-            # H-1：SET 抛异常（缓存 client 已坏）绝不外泄——作废坏 client，本次退化为纯进程内锁
-            # （本地锁已持），契约=acquire 永不抛只返 bool。
+            # H-1：SET 抛异常（缓存 client 已坏）绝不外泄——作废坏 client，本次退化为纯进程内锁。
             _invalidate_redis(exc)
             _warn_lock_fail_open_once()
-            self._held = True
             self._redis_held = False
             return True
         if ok:
-            self._held = True
             self._redis_held = True  # 叠加跨进程互斥层
             self._last_ok_monotonic = time.monotonic()  # Item 1：墙钟基准
             return True
@@ -218,9 +372,104 @@ class ModuleLock:
         except RuntimeError:
             pass
         self._local_held = False
-        self._held = False
-        self._redis_held = False
         return False
+
+    def _release_key_only(self) -> None:
+        """释放 per-key 两层（Redis key + 进程内 key 锁），【不碰门】。release / 降级回滚共用。"""
+        if self._redis_held:
+            r = get_redis()
+            if r is None:
+                logger.warning(
+                    "[ModuleLock] release 时 Redis 不可用，锁 %s 的 Redis key 靠 TTL(%ds)过期回收",
+                    self.key, self.ttl_sec,
+                )
+            else:
+                try:
+                    r.eval(_LOCK_RELEASE_LUA, 1, self.key, self.token)
+                except Exception as exc:
+                    _invalidate_redis(exc)  # H-1：坏 client 作废重探（key 靠 TTL 回收）
+                    logger.debug("[ModuleLock] release: %s", exc)
+            self._redis_held = False
+        if self._local_held:
+            try:
+                _local_lock_for(self.key).release()
+            except RuntimeError as exc:
+                logger.warning("[ModuleLock] 进程内锁释放异常(锁=%s，疑重复释放): %s", self.key, exc)
+            self._local_held = False
+
+    def _acquire_gate(self) -> bool:
+        """H-3：过项目读写门（进程内权威 + Redis 跨进程叠加）。拿不到=互斥角色在场，返回 False。"""
+        g = _project_gate_for(self.project_id)
+        if self._is_project_wide:
+            if not g.acquire_exclusive(self.token):
+                return False
+        elif not g.acquire_shared(self.token):
+            return False
+        self._gate_held = True
+        r = get_redis()
+        if r is not None:
+            hk, zk = _pgate_key(self.project_id), _pgate_readers_key(self.project_id)
+            try:
+                if self._is_project_wide:
+                    ok = r.eval(_PGATE_ACQ_EXCL_LUA, 2, hk, zk, self.token, self.ttl_sec)
+                else:
+                    ok = r.eval(_PGATE_ACQ_SHARED_LUA, 2, hk, zk, self.token, self.ttl_sec)
+                if not ok:
+                    # 他进程经 Redis 持有互斥角色 → 回滚进程内门槽并让位。
+                    self._release_gate_local(g)
+                    return False
+                self._gate_redis_held = True
+            except Exception as exc:  # noqa: BLE001
+                # Redis 门 IO 失败 → 作废坏 client；本次退化为进程内门权威（不叠加跨进程层）。
+                _invalidate_redis(exc)
+        return True
+
+    def _release_gate_local(self, g: "_ProjectGate") -> None:
+        if self._is_project_wide:
+            g.release_exclusive(self.token)
+        else:
+            g.release_shared(self.token)
+        self._gate_held = False
+
+    def _release_gate(self) -> None:
+        if not self._gate_held:
+            return
+        g = _project_gate_for(self.project_id)
+        if self._gate_redis_held:
+            r = get_redis()
+            if r is not None:
+                hk, zk = _pgate_key(self.project_id), _pgate_readers_key(self.project_id)
+                try:
+                    if self._is_project_wide:
+                        r.eval(_PGATE_REL_EXCL_LUA, 2, hk, zk, self.token)
+                    else:
+                        r.eval(_PGATE_REL_SHARED_LUA, 2, hk, zk, self.token)
+                except Exception as exc:  # noqa: BLE001
+                    _invalidate_redis(exc)  # 坏 client 作废；门态由 TTL/score 兜底回收
+            self._gate_redis_held = False
+        self._release_gate_local(g)
+
+    def _renew_gate(self, r: Any) -> bool:
+        """renew 搭车续门（仅 Redis 门层持有时）。返回 False=Redis 侧【确认丢门】（写者 token 被
+        替换 / 读者遭遇写者冒进）→ 调用方 fail-closed（对抗复核 F1）。瞬时 IO 失败=容忍返 True
+        （与 key renew 瞬时语义一致，门态服务器侧仍在）。无 Redis 门层=无需续，返 True。"""
+        if not self._gate_redis_held or r is None:
+            return True
+        hk, zk = _pgate_key(self.project_id), _pgate_readers_key(self.project_id)
+        try:
+            if self._is_project_wide:
+                ok = r.eval(_PGATE_RENEW_EXCL_LUA, 2, hk, zk, self.token, self.ttl_sec)
+            else:
+                ok = r.eval(_PGATE_RENEW_SHARED_LUA, 2, hk, zk, self.token, self.ttl_sec)
+            if not ok:
+                self._gate_redis_held = False
+                logger.warning("[ModuleLock] H-3 项目门续期确认丢失(锁=%s，role=%s)→判失锁",
+                               self.key, "writer" if self._is_project_wide else "reader")
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _invalidate_redis(exc)  # 瞬时失败容忍（门态服务器侧仍在）；下次 get_redis 重探
+            return True
 
     def renew(self) -> bool:
         """续期持有中的锁 TTL（原子比对+EXPIRE，仅当 value==自己的 token）。
@@ -233,12 +482,18 @@ class ModuleLock:
         """
         if not self._held:
             return False
-        # H-2：纯进程内锁（Redis 宕机期获取或未叠加 Redis 层）不过期，renew 直接 no-op。否则
+        r = get_redis()
+        # H-3（对抗复核 F2）：项目门续期【独立于】key 的 _redis_held——两层各自的 Redis flag 可能
+        # 分叉（门 eval 成功但随后 key SET 抛异常→_gate_redis_held=True 而 _redis_held=False）。
+        # 门续期必须无条件先跑，否则长任务持门期间门键静默过期让互斥角色跨进程冒进。
+        gate_ok = self._renew_gate(r) if r is not None else True
+        if not gate_ok:
+            return False  # F1：Redis 侧确认丢门 → fail-closed
+        # H-2：纯进程内锁（Redis 宕机期获取或未叠加 Redis 层）不过期，key renew no-op。否则
         # renew 会对一把【从未 SET 进 Redis】的 key 跑 Lua GET → 恒返回 0 → 误判失锁（Redis
-        # 恢复后尤甚）。只有 _redis_held 的锁才需续 Redis TTL。
+        # 恢复后尤甚）。只有 _redis_held 的锁才需续 Redis key TTL。
         if not self._redis_held:
             return True
-        r = get_redis()
         if r is None:
             return True
         try:
@@ -278,34 +533,10 @@ class ModuleLock:
     def release(self) -> None:
         if not self._held:
             return
-        # H-2 治本：对称释放【两层】——始终释放已持的进程级本地锁；若还叠加了 Redis 层则再
-        # 原子删 Redis key。顺序无关（两层各自权威）；本地锁的释放不看当刻 Redis 状态（B1）。
-        if self._redis_held:
-            r = get_redis()
-            if r is None:
-                # release 时 Redis 挂 → 无法主动删 key，靠 TTL 过期回收（本地锁下面照常释放）。
-                logger.warning(
-                    "[ModuleLock] release 时 Redis 不可用，锁 %s 的 Redis key 靠 TTL(%ds)过期回收",
-                    self.key, self.ttl_sec,
-                )
-            else:
-                try:
-                    # H8：get-then-del 非原子→Lua 原子比对+删除，仅当 value==自己的 token 才删。
-                    _release_lua = (
-                        "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                        "return redis.call('del', KEYS[1]) else return 0 end"
-                    )
-                    r.eval(_release_lua, 1, self.key, self.token)
-                except Exception as exc:
-                    _invalidate_redis(exc)  # H-1：坏 client 作废重探（key 靠 TTL 回收）
-                    logger.debug("[ModuleLock] release: %s", exc)
-            self._redis_held = False
-        if self._local_held:
-            try:
-                _local_lock_for(self.key).release()
-            except RuntimeError as exc:
-                logger.warning("[ModuleLock] 进程内锁释放异常(锁=%s，疑重复释放): %s", self.key, exc)
-            self._local_held = False
+        # H-2 治本：对称释放【两层】——始终释放已持的进程级本地锁；若还叠加了 Redis 层则再原子删
+        # Redis key（_release_key_only）。H-3：再释放项目读写门。顺序无关（各层各自权威）。
+        self._release_key_only()
+        self._release_gate()
         self._held = False
 
 
@@ -366,16 +597,28 @@ def upgrade_module_lock(
     照跑——旧"default"与他人模块键不同串=零互斥，两任务并发写同一 git 树。
     新行为：目标=写集全部顶层目录的组合锁；获取失败抛 ModuleLockUpgradeConflict
     （调用方有界等待重试，绝不静默照跑）。单次尝试、不阻塞（本函数在事件循环内被
-    同步调用，等待由调用方 await 节拍执行）。"""
+    同步调用，等待由调用方 await 节拍执行）。
+
+    H-3（读写门治本）：旧锁若是【整项目写者】(default)，new_lock 的模块读者会被旧锁自己的写者门
+    挡住（写↔读互斥）——故此路径走【原子降级】：写者独占保护下取模块 key + 原子换门（不空窗），
+    绝不 acquire-before-release 自撞。失败=旧写者门原样保留，fail-loud 重试（调用方 lock 仍持有）。"""
     new_keys = module_keys_from_plan(plan)
     new_key = "+".join(new_keys)
     if new_key == lock.module_key:
         return lock
     new_lock = MultiModuleLock(project_id, new_keys, ttl_sec=lock.ttl_sec)
-    if not new_lock.acquire():
-        raise ModuleLockUpgradeConflict(
-            f"模块锁升级冲突：{lock.module_key} → {new_key}（目标键被其它任务持有）")
-    lock.release()
+    if getattr(lock, "_is_project_wide", False) and getattr(lock, "_held", False):
+        # 整项目写者 → 模块读者：原子降级（消除自撞与释放窗口）。
+        if not new_lock.acquire_by_downgrade(lock):
+            raise ModuleLockUpgradeConflict(
+                f"模块锁降级冲突：{lock.module_key} → {new_key}（模块键异常争用）")
+        lock.release()  # 释放旧 default 的 per-key（门已在降级内交出，release 跳过门）
+    else:
+        # 窄锁→更宽锁（非写者）：保持 acquire-before-release，避免释放窗口丢已持模块键。
+        if not new_lock.acquire():
+            raise ModuleLockUpgradeConflict(
+                f"模块锁升级冲突：{lock.module_key} → {new_key}（目标键被其它任务持有）")
+        lock.release()
     logger.info("[ModuleLock] upgraded %s → %s", lock.module_key, new_key)
     return new_lock
 
@@ -425,7 +668,9 @@ class MultiModuleLock:
         self.project_id = project_id
         self.module_key = "+".join(_uniq)
         self.ttl_sec = ttl_sec
-        self._locks = [ModuleLock(project_id, k, ttl_sec=ttl_sec) for k in _uniq]
+        # F3：子锁一律【模块读者】——即便写集里真有名为 "default" 的顶层目录派生出键 "default"，
+        # 也绝不当整项目写者（否则与同组合内其它读者在同一门自撞→该组合锁永不可达）。
+        self._locks = [ModuleLock(project_id, k, ttl_sec=ttl_sec, project_wide=False) for k in _uniq]
 
     def acquire(self) -> bool:
         got: list[ModuleLock] = []
@@ -453,6 +698,60 @@ class MultiModuleLock:
         for lk in self._locks:
             ok = lk.renew() and ok  # 全续；任一失败=失锁（与单锁语义一致 fail-closed）
         return ok
+
+    def acquire_by_downgrade(self, old_lock: "ModuleLock") -> bool:
+        """H-3（对抗复核）：从整项目【写者】old_lock 原子降级为本组合的【模块读者】。
+
+        写者独占期无并发者能持有任何模块键/门 → ①先在写者保护下取所有模块 key（无争用）；②原子
+        换门（写者→N 读者，一次临界区/一次 Lua，门态绝不空窗=无 pounce）；③把门态标记接管到各子锁。
+        任一步失败=回滚已取模块 key，old_lock 的写者门【原样保留】（调用方据此 fail-loud 重试，
+        绝不静默丢锁）。降级本身不应因【他人】冲突失败（写者在场无人可争）。"""
+        # 1) 写者独占保护下取所有模块 key（不碰门）。
+        got: list[ModuleLock] = []
+        for lk in self._locks:
+            if lk._acquire_key_only():
+                got.append(lk)
+            else:
+                for g in reversed(got):
+                    g._release_key_only()
+                return False
+        reader_tokens = [lk.token for lk in self._locks]
+        # 2) Redis 门层【先】原子降级（跨进程权威）——旧锁曾叠加 Redis 门层才做。对抗复核 2nd（CONFIRMED）：
+        #    Lua 返回 0 = 跨进程写者 token 已不匹配（TTL 失效期被他进程夺走）→ 绝不能视同成功（否则本
+        #    进程当读者写树、他进程当写者写树=双写）。硬失败回滚模块 key，旧写者门原样保留，fail-loud 重试。
+        had_redis_gate = old_lock._gate_redis_held
+        redis_gate_ok = False
+        if had_redis_gate:
+            r = get_redis()
+            if r is not None:
+                try:
+                    ok = r.eval(_PGATE_DOWNGRADE_LUA, 2, _pgate_key(self.project_id),
+                                _pgate_readers_key(self.project_id),
+                                old_lock.token, self.ttl_sec, *reader_tokens)
+                    if not ok:
+                        logger.warning("[ModuleLock] H-3 降级：Redis 写者 token 已不匹配(跨进程被夺/过期)"
+                                       "→ 硬失败回滚，fail-loud 重试（绝不双写）")
+                        for lk in reversed(got):
+                            lk._release_key_only()
+                        return False
+                    redis_gate_ok = True
+                except Exception as exc:  # noqa: BLE001
+                    _invalidate_redis(exc)  # 瞬时 IO 失败 → 退化为进程内门权威（旧写者键靠 TTL 兜底）
+        # 3) 进程内权威层原子换门（本进程持写者 → downgrade 恒成功；意外失败=不该发生，防御回滚）。
+        g = _project_gate_for(self.project_id)
+        if not g.downgrade(old_lock.token, reader_tokens):
+            logger.error("[ModuleLock] H-3 降级：进程内写者门意外丢失(不该发生)——回滚")
+            for lk in reversed(got):
+                lk._release_key_only()
+            return False
+        # 4) 门态标记接管到各子锁；旧锁交出门（其 per-key :default 仍由调用方 release() 回收）。
+        old_lock._gate_held = False
+        old_lock._gate_redis_held = False
+        for lk in self._locks:
+            lk._gate_held = True
+            lk._gate_redis_held = redis_gate_ok
+            lk._held = True
+        return True
 
 
 class TaskQueue:

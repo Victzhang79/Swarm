@@ -83,31 +83,49 @@ def test_e3_disjoint_writesets_run_in_parallel(monkeypatch):
 
 
 def test_e3_upgrade_conflict_raises_not_silent_keep(monkeypatch):
+    """H-3 后：整项目写者→模块读者走【原子降级】。降级取模块 key 若撞异常占用（crash 残留 /
+    另路径持 key）→ 抛 ModuleLockUpgradeConflict 且旧写者门【原样保留】（fail-loud，绝不静默丢锁）。"""
+    import swarm.infra.redis_client as rc
     monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
-    holder = ModuleLock("proj-4", "mod-y")
-    assert holder.acquire()
+    rc._reset_project_gates()
+    rc._LOCAL_LOCKS.clear()
     task_lock = ModuleLock("proj-4", "default")
-    assert task_lock.acquire()
-    with pytest.raises(ModuleLockUpgradeConflict):
-        upgrade_module_lock(task_lock, "proj-4", _plan("mod-y/src/A.java"))
-    # 冲突时原锁必须仍被持有（调用方等待期间互斥面不塌）
-    probe = ModuleLock("proj-4", "default")
-    assert probe.acquire() is False, "升级冲突后原锁不得被误释放"
-    holder.release(); task_lock.release()
+    assert task_lock.acquire()  # 整项目写者
+    # 模拟目标模块 key 被异常占用（crash 残留 / 另路径持该 key 本地锁）→ 降级取 key 必失败。
+    contended = rc._local_lock_for("swarm:lock:proj-4:mod-y")
+    assert contended.acquire(blocking=False)
+    try:
+        with pytest.raises(ModuleLockUpgradeConflict):
+            upgrade_module_lock(task_lock, "proj-4", _plan("mod-y/src/A.java"))
+        # 冲突后旧写者门【原样保留】——互斥面不塌：token 未交出、门仍持。
+        assert task_lock._held is True and task_lock._gate_held is True, "冲突后旧写者锁不得被误释放"
+    finally:
+        contended.release()
+        task_lock.release()
 
 
 def test_e3_upgrade_success_swaps_to_writeset_lock(monkeypatch):
+    """H-3 后：升级=写者→模块读者【原子降级】。升级后持模块读者 → default 写者被挡（读者在场），
+    另一无关模块可并行；组合锁全释放后 default 复可入。"""
+    import swarm.infra.redis_client as rc
     monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
+    rc._reset_project_gates()
     task_lock = ModuleLock("proj-5", "default")
     assert task_lock.acquire()
     new_lock = upgrade_module_lock(task_lock, "proj-5",
                                    _plan("mod-x/src/A.java", "mod-y/pom.xml"))
     assert new_lock.module_key == "mod-x+mod-y"
     assert new_lock.renew() is True, "组合锁 renew 接口与单锁同语义（runner 搭车续期）"
-    # 旧 default 已释放
+    # 降级后持模块读者：default 写者被挡（H-3 层级互斥），但无关模块可并行。
     probe = ModuleLock("proj-5", "default")
-    assert probe.acquire() is True
-    probe.release(); new_lock.release()
+    assert probe.acquire() is False, "升级后模块读者在场 → default 写者被挡"
+    other_mod = ModuleLock("proj-5", "mod-z")
+    assert other_mod.acquire() is True, "无关模块读者与升级后的读者并行（E3 不牺牲并行度）"
+    other_mod.release()
+    # 组合锁全释放 → 门槽清零 → default 复可入。
+    new_lock.release()
+    assert probe.acquire() is True, "组合锁释放后 default 复可入"
+    probe.release()
 
 
 # ─────────────── F6（同批补漏）：LLM 摘要不覆写用户 description ───────────────

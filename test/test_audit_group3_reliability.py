@@ -10,16 +10,42 @@ def test_h8_modulelock_token_unique():
     assert len(a.token) >= 16, "uuid hex 应足够长"
 
 
-def test_h8_release_uses_lua_atomic():
-    """H8：release 走 Lua 原子脚本（源码不应再有 get-then-del 两步）。"""
-    import inspect
+def test_h8_release_uses_lua_atomic(monkeypatch):
+    """H8：release 删 Redis key 走 Lua 原子脚本（比对+删除一次往返），绝不 get-then-del 两步。
 
-    from swarm.infra.redis_client import ModuleLock
-    src = inspect.getsource(ModuleLock.release)
-    assert "eval" in src, "release 应用 Lua eval 原子比对删除"
-    # 不应再有先 get 再 delete 的非原子两步
-    assert not ("r.get(self.key) == self.token" in src and "r.delete" in src), \
-        "不应保留 get-then-del 非原子写法"
+    行为断言（去 getsource 焊死）：用 fake redis 记录调用序列——release 必须调 eval（原子 Lua），
+    绝不出现 get 后再 delete 的非原子两步。"""
+    import swarm.infra.redis_client as rc
+    from swarm.infra.redis_client import ModuleLock, _LOCK_RELEASE_LUA
+
+    calls: list = []
+
+    class _FakeRedis:
+        def set(self, *a, **k):
+            calls.append(("set", a))
+            return True
+
+        def eval(self, script, numkeys, *a):
+            calls.append(("eval", script, a))
+            return 1
+
+        def get(self, *a, **k):
+            calls.append(("get", a))
+            return None
+
+        def delete(self, *a, **k):
+            calls.append(("delete", a))
+            return 1
+
+    monkeypatch.setattr(rc, "get_redis", lambda: _FakeRedis())
+    rc._reset_project_gates()
+    lk = ModuleLock("proj-h8", "modA")
+    assert lk.acquire() is True
+    calls.clear()
+    lk.release()
+    evals = [c for c in calls if c[0] == "eval"]
+    assert any(c[1] is _LOCK_RELEASE_LUA for c in evals), "release 应用 _LOCK_RELEASE_LUA 原子比对删除"
+    assert not any(c[0] == "delete" for c in calls), "绝不 get-then-del 非原子两步"
 
 
 def test_h2_l2_replan_counts_toward_limit():
