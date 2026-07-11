@@ -422,6 +422,61 @@ async def stop_task_scheduler() -> None:
     _wakeup = None
 
 
+async def await_execution_slot(task_id: str) -> bool:
+    """M-5（外部深审）：审批恢复也走 max_concurrent 准入——等到有空位（与初始任务共享 _inflight
+    账=统一并发天花板）再放行 resume，防【跨项目批量审批】瞬时 create_task 无界超卖模型/线程/
+    沙箱资源。返回 True=已占位（调用方 finally 必须 release_execution_slot）。
+
+    消费循环未运行（CLI/测试/未启动）→ 返回 False 不门控（那些环境本无准入面）。轮询而非复用
+    _loop 的 _wakeup（避免与消费循环共享 Event 的 set/clear 竞态）。单线程 asyncio 下"while 满则
+    await sleep；不满则原子 add"——最后一次 check 通过与 add 之间无 await → 不会超卖。fail-open
+    保险：等待超上界仍放行（防某槽泄漏使人工触发的 resume 永久挂死），留 WARNING 可观测。"""
+    if not is_consumer_running():
+        return False
+    # hunter F1：_inflight 是 set 非 refcount——同 task_id 的重复并发 resume 若都"占位"，后完成
+    # 者 release 会误删仍在跑者的槽位（欠计）。故只在【本次调用真正新增】时返回 True（调用方据此
+    # 决定是否 release）。等待前/等待后各查一次：本 task 已在账（被 claim_human_gate 上游挡掉的
+    # 极端并发或未来调用方）→ 直接返 False 不重复占位、不等待（交 resume_task 的 _task_running 早退）。
+    if task_id in _inflight:
+        return False
+    import time as _t
+    _t0 = _t.monotonic()
+    _cap = _slot_wait_cap_s()
+    while len(_inflight) >= _max_concurrent():
+        if _cap > 0 and (_t.monotonic() - _t0) >= _cap:
+            logger.warning(
+                "[Scheduler] resume 等并发额度超 %.0fs 仍未空（疑槽泄漏）→ fail-open 放行 task=%s",
+                _cap, task_id)
+            break
+        await asyncio.sleep(0.3)
+    if task_id in _inflight:  # 等待期间被另一并发同 task resume 抢先占位 → 不重复占/不 release
+        return False
+    _inflight.add(task_id)
+    return True
+
+
+def _slot_wait_cap_s() -> float:
+    """resume 等额度上界（秒），fail-open 保险丝。SWARM_RESUME_SLOT_WAIT_S 覆盖（>0 生效），
+    默认 300s；0=不设界（无限等）。"""
+    import os as _os
+    raw = _os.environ.get("SWARM_RESUME_SLOT_WAIT_S")
+    if raw:
+        try:
+            v = float(raw)
+            if v >= 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return 300.0
+
+
+def release_execution_slot(task_id: str) -> None:
+    """M-5：释放 await_execution_slot 占的额度并唤醒消费循环取下一个。"""
+    _inflight.discard(task_id)
+    if _wakeup is not None:
+        _wakeup.set()
+
+
 def _run_with_slot(task_id: str, meta: dict, start_fn) -> None:
     """执行任务并在完成时释放并发额度。"""
     import asyncio as _asyncio

@@ -2291,10 +2291,26 @@ def resume_task_background(
     async def _wrap() -> None:
         from swarm.logging_config import bind_task
 
+        # M-5（外部深审）：审批恢复走与初始任务【同一 max_concurrent 天花板】——图 interrupt 返回
+        # 时已释放调度槽，任务在等人审批期间不占额度；批量审批若直接 create_task 会无界超卖。
+        # 此处等到有空位再跑 resume，占位/释放对称（消费器未运行=CLI/测试则不门控）。
+        from swarm.brain import scheduler as _sched
+        _slotted = False
         with bind_task(task_id):
             try:
+                # hunter F2：准入是【优化】不是正确性闸——绝不能因它抛异常把已认领出审批态的
+                # 任务卡死（resume_task 才有回滚/SSE 通知的 umbrella）。故 fail-open：等额度失败
+                # 就直接跑 resume（宁可短暂过额，不留无错卡死态）。
+                try:
+                    _slotted = await _sched.await_execution_slot(task_id)
+                except Exception as _slot_exc:  # noqa: BLE001
+                    logger.warning("[Scheduler] resume 准入等待异常，fail-open 直跑 task=%s: %s",
+                                   task_id, _slot_exc)
+                    _slotted = False
                 await resume_task(task_id, decision, feedback, revert_status=revert_status)
             finally:
+                if _slotted:
+                    _sched.release_execution_slot(task_id)
                 _task_handles.pop(task_id, None)
 
     _task_handles[task_id] = asyncio.create_task(_wrap())
