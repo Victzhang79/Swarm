@@ -137,6 +137,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_PLAN_COVERAGE_GATE": "brain/nodes/__init__.py:1185",
     "SWARM_PLAN_COVERAGE_TOPUP": "brain/nodes/__init__.py:1718",
     "SWARM_PLAN_SINGLE_TIMEOUT": "brain/nodes/__init__.py:1972",
+    "SWARM_PLAN_SYMBOL_SURGERY": "brain/symbol_surgery.py:151",
     "SWARM_POOL_LIST_MAX_PAGES": "worker/sandbox_pool.py:508",
     "SWARM_PORT": "api/app.py:1929",
     "SWARM_PREPROCESS_TIMEOUT_SEC": "project/preprocess.py:28",

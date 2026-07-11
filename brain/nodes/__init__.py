@@ -1962,6 +1962,30 @@ async def plan(state: BrainState) -> dict:
             "[PLAN] P1 命中外科补齐路径：跳过全量重拆，复用上一版 %d 子任务定向补覆盖",
             len(task_plan.subtasks))
 
+    # ── R39-5 符号外科通道：C1 符号类/规则5 校验失败时【不全量重拆】──
+    # round39 死因：覆盖满足后 P1 让路，符号类失败只剩全量重拆，LLM 三轮缺口 71→71→68
+    # 不动白烧（D09 裸文本对符号缺口无效）。确定性修复=R39-4 脚手架注入+R39-2 符号挂靠，
+    # C1 同口径复核通过才放行；修不好 None 回退全量重拆（结构类失败的正当出口）。
+    if task_plan is None:
+        _sym_plan = None
+        try:
+            import asyncio as _sym_aio
+
+            from swarm.brain.symbol_surgery import maybe_symbol_repair
+            # 复核 MEDIUM：内含基线树 os.walk（存量豁免扫描），丢线程池防阻塞事件循环
+            _sym_plan = await _sym_aio.to_thread(
+                maybe_symbol_repair,
+                state, project_path=_get_project_path(state.get("project_id") or ""))
+        except ImportError as _sym_ie:
+            # hunter⑥：外科模块加载失败应优雅降级走常规路径，不炸 PLAN 节点成裸 FAILED
+            logger.warning("[PLAN] R39-5 符号外科不可用(%s) → 回退常规路径", _sym_ie)
+        if _sym_plan is not None:
+            task_plan = _sym_plan
+            _baseline_covered = state.get("baseline_covered")
+            # 同 P1 复核 CONFIRMED#1/#2：不触碰分批记账/缓存，原样带走 state 值
+            _plan_batch_failed = list(state.get("plan_batch_failed_modules") or [])
+            _plan_batch_cache = dict(state.get("plan_batch_cache") or {})
+
     # ── LLM 任务拆解 ──
     if task_plan is None:
       try:
@@ -2488,7 +2512,9 @@ async def validate_plan(state: BrainState) -> dict:
     # 无主符号占比超阈值 → 打回 PLAN（D09 回灌，熔断共用 plan_retry_count）。
     from swarm.brain.plan_validator import validate_contract_ownership as _vco
     _sc_own = state.get("shared_contract") or (getattr(plan_obj, "shared_contract", None) or {})
-    _co_result = _vco(plan_obj, _sc_own)
+    # R39-2 存量豁免：带 project_path，棕地基线已有同名文件的符号不算 unowned
+    _co_result = _vco(plan_obj, _sc_own,
+                      project_path=_get_project_path(state.get("project_id") or ""))
     for w in _co_result.warnings:
         _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] C1 契约对账: %s", w)

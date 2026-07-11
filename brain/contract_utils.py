@@ -6,6 +6,7 @@ import functools as _functools
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from swarm.types import SubTaskDifficulty, TaskPlan
@@ -232,6 +233,73 @@ def unclaimed_contract_deps(plan) -> list[dict]:
         if owner is None:
             out.append({"module": mod, "artifacts": arts})
     return out
+
+
+def inject_build_scaffold_subtasks(
+    plan, project_path: str | None = None,
+) -> list[dict]:
+    """R39-4：规则5 落空模块 → 确定性注入构建文件脚手架子任务（零 LLM）。
+
+    round39 三轮 VALIDATE 各 6 模块规则5 WARNING 无人消费（#30② 同病）；脚手架
+    此前只靠 prompts 叮嘱 LLM。本函数把落空模块的构建文件承接变成确定性动作：
+    - 注入子任务 owner `<module>/pom.xml`（沿用规则5 自身口径；Maven 专属为既有
+      产品决策，round24 A2 先例），契约 dependencies 全集随 contract 落地；
+    - 基线已有 pom → writable 修改，否则 create_files 新建（project_path 判存在）；
+    - 同模块写代码子任务 depends_on 脚手架（先有构建文件再编译）；脚手架自身无
+      上游依赖 → 结构上不可能成环；其它模块不受影响（不过度串行）；
+    - parallel_groups 完整性守约（validate_plan_structure 要求全员入组）。
+    返回机读清单 [{module, subtask_id, artifacts, pom_exists}]；无落空=[]（幂等）。
+    """
+    entries = unclaimed_contract_deps(plan)
+    if not entries:
+        return []
+    from swarm.types import FileScope, SubTask, TaskIntent
+    injected: list[dict] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    for entry in entries:
+        mod = entry["module"]
+        arts = list(entry["artifacts"])
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue  # 幂等兜底（正常情况下注入后 unclaimed 已清零走不到这）
+        pom = f"{mod}/pom.xml"
+        pom_exists = bool(project_path) and (Path(project_path) / pom).is_file()
+        scaffold = SubTask(
+            id=sid,
+            description=(
+                f"【构建脚手架】为模块 {mod} " + ("补齐" if pom_exists else "创建")
+                + f"构建文件 {pom}：一次性声明契约 dependencies 的全部 artifacts"
+                "（写代码的子任务碰不到构建文件，缺一个依赖=整模块编译失败）"),
+            intent=TaskIntent.MODIFY if pom_exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(
+                writable=[pom] if pom_exists else [],
+                create_files=[] if pom_exists else [pom]),
+            contract={"dependencies": [{"module": mod, "artifacts": arts}]},
+            acceptance_criteria=[
+                f"{pom} 声明契约 dependencies 全部 artifacts，模块构建命令通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        prefix = mod.rstrip("/") + "/"
+        for st in plan.subtasks:
+            if st.id == sid:
+                continue
+            sc = getattr(st, "scope", None)
+            writes = (list(getattr(sc, "create_files", None) or [])
+                      + list(getattr(sc, "writable", None) or []))
+            if any(str(f).replace("\\", "/").lstrip("/").startswith(prefix)
+                   for f in writes) and sid not in st.depends_on:
+                st.depends_on.append(sid)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid,
+                         "artifacts": arts, "pom_exists": pom_exists})
+    if injected:
+        logger.info(
+            "[SCAFFOLD-INJECT] 规则5 落空模块确定性注入脚手架 %d 个: %s",
+            len(injected), [e["module"] for e in injected])
+    return injected
 
 
 def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
@@ -746,13 +814,15 @@ def format_shared_contract_for_prompt(plan: TaskPlan | None) -> str:
         return str(plan.shared_contract)
 
 
-def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
-    """从共享契约提取需出现在变更中的【核心标识符】（非整句描述）。
+def contract_symbols_with_module(
+    shared_contract: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """contract_symbols 的带模块归属版（R39-2 单一事实源）。
 
-    task 2c019bc5：契约 apis 常是 "GET /system/device/list — 分页查询设备列表，参数：..."
-    这种带中文描述的整句。旧实现把整句当符号去 diff 精确匹配 → 必然找不到 → 误判契约偏离。
-    修复：抽核心标识——API 取 URL 路径段（/system/device/list → device/list 或末段），
-    类/方法/字段取其标识符 token。这样匹配的是代码里真会出现的东西，而非自然语言描述。
+    返回 [{"symbol": <核心标识符>, "module": <契约条目 module 字段，无则空串>}]，
+    符号序列与 contract_symbols 逐项同序同值——contract_symbols 委托本函数，
+    防"两份提取逻辑"漂移。module 归属来自 _merge_module_contracts D10 合并键，
+    是符号外科挂靠（symbol_surgery）的确定性依据。
     """
     if not shared_contract:
         return []
@@ -775,25 +845,84 @@ def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
         tok = re.search(r"[A-Za-z_]\w{2,}", s)
         return tok.group(0) if tok else ""
 
-    symbols: list[str] = []
+    entries: list[dict[str, str]] = []
     # C1 复核补漏：ULTRA 合并契约的 DTO 落在 "dtos" 键（CONTRACT_MODULE schema），
     # 旧列表只读 "types" → DTO 名对 C1 规划期对账 / L2 契约核验双盲。
+    # R39-3：kind=来源键，C1 硬/软分级消费（interfaces/types/apis/symbols 硬，
+    # dtos/fields/methods 软）；L2 全量消费不区分。
     for key in ("interfaces", "types", "dtos", "apis", "fields", "methods"):
         val = shared_contract.get(key)
         if isinstance(val, list):
             for item in val:
                 if isinstance(item, str):
-                    symbols.append(_core(item))
+                    entries.append({"symbol": _core(item), "module": "", "kind": key})
                 elif isinstance(item, dict):
-                    symbols.append(str(item.get("name") or item.get("id") or ""))
+                    entries.append({
+                        "symbol": str(item.get("name") or item.get("id") or ""),
+                        "module": str(item.get("module") or "").strip().rstrip("/"),
+                        "kind": key,
+                    })
         elif isinstance(val, dict):
-            symbols.extend(str(k) for k in val.keys())
+            entries.extend(
+                {"symbol": str(k), "module": "", "kind": key} for k in val.keys())
     for item in shared_contract.get("symbols", []) or []:
         if isinstance(item, str):
-            symbols.append(_core(item))
-    # 去重 + 过滤太短/HTTP 动词噪音
+            entries.append({"symbol": _core(item), "module": "", "kind": "symbols"})
+    # 去重（保首见及其 module 归属）+ 过滤太短/HTTP 动词噪音
     _noise = {"get", "post", "put", "delete", "patch", "the", "and", "for"}
-    return [s for s in dict.fromkeys(symbols) if s and len(s) >= 3 and s.lower() not in _noise]
+    seen: dict[str, dict[str, str]] = {}
+    for e in entries:
+        s = e["symbol"]
+        if s and len(s) >= 3 and s.lower() not in _noise and s not in seen:
+            seen[s] = e
+    return list(seen.values())
+
+
+def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
+    """从共享契约提取需出现在变更中的【核心标识符】（非整句描述）。
+
+    task 2c019bc5：契约 apis 常是 "GET /system/device/list — 分页查询设备列表，参数：..."
+    这种带中文描述的整句。旧实现把整句当符号去 diff 精确匹配 → 必然找不到 → 误判契约偏离。
+    修复：抽核心标识——API 取 URL 路径段（/system/device/list → device/list 或末段），
+    类/方法/字段取其标识符 token。这样匹配的是代码里真会出现的东西，而非自然语言描述。
+    实现委托 contract_symbols_with_module（R39-2）——单一提取逻辑，防两份事实。
+    """
+    return [e["symbol"] for e in contract_symbols_with_module(shared_contract)]
+
+
+def baseline_symbol_files(
+    symbols: list[str], project_path: str | None,
+) -> set[str]:
+    """R39-2 存量豁免依据：项目基线树里已有 `<Symbol>.<ext>` 同名文件的符号集。
+
+    棕地场景契约常引用存量类型（round39：C1 完全不查存量 → 已存在的符号也被判
+    unowned）。判据=文件名 stem 精确等于符号（确定性、栈无关：Java/TS/C# 等类文件
+    同名约定；不做内容 grep 防误命中注释）。跳过依赖/构建产物目录。
+    """
+    if not symbols or not project_path:
+        return set()
+    import os as _os
+    root = Path(project_path)
+    if not root.is_dir():
+        # hunter②：给了 project_path 却不是可用目录=存量豁免整体失效，绝不能与
+        # "真无存量"混同静默——否则棕地符号全落 unowned 硬性打回（round39 死因族）。
+        logger.warning(
+            "[baseline-scan] project_path 非有效目录，存量豁免失效（按无存量处理）: %s",
+            project_path)
+        return set()
+    want = {s for s in symbols if s}
+    hits: set[str] = set()
+    _skip = {".git", "node_modules", "target", "build", "dist", "out",
+             ".gradle", ".idea", ".vscode", "__pycache__", ".codegraph"}
+    for dirpath, dirnames, filenames in _os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _skip]
+        for fn in filenames:
+            stem = fn.rsplit(".", 1)[0]
+            if stem in want:
+                hits.add(stem)
+        if hits >= want:
+            break
+    return hits
 
 
 def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bool:

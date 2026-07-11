@@ -2,11 +2,16 @@
 from swarm.config.settings import ModelConfig, WorkerConfig
 
 
-def test_brain_primary_is_kimi():
-    """Brain 主模型 = Kimi-K2.7-Code，备 = GLM-5.1（用户拍板对调）。"""
+def test_brain_primary_fallback_configured_and_distinct():
+    """脑主/备模型是部署配置（.env 单一事实源，运维可随时对调主备）。
+
+    只断机制不变量：两者非空且互不相同（主备相同=切备失去意义）。不焊死具体
+    模型名——2026-07-11 主备对调再次实证焊死断言必被运维动作打红（disciplines:
+    禁结构焊死测试）。"""
     c = ModelConfig()
-    assert c.brain_primary == "zai-org/GLM-5.2", c.brain_primary
-    assert c.brain_fallback == "moonshotai/Kimi-K2.7-Code", c.brain_fallback
+    assert c.brain_primary and isinstance(c.brain_primary, str)
+    assert c.brain_fallback and isinstance(c.brain_fallback, str)
+    assert c.brain_primary != c.brain_fallback
 
 
 def test_worker_parallel_pool_tracks_live_config():

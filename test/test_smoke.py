@@ -50,8 +50,10 @@ def test_config():
 
     config = get_config()
     assert config.app_name == "Swarm"
-    assert config.model.brain_primary == "zai-org/GLM-5.2"
-    assert config.model.worker_primary == "MiniMax-M2.7-Pro"
+    # 路由模型名是部署配置（.env 单一事实源，可被运维随时对调主备），测试只断
+    # "已配置非空"这一机制不变量，不焊死具体模型名（2026-07-11 主备对调实证误报）。
+    assert config.model.brain_primary and isinstance(config.model.brain_primary, str)
+    assert config.model.worker_primary and isinstance(config.model.worker_primary, str)
     assert config.worker.max_concurrent == 4
 
     print("  ✅ config — 配置系统正常")
@@ -62,8 +64,8 @@ def test_model_router():
     from swarm.models.router import ModelRouter
 
     router = ModelRouter()
-    # 验证路由器能创建（不实际调用 API）
-    assert router.config.brain_primary == "zai-org/GLM-5.2"
+    # 验证路由器能创建（不实际调用 API）；模型名是部署配置不焊死（同 test_config）
+    assert router.config.brain_primary and isinstance(router.config.brain_primary, str)
     assert router.config.worker_primary == "MiniMax-M2.7-Pro"
 
     print("  ✅ models — 模型路由正常")

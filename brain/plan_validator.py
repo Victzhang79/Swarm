@@ -408,63 +408,116 @@ def covered_req_ids(matrix: dict) -> list[str]:
     return sorted(ids)
 
 
-def validate_contract_ownership(plan, shared_contract) -> PlanValidationResult:
+def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
+    """C1 owner 匹配判定（R39-2 抽出为单一口径：C1 闸与 symbol_surgery 共用）。
+
+    owner 判据（零 LLM）：某子任务的 description/acceptance_criteria/contract
+    词边界命中（与 verify._d5_attribute_owners 同口径），或 create_files/writable
+    文件名命中（<Symbol>.<ext>）。返回无 owner 符号列表（保输入序）。"""
+    import json as _json
+    import re as _re
+
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    if not symbols or not subtasks:
+        return []
+    corpus: dict[str, str] = {}
+    files_by_st: dict[str, list[str]] = {}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        corpus[st.id] = (
+            (getattr(st, "description", "") or "") + " "
+            + " ".join(getattr(st, "acceptance_criteria", None) or [])
+            + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
+        ).lower()
+        files_by_st[st.id] = [
+            str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
+            for f in (list(getattr(sc, "create_files", None) or [])
+                      + list(getattr(sc, "writable", None) or []))]
+    unowned: list[str] = []
+    for sym in symbols:
+        s = str(sym).lower()
+        pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
+        hit = any(pat.search(txt) for txt in corpus.values()) or any(
+            b.startswith(s + ".") for bl in files_by_st.values() for b in bl)
+        if not hit:
+            unowned.append(str(sym))
+    return unowned
+
+
+def validate_contract_ownership(
+    plan, shared_contract, project_path: str | None = None,
+) -> PlanValidationResult:
     """C1（round38c 主题C）：契约符号→owner 确定性对账——D5 从 VERIFY_L2 前移到 PLAN 期。
 
     round38c 死因链头：24 个契约接口从未进任何子任务语料，规划期两张皮，8 小时后
     L2 才第一次对账爆缺失 16/24 → 全员清零（A1 已封死清零，本函数掐断"两张皮"本身）。
-    规则（零 LLM）：每个 shared_contract 符号必须有 owner——某子任务的
-    description/acceptance_criteria/contract 词边界命中（与 verify._d5_attribute_owners
-    同口径），或 create_files/writable 文件名命中（<Symbol>.<ext>）。
+    规则（零 LLM）：owner 判据见 unowned_contract_symbols（单一口径）。
     无主符号占比 > SWARM_CONTRACT_UNOWNED_RATIO（默认 0.4，与 L2 缺失阈值同源）→
     invalid 走 D09 回灌打回（feedback 教 PLAN 怎么修）；否则逐条 warn（可观测不烧重试）。
-    规则5 落空依赖（unclaimed_contract_deps）并入 warnings（旧纯 log 无人消费）。"""
-    import json as _json
+    规则5 落空依赖（unclaimed_contract_deps）并入 warnings（旧纯 log 无人消费）。
+    R39-2 存量豁免：project_path 非空时，基线树已有 `<Symbol>.<ext>` 同名文件的
+    符号视为存量承接不算 unowned（round39：棕地存量符号被判无主是误伤面）。"""
     import os as _os
-    import re as _re
 
-    from swarm.brain.contract_utils import contract_symbols, unclaimed_contract_deps
+    from swarm.brain.contract_utils import (
+        baseline_symbol_files,
+        contract_symbols_with_module,
+        unclaimed_contract_deps,
+    )
     result = PlanValidationResult(valid=True)
-    symbols = contract_symbols(shared_contract or {})
+    entries = contract_symbols_with_module(shared_contract or {})
+    symbols = [e["symbol"] for e in entries]
     subtasks = list(getattr(plan, "subtasks", None) or [])
     if symbols and subtasks:
-        corpus: dict[str, str] = {}
-        files_by_st: dict[str, list[str]] = {}
-        for st in subtasks:
-            sc = getattr(st, "scope", None)
-            corpus[st.id] = (
-                (getattr(st, "description", "") or "") + " "
-                + " ".join(getattr(st, "acceptance_criteria", None) or [])
-                + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
-            ).lower()
-            files_by_st[st.id] = [
-                str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
-                for f in (list(getattr(sc, "create_files", None) or [])
-                          + list(getattr(sc, "writable", None) or []))]
-        unowned: list[str] = []
-        for sym in symbols:
-            s = str(sym).lower()
-            pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
-            hit = any(pat.search(txt) for txt in corpus.values()) or any(
-                b.startswith(s + ".") for bl in files_by_st.values() for b in bl)
-            if not hit:
-                unowned.append(str(sym))
+        unowned = unowned_contract_symbols(plan, symbols)
+        if unowned and project_path:
+            _base_hits = baseline_symbol_files(unowned, project_path)
+            if _base_hits:
+                logger.info(
+                    "[C1] 存量豁免 %d 符号（基线树同名文件承接）: %s",
+                    len(_base_hits), sorted(_base_hits)[:8])
+                # hunter⑤：豁免决策进 state 级 warnings（唯一审计痕不能只活在
+                # 日志里——运维把日志级别调到 WARNING 就蒸发）
+                for _sym in sorted(_base_hits)[:20]:
+                    result.warn(f"契约符号 {_sym} 由基线存量文件承接（存量豁免，"
+                                "不要求新 owner）")
+                unowned = [s for s in unowned if s not in _base_hits]
         if unowned:
+            # R39-3 硬/软分级：C1 原始意图是"接口两张皮"（round38c 24 接口从未进
+            # 计划语料）；DTO/字段/方法名随其宿主文件落地，不必逐名出现在子任务语料
+            # ——round39 胖契约 67 DTO 全算硬性把 40% 阈值顶爆=FAILED@PLAN 直接死因。
+            # 成员符号（X.Y 且 X 已在符号集，如 AlarmSimpleUtil.Builder）是边界重叠
+            # 自并膨胀产物，同样降软。软性 unowned 保留 warn 可观测，L2 全量消费不变。
+            _HARD_KINDS = {"interfaces", "types", "apis", "symbols"}
+            _kind_of = {e["symbol"]: e.get("kind", "") for e in entries}
+            _sym_set = set(symbols)
+
+            def _is_soft(s: str) -> bool:
+                if _kind_of.get(s) not in _HARD_KINDS:
+                    return True
+                return "." in s and s.split(".", 1)[0] in _sym_set
+
+            hard_unowned = [s for s in unowned if not _is_soft(s)]
+            soft_unowned = [s for s in unowned if _is_soft(s)]
+            hard_total = sum(1 for s in symbols if not _is_soft(s))
             try:
                 ratio_cap = float(_os.environ.get("SWARM_CONTRACT_UNOWNED_RATIO", "0.4"))
             except (TypeError, ValueError):
                 ratio_cap = 0.4
-            ratio = len(unowned) / max(len(symbols), 1)
-            if ratio > ratio_cap:
+            ratio = len(hard_unowned) / max(hard_total, 1)
+            if hard_unowned and ratio > ratio_cap:
                 result.add(
-                    f"契约符号无 owner 子任务承接 {len(unowned)}/{len(symbols)}"
-                    f"（占比 {ratio:.0%} 超阈值 {ratio_cap:.0%}）: {', '.join(unowned[:12])}"
+                    f"契约符号无 owner 子任务承接 {len(hard_unowned)}/{hard_total}"
+                    f"（占比 {ratio:.0%} 超阈值 {ratio_cap:.0%}）: {', '.join(hard_unowned[:12])}"
                     "——每个契约符号必须由某个子任务负责产出：在该子任务的 description/"
                     "contract 中点名符号，或在其 create_files 安排 <符号名>.<扩展名> 文件")
             else:
-                for sym in unowned[:20]:
+                for sym in hard_unowned[:20]:
                     result.warn(f"契约符号 {sym} 无 owner 子任务（L2 将按 D5 归因定向重派，"
                                 "建议规划期即安排 owner）")
+            for sym in soft_unowned[:20]:
+                result.warn(f"契约软性符号 {sym} 无 owner（dtos/fields/methods/成员符号"
+                            "随宿主文件落地，不计入打回比率；L2 D5 仍全量核验）")
     for entry in unclaimed_contract_deps(plan):
         result.warn(
             f"规则5：模块 {entry['module']} 的 {len(entry['artifacts'])} 个依赖契约"
