@@ -176,11 +176,14 @@ def _c2_missing_symbols(subtask, shared_contract: dict, diff: str) -> list[str]:
     """C2（round38c 主题C）：本子任务【归属】的 shared_contract 符号中未出现在其 diff
     的清单。归属口径与 C1 validate_contract_ownership/verify D5 同源：子任务
     description/acceptance_criteria/contract 词边界命中，或 create_files/writable
-    文件名 <Symbol>.<ext> 命中。纯函数可测。"""
+    文件名按命名惯例等价命中（R42 复核 F1：C1 换 basename_owns_symbol 后 C2 沿用
+    字面 <Symbol>.<ext> 会对 I 前缀/Impl 惯例文件永不认主=同口径不变量被击穿，
+    该符号类的"owned 必须现身 diff"检查结构性失火）。纯函数可测。"""
     import json as _json
     import re as _re
 
     from swarm.brain.contract_utils import contract_symbols
+    from swarm.brain.plan_validator import basename_owns_symbol
     symbols = contract_symbols(shared_contract or {})
     if not symbols:
         return []
@@ -190,15 +193,22 @@ def _c2_missing_symbols(subtask, shared_contract: dict, diff: str) -> list[str]:
         + " ".join(getattr(subtask, "acceptance_criteria", None) or [])
         + " " + _json.dumps(getattr(subtask, "contract", None) or {}, ensure_ascii=False)
     ).lower()
-    basenames = [str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
-                 for f in (list(getattr(sc, "create_files", None) or [])
-                           + list(getattr(sc, "writable", None) or []))]
+    stems = [str(f).replace("\\", "/").rsplit("/", 1)[-1].split(".", 1)[0]
+             for f in (list(getattr(sc, "create_files", None) or [])
+                       + list(getattr(sc, "writable", None) or []))]
+    # F2 同款最长符号优先消歧：装饰前缀误配的短符号不在本子任务的归属集里
+    _syms = [str(x) for x in symbols]
+    file_owned: set[str] = set()
+    for b in stems:
+        matched = [y for y in _syms if basename_owns_symbol(b, y)]
+        if matched:
+            file_owned.add(max(matched, key=len))
     dl = (diff or "").lower()
     missing: list[str] = []
     for sym in symbols:
         s = str(sym).lower()
         pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
-        owned = bool(pat.search(corpus)) or any(b.startswith(s + ".") for b in basenames)
+        owned = str(sym) in file_owned or bool(pat.search(corpus))
         if owned and s not in dl:
             missing.append(str(sym))
     return sorted(missing)

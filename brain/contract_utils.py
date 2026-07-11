@@ -928,12 +928,21 @@ def baseline_symbol_files(
     hits: set[str] = set()
     _skip = {".git", "node_modules", "target", "build", "dist", "out",
              ".gradle", ".idea", ".vscode", "__pycache__", ".codegraph"}
+    # R42：命名惯例等价（棕地存量 ISysRoleService.java 承接符号 SysRoleService 同病
+    # 同治）。复核 F3：只开 ①②③ 通道（decorated_prefix=False）——④ 装饰前缀在
+    # 5k 文件棕地树上豁免半径失控（ISysUserService 会豁免一切 *UserService 新符号，
+    # 缺实现静默漂到 L2 且子串核验兜不住）。
+    from swarm.brain.plan_validator import basename_owns_symbol
     for dirpath, dirnames, filenames in _os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _skip]
         for fn in filenames:
             stem = fn.rsplit(".", 1)[0]
             if stem in want:
                 hits.add(stem)
+                continue
+            for s in want - hits:
+                if basename_owns_symbol(stem, s, decorated_prefix=False):
+                    hits.add(s)
         if hits >= want:
             break
     return hits

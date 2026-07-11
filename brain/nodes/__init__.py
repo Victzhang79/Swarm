@@ -2553,9 +2553,13 @@ async def validate_plan(state: BrainState) -> dict:
     # 无主符号占比超阈值 → 打回 PLAN（D09 回灌，熔断共用 plan_retry_count）。
     from swarm.brain.plan_validator import validate_contract_ownership as _vco
     _sc_own = state.get("shared_contract") or (getattr(plan_obj, "shared_contract", None) or {})
-    # R39-2 存量豁免：带 project_path，棕地基线已有同名文件的符号不算 unowned
-    _co_result = _vco(plan_obj, _sc_own,
-                      project_path=_get_project_path(state.get("project_id") or ""))
+    # R39-2 存量豁免：带 project_path，棕地基线已有同名文件的符号不算 unowned。
+    # R42 复核 F4：内含基线树 os.walk（baseline_symbol_files），与 R39-5 外科调用
+    # 同理（nodes:1986 复核 MEDIUM）丢线程池，不阻塞事件循环——此前直调是漏配。
+    import asyncio as _vco_aio
+    _co_result = await _vco_aio.to_thread(
+        _vco, plan_obj, _sc_own,
+        project_path=_get_project_path(state.get("project_id") or ""))
     for w in _co_result.warnings:
         _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] C1 契约对账: %s", w)

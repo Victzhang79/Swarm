@@ -408,12 +408,49 @@ def covered_req_ids(matrix: dict) -> list[str]:
     return sorted(ids)
 
 
+def basename_owns_symbol(stem: str, sym: str,
+                         decorated_prefix: bool = True) -> bool:
+    """R42：文件名主干是否按【确定性命名惯例等价】承接契约符号（零 LLM 单一口径）。
+
+    round42 死因实锤：契约符号 AlarmTaskService ↔ 计划文件 IAlarmTaskService.java +
+    AlarmTaskServiceImpl.java（RuoYi I 前缀接口/Impl 实现惯例）、NotifyUserService ↔
+    IAlarmNotifyUserService.java（再加项目前缀装饰）——plan 按栈惯例命名没错，字面
+    basename 对账把 21/26 判无主，三轮教育 LLM 也"修不对"（错的是口径不是 plan）。
+    等价规则：
+      ① 精确：stem == Symbol
+      ② 接口 I 前缀：stem == "I"+Symbol
+      ③ 实现 Impl 后缀：剥尾部 Impl 后回到 ①/②
+      ④ 装饰前缀（项目/模块名，如 Alarm+NotifyUserService）：Symbol ≥8 字符时
+         【大小写敏感】CamelCase 词边界后缀匹配（半词 Taskservice≠TaskService）。
+    ④ 是"宁误勿漏"通道：同一 stem 可同时命中长短两个契约符号（AlarmTaskServiceImpl
+    命中 AlarmTaskService 也命中 TaskService）——真缺的短符号会被吞掉，且 L2 契约
+    核验是子串匹配（taskservice ⊂ alarmtaskservice）**兜不住**这类遮蔽（复核 F2
+    CONFIRMED）。调用方消费文件通道时必须做【最长符号优先消歧】（见
+    unowned_contract_symbols）；无全量符号清单的场景（棕地基线豁免）传
+    decorated_prefix=False 关掉 ④（复核 F3：5k 文件树上 ISysUserService 会豁免
+    一切 *UserService 新符号，豁免半径失控）。"""
+    s = str(stem or "")
+    y = str(sym or "")
+    if not s or not y:
+        return False
+    if s.lower().endswith("impl") and len(s) > 4:
+        s = s[:-4]
+    sl, yl = s.lower(), y.lower()
+    if sl == yl or sl == "i" + yl:
+        return True
+    if decorated_prefix and len(y) >= 8 and len(s) > len(y) and s.endswith(y):
+        return s[len(s) - len(y)].isupper()
+    return False
+
+
 def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
     """C1 owner 匹配判定（R39-2 抽出为单一口径：C1 闸与 symbol_surgery 共用）。
 
     owner 判据（零 LLM）：某子任务的 description/acceptance_criteria/contract
     词边界命中（与 verify._d5_attribute_owners 同口径），或 create_files/writable
-    文件名命中（<Symbol>.<ext>）。返回无 owner 符号列表（保输入序）。"""
+    文件名按命名惯例等价命中（basename_owns_symbol，R42：字面 <Symbol>.<ext>
+    对 RuoYi I 前缀/Impl 惯例结构性落空是 round42 FAILED@PLAN 直接死因）。
+    返回无 owner 符号列表（保输入序）。"""
     import json as _json
     import re as _re
 
@@ -421,7 +458,7 @@ def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
     if not symbols or not subtasks:
         return []
     corpus: dict[str, str] = {}
-    files_by_st: dict[str, list[str]] = {}
+    stems_by_st: dict[str, list[str]] = {}
     for st in subtasks:
         sc = getattr(st, "scope", None)
         corpus[st.id] = (
@@ -429,16 +466,27 @@ def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
             + " ".join(getattr(st, "acceptance_criteria", None) or [])
             + " " + _json.dumps(getattr(st, "contract", None) or {}, ensure_ascii=False)
         ).lower()
-        files_by_st[st.id] = [
-            str(f).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        # 保留原大小写主干：惯例等价的 CamelCase 边界判定需要大小写信息
+        stems_by_st[st.id] = [
+            str(f).replace("\\", "/").rsplit("/", 1)[-1].split(".", 1)[0]
             for f in (list(getattr(sc, "create_files", None) or [])
                       + list(getattr(sc, "writable", None) or []))]
+    # 文件通道（R42 复核 F2：最长符号优先消歧）——同一 stem 命中多个契约符号时只归
+    # 最长者：AlarmTaskServiceImpl 同时命中 AlarmTaskService（真 owner）与 TaskService
+    # （装饰前缀误配），若都算 owned 则真缺的 TaskService 被吞掉且 L2 子串核验兜不住。
+    _syms = [str(x) for x in symbols]
+    file_owned: set[str] = set()
+    for bl in stems_by_st.values():
+        for b in bl:
+            matched = [y for y in _syms if basename_owns_symbol(b, y)]
+            if matched:
+                file_owned.add(max(matched, key=len))
     unowned: list[str] = []
     for sym in symbols:
         s = str(sym).lower()
         pat = _re.compile(r"(?<![0-9a-z_])" + _re.escape(s) + r"(?![0-9a-z_])")
-        hit = any(pat.search(txt) for txt in corpus.values()) or any(
-            b.startswith(s + ".") for bl in files_by_st.values() for b in bl)
+        hit = str(sym) in file_owned or any(
+            pat.search(txt) for txt in corpus.values())
         if not hit:
             unowned.append(str(sym))
     return unowned
