@@ -134,6 +134,17 @@ def _local_lock_for(key: str) -> threading.Lock:
         return lk
 
 
+def _invalidate_redis(exc: Exception) -> None:
+    """H-1（外部深审）：缓存 client 操作抛异常（Redis 连上后故障/连接断）→ 作废缓存并
+    进冷却，下次 get_redis 重探。get_redis 一旦连上就缓存 client（第 86 行）从不重探，
+    坏 client 的后续 IO 会持续抛异常；acquire 的 SET 又在 runner 调用点 try 之外 → 异常
+    泄漏使 _task_running 残留、task_id 永判"已在执行中"死锁。作废后本次转内存兜底。"""
+    global _redis_client, _redis_unavailable_at
+    _redis_client = None
+    _redis_unavailable_at = time.monotonic()
+    logger.warning("[Redis] 缓存连接 IO 失败 → 作废重探 + 本次转内存兜底: %s", exc)
+
+
 class ModuleLock:
     """同项目同模块互斥锁（Redis SET NX + TTL）。"""
 
@@ -170,7 +181,18 @@ class ModuleLock:
             self._held = got
             self._local_held = got  # 经进程内锁获取 → release 也走进程内锁
             return got
-        ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
+        try:
+            ok = r.set(self.key, self.token, nx=True, ex=self.ttl_sec)
+        except Exception as exc:  # noqa: BLE001
+            # H-1（外部深审）：SET 抛异常（缓存 client 已坏）绝不外泄——runner acquire 在
+            # try 外，泄漏会残留 _task_running 使 task_id 永久死锁。作废坏 client + 转本地
+            # 锁 fallback（与 r is None 同路径），契约=acquire 永不抛，只返回 bool。
+            _invalidate_redis(exc)
+            _warn_lock_fail_open_once()
+            got = _local_lock_for(self.key).acquire(blocking=False)
+            self._held = got
+            self._local_held = got
+            return got
         self._held = bool(ok)
         self._local_held = False  # 经 Redis 获取 → release 走 Redis(即便届时 Redis 挂也不碰本地锁)
         if self._held:
@@ -207,6 +229,8 @@ class ModuleLock:
         except Exception as exc:  # noqa: BLE001
             # 对抗复核 4a：这是【瞬时】通信错误（网络超时/连接池/Redis 重启），不等于确认失锁。
             # 容忍到阈值前返回 True（不误杀长任务）；连续超阈值才判失锁（Redis 长时不可用=真降级）。
+            # H-1：作废坏 client 让下次 get_redis 重探（不改瞬时容忍语义——容忍逻辑照旧走下方）。
+            _invalidate_redis(exc)
             self._renew_transient_fails += 1
             # ★复核 Item 1★：墙钟闸——即便计数未到阈值，若距上次确认续期已 > TTL*0.8，Redis 侧锁
             # 极可能已过期(另一同模块任务可 acquire→双写) → 立即判失锁，不再容忍（安全 > 长任务存活）。
@@ -256,6 +280,8 @@ class ModuleLock:
             )
             r.eval(_release_lua, 1, self.key, self.token)
         except Exception as exc:
+            # H-1：作废坏 client（release 失败靠 TTL 回收，但坏 client 须重探）
+            _invalidate_redis(exc)
             logger.debug("[ModuleLock] release: %s", exc)
         self._held = False
 
