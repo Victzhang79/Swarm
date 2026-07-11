@@ -205,6 +205,14 @@ def _base_tree_listing(project_path: str | None, base_ref: str | None) -> list[s
         return None
 
 
+def _norm_scope_path(f) -> str:
+    """scope 路径归一（R41 复核 F5）：反斜杠→/、剥 './' 前缀与前导 '/'。"""
+    p = str(f).replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
 def unclaimed_contract_deps(plan) -> list[dict]:
     """C1/规则5 机读面（round38c：98 条 artifacts 落空纯 log 无消费）：返回无 pom owner
     承接且无法归并（多物理模块歧义）的契约依赖 entries [{module, artifacts}]，供
@@ -227,9 +235,13 @@ def unclaimed_contract_deps(plan) -> list[dict]:
         if not mod or not arts:
             continue
         mod_pom = f"{mod}/pom.xml"
+        # R41 复核 F5：归一后再比（./mod/pom.xml、反斜杠等写法的 owner 此前会被漏判
+        # → 重复注入 pom 写者 → T3 单写者归一把脚手架降成空 scope 壳子任务）
         owner = next((st for st in subtasks if mod_pom in (
-            list(getattr(getattr(st, "scope", None), "create_files", []) or [])
-            + list(getattr(getattr(st, "scope", None), "writable", []) or []))), None)
+            _norm_scope_path(f)
+            for f in (list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+                      + list(getattr(getattr(st, "scope", None), "writable", []) or []))
+        )), None)
         if owner is None:
             out.append({"module": mod, "artifacts": arts})
     return out
@@ -263,7 +275,9 @@ def inject_build_scaffold_subtasks(
         if sid in existing_ids:
             continue  # 幂等兜底（正常情况下注入后 unclaimed 已清零走不到这）
         pom = f"{mod}/pom.xml"
-        pom_exists = bool(project_path) and (Path(project_path) / pom).is_file()
+        # R41 复核 F5：project_path 未知（store 瞬时失败等）时保守按"已存在"走 MODIFY
+        # ——CREATE 会让 worker 现造最小 pom 盖掉基线真 pom（clobber 比漏改更致命）
+        pom_exists = (not project_path) or (Path(project_path) / pom).is_file()
         scaffold = SubTask(
             id=sid,
             description=(

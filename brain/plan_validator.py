@@ -525,7 +525,9 @@ def validate_contract_ownership(
     return result
 
 
-def validate_file_plan_ownership(plan, file_plan) -> PlanValidationResult:
+def validate_file_plan_ownership(
+    plan, file_plan, exclude_test_paths: bool = False,
+) -> PlanValidationResult:
     """R40-1(a)：file_plan 归属确定性闸——tech_design 规划的文件必须有 owner 子任务。
 
     round40 PARTIAL 直接死因：file_plan 43 文件里 3 个（含两个 ServiceImpl=BLOCKED
@@ -540,7 +542,7 @@ def validate_file_plan_ownership(plan, file_plan) -> PlanValidationResult:
     """
     result = PlanValidationResult(valid=True)
     subtasks = list(getattr(plan, "subtasks", None) or [])
-    files = normalized_file_plan_paths(file_plan)
+    files = normalized_file_plan_paths(file_plan, exclude_test_paths=exclude_test_paths)
     if len(subtasks) <= 1 or not files:
         return result
     owned_paths: set[str] = set()
@@ -559,11 +561,14 @@ def validate_file_plan_ownership(plan, file_plan) -> PlanValidationResult:
     return result
 
 
-def normalized_file_plan_paths(file_plan) -> list[str]:
+def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> list[str]:
     """R40-1 口径适配：原始 file_plan（str 或 {path} dict 混合）→ P5 去重后的归一路径列表。
 
     与 plan 批拆消费同一 dedupe_file_plan（单一事实源）——被 P5 按 basename 丢弃的
-    同名件不进校验分母，validate/repair 两侧共用本函数防口径分叉。"""
+    同名件不进校验分母，validate/repair 两侧共用本函数防口径分叉。
+    exclude_test_paths（R41 复核 F2）：任务未要求测试时 _strip_unrequested_tests 会把
+    测试文件从 scope 剥掉，但归属分母若仍计入=确定性弹跳（挂靠→剥离→打回→再挂靠，
+    修复通道每轮"成功"却永不过闸）——分母必须与剥离对称（谓词同源 _is_test_file_path）。"""
     from swarm.brain.plan_batch import dedupe_file_plan
     entries = []
     for f in (file_plan or []):
@@ -573,8 +578,12 @@ def normalized_file_plan_paths(file_plan) -> list[str]:
         elif str(f or "").strip():
             entries.append({"path": str(f)})
     deduped = dedupe_file_plan(entries)
-    return [str(e["path"]).replace("\\", "/").strip("/")
-            for e in deduped if isinstance(e, dict) and e.get("path")]
+    paths = [str(e["path"]).replace("\\", "/").strip("/")
+             for e in deduped if isinstance(e, dict) and e.get("path")]
+    if exclude_test_paths:
+        from swarm.brain.nodes.shared import _is_test_file_path
+        paths = [p for p in paths if not _is_test_file_path(p)]
+    return paths
 
 
 def validate_requirement_coverage(

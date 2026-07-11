@@ -143,6 +143,77 @@ _SYMBOL_ISSUE_MARKERS = ("契约符号无 owner", "规则5")
 _FILEPLAN_ISSUE_MARKER = "file_plan 文件无 owner"
 
 
+def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[str]]:
+    """R41-1 共享内核：file_plan 孤儿文件按【同顶层模块 + 共享路径前缀最深】确定性
+    挂靠到子任务 create_files（零 LLM、幂等）。
+
+    round41 死因：孤儿挂靠算法只活在 maybe_file_plan_repair 的互斥通道里
+    （task_plan is None 才走），P1 覆盖外科抢跑后缺件带病重验，最后一轮重试
+    原地复死——一个 sql 文件杀掉 90 子任务计划。抽成共享内核后：
+    - 外科通道保持 strict 语义（有挂不上的 → 调用方整体回退全量重拆）；
+    - PLAN 确定性收尾器 fail-open 语义（挂不上的留给 VALIDATE 如实打回）。
+    返回 (挂上数, 挂不上清单)。构建清单-only 脚手架不作候选（同 R39 CRITICAL 教训，
+    _subtask_modules 已滤权重）。
+    """
+    owned: set[str] = set()
+    for st in plan.subtasks:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            owned.add(str(f).replace("\\", "/").lstrip("/"))
+    missing = [f for f in (file_plan_paths or [])
+               if f.replace("\\", "/").lstrip("/") not in owned]
+
+    def _prefix_depth(a: str, b: str) -> int:
+        pa, pb = a.split("/"), b.split("/")
+        n = 0
+        for x, y in zip(pa, pb):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    attached, left = 0, []
+    for f in missing:
+        # 口径同源（复核 HIGH 修）：file_plan 已过 P5 权威去重，走到这的全是真缺件
+        # ——绝不再按 basename 豁免（自造豁免会静默放行"不同模块同名各建"的合法缺件）
+        p = f.replace("\\", "/").lstrip("/")
+        mod = p.split("/", 1)[0] if "/" in p else ""
+        best, best_key = None, (-1, -1)
+        for st in plan.subtasks:
+            mods = _subtask_modules(st)
+            if not mod or mod not in mods:
+                continue
+            sc = st.scope
+            depth = max((_prefix_depth(p, str(w).replace("\\", "/").lstrip("/"))
+                         for w in (list(sc.create_files) + list(sc.writable))),
+                        default=0)
+            key = (depth, mods[mod])
+            if key > best_key:
+                best, best_key = st, key
+        if best is None:
+            left.append(f)
+            continue
+        if p not in best.scope.create_files:
+            best.scope.create_files.append(p)
+            # 复核 F3：只挂 scope 不挂意图=worker prompt 永不提及该文件，L1 只拦
+            # "零 diff"不拦"缺单个文件"→ 静默丢交付物直通 DONE。挂靠必须同步注入
+            # 描述+验收标准，让 worker 拿到"要产出这个文件"的明示意图。
+            best.description = (best.description or "") + (
+                f"\n【收尾器挂靠】file_plan 规划了 {p} 但无子任务认领，"
+                f"按模块归属由你产出：必须创建该文件并实现其应有内容。")
+            if p not in " ".join(best.acceptance_criteria or []):
+                best.acceptance_criteria = list(best.acceptance_criteria or []) + [
+                    f"文件 {p} 已创建且内容完整"]
+        # 复核 F1：记录挂靠（#6 覆盖单调化 scope 身份配对两侧对称剔除，防键漂移丢 covers）
+        rec = plan.finisher_attached.setdefault(best.id, [])
+        if p not in rec:
+            rec.append(p)
+        owned.add(p)
+        attached += 1
+    return attached, left
+
+
 def maybe_file_plan_repair(state, project_path: str | None = None):
     """R40-1(b)：file_plan 缺件类校验失败 → 确定性挂靠修复，不全量重拆。
 
@@ -172,8 +243,12 @@ def maybe_file_plan_repair(state, project_path: str | None = None):
         logger.info("[FILEPLAN-SURGERY] 整模块分解失败 → 让位全量重拆")
         return None
     prior = state.get("plan")
+    from swarm.brain.nodes.shared import _task_requests_tests
     from swarm.brain.plan_validator import normalized_file_plan_paths
-    file_plan = normalized_file_plan_paths(state.get("tech_design_file_plan"))
+    # R41 复核 F2：分母口径与 VALIDATE/_strip_unrequested_tests 三方对称
+    _excl_tests = not _task_requests_tests(state.get("task_description") or "")
+    file_plan = normalized_file_plan_paths(
+        state.get("tech_design_file_plan"), exclude_test_paths=_excl_tests)
     if prior is None or not getattr(prior, "subtasks", None) or not file_plan:
         logger.warning("[FILEPLAN-SURGERY] 缺件类失败但无上一版 plan/file_plan → 全量重拆")
         return None
@@ -184,54 +259,18 @@ def maybe_file_plan_repair(state, project_path: str | None = None):
     if not validate_plan_structure(prior).valid:
         logger.warning("[FILEPLAN-SURGERY] 上一版结构不合法 → 结构失败归全量重拆")
         return None
-    verdict0 = validate_file_plan_ownership(prior, file_plan)
+    verdict0 = validate_file_plan_ownership(prior, file_plan,
+                                            exclude_test_paths=_excl_tests)
     if verdict0.valid:
         return None  # 缺件已不存在（别的维度失败），不越权
     candidate = prior.model_copy(deep=True)
-    owned = set()
-    for st in candidate.subtasks:
-        sc = getattr(st, "scope", None)
-        for f in (list(getattr(sc, "create_files", None) or [])
-                  + list(getattr(sc, "writable", None) or [])):
-            owned.add(str(f).replace("\\", "/").lstrip("/"))
-    missing = [f for f in file_plan
-               if f.replace("\\", "/").lstrip("/") not in owned]
-
-    def _prefix_depth(a: str, b: str) -> int:
-        pa, pb = a.split("/"), b.split("/")
-        n = 0
-        for x, y in zip(pa, pb):
-            if x != y:
-                break
-            n += 1
-        return n
-
-    attached = 0
-    for f in missing:
-        # 口径同源（复核 HIGH 修）：file_plan 已过 P5 权威去重，走到这的全是真缺件
-        # ——绝不再按 basename 豁免（自造豁免会静默放行"不同模块同名各建"的合法缺件）
-        p = f.replace("\\", "/").lstrip("/")
-        mod = p.split("/", 1)[0] if "/" in p else ""
-        best, best_key = None, (-1, -1)
-        for st in candidate.subtasks:
-            mods = _subtask_modules(st)
-            if not mod or mod not in mods:
-                continue
-            sc = st.scope
-            depth = max((_prefix_depth(p, str(w).replace("\\", "/").lstrip("/"))
-                         for w in (list(sc.create_files) + list(sc.writable))),
-                        default=0)
-            key = (depth, mods[mod])
-            if key > best_key:
-                best, best_key = st, key
-        if best is None:
-            logger.warning("[FILEPLAN-SURGERY] 缺件 %s 无同模块候选 → 回退全量重拆", f)
-            return None
-        if p not in best.scope.create_files:
-            best.scope.create_files.append(p)
-        owned.add(p)
-        attached += 1
-    verdict = validate_file_plan_ownership(candidate, file_plan)
+    attached, left = attach_orphan_file_plan_entries(candidate, file_plan)
+    if left:
+        # strict 语义：有挂不上的缺件 → 整体回退全量重拆（半修不放行）
+        logger.warning("[FILEPLAN-SURGERY] 缺件 %s 无同模块候选 → 回退全量重拆", left[0])
+        return None
+    verdict = validate_file_plan_ownership(candidate, file_plan,
+                                           exclude_test_paths=_excl_tests)
     if not verdict.valid:
         logger.warning("[FILEPLAN-SURGERY] 修后闸仍未过 → 回退全量重拆")
         return None

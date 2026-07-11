@@ -341,6 +341,14 @@ class TaskPlan(BaseModel):
         default_factory=dict,
         description="Brain 统一定义的跨子任务共享接口契约",
     )
+    # R41 复核 F1：确定性收尾器/缺件外科挂靠的孤儿文件记录 {subtask_id: [paths]}。
+    # #6 覆盖单调化按 scope 文件身份跨轮配对，挂靠会让 scope 键漂移（挂靠轮 vs 全量
+    # 重拆轮键不等 → covers 静默丢失不收敛）——配对两侧对称减去本记录即可还原 LLM
+    # 原始 scope 身份。随 plan 持久化（老 checkpoint 缺字段=默认空，零迁移）。
+    finisher_attached: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="收尾器/外科确定性挂靠的孤儿文件（scope 身份配对时剔除）",
+    )
 
     def get_ready_tasks(
         self, completed_ids: set[str], abandoned: set[str] | None = None

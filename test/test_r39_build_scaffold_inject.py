@@ -56,14 +56,16 @@ def _plan_two_modules():
     return plan
 
 
-def test_inject_creates_scaffold_for_unclaimed_module():
+def test_inject_creates_scaffold_for_unclaimed_module(tmp_path):
     plan = _plan_two_modules()
     assert len(unclaimed_contract_deps(plan)) == 2, "前置：两模块规则5 全落空"
-    injected = inject_build_scaffold_subtasks(plan)
+    # R41 复核 F5 语义更新：CREATE 需【确证基线无 pom】（传真实 project_path）；
+    # project_path 未知时保守 MODIFY（见 test_r41 F5 用例），防 clobber 基线 pom
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
     assert {e["module"] for e in injected} == {"mod-a", "mod-b"}
     sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
     sc_st = next(st for st in plan.subtasks if st.id == sid)
-    assert "mod-b/pom.xml" in sc_st.scope.create_files, "基线无 pom → create_files"
+    assert "mod-b/pom.xml" in sc_st.scope.create_files, "确证基线无 pom → create_files"
     assert sc_st.contract.get("dependencies"), "契约 dependencies 全集随脚手架落地"
     arts = sc_st.contract["dependencies"][0]["artifacts"]
     assert "org.springframework:spring-context" in arts

@@ -1384,21 +1384,31 @@ def _merge_prior_covers_by_scope(new_plan, old_plan, valid_req_ids: set) -> dict
     if not old_subs or not new_subs or not valid_req_ids:
         return {}
 
-    def _sk(st) -> tuple:
+    # R41 复核 F1：收尾器/缺件外科挂靠会让 scope 键跨轮漂移（挂靠轮 plan 带孤儿文件、
+    # 全量重拆轮 LLM 原始 scope 不带 → 键不等 → covers 静默丢失=#6 要杀的不收敛复活）。
+    # 两侧各自按本 plan 的 finisher_attached 记录对称剔除，还原 LLM 原始 scope 身份
+    # （外科 deepcopy 路径记录随 plan 一起复制，同样被剔除 → 两侧仍相等）。
+    _old_att = dict(getattr(old_plan, "finisher_attached", None) or {})
+    _new_att = dict(getattr(new_plan, "finisher_attached", None) or {})
+
+    def _sk(st, _att: dict) -> tuple:
         sc = getattr(st, "scope", None)
-        w = tuple(sorted(getattr(sc, "writable", []) or [])) if sc else ()
-        c = tuple(sorted(getattr(sc, "create_files", []) or [])) if sc else ()
+        ex = set(_att.get(getattr(st, "id", ""), []) or [])
+        w = tuple(sorted(f for f in (getattr(sc, "writable", []) or [])
+                         if f not in ex)) if sc else ()
+        c = tuple(sorted(f for f in (getattr(sc, "create_files", []) or [])
+                         if f not in ex)) if sc else ()
         return (w, c)
 
     from collections import Counter as _Counter
-    _oc = _Counter(_sk(s) for s in old_subs)
-    _nc = _Counter(_sk(s) for s in new_subs)
+    _oc = _Counter(_sk(s, _old_att) for s in old_subs)
+    _nc = _Counter(_sk(s, _new_att) for s in new_subs)
     _old_by_sk: dict = {}
     for s in old_subs:
-        _old_by_sk.setdefault(_sk(s), s)
+        _old_by_sk.setdefault(_sk(s, _old_att), s)
     injected: dict[str, set] = {}
     for ns in new_subs:
-        sk = _sk(ns)
+        sk = _sk(ns, _new_att)
         if sk == ((), ()) or _oc.get(sk) != 1 or _nc.get(sk) != 1:
             continue
         _os = _old_by_sk.get(sk)
@@ -2261,6 +2271,19 @@ async def plan(state: BrainState) -> dict:
             _baseline_covered = [
                 e for e in _baseline_covered if e.get("id") not in _covered_ids]
 
+    # R41 确定性收尾器：任何路径产出的 plan（P1/R39-5/R40-1 外科、LLM 重拆、ULTRA 分批）
+    # 进 VALIDATE 前统一消解机械可修缺口——①规则5 落空模块 pom 脚手架注入（原先只接线在
+    # 符号外科内部，外科回退时注入随候选蒸发）②file_plan 孤儿文件同模块挂靠（原先与 P1
+    # first-match-wins 互斥，round41 一个孤儿 sql 文件在最后一轮重试杀掉 90 子任务计划）。
+    # 位置=后处理区末端（复核 F1）：#6 覆盖单调化按 scope 身份配对，收尾器改 scope 必须
+    # 在其后；挂靠记录进 plan.finisher_attached 供 #6 跨轮对称剔除（_merge_prior_covers_
+    # by_scope 消费）。脚手架 harness 由收尾器自行 bootstrap（错过主循环）。
+    from swarm.brain.plan_finisher import finish_plan_deterministic
+    finish_plan_deterministic(
+        task_plan, state.get("tech_design_file_plan"),
+        project_path=_get_project_path(state.get("project_id") or ""),
+        task_description=task_description)
+
     plan_touch = touch_context(
         state,
         "plan",
@@ -2559,7 +2582,11 @@ async def validate_plan(state: BrainState) -> dict:
     # 才以 BLOCKED"无生产者的包"→连坐放弃爆发。打回带具体缺件清单（D09），plan
     # 侧 maybe_file_plan_repair 优先确定性挂靠不重拆。
     from swarm.brain.plan_validator import validate_file_plan_ownership as _vfpo
-    _fp_result = _vfpo(plan_obj, state.get("tech_design_file_plan") or [])
+    # R41 复核 F2：分母与 _strip_unrequested_tests 对称——任务未要求测试时测试路径
+    # 不进归属分母（否则挂靠→剥离→打回确定性弹跳，修复通道每轮"成功"却永不过闸）
+    from swarm.brain.nodes.shared import _task_requests_tests as _trt
+    _fp_result = _vfpo(plan_obj, state.get("tech_design_file_plan") or [],
+                       exclude_test_paths=not _trt(state.get("task_description") or ""))
     for w in _fp_result.warnings:
         _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属: %s", w)

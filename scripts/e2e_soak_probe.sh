@@ -38,15 +38,23 @@ for _line in open(".env"):
     _os.environ.setdefault(_k, _v.strip().strip('"').strip("'"))
 
 rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-# 模型名必须与 .env 路由配置一致
-MODELS = [
-    "zai-org/GLM-5.2",              # BRAIN_PRIMARY
-    "MiniMax-M2.7-Pro",             # WORKER_PRIMARY / ROUTING_MEDIUM
-    "Qwopus3.6-27B-v2-NVFP4",       # ROUTING_COMPLEX/MULTIMODAL
-    "Qwen3.6-27B-Saka-NVFP4",       # ROUTING_TRIVIAL
-    "moonshotai/Kimi-K2.7-Code",    # BRAIN_FALLBACK
-    "stepfun-ai/Step-3.7-Flash-FP8",# 本地 provider 显式映射
-]
+# ★模型清单从 config 动态派生（round41 治本）★：写死清单会与 .env 路由漂移——
+# 本脚本要抓的"③路由名与网关不一致"曾发生在脚本自身（Qwopus 下线后仍探旧名假红）。
+from swarm.config.settings import get_config
+_mc = get_config().model
+MODELS = []
+for _name in [
+    _mc.brain_primary, _mc.brain_fallback, _mc.worker_primary, _mc.worker_fallback,
+    _mc.routing_trivial, _mc.routing_medium, _mc.routing_complex, _mc.routing_multimodal,
+    # fallback 链也探（复核 LOW 补）：切备时真会上场（round41 Kimi 救回实证），
+    # 漏探=切备时才发现备用不可达。worker_local(Ollama 遗留字段)不探：不在网关路由面。
+    *_mc.routing_trivial_fallback, *_mc.routing_medium_fallback,
+    *_mc.routing_complex_fallback, *_mc.routing_multimodal_fallback,
+    *(_mc.model_providers or {}).keys(),
+]:
+    _name = (_name or "").strip()
+    if _name and _name not in MODELS:
+        MODELS.append(_name)
 router = ModelRouter()
 overall_ok = True
 for r in range(1, rounds + 1):
