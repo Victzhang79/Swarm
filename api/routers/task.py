@@ -288,7 +288,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
 @router.get("/api/tasks/{task_id}/stream", tags=["任务管理"])
 async def stream_task(task_id: str, request: Request):
     """SSE 流式推送任务 Brain 执行进度"""
-    from swarm.brain.runner import subscribe_task
+    from swarm.brain.runner import FanoutSubscriberLimitExceeded, subscribe_task
 
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
@@ -297,7 +297,11 @@ async def stream_task(task_id: str, request: Request):
     await _require_task_access_async(request, task, task_id, "task:read")
 
     # N-CW1/N-CW2：每个连接订阅【自己的】队列（多端互不抢事件），断开时注销回收。
-    topic, queue = subscribe_task(task_id)
+    # M-4：订阅者数达硬上限 → 429（防单成员无限开连接压内存/socket/周期鉴权）。
+    try:
+        topic, queue = subscribe_task(task_id)
+    except FanoutSubscriberLimitExceeded as _exc:
+        raise HTTPException(status_code=429, detail="任务进度订阅连接数已达上限，请稍后重试") from _exc
 
     async def event_generator():
         try:
@@ -372,7 +376,14 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         return
 
     # N-CW1/N-CW2：独立订阅 + 断开注销
-    topic, queue = subscribe_task(task_id)
+    # M-4：订阅者数达硬上限 → 拒绝（1013 try-again-later），防单成员无限开连接压内存/socket。
+    from swarm.brain.runner import FanoutSubscriberLimitExceeded
+    try:
+        topic, queue = subscribe_task(task_id)
+    except FanoutSubscriberLimitExceeded:
+        await websocket.send_json({"event": "error", "data": {"detail": "订阅连接数已达上限，请稍后重试"}})
+        await websocket.close(code=1013)  # 1013 = Try Again Later
+        return
 
     try:
         while True:

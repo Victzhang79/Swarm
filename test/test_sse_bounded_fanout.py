@@ -48,17 +48,23 @@ def test_slow_subscriber_does_not_block_others():
     assert slow.qsize() <= slow.maxsize
 
 
-def test_subscriber_soft_cap_warns(monkeypatch):
-    """订阅者数超软上限 → 告警（可观测），但不硬拒（SSE 仍可连）。
+def test_subscriber_hard_cap_rejects(monkeypatch):
+    """M-4：订阅者数达硬上限 → 告警【且硬拒】（抛 FanoutSubscriberLimitExceeded，端点转 429/1013）。
 
-    不用 caplog：全量套件里先跑的测试会触发 _configure_app_logging 把 swarm logger
-    设为不向 root 传播，caplog（挂 root）就收不到 → 顺序相关 flaky。直接在 runner
-    的 logger 上挂 handler 断言，不依赖传播链。
+    旧行为仅软告警照连 → 成员可无限开连接压内存/socket/周期鉴权；M-4 改硬上限。
+    不用 caplog：全量套件里先跑的测试会触发 _configure_app_logging 把 swarm logger 设为不向 root
+    传播，caplog（挂 root）就收不到 → 顺序相关 flaky。直接在 runner 的 logger 上挂 handler 断言。
     """
     import logging
+
+    import pytest
+
     from swarm.brain import runner
+    from swarm.brain.runner import FanoutSubscriberLimitExceeded
 
     monkeypatch.setattr(runner, "_MAX_SUBS_PER_TASK", 2)
+    monkeypatch.setattr(runner, "_GLOBAL_MAX_SUBS", 1000)
+    monkeypatch.setattr(runner, "_global_sub_count", 0)
     records: list[logging.LogRecord] = []
 
     class _Capture(logging.Handler):
@@ -71,13 +77,15 @@ def test_subscriber_soft_cap_warns(monkeypatch):
     runner.logger.setLevel(logging.WARNING)
     try:
         t = runner._FanoutTopic(history=0)
-        for _ in range(4):
-            t.subscribe()
+        t.subscribe()
+        t.subscribe()  # 占满硬上限 2
+        with pytest.raises(FanoutSubscriberLimitExceeded):
+            t.subscribe()  # 第 3 个硬拒（旧行为=照连）
     finally:
         runner.logger.removeHandler(handler)
         runner.logger.setLevel(old_level)
     msgs = [r.getMessage() for r in records]
-    assert any("订阅者" in m or "subscriber" in m.lower() for m in msgs), f"未捕获软上限告警: {msgs}"
+    assert any("订阅者" in m or "subscriber" in m.lower() for m in msgs), f"未捕获硬上限告警: {msgs}"
 
 
 def test_late_subscriber_replays_most_recent_history(monkeypatch):

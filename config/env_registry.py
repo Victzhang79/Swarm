@@ -186,6 +186,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_SMOKE_LOGIN_PATH": "brain/acceptance_spec.py:554",
     "SWARM_SMOKE_TOKEN": "brain/acceptance_spec.py:445",
     "SWARM_SMOKE_TOKEN_FIELD": "brain/acceptance_spec.py:558",
+    "SWARM_SSE_MAX_SUBS_GLOBAL": "brain/runner.py:_GLOBAL_MAX_SUBS",
     "SWARM_SSE_MAX_SUBS_PER_TASK": "brain/runner.py:93",
     "SWARM_SSE_REAUTH_INTERVAL_S": "api/routers/task.py:55",
     "SWARM_SSE_SUB_QUEUE_MAX": "brain/runner.py:92",

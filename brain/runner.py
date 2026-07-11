@@ -91,6 +91,16 @@ def _raise_if_wallclock_exceeded(start_monotonic: float, deadline_s: float) -> N
 # P2-F：SSE/WS fanout 有界参数（防慢/挂死客户端无界积压）。可经环境变量调。
 _SUB_QUEUE_MAXSIZE = max(64, int(os.environ.get("SWARM_SSE_SUB_QUEUE_MAX", "2000")))
 _MAX_SUBS_PER_TASK = max(1, int(os.environ.get("SWARM_SSE_MAX_SUBS_PER_TASK", "50")))
+# M-4（外部深审）：全进程订阅者总数硬上限——防成员对【多个 task】各开满 _MAX_SUBS_PER_TASK 连接
+# 累积压垮整进程（内存 = 总数×队列容量、socket、每心跳周期鉴权）。默认 2000。
+_GLOBAL_MAX_SUBS = max(_MAX_SUBS_PER_TASK, int(os.environ.get("SWARM_SSE_MAX_SUBS_GLOBAL", "2000")))
+# 全进程当前订阅者计数（subscribe 增、unsubscribe 减）。
+_global_sub_count = 0
+
+
+class FanoutSubscriberLimitExceeded(Exception):
+    """M-4：单 task 或全进程订阅者数达硬上限——拒绝新 SSE/WS 连接（端点转 429/关闭），防单成员无限
+    开连接制造内存/socket/周期鉴权压力。区别于旧【仅软告警不拒】。"""
 
 
 class _FanoutTopic:
@@ -111,6 +121,19 @@ class _FanoutTopic:
         self._history: deque[dict[str, Any]] = deque(maxlen=history)
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        # M-4（外部深审）：订阅者数【硬上限】——达到即拒绝新连接（抛 FanoutSubscriberLimitExceeded，
+        # 端点转 429/关闭），不再仅软告警照连。旧行为：连接总数无限、流端点无专门连接上限 → 项目成员
+        # 可对本 task（乃至多 task）无限开 SSE/WS 连接制造内存(N×队列容量)/socket/每心跳周期鉴权压力。
+        # 双闸：单 task 上限 + 全进程总上限（防多 task 各开满累积压垮进程）。检查在建队列/改计数【之前】。
+        global _global_sub_count
+        if len(self._subs) >= _MAX_SUBS_PER_TASK:
+            logger.warning("[FANOUT] 单 task 订阅者数达硬上限 %d，拒绝新连接（疑 SSE/WS 泄漏或滥用）",
+                           _MAX_SUBS_PER_TASK)
+            raise FanoutSubscriberLimitExceeded(f"单 task 订阅者数达上限 {_MAX_SUBS_PER_TASK}")
+        if _global_sub_count >= _GLOBAL_MAX_SUBS:
+            logger.warning("[FANOUT] 全进程订阅者总数达硬上限 %d，拒绝新连接（疑滥用/泄漏）",
+                           _GLOBAL_MAX_SUBS)
+            raise FanoutSubscriberLimitExceeded(f"全进程订阅者总数达上限 {_GLOBAL_MAX_SUBS}")
         # P2-F：订阅者队列【有界】——慢/挂死的 SSE 客户端不再让队列无界增长撑爆内存。
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_SUB_QUEUE_MAXSIZE)
         # 复核 F3：history 长于队列容量时，回放【最近 maxsize 条】而非最旧那批——否则 late 订阅者
@@ -123,16 +146,15 @@ class _FanoutTopic:
                 q.put_nowait(ev)
             except asyncio.QueueFull:
                 break
-        # P2-F：订阅者数软上限——超限仅告警（可观测）不硬拒（SSE/WS 仍可连），
-        # 每队列已有界故总内存 = N×maxsize 受控；异常多订阅者=泄漏信号，需人工排查。
-        if len(self._subs) >= _MAX_SUBS_PER_TASK:
-            logger.warning("[FANOUT] 单 task 订阅者数达软上限 %d，疑似 SSE/WS 未注销泄漏",
-                           _MAX_SUBS_PER_TASK)
         self._subs.add(q)
+        _global_sub_count += 1
         return q
 
     def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
-        self._subs.discard(q)
+        global _global_sub_count
+        if q in self._subs:
+            self._subs.discard(q)
+            _global_sub_count = max(0, _global_sub_count - 1)
 
     def publish(self, event: dict[str, Any]) -> None:
         self._history.append(event)
