@@ -120,3 +120,82 @@ def test_idempotent_and_noop_when_clean():
         {"module": "mod-x", "artifacts": ["g:a"]}]}
     assert unclaimed_contract_deps(clean) == [], "前置：A5 归并恒空"
     assert inject_build_scaffold_subtasks(clean) == []
+
+
+def test_r45_pom_template_embedded_when_root_pom_parseable(tmp_path):
+    """R45-2：根 pom 可解析时 scaffold description 内嵌确定性 pom 模板（小模型抄不编）。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version><packaging>pom</packaging></project>", "utf-8")
+    plan = _plan_two_modules()
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
+    st = next(s for s in plan.subtasks if s.id == sid)
+    d = st.description
+    assert "<parent>" in d and "com.ruoyi" in d and "4.7.8" in d, "parent GAV 来自根 pom"
+    assert "<artifactId>mod-b</artifactId>" in d
+    assert "spring-context" in d, "契约 artifacts 展开成 <dependency>"
+    import xml.etree.ElementTree as ET
+    xml = d.split("```xml\n", 1)[1].split("\n```", 1)[0]
+    ET.fromstring(xml)  # 模板必须是合法 XML
+
+
+def test_r45_pom_template_absent_without_root_pom(tmp_path):
+    """根 pom 缺失 → 模板留空退回旧行为（不假装精确）。"""
+    plan = _plan_two_modules()
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert "权威 pom 模板" not in st.description
+
+
+def test_r45_f1_inherited_gav_root_pom_fails_open(tmp_path):
+    """复核 F1：根 pom 继承 GAV（无自身 groupId/version）→ 模板必须留空，
+    绝不用 dependencies 区块里的坐标拼幽灵 parent。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<parent><groupId>org.springframework.boot</groupId>"
+        "<artifactId>spring-boot-starter-parent</artifactId>"
+        "<version>3.2.0</version></parent>"
+        "<artifactId>acme-app</artifactId>"
+        "<dependencies><dependency><groupId>com.fasterxml.jackson</groupId>"
+        "<artifactId>jackson-databind</artifactId><version>2.15.2</version>"
+        "</dependency></dependencies></project>", "utf-8")
+    plan = _plan_two_modules()
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert "权威 pom 模板" not in st.description
+    assert "jackson" not in st.description, "依赖区坐标绝不冒充工程 GAV"
+
+
+def test_r45_f2_commented_coordinates_ignored(tmp_path):
+    """复核 F2：注释里的历史坐标不得赢过真坐标。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<!-- <groupId>com.legacy</groupId><version>0.9</version> -->"
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version></project>", "utf-8")
+    plan = _plan_two_modules()
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert "com.ruoyi" in st.description and "com.legacy" not in st.description
+
+
+def test_r45_f3_modify_case_gets_merge_snippets_not_full_template(tmp_path):
+    """复核 F3：既有 pom（MODIFY）只给依赖片段+并入措辞，绝不给"原样写入"全模板。"""
+    proj = tmp_path / "proj"
+    (proj / "mod-b").mkdir(parents=True)
+    (proj / "mod-b/pom.xml").write_text("<project/>", "utf-8")
+    (proj / "pom.xml").write_text(
+        "<project><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version></project>", "utf-8")
+    plan = _plan_two_modules()
+    injected = inject_build_scaffold_subtasks(plan, str(proj))
+    sid = next(e["subtask_id"] for e in injected if e["module"] == "mod-b")
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert "权威 pom 模板" not in st.description and "原样写入" not in st.description
+    assert "并入" in st.description and "spring-context" in st.description
+    assert "绝不整体替换" in st.description

@@ -42,9 +42,12 @@ rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 # 本脚本要抓的"③路由名与网关不一致"曾发生在脚本自身（Qwopus 下线后仍探旧名假红）。
 from swarm.config.settings import get_config
 _mc = get_config().model
+_wc = get_config().worker
 MODELS = []
 for _name in [
     _mc.brain_primary, _mc.brain_fallback, _mc.worker_primary, _mc.worker_fallback,
+    # 复核 F5：并行池主力必须显式探（今天恰与 trivial 链重合是巧合，指向链外模型即漂移盲区）
+    *(getattr(_wc, "worker_parallel_pool", None) or []),
     _mc.routing_trivial, _mc.routing_medium, _mc.routing_complex, _mc.routing_multimodal,
     # fallback 链也探（复核 LOW 补）：切备时真会上场（round41 Kimi 救回实证），
     # 漏探=切备时才发现备用不可达。worker_local(Ollama 遗留字段)不探：不在网关路由面。
@@ -56,7 +59,8 @@ for _name in [
     if _name and _name not in MODELS:
         MODELS.append(_name)
 router = ModelRouter()
-overall_ok = True
+# 模型健康表：任一轮失败即判该模型不健康（sustained 语义=全程稳定才算绿）
+healthy = {m: True for m in MODELS}
 for r in range(1, rounds + 1):
     print(f"── soak 探活 第 {r}/{rounds} 轮 ──")
     for m in MODELS:
@@ -64,17 +68,41 @@ for r in range(1, rounds + 1):
             resp = router.get_model_by_name(m, temperature=0).invoke("hi")
             ok = getattr(resp, "content", None) is not None
             print(f"  {'✅' if ok else '⚠️ 空响应'} {m}")
-            overall_ok = overall_ok and ok
+            healthy[m] = healthy[m] and ok
         except Exception as e:
             print(f"  ❌ {m} :: {str(e)[:100]}")
-            overall_ok = False
+            healthy[m] = False
     if r < rounds:
         time.sleep(20)
 
-if overall_ok:
-    print("[soak] ✅ 六模型全绿，可开跑")
+# ★链覆盖闸门（round45 用户拍板治本）★：自建模型临时掉线（修 10min 又恢复）是常态，
+# 单模型红不再阻断起跑——运行期有熔断半开+fallback 链兜底，掉线模型恢复后自动回场。
+# 只有【某条路由链全灭】（主备无一健康）才禁跑：那才是真跑必死面。
+CHAINS = {
+    "brain":      [_mc.brain_primary, _mc.brain_fallback],
+    "worker":     [_mc.worker_primary, _mc.worker_fallback],
+    "trivial":    [_mc.routing_trivial, *_mc.routing_trivial_fallback],
+    "medium":     [_mc.routing_medium, *_mc.routing_medium_fallback],
+    "complex":    [_mc.routing_complex, *_mc.routing_complex_fallback],
+    "multimodal": [_mc.routing_multimodal, *_mc.routing_multimodal_fallback],
+}
+down = [m for m, ok in healthy.items() if not ok]
+dead_chains = []
+for role, chain in CHAINS.items():
+    names = [n.strip() for n in chain if n and n.strip()]
+    if names and not any(healthy.get(n, False) for n in names):
+        dead_chains.append(role)
+
+if not down:
+    print(f"[soak] ✅ 全部 {len(MODELS)} 模型全绿，可开跑")
     sys.exit(0)
-print("[soak] ❌ 有模型不可达，禁止开跑（否则污染本轮判读）")
+if not dead_chains:
+    print(f"[soak] ⚠️ {len(down)} 个模型不可达但每条路由链仍有健康兜底 → 允许开跑（降级模式）")
+    print(f"[soak]   掉线名单: {down}")
+    print("[soak]   运行期由熔断半开+fallback 兜底；掉线模型恢复后自动回场（无需改配置）")
+    sys.exit(0)
+print(f"[soak] ❌ 路由链全灭: {dead_chains}（主备无一健康）→ 禁止开跑（真跑必死面）")
+print(f"[soak]   掉线名单: {down}")
 print("[soak] 常见根因：①SWARM_SECRET_KEY 轮换/密文损坏→secret_store 解密失败回退 .env 空 key→401")
 print("[soak]           ②模型机/网关宕或卸载模型  ③.env 路由模型名与网关不一致")
 sys.exit(1)

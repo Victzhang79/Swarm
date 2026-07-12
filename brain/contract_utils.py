@@ -247,6 +247,71 @@ def unclaimed_contract_deps(plan) -> list[dict]:
     return out
 
 
+def _deterministic_pom_template(mod: str, artifacts: list[str],
+                                project_path: str | None) -> str:
+    """R45-2：从根 pom parent GAV + 契约 artifacts 确定性生成模块 pom 模板。
+
+    根 pom 不可解析/无 project_path → 返回空串（scaffold 退回旧行为，不假装精确）。
+    依赖版本不写：交由父 pom dependencyManagement / D2 reconcile 兜底（既有决策）。"""
+    if not project_path:
+        return ""
+    try:
+        import re as _re
+        root_pom = Path(project_path) / "pom.xml"
+        if not root_pom.is_file():
+            return ""
+        txt = root_pom.read_text("utf-8", errors="replace")
+        # 复核 F2：先剥注释（注释里的历史坐标会赢过真坐标）；再剥 <parent> 防误取父级
+        stripped = _re.sub(r"<!--.*?-->", "", txt, flags=_re.S)
+        stripped = _re.sub(r"<parent>.*?</parent>", "", stripped, flags=_re.S)
+        # 复核 F1：GAV 搜索限定在首个大区块之前（properties/dependencies/…里的
+        # 坐标是依赖不是本工程）；根 pom 继承 GAV（缺 groupId/version）→ 如实 ""
+        # fail-open——否则首个匹配会拼出幽灵 parent 坐标还盖"权威"章=确定性制造
+        # round45 要防的 reactor 中毒
+        m_blk = _re.search(
+            r"<(properties|dependencies|dependencyManagement|build|modules|profiles)>",
+            stripped)
+        head = stripped[:m_blk.start()] if m_blk else stripped
+        g = _re.search(r"<groupId>([^<]+)</groupId>", head)
+        a = _re.search(r"<artifactId>([^<]+)</artifactId>", head)
+        v = _re.search(r"<version>([^<]+)</version>", head)
+        if not (g and a and v):
+            return ""
+        deps = []
+        for art in artifacts:
+            art = str(art).strip()
+            if ":" in art:
+                dg, da = art.split(":", 1)[0].strip(), art.split(":", 1)[1].split(":")[0].strip()
+            else:
+                dg, da = g.group(1).strip(), art
+            if dg and da:
+                deps.append(
+                    f"        <dependency>\n            <groupId>{dg}</groupId>\n"
+                    f"            <artifactId>{da}</artifactId>\n        </dependency>")
+        deps_block = "\n".join(deps)
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<project xmlns="http://maven.apache.org/POM/4.0.0"\n'
+            '         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
+            '         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 '
+            'http://maven.apache.org/xsd/maven-4.0.0.xsd">\n'
+            "    <modelVersion>4.0.0</modelVersion>\n"
+            "    <parent>\n"
+            f"        <groupId>{g.group(1).strip()}</groupId>\n"
+            f"        <artifactId>{a.group(1).strip()}</artifactId>\n"
+            f"        <version>{v.group(1).strip()}</version>\n"
+            "    </parent>\n"
+            f"    <artifactId>{mod}</artifactId>\n"
+            "    <packaging>jar</packaging>\n"
+            "    <dependencies>\n"
+            f"{deps_block}\n"
+            "    </dependencies>\n"
+            "</project>")
+    except Exception:  # noqa: BLE001 — 模板生成 fail-open，scaffold 退回旧行为
+        logger.warning("[SCAFFOLD-INJECT] pom 模板确定性生成失败（fail-open）", exc_info=True)
+        return ""
+
+
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None,
 ) -> list[dict]:
@@ -278,12 +343,35 @@ def inject_build_scaffold_subtasks(
         # R41 复核 F5：project_path 未知（store 瞬时失败等）时保守按"已存在"走 MODIFY
         # ——CREATE 会让 worker 现造最小 pom 盖掉基线真 pom（clobber 比漏改更致命）
         pom_exists = (not project_path) or (Path(project_path) / pom).is_file()
+        # R45-2（round45 死因）：pom 内容是纯机械产物（parent GAV+契约依赖展开），
+        # 交给最弱环节（小模型）自由发挥产出坏 POM=reactor 中毒 → 阶梯三 revert
+        # 连坐下游 95/107。确定性生成权威模板嵌进 description：小模型抄而不是编。
+        # 复核 F3：完整模板只给 CREATE（新建无可失）；MODIFY 只给依赖片段+并入措辞
+        # ——"原样写入"对既有 pom=clobber 复活（R41-F5 铁律：clobber 比漏改更致命）。
+        _tpl_block = ""
+        if not pom_exists:
+            _tpl = _deterministic_pom_template(mod, arts, project_path)
+            if _tpl:
+                _tpl_block = (
+                    f"\n【权威 pom 模板（确定性生成，原样写入 {pom}；仅当项目另有明确"
+                    f"约定才允许在此基础上增改，绝不重构结构）】\n```xml\n{_tpl}\n```")
+        else:
+            _dep_snips = "\n".join(
+                f"        <dependency><groupId>{a0.split(':',1)[0]}</groupId>"
+                f"<artifactId>{a0.split(':',1)[1].split(':')[0]}</artifactId></dependency>"
+                for a0 in (str(x).strip() for x in arts) if ":" in a0)
+            if _dep_snips:
+                _tpl_block = (
+                    f"\n【缺失依赖片段（并入 {pom} 既有 <dependencies>，"
+                    "绝不整体替换/删除既有内容）】\n```xml\n"
+                    f"{_dep_snips}\n```")
         scaffold = SubTask(
             id=sid,
             description=(
                 f"【构建脚手架】为模块 {mod} " + ("补齐" if pom_exists else "创建")
                 + f"构建文件 {pom}：一次性声明契约 dependencies 的全部 artifacts"
-                "（写代码的子任务碰不到构建文件，缺一个依赖=整模块编译失败）"),
+                "（写代码的子任务碰不到构建文件，缺一个依赖=整模块编译失败）"
+                + _tpl_block),
             intent=TaskIntent.MODIFY if pom_exists else TaskIntent.CREATE,
             difficulty=SubTaskDifficulty.TRIVIAL,
             scope=FileScope(
