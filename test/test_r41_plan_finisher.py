@@ -391,3 +391,155 @@ def test_r48_f2_large_group_presharded():
     assert len(sts) == 3, "15 文件 → 3 片（6+6+3）"
     for s in sts:
         assert len(s.scope.create_files) + len(s.scope.writable) <= 6
+
+
+# ── ④ R48b-1：契约符号安置 ──
+_SC = {"interfaces": [
+    {"name": "RobotQueryService", "module": "alarm-robot"},
+    {"name": "TemplateRenderService", "module": "alarm-template"},
+    {"name": "IChannelSender", "module": "alarm-channel"}],
+    "dtos": [{"name": "RobotDTO", "module": "alarm-robot"}]}
+
+
+def test_r48b_unowned_hard_symbols_domiciled():
+    """round48b 死因回归：P1 短路符号外科后，收尾器必须安置无主硬符号过 C1。"""
+    plan = TaskPlan(
+        task_id="t-48b", subtasks=[
+            _st("st-1", create=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/A.java"]),
+            _st("st-2", create=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=_SC)
+    dom = out.get("symbols_domiciled")
+    assert dom, "无主硬符号必须被安置"
+    from swarm.brain.plan_validator import unowned_contract_symbols
+    hard = ["RobotQueryService", "TemplateRenderService", "IChannelSender"]
+    assert unowned_contract_symbols(plan, hard) == [], "安置后 C1 硬符号全员有主"
+    # 软符号（dtos kind）不安置——随宿主落地
+    all_files = [f for s in plan.subtasks for f in s.scope.create_files]
+    assert not any("RobotDTO" in f for f in all_files)
+    # 扩展名取 plan 众数（java）
+    assert any(f.endswith("RobotQueryService.java") for f in all_files)
+
+
+def test_r48b_scaffold_dependency_and_idempotent():
+    plan = TaskPlan(
+        task_id="t-48c", subtasks=[
+            _st("st-scaffold-alarm-robot", create=["alarm-robot/pom.xml"]),
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-scaffold-alarm-robot", "st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "RobotQueryService", "module": "alarm-robot"}]}
+    out1 = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert out1.get("symbols_domiciled")
+    st = next(s for s in plan.subtasks if s.id == "st-contract-alarm-robot")
+    assert "st-scaffold-alarm-robot" in st.depends_on
+    n1 = len(plan.subtasks)
+    out2 = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert len(plan.subtasks) == n1 and not out2.get("symbols_domiciled")
+
+
+def test_r48b_module_missing_left_to_validate():
+    """module 归属缺失的符号如实留给 VALIDATE，绝不猜模块。"""
+    plan = TaskPlan(
+        task_id="t-48d", subtasks=[
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "OrphanNoModuleService", "module": ""}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert not out.get("symbols_domiciled")
+
+
+def test_r48b_adopt_into_existing_contract_subtask():
+    plan = TaskPlan(
+        task_id="t-48e", subtasks=[
+            _st("st-contract-alarm-robot",
+                create=["alarm-robot/src/x/RobotQueryService.java"]),
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-contract-alarm-robot", "st-1", "st-2"]])
+    sc = {"interfaces": [
+        {"name": "RobotQueryService", "module": "alarm-robot"},
+        {"name": "RobotAuditService", "module": "alarm-robot"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    host = next(s for s in plan.subtasks if s.id == "st-contract-alarm-robot")
+    assert any("RobotAuditService" in f for f in host.scope.create_files), "后到符号收养"
+    assert out["symbols_domiciled"]["st-contract-alarm-robot"] == ["RobotAuditService"]
+
+
+def test_r48b_f1_dirty_symbol_names_rejected():
+    """复核 F1：脏符号名（URL/泛型/穿越）绝不进路径。"""
+    plan = TaskPlan(
+        task_id="t-48f", subtasks=[
+            _st("st-1", create=["m/src/a.java"]), _st("st-2", create=["m/src/b.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [
+        {"name": "GET /system/robot/Export", "module": "alarm-api"},
+        {"name": "IChannelSender<T>", "module": "alarm-channel"},
+        {"name": "../EvilService", "module": "alarm-x"},
+        {"name": "GoodService", "module": "alarm-y"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    all_files = [f for s in plan.subtasks for f in s.scope.create_files]
+    assert not any(" " in f or "<" in f or ".." in f for f in all_files)
+    assert any(f.endswith("GoodService.java") for f in all_files)
+
+
+def test_r48b_f2_single_module_layout_keeps_src_root():
+    """复核 F2：单模块工程（src/ 顶层）——新模块路径必须保留完整源根段。"""
+    plan = TaskPlan(
+        task_id="t-48g", subtasks=[
+            _st("st-1", create=["src/main/java/com/x/A.java"]),
+            _st("st-2", create=["src/main/java/com/x/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "RobotQueryService", "module": "alarm-robot"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled")
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("RobotQueryService.java"))
+    assert "/src/main/java/" in f, f"必须含完整源根: {f}"
+
+
+def test_r48b_f3_no_source_ext_evidence_fails_open():
+    """复核 F3：纯配置 plan（无源码扩展名）→ 不猜语言，安置跳过。"""
+    plan = TaskPlan(
+        task_id="t-48h", subtasks=[
+            _st("st-1", create=["conf/app.yml"]), _st("st-2", create=["db/init.sql"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "RobotQueryService", "module": "alarm-robot"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert not out.get("symbols_domiciled")
+
+
+def test_r48b_f4_adopt_overflow_shards():
+    """复核 F4：host 满员后溢出分片，符号一个不丢。"""
+    plan = TaskPlan(
+        task_id="t-48i", subtasks=[
+            _st("st-contract-alarm-robot",
+                create=[f"alarm-robot/src/S{i}.java" for i in range(6)]),
+            _st("st-1", create=["m/src/a.java"]), _st("st-2", create=["m/src/b.java"])],
+        parallel_groups=[["st-contract-alarm-robot", "st-1", "st-2"]])
+    sc = {"interfaces": [
+        {"name": f"NewSvc{i}", "module": "alarm-robot"} for i in range(8)]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    dom = out["symbols_domiciled"]
+    placed = [s for v in dom.values() for s in v]
+    assert sorted(placed) == sorted(f"NewSvc{i}" for i in range(8)), "8 符号全安置"
+    host = next(s for s in plan.subtasks if s.id == "st-contract-alarm-robot")
+    assert len(host.scope.create_files) <= 6, "host 不超员"
+    assert any(s.id.startswith("st-contract-alarm-robot-") for s in plan.subtasks)
+
+
+def test_r48b_f5_new_module_gets_scaffold(tmp_path):
+    """复核 F5：物理不存在的新模块 → 补注脚手架并依赖之（防 reactor missing-child）。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.x</groupId><artifactId>root</artifactId>"
+        "<version>1.0</version><packaging>pom</packaging></project>", "utf-8")
+    plan = TaskPlan(
+        task_id="t-48j", subtasks=[
+            _st("st-1", create=["m/src/a.java"]), _st("st-2", create=["m/src/b.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "RobotQueryService", "module": "alarm-robot"}]}
+    finish_plan_deterministic(plan, [], str(tmp_path), "t", shared_contract=sc)
+    sc_st = next((s for s in plan.subtasks if s.id == "st-scaffold-alarm-robot"), None)
+    assert sc_st is not None, "新模块必须补注脚手架"
+    assert "权威 pom 模板" in sc_st.description
+    ct = next(s for s in plan.subtasks if s.id == "st-contract-alarm-robot")
+    assert "st-scaffold-alarm-robot" in ct.depends_on

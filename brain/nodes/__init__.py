@@ -2282,7 +2282,12 @@ async def plan(state: BrainState) -> dict:
     finish_plan_deterministic(
         task_plan, state.get("tech_design_file_plan"),
         project_path=_get_project_path(state.get("project_id") or ""),
-        task_description=task_description)
+        task_description=task_description,
+        # R48b-1：③孤儿承接之外，④契约符号安置也进收尾器——P1 命中时 R39-5 符号
+        # 外科被 first-match 短路（round48b 最后一轮实锤：P1 补 13 covers 后 19 个
+        # 无主硬符号无人处理→三连耗尽 REJECTED），收尾器是唯一全路径必经点。
+        shared_contract=(state.get("shared_contract")
+                         or getattr(task_plan, "shared_contract", None) or {}))
 
     plan_touch = touch_context(
         state,
