@@ -892,6 +892,18 @@ def contract_symbols_with_module(
     return list(seen.values())
 
 
+def symbol_diff_variants(sym: str) -> list[str]:
+    """R43 复核 F4：L2 子串核验的符号变体（lower）。契约符号带 I 前缀而代码只写
+    基名（IChannelAdapter ↔ class ChannelAdapter）时，字面子串会把 C1 已按惯例
+    等价放行的符号在 L2 判缺——C1↔L2 口径必须对称，否则"两张皮"只是位移到 8h 后。
+    保守只加 I 基名变体（不加装饰前缀：子串方向天然覆盖装饰）。"""
+    s = str(sym or "")
+    out = [s.lower()]
+    if len(s) >= 3 and s[0] == "I" and s[1].isupper():
+        out.append(s[1:].lower())
+    return out
+
+
 def contract_symbols(shared_contract: dict[str, Any] | None) -> list[str]:
     """从共享契约提取需出现在变更中的【核心标识符】（非整句描述）。
 

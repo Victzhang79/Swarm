@@ -196,13 +196,21 @@ def _c2_missing_symbols(subtask, shared_contract: dict, diff: str) -> list[str]:
     stems = [str(f).replace("\\", "/").rsplit("/", 1)[-1].split(".", 1)[0]
              for f in (list(getattr(sc, "create_files", None) or [])
                        + list(getattr(sc, "writable", None) or []))]
-    # F2 同款最长符号优先消歧：装饰前缀误配的短符号不在本子任务的归属集里
+    # F2 消歧（R43 复核 F1 修订：先强度后长度，精确同名不被弱通道长符号抢走）
+    from swarm.brain.plan_validator import basename_symbol_match
     _syms = [str(x) for x in symbols]
     file_owned: set[str] = set()
     for b in stems:
-        matched = [y for y in _syms if basename_owns_symbol(b, y)]
-        if matched:
-            file_owned.add(max(matched, key=len))
+        best, best_key = None, None
+        for y in _syms:
+            t = basename_symbol_match(b, y)
+            if t < 0:
+                continue
+            key = (t, -len(y))
+            if best_key is None or key < best_key:
+                best, best_key = y, key
+        if best is not None:
+            file_owned.add(best)
     dl = (diff or "").lower()
     missing: list[str] = []
     for sym in symbols:

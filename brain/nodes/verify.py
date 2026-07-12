@@ -242,10 +242,15 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     import json as _json
 
                     from swarm.brain.contract_utils import contract_symbols as _csyms
+                    from swarm.brain.contract_utils import (
+                        symbol_diff_variants as _sdv,
+                    )
                     _sc = state.get("shared_contract") or (
                         plan_obj.shared_contract if plan_obj else {})
                     _dl = (merged_diff or "").lower()
-                    _missing = [x for x in _csyms(_sc) if x.lower() not in _dl]
+                    # R43 复核 F4：与 integration_review 同口径（I 基名变体）
+                    _missing = [x for x in _csyms(_sc)
+                                if not any(v in _dl for v in _sdv(x))]
                     if _missing and plan_obj is not None:
                         _owners, _sym_owners, _unattributed = _d5_attribute_owners(
                             _missing, plan_obj, subtask_results)

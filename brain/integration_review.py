@@ -156,7 +156,10 @@ def check_contract_in_diff(
     if not symbols:
         return True, []
     diff_lower = (merged_diff or "").lower()
-    missing = [s for s in symbols if s.lower() not in diff_lower]
+    # R43 复核 F4：I 前缀符号接受基名子串（与 C1 惯例等价口径对称，防两张皮位移到 L2）
+    from swarm.brain.contract_utils import symbol_diff_variants
+    missing = [s for s in symbols
+               if not any(v in diff_lower for v in symbol_diff_variants(s))]
     if not missing:
         return True, []
     import os

@@ -429,18 +429,46 @@ def basename_owns_symbol(stem: str, sym: str,
     unowned_contract_symbols）；无全量符号清单的场景（棕地基线豁免）传
     decorated_prefix=False 关掉 ④（复核 F3：5k 文件树上 ISysUserService 会豁免
     一切 *UserService 新符号，豁免半径失控）。"""
+    return basename_symbol_match(stem, sym, decorated_prefix=decorated_prefix) >= 0
+
+
+def basename_symbol_match(stem: str, sym: str,
+                          decorated_prefix: bool = True) -> int:
+    """R43 复核 F1：带【匹配强度】的等价判定——消歧必须先比强度再比长度。
+
+    tier 0=精确同名（Impl 剥离后 stem==Symbol）
+    tier 1=惯例等价精确（文件带 I / 符号带 I，剥后同名）
+    tier 2=装饰前缀后缀匹配（宁误勿漏通道，decorated_prefix=False 时关闭）
+    -1=不匹配。
+    复核 F1（CONFIRMED 回归）：契约同时含 IChannelAdapter+ChannelAdapter 双胞胎
+    （P6 边界重叠自并的典型产物）且两文件都在计划时，纯 max(len) 消歧让弱通道的
+    长符号抢走精确同名文件 → 短胞胎被判无主且 LLM 无法修（文件明明在）——精确
+    匹配必须永远赢过等价通道。
+    已知有界误配（复核 F3）：^I[A-Z] 无法区分接口前缀与 I 开头缩写
+    （IOException 的 base=OException 可后缀误配 DAOException）；≥8 字符+大写
+    边界+强度分层兜住半径，且契约极少收录 JDK 异常类，留观不加特判。"""
     s = str(stem or "")
     y = str(sym or "")
     if not s or not y:
-        return False
+        return -1
     if s.lower().endswith("impl") and len(s) > 4:
         s = s[:-4]
     sl, yl = s.lower(), y.lower()
-    if sl == yl or sl == "i" + yl:
-        return True
-    if decorated_prefix and len(y) >= 8 and len(s) > len(y) and s.endswith(y):
-        return s[len(s) - len(y)].isupper()
-    return False
+    if sl == yl:
+        return 0
+    if sl == "i" + yl:
+        return 1
+    y_base = y[1:] if (len(y) >= 3 and y[0] == "I" and y[1].isupper()) else None
+    if y_base is not None and sl == y_base.lower():
+        return 1
+    if decorated_prefix:
+        if len(y) >= 8 and len(s) > len(y) and s.endswith(y) \
+                and s[len(s) - len(y)].isupper():
+            return 2
+        if y_base is not None and len(y_base) >= 8 and len(s) > len(y_base) \
+                and s.endswith(y_base) and s[len(s) - len(y_base)].isupper():
+            return 2
+    return -1
 
 
 def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
@@ -478,9 +506,18 @@ def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
     file_owned: set[str] = set()
     for bl in stems_by_st.values():
         for b in bl:
-            matched = [y for y in _syms if basename_owns_symbol(b, y)]
-            if matched:
-                file_owned.add(max(matched, key=len))
+            # 复核 F1：先比匹配强度（精确>等价>装饰），同强度才取最长符号——
+            # 精确同名文件绝不被弱通道的长符号抢走
+            best, best_key = None, None
+            for y in _syms:
+                t = basename_symbol_match(b, y)
+                if t < 0:
+                    continue
+                key = (t, -len(y))
+                if best_key is None or key < best_key:
+                    best, best_key = y, key
+            if best is not None:
+                file_owned.add(best)
     unowned: list[str] = []
     for sym in symbols:
         s = str(sym).lower()
@@ -543,7 +580,14 @@ def validate_contract_ownership(
             def _is_soft(s: str) -> bool:
                 if _kind_of.get(s) not in _HARD_KINDS:
                     return True
-                return "." in s and s.split(".", 1)[0] in _sym_set
+                if "." in s and s.split(".", 1)[0] in _sym_set:
+                    return True
+                # R43：成员形态降软——小写开头标识符（getByAppId/validateApp…）是
+                # 方法/字段命名惯例，从不对应独立文件，file-owner 硬对账对其结构性
+                # 无解（round43 实测：GLM 把 8 个方法名塞进 apis/interfaces 硬键，
+                # 24/37=65% 打回里方法占一半，教育 LLM 不收敛）。惯例判据非语言写死；
+                # PascalCase 方法栈（C#）不受益也不受害（维持原 kind 分级）。
+                return bool(s) and s[0].islower()
 
             hard_unowned = [s for s in unowned if not _is_soft(s)]
             soft_unowned = [s for s in unowned if _is_soft(s)]
