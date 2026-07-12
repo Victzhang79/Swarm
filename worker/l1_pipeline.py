@@ -171,6 +171,47 @@ def _write_project_file(project_path: str, rel: str, content: str, timeout: int 
     return ec == 0
 
 
+def _inject_dep_version_in_blocks(
+        text: str, group: str, artifact: str, version: str) -> str | None:
+    """R47-3：仅在 <dependency> 块内为匹配依赖注入缺失 <version> → 新文本或 None。
+
+    块内已有 <version>、artifactId 不匹配、groupId 明确不匹配 → 原样保留（幂等）。
+    工程/<parent> 的 artifactId 声明不在 <dependency> 块内，天然免疫误插（旧 perl
+    盲插正是在工程自身声明旁再插一个 → Duplicated tag Non-parseable，round47 实锤）。
+    复核 F2：匹配前剥 <exclusions>（exclusion 撞名会把 version 插进 exclusions 块）；
+    复核 F5：groupId 是 ${属性} 引用时不可字面比对 → 放行到 artifactId 匹配（fail-open）。
+    模块级函数：测试必须 import 真身（禁"抄本测试"假绿）。"""
+    hits = 0
+
+    def _fix(m: "re.Match[str]") -> str:
+        nonlocal hits
+        blk = m.group(0)
+        inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
+        if "<version>" in inner:
+            return blk
+        if not re.search(
+                r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>", inner):
+            return blk
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", inner)
+        if group and g and not g.group(1).startswith("${") and g.group(1) != group:
+            return blk
+        # 插入点锚定【exclusions 之外】的 artifactId 出现（撞名 exclusion 排前时
+        # 首次出现在 exclusions 内，盲取首个会把 version 插进 exclusions 块）
+        exc_spans = [mm.span() for mm in re.finditer(
+            r"<exclusions>.*?</exclusions>", blk, re.S)]
+        for am in re.finditer(
+                r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>", blk):
+            if any(s <= am.start() < e for s, e in exc_spans):
+                continue
+            hits += 1
+            return (blk[:am.end()]
+                    + f"\n            <version>{version}</version>" + blk[am.end():])
+        return blk
+
+    new_text = re.sub(r"<dependency>(.*?)</dependency>", _fix, text, flags=re.S)
+    return new_text if hits else None
+
+
 def _attempt_maven_version_repair(
     project_path: str, build_output: str, timeout: int
 ) -> tuple[int, list[str]]:
@@ -256,21 +297,24 @@ def _attempt_maven_version_repair(
         poms = sorted({line.strip() for line in (gout or "").splitlines() if line.strip()})
         for pom in poms:
             # 只在【无 dependencyManagement 的模块 pom】注入：父 pom 的受管块本就带版本，
-            # 误插会造双 version。模块 pom 里该 artifactId 唯一，插在其后安全。
+            # 误插会造双 version。
             _gc, gmgmt, _ge = _run_check_split(
                 f"grep -c '<dependencyManagement>' {shlex.quote(pom)}", project_path, timeout=10
             )
             if (gmgmt or "").strip() not in ("", "0"):
                 continue
-            # 在该 artifact 的 <artifactId> 行后插入 <version>（模块 pom 内唯一，安全）。
-            # 用 perl（GNU/BSD/沙箱皆一致，避开 sed a\ 在 BSD 上不可用），\Q\E 字面转义。
-            scmd = (
-                f"perl -i.bak -pe "
-                f"'s#(<artifactId>\\Q{artifact}\\E</artifactId>)#$1\\n            "
-                f"<version>{good_ver}</version>#' {shlex.quote(pom)} && rm -f {shlex.quote(pom + '.bak')}"
-            )
-            ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
-            if ec2 == 0:
+            # R47-3 治本：旧 perl 盲插会命中【项目自身 artifactId 行】（grep -rl 把
+            # "工程叫这个名"的 pom 也算声明者），在工程 <version> 旁再插一个 →
+            # Duplicated tag: 'version'，整 pom Non-parseable 毒化 reactor；且不查
+            # 依赖块内是否已有 version，不幂等。改为 Python 侧块级精准注入：只在
+            # <dependency> 块内、artifactId 匹配、（有 groupId 时）groupId 匹配、
+            # 且块内无 <version> 时插入——工程/parent 声明在块外天然不碰，天然幂等。
+            text = _read_project_file(project_path, pom, timeout=20)
+            if text is None:
+                continue
+            new_text = _inject_dep_version_in_blocks(text, group, artifact, good_ver)
+            if new_text is not None and _write_project_file(
+                    project_path, pom, new_text, timeout=20):
                 changed.add(pom)
         logger.info(
             "[L1.2.1·version-repair] %s:%s 缺 <version> → 注入 %s（%d pom，受管 pom 跳过）",

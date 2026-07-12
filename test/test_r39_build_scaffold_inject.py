@@ -199,3 +199,113 @@ def test_r45_f3_modify_case_gets_merge_snippets_not_full_template(tmp_path):
     assert "权威 pom 模板" not in st.description and "原样写入" not in st.description
     assert "并入" in st.description and "spring-context" in st.description
     assert "绝不整体替换" in st.description
+
+
+def test_r47_bare_artifact_group_resolved_from_baseline(tmp_path):
+    """R47-2：裸 artifact 的 groupId 从基线 poms 解析，绝不回退工程 groupId。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version><packaging>pom</packaging>"
+        "<dependencyManagement><dependencies><dependency>"
+        "<groupId>org.springframework.boot</groupId>"
+        "<artifactId>spring-boot-starter-web</artifactId>"
+        "<version>2.5.15</version></dependency>"
+        "</dependencies></dependencyManagement></project>", "utf-8")
+    from swarm.brain.contract_utils import _deterministic_pom_template
+    tpl = _deterministic_pom_template(
+        "mod-b", ["spring-boot-starter-web"], str(tmp_path))
+    assert "<groupId>org.springframework.boot</groupId>" in tpl
+    assert "com.ruoyi</groupId>\n            <artifactId>spring-boot-starter-web" \
+        not in tpl.replace("    ", " ")
+    # 工程 groupId 只出现在 parent 块
+    assert tpl.count("com.ruoyi") == 1
+
+
+def test_r47_unresolvable_bare_artifact_omitted(tmp_path):
+    """R47-2：基线解析不到的裸 artifact 从模板省略（缺依赖可修，伪造坐标是毒药）。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version><packaging>pom</packaging></project>", "utf-8")
+    from swarm.brain.contract_utils import _deterministic_pom_template
+    tpl = _deterministic_pom_template(
+        "mod-b", ["totally-unknown-artifact", "org.projectlombok:lombok"], str(tmp_path))
+    assert "totally-unknown-artifact" not in tpl
+    assert "<artifactId>lombok</artifactId>" in tpl, "显式 g:a 照常展开"
+
+
+def test_r47_baseline_group_from_sibling_module_pom(tmp_path):
+    """R47-2：root pom 无此依赖时，兄弟模块 pom 的依赖块也算基线证据。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.7.8</version><packaging>pom</packaging></project>", "utf-8")
+    (tmp_path / "ruoyi-common").mkdir()
+    (tmp_path / "ruoyi-common" / "pom.xml").write_text(
+        "<project><parent><groupId>com.ruoyi</groupId></parent>"
+        "<artifactId>ruoyi-common</artifactId><dependencies><dependency>"
+        "<groupId>cn.hutool</groupId><artifactId>hutool-all</artifactId>"
+        "</dependency></dependencies></project>", "utf-8")
+    from swarm.brain.contract_utils import _deterministic_pom_template
+    tpl = _deterministic_pom_template("mod-b", ["hutool-all"], str(tmp_path))
+    assert "<groupId>cn.hutool</groupId>" in tpl
+
+
+def test_r47_f1_poisoned_sibling_pom_rejected(tmp_path):
+    """复核 F1（真树复现级）：残留毒 pom 声明 com.ruoyi:spring-boot-starter-web ——
+    工程 groupId + 非内部模块 artifact = 伪造，无论证据来自哪都拒绝（省略该依赖）。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.8.3</version><packaging>pom</packaging>"
+        "<modules><module>ruoyi-common</module></modules></project>", "utf-8")
+    (tmp_path / "alarm-notify-api").mkdir()
+    (tmp_path / "alarm-notify-api" / "pom.xml").write_text(
+        "<project><parent><groupId>com.ruoyi</groupId></parent>"
+        "<artifactId>alarm-notify-api</artifactId><dependencies><dependency>"
+        "<groupId>com.ruoyi</groupId><artifactId>spring-boot-starter-web</artifactId>"
+        "</dependency></dependencies></project>", "utf-8")
+    from swarm.brain.contract_utils import _dep_group_from_baseline
+    assert _dep_group_from_baseline(str(tmp_path), "spring-boot-starter-web") is None
+    # 真内部模块（root <modules> 登记）→ 工程 groupId 合法
+    assert _dep_group_from_baseline(str(tmp_path), "ruoyi-common") == "com.ruoyi"
+
+
+def test_r47_f1_conflicting_third_party_evidence_rejected(tmp_path):
+    """互斥第三方证据 → 存疑弃用；唯一第三方证据胜过毒证据。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.8.3</version><packaging>pom</packaging></project>", "utf-8")
+    (tmp_path / "bad-mod").mkdir()
+    (tmp_path / "bad-mod" / "pom.xml").write_text(
+        "<project><parent><groupId>com.ruoyi</groupId></parent>"
+        "<artifactId>bad-mod</artifactId><dependencies><dependency>"
+        "<groupId>com.ruoyi</groupId><artifactId>hutool-all</artifactId>"
+        "</dependency></dependencies></project>", "utf-8")
+    (tmp_path / "good-mod").mkdir()
+    (tmp_path / "good-mod" / "pom.xml").write_text(
+        "<project><parent><groupId>com.ruoyi</groupId></parent>"
+        "<artifactId>good-mod</artifactId><dependencies><dependency>"
+        "<groupId>cn.hutool</groupId><artifactId>hutool-all</artifactId>"
+        "</dependency></dependencies></project>", "utf-8")
+    from swarm.brain.contract_utils import _dep_group_from_baseline
+    # 毒证据(工程 groupId)在场时，唯一真第三方证据仍胜出
+    assert _dep_group_from_baseline(str(tmp_path), "hutool-all") == "cn.hutool"
+
+
+def test_r47_f2_exclusion_artifact_not_treated_as_dep(tmp_path):
+    """复核 F2：只以 exclusion 形式出现的 artifact 不得错配外层 groupId。"""
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project>'
+        "<groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.8.3</version><packaging>pom</packaging>"
+        "<dependencyManagement><dependencies><dependency>"
+        "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
+        "<version>5.3.39</version>"
+        "<exclusions><exclusion><groupId>commons-logging</groupId>"
+        "<artifactId>commons-logging</artifactId></exclusion></exclusions>"
+        "</dependency></dependencies></dependencyManagement></project>", "utf-8")
+    from swarm.brain.contract_utils import _dep_group_from_baseline
+    assert _dep_group_from_baseline(str(tmp_path), "commons-logging") is None

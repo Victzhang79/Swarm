@@ -247,6 +247,71 @@ def unclaimed_contract_deps(plan) -> list[dict]:
     return out
 
 
+def _dep_group_from_baseline(project_path: str, artifact_id: str) -> str | None:
+    """R47-2：从基线 poms ground truth 解析依赖 artifactId 的真实 groupId。
+
+    round47 实锤：模板对裸 artifact（spring-boot-starter-web/lombok/…）回退用
+    【工程 groupId】= 凭空制造 `com.ruoyi:spring-boot-starter-web` 无版本幽灵坐标，
+    盖着"权威模板"章让听话 worker 原样写入 → 毒化整个 reactor（R45-2 要防的病被
+    模板自己复制）。治本 = groupId 只认基线证据：root pom（dependencyManagement
+    含）优先，其余基线 poms 兜底；解析不到返回 None（调用方省略该依赖并响亮日志
+    ——缺依赖是可归因可修的编译错，伪造坐标是 reactor 毒药）。纯文本确定性解析。
+    """
+    import re as _re
+    root = Path(project_path)
+    poms = [root / "pom.xml"]
+    try:
+        poms += sorted(root.glob("*/pom.xml"))  # 单层扫描假设：多模块惯例为扁平布局
+    except OSError:
+        pass
+    # 复核 F1（真树复现级）：往届轮次交付/残留的 LLM 毒 pom（com.ruoyi:starter-web 类
+    # 伪造块）也躺在项目树里——"项目树=干净基线"跨任务即失效，首个匹配会把 round47 的
+    # 毒原样发回还盖权威章。治法：①收集全部候选 group + 各 pom 自身 artifactId（工程
+    # 内部模块集合）；②非工程 groupId 的候选唯一 → 采信；多个互斥 → 存疑弃用；
+    # ③工程 groupId 只有当 artifact 真是 reactor 内部模块时才合法（裸第三方 artifact
+    # + 工程 groupId = 伪造，本函数的公理，无论证据来自哪都拒绝）。
+    project_group: str | None = None
+    module_own: set[str] = set()
+    candidates: list[str] = []
+    for i, pom in enumerate(poms):
+        try:
+            txt = pom.read_text("utf-8", errors="replace")
+        except OSError:
+            continue
+        txt = _re.sub(r"<!--.*?-->", "", txt, flags=_re.S)
+        # pom 自身坐标区（剥 parent/依赖/构建块后首个 artifactId/groupId）
+        body = _re.sub(r"<parent>.*?</parent>", "", txt, flags=_re.S)
+        body = _re.sub(
+            r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=_re.S)
+        body = _re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=_re.S)
+        body = _re.sub(r"<build>.*?</build>", "", body, flags=_re.S)
+        own_a = _re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
+        if own_a:
+            module_own.add(own_a.group(1))
+        if i == 0:
+            og = _re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", body)
+            project_group = og.group(1) if og else None
+            for m in _re.findall(r"<module>\s*([^<\s]+)\s*</module>", txt):
+                module_own.add(m.rstrip("/").rsplit("/", 1)[-1])
+        for blk in _re.finditer(r"<dependency>(.*?)</dependency>", txt, _re.S):
+            # 复核 F2：剥 <exclusions>——exclusion 里的 artifactId 撞名会错配外层 group
+            b = _re.sub(r"<exclusions>.*?</exclusions>", "", blk.group(1), flags=_re.S)
+            a = _re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", b)
+            if not a or a.group(1) != artifact_id:
+                continue
+            g = _re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", b)
+            if g:
+                candidates.append(g.group(1))
+    third_party = sorted({c for c in candidates if c != project_group})
+    if len(third_party) == 1:
+        return third_party[0]
+    if len(third_party) > 1:
+        return None  # 互斥证据 → 存疑弃用（省略依赖，绝不猜）
+    if project_group and artifact_id in module_own:
+        return project_group  # 真 reactor 内部模块，工程 groupId 合法（无需依赖块证据）
+    return None
+
+
 def _deterministic_pom_template(mod: str, artifacts: list[str],
                                 project_path: str | None) -> str:
     """R45-2：从根 pom parent GAV + 契约 artifacts 确定性生成模块 pom 模板。
@@ -283,7 +348,18 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
             if ":" in art:
                 dg, da = art.split(":", 1)[0].strip(), art.split(":", 1)[1].split(":")[0].strip()
             else:
-                dg, da = g.group(1).strip(), art
+                # R47-2 治本：裸 artifact 绝不回退工程 groupId（那会凭空制造
+                # `com.ruoyi:spring-boot-starter-web` 幽灵坐标毒化 reactor）——只认
+                # 基线 poms 证据；解析不到 → 省略该依赖 + 响亮日志（缺依赖=可归因
+                # 可修的编译错，worker/A2 可后补；伪造坐标=全 reactor 连坐）。
+                da = art
+                dg = _dep_group_from_baseline(project_path, art)
+                if not dg:
+                    logger.warning(
+                        "[SCAFFOLD-TPL] R47-2 模块 %s 的契约依赖 %r 在基线 poms 中"
+                        "解析不到 groupId → 从权威模板省略（绝不伪造工程 groupId 坐标）",
+                        mod, art)
+                    continue
             if dg and da:
                 deps.append(
                     f"        <dependency>\n            <groupId>{dg}</groupId>\n"
