@@ -291,3 +291,103 @@ def test_f5_owner_check_normalizes_dot_slash():
         {"module": "mod-b", "artifacts": ["org.x:mod-a"]},
     ]}
     assert unclaimed_contract_deps(plan) == [], "归一后 ./mod-b/pom.xml 是合法 owner"
+
+
+# ── ③ R48-1：无候选孤儿 → 确定性新建承接子任务 ──
+def test_r48_orphan_no_candidate_synthesizes_subtask():
+    """round48 死因回归：ruoyi-common 孤儿文件无任何同模块子任务 → 三轮原样打回
+    CONFIRM 拒绝。治=收尾器新建承接子任务，VALIDATE 归属过闸。"""
+    plan = TaskPlan(
+        task_id="t-r48", subtasks=[
+            _st("st-1", create=["alarm-core/src/A.java"]),
+            _st("st-2", create=["alarm-core/src/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    fp = [{"path": "ruoyi-common/src/main/java/com/ruoyi/common/utils/sign/SysPasswordService.java",
+           "purpose": "密码策略校验服务"}]
+    out = finish_plan_deterministic(plan, fp, None, "实现密码策略")
+    assert out["orphans_left"] == [], "无候选孤儿必须被承接，不再留给 VALIDATE 打回"
+    assert out.get("orphan_subtasks"), "机读账必须记录新建承接"
+    sid = next(iter(out["orphan_subtasks"]))
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert st.scope.create_files == [fp[0]["path"]]
+    assert "密码策略校验服务" in st.description, "file_plan purpose 必须进 worker 明示意图"
+    assert [sid] in plan.parallel_groups, "parallel_groups 完整性守约"
+    # 归属校验过闸（VALIDATE 权威口径）
+    res = validate_file_plan_ownership(plan, fp)
+    assert res.valid and not res.issues
+
+
+def test_r48_orphan_synthesis_idempotent():
+    plan = TaskPlan(
+        task_id="t-r48b", subtasks=[_st("st-1", create=["m/x.java"])],
+        parallel_groups=[["st-1"]])
+    # 单子任务计划跳过孤儿处理（既有语义）——用双子任务触发
+    plan.subtasks.append(_st("st-2", create=["m/y.java"]))
+    plan.parallel_groups[0].append("st-2")
+    fp = [{"path": "other/z.java"}]
+    out1 = finish_plan_deterministic(plan, fp, None, "t")
+    n1 = len(plan.subtasks)
+    out2 = finish_plan_deterministic(plan, fp, None, "t")
+    assert len(plan.subtasks) == n1, "二跑不得重复建子任务"
+    assert out1.get("orphan_subtasks")
+    assert not out2.get("orphan_subtasks") and out2["orphans_left"] == []
+
+
+def test_r48_existing_baseline_file_goes_writable(tmp_path):
+    """基线已存在的孤儿文件 → writable（改）而非 create_files（防 clobber 语义错位）。"""
+    (tmp_path / "modx").mkdir()
+    (tmp_path / "modx" / "Existing.java").write_text("class E {}", "utf-8")
+    plan = TaskPlan(
+        task_id="t-r48c", subtasks=[
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    fp = [{"path": "modx/Existing.java"}]
+    out = finish_plan_deterministic(plan, fp, str(tmp_path), "t")
+    sid = next(iter(out["orphan_subtasks"]))
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert st.scope.writable == ["modx/Existing.java"]
+    assert st.scope.create_files == []
+
+
+def test_r48_depends_on_same_module_scaffold():
+    """同模块已有脚手架 → 新建承接子任务依赖之（先有 pom 再写码）。"""
+    plan = TaskPlan(
+        task_id="t-r48d", subtasks=[
+            _st("st-scaffold-modz", create=["modz/pom.xml"]),
+            _st("st-1", create=["m/a.java"])],
+        parallel_groups=[["st-scaffold-modz", "st-1"]])
+    fp = [{"path": "modz/src/Svc.java"}]
+    out = finish_plan_deterministic(plan, fp, None, "t")
+    sid = next(iter(out["orphan_subtasks"]))
+    st = next(s for s in plan.subtasks if s.id == sid)
+    assert "st-scaffold-modz" in st.depends_on
+
+
+def test_r48_f1_adopt_into_existing_fileplan_subtask():
+    """复核 F1：sid 撞既有 st-fileplan-* → 收养追加，绝不丢弃后到孤儿。"""
+    plan = TaskPlan(
+        task_id="t-r48e", subtasks=[
+            _st("st-fileplan-modq", create=["modq/pom.xml"]),  # 只有构建清单=非候选
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-fileplan-modq", "st-1", "st-2"]])
+    fp = [{"path": "modq/src/NewSvc.java", "purpose": "新服务"}]
+    out = finish_plan_deterministic(plan, fp, None, "t")
+    host = next(s for s in plan.subtasks if s.id == "st-fileplan-modq")
+    assert "modq/src/NewSvc.java" in host.scope.create_files, "后到孤儿必须被收养"
+    assert out["orphans_left"] == []
+    assert "新服务" in host.description
+
+
+def test_r48_f2_large_group_presharded():
+    """复核 F2：15 个同模块孤儿 → 预分片（每组 ≤6），绝不造超限子任务。"""
+    plan = TaskPlan(
+        task_id="t-r48f", subtasks=[
+            _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    fp = [{"path": f"bigmod/src/F{i}.java"} for i in range(15)]
+    out = finish_plan_deterministic(plan, fp, None, "t")
+    assert out["orphans_left"] == []
+    sts = [s for s in plan.subtasks if s.id.startswith("st-fileplan-bigmod")]
+    assert len(sts) == 3, "15 文件 → 3 片（6+6+3）"
+    for s in sts:
+        assert len(s.scope.create_files) + len(s.scope.writable) <= 6

@@ -24,6 +24,98 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
+                                project_path: str | None,
+                                _task_description: str = "") -> dict[str, list[str]]:
+    """R48-1：为挂靠无候选的 file_plan 孤儿按顶层模块新建子任务 → {sid: [paths]}。
+
+    确定性、幂等；描述带上 file_plan 条目的 purpose（worker 拿到明示意图）；文件
+    已存在于基线 → writable（改），否则 create_files（建）；同模块有脚手架子任务
+    → depends_on（先有 pom 再写码）；parallel_groups 完整性守约（与 SCAFFOLD-INJECT
+    同款接线；dispatch 纯 depends_on 驱动，组序无拓扑约束）。
+    复核 F1：sid 撞既有 st-fileplan-* 时【收养进既有子任务】而非丢弃整组——
+    continue 会让后到孤儿每轮原样打回=round48 死法换壳；复核 F2：组内按
+    _MAX_FILES_PER_GROUP 预分片，绝不确定性造出超 validate 文件上限的子任务。
+    """
+    from pathlib import Path
+
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskIntent
+    _MAX_FILES_PER_GROUP = 6  # < validate 硬闸 12，且给 ELABORATE 按实体拆留余量
+    # purpose 索引：归一路径 → file_plan 条目描述文本
+    purpose: dict[str, str] = {}
+    for e in (file_plan or []):
+        if isinstance(e, dict) and e.get("path"):
+            p = str(e["path"]).replace("\\", "/").strip("/")
+            txt = str(e.get("purpose") or e.get("description") or "").strip()
+            if txt:
+                purpose[p] = txt
+    groups: dict[str, list[str]] = {}
+    for f in orphans:
+        p = str(f).replace("\\", "/").lstrip("/")
+        groups.setdefault(p.split("/", 1)[0] if "/" in p else "root", []).append(p)
+    by_id = {st.id: st for st in plan.subtasks}
+    created: dict[str, list[str]] = {}
+
+    def _fmt(paths: list[str]) -> str:
+        return "\n".join(
+            f"- {p}" + (f"：{purpose[p]}" if p in purpose else "") for p in paths)
+
+    for mod, paths in sorted(groups.items()):
+        base_sid = f"st-fileplan-{mod}"
+        # 复核 F1：既有承接子任务 → 收养（追加 scope+描述+验收），绝不丢弃
+        if base_sid in by_id and by_id[base_sid].id.startswith("st-fileplan-"):
+            host = by_id[base_sid]
+            adopt = [p for p in paths
+                     if p not in host.scope.create_files
+                     and p not in host.scope.writable]
+            if adopt:
+                for p in adopt:
+                    exists = bool(project_path) and (Path(project_path) / p).is_file()
+                    (host.scope.writable if exists
+                     else host.scope.create_files).append(p)
+                    host.acceptance_criteria.append(
+                        f"{p} 按 file_plan 用途实现并编译通过")
+                host.description += "\n【file_plan 承接·追加】\n" + _fmt(adopt)
+                created[base_sid] = adopt
+            continue
+        # 复核 F2：预分片防超限
+        chunks = [paths[i:i + _MAX_FILES_PER_GROUP]
+                  for i in range(0, len(paths), _MAX_FILES_PER_GROUP)]
+        for ci, chunk in enumerate(chunks):
+            sid = base_sid if ci == 0 else f"{base_sid}-{ci + 1}"
+            if sid in by_id:
+                continue
+            writable, create = [], []
+            for p in chunk:
+                exists = bool(project_path) and (Path(project_path) / p).is_file()
+                (writable if exists else create).append(p)
+            st = SubTask(
+                id=sid,
+                description=(
+                    f"【file_plan 承接】技术方案 file_plan 规划了以下 {mod} 模块文件，"
+                    "但无子任务承接（收尾器确定性新建本子任务）。按各文件用途完整实现：\n"
+                    + _fmt(chunk)),
+                intent=TaskIntent.MODIFY if writable and not create else TaskIntent.CREATE,
+                difficulty=SubTaskDifficulty.MEDIUM,
+                scope=FileScope(writable=writable, create_files=create),
+                acceptance_criteria=[
+                    f"{p} 按 file_plan 用途实现并编译通过" for p in chunk],
+            )
+            scaffold_sid = f"st-scaffold-{mod}"
+            if scaffold_sid in by_id:
+                st.depends_on.append(scaffold_sid)
+            plan.subtasks.append(st)
+            by_id[sid] = st
+            if plan.parallel_groups:
+                plan.parallel_groups.append([sid])
+            created[sid] = chunk
+    if created:
+        logger.info(
+            "[PLAN-FINISH] R48-1 孤儿无候选 → 确定性新建/收养承接子任务 %d 个: %s",
+            len(created), {k: v[:3] for k, v in created.items()})
+    return created
+
+
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "") -> dict:
     """对 plan 原地跑确定性收尾（脚手架注入 + 孤儿挂靠）。
@@ -67,14 +159,38 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             attached, left = attach_orphan_file_plan_entries(plan, paths)
             out["orphans_attached"] = attached
             out["orphans_left"] = left
+            # ③ R48-1（round48 死因）：挂靠"无候选"（没有任何子任务碰该模块）时，
+            # 旧行为留给 VALIDATE 打回——但 LLM 三轮都不按 issues 修（round48 实测
+            # 单个 ruoyi-common 孤儿文件三连原样打回 → CONFIRM 拒绝杀整个计划）。
+            # VALIDATE 提示语自己就写着治法"或为其新建子任务"——这一步是机械可做的，
+            # 收尾器确定性闭环：按模块分组新建子任务承接（幂等、零 LLM）。
+            if left:
+                created = _synthesize_orphan_subtasks(
+                    plan, left, file_plan, project_path, task_description)
+                if created:
+                    out["orphan_subtasks"] = created
+                    _cset = {p for ids in created.values() for p in ids}
+                    out["orphans_left"] = [p for p in left if p not in _cset]
+                    from swarm.brain.nodes.shared import bootstrap_subtask_harness
+                    for st in plan.subtasks:
+                        if st.id in created:
+                            bootstrap_subtask_harness(
+                                st, task_description or st.description)
+                            if not getattr(st, "est_context_tokens", 0):
+                                # 复核 F3：MEDIUM 基线 50000 与主启发式同源（8000 是 TRIVIAL 档）
+                                st.est_context_tokens = (
+                                    50000 + 6000 * max(1, len(created[st.id])))
     except Exception:  # noqa: BLE001
         logger.warning("[PLAN-FINISH] 孤儿文件挂靠失败（fail-open）", exc_info=True)
-    if out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]:
+    if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
+            or out.get("orphan_subtasks")):
         logger.info(
-            "[PLAN-FINISH] 确定性收尾：脚手架注入 %d 个模块%s；file_plan 孤儿挂靠 %d 个%s",
+            "[PLAN-FINISH] 确定性收尾：脚手架注入 %d 个模块%s；file_plan 孤儿挂靠 %d 个%s%s",
             len(out["scaffolds"]),
             f" {out['scaffolds']}" if out["scaffolds"] else "",
             out["orphans_attached"],
+            f"；无候选新建承接子任务 {len(out['orphan_subtasks'])} 个"
+            if out.get("orphan_subtasks") else "",
             f"（仍无候选 {len(out['orphans_left'])} 个: {out['orphans_left'][:5]}，"
             "留 VALIDATE 权威打回）" if out["orphans_left"] else "")
     return out
