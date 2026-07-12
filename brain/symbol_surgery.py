@@ -98,9 +98,52 @@ def surgical_symbol_attach(
     st_by_id = {st.id: st for st in subtasks}
     attach_load: dict[str, int] = {st.id: 0 for st in subtasks}
 
+    # R44（R41-5 真身实锤）：契约 module=tech_design 逻辑模块名（alarm-channel），
+    # 代码实际落在物理目录（ruoyi-alarm/**/channel/**）——路径首段推导与逻辑名
+    # 永不相交，外科四轮 0 命中（0/100、0/72、0/76、0/47）。词元通道兜底：
+    # 模块名的【全部】词元段都以子串出现在写目标的目录部（小写去分隔符）才算候选
+    # （全段命中防短词元误配；通用规则不写死项目名）。round44 真 plan 离线验证
+    # 9/9 逻辑模块均有候选（1-20 个）。误配面有界：挂靠只写 contract.symbols
+    # （advisory），挂后 C1 同口径复核通过才放行，L2 全量核验不变。
+    _dir_blob: dict[str, str] = {}
+    _dir_files: dict[str, list[str]] = {}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        dirs = []
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            p = str(f).replace("\\", "/")
+            # 复核 F1：无目录的根文件（alarm_channel_schema.sql 等）rsplit 会把
+            # 文件名当目录漏进 blob → 纯 DDL/文档子任务幻影 owner——与
+            # _subtask_modules 同口径跳过
+            if "/" not in p:
+                continue
+            # R39 CRITICAL 红线同源：构建清单不构成"能实现符号"的证据——脚手架
+            # <module>/pom.xml 的目录名天然含模块词元，不滤则幻影 ownership 复活
+            if p.rsplit("/", 1)[-1].strip() in _BUILD_MANIFESTS:
+                continue
+            dirs.append(p.rsplit("/", 1)[0].lower().replace("-", "").replace("_", ""))
+        _dir_files[st.id] = dirs
+        _dir_blob[st.id] = " ".join(dirs)
+
     def _candidates(mod: str) -> list[str]:
         cands = [sid for sid, mods in st_mods.items() if mod in mods]
-        return sorted(cands, key=lambda sid: (-st_mods[sid][mod], sid))
+        if cands:
+            return sorted(cands, key=lambda sid: (-st_mods[sid][mod], sid))
+        segs = [s for s in mod.lower().replace("_", "-").split("-") if s]
+        if not segs:
+            return []
+
+        # 复核 F2：候选门槛=存在【单个目录】全段命中（跨文件拼凑
+        # ruoyi-alarm/**/log + ruoyi-system/**/notify 凑出 alarm-notify 不算）。
+        # 复核 F3（留观的设计取舍）：词元按子串匹配目录串，"rapid" 含 "api" 这类
+        # 词内误配理论存在；换 / 分段包含匹配会伤真实召回（35/47 实测通道），
+        # 且误配后果=advisory 挂靠由 L2/D5 兜底，接受并留观。
+        def _hits(sid: str) -> int:
+            return sum(1 for d in _dir_files[sid] if all(seg in d for seg in segs))
+
+        tok_cands = [sid for sid in _dir_files if _hits(sid) > 0]
+        return sorted(tok_cands, key=lambda sid: (-_hits(sid), sid))
 
     # 3) 逐符号确定性挂靠；无模块/无候选/候选全满 → remainder（绝不猜挂）
     for sym in unowned:
