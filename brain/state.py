@@ -248,6 +248,7 @@ class BrainState(TypedDict, total=False):
     tech_design_generation_failed: bool  # F7(round28)：tech_design 整体 LLM 失败→file_plan 为空/方案占位的 fail-fast 标记 → can_auto_accept_plan(gates.py:66) 拦下升级人工。此前未声明→LangGraph 静默丢→闸门死代码（与 plan_generation_failed 同类，AST 测试原 glob 只扫 brain/nodes/ 漏了 brain/planning_nodes.py 才放过）
     deliver_auto_reject_reason: str     # DELIVER 自动拒绝原因（runner 读取回写任务态/前端展示）
     l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
+    l2_missing_fp_history: list[str]    # R46-3：L2 契约缺失符号指纹连击史（三连不变→跳过 D5 归因直接升级，杜绝同缺口空转重跑 L2；指纹变化即重置）
 
     # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
     uploaded_files: list[str]           # 任务创建时上传的文件路径（绝对路径，任务专属目录）
@@ -314,6 +315,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "subtask_rebase_counts": "monotonic",
     "merge_rebase_dropped": "monotonic",
     "l2_targeted": "oneshot",
+    "l2_missing_fp_history": "round",   # R46-3：每次契约失败整体替换（连击追加/指纹变化重置）
     "verification_failure": "oneshot",
     "runtime_smoke_sandbox_id": "oneshot",
     "runtime_smoke_last_signature": "oneshot",  # 冒烟通过断链清（3.8 修）

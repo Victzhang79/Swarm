@@ -1217,7 +1217,106 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
         rels = [m for m in manifests if (_P(project_path) / m).is_file()]
         if not rels:
             return 0
-        stats = manager.sync_files_to_sandbox(sandbox, project_path, rels, remote)
+        # R46-1 治本：本地共享树的聚合清单可能已注册【并行兄弟子任务】拉回的模块，而这些
+        # 模块目录在【本沙箱】不存在——原样推进会让 reactor "Child module does not exist"
+        # 硬错，构建根本跑不起来 → det=None → verification_not_run 判死好产出。推送前剪枝，
+        # 三重保守闸（对抗复核 F1/F3 整改）：
+        #   ① 基线闸：只有【相对 git HEAD 基线新增】的成员才有剪枝资格——bootstrap 是 scope
+        #     稀疏上传（非全树），基线成员在沙箱缺席是上传策略使然，剪掉会经 repaired_file_paths
+        #     的 push→pull-back 回路把反注册扩散进权威树与交付 diff（F1 最高危）。基线读不到
+        #     （非 git 等）→ 该清单整体不剪。
+        #   ② 双态探针：沙箱逐项回显 OK/NO；行缺失=未知=保留（F3：单态 [ -e ]&&echo 无法区分
+        #     「测过不存在」与「输出丢行」，fail-open 契约会被击穿）。
+        #   ③ 剪枝副本从临时镜像目录同步（用后即删，F6），绝不回写本地共享树。
+        src_root = project_path
+        _mirror: str | None = None
+        try:
+            from swarm.worker.workspace_manifest import (
+                manifest_member_probes, prune_manifest_members,
+            )
+            import subprocess as _sp
+            probe_map: dict[str, list[tuple[str, str]]] = {}
+            baseline_members: dict[str, set] = {}
+            all_probes: list[str] = []
+            for rel in rels:
+                text = (_P(project_path) / rel).read_text("utf-8", errors="ignore")
+                pairs = manifest_member_probes(rel, text)
+                if not pairs:
+                    continue
+                # ① 基线成员集：git HEAD 里同清单的成员 token（读不到 → None 哨兵=整体不剪）
+                try:
+                    _git = _sp.run(
+                        ["git", "-C", project_path, "show", f"HEAD:{rel}"],
+                        capture_output=True, text=True, timeout=10)
+                    if _git.returncode == 0:
+                        baseline_members[rel] = {
+                            t for t, _ in manifest_member_probes(rel, _git.stdout)}
+                    else:
+                        continue  # 基线不可知 → 本清单不剪（fail-open）
+                except Exception:  # noqa: BLE001
+                    continue
+                base = rel.rsplit("/", 1)[0] + "/" if "/" in rel else ""
+                probe_map[rel] = pairs
+                # 只探测有剪枝资格（非基线）的成员，省探针
+                all_probes.extend(
+                    base + p for t, p in pairs if t not in baseline_members[rel])
+            if all_probes:
+                import shlex as _shlex
+                _q = " ".join(_shlex.quote(p) for p in sorted(set(all_probes)))
+                cr = manager.run_command(
+                    sandbox,
+                    f'cd {remote} && for p in {_q}; do if [ -e "$p" ]; then echo "OK $p"; '
+                    f'else echo "NO $p"; fi; done; true',
+                    timeout=30,
+                )
+                if getattr(cr, "success", False):
+                    _state: dict[str, bool] = {}
+                    for ln in (cr.stdout or "").splitlines():
+                        ln = ln.strip()
+                        if ln.startswith("OK "):
+                            _state[ln[3:]] = True
+                        elif ln.startswith("NO "):
+                            _state[ln[3:]] = False
+                    import tempfile as _tmp
+                    for rel, pairs in probe_map.items():
+                        text = (_P(project_path) / rel).read_text("utf-8", errors="ignore")
+                        base = rel.rsplit("/", 1)[0] + "/" if "/" in rel else ""
+                        _bl = baseline_members[rel]
+                        _tok_probe = {p: t for t, p in pairs}
+
+                        def _exists(p, _b=base, _bl=_bl, _tp=_tok_probe):
+                            if _tp.get(p) in _bl:
+                                return True  # ① 基线成员恒保留
+                            return _state.get(_b + p)  # ② 双态；缺行=None=保留
+
+                        new_text, removed = prune_manifest_members(rel, text, _exists)
+                        if not removed:
+                            continue
+                        if _mirror is None:
+                            _mirror = _tmp.mkdtemp(prefix="swarm-manifest-prune-")
+                            # 未剪枝的清单也镜像原文，保证单一 src_root 一次同步
+                            for r2 in rels:
+                                dst0 = _P(_mirror) / r2
+                                dst0.parent.mkdir(parents=True, exist_ok=True)
+                                dst0.write_text(
+                                    (_P(project_path) / r2).read_text("utf-8", errors="ignore"),
+                                    encoding="utf-8")
+                        (_P(_mirror) / rel).write_text(new_text, encoding="utf-8")
+                        logger.info(
+                            "[L1.2.1·module-reg] 推送前按沙箱 ground truth 剪枝 %s：摘除"
+                            "【基线外且沙箱不存在】的成员 %s（防 reactor missing-child "
+                            "硬错误判死本子任务；基线成员恒保留）", rel, removed)
+                    if _mirror is not None:
+                        src_root = _mirror
+        except Exception as _pexc:  # noqa: BLE001 — 剪枝失败回退原样推送（旧行为）
+            logger.warning("[L1.2.1·module-reg] 沙箱剪枝跳过(不致命,原样推送): %s", _pexc)
+            src_root = project_path
+        try:
+            stats = manager.sync_files_to_sandbox(sandbox, src_root, rels, remote)
+        finally:
+            if _mirror is not None:
+                import shutil as _sh
+                _sh.rmtree(_mirror, ignore_errors=True)
         uploaded = int((stats or {}).get("uploaded", 0))
         if uploaded:
             # D57：沙箱清单集变化（本函数是 L1 中途唯一新增清单的路径）→ 失效在场性缓存
@@ -2674,7 +2773,9 @@ def run_l1_pipeline(
         # 注册)，再 scope——否则 _maven_modules 扫不到该模块、无法 -pl 收窄，退回全 reactor 必死。
         try:
             from swarm.worker.workspace_manifest import reconcile_workspace_manifests
-            _wm = reconcile_workspace_manifests(project_path, modified)
+            # F4：L1 在【活动共享树】上只补漏不摘幽灵——owner 先行登记(contract_utils 规则4)
+            # 的模块目录物化在后，此时 prune 会误摘；幽灵清理留给 L2/交付两处定格树。
+            _wm = reconcile_workspace_manifests(project_path, modified, prune=False)
             _manifests = _wm.get("modified_manifests") or []
             if _manifests:
                 logger.info(

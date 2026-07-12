@@ -31,6 +31,18 @@ from swarm.types import Complexity, WorkerOutput
 logger = logging.getLogger(__name__)
 
 
+def _l2_fp_advance(hist: list | None, fp: str, limit: int = 3) -> tuple[list[str], bool]:
+    """R46-3：L2 契约失败指纹连击推进 → (新历史, 是否达连击上限)。
+
+    与 B2 子任务级"失败指纹三连不变"同构，上移到 L2 层：同一批缺失符号连续 limit 次
+    不变，说明 D5 定向重派/复活通道对该缺口已无牙（round46 实测同指纹 4 连、每连重跑
+    一次完整 L2 集成编译白烧 ~9min）→ 直接携机读账走升级，不再空转。
+    指纹变化即重置（新缺口值得重新给 D5 机会）。"""
+    hist = list(hist or [])
+    hist = hist + [fp] if (hist and hist[-1] == fp) else [fp]
+    return hist, len(hist) >= limit
+
+
 def _runtime_smoke_enabled() -> bool:
     """S1-4 运行时冒烟杀开关（对照 D52 SWARM_SANDBOX_TAR_SYNC 先例）：默认开。
 
@@ -128,6 +140,8 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
     # fail-closed 惯例：degraded 留痕（拦 L6 假成功学习 + deliver 可见），LLM 判定
     # 照跑（fail-open 主链不断，但绝不再无痕）。
     _l2_unverified_degraded: list[str] = []
+    # F5：契约对账通过时置 {"l2_missing_fp_history": []}，随后每个 return 统一携带清零
+    _fp_reset: dict = {}
     if not project_path and (merged_diff or "").strip():
         logger.warning(
             "[VERIFY_L2] project_path 不可得（project_id=%s）——确定性集成审查（编译+契约）"
@@ -238,6 +252,9 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                 _ctr_failed: list = []
                 _missing: list = []
                 _unattributed: list = []
+                # R46-3 预初始化：归因 try 块内任何一步抛错都不能让下方 return 的
+                # _fp_hist 变成 NameError（异常路径本就走升级，历史原样带出即可）
+                _fp_hist: list = list(state.get("l2_missing_fp_history") or [])
                 try:
                     import json as _json
 
@@ -251,6 +268,29 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     # R43 复核 F4：与 integration_review 同口径（I 基名变体）
                     _missing = [x for x in _csyms(_sc)
                                 if not any(v in _dl for v in _sdv(x))]
+                    # R46-3：同指纹连击守卫——缺失集合三连不变则跳过归因直接升级
+                    import hashlib as _hl
+                    _fp = _hl.sha1(
+                        "|".join(sorted(_missing)).encode("utf-8")).hexdigest()[:16]
+                    _fp_hist, _fp_exhausted = _l2_fp_advance(
+                        state.get("l2_missing_fp_history"), _fp)
+                    if _fp_exhausted:
+                        logger.warning(
+                            "[VERIFY_L2] R46-3 契约缺失指纹 %s 连续 %d 次不变——D5 定向"
+                            "重派对该缺口已无牙，携机读账直接升级（不再空转 L2）",
+                            _fp, len(_fp_hist))
+                        return {
+                            "l2_passed": False,
+                            "verification_failure": "contract",
+                            "failure_strategy": "escalate",
+                            "failed_subtask_ids": [],
+                            "l2_missing_fp_history": _fp_hist,
+                            "l2_details": {
+                                "integration_review": ir_details, "issues": ir_issues,
+                                "contract_unattributed": list(_missing),
+                                "fp_repeat_exhausted": len(_fp_hist),
+                            },
+                        }
                     if _missing and plan_obj is not None:
                         _owners, _sym_owners, _unattributed = _d5_attribute_owners(
                             _missing, plan_obj, subtask_results)
@@ -272,6 +312,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     "verification_failure": "contract",
                     "failure_strategy": "retry" if _ctr_failed else "escalate",
                     "failed_subtask_ids": _ctr_failed,
+                    "l2_missing_fp_history": _fp_hist,
                     "l2_details": _l2d,
                 }
             # TD2606-B8：把集成编译失败归因到具体子任务（编译输出已含出错文件路径），
@@ -281,6 +322,10 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             return _l2_failure_state(
                 subtask_results, attributed_ids=attributed, l2_details=_l2_details
             )
+        # F5（对抗复核，T5 粘滞同构）：契约对账通过=旧缺失集已解决 → 指纹历史必须清零，
+        # 否则跨"失败→修好→回归"的历史残留会让新一轮首次契约失败被误凑成三连直升级。
+        if state.get("l2_missing_fp_history"):
+            _fp_reset["l2_missing_fp_history"] = []
 
     if (merged_diff or "").strip() and test_cmd.strip():
         # R23-1 续（round25 #10）：_try_l2_sandbox_verify/_try_l2_local_verify 内含 subprocess.run
@@ -292,8 +337,8 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         if sandbox_result is not None:
             logger.info("[VERIFY_L2] 沙箱结果: %s", "通过" if sandbox_result else "未通过")
             if not sandbox_result:
-                return _l2_failure_state(subtask_results)
-            return {"l2_passed": sandbox_result}
+                return {**_l2_failure_state(subtask_results), **_fp_reset}
+            return {"l2_passed": sandbox_result, **_fp_reset}
 
         local_result = await asyncio.to_thread(
             nodes._try_l2_local_verify,
@@ -303,8 +348,8 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         if local_result is not None:
             logger.info("[VERIFY_L2] 本地结果: %s", "通过" if local_result else "未通过")
             if not local_result:
-                return _l2_failure_state(subtask_results)
-            return {"l2_passed": local_result}
+                return {**_l2_failure_state(subtask_results), **_fp_reset}
+            return {"l2_passed": local_result, **_fp_reset}
     elif (merged_diff or "").strip() and not test_cmd.strip():
         # 任务未要求测试（criteria 无显式测试命令）→ 跳过功能测试验证。
         # integration_review（编译+契约+git apply 同源）已作为确定性证据通过，故【放行】
@@ -317,7 +362,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             "[VERIFY_L2] 无显式测试命令，integration_review 已通过 → L2 放行"
             "（未跑功能测试，标记 degraded: l2_no_test_executed）"
         )
-        return {"l2_passed": True, "degraded_reasons": ["l2_no_test_executed"]}
+        return {"l2_passed": True, "degraded_reasons": ["l2_no_test_executed"], **_fp_reset}
 
     l2_passed = await nodes._verify_l2_via_llm(
         task_description,
@@ -328,11 +373,12 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
     logger.info(f"[VERIFY_L2] 结果: {'通过' if l2_passed else '未通过'}")
     if not l2_passed:
-        return _l2_failure_state(subtask_results)
+        return {**_l2_failure_state(subtask_results), **_fp_reset}
     # D6：纯 LLM 放行 + 确定性审查被跳过 → degraded 留痕（reducer 追加去重）
     if _l2_unverified_degraded:
-        return {"l2_passed": l2_passed, "degraded_reasons": _l2_unverified_degraded}
-    return {"l2_passed": l2_passed}
+        return {"l2_passed": l2_passed, "degraded_reasons": _l2_unverified_degraded,
+                **_fp_reset}
+    return {"l2_passed": l2_passed, **_fp_reset}
 
 
 async def verify_l3(state: BrainState) -> dict:

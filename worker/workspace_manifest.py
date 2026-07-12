@@ -39,19 +39,24 @@ _SKIP_DIRS = {
 
 
 def reconcile_workspace_manifests(
-    project_path: str, modified: list[str] | None = None
+    project_path: str, modified: list[str] | None = None, prune: bool = True
 ) -> dict:
     """对账项目内所有【显式成员列表】型聚合清单，使其枚举磁盘上真实存在的成员模块。
 
     确定性、幂等、模型无关。返回:
         {"modified_manifests": [清单相对路径...],
-         "added": {清单相对路径: [新增成员标识...]}}
+         "added": {清单相对路径: [新增成员标识...]},
+         "removed": {清单相对路径: [被摘幽灵成员...]}}
     `modified` 仅作候选提示，真正驱动是磁盘 ground-truth 扫描，故传 None 也正确。
     任一生态的对账抛错都被隔离吞掉(增益层不可拖垮主流程)，其它生态照常对账。
+    `prune=False` 只补漏不摘幽灵——L1 调用点必须传 False（对抗复核 F4：活动共享树上
+    contract_utils 规则 4 让 root pom owner 先行登记全部新模块，目录物化在后；此时
+    prune 会把先行登记误当幽灵摘掉，且与 pull-back flock 不是同一把锁存在 lost-update）。
+    L2(integration_review，reset+apply 定格树)/交付(learn_success，锁内)两处用默认 True。
     """
     root = Path(project_path)
     if not root.is_dir():
-        return {"modified_manifests": [], "added": {}}
+        return {"modified_manifests": [], "added": {}, "removed": {}}
     hint = [str(m or "") for m in (modified or [])]
     modified_manifests: list[str] = []
     added: dict[str, list[str]] = {}
@@ -68,7 +73,13 @@ def reconcile_workspace_manifests(
         for k, v in adds.items():
             if v:
                 added.setdefault(k, []).extend(v)
-    return {"modified_manifests": modified_manifests, "added": added}
+    # R46-2：add 侧补漏后跑 prune 侧摘幽灵（目录已不存在的成员条目会毒死 reactor/构建）。
+    # 双向镜像同一 ground truth，幂等：add 只加真实存在的，prune 只摘真实不存在的，互不打架。
+    removed = prune_stale_manifest_members(project_path) if prune else {}
+    for k in removed:
+        if k not in modified_manifests:
+            modified_manifests.append(k)
+    return {"modified_manifests": modified_manifests, "added": added, "removed": removed}
 
 
 def _rel(root: Path, p: Path) -> str:
@@ -555,3 +566,159 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
         return [], {}
     rel = _rel(root, gowork)
     return [rel], {rel: new_members}
+
+
+# ══════════════════ R46 治本：成员条目 ↔ 磁盘存在 双向镜像（prune 侧）══════════════════
+# round46 实锤两面同根：
+#   R46-1  reconcile 按【本地共享树】注册的聚合清单被原样推进【沙箱】——沙箱里没有并行兄弟
+#          模块目录 → Maven reactor "Child module does not exist" 硬错 → 构建根本跑不起来
+#          → det=None → verification_not_run 判死好产出（脚手架 pom 本身完全正确）。
+#   R46-2  阶梯三 revert 清了模块目录足迹，但 root pom 的 <module> 条目没反注册 → 幽灵条目
+#          把 L2 集成编译毒死（revert 本意恰是"防 reactor 中毒"）。
+# 治本不变量：显式成员清单的条目必须与【目标树】上真实存在的成员双向镜像——add 侧(上方
+# reconcile)补漏，prune 侧(本节)摘幽灵。probe 语义统一为「相对清单所在目录的存在性探针」，
+# 存在性判定由调用方注入(本地 FS / 沙箱批量 test -e)，核心解析只此一份、多栈复用。
+# 保守边界与 add 侧一致：.sln 不碰(格式复杂)；glob 型成员不碰；member_exists 返回 None
+# (未知，如沙箱探测失败)一律保留条目 fail-open——绝不因探测通道故障误删成员。
+
+def _pom_modules_span(text: str) -> tuple[int, int] | None:
+    """首个【不在 <profiles> 内】的 <modules> 块 span（含标签）。
+
+    对抗复核 F2-3：profiles 块可先于主 <modules> 出现，全文首匹配会把探测/剪除
+    整体打在 profile 块上（主块幽灵永不被剪 + profile 被误清空）。probes 与 prune
+    都必须锚定同一个主块 span。
+    """
+    pspans = [m.span() for m in re.finditer(r"<profiles>.*?</profiles>", text, re.S)]
+    for m in re.finditer(r"<modules>.*?</modules>", text, re.S):
+        if not any(a <= m.start() < b for a, b in pspans):
+            return m.span()
+    return None
+
+
+def manifest_member_probes(rel_path: str, text: str) -> list[tuple[str, str]]:
+    """解析清单的显式成员 → [(成员原始 token, 存在性探针相对路径)]。
+
+    探针相对【清单所在目录】：Maven=<module 值>/pom.xml（reactor 两者缺一即硬错）；
+    Gradle include ':a:b'=a/b 目录；Cargo 显式 member=目录；go.work use=目录。
+    未识别的清单类型返回 []（调用方自然跳过剪枝）。
+    保守边界（对抗复核 F2）：pom 只看主 <modules> 块（profiles 不碰）；Gradle 只收
+    【单 token 独占一行】的 include（多工程单行 include 整行跳过，避免截断腐蚀）；
+    Cargo 只在 members 数组 span 内取显式项。
+    """
+    name = rel_path.rsplit("/", 1)[-1]
+    out: list[tuple[str, str]] = []
+    if name == "pom.xml":
+        span = _pom_modules_span(text)
+        if span:
+            for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", text[span[0]:span[1]]):
+                out.append((m, f"{m.rstrip('/')}/pom.xml"))
+    elif name in ("settings.gradle", "settings.gradle.kts"):
+        if not _GRADLE_DYNAMIC.search(text):
+            # 仅单 token 独占一行的 include；`include ':a', ':b'` 多 token 行不收
+            for m in re.finditer(
+                    r"(?m)^[ \t]*include[ \t]*\(?[ \t]*['\"]:?([\w:.-]+)['\"][ \t]*\)?[ \t]*$",
+                    text):
+                tok = m.group(1)
+                out.append((tok, tok.replace(":", "/")))
+    elif name == "Cargo.toml":
+        marr = re.search(r"members\s*=\s*\[(.*?)\]", text, re.S)
+        if marr and "#" not in marr.group(1):
+            for e in re.findall(r"['\"]([^'\"]+)['\"]", marr.group(1)):
+                if "*" not in e:  # glob 成员自愈，不碰
+                    out.append((e, e.rstrip("/")))
+    elif name == "go.work":
+        for m in re.finditer(r"use\s+(?:\(\s*)?\.?/?([^\s()]+)", text):
+            tok = m.group(1)
+            out.append((tok, tok.strip("/")))
+    return out
+
+
+def _sub_in_span(text: str, span: tuple[int, int], pat: re.Pattern) -> tuple[str, int]:
+    """只在 span 切片内做 count=1 删除，重组全文 → (新文本, 命中数)。"""
+    seg, n = pat.subn("", text[span[0]:span[1]], count=1)
+    if not n:
+        return text, 0
+    return text[:span[0]] + seg + text[span[1]:], n
+
+
+def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str, list[str]]:
+    """按存在性摘除清单中的幽灵成员条目 → (新文本, 被摘成员 token 列表)。
+
+    member_exists(probe_rel) -> bool | None：True=存在保留；False=幽灵摘除；
+    None=未知保留（fail-open）。仅逐条目做行级/标签级删除，绝不重排既有结构；
+    删除严格限定在 probes 同一 span 内（对抗复核 F2：全文匹配曾实测腐蚀
+    Gradle 多工程行 / Cargo path 依赖 / pom profiles 块）。
+    """
+    removed: list[str] = []
+    new_text = text
+    name = rel_path.rsplit("/", 1)[-1]
+    for tok, probe in manifest_member_probes(rel_path, text):
+        exists = member_exists(probe)
+        if exists is not False:
+            continue
+        n = 0
+        if name == "pom.xml":
+            span = _pom_modules_span(new_text)
+            if span:
+                pat = re.compile(
+                    r"[ \t]*<module>\s*" + re.escape(tok) + r"\s*</module>[ \t]*\r?\n?")
+                new_text, n = _sub_in_span(new_text, span, pat)
+        elif name in ("settings.gradle", "settings.gradle.kts"):
+            # 整行锚定：只删「单 token 独占一行」形态，多 token 行/注释行天然不匹配
+            pat = re.compile(
+                r"(?m)^[ \t]*include[ \t]*\(?[ \t]*['\"]:?" + re.escape(tok)
+                + r"['\"][ \t]*\)?[ \t]*$\n?")
+            new_text, n = pat.subn("", new_text, count=1)
+        elif name == "Cargo.toml":
+            marr = re.search(r"members\s*=\s*\[(.*?)\]", new_text, re.S)
+            if marr:
+                pat = re.compile(r"[ \t]*['\"]" + re.escape(tok) + r"['\"]\s*,?[ \t]*\r?\n?")
+                new_text, n = _sub_in_span(new_text, marr.span(1), pat)
+        elif name == "go.work":
+            pat = re.compile(r"(?m)^[ \t]*use[ \t]+\.?/?" + re.escape(tok) + r"[ \t]*$\n?")
+            new_text, n = pat.subn("", new_text, count=1)
+        if n and tok not in removed:
+            removed.append(tok)
+    return new_text, removed
+
+
+def prune_stale_manifest_members(project_path: str) -> dict[str, list[str]]:
+    """本地树 prune 入口：对磁盘上的聚合清单摘除目录已不存在的幽灵成员。
+
+    与 reconcile_workspace_manifests(add 侧)配对，在 ①L1 ②L2 ③交付 同三处生效——
+    R46-2 revert 幽灵、以及任何"目录没了条目还在"的残留都在下一次对账被确定性自愈。
+    返回 {清单相对路径: [被摘成员...]}；任何异常整体吞掉（增益层不可拖垮主流程）。
+    """
+    root = Path(project_path)
+    if not root.is_dir():
+        return {}
+    removed_all: dict[str, list[str]] = {}
+    try:
+        cands: list[Path] = [d / "pom.xml" for d in _maven_aggregators(root)]
+        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work"):
+            p = root / n
+            if p.is_file():
+                cands.append(p)
+        for mf in cands:
+            text = _read(mf)
+            if text is None:
+                continue
+            rel = _rel(root, mf)
+
+            def _exists(probe: str, _base: Path = mf.parent) -> bool:
+                return (_base / probe).exists()
+
+            new_text, removed = prune_manifest_members(rel, text, _exists)
+            if not removed:
+                continue
+            try:
+                mf.write_text(new_text, encoding="utf-8")
+            except OSError:
+                continue
+            removed_all[rel] = removed
+            logger.info(
+                "[workspace-manifest] prune 摘除幽灵成员（目录已不存在，条目残留会毒死"
+                "构建/reactor）: %s ← %s", rel, removed)
+    except Exception as exc:  # noqa: BLE001 — 增益层：prune 失败不影响主流程
+        logger.debug("[workspace-manifest] prune 跳过(异常,不致命): %s", exc)
+    return removed_all

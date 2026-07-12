@@ -197,7 +197,8 @@ def test_go_work_absent_not_created():
 def test_no_aggregate_manifest_noop():
     root = _mk()
     (root / "README.md").write_text("hi", "utf-8")
-    assert reconcile_workspace_manifests(str(root)) == {"modified_manifests": [], "added": {}}
+    assert reconcile_workspace_manifests(str(root)) == {
+        "modified_manifests": [], "added": {}, "removed": {}}
 
 
 if __name__ == "__main__":
