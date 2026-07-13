@@ -498,6 +498,26 @@ class _SandboxSyncMixin:
         本地执行模式（无沙箱）下仅记录本地快照作为 diff 基线。
         """
         local_root = Path(self.project_path).resolve()
+        # R49-2/D12（round48c 深读+round49b 实锤）：readable 清单里"计划内但从未
+        # 产出"的幻影文件（sql/alarm_core.sql 43×2 次 404、200+ WARNING）让 worker
+        # 每轮双通道读失败、喂养 agent 反复读取循环（LOCATING 58% 撞步数上限的
+        # 燃料）。按本地树存在性过滤 readable——不存在的文件沙箱里也不会有
+        # （沙箱=基线+上传），读它只有失败一种结局。create/writable 不动（新建
+        # 本就不存在）；聚合日志一行可观测。
+        try:
+            _sc = self.effective_scope
+            _rd = list(getattr(_sc, "readable", None) or [])
+            if _rd:
+                _kept = [f for f in _rd
+                         if (local_root / str(f).replace("\\", "/").lstrip("/")).is_file()]
+                if len(_kept) != len(_rd):
+                    _dropped = sorted(set(map(str, _rd)) - set(map(str, _kept)))
+                    self._log(
+                        f"R49-2 readable 幻影过滤：剔除 {len(_dropped)} 个本地树不存在"
+                        f"的文件（防双通道读失败喂养循环）: {_dropped[:5]}")
+                    _sc.readable = _kept
+        except Exception:  # noqa: BLE001 — 过滤失败保持原清单（旧行为）
+            pass
         self._pre_sync_contents = self._snapshot_scope_local(local_root)
         # R49-1：共享清单 bootstrap 快照（本地树【真实文本】非 git HEAD）——H2 回滚的
         # 唯一合法剥离基线。_pre_sync_contents 只覆盖 scope 且偏 git 基线，root pom 等
