@@ -355,3 +355,64 @@ class TestR50BehaviorLock:
         host = _Host()
         out = asyncio.run(host._run_agent("hi", step="code"))
         assert "迭代上限" in out and "L1" in out, f"必须优雅降级: {out}"
+
+
+class TestR50bBatch:
+    """R50-2/R50-3 回归锁（round50b 实锤）。"""
+
+    def test_r50_2_blocked_verdict_skips_rollback(self, tmp_path):
+        """BLOCKED（等上游）产出无毒——H2 回滚必须跳过，依赖注入不被摘。"""
+        import subprocess as sp
+        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+        root_txt = ("<project><dependencies><dependency><groupId>g</groupId>"
+                    "<artifactId>base</artifactId></dependency></dependencies></project>")
+        (tmp_path / "pom.xml").write_text(root_txt, "utf-8")
+        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c",
+                "user.name=t", "commit", "-qm", "base"], check=True)
+        poisoned = root_txt.replace(
+            "</dependencies>",
+            "<dependency><groupId>x</groupId><artifactId>injected-dep</artifactId>"
+            "</dependency></dependencies>")
+        (tmp_path / "pom.xml").write_text(poisoned, "utf-8")
+
+        class _Host:
+            project_path = str(tmp_path)
+            base_ref = None
+            _post_sync_contents = {"pom.xml": poisoned}
+            _manifest_baseline_snapshot = {"pom.xml": root_txt}
+
+            class subtask:
+                class scope:
+                    create_files = []
+                    writable = ["pom.xml"]
+
+            def _log(self, msg):
+                pass
+
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(
+            _Host(), {"not_run_kind": "blocked",
+                      "pipeline_blocked": "upstream_module_broken"})
+        assert "injected-dep" in (tmp_path / "pom.xml").read_text("utf-8"), \
+            "BLOCKED 场景绝不回滚（依赖注入是合法修复）"
+        # 对照：真 FAIL 场景照常摘
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(_Host(), {})
+        assert "injected-dep" not in (tmp_path / "pom.xml").read_text("utf-8")
+
+    def test_r50_3_repaired_paths_excluded_from_pl(self, tmp_path):
+        """repair 触达的外模块清单不得进 -pl（脚手架不被外模块连坐）。"""
+        (tmp_path / "pom.xml").write_text(
+            "<project><modules><module>alarm-security</module>"
+            "<module>ruoyi-framework</module></modules></project>", "utf-8")
+        for m in ("alarm-security", "ruoyi-framework"):
+            (tmp_path / m).mkdir()
+            (tmp_path / m / "pom.xml").write_text("<project/>", "utf-8")
+        from swarm.worker.l1_pipeline import _scope_maven_command
+        # 模拟 R50-3 修复后的调用方语义：basis 已剔除 repaired 外模块清单
+        modified = ["alarm-security/pom.xml", "ruoyi-framework/pom.xml"]
+        repaired = {"ruoyi-framework/pom.xml"}
+        basis = [f for f in modified if f not in repaired] or modified
+        cmd = _scope_maven_command("mvn -q compile", str(tmp_path), basis)
+        assert "-pl alarm-security" in cmd or "-f alarm-security" in cmd
+        assert "ruoyi-framework" not in cmd, "外模块绝不进 -pl"

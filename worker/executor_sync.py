@@ -808,6 +808,14 @@ class _SandboxSyncMixin:
         root = self.project_path
         if not root:
             return
+        # R50-2（round50b 实锤 st-10）：BLOCKED/transient 不是能力失败——产出在等
+        # 上游、无毒，其清单贡献（防线④依赖注入等）是合法修复，摘了重试还得重补。
+        # 回滚只打真 FAIL（能力/毒产出），等待类判定整体跳过。
+        _d = l1_details or {}
+        if (_d.get("not_run_kind") == "blocked"
+                or _d.get("pipeline_blocked")
+                or _d.get("failure_class") == "transient"):
+            return
         own = dict(getattr(self, "_post_sync_contents", None) or {})
         rels: set[str] = set(own.keys())
         try:

@@ -2844,7 +2844,16 @@ def run_l1_pipeline(
                     details["module_registration_pushed"] = _pushed
         except Exception as _exc:  # noqa: BLE001
             logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
-        build_cmd = _scope_maven_command(build_cmd, project_path, modified)
+        # R50-3（r49b/r50/r50b 三轮脚手架连败真因）：-pl 推导只用【本子任务真实
+        # 产出】。repair 通道（D2 版本对账/module-reg/依赖注入）触达的外模块清单混进
+        # modified 会把外模块拖进 -pl → 脚手架被别人模块的在飞坏代码连坐判死（"构建
+        # 错全在上游模块"豁免只对 -pl 外模块生效，被拖进 -pl 即失效）。repaired 文件
+        # 照常推送沙箱/回传本地，只是不参与 -pl 圈定。全被过滤（纯 repair 轮）退回原集。
+        _rfp_set = {str(x).lstrip("./").lstrip("/")
+                    for x in (details.get("repaired_file_paths") or [])}
+        _pl_basis = [f for f in modified
+                     if str(f).lstrip("./").lstrip("/") not in _rfp_set] or modified
+        build_cmd = _scope_maven_command(build_cmd, project_path, _pl_basis)
         # D3c（round38c 主题D 分流）：脚手架窗口 validate 降级【可见性】——validate 不编译
         # 源码，scaffold 子任务同批新建 .java 时这些源码零编译即 l1_passed=True。降级本身
         # 是 R34-6/Death B 的故意治法（脚手架契约=模块良构可注册；真编译由 L2 reactor
@@ -3137,7 +3146,12 @@ def run_l1_pipeline(
     harness_test = getattr(harness, "test_command", "") if harness else ""
     test_cmd = harness_test or _guess_test_cmd(project_path, modified)
     if test_cmd:
-        test_cmd = _scope_maven_command(test_cmd, project_path, modified)
+        # R50-3 同源：test 的 -pl 圈定同样只用真实产出
+        _rfp_t = {str(x).lstrip("./").lstrip("/")
+                  for x in (details.get("repaired_file_paths") or [])}
+        _pl_t = [f for f in modified
+                 if str(f).lstrip("./").lstrip("/") not in _rfp_t] or modified
+        test_cmd = _scope_maven_command(test_cmd, project_path, _pl_t)
     details["test_cmd"] = test_cmd
     details["test_cmd_source"] = "harness" if harness_test else "heuristic"
     if not test_cmd:
