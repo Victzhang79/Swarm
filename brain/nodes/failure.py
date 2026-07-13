@@ -1438,6 +1438,22 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 计算本批失败子任务里"最深"的重试次数，决定整批升级档位
     next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
     deepest = max(next_counts.values(), default=0)
+    # A2（round48c 实锤）：终身派发硬熔断——retry_counts 会被签名剪枝重置（scope
+    # 加宽/replan 改签名），st-14-1 实跑 11 次烧掉 2.8h 槽位。terminal 兜底：任一
+    # 失败者终身派发数 ≥ 上限 → 视同重试耗尽进终局分支（部分交付/abandon 优先，
+    # 与 B2 三连同构），任何签名重置都救不活它。
+    try:
+        _lifetime_cap = int(os.environ.get("SWARM_SUBTASK_MAX_DISPATCH_TOTAL", "6"))
+    except (TypeError, ValueError):
+        _lifetime_cap = 6
+    _totals = state.get("subtask_dispatch_totals") or {}
+    _over_cap = [fid for fid in failed_ids
+                 if int(_totals.get(fid, 0)) >= _lifetime_cap > 0]
+    if _over_cap:
+        logger.warning(
+            "[HANDLE_FAILURE] A2 终身派发熔断：%s 已派 ≥%d 次（签名重置免疫账本）→ "
+            "视同重试耗尽进终局分支", _over_cap, _lifetime_cap)
+        deepest = max(deepest, max_retries + 2)
     if _sig_exhausted:
         # B2 三连不变：确定性阻断对同输入已白跑 transient+阶梯——视同重试耗尽进终局
         # 分支（下方 deepest>max+1：有完成产物 → abandon+PARTIAL 部分交付；无 → escalate）。

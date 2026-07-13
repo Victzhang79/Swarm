@@ -418,12 +418,29 @@ class TaskPlan(BaseModel):
             t for t in self.subtasks
             if t.id in remaining and _is_ready(t)
         ]
-        if _dp:
-            # Fix F：从未尝试的就绪子任务（新前沿/生产者）优先于失败重试中的子任务，
-            # 防失败撮霸占全部并发槽。纯重排，稳定序不变。
-            fresh = [t for t in ready if t.id not in _dp]
-            retry = [t for t in ready if t.id in _dp]
-            ready = fresh + retry
+        fresh = [t for t in ready if t.id not in _dp]
+        retry = [t for t in ready if t.id in _dp]
+        # B6（round48c 实锤）：收尾器注入的 st-scaffold-*/st-contract-* 在 subtasks
+        # 尾部 → 列表序派发让结构上游等了 4.4h，派到时环境已被毒死。fresh 内按
+        # 结构优先级稳定重排：①纯构建清单子任务（脚手架——模块存在性是全场地基）
+        # ②被依赖的生产者 ③其余。稳定排序保确定性；retry 组语义不变（Fix F）。
+        _manifest_names = ("pom.xml", "settings.gradle", "settings.gradle.kts",
+                           "build.gradle", "build.gradle.kts", "cargo.toml", "go.work")
+        _dep_counts: dict[str, int] = {}
+        for t in self.subtasks:
+            for d in t.depends_on:
+                _dep_counts[d] = _dep_counts.get(d, 0) + 1
+
+        def _prio(t: SubTask) -> int:
+            files = [str(f).rsplit("/", 1)[-1].lower()
+                     for f in (list(t.scope.create_files) + list(t.scope.writable))]
+            if files and all(f in _manifest_names or f.endswith(".sln")
+                             for f in files):
+                return 0
+            return 1 if _dep_counts.get(t.id, 0) > 0 else 2
+
+        fresh.sort(key=_prio)  # list.sort 稳定：同级保持 subtasks 原序
+        ready = fresh + retry
         return ready[:max_concurrent]
 
     def all_completed(self, completed_ids: set[str]) -> bool:

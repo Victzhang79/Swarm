@@ -744,6 +744,110 @@ class _SandboxSyncMixin:
             if staging_dir:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
+    def _rollback_failed_manifest_footprint(self, l1_details: dict | None = None) -> None:
+        """H2（round48c 深读实锤）：L1 终局未通过 → 摘除本子任务对共享清单的新增贡献。
+
+        对每个本子任务触碰过的共享清单（post_sync/repaired/scope 并集 × _is_shared_manifest）：
+        - 清单在 git HEAD 存在 → 外科减法：仅摘【worker 版本相对 HEAD 新增】的
+          dependency/module 条目（绝不盲用 HEAD 恢复冲掉并行他人的合法注册）；
+        - 清单在 HEAD 不存在（本子任务新建，如幻觉 parent 的新模块 pom）→ 直接删除
+          本地文件（存在本身即毒源，重试会重建；root pom 的对应 <module> 条目交
+          reconcile prune 侧摘除）。
+        持 per-project flock（读-改-写原子）。任何异常整体吞掉（不改变终局判定）。
+        """
+        import subprocess as _sp
+
+        from swarm.worker.sandbox import _is_shared_manifest
+        from swarm.worker.workspace_manifest import strip_worker_manifest_contribs
+        root = self.project_path
+        if not root:
+            return
+        own = dict(getattr(self, "_post_sync_contents", None) or {})
+        rels: set[str] = set(own.keys())
+        try:
+            for f in ((l1_details or {}).get("repaired_file_paths") or []):
+                rels.add(str(f).replace("\\", "/").lstrip("./").lstrip("/"))
+        except Exception:  # noqa: BLE001
+            pass
+        sc = getattr(self.subtask, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            rels.add(str(f).replace("\\", "/").lstrip("/"))
+        manifests = sorted(r for r in rels if r and _is_shared_manifest(r))
+        if not manifests:
+            return
+        base = resolve_base_ref(getattr(self, "base_ref", None))
+        # 复核 #1 后半：git 本身坏（非 git 仓/base 失效）→ 整体跳过（fail-open），
+        # 绝不把"git 失败"误判成"HEAD 无此文件"而误删他人产出。
+        _probe = _sp.run(["git", "-C", root, "rev-parse", "--verify", base],
+                         capture_output=True, text=True, timeout=10)
+        if _probe.returncode != 0:
+            return
+        pre = dict(getattr(self, "_pre_sync_contents", None) or {})
+        with _ProjectGitFlock(root):
+            for rel in manifests:
+                lp = Path(root) / rel
+                if not lp.is_file():
+                    continue
+                worker_text = own.get(rel)
+                if not isinstance(worker_text, str):
+                    continue  # 复核 #1：本子任务没实际写过（仅 scope 声明/加宽）→ 不动
+                r = _sp.run(["git", "-C", root, "show", f"{base}:{rel}"],
+                            capture_output=True, text=True, timeout=15)
+                if r.returncode != 0:
+                    # base 无此清单 = 新建。复核 #2：bootstrap 快照里已存在 → 是
+                    # 并行兄弟先建的（本子任务只是改）→ 走摘除分支不删文件。
+                    pre_text = pre.get(rel)
+                    if isinstance(pre_text, str) and pre_text.strip():
+                        baseline = pre_text
+                    else:
+                        # 真·本子任务新建 → 删除（毒源即存在本身）
+                        try:
+                            lp.unlink()
+                            self._log(f"H2 回滚：删除 FAIL 子任务新建的清单 {rel}")
+                        except OSError:
+                            continue
+                        # 复核 #3：执行期 reconcile 恒 prune=False，root pom 的
+                        # <module> 幽灵条目无人摘 → 同一把锁内同步摘除（确定性有界），
+                        # 否则兄弟沙箱复制幽灵 root pom 全员 reactor 必炸。
+                        try:
+                            from swarm.worker.workspace_manifest import (
+                                prune_manifest_members,
+                            )
+                            mod_dir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                            root_pom = Path(root) / "pom.xml"
+                            if mod_dir and root_pom.is_file():
+                                rp_text = root_pom.read_bytes().decode("utf-8")
+                                new_rp, removed_m = prune_manifest_members(
+                                    "pom.xml", rp_text,
+                                    lambda pr: (None if not pr.startswith(mod_dir + "/")
+                                                else False))
+                                if removed_m:
+                                    root_pom.write_bytes(new_rp.encode("utf-8"))
+                                    self._log(
+                                        f"H2 回滚：root pom 同步摘除幽灵 <module> {removed_m}")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        continue
+                else:
+                    # 复核 #2：摘除基线必须用【bootstrap 快照】而非 task base——
+                    # worker_text 含快照前已入树的兄弟条目，对 base 求差会把兄弟
+                    # 的合法注册当成本 worker 新增一并误摘。快照缺失退 base 文本
+                    # （保守：可能少摘，绝不多摘——快照总包含 base 内容）。
+                    pre_text = pre.get(rel)
+                    baseline = pre_text if isinstance(pre_text, str) else r.stdout
+                try:
+                    local_text = lp.read_bytes().decode("utf-8")
+                except Exception:  # noqa: BLE001
+                    continue
+                new_text, removed = strip_worker_manifest_contribs(
+                    local_text, worker_text, baseline, rel)
+                if removed:
+                    lp.write_bytes(new_text.encode("utf-8"))
+                    self._log(
+                        f"H2 回滚：从 {rel} 摘除本 FAIL 子任务新增条目 {removed} 个"
+                        "（毒不进树；他人贡献保留）")
+
     async def _sync_from_sandbox(self, reason: str) -> None:
         """精准拉回：只把子任务可写文件从沙箱拉回本地 project_path。
 

@@ -979,6 +979,20 @@ class WorkerExecutor(
             # 记录 L1 结果供 kill_sandbox 决定是否归还热池复用（脏沙箱不回池）
             self._l1_passed_flag = bool(getattr(output, "l1_passed", False))
 
+            # H2（round48c 深读实锤·本轮最大杀伤链）：L1 最终未通过的子任务，其触碰的
+            # 【共享构建清单】足迹必须立即从本地共享树回滚——毒 pom 落树后被 bootstrap
+            # "补传上游产物"复制进后续全部沙箱（17 会话 86 次命中），三层旧防线全部
+            # 失效（clean_upload tracked 判定空集 55/88、钉扎 reset 不管 untracked、
+            # L1 闸不拦 pull-back）。diff 已进 WorkerOutput（重试上下文不丢工作）；
+            # 源码文件不回滚（模块内污染有 BLOCKED 豁免，且保留供重试增量）。
+            if not self._l1_passed_flag:
+                try:
+                    await asyncio.to_thread(
+                        self._rollback_failed_manifest_footprint,
+                        getattr(output, "l1_details", None) or {})
+                except Exception as _rb_exc:  # noqa: BLE001 — 回滚失败不改变终局
+                    self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
+
             return output
 
     # ──────────────────────────────────────────
@@ -1093,6 +1107,14 @@ class WorkerExecutor(
         # trivial 快速路径直接 return，不经过 run() 末尾的 _l1_passed_flag 赋值，
         # 必须在此显式设置，否则 L1 失败的脏沙箱会以默认 reusable=True 回池污染。
         self._l1_passed_flag = bool(getattr(output, "l1_passed", False))
+        # H2：trivial 路径同享清单足迹回滚（入口对称——脚手架 pom 子任务多走此路）
+        if not self._l1_passed_flag:
+            try:
+                await asyncio.to_thread(
+                    self._rollback_failed_manifest_footprint,
+                    getattr(output, "l1_details", None) or {})
+            except Exception as _rb_exc:  # noqa: BLE001
+                self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
         self._log(f"trivial 快速路径完成，置信度: {output.confidence.value}")
         return output
 

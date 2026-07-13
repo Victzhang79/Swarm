@@ -211,6 +211,7 @@ class _LedgerGuard(BaseCallbackHandler):
         # reserve 余额不足抛 TaskTokenLimitExceeded → raise_error=True 传播 → 调用被拒绝发起
         rid = ledger.reserve(task_id, est_in=est_in, est_out=est_out, kind=self.kind)
         self._rids[kwargs.get("run_id")] = rid
+        ledger.register_inflight_rid(rid)  # C7：登记到调用方作用域（硬杀即时结算）
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         # 逐 chunk 抓 usage（字段取最大，累计型网关口径，见 _UsageRecorder 注释）——
@@ -263,8 +264,10 @@ class _LedgerGuard(BaseCallbackHandler):
                         "output=响应文本估），usage_tracker 此类调用记 0，两账本将分叉"
                         "（本任务仅提示一次）", self.model_name)
                 ledger.settle_error(rid, chunk_in=0, chunk_out=_out_est)
+                ledger.unregister_inflight_rid(rid)
                 return
             ledger.settle(rid, real_in=real_in, real_out=real_out)
+            ledger.unregister_inflight_rid(rid)
         except Exception as exc:  # noqa: BLE001
             # 复核 H6：结算失败必须留痕——预留将挂到 TTL 过期/detach 才释放，期间余额虚低。
             logger.warning("[ledger] on_llm_end 结算失败（预留挂到 TTL/detach 才释放）: %s", exc)
@@ -279,6 +282,7 @@ class _LedgerGuard(BaseCallbackHandler):
             from swarm.models import ledger
             # B4 治本：中止/超时/掐流按已收 chunk 估算结算（input 取 max(chunk,预留)宁可高估）
             ledger.settle_error(rid, chunk_in=tracked[0], chunk_out=tracked[1])
+            ledger.unregister_inflight_rid(rid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ledger] on_llm_error 结算失败（预留挂到 TTL/detach 才释放）: %s", exc)
 
@@ -926,6 +930,12 @@ class ModelRouter:
         （全本地，主→次→兜底）。LangChain with_fallbacks 接受多个，按序尝试。
         """
         primary_name, fallback_names = self._resolve_route(difficulty, modality)
+        # D10（round48c 实锤）：fallback 链含 primary 自身（配置漂移常态）→ primary
+        # 挂时同一死模型必两连败才到真备选（42 次实测）。链内去重 primary+去自重。
+        _seen = {primary_name}
+        fallback_names = [
+            fb for fb in fallback_names
+            if fb and fb not in _seen and not _seen.add(fb)]
 
         role = f"worker/{difficulty}"
         _wmax = getattr(self.config, "worker_max_tokens", 0) or None

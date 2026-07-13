@@ -300,18 +300,33 @@ _MVN_LIFECYCLE = {
 }
 
 
+def _strip_cd_prefix(command: str) -> tuple[str, str]:
+    """剥掉 `cd X && `/`cd X ; ` 前缀 → (前缀含分隔符, 剩余命令)。
+
+    round48c 实锤（M1）：Qwopus 习惯性给命令加 `cd /workspace && `，规范化/守卫都
+    只看首 token → mvn 误用改写 0 拦截（54 次白烧）、git 守卫 0 拦截（39 次必败）。
+    只剥【单个简单 cd 段】（无嵌套引号/子 shell），剥不动原样返回（保守）。
+    """
+    m = re.match(r"^(\s*cd\s+[^;&|()\"']+(?:&&|;)\s*)(.+)$", command, re.S)
+    if m:
+        return m.group(1), m.group(2)
+    return "", command
+
+
 def _normalize_maven_module_command(command: str) -> tuple[str, bool]:
     """把模型常犯的 `mvn compile <module>`（模块名当生命周期阶段，必报 Unknown lifecycle
     phase）静默改写为正确的 `mvn -pl <module> -am compile`，省掉一轮白跑。
 
     仅在【明确是该误用形态】（mvn + 生命周期阶段 + 恰一个裸模块名、且未含 -pl/-f）时改写，
     否则原样返回，绝不误改正常命令。返回 (命令, 是否改写)。
+    M1：先剥 `cd X && ` 前缀再判形态（改写后前缀原样拼回）。
     """
+    _pfx, command = _strip_cd_prefix(command)
     parts = command.strip().split()
     if len(parts) < 3 or parts[0] != "mvn":
-        return command, False
+        return _pfx + command, False
     if any(p in ("-pl", "-f", "--projects", "--file", "-N") for p in parts):
-        return command, False
+        return _pfx + command, False
     args = parts[1:]
     phases = [p for p in args if p in _MVN_LIFECYCLE]
     bare = [
@@ -322,8 +337,8 @@ def _normalize_maven_module_command(command: str) -> tuple[str, bool]:
     if phases and len(bare) == 1:
         mod = bare[0]
         rest = [p for p in args if p != mod]
-        return "mvn -pl " + mod + " -am " + " ".join(rest), True
-    return command, False
+        return _pfx + "mvn -pl " + mod + " -am " + " ".join(rest), True
+    return _pfx + command, False
 
 
 def _guard_unhelpful_command(command: str) -> str | None:
@@ -332,6 +347,7 @@ def _guard_unhelpful_command(command: str) -> str | None:
     git 查看类：烤源沙箱（项目专属镜像）常【不含 .git】，git 必 128/129 失败；且沙箱内改动
     由确定性 L1 闸门自动追踪，worker 本就无需用 git。拦掉省得模型反复撞失败。
     """
+    _, command = _strip_cd_prefix(command)  # M1：cd 前缀不豁免守卫
     if re.match(r"\s*git\s+(diff|log|status|show|blame|ls-files|rev-parse|stash)\b", command):
         return (
             "ℹ️ 沙箱内改动由确定性 L1 闸门自动追踪，无需也勿用 git 查看"

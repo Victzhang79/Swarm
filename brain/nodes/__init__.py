@@ -1435,7 +1435,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_contract_counts: dict | None = None,
                            old_block_signatures: dict | None = None,
                            old_scope_amend_counts: dict | None = None,
-                           merged_cover_injections: dict | None = None) -> dict:
+                           merged_cover_injections: dict | None = None,
+                           old_dispatch_totals: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -1597,6 +1598,12 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         "targeted_recovery_counts": pruned_counts,
         # D08：补清余下三张 replan 敏感记账/放弃表（同签名纪律，防旧账饿死/误弃新子任务）
         "subtask_retry_counts": pruned_retry,
+        # A2 复核#5：终身派发账本同受 D08 语义签名剪枝——replan 重编号使 id 复用是
+        # 默认情形，语义全新的同名 id 不该继承旧账首败即熔断；而 in-place scope 加宽
+        # （A2 病灶）不经本函数，账本对其保持免疫，熔断牙口不丢。
+        "subtask_dispatch_totals": {
+            sid: n for sid, n in (old_dispatch_totals or {}).items()
+            if _sig_unchanged(sid)},
         "subtask_redecompose_count": pruned_redecompose,
         "abandoned_subtask_ids": pruned_abandoned,
         "give_up_isolated_ids": pruned_give_up,
@@ -1893,7 +1900,8 @@ async def plan(state: BrainState) -> dict:
                                  old_use_alternate=state.get("subtask_use_alternate"),
                                  old_contract_counts=state.get("contract_retry_counts"),
                                  old_block_signatures=state.get("subtask_block_signatures"),
-                                 old_scope_amend_counts=state.get("subtask_scope_amend_counts")),
+                                 old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
+                                 old_dispatch_totals=state.get("subtask_dispatch_totals")),
             **plan_touch,
         }
 
@@ -2343,7 +2351,8 @@ async def plan(state: BrainState) -> dict:
                                  old_block_signatures=state.get("subtask_block_signatures"),
                                  old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
                                  # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
-                                 merged_cover_injections=_cover_injections),
+                                 merged_cover_injections=_cover_injections,
+                                 old_dispatch_totals=state.get("subtask_dispatch_totals")),
         **plan_touch,
     }
 

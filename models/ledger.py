@@ -740,3 +740,68 @@ def snapshot(task_id: str) -> dict:
         if task_id not in _entries:
             return {}
         return _snapshot_locked(task_id)
+
+
+# ══════════ C7/R41-4 治本（round48c 深读实锤）：在飞预留作用域即时结算 ══════════
+# 900s 硬杀（asyncio.wait_for 超时 cancel）不触发 on_llm_error → 预留挂 30min TTL
+# 才"宁可高估"结算（round48c 实测 37 次 ≈2.05M 虚增）。作用域机制：调用方（executor
+# _run_agent）在 await 前立作用域令牌（ContextVar 子任务继承），on_llm_start 把 rid
+# 登记到令牌名下；正常 settle/settle_error 会注销；调用方捕获超时/取消后按令牌把
+# 残留 rid 立即按 settle_error(0,0) 语义结算（input=预留估/output=0，与 TTL 过期
+# 同口径但零延迟零虚增窗口）。并行兄弟 worker 各持自己的令牌，互不误伤。
+import contextvars as _ctxv
+import uuid as _uuid
+
+_INFLIGHT_SCOPE: "_ctxv.ContextVar[str | None]" = _ctxv.ContextVar(
+    "swarm_ledger_inflight_scope", default=None)
+_SCOPE_RIDS: dict[str, set] = {}
+
+
+def begin_inflight_scope() -> str:
+    """开一个在飞预留作用域 → 令牌。调用方负责 finally 里 end_inflight_scope。"""
+    token = _uuid.uuid4().hex[:12]
+    with _lock:
+        _SCOPE_RIDS[token] = set()
+    _INFLIGHT_SCOPE.set(token)
+    return token
+
+
+def register_inflight_rid(rid: str) -> None:
+    """on_llm_start 调：把 rid 登记到当前作用域（无作用域=无操作）。"""
+    token = _INFLIGHT_SCOPE.get()
+    if not token:
+        return
+    with _lock:
+        s = _SCOPE_RIDS.get(token)
+        if s is not None:
+            s.add(rid)
+
+
+def unregister_inflight_rid(rid: str) -> None:
+    """正常结算路径调（settle/settle_error 已处理该 rid）——注销防重复结算。"""
+    with _lock:
+        for s in _SCOPE_RIDS.values():
+            s.discard(rid)
+
+
+def end_inflight_scope(token: str, *, settle_leaked: bool) -> int:
+    """关闭作用域；settle_leaked=True 时把残留 rid 立即按中止语义结算 → 结算数。
+
+    正常完成路径传 False（残留应为空；万一有交 TTL 兜底）；超时/取消路径传 True。
+    """
+    with _lock:
+        rids = _SCOPE_RIDS.pop(token, set())
+    if not settle_leaked or not rids:
+        return 0
+    n = 0
+    for rid in rids:
+        try:
+            settle_error(rid, chunk_in=0, chunk_out=0)
+            n += 1
+        except Exception:  # noqa: BLE001 — 单条失败不阻断其余，TTL 兜底仍在
+            pass
+    if n:
+        logger.info(
+            "[ledger] C7 作用域即时结算：硬杀/取消的在飞预留 %d 条已按中止语义结算"
+            "（不再挂 TTL 虚增 30min）", n)
+    return n

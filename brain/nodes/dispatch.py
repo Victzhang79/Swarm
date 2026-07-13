@@ -550,7 +550,16 @@ async def dispatch(state: BrainState) -> dict:
         # override 算出最强又被丢弃。complex 重试走 boost 路径（同模型+加步数）。
         _d = str(getattr(getattr(subtask, "difficulty", None), "value", None)
                  or getattr(subtask, "difficulty", None) or "").lower()
-        _ua = _sid_alt and not _fs and not _single and _d not in ("complex", "ultra")
+        # A2（round48c 实锤）：C-4"complex 已派最强故禁换备"在最强模型反复失败时
+        # 反转为死刑——st-14-1×11/st-21×9 全烧同一主力，failure 五轮说换备全被此
+        # 闸吞掉。同一子任务同模型深度重试（≥2 次）后，多样性 > 假定强度：放行异
+        # 构换备。首次重试仍维持 C-4（最强模型偶发失败换弱备确是降级）。
+        # 复核#4：retry_counts 会被签名剪枝重置（A2b 立项理由），并读终身账本
+        _deep_retry = (
+            int((state.get("subtask_retry_counts") or {}).get(subtask.id, 0)) >= 2
+            or int((state.get("subtask_dispatch_totals") or {}).get(subtask.id, 0)) >= 3)
+        _ua = (_sid_alt and not _fs and not _single
+               and (_d not in ("complex", "ultra") or _deep_retry))
         # B10：override 决策抽为纯函数——force_strong 或 complex 子任务绕过轮转直取最强模型，
         # 否则池非空非 alternate 走轮转，池空/alternate 按 difficulty 路由。
         _override = _select_pool_override(
@@ -723,6 +732,13 @@ async def dispatch(state: BrainState) -> dict:
     _dispatched_ids = {t.id for t in to_dispatch}
     result["subtask_use_alternate"] = {
         k: v for k, v in _alt_map.items() if k not in _dispatched_ids}
+    # A2（round48c 实锤）：终身派发计数——subtask_retry_counts 按签名剪枝，scope
+    # 加宽/replan 改签名即重置 → st-14-1 实跑 11 次（重试上限/配额/阶梯全被绕）。
+    # 本表按【子任务 id】单调累积、绝不剪枝，handle_failure 据它做硬熔断兜底。
+    _totals = dict(state.get("subtask_dispatch_totals") or {})
+    for _tid in _dispatched_ids:
+        _totals[_tid] = _totals.get(_tid, 0) + 1
+    result["subtask_dispatch_totals"] = _totals
     return result
 
 

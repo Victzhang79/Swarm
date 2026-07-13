@@ -151,6 +151,37 @@ class _L1GateMixin:
                     except (OSError, UnicodeDecodeError):
                         self._pre_sync_contents[rel] = ""
 
+    def _enforce_authoritative_template(self) -> None:
+        """H1：description 含【权威 pom 模板…```xml】且 scope 目标是 CREATE 单 pom
+        → 模板直接覆写沙箱+本地（write-through，同 repaired 通道），不赌 worker 抄写。
+
+        仅 CREATE 形态（新建无可失，R41-F5 铁律：MODIFY 覆写=clobber 比漏改更致命，
+        MODIFY 面维持依赖片段+并入语义）。幂等：内容一致即跳过。
+        """
+        desc = str(getattr(self.subtask, "description", "") or "")
+        if "权威 pom 模板" not in desc or "```xml" not in desc:
+            return
+        sc = getattr(self.subtask, "scope", None)
+        creates = [str(f).replace("\\", "/").lstrip("/")
+                   for f in (getattr(sc, "create_files", None) or [])]
+        poms = [f for f in creates if f.rsplit("/", 1)[-1] == "pom.xml"]
+        if len(poms) != 1 or (getattr(sc, "writable", None) or []):
+            return
+        tpl = desc.split("```xml", 1)[1].split("```", 1)[0].strip()
+        if not tpl.startswith("<?xml") and "<project" not in tpl[:200]:
+            return
+        rel = poms[0]
+        from swarm.worker.l1_pipeline import (
+            _read_project_file, _write_project_file,
+        )
+        cur = _read_project_file(self.project_path, rel, timeout=15)
+        if cur is not None and cur.strip() == tpl:
+            return  # 幂等
+        if _write_project_file(self.project_path, rel, tpl + "\n", timeout=20):
+            self._log(
+                f"[H1] 权威 pom 模板确定性落盘 {rel}"
+                "（机械产物不赌 LLM 服从度，worker 徒手版本被模板覆写）")
+
     def _deterministic_l1_gate(self) -> tuple[bool | None, dict]:
         """循环内确定性 L1 闸门：用真实 compile/lint/scope 结果驱动修复轮次。
 
@@ -170,6 +201,15 @@ class _L1GateMixin:
         if not self.project_path:
             return None, {"deterministic_gate": "skipped: no project_path",
                           "not_run_kind": NotRunKind.BLOCKED.value}
+        # H1（round48c 深读实锤）：脚手架子任务的权威 pom 模板【确定性落盘】——
+        # round48c alarm-sdk 实证：模板嵌在 description 里"原样写入"仍被 worker
+        # 徒手改写（parent 3.9.0 幻觉 + 依赖无 version）→ reactor 毒。机械产物
+        # 不赌 LLM 服从度：进闸前从 description 提取模板直接覆写目标 pom（单一
+        # 写者权威——模板即真值，worker 编的任何 pom 内容都不该赢过它）。幂等。
+        try:
+            self._enforce_authoritative_template()
+        except Exception as _tpl_exc:  # noqa: BLE001 — fail-open，闸门照常裁决
+            logger.debug("[H1] 权威模板落盘跳过(异常): %s", _tpl_exc)
         try:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001

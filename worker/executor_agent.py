@@ -153,6 +153,11 @@ class _AgentLoopMixin:
         # E4（round38c 主题E，register #34）：预算动态注入——此前只有静态「省步数」劝诫，
         # 模型对具体预算不可见（定位期 22 次必撞 cap）。数字可见让模型自己收敛探索。
         human_message = _budget_banner(_limit, remaining) + human_message
+        # C7/R41-4（round48c 实锤 37 次≈2.05M 虚增）：硬杀的在飞 LLM 调用不触发
+        # on_llm_error → 预留挂 30min TTL 才高估结算。作用域令牌让本步被 cancel 的
+        # 预留【即时】按中止语义结算；正常路径残留为空（settle 时已注销）。
+        from swarm.models import ledger as _ledger
+        _scope = _ledger.begin_inflight_scope()
         try:
             result = await asyncio.wait_for(
                 agent.ainvoke(
@@ -162,18 +167,28 @@ class _AgentLoopMixin:
                 timeout=remaining,
             )
         except asyncio.TimeoutError:
+            _ledger.end_inflight_scope(_scope, settle_leaked=True)
             self._log(f"Agent 调用超时（剩余预算 {remaining:.0f}s）")
             return f"❌ Agent 调用超时（预算 {self.max_execution_time}s）"
+        except asyncio.CancelledError:
+            _ledger.end_inflight_scope(_scope, settle_leaked=True)
+            raise
+        except BaseException:  # noqa: BLE001 — KeyboardInterrupt 级：清作用域防内存泄漏
+            _ledger.end_inflight_scope(_scope, settle_leaked=True)
+            raise
         except Exception as exc:
             # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
             # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
             # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。
             cls = type(exc).__name__
             if "Recursion" in cls or "recursion" in str(exc).lower():
+                _ledger.end_inflight_scope(_scope, settle_leaked=False)
                 self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
                 return f"⚠️ Agent 达到迭代上限（{_limit}），已做改动交由确定性 L1 验证"
+            _ledger.end_inflight_scope(_scope, settle_leaked=True)
             raise
 
+        _ledger.end_inflight_scope(_scope, settle_leaked=False)
         # 提取最后一条 AI 消息
         messages = result.get("messages", [])
         self._record_tool_telemetry(messages, step)

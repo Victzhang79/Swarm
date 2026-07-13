@@ -249,6 +249,7 @@ class BrainState(TypedDict, total=False):
     deliver_auto_reject_reason: str     # DELIVER 自动拒绝原因（runner 读取回写任务态/前端展示）
     l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
     l2_missing_fp_history: list[str]    # R46-3：L2 契约缺失符号指纹连击史（三连不变→跳过 D5 归因直接升级，杜绝同缺口空转重跑 L2；指纹变化即重置）
+    subtask_dispatch_totals: dict[str, int]  # A2(r48c)：终身派发计数（按 id 单调、绝不签名剪枝）——handle_failure 硬熔断兜底，治 retry_counts 被 scope 加宽/replan 改签名重置后的无界重派
 
     # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
     uploaded_files: list[str]           # 任务创建时上传的文件路径（绝对路径，任务专属目录）
@@ -300,6 +301,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "failure_escalated": "round",
     "subtask_force_strong": "monotonic",   # D08 签名剪枝（3.8 补）
     "subtask_retry_counts": "monotonic",   # D08 签名剪枝
+    "subtask_dispatch_totals": "monotonic",  # A2：终身账本【豁免 D08 剪枝】（剪了=熔断被绕，就是它要治的病）
     "contract_retry_counts": "monotonic",  # D08 签名剪枝（D13 独立契约表）
     "subtask_redecompose_count": "monotonic",  # D08 签名剪枝
     "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）

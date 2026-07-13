@@ -841,3 +841,80 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
         logger.warning("[workspace-manifest] R48c-1 合并异常 fail-open: %s", exc)
         return incoming_text
+
+
+# ══════════════ H2（round48c 深读）：FAIL 子任务共享清单贡献外科摘除 ══════════════
+# L1 最终未通过的子任务，其对共享清单的【新增条目】必须从本地共享树摘除——盲用 HEAD
+# 恢复会冲掉并行他人的合法注册（正是 R48c-1 要防的 clobber），故做减法外科：
+# 本 worker 版本相对 HEAD 新增的 dependency(g,a,区域)/module 条目 → 从当前 local 文本
+# 中逐块删除。他人贡献的同名条目碰撞面：极罕见且下一轮 reconcile/dep-repair 会按
+# ground truth 补回（加法侧幂等），correctness 优先。
+
+def strip_worker_manifest_contribs(
+        local_text: str, worker_text: str, head_text: str, rel_path: str,
+) -> tuple[str, int]:
+    """从 local 摘除【worker 相对 HEAD 新增】的清单条目 → (新文本, 摘除数)。
+
+    仅 Maven pom（毒性实证面）；其它清单返回原文。fail-open。"""
+    try:
+        if rel_path.rsplit("/", 1)[-1].lower() != "pom.xml":
+            return local_text, 0
+        head_deps = {(ga, r) for ga, _, r in _pom_dep_blocks(head_text)}
+        added = [(ga, r) for ga, _, r in _pom_dep_blocks(worker_text)
+                 if (ga, r) not in head_deps]
+        head_span = _pom_modules_span(head_text)
+        head_mods = set(re.findall(
+            r"<module>\s*([^<\s]+)\s*</module>",
+            head_text[head_span[0]:head_span[1]]) if head_span else [])
+        w_span = _pom_modules_span(worker_text)
+        added_mods = [m for m in (re.findall(
+            r"<module>\s*([^<\s]+)\s*</module>",
+            worker_text[w_span[0]:w_span[1]]) if w_span else [])
+            if m not in head_mods]
+        if not added and not added_mods:
+            return local_text, 0
+        new_text, removed = local_text, 0
+        add_set = set(added)
+        # 逐块扫 local，删除命中 (ga,region) 的块（span 递减序删，避免位移失效）
+        hits = [(m.span(), (ga, r)) for m, ga, r in _iter_dep_blocks_with_span(new_text)
+                if (ga, r) in add_set]
+        for (s0, e0), _key in sorted(hits, key=lambda x: -x[0][0]):
+            # 连同尾随换行/前导缩进一起删
+            line_start = new_text.rfind("\n", 0, s0) + 1
+            if new_text[line_start:s0].strip() == "":
+                s0 = line_start
+            if e0 < len(new_text) and new_text[e0:e0 + 1] == "\n":
+                e0 += 1
+            new_text = new_text[:s0] + new_text[e0:]
+            removed += 1
+        for m in added_mods:
+            span = _pom_modules_span(new_text)
+            if not span:
+                break
+            pat = re.compile(
+                r"[ \t]*<module>\s*" + re.escape(m) + r"\s*</module>[ \t]*\r?\n?")
+            new_text2, n = _sub_in_span(new_text, span, pat)
+            if n:
+                new_text = new_text2
+                removed += n
+        return new_text, removed
+    except Exception as exc:  # noqa: BLE001 — fail-open 原样返回
+        logger.warning("[workspace-manifest] H2 摘除异常 fail-open: %s", exc)
+        return local_text, 0
+
+
+def _iter_dep_blocks_with_span(text: str):
+    """(match, (g,a), region) 迭代器——与 _pom_dep_blocks 同口径但带 span。"""
+    spans = _pom_region_spans(text)
+    for m in re.finditer(r"<dependency>(.*?)</dependency>", text, re.S):
+        if any(s <= m.start() < e for sp in (spans["profiles"], spans["build"])
+               for s, e in sp):
+            continue
+        inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", inner)
+        a = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", inner)
+        if not (g and a):
+            continue
+        region = "dm" if any(
+            s <= m.start() < e for s, e in spans["dm"]) else "plain"
+        yield m, (g.group(1), a.group(1)), region
