@@ -722,3 +722,122 @@ def prune_stale_manifest_members(project_path: str) -> dict[str, list[str]]:
     except Exception as exc:  # noqa: BLE001 — 增益层：prune 失败不影响主流程
         logger.debug("[workspace-manifest] prune 跳过(异常,不致命): %s", exc)
     return removed_all
+
+
+# ══════════════ R48c-1：共享清单 pull-back 并集合并（防陈旧副本覆盖丢修复）══════════════
+# round48c 实锤：st-20 的防线④把 spring-data-redis 注入 ruoyi-system/pom.xml 并按 C9 回传
+# 本地（10:29）；随后并行子任务的 pull-back 携【bootstrap 时的基线旧副本】盲覆盖（11:59
+# mtime、内容=基线）→ 修复静默蒸发 → 全部下游子任务在同一缺包上 BLOCKED 空转。flock 只
+# 串行化写、不防陈旧内容 last-write-wins——治本=共享清单写盘并集合并：以 incoming（本 worker
+# 的有意编辑）为基，把 local 已有而 incoming 缺失的 <dependency>(按 g:a)/<module> 条目并回。
+# 加法-only：绝不删 incoming 内容；解析异常 fail-open 原样返回 incoming（回退旧行为）。
+
+def _pom_region_spans(text: str) -> dict[str, list[tuple[int, int]]]:
+    """pom 分区 span：dm / profiles / build（复核 C：profile·插件依赖是条件/工具面，
+    并集绝不跨区搬运——搬进主区=条件依赖变无条件、插件依赖污染编译 classpath）。"""
+    return {
+        "dm": [m.span() for m in re.finditer(
+            r"<dependencyManagement>.*?</dependencyManagement>", text, re.S)],
+        "profiles": [m.span() for m in re.finditer(
+            r"<profiles>.*?</profiles>", text, re.S)],
+        "build": [m.span() for m in re.finditer(
+            r"<build>.*?</build>", text, re.S)],
+    }
+
+
+def _pom_dep_blocks(text: str) -> list[tuple[tuple[str, str], str, str]]:
+    """pom 的 <dependency> 块 → [((g,a), 块文本, 区域)]，区域∈{"plain","dm"}。
+
+    profiles/build(插件) 内的块【整体跳过】（不收集也不计键，复核 C）。"""
+    out = []
+    spans = _pom_region_spans(text)
+    for m in re.finditer(r"<dependency>(.*?)</dependency>", text, re.S):
+        if any(s <= m.start() < e for sp in (spans["profiles"], spans["build"])
+               for s, e in sp):
+            continue
+        inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", inner)
+        a = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", inner)
+        if not (g and a):
+            continue
+        region = "dm" if any(
+            s <= m.start() < e for s, e in spans["dm"]) else "plain"
+        out.append(((g.group(1), a.group(1)), m.group(0), region))
+    return out
+
+
+def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
+                          base_dir: "Path | None" = None) -> str:
+    """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。
+
+    仅 Maven pom 做依赖/成员并集（丢失面已 live 实证）；其它清单类型原样返回
+    incoming（保守——gradle/cargo 未实证丢失面，盲并有语义风险）。任何异常
+    fail-open 返回 incoming。
+    复核 B：依赖键=(g,a,区域) 分账——dm 条目绝不挡 classpath 修复（RuoYi 根 pom
+    是巨型 dm，跨区混同=原 live 缺陷的残留半径）。复核 C：profiles/build 插件
+    依赖整体不参与（不收集/不插入其区）。复核 4：modules 并回带存在性校验
+    （base_dir 提供时，目录已不存在的幽灵成员不复活）。加法-only 已知取舍：
+    内容级"有意删除"会被并回复活（两方合并无法与覆盖丢失区分，需三方基线——
+    登记债）；文件级删除走 delete_files 专路不受影响。
+    """
+    try:
+        name = rel_path.rsplit("/", 1)[-1].lower()
+        if name != "pom.xml" or local_text == incoming_text:
+            return incoming_text
+        merged = incoming_text
+        inc_plain = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "plain"}
+        inc_dm = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "dm"}
+        add_plain: list[str] = []
+        add_dm: list[str] = []
+        for ga, blk, region in _pom_dep_blocks(local_text):
+            if region == "plain" and ga not in inc_plain:
+                add_plain.append(blk)
+                inc_plain.add(ga)
+            elif region == "dm" and ga not in inc_dm:
+                add_dm.append(blk)
+                inc_dm.add(ga)
+        if add_plain:
+            # 并入 incoming 首个【主区】</dependencies> 之前（排除 dm/profiles/build）
+            spans = _pom_region_spans(merged)
+            _excl = spans["dm"] + spans["profiles"] + spans["build"]
+            for m in re.finditer(r"</dependencies>", merged):
+                if not any(s <= m.start() < e for s, e in _excl):
+                    ins = "".join(f"        {b}\n" for b in add_plain)
+                    merged = merged[:m.start()] + ins + merged[m.start():]
+                    break
+            else:
+                add_plain = []  # incoming 无主依赖区 → 保守不并（避免臆造结构/落错区）
+        if add_dm:
+            m2 = re.search(
+                r"<dependencyManagement>.*?(</dependencies>)", merged, re.S)
+            if m2:
+                ins = "".join(f"            {b}\n" for b in add_dm)
+                merged = merged[:m2.start(1)] + ins + merged[m2.start(1):]
+            else:
+                add_dm = []
+        # <modules> 成员并集（主块口径与 prune 同锚点；存在性校验防幽灵复活）
+        add_mods: list[str] = []
+        loc_span = _pom_modules_span(local_text)
+        inc_span = _pom_modules_span(merged)
+        if loc_span and inc_span:
+            loc_mods = re.findall(
+                r"<module>\s*([^<\s]+)\s*</module>", local_text[loc_span[0]:loc_span[1]])
+            inc_mods = set(re.findall(
+                r"<module>\s*([^<\s]+)\s*</module>", merged[inc_span[0]:inc_span[1]]))
+            add_mods = [x for x in loc_mods if x not in inc_mods]
+            if add_mods and base_dir is not None:
+                add_mods = [x for x in add_mods
+                            if (base_dir / x.rstrip("/") / "pom.xml").is_file()]
+            if add_mods:
+                ins_at = merged.index("</modules>", inc_span[0])
+                ins = "".join(f"        <module>{x}</module>\n" for x in add_mods)
+                merged = merged[:ins_at] + ins + merged[ins_at:]
+        if add_plain or add_dm or add_mods:
+            logger.info(
+                "[workspace-manifest] R48c-1 共享清单并集合并 %s：并回 local 独有 "
+                "dependency %d 个 + dm %d 个 + module %d 个（陈旧副本覆盖丢修复面）",
+                rel_path, len(add_plain), len(add_dm), len(add_mods))
+        return merged
+    except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
+        logger.warning("[workspace-manifest] R48c-1 合并异常 fail-open: %s", exc)
+        return incoming_text

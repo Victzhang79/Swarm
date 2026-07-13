@@ -1248,7 +1248,24 @@ class _SandboxSyncMixin:
                         # （与本地/HEAD 同行尾），decode 成字符串后行尾已正确，直接 encode 写回即同源。
                         # 【不再】二次对磁盘采样判 CRLF——持锁前磁盘可能是别的 worker 的覆盖版，采它会
                         # 误判行尾、给本 worker 的 diff 引入伪 CRLF 噪声（评审 MEDIUM，治本：不依赖共享磁盘）。
-                        _lp.write_bytes(_txt.encode("utf-8"))
+                        # R48c-1 复核 A：共享清单的自产出快照可能【陈旧】——快照后其他 worker 的
+                        # 防线④修复/成员注册已并进本地（pull-back 并集合并落盘），此处盲写快照
+                        # =同一类 last-write-wins 盲覆盖的第二写点（live 死因两个写点都能产生）。
+                        # 对共享清单：快照与磁盘现文本先并集合并再写（同一内核，锁已持有）。
+                        _out = _txt.encode("utf-8")
+                        try:
+                            from swarm.worker.sandbox import _is_shared_manifest
+                            if _is_shared_manifest(_f) and _lp.is_file():
+                                from swarm.worker.workspace_manifest import (
+                                    merge_shared_manifest,
+                                )
+                                _cur = _lp.read_bytes().decode("utf-8")
+                                _merged = merge_shared_manifest(
+                                    _cur, _txt, _f, base_dir=_lp.parent)
+                                _out = _merged.encode("utf-8")
+                        except Exception:  # noqa: BLE001 — fail-open 盲写快照（旧行为）
+                            pass
+                        _lp.write_bytes(_out)
                     except OSError as _wexc:
                         self._log(f"主干A 自产出重置落盘失败 {_f}（退化读工作区现状）: {_wexc}")
                 if untracked:

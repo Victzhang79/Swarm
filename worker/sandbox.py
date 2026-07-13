@@ -1504,9 +1504,15 @@ print(json.dumps(files))
                     # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
                     # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
                     # A6：写入本身用原子 temp+rename（即便持锁也无害），杜绝 torn-write。
+                    # R48c-1：写盘前与本地现文本【并集合并】——flock 只串行化写、不防陈旧
+                    # 内容 last-write-wins（round48c 实锤：防线④修好的 ruoyi-system/pom.xml
+                    # 被并行子任务携基线旧副本盲覆盖，修复蒸发→全下游同缺包 BLOCKED 空转）。
+                    # 合并必须持锁做（读-并-写原子），fail-open 回退盲覆盖。
                     try:
                         from swarm.worker.executor import _ProjectGitFlock
                         with _ProjectGitFlock(local_root):
+                            data = self._merge_manifest_with_local(
+                                local_path, rel_posix, data)
                             _atomic_write_bytes(local_path, data)
                     except Exception:
                         _atomic_write_bytes(local_path, data)
@@ -1529,6 +1535,27 @@ print(json.dumps(files))
             len(stats["errors"]),
         )
         return stats
+
+    @staticmethod
+    def _merge_manifest_with_local(local_path: Path, rel_posix: str,
+                                   data: bytes) -> bytes:
+        """R48c-1：共享清单写盘前与本地现文本并集合并 → 合并后 bytes。
+
+        任何异常/二进制/本地不存在 → 原样返回 data（盲覆盖旧行为）。调用方持
+        per-project flock（读-并-写原子）。"""
+        try:
+            if not local_path.is_file():
+                return data
+            # 复核 6：read_bytes+decode——read_text 的 universal newlines 会把 CRLF
+            # 剥成 LF（== 短路失效 + 并回块混行尾）；bytes 精确保行尾同源。
+            local_text = local_path.read_bytes().decode("utf-8")
+            incoming_text = data.decode("utf-8")
+            from swarm.worker.workspace_manifest import merge_shared_manifest
+            merged = merge_shared_manifest(
+                local_text, incoming_text, rel_posix, base_dir=local_path.parent)
+            return merged.encode("utf-8") if merged != incoming_text else data
+        except Exception:  # noqa: BLE001 — fail-open
+            return data
 
     @staticmethod
     def _preserve_line_endings(local_path: Path, new_data: bytes) -> bytes:

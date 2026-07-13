@@ -203,3 +203,155 @@ class TestL2FpAdvance:
         h, _ = _l2_fp_advance(h, "bbb")
         h, ex = _l2_fp_advance(h, "bbb")
         assert ex and len(h) == 3
+
+
+class TestR48cMergeSharedManifest:
+    """R48c-1：pull-back 并集合并——陈旧副本绝不冲掉他人已落盘的依赖/成员。"""
+
+    _LOCAL = """<project>
+    <modules>
+        <module>ruoyi-system</module>
+        <module>alarm-core</module>
+    </modules>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.data</groupId>
+            <artifactId>spring-data-redis</artifactId>
+            <version>2.5.0</version>
+        </dependency>
+    </dependencies>
+</project>
+"""
+    _STALE = """<project>
+    <modules>
+        <module>ruoyi-system</module>
+    </modules>
+    <dependencies>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+        </dependency>
+    </dependencies>
+</project>
+"""
+
+    def test_round48c_repair_survives_stale_overwrite(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        merged = merge_shared_manifest(self._LOCAL, self._STALE, "ruoyi-system/pom.xml")
+        # incoming 的新依赖保留 + local 的修复依赖并回 + local 的模块成员并回
+        assert "hutool-all" in merged
+        assert "spring-data-redis" in merged, "防线④修复绝不被陈旧副本冲掉"
+        assert "<module>alarm-core</module>" in merged
+
+    def test_incoming_wins_on_same_ga(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        local = self._LOCAL.replace("2.5.0", "9.9.9")
+        inc = self._LOCAL  # 同 g:a 已存在 → 不重复并入
+        merged = merge_shared_manifest(local, inc, "pom.xml")
+        assert merged.count("spring-data-redis") == 1
+        assert "9.9.9" not in merged
+
+    def test_non_pom_passthrough(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        assert merge_shared_manifest("include ':a'", "include ':b'",
+                                     "settings.gradle") == "include ':b'"
+
+    def test_incoming_without_dep_section_conservative(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        inc = "<project><modules><module>m</module></modules></project>"
+        merged = merge_shared_manifest(self._LOCAL, inc, "pom.xml")
+        assert "spring-data-redis" not in merged, "incoming 无依赖区不臆造结构"
+
+    def test_dm_block_merged_into_dm(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        local = ("<project><dependencyManagement><dependencies><dependency>"
+                 "<groupId>g</groupId><artifactId>managed-x</artifactId>"
+                 "<version>1</version></dependency></dependencies>"
+                 "</dependencyManagement></project>")
+        inc = ("<project><dependencyManagement><dependencies><dependency>"
+               "<groupId>g</groupId><artifactId>managed-y</artifactId>"
+               "<version>2</version></dependency></dependencies>"
+               "</dependencyManagement></project>")
+        merged = merge_shared_manifest(local, inc, "pom.xml")
+        assert "managed-x" in merged and "managed-y" in merged
+        dm = merged.split("<dependencyManagement>")[1]
+        assert "managed-x" in dm, "dm 块并回 dm 区，不落顶层依赖区"
+
+    def test_idempotent(self):
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        m1 = merge_shared_manifest(self._LOCAL, self._STALE, "pom.xml")
+        m2 = merge_shared_manifest(self._LOCAL, m1, "pom.xml")
+        assert m1 == m2
+
+
+class TestR48cReviewFixes:
+    """R48c-1 对抗复核 A/B/C/4/6 整改回归锁。"""
+
+    def test_b_dm_entry_does_not_block_plain_repair(self):
+        """复核 B：incoming 仅 dm 里有 X → local 主区的 X 修复必须并回主区。"""
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        local = ("<project><dependencies><dependency>"
+                 "<groupId>org.springframework.data</groupId>"
+                 "<artifactId>spring-data-redis</artifactId>"
+                 "</dependency></dependencies></project>")
+        inc = ("<project><dependencyManagement><dependencies><dependency>"
+               "<groupId>org.springframework.data</groupId>"
+               "<artifactId>spring-data-redis</artifactId><version>2.5.0</version>"
+               "</dependency></dependencies></dependencyManagement>"
+               "<dependencies><dependency><groupId>x</groupId>"
+               "<artifactId>y</artifactId></dependency></dependencies></project>")
+        merged = merge_shared_manifest(local, inc, "pom.xml")
+        # 主区必须出现 spring-data-redis（dm 声明版本不提供 classpath）
+        plain = merged.split("</dependencyManagement>")[1]
+        assert "spring-data-redis" in plain
+
+    def test_c_profile_deps_not_collected_nor_polluted(self):
+        """复核 C：profile 依赖不外溢主区；插入点不落 profile 区。"""
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        local = ("<project><profiles><profile><dependencies><dependency>"
+                 "<groupId>p</groupId><artifactId>prof-only</artifactId>"
+                 "</dependency></dependencies></profile></profiles></project>")
+        inc = ("<project><dependencies><dependency><groupId>x</groupId>"
+               "<artifactId>y</artifactId></dependency></dependencies></project>")
+        merged = merge_shared_manifest(local, inc, "pom.xml")
+        assert "prof-only" not in merged, "profile 条件依赖绝不搬进主区"
+        # incoming 无主区、只有 profile 区 → 修复依赖绝不插进 profile
+        local2 = ("<project><dependencies><dependency><groupId>g</groupId>"
+                  "<artifactId>fix-dep</artifactId></dependency></dependencies></project>")
+        inc2 = ("<project><profiles><profile><dependencies><dependency>"
+                "<groupId>p</groupId><artifactId>q</artifactId>"
+                "</dependency></dependencies></profile></profiles></project>")
+        merged2 = merge_shared_manifest(local2, inc2, "pom.xml")
+        assert "fix-dep" not in merged2, "无主区保守不并，绝不落 profile"
+
+    def test_4_ghost_module_not_resurrected(self, tmp_path):
+        """复核 4：目录已不存在的幽灵成员不经并集复活（base_dir 存在性校验）。"""
+        from swarm.worker.workspace_manifest import merge_shared_manifest
+        (tmp_path / "alive").mkdir()
+        (tmp_path / "alive" / "pom.xml").write_text("<project/>", "utf-8")
+        local = ("<project><modules><module>alive</module>"
+                 "<module>ghost</module></modules></project>")
+        inc = "<project><modules><module>base</module></modules></project>"
+        merged = merge_shared_manifest(local, inc, "pom.xml", base_dir=tmp_path)
+        assert "<module>alive</module>" in merged
+        assert "ghost" not in merged, "幽灵成员（无目录）绝不并回"
+
+    def test_6_crlf_preserved_through_merge(self, tmp_path):
+        """复核 6：CRLF local 经 bytes 读取不被剥行尾（== 短路命中）。"""
+        pom = tmp_path / "pom.xml"
+        text = "<project>\r\n<modules>\r\n</modules>\r\n</project>\r\n"
+        pom.write_bytes(text.encode("utf-8"))
+        from swarm.worker.sandbox import SandboxManager
+        out = SandboxManager._merge_manifest_with_local(
+            pom, "pom.xml", text.encode("utf-8"))
+        assert out == text.encode("utf-8"), "同内容必须原样短路（bytes 精确）"
+
+    def test_a_diff_reset_merges_shared_manifest(self):
+        """复核 A：主干A 自产出重置对共享清单走同一并集内核（陈旧快照不冲修复）。"""
+        import inspect
+        from swarm.worker import executor_sync
+        src = inspect.getsource(executor_sync)
+        seg = src[src.index("主干A 治本（并行子任务共享聚合态）"):]
+        seg = seg[:seg.index("if untracked:")]
+        assert "merge_shared_manifest" in seg, "diff-time 重置写点必须走并集合并"
+        assert "_is_shared_manifest" in seg
