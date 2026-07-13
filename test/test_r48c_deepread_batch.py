@@ -314,3 +314,44 @@ class TestR50ExceptOrder:
         i_base = seg.index("except BaseException")
         assert i_exc < i_base, "except Exception 必须先于 except BaseException"
         assert "Recursion" in seg[i_exc:i_base], "递归优雅路径在 Exception 分支内"
+
+
+class TestR50BehaviorLock:
+    def test_graph_recursion_returns_graceful_string(self):
+        """R50-1 行为锁（结构锁之外）：真实抛 GraphRecursionError 穿过 _run_agent，
+        必须拿到优雅降级字符串而非异常外逸。"""
+        import asyncio
+
+        from swarm.worker.executor_agent import _AgentLoopMixin
+
+        class _Boom:
+            async def ainvoke(self, *_a, **_k):
+                class GraphRecursionError(Exception):
+                    pass
+                raise GraphRecursionError(
+                    "Recursion limit of 28 reached without hitting a stop condition.")
+
+        class _Host(_AgentLoopMixin):
+            _agent = {"agent": _Boom()}
+            max_execution_time = 900
+            max_iterations = 25
+            task_id = "t"
+            project_id = "p"
+
+            class subtask:
+                id = "st-x"
+                class difficulty:
+                    value = "medium"
+
+            class phase:
+                value = "coding"
+
+            def _remaining_seconds(self):
+                return 60
+
+            def _log(self, msg):
+                self.logged = msg
+
+        host = _Host()
+        out = asyncio.run(host._run_agent("hi", step="code"))
+        assert "迭代上限" in out and "L1" in out, f"必须优雅降级: {out}"
