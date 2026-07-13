@@ -300,3 +300,17 @@ class TestR49H2Regression:
         assert not (tmp_path / "poison-mod" / "pom.xml").is_file(), "毒源被删"
         assert "poison-mod" not in (tmp_path / "pom.xml").read_text("utf-8"), \
             "root pom 幽灵条目同步摘除"
+
+
+class TestR50ExceptOrder:
+    def test_recursion_error_handled_before_baseexception(self):
+        """r50 实锤：except BaseException 列在 Exception 前会截走 GraphRecursionError，
+        优雅路径（交 L1 按沙箱产出裁决）变死代码 → 撞上限=硬 FAILED。结构锁定顺序。"""
+        import re
+        src = open("worker/executor_agent.py", encoding="utf-8").read()
+        seg = src[src.index("except asyncio.TimeoutError"):]
+        seg = seg[:seg.index("_record_tool_telemetry")]
+        i_exc = seg.index("except Exception")
+        i_base = seg.index("except BaseException")
+        assert i_exc < i_base, "except Exception 必须先于 except BaseException"
+        assert "Recursion" in seg[i_exc:i_base], "递归优雅路径在 Exception 分支内"

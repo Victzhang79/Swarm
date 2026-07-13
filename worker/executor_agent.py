@@ -173,9 +173,6 @@ class _AgentLoopMixin:
         except asyncio.CancelledError:
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
             raise
-        except BaseException:  # noqa: BLE001 — KeyboardInterrupt 级：清作用域防内存泄漏
-            _ledger.end_inflight_scope(_scope, settle_leaked=True)
-            raise
         except Exception as exc:
             # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
             # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
@@ -185,6 +182,10 @@ class _AgentLoopMixin:
                 _ledger.end_inflight_scope(_scope, settle_leaked=False)
                 self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
                 return f"⚠️ Agent 达到迭代上限（{_limit}），已做改动交由确定性 L1 验证"
+            _ledger.end_inflight_scope(_scope, settle_leaked=True)
+            raise
+        except BaseException:  # KeyboardInterrupt 级：清作用域防内存泄漏（必须列在
+            # Exception 之后——r50 实测列前面会截走 GraphRecursionError 杀死优雅路径）
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
             raise
 
