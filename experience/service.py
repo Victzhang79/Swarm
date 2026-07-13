@@ -199,6 +199,12 @@ def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
         pushes, pulls = select_worker_push_pull(subtask, project_stack)
         parts = []
         if pushes:
+            # 可观测性（round48c 实证缺口）：push 是 R40-3 后 worker 侧唯一经验通道，
+            # 却零日志——live 轮无法区分"通道工作中"与"静默失活"（pull 恒 0 的教训
+            # 就是靠遥测才定案的）。一行 INFO 让 grep skills-telemetry 两通道齐观测。
+            logger.info(
+                "[skills-telemetry] worker_push subtask=%s skills=%s",
+                str(getattr(subtask, "id", "") or "?"), [d.id for d in pushes])
             parts.append(render_skills_block(list(pushes)))
         catalog = render_experience_tool_catalog(pulls)
         if catalog:
