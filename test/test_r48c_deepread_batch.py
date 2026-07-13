@@ -202,3 +202,101 @@ class TestH2ReviewFixes:
         from swarm.worker.executor_sync import _SandboxSyncMixin
         _SandboxSyncMixin._rollback_failed_manifest_footprint(_Host(), {})
         assert (tmp_path / "x" / "pom.xml").is_file(), "仅声明未写过 → 绝不删"
+
+
+class TestR49H2Regression:
+    """R49-1 回归锁：H2 首次 live 触发误删成功兄弟产出（round49 实测）。"""
+
+    @staticmethod
+    def _mk_repo(tmp_path):
+        import subprocess as sp
+        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / "pom.xml").write_text(
+            "<project><modules><module>base</module></modules></project>", "utf-8")
+        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c",
+                "user.name=t", "commit", "-qm", "base"], check=True)
+
+    @staticmethod
+    def _host(tmp_path, *, own, snap, creates):
+        class _Host:
+            project_path = str(tmp_path)
+            base_ref = None
+            _post_sync_contents = own
+            _manifest_baseline_snapshot = snap
+
+            class subtask:
+                class scope:
+                    create_files = creates
+                    writable = []
+
+            def _log(self, msg):
+                pass
+        return _Host()
+
+    def test_sibling_pom_copied_via_pullback_not_deleted(self, tmp_path):
+        """r49 实锤主场景：兄弟新建的 pom 经补传/pull-back 进了本 worker 的
+        post_sync（内容原样）——绝不能被当'本人新建'删除。"""
+        self._mk_repo(tmp_path)
+        (tmp_path / "alarm-schedule").mkdir()
+        sib = "<project>sibling scaffold</project>"
+        (tmp_path / "alarm-schedule" / "pom.xml").write_text(sib, "utf-8")
+        host = self._host(
+            tmp_path,
+            own={"alarm-schedule/pom.xml": sib},
+            snap={"pom.xml": "<project><modules><module>base</module></modules></project>"},
+            creates=["alarm-callback/pom.xml"])  # 本子任务声明建的是别的
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(host, {})
+        assert (tmp_path / "alarm-schedule" / "pom.xml").is_file(), \
+            "pull-back 复制 ≠ 本人建的，绝不删"
+
+    def test_root_pom_strip_uses_bootstrap_snapshot(self, tmp_path):
+        """r49 实锤第二场景：root pom 剥离基线=bootstrap 快照——兄弟自 HEAD 以来
+        的注册（快照里已有）绝不被剥。"""
+        self._mk_repo(tmp_path)
+        # 快照=HEAD+兄弟注册；worker 版本=快照+自己的模块；local=worker 版本
+        snap_txt = ("<project><modules><module>base</module>"
+                    "<module>sibling-mod</module></modules></project>")
+        worker_txt = snap_txt.replace(
+            "</modules>", "<module>my-mod</module></modules>")
+        (tmp_path / "pom.xml").write_text(worker_txt, "utf-8")
+        host = self._host(
+            tmp_path, own={"pom.xml": worker_txt},
+            snap={"pom.xml": snap_txt}, creates=["my-mod/pom.xml"])
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(host, {})
+        text = (tmp_path / "pom.xml").read_text("utf-8")
+        assert "sibling-mod" in text, "兄弟注册（快照内）绝不被剥"
+        assert "my-mod" not in text, "本 worker 新增被摘"
+
+    def test_snapshot_missing_skips_entirely(self, tmp_path):
+        """快照缺失=无法归因 → 整体跳过（宁可漏回滚绝不误删）。"""
+        self._mk_repo(tmp_path)
+        (tmp_path / "x").mkdir()
+        (tmp_path / "x" / "pom.xml").write_text("<project/>", "utf-8")
+        host = self._host(tmp_path, own={"x/pom.xml": "<project/>"},
+                          snap={}, creates=["x/pom.xml"])
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(host, {})
+        assert (tmp_path / "x" / "pom.xml").is_file()
+
+    def test_own_created_poison_deleted_with_root_prune(self, tmp_path):
+        """正向：本人声明创建+快照证实 bootstrap 不存在 → 删除+root pom 摘幽灵。"""
+        self._mk_repo(tmp_path)
+        (tmp_path / "poison-mod").mkdir()
+        (tmp_path / "poison-mod" / "pom.xml").write_text("<project>bad</project>", "utf-8")
+        root_txt = ("<project><modules><module>base</module>"
+                    "<module>poison-mod</module></modules></project>")
+        (tmp_path / "pom.xml").write_text(root_txt, "utf-8")
+        host = self._host(
+            tmp_path,
+            own={"poison-mod/pom.xml": "<project>bad</project>"},
+            snap={"poison-mod/pom.xml": "",
+                  "pom.xml": "<project><modules><module>base</module></modules></project>"},
+            creates=["poison-mod/pom.xml"])
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(host, {})
+        assert not (tmp_path / "poison-mod" / "pom.xml").is_file(), "毒源被删"
+        assert "poison-mod" not in (tmp_path / "pom.xml").read_text("utf-8"), \
+            "root pom 幽灵条目同步摘除"
