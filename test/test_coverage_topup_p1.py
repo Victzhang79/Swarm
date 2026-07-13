@@ -410,7 +410,12 @@ async def test_plan_node_ultra_coverage_retry_uses_topup_not_redecompose(monkeyp
     got = out["plan"]
     got_ids = {s.id for s in got.subtasks}
     assert "st-NEW" not in got_ids, "绝不触发全量重拆（重拆 fake 的新 id 不应出现）"
-    assert got_ids == {"st-keep-1", "st-keep-2"}, "复用上一版子任务 id，无重编号"
+    # R48-1（v0.9.38+）：收尾器会为 file_plan 无主孤儿确定性新建 st-fileplan-* 承接
+    # 子任务——P1 复用语义不变（原 id 全保留、无重编号），新增承接是设计行为。
+    assert {"st-keep-1", "st-keep-2"} <= got_ids, "复用上一版子任务 id，无重编号"
+    _extras = got_ids - {"st-keep-1", "st-keep-2"}
+    assert all(x.startswith(("st-fileplan-", "st-contract-", "st-scaffold-"))
+               for x in _extras), f"非收尾器来源的意外新子任务: {_extras}"
     assert redecompose_fake.captured == [], "重拆 LLM 一次都不该被调"
     m = build_coverage_matrix(got, _items(), out.get("baseline_covered"))
     assert m["uncovered"] == [], "外科补齐后覆盖收敛"

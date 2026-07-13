@@ -48,6 +48,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_DOCS_PUBLIC": "api/auth.py:28",
     "SWARM_ENV": "config/settings.py:719",
     "SWARM_EXTRACT_MAX_ITEMS": "brain/requirements_extract.py:41",
+    "SWARM_SUBTASK_MAX_DISPATCH_TOTAL": "brain/nodes/failure.py:_lifetime_cap",
     "SWARM_GITLAB_MR_ON_ACCEPT": "brain/nodes/__init__.py:4359",
     "SWARM_GITLAB_PROJECT_ID": "brain/l3_gitlab.py:27",
     "SWARM_GITLAB_PUSH_ENABLED": "brain/l3_gitlab.py:32",
