@@ -416,3 +416,31 @@ class TestR50bBatch:
         cmd = _scope_maven_command("mvn -q compile", str(tmp_path), basis)
         assert "-pl alarm-security" in cmd or "-f alarm-security" in cmd
         assert "ruoyi-framework" not in cmd, "外模块绝不进 -pl"
+
+
+class TestR51CompletedNotAbandoned:
+    """R51-1：已完成子任务绝不入放弃闭包（三连误杀真因）。"""
+
+    def test_completed_dependent_excluded_from_closure(self):
+        from swarm.brain.nodes.planning_core import _transitive_abandon
+        sts = [_st("st-a", create=["m/a.java"]),
+               _st("st-b", create=["m/b.java"], deps=["st-a"]),
+               _st("st-c", create=["m/c.java"], deps=["st-b"])]
+        # st-b 已完成（C9 边后加是常态）——st-a 放弃时 st-b 免疫，st-c（未完成）仍连坐
+        closed = _transitive_abandon(sts, {"st-a"}, completed_ids={"st-b"})
+        assert "st-b" not in closed, "已完成者绝不入闭包（产出已入账）"
+        assert "st-a" in closed
+        # st-c 依赖 st-b（存活）非闭包成员 → 也不连坐
+        assert "st-c" not in closed
+
+    def test_completed_seed_removed(self):
+        from swarm.brain.nodes.planning_core import _transitive_abandon
+        sts = [_st("st-a", create=["m/a.java"])]
+        closed = _transitive_abandon(sts, {"st-a"}, completed_ids={"st-a"})
+        assert closed == set(), "种子里的已完成者同样剔除（完成的工作永不弃）"
+
+    def test_backcompat_without_completed(self):
+        from swarm.brain.nodes.planning_core import _transitive_abandon
+        sts = [_st("st-a", create=["m/a.java"]),
+               _st("st-b", create=["m/b.java"], deps=["st-a"])]
+        assert _transitive_abandon(sts, {"st-a"}) == {"st-a", "st-b"}

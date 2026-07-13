@@ -73,17 +73,24 @@ def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[s
 # 仅保留【缺依赖/缺符号】的特异信号，杜绝 "does not exist"/"无法访问" 这类宽串误伤
 # （会命中 "User does not exist"/"table does not exist"/Java 模块可见性 "cannot access" 等
 # 非依赖失败 → 误授 pom 写权、空烧定向恢复配额）。各语言 javac/go/rustc/py/node 的缺包特征：
-def _transitive_abandon(subtasks: list, abandoned: set[str]) -> set[str]:
+def _transitive_abandon(subtasks: list, abandoned: set[str],
+                        completed_ids: set[str] | None = None) -> set[str]:
     """传递放弃闭包：把【依赖任一已放弃子任务】的子任务也并入放弃集（缺依赖永远跑不了）。
 
     单一事实源，供 revert 连坐 / 部分交付 / 上游放弃短路三处共用，杜绝"只放弃直接失败者、
-    漏掉依赖链下游"致下游永留 remaining 被反复重派的无界循环。返回闭包后的放弃集（原地不改入参）。"""
-    closed = set(abandoned)
+    漏掉依赖链下游"致下游永留 remaining 被反复重派的无界循环。返回闭包后的放弃集（原地不改入参）。
+    R51-1（round51 三连误杀真因）：completed_ids 里的子任务【绝不入闭包】——它已经跑完了，
+    "缺依赖跑不了"对历史不成立（C9 动态边在完成后才补上是常态）。旧行为把已完成者卷进
+    闭包 → 调用方 pop 其 subtask_results = 已交付工作静默丢弃 + 完成计数倒退（D14）→
+    看守 progress 高水位锁死误杀健康轮。与 types._is_ready 的 T5 先例（completed 优先于
+    放弃集）同一原则。种子集内的已完成者同样剔除（fail-safe：完成的工作永不弃）。"""
+    _done = completed_ids or set()
+    closed = {a for a in abandoned if a not in _done}
     _changed = True
     while _changed:
         _changed = False
         for s in subtasks:
-            if s.id in closed:
+            if s.id in closed or s.id in _done:
                 continue
             if any(d in closed for d in (getattr(s, "depends_on", []) or [])):
                 closed.add(s.id)
@@ -743,6 +750,9 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
             )
             # revert 路：X 被依赖 → 其下游缺依赖跑不了 → 传递放弃（清足迹防毒 + 出完成态）。
             if depended:
+                # R51-1 边界：revert 路径【保留】完成者连坐——上游代码被主动抽离树，
+                # 依赖它编译过的下游产出随之破碎（与 unrecoverable/部分交付不同：那两路
+                # 上游本无产出，下游完成=未真依赖）。
                 _closed = _transitive_abandon(subtasks, abandoned | {fid})
                 for s in subtasks:
                     if (s.id in _closed and s.id != fid

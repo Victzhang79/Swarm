@@ -812,9 +812,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             if _healed:
                 # 复核 HIGH#1（混批）：真死上游 _unrecoverable 在同一 return 里【照常连坐放弃】，
                 # 绝不因存在自愈项就拖着不放弃；只重派【已愈】项，放弃/未愈项不重派。
-                _ab = _transitive_abandon(
+                _ab = _transitive_abandon(  # R51-1：completed 绝不入闭包
                     plan_obj.subtasks,
                     set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
+                    completed_ids=_completed_ok,
                 ) if _unrecoverable else set()
                 for _a in _ab:
                     subtask_results.pop(_a, None)
@@ -850,6 +851,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             abandoned = _transitive_abandon(
                 plan_obj.subtasks,
                 set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
+                completed_ids=_completed_ok,  # R51-1
             )
             for _a in abandoned:
                 subtask_results.pop(_a, None)
@@ -1482,7 +1484,11 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         _allow_partial = getattr(get_config().worker, "allow_partial_delivery", True)
         if _allow_partial and _done and plan_obj is not None:
             # 传递放弃：依赖被放弃者的子任务也放弃(缺依赖跑不了)，避免它们永留 remaining 死循环
-            abandoned = _transitive_abandon(plan_obj.subtasks, _abandoned_so_far | set(failed_ids))
+            _done_ok = {tid for tid, o in subtask_results.items()
+                        if tid not in failed_ids and l1_passed(o)}
+            abandoned = _transitive_abandon(
+                plan_obj.subtasks, _abandoned_so_far | set(failed_ids),
+                completed_ids=_done_ok)  # R51-1：completed 绝不入闭包
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
             logger.warning(
                 "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",
