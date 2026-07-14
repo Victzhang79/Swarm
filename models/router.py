@@ -460,6 +460,11 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     swarm_heartbeat_every: float = 30.0
     # 总时长看门狗：单次流式累计超此秒数即判 runaway 抛 transient。0=关闭（默认，worker 热路径不动）。
     swarm_wallclock_budget: float = 0.0
+    # R55-1：**思考阶段**预算（秒）。reasoning 模型在思维链里原地打转时，max_tokens 封不住
+    # （只封最终答案）、stall 看门狗看不出（chunk 一直在吐）、墙钟兜底要先烧满 25 分钟。
+    # 关键洞察：**正文尚未吐出一个字之前**中途 abort 是无损的（下游一个 chunk 都没收到）→
+    # 超预算即就地关 thinking、用同一模型重开流，下游无感。0=关闭。
+    swarm_reasoning_phase_budget: float = 0.0
     # B6（阶段2.4，登记册 §三）：provider 级进程并发闸。每任务 Semaphore(4)×多任务×
     # tech_design(3)×contract 并发可达十几路，系统自己把云端打饱和（饱和→超时→重试→更
     # 饱和自激振荡）。同 provider 的所有流式调用共享一个进程级槽位池，持有整个流期间。
@@ -523,6 +528,8 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
         last_beat = t0
         n_chunks = 0
         last_chunk: Any = None
+        content_seen = False    # R55-1：是否已吐出正文（未吐 → 仍在思考阶段，abort 无损）
+        thinking_off = False    # R55-1：已就地降级过一次（绝不无限重开）
         while True:
             to = self.swarm_first_token_timeout if first else self.swarm_inter_chunk_timeout
             try:
@@ -576,6 +583,34 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             first = False
             n_chunks += 1
             now = _monotonic()
+            if not content_seen and str(getattr(chunk, "content", "") or ""):
+                content_seen = True    # 正文已开吐 → 思考阶段结束，此后 abort 不再无损
+            # R55-1（round55 实锤）：**思考阶段**预算——正文一个字都还没吐、思维链却已烧穿预算
+            # → 模型在原地打转（实测 EXTRACT_REQ：1471s / 79605 chunk，前 400+ chunk 无一正文）。
+            # 此刻 abort 是【无损】的（下游没收到任何 chunk）→ 就地关 thinking、用**同一模型**重开流：
+            # 几十秒拿到正文，而不是烧满墙钟预算再切备模型从头重跑（后者丢掉 25 分钟且换模型）。
+            # 只降级一次（_thinking_off 置位）：再失控就交给墙钟/stall 兜底，绝不无限重开。
+            if (self.swarm_reasoning_phase_budget > 0 and not content_seen
+                    and not thinking_off and now - t0 >= self.swarm_reasoning_phase_budget):
+                logger.warning(
+                    "[stream] %s%s R55-1 思考阶段已 %.0fs（%d chunk）仍未吐出任何正文 → 判 reasoning "
+                    "runaway：就地关闭 thinking 用同一模型重开流（无损：下游尚未收到任何 chunk）",
+                    _llm_node_tag(), getattr(self, "model_name", None) or "model", now - t0, n_chunks,
+                )
+                try:
+                    await agen.aclose()   # 关底层流，让推理端 abort 解码、释放算力
+                except Exception:  # noqa: BLE001
+                    pass
+                _eb = dict(kwargs.get("extra_body") or {})
+                _eb["thinking"] = {"type": "disabled"}
+                kwargs["extra_body"] = _eb
+                agen = super()._astream(*args, **kwargs)
+                thinking_off = True
+                first = True          # 重开流：首 token 重新按 prefill 超时计
+                t0 = _monotonic()     # 墙钟/心跳按新流重算（旧流成果已丢弃，不该继续计入）
+                last_beat = t0
+                n_chunks = 0
+                continue
             # 总时长看门狗（第三条腿）：稳定吐但吐不完的 runaway，stall 看门狗与 max_tokens 都拦不住，
             # 累计超预算即判定 runaway → 抛 transient（早 fail-fast 切 fallback，不空烧到自然 stall）。
             if self.swarm_wallclock_budget > 0 and now - t0 >= self.swarm_wallclock_budget:
@@ -670,6 +705,7 @@ class EndpointProvider:
                 self.provider.id, self.provider.kind, self.provider.base_url, api_key,
                 self._resolve_retries(), model_name, float(temperature),
                 int(max_tokens or 0), float(wallclock_budget or 0.0),
+                float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0),
                 float(self.config.timeout_seconds),
                 float(getattr(self.config, "first_token_timeout", self.config.stream_chunk_timeout)),
                 float(getattr(self.config, "inter_chunk_timeout", 30.0)),
@@ -722,6 +758,13 @@ class EndpointProvider:
         _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
         # 治本（第三条腿）：总时长看门狗。由调用方按角色传入（brain 开/worker 默认关），0=关闭。
         _kwargs["swarm_wallclock_budget"] = float(wallclock_budget or 0.0)
+        # R55-1：思考阶段预算——只对【云端 reasoning 模型】有意义（本地 provider 上面已直接关
+        # thinking）。开了墙钟兜底（即 brain 角色）才启用：两者是同一条腿的粗细两级——先用无损的
+        # "关 thinking 重开流"抢救，抢救不回再由墙钟切备模型。
+        _kwargs["swarm_reasoning_phase_budget"] = (
+            float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0)
+            if (wallclock_budget or 0) > 0 and self.provider.kind != "local" else 0.0
+        )
         # B6：provider 并发闸参数——provider 显式 max_concurrency 优先；云端缺省走
         # SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY（默认 6）；本地缺省 0=不闸（时间成本口径）。
         _kwargs["swarm_provider_id"] = self.provider.id

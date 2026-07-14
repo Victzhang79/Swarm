@@ -268,6 +268,18 @@ class ModelConfig(BaseSettings):
     # 重跑）可调低，但更优解是从源头限 reasoning（reasoning_effort/关 thinking）。0=关闭。worker 热路径不开
     # （已有 stall+worker_max_tokens=8192 双重兜底）。
     brain_stream_wallclock_s: float = 1500.0
+    # R55-1（round55 实锤）：**思考阶段**预算（秒）。云端 reasoning 模型（GLM-5.2）会在思维链里
+    # 原地打转：实测 EXTRACT_REQ 一次调用吐了 1471s / 79605 chunk，**其中前 400+ chunk 一个正文都没有**
+    # ——全是 reasoning。而 max_tokens 只封最终答案（reasoning_content 豁免），双超时只看 chunk 间隔
+    # （它一直在吐，看门狗认为"健康"），于是唯一的兜底是 1500s 墙钟：**先烧满 25 分钟**再抛 transient
+    # 切备模型、从头重跑。代价太高。
+    # 治本抓手（实测坐实）：SiliconFlow 的 `thinking:{"type":"disabled"}` **真生效**（同题 40.9s/2252
+    # chunk → 15.6s/736 chunk，正文长度相当）；而 `reasoning_effort=low` 被**忽略**（44.4s，无变化）。
+    # 机制：思考阶段【还没吐出任何正文】时中途 abort 是**无损的**（下游一个 chunk 都没收到）→ 超过本
+    # 预算即就地关 thinking、用**同一个模型**重开流，下游无感，几十秒拿到正文；而不是丢掉 25 分钟成果
+    # 再换模型从头来过。合法的深度思考不受影响（预算给足）。0=关闭。
+    # env: SWARM_MODEL_BRAIN_REASONING_PHASE_BUDGET_S
+    brain_reasoning_phase_budget_s: float = 900.0
     # E2（round38c 主题E，register #32）：worker 单次流式调用总墙钟。R35-A/round38c 实证
     # 存在「单调用挂满 900s 总预算」形态（stall 看门狗可被 provider 心跳空 chunk 重置、
     # B6 槽位排队不计入 stall），届时整个 agent 被外层 cancel，无任何本步换备。开 wallclock

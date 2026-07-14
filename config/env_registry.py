@@ -14,6 +14,10 @@ REGISTERED_ENVS: dict[str, str] = {
     # R53-1：Maven 坐标/版本解析（仓库联网）。0=关闭（单测默认关，见 test/conftest.py：
     # 绝不让测试依赖网络，也杜绝"网络好就绿"的假绿）；关闭后行为=解析不到即如实省略。
     "SWARM_MAVEN_LOOKUP": "brain/maven_registry.py:_lookup_enabled",
+    # R55-1：思考阶段预算（秒）。云端 reasoning 模型在思维链里原地打转时，max_tokens/stall
+    # 看门狗都拦不住，墙钟兜底要先烧满 25 分钟。超此预算且尚未吐出正文 → 就地关 thinking
+    # 用同一模型重开流（无损，下游无感）。0=关闭。
+    "SWARM_MODEL_BRAIN_REASONING_PHASE_BUDGET_S": "config/settings.py:brain_reasoning_phase_budget_s",
     "SWARM_MAVEN_LOOKUP_TIMEOUT_S": "brain/maven_registry.py:_HTTP_TIMEOUT_S",
     "SWARM_ADVERSARIAL_MAX_ROUNDS": "brain/nodes/adversarial.py:51",
     "SWARM_ADVERSARIAL_REVIEW_TIMEOUT": "brain/nodes/adversarial.py:61",
