@@ -100,9 +100,11 @@ def test_d32_version_repair_spares_project_own_version(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         _setup_maven_project(tmp, _MODULE_POM_LITERAL)
+        # 桩必须桩在**真实取数口**上：R56-6 后剪除路径走 probe → (versions, reachable)。
+        # reachable=True = 仓库确证答复；桩成 reachable=False 会让全闸 fail-open（什么都不修）。
         monkeypatch.setattr(
-            lp, "_fetch_maven_versions",
-            lambda g, a, p, t: ["3.0.0", "3.5.0"] if a == "foo" else [],
+            lp, "_fetch_maven_versions_probe",
+            lambda g, a, p, t: ((["3.0.0", "3.5.0"], True) if a == "foo" else ([], True)),
         )
         build_out = (
             "[ERROR] Failed to execute goal: Could not find artifact "
@@ -136,8 +138,8 @@ def test_d32_version_repair_property_indirection_still_works(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _setup_maven_project(tmp, _MODULE_POM_PROPERTY)
         monkeypatch.setattr(
-            lp, "_fetch_maven_versions",
-            lambda g, a, p, t: ["9.0.0", "9.5.0"] if a == "foo" else [],
+            lp, "_fetch_maven_versions_probe",
+            lambda g, a, p, t: ((["9.0.0", "9.5.0"], True) if a == "foo" else ([], True)),
         )
         build_out = "Could not find artifact com.thirdparty:foo:jar:9.9.9 in public"
         n, changed = lp._attempt_maven_version_repair(tmp, build_out, timeout=30)

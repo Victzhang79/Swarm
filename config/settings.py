@@ -278,8 +278,11 @@ class ModelConfig(BaseSettings):
     # 机制：思考阶段【还没吐出任何正文】时中途 abort 是**无损的**（下游一个 chunk 都没收到）→ 超过本
     # 预算即就地关 thinking、用**同一个模型**重开流，下游无感，几十秒拿到正文；而不是丢掉 25 分钟成果
     # 再换模型从头来过。合法的深度思考不受影响（预算给足）。0=关闭。
+    # R56-2：预算必须**明显早于**节点级处决闸——PLAN-BATCH 的 B5 硬顶也是 900s，两者同刻触发
+    # 时谁先谁不确定；B5 若抢先杀流，救援就永远没机会出手（EXTRACT_REQ 无 B5，所以 round56 才救成）。
+    # 600s：早于 B5(900s)/墙钟(1500s)，又远高于合法思考时长（实测合法慢调用的思考期远不到 10min）。
     # env: SWARM_MODEL_BRAIN_REASONING_PHASE_BUDGET_S
-    brain_reasoning_phase_budget_s: float = 900.0
+    brain_reasoning_phase_budget_s: float = 600.0
     # E2（round38c 主题E，register #32）：worker 单次流式调用总墙钟。R35-A/round38c 实证
     # 存在「单调用挂满 900s 总预算」形态（stall 看门狗可被 provider 心跳空 chunk 重置、
     # B6 槽位排队不计入 stall），届时整个 agent 被外层 cancel，无任何本步换备。开 wallclock

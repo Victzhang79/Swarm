@@ -204,14 +204,42 @@ def test_prune_ignores_groupid_mismatch_and_exclusions():
         "exclusions 内撞名不得触发剪除（外层依赖有版本且合法）"
 
 
-def test_reactor_artifacts_reads_modules_and_root(tmp_path):
+def test_reactor_artifacts_reads_modules_and_root(tmp_path, monkeypatch):
     (tmp_path / "pom.xml").write_text(ROOT_POM, encoding="utf-8")
     import swarm.worker.l1_pipeline as lp
-    mods = _reactor_artifacts.__wrapped__(str(tmp_path)) if hasattr(
-        _reactor_artifacts, "__wrapped__") else None
-    # _read_project_file 走沙箱通道 → 直接注入本地读取
-    lp._read_project_file = lambda p, rel, timeout=20: (  # type: ignore[assignment]
-        (tmp_path / rel).read_text("utf-8") if (tmp_path / rel).is_file() else None)
+    # ★必须用 monkeypatch★：此前这里是裸赋值 `lp._read_project_file = ...`，**永不还原** →
+    # 整个 pytest session 后续所有测试的文件读取都被绑死在本测试的 tmp_path 上（实测打死 D32 两条）。
+    monkeypatch.setattr(lp, "_read_project_file", lambda p, rel, timeout=20: (
+        (tmp_path / rel).read_text("utf-8") if (tmp_path / rel).is_file() else None))
     mods = lp._reactor_artifacts(str(tmp_path))
     assert {"ruoyi-common", "alarm-api", "ruoyi"} <= mods
     assert "alarm-interface" not in mods, "不存在的模块绝不能被当成 reactor 成员（否则幻影逃逸）"
+
+
+def test_reactor_artifacts_walks_nested_aggregators(tmp_path, monkeypatch):
+    """★嵌套 reactor★ 孙模块经中间聚合 pom 声明 → 也必须算工作区成员。
+
+    否则合法的兄弟依赖会被合法性闸规则②当作"幻影"**无条件剪除**（该规则没有 fail-open 出口）——
+    这正是 round46 "reactor missing-child" 那一族的死法。
+    """
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<modules><module>ruoyi-modules</module></modules></project>", encoding="utf-8")
+    sub = tmp_path / "ruoyi-modules"
+    sub.mkdir()
+    (sub / "pom.xml").write_text(
+        "<project><parent><artifactId>ruoyi</artifactId></parent>"
+        "<artifactId>ruoyi-modules</artifactId>"
+        "<modules><module>alarm-core</module></modules></project>", encoding="utf-8")
+    leaf = sub / "alarm-core"
+    leaf.mkdir()
+    (leaf / "pom.xml").write_text(
+        "<project><parent><artifactId>ruoyi-modules</artifactId></parent>"
+        "<artifactId>alarm-core</artifactId></project>", encoding="utf-8")
+
+    import swarm.worker.l1_pipeline as lp
+    monkeypatch.setattr(lp, "_read_project_file", lambda p, rel, timeout=20: (
+        (tmp_path / rel).read_text("utf-8") if (tmp_path / rel).is_file() else None))
+    mods = lp._reactor_artifacts(str(tmp_path))
+    assert "alarm-core" in mods, "孙模块必须被认成工作区成员，否则依赖它的兄弟 pom 会被误剪"
+    assert {"ruoyi", "ruoyi-modules"} <= mods

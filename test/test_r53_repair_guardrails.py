@@ -153,3 +153,83 @@ def test_group_family_version_resolves_property(tmp_path, monkeypatch):
                         if (tmp_path / rel).is_file() else None)
     assert lp._group_family_version(str(tmp_path), "org.springframework.boot") == "4.0.6"
     assert lp._group_family_version(str(tmp_path), "cn.hutool") is None, "无先例 → None（走最新稳定版）"
+
+
+# ── R56-3：同 groupId ≠ 同发布列车（round56 活体误伤，修正 R54-5） ─────────────
+def test_umbrella_group_never_triggers_generation_prune():
+    """★ `com.alibaba` 是伞形 groupId：druid(1.2.28) / easyexcel(4.0.3) / fastjson 彼此无版本关系。
+
+    round56 活体误伤：R54-5 拿"工程 com.alibaba 钉在 1.2.28"判定 easyexcel(4.0.3) 跨代 →
+    **把合法依赖直接剪掉**（代码用到它就编译失败）。判据必须收紧为【同发布列车】。
+    """
+    from swarm.worker.l1_pipeline import _same_release_train
+
+    assert _same_release_train("spring-boot-starter-aop", "spring-boot-dependencies"), \
+        "同列车（共享 spring-boot 前缀）→ 版本必须对齐"
+    assert not _same_release_train("easyexcel", "druid-spring-boot-4-starter"), \
+        "★不同产品线绝不能被当成同一代（那会剪掉合法依赖）"
+    assert not _same_release_train("fastjson2", "fastjson"), "只共享 1 段词元不算同列车"
+
+
+def test_family_version_skips_unrelated_artifact_in_same_group(tmp_path, monkeypatch):
+    """伞形 group 下，目标 artifact 与已钉 artifact 无公共前缀 → 不返回家族版本（走最新稳定版）。"""
+    import swarm.worker.l1_pipeline as lp
+
+    (tmp_path / "pom.xml").write_text(
+        "<project><dependencyManagement><dependencies>"
+        "<dependency><groupId>com.alibaba</groupId>"
+        "<artifactId>druid-spring-boot-4-starter</artifactId>"
+        "<version>1.2.28</version></dependency>"
+        "</dependencies></dependencyManagement></project>", encoding="utf-8")
+    monkeypatch.setattr(lp, "_read_project_file",
+                        lambda p, rel, timeout=20: (tmp_path / rel).read_text("utf-8")
+                        if (tmp_path / rel).is_file() else None)
+
+    assert lp._group_family_version(str(tmp_path), "com.alibaba", "easyexcel") is None, \
+        "★easyexcel 与 druid 不同列车 → 不得对齐到 1.2.28（否则合法依赖被剪）"
+    assert lp._group_family_version(
+        str(tmp_path), "com.alibaba", "druid-spring-boot-starter") == "1.2.28", \
+        "同列车（druid-spring-boot-*）→ 正常对齐"
+
+
+# ── R56-4：**有 version 的**幻影坐标（round56 实锤，从所有闸门缝里钻过去） ──────
+POM_PHANTOM_WITH_VERSION = """<project>
+    <artifactId>ruoyi-alarm-admin</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.ruoyi</groupId>
+            <artifactId>ruoyi-alarm-system</artifactId>
+            <version>4.8.3</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ruoyi</groupId>
+            <artifactId>ruoyi-common</artifactId>
+            <version>4.8.3</version>
+        </dependency>
+    </dependencies>
+</project>
+"""
+
+
+def test_prune_can_cut_phantom_that_carries_a_version():
+    """★ 有 version 的幻影必须能剪 ★
+
+    round56 实锤：`com.ruoyi:ruoyi-alarm-system:4.8.3` —— 用工程自己的 groupId（R54-6 无从改）、
+    带着 version（R53-2 不剪）、仓库查无（version-repair 静默跳过）→ `Could not resolve
+    dependencies` → 整个模块解析失败、连坐下游。工程模块从不在远程仓库里 = **可证永不可解析**。
+    """
+    from swarm.worker.l1_pipeline import _prune_dep_blocks
+
+    out = _prune_dep_blocks(POM_PHANTOM_WITH_VERSION, "com.ruoyi", "ruoyi-alarm-system",
+                            even_with_version=True)
+    assert out is not None and "ruoyi-alarm-system" not in out, "幻影模块坐标必须被剪除"
+    assert "ruoyi-common" in out, "真 reactor 模块依赖不得被误伤"
+
+
+def test_default_prune_still_refuses_to_cut_versioned_deps():
+    """默认（保守）仍只剪无版本的——带版本的坏依赖顶多局部解析失败，不扩大打击面。"""
+    from swarm.worker.l1_pipeline import _prune_dep_blocks
+
+    assert _prune_dep_blocks(
+        POM_PHANTOM_WITH_VERSION, "com.ruoyi", "ruoyi-alarm-system") is None, \
+        "未显式开 even_with_version → 有版本的依赖绝不动"

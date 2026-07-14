@@ -130,25 +130,57 @@ def _attempt_import_repair(
 # 不再逐错加正则（避免 §0 的 whack-a-mole）。
 
 
-def _fetch_maven_versions(group: str, artifact: str, project_path: str, timeout: int) -> list[str]:
-    """查仓库 maven-metadata.xml 列出 artifact 的真实可用版本（aliyun→Central 兜底）。
+def _fetch_maven_versions_probe(
+    group: str, artifact: str, project_path: str, timeout: int
+) -> tuple[list[str], bool]:
+    """查仓库真实可用版本 → **(versions, reachable)**。
 
-    在沙箱内跑 curl/wget（沙箱有出网）。任一仓库取到非空版本即返回；都取不到返回 []。
+    ★为什么必须返回 reachable★（R56-6 治本，round56 后自审揪出）：
+    「仓库**确证**查无此 artifact」与「仓库**根本没连上**（断网/curl 缺失/两仓 5xx）」在旧实现里
+    **同样返回 []**——于是所有"空列表 ⇒ 坐标不可解析 ⇒ 剪除"的判定，在**沙箱一断网时会把全工程
+    的合法第三方依赖全部剪光**。这正是本系统最不能犯的错（误剪合法依赖 ≫ 漏过坏坐标：后者下游
+    还有闸，前者直接毁产物）。剪除是**不可逆**动作，必须建立在**肯定证据**（仓库确证 404）之上，
+    绝不能建立在**证据缺失**（没连上）之上。
+
+    reachable=True 的判据（二者其一，须是**肯定**证据）：
+      · 取到了版本列表（不论哪个仓库、curl 还是 wget）；
+      · HTTP 状态码确证为 404（仓库答复了："我这儿没有它"）。
+    只要没有任何仓库给出肯定证据 → reachable=False → 调用方一律 fail-open（放行，绝不剪）。
     """
     gpath = group.replace(".", "/")
     urls = [
         f"https://maven.aliyun.com/repository/public/{gpath}/{artifact}/maven-metadata.xml",
         f"https://repo1.maven.org/maven2/{gpath}/{artifact}/maven-metadata.xml",
     ]
+    reachable = False
     for url in urls:
-        cmd = f"curl -s -m 15 {shlex.quote(url)} 2>/dev/null || wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null"
+        # -w 把 HTTP 码贴在正文尾部：区分「404=确证没有」与「000/5xx/超时=没连上」的唯一手段。
+        # wget 兜底不带状态码 → 只能用于**肯定**结论（拿到版本），拿不到时不敢断言"仓库没有"。
+        cmd = (f"curl -s -m 15 -w '\\n__HTTP__%{{http_code}}' {shlex.quote(url)} 2>/dev/null "
+               f"|| wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null")
         _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
         if _tool_missing(out):
             continue
-        versions = re.findall(r"<version>([^<]+)</version>", out or "")
+        body = out or ""
+        m = re.search(r"__HTTP__(\d{3})\s*$", body)
+        code = m.group(1) if m else ""
+        versions = re.findall(r"<version>([^<]+)</version>", body)
         if versions:
-            return [v.strip() for v in versions if v.strip()]
-    return []
+            return [v.strip() for v in versions if v.strip()], True
+        if code == "404":
+            reachable = True   # 仓库确证答复"没有它"——这才是可据以剪除的肯定证据
+        # 000（连不上）/5xx（仓库故障）/无状态码（wget 路径） → 不构成任何结论，试下一个仓库
+    return [], reachable
+
+
+def _fetch_maven_versions(group: str, artifact: str, project_path: str, timeout: int) -> list[str]:
+    """兼容旧调用点：只要版本列表（空 = 没拿到，**不区分**查无与不可达）。
+
+    ⚠️ 任何要据"空列表"做**剪除/否定**判定的调用点，必须改用 `_fetch_maven_versions_probe`
+    并检查 reachable——否则断网即误剪（见 probe 的文档）。
+    """
+    versions, _reachable = _fetch_maven_versions_probe(group, artifact, project_path, timeout)
+    return versions
 
 
 
@@ -214,21 +246,64 @@ def _inject_dep_version_in_blocks(
 
 
 def _reactor_artifacts(project_path: str) -> set[str]:
-    """reactor 内部模块 artifactId 集合（根 pom <modules> + 根自身 artifactId）。纯文本确定性。"""
-    txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
-    txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
-    mods = {m.rstrip("/").rsplit("/", 1)[-1]
-            for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", txt)}
-    body = re.sub(r"<parent>.*?</parent>", "", txt, flags=re.S)
-    body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
-    body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
-    own = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
-    if own:
-        mods.add(own.group(1))
+    """reactor 内部模块 artifactId 集合。纯文本确定性。
+
+    ★必须**递归**走 <module>★（治 round46 "reactor missing-child" 一族）：Maven 多级 reactor
+    里，中间聚合模块（如 `ruoyi-modules/pom.xml`）会再声明自己的 <modules>——只扫根 pom 会漏掉
+    全部孙模块。漏掉的后果不是"少修一点"，而是**合法性闸规则②把依赖它们的合法兄弟依赖当幻影剪除**
+    （该规则以"仓库里永远没有工程模块"为由无条件剪，**没有 fail-open 出口**）→ 误剪真依赖。
+
+    每个 pom 同时贡献两个名字：目录名（兜底，子 pom 读不到时仍认成员）与它自己的 artifactId
+    （权威，目录名与 artifactId 常不一致）。读取有上限，防病态深树把预算读穿。
+    """
+    import posixpath
+
+    mods: set[str] = set()
+    seen: set[str] = set()
+    stack: list[str] = ["pom.xml"]
+    while stack and len(seen) < 80:
+        rel = stack.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        txt = _read_project_file(project_path, rel, timeout=20) or ""
+        if not txt:
+            continue
+        txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
+        body = re.sub(r"<parent>.*?</parent>", "", txt, flags=re.S)
+        body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
+        body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
+        own = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
+        if own:
+            mods.add(own.group(1))
+        base = posixpath.dirname(rel)
+        for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", txt):
+            m = m.strip().rstrip("/")
+            mods.add(m.rsplit("/", 1)[-1])           # 目录名兜底
+            child = posixpath.normpath(posixpath.join(base, m))
+            child_pom = child if child.endswith(".xml") else posixpath.join(child, "pom.xml")
+            if not child_pom.startswith(".."):        # 绝不越出工程树
+                stack.append(child_pom)
     return mods
 
 
-def _group_family_version(project_path: str, group: str) -> str | None:
+def _same_release_train(a1: str, a2: str) -> bool:
+    """两个 artifactId 是否属同一发布列车（共享 ≥2 段公共前缀词元）。
+
+    spring-boot-starter-aop ↔ spring-boot-dependencies → 共享 ["spring","boot"] → True
+    easyexcel ↔ druid-spring-boot-4-starter            → 无公共前缀              → False
+    """
+    t1 = a1.lower().split("-")
+    t2 = a2.lower().split("-")
+    n = 0
+    for x, y in zip(t1, t2):
+        if x != y:
+            break
+        n += 1
+    return n >= 2
+
+
+def _group_family_version(project_path: str, group: str, artifact: str = "") -> str | None:
     """R54-5：工程里【同 groupId 家族】已经在用的版本（root pom 证据，${prop} 展开）。
 
     round54 实锤：`spring-boot-starter-aop` 在 Spring Boot 4 里**已不存在**（改名 aspectj），
@@ -236,14 +311,25 @@ def _group_family_version(project_path: str, group: str) -> str | None:
     跨大版本混用（Spring 6 vs 7）。**稳定 ≠ 与本工程兼容**：版本闸只挡住了预发布，挡不住"版本
     对、代际错"。工程自己已经为该 groupId 钉过一个版本（这里是 spring-boot.version=4.0.6），
     那才是唯一正确的对齐目标。返回 None = 该 group 在工程里没有先例（按最新稳定版走，旧行为）。
+
+    R56-3（round56 活体误伤，修正 R54-5）：**同 groupId ≠ 同一个发布列车**。`com.alibaba` 是伞形
+    groupId——底下住着 druid(1.2.28)、easyexcel(4.0.3)、fastjson…**彼此毫无版本关系**。原实现拿
+    "工程里 com.alibaba 钉在 1.2.28"去判定 easyexcel(4.0.3) "跨代"，把一个**合法依赖直接剪掉**
+    （代码用到它就编译失败）。判据收紧为【同发布列车】：目标 artifactId 与已钉 artifactId 必须共享
+    有意义的公共前缀（≥2 段词元，如 spring-boot-starter-aop ↔ spring-boot-dependencies 共享
+    "spring-boot"）。无共享前缀 = 不同产品线 → 不对齐（按最新稳定版注入，旧行为）。
     """
     txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
     txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
     for blk in re.finditer(r"<dependency>(.*?)</dependency>", txt, re.S):
         b = re.sub(r"<exclusions>.*?</exclusions>", "", blk.group(1), flags=re.S)
         g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", b)
+        a = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", b)
         v = re.search(r"<version>\s*([^<]+?)\s*</version>", b)
         if not (g and v and g.group(1) == group):
+            continue
+        # R56-3：同发布列车才算"家族"——artifactId 须共享 ≥2 段公共前缀词元
+        if artifact and a and not _same_release_train(artifact, a.group(1)):
             continue
         val = v.group(1).strip()
         m = re.fullmatch(r"\$\{([^}]+)\}", val)
@@ -307,7 +393,8 @@ def _fix_reactor_dep_group(text: str, artifact: str, project_group: str,
     return new_text if hits else None
 
 
-def _prune_dep_blocks(text: str, group: str, artifact: str) -> str | None:
+def _prune_dep_blocks(text: str, group: str, artifact: str,
+                      even_with_version: bool = False) -> str | None:
     """R53-2：剪除【无 <version> 且匹配坐标】的 <dependency> 块 → 新文本或 None（未命中）。
 
     与 _inject_dep_version_in_blocks 严格对称：块内已有 <version> / artifactId 不匹配 /
@@ -320,7 +407,9 @@ def _prune_dep_blocks(text: str, group: str, artifact: str) -> str | None:
         nonlocal hits
         blk = m.group(0)
         inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
-        if "<version>" in inner:
+        # R56-4：默认只剪无版本的（保守）；even_with_version=True 时连带有版本的一起剪——
+        # 用于【可证永不可解析】的坐标（工程 groupId 但非 reactor 模块 / 仓库查无任何版本）。
+        if "<version>" in inner and not even_with_version:
             return blk
         if not re.search(r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>", inner):
             return blk
@@ -332,6 +421,79 @@ def _prune_dep_blocks(text: str, group: str, artifact: str) -> str | None:
 
     new_text = re.sub(r"[ \t]*<dependency>(.*?)</dependency>\s*\n?", _cut, text, flags=re.S)
     return new_text if hits else None
+
+
+
+def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """R56-5：构建**之前**对全树 pom 施加依赖合法性不变量（state-driven，不看 Maven 报什么错）。
+
+    收敛 R53-2/R54-5/R54-6/R56-4 四条 error-driven 分支——它们全是"等 Maven 报出一种新错法，
+    再针对那句错误文本加一条分支"，**换个错法就漏一个**（用户点破：这就是打地鼠）。
+    本闸只看 pom 的**状态**：每条依赖必须满足「reactor 模块 / 父级受管 / 仓库真实存在」三者之一，
+    否则确定性处置。旧分支保留为兜底（网络抖动/边角），但问题在进 Maven 之前就已被消掉。
+
+    fail-open 铁律：仓库不可达 → 一律放行（宁可漏判，绝不误剪合法依赖）。
+    """
+    from swarm.worker.dep_legality import driver_for, enforce
+
+    drv = driver_for("maven")   # 新栈=注册 driver（dep_legality.DRIVERS），闸与不变量本身零栈耦合
+    if drv is None:
+        return 0, []
+    root_text = _read_project_file(project_path, "pom.xml", timeout=20)
+    if not root_text:
+        return 0, []
+    _ec, gout, _e = _run_check_split(
+        "find . -name pom.xml -not -path '*/target/*' 2>/dev/null", project_path, timeout=30)
+    if _ec != 0:
+        # 扫不到 ≠ 没有——沉默返回会让"闸本轮压根没跑"伪装成"扫完没问题"
+        logger.warning("[L1.2.1·dep-legality] manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
+                       _ec, (_e or "")[:200])
+        return 0, []
+    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    if not rels:
+        return 0, []
+    texts: dict[str, str] = {}
+    for rel in rels[:60]:
+        t = _read_project_file(project_path, rel, timeout=20)
+        if t:
+            texts[rel] = t
+    if not texts:
+        return 0, []
+
+    _cache: dict[tuple[str, str], list[str] | None] = {}
+
+    def _versions(group: str, artifact: str):
+        """契约：**不可达 → None**（fail-open，绝不据此剪除）；确证查无 → []。
+        R56-6：旧实现把两者都返回 []，断网即把全工程合法依赖剪光——证据缺失 ≠ 否定证据。"""
+        key = (group, artifact)
+        if key not in _cache:
+            try:
+                vers, reachable = _fetch_maven_versions_probe(
+                    group, artifact, project_path, timeout)
+                _cache[key] = vers if (vers or reachable) else None
+            except Exception as _fx:  # noqa: BLE001 —— 取数层自身故障同样按"不可达"处理
+                # 但**必须响亮**：若取数层有恒抛的 bug，静默吞掉会让规则③（仓库真实存在）
+                # 永久失效——闸照常播报"处置 N 条"，最关键的一条规则却已悄悄瘫痪。
+                logger.warning("[L1.2.1·dep-legality] 仓库查询异常（按不可达 fail-open）"
+                               "%s:%s → %s", group, artifact, _fx)
+                _cache[key] = None
+        return _cache[key]
+
+    new_texts, actions = enforce(
+        texts, root_text=root_text, namespace=_project_group(project_path),
+        workspace_members=_reactor_artifacts(project_path), registry_versions=_versions,
+        driver=drv,
+    )
+    changed: list[str] = []
+    for rel, txt in new_texts.items():
+        if _write_project_file(project_path, rel, txt, timeout=20):
+            changed.append(rel)
+    if actions:
+        logger.warning(
+            "[L1.2.1·dep-legality] R56-5 构建前依赖合法性闸：处置 %d 条（%d pom 改写）——"
+            "不变量=每条依赖须满足【reactor 模块 / 父级受管 / 仓库真实存在】三者之一：\n  %s",
+            len(actions), len(changed), "\n  ".join(actions[:12]))
+    return len(changed), sorted(changed)
 
 
 def _attempt_maven_version_repair(
@@ -387,7 +549,47 @@ def _attempt_maven_version_repair(
                 "→ 改回工程 groupId %r（%d pom）；仓库里本就没有它，校正版本无从谈起",
                 artifact, group, _proj_group, len(_fixed))
             continue
-        available = _fetch_maven_versions(group, artifact, project_path, timeout)
+        # R56-4（round56 实锤）：**有 version 的幻影坐标**——从所有既有闸门的缝里钻过去：
+        #   · R53-2 只剪【无 version】的；这类有 version
+        #   · R54-6 只改【groupId 编错】的；`com.ruoyi:ruoyi-alarm-system` 的 groupId 是**对的**
+        #   · version-repair 查不到任何可用版本 → 静默跳过（"交其它防线"，但没有其它防线）
+        # 实测两种形态，都是【可证永不可解析】：
+        #   ① `com.ruoyi:ruoyi-alarm-system:4.8.3` —— 用工程自己的 groupId，但它**不是 reactor 模块**
+        #      （本轮压根没这个模块）→ 工程模块从来不在远程仓库里，此坐标永远拉不到；
+        #   ② `com.github.aerogear:aerogear-otp-java:1.1.0` —— 仓库里**查无任何版本**（artifact 本身不存在）。
+        # 留着它 → `Could not resolve dependencies` → 整个模块解析失败、连坐下游。剪除 + 响亮日志：
+        # 缺依赖是可归因的编译错，幻影坐标是模块级的解析崩塌。
+        _is_reactor = artifact in (_reactor_mods or set())
+        _phantom_internal = (_proj_group and group == _proj_group and not _is_reactor)
+        # 幻影内部模块无需查仓库（工程模块从不在远程仓库里）；其余去查——但 R56-6 铁律：
+        # 只有【仓库确证查无】(reachable=True 且空) 才敢剪；【仓库没连上】绝不剪（证据缺失≠否定证据，
+        # 否则沙箱一断网就把全工程合法依赖剪光）。
+        if _phantom_internal:
+            available, _reachable = [], True
+        else:
+            available, _reachable = _fetch_maven_versions_probe(
+                group, artifact, project_path, timeout)
+        if _phantom_internal or (_reachable and not available):
+            _why = ("用工程 groupId 但非 reactor 模块（工程模块从不在远程仓库）"
+                    if _phantom_internal else "仓库确证查无该 artifact 的任何版本")
+            art_esc = artifact.replace(".", r"\.")
+            _gc, _gout, _ge = _run_check_split(
+                f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _cut2: list[str] = []
+            for _pom in sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()}):
+                _text = _read_project_file(project_path, _pom, timeout=20)
+                if _text is None:
+                    continue
+                _new = _prune_dep_blocks(_text, group, artifact, even_with_version=True)
+                if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                    changed.add(_pom)
+                    _cut2.append(_pom)
+            logger.warning(
+                "[L1.2.1·phantom-dep] R56-4 %s:%s 永不可解析（%s）→ 确定性剪除（%d pom）；"
+                "留着它整个模块都解析不了（Could not resolve → 连坐下游）",
+                group, artifact, _why, len(_cut2))
+            continue
         good_ver = _choose_valid_version(bad_ver, available)
         if not good_ver:
             continue  # 版本其实存在（别的网络问题）或查不到可用版本 → 不动，绝不误修
@@ -437,7 +639,17 @@ def _attempt_maven_version_repair(
     # ── ② 缺 <version> 元素 → 注入有效版本 ──
     _reactor: set[str] | None = None
     for group, artifact in missing_versions[:8]:
-        available = _fetch_maven_versions(group, artifact, project_path, timeout)
+        # R56-6：这里的分支会**剪除依赖**（不可逆）→ 必须区分「仓库确证查无」与「仓库没连上」。
+        # 用旧口（空列表兼表两义）等于断网即误剪全工程合法依赖。
+        available, _reach = _fetch_maven_versions_probe(group, artifact, project_path, timeout)
+        if _reactor is None:
+            _reactor = _reactor_artifacts(project_path)
+        # 真 reactor 兄弟模块靠**本地证据**判定（不需要仓库）→ 断网也照常注 ${project.version}；
+        # 只有"要据仓库空结果去剪除"的路径才受不可达影响 → fail-open 跳过。
+        if not available and not _reach and artifact not in _reactor:
+            logger.warning("[L1.2.1·phantom-dep] %s:%s 仓库不可达（非确证查无）→ 本轮不处置"
+                           "（fail-open：宁可漏判，绝不误剪合法依赖）", group, artifact)
+            continue
         if not available:
             # R53-2 治本（round53 实锤死因）：旧实现在这里静默 continue，注释写"交其它防线"
             # ——**根本没有其它防线**。仓库查无此 artifact 且父级不管、又无 version →
@@ -483,7 +695,7 @@ def _attempt_maven_version_repair(
             continue
         # R54-5：先与【工程同 groupId 家族已钉的版本】对齐——"稳定版"只挡预发布，挡不住
         # "版本对、代际错"（round54：Boot 4.0.6 工程被注进 Boot 3 系的 spring-boot-starter-aop:3.5.16）。
-        _fam = _group_family_version(project_path, group)
+        _fam = _group_family_version(project_path, group, artifact)
         if _fam:
             if _fam in available:
                 good_ver = _fam                      # 与工程同代 → 唯一正确的对齐目标
@@ -3128,6 +3340,18 @@ def run_l1_pipeline(
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         if _deadline_blocked("build"):
             return True, details
+        # R56-5：构建**之前**先过依赖合法性闸——坏坐标在进 Maven 前就被消掉（state-driven），
+        # 而不是等它炸出 `Could not resolve` 再按错误文本逐形态打补丁（error-driven=打地鼠）。
+        if str(build_cmd).lstrip().startswith("mvn"):
+            try:
+                _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout)
+                if _dl_files:
+                    _rfp = details.setdefault("repaired_file_paths", [])
+                    for _f in _dl_files:
+                        if _f not in _rfp:
+                            _rfp.append(_f)   # 随 pull-back 回传本地，否则修复只活在沙箱
+            except Exception as _dl_exc:  # noqa: BLE001 —— 闸门自身绝不阻断构建
+                logger.warning("[L1.2.1·dep-legality] 合法性闸异常（跳过，不阻断）: %s", _dl_exc)
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
         b_ec, b_out = _run_l1_command(
             build_cmd, project_path, timeout=_stage_timeout(max(timeout, 300), deadline))

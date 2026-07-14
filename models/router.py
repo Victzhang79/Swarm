@@ -460,6 +460,9 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     swarm_heartbeat_every: float = 30.0
     # 总时长看门狗：单次流式累计超此秒数即判 runaway 抛 transient。0=关闭（默认，worker 热路径不动）。
     swarm_wallclock_budget: float = 0.0
+    # R56-1：本实例是否已是链尾（无备选可切）。链尾遇 reasoning runaway 只能"关 thinking 重开"
+    # （质量降级已知），非链尾则抛 transient 让 fallback 切到备用大脑（保留完整推理）。
+    swarm_no_fallback: bool = False
     # R55-1：**思考阶段**预算（秒）。reasoning 模型在思维链里原地打转时，max_tokens 封不住
     # （只封最终答案）、stall 看门狗看不出（chunk 一直在吐）、墙钟兜底要先烧满 25 分钟。
     # 关键洞察：**正文尚未吐出一个字之前**中途 abort 是无损的（下游一个 chunk 都没收到）→
@@ -592,15 +595,36 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             # 只降级一次（_thinking_off 置位）：再失控就交给墙钟/stall 兜底，绝不无限重开。
             if (self.swarm_reasoning_phase_budget > 0 and not content_seen
                     and not thinking_off and now - t0 >= self.swarm_reasoning_phase_budget):
-                logger.warning(
-                    "[stream] %s%s R55-1 思考阶段已 %.0fs（%d chunk）仍未吐出任何正文 → 判 reasoning "
-                    "runaway：就地关闭 thinking 用同一模型重开流（无损：下游尚未收到任何 chunk）",
-                    _llm_node_tag(), getattr(self, "model_name", None) or "model", now - t0, n_chunks,
-                )
                 try:
                     await agen.aclose()   # 关底层流，让推理端 abort 解码、释放算力
                 except Exception:  # noqa: BLE001
                     pass
+                # R56-1（round56 实锤，修正 R55-1）：失控时**不降级思考，先换模型**。
+                # round56 实测：关 thinking 后同一模型确实产出了、流程也救活了，但**质量掉了**——
+                # 同一份 PRD，有推理抽出 106 条需求、关推理只抽出 92 条，且**整块功能消失**
+                # （AES/SHA512 加密、企微 Bot/Lark/VoIP 渠道、排班快照的 5 个数据字段、3 个 API）。
+                # 更坏的是覆盖闸**看不见**这种损失（它只校验"抽出来的都被覆盖了"）。
+                # 正确顺序：①有备选模型 → 抛 transient，让 fallback 链切到备用大脑（**保留完整推理**，
+                # 不牺牲质量；此刻下游尚未收到任何 chunk，切换同样无损）；②无备选可切（swarm_no_fallback）
+                # → 才退到"关 thinking 同模型重开"（有产出胜过烧穿墙钟，但质量降级已知）。
+                if not self.swarm_no_fallback:
+                    logger.warning(
+                        "[stream] %s%s R56-1 思考阶段已 %.0fs（%d chunk）仍未吐出任何正文 → 判 reasoning "
+                        "runaway：抛 transient 切【备用大脑】（保留完整推理，不牺牲质量；下游尚未收到任何 "
+                        "chunk，切换无损）",
+                        _llm_node_tag(), getattr(self, "model_name", None) or "model",
+                        now - t0, n_chunks,
+                    )
+                    raise TransientInfraError(
+                        # 首行含 "timeout" 供 _breaker_error_transient 关键词判定（与墙钟同口径）
+                        f"reasoning runaway timeout: 思考阶段 {now - t0:.0f}s（{n_chunks} chunk）仍未吐出"
+                        f"正文 —— 基建瞬时，切备用模型（保留推理）"
+                    )
+                logger.warning(
+                    "[stream] %s%s R56-1 思考阶段已 %.0fs（%d chunk）仍未吐出任何正文，且**无备选模型可切** "
+                    "→ 退到关闭 thinking 用同一模型重开流（有产出胜过烧穿墙钟；**质量降级已知**：实测会漏需求）",
+                    _llm_node_tag(), getattr(self, "model_name", None) or "model", now - t0, n_chunks,
+                )
                 _eb = dict(kwargs.get("extra_body") or {})
                 _eb["thinking"] = {"type": "disabled"}
                 kwargs["extra_body"] = _eb
@@ -693,6 +717,7 @@ class EndpointProvider:
     def get_chat_model(
         self, model_name: str, temperature: float = 0.2, callbacks: list | None = None,
         max_tokens: int | None = None, wallclock_budget: float | None = None,
+        no_fallback: bool = False,
     ) -> BaseChatModel:
         # 本地推理服务常无需 key；空则用占位（vLLM/Ollama 网关忽略）。
         api_key: str = self.provider.api_key or "EMPTY"  # type: ignore[assignment]
@@ -706,6 +731,7 @@ class EndpointProvider:
                 self._resolve_retries(), model_name, float(temperature),
                 int(max_tokens or 0), float(wallclock_budget or 0.0),
                 float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0),
+                bool(no_fallback),
                 float(self.config.timeout_seconds),
                 float(getattr(self.config, "first_token_timeout", self.config.stream_chunk_timeout)),
                 float(getattr(self.config, "inter_chunk_timeout", 30.0)),
@@ -761,6 +787,7 @@ class EndpointProvider:
         # R55-1：思考阶段预算——只对【云端 reasoning 模型】有意义（本地 provider 上面已直接关
         # thinking）。开了墙钟兜底（即 brain 角色）才启用：两者是同一条腿的粗细两级——先用无损的
         # "关 thinking 重开流"抢救，抢救不回再由墙钟切备模型。
+        _kwargs["swarm_no_fallback"] = bool(no_fallback)
         _kwargs["swarm_reasoning_phase_budget"] = (
             float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0)
             if (wallclock_budget or 0) > 0 and self.provider.kind != "local" else 0.0
@@ -905,6 +932,7 @@ class ModelRouter:
         fallback = self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
             self.config.brain_fallback, temperature=self.config.brain_temperature,
             max_tokens=_bmt, wallclock_budget=_wc,
+            no_fallback=True,   # R56-1：链尾——它再失控就没人可切了，只能关 thinking 保产出
         )
         return primary.with_fallbacks([fallback])
 
@@ -961,6 +989,16 @@ class ModelRouter:
                 "[router] F-F worker 链健康重排：熔断中的模型 %s 移到链尾（健康优先 %s）",
                 [n for n, _ in opened], [n for n, _ in healthy])
         ordered = (healthy + opened) or named
+        # R56-1 补齐（worker 面）：**链尾**必须标 no_fallback——它再思考失控就没人可切了，
+        # 此时只能就地关 thinking 保产出；不标的话它会抛 TransientInfraError 而无人接，
+        # 整个 worker 调用直接失败（比 R55-1 之前更糟）。注意链序是 breaker 健康**重排后**的，
+        # 所以只能在这里定链尾，不能在构造时静态定。
+        for _i, (_n, _m) in enumerate(ordered):
+            if hasattr(_m, "swarm_no_fallback"):
+                try:
+                    _m.swarm_no_fallback = (_i == len(ordered) - 1)
+                except Exception:  # noqa: BLE001 —— 非 Dual 模型/不可写 → 保持默认
+                    pass
         chained = [_listened(n, m) for n, m in ordered]
         if len(chained) > 1:
             return chained[0].with_fallbacks(chained[1:])

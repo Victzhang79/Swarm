@@ -297,8 +297,10 @@ def test_parse_missing_versions():
 def test_version_repair_injects_missing_version(monkeypatch):
     """模块 pom 的依赖缺 <version>（非版本写错）→ 从仓库 metadata 注入有效版本。"""
     import swarm.worker.l1_pipeline as L
-    monkeypatch.setattr(L, "_fetch_maven_versions",
-                        lambda g, a, p, t: ["5.8.0", "5.8.35", "5.7.22"])
+    # 桩在**真实取数口**上（R56-6 后剪除/注入路径走 probe → (versions, reachable)）；
+    # 桩错口子 = 测试真打网络（实测注进了 Central 上的真版本），既慢又不确定。
+    monkeypatch.setattr(L, "_fetch_maven_versions_probe",
+                        lambda g, a, p, t: (["5.8.0", "5.8.35", "5.7.22"], True))
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         pom = root / "ruoyi-generator" / "pom.xml"
@@ -320,7 +322,8 @@ def test_version_repair_injects_missing_version(monkeypatch):
 def test_version_repair_skips_managed_pom(monkeypatch):
     """带 dependencyManagement 的父 pom 不注入（受管块本就带版本，注入会造双 version）。"""
     import swarm.worker.l1_pipeline as L
-    monkeypatch.setattr(L, "_fetch_maven_versions", lambda g, a, p, t: ["5.8.35"])
+    monkeypatch.setattr(L, "_fetch_maven_versions_probe",
+                        lambda g, a, p, t: (["5.8.35"], True))
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         pom = root / "pom.xml"

@@ -15,7 +15,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-3800%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.50-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.51-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -228,7 +228,7 @@ flowchart TB
 
 - **任务级预算账本（TaskLedger）**：所有模型调用经单点闸预留-结算，**错误路径同样入账**（超时/取消的已烧 token 不再失明）；账本落库、跨重启延续；所有重试层统一从账本扣减——饱和的供应商再也不能把一个任务烧成无底洞，超支确定性熔断并抢救部分交付。
 - **供应商弹性**：进程级熔断 + 半开恢复；主模型停滞自动切备（流式看门狗按 chunk 间隔判停滞，活跃流不误杀）；provider 级并发闸防打爆限流；每个 Worker 模型带多级 fallback 链。
-- **思维链失控无损自愈**：云端 reasoning 模型会在思维链里原地打转——它一直在吐 chunk，停滞看门狗判“健康”，`max_tokens` 又只封最终答案（reasoning 内容豁免），实测单次调用烧 25 分钟仍不收尾。抓手是一个事实：**正文吐出第一个字之前，中途 abort 是无损的**（下游一个 chunk 都没收到）→ 思考阶段超预算即**就地关闭 thinking、用同一模型重开流**，下游完全无感（实测十几秒即拿到正文），而不是烧满墙钟预算再换模型从头重跑。
+- **思维链失控无损自愈**：云端 reasoning 模型会在思维链里原地打转——它一直在吐 chunk，停滞看门狗判“健康”，`max_tokens` 又只封最终答案（reasoning 内容豁免），实测单次调用烧 25 分钟仍不收尾。抓手是一个事实：**正文吐出第一个字之前，中途 abort 是无损的**（下游一个 chunk 都没收到）→ 思考阶段超预算即中止，**先换一个不失控的模型重跑（推理能力完整保留）**；只有在整条 fallback 链都用尽时，才退而求其次关闭 thinking 重开流。顺序不能反：实测关掉思考虽能救活流程，却会**漏掉需求**（同一份 PRD：106 条 → 92 条，整块功能消失），交付基准被悄悄降级。
 - **弹性墙钟**：执行段墙钟随任务规模自动放宽（基线 + 每子任务增量），大型任务不被误杀，失控任务有上限。
 - **小模型胜任性**：Worker 侧默认本地小模型并行——ReAct 历史按预算裁剪、文件局部读取、scope 精确收窄、工具面按需裁剪、时间预算贯穿每个验证阶段，小模型也能稳定长跑。
 
@@ -274,6 +274,7 @@ flowchart LR
 | Lint | 5 语言 | checkstyle / go vet / clippy / eslint / ruff（工具故障≠代码错误，基础设施瞬时故障单独识别） |
 | 确定性修复 | Java/Go/Rust/TS | 按生态委托事实标准工具：Java import/依赖自证、`goimports`、`cargo fix`、`eslint --fix` |
 | 依赖补全 | 多栈 driver 化 | 从**项目自身兄弟 manifest** 找权威坐标注入（只用自证坐标、绝不臆造、fail-closed）；新栈=注册一个 driver |
+| 依赖坐标合法性闸 | Java/Maven（可推广） | 构建**之前**扫全树 manifest：每条依赖必须是【本工程模块 / 父级受管 / 仓库真实存在】三者之一，否则**可证永不可解析** → 确定性改回或剪除。**不解析构建工具的报错文本**（那是打地鼠，换个错法就漏一个），只校验坐标状态；仓库不可达则一律放行（fail-open，宁可漏判绝不误剪）。为什么必须前置：坏坐标是**解析期**崩塌，会连坐整棵 reactor，让每个 Worker 的构建闸都误报“错在上游” |
 | 分层模板 | Java/Vue/TS/Go/Python | 新建文件按栈找同类既有文件做范例注入，免全项目探索空烧预算 |
 | 规划去特化 | 全部 | 分组/拆分/prompt 中无任何项目专名或单栈写死（有回归测试锁定不得回流） |
 
