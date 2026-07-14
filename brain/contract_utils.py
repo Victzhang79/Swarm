@@ -461,6 +461,9 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
         return ""
 
 
+# 标准源码布局段：它们是**布局**不是模块（Maven/Gradle: src/main/java；Cargo: src；Go: cmd/internal…）
+_SRC_LAYOUT_SEGMENTS = frozenset({"src", "main", "java", "kotlin", "scala", "resources",
+                                  "test", "tests", "webapp", "cmd", "internal", "pkg"})
 _BUILD_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml",
                     "go.mod", "package.json", "pyproject.toml")
 
@@ -527,6 +530,21 @@ def _module_physical_dirs(plan, project_path: str | None,
         prefix = _common_module_prefix(paths, project_path)
         if prefix:
             out[mod] = prefix
+
+    # ★R59-2 护栏★ 两个契约模块解析到**同一个物理目录** = 矛盾（round59 实锤：所有模块都成了
+    # 聚合父 `ruoyi-alarm` → R57-6 收回写权变成击鼓传花 → 没人拥有聚合父的 pom → 全员 BLOCKED）。
+    # 同一个 pom 不可能同时是两个模块的构建文件 → fail-closed 全部丢弃，绝不带病继续。
+    _by_dir: dict[str, list[str]] = {}
+    for m, d in out.items():
+        _by_dir.setdefault(d, []).append(m)
+    for d, mods in _by_dir.items():
+        if len(mods) > 1:
+            logger.warning(
+                "[SCAFFOLD-INJECT] R59-2 %d 个契约模块解析到**同一物理目录** %r：%s → 矛盾，"
+                "全部拒绝脚手架（同一个 pom 不可能是两个模块的构建文件；带病继续会让写权击鼓传花、"
+                "最终没人拥有它 → 全员 BLOCKED）", len(mods), d, sorted(mods))
+            for m in mods:
+                out.pop(m, None)
     return out
 
 
@@ -543,32 +561,33 @@ def _file_plan_module_paths(file_plan: list | None) -> dict[str, list[str]]:
 
 
 def _common_module_prefix(paths: list[str], project_path: str | None) -> str | None:
-    """一组文件的**模块根目录**：取最长公共目录前缀，再收窄到"含构建清单/是基线真实目录"的那一层。
+    """一组文件的**模块根目录** = 最长公共目录前缀，**切在标准源码布局之前**。
 
-    `ruoyi-admin/src/main/java/…` + `ruoyi-admin/src/main/resources/…` → 公共前缀
-    `ruoyi-admin/src/main` → 逐级上溯，取**基线里真实存在**且最接近根的模块目录 → `ruoyi-admin`。
-    找不到可靠落点 → None（fail-closed：绝不猜）。
+    ★R59-1（round59 死因，我自己的补丁造成的）★ 旧实现取"从根往下第一个**存在的**目录"——
+    第一轮 worker 在磁盘上建出 `ruoyi-alarm/` 之后，replan 时它对**每个**子模块都返回聚合父
+    `ruoyi-alarm` → 所有模块共用一个 pom 路径 → R57-6 收回写权变成**击鼓传花**
+    → 聚合父脚手架失去自己的 pom 写权 → 根 pom 注册了 ruoyi-alarm 但该 pom 从未被建
+    → `清单注册的模块在树里不存在` → **全员 BLOCKED**。
+    **这是状态依赖 bug：第一轮跑不出来，replan 才炸。** 判据绝不能依赖"目录存不存在"。
+
+    `ruoyi-alarm/alarm-common/src/main/java/…` + `ruoyi-alarm/alarm-common/src/main/resources/…`
+      → 公共前缀 `ruoyi-alarm/alarm-common/src/main` → 切在 `src` 前 → **`ruoyi-alarm/alarm-common`**
     """
     if not paths:
         return None
     segs = [p.split("/") for p in paths]
     common: list[str] = []
-    for i in range(min(len(x) for x in segs)):
+    for i in range(min(len(x) for x in segs) - 1):     # 末段是文件名，不参与
         col = {x[i] for x in segs}
         if len(col) != 1:
             break
         common.append(next(iter(col)))
-    if not common:
-        return None
-    # 从公共前缀逐级上溯，取【基线里真实存在的目录】里最短的那一层（= 模块根，不是 src/main/java）
-    base = Path(project_path) if project_path else None
-    for i in range(1, len(common) + 1):
-        cand = "/".join(common[:i])
-        if cand in ("src", "main", "java", "resources"):
-            continue
-        if base is None or (base / cand).is_dir():
-            return cand
-    return None
+    # 切在标准源码布局之前——它们是**布局**不是模块（多栈通用：Maven/Gradle/Cargo/Go 皆然）
+    for i, seg in enumerate(common):
+        if seg in _SRC_LAYOUT_SEGMENTS:
+            common = common[:i]
+            break
+    return "/".join(common) if common else None
 
 
 def _inject_templates_into_pom_owners(plan, project_path: str | None,
@@ -820,6 +839,10 @@ def inject_build_scaffold_subtasks(
         # 多写者从源头消失，rebase 循环自然不存在。
         for st in plan.subtasks:
             if st.id == sid:
+                continue
+            # R59-2：绝不从**别的脚手架**手里抢写权——它们同样是确定性 owner。
+            # round59 实锤：脚手架之间互相"收回"同一个 pom，击鼓传花到最后没人拥有聚合父的 pom。
+            if str(st.id).startswith("st-scaffold-"):
                 continue
             sc = getattr(st, "scope", None)
             for _attr in ("create_files", "writable"):
