@@ -428,3 +428,67 @@ def test_adversarial_verify_no_static_edge_fanout():
     for spec in graph.branches["adversarial_verify"].values():
         ends.update((spec.ends or {}).values())
     assert ends == {"merge", "handle_failure"}, f"条件边出口不符: {ends}"
+
+
+# ───────────────────────── R53-4：机制 provenance + 粘滞熔断（round49b/50b/51/52 实锤） ────────
+
+def test_r53_4_mechanism_paths_are_disclosed_and_exempted(monkeypatch):
+    """★头号锁★ 确定性修复层的产物必须在载荷里标注免责——否则 reviewer 结构上无法区分，
+    必然把 L1 注入的版本号指控成"worker 擅自硬编码"，worker 删 → 机制再注入 → 死循环。"""
+    a = _FakeReviewer({"st-1": ("PASS", "")}, "A")
+    b = _FakeReviewer({"st-1": ("PASS", "")}, "B")
+    _wire(monkeypatch, a, b)
+    st = _state(ids=("st-1",))
+    st["subtask_results"]["st-1"] = WorkerOutput(
+        subtask_id="st-1", diff="+ code\n", summary="s", l1_passed=True,
+        l1_details={"repaired_file_paths": ["pom.xml", "alarm-api/pom.xml"],
+                    "modified_files": ["alarm-api/src/A.java", "alarm-api/pom.xml"]})
+    _run(st)
+    prompt = "\n".join(str(m.get("content", "")) for m in a.last_prompt)
+    assert "不计 worker 的账" in prompt
+    assert "alarm-api/pom.xml" in prompt and "pom.xml" in prompt
+    assert "实际改动文件清单" in prompt and "alarm-api/src/A.java" in prompt
+
+
+def test_r53_4_file_list_never_truncated_even_when_diff_is(monkeypatch):
+    """diff 截断不得让 reviewer 误判"未创建任何文件"（round50b 冤杀）：文件清单永不截断。"""
+    monkeypatch.setenv("SWARM_ADVERSARIAL_DIFF_CHARS", "200")
+    a = _FakeReviewer({"st-1": ("PASS", "")}, "A")
+    b = _FakeReviewer({"st-1": ("PASS", "")}, "B")
+    _wire(monkeypatch, a, b)
+    st = _state(ids=("st-1",))
+    st["subtask_results"]["st-1"] = WorkerOutput(
+        subtask_id="st-1", diff="+ x\n" * 500, summary="s", l1_passed=True,
+        l1_details={"modified_files": [f"m/F{i}.java" for i in range(8)]})
+    _run(st)
+    prompt = "\n".join(str(m.get("content", "")) for m in a.last_prompt)
+    assert "已截断" in prompt, "前置：diff 确实被截断"
+    for i in range(8):
+        assert f"m/F{i}.java" in prompt, "文件清单必须完整进载荷"
+
+
+def test_r53_4_escalated_task_never_flags_back_again(monkeypatch):
+    """★粘滞熔断★ 已宣布"未收敛→升人工（绝不再打回）"后，rebase 重派再复核只出 advisory。
+
+    round50b/52 实锤：cap 短路把 round 归零，rebase 重派后计数从 0 起 → 又连打回 3 轮，
+    把已 L1 通过的产出反复打成失败 → 连坐放弃 → 空转到用户取消。
+    """
+    a = _FakeReviewer({"st-1": ("FAIL", "NPE：调用了不存在的 Foo.bar()")}, "A")
+    b = _FakeReviewer({"st-1": ("PASS", "")}, "B")
+    _wire(monkeypatch, a, b)
+    st = _state(ids=("st-1",),
+                degraded_reasons=["adversarial_verify_unconverged:round_cap_2"])
+    out = _run(st)
+    assert out["adversarial_verify_passed"] is not False, "熔断后绝不再打回"
+    assert not out.get("failed_subtask_ids"), "不得再进失败集（那会触发连坐放弃）"
+    assert st["subtask_results"]["st-1"].l1_passed is True, "已通过的产出不得被改写成失败"
+    assert any("advisory" in r for r in out.get("degraded_reasons", [])), "发现仍留痕（不静默）"
+
+
+def test_r53_4_runtime_reviewer_death_is_recorded_as_degraded(monkeypatch):
+    """reviewer 运行时挂掉 → 仍出裁决，但独立性丢失必须留痕（此前完全不记账，人工面看不见）。"""
+    a = _FakeReviewer({"st-1": ("PASS", "")}, "A")
+    _wire(monkeypatch, a, _DeadReviewer())
+    st = _state(ids=("st-1",))
+    out = _run(st)
+    assert any("reviewer_died_at_runtime" in r for r in out.get("degraded_reasons", []))

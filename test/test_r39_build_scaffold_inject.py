@@ -14,6 +14,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
@@ -120,6 +122,28 @@ def test_idempotent_and_noop_when_clean():
         {"module": "mod-x", "artifacts": ["g:a"]}]}
     assert unclaimed_contract_deps(clean) == [], "前置：A5 归并恒空"
     assert inject_build_scaffold_subtasks(clean) == []
+
+
+@pytest.fixture(autouse=True)
+def _stub_maven_registry(monkeypatch):
+    """R53-1：坐标解析确定性打桩（单测禁联网，见 conftest SWARM_MAVEN_LOOKUP=0）。
+
+    语义变更说明（不是把旧锁改绿，是旧锁锁的行为已被实测证明致死）：
+    模板过去对"父级管不到又查不到版本"的依赖**照样不带版本写进 pom**——round51/52/53 三轮
+    实锤，这会让 Maven 在 **pom 解析期**就炸（`'dependencies.dependency.version' … is missing`），
+    整棵 reactor 读不出、全体 worker 构建闸 BLOCKED。现在：受管→不写版本；不受管→写解析到的
+    显式版本；解析不到→如实丢弃（worker 的 L1 防线④会按真实 import 反查坐标补回）。
+    """
+    from swarm.brain import maven_registry as mr
+    vers = {
+        ("org.springframework", "spring-context"): "5.3.39",
+        ("org.projectlombok", "lombok"): "1.18.34",
+        ("cn.hutool", "hutool-all"): "5.8.47",
+    }
+    monkeypatch.setattr(mr, "registry_latest_version", lambda g, a: vers.get((g, a)))
+    monkeypatch.setattr(mr, "registry_group_for",
+                        lambda a: {"hutool-all": "cn.hutool"}.get(a))
+    mr._http_cache.clear()
 
 
 def test_r45_pom_template_embedded_when_root_pom_parseable(tmp_path):

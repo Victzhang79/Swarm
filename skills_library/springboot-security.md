@@ -8,7 +8,7 @@ applies_to_phases: ["code", "produce"]
 target: ["worker"]
 priority: 50
 max_chars: 1800
-tags: ["java", "spring-boot", "security"]
+tags: ["java", "spring-boot", "security", "auth", "login", "jwt", "authentication"]
 ---
 
 加认证、处理输入、建端点、碰密钥时启用。核心：默认拒绝、校验输入、最小权限、安全默认配置。

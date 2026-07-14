@@ -312,12 +312,40 @@ def _dep_group_from_baseline(project_path: str, artifact_id: str) -> str | None:
     return None
 
 
+def resolve_scaffold_artifacts(project_path: str | None, artifacts: list[str]):
+    """R53-1：契约 artifacts → 可写入 pom 的确定性坐标 (kept, dropped)。
+
+    模板与验收标准必须**同源**：能解析的才进模板、才进契约/验收；解析不到的一并剔除。
+    旧实现把依赖从模板里省略、验收却仍要求"声明契约全部 artifacts" → 自相矛盾 →
+    worker 只能手写臆造坐标（round53 实锤：幻影 alarm-interface 无 version，Maven 连
+    reactor 都读不出，全体 worker 构建闸 BLOCKED）。project_path 未知/解析器异常 →
+    退回旧行为（全部省略，不阻断规划）。"""
+    if not project_path:
+        return [], list(artifacts)
+    try:
+        from swarm.brain.maven_registry import resolve_artifacts
+        return resolve_artifacts(project_path, list(artifacts))
+    except Exception as exc:  # 解析器/网络异常绝不阻断规划期
+        logger.warning("[SCAFFOLD-TPL] R53-1 坐标解析不可用（%s）→ 退回省略旧行为", exc)
+        return [], list(artifacts)
+
+
+def _render_dep_block(dep) -> str:
+    ver = (f"\n            <version>{dep.version}</version>" if dep.version else "")
+    return (f"        <dependency>\n            <groupId>{dep.group}</groupId>\n"
+            f"            <artifactId>{dep.artifact}</artifactId>{ver}\n"
+            "        </dependency>")
+
+
 def _deterministic_pom_template(mod: str, artifacts: list[str],
-                                project_path: str | None) -> str:
+                                project_path: str | None,
+                                resolved: list | None = None) -> str:
     """R45-2：从根 pom parent GAV + 契约 artifacts 确定性生成模块 pom 模板。
 
     根 pom 不可解析/无 project_path → 返回空串（scaffold 退回旧行为，不假装精确）。
-    依赖版本不写：交由父 pom dependencyManagement / D2 reconcile 兜底（既有决策）。"""
+    R53-1：依赖坐标经 maven_registry 解析——父级（含 import BOM 传递闭包）受管 → 不写
+    版本（写死会覆盖工程统一版本）；不受管 → **必须写显式版本**（无版本又无人管 = Maven
+    连 reactor 都读不出，比缺依赖严重一个数量级）；解析不到 → 省略（调用方须同步剔除验收）。"""
     if not project_path:
         return ""
     try:
@@ -342,29 +370,16 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
         v = _re.search(r"<version>([^<]+)</version>", head)
         if not (g and a and v):
             return ""
-        deps = []
-        for art in artifacts:
-            art = str(art).strip()
-            if ":" in art:
-                dg, da = art.split(":", 1)[0].strip(), art.split(":", 1)[1].split(":")[0].strip()
-            else:
-                # R47-2 治本：裸 artifact 绝不回退工程 groupId（那会凭空制造
-                # `com.ruoyi:spring-boot-starter-web` 幽灵坐标毒化 reactor）——只认
-                # 基线 poms 证据；解析不到 → 省略该依赖 + 响亮日志（缺依赖=可归因
-                # 可修的编译错，worker/A2 可后补；伪造坐标=全 reactor 连坐）。
-                da = art
-                dg = _dep_group_from_baseline(project_path, art)
-                if not dg:
-                    logger.warning(
-                        "[SCAFFOLD-TPL] R47-2 模块 %s 的契约依赖 %r 在基线 poms 中"
-                        "解析不到 groupId → 从权威模板省略（绝不伪造工程 groupId 坐标）",
-                        mod, art)
-                    continue
-            if dg and da:
-                deps.append(
-                    f"        <dependency>\n            <groupId>{dg}</groupId>\n"
-                    f"            <artifactId>{da}</artifactId>\n        </dependency>")
-        deps_block = "\n".join(deps)
+        # R53-1：坐标解析统一走 maven_registry（基线证据 → reactor 模块 → Central 反查），
+        # R47-2 铁律不变（绝不伪造工程 groupId），但不再"查不到就一律省略"——省略会让权威
+        # 模板变空壳 pom，而验收标准仍要求声明全部依赖 → 逼 worker 手写臆造坐标。
+        if resolved is None:
+            resolved, _dropped = resolve_scaffold_artifacts(project_path, artifacts)
+            if _dropped:
+                logger.warning(
+                    "[SCAFFOLD-TPL] 模块 %s 的 %d 个契约依赖无法解析坐标/版本 → 从模板省略"
+                    "（调用方须同步从验收标准剔除）: %s", mod, len(_dropped), _dropped)
+        deps_block = "\n".join(_render_dep_block(d) for d in resolved)
         return (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<project xmlns="http://maven.apache.org/POM/4.0.0"\n'
@@ -424,18 +439,26 @@ def inject_build_scaffold_subtasks(
         # 连坐下游 95/107。确定性生成权威模板嵌进 description：小模型抄而不是编。
         # 复核 F3：完整模板只给 CREATE（新建无可失）；MODIFY 只给依赖片段+并入措辞
         # ——"原样写入"对既有 pom=clobber 复活（R41-F5 铁律：clobber 比漏改更致命）。
+        # R53-1：坐标解析【一次】，模板 / 契约 / 验收标准三者同源。解析不到的依赖必须
+        # 从三处一并剔除——旧实现只从模板剔除、验收仍要求"声明全部 artifacts"，这条矛盾
+        # 直接逼 worker 手写臆造坐标（round53：幻影 alarm-interface 毒死整个 reactor）。
+        _kept, _dropped = resolve_scaffold_artifacts(project_path, arts)
+        if _dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] R53-1 模块 %s 的 %d 个契约依赖无法确定性解析 → 模板/契约/"
+                "验收三处一并剔除（如实缺失，绝不逼 worker 编坐标）: %s",
+                mod, len(_dropped), _dropped)
+        arts = [f"{d.group}:{d.artifact}" + (f":{d.version}" if d.version else "")
+                for d in _kept]
         _tpl_block = ""
         if not pom_exists:
-            _tpl = _deterministic_pom_template(mod, arts, project_path)
+            _tpl = _deterministic_pom_template(mod, arts, project_path, resolved=_kept)
             if _tpl:
                 _tpl_block = (
                     f"\n【权威 pom 模板（确定性生成，原样写入 {pom}；仅当项目另有明确"
                     f"约定才允许在此基础上增改，绝不重构结构）】\n```xml\n{_tpl}\n```")
         else:
-            _dep_snips = "\n".join(
-                f"        <dependency><groupId>{a0.split(':',1)[0]}</groupId>"
-                f"<artifactId>{a0.split(':',1)[1].split(':')[0]}</artifactId></dependency>"
-                for a0 in (str(x).strip() for x in arts) if ":" in a0)
+            _dep_snips = "\n".join(_render_dep_block(d) for d in _kept)
             if _dep_snips:
                 _tpl_block = (
                     f"\n【缺失依赖片段（并入 {pom} 既有 <dependencies>，"

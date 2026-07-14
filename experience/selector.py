@@ -142,11 +142,70 @@ def _fw_hit(s: SkillDoc, terms: set[str]) -> int:
         return 0
     toks = {t for t in (set(s.id.lower().split("-"))
                         | {str(t).lower() for t in (s.tags or ())}) if len(t) >= 3}
+    # 语言词元不算"框架相关"：django-security 的 tags 里有 python，FastAPI 项目的画像里也有
+    # python → 旧实现据此判定"框架相关"并把 Django 安全全文推给 FastAPI 项目（E9-3 本想防的
+    # 正是这个）。框架相关性必须由**框架词元**（django/fastapi/spring/vue…）决定。
+    toks -= set(_LANG_SUBSTRINGS.keys()) | set(_DB_SUBSTRINGS.keys())
     for tok in toks:
         for term in terms:
             if tok.startswith(term) or term.startswith(tok):
                 return 1
     return 0
+
+
+# 框架/工具词元表：由 _LANG_SUBSTRINGS 的取值展开，减去语言名本身（那是语言不是框架）。
+# 判据不是"语言 vs 非语言"，而是：**技能是否绑定了某个具体框架/构建工具**。
+_FRAMEWORK_WORDS: frozenset[str] = frozenset(
+    w for words in _LANG_SUBSTRINGS.values() for w in words
+) - frozenset(_LANG_SUBSTRINGS.keys())
+
+
+def stack_affinity(s: SkillDoc, terms: set[str], stack_langs: set[str] | None = None) -> int:
+    """技能与本工程栈的亲和度（push 门槛与排序共用同一把尺）。
+
+    - 技能**绑定了具体框架/构建工具**（词元含 django / spring / vue / maven / gradle…）→
+      必须与本工程画像匹配才算亲和。否则 FastAPI 工程会被推 django-security（E9-3 的初衷），
+      Gradle 工程会被推 maven-* 经验（同一类错，跨栈更毒）。
+    - 技能**不绑定任何框架**（纯语言通用，如 java-coding-standards）→ 栈轴已匹配即算亲和：
+      "该用的编码规范该用还得用"。
+    """
+    toks = {t for t in (set(s.id.lower().split("-"))
+                        | {str(t).lower() for t in (s.tags or ())}) if len(t) >= 3}
+    toks -= set(_LANG_SUBSTRINGS.keys()) | set(_DB_SUBSTRINGS.keys())   # 语言词元不是框架
+    # 单向前缀：技能词元以框架词开头才算绑定框架（springboot⊃spring ✓）。反向会误判——
+    # 框架词表里有 javascript，反向匹配会让 `java` 被当成"绑定 JavaScript 框架"，
+    # 于是 java-coding-standards 在 Java 工程里亲和度归零、被踢出 push 面（实测）。
+    fw_toks = {t for t in toks if any(t.startswith(w) for w in _FRAMEWORK_WORDS)}
+    if not fw_toks:
+        return 1                       # 语言通用技能：栈匹配即可
+    return 1 if _fw_hit(s, terms) else 0
+
+
+def _task_hit(s: SkillDoc, terms: set[str], stack_langs: set[str] | None = None) -> int:
+    """R53-7：技能与【本子任务】的相关性（id 词元 / tags / 标题词 与任务词元命中数）。
+
+    为什么必须有这一维（实测）：round51/52/53 三轮共 104 次 worker_push，**104 次推的是
+    同一对技能**（java-coding-standards + springboot-patterns），而技能库有 44 篇。原因是
+    排序键 =(栈特化, 框架命中, priority, id) —— **没有任何一维与子任务有关**：同一个
+    Java/Spring 项目里，写 pom 的脚手架、写 Controller 的、写 Mapper 的、写测试的，打分
+    完全相同 → 永远是最泛的那两篇出场，jpa-patterns / mysql-patterns / api-design /
+    e2e-testing / error-handling 一次都够不着。经验层因此形同虚设。
+    """
+    if not terms:
+        return 0
+    # 匹配面含 summary：子任务说"Mapper/实体映射"，技能 id/tags 里没有 mapper，但摘要里有
+    # Repository/Entity/ORM 这类词——不纳入摘要，相关性就永远撞不上。
+    toks = {t for t in (set(s.id.lower().split("-"))
+                        | {str(t).lower() for t in (s.tags or ())}
+                        | {w for w in re.split(r"\W+", (s.title or "").lower()) if w}
+                        | {w for w in re.split(r"\W+", (s.summary or "").lower()) if w})
+            if len(t) >= 3}
+    # 栈语言词元（java/python/…）零区分度：它对该栈的**每个**子任务都命中，会把相关性拉平
+    # 成常数——正是"104 次 push 全同一对"的数学原因。栈匹配已由 applies_to_stacks 轴负责。
+    toks -= {str(x).lower() for x in (stack_langs or set())}
+    # 词元**精确**匹配：早先用双向子串，包名 `com` 恰是 `compile` 的子串 → 每个 Java 子任务
+    # 都白捡一分，maven-build-lifecycle 泄漏进所有子任务。相关性宁可漏，绝不脏。
+    return len(toks & terms)
 
 
 def select_skills(
@@ -160,6 +219,7 @@ def select_skills(
     max_k: int,
     rerank_fn: RerankFn | None = None,
     profile_terms: set[str] | None = None,
+    task_terms: set[str] | None = None,
 ) -> list[SkillDoc]:
     """选出注入用技能（handoff §5 混合算法）。
 
@@ -186,8 +246,14 @@ def select_skills(
     # （复核实证：FastAPI 项目 push django-security、Vue 项目挂 react-patterns 丢
     # vue-patterns）——框架词元命中提权，确定性无 LLM。
     _terms = profile_terms or set()
+    _tterms = task_terms or set()
+    # R53-7：把【子任务相关性】插进栈特化之后、框架命中之前——同栈同框架的候选之间，
+    # 由"这个子任务到底在写什么"来分胜负（写 pom→构建类、写 Mapper/Entity→JPA/SQL、
+    # 写 Controller→API 设计、写测试→测试类），而不是恒定按 priority/id 选同两篇。
     cands.sort(key=lambda s: (0 if "*" in s.applies_to_stacks else -1,
-                              -_fw_hit(s, _terms), -s.priority, s.id))
+                              -_task_hit(s, _tterms, stack_langs),
+                              -stack_affinity(s, _terms, stack_langs),
+                              -s.priority, s.id))
 
     picked = _budget_pick(cands, budget_chars=budget_chars, max_k=max_k)
     # E9-4（复核 RF14）：通配层保底——G2（3 个位）×G3（特化绝对优先）乘积效应会让

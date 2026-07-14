@@ -1013,8 +1013,27 @@ class ModelRouter:
         primary_name, fallback_names = self._resolve_route(difficulty, modality)
         _trivial = (getattr(self.config, "routing_trivial", None)
                     if str(difficulty).lower() != "trivial" else None)
-        return [f for f in (fallback_names or [])
-                if f and f != primary_name and f != _trivial]
+        # R53-6（round49b/50b 实锤）：排除口径必须是【实际跑起来的主力】，不只是"路由表 primary"。
+        # 实测 .env：MEDIUM primary=MiniMax，但 medium 子任务首派走 **worker_parallel_pool 轮转**
+        # → 实跑 Qwopus；失败后 alternate 取"第一个 ≠ MiniMax"的 fallback = **Qwopus** = 刚挂的
+        # 那一个 → 日志照打"使用备选模型"，实际原地重试，恢复阶梯的中间几级全是空转
+        # （round49b：三轮 retry_alternate 全派回同一模型 → 直接掉进"放弃 78/89"）。
+        # 池挂在 config.worker（WorkerConfig）上，不在 router.config（ModelConfig）上——
+        # 取错对象会让本闸静默失效（拿到 None）。
+        try:
+            from swarm.config import get_config
+            _pool = {m for m in (getattr(get_config().worker, "worker_parallel_pool", None) or []) if m}
+        except Exception:  # 配置不可用（CI/单测）→ 不排除，退回旧行为
+            _pool = set()
+        _cands = [f for f in (fallback_names or [])
+                  if f and f != primary_name and f != _trivial and f not in _pool]
+        if not _cands and _pool:
+            # 排除主力池后无候选 → 说明"备选"只剩主力自己：如实告警（此前是**静默**换回同一个
+            # 模型并打印"使用备选模型"，把恢复阶梯骗成有梯子的样子）。
+            logger.warning(
+                "[ROUTER] R53-6 难度 %s 排除实跑主力池 %s 后无异构备选 → 换模型无从谈起，"
+                "调用方将回退主力（阶梯只剩'放弃'一级，请补配异构备选）", difficulty, sorted(_pool))
+        return _cands
 
     def has_alternate_for_subtask(self, difficulty: str, modality: str = "text") -> bool:
         """E1（round38c 主题E）：该难度是否存在 ≠primary 的异构备选。

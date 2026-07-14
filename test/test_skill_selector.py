@@ -165,3 +165,83 @@ def test_stack_langs_none_and_empty():
     assert stack_langs_from_project_stack(None) == set()
     assert stack_langs_from_project_stack({}) == set()
     assert stack_langs_from_project_stack({"backend": "", "build": ""}) == set()
+
+
+# ── R53-7：经验层必须按【子任务内容】选技能（实测三轮 104 次 push 全是同一对） ──
+def test_r53_7_push_varies_by_subtask_content():
+    """★经验层锁★ 同一 Java/Spring 项目里，写 Mapper 的和写安全的必须拿到不同经验。
+
+    旧排序键 =(栈特化, 框架命中, priority, id) 对子任务内容完全盲 → round51/52/53 共
+    104 次 worker_push **全部**是 ['java-coding-standards','springboot-patterns']，
+    而技能库有 44 篇（jpa/mysql/api-design/e2e-testing/error-handling 一次都够不着）。
+    """
+    from swarm.experience.service import select_worker_push_pull
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskIntent
+
+    stack = {"backend": "Spring Boot (java)", "language": "java"}
+
+    def _push(desc, files):
+        st = SubTask(id="st-x", description=desc, intent=TaskIntent.CREATE,
+                     difficulty=SubTaskDifficulty.MEDIUM,
+                     scope=FileScope(create_files=files))
+        return [d.id for d in select_worker_push_pull(st, stack)[0]]
+
+    persist = _push("实现告警任务持久化：Mapper 与实体映射、Repository",
+                    ["alarm-task/src/main/java/com/ruoyi/alarm/mapper/AlarmTaskMapper.java"])
+    security = _push("实现 2FA 认证与登录 security",
+                     ["alarm-security/src/main/java/com/ruoyi/alarm/security/Google2FAService.java"])
+    assert persist != security, "★不同子任务必须拿到不同经验（否则经验层形同虚设）★"
+    assert "jpa-patterns" in persist, "持久化子任务应够到 JPA 经验"
+    assert "springboot-security" in security, "安全子任务应够到安全经验"
+
+
+def test_r53_7_stack_language_token_has_no_discriminating_power():
+    """'java' 对该栈每个子任务都命中 → 必须从相关性打分里剔除，否则相关性被拉平成常数。"""
+    from swarm.experience.models import SkillDoc
+    from swarm.experience.selector import _task_hit
+
+    doc = SkillDoc(id="java-coding-standards", title="Java Coding Standards", body="x",
+                   tags=("java", "style"), summary="Java 编码规范")
+    # 任务词元里只有栈语言词 java → 剔除后应为 0（不得靠 'java' 拿分）
+    assert _task_hit(doc, {"java"}, {"java"}) == 0
+
+
+def _push_ids(desc, files, stack):
+    from swarm.experience.service import select_worker_push_pull
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskIntent
+    st = SubTask(id="st-x", description=desc, intent=TaskIntent.CREATE,
+                 difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(create_files=files))
+    return [d.id for d in select_worker_push_pull(st, stack)[0]]
+
+
+def test_r53_7_maven_scaffold_gets_maven_skills():
+    """Maven 脚手架必须够到 Maven 经验——round51/52/53 三轮死因全在 pom 上，
+    而此前推给它的是 Java 编码规范（对写 pom 毫无用处）。"""
+    ids = _push_ids("【构建脚手架】创建构建文件 pom.xml：声明契约 dependencies 全部 artifacts",
+                    ["alarm-api/pom.xml"],
+                    {"backend": "Spring Boot (java)", "build": "maven"})
+    assert any(i.startswith("maven-") for i in ids), f"写 pom 必须拿到 Maven 经验: {ids}"
+
+
+def test_r53_7_maven_skills_never_leak_into_other_build_systems():
+    """★通用性铁律★ swarm 是多栈系统：Gradle/npm/Go 的脚手架**绝不能**被 Maven 经验污染
+    （那是有害注入，不是没用而已），但也不能因此空手而归。"""
+    gradle = _push_ids("创建构建文件 build.gradle 声明依赖", ["app/build.gradle"],
+                       {"backend": "Spring Boot (java)", "build": "gradle"})
+    node = _push_ids("创建 package.json 声明依赖", ["package.json"],
+                     {"frontend": "Vue 3", "build": "npm"})
+    go = _push_ids("创建 go.mod 声明依赖", ["go.mod"],
+                   {"backend": "Gin (golang)", "build": "go"})
+    for ids, name in ((gradle, "gradle"), (node, "npm"), (go, "go")):
+        assert not any(i.startswith("maven-") for i in ids), f"{name} 工程被 Maven 经验污染: {ids}"
+    assert gradle and node and go, "非 Maven 栈也必须拿到本栈经验，不能空手"
+
+
+def test_r53_7_specialized_and_general_coexist():
+    """专精经验不得把通用编码规范挤掉：写 Mapper 既要 JPA 经验，也要 Java 编码规范。"""
+    ids = _push_ids("实现持久化与实体映射",
+                    ["a/src/main/java/mapper/AlarmTaskMapper.java"],
+                    {"backend": "Spring Boot (java)", "build": "maven"})
+    assert "jpa-patterns" in ids, f"持久化子任务应够到 JPA 经验: {ids}"
+    assert "java-coding-standards" in ids, f"通用编码规范该用还得用: {ids}"

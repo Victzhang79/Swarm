@@ -12,6 +12,11 @@ import pytest
 # 认证相关测试（test_auth_login / test_rbac）直接调用 auth 模块或公开端点，不受影响。
 os.environ.setdefault("SWARM_RBAC_ENABLED", "false")
 
+# R53-1：单测默认关闭 Maven 仓库联网解析。测试要么 monkeypatch 解析器（确定性），要么
+# 走"解析不到 → 如实省略"的离线降级路径；绝不允许真去 Central 查坐标——那会让结果随
+# 网络与上游版本发布漂移（"网络好就绿"是最坏的一种假绿），且拖慢每一次跑测。
+os.environ.setdefault("SWARM_MAVEN_LOOKUP", "0")
+
 def install_noop_transaction(mock_store) -> None:
     """A-P1-26：给 AsyncMock 的 MemoryStore 装一个 no-op 的 transaction() 异步上下文。
 

@@ -11,6 +11,10 @@
 # 206 个已知开关（2026-07-10 阶段7 冻结基线；按名排序）
 REGISTERED_ENVS: dict[str, str] = {
     "SWARM_ADVERSARIAL_DIFF_CHARS": "brain/nodes/adversarial.py:69",
+    # R53-1：Maven 坐标/版本解析（仓库联网）。0=关闭（单测默认关，见 test/conftest.py：
+    # 绝不让测试依赖网络，也杜绝"网络好就绿"的假绿）；关闭后行为=解析不到即如实省略。
+    "SWARM_MAVEN_LOOKUP": "brain/maven_registry.py:_lookup_enabled",
+    "SWARM_MAVEN_LOOKUP_TIMEOUT_S": "brain/maven_registry.py:_HTTP_TIMEOUT_S",
     "SWARM_ADVERSARIAL_MAX_ROUNDS": "brain/nodes/adversarial.py:51",
     "SWARM_ADVERSARIAL_REVIEW_TIMEOUT": "brain/nodes/adversarial.py:61",
     "SWARM_ADVERSARIAL_VERIFY": "brain/nodes/adversarial.py:44",

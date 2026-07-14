@@ -126,13 +126,37 @@ def parse_missing_versions(build_output: str) -> list[tuple[str, str]]:
     return out
 
 
+# R53-3（round49b/50/50b/51/52 **五轮**复现）：注入版本必须优先落在**稳定版**上。
+# 旧实现一律 max(available)，而 maven-metadata 的最高版常是里程碑/预发布：实测注入过
+# spring-boot-starter-aop:4.0.0-M2、shiro-core:3.0.0-alpha-1、commons-collections4:4.5.0-M3、
+# spring-security-core:7.1.0-RC1 —— 与工程基线（RuoYi 4.8.3 / Spring Boot 2.x 系）根本不兼容，
+# L1 侧"修好了"，L2 集成期真炸；更毒的是对抗复核随后把这些版本算成 **worker 擅自硬编码**，
+# worker 依言删掉 → version-repair 立刻再注入 → 反复打回死循环（round50b 实锤三轮）。
+# 稳定版一个都没有时才退回预发布（那是该 artifact 的真实现状，不是我们瞎选）。
+_PRERELEASE_RE = re.compile(
+    r"(?i)(?:^|[.\-_])(?:snapshot|alpha|beta|rc\d*|m\d+|cr\d+|ea|preview|pre|dev)(?:[.\-_]|\d|$)")
+
+
+def stable_versions(available: list[str]) -> list[str]:
+    """过滤掉预发布/里程碑版本；全是预发布则原样返回（不制造空集）。"""
+    stable = [v for v in available if not _PRERELEASE_RE.search(v)]
+    return stable or list(available)
+
+
+def pick_latest_stable(available: list[str]) -> str | None:
+    """取最新**稳定**版（version-repair 注入缺失 <version> 的唯一入口）。"""
+    pool = stable_versions(available)
+    return max(pool, key=_ver_key) if pool else None
+
+
 def _choose_valid_version(bad: str, available: list[str]) -> str | None:
-    """选最近的有效版本：≤目标的最高版本；若无（目标比所有都低）→ 最高可用版本。"""
+    """选最近的有效版本：≤目标的最高**稳定**版；若无（目标比所有都低）→ 最高稳定版。"""
     if not available or bad in available:
         return None
+    pool = stable_versions(available)
     bk = _ver_key(bad)
-    le = [v for v in available if _ver_key(v) <= bk]
-    pick = max(le, key=_ver_key) if le else max(available, key=_ver_key)
+    le = [v for v in pool if _ver_key(v) <= bk]
+    pick = max(le, key=_ver_key) if le else max(pool, key=_ver_key)
     return pick if pick != bad else None
 
 

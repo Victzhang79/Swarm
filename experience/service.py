@@ -124,6 +124,46 @@ def select_worker_skills(subtask, project_stack: dict | None = None) -> list[Ski
     return list(pushes) + list(pulls)
 
 
+# 路径/构建面的**泛词**：几乎每个子任务都有，零区分度，且会制造跨栈误推
+# （Gradle 工程的 build.gradle 命中 maven-build-lifecycle 的 "build" 词元 → Maven 经验
+# 漏进 Gradle 工程）。相关性只认有信息量的词（mapper/controller/security/migration…）。
+_NOISE_TERMS = frozenset({
+    "src", "main", "app", "com", "org", "net", "impl", "resources", "target",
+    "build", "project", "module", "modules", "file", "files", "code", "new",
+})
+
+
+def _subtask_terms(subtask) -> set[str]:
+    """R53-7：从子任务本身提取词元——描述 + 它要写的文件路径（目录/文件名/扩展名）。
+
+    经验层此前对子任务内容完全盲（选择器只吃 stack/intent/phase/画像词元），导致三轮
+    104 次 push 全是同一对最泛技能。文件路径是最硬的信号：`*/pom.xml`→构建，`*Mapper.java`
+    /`*Entity.java`/`*.sql`→持久化，`*Controller.java`→API，`*Test.java`→测试。
+    栈无关：只做词元切分，不写死任何语言/框架名。
+    """
+    import re as _re
+    terms: set[str] = set()
+    for w in _re.split(r"\W+", str(getattr(subtask, "description", "") or "").lower()):
+        if len(w) >= 3:
+            terms.add(w)
+    sc = getattr(subtask, "scope", None)
+    files = (list(getattr(sc, "create_files", None) or [])
+             + list(getattr(sc, "writable", None) or []))
+    for f in files:
+        p = str(f).replace("\\", "/").lower()
+        for w in _re.split(r"[^a-z0-9]+", p):
+            if len(w) >= 3:
+                terms.add(w)
+        # 驼峰再切一层：AlarmTaskMapper.java → alarm/task/mapper
+        raw_base = str(f).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        # 驼峰按原大小写切（先小写再切 → AlarmTaskMapper 变成一坨，切不出 task/mapper）
+        for w in _re.findall(r"[A-Z]?[a-z]{2,}", raw_base):
+            terms.add(w.lower())
+        if "." in p.rsplit("/", 1)[-1]:
+            terms.add(p.rsplit(".", 1)[-1])   # 扩展名（sql/xml/java/ts…）
+    return terms - _NOISE_TERMS
+
+
 def select_worker_push_pull(subtask, project_stack: dict | None = None):
     """R40-3（round40 定案重塑 G8）：push top-K 栈特化全文 + pull 默认关。
 
@@ -162,22 +202,35 @@ def select_worker_push_pull(subtask, project_stack: dict | None = None):
         picked = select_skills(
             skills, stack_langs=stack_langs, intent=intent, phase="code",
             target="worker", budget_chars=10**9,
-            # +1：RF14 通配保底会占末位一槽，不留余量会把第 K 条栈特化挤出候选
-            max_k=push_k + max(pull_budget, 0) + 1,
+            # R53-7：多取候选。push 门槛（_pushable）是在**截断之后**才施加的——若只取
+            # push_k+1 条，排名靠前但不可 push 的候选（如 Gradle 工程里的 maven-* 技能）
+            # 会把坑占满，随后被门槛筛掉 → 实测 Gradle/Java 脚手架一条经验都推不出来（空集）。
+            # 多留余量，让门槛筛完仍有货。
+            max_k=push_k + max(pull_budget, 0) + 6,
             rerank_fn=None, profile_terms=terms,
+            task_terms=_subtask_terms(subtask),   # R53-7：按"这个子任务在写什么"选经验
         )
         if not picked:
             return [], []
         # E9-3（复核 RF2）：push 门槛逐条适用——栈特化且【与画像框架级相关】
         # （框架词元命中，或 id 语言前缀 ∈ 探出语言集，如 java-coding-standards）。
         # 否则"任意栈特化即 push"会把 django-security 全文塞给 FastAPI 项目。
-        from swarm.experience.selector import _fw_hit
+        from swarm.experience.selector import _task_hit, stack_affinity
+
+        _task_terms = _subtask_terms(subtask)
 
         def _pushable(doc) -> bool:
             if "*" in doc.applies_to_stacks:
                 return False
-            _lang_prefix = doc.id.split("-", 1)[0].lower() in stack_langs
-            return _fw_hit(doc, terms) or _lang_prefix
+            # 与排序同尺（stack_affinity）：框架词元命中 或 id 语言前缀 ∈ 栈语言集。
+            if stack_affinity(doc, terms, stack_langs):
+                return True
+            # R53-7：栈已匹配（applies_to_stacks 轴）+ 与本子任务**强相关** → 同样放行。
+            # 否则 jpa-patterns 这类"栈特化但 id 不以语言开头、也不含框架词元"的技能永远
+            # 进不了 push 面：写 Mapper/Repository 的子任务够不到 JPA 经验（实测）。
+            # 泛词已在 _subtask_terms 里剔除（_NOISE_TERMS），剩下的都是有信息量的词，
+            # 命中 1 个即足以证明相关（写 Mapper 的子任务只会命中 jpa 的 "mapper" 一词）。
+            return _task_hit(doc, _task_terms, stack_langs) >= 1
 
         pushes = [d for d in picked if _pushable(d)][:push_k]
         _pushed_ids = {d.id for d in pushes}

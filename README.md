@@ -15,7 +15,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-3800%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.41-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.48-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -248,7 +248,7 @@ flowchart LR
     end
     subgraph EXP[“🧩 策展经验库”]
       direction TB
-      SK[43+ 内置技能<br/>栈×意图×阶段 精确路由]
+      SK[46+ 内置技能<br/>栈×意图×阶段×子任务 精确路由]
       PP[push 最相关 top-K 全文<br/>（pull 工具可选，默认关）]
     end
     KB -. 上下文注入 / just-in-time 检索 .-> TASK([任务执行])
@@ -262,7 +262,7 @@ flowchart LR
 
 - **代码知识库**：符号表 + 向量检索（embedding + rerank，可配云端或自建），为每个任务精准注入相关代码；Worker 还可即时检索。多语言语法感知切分 + 多源资料采集（PDF/Word/HTML/图片）。
 - **分层记忆 L0–L6**：每次审核反馈沉淀为记忆，影响后续编排与生成。时间感知衰减让旧案例自动淡出、新鲜教训优先；近因融合排序 + cross-encoder 精排提升召回精度；碎片自动整合，库越用越干净。
-- **经验拔插层**：一个 `.md` 即一个技能，零代码热插拔。选择器按**栈×意图×阶段**精确路由，带框架级相关性判别（FastAPI 项目绝不会被推 Django 建议）与数据库依赖探测（探出 MySQL 才挂 MySQL 经验）；最相关的 top-K 条栈特化经验全文直接进提示词（实测小模型对"按需工具自取"零采用，故 pull 工具默认关闭、可开关回退）。系统级编写/导入（WebUI 管理），每次入库过严格准入闸（schema/密钥扫描/提示注入拦截/标题-正文意图一致性裁判），保存前可**预览挂载面**——这条技能会出现在哪些项目的哪些任务里，一目了然。经验永远是建议（advisory），无权跳过任何确定性闸门。
+- **经验拔插层**：一个 `.md` 即一个技能，零代码热插拔。选择器按**栈×意图×阶段×子任务内容**精确路由：既看工程画像（框架级相关性判别——FastAPI 项目绝不会被推 Django 建议，Gradle 工程绝不会被推 Maven 经验；数据库依赖探测——探出 MySQL 才挂 MySQL 经验），也看**这个子任务到底在写什么**（写 pom 的拿构建经验、写 Mapper 的拿持久化经验、写认证的拿安全经验），同时保留本栈通用编码规范。最相关的 top-K 条经验全文直接进提示词（实测小模型对"按需工具自取"零采用，故 pull 工具默认关闭、可开关回退）。系统级编写/导入（WebUI 管理），每次入库过严格准入闸（schema/密钥扫描/提示注入拦截/标题-正文意图一致性裁判），保存前可**预览挂载面**——这条技能会出现在哪些项目的哪些任务里，一目了然。经验永远是建议（advisory），无权跳过任何确定性闸门。
 
 ### 🌐 多技术栈：不是"支持 Java 顺带其它"，而是栈无关设计
 

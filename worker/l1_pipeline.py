@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # `from swarm.worker.l1_pipeline import <fn>` 调用点（executor_sync / 测试）零改动、可寻址。
 from swarm.worker.l1_parse import (  # noqa: F401  (re-export，供既有调用点)
     _choose_valid_version,
+    pick_latest_stable,
     _is_reserved_maven_property,
     _ver_key,
     parse_missing_artifacts,
@@ -212,6 +213,48 @@ def _inject_dep_version_in_blocks(
     return new_text if hits else None
 
 
+def _reactor_artifacts(project_path: str) -> set[str]:
+    """reactor 内部模块 artifactId 集合（根 pom <modules> + 根自身 artifactId）。纯文本确定性。"""
+    txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
+    txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
+    mods = {m.rstrip("/").rsplit("/", 1)[-1]
+            for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", txt)}
+    body = re.sub(r"<parent>.*?</parent>", "", txt, flags=re.S)
+    body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
+    body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
+    own = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
+    if own:
+        mods.add(own.group(1))
+    return mods
+
+
+def _prune_dep_blocks(text: str, group: str, artifact: str) -> str | None:
+    """R53-2：剪除【无 <version> 且匹配坐标】的 <dependency> 块 → 新文本或 None（未命中）。
+
+    与 _inject_dep_version_in_blocks 严格对称：块内已有 <version> / artifactId 不匹配 /
+    groupId 明确不匹配 → 原样保留。剥 <exclusions> 防撞名误剪。只剪无版本的那一类——
+    有版本的坏依赖顶多解析失败（可归因），无版本又无人管的会让 Maven 连 reactor 都读不出（全局）。
+    模块级函数：测试 import 真身（禁抄本测试假绿）。"""
+    hits = 0
+
+    def _cut(m: "re.Match[str]") -> str:
+        nonlocal hits
+        blk = m.group(0)
+        inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
+        if "<version>" in inner:
+            return blk
+        if not re.search(r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>", inner):
+            return blk
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", inner)
+        if group and g and not g.group(1).startswith("${") and g.group(1) != group:
+            return blk
+        hits += 1
+        return ""
+
+    new_text = re.sub(r"[ \t]*<dependency>(.*?)</dependency>\s*\n?", _cut, text, flags=re.S)
+    return new_text if hits else None
+
+
 def _attempt_maven_version_repair(
     project_path: str, build_output: str, timeout: int
 ) -> tuple[int, list[str]]:
@@ -280,15 +323,59 @@ def _attempt_maven_version_repair(
             "[L1.2.1·version-repair] %s:%s 版本 %s 不存在（仓库可用最高=%s）→ 校正为 %s"
             "（声明 pom %d 个，属性引用 %s，仅依赖块/属性定义标签，项目自身版本不碰）",
             group, artifact, bad_ver,
-            max(available, key=_ver_key) if available else "?", good_ver, len(poms),
+            pick_latest_stable(available) or "?", good_ver, len(poms),
             sorted(prop_names) or "-",
         )
     # ── ② 缺 <version> 元素 → 注入有效版本 ──
+    _reactor: set[str] | None = None
     for group, artifact in missing_versions[:8]:
         available = _fetch_maven_versions(group, artifact, project_path, timeout)
         if not available:
-            continue  # 查不到可用版本 → 不动（缺依赖而非缺版本，交其它防线/定向恢复）
-        good_ver = max(available, key=_ver_key)
+            # R53-2 治本（round53 实锤死因）：旧实现在这里静默 continue，注释写"交其它防线"
+            # ——**根本没有其它防线**。仓库查无此 artifact 且父级不管、又无 version →
+            # `'dependencies.dependency.version' for G:A:jar is missing` 是 **pom 解析期**错：
+            # Maven 连 reactor 都读不出 → 此后每个 worker 的构建闸都判"错在上游模块"BLOCKED
+            # → 编译验证全线失效 → 整任务陪跑到熔断（round53 实测：契约臆造的幻影模块
+            # alarm-interface，两个 worker 各编一个 groupId 写进 pom，全树 8/80 后判死）。
+            # 治法与根 pom 幻影 <module> 剪枝对称：
+            #   · 真 reactor 兄弟模块（父级漏管）→ 注 ${project.version}（与父同版，确定性）
+            #   · 仓库查无此物 + 非 reactor 模块 = **幻影坐标，永不可解析** → 确定性剪除 + 响亮日志
+            # 剪掉后若代码真需要它 → 报 cannot-find-symbol（可归因、可修的局部编译错），
+            # 远优于让整棵树读不出（全局连坐）。
+            if _reactor is None:
+                _reactor = _reactor_artifacts(project_path)
+            _is_module = artifact in _reactor
+            art_esc = artifact.replace(".", r"\.")
+            _gc, _gout, _ge = _run_check_split(
+                f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _poms = sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()})
+            _touched: list[str] = []
+            for _pom in _poms:
+                _text = _read_project_file(project_path, _pom, timeout=20)
+                if _text is None:
+                    continue
+                _new = (_inject_dep_version_in_blocks(_text, group, artifact, "${project.version}")
+                        if _is_module else _prune_dep_blocks(_text, group, artifact))
+                if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                    changed.add(_pom)
+                    _touched.append(_pom)
+            if _is_module:
+                logger.warning(
+                    "[L1.2.1·version-repair] %s:%s 是 reactor 内部模块但父级未受管且无 version"
+                    "（pom 解析期硬错）→ 注入 ${project.version}（%d pom）",
+                    group, artifact, len(_touched))
+            else:
+                logger.warning(
+                    "[L1.2.1·phantom-dep] R53-2 %s:%s 仓库查无此 artifact 且非 reactor 模块、"
+                    "又无 <version> → **幻影坐标，永不可解析**，确定性剪除（%d pom）。"
+                    "留着它整个 reactor 都读不出（全员 BLOCKED）；剪掉后若代码真需要 → "
+                    "报可归因的 cannot-find-symbol",
+                    group, artifact, len(_touched))
+            continue
+        good_ver = pick_latest_stable(available)   # R53-3：稳定版优先（禁 M#/RC/alpha 毒树）
+        if not good_ver:
+            continue
         art_esc = artifact.replace(".", r"\.")
         gcmd = (
             f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null"
@@ -557,7 +644,9 @@ def _attempt_dependency_repair(
             available = _fetch_maven_versions(group, artifact, project_path, timeout)
             if not available:
                 continue  # 既不受管又查不到版本 → 不赌
-            version = max(available, key=_ver_key)
+            version = pick_latest_stable(available)   # R53-3：稳定版优先
+            if not version:
+                continue
         # 运行时伴生件（jjwt-api → jjwt-impl/jjwt-jackson）：同版本、runtime scope，杜绝"编译过
         # 但运行期 ClassNotFound"。受管(version=None)则伴生件也无 version 继承。
         family = _resolve_artifact_family(group, artifact, project_path, timeout)
@@ -750,10 +839,36 @@ def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
     return langs or None
 
 
+# R53-5（round50b/52 实锤）：编译器已经告诉我们缺失符号的**角色**（method/class/variable），
+# 旧正则却用【非捕获组】把它丢掉 → 类型名与变量名混在同一个候选池里按编辑距离改写 →
+# `IAlarmBotService→alarmBotService`（距=2）、`AlarmBot→alarmBot`（距=1）、`super→user`、
+# `Constants→constant` —— 确定性修复**主动把代码改坏**，随后编译报 `cannot find symbol:
+# class alarmBotService`，子任务被判死、连坐放弃 63 个。现在把角色捕获出来并强制同角色改写。
 _SYMBOL_ERR_RE = re.compile(
     r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala)):\[\d+,\d+\][^\n]*cannot find symbol[^\n]*\n"
-    r"[^\n]*symbol:\s*(?:method|class|variable)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"[^\n]*symbol:\s*(method|class|variable)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
+
+# 语言关键字绝不是"拼错的项目符号"：`cannot find symbol: variable super` 是用法错，
+# 把 super 改成 user（距=2 频=425，round52 实锤）只会把代码改得更坏。fail-closed 跳过。
+_JVM_KEYWORDS = frozenset("""
+abstract assert boolean break byte case catch char class const continue default do double else
+enum extends final finally float for goto if implements import instanceof int interface long
+native new package private protected public return short static strictfp super switch
+synchronized this throw throws transient try void volatile while var record sealed permits
+true false null object fun val suspend companion
+""".split())
+
+
+# JVM 生态命名惯例（栈内事实标准，非项目写死）：类型=大驼峰，方法/变量=小驼峰。
+# 角色不同 = 语义不同实体，编辑距离再近也绝不可互改。
+def _same_role(kind: str, name: str, cand: str) -> bool:
+    """候选与缺失符号必须**同角色**才允许改写（类型只能改成类型）。"""
+    if not name or not cand:
+        return False
+    if kind == "class":
+        return cand[:1].isupper()          # 类型 → 只接受类型形态候选
+    return not cand[:1].isupper() or name[:1].isupper()  # 方法/变量 → 不许被抬成类型形态
 
 
 def _edit_distance(a: str, b: str, cap: int = 3) -> int:
@@ -800,15 +915,20 @@ def _attempt_symbol_repair(
         return 0, []
     changed: set[str] = set()
     seen: set[tuple] = set()
-    for fpath, name in errs:
+    for fpath, kind, name in errs:
         rel = _norm_src_path(fpath)
         if mods and rel not in mods and not any(rel.endswith(m) or m.endswith(rel) for m in mods):
             continue  # 别人的文件，不动
         if (rel, name) in seen:
             continue
         seen.add((rel, name))
+        if name in _JVM_KEYWORDS:
+            logger.info("[L1.2.1·symbol-repair] R53-5 %r 是语言关键字（用法错，非拼写错）→ 不改写", name)
+            continue
         cands = [(w, _edit_distance(name, w)) for w in freq
-                 if w != name and freq[w] >= 5 and abs(len(w) - len(name)) <= 2]
+                 if w != name and freq[w] >= 5 and abs(len(w) - len(name)) <= 2
+                 and w not in _JVM_KEYWORDS
+                 and _same_role(kind, name, w)]   # R53-5：绝不跨角色改写（类型≠变量）
         cands = [(w, d) for w, d in cands if d <= 2]
         if not cands:
             continue

@@ -8,7 +8,7 @@ applies_to_phases: ["code", "produce"]
 target: ["worker"]
 priority: 48
 max_chars: 1800
-tags: ["java", "jpa", "orm"]
+tags: ["java", "jpa", "orm", "mapper", "repository", "entity", "dao", "mybatis", "persistence"]
 ---
 
 # JPA/Hibernate 持久化模式

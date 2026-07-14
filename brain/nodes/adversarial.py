@@ -102,6 +102,18 @@ _REVIEW_SYSTEM = """你是一名【独立】质量复核员，正在复核某个
 输出/崩溃路径）。给不出具体失败场景 = 你在模式匹配而非复核 → 该项必须判 PASS。宁可漏报也不
 凑数误报；干净产出就该 PASS（零 FAIL 是完全正常且被期望的结果）。
 
+【R53-4 免责铁律（据 round49b/50b/51/52 四轮实锤误判）】diff 里混着**确定性机制**自动注入的
+改动，它们不是 worker 写的，**一律不得据此判 worker FAIL**：
+  · 载荷中【确定性机制注入】列出的文件/改动（依赖版本注入、缺失依赖补齐、符号修复、权威 pom
+    模板落盘、共享清单并集合并、上游产物 pull-back 带回的兄弟文件）；
+  · 典型误判（真实发生过，务必避免）：把 L1 自动注入的第三方依赖版本号指控为"worker 擅自
+    硬编码不存在的版本"；把权威模板写入的依赖指控为"擅自新增依赖"；把 pull-back 带回的
+    上游文件指控为"worker 创建了错误的目标文件"。worker 依言删改 → 机制立即重新注入 →
+    下一轮再被打回，系统进入死循环。**这些账不记 worker 头上。**
+
+【截断守则】diff 可能被截断（载荷会注明）。**绝不可**因为截断后看不到某文件就判"未实现/
+未创建文件"——载荷里的【实际改动文件清单】才是完整事实，它永不截断。
+
 只输出 JSON，不要任何解释文字：
 {"reviews": [{"subtask_id": "<id>", "verdict": "PASS"|"FAIL",
   "issue": "<FAIL 时一句话问题，PASS 留空>",
@@ -137,10 +149,51 @@ def _build_review_user(candidates: list[tuple[SubTask, WorkerOutput]],
             blocks.append(f"验收标准: {'; '.join(st.acceptance_criteria)}")
         if st.contract:
             blocks.append(f"本子任务契约: {_format_contracts(st.contract)}")
+        # R53-4：改动文件清单**永不截断**——reviewer 因看不到截断掉的部分而指控"未创建任何
+        # Java 文件"是实测发生过的冤杀（round50b：L1 的 modified_files 里 5 个文件俱在且 build ok）。
+        _files = _changed_files(wo)
+        if _files:
+            blocks.append(f"实际改动文件清单（完整，不截断，共 {len(_files)} 个）: {', '.join(_files)}")
+        # R53-4：确定性机制注入的改动 → 明确标注免责，杜绝"机制产的毒算 worker 的罪"死循环
+        _mech = _mechanism_paths(wo)
+        if _mech:
+            blocks.append(
+                f"确定性机制注入（**不计 worker 的账**，不得据此判 FAIL），共 {len(_mech)} 个: "
+                f"{', '.join(_mech)}")
         blocks.append("diff:")
-        blocks.append(diff[:cap] + ("\n…（已截断）" if truncated else ""))
+        blocks.append(diff[:cap] + ("\n…（已截断——请以上面的完整文件清单为准）" if truncated else ""))
         blocks.append("")
     return "\n".join(blocks)
+
+
+def _changed_files(wo: WorkerOutput) -> list[str]:
+    """本子任务真实改动的文件全集（L1 机读账优先，回退 diff 头解析）。永不截断进载荷。"""
+    d = getattr(wo, "l1_details", None) or {}
+    files: list[str] = []
+    for key in ("modified_files", "created_files", "changed_files"):
+        for f in (d.get(key) or []):
+            if f and str(f) not in files:
+                files.append(str(f))
+    if not files:
+        import re as _re
+        for m in _re.finditer(r"^\+\+\+ b/(.+)$", wo.diff or "", _re.M):
+            if m.group(1) not in files:
+                files.append(m.group(1))
+    return files
+
+
+def _mechanism_paths(wo: WorkerOutput) -> list[str]:
+    """确定性修复层触及的路径：version-repair / dep-repair / symbol-repair / H1 模板 /
+    R48c-1 并集 / pull-back 兄弟文件——它们被 executor_sync 显式并进 worker 的 diff
+    (executor_sync.py `_repaired_extra_paths` → repaired_file_paths)，但此前没有任何一处
+    告诉 reviewer"这些不是 worker 写的"。provenance 就此丢失 → 四轮冤杀 + 死循环。"""
+    d = getattr(wo, "l1_details", None) or {}
+    out: list[str] = []
+    for f in (d.get("repaired_file_paths") or []):
+        s = str(f).replace("\\", "/").lstrip("./")
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def _parse_reviews(content: str) -> dict[str, tuple[str, str]]:
@@ -310,6 +363,14 @@ async def adversarial_verify(state: BrainState) -> dict:
         vt = await _run_one_reviewer(llm, messages, tag)
         if vt is not None:
             verdict_tables.append(vt)
+    # R53-4：reviewer **运行时**挂掉（超时/解析失败）此前只是被丢弃、不记账——于是"本轮其实
+    # 只有一个人在审、且他单方面打回了 9 个子任务"在人工面上完全看不见（round50b 实锤）。
+    # 独立性丢失必须留痕（degraded 单调累积，挡 auto_accept），与"配置上无备用模型"同权。
+    if len(reviewer_llms) > 1 and len(verdict_tables) < len(reviewer_llms):
+        single_reviewer_degraded = "adversarial_verify_single_reviewer:reviewer_died_at_runtime"
+        logger.warning(
+            "[ADVERSARIAL] %d/%d 个 reviewer 运行时不可用 → 本轮独立性降级（仍出裁决，但已留痕）",
+            len(reviewer_llms) - len(verdict_tables), len(reviewer_llms))
 
     # ── reviewer 基建全挂 → 降级放行（绝不因坏 reviewer 黑洞交付，也不误 flag）──
     if not verdict_tables:
@@ -382,6 +443,23 @@ async def adversarial_verify(state: BrainState) -> dict:
         if degraded:
             out["degraded_reasons"] = degraded
         return out
+
+    # ── R53-4 粘滞熔断：本任务已因"N 轮未收敛"升过人工 → **永不再打回**（复核照跑，发现降为
+    # advisory）。round50b/52 实锤：cap 短路把 round 归零（R-F6 有意为之，防跨战役永久免复核），
+    # 但 MERGE 的 rebase 重派会重进本节点、计数从 0 起，于是"已宣布 degraded 放行、绝不再打回"
+    # 之后又连打回 3 轮，把已 L1 通过的产出反复打成失败 → 连坐放弃 → 空转到用户取消。
+    # 治法：保留复核信号（仍产出 critique + degraded 留痕挡 auto_accept），但不再动 l1_passed、
+    # 不再进 failed_subtask_ids——熔断的语义是"交人工"，不是"再来一轮"。
+    _escalated = any(
+        str(r).startswith("adversarial_verify_unconverged")
+        for r in (state.get("degraded_reasons") or []))
+    if _escalated:
+        logger.warning(
+            "[ADVERSARIAL] R53-4 本任务已因未收敛升人工 → %d 个 FAIL 判定降为 advisory，"
+            "绝不再打回（熔断=交人工，不是再来一轮）: %s", len(naughty), list(naughty.keys()))
+        return _skip(cur_round, new_verified,
+                     f"已升人工，本轮 {len(naughty)} 条对抗复核发现降为 advisory（不打回）",
+                     degraded="adversarial_verify_advisory_after_escalation")
 
     # ── 有 NAUGHTY：flag-back（复用 HANDLE_FAILURE 重试预算），l1_passed 置 False + 评语入 l1_details ──
     logger.warning("[ADVERSARIAL] %d 个子任务未过对抗复核 → 打回重做: %s",

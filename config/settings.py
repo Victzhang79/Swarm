@@ -658,7 +658,10 @@ class SkillsConfig(BaseSettings):
     # （小模型不接可选离散工具，纯占工具槽）→ push 从 top-1 扩到 top-K 全文注入，
     # pull 工具默认关（SWARM_SKILLS_WORKER_PULL_ENABLED=1 回退旧混合行为）。
     # E9-3 push 门槛（栈特化+框架相关）逐条保留；E9-5（worker_max_tools=0 全关）不变。
-    worker_push_k: int = 2
+    # R53-7：2 → 3。相关性维度上线后，专精技能（jpa-patterns / maven-dependency-management /
+    # springboot-security）会挤掉通用编码规范——但"该模块怎么写 Java"和"这个子任务在写什么"
+    # 是两件事，两者都要。第 3 槽让专精 + 通用规范并存。
+    worker_push_k: int = 3
     worker_pull_enabled: bool = False
     rerank: bool = False               # 可选 LLM rerank；默认关（确定性优先）
     # 导入准入闸的 LLM 一致性裁判（标题/描述 vs 正文意图）。默认开=严格；LLM 不可用时自动降级
