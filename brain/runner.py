@@ -983,6 +983,35 @@ async def _handle_post_run(
         )
         logger.warning("[RUNNER] 任务 %s REJECT/非法终态 fail-fast: %s", task_id, reason)
         _rec = store.get_task(task_id) or {}
+        # R52-1（round52 实锤=外审#14 家族）：REJECT ≠ 一律 FAILED。escalate 家族的
+        # REJECT（failure_escalated/failed_subtasks/l2_failed）只说明【任务整体】没
+        # 达成功终态；若当前 plan 内已有 L1 通过的完成产出（round52 实测 16 个被本
+        # 分支整体丢弃），诚实终态=PARTIAL（列明需人工补完），与 HANDLE_FAILURE 一路
+        # 承诺的口径一致。绝不放行为 DONE（human_decision 仍 REJECT、不走
+        # LEARN_SUCCESS）；仅虚假前提/计划无效类（产出本身不可信）与零产出维持 FAILED。
+        _completed_n = _count_completed_in_plan(state)
+        _partial_eligible = (
+            _completed_n > 0
+            and _vf != "plan_invalid"
+            and not str(reason).startswith("clarification_required")
+            and not state.get("clarify_blocked_by_facts")
+        )
+        if _partial_eligible:
+            logger.warning(
+                "[RUNNER] R52-1 REJECT 但 plan 内已有 %d 个 L1 通过产出 → 诚实 PARTIAL"
+                "（拒因存档 error，不丢已完成工作）: %s", _completed_n, reason)
+            store.update_task(
+                task_id, status="PARTIAL", error=f"partial(rejected): {reason}"[:300],
+                token_usage=_failed_machine_account(task_id, state, "rejected_partial"))
+            _emit_task_notification(task_id, _rec, "PARTIAL")
+            audit("task_partial", orchestrator="Brain", task_id=task_id,
+                  project_id=_rec.get("project_id"),
+                  error=f"partial(rejected): {reason}"[:300])
+            await _emit(queue, {
+                "step": "done", "status": "partial",
+                "message": f"部分交付（{_completed_n} 个完成产出保留；拒因：{reason[:160]}）",
+            })
+            return
         # R38-E 复核 F7：所有 FAILED 写入都带机读账（error+ledger 快照），audit 不再是唯一去处
         store.update_task(task_id, status="FAILED", error=f"rejected: {reason}"[:300],
                           token_usage=_failed_machine_account(task_id, state, "rejected"))

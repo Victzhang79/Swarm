@@ -444,3 +444,31 @@ class TestR51CompletedNotAbandoned:
         sts = [_st("st-a", create=["m/a.java"]),
                _st("st-b", create=["m/b.java"], deps=["st-a"])]
         assert _transitive_abandon(sts, {"st-a"}) == {"st-a", "st-b"}
+
+
+class TestR52RejectPartial:
+    """R52-1：REJECT 但 plan 内有 L1 通过产出 → 诚实 PARTIAL 不丢工作。"""
+
+    def test_count_completed_oracle(self):
+        from swarm.brain.runner import _count_completed_in_plan
+        from swarm.types import Confidence, WorkerOutput
+
+        def _wo(ok):
+            return WorkerOutput(subtask_id="x", diff="d", summary="s",
+                                confidence=Confidence.HIGH, l1_passed=ok)
+        plan = TaskPlan(task_id="t", subtasks=[
+            _st("st-1", create=["a.java"]), _st("st-2", create=["b.java"])],
+            parallel_groups=[["st-1", "st-2"]])
+        state = {"plan": plan,
+                 "subtask_results": {"st-1": _wo(True), "st-2": _wo(False),
+                                     "st-old": _wo(True)}}  # 不在 plan 的旧 id 不计
+        assert _count_completed_in_plan(state) == 1
+
+    def test_runner_source_has_partial_branch(self):
+        """结构锁：REJECT 分支必须先问完成数、escalate 家族带产出走 PARTIAL。"""
+        src = open("brain/runner.py", encoding="utf-8").read()
+        seg = src[src.index("REJECT/非法终态 fail-fast"):]
+        seg = seg[:seg.index("_emit_task_notification(task_id, _rec, \"FAILED\")")]
+        assert "_count_completed_in_plan" in seg
+        assert 'status="PARTIAL"' in seg
+        assert "clarification_required" in seg, "虚假前提类维持 FAILED"
