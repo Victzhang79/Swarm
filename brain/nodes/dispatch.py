@@ -284,9 +284,16 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
         async def _run():
             try:
                 from swarm.knowledge.hooks import enqueue_kb_update
-                await enqueue_kb_update(event)
+                _eid = await enqueue_kb_update(event)
+                # R54-3：成功与否必须在【真正入队之后】才播报——旧实现在 create_task 之后
+                # 立刻打 "已入队" INFO，而失败走 logger.debug（INFO 级下不可见）→ 日志宣称
+                # 成功、实际每次都 NotNullViolation，整条回灌链路死了都没人发现。
+                logger.info("[DISPATCH] 事实库回灌：%d 个变更文件入队增量索引"
+                            "（子任务 %s，event=%s）",
+                            len(changes), getattr(subtask, "id", "?"), _eid)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("[DISPATCH] 知识库回灌入队失败(非致命): %s", exc)
+                # fail-loud：回灌断了 = 知识库永远看不到产出 = 后续任务的事实核验基于陈旧世界。
+                logger.warning("[DISPATCH] 知识库回灌入队失败（非致命但知识库将滞后）: %s", exc)
 
         # fire-and-forget：入队异步消费，不阻塞主流程
         import asyncio
@@ -298,10 +305,8 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
             _t.add_done_callback(_BG_TASKS.discard)
         except RuntimeError:
             pass
-        logger.info("[DISPATCH] 事实库回灌：%d 个变更文件入队增量索引（子任务 %s）",
-                    len(changes), getattr(subtask, "id", "?"))
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[DISPATCH] 知识库回灌跳过(非致命): %s", exc)
+        logger.warning("[DISPATCH] 知识库回灌跳过（非致命）: %s", exc)
 
 
 def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,

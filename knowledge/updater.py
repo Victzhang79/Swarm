@@ -699,13 +699,21 @@ class KnowledgeUpdater:
         }
         async with self._lock:
             async with self._conn.cursor() as cur:
+                # R54-3（round54 实锤）：**必须显式写 event_type**。代码 DDL 声明它
+                # `DEFAULT 'push'`，但线上真表是 `NOT NULL` 且**无默认值**（schema 漂移——
+                # 表早已存在，`CREATE TABLE IF NOT EXISTS` 从未生效）→ 每一次入队都
+                # NotNullViolation → 被调用方 logger.debug 静默吞掉 → **知识库增量回灌链路
+                # 从未成功过一次**（kb_update_events / kb_modification_log / kb_co_occurrence
+                # 三张表全空，retrieve_for_brain 的 behavior 面五轮恒 0）。
+                # 不靠默认值（漂移的 schema 不可信），坐标由调用方语义决定。
+                _etype = str((event.metadata or {}).get("source") or "push")
                 await cur.execute(
                     """
-                    INSERT INTO kb_update_events (project_id, payload_json)
-                    VALUES (%s, %s)
+                    INSERT INTO kb_update_events (project_id, event_type, payload_json)
+                    VALUES (%s, %s, %s)
                     RETURNING id
                     """,
-                    (event.project_id, psycopg.types.json.Jsonb(payload)),
+                    (event.project_id, _etype, psycopg.types.json.Jsonb(payload)),
                 )
                 row = await cur.fetchone()
         return row[0]

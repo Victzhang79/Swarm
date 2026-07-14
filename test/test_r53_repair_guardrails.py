@@ -79,3 +79,77 @@ def test_alternate_excludes_actual_parallel_pool(monkeypatch):
     assert "Qwopus" not in cands, "★实跑主力绝不能当自己的备选★"
     assert "Saka" not in cands, "trivial 档主力仍被排除（换模型≠降级到最弱档）"
     assert cands == ["Kimi"]
+
+
+# ── R54-6：reactor 内部模块被安上臆造 groupId（round54 实锤，逃过 R53-2） ────────
+POM_WRONG_GROUP = """<project>
+    <artifactId>alarm-schedule</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.alarm</groupId>
+            <artifactId>alarm-core</artifactId>
+            <version>4.8.3</version>
+        </dependency>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.47</version>
+        </dependency>
+    </dependencies>
+</project>
+"""
+
+
+def test_reactor_module_dep_group_is_rewritten_to_project_group():
+    """★ artifactId 是 reactor 成员 → groupId 只能是工程自己的（模块由本工程构建）。
+
+    round54 实锤：`com.alarm:alarm-core` → Maven 当外部依赖去远程仓库拉 →
+    `Could not find artifact com.alarm:alarm-core:jar:4.8.3` → 整模块解析失败。
+    它**有** version、artifactId **确实是**真模块 → 逃过 R53-2 的幻影剪除。
+    """
+    from swarm.worker.l1_pipeline import _fix_reactor_dep_group
+
+    out = _fix_reactor_dep_group(POM_WRONG_GROUP, "alarm-core", "com.ruoyi", {"alarm-core"})
+    assert out is not None
+    assert "<groupId>com.ruoyi</groupId>" in out
+    assert "com.alarm" not in out, "臆造 groupId 必须被改掉"
+    assert "cn.hutool" in out and "5.8.47" in out, "真第三方依赖不得被误伤"
+
+
+def test_reactor_group_fix_is_idempotent_and_skips_correct_ones():
+    from swarm.worker.l1_pipeline import _fix_reactor_dep_group
+
+    good = POM_WRONG_GROUP.replace("com.alarm", "com.ruoyi")
+    assert _fix_reactor_dep_group(good, "alarm-core", "com.ruoyi", {"alarm-core"}) is None, \
+        "已正确 → 不动（幂等）"
+    # fail-closed 自守门：不是 reactor 成员 → 绝不改写（否则本函数就成了伪造坐标的工具）
+    assert _fix_reactor_dep_group(
+        POM_WRONG_GROUP, "hutool-all", "com.ruoyi", {"alarm-core"}) is None, \
+        "第三方 artifact 绝不能被安上工程 groupId（那正是 R47-2 禁的伪造）"
+
+
+# ── R54-5：稳定 ≠ 兼容（版本必须与工程同代对齐） ─────────────────────────────
+ROOT_POM_BOOT4 = """<project>
+    <groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId><version>4.8.3</version>
+    <properties><spring-boot.version>4.0.6</spring-boot.version></properties>
+    <dependencyManagement><dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-dependencies</artifactId>
+            <version>${spring-boot.version}</version>
+            <type>pom</type><scope>import</scope>
+        </dependency>
+    </dependencies></dependencyManagement>
+</project>
+"""
+
+
+def test_group_family_version_resolves_property(tmp_path, monkeypatch):
+    """工程为某 groupId 钉的版本（含 ${prop} 展开）= 注入时唯一正确的对齐目标。"""
+    import swarm.worker.l1_pipeline as lp
+    (tmp_path / "pom.xml").write_text(ROOT_POM_BOOT4, encoding="utf-8")
+    monkeypatch.setattr(lp, "_read_project_file",
+                        lambda p, rel, timeout=20: (tmp_path / rel).read_text("utf-8")
+                        if (tmp_path / rel).is_file() else None)
+    assert lp._group_family_version(str(tmp_path), "org.springframework.boot") == "4.0.6"
+    assert lp._group_family_version(str(tmp_path), "cn.hutool") is None, "无先例 → None（走最新稳定版）"

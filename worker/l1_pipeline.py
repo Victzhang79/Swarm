@@ -228,6 +228,85 @@ def _reactor_artifacts(project_path: str) -> set[str]:
     return mods
 
 
+def _group_family_version(project_path: str, group: str) -> str | None:
+    """R54-5：工程里【同 groupId 家族】已经在用的版本（root pom 证据，${prop} 展开）。
+
+    round54 实锤：`spring-boot-starter-aop` 在 Spring Boot 4 里**已不存在**（改名 aspectj），
+    L1 去 Central 找"最新稳定版"找到的是 **Boot 3 系的 3.5.16**，注进了 Boot 4.0.6 的工程 →
+    跨大版本混用（Spring 6 vs 7）。**稳定 ≠ 与本工程兼容**：版本闸只挡住了预发布，挡不住"版本
+    对、代际错"。工程自己已经为该 groupId 钉过一个版本（这里是 spring-boot.version=4.0.6），
+    那才是唯一正确的对齐目标。返回 None = 该 group 在工程里没有先例（按最新稳定版走，旧行为）。
+    """
+    txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
+    txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
+    for blk in re.finditer(r"<dependency>(.*?)</dependency>", txt, re.S):
+        b = re.sub(r"<exclusions>.*?</exclusions>", "", blk.group(1), flags=re.S)
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", b)
+        v = re.search(r"<version>\s*([^<]+?)\s*</version>", b)
+        if not (g and v and g.group(1) == group):
+            continue
+        val = v.group(1).strip()
+        m = re.fullmatch(r"\$\{([^}]+)\}", val)
+        if not m:
+            return val
+        prop = re.escape(m.group(1))
+        pm = re.search(rf"<{prop}>\s*([^<\s]+)\s*</{prop}>", txt)
+        if pm:
+            return pm.group(1)
+    return None
+
+
+def _project_group(project_path: str) -> str | None:
+    """工程自身 groupId（根 pom 坐标区，剥 parent/依赖/构建块后的首个 groupId）。"""
+    txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
+    txt = re.sub(r"<!--.*?-->", "", txt, flags=re.S)
+    body = re.sub(r"<parent>.*?</parent>", "", txt, flags=re.S)
+    body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
+    body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
+    body = re.sub(r"<build>.*?</build>", "", body, flags=re.S)
+    m = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", body)
+    return m.group(1) if m else None
+
+
+def _fix_reactor_dep_group(text: str, artifact: str, project_group: str,
+                           reactor_mods: set[str] | None = None) -> str | None:
+    """R54-6：把【reactor 内部模块】依赖的臆造 groupId 改回工程自己的 → 新文本或 None。
+
+    round54 实锤：`alarm-schedule/pom.xml` 依赖兄弟模块写成 `com.alarm:alarm-core`（工程真实
+    groupId 是 com.ruoyi）→ Maven 当成外部依赖去远程仓库拉 → `Could not find artifact
+    com.alarm:alarm-core:jar:4.8.3` → 整个模块解析失败。
+
+    这是幻影坐标的第三种形态，**逃过 R53-2**（它只剪"无 version 且非 reactor 模块"的）：
+    此处**有** version、artifactId **确实是** reactor 模块，只有 groupId 是编的。判据是硬的、
+    零歧义：artifactId 是 reactor 成员 → 它的 groupId 只能是工程 groupId（模块由本工程构建，
+    不可能来自任何外部 group）。故直接改写，不猜、不删。
+    """
+    if not (artifact and project_group):
+        return None
+    # fail-closed 自守门：artifact **必须**被证明是 reactor 成员才允许改写 groupId。
+    # 只靠调用方守门 → 本函数一旦被别处误用就成了"给第三方 artifact 安上工程 groupId"的
+    # 伪造器（正是 R47-2 铁律禁的、round47 毒死整棵树的那件事）。
+    if reactor_mods is not None and artifact not in reactor_mods:
+        return None
+    hits = 0
+
+    def _fix(m: "re.Match[str]") -> str:
+        nonlocal hits
+        blk = m.group(0)
+        inner = re.sub(r"<exclusions>.*?</exclusions>", "", m.group(1), flags=re.S)
+        if not re.search(r"<artifactId>\s*" + re.escape(artifact) + r"\s*</artifactId>", inner):
+            return blk
+        g = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", inner)
+        if not g or g.group(1).startswith("${") or g.group(1) == project_group:
+            return blk
+        hits += 1
+        return blk.replace(f"<groupId>{g.group(1)}</groupId>",
+                           f"<groupId>{project_group}</groupId>", 1)
+
+    new_text = re.sub(r"<dependency>(.*?)</dependency>", _fix, text, flags=re.S)
+    return new_text if hits else None
+
+
 def _prune_dep_blocks(text: str, group: str, artifact: str) -> str | None:
     """R53-2：剪除【无 <version> 且匹配坐标】的 <dependency> 块 → 新文本或 None（未命中）。
 
@@ -277,8 +356,37 @@ def _attempt_maven_version_repair(
     if not missing and not missing_versions:
         return 0, []
     changed: set[str] = set()
+    _reactor_mods: set[str] | None = None
+    _proj_group: str | None = None
     # ── ① 版本写错/不存在 → 校正 ──
     for group, artifact, bad_ver in missing[:8]:
+        # R54-6（round54 实锤）：`Could not find artifact com.alarm:alarm-core:jar:4.8.3` ——
+        # artifact 其实是 **reactor 内部模块**，只是 groupId 被 LLM 编错（工程真身 com.ruoyi）→
+        # Maven 当外部依赖去远程仓库拉 → 整模块解析失败。这类**绝不能**走"查仓库校正版本"
+        # （仓库里本就不该有它），必须把 groupId 改回工程自己的：artifactId 是 reactor 成员 →
+        # 其 groupId 只能是工程 groupId（模块由本工程构建，不可能来自任何外部 group），零歧义。
+        if _reactor_mods is None:
+            _reactor_mods = _reactor_artifacts(project_path)
+            _proj_group = _project_group(project_path)
+        if artifact in _reactor_mods and _proj_group and group != _proj_group:
+            art_esc = artifact.replace(".", r"\.")
+            _ec, _gout, _ge = _run_check_split(
+                f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _fixed: list[str] = []
+            for _pom in sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()}):
+                _text = _read_project_file(project_path, _pom, timeout=20)
+                if _text is None:
+                    continue
+                _new = _fix_reactor_dep_group(_text, artifact, _proj_group, _reactor_mods)
+                if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                    changed.add(_pom)
+                    _fixed.append(_pom)
+            logger.warning(
+                "[L1.2.1·reactor-group] R54-6 %s 是 reactor 内部模块，依赖却写成外部 groupId %r "
+                "→ 改回工程 groupId %r（%d pom）；仓库里本就没有它，校正版本无从谈起",
+                artifact, group, _proj_group, len(_fixed))
+            continue
         available = _fetch_maven_versions(group, artifact, project_path, timeout)
         good_ver = _choose_valid_version(bad_ver, available)
         if not good_ver:
@@ -373,7 +481,37 @@ def _attempt_maven_version_repair(
                     "报可归因的 cannot-find-symbol",
                     group, artifact, len(_touched))
             continue
-        good_ver = pick_latest_stable(available)   # R53-3：稳定版优先（禁 M#/RC/alpha 毒树）
+        # R54-5：先与【工程同 groupId 家族已钉的版本】对齐——"稳定版"只挡预发布，挡不住
+        # "版本对、代际错"（round54：Boot 4.0.6 工程被注进 Boot 3 系的 spring-boot-starter-aop:3.5.16）。
+        _fam = _group_family_version(project_path, group)
+        if _fam:
+            if _fam in available:
+                good_ver = _fam                      # 与工程同代 → 唯一正确的对齐目标
+            else:
+                # 工程用的是该 group 的 X 代，而这个 artifact 在 X 代**不存在**（典型：Boot 4 删掉
+                # 了 starter-aop）→ 注入任何"可用版本"都是跨代混用（更隐蔽的毒）。如实剪除：
+                # 缺依赖 = 可归因的编译错，跨代依赖 = 运行期/集成期才炸的暗雷。
+                art_esc = artifact.replace(".", r"\.")
+                _gc, _gout, _ge = _run_check_split(
+                    f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                    project_path, timeout=30)
+                _cut: list[str] = []
+                for _pom in sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()}):
+                    _text = _read_project_file(project_path, _pom, timeout=20)
+                    if _text is None:
+                        continue
+                    _new = _prune_dep_blocks(_text, group, artifact)
+                    if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                        changed.add(_pom)
+                        _cut.append(_pom)
+                logger.warning(
+                    "[L1.2.1·generation-mismatch] R54-5 工程的 %s 家族钉在 %s，但 %s 在该代不存在"
+                    "（仓库可用最高稳定版=%s，属另一代）→ 剪除该依赖（跨代混用是集成期才炸的暗雷；"
+                    "缺依赖是可归因的编译错）（%d pom）",
+                    group, _fam, artifact, pick_latest_stable(available) or "?", len(_cut))
+                continue
+        else:
+            good_ver = pick_latest_stable(available)   # R53-3：稳定版优先（禁 M#/RC/alpha 毒树）
         if not good_ver:
             continue
         art_esc = artifact.replace(".", r"\.")

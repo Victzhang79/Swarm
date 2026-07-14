@@ -233,22 +233,64 @@ def bom_managed_artifacts(group: str, artifact: str, version: str) -> dict[str, 
 
 
 # ── 注册中心解析（网络，失败即 None） ────────────────────────────────────────
+def local_m2_groups_for(artifact: str) -> set[str]:
+    """本地 ~/.m2 里**真实存在**该 artifact 的 groupId 集合（目录结构即证据，零网络）。"""
+    root = Path.home() / ".m2" / "repository"
+    found: set[str] = set()
+    try:
+        for d in root.rglob(artifact):
+            if not d.is_dir():
+                continue
+            # 版本目录里有同名 .pom 才算数（排除同名中间目录）
+            if not any((v / f"{artifact}-{v.name}.pom").is_file()
+                       for v in d.iterdir() if v.is_dir()):
+                continue
+            found.add(".".join(d.relative_to(root).parts[:-1]))
+    except OSError:
+        return set()
+    return found
+
+
 def registry_group_for(artifact: str) -> str | None:
-    """Maven Central 按 artifactId 反查 groupId：**唯一**才采信，多个候选 → None（绝不猜）。"""
+    """按 artifactId 反查 groupId。唯一 → 采信；多候选 → 用**本地 ~/.m2 证据**消歧；仍不唯一 → None。
+
+    R54-1（round54 实测）：Central 上 `okhttp` 有 20 个 groupId 候选、`mybatis-plus-boot-starter` 9 个、
+    `hutool-all` 3 个（fork / 镜像 / shaded 重打包满天飞）→ 原来的"一有歧义就全丢"把**常用依赖也丢光**，
+    模板偏薄，只能靠 worker 手写 + L1 事后补救（多烧一轮构建）。
+    消歧证据必须是**事实而非偏好**：本地仓库里真实存在哪个 group 的这个 artifact——那是本机生态
+    真正在用的那一个（同时天然离线可用）。本地也不唯一 → 仍然 None（绝不猜）。
+    """
+    if not _lookup_enabled():
+        return None
     q = urllib.parse.urlencode({"q": f'a:"{artifact}"', "rows": "20", "wt": "json"})
     raw = _http_get(f"{_SEARCH_URL}?{q}")
-    if not raw:
-        return None
-    try:
-        docs = (json.loads(raw).get("response") or {}).get("docs") or []
-    except (ValueError, AttributeError):
-        return None
-    groups = {d.get("g") for d in docs if d.get("a") == artifact and d.get("g")}
+    groups: set[str] = set()
+    if raw:
+        try:
+            docs = (json.loads(raw).get("response") or {}).get("docs") or []
+            groups = {d.get("g") for d in docs if d.get("a") == artifact and d.get("g")}
+        except (ValueError, AttributeError):
+            groups = set()
     if len(groups) == 1:
         return groups.pop()
-    if len(groups) > 1:
-        logger.info("[maven-registry] %r 在 Central 有 %d 个 groupId 候选 → 存疑弃用（不猜）",
-                    artifact, len(groups))
+
+    local = local_m2_groups_for(artifact)
+    if groups:
+        overlap = local & groups          # 本地有 ∩ Central 有 → 最强证据
+        if len(overlap) == 1:
+            g = overlap.pop()
+            logger.info("[maven-registry] R54-1 %r Central 有 %d 个 groupId 候选 → 用本地 m2 证据"
+                        "消歧为 %s（本机生态真实在用）", artifact, len(groups), g)
+            return g
+        logger.info("[maven-registry] %r 在 Central 有 %d 个 groupId 候选、本地 m2 %d 个 → "
+                    "仍不唯一，存疑弃用（不猜）", artifact, len(groups), len(local))
+        return None
+    # Central 查不通（离线）→ 纯本地证据唯一即可采信
+    if len(local) == 1:
+        g = local.pop()
+        logger.info("[maven-registry] R54-1 Central 不可达 → 用本地 m2 唯一证据解析 %r → %s",
+                    artifact, g)
+        return g
     return None
 
 
