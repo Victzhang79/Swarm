@@ -480,3 +480,56 @@ def test_child_module_parent_gav_matches_the_aggregator_not_the_root(tmp_path):
     for m in ("<module>alarm-core</module>", "<module>alarm-web</module>"):
         assert m in agg.description, f"聚合父必须登记子模块 {m}"
     assert injected
+
+
+def test_aggregator_pom_injected_even_when_all_submodule_poms_are_claimed(tmp_path):
+    """★R60-1（round60 死因）★ 子模块 pom 全被认领 → entries 空 → 聚合父注入被跳过 → FATAL。
+
+    R58-3 太成功了：8 个子模块的 pom 都被写代码的子任务认领、拿到确定性模板 →
+    `unclaimed_contract_deps` 返回空 → `inject_build_scaffold_subtasks` 提前 return
+    → **聚合父脚手架 `_inject_aggregator_scaffold` 根本没机会运行**。
+    而聚合父 pom（纯 packaging=pom、无代码）**没有任何子任务会认领它** →
+    `ruoyi-alarm/pom.xml` 没人建 → 所有子模块 parent `com.ruoyi:ruoyi-alarm:pom` 找不到 → 全员 FATAL。
+
+    聚合父的存在性**与子模块 pom 有没有 owner 无关**：只要子模块同处一个非根聚合目录，
+    那个聚合父 pom 就必须有确定性的创建者。
+    """
+    from swarm.brain.contract_utils import inject_build_scaffold_subtasks
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version>"
+        "<packaging>pom</packaging></project>", encoding="utf-8")
+
+    def _st(sid, create):
+        return SubTask(id=sid, description=f"task {sid}",
+                       difficulty=SubTaskDifficulty.MEDIUM,
+                       scope=FileScope(create_files=create))
+
+    # 每个子模块 pom 都被写代码的子任务认领（round60 实况）
+    plan = TaskPlan(subtasks=[
+        _st("st-1", ["ruoyi-alarm/alarm-core/pom.xml",
+                     "ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", ["ruoyi-alarm/alarm-channel/pom.xml",
+                     "ruoyi-alarm/alarm-channel/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": []},
+        {"module": "alarm-channel", "artifacts": []}]}
+    file_plan = [{"module": "alarm-core", "path": "ruoyi-alarm/alarm-core/src/main/java/A.java"},
+                 {"module": "alarm-channel", "path": "ruoyi-alarm/alarm-channel/src/main/java/B.java"}]
+
+    inject_build_scaffold_subtasks(plan, str(tmp_path), file_plan)
+
+    agg = next((st for st in plan.subtasks
+                if "ruoyi-alarm/pom.xml" in (list(st.scope.create_files)
+                                             + list(st.scope.writable))), None)
+    assert agg is not None, (
+        "子模块 pom 全被认领时，聚合父 ruoyi-alarm/pom.xml 仍必须有确定性创建者"
+        "（否则所有子模块的 parent POM 找不到 → 全员 FATAL）")
+    assert not agg.depends_on, "聚合父绝不依赖任何子模块"
+    # 子模块认领者应依赖聚合父先落地
+    for sid in ("st-1", "st-2"):
+        st = next(s for s in plan.subtasks if s.id == sid)
+        assert agg.id in st.depends_on, f"{sid} 必须依赖聚合父 {agg.id} 先建好"

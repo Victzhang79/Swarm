@@ -644,7 +644,7 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
     return touched
 
 
-def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
+def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
                                 project_path: str | None, existing_ids: set,
                                 injected: list) -> str | None:
     """R57-4b：子模块同处一个**非根**聚合目录时，确定性注入该聚合父 POM 的脚手架（拓扑最先）。
@@ -654,12 +654,18 @@ def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
     不存在（`Could not find the selected project in the reactor`）→ 全灭 → 阶梯三保 build
     → **连坐放弃下游 69 个**。父聚合模块**不依赖任何子模块**，必须先于它们落地。
 
+    ★R60-1（round60 死因）★ 聚合父的存在性**与子模块 pom 有没有 owner 无关**——必须基于
+    **全部契约模块的物理目录**判定，绝不能只看 `unclaimed` 的那些。round60 实锤：R58-3 太成功，
+    8 个子模块 pom 全被认领 → entries 空 → 本函数（曾用 entries 过滤）看到空聚合层 → 不注入
+    → `ruoyi-alarm/pom.xml` 没人建 → 所有子模块 parent `com.ruoyi:ruoyi-alarm:pom` 找不到 → 全员 FATAL。
+
     只在**唯一**聚合目录且**无人认领其 pom** 时注入；歧义/已有 owner → 不动（绝不猜）。
+    注入后，让**所有认领了该聚合下子模块 pom 的 owner**（含脚手架与写代码的子任务）依赖聚合父先落地。
     """
     from swarm.types import FileScope, SubTask, TaskIntent
 
-    parents = {d.rsplit("/", 1)[0] for m, d in dirs.items()
-               if m in {e["module"] for e in entries} and "/" in d}
+    # ★用全部契约模块的落点★（不再拿 entries 过滤——那会漏掉"pom 已被认领"的子模块）
+    parents = {d.rsplit("/", 1)[0] for d in dirs.values() if "/" in d}
     if len(parents) != 1:
         return None                      # 无聚合层（模块在根级）或多个聚合层（歧义）→ 不动
     agg = next(iter(parents))
@@ -674,8 +680,8 @@ def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
     if sid in existing_ids:
         return sid
     exists = bool(project_path) and (Path(project_path) / agg_pom).is_file()
-    sub_names = sorted({d.rsplit("/", 1)[-1] for m, d in dirs.items()
-                        if m in {e["module"] for e in entries} and d.startswith(f"{agg}/")})
+    sub_names = sorted({d.rsplit("/", 1)[-1] for d in dirs.values()
+                        if d.startswith(f"{agg}/")})
     _agg_tpl = _aggregator_pom_template(agg, sub_names, project_path)
     scaffold = SubTask(
         id=sid,
@@ -702,10 +708,23 @@ def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
         plan.parallel_groups.insert(0, [sid])   # 拓扑最先
     injected.append({"module": agg, "subtask_id": sid, "artifacts": [],
                      "pom_exists": exists, "aggregator": True})
+    # R60-1：让**所有认领了该聚合下任一 pom 的子任务**（含写代码的认领者）依赖聚合父先落地。
+    # 否则子模块编译时 `ruoyi-alarm/pom.xml` 可能还没建 → parent 找不到（round60 死因）。
+    _agg_prefix = f"{agg}/"
+    for st in plan.subtasks:
+        if st.id == sid:
+            continue
+        sc = getattr(st, "scope", None)
+        owns = [_norm_scope_path(f) for f in
+                (list(getattr(sc, "create_files", None) or [])
+                 + list(getattr(sc, "writable", None) or []))]
+        if any(o.startswith(_agg_prefix) and o.endswith("pom.xml") for o in owns) \
+                and sid not in st.depends_on:
+            st.depends_on.append(sid)
     logger.warning(
-        "[SCAFFOLD-INJECT] R57-4b 子模块同处聚合目录 %r → 确定性注入父 POM 脚手架 %s（拓扑最先，"
-        "不依赖任何子模块）。round57 实锤：父 POM 没人先建 → 子模块全部 'not in the reactor' → "
-        "连坐放弃 69 个下游子任务。", agg, sid)
+        "[SCAFFOLD-INJECT] R57-4b/R60-1 子模块同处聚合目录 %r → 确定性注入父 POM 脚手架 %s（拓扑最先，"
+        "不依赖任何子模块；所有子模块 pom 的 owner 依赖它先落地）。父 POM 没人先建 → 子模块全部 "
+        "'not in the reactor' / parent not found → 连坐全灭。", agg, sid)
     return sid
 
 
@@ -732,9 +751,19 @@ def inject_build_scaffold_subtasks(
     # 治：**认领者也必须拿到确定性权威模板**（嵌进 description，让它抄而不是编）。
     _inject_templates_into_pom_owners(plan, project_path, file_plan)
 
+    from swarm.types import FileScope, SubTask, TaskIntent
+    injected: list[dict] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    _dirs = _module_physical_dirs(plan, project_path, file_plan)
+    # ★先算 entries★：聚合父脚手架会写根 `pom.xml`，这会触发规则5 的 A5 归并（误判"单 pom owner
+    # → 单模块项目"）把子模块的 unclaimed 全吃掉 → 子模块脚手架不再注入。故必须在注入聚合父**之前**固定。
     entries = unclaimed_contract_deps(plan)
+    # ★R60-1（round60 死因）★ 聚合父注入必须**先于** early-return，且**独立于 entries**——
+    # 子模块 pom 全被认领时 entries 空，但聚合父 pom（纯 packaging=pom、无代码）没人认领，
+    # 若被 early-return 跳过 → `ruoyi-alarm/pom.xml` 无人建 → 所有子模块 parent 找不到 → 全员 FATAL。
+    _agg_id = _inject_aggregator_scaffold(plan, _dirs, project_path, existing_ids, injected)
     if not entries:
-        return []
+        return injected   # 可能已注入聚合父（R60-1）——绝不能再返回硬编码 []
     # R57-1 治本（round57 实锤）：**光凭契约里一个字符串，不足以在磁盘上造一个模块。**
     # LLM 把契约 schema 的占位符原样抄成了模块名（真实出现过 `module` / `artifacts`），
     # 旧实现对模块名零取证 → 无条件建 `module/pom.xml`、`artifacts/pom.xml` → 磁盘上凭空
@@ -752,16 +781,8 @@ def inject_build_scaffold_subtasks(
             len(_rejected), _rejected)
         entries = [e for e in entries if e["module"] in _dirs]
         if not entries:
-            return []
-    from swarm.types import FileScope, SubTask, TaskIntent
-    injected: list[dict] = []
-    existing_ids = {st.id for st in plan.subtasks}
-    # R57-4b：子模块若同处一个**非根**的聚合目录（如 `ruoyi-alarm/alarm-*`），那个聚合父 POM
-    # 必须**确定性地先建出来**。round57 实锤：父 POM 的创建权被分给了 st-1，而 st-1 又依赖
-    # st-13/21/39 → 依赖顺序死结 → 那三个子任务编译时父 POM 不存在 → 全灭 → 连坐 69 个。
-    # 父聚合模块拓扑上必须先于所有子模块，且**不依赖任何子模块**。
-    _agg_id = _inject_aggregator_scaffold(
-        plan, entries, _dirs, project_path, existing_ids, injected)
+            return injected   # 聚合父可能已注入（R60-1）
+    # 注：聚合父脚手架（R57-4b/R60-1）已在 early-return 之前注入，此处不再重复。
     for entry in entries:
         mod = entry["module"]
         arts = list(entry["artifacts"])
