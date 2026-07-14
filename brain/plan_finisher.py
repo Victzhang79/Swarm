@@ -325,7 +325,8 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         return out
     try:
         from swarm.brain.contract_utils import inject_build_scaffold_subtasks
-        injected = inject_build_scaffold_subtasks(plan, project_path)
+        # R58-1：file_plan 是【模块 → 文件】的权威归属（逻辑模块名 ≠ 物理目录时唯一的证据源）
+        injected = inject_build_scaffold_subtasks(plan, project_path, file_plan)
         out["scaffolds"] = [e["module"] for e in injected]
         if injected:
             from swarm.brain.nodes.shared import bootstrap_subtask_harness

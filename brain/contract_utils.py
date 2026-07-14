@@ -465,7 +465,8 @@ _BUILD_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml",
                     "go.mod", "package.json", "pyproject.toml")
 
 
-def _module_physical_dirs(plan, project_path: str | None) -> dict[str, str]:
+def _module_physical_dirs(plan, project_path: str | None,
+                          file_plan: list | None = None) -> dict[str, str]:
     """R57-1 + R57-4 合治：契约模块名 → 它在磁盘上的**真实物理目录**（多栈通用，不写死任何栈）。
 
     ★round57 头号杀手★ 旧实现把契约里的**模块名字面**当**物理路径**（`alarm-core` →
@@ -482,6 +483,11 @@ def _module_physical_dirs(plan, project_path: str | None) -> dict[str, str]:
     命中**多个**不同物理目录（歧义）或**零个**（如 LLM 把 schema 占位符 `module`/`artifacts`
     抄成了模块名）→ **不返回**（fail-closed：绝不凭一个字符串在磁盘上造模块）。
     """
+    # ★只对【契约里出现的模块名】求落点★：给每个路径段都建候选，会把 src/main/java/com/impl…
+    # 全当成"模块名"，刷一屏无意义的歧义告警（round58 实测）。噪声会淹掉真信号。
+    _want = {(e.get("module") or "").strip().rstrip("/")
+             for e in ((getattr(plan, "shared_contract", None) or {}).get("dependencies") or [])
+             if isinstance(e, dict)} - {""}
     cands: dict[str, set[str]] = {}
     for st in getattr(plan, "subtasks", []) or []:
         sc = getattr(st, "scope", None)
@@ -493,7 +499,8 @@ def _module_physical_dirs(plan, project_path: str | None) -> dict[str, str]:
                 continue   # 构建清单不算证据（它正是我们要造的东西）
             parts = p.split("/")
             for i, seg in enumerate(parts[:-1]):    # 末段是文件名
-                cands.setdefault(seg, set()).add("/".join(parts[:i + 1]))
+                if seg in _want:
+                    cands.setdefault(seg, set()).add("/".join(parts[:i + 1]))
     out: dict[str, str] = {}
     for mod, dirs in cands.items():
         if len(dirs) == 1:
@@ -510,7 +517,112 @@ def _module_physical_dirs(plan, project_path: str | None) -> dict[str, str]:
             mod = (entry.get("module") or "").strip().rstrip("/")
             if mod and mod not in out and (base / mod).is_dir():
                 out[mod] = mod   # 基线里真实存在的目录 = 真模块（棕地）
+
+    # ★R58-1（round58 实锤）★ **权威证据是 file_plan，不是名字匹配。**
+    # 契约声明逻辑模块 `alarm-admin`，代码却落在基线既有模块 `ruoyi-admin/` 里（这是对的——
+    # admin 功能加进现有模块，不该新建）。名字匹配必然落空 → 它的依赖契约全部无人承接
+    # → 编译期缺依赖。TECH_DESIGN 本就产出了权威的【模块 → 文件】归属，据它求**公共物理前缀**。
+    # 名字匹配拿到的落点若与 file_plan 冲突，以 file_plan 为准（它是设计的原始归属）。
+    for mod, paths in _file_plan_module_paths(file_plan).items():
+        prefix = _common_module_prefix(paths, project_path)
+        if prefix:
+            out[mod] = prefix
     return out
+
+
+def _file_plan_module_paths(file_plan: list | None) -> dict[str, list[str]]:
+    """file_plan → {模块名: [文件路径…]}（容忍 dict / 对象两种形态）。"""
+    out: dict[str, list[str]] = {}
+    for it in (file_plan or []):
+        mod = (it.get("module") if isinstance(it, dict) else getattr(it, "module", None)) or ""
+        path = (it.get("path") if isinstance(it, dict) else getattr(it, "path", None)) or ""
+        mod, path = str(mod).strip().rstrip("/"), _norm_scope_path(path)
+        if mod and path:
+            out.setdefault(mod, []).append(path)
+    return out
+
+
+def _common_module_prefix(paths: list[str], project_path: str | None) -> str | None:
+    """一组文件的**模块根目录**：取最长公共目录前缀，再收窄到"含构建清单/是基线真实目录"的那一层。
+
+    `ruoyi-admin/src/main/java/…` + `ruoyi-admin/src/main/resources/…` → 公共前缀
+    `ruoyi-admin/src/main` → 逐级上溯，取**基线里真实存在**且最接近根的模块目录 → `ruoyi-admin`。
+    找不到可靠落点 → None（fail-closed：绝不猜）。
+    """
+    if not paths:
+        return None
+    segs = [p.split("/") for p in paths]
+    common: list[str] = []
+    for i in range(min(len(x) for x in segs)):
+        col = {x[i] for x in segs}
+        if len(col) != 1:
+            break
+        common.append(next(iter(col)))
+    if not common:
+        return None
+    # 从公共前缀逐级上溯，取【基线里真实存在的目录】里最短的那一层（= 模块根，不是 src/main/java）
+    base = Path(project_path) if project_path else None
+    for i in range(1, len(common) + 1):
+        cand = "/".join(common[:i])
+        if cand in ("src", "main", "java", "resources"):
+            continue
+        if base is None or (base / cand).is_dir():
+            return cand
+    return None
+
+
+def _inject_templates_into_pom_owners(plan, project_path: str | None,
+                                      file_plan: list | None = None) -> list[str]:
+    """R58-3：给**已被认领**的模块 pom 的 owner 子任务，也嵌入确定性权威模板。
+
+    脚手架只覆盖"无人认领"的 pom；一旦计划里某个写代码的子任务顺手认领了 `<mod>/pom.xml`，
+    它就绕过了确定性模板、由小模型自由发挥 —— round58 实测写出属性引用的 parent 版本 → FATAL。
+    模板是**纯机械产物**，谁写都该照抄同一份。
+    """
+    if not project_path:
+        return []
+    dirs = _module_physical_dirs(plan, project_path, file_plan)
+    touched: list[str] = []
+    for entry in ((plan.shared_contract or {}).get("dependencies") or []):
+        if not isinstance(entry, dict):
+            continue
+        mod = (entry.get("module") or "").strip().rstrip("/")
+        arts = [a for a in (entry.get("artifacts") or []) if a]
+        mdir = dirs.get(mod)
+        if not mod or not mdir:
+            continue
+        pom = f"{mdir}/pom.xml"
+        owner = None
+        for st in plan.subtasks:
+            sc = getattr(st, "scope", None)
+            owns = [_norm_scope_path(f) for f in
+                    (list(getattr(sc, "create_files", None) or [])
+                     + list(getattr(sc, "writable", None) or []))]
+            if pom in owns:
+                owner = st
+                break
+        if owner is None or "权威 pom 模板" in (owner.description or ""):
+            continue
+        _kept, _ = resolve_scaffold_artifacts(project_path, arts)
+        _pgav = None
+        _rg = _root_gav(project_path)
+        if _rg and "/" in mdir:      # R57-7：住在聚合目录下 → parent 是聚合父，不是根
+            _pgav = (_rg[0], mdir.rsplit("/", 1)[0].rsplit("/", 1)[-1], _rg[2])
+        tpl = _deterministic_pom_template(mod, [], project_path, resolved=_kept,
+                                          parent_gav=_pgav)
+        if not tpl:
+            continue
+        owner.description = (owner.description or "") + (
+            f"\n【权威 pom 模板（确定性生成，原样写入 {pom}；parent 版本必须是**字面量**，"
+            f"绝不可写成 ${{...}} 属性引用——Maven 解析 parent 时尚未加载父 pom，属性永远解析不了，"
+            f"整棵 reactor 会读不出）】\n```xml\n{tpl}\n```")
+        touched.append(owner.id)
+    if touched:
+        logger.warning(
+            "[SCAFFOLD-INJECT] R58-3 %d 个子任务自行认领了模块 pom（不走脚手架）→ 已把**确定性权威模板**"
+            "嵌进它们的 description：%s —— 有 owner ≠ 有模板；小模型手写 pom 会写出属性引用的 parent "
+            "版本，pom 解析期就崩（round58 实锤死因）", len(touched), touched[:8])
+    return touched
 
 
 def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
@@ -579,7 +691,7 @@ def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
 
 
 def inject_build_scaffold_subtasks(
-    plan, project_path: str | None = None,
+    plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
     """R39-4：规则5 落空模块 → 确定性注入构建文件脚手架子任务（零 LLM）。
 
@@ -593,6 +705,14 @@ def inject_build_scaffold_subtasks(
     - parallel_groups 完整性守约（validate_plan_structure 要求全员入组）。
     返回机读清单 [{module, subtask_id, artifacts, pom_exists}]；无落空=[]（幂等）。
     """
+    # R58-3（round58 结构性死因）：**有 owner ≠ 有模板**。
+    # 计划里的 pom 一旦被某个写代码的子任务"认领"，旧规则就不建脚手架 → 那个 pom **完全没经过
+    # 确定性模板**、由小模型手写 → 写出 `<parent><version>${ruoyi.version}</version>`（属性引用，
+    # Maven 解析 parent 时还没加载父 pom → 永远解析不了）→ **pom 解析期崩塌、整棵 reactor 读不出**。
+    # R45-2 的全部意义（"pom 是纯机械产物，别让小模型编"）在这条路径上完全落空。
+    # 治：**认领者也必须拿到确定性权威模板**（嵌进 description，让它抄而不是编）。
+    _inject_templates_into_pom_owners(plan, project_path, file_plan)
+
     entries = unclaimed_contract_deps(plan)
     if not entries:
         return []
@@ -603,7 +723,7 @@ def inject_build_scaffold_subtasks(
     # 取证要求（二者其一，独立于契约自身——否则是循环论证）：
     #   ① 计划里有子任务往 `<mod>/` 下写**代码**（pom 本身不算：那正是我们要造的东西）；
     #   ② 它已在基线根 manifest 的模块清单里（棕地既有模块，本轮无人动它也仍是真模块）。
-    _dirs = _module_physical_dirs(plan, project_path)
+    _dirs = _module_physical_dirs(plan, project_path, file_plan)
     _rejected = [e["module"] for e in entries if e["module"] not in _dirs]
     if _rejected:
         logger.warning(

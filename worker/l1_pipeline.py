@@ -424,6 +424,64 @@ def _prune_dep_blocks(text: str, group: str, artifact: str,
 
 
 
+def _fix_parent_version_literal(text: str, root_text: str) -> str | None:
+    """R58-2：把 `<parent><version>` 里的**属性引用**还原成字面量 → 新文本；无需改则 None。
+
+    ★Maven 硬规则★ parent 的版本**必须是字面量**：属性定义在**父 pom 里**，而 Maven 解析
+    parent 坐标时**还没加载父 pom**（先有鸡还是先有蛋）→ `${x.version}` 永远解析不了。
+
+    round58 死因实锤：
+        [FATAL] Non-resolvable parent POM for com.ruoyi:alarm-api:${ruoyi.version}:
+                Could not find artifact com.ruoyi:ruoyi:pom:${ruoyi.version}
+    这是 **pom 解析期**崩塌 → 整棵 reactor 读不出 → 全员构建闸 BLOCKED（round51-53 同一死法）。
+
+    fail-open：根 pom 拿不到**字面** version（继承 GAV 等）→ 不动（绝不猜版本）。
+    只动 <parent> 块内的 version——依赖块里的 `${...}` 版本是**合法的**，误改会毁掉工程统一版本。
+    """
+    m = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    if not m:
+        return None
+    inner = m.group(1)
+    vm = re.search(r"<version>\s*(\$\{[^}]+\})\s*</version>", inner)
+    if not vm:
+        return None   # 已是字面量（或没写 version）→ 一个字符都不动
+    rv = re.search(r"<version>\s*([^<${\s][^<]*?)\s*</version>",
+                   re.sub(r"<(dependencies|dependencyManagement|build|parent)>.*?</\1>", "",
+                          re.sub(r"<!--.*?-->", "", root_text, flags=re.S), flags=re.S))
+    if not rv:
+        return None   # 根 pom 无字面 version → fail-open，绝不猜
+    fixed_inner = inner.replace(vm.group(0), f"<version>{rv.group(1).strip()}</version>", 1)
+    return text.replace(m.group(0), f"<parent>{fixed_inner}</parent>", 1)
+
+
+def _enforce_parent_version_literals(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """R58-2：构建前把全树 pom 的 parent 属性版本还原成字面量（比依赖合法性闸更早、更致命）。"""
+    root_text = _read_project_file(project_path, "pom.xml", timeout=20)
+    if not root_text:
+        return 0, []
+    _ec, gout, _e = _run_check_split(
+        "find . -name pom.xml -not -path '*/target/*' 2>/dev/null", project_path, timeout=30)
+    if _ec != 0:
+        logger.warning("[L1.2.1·parent-version] manifest 扫描失败(ec=%s) → 本轮闸未运行", _ec)
+        return 0, []
+    changed: list[str] = []
+    for rel in sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})[:60]:
+        if rel == "pom.xml":
+            continue   # 根 pom 的 parent（若有）指向工程外，不归本闸管
+        t = _read_project_file(project_path, rel, timeout=20)
+        if not t:
+            continue
+        new = _fix_parent_version_literal(t, root_text)
+        if new and _write_project_file(project_path, rel, new, timeout=20):
+            changed.append(rel)
+    if changed:
+        logger.warning(
+            "[L1.2.1·parent-version] R58-2 %d 个 pom 的 <parent><version> 是属性引用 → 还原为字面量：%s"
+            "\n  Maven 解析 parent 时还没加载父 pom，属性永远解析不了 → pom 解析期崩塌、整棵 reactor "
+            "读不出、全员构建闸 BLOCKED（round58 实锤死因）", len(changed), changed[:8])
+    return len(changed), changed
+
+
 def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[str]]:
     """R56-5：构建**之前**对全树 pom 施加依赖合法性不变量（state-driven，不看 Maven 报什么错）。
 
@@ -3351,6 +3409,14 @@ def run_l1_pipeline(
         # 而不是等它炸出 `Could not resolve` 再按错误文本逐形态打补丁（error-driven=打地鼠）。
         if str(build_cmd).lstrip().startswith("mvn"):
             try:
+                # R58-2：parent 版本必须是字面量——它比依赖合法性更早、更致命（parent 解析不了
+                # 连 pom 都读不出，谈不上依赖）。故排在合法性闸**之前**。
+                _pv_n, _pv_files = _enforce_parent_version_literals(project_path, timeout)
+                if _pv_files:
+                    _rfp = details.setdefault("repaired_file_paths", [])
+                    for _f in _pv_files:
+                        if _f not in _rfp:
+                            _rfp.append(_f)
                 _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout)
                 if _dl_files:
                     _rfp = details.setdefault("repaired_file_paths", [])
