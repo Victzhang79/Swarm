@@ -980,6 +980,7 @@ def merge_diffs(
     base_reader: BaseReader | None = None,
     auto_resolve: bool = True,
     subtask_order: list[str] | None = None,
+    file_owner: "Callable[[str], str | None] | None" = None,
 ) -> MergeResult:
     """Merge unified diffs from multiple subtasks.
 
@@ -1138,11 +1139,35 @@ def merge_diffs(
                 if len(distinct) == 1:
                     chosen_sid = next(iter(by_sid_new))            # 全一致 → 取一
                 else:
-                    chosen_sid = min(                              # 不一致 → 拓扑最上游
-                        by_sid_new,
-                        key=lambda s: order_prio.get(s, len(order_prio) + list(by_sid_new).index(s)),
-                    )
-                    _dropped_new_sids = [s for s in by_sid_new if s != chosen_sid]
+                    # R57-6（round57 MERGE 死循环）：**声明了写权的 owner 优先**。
+                    # 实锤：确定性修复（版本注入/合法性闸/模块注册）会在 worker 沙箱里改**别的模块**
+                    # 的 pom，这些足迹随 pull-back 进了该 worker 的 diff → **每个 worker 都成了全树
+                    # pom 的"写者"**，尽管它们 scope 里根本没有这些文件。旧裁决按"拓扑最上游"选，
+                    # 于是选中了一个**碰过但不拥有**该文件的子任务（st-16），把真正 owner（脚手架的
+                    # 确定性权威模板）丢进 rebase 重生成 → 重做 → 修复又碰 → 又多写者 → **不收敛**
+                    # （实测两轮 rebase=10 冲突集完全相同）。
+                    # owner = 计划里**声明**该文件写权的子任务；非 owner 的修复足迹不参与内容竞争，
+                    # 也**不该被 rebase 重做**（它本就不拥有该文件，重做多少次还会被修复碰到）。
+                    # ★file_owner 只对【计划里写权唯一】的文件返回 owner★（见调用点）：
+                    # 若 ≥2 个子任务都声明了该文件的写权 → 那是**真多写者**，必须退回旧行为
+                    # （拓扑选 + rebase 记账）——静默丢掉一个真写者的产出会违反 D2 铁律
+                    # 「非选中写者不再静默丢弃」。
+                    _owner = file_owner(file_path) if file_owner else None
+                    if _owner in by_sid_new:
+                        chosen_sid = _owner
+                        _dropped_new_sids = []      # 非 owner 只是"碰过" → 丢弃其内容即可，不重做
+                        logger.warning(
+                            "[MERGE] R57-6 新文件 %s 多写者：取**声明写权的 owner** %s；"
+                            "其余 %s 只是确定性修复碰过（非 owner）→ 丢弃其版本、**不进 rebase**"
+                            "（它们重做多少次还会被修复碰到 → 那正是 rebase 不收敛的根源）",
+                            file_path, _owner, [s for s in by_sid_new if s != _owner])
+                    else:
+                        chosen_sid = min(                          # 无 owner 证据 → 退回拓扑最上游
+                            by_sid_new,
+                            key=lambda s: order_prio.get(
+                                s, len(order_prio) + list(by_sid_new).index(s)),
+                        )
+                        _dropped_new_sids = [s for s in by_sid_new if s != chosen_sid]
                     # D2（阶段6，登记册 §五）：非选中写者不再静默丢——并入 rebase 通道
                     # （merge 后该文件已在树，重派 worker 在其上重生成；账面不再假成功）。
                     rebase_subtask_ids_all.extend(_dropped_new_sids)

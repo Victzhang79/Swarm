@@ -560,6 +560,13 @@ def _attempt_maven_version_repair(
         # 留着它 → `Could not resolve dependencies` → 整个模块解析失败、连坐下游。剪除 + 响亮日志：
         # 缺依赖是可归因的编译错，幻影坐标是模块级的解析崩塌。
         _is_reactor = artifact in (_reactor_mods or set())
+        # ★R57-3（round57 near-miss 实锤）★ reactor 成员**永远不许**据"仓库查无"剪除——
+        # 工程模块本来就不在远程仓库里，查无是**正常**的，不是罪证。实测 `com.ruoyi:ruoyi`
+        # （工程根模块自己）走到了第三方分支、被判"仓库确证查无 → 确定性剪除"，只因当时
+        # 恰好没有 pom 声明它（0 pom）才没酿成删除合法依赖。同一条不变量在 dep_legality
+        # 的规则①里挡住了，这条老分支却漏了——**打地鼠遗产：一个不变量两处实现，只有一处对。**
+        if _is_reactor:
+            continue   # 它的版本由 reactor 承接（真缺 version 由上面的 R53-2 分支注入）
         _phantom_internal = (_proj_group and group == _proj_group and not _is_reactor)
         # 幻影内部模块无需查仓库（工程模块从不在远程仓库里）；其余去查——但 R56-6 铁律：
         # 只有【仓库确证查无】(reachable=True 且空) 才敢剪；【仓库没连上】绝不剪（证据缺失≠否定证据，

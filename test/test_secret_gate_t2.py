@@ -218,7 +218,7 @@ def _patch_merge_engine(monkeypatch, merged_diff: str):
     from swarm.brain import merge_engine
     from swarm.brain import nodes as brain_nodes
 
-    def _fake_merge_diffs(subtask_diffs, *, base_reader=None, subtask_order=None):
+    def _fake_merge_diffs(subtask_diffs, *, base_reader=None, subtask_order=None, **_kw):
         return merge_engine.MergeResult(merged_diff=merged_diff, success=True)
 
     monkeypatch.setattr(merge_engine, "merge_diffs", _fake_merge_diffs)
@@ -326,7 +326,7 @@ def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
     from swarm.brain.nodes import merge
     from swarm.types import WorkerOutput
 
-    def _fake_merge_diffs(subtask_diffs, *, base_reader=None, subtask_order=None):
+    def _fake_merge_diffs(subtask_diffs, *, base_reader=None, subtask_order=None, **_kw):
         # rebase_subtask_ids 非空 + 无冲突 + success=True → 触发 over_limit clean-accept 分支
         return merge_engine.MergeResult(
             merged_diff=merged_diff, success=True, conflicts=[], rebase_subtask_ids=["st-1"],

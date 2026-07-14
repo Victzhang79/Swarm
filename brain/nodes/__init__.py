@@ -3386,10 +3386,23 @@ def merge(state: BrainState) -> dict:
     plan = state.get("plan")
     subtask_order = plan.topological_order() if plan is not None else None
 
+    # R57-6：文件写权归属（计划声明的 owner）——多写者裁决据此选，绝不让"确定性修复碰过"的
+    # 子任务顶掉真 owner（那会把脚手架的确定性权威模板挤掉，并让 rebase 永不收敛）。
+    _claims: dict[str, set[str]] = {}
+    for _st in (getattr(plan, "subtasks", None) or []):
+        _sc = getattr(_st, "scope", None)
+        for _f in (list(getattr(_sc, "create_files", None) or [])
+                   + list(getattr(_sc, "writable", None) or [])):
+            _claims.setdefault(str(_f).replace("\\", "/").lstrip("./"), set()).add(_st.id)
+    # ★只认【写权唯一】的文件★：若 ≥2 个子任务都声明写权 → 那是真多写者，退回旧行为
+    # （拓扑选 + rebase 记账），绝不静默丢掉一个真写者的产出（D2 铁律）。
+    _owners: dict[str, str] = {f: next(iter(o)) for f, o in _claims.items() if len(o) == 1}
+
     result = merge_diffs(
         subtask_diffs,
         base_reader=_make_base_reader(state),
         subtask_order=subtask_order,
+        file_owner=_owners.get,
     )
 
     if result.conflicts:

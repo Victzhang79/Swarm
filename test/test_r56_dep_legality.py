@@ -222,3 +222,79 @@ def test_commented_out_dependency_is_ignored_and_real_one_with_inline_comment_is
     assert "ruoyi-phantom" not in out, "含行内注释的真幻影依赖必须被真正剪掉（不能只判不改）"
     assert "old-thing" in out, "被注释掉的依赖不是真依赖，不该被当成处置对象"
     assert len(actions) == 1
+
+
+# ── R57-2：名字写错（加了工程前缀）→ 必须**改名**，不是剪除 ──────────────────
+
+def test_sibling_with_project_prefix_is_renamed_not_pruned():
+    """★R57-2 P0（round57 实锤）★ LLM 给兄弟模块 artifactId 统一加了工程前缀 → 必须确定性改名。
+
+    实锤：alarm-web/pom.xml 依赖 5 个兄弟模块，全写成 `ruoyi-alarm-core` / `ruoyi-alarm-engine`…
+    （根 artifactId 就叫 ruoyi）。旧闸判"永不可解析"**正确**，但把 5 条**真实兄弟依赖全剪光**
+    → alarm-web 编译期满屏 cannot-find-symbol。这是把"可确定性修复的错"降级成了"不可逆的剪除"。
+
+    铁律：**剪除是最后手段，能修则修**。判据必须零歧义——去掉工程前缀后**唯一**命中一个工作区成员。
+    """
+    for real in ("alarm-core", "alarm-engine", "alarm-schedule", "alarm-security", "alarm-api"):
+        dep = {"namespace": NS, "name": f"ruoyi-{real}",
+               "version": "${project.version}", "block": ""}
+        v, why = classify(dep, namespace=NS,
+                          workspace_members={"ruoyi", *[
+                              "alarm-core", "alarm-engine", "alarm-schedule",
+                              "alarm-security", "alarm-api"]},
+                          managed=set(), managed_unknown=False,
+                          registry_versions=_reg({}), root_name="ruoyi")
+        assert v == "fix_name", f"{dep['name']} 应改名到 {real}，而不是 {v}：{why}"
+        assert real in why
+
+
+def test_ambiguous_near_miss_name_is_pruned_never_guessed():
+    """去掉前缀后命中**多个**成员（或零个）→ 一律剪除，**绝不猜**（猜错=接错模块，比缺依赖更毒）。"""
+    dep = {"namespace": NS, "name": "ruoyi-common", "version": None, "block": ""}
+    # 工作区里没有 common → 无候选 → 剪
+    v, _ = classify(dep, namespace=NS, workspace_members={"ruoyi", "alarm-core"},
+                    managed=set(), managed_unknown=False,
+                    registry_versions=_reg({}), root_name="ruoyi")
+    assert v == "prune"
+
+
+def test_enforce_renames_sibling_deps_end_to_end():
+    """端到端：alarm-web 的 5 条兄弟依赖被改名（而非剪除），版本引用原样保留。"""
+    pom = """<project>
+    <artifactId>alarm-web</artifactId>
+    <dependencies>
+        <dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-alarm-core</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-alarm-api</artifactId><version>${project.version}</version></dependency>
+    </dependencies>
+</project>
+"""
+    root = ("<project><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+            "<modules><module>alarm-core</module><module>alarm-api</module>"
+            "<module>alarm-web</module></modules></project>")
+    new, actions = enforce(
+        {"alarm-web/pom.xml": pom}, root_text=root, namespace=NS,
+        workspace_members={"ruoyi", "alarm-core", "alarm-api", "alarm-web"},
+        registry_versions=_reg({}), root_name="ruoyi",
+    )
+    out = new["alarm-web/pom.xml"]
+    assert "<artifactId>alarm-core</artifactId>" in out and "ruoyi-alarm-core" not in out
+    assert "<artifactId>alarm-api</artifactId>" in out and "ruoyi-alarm-api" not in out
+    assert out.count("${project.version}") == 2, "版本引用必须原样保留（由 reactor 承接）"
+    assert len(actions) == 2 and all("fix_name" in a for a in actions)
+
+
+def test_reactor_member_is_never_pruned_by_registry_evidence():
+    """★R57-3（round57 near-miss）★ reactor 成员在远程仓库里查无是**正常的**，不是罪证。
+
+    实锤：`com.ruoyi:ruoyi`（工程根模块自己）走进第三方分支 → "仓库确证查无 → 确定性剪除"，
+    只因当时恰好没有 pom 声明它（0 pom）才没删掉合法依赖。
+    规则①（工作区成员优先）必须在**任何**查仓库的判定之前短路——工程模块从不由仓库解析。
+    """
+    def _boom(ns, name):
+        raise AssertionError("工作区成员绝不该去查仓库（查了必然查无 → 必然误剪）")
+
+    for ver in (None, "4.8.3", "${project.version}"):
+        dep = {"namespace": NS, "name": "ruoyi", "version": ver, "block": ""}
+        v, why = classify(dep, namespace=NS, workspace_members=MEMBERS, managed=set(),
+                          managed_unknown=False, registry_versions=_boom)
+        assert v == "legal", f"reactor 成员(version={ver}) 必须直接判合法：{why}"

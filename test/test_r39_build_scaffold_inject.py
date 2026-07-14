@@ -333,3 +333,150 @@ def test_r47_f2_exclusion_artifact_not_treated_as_dep(tmp_path):
         "</dependency></dependencies></dependencyManagement></project>", "utf-8")
     from swarm.brain.contract_utils import _dep_group_from_baseline
     assert _dep_group_from_baseline(str(tmp_path), "commons-logging") is None
+
+
+# ── R57-1：契约里的模块名必须有【独立证据】才允许在磁盘上造出模块 ──────────────
+
+def test_scaffold_refuses_module_names_with_no_code_evidence(tmp_path, caplog):
+    """★R57-1 P0（round57 实锤）★ LLM 把 schema 占位符抄成模块名 → 脚手架凭空造出垃圾模块。
+
+    实锤：契约里出现 `{"module": "module", ...}` 与 `{"module": "artifacts", ...}`
+    （真实模块只有 alarm-*）。旧实现对模块名**零取证**，无条件建 `module/pom.xml`、
+    `artifacts/pom.xml` → 真的在磁盘上长出两个垃圾目录 → 污染 reactor。
+
+    铁律：**光凭契约里一个字符串，不足以在磁盘上造一个模块。**
+    必须有独立证据：计划里有子任务往 `<mod>/` 下写代码（pom 本身不算——那是循环论证）。
+    """
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["alarm-web/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "alarm-web", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "module", "artifacts": ["org.projectlombok:lombok"]},      # ← schema 占位符
+        {"module": "artifacts", "artifacts": ["org.projectlombok:lombok"]},   # ← schema 占位符
+    ]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    mods = {e["module"] for e in injected}
+    assert mods == {"alarm-core", "alarm-web"}, f"无代码证据的模块名必须拒绝脚手架，实得 {mods}"
+    assert not any(st.id.startswith("st-scaffold-module") for st in plan.subtasks)
+    assert not any(st.id.startswith("st-scaffold-artifacts") for st in plan.subtasks)
+
+
+def test_scaffold_accepts_module_present_in_baseline_reactor(tmp_path):
+    """基线里**真实存在的模块目录**（棕地既有模块）→ 即便本轮无人写它的代码，也是真模块，允许补 pom。
+
+    证据必须是**栈中立**的：目录存在（任何栈的模块都有目录），而不是去解析某一种构建清单。
+    """
+    (tmp_path / "pom.xml").write_text(
+        "<project><artifactId>ruoyi</artifactId>"
+        "<modules><module>ruoyi-common</module></modules></project>", encoding="utf-8")
+    (tmp_path / "ruoyi-common" / "src").mkdir(parents=True)   # 棕地既有模块：目录真实存在
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["alarm-web/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "alarm-web", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "ruoyi-common", "artifacts": ["org.projectlombok:lombok"]},  # 基线真模块
+    ]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    assert "ruoyi-common" in {e["module"] for e in injected}, "基线 reactor 成员是真模块，必须允许"
+
+
+# ── R57-4：模块的【物理落点】必须由计划 scope 自证；契约模块名只是标签 ────────────
+
+def test_scaffold_pom_lands_where_the_code_actually_lives(tmp_path):
+    """★R57-4 P0（round57 头号杀手）★ 脚手架把 pom 建在了【契约模块名】处，而代码在别的目录。
+
+    round57 实锤：契约模块名是 `alarm-core`，脚手架就建 `alarm-core/pom.xml`（根级），
+    但计划里的代码全落在 `ruoyi-alarm/alarm-core/` 下 → 两套口径分叉：
+      · st-13 验收 `mvn compile -pl ruoyi-alarm/alarm-interface -am` → reactor 里找不到该项目
+      · st-21 验收 `test -f ruoyi-alarm/pom.xml` → 父 POM 根本没人建
+    → 3 个子任务全灭 → 阶梯三保 build → **连坐放弃下游 69 个**（一条根因炸掉 79% 的计划）。
+
+    铁律：**模块 = 物理路径**，由计划的真实 scope 自证；契约里的模块名只是个标签。
+    """
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-web/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "alarm-web", "artifacts": ["org.projectlombok:lombok"]},
+    ]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    poms = {f for e in injected
+            for st in plan.subtasks if st.id == e["subtask_id"]
+            for f in (list(st.scope.create_files) + list(st.scope.writable))}
+    assert "ruoyi-alarm/alarm-core/pom.xml" in poms, f"pom 必须建在代码真实所在处，实得 {poms}"
+    assert "ruoyi-alarm/alarm-web/pom.xml" in poms
+    assert "alarm-core/pom.xml" not in poms, "绝不能按契约模块名字面建在根级（口径分叉的源头）"
+
+
+def test_aggregator_parent_pom_is_scaffolded_first(tmp_path):
+    """★R57-4b★ 子模块都在 `ruoyi-alarm/` 下 → 聚合父 POM 必须**确定性地先建出来**。
+
+    round57 实锤：父 POM `ruoyi-alarm/pom.xml` 的创建权被分给了 st-1，而 st-1 又依赖
+    st-13/21/39 → **依赖顺序死结** → 那三个子任务编译时父 POM 不存在 → 全灭。
+    父聚合模块拓扑上必须先于所有子模块，且**不依赖任何子模块**。
+    """
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-web/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "alarm-web", "artifacts": ["org.projectlombok:lombok"]},
+    ]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+    agg = next((st for st in plan.subtasks
+                if "ruoyi-alarm/pom.xml" in (list(st.scope.create_files)
+                                             + list(st.scope.writable))), None)
+    assert agg is not None, "聚合父 POM 必须有确定性的创建者（否则子模块永远编译不了）"
+    assert not agg.depends_on, "父聚合模块绝不能依赖任何子模块（那正是 round57 的依赖死结）"
+    kids = [st for st in plan.subtasks
+            if st.id.startswith("st-scaffold-") and st.id != agg.id]
+    assert kids and all(agg.id in st.depends_on for st in kids), "子模块脚手架必须依赖父 POM 先建好"
+
+
+# ── R57-7：parent GAV 必须与【真实的上级 pom】一致（发版前推演揪出，未进 E2E 就治） ──
+
+def test_child_module_parent_gav_matches_the_aggregator_not_the_root(tmp_path):
+    """★R57-7（推演揪出，round57 的 FATAL 原文）★ 子模块的 <parent> 必须指向**真实上级 pom**。
+
+    Maven 的 <parent> 默认 relativePath 是 `../pom.xml`。模块住在 `ruoyi-alarm/alarm-core/` 时，
+    `../pom.xml` = `ruoyi-alarm/pom.xml`（聚合父）。若模板把 parent GAV 写成**根工程**的坐标，
+    二者对不上 → Maven 直接 FATAL（round57 实锤原文）：
+        Non-resolvable parent POM for com.ruoyi:ruoyi-alarm-security:
+        Could not find artifact com.ruoyi:ruoyi-alarm:pom ... 'parent.relativePath' points at wrong local POM
+
+    R57-4b 注入聚合父之后，这条**必然**发生——不推演就发版，round58 会死在一模一样的错误上。
+    """
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version>"
+        "<packaging>pom</packaging></project>", encoding="utf-8")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-web/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "alarm-web", "artifacts": ["org.projectlombok:lombok"]},
+    ]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    child = next(st for st in plan.subtasks if st.id == "st-scaffold-alarm-core")
+    assert "<artifactId>ruoyi-alarm</artifactId>" in child.description, (
+        "子模块的 parent 必须是**聚合父** ruoyi-alarm，不是根工程 ruoyi"
+        "（写根工程 → relativePath ../pom.xml 指到聚合父 → GAV 对不上 → FATAL）")
+
+    agg = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm")
+    assert "<packaging>pom</packaging>" in agg.description, "聚合父必须是 packaging=pom"
+    assert "<artifactId>ruoyi</artifactId>" in agg.description, "聚合父自己的 parent = 根工程"
+    for m in ("<module>alarm-core</module>", "<module>alarm-web</module>"):
+        assert m in agg.description, f"聚合父必须登记子模块 {m}"
+    assert injected

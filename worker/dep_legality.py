@@ -81,6 +81,14 @@ class ManifestDriver(Protocol):
         """把一条依赖的命名空间改写为工程命名空间（Maven=groupId）。"""
         ...
 
+    def rewrite_name(self, block: str, name: str) -> str:
+        """把一条依赖的名字改写为真工作区成员名（Maven=artifactId）。R57-2。"""
+        ...
+
+    def root_name(self, root_text: str) -> str | None:
+        """工程根自身的名字（Maven=根 pom 的 artifactId）——用于识别"工程前缀"。"""
+        ...
+
     def remove(self, text: str, block: str) -> str:
         """从 manifest 文本里删除这条依赖（连同其周边空白）。"""
         ...
@@ -148,6 +156,20 @@ class MavenDriver:
         # 无 groupId（少见）→ 补一个，绝不留空命名空间
         return block.replace("<dependency>", f"<dependency><groupId>{namespace}</groupId>", 1)
 
+    def rewrite_name(self, block: str, name: str) -> str:
+        return re.sub(r"(<artifactId>\s*)[^<\s]+(\s*</artifactId>)",
+                      rf"\g<1>{name}\g<2>", block, count=1)
+
+    def root_name(self, root_text: str) -> str | None:
+        """根 pom 自身 artifactId（剥掉 parent / 依赖 / 受管块后的第一个）。"""
+        body = self._strip(root_text)
+        body = re.sub(r"<parent>.*?</parent>", "", body, flags=re.S)
+        body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", body, flags=re.S)
+        body = re.sub(r"<dependencies>.*?</dependencies>", "", body, flags=re.S)
+        body = re.sub(r"<build>.*?</build>", "", body, flags=re.S)
+        m = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
+        return m.group(1) if m else None
+
     def remove(self, text: str, block: str) -> str:
         return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
 
@@ -161,15 +183,41 @@ def driver_for(stack: str) -> ManifestDriver | None:
     return DRIVERS.get((stack or "").strip().lower())
 
 
+def _resolve_prefixed_member(name: str, workspace_members: set[str],
+                             root_name: str | None) -> str | None:
+    """R57-2：名字写错成「工程前缀 + 真成员名」时，**唯一**地还原出真成员；有歧义则 None。
+
+    round57 实锤：LLM 把 5 个兄弟模块全写成 `ruoyi-alarm-core` / `ruoyi-alarm-engine`…
+    （工程根 artifactId 就叫 `ruoyi`）。它们**全是真实工作区成员**，只是多了个前缀。
+    旧闸只会 prune → alarm-web 失去全部兄弟依赖 → 编译期满屏 cannot-find-symbol。
+
+    ★铁律★ 只接受**零歧义**的还原：剥掉前缀后**恰好命中一个**成员才改名；
+    命中 0 个或 >1 个 → 返回 None（交回 prune）。**绝不猜**——接错模块比缺依赖更毒。
+    """
+    if not name:
+        return None
+    cands = {m for m in workspace_members if m and m != name and name.endswith(f"-{m}")}
+    if root_name:
+        # 最强证据：前缀恰好是工程根名（`{root}-{member}`）
+        strict = {m for m in cands if name == f"{root_name}-{m}"}
+        if len(strict) == 1:
+            return next(iter(strict))
+    return next(iter(cands)) if len(cands) == 1 else None
+
+
 def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
              managed: set[str], managed_unknown: bool,
-             registry_versions) -> tuple[str, str]:
+             registry_versions, root_name: str | None = None) -> tuple[str, str]:
     """判定一条依赖的合法性 → (verdict, reason)。**纯函数，零栈耦合。**
 
-    verdict ∈ {legal, fix_namespace, prune}
+    verdict ∈ {legal, fix_namespace, fix_name, prune}
       · legal          —— 满足三条之一，不动
       · fix_namespace  —— 名字是工作区成员，命名空间却写成外部的 → 改回工程命名空间
+      · fix_name       —— 名字是「工程前缀 + 真成员」→ 确定性改名到真成员（R57-2）
       · prune          —— **可证永不可解析** → 剪除
+
+    ★处置优先级铁律★ **剪除是最后手段，能修则修**。合法性闸此前只有 prune 一条出路，
+    把"可确定性修复的名字错"降级成了"不可逆的删依赖"（round57 实锤：一次剪光 5 条真兄弟依赖）。
 
     registry_versions(namespace, name) -> list[str] | None
       · list  —— 仓库**确证**答复：这些是可用版本（空列表 = 确证"查无此物"）
@@ -189,6 +237,12 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
             return "fix_namespace", (f"{name} 是工作区内部模块，命名空间却写成外部 '{ns}'"
                                      f"（工程模块从不在远程仓库里，此坐标永远拉不到）")
         return "legal", "工作区成员"
+
+    # ②a 名字写错成「工程前缀 + 真成员」（R57-2）→ 确定性改名（**优先于剪除**：能修则修）
+    _real = _resolve_prefixed_member(name, workspace_members, root_name)
+    if _real:
+        return "fix_name", (f"{name} 不是工作区成员，但剥掉工程前缀后**唯一**命中真成员 "
+                            f"'{_real}'（意图明确、零歧义）→ 确定性改名，绝不剪除真兄弟依赖")
 
     # ② 用了工程命名空间、却不是工作区成员 → 幻影模块（不论有无版本，仓库里永远没有它）
     if namespace and ns == namespace:
@@ -221,7 +275,7 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
 
 def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | None,
             workspace_members: set[str], registry_versions,
-            driver: ManifestDriver | None = None,
+            driver: ManifestDriver | None = None, root_name: str | None = None,
             ) -> tuple[dict[str, str], list[str]]:
     """对全工作区 manifest 施加不变量 → (改写后的文本, 处置说明)。纯函数：可确定性单测、可离线。
 
@@ -231,6 +285,8 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
     drv = driver or DRIVERS["maven"]
     managed = drv.managed_names(root_text)
     managed_unknown = drv.managed_unknown(root_text)
+    if root_name is None and hasattr(drv, "root_name"):
+        root_name = drv.root_name(root_text)   # 工程根名自证（识别"工程前缀 + 真成员"的错名）
     new_texts: dict[str, str] = {}
     actions: list[str] = []
 
@@ -240,7 +296,7 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
             verdict, why = classify(
                 dep, namespace=namespace, workspace_members=workspace_members,
                 managed=managed, managed_unknown=managed_unknown,
-                registry_versions=registry_versions,
+                registry_versions=registry_versions, root_name=root_name,
             )
             if verdict == "legal":
                 continue
@@ -258,6 +314,11 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
             before = cur
             if verdict == "fix_namespace" and namespace:
                 cur = cur.replace(blk, drv.rewrite_namespace(blk, namespace), 1)
+            elif verdict == "fix_name":
+                _real = _resolve_prefixed_member(dep["name"], workspace_members, root_name)
+                if not _real:      # 理论上不可能（classify 刚判过）——但绝不盲改
+                    continue
+                cur = cur.replace(blk, drv.rewrite_name(blk, _real), 1)
             elif verdict == "prune":
                 cur = drv.remove(cur, blk)
             if cur == before:

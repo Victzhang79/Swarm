@@ -337,9 +337,64 @@ def _render_dep_block(dep) -> str:
             "        </dependency>")
 
 
+def _root_gav(project_path: str | None) -> tuple[str, str, str] | None:
+    """根 pom 自身 GAV（剥注释/parent/依赖后取坐标区）。继承 GAV 的根 → None（不猜）。"""
+    if not project_path:
+        return None
+    import re as _re
+    f = Path(project_path) / "pom.xml"
+    if not f.is_file():
+        return None
+    txt = _re.sub(r"<!--.*?-->", "", f.read_text("utf-8", errors="replace"), flags=_re.S)
+    head = _re.sub(r"<parent>.*?</parent>", "", txt, flags=_re.S)
+    head = _re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", head, flags=_re.S)
+    head = _re.sub(r"<dependencies>.*?</dependencies>", "", head, flags=_re.S)
+    head = _re.sub(r"<build>.*?</build>", "", head, flags=_re.S)
+    g = _re.search(r"<groupId>([^<]+)</groupId>", head)
+    a = _re.search(r"<artifactId>([^<]+)</artifactId>", head)
+    v = _re.search(r"<version>([^<]+)</version>", head)
+    if not (g and a and v):
+        return None
+    return g.group(1).strip(), a.group(1).strip(), v.group(1).strip()
+
+
+def _aggregator_pom_template(agg_dir: str, submodules: list[str],
+                             project_path: str | None) -> str:
+    """R57-4b：聚合父模块 pom（packaging=pom）的确定性模板。
+
+    ★R57-7（推演揪出）★ 它的 GAV 必须是**可预测的**——因为子模块的 <parent> 要指向它：
+    groupId = 根 groupId；artifactId = **聚合目录名**；version = 根 version。
+    子模块 pom 的 relativePath 默认 `../pom.xml` 正好指到这里，GAV 一致 → Maven 解析得通。
+    """
+    gav = _root_gav(project_path)
+    if not gav:
+        return ""
+    rg, ra, rv = gav
+    mods = "\n".join(f"        <module>{m}</module>" for m in submodules)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<project xmlns="http://maven.apache.org/POM/4.0.0"\n'
+        '         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
+        '         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 '
+        'http://maven.apache.org/xsd/maven-4.0.0.xsd">\n'
+        "    <modelVersion>4.0.0</modelVersion>\n"
+        "    <parent>\n"
+        f"        <groupId>{rg}</groupId>\n"
+        f"        <artifactId>{ra}</artifactId>\n"
+        f"        <version>{rv}</version>\n"
+        "    </parent>\n"
+        f"    <artifactId>{agg_dir.rsplit('/', 1)[-1]}</artifactId>\n"
+        "    <packaging>pom</packaging>\n"
+        "    <modules>\n"
+        f"{mods}\n"
+        "    </modules>\n"
+        "</project>")
+
+
 def _deterministic_pom_template(mod: str, artifacts: list[str],
                                 project_path: str | None,
-                                resolved: list | None = None) -> str:
+                                resolved: list | None = None,
+                                parent_gav: tuple[str, str, str] | None = None) -> str:
     """R45-2：从根 pom parent GAV + 契约 artifacts 确定性生成模块 pom 模板。
 
     根 pom 不可解析/无 project_path → 返回空串（scaffold 退回旧行为，不假装精确）。
@@ -388,9 +443,12 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
             'http://maven.apache.org/xsd/maven-4.0.0.xsd">\n'
             "    <modelVersion>4.0.0</modelVersion>\n"
             "    <parent>\n"
-            f"        <groupId>{g.group(1).strip()}</groupId>\n"
-            f"        <artifactId>{a.group(1).strip()}</artifactId>\n"
-            f"        <version>{v.group(1).strip()}</version>\n"
+            # R57-7：子模块的 <parent> 必须是它**真实的上级 pom**（relativePath 默认 ../pom.xml）。
+            # 住在聚合目录下却把 parent 写成根工程 → GAV 对不上 → Maven FATAL
+            # 'parent.relativePath points at wrong local POM'（round57 实锤原文）。
+            f"        <groupId>{(parent_gav or (g.group(1).strip(), a.group(1).strip(), v.group(1).strip()))[0]}</groupId>\n"
+            f"        <artifactId>{(parent_gav or (g.group(1).strip(), a.group(1).strip(), v.group(1).strip()))[1]}</artifactId>\n"
+            f"        <version>{(parent_gav or (g.group(1).strip(), a.group(1).strip(), v.group(1).strip()))[2]}</version>\n"
             "    </parent>\n"
             f"    <artifactId>{mod}</artifactId>\n"
             "    <packaging>jar</packaging>\n"
@@ -401,6 +459,123 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
     except Exception:  # noqa: BLE001 — 模板生成 fail-open，scaffold 退回旧行为
         logger.warning("[SCAFFOLD-INJECT] pom 模板确定性生成失败（fail-open）", exc_info=True)
         return ""
+
+
+_BUILD_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml",
+                    "go.mod", "package.json", "pyproject.toml")
+
+
+def _module_physical_dirs(plan, project_path: str | None) -> dict[str, str]:
+    """R57-1 + R57-4 合治：契约模块名 → 它在磁盘上的**真实物理目录**（多栈通用，不写死任何栈）。
+
+    ★round57 头号杀手★ 旧实现把契约里的**模块名字面**当**物理路径**（`alarm-core` →
+    根级 `alarm-core/pom.xml`），而计划里的代码其实全落在 `ruoyi-alarm/alarm-core/` 下 →
+    两套口径分叉：脚手架在根级建 pom，验收命令 `mvn -pl ruoyi-alarm/alarm-interface` 却在
+    reactor 里找不到项目 → 3 个子任务全灭 → 阶梯三保 build → **连坐放弃下游 69 个**。
+    这正是 round44 的病根本体（契约【逻辑模块名】≠【物理目录】），当时只治了符号通道。
+
+    **铁律：模块 = 物理路径，由计划的真实 scope 自证；契约里的模块名只是一个标签。**
+
+    取证（证据必须独立于契约自身，否则是循环论证）：
+      ① 计划里有子任务往 `…/<mod>/` 下写/建**非构建清单**文件（即真代码）→ 该目录就是物理落点；
+      ② 基线里 `…/<mod>/` 是真实存在的目录（棕地既有模块）。
+    命中**多个**不同物理目录（歧义）或**零个**（如 LLM 把 schema 占位符 `module`/`artifacts`
+    抄成了模块名）→ **不返回**（fail-closed：绝不凭一个字符串在磁盘上造模块）。
+    """
+    cands: dict[str, set[str]] = {}
+    for st in getattr(plan, "subtasks", []) or []:
+        sc = getattr(st, "scope", None)
+        files = (list(getattr(sc, "create_files", []) or [])
+                 + list(getattr(sc, "writable", []) or []))
+        for f in files:
+            p = _norm_scope_path(f)
+            if "/" not in p or p.endswith(_BUILD_MANIFESTS):
+                continue   # 构建清单不算证据（它正是我们要造的东西）
+            parts = p.split("/")
+            for i, seg in enumerate(parts[:-1]):    # 末段是文件名
+                cands.setdefault(seg, set()).add("/".join(parts[:i + 1]))
+    out: dict[str, str] = {}
+    for mod, dirs in cands.items():
+        if len(dirs) == 1:
+            out[mod] = next(iter(dirs))
+        else:
+            logger.warning(
+                "[SCAFFOLD-INJECT] R57-4 模块名 %r 在计划里对应**多个**物理目录 %s → 歧义，"
+                "拒绝脚手架（绝不猜落点：建错层级=reactor 找不到项目=整批子任务白跑）", mod, sorted(dirs))
+    if project_path:
+        base = Path(project_path)
+        for entry in ((plan.shared_contract or {}).get("dependencies") or []):
+            if not isinstance(entry, dict):
+                continue
+            mod = (entry.get("module") or "").strip().rstrip("/")
+            if mod and mod not in out and (base / mod).is_dir():
+                out[mod] = mod   # 基线里真实存在的目录 = 真模块（棕地）
+    return out
+
+
+def _inject_aggregator_scaffold(plan, entries, dirs: dict[str, str],
+                                project_path: str | None, existing_ids: set,
+                                injected: list) -> str | None:
+    """R57-4b：子模块同处一个**非根**聚合目录时，确定性注入该聚合父 POM 的脚手架（拓扑最先）。
+
+    round57 实锤：子模块都在 `ruoyi-alarm/` 下，而父 POM `ruoyi-alarm/pom.xml` 的创建权被
+    分给了 st-1，st-1 又依赖 st-13/21/39 → **依赖顺序死结** → 那三个子任务编译时父 POM
+    不存在（`Could not find the selected project in the reactor`）→ 全灭 → 阶梯三保 build
+    → **连坐放弃下游 69 个**。父聚合模块**不依赖任何子模块**，必须先于它们落地。
+
+    只在**唯一**聚合目录且**无人认领其 pom** 时注入；歧义/已有 owner → 不动（绝不猜）。
+    """
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    parents = {d.rsplit("/", 1)[0] for m, d in dirs.items()
+               if m in {e["module"] for e in entries} and "/" in d}
+    if len(parents) != 1:
+        return None                      # 无聚合层（模块在根级）或多个聚合层（歧义）→ 不动
+    agg = next(iter(parents))
+    agg_pom = f"{agg}/pom.xml"
+    for st in plan.subtasks:             # 已有人认领父 POM → 不重复注入
+        sc = getattr(st, "scope", None)
+        owns = (list(getattr(sc, "create_files", None) or [])
+                + list(getattr(sc, "writable", None) or []))
+        if agg_pom in [_norm_scope_path(f) for f in owns]:
+            return None
+    sid = f"st-scaffold-{agg.replace('/', '-')}"
+    if sid in existing_ids:
+        return sid
+    exists = bool(project_path) and (Path(project_path) / agg_pom).is_file()
+    sub_names = sorted({d.rsplit("/", 1)[-1] for m, d in dirs.items()
+                        if m in {e["module"] for e in entries} and d.startswith(f"{agg}/")})
+    _agg_tpl = _aggregator_pom_template(agg, sub_names, project_path)
+    scaffold = SubTask(
+        id=sid,
+        description=(
+            f"【构建脚手架·聚合父模块】{'补齐' if exists else '创建'} {agg_pom}："
+            f"packaging=pom 的聚合模块，<modules> 里登记全部子模块 {sub_names}，"
+            f"并把 {agg} 注册进根 pom 的 <modules>。"
+            "\n⚠️ 它是所有子模块的父级：父 POM 不存在 → 子模块一个都编译不了"
+            "（`Could not find the selected project in the reactor`）→ 必须最先落地。"
+            "\n只写构建文件，不写任何业务代码。"
+            + (f"\n【权威 pom 模板（确定性生成，原样写入 {agg_pom}）】\n```xml\n{_agg_tpl}\n```"
+               if _agg_tpl else "")),
+        intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+        difficulty=SubTaskDifficulty.TRIVIAL,
+        scope=FileScope(writable=[agg_pom, "pom.xml"] if exists else ["pom.xml"],
+                        create_files=[] if exists else [agg_pom]),
+        acceptance_criteria=[f"{agg_pom} 存在且 packaging 为 pom",
+                             f"{agg_pom} 的 <modules> 登记了 {sub_names}",
+                             f"根 pom 的 <modules> 里有 {agg}"],
+    )
+    plan.subtasks.append(scaffold)
+    existing_ids.add(sid)
+    if plan.parallel_groups:
+        plan.parallel_groups.insert(0, [sid])   # 拓扑最先
+    injected.append({"module": agg, "subtask_id": sid, "artifacts": [],
+                     "pom_exists": exists, "aggregator": True})
+    logger.warning(
+        "[SCAFFOLD-INJECT] R57-4b 子模块同处聚合目录 %r → 确定性注入父 POM 脚手架 %s（拓扑最先，"
+        "不依赖任何子模块）。round57 实锤：父 POM 没人先建 → 子模块全部 'not in the reactor' → "
+        "连坐放弃 69 个下游子任务。", agg, sid)
+    return sid
 
 
 def inject_build_scaffold_subtasks(
@@ -421,16 +596,42 @@ def inject_build_scaffold_subtasks(
     entries = unclaimed_contract_deps(plan)
     if not entries:
         return []
+    # R57-1 治本（round57 实锤）：**光凭契约里一个字符串，不足以在磁盘上造一个模块。**
+    # LLM 把契约 schema 的占位符原样抄成了模块名（真实出现过 `module` / `artifacts`），
+    # 旧实现对模块名零取证 → 无条件建 `module/pom.xml`、`artifacts/pom.xml` → 磁盘上凭空
+    # 长出垃圾模块、污染 reactor（还得靠依赖合法性闸去替它擦屁股）。
+    # 取证要求（二者其一，独立于契约自身——否则是循环论证）：
+    #   ① 计划里有子任务往 `<mod>/` 下写**代码**（pom 本身不算：那正是我们要造的东西）；
+    #   ② 它已在基线根 manifest 的模块清单里（棕地既有模块，本轮无人动它也仍是真模块）。
+    _dirs = _module_physical_dirs(plan, project_path)
+    _rejected = [e["module"] for e in entries if e["module"] not in _dirs]
+    if _rejected:
+        logger.warning(
+            "[SCAFFOLD-INJECT] R57-1 拒绝为 %d 个**无物理落点**的契约模块名建脚手架（它们不是真模块，"
+            "多半是 LLM 把契约 schema 的占位符抄成了模块名）：%s —— 判据=计划里无人往该目录写代码、"
+            "且基线里也没有该目录。凭空造模块会污染 reactor。",
+            len(_rejected), _rejected)
+        entries = [e for e in entries if e["module"] in _dirs]
+        if not entries:
+            return []
     from swarm.types import FileScope, SubTask, TaskIntent
     injected: list[dict] = []
     existing_ids = {st.id for st in plan.subtasks}
+    # R57-4b：子模块若同处一个**非根**的聚合目录（如 `ruoyi-alarm/alarm-*`），那个聚合父 POM
+    # 必须**确定性地先建出来**。round57 实锤：父 POM 的创建权被分给了 st-1，而 st-1 又依赖
+    # st-13/21/39 → 依赖顺序死结 → 那三个子任务编译时父 POM 不存在 → 全灭 → 连坐 69 个。
+    # 父聚合模块拓扑上必须先于所有子模块，且**不依赖任何子模块**。
+    _agg_id = _inject_aggregator_scaffold(
+        plan, entries, _dirs, project_path, existing_ids, injected)
     for entry in entries:
         mod = entry["module"]
         arts = list(entry["artifacts"])
         sid = f"st-scaffold-{mod}"
         if sid in existing_ids:
             continue  # 幂等兜底（正常情况下注入后 unclaimed 已清零走不到这）
-        pom = f"{mod}/pom.xml"
+        # R57-4：pom 建在**代码真实所在的物理目录**，而不是契约模块名的字面处。
+        _mdir = _dirs[mod]
+        pom = f"{_mdir}/pom.xml"
         # R41 复核 F5：project_path 未知（store 瞬时失败等）时保守按"已存在"走 MODIFY
         # ——CREATE 会让 worker 现造最小 pom 盖掉基线真 pom（clobber 比漏改更致命）
         pom_exists = (not project_path) or (Path(project_path) / pom).is_file()
@@ -452,7 +653,15 @@ def inject_build_scaffold_subtasks(
                 for d in _kept]
         _tpl_block = ""
         if not pom_exists:
-            _tpl = _deterministic_pom_template(mod, arts, project_path, resolved=_kept)
+            # R57-7：住在聚合目录下的子模块，其 <parent> 必须是**聚合父**（relativePath ../pom.xml
+            # 正好指到它），GAV 与聚合模板同源（根 groupId + 聚合目录名 + 根 version）。
+            _pgav = None
+            _rg = _root_gav(project_path)
+            if _rg and "/" in _mdir:
+                _agg_dir = _mdir.rsplit("/", 1)[0]
+                _pgav = (_rg[0], _agg_dir.rsplit("/", 1)[-1], _rg[2])
+            _tpl = _deterministic_pom_template(mod, arts, project_path, resolved=_kept,
+                                               parent_gav=_pgav)
             if _tpl:
                 _tpl_block = (
                     f"\n【权威 pom 模板（确定性生成，原样写入 {pom}；仅当项目另有明确"
@@ -482,7 +691,28 @@ def inject_build_scaffold_subtasks(
         )
         plan.subtasks.append(scaffold)
         existing_ids.add(sid)
-        prefix = mod.rstrip("/") + "/"
+        prefix = _mdir.rstrip("/") + "/"   # R57-4：按**物理目录**判同模块，不按契约模块名
+        # R57-6（round57 MERGE 死循环）：**脚手架独占本模块构建文件写权**。
+        # 实锤：写代码的 st-16/st-29 也在建同一批 `alarm-*/pom.xml` → MERGE 判"多写者内容不一致"
+        # → 确定性取了 LLM 手写版、把脚手架的确定性权威模板丢进 rebase 重生成 → 重做 → 再 MERGE
+        # → **同一批多写者** → 再 rebase……两轮 rebase=10 冲突集完全相同，**不收敛**。
+        # 脚手架存在的全部理由就是"写代码的子任务碰不到构建文件"（R39-4）——把写权从它们手里收回来，
+        # 多写者从源头消失，rebase 循环自然不存在。
+        for st in plan.subtasks:
+            if st.id == sid:
+                continue
+            sc = getattr(st, "scope", None)
+            for _attr in ("create_files", "writable"):
+                _lst = getattr(sc, _attr, None)
+                if not _lst:
+                    continue
+                _keep = [f for f in _lst if _norm_scope_path(f) != pom]
+                if len(_keep) != len(_lst):
+                    logger.warning(
+                        "[SCAFFOLD-INJECT] R57-6 从 %s 的 %s 收回构建文件写权 %s → 脚手架 %s 独占"
+                        "（多写者会让 MERGE 反复 rebase 不收敛，且确定性模板会被 LLM 手写版顶掉）",
+                        st.id, _attr, pom, sid)
+                    setattr(sc, _attr, _keep)
         for st in plan.subtasks:
             if st.id == sid:
                 continue
@@ -492,6 +722,8 @@ def inject_build_scaffold_subtasks(
             if any(str(f).replace("\\", "/").lstrip("/").startswith(prefix)
                    for f in writes) and sid not in st.depends_on:
                 st.depends_on.append(sid)
+        if _agg_id and _agg_id != sid and _agg_id not in scaffold.depends_on:
+            scaffold.depends_on.append(_agg_id)   # R57-4b：父 POM 必须先落地
         if plan.parallel_groups:
             plan.parallel_groups.insert(0, [sid])
         injected.append({"module": mod, "subtask_id": sid,
