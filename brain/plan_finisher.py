@@ -508,6 +508,15 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                                 50000 + 6000 * max(1, len(dom[st.id])))
     except Exception:  # noqa: BLE001
         logger.warning("[PLAN-FINISH] 契约符号安置失败（fail-open）", exc_info=True)
+    try:
+        # R62-Task5：readable 幻影包路径归一到 producer 真实落点（放【末端】——所有
+        # producer 含 domicile 新建者都已就位，落点已定）→ provenance 一致，consumer 编得过。
+        from swarm.brain.contract_utils import align_readable_to_producer
+        _al = align_readable_to_producer(plan, project_path)
+        if _al.get("aligned"):
+            out["readable_aligned"] = _al["aligned"]
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] readable 落点归一失败（fail-open）", exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):
         logger.info(

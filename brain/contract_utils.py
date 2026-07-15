@@ -1004,6 +1004,93 @@ def prune_empty_scope_subtasks(plan) -> list[str]:
     return pruned_all
 
 
+def align_readable_to_producer(plan, project_path: str | None = None) -> dict:
+    """R62-Task5（round62 治本）：readable 幻影包路径确定性归一到 producer 真实落点。
+
+    病根（不变量③ provenance 一致性）：consumer 的 readable 引 `.../sdk/model/
+    AlarmRequest.java`（幻影子路径），但唯一 producer 其实建在 `.../sdk/AlarmRequest.java`
+    → consumer `import sdk.model.X` 编不过（round62 实测 43 条幻影 readable）。依赖边与
+    上下文不一致：worker 拿到看不见的文件路径。
+
+    治：readable 的 basename 若被【恰好一个】producer 的 create_files 产出（=唯一符号、
+    且是 code 文件）且**路径不一致** → 对齐到真实 create 落点。★只归一唯一 producer★：
+    歧义 basename（多 producer，如每模块都有 pom.xml/常见名）绝不动（会误改）；无 producer
+    的 readable（baseline 只读文件）不动（不是幻影）。upstream_artifacts 同步归一。栈中立。
+
+    ★防误改真文件（对抗复核 #1）★：只归一【真幻影】——readable 路径本身既不是任何
+    producer/writable 的真实计划落点、又不是 baseline 磁盘上真实存在的文件（后者是合法
+    只读上下文，同 basename 纯属巧合，绝不把 consumer 重定向到别的同名文件）。返回 {aligned}。
+    """
+    _NON_CODE = {"xml", "yml", "yaml", "properties", "sql", "md",
+                 "html", "htm", "css", "scss", "sass", "less"}
+    subs = getattr(plan, "subtasks", None) or []
+    # basename → 所有 create 落点（只收 code 文件，排 manifest/配置/标记）；并集所有真实计划路径
+    producers: dict[str, set] = {}
+    real_paths: set = set()
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            p = _norm_scope_path(f)
+            real_paths.add(p)
+        for f in (list(getattr(sc, "create_files", None) or [])):
+            p = _norm_scope_path(f)
+            b = p.rsplit("/", 1)[-1]
+            if ("." not in b or b.startswith("pom.")
+                    or b.rsplit(".", 1)[-1].lower() in _NON_CODE):
+                continue
+            producers.setdefault(b, set()).add(p)
+    # 唯一 producer 的 basename → 其真实落点
+    unique = {b: next(iter(ps)) for b, ps in producers.items() if len(ps) == 1}
+    if not unique:
+        return {"aligned": 0}
+    aligned = 0
+    _base = Path(project_path) if project_path else None
+
+    def _is_real(xp: str) -> bool:
+        # 真实计划落点（有人建/改）或 baseline 磁盘既有 → 合法引用，非幻影，绝不动
+        return xp in real_paths or (_base is not None and (_base / xp).is_file())
+
+    def _fix(paths):
+        nonlocal aligned
+        out = []
+        local = []   # (old, new)
+        for x in paths:
+            xp = _norm_scope_path(x)
+            b = xp.rsplit("/", 1)[-1]
+            tgt = unique.get(b)
+            if tgt and tgt != xp and not _is_real(xp):
+                out.append(tgt)
+                aligned += 1
+                local.append((xp, tgt))
+            else:
+                out.append(x)
+        return out, local
+
+    changes: list = []   # (subtask_id, attr, old, new) —— 机读审计（对抗复核 #3）
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        for _attr in ("readable", "upstream_artifacts"):
+            _lst = getattr(sc, _attr, None)
+            if _lst:
+                _new, _local = _fix(_lst)
+                if _local:
+                    # 去重保序
+                    _seen = set()
+                    _dedup = [x for x in _new if not (x in _seen or _seen.add(x))]
+                    setattr(sc, _attr, _dedup)
+                    for _old, _tgt in _local:
+                        changes.append((st.id, _attr, _old, _tgt))
+    if aligned:
+        logger.info(
+            "[PLAN-FINISH] R62-Task5 幻影 readable 包路径归一到 producer 真实落点 %d 条"
+            "（唯一符号 basename 匹配；歧义名/无 producer/真实文件不动）: %s",
+            aligned, [f"{c[0]}:{c[2]}→{c[3]}" for c in changes[:8]])
+    return {"aligned": aligned, "changes": changes}
+
+
 def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                           base_ref: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。

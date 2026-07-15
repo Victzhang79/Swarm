@@ -849,3 +849,101 @@ def test_r62_task3_never_prune_to_empty_plan():
         parallel_groups=[["st-1"]])
     assert prune_empty_scope_subtasks(plan) == []
     assert [s.id for s in plan.subtasks] == ["st-1"]    # 计划恒 ≥1 子任务
+
+
+# ── ⑦ Task5（round62 治本）：readable 幻影包路径归一到 producer 真实落点 ──
+
+def test_r62_task5_phantom_readable_aligned_to_unique_producer():
+    """consumer readable 引幻影子路径 `.../sdk/model/X.java`，唯一 producer 建在
+    `.../sdk/X.java` → 归一到真实落点（provenance 一致，import 编得过）。"""
+    from swarm.brain.contract_utils import align_readable_to_producer
+    plan = TaskPlan(
+        task_id="t-62t5", subtasks=[
+            _st_scope("st-producer", FileScope(
+                create_files=["m/src/main/java/com/x/sdk/AlarmRequest.java"])),
+            _st_scope("st-consumer", FileScope(
+                create_files=["m/src/main/java/com/x/svc/Use.java"],
+                readable=["m/src/main/java/com/x/sdk/model/AlarmRequest.java"],
+                upstream_artifacts=[
+                    "m/src/main/java/com/x/sdk/model/AlarmRequest.java"]))],
+        parallel_groups=[["st-producer", "st-consumer"]])
+    out = align_readable_to_producer(plan)
+    assert out["aligned"] == 2   # readable + upstream_artifacts 各 1
+    consumer = next(s for s in plan.subtasks if s.id == "st-consumer")
+    assert consumer.scope.readable == ["m/src/main/java/com/x/sdk/AlarmRequest.java"]
+    assert consumer.scope.upstream_artifacts == [
+        "m/src/main/java/com/x/sdk/AlarmRequest.java"]
+
+
+def test_r62_task5_ambiguous_basename_not_touched():
+    """歧义 basename（多 producer，如每模块 pom.xml/同名类）绝不归一——避免误改。"""
+    from swarm.brain.contract_utils import align_readable_to_producer
+    plan = TaskPlan(
+        task_id="t-62t5b", subtasks=[
+            _st_scope("st-a", FileScope(create_files=["a/Foo.java", "a/pom.xml"])),
+            _st_scope("st-b", FileScope(create_files=["b/Foo.java", "b/pom.xml"])),
+            _st_scope("st-c", FileScope(
+                create_files=["c/Use.java"],
+                readable=["wrong/Foo.java", "ruoyi-common/pom.xml"]))],
+        parallel_groups=[["st-a", "st-b", "st-c"]])
+    out = align_readable_to_producer(plan)
+    assert out["aligned"] == 0   # Foo.java 多 producer、pom.xml 非 code → 不动
+    stc = next(s for s in plan.subtasks if s.id == "st-c")
+    assert stc.scope.readable == ["wrong/Foo.java", "ruoyi-common/pom.xml"]
+
+
+def test_r62_task5_no_producer_readable_untouched():
+    """无 producer 的 readable（baseline 只读文件）不是幻影 → 不动。"""
+    from swarm.brain.contract_utils import align_readable_to_producer
+    plan = TaskPlan(
+        task_id="t-62t5c", subtasks=[
+            _st_scope("st-1", FileScope(
+                create_files=["m/A.java"],
+                readable=["baseline/only/Existing.java"]))],
+        parallel_groups=[["st-1"]])
+    assert align_readable_to_producer(plan)["aligned"] == 0
+    assert next(s for s in plan.subtasks
+                if s.id == "st-1").scope.readable == ["baseline/only/Existing.java"]
+
+
+def test_r62_task5_real_baseline_same_basename_not_redirected(tmp_path):
+    """★对抗复核 CRITICAL #1★：consumer 读的是【磁盘真实 baseline 文件】，只是恰好与
+    某唯一 producer 同 basename → 绝不重定向（同名纯巧合，不是幻影）。"""
+    from swarm.brain.contract_utils import align_readable_to_producer
+    # 真实 baseline 文件
+    real = tmp_path / "ruoyi-common/src/main/java/com/ruoyi/common/core/domain"
+    real.mkdir(parents=True)
+    (real / "Result.java").write_text("class Result{}", "utf-8")
+    plan = TaskPlan(
+        task_id="t-62t5d", subtasks=[
+            _st_scope("st-prod", FileScope(
+                create_files=["modA/newfeature/Result.java"])),   # 唯一 Result.java
+            _st_scope("st-cons", FileScope(
+                create_files=["modB/Use.java"],
+                readable=[
+                    "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/"
+                    "Result.java"]))],                            # 真 baseline，同名巧合
+        parallel_groups=[["st-prod", "st-cons"]])
+    out = align_readable_to_producer(plan, str(tmp_path))
+    assert out["aligned"] == 0, "磁盘真实 baseline 文件绝不被同名 producer 重定向"
+    cons = next(s for s in plan.subtasks if s.id == "st-cons")
+    assert cons.scope.readable[0].endswith(
+        "ruoyi/common/core/domain/Result.java")
+
+
+def test_r62_task5_real_planned_path_not_redirected():
+    """真实计划落点（别的子任务在建/改的文件）不是幻影 → 同名也不重定向。"""
+    from swarm.brain.contract_utils import align_readable_to_producer
+    plan = TaskPlan(
+        task_id="t-62t5e", subtasks=[
+            _st_scope("st-prod", FileScope(create_files=["modA/deep/Result.java"])),
+            _st_scope("st-other", FileScope(create_files=["modB/other/Result.java"])),
+            _st_scope("st-cons", FileScope(
+                create_files=["modC/Use.java"],
+                readable=["modB/other/Result.java"]))],   # 真实计划落点（st-other 建）
+        parallel_groups=[["st-prod", "st-other", "st-cons"]])
+    # Result.java 有两个 producer（modA, modB）→ 非唯一 → 本就不动；此处额外证真实落点保护
+    out = align_readable_to_producer(plan)
+    assert out["aligned"] == 0
+    cons = next(s for s in plan.subtasks if s.id == "st-cons")
+    assert cons.scope.readable == ["modB/other/Result.java"]
