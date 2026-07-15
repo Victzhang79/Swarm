@@ -119,6 +119,52 @@ def test_no_deps_noop():
     print("  ✅ 无依赖 no-op")
 
 
+def test_r62_scaffold_ordering_edge_never_stripped():
+    """R62-1 治本（round62 死因·结构性边不可剥）：module 脚手架 depends_on 聚合父脚手架的边，
+    零文件重叠 + 无契约（脚手架只建 pom，天然零重叠），但它是 **Maven reactor 磁盘落地顺序**
+    约束——绝不能被 decouple 当假依赖剥掉。
+
+    round62 现场（task 01520400）：inject 正确造了 `st-scaffold-alarm-channel →
+    st-scaffold-ruoyi-alarm` 等 4 条边，decouple 用"文件重叠+契约"启发式（对 reactor 顺序天然盲）
+    把它们全剥了 → module 脚手架空 depends_on → 与聚合父同一并行 wave 派发 →
+    module_registered_before_scaffold（25 次）→ 连坐放弃 → 完成 11→3。
+    判据=**目标 id 以 `st-scaffold-` 开头**（LLM 永不产出此类 id，必为确定性注入器的结构性产物）。
+    """
+    agg = _st("st-scaffold-ruoyi-alarm", create=["ruoyi-alarm/pom.xml"])
+    # module 脚手架：只建自己的 pom（与聚合父零文件重叠、无 contract），depends_on 聚合父
+    channel = _st("st-scaffold-alarm-channel", create=["ruoyi-alarm/alarm-channel/pom.xml"],
+                  depends_on=["st-scaffold-ruoyi-alarm"])
+    engine = _st("st-scaffold-alarm-engine", create=["ruoyi-alarm/alarm-engine/pom.xml"],
+                 depends_on=["st-scaffold-ruoyi-alarm"])
+    # 写代码子任务：depends_on 本模块脚手架（先有 pom 再编译），同样零文件重叠
+    impl = _st("st-impl-1", create=["ruoyi-alarm/alarm-channel/src/X.java"],
+               depends_on=["st-scaffold-alarm-channel"])
+    plan = _plan([agg, channel, engine, impl])
+    removed = _decouple_independent_subtasks(plan)
+    assert removed == 0, f"结构性脚手架排序边被误剥 {removed} 条 = round62 死因复活"
+    by_id = {st.id: st for st in plan.subtasks}
+    assert by_id["st-scaffold-alarm-channel"].depends_on == ["st-scaffold-ruoyi-alarm"]
+    assert by_id["st-scaffold-alarm-engine"].depends_on == ["st-scaffold-ruoyi-alarm"]
+    assert by_id["st-impl-1"].depends_on == ["st-scaffold-alarm-channel"]
+    print("  ✅ 脚手架排序边（module→聚合父 / impl→module）全部保留")
+
+
+def test_r62_llm_owned_pom_edge_preserved_r58_3():
+    """R62 收编（对抗复核 HIGH）：判据用【结构性 _is_scaffold_subtask】而非 id 前缀——覆盖
+    R58-3「有 owner≠有模板」：LLM 认领某 module pom.xml 的子任务【结构上是脚手架但无
+    st-scaffold- id】。code 子任务 depends_on 该 LLM-pom-owner 同样是真构建序（先有 pom 再编译），
+    零文件重叠（pom↔java），旧 id-前缀 guard 漏保 → 被 decouple 误剥（=round62 机制经 R58-3 通道）。
+    """
+    # LLM 认领的 pom owner——注意 id 是普通 st-N，非 st-scaffold-
+    owner = _st("st-7", create=["modx/pom.xml"])
+    code = _st("st-8", create=["modx/src/main/java/Svc.java"], depends_on=["st-7"])
+    plan = _plan([owner, code])
+    removed = _decouple_independent_subtasks(plan)
+    assert removed == 0, "LLM 认领 pom 者（结构性脚手架、无 st-scaffold- id）的入边被误剥"
+    assert plan.subtasks[1].depends_on == ["st-7"]
+    print("  ✅ R58-3 LLM 认领 pom 者的入边保留（结构判据 > id 前缀）")
+
+
 if __name__ == "__main__":
     import sys
     import pytest

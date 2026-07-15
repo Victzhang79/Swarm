@@ -1291,10 +1291,28 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                         )
                         continue
                     deps_st = list(getattr(st, "depends_on", []) or [])
+                    # R62 收编：若 owner 本身是脚手架（如嵌套聚合父 pom），则 st→owner 是
+                    # **结构性继承边**（子模块 pom 的 <parent> 指向聚合父，R57-4b/R61 注入器造），
+                    # 绝不能删——删了就是 round62 死因经 normalize 通道复活（合成多聚合几何实锤：
+                    # owner=st-scaffold-ruoyi-alarm 时旧码把 child→父边 REMOVE 掉再反转）。
+                    # 只对【非脚手架 registrant】（做递归 reactor 构建、真需注册后于脚手架者，
+                    # 如 d37a52a3 建代码的根 registrant）删反向直边。owner 是脚手架时保留继承边；
+                    # 其后 ADD 有 _depends_transitively 守卫，继承边在 → 反向 ADD 自动跳过、绝不成环。
                     if owner.id in deps_st:
-                        deps_st.remove(owner.id)   # 删反向直边：只留单一规范方向
-                        st.depends_on = deps_st
-                        changed = True
+                        if _is_scaffold_inheritance_parent(st, owner):
+                            # owner 是 st 的【继承父】（st 的 module pom 严格嵌套在 owner 的
+                            # module pom 下）→ st→owner 是结构性继承边，保留、不反转（后续 ADD
+                            # 由 _depends_transitively 自动跳过、不成环）。★用边关系判而非目标分类：
+                            # registrant 若只是"注册 st 的模块进根 pom"（无目录嵌套）则照常反正，
+                            # 不误伤 d37a52a3/d1 的注册序。★
+                            logger.info(
+                                "[contract] 规则4 保留结构性继承边 %s→%s（owner 是 st 的继承父，"
+                                "非 registrant；反转会复活 round62 module_registered_before_scaffold）",
+                                st.id, owner.id)
+                        else:
+                            deps_st.remove(owner.id)   # 删反向直边：只留单一规范方向
+                            st.depends_on = deps_st
+                            changed = True
                     if not _depends_transitively(st.id, owner.id):
                         odeps = list(getattr(owner, "depends_on", []) or [])
                         if st.id not in odeps:
@@ -1982,6 +2000,62 @@ def _is_scaffold_subtask(st) -> bool:
     has_pom = any(f.replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml" for f in cf)
     builds_entity = any(f.endswith(".java") and ("/domain/" in f or "/entity/" in f) for f in cf)
     return has_pom and not builds_entity
+
+
+def _module_pom_dirs(st) -> set[str]:
+    """该子任务创建的所有【目录限定 module pom】的模块目录集（排除裸根 `pom.xml`）。"""
+    out: set[str] = set()
+    for f in _st_create_files(st):
+        fn = str(f).replace("\\", "/").lstrip("./")
+        if "/" in fn and fn.rsplit("/", 1)[-1] == "pom.xml":
+            out.add(fn.rsplit("/", 1)[0])
+    return out
+
+
+def _creates_module_pom(st) -> bool:
+    """创建【目录限定的模块 pom】（`<dir>/pom.xml`，**排除裸根 `pom.xml`**）。
+    模块 pom 才有 `<parent>`、才参与继承排序；裸根 pom 是继承树顶（registrant 角色），不算。"""
+    return bool(_module_pom_dirs(st))
+
+
+def _is_scaffold_inheritance_parent(child_st, parent_st) -> bool:
+    """parent_st 是否是 child_st 的【Maven 继承父】：child 建的某 module pom 目录**严格嵌套**在
+    parent 建的某 module pom 目录之下（`child_dir startswith parent_dir + "/"`）。
+
+    这才是"子 pom 的 `<parent>` 要求父 pom 先落地"的**继承结构边**（R57-4b/R61 注入器造），
+    与"**注册边**"（模块登记进根/父 pom 的 `<modules>`，无目录嵌套关系）**本质不同**：
+    registrant 即便自己也建某 module pom（如 st-1 建 ruoyi-alarm/pom.xml + 写根 pom 注册
+    ruoyi-alarm-sdk），只要 st 的模块目录不在它下面（ruoyi-alarm-sdk ⊄ ruoyi-alarm/），
+    就**不是**继承父 → 规则4 照常反正（注册后于脚手架），d37a52a3/d1 保护不动。
+    ★用【边关系】判，而非【目标分类】——同一 owner 可兼任 registrant 与 module 脚手架两角，
+    只有目录嵌套能区分该边到底是"继承"还是"注册"（对抗双复核 + d1 全量回归共同实锤）。★"""
+    child_dirs = _module_pom_dirs(child_st)
+    parent_dirs = _module_pom_dirs(parent_st)
+    return any(cd.startswith(pd + "/") for cd in child_dirs for pd in parent_dirs)
+
+
+def is_structural_scaffold_dep(dep_st) -> bool:
+    """★脚手架排序边【单一权威判据】（R62 收编）★
+
+    一条 `depends_on` 边【指向模块脚手架】即为**确定性构建顺序约束**（Maven 继承地基：
+    子 pom 的 `<parent>` 要求父 pom 先落地；写代码子任务要求本模块 pom 先落地），**绝非**
+    "LLM 误加的假依赖"。任何启发式 pass 都不得【剥】它（decouple 剥离假依赖）或【反转】它
+    （normalize 规则4 registrant-inversion 的 REMOVE 步）。脚手架用 `mvn -f <pom> validate`
+    非递归构建（l1_pipeline:3033），彼此靠注入器造的继承边自排序，不需 registrant 倒挂。
+
+    判据 = 结构性脚手架(`_is_scaffold_subtask`：建 pom + 不建实体) **且** 建【目录限定 module
+    pom】(`_creates_module_pom`)。覆盖两条 provenance：①注入器脚手架(id `st-scaffold-*`，
+    contract_utils:688/814)；②R58-3 LLM 认领某 module pom 者(结构上是脚手架、无 st-scaffold- id)。
+
+    ★为何必须排除裸根 pom（对抗双复核一致 HIGH，两 reviewer 独立实锤）★：`_is_scaffold_subtask`
+    对**创建裸根 `pom.xml` 的 registrant**也判 True。若不排除，normalize 规则4 的 REMOVE 守卫会
+    把根 pom registrant 误当"结构性脚手架"→跳过 registrant-inversion→静默重引 d37a52a3
+    「Child module … does not exist」reactor 中毒（registrant 建 create_files 含裸 pom.xml 时）。
+    仓库既有 `bump_scaffold_difficulty` 用 `_is_scaffold_subtask(st) or writes_root_pom` 早已区分
+    "建根 pom"≠"是模块脚手架"；此处同口径：只有【目录限定 module pom】才是继承地基。
+
+    dep_st=None（悬空依赖，目标不存在）→ False（不臆断，交既有悬空处理）。"""
+    return dep_st is not None and _is_scaffold_subtask(dep_st) and _creates_module_pom(dep_st)
 
 
 def _is_sql_subtask(st) -> bool:

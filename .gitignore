@@ -82,3 +82,9 @@ TASK_REGISTER_*.md
 E2E_ROUND*.md
 UPSTREAM_DOWNSTREAM_TREATMENT.md
 .env.lock
+
+# 离线 record/replay 卡带（从 live checkpoint 抽取的 plan 快照；本地排障件，绝不上传）
+cassettes/
+
+# E2E 陪跑镜像/journal（会话working notes，本地排障用，不入库）
+run_mirrors/

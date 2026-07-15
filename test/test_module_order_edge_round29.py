@@ -165,6 +165,34 @@ def test_rule4_removes_preexisting_reverse_edge_no_2cycle(tmp_path):
     assert "st-6" in reg_d["depends_on"], "规范边必须在 break_dependency_cycles 后确定性存活"
 
 
+def test_rule4_reverse_edge_stripped_when_registrant_declares_root_pom_in_create_files(tmp_path):
+    """★R62 对抗双复核（两 reviewer 独立实锤 HIGH）回归★：registrant 把【已存在的根 pom.xml】
+    误列进 `create_files`（对称于既已处理的 writable 误标）时，`_is_scaffold_subtask` 仅看
+    create_files → 把 registrant 判成"脚手架"。R62 的规则4 REMOVE 守卫若只看 `is_structural_
+    scaffold_dep(owner)` 的目标分类，会误跳 REMOVE → 静默保留 scaffold→registrant 反边 →
+    d37a52a3「Child module … does not exist」reactor 中毒复活。
+
+    治本=`is_structural_scaffold_dep` 要求【目录限定 module pom】：裸根 pom.xml（无目录）不算
+    结构性脚手架 → owner 仍走 REMOVE → 反边被删、规范边补上。本测试锁死 create_files 变体
+    （既有 test_rule4_removes_preexisting_reverse_edge_no_2cycle 只测 writable，漏了此路）。
+    """
+    from swarm.brain.contract_utils import normalize_plan_scopes
+
+    proj = _repo(tmp_path, {"pom.xml": _ROOT_POM})
+    st_reg = _st("st-1", create=["pom.xml"])                                   # 裸根 pom 进 create_files
+    st_scaf = _st("st-6", create=["alarm-interface/pom.xml"], depends=["st-1"])  # d37a52a3 反边预置
+    plan = TaskPlan(subtasks=[st_reg, st_scaf])
+
+    normalize_plan_scopes(plan, project_path=proj)
+
+    reg = next(s for s in plan.subtasks if s.id == "st-1")
+    scaf = next(s for s in plan.subtasks if s.id == "st-6")
+    assert "st-1" not in (scaf.depends_on or []), (
+        f"裸根 registrant 被误当脚手架、反边未删 = d37a52a3 复活，实际 scaf.depends_on={scaf.depends_on}")
+    assert "st-6" in (reg.depends_on or []), (
+        f"registrant 必须依赖 scaffold（规范方向），实际 reg.depends_on={reg.depends_on}")
+
+
 def test_rule4_content_task_still_after_registrant(tmp_path):
     """非脚手架的模块内容子任务仍依赖 registrant（内容 -pl 构建需注册在位），链式 content→reg→scaf。"""
     from swarm.brain.contract_utils import normalize_plan_scopes

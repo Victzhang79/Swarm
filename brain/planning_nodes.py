@@ -2207,6 +2207,8 @@ def _decouple_independent_subtasks(plan_obj) -> int:
     subtasks = getattr(plan_obj, "subtasks", None)
     if not subtasks:
         return 0
+    # 脚手架排序边【单一权威判据】——见 contract_utils.is_structural_scaffold_dep 的不变量。
+    from swarm.brain.contract_utils import is_structural_scaffold_dep
     by_id = {st.id: st for st in subtasks}
 
     def _write_set(st) -> set[str]:
@@ -2237,6 +2239,16 @@ def _decouple_independent_subtasks(plan_obj) -> int:
             dep = by_id.get(dep_id)
             if dep is None:
                 kept.append(dep_id)  # 悬空依赖 ID 保留（不臆断）
+                continue
+            # 条件0（R62 治本·结构性边不可剥）：目标是【脚手架子任务】的边，是确定性构建顺序
+            # 约束（Maven 继承地基：父 pom 先落地、本模块 pom 先落地），绝非"LLM 误加的假依赖"。
+            # decouple 的"文件重叠+契约耦合"启发式对它天然盲（pom↔代码零文件重叠），剥了就是
+            # round62 死因（module 脚手架空 depends_on → 与聚合父同一并行 wave → module_registered_
+            # before_scaffold → 连坐放弃）。判据用【单一权威】is_structural_scaffold_dep（=结构性
+            # _is_scaffold_subtask，非 id 前缀）——同时覆盖注入器脚手架 + R58-3 LLM 认领 pom 者
+            # （对抗复核实锤：后者无 st-scaffold- id 但同样被误剥）。无条件保留。
+            if is_structural_scaffold_dep(dep):
+                kept.append(dep_id)
                 continue
             # 条件3：任一 allow_any → 保留
             if _allow_any(st) or _allow_any(dep):
