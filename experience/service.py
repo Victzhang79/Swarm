@@ -83,7 +83,8 @@ def _merged_skills(dir_list: list[str]) -> list[SkillDoc]:
 
 
 def _render_block(
-    *, stack_langs: set[str], intent: str, phase: str, target: str, budget_chars: int
+    *, stack_langs: set[str], intent: str, phase: str, target: str, budget_chars: int,
+    exclude_tags: set[str] | None = None,
 ) -> str:
     """选择 + 渲染。任一步异常 → ""（fail-open）。"""
     from swarm.config.settings import get_config
@@ -104,6 +105,7 @@ def _render_block(
             budget_chars=budget_chars,
             max_k=cfg.max_k,
             rerank_fn=None,  # P6：rerank 落地后按 cfg.rerank 挂 _llm_rerank；默认确定性
+            exclude_tags=exclude_tags,
         )
         return render_skills_block(picked)
     except Exception as e:  # noqa: BLE001 — advisory，绝不阻断主流程
@@ -341,11 +343,23 @@ def preview_mount_surfaces(doc: SkillDoc) -> dict:
             "note": "单栈理想面模拟；多栈项目候选更多、实际排位可能更靠后"}
 
 
+# G10（审计⑤）：绝不进【大脑 planner】注入面的技能标签——架构分层/端口适配/微服务/领域
+# 拆分类经验都在教"按层/按域切成多个单元"，与 Task#7「module=单一物理 build 单元」硬不变量
+# 正面冲突。planner 只该拿【栈无关、不碰模块划分】的横切经验（api 约定/迁移/错误处理）。
+# 结构性 deny（非内容扫描、非靠预算巧合）——任何新增带这些 tag 的技能都自动挡在大脑之外。
+_PLANNER_DENY_TAGS = frozenset({
+    "architecture", "ddd", "ports-adapters", "hexagonal", "microservices",
+    "microservice", "modularization", "layering", "clean-architecture",
+    "domain-driven-design", "bounded-context",
+})
+
+
 def planner_skills_block(project_stack: dict | None = None) -> str:
     """为 Planner（plan 节点）生成技能注入块。空/禁用/异常 → ""。
 
     栈来自 project_stack；阶段固定 'plan'；意图在规划期尚未拆到子任务，用 '*' 表示
     "不按意图轴过滤"（栈×plan 预筛即可，见 handoff §6）。
+    _PLANNER_DENY_TAGS：结构性挡掉架构分解类技能（G10），防其诱导大脑拆多物理模块。
     """
     try:
         from swarm.config.settings import get_config
@@ -358,6 +372,7 @@ def planner_skills_block(project_stack: dict | None = None) -> str:
             phase="plan",
             target="planner",
             budget_chars=budget,
+            exclude_tags=_PLANNER_DENY_TAGS,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("[skills] planner 注入失败，降级为空：%s", e)

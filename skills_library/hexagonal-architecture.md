@@ -5,9 +5,11 @@ description: "当你在做六边形架构（端口与适配器）设计、隔离
 applies_to_stacks: ["*"]
 applies_to_intents: ["create", "refactor"]
 applies_to_phases: ["plan", "code"]
-target: ["worker", "planner"]
+target: ["worker"]  # G10：架构分层是【编码期/worker】关注点，绝不上 planner 面——否则
+                    # Domain/Application/Adapters 纵切分层会诱导大脑把一个功能域拆成多个物理
+                    # build 模块，直接反 Task#7「module=单一物理 build 单元」不变量。审计⑤定时炸弹。
 priority: 45
-max_chars: 1400  # G10：≤ planner_budget_chars(1500)，否则填缝永进不去=死配置
+max_chars: 1400
 tags: ["architecture", "ddd", "ports-adapters"]
 ---
 

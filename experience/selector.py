@@ -220,18 +220,23 @@ def select_skills(
     rerank_fn: RerankFn | None = None,
     profile_terms: set[str] | None = None,
     task_terms: set[str] | None = None,
+    exclude_tags: set[str] | None = None,
 ) -> list[SkillDoc]:
     """选出注入用技能（handoff §5 混合算法）。
 
-    ① 确定性标签预筛：target 命中 + 栈×意图×阶段 命中。
+    ① 确定性标签预筛：target 命中 + 栈×意图×阶段 命中 + 排除 exclude_tags。
     ② 优先级降序 + 预算截断（填缝）+ max_k。
     ③ 可选 LLM rerank：仅 rerank_fn 提供且候选 > max_k 时；失败回退 ②。
 
     栈/意图/阶段任一为空时退化为宽匹配（空 stack_langs → 只命中 '*' 栈技能；空
     intent/phase → 只命中 '*' 意图/阶段技能），不会误命中。
+
+    exclude_tags：结构性 deny 面——tags 与其相交的技能整条剔除。G10：planner 面用它挡掉
+    架构分层/微服务类技能（无论何时新增），防其诱导大脑按 feature/层拆多物理 build 模块。
     """
     intent = (intent or "").strip().lower()
     phase = (phase or "").strip().lower()
+    _deny = {str(t).strip().lower() for t in (exclude_tags or set())}
     cands = [
         s
         for s in skills
@@ -240,6 +245,7 @@ def select_skills(
         and _match_stacks(s.applies_to_stacks, stack_langs)
         and _match_one(s.applies_to_intents, intent)
         and _match_one(s.applies_to_phases, phase)
+        and not (_deny & {str(t).strip().lower() for t in (getattr(s, "tags", None) or [])})
     ]
     # G3（阶段E）+E9-3：排序 = 栈特化 > 框架相关性 > priority > id。
     # 旧键 (-priority, id) 在截断点按字母序丢栈特化技能；语言级栈轴又分不出框架

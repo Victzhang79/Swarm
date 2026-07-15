@@ -176,6 +176,48 @@ def test_planner_block_targets_planner_skills():
     assert ("API 设计" in out) or ("数据库迁移" in out)
 
 
+# ── G10（审计⑤）：架构分解类技能绝不进大脑 planner 面 ──
+def test_g10_hexagonal_never_reaches_planner_even_with_huge_budget():
+    """定时炸弹拆除：即便把 planner 预算撑到远超 hexagonal 正文，它也进不了大脑面。
+
+    revert-check：若 hexagonal 仍 target=[...,'planner'] 且无 _PLANNER_DENY_TAGS，
+    足够大的预算会让它注入 → 断言必红。现在 target=worker + 结构性 deny 双保险。
+    """
+    with _skills_cfg(planner_budget_chars=100_000):
+        out = planner_skills_block(_JAVA_STACK)
+    assert out, "预算撑大后 planner 块仍应有通用技能"
+    for poison in ("六边形", "端口与适配器", "Adapters", "Domain：实体"):
+        assert poison not in out, f"架构分层内容 {poison!r} 泄漏进大脑 planner 面"
+
+
+def test_g10_select_skills_exclude_tags_filters_structurally():
+    """结构性 deny：tags 命中 exclude_tags 的技能整条剔除，与预算/排序无关。"""
+    from swarm.experience.selector import select_skills
+
+    arch = SkillDoc(id="arch-x", title="Arch", body="layer split guidance",
+                    target=("planner",), applies_to_phases=("plan",),
+                    priority=99, tags=("architecture", "ddd"))
+    plain = SkillDoc(id="plain-y", title="Plain", body="api convention",
+                     target=("planner",), applies_to_phases=("plan",),
+                     priority=10, tags=("api",))
+    picked = select_skills(
+        [arch, plain], stack_langs=set(), intent="*", phase="plan",
+        target="planner", budget_chars=100_000, max_k=10,
+        exclude_tags={"architecture"},
+    )
+    ids = {s.id for s in picked}
+    assert "arch-x" not in ids, "带 architecture tag 的技能必须被 deny"
+    assert "plain-y" in ids, "无毒技能不受影响"
+
+
+def test_g10_planner_deny_set_covers_hexagonal_tags():
+    """守卫：hexagonal 的 tags 与 _PLANNER_DENY_TAGS 必有交集（防其 tag 改名后漏网）。"""
+    from swarm.experience.service import _PLANNER_DENY_TAGS
+
+    hexa_tags = {"architecture", "ddd", "ports-adapters"}
+    assert hexa_tags & _PLANNER_DENY_TAGS, "hexagonal 的架构 tag 必须在 planner deny 集内"
+
+
 # ── fail-open / bypass ──
 def test_disabled_bypass_returns_empty():
     with _skills_cfg(enabled=False):
