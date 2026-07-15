@@ -569,6 +569,45 @@ def test_gates_baseline_strict_valve(monkeypatch):
     assert allow3 is True
 
 
+def test_g12_contradicted_baseline_emitted_and_hard_gated(monkeypatch):
+    """G12（Task#9 审计⑥）：申报 baseline_covered 的条目其断言【已执行且 fail】= 被证伪
+    → 单列 contradicted，且 gates 无条件硬拦 auto_accept（不受 STRICT_GATE 默认关影响）。"""
+    from swarm.brain.gates import can_auto_accept_delivery
+    from swarm.brain.nodes.verify import _baseline_unverified_degraded
+    state = {"baseline_covered": [
+        {"id": REQ_A, "reason": "存量已有"},
+        {"id": REQ_B, "reason": "存量已有"},
+    ]}
+    # A 断言执行判 fail（证伪）、B skip（仅未核实）→ 两条 degraded 分列
+    patch = {"acceptance_details": {"assertions": [
+        {"req_id": REQ_A, "verdict": "fail"},
+        {"req_id": REQ_B, "verdict": "skipped_manual"},
+    ]}}
+    out = _baseline_unverified_degraded(state, patch)
+    contra = [d for d in out if d.startswith("baseline_covered:contradicted")]
+    unver = [d for d in out if d.startswith("baseline_covered:unverified")]
+    assert len(contra) == 1 and REQ_A in contra[0], f"证伪条目必须单列 contradicted: {out}"
+    assert len(unver) == 1 and REQ_B in unver[0], f"仅未核实条目仍走 unverified: {out}"
+    # gates：contradicted 无条件硬拦，即便 STRICT_GATE 默认关
+    monkeypatch.delenv("SWARM_BASELINE_STRICT_GATE", raising=False)
+    allow, reason = can_auto_accept_delivery({"l2_passed": True, "degraded_reasons": out})
+    assert allow is False and reason.startswith("baseline_contradicted"), \
+        "被证伪的假 DONE 绝不能自动放行（不受默认关影响）"
+
+
+def test_g12_mixed_pass_fail_not_contradicted():
+    """保守：同一 req 既有 pass 又有 fail 断言 → 视为已核实通过，不误列 contradicted（杜绝假硬拦）。"""
+    from swarm.brain.nodes.verify import _baseline_unverified_degraded
+    state = {"baseline_covered": [{"id": REQ_A, "reason": "存量已有"}]}
+    patch = {"acceptance_details": {"assertions": [
+        {"req_id": REQ_A, "verdict": "pass"},
+        {"req_id": REQ_A, "verdict": "fail"},
+    ]}}
+    out = _baseline_unverified_degraded(state, patch)
+    assert not any(d.startswith("baseline_covered:contradicted") for d in out), \
+        f"混合 pass/fail 不误列 contradicted: {out}"
+
+
 def test_confirm_plan_interrupt_payload_carries_baseline(monkeypatch):
     """hunter F5：PLAN 人工闸 payload 必须带申报+覆盖对账（最廉价否决点不失明）。"""
     _clean_env()

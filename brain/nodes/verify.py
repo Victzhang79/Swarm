@@ -1204,11 +1204,24 @@ def _baseline_unverified_degraded(state: BrainState, accept_patch: dict) -> list
         details = accept_patch.get("acceptance_details")
         rows = (details.get("assertions") if isinstance(details, dict) else None) or []
         passed = {str(r.get("req_id")) for r in rows if r.get("verdict") == "pass"}
-        unverified = [i for i in declared if i not in passed]
-        if not unverified:
-            return []
-        head = ",".join(unverified[:8]) + ("…" if len(unverified) > 8 else "")
-        return [f"baseline_covered:unverified({len(unverified)}:{head})"]
+        failed = {str(r.get("req_id")) for r in rows if r.get("verdict") == "fail"}
+        # ★G12（Task#9 审计⑥）★ 区分【被证伪 contradicted】与【仅未核实 unverified】：
+        #   · contradicted = 申报存量已满足、但其断言【已执行且判 fail 且无任何 pass】= 存量代码
+        #     根本没满足该需求（证伪，无棕地鉴权墙借口）→ 单列，供 gates 无条件硬拦 auto_accept
+        #     （不受 SWARM_BASELINE_STRICT_GATE 默认关影响——谎报不是"无法自动核实"）。
+        #   · unverified = 仅 skip/manual/无断言/inconclusive（真·无法自动核实）→ 保留既有
+        #     STRICT_GATE 默认关的棕地权衡（鉴权墙下诚实申报不该被硬拦）。
+        #   · 混合(既有 pass 又有 fail)→ 视为已核实通过，不误列 contradicted（保守，杜绝假硬拦）。
+        contradicted = [i for i in declared if i in failed and i not in passed]
+        unverified = [i for i in declared if i not in passed and i not in failed]
+        out: list[str] = []
+        if contradicted:
+            head = ",".join(contradicted[:8]) + ("…" if len(contradicted) > 8 else "")
+            out.append(f"baseline_covered:contradicted({len(contradicted)}:{head})")
+        if unverified:
+            head = ",".join(unverified[:8]) + ("…" if len(unverified) > 8 else "")
+            out.append(f"baseline_covered:unverified({len(unverified)}:{head})")
+        return out
     except Exception as exc:  # noqa: BLE001
         logger.warning("[VERIFY_RUNTIME] baseline 申报核验留痕失败(跳过): %s", exc)
         return []

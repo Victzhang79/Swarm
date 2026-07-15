@@ -204,6 +204,18 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             "非启动/探活失败）"
         )
 
+    # ★G12（Task#9 审计⑥）★ baseline_covered 被【运行时断言证伪】→ 无条件硬拦 auto_accept
+    # （不受 SWARM_BASELINE_STRICT_GATE 默认关影响）：申报"存量已满足"但其断言【已执行且 fail、
+    # 无任何 pass】= 谎报，无棕地鉴权墙借口（鉴权墙下无法核实的走下方 unverified 通道、仍受默认关
+    # 权衡）。与 runtime/acceptance "显式失败即拦" 同构；证伪的假 DONE 绝不能自动放行、漏需求前滚。
+    _contra = [str(d) for d in (state.get("degraded_reasons") or [])
+               if str(d).startswith("baseline_covered:contradicted")]
+    if _contra:
+        return False, (
+            f"baseline_contradicted: 存量「已满足」申报被运行时断言证伪（已执行且未过）"
+            f"——非「无法核实」而是谎报，拒绝 auto_accept 交人工：{_contra[0][:200]}"
+        )
+
     # R31 hunter F1 收紧阀（默认关，开启需运维/用户拍板）：baseline_covered 申报存在
     # 未经【已执行且 pass】断言验证的条目（鉴权类断言恒 manual / 冒烟 skip 均属此形态）
     # → 拒绝 auto_accept 交人工。消费 verify 写入的同一条 degraded 留痕（不另算一份事实）。
