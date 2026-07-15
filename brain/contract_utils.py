@@ -370,6 +370,12 @@ def _aggregator_pom_template(agg_dir: str, submodules: list[str],
     if not gav:
         return ""
     rg, ra, rv = gav
+    # ★Task#4 复核治本★ 聚合器的 <parent> 必须是它的**直接上级**（relativePath ../pom.xml），
+    # 不是无条件的根工程——嵌套聚合器（agg_dir 含 '/'）的 parent 是其**上级聚合目录**的
+    # artifactId，只有顶层聚合器（无 '/'）的 parent 才是根。旧实现一律写根 GAV → 嵌套时
+    # `../pom.xml` 指到的上级 artifactId 与之对不上 → round57 'wrong local POM' FATAL。
+    # 与叶子/孤儿 pom 的 _pgav 计算同源（groupId/version 全工程统一 = 根的）。
+    parent_art = agg_dir.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in agg_dir else ra
     mods = "\n".join(f"        <module>{m}</module>" for m in submodules)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -380,7 +386,7 @@ def _aggregator_pom_template(agg_dir: str, submodules: list[str],
         "    <modelVersion>4.0.0</modelVersion>\n"
         "    <parent>\n"
         f"        <groupId>{rg}</groupId>\n"
-        f"        <artifactId>{ra}</artifactId>\n"
+        f"        <artifactId>{parent_art}</artifactId>\n"
         f"        <version>{rv}</version>\n"
         "    </parent>\n"
         f"    <artifactId>{agg_dir.rsplit('/', 1)[-1]}</artifactId>\n"
@@ -590,6 +596,75 @@ def _common_module_prefix(paths: list[str], project_path: str | None) -> str | N
     return "/".join(common) if common else None
 
 
+def _code_module_root(path: str) -> str | None:
+    """一个文件路径 → 它所属的**物理模块根目录**（切在标准源码布局之前），与
+    `_common_module_prefix` 同口径但作用于**单个文件**：
+
+      `ruoyi-alarm/alarm-core/src/main/java/X.java` → `ruoyi-alarm/alarm-core`
+
+    构建清单（pom.xml 等）不算证据（那正是脚手架要造的东西）；根级源码（`src/...`，
+    模块根为空串）→ None（根模块不是聚合子模块）；找不到源码布局段（无法判定模块
+    边界，多栈通用）→ None（fail-closed：绝不凭一个字符串在磁盘上切出模块）。
+    """
+    p = _norm_scope_path(path)
+    if not p or "/" not in p or p.endswith(_BUILD_MANIFESTS):
+        return None
+    parts = p.split("/")
+    for i, seg in enumerate(parts):
+        if seg in _SRC_LAYOUT_SEGMENTS:
+            root = "/".join(parts[:i])
+            return root or None
+    return None
+
+
+def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:
+    """★Task#4 治本★ 计划里**实际收码**的全部物理模块根目录——聚合器 <modules> 完整性的权威。
+
+    与 `_module_physical_dirs` 的分工必须分清：后者按【契约模块名】求落点、对歧义/撞车
+    fail-closed（宁缺毋滥——它决定"给谁建带契约依赖的 pom / 收谁的写权"）；本函数只回答
+    "哪些目录里真的落了代码"，**不做名字匹配、不 fail-closed**。
+
+    为什么聚合器 <modules> 必须用它而不是 `_module_physical_dirs`（round62 真断）：Maven 只会
+    下钻**登记在父 <modules> 里的**子模块。一个收了码、拿了 pom、但**契约模块名解析被 fail-closed
+    拒掉**（歧义/撞车/占位符）的物理模块，若不进父 <modules> → mvn 根本不构建它 → **静默丢模块**
+    （无任何报错的 round62 级真断）。登记一个真实收码目录永远安全（它本就要 build）——这正是
+    "少登记=灾难、多登记=无害"的非对称，故此处用**完整物理证据**，不用 fail-closed 的名字映射。
+    """
+    out: set[str] = set()
+    _unrooted: set[str] = set()
+
+    def _consider(f: str) -> None:
+        p = _norm_scope_path(f)
+        if not p:
+            return
+        d = _code_module_root(f)
+        if d:
+            out.add(d)
+        elif "/" in p and not p.endswith(_BUILD_MANIFESTS):
+            _unrooted.add(p.rsplit("/", 1)[0])   # 无源码布局段 → 记其所在目录，待覆盖判定
+
+    for st in getattr(plan, "subtasks", []) or []:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            _consider(f)
+    for it in (file_plan or []):
+        path = (it.get("path") if isinstance(it, dict) else getattr(it, "path", None)) or ""
+        _consider(str(path))
+    # ★Task#4 复核（silent-failure-hunter）★ 收码路径**无标准源码布局段**（非 src/main/... 布局，
+    # 如 flat 布局或纯 sql/config 目录）→ `_code_module_root` 无法确定物理模块根、未纳入 phys。
+    # 若该目录也不在任何已解析模块之下 = 潜在**漏登记的独立模块** → LOUD 提示（绝不静默隐形）。
+    # named 模块（契约/file_plan）另由 `_module_physical_dirs` 覆盖、不依赖本通道，故此仅提示非致命。
+    _uncovered = sorted(d for d in _unrooted
+                        if not any(d == o or d.startswith(o + "/") for o in out))
+    if _uncovered:
+        logger.warning(
+            "[SCAFFOLD-INJECT] Task#4 %d 个收码目录无标准源码布局段、无法确定物理模块根 → 未纳入聚合器 "
+            "<modules> 完整性判定；若本应是独立 maven 模块则可能漏登记（named 模块由契约/file_plan 通道"
+            "覆盖、不受影响）：%s", len(_uncovered), _uncovered[:8])
+    return out
+
+
 def _inject_templates_into_pom_owners(plan, project_path: str | None,
                                       file_plan: list | None = None) -> list[str]:
     """R58-3：给**已被认领**的模块 pom 的 owner 子任务，也嵌入确定性权威模板。
@@ -646,7 +721,8 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
 
 def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
                                 project_path: str | None, existing_ids: set,
-                                injected: list) -> dict[str, str]:
+                                injected: list,
+                                phys: set[str] | None = None) -> dict[str, str]:
     """R57-4b：子模块同处一个**非根**聚合目录时，确定性注入该聚合父 POM 的脚手架（拓扑最先）。
 
     round57 实锤：子模块都在 `ruoyi-alarm/` 下，而父 POM `ruoyi-alarm/pom.xml` 的创建权被
@@ -668,19 +744,43 @@ def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
     # 子模块脚手架挂"依赖父 POM 先落地"的边时，必须挂**它自己所在聚合目录**的父，不能一律挂最后
     # 一个（多聚合场景会把 ruoyi-alarm 下的模块错挂到 ruoyi-biz 的父上、且漏掉真父 → parent
     # 找不到 → round57 死因原样复活）。
-    parents = sorted({d.rsplit("/", 1)[0] for d in dirs.values() if "/" in d})
+    # ★Task#4 治本★ 聚合目录集合必须覆盖**所有收码物理模块**的父目录，而不仅是干净契约模块
+    # 解析出的那些——否则一个契约名被 fail-closed 拒掉、但真收了码的子模块，其聚合父根本不会被
+    # 注入 → 该聚合层缺父 pom / 子模块不进 <modules> → round62 静默丢模块。
+    _all_mod_dirs = set(dirs.values()) | (phys or set())
+    # ★Task#4 复核治本（多级聚合）★ parents = 每个物理模块到根之间的**全部祖先目录**，而非仅
+    # 直接父。否则 `a/b/c` 只注入 `a/b`、漏掉中间层 `a`，且 `a/b` 的 parent GAV 会指向不存在/
+    # 错误的上级 → round57 FATAL。all_nodes = 物理模块 ∪ 全部聚合祖先 = reactor 里每个 maven
+    # 节点（jar 或 pom），<modules> 完整性据它算（直接子节点，含中间层聚合器）。
+    parents_set: set[str] = set()
+    for d in _all_mod_dirs:
+        _parts = d.split("/")
+        for i in range(1, len(_parts)):
+            parents_set.add("/".join(_parts[:i]))
+    all_nodes = _all_mod_dirs | parents_set
     agg_ids: dict[str, str] = {}
-    for agg in parents:
+    for agg in sorted(parents_set):   # 浅→深：父聚合器先注入，子聚合器才挂得到它
         _sid = _inject_one_aggregator_pom(
-            plan, agg, dirs, project_path, existing_ids, injected)
-        if _sid:
-            agg_ids[agg] = _sid
+            plan, agg, dirs, project_path, existing_ids, injected, phys, all_nodes)
+        if not _sid:
+            continue
+        agg_ids[agg] = _sid
+        # 嵌套聚合器依赖它**自己的上级聚合器**先落地（顶层聚合器 parent=根，无此边）——
+        # 与叶子/孤儿依赖直接聚合父同理，保证 parent pom 链在编译前齐备。
+        _pagg = agg.rsplit("/", 1)[0] if "/" in agg else None
+        _pagg_sid = agg_ids.get(_pagg) if _pagg else None
+        if _pagg_sid:
+            _scaf = next((s for s in plan.subtasks if s.id == _sid), None)
+            if _scaf is not None and _pagg_sid not in _scaf.depends_on:
+                _scaf.depends_on.append(_pagg_sid)
     return agg_ids
 
 
 def _inject_one_aggregator_pom(plan, agg: str, dirs: dict[str, str],
                                project_path: str | None, existing_ids: set,
-                               injected: list) -> str | None:
+                               injected: list,
+                               phys: set[str] | None = None,
+                               all_nodes: set[str] | None = None) -> str | None:
     """为单个聚合目录 agg 注入确定性聚合父 POM 脚手架（拓扑最先、**独占**其 pom 写权）。"""
     from swarm.types import FileScope, SubTask, TaskIntent
 
@@ -693,8 +793,22 @@ def _inject_one_aggregator_pom(plan, agg: str, dirs: dict[str, str],
     # → `Non-resolvable parent POM` → 全员 FATAL（round57 原始死因复活）。改为：确定性脚手架
     # 独占其写权（下方 R57-6 式收回），拓扑最先。
     exists = bool(project_path) and (Path(project_path) / agg_pom).is_file()
-    sub_names = sorted({d.rsplit("/", 1)[-1] for d in dirs.values()
-                        if d.rsplit("/", 1)[0] == agg})   # 只算**直接**子模块
+    # ★Task#4 复核治本（多级）★ 结构冲突自检：一个目录若**既是收码物理模块又是聚合父**
+    # （自身有直接代码 + 名下还有子模块），Maven 无法两全（packaging=pom 不编译自身代码、
+    # packaging=jar 不下钻 <modules>）——这是计划质量缺陷（公共代码应下沉到独立子模块）。
+    # 绝不静默产出会丢代码的 pom：LOUD 告警交 plan-quality 复核（Task#9），登记仍按聚合父走。
+    if phys and agg in phys:
+        logger.warning(
+            "[SCAFFOLD-INJECT] Task#4 结构冲突：聚合目录 %r **同时有直接代码落点**——Maven 目录不能既是 "
+            "packaging=pom 聚合父又是 jar 代码模块，其自身直接代码将不被编译。这是计划质量缺陷"
+            "（应把公共代码下沉到独立子模块）→ 已按聚合父登记但请复核。", agg)
+    # ★Task#4 治本（round62 真断）★ <modules> 必须登记**该聚合下全部直接子节点**（收码物理子模块
+    # + 中间层子聚合器）——而非仅 `_module_physical_dirs` 解析出的干净契约模块。契约名被 fail-closed
+    # 拒掉（歧义/撞车/占位符）但真收了码、拿了 pom 的子模块，若不进 <modules> → Maven 不下钻 → 静默
+    # 丢模块。据 all_nodes（物理模块 ∪ 全部聚合祖先）算，缺登记=灾难、多登记=无害。
+    _nodes = all_nodes if all_nodes is not None else (set(dirs.values()) | (phys or set()))
+    sub_names = sorted({d.rsplit("/", 1)[-1] for d in _nodes
+                        if "/" in d and d.rsplit("/", 1)[0] == agg})   # 只算**直接**子节点
     _agg_tpl = _aggregator_pom_template(agg, sub_names, project_path)
     scaffold = SubTask(
         id=sid,
@@ -753,6 +867,101 @@ def _inject_one_aggregator_pom(plan, agg: str, dirs: dict[str, str],
     return sid
 
 
+def _inject_orphan_module_scaffolds(plan, phys: set[str], dirs: dict[str, str],
+                                    agg_ids: dict[str, str], project_path: str | None,
+                                    existing_ids: set, injected: list) -> None:
+    """★Task#4 治本★ 收码但【非干净契约模块】的物理子模块 → 补确定性最小 pom 脚手架。
+
+    `_module_physical_dirs` 对歧义/撞车契约模块名 fail-closed（不给它们建带契约依赖的 pom）；
+    但它们**真的收了码**、且已被 `_inject_one_aggregator_pom` 用 phys 登记进聚合父 <modules>
+    → Maven 会下钻找它们的 pom。若没人确定性地建这个 pom（worker 手写又可能把 parent GAV 写成
+    根工程 → round57 FATAL），就是"派 worker 去失败"。这里给每个这样的孤儿模块补一个
+    parent=聚合父、packaging=jar、无契约依赖的最小 pom（L1 build-repair 再补依赖），并**独占**
+    其写权（同 R57-6/R61-1：构建文件是纯机械产物，绝不让小模型编 parent 坐标）。
+
+    只处理**聚合父之下**的孤儿（agg_ids 里有其父）——根级模块由 manifest_synth 路径兜底、
+    且根级无 parent-GAV 歧义。id 用**完整物理路径**（st-scaffold-<path-dashed>）→ 天然防止
+    同名叶子在不同聚合下 slug 撞车（Task#4 预判）。基线已有该 pom → 尊重既有、不 clobber。
+    """
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    _clean_dirs = set(dirs.values())
+    for d in sorted(phys):
+        if "/" not in d:
+            continue                       # 根级模块（无聚合父）：不在本函数职责内
+        agg = d.rsplit("/", 1)[0]
+        agg_sid = agg_ids.get(agg)
+        if not agg_sid:
+            continue                       # 不在任何已注入的聚合父之下 → 不动（绝不猜落点）
+        if d in _clean_dirs:
+            continue                       # 干净契约模块：走 entries 脚手架（带契约依赖），不重复
+        pom = f"{d}/pom.xml"
+        sid = f"st-scaffold-{d.replace('/', '-')}"
+        if sid in existing_ids:
+            continue                       # 幂等（含 d 本身又是聚合父的自反情形：sid 已被聚合父占用）
+        if project_path and (Path(project_path) / pom).is_file():
+            continue                       # 基线已有 pom：尊重既有（登记已由 <modules> 完成）
+        name = d.rsplit("/", 1)[-1]
+        _pgav = None
+        _rg = _root_gav(project_path)
+        if _rg:
+            _pgav = (_rg[0], agg.rsplit("/", 1)[-1], _rg[2])   # parent = 聚合父 GAV（同聚合模板）
+        _tpl = _deterministic_pom_template(name, [], project_path, resolved=[],
+                                           parent_gav=_pgav)
+        _tpl_block = (f"\n【权威 pom 模板（确定性生成，原样写入 {pom}）】\n```xml\n{_tpl}\n```"
+                      if _tpl else "")
+        if not _tpl:
+            # ★Task#4 复核（silent-failure-hunter F3）★ 根 pom 不可解析/缺 GAV → 无确定性模板，
+            # 脚手架仅剩文字指引、无字面 parent GAV，worker 须手写 parent（R57-7 手写属性引用/错
+            # 坐标风险）。绝不静默降级：LOUD 标注为待复核降级项（同 R45-2 精神——pom 是机械产物）。
+            logger.warning(
+                "[SCAFFOLD-INJECT] Task#4 孤儿模块 %r 无法确定性生成 pom 模板（根 pom 不可解析/缺 GAV）→ "
+                "脚手架降级为纯文字指引、无字面 GAV，worker 须手写 parent（R57-7 风险）——已标注待复核。", d)
+        scaffold = SubTask(
+            id=sid,
+            description=(
+                f"【构建脚手架·孤儿模块】为收码物理模块 {d} 创建 {pom}："
+                f"packaging=jar、parent=聚合父 {agg.rsplit('/', 1)[-1]}（relativePath ../pom.xml 正好指到它）。"
+                "\n它已登记进聚合父 <modules>，Maven 会下钻构建它——pom 不存在 → "
+                "`child module ... does not exist`。只写构建文件，不写任何业务代码。"
+                + _tpl_block),
+            intent=TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(create_files=[pom]),
+            acceptance_criteria=[f"{pom} 存在且 packaging 为 jar，parent 指向聚合父 {name!r} 的上级"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        if agg_sid != sid and agg_sid not in scaffold.depends_on:
+            scaffold.depends_on.append(agg_sid)   # 孤儿依赖聚合父先落地（拓扑：父 pom 先在）
+        # R57-6 式收权：从写代码子任务手里收回该孤儿 pom 写权（多写者 rebase 不收敛 + 手写
+        # parent 坐标风险），并让往该目录写码者依赖脚手架先落地。绝不碰别的脚手架的写权。
+        _prefix = d.rstrip("/") + "/"
+        for st in plan.subtasks:
+            if st.id == sid or str(st.id).startswith("st-scaffold-"):
+                continue
+            sc = getattr(st, "scope", None)
+            for _attr in ("create_files", "writable"):
+                _lst = getattr(sc, _attr, None)
+                if _lst:
+                    _keep = [f for f in _lst if _norm_scope_path(f) != pom]
+                    if len(_keep) != len(_lst):
+                        setattr(sc, _attr, _keep)
+            _writes = [_norm_scope_path(f) for f in
+                       (list(getattr(sc, "create_files", None) or [])
+                        + list(getattr(sc, "writable", None) or []))]
+            if any(w.startswith(_prefix) for w in _writes) and sid not in st.depends_on:
+                st.depends_on.append(sid)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": name, "subtask_id": sid, "artifacts": [],
+                         "pom_exists": False, "orphan": True})
+        logger.warning(
+            "[SCAFFOLD-INJECT] Task#4 收码物理模块 %r 非干净契约模块、无 pom owner → 补确定性最小 pom "
+            "脚手架 %s（parent=聚合父 %s，已进父 <modules>；否则 Maven 下钻找不到其 pom = 派 worker 去失败）",
+            d, sid, agg.rsplit("/", 1)[-1])
+
+
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
@@ -780,15 +989,23 @@ def inject_build_scaffold_subtasks(
     injected: list[dict] = []
     existing_ids = {st.id for st in plan.subtasks}
     _dirs = _module_physical_dirs(plan, project_path, file_plan)
+    # ★Task#4 治本★ 全部**实际收码**物理模块目录（不做名字匹配、不 fail-closed）——聚合器
+    # <modules> 完整性与孤儿模块补脚手架的权威证据源，与 fail-closed 的 _dirs 分工。
+    _phys = _physical_code_module_dirs(plan, file_plan)
     # ★先算 entries★：聚合父脚手架会写根 `pom.xml`，这会触发规则5 的 A5 归并（误判"单 pom owner
     # → 单模块项目"）把子模块的 unclaimed 全吃掉 → 子模块脚手架不再注入。故必须在注入聚合父**之前**固定。
     entries = unclaimed_contract_deps(plan)
     # ★R60-1（round60 死因）★ 聚合父注入必须**先于** early-return，且**独立于 entries**——
     # 子模块 pom 全被认领时 entries 空，但聚合父 pom（纯 packaging=pom、无代码）没人认领，
     # 若被 early-return 跳过 → `ruoyi-alarm/pom.xml` 无人建 → 所有子模块 parent 找不到 → 全员 FATAL。
-    _agg_ids = _inject_aggregator_scaffold(plan, _dirs, project_path, existing_ids, injected)
+    _agg_ids = _inject_aggregator_scaffold(plan, _dirs, project_path, existing_ids, injected, _phys)
+    # ★Task#4 治本★ 补孤儿：收码但**非干净契约模块**的物理子模块（已进聚合父 <modules>、Maven
+    # 会下钻找其 pom）必须有确定性 pom owner，否则 `child module ... does not exist` = 派 worker
+    # 去失败。同样**先于** early-return（entries 可能空，但孤儿仍需补 pom）。
+    _inject_orphan_module_scaffolds(
+        plan, _phys, _dirs, _agg_ids, project_path, existing_ids, injected)
     if not entries:
-        return injected   # 可能已注入聚合父（R60-1）——绝不能再返回硬编码 []
+        return injected   # 可能已注入聚合父/孤儿（R60-1/Task#4）——绝不能再返回硬编码 []
     # R57-1 治本（round57 实锤）：**光凭契约里一个字符串，不足以在磁盘上造一个模块。**
     # LLM 把契约 schema 的占位符原样抄成了模块名（真实出现过 `module` / `artifacts`），
     # 旧实现对模块名零取证 → 无条件建 `module/pom.xml`、`artifacts/pom.xml` → 磁盘上凭空

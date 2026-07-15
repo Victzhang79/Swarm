@@ -641,3 +641,177 @@ def test_multi_aggregator_module_scaffold_depends_on_its_own_parent(tmp_path):
         "biz-core 脚手架必须依赖它自己的聚合父 ruoyi-biz 先落地")
     assert "st-scaffold-ruoyi-alarm" not in biz_mod.depends_on, (
         "biz-core 绝不能错挂到 ruoyi-alarm 的父上")
+
+
+# ── Task#4（round62 真断治本）：聚合器 <modules> 必须登记**全部收码物理子模块** ──
+
+def _root_pom(tmp_path):
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version>"
+        "<packaging>pom</packaging></project>", encoding="utf-8")
+
+
+def test_task4_orphan_physical_module_registered_in_aggregator_modules(tmp_path):
+    """★round62 真断★ 一个收了码、但**契约里没有它**（非干净契约模块）的物理子模块，
+    必须仍被登记进聚合父 <modules>——否则 Maven 不下钻 = **静默丢模块**（无报错）。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),   # 干净契约模块
+        _st("st-2", create=["ruoyi-alarm/alarm-extra/src/main/java/B.java"]),  # 孤儿：契约里没有
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+    ]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    agg = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm")
+    assert "<module>alarm-core</module>" in agg.description, "干净契约模块须登记"
+    assert "<module>alarm-extra</module>" in agg.description, (
+        "★治本核心★ 收码但非契约模块的 alarm-extra 也**必须**进聚合父 <modules>，"
+        "否则 mvn 不下钻 → round62 静默丢模块")
+
+
+def test_task4_orphan_gets_deterministic_pom_scaffold_with_aggregator_parent(tmp_path):
+    """孤儿模块被登记后，Maven 会下钻找它的 pom → 必须有确定性 pom owner（parent=聚合父），
+    否则 `child module ... does not exist` = 派 worker 去失败。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-extra/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]}]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    orphan = next((st for st in plan.subtasks
+                   if st.id == "st-scaffold-ruoyi-alarm-alarm-extra"), None)
+    assert orphan is not None, "孤儿模块必须有确定性 pom 脚手架"
+    assert "ruoyi-alarm/alarm-extra/pom.xml" in list(orphan.scope.create_files)
+    assert "<artifactId>ruoyi-alarm</artifactId>" in orphan.description, (
+        "孤儿 pom 的 parent 必须是**聚合父** ruoyi-alarm（relativePath ../pom.xml），"
+        "绝不能写根工程 ruoyi → GAV 对不上 → round57 FATAL")
+    assert "<packaging>jar</packaging>" in orphan.description
+    assert "st-scaffold-ruoyi-alarm" in orphan.depends_on, "孤儿脚手架依赖聚合父先落地"
+    assert any(e.get("orphan") for e in injected), "injected 应记录孤儿条目"
+
+
+def test_task4_orphan_scaffolds_are_collision_safe_across_aggregators(tmp_path):
+    """★Task#4 预判：slug 撞车★ 不同聚合父下的**同名叶子**孤儿模块，脚手架 id 必须互不撞车
+    （用完整物理路径，不用叶子名），且各自 parent 指向**自己的**聚合父。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/common/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-biz/common/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": []}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    ids = {st.id for st in plan.subtasks}
+    assert "st-scaffold-ruoyi-alarm-common" in ids
+    assert "st-scaffold-ruoyi-biz-common" in ids, "同名叶子 common 绝不能 slug 撞车成一个"
+    alarm_orphan = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm-common")
+    biz_orphan = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-biz-common")
+    assert "st-scaffold-ruoyi-alarm" in alarm_orphan.depends_on
+    assert "st-scaffold-ruoyi-biz" in biz_orphan.depends_on
+    assert "st-scaffold-ruoyi-biz" not in alarm_orphan.depends_on, "绝不错挂到别的聚合父"
+
+
+def test_task4_baseline_orphan_pom_respected_not_clobbered(tmp_path):
+    """孤儿目录在**基线已有 pom** → 只补登记进 <modules>，绝不建脚手架覆盖既有（clobber 更致命）。"""
+    _root_pom(tmp_path)
+    (tmp_path / "ruoyi-alarm/alarm-extra").mkdir(parents=True)
+    (tmp_path / "ruoyi-alarm/alarm-extra/pom.xml").write_text(
+        '<?xml version="1.0"?><project><artifactId>alarm-extra</artifactId></project>',
+        encoding="utf-8")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", writable=["ruoyi-alarm/alarm-extra/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": []}]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    agg = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm")
+    assert "<module>alarm-extra</module>" in agg.description, "既有孤儿模块仍须登记进 <modules>"
+    assert not any(st.id == "st-scaffold-ruoyi-alarm-alarm-extra" for st in plan.subtasks), (
+        "基线已有 pom → 绝不建脚手架 clobber 既有内容")
+
+
+def test_task4_orphan_pom_write_reclaimed_from_code_writer(tmp_path):
+    """写代码子任务顺手认领了孤儿 pom → 脚手架**收回**其写权（同 R57-6：构建文件是机械产物，
+    多写者 rebase 不收敛 + 手写 parent 坐标风险），认领者转为依赖脚手架先落地。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-extra/pom.xml",
+                            "ruoyi-alarm/alarm-extra/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": []}]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    st2 = next(st for st in plan.subtasks if st.id == "st-2")
+    st2_files = list(st2.scope.create_files) + list(st2.scope.writable)
+    assert "ruoyi-alarm/alarm-extra/pom.xml" not in st2_files, (
+        "孤儿 pom 写权必须从写代码子任务手里收回，交确定性脚手架独占")
+    assert "ruoyi-alarm/alarm-extra/src/main/java/B.java" in st2_files, "代码文件写权保留"
+    assert "st-scaffold-ruoyi-alarm-alarm-extra" in st2.depends_on, "认领者转为依赖脚手架先落地"
+
+
+def test_task4_plan_structure_stays_valid_with_orphans(tmp_path):
+    """治本后计划仍满足结构不变量（全员入组、依赖可解）。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-alarm/alarm-extra/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": []}]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+    validate_plan_structure(plan)   # 不抛 = 结构不变量守约
+
+
+def test_task4_nested_aggregator_parent_gav_points_to_immediate_parent(tmp_path):
+    """★双复核 HIGH★ 多级嵌套聚合器：中间层聚合器的 <parent> 必须指向**直接上级聚合目录**，
+    绝不能一律写根工程——否则 relativePath ../pom.xml 指到的上级 GAV 对不上 → round57 FATAL。
+    且每一层聚合器都必须被注入（漏中间层 = 子模块 parent 链断）。"""
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/inner/leaf/src/main/java/A.java"]),
+    ], parallel_groups=[["st-1"]])
+    plan.shared_contract = {"dependencies": []}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    ids = {st.id for st in plan.subtasks}
+    top = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm")
+    mid = next(st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm-inner")
+    assert "st-scaffold-ruoyi-alarm-inner-leaf" in ids, "叶子模块须有脚手架"
+    # 顶层聚合器 parent = 根工程 ruoyi；中间层聚合器 parent = 直接上级 ruoyi-alarm
+    assert "<artifactId>ruoyi</artifactId>" in top.description, "顶层聚合器 parent = 根工程"
+    assert "<artifactId>ruoyi-alarm</artifactId>" in mid.description, (
+        "★核心★ 中间层聚合器 ruoyi-alarm/inner 的 parent 必须是直接上级 ruoyi-alarm，"
+        "绝不能是根工程 ruoyi（../pom.xml GAV 对不上 → round57 FATAL）")
+    assert "<module>inner</module>" in top.description, "顶层聚合器须登记中间层 inner"
+    assert "<module>leaf</module>" in mid.description, "中间层聚合器须登记叶子 leaf"
+    # 中间层聚合器依赖顶层聚合器先落地；顶层不依赖任何人
+    assert "st-scaffold-ruoyi-alarm" in mid.depends_on, "中间层依赖顶层聚合器先落地"
+    assert not top.depends_on, "顶层聚合器绝不依赖任何子级"
+    validate_plan_structure(plan)
+
+
+def test_task4_self_reflexive_aggregator_with_own_code_is_flagged_loudly(tmp_path, caplog):
+    """★双复核 HIGH（结构冲突）★ 一个目录既有直接代码又是聚合父 → Maven 无法两全，
+    绝不能静默产出丢代码的 packaging=pom → 必须 LOUD 告警交 plan-quality 复核。"""
+    import logging
+    _root_pom(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/core/src/main/java/Own.java"]),      # core 自身有码
+        _st("st-2", create=["ruoyi-alarm/core/sub/src/main/java/Sub.java"]),  # 且是 sub 的聚合父
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": []}
+    with caplog.at_level(logging.WARNING):
+        inject_build_scaffold_subtasks(plan, str(tmp_path))
+    assert any("结构冲突" in r.message and "ruoyi-alarm/core" in str(r.args)
+               for r in caplog.records), (
+        "既是收码模块又是聚合父的目录必须被 LOUD 标记为计划质量缺陷，绝不静默丢代码")
