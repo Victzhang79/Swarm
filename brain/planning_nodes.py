@@ -2348,6 +2348,7 @@ async def elaborate(state: BrainState) -> dict:
         inject_api_knowledge,
         prune_empty_scope_subtasks,
         resolve_plan_conflicts,
+        wire_readable_provenance,
     )
     # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
     # （治本文件争抢——已存在聚合文件多写者串行保留写权，不静默降级丢贡献）。
@@ -2416,6 +2417,22 @@ async def elaborate(state: BrainState) -> dict:
     dangling_fixed = _prune_dangling_dependencies(plan_obj.subtasks)
     if dangling_fixed:
         logger.info("[ELABORATE] 悬空依赖兜底：修正 %d 个子任务的 depends_on", dangling_fixed)
+
+    # ── G2（Task#9 审计③ GAP1）：readable 消费 → 补 provenance 依赖边 ──
+    # readable 里出现某 producer 的 create_files（精确路径匹配）= 确定性消费其产物 → 必须
+    # depends_on 该 producer（同沙箱产物才在/跨沙箱 B1 才注入已完成产物），否则同波派发 →
+    # worker 伪造未见符号。加边前查环，成环则不加、告警交结构闸。放在悬空兜底之后（我的边只指
+    # 现存任务，不被 dangling-fix 误删），全 scope/readable 变换收敛后再补序。
+    try:
+        _prov_added, _prov_cycle = wire_readable_provenance(plan_obj)
+        if _prov_added:
+            logger.info("[ELABORATE] G2: 补 %d 条 provenance 依赖边（readable 消费者→产物 owner）: %s",
+                        len(_prov_added), _prov_added[:5])
+        if _prov_cycle:
+            logger.warning("[ELABORATE] G2: %d 对 readable 消费加边会成环（更深计划错，未补边、未制造环）: %s",
+                           len(_prov_cycle), _prov_cycle[:5])
+    except Exception as exc:  # noqa: BLE001 — 自愈尽力而为，绝不因它拖垮规划（与兄弟 pass 对称）
+        logger.warning("[ELABORATE] G2: provenance 接线失败（非致命，跳过）: %s", exc)
 
     # 最终检查：仍超预算/缺验收的标记出来（人工介入信号）
     oversized: list[str] = []

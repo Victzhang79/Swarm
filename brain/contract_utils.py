@@ -1250,6 +1250,80 @@ def prune_empty_scope_subtasks(plan) -> list[str]:
     return pruned_all
 
 
+def wire_readable_provenance(plan) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """G2（Task#9 审计③ GAP1）：readable 声明的消费 → 补上 depends_on 供给边（provenance 自愈）。
+
+    审计③ GAP1：C1 只保证每个契约符号有 owner，但【消费 A 产物的 B】从未被校验必须 depends_on A。
+    LLM 漏画依赖边时 B 与 A 同波派发 → B 的沙箱里根本没有 A 的产物 → worker 伪造未见符号。
+    既有 normalize 规则2 是【依赖边→readable】的单向传播；本 pass 补对称的另一向【readable→依赖边】：
+    B.readable 里出现某个 A 的 create_files（★精确路径匹配，非模糊符号提及★）= B 确定性消费 A 的
+    产物 → B 必须 depends_on A（同沙箱里 A 的文件才存在；跨沙箱 B1 才把已完成产物注入）。
+
+    与 [[align_readable_to_producer]] 互补：那个修 readable 的【路径形状】对齐 producer 落点，本个
+    修 readable 消费关系对应的【依赖序】。加边前查环：若加 B→A 会成环（A 已传递依赖 B）则**不加**、
+    记为 unresolved（更深的计划环，交结构闸/告警，绝不制造环）。栈中立（纯路径匹配 + 图判定）。
+    返回 (added_edges, unresolved_cycles)。
+    """
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if len(subs) < 2:
+        return [], []
+    by_id = {s.id: s for s in subs}
+    # 产者映射按 _norm_scope_path 归一键（栈中立）。★复核 HIGH★：normalize 的撞车检测用的是
+    # 原始路径串键，与本函数键空间不一致——同一文件不同拼写（`./x/A` vs `x/A`）它检测不到、不串行；
+    # 故此处**不假设**撞车已归一：同一归一键有 2+ 不同产者 = normalize 漏归一的双建，记入 _ambig，
+    # 绝不静默 setdefault 挑一个产者去接线（会把消费者挂到任意一个而非它真需要的那个）。normalize
+    # 键空间统一交 G5（[[swarm-task9-brain-plan-audit]] 次级批）根治。
+    produced_by: dict[str, str] = {}
+    _ambig: set[str] = set()
+    for s in subs:
+        sc = getattr(s, "scope", None)
+        for f in list(getattr(sc, "create_files", None) or []):
+            k = _norm_scope_path(f)
+            if k in produced_by and produced_by[k] != s.id:
+                _ambig.add(k)
+            else:
+                produced_by.setdefault(k, s.id)
+    if _ambig:
+        logger.warning(
+            "[contract] G2 %d 个文件被多个子任务 create（normalize 因键空间差异漏归一双建）→ "
+            "跳过其 provenance 接线（不挂任意产者），交 normalize 键空间统一(G5)根治: %s",
+            len(_ambig), sorted(_ambig)[:5])
+
+    def _reaches(a: str, b: str) -> bool:
+        """a 是否【传递】depends_on b（含直接）。迭代式（复核 MEDIUM：递归在长链上会
+        RecursionError 崩掉整个 ELABORATE 节点）——照 `_depends_transitively` 的栈式写法。"""
+        stack = list(getattr(by_id.get(a), "depends_on", None) or [])
+        seen: set[str] = set()
+        while stack:
+            d = stack.pop()
+            if d == b:
+                return True
+            if d in seen or d not in by_id:
+                continue
+            seen.add(d)
+            stack.extend(getattr(by_id.get(d), "depends_on", None) or [])
+        return False
+
+    added: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, str]] = []
+    for b in subs:
+        sc = getattr(b, "scope", None)
+        needs = {produced_by.get(_norm_scope_path(f))
+                 for f in list(getattr(sc, "readable", None) or [])
+                 if _norm_scope_path(f) not in _ambig}
+        needs.discard(None)
+        needs.discard(b.id)
+        for a in sorted(x for x in needs if x):
+            if _reaches(b.id, a):
+                continue   # provenance 依赖序已在（直接或传递）
+            if _reaches(a, b.id):
+                unresolved.append((b.id, a))   # 加边成环 → 更深计划错，绝不制造环
+                continue
+            b.depends_on = list(getattr(b, "depends_on", None) or []) + [a]
+            added.append((b.id, a))
+    return added, unresolved
+
+
 def align_readable_to_producer(plan, project_path: str | None = None) -> dict:
     """R62-Task5（round62 治本）：readable 幻影包路径确定性归一到 producer 真实落点。
 
