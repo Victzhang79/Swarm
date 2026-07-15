@@ -98,6 +98,26 @@ def test_three_writers_all_depend_on_first():
         assert f not in (s.scope.writable or [])
 
 
+def test_g5_cross_spelling_collision_detected():
+    """G5（Task#9 TIER3 / G2 复核 HIGH 收尾）：同一物理文件被两个子任务【不同拼写】create
+    （`./mod-a/Foo.java` vs `mod-a/Foo.java`）→ 归一键统一后必须识别为同文件双写者 → 收敛唯一
+    首写者、另一降级 readable + 串行依赖。修前：各自唯一首写者 → 双建撞车逃过单写者归一。"""
+    plan = TaskPlan(
+        subtasks=[_mk("st-1", create=["./mod-a/src/main/java/Foo.java"]),
+                  _mk("st-2", create=["mod-a/src/main/java/Foo.java"])],
+        parallel_groups=[], shared_contract={},
+    )
+    changed = normalize_plan_scopes(plan)
+    assert changed, "跨拼写双写者必须被识别并归一"
+    s1 = next(s for s in plan.subtasks if s.id == "st-1")
+    s2 = next(s for s in plan.subtasks if s.id == "st-2")
+    # 首写者 st-1 保留（原始拼写不被改写），st-2 降级
+    assert "./mod-a/src/main/java/Foo.java" in s1.scope.create_files
+    assert not s2.scope.create_files, "非首写者的双建拼写必须被移除（不再并发建同一物理文件）"
+    assert "mod-a/src/main/java/Foo.java" in s2.scope.readable, "降级为 readable（原始拼写）"
+    assert "st-1" in s2.depends_on, "降级者串行依赖首写者"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

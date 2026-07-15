@@ -1516,6 +1516,12 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
 
     # ── 规则 1：同文件写权处理（区分串行协作 vs 独立并发 vs 聚合修改）──
     # 每个文件的【有序写者列表】（按 subtasks 顺序，近似拓扑序：上游在前）。
+    # ★G5（Task#9 审计 TIER3 / G2 复核 HIGH 收尾）★ 写者身份索引必须按【归一路径】建键：
+    # `./mod-a/Foo.java` 与 `mod-a/Foo.java`（同一物理文件、拼写不同）若各自建键 → 各是
+    # "唯一首写者" → 双建撞车逃过单写者归一 → 直通 plan_validator（它信任本函数已收敛唯一
+    # owner，见 plan_validator.py:194 注释）→ dispatch 期两子任务并发建同一物理文件。产者索引
+    # （wire_readable_provenance）早已按 _norm_scope_path 建键——此处统一到同一键空间。
+    # 注：scope 里保留原始拼写（本 pass 只纠正写者【身份判定】，不改写路径字符串）。
     writers_by_file: dict[str, list[str]] = {}
     for st in subtasks:
         scope = getattr(st, "scope", None)
@@ -1524,10 +1530,10 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         _wt = list(getattr(scope, "create_files", []) or [])
         _wt += list(getattr(scope, "writable", []) or [])
         for f in _wt:
-            ids = writers_by_file.setdefault(f, [])
+            ids = writers_by_file.setdefault(_norm_scope_path(f), [])
             if st.id not in ids:
                 ids.append(st.id)
-    first_writer: dict[str, str] = {f: ids[0] for f, ids in writers_by_file.items()}
+    first_writer: dict[str, str] = {k: ids[0] for k, ids in writers_by_file.items()}
 
     # 依赖可达性：判断 a 是否（直接/间接）依赖 b，用于区分"串行子链协作"与"独立并发"。
     by_id_all = {getattr(s, "id", ""): s for s in subtasks}
@@ -1594,10 +1600,11 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                 _seen_t.add(f)
 
         for f, from_create in targets:
-            writer = first_writer.get(f)
+            nf = _norm_scope_path(f)   # G5：写者身份/聚合判定走归一键；scope 仍存原始拼写 f
+            writer = first_writer.get(nf)
             if writer == st.id:
                 # 首写者：聚合文件且已存在 → 实为 modify，落 writable；否则保留原操作类型。
-                if f in aggregate_files:
+                if nf in aggregate_files:
                     if f not in new_writables:
                         new_writables.append(f)
                 elif from_create:
@@ -1618,9 +1625,9 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                 # 串行链协作（或无主）：保留写权（create→writable 改首写者产物）。
                 if f not in new_writables:
                     new_writables.append(f)
-            elif f in aggregate_files:
+            elif nf in aggregate_files:
                 # 独立并发 + 聚合文件：保留写权（转 writable 修改）+ 串行到前序写者，绝不降级。
-                prev = _prev_safe_writer(f, st.id)
+                prev = _prev_safe_writer(nf, st.id)
                 if prev:
                     if f not in new_writables:
                         new_writables.append(f)
@@ -1645,7 +1652,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             # 降级者（新建撞车 / 根 pom 非 owner）依赖首写者强制串行，杜绝并发物理冲突。
             # 防环：owner 若已(传递)依赖本子任务，加反向边会成环 → 跳过(不加边，reconcile 兜底登记)。
             for f in demoted:
-                writer = first_writer.get(f)
+                writer = first_writer.get(_norm_scope_path(f))   # G5：归一键（demoted 存原始拼写）
                 if (writer and writer != st.id and writer not in deps
                         and not _depends_transitively(writer, st.id)):
                     deps.append(writer)
