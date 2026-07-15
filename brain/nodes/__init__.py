@@ -2619,6 +2619,43 @@ async def validate_plan(state: BrainState) -> dict:
                 _fp_result.issues, rotate=retry_count),
         }
 
+    # ── G1 模块 coherence 确定性闸（Task#9 审计①②）：每模块=恰好一个物理构建单元 ──
+    # 60 轮死因家族（round44/57/59/62）真根 = 规划期从不校验 plan 可执行性；契约逻辑模块↔物理
+    # 目录一对多/多对一时，脚手架只能尽力造 pom、造错层级 → reactor 找不到项目 → 整批连坐。
+    # 此前只有【归一器 + 告警】、无【验证闸】。本闸打回 disk-independent 铁证（一对多/多对一），
+    # 绝不做状态依赖判定（round59：依赖"目录存不存在"的判据第一轮过、replan 才炸）。
+    # 杀开关（对照覆盖闸/冒烟闸先例，宽松解析同源）：坏 plan 反复不服从时运维不改代码即可泄压，
+    # 默认全开；关闭走 degraded 留痕（绝不静默——否则 round62 级复发与"闸跑了没抓到"日志上不可分）。
+    _mc_gate_on = os.environ.get(
+        "SWARM_MODULE_COHERENCE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
+    if not _mc_gate_on:
+        logger.warning("[VALIDATE_PLAN] SWARM_MODULE_COHERENCE_GATE 关闭 — 跳过模块 coherence 校验（degraded 留痕）")
+        _vp_warnings.append("module_coherence:skipped(disabled)")
+    else:
+        from swarm.brain.plan_validator import validate_module_coherence as _vmc
+        _mc_result = _vmc(
+            plan_obj,
+            project_path=_get_project_path(state.get("project_id") or ""),
+            file_plan=state.get("tech_design_file_plan") or [])
+        for w in _mc_result.warnings:
+            _vp_warnings.append(str(w))
+            logger.warning("[VALIDATE_PLAN] G1 模块 coherence: %s", w)
+        if not _mc_result.valid:
+            logger.warning(
+                "[VALIDATE_PLAN] G1 模块 coherence 未通过 → 打回 PLAN（模块≠单一物理构建单元）: %s",
+                _mc_result.issues[:3])
+            return {
+                "plan_valid": False,
+                "plan_retry_count": retry_count,
+                "plan_validation_issues": _mc_result.issues,
+                "plan_validation_feedback": _format_validation_feedback(
+                    _mc_result.issues, rotate=retry_count),
+                # silent-hunter #4：早退分支也必须 always-emit 本轮软警告（含 G1 自己的 zero-dir
+                # warn + 上游 C1/R40-1 累积）——plan_validation_warnings 是 round 级键，早退漏带
+                # = 该轮软信号对 API/盯跑不可见。
+                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+            }
+
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
     # 接缝：结构校验后、SIMPLE 早退后（单 trivial 子任务自证覆盖，强校验只会误伤）、
     # LLM 软校验前。requirement_items 缺失/空（抽取降级/老 checkpoint）→ 跳过校验 +

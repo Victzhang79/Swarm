@@ -492,8 +492,39 @@ def _module_physical_dirs(plan, project_path: str | None,
     命中**多个**不同物理目录（歧义）或**零个**（如 LLM 把 schema 占位符 `module`/`artifacts`
     抄成了模块名）→ **不返回**（fail-closed：绝不凭一个字符串在磁盘上造模块）。
     """
-    # ★只对【契约里出现的模块名】求落点★：给每个路径段都建候选，会把 src/main/java/com/impl…
-    # 全当成"模块名"，刷一屏无意义的歧义告警（round58 实测）。噪声会淹掉真信号。
+    # ★单一权威 resolver（Task#9 G1/G5）★ 解析 + 结构化诊断都走 `_resolve_module_dirs`；
+    # 本函数只负责【告警 + 返回 resolved】（保持既有脚手架契约不变），G1 模块 coherence 闸
+    # 消费同一份诊断打回——绝不再各自实现一套 module→dir 解析（那正是审计①的 forked-resolver 病根）。
+    out, ambiguous, collision = _resolve_module_dirs(plan, project_path, file_plan)
+    for mod, dirs in ambiguous.items():
+        logger.warning(
+            "[SCAFFOLD-INJECT] R57-4 模块名 %r 在计划里对应**多个**物理目录 %s → 歧义，"
+            "拒绝脚手架（绝不猜落点：建错层级=reactor 找不到项目=整批子任务白跑）", mod, dirs)
+    for d, mods in collision.items():
+        logger.warning(
+            "[SCAFFOLD-INJECT] R59-2 %d 个契约模块解析到**同一物理目录** %r：%s → 矛盾，"
+            "全部拒绝脚手架（同一个 pom 不可能是两个模块的构建文件；带病继续会让写权击鼓传花、"
+            "最终没人拥有它 → 全员 BLOCKED）", len(mods), d, mods)
+    return out
+
+
+def _resolve_module_dirs(
+    plan, project_path: str | None, file_plan: list | None = None,
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, list[str]]]:
+    """★单一权威 module→物理目录 resolver + 结构化诊断（Task#9 G1/G5 单一事实源）★。
+
+    返回 (resolved, ambiguous, collision)：
+      - resolved: {契约模块名 → 唯一物理构建目录}（fail-closed，歧义/撞车者不在内）。
+      - ambiguous: {模块 → [多个物理目录]}——名字匹配落到 2+ 目录且 file_plan/基线未消歧（违①）。
+      - collision: {物理目录 → [2+ 模块]}——多个模块塌进同一目录（R59-2，违②）。
+
+    证据独立于契约自身（否则循环论证）：计划里往 `…/<mod>/` 写**非构建清单**文件 + file_plan
+    权威归属 + 基线既有目录。★关键修正（Task#9 双复核 CRITICAL）★ 模块名段只在【源码根之前】
+    出现才算模块边界——`ruoyi-alarm/api/src/main/java/com/x/api/Foo.java` 里尾部包名 `api` 是
+    **包**不是模块，扫到第一个源码布局段即停，绝不把包名当第二个物理目录（否则单模块惯例命名被
+    误判成多落点、确定性打回好 plan=比 round59 更毒的死锁）。file_plan/基线是权威、覆盖名字匹配
+    （R58-1）；歧义仅在权威未消解时才成立。
+    """
     _want = {(e.get("module") or "").strip().rstrip("/")
              for e in ((getattr(plan, "shared_contract", None) or {}).get("dependencies") or [])
              if isinstance(e, dict)} - {""}
@@ -508,50 +539,48 @@ def _module_physical_dirs(plan, project_path: str | None,
                 continue   # 构建清单不算证据（它正是我们要造的东西）
             parts = p.split("/")
             for i, seg in enumerate(parts[:-1]):    # 末段是文件名
+                if seg in _SRC_LAYOUT_SEGMENTS:
+                    break   # 模块名只可能在源码根之前；其后是包/目录段，不是模块边界
                 if seg in _want:
                     cands.setdefault(seg, set()).add("/".join(parts[:i + 1]))
     out: dict[str, str] = {}
     for mod, dirs in cands.items():
         if len(dirs) == 1:
             out[mod] = next(iter(dirs))
-        else:
-            logger.warning(
-                "[SCAFFOLD-INJECT] R57-4 模块名 %r 在计划里对应**多个**物理目录 %s → 歧义，"
-                "拒绝脚手架（绝不猜落点：建错层级=reactor 找不到项目=整批子任务白跑）", mod, sorted(dirs))
     if project_path:
         base = Path(project_path)
-        for entry in ((plan.shared_contract or {}).get("dependencies") or []):
-            if not isinstance(entry, dict):
-                continue
-            mod = (entry.get("module") or "").strip().rstrip("/")
+        for mod in _want:
             if mod and mod not in out and (base / mod).is_dir():
                 out[mod] = mod   # 基线里真实存在的目录 = 真模块（棕地）
-
-    # ★R58-1（round58 实锤）★ **权威证据是 file_plan，不是名字匹配。**
-    # 契约声明逻辑模块 `alarm-admin`，代码却落在基线既有模块 `ruoyi-admin/` 里（这是对的——
-    # admin 功能加进现有模块，不该新建）。名字匹配必然落空 → 它的依赖契约全部无人承接
-    # → 编译期缺依赖。TECH_DESIGN 本就产出了权威的【模块 → 文件】归属，据它求**公共物理前缀**。
-    # 名字匹配拿到的落点若与 file_plan 冲突，以 file_plan 为准（它是设计的原始归属）。
+    # ★R58-1★ file_plan 是权威归属，覆盖名字匹配（契约 `alarm-admin` 实住 `ruoyi-admin/`）。
+    # 同时按【每文件物理模块根】判 file_plan 自身是否把一个模块摊到多个物理根（违①）：源码布局
+    # 走 `_code_module_root`，非标准布局（flat/纯脚本）退回顶层目录（栈中立，补 silent-hunter #1
+    # 的 `_code_module_root`→None 静默漏判）。out 的解析口径保持 `_common_module_prefix` 不变
+    # （脚手架行为零回归）——多根仅额外进 fp_ambiguous 供 G1 闸打回，不改 out。
+    fp_ambiguous: dict[str, list[str]] = {}
     for mod, paths in _file_plan_module_paths(file_plan).items():
         prefix = _common_module_prefix(paths, project_path)
         if prefix:
             out[mod] = prefix
-
-    # ★R59-2 护栏★ 两个契约模块解析到**同一个物理目录** = 矛盾（round59 实锤：所有模块都成了
-    # 聚合父 `ruoyi-alarm` → R57-6 收回写权变成击鼓传花 → 没人拥有聚合父的 pom → 全员 BLOCKED）。
-    # 同一个 pom 不可能同时是两个模块的构建文件 → fail-closed 全部丢弃，绝不带病继续。
+        _roots = {r for p in paths
+                  for r in (_code_module_root(p) or (p.split("/", 1)[0] if "/" in p else ""),)
+                  if r}
+        if len(_roots) > 1:
+            fp_ambiguous[mod] = sorted(_roots)
+    # 违①：名字匹配落到 2+ 目录、且 file_plan/基线未把它消解到唯一目录 → 真歧义；file_plan 自身
+    # 跨多物理根也是违①（即便 _common_module_prefix 给了浅公共前缀）。
+    ambiguous = {m: sorted(d) for m, d in cands.items() if len(d) > 1 and m not in out}
+    for m, roots in fp_ambiguous.items():
+        ambiguous.setdefault(m, roots)
+    # ★R59-2★ 违②：多个模块塌进同一物理目录 → fail-closed 全丢（同一 pom 不能属两模块）。
     _by_dir: dict[str, list[str]] = {}
     for m, d in out.items():
         _by_dir.setdefault(d, []).append(m)
-    for d, mods in _by_dir.items():
-        if len(mods) > 1:
-            logger.warning(
-                "[SCAFFOLD-INJECT] R59-2 %d 个契约模块解析到**同一物理目录** %r：%s → 矛盾，"
-                "全部拒绝脚手架（同一个 pom 不可能是两个模块的构建文件；带病继续会让写权击鼓传花、"
-                "最终没人拥有它 → 全员 BLOCKED）", len(mods), d, sorted(mods))
-            for m in mods:
-                out.pop(m, None)
-    return out
+    collision = {d: sorted(mods) for d, mods in _by_dir.items() if len(mods) > 1}
+    for d in collision:
+        for m in collision[d]:
+            out.pop(m, None)
+    return out, ambiguous, collision
 
 
 def _file_plan_module_paths(file_plan: list | None) -> dict[str, list[str]]:

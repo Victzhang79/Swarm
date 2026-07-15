@@ -653,6 +653,70 @@ def validate_file_plan_ownership(
     return result
 
 
+def validate_module_coherence(
+    plan, *, project_path: str | None = None, file_plan: list | None = None,
+) -> PlanValidationResult:
+    """G1 ★真治本闸★（Task#9 审计①②）：每个模块解析到【恰好一个物理构建单元】。
+
+    60 轮死因家族（round44/57/59/62）真根 = 规划期【从不校验 plan 本身可执行性】：契约声明的
+    【逻辑模块】与【物理构建目录】不相交/一对多/多对一时，脚手架归一器只能【尽力】造 pom，造错
+    层级/撞车 → reactor 找不到项目 → 整批连坐。此前只有【归一器】(scaffold 注入)+【告警】，**没有
+    验证闸**：不coherent 的 plan 照过 structure/C1/R40-1/coverage 四闸、死在 worker/reactor。
+
+    本闸把【计划+契约自证的、与磁盘状态无关的】不coherent 硬失败——**只**打回 disk-independent
+    的铁证，绝不做状态依赖判定（round59 血泪：依赖"目录存不存在"的判据第一轮过、replan 才炸）：
+
+      ① 一个模块 → 计划里【多个】不同物理目录（module≠单一 build 单元；round62 alarm-api 双落点）。
+      ② 多个模块 → 【同一个】物理目录（一个构建清单不可能是多个模块的构建文件；R59-2）。
+
+    zero-dir（契约声明了模块、但计划里无任何代码落点）与自反聚合器 → **仅 warn**：前者离线无法
+    区分"幻影模块"与"棕地既有基线目录"（硬判=状态依赖假阳）；后者由脚手架 LOUD 告警 + Task#4
+    归一器处理。多栈中立：模块边界一律经 `_code_module_root`/`_SRC_LAYOUT_SEGMENTS` 求，绝不写死栈。
+    """
+    from swarm.brain.contract_utils import (
+        _file_plan_module_paths,
+        _resolve_module_dirs,
+    )
+
+    result = PlanValidationResult(valid=True)
+    # 模块宇宙 = 契约依赖声明的模块 ∪ file_plan 声明的模块（两者都是【这是一个模块】的权威声明）。
+    deps = ((getattr(plan, "shared_contract", None) or {}).get("dependencies")) or []
+    want = {(e.get("module") or "").strip().rstrip("/")
+            for e in deps if isinstance(e, dict)} - {""}
+    want |= set(_file_plan_module_paths(file_plan).keys())
+    if not want:
+        return result   # 无多模块声明 → 本不变量无适用面（单模块/greenfield）
+
+    # ★消费单一权威 resolver 的结构化诊断（Task#9 双复核 CRITICAL 整改）★——绝不再 fork 一套
+    # module→dir 扫描（forked-resolver 正是审计①病根；旧实现把尾部包名当第二个物理目录、
+    # 确定性打回好 plan）。歧义/撞车的口径与脚手架**完全同源**：resolver 消歧（file_plan/基线
+    # 覆盖名字匹配、扫到源码根即停）后仍未解的才是真违规，故绝不误伤惯例命名的单模块 plan。
+    resolved, ambiguous, collision = _resolve_module_dirs(plan, project_path, file_plan)
+
+    # ① 一对多：一个模块散落到多个物理目录 = module≠单一 build 单元（file_plan/基线未能消歧）
+    for mod, dirs in sorted(ambiguous.items()):
+        result.add(
+            f"模块 {mod!r} 在计划里对应【多个物理目录】{dirs}——一个模块必须【恰好】是一个物理"
+            f"构建单元（含单一构建清单的目录）。请把 {mod} 的全部文件归到同一个模块目录，并在 "
+            f"file_plan 里明确它的归属；若它们本属不同物理模块，请起【不同的模块名】各自独立。")
+
+    # ② 多对一：多个模块塌进同一物理目录 = 一个构建清单不可能是多个模块的构建文件（R59-2）
+    for d, mods in sorted(collision.items()):
+        result.add(
+            f"模块 {mods} 全部落在【同一物理目录】{d!r}——同一个构建清单不可能是多个模块的构建"
+            f"文件。请把它们合并为一个模块，或给每个模块独立的目录。")
+
+    # zero-dir：声明了模块但既无落点、又非棕地基线目录（project_path 已在 resolver 里核过基线）
+    # → 仅 warn（离线无法证伪幻影 vs 遗漏生产者，硬判=状态依赖假阳，round59 血泪）。
+    _accounted = set(resolved) | set(ambiguous) | {m for ms in collision.values() for m in ms}
+    _zero = sorted(m for m in want if m not in _accounted)
+    if _zero:
+        result.warn(
+            f"{len(_zero)} 个声明的模块在计划里无任何代码落点、且非棕地既有基线目录（可能是幻影"
+            f"依赖，也可能缺生产者子任务）：{_zero[:8]}")
+    return result
+
+
 def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> list[str]:
     """R40-1 口径适配：原始 file_plan（str 或 {path} dict 混合）→ P5 去重后的归一路径列表。
 
