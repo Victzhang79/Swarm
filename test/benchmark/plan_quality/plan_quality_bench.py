@@ -56,12 +56,22 @@ def _check_invariants(plan: TaskPlan, invariants: list[str]) -> list[str]:
     violations: list[str] = []
     for inv in invariants:
         if inv == "no_trivial_scaffold":
-            # 解决后不应再有 trivial 脚手架(会走 worker 单发拒答陷阱)
-            from swarm.brain.contract_utils import _is_scaffold_subtask
-            bad = [s.id for s in plan.subtasks
-                   if s.difficulty == SubTaskDifficulty.TRIVIAL and _is_scaffold_subtask(s)]
+            # R62-Task6 收窄：只有【写根 pom.xml】的脚手架（RUN19 多步本质=读庞大根 pom +
+            # 定位 <modules> + 多模块登记）必须非 trivial；模块 pom 脚手架（<dir>/pom.xml，
+            # 描述内嵌权威模板=单文件落盘）维持 trivial 轻量路径（与 bump_scaffold_difficulty
+            # 同口径）。原不变量对所有脚手架一刀切=把纯机械模块 pom 写误送重多步路径。
+            from swarm.brain.contract_utils import _norm_scope_path
+            bad = []
+            for s in plan.subtasks:
+                if s.difficulty != SubTaskDifficulty.TRIVIAL:
+                    continue
+                sc = getattr(s, "scope", None)
+                _w = (set(getattr(sc, "create_files", []) or [])
+                      | set(getattr(sc, "writable", []) or []))
+                if "pom.xml" in {_norm_scope_path(x) for x in _w}:
+                    bad.append(s.id)
             if bad:
-                violations.append(f"no_trivial_scaffold: 仍有 trivial 脚手架 {bad}")
+                violations.append(f"no_trivial_scaffold: 仍有 trivial 根 pom 脚手架 {bad}")
         elif inv == "no_parallel_file_writers":
             # 任一文件的多个写者必须有依赖序(不能并发写)；用 validator 的同款判定兜底
             r = validate_plan_structure(plan)

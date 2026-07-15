@@ -947,3 +947,49 @@ def test_r62_task5_real_planned_path_not_redirected():
     assert out["aligned"] == 0
     cons = next(s for s in plan.subtasks if s.id == "st-cons")
     assert cons.scope.readable == ["modB/other/Result.java"]
+
+
+# ── ⑧ Task6（round62 治本）：难度路由——模块 pom 脚手架维持轻量，仅根 pom 提 MEDIUM ──
+
+def _st_diff(sid, difficulty, create=None, writable=None):
+    return SubTask(id=sid, description=f"task {sid}", difficulty=difficulty,
+                   scope=FileScope(create_files=create or [], writable=writable or []))
+
+
+def test_r62_task6_module_pom_scaffold_stays_trivial():
+    """模块 pom 脚手架（<mod>/pom.xml，内嵌权威模板=单文件落盘）维持 TRIVIAL 轻量路径，
+    不被误抬 MEDIUM 送重多步路径白占小本地模型算力。"""
+    from swarm.brain.contract_utils import bump_scaffold_difficulty
+    plan = TaskPlan(
+        task_id="t-62t6", subtasks=[
+            _st_diff("st-mod", SubTaskDifficulty.TRIVIAL,
+                     create=["ruoyi-alarm/alarm-api/pom.xml"]),
+            _st_diff("st-mod2", SubTaskDifficulty.TRIVIAL, create=["m/sub/pom.xml"])],
+        parallel_groups=[["st-mod", "st-mod2"]])
+    assert bump_scaffold_difficulty(plan) == 0
+    assert all(s.difficulty == SubTaskDifficulty.TRIVIAL for s in plan.subtasks)
+
+
+def test_r62_task6_root_pom_writer_bumped_to_medium():
+    """★保 RUN19★：写【根】pom.xml（读庞大根 pom + <modules> 多模块登记=真多步）仍提 MEDIUM。"""
+    from swarm.brain.contract_utils import bump_scaffold_difficulty
+    plan = TaskPlan(
+        task_id="t-62t6b", subtasks=[
+            _st_diff("st-root", SubTaskDifficulty.TRIVIAL,
+                     create=["pom.xml", "ruoyi-admin/pom.xml"])],
+        parallel_groups=[["st-root"]])
+    assert bump_scaffold_difficulty(plan) == 1
+    assert next(s for s in plan.subtasks
+                if s.id == "st-root").difficulty == SubTaskDifficulty.MEDIUM
+
+
+def test_r62_task6_non_trivial_scaffold_untouched():
+    """已是 MEDIUM/COMPLEX 的不动（bump 只提 TRIVIAL 下限，不降级）。"""
+    from swarm.brain.contract_utils import bump_scaffold_difficulty
+    plan = TaskPlan(
+        task_id="t-62t6c", subtasks=[
+            _st_diff("st-x", SubTaskDifficulty.COMPLEX, create=["pom.xml"])],
+        parallel_groups=[["st-x"]])
+    assert bump_scaffold_difficulty(plan) == 0
+    assert next(s for s in plan.subtasks
+                if s.id == "st-x").difficulty == SubTaskDifficulty.COMPLEX

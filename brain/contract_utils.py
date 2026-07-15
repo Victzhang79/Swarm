@@ -2238,7 +2238,15 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     模型强弱，在【路径】——这种脚手架必须走结构化 locate→code→verify 多步路径(MEDIUM 起，按文件数
     动态加步数预算)，而非 trivial 单发。
 
-    规则：difficulty==TRIVIAL 且 (是脚手架子任务 或 写根 pom.xml) → 提到 MEDIUM。原地改，返回提升个数。
+    ★R62-Task6 收窄（对抗复核路由病）★：只提【写根 pom.xml】者。RUN19 的多步本质是
+    "读庞大根 pom + 定位 <modules> + 追加注册"——那是**根** pom 专属。而**模块** pom 脚手架
+    （`<mod>/pom.xml`，描述内嵌【权威模板·原样写入】）本质是**单文件模板落盘**（无需 locate、
+    无需读大文件）=真 trivial；旧判据 `_is_scaffold_subtask(st) or …` 把这 8-9 个纯机械 pom 写
+    全提到 MEDIUM → 送 worker 重多步路径、白占小本地模型算力（不变量④难度路由异味）。收窄后
+    模块 pom 脚手架维持 TRIVIAL 轻量路径，仅根 pom 写者（真多步）保 MEDIUM。
+
+    规则：difficulty==TRIVIAL 且 写根 pom.xml（scope 含**裸** `pom.xml`）→ 提到 MEDIUM。
+    原地改，返回提升个数。
     """
     bumped = 0
     for st in getattr(plan, "subtasks", []) or []:
@@ -2246,8 +2254,9 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
             continue
         sc = getattr(st, "scope", None)
         writes = set(_st_create_files(st)) | set(getattr(sc, "writable", []) or [])
-        writes_root_pom = "pom.xml" in writes  # 根 pom：大文件 + 多模块登记，读改皆重
-        if _is_scaffold_subtask(st) or writes_root_pom:
+        # 裸 `pom.xml`（根 pom：大文件 + 多模块登记，读改皆重多步）——模块 pom 是 `<dir>/pom.xml`
+        writes_root_pom = "pom.xml" in {_norm_scope_path(w) for w in writes}
+        if writes_root_pom:
             st.difficulty = SubTaskDifficulty.MEDIUM
             bumped += 1
     return bumped
