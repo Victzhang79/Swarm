@@ -687,6 +687,29 @@ def test_r62_task1_polyglot_module_uses_own_extension_not_plan_mode():
     assert "/java/" not in f, f                            # 绝不落 java 目录
 
 
+def test_r62_task2_legacy_tpl_dir_excludes_resource_dirs():
+    """Task2：file_plan 缺席的老路径下，mod_dirs/tpl_dir 只统计【源码】目录——MyBatis
+    `.xml`(src/main/resources/mapper) 即便数量占优也绝不把 tpl_dir 拽进资源目录，令
+    .java 落到 classpath 不可见的 resources/mapper（不编译）。"""
+    plan = TaskPlan(
+        task_id="t-62task2", subtasks=[
+            # 资源 .xml（多）vs 源码 .java（少）——旧实现 tpl_dir 会取众数 mapper 目录
+            _st("st-1", create=[
+                "biz/src/main/resources/mapper/AMapper.xml",
+                "biz/src/main/resources/mapper/BMapper.xml",
+                "biz/src/main/resources/mapper/CMapper.xml"]),
+            _st("st-2", create=["biz/src/main/java/com/x/Svc.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "NewFeatureService", "module": "newmod"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "无主硬符号必须被安置"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("NewFeatureService.java"))
+    assert "/resources/mapper/" not in f, f      # 绝不落资源目录
+    assert "/resources/" not in f, f
+    assert "/src/main/java/" in f, f             # 落真源根
+
+
 def test_r62_task1_empty_file_plan_keeps_legacy_heuristic():
     """回归护栏：file_plan 为空（老流程）时，安置退回旧启发式、行为不变。"""
     plan = TaskPlan(

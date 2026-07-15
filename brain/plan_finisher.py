@@ -166,6 +166,13 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # L1.1b fqn 解析不到 + reactor 编不到的永久死文件）。源根形态记入 "" 键，
     # 模板取【完整目录】。
     _SRC_ROOTS = {"src", "app", "lib", "source", "sources"}
+    # 非源码/清单/纯标记样式扩展名：绝不作 code 符号的扩展名/源目录证据（markup/style ≠
+    # code，栈中立）。★Task2 病根★：旧实现 mod_dirs 对**每个**文件无条件计数，MyBatis
+    # `.xml`（src/main/resources/mapper）把 tpl_dir 拽进 resources/mapper → ext=java 造出
+    # `.../resources/mapper/…/NotifyFacade.java`（classpath 不可见、不编译）。治=扩展名/
+    # 源目录证据都只认 code 文件（同一集合，Task1/Task2 同源）。
+    _NON_CODE_EXT = {"xml", "yml", "yaml", "properties", "sql", "md",
+                     "html", "htm", "css", "scss", "sass", "less"}
     from collections import Counter
     exts: Counter = Counter()
     mod_dirs: dict[str, Counter] = {}
@@ -175,10 +182,12 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
                   + list(getattr(sc, "writable", None) or [])):
             p = str(f).replace("\\", "/").lstrip("/")
             base = p.rsplit("/", 1)[-1]
-            if "." in base and not base.startswith("pom."):
-                ext = base.rsplit(".", 1)[-1].lower()
-                if ext not in ("xml", "yml", "yaml", "properties", "sql", "md"):
-                    exts[ext] += 1
+            # 只认 code 文件作扩展名/源目录证据（resource/markup/style 都不是源码落点）
+            if "." not in base or base.startswith("pom."):
+                continue
+            if base.rsplit(".", 1)[-1].lower() in _NON_CODE_EXT:
+                continue
+            exts[base.rsplit(".", 1)[-1].lower()] += 1
             if "/" not in p:
                 continue
             top, rest = p.split("/", 1)
@@ -213,10 +222,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # ★不丢符号★：无 file_plan/physical 证据的模块退回旧启发式（老流程零回归），绝不
     # "留 VALIDATE"——实测 C1 无主符号占比<0.4 仅告警不拦（silent-hunter F2），丢弃=符号
     # 既不落地又不被拦。跨物理模块的功能分组（module≠单一 build 单元）落主模块并告警，
-    # 结构性归一/硬打回交 Task4 模块 coherence 闸。
-    # 非源码/清单/纯标记样式扩展名：绝不作 code 符号落点（markup/style ≠ code，栈中立）。
-    _NON_CODE_EXT = {"xml", "yml", "yaml", "properties", "sql", "md",
-                     "html", "htm", "css", "scss", "sass", "less"}
+    # 结构性归一/硬打回交 Task4 模块 coherence 闸。（_NON_CODE_EXT 见函数顶部，Task2 同源）
 
     def _mode(items: list[str]) -> str:
         """众数；平票按字典序取最小 → 确定性（items 非空）。"""
