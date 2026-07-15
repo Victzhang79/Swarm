@@ -2346,6 +2346,7 @@ async def elaborate(state: BrainState) -> dict:
         enrich_context_snippets,
         enrich_java_package_readable,
         inject_api_knowledge,
+        prune_empty_scope_subtasks,
         resolve_plan_conflicts,
     )
     # project_path 先解析：normalize 需据"文件是否已存在于 repo"区分聚合修改 vs 新建撞车
@@ -2370,6 +2371,16 @@ async def elaborate(state: BrainState) -> dict:
     if _resolve["difficulty_bumped"]:
         logger.info("[ELABORATE] 脚手架难度提升：%d 个脚手架/根pom写者 trivial→MEDIUM（避开单发拒答）",
                     _resolve["difficulty_bumped"])
+
+    # ── G3（Task#9 审计③ GAP2）：demote 之后【重跑】空 scope 剪除 ──
+    # 唯一的 prune 跑在 plan 节点、在 ELABORATE 之前；而 normalize_plan_scopes（在
+    # resolve_plan_conflicts 内）把撞车的非首写者 demote 成 readable，可能把子任务 scope 收成空
+    # → 空写 scope 死任务漏到 dispatch（round62 empty-diff churn 仍可达那条路）。此处 demote 之后
+    # 重剪，幂等、栈中立、绝不剪空计划（守卫见 prune_empty_scope_subtasks）。
+    _repruned = prune_empty_scope_subtasks(plan_obj)
+    if _repruned:
+        logger.info("[ELABORATE] G3: demote 后重剪 %d 个空写 scope 死子任务（防漏到 dispatch）: %s",
+                    len(_repruned), _repruned)
 
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。

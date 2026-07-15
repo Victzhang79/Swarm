@@ -67,6 +67,24 @@ def test_no_conflict_no_change():
     assert "st-1" not in s2.depends_on
 
 
+def test_g3_reprune_removes_scope_emptied_by_demote():
+    """G3（Task#9 审计③ GAP2）：st-2 唯一写 scope 是与 st-1 撞车的新建文件 → normalize 把它
+    demote 成 readable → st-2 空写 scope → ELABORATE 重剪必须移除它（否则漏到 dispatch 空转
+    churn，round62 那条仍可达的路）。此处验证 normalize→prune 组合确定性自愈。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    f = "mod/src/main/java/X.java"
+    plan = TaskPlan(
+        subtasks=[_mk("st-1", create=[f]), _mk("st-2", create=[f])],
+        parallel_groups=[["st-1", "st-2"]], shared_contract={},
+    )
+    normalize_plan_scopes(plan)
+    s2 = next(s for s in plan.subtasks if s.id == "st-2")
+    assert not (s2.scope.create_files or s2.scope.writable), "前置：demote 后 st-2 空写 scope"
+    pruned = prune_empty_scope_subtasks(plan)
+    assert "st-2" in pruned, "被 demote 收成空的 st-2 必须被重剪"
+    assert {s.id for s in plan.subtasks} == {"st-1"}, "只剩真正有产出的 st-1"
+
+
 def test_three_writers_all_depend_on_first():
     f = "shared.java"
     plan = TaskPlan(
