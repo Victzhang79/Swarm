@@ -336,6 +336,11 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     by_id = {st.id: st for st in plan.subtasks}
     created: dict[str, list[str]] = {}
     _MAX = 6
+    # ★G9 收口（对抗双复核 HIGH：两处 pom 伪造入口必须同源）★ 本函数下方给【零证据新模块】补
+    # pom 脚手架是第二条 pom 伪造路径，必须与 inject_build_scaffold_subtasks 走【同一】栈闸，
+    # 否则异栈工程仍会经此路径被塞 pom。已知非 Maven 栈 → 不补 pom（其余安置逻辑照常，绝不丢符号）。
+    from swarm.brain.contract_utils import _should_fabricate_maven_scaffold
+    _maven_scaffold_ok, _ = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
     for mod, syms in sorted(groups.items()):
         base_sid = f"st-contract-{mod}"
         host = by_id.get(base_sid)
@@ -386,7 +391,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             # 复核 F5：新顶层模块无 pom 无注册 = r46 reactor missing-child 同款毒。
             # 模块物理不存在且 plan 无其文件且无脚手架 → 确定性补注（R45-2 权威模板
             # 同源），代码子任务依赖之；root pom 注册交 workspace reconcile add 侧。
-            if (scaffold_sid not in by_id and project_path
+            if (scaffold_sid not in by_id and project_path and _maven_scaffold_ok
                     and mod not in phys and mod not in _fp_src
                     and mod not in mod_dirs
                     and not (Path(project_path) / mod).is_dir()):

@@ -815,3 +815,73 @@ def test_task4_self_reflexive_aggregator_with_own_code_is_flagged_loudly(tmp_pat
     assert any("结构冲突" in r.message and "ruoyi-alarm/core" in str(r.args)
                for r in caplog.records), (
         "既是收码模块又是聚合父的目录必须被 LOUD 标记为计划质量缺陷，绝不静默丢代码")
+
+
+# ── G9（Task#9 审计⑤ stack-neutrality）：脚手架注入 per-stack 分派 ──
+from swarm.brain.contract_utils import _detect_build_stack  # noqa: E402
+
+
+def test_g9_detect_stack_from_plan_manifests():
+    """_detect_build_stack：从计划 manifest basename 确定性判栈；无证据=unknown。"""
+    go_plan = TaskPlan(subtasks=[
+        _st("s1", create=["svc-a/go.mod", "svc-a/main.go"])], parallel_groups=[["s1"]])
+    assert _detect_build_stack(go_plan, None) == "go"
+    # Cargo：计划路径大小写不可信（LLM 写 cargo.toml/Cargo.toml 都要认）
+    for name in ("Cargo.toml", "cargo.toml"):
+        cargo = TaskPlan(subtasks=[_st("s1", create=[f"crate-a/{name}", "crate-a/src/lib.rs"])],
+                         parallel_groups=[["s1"]])
+        assert _detect_build_stack(cargo, None) == "cargo", name
+    mvn_plan = TaskPlan(subtasks=[
+        _st("s1", create=["mod-a/pom.xml", "mod-a/src/main/java/A.java"])],
+        parallel_groups=[["s1"]])
+    assert _detect_build_stack(mvn_plan, None) == "maven"
+    # 混栈：有 pom 证据 → 优先 maven（保 Maven 脚手架，与今日一致）
+    mixed = TaskPlan(subtasks=[
+        _st("s1", create=["backend/pom.xml"]), _st("s2", create=["frontend/package.json"])],
+        parallel_groups=[["s1", "s2"]])
+    assert _detect_build_stack(mixed, None) == "maven"
+    # 无 manifest 证据 → unknown（保守回退 Maven）
+    bare = TaskPlan(subtasks=[_st("s1", create=["a/A.java"])], parallel_groups=[["s1"]])
+    assert _detect_build_stack(bare, None) == "unknown"
+    # ★安全护栏★ JVM 源码 + package.json、无 pom（greenfield Maven 后端+JS 前端歧义）→ unknown
+    # （绝不按 npm 跳过 Maven 脚手架，否则后端 Java 模块静默丢 pom = 回归）
+    ambig = TaskPlan(subtasks=[
+        _st("s1", create=["backend/src/main/java/A.java"]),
+        _st("s2", create=["frontend/package.json"])], parallel_groups=[["s1", "s2"]])
+    assert _detect_build_stack(ambig, None) == "unknown"
+    # 明确 Gradle → gradle（不伪造 pom），即便有 .java
+    gr = TaskPlan(subtasks=[_st("s1", create=["app/build.gradle", "app/src/main/java/A.java"])],
+                  parallel_groups=[["s1"]])
+    assert _detect_build_stack(gr, None) == "gradle"
+
+
+def test_g9_non_maven_stack_no_pom_fabrication(caplog):
+    """★G9 治本★ Go 工程（go.mod）即便有 unclaimed 契约依赖，也绝不注入 Maven pom 脚手架
+    （旧行为=凭空造 pom 污染 reactor）。返回 []、LOUD 告警，且计划里不新增任何 st-scaffold。"""
+    import logging
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["svc-a/go.mod", "svc-a/a.go"]),
+        _st("st-2", create=["svc-b/go.mod", "svc-b/b.go"]),
+        _st("st-3", create=["svc-b/c.go"]),
+    ], parallel_groups=[["st-1"], ["st-2", "st-3"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "svc-a", "artifacts": ["github.com/x/y"]},
+        {"module": "svc-b", "artifacts": ["github.com/x/z"]},
+    ]}
+    n_before = len(plan.subtasks)
+    with caplog.at_level(logging.WARNING):
+        injected = inject_build_scaffold_subtasks(plan, None)
+    assert injected == [], "非 Maven 栈绝不注入 Maven 脚手架"
+    assert len(plan.subtasks) == n_before, "绝不新增 st-scaffold 子任务"
+    assert not any("pom.xml" in f for st in plan.subtasks
+                   for f in (st.scope.create_files or [])), "绝不凭空造 pom 污染 Go 工程"
+    assert any("G9" in r.message and "go" in str(r.args) for r in caplog.records)
+
+
+def test_g9_maven_stack_still_injects(tmp_path):
+    """回归护栏：Maven 工程（基线根 pom = 权威 maven 证据）脚手架注入行为不变。"""
+    _root_pom(tmp_path)   # 基线根 pom → _detect_build_stack=maven（模块自身 pom-less，避免 A5 单owner归并）
+    plan = _plan_two_modules()
+    assert _detect_build_stack(plan, str(tmp_path)) == "maven"
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    assert {e["module"] for e in injected} == {"mod-a", "mod-b"}, "Maven 工程脚手架照常注入"

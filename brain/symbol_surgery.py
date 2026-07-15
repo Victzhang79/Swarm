@@ -370,7 +370,10 @@ def maybe_symbol_repair(state, project_path: str | None = None):
     candidate = prior.model_copy(deep=True)
     sc = state.get("shared_contract") or (
         getattr(candidate, "shared_contract", None) or {})
-    injected = inject_build_scaffold_subtasks(candidate, project_path)
+    # G9 复核#4：把 file_plan 一并传下——脚手架栈判据（_detect_build_stack）多一路证据源，
+    # 与主 finisher 入口（plan_finisher.py）口径一致，杜绝外科重试路径的栈误判不对称。
+    injected = inject_build_scaffold_subtasks(
+        candidate, project_path, state.get("tech_design_file_plan") or [])
     report = surgical_symbol_attach(candidate, sc, project_path=project_path)
     verdict = validate_contract_ownership(candidate, sc, project_path=project_path)
     if not verdict.valid:

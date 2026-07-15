@@ -1016,3 +1016,23 @@ def test_r62_task6_non_trivial_scaffold_untouched():
     assert bump_scaffold_difficulty(plan) == 0
     assert next(s for s in plan.subtasks
                 if s.id == "st-x").difficulty == SubTaskDifficulty.COMPLEX
+
+
+def test_g9_domicile_no_pom_fabrication_for_non_maven(tmp_path):
+    """★G9 收口（对抗双复核 HIGH）★ _domicile_contract_symbols 的第二条 pom 伪造路径必须
+    与 inject 入口同栈闸：Go 工程（go.mod、无根 pom）即便有无主契约符号落到零证据新模块，
+    也【绝不】经收尾器补 pom 脚手架污染工程。符号本体照常安置（fail-open，绝不丢）。"""
+    plan = TaskPlan(
+        task_id="t-g9dom", subtasks=[
+            _st("st-1", create=["svc-core/go.mod", "svc-core/a.go"]),
+            _st("st-2", create=["svc-core/b.go"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "NotifyPort", "module": "notify-worker"}]}
+    out = finish_plan_deterministic(plan, [], str(tmp_path), "t", shared_contract=sc)
+    all_files = [f for s in plan.subtasks for f in (s.scope.create_files or [])]
+    assert not any(f.endswith("pom.xml") for f in all_files), \
+        "非 Maven 工程绝不经收尾器补 pom 脚手架"
+    assert not any(s.id.startswith("st-scaffold-notify-worker") for s in plan.subtasks), \
+        "绝不为异栈新模块建 Maven 脚手架子任务"
+    # 符号本体仍被安置（栈中立，绝不丢符号）
+    assert out.get("symbols_domiciled") or any("NotifyPort" in f for f in all_files)

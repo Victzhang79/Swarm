@@ -991,6 +991,87 @@ def _inject_orphan_module_scaffolds(plan, phys: set[str], dirs: dict[str, str],
             d, sid, agg.rsplit("/", 1)[-1])
 
 
+# ★G9（Task#9 审计⑤ stack-neutrality 铁律）★ 脚手架注入 per-stack driver 注册表。
+# round44-62 病根之一：plan 期 build 闭合机制【只认 Maven】——脚手架无条件造 pom.xml/<modules>/
+# <parent> reactor，从不看技术栈；对 Go/npm/Rust/Python 工程 = 凭空塞 Maven 产物污染 reactor。
+# 治：注入【入口按栈分派】——Maven 走既有确定性 pom 脚手架（行为字节级不变，是本注册表首个 driver）；
+# 已知非 Maven 栈目前无 aggregator 脚手架实现 → 明确【不伪造】(no-op + LOUD 告警)，绝不再拿 pom
+# 污染异栈；未知栈 → 保守回退 Maven（back-compat，与今日行为一致，下游 R57-1 pom 取证仍二次把关）。
+# 各栈的 aggregator 脚手架（Gradle settings.gradle include / Cargo workspace / go.work…）是本注册表
+# 的后续插入点：新增一栈只需给它一个 aggregator driver 并登记进 _AGGREGATOR_SCAFFOLD_STACKS。
+# ★键用 manifest 的【规范大小写】★（Cargo.toml 首字母大写）——基线 os.path.exists 在
+# 大小写敏感文件系统（Linux）上必须用真实文件名，否则漏检 Cargo 工程。计划路径匹配走下方
+# 小写映射（LLM 写的路径大小写不可信）。
+_MANIFEST_TO_STACK = {
+    "pom.xml": "maven",
+    "build.gradle": "gradle", "build.gradle.kts": "gradle",
+    "settings.gradle": "gradle", "settings.gradle.kts": "gradle",
+    "package.json": "npm", "go.mod": "go", "go.work": "go",
+    "Cargo.toml": "cargo", "pyproject.toml": "python",
+}
+_MANIFEST_TO_STACK_LC = {k.lower(): v for k, v in _MANIFEST_TO_STACK.items()}
+# 目前具备【确定性 aggregator 脚手架实现】的栈（其余已知栈明确不伪造，交后续 driver）。
+_AGGREGATOR_SCAFFOLD_STACKS = frozenset({"maven"})
+
+
+def _detect_build_stack(plan, project_path: str | None, file_plan: list | None = None) -> str:
+    """确定性推断工程构建栈（栈中立、离线）：基线根 manifest（真工程）+ 计划/file_plan 里出现的
+    manifest basename。有 pom 证据 → 'maven'（混栈工程优先保 Maven 脚手架，与今日行为一致）；
+    无任何 manifest 证据 → 'unknown'（保守回退 Maven，back-compat）。"""
+    import os
+    seen: set[str] = set()
+    if project_path:
+        try:
+            for name, stk in _MANIFEST_TO_STACK.items():
+                if os.path.exists(os.path.join(project_path, name)):
+                    seen.add(stk)
+        except (OSError, TypeError, ValueError) as exc:  # os.path.join 对非法输入可抛
+            logger.debug("[SCAFFOLD-INJECT] G9 基线 manifest 探测异常（跳过基线证据源）: %s", exc)
+    paths: list[str] = []
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        paths += list(getattr(sc, "create_files", None) or [])
+        paths += list(getattr(sc, "writable", None) or [])
+    try:
+        for ps in _file_plan_module_paths(file_plan).values():
+            paths += list(ps or [])
+    except Exception as exc:  # noqa: BLE001 — file_plan 解析失败不影响栈判定
+        logger.debug("[SCAFFOLD-INJECT] G9 file_plan 栈证据解析失败（跳过该证据源）: %s", exc)
+    _has_jvm_src = False
+    for p in paths:
+        pn = _norm_scope_path(p)
+        base = pn.rsplit("/", 1)[-1].lower()
+        if base in _MANIFEST_TO_STACK_LC:
+            seen.add(_MANIFEST_TO_STACK_LC[base])
+        if base.rsplit(".", 1)[-1] in ("java", "kt", "kts", "scala"):
+            _has_jvm_src = True
+    if not seen:
+        return "unknown"          # 无任何 manifest 证据 → 保守回退 Maven（调用方 log）
+    if "maven" in seen:
+        return "maven"            # pom 证据 → Maven 脚手架适用（混栈优先保 Maven）
+    if "gradle" in seen:
+        return "gradle"           # 明确 Gradle → 跳过 pom 伪造（Gradle 不用 pom）
+    # 无 pom/gradle manifest、但有 go/npm/cargo/python manifest。★安全护栏（对抗复核预判）★：
+    # 若计划里同时有 JVM 源码（.java/.kt/.scala），这是【歧义混栈】——可能是 greenfield Maven
+    # 后端 pom 尚未建 + 前端 package.json；此时【绝不】按 npm 跳过 Maven 脚手架（否则后端 Java
+    # 模块静默丢 pom = round62 家族级回归），回退 unknown→Maven（与今日行为一致，下游 R57-1 把关）。
+    if _has_jvm_src:
+        return "unknown"
+    return sorted(seen)[0]
+
+
+def _should_fabricate_maven_scaffold(
+    plan, project_path: str | None, file_plan: list | None = None,
+) -> tuple[bool, str]:
+    """★G9 单一权威闸（对抗双复核 HIGH：两处 pom 伪造入口必须同源、杜绝漂移）★
+    是否应走 Maven pom 脚手架 → (should, detected_stack)。已知非 Maven 栈（gradle/go/npm/cargo/
+    python）→ False；Maven/unknown → True（unknown=无证据保守回退 Maven，back-compat）。
+    ★局限（诚实记录）★：本判据是【整计划级】——零证据【新模块】落在 Maven 根工程里时无法逐模块
+    辨栈，随根工程按 Maven 处理（无证据即随根约定，是合理默认；root pom 存在性由下游模板再把关）。"""
+    stk = _detect_build_stack(plan, project_path, file_plan)
+    return (stk == "unknown" or stk in _AGGREGATOR_SCAFFOLD_STACKS), stk
+
+
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
@@ -1006,6 +1087,18 @@ def inject_build_scaffold_subtasks(
     - parallel_groups 完整性守约（validate_plan_structure 要求全员入组）。
     返回机读清单 [{module, subtask_id, artifacts, pom_exists}]；无落空=[]（幂等）。
     """
+    # ★G9（Task#9 审计⑤）★ 入口按栈分派：本函数以下全部逻辑都是【Maven 专属】（pom.xml/<modules>/
+    # <parent> reactor）。仅当工程栈是 Maven（或未知，back-compat 回退）才跑；已知非 Maven 栈
+    # （Go/npm/Rust/Python/Gradle…）→ 明确不伪造 Maven 产物（no-op + 告警），杜绝异栈 reactor 污染。
+    _ok, _stack = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
+    if not _ok:
+        logger.warning(
+            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven）→ 跳过 Maven pom 脚手架注入（绝不拿 "
+            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入 "
+            "_AGGREGATOR_SCAFFOLD_STACKS。", _stack)
+        return []
+    if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
+        logger.debug("[SCAFFOLD-INJECT] G9 未检出构建栈证据 → 保守回退 Maven（back-compat）")
     # R58-3（round58 结构性死因）：**有 owner ≠ 有模板**。
     # 计划里的 pom 一旦被某个写代码的子任务"认领"，旧规则就不建脚手架 → 那个 pom **完全没经过
     # 确定性模板**、由小模型手写 → 写出 `<parent><version>${ruoyi.version}</version>`（属性引用，
