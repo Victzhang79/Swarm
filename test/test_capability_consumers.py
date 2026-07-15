@@ -82,7 +82,9 @@ def test_min_worker_window_takes_min_of_real(monkeypatch):
     real_windows = {"probed_a": 128000, "probed_b": 32768}
 
     def fake_get_cap(provider_id, model_id, conn_str=None):
-        return {"context_window": real_windows[model_id], "source": cap.SOURCE_PROBED}
+        # 候选集 = 池 ∪ 路由三档+fallback（2026-07-15 治本：涵盖所有可达 worker 目标）。
+        # 对注入的两个 pool 模型给真值；其余(live 路由模型)给大窗口，不影响"取最小"断言。
+        return {"context_window": real_windows.get(model_id, 999999), "source": cap.SOURCE_PROBED}
 
     with patch("swarm.models.capability_store.get_capability", side_effect=fake_get_cap):
         result = P._min_worker_context_window()
@@ -92,20 +94,38 @@ def test_min_worker_window_takes_min_of_real(monkeypatch):
 
 # ── 多模态选型 ─────────────────────────────────────────────
 
-def test_multimodal_route_uses_capability():
+def test_multimodal_route_autodiscovers_when_configured_not_mm(monkeypatch):
+    """precedence 演进（2026-07-15 hunter#4 治本）：仅当配的 routing_multimodal【本身非多模态】
+    (疑似误配)时，才从能力库自动发现——探测确认的 vision-pro 优先 default 源的 vision-small。"""
     from swarm.models.router import ModelRouter
 
     router = ModelRouter()
+    monkeypatch.setattr(router.config, "routing_multimodal", "plain-text-model")  # 非多模态
     rows = [
         {"model_id": "text-only", "supports_multimodal": False, "source": "probed", "context_window": 128000},
         {"model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000},
         {"model_id": "vision-small", "supports_multimodal": True, "source": "default", "context_window": 32000},
     ]
-    with patch("swarm.models.capability_store.list_capabilities", return_value=rows):
+    with patch("swarm.models.capability_store.list_capabilities", return_value=rows), \
+         patch("swarm.models.capability_store.get_capability", return_value=None):
         primary, fallback = router._resolve_route("medium", "multimodal")
-    # 探测确认的 vision-pro 优先于 default 源的 vision-small
     assert primary == "vision-pro", primary
-    print("  ✅ 多模态: 从能力库选探测确认的 vision-pro (优先于default源)")
+    print("  ✅ 多模态: 配非多模态→能力库自动发现探测确认的 vision-pro")
+
+
+def test_configured_multimodal_wins_over_capability(monkeypatch):
+    """换装安全（hunter#4 治本）：配的 routing_multimodal 本身多模态 → 单一权威，压过能力库
+    自动发现——绝不被陈旧/下线模型的 probed 行把子任务派到死端点。"""
+    from swarm.models.router import ModelRouter
+
+    router = ModelRouter()
+    monkeypatch.setattr(router.config, "routing_multimodal", "ThinkingCap-Qwen3.6-27B")  # 名字 hint→多模态
+    rows = [{"model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000}]
+    with patch("swarm.models.capability_store.list_capabilities", return_value=rows), \
+         patch("swarm.models.capability_store.get_capability", return_value=None):
+        primary, fallback = router._resolve_route("medium", "multimodal")
+    assert primary == "ThinkingCap-Qwen3.6-27B", primary  # 配的权威，不被 vision-pro 顶掉
+    print("  ✅ 多模态: 配的多模态模型权威，压过能力库自动发现")
 
 
 def test_multimodal_route_fallback_when_no_capability():

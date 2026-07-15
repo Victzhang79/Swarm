@@ -47,11 +47,18 @@ def test_heuristic_context_cloud_default():
 
 
 def test_heuristic_multimodal():
-    assert cap.heuristic_supports_multimodal("Qwen3.6-27B-Saka-NVFP4-multimodal") is True
+    assert cap.heuristic_supports_multimodal("some-model-NVFP4-multimodal") is True
     assert cap.heuristic_supports_multimodal("some-vl-model") is True
     assert cap.heuristic_supports_multimodal("Step-3.7-Flash") is True
+    # ThinkingCap-Qwen3.6-27B 含视觉但名字无 vl/vision 线索 → 显式登记 hint(2026-07-15 换装)
+    assert cap.heuristic_supports_multimodal("ThinkingCap-Qwen3.6-27B") is True
     assert cap.heuristic_supports_multimodal("plain-text-model") is False
-    print("  ✅ 启发式: 多模态名字线索 (vl/multimodal/step-3 → True)")
+    print("  ✅ 启发式: 多模态名字线索 (vl/multimodal/step-3/thinkingcap → True)")
+
+
+def test_heuristic_thinkingcap_context_256k():
+    # ThinkingCap 标称 256K，须先于 "qwen3"(128K)泛匹配命中(名字含 qwen3.6)
+    assert cap.heuristic_context_window("ThinkingCap-Qwen3.6-27B", kind="local") == 256_000
 
 
 def test_default_capability_shape():

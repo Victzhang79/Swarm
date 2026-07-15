@@ -529,7 +529,7 @@ async def dispatch(state: BrainState) -> dict:
         plan_obj.shared_contract if plan_obj else {}
     )
     # 主力并行轮转：把本批子任务按序轮转分配到 worker_parallel_pool 里的本地主力，
-    # 让两个能力相当的本地主力(Qwen3.6-40B-Claude/MiniMax)同时干、分散负载、产出更快。
+    # 让两个能力相当的本地主力(如 Qwopus3.6-27B-v2/MiniMax)同时干、分散负载、产出更快。
     # 轮转不覆盖 alternate(失败重试)；池空则不轮转(按 difficulty 路由)。
     _pool = list(getattr(config.worker, "worker_parallel_pool", []) or [])
     # FINDING-12 + E5：闸门对拆不动大块的首轮 force_strong 标记已合并进 _gate_force_strong

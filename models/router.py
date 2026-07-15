@@ -771,7 +771,7 @@ class EndpointProvider:
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens
         # ── 关闭本地推理模型的 reasoning/think 块（task 94334785 根因）──
-        # 本地 Qwen 系 reasoning 模型(如 Qwen3.6-40B-Claude-4.6)默认输出 <think>...</think>
+        # 本地 Qwen 系 reasoning 模型(如 Qwopus3.6-27B-v2 / ThinkingCap-Qwen3.6-27B)默认输出 <think>...</think>
         # 推理块，但经 vLLM chat template 后【开头 <think> 被吃掉、内容全进 think、think 外的
         # 真实答案为空】→ worker agent 拿到空回复 → 反复要求 → "Sorry, need more steps" 拒答
         # (实证：st-1 30s 空转拒答，未调任何工具)。worker 执行不需要 reasoning(要直接调工具
@@ -1087,7 +1087,7 @@ class ModelRouter:
         """E1+复核 C-4：alternate 候选=fallback 链中 ≠primary 且【非 trivial 档 primary】
         的模型（难度本身为 trivial 除外）。
 
-        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 Saka 112K 最弱）居首
+        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 ThinkingCap-27B）居首
         时，「第一个 ≠primary」会把 medium/complex 的失败重试派到最弱模型=RUN10 顾虑成真。
         排除 trivial 档 primary 后，medium 的 alternate 自然落到更强档，「换模型」不再
         意味着「降级」。"""
@@ -1167,16 +1167,20 @@ class ModelRouter:
         """查路由表 → (primary_model_name, fallback_model_names)。
         fallback 现为【多级兜底链】(list)：主失败后逐级降级，全本地。"""
         if modality == "multimodal":
-            # 设计 v3 A.5：优先从能力库筛 supports_multimodal=True 的模型，
-            # 而非读写死的 routing_multimodal。能力库无可用项则回退写死配置。
+            fb = self.config.routing_multimodal_fallback
+            configured = self.config.routing_multimodal
+            # 换装安全（2026-07-15 复核 hunter#4 治本）：显式配置的 routing_multimodal 若【本身确为
+            # 多模态】(能力库探测真值 or 名字启发式)，它即单一权威——绝不让能力库里【已下线模型的
+            # 陈旧 probed 行】(upsert-only 不自动删，source=probed 会盖过新配模型的 default 档)把图像
+            # 子任务静默首派到死端点。仅当配的这个【不是多模态】(疑似误配)才回落 A.5 自动发现。
+            # 与北极星「单一权威 resolver」一致：显式路由配置 > 能力库陈旧探测。
+            if configured and self._model_supports_multimodal(configured):
+                return (configured, fb)
+            # 设计 v3 A.5：配的不是多模态 → 从能力库自动发现本地 VL 模型；仍无则回退写死配置。
             mm_primary = self._multimodal_model_from_capabilities()
             if mm_primary:
-                # primary 用能力库选出的真·多模态模型；fallback 仍用写死配置兜底
-                return (mm_primary, self.config.routing_multimodal_fallback)
-            return (
-                self.config.routing_multimodal,
-                self.config.routing_multimodal_fallback,
-            )
+                return (mm_primary, fb)
+            return (configured, fb)
 
         route_map = {
             "trivial": (self.config.routing_trivial, self.config.routing_trivial_fallback),
@@ -1235,6 +1239,23 @@ class ModelRouter:
         except Exception as exc:  # noqa: BLE001
             logger.debug("从能力库选多模态模型失败，回退写死配置: %s", exc)
             return None
+
+    def _model_supports_multimodal(self, model_id: str) -> bool:
+        """指定模型是否多模态：优先能力库【探测真值】(source!=default)，无真值记录回退名字启发式。
+
+        供 _resolve_route 判定"显式配的 routing_multimodal 本身是否多模态"——是则它权威，
+        不被能力库里下线模型的陈旧行盖过（换装安全，hunter#4 治本）。DB 不可达/异常 → 启发式兜底。
+        """
+        from swarm.models import capability_store as cap
+        try:
+            prov = self.config.provider_for_model(model_id)
+            if prov is not None:
+                rec = cap.get_capability(getattr(prov, "id", None), model_id)
+                if rec and rec.get("source") != cap.SOURCE_DEFAULT:
+                    return bool(rec.get("supports_multimodal"))
+        except Exception:  # noqa: BLE001 — DB 不可达等，落启发式
+            pass
+        return cap.heuristic_supports_multimodal(model_id)
 
     def _get_provider_for_model(self, model_name: str) -> EndpointProvider:
         """模型 → EndpointProvider。按 config.provider_for_model() 显式归属优先，

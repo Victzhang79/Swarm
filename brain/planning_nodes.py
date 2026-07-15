@@ -138,16 +138,19 @@ def _min_worker_context_window() -> int | None:
 
         cfg = get_config().model
         wcfg = get_config().worker
-        # 预算基于【worker 主力池】窗口——三个本地模型都是 worker(不按难度绑死)，
-        # 但预算该用主力(Qwen3.6-40B-Claude 256K / MiniMax 196K)窗口算，
-        # 不被次级 Saka(112K,只跑trivial小活+fallback)拖低。
-        # 安全性：budget×0.75×0.7≈103K < Saka 112K，即使降级到 Saka，worker 的
-        # pre_model_hook 裁剪后输入也装得下——三个 worker 模型通吃，无需额外重拆。
-        candidate_models = list(getattr(wcfg, "worker_parallel_pool", []) or [])
-        if not candidate_models:
-            # 池空兜底：退回各档 primary（向后兼容）
-            candidate_models = [cfg.routing_trivial, cfg.routing_medium, cfg.routing_complex]
-        candidate_models = [m for m in candidate_models if m]
+        # 候选 = 首派池 ∪ 路由三档 primary+fallback——worker 子任务首派走池，失败按难度
+        # fallback 链切备，故【实际可能落到】的模型是这全集，最小真实窗口须涵盖全部可达目标。
+        # （2026-07-15 复核治本：池收成单 Qwopus 后，旧写法"池非空就只算池"会把 MiniMax 196K
+        # 等 fallback 排除出最小窗口计算——安全下界虚高。改为并集，与本函数 docstring 一致。）
+        # 安全性：budget×0.75×0.7≈103K < 最小 worker 窗口(MiniMax 196K)，即使降级切备，worker 的
+        # pre_model_hook 裁剪后输入也装得下——所有 worker 模型通吃，无需额外重拆。
+        candidate_models = (
+            list(getattr(wcfg, "worker_parallel_pool", []) or [])
+            + [cfg.routing_trivial, *cfg.routing_trivial_fallback,
+               cfg.routing_medium, *cfg.routing_medium_fallback,
+               cfg.routing_complex, *cfg.routing_complex_fallback]
+        )
+        candidate_models = [m for m in dict.fromkeys(candidate_models) if m]  # 去重保序
 
         windows: list[int] = []
         for model_name in candidate_models:

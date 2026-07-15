@@ -24,13 +24,13 @@ def test_complex_primary_is_strongest_local():
 
 
 def test_complex_fallback_chain_order():
-    """用户编排(2026-06-18)：complex 兜底链 = 先 27B-Saka(轻快112k) → 再另一台大的(保上下文)
-    → 最后 Step-Flash(256k但慢)。并行主力 40B/MiniMax 任一挂先上 27B-Saka。"""
+    """用户编排(2026-06-18，2026-07-15 换装)：complex 兜底链 = 先 ThinkingCap-27B(256k，等效原
+    27B-Saka) → 再另一台大的(保上下文) → 最后 Step-Flash(256k但慢)。并行主力任一挂先上 ThinkingCap。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert "Saka" in fb[0], f"第一兜底应 27B-Saka(挂了先上小的): {fb}"
-    assert any("MiniMax" in x or "40B" in x for x in fb), f"应含另一台大模型兜底(保上下文): {fb}"
+    assert "ThinkingCap" in fb[0], f"第一兜底应 ThinkingCap-27B(挂了先上小的): {fb}"
+    assert any("MiniMax" in x for x in fb), f"应含另一台大模型兜底(保上下文): {fb}"
     assert any("Step" in x for x in fb), f"应含 Step-Flash 最终垫底: {fb}"
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
@@ -66,16 +66,15 @@ def test_alternate_picks_first_non_primary():
     """retry 换备选取 fallback 链上首个 ≠primary【且非 trivial 档 primary】的模型。
 
     语义演进（round38c 主题E 复核 C-4）：FINDING-8 原语义「首个≠primary」在三档链统一
-    trivial 档居首的编排下，把 medium/complex 失败重试全派到最弱模型（Saka 112K）——
+    trivial 档居首的编排下，把 medium/complex 失败重试全派到 trivial 档模型（ThinkingCap）——
     RUN10「换模型=降级」顾虑成真。现 alternate 候选排除 trivial 档 primary：complex
-    (primary=Qwopus) 的 alternate=MiniMax（medium 档）而非 Saka。"""
+    (primary=Qwopus) 的 alternate=MiniMax（medium 档）而非 trivial 档 ThinkingCap。"""
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     _, model_name = r.get_alternate_llm_for_subtask("complex", "text")
-    assert "Saka" not in model_name, (
-        f"非 trivial 难度的 alternate 不得落到 trivial 档最弱模型: {model_name}")
     _trivial = getattr(r.config, "routing_trivial", "")
-    assert model_name != _trivial and model_name, f"alternate 应为非 trivial 异构备选: {model_name}"
+    assert model_name != _trivial and model_name, (
+        f"非 trivial 难度的 alternate 不得落到 trivial 档 primary: {model_name}")
 
 
 def test_alternate_skips_primary_duplicate():
@@ -117,9 +116,9 @@ def test_update_routing_stores_list_as_comma_chain():
     """T2-4：PUT /api/routing 收到 fallback list → 存逗号链(非 str(list))，可被 _coerce 还原。"""
     from swarm.config.settings import _coerce_model_list
     # 模拟 update_routing 的 list→env 转换逻辑
-    raw = ["MiniMax-M2.7-Pro", "Qwen3.6-27B-Saka-NVFP4", "Qwen3.5-122B-A10B-NVFP4"]
+    raw = ["MiniMax-M2.7-Pro", "ThinkingCap-Qwen3.6-27B", "Qwopus3.6-27B-v2-NVFP4"]
     val = ",".join(str(x).strip() for x in raw if str(x).strip())
-    assert val == "MiniMax-M2.7-Pro,Qwen3.6-27B-Saka-NVFP4,Qwen3.5-122B-A10B-NVFP4"
+    assert val == "MiniMax-M2.7-Pro,ThinkingCap-Qwen3.6-27B,Qwopus3.6-27B-v2-NVFP4"
     # env 读回应还原成原 list
     assert _coerce_model_list(val) == raw
     # 反例：str(list) 会产生非法 JSON（验证我们没用它）

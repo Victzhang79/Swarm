@@ -3,7 +3,7 @@
 
 取证（forensics 主题E + 亲核）：
 - E1：dispatch 旧判据 len(_pool)==1 把「池长」当「无备选」——.env 池 1 模型但 difficulty
-  fallback 链有异构备选（Saka/MiniMax/Step），retry_alternate 被静默改写同模型+boost，
+  fallback 链有异构备选（ThinkingCap/MiniMax/Step），retry_alternate 被静默改写同模型+boost，
   failure 侧「换备选」日志 9 次全空转（register #26）。
 - E6③：MERGE 密钥闸丢弃 scan_diff_for_secrets 返回的 should_block、硬编码 CRITICAL；
   settings.security_block_severity 开关存在但只被 AUDIT 消费——配 high 无效。

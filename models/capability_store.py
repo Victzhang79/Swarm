@@ -91,13 +91,18 @@ _CONTEXT_HINTS: list[tuple[str, int]] = [
     # 122B-A10B 本地部署实测 max_model_len=65536（2026-07-12 网关元数据），
     # 必须先于 "qwen3" 泛匹配命中，否则高估一倍 → 上下文预算超包 400。
     ("122b-a10b", 64_000),
+    # ThinkingCap-Qwen3.6-27B(2026-07-15 换装 27B-Saka)标称 256K，须先于 "qwen3" 泛匹配
+    # (名字含 qwen3.6)命中，否则被低估成 128K。真值仍以探测为准，此为无探测时的兜底。
+    ("thinkingcap", 256_000),
     ("qwen3", 128_000),
     ("deepseek", 64_000),
     ("minimax", 200_000),
 ]
 
 # 名字里出现这些子串时，倾向判断为多模态（仅启发式默认；真值靠探测）。
-_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "step-3")
+# "thinkingcap"：ThinkingCap-Qwen3.6-27B 含视觉能力(2026-07-15 用户确认，等效原 Saka-mm)，
+# 但名字无 vl/vision 线索 → 显式登记，否则多模态路由把它当纯文本、图像子任务无本地承接。
+_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "step-3", "thinkingcap")
 
 
 def _normalize_size_token(model_id: str) -> int | None:

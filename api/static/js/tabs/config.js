@@ -615,7 +615,7 @@ function renderRoutingTable(data) {
             <label class="form-label">备选模型链（多级兜底，逗号分隔，按序降级）</label>
             <input class="form-input routing-fallback-input" data-tier="${t.key}" data-role="fallback"
                    value="${escapeHtml(Array.isArray(cfg.fallback) ? cfg.fallback.join(', ') : (cfg.fallback || ''))}"
-                   placeholder="如 MiniMax-M2.7-Pro, Qwen3.6-27B-Saka-NVFP4" />
+                   placeholder="如 MiniMax-M2.7-Pro, ThinkingCap-Qwen3.6-27B" />
           </div>
         </div>
       </div>`;

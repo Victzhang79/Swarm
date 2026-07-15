@@ -1036,8 +1036,8 @@ class WorkerExecutor(
         if _is_refusal_or_truncated(combined):
             # ── 拒答(空转输出 "Sorry, need more steps")是【模型能力】问题
             # (models/errors.py 归 CAPABILITY，非瞬时)。RUN5/RUN6 实证：trivial 档拒答时换
-            # 该难度 fallback 链首=更弱模型(如 27B-Saka)→ 雪上加霜，仍拒答。修正方向：
-            # 换【最强本地模型】(routing_complex=40B 256k)worker 内部重试一次；已在最强模型上
+            # 该难度 fallback 链首=更弱模型(如 ThinkingCap-27B)→ 雪上加霜，仍拒答。修正方向：
+            # 换【最强本地模型】(routing_complex=Qwopus 256k)worker 内部重试一次；已在最强模型上
             # 则无可再升，直接硬否决，抛给上层 HANDLE_FAILURE 走 force_strong/abandon。
             _strongest = get_config().model.routing_complex
             if (not getattr(self, "_trivial_alt_retried", False)

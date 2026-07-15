@@ -45,7 +45,7 @@ def test_get_llm_by_name_exists():
 
 def test_round_robin_index_logic():
     """轮转索引逻辑：N 个子任务按 idx % len(pool) 分配到 2 个主力。"""
-    pool = ["Qwen3.6-40B-Claude-4.6-NVFP4", "MiniMax-M2.7-Pro"]
+    pool = ["Qwopus3.6-27B-v2-NVFP4", "MiniMax-M2.7-Pro"]
     assigned = [pool[i % len(pool)] for i in range(4)]
     # 4 个子任务 → 两个模型各 2 个（均衡）
     assert assigned.count(pool[0]) == 2
