@@ -722,3 +722,130 @@ def test_r62_task1_empty_file_plan_keeps_legacy_heuristic():
     assert out.get("symbols_domiciled"), "空 file_plan 走旧启发式，行为不变"
     assert any(f.endswith("RobotQueryService.java")
                for s in plan.subtasks for f in s.scope.create_files)
+
+
+# ── ⑤ Task3（round62 治本）：R57-6 收权后剪除空写 scope 死子任务 ──
+
+def _st_scope(sid, scope, depends_on=None):
+    return SubTask(id=sid, description=f"task {sid}",
+                   difficulty=SubTaskDifficulty.MEDIUM, scope=scope,
+                   depends_on=depends_on or [])
+
+
+def test_r62_task3_prune_empty_scope_no_dependents():
+    """R57-6 收权留下的空写 scope 死子任务（无人依赖）→ 确定性剪除，不派 worker 空转。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    plan = TaskPlan(
+        task_id="t-62t3", subtasks=[
+            _st_scope("st-1", FileScope(create_files=["a/A.java"])),
+            _st_scope("st-dead", FileScope()),          # 空写 scope、非 allow_any = 死
+            _st_scope("st-2", FileScope(writable=["b/B.java"])),
+        ],
+        parallel_groups=[["st-1", "st-dead", "st-2"]])
+    pruned = prune_empty_scope_subtasks(plan)
+    assert pruned == ["st-dead"]
+    assert {s.id for s in plan.subtasks} == {"st-1", "st-2"}
+    # parallel_groups 同步清理，无空组、无残留 id
+    assert all("st-dead" not in g for g in plan.parallel_groups)
+
+
+def test_r62_task3_keep_dead_task_with_dependents():
+    """空写 scope 死任务【被别人依赖】→ 保留 + 告警，绝不静默重映射把工作丢了。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    plan = TaskPlan(
+        task_id="t-62t3b", subtasks=[
+            _st_scope("st-dead", FileScope()),
+            _st_scope("st-child", FileScope(create_files=["c/C.java"]),
+                      depends_on=["st-dead"]),
+        ],
+        parallel_groups=[["st-dead", "st-child"]])
+    pruned = prune_empty_scope_subtasks(plan)
+    assert pruned == []                                  # 被依赖 → 不剪
+    assert {s.id for s in plan.subtasks} == {"st-dead", "st-child"}
+
+
+def test_r62_task3_allow_any_empty_scope_not_pruned():
+    """allow_any 的空 scope 不是死任务（worker 有全域写权）→ 绝不剪。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    plan = TaskPlan(
+        task_id="t-62t3c", subtasks=[
+            _st_scope("st-free", FileScope(allow_any=True)),
+            _st_scope("st-1", FileScope(create_files=["a/A.java"])),
+        ],
+        parallel_groups=[["st-free", "st-1"]])
+    assert prune_empty_scope_subtasks(plan) == []
+    assert {s.id for s in plan.subtasks} == {"st-free", "st-1"}
+
+
+def test_r62_task3_delete_only_scope_not_pruned():
+    """仅 delete_files 也是有效写目标（删除是真工作）→ 绝不剪。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    plan = TaskPlan(
+        task_id="t-62t3d", subtasks=[
+            _st_scope("st-del", FileScope(delete_files=["old/Legacy.java"])),
+            _st_scope("st-1", FileScope(create_files=["a/A.java"])),
+        ],
+        parallel_groups=[["st-del", "st-1"]])
+    assert prune_empty_scope_subtasks(plan) == []
+    assert {s.id for s in plan.subtasks} == {"st-del", "st-1"}
+
+
+def test_r62_task3_prune_cleans_stale_depends_on_ref():
+    """剪掉死任务时，其它子任务里指向它的 depends_on 引用也一并清（无悬空边）。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    # st-dead 无人依赖被剪；st-2 曾错误地 depends_on 一个【也被剪】的死任务是不可能的
+    # （被依赖就不剪）——此处验证：另一个死任务 st-dead2 无依赖被剪后，其自身 depends_on
+    # 被清、且不给别人留悬空。
+    plan = TaskPlan(
+        task_id="t-62t3e", subtasks=[
+            _st_scope("st-1", FileScope(create_files=["a/A.java"])),
+            _st_scope("st-dead", FileScope(), depends_on=["st-1"]),
+        ],
+        parallel_groups=[["st-1", "st-dead"]])
+    pruned = prune_empty_scope_subtasks(plan)
+    assert pruned == ["st-dead"]
+    assert {s.id for s in plan.subtasks} == {"st-1"}
+    assert all("st-dead" not in (s.depends_on or []) for s in plan.subtasks)
+
+
+def test_r62_task3_audit_intent_not_pruned():
+    """对抗复核 Finding1（CRITICAL）：intent=AUDIT 不产 diff、走审计专路，空写 scope 是
+    预期形态——绝不当死任务剪，否则静默删真安全审计工作。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    from swarm.types import TaskIntent
+    audit = SubTask(id="st-audit", description="安全审计", intent=TaskIntent.AUDIT,
+                    difficulty=SubTaskDifficulty.MEDIUM, scope=FileScope())
+    plan = TaskPlan(
+        task_id="t-62t3audit",
+        subtasks=[audit, _st_scope("st-1", FileScope(create_files=["a/A.java"]))],
+        parallel_groups=[["st-audit", "st-1"]])
+    assert prune_empty_scope_subtasks(plan) == []       # AUDIT 不剪
+    assert {s.id for s in plan.subtasks} == {"st-audit", "st-1"}
+
+
+def test_r62_task3_chained_dead_tasks_pruned_to_fixpoint():
+    """对抗复核 Finding3：链尾死任务剪掉后，上游死任务变得无人依赖 → 不动点再剪，
+    绝不留链上的死任务继续空转（单趟会漏）。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    # st-A 死（无依赖）；st-B 死且 depends_on st-A；二者都无外部依赖者
+    plan = TaskPlan(
+        task_id="t-62t3chain", subtasks=[
+            _st_scope("st-real", FileScope(create_files=["a/A.java"])),
+            _st_scope("st-A", FileScope()),
+            _st_scope("st-B", FileScope(), depends_on=["st-A"])],
+        parallel_groups=[["st-real", "st-A", "st-B"]])
+    pruned = prune_empty_scope_subtasks(plan)
+    assert set(pruned) == {"st-A", "st-B"}              # 两个都剪（不动点）
+    assert {s.id for s in plan.subtasks} == {"st-real"}
+
+
+def test_r62_task3_never_prune_to_empty_plan():
+    """对抗复核 + 回归（degraded 兜底）：全部子任务都是空写 scope（LLM 双超时兜底的
+    单个占位 st-1）→ 绝不剪成空计划，保留交下游 plan_generation_failed fail-fast。"""
+    from swarm.brain.contract_utils import prune_empty_scope_subtasks
+    plan = TaskPlan(
+        task_id="t-62t3empty",
+        subtasks=[_st_scope("st-1", FileScope(writable=[], readable=[]))],
+        parallel_groups=[["st-1"]])
+    assert prune_empty_scope_subtasks(plan) == []
+    assert [s.id for s in plan.subtasks] == ["st-1"]    # 计划恒 ≥1 子任务

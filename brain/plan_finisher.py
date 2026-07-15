@@ -445,6 +445,15 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
     except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
         logger.warning("[PLAN-FINISH] 脚手架注入失败（fail-open）", exc_info=True)
     try:
+        # R62-Task3：R57-6 收权后确定性剪除空写 scope 死子任务（无人依赖者），
+        # 否则一路漏到 dispatch → worker 空转 churn。
+        from swarm.brain.contract_utils import prune_empty_scope_subtasks
+        _pruned = prune_empty_scope_subtasks(plan)
+        if _pruned:
+            out["pruned_empty_scope"] = _pruned
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] 空 scope 死子任务剪除失败（fail-open）", exc_info=True)
+    try:
         from swarm.brain.nodes.shared import _task_requests_tests
         from swarm.brain.plan_validator import normalized_file_plan_paths
         from swarm.brain.symbol_surgery import attach_orphan_file_plan_entries

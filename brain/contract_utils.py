@@ -928,6 +928,82 @@ def inject_build_scaffold_subtasks(
     return injected
 
 
+def prune_empty_scope_subtasks(plan) -> list[str]:
+    """R62-Task3（round62 治本）：R57-6 收权后确定性剪除【空写 scope 死子任务】。
+
+    病根：R57-6 从 LLM 自建脚手架子任务手里收回 pom 写权（脚手架独占），留下 writable/
+    create_files/delete_files **全空**且非 allow_any 的子任务（round62 实测 st-3/25/31/34）。
+    这类子任务**不可派发**——scope_guard 放行不了任何写、验收"构建成功"永不满足 → worker
+    空转 churn。dispatch 无空 scope 闸、plan_batch 只剪 group 不剪子任务 → 它们一路漏到执行期。
+
+    治：无任何写目标且非 allow_any = 死任务，确定性剪除。★仅剪【无人依赖】者★——被别的
+    子任务 depends_on 的死任务是更深的计划错，保留并告警，**绝不静默重映射把工作丢了**。
+    剪除时一并清 depends_on 引用 + parallel_groups（守 validate_plan_structure 全员入组约束）。
+    栈中立（纯结构判定，不涉任何语言）。返回被剪 id 列表（供收尾器机读观测）。
+
+    对抗复核加固：
+    - ★AUDIT 意图豁免★：intent=AUDIT 不产 diff、走 _run_security_audit 专路（nodes:3051），
+      空写 scope 是它的**预期**形态（contract_utils:2407 反向印证：AUDIT 带写权才是误标）→
+      绝不当死任务剪，否则静默删真审计工作。
+    - ★不动点迭代★：剪掉链尾死任务后其上游死任务可能变得无人依赖 → 再剪，直到不动
+      （单趟会漏链尾之上的死任务，仍空转）。
+    - ★绝不剪成空计划★：LLM 双超时/解析失败的降级兜底计划就是单个空 scope 占位 st-1，
+      携 plan_generation_failed 交下游 fail-fast，不可剪没；计划恒 ≥1 子任务。
+    - ★过度剪除升警★：一次剪掉计划相当比例=多半上游回归（本区历史"补丁磁铁"），升 warning。
+    """
+    from swarm.types import TaskIntent
+
+    def _dead(s) -> bool:
+        if getattr(s, "intent", None) == TaskIntent.AUDIT:
+            return False   # AUDIT 空写 scope 是预期形态（走审计专路），绝不剪
+        sc = getattr(s, "scope", None)
+        if sc is None or getattr(sc, "allow_any", False):
+            return False
+        return not (list(getattr(sc, "writable", None) or [])
+                    + list(getattr(sc, "create_files", None) or [])
+                    + list(getattr(sc, "delete_files", None) or []))
+
+    pruned_all: list[str] = []
+    subs = getattr(plan, "subtasks", None) or []
+    for _ in range(len(subs) + 1):   # 不动点；上界=子任务数，绝不无限
+        subs = plan.subtasks
+        dead_ids = {s.id for s in subs if _dead(s)}
+        if not dead_ids:
+            break
+        depended = {d for s in subs for d in (getattr(s, "depends_on", None) or [])
+                    if d in dead_ids}
+        prunable = dead_ids - depended
+        # ★绝不剪成空计划★：全死（含降级兜底单 st-1）→ 保留交下游 fail-fast
+        if prunable and [s for s in subs if s.id not in prunable]:
+            plan.subtasks = [s for s in subs if s.id not in prunable]
+            for s in plan.subtasks:
+                if getattr(s, "depends_on", None):
+                    s.depends_on = [d for d in s.depends_on if d not in prunable]
+            pg = getattr(plan, "parallel_groups", None)
+            if pg:
+                plan.parallel_groups = [[x for x in g if x not in prunable] for g in pg]
+                plan.parallel_groups = [g for g in plan.parallel_groups if g]
+            pruned_all.extend(sorted(prunable))
+        else:
+            break   # 无可剪（全被依赖 / 会剪空）→ 停
+    # 收尾：仍在的死任务（被依赖或"剪空"守卫保下的降级态）→ 告警可观测，不静默
+    _left_dead = sorted(s.id for s in plan.subtasks if _dead(s))
+    if _left_dead:
+        logger.warning(
+            "[SCAFFOLD-INJECT] R62-Task3 %d 个空写 scope 死子任务保留（被依赖 或 全死降级态"
+            "不可剪空）→ 交下游计划复核/fail-fast，绝不静默重映射丢工作: %s",
+            len(_left_dead), _left_dead)
+    if pruned_all:
+        _total = len(pruned_all) + len(plan.subtasks)
+        _lvl = (logger.warning if len(pruned_all) > max(2, _total // 4)
+                else logger.info)
+        _lvl("[SCAFFOLD-INJECT] R62-Task3 确定性剪除 %d/%d 个空写 scope 死子任务（收权后无写"
+             "目标、无人依赖，派发=worker 空转 churn）%s: %s", len(pruned_all), _total,
+             "（占比偏高，疑上游回归，请核）" if len(pruned_all) > max(2, _total // 4) else "",
+             pruned_all)
+    return pruned_all
+
+
 def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                           base_ref: str | None = None) -> bool:
     """P1-1：scope 归一，消除"同一文件创建/写权限分散到多个子任务"导致的 scope_violation。
