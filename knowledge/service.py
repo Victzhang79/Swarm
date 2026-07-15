@@ -337,8 +337,63 @@ def empty_knowledge_context() -> KnowledgeContext:
     }
 
 
+# ★G11（Task#9 审计⑥）★ 相似度地板：错题/成功层是【按真·余弦相似度排名的历史召回】
+# （store.py `1-(embedding<=>q)` ∈[0,1]，越大越相关）；低相似度命中=与当前任务无关（异栈错题
+# 向量相似度天然低——异栈=异词表=低相似），当作权威"过往教训"注入 plan prompt 会误导大脑。
+# ★只治真·余弦层★（对抗 silent-hunter 双 CRITICAL 整改）：
+#   · 【不含 semantic】——嵌入不可用时它降级为 BM25 关键词检索，写的是【未归一 raw BM25 分】
+#     （scale≠余弦），拿 0.25 余弦地板去卡会在【嵌入宕机降级期】静默清空关键词兜底召回
+#     （正是 N-12/N-13 要保的降级路径，硬过滤=雪上加霜）；
+#   · 【不含 behavior】——共现层根本不带 similarity/score 字段，列进来是死代码+虚假覆盖声明。
+#   · struct（精确符号查）/norms（人工规范按 priority）本就不设地板。
+# ★fail-open 三重★（绝不误清召回）：无字段(None/"")、非数值、NaN、【以及恰好 0.0】→ 一律保留。
+#   0.0 恰好是 store.py 把【空 embedding 行】NULL 相似度强制 coerce 成的值（silent-hunter
+#   CONFIRMED #1）——把 0.0 也当 fail-open，既救回无向量的 pinned/降级行，又只丢真·(0,floor)
+#   区间的"弱相关"噪声；真·正交(cos=0)召回极罕见、保留亦无害。
+# ★范围★：本地板只作用于 Brain 规划 prompt（format_brain_knowledge_prompt→本函数）；Worker 执行
+#   prompt 走 compact_knowledge_context 未过地板（by design，规划期防误导优先，worker 面另议）。
+_SIMILARITY_RANKED_LAYERS = frozenset({"mistakes", "successes"})
+
+
+def _recall_similarity_floor() -> float:
+    import os
+    try:
+        return float(os.environ.get("SWARM_RECALL_SIMILARITY_FLOOR", "0.25"))
+    except (TypeError, ValueError):
+        return 0.25
+
+
+def _above_similarity_floor(item: dict[str, Any], floor: float) -> bool:
+    """条目相似度是否 ≥ 地板；无/非数值/NaN/恰好 0.0 → True（fail-open，绝不误清召回）。"""
+    import math
+    raw = item.get("similarity")
+    if raw is None:
+        raw = item.get("score")
+    if raw is None or raw == "":
+        return True
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return True
+    if math.isnan(val) or val == 0.0:   # NaN=零向量余弦；0.0=NULL embedding coerce 值 → fail-open
+        return True
+    return val >= floor
+
+
 def format_layer_items(layer: str, items: list[dict[str, Any]], top_k: int) -> list[dict[str, str]]:
     """将检索结果格式化为 Tool 输出条目"""
+    # G11：真·余弦相似度层先过地板再截 top_k（items 已按相似度降序，过滤低分噪声召回）。
+    if layer in _SIMILARITY_RANKED_LAYERS:
+        _floor = _recall_similarity_floor()
+        if _floor > 0:
+            _kept = [it for it in items if _above_similarity_floor(it, _floor)]
+            if len(_kept) != len(items):
+                # 全层被清空 → WARNING（可能是降级/异常，operator 需可见）；部分丢弃 → INFO。
+                _lvl = logger.warning if (items and not _kept) else logger.info
+                _lvl("[knowledge] G11 %s 层相似度地板 %.2f：命中 %d → 保留 %d（丢弃低相似召回，"
+                     "防异栈/陈旧错题误导大脑）%s", layer, _floor, len(items), len(_kept),
+                     "【整层清空——疑降级，请核查嵌入服务】" if (items and not _kept) else "")
+            items = _kept
     formatted: list[dict[str, str]] = []
     for item in items[:top_k]:
         if layer == "struct":

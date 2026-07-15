@@ -29,6 +29,78 @@ def test_format_layer_items():
     print("  ✅ format_layer_items")
 
 
+def test_g11_similarity_floor_filters_low_recall():
+    """G11（Task#9 审计⑥）：错题/成功等相似度排名层，低于相似度地板的召回被丢弃
+    （防异栈/陈旧错题误导大脑）；struct 层不设地板。"""
+    import os
+    from unittest.mock import patch
+
+    from swarm.knowledge.service import format_layer_items
+    mistakes = [
+        {"error_type": "high", "fix_description": "相关错题", "similarity": 0.8},
+        {"error_type": "low", "fix_description": "异栈噪声", "similarity": 0.05},
+    ]
+    with patch.dict(os.environ, {"SWARM_RECALL_SIMILARITY_FLOOR": "0.25"}):
+        out = format_layer_items("mistakes", mistakes, 5)
+    titles = [o["title"] for o in out]
+    assert "high" in titles and "low" not in titles, f"低相似度错题必须被地板过滤: {titles}"
+
+
+def test_g11_floor_fail_open_when_no_similarity():
+    """fail-open：条目无相似度字段（嵌入不可用/降级）→ 全保留，绝不清空召回。"""
+    import os
+    from unittest.mock import patch
+
+    from swarm.knowledge.service import format_layer_items
+    mistakes = [{"error_type": "a", "fix_description": "x"},
+                {"error_type": "b", "fix_description": "y"}]
+    with patch.dict(os.environ, {"SWARM_RECALL_SIMILARITY_FLOOR": "0.5"}):
+        out = format_layer_items("mistakes", mistakes, 5)
+    assert len(out) == 2, "无相似度字段的条目 fail-open 全保留"
+
+
+def test_g11_struct_layer_not_floored():
+    """struct 层（精确符号查，非相似度排名）不受地板影响。"""
+    import os
+    from unittest.mock import patch
+
+    from swarm.knowledge.service import format_layer_items
+    items = [{"symbol_name": "foo", "file_path": "a.py", "signature": "def foo",
+              "similarity": 0.01}]
+    with patch.dict(os.environ, {"SWARM_RECALL_SIMILARITY_FLOOR": "0.5"}):
+        out = format_layer_items("struct", items, 5)
+    assert len(out) == 1, "struct 层不设相似度地板"
+
+
+def test_g11_semantic_layer_not_floored_bm25_scale_safe():
+    """复核 CRITICAL#2 整改：semantic 层【不设地板】——嵌入宕机降级为 BM25(异 scale)，
+    拿余弦地板卡会静默清空关键词兜底召回（N-12/N-13）。低 score 的 semantic 必须保留。"""
+    import os
+    from unittest.mock import patch
+
+    from swarm.knowledge.service import format_layer_items
+    items = [{"file_path": "a.py", "content": "kw hit", "score": 0.03}]
+    with patch.dict(os.environ, {"SWARM_RECALL_SIMILARITY_FLOOR": "0.5"}):
+        out = format_layer_items("semantic", items, 5)
+    assert len(out) == 1, "semantic 层降级 BM25 scale，绝不设余弦地板"
+
+
+def test_g11_zero_similarity_fail_open():
+    """复核 CRITICAL#1 整改：0.0 是 store.py 对【空 embedding 行】NULL 相似度的 coerce 值 →
+    必须 fail-open 保留（无向量 pinned/降级行不被误清），只丢真·(0,floor) 弱相关。"""
+    import os
+    from unittest.mock import patch
+
+    from swarm.knowledge.service import format_layer_items
+    mistakes = [{"error_type": "pinned", "fix_description": "无向量行", "similarity": 0.0},
+                {"error_type": "weak", "fix_description": "弱相关噪声", "similarity": 0.1}]
+    with patch.dict(os.environ, {"SWARM_RECALL_SIMILARITY_FLOOR": "0.25"}):
+        out = format_layer_items("mistakes", mistakes, 5)
+    titles = [o["title"] for o in out]
+    assert "pinned" in titles, "0.0（空向量 coerce）必须 fail-open 保留"
+    assert "weak" not in titles, "真·(0,floor) 弱相关仍被过滤"
+
+
 def test_knowledge_tool_without_project():
     from swarm.knowledge.service import set_worker_context
     from swarm.tools.knowledge_tools import query_knowledge_base
