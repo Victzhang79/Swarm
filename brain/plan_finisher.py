@@ -298,18 +298,36 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     def _ext_for(mod: str) -> str:
         return _resolved_ext.get(mod, ext)
 
+    _guessed_mods: set[str] = set()   # G4：零证据兜底告警去重（_dir_for 每模块可被调多次）
+
     def _dir_for(mod: str) -> str:
         # ★file_plan 可用且有权威证据 → 走众数预解析（真目录、栈中立）★
         if mod in _resolved_dir:
             return _resolved_dir[mod]
-        # 回退（无 file_plan 权威证据的模块）：旧启发式，保留避免回归
+        # 回退第一档：模块名【本身就是】计划里真出现过的顶层目录（mod_dirs 命中=真证据，
+        # 非名字臆造）→ 用之。注：单一权威 _resolve_module_dirs（经 phys/_resolved_dir）
+        # 已先吃过 plan scope + 基线树证据；走到这里说明那层要么歧义（G1 闸会硬打回、此
+        # 落点无所谓）、要么该模块压根没被它覆盖。
         if mod in mod_dirs:
             return f"{mod}/{mod_dirs[mod].most_common(1)[0][0]}"
+        # ★G4（Task#9 审计 TIER3）★ 走到这里=file_plan/scaffold/基线【全部证据穷尽】、
+        # mod 也不是任何真实顶层目录 → 该契约模块【零物理证据】。审计原判"杀掉 fallback"
+        # 经复核为误：此处并非 R44/R57 病根（那病根=模块【已存在于他处】却被名字臆造成幻影
+        # 重复，已由上面的权威解析吃掉），而是【真·新模块 or 计划欠指定】的末端兜底。
+        # 保留 `{mod}/` 形状（脚手架注入可将其注册进 reactor 成真新模块）——剥掉前缀会把
+        # 符号落到工程根 src/（多模块 reactor 里根本不是模块，编不到），是【回归】不是治本。
+        # 真正缺的是【可观测】：把静默臆造升级为一次去重 LOUD 告警，令 G1 coherence 闸/
+        # coverage 面能看见"这个模块零证据、按新模块名安置"这一存疑事实（交闸=surface，非删）。
+        seg = mod.replace("_", "-").split("-")[-1]
+        if mod not in _guessed_mods:
+            _guessed_mods.add(mod)
+            logger.warning(
+                "[PLAN-FINISH] G4 契约模块 %r 零物理证据（file_plan/scaffold/基线全无）→ "
+                "按新模块名兜底安置到 %s/…（存疑：若非真·新模块，计划欠指定其物理落点）；"
+                "交 G1 coherence 闸/coverage 面暴露，绝不静默丢符号", mod, mod)
         if "" in mod_dirs and mod_dirs[""]:
             # 单模块布局：模板已是完整目录（含 src 段），前缀模块 + 尾段包名
-            seg = mod.replace("_", "-").split("-")[-1]
             return f"{mod}/{mod_dirs[''].most_common(1)[0][0]}/{seg}"
-        seg = mod.replace("_", "-").split("-")[-1]
         return f"{mod}/{tpl_dir}/{seg}"
 
     groups: dict[str, list[str]] = {}

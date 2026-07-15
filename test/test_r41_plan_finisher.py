@@ -724,6 +724,29 @@ def test_r62_task1_empty_file_plan_keeps_legacy_heuristic():
                for s in plan.subtasks for f in s.scope.create_files)
 
 
+def test_g4_zero_evidence_module_warns_and_keeps_module_shape(caplog):
+    """G4（Task#9 TIER3）：契约模块零物理证据（file_plan/scaffold/基线全无、名字也非任何
+    真实顶层目录）→ ① LOUD 告警（可观测、交闸），② 仍按 `{mod}/` 新模块形状安置（绝不剥
+    前缀落工程根 src/ = 多模块 reactor 里非模块 = 回归），③ 绝不丢符号。"""
+    import logging
+    plan = TaskPlan(
+        task_id="t-g4", subtasks=[
+            _st("st-1", create=["biz-core/src/main/java/com/x/A.java"]),
+            _st("st-2", create=["biz-core/src/main/java/com/x/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    # `ghost-mod` 从不作为任何顶层目录出现，也无 file_plan → 零证据
+    sc = {"interfaces": [{"name": "GhostService", "module": "ghost-mod"}]}
+    with caplog.at_level(logging.WARNING):
+        out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "零证据也绝不丢符号（fail-open）"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("GhostService.java"))
+    assert f.startswith("ghost-mod/"), f          # 保留新模块形状（可被脚手架注册进 reactor）
+    assert not f.startswith("src/"), f            # 绝不落工程根 src/（多模块 reactor 非模块）
+    assert any("G4" in r.message and "零物理证据" in r.message
+               for r in caplog.records), "零证据兜底必须 LOUD 告警（交闸=surface）"
+
+
 # ── ⑤ Task3（round62 治本）：R57-6 收权后剪除空写 scope 死子任务 ──
 
 def _st_scope(sid, scope, depends_on=None):
