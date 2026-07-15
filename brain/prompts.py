@@ -219,9 +219,9 @@ PLAN_USER = """## 任务描述
     "interfaces": ["InterfaceName"],
     "fields": ["fieldName"],
     "dependencies": [
-      {{"module": "<新模块目录名>", "artifacts": ["groupId:artifactId", "org.projectlombok:lombok"], "reason": "本模块子任务用到 @Slf4j/RedisTemplate 等，父 pom 未传递"}}
+      {{"module": "<模块目录名=含单一构建清单的目录，既有优先复用、勿按功能拆新模块>", "artifacts": ["groupId:artifactId", "org.projectlombok:lombok"], "reason": "本模块子任务用到 @Slf4j/RedisTemplate 等，父 pom 未传递"}}
     ],
-    "description": "Brain 统一定义的跨子任务接口契约。dependencies：每个新建模块需在其 pom 声明的依赖并集（建 pom 的脚手架子任务负责落地，写代码的子任务碰不到 pom）"
+    "description": "Brain 统一定义的跨子任务接口契约。dependencies：每个【物理构建模块】需在其构建清单声明的依赖并集（建构建文件的脚手架子任务负责落地，写代码的子任务碰不到构建文件）"
   }},
   "subtasks": [
     {{
