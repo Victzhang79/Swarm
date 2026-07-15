@@ -232,6 +232,64 @@ def test_g1_rejects_round62_cassette():
     assert any("alarm-api" in i for i in r.issues)
 
 
+from swarm.brain.plan_validator import validate_plan_granularity
+
+
+def _dst(sid, difficulty, create_files=None):
+    return SubTask(id=sid, description=sid, difficulty=difficulty,
+                   modality=SubTaskModality.TEXT,
+                   scope=FileScope(writable=[], readable=[],
+                                   create_files=create_files or [f"m/src/main/java/{sid}.java"]))
+
+
+def test_g7_high_complex_ratio_warns():
+    """G7：COMPLEX 占比超阈值 → 告警（绝不硬失败）。"""
+    subs = [_dst(f"c{i}", SubTaskDifficulty.COMPLEX) for i in range(5)] + \
+           [_dst("m1", SubTaskDifficulty.MEDIUM)]
+    plan = TaskPlan(subtasks=subs, parallel_groups=[[s.id for s in subs]])
+    r = validate_plan_granularity(plan)
+    assert r.valid, "颗粒度 smell 只告警，绝不硬失败"
+    assert any("G7" in w and "COMPLEX" in w for w in r.warnings)
+
+
+def test_g7_balanced_plan_no_warn():
+    """健康难度分布（多数 MEDIUM/TRIVIAL）→ 不告警。"""
+    subs = [_dst("c1", SubTaskDifficulty.COMPLEX)] + \
+           [_dst(f"m{i}", SubTaskDifficulty.MEDIUM) for i in range(5)]
+    plan = TaskPlan(subtasks=subs, parallel_groups=[[s.id for s in subs]])
+    r = validate_plan_granularity(plan)
+    assert not any("G7" in w for w in r.warnings)
+
+
+def test_g7_small_plan_not_evaluated():
+    """小 plan（<min_subtasks）天然高占比、不算 smell → 不评估。"""
+    subs = [_dst("c1", SubTaskDifficulty.COMPLEX), _dst("c2", SubTaskDifficulty.COMPLEX)]
+    plan = TaskPlan(subtasks=subs, parallel_groups=[[s.id for s in subs]])
+    r = validate_plan_granularity(plan)
+    assert not any("G7" in w for w in r.warnings)
+
+
+def test_g8_cross_module_subtask_warns():
+    """G8：单子任务写目标横跨 2 个物理模块根 → 告警。"""
+    st = _dst("mix", SubTaskDifficulty.MEDIUM, create_files=[
+        "ruoyi-alarm/alarm-core/src/main/java/A.java",
+        "ruoyi-alarm/alarm-api/src/main/java/B.java"])
+    plan = TaskPlan(subtasks=[st], parallel_groups=[["mix"]])
+    r = validate_plan_granularity(plan)
+    assert r.valid
+    assert any("G8" in w and "mix" in w for w in r.warnings)
+
+
+def test_g8_single_module_subtask_no_warn():
+    """内聚于单模块（不同包、同模块根）→ 不告警。"""
+    st = _dst("coh", SubTaskDifficulty.MEDIUM, create_files=[
+        "ruoyi-alarm/alarm-core/src/main/java/a/A.java",
+        "ruoyi-alarm/alarm-core/src/main/java/b/B.java"])
+    plan = TaskPlan(subtasks=[st], parallel_groups=[["coh"]])
+    r = validate_plan_granularity(plan)
+    assert not any("G8" in w for w in r.warnings)
+
+
 if __name__ == "__main__":
     test_valid_plan_passes()
     test_cycle_detected()

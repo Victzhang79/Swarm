@@ -2226,12 +2226,20 @@ async def plan(state: BrainState) -> dict:
             )
         # est_context_tokens 兜底(Q7 上下文预算)：LLM 未估时按难度+scope 文件数启发式估算，
         # 让 elaborate 的二次拆分有真实信号(否则字段恒 0，预算检测形同虚设)。
+        # ★G6（Task#9 审计④）★ 旧式只算 writable → readable/新建/产出全没算 = "0.75 余量是假的"
+        # （读 8 个大文件的子任务 est 却和只改 1 文件一样小、逃过 oversized/resplit）。纳入：
+        #   · writable ~6k（读+改）· create_files ~5k（产出）· readable ~4k（注入上下文，读侧真实开销）
+        #   · 产出余量 = 难度基线的 25%（生成 token 也吃预算，注入后大头在此近似）。栈中立、确定性。
         if not getattr(st, "est_context_tokens", 0):
             _diff = getattr(st, "difficulty", SubTaskDifficulty.MEDIUM)
             _base = {SubTaskDifficulty.TRIVIAL: 8000, SubTaskDifficulty.MEDIUM: 50000,
                      SubTaskDifficulty.COMPLEX: 120000}.get(_diff, 50000)
-            # 每个 writable 文件按 ~6k token 估(读+改)，叠加难度基线
-            st.est_context_tokens = _base + len(_writable) * 6000
+            _sc = getattr(st, "scope", None)
+            _n_create = len(getattr(_sc, "create_files", None) or [])
+            _n_read = len(getattr(_sc, "readable", None) or [])
+            st.est_context_tokens = (
+                _base + len(_writable) * 6000 + _n_create * 5000
+                + _n_read * 4000 + _base // 4)
 
     # ── 测试剔除（task 744316e7 根因·单一事实源）──
     # 此处 scope + harness 都已齐备。任务未明确要求测试时，统一剔除 scope 里的测试文件
@@ -2655,6 +2663,21 @@ async def validate_plan(state: BrainState) -> dict:
                 # = 该轮软信号对 API/盯跑不可见。
                 **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
             }
+
+    # ── G7+G8 颗粒度/难度路由 smell（Task#9 审计④）：仅告警、绝不打回 ──
+    # COMPLEX 占比过高 / 单子任务跨多物理模块 = 规划期欠分解信号（非执行致命）。此前完全不可见；
+    # 本闸把信号 surface 进 validation warnings + 遥测（下方 push_planning_feedback），令 replan/
+    # 运维可见可反馈。绝不硬打回、绝不盲目 force-resplit（会把单文件 COMPLEX 拆成同写一文件坏 patch）。
+    try:
+        from swarm.brain.plan_validator import validate_plan_granularity as _vpg
+        _gran = _vpg(plan_obj)
+        for w in _gran.warnings:
+            _vp_warnings.append(str(w))
+            logger.warning("[VALIDATE_PLAN] %s", w)
+    except Exception as exc:  # noqa: BLE001 — 纯观测，绝不因它拖垮规划主链
+        # silent-hunter #1：warning 非 debug——与本文件其它"绝不断主链"吞异常同级（默认日志级
+        # 下 debug 被滤掉=闸静默失效又回到"不可见"，正是本闸要治的病）。不阻断，但留 operator 可见痕。
+        logger.warning("[VALIDATE_PLAN] G7/G8 颗粒度检测异常跳过（非致命，本轮无颗粒度信号）: %s", exc)
 
     # ── S2-3 PRD 覆盖矩阵（确定性维度，ACCEPTANCE_DESIGN 定案3/§2.5，task#24）──
     # 接缝：结构校验后、SIMPLE 早退后（单 trivial 子任务自证覆盖，强校验只会误伤）、

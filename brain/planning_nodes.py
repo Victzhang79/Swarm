@@ -2437,7 +2437,7 @@ async def elaborate(state: BrainState) -> dict:
     # 最终检查：仍超预算/缺验收的标记出来（人工介入信号）
     oversized: list[str] = []
     for st in plan_obj.subtasks:
-        est = getattr(st, "est_context_tokens", 0) or 0
+        est = _effective_est_tokens(st)   # G6：含注入 snippet 的有效预算（注入后重算，读时算不漂移）
         if est > budget:
             oversized.append(st.id)
         if not getattr(st, "acceptance_criteria", None):
@@ -2483,6 +2483,16 @@ async def elaborate(state: BrainState) -> dict:
     return out
 
 
+def _effective_est_tokens(st) -> int:
+    """★G6（Task#9 审计④）★ 子任务的【有效】上下文预算 = 声明 est + 已注入 context_snippets
+    的 token 量（~4 char/token）。context_snippets 是真实吃 worker 上下文的注入内容，注入前的
+    est 完全没算它——"注入后重算"在此【读时计算】（不回写 est，故 elaborate 多轮 replan 重注入
+    也不漂移/双计）。栈中立、确定性。est 缺省=0 时仍只回 snippet 贡献（下界，不假绿）。"""
+    est = getattr(st, "est_context_tokens", 0) or 0
+    snip = getattr(st, "context_snippets", "") or ""
+    return est + len(snip) // 4
+
+
 def _needs_resplit(st, budget: int) -> bool:
     """子任务是否需二次拆分：超上下文预算（INVEST 缺验收不强制拆，仅标记）。
 
@@ -2504,8 +2514,7 @@ def _needs_resplit(st, budget: int) -> bool:
     # 150k 预算，但 CODING 工作量(逐个写 9 个文件)远超时间预算。按文件数拆，确定性投喂。
     if _oversized_by_files(st):
         return True
-    est = getattr(st, "est_context_tokens", 0) or 0
-    return est > budget
+    return _effective_est_tokens(st) > budget   # G6：含注入 snippet 的有效预算
 
 
 def _oversized_by_files(st) -> bool:

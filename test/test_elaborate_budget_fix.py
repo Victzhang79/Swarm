@@ -45,3 +45,34 @@ def test_truly_oversized_still_resplits():
         est_context_tokens=budget + 100000,  # 远超预算
     )
     assert _needs_resplit(st, budget), "真超预算的子任务仍应拆分"
+
+
+def test_g6_effective_est_includes_snippets():
+    """G6（Task#9 审计④）：注入 context_snippets 后有效预算 = est + snippet token（~4char/tok），
+    读时计算不回写（多轮 elaborate 重注入不漂移）。"""
+    from swarm.brain.planning_nodes import _effective_est_tokens
+    st = SubTask(
+        id="st-snip", description="x", difficulty=SubTaskDifficulty.MEDIUM,
+        modality=SubTaskModality.TEXT,
+        scope=FileScope(writable=["a.java"], create_files=[], readable=[]),
+        depends_on=[], contract={}, est_context_tokens=50000)
+    st.context_snippets = "x" * 40000   # ~10000 token
+    eff = _effective_est_tokens(st)
+    assert eff == 50000 + 10000, f"有效预算须含注入片段 token: {eff}"
+    # 幂等：再算一次不变（读时计算，不回写 est）
+    assert _effective_est_tokens(st) == eff
+    assert st.est_context_tokens == 50000, "绝不回写 est（防 replan 重注入双计漂移）"
+
+
+def test_g6_big_snippet_triggers_resplit():
+    """est 本身没超预算，但注入巨量 snippet 后有效预算超标 → 触发拆分（旧式漏判）。"""
+    from swarm.brain.planning_nodes import _context_budget, _needs_resplit
+    budget = _context_budget()
+    st = SubTask(
+        id="st-heavy", description="读侧巨大", difficulty=SubTaskDifficulty.MEDIUM,
+        modality=SubTaskModality.TEXT,
+        scope=FileScope(writable=["a.java", "b.java"], create_files=[], readable=[]),
+        depends_on=[], contract={}, est_context_tokens=50000)
+    # est 50k < budget；注入 (budget)*4 字符 snippet → 有效预算远超
+    st.context_snippets = "y" * (budget * 4)
+    assert _needs_resplit(st, budget), "注入巨量 snippet 后有效预算超标应触发拆分"

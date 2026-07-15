@@ -717,6 +717,61 @@ def validate_module_coherence(
     return result
 
 
+def validate_plan_granularity(
+    plan, *, complex_ratio_warn: float = 0.6, min_subtasks: int = 4,
+) -> PlanValidationResult:
+    """G7+G8（Task#9 审计④ 颗粒度/难度路由）：规划期【颗粒度 smell】确定性检测——**仅告警**。
+
+    这两条是启发式质量信号、**非执行致命**（COMPLEX-heavy / 混模块的 plan 照样能跑，只是难度
+    路由把多数子任务压到最强模型、且更易失败/绕圈），故【绝不硬打回、绝不盲目强制再拆】：
+      · 盲目 force-resplit 会把"COMPLEX 但单文件"的合法任务拆成多子任务同写一文件 → diff 行号
+        冲突拼坏 patch（正是 planning_nodes._needs_resplit 单文件守卫要防的回归）；
+      · 真·超预算/超文件数的 COMPLEX 子任务，_needs_resplit 已按预算+文件数确定性再拆。
+    本闸只把【全局欠分解】这一此前**不可见**的信号 surface 出来（喂 validation warnings + 遥测 +
+    replan feedback），令"67% 子任务是 COMPLEX"这类规划期质量问题可观测、可反馈重分解。多栈中立。
+
+    G7 COMPLEX 占比：难度=COMPLEX 的子任务占比超阈值（且 plan 够大）→ warn（欠分解信号）。
+    G8 混模块颗粒度：单个子任务的写目标（create ∪ writable）横跨 ≥2 个不同【物理模块根】
+       （经 _code_module_root 求，栈中立）→ warn（一个子任务应内聚于一个模块，混关注点难验收）。
+    """
+    from swarm.brain.contract_utils import _code_module_root
+
+    result = PlanValidationResult(valid=True)
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if not subs:
+        return result
+
+    # ── G7：COMPLEX 占比（仅在 plan 够大时评估，小 plan 天然高占比不是 smell）──
+    if len(subs) >= min_subtasks:
+        # silent-hunter #2：难度取值 enum→.value / 纯串→自身（绝不因 difficulty 偶为字符串
+        # 而静默漏数 COMPLEX）。注：str(str-Enum) 在部分 Python 版本返回 "类名.成员" 故不能用。
+        def _diff_val(st):
+            d = getattr(st, "difficulty", None)
+            return str(getattr(d, "value", d) or "").lower()
+        _n_complex = sum(1 for st in subs if _diff_val(st) == "complex")
+        _ratio = _n_complex / len(subs)
+        if _ratio > complex_ratio_warn:
+            result.warn(
+                f"G7 颗粒度：{_n_complex}/{len(subs)} 个子任务为 COMPLEX（占比 {_ratio:.0%}，超阈值 "
+                f"{complex_ratio_warn:.0%}）——COMPLEX=架构/跨模块/复杂算法，理应稀少；占比过高多为规划期"
+                f"【欠分解】（难度路由会把多数子任务压到最强模型、更易失败）。建议更细粒度拆分。")
+
+    # ── G8：单子任务混模块（写目标横跨多个物理模块根）──
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        _targets = (list(getattr(sc, "create_files", None) or [])
+                    + list(getattr(sc, "writable", None) or []))
+        _roots = {r for f in _targets if (r := _code_module_root(f))}
+        if len(_roots) >= 2:
+            result.warn(
+                f"G8 颗粒度：子任务 {getattr(st, 'id', '?')!r} 的写目标横跨 {len(_roots)} 个物理模块根 "
+                f"{sorted(_roots)[:4]}——一个子任务应内聚于【单个模块】，跨模块混关注点难独立验收、"
+                f"易并发撞写。建议按模块拆分为多个子任务。")
+    return result
+
+
 def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> list[str]:
     """R40-1 口径适配：原始 file_plan（str 或 {path} dict 混合）→ P5 去重后的归一路径列表。
 
