@@ -117,7 +117,8 @@ def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
 
 
 def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
-                               task_description: str) -> dict[str, list[str]]:
+                               task_description: str,
+                               file_plan: list | None = None) -> dict[str, list[str]]:
     """R48b-1（收尾器第④步）：C1 无主硬符号按契约模块确定性安置 → {sid: [symbols]}。
 
     round48b 死因：P1 覆盖外科命中即短路 R39-5 符号外科（first-match 互斥残留），
@@ -197,7 +198,105 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
         all_dir.update(c)
     tpl_dir = all_dir.most_common(1)[0][0] if all_dir else "src"
 
+    # ★Task1（round62 治本）★ 落点解析必须走【权威 file_plan】，不拿逻辑模块名拼猜。
+    # file_plan 是设计产出的【模块→文件】权威归属，也是唯一与 CubeSandbox 挂载一致的
+    # **项目相对**坐标源（host 磁盘探测会与 sandbox 分叉，故这里只认 file_plan / 计划
+    # scope，二者皆项目相对，绝不产出 host 绝对路径）。逻辑模块名 ≠ 物理目录（契约
+    # `alarm-sdk` 实住 `ruoyi-alarm/alarm-interface/`）：旧 `_dir_for` 拿名字拼出幻影
+    # `alarm-sdk/…`、且把 .java 落进 resources/mapper。
+    # 落点+扩展名 = 该模块【自身】源文件众数决定（★per-module，非 plan 全局★）：先取该模块
+    # 自己的主源扩展名（众数，排配置/清单/纯标记样式），再取该扩展名【非测试】目录的众数
+    # ——一个磁盘/设计里真实存在、含真源码、任意技术栈都可编译的目录。众数绝不像"公共前缀"
+    # 塌成 `src/` 浅目录，也无需"像不像源目录"白名单；★per-module 扩展名让 Java 主计划里的
+    # TS 模块也落到 .ts 真目录而非幻影★（对抗复核 HIGH：plan 全局 ext 会饿死异栈模块）。
+    # 测试目录不放主代码符号（栈中立按 test/tests 段剔除，全测试则 fail-open 不剔）。
+    # ★不丢符号★：无 file_plan/physical 证据的模块退回旧启发式（老流程零回归），绝不
+    # "留 VALIDATE"——实测 C1 无主符号占比<0.4 仅告警不拦（silent-hunter F2），丢弃=符号
+    # 既不落地又不被拦。跨物理模块的功能分组（module≠单一 build 单元）落主模块并告警，
+    # 结构性归一/硬打回交 Task4 模块 coherence 闸。
+    # 非源码/清单/纯标记样式扩展名：绝不作 code 符号落点（markup/style ≠ code，栈中立）。
+    _NON_CODE_EXT = {"xml", "yml", "yaml", "properties", "sql", "md",
+                     "html", "htm", "css", "scss", "sass", "less"}
+
+    def _mode(items: list[str]) -> str:
+        """众数；平票按字典序取最小 → 确定性（items 非空）。"""
+        return sorted(Counter(items).items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+    def _resolve_place(paths: list[str]) -> tuple[str | None, str | None]:
+        """一组文件路径 → (落点目录, 符号扩展名)：定该模块【自身】主源扩展名（众数，排
+        非源码/清单/标记），再取该扩展名【非测试】目录众数。无源码证据→(None, None)。"""
+        src: list[tuple[str, str]] = []
+        for p in paths:
+            p = str(p).replace("\\", "/").lstrip("/")
+            b = p.rsplit("/", 1)[-1]
+            if "/" not in p or "." not in b or b.startswith("pom."):
+                continue
+            e = b.rsplit(".", 1)[-1].lower()
+            if e in _NON_CODE_EXT:
+                continue
+            src.append((p.rsplit("/", 1)[0], e))
+        if not src:
+            return None, None
+        mode_ext = _mode([e for _, e in src])
+        dirs = [d for d, e in src if e == mode_ext
+                and not any(seg in ("test", "tests") for seg in d.split("/"))]
+        dirs = dirs or [d for d, e in src if e == mode_ext]
+        return _mode(dirs), mode_ext
+
+    # ★权威落点预解析（file_plan 可用时）★ gate 与 _dir_for/_ext_for 共用同一张
+    # `_resolved_dir`——绝不让"判定可安置"与"实际落点"分叉（round62 d1 回归教训同源）。
+    _resolved_dir: dict[str, str] = {}
+    _resolved_ext: dict[str, str] = {}
+    _fp_src: dict[str, list[str]] = {}
+    phys: dict[str, str] = {}
+    if file_plan:
+        from swarm.brain.contract_utils import (
+            _file_plan_module_paths,
+            _module_physical_dirs,
+        )
+        _fp_paths = _file_plan_module_paths(file_plan)
+        _fp_src = {m: ps for m, ps in _fp_paths.items() if ps}   # F5 门：该模块有 file_plan 落点
+        phys = _module_physical_dirs(plan, project_path, file_plan)
+        for _m in {e["module"] for e in todo}:
+            # ① 权威：file_plan 该模块自身源文件众数（真目录 + per-module 扩展名）
+            d, e2 = _resolve_place(_fp_paths.get(_m, []))
+            if d:
+                _resolved_dir[_m], _resolved_ext[_m] = d, e2
+                # 观测：源文件跨【多个物理模块根】= 功能分组（module≠单一 build 单元）。
+                # 落主模块目录，结构性归一/硬打回交 Task4 模块 coherence 闸（不在此丢符号）。
+                _roots = {"/".join(x.split("/")[:2]) for x in _fp_paths[_m] if "/" in x}
+                if len(_roots) > 1:
+                    logger.warning(
+                        "[PLAN-FINISH] Task1 契约模块 %s 的 file_plan 源文件跨多个物理模块 "
+                        "%s → 落到主模块目录 %s（module≠单一 build 单元，Task4 模块 "
+                        "coherence 闸待接管归一）", _m, sorted(_roots), d)
+                continue
+            # ② 次权威：_module_physical_dirs 物理根（含 flat 裸根，真 plan 证据）下计划
+            #    源文件众数；仍无源证据 → 用物理根本身（真实证据目录胜过名字臆造幻影）。
+            root = phys.get(_m)
+            if root:
+                _under = []
+                for st in plan.subtasks:
+                    sc = getattr(st, "scope", None)
+                    for f in (list(getattr(sc, "create_files", None) or [])
+                              + list(getattr(sc, "writable", None) or [])):
+                        pp = str(f).replace("\\", "/").lstrip("/")
+                        if pp == root or pp.startswith(root + "/"):
+                            _under.append(pp)
+                d2, e2 = _resolve_place(_under)
+                _resolved_dir[_m] = d2 or root
+                if e2:
+                    _resolved_ext[_m] = e2
+            # ③ 无 file_plan/physical 证据 → 不预解析，_dir_for 走旧启发式（老流程零回归）
+
+    def _ext_for(mod: str) -> str:
+        return _resolved_ext.get(mod, ext)
+
     def _dir_for(mod: str) -> str:
+        # ★file_plan 可用且有权威证据 → 走众数预解析（真目录、栈中立）★
+        if mod in _resolved_dir:
+            return _resolved_dir[mod]
+        # 回退（无 file_plan 权威证据的模块）：旧启发式，保留避免回归
         if mod in mod_dirs:
             return f"{mod}/{mod_dirs[mod].most_common(1)[0][0]}"
         if "" in mod_dirs and mod_dirs[""]:
@@ -227,9 +326,9 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
                        - len(host.scope.writable))
             adopt, syms = adopt_all[:room], adopt_all[room:]
             if adopt:
-                d = _dir_for(mod)
+                d, _e = _dir_for(mod), _ext_for(mod)
                 for s in adopt:
-                    host.scope.create_files.append(f"{d}/{s}.{ext}")
+                    host.scope.create_files.append(f"{d}/{s}.{_e}")
                     host.acceptance_criteria.append(f"契约符号 {s} 已定义并编译通过")
                 host.description += "\n【契约符号安置·追加】\n" + "\n".join(
                     f"- {s}" for s in adopt)
@@ -244,15 +343,15 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
         _suffixes = iter([base_sid] + [f"{base_sid}-{n}" for n in range(2, 99)])
         for chunk in chunks:
             sid = next(s for s in _suffixes if s not in by_id)
-            d = _dir_for(mod)
-            files = [f"{d}/{s}.{ext}" for s in chunk]
+            d, _e = _dir_for(mod), _ext_for(mod)
+            files = [f"{d}/{s}.{_e}" for s in chunk]
             st = SubTask(
                 id=sid,
                 description=(
                     f"【契约符号安置】契约模块 {mod} 的以下符号无子任务承接"
                     "（收尾器确定性新建本子任务）。按共享契约定义完整实现每个符号"
                     "（接口/类型按契约签名，落在对应文件）：\n"
-                    + "\n".join(f"- {s} → {d}/{s}.{ext}" for s in chunk)),
+                    + "\n".join(f"- {s} → {d}/{s}.{_e}" for s in chunk)),
                 difficulty=SubTaskDifficulty.MEDIUM,
                 scope=FileScope(writable=[], create_files=files),
                 contract={"symbols": list(chunk), "module": mod},
@@ -264,6 +363,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             # 模块物理不存在且 plan 无其文件且无脚手架 → 确定性补注（R45-2 权威模板
             # 同源），代码子任务依赖之；root pom 注册交 workspace reconcile add 侧。
             if (scaffold_sid not in by_id and project_path
+                    and mod not in phys and mod not in _fp_src
                     and mod not in mod_dirs
                     and not (Path(project_path) / mod).is_dir()):
                 try:
@@ -380,7 +480,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         # ④ R48b-1：契约符号安置（P1 命中会短路 R39-5 符号外科——收尾器全路径必经）
         if shared_contract and len(plan.subtasks) > 1:
             dom = _domicile_contract_symbols(
-                plan, shared_contract, project_path, task_description)
+                plan, shared_contract, project_path, task_description, file_plan)
             if dom:
                 out["symbols_domiciled"] = dom
                 from swarm.brain.nodes.shared import bootstrap_subtask_harness

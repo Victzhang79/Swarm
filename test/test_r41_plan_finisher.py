@@ -543,3 +543,159 @@ def test_r48b_f5_new_module_gets_scaffold(tmp_path):
     assert "权威 pom 模板" in sc_st.description
     ct = next(s for s in plan.subtasks if s.id == "st-contract-alarm-robot")
     assert "st-scaffold-alarm-robot" in ct.depends_on
+
+
+# ── ④' Task1（round62 治本）：契约符号安置落点走 file_plan 权威物理路径 ──
+
+def test_r62_task1_domicile_uses_file_plan_physical_path():
+    """round62 幻影落点治本：逻辑模块名 ≠ 物理目录（契约 alarm-sdk 实住
+    ruoyi-alarm/alarm-interface/）时，符号必须落到 file_plan 权威物理目录，
+    绝不拼幻影 `alarm-sdk/…`、绝不把 .java 落进 resources/mapper。"""
+    plan = TaskPlan(
+        task_id="t-62task1", subtasks=[
+            _st("st-1", create=[
+                "ruoyi-alarm/alarm-interface/src/main/java/com/ruoyi/alarm/"
+                "sdk/AlarmSdkConfig.java"]),
+            _st("st-2", create=[
+                "ruoyi-alarm/alarm-api/src/main/java/com/ruoyi/alarm/api/"
+                "AlarmApiDTO.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    file_plan = [
+        {"module": "alarm-sdk", "path":
+            "ruoyi-alarm/alarm-interface/src/main/java/com/ruoyi/alarm/sdk/"
+            "AlarmSdkConfig.java"},
+        {"module": "alarm-sdk", "path":
+            "ruoyi-alarm/alarm-interface/src/main/java/com/ruoyi/alarm/sdk/"
+            "http/HttpUtil.java"},
+        {"module": "alarm-api", "path":
+            "ruoyi-alarm/alarm-api/src/main/java/com/ruoyi/alarm/api/AlarmApiDTO.java"},
+    ]
+    sc = {"interfaces": [{"name": "IAlarmHttpClient", "module": "alarm-sdk"}]}
+    out = finish_plan_deterministic(plan, file_plan, None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "无主硬符号必须被安置"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("IAlarmHttpClient.java"))
+    # 逻辑名 alarm-sdk → 物理目录 ruoyi-alarm/alarm-interface/（file_plan 权威）
+    assert f.startswith("ruoyi-alarm/alarm-interface/src/main/java/"), f
+    assert "/resources/mapper/" not in f, f
+    assert not f.startswith("alarm-sdk/"), f
+
+
+def test_r62_task1_main_test_split_places_in_main_not_shallow_src():
+    """对抗复核 HIGH 回归：模块源文件同时含 main 与 test 分支时，落点必须是 main 下的
+    真源目录，绝不塌成不可编译的浅目录 `.../src/`（旧公共前缀会塌）。"""
+    plan = TaskPlan(
+        task_id="t-62task1m", subtasks=[
+            _st("st-1", create=[
+                "ruoyi-alarm/alarm-interface/src/main/java/com/ruoyi/alarm/"
+                "sdk/AlarmSdkConfig.java"]),
+            _st("st-2", create=["ruoyi-alarm/alarm-api/src/main/java/com/x/A.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    file_plan = [
+        {"module": "alarm-sdk", "path":
+            "ruoyi-alarm/alarm-interface/src/main/java/com/ruoyi/alarm/sdk/"
+            "AlarmSdkConfig.java"},
+        {"module": "alarm-sdk", "path":
+            "ruoyi-alarm/alarm-interface/src/test/java/com/ruoyi/alarm/sdk/"
+            "AlarmSdkConfigTest.java"},
+    ]
+    sc = {"interfaces": [{"name": "IAlarmHttpClient", "module": "alarm-sdk"}]}
+    finish_plan_deterministic(plan, file_plan, None, "t", shared_contract=sc)
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("IAlarmHttpClient.java"))
+    assert "/src/main/java/" in f, f          # 真 main 源根，非浅 .../src/
+    assert "/src/test/" not in f, f           # 主代码符号不落测试目录
+    assert f.rsplit("/", 1)[0].endswith("com/ruoyi/alarm/sdk"), f
+
+
+def test_r62_task1_cross_module_feature_placed_in_dominant_module():
+    """round62 治本：跨【多个物理模块】的功能分组（module≠单一 build 单元）→ 落到
+    主模块（源文件众数所在真目录），绝不臆造 `alarm-strategy/...` 幻影、也绝不丢符号
+    （丢=C1 占比不足则仅告警不拦→符号既不落地又不被拦）。结构性归一交 Task4。"""
+    plan = TaskPlan(
+        task_id="t-62task1b", subtasks=[
+            _st("st-1", create=[
+                "ruoyi-alarm/alarm-schedule/src/main/java/com/ruoyi/alarm/"
+                "schedule/service/A.java"]),
+            _st("st-2", create=[
+                "ruoyi-admin/src/main/java/com/ruoyi/web/controller/alarm/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    # alarm-schedule 3 文件（主）vs ruoyi-admin 1 文件 → 众数落 alarm-schedule
+    file_plan = [
+        {"module": "alarm-strategy", "path":
+            "ruoyi-alarm/alarm-schedule/src/main/java/com/ruoyi/alarm/schedule/"
+            f"service/S{i}.java"} for i in range(3)] + [
+        {"module": "alarm-strategy", "path":
+            "ruoyi-admin/src/main/java/com/ruoyi/web/controller/alarm/Ctrl.java"}]
+    sc = {"interfaces": [{"name": "DutyScheduleService", "module": "alarm-strategy"}]}
+    out = finish_plan_deterministic(plan, file_plan, None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "跨模块功能分组也要安置，绝不丢符号"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("DutyScheduleService.java"))
+    assert f.startswith("ruoyi-alarm/alarm-schedule/src/main/java/"), f  # 主模块
+    assert not f.startswith("alarm-strategy/"), f                        # 非幻影逻辑名
+    assert "/resources/mapper/" not in f, f
+
+
+def test_r62_task1_partial_file_plan_places_via_phys_not_dropped():
+    """对抗复核 MEDIUM 回归：file_plan 非空但【不含】某模块时，该模块仍应经 physical
+    证据（含 flat 裸根）落到真目录，绝不因"有 file_plan 就走新路"而丢覆盖。"""
+    plan = TaskPlan(
+        task_id="t-62task1p", subtasks=[
+            _st("st-1", create=[
+                "alarm-sdk/src/main/java/com/ruoyi/alarm/sdk/AlarmSdkConfig.java"]),
+            _st("st-2", create=["alarm-sdk/src/main/java/com/ruoyi/alarm/sdk/X.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    # file_plan 只覆盖别的模块，故意不含 alarm-sdk
+    file_plan = [{"module": "alarm-api", "path":
+                  "alarm-api/src/main/java/com/ruoyi/alarm/api/Foo.java"}]
+    sc = {"interfaces": [{"name": "IAlarmHttpClient", "module": "alarm-sdk"}]}
+    out = finish_plan_deterministic(plan, file_plan, None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "部分 file_plan 不得丢覆盖"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if f.endswith("IAlarmHttpClient.java"))
+    assert f.startswith("alarm-sdk/src/main/java/"), f   # flat 裸根经 physical 证据落真目录
+
+
+def test_r62_task1_polyglot_module_uses_own_extension_not_plan_mode():
+    """对抗复核 HIGH 回归：Java 主导计划里的 TS 模块，符号必须落到该模块【自身】的
+    .ts 真目录、且文件名用 .ts（per-module 扩展名），绝不因 plan 全局 ext=java 饿死它
+    而拼幻影（旧实现 plan 全局 ext 过滤会把异栈模块打回名字臆造路径）。"""
+    plan = TaskPlan(
+        task_id="t-62task1poly", subtasks=[
+            _st("st-1", create=[
+                "backend/alarm-core/src/main/java/com/x/A.java"]),
+            _st("st-2", create=[
+                "backend/alarm-core/src/main/java/com/x/B.java"]),
+            _st("st-3", create=[
+                "frontend/alarm-web/src/ts/AlarmWebClient.ts"])],
+        parallel_groups=[["st-1", "st-2", "st-3"]])
+    file_plan = [
+        {"module": "alarm-core", "path": "backend/alarm-core/src/main/java/com/x/A.java"},
+        {"module": "alarm-core", "path": "backend/alarm-core/src/main/java/com/x/B.java"},
+        {"module": "alarm-web-sdk", "path": "frontend/alarm-web/src/ts/AlarmWebClient.ts"},
+        {"module": "alarm-web-sdk", "path": "frontend/alarm-web/src/ts/http/Req.ts"},
+    ]
+    sc = {"interfaces": [{"name": "IAlarmWebConfig", "module": "alarm-web-sdk"}]}
+    out = finish_plan_deterministic(plan, file_plan, None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "异栈模块也要安置，绝不饿死"
+    f = next(f for s in plan.subtasks for f in s.scope.create_files
+             if "IAlarmWebConfig" in f)
+    assert f.startswith("frontend/alarm-web/src/ts/"), f   # 落自身 TS 真目录
+    assert f.endswith("IAlarmWebConfig.ts"), f             # per-module 扩展名 .ts
+    assert not f.startswith("alarm-web-sdk/"), f           # 非幻影逻辑名
+    assert "/java/" not in f, f                            # 绝不落 java 目录
+
+
+def test_r62_task1_empty_file_plan_keeps_legacy_heuristic():
+    """回归护栏：file_plan 为空（老流程）时，安置退回旧启发式、行为不变。"""
+    plan = TaskPlan(
+        task_id="t-62task1c", subtasks=[
+            _st("st-1", create=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/A.java"]),
+            _st("st-2", create=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/B.java"])],
+        parallel_groups=[["st-1", "st-2"]])
+    sc = {"interfaces": [{"name": "RobotQueryService", "module": "alarm-robot"}]}
+    out = finish_plan_deterministic(plan, [], None, "t", shared_contract=sc)
+    assert out.get("symbols_domiciled"), "空 file_plan 走旧启发式，行为不变"
+    assert any(f.endswith("RobotQueryService.java")
+               for s in plan.subtasks for f in s.scope.create_files)
