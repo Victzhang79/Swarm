@@ -646,7 +646,7 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
 
 def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
                                 project_path: str | None, existing_ids: set,
-                                injected: list) -> str | None:
+                                injected: list) -> dict[str, str]:
     """R57-4b：子模块同处一个**非根**聚合目录时，确定性注入该聚合父 POM 的脚手架（拓扑最先）。
 
     round57 实锤：子模块都在 `ruoyi-alarm/` 下，而父 POM `ruoyi-alarm/pom.xml` 的创建权被
@@ -662,26 +662,39 @@ def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
     只在**唯一**聚合目录且**无人认领其 pom** 时注入；歧义/已有 owner → 不动（绝不猜）。
     注入后，让**所有认领了该聚合下子模块 pom 的 owner**（含脚手架与写代码的子任务）依赖聚合父先落地。
     """
+    # ★R61-1★ 每个**非根**聚合目录都需要一个聚合父 POM。round61 前旧实现"全局唯一聚合目录
+    # 才注入、否则一个不建"，多聚合场景会漏掉全部父 POM。逐个处理。
+    # ★R61-2（对抗复核实锤）★ 返回【聚合目录→脚手架 sid】映射，而非单个 last_sid：下游给每个
+    # 子模块脚手架挂"依赖父 POM 先落地"的边时，必须挂**它自己所在聚合目录**的父，不能一律挂最后
+    # 一个（多聚合场景会把 ruoyi-alarm 下的模块错挂到 ruoyi-biz 的父上、且漏掉真父 → parent
+    # 找不到 → round57 死因原样复活）。
+    parents = sorted({d.rsplit("/", 1)[0] for d in dirs.values() if "/" in d})
+    agg_ids: dict[str, str] = {}
+    for agg in parents:
+        _sid = _inject_one_aggregator_pom(
+            plan, agg, dirs, project_path, existing_ids, injected)
+        if _sid:
+            agg_ids[agg] = _sid
+    return agg_ids
+
+
+def _inject_one_aggregator_pom(plan, agg: str, dirs: dict[str, str],
+                               project_path: str | None, existing_ids: set,
+                               injected: list) -> str | None:
+    """为单个聚合目录 agg 注入确定性聚合父 POM 脚手架（拓扑最先、**独占**其 pom 写权）。"""
     from swarm.types import FileScope, SubTask, TaskIntent
 
-    # ★用全部契约模块的落点★（不再拿 entries 过滤——那会漏掉"pom 已被认领"的子模块）
-    parents = {d.rsplit("/", 1)[0] for d in dirs.values() if "/" in d}
-    if len(parents) != 1:
-        return None                      # 无聚合层（模块在根级）或多个聚合层（歧义）→ 不动
-    agg = next(iter(parents))
     agg_pom = f"{agg}/pom.xml"
-    for st in plan.subtasks:             # 已有人认领父 POM → 不重复注入
-        sc = getattr(st, "scope", None)
-        owns = (list(getattr(sc, "create_files", None) or [])
-                + list(getattr(sc, "writable", None) or []))
-        if agg_pom in [_norm_scope_path(f) for f in owns]:
-            return None
     sid = f"st-scaffold-{agg.replace('/', '-')}"
     if sid in existing_ids:
         return sid
+    # ★R61-1（round61 死因）★ 即使有**写代码的子任务**认领了聚合父 pom，也**绝不让位**——
+    # 它不保证拓扑最先、也不保证内容正确（手写 pom），子模块编译时父 POM 可能还没建/内容不对
+    # → `Non-resolvable parent POM` → 全员 FATAL（round57 原始死因复活）。改为：确定性脚手架
+    # 独占其写权（下方 R57-6 式收回），拓扑最先。
     exists = bool(project_path) and (Path(project_path) / agg_pom).is_file()
     sub_names = sorted({d.rsplit("/", 1)[-1] for d in dirs.values()
-                        if d.startswith(f"{agg}/")})
+                        if d.rsplit("/", 1)[0] == agg})   # 只算**直接**子模块
     _agg_tpl = _aggregator_pom_template(agg, sub_names, project_path)
     scaffold = SubTask(
         id=sid,
@@ -715,11 +728,23 @@ def _inject_aggregator_scaffold(plan, dirs: dict[str, str],
         if st.id == sid:
             continue
         sc = getattr(st, "scope", None)
+        # R61-1：从**写代码的子任务**手里收回聚合父 pom 写权（脚手架不碰）→ 脚手架独占、拓扑最先。
+        if not str(st.id).startswith("st-scaffold-"):
+            for _attr in ("create_files", "writable"):
+                _lst = getattr(sc, _attr, None)
+                if _lst:
+                    _keep = [f for f in _lst if _norm_scope_path(f) != agg_pom]
+                    if len(_keep) != len(_lst):
+                        logger.warning(
+                            "[SCAFFOLD-INJECT] R61-1 从 %s 收回聚合父 pom 写权 %s → 脚手架 %s 独占"
+                            "（认领者不保证拓扑最先/内容正确 → parent POM 找不到 → 全员 FATAL）",
+                            st.id, agg_pom, sid)
+                        setattr(sc, _attr, _keep)
         owns = [_norm_scope_path(f) for f in
                 (list(getattr(sc, "create_files", None) or [])
                  + list(getattr(sc, "writable", None) or []))]
-        if any(o.startswith(_agg_prefix) and o.endswith("pom.xml") for o in owns) \
-                and sid not in st.depends_on:
+        # 往聚合目录下写**任何**文件（代码或 pom）的子任务，编译都需要父 POM 先在 → 依赖它。
+        if any(o.startswith(_agg_prefix) for o in owns) and sid not in st.depends_on:
             st.depends_on.append(sid)
     logger.warning(
         "[SCAFFOLD-INJECT] R57-4b/R60-1 子模块同处聚合目录 %r → 确定性注入父 POM 脚手架 %s（拓扑最先，"
@@ -761,7 +786,7 @@ def inject_build_scaffold_subtasks(
     # ★R60-1（round60 死因）★ 聚合父注入必须**先于** early-return，且**独立于 entries**——
     # 子模块 pom 全被认领时 entries 空，但聚合父 pom（纯 packaging=pom、无代码）没人认领，
     # 若被 early-return 跳过 → `ruoyi-alarm/pom.xml` 无人建 → 所有子模块 parent 找不到 → 全员 FATAL。
-    _agg_id = _inject_aggregator_scaffold(plan, _dirs, project_path, existing_ids, injected)
+    _agg_ids = _inject_aggregator_scaffold(plan, _dirs, project_path, existing_ids, injected)
     if not entries:
         return injected   # 可能已注入聚合父（R60-1）——绝不能再返回硬编码 []
     # R57-1 治本（round57 实锤）：**光凭契约里一个字符串，不足以在磁盘上造一个模块。**
@@ -886,8 +911,12 @@ def inject_build_scaffold_subtasks(
             if any(str(f).replace("\\", "/").lstrip("/").startswith(prefix)
                    for f in writes) and sid not in st.depends_on:
                 st.depends_on.append(sid)
-        if _agg_id and _agg_id != sid and _agg_id not in scaffold.depends_on:
-            scaffold.depends_on.append(_agg_id)   # R57-4b：父 POM 必须先落地
+        # R57-4b：本模块脚手架必须依赖**它自己所在聚合目录**的父 POM 先落地（R61-2：按 _mdir
+        # 的直接父目录查，绝不用"最后一个聚合"——那会在多聚合场景错挂/漏挂真父）。
+        _mod_agg = _mdir.rsplit("/", 1)[0] if "/" in _mdir else None
+        _agg_sid = _agg_ids.get(_mod_agg) if _mod_agg else None
+        if _agg_sid and _agg_sid != sid and _agg_sid not in scaffold.depends_on:
+            scaffold.depends_on.append(_agg_sid)
         if plan.parallel_groups:
             plan.parallel_groups.insert(0, [sid])
         injected.append({"module": mod, "subtask_id": sid,

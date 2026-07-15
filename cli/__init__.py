@@ -70,7 +70,7 @@ def _hdelete(url: str, **kw):
 
 
 @click.group()
-@click.version_option(version="0.9.55", prog_name="swarm")
+@click.version_option(version="0.9.56", prog_name="swarm")
 def main():
     """🐝 Swarm — 蜂群 AI 编程智能体系统"""
     # 统一日志（CLI 本地执行 worker/check 等命令时也走轮转文件 + task 上下文）

@@ -533,3 +533,111 @@ def test_aggregator_pom_injected_even_when_all_submodule_poms_are_claimed(tmp_pa
     for sid in ("st-1", "st-2"):
         st = next(s for s in plan.subtasks if s.id == sid)
         assert agg.id in st.depends_on, f"{sid} 必须依赖聚合父 {agg.id} 先建好"
+
+
+def test_aggregator_injected_even_when_someone_claimed_its_pom(tmp_path):
+    """★R61-1（round61 死因）★ 写代码的子任务顺手认领了聚合父 pom → 绝不让位，收回写权。
+
+    round61 实锤：某子任务认领了 `ruoyi-alarm/pom.xml`，R60-1 判"已有 owner → 不注入脚手架"。
+    但认领者不保证拓扑最先/内容正确 → 子模块编译时父 POM 找不到 → `Non-resolvable parent POM`
+    → 全员 FATAL（round57 原始死因复活）。聚合父必须由确定性脚手架**独占**其写权、拓扑最先。
+    """
+    from swarm.brain.contract_utils import inject_build_scaffold_subtasks
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version><packaging>pom</packaging></project>",
+        encoding="utf-8")
+
+    def _st(sid, create):
+        return SubTask(id=sid, description="d", difficulty=SubTaskDifficulty.MEDIUM,
+                       scope=FileScope(create_files=create))
+
+    # st-1 写 alarm-api 的代码，**并顺手认领了聚合父 ruoyi-alarm/pom.xml**
+    plan = TaskPlan(subtasks=[
+        _st("st-1", ["ruoyi-alarm/pom.xml",
+                     "ruoyi-alarm/alarm-api/src/main/java/A.java"]),
+        _st("st-2", ["ruoyi-alarm/alarm-engine/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-api", "artifacts": []},
+        {"module": "alarm-engine", "artifacts": []}]}
+    file_plan = [{"module": "alarm-api", "path": "ruoyi-alarm/alarm-api/src/main/java/A.java"},
+                 {"module": "alarm-engine", "path": "ruoyi-alarm/alarm-engine/src/main/java/B.java"}]
+    inject_build_scaffold_subtasks(plan, str(tmp_path), file_plan)
+
+    agg = next((st for st in plan.subtasks if st.id == "st-scaffold-ruoyi-alarm"), None)
+    assert agg is not None, "聚合父必须由确定性脚手架建，绝不让位给认领者"
+    assert not agg.depends_on, "聚合父不依赖任何子模块"
+    # 写权已从 st-1 收回
+    st1 = next(s for s in plan.subtasks if s.id == "st-1")
+    st1_owns = list(st1.scope.create_files) + list(st1.scope.writable)
+    assert "ruoyi-alarm/pom.xml" not in st1_owns, "聚合父 pom 写权必须从认领者手里收回（脚手架独占）"
+    assert agg.id in st1.depends_on, "st-1（写 alarm-api 代码）必须依赖聚合父先落地"
+
+
+def test_multiple_aggregator_dirs_each_get_a_parent(tmp_path):
+    """★R61-1★ 模块分处**多个**聚合目录 → 每个聚合目录各注入一个父 POM（不再"歧义→一个不建"）。"""
+    from swarm.brain.contract_utils import inject_build_scaffold_subtasks
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version><packaging>pom</packaging></project>",
+        encoding="utf-8")
+
+    def _st(sid, create):
+        return SubTask(id=sid, description="d", difficulty=SubTaskDifficulty.MEDIUM,
+                       scope=FileScope(create_files=create))
+
+    plan = TaskPlan(subtasks=[
+        _st("st-1", ["ruoyi-alarm/alarm-api/src/main/java/A.java"]),
+        _st("st-2", ["ruoyi-biz/biz-core/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-api", "artifacts": []},
+        {"module": "biz-core", "artifacts": []}]}
+    file_plan = [{"module": "alarm-api", "path": "ruoyi-alarm/alarm-api/src/main/java/A.java"},
+                 {"module": "biz-core", "path": "ruoyi-biz/biz-core/src/main/java/B.java"}]
+    inject_build_scaffold_subtasks(plan, str(tmp_path), file_plan)
+
+    aggs = {st.id for st in plan.subtasks if st.id.startswith("st-scaffold-ruoyi-")}
+    assert "st-scaffold-ruoyi-alarm" in aggs and "st-scaffold-ruoyi-biz" in aggs, (
+        f"两个聚合目录都必须各注入一个父 POM，实得 {aggs}")
+
+
+def test_multi_aggregator_module_scaffold_depends_on_its_own_parent(tmp_path):
+    """★R61-2（对抗复核实锤）★ 多聚合场景：每个子模块脚手架必须依赖**它自己所在聚合目录**的父 POM。
+
+    R61-1 曾用单个 `last_sid`（排序最后一个聚合）给**所有**子模块脚手架挂父依赖边 → `ruoyi-alarm`
+    下的模块被错挂到 `ruoyi-biz` 的父上、且**漏掉真父** → 调度可能在 `ruoyi-alarm/pom.xml` 建好前
+    就跑子模块 → `Non-resolvable parent POM` → round57 死因原样复活（且只在≥2 聚合时触发，单聚合
+    的 RuoYi-E2E 测不到）。此测试在 entries 路径（模块有 artifacts → 生成 st-scaffold-<mod>）上锁死。
+    """
+    from swarm.brain.contract_utils import inject_build_scaffold_subtasks
+
+    (tmp_path / "pom.xml").write_text(
+        '<?xml version="1.0"?><project><groupId>com.ruoyi</groupId>'
+        "<artifactId>ruoyi</artifactId><version>4.8.3</version><packaging>pom</packaging></project>",
+        encoding="utf-8")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-alarm/alarm-core/src/main/java/A.java"]),
+        _st("st-2", create=["ruoyi-biz/biz-core/src/main/java/B.java"]),
+    ], parallel_groups=[["st-1", "st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "alarm-core", "artifacts": ["org.projectlombok:lombok"]},
+        {"module": "biz-core", "artifacts": ["org.projectlombok:lombok"]},
+    ]}
+    inject_build_scaffold_subtasks(plan, str(tmp_path))
+
+    alarm_mod = next(st for st in plan.subtasks if st.id == "st-scaffold-alarm-core")
+    biz_mod = next(st for st in plan.subtasks if st.id == "st-scaffold-biz-core")
+    assert "st-scaffold-ruoyi-alarm" in alarm_mod.depends_on, (
+        "alarm-core 脚手架必须依赖它自己的聚合父 ruoyi-alarm 先落地")
+    assert "st-scaffold-ruoyi-biz" not in alarm_mod.depends_on, (
+        "alarm-core 绝不能错挂到 ruoyi-biz 的父上（R61-1 单 last_sid 的病）")
+    assert "st-scaffold-ruoyi-biz" in biz_mod.depends_on, (
+        "biz-core 脚手架必须依赖它自己的聚合父 ruoyi-biz 先落地")
+    assert "st-scaffold-ruoyi-alarm" not in biz_mod.depends_on, (
+        "biz-core 绝不能错挂到 ruoyi-alarm 的父上")
