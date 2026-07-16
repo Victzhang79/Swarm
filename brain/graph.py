@@ -465,6 +465,93 @@ def _increment_plan_retry(state: BrainState) -> dict:
 # ══════════════════════════════════════════════
 
 
+# R63-T11：LLM 录制作用域——节点分派层统一打标签。
+# 录制门控（models/router.py _astream）= env 开 AND _LLM_NODE_CV 非空；此前全仓只有
+# 4 个标签点（plan_batch/plan_single/validate_plan/review:{tag}，走 _invoke_llm_abortable），
+# tech_design/contract_design/extract_requirements 等直连 llm.ainvoke 的节点全部漏录
+# （round63 cassette 实锤 10 行全 plan_batch）。brain LLM streaming=True，ainvoke 也走
+# _astream——缺的只是标签，注册层每节点包一次即补全。
+# denylist（绝不包装）：dispatch/monitor 会 asyncio.ensure_future spawn worker 任务
+# （dispatch.py:610），contextvar 随 spawn 拷贝进 worker 上下文——包了它们 = worker 流量
+# 被误录（cassette 铁律：worker 流量不录；worker _run_agent 入口另有 set_llm_node("")
+# 双保险）。细粒度标签（_invoke_llm_abortable）在节点标签内层设置，天然嵌套覆盖再还原。
+_LLM_NODE_LABEL_DENYLIST = frozenset({"dispatch", "monitor"})
+
+
+def _labeled_node(name: str, fn):
+    import functools
+    import inspect
+
+    from swarm.models.router import reset_llm_node, set_llm_node
+
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def _awrapped(*args, **kwargs):
+            tok = set_llm_node(name)
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                reset_llm_node(tok)
+        _awrapped.__swarm_llm_node_label__ = name
+        return _awrapped
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        tok = set_llm_node(name)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            reset_llm_node(tok)
+    _wrapped.__swarm_llm_node_label__ = name
+    return _wrapped
+
+
+def _maybe_labeled(name: str, fn):
+    """注册层标签闸：denylist（spawn worker 的节点）原样返回，其余包节点名标签。"""
+    if name in _LLM_NODE_LABEL_DENYLIST:
+        return fn
+    return _labeled_node(name, fn)
+
+
+# 图节点注册表【单一事实源】（R63-T11）：build_brain_graph 据此注册（经 _maybe_labeled
+# 打标签）；test_brain_state_schema / test_ledger_runner_wiring 等冻结面直接 import 消费
+# ——此前它们靠正则/AST 扫 add_node 字面量，注册形态一变就静默解析出空集。存【裸】函数，
+# 包装在注册时做（schema 测试要按 fn.__name__ 回查源码函数体）。
+GRAPH_NODE_REGISTRY: tuple = (
+    ("ingest", ingest),        # B 部分：多模态需求摄取（前置于 analyze）
+    ("analyze", analyze),
+    ("detect_stack", detect_stack),  # 2.7：技术栈/架构识别（plan 前预处理，磁盘 ground truth）
+    # Q4 规划子图节点
+    ("clarify", clarify),
+    ("assess", assess),
+    ("tech_design", tech_design),
+    ("contract_design", contract_design),  # T1：多模块共享契约（Brain 大模型）
+    # S2-2：需求条目结构化（contract_design→plan 之间的轻量纯计算节点）。对称面裁决：
+    # 不进 runner._NODE_STATUS_MAP（与 clarify/assess/tech_design/contract_design/elaborate
+    # 等规划子图节点同先例——不写任务状态，仍有 brain_node 事件）；非 interrupt、非活跃
+    # 执行态之间，checkpoint 风险与 S1-4 结论同级（ACCEPTANCE_DESIGN §4.3）。
+    ("extract_requirements", extract_requirements),
+    ("review_design", review_design),
+    ("elaborate", elaborate),
+    ("plan", plan),
+    ("validate_plan", validate_plan),
+    ("confirm", confirm_plan),
+    ("dispatch", dispatch),
+    ("monitor", monitor),
+    ("adversarial_verify", adversarial_verify),  # T1：对抗验证 stage（MONITOR 全完成→此→MERGE）
+    ("handle_failure", handle_failure),
+    ("merge", merge),
+    ("verify_l2", verify_l2),
+    ("verify_runtime", verify_runtime),  # S1-4：运行时冒烟闸门（L2 与 L3 之间）
+    ("verify_l3", verify_l3),
+    ("deliver", deliver),
+    ("revision", revision),
+    ("learn_success", learn_success),
+    ("learn_failure", learn_failure),
+    ("increment_retry", _increment_plan_retry),
+)
+
+
 def build_brain_graph() -> StateGraph:
     """构建 Brain 状态机图
 
@@ -473,38 +560,10 @@ def build_brain_graph() -> StateGraph:
     """
     graph = StateGraph(BrainState)
 
-    # ── 注册节点 ──
-    graph.add_node("ingest", ingest)        # B 部分：多模态需求摄取（前置于 analyze）
-    graph.add_node("analyze", analyze)
-    graph.add_node("detect_stack", detect_stack)  # 2.7：技术栈/架构识别（plan 前预处理，磁盘 ground truth）
-    # Q4 规划子图节点
-    graph.add_node("clarify", clarify)
-    graph.add_node("assess", assess)
-    graph.add_node("tech_design", tech_design)
-    graph.add_node("contract_design", contract_design)  # T1：多模块共享契约（Brain 大模型）
-    # S2-2：需求条目结构化（contract_design→plan 之间的轻量纯计算节点）。对称面裁决：
-    # 不进 runner._NODE_STATUS_MAP（与 clarify/assess/tech_design/contract_design/elaborate
-    # 等规划子图节点同先例——不写任务状态，仍有 brain_node 事件）；非 interrupt、非活跃
-    # 执行态之间，checkpoint 风险与 S1-4 结论同级（ACCEPTANCE_DESIGN §4.3）。
-    graph.add_node("extract_requirements", extract_requirements)
-    graph.add_node("review_design", review_design)
-    graph.add_node("elaborate", elaborate)
-    graph.add_node("plan", plan)
-    graph.add_node("validate_plan", validate_plan)
-    graph.add_node("confirm", confirm_plan)
-    graph.add_node("dispatch", dispatch)
-    graph.add_node("monitor", monitor)
-    graph.add_node("adversarial_verify", adversarial_verify)  # T1：对抗验证 stage（MONITOR 全完成→此→MERGE）
-    graph.add_node("handle_failure", handle_failure)
-    graph.add_node("merge", merge)
-    graph.add_node("verify_l2", verify_l2)
-    graph.add_node("verify_runtime", verify_runtime)  # S1-4：运行时冒烟闸门（L2 与 L3 之间）
-    graph.add_node("verify_l3", verify_l3)
-    graph.add_node("deliver", deliver)
-    graph.add_node("revision", revision)
-    graph.add_node("learn_success", learn_success)
-    graph.add_node("learn_failure", learn_failure)
-    graph.add_node("increment_retry", _increment_plan_retry)
+    # ── 注册节点 ──（R63-T11：统一经 _maybe_labeled 打 LLM 录制标签，denylist 见上；
+    # 节点清单/注释见模块级 GRAPH_NODE_REGISTRY 单一事实源）
+    for _name, _fn in GRAPH_NODE_REGISTRY:
+        graph.add_node(_name, _maybe_labeled(_name, _fn))
 
     # ── 设置入口 ──
     graph.set_entry_point("ingest")          # B 部分：先摄取上传文件（无文件则直通）

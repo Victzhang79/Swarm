@@ -530,3 +530,36 @@ worker prompt）**，round63 端到端健康【亲核】：34 条 [skills-teleme
 （排除异常 fail-open 静默）。逃生口 SWARM_SKILLS_WORKER_PULL_ENABLED=1 可回退旧混合行为。
 **遗留划界**：push 注入的经验是否真改善小模型产出（内容有效性/因果）是另一命题，34 条
 push 遥测无法单独证明——不属本任务（核实"是否真注入"），不立新任务，留 E2E 判读维度。
+
+## T11 调查结论（2026-07-16，一路取证：录制钩/标签点/图分派层/replay 耦合）
+**缺口比 register 描述更广**：录制门控（router.py `_astream`）= env 开 AND `_LLM_NODE_CV`
+非空；全仓仅 4 个标签点（plan_batch/plan_single/validate_plan/review:{tag}，均经
+_invoke_llm_abortable）——除 plan 族+对抗外【全部】brain 节点（tech_design/contract_design/
+extract_requirements/analyze/clarify/assess/detect_stack/review_design/elaborate/revision/
+verify_l2/learn_*/ingest/vision）直连 llm.ainvoke 无标签→直通不录。round63 实录
+cassettes/round63/llm-41088.jsonl 10 行全 plan_batch 实锤。关键机制【亲核】：brain LLM
+streaming=True（router.py:914），ainvoke 内部走 _astream——缺的只是标签，无需改调用形态。
+**两套 cassette 澄清**：scripts/cassette_extract/replay 是 swarm-plan-cassette/v1（checkpoint
+抽 plan 重放确定性管线，零 LLM）；Task#10 录的是 swarm-llm-cassette/v1（原始 LLM 流量，
+尚无 replay 消费者）——扩作用域零下游耦合破坏。
+
+### T11 完成（2026-07-16，test-first + 对抗双复核 + 全量套件）
+**治本**：graph 注册层 `_maybe_labeled(name, fn)` 统一打标签（同步/异步双支持、
+functools.wraps 签名透明、marker 属性可断言）；★denylist={dispatch, monitor}★——
+contextvar 经 asyncio.ensure_future（dispatch.py:610 spawn worker）拷贝，包了=worker
+流量被误录（cassette 铁律）；双保险=worker `_run_agent` 入口无条件 set_llm_node("")。
+注册表提升为模块级 GRAPH_NODE_REGISTRY 单一事实源（存裸函数），治掉两个靠正则/AST
+扫 add_node 字面量的冻结测试（test_ledger_runner_wiring/test_brain_state_schema——注册
+形态一变就静默解析出空集，本轮全量套件实抓，改为直接 import 消费）。
+**亲核承重细节**：`_LLM_NODE_CV` 消费点仅 2 处（录制门控+`_llm_node_tag` 日志前缀，
+后者纯归因改善、无按空标签做逻辑判定的点）；LangGraph trace=False 直调节点（同 task，
+标签可达 llm 调用）；同步节点经 run_in_executor copy_context().run 同 Context 配对。
+**对抗双复核全治全锁**：reviewer 唯一 HIGH=冻结测试回归（已治见上）其余六维核清
+（LangGraph 兼容/contextvar 传播/denylist 完备——handle_failure/merge/verify_* 无 worker
+LLM spawn/嵌套标签 LIFO/worker 隔离逆向无 brain 复用 _run_agent/录制量 env 门控+
+gitignore）；猎手 F1=reset_llm_node 静默吞失败→粘滞标签比缺失更毒（归错节点污染判读
+数据）→WARNING+锁；F3=接线锁只抽查 7 节点→全量参数化 26 节点；F4=补 GraphInterrupt
+显式还原锁+录制端到端锁（包装节点→CV→门控→cassette 行 node 字段整链）。
+**revert-check**：stash 回退 HEAD 下 11/11 全红✓。**已知划界**：monitor 进 denylist 是
+保守项（纯状态检查无 LLM，denylist 无害）；swarm-llm-cassette 的 replay 消费者尚未实现
+（本任务只治录制作用域，schema 已带 node 字段留好索引余地）。

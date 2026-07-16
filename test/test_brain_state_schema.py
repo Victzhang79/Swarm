@@ -65,14 +65,12 @@ def test_s2_acceptance_keys_declared():
 
 
 def _registered_node_fn_names() -> set[str]:
-    tree = ast.parse((_BRAIN / "graph.py").read_text())
-    names: set[str] = set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "add_node" and len(n.args) >= 2:
-            name = getattr(n.args[1], "id", None) or getattr(n.args[1], "attr", None)
-            if name:
-                names.add(name)
-    return names
+    """R63-T11：改吃 GRAPH_NODE_REGISTRY 单一事实源（存裸函数，__name__ 与源码
+    def 名恒等）——此前 AST 扫 add_node 调用点参数名，注册形态一变（表驱动重构）
+    就静默解析出空集。"""
+    from swarm.brain.graph import GRAPH_NODE_REGISTRY
+
+    return {fn.__name__ for _, fn in GRAPH_NODE_REGISTRY}
 
 
 def _node_written_keys(fn: ast.AST) -> set[str]:

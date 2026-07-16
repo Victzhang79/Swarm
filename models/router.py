@@ -361,8 +361,16 @@ def set_llm_node(label: str) -> object:
 def reset_llm_node(token: object) -> None:
     try:
         _LLM_NODE_CV.reset(token)  # type: ignore[arg-type]
-    except (ValueError, LookupError, TypeError):  # 跨任务/已重置/非 Token：忽略（观测面绝不抛）
-        pass
+    except (ValueError, LookupError, TypeError) as exc:
+        # R63-T11 猎手 F1：reset 失败=标签可能【粘滞】在上一个节点名——粘滞比缺失更毒
+        # （cassette node 字段/看门狗 [stream] 日志把后续调用全归错节点，污染判读数据）。
+        # T11 后 set/reset 对从 4 处扩到全图节点，此路径必须可观测（观测面仍绝不抛）。
+        try:
+            logger.warning(
+                "reset_llm_node 失败，节点标签可能粘滞为 %r（归因数据自此不可信）：%s",
+                _LLM_NODE_CV.get(), exc)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _llm_node_tag() -> str:

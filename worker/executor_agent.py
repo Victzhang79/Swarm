@@ -140,6 +140,12 @@ class _AgentLoopMixin:
         """
         if self._agent is None:
             return "❌ Agent 未创建"
+        # R63-T11 双保险：brain 图节点层统一打 LLM 录制标签（graph._maybe_labeled），
+        # dispatch/monitor 已在 denylist 不打——但 contextvar 会经 ensure_future 拷贝，
+        # 未来任何标签泄漏进 worker 任务上下文都会让 worker 流量被误录（cassette 铁律：
+        # worker 流量不录）。此处无条件清空，worker agent LLM 调用绝不带 brain 节点标签。
+        from swarm.models.router import set_llm_node
+        set_llm_node("")
         # 产码步先清 carry 源：本轮失败/异常时不留 stale 历史（比没有历史更危险），
         # 成功后在下方以本轮全量对话覆盖。非产码步（verify 等）不触碰。
         _continuity = _is_continuity_step(step)

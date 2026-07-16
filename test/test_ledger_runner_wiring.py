@@ -25,11 +25,14 @@ def _clean(monkeypatch):
 
 
 def test_stage_map_covers_all_graph_nodes():
-    """图上每个业务节点都必须有阶段归属（漏映射=该节点花费归错阶段）。"""
-    import re
-    src = open("brain/graph.py").read()
-    nodes = set(re.findall(r'graph\.add_node\("([^"]+)"', src))
-    assert nodes, "未解析到图节点"
+    """图上每个业务节点都必须有阶段归属（漏映射=该节点花费归错阶段）。
+
+    R63-T11：改吃 GRAPH_NODE_REGISTRY 单一事实源——此前正则扫 add_node 字面量，
+    注册形态一变（表驱动重构）就静默解析出空集。"""
+    from swarm.brain.graph import GRAPH_NODE_REGISTRY
+
+    nodes = {n for n, _ in GRAPH_NODE_REGISTRY}
+    assert len(nodes) >= 26, f"图节点数异常（{len(nodes)}），注册表疑似被截: {sorted(nodes)}"
     missing = {n for n in nodes if ledger.stage_for_node(n) is None}
     assert missing == set(), f"图节点缺阶段映射: {missing}"
 
