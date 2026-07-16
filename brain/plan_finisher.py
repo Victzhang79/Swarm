@@ -141,14 +141,28 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     entries = contract_symbols_with_module(shared_contract)
     if not entries:
         return {}
+    import json as _json
     import re as _re
     _HARD = {"interfaces", "types", "apis", "symbols"}
+    # T6②（round63 幻影 DTO）：dtos 是软符号（C1 只警不闸），但**被接口签名/apis 引用**的
+    # 无主 dto=契约自引用的幻影类型（AlarmTaskDTO：契约声明+签名引用+plan 零文件零语料 →
+    # worker 实现接口时只能臆造包名，8× "package …core.domain.dto does not exist"）。
+    # 与硬符号同等安置成真产出文件（T4 pin 随后钉 defined_in，消费者拿精确 import）；
+    # 孤立无引用的 dto 不安置（宁缺勿滥，交 C1 warn）。
+    _ref_blob = " ".join(
+        str(i.get("signature") or "")
+        for i in (shared_contract.get("interfaces") or []) if isinstance(i, dict)
+    ) + " " + _json.dumps(shared_contract.get("apis") or [], ensure_ascii=False)
+    _referenced_dtos = {
+        e["symbol"] for e in entries
+        if e.get("kind") == "dtos" and e["symbol"] and _re.search(
+            r"(?<![0-9A-Za-z_])" + _re.escape(e["symbol"]) + r"(?![0-9A-Za-z_])", _ref_blob)}
     sym_set = {e["symbol"] for e in entries}
     # 复核 F1：符号名标识符白名单——dict 条目 name 是未净化 LLM 字符串，脏名
     # （"GET /x/Export"、"IFoo<T>"、"../X"）直通会拼出垃圾/穿越路径；不合格如实留 VALIDATE
     _ident = _re.compile(r"^[A-Za-z_]\w*$")
     hard = [e for e in entries
-            if e.get("kind") in _HARD
+            if (e.get("kind") in _HARD or e["symbol"] in _referenced_dtos)
             and e["symbol"] and _ident.fullmatch(e["symbol"])
             and not e["symbol"][0].islower()
             and not ("." in e["symbol"] and e["symbol"].split(".", 1)[0] in sym_set)]

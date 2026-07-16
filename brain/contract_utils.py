@@ -694,6 +694,107 @@ def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:
     return out
 
 
+def prune_contract_dependencies(plan, project_path: str | None) -> dict[str, list[str]]:
+    """T6①（round63 治本）：契约依赖剪除**同源传播**。
+
+    round63 死因（cassette 实锤）：R53-1 的"模板/契约/验收三处同源剔除"只实现在**脚手架
+    子任务**自己的三处；shared_contract.dependencies 本身从未被剪，normalize 规则5 的验收
+    note 又用未解析原始 artifacts → st-5 验收标准要求含被剪 spring-boot-starter-aop 的
+    20 项而权威模板只有 19 项（"缺一即整模块 mvn compile 失败"）＝结构性逼 worker 复入。
+
+    治：PLAN 期（脚手架注入前）统一 resolve 一次：entry.artifacts 回写为 kept（保留原
+    spec 字符串，幂等），dropped 落 shared_contract["pruned_artifacts"]（{module: [spec…]}
+    持久账本——随 D51 契约下发，worker 可见"这些坐标已证不可解析"的负面知识）。此后
+    模板（resolve kept）/规则5 验收（读已剪 entry）/worker 契约三面天然同源。
+
+    ★不禁 worker 复入★：防线④按**真实 import + Central FQCN 反查**注入是比规划期解析
+    更强的证据（受管不写版本/不受管取稳定版），是误剪的救生索——"禁复入"字面执行会把
+    解析器误剪变成永久缺依赖死锁。fail-open：project_path 缺/解析器异常 → 不动契约
+    （绝不把"解析器坏了"当"全部不可解析"剪空契约）+ WARNING。返回本次剪除。
+    """
+    sc = getattr(plan, "shared_contract", None)
+    if not project_path or not isinstance(sc, dict):
+        return {}
+    deps = sc.get("dependencies")
+    if not isinstance(deps, list) or not deps:
+        return {}
+    # hunter#F1（HIGH，实证）：先**全部解析进暂存区**、零变异；任何 entry 抛异常 → 整批
+    # 放弃（契约真·保持原样）。旧写法边解析边就地剪，第 3 个 entry 抛异常时前 2 个已永久
+    # 变异，except 却谎报"保持原样"——T4 hunter#1 同型半应用反模式。
+    staged: list[tuple[dict, list, str, list[str]]] = []
+    total_arts = 0
+    total_dropped = 0
+    try:
+        from swarm.brain.maven_registry import resolve_artifacts
+        for entry in deps:
+            if not isinstance(entry, dict):
+                continue
+            mod = str(entry.get("module") or "").strip().rstrip("/")
+            arts_now = [a for a in (entry.get("artifacts") or []) if a]
+            # 复核 MED（跨轮破坏性别名）：plan.shared_contract 与 state["shared_contract_draft"]
+            # 同对象，replan 不再生契约——若直接从已剪 artifacts 重解析，单次瞬时误剪将永久
+            # 不可复议。每轮都从 artifacts_pre_prune（首轮快照的原始清单）重解析：瞬时误剪
+            # 在解析器恢复后的下一轮自动复原。
+            orig = [a for a in (entry.get("artifacts_pre_prune") or []) if a] or arts_now
+            if not mod or not orig:
+                continue
+            total_arts += len(orig)
+            _kept, dropped = resolve_artifacts(project_path, list(orig))
+            _dropped_set = {str(d).strip() for d in dropped}
+            total_dropped += len(_dropped_set)
+            if _dropped_set:
+                staged.append((entry,
+                               [a for a in orig if str(a).strip() not in _dropped_set],
+                               mod, sorted(_dropped_set)))
+            elif arts_now != orig:
+                # 历史轮剪过、本轮全部可解析 → 从原始清单整体复原（瞬时误剪自愈）
+                staged.append((entry, list(orig), mod, []))
+    except Exception:  # noqa: BLE001 — 解析器异常绝不误剪契约（暂存未提交=真·原样）
+        logger.warning("[T6] 契约依赖同源剪除失败（fail-open：暂存未提交，契约真·保持原样；"
+                       "模板侧照旧按 R53-1 剪模板——两面本轮暂不同源，验收或仍含不可解析项）",
+                       exc_info=True)
+        return {}
+    if not staged:
+        return {}
+    # hunter#F2：断网/解析器退化时 registry 查无静默返回 None，与"真不可解析"不可区分。
+    # dropped 占比>50% 且绝对量≥3 → 判解析器退化，整批拒剪+WARNING（绝不把网络故障当
+    # "不可解析"永久烧进权威契约；占比思路同 SWARM_CONTRACT_MISSING_RATIO）。
+    if total_dropped >= 3 and total_arts and total_dropped / total_arts > 0.5:
+        logger.warning(
+            "[T6] 待剪 %d/%d（>50%%）个契约依赖，疑解析器退化/断网 → 本轮拒绝同源剪除"
+            "（绝不把网络故障当'不可解析'永久剪进权威契约），模板侧仍按 R53-1 剪模板",
+            total_dropped, total_arts)
+        return {}
+    pruned_now: dict[str, list[str]] = {}
+    for entry, _new_arts, mod, _dlist in staged:
+        if "artifacts_pre_prune" not in entry:
+            entry["artifacts_pre_prune"] = [a for a in (entry.get("artifacts") or []) if a]
+        entry["artifacts"] = _new_arts
+        ledger = sc.setdefault("pruned_artifacts", {})
+        if _dlist:
+            ledger[mod] = _dlist          # 按轮重建（复议语义），不跨轮累积陈旧项
+            pruned_now[mod] = _dlist
+        else:
+            ledger.pop(mod, None)          # 本轮全部可解析 → 撤账（瞬时误剪自愈）
+            logger.info("[T6] 模块 %s 历史轮被剪依赖本轮全部可解析 → 契约从原始清单复原", mod)
+    if not sc.get("pruned_artifacts"):
+        sc.pop("pruned_artifacts", None)
+        sc.pop("pruned_artifacts_note", None)
+    if not pruned_now:
+        return {}
+    # hunter#F3：账本随 D51 契约 JSON 进 worker prompt——裸 {module:[spec]} 对 LLM 语义
+    # 歧义（可能被读成"要声明的清单"）。就地自释义，钉死负面知识框定。
+    sc.setdefault(
+        "pruned_artifacts_note",
+        "pruned_artifacts 中的坐标已证无法确定性解析，已从模板与验收标准剔除；请勿在构建"
+        "清单手写声明它们——若源码确实需要，构建修复会按真实 import 反查合法坐标补入")
+    logger.warning(
+        "[T6] R53-1 剪除同源传播：%d 个模块的不可解析契约依赖已从 shared_contract 剪除"
+        "并记入 pruned_artifacts 账本（模板/验收/worker 契约同源，消除'验收逼 worker "
+        "复入'——round63 st-5 死型）: %s", len(pruned_now), pruned_now)
+    return pruned_now
+
+
 def _baseline_module_artifact(root: Path, mod_dir: str) -> str | None:
     """T5：磁盘上既有模块是否**可被依赖**（Maven 注入层过滤）。可依赖 → 返回其 artifactId。
 
@@ -1281,6 +1382,9 @@ def inject_build_scaffold_subtasks(
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
         logger.debug("[SCAFFOLD-INJECT] G9 未检出构建栈证据 → 保守回退 Maven（back-compat）")
+    # T6①：契约依赖同源剪除**先于一切消费面**（owner 模板/scaffold 模板/后续规则5 验收
+    # 读的都是剪后 entry）——round63 死型=验收要求被剪依赖逼 worker 复入。
+    prune_contract_dependencies(plan, project_path)
     # T5（hunter#F4）：内部模块依赖推导**单次计算**、两个注入点（owner/scaffold）共用同一份
     # ——各算各的会让 fail-open-per-callsite 在输入分叉时给同一模块产出两份不一致模板。
     _dirs = _module_physical_dirs(plan, project_path, file_plan)
@@ -1313,7 +1417,14 @@ def inject_build_scaffold_subtasks(
     # 依赖**无处注入**、模块 pom 无人建，而旧 INFO 还谎报"已并入模板"。治：有内部依赖证据且
     # 无 pom owner 的模块，补一条零 artifacts 脚手架条目（R57-1 物理落点取证照常适用）。
     _entry_mods = {e["module"] for e in entries}
-    for _m in sorted(_internal_deps):
+    # T6①补面：artifacts 全为空的契约模块（原生空 / 被同源剪除剪空）同样需要 pom 出口——
+    # 声明了模块就得有构建清单，与"有没有第三方依赖"无关。
+    _empty_contract_mods = {
+        (e.get("module") or "").strip().rstrip("/")
+        for e in ((plan.shared_contract or {}).get("dependencies") or [])
+        if isinstance(e, dict) and (e.get("module") or "").strip()
+        and not [a for a in (e.get("artifacts") or []) if a]}
+    for _m in sorted(set(_internal_deps) | _empty_contract_mods):
         if _m in _entry_mods or _m not in _dirs:
             continue
         _pom_m = f"{_dirs[_m]}/pom.xml"
@@ -1326,8 +1437,8 @@ def inject_build_scaffold_subtasks(
             continue   # 认领者路径（R58-3 owner 注入点）已拿到含内部依赖的模板
         entries.append({"module": _m, "artifacts": []})
         logger.info(
-            "[T5] 模块 %s 契约零第三方 artifacts 但有内部模块依赖证据 → 补脚手架条目"
-            "（否则推导结果无注入出口，round63 死型换壳）", _m)
+            "[T5/T6] 模块 %s 契约零第三方 artifacts（原生空/被同源剪空）→ 补脚手架条目"
+            "（模块声明了就得有 pom；有内部依赖证据时随模板一并注入）", _m)
     # ★R60-1（round60 死因）★ 聚合父注入必须**先于** early-return，且**独立于 entries**——
     # 子模块 pom 全被认领时 entries 空，但聚合父 pom（纯 packaging=pom、无代码）没人认领，
     # 若被 early-return 跳过 → `ruoyi-alarm/pom.xml` 无人建 → 所有子模块 parent 找不到 → 全员 FATAL。
