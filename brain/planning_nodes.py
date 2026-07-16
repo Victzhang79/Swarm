@@ -2418,11 +2418,44 @@ async def elaborate(state: BrainState) -> dict:
     if dangling_fixed:
         logger.info("[ELABORATE] 悬空依赖兜底：修正 %d 个子任务的 depends_on", dangling_fixed)
 
+    # ── T4（round63）：契约符号钉权威落点 + 跨子任务类型引用布线 ──
+    # 必须在 G2 之前：本 pass 只把 producer 路径布进 consumer readable+upstream_artifacts，
+    # 依赖边交下方既有 G2 按 readable∩create 补（复用其环守卫，不造第二套加边逻辑）。
+    # import 不进 try（hunter#2）：模块级回归（循环导入/语法错）要 fail-loud 于此，
+    # 绝不与"单个 plan 数据怪癖"共享同一条 WARNING 被当瞬时失败无限吞掉。
+    from swarm.brain.symbol_provenance import (
+        pin_contract_symbol_paths,
+        wire_created_type_references,
+    )
+    _t4_pinned, _t4_wired = 0, []
+    # pin 与 wire 分开 try（hunter#1 HIGH）：pin 已就地提交 defined_in 后 wire 再抛，
+    # 共用一条"跳过"日志=半应用状态被谎报成全无事发生——worker 拿到权威落点指令却没有
+    # readable/依赖边，比 round63 前的裸猜更害人。分开 catch、各自留痕、带栈（hunter#4）。
+    try:
+        _t4_pinned = pin_contract_symbol_paths(plan_obj)
+        if _t4_pinned:
+            logger.info("[ELABORATE] T4: 契约符号钉权威落点 defined_in %d 条（worker import 依此推导）",
+                        _t4_pinned)
+    except Exception as exc:  # noqa: BLE001 — 自愈尽力而为；未钉=退回 worker 事后符号接地
+        logger.warning("[ELABORATE] T4: 契约符号钉落点失败（非致命，本轮无新增 defined_in）: %s",
+                       exc, exc_info=True)
+    try:
+        _t4_wired = wire_created_type_references(plan_obj).get("wired") or []
+        if _t4_wired:
+            logger.info("[ELABORATE] T4: 跨子任务类型引用布线 %d 条（readable+upstream_artifacts，"
+                        "依赖边交 G2）: %s", len(_t4_wired), _t4_wired[:5])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[ELABORATE] T4: 类型引用布线异常中断（非致命；注意半应用状态：本轮已钉 defined_in "
+            "%d 条但 consumer 未获 readable/依赖边——worker 侧靠 seed 闸/符号接地兜底）: %s",
+            _t4_pinned, exc, exc_info=True)
+
     # ── G2（Task#9 审计③ GAP1）：readable 消费 → 补 provenance 依赖边 ──
     # readable 里出现某 producer 的 create_files（精确路径匹配）= 确定性消费其产物 → 必须
     # depends_on 该 producer（同沙箱产物才在/跨沙箱 B1 才注入已完成产物），否则同波派发 →
     # worker 伪造未见符号。加边前查环，成环则不加、告警交结构闸。放在悬空兜底之后（我的边只指
     # 现存任务，不被 dangling-fix 误删），全 scope/readable 变换收敛后再补序。
+    _prov_added: list = []
     try:
         _prov_added, _prov_cycle = wire_readable_provenance(plan_obj)
         if _prov_added:
@@ -2477,9 +2510,16 @@ async def elaborate(state: BrainState) -> dict:
         "invest_fail_count": invest_fail,
     }
     if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or java_enriched
-            or dangling_fixed):
-        # 拆分 / 剥离假依赖 / 冲突解决(合并·依赖序·归一·难度) / Java 同包入域 / 悬空依赖兜底 改变了 plan，回写
+            or dangling_fixed or _t4_pinned or _t4_wired or _prov_added):
+        # 拆分 / 剥离假依赖 / 冲突解决(合并·依赖序·归一·难度) / Java 同包入域 / 悬空依赖兜底 /
+        # T4 钉落点·布线 / G2 补边 改变了 plan，回写。（T4 之前 G2 加的依赖边靠 plan_obj
+        # 就地变异侥幸存活——LangGraph 只保证【返回键】进 state，checkpoint 恢复语义下
+        # 未回写的变异不可依赖，此处一并治了。）
         out["plan"] = plan_obj
+    if _t4_pinned:
+        # dispatch.py:528 读 state["shared_contract"] 优先于 plan.shared_contract——
+        # 钉住的 defined_in 必须随 state 键回写，否则派发面读到旧契约=白钉。
+        out["shared_contract"] = plan_obj.shared_contract or {}
     return out
 
 

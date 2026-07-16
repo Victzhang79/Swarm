@@ -32,7 +32,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 ```json
 {contract}
 ```
-
+{contract_location_note}
 ## 🔒 文件访问权限（Scope 约束）
 - ✏️ 可修改文件（已存在）: {writable_files}
 - 📄 需新建文件（已授权，应当创建；若确认某文件名/路径本身错误——撞框架/依赖库类名、包路径与项目结构不符——勿硬凑实现，按产出格式追加 SCOPE_OBJECTION 行上报）: {create_files}
@@ -178,6 +178,34 @@ def build_worker_prompt(
         contract_payload["shared_contract"] = shared_contract
     _merged_contract: dict = dict(shared_contract or {})
     _merged_contract.update(subtask.contract or {})
+    # T4 hunter#5：整键 update 会让子任务级 contract 把 shared 里 plan 期钉好的 defined_in
+    # 连条目一起顶掉（旧 checkpoint 烤进的过期副本是典型来源）→ worker 失去权威落点回到裸猜。
+    # 条目级回填：被覆盖的类型键里同名 dict 条目若缺 defined_in，从 shared 原条目补回
+    # （defined_in 是 plan 文件落点的确定性事实，不随子任务 override 改变）。不改 merge
+    # 其余语义（D51 与旧 enrich 逐字节一致的承诺只涉既有键值，本回填是 T4 新增事实的保全）。
+    for _pk in ("interfaces", "types", "dtos"):
+        _sh_v, _mg_v = (shared_contract or {}).get(_pk), _merged_contract.get(_pk)
+        if not (isinstance(_sh_v, list) and isinstance(_mg_v, list) and _sh_v is not _mg_v):
+            continue
+        _pins = {str(it.get("name")): it["defined_in"] for it in _sh_v
+                 if isinstance(it, dict) and it.get("name") and it.get("defined_in")}
+        if not _pins:
+            continue
+        # 条目浅拷贝再回填：_mg_v 的元素就是 subtask.contract 的 dict 本体，prompt 构造器
+        # 绝不就地变异 state 对象（会随 checkpoint 固化，越权写 plan）。
+        _mg_v = [dict(it) if isinstance(it, dict) else it for it in _mg_v]
+        _merged_contract[_pk] = _mg_v
+        _restored = 0
+        for it in _mg_v:
+            if (isinstance(it, dict) and not it.get("defined_in")
+                    and str(it.get("name")) in _pins):
+                it["defined_in"] = _pins[str(it.get("name"))]
+                _restored += 1
+        if _restored:
+            logger.warning(
+                "[PROMPT] T4: 子任务 %s contract 覆盖 %s 键顶掉了 %d 条 defined_in 权威落点"
+                "→ 已按符号名从 shared 回填（覆盖来源疑旧 checkpoint 过期副本，请核）",
+                getattr(subtask, "id", "?"), _pk, _restored)
     if _merged_contract:
         contract_payload["subtask_contract"] = _merged_contract
         # hunter#2 防御性可观测：子任务 contract 覆盖了 shared 同名键且值不同——要么是
@@ -201,6 +229,19 @@ def build_worker_prompt(
             contract_str = str(contract_payload)
     else:
         contract_str = "（无契约约束）"
+
+    # T4（round63）：契约条目带 defined_in（plan 期确定性钉的符号权威落点）时，显式指令
+    # import/包路径必须由该路径推导——round63 实测 worker 首发 import 全靠臆造（AlarmRobot
+    # 三包共存、10× "package does not exist"）。无 defined_in 时不注入（不给 worker
+    # 无中生有的字段名）。栈中立：路径→包/模块名的推导交 worker 按自己栈的惯例。
+    _has_defined_in = any(
+        isinstance(it, dict) and it.get("defined_in")
+        for v in _merged_contract.values() if isinstance(v, list)
+        for it in v)
+    contract_location_note = (
+        "⚠️ 契约条目中的 `defined_in` 是该符号的【权威文件落点】：引用它时的 import/"
+        "包名/模块路径必须由该路径按本项目栈的惯例推导，绝不臆造别的包或路径。\n"
+        if _has_defined_in else "")
 
     # Scope 格式化
     writable_files = ", ".join(effective_scope.writable) if effective_scope.writable else "（无）"
@@ -306,6 +347,7 @@ def build_worker_prompt(
         subtask_description=_desc,
         acceptance_criteria=criteria_lines,
         contract=contract_str,
+        contract_location_note=contract_location_note,
         writable_files=writable_files,
         create_files=create_files,
         readable_files=readable_files,
