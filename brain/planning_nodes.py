@@ -96,6 +96,24 @@ def _auto_mode(state: BrainState) -> bool:
     return os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
 
 
+def _stage2_module_timeout() -> float:
+    """R64-T5：tech_design 阶段2 单模块超时（秒）——必须与 R56-1 思考失控无损切备预算
+    保持【确定性排序】：节点超时 > 思考预算 + 余量。
+
+    round64 实锤（cassette seq6）：ruoyi-framework 模块思考失控（500s 内 28841 个
+    reasoning chunk、零正文），旧写死 500s 的 asyncio.wait_for 在 R56-1 预算（默认 600s）
+    之前抢跑掐流 → 白烧 500s + 盲目同模型重试碰运气；而 600s 时 R56-1 本可【无损】切
+    备用大脑（下游零 chunk，保留完整推理质量）。预算关闭（0）时保持 500s 原值；预算低于
+    500s 时 500s 地板不变（此时 R56-1 先触发，排序天然成立）。"""
+    try:
+        budget = float(getattr(get_config(), "brain_reasoning_phase_budget_s", 0.0) or 0.0)
+    except Exception as exc:  # noqa: BLE001 — 猎手批2 F3：config 失败回退地板，绝不让
+        # 超时调参把整个 tech_design 炸成"LLM 异常"误导归因
+        logger.warning("[TECH_DESIGN] _stage2_module_timeout 读配置失败，回退 500s 地板: %s", exc)
+        budget = 0.0
+    return max(500.0, budget + 120.0) if budget > 0 else 500.0
+
+
 def _context_budget() -> int:
     """子任务上下文预算（设计 v3 A.4，诚实分步）。
 
@@ -1259,7 +1277,7 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     import asyncio as _asyncio
 
     mod_total = len(modules)
-    _STAGE2_MODULE_TIMEOUT = 500.0  # 秒/模块
+    _STAGE2_MODULE_TIMEOUT = _stage2_module_timeout()  # 秒/模块（R64-T5 排序，见函数注释）
     _STAGE2_CONCURRENCY = 3         # 单云端 key 友好的并发上限
     _sem = _asyncio.Semaphore(_STAGE2_CONCURRENCY)
 
@@ -1693,8 +1711,46 @@ CONTRACT_MODULE_USER = """总需求（背景）：{task_description}
 被这些模块消费：{consumed_by}
 对方期望你暴露：{expected_surface}
 
+本模块已规划的文件清单（真实落盘文件名）：
+{module_files}
+
+★命名铁律★：interfaces/dtos 的 name 必须与上述清单里某个文件的主名一致（文件名去扩展名）——
+清单里已有承载该概念的文件时【绝不】另起新名字（那会造出同一概念的重复文件）；只有清单里
+确实没有对应文件的全新概念才允许新名字。I 前缀与去前缀视为同一概念（IAlarmService 与
+AlarmService 是一个东西）：接口条目优先用接口形态的文件名，绝不把 *Impl 实现类名当接口名。
+
 只产出【这个模块 owns 的契约片】JSON，module 字段统一填 "{mod_name}"。
 务必填全 dependencies：列出本模块编译期需声明的全部第三方依赖并集（漏一个即整模块编译失败）。"""
+
+
+def _contract_module_files_block(file_plan: list, mod_name: str, cap: int = 60) -> str:
+    """R64-T4 源头预防：把本模块已规划文件的【文件名】注入契约 prompt。
+
+    round64 实锤（cassette seq8-13）：契约与 file_plan 是两次独立 LLM 调用且契约 prompt
+    不含 file_plan（has_file_plan=False）——两个命名空间独立产生，56 个契约符号 30 个 name
+    对不上任何 file_plan basename（AlarmSimpleRequest↔SimpleNotifyRequest.java、
+    AlarmComposeUtil 无文件），下游 R48b-1 被迫为幻影名造重复文件、R62-Task5 每轮重新归一
+    （40→59 条）。治本=让契约命名对齐真实文件（栈中立：只注文件名，不注任何栈约定）。"""
+    names: list[str] = []
+    want = str(mod_name or "").strip().rstrip("/")
+    for it in file_plan or []:
+        mod = (it.get("module") if isinstance(it, dict) else getattr(it, "module", "")) or ""
+        path = (it.get("path") if isinstance(it, dict) else getattr(it, "path", "")) or ""
+        if str(mod).strip().rstrip("/") == want and path:
+            base = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            if base and base not in names:
+                names.append(base)
+    if not names:
+        if file_plan:
+            # 猎手批2 F1：file_plan 非空却零匹配=模块名漂移（大小写/别名），铁律静默失效
+            # 必须留痕——与 pin_contract_symbol_paths 的 full_miss 观察面同律对称。
+            logger.info(
+                "[R64-T4] 模块 %r 在 file_plan（共 %d 条）零匹配——命名铁律对该模块静默失效"
+                "（疑模块名漂移，round65 观察面）", want, len(file_plan))
+        return "（本模块暂无已规划文件清单——命名铁律不适用，按概念命名即可）"
+    shown = names[:cap]
+    tail = f"\n…（共 {len(names)} 个，仅列前 {cap}）" if len(names) > cap else ""
+    return "\n".join(f"- {n}" for n in shown) + tail
 
 
 def _normalize_contract_dependencies(raw) -> list[dict]:
@@ -2028,6 +2084,9 @@ async def contract_design(state: BrainState) -> dict:
                             mod_responsibility=mod.get("responsibility", ""),
                             consumed_by="、".join(cm.get("consumed_by") or []) or "（无）",
                             expected_surface=cm.get("expected_surface", "") or "（无特别约定）",
+                            # R64-T4：契约命名对齐真实 file_plan（源头预防命名漂移）
+                            module_files=_contract_module_files_block(
+                                state.get("tech_design_file_plan") or [], mod_name),
                         ) + _retry_brief},
                     ]), timeout=_CONTRACT_STAGE_TIMEOUT)
                     r = _parse_json_from_llm(resp.content)

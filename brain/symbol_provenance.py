@@ -101,6 +101,8 @@ def pin_contract_symbol_paths(plan) -> int:
         return 0
     pinned = 0
     tier2_only: list[str] = []   # hunter#3：仅弱通道命中而钉不上的符号要留痕，不许全静默
+    full_miss: list[str] = []    # R64-T4：任何通道零命中=真·命名漂移（此前完全静默，round64
+                                 # 实测 30/56 漂移全走此分支，下游 R48b-1 被迫为幻影名造重复文件）
     for key in _PIN_KEYS:
         val = sc.get(key)
         if not isinstance(val, list):
@@ -130,6 +132,8 @@ def pin_contract_symbol_paths(plan) -> int:
             if not cand:
                 if has_tier2:
                     tier2_only.append(name)
+                else:
+                    full_miss.append(name)
                 continue
             if len(cand) > 1:
                 # 条目 module（构建模块目录名）可消歧：只留该模块目录下的落点
@@ -152,6 +156,11 @@ def pin_contract_symbol_paths(plan) -> int:
         logger.info(
             "[T4] %d 个契约符号仅装饰前缀弱等价命中文件（tier2 不参与钉死）→ 未钉 defined_in，"
             "worker 对其仍靠事后符号接地: %s", len(tier2_only), tier2_only[:5])
+    if full_miss:
+        logger.info(
+            "[R64-T4] %d 个契约符号在计划内【零 basename 命中】（契约↔file_plan 命名漂移，"
+            "源头已在契约 prompt 注入文件清单预防；此留痕=round65 漂移残量观察面）: %s",
+            len(full_miss), full_miss[:8])
     return pinned
 
 
