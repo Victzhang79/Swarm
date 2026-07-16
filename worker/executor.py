@@ -87,6 +87,40 @@ class WorkerPhase(str, Enum):
     FAILED = "FAILED"
 
 
+def _should_run_verify_agent(mode: str, det_ok, det_details: dict) -> bool:
+    """R63-T8④：verify agent 步（每 fix_round 一整轮带工具 agent，高成本）是否该跑。
+
+    C5 既有规则：det 有结论时不跑（llm_ok 恒被仲裁器强制 True，近零价值）。
+    T8 补：det_ok=None 但 pipeline BLOCKED（如 upstream_module_broken）时也不跑——
+    仲裁器对 BLOCKED 恒判 verification_not_run，verify agent 的输出无论说什么都被丢弃，
+    跑它=纯烧预算（round63 st-8 VERIFYING 撞 95 迭代的直接来源）。
+    mode=always 保留旧行为逃生口；never 恒不跑。
+    """
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if det_ok is not None:
+        return False
+    if (det_details or {}).get("pipeline_blocked"):
+        return False
+    return True
+
+
+def _blocked_failfast_kind(prior, l1_details: dict) -> str | None:
+    """R63-T8③：Phase-4 是否应 BLOCKED fail-fast（跳过 produce LLM 步与复核）。
+
+    仅当验证循环的结论是 verification_not_run（验证根本没跑成）且确凿带
+    pipeline_blocked（如 upstream_module_broken：构建阻断根因在本子任务 scope 外）——
+    此时 produce agent 与 Phase-4 重跑闸门都无增值（round63 st-8 在 blocked 判定后
+    PRODUCING 仍烧 622.8s/95 迭代）。真编译错（deterministic）绝不短路：produce 步
+    要收集/汇报模型已做的修复。返回阻断类别或 None。
+    """
+    if prior is None or getattr(prior, "source", "") != "verification_not_run":
+        return None
+    return (l1_details or {}).get("pipeline_blocked") or None
+
+
 class WorkerExecutor(
     _L1GateMixin, _SandboxSyncMixin, _PromptBuildingMixin,
     _AgentLoopMixin, _SandboxLifecycleMixin,
@@ -705,7 +739,9 @@ class WorkerExecutor(
                     "SWARM_WORKER_VERIFY_AGENT_STEP", "auto").strip().lower()
                 verify_result: str | None = None
                 llm_passed, l1_details = True, {}
-                if _verify_mode == "always" or (_verify_mode != "never" and det_ok is None):
+                # R63-T8④：BLOCKED（det_ok=None + pipeline_blocked）时 verify agent 输出
+                # 恒被仲裁器丢弃 → 跳过，不烧 95 迭代（决策收拢 _should_run_verify_agent）。
+                if _should_run_verify_agent(_verify_mode, det_ok, det_details):
                     verify_result = await self._run_agent(
                         self._build_verify_prompt(),
                         step=f"verify-{fix_round}",
@@ -820,10 +856,27 @@ class WorkerExecutor(
             self.phase = WorkerPhase.PRODUCING
             self._log("产出阶段：从沙箱 pull-back 并收集 diff")
             await self._sync_from_sandbox("产出")
-            produce_result = await self._run_agent(
-                self._build_produce_prompt(),
-                step="produce",
-            )
+            # R63-T8③：验证循环已确定性判 BLOCKED（如 upstream_module_broken：构建阻断
+            # 根因在本子任务 scope 外）→ produce LLM 步与 Phase-4 复核都无增值，立即
+            # 结构化 fail-fast 交 brain（round63 st-8 在 blocked 判定后 PRODUCING 仍烧
+            # 622.8s/95 迭代）。已做改动仍随 pull-back diff 回传，不丢工作。
+            _ff_kind = _blocked_failfast_kind(prior, l1_details)
+            if _ff_kind:
+                _bmods = (l1_details or {}).get("blocked_on_modules") or []
+                self._log(
+                    f"R63-T8 fail-fast：L1 BLOCKED（{_ff_kind}，blocked_on={_bmods}）→ "
+                    "跳过产出 LLM 步与 Phase-4 复核，立即交 brain（省预算，不烧无效迭代）"
+                )
+                produce_result = (
+                    f"❌ blocked by upstream: {_ff_kind} blocked_on_modules={_bmods}"
+                    "（R63-T8 fail-fast：构建阻断根因在本子任务 scope 之外，产出/复核步"
+                    "已跳过，已做改动仍随 diff 回传）"
+                )
+            else:
+                produce_result = await self._run_agent(
+                    self._build_produce_prompt(),
+                    step="produce",
+                )
 
             # D53：_parse_produce_result 内含 _get_git_diff（git 子进程 + per-project flock），卸线程
             output = await asyncio.to_thread(
@@ -834,7 +887,7 @@ class WorkerExecutor(
             # _deterministic_l1_gate 的 "empty_diff + expects_changes → False" 拦截，
             # 导致占位/空 diff 被 run_l1_pipeline 当 "no diff changes" 返回 True → 翻盘为通过。
             # 现统一走确定性闸门拿三态，再以 LLM 自检作为 Phase4 增值，杜绝 "skip 当 pass"。
-            if self.project_path:
+            if self.project_path and not _ff_kind:
                 # D53：卸线程（同 Phase-3 循环内闸门，见上）
                 det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
                 l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok,
@@ -908,7 +961,10 @@ class WorkerExecutor(
                 output = output.model_copy(update={"l1_passed": l1_passed, "l1_details": l1_details})
 
             # ── DEBUG 意图专属 L1 校验：验证 failing_test_command 修复后通过 ──
-            if self.subtask.intent == "debug" and self.project_path:
+            # 猎手 F3/复核 LOW：BLOCKED fail-fast 时同样跳过——对着已知被上游阻断的
+            # 工作区跑 failing_test 只会再失败一次（最多 120s 白烧），且"仍失败=未修复"
+            # 的日志会掩盖真实原因是上游阻断。
+            if self.subtask.intent == "debug" and self.project_path and not _ff_kind:
                 harness = getattr(self.subtask, "harness", None)
                 failing_cmd = getattr(harness, "failing_test_command", "") if harness else ""
                 if failing_cmd:

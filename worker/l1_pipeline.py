@@ -3292,23 +3292,123 @@ def _build_error_is_reactor_missing_module(build_output: str | None) -> set[str]
     return out
 
 
+_RX_MVN_MISSING_ARTIFACT = re.compile(
+    r"Could not find artifact\s+[\w.\-]+:([\w.\-]+):(?:[\w.\-]+:)?([\w.${}\-]+)?", re.I)
+_RX_POM_PARENT_BLOCK = re.compile(r"<parent>.*?</parent>", re.S | re.I)
+_RX_POM_OWN_VERSION = re.compile(r"<version>\s*([^<\s]+)\s*</version>", re.I)
+
+
+def _module_declared_version(project_path: str, rel: str) -> str | None:
+    """取模块 pom 自身声明的 <version>（剥 <parent> 块后的首个；模块未声明=继承父版本
+    → 回退根 pom 同法）。属性形态（${...}）/读不到 → None=不可判定。"""
+    from pathlib import Path as _P
+    for pom_rel in (f"{rel}/pom.xml", "pom.xml"):
+        try:
+            text = (_P(project_path) / pom_rel).read_text("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        m = _RX_POM_OWN_VERSION.search(_RX_POM_PARENT_BLOCK.sub("", text))
+        if m:
+            v = m.group(1).strip()
+            return None if "${" in v else v
+    return None
+
+
+def _unresolved_internal_module_poms(build_output: str, project_path: str) -> set[str]:
+    """R63-T8②：依赖解析级错误（`Could not find artifact G:A:...`）不含任何源文件路径，
+    _build_error_files 恒空 → upstream 判定盲区。若缺失坐标的 artifactId 对应【工作区已
+    注册模块】（_maven_modules 目录末段），则这是内部模块产物未就绪/被毒化——返回其
+    `<模块目录>/pom.xml` 集合供文件级归属判定与 blocked_on 结构化输出。第三方坐标
+    （无对应注册模块）返回空集：那是 dep-repair 防线④ 的领域，绝不冒充 upstream。
+
+    复核 R-MED 加固：缺失坐标的【版本】与目标模块自身声明版本字面不符（错误要 9.9.9、
+    模块真身 3.8.7）→ 不是"模块未就绪"而是【引用方 pom 写了幻觉版本】（round47 已知
+    故障类，病灶多半在本子任务自己的 pom）→ 不映射，留 fix 循环源头修，绝不把健康
+    兄弟模块诬告成 upstream。版本不可判定（属性形态/读不到）→ 保守仍映射。"""
+    if not build_output or not project_path:
+        return set()
+    arts: dict[str, str | None] = {}
+    for m in _RX_MVN_MISSING_ARTIFACT.finditer(build_output):
+        arts.setdefault(m.group(1), (m.group(2) or "").strip() or None)
+    if not arts:
+        return set()
+    try:
+        mods = _maven_modules(project_path)
+    except Exception as exc:  # noqa: BLE001 — 树读取失败 → 无从映射，如实空集
+        # 猎手 F2：这不是"确无内部模块"而是"无从判定"——必须可观测，否则②在读树
+        # 故障时静默退回治本前旧行为（硬 FAIL 烧迭代）而无人察觉。
+        logger.warning(
+            "[L1.2.1] R63-T8② 坐标→模块映射读树失败（fail-open 空集，upstream 判定"
+            "退回旧启发式）：project=%s err=%r", project_path, exc)
+        return set()
+    out: set[str] = set()
+    for rel in mods:
+        art = rel.split("/")[-1]
+        if art not in arts:
+            continue
+        want = arts[art]
+        have = _module_declared_version(project_path, rel) if want else None
+        if want and have and "${" not in want and want != have:
+            logger.warning(
+                "[L1.2.1] R63-T8② 缺失坐标 %s:%s 与模块真身版本 %s 不符——判为引用方"
+                "幻觉版本（非模块未就绪），不映射 upstream，留 fix 循环源头修",
+                art, want, have)
+            continue
+        out.add(f"{rel}/pom.xml")
+    return out
+
+
 def _build_error_is_upstream(build_output: str, build_cmd: str,
-                             modified: list[str] | None = None) -> bool:
+                             modified: list[str] | None = None,
+                             scope=None, project_path: str | None = None,
+                             evidence_out: dict | None = None) -> bool:
     """构建错是否【非本子任务写的代码造成】（→ 标 BLOCKED 交 owner 修，不连坐本子任务）。
 
-    优先【文件级】（根因#3）：报错文件全部不在本子任务 modified 改动集 → True；只要有一个报错
-    文件是本子任务改的 → False（自己有错，不放过，由根因#1 的全量闸门在源头当场修）。
-    无 modified 信息时回退【模块级】（-pl 模块 vs 报错模块），向后兼容。
+    R63-T8①：优先【scope 写权归属】确定性判据——报错文件与本子任务 FileScope 写权集
+    （writable/create/delete）的归属是结构事实，比「是否在本轮 diff」更准：round63 形态
+    （空 diff 轮 / 无 -pl 的全量构建命令）下旧启发式双双失灵 → 掉进 build_failed 硬 FAIL
+    烧修复轮（st-8 三阶段各撞 95 迭代）。只要有一个报错文件在写权集内 → False（自己的错
+    源头修，绝不推给上游）；全部无写权 → True。allow_any scope 无「写权外」概念，让位
+    旧启发式。scope 未传（老调用方）→ 旧行为原样。
+
+    旧启发式（保留兜底）：文件级 disjoint（报错文件 vs modified）→ 模块级（-pl vs 报错模块）。
+    猎手 F4：判据来源写入 evidence_out["channel"]（scope/scope_error_fallback/file_disjoint/
+    module_fallback/none），供调用点落进 details——下次同类死锁复盘不用再大海捞针。
     """
+    def _ch(name: str) -> None:
+        if evidence_out is not None:
+            evidence_out["channel"] = name
+
     errs_files = _build_error_files(build_output)
+    if project_path:
+        errs_files = errs_files | _unresolved_internal_module_poms(build_output, project_path)
+    if (errs_files and scope is not None
+            and not getattr(scope, "allow_any", False)):
+        try:
+            _hit = any(scope.is_writable(f) for f in errs_files)
+            _ch("scope")
+            return not _hit
+        except Exception as exc:  # noqa: BLE001 — scope 判定异常 → 落回旧启发式，绝不误 BLOCKED
+            # 猎手 F1：必须可观测——scope 通道若因 scope 对象形态变化而失效，
+            # 静默降级=退回 T8 治本前旧行为且无人察觉，直到下一次 95 迭代烧穿。
+            logger.warning(
+                "[L1.2.1] R63-T8① scope 写权判定异常（fail-open 落回旧启发式）："
+                "scope_type=%s err=%r", type(scope).__name__, exc)
+            _ch("scope_error_fallback")
     mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()}
     if errs_files and mods:
+        if evidence_out is not None and evidence_out.get("channel") != "scope_error_fallback":
+            _ch("file_disjoint")
         return errs_files.isdisjoint(mods)
     # 回退：模块级
     own = _pl_modules_from_cmd(build_cmd)
     errs = _build_error_modules(build_output)
     if not own or not errs:
+        if evidence_out is not None and "channel" not in evidence_out:
+            _ch("none")
         return False
+    if evidence_out is not None and evidence_out.get("channel") != "scope_error_fallback":
+        _ch("module_fallback")
     return own.isdisjoint(errs)
 
 
@@ -3633,15 +3733,27 @@ def run_l1_pipeline(
                 # 但报错在 ruoyi-generator 的坏 pom），是上游子任务没收尾，非本子任务能力问题。
                 # 标 BLOCKED 交退避重试（待上游 pom 被其 owner/对账修好），不烧本子任务修复轮——
                 # 杜绝一个坏 pom 经 -am reactor 连坐拖死十几个无辜子任务（996db614 实测）。
-                if _build_error_is_upstream(b_out, build_cmd, modified):
+                # R63-T8①：传真 scope 做写权归属确定性判据（旧 diff/-pl 启发式在空 diff/
+                # 无 -pl 形态下双双失灵）；project_path 供②坐标→pom 映射补依赖解析级盲区。
+                _up_ev: dict = {}
+                if _build_error_is_upstream(b_out, build_cmd, modified,
+                                            scope=getattr(subtask, "scope", None),
+                                            project_path=project_path,
+                                            evidence_out=_up_ev):
                     details["l1_2_1_build_ok"] = None
                     details["build_blocked"] = build_cmd
                     details["pipeline_blocked"] = "upstream_module_broken"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value
                     # 结构化吐【阻断在哪些上游模块/文件】，供 brain 反查生产者子任务：若生产者已被
                     # 永久放弃(阶梯三打桩/revert)，则本下游不可恢复，应连坐放弃而非无限 replan。
-                    details["blocked_on_modules"] = sorted(_build_error_modules(b_out))
-                    details["blocked_on_files"] = sorted(_build_error_files(b_out))
+                    _pom_blocked = _unresolved_internal_module_poms(b_out, project_path)
+                    details["blocked_on_modules"] = sorted(
+                        _build_error_modules(b_out)
+                        | {p.rsplit("/pom.xml", 1)[0] for p in _pom_blocked})
+                    details["blocked_on_files"] = sorted(
+                        _build_error_files(b_out) | _pom_blocked)
+                    # 猎手 F4：判据通道留痕（scope/file_disjoint/module_fallback），复盘免捞
+                    details["upstream_judge_channel"] = _up_ev.get("channel") or "unknown"
                     logger.warning(
                         "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
                         "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
