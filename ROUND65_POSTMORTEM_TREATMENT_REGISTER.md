@@ -37,3 +37,26 @@
 - **模块级墙钟上限**从 3×500s 升到最多 (10批+8失败)×500s（复核 R-3）：有界、批多为产出型短调用，接受。
 - gather 无 return_exceptions（猎手 F8，既往债）→ harness task #47 排下一批。
 - round65b 观察面新增：`[TECH_DESIGN-STAGE2] 批 N → +K 文件` 分批收敛曲线；stage1 不再检索到 alarm 残碎路径；`stage2_incomplete_modules` 应恒空。
+
+---
+
+# Round65b 段（2026-07-17 01:27-02:51，task e00bc84c）
+
+## 疗效确认（两大治本 live 全兑现）
+- T1：ruoyi-alarm 163 文件（自估 95）9 批/11 次调用零超时收敛；空批确认超时 1 次被双轨预算+缩批正确吸收；无触顶无 incomplete。interface 模块 8 文件自估全中。
+- T2：purge-kb 首跑清 PG 6929 行 + Qdrant + preprocess READY 轮询正确识别；ANALYZE 检索 struct=25/semantic=20（重建基线）+ mistakes=5/successes=5（经验层健在）。
+- 进展面：tech_design→CONTRACT_MERGE（2/2）→REVIEW 通过→PLAN-BATCH 10 批启动——死点比 round64/65 深两层。
+
+## 死因（新前沿）
+FAILED@PLANNING `token_budget_exceeded`（02:51，无已完成子任务）：R38-A 预算按【模块数】
+弹性（2 模块→1.1M，plan 顶格 577.5k），而 T1 分批协议+「少物理模块」导向后规划成本按
+【文件数】走——171 文件 = 13 次 stage2 调用 + 10 个 plan 批（输出 42 万 token 为大头），
+plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round64 未死此处纯因它模块多
+预算大。**T1 治超时把成本挪进了预算模型的盲区**。
+
+## 治本
+- R65B-T1：文件规模二级弹性——STAGE2 聚合后 widen_budget(base+per_module×n+
+  per_planned_file×files)，新配置 max_task_tokens_per_planned_file=4000（0=关，
+  SWARM_MAX_TASK_TOKENS_PER_PLANNED_FILE 可调）。标定=round65b 需求 ≈850k 反推 4k/文件
+  （171 文件→1.784M→plan 顶格 936k）。决策记录：续批提示瘦身**不做**（cloud out 422k vs
+  in 198k，输入瘦身收益低且有路径规律丢失风险）。

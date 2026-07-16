@@ -109,6 +109,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_MAX_ACTIVE_PROJECTS": "infra/redis_client.py:430",
     "SWARM_MAX_CONCURRENT_TASKS": "brain/scheduler.py:10",
     "SWARM_MAX_TASK_TOKENS_PER_MODULE": "config/settings.py:762",
+    "SWARM_MAX_TASK_TOKENS_PER_PLANNED_FILE": "config/settings.py:830(R65B-T1 文件规模二级预算弹性)",
     "SWARM_MILESTONE_REPORTS_KEEP": "project/store.py:2086",
     "SWARM_MODEL_": "api/app.py:518",
     "SWARM_MODEL_BRAIN_FALLBACK": "api/_shared.py:30",

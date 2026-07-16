@@ -1278,17 +1278,25 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     # 弹性在规划期恒 0）。widen_budget 单调只增不减，且对 track-only（闸关）任务 no-op。
     _r38_task_id = state.get("task_id")
     if _r38_task_id:
-        _r38_cfg = get_config()
-        _r38_base = int(getattr(_r38_cfg, "max_task_tokens", 0) or 0)
-        _r38_per_mod = int(getattr(_r38_cfg, "max_task_tokens_per_module", 0) or 0)
-        if _r38_base > 0 and _r38_per_mod > 0:
-            from swarm.models import ledger as _r38_ledger
-            _r38_budget = _r38_base + _r38_per_mod * len(modules)
-            _r38_ledger.widen_budget(_r38_task_id, _r38_budget)
-            logger.info(
-                "[TECH_DESIGN-STAGE1] 预算弹性：%d 模块 → widen_budget(base %d + %d×%d = %d)",
-                len(modules), _r38_base, _r38_per_mod, len(modules), _r38_budget,
-            )
+        # 猎手 R65B (e)：记账旁路窄 try 隔离——异常漏进节点级 catch-all 会被误标
+        # 「LLM 失败」（STAGE1 这里代价小，但同病同治保持口径一致）。
+        try:
+            _r38_cfg = get_config()
+            _r38_base = int(getattr(_r38_cfg, "max_task_tokens", 0) or 0)
+            _r38_per_mod = int(getattr(_r38_cfg, "max_task_tokens_per_module", 0) or 0)
+            if _r38_base > 0 and _r38_per_mod > 0:
+                from swarm.models import ledger as _r38_ledger
+                _r38_budget = _r38_base + _r38_per_mod * len(modules)
+                _r38_ledger.widen_budget(_r38_task_id, _r38_budget)
+                logger.info(
+                    "[TECH_DESIGN-STAGE1] 预算弹性：%d 模块 → widen_budget(base %d + %d×%d = %d)",
+                    len(modules), _r38_base, _r38_per_mod, len(modules), _r38_budget,
+                )
+        except Exception as _r38_exc:  # noqa: BLE001
+            logger.warning(
+                "[TECH_DESIGN-STAGE1] 预算弹性记账失败（%s）——继续规划不阻断，"
+                "预算未放宽（ultra 规划期可能撞基线预算，请查 ledger/config）",
+                _r38_exc)
 
     # ── 阶段2：按模块并行产出 file_plan（每次短输出）──
     # P1-DEBT-12 修复（并行 + 双护栏）：
@@ -1523,6 +1531,37 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
             "下游事实核验/计划校验应据此对账，勿当成功",
             len(failed_modules), mod_total, _failed_names,
         )
+
+    # R65B-T1：第二级预算弹性——STAGE2 聚合揭示 file_plan 规模后按文件数再放宽。
+    # R38-A 模块弹性标定于「单模块≈75k」旧成本模型；R65-T1 分批协议 + STAGE1「少物理
+    # 模块」导向后，规划成本随文件数走（round65b 实锤：2 模块 171 文件拿 1.1M 干 10+
+    # 模块的活，plan 顶格 577.5k 烧穿）。widen_budget 单调只增，外科补齐子集重跑的
+    # 小值天然 no-op。
+    # 猎手 (e) 整改：本块跑在昂贵 gather 之后——记账旁路的任何异常若漏进节点级
+    # catch-all，会把已产出的完整 file_plan 扔掉并误标成「LLM 失败」。窄 try 隔离：
+    # 记账失败只 WARNING（预算不放宽=最坏退回 round65b 形态，仍有闸兜），设计产出必须保住。
+    if _r38_task_id and all_file_plan:
+        try:
+            _r65_cfg = get_config()
+            _r65_base = int(getattr(_r65_cfg, "max_task_tokens", 0) or 0)
+            _r65_per_mod = int(getattr(_r65_cfg, "max_task_tokens_per_module", 0) or 0)
+            _r65_per_file = int(getattr(_r65_cfg, "max_task_tokens_per_planned_file", 0) or 0)
+            if _r65_base > 0 and _r65_per_file > 0:
+                from swarm.models import ledger as _r65_ledger
+                _r65_budget = (_r65_base + _r65_per_mod * len(modules)
+                               + _r65_per_file * len(all_file_plan))
+                _r65_ledger.widen_budget(_r38_task_id, _r65_budget)
+                logger.info(
+                    "[TECH_DESIGN-STAGE2] 预算二级弹性：%d 文件 → widen_budget"
+                    "(base %d + %d×%d 模块 + %d×%d 文件 = %d)",
+                    len(all_file_plan), _r65_base, _r65_per_mod, len(modules),
+                    _r65_per_file, len(all_file_plan), _r65_budget,
+                )
+        except Exception as _r65_exc:  # noqa: BLE001
+            logger.warning(
+                "[TECH_DESIGN-STAGE2] 预算二级弹性记账失败（%s）——设计产出保留继续，"
+                "预算未放宽（规划期可能复现 round65b 预算饿死，请查 ledger/config）",
+                _r65_exc)
 
     result = {
         "architecture": architecture, "data_model": data_model,

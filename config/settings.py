@@ -816,6 +816,18 @@ class AppConfig(BaseSettings):
     # 让常态不触发阶段借位（借位是安全阀非常态）。0=关闭模块弹性（退回 flat base）。
     # SWARM_MAX_TASK_TOKENS_PER_MODULE 可调。
     max_task_tokens_per_module: int = Field(300_000, ge=0)
+    # R65B-T1（round65b 治本）：模块弹性之外的【文件规模】二级弹性。R65-T1 分批协议 +
+    # STAGE1「一个功能域=一个物理模块」导向后，规划成本随 file_plan 文件数（stage2 续批数
+    # + plan_batch 批数 + 契约/校验体量）线性走、与模块数脱钩：round65b 实测 2 模块 171 文件
+    # 按模块弹性只拿 1.1M，plan 阶段顶格 577.5k 被 555k 烧穿（干的是 10+ 模块体量的活，
+    # 10 个 plan 批只跑完 ~6 个）。TECH_DESIGN-STAGE2 聚合出 file_plan 后按
+    # base + per_module×n + per_planned_file×文件数 二次 widen_budget（单调只增）。
+    # 标定：round65b plan 阶段需求 ≈850k（估计值：spent 555k + 未跑完的 ~4 个 plan 批 +
+    # G1 校验/收尾器）→ 5k/文件（171 文件 → 总预算 1.955M → plan 顶格 ~1.03M，
+    # ≈20% 余量；4k 时仅 ~10% 被复核判偏薄。真失控仍由墙钟/recursion/单流兜，
+    # 预算上限放宽不等于必然花掉）。0=关闭文件弹性。
+    # SWARM_MAX_TASK_TOKENS_PER_PLANNED_FILE 可调。
+    max_task_tokens_per_planned_file: int = Field(5_000, ge=0)
     # P1-B：单次 Brain 执行墙钟【弹性】上限，防失控任务（replan 空转/卡节点）无上限占沙箱/GPU。
     # ★整体考虑：绝不误杀合法大型任务★——实测合法 E2E 大任务跑 7-8h（见 DEVLOG round9 7h45m）。
     # 故用【弹性预算】：有效上限 = base + per_subtask×子任务数，随规划揭示的任务规模动态放宽

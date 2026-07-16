@@ -216,3 +216,92 @@ def test_tech_design_no_widen_when_no_modules(monkeypatch):
     asyncio.run(pn._tech_design_staged(
         _NoModuleLLM(), "task desc", "medium", True, state, "facts", "", ""))
     assert not widen_calls
+
+
+# ─────────── R65B-T1：文件规模二级弹性（round65b token 烧穿治本）───────────
+
+def test_stage2_filecount_second_widen(monkeypatch):
+    """STAGE2 聚合揭示 file_plan 规模后，按 base+per_module×n+per_planned_file×files
+    二次放宽——T1 分批协议后规划成本随文件数走，2 模块 171 文件绝不能只拿 2 模块的钱
+    （round65b FAILED@PLANNING 实锤）。"""
+    from swarm.brain import planning_nodes as pn
+
+    widen_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "swarm.models.ledger.widen_budget",
+        lambda task_id, budget: widen_calls.append((task_id, budget)))
+    cfg = type("Cfg", (), {"max_task_tokens": 500_000,
+                           "max_task_tokens_per_module": 200_000,
+                           "max_task_tokens_per_planned_file": 4_000})()
+    monkeypatch.setattr(pn, "get_config", lambda: cfg)
+
+    state = {"task_id": "t-file-widen", "clarify_summary": ""}
+    result, file_plan, _fi, _c = asyncio.run(
+        pn._tech_design_staged(
+            _FakeLLM(widen_calls), "task desc", "ultra", True, state,
+            "facts", "", ""))
+    assert len(file_plan) == 9
+    # 第一次 widen = 模块弹性；最后一次 = 文件规模二级弹性
+    assert widen_calls[0][1] == 500_000 + 9 * 200_000
+    assert widen_calls[-1] == ("t-file-widen", 500_000 + 9 * 200_000 + 9 * 4_000), \
+        f"STAGE2 完成后应按文件数二次放宽: {widen_calls}"
+
+
+def test_filecount_widen_disabled_when_zero(monkeypatch):
+    """per_planned_file=0 → 关闭文件弹性，只有模块弹性 widen（不引入隐性放宽）。"""
+    from swarm.brain import planning_nodes as pn
+
+    widen_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "swarm.models.ledger.widen_budget",
+        lambda task_id, budget: widen_calls.append((task_id, budget)))
+    cfg = type("Cfg", (), {"max_task_tokens": 500_000,
+                           "max_task_tokens_per_module": 200_000,
+                           "max_task_tokens_per_planned_file": 0})()
+    monkeypatch.setattr(pn, "get_config", lambda: cfg)
+
+    state = {"task_id": "t-nofile", "clarify_summary": ""}
+    asyncio.run(pn._tech_design_staged(
+        _FakeLLM(widen_calls), "task desc", "ultra", True, state, "facts", "", ""))
+    assert widen_calls, "模块弹性仍应生效"
+    assert all(b == 500_000 + 9 * 200_000 for _t, b in widen_calls), \
+        f"关闭文件弹性后不得出现文件项放宽: {widen_calls}"
+
+
+def test_config_has_per_planned_file_field():
+    """配置字段存在且默认>0（round65b 后文件弹性默认开启）。"""
+    from swarm.config.settings import AppConfig
+    cfg = AppConfig()
+    per_file = getattr(cfg, "max_task_tokens_per_planned_file", None)
+    assert per_file is not None, "缺 max_task_tokens_per_planned_file 配置字段"
+    assert per_file > 0, "默认应开启文件弹性（round65b 治本）"
+
+
+def test_widen_failure_never_discards_design_output(monkeypatch, caplog):
+    """猎手 R65B (e)（CONFIRMED HIGH）：记账旁路异常绝不许炸掉已产出的 file_plan
+    ——widen 块跑在昂贵 gather 之后，漏进节点级 catch-all 会误标「LLM 失败」并
+    丢弃全部设计产出。窄 try 隔离后：WARNING 留痕、产出完整返回。"""
+    import logging
+    from swarm.brain import planning_nodes as pn
+
+    widen_calls: list[tuple[str, int]] = []
+
+    def _boom(task_id, budget):
+        widen_calls.append((task_id, budget))
+        raise RuntimeError("simulated ledger bug")
+
+    monkeypatch.setattr("swarm.models.ledger.widen_budget", _boom)
+    cfg = type("Cfg", (), {"max_task_tokens": 500_000,
+                           "max_task_tokens_per_module": 200_000,
+                           "max_task_tokens_per_planned_file": 4_000})()
+    monkeypatch.setattr(pn, "get_config", lambda: cfg)
+
+    state = {"task_id": "t-boom", "clarify_summary": ""}
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.planning_nodes"):
+        result, file_plan, _fi, _c = asyncio.run(
+            pn._tech_design_staged(
+                _FakeLLM(widen_calls), "task desc", "ultra", True, state,
+                "facts", "", ""))
+    assert len(file_plan) == 9, "记账异常绝不许丢设计产出"
+    assert not result.get("stage2_failed_modules")
+    assert any("记账失败" in r.message for r in caplog.records), "记账失败必须 WARNING 留痕"
