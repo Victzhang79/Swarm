@@ -766,6 +766,150 @@ def _pom_dep_blocks(text: str) -> list[tuple[tuple[str, str], str, str]]:
     return out
 
 
+# ════════════ T2（round63 死锁触发器结构性兜底）：三方基线·共享版本锚不可篡改 ════════════
+# merge_shared_manifest 是【加法-only 两方并集】，自己登记了"内容级篡改无三方基线无法与覆盖
+# 区分→被并回复活"的债。round63 正踩此洞：version-repair 把根 pom 顶层 <properties> 的
+# 【共享版本锚】spring-boot.version 4.0.6→3.5.16（属于内容级篡改，既非 dependency 也非 module
+# 条目）→ merge 原样放行 incoming 毒值 → 整 reactor 降代死锁。T1 已在 version-repair 源头禁此
+# 改写；T2 是【独立三方基线闸】：pull-back 落盘后，用 git HEAD 基线校验 worker/repair 是否篡改
+# 了【基线既有】的版本锚，命中即还原基线值（拒毒进共享树）。判据栈无关（版本锚在任何清单都有），
+# 实现按 pom 精确解析；其它清单原样返回（未实证篡改面，保守）。fail-open。
+
+# 顶层 <properties> 叶子属性 `<key>value</key>`（单行、value 不含尖括号）。
+_PROP_LEAF_RE = re.compile(r"<([A-Za-z_][\w.\-]*)>([^<>]*)</\1>")
+
+
+def _toplevel_property_map(text: str) -> dict[str, str]:
+    """收集 pom 顶层 <properties>（排除 profiles/build 区）叶子属性 {key: value}。
+
+    同名多值（跨块冲突/歧义）→ 剔除该键（宁可漏护绝不误改）。任何异常回空 dict。"""
+    try:
+        spans = _pom_region_spans(text)
+        excl = spans["profiles"] + spans["build"]
+        result: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for pm in re.finditer(r"<properties>(.*?)</properties>", text, re.S):
+            if any(s <= pm.start() < e for s, e in excl):
+                continue
+            for m in _PROP_LEAF_RE.finditer(pm.group(1)):
+                k, v = m.group(1), m.group(2).strip()
+                if k in result and result[k] != v:
+                    ambiguous.add(k)
+                else:
+                    result.setdefault(k, v)
+        for k in ambiguous:
+            result.pop(k, None)
+        return result
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _toplevel_property_values(text: str, key: str) -> list[str]:
+    """当前文本里某属性 key 在顶层 <properties>（排除 profiles/build）的【所有】叶子值。
+
+    刻意不去重：复核实锤——盲插式毒会留【重复 <key> 叶子】（round47 双 version 前例），
+    去重 map 会因歧义丢弃该键→检测被静默解除。逐值扫描才能对"有一个值≠基线"判篡改。"""
+    spans = _pom_region_spans(text)
+    excl = spans["profiles"] + spans["build"]
+    pat = re.compile(r"<" + re.escape(key) + r">([^<>]*)</" + re.escape(key) + r">")
+    vals: list[str] = []
+    for m in pat.finditer(text):
+        if any(s <= m.start() < e for s, e in excl):
+            continue
+        vals.append(m.group(1).strip())
+    return vals
+
+
+def _parent_version(text: str) -> str | None:
+    """首个 <parent> 块内的 <version> 值（继承的平台/BOM 版本锚）；无则 None。"""
+    try:
+        pm = re.search(r"<parent>(.*?)</parent>", text, re.S)
+        if not pm:
+            return None
+        vm = re.search(r"<version>\s*([^<]+?)\s*</version>", pm.group(1))
+        return vm.group(1).strip() if vm else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _restore_property_leaf(text: str, key: str, baseval: str) -> tuple[str, int]:
+    """把顶层（非 profiles/build 区）属性 <key>…</key> 的值改回 baseval。返回 (新文本, 改动数)。"""
+    spans = _pom_region_spans(text)
+    excl = spans["profiles"] + spans["build"]
+    pat = re.compile(r"<" + re.escape(key) + r">[^<>]*</" + re.escape(key) + r">")
+    out: list[str] = []
+    last = 0
+    count = 0
+    for m in pat.finditer(text):
+        if any(s <= m.start() < e for s, e in excl):
+            continue
+        out.append(text[last:m.start()])
+        out.append(f"<{key}>{baseval}</{key}>")
+        last = m.end()
+        count += 1
+    out.append(text[last:])
+    return "".join(out), count
+
+
+def _restore_parent_version(text: str, baseval: str) -> tuple[str, int]:
+    """把首个 <parent> 块内的 <version> 值改回 baseval。返回 (新文本, 改动数)。"""
+    pm = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    if not pm:
+        return text, 0
+    inner = pm.group(1)
+    new_inner, n = re.subn(
+        r"<version>\s*[^<]+?\s*</version>",
+        f"<version>{baseval}</version>", inner, count=1)
+    if not n:
+        return text, 0
+    return text[:pm.start(1)] + new_inner + text[pm.end(1):], n
+
+
+def restore_baseline_version_anchors(
+        text: str, baseline_text: str, rel_path: str,
+) -> tuple[str, list[dict]]:
+    """三方基线闸：把 worker/repair 对【基线既有】版本锚的【篡改】还原为基线值。
+
+    护住的锚：①顶层 <properties> 叶子属性（round63 死因本体：spring-boot.version）；
+    ②<parent><version>（继承的平台版本）。判据=「基线里存在该锚且当前值≠基线值」→ 还原基线值。
+    【加法】(新属性/新依赖/新模块、基线本无的键) 一律不动——只挡篡改既有锚，不挡合法扩充。
+    仅 pom；其它清单原样返回（未实证篡改面）。任何异常 fail-open 返回原文。
+    返回 (新文本, [{anchor, from, to}])。"""
+    try:
+        if rel_path.rsplit("/", 1)[-1].lower() != "pom.xml":
+            return text, []
+        if not baseline_text:
+            return text, []
+        base_props = _toplevel_property_map(baseline_text)
+        restorations: list[dict] = []
+        new_text = text
+        for key, bval in base_props.items():
+            # 逐值扫描（非去重 map）：任一顶层叶子值≠基线值即篡改。这样【重复叶子毒】
+            # (盲插双 <key>) 也被捕获，不因歧义静默解除检测（silent-hunter #1）。
+            cur_vals = _toplevel_property_values(new_text, key)
+            if not cur_vals or all(v == bval for v in cur_vals):
+                continue  # 键被删/全等基线 → 非值篡改，跳过（删除是别的形态，登记债）
+            new_text, n = _restore_property_leaf(new_text, key, bval)
+            if n:
+                differing = next(v for v in cur_vals if v != bval)
+                entry = {"anchor": f"property:{key}", "from": differing, "to": bval}
+                if len(cur_vals) > 1:
+                    entry["note"] = "multiple-current-leaves"  # 盲插重复叶子已一并收敛
+                restorations.append(entry)
+        b_pv = _parent_version(baseline_text)
+        c_pv = _parent_version(new_text)
+        if b_pv and c_pv and b_pv != c_pv:
+            new_text, n = _restore_parent_version(new_text, b_pv)
+            if n:
+                restorations.append(
+                    {"anchor": "parent.version", "from": c_pv, "to": b_pv})
+        return new_text, restorations
+    except Exception as exc:  # noqa: BLE001 — fail-open：绝不因解析异常阻断 pull-back
+        logger.warning(
+            "[workspace-manifest] T2 三方基线锚校验异常 fail-open: %s", exc)
+        return text, []
+
+
 def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
                           base_dir: "Path | None" = None) -> str:
     """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。

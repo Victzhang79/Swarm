@@ -115,3 +115,49 @@ fixture）。绝不 mid-run、绝不猜。
 T2 的必要性：投毒能落到基线 checkout（untracked alarm-interface/ruoyi-alarm 目录仍在）。★
 **栈中立**：判据全走 groupId/release-train/version-list/属性引用计数，无 Spring/Java 名硬编码；
 不变量（共享版本锚不得为单依赖降级）对 npm/Gradle/Cargo 同样成立。
+
+### T2 调查结论（2026-07-16，投毒进树的确切通道）
+**通道**：pull-back 共享清单落盘走 `sandbox._merge_manifest_with_local`→`workspace_manifest.merge_shared_manifest`。
+该 merge 是**加法-only 两方并集**（只并 dependency/module 条目），自己 docstring 登记了债：
+"内容级'有意删除/篡改'两方合并无法与覆盖丢失区分→被并回复活，需三方基线（登记债）"。round63 的
+`<spring-boot.version>4.0.6→3.5.16`（顶层 <properties> 篡改，既非 dep 块也非 module）恰落此洞→
+incoming 毒值原样穿过 merge 进共享树→整 reactor 降代死锁。H2 `_rollback_failed_manifest_footprint`
+只在 L1 **FAIL** 时摘贡献，而毒子任务沙箱**裁绿**（本模块编过）→ H2 不触发→毒照进。scope 守卫
+（round18 P0-B）**故意**豁免 `_repaired_extra_paths`（否则合法 module-registration 改父 pom 被误杀）
+→ 篡改共享锚不被 scope 抓。**结论**：缺的正是 merge 自认的"三方基线"。
+
+### T2 完成（2026-07-16，test-first + 对抗双复核 + 全量套件）
+**设计**：补上 merge 缺的第三方基线（git HEAD），在 pull-back 落盘后加**独立三方基线闸**。判据=
+「基线**既有**版本锚（顶层 <properties> 叶子 + <parent><version>）当前值≠基线值」→ 篡改 → 还原基线值
+（拒毒进共享树）。**只挡篡改既有锚，放行一切加法**（新属性/依赖/module 注册）→ 结构上不会冲掉并行
+兄弟的合法注册（兄弟都是加法）。用结构不变量而非"基线编译→变不可编译"的昂贵全 reactor 编译闸——
+确定性、离线、栈中立（版本锚在任何清单都有；实现按 pom 精确解析，其它清单原样放行未实证面）。
+**改动**：
+- `workspace_manifest.py` 纯判据 `restore_baseline_version_anchors(text, baseline, rel)→(新文本, 还原清单)`
+  + `_toplevel_property_map`/`_toplevel_property_values`/`_parent_version`/`_restore_property_leaf`/
+  `_restore_parent_version`（均纯函数、fail-open）。
+- `executor_sync.py` `_enforce_baseline_anchor_integrity` 接进 `_sync_from_sandbox` 两分支（沙箱 pull-back
+  + 本地模式），持 per-project flock 读-改-写，同步修正 `_post_sync_contents`（防 diff 再把毒当产出）。
+- `executor.py` 初始化 `_baseline_integrity_restored`；`executor_l1gate.py` 挂进 L1 details 可查。
+**对抗双复核抓到并已治的缺陷**：
+- ★HIGH（code-reviewer）★ **越界误还原**：初版对【任何】pom 既有属性篡改都还原，会把子任务
+  **合法拥有**的模块 pom 里的私有属性 bump（brain 授权）也误还原、静默丢交付。已治：**scope-ownership
+  豁免**——清单在子任务 writable/create scope 内=授权编辑，放行；只护"非本子任务 scope"（repair 越界
+  摸到基线，正是 round63 毒的签名）。加 `test_enforce_owned_pom_property_bump_not_reverted` +
+  `test_enforce_out_of_scope_property_still_reverted` 成对锁死。
+- ★HIGH（silent-hunter）★ **重复叶子静默解除检测**：去重 map 遇同键异值判歧义**丢弃该键**→
+  盲插式毒（round47 双 version 前例）留下重复 <key> 叶子时检测被静默解除、毒漏过。已治：改**逐值扫描**
+  `_toplevel_property_values`（不去重），任一值≠基线即判篡改、全部收敛基线值并标 note。加
+  `test_duplicate_current_leaf_poison_still_detected`。
+- MEDIUM（silent-hunter #2/#3）**写盘失败/解码失败静默跳过**：已确证篡改却还原写盘失败=毒仍在树，
+  或读取解码失败=可能漏毒——都改 `level="warning"` 留声。
+- MEDIUM（silent-hunter #4 + code-reviewer 锁范围）：命中/异常日志全升 `level="warning"`（观测约定）；
+  git 基线读取移出 flock（不可变历史无需锁），只锁本地读-改-写，去掉阻塞并行兄弟的隐患。
+- 观测（silent-hunter #6）：`_baseline_integrity_restored` 挂进 L1 details，verdict/telemetry 可查。
+**测试**：本 T2 文件 13/13 绿；manifest/sync/merge/L1/round18/CRLF/T1 定向回归 130 全绿；ruff 我新增区无
+新 E501/F 类（余为既有 noqa 抑制项）。
+**已知边界（登记债，非本轮 blocker）**：①三方基线本身若被前序毒污染（毒已 commit 进 HEAD）则闸静默降级
+——T2 明定为 git HEAD 之上的结构兜底，非防污染 HEAD；②基线属性被**删除**（非改值）暂不重插（round63 是
+改值不是删）。二者留待需要时再治。
+**栈中立**：判据=版本锚差异（任何清单都有的概念）；实现按 pom 精确解析，非 pom 清单原样放行（未实证篡改
+面，保守），符合"通用多栈绝不写死语言"铁律。

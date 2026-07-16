@@ -332,6 +332,12 @@ class _L1GateMixin:
                 details["pullback_errors"] = len(self._sync_error_rels)
                 return None, details
             details["deterministic_gate"] = "pass" if ok else "fail"
+            # T2 观测（silent-hunter #6）：pull-back 三方基线闸还原过的基线共享锚篡改
+            # 挂进 L1 details，使 verdict/telemetry 可查（否则仅 warning 日志一处痕迹）。
+            # 纯信息键，不改 ok/fail 判定。
+            if getattr(self, "_baseline_integrity_restored", None):
+                details["baseline_integrity_restored"] = list(
+                    self._baseline_integrity_restored)
             if empty_diff:
                 details["note"] = "empty diff，仅靠 harness 命令验证"
             # C2（阶段4）：只缓存【确定性 PASS】——diff 内容签名未变时 Phase-4 复用，

@@ -192,6 +192,9 @@ class WorkerExecutor(
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
         self._repaired_extra_paths: set[str] = set()
+        # T2（round63 死锁触发器结构性兜底）：pull-back 三方基线闸还原过的【基线共享版本锚篡改】
+        # 登记 [{file, anchor, from, to}]。fail-loud 可查证据（worker/repair 无权改基线共享锚）。
+        self._baseline_integrity_restored: list[dict] = []
         # D36：bootstrap 上传完成后在沙箱 touch 的标记文件相对路径。pull-back 时据其 mtime
         # 用 `find -newer` 圈出 worker 在沙箱改过的【上下文兄弟文件】（readable/整模块源码里被
         # sed 改的），并入回传+diff——否则 sandbox 编过绿、改动不落盘→集成期 cannot find symbol。

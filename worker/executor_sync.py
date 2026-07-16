@@ -790,6 +790,103 @@ class _SandboxSyncMixin:
             if staging_dir:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
+    def _enforce_baseline_anchor_integrity(self, local_root: Path, reason: str) -> None:
+        """T2（round63 死锁触发器结构性兜底）：pull-back 落盘后，校验【基线跟踪的共享清单】
+        的既有版本锚是否被 worker/repair 篡改；命中即还原基线值（拒毒进共享树）+ fail-loud 登记。
+
+        为何是三方基线而非编译闸：merge_shared_manifest 是加法-only 两方并集，自登记"内容级篡改
+        无三方基线无法与覆盖区分→被并回复活"的债；round63 正踩此洞（共享 spring-boot.version 被
+        单依赖降级）。此处用 git HEAD 作第三方基线，判据「基线既有锚 & 当前值≠基线值」=篡改，
+        确定性、离线、栈无关，无须昂贵的全 reactor 编译。T1 已在 version-repair 源头禁改共享锚；
+        本闸是独立结构兜底（任何未来修复路径误改基线共享锚都被挡）。
+
+        只挡【篡改既有锚】，不挡加法（新属性/依赖/module 注册照常并回）→ 不会冲掉并行兄弟的合法
+        注册（兄弟是加法）。持 per-project flock（读-改-写原子）。任何异常 fail-open 不阻断 pull-back。
+        """
+        try:
+            from swarm.worker.sandbox import _is_shared_manifest
+            from swarm.worker.workspace_manifest import (
+                restore_baseline_version_anchors,
+            )
+            own = dict(getattr(self, "_post_sync_contents", None) or {})
+            rels = sorted(r for r in own if r and _is_shared_manifest(r))
+            if not rels:
+                return
+
+            def _norm(p: str) -> str:
+                p = str(p or "").replace("\\", "/")
+                return p[2:] if p.startswith("./") else p.lstrip("/")
+
+            # ★复核 HIGH（code-reviewer）★：只护【本子任务无写权】的清单。若清单在子任务
+            # writable/create scope 内=brain 授权其编辑（如规划的版本升级、模块私有属性 bump）
+            # →放行，绝不误还原。round63 毒正是【repair 路径越 scope 摸到基线根 pom】——即
+            # 恰是"非本子任务 scope"这一侧，判据精准命中而不误伤合法交付。
+            sc = (getattr(self, "effective_scope", None)
+                  or getattr(getattr(self, "subtask", None), "scope", None))
+            owned = {
+                _norm(f)
+                for f in (list(getattr(sc, "writable", None) or [])
+                          + list(getattr(sc, "create_files", None) or []))
+                if f
+            }
+            # git 基线读取（不可变已提交历史）在锁外先批量取——避免把每文件 ≤15s 的 git
+            # 子进程串进全局 per-project 锁，阻塞并行兄弟 pull-back（code-reviewer MEDIUM）。
+            work: list[tuple[str, str]] = []
+            for rel in rels:
+                if _norm(rel) in owned:
+                    continue  # 本子任务有写权=授权编辑，放行
+                baseline = self._git_baseline_text(local_root, rel)
+                # None=git 不可用/未跟踪；""=基线树无此文件（本子任务新建）——两者都无
+                # 【基线既有锚】可护，跳过（fail-open：绝不把"无基线"当篡改）。
+                if not baseline:
+                    continue
+                work.append((rel, baseline))
+            if not work:
+                return
+            restored_all: list[dict] = []
+            with _ProjectGitFlock(self.project_path):  # 仅护本地读-改-写原子
+                for rel, baseline in work:
+                    lp = local_root / rel
+                    if not lp.is_file():
+                        continue
+                    try:
+                        cur = lp.read_bytes().decode("utf-8")
+                    except Exception as _de:  # noqa: BLE001
+                        # silent-hunter #3：解码失败≠无毒，须留声（否则毒被静默跳过）
+                        self._log(
+                            f"{reason} T2 基线完整性闸：共享清单 {rel} 读取/解码失败，"
+                            f"跳过校验（非致命）: {_de}", level="warning")
+                        continue
+                    new_text, restorations = restore_baseline_version_anchors(
+                        cur, baseline, rel)
+                    if not restorations:
+                        continue
+                    try:
+                        lp.write_bytes(new_text.encode("utf-8"))
+                    except Exception as _we:  # noqa: BLE001
+                        # silent-hunter #2：已确证篡改但还原【写盘失败】=毒仍在树，绝不静默
+                        self._log(
+                            f"{reason} ★T2 基线完整性闸★：{rel} 检测到既有版本锚被篡改 "
+                            f"{[(r['anchor'], r['from'], '→', r['to']) for r in restorations]} "
+                            f"但【还原写盘失败·毒仍在树，需介入】: {_we}", level="warning")
+                        continue
+                    # 同步修正产出快照，避免 diff/后续机制再把毒当产出回传
+                    self._post_sync_contents[rel] = new_text
+                    # 逐文件即时登记（不攒到循环末）：后续文件抛异常也不丢已还原记录（minor）
+                    self._baseline_integrity_restored = (
+                        list(getattr(self, "_baseline_integrity_restored", []))
+                        + [{"file": rel, **r} for r in restorations])
+                    restored_all.append(rel)
+                    self._log(
+                        f"{reason} ★T2 基线完整性闸★：{rel} 既有版本锚被篡改→已还原基线值 "
+                        f"{[(r['anchor'], r['from'], '→', r['to']) for r in restorations]}"
+                        "（拒毒进共享树；worker/repair 无权改基线共享版本锚）",
+                        level="warning")
+        except Exception as _exc:  # noqa: BLE001 — fail-open
+            self._log(
+                f"{reason} T2 基线完整性闸异常（非致命，fail-open）: {_exc}",
+                level="warning")
+
     def _rollback_failed_manifest_footprint(self, l1_details: dict | None = None) -> None:
         """H2（round48c 深读实锤）：L1 终局未通过 → 摘除本子任务对共享清单的新增贡献。
 
@@ -915,6 +1012,7 @@ class _SandboxSyncMixin:
             self._post_sync_contents = self._snapshot_scope_local(
                 local_root, files=self._writable_files() + extra_repaired
             )
+            self._enforce_baseline_anchor_integrity(local_root, reason)
             await self._normalize_jvm_namespace(local_root, reason)
             return
         self._post_sync_contents = {}
@@ -1032,6 +1130,7 @@ class _SandboxSyncMixin:
             )
             for err in (sync_stats.get("errors") or [])[:5]:
                 self._log(f"pull-back 警告: {err}")
+            self._enforce_baseline_anchor_integrity(local_root, reason)
             await self._normalize_jvm_namespace(local_root, reason)
         except Exception as sync_exc:
             # N-07：pull-back 失败若吞掉，成功执行的产出拉不回来→diff 空→报"无变更"→
