@@ -474,6 +474,60 @@ _BUILD_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml",
                     "go.mod", "package.json", "pyproject.toml")
 
 
+# ★R64★ 辅助交付物扩展名（多栈通用）：DDL/文档/图片/脚本/纯配置——不参与构建 reactor、
+# 不需要构建清单的文件类型。它们是逻辑归属模块的辅助交付物，绝不定义/扩张模块物理根。
+# .xml/.yml/.properties 在 src 树内（mapper/应用配置）也归此类——无损：模块根由同树源码
+# 文件给出；构建清单（pom.xml 等）在分类器里【先于】本表判定，不受影响。
+_AUX_EXTENSIONS = frozenset({
+    ".sql", ".ddl", ".md", ".markdown", ".rst", ".adoc", ".txt", ".csv", ".tsv",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".log",
+    ".html", ".css", ".xml", ".yml", ".yaml", ".toml", ".properties", ".conf",
+    ".ini", ".cfg", ".env", ".sh", ".bat", ".ps1",
+})
+
+# 证据分类（★R64 证据强度分层★，round64 死因 + 对抗双复核 4 条 CONFIRMED 一体整改）：
+#   manifest  构建清单=「声明的构建根」本身：主张【所在目录】为根（逮"清单声明错目录"，
+#             猎手 F3），不参与源码定根/前缀。
+#   aux       辅助扩展名——【先于】布局段判定（'sql/main/x.sql' 的 'main' 撞布局段词表也
+#             不得升格，猎手 F2）。有任何代码/清单证据时整类退位；纯辅助模块才回退顶层目录。
+#   strong    含标准布局段的源码（<mod>/src/main/java/…）：根=_code_module_root；根级布局
+#             （src/ 直居仓库根）根记 "."=仓库根本身，绝不静默丢证据（复核 CR-H1：丢了它，
+#             "根级根+子目录根"的真双根违①会静默消失、G1 降级成 warn）。
+#   weak_code 无布局段的其余文件（flat 布局真源码：web/App.js、svc/app.py）：根=顶层目录。
+#             flat 源码是真代码不是辅助物，与 strong 同等参与歧义判定（猎手 F1：混合布局
+#             真双根不得因"另一根恰好带布局段"被静默放行）。
+_EV_MANIFEST, _EV_AUX, _EV_STRONG, _EV_WEAK_CODE = "manifest", "aux", "strong", "weak_code"
+
+
+def _evidence_class(path: str) -> str:
+    """单文件路径 → 证据类别（见上表）。round64 死因本体：顶层 sql/*.sql 经顶层目录回退
+    被当第二物理根 → G1 三验三拒好 plan（issues 反馈"归到同一模块目录"对棕地顶层 sql
+    惯例结构性不可满足 → LLM 永不收敛 → FAILED@PLAN）。多栈中立，不写死任何单一栈。"""
+    p = _norm_scope_path(path)
+    if p.endswith(_BUILD_MANIFESTS):
+        return _EV_MANIFEST
+    name = p.rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    if dot > 0 and name[dot:].lower() in _AUX_EXTENSIONS:
+        return _EV_AUX
+    if any(seg in _SRC_LAYOUT_SEGMENTS for seg in p.split("/")[:-1]):
+        return _EV_STRONG
+    return _EV_WEAK_CODE
+
+
+def _evidence_root(path: str, cls: str) -> str | None:
+    """单文件路径 + 证据类别 → 它主张的模块物理根（None=不主张）。"""
+    p = _norm_scope_path(path)
+    if cls == _EV_MANIFEST:
+        return p.rsplit("/", 1)[0] if "/" in p else None   # 根级清单=聚合器本体，不主张
+    if cls == _EV_STRONG:
+        r = _code_module_root(p)
+        return r if r is not None else "."   # 根级布局：模块根=仓库根（CR-H1）
+    if cls == _EV_WEAK_CODE:
+        return p.split("/", 1)[0] if "/" in p else None
+    return None   # aux：不主张（调用方对纯辅助模块另行回退顶层目录）
+
+
 def _module_physical_dirs(plan, project_path: str | None,
                           file_plan: list | None = None) -> dict[str, str]:
     """R57-1 + R57-4 合治：契约模块名 → 它在磁盘上的**真实物理目录**（多栈通用，不写死任何栈）。
@@ -528,7 +582,13 @@ def _resolve_module_dirs(
     _want = {(e.get("module") or "").strip().rstrip("/")
              for e in ((getattr(plan, "shared_contract", None) or {}).get("dependencies") or [])
              if isinstance(e, dict)} - {""}
-    cands: dict[str, set[str]] = {}
+    # ★R64 证据强度分层（两通道同规则）★：代码证据（strong/weak_code）与辅助证据（aux）
+    # 分桶收集；有代码证据的模块只看代码证据——aux 绝不给名字匹配通道造第二物理根
+    # （`sql/<模块名>/…` 与 fp 通道的顶层 sql 是同族暗门，猎手 F2 一并封死）。flat 布局
+    # 真源码（weak_code）与 strong 同等参与（猎手 F1）；纯辅助模块回退 aux 桶（不砍
+    # flat/纯资源项目的唯一证据来源，silent-hunter #1 兜底不放水）。
+    cands_code: dict[str, set[str]] = {}
+    cands_aux: dict[str, set[str]] = {}
     for st in getattr(plan, "subtasks", []) or []:
         sc = getattr(st, "scope", None)
         files = (list(getattr(sc, "create_files", []) or [])
@@ -536,13 +596,23 @@ def _resolve_module_dirs(
         for f in files:
             p = _norm_scope_path(f)
             if "/" not in p or p.endswith(_BUILD_MANIFESTS):
-                continue   # 构建清单不算证据（它正是我们要造的东西）
+                continue   # 构建清单不算名字匹配证据（它正是我们要造的东西）
+            bucket = (cands_aux if _evidence_class(p) == _EV_AUX else cands_code)
             parts = p.split("/")
             for i, seg in enumerate(parts[:-1]):    # 末段是文件名
                 if seg in _SRC_LAYOUT_SEGMENTS:
                     break   # 模块名只可能在源码根之前；其后是包/目录段，不是模块边界
                 if seg in _want:
-                    cands.setdefault(seg, set()).add("/".join(parts[:i + 1]))
+                    bucket.setdefault(seg, set()).add("/".join(parts[:i + 1]))
+    cands: dict[str, set[str]] = {}
+    for m in set(cands_code) | set(cands_aux):
+        code_dirs, aux_dirs = cands_code.get(m), cands_aux.get(m)
+        cands[m] = code_dirs or aux_dirs or set()
+        if code_dirs and aux_dirs and not (aux_dirs <= code_dirs):
+            # 猎手 F5：证据退位必须可观测——否则"闸正确解析"与"闸静默扔了一桶矛盾证据"
+            # 在日志上不可分，round64 族回归将再次只能靠第一性原理考古。
+            logger.info("[R64-EVIDENCE] 模块 %r 名字匹配的辅助文件根 %s 不计入物理根判定"
+                        "（代码证据根=%s）", m, sorted(aux_dirs - code_dirs), sorted(code_dirs))
     out: dict[str, str] = {}
     for mod, dirs in cands.items():
         if len(dirs) == 1:
@@ -559,12 +629,35 @@ def _resolve_module_dirs(
     # （脚手架行为零回归）——多根仅额外进 fp_ambiguous 供 G1 闸打回，不改 out。
     fp_ambiguous: dict[str, list[str]] = {}
     for mod, paths in _file_plan_module_paths(file_plan).items():
-        prefix = _common_module_prefix(paths, project_path)
+        # ★R64 证据强度分层★：按 _evidence_class 逐文件分类。物理根由代码证据
+        # （strong/weak_code）+ 清单证据（manifest，主张清单所在目录——逮"清单声明错目录"）
+        # 共同主张；aux（顶层 sql/docs/scripts 等辅助交付物）在存在任何其它证据时整类退位、
+        # 绝不扩张物理根（round64 死因本体）。纯辅助模块（如 db-scripts 只含 sql）→ 回退
+        # aux 顶层目录，保持原行为。
+        by_cls: dict[str, list[str]] = {}
+        for p in paths:
+            by_cls.setdefault(_evidence_class(p), []).append(p)
+        aux = by_cls.get(_EV_AUX, [])
+        code_paths = by_cls.get(_EV_STRONG, []) + by_cls.get(_EV_WEAK_CODE, [])
+        # 定根前缀优先代码证据；无代码证据（纯辅助/纯清单模块，如聚合父只带自己的 pom）
+        # 回退全 paths——保持旧行为（_common_module_prefix 的末段=文件名不参与，清单路径
+        # 能给出正确的模块目录前缀）。
+        prefix = _common_module_prefix(code_paths or paths, project_path)
         if prefix:
             out[mod] = prefix
-        _roots = {r for p in paths
-                  for r in (_code_module_root(p) or (p.split("/", 1)[0] if "/" in p else ""),)
-                  if r}
+        _roots: set[str] = set()
+        for p, cls in ((q, c) for c, ps in by_cls.items() for q in ps if c != _EV_AUX):
+            r = _evidence_root(p, cls)
+            if r:
+                _roots.add(r)
+        if not _roots:   # 纯辅助模块：回退顶层目录（多根照打回，flat 兜底不放水）
+            _roots = {q.split("/", 1)[0] for q in aux if "/" in q}
+        elif aux:
+            _aux_tops = {q.split("/", 1)[0] for q in aux if "/" in q} - _roots
+            if _aux_tops:
+                # 猎手 F5：退位必须可观测（fail-open 可观测铁律）
+                logger.info("[R64-EVIDENCE] 模块 %r file_plan 的辅助文件根 %s 不计入物理根"
+                            "判定（代码/清单证据根=%s）", mod, sorted(_aux_tops), sorted(_roots))
         if len(_roots) > 1:
             fp_ambiguous[mod] = sorted(_roots)
     # 违①：名字匹配落到 2+ 目录、且 file_plan/基线未把它消解到唯一目录 → 真歧义；file_plan 自身
