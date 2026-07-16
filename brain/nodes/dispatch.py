@@ -757,9 +757,14 @@ def monitor(state: BrainState) -> dict:
     subtask_results: dict = state.get("subtask_results", {})
     failed_ids = state.get("failed_subtask_ids", [])
 
+    # R65C-T2 修⑤：三本账统一口径——旧行把滞留的 L1 失败结果也计成"已完成"
+    # （round65c 排障时 已完成 在 5↔3 间跳动=两处口径不一的假象），且放弃数不可见。
+    _aband_n = len(set(state.get("abandoned_subtask_ids") or [])
+                   | set(state.get("give_up_isolated_ids") or []))
     logger.info(
         f"[MONITOR] 剩余={len(dispatch_remaining)}, "
-        f"已完成={len(subtask_results)}, 失败={len(failed_ids)}"
+        f"已完成(L1过)={len(completed_l1_ids(subtask_results))}, "
+        f"失败={len(failed_ids)}, 放弃={_aband_n}"
     )
 
     # 此节点不做状态变更，仅用于条件路由

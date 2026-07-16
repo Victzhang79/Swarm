@@ -713,13 +713,28 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 非空时各 return 路径须回写 plan（in-place 补边后 LangGraph 需要显式 emit 才持久化）。
     _c9_edges: dict[str, list[str]] = {}
     if plan_obj is not None:
-        _unsat = (set(state.get("give_up_isolated_ids") or [])
-                  | set(state.get("abandoned_subtask_ids") or []))
         _proj_path = _get_project_path(state.get("project_id") or "")
         _by_id = {s.id: s for s in plan_obj.subtasks}
         # #10 治本所需：全局 settled 生产者判据的两个集合。
         _completed_ok = {sid for sid, out in subtask_results.items()
                          if sid not in failed_ids and l1_passed(out)}
+        # R65C-T2 修①：【stub 模式】的 give-up ≠ 死上游——阶梯三给被依赖的失败子任务
+        # 打了可编译桩（其承诺就是"下游可编译，不连坐"），把它仍计入不可满足集会让
+        # 下游一次 0.8s 的 BLOCKED 探针经 _prod_hit 引爆全计划传递闭包连坐
+        # （round65c 实锤：st-1-2 探针 → 102/107 被弃 → 假«全部完成» → L2 拦下假交付）。
+        # ★复核 CRITICAL 整改★：豁免判据=give_up_mode=="stub"（settled-with-product），
+        # 绝不用裸 l1_passed——revert 模式同样写 l1_passed 占位但产物已剥离（round12/13
+        # 真死上游必须照旧连坐，两只既有回归锁实证）；abandoned 集不豁免
+        # （R51-1：完成者本就不该进 abandoned）。
+        from swarm.brain.nodes.shared import l1_details_of as _l1d
+        _stubbed_ok = {
+            sid for sid in (state.get("give_up_isolated_ids") or [])
+            if l1_passed(subtask_results.get(sid))
+            and (_l1d(subtask_results.get(sid)) or {}).get("give_up_mode") == "stub"
+        }
+        _unsat = ((set(state.get("give_up_isolated_ids") or [])
+                   | set(state.get("abandoned_subtask_ids") or []))
+                  - _stubbed_ok)
         _pending_now = set(state.get("dispatch_remaining") or []) | set(failed_ids)
         _unrecoverable: set[str] = set()
         # round36 P0 治本：区分两类"阻断在无产物的内部包"——(1)【真死上游】有生产者但已放弃/
@@ -956,6 +971,27 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
                 completed_ids=_completed_ok,  # R51-1
             )
+            # R65C-T2 修③：连坐规模闸——一次放弃超过计划 25%（或 10 个取大）绝不静默
+            # 执行：那不是"剪除死枝"而是"计划覆灭"，必须 escalate 人工决策。
+            # round65c 实锤：单个 0.8s BLOCKED 探针触发 102/107 连坐 → 假«全部完成»。
+            # 显式剪除决策之外，pending 工作集绝不允许一笔大额缩水（结构性不变量）。
+            _new_abandon = set(abandoned) - set(state.get("abandoned_subtask_ids") or [])
+            _abandon_cap = max(10, int(len(plan_obj.subtasks) * 0.25))
+            if len(_new_abandon) > _abandon_cap:
+                logger.error(
+                    "[HANDLE_FAILURE] R65C-T2 连坐规模闸：本次连坐 %d 个（阈值 %d，计划共 %d）"
+                    "——触发源 %s。这不是剪枝而是计划覆灭，escalate 人工决策，绝不静默放弃",
+                    len(_new_abandon), _abandon_cap, len(plan_obj.subtasks),
+                    sorted(_unrecoverable)[:6],
+                )
+                return {
+                    **({"plan": plan_obj} if _c9_edges else {}),
+                    "failure_strategy": "escalate",
+                    "failure_escalated": True,
+                    "failed_subtask_ids": failed_ids,
+                    "degraded_reasons": [
+                        f"mass_abandon_gate:{len(_new_abandon)}/{len(plan_obj.subtasks)}"],
+                }
             for _a in abandoned:
                 subtask_results.pop(_a, None)
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]

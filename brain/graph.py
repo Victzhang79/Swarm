@@ -307,6 +307,21 @@ def after_monitor(state: BrainState) -> Literal["handle_failure", "dispatch", "m
         logger.info(f"[ROUTE] MONITOR → DISPATCH ({len(dispatch_remaining)} 个剩余)")
         return "dispatch"
 
+    # R65C-T2 修④：完成判据对全计划诚实——remaining==0 可能是«做完了»也可能是
+    # «都被放弃了»（round65c：102/107 连坐后 remaining=0，旧标签"全部完成"掩盖计划
+    # 覆灭直到 L2 才拦下假交付）。放弃>0 时按三本账 WARNING 留痕，绝不谎报全部完成。
+    _plan_final = state.get("plan")
+    _aband_final = (set(state.get("abandoned_subtask_ids") or [])
+                    | set(state.get("give_up_isolated_ids") or []))
+    if _aband_final and _plan_final is not None:
+        from swarm.brain.nodes.shared import completed_l1_ids
+        _done_n = len(completed_l1_ids(state.get("subtask_results", {})))
+        logger.warning(
+            "[ROUTE] MONITOR → MERGE (完成 %d + 放弃 %d / 计划 %d —— PARTIAL 交付，"
+            "绝非全部完成；放弃清单入终态机读账)",
+            _done_n, len(_aband_final), len(_plan_final.subtasks),
+        )
+        return "merge"
     logger.info("[ROUTE] MONITOR → MERGE (全部完成)")
     return "merge"
 
