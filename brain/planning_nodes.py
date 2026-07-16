@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from langgraph.types import interrupt
 
@@ -1134,8 +1135,32 @@ TECH_DESIGN_STAGE2_USER = """总需求（背景）：{task_description}
 模块名：{mod_name}
 职责：{mod_responsibility}
 预估文件数：{mod_est_files}
+{cont_section}
+只为这个模块产出 file_plan（完整路径），module 字段统一填 "{mod_name}"。
+本批【最多输出 {batch_cap} 个文件】：按依赖序先输出最基础的文件；若超出上限，
+剩余文件我会继续分批向你请求——绝不要为塞进一批而省略文件或截断单个文件项。"""
 
-只为这个模块产出 file_plan（完整路径），module 字段统一填 "{mod_name}"。"""
+# R65-T1 分批续写参数：round65 实测 sdk 模块 12 文件 53.5s，30 文件 ~2-4min，
+# 远离单调用超时；批次硬上限触顶 = WARNING+机读 incomplete 标记收下已产出（绝不静默截断）。
+_STAGE2_BATCH_FILES = 30   # 单批文件数上限（提示词约束 + 续写收敛判据用确定性空批/0新增，不猜批大小）
+_STAGE2_MAX_BATCHES = 10   # 单模块产出批次硬上限（10×30=300 文件，病理性无限产出的止损阀）
+# R65-T1 猎手 F3：失败预算改双轨——「连续失败」判模块死（同构失败快收敛），
+# 「累计失败」只作硬上限（大模块批多，零星瞬时失败不该跨批累积成死刑，
+# 否则恰好惩罚本机制要救的大模块）。
+_STAGE2_MAX_TOTAL_FAILURES = 8
+
+# 猎手 F4：est_files 是 LLM 自报字段，宽松抽数字（"~15"/"10-20" 取首段数字）
+_RE_EST_DIGITS = re.compile(r"\d+")
+
+
+def _fileplan_path_key(path: str) -> str:
+    """跨批去重键归一（R65-T1 猎手 F6）：strip + 反斜杠→斜杠 + 剥 ./ 前缀。
+    模型续批把 src/A.x 复读成 ./src/A.x 时不得当新文件（污染计数+重复条目）。
+    只归一键，条目里保留原始 path（下游有自己的规范化管线）。"""
+    q = str(path or "").strip().replace("\\", "/")
+    while q.startswith("./"):
+        q = q[2:]
+    return q
 
 
 def _is_token_limit_error(exc: BaseException) -> bool:
@@ -1285,15 +1310,53 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                               # (RUN12 实证 alarm-config 'Expecting value: char0' 空响应 → 整模块丢失 → 欠 PRD)
 
     async def _gen_one_module(mi: int, mod: dict) -> dict:
-        """产出单个模块的 file_plan，失败重试至多 _STAGE2_MAX_ATTEMPTS 次。返回 {idx,name,file_plan,error}。
+        """产出单个模块的 file_plan（R65-T1 分批续写）。返回 {idx,name,file_plan,error}。
+
+        round65 死因：大模块（est_files=92）单次调用枚举全部文件 → 单流 500s 必超时，
+        重试同构必复现 → 整模块丢失。治本：
+        - 每批带上限（提示词约束）短输出；续批带「已产出清单勿重复」；
+        - 收敛判据是确定性的：空批 或 0 新增（不猜批大小——模型自行提前停会被
+          est_files 覆盖率 WARNING 暴露，绝不静默）；
+        - 批失败只重试该批（累积成果不丢）；失败预算双轨（猎手 F3）：连续
+          _STAGE2_MAX_ATTEMPTS 次判死（同构失败快收敛），累计 _STAGE2_MAX_TOTAL_FAILURES
+          硬上限（零星瞬时失败不跨批累积成死刑——那会恰好惩罚要救的大模块）；
+        - 超时/输出上限截断重试自适应缩批（大响应超时 → 更小的批才可能过）；
+        - 批次硬上限触顶 → WARNING + incomplete 机读标记收下已产出（绝不静默截断亦不丢弃）；
+        - 模块级 all-or-nothing：预算烧尽 → file_plan=[] 走 stage2_failed_modules
+          对账（半截 plan 静默当成功 = silent-pass 禁令）。
 
         R38 复核 F8：token 拒绝后等到准入的重试不占能力配额（admission_probe 无副作用，
         probe→reserve 竞态输家不该烧配额），独立计数有界（_ADMISSION_RETRY_MAX）防死循环。"""
         mod_name = mod.get("name") or f"module-{mi}"
+        _t_mod = _time.monotonic()
+        _acc: dict[str, dict] = {}  # 归一路径键 → 条目（插入序 = 依赖序），跨批去重合并
         _last_err = "unknown"
-        _attempt = 0        # 能力/瞬时失败次数（旧语义配额）
+        _consec_fail = 0    # 连续失败（成功批清零）——判模块死的主判据（猎手 F3）
+        _total_fail = 0     # 累计失败硬上限（防长序列失败无界）
         _adm_retries = 0    # 准入等待后的重试次数（不占能力配额）
-        while _attempt < _STAGE2_MAX_ATTEMPTS and _adm_retries <= _ADMISSION_RETRY_MAX:
+        _ok_batches = 0     # 产出了新文件的成功批数
+        _batch_cap = _STAGE2_BATCH_FILES
+        _converged = False
+        _topped_out = False
+        while (_consec_fail < _STAGE2_MAX_ATTEMPTS
+               and _total_fail < _STAGE2_MAX_TOTAL_FAILURES
+               and _adm_retries <= _ADMISSION_RETRY_MAX):
+            if _ok_batches >= _STAGE2_MAX_BATCHES:
+                _topped_out = True
+                logger.warning(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 触批次上限（%d 批，已产出 %d 文件）"
+                    "——收下已产出并打 incomplete 机读标记，绝不静默截断",
+                    mi, mod_total, mod_name, _STAGE2_MAX_BATCHES, len(_acc))
+                break
+            if _acc:
+                _done_lines = "\n".join(f"- {p}" for p in _acc)
+                _cont_section = (
+                    f"\n已产出的文件（共 {len(_acc)} 个，【绝不要】重复输出，只列剩余）：\n"
+                    f"{_done_lines}\n"
+                    '若上述清单已覆盖该模块全部文件：直接输出 {"file_plan": []}'
+                    "——【绝不虚构】凑数文件。\n")
+            else:
+                _cont_section = ""
             _tm = _time.monotonic()
             _token_denied: dict | None = None  # R38-C：账本拒绝时带 usage，信号量外等准入
             async with _sem:
@@ -1310,26 +1373,69 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                                 mod_name=mod_name,
                                 mod_responsibility=mod.get("responsibility", ""),
                                 mod_est_files=mod.get("est_files", "?"),
+                                cont_section=_cont_section,
+                                batch_cap=_batch_cap,
                             )},
                         ]),
                         timeout=_STAGE2_MODULE_TIMEOUT,
                     )
+                    # R65-T1 猎手 F7（尽力而为面）：max_tokens 截断的响应 json_repair 会
+                    # "修好"成含幻影残路径的合法 JSON 静默入账——有 finish_reason 元数据时
+                    # 在解析前拦截判失败并缩批（无元数据的静默截断残量靠录制带观察）。
+                    _fin = str(((getattr(resp2, "response_metadata", None) or {})
+                                .get("finish_reason") or "")).lower()
+                    if _fin in ("length", "max_tokens"):
+                        _batch_cap = max(10, _batch_cap // 2)
+                        raise ValueError(f"响应被输出上限截断(finish_reason={_fin})，缩批重试")
                     r2 = _parse_json_from_llm(resp2.content)
+                    # 复核 R-1（CONFIRMED HIGH）：合法 JSON 但缺 file_plan 数组 = off-schema
+                    # 退化响应，绝不作收敛信号——落失败重试路径（首批/续批同律）。
+                    if not isinstance(r2, dict) or not isinstance(r2.get("file_plan"), list):
+                        raise ValueError("响应缺 file_plan 数组（off-schema，不作收敛信号）")
+                    _raw_list = r2["file_plan"]
                     # Wave 1/TD2606-B1：清洗 file_plan——丢弃无有效 path 的 malformed 项（不让其流向 dispatch），
                     # 并按模块名补全缺失的 module 字段。
-                    fp = validate_file_plan(
-                        r2.get("file_plan", []) if isinstance(r2, dict) else [], module=mod_name)
-                    if not fp:
-                        raise ValueError("file_plan 为空或全为无效项（模块未产出有效文件）")  # 触发重试
-                    _n_calls = _attempt + _adm_retries + 1
+                    fp = validate_file_plan(_raw_list, module=mod_name)
+                    if _raw_list and not fp:
+                        raise ValueError("file_plan 全为无效项（模块未产出有效文件）")
+                    # 猎手 F1/F6：归一键去重；同路径冲突复读（字段不同）保首见但必须留痕
+                    _new: dict[str, dict] = {}
+                    _n_conflict = 0
+                    _conf_sample: list[str] = []
+                    for e in fp:
+                        k = _fileplan_path_key(e.get("path", ""))
+                        _kept = _acc.get(k) if k in _acc else _new.get(k)
+                        if _kept is None:
+                            _new[k] = e
+                        elif e != _kept:
+                            _n_conflict += 1
+                            if len(_conf_sample) < 3:
+                                _conf_sample.append(str(e.get("path")))
+                    if _n_conflict:
+                        logger.warning(
+                            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 同路径冲突复读 %d 处"
+                            "（保首见弃后见，样本 %s）——若为模型自我修正(如 create→modify)"
+                            "该修正已被丢弃，反复出现需核对 action 口径",
+                            mi, mod_total, mod_name, _n_conflict, _conf_sample)
+                    if not _new:
+                        # 空批 / 全复读 = 收敛信号（有累积）；首批就空 = 模块 0 产出，计失败重试
+                        if _acc:
+                            _converged = True
+                            break
+                        raise ValueError("file_plan 为空（模块未产出有效文件）")
+                    _acc.update(_new)
+                    _ok_batches += 1
+                    _consec_fail = 0  # 猎手 F3：成功批清零连续失败计数
                     logger.info(
-                        "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件，耗时 %.1fs%s",
-                        mi, mod_total, mod_name, len(fp), _time.monotonic() - _tm,
-                        f"（第 {_n_calls} 次调用成功）" if _n_calls > 1 else "",
+                        "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 批 %d → +%d 文件（累计 %d，耗时 %.1fs）",
+                        mi, mod_total, mod_name, _ok_batches, len(_new), len(_acc),
+                        _time.monotonic() - _tm,
                     )
-                    return {"idx": mi, "name": mod_name, "file_plan": fp, "error": None}
+                    continue  # 下一批（或空批确认收敛）
                 except _asyncio.TimeoutError:
                     _last_err = "timeout"
+                    # 超时 = 响应太大/太慢的结构信号，重试前缩批（同构重试必复现 round65 死法）
+                    _batch_cap = max(10, _batch_cap // 2)
                 except Exception as exc:  # noqa: BLE001
                     _last_err = str(exc)[:200]
                     if _is_token_limit_error(exc):
@@ -1344,17 +1450,52 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                     break
                 _adm_retries += 1
                 continue
-            _attempt += 1
-            if _attempt < _STAGE2_MAX_ATTEMPTS:
+            _consec_fail += 1
+            _total_fail += 1
+            if (_consec_fail < _STAGE2_MAX_ATTEMPTS
+                    and _total_fail < _STAGE2_MAX_TOTAL_FAILURES):
                 logger.warning(
-                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试",
-                    mi, mod_total, mod_name, _attempt, _last_err,
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 第 %d 次失败(%s)，重试"
+                    "（连续 %d/累计 %d；累积 %d 文件不丢，只重试当前批）",
+                    mi, mod_total, mod_name, _total_fail, _last_err,
+                    _consec_fail, _total_fail, len(_acc),
                 )
+        if _acc and (_converged or _topped_out):
+            # 猎手 F4：est_files 是 LLM 自报字段（"~15"/"10-20"/"?" 都出现过），
+            # int() 直转失败会静默废掉完备性观察面——宽松抽数字，抽不出也要留痕。
+            _est = 0
+            _est_raw = mod.get("est_files")
+            _m = _RE_EST_DIGITS.search(str(_est_raw or ""))
+            if _m:
+                _est = int(_m.group())
+            elif _est_raw not in (None, "", "?"):
+                logger.warning(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' est_files=%r 不可解析"
+                    "——无法校验收敛完备性，下游覆盖闸注意对账",
+                    mi, mod_total, mod_name, _est_raw)
+            if _est > 0 and len(_acc) * 2 < _est:
+                # 收敛判据依赖模型自报"已完整"——产出远低于其 stage1 自估时必须可观测
+                logger.warning(
+                    "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 产出 %d 文件 < 自估 est_files=%d 的一半"
+                    "——模型可能提前收敛，下游覆盖闸/事实核验注意对账",
+                    mi, mod_total, mod_name, len(_acc), _est)
+            _n_calls = _ok_batches + _total_fail + _adm_retries + (1 if _converged else 0)
+            logger.info(
+                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' → %d 文件（自估 %s），耗时 %.1fs"
+                "（%d 批/%d 次调用%s）",
+                mi, mod_total, mod_name, len(_acc), _est_raw if _est_raw is not None else "?",
+                _time.monotonic() - _t_mod, _ok_batches, _n_calls,
+                "，触顶 incomplete" if _topped_out else "",
+            )
+            return {"idx": mi, "name": mod_name, "file_plan": list(_acc.values()),
+                    "error": None, "incomplete": _topped_out}
         # R38 复核 F3：报真实次数与放弃原因（早退时旧日志谎报"重试 MAX 次"误导排障）
         logger.error(
-            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 失败放弃（能力重试 %d/%d，准入重试 %d，"
-            "硬告警，该模块文件丢失）: %s",
-            mi, mod_total, mod_name, _attempt, _STAGE2_MAX_ATTEMPTS, _adm_retries, _last_err,
+            "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 失败放弃（连续失败 %d/%d，累计 %d/%d，"
+            "准入重试 %d，已产出 %d 文件按 all-or-nothing 弃置走失败对账，硬告警，"
+            "该模块文件丢失）: %s",
+            mi, mod_total, mod_name, _consec_fail, _STAGE2_MAX_ATTEMPTS,
+            _total_fail, _STAGE2_MAX_TOTAL_FAILURES, _adm_retries, len(_acc), _last_err,
         )
         return {"idx": mi, "name": mod_name, "file_plan": [], "error": _last_err}
 
@@ -1365,11 +1506,15 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
 
     all_file_plan: list[dict] = []
     failed_modules: list[dict] = []
+    incomplete_modules: list[dict] = []  # 猎手 F2：触批次上限的模块必须机读可辨，不能只靠日志
     for r in _results:
         if r["error"]:
             failed_modules.append({"name": r["name"], "idx": r["idx"], "reason": r["error"]})
         else:
             all_file_plan.extend(r["file_plan"])
+            if r.get("incomplete"):
+                incomplete_modules.append(
+                    {"name": r["name"], "idx": r["idx"], "files": len(r["file_plan"])})
 
     if failed_modules:
         _failed_names = [m["name"] for m in failed_modules]
@@ -1384,6 +1529,7 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         "stack": stage1.get("stack", {}), "modules": modules,
         "file_plan": all_file_plan, "fact_issues": fact_issues,
         "stage2_failed_modules": failed_modules,
+        "stage2_incomplete_modules": incomplete_modules,
     }
     logger.info(
         "[TECH_DESIGN-STAGED] 两阶段完成：%d 模块（%d 失败，并发=%d）→ 合计 %d 文件",
@@ -1415,6 +1561,18 @@ def _package_tech_design_output(state: "BrainState", result, file_plan,
         )
         logger.error("[TECH_DESIGN] %s", _reason)
         _out["degraded_reasons"] = list(state.get("degraded_reasons") or []) + [_reason]
+    # R65-T1 猎手 F2：触批次上限的模块（file_plan 收下但可能未列全）同走 degraded 透传，
+    # 让覆盖闸/交付面机读可辨，而非只留 WARNING 日志。
+    _inc_mods = (result.get("stage2_incomplete_modules") or []) if isinstance(result, dict) else []
+    if _inc_mods:
+        _inc_names = [m.get("name", "?") for m in _inc_mods if isinstance(m, dict)]
+        _inc_reason = (
+            f"tech_design 阶段 {len(_inc_mods)} 个模块触产出批次上限 {_inc_names}"
+            "——file_plan 已收下但可能未列全，下游覆盖闸/事实核验须对账"
+        )
+        logger.warning("[TECH_DESIGN] %s", _inc_reason)
+        _out["degraded_reasons"] = list(
+            _out.get("degraded_reasons") or state.get("degraded_reasons") or []) + [_inc_reason]
     # ── C3 哨兵（round38c：设计了十几张 alarm_* 新表，全 diff 零 .sql，2FA 列无 DDL）──
     # data_model 设计了表 ∧ file_plan 无任何 schema-migration 形态文件 → warn+degraded
     # （栈无关模式集启发式，warn 级不阻断；prompt 侧已同批加 DDL 硬要求）。

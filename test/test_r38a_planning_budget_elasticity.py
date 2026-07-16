@@ -139,11 +139,15 @@ class _FakeResp:
 
 class _FakeLLM:
     """第 1 次 ainvoke 返回 STAGE1 顶层方案（9 模块）；后续返回各模块 file_plan。
-    STAGE2 调用发生时断言 widen 已被调用（时序：放宽必须先于 STAGE2 发起）。"""
+    STAGE2 调用发生时断言 widen 已被调用（时序：放宽必须先于 STAGE2 发起）。
+
+    R65-T1 起 stage2 为分批续写协议（续批带已产出排除清单）：mock 须像真模型一样
+    尊重排除清单——每模块首批出 1 文件，续批返回空批收敛，否则永不收敛直到触顶。"""
 
     def __init__(self, widen_calls: list):
         self._n = 0
         self._widen_calls = widen_calls
+        self._served: set[str] = set()  # 已出过首批的模块
 
     async def ainvoke(self, messages):
         self._n += 1
@@ -155,8 +159,13 @@ class _FakeLLM:
                 "fact_issues": [], "shared_contract": {},
             }))
         assert self._widen_calls, "STAGE2 已发起但预算尚未按模块数放宽（时序错误）"
+        user = messages[-1]["content"]
+        mod = next((f"mod-{i}" for i in range(9) if f"模块名：mod-{i}" in user), None)
+        if mod is None or mod in self._served:
+            return _FakeResp(json.dumps({"file_plan": []}))  # 空批确认收敛
+        self._served.add(mod)
         return _FakeResp(json.dumps({
-            "file_plan": [{"path": f"src/f{self._n}.x", "action": "create",
+            "file_plan": [{"path": f"src/{mod}.x", "action": "create",
                            "description": "d"}],
         }))
 
