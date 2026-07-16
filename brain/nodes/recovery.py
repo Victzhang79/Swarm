@@ -10,9 +10,13 @@ _det_of）走本模块 global，故测试要 patch 本模块（swarm.brain.nodes
 from __future__ import annotations
 
 import json
+import logging
 import os
+import subprocess
 
 from swarm.types import WorkerOutput
+
+logger = logging.getLogger(__name__)
 
 _MISSING_DEP_PATTERNS = (
     "cannot find symbol",      # javac (en)
@@ -190,6 +194,148 @@ def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
     except OSError:
         return True  # 扫描异常 → 保守当【存在】，避免误杀（不缓存，下次重试）
     return any(r.endswith(suffix) for r in roots)
+
+
+def _module_in_git_baseline(project_path: str | None, module: str) -> bool:
+    """模块目录是否存在于 git 基线(HEAD)树——判「基线模块」的结构性判据（T3/round63）。
+
+    基线模块=项目基线自带、非本计划任何子任务生产的模块。它的构建破坏没有 plan 内 owner，
+    transient 重试是无望等待（round63 实锤：LLM 自己诊断"预置模块、不在任何子任务范围内"
+    却仍 retry 三周期）。工作树存在性判不了这个——脚手架新建的模块也在工作树；HEAD 才是
+    "谁属于基线"的唯一权威。git 不可用/非仓库/异常 → False（fail-open：不触发 T3 拦截，
+    回落既有行为）。栈中立（纯目录存在性，不含任何清单格式假设）。
+    """
+    if not project_path or not module:
+        return False
+    rel = str(module).replace("\\", "/").strip().strip("/")
+    if not rel or rel in (".", "..") or rel.startswith("../"):
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(project_path), "cat-file", "-e", f"HEAD:{rel}"],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        # hunter#2：异常≠"非基线"。静默 False 会让 T3 臂对真基线破坏整体解除武装、无痕退回
+        # round63 无望 transient 循环。留 WARNING 痕（非仓库/模块真不在 HEAD 走 returncode≠0，
+        # 不进此支、不刷屏）；方向仍 fail-open False——绝不因 git 抖动误判死锁。
+        logger.warning(
+            "[T3] 基线模块判定 git 异常（%s: %s）→ fail-open 视为非基线模块"
+            "（本轮 T3 死锁臂对该模块失效，回落既有 transient 行为）", rel, e,
+        )
+        return False
+
+
+# T3 修复臂扫描的目录剪枝（与 _baseline_dir_roots 同口径：构建产物/VCS/依赖目录不进）。
+_SWEEP_PRUNE_DIRS = (".git", "target", "build", "dist", "out",
+                     "node_modules", ".gradle", ".idea")
+
+
+def sweep_baseline_anchor_poison(
+    project_path: str | None, plan_obj,
+) -> tuple[list[dict], int]:
+    """确定性基线锚修复扫描（T3 round63 死锁治本·brain 侧修复臂）。
+
+    对项目树内【git 基线(HEAD)已存在的共享清单】逐个对照基线，还原「既有版本锚篡改」——
+    复用 T2 纯函数 restore_baseline_version_anchors：只还原既有锚的突变，纯加法（新属性/
+    新依赖/新模块注册）一律放行，结构上绝不冲掉并行兄弟的合法注册。豁免任何 plan 子任务
+    writable/create_files 覆盖的清单（计划授权编辑面，T2 HIGH#1 同款豁免）。
+
+    与 T1/T2 的分工：T1 禁 repair 产毒（源头）、T2 禁毒经 pull-back 进共享树（通道）、
+    本函数治「毒已在共享树」（round63 遗留态/未覆盖通道）——三层防线的最后修复臂。
+
+    返回 (restored, scan_errors)：restored=修复登记 [{"file", "anchor", "from", "to"}]；
+    scan_errors=扫描期异常计数（git 失败/读盘失败/解码失败）。hunter#1：调用方必须区分
+    「扫净（restored=[] 且 scan_errors=0）」与「扫瞎（scan_errors>0）」——后者不得据以
+    判死锁放弃（scanner 坏 ≠ 树干净）。单文件异常跳过（fail-open），已还原项保留。
+    写盘经 per-project flock 串行化（与 worker pull-back 同一把锁，防并发互踩）。
+    """
+    if not project_path or plan_obj is None:
+        return [], 0
+    from swarm.worker.git_flock import _ProjectGitFlock
+    from swarm.worker.sandbox import _is_shared_manifest
+    from swarm.worker.workspace_manifest import restore_baseline_version_anchors
+
+    root = str(project_path)
+    scan_errors = 0
+
+    # plan 授权编辑面（writable ∪ create_files，归一化 posix 相对路径）。
+    # 复核 LOW#2：前缀剥离用显式判断，不用 lstrip("./") 字符集剥（会吃掉 .mvn 类段首点）。
+    owned: set[str] = set()
+    for s in getattr(plan_obj, "subtasks", []) or []:
+        sc = getattr(s, "scope", None)
+        if sc is None:
+            continue
+        for f in (list(getattr(sc, "writable", []) or [])
+                  + list(getattr(sc, "create_files", []) or [])):
+            p = str(f).replace("\\", "/")
+            p = p[2:] if p.startswith("./") else p
+            owned.add(p.strip("/"))
+
+    # 候选：工作树内共享清单（剪枝口径与 _baseline_dir_roots 一致）
+    candidates: list[str] = []
+    try:
+        for droot, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in _SWEEP_PRUNE_DIRS]
+            for fn in files:
+                rel = os.path.relpath(os.path.join(droot, fn), root).replace(os.sep, "/")
+                if _is_shared_manifest(rel):
+                    candidates.append(rel)
+    except OSError as e:
+        logger.warning("[T3] 基线锚修复扫描无法遍历项目树（%s）→ 本轮扫描盲", e)
+        return [], 1
+
+    # 基线读取（不可变已提交历史）在锁外批量完成，锁只护本地读-改-写
+    work: list[tuple[str, str]] = []
+    for rel in sorted(candidates):
+        if rel in owned:
+            continue  # 计划授权面：brain 无权对齐基线（可能是合法交付）
+        try:
+            r = subprocess.run(
+                ["git", "-C", root, "show", f"HEAD:{rel}"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            scan_errors += 1
+            logger.warning("[T3] 基线锚修复扫描读 %s 基线失败（%s）→ 该文件本轮盲", rel, e)
+            continue
+        if r.returncode != 0 or not r.stdout:
+            continue  # 不在基线（计划新建清单）→ 加法产物，放行
+        try:
+            baseline = r.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            scan_errors += 1
+            continue
+        work.append((rel, baseline))
+
+    restored: list[dict] = []
+    with _ProjectGitFlock(root):
+        for rel, baseline in work:
+            fp = os.path.join(root, rel)
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    cur = fh.read()
+            except (OSError, UnicodeDecodeError) as e:
+                scan_errors += 1
+                logger.warning("[T3] 基线锚修复扫描读工作树 %s 失败（%s）→ 该文件本轮盲", rel, e)
+                continue
+            new_text, items = restore_baseline_version_anchors(cur, baseline, rel)
+            if not items:
+                continue
+            try:
+                with open(fp, "w", encoding="utf-8") as fh:
+                    fh.write(new_text)
+            except OSError as e:
+                scan_errors += 1
+                logger.warning(
+                    "[T3] 基线锚修复扫描检出 %s 的锚篡改 %s 但【还原写盘失败·毒仍在树】: %s",
+                    rel, items, e,
+                )
+                continue
+            for it in items:
+                restored.append({"file": rel, **it})
+    return restored, scan_errors
 
 
 def _blocked_pkg_unrecoverable(

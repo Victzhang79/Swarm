@@ -34,10 +34,12 @@ from swarm.brain.nodes.recovery import (
     _blocked_pkg_unrecoverable,
     _det_of,
     _is_missing_dependency_failure,
+    _module_in_git_baseline,
     _module_order_violation_modules,
     _producers_of,
     _root_manifest_registrants,
     _scaffold_subtask_of_module,
+    sweep_baseline_anchor_poison,
 )
 from swarm.brain.nodes.planning_core import (
     _give_up_preserve_build,
@@ -724,6 +726,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # st-12-1 引用 TwoFactorSetupVO，全计划无 owner→连坐炸 62/64)。第(2)类不该直接连坐放弃——
         # 那类型本就该由消费者自己在本模块建出，先给一次 scope 自愈(allow_any)+提示重试机会。
         _selfheal: set[str] = set()
+        # T3（round63 死锁本体）：阻断在【基线模块】（git HEAD 自带、plan 无任何生产者）的失败集。
+        # 逐 fid 判定——绝不做批级判据（round63 缺口3：B2 的 _all_blocked 被混批搭车的超时受害者
+        # 永久拆台，三周期 16min×4 白跑至取消）。
+        _baseline_broken: dict[str, list[str]] = {}
         for fid in failed_ids:
             _det = _det_of(subtask_results.get(fid))
             if _det.get("pipeline_blocked") not in _INTERNAL_BLOCKED_KINDS:
@@ -769,6 +775,15 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     if _added:
                         _st.depends_on = _deps_now + _added
                         _c9_edges[fid] = _added
+            elif _bmods and not _prods:
+                # T3：无生产者的模块阻断——若模块存在于 git HEAD 基线 = 基线构建被破坏。
+                # 三既有臂全够不到它（dep_hit/prod_hit 要有已放弃上游；futile 要包不在树；
+                # C9 要有 active 生产者），恰落空洞 → 旧行为 transient 无望等待（round63:
+                # LLM 三轮自诊"预置模块、不在任何子任务范围内"却仍 retry）。此处结构性接住。
+                _bb_mods = [m for m in _bmods if _module_in_git_baseline(
+                    _proj_path, str(m))]
+                if _bb_mods:
+                    _baseline_broken[fid] = _bb_mods
         # round36 P0 自愈：无生产者内部包(worker 自造引用) → 授消费者 allow_any + 提示本模块补建被引
         # 类型 + 重派(按子任务 targeted_recovery_counts 熔断，与 A2 缺依赖恢复同预算)。耗尽预算才回落
         # 连坐放弃(原行为)。这把"一个自造引用炸 62 子任务"降为"消费者补建它自己引用的类型"。
@@ -776,6 +791,92 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             logger.info(
                 "[HANDLE_FAILURE] C9 合法跨模块等待 → 补动态依赖边（消费者扣在依赖闸，"
                 "生产者 L1 过再派，替代 transient 白跑）: %s", _c9_edges)
+        # ── T3（round63）：基线模块破坏 → 修复臂优先，修不动才 fail-loud，绝不 transient ──
+        if _baseline_broken:
+            _br_rounds = int(state.get("baseline_repair_rounds", 0) or 0)
+            _br_cap = get_config().model.max_retries  # 与各修复阶梯同上限（默认 2）
+            _br_restored: list[dict] = []
+            _br_scan_errors = 0
+            if _br_rounds < _br_cap:
+                _br_restored, _br_scan_errors = sweep_baseline_anchor_poison(
+                    _proj_path, plan_obj)
+            if _br_restored:
+                # 修复臂：基线锚已还原（毒真出树）→ 重派。重试此时有据：输入变了（与 B2
+                # "同输入必同结果"判据自洽）。baseline_repair_rounds 封顶防"修了又被投毒"
+                # 无界循环（T1 禁产毒 + T2 禁入树后，复发即结构异常，耗尽轮次落死锁终局）。
+                # 复核 HIGH#1（混批裁决保全）：同批已判 _unrecoverable（真死上游）者照常
+                # 连坐放弃、绝不搭修复臂便车白跑整周期；_selfheal 者随批重派（其 scope 自愈
+                # 推迟到下轮该臂处理，受本臂轮次上限约束——此处不复制整套自愈机制）。
+                _br_ab = _transitive_abandon(
+                    plan_obj.subtasks,
+                    set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
+                    completed_ids=_completed_ok,
+                ) if _unrecoverable else set()
+                for _a in _br_ab:
+                    subtask_results.pop(_a, None)
+                _br_remaining = [t for t in (state.get("dispatch_remaining") or [])
+                                 if t not in _br_ab]
+                _br_rc = dict(state.get("subtask_retry_counts", {}))
+                for fid in failed_ids:
+                    if fid in _br_ab:
+                        continue
+                    subtask_results.pop(fid, None)
+                    if fid not in _br_remaining:
+                        _br_remaining.append(fid)
+                    # hunter#5：对着毒树的重试徒劳=只豁免【已证归因毒树】的基线阻断者；
+                    # 搭车者（超时/其它失败）按全文件统一惯例 +1 记账，绝不白拿免费重试。
+                    _br_rc[fid] = 0 if fid in _baseline_broken \
+                        else _br_rc.get(fid, 0) + 1
+                logger.warning(
+                    "[HANDLE_FAILURE] T3 基线模块破坏死锁（%s 阻断在基线模块 %s，plan 无生产者"
+                    "=无人会修）→ 修复臂已按 git 基线还原共享清单版本锚 %s（第 %d/%d 轮%s），"
+                    "毒已出树，重派 %s（基线阻断者不计配额；同批真死上游连坐放弃 %d）",
+                    sorted(_baseline_broken),
+                    sorted({m for ms in _baseline_broken.values() for m in ms}),
+                    _br_restored, _br_rounds + 1, _br_cap,
+                    f"，扫描另有 {_br_scan_errors} 处盲区" if _br_scan_errors else "",
+                    [f for f in failed_ids if f not in _br_ab], len(_br_ab),
+                )
+                _br_ret = {
+                    # C9 补边/重派路径统一回写 plan（外层 handle_failure 兜底，此处显式）
+                    "plan": plan_obj,
+                    "subtask_results": subtask_results,
+                    "dispatch_remaining": _br_remaining,
+                    "failed_subtask_ids": [],
+                    "failure_strategy": "retry",
+                    "failure_escalated": False,
+                    "subtask_retry_counts": _br_rc,
+                    "baseline_repair_rounds": _br_rounds + 1,
+                }
+                if _br_ab:
+                    _br_ret["abandoned_subtask_ids"] = sorted(_br_ab)
+                return _br_ret
+            if _br_rounds < _br_cap and _br_scan_errors:
+                # hunter#1：扫瞎（scanner 坏）≠ 扫净（树真干净）。据盲扫判死锁放弃是方向性
+                # 错误——回落既有行为（transient 阶梯自有 B2/A2 封顶），不消耗修复轮次，
+                # WARNING 留痕供运维定位 scanner 故障。
+                logger.warning(
+                    "[HANDLE_FAILURE] T3 基线模块破坏疑似死锁（%s 阻断在基线模块 %s）但修复臂"
+                    "扫描盲（%d 处扫描失败、0 还原）→ 不判死锁不放弃，回落既有阶梯；"
+                    "请排查 git/文件系统故障",
+                    sorted(_baseline_broken),
+                    sorted({m for ms in _baseline_broken.values() for m in ms}),
+                    _br_scan_errors,
+                )
+            else:
+                # 扫净无可还原（破坏非锚投毒/HEAD 本身坏）或修复轮次耗尽 → 判死锁：并入
+                # _unrecoverable 连坐放弃通道（诚实 PARTIAL），fail-loud，绝不 transient
+                # 无望等待（register T3 处方：upstream_module_broken on 基线模块 ≠ transient）。
+                logger.warning(
+                    "[HANDLE_FAILURE] T3 基线模块破坏死锁（%s 阻断在基线模块 %s，plan 无生产者）"
+                    "且修复臂%s → 判死锁，连坐放弃（诚实 PARTIAL），不再 transient 重试"
+                    "（round63：三周期无望等待 16min×4/轮的治本）",
+                    sorted(_baseline_broken),
+                    sorted({m for ms in _baseline_broken.values() for m in ms}),
+                    f"已达轮次上限({_br_cap})" if _br_rounds >= _br_cap
+                    else "无可还原差异（破坏非版本锚投毒，需人工介入）",
+                )
+                _unrecoverable |= set(_baseline_broken)
         if _selfheal:
             _sh_max = get_config().model.max_retries
             _sh_trc = dict(state.get("targeted_recovery_counts") or {})

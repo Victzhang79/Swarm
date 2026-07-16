@@ -122,6 +122,7 @@ class BrainState(TypedDict, total=False):
     subtask_scope_amend_counts: dict[str, int]  # B3-2/B4-2（round38c）：外科 scope 修正次数（补 create_files/异议改名，每子任务≤1，防修正震荡）
     contract_failed_modules: list[str]  # C4-8（round38c）：共享契约缺片模块名（CONTRACT_MODULE 放弃后机读可见；成功路径清空）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
+    baseline_repair_rounds: int         # T3（round63）：基线锚修复扫描累计轮次——阻断在基线模块（HEAD 自带、plan 无生产者）时的修复臂计数，封顶 max_retries 防"修了又被投毒"无界循环；耗尽即判死锁连坐放弃（PARTIAL）
     replan_feedback: str                # P0-2：上轮失败根因，replan 重入时注入 PLAN 供 LLM 规避
     targeted_recovery_count: int        # P0-B(f9e38dae)：定向恢复累计次数——round29 遗漏项#2 起仅作遥测，熔断改用 targeted_recovery_counts（按子任务）
     targeted_recovery_counts: dict[str, int]  # round29 遗漏项#2：定向恢复次数【按子任务】熔断 {sid: n}——旧任务级全局计数会被先失败者用光、饿死后续同类受害者（d37a52a3 st-25 从未拿到 pom 写权即"已达上限"空烧）。A2 缺依赖 + 序修复阶梯共用此表，同子任务环安全语义不变
@@ -294,6 +295,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "invest_fail_count": "round",
     # 失败/重试
     "replan_count": "monotonic",
+    "baseline_repair_rounds": "monotonic",  # T3：修复臂轮次熔断账本——剪了=封顶被绕（同 subtask_dispatch_totals 理由）
     "replan_feedback": "oneshot",
     "failed_subtask_ids": "round",
     "failure_strategy": "round",

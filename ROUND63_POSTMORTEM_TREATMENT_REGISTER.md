@@ -161,3 +161,87 @@ incoming 毒值原样穿过 merge 进共享树→整 reactor 降代死锁。H2 `
 改值不是删）。二者留待需要时再治。
 **栈中立**：判据=版本锚差异（任何清单都有的概念）；实现按 pom 精确解析，非 pom 清单原样放行（未实证篡改
 面，保守），符合"通用多栈绝不写死语言"铁律。
+
+---
+## T3 调查结论（2026-07-16，死锁通道逐层实锤）
+
+**死锁实况（postmortem 主日志）**：MONITOR 完成数 13 冻结跨 3 个 handle 周期（10:30/10:47/11:03 均
+`剩余=67, 已完成=13, 失败=4`），同一批 `['st-11-4','st-7-1','st-8','st-2-1-1-2']`。其中 3 个
+`pipeline_blocked=upstream_module_broken, blocked_on_modules=['ruoyi-common']`（12 次上报全同签名），
+第 4 个（st-2-1-1-2）前两轮是 coding 超时（非 blocked）。HANDLE_FAILURE 走 transient 退避 1/3→2/3→3/3
+（10:32/10:48/11:05），每周期 4 worker 全管线白跑 ~16min，直至 run 终止。
+
+**自相矛盾原文实锤**：LLM 三轮诊断全对——"构建系统自动导入修复机制修改了根 pom.xml 和
+ruoyi-framework/pom.xml → ruoyi-common 编译崩 → 阻塞所有依赖者"，且明写"**ruoyi-common 是预置模块，
+其依赖声明不在任何子任务范围内**"（=无人能修），却给 strategy=retry，理由是"重试时**若**环境 POM
+已恢复正确状态，编译应能通过"——寄望环境自愈的无据重试。
+
+**为什么现有闸全没接住（逐层）**：
+1. `worker/l1_verdict.py:305`：一切 BLOCKED 统一 `failure_class="transient"`（fail-closed 设计本意
+   是交 brain 退避），worker 无 git/plan 视野，无法分辨"上游产物未就绪（真 transient）"vs"基线模块
+   被永久破坏（无人会修）"。
+2. `failure.py` 早段 `_INTERNAL_BLOCKED_KINDS` 拦截（702-879）三臂全空过：`_producers_of` 对基线模块
+   （无子任务 scope 落在 ruoyi-common）返回空 → 非 dep_hit/prod_hit；`_blocked_pkg_unrecoverable`
+   要求 blocked_pkgs 非空且**不在**工作树（ruoyi-common 包在树里、只是编译崩）→ 非 futile；
+   C9 补边要求有 active 生产者 → 跳过。基线模块破坏=结构性无 owner，恰好落在三臂之间的空洞。
+3. B2 失败指纹短路被混批拆台：`_all_blocked` 要求批内**全部** transient 都带 pipeline_blocked，
+   `_sig_skip/_sig_exhausted` 用 `min(_blk_counts)`——st-2-1-1-2（同一死锁的**受害者**，超时非 blocked）
+   把整批判据永久解除武装。批级判据被单个搭车者拆台=结构性缺口。
+4. A2 终身派发熔断（6 次）最终会停，但每周期 ~16min×4 worker，代价 2h+ 才到底，且终局=abandon，
+   不含修复臂。
+
+**治本设计（与 T1/T2 构成三层防线，本条为"毒已在共享树"时的 brain 侧修复臂+死锁判决）**：
+- 判据用结构不用状态（round59 铁律）：`blocked_on_modules` 含【git HEAD 基线已存在的模块】
+  （`git cat-file -e HEAD:<module>`，栈中立）且 plan 无任何生产者 → 基线破坏，非 transient——
+  **逐 fid 判定**，天然免疫混批拆台（缺口 3）。
+- 修复臂（先于放弃）：确定性基线锚修复扫描 `sweep_baseline_anchor_poison`——对项目树内 git 基线
+  已存在的共享清单逐个对照 HEAD 还原既有版本锚篡改（复用 T2 纯函数，加法放行、突变还原），
+  豁免 plan 子任务 writable/create 覆盖的清单（计划授权面）。还原>0 → 毒已出树，重派失败子任务
+  （输入真变了，重试有据；徒劳重试不计 capability 配额），`baseline_repair_rounds` 计数封顶
+  （max_retries，防修了又被投毒的无界循环）。
+- fail-loud 终局：扫描无可还原（破坏非锚投毒/HEAD 本身坏）或轮次耗尽 → 判死锁，并入既有
+  `_unrecoverable` 连坐放弃通道（诚实 PARTIAL），绝不 transient 无望等待。
+- worker 侧 fc=transient 保持不变（worker 无判定视野），brain 侧结构性再分类=register 处方
+  "`upstream_module_broken` on 基线模块应归 plan/environment"的落地形态。
+
+### T3 完成（2026-07-16）
+
+**改动**：
+- `brain/nodes/recovery.py`：`_module_in_git_baseline`（`git cat-file -e HEAD:<module>`，栈中立，
+  异常 fail-open False + WARNING 留痕）+ `sweep_baseline_anchor_poison`（对照 HEAD 还原共享清单
+  既有版本锚篡改，复用 T2 纯函数；豁免 plan 授权面；返回 `(restored, scan_errors)` 区分扫净/扫瞎；
+  基线读取锁外、读-改-写在 `_ProjectGitFlock` 内与 worker pull-back 同锁）。
+- `brain/nodes/failure.py`：早段 `_INTERNAL_BLOCKED_KINDS` 拦截链新增第四臂（`elif _bmods and
+  not _prods` 且模块在 git 基线）——**逐 fid 判定**（免疫混批拆台）；命中后修复臂优先：还原>0 →
+  重派（基线阻断者不计配额、搭车者按惯例 +1）+ `baseline_repair_rounds` 封顶 max_retries；
+  扫净无可还原/轮次耗尽 → 并入 `_unrecoverable` 连坐放弃（诚实 PARTIAL）；扫瞎（scan_errors>0
+  且 0 还原）→ 不判死锁不耗轮次，WARNING 回落既有阶梯。
+- `brain/state.py`：`baseline_repair_rounds: int` 声明 + "monotonic" 生命周期（任务级标量，同
+  `replan_count` 不受 D08 按子任务剪枝；跨 replan 保留是刻意——毒是树属性非 plan 属性）。
+
+**对抗双复核（reviewer + silent-hunter）全治**：
+- reviewer HIGH#1：修复臂 early-return 吞同批已判 `_unrecoverable`（真死上游）裁决=白跑整周期 →
+  同一 return 里照常 `_transitive_abandon` 连坐放弃（镜像 _selfheal 块先例）；_selfheal 者随批
+  重派（自愈推迟一轮，受修复臂轮次上限约束，注释明示权衡）。锁 `test_mixed_unrecoverable_verdict_preserved`。
+- hunter#1 HIGH：扫瞎与扫净不可区分 → 误把"scanner 坏"判成"树干净"而放弃（方向性错误）→
+  sweep 返回 scan_errors + 盲扫回落既有阶梯不判死锁。锁 `test_scan_blind_not_misjudged_as_deadlock`。
+- hunter#2 HIGH：`_module_in_git_baseline` git 异常静默 False=T3 臂无痕解除武装 → WARNING 留痕
+  （非仓库/不在 HEAD 走 returncode≠0 不刷屏）。锁 `test_module_in_git_baseline_git_error_failopen`。
+- hunter#5 MEDIUM-HIGH：混批搭车者重试计数既不加也不清=无限白拿免费重试绕阶梯 → 搭车者 +1、
+  仅基线阻断者豁免归零。锁 `test_straggler_retry_counter_increments`。
+- reviewer LOW#2：owned 归一化 `lstrip("./")` 字符集过剥（吃 .mvn 段首点）→ 显式前缀剥离。
+- 双方 cleared：拦截链 elif 序无互踩/plan 回写全路径/轮次账本免疫 D08 剪枝/并发窗口（dispatch
+  gather 全收后才进 HANDLE_FAILURE + 同 flock）/worker.sandbox import 无副作用风险。
+
+**register 三判据落地对照**：①"≥K 共享同一 blocked_on_modules + 完成数冻结"→ 用更强的结构判据
+（基线模块+无生产者）在**首个周期**即拦截，不必等 2 周期冻结（round63 每周期 16min×4）；②"自诊
+不在任何子任务 scope 却 retry"→ 确定性拦截先于 LLM 策略，自相矛盾通道整体旁路；③"upstream_module_broken
+on 基线模块 ≠ transient"→ brain 侧结构性再分类（worker 侧 fc 保持——worker 无 git/plan 视野）。
+
+**测试**：test_r63_deadlock_baseline_repair.py 19/19（结构判据 3 + 修复臂 6 + handle_failure 集成
+5 + 复核回归锁 5）；revert-check 两层（撤 failure 接线=6 集成红；撤 recovery=ImportError）；
+定向回归 12 文件 PYTEST_EXIT=0；全量套件 PYTEST_EXIT=0。
+
+**已知边界（登记债）**：①修复臂只还原版本锚（pom 精确解析，非 pom 清单放行）——非锚形态的基线
+破坏走 fail-loud 放弃而非修复，方向保守正确；②`_ProjectGitFlock` 无超时为既有行为（hunter bonus，
+T3 只是新增调用方，不在本条治）；③_selfheal 与基线破坏同批时自愈推迟一轮（有界：修复臂轮次上限）。
