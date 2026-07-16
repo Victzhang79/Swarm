@@ -342,6 +342,53 @@ def _group_family_version(project_path: str, group: str, artifact: str = "") -> 
     return None
 
 
+# R63：version-repair 两分支共用的【代际对齐/剪除】纯判据（单一权威）。
+# round63 死因是"一个不变量两处实现，只有一处对"（round57-3 教训重演）：分支②「缺 version→注入」
+# 早有 _group_family_version 代际守卫（R54-5），分支①「版本不存在→校正」没有 → 为满足跨代的
+# spring-boot-starter-aop 把**共享** ${spring-boot.version} 4.0.6→3.5.16、整 reactor 降代。
+# 抽成此纯函数后两分支共用，杜绝再次漂移。栈中立：只谈"工程为某家族钉的版本 vs 仓库可用版本"。
+_PRUNE_DEP = object()   # 哨兵：该依赖属跨代混用，应剪除而非降级（绝不改写共享锚属性）
+
+
+def _family_generation_choice(fam: str | None, available: list[str]):
+    """依赖版本应对齐到工程家族代际，还是因跨代而剪除，还是交调用方按默认处理。
+
+    返回：
+      · 版本字符串 —— 工程家族钉在 fam 且 fam 在仓库可用 → 对齐到 fam（唯一正确目标）。
+      · _PRUNE_DEP —— 工程家族钉在 fam，但该 artifact 在该代不存在（仓库最高属另一代）→
+        跨代混用是集成期才炸的暗雷；如实剪除依赖（缺依赖=可归因的编译错），**绝不降级共享锚属性**。
+      · None       —— 工程无该家族先例 → 交调用方走各自默认（分支①最近有效版 / 分支②最新稳定版）。
+    """
+    if not fam:
+        return None
+    return fam if fam in available else _PRUNE_DEP
+
+
+_DEP_BLOCK_SCAN_RE = re.compile(r"<dependency>(.*?)</dependency>", re.S)
+
+
+def _dep_consumers_of_property(pom_texts: list[str], prop: str) -> set[str]:
+    """扫描 pom 文本集，收集【版本写作 ${prop} 的 <dependency> 块】的 artifactId 集合（纯函数）。
+
+    R63：判定某 <properties> 版本条目是否被【多个依赖】共享。被 ≥2 个依赖共享 = 平台/BOM 版本
+    锚（如 ${spring-boot.version}），version-repair 绝不能为满足单个依赖的版本诉求去降级它——
+    那会连坐整棵 reactor 的代际（round63 死因）。只专属于单个依赖的私有属性才允许校正。
+    栈中立：npm/Gradle/Cargo 的共享版本变量同理，判据都是"是否被多方引用"。
+    """
+    ref = "${" + prop + "}"
+    arts: set[str] = set()
+    for txt in pom_texts:
+        for blk in _DEP_BLOCK_SCAN_RE.finditer(txt or ""):
+            inner = re.sub(r"<exclusions>.*?</exclusions>", "", blk.group(1), flags=re.S)
+            vm = re.search(r"<version>\s*([^<]+?)\s*</version>", inner)
+            if not vm or vm.group(1).strip() != ref:
+                continue
+            am = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", inner)
+            if am:
+                arts.add(am.group(1))
+    return arts
+
+
 def _project_group(project_path: str) -> str | None:
     """工程自身 groupId（根 pom 坐标区，剥 parent/依赖/构建块后的首个 groupId）。"""
     txt = _read_project_file(project_path, "pom.xml", timeout=20) or ""
@@ -655,7 +702,38 @@ def _attempt_maven_version_repair(
                 "留着它整个模块都解析不了（Could not resolve → 连坐下游）",
                 group, artifact, _why, len(_cut2))
             continue
-        good_ver = _choose_valid_version(bad_ver, available)
+        # ★R63 治本★ 与分支②「缺 version→注入」对称：先据工程家族代际判对齐/剪除。
+        # round63 死因：aop@4.0.6 在 Boot 4 不存在（仓库最高属 Boot 3 系 3.5.16），旧逻辑
+        # _choose_valid_version 选 3.5.16 → 把**共享** ${spring-boot.version} 降到 3.5.16 →
+        # 整 reactor 降代、基座编译崩、-am 全线连坐。共享/平台锚属性绝不因单依赖被降级：
+        # 要么对齐工程家族版，要么剪除该依赖（跨代混用是集成期才炸的暗雷）。
+        # ★fail-open 铁律（R56-6）★ 只有【仓库确证可达】才敢据代际差剪除依赖；仓库没连上时
+        # available=[] 是"证据缺失"而非"确证查无"，据此剪除=断网即误剪合法依赖（本系统最不能犯
+        # 的错）。不可达 → _gc 置 None，落回 _choose_valid_version（对空表返回 None）→ 本轮不动。
+        # 与分支②的 `if not available and not _reach ... continue` 守卫对称。
+        _fam = _group_family_version(project_path, group, artifact)
+        _gc = _family_generation_choice(_fam, available) if _reachable else None
+        if _gc is _PRUNE_DEP:
+            art_esc = artifact.replace(".", r"\.")
+            _pc, _pout, _pe = _run_check_split(
+                f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _cut: list[str] = []
+            for _pom in sorted({ln.strip() for ln in (_pout or "").splitlines() if ln.strip()}):
+                _text = _read_project_file(project_path, _pom, timeout=20)
+                if _text is None:
+                    continue
+                _new = _prune_dep_blocks(_text, group, artifact, even_with_version=True)
+                if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                    changed.add(_pom)
+                    _cut.append(_pom)
+            logger.warning(
+                "[L1.2.1·generation-mismatch] R63 工程的 %s 家族钉在 %s，但 %s 版本 %s 在该代不存在"
+                "（仓库可用最高稳定版=%s，属另一代）→ 剪除该依赖，绝不降级共享锚属性 ${...}"
+                "（降级会连坐整 reactor 代际，正是 round63 死因）（%d pom）",
+                group, _fam, artifact, bad_ver, pick_latest_stable(available) or "?", len(_cut))
+            continue
+        good_ver = _gc if _gc is not None else _choose_valid_version(bad_ver, available)
         if not good_ver:
             continue  # 版本其实存在（别的网络问题）或查不到可用版本 → 不动，绝不误修
         # D32 治本：候选只取【声明该 artifactId】的 pom；替换只发生在该 <dependency> 块内。
@@ -684,6 +762,26 @@ def _attempt_maven_version_repair(
             if not re.fullmatch(r"[A-Za-z0-9_.\-]+", prop):
                 logger.warning(
                     "[L1.2.1·version-repair] 属性名 %r 含意外字符 → fail-closed 跳过", prop)
+                continue
+            # ★R63 治本·共享锚保护（不依赖家族探测的兜底不变量）★ version-repair 只许校正
+            # 【专属于本依赖】的私有版本属性；被 ≥2 个依赖共享的平台/BOM 版本锚（如
+            # ${spring-boot.version}）绝不因单个依赖的版本诉求被降级——那会连坐整棵 reactor 的
+            # 代际（round63 死因）。代际守卫在家族可探测时已剪除跨代依赖；此处再兜住"家族属性钉在
+            # 中间层父 pom、_group_family_version 探测不到"的拓扑：只要该属性被别的依赖引用即拒改。
+            _rc, _rout, _re2 = _run_check_split(
+                f"grep -rlF '${{{prop}}}' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _ctexts = []
+            for _cpom in sorted({ln.strip() for ln in (_rout or "").splitlines() if ln.strip()}):
+                _ct = _read_project_file(project_path, _cpom, timeout=20)
+                if _ct is not None:
+                    _ctexts.append(_ct)
+            _consumers = _dep_consumers_of_property(_ctexts, prop)
+            if _consumers - {artifact}:
+                logger.warning(
+                    "[L1.2.1·version-repair] 属性 ${%s} 被多个依赖共享（%s）→ 拒绝为 %s 单独降级"
+                    "（共享/平台版本锚降级会连坐整 reactor 代际，正是 round63 死因）；"
+                    "该依赖交代际守卫/更上层防线处理", prop, sorted(_consumers), artifact)
                 continue
             pcmd = f"grep -rl '<{prop}>' --include=pom.xml . 2>/dev/null"
             _pc, pout, _pe = _run_check_split(pcmd, project_path, timeout=30)
@@ -758,37 +856,36 @@ def _attempt_maven_version_repair(
                     "报可归因的 cannot-find-symbol",
                     group, artifact, len(_touched))
             continue
-        # R54-5：先与【工程同 groupId 家族已钉的版本】对齐——"稳定版"只挡预发布，挡不住
-        # "版本对、代际错"（round54：Boot 4.0.6 工程被注进 Boot 3 系的 spring-boot-starter-aop:3.5.16）。
+        # R54-5 / R63：与分支①共用同一代际判据（_family_generation_choice，单一权威）——
+        # "稳定版"只挡预发布，挡不住"版本对、代际错"（round54：Boot 4.0.6 工程被注进 Boot 3 系的
+        # spring-boot-starter-aop:3.5.16）。判据抽成纯函数后两分支不再各写一份（治 round57-3 漂移）。
         _fam = _group_family_version(project_path, group, artifact)
-        if _fam:
-            if _fam in available:
-                good_ver = _fam                      # 与工程同代 → 唯一正确的对齐目标
-            else:
-                # 工程用的是该 group 的 X 代，而这个 artifact 在 X 代**不存在**（典型：Boot 4 删掉
-                # 了 starter-aop）→ 注入任何"可用版本"都是跨代混用（更隐蔽的毒）。如实剪除：
-                # 缺依赖 = 可归因的编译错，跨代依赖 = 运行期/集成期才炸的暗雷。
-                art_esc = artifact.replace(".", r"\.")
-                _gc, _gout, _ge = _run_check_split(
-                    f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
-                    project_path, timeout=30)
-                _cut: list[str] = []
-                for _pom in sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()}):
-                    _text = _read_project_file(project_path, _pom, timeout=20)
-                    if _text is None:
-                        continue
-                    _new = _prune_dep_blocks(_text, group, artifact)
-                    if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
-                        changed.add(_pom)
-                        _cut.append(_pom)
-                logger.warning(
-                    "[L1.2.1·generation-mismatch] R54-5 工程的 %s 家族钉在 %s，但 %s 在该代不存在"
-                    "（仓库可用最高稳定版=%s，属另一代）→ 剪除该依赖（跨代混用是集成期才炸的暗雷；"
-                    "缺依赖是可归因的编译错）（%d pom）",
-                    group, _fam, artifact, pick_latest_stable(available) or "?", len(_cut))
-                continue
-        else:
-            good_ver = pick_latest_stable(available)   # R53-3：稳定版优先（禁 M#/RC/alpha 毒树）
+        _choice = _family_generation_choice(_fam, available)
+        if _choice is _PRUNE_DEP:
+            # 工程用的是该 group 的 X 代，而这个 artifact 在 X 代**不存在**（典型：Boot 4 删掉
+            # 了 starter-aop）→ 注入任何"可用版本"都是跨代混用（更隐蔽的毒）。如实剪除：
+            # 缺依赖 = 可归因的编译错，跨代依赖 = 运行期/集成期才炸的暗雷。
+            art_esc = artifact.replace(".", r"\.")
+            _gc, _gout, _ge = _run_check_split(
+                f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
+                project_path, timeout=30)
+            _cut: list[str] = []
+            for _pom in sorted({ln.strip() for ln in (_gout or "").splitlines() if ln.strip()}):
+                _text = _read_project_file(project_path, _pom, timeout=20)
+                if _text is None:
+                    continue
+                _new = _prune_dep_blocks(_text, group, artifact)
+                if _new is not None and _write_project_file(project_path, _pom, _new, timeout=20):
+                    changed.add(_pom)
+                    _cut.append(_pom)
+            logger.warning(
+                "[L1.2.1·generation-mismatch] R54-5 工程的 %s 家族钉在 %s，但 %s 在该代不存在"
+                "（仓库可用最高稳定版=%s，属另一代）→ 剪除该依赖（跨代混用是集成期才炸的暗雷；"
+                "缺依赖是可归因的编译错）（%d pom）",
+                group, _fam, artifact, pick_latest_stable(available) or "?", len(_cut))
+            continue
+        # 与工程同代 → 对齐家族版（唯一正确目标）；无家族先例 → 稳定版优先（R53-3，禁 M#/RC/alpha）
+        good_ver = _choice if _choice is not None else pick_latest_stable(available)
         if not good_ver:
             continue
         art_esc = artifact.replace(".", r"\.")
