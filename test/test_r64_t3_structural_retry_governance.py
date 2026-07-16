@@ -226,6 +226,9 @@ def test_confirm_revise_resets_retry_and_signature(monkeypatch):
     confirm，人工反馈得不到任何自动重试（软锁死）。"""
     import swarm.brain.nodes as _n
 
+    # 自我隔离：confirm_plan 读 SWARM_AUTO_ACCEPT env——全量套件里其它测试的残留值会让
+    # 本测试走 auto_accept 分支根本到不了 interrupt（全量实测被污染挂过一次）。
+    monkeypatch.delenv("SWARM_AUTO_ACCEPT", raising=False)
     monkeypatch.setattr(_n, "interrupt",
                         lambda payload: {"decision": "revise", "feedback": "改一下模块拆分"})
     out = _n.confirm_plan({
