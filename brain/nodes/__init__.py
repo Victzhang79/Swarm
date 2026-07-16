@@ -1811,10 +1811,35 @@ async def _maybe_surgical_coverage_topup(state):
         return None
     from swarm.brain.plan_validator import (
         build_coverage_matrix,
+        validate_module_coherence,
         validate_plan_structure,
     )
     if not validate_plan_structure(prior_plan).valid:
         return None
+    # ★R64-T3①★ 结构性模块 coherence 违例 → 让路全量重拆（带 issues 反馈）。外科补齐只补
+    # covers/baseline 申报，动不了 module/file_plan——round64 pass1/pass3 对 G1 违例走外科
+    # =注定空转白耗 2 次重试额度。判据与 G1 闸同一权威函数（绝不 fork 口径），且尊重同一
+    # 泄压阀（复核 LOW：SWARM_MODULE_COHERENCE_GATE=0 时 G1 已不打回，这里再强制全量重拆
+    # =杀开关名存实亡）。
+    if os.environ.get("SWARM_MODULE_COHERENCE_GATE", "1").strip().lower() not in (
+            "0", "false", "no", "off"):
+        # 猎手 F3：本函数契约=任一前置不满足→None（外科是优化捷径，全量重拆恒安全），
+        # 调用方无 try 包裹——这里异常裸抛会经 plan() 冒泡把整任务打成 FAILED。异常时
+        # 保守让路全量重拆并留痕，绝不炸主链。
+        try:
+            _mc_valid = validate_module_coherence(
+                prior_plan,
+                project_path=_get_project_path(state.get("project_id") or ""),
+                file_plan=state.get("tech_design_file_plan") or []).valid
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[PLAN] R64-T3 外科前置 coherence 核异常（保守让路全量重拆，不炸主链）: %s", exc)
+            _mc_valid = False
+        if not _mc_valid:
+            logger.info(
+                "[PLAN] R64-T3 P1 外科补齐让路：上一版 plan 存在结构性模块 coherence 违例"
+                "（外科只补覆盖救不了结构）→ 走全量重拆带反馈")
+            return None
     _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"))
     if not _matrix["uncovered"] and not _matrix["dangling_covers"]:
         return None  # 覆盖已满足——失败来自别处，回退常规路径
@@ -2652,10 +2677,31 @@ async def validate_plan(state: BrainState) -> dict:
             logger.warning(
                 "[VALIDATE_PLAN] G1 模块 coherence 未通过 → 打回 PLAN（模块≠单一物理构建单元）: %s",
                 _mc_result.issues[:3])
+            # ★R64-T3 同签名收敛熔断★ round64：G1 反馈注入 plan_batch，但其输出 schema 无
+            # module/file_plan 字段 + P4 禁改前缀 → 反馈结构性无法执行，全量重产 33min 输出
+            # 逐字节相同。连续两轮（retry 严格连续，防跨 replan 周期陈旧签名误熔断）违例签名
+            # 一致 → 顶格 retry_count 复用 after_validate 既有 CONFIRM 路由 fail-fast，
+            # 绝不再烧一轮注定同结果的全量重产。
+            _t3_sig = sorted(str(i) for i in _mc_result.issues)
+            _t3_prev = state.get("plan_validation_prev_structural") or {}
+            _t3_retry_out = retry_count
+            # 猎手 F4：熔断泄压阀（对照 SWARM_MODULE_COHERENCE_GATE 先例）——"同签名=重试
+            # 必然无效"是 round64 单轮经验推广，若某任务/模型存在部分确定性反例，运维可
+            # 不改代码关掉熔断恢复满额重试。默认开。
+            _t3_fuse_on = os.environ.get(
+                "SWARM_G1_RETRY_FUSE", "1").strip().lower() not in ("0", "false", "no", "off")
+            if (_t3_fuse_on and _t3_prev.get("sig") == _t3_sig
+                    and _t3_prev.get("retry") == retry_count - 1):
+                from swarm.brain.graph import MAX_PLAN_RETRY as _t3_max
+                _t3_retry_out = max(retry_count, _t3_max)
+                logger.warning(
+                    "[VALIDATE_PLAN] R64-T3 结构违例签名连续两轮未变（带反馈全量重产未收敛）"
+                    "→ 熔断：retry 顶格 %d，直接进 CONFIRM fail-fast（不再烧重产轮）", _t3_retry_out)
             return {
                 "plan_valid": False,
-                "plan_retry_count": retry_count,
+                "plan_retry_count": _t3_retry_out,
                 "plan_validation_issues": _mc_result.issues,
+                "plan_validation_prev_structural": {"sig": _t3_sig, "retry": retry_count},
                 "plan_validation_feedback": _format_validation_feedback(
                     _mc_result.issues, rotate=retry_count),
                 # silent-hunter #4：早退分支也必须 always-emit 本轮软警告（含 G1 自己的 zero-dir
@@ -2950,6 +2996,9 @@ async def validate_plan(state: BrainState) -> dict:
         # 下一轮结构相同的计划命中 _soft_skip 直接 valid（硬 LLM 门被静默转放行；
         # 完整性预算>1 时 P6b 重查被跳过）。否决轮发空串=下一轮必重跑软校验。
         "plan_soft_review_sig": _soft_sig if plan_valid else "",
+        # R64-T3 猎手 F1：校验【通过】即清 G1 结构签名——G1 早已过闸，残留签名会在
+        # 下一个 replan 周期与新失败发生"相邻巧合"误熔断（新周期首个 G1 失败即顶格）。
+        **({"plan_validation_prev_structural": {}} if plan_valid else {}),
     }
 
 
@@ -3075,6 +3124,13 @@ def confirm_plan(state: BrainState) -> dict:
         _fb = (decision.get("feedback") or "").strip()
         if _fb:
             _patch_out["replan_feedback"] = _fb
+    # ★R64-T3 复核 MEDIUM 整改★：REVISE=人工开启新规划周期，必须对称重置 retry 计数与
+    # 结构违例签名（与 failure.py 三个 replan 出口同律）。既有缺口：CONFIRM→PLAN 边不经
+    # increment_retry 也无人重置——熔断顶格(retry=3)后人工 REVISE 的新 plan 一旦任何原因
+    # 校验失败即被 retry>=MAX 直送 confirm，人工反馈得不到任何自动重试机会（软锁死）。
+    if human_decision == HumanDecision.REVISE:
+        _patch_out["plan_retry_count"] = 0
+        _patch_out["plan_validation_prev_structural"] = {}
     return _patch_out
 
 

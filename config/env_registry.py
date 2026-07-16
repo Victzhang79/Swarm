@@ -119,6 +119,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_MODEL_MODEL_PROVIDERS": "api/routers/config.py:505",
     "SWARM_MODEL_MODEL_SIZES": "api/routers/config.py:505",
     "SWARM_MODULE_COHERENCE_GATE": "brain/nodes/__init__.py:2628",
+    "SWARM_G1_RETRY_FUSE": "brain/nodes/__init__.py:validate_plan(R64-T3 同签名熔断泄压阀)",
     "SWARM_MODULE_LOCK_UPGRADE_WAIT_S": "brain/runner.py:760",
     "SWARM_MODEL_PROVIDERS": "api/routers/config.py:504",
     "SWARM_MODEL_ROUTING_COMPLEX": "api/_shared.py:42",

@@ -90,6 +90,11 @@ class BrainState(TypedDict, total=False):
     # F10（阶段3.7）：validate LLM 软校验的 plan 结构签名（不含 id）——重试轮签名一致
     # 则跳过软校验（此前每轮必烧 ~120K 字符且结果丢弃）。last-write-wins 每轮整体替换。
     plan_soft_review_sig: str
+    # R64-T3：G1 结构性违例签名 {"sig": [...], "retry": N}（绑定 retry 轮次）——连续两轮
+    # 同签名=全量重产也无法收敛（round64：反馈注入 plan_batch 但其 schema 无 module 字段
+    # +P4 禁改前缀，结构性无法执行）→ 熔断顶格 retry 直接 CONFIRM，省 33min 重产。
+    # retry 绑定天然免疫跨 replan 周期的陈旧残留（新周期至少获得一次带反馈重试）。
+    plan_validation_prev_structural: dict
     shared_contract: dict               # Brain 级共享契约（来自 plan）
     # D10：PLAN 节点对 plan.parallel_groups 剔除悬空引用后，把修剪结果同步写回 state 顶层
     # （dedupe/replan 改了 subtasks 集合时 groups 必须跟着改）。LangGraph 未声明键会被静默
@@ -290,6 +295,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "coverage_watermark": "monotonic",
     "coverage_gap_residual": "round",   # A6 残差 last-write-wins：gap 放行覆写/全覆盖清空（3.9 H-F5）
     "plan_soft_review_sig": "round",    # 只在真放行时 emit，否决轮发空串（3.9 H-F6/R-F5）
+    "plan_validation_prev_structural": "round",  # R64-T3：G1 失败轮整体替换；retry 绑定免疫陈旧残留
     "plan_generation_failed": "round",
     "oversized_subtask_ids": "round",
     "invest_fail_count": "round",

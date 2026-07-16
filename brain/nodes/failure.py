@@ -456,6 +456,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # 目标，给全新 plan 校验重试预算（round36 #9 同理），并清旧覆盖 issue 防污染新规划。
             # 原漏此二键 → 新计划继承已耗尽的 plan_retry_count，首次校验失败即 CONFIRM REJECT。
             "plan_retry_count": 0,
+            "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             "plan_validation_feedback": "",
         }
 
@@ -550,6 +551,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # 3/3 耗尽 CONFIRM reject（round36 实证 replan 从没派发就死在规划）。replan 总次数另由
             # replan_count(独立熔断,默认 2)封顶，故此处清零安全、不会无界。
             "plan_retry_count": 0,
+            "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             "plan_validation_feedback": "",  # 同清跨轮校验粘滞，防旧覆盖 issue 污染新规划
             # D12（2026-07-09 登记册）：全量 replan 出口清 l2_targeted 粘滞——否则下一轮 L2
             # 归因不出（_l2_failure_state 不 emit 该键）时，粘滞 True 把全员连坐误判成"已归因定向"。
@@ -1408,6 +1410,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # round36 #9 治本：执行失败 replan 同理给全新 plan 校验重试预算（清零 plan_retry_count），
             # 别继承覆盖重试已耗尽的额度。replan_count(独立熔断)封顶总次数。
             "plan_retry_count": 0,
+            "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             # A3 sibling（2026-07-09 登记册）：与 L2 出口对称清旧覆盖 issue，防污染新规划。
             "plan_validation_feedback": "",
         }
