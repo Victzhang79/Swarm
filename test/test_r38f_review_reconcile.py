@@ -134,7 +134,11 @@ def test_tech_design_repair_only_regenerates_missing_modules(monkeypatch):
                           "feedback": "只补齐缺失模块"},
     }
     out = asyncio.run(pn.tech_design(state))
-    assert len(calls) == 7  # 只有 7 个缺失模块各 1 次调用
+    # R65-T1 起 stage2 为分批续写协议：每模块 1 产出批 + 1 空批确认 = 2 次调用；
+    # 本断言核心语义不变——只有 7 个【缺失】模块被重生成，已成模块 0 调用
+    assert len(calls) == 14
+    assert all(f"模块名：mod-{i}" not in c for c in calls for i in (2, 3)), \
+        "已成模块 mod-2/mod-3 不得被重拆"
     fp = out["tech_design_file_plan"]
     paths = {f["path"] for f in fp}
     assert "src/mod-2/a.x" in paths and "src/mod-3/a.x" in paths  # 已成模块保留
