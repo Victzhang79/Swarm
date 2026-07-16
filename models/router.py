@@ -476,6 +476,34 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     swarm_provider_concurrency: int = 0
 
     async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        # Task#10：模型层 LLM 录制钩（env 门控 + 仅 brain）。默认关（未设
+        # SWARM_CASSETTE_RECORD_DIR）时零开销直通；开启且本调用带 brain 节点标签
+        # （_LLM_NODE_CV，仅 brain 图节点绑定，见 set_llm_node）才录——自动排除高频
+        # worker 本地流量。tee_record 全程 fail-open 且忠实透传 GeneratorExit/取消，
+        # 既有 aclose→GPU abort 链不受影响（见 cassette_record 铁律）。
+        from contextlib import aclosing
+
+        from swarm.models import cassette_record as _cass
+        if _cass.recording_enabled() and _LLM_NODE_CV.get():
+            # 复核 F1：aclosing 把消费者的 aclose 确定性转发给 tee_record（它再转发给
+            # _astream_slotted，触发其 B6 槽位 finally 释放 + cassette _flush 落盘）——录制路径
+            # 不给既有释放链新增 GC 悬挂 hop。底层 _astream_inner→super 的既有 GC 终结属 Task#10
+            # 之外的历史行为，未改动（真正的 GPU abort 走 _astream_inner 的超时/取消分支，确定）。
+            async with aclosing(_cass.tee_record(
+                self._astream_slotted(*args, **kwargs),
+                node=_LLM_NODE_CV.get(),
+                model=str(getattr(self, "model_name", "") or ""),
+                provider=self.swarm_provider_id or "",
+                args=args, kwargs=kwargs,
+            )) as _rec:
+                async for _chunk in _rec:
+                    yield _chunk
+            return
+        async for _chunk in self._astream_slotted(*args, **kwargs):
+            yield _chunk
+
+    async def _astream_slotted(self, *args: Any, **kwargs: Any):
+        # B6 provider 级并发闸 + 双超时内层（原 _astream 主体，录制钩抽离后不变语义）。
         _sem = _provider_slot(self.swarm_provider_id, self.swarm_provider_concurrency)
         if _sem is None:
             async for chunk in self._astream_inner(*args, **kwargs):

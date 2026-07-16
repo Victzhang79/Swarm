@@ -37,6 +37,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_BRAIN_JSON_MODE": "brain/nodes/__init__.py:203",
     "SWARM_BREAKER_COOLDOWN_S": "models/breaker.py:18",
     "SWARM_BREAKER_THRESHOLD": "models/breaker.py:17",
+    "SWARM_CASSETTE_RECORD_DIR": "models/cassette_record.py:_ENV_DIR",
     "SWARM_CHECKPOINT_TTL_DAYS": "infra/checkpoint_gc.py:16",
     "SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY": "models/router.py:392",
     "SWARM_CODEGRAPH_BIN": "project/codegraph.py:41",
