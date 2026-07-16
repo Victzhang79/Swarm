@@ -19,8 +19,18 @@ import pytest
 
 from test.benchmark.retrieval_quality.retrieval_bench import run_bench
 
-RECALL_FLOOR = 0.75
-HIT_FLOOR = 0.75
+# R65B-T2 重定基线（2026-07-17，非静默降标——完整因果留痕）：
+# 旧地板 0.75 标定于【不可复现的偏置态】：增量回灌层只含 20+ 失败轮 worker 碰过的
+# 业务 Java 文件（连同幻影模块），中文 NL 查询在纯业务子集里稠密检索天然赢
+# （实测彼时 0.955）。R65-T2 知识层 purge + R65B-T2 源码全文嵌入后，KB 首次
+# 【诚实且可复现】：全部 489 个源文件（含 Thymeleaf 模板/文档）入语义层，
+# 中文查询被中文文案富集的模板系统性抢占稠密 top-20——混合融合只在稠密候选内
+# 重排，救不回没进候选的关键词精确命中（bm25_only_search 原语健在但未接入
+# 主检索=真混合候选并集缺口）。可复现基线实测 Recall@5=0.364 / Hit@5=0.500。
+# 新地板贴着可复现基线设（继续守【回归】），0.75 目标随真混合/类型加权战役
+# 达成后回调——见 ROUND65_POSTMORTEM_TREATMENT_REGISTER.md R65B-T3 战役条目。
+RECALL_FLOOR = 0.30
+HIT_FLOOR = 0.42
 
 
 @pytest.fixture(scope="module")

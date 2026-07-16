@@ -80,6 +80,25 @@ def _parse_preprocess_status(payload: dict) -> str:
     return str((payload or {}).get("project_status") or "").upper()
 
 
+def _check_source_embed_stats(project_id: str) -> tuple[bool, str]:
+    """R65B-T2 猎手(c)：READY 后核源码语义层健康（直读 PG preprocess_progress）。
+
+    embed_stats.source_aborted 存在 或 source_files==0（非空项目）→ 语义层退化，
+    拒绝放行。读不到 stats 视为不健康（fail-closed：宁可挡住重跑也不带退化 KB 起跑）。"""
+    try:
+        from swarm.project.store import get_progress
+        prog = get_progress(project_id) or {}
+        es = prog.get("embed_stats") or {}
+        if es.get("source_aborted"):
+            return False, f"source_aborted={str(es['source_aborted'])[:120]}"
+        n = int(es.get("source_files") or 0)
+        if n <= 0:
+            return False, f"source_files={n}（源码语义层为空）"
+        return True, f"source_files={n}/source_chunks={es.get('source_chunks')}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"embed_stats 读取失败: {str(exc)[:120]}"
+
+
 def _trigger_rebuild(api: str, project_id: str, timeout_s: int) -> bool:
     import urllib.error
     import urllib.request
@@ -114,7 +133,14 @@ def _trigger_rebuild(api: str, project_id: str, timeout_s: int) -> bool:
             st = _req("GET", f"{api}/api/projects/{project_id}/preprocess/status")
             status = _parse_preprocess_status(st)
             if status == "READY":
-                print(f"[purge-kb] ✓ preprocess 重建完成（project_status={status}）")
+                # R65B-T2 猎手(c)：READY ≠ 语义层健在——源码嵌入中止/零文件时 status 仍
+                # READY（签名层成功即过），必须核 embed_stats，否则下一轮又跑在退化 KB 上。
+                ok, why = _check_source_embed_stats(project_id)
+                if not ok:
+                    print(f"[purge-kb] ❌ preprocess READY 但源码语义层退化：{why}"
+                          "——拒绝放行（重跑本脚本或查嵌入服务）", file=sys.stderr)
+                    return False
+                print(f"[purge-kb] ✓ preprocess 重建完成（project_status={status}，{why}）")
                 return True
             if status == "ERROR":
                 print(f"[purge-kb] ❌ preprocess 重建失败: {st}", file=sys.stderr)

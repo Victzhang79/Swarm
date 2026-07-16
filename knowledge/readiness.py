@@ -47,13 +47,19 @@ def assess_knowledge_readiness(
             "show_preprocess_cta": True,
         }
 
-    partial = bool(index.get("skipped") or embed.get("skipped"))
+    # R65B-T2 猎手(c)：源码语义嵌入中止也算 partial——否则"签名层成功+源码层死了"
+    # 仍报 ready，Brain 在退化语义层上检索却以为正常（正是本机制要治的召回塌陷复发面）。
+    partial = bool(index.get("skipped") or embed.get("skipped")
+                   or embed.get("source_aborted"))
     if partial:
         parts: list[str] = []
         if index.get("skipped"):
             parts.append("结构索引(Layer A)已跳过")
         if embed.get("skipped"):
             parts.append("向量嵌入(Layer B)已跳过")
+        if embed.get("source_aborted"):
+            parts.append(
+                f"源码语义嵌入中止（{str(embed.get('source_aborted'))[:60]}——检索退化为签名层）")
         return {
             "level": "partial",
             "message": "预处理已完成 · " + "，".join(parts) + "（Brain 仍可使用扫描/分析结果）",

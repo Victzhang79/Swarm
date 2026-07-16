@@ -655,21 +655,34 @@ async def _phase_embed(
         _embed_progress_cb,
     )
 
+    # R65B-T2：符号签名向量之外，源码全文切块嵌入（与增量 updater 同一管线）——
+    # 否则干净重建后语义层=纯签名，源文本类查询召回塌（Recall@5 0.75+→0.568 实测）。
+    src_stats = await _embed_source_text_chunks(project_id, project_path, _embed_progress_cb)
+
     embed_stats = {
         "vectors": len(vectors),
         "dim": dim,
+        "source_files": src_stats.get("files", 0),
+        "source_chunks": src_stats.get("chunks", 0),
+        "source_skipped": src_stats.get("skipped", 0),
     }
+    _src_note = f"，source {src_stats.get('chunks', 0)} chunks"
+    if src_stats.get("aborted"):
+        embed_stats["source_aborted"] = src_stats["aborted"]
+        _src_note += f"（源码嵌入中止: {src_stats['aborted'][:80]}）"
     await asyncio.to_thread(
         upsert_progress,
         project_id,
         phase="embedding",
         phase_progress=1.0,
-        message=f"Embedding complete: {len(vectors)} vectors",
+        message=f"Embedding complete: {len(vectors)} vectors{_src_note}",
         embed_stats=embed_stats,
     )
     await asyncio.sleep(0.1)
 
-    return {"vector_count": len(vectors), "dim": dim}
+    return {"vector_count": len(vectors), "dim": dim,
+            "source_files": src_stats.get("files", 0),
+            "source_chunks": src_stats.get("chunks", 0)}
 
 
 # ──────────────────────────────────────────────
@@ -1139,6 +1152,168 @@ def _replace_dependency_graph(project_id: str, edges: list) -> None:
                         cur.executemany(_DEP_INSERT_SQL, rows)
     except Exception as exc:
         logger.warning("Failed to replace dependency graph: %s", exc)
+
+
+# R65B-T2：源码全文嵌入的单文件体积上限——超大文件多为生成物/数据文件，
+# 嵌入价值低且拖垮预处理时长；跳过必计数留痕（绝不静默）。
+_SOURCE_EMBED_MAX_FILE_BYTES = 512_000
+
+
+def _make_semantic_indexer():
+    """工厂（测试替身注入点）：预处理源码嵌入用的 SemanticIndexer。"""
+    from swarm.knowledge.semantic_index import SemanticIndexer
+    return SemanticIndexer()
+
+
+# R65B-T2：源码嵌入的【资产/三方件】排除段（栈中立目录约定，非语言判断——前端项目
+# 的 .js/.html 是一等源码，但 static 资产目录/vendored 三方库/压缩产物对代码检索是
+# 纯噪声：实测 RuoYi 135/624 个 static 下 vendored JS 把业务源码挤出 top5，
+# Recall@5 0.386）。对齐 GitHub linguist vendored 惯例的强约定子集。
+_SOURCE_EMBED_EXCLUDED_SEGMENTS = (
+    "/static/", "/node_modules/", "/vendor/", "/vendors/",
+    "/bower_components/", "/third_party/", "/thirdparty/",
+)
+_SOURCE_EMBED_EXCLUDED_SUFFIXES = (".min.js", ".min.css", ".map")
+
+
+def _source_embed_excluded(rel_path: str) -> bool:
+    p = "/" + rel_path.replace("\\", "/").lstrip("/")
+    return (any(seg in p for seg in _SOURCE_EMBED_EXCLUDED_SEGMENTS)
+            or p.endswith(_SOURCE_EMBED_EXCLUDED_SUFFIXES))
+
+
+def _read_files_for_source_embed(project_id: str) -> list[str]:
+    """从 kb_file_index 读取已索引源文件相对路径（源码全文嵌入的文件清单权威）。
+
+    猎手 (d) 整改：DB 读失败绝不折叠成"空项目"——抛给调用方置 aborted 机读标记。"""
+    from swarm.infra.db import sync_pool
+    with sync_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_path FROM kb_file_index WHERE project_id = %s"
+                " ORDER BY file_path",
+                (project_id,),
+            )
+            rows = [r[0] for r in cur.fetchall()]
+    kept = [p for p in rows if not _source_embed_excluded(p)]
+    if len(kept) != len(rows):
+        logger.info(
+            "[EMBED-SOURCE] 资产/三方件排除：%d/%d 文件不入语义嵌入（static/vendored/minified）",
+            len(rows) - len(kept), len(rows))
+    return kept
+
+
+async def _embed_source_text_chunks(
+    project_id: str, project_path: str, progress_cb=None,
+) -> dict[str, Any]:
+    """R65B-T2：源码全文切块嵌入——与增量 updater 完全同一管线。
+
+    背景：preprocess 此前只嵌符号签名元数据向量（codegraph 道），源码全文 chunk
+    历史上只有 worker DONE 增量回灌产出——语义层质量靠失败轮碰文件顺带长出（连同
+    幻影一起）。知识层 purge+干净重建后语义层=纯签名 → 源文本类查询召回塌
+    （round65b 后实测 Recall@5 0.75+→0.568）。本函数让干净重建达到与增量对齐的质量：
+    - 同一切块器/同一 make_point_id（与增量互 upsert 幂等去重）；
+    - 全量代际 write-then-prune（钉 index_source=semantic，F2 双车道不误删）；
+    - 嵌入服务失败/取消 → 绝不 prune（旧点保留无空窗），机读 aborted 标记大声降级。"""
+    try:
+        files = await asyncio.to_thread(_read_files_for_source_embed, project_id)
+    except Exception as exc:  # noqa: BLE001 — 猎手(d)：DB 读失败≠空项目，机读 aborted
+        logger.error("[EMBED-SOURCE] 文件清单读取失败（DB？）: %s", exc)
+        return {"files": 0, "chunks": 0, "skipped": 0,
+                "aborted": f"file_list_read_failed: {str(exc)[:150]}"}
+    if not files:
+        return {"files": 0, "chunks": 0, "skipped": 0}
+
+    idx = _make_semantic_indexer()
+    await idx.connect()
+
+    from swarm.knowledge.semantic_index import (
+        EmbeddingDimensionMismatchError,
+        EmbeddingUnavailableError,
+    )
+
+    async def _real_embed(texts: list[str]) -> list[list[float]]:
+        vecs = await asyncio.to_thread(_embed_texts, texts)
+        if vecs is None:
+            # 专用异常：服务级判据靠类型不靠猜（RuntimeError 会误吞 RecursionError
+            # 等单文件病理——猎手(b) 测试锁实证）
+            raise EmbeddingUnavailableError("embedding 服务不可用（_embed_texts 返回 None）")
+        return vecs
+
+    idx.set_embed_fn(_real_embed)
+    ev = _get_cancel_event(project_id)
+    root = Path(project_path)
+    n_files = n_chunks = n_skipped = n_failed = 0
+    aborted: str | None = None
+    # 猎手(b)：服务级异常（嵌入不可用/维度不符）→ 整段中止（逐文件重试是空转）；
+    # 其余单文件异常（tree-sitter 递归爆栈/病理文件/单点 upsert 拒）→ 跳过计数继续，
+    # 失败占比超阈值才判整段中止（区分"一颗坏文件" vs "服务真死"）。
+    _fail_cap = max(10, len(files) // 5)
+    try:
+        for i, rel in enumerate(files):
+            if ev is not None and ev.is_set():
+                aborted = "cancelled"
+                logger.warning(
+                    "[EMBED-SOURCE] 预处理已取消，中止源码嵌入（%d/%d 文件已写）project=%s",
+                    n_files, len(files), project_id)
+                break
+            p = root / rel
+            try:
+                if not p.is_file() or p.stat().st_size > _SOURCE_EMBED_MAX_FILE_BYTES:
+                    n_skipped += 1
+                    continue
+                source = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                n_skipped += 1
+                continue
+            if not source.strip():
+                n_skipped += 1
+                continue
+            try:
+                # 猎手(a)：逐文件 write-then-prune（reindex_file_atomic 与增量 updater
+                # 完全同语义）——绝不做项目级代际 prune：那会把并发 updater 刚写的
+                # 新鲜 chunk 当"旧代际"连带删掉（file-scoped 竞态最坏=同文件两个近期
+                # 版本二选一，均为有效近期内容，有界）。
+                n_chunks += await idx.reindex_file_atomic(project_id, source, rel, None)
+                n_files += 1
+            except (EmbeddingUnavailableError, EmbeddingDimensionMismatchError) as exc:
+                aborted = str(exc)[:200]
+                logger.error(
+                    "[EMBED-SOURCE] 嵌入服务级故障，中止于 %r（%d/%d 已写，已写文件"
+                    "各自完成 write-then-prune 无空窗）: %s",
+                    rel, n_files, len(files), aborted)
+                break
+            except Exception as exc:  # noqa: BLE001 — 单文件病理：跳过留痕，不连坐全程
+                n_failed += 1
+                logger.warning(
+                    "[EMBED-SOURCE] 文件 %r 索引失败（跳过继续，%d/%d 失败）: %s",
+                    rel, n_failed, _fail_cap, str(exc)[:150])
+                if n_failed >= _fail_cap:
+                    aborted = f"too_many_file_failures({n_failed})"
+                    logger.error(
+                        "[EMBED-SOURCE] 单文件失败超阈值（%d≥%d），判服务异常中止 project=%s",
+                        n_failed, _fail_cap, project_id)
+                    break
+            if progress_cb is not None and (i + 1) % 25 == 0:
+                try:
+                    progress_cb(min(0.99, (i + 1) / len(files)),
+                                f"Source-text embedding {i + 1}/{len(files)} files...")
+                except Exception:  # noqa: BLE001 — 进度上报绝不阻断嵌入
+                    pass
+    finally:
+        try:
+            await idx.close()
+        except Exception:  # noqa: BLE001 — 终态清理，主结果已定
+            logger.debug("[EMBED-SOURCE] indexer close 失败（忽略）", exc_info=True)
+    stats: dict[str, Any] = {"files": n_files, "chunks": n_chunks,
+                             "skipped": n_skipped, "failed_files": n_failed}
+    if aborted is not None:
+        stats["aborted"] = aborted
+    logger.info(
+        "[EMBED-SOURCE] 项目 %s 源码全文嵌入：%d 文件 %d chunks（跳过 %d/单文件失败 %d%s）",
+        project_id, n_files, n_chunks, n_skipped, n_failed,
+        f"，中止: {aborted}" if aborted else "")
+    return stats
 
 
 def _read_symbols_for_embed(project_id: str) -> list[dict[str, Any]]:

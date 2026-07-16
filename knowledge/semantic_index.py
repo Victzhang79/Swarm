@@ -402,6 +402,12 @@ class SemanticIndexer:
         await self.prune_file_stale(project_id, file_path, gen)
         return n
 
+    # （R65B-T2 复核记录：曾设计项目级语义道代际 prune，猎手实证其与增量 updater
+    # 的逐文件代际存在竞态——updater 刚写的新鲜 chunk 会被当"旧代际"连带删除。
+    # 故源码全文嵌入与增量共用 reindex_file_atomic 的【逐文件】write-then-prune，
+    # 不提供项目级代际 prune 原语；已删除文件的语义残点由 delete_by_file/
+    # delete_by_project 及 reconcile 兜。）
+
     async def prune_file_stale(
         self, project_id: str, file_path: str, keep_generation: str
     ) -> None:

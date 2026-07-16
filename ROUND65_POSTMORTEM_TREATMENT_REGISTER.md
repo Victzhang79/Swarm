@@ -60,3 +60,8 @@ plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round
   SWARM_MAX_TASK_TOKENS_PER_PLANNED_FILE 可调）。标定=round65b 需求 ≈850k 反推 4k/文件
   （171 文件→1.784M→plan 顶格 936k）。决策记录：续批提示瘦身**不做**（cloud out 422k vs
   in 198k，输入瘦身收益低且有路径规律丢失风险）。
+
+## R65B-T2/T3 段（源码嵌入 + 检索基线诚实化）
+- T2 purge 曝光先天缺口：preprocess 只嵌符号签名，源码全文层历史上靠失败轮 worker 碰文件顺带长出（连同幻影）。治本=preprocess 逐文件 reindex_file_atomic（与增量同管线同语义）+ 资产/三方件栈中立排除（static/vendored/minified，实测 135/624）+ 服务级 vs 单文件异常分类 + readiness/purge 脚本双闸（猎手 4 CONFIRMED 全治）。live 实测：489 文件 7806 chunks 重建 READY。
+- ★重定基线（非静默降标）★：旧 0.75 地板标定于不可复现偏置态（0.955=纯业务 Java 子集）；诚实可复现 KB 上中文查询被模板抢占稠密候选，实测 0.364/0.500。新地板 0.30/0.42 贴基线守回归；0.75 目标随 R65B-T3 战役（真混合候选并集：bm25_only_search∪稠密→融合重排 + 类型加权 + gold 集复审，task #51）达成后回调。
+- 复核记录：曾设计项目级语义道代际 prune，猎手实证与增量 updater 竞态（会删并发新鲜 chunk）→ 改逐文件 write-then-prune，项目级原语不提供。
