@@ -319,3 +319,44 @@ test_prompt_shadowed_pin_keys_restore_defined_in）；reviewer R1 MEDIUM CONFIRM
 闸 fail-closed 自动生效，零新机制。**已知留观**：writable-only 落点无依赖序（WARNING 可查）；
 语料反向提及（"不要动 X"）会多布一条无害 readable；fan-out 帽 max(8, n/3)。
 revert-check：撤接线→恰 2 集成测试红；撤模块→collection ImportError。
+
+## T5 调查结论（2026-07-16，coherence 闸真相核实 + pom 基线依赖缺口实锤）
+
+**核实结果：闸已实现已接线，"待接管"是文档滞后。** `validate_module_coherence`
+（brain/plan_validator.py:656，G1/cc7be64）已接线 validate_plan（nodes/__init__.py:2630-2665，
+杀开关 SWARM_MODULE_COHERENCE_GATE 默认开），硬判①模块散多目录②多模块塌同目录。round63
+日志"Task4 模块 coherence 闸待接管归一"来自 plan_finisher 闸落地**前**的前瞻注释未回填——
+本轮已改措辞。但该闸语义=物理落点 coherence，与 pom 依赖内容**正交**，挡不住 T5 真死因。
+
+**真缺口（cassette 实锤）**：st-5 描述文字明说"一次性声明…ruoyi-common、ruoyi-framework…"，
+但"权威 pom 模板（原样写入）"的 XML 里两者皆无——模板 <dependencies> 唯一来源=契约
+`dependencies[].artifacts`（LLM 只报第三方 GAV，从不报内部模块；prompt schema 也没要求），
+无任何机制推导"新模块引用基线模块 → pom 须声明"；plan 期无此闸，事后只有 worker 编译失败后的
+L1 防线④（30+ 次"程序包 com.ruoyi.common.core.domain 不存在"烧完预算才触发）。推导证据 plan
+里现成：ruoyi-alarm 子任务 readable→ruoyi-common code 文件 108 次、alarm-interface 111 次。
+
+### T5 完成（2026-07-16，test-first + 对抗双复核 + 全量套件）
+
+**变更**（brain/contract_utils.py + brain/plan_finisher.py 措辞 + 15 测试）：
+- `derive_internal_module_deps`：模块子任务跨模块 readable **code** 文件=编译依赖证据（栈中立
+  证据面）；plan 兄弟互指=双向剪+WARNING（注入必成环）；新兄弟（无 pom）=显式
+  `group:名:${project.version}`；基线/既有目录经 `_baseline_module_artifact` 过滤（无 pom/
+  packaging pom|war|ear/spring-boot 可执行件不可依赖，R58-1 形态依真 artifactId）。
+- 单次推导（hunter#F4）传入两个注入点（scaffold 循环 + R58-3 owner 嵌入），
+  `_merge_internal_deps` 按 artifactId 去重并入契约 artifacts → 既有 resolve_scaffold_artifacts
+  （坐标解析单一权威不变）。
+
+**对抗双复核（2 blocker 全治+锁）**：
+- hunter#F2 **CRITICAL**（实证）：根 GAV 解析不到时新兄弟退化裸名 → maven_registry Central
+  反查把**本工程新模块名**解析成不相干真实构件（org.ow2.jasmine:alarm-interface）=伪造坐标盖
+  权威章（R47-2 变体）→ 治：rg 缺失不注入+响亮 WARNING（锁 test_sibling_without_root_gav_not_bare_name）。
+- hunter#F1 **HIGH**（实证，round63 死型本体）：契约条目 artifacts 空（模块只需基线库）被
+  unclaimed_contract_deps 剪掉 → 推导结果无注入出口、pom 无人建，INFO 却谎报"已并入"→ 治：
+  补零 artifacts 脚手架条目 + owner 迭代面扩到 derived-only 模块 + INFO 措辞校准
+  （锁 test_empty_artifacts_module_still_gets_scaffold_with_internal_dep）。
+- hunter#F3（OSError≠不可依赖，WARNING 区分设计内过滤）、reviewer MED（_owner_mod 最长前缀，
+  嵌套目录误归属）、盲区测试（R58-1 混合形态/嵌套 dirs/_merge 去重表）全补锁。
+**已知留观**：孤儿模块脚手架路径（_inject_orphan_module_scaffolds resolved=[] by design，
+L1 防线④兜底）不含推导依赖（hunter#F5，存量设计）；两级嵌套基线布局继承单层扫描假设（存量）；
+样例引用会多注入无害 lib 依赖（上限=多一条可解析的基线库坐标）。
+revert-check：撤实现→收集期 ImportError+死型集成测试红；恢复→绿。

@@ -694,23 +694,204 @@ def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:
     return out
 
 
+def _baseline_module_artifact(root: Path, mod_dir: str) -> str | None:
+    """T5：磁盘上既有模块是否**可被依赖**（Maven 注入层过滤）。可依赖 → 返回其 artifactId。
+
+    不可依赖三类：无 pom（非 Maven 模块，注入层不认）；packaging=pom/war（聚合父/война包
+    不能上 classpath）；含 spring-boot-maven-plugin（repackage 后的可执行 fat-jar 不是库，
+    依赖它必炸——round63 佐证：ruoyi-alarm 子任务 readable 里有 ruoyi-admin 样例文件，
+    盲注会把可执行件拖进依赖）。纯文本确定性解析，解析失败按不可依赖（宁缺勿滥）。"""
+    import re as _re
+    pom = root / mod_dir / "pom.xml"
+    try:
+        if not pom.is_file():
+            return None
+        txt = _re.sub(r"<!--.*?-->", "", pom.read_text("utf-8", errors="replace"), flags=_re.S)
+        m_pkg = _re.search(r"<packaging>([^<]+)</packaging>", txt)
+        if m_pkg and m_pkg.group(1).strip().lower() in ("pom", "war", "ear"):
+            logger.debug("[T5] 模块 %s packaging=%s → 不可被依赖（聚合父/打包件，设计内过滤）",
+                         mod_dir, m_pkg.group(1).strip())
+            return None
+        if "spring-boot-maven-plugin" in txt:
+            logger.debug("[T5] 模块 %s 含 spring-boot-maven-plugin（可执行 fat-jar）→ 不可被依赖",
+                         mod_dir)
+            return None
+        head = _re.sub(r"<parent>.*?</parent>", "", txt, flags=_re.S)
+        m_a = _re.search(r"<artifactId>([^<]+)</artifactId>", head)
+        return m_a.group(1).strip() if m_a else None
+    except OSError as e:
+        # hunter#F3："读不到"≠"确认不可依赖"——瞬时 IO 失败会让真实基线库从模板里静默消失
+        # （round63 症状复现且无痕）。WARNING 区分于上面的设计内 debug 过滤。
+        logger.warning("[T5] 模块 %s 的 pom 读取失败（%s）→ 本轮视为不可依赖，模板可能缺真实"
+                       "基线依赖（交 worker L1 防线④兜底）", mod_dir, e)
+        return None
+
+
+def derive_internal_module_deps(plan, dirs: dict[str, str],
+                                project_path: str | None) -> dict[str, list[str]]:
+    """T5（round63 治本）：从子任务跨模块 readable 证据确定性推导**内部模块依赖**。
+
+    round63 死因：模板 <dependencies> 唯一来源=契约 LLM 自声明的第三方 artifacts，契约从不
+    产内部模块依赖 → st-5 权威模板缺 ruoyi-common → 首波 30+ 次"程序包 com.ruoyi.common.
+    core.domain 不存在"。而推导证据 plan 里现成（ruoyi-alarm 子任务 readable→ruoyi-common
+    code 文件 108 次）从无人消费。
+
+    推导（证据面栈中立）：模块 M 的子任务（写文件落在 dirs[M] 下）的 readable 里出现
+    **其他模块的 code 文件** = M 编译需要该模块。落点两类：
+    - plan 模块（dirs 有映射）：磁盘已有 pom → 按基线模块过滤；尚无 pom（新兄弟）→ 显式
+      `group:模块名:${project.version}`（group 取根 GAV；模板 artifactId=契约模块名同源）。
+      互指（A↔B 都有对方证据）=注入必成环 → 双向跳过+WARNING（更深计划错，交结构闸）。
+    - 基线目录（顶段含构建清单）：经 _baseline_module_artifact 过滤（无 pom/聚合父/war/
+      spring-boot 可执行件不注入）。基线绝不依赖新模块（它出现时新模块还不存在）→ 无环。
+    返回 {契约模块: [artifact spec…]}；注入点合并进契约 artifacts 后走既有
+    resolve_scaffold_artifacts（坐标解析单一权威，R53-1）。fail-open：无 project_path → {}。
+    """
+    if not project_path or not dirs:
+        return {}
+    root = Path(project_path)
+    from swarm.brain.symbol_provenance import _is_code_path  # T4 单一 code 判定源
+    plan_dir_of = {m: (d or "").strip("/") for m, d in dirs.items() if d}
+    if not plan_dir_of:
+        return {}
+
+    # 复核 MED：**最长目录优先**——嵌套布局（"mods" 与 "mods/alarm" 同为 plan 模块）下
+    # 首配会把内层文件误归外层模块，证据错挂/互指误剪。按目录长度降序保证最具体者赢。
+    _ordered_dirs = sorted(plan_dir_of.items(), key=lambda kv: -len(kv[1]))
+
+    def _owner_mod(p: str) -> str | None:
+        for m, d in _ordered_dirs:
+            if p == d or p.startswith(d + "/"):
+                return m
+        return None
+
+    # 证据收集：{module: {("plan"|"baseline", 名)}}
+    evid: dict[str, set[tuple[str, str]]] = {m: set() for m in plan_dir_of}
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        writes = [_norm_scope_path(str(f)) for f in
+                  (list(getattr(sc, "create_files", None) or [])
+                   + list(getattr(sc, "writable", None) or []))]
+        write_mods = {_owner_mod(p) for p in writes} - {None}
+        if not write_mods:
+            continue
+        for r in (getattr(sc, "readable", None) or []):
+            rp = _norm_scope_path(str(r))
+            if "/" not in rp or not _is_code_path(rp):
+                continue
+            om = _owner_mod(rp)
+            for m in write_mods:
+                if om is not None:
+                    if om != m:
+                        evid[m].add(("plan", om))
+                    continue
+                top = rp.split("/", 1)[0]
+                if top in _SRC_LAYOUT_SEGMENTS:
+                    continue
+                evid[m].add(("baseline", top))
+
+    # plan 兄弟互指 = 注入必成环 → 双向剪除（更深计划错，surfaced 不静默）
+    mutual = {(a, b) for a, deps in evid.items()
+              for kind, b in deps if kind == "plan" and ("plan", a) in evid.get(b, set())}
+    if mutual:
+        logger.warning(
+            "[T5] %d 对 plan 模块互相消费对方产物（注入依赖必成环）→ 双向都不注入内部依赖"
+            "（更深计划错，交结构闸/依赖序机制），请查: %s",
+            len(mutual), sorted(mutual)[:4])
+
+    rg = _root_gav(project_path)
+    out: dict[str, list[str]] = {}
+    for m, deps in evid.items():
+        specs: list[str] = []
+        for kind, name in sorted(deps):
+            if kind == "plan":
+                if (m, name) in mutual:
+                    continue
+                d = plan_dir_of.get(name) or name
+                art = _baseline_module_artifact(root, d)
+                if art:
+                    specs.append(art)          # 落在既有模块目录（R58-1 形态）→ 依真 artifactId
+                elif not (root / d / "pom.xml").is_file():
+                    # 新兄弟：pom 尚不存在（同批 scaffold 造）→ 显式坐标与模板 artifactId 同源。
+                    # hunter#F2 CRITICAL：根 GAV 解析不到（继承 GAV 根）绝不退化裸名——裸名会
+                    # 流进 maven_registry 的 Central 反查，把**本工程自己的新模块名**解析成
+                    # 不相干的真实第三方构件（实测 alarm-interface → org.ow2.jasmine 包）＝
+                    # 伪造坐标盖权威章（R47-2 禁令变体）。解析不到就不注入+响亮留痕。
+                    if rg:
+                        specs.append(f"{rg[0]}:{name}:${{project.version}}")
+                    else:
+                        logger.warning(
+                            "[T5] 根 pom GAV 不可解析（继承 GAV？）→ 新兄弟模块 %s 的内部"
+                            "依赖不注入（绝不退化裸名走 Central 反查伪造坐标，R47-2）——"
+                            "该依赖交 worker L1 防线④按真实 import 事后补", name)
+            else:
+                art = _baseline_module_artifact(root, name)
+                if art:
+                    specs.append(art)
+        if specs:
+            out[m] = sorted(set(specs))
+    if out:
+        logger.info(
+            "[T5] 从跨模块 readable 证据推导出内部模块依赖（消费方=owner/scaffold 两个模板"
+            "注入点；round63：契约从不声明内部依赖 → 模板缺 ruoyi-common 类基线库）: %s",
+            {k: v for k, v in sorted(out.items())})
+    return out
+
+
+def _merge_internal_deps(arts: list[str], derived: list[str]) -> list[str]:
+    """T5：把推导出的内部依赖并入契约 artifacts（按 artifactId 去重，契约已列的绝不重复）。"""
+    have: set[str] = set()
+    for a in arts:
+        parts = str(a).split(":")
+        have.add((parts[1] if len(parts) > 1 else parts[0]).strip())
+    merged = list(arts)
+    for d in derived:
+        parts = str(d).split(":")
+        art = (parts[1] if len(parts) > 1 else parts[0]).strip()
+        if art and art not in have:
+            merged.append(d)
+            have.add(art)
+    return merged
+
+
 def _inject_templates_into_pom_owners(plan, project_path: str | None,
-                                      file_plan: list | None = None) -> list[str]:
+                                      file_plan: list | None = None,
+                                      internal_deps: dict[str, list[str]] | None = None,
+                                      ) -> list[str]:
     """R58-3：给**已被认领**的模块 pom 的 owner 子任务，也嵌入确定性权威模板。
 
     脚手架只覆盖"无人认领"的 pom；一旦计划里某个写代码的子任务顺手认领了 `<mod>/pom.xml`，
     它就绕过了确定性模板、由小模型自由发挥 —— round58 实测写出属性引用的 parent 版本 → FATAL。
     模板是**纯机械产物**，谁写都该照抄同一份。
+    T5：internal_deps 由调用方（inject_build_scaffold_subtasks）单次推导传入（hunter#F4：
+    两注入点必须共用同一份，各算各的会在输入分叉时产出不一致模板）；直接调用时自算兜底。
     """
     if not project_path:
         return []
     dirs = _module_physical_dirs(plan, project_path, file_plan)
+    if internal_deps is None:
+        try:
+            internal_deps = derive_internal_module_deps(plan, dirs, project_path)
+        except Exception:  # noqa: BLE001
+            logger.warning("[T5] 内部模块依赖推导失败（fail-open，模板退回纯契约 artifacts）",
+                           exc_info=True)
+            internal_deps = {}
+    _internal_deps = internal_deps
     touched: list[str] = []
+    # T5（hunter#F1 对称面）：迭代面=契约 dependencies 条目 ∪ 只有内部依赖证据的模块——
+    # 契约无条目/条目被剪的模块，其认领者同样必须拿到含内部依赖的模板。
+    _iter_entries: list[tuple[str, list]] = []
+    _seen_mods: set[str] = set()
     for entry in ((plan.shared_contract or {}).get("dependencies") or []):
         if not isinstance(entry, dict):
             continue
-        mod = (entry.get("module") or "").strip().rstrip("/")
-        arts = [a for a in (entry.get("artifacts") or []) if a]
+        _em = (entry.get("module") or "").strip().rstrip("/")
+        if _em:
+            _iter_entries.append((_em, [a for a in (entry.get("artifacts") or []) if a]))
+            _seen_mods.add(_em)
+    for _m in sorted(_internal_deps):
+        if _m not in _seen_mods:
+            _iter_entries.append((_m, []))
+    for mod, arts in _iter_entries:
         mdir = dirs.get(mod)
         if not mod or not mdir:
             continue
@@ -726,6 +907,7 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
                 break
         if owner is None or "权威 pom 模板" in (owner.description or ""):
             continue
+        arts = _merge_internal_deps(arts, _internal_deps.get(mod) or [])   # T5
         _kept, _ = resolve_scaffold_artifacts(project_path, arts)
         _pgav = None
         _rg = _root_gav(project_path)
@@ -1099,24 +1281,53 @@ def inject_build_scaffold_subtasks(
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
         logger.debug("[SCAFFOLD-INJECT] G9 未检出构建栈证据 → 保守回退 Maven（back-compat）")
+    # T5（hunter#F4）：内部模块依赖推导**单次计算**、两个注入点（owner/scaffold）共用同一份
+    # ——各算各的会让 fail-open-per-callsite 在输入分叉时给同一模块产出两份不一致模板。
+    _dirs = _module_physical_dirs(plan, project_path, file_plan)
+    try:
+        _internal_deps = derive_internal_module_deps(plan, _dirs, project_path)
+    except Exception:  # noqa: BLE001
+        logger.warning("[T5] 内部模块依赖推导失败（fail-open，模板退回纯契约 artifacts）",
+                       exc_info=True)
+        _internal_deps = {}
     # R58-3（round58 结构性死因）：**有 owner ≠ 有模板**。
     # 计划里的 pom 一旦被某个写代码的子任务"认领"，旧规则就不建脚手架 → 那个 pom **完全没经过
     # 确定性模板**、由小模型手写 → 写出 `<parent><version>${ruoyi.version}</version>`（属性引用，
     # Maven 解析 parent 时还没加载父 pom → 永远解析不了）→ **pom 解析期崩塌、整棵 reactor 读不出**。
     # R45-2 的全部意义（"pom 是纯机械产物，别让小模型编"）在这条路径上完全落空。
     # 治：**认领者也必须拿到确定性权威模板**（嵌进 description，让它抄而不是编）。
-    _inject_templates_into_pom_owners(plan, project_path, file_plan)
+    _inject_templates_into_pom_owners(plan, project_path, file_plan,
+                                      internal_deps=_internal_deps)
 
     from swarm.types import FileScope, SubTask, TaskIntent
     injected: list[dict] = []
     existing_ids = {st.id for st in plan.subtasks}
-    _dirs = _module_physical_dirs(plan, project_path, file_plan)
     # ★Task#4 治本★ 全部**实际收码**物理模块目录（不做名字匹配、不 fail-closed）——聚合器
     # <modules> 完整性与孤儿模块补脚手架的权威证据源，与 fail-closed 的 _dirs 分工。
     _phys = _physical_code_module_dirs(plan, file_plan)
     # ★先算 entries★：聚合父脚手架会写根 `pom.xml`，这会触发规则5 的 A5 归并（误判"单 pom owner
     # → 单模块项目"）把子模块的 unclaimed 全吃掉 → 子模块脚手架不再注入。故必须在注入聚合父**之前**固定。
     entries = unclaimed_contract_deps(plan)
+    # T5（hunter#F1 HIGH，round63 死型本体）：契约条目 artifacts 为空（模块只需内部基线库，
+    # 如只依赖 ruoyi-common）会被 unclaimed_contract_deps 的 `not arts` 剪掉 → 推导出的内部
+    # 依赖**无处注入**、模块 pom 无人建，而旧 INFO 还谎报"已并入模板"。治：有内部依赖证据且
+    # 无 pom owner 的模块，补一条零 artifacts 脚手架条目（R57-1 物理落点取证照常适用）。
+    _entry_mods = {e["module"] for e in entries}
+    for _m in sorted(_internal_deps):
+        if _m in _entry_mods or _m not in _dirs:
+            continue
+        _pom_m = f"{_dirs[_m]}/pom.xml"
+        _owned = any(_pom_m in (
+            _norm_scope_path(f)
+            for f in (list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+                      + list(getattr(getattr(st, "scope", None), "writable", []) or [])))
+            for st in plan.subtasks)
+        if _owned:
+            continue   # 认领者路径（R58-3 owner 注入点）已拿到含内部依赖的模板
+        entries.append({"module": _m, "artifacts": []})
+        logger.info(
+            "[T5] 模块 %s 契约零第三方 artifacts 但有内部模块依赖证据 → 补脚手架条目"
+            "（否则推导结果无注入出口，round63 死型换壳）", _m)
     # ★R60-1（round60 死因）★ 聚合父注入必须**先于** early-return，且**独立于 entries**——
     # 子模块 pom 全被认领时 entries 空，但聚合父 pom（纯 packaging=pom、无代码）没人认领，
     # 若被 early-return 跳过 → `ruoyi-alarm/pom.xml` 无人建 → 所有子模块 parent 找不到 → 全员 FATAL。
@@ -1147,9 +1358,10 @@ def inject_build_scaffold_subtasks(
         if not entries:
             return injected   # 聚合父可能已注入（R60-1）
     # 注：聚合父脚手架（R57-4b/R60-1）已在 early-return 之前注入，此处不再重复。
+    # T5：内部模块依赖已在函数头单次推导（hunter#F4），此处直接并入。
     for entry in entries:
         mod = entry["module"]
-        arts = list(entry["artifacts"])
+        arts = _merge_internal_deps(list(entry["artifacts"]), _internal_deps.get(mod) or [])
         sid = f"st-scaffold-{mod}"
         if sid in existing_ids:
             continue  # 幂等兜底（正常情况下注入后 unclaimed 已清零走不到这）

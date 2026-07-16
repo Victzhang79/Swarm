@@ -222,7 +222,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # ★不丢符号★：无 file_plan/physical 证据的模块退回旧启发式（老流程零回归），绝不
     # "留 VALIDATE"——实测 C1 无主符号占比<0.4 仅告警不拦（silent-hunter F2），丢弃=符号
     # 既不落地又不被拦。跨物理模块的功能分组（module≠单一 build 单元）落主模块并告警，
-    # 结构性归一/硬打回交 Task4 模块 coherence 闸。（_NON_CODE_EXT 见函数顶部，Task2 同源）
+    # 结构性归一/硬打回由 G1 validate_module_coherence 负责。（_NON_CODE_EXT 同 Task2 源）
 
     def _mode(items: list[str]) -> str:
         """众数；平票按字典序取最小 → 确定性（items 非空）。"""
@@ -269,13 +269,15 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             if d:
                 _resolved_dir[_m], _resolved_ext[_m] = d, e2
                 # 观测：源文件跨【多个物理模块根】= 功能分组（module≠单一 build 单元）。
-                # 落主模块目录，结构性归一/硬打回交 Task4 模块 coherence 闸（不在此丢符号）。
+                # 落主模块目录，结构性归一/硬打回由 validate_module_coherence（G1，cc7be64，
+                # 已接线 validate_plan）判定——本函数只负责安置不丢符号。T5 核实：旧措辞
+                # "Task4 待接管"是闸落地前的前瞻语，round63 复盘曾被它误导成"闸未实现"。
                 _roots = {"/".join(x.split("/")[:2]) for x in _fp_paths[_m] if "/" in x}
                 if len(_roots) > 1:
                     logger.warning(
                         "[PLAN-FINISH] Task1 契约模块 %s 的 file_plan 源文件跨多个物理模块 "
-                        "%s → 落到主模块目录 %s（module≠单一 build 单元，Task4 模块 "
-                        "coherence 闸待接管归一）", _m, sorted(_roots), d)
+                        "%s → 落到主模块目录 %s（module≠单一 build 单元，一对多/多对一硬判"
+                        "由 G1 validate_module_coherence 负责）", _m, sorted(_roots), d)
                 continue
             # ② 次权威：_module_physical_dirs 物理根（含 flat 裸根，真 plan 证据）下计划
             #    源文件众数；仍无源证据 → 用物理根本身（真实证据目录胜过名字臆造幻影）。
