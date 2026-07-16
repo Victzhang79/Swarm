@@ -65,3 +65,14 @@ plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round
 - T2 purge 曝光先天缺口：preprocess 只嵌符号签名，源码全文层历史上靠失败轮 worker 碰文件顺带长出（连同幻影）。治本=preprocess 逐文件 reindex_file_atomic（与增量同管线同语义）+ 资产/三方件栈中立排除（static/vendored/minified，实测 135/624）+ 服务级 vs 单文件异常分类 + readiness/purge 脚本双闸（猎手 4 CONFIRMED 全治）。live 实测：489 文件 7806 chunks 重建 READY。
 - ★重定基线（非静默降标）★：旧 0.75 地板标定于不可复现偏置态（0.955=纯业务 Java 子集）；诚实可复现 KB 上中文查询被模板抢占稠密候选，实测 0.364/0.500。新地板 0.30/0.42 贴基线守回归；0.75 目标随 R65B-T3 战役（真混合候选并集：bm25_only_search∪稠密→融合重排 + 类型加权 + gold 集复审，task #51）达成后回调。
 - 复核记录：曾设计项目级语义道代际 prune，猎手实证与增量 updater 竞态（会删并发新鲜 chunk）→ 改逐文件 write-then-prune，项目级原语不提供。
+
+## round65c 段（首入执行深水区：死于执行层连坐，规划层三死点全过）
+- 进展面：R64-EVIDENCE sql/ 降权✓ G1 覆盖重试+外科补齐✓ T8 上游 fail-fast 4 次命中✓ 首次增量 MERGE 零冲突✓ L2 终态闸✓——round65/65b 两个死点 live 全过。
+- 死因二定案（双缺陷合谋 → 102/107 连坐放弃 → 空派发被读成「全部完成」→ 假交付）：
+  - **#52 pom 权威模板双毒株**：(a) `_inject_templates_into_pom_owners` 对**既有** pom 也无条件注入「原样写入」全量模板（主入口 1595-1615 有 CREATE-only 闸，owner 通道没有；`_deterministic_pom_template` 从不读模块基线 pom）→ worker 拿模板整体覆写毒化 reactor；(b) `MERGED_DUP_DELIM` 机器注记连同 dup 模板围栏原样拼进 description，只在签名路径剥离，worker 出口裸奔。
+  - **#53 连坐失守三连**：st-1-2 0.8s BLOCKED 于 #12 种子闸（stub 没铺 alarm-interface/pom.xml）→ failure.py 把 stub 完成的 give-up 也算死上游 → `_transitive_abandon` 102/107 → dispatch_remaining=[] → after_monitor 打「全部完成」→ 带病 MERGE → L2 挡下假交付。
+- 治本八刀（全 test-first，锁 test_r65c_plan_governance.py 10 只）：
+  - #52：owner 通道既有 pom 改「最小增量修改铁律」文本+依赖片段（**零可解析依赖也必发护栏**——猎手 CONFIRMED HIGH）；聚合器 exists 措辞闸；dedupe 只剥**尾部**围栏块（循环剥净不误伤正文）；worker 双出口 `strip_machine_annotations`（导入失败 fail-open 且 logger.error 留痕）。
+  - #53：修① 死上游豁免收紧为 **give_up_mode=="stub" 且 l1_passed** 才豁免（reviewer CRITICAL：裸 l1_passed 会把 revert 占位也豁免，round12/13 连坐判官翻红实证→已治+revert 对照锁）；修③ 连坐规模闸 `>max(10, 25%×计划)` → escalate 而非静默清盘（带机读 degraded_reason）；修④ after_monitor 有放弃时打「PARTIAL 交付，绝非全部完成」WARNING；修⑤ monitor 三本账（L1过/失败/放弃）。
+- 质量闸：双复核逮 1 CRITICAL + 1 CONFIRMED HIGH 全治；全量 4666/0/0（skip 5）；revert-check 红面 7/10（余 3=旧行为对照锁，设计使然）→ 复绿 27/0/0。
+- 遗留登记：#54 stub provenance 完备性（种子闸要求的 upstream_artifacts 覆盖）；LOW×2（owner 注入措辞 parent-version 仅 CREATE 相关=表述瑕疵；l1_pipeline.py:2980 自检提示词用原始 description=非写文件路径）。

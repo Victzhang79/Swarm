@@ -1087,9 +1087,10 @@ class WorkerExecutor(
         """trivial 子任务快速路径：合并定位+编码，最小 L1，快速产出"""
         self.phase = WorkerPhase.CODING
         self._log("trivial 快速路径：合并定位与编码")
+        from swarm.worker.prompts import strip_machine_annotations as _strip_ann
         combined = await self._run_agent(
             "这是 trivial 简单子任务，请一次完成：\n"
-            f"任务：{self.subtask.description}\n\n"
+            f"任务：{_strip_ann(self.subtask.description)}\n\n"
             "文件操作清单（务必按操作类型处理）：\n"
             f"{self._scope_ops_hint()}\n"
             f"{self._context_snippets_block()}\n"

@@ -135,6 +135,26 @@ def _cap_section(text: str, max_chars: int) -> str:
     return cut.rstrip() + f"\n…（上下文预算裁剪：省略 {len(text) - len(cut)} 字以压 prefill / 防流式超时）"
 
 
+def strip_machine_annotations(desc: str) -> str:
+    """R65C-T1 毒株(b)：剥离 brain 侧机器注记段（worker 出口单一剥离点）。
+
+    dedupe_module_scaffolds 会把重复脚手架语义以 [MERGED-DUP] 定界符追加进
+    description——该段是 brain 内部账（签名侧另有剥离），绝不能进 worker 提示：
+    trivial 快路径会把描述尾部（含注记与 dup 的模板围栏）原样写进文件
+    （round65c 实锤：中文注记进 ruoyi-alarm/pom.xml 致 XML 非法、Maven 解析崩）。"""
+    if not desc:
+        return desc
+    try:
+        from swarm.brain.contract_utils import MERGED_DUP_DELIM
+    except Exception:  # noqa: BLE001 — 剥离是防御面，导入异常时原样放行但必须留痕
+        import logging
+        logging.getLogger(__name__).error(
+            "[STRIP-ANN] MERGED_DUP_DELIM 导入失败——注记剥离已失效，"
+            "毒株(b)（注记入生成文件）防线缺位，请查循环导入/打包", exc_info=True)
+        return desc
+    return desc.split(MERGED_DUP_DELIM, 1)[0]
+
+
 def build_worker_prompt(
     subtask: SubTask,
     scope: FileScope | None = None,
@@ -329,7 +349,7 @@ def build_worker_prompt(
         )
 
     # A4(round11)：重试时把 brain 失败诊断作为硬约束块前置到描述，防换模型重试仍重蹈同类错。
-    _desc = subtask.description
+    _desc = strip_machine_annotations(subtask.description)
     _rg = (getattr(subtask, "retry_guidance", "") or "").strip()
     # 6.9-Rp5：渲染侧封顶——最大写者是 D4 rebase 注入（≤8000 字符），failure 各分支自律
     # 截断但此处是最后闸口；小模型 prefill 被诊断块挤爆比丢尾部更伤。

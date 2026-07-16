@@ -1103,6 +1103,26 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
             continue
         arts = _merge_internal_deps(arts, _internal_deps.get(mod) or [])   # T5
         _kept, _ = resolve_scaffold_artifacts(project_path, arts)
+        # R65C-T1 毒株(a)：完整模板只给 CREATE（与主入口 1595-1615 同律）——
+        # 「原样写入」对**既有** pom = 最小化重写清空基线依赖（round65c 实锤：
+        # ruoyi-common 丢 poi / ruoyi-framework 丢 web、aop starter，worker 服从性
+        # 写入 → 模块自伤 346 行编译错，换模型重试必同果）。既有 pom 只给
+        # 缺失依赖片段 + 并入措辞。
+        _pom_exists = bool(project_path) and (Path(project_path) / pom).is_file()
+        if _pom_exists:
+            # 猎手 R65C (a)：零可解析缺失依赖也必须给护栏——静默跳过=owner 在无任何
+            # 反 clobber/反属性引用指引下自由改既有 pom（R58-3 保护面整段丢弃且无日志）。
+            # 片段可以没有，护栏必须有，touched 必须记。
+            _dep_snips = "\n".join(_render_dep_block(d) for d in _kept)
+            _snip_block = (f"\n【缺失依赖片段（并入 {pom} 既有 <dependencies>）】\n```xml\n"
+                           f"{_dep_snips}\n```") if _dep_snips else ""
+            owner.description = (owner.description or "") + (
+                f"\n【既有 pom 修改铁律（{pom} 已存在）】只做最小增量修改：绝不整体替换/"
+                "重写该文件，绝不删除既有依赖/插件/属性，绝不改动既有 parent 声明"
+                "（parent 版本若需写必须是**字面量**，绝不可写成 ${{...}} 属性引用）。"
+                + _snip_block)
+            touched.append(owner.id)
+            continue
         _pgav = None
         _rg = _root_gav(project_path)
         if _rg and "/" in mdir:      # R57-7：住在聚合目录下 → parent 是聚合父，不是根
@@ -1224,7 +1244,11 @@ def _inject_one_aggregator_pom(plan, agg: str, dirs: dict[str, str],
             "\n⚠️ 它是所有子模块的父级：父 POM 不存在 → 子模块一个都编译不了"
             "（`Could not find the selected project in the reactor`）→ 必须最先落地。"
             "\n只写构建文件，不写任何业务代码。"
-            + (f"\n【权威 pom 模板（确定性生成，原样写入 {agg_pom}）】\n```xml\n{_agg_tpl}\n```"
+            + ((f"\n【权威 pom 模板（确定性生成，"
+                + (f"参照此模板补齐 {agg_pom} 的 <modules> 登记——并入既有内容，"
+                   "绝不删除既有 <modules> 条目/依赖/其他既有段"
+                   if exists else f"原样写入 {agg_pom}")
+                + f"）】\n```xml\n{_agg_tpl}\n```")
                if _agg_tpl else "")),
         intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
         difficulty=SubTaskDifficulty.TRIVIAL,
@@ -3190,6 +3214,19 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
             if _ac:
                 canon.acceptance_criteria = _ac
             _dd = (getattr(dup, "description", "") or "").strip()
+            # R65C-T1 毒株(b) 源头面：dup 描述【尾部】的权威模板围栏（含其【…】标头）
+            # 绝不随注记并入——canon 自有权威模板，双模板+注记文本会被 trivial 快路径
+            # 原样写进文件（round65c 实锤：[MERGED-DUP] 注记进 ruoyi-alarm/pom.xml 致
+            # XML 非法）。猎手(b)：只剥**尾部**围栏块（循环剥多块），不动中段引用——
+            # R58-3 认领型 dup 的自由文本里合法围栏不误伤；worker 出口另有剥离兜底。
+            import re as _re_dd
+            while True:
+                _dd2 = _re_dd.sub(
+                    r"(?:\n?【[^\n]*】)?\s*```[a-zA-Z]*\n.*?```\s*$", "", _dd,
+                    count=1, flags=_re_dd.S).strip()
+                if _dd2 == _dd:
+                    break
+                _dd = _dd2
             if _dd and _dd not in (getattr(canon, "description", "") or ""):
                 # 6.9-HF9：机器追加段用固定定界符——_subtask_signature 含 description 全文，
                 # 两轮 replan 的 dup 集不同（常态）会使 canon 描述串漂移 → 签名不等 →
