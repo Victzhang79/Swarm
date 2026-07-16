@@ -473,6 +473,53 @@ def _delete_if_table_exists(cur: Any, table: str, project_id: str) -> None:
     cur.execute(f"DELETE FROM {table} WHERE project_id = %s", (project_id,))
 
 
+# R65-T2 单一事实源：项目级【文件事实/行为】知识表（PG 侧 Layer A/C/D + 增量队列 + MR 史）。
+# purge_project_knowledge（外科清知识保项目）与 delete_project（整项目级联）共用，
+# 两处清理面绝不允许各自维护漂移。★不含 mem_*（L2/L5/L6 经验层，跨轮学习价值 +
+# 前提证伪机制自淘汰）、不含 projects/task_records（注册行与任务史）★
+_KB_KNOWLEDGE_TABLES: tuple[str, ...] = (
+    "kb_file_index",
+    "kb_symbol_index",
+    "kb_dependency_graph",
+    "kb_norms",
+    "kb_modification_log",
+    "kb_co_occurrence",
+    "kb_update_events",
+    "kb_pending_embeddings",
+    "kb_mr_history",
+)
+
+
+def purge_project_knowledge(project_id: str, conn_str: str | None = None) -> dict[str, int]:
+    """R65-T2 外科清知识：只清该项目 PG 侧文件事实/行为知识层（kb_*），
+    保留 projects 注册行、task_records 任务史与 mem_* 经验层。返回各表删除行数。
+
+    场景：E2E 每轮复用同 project_id，失败轮 worker 产物经子任务 DONE 后增量回灌
+    （dispatch._feedback_to_knowledge）进知识层，而基线重置只 git reset 磁盘 →
+    幻影模块跨轮堆叠污染规划检索（round65 实锤：20+ 种互相冲突的 alarm 模块布局）。
+
+    ★Qdrant 向量不在本函数（PG 事务）内——调用方必须用 SemanticIndexer.
+    delete_by_project 配对清理；scripts/e2e_purge_project_knowledge.py 是标准入口，
+    清完须重跑 preprocess 重建基线知识（否则 Layer A/B 为空，棕地接地退化）★"""
+    if not project_id:
+        raise ValueError("purge_project_knowledge: project_id 不能为空（防无条件全表清空）")
+    counts: dict[str, int] = {}
+    with _get_conn(conn_str) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for tbl in _KB_KNOWLEDGE_TABLES:
+                    cur.execute("SELECT to_regclass(%s)", (tbl,))
+                    row = cur.fetchone()
+                    if not row or row[0] is None:
+                        continue  # 表不存在=该子系统未启用，跳过不回滚事务（同 12.5）
+                    cur.execute(f"DELETE FROM {tbl} WHERE project_id = %s", (project_id,))
+                    counts[tbl] = cur.rowcount
+    logger.info(
+        "[R65-T2] 项目 %s PG 知识层外科清理完成: %s（mem_*/projects/task_records 保留；"
+        "Qdrant 由调用方配对清理）", project_id, counts or "全部表 0 行/不存在")
+    return counts
+
+
 def delete_project(project_id: str, conn_str: str | None = None) -> bool:
     """删除项目及其关联数据（task_records + preprocess_progress 级联删除需手动）。
 
@@ -511,17 +558,9 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                 # preprocess_progress + projects，残留 kb_*/mem_* 行成为孤立数据，长期膨胀）。
                 cur.execute("DELETE FROM task_records WHERE project_id = %s", (project_id,))
                 cur.execute("DELETE FROM preprocess_progress WHERE project_id = %s", (project_id,))
-                # 知识库 Layer A/C/D + 增量队列
-                for tbl in (
-                    "kb_file_index",
-                    "kb_symbol_index",
-                    "kb_dependency_graph",
-                    "kb_norms",
-                    "kb_modification_log",
-                    "kb_co_occurrence",
-                    "kb_update_events",
-                    "kb_pending_embeddings",
-                ):
+                # 知识库 Layer A/C/D + 增量队列 + MR 史（R65-T2：与 purge_project_knowledge
+                # 共用单一事实源常量，清理面绝不各自维护漂移；kb_mr_history 原在 D21 组）
+                for tbl in _KB_KNOWLEDGE_TABLES:
                     _delete_if_table_exists(cur, tbl, project_id)
                 # 记忆 L2/L5/L6（向量随行一并删；按 project_id 列）
                 for tbl in (
@@ -551,15 +590,10 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                     "llm_token_usage",
                 ):
                     _delete_if_table_exists(cur, tbl, project_id)
-                # D21：此前遗漏的两张项目级作用域表——
-                # swarm_project_members：成员行残留会永久污染 list_user_project_ids
-                # 白名单（被删项目 id 一直出现在用户可见集）；kb_mr_history：MR 历史
-                # 按 project_id 作用域，同属项目生命周期。
-                for tbl in (
-                    "swarm_project_members",
-                    "kb_mr_history",
-                ):
-                    _delete_if_table_exists(cur, tbl, project_id)
+                # D21：此前遗漏的项目级作用域表——swarm_project_members：成员行残留会
+                # 永久污染 list_user_project_ids 白名单（被删项目 id 一直出现在用户可见集）。
+                # （kb_mr_history 已并入上方 _KB_KNOWLEDGE_TABLES 单一事实源。）
+                _delete_if_table_exists(cur, "swarm_project_members", project_id)
                 cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
                 deleted = cur.rowcount
     # D21：DB 级联提交成功后清理该项目所有任务的 uploads 文件（事务外 best-effort，

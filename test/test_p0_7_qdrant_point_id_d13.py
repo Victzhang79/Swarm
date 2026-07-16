@@ -55,6 +55,16 @@ class FakeAsyncQdrant:
         for pid in doomed:
             del self.points[pid]
 
+    async def get_collections(self):
+        # R65-T2 起 delete_by_project 会探测 legacy project_<id> 集合——替身只模拟
+        # 单一共享集合，返回空清单即可（无 legacy 集合分支）
+        class _Cols:
+            collections = []
+        return _Cols()
+
+    async def delete_collection(self, collection_name):
+        raise AssertionError("单集合替身不应发生集合级删除")
+
     # ── 便捷查询（测试用，非 Qdrant API）──
     def payloads_for_project(self, project_id: str) -> list[dict]:
         return [rec["payload"] for rec in self.points.values()

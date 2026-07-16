@@ -677,7 +677,12 @@ class SemanticIndexer:
         )
 
     async def delete_by_project(self, project_id: str) -> None:
-        """删除某项目的所有 chunks"""
+        """删除某项目的所有 chunks（含 legacy 每项目集合）。
+
+        R65-T2 猎手 (b)：search() 的旧集合回退路径（project_<id>）在共享集合
+        清空后会【主动复活】legacy 残留向量——恰在 purge 后/重建完成前的窗口
+        把"已清"的幻影知识喂回规划检索。故删除必须两个集合成对清，
+        legacy 命中与否都留痕（不做静默未知）。"""
         client = self._client_or_raise()
         await client.delete(
             collection_name=self._collection_name,
@@ -689,6 +694,15 @@ class SemanticIndexer:
                 )
             ),
         )
+        legacy = f"project_{project_id}"
+        if await self._collection_exists(legacy):
+            # legacy 集合整个属于该项目（D13 迁移前的每项目布局）——直接删集合，
+            # 消灭 search 回退路径的复活源
+            await client.delete_collection(collection_name=legacy)
+            logger.warning(
+                "[SEMANTIC-INDEX] 项目 %s 存在 legacy 集合 %s（D13 迁移前残留）"
+                "——已随 delete_by_project 整体删除，search 旧集合回退不再有复活源",
+                project_id, legacy)
 
 
 # ──────────────────────────────────────────────
