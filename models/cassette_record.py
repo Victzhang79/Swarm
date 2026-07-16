@@ -113,11 +113,28 @@ def _chunk_to_dict(chunk: Any) -> dict:
     """把一个流式 chunk 转最小忠实切片：正文 + reasoning（additional_kwargs）+ 收尾元数据。"""
     msg = getattr(chunk, "message", None)
     if msg is not None:
-        return {
+        out = {
             "content": _jsonable(getattr(msg, "content", "")),
             "additional_kwargs": _jsonable(getattr(msg, "additional_kwargs", None)),
             "response_metadata": _jsonable(getattr(msg, "response_metadata", None)),
         }
+        # R64-T6：ChatGenerationChunk 的 finish_reason 落在 generation_info（不在
+        # response_metadata）——旧实现 msg 分支把它丢了，round64 全 58 行 finish_reason
+        # 皆 None、事后无法判截断。只在非空时带上；超大 payload（provider 塞 logprobs 等）
+        # 只留 finish_reason+截断标（猎手批2 F4：条数帽 _MAX_CHUNKS 管不住单条膨胀，
+        # 录制自诩轻量不能反成磁盘炸弹）。
+        gi = getattr(chunk, "generation_info", None)
+        if gi:
+            gj = _jsonable(gi)
+            try:
+                if len(json.dumps(gj, ensure_ascii=False)) > 4096:
+                    gj = {"finish_reason": (gi.get("finish_reason")
+                                            if isinstance(gi, dict) else None),
+                          "_truncated": True}
+            except Exception:  # noqa: BLE001 — 尺寸探测失败按原样保留（fail-open）
+                pass
+            out["generation_info"] = gj
+        return out
     return {
         "content": _jsonable(getattr(chunk, "content", "")),
         "generation_info": _jsonable(getattr(chunk, "generation_info", None)),

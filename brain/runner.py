@@ -1265,6 +1265,14 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
     if _dg:
         tu["degraded_summary"] = build_degraded_summary(_dg)
         tu["degraded_reasons"] = list(_dg)[:50]
+    # R64-T7③：FAILED@PLAN 的规划期诊断入账——round64 死于 G1 三验三拒，终态只有 error
+    # 字符串（截断 300 字），retry 轮次/违例明细全靠回读 3800 行日志考古。有 issues 才发键。
+    _pv = (state or {}).get("plan_validation_issues") or []
+    if _pv:
+        tu["plan_validation"] = {
+            "retry_count": int((state or {}).get("plan_retry_count") or 0),
+            "last_issues": [str(i)[:300] for i in list(_pv)[:8]],
+        }
     # A2 复核残留：token 闸预写的 limit_exceeded/limit 诊断键不被本账覆写丢失——
     # H3 合并原来只在 PARTIAL 分支生效，FAILED 分支整体覆写会抹掉"因预算闸而死"
     # 的机读归因（与 PARTIAL 对称补齐）。

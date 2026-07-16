@@ -339,3 +339,19 @@ def test_router_abandon_flushes_cassette_deterministically(tmp_path, monkeypatch
     assert len(lines_at_close) == 1, "弃流的 brain 调用必须在 aclose 时确定性落一行（不靠 GC）"
     assert lines_at_close[0]["n_chunks"] == 1, "弃流前只消费了 1 个 chunk"
     assert "GeneratorExit" in (lines_at_close[0]["error"] or ""), "弃流应记为 GeneratorExit"
+
+
+def test_chunk_generation_info_finish_reason_recorded():
+    """R64-T6：ChatGenerationChunk 的 finish_reason 落在 generation_info（不在
+    response_metadata）——round64 全 58 行 finish_reason 皆 None、事后无法判截断。
+    msg 分支必须带上非空 generation_info；空时不发键（不膨胀正常 chunk）。"""
+    class _GenChunk(_Chunk):
+        def __init__(self, content, generation_info=None, **kw):
+            super().__init__(content, **kw)
+            self.generation_info = generation_info
+
+    mid = cass._chunk_to_dict(_GenChunk("正文", generation_info=None))
+    assert "generation_info" not in mid, "空 generation_info 不发键"
+    last = cass._chunk_to_dict(_GenChunk("", generation_info={"finish_reason": "stop"}))
+    assert last.get("generation_info", {}).get("finish_reason") == "stop", \
+        "终止原因必须入带（round64 缺口）"
