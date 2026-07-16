@@ -291,6 +291,20 @@ class ModelConfig(BaseSettings):
     # 误杀后果也只是提前切备重试（非丢工作）。0=关闭（回退旧行为）。
     # env: SWARM_MODEL_WORKER_STREAM_WALLCLOCK_S
     worker_stream_wallclock_s: float = 420.0
+    # R63-T7：流式复读退化探测（models/degeneration.py，钩在 router._astream_inner）。
+    # round63 实锤：本地 4-bit worker 在正文里 token 级复读（`IllegalArgumentEx`×12/
+    # 整句循环），chunk 持续产出 → stall 双超时/R55 思考预算/max_tokens 全抓不到，
+    # 只能烧满 900s 墙钟（st-2-1-1-2 连烧 3×900s）且复读产物毒化源码。触发即 abort 流
+    # 并抛 StreamDegenerationError（capability）：非链尾 with_fallbacks 同请求切下一
+    # 模型；链尾冒泡 degeneration_hard_fail → FINDING-12 force_strong 升最强模型。
+    # 覆盖率/多样性等成对阈值是模块常量（改动必须重跑 test_r63_t7 双向校准），这里只
+    # 开总闸/窗口/重复次数三类粗旋钮。env: SWARM_MODEL_STREAM_DEGEN_ENABLED /
+    # SWARM_MODEL_STREAM_DEGEN_WINDOW_CHARS / SWARM_MODEL_STREAM_DEGEN_WORD_REPEATS /
+    # SWARM_MODEL_STREAM_DEGEN_SEG_REPEATS（均已登记 env_registry）
+    stream_degen_enabled: bool = True
+    stream_degen_window_chars: int = 1200
+    stream_degen_word_repeats: int = 8
+    stream_degen_seg_repeats: int = 4
 
     # ── I1 模型能力分级（Brain 编排约束随模型能力调整）──────────────
     # tier_enabled 默认 False = 永远 standard = 现有硬编码约束上限，行为零变化（安全闸门）。

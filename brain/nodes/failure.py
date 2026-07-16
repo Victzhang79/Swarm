@@ -1568,11 +1568,14 @@ async def _handle_failure_impl(state: BrainState) -> dict:
 
     # FINDING-12：拒答/步数耗尽(refusal_hard_fail)的子任务，重试强制走【最强模型】(40B 256k)，
     # 而非更弱 fallback——步数耗尽是小模型 agent 循环不收敛，换更弱只会更糟。
+    # R63-T7：复读退化(degeneration_hard_fail)同通路——round63 实锤 st-2-1-1-2 同模型
+    # 跨 4 次重启反复复读（同上下文大概率复现），链内 fallback 已试过更弱备选仍冒泡到
+    # 这里，只有升最强模型才有意义。
     force_strong = dict(state.get("subtask_force_strong", {}))
     for _fid in failed_ids:
         _res = subtask_results.get(_fid)
         _src = (getattr(_res, "l1_details", {}) or {}).get("l1_decision_source") if _res else None
-        if _src == "refusal_hard_fail":
+        if _src in ("refusal_hard_fail", "degeneration_hard_fail"):
             force_strong[_fid] = True
 
     if deepest > max_retries + 1:

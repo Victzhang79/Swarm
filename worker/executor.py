@@ -363,14 +363,17 @@ class WorkerExecutor(
             self._log(f"执行异常: {e}")
             self._l1_passed_flag = False  # 异常路径：沙箱可能脏，不归还复用
             # P2：分类失败类型，供 handle_failure 决定退避重试(transient) 还是换模型(capability)。
+            # R63-T7：l1_details 组装收拢到 exception_l1_details——复读退化（链尾冒泡）
+            # 在此打 degeneration_hard_fail，brain 据此 force_strong 升档。
             from swarm.models.errors import classify_failure
+            from swarm.worker.l1_verdict import exception_l1_details
             failure_class = classify_failure(e)
             return self._make_output(
                 diff="",
                 summary=f"执行异常: {e}",
                 confidence=Confidence.LOW,
                 l1_passed=False,
-                l1_details={"error": str(e), "failure_class": failure_class},
+                l1_details=exception_l1_details(e, failure_class),
             )
         finally:
             from swarm.tools.build_tools import (

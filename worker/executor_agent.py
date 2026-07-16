@@ -174,6 +174,15 @@ class _AgentLoopMixin:
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
             raise
         except Exception as exc:
+            # R63-T7 猎手 F1（CRITICAL）：StreamDegenerationError 的 message 内嵌任意复读
+            # token（needle）——若恰含 "recursion"（模型卡壳时念叨 RecursionError/infinite
+            # recursion 很常见），会被下方无词边界的子串启发式吞成"撞迭代上限"优雅返回，
+            # 升档信号（degeneration_hard_fail→force_strong）整条丢失。已分类异常必须
+            # 先 isinstance 短路原样上抛，绝不进启发式。
+            from swarm.models.errors import StreamDegenerationError
+            if isinstance(exc, StreamDegenerationError):
+                _ledger.end_inflight_scope(_scope, settle_leaked=True)
+                raise
             # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
             # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
             # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。

@@ -14,11 +14,16 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 
 
-class _Chunk:
-    def __init__(self, content: str = ""):
-        self.content = content
+def _Chunk(content: str = "") -> ChatGenerationChunk:
+    """真实生产形态（R63-T7 保真升级）：ChatOpenAI._astream 真正 yield 的是
+    ChatGenerationChunk——它【没有 .content 属性】（正文在 .text / .message.content）。
+    旧假 chunk 自带 .content → 测试绿但生产里 content_seen 恒 False，R55 的
+    「正文已开吐绝不重开」保护对真实流失效。此后所有流式假件必须用真类型。"""
+    return ChatGenerationChunk(message=AIMessageChunk(content=content))
 
 
 @pytest.mark.asyncio
@@ -79,7 +84,7 @@ async def test_chain_tail_degrades_thinking_as_last_resort(monkeypatch):
     )
     out = ""
     async for c in llm._astream([]):
-        out += str(getattr(c, "content", "") or "")
+        out += c.text
 
     assert out == "最终答案", "★ 降级重开必须无损：下游仍拿到完整正文"
     assert len(calls) == 2, "应且仅应重开一次"
@@ -112,7 +117,7 @@ async def test_content_started_then_slow_is_never_restarted(monkeypatch):
     )
     out = ""
     async for c in llm._astream([]):
-        out += str(getattr(c, "content", "") or "")
+        out += c.text
     assert out == "正文"
     assert len(calls) == 1, "★ 正文已开吐 → 绝不重开（重开会丢已交付的 chunk）"
 

@@ -429,6 +429,48 @@ class ModelProvider(Protocol):
     def get_chat_model(self, model_name: str, temperature: float = 0.2) -> BaseChatModel: ...
 
 
+def _gen_chunk_text(chunk: Any) -> str:
+    """取流式 chunk 的正文文本（R63-T7 单一权威抽取点）。
+
+    实锤：ChatOpenAI._astream 真正 yield 的是 ChatGenerationChunk——它【没有 .content
+    属性】，正文在 .text。旧代码 getattr(chunk,'content') 恒取空 → content_seen 永假
+    → R55「正文已开吐绝不重开」保护对真实流失效（老测试用自带 .content 的假 chunk
+    假绿）。此处 .text 权威、.content 兜底（兼容非标准 chunk 形态）。
+    """
+    t = getattr(chunk, "text", None)
+    # 猎手 F3：当前 langchain 的 .text 返回 TextAccessor（str 子类且实现 __call__，兼容旧
+    # 方法式调用）——裸 callable(t) 恒真会让每个 chunk 都走 t() 触发弃用告警（实测每流
+    # 上百条），且 langchain 2.0 移除 __call__ 后会静默掉进 .content 兜底。只有非 str 的
+    # 真方法才需要调用。
+    if callable(t) and not isinstance(t, str):
+        try:
+            t = t()
+        except Exception:  # noqa: BLE001
+            t = None
+    if isinstance(t, str) and t:
+        return t
+    c = getattr(chunk, "content", None)
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        # 猎手 F4：多模态 content block 形态（list）直接判空会让真实正文被当空——
+        # content_seen 恒假的老 bug 换形态复活。拼接 str 片段与 text block。
+        return "".join(
+            p if isinstance(p, str) else p.get("text", "")
+            for p in c
+            if isinstance(p, str) or (isinstance(p, dict) and isinstance(p.get("text"), str))
+        )
+    return ""
+
+
+def _chunk_reasoning_text(chunk: Any) -> str:
+    """取流式 chunk 的思维链增量（reasoning_content，云端 reasoning 模型才有）。"""
+    msg = getattr(chunk, "message", None)
+    ak = getattr(msg, "additional_kwargs", None) or {}
+    rc = ak.get("reasoning_content")
+    return rc if isinstance(rc, str) else ""
+
+
 class _DualTimeoutChatOpenAI(ChatOpenAI):
     """治本 A：流式【双超时拆分】——首 token 与解码间隔本质不同，不该共用一个阈值。
 
@@ -474,6 +516,15 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     # 0=不闸（本地默认：只有时间成本，vLLM 自身排队）。
     swarm_provider_id: str = ""
     swarm_provider_concurrency: int = 0
+    # R63-T7：流式复读退化探测（models/degeneration.py）。round63 实锤：本地 4-bit 量化
+    # worker 在正文里 token 级复读（`IllegalArgumentEx`×12/整句循环），chunk 持续产出 →
+    # stall/思考预算/max_tokens 全抓不到，只能烧满 900s 墙钟（st-2-1-1-2 连烧 3×900s）。
+    # 触发即 aclose + 抛 StreamDegenerationError（capability，绝不 transient）：非链尾
+    # 由 with_fallbacks 同请求内切下一模型；链尾冒泡 degeneration_hard_fail → force_strong。
+    swarm_degen_enabled: bool = False
+    swarm_degen_window: int = 1200
+    swarm_degen_word_repeats: int = 8
+    swarm_degen_seg_repeats: int = 4
 
     async def _astream(self, *args: Any, **kwargs: Any):  # type: ignore[override]
         # Task#10：模型层 LLM 录制钩（env 门控 + 仅 brain）。默认关（未设
@@ -561,6 +612,18 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
         last_chunk: Any = None
         content_seen = False    # R55-1：是否已吐出正文（未吐 → 仍在思考阶段，abort 无损）
         thinking_off = False    # R55-1：已就地降级过一次（绝不无限重开）
+        # R63-T7：正文/思维链各一个复读探测器（窗口独立，互不污染）。
+        _degen = _degen_reason = None
+        if self.swarm_degen_enabled:
+            from swarm.models.degeneration import StreamRepetitionDetector
+
+            def _new_det() -> StreamRepetitionDetector:
+                return StreamRepetitionDetector(
+                    window_chars=self.swarm_degen_window,
+                    word_repeats=self.swarm_degen_word_repeats,
+                    seg_repeats=self.swarm_degen_seg_repeats,
+                )
+            _degen, _degen_reason = _new_det(), _new_det()
         while True:
             to = self.swarm_first_token_timeout if first else self.swarm_inter_chunk_timeout
             try:
@@ -614,8 +677,62 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             first = False
             n_chunks += 1
             now = _monotonic()
-            if not content_seen and str(getattr(chunk, "content", "") or ""):
+            # R63-T7-0：正文判据修正——ChatGenerationChunk 无 .content 属性，旧
+            # getattr(chunk,'content') 恒空 → content_seen 永假 → 下方 R55 保护
+            # 对真实流失效（正文已开吐仍会被判 reasoning runaway 重开/切备）。
+            _ctext = _gen_chunk_text(chunk)
+            if not content_seen and _ctext:
                 content_seen = True    # 正文已开吐 → 思考阶段结束，此后 abort 不再无损
+            # R63-T7：复读退化探测——正文通道优先（round63 全部实锤在正文），
+            # 思维链通道兜底（比 R55 的 600s 时间预算快得多）。触发即 abort：
+            # 复读产物是毒（st-2-1-1 把截断类名写进源码毒化下游编译），快败优于烂产出。
+            if _degen is not None:
+                # 猎手 F2：探测器是优化性质的闸，自身故障绝不许杀死健康流——fail-open
+                # 停用本流剩余探测并 WARNING（可观测，非静默 pass），流照常透传。
+                _dv = None
+                try:
+                    _dv = _degen.feed(_ctext) if _ctext else None
+                    if _dv is None:
+                        _rtext = _chunk_reasoning_text(chunk)
+                        if _rtext:
+                            _dv = _degen_reason.feed(_rtext)
+                except Exception as _dg_exc:  # noqa: BLE001
+                    logger.warning(
+                        "[stream] %s%s R63-T7 复读探测器内部异常（fail-open：本流剩余部分"
+                        "停用探测，健康流不受影响；若持续出现请修 degeneration.py）: %r",
+                        _llm_node_tag(), getattr(self, "model_name", None) or "model",
+                        _dg_exc,
+                    )
+                    _degen = _degen_reason = None
+                    _dv = None
+                if _dv is not None:
+                    try:
+                        await agen.aclose()  # 关底层流，让推理端 abort 解码、释放 GPU
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.warning(
+                        "[stream] %s%s R63-T7 复读退化：channel=%s needle=%r ×%d "
+                        "coverage=%.0f%%（%.0fs / %d chunk）→ abort 流并按 capability "
+                        "换挡（非链尾切下一模型；链尾冒泡 force_strong 升档）。样本尾: %r",
+                        _llm_node_tag(), getattr(self, "model_name", None) or "model",
+                        _dv.channel, _dv.needle[:60], _dv.count, _dv.coverage * 100,
+                        now - t0, n_chunks, _dv.sample[-120:],
+                    )
+                    from swarm.models.errors import StreamDegenerationError
+
+                    # 铁律：首行绝不含 timeout/stall 等 transient 关键词（见 errors.py）；
+                    # 复读证据只放次行与 evidence。
+                    raise StreamDegenerationError(
+                        "stream degeneration: 流式输出复读退化（模型能力问题，换模型档）\n"
+                        f"channel={_dv.channel} needle={_dv.needle[:60]!r} count={_dv.count} "
+                        f"coverage={_dv.coverage} model={getattr(self, 'model_name', '')}",
+                        evidence={
+                            "channel": _dv.channel, "needle": _dv.needle,
+                            "count": _dv.count, "coverage": _dv.coverage,
+                            "sample": _dv.sample,
+                            "model": str(getattr(self, "model_name", "") or ""),
+                        },
+                    )
             # R55-1（round55 实锤）：**思考阶段**预算——正文一个字都还没吐、思维链却已烧穿预算
             # → 模型在原地打转（实测 EXTRACT_REQ：1471s / 79605 chunk，前 400+ chunk 无一正文）。
             # 此刻 abort 是【无损】的（下游没收到任何 chunk）→ 就地关 thinking、用**同一模型**重开流：
@@ -662,6 +779,9 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                 t0 = _monotonic()     # 墙钟/心跳按新流重算（旧流成果已丢弃，不该继续计入）
                 last_beat = t0
                 n_chunks = 0
+                if _degen is not None:  # R63-T7：新流旧窗不共账（防跨流拼接假阳性）
+                    _degen.reset()
+                    _degen_reason.reset()
                 continue
             # 总时长看门狗（第三条腿）：稳定吐但吐不完的 runaway，stall 看门狗与 max_tokens 都拦不住，
             # 累计超预算即判定 runaway → 抛 transient（早 fail-fast 切 fallback，不空烧到自然 stall）。
@@ -764,6 +884,11 @@ class EndpointProvider:
                 float(getattr(self.config, "first_token_timeout", self.config.stream_chunk_timeout)),
                 float(getattr(self.config, "inter_chunk_timeout", 30.0)),
                 _resolve_provider_concurrency(self.provider),  # B6：并发闸参数入缓存键
+                # R63-T7：复读探测参数入缓存键（与超时族同口径，全部影响行为的参数须覆盖）
+                bool(getattr(self.config, "stream_degen_enabled", True)),
+                int(getattr(self.config, "stream_degen_window_chars", 1200)),
+                int(getattr(self.config, "stream_degen_word_repeats", 8)),
+                int(getattr(self.config, "stream_degen_seg_repeats", 4)),
                 _cb_token,
             )
             with _CHAT_MODEL_CACHE_LOCK:
@@ -824,6 +949,13 @@ class EndpointProvider:
         # SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY（默认 6）；本地缺省 0=不闸（时间成本口径）。
         _kwargs["swarm_provider_id"] = self.provider.id
         _kwargs["swarm_provider_concurrency"] = _resolve_provider_concurrency(self.provider)
+        # R63-T7：流式复读退化探测参数（brain/worker、cloud/local 全路径同源透传）。
+        _kwargs["swarm_degen_enabled"] = bool(getattr(self.config, "stream_degen_enabled", True))
+        _kwargs["swarm_degen_window"] = int(getattr(self.config, "stream_degen_window_chars", 1200))
+        _kwargs["swarm_degen_word_repeats"] = int(
+            getattr(self.config, "stream_degen_word_repeats", 8))
+        _kwargs["swarm_degen_seg_repeats"] = int(
+            getattr(self.config, "stream_degen_seg_repeats", 4))
         model = _DualTimeoutChatOpenAI(**_kwargs)
         if _cache_key is not None:
             with _CHAT_MODEL_CACHE_LOCK:

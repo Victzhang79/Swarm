@@ -41,6 +41,25 @@ class TransientInfraError(Exception):
     """
 
 
+class StreamDegenerationError(Exception):
+    """R63-T7：流式输出复读退化（同标识符/句在滑窗内高密度重复，见 models/degeneration.py）。
+
+    与 TransientInfraError 语义相反：这是【模型能力问题】——同一模型同一上下文
+    大概率复现（round63 st-2-1-1-2 跨 4 次重启反复复读），退避重试同模型只会白烧。
+    classify_failure 按 isinstance 归 CAPABILITY → 非链尾由 with_fallbacks 同请求内
+    切下一模型；链尾冒泡为子任务失败 + l1_decision_source=degeneration_hard_fail →
+    brain FINDING-12 通路 force_strong 升最强模型重派。
+
+    铁律：message 首行绝不含 timeout/stall/connect 等 transient 关键词——否则
+    _breaker_error_transient 会把它喂进熔断（健康模型被摘）、字符串兜底分类会误归
+    transient。复读证据（可能含任意 token）只放 evidence 与次行。
+    """
+
+    def __init__(self, message: str, *, evidence: dict | None = None) -> None:
+        self.evidence = dict(evidence or {})
+        super().__init__(message)
+
+
 # 拒答/截断标记（模型能力问题，非基础设施）——与 executor._REFUSAL_MARKERS 对齐。
 _REFUSAL_MARKERS = (
     "sorry, need more steps",
@@ -114,6 +133,10 @@ def classify_failure(err: BaseException | str | None) -> str | None:
 
     # 1) 异常对象：isinstance 优先
     if isinstance(err, BaseException):
+        # R63-T7：复读退化必须先于一切 transient 判据——它的 evidence/message 次行可能
+        # 含任意复读 token（哪怕撞上 "timeout" 字样也绝不能归 transient 退避同模型）。
+        if isinstance(err, StreamDegenerationError):
+            return CAPABILITY
         # 阶段0 复核 H2（2026-07-09）：裸 TimeoutError/asyncio.TimeoutError 的 str() 为空，
         # 文本特征全绕过 → 最典型的超时形态被判 None。TimeoutError 天然是基建瞬时
         # （asyncio.TimeoutError/socket.timeout 自 3.10 起均为其别名/子类）。

@@ -332,6 +332,23 @@ def evaluate_l1(
     )
 
 
+def exception_l1_details(exc: BaseException, failure_class: str | None) -> dict:
+    """R63-T7：worker execute() 异常路径的 l1_details 组装（单一权威）。
+
+    StreamDegenerationError（流式复读退化，链尾无模型可切时冒泡至此）打
+    l1_decision_source=degeneration_hard_fail——brain FINDING-12 据此 force_strong
+    升最强模型重派（与 refusal_hard_fail 同通路：都是"同模型重试只会更糟"的能力信号）。
+    普通异常绝不冒充该标记（否则一切 infra 异常都被升档，烧穿最强模型配额）。
+    """
+    details: dict = {"error": str(exc), "failure_class": failure_class}
+    from swarm.models.errors import StreamDegenerationError
+    if isinstance(exc, StreamDegenerationError):
+        details["l1_decision_source"] = "degeneration_hard_fail"
+        if exc.evidence:
+            details["degeneration_evidence"] = dict(exc.evidence)
+    return details
+
+
 def missing_seed_artifacts(artifacts: list[str], local_root: "Path") -> list[str]:
     """#12 治本(B fail-closed seed)·纯函数：返回【上游产物里缺失于本地树】的相对路径（去重保序）。
 

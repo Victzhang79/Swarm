@@ -18,6 +18,13 @@ REGISTERED_ENVS: dict[str, str] = {
     # 看门狗都拦不住，墙钟兜底要先烧满 25 分钟。超此预算且尚未吐出正文 → 就地关 thinking
     # 用同一模型重开流（无损，下游无感）。0=关闭。
     "SWARM_MODEL_BRAIN_REASONING_PHASE_BUDGET_S": "config/settings.py:brain_reasoning_phase_budget_s",
+    # R63-T7：流式复读退化探测（正文/思维链 token 级复读 → abort 流 + capability 换挡）。
+    # enabled=总闸（0=回退旧行为：只靠 900s 墙钟/迭代上限兜底）；window/repeats 粗旋钮，
+    # 覆盖率/多样性成对阈值固化在 models/degeneration.py（防只调一半打破误杀/漏杀平衡）。
+    "SWARM_MODEL_STREAM_DEGEN_ENABLED": "config/settings.py:stream_degen_enabled",
+    "SWARM_MODEL_STREAM_DEGEN_WINDOW_CHARS": "config/settings.py:stream_degen_window_chars",
+    "SWARM_MODEL_STREAM_DEGEN_WORD_REPEATS": "config/settings.py:stream_degen_word_repeats",
+    "SWARM_MODEL_STREAM_DEGEN_SEG_REPEATS": "config/settings.py:stream_degen_seg_repeats",
     "SWARM_MAVEN_LOOKUP_TIMEOUT_S": "brain/maven_registry.py:_HTTP_TIMEOUT_S",
     "SWARM_ADVERSARIAL_MAX_ROUNDS": "brain/nodes/adversarial.py:51",
     "SWARM_ADVERSARIAL_REVIEW_TIMEOUT": "brain/nodes/adversarial.py:61",
