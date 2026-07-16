@@ -170,7 +170,7 @@ def test_self_review_env_var_disable():
 
 
 def test_self_review_no_llm():
-    """llm=None 时自检跳过。"""
+    """llm=None 时自检跳过（R63-T9 后需显式 opt-in 才走到该分支）。"""
     from swarm.worker.l1_pipeline import run_l1_pipeline
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -178,10 +178,13 @@ def test_self_review_no_llm():
         subtask = _make_subtask()
         diff = _simple_diff()
         os.environ.pop("SWARM_WORKER_L1_LINT", None)
-        os.environ.pop("SWARM_WORKER_L1_SELF_REVIEW", None)
-        ok, details = run_l1_pipeline(tmp, subtask, diff, llm=None)
-        assert details["self_review"]["status"] == "skipped"
-        assert details["self_review"]["reason"] == "llm not provided"
+        os.environ["SWARM_WORKER_L1_SELF_REVIEW"] = "true"
+        try:
+            ok, details = run_l1_pipeline(tmp, subtask, diff, llm=None)
+            assert details["self_review"]["status"] == "skipped"
+            assert details["self_review"]["reason"] == "llm not provided"
+        finally:
+            del os.environ["SWARM_WORKER_L1_SELF_REVIEW"]
     print("  ✅ llm=None 时自检跳过")
 
 
@@ -216,16 +219,19 @@ def test_self_review_llm_finds_issues():
     assert len(result["issues"]) == 1
     print("  ✅ mock LLM 自检发现问题")
 
-    # 集成：自检失败不硬阻断流水线
+    # 集成：自检失败不硬阻断流水线（R63-T9 后需显式 opt-in 才执行自检）
     with tempfile.TemporaryDirectory() as tmp:
         _setup_project(tmp)
         os.environ.pop("SWARM_WORKER_L1_LINT", None)
-        os.environ.pop("SWARM_WORKER_L1_SELF_REVIEW", None)
-        ok, details = run_l1_pipeline(tmp, subtask, _simple_diff(), llm=mock_llm)
-        # 流水线应通过（自检不硬阻断）
-        assert ok is True, f"自检不应硬阻断: {details}"
-        assert details["self_review"]["passed"] is False
-        assert "note" in details["self_review"]
+        os.environ["SWARM_WORKER_L1_SELF_REVIEW"] = "true"
+        try:
+            ok, details = run_l1_pipeline(tmp, subtask, _simple_diff(), llm=mock_llm)
+            # 流水线应通过（自检不硬阻断）
+            assert ok is True, f"自检不应硬阻断: {details}"
+            assert details["self_review"]["passed"] is False
+            assert "note" in details["self_review"]
+        finally:
+            del os.environ["SWARM_WORKER_L1_SELF_REVIEW"]
     print("  ✅ 自检失败不硬阻断流水线")
 
 
@@ -270,7 +276,7 @@ def test_pipeline_full_success():
 
 
 def test_pipeline_backward_compatible():
-    """不传 llm 也能跑（向后兼容）。"""
+    """不传 llm 也能跑（向后兼容）；默认（无 env）自检 disabled（R63-T9）。"""
     from swarm.worker.l1_pipeline import run_l1_pipeline
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -282,7 +288,7 @@ def test_pipeline_backward_compatible():
         ok, details = run_l1_pipeline(tmp, subtask, diff)
         assert "lint" in details
         assert "self_review" in details
-        assert details["self_review"]["status"] == "skipped"
+        assert details["self_review"]["status"] == "disabled"
     print("  ✅ 不传 llm 向后兼容")
 
 

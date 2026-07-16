@@ -237,6 +237,11 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_WORKER_IMPORT_REPAIR": "worker/l1_pipeline.py:2764",
     "SWARM_WORKER_JVM_NS_FIX": "worker/executor_sync.py:864",
     "SWARM_WORKER_L1_FORMAT": "worker/l1_pipeline.py:2942",
+    # R63-T9②：fix 轮 turn 连续性——上一产码轮对话（裁剪后）延续进修复轮，确定性
+    # build 错回喂同一对话。CONTINUITY=false 回退旧行为（全新单消息轮）；
+    # BUDGET_CHARS=携带预算（默认 24000，本地小窗 worker 可调小）。
+    "SWARM_WORKER_FIX_TURN_CONTINUITY": "worker/executor_agent.py:_fix_carry_messages",
+    "SWARM_WORKER_FIX_CARRY_BUDGET_CHARS": "worker/executor_agent.py:_fix_carry_messages",
     "SWARM_WORKER_L1_LINT": "worker/l1_pipeline.py:2956",
     "SWARM_WORKER_L1_LINT_GATE": "worker/l1_pipeline.py:2968",
     "SWARM_WORKER_L1_MAX_FILES": "worker/l1_pipeline.py:1202",

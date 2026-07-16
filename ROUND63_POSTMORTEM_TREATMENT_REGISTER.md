@@ -477,3 +477,44 @@ failing_test 闸未收口于短路→and not _ff_kind；F4=判据通道不可追
 **revert-check**：版本闸/DEBUG 闸/scope 通道三处回退全红✓。
 **已知留观**：artifactId≠目录末段的模块漏映射（降级旧行为，注释已划界）；CODING 期（首轮
 build 前）无从预知阻断仍会烧（brain 重投前清洗是 T3 sweep 臂领域）。16 测试。
+
+## T9 调查结论（2026-07-16，一路取证：worker 全部 4 个自评点 × round63 日志定位）
+**register 两句处方里一半已被既有机制覆盖（如实记录，不重复治）**：
+- 「compile 已失败就短路自评」**已成立**：L1.2/L1.2.1 失败在 L1.4 之前 `return False`
+  （l1_pipeline.py:3528/3781）；verify agent 步由 C5（det_ok≠None 跳过，executor.py:103）
+  + T8④（BLOCKED 跳过，:105）短路。round63 日志里"BLOCKED 仍烧 verify 95 迭代产假 PASS
+  叙事"（st-7-1 带 ✅ 文件清单、st-8 撞 95 迭代）全是 **T8 修复前**的运行——当前 HEAD 已治。
+- 「advisory 化」**主体已成立**：L1.4 自检结论恒不影响返回（l1_pipeline.py 恒 return True）；
+  Phase-3 循环 det≠None 时 llm_ok 钉 True（executor.py:755）；Phase-4 的 llm_ok 是
+  run_l1_pipeline **确定性返回值**（非 self_review），deterministic_llm_conflict 是双确定性
+  证据冲突非 LLM 杀好产出（round63 计数=0）。唯一 LLM 决定权残留=no_op_benign
+  （l1_verdict.py:299 真 no-op 回退弱自报）——**决定不动**：无产出无确定性证据时唯一信号
+  就是自报，round63 计数=0，强行去 LLM 化是过激处方（G4/G7/G9/G12 教训）。
+**T9 真正的两个治本落点**：①Phase-4 对 det_ok=True 的通过任务仍烧 1 次 worker LLM 自检
+产假 ✅ 清单（每个通过 worker 一行"确定性闸门 + LLM 自检通过"）；②确定性 build 错只能
+跨 turn 经全新单条 human 消息回喂（executor_agent.py ainvoke 单消息模型），模型丢失自己
+上一轮改动/推理，C7 记忆块只是有损代偿——同一 cannot find symbol 反复重探。
+
+### T9 完成（2026-07-16，test-first + 对抗双复核 + 全量套件）
+**治本**：①L1.4 自检默认关闭（l1_self_review_enabled，SWARM_WORKER_L1_SELF_REVIEW 默认
+true→false，opt-in 恢复；executor._self_review_llm 关闭时连 ModelRouter 都不取；disabled
+进 details 可观测）；②fix 轮 turn 连续性（新模块 worker/turn_continuity.py
+trim_carry_messages：AI(tool_calls)+tool 结果成组保留/丢弃、args 绝不截断、首消息必须
+human、绝不改原件、预算超限丢最旧组、单组仍超放弃 carry；_run_agent 新参
+continue_messages 前置历史+telemetry 只吃新增切片+成功产码轮更新 carry 源、产码步开头
+先清防 stale；verify 循环 fix 步接线 _fix_carry_messages；env
+SWARM_WORKER_FIX_TURN_CONTINUITY 默认开/SWARM_WORKER_FIX_CARRY_BUDGET_CHARS=24000）。
+**亲核的承重细节**：langchain_openai 序列化 .tool_calls 优先于 additional_kwargs 且
+reasoning 键不回发（预算账实相符）；LangGraph checkpointer=False + add_messages 空左值
+纯追加（telemetry 切片精确）；pre_model_hook 写 llm_input_messages 不动 messages。
+**对抗双复核（reviewer APPROVE 0C/0H + 猎手 5 条）全治全锁**：猎手 F1=无 carry 源/超时/
+撞上限的 carry 断链零观测→三处日志（撞上限正是 T9 要治的病理场景，断链必须可见）；
+F2=预算 env 坏值静默回退→WARNING；F3=既有 clobber：deadline 耗尽的
+worker_deadline_exhausted 被 disabled 文案覆盖→elif 优先保留（测试先红实锤再修）；
+R-MED=reasoning_content 不计预算→亲核 wire 不回发（非真超支），仍纵深剥离携带副本；
+F4=str(args) 是 json 近似→注释固化"软上限"口径；B2 批次 carry 只留末批=设计边界（最近
+工具活动最相关，预算下累积不可行）。
+**revert-check**：stash 回退 HEAD 下 17/26 红（余 9 条为新模块纯函数测试）✓ F3 天然
+RED→GREEN✓。**已知留观**：撞迭代上限/超时的轮次无对话可延续（LangGraph 异常不带
+state，checkpointer=False by design round29）→该轮后回退 C7 记忆块，日志可见；trivial
+通道无 fix 循环无需接线（reviewer 核清）。26+3 既有测试更新。

@@ -236,6 +236,9 @@ class WorkerExecutor(
         # P1-D：fix 循环 no-progress 早停——记上一轮确定性失败签名 + 连同次数。
         self._last_fail_sig: str = ""
         self._same_fail_streak: int = 0
+        # R63-T9②：turn 连续性 carry 源——最近一次成功产码轮（code/code-batch/fix）
+        # 的全量对话，fix 轮取用时经 trim_carry_messages 裁剪。失败轮清空。
+        self._continuity_messages: list | None = None
 
         # 归一化 scope：Brain 有时把【已存在】文件误判进 create_files（如"给现有
         # ruoyi.js 加函数"），create_files 走"新建"路径(不上传/不读取原内容)会丢内容。
@@ -831,9 +834,13 @@ class WorkerExecutor(
                     # C5：verify 步可能被跳过（det 已有结论）——fix 证据以确定性 digest 为主
                     symbol_hint = await self._symbol_grounding_hint(
                         verify_result or "", l1_details)
+                    # R63-T9②：延续上一产码轮对话（裁剪后），把确定性 build 错回喂
+                    # 进【同一对话】——模型看得到自己上一轮的改动与推理，不再全新
+                    # 单消息从零重探（st-8 撞 95 迭代成因之一；C7 记忆块仍兜底）。
                     fix_result = await self._run_agent(
                         self._build_fix_prompt(verify_result or "", l1_details, symbol_hint),
                         step=f"fix-{fix_round}",
+                        continue_messages=self._fix_carry_messages(),
                     )
                     self._log(f"修复完成: {fix_result[:200]}")
 
@@ -846,6 +853,24 @@ class WorkerExecutor(
                     break
 
         return l1_passed, l1_details, verdict
+
+    def _self_review_llm(self):
+        """R63-T9①：Phase-4 advisory 自检的 LLM 句柄——默认 None（不烧）。
+
+        round63 实锤：L1.4 自检结论从不影响 verdict（pipeline 恒 return True；
+        evaluate_l1 的 llm_ok 是 pipeline 确定性返回值），却在每个通过的子任务上烧
+        1 次 worker LLM 调用产假 ✅ 清单。默认关闭时连 ModelRouter 都不碰；
+        SWARM_WORKER_L1_SELF_REVIEW=true 显式恢复（与 pipeline 内 L1.4 闸同源）。
+        """
+        from swarm.worker.l1_pipeline import l1_self_review_enabled
+        if not l1_self_review_enabled():
+            return None
+        try:
+            from swarm.models.router import ModelRouter
+            return ModelRouter().get_worker_llm(strategy="cost_optimized")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
+            return None
 
     async def _phase_produce(
         self, l1_passed: bool, l1_details: dict, prior: L1Verdict | None = None,
@@ -899,12 +924,8 @@ class WorkerExecutor(
                 if det_ok is True and output.diff:
                     from swarm.worker.l1_pipeline import run_l1_pipeline
 
-                    l1_llm = None
-                    try:
-                        from swarm.models.router import ModelRouter
-                        l1_llm = ModelRouter().get_worker_llm(strategy="cost_optimized")
-                    except Exception as exc:  # noqa: BLE001
-                        self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
+                    # R63-T9①：自检 LLM 默认不取（advisory 空烧），env opt-in 恢复。
+                    l1_llm = self._self_review_llm()
                     # D53：带 LLM 自检的 pipeline（同步 HTTP，可长跑）同样卸线程
                     llm_ok, llm_details = await asyncio.to_thread(
                         run_l1_pipeline,

@@ -11,9 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 logger = logging.getLogger(__name__)
+
+
+def _is_continuity_step(step: str) -> bool:
+    """R63-T9②：该步的对话是否可作下一 fix 轮的延续源。
+
+    只有【产码步】（code / code-batch-N / fix-N）参与——模型改代码的推理与工具轨迹
+    是修复轮最需要的上下文；verify/locate/produce 步框架不同（验证叙事/定位探索），
+    延续进修复轮只添噪，且 verify 步夹在 code 与 fix 之间，纳入会冲掉真正的产码对话。
+    """
+    return step == "code" or step.startswith("code-batch-") or step.startswith("fix-")
 
 
 def _budget_banner(limit: int, remaining_s: float) -> str:
@@ -115,15 +126,25 @@ class _AgentLoopMixin:
         return max(0.0, self.max_execution_time - (time.monotonic() - self.start_time))
 
     async def _run_agent(self, human_message: str, *, step: str = "react",
-                         max_steps: int | None = None) -> str:
+                         max_steps: int | None = None,
+                         continue_messages: list | None = None) -> str:
         """调用 Agent 执行一步并返回结果（受总执行时间预算约束）。
 
         max_steps：本步专属 recursion_limit 上限（默认用整体 max_iterations）。LOCATING 等
         "理解/定位"阶段用更紧的 cap，逼模型少探索直接产出（RUN12 实证：预读注入了但模型仍
         探索 167-286s 烧光预算）。撞 cap 非硬失败——下方 GraphRecursionError 优雅返回，交 CODING。
+
+        continue_messages（R63-T9②）：历史对话前缀（已裁剪），前置进本次 ainvoke——
+        fix 轮据此把确定性 build 错回喂进【同一对话】，模型看得到自己上一轮的改动与
+        推理，不再每轮全新单消息从零重探（st-8 撞 95 迭代的直接成因之一）。
         """
         if self._agent is None:
             return "❌ Agent 未创建"
+        # 产码步先清 carry 源：本轮失败/异常时不留 stale 历史（比没有历史更危险），
+        # 成功后在下方以本轮全量对话覆盖。非产码步（verify 等）不触碰。
+        _continuity = _is_continuity_step(step)
+        if _continuity:
+            self._continuity_messages = None
 
         remaining = self._remaining_seconds()
         if remaining <= 1:
@@ -158,10 +179,14 @@ class _AgentLoopMixin:
         # 预留【即时】按中止语义结算；正常路径残留为空（settle 时已注销）。
         from swarm.models import ledger as _ledger
         _scope = _ledger.begin_inflight_scope()
+        # R63-T9②：历史前缀 + 新 human 消息（无前缀=旧行为单消息，零回归）。
+        _prior_n = len(continue_messages) if continue_messages else 0
+        _input_messages = (list(continue_messages) if continue_messages else []) \
+            + [("human", human_message)]
         try:
             result = await asyncio.wait_for(
                 agent.ainvoke(
-                    {"messages": [("human", human_message)]},
+                    {"messages": _input_messages},
                     config=invoke_config,
                 ),
                 timeout=remaining,
@@ -169,6 +194,11 @@ class _AgentLoopMixin:
         except asyncio.TimeoutError:
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
             self._log(f"Agent 调用超时（剩余预算 {remaining:.0f}s）")
+            if _continuity:
+                # T9 猎手 F1：优雅返回路径必须留观测——carry 源已在开头清空，
+                # 下一 fix 轮会回退全新单消息，操作员要能从日志区分这与"从未有 carry"。
+                self._log("R63-T9 turn 连续性：本轮超时无完整对话可延续，"
+                          "carry 源已清空，下一 fix 轮回退全新单消息")
             return f"❌ Agent 调用超时（预算 {self.max_execution_time}s）"
         except asyncio.CancelledError:
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
@@ -190,6 +220,10 @@ class _AgentLoopMixin:
             if "Recursion" in cls or "recursion" in str(exc).lower():
                 _ledger.end_inflight_scope(_scope, settle_leaked=False)
                 self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
+                if _continuity:
+                    # T9 猎手 F1：同上——撞上限正是 T9 要治的病理场景，carry 断链必须可见。
+                    self._log("R63-T9 turn 连续性：本轮撞迭代上限无完整对话可延续，"
+                              "carry 源已清空，下一 fix 轮回退全新单消息")
                 return f"⚠️ Agent 达到迭代上限（{_limit}），已做改动交由确定性 L1 验证"
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
             raise
@@ -201,11 +235,50 @@ class _AgentLoopMixin:
         _ledger.end_inflight_scope(_scope, settle_leaked=False)
         # 提取最后一条 AI 消息
         messages = result.get("messages", [])
-        self._record_tool_telemetry(messages, step)
+        # R63-T9②：telemetry 只吃本次新增切片（携带的历史前缀含前轮工具调用，
+        # 全量喂会重复计数）；成功的产码轮以全量对话更新 carry 源（用时再裁剪）。
+        self._record_tool_telemetry(messages[_prior_n:], step)
+        if _continuity:
+            self._continuity_messages = messages or None
         if messages:
             last = messages[-1]
             return getattr(last, "content", str(last))
         return "(Agent 无输出)"
+
+    def _fix_carry_messages(self) -> list | None:
+        """R63-T9②：取上一产码轮对话（裁剪后）作为本 fix 轮的延续前缀。
+
+        env SWARM_WORKER_FIX_TURN_CONTINUITY=false 一键回退旧行为（全新单消息轮）；
+        SWARM_WORKER_FIX_CARRY_BUDGET_CHARS 控制携带预算（默认 24000 字符，本地小窗
+        worker 可调小）。裁剪自身异常 → fail-open 回退 + WARNING（铁律：不许静默）。
+        """
+        if os.environ.get("SWARM_WORKER_FIX_TURN_CONTINUITY",
+                          "true").strip().lower() in ("false", "0", "no"):
+            return None
+        msgs = getattr(self, "_continuity_messages", None)
+        if not msgs:
+            # T9 猎手 F1：无 carry 源（首轮，或上一产码轮超时/撞上限被清）必须可见，
+            # 操作员才能验证 T9 在病理 fix 循环上是否真的接管了。
+            logger.info(
+                "R63-T9 turn 连续性：本 fix 轮无可延续 carry 源"
+                "（首轮或上一产码轮未成功完成），回退全新单消息轮")
+            return None
+        _raw_budget = os.environ.get("SWARM_WORKER_FIX_CARRY_BUDGET_CHARS", "24000")
+        try:
+            budget = int(_raw_budget)
+        except ValueError:
+            # T9 猎手 F2：配置坏值静默回退违反 fail-open 可观测铁律。
+            logger.warning(
+                "R63-T9：SWARM_WORKER_FIX_CARRY_BUDGET_CHARS=%r 不是整数，"
+                "回退默认 24000", _raw_budget)
+            budget = 24000
+        try:
+            from swarm.worker import turn_continuity as _tc
+            return _tc.trim_carry_messages(msgs, budget_chars=budget)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "R63-T9 turn 连续性裁剪失败，fail-open 回退全新单消息轮: %s", exc)
+            return None
 
     def _record_tool_telemetry(self, messages, step: str) -> None:
         """G2-2（主题G·工具观测面，#9-C）：从 agent 返回 messages 确定性统计工具调用。

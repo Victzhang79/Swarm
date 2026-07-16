@@ -2933,6 +2933,19 @@ def _split_lint_errors_by_scope(
 
 # ── L1.4 LLM 自检阶段 ──
 
+def l1_self_review_enabled() -> bool:
+    """R63-T9①：L1.4 LLM 自检总闸——默认关闭，env 显式 opt-in。
+
+    round63 实锤：自检结论【从不影响 verdict】（本 pipeline 到 L1.4 后无论自检结论
+    恒 return True；executor 仲裁的 llm_ok 来自 pipeline 确定性返回值而非 self_review），
+    却在每个通过的子任务上烧 1 次 worker LLM 调用产假 ✅ 清单（21/34 幻觉 PASS 同族
+    模型盖章）。默认翻转为关闭；SWARM_WORKER_L1_SELF_REVIEW=true 显式恢复旧行为。
+    executor Phase-4 与本函数共用此闸（关闭时连 LLM 句柄都不取）。
+    """
+    return os.environ.get(
+        "SWARM_WORKER_L1_SELF_REVIEW", "false").strip().lower() in ("true", "1", "yes")
+
+
 _SELF_REVIEW_PROMPT = """\
 你是一位严格的代码审查员。请对以下代码变更进行自检，检查：
 1. 是否完整实现了子任务目标
@@ -3982,7 +3995,7 @@ def run_l1_pipeline(
         details["needs_review"] = "no_test_or_verify_commands"
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
-    self_review_enabled = os.environ.get("SWARM_WORKER_L1_SELF_REVIEW", "true").lower() not in ("false", "0", "no")
+    self_review_enabled = l1_self_review_enabled()
     # C1：自检是 advisory——预算耗尽只跳过自检（不 BLOCKED 整个已通过的确定性结论）
     if deadline is not None and _time.monotonic() >= deadline:
         self_review_enabled = False
@@ -3996,8 +4009,17 @@ def run_l1_pipeline(
         elif review_result.get("passed") is False:
             # 自检发现问题，仅作为警告，不硬阻断
             details["self_review"]["note"] = "LLM 自检发现潜在问题，作为警告（不阻断）"
+    elif "self_review" in details:
+        # T9 猎手 F3（既有 clobber）：deadline 耗尽分支已写入更具体的
+        # worker_deadline_exhausted 原因——不许被下面的通用 disabled 文案覆盖，
+        # 否则 opt-in 的操作员会被误导去查 env 而不是查预算。
+        pass
     elif not self_review_enabled:
-        details["self_review"] = {"status": "disabled", "reason": "SWARM_WORKER_L1_SELF_REVIEW=false"}
+        details["self_review"] = {
+            "status": "disabled",
+            "reason": "SWARM_WORKER_L1_SELF_REVIEW 未开启"
+                      "（R63-T9 默认关闭：advisory 结论从不影响 verdict）",
+        }
     else:
         details["self_review"] = {"status": "skipped", "reason": "llm not provided"}
 
