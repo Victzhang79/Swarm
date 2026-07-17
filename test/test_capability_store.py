@@ -56,9 +56,15 @@ def test_heuristic_multimodal():
     print("  ✅ 启发式: 多模态名字线索 (vl/multimodal/step-3/thinkingcap → True)")
 
 
-def test_heuristic_thinkingcap_context_256k():
-    # ThinkingCap 标称 256K，须先于 "qwen3"(128K)泛匹配命中(名字含 qwen3.6)
-    assert cap.heuristic_context_window("ThinkingCap-Qwen3.6-27B", kind="local") == 256_000
+def test_heuristic_thinkingcap_context_probed_137600():
+    # ThinkingCap 2026-07-17 真探测 max_model_len=137600（标称 256K 不实，高估会超包 400），
+    # 且须先于 "qwen3"(128K)泛匹配命中(名字含 qwen3.6)
+    assert cap.heuristic_context_window("ThinkingCap-Qwen3.6-27B", kind="local") == 137_600
+
+
+def test_heuristic_qwen3_coder_next_context_256k():
+    # R65E-PRE 换装（替代下线 Qwen3.5 系）：真探测 262144，须先于 "qwen3"(128K)泛匹配命中
+    assert cap.heuristic_context_window("Qwen3-Coder-Next-FP8", kind="local") == 262_144
 
 
 def test_default_capability_shape():

@@ -153,7 +153,7 @@ def classify_failure(err: BaseException | str | None) -> str | None:
         return CAPABILITY
 
     # 2.5) 上下文超限 400 → capability（同模型重试必再超限，须换大窗口模型/收窄输入）。
-    #      实测：Qwen3.5-122B(65536) 改大文件时输入+输出超限报 "maximum context length"。
+    #      实测：已下线 Qwen3.5-122B(65536) 改大文件时输入+输出超限报 "maximum context length"。
     if any(
         m in low
         for m in ("maximum context length", "context length", "context_length_exceeded",

@@ -21,7 +21,7 @@ from swarm.worker.prompts import build_worker_prompt
 def _make_pre_model_hook(max_input_tokens: int):
     """生成 create_react_agent 的 pre_model_hook：每次调 LLM 前裁剪历史 messages，
     防止 ReAct 多轮工具调用的历史(read_file 结果/reasoning/tool 输出)无限累积撞穿
-    模型上下文窗口(实测 Qwen3.5-122B 65536 窗口被累积到 57345 输入 → 400 报错 → 子任务死循环)。
+    模型上下文窗口(实测已下线 122B 机型 65536 窗口被累积到 57345 输入 → 400 报错 → 子任务死循环)。
 
     用 LangChain trim_messages 保留最近的 message(strategy="last")，按 token 预算裁剪，
     但始终保留 system prompt(include_system=True)。裁剪结果写入 llm_input_messages —— 只影响

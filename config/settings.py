@@ -242,7 +242,7 @@ class ModelConfig(BaseSettings):
     # （模型级第三腿）另行把守。改大本值不会放宽总预算，改小会误杀慢首包。
     timeout_seconds: int = 120  # SWARM_MODEL_TIMEOUT_SECONDS（流式=字节间隔，非总超时）
     # worker 单次响应输出上限（token）。防止 worker 改大文件时全文重写输出撑爆 context
-    # （实测 Qwen3.5-122B 改 877 行 StringUtils 时输出 38086 token，叠加输入 27451 超 65536
+    # （实测已下线 122B 机型改 877 行 StringUtils 时输出 38086 token，叠加输入 27451 超 65536
     # 上下文上限 → 400 报错 → 子任务失败）。worker 应用 patch_file 做最小改动，输出本不该
     # 这么大；限上限既强制增量编辑、又留 fallback 接管空间。0 表示不限制（向后兼容）。
     worker_max_tokens: int = 8192
