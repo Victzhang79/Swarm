@@ -101,6 +101,11 @@ class _AgentLoopMixin:
                         profile.get("fingerprint"), cur_fp)
         need_disk = fp_drifted or not profile or not (
             (profile.get("jvm") or {}).get("servlet_namespace")
+        ) or (
+            # R65TR-T5 猎手 F3：老缓存画像缺新 jvm 事实键 → 补探（否则 lombok 基线
+            # 约束对已建档项目永不生效；与 _STACK_SCHEMA_VERSION=3 双保险）。
+            profile.get("jvm") is not None
+            and "lombok_available" not in (profile.get("jvm") or {})
         )
         if need_disk and self.project_path:
             try:

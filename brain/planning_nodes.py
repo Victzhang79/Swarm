@@ -888,7 +888,9 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
 # 栈画像 schema 版本：探测逻辑/画像字段变更时递增，使按指纹缓存的旧画像失效重探。
 # 仅指纹（repo 内容）相同不足以复用——画像结构变了（如新增 infra_symbols），旧缓存缺字段。
 # v2: 新增 infra_symbols（基建符号锚点，治本 worker 臆造不存在的框架类如 RedisCache）。
-_STACK_SCHEMA_VERSION = 2
+# v3: jvm 新增 lombok_available/lombok_source（R65TR-T5 基线注解处理器在位性）——不 bump
+#     则已缓存画像永缺该键、硬约束永不渲染（猎手 F3，前例 108676a 同纪律）。
+_STACK_SCHEMA_VERSION = 3
 
 
 async def detect_stack(state: BrainState) -> dict:

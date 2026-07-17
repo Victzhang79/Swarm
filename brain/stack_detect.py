@@ -291,6 +291,28 @@ def _detect_jvm_facts(
     if jm:
         java_version = jm.group(1)
 
+    # ── 4) Lombok 基线在位性（R65TR-T5，jakarta/javax 同型病：模型训练先验 vs 磁盘
+    # ground truth）——基线无 Lombok 时交付引入 @Data 等注解=基线约定漂移：JDK≥23 默认
+    # 关闭隐式注解处理必炸（回放实锤 112 处找不到符号），且无调用者的 @Data 类在
+    # Lombok 失效时静默编译通过=跨模块哑弹。构建清单/源码双证。
+    # 猎手 F2：裸 "lombok" 子串会被【蓄意传递排除块】骗真（企业常见：exclusion 挡三方
+    # starter 传递引入 lombok，本项目根本没启用）→ 误放行=探测器自己复现要防的哑弹。
+    # 先剥 XML 注释/Maven exclusion 块/Gradle exclude 行，再按真实坐标 org.projectlombok 判。
+    _bt = re.sub(r"<!--.*?-->", " ", build_text, flags=re.S)
+    _bt = re.sub(r"<exclusions?>.*?</exclusions?>", " ", _bt, flags=re.S)
+    _bt = "\n".join(ln for ln in _bt.splitlines() if "exclude" not in ln)
+    _lombok_build = "org.projectlombok" in _bt
+    _lombok_src = 0
+    for p in java_sample_paths[:120]:
+        # 猎手 F5：锚定 `import lombok.`（防 lombokx.* 类前缀假阳）
+        _lombok_src += _read_text(p, limit=4000).count("import lombok.")
+    lombok_available = bool(_lombok_build or _lombok_src)
+    lombok_source = (
+        ("构建清单" if _lombok_build else "")
+        + ("+" if _lombok_build and _lombok_src else "")
+        + (f"源码实证×{_lombok_src}" if _lombok_src else "")
+    ) or "基线双证均无"
+
     if not (namespace or boot_version or java_version):
         return None
     return {
@@ -298,6 +320,8 @@ def _detect_jvm_facts(
         "namespace_source": ns_source,
         "spring_boot_version": boot_version,
         "java_version": java_version,
+        "lombok_available": lombok_available,  # R65TR-T5：基线注解处理器在位性
+        "lombok_source": lombok_source,
     }
 
 
@@ -347,7 +371,12 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             low = f.lower()
             if f in _MANIFEST_BACKEND or f.endswith(".csproj"):
                 manifests.append(os.path.join(rel, f) if rel else f)
-                manifest_texts[f] = _read_text(os.path.join(root, f))
+                # R65TR-T5 猎手 F1：按 basename【累积】而非覆盖——多模块工程每个子模块
+                # pom.xml 撞同键，last-write-wins 会静默丢弃先访问的子模块清单（依赖只
+                # 声明在非根子模块时 lombok/boot 版本探测全盲）。总量封顶防超大 monorepo。
+                if len(manifest_texts.get(f, "")) < 200_000:
+                    manifest_texts[f] = (
+                        manifest_texts.get(f, "") + " " + _read_text(os.path.join(root, f)))
             if f == "package.json":
                 manifest_texts.setdefault("package.json", "")
                 manifest_texts["package.json"] += _read_text(os.path.join(root, f))
@@ -606,6 +635,21 @@ def format_stack_for_prompt(profile: dict | None) -> str:
             f"`{ns}.servlet.http.HttpServletRequest`、`{ns}.persistence.*`、`{ns}.validation.*`、"
             f"`{ns}.annotation.Resource`）；【严禁】写 `{other}.*` 包名——本项目 classpath 没有它，"
             f"会直接 `package {other}.servlet does not exist` 编译失败。新建模块 pom 也按此栈继承依赖。"
+        )
+    # R65TR-T5：Lombok 基线在位性硬约束——键缺席（老画像/回放 profile）不猜不渲染。
+    if jvm.get("lombok_available") is False:
+        lines.append(
+            "- 【基线约定·硬约束】本项目基线【未引入 Lombok】（判据："
+            f"{jvm.get('lombok_source') or '基线双证均无'}）：【禁止】使用 @Data/@Getter/"
+            "@Setter/@Builder/@Slf4j 等 Lombok 注解与 `import lombok.*`，也【禁止】往任何 "
+            "pom 添加 lombok 依赖——实体/DTO 的 getter/setter/构造器/logger 一律【手写】"
+            "（与基线代码风格一致）。引入注解处理器属基线约定漂移：高版本 JDK 默认关闭"
+            "隐式注解处理会整模块编译失败，且无调用者的注解类会静默编译通过成哑弹。"
+        )
+    elif jvm.get("lombok_available") is True:
+        lines.append(
+            f"- 【基线约定】本项目基线已用 Lombok（{jvm.get('lombok_source') or ''}）：实体/DTO "
+            "可沿用既有 Lombok 注解风格，与邻近代码保持一致。"
         )
     infra = profile.get("infra_symbols") or {}
     if infra:
