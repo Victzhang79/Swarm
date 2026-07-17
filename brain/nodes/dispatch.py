@@ -84,6 +84,31 @@ def _inject_predecessor_context(to_dispatch, plan_obj, subtask_results: dict) ->
             logger.info("[DISPATCH] 跨子任务上下文：已为 %s 注入 %d 个前序产出签名", st.id, len(pred_blocks))
 
 
+def _reconcile_dispatch_accounts(plan_obj, to_dispatch) -> bool:
+    """R65REPLAY-T4 派发侧兜底：规划收尾期对账后，执行期仍会有代码路径改写 scope
+    账面（实锤=预算闸拆分对 scope 的 deep-copy 继承把 st-11-1 一个死等复制成 4 个；
+    HANDLE_FAILURE 期亦有 create_files/ua 修补路径）。进 seed 闸前用同一 helper
+    （plan_finisher 单一事实源）再对账一次。★覆盖是写者无关的（复核 F5）：helper
+    每次从当前 plan 的 create_files/writable/depends_on 全量结构重算，不按写者点名
+    ——新增任何账写者只要发生在下一次 dispatch 前即自动被覆盖，维护者勿加按写者
+    的特判★。返回是否发生剔账（调用方据此显式 emit plan——in-place 变异靠
+    checkpoint 捎带是本仓被禁模式）。幂等，失败 fail-open（seed 闸 BLOCKED+A2 兜底）。
+    """
+    try:
+        from swarm.brain.plan_finisher import reconcile_upstream_account
+        removed = reconcile_upstream_account(plan_obj)
+    except Exception as _exc:  # noqa: BLE001 — 对账失败按未变更继续（可观测不静默）
+        logger.warning("[DISPATCH] R65REPLAY-T4 上游账对账异常（跳过）: %s", _exc)
+        return False
+    if not removed:
+        return False
+    _batch_hit = sorted(set(removed) & {getattr(st, "id", "") for st in (to_dispatch or [])})
+    logger.warning(
+        "[DISPATCH] R65REPLAY-T4 派发前剔除幽灵上游账 %d 个子任务（本批命中 %s）"
+        "——不剔则 seed 闸永久死等生产者在自己下游的产物", len(removed), _batch_hit[:6])
+    return True
+
+
 def _inject_upstream_products(to_dispatch, subtask_results: dict,
                               project_path: str | None = None) -> bool:
     """B1（round38c 主题B 治本）：派发时把【全体 L1 通过子任务】的产物文件清单注入
@@ -481,6 +506,11 @@ async def dispatch(state: BrainState) -> dict:
         _abandoned, _deprioritized, force_strong_out=_gate_force_strong
     )
     _gate_split = plan_obj is not _plan_before_gate
+    # R65REPLAY-T4 派发侧兜底：执行期写者产生的幽灵 ua 进 seed 闸前剔除。
+    # 复核 F4 定序裁决：必须在 B1 注入【之前】且【不得】在 B1 后重跑——B1 只注入
+    # 完成态+本地存在的产物（零死等风险），事后重跑对账反而可能剔掉 B1 合法注入、
+    # 让 bootstrap 补传漏文件。plan 侧幽灵在此清，B1 增量交存在性过滤把关。
+    _acct_changed = _reconcile_dispatch_accounts(plan_obj, to_dispatch)
 
     # ── 跨子任务上下文传递(B3 配套)：把【前序已完成依赖子任务】的产出注入后序子任务，
     # 让后序看到前序定义的真实接口签名/新建符号，避免接口对不上（依赖序拆分场景）。
@@ -508,8 +538,8 @@ async def dispatch(state: BrainState) -> dict:
             # 残留失败再进 handle_failure，此时 verification_failure 已清 → 走常规能力阶梯误全量重跑。
             "failed_subtask_ids": list(state.get("failed_subtask_ids", [])),
         }
-        if _gate_split:
-            _empty["plan"] = plan_obj  # 闸门拆小后须回写新 plan，否则子块在旧 plan 找不到→孤儿
+        if _gate_split or _acct_changed:
+            _empty["plan"] = plan_obj  # 闸门拆小/剔账后须回写新 plan，否则变更只活在内存重启即丢
         return _empty
 
     project_id = state.get("project_id", "")
@@ -797,8 +827,8 @@ async def dispatch(state: BrainState) -> dict:
     if _gate_force_strong != (state.get("subtask_force_strong") or {}):
         # E5：闸门新标的拆不动大块 force_strong 必须显式 emit（in-place 捎带是被禁模式）
         result["subtask_force_strong"] = _gate_force_strong
-    if _gate_split or _ua_changed:
-        # B1 对抗复核#1：注入 mutate 了 scope.upstream_artifacts——in-place 变异靠
+    if _gate_split or _ua_changed or _acct_changed:
+        # B1 对抗复核#1：注入/对账 mutate 了 scope.upstream_artifacts——in-place 变异靠
         # checkpoint 捎带是被禁模式（C9 同纪律），显式 emit 否则重启恢复即丢注入。
         result["plan"] = plan_obj
     # H3 修复：永远回填 failed_subtask_ids（空也回填）。state 无 reducer(last-write-wins)，

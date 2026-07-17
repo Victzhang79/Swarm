@@ -346,3 +346,45 @@ grep 项）。
 **用法**（round65d 回放）：重置基线到 0d42679 → SWARM_PLAN_INJECT_ENABLE=1 [+
 SWARM_BRAIN_OFFLINE=1] restart-api → plan_inject_submit.py test/fixtures/plan_b583.json
 --project <pid>。绝不 retry 旧任务 b583df8f 本体。
+
+## #69 R65REPLAY-T4：上游账↔依赖序对账——幽灵死等账死锁治本（回放轮主死因）
+
+**定案因果链**（三路交叉印证+代码取证，全文 logs_archive/process/round65d_replay_mirrors/journal.md）：
+R63-T4 符号布线按语料文本引用布 readable+upstream_artifacts 不查方向
+（symbol_provenance.py:263-266，fixture 固有非拆分引入）→ st-11-1(XML) 账含下游
+st-11-2..5 才创建的 4 个 Mapper 接口 → W2/T5 规划期见环只跳边不清账
+（plan_finisher.py 旧 482-486）→ seed 闸 fail-closed 只看账不知生产者∈自己传递下游
+（executor.py:667）→ 父任务 18:05 首攻即 BLOCKED；预算闸拆分 scope deep-copy 继承
+（planning_nodes.py:3281）1 死等复制成 4 → 18 派发 14 同签名 → A2/B2/规模闸 64min
+三闸会师 → 连坐 72 → PARTIAL 24/97。st-17-1 同构第二发。
+
+**治本**（栈中立，纯 DAG/路径逻辑）：
+1. plan_finisher.reconcile_upstream_account：ua 条目的计划内生产者【全部】为自身或
+   （传递）依赖本任务 → 从 ua+readable 剔除 + WARNING + 机读账 + 权威路径文本提示
+   注入 context_snippets（信息通道保留，只掐死 seed 死等语义）。生产者口径
+   create∪writable；路径 _norm_scope_path 归一；歧义/基线不动；写者无关全量重算；幂等。
+2. 接线①收尾器末端（W2 消费边之后——能成的边先成，生产者转正则账合法保留；live 规划
+   与注入回放共用）；②dispatch 派发前兜底（B1 之前，兜执行期账写者），plan 显式 emit
+   两处（空批早退+末端）。
+
+**双复核处置**（reviewer=APPROVE 零 finding；hunter 3H/3M/1L 逐条裁决）：
+- F1 HIGH CONFIRMED：owner 口径 create-only 看不见上游 writable 修改者→冤剔真上游
+  → 口径扩 create∪writable + 锁（test_writable_upstream_producer_kept）。
+- F2 HIGH CONFIRMED：无路径归一，'./'/反斜杠漂移让幽灵漏网（R41 先例）→
+  _norm_scope_path 单一口径源 + 锁（test_path_drift_normalized_still_removed）。
+- F3 HIGH 部分成立：剔 readable 后引用型产出（如 XML 引接口 FQN）失去权威路径=从死等
+  退化成盲猜 → 采纳方案 b：剔除路径以文本提示注入 context_snippets + 锁。
+- F4 MED 裁 no-change：reconcile 必须在 B1 前且不得 B1 后重跑（B1 只注入完成态+存在
+  文件零死等风险；事后重跑可能剔掉合法注入让 bootstrap 漏传）——定序裁决落注释。
+- F5 MED CONFIRMED：docstring 按写者点名不实（梯三桩实无 ua 直写；failure.py
+  _amend_scope_with_missing_files 才是真第三写者）→ 改为"写者无关全量结构重算"不变量表述。
+- F6 MED CONFIRMED：机读账零消费者+fail-open 静默 → 失败落 out 标记 → live 调用点
+  （nodes/__init__.py）进 degraded_reasons"upstream_account_reconcile_failed"；注入路径
+  _FailOpenAlarm 对 exc_info WARNING 自动升闸；plan_inject 消费账落 INFO + 锁。
+- F7：测试盲区按 F1/F2/F3/F6 补 4 锁；dispatch 全节点集成/旧 checkpoint 恢复两项接受
+  （helper 全 plan 重扫+调用点无条件=reviewer 已验结构性覆盖）。
+
+**质量闸**：15 测试 GREEN（含 fixture 级：cassette 重推导后 st-11-1 4 Mapper 幽灵账+
+st-17-1 Impl 账全清）；revert-check 红；定向 155+ 绿；全量 4786/0/0（整改前基线）+
+整改后全量见提交。注：首轮全量 4 失败=当时 .env 回放双闸污染（BRAIN_OFFLINE/
+PLAN_INJECT_ENABLE），非本案回归——双闸已删+restart-api（round65e 前置检查项已了）。

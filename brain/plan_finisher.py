@@ -493,6 +493,98 @@ def derive_consumer_depends_edges(plan) -> dict[str, list[str]]:
     return added
 
 
+def reconcile_upstream_account(plan) -> dict[str, list[str]]:
+    """R65REPLAY-T4（round65d 回放轮死因本体）：上游账↔依赖序对账。
+
+    实锤链：R63-T4 符号布线按语料文本引用写 readable+upstream_artifacts 不查方向
+    → st-11-1(XML) 的账里被布进 4 个 Mapper 接口，其计划内创建者 st-11-2..5 反过来
+    （传递）依赖 st-11-1 → seed 闸 fail-closed 只看账、不知生产者在自己下游=永久
+    BLOCKED"等生产者"→ 预算闸拆分 deep-copy 继承账 1 变 4 → 连坐 72 → PARTIAL。
+    W2/T5 检测到环只跳边从不清账——DAG 无环但【账与序矛盾】原样入执行期。
+
+    对每个子任务的 upstream_artifacts 条目：若其计划内生产者【全部】是本任务自身或
+    （传递）依赖本任务=生产者在自己下游，结构矛盾 → 从 ua（及 readable 同路径）确定性
+    剔除 + WARNING + 机读账 + 把剔除路径以文本提示注入 context_snippets（复核 F3：
+    信息通道保留——worker 仍知道权威路径可推导符号名，只掐死 seed 闸死等通道）。
+    账让位于序：语义引用不是构建输入，真需要时 L1 编译闸/C9 动态边兜底。
+    生产者口径=create_files∪writable（复核 F1：剔除判定必须比 G2 加边的 create-only
+    更宽——writable 声明的上游修改者也是合法生产者，看不见它=冤剔真上游账）；
+    路径经 _norm_scope_path 归一比对（复核 F2：R41 实证 './'/反斜杠口径漂移是真实病）。
+    生产者歧义（上下游混合）不猜；无计划内生产者（基线/存量）不动——存在性交
+    seed 闸/R49-2 运行期判。★写者无关：每次调用都从当前 create_files/writable/
+    depends_on 全量结构重算，不维护写者清单——任何时点新增的 ua/scope 写者只要发生在
+    下一次调用前即自动被覆盖（复核 F5，维护者勿退化成按写者点名的补丁）★。
+    纯 DAG/路径逻辑，栈中立；幂等。返回 {子任务 id: [剔除路径…]} 机读账（空=零矛盾）。
+    """
+    subs = getattr(plan, "subtasks", None) or []
+    if not subs:
+        return {}
+    from swarm.brain.contract_utils import _norm_scope_path  # 路径口径单一事实源(R41)
+    by_id = {st.id: st for st in subs}
+    owners: dict[str, set[str]] = {}
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        for p in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            owners.setdefault(_norm_scope_path(p), set()).add(st.id)
+    if not owners:
+        return {}
+    _closure_cache: dict[str, set[str]] = {}
+
+    def _closure(sid: str) -> set[str]:
+        """sid 的传递 depends_on 闭包（迭代 DFS，环安全）。"""
+        cached = _closure_cache.get(sid)
+        if cached is not None:
+            return cached
+        seen: set[str] = set()
+        stack = [sid]
+        while stack:
+            cur = by_id.get(stack.pop())
+            for dep in (getattr(cur, "depends_on", None) or []) if cur else []:
+                if dep not in seen:
+                    seen.add(dep)
+                    stack.append(dep)
+        _closure_cache[sid] = seen
+        return seen
+
+    removed: dict[str, list[str]] = {}
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        ua = list(getattr(sc, "upstream_artifacts", None) or [])
+        if not ua:
+            continue
+        bad = [p for p in ua
+               if (own := owners.get(_norm_scope_path(p)))
+               and all(o == st.id or st.id in _closure(o) for o in own)]
+        if not bad:
+            continue
+        _bad_norm = {_norm_scope_path(p) for p in bad}
+        sc.upstream_artifacts = [p for p in ua if _norm_scope_path(p) not in _bad_norm]
+        rd = list(getattr(sc, "readable", None) or [])
+        if any(_norm_scope_path(p) in _bad_norm for p in rd):
+            sc.readable = [p for p in rd if _norm_scope_path(p) not in _bad_norm]
+        # 复核 F3：信息通道保留——剔的是 seed 闸死等语义，不是路径知识。worker（尤其
+        # 引用后续任务符号的资源/模板类产出）仍需权威路径推导符号名，否则从"死等"退化成
+        # "盲猜命名"（更糟：无 BLOCKED 信号无人知道）。文本提示零 seed 语义。
+        _hint = ("\n\n[计划序提示] 以下文件由计划内后续任务创建，本批次不可读取；"
+                 "如需引用其符号/命名，以下列路径为权威推导，勿自行发明：\n"
+                 + "\n".join(f"- {p}" for p in bad))
+        st.context_snippets = (getattr(st, "context_snippets", "") or "") + _hint
+        removed[st.id] = bad
+    if removed:
+        logger.warning(
+            "[PLAN-FINISH] R65REPLAY-T4 上游账对账：%d 个子任务共 %d 条 ua 条目的计划内"
+            "创建者在自己（传递）下游=账与序矛盾（seed 闸会永久死等）→ 从账剔除"
+            "（账让位于序；L1/C9 兜底）: %s",
+            len(removed), sum(len(v) for v in removed.values()),
+            {k: v[:3] for k, v in sorted(removed.items())[:6]})
+    return removed
+
+
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
                               shared_contract: dict | None = None) -> dict:
@@ -603,6 +695,19 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             out["consumer_edges"] = _ce
     except Exception:  # noqa: BLE001 — fail-open
         logger.warning("[PLAN-FINISH] 消费边下推失败（fail-open）", exc_info=True)
+    try:
+        # R65REPLAY-T4：上游账对账放【消费边之后】——W2 能成的边先成（生产者转正为
+        # 真上游，账合法保留）；只有成环跳过的矛盾账才被剔除。
+        _ra = reconcile_upstream_account(plan)
+        if _ra:
+            out["upstream_account_reconciled"] = _ra
+    except Exception:  # noqa: BLE001 — fail-open
+        # 复核 F6：对账挂了=幽灵死等账可能残留（比本机制出现前更糟的是无人知道）——
+        # 机读标记供调用方进 degraded_reasons；注入路径由 _FailOpenAlarm（watch 本
+        # logger 的 exc_info WARNING）自动升闸。
+        out["upstream_account_reconcile_failed"] = True
+        logger.warning("[PLAN-FINISH] 上游账对账失败（fail-open，幽灵死等账可能残留）",
+                       exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):
         logger.info(

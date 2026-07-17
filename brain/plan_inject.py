@@ -188,6 +188,14 @@ def prepare_injected_state(
         logger.warning(
             "[PLAN-INJECT] 剥离 %d 个旧脚手架后重注入为 0 且无异常——请人工核对模块地基"
             "是否已由 owner 通道承接", stripped)
+    _ra = finish_out.get("upstream_account_reconciled") or {}
+    if _ra:
+        # R65REPLAY-T4 复核 F6：机读账在注入路径落日志（回放调试正是本通道的用途——
+        # 录制 plan 里的幽灵死等账被清了几条要看得见）。
+        logger.info(
+            "[PLAN-INJECT] 上游账对账剔除幽灵死等条目 %d 子任务/%d 条: %s",
+            len(_ra), sum(len(v) for v in _ra.values()),
+            {k: v[:3] for k, v in sorted(_ra.items())[:6]})
 
     # ── 闸4：确定性结构校验（fail-closed）──
     # 注入跳过了 VALIDATE 节点，而 finisher/resolve 全程 fail-open（live 管线里缺口由

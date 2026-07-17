@@ -2365,7 +2365,7 @@ async def plan(state: BrainState) -> dict:
     # 在其后；挂靠记录进 plan.finisher_attached 供 #6 跨轮对称剔除（_merge_prior_covers_
     # by_scope 消费）。脚手架 harness 由收尾器自行 bootstrap（错过主循环）。
     from swarm.brain.plan_finisher import finish_plan_deterministic
-    finish_plan_deterministic(
+    _finish_out = finish_plan_deterministic(
         task_plan, state.get("tech_design_file_plan"),
         project_path=_get_project_path(state.get("project_id") or ""),
         task_description=task_description,
@@ -2385,6 +2385,11 @@ async def plan(state: BrainState) -> dict:
         "shared_contract": task_plan.shared_contract or {},
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
+        ) + (
+            # R65REPLAY-T4 复核 F6：对账 pass 自身挂掉=幽灵死等账可能残留（round65d
+            # 回放死因类），必须进 degraded 可查——否则唯一信号是无人 grep 的 WARNING。
+            ["upstream_account_reconcile_failed"]
+            if _finish_out.get("upstream_account_reconcile_failed") else []
         ) + (
             # round29 真因4：丢模块=交付范围残缺，必须进 degraded（should_write_success 据此
             # 拦 L6 假成功学习；人工 accept 放行后终态仍诚实带痕）。reducer 追加去重。
