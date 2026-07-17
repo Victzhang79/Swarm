@@ -34,10 +34,17 @@ from test.benchmark.retrieval_quality.retrieval_bench import run_bench
 #    匹配=BM25 维度一直无效测量），改用生产同款 _extract_keywords。
 # 实测 Recall@5=0.432 / Hit@5=0.591（池上限 10000 全库覆盖反而更差 0.386/0.545：
 # 瓶颈已从「候选缺席」转移到「rerank 池内噪声竞争」——sql/模板富中文块挤掉 gold）。
-# 0.75 目标属战役第二阶段（gold 集复审+类型加权，避免对 22 题基准裸调参过拟合），
-# 见 ROUND65_POSTMORTEM_TREATMENT_REGISTER.md R65B-T3 条目。地板留安全余量防 flake。
-RECALL_FLOOR = 0.38
-HIT_FLOOR = 0.50
+#
+# R65B-T3 二阶段（同日）：gold 集复审修 3 条死子句（306/320/335.md 是旧偏置 KB 外采
+# 文档、项目里不存在=永不可满足，改写为仓内真实证据 Mapper.xml/DataScope/ShiroConfig）
+# → 实测 Recall@5=0.455 / Hit@5=0.636（连续 3 轮稳定）。两项负结果如实记录：
+# ① rerank×hybrid blend 全权重扫描均有害（0.636→0.545，hybrid 分在噪声上同样虚高）
+#   ——已删除不上船；② 关键词臂每文件多样性 cap 对 bench 中性（保留为结构性护栏）。
+# 剩余 5 个 MISS 定案=reranker 模型对中文概念查询系统性偏好文案块（gold 以全池最高
+# 融合分仍被踢出）+查询歧义（startPage 出现于 50+ 文件），属模型评估/换装工作面，
+# 编排层继续调参=对 22 题过拟合。0.75 目标挂 reranker 评估任务，非起跑阻断。
+RECALL_FLOOR = 0.40
+HIT_FLOOR = 0.54
 
 
 @pytest.fixture(scope="module")

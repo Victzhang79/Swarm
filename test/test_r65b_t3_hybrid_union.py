@@ -38,10 +38,11 @@ def _mk_indexer(dense, keyword, *, union_cap=5000, bm25_w=0.3,
         return [dict(c) for c in dense]
 
     async def _bm25_only(project_id, query_terms=None, top_k=None,
-                         scroll_limit=None):
+                         scroll_limit=None, per_file_cap=None):
         if calls is not None:
             calls.append({"query_terms": query_terms, "top_k": top_k,
-                          "scroll_limit": scroll_limit})
+                          "scroll_limit": scroll_limit,
+                          "per_file_cap": per_file_cap})
         if keyword_raises:
             raise RuntimeError("qdrant scroll down")
         return [dict(c) for c in keyword]
@@ -137,3 +138,40 @@ def test_union_cap_passed_as_scroll_limit():
     idx = _mk_indexer(_DENSE, [_KW_HIT], union_cap=3333, calls=calls)
     _run_swr(idx, ["selectalarmtask"])
     assert calls and calls[0]["scroll_limit"] == 3333
+
+
+def test_bm25_per_file_cap_diversifies():
+    """R65B-T3 二阶段：每文件多样性上限——sql 全量 dump 等单文件几十个 chunk 霸榜
+    会把其它文件的关键词命中整批挤出 top_k。cap 后同文件最多留 N 条（宁缺勿滥，
+    不回填同文件溢出块）。"""
+    import asyncio as _aio
+    from unittest.mock import AsyncMock
+
+    idx = object.__new__(SemanticIndexer)
+
+    class _Cfg:
+        retrieval_top_k = 5
+
+    idx._kb_config = _Cfg()
+    idx._collection_name = "test_kb"
+
+    class _Pt:
+        def __init__(self, i, fp, content):
+            self.id = f"p{i}"
+            self.payload = {"file_path": fp, "content": content,
+                            "project_id": "p1"}
+
+    # 6 个高分同文件块 + 1 个低分其它文件块
+    pts = [_Pt(i, "sql/dump.sql", "告警 任务 调度 " * (10 - i)) for i in range(6)]
+    pts.append(_Pt(9, "src/AlarmTask.java", "告警"))
+    client = AsyncMock()
+    client.scroll = AsyncMock(return_value=(pts, None))
+    idx._client_or_raise = lambda: client
+
+    out = _aio.run(idx.bm25_only_search(
+        "p1", query_terms=["告警"], top_k=5, per_file_cap=3))
+    by_file = {}
+    for c in out:
+        by_file[c["file_path"]] = by_file.get(c["file_path"], 0) + 1
+    assert by_file.get("sql/dump.sql", 0) <= 3, f"单文件超上限: {by_file}"
+    assert "src/AlarmTask.java" in by_file, "其它文件命中不应被同文件霸榜挤出"

@@ -604,7 +604,8 @@ class SemanticIndexer:
                 try:
                     kw_cands = await self.bm25_only_search(
                         project_id, query_terms=query_terms,
-                        top_k=retrieval_top_k, scroll_limit=_union_cap)
+                        top_k=retrieval_top_k, scroll_limit=_union_cap,
+                        per_file_cap=3)  # 防 sql dump/巨模板单文件霸榜挤掉其它命中
                     _seen_ids = {c.get("id") for c in candidates}
                     _extra = [c for c in kw_cands
                               if c.get("id") not in _seen_ids
@@ -632,6 +633,12 @@ class SemanticIndexer:
 
         from swarm.knowledge.reranker import rerank_documents
 
+        # R65B-T3 二阶段实验记录（决策：不上船）：曾实现「终排 rerank×hybrid 归一加权
+        # blend」以救『gold 以全池最高 hybrid_score 仍被 rerank 踢出 top-K』的实测面，
+        # 但 22 题基准全扫描证明任何 blend 权重都整体有害（Hit@5 0.636→0.545：hybrid
+        # 分在 sql/模板噪声上同样虚高）——按「无实证价值的修复不上船」纪律删除，终排
+        # 维持纯 rerank。0.75 目标的真瓶颈=reranker 模型对中文概念查询偏好文案块，
+        # 属模型评估/换装工作面，见登记册 R65B-T3 二阶段结论。
         return await asyncio.to_thread(
             rerank_documents,
             query,
@@ -646,6 +653,7 @@ class SemanticIndexer:
         query_terms: list[str] | None = None,
         top_k: int | None = None,
         scroll_limit: int | None = None,
+        per_file_cap: int | None = None,
     ) -> list[dict[str, Any]]:
         """无向量降级检索（修复 12.7）：embedding 服务不可用时的优雅降级路径。
 
@@ -687,6 +695,19 @@ class SemanticIndexer:
                 c["bm25_score"] = round(s, 4)
                 c["score"] = round(s, 4)  # 让下游按 score 排序/筛选时有信号
             candidates.sort(key=lambda c: c.get("bm25_score", 0.0), reverse=True)
+            if per_file_cap and per_file_cap > 0:
+                # R65B-T3 二阶段：每文件多样性上限——sql 全量 dump/巨模板单文件几十个
+                # chunk 霸榜会把其它文件的关键词命中整批挤出 top_k（r-07/r-13 实锤）。
+                # 宁缺勿滥：截到 cap 后不回填同文件溢出块。
+                _per_file: dict[str, int] = {}
+                _diverse: list[dict[str, Any]] = []
+                for c in candidates:
+                    fp = str(c.get("file_path") or "")
+                    if _per_file.get(fp, 0) >= per_file_cap:
+                        continue
+                    _per_file[fp] = _per_file.get(fp, 0) + 1
+                    _diverse.append(c)
+                candidates = _diverse
 
         return candidates[:top_k]
 

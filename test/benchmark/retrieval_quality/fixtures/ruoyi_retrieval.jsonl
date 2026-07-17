@@ -1,14 +1,14 @@
 {"id": "r-01", "cat": "pagination", "query": "若依列表查询怎么做分页", "relevant": [{"source_contains": "PageUtils.java", "keyword_contains": "startPage"}, {"source_contains": "BaseController.java", "keyword_contains": "startPage"}]}
 {"id": "r-02", "cat": "pagination", "query": "若依分页 startPage 在哪里设置请求分页数据", "relevant": [{"source_contains": "PageUtils", "keyword_contains": "分页"}]}
-{"id": "r-03", "cat": "mapper", "query": "若依 Mapper 接口和 XML 映射文件的约定", "relevant": [{"source_contains": "306.md", "keyword_contains": "Mapper"}, {"keyword_contains": "Mapper 接口"}]}
+{"id": "r-03", "cat": "mapper", "query": "若依 Mapper 接口和 XML 映射文件的约定", "relevant": [{"source_contains": "Mapper.xml", "keyword_contains": "Mapper"}, {"keyword_contains": "Mapper 接口"}]}
 {"id": "r-04", "cat": "mapper", "query": "MyBatis mapperLocations 配置在哪", "relevant": [{"source_contains": "application.yml", "keyword_contains": "mapperLocations"}]}
-{"id": "r-05", "cat": "data_scope", "query": "若依怎么做数据权限控制", "relevant": [{"source_contains": "320.md", "keyword_contains": "数据权限"}, {"keyword_contains": "DataScope"}]}
+{"id": "r-05", "cat": "data_scope", "query": "若依怎么做数据权限控制", "relevant": [{"source_contains": "DataScope", "keyword_contains": "数据权限"}, {"keyword_contains": "DataScope"}]}
 {"id": "r-06", "cat": "data_scope", "query": "校验用户是否有数据权限的方法", "relevant": [{"source_contains": "SysUserService", "keyword_contains": "数据权限"}, {"keyword_contains": "checkUserDataScope"}]}
 {"id": "r-07", "cat": "codegen", "query": "若依代码生成器工具类", "relevant": [{"source_contains": "GenUtils.java", "keyword_contains": "代码生成"}]}
 {"id": "r-08", "cat": "codegen", "query": "若依代码生成支持哪些表类型 单表 树表 主子表", "relevant": [{"source_contains": "332.md", "keyword_contains": "代码生成"}, {"keyword_contains": "树表"}]}
 {"id": "r-09", "cat": "codegen", "query": "代码生成操作处理的 Controller", "relevant": [{"source_contains": "GenController.java", "keyword_contains": "代码生成"}]}
 {"id": "r-10", "cat": "permission", "query": "若依接口权限注解 @PreAuthorize hasPermi 怎么用", "relevant": [{"source_contains": "301.md", "keyword_contains": "PreAuthorize"}, {"keyword_contains": "hasPermi"}]}
-{"id": "r-11", "cat": "permission", "query": "若依匿名访问 不需要登录的接口怎么放行", "relevant": [{"source_contains": "335.md", "keyword_contains": "Anonymous"}, {"keyword_contains": "匿名"}]}
+{"id": "r-11", "cat": "permission", "query": "若依匿名访问 不需要登录的接口怎么放行", "relevant": [{"source_contains": "ShiroConfig", "keyword_contains": "anon"}, {"keyword_contains": "匿名"}]}
 {"id": "r-12", "cat": "permission", "query": "ShiroConfig 安全配置类", "relevant": [{"source_contains": "ShiroConfig.java", "keyword_contains": "Shiro"}, {"source_contains": "ShiroConfig"}]}
 {"id": "r-13", "cat": "schedule", "query": "若依定时任务调度服务层接口", "relevant": [{"source_contains": "ISysJobService", "keyword_contains": "定时任务"}]}
 {"id": "r-14", "cat": "schedule", "query": "定时任务调度日志服务", "relevant": [{"source_contains": "ISysJobLogService", "keyword_contains": "定时任务"}, {"source_contains": "JobLog", "keyword_contains": "日志"}]}

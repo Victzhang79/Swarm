@@ -111,3 +111,19 @@ plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round
   无迹可查 → ERROR 硬告警+degraded_reasons（reducer 通道）机读账
   cascade_revert_failed:<id>:<files>+锁。LOW 留档：l1_details.revert_failed 目前无
   下游消费者（L2 只能间接兜真编译毒），后续可接 runner 终态摘要。
+
+## R65B-T3 二阶段结论（gold 复审+类型加权面，2026-07-17）
+- **gold 复审（真弹）**：22 题集里 3 条子句引用 306/320/335.md——旧偏置 KB 的外采文档，
+  项目里根本不存在=永不可满足的死子句。改写为仓内真实证据（Mapper.xml / DataScopeAspect /
+  ShiroConfig anon 链）。实测 Hit@5 0.591→**0.636**、Recall@5 0.432→**0.455**（连续 3 轮稳定）。
+- **两项负结果如实记录**：
+  ① rerank×hybrid blend（终排归一加权 ensemble）：为救「gold 以全池最高 hybrid_score 仍被
+    rerank 踢出 top-5」（r-05 实测）而做，但全权重扫描（0.2/0.4/0.6）均整体有害
+    （0.636→0.545）——hybrid 分在 sql/模板噪声上同样虚高。按「无实证价值不上船」删除。
+  ② 关键词臂每文件多样性 cap（防 sql dump 单文件霸榜）：bench 中性（misses 不变），
+    保留为结构性护栏（param 默认 None，并集调用点 cap=3）。
+- **剩余 5 MISS 定案**：reranker 模型对中文概念查询系统性偏好文案富集块（rr=0.96 给
+  main.html 噪声）+查询歧义（startPage 在 50+ 文件出现，IDF 天然低）。属 reranker 模型
+  评估/换装工作面——编排层继续调参=对 22 题过拟合，明确不做。
+- 战役累计：0.500/0.364 →（一阶段并集+bench 口径修正 0.591/0.432）→（二阶段 gold 复审
+  0.636/0.455）。地板 0.54/0.40。0.75 目标移交 reranker 模型评估任务（非起跑阻断）。
