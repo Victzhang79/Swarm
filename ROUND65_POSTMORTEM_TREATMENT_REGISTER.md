@@ -204,3 +204,25 @@ worker 抄模板必过闸；即便旧 plan 直入，H1 覆写后旧 grep jackson
 
 质量闸：RED 3→GREEN 9；双复核 reviewer(1C/1H/1L·两条 live 复现)+hunter(1C/1M/1LM/2清白)
 全整改全锁；give-up 阶梯/round36/round29 恢复面回归 50/50；revert-check 红；全量绿。
+
+## #62 R65D-T3 已治（2026-07-17，本地提交）
+
+MERGE 病灶：merge() 组装 subtask_diffs 无条件收 subtask_results 全部 diff，从不查
+l1_passed——round65d 冻结的 L1-fail 三僵尸(4 diff/17801 chars)照单合入=毒树四株落盘。
+
+治本：
+1. 交付面闸：组装前剔除 l1_passed=False 输出（shared.l1_passed 单一事实源，give-up
+   桩 l1_passed=True 不受影响）；被剔者 D7 孤儿同口径入账（并入 abandoned+pop 完成态+
+   degraded_reasons merge_rejected_l1_fail:<sid>）+ ERROR 足迹日志（毒株文件落点可审计，
+   round47 读树取证面）；足迹审计整块 best-effort（猎手 LOW-MED：import 收进 try）。
+2. 剔除规模闸（猎手 HIGH CONFIRMED+复核 MED 合并）：全员被剔（空 diff 会被
+   merge_diffs([]) 判 success→COMPLEX 确定性检查全跳→裸 LLM 可给空交付盖章自动放行）
+   或超阈值 max(10,25%×计划) → escalate 人工 fail-closed（verification_failure=
+   merge_l1_reject_mass），落点在 failure_escalated=False 粘滞清理之后（自查逮到的
+   时序 bug：入账块先于清理行，escalate 会被清掉）。
+3. 复核核实非死代码：#60 铁律 fail-open 轮/replan-escalate 豁免路径仍可漏僵尸到
+   MERGE，本闸是必要第二层；rebase 重入/入账不被后续分支冲掉/L6 不学假成功全核实。
+
+复核战果：reviewer APPROVE(1M/1L)；hunter 1 HIGH CONFIRMED(空交付盖章链)+1 LOW-MED+
+1 LOW(dict 缺键无活体生产者，fail-closed 属仓规先例)。
+质量闸：RED 1→GREEN 7；相邻 merge 面回归 49/49；revert-check 红；全量绿。

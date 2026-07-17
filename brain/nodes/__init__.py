@@ -3474,8 +3474,39 @@ def merge(state: BrainState) -> dict:
 
     logger.info(f"[MERGE] 合并 {len(subtask_results)} 个子任务的 diff")
 
+    # R65D-T3 交付面闸（round65d 毒树四株）：MERGE 只收 L1 通过的产物——fail-closed。
+    # L1-fail result 出现在 MERGE 输入=上游处置层已破防（#60 铁律的下一层闸），照单全收
+    # 会把拒工书/必死 typo 合进交付树，且毒残留会被下一轮读树取证当权威（round47）。
+    # give-up 桩/revert 的 l1_passed=True 不受影响。被剔者与 D7 孤儿同口径入账（下方）。
+    from swarm.brain.nodes.shared import l1_passed as _merge_l1p
+    _l1_rejected = sorted(sid for sid, o in subtask_results.items()
+                          if not _merge_l1p(o))
+    if _l1_rejected:
+        # 足迹审计（毒株落点）整块 best-effort——猎手 LOW-MED：import/解析任何一环
+        # 挂掉都绝不能拖垮剔除闸本体。
+        _rej_files: dict[str, list[str]] = {}
+        try:
+            from swarm.project.diff_apply import files_from_unified_diff as _ffud
+            for _sid in _l1_rejected:
+                _o = subtask_results.get(_sid)
+                _d = (getattr(_o, "diff", None)
+                      or (_o.get("diff") if isinstance(_o, dict) else "") or "")
+                try:
+                    _rej_files[_sid] = sorted(_ffud(_d))[:8]
+                except Exception:  # noqa: BLE001 — 足迹解析失败不阻断剔除
+                    _rej_files[_sid] = ["<diff 解析失败>"]
+        except Exception:  # noqa: BLE001
+            _rej_files = dict.fromkeys(_l1_rejected, ["<足迹审计不可用>"])
+        logger.error(
+            "[MERGE] ⚠️ R65D-T3 交付面闸：%d 个 L1-fail 产物混入 MERGE 输入 → 剔除、"
+            "绝不合入交付树（上游处置层破防信号，round65d 毒树四株死型）；"
+            "被剔足迹（文件落点，供毒株审计）=%s",
+            len(_l1_rejected), _rej_files)
+
     subtask_diffs: list[tuple[str, str]] = []
     for subtask_id, output in subtask_results.items():
+        if subtask_id in _l1_rejected:
+            continue
         if isinstance(output, WorkerOutput):
             subtask_diffs.append((subtask_id, output.diff or ""))
         elif isinstance(output, dict):
@@ -3604,15 +3635,21 @@ def merge(state: BrainState) -> dict:
         ),
     )
     out: dict = {"merged_diff": result.merged_diff, **merge_touch}
-    if _orphan_abandoned:
-        # D7：被剔孤儿 sid 并入 abandoned（终态诚实 PARTIAL）+ pop 完成态（不再算 DONE）
+    if _orphan_abandoned or _l1_rejected:
+        # D7：被剔孤儿 sid 并入 abandoned（终态诚实 PARTIAL）+ pop 完成态（不再算 DONE）。
+        # R65D-T3：L1-fail 被剔者同口径入账 + degraded_reasons 机读留痕。
         out["abandoned_subtask_ids"] = sorted(
-            set(state.get("abandoned_subtask_ids") or []) | set(_orphan_abandoned))
+            set(state.get("abandoned_subtask_ids") or [])
+            | set(_orphan_abandoned) | set(_l1_rejected))
         _sr_after_orphan = dict(subtask_results)
-        for _sid in _orphan_abandoned:
+        for _sid in (*_orphan_abandoned, *_l1_rejected):
             _sr_after_orphan.pop(_sid, None)
         out["subtask_results"] = _sr_after_orphan
         subtask_results = _sr_after_orphan
+        if _l1_rejected:
+            out["degraded_reasons"] = (
+                list(out.get("degraded_reasons") or [])
+                + [f"merge_rejected_l1_fail:{s}" for s in _l1_rejected])
 
     # H3 纪律：BrainState 无 reducer（last-write-wins），clean merge 必须显式回写
     # rebase_subtask_ids=[]，否则上一轮的非空 rebase 列表会残留，导致 after_merge
@@ -3629,6 +3666,27 @@ def merge(state: BrainState) -> dict:
     # 本函数下方 apply-check 失败 / rebase 超限硬冲突两条 escalate 路径在同一 out 覆盖为
     # True（A6 每轮独立判定，语义不变）。与上面 merge_conflicts 的 round27 修法对称。
     out["failure_escalated"] = False
+
+    # R65D-T3 剔除规模闸（猎手 HIGH CONFIRMED + 复核 MED）：全员被剔=空 diff 会被
+    # merge_diffs([]) 判 success、COMPLEX 路径确定性检查全跳、裸 LLM 可能给空交付盖章
+    # 自动放行——round65c「有放弃绝不称全部完成」同缺口在 MERGE 层复现；超规模剔除同理
+    # （R65C-T2 连坐规模闸先例：大额缩水绝不静默）。两形态一律 escalate 人工 fail-closed
+    # （abandoned/degraded 照记=终态诚实 PARTIAL，但绝不自动放行）。必须在上方
+    # failure_escalated=False 粘滞清理【之后】落标记，否则被清掉。
+    if _l1_rejected:
+        _plan_n = len(getattr(state.get("plan"), "subtasks", None) or []) or len(
+            state.get("subtask_results") or {})
+        _rej_cap = max(10, int(_plan_n * 0.25))
+        if not subtask_diffs or len(_l1_rejected) > _rej_cap:
+            logger.error(
+                "[MERGE] ⚠️ R65D-T3 剔除规模闸：被剔 %d（阈值 %d，计划 %d）%s → "
+                "escalate 人工 fail-closed，绝不把大额剔除/空交付当干净合并自动放行",
+                len(_l1_rejected), _rej_cap, _plan_n,
+                "，且无任何幸存产物（空交付）" if not subtask_diffs else "")
+            out["failure_escalated"] = True
+            out["failure_strategy"] = "escalate"
+            out["l2_passed"] = False
+            out["verification_failure"] = "merge_l1_reject_mass"
 
     # #1(a) fail-closed：终局干净合并但 merged_diff `git apply --check` 失败＝确定性组装缺陷。
     # 绝不能只诊断后默认落 VERIFY_L2（project_path 空时 L2 复核整块跳过 → 非法 patch 假绿放行）。
