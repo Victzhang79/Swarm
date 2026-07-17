@@ -604,6 +604,7 @@ def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str |
 async def _generate_compile_stub(
     state: BrainState, st, project_path: str | None,
     protected_files: set[str] | None = None,
+    required_files: set[str] | None = None,
 ) -> str | None:
     """卡死子任务恢复阶梯·阶梯三(stub)：为【被依赖】的卡死子任务生成可编译桩。
 
@@ -621,9 +622,13 @@ async def _generate_compile_stub(
     if not footprint:
         return None
     # 只为【会产出代码的源文件】打桩（排除 pom/配置/资源等非代码足迹，避免乱改构建文件）。
+    # R65C-T3 例外：下游 upstream_artifacts 明确声明的产物（含非代码，如模块构建清单）
+    # 是种子闸的硬要求——缺一个下游必 BLOCKED 永堵，桩必须覆盖，故对声明项让路。
     _CODE_EXT = (".java", ".kt", ".go", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".cs", ".scala")
     code_files = [f for f in footprint if f.lower().endswith(_CODE_EXT)]
-    if not code_files:
+    _required = {f for f in (required_files or set()) if f in footprint}
+    _req_extra = sorted(_required - set(code_files))  # 声明的非代码产物
+    if not code_files and not _req_extra:
         return None
     # lazy import：_get_brain_llm 定义在 nodes/__init__（本模块被其 eager import 做 re-export，
     # 不可反向 eager import，否则重建 A6 环）；call-time import 也让 patch(nodes._get_brain_llm) 生效。
@@ -642,10 +647,15 @@ async def _generate_compile_stub(
             "`throw new Error(\"TODO: not implemented\");`；.go→`panic(\"TODO: not implemented\")`；"
             ".py→`raise NotImplementedError(...)`；其它语言用其惯用未实现抛错）。\n"
             "3. 桩必须能通过编译（import/包声明/类型完整），绝不留语法错误或未解析符号。\n"
-            "4. 仅输出 JSON：{\"files\": {\"<相对路径>\": \"<完整文件内容>\"}}，不要解释。\n\n"
+            "4. 仅输出 JSON：{\"files\": {\"<相对路径>\": \"<完整文件内容>\"}}，不要解释。\n"
+            + (("5. 【下游硬依赖清单】以下文件是下游子任务声明依赖的产物，无论类型必须"
+                "全部产出：非代码文件（构建清单/配置等）给出该类型的最小合法完整内容"
+                "（如构建清单坐标必须完整可被构建工具解析），绝不给空文件或占位注释：\n"
+                f"{_req_extra}\n") if _req_extra else "")
+            + "\n"
             f"子任务描述：{getattr(st, 'description', '')}\n"
             f"契约：{json.dumps(contract, ensure_ascii=False) if contract else '无'}\n"
-            f"需打桩的文件：{code_files}\n"
+            f"需打桩的文件：{sorted(set(code_files) | _required)}\n"
         )
         response = await llm.ainvoke([
             {"role": "system", "content": "你是资深工程师，生成最小可编译占位桩。只输出 JSON。"},
@@ -659,11 +669,12 @@ async def _generate_compile_stub(
     if not isinstance(files, dict) or not files:
         return None
     root = Path(project_path)
+    _allowed = set(code_files) | _required
     written: list[str] = []
     for rel, content in files.items():
         rel_norm = str(rel).strip().lstrip("/")
-        if not rel_norm or rel_norm not in code_files or not isinstance(content, str) or not content.strip():
-            continue  # 只接受落在 X 足迹内的代码文件，杜绝越权写其它路径
+        if not rel_norm or rel_norm not in _allowed or not isinstance(content, str) or not content.strip():
+            continue  # 只接受落在 X 足迹内的代码文件/下游声明产物，杜绝越权写其它路径
         abs_f = root / rel_norm
         try:
             abs_f.parent.mkdir(parents=True, exist_ok=True)
@@ -672,6 +683,24 @@ async def _generate_compile_stub(
         except OSError as exc:
             logger.debug("[阶梯三·桩] 写文件失败 %s: %s", rel_norm, exc)
     if not written:
+        return None
+    # R65C-T3 完备性闸：下游声明的 provenance 有缺 → 桩不完整（下游种子闸必 BLOCKED
+    # 永堵，#53 修①后还会反复撞闸烧失败预算）→ 清理已写半桩回退 revert（诚实连坐），
+    # 绝不产出 settled-with-product 的假桩。
+    _missing_req = _required - set(written)
+    if _missing_req:
+        logger.warning(
+            "[阶梯三·桩] 子任务 %s 桩缺下游声明的 provenance %s（LLM 未产出/内容为空）"
+            "——桩不完整判失败，清理半桩回退 revert（下游诚实连坐，绝不留永堵假桩）",
+            getattr(st, "id", "?"), sorted(_missing_req))
+        _rev = _local_tree_revert_subtask(project_path, st, protected_files=protected_files or set(),
+                                          base_ref=state.get("base_commit"))
+        if _rev.get("revert_failed"):
+            # 猎手 F1：清理失败=半桩仍在树上（会毒 build 且零 provenance）——硬告警留痕；
+            # 调用方 revert 路会对同足迹再清一次，仍失败则记入其 l1_details.revert_failed。
+            logger.error(
+                "[阶梯三·桩] 子任务 %s 半桩清理失败 %s——文件仍在树上，等 revert 路重清/"
+                "L2 终态闸兜底", getattr(st, "id", "?"), _rev["revert_failed"])
         return None
     diff = _git_diff_for_paths(project_path, written, base_ref=state.get("base_commit"))
     if not diff.strip():
@@ -711,6 +740,9 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
     give_up = set(state.get("give_up_isolated_ids") or [])
     abandoned = set(state.get("abandoned_subtask_ids") or [])
     handled: list[tuple[str, str]] = []
+    # 猎手 F2：连坐放弃的下游 WorkerOutput 会被 pop（无 l1_details 可挂账）——其足迹
+    # 清理失败必须走 degraded_reasons（reducer 通道）留机读痕，绝不随 pop 消失。
+    cascade_revert_failed: list[str] = []
 
     for fid in failed_ids:
         st = by_id.get(fid)
@@ -721,8 +753,34 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
         if depended:
             # round27：桩生成内部的 diff 失败清理路径也按 H-exec2 护住已完成兄弟产物。
             _prot_stub = _files_owned_by_completed(subtasks, subtask_results, exclude_ids={fid})
+            # R65C-T3：下游 upstream_artifacts 声明的、落在 X 足迹内的产物 = 桩的硬覆盖
+            # 目标（种子闸 #12 的判据面，含非代码文件）。
+            # 猎手 F2（CONFIRMED HIGH）整改：两侧都过权威归一器 _norm_scope_path
+            # （R41 实证 './'/反斜杠口径漂移是真实病）——弱归一会让 required 静默算空，
+            # 完备性闸退化 no-op 且零留痕；匹配结果收敛回【足迹原形】保持下游比较一致。
+            from swarm.brain.contract_utils import _norm_scope_path
+            _fp_by_norm = {_norm_scope_path(f): f for f in _subtask_footprint(st)}
+            _required_by_downstream: set[str] = set()
+            _declared_n = 0
+            for s in subtasks:
+                if fid in (getattr(s, "depends_on", []) or []):
+                    for ua in (getattr(getattr(s, "scope", None), "upstream_artifacts", []) or []):
+                        _declared_n += 1
+                        hit = _fp_by_norm.get(_norm_scope_path(str(ua).strip()))
+                        if hit is not None:
+                            _required_by_downstream.add(hit)
+            if _declared_n:
+                # 声明→匹配计数留痕：matched=0 时完备性闸等于未启用（声明可能指向
+                # 其它上游，也可能是口径漂移）——必须可观测，绝不静默 no-op。
+                logger.info(
+                    "[阶梯三·桩] %s 下游声明 upstream_artifacts %d 条，落在其足迹内 %d 条"
+                    "（=桩硬覆盖目标）%s",
+                    fid, _declared_n, len(_required_by_downstream),
+                    "" if _required_by_downstream else
+                    "——完备性闸无目标（若声明本应指向该上游，查路径口径）")
             stub_diff = await _generate_compile_stub(state, st, project_path,
-                                                     protected_files=_prot_stub)
+                                                     protected_files=_prot_stub,
+                                                     required_files=_required_by_downstream)
         if stub_diff:
             mode = "stub"
             subtask_results[fid] = WorkerOutput(
@@ -739,13 +797,28 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
             rev = _local_tree_revert_subtask(project_path, st, protected_files=_prot,
                                              base_ref=state.get("base_commit"))
             mode = "revert"
+            # 猎手 F1（CONFIRMED HIGH）：revert_failed 非空=树仍脏（git checkout/unlink
+            # 失败），账面绝不能写「已清」——摘要如实 + l1_details 机读留痕（L2 终态闸
+            # 兜真毒面；这里保 settled 终态语义不翻 l1_passed，防重入失败处理空转）。
+            _rev_failed = list(rev.get("revert_failed") or [])
+            if _rev_failed:
+                logger.error(
+                    "[阶梯三·revert] %s 足迹清理不完整 revert_failed=%s——残留文件可能"
+                    "毒 build，已机读留痕，L2 终态闸兜底", fid, _rev_failed)
+            _l1d_rev = {"given_up": True, "give_up_mode": "revert"}
+            if _rev_failed:
+                _l1d_rev["revert_failed"] = _rev_failed
             subtask_results[fid] = WorkerOutput(
                 subtask_id=fid, diff="",
-                summary=(f"[阶梯三·revert] {fid} 卡死 → 已清本地树足迹"
-                         f"(reverted={rev['reverted']}, removed={rev['removed']})，"
-                         "build 不被毒、其余成果照常交付，需人工补完"),
+                summary=((f"[阶梯三·revert] {fid} 卡死 → 足迹清理不完整"
+                          f"(revert_failed={_rev_failed}, reverted={rev['reverted']}, "
+                          f"removed={rev['removed']})，残留文件可能毒 build，需人工清理补完")
+                         if _rev_failed else
+                         (f"[阶梯三·revert] {fid} 卡死 → 已清本地树足迹"
+                          f"(reverted={rev['reverted']}, removed={rev['removed']})，"
+                          "build 不被毒、其余成果照常交付，需人工补完")),
                 l1_passed=True,
-                l1_details={"given_up": True, "give_up_mode": "revert"},
+                l1_details=_l1d_rev,
                 confidence=Confidence.LOW,
             )
             # revert 路：X 被依赖 → 其下游缺依赖跑不了 → 传递放弃（清足迹防毒 + 出完成态）。
@@ -761,8 +834,17 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
                         # H-exec2：级联放弃下游清足迹时，同样护住其它已完成兄弟的有效产物。
                         _prot_c = _files_owned_by_completed(
                             subtasks, subtask_results, exclude_ids=_closed | {fid})
-                        _local_tree_revert_subtask(project_path, s, protected_files=_prot_c,
-                                                   base_ref=state.get("base_commit"))
+                        _rev_c = _local_tree_revert_subtask(
+                            project_path, s, protected_files=_prot_c,
+                            base_ref=state.get("base_commit"))
+                        if _rev_c.get("revert_failed"):
+                            logger.error(
+                                "[阶梯三·连坐] 放弃下游 %s 足迹清理不完整 revert_failed=%s"
+                                "——残留文件可能毒 build，已入 degraded_reasons 机读账",
+                                s.id, _rev_c["revert_failed"])
+                            cascade_revert_failed.append(
+                                "cascade_revert_failed:%s:%s"
+                                % (s.id, ",".join(_rev_c["revert_failed"][:3])))
                         subtask_results.pop(s.id, None)
         give_up.add(fid)
         handled.append((fid, mode))
@@ -776,7 +858,7 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
         "run 继续 merge→L2，终态将 PARTIAL 诚实列明需人工补完）；连坐放弃下游 %d 个",
         handled, len(abandoned),
     )
-    return {
+    out = {
         "plan": plan_obj,
         "subtask_results": subtask_results,
         "dispatch_remaining": dispatch_remaining,
@@ -785,3 +867,7 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
         "give_up_isolated_ids": sorted(give_up),
         "abandoned_subtask_ids": sorted(abandoned),
     }
+    if cascade_revert_failed:
+        # degraded_reasons 是 reducer 通道（append+dedup）——被 pop 的连坐下游唯一账面
+        out["degraded_reasons"] = cascade_revert_failed
+    return out

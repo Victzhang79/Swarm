@@ -179,6 +179,184 @@ def test_giveup_depended_stub_fail_falls_back_revert_and_abandons_dependents(tmp
     assert not (repo / "X.java").exists()
 
 
+# ── R65C-T3：桩必须覆盖下游声明的 provenance（upstream_artifacts 完备性）────
+def _stub_llm_returning(files: dict):
+    import json as _json
+
+    class _Resp:
+        def __init__(self, c):
+            self.content = c
+
+    class _L:
+        async def ainvoke(self, _msgs):
+            return _Resp(_json.dumps({"files": files}, ensure_ascii=False))
+
+    return lambda: _L()
+
+
+def _plan_with_declared_downstream(x_files, declared):
+    return TaskPlan(subtasks=[
+        _st("st-x", create_files=list(x_files)),
+        SubTask(id="st-d", description="下游", difficulty=SubTaskDifficulty.MEDIUM,
+                scope=FileScope(create_files=["m/src/B.java"],
+                                upstream_artifacts=list(declared)),
+                depends_on=["st-x"]),
+    ])
+
+
+def test_stub_missing_downstream_provenance_falls_back_revert(tmp_path):
+    """R65C-T3（round65c 实锤面）：下游 upstream_artifacts 声明了上游的 pom，桩只
+    产出代码文件 → 桩不完整（下游种子闸必 BLOCKED 永堵，#53 修①后还会反复撞闸
+    烧失败预算）→ 必须回退 revert 诚实连坐，绝不 settled-with-product 假桩；
+    不完整桩已写的文件必须清理，防半桩毒树。"""
+    import swarm.brain.nodes as nodes
+    repo = _git_repo(tmp_path)
+    plan = _plan_with_declared_downstream(
+        ["m/pom.xml", "m/src/A.java"], ["m/pom.xml", "m/src/A.java"])
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False), "st-d": _wo("st-d")},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_git_diff_for_paths",
+                      lambda *a, **k: "diff --git a/m/src/A.java b/m/src/A.java\n+stub"), \
+         patch.object(nodes, "_get_brain_llm",
+                      _stub_llm_returning({"m/src/A.java": "public class A {}"})):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    xo = out["subtask_results"]["st-x"]
+    assert xo.l1_details.get("give_up_mode") == "revert", \
+        "桩缺下游声明的 m/pom.xml → 不完整，必须回退 revert 而非假桩"
+    assert "st-d" in out["abandoned_subtask_ids"], "revert 路下游诚实连坐"
+    assert not (repo / "m" / "src" / "A.java").exists(), "不完整桩的已写文件必须清理"
+
+
+def test_stub_accepts_downstream_declared_noncode_files(tmp_path):
+    """R65C-T3：下游声明的非代码产物（构建清单等）必须允许打桩落树——_CODE_EXT
+    过滤只适用于【未被下游声明】的文件。LLM 全覆盖时桩成立、pom 真实落树。"""
+    import swarm.brain.nodes as nodes
+    repo = _git_repo(tmp_path)
+    plan = _plan_with_declared_downstream(
+        ["m/pom.xml", "m/src/A.java"], ["m/pom.xml", "m/src/A.java"])
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False), "st-d": _wo("st-d")},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_git_diff_for_paths",
+                      lambda *a, **k: "diff --git a/m/pom.xml b/m/pom.xml\n+stub"), \
+         patch.object(nodes, "_get_brain_llm", _stub_llm_returning({
+             "m/src/A.java": "public class A {}",
+             "m/pom.xml": "<project><modelVersion>4.0.0</modelVersion></project>",
+         })):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    xo = out["subtask_results"]["st-x"]
+    assert xo.l1_details.get("give_up_mode") == "stub", "provenance 全覆盖 → 桩成立"
+    assert out["abandoned_subtask_ids"] == [], "桩完整 → 下游不连坐"
+    assert (repo / "m" / "pom.xml").exists(), "下游声明的 pom 必须真实落树（种子闸依据）"
+
+
+def test_stub_ignores_undeclared_noncode_files(tmp_path):
+    """行为锁（两侧恒绿）：足迹里未被任何下游声明的非代码文件仍被过滤——
+    「不乱碰构建文件」原则只对下游明确声明的 provenance 让路。"""
+    import swarm.brain.nodes as nodes
+    repo = _git_repo(tmp_path)
+    plan = _plan_with_declared_downstream(
+        ["m/pom.xml", "m/src/A.java"], ["m/src/A.java"])  # 下游只声明代码文件
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False), "st-d": _wo("st-d")},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_git_diff_for_paths",
+                      lambda *a, **k: "diff --git a/m/src/A.java b/m/src/A.java\n+stub"), \
+         patch.object(nodes, "_get_brain_llm", _stub_llm_returning({
+             "m/src/A.java": "public class A {}",
+             "m/pom.xml": "<project/>",
+         })):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    xo = out["subtask_results"]["st-x"]
+    assert xo.l1_details.get("give_up_mode") == "stub"
+    assert not (repo / "m" / "pom.xml").exists(), \
+        "未被下游声明的构建文件绝不打桩（越权写过滤不回归）"
+
+
+def test_required_set_uses_canonical_normalization(tmp_path):
+    """猎手 R65C-T3 F2（CONFIRMED HIGH）：下游声明带 './' 前缀/反斜杠的路径口径漂移
+    （R41 实证过的真实病）必须仍匹配上游足迹——否则 required 集静默算空，完备性闸
+    退化为 no-op，round65c 死法零留痕复发。"""
+    import swarm.brain.nodes as nodes
+    repo = _git_repo(tmp_path)
+    plan = _plan_with_declared_downstream(
+        ["m/pom.xml", "m/src/A.java"], ["./m/pom.xml", "m\\src\\A.java"])
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False), "st-d": _wo("st-d")},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_git_diff_for_paths",
+                      lambda *a, **k: "diff --git a/m/src/A.java b/m/src/A.java\n+stub"), \
+         patch.object(nodes, "_get_brain_llm",
+                      _stub_llm_returning({"m/src/A.java": "public class A {}"})):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    xo = out["subtask_results"]["st-x"]
+    assert xo.l1_details.get("give_up_mode") == "revert", \
+        "口径漂移的声明必须归一后匹配足迹——桩缺 pom 应判不完整回退 revert"
+
+
+def test_cascade_revert_failure_goes_to_degraded_reasons(tmp_path):
+    """猎手 F2（CONFIRMED）：连坐放弃的下游 WorkerOutput 被 pop（无 l1_details 可挂账）
+    ——其足迹清理失败必须走 degraded_reasons 机读留痕，绝不随 pop 无迹消失。"""
+    repo = _git_repo(tmp_path)
+    plan = TaskPlan(subtasks=[
+        _st("st-x", create_files=["X.java"]),
+        _st("st-2", create_files=["Y.java"], depends_on=["st-x"]),
+    ])
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False), "st-2": _wo("st-2")},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+
+    def _dirty_only_downstream(project_path, st_, protected_files=None, base_ref=None):
+        if getattr(st_, "id", "") == "st-2":
+            return {"reverted": [], "removed": [], "revert_failed": ["Y.java"],
+                    "skipped_protected": []}
+        return {"reverted": [], "removed": ["X.java"], "revert_failed": [],
+                "skipped_protected": []}
+
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_generate_compile_stub", new=_async_return(None)), \
+         patch.object(pc, "_local_tree_revert_subtask", _dirty_only_downstream):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    assert "st-2" in out["abandoned_subtask_ids"]
+    _dr = out.get("degraded_reasons") or []
+    assert any(d.startswith("cascade_revert_failed:st-2") for d in _dr), \
+        f"连坐下游清理失败必须入 degraded_reasons 机读账，得 {_dr}"
+
+
+def test_revert_failure_surfaced_in_ledger(tmp_path):
+    """猎手 R65C-T3 F1（CONFIRMED HIGH）：revert 清理失败（revert_failed 非空=树仍脏）
+    绝不能账面写「已清」——必须机读留痕 l1_details.revert_failed，摘要如实说清理不完整。"""
+    repo = _git_repo(tmp_path)
+    plan = TaskPlan(subtasks=[_st("st-x", create_files=["X.java"])])
+    state = {"plan": plan, "project_id": "p1",
+             "subtask_results": {"st-x": _wo("st-x", ok=False)},
+             "dispatch_remaining": [], "give_up_isolated_ids": [],
+             "abandoned_subtask_ids": []}
+
+    def _dirty_revert(project_path, st_, protected_files=None, base_ref=None):
+        return {"reverted": [], "removed": [], "revert_failed": ["X.java"],
+                "skipped_protected": []}
+
+    with patch.object(pc, "_proj_path_from_state", return_value=str(repo)), \
+         patch.object(pc, "_local_tree_revert_subtask", _dirty_revert):
+        out = _run(_give_up_preserve_build(state, ["st-x"]))
+    xo = out["subtask_results"]["st-x"]
+    assert xo.l1_details.get("revert_failed") == ["X.java"], \
+        "清理失败必须机读留痕（revert_failed 写进 l1_details）"
+    assert "已清本地树足迹" not in (xo.summary or ""), \
+        "树仍脏时摘要绝不能声称『已清本地树足迹』"
+
+
 # ── handle_failure 端到端：耗尽 + 单文件(阶梯二拆不动) → 阶梯三 give_up，非 escalate ──
 def test_handle_failure_exhausted_single_file_giveup_not_escalate(tmp_path):
     repo = _git_repo(tmp_path)
