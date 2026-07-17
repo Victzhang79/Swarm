@@ -55,9 +55,15 @@ _WORKSPACE_LIST_CAP = _workspace_list_cap()
 _BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
 
 
-def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> set[str]:
+def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> set[str] | None:
     """一次 `git ls-tree -r --name-only <ref> -- <paths>` 批量判定哪些相对路径
     【真实存在于钉扎 base 树】。
+
+    R65TR-T1 三态：返回 None=git 故障（rc≠0/异常）；返回空集=命令成功、候选
+    权威不在 base 树（棕地新建/greenfield 的定义使然形态）。治后回放实证二态
+    混同的代价：clean_upload 侧 59/59 把权威空集误诊成"git 故障"WARN（真
+    [git_tracked_set] 故障 0 条），两轮噪音淹没真信号；reset 侧反向——真故障
+    被当空集走定义使然 INFO 静默降级。调用方必须分流 None 与空集。
 
     round29 遗漏项#3 口径修正：原用 `git ls-files`（**index 口径**）——pull-back/diff 收集
     对 untracked 新文件跑 `git add -N`（intent-to-add）后，占位文件进 index 被误判 tracked，
@@ -67,9 +73,8 @@ def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> se
         → 防脏叠加护栏对【全部】文件静默失效（现场 pathspec 警告即此）。
     两个调用方要的语义都是「存在于 base 树」→ ls-tree（对象树口径，locale 无关）。
 
-    round27 perf 语义保留：单次批量判定替代 N 次进程 spawn。失败 fail-safe 返回空集
-    （调用方语义 = 全部按 untracked 处理）。模块级函数（非 mixin 方法）：测试用
-    SimpleNamespace stub 绑定 mixin 方法，self 上取不到兄弟新方法。"""
+    round27 perf 语义保留：单次批量判定替代 N 次进程 spawn。模块级函数（非 mixin
+    方法）：测试用 SimpleNamespace stub 绑定 mixin 方法，self 上取不到兄弟新方法。"""
     import subprocess
     if not rels:
         return set()
@@ -79,20 +84,20 @@ def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> se
             cwd=str(local_root), capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
-            # 批量版一次失败 = 调用方整个护栏（reset 防脏/clean_upload 防脏叠加）按
-            # "全 untracked"降级——必须可观测，否则与"真没有 tracked 文件"不可区分。
+            # 批量版一次失败 = 调用方整个护栏（reset 防脏/clean_upload 防脏叠加）失效——
+            # 返回 None 让调用方按真故障分流（warning 留痕+降级），绝不与权威空集混同。
             logger.warning(
-                "[git_tracked_set] git ls-tree 非零(rc=%d, %d 路径, cwd=%s)，按全 untracked 降级: %s",
+                "[git_tracked_set] git ls-tree 非零(rc=%d, %d 路径, cwd=%s)，判定失败: %s",
                 r.returncode, len(rels), local_root, (r.stderr or "").strip()[:200],
             )
-            return set()
+            return None
         return {p for p in r.stdout.split("\0") if p}
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[git_tracked_set] git ls-tree 异常(%d 路径, cwd=%s)，按全 untracked 降级: %s",
+            "[git_tracked_set] git ls-tree 异常(%d 路径, cwd=%s)，判定失败: %s",
             len(rels), local_root, exc,
         )
-        return set()
+        return None
 
 class _SandboxSyncMixin:
     """WorkerExecutor 的沙箱同步 / git / scope 方法簇（见模块 docstring）。
@@ -449,8 +454,18 @@ class _SandboxSyncMixin:
             return 0
 
         # 只保留 git 跟踪的文件（round27 perf：单次 ls-files 批量判定，替代逐文件 N 进程）
-        tracked = sorted(_git_tracked_set(
-            local_root, sorted(candidates), resolve_base_ref(getattr(self, 'base_ref', None))))
+        _tracked_r = _git_tracked_set(
+            local_root, sorted(candidates), resolve_base_ref(getattr(self, 'base_ref', None)))
+        if _tracked_r is None:
+            # R65TR-T1：真 git 故障（判定层已打 [git_tracked_set] WARNING）→ 任务级
+            # warning 留痕并跳过 reset（fail-open 保执行；绝不在故障状态下动工作树）。
+            self._log(
+                f"workspace reset: tracked 批量判定 git 故障 → 本轮防脏叠加 reset "
+                f"降级跳过 {len(candidates)} 个候选（详见 [git_tracked_set] WARNING）",
+                level="warning",
+            )
+            return 0
+        tracked = sorted(_tracked_r)
         if not tracked:
             # 遗漏项#3 复核（hunter#2）：候选非空却全不在 base 树时防脏叠加 reset 失效——任务级留痕。
             # round36 #12 治本：区分【良性全新建】(候选全是 create_files，本就不在 base、无需 reset)
@@ -594,15 +609,18 @@ class _SandboxSyncMixin:
                         if _lt.returncode == 0:
                             _in_head_set = {p for p in _lt.stdout.split("\0") if p}
                         else:
+                            # G1-4/R65TR-T1 猎手：真故障要真级别，[WARN]-in-INFO 是监控面静默
                             self._log(
-                                f"[WARN] {reason} ls-tree 非零(rc={_lt.returncode})，"
+                                f"{reason} ls-tree 非零(rc={_lt.returncode})，"
                                 f"{len(_readable_rels)} 个 readable 全量按补传降级（多传不漏传）: "
-                                f"{(_lt.stderr or '').strip()[:120]}"
+                                f"{(_lt.stderr or '').strip()[:120]}",
+                                level="warning",
                             )
                     except Exception as _lt_exc:  # noqa: BLE001
                         self._log(
-                            f"[WARN] {reason} ls-tree 异常，{len(_readable_rels)} 个 readable "
-                            f"全量按补传降级（多传不漏传）: {_lt_exc}"
+                            f"{reason} ls-tree 异常，{len(_readable_rels)} 个 readable "
+                            f"全量按补传降级（多传不漏传）: {_lt_exc}",
+                            level="warning",
                         )
                         _in_head_set = set()
                 for rel in _readable_rels:
@@ -709,7 +727,6 @@ class _SandboxSyncMixin:
         upload_root = local_root
         staging_dir: str | None = None
         if clean_upload:
-            import subprocess as _sp
             try:
                 staging_dir = tempfile.mkdtemp(prefix="swarm_clean_upload_")
                 staging_root = Path(staging_dir)
@@ -722,34 +739,28 @@ class _SandboxSyncMixin:
                 _tracked_writables = _git_tracked_set(
                     local_root, _writable_candidates,
                     resolve_base_ref(getattr(self, 'base_ref', None)))
-                if _writable_candidates and not _tracked_writables:
-                    # hunter round27 HIGH：批量判定失败 = 整个 clean_upload 防脏叠加机制
-                    # 按"全 untracked→copy 脏磁盘"静默失效。R65D-W3④：greenfield（仓库
-                    # 本就零 tracked 文件=全新建预期形态）与 git 故障分级——前者 INFO
-                    # 后者 WARN，round65d 复盘时两者混一条 WARN 无法判读。
-                    _repo_has_tracked = False
-                    try:
-                        # 猎手 HIGH：同函数惯例 to_thread 卸载——直调 subprocess 会把
-                        # 全部并发 worker/brain/SSE/心跳冻结在事件循环上（本文件自述铁律）
-                        _r_ls = await asyncio.to_thread(
-                            _sp.run,
-                            ["git", "-C", str(local_root), "ls-files", "-z"],
-                            capture_output=True, timeout=10)
-                        _repo_has_tracked = bool((_r_ls.stdout or b"").strip())
-                    except Exception:  # noqa: BLE001 — 探测失败按可疑（WARN）处理
-                        _repo_has_tracked = True
-                    if _repo_has_tracked:
+                if _tracked_writables is None:
+                    # R65TR-T1 三态分流：None=真 git 故障（判定层已打 [git_tracked_set]
+                    # WARNING）→ 护栏确实失效，真 warning 级留痕后降级脏盘上传（fail-open
+                    # 保执行）。旧实现用"整仓 ls-files 有无 tracked"代理判故障，把棕地
+                    # 新建 writable 的权威空集（本轮 59/59 主流形态）也刷成故障 WARN。
+                    _tracked_writables = set()
+                    if _writable_candidates:
                         self._log(
-                            f"[WARN] {reason} clean_upload: tracked 判定空集但仓库确有 "
-                            f"tracked 文件（git 故障/超时/base_ref 异常）→ "
+                            f"{reason} clean_upload: tracked 批量判定 git 故障 → "
                             f"{len(_writable_candidates)} 个 writable 按脏磁盘上传，"
-                            f"防脏叠加护栏未生效"
+                            f"防脏叠加护栏未生效（详见 [git_tracked_set] WARNING）",
+                            level="warning",
                         )
-                    else:
-                        self._log(
-                            f"{reason} clean_upload: 仓库零 tracked 文件（greenfield 全新建，"
-                            f"预期形态）→ {len(_writable_candidates)} 个 writable 按磁盘上传"
-                        )
+                elif _writable_candidates and not _tracked_writables:
+                    # 命令成功的空集是权威答案：writable 均不在钉扎 base 树（棕地新建/
+                    # 上游产物被声明 writable-modify/greenfield），定义使然非故障——
+                    # HEAD 无此版，防脏叠加不适用，按磁盘上传是唯一可行行为。
+                    self._log(
+                        f"{reason} clean_upload: {len(_writable_candidates)} 个 writable "
+                        f"均不在钉扎 base 树（新建/上游产物 writable-modify，定义使然）"
+                        f"→ 按磁盘上传，防脏叠加不适用"
+                    )
                 for rel in rel_files:
                     dst = staging_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
