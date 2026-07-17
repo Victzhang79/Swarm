@@ -50,6 +50,7 @@ from swarm.worker.l1_verdict import (  # noqa: E402,F401
     _FLIPPABLE_SOURCES,
     _LOCATE_STEP_CAP,
     _LOCATE_STEP_CAP_MAX,
+    _det_fail_reason,  # R65TR-T2：移入 l1_verdict（仲裁器 stamp 单一源），此处保可寻址
     _det_fail_source,
     _is_refusal_or_truncated,
     _locate_step_cap,
@@ -85,58 +86,6 @@ class WorkerPhase(str, Enum):
     PRODUCING = "PRODUCING"     # Phase 4
     DONE = "DONE"
     FAILED = "FAILED"
-
-
-def _det_fail_reason(details: dict) -> str:
-    """R65D-W3①：确定性闸判死的机读 reason 提取——round65d st-26 冤案 79ms 判 False
-    全程零解释。单一提取点，判死日志必带。
-    猎手 HIGH：观测代码绝不反噬主流程——畸形 details 兑底成标记串而非冒泡崩 Phase-4。"""
-    try:
-        d = details if isinstance(details, dict) else {}
-        if d.get("verify_failed"):
-            return f"verify_failed: {str(d['verify_failed'])[:160]}"
-        if d.get("reason"):
-            _note = f" | {str(d['note'])[:120]}" if d.get("note") else ""
-            return f"reason: {str(d['reason'])[:160]}{_note}"
-        _sv = d.get("scope_violations")
-        if _sv:
-            _svl = list(_sv) if isinstance(_sv, (list, tuple, set)) else [_sv]
-            return f"scope_violations×{len(_svl)}: " \
-                   f"{[str(v)[:60] for v in _svl[:3]]}"
-        if d.get("pipeline_blocked"):
-            return f"pipeline_blocked: {str(d['pipeline_blocked'])[:120]}"
-        # 复核 HIGH：单文件编译闸失败时真错误在 compile_message（此形态 build_output
-        # 结构性缺席——early-return 于 harness 构建段之前），漏读=最常见判死形态
-        # 照旧空 reason。
-        # R65REPLAY 回放实锤修正：build 段失败时 compile_message 常是早段通过的
-        # "compile ok"——旧序无条件先引它 = 判死依据自相矛盾（"compile_fail: compile
-        # ok"）。按失败面取证：build 失败引 build_output 首个错误行。
-        if d.get("l1_2_1_build_ok") is False or d.get("build_failed"):
-            _bo = str(d.get("build_output") or "")
-            if not _bo.strip():
-                # 复核 F4：build_failed 存的是【构建命令】不是错误文本——空输出时绝不
-                # 让命令冒充诊断（貌似有内容的假 reason 比"无输出"更害排障）。
-                return ("build_fail: (构建无输出捕获) "
-                        f"cmd={str(d.get('build_failed') or '?')[:100]}")
-            # 复核 F5：错误行识别复用 output_compress 多栈信号正则（ERROR/error: 双
-            # 字面量漏 npm ERR!/Gradle FAILURE/中文 错误: 等口径）。
-            try:
-                from swarm.worker.output_compress import _SIGNAL_RE
-                _err = next((ln.strip() for ln in _bo.splitlines()
-                             if _SIGNAL_RE.search(ln)), _bo[:160])
-            except Exception:  # noqa: BLE001 — 正则源不可用退回双字面量
-                _err = next((ln.strip() for ln in _bo.splitlines()
-                             if "ERROR" in ln or "error:" in ln), _bo[:160])
-            return f"build_fail: {_err[:160]}"
-        if d.get("compile_message"):
-            return f"compile_fail: {str(d['compile_message'])[:160]}"
-        if d.get("l1_2_compile_ok") is False or d.get("build_output"):
-            return f"compile_fail: {str(d.get('build_output') or '')[:160]}"
-        if d.get("test_output"):
-            return f"test_fail: {str(d['test_output'])[:160]}"
-        return f"deterministic_gate={d.get('deterministic_gate', '?')}（无细分 reason 键）"
-    except Exception as _exc:  # noqa: BLE001 — 提取失败自报，绝不把判死日志崩成通用异常
-        return f"reason_extraction_failed:{type(_exc).__name__}"
 
 
 def _det_conflict_log_line(l1_details: dict, phase: str = "") -> str:
@@ -1221,36 +1170,91 @@ class WorkerExecutor(
         # 确定性 L1 闸门：trivial 路径过去仅靠 LLM 文本里有无 "fail" 判定（纯自报，
         # 曾让 "Sorry, need more steps" 也被判通过）。pull-back 后文件已在本地，
         # 用 harness 真跑 compile/test/verify 覆盖自报，杜绝幻觉 PASS。
-        # D53：卸线程（同步 build/git/flock 不冻结事件循环）
-        det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
-        # W1.2 commit②：trivial 也走单一仲裁器。此处 combined 已确认非 refusal（上方
-        # refusal 分支已早返），故 verify_result=None 避免重复 refusal 检测；llm_ok 语义
-        # 同 Phase-3：det_ok=None 时用弱自报，det_ok 非 None 时 llm_ok=True 让确定性权威。
-        _llm_ok_for_arbiter = llm_passed if det_ok is None else True
-        verdict = evaluate_l1(
-            det_ok=det_ok,
-            det_details={**l1_details, **det_details},
-            verify_result=None,
-            llm_ok=_llm_ok_for_arbiter,
-            prior=None,
-            phase="trivial",
-        )
-        l1_passed = bool(verdict.passed)
-        l1_details = {**l1_details, **verdict.details}
-        if det_ok is False and llm_passed:
-            # R65D-W3①②：同 Phase-4 口径——去冤案措辞+必带机读判死依据
-            self._log(_det_conflict_log_line(l1_details, phase="trivial"))
-        self._log(
-            f"trivial L1: {'通过 ✅' if l1_passed else '未通过 ❌'} "
-            f"| 来源: {l1_details.get('l1_decision_source')}"
-            + ("" if l1_passed
-               else f" | 判死依据: {_det_fail_reason(l1_details)}")
-        )
-        try:
-            from swarm.tracing import push_l1_feedback
-            push_l1_feedback(l1_details, l1_passed=l1_passed)
-        except Exception:  # noqa: BLE001
-            pass
+        # R65TR-T2 W1：判死后携判死原文一轮有界修复再复闸——回放实锤 st-2 五连派
+        # 判死依据（verify 缺 selectAlarmAppById）从未抵达模型，trivial 一锤定音
+        # 让 60 秒可修的缺口烧掉 5 个执行周期+连坐 28。拒答即止；默认开，
+        # SWARM_WORKER_TRIVIAL_REPAIR=false 关。
+        l1_passed = False
+        _repair_used = False
+        while True:
+            # D53：卸线程（同步 build/git/flock 不冻结事件循环）
+            det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
+            # W1.2 commit②：trivial 也走单一仲裁器。此处 combined 已确认非 refusal（上方
+            # refusal 分支已早返），故 verify_result=None 避免重复 refusal 检测；llm_ok 语义
+            # 同 Phase-3：det_ok=None 时用弱自报，det_ok 非 None 时 llm_ok=True 让确定性权威。
+            _llm_ok_for_arbiter = llm_passed if det_ok is None else True
+            verdict = evaluate_l1(
+                det_ok=det_ok,
+                det_details={**l1_details, **det_details},
+                verify_result=None,
+                llm_ok=_llm_ok_for_arbiter,
+                prior=None,
+                phase="trivial",
+            )
+            l1_passed = bool(verdict.passed)
+            l1_details = {**l1_details, **verdict.details}
+            if l1_passed:
+                # 修复轮翻盘后清陈旧判死依据（存在⟺判死；跨轮 merge 会残留首轮 stamp）
+                l1_details.pop("det_fail_reason", None)
+            if det_ok is False and llm_passed:
+                # R65D-W3①②：同 Phase-4 口径——去冤案措辞+必带机读判死依据
+                self._log(_det_conflict_log_line(l1_details, phase="trivial"))
+            self._log(
+                f"trivial L1: {'通过 ✅' if l1_passed else '未通过 ❌'} "
+                f"| 来源: {l1_details.get('l1_decision_source')}"
+                + ("" if l1_passed
+                   else f" | 判死依据: {_det_fail_reason(l1_details)}")
+            )
+            try:
+                from swarm.tracing import push_l1_feedback
+                push_l1_feedback(l1_details, l1_passed=l1_passed)
+            except Exception:  # noqa: BLE001
+                pass
+            if l1_passed or _repair_used:
+                break
+            if os.environ.get("SWARM_WORKER_TRIVIAL_REPAIR", "true").lower() in (
+                    "false", "0", "no"):
+                break
+            _repair_used = True
+            _reason = _det_fail_reason(l1_details)
+            self.phase = WorkerPhase.CODING
+            self._log(f"trivial: 确定性闸门未过 → 携判死依据修复一轮: {_reason[:160]}")
+            # 猎手 R65TR-T2 HIGH：修复轮是判死后的【增益尝试】，其 agent/pull-back 异常
+            # 绝不能把"判死但有产出+机读依据"劣化成"执行异常零产出"（异常路径的
+            # exception_l1_details 不带 det_fail_reason，会把 B1 装填也一并饿死）——
+            # 任何异常=跳过修复，保首轮判决与产出继续走 produce。
+            try:
+                # 复核 MED：修复轮必须带任务原意+上下文——只给判死原文会诱导"字面满足
+                # 式假修复"（如为过 grep 塞空壳方法），且模型从零重探烧步数。
+                _fix = await self._run_agent(
+                    "上一轮产出未通过确定性 L1 闸门。判死依据（机读，必须针对性修复）：\n"
+                    f"{_reason}\n\n"
+                    f"任务原意（修复必须仍满足它，不许为过闸门做空壳/假实现）：\n"
+                    f"{_strip_ann(self.subtask.description)}\n"
+                    f"{self._context_snippets_block()}\n"
+                    "请只做最小必要修复（仅 scope 内文件），修完立即停止，不要自跑构建。\n"
+                    "文件操作清单：\n"
+                    f"{self._scope_ops_hint()}\n",
+                    step="trivial-repair",
+                )
+            except Exception as _fix_exc:  # noqa: BLE001
+                self._log(
+                    f"trivial: 修复轮 agent 异常 → 跳过修复，保留首轮判死与产出: "
+                    f"{str(_fix_exc)[:120]}", level="warning")
+                self.phase = WorkerPhase.PRODUCING
+                break
+            if _is_refusal_or_truncated(_fix):
+                self._log("trivial: 修复轮拒答/截断 → 维持判死")
+                self.phase = WorkerPhase.PRODUCING
+                break
+            self.phase = WorkerPhase.PRODUCING
+            try:
+                await self._sync_from_sandbox("产出")
+            except Exception as _sync_exc:  # noqa: BLE001
+                self._log(
+                    f"trivial: 修复轮 pull-back 异常 → 保留首轮判死与产出: "
+                    f"{str(_sync_exc)[:120]}", level="warning")
+                break
 
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
         # D53：git diff 子进程 + flock 卸线程

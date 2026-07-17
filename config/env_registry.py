@@ -254,6 +254,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_WORKER_L1_SELF_REVIEW": "worker/l1_pipeline.py:3096",
     "SWARM_WORKER_RESET_SCOPE": "worker/executor_sync.py:410",
     "SWARM_WORKER_TDD_RED_GATE": "worker/executor_l1gate.py:311",
+    "SWARM_WORKER_TRIVIAL_REPAIR": "worker/executor.py:1215",
     "SWARM_WORKER_TDD_RED_STRICT": "worker/executor.py:904",
     "SWARM_WORKER_VERIFY_AGENT_STEP": "worker/executor.py:679",
     "SWARM_WORKER_VERIFY_BAIL_FRACTION": "worker/executor.py:292",

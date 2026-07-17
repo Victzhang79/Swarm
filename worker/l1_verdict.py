@@ -198,7 +198,88 @@ def _det_fail_source(det_details: dict) -> tuple[str, str]:
     return "deterministic", det_details.get("deterministic_gate") or "确定性闸门判失败"
 
 
+def _det_fail_reason(details: dict) -> str:
+    """R65D-W3①：确定性闸判死的机读 reason 提取——round65d st-26 冤案 79ms 判 False
+    全程零解释。单一提取点，判死日志必带。
+    猎手 HIGH：观测代码绝不反噬主流程——畸形 details 兑底成标记串而非冒泡崩 Phase-4。
+    R65TR-T2：从 executor.py 移入本模块（executor re-export 保可寻址）——evaluate_l1
+    失败时 stamp 进 details，供 brain 侧确定性装填 retry_guidance，免跨层 import。"""
+    try:
+        d = details if isinstance(details, dict) else {}
+        if d.get("verify_failed"):
+            return f"verify_failed: {str(d['verify_failed'])[:160]}"
+        if d.get("reason"):
+            _note = f" | {str(d['note'])[:120]}" if d.get("note") else ""
+            return f"reason: {str(d['reason'])[:160]}{_note}"
+        _sv = d.get("scope_violations")
+        if _sv:
+            _svl = list(_sv) if isinstance(_sv, (list, tuple, set)) else [_sv]
+            return f"scope_violations×{len(_svl)}: " \
+                   f"{[str(v)[:60] for v in _svl[:3]]}"
+        if d.get("pipeline_blocked"):
+            return f"pipeline_blocked: {str(d['pipeline_blocked'])[:120]}"
+        # 复核 HIGH：单文件编译闸失败时真错误在 compile_message（此形态 build_output
+        # 结构性缺席——early-return 于 harness 构建段之前），漏读=最常见判死形态
+        # 照旧空 reason。
+        # R65REPLAY 回放实锤修正：build 段失败时 compile_message 常是早段通过的
+        # "compile ok"——旧序无条件先引它 = 判死依据自相矛盾（"compile_fail: compile
+        # ok"）。按失败面取证：build 失败引 build_output 首个错误行。
+        if d.get("l1_2_1_build_ok") is False or d.get("build_failed"):
+            _bo = str(d.get("build_output") or "")
+            if not _bo.strip():
+                # 复核 F4：build_failed 存的是【构建命令】不是错误文本——空输出时绝不
+                # 让命令冒充诊断（貌似有内容的假 reason 比"无输出"更害排障）。
+                return ("build_fail: (构建无输出捕获) "
+                        f"cmd={str(d.get('build_failed') or '?')[:100]}")
+            # 复核 F5：错误行识别复用 output_compress 多栈信号正则（ERROR/error: 双
+            # 字面量漏 npm ERR!/Gradle FAILURE/中文 错误: 等口径）。
+            try:
+                from swarm.worker.output_compress import _SIGNAL_RE
+                _err = next((ln.strip() for ln in _bo.splitlines()
+                             if _SIGNAL_RE.search(ln)), _bo[:160])
+            except Exception:  # noqa: BLE001 — 正则源不可用退回双字面量
+                _err = next((ln.strip() for ln in _bo.splitlines()
+                             if "ERROR" in ln or "error:" in ln), _bo[:160])
+            return f"build_fail: {_err[:160]}"
+        if d.get("compile_message"):
+            return f"compile_fail: {str(d['compile_message'])[:160]}"
+        if d.get("l1_2_compile_ok") is False or d.get("build_output"):
+            return f"compile_fail: {str(d.get('build_output') or '')[:160]}"
+        if d.get("test_output"):
+            return f"test_fail: {str(d['test_output'])[:160]}"
+        return f"deterministic_gate={d.get('deterministic_gate', '?')}（无细分 reason 键）"
+    except Exception as _exc:  # noqa: BLE001 — 提取失败自报，绝不把判死日志崩成通用异常
+        return f"reason_extraction_failed:{type(_exc).__name__}"
+
+
 def evaluate_l1(
+    *,
+    det_ok: bool | None,
+    det_details: dict,
+    verify_result: str | None,
+    llm_ok: bool | None,
+    prior: L1Verdict | None,
+    phase: str,
+) -> L1Verdict:
+    """单一仲裁器出口包装（R65TR-T2 W2）：判死 verdict 必带机读
+    details["det_fail_reason"]（回放实锤：st-2 五连跑判死原文从未抵达重试模型——
+    brain 侧确定性装填 retry_guidance 的单一事实源在此 stamp）；通过时清除，
+    保持「存在⟺判死」不变量（trivial 修复轮跨次合并 details 不残留陈旧依据）。"""
+    verdict = _evaluate_l1_core(
+        det_ok=det_ok, det_details=det_details, verify_result=verify_result,
+        llm_ok=llm_ok, prior=prior, phase=phase,
+    )
+    try:
+        if verdict.passed:
+            verdict.details.pop("det_fail_reason", None)
+        else:
+            verdict.details["det_fail_reason"] = _det_fail_reason(verdict.details)
+    except Exception:  # noqa: BLE001 — stamp 是观测增强，绝不反噬裁决
+        pass
+    return verdict
+
+
+def _evaluate_l1_core(
     *,
     det_ok: bool | None,
     det_details: dict,

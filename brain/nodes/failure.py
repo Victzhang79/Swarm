@@ -1248,15 +1248,40 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # round11: brain 明写"该 RuoYi 版本用 ShiroUtils 而非 SecurityUtils"却只 retry_alternate
     # 换模型、不传 worker → 重试 worker 仍 import 不存在的 SecurityUtils。把诊断挂到失败子任务
     # 的 retry_guidance(worker prompt 渲染为硬约束块)，所有 retry 分支(A2/常规阶梯)统一携带。
-    if _diagnosis and failed_ids:
+    # R65TR-T2 B1：确定性装填——LLM 诊断有无都恒并入该子任务的机读判死依据
+    # （evaluate_l1 stamp 的 l1_details["det_fail_reason"]）。回放实锤：brain 离线时
+    # LLM 分析异常→_diagnosis 空→st-2 五连跑零信息重试，判死原文从未抵达模型；
+    # 在线时确定性依据也从不注入。栈中立（依据由 worker 闸门按失败面取证）。
+    if failed_ids:
         _by_id = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
         for _fid in failed_ids:
             _st = _by_id.get(_fid)
-            if _st is not None:
+            if _st is None:
+                continue
+            _parts: list[str] = []
+            if _diagnosis:
+                _parts.append(_diagnosis[:800])
+            else:
+                # 猎手 R65TR-T2：LLM 本轮闪断（自建模型临时掉线是常态）时绝不倒退——
+                # 保留上一轮语义诊断（剥掉旧确定性依据行防跨轮堆叠，该行下方按本轮重写）。
+                _prev = (getattr(_st, "retry_guidance", "") or "").strip()
+                if _prev:
+                    _prev_keep = "\n".join(
+                        ln for ln in _prev.splitlines()
+                        if not ln.startswith("上次尝试的确定性判死依据")).strip()
+                    if _prev_keep:
+                        _parts.append(_prev_keep[:800])
+            _det_r = str((_l1_details_of(subtask_results, _fid) or {})
+                         .get("det_fail_reason") or "").strip()
+            if _det_r:
+                _parts.append(
+                    "上次尝试的确定性判死依据（机读，必须针对性修复后再交付）："
+                    f"{_det_r[:600]}")
+            if _parts:
                 # SubTask 是可变 pydantic BaseModel、retry_guidance 是声明的 str 字段 →
                 # 直接赋值不会抛（原 except:pass 是无谓的静默吞错，brain#3 一并去掉）。
                 # 就地改的持久化由外层 handle_failure 回传 plan 保证。
-                _st.retry_guidance = _diagnosis[:800]
+                _st.retry_guidance = "\n".join(_parts)
 
     # ── P0-B/P1-D：缺符号/缺依赖编译失败 → 定向恢复（先于一切 strategy 分支拦截）──
     # 这类失败是【scope 不可满足】（pom 不在子任务写权内，原地重试 100 次也修不了）。无论 LLM
@@ -1894,10 +1919,29 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         out["plan"] = plan_obj  # 回写加宽后的 scope / C9 动态依赖边，dispatch 重试用
     if effective_strategy == "retry_alternate":
         out["subtask_use_alternate"] = _alt_map_update(state, failed_ids, True)
-        logger.info(
-            "[HANDLE_FAILURE] 策略=retry_alternate（第 %d 次，换备选模型）: %s",
-            deepest, failed_ids,
-        )
+        # R65TR-T2 B2：换备宣称接 router 真相——dispatch E1 判据判无异构备选的难度
+        # 实派仍是同模型+加步数，此处日志谎称"换备选"与实派永久不符（回放 st-2
+        # L6454/6458 实锤，两轮误导复盘）。判据异常按"有备选"处理（只影响措辞）。
+        try:
+            from swarm.brain.nodes.dispatch import _has_hetero_alternate
+            _by_id_alt = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
+            _no_alt = [fid for fid in failed_ids if not _has_hetero_alternate(
+                getattr(_by_id_alt.get(fid), "difficulty", None))]
+        except Exception:  # noqa: BLE001
+            # 猎手 R65TR-T2：回退方向必须与 _has_hetero_alternate 自身惯例一致
+            # （异常按【无备选】处理）——回退成 []=谎称全员有备选，恰是本处要治的谎。
+            _no_alt = list(failed_ids)
+        if _no_alt:
+            logger.info(
+                "[HANDLE_FAILURE] 策略=retry_alternate（第 %d 次）: %s"
+                "（其中无异构备选→实派同模型+加步数: %s）",
+                deepest, failed_ids, _no_alt,
+            )
+        else:
+            logger.info(
+                "[HANDLE_FAILURE] 策略=retry_alternate（第 %d 次，换备选模型）: %s",
+                deepest, failed_ids,
+            )
     else:
         out["subtask_use_alternate"] = _alt_map_update(state, failed_ids, False)
         logger.info(
