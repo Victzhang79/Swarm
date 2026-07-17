@@ -51,6 +51,7 @@ from swarm.brain.nodes.planning_core import (
     _serialize_pom_writers,
     _targeted_redecompose,
     _transitive_abandon,
+    mass_abandon_cap,
     _widen_scope_for_compile_repair,
 )
 from swarm.brain.nodes.shared import (
@@ -211,6 +212,61 @@ def _apply_scope_objection(plan_obj, subtask_results: dict, failed_ids: list, st
     return {"applied": applied, "counts": _amend_counts}
 
 
+# R65D-T4：JDK/标准库高频类型（本文件自愈面本就 JVM 专属语义，集合过滤不违栈中立）。
+# round65d 毒树第一株：worker 缺 `import java.util.Map` → 编译错里 Map 恰好【没有】
+# import 证据（缺的就是 import）→ 旧分支③把它当"自造内部类型"下新建指令 → worker
+# 抗命写 SCOPE_OBJECTION 拒工书落盘。名单只作用于【无 import 证据/邻近共现】两路，
+# 显式 import 证据（`import <blocked>.Map`）仍放行——证据赢过名单。
+_JDK_COMMON_TYPES = frozenset({
+    # java.lang（隐式导入但 location 报告仍可能出现）/ java.util
+    "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte", "Short",
+    "Character", "Object", "Class", "Void", "Number", "Math", "Thread", "Runnable",
+    "Exception", "RuntimeException", "Error", "Throwable", "Iterable", "Comparable",
+    "Map", "HashMap", "LinkedHashMap", "TreeMap", "ConcurrentHashMap",
+    "List", "ArrayList", "LinkedList", "CopyOnWriteArrayList",
+    "Set", "HashSet", "LinkedHashSet", "TreeSet", "Collection", "Collections",
+    "Arrays", "Iterator", "Optional", "Objects", "UUID", "Random", "Scanner",
+    "Queue", "Deque", "ArrayDeque", "PriorityQueue", "Stack", "Vector",
+    "Date", "Calendar", "TimeZone", "Locale", "Properties", "Base64",
+    # java.time / java.math / java.io / java.nio
+    "LocalDate", "LocalDateTime", "LocalTime", "Instant", "Duration", "Period",
+    "ZonedDateTime", "OffsetDateTime", "DateTimeFormatter", "ChronoUnit",
+    "BigDecimal", "BigInteger",
+    "File", "InputStream", "OutputStream", "Reader", "Writer", "IOException",
+    "BufferedReader", "BufferedWriter", "InputStreamReader", "OutputStreamWriter",
+    "Path", "Paths", "Files", "Charset", "StandardCharsets",
+    # java.util.function / stream / concurrent
+    "Function", "Supplier", "Consumer", "Predicate", "BiFunction", "BiConsumer",
+    "Stream", "Collectors", "IntStream", "LongStream",
+    "CompletableFuture", "Future", "Executor", "ExecutorService", "Executors",
+    "TimeUnit", "CountDownLatch", "AtomicInteger", "AtomicLong", "AtomicBoolean",
+    "AtomicReference", "ReentrantLock", "Semaphore",
+    # 序列化/常用注解宿主
+    "Serializable", "Cloneable", "AutoCloseable", "StringBuilder", "StringBuffer",
+})
+
+
+def _import_evidenced_classes(build_output: str) -> dict[str, set[str]]:
+    """import 证据单一事实源（猎手 LOW：双份正则必漂移）：{类名: {import 声明的包}}。"""
+    import re
+    out: dict[str, set[str]] = {}
+    for m in re.finditer(r"import\s+(?:static\s+)?([A-Za-z_][\w.]*)\.([A-Z]\w*)",
+                         build_output or ""):
+        out.setdefault(m.group(2), set()).add(m.group(1))
+    return out
+
+
+def _stdlib_missing_classes(build_output: str) -> set[str]:
+    """R65D-T4：编译错里【无任何 import 证据】且名列 JDK 常见类型的缺失类——诊断=缺
+    import 语句，不是缺内部类型。供自愈调用方改道注入补 import 指导。
+    （保守 ANY-证据口径：只要全文有该类的 import——无论指向哪个包——都不下"补 JDK
+    import"结论；三方 classpath 缺失等形态交常规阶梯，绝不给错方向指导。）"""
+    import re
+    evidenced = _import_evidenced_classes(build_output)
+    return {c for c in re.findall(r"symbol:\s*class\s+([A-Z]\w*)", build_output or "")
+            if c in _JDK_COMMON_TYPES and not evidenced.get(c)}
+
+
 def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str) -> list:
     """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
     推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built（本就 JVM 包语义）；推不出→空
@@ -245,23 +301,32 @@ def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_outp
     #   真自造引用恰是这种形态（全量回归 2 用例坐实），误配残余由 B4-2 异议通道兜底。
     txt = build_output or ""
     ext = ".kt" if "kotlin" in srcroot else ".java"
-    evidenced: dict[str, set[str]] = {}
-    for m in re.finditer(r"import\s+(?:static\s+)?([A-Za-z_][\w.]*)\.([A-Z]\w*)", txt):
-        evidenced.setdefault(m.group(2), set()).add(m.group(1))
+    evidenced = _import_evidenced_classes(txt)   # 单一事实源（猎手 LOW）
     blocked = [str(p).strip() for p in blocked_pkgs if str(p).strip()]
     pairs: set[tuple[str, str]] = set()
+
+    def _stdlib_shadow(cls: str, pkg: str) -> bool:
+        # R65D-T4：JDK 常见类型且【对这个 blocked 包】无 import 证据=缺 import 而非
+        # 缺内部类型——绝不下"新建同名类型"毒指令（Map.java 拒工书死型）。
+        # ★复核 HIGH（带复现）整改：证据按【类名×包】配对判定——别的 blocked 包一条
+        # 断裂 import（如 `import com.x.dto.Date;` 的 package-does-not-exist 回显）
+        # 绝不全局解除同名类在其它包上的遮蔽（文本级 ANY-证据可被巧合同名击穿）。
+        return cls in _JDK_COMMON_TYPES and pkg not in evidenced.get(cls, set())
+
     for p in blocked:
         _pq = re.escape(p)
         for m in re.finditer(
                 r"symbol:\s*class\s+([A-Z]\w*)(?:[^\n]*\n){0,3}?[^\n]*" + _pq, txt):
-            pairs.add((p, m.group(1)))
+            if not _stdlib_shadow(m.group(1), p):
+                pairs.add((p, m.group(1)))
     for cls, pkgs in evidenced.items():
         for p in blocked:
             if p in pkgs:
-                pairs.add((p, cls))
+                pairs.add((p, cls))   # 显式 import 证据赢过名单（真自定义同名类型）
     paired_cls = {c for _, c in pairs}
     for cls in set(re.findall(r"symbol:\s*class\s+([A-Z]\w*)", txt)):
-        if cls not in paired_cls and not evidenced.get(cls):
+        if cls not in paired_cls and not evidenced.get(cls) \
+                and cls not in _JDK_COMMON_TYPES:
             for p in blocked:
                 pairs.add((p, cls))
     if not pairs:
@@ -829,6 +894,23 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
                     completed_ids=_completed_ok,
                 ) if _unrecoverable else set()
+                # R65D-W2 猎手 CRITICAL：消费边织密图后，混批连坐同样受规模闸约束
+                # ——一次新增放弃超阈值=计划覆灭，escalate 人工，绝不静默清盘。
+                _br_new = _br_ab - set(state.get("abandoned_subtask_ids") or [])
+                if len(_br_new) > mass_abandon_cap(len(plan_obj.subtasks)):
+                    logger.error(
+                        "[HANDLE_FAILURE] R65D-W2 规模闸（T3 修复臂混批）：连坐 %d 超阈值 %d"
+                        "（计划 %d）→ escalate 人工，绝不静默清盘",
+                        len(_br_new), mass_abandon_cap(len(plan_obj.subtasks)),
+                        len(plan_obj.subtasks))
+                    return {
+                        **({"plan": plan_obj} if _c9_edges else {}),
+                        "failure_strategy": "escalate",
+                        "failure_escalated": True,
+                        "failed_subtask_ids": failed_ids,
+                        "degraded_reasons": [
+                            f"mass_abandon_gate:{len(_br_new)}/{len(plan_obj.subtasks)}"],
+                    }
                 for _a in _br_ab:
                     subtask_results.pop(_a, None)
                 _br_remaining = [t for t in (state.get("dispatch_remaining") or [])
@@ -898,8 +980,21 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             _sh_max = get_config().model.max_retries
             _sh_trc = dict(state.get("targeted_recovery_counts") or {})
             _healed: list[str] = []
+            _diverted: set[str] = set()   # R65D-T4：补 import 改道者（区别于 scope 自愈）
             for fid in sorted(_selfheal):
                 if _sh_trc.get(fid, 0) >= _sh_max:
+                    # 猎手 MED：stdlib 改道耗尽配额时给区分性告警——若真身是与 JDK
+                    # 同名的自定义类型（Optional/Path 等），运维要能看见真因，
+                    # 而非误读下方"臆造/无生产者"的通用放弃文案。
+                    _ex_det = _det_of(subtask_results.get(fid))
+                    _ex_stdlib = _stdlib_missing_classes(
+                        _ex_det.get("build_output") or "")
+                    if _ex_stdlib:
+                        logger.warning(
+                            "[HANDLE_FAILURE] R65D-T4 补 import 指导已耗尽配额(%d) 仍缺 %s"
+                            "——若这是与 JDK 同名的项目自定义类型，需人工把它加进该子任务 "
+                            "create_files（名单式改道对真同名自定义类型无能为力）: %s",
+                            _sh_max, sorted(_ex_stdlib)[:4], fid)
                     _unrecoverable.add(fid)  # 自愈预算耗尽 → 回落连坐放弃
                     continue
                 _st = _by_id.get(fid)
@@ -911,6 +1006,37 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 _new_files = _derive_missing_type_files(
                     _decl, _bpkgs, _det2.get("build_output") or "")
                 if not _new_files:
+                    # R65D-T4 改道：缺失类全是 JDK 标准库类型=worker 缺 import 语句——
+                    # 治得了的病绝不放弃、更绝不下"新建同名类型"毒指令（round65d
+                    # Map.java 拒工书死型）。注入补 import 指导，按同一自愈配额重派。
+                    _stdlib = _stdlib_missing_classes(
+                        _det2.get("build_output") or "")
+                    if _stdlib:
+                        # 猎手 HIGH：清除旧轮（本闸上线前/checkpoint 恢复）被误诊逻辑
+                        # 塞进 create_files 的 JDK 同名毒文件声明——否则 worker 同时
+                        # 收到"补 import"与"可新建 Map.java"两道矛盾指令（round65d
+                        # SCOPE_OBJECTION 拒工书死型变体）。
+                        _bad_names = {c.lower() for c in _stdlib}
+                        _cf_old = list(getattr(_sc, "create_files", []) or [])
+                        _cf_new = [p for p in _cf_old
+                                   if str(p).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                                   .lower() not in _bad_names]
+                        if len(_cf_new) != len(_cf_old):
+                            _sc.create_files = _cf_new
+                            logger.warning(
+                                "[HANDLE_FAILURE] R65D-T4 清除 %s 残留的 JDK 同名毒 "
+                                "create_files 声明 %d 条（旧轮误诊/checkpoint 恢复残留）",
+                                fid, len(_cf_old) - len(_cf_new))
+                        _st.retry_guidance = (
+                            f"编译缺失的 {sorted(_stdlib)[:6]} 是 JDK/标准库类型——"
+                            "你缺的是 import 语句（如 import java.util.Map），"
+                            "请在报错文件顶部补全对应 import 后重交。"
+                            "绝不在项目内新建这些同名类型（会遮蔽标准库并毒化模块）。"
+                        )[:800]
+                        _sh_trc[fid] = _sh_trc.get(fid, 0) + 1
+                        _healed.append(fid)
+                        _diverted.add(fid)
+                        continue
                     # 推不出该建哪个文件 → 自愈无从下手 → 回落连坐放弃(不空烧预算、不假装能修)
                     _unrecoverable.add(fid)
                     continue
@@ -935,11 +1061,31 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     set(state.get("abandoned_subtask_ids") or []) | _unrecoverable,
                     completed_ids=_completed_ok,
                 ) if _unrecoverable else set()
+                # R65D-W2 猎手 CRITICAL：自愈混批的连坐同受规模闸约束（四点同源）
+                _sh_new_ab = _ab - set(state.get("abandoned_subtask_ids") or [])
+                if len(_sh_new_ab) > mass_abandon_cap(len(plan_obj.subtasks)):
+                    logger.error(
+                        "[HANDLE_FAILURE] R65D-W2 规模闸（自愈混批）：连坐 %d 超阈值 %d"
+                        "（计划 %d）→ escalate 人工，绝不静默清盘",
+                        len(_sh_new_ab), mass_abandon_cap(len(plan_obj.subtasks)),
+                        len(plan_obj.subtasks))
+                    return {
+                        **({"plan": plan_obj} if _c9_edges else {}),
+                        "failure_strategy": "escalate",
+                        "failure_escalated": True,
+                        "failed_subtask_ids": failed_ids,
+                        "degraded_reasons": [
+                            f"mass_abandon_gate:{len(_sh_new_ab)}/{len(plan_obj.subtasks)}"],
+                    }
                 for _a in _ab:
                     subtask_results.pop(_a, None)
                 _sh_rc = dict(state.get("subtask_retry_counts", {}))
                 for fid in _healed:
-                    _sh_rc[fid] = 0  # 因 scope 不可满足而徒劳的重试不计入常规配额
+                    # 猎手 MED：清零只给【scope 真不可满足】的自愈者（旧理由成立）；
+                    # 补 import 改道者的既往失败是普通可修错误，保留计数——否则每次
+                    # 改道都白拿一份全新常规配额（预算静默翻倍+违反单调记账不变量）。
+                    if fid not in _diverted:
+                        _sh_rc[fid] = 0  # 因 scope 不可满足而徒劳的重试不计入常规配额
                 _sh_remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in _ab]
                 for fid in _healed:
                     if fid in _ab:  # 已愈但落在放弃闭包(依赖真死上游)→随闭包放弃，不重派
@@ -988,7 +1134,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # round65c 实锤：单个 0.8s BLOCKED 探针触发 102/107 连坐 → 假«全部完成»。
             # 显式剪除决策之外，pending 工作集绝不允许一笔大额缩水（结构性不变量）。
             _new_abandon = set(abandoned) - set(state.get("abandoned_subtask_ids") or [])
-            _abandon_cap = max(10, int(len(plan_obj.subtasks) * 0.25))
+            _abandon_cap = mass_abandon_cap(len(plan_obj.subtasks))  # R65D-W2 四点单源
             if len(_new_abandon) > _abandon_cap:
                 logger.error(
                     "[HANDLE_FAILURE] R65C-T2 连坐规模闸：本次连坐 %d 个（阈值 %d，计划共 %d）"
@@ -1644,6 +1790,25 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             abandoned = _transitive_abandon(
                 plan_obj.subtasks, _abandoned_so_far | set(failed_ids),
                 completed_ids=_done_ok)  # R51-1：completed 绝不入闭包
+            # R65D-W2 猎手 CRITICAL（复现实锤）：消费边织密图后，单个高扇出生产者重试
+            # 耗尽会沿新边一笔连坐全场闭包——本分支此前是四个 _transitive_abandon 消费点
+            # 中唯一最常走且完全未设防的旁门（round65c 102/107 静默清盘死型复活路径）。
+            _pd_new = abandoned - _abandoned_so_far
+            if len(_pd_new) > mass_abandon_cap(len(plan_obj.subtasks)):
+                logger.error(
+                    "[HANDLE_FAILURE] R65D-W2 规模闸（重试耗尽部分交付）：连坐 %d 超阈值 %d"
+                    "（计划 %d，触发源 %s）→ escalate 人工，绝不静默清盘成 PARTIAL",
+                    len(_pd_new), mass_abandon_cap(len(plan_obj.subtasks)),
+                    len(plan_obj.subtasks), failed_ids[:6])
+                return {
+                    **({"plan": plan_obj} if _c9_edges else {}),
+                    "failure_strategy": "escalate",
+                    "failure_escalated": True,
+                    "failed_subtask_ids": failed_ids,
+                    "subtask_retry_counts": {**retry_counts, **next_counts},
+                    "degraded_reasons": [
+                        f"mass_abandon_gate:{len(_pd_new)}/{len(plan_obj.subtasks)}"],
+                }
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
             logger.warning(
                 "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",

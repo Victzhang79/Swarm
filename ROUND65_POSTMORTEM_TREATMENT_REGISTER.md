@@ -226,3 +226,32 @@ l1_passed——round65d 冻结的 L1-fail 三僵尸(4 diff/17801 chars)照单合
 复核战果：reviewer APPROVE(1M/1L)；hunter 1 HIGH CONFIRMED(空交付盖章链)+1 LOW-MED+
 1 LOW(dict 缺键无活体生产者，fail-closed 属仓规先例)。
 质量闸：RED 1→GREEN 7；相邻 merge 面回归 49/49；revert-check 红；全量绿。
+
+## #57 R65D-W2 已治（2026-07-17，本地提交）
+
+治本两面：
+1. 消费边下推：plan_finisher 新步 derive_consumer_depends_edges（算法收敛=G2
+   wire_readable_provenance 单一事实源，复核 MED 去双实现漂移；收尾器末端再跑一遍
+   接住 elaborate 期 G2 看不到的 readable 增量）。fixture 实测 +176 边/70 消费者，
+   94 节点零环（"13 根"为 live 事发态，fixture 终版本就 2 根——docstring 已如实化，
+   复核 LOW）。
+2. 调度扇出优先：get_dispatch_batch._prio 升级 (tier, -fanout)——高位生产者同层先派
+   （静态扇出≈动态扇出，复核核实无害）；B6 清单恒第一/Fix F retry 语义不变。
+★猎手 CRITICAL（带复现）连带治本：消费边织密图激活休眠缺口——_transitive_abandon
+四个调用点仅 R65C-T2 一处有规模闸，重试耗尽部分交付/T3 修复臂混批/自愈混批三条
+未设防路径可让单个高扇出生产者一笔静默连坐全场（复现 31/31=100%）。治=
+mass_abandon_cap 下沉 planning_core 单一事实源，四点全接（超阈值一律 escalate 人工，
+mass_abandon_gate 机读）★。hunter MED（finisher 返回值被 PLAN 节点丢弃=机读账
+aspirational）记 follow-up；reviewer MED（互指 readable 边方向依列表序，G2 继承
+特性非新回归）记注释级。
+质量闸：RED 8→GREEN 13（含规模闸联动 2 条）；调度面 405/405；恢复面 56/56。
+
+## #63 R65D-T4 已治（2026-07-17，本地提交）
+
+毒树第一株治本：_derive_missing_type_files 分支③把无 import 证据的 JDK 类型
+（Map——缺的就是 import 所以才无证据！）误诊自造内部类型→下"新建 Map.java"指令→
+worker 拒工书落盘。治=①_JDK_COMMON_TYPES 名单过滤邻近共现+无证据两路（显式
+import 证据指向 blocked 包仍放行=真自定义同名类型不误伤）；②改道：缺失类全是
+标准库→注入补 import 指导按自愈配额重派（治得了的病绝不连坐放弃）。
+retry_guidance 通道分离面：毒源已断（误诊+create_files 毒文件声明均不再产生），
+通道分离属结构卫生爆炸半径大→按"既有闸门能抓→诚实记 B 类"惯例登记 follow-up 不强做。
