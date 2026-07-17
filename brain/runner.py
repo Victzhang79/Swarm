@@ -1340,6 +1340,10 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
                 if n:
                     out["swept_subtasks"].append(sid)
                     out["swept_files"] += n
+                    # R65TR-T4②：账面文件数与 scope 声明数对不上时（回放实锤 8 vs 7），
+                    # 无明细账无从对账——按 sid 落文件清单（机读+入日志，各限 12）。
+                    out.setdefault("swept_detail", {})[sid] = (
+                        (r.get("reverted") or []) + (r.get("removed") or []))[:12]
                 # 复核 MED：revert_failed（checkout 非零/unlink 抛）绝不静默——没这条，
                 # 运维读账见"无键"会误判"无幽灵件"，而毒件还在盘上。
                 if r.get("revert_failed"):
@@ -1353,8 +1357,9 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
             logger.warning(
                 "[RUNNER] 任务 %s R65REPLAY-T7 终态诚实清扫：%d 个未完成子任务的 %d 个"
                 "未验产物已从交付树剔除（tracked 还原钉扎基线/untracked 删除；完成者产物"
-                "受 protected 守卫）: %s", task_id, len(out["swept_subtasks"]),
-                out["swept_files"], out["swept_subtasks"][:8])
+                "受 protected 守卫）: %s；明细=%s", task_id, len(out["swept_subtasks"]),
+                out["swept_files"], out["swept_subtasks"][:8],
+                {k: v for k, v in list((out.get("swept_detail") or {}).items())[:8]})
     except Exception:  # noqa: BLE001 — 清扫失败绝不阻断终态（fail-open 可观测）
         logger.warning("[RUNNER] 任务 %s 终态清扫异常（fail-open 跳过）", task_id,
                        exc_info=True)

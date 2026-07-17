@@ -1828,9 +1828,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             if len(_pd_new) > mass_abandon_cap(len(plan_obj.subtasks)):
                 logger.error(
                     "[HANDLE_FAILURE] R65D-W2 规模闸（重试耗尽部分交付）：连坐 %d 超阈值 %d"
-                    "（计划 %d，触发源 %s）→ escalate 人工，绝不静默清盘成 PARTIAL",
+                    "（计划 %d，触发源 %s）→ escalate 人工，绝不静默清盘成 PARTIAL"
+                    "；连坐名单=%s",  # R65TR-T4④：名单从不打印=复盘只能靠 fixture 闭包倒推
                     len(_pd_new), mass_abandon_cap(len(plan_obj.subtasks)),
-                    len(plan_obj.subtasks), failed_ids[:6])
+                    len(plan_obj.subtasks), failed_ids[:6], sorted(_pd_new)[:40])
                 return {
                     **({"plan": plan_obj} if _c9_edges else {}),
                     "failure_strategy": "escalate",

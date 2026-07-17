@@ -1270,7 +1270,7 @@ class _SandboxSyncMixin:
             # 截断：真实产物数超过上限 → 第 cap+1 起被丢弃。必须留痕（否则与"恰好 cap 个"
             # 不可区分），提示可能有产物未回传。返回前 cap 个（去掉探测多取的那一个）。
             self._log(
-                f"[WARN] 沙箱 workspace 文件枚举达上限 {_WORKSPACE_LIST_CAP}（真实数更多）→ "
+                f"沙箱 workspace 文件枚举达上限 {_WORKSPACE_LIST_CAP}（真实数更多）→ "
                 f"超出部分未纳入 pull-back，可能漏产物；如常触发请调大 SWARM_WORKSPACE_LIST_CAP"
             )
             files = files[:_WORKSPACE_LIST_CAP]
@@ -1294,11 +1294,11 @@ class _SandboxSyncMixin:
         try:
             result = rc(self._sandbox, f"cd {remote} 2>/dev/null && touch {marker}", timeout=15)
             if getattr(result, "error", None) and getattr(result, "error"):
-                self._log(f"[WARN] D36 bootstrap 标记创建失败（改动兄弟文件回传降级为 no-op）: {result.error}")
+                self._log(f"D36 bootstrap 标记创建失败（改动兄弟文件回传降级为 no-op）: {result.error}", level="warning")
                 return
             self._bootstrap_marker = marker
         except Exception as exc:  # noqa: BLE001
-            self._log(f"[WARN] D36 bootstrap 标记创建异常（改动兄弟文件回传降级为 no-op）: {exc}")
+            self._log(f"D36 bootstrap 标记创建异常（改动兄弟文件回传降级为 no-op）: {exc}", level="warning")
 
     def _context_sibling_rels(self, local_root: Path) -> set[str]:
         """D36：本子任务【上下文集】= readable ∪ 整模块源码，减去 writable/create（已单独回传）。
@@ -1348,7 +1348,7 @@ class _SandboxSyncMixin:
         files = [line.strip() for line in out.splitlines() if line.strip()]
         if len(files) > _WORKSPACE_LIST_CAP:
             self._log(
-                f"[WARN] H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件"
+                f"H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件"
             )
             files = files[:_WORKSPACE_LIST_CAP]
         return files
@@ -1383,7 +1383,7 @@ class _SandboxSyncMixin:
             return []
         files = [line.strip() for line in out.splitlines() if line.strip() and line.strip() != marker_rel]
         if len(files) > _WORKSPACE_LIST_CAP:
-            self._log(f"[WARN] 沙箱改动文件枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏改动")
+            self._log(f"沙箱改动文件枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏改动", level="warning")
             files = files[:_WORKSPACE_LIST_CAP]
         return files
 
@@ -1574,7 +1574,7 @@ class _SandboxSyncMixin:
                             _sp.run(["git", "-C", root, "restore", "--staged", "--", *untracked],
                                     capture_output=True, text=True, timeout=30)
                         except Exception as _cexc:  # noqa: BLE001 — 清理失败可观测，不吞主异常
-                            self._log(f"[WARN] D44 add -N 占位清理失败（index 可能残留）: {_cexc}")
+                            self._log(f"D44 add -N 占位清理失败（index 可能残留）: {_cexc}", level="warning")
 
             # 生成 diff：钉扎 base 基线 vs 工作区当前（含 pull-back 的改动 + -N 的新文件）。
             # 3rd#2：显式相对 base（None→HEAD），与 merge base_reader 同源对齐，消除运行期 HEAD 漂移。

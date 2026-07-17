@@ -642,6 +642,7 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
         last_beat = t0
         n_chunks = 0
         last_chunk: Any = None
+        _fr_seen: str = ""   # R65TR-T4①：流中捕获的 finish_reason（尾部 usage chunk 免疫）
         content_seen = False    # R55-1：是否已吐出正文（未吐 → 仍在思考阶段，abort 无损）
         thinking_off = False    # R55-1：已就地降级过一次（绝不无限重开）
         # R63-T7：正文/思维链各一个复读探测器（窗口独立，互不污染）。
@@ -663,15 +664,20 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
             except StopAsyncIteration:
                 # 干净收尾：长调用记 elapsed+chunk 数+finish_reason。finish_reason=="length" 证明撞了
                 # max_tokens（output 计 token）；=="stop" 是自然收束——用于坐实 runaway 时 max_tokens 为何没拦。
+                # R65TR-T4①（round64 T6 回归定案）：只看 last_chunk 结构性拿不到——开启
+                # include_usage 时流末尾是 usage-only 空 choices chunk（无 finish_reason），
+                # 真值在倒数第二个 chunk 里被覆盖 → 回放全程 finish_reason=?。改为流中即时
+                # 捕获（_fr_seen，见非空即记），此处仅兜底再看一眼 last_chunk。
                 elapsed = _monotonic() - t0
                 if elapsed >= self.swarm_heartbeat_after:
-                    fr = "?"
-                    try:
-                        meta = getattr(getattr(last_chunk, "message", None), "response_metadata", None) or \
-                            getattr(last_chunk, "generation_info", None) or {}
-                        fr = meta.get("finish_reason") or meta.get("stop_reason") or "?"
-                    except Exception:  # noqa: BLE001
-                        pass
+                    fr = _fr_seen or "?"
+                    if fr == "?":
+                        try:
+                            meta = getattr(getattr(last_chunk, "message", None), "response_metadata", None) or \
+                                getattr(last_chunk, "generation_info", None) or {}
+                            fr = meta.get("finish_reason") or meta.get("stop_reason") or "?"
+                        except Exception:  # noqa: BLE001
+                            pass
                     logger.info(
                         "[stream] %s%s 流式完成 %.0fs（共 %d chunk，finish_reason=%s）",
                         _llm_node_tag(), getattr(self, "model_name", None) or "model",
@@ -838,6 +844,16 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                     now - t0, n_chunks,
                 )
             last_chunk = chunk
+            # R65TR-T4①：finish_reason 流中即时捕获（usage-only 尾 chunk 会覆盖 last_chunk）
+            try:
+                _gi = getattr(chunk, "generation_info", None) or {}
+                _fr_c = _gi.get("finish_reason") or (
+                    (getattr(getattr(chunk, "message", None), "response_metadata", None) or {})
+                    .get("finish_reason"))
+                if _fr_c:
+                    _fr_seen = str(_fr_c)
+            except Exception:  # noqa: BLE001 — 遥测绝不反噬流
+                pass
             yield chunk
 
 
