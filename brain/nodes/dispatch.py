@@ -603,29 +603,102 @@ async def dispatch(state: BrainState) -> dict:
 
     # 复核 H1b（阶段1）：任务级异常逃逸时取消兄弟 worker（裸 gather 不取消，兄弟继续烧钱
     # 且结算落在 detach 后形成幽灵账目）。
-    # E4+E10（阶段5）：as_completed 去屏障——先完成者立即回写 completed_subtasks
-    # （批内进度不再冻结到最慢者）；异常时取消未完成兄弟并原样上抛（保 H1b 语义）。
+    # E4+E10（阶段5）：先完成者立即回写 completed_subtasks（批内进度不冻结到最慢者）；
+    # 异常时取消未完成兄弟并原样上抛（保 H1b 语义）。
+    # R65D-T6①（round65d 8min stall）：批门闩→滚动补位——批内任一任务完成即查新就绪者
+    # 补位（get_dispatch_batch 同源选批：依赖闸/放弃集/fresh 优先/扇出全继承）。护栏：
+    # ★任一失败/异常立即停止补位、收批返回（HANDLE_FAILURE/R13-4 批间熔断节奏原样）★；
+    # 单节点补位总量封顶 max_concurrent×SWARM_DISPATCH_ROLL_FACTOR（默认 3，0=关回旧
+    # 批门闩）；超大块（_oversized_by_files）不滚动，留下轮节点级预算闸拆小。
     # 结果的语义处理（failed 记账/知识回灌）仍在收齐后统一做（顺序无关，不改行为）。
+    import os as _os
+    try:
+        _roll_factor = int(_os.environ.get("SWARM_DISPATCH_ROLL_FACTOR", "3") or 0)
+    except ValueError:
+        # 猎手 LOW-MED：非法值绝不静默启用——运维想用 "off"/"false" 关滚动时必须看得见
+        # 开关没生效（应急回退唯一合法值=字面 "0"）。
+        logger.error(
+            "[DISPATCH] SWARM_DISPATCH_ROLL_FACTOR 配置非法(%r)——回退默认 3（滚动开启）；"
+            "关闭滚动请设字面 0",
+            _os.environ.get("SWARM_DISPATCH_ROLL_FACTOR"))
+        _roll_factor = 3
+    _roll_budget = max_concurrent * max(0, _roll_factor)
     _base_done = len(completed_l1_ids(subtask_results))
-    _futs = [asyncio.ensure_future(_run_one(st, i)) for i, st in enumerate(to_dispatch)]
+    _spawned_ids = {st.id for st in to_dispatch}
+    _next_idx = len(to_dispatch)
+    _rolling_completed = set(completed_ids)
+    _results_view = dict(subtask_results)   # 滚动候选的前序上下文注入用（含本批新产出）
+    _any_bad = False
+    _rolled: list[str] = []
+    pending: set = {asyncio.ensure_future(_run_one(st, i))
+                    for i, st in enumerate(to_dispatch)}
     outcomes = []
     try:
-        for _fut in asyncio.as_completed(_futs):
-            _st, _oc = await _fut
-            outcomes.append((_st, _oc))
-            if task_id and isinstance(_oc, WorkerOutput) and _oc.l1_passed:
-                _base_done += 1
+        while pending:
+            _done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for _fut in _done:
+                _st, _oc = _fut.result()   # TaskTokenLimitExceeded 原样上抛（H2 语义）
+                outcomes.append((_st, _oc))
+                if isinstance(_oc, WorkerOutput) and _oc.l1_passed:
+                    _rolling_completed.add(_st.id)
+                    _results_view[_st.id] = _oc
+                    _base_done += 1
+                    if task_id:
+                        try:
+                            from swarm.project import store as _store
+                            await asyncio.to_thread(
+                                _store.update_task, task_id,
+                                completed_subtasks=_base_done)
+                        except Exception:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
+                            pass
+                else:
+                    _any_bad = True   # 失败/异常 → 停止补位，收批交失败处置
+            if (_roll_budget <= 0 or _any_bad
+                    or len(_rolled) >= _roll_budget):
+                continue
+            _slots = max_concurrent - len(pending)
+            if _slots <= 0:
+                continue
+            _rem = [t for t in dispatch_remaining if t not in _spawned_ids]
+            if not _rem:
+                continue
+            try:
+                from swarm.brain.planning_nodes import _oversized_by_files
+                _next_batch = [
+                    st for st in plan_obj.get_dispatch_batch(
+                        _rolling_completed, _rem, _slots,
+                        _abandoned, _deprioritized)
+                    if st.id not in _spawned_ids and not _oversized_by_files(st)
+                ][: _roll_budget - len(_rolled)]
+            except Exception:  # noqa: BLE001 — 补位是增益，选批异常绝不拖垮本批
+                logger.warning("[DISPATCH] R65D-T6 滚动补位选批异常（本轮停止补位）",
+                               exc_info=True)
+                _next_batch = []
+            for _nst in _next_batch:
                 try:
-                    from swarm.project import store as _store
-                    await asyncio.to_thread(
-                        _store.update_task, task_id, completed_subtasks=_base_done)
-                except Exception:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
-                    pass
+                    _inject_predecessor_context([_nst], plan_obj, _results_view)
+                    # 复核 MED：注入 mutate 了 scope.upstream_artifacts——并入 _ua_changed
+                    # 让下方 plan 显式回写闸看到（B1 CONFIRMED#1 纪律：in-place 变异
+                    # 靠 checkpoint 捎带是被禁模式）。
+                    _ua_changed = _inject_upstream_products(
+                        [_nst], _results_view, _b1_proj_path) or _ua_changed
+                except Exception:  # noqa: BLE001 — 注入是增益
+                    logger.debug("[DISPATCH] 滚动补位上下文注入跳过: %s", _nst.id)
+                pending.add(asyncio.ensure_future(_run_one(_nst, _next_idx)))
+                _next_idx += 1
+                _spawned_ids.add(_nst.id)
+                _rolled.append(_nst.id)
+            if _next_batch:
+                logger.info(
+                    "[DISPATCH] R65D-T6 滚动补位 %d 个（累计 %d/上限 %d，批内零失败）: %s",
+                    len(_next_batch), len(_rolled), _roll_budget,
+                    [s.id for s in _next_batch])
     except BaseException:
-        for _t in _futs:
+        for _t in pending:
             if not _t.done():
                 _t.cancel()
-        await asyncio.gather(*_futs, return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
         raise
 
     def _worker_batch_context() -> dict:
@@ -734,7 +807,10 @@ async def dispatch(state: BrainState) -> dict:
     # 3.8 生命周期收敛 TOP-1 + 3.9 H-F7/R-F1 升级：alternate 标记【按子任务】消费——
     # 本批真派出的 sid 从表中清除（消费即清，防粘滞劫持路由）；未派出的（被降优先级
     # 错开的失败撮）保留给后续批。空批早退分支不发键=零消费零清（语义自洽，不漂移）。
-    _dispatched_ids = {t.id for t in to_dispatch}
+    # R65D-T6 双复核 CRITICAL/HIGH（各自带复现）：派发账必须用【全 spawn 集】——
+    # 只数初始批会让滚动补位者绕过 A2 终身派发硬熔断（round48c 11 连派死型复活面）
+    # 且 alternate 标记不被消费（粘滞劫持路由回归）。_spawned_ids=初始批∪滚动补位。
+    _dispatched_ids = set(_spawned_ids)
     result["subtask_use_alternate"] = {
         k: v for k, v in _alt_map.items() if k not in _dispatched_ids}
     # A2（round48c 实锤）：终身派发计数——subtask_retry_counts 按签名剪枝，scope

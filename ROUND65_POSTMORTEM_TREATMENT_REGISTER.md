@@ -255,3 +255,27 @@ import 证据指向 blocked 包仍放行=真自定义同名类型不误伤）；
 标准库→注入补 import 指导按自愈配额重派（治得了的病绝不连坐放弃）。
 retry_guidance 通道分离面：毒源已断（误诊+create_files 毒文件声明均不再产生），
 通道分离属结构卫生爆炸半径大→按"既有闸门能抓→诚实记 B 类"惯例登记 follow-up 不强做。
+
+## #64 R65D-T6 已治（2026-07-17，本地提交）
+
+四子项处置：
+1. ★批门闩→滚动补位★（dispatch.py）：asyncio.wait 泵——批内任一完成即用
+   get_dispatch_batch（滚动 completed 视图）选新就绪者补位（predecessor/upstream 注入
+   同批前口径，_ua_changed 并入 plan 回写闸）。护栏：任一失败/异常立即停滚收批
+   （HANDLE_FAILURE/R13-4 批间熔断节奏原样，BLOCKED 也停=保守正确，双复核核实）；
+   补位总量封顶 max_concurrent×SWARM_DISPATCH_ROLL_FACTOR；_oversized_by_files 不滚。
+   ★★应急回滚开关：SWARM_DISPATCH_ROLL_FACTOR=0（字面 0）恢复旧批门闩语义；非法值
+   ERROR 留痕回默认 3★★。双复核双双逮到：滚动者绕过 subtask_dispatch_totals 终身账
+   （A2 硬熔断失明，round48c 11 连派死型复活面，hunter CRITICAL 复现）+use_alternate
+   不消费（粘滞劫持路由回归）→ 派发账改用全 spawn 集 _spawned_ids。
+2. 规划侧 C7 在飞预留作用域（nodes/__init__.py _invoke_llm_abortable 唯一咽喉）：
+   round65d 09:52/09:57 两条 TTL 泄漏实锤=作用域此前只接 worker 侧——正常返回
+   settle_leaked=False，异常/取消立即按中止结算（零 30min 虚增窗口）。复核核实：
+   两 return 全包、与 on_llm_error 正常结算互斥无双记、ContextVar 不还原无害。
+3. 迭代预算自适应：记 B 类——executor 已有 nfiles 自适应+force_strong boost，round65d
+   撞顶者止损链全对；盲目抬顶=每次尝试更贵，待下轮遥测（撞顶者 diff 质量 vs 步数曲线）
+   定参再动。
+4. 连坐重试先查可派发性：covered——#57 消费边（依赖闸前置扣住）+#60 处方核销
+   （recovery_prescription_unsatisfiable 机读）已结构性化解，不另设闸。
+质量闸：RED 2→GREEN 9（含双复核锁 3 条）；dispatch/phase3/FixF/D23 回归 44/44；
+revert-check 红；全量绿。
