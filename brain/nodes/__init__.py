@@ -455,6 +455,15 @@ def _format_tech_design_for_plan(state: BrainState) -> str:
     return "\n".join(lines)
 
 
+def _is_auth_shaped_error(exc: BaseException) -> bool:
+    """R65D-W3⑤：auth 类错误判形（401/403/无效 key）——配置错需 ops 立即介入，
+    与瞬时基建错分级（round65d 复盘：规划期 401×5 淹没在 WARNING 噪声里）。"""
+    t = str(exc).lower()
+    return any(k in t for k in (
+        "401", "403", "unauthorized", "forbidden", "invalid api key",
+        "invalid_api_key", "api key", "authentication", "permission denied"))
+
+
 async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_llm=None,
                                 node_label: str = ""):
     """R34-1：流式优先 LLM 调用——僵尸生成缓解（token 黑洞治本客户端侧杠杆）。
@@ -1741,11 +1750,24 @@ async def _targeted_coverage_topup(
                 except TaskTokenLimitExceeded:
                     raise  # 复核 H5：备用同判
                 except Exception as exc2:  # noqa: BLE001
-                    logger.warning(
-                        "[PLAN] P1 外科补齐主备均失败(%s / %s)→回退全量重拆", exc, exc2)
+                    # R65D-W3⑤：auth 类（401/403/坏 key）=配置错需 ops 立即介入，
+                    # 与瞬时错分级——round65d 复盘 401×5 淹没在 WARNING 噪声里
+                    _lvl = (logger.error
+                            if (_is_auth_shaped_error(exc)
+                                or _is_auth_shaped_error(exc2))
+                            else logger.warning)
+                    _lvl("[PLAN] P1 外科补齐主备均失败(%s / %s)→回退全量重拆%s",
+                         exc, exc2,
+                         "——含 auth 类错误（401/403/坏 key=配置问题，请查凭据）"
+                         if (_is_auth_shaped_error(exc)
+                             or _is_auth_shaped_error(exc2)) else "")
                     return None
             else:
-                logger.warning("[PLAN] P1 外科补齐 LLM 失败(%s)→回退全量重拆", exc)
+                _lvl = (logger.error if _is_auth_shaped_error(exc)
+                        else logger.warning)
+                _lvl("[PLAN] P1 外科补齐 LLM 失败(%s)→回退全量重拆%s", exc,
+                     "——auth 类错误（配置问题，请查凭据）"
+                     if _is_auth_shaped_error(exc) else "")
                 return None
 
         _result = _parse_json_from_llm(_resp.content)
@@ -3307,6 +3329,13 @@ async def handle_failure(state: BrainState) -> dict:
     except Exception as _audit_exc:  # noqa: BLE001 — 审计绝不拖垮失败处置本体
         logger.error("[HANDLE_FAILURE] R65D-T1 处置完备性审计自身异常（本轮铁律下线，"
                      "处置结果按 impl 原样放行）", exc_info=True)
+        # 猎手 MED：审计崩掉的那一轮恰是总账最需要的一轮——只用保证安全的原语
+        # 补一行最小账（正常轮的完整总账在 audit 内部）。
+        logger.error(
+            "[HANDLE_FAILURE] R65D-W3 处置总账不可用（审计异常 %s）：入口 %d（%s）",
+            type(_audit_exc).__name__,
+            len(state.get("failed_subtask_ids") or []),
+            (state.get("failed_subtask_ids") or [])[:8])
         if isinstance(result, dict):
             result["degraded_reasons"] = (
                 list(result.get("degraded_reasons") or [])

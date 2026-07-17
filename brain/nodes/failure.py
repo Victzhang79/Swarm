@@ -1934,6 +1934,21 @@ def audit_failure_disposition(state, result) -> None:
     # 重置 dispatch_remaining）；escalate=交棒人工。两者都是合法整体处置，绝不当掉账。
     _strategy = str(result.get("failure_strategy")
                     or state.get("failure_strategy") or "")
+    # R65D-W3③：恒 INFO 处置总账（round65d 掉账要等终态复盘才发现——每轮一行机读账，
+    # 陪跑镜像当场可见）。escalate/replan 交棒也记（覆盖全部出口）。
+    _acc_q = set(result.get("dispatch_remaining")
+                 if "dispatch_remaining" in result
+                 else (state.get("dispatch_remaining") or []))
+    _acc_ab = set(result.get("abandoned_subtask_ids") or [])
+    _acc_sf = set(result.get("failed_subtask_ids")
+                  if "failed_subtask_ids" in result else entry)
+    logger.info(
+        "[HANDLE_FAILURE] R65D-W3 处置总账：入口 %d → 重派 %d / 放弃 %d / 保留失败 %d"
+        "（strategy=%s）: %s",
+        len(entry), len([f for f in entry if f in _acc_q]),
+        len([f for f in entry if f in _acc_ab]),
+        len([f for f in entry if f in _acc_sf]),
+        _strategy or "retry", entry[:8])
     if _strategy in ("replan", "escalate"):
         return
     plan_obj = result.get("plan") or state.get("plan")

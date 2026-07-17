@@ -83,8 +83,28 @@ def fold_module_registrations(merged_diff: str,
     if not base_root_pom.endswith("\n"):
         # difflib 全文件 diff 无 "\ No newline at end of file" 支持——base 无尾换行
         # 时合成段对磁盘真实 base apply 语义会漂（自校验用同一文本变量抓不到）→
-        # 保守跳过（极罕见形态，loud）
-        logger.warning("[MANIFEST-SYNTH] base 根 pom 无尾换行（异常形态）→ 跳过合成")
+        # 保守跳过（极罕见形态）。R65D-W3⑥：跳过必须点名【哪些新模块注册被丢弃】
+        # ——否则运维只见"跳过合成"看不见损失面（reactor 将读不到这些子模块）。
+        _lost: list[str] = []
+        _probe_broken = ""
+        try:
+            # 复核 MED：点名口径与主体合成判据【同源】（_NEW_MODULE_POM_RE 单段路径+
+            # 新建+含 <parent>）——宽松口径会把本就不可合成的 pom 报成受损（假警报）。
+            from swarm.project.diff_apply import split_diff_by_file as _sdbf
+            for _files, _text in _sdbf(merged_diff):
+                for _f in _files:
+                    _fn = str(_f).replace("\\", "/").lstrip("/")
+                    _m = _NEW_MODULE_POM_RE.match(_fn)
+                    if (_m and ("--- /dev/null" in _text or "new file mode" in _text)
+                            and "<parent" in _text):
+                        _lost.append(_m.group(1))
+        except Exception as _det_exc:  # noqa: BLE001 — 点名是观测增益
+            # 猎手 MED：检测器自身失败绝不与"确实零损失"同文案（错误变空列表死型）
+            _probe_broken = f"（受损检测失败: {type(_det_exc).__name__}，损失面未知≠零损失）"
+        logger.warning(
+            "[MANIFEST-SYNTH] base 根 pom 无尾换行（异常形态）→ 跳过合成；"
+            "受损=以下新模块的 <module> 注册不会被确定性补入根 pom：%s%s",
+            sorted(set(_lost)) or "（diff 内未检出可合成的新模块 pom）", _probe_broken)
         return merged_diff, []
     try:
         from swarm.project.diff_apply import split_diff_by_file

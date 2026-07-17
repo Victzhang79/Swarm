@@ -724,13 +724,32 @@ class _SandboxSyncMixin:
                     resolve_base_ref(getattr(self, 'base_ref', None)))
                 if _writable_candidates and not _tracked_writables:
                     # hunter round27 HIGH：批量判定失败 = 整个 clean_upload 防脏叠加机制
-                    # 按"全 untracked→copy 脏磁盘"静默失效（旧逐文件版单文件失败只影响单文件）。
-                    # 无法区分"真全 untracked"与"git 故障"，但两者都值得在上传日志里留痕。
-                    self._log(
-                        f"[WARN] {reason} clean_upload: tracked 判定空集"
-                        f"（git 故障/超时或确实全新建）→ {len(_writable_candidates)} 个 "
-                        f"writable 按脏磁盘上传，防脏叠加护栏未生效"
-                    )
+                    # 按"全 untracked→copy 脏磁盘"静默失效。R65D-W3④：greenfield（仓库
+                    # 本就零 tracked 文件=全新建预期形态）与 git 故障分级——前者 INFO
+                    # 后者 WARN，round65d 复盘时两者混一条 WARN 无法判读。
+                    _repo_has_tracked = False
+                    try:
+                        # 猎手 HIGH：同函数惯例 to_thread 卸载——直调 subprocess 会把
+                        # 全部并发 worker/brain/SSE/心跳冻结在事件循环上（本文件自述铁律）
+                        _r_ls = await asyncio.to_thread(
+                            _sp.run,
+                            ["git", "-C", str(local_root), "ls-files", "-z"],
+                            capture_output=True, timeout=10)
+                        _repo_has_tracked = bool((_r_ls.stdout or b"").strip())
+                    except Exception:  # noqa: BLE001 — 探测失败按可疑（WARN）处理
+                        _repo_has_tracked = True
+                    if _repo_has_tracked:
+                        self._log(
+                            f"[WARN] {reason} clean_upload: tracked 判定空集但仓库确有 "
+                            f"tracked 文件（git 故障/超时/base_ref 异常）→ "
+                            f"{len(_writable_candidates)} 个 writable 按脏磁盘上传，"
+                            f"防脏叠加护栏未生效"
+                        )
+                    else:
+                        self._log(
+                            f"{reason} clean_upload: 仓库零 tracked 文件（greenfield 全新建，"
+                            f"预期形态）→ {len(_writable_candidates)} 个 writable 按磁盘上传"
+                        )
                 for rel in rel_files:
                     dst = staging_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)

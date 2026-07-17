@@ -279,3 +279,24 @@ retry_guidance 通道分离面：毒源已断（误诊+create_files 毒文件声
    （recovery_prescription_unsatisfiable 机读）已结构性化解，不另设闸。
 质量闸：RED 2→GREEN 9（含双复核锁 3 条）；dispatch/phase3/FixF/D23 回归 44/44；
 revert-check 红；全量绿。
+
+## #58 R65D-W3 已治（2026-07-17，本地提交）
+
+六项观测缺口+双复核整改：
+① _det_fail_reason 判死机读 reason 单一提取点（verify_failed/reason+note/scope/
+  pipeline_blocked/★compile_message——复核 HIGH：单文件编译闸真错误在此，build_output
+  结构性缺席，漏读=最常见判死形态照旧空 reason★/build_output/test_output；畸形 details
+  兜底自报 reason_extraction_failed，猎手 HIGH：观测代码绝不反噬 Phase-4）；
+② 去"拦截幻觉 PASS"冤案措辞——_det_conflict_log_line 单一生成点（行为级可测，
+  替代 getsource 守卫——猎手裁定原测试违反本仓"禁 getsource"仓规，已改写）；
+③ HANDLE_FAILURE 恒 INFO 处置总账行（入口→重派/放弃/保留失败，全出口含 replan/
+  escalate；审计自身异常轮补最小账——猎手 MED：审计崩的那轮恰最需要总账）；
+④ clean_upload tracked 空集分级：greenfield probe（git ls-files，to_thread 卸载——
+  猎手 CONFIRMED HIGH：直调 subprocess 阻塞事件循环违反本文件自述铁律）→INFO；
+  仓库确有 tracked=git 故障→WARN；probe 失败按可疑 WARN（fail-safe 方向复核核实）；
+⑤ P1 外科主备双失败 auth 类（401/403/坏 key）升 ERROR（配置错需 ops；round65d 复盘
+  401×5 淹没在 WARNING 噪声）——仅日志级别，全仓无 level 消费者（猎手核实无误 page 面）；
+⑥ MANIFEST-SYNTH 无尾换行跳过时点名受损模块（口径与主体合成判据同源
+  _NEW_MODULE_POM_RE+<parent>，复核 MED：宽松口径=假警报；检测器自身失败自报
+  "损失面未知≠零损失"，猎手 MED：错误变空列表死型）。
+质量闸：RED 5→GREEN 7；manifest/处置/恢复面回归 26/26；revert-check 红；全量绿。

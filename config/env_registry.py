@@ -61,6 +61,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_DB_POOL_MIN": "infra/db.py:21",
     "SWARM_DB_POOL_TIMEOUT": "infra/db.py:78",
     "SWARM_DB_POSTGRES_URI": "config/settings.py:113",
+    "SWARM_DISPATCH_ROLL_FACTOR": "brain/nodes/dispatch.py:616",  # R65D-T6 滚动派发补位因子（0=关回旧批门闩）
     "SWARM_DOCS_PUBLIC": "api/auth.py:28",
     "SWARM_ENV": "config/settings.py:719",
     "SWARM_EXTRACT_MAX_ITEMS": "brain/requirements_extract.py:41",

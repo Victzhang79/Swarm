@@ -87,6 +87,46 @@ class WorkerPhase(str, Enum):
     FAILED = "FAILED"
 
 
+def _det_fail_reason(details: dict) -> str:
+    """R65D-W3①：确定性闸判死的机读 reason 提取——round65d st-26 冤案 79ms 判 False
+    全程零解释。单一提取点，判死日志必带。
+    猎手 HIGH：观测代码绝不反噬主流程——畸形 details 兑底成标记串而非冒泡崩 Phase-4。"""
+    try:
+        d = details if isinstance(details, dict) else {}
+        if d.get("verify_failed"):
+            return f"verify_failed: {str(d['verify_failed'])[:160]}"
+        if d.get("reason"):
+            _note = f" | {str(d['note'])[:120]}" if d.get("note") else ""
+            return f"reason: {str(d['reason'])[:160]}{_note}"
+        _sv = d.get("scope_violations")
+        if _sv:
+            _svl = list(_sv) if isinstance(_sv, (list, tuple, set)) else [_sv]
+            return f"scope_violations×{len(_svl)}: " \
+                   f"{[str(v)[:60] for v in _svl[:3]]}"
+        if d.get("pipeline_blocked"):
+            return f"pipeline_blocked: {str(d['pipeline_blocked'])[:120]}"
+        # 复核 HIGH：单文件编译闸失败时真错误在 compile_message（此形态 build_output
+        # 结构性缺席——early-return 于 harness 构建段之前），漏读=最常见判死形态
+        # 照旧空 reason。
+        if d.get("compile_message"):
+            return f"compile_fail: {str(d['compile_message'])[:160]}"
+        if d.get("l1_2_compile_ok") is False or d.get("build_output"):
+            return f"compile_fail: {str(d.get('build_output') or '')[:160]}"
+        if d.get("test_output"):
+            return f"test_fail: {str(d['test_output'])[:160]}"
+        return f"deterministic_gate={d.get('deterministic_gate', '?')}（无细分 reason 键）"
+    except Exception as _exc:  # noqa: BLE001 — 提取失败自报，绝不把判死日志崩成通用异常
+        return f"reason_extraction_failed:{type(_exc).__name__}"
+
+
+def _det_conflict_log_line(l1_details: dict, phase: str = "") -> str:
+    """R65D-W3②：det=False 而 LLM 自报通过时的日志行——单一生成点（可行为级测试，
+    替代 getsource 守卫）：必带机读判死依据、绝不用'拦截幻觉'冤案措辞。"""
+    _p = f"{phase}: " if phase else ""
+    return (f"{_p}LLM 自报通过但确定性闸门失败，以确定性结果为准 | "
+            f"判死依据: {_det_fail_reason(l1_details)}")
+
+
 def _should_run_verify_agent(mode: str, det_ok, det_details: dict) -> bool:
     """R63-T8④：verify agent 步（每 fix_round 一整轮带工具 agent，高成本）是否该跑。
 
@@ -771,7 +811,9 @@ class WorkerExecutor(
                 elif det_ok is True and not llm_passed:
                     self._log("确定性闸门通过但 LLM 自报失败，以确定性结果为准")
                 elif det_ok is False and llm_passed:
-                    self._log("LLM 自报通过但确定性闸门失败，以确定性结果为准（拦截幻觉 PASS）")
+                    # R65D-W3②：去冤案措辞（round65d st-26：worker 产物本合规，败于
+                    # H1 覆写后旧考卷——"幻觉"定性会误导复盘）+ ①必带机读 reason
+                    self._log(_det_conflict_log_line({**l1_details, **verdict.details}))
 
                 self._log(
                     f"L1 验证结果: {'通过 ✅' if l1_passed else '未通过 ❌'} "
@@ -1172,10 +1214,13 @@ class WorkerExecutor(
         l1_passed = bool(verdict.passed)
         l1_details = {**l1_details, **verdict.details}
         if det_ok is False and llm_passed:
-            self._log("trivial: LLM 自报通过但确定性闸门失败，以确定性为准（拦截幻觉 PASS）")
+            # R65D-W3①②：同 Phase-4 口径——去冤案措辞+必带机读判死依据
+            self._log(_det_conflict_log_line(l1_details, phase="trivial"))
         self._log(
             f"trivial L1: {'通过 ✅' if l1_passed else '未通过 ❌'} "
             f"| 来源: {l1_details.get('l1_decision_source')}"
+            + ("" if l1_passed
+               else f" | 判死依据: {_det_fail_reason(l1_details)}")
         )
         try:
             from swarm.tracing import push_l1_feedback
