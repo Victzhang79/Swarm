@@ -1434,6 +1434,49 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
     _swept = (state or {}).get("unverified_footprints_swept")
     if _swept:
         tu["unverified_footprints_swept"] = _swept
+    # R65TR-T4③⑤：终态未核验账——推迟给 L2 D5/复核但 L2 从未到达（PARTIAL@dispatch）
+    # 的验收项静默丢失。纯聚合已在 per-subtask l1_details 的两类悬置键（不设闸、零假阳、
+    # 栈中立）：①C2 契约符号未现 diff（contract_missing_symbols）②NL-only 验收未确定性核
+    # （needs_review=no_test_or_verify_commands/verify_all_skipped_h1）。L2 跑过则 D5 已
+    # 全局对账，不重复报（避免与 D5 结论两张皮）。
+    try:
+        # 猎手 CONFIRMED HIGH：l2_details 只在【失败分支】设，L2 通过时根本不设 →
+        # 用它当"L2 是否运行"代理会两头错（L2 跑过且通过→误报；旧轮失败残留→漏报）。
+        # l2_passed 在 verify_l2 每个返回分支都设（通过/失败皆有）→ is None 才是
+        # "verify_l2 节点从未执行"（PARTIAL@dispatch 的真形态）的可靠信号。
+        if (state or {}).get("l2_passed") is None:
+            _res = (state or {}).get("subtask_results") or {}
+            # 猎手 CONFIRMED：subtask_results 可能是 checkpoint 还原的 plain dict——
+            # getattr(dict,'l1_details') 恒 None 会静默丢账（salvage 路径正是本特性
+            # 的动因场景）。复用单一事实源 helper（CODEWALK §3.2 收敛，兼容两形态）。
+            from swarm.brain.nodes.shared import l1_details_of as _l1d
+            _c2: dict[str, list] = {}
+            _nl: list[str] = []
+            for _sid, _out in _res.items():
+                _d = _l1d(_out) or {}
+                if not isinstance(_d, dict):
+                    continue
+                _cm = _d.get("contract_missing_symbols")
+                # 猎手预防：非 list（str 等）→ list() 会拆字符成脏账；只认真正的序列
+                if _cm and isinstance(_cm, (list, tuple, set)):
+                    _c2[_sid] = list(_cm)[:20]
+                if str(_d.get("needs_review") or "") in (
+                        "no_test_or_verify_commands", "verify_all_skipped_h1"):
+                    _nl.append(_sid)
+            if _c2 or _nl:
+                _acc: dict[str, Any] = {}
+                if _c2:
+                    _acc["contract_missing"] = dict(sorted(_c2.items())[:40])
+                if _nl:
+                    _acc["nl_acceptance_only"] = sorted(_nl)[:40]
+                tu["acceptance_unverified"] = _acc
+                logger.warning(
+                    "[RUNNER] 任务 %s 终态未核验账（L2 从未运行，推迟验收静默丢失）："
+                    "C2 契约符号悬置 %d 子任务 / NL-only 验收未核 %d 子任务",
+                    task_id, len(_c2), len(_nl))
+    except Exception:  # noqa: BLE001 — 未核验账是观测增强，绝不阻断终态
+        logger.warning("[RUNNER] 任务 %s 终态未核验账聚合异常（跳过）", task_id,
+                       exc_info=True)
     _attach_observability_account(tu, state)  # G3-1：FAILED 同享机读键（幂等）
     return tu
 
