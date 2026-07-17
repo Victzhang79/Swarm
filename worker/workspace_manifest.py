@@ -238,6 +238,10 @@ def _reconcile_maven_dep_versions(root: Path, hint: list[str]) -> tuple[list[str
     root dependencyManagement 又未声明其版本 → reactor 解析失败 → compile 失败，且无机制补回。
     据磁盘 ground-truth 补版本(= 模块自身/继承的项目版本)，使任何版本缺省的内部依赖可解析。
     保守：仅补进【已存在】的 <dependencyManagement><dependencies> 块，绝不臆造该块(无块交闸门 fail-closed)。
+    R65REPLAY-T3(回放实锤 com.ruoyi:ruoyi-admin:4.8.3 入根 depMgmt 存活至终态树)：
+    只补【被本工程其它模块运行时依赖引用】的 (g,a)——旧行为无差别登记全部带 <parent>
+    的子模块，把无人依赖的应用壳(assembly/launcher)也声明成可依赖件=错误对外契约。
+    治本初衷(round18 内部依赖版本可解析)只需要被引用者，过宽即病。
     确定性、幂等(已管理的 g:a 跳过)、模型无关。
     """
     modified: list[str] = []
@@ -247,6 +251,13 @@ def _reconcile_maven_dep_versions(root: Path, hint: list[str]) -> tuple[list[str
         text = _read(pom)
         if text is None:
             continue
+        # 本聚合树内全部模块的运行时依赖引用集(g,a)——depMgmt 只为它们服务
+        referenced: set[tuple[str, str]] = set()
+        for _rp in _all_poms(agg):
+            _rt = _read(_rp) or ""
+            for _g, _a, _hv in _maven_direct_deps(_rt):
+                if _g and _a:
+                    referenced.add((_g, _a))
         dm = re.search(
             r"(<dependencyManagement>\s*<dependencies>)(.*?)(</dependencies>\s*</dependencyManagement>)",
             text, re.S,
@@ -272,6 +283,8 @@ def _reconcile_maven_dep_versions(root: Path, hint: list[str]) -> tuple[list[str
             g, a, v = coords
             if (g, a) in managed:
                 continue
+            if (g, a) not in referenced:
+                continue  # 无人依赖(应用壳/launcher) → 不登记为可依赖件
             managed.add((g, a))
             new_entries.append((g, a, v))
         if not new_entries:

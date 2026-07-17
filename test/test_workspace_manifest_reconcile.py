@@ -206,3 +206,52 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"ok {name}")
+
+
+# ── R65REPLAY-T3（task #68）：depMgmt 只登【被依赖的】子模块，应用壳不入账 ──
+
+def _mk_maven_tree(tmp_path):
+    """root(带 depMgmt 块) + lib(被 app 依赖) + app(应用壳，无人依赖)。"""
+    root = tmp_path / "proj"
+    (root / "lib").mkdir(parents=True)
+    (root / "app").mkdir(parents=True)
+    (root / "pom.xml").write_text(
+        "<project><groupId>com.x</groupId><artifactId>root</artifactId>"
+        "<version>1.0</version><packaging>pom</packaging>"
+        "<modules><module>lib</module><module>app</module></modules>"
+        "<dependencyManagement>\n  <dependencies>\n  </dependencies>\n"
+        "</dependencyManagement></project>")
+    (root / "lib" / "pom.xml").write_text(
+        "<project><parent><groupId>com.x</groupId><artifactId>root</artifactId>"
+        "<version>1.0</version></parent><artifactId>lib</artifactId></project>")
+    (root / "app" / "pom.xml").write_text(
+        "<project><parent><groupId>com.x</groupId><artifactId>root</artifactId>"
+        "<version>1.0</version></parent><artifactId>app</artifactId>"
+        "<dependencies><dependency><groupId>com.x</groupId>"
+        "<artifactId>lib</artifactId></dependency></dependencies></project>")
+    return root
+
+
+def test_depmgmt_only_registers_referenced_modules(tmp_path):
+    """★回放毒株本体★：D2 补写把【无人依赖的应用壳】(ruoyi-admin 形态)也登进根
+    depMgmt=错误声明可依赖件（回放实锤 com.ruoyi:ruoyi-admin:4.8.3 存活至终态树）。
+    治=只补【被本工程其它模块运行时依赖引用】的 (g,a)——与 round18 治本初衷
+    （内部依赖版本可解析）精确对齐；应用壳没人依赖自然不入账。"""
+    from swarm.worker.workspace_manifest import _reconcile_maven_dep_versions
+    root = _mk_maven_tree(tmp_path)
+    modified, added = _reconcile_maven_dep_versions(root, [])
+    dm = (root / "pom.xml").read_text()
+    assert "<artifactId>lib</artifactId>" in dm.split("dependencyManagement")[1], \
+        "被依赖的 lib 必须补进 depMgmt（round18 语义不回归）"
+    assert "com.x:lib:1.0" in (added.get("pom.xml") or []), added
+    assert "<artifactId>app</artifactId>" not in dm.split("dependencyManagement")[1], \
+        "无人依赖的应用壳被登成可依赖件=回放根 pom 毒株死型"
+
+
+def test_depmgmt_idempotent_after_referenced_fix(tmp_path):
+    """幂等回归：已管理的 (g,a) 二次跑零变更。"""
+    from swarm.worker.workspace_manifest import _reconcile_maven_dep_versions
+    root = _mk_maven_tree(tmp_path)
+    _reconcile_maven_dep_versions(root, [])
+    modified2, added2 = _reconcile_maven_dep_versions(root, [])
+    assert not modified2 and not added2
