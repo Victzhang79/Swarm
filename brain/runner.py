@@ -1173,6 +1173,16 @@ def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     return output_parts
 
 
+async def _best_effort_snapshot(task_id: str) -> dict[str, Any] | None:
+    """R65REPLAY-T8：终态兜底路径专用——包一层 try/except，取快照失败绝不冒泡崩终态。
+    resume 两处泛 except 用它换掉裸 None，供 _sweep/_failed_machine_account best-effort。"""
+    try:
+        return await _load_state_snapshot(task_id)
+    except Exception:  # noqa: BLE001 — 快照读失败按不可得处理（空账不阻断终态）
+        logger.warning("[RUNNER] 任务 %s 终态兜底取快照失败（回退空账）", task_id, exc_info=True)
+        return None
+
+
 async def _load_state_snapshot(task_id: str, thread_id: str | None = None) -> dict[str, Any] | None:
     """读任务 LangGraph 实时快照的 state values（纯读，不推进图）。取不到返回 None。
 
@@ -1897,15 +1907,20 @@ async def run_task(
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
         # R38-E 复核 F7：泛 except 是 R38-D fail-loud RuntimeError 的必经之路——同样落机读账。
         # R65REPLAY 双复核 HIGH：本路径原 state=None——#71 对账/#72 清扫双双失效（未捕获
-        # 异常恰是最留幽灵件的死法）。best-effort 取已累积 state（异常早于其定义则回退 None）。
-        _exc_state: dict[str, Any] | None = None
-        try:
-            _exc_state = _accumulated_state  # noqa: F821 — 定义前抛出时 NameError 回退
-        except NameError:
-            _exc_state = None
+        # 异常恰是最留幽灵件的死法）。
+        # ★R65REPLAY-T8 猎手 CONFIRMED HIGH★：原 `_exc_state = _accumulated_state` 是【死代码】
+        # ——_accumulated_state 是 _stream_brain_events 的局部，不在 run_task 作用域，
+        # try/except NameError 恒命中 → _exc_state 恒 None → 自 d60e118 起 run_task 最常见
+        # 崩溃路径的清扫/账双双静默失效。收敛到 _best_effort_snapshot（与 resume 两路同源、
+        # 已测），从 checkpoint 取真 state。
+        _exc_state = await _best_effort_snapshot(task_id)
+        # 猎手 CONFIRMED MED/HIGH：await-in-except 引入二次取消窗口 + to_thread 取消不停线程
+        # → shield 包住 snapshot+sweep，杜绝调度器停机/看门狗中止在兜底期截断终态写、或
+        # 锁释放后孤儿线程仍在改 worktree。
         if _exc_state:
             try:
-                await asyncio.to_thread(_sweep_unverified_footprints, task_id, _exc_state)
+                await asyncio.shield(
+                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _exc_state))
             except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
                 logger.warning("[RUNNER] 任务 %s 泛异常路径清扫失败（跳过）", task_id,
                                exc_info=True)
@@ -2065,8 +2080,21 @@ async def resume_task(
         ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
+        # R65REPLAY-T8：未捕获异常是最留幽灵件的死法（#71/#72 双复核铁律）——resume 无
+        # 累积 state（state 仅 _stream_brain_events 返回后绑定，异常早于它则未定义），
+        # best-effort 取 checkpoint 快照做清扫+机读账，绝不裸传 None 丢账。取快照失败
+        # 回退 None（空账不阻断终态，与 run_task 泛 except 对齐）。
+        _rt_state = await _best_effort_snapshot(task_id)
+        if _rt_state:
+            try:
+                # 猎手：shield 防二次取消截断兜底 / 锁释放后孤儿 git 线程改 worktree
+                await asyncio.shield(
+                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _rt_state))
+            except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
+                logger.warning("[RUNNER] 任务 %s resume 泛异常清扫失败（跳过）", task_id,
+                               exc_info=True)
         store.update_task(task_id, status="FAILED", error=f"resume_failed: {exc}"[:300],
-                          token_usage=_failed_machine_account(task_id, None, "resume_failed"))
+                          token_usage=_failed_machine_account(task_id, _rt_state, "resume_failed"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {
             "step": "error",
@@ -2197,8 +2225,18 @@ async def resume_planning(
         ))
     except Exception as exc:  # noqa: BLE001
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
+        # R65REPLAY-T8：同 resume_task——best-effort 快照做清扫+机读账（规划 resume 多在
+        # 规划期，通常无子任务足迹，但已进执行的 resume-planning 同样可能留幽灵，对齐口径）。
+        _rp_state = await _best_effort_snapshot(task_id)
+        if _rp_state:
+            try:
+                await asyncio.shield(
+                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _rp_state))
+            except Exception:  # noqa: BLE001
+                logger.warning("[RUNNER] 任务 %s 规划 resume 泛异常清扫失败（跳过）", task_id,
+                               exc_info=True)
         store.update_task(task_id, status="FAILED", error=f"resume_planning_failed: {exc}"[:300],
-                          token_usage=_failed_machine_account(task_id, None, "resume_planning_failed"))
+                          token_usage=_failed_machine_account(task_id, _rp_state, "resume_planning_failed"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:

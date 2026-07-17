@@ -36,7 +36,7 @@ def test_e1_retry_seed_consumed_into_initial_state():
 
     async def _capture_stream(task_id, graph_input, queue, **kw):
         seen["initial"] = graph_input
-        raise RuntimeError("stop here")  # 播种验证完即止（走泛 except FAILED，不影响断言）
+        raise RuntimeError("stop here")  # 播种验证完即止（走泛 except FAILED）
 
     prev_state = {
         "plan": {"subtasks": [{"id": "st-1"}]},
@@ -61,8 +61,13 @@ def test_e1_retry_seed_consumed_into_initial_state():
          patch("swarm.memory.session.build_session_metadata", return_value={}):
         asyncio.run(runner.run_task("t-e1", "p-e1", "desc"))
 
-    load_mock.assert_awaited_once()
-    assert load_mock.await_args.kwargs.get("thread_id") == "t-e1-old", "必须读上一执行段 thread"
+    # R65REPLAY-T8：泛 except 兜底现会再取一次快照（best-effort 机读账/清扫——治后
+    # 恒生效，旧死代码 _accumulated_state 从不触发此二次读）。retry-seed 是【首次】读，
+    # 须带上一执行段 thread；第二次是终态兜底（无 thread_id kwarg）。
+    assert load_mock.await_count == 2, \
+        f"retry-seed 首读 + 泛 except 兜底二读: 实际 {load_mock.await_count}"
+    _seed_call = load_mock.await_args_list[0]
+    assert _seed_call.kwargs.get("thread_id") == "t-e1-old", "首次读必须是上一执行段 thread（retry 播种）"
     initial = seen["initial"]
     assert set(initial.get("subtask_results", {})) == {"st-1"}, (
         "retry 播种只带【L1 通过】产物——旧 retry 从零重跑把已付工作整批作废")
