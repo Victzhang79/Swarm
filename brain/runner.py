@@ -999,6 +999,9 @@ async def _handle_post_run(
         # 承诺的口径一致。绝不放行为 DONE（human_decision 仍 REJECT、不走
         # LEARN_SUCCESS）；仅虚假前提/计划无效类（产出本身不可信）与零产出维持 FAILED。
         _completed_n = _count_completed_in_plan(state)
+        # R65REPLAY-T7：非成功终态（PARTIAL/FAILED 两分支同享）先做诚实清扫——
+        # 未验产物出交付树，完成者产物受 protected 守卫；结果由机读账拾取。
+        await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)
         _partial_eligible = (
             _completed_n > 0
             and _vf != "plan_invalid"
@@ -1045,6 +1048,7 @@ async def _handle_post_run(
         if not _allow:
             logger.warning("[RUNNER] 任务 %s 终态非成功（gates 复核）: %s", task_id, _reason)
             _rec = store.get_task(task_id) or {}
+            await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)  # R65REPLAY-T7
             store.update_task(
                 task_id, status="FAILED",
                 error=f"delivery_not_accepted: {_reason}"[:300],
@@ -1248,6 +1252,115 @@ def _attach_observability_account(token_usage: dict[str, Any],
     return token_usage
 
 
+def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
+                                 project_path: str | None = None) -> dict:
+    """R65REPLAY-T7（回放轮 15 幽灵件=盘上全部编译破坏源，有账 24 产物 100% 编译过）：
+    终态诚实清扫——PARTIAL/FAILED 结算前，把【派发过（dispatch_totals>0）且未完成
+    （非 l1_passed）】的计划内子任务在本地树的足迹清掉（复用 H2 同源
+    _local_tree_revert_subtask：tracked→checkout 钉扎 base，untracked→删除）。
+
+    protected=完成者 diff 实际产物 ∪ scope 声明归属（_files_owned_by_completed，
+    H-exec2 其它调用点同源守卫；纯 diff 解析在同内容 rename/空 hunk 形态会漏保，
+    复核 F1）——绝不误删兄弟好产物。
+    边界：pull-back 本身不动（B2 分批续作/重试/取证依赖失败产物在树）；DONE/CANCELLED
+    不清扫（DONE 走 merge+#62；CANCELLED 留树供人查——两者的工作树残留面登记跟进批）；
+    plan 外旧 id 无 scope 可清（unsweepable 留痕，#71 账列 id）。fail-open；同步阻塞
+    git 子进程——async 调用点必须 asyncio.to_thread 卸载（单进程 asyncio 无抢占）。
+    结果落 state["unverified_footprints_swept"] 供 _failed_machine_account 发键。栈中立。
+    """
+    out: dict = {"swept_subtasks": [], "swept_files": 0}
+
+    def _book(_state):
+        if isinstance(_state, dict) and (
+                out["swept_subtasks"] or out.get("sweep_errors")
+                or out.get("unsweepable")):
+            _state["unverified_footprints_swept"] = dict(out)
+
+    try:
+        st_map = {s.id: s
+                  for s in getattr((state or {}).get("plan"), "subtasks", None) or []}
+        if not st_map:
+            return out
+        totals = (state or {}).get("subtask_dispatch_totals") or {}
+        results = (state or {}).get("subtask_results") or {}
+        completed = {
+            sid for sid, r in results.items()
+            if (getattr(r, "l1_passed", None) is True
+                or (isinstance(r, dict) and r.get("l1_passed") is True))
+        }
+        targets = [sid for sid in totals if sid in st_map and sid not in completed]
+        # 复核 F5：plan 外旧 id（重拆前父）派发过但无 scope 可清——账与扫帚的分歧必须可见。
+        _unsweepable = sorted(sid for sid in totals
+                              if sid not in st_map and sid not in completed)
+        if _unsweepable:
+            out["unsweepable"] = _unsweepable
+            logger.warning(
+                "[RUNNER] 任务 %s 终态清扫：%d 个 plan 外旧 id 派发过但无 scope 可清"
+                "（足迹可能残留树中，id 由 dispatched_unaccounted 列出）: %s",
+                task_id, len(_unsweepable), _unsweepable[:6])
+        if not targets:
+            _book(state)
+            return out
+        if not project_path:
+            from swarm.project import store as _pstore
+            _t = store.get_task(task_id) or {}
+            _proj = _pstore.get_project(_t.get("project_id") or "") or {}
+            project_path = _proj.get("path")
+        if not project_path:
+            _book(state)
+            return out
+        from swarm.brain.nodes.dispatch import _changes_from_diff
+        from swarm.brain.nodes.planning_core import (
+            _files_owned_by_completed,
+            _local_tree_revert_subtask,
+        )
+        # 复核 F1：diff 真账 ∪ scope 声明双保险（同内容 rename 无 hunk/多写者 pom 场景）。
+        protected: set[str] = set(_files_owned_by_completed(
+            list(st_map.values()), results, exclude_ids=set(targets)))
+        for sid in completed:
+            r = results.get(sid)
+            _diff = (getattr(r, "diff", None)
+                     or (r.get("diff") if isinstance(r, dict) else "") or "")
+            for ch in _changes_from_diff(_diff):
+                p = (getattr(ch, "file_path", "") or "").replace("\\", "/").lstrip("./")
+                if p:
+                    protected.add(p)
+        base_ref = (state or {}).get("base_commit")
+        if not base_ref:
+            # 复核 F8：base 缺失 → tracked 还原回退当前 HEAD；本点触发频率高，留痕供审计。
+            logger.warning(
+                "[RUNNER] 任务 %s 终态清扫：state 无 base_commit，tracked 还原将回退"
+                "当前 HEAD（若 HEAD 已漂移可能非任务启动基线）", task_id)
+        for sid in sorted(targets):
+            try:
+                r = _local_tree_revert_subtask(
+                    project_path, st_map[sid],
+                    protected_files=protected, base_ref=base_ref)
+                n = len(r.get("reverted") or []) + len(r.get("removed") or [])
+                if n:
+                    out["swept_subtasks"].append(sid)
+                    out["swept_files"] += n
+                # 复核 MED：revert_failed（checkout 非零/unlink 抛）绝不静默——没这条，
+                # 运维读账见"无键"会误判"无幽灵件"，而毒件还在盘上。
+                if r.get("revert_failed"):
+                    out.setdefault("sweep_errors", []).append(sid)
+            except Exception as _sw_exc:  # noqa: BLE001 — 复核 F6：单子任务失败不丢已扫账
+                out.setdefault("sweep_errors", []).append(sid)
+                logger.warning("[RUNNER] 任务 %s 清扫子任务 %s 失败（继续其余）: %s",
+                               task_id, sid, _sw_exc)
+        if out["swept_subtasks"] or out.get("sweep_errors"):
+            _book(state)
+            logger.warning(
+                "[RUNNER] 任务 %s R65REPLAY-T7 终态诚实清扫：%d 个未完成子任务的 %d 个"
+                "未验产物已从交付树剔除（tracked 还原钉扎基线/untracked 删除；完成者产物"
+                "受 protected 守卫）: %s", task_id, len(out["swept_subtasks"]),
+                out["swept_files"], out["swept_subtasks"][:8])
+    except Exception:  # noqa: BLE001 — 清扫失败绝不阻断终态（fail-open 可观测）
+        logger.warning("[RUNNER] 任务 %s 终态清扫异常（fail-open 跳过）", task_id,
+                       exc_info=True)
+    return out
+
+
 def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                             reason_code: str) -> dict[str, Any]:
     """R38-E：FAILED 终态的机读账（复用 token_usage jsonb 槽，与 PARTIAL 对称）。
@@ -1293,6 +1406,29 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                     tu[_k] = _prev[_k]
     except Exception:  # noqa: BLE001 — 诊断键补齐失败不阻断终态账
         pass
+    # R65REPLAY-T6（回放轮软掉账 5 例：audit 33 派发 vs results 28）：终态账务守恒——
+    # subtask_dispatch_totals（单调终身账，豁免剪枝）有派发记录、subtask_results 无条目、
+    # 且非放弃者 = "派发过却无账"的第五态（HANDLE_FAILURE 重派 pop 后调度未兑现）。
+    # W3 处置总账只保证帧内平账，跨帧承诺在此收口；plan 外旧 id（重拆前父）同列——派发
+    # 是事实。调度兑现本体归 #70，此闸保证蒸发必可见。
+    try:
+        _totals = (state or {}).get("subtask_dispatch_totals") or {}
+        _res = (state or {}).get("subtask_results") or {}
+        _ab = set((state or {}).get("abandoned_subtask_ids") or [])
+        _lost = sorted(sid for sid in _totals if sid not in _res and sid not in _ab)
+        if _lost:
+            tu["dispatched_unaccounted"] = _lost
+            logger.warning(
+                "[RUNNER] 任务 %s 终态账务守恒：%d 个子任务派发过却无账"
+                "（dispatched_unaccounted，重派承诺未兑现的软掉账）: %s",
+                task_id, len(_lost), _lost[:8])
+    except Exception:  # noqa: BLE001 — 对账失败不阻断终态
+        logger.warning("[RUNNER] 任务 %s 终态账务守恒对账异常（跳过）", task_id,
+                       exc_info=True)
+    # R65REPLAY-T7：终态清扫结果入账（清扫先于本账调用，有才发键）。
+    _swept = (state or {}).get("unverified_footprints_swept")
+    if _swept:
+        tu["unverified_footprints_swept"] = _swept
     _attach_observability_account(tu, state)  # G3-1：FAILED 同享机读键（幂等）
     return tu
 
@@ -1322,6 +1458,8 @@ async def _finalize_governor_partial(
         logger.warning("[RUNNER] 任务 %s 抢救前回写 state 失败（不阻断终态判定）: %s", task_id, exc)
 
     completed = _count_completed_in_plan(state)
+    # R65REPLAY-T7：PARTIAL/FAILED 同享清扫（to_thread 卸载：git 子进程不卡事件环）
+    await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)
     if completed <= 0:
         # R38-E：FAILED 终态也带机读账——error 串 + ledger 权威快照 + degraded_summary
         # 落任务记录（round38 实测：audit 有账但 API task.error=None/token_usage={}，
@@ -1709,9 +1847,23 @@ async def run_task(
         ))
     except Exception as exc:
         logger.exception("[RUNNER] 任务 %s 执行失败", task_id)
-        # R38-E 复核 F7：泛 except 是 R38-D fail-loud RuntimeError 的必经之路——同样落机读账
+        # R38-E 复核 F7：泛 except 是 R38-D fail-loud RuntimeError 的必经之路——同样落机读账。
+        # R65REPLAY 双复核 HIGH：本路径原 state=None——#71 对账/#72 清扫双双失效（未捕获
+        # 异常恰是最留幽灵件的死法）。best-effort 取已累积 state（异常早于其定义则回退 None）。
+        _exc_state: dict[str, Any] | None = None
+        try:
+            _exc_state = _accumulated_state  # noqa: F821 — 定义前抛出时 NameError 回退
+        except NameError:
+            _exc_state = None
+        if _exc_state:
+            try:
+                await asyncio.to_thread(_sweep_unverified_footprints, task_id, _exc_state)
+            except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
+                logger.warning("[RUNNER] 任务 %s 泛异常路径清扫失败（跳过）", task_id,
+                               exc_info=True)
         store.update_task(task_id, status="FAILED", error=str(exc)[:300],
-                          token_usage=_failed_machine_account(task_id, None, "unhandled_exception"))
+                          token_usage=_failed_machine_account(
+                              task_id, _exc_state, "unhandled_exception"))
         _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id, project_id=project_id, error=str(exc)[:300])
         await _emit(queue, {
@@ -2161,13 +2313,28 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
                     if _age < _grace_s:
                         stats["skipped_running"] += 1
                         continue
-            # 活跃执行态 fail-closed
+            # 活跃执行态 fail-closed。
+            # R65REPLAY 猎手 CRITICAL：重启孤儿原裸 FAILED——零机读账/零清扫，重启恰是
+            # 幽灵件最易残留场景。先走 salvage（checkpoint state→governor 终态：有产物
+            # 诚实 PARTIAL+#71 对账+#72 清扫；checkpoint 不可读→内部退 FAILED 带机读账）；
+            # salvage 自身异常才回退旧裸 FAILED（不比旧路径差）。
             try:
-                await loop.run_in_executor(
-                    None, lambda t=tid: store.update_task(t, status="FAILED")
-                )
-                _audit_reconcile(tid, rec, "orphaned_on_restart", "FAILED",
-                                 "API restart; active-execution task failed-closed, resources released")
+                try:
+                    await _salvage_partial_from_checkpoint(
+                        tid, _FanoutTopic(),
+                        reason_code="orphaned_on_restart",
+                        reason_msg="API 重启时任务处活跃执行态，fail-closed 收编")
+                    _audit_reconcile(tid, rec, "orphaned_on_restart", "SALVAGED",
+                                     "API restart; salvaged via checkpoint "
+                                     "(PARTIAL if products else FAILED, swept+accounted)")
+                except Exception as _sv_exc:  # noqa: BLE001 — salvage 失败回退旧行为
+                    logger.warning("[RECONCILE] 任务 %s salvage 失败，回退裸 FAILED: %s",
+                                   tid, _sv_exc)
+                    await loop.run_in_executor(
+                        None, lambda t=tid: store.update_task(t, status="FAILED")
+                    )
+                    _audit_reconcile(tid, rec, "orphaned_on_restart", "FAILED",
+                                     "API restart; active-execution task failed-closed, resources released")
                 _task_running.discard(tid)
                 try:
                     from swarm.worker.sandbox import get_sandbox_manager

@@ -423,3 +423,39 @@ get_dispatch_batch._is_ready）/活产者照常排序。R51-1/T5 先例（comple
 
 **质量闸**：19 测试（软边 15+W3 reason 2+平价 1+回放缩微 1）；revert-check 5 红；定向
 45+99 绿；全量见提交。
+
+## #71 R65REPLAY-T6 + #72 R65REPLAY-T7：终态账务守恒 + 终态诚实清扫（回放轮软掉账/幽灵件双治）
+
+**#71 软掉账**（C 路独家：audit 33 派发 vs results 28，st-2/st-23-1/st-17-1/st-27/st-11-1
+旧 id 五例）：HANDLE_FAILURE 重派 pop subtask_results 后调度未兑现（#70）→ 终态无失败无
+完成的"第五态"。裁决：不动 pop 语义（presence 被广泛消费，重派意图合法；兑现本体归 #70）
+——治=_failed_machine_account 终态对账：subtask_dispatch_totals（单调终身账）有记录/
+results 无/非放弃 → tu["dispatched_unaccounted"]+WARNING（plan 外旧 id 同列）。
+
+**#72 幽灵件**（C 路 mvn 实证：有账 24 产物 100% 编译过、账外 15 件=盘上全部编译破坏源）：
+治=_sweep_unverified_footprints 终态诚实清扫——PARTIAL/FAILED 结算前对"派发过且非
+l1_passed"的计划内子任务跑 _local_tree_revert_subtask（H2 同源：tracked→checkout 钉扎
+base/untracked→删除）。protected=完成者 diff 真账∪scope 声明（_files_owned_by_completed
+同源守卫）。边界：pull-back 不动（B2 续作/取证）；DONE/CANCELLED 不清扫（跟进批 #73）。
+
+**双复核处置**（reviewer WARNING 2H/2M/1L + hunter 1C/3H/3M/1LM，合流裁决）：
+- ★hunter CRITICAL：重启孤儿对账裸 FAILED 零账零扫 → orphaned_on_restart 改走
+  _salvage_partial_from_checkpoint（checkpoint state→governor 终态：有产物诚实 PARTIAL+
+  对账+清扫），salvage 异常回退旧裸 FAILED——重启语义从"一律 FAILED"升级为"诚实收编"★。
+- 双 HIGH（两家同报）：run_task 泛 except state=None 双闸失效 → best-effort 取
+  _accumulated_state（NameError 回退）+ 清扫接线。
+- reviewer HIGH：同步 git 子进程卡单进程事件环 → 三调用点+泛 except 全部
+  asyncio.to_thread 卸载。
+- hunter F1/reviewer LOW：protected 纯 diff 解析漏保（同内容 rename 无 hunk/多写者 pom）
+  → ∪ _files_owned_by_completed（scope 声明）双保险+锁。
+- hunter F5：plan 外旧 id 无 scope 可清 → out["unsweepable"] 留痕入账+锁（账与扫帚的
+  分歧必可见）。
+- hunter F6+reviewer MED：单子任务失败不丢已扫账（per-sid try/except+sweep_errors）+
+  revert_failed 非零入 sweep_errors（"清了无人知道"绝迹）+锁。
+- hunter F8：base_commit 缺失 → WARNING（HEAD 回退半径大，留痕供审计）。
+- 刻意不并入（登记 #73 跟进批）：DONE 工作树残留/CANCELLED 不清扫/resume 两处泛
+  except/run_task 泛 except 行为级测试。
+
+**质量闸**：10 测试（#71 3+#72 7，含临时 git repo 实测 checkout/删除/protected/
+unsweepable/mid-loop 隔离）；revert-check 5 红；终态家族定向 35+37 绿；ruff 阻断级 0；
+全量见提交。
