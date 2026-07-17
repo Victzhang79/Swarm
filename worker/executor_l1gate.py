@@ -174,10 +174,19 @@ class _L1GateMixin:
         from swarm.worker.l1_pipeline import (
             _read_project_file, _write_project_file,
         )
+        # R65D-T2④：登记被 H1 覆写的文件→模板内容映射——verify 阶段对这些文件的内容
+        # 断言是旧考卷考新模板（round65d st-26：worker 徒手 pom 本可过自己的卷，被 H1
+        # 覆写后 grep jackson 考模板必死=冤案），pipeline 在 verify 时点【重比内容仍
+        # 等于模板】才跳过（猎手 CRITICAL：同 run 内 R56-5/version-repair 可能在 H1 后
+        # 合法改写该 pom——温差窗口内断言必须保有牙齿）。写失败不登记，fail-open。
+        if not hasattr(self, "_h1_enforced_templates"):
+            self._h1_enforced_templates: dict[str, str] = {}
         cur = _read_project_file(self.project_path, rel, timeout=15)
         if cur is not None and cur.strip() == tpl:
+            self._h1_enforced_templates[rel] = tpl
             return  # 幂等
         if _write_project_file(self.project_path, rel, tpl + "\n", timeout=20):
+            self._h1_enforced_templates[rel] = tpl
             self._log(
                 f"[H1] 权威 pom 模板确定性落盘 {rel}"
                 "（机械产物不赌 LLM 服从度，worker 徒手版本被模板覆写）")
@@ -287,6 +296,9 @@ class _L1GateMixin:
                 # 已超时"，进门后 build+repair 900s 墙钟与预算解耦（最坏 ~35min runaway）。
                 deadline=(self.start_time + self.max_execution_time
                           if getattr(self, "start_time", 0) else None),
+                # R65D-T2④：H1 覆写文件的旧内容断言不得杀 worker（st-26 冤案兜底）；
+                # 传 rel→模板映射，pipeline 在 verify 时点重比内容后才跳过
+                template_enforced_rels=getattr(self, "_h1_enforced_templates", None),
             )
             # TD2606-C9：登记本轮在沙箱里被确定性修复的文件，使其回传本地 + 计入 diff。
             self._record_repaired_paths(details)

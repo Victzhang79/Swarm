@@ -3425,6 +3425,31 @@ def _build_error_is_upstream(build_output: str, build_cmd: str,
     return own.isdisjoint(errs)
 
 
+def _cmd_references_path(cmd: str, rel: str) -> bool:
+    """路径是否以【完整 token 边界】出现在命令文本中。复核 CONFIRMED：裸子串会把
+    `xmod-a/pom.xml.bak` / `a/mod-a/pom.xml` 误判成 `mod-a/pom.xml`——嵌套模块复用
+    叶名是常见 Maven 布局，误判=误跳过合法断言=假绿。"""
+    if not rel:
+        return False
+    return re.search(
+        r"(^|[\s'\"=(])" + re.escape(rel) + r"($|[\s'\")])", cmd or "") is not None
+
+
+def _is_h1_content_assert(cmd: str, rels) -> bool:
+    """R65D-T2④：命令是否为「针对 H1 覆写文件的内容断言」。
+
+    判定收窄到两形态交集（grep 正断言 / test -z|-n "$(grep…)" 负断言）×（命令文本
+    以 token 边界引用被覆写文件路径）——构建命令（mvn validate 等）、工具类检查
+    （test -f）、针对其他文件的断言全部不命中，绝不放大成 verify 面的免死金牌。
+    复合命令（&&/;/|）不命中（fail-open：解析不了就照常执行，保考卷牙齿）。
+    """
+    c = (cmd or "").strip()
+    if not (c.startswith("grep ")
+            or re.match(r'^test\s+-[zn]\s+["\']?\$\(\s*grep', c)):
+        return False
+    return any(_cmd_references_path(c, r) for r in rels)
+
+
 def run_l1_pipeline(
     project_path: str,
     subtask: SubTask,
@@ -3435,6 +3460,7 @@ def run_l1_pipeline(
     project_stack: dict | None = None,
     extra_writable_paths: set[str] | None = None,
     deadline: float | None = None,
+    template_enforced_rels: set[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
@@ -3456,6 +3482,10 @@ def run_l1_pipeline(
         extra_writable_paths: round18 P0-B——确定性修复机制合法触达的 scope 外文件
             (executor._repaired_extra_paths，如 module-registration 自愈改的父 pom)，
             scope 复核时视为允许，避免把非 worker 越权写的修复文件误判越权整份判死。
+        template_enforced_rels: R65D-T2④——H1 权威模板确定性覆写过的文件（内容即模板）。
+            对这些文件的内容断言（grep / test -z "$(grep…)"）是旧考卷考新模板，
+            跳过并记 details["verify_skipped_h1"]（round65d st-26 冤案兜底；断言同源
+            由规划期 reconcile_template_exam 保证）。其余 verify 命令照常执行。
     """
     details: dict[str, Any] = {"pipeline": "L1.1-L1.4"}
 
@@ -3966,8 +3996,40 @@ def run_l1_pipeline(
     if verify_cmds:
         if _deadline_blocked("verify_commands"):
             return True, details
+        # R65D-T2④：H1 覆写文件的内容断言跳过面。猎手 CRITICAL 整改：跳过判据不是
+        # 「rel 曾被 H1 覆写」而是「verify 此刻内容仍等于模板」——同一 run 内 R56-5
+        # 依赖合法性/version-repair 可能在 H1 之后合法改写该 pom（温差窗口），跨迭代
+        # 集合也只增不减；内容一旦偏离模板，断言立即恢复牙齿，绝不留假绿窗口。
+        _h1_tpl: dict[str, str] = {}
+        if isinstance(template_enforced_rels, dict):
+            _h1_tpl = {str(r).replace("\\", "/").lstrip("/"): t
+                       for r, t in template_enforced_rels.items() if r and t}
+        _h1_live: dict[str, bool] = {}
+
+        def _h1_still_template(rel: str) -> bool:
+            if rel not in _h1_live:
+                _cur = _read_project_file(project_path, rel, timeout=15)
+                _h1_live[rel] = (_cur is not None
+                                 and _cur.strip() == _h1_tpl[rel].strip())
+                if not _h1_live[rel]:
+                    logger.info(
+                        "[L1.3.5] R65D-T2 %s 在 H1 覆写后被后续机制改写（内容≠模板）"
+                        "→ 对它的内容断言恢复照常执行", rel)
+            return _h1_live[rel]
+
         verify_results = []
         for vc in verify_cmds:
+            _hit = next((r for r in _h1_tpl
+                         if _is_h1_content_assert(vc, {r})), None)
+            if _hit is not None and _h1_still_template(_hit):
+                # 文件内容确证=权威模板——对它的内容断言要么同义反复要么是陈旧卷
+                # （round65d st-26：grep jackson 考 okhttp 模板必死=冤案）。
+                # 跳过+机读留痕，绝不静默；构建/工具类命令不在此列。
+                details.setdefault("verify_skipped_h1", []).append(vc)
+                logger.info(
+                    "[L1.3.5] R65D-T2 跳过 H1 权威模板覆写文件的内容断言"
+                    "（模板即真值，旧考卷不考新模板）: %s", vc)
+                continue
             v_ec, v_out = _run_l1_command(
                 vc, project_path, timeout=_stage_timeout(timeout, deadline))
             ok = v_ec == 0
@@ -3990,9 +4052,15 @@ def run_l1_pipeline(
     # 子任务——确定性验证面只剩编译（test skip 判过），语义正确性零覆盖。打 needs_review
     # 标记（deliver/人工闸可见；阻断语义由 det+llm conflict 分支承担——Phase-4 自检判
     # False 时 evaluate_l1 已 fail，见 deterministic_llm_conflict）。
+    # 猎手 HIGH 整改（R65D-T2④伴生）：判据用【实际执行】的 verify 结果，不用 harness
+    # 原始清单——全部内容断言被 H1 跳过时清单非空但零命令真跑，语义正确性零覆盖，
+    # 必须打 needs_review（原样放行=假绿盲区）。
+    _executed_verify = list(details.get("verify_commands") or [])
     if modified and not (getattr(harness, "test_command", "") if harness else "") \
-            and not (list(getattr(harness, "verify_commands", []) or []) if harness else []):
-        details["needs_review"] = "no_test_or_verify_commands"
+            and not _executed_verify:
+        details["needs_review"] = ("verify_all_skipped_h1"
+                                   if details.get("verify_skipped_h1")
+                                   else "no_test_or_verify_commands")
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = l1_self_review_enabled()

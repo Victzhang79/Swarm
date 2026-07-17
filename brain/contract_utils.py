@@ -921,6 +921,94 @@ def _baseline_module_artifact(root: Path, mod_dir: str) -> str | None:
         return None
 
 
+def _reverse_internal_edge_producer(plan, root: Path, consumer_writer_ids: set[str],
+                                    target_dir: str) -> str | None:
+    """R65D-T2② 判据（round65d st-26 反向边死型）：目标模块 pom 不在磁盘、且它的
+    plan 生产者【传递依赖】消费方的写者 → 消费方构建时目标 pom 必然还不存在
+    （成环形态），注入该依赖=确定性制造不可解析坐标。命中返回生产者 id，否则 None。
+    正向证据才剪：无 pom 生产者/基线已有 pom 一律放行，绝不误杀合法单向依赖。"""
+    d = (target_dir or "").strip("/")
+    if not d or (root / d / "pom.xml").is_file():
+        return None
+    pom = f"{d}/pom.xml"
+    prod = None
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        owns = [_norm_scope_path(str(f)) for f in
+                (list(getattr(sc, "create_files", None) or [])
+                 + list(getattr(sc, "writable", None) or []))]
+        if pom in owns:
+            prod = st.id
+            break
+    if prod is None or not consumer_writer_ids:
+        return None
+    deps_of = {st.id: list(getattr(st, "depends_on", []) or [])
+               for st in (getattr(plan, "subtasks", None) or [])}
+    seen: set[str] = set()
+    stack = [prod]
+    while stack:
+        for dep in deps_of.get(stack.pop(), []):
+            if dep not in seen:
+                seen.add(dep)
+                stack.append(dep)
+    return prod if (seen & consumer_writer_ids) else None
+
+
+def _prune_reverse_contract_internal_deps(plan, dirs: dict[str, str],
+                                          project_path: str | None) -> None:
+    """R65D-T2② 配套（猎手 HIGH）：反向边剪除同样适用于【契约自声明】的兄弟模块依赖。
+
+    只剪推导通道不够——round63 观察是"契约从不声明内部依赖"，但一旦 LLM 在
+    shared_contract 里直接声明反向兄弟依赖，_merge_internal_deps 以契约优先只去重
+    不剪环，st-26 死型换个通道原样复活。判据与推导通道同源
+    （_reverse_internal_edge_producer），剪除响亮留痕。fail-open：无证据不动。"""
+    if not project_path or not dirs:
+        return
+    root = Path(project_path)
+    shared = getattr(plan, "shared_contract", None)
+    entries = shared.get("dependencies") if isinstance(shared, dict) else None
+    if not isinstance(entries, list):
+        return
+    sib_by_key: dict[str, str] = {}
+    for n, d in dirs.items():
+        sib_by_key[(d or "").rstrip("/").rsplit("/", 1)[-1]] = n
+        sib_by_key[n] = n
+    writers_of: dict[str, set[str]] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            p = _norm_scope_path(str(f))
+            for n, d in dirs.items():
+                dd = (d or "").strip("/")
+                if dd and (p == dd or p.startswith(dd + "/")):
+                    writers_of.setdefault(n, set()).add(st.id)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        m = (entry.get("module") or "").strip().rstrip("/")
+        if m not in dirs:
+            continue
+        arts = [a for a in (entry.get("artifacts") or []) if a]
+        kept: list[str] = []
+        for a in arts:
+            parts = str(a).split(":")
+            art_id = (parts[1] if len(parts) > 1 else parts[0]).strip()
+            target = sib_by_key.get(art_id)
+            if target and target != m:
+                prod = _reverse_internal_edge_producer(
+                    plan, root, writers_of.get(m, set()), dirs.get(target) or "")
+                if prod is not None:
+                    logger.warning(
+                        "[R65D-T2] 契约声明的反向内部依赖剪除：%s → %s（artifact=%s，"
+                        "目标 pom 生产者 %s 在消费方传递下游=成环死型；只剪推导通道"
+                        "会让 st-26 换契约通道复活）", m, target, a, prod)
+                    continue
+            kept.append(a)
+        if len(kept) != len(arts):
+            entry["artifacts"] = kept
+
+
 def derive_internal_module_deps(plan, dirs: dict[str, str],
                                 project_path: str | None) -> dict[str, list[str]]:
     """T5（round63 治本）：从子任务跨模块 readable 证据确定性推导**内部模块依赖**。
@@ -958,8 +1046,9 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
                 return m
         return None
 
-    # 证据收集：{module: {("plan"|"baseline", 名)}}
+    # 证据收集：{module: {("plan"|"baseline", 名)}}；writers_of 供 R65D-T2② 方向校验
     evid: dict[str, set[tuple[str, str]]] = {m: set() for m in plan_dir_of}
+    writers_of: dict[str, set[str]] = {}
     for st in (getattr(plan, "subtasks", None) or []):
         sc = getattr(st, "scope", None)
         writes = [_norm_scope_path(str(f)) for f in
@@ -968,6 +1057,8 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
         write_mods = {_owner_mod(p) for p in writes} - {None}
         if not write_mods:
             continue
+        for _wm in write_mods:
+            writers_of.setdefault(_wm, set()).add(st.id)
         for r in (getattr(sc, "readable", None) or []):
             rp = _norm_scope_path(str(r))
             if "/" not in rp or not _is_code_path(rp):
@@ -1001,6 +1092,17 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
                 if (m, name) in mutual:
                     continue
                 d = plan_dir_of.get(name) or name
+                # R65D-T2②（round65d st-26 反向边死型）：目标模块 pom 生产者在消费方
+                # 写者的传递下游 → 剪除 fail-loud（判据/铁律见 helper docstring）
+                _prod = _reverse_internal_edge_producer(
+                    plan, root, writers_of.get(m, set()), d)
+                if _prod is not None:
+                    logger.warning(
+                        "[T5] R65D-T2 反向内部依赖剪除：%s → %s——目标模块 pom 生产者 "
+                        "%s 传递依赖 %s 的写者（消费方构建时目标 pom 必不存在=成环死型，"
+                        "round65d st-26 本体），绝不注入；边方向属更深计划错，交 #57 DAG 面",
+                        m, name, _prod, m)
+                    continue
                 art = _baseline_module_artifact(root, d)
                 if art:
                     specs.append(art)          # 落在既有模块目录（R58-1 形态）→ 依真 artifactId
@@ -1045,6 +1147,50 @@ def _merge_internal_deps(arts: list[str], derived: list[str]) -> list[str]:
             merged.append(d)
             have.add(art)
     return merged
+
+
+def _strip_machine_pom_blocks(desc: str, pom: str) -> str:
+    """R65D-T2①：剥除 description 中针对 pom 的既有机器块（权威模板/铁律/缺失片段）。
+
+    round65d 死因链第①层：R58-3 旧幂等守卫「描述里已有模板→整体跳过」把第一遍
+    注入的陈旧模板冻结（10:25 T5 单向证据推出 interface→alarm 反向依赖烤进 st-26，
+    10:39 终版推导该边已消失却无从刷新）；MODIFY 形态守卫更是只认「权威 pom 模板」
+    字样 → 铁律/片段块被重复追加（st-42 实锤 ×2）。upsert=先剥后贴，终版为真值。
+    """
+    import re as _re
+    p = _re.escape(pom)
+    # 带 ```xml fence 的块（权威模板 / 缺失依赖片段），两代措辞通吃
+    desc = _re.sub(
+        rf"\n?【(?:权威 pom 模板|缺失依赖片段)（[^】]*{p}[^】]*】\n```xml\n.*?\n?```",
+        "", desc, flags=_re.S)
+    # 铁律块（无 fence）：从标题到下一个机器块标题或串尾
+    desc = _re.sub(
+        rf"\n?【既有 pom 修改铁律（{p} 已存在）】.*?(?=\n【|\Z)",
+        "", desc, flags=_re.S)
+    return desc
+
+
+def _upsert_owner_pom_block(owner, pom: str, new_block: str) -> bool:
+    """把针对 pom 的机器块 upsert 进 owner.description（幂等；刷新时 fail-loud）。"""
+    old = owner.description or ""
+    new_desc = _strip_machine_pom_blocks(old, pom) + new_block
+    if new_desc == old:
+        return False   # 幂等：本遍确定性产物与已有块一致
+    # 猎手 MED 整改（多 pom owner 顺序抖动）：块内容一致只是位置不同（strip+append 会把
+    # 先处理的 pom 块挪到后处理的之后，逐遍交替"变化"）→ 位置无关幂等，杜绝 WARNING
+    # 刷屏把真漂移信号淹成噪声。判据=旧描述已含完全一致的本遍块，且除它外无本 pom 其他机器块。
+    if new_block and new_block in old:
+        _without = old.replace(new_block, "", 1)
+        if _strip_machine_pom_blocks(_without, pom) == _without:
+            return False
+    had_block = old != _strip_machine_pom_blocks(old, pom)
+    if had_block:
+        logger.warning(
+            "[SCAFFOLD-INJECT] R65D-T2 %s 的 %s 机器块与本遍确定性产物不一致 → 刷新"
+            "（陈旧模板绝不冻结上车——round65d st-26 反向依赖即第一遍毒模板被旧守卫冻结）",
+            getattr(owner, "id", "?"), pom)
+    owner.description = new_desc
+    return True
 
 
 def _inject_templates_into_pom_owners(plan, project_path: str | None,
@@ -1099,8 +1245,10 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
             if pom in owns:
                 owner = st
                 break
-        if owner is None or "权威 pom 模板" in (owner.description or ""):
+        if owner is None:
             continue
+        # R65D-T2①：已有机器块不再是跳过理由——终版确定性产物 upsert（幂等/刷新），
+        # 陈旧模板（第一遍 T5 推导烤进的反向依赖）绝不冻结上车。
         arts = _merge_internal_deps(arts, _internal_deps.get(mod) or [])   # T5
         _kept, _ = resolve_scaffold_artifacts(project_path, arts)
         # R65C-T1 毒株(a)：完整模板只给 CREATE（与主入口 1595-1615 同律）——
@@ -1116,12 +1264,13 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
             _dep_snips = "\n".join(_render_dep_block(d) for d in _kept)
             _snip_block = (f"\n【缺失依赖片段（并入 {pom} 既有 <dependencies>）】\n```xml\n"
                            f"{_dep_snips}\n```") if _dep_snips else ""
-            owner.description = (owner.description or "") + (
+            _iron_block = (
                 f"\n【既有 pom 修改铁律（{pom} 已存在）】只做最小增量修改：绝不整体替换/"
                 "重写该文件，绝不删除既有依赖/插件/属性，绝不改动既有 parent 声明"
                 "（parent 版本若需写必须是**字面量**，绝不可写成 ${{...}} 属性引用）。"
                 + _snip_block)
-            touched.append(owner.id)
+            if _upsert_owner_pom_block(owner, pom, _iron_block):   # R65D-T2①
+                touched.append(owner.id)
             continue
         _pgav = None
         _rg = _root_gav(project_path)
@@ -1131,11 +1280,12 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
                                           parent_gav=_pgav)
         if not tpl:
             continue
-        owner.description = (owner.description or "") + (
+        _auth_block = (
             f"\n【权威 pom 模板（确定性生成，原样写入 {pom}；parent 版本必须是**字面量**，"
             f"绝不可写成 ${{...}} 属性引用——Maven 解析 parent 时尚未加载父 pom，属性永远解析不了，"
             f"整棵 reactor 会读不出）】\n```xml\n{tpl}\n```")
-        touched.append(owner.id)
+        if _upsert_owner_pom_block(owner, pom, _auth_block):   # R65D-T2①
+            touched.append(owner.id)
     if touched:
         logger.warning(
             "[SCAFFOLD-INJECT] R58-3 %d 个子任务自行认领了模块 pom（不走脚手架）→ 已把**确定性权威模板**"
@@ -1472,7 +1622,184 @@ def _should_fabricate_maven_scaffold(
     return (stk == "unknown" or stk in _AGGREGATOR_SCAFFOLD_STACKS), stk
 
 
+def _extract_auth_templates(desc: str) -> list[tuple[str, str]]:
+    """description → [(pom 路径, 模板 XML)]（仅「原样写入」CREATE 形态；MODIFY 片段
+    是增量语义、文件终态不确定，考卷同源不适用）。"""
+    import re as _re
+    out: list[tuple[str, str]] = []
+    for m in _re.finditer(
+            # 复核 CONFIRMED：路径捕获必须排除全角）——聚合父/孤儿脚手架措辞
+            # 「原样写入 {pom}）】」无限定语，漏排会把 ）粘进路径 → 断言永远考错文件
+            r"【权威 pom 模板（[^】]*?原样写入 ([^\s;；)）】]+)[^】]*】\n```xml\n(.*?)\n?```",
+            desc or "", flags=_re.S):
+        out.append((m.group(1).strip(), m.group(2)))
+    return out
+
+
+def _template_dep_artifacts(tpl: str) -> list[str]:
+    """模板 <dependencies> 区的 artifactId 清单（去重保序；parent/自身声明天然不在区内）。"""
+    import re as _re
+    seg = (tpl or "").split("<dependencies>", 1)
+    if len(seg) < 2:
+        return []
+    body = seg[1].split("</dependencies>", 1)[0]
+    return list(dict.fromkeys(
+        a.strip() for a in _re.findall(r"<artifactId>([^<]+)</artifactId>", body)
+        if a.strip()))
+
+
+def _exam_grep_pattern(cmd: str) -> str | None:
+    import re as _re
+    m = _re.search(r"grep\s+(?:-{1,2}[\w=-]+\s+)*(?:'([^']*)'|\"([^\"]*)\")", cmd or "")
+    if not m:
+        return None
+    return m.group(1) if m.group(1) is not None else m.group(2)
+
+
+def _exam_pattern_hits(pat: str, text: str) -> bool:
+    import re as _re
+    try:
+        return _re.search(pat, text) is not None
+    except _re.error:
+        return pat in text
+
+
+def _is_pom_content_assert(cmd: str, pom: str) -> bool:
+    import re as _re
+    c = (cmd or "").strip()
+    # 复核 CONFIRMED：路径按完整 token 边界匹配——裸子串会把兄弟模块
+    # `a/mod-a/pom.xml`（嵌套复用叶名）的合法断言误吞进本 pom 的重生成面
+    if not pom or not _re.search(
+            r"(^|[\s'\"=(])" + _re.escape(pom) + r"($|[\s'\")])", c):
+        return False
+    return bool(c.startswith("grep ")
+                or _re.match(r'^test\s+-[zn]\s+["\']?\$\(\s*grep', c))
+
+
+def reconcile_template_exam(plan) -> dict[str, dict]:
+    """R65D-T2③（round65d 主治）：考卷与权威模板同源——模板即真值，考卷必须从模板生成。
+
+    st-26 四面矛盾死局：description 前半（LLM：jackson+httpclient5）↔ 权威模板
+    （契约+T5：okhttp 系）↔ harness.verify（LLM 按自己的前半写 grep jackson）↔
+    acceptance（#3 LLM jackson 系 vs #4 规则5 契约 okhttp 系互斥）。worker 徒手写出
+    并集 pom（矛盾卷唯一最优解）被 H1 覆写销毁，再被旧考卷杀死=规划期注定的冤案。
+
+    确定性对账（零 LLM，纯文本，幂等）——对每个带「原样写入」权威模板的子任务：
+    - verify_commands 中针对该 pom 的【正断言】剔除、由模板 <dependencies> 逐条重新
+      生成 grep '<artifactId>…</artifactId>'（陈旧正断言=考错卷，st-26 死型）；
+    - 【负断言】（test -z "$(grep…)"）与模板正面冲突 → 剔除+WARNING（规划期自曝矛盾，
+      绝不留给 worker 送死）；与模板不冲突 → ★保留★（猎手 CRITICAL：负断言是
+      "禁入依赖不得出现"的守卫，模板被后续机制改写时它是最后一道牙齿）；
+    - acceptance 的规则5 机器行（"必须声明依赖: […]"）改写为模板依赖清单；
+      追加「模板即真值」权威验收行（下游 L2/CONFIRM 判官消歧用）。
+    构建/工具类命令与针对其他文件的断言绝不误动。
+    猎手 MED 整改：每子任务先在暂存区算全量结果、末尾一次性提交+独立 try/except——
+    某子任务模板畸形绝不让已处理/未处理的兄弟处于半变异态（prune_contract_dependencies
+    同律）。
+    接线唯一咽喉=inject_build_scaffold_subtasks 末端（两遍注入+外科重试全覆盖）。
+    返回 {subtask_id: {dropped_verify, added_verify, acceptance_rewritten}} 机读摘要
+    （直接调用方消费；咽喉包装内以日志留痕）。
+    """
+    import re as _re
+    summary: dict[str, dict] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        try:
+            tpls = _extract_auth_templates(getattr(st, "description", "") or "")
+            if not tpls:
+                continue
+            rec = {"dropped_verify": [], "added_verify": 0, "acceptance_rewritten": 0}
+            h = getattr(st, "harness", None)
+            # 暂存区：全部 pom 处理完才一次性提交（异常=本子任务整体放弃，零半变异）
+            staged_vcs = list(getattr(h, "verify_commands", []) or []) if h else []
+            staged_acc = list(getattr(st, "acceptance_criteria", []) or [])
+            for pom, tpl in tpls:
+                deps = _template_dep_artifacts(tpl)
+                tpl_asserts = [f"grep -q '<artifactId>{a}</artifactId>' {pom}"
+                               for a in deps]
+                if h is not None:
+                    kept: list[str] = []
+                    for vc in staged_vcs:
+                        if vc in tpl_asserts or not _is_pom_content_assert(vc, pom):
+                            kept.append(vc)
+                            continue
+                        neg = bool(_re.match(r"^test\s+-[zn]", vc.strip()))
+                        pat = _exam_grep_pattern(vc)
+                        if neg:
+                            if (pat and _re.match(r"^test\s+-z", vc.strip())
+                                    and _exam_pattern_hits(pat, tpl)):
+                                logger.warning(
+                                    "[R65D-T2] %s 验收负断言与权威模板正面矛盾"
+                                    "（pattern=%r 在模板中存在）→ 剔除+留痕"
+                                    "（st-26 四面矛盾死型在规划期现形）: %s",
+                                    st.id, pat, vc)
+                                rec["dropped_verify"].append(vc)
+                            else:
+                                kept.append(vc)   # 不冲突的负断言=禁入守卫，保留
+                            continue
+                        rec["dropped_verify"].append(vc)   # 陈旧正断言 → 模板重生成
+                    staged_vcs = list(dict.fromkeys(kept + tpl_asserts))
+                rule5_line = (f"{pom} 必须声明依赖: {sorted(deps)}"
+                              "（缺一即整模块 mvn compile 失败）") if deps else ""
+                _single_tpl = len(tpls) == 1
+                new_acc: list[str] = []
+                for a in staged_acc:
+                    # 复核 LOW：契约模块名≠物理目录（R58-1）时规则5 行的路径对不上
+                    # pom——唯一模板子任务兜底匹配任何规则5 机器行，杜绝新旧两行并存
+                    if (("必须声明依赖" in a or "所需依赖" in a)
+                            and _re.search(r"依赖: \[", a)
+                            and (pom in a or a.startswith("本模块 pom.xml")
+                                 or _single_tpl)):
+                        if rule5_line and rule5_line not in new_acc:
+                            new_acc.append(rule5_line)
+                            if a != rule5_line:
+                                rec["acceptance_rewritten"] += 1
+                        continue
+                    new_acc.append(a)
+                auth_line = (f"依赖清单以 description 中【权威 pom 模板】（{pom}）字面为准"
+                             "——模板即真值，其他验收条目与模板冲突时以模板为准")
+                if auth_line not in new_acc:
+                    new_acc.append(auth_line)
+                    rec["acceptance_rewritten"] += 1
+                staged_acc = new_acc
+            # 一次性提交暂存区
+            if h is not None and staged_vcs != list(getattr(h, "verify_commands", []) or []):
+                rec["added_verify"] += len(
+                    [v for v in staged_vcs
+                     if v not in (getattr(h, "verify_commands", []) or [])])
+                h.verify_commands = staged_vcs
+            if staged_acc != list(getattr(st, "acceptance_criteria", []) or []):
+                st.acceptance_criteria = staged_acc
+            if rec["dropped_verify"] or rec["added_verify"] or rec["acceptance_rewritten"]:
+                summary[st.id] = rec
+                if rec["dropped_verify"]:
+                    logger.info(
+                        "[R65D-T2] 考卷同源重生成 %s：剔除旧内容断言 %d 条 %s → 模板依赖"
+                        "断言 %d 条（模板即真值，考卷必须从模板生成）",
+                        st.id, len(rec["dropped_verify"]), rec["dropped_verify"][:4],
+                        rec["added_verify"])
+        except Exception:  # noqa: BLE001 — 单子任务畸形绝不拖垮全计划的对账
+            logger.warning(
+                "[R65D-T2] %s 考卷同源对账失败（该子任务保持原样，兄弟不受影响）",
+                getattr(st, "id", "?"), exc_info=True)
+    return summary
+
+
 def inject_build_scaffold_subtasks(
+    plan, project_path: str | None = None, file_plan: list | None = None,
+) -> list[dict]:
+    """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile。"""
+    injected = _inject_build_scaffold_subtasks_impl(plan, project_path, file_plan)
+    try:
+        _exam = reconcile_template_exam(plan)
+        if _exam:
+            logger.info("[R65D-T2] 考卷同源对账完成：%d 个子任务被重写 %s",
+                        len(_exam), sorted(_exam)[:8])
+    except Exception:  # noqa: BLE001 — fail-open，考卷维持原样交 worker 侧 H1 兜底
+        logger.warning("[R65D-T2] 考卷同源 reconcile 失败（fail-open）", exc_info=True)
+    return injected
+
+
+def _inject_build_scaffold_subtasks_impl(
     plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
     """R39-4：规则5 落空模块 → 确定性注入构建文件脚手架子任务（零 LLM）。
@@ -1505,6 +1832,11 @@ def inject_build_scaffold_subtasks(
     # T5（hunter#F4）：内部模块依赖推导**单次计算**、两个注入点（owner/scaffold）共用同一份
     # ——各算各的会让 fail-open-per-callsite 在输入分叉时给同一模块产出两份不一致模板。
     _dirs = _module_physical_dirs(plan, project_path, file_plan)
+    try:
+        # R65D-T2②配套：契约自声明的反向兄弟依赖与推导通道同判据剪除（先于模板消费面）
+        _prune_reverse_contract_internal_deps(plan, _dirs, project_path)
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[R65D-T2] 契约反向内部依赖剪除失败（fail-open）", exc_info=True)
     try:
         _internal_deps = derive_internal_module_deps(plan, _dirs, project_path)
     except Exception:  # noqa: BLE001

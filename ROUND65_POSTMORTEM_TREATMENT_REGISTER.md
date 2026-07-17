@@ -127,3 +127,54 @@ plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round
   评估/换装工作面——编排层继续调参=对 22 题过拟合，明确不做。
 - 战役累计：0.500/0.364 →（一阶段并集+bench 口径修正 0.591/0.432）→（二阶段 gold 复审
   0.636/0.455）。地板 0.54/0.40。0.75 目标移交 reranker 模型评估任务（非起跑阻断）。
+
+## round65d 终局（2026-07-17，task b583df8f，PARTIAL 1/94 @执行期31min）
+- 规划期零打回穿越（#52 三模式 pom 注入首验✓/覆盖矩阵 98/98✓/pom 写权唯一✓）；执行期 317 模型调用全本地零云端。
+- 死因链：st-26 trivial 判死无 reason（validate exit=0 后 79ms 静默 False）→ HANDLE_FAILURE 4 失败仅处置 3，st-26 静默丢弃永不重派 → C9 汇流单点 94 任务饿死 → R13-4/R46-3/DELIVER 三级止损全对 → 诚实 PARTIAL。
+- 新登记：#60 主治 HANDLE_FAILURE 处置完备性铁律 / #57 DAG 消费者→生产者补边+生产者优先调度 / #58 观测缺口+st-26 判死点 / #59 plan 注入离线调试通道（大脑离线闸）。
+- 复用资产：checkpoint plan（94 st，base=0d42679）+ cassettes/round65d 全程录制。
+
+## round65d 三路交叉印证终版定案（2026-07-17，方法论首用即破案）
+四方对齐（A=swarm.log 全读/B=沙箱 jsonl 逐事件/C=产出+plan 对抗复核/主线程复审），死因链五层：
+1.【规划期埋雷】st-26 四面矛盾：desc(jackson+httpclient5)↔R58-3 模板(okhttp+fastjson2+lombok+slf4j+反向 ruoyi-alarm 依赖)↔verify(grep jackson/httpclient)↔acceptance(3条 jackson 系 vs 4条 okhttp 系互斥)。T5 10:39:44 明知互耗环"双向都不注入"，模板通道仍注入反向依赖。
+2.【执行期冤杀】worker 117s 交出 jackson∪okhttp 并集 pom=矛盾卷唯一最优解（沙箱 ev15）→H1 覆写销毁（ev17）→R56-5 剪幻影依赖（ev51）→mvn validate exit=0（ev52）→grep jackson exit=1 判死（ev53，l1_pipeline.py:3986 静默 return False）。H1×R56-5×verify 三机制互咬=round60 拆台死型。
+3.【处置黑洞】10:45 HANDLE_FAILURE 4 失败只处置 3，st-26 掉账零日志；10:59 被冻"完成态"；同次恢复宣称重派 4 实派 0（C9 边自阻，补写权/换模型处方全落空）；25min 无告警至 R13-4。
+4.【交付倒挂】冻结完成态的 L1-fail 产物进 MERGE(4 diff)→毒树四株落盘（SCOPE_OBJECTION 拒工书当源码/SysLoginController 必死 typo/LoginService 无依赖 import/8 控制器 import 缺失模块）；round36 自愈把 java.util.Map 误诊内部类型下毒指令。
+5.【模型无罪】worker 全程有效（st-26 并集解/AlarmApp 一次成型/2FA 单调收敛），11/14 撞迭代上限仍产出连贯实现；73 WARNING 0 ERROR；止损链 R13-4/R46-3(指纹 25035cd3×3)/DELIVER 拒放行全对；执行期 317 调用全本地零云端。
+治本登记 8 案（treat 顺序）：#61 子任务自洽闸+H1 verify 同源【主治】→ #60 处置完备性铁律+L1-fail 禁入完成态+处方核销【主治】→ #62 交付面闸 MERGE 只收 l1_passed → #57 DAG 消费边+任务书空心(54/94 upstream 空)+blocked_on=[] → #63 round36 stdlib 误诊+retry_guidance 污染 → #58 观测批(verify_failed 不出沙箱/拦截幻觉 PASS 冤案措辞/bootstrap WARN 口径/401 静默降级) → #64 效率批(批门闩滚动派发/迭代预算/ledger 取消结算/连坐先查可派发) → #59 plan 注入端+SWARM_BRAIN_OFFLINE（工具，可先行）。
+复现资产：scratchpad/plan_b583.json（94 st fixture）+ cassettes/round65d 全程录制 + 沙箱 jsonl 已归档待三清。
+
+## #61 R65D-T2 已治（2026-07-17，本地提交）
+
+**取证修正登记描述**（比登记时更深一层）：反向依赖非"T5 明知互耗仍注入"——round65d 全程互指
+WARNING 零触发。真相=跨遍陈旧模板冻结：10:25:05 第一遍 T5 单向 readable 证据推出
+interface→alarm 烤进 st-26 模板；10:39:44 第二遍推导该边已消失，但 R58-3 守卫
+「描述含'权威 pom 模板'→跳过」把毒模板冻结；MODIFY 形态守卫更是完全失效（st-42 铁律块
+×2 重复追加，fixture 实锤）。考卷矛盾源头=契约（okhttp 系）与 plan_batch LLM（jackson 系）
+两份云端产物从无对账：模板跟契约、verify 跟 LLM 描述、acceptance#4 规则5 用契约、#3 用 LLM。
+
+**治本四刀+双复核整改（全部测试锁定，test_r65d_t2_plan_exam_coherence.py 19 条 +
+test_r65d_t2_h1_exam_source.py 8 条 + fixture 重放 test/fixtures/plan_b583.json）**：
+1. 模板 upsert（_strip_machine_pom_blocks/_upsert_owner_pom_block）：CREATE 权威模板/
+   MODIFY 铁律+片段两形态幂等替换，陈旧刷新 WARNING fail-loud；多 pom owner 位置无关幂等
+   （猎手 MED：顺序抖动 WARNING 刷屏）。
+2. T5 反向边剪除（_reverse_internal_edge_producer）：目标模块 pom 生产者在消费方传递下游
+   → 剪+WARNING；契约通道同判据（_prune_reverse_contract_internal_deps，猎手 HIGH：
+   带 ${project.version} 的契约坐标能过 R53-1 可解析闸，剪推导不剪契约=换通道复活）；
+   正向单向依赖对照锁不误杀。
+3. 考卷同源 reconcile_template_exam：正断言剔除+模板依赖逐条重生成；负断言与模板矛盾→
+   剔除+WARNING（st-26 死局规划期现形），不矛盾→保留（猎手 CRITICAL：禁入守卫是模板被
+   后续机制改写时最后的牙齿）；规则5 验收行改写+「模板即真值」权威行；R58-1 名≠目录时
+   唯一模板子任务兜底匹配（复核 LOW）；每子任务暂存区+独立 try/except 零半变异（猎手 MED）；
+   接线唯一咽喉=inject_build_scaffold_subtasks 包装（两遍注入+外科重试全覆盖）。
+4. worker H1 同源兜底：H1 登记 rel→模板映射，verify 时点【重比内容仍=模板】才跳过内容断言
+   （猎手 CRITICAL：R56-5/version-repair 在 H1 后改写=温差窗口，内容偏离断言立即恢复牙齿）；
+   verify_skipped_h1 机读留痕；全跳过打 needs_review=verify_all_skipped_h1（猎手 HIGH 盲区）；
+   路径 token 边界匹配（复核 CONFIRMED：xmod-a/pom.xml.bak/嵌套叶名串扰）；无 H1 时旧考卷
+   牙齿原样（对照锁）。
+5. 附带：_extract_auth_templates 全角）路径污染（复核 CONFIRMED，聚合父/孤儿措辞）。
+
+质量闸：RED 14→GREEN；双复核 reviewer(1H/2M/1L)+hunter(2C/2H/3M/1L) 全整改全锁；
+revert-check 22 红/复原 24 绿（2 常绿=旧行为对照锁）；全量套件绿；lint 零新增。
+st-26 若重跑本代码：模板第二遍刷新剔除反向依赖→考卷从模板重生成（okhttp 系断言）→
+worker 抄模板必过闸；即便旧 plan 直入，H1 覆写后旧 grep jackson 被跳过+留痕不再冤杀。
