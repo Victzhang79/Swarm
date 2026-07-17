@@ -431,15 +431,18 @@ class TaskPlan(BaseModel):
             for d in t.depends_on:
                 _dep_counts[d] = _dep_counts.get(d, 0) + 1
 
-        def _prio(t: SubTask) -> int:
+        def _prio(t: SubTask) -> tuple[int, int]:
+            # R65D-W2②：同层内按下游扇出降序——高位生产者（round65d st-26 扇出 90）
+            # 晚跑一轮=全场多等一轮。稳定排序保同扇出者原序确定性。
+            _fan = _dep_counts.get(t.id, 0)
             files = [str(f).rsplit("/", 1)[-1].lower()
                      for f in (list(t.scope.create_files) + list(t.scope.writable))]
             if files and all(f in _manifest_names or f.endswith(".sln")
                              for f in files):
-                return 0
-            return 1 if _dep_counts.get(t.id, 0) > 0 else 2
+                return (0, -_fan)
+            return (1, -_fan) if _fan > 0 else (2, 0)
 
-        fresh.sort(key=_prio)  # list.sort 稳定：同级保持 subtasks 原序
+        fresh.sort(key=_prio)  # list.sort 稳定：同级同扇出保持 subtasks 原序
         ready = fresh + retry
         return ready[:max_concurrent]
 

@@ -453,6 +453,46 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     return created
 
 
+def derive_consumer_depends_edges(plan) -> dict[str, list[str]]:
+    """R65D-W2①（round65d 头排堵塞）：readable→创建者的结构性消费关系确定性下推为
+    depends_on 边（零 LLM、幂等）。
+
+    round65d 实锤（live 事发态）：13 根任务大半是 admin 隐性消费者（readable 引用
+    alarm 新文件却零 depends_on 边）→ 首两批 7/8 派发全 BLOCKED 白跑整条 locate/code；
+    C9 动态补边只能执行期代偿。规划期就把边建好：消费者被 dispatch 依赖闸自然扣住、
+    生产者 dep_counts>0 自然升 tier-1、B1/规则2 的上游产物注入面被激活。
+    （fixture plan_b583.json 为终版 checkpoint 态：既有边已较多，本步实测仍 +176 条/
+    70 消费者——G2 在 elaborate 期看不到的增量；根任务数在该 fixture 上前后均为 2。）
+
+    算法单一事实源=contract_utils.wire_readable_provenance（G2，elaborate 期同 pass）
+    ——复核 MED 收敛：两处独立实现必然漂移，本步只是把 G2 在收尾器【末端】（scaffold/
+    孤儿/domicile/readable 归一全就位后）再跑一遍，接住 G2 在 elaborate 期看不到的
+    readable 增量（round65d fixture 实测 +176 条）。护栏随 G2：唯一创建者才成边、
+    歧义/基线不猜、成环记 unresolved 绝不制造环、传递可达即幂等跳过。
+    返回 {消费者 id: [新增上游 id…]} 机读账（unresolved 环候选 WARNING 留痕）。
+    """
+    subs = getattr(plan, "subtasks", None) or []
+    if len(subs) < 2:
+        return {}
+    from swarm.brain.contract_utils import wire_readable_provenance
+    added_edges, unresolved = wire_readable_provenance(plan)
+    added: dict[str, list[str]] = {}
+    for consumer, producer in added_edges:
+        added.setdefault(consumer, []).append(producer)
+    if unresolved:
+        logger.warning(
+            "[PLAN-FINISH] R65D-W2 %d 条消费边会成环（创建者传递依赖消费者）→ 跳过；"
+            "边方向属更深计划错，留 VALIDATE/C9 面: %s",
+            len(unresolved), unresolved[:6])
+    if added:
+        logger.info(
+            "[PLAN-FINISH] R65D-W2 消费边下推 %d 个消费者共 %d 条（readable→创建者，"
+            "头排 BLOCKED 白跑在规划期消解；算法同源 G2）: %s",
+            len(added), sum(len(v) for v in added.values()),
+            {k: v for k, v in sorted(added.items())[:6]})
+    return added
+
+
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
                               shared_contract: dict | None = None) -> dict:
@@ -556,6 +596,13 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             out["readable_aligned"] = _al["aligned"]
     except Exception:  # noqa: BLE001 — fail-open
         logger.warning("[PLAN-FINISH] readable 落点归一失败（fail-open）", exc_info=True)
+    try:
+        # R65D-W2①：消费边下推（放 readable 归一之后——落点已定，边才准）
+        _ce = derive_consumer_depends_edges(plan)
+        if _ce:
+            out["consumer_edges"] = _ce
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] 消费边下推失败（fail-open）", exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):
         logger.info(

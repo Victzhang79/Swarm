@@ -73,6 +73,17 @@ def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[s
 # 仅保留【缺依赖/缺符号】的特异信号，杜绝 "does not exist"/"无法访问" 这类宽串误伤
 # （会命中 "User does not exist"/"table does not exist"/Java 模块可见性 "cannot access" 等
 # 非依赖失败 → 误授 pom 写权、空烧定向恢复配额）。各语言 javac/go/rustc/py/node 的缺包特征：
+def mass_abandon_cap(plan_subtasks_n: int) -> int:
+    """R65C-T2 连坐规模闸阈值——四个 _transitive_abandon 消费点的单一事实源。
+
+    R65D-W2 猎手 CRITICAL：消费边下推把 depends_on 图织密（fixture +176 边）后，
+    任何未设防的放弃路径（重试耗尽部分交付/T3 基线修复混批/自愈混批）都可能让单个
+    高扇出生产者一笔放弃全场闭包——round65c「102/107 静默清盘→假全部完成」死型从
+    旁门复活。阈值语义与 R65C-T2 修③一致：一次新增放弃超 max(10, 25%×计划) 不是
+    剪枝而是计划覆灭，必须 escalate 人工，绝不静默。"""
+    return max(10, int(plan_subtasks_n * 0.25))
+
+
 def _transitive_abandon(subtasks: list, abandoned: set[str],
                         completed_ids: set[str] | None = None) -> set[str]:
     """传递放弃闭包：把【依赖任一已放弃子任务】的子任务也并入放弃集（缺依赖永远跑不了）。
