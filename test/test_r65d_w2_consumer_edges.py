@@ -32,11 +32,12 @@ _IMPL = "mod-impl/src/main/java/com/x/ChannelImpl.java"
 _BASE = "ruoyi-common/src/main/java/com/ruoyi/common/BaseEntity.java"
 
 
-def _st(sid, *, create=None, readable=None, depends=None):
+def _st(sid, *, create=None, readable=None, depends=None, ua=None):
     return SubTask(id=sid, description=f"task {sid}",
                    difficulty=SubTaskDifficulty.MEDIUM,
                    scope=FileScope(create_files=create or [],
-                                   readable=readable or []),
+                                   readable=readable or [],
+                                   upstream_artifacts=ua or []),
                    depends_on=depends or [])
 
 
@@ -153,9 +154,12 @@ def test_ladder_exhausted_mass_abandon_gated(derive_consumer_depends_edges):
     from swarm.brain.nodes import handle_failure
     from swarm.types import WorkerOutput
     prod = _st("st-p", create=[_API])
+    # R65REPLAY-T1 语义演进：readable-only=软序边不再连坐（那是回放轮 15→72 爆炸
+    # 半径的病根）；本测试锁的"大额连坐必须 escalate"不变量以【硬消费】(ua=seed
+    # 构建输入)形态构造——语义不变量本身不变。
     consumers = [
         _st(f"st-c{i}", create=[f"admin/src/main/java/C{i}.java"],
-            readable=[_API])
+            readable=[_API], ua=[_API])
         for i in range(14)
     ]
     done = _st("st-done", create=["m/src/main/java/D.java"])
@@ -187,7 +191,8 @@ def test_ladder_exhausted_small_abandon_still_partial(derive_consumer_depends_ed
     from swarm.brain.nodes import handle_failure
     from swarm.types import WorkerOutput
     subs = [_st("st-p", create=[_API]),
-            _st("st-c0", create=["admin/src/main/java/C0.java"], readable=[_API])]
+            _st("st-c0", create=["admin/src/main/java/C0.java"],
+                readable=[_API], ua=[_API])]  # R65REPLAY-T1：硬消费形态（软边不连坐）
     subs += [_st(f"st-x{i}", create=[f"m/src/main/java/X{i}.java"])
              for i in range(40)]   # 大计划：闭包 2/42 远低于阈值
     done = _st("st-done", create=["m/src/main/java/D.java"])

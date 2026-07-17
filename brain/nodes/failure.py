@@ -821,7 +821,13 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             _bmods = _det.get("blocked_on_modules") or []
             _prods = _producers_of(plan_obj, _bpkgs, _bmods)
             # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
-            _dep_hit = bool(set(getattr(_st, "depends_on", []) or []) & _unsat) if _st else False
+            # R65REPLAY-T1 复核 F2：只算【硬】依赖——软序边（edge_is_soft，readable
+            # 驱动消费）的死产者与本次 pipeline_blocked 无因果（真因由 _prods/_futile
+            # 单独归因），拿无关死软边判永久放弃=把可恢复的"等生产者"误杀成硬弃。
+            from swarm.types import edge_is_soft as _eis
+            _dep_hit = bool(_st and any(
+                d in _unsat and not _eis(_st, _by_id.get(d))
+                for d in (getattr(_st, "depends_on", []) or [])))
             _prod_hit = bool(_prods & _unsat)
             # (#R13-2 → #10 泛化) 阻断在【全部生产者已终结(放弃/完成) 且 包仍不在工作树】的内部包 =
             # 在等一个永不会来的产物，永不可满足。含两情形：(a) 完全无生产者=臆造(#R13-2 原语义)；

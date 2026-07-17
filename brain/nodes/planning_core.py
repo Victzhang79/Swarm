@@ -94,18 +94,44 @@ def _transitive_abandon(subtasks: list, abandoned: set[str],
     "缺依赖跑不了"对历史不成立（C9 动态边在完成后才补上是常态）。旧行为把已完成者卷进
     闭包 → 调用方 pop 其 subtask_results = 已交付工作静默丢弃 + 完成计数倒退（D14）→
     看守 progress 高水位锁死误杀健康轮。与 types._is_ready 的 T5 先例（completed 优先于
-    放弃集）同一原则。种子集内的已完成者同样剔除（fail-safe：完成的工作永不弃）。"""
+    放弃集）同一原则。种子集内的已完成者同样剔除（fail-safe：完成的工作永不弃）。
+
+    R65REPLAY-T1（回放 C 路反事实：消费边把闭包 15→72）：闭包【不穿透软序边】
+    （types.edge_is_soft，readable 驱动消费、非 seed 构建输入）——生产者死了，
+    "只想读它文件"的消费者仍可尝试（幻影 readable R49-2 运行期剔、L1 裁决），
+    绝不整链陪葬；ua 构建输入/零交集结构边照旧硬传递。"""
+    from swarm.types import edge_is_soft
     _done = completed_ids or set()
+    _by_id = {s.id: s for s in subtasks}
     closed = {a for a in abandoned if a not in _done}
+    _spared: set[str] = set()
     _changed = True
     while _changed:
         _changed = False
         for s in subtasks:
             if s.id in closed or s.id in _done:
                 continue
-            if any(d in closed for d in (getattr(s, "depends_on", []) or [])):
+            _hard_dead = False
+            for d in (getattr(s, "depends_on", []) or []):
+                if d not in closed:
+                    continue
+                if edge_is_soft(s, _by_id.get(d)):
+                    _spared.add(s.id)
+                else:
+                    _hard_dead = True
+                    break
+            if _hard_dead:
                 closed.add(s.id)
+                _spared.discard(s.id)
                 _changed = True
+    _spared -= closed
+    if _spared:
+        # 复核 F3：软边豁免必须留痕——否则规模闸 escalate 率下降与"图本来就小"在日志
+        # 里不可分辨，软化放走烂货时无从审计。
+        logger.warning(
+            "[TRANSITIVE-ABANDON] R65REPLAY-T1 软序边豁免 %d 个子任务免于连坐"
+            "（其到死产者的边为 readable 驱动消费，非构建输入；越过后 L1 裁决）: %s",
+            len(_spared), sorted(_spared)[:8])
     return closed
 
 

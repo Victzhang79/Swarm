@@ -108,3 +108,30 @@ def test_manifest_synth_skip_names_lost_registrations(caplog):
     assert any("new-mod" in rec.message for rec in caplog.records
                if "MANIFEST-SYNTH" in rec.message), \
         "跳过必须点名受损模块（观测缺口：现在只说'跳过合成'不说丢了什么）"
+
+
+def test_det_fail_reason_build_fail_not_masked_by_compile_ok():
+    """R65REPLAY（回放实锤"判死依据: compile_fail: compile ok"）：build 段失败时
+    compile_message 常是早段通过的 "compile ok"——必须引 build_output 真错误行，
+    绝不让判死依据变成一句自相矛盾的废话。"""
+    from swarm.worker.executor import _det_fail_reason
+    r = _det_fail_reason({
+        "l1_2_compile_ok": True,
+        "compile_message": "compile ok",
+        "l1_2_1_build_ok": False,
+        "build_output": ("[INFO] Scanning...\n"
+                         "[ERROR] Failed to execute goal on project ruoyi-alarm: "
+                         "Non-resolvable parent POM\n[INFO] BUILD FAILURE"),
+    })
+    assert "compile ok" not in r, f"build 失败被 compile ok 遮蔽: {r}"
+    assert "Non-resolvable parent POM" in r, f"build_output 真错误行未被提取: {r}"
+
+
+def test_det_fail_reason_true_compile_fail_still_quoted():
+    """回归锁：单文件编译真失败（compile_ok=False）仍引 compile_message。"""
+    from swarm.worker.executor import _det_fail_reason
+    r = _det_fail_reason({
+        "l1_2_compile_ok": False,
+        "compile_message": "cannot find symbol: AlarmDutySnapshot",
+    })
+    assert "cannot find symbol" in r

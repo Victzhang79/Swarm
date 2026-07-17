@@ -108,6 +108,26 @@ def _det_fail_reason(details: dict) -> str:
         # 复核 HIGH：单文件编译闸失败时真错误在 compile_message（此形态 build_output
         # 结构性缺席——early-return 于 harness 构建段之前），漏读=最常见判死形态
         # 照旧空 reason。
+        # R65REPLAY 回放实锤修正：build 段失败时 compile_message 常是早段通过的
+        # "compile ok"——旧序无条件先引它 = 判死依据自相矛盾（"compile_fail: compile
+        # ok"）。按失败面取证：build 失败引 build_output 首个错误行。
+        if d.get("l1_2_1_build_ok") is False or d.get("build_failed"):
+            _bo = str(d.get("build_output") or "")
+            if not _bo.strip():
+                # 复核 F4：build_failed 存的是【构建命令】不是错误文本——空输出时绝不
+                # 让命令冒充诊断（貌似有内容的假 reason 比"无输出"更害排障）。
+                return ("build_fail: (构建无输出捕获) "
+                        f"cmd={str(d.get('build_failed') or '?')[:100]}")
+            # 复核 F5：错误行识别复用 output_compress 多栈信号正则（ERROR/error: 双
+            # 字面量漏 npm ERR!/Gradle FAILURE/中文 错误: 等口径）。
+            try:
+                from swarm.worker.output_compress import _SIGNAL_RE
+                _err = next((ln.strip() for ln in _bo.splitlines()
+                             if _SIGNAL_RE.search(ln)), _bo[:160])
+            except Exception:  # noqa: BLE001 — 正则源不可用退回双字面量
+                _err = next((ln.strip() for ln in _bo.splitlines()
+                             if "ERROR" in ln or "error:" in ln), _bo[:160])
+            return f"build_fail: {_err[:160]}"
         if d.get("compile_message"):
             return f"compile_fail: {str(d['compile_message'])[:160]}"
         if d.get("l1_2_compile_ok") is False or d.get("build_output"):

@@ -330,6 +330,52 @@ class SubTask(BaseModel):
 # ──────────────────────────────────────────────
 # 子任务 DAG（执行计划）
 # ──────────────────────────────────────────────
+def _edge_norm_path(f) -> str:
+    """路径归一（与 contract_utils._norm_scope_path 同口径；types 为底层不可反向 import，
+    此处内联同一 3 行规则——两处必须保持一致，改动须同步）。"""
+    p = str(f).replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
+def edge_is_soft(consumer: "SubTask", producer: "SubTask | None") -> bool:
+    """R65REPLAY-T1（round65d 回放 C 路反事实实锤：消费边把连坐闭包 15→72）：
+    依赖边 consumer→producer 的【软序/硬依赖】结构性判定（零簿记——存储标记方案在
+    重拆 remap/plan rebuild/注入重推导处必漏，st-2→st-11-1 软边被 remap 成→分片即实锤）。
+
+    软序边 ⇔ producer 产出(create∪writable) ∩ consumer.upstream_artifacts = ∅
+             且 producer.create_files ∩ consumer.readable ≠ ∅
+             且 producer.writable    ∩ consumer.readable = ∅
+    语义：readable 驱动的"我想读你将【新建】的文件"只值一个调度顺序——生产者死了
+    文件不存在，R49-2 幻影过滤运行期剔除、消费者不会读到垃圾，可越过尝试（L1 裁决）。
+    ★复核 F1（hunter HIGH）：consumer.readable 与 producer.writable 有交=消费者要读
+    的是【存量文件的改造后版本】——生产者死了文件仍在盘上（改造前旧版），R49-2 只查
+    存在性兜不住，越过=静默拿旧接口写代码 → 判硬★。ua 有交=seed 闸构建输入=硬；
+    零交集=LLM/脚手架结构边（理由未知）=保守硬；producer 悬空（不在 plan，如重拆
+    旧 id）无法判定=保守硬。栈中立（纯路径/集合逻辑）。
+    """
+    if producer is None:
+        return False
+    psc = getattr(producer, "scope", None)
+    if psc is None:
+        return False
+    created = {_edge_norm_path(f) for f in (getattr(psc, "create_files", None) or [])}
+    modified = {_edge_norm_path(f) for f in (getattr(psc, "writable", None) or [])}
+    if not (created or modified):
+        return False
+    csc = getattr(consumer, "scope", None)
+    if csc is None:
+        return False
+    ua = {_edge_norm_path(f) for f in (getattr(csc, "upstream_artifacts", None) or [])}
+    if (created | modified) & ua:
+        return False
+    rd = {_edge_norm_path(f) for f in (getattr(csc, "readable", None) or [])}
+    if modified & rd:
+        return False   # 读存量文件的改造后版本：死产者留下旧版在盘上，越过=静默陈旧
+    return bool(created & rd)
+
+
 class TaskPlan(BaseModel):
     """Brain 生成的执行计划 — 子任务 DAG"""
     subtasks: list[SubTask]
@@ -355,15 +401,23 @@ class TaskPlan(BaseModel):
     ) -> list[SubTask]:
         """获取当前可执行的子任务（依赖已全部完成）。
 
-        abandoned=【已永久放弃的子任务集】(阶梯三打桩/revert/连坐)：本身被放弃的、或依赖了
-        放弃项的子任务【永不就绪】，绝不再派发——杜绝"依赖永远不会落地的下游"被反复重派。
+        abandoned=【已永久放弃的子任务集】(阶梯三打桩/revert/连坐)：本身被放弃的、或【硬】
+        依赖了放弃项的子任务【永不就绪】，绝不再派发——杜绝"依赖永远不会落地的下游"被反复
+        重派。R65REPLAY-T1：软序边（edge_is_soft，readable 驱动消费）的死产者视为已满足
+        ——消费者可越过尝试，不陪葬；活产者软硬边照常等待。
         """
         _ab = abandoned or set()
+        _by_id = {t.id: t for t in self.subtasks}
+
+        def _dep_ok(t: "SubTask", d: str) -> bool:
+            if d in completed_ids:
+                return True
+            return d in _ab and edge_is_soft(t, _by_id.get(d))
+
         return [
             t for t in self.subtasks
             if t.id not in completed_ids and t.id not in _ab
-            and all(d in completed_ids for d in t.depends_on)
-            and not any(d in _ab for d in t.depends_on)
+            and all(_dep_ok(t, d) for d in t.depends_on)
         ]
 
     def get_dispatch_batch(
@@ -397,6 +451,7 @@ class TaskPlan(BaseModel):
             return []
         _ab = abandoned or set()
         _dp = deprioritized or set()
+        _by_id = {t.id: t for t in self.subtasks}
 
         def _is_ready(task: SubTask) -> bool:
             # 已放弃的子任务、或依赖了【无产出】放弃项的下游 → 永不就绪（其依赖永远
@@ -407,10 +462,16 @@ class TaskPlan(BaseModel):
             # #R13-4 静默划进 PARTIAL。revert 路（无产出）不在 completed，语义不变。
             if task.id in _ab:
                 return False
-            if any(d in _ab and d not in completed_ids for d in task.depends_on):
-                return False
+            # R65REPLAY-T1：死产者（放弃且无产出）——硬依赖扣死（旧语义）；软序边
+            # （edge_is_soft，readable 驱动消费）视为已满足，消费者可越过尝试。
+            for d in task.depends_on:
+                if d in _ab and d not in completed_ids \
+                        and not edge_is_soft(task, _by_id.get(d)):
+                    return False
             return task.id not in completed_ids and all(
-                d in completed_ids for d in task.depends_on
+                d in completed_ids
+                or (d in _ab and edge_is_soft(task, _by_id.get(d)))
+                for d in task.depends_on
             )
 
         # 所有 remaining 中依赖已满足的子任务都可并行派发
