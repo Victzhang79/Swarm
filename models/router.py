@@ -22,6 +22,30 @@ from swarm.config.settings import ModelConfig, ProviderConfig, get_config
 logger = logging.getLogger(__name__)
 
 
+class BrainOfflineError(RuntimeError):
+    """R65D-T5：SWARM_BRAIN_OFFLINE=1 时 brain 云端 LLM 构造被离线闸拦截。
+
+    闸设在【构造点】而非 20+ 个调用点：brain 侧所有云端调用都要先 get_brain_llm/
+    get_brain_fallback_llm 拿实例，且各调用点对"取用失败"已有既有降级路径
+    （确定性回退 retry / 返回 None / degraded 留痕——round56 fail-open 铁律接线面）。
+    worker 本地模型走 get_llm_for_subtask/get_worker_llm，不受本闸影响。
+    """
+
+
+def _raise_if_brain_offline(where: str) -> None:
+    """plan 注入调试轮（零云端）用闸：默认关；开启时 fail-closed + 机读账。"""
+    import os
+
+    if os.environ.get("SWARM_BRAIN_OFFLINE", "").lower() not in ("1", "true", "yes"):
+        return
+    logger.error(
+        "[BRAIN-OFFLINE] brain 云端 LLM 构造被离线闸拦截（SWARM_BRAIN_OFFLINE=1，入口=%s）"
+        "——调用方将走其既有降级/失败路径。机读: brain_offline_llm_blocked", where)
+    raise BrainOfflineError(
+        f"brain_offline_llm_blocked: SWARM_BRAIN_OFFLINE=1 拦截 {where}"
+        "（plan 注入调试轮零云端；如需云端请去掉该环境变量）")
+
+
 def _monotonic() -> float:
     """心跳计时时钟（独立间接层）。
 
@@ -1091,6 +1115,7 @@ class ModelRouter:
         无限挂死）。0 表示不限（向后兼容）。max_tokens 只封最终答案 token、拦不住 reasoning runaway
         （实测 GLM-5.2 稳定吐 6w+ chunk/22min 才 stall），故再叠【总时长看门狗】wallclock 兜底。
         """
+        _raise_if_brain_offline("get_brain_llm")
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
         _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
         primary = self._get_provider_for_model(self.config.brain_primary).get_chat_model(
@@ -1111,6 +1136,7 @@ class ModelRouter:
         asyncio.TimeoutError，绕过 with_fallbacks（round35 实证：SiliconFlow 饱和时 GLM-5.2
         稳定慢产 >300s→外层墙钟掐断→不切 Kimi→同模型空重试仍超时）。故备用模型须单独暴露，
         由调用方在外层超时后主动切一次（备用 fresh 预算）。与 get_brain_llm 同构造（同看门狗）。"""
+        _raise_if_brain_offline("get_brain_fallback_llm")
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
         _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
         return self._get_provider_for_model(self.config.brain_fallback).get_chat_model(

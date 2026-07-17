@@ -1882,8 +1882,17 @@ async def _maybe_surgical_coverage_topup(state):
     _valid_ids = {row["id"] for row in _matrix["items"]}
     # P3：注入现有项目结构作 baseline 申报接地依据（棕地存量采纳）
     _proj_struct = _format_project_structure(state.get("knowledge_context"))
+    # R65D-T5 复核（猎手）：本函数契约=任一前置不满足→None，调用方无 try 包裹——
+    # LLM 构造失败（含 SWARM_BRAIN_OFFLINE 闸）裸抛会经 plan() 冒泡把整任务打成
+    # FAILED，与上方 coherence 核的既有让路口径不对称。同法保守让路全量重拆。
+    try:
+        _topup_llm = _get_brain_llm()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[PLAN] P1 外科补齐取 brain LLM 失败（保守让路全量重拆，不炸主链）: %s", exc)
+        return None
     return await _targeted_coverage_topup(
-        _get_brain_llm(), prior_plan, _matrix["uncovered"], _valid_ids,
+        _topup_llm, prior_plan, _matrix["uncovered"], _valid_ids,
         prior_baseline=state.get("baseline_covered"),
         fallback_llm=_get_brain_fallback_llm(),
         project_structure=_proj_struct,

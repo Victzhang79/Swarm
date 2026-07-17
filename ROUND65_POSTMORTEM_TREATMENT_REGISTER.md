@@ -300,3 +300,49 @@ revert-check 红；全量绿。
   _NEW_MODULE_POM_RE+<parent>，复核 MED：宽松口径=假警报；检测器自身失败自报
   "损失面未知≠零损失"，猎手 MED：错误变空列表死型）。
 质量闸：RED 5→GREEN 7；manifest/处置/恢复面回归 26/26；revert-check 红；全量绿。
+
+## #59 R65D-T5 已治（2026-07-17，本地提交）
+
+**plan 注入端**：录制 cassette（cassette_extract 产物）直入 DISPATCH 的 worker 阶段离线
+调试通道——执行期编排 bug 复现不再重烧云端规划期。
+
+**通道形态**（test_r65d_t5_plan_inject.py 22 条锁定）：
+1. 入口：POST create_task 带 `injected_plan`（TaskCreateRequest 新字段），总闸
+   SWARM_PLAN_INJECT_ENABLE 默认关死（403）；轻校验 schema/非空。落库 task_records.
+   injected_plan JSONB（_TASK_SELECT 第 29 列，light 行刻意排除并注释招牌）。
+2. runner 深校验 prepare_injected_state 五道 fail-closed 闸：schema / 空 plan /
+   base_commit 一致性（单侧缺失同罪，报错带重置指引）/ 治疗 pass fail-open 吞异常
+   升闸（logger exc_info 捕获，猎手 HIGH）/ 重推导后 validate_plan_structure。
+3. 治后形态重推导（绝不原样回放）：strip 旧脚手架（单一事实源收编 cassette_replay）
+   → finish_plan_deterministic（#61 考卷同源+#57 消费边）→ resolve_plan_conflicts
+   （异常归一 plan_inject_rederive_failed，猎手 MEDIUM）。fixture 实测 st-26 毒考卷
+   （jackson grep）被同源重写；边 420→407（#61 反向剪除合法减边——边总数非治后判据）。
+4. 图入口：aupdate_state(as_node="confirm", human_decision=ACCEPT) → 校验
+   next==('dispatch',) 不符 fail-loud → astream(None) 续跑。实测 MemorySaver 通过；
+   复核确认 LangGraph abulk_update_state 对 PG/Memory checkpointer 同构。
+5. SWARM_BRAIN_OFFLINE=1：闸在 ModelRouter.get_brain_llm/get_brain_fallback_llm
+   【构造点】raise BrainOfflineError（取证：brain 有 20+ 直接 ainvoke 调用点，
+   _invoke_llm_abortable 非唯一咽喉；构造点才是单点）——调用方走既有降级
+   （HANDLE_FAILURE strategy=retry 默认/fallback getter 返 None/外科 topup 让路）。
+6. 工具：scripts/plan_inject_submit.py（e2e token，✗ 约定覆盖 HTTP/连接/超时/非 JSON）。
+
+**双复核处置**（reviewer=正确性/时序/状态机 + hunter=静默失败，全 CONFIRMED 已治）：
+- reviewer HIGH：注入拒绝路径缺 FAILED 终态三件套（R38-E 机读账/audit/站内通知）→
+  抽 _reject_plan_inject helper 同口径补齐+锁。
+- hunter HIGH×2：①治疗 pass fail-open 吞异常→毒 plan 带成功账开跑（round65d 冻结
+  陈旧模板死型）→ exc_info 警报升闸 plan_inject_rederive_degraded+锁；②闸3 在
+  _stream_brain_events 深处触发走 generic FAILED，error 无机读码 → PlanInjectError
+  message 自带 code 前缀+锁。
+- hunter MEDIUM×2：resolve 无包裹裸冒泡→归一 rederive_failed+锁；strip 后零重注入
+  →不武断拒绝（无异常≠静默失败）但 WARNING 点名。
+- hunter INFO：外科 topup 裸 _get_brain_llm 与兄弟护栏不对称 → 让路全量重拆+锁。
+- 权限口径（reviewer MEDIUM，拍板记录）：开闸后 task:create 即可注入=环境级安全模型
+  （单运维调试/E2E 开启、用完即关），docstring 已改为如实口径，不做用户级权限。
+**B类遗留**：①Web UI renderTaskDetail 不渲染 task.error（先在，注入排障靠 API/日志/
+DB——前端补渲染另立小项）；②SWARM_BRAIN_OFFLINE 是全局开关，调试后遗留 .env 会让
+普通任务 brain 全降级（构造点每次 ERROR [BRAIN-OFFLINE] 可见，e2e 起跑自检建议加
+grep 项）。
+**质量闸**：22 测试 GREEN；定向回归 68 绿；revert-check 红 8/复原 22 绿；全量见提交。
+**用法**（round65d 回放）：重置基线到 0d42679 → SWARM_PLAN_INJECT_ENABLE=1 [+
+SWARM_BRAIN_OFFLINE=1] restart-api → plan_inject_submit.py test/fixtures/plan_b583.json
+--project <pid>。绝不 retry 旧任务 b583df8f 本体。

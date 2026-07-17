@@ -42,6 +42,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_BASELINE_STRICT_GATE": "brain/gates.py:193",
     "SWARM_BOOTSTRAP_ADMIN_PASSWORD": "config/settings.py:855",
     "SWARM_BRAIN_JSON_MODE": "brain/nodes/__init__.py:203",
+    "SWARM_BRAIN_OFFLINE": "models/router.py:_raise_if_brain_offline",  # R65D-T5 注入调试轮零云端闸（构造点 fail-closed）
     "SWARM_BREAKER_COOLDOWN_S": "models/breaker.py:18",
     "SWARM_BREAKER_THRESHOLD": "models/breaker.py:17",
     "SWARM_CASSETTE_RECORD_DIR": "models/cassette_record.py:_ENV_DIR",
@@ -152,6 +153,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_PLAN_BATCH_MAX_ATTEMPTS": "brain/nodes/__init__.py:972",
     "SWARM_PLAN_BATCH_MAX_FILES": "brain/nodes/__init__.py:883",
     "SWARM_PLAN_BATCH_TIMEOUT": "brain/nodes/__init__.py:961",
+    "SWARM_PLAN_INJECT_ENABLE": "api/routers/task.py:_plan_inject_enabled",  # R65D-T5 注入端总闸（默认关死）
     "SWARM_PLAN_BATCH_TIMEOUT_COOLDOWN": "brain/nodes/__init__.py:1209",
     "SWARM_PLAN_COMPLETENESS_RETRIES": "brain/nodes/__init__.py:2644",
     "SWARM_PLAN_COVERAGE_GAP_MAX": "brain/nodes/__init__.py:2286",

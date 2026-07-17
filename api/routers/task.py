@@ -86,6 +86,22 @@ class TaskCreateRequest(BaseModel):
     uploaded_files: list[str] = Field(default_factory=list, description="上传文件路径（来自 /api/uploads）")
     auto_confirm_vision: bool = Field(default=False, description="模型自行确认图片理解（跳过人工确认）")
     pooled: bool = Field(default=False, description="仅入需求池（不立即执行），稍后手动触发")
+    # R65D-T5 plan 注入端（内部调试通道，默认关死——需 SWARM_PLAN_INJECT_ENABLE=1）：
+    # scripts/cassette_extract.py 抽出的录制 cassette，任务将跳过云端规划子图直入 DISPATCH。
+    injected_plan: dict | None = Field(
+        default=None,
+        description="录制 plan cassette（swarm-plan-cassette/v1）——跳过云端规划直入执行（调试）")
+
+
+def _plan_inject_enabled() -> bool:
+    """R65D-T5：注入端总闸。默认关死（fail-closed）。
+
+    权限口径（复核定性，有意为之）：开闸后任何持 task:create 的用户即可注入
+    ——注入绕过 confirm 人工闸（human_decision 被强制 ACCEPT），只余确定性结构闸。
+    因此本闸的安全模型=【环境级】而非【用户级】：只在单运维者调试/E2E 环境开启，
+    用完即关（restart-api 生效）；多租户生产面保持默认关死。"""
+    import os
+    return os.environ.get("SWARM_PLAN_INJECT_ENABLE", "").lower() in ("1", "true", "yes")
 
 
 class TaskReviseRequest(BaseModel):
@@ -211,6 +227,25 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 ),
             }
 
+    # R65D-T5 plan 注入端：默认关死；开闸后也只做轻校验（schema/非空），
+    # 深校验（base_commit 一致性/TaskPlan 合法性）在 runner 启动时 fail-closed。
+    if req.injected_plan is not None:
+        if not _plan_inject_enabled():
+            _app.logger.warning(
+                "拒绝 plan 注入任务（SWARM_PLAN_INJECT_ENABLE 未开）: project=%s user=%s",
+                project_id, getattr(user, "id", "?"))
+            raise HTTPException(
+                status_code=403,
+                detail="plan 注入端未启用（内部调试通道，需 SWARM_PLAN_INJECT_ENABLE=1）")
+        from swarm.brain.plan_inject import CASSETTE_SCHEMA
+        _pl = (req.injected_plan.get("plan") or {}) if isinstance(req.injected_plan, dict) else {}
+        if req.injected_plan.get("schema") != CASSETTE_SCHEMA or not (
+                isinstance(_pl, dict) and _pl.get("subtasks")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"injected_plan 不是合法 {CASSETTE_SCHEMA} cassette"
+                       "（请用 scripts/cassette_extract.py 抽取）")
+
     task_id = str(uuid.uuid4())
     # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
     initial_status = "POOLED" if req.pooled else "SUBMITTED"
@@ -235,6 +270,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 thread_id=task_id,
                 auto_accept=bool(req.auto_accept),
                 queue_priority=priority,
+                injected_plan=req.injected_plan,
             ),
         )
     except Exception as e:

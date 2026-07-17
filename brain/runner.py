@@ -22,6 +22,7 @@ from langgraph.types import Command
 
 from swarm.audit import audit
 from swarm.brain.graph import get_compiled_brain_graph
+from swarm.brain.plan_inject import PlanInjectSeed, apply_plan_inject_seed
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.project import store
@@ -475,7 +476,7 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
 
 async def _stream_brain_events(
     task_id: str,
-    graph_input: BrainState | Command,
+    graph_input: BrainState | Command | PlanInjectSeed,
     queue: asyncio.Queue[dict[str, Any]],
     *,
     project_id: str = "",
@@ -518,6 +519,14 @@ async def _stream_brain_events(
         complexity=task_rec.get("complexity"),
         subtask_count=_subtask_n,
     )
+
+    # R65D-T5 plan 注入：以 confirm 名义把录制态（含治后 plan）写进本 thread 的
+    # checkpoint 并校验 next==('dispatch',)（不符 fail-loud，见 apply_plan_inject_seed），
+    # 随后 input=None 续跑——图从 DISPATCH 开始，云端规划子图整段不执行。
+    if isinstance(graph_input, PlanInjectSeed):
+        await apply_plan_inject_seed(graph, config, graph_input.values)
+        graph_input = None
+
     progress = 10
     _progress_plan_gen: int | None = None  # F5：进度单调的计划代际界
     # P1-B：本次执行段墙钟起点 + 弹性预算。每个图事件循环顶检查；超【弹性】上限 → raise →
@@ -1410,6 +1419,30 @@ async def _salvage_partial_from_checkpoint(
     )
 
 
+async def _reject_plan_inject(task_id: str, project_id: str,
+                              exc: Exception, queue: asyncio.Queue) -> None:
+    """R65D-T5 注入 fail-closed 拒绝的终态落账（复核 HIGH 整改）。
+
+    FAILED 终态三件套与本文件其余终态写点同口径：R38-E 机读账入 token_usage /
+    audit 留痕 / 站内通知——否则注入拒绝对通知中心与审计对账不可见。
+    str(exc) 已带 plan_inject_* 机读前缀（PlanInjectError 构造保证）。
+    """
+    logger.error("[PLAN-INJECT] 任务 %s 注入被拒: %s", task_id, exc)
+    _code = getattr(exc, "code", "plan_inject_rejected")
+    store.update_task(
+        task_id, status="FAILED", error=str(exc)[:1000],
+        token_usage=_failed_machine_account(task_id, None, _code))
+    _rec = store.get_task(task_id) or {}
+    _emit_task_notification(task_id, _rec, "FAILED")
+    audit("task_failed", orchestrator="Brain", task_id=task_id,
+          project_id=project_id, error=str(exc)[:300])
+    await _emit(queue, {
+        "step": "error", "status": "failed",
+        "message": f"plan 注入被拒（fail-closed）: {exc}",
+        "mode": "brain", "progress": 100,
+    })
+
+
 async def run_task(
     task_id: str,
     project_id: str,
@@ -1570,6 +1603,39 @@ async def run_task(
                 except Exception:  # noqa: BLE001
                     pass
 
+        # ── R65D-T5 plan 注入端：任务带录制 cassette → 跳过云端规划子图直入 DISPATCH ──
+        # prepare 三道闸全 fail-closed（schema/空 plan/base_commit 一致性）；通过后重跑
+        # 确定性收尾器得【治后形态】，plan 先落库（recursion_limit/进度分母/弹性墙钟
+        # 都按 task_rec.plan 的子任务数放宽），再以 PlanInjectSeed 交 _stream_brain_events
+        # 用 aupdate_state(as_node="confirm") 就位。执行期本就全本地 worker；
+        # 配套 SWARM_BRAIN_OFFLINE=1 可把执行期条件性云端 brain 调用也闸死（见 models/router.py）。
+        graph_input: Any = initial_state
+        _inject_cassette = task_rec.get("injected_plan")
+        if _inject_cassette:
+            from swarm.brain.plan_inject import PlanInjectError, prepare_injected_state
+            try:
+                _prepared = prepare_injected_state(
+                    _inject_cassette,
+                    live_base_commit=initial_state.get("base_commit"),
+                    project_path=project_path,
+                    task_description=description,
+                )
+            except PlanInjectError as exc:
+                await _reject_plan_inject(task_id, project_id, exc, queue)
+                return
+            _inj_plan = _prepared["plan"]
+            store.update_task(
+                task_id,
+                plan=_inj_plan.model_dump(mode="json"),
+                subtask_count=len(_inj_plan.subtasks),
+            )
+            initial_state.update(_prepared)
+            graph_input = PlanInjectSeed(values=dict(initial_state))
+            logger.info(
+                "[PLAN-INJECT] 任务 %s 使用注入 plan（subtasks=%d，源 task=%s）——"
+                "跳过云端规划子图", task_id, len(_inj_plan.subtasks),
+                _inject_cassette.get("task_id", "?"))
+
         thread_id = task_rec.get("thread_id") or task_id
         store.update_task(task_id, status="ANALYZING", thread_id=thread_id)
         audit(
@@ -1580,7 +1646,7 @@ async def run_task(
             description=description[:200],
         )
         state, snapshot = await _stream_brain_events(
-            task_id, initial_state, queue, project_id=project_id, lock_holder=lock_holder,
+            task_id, graph_input, queue, project_id=project_id, lock_holder=lock_holder,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
         _final_rec = store.get_task(task_id)

@@ -53,28 +53,12 @@ class ReplayResult:
         return self.error is None
 
 
-def _strip_injected_scaffolds(plan) -> int:
-    """还原 pre-scaffold 态：剥掉【已注入】的 st-scaffold-* 子任务 + 一切指向它们的 depends_on /
-    parallel_groups 引用。
-
-    为何必须剥：cassette 常抽自 DISPATCHING（plan 节点已跑完 inject+decouple），plan 里已带
-    脚手架。inject_build_scaffold_subtasks 幂等（sid 已存在即跳过），若不剥，replay 再跑 inject
-    是 no-op、decouple 也无边可剥 → 复现不出「inject 造边 → decouple 删边」这条 round62 死链。
-    剥回功能子任务后重跑 inject，才忠实复刻脚手架从无到有再经 decouple 的真实序。返回剥掉的数量。
-    """
-    subs = getattr(plan, "subtasks", None) or []
-    scaf_ids = {st.id for st in subs if str(st.id).startswith("st-scaffold-")}
-    if not scaf_ids:
-        return 0
-    plan.subtasks = [st for st in subs if st.id not in scaf_ids]
-    for st in plan.subtasks:
-        deps = [d for d in (getattr(st, "depends_on", None) or []) if d not in scaf_ids]
-        st.depends_on = deps
-    pg = getattr(plan, "parallel_groups", None)
-    if pg:
-        plan.parallel_groups = [[x for x in g if x not in scaf_ids] for g in pg]
-        plan.parallel_groups = [g for g in plan.parallel_groups if g]
-    return len(scaf_ids)
+# 还原 pre-scaffold 态（为何必须剥见 brain/plan_inject.strip_injected_scaffolds 文档——
+# round62「inject 造边 → decouple 删边」死链只有剥回功能子任务重注入才复现得出）。
+# R65D-T5 起单一事实源在 brain/plan_inject.py，本脚本与注入端共用同一实现。
+from swarm.brain.plan_inject import (  # noqa: E402
+    strip_injected_scaffolds as _strip_injected_scaffolds,
+)
 
 
 def _build_plan(cassette: dict):

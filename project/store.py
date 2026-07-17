@@ -158,6 +158,9 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS abandoned_subtasks INTEGER DEFAULT 0",
     # F6（阶段6 补漏，发版回查）：预处理 LLM 摘要落独立字段，绝不静默覆写用户 description
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS analysis_summary TEXT DEFAULT ''",
+    # R65D-T5 plan 注入端：录制 cassette（swarm-plan-cassette/v1）随任务落库，runner 启动时
+    # 检出即跳过云端规划子图直入 DISPATCH（NULL=普通任务，零影响）。
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS injected_plan JSONB",
 ]
 
 _TASK_SELECT = """
@@ -171,7 +174,8 @@ _TASK_SELECT = """
     abandoned_subtasks,
     auto_accept, queue_priority,
     base_commit, retry_prev_thread_id,
-    error
+    error,
+    injected_plan
 """
 
 
@@ -658,6 +662,7 @@ def create_task(
     thread_id: str | None = None,
     auto_accept: bool | None = None,
     queue_priority: str | None = None,
+    injected_plan: dict[str, Any] | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
     """创建任务记录。
@@ -668,11 +673,16 @@ def create_task(
     status/thread_id/auto_accept/queue_priority: D22 治本——初始执行 meta 随同一条 INSERT
     原子落库（None=沿用 DDL 默认）。旧链路是 create_task + update_task 两条 autocommit，
     第二条失败会留下缺 meta 的 SUBMITTED 残行（未入调度队列，长稳进程永久卡死至重启对账）。
+    injected_plan: R65D-T5 录制 cassette（None=普通任务）——随 INSERT 原子落库，
+    runner 启动时检出即跳过云端规划子图直入 DISPATCH。
     """
     cols = ["id", "project_id", "description", "created_by_user_id",
             "uploaded_files", "auto_confirm_vision", "pooled"]
     vals: list[Any] = [task_id, project_id, description, created_by_user_id,
                        Jsonb(uploaded_files or []), auto_confirm_vision, pooled]
+    if injected_plan is not None:
+        cols.append("injected_plan")
+        vals.append(Jsonb(injected_plan))
     for col, val in (("status", status), ("thread_id", thread_id),
                      ("auto_accept", auto_accept), ("queue_priority", queue_priority)):
         if val is not None:
@@ -805,6 +815,9 @@ def list_tasks(project_id: str, conn_str: str | None = None) -> list[dict[str, A
 # l3_result/ingest_draft），其余字段与 _TASK_SELECT 同名同序义。取证：列表消费者（web
 # tasks.js / project.js / cli task_list / runner 级联取消 / delete_project 快照）只用
 # id/status/description/complexity/uploaded_files 等轻字段；重字段一律走 get_task 详情。
+# ★injected_plan（R65D-T5）也是刻意排除的重字段（cassette 可达 MB 级）：消费方唯一在
+# runner.run_task（task_rec=get_task 全行）。任何用 light 行冒充 task_rec 的新代码都会把
+# 注入任务静默当普通任务跑——加消费点前必须核对行来源。
 _TASK_SELECT_LIGHT = """
     id, project_id, description, status, complexity,
     subtask_count, completed_subtasks,
@@ -2119,6 +2132,11 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
         "retry_prev_thread_id": (row[26] or "") if len(row) > 26 else "",
         # R38-E：FAILED 终态机读账（error 串；DONE/PARTIAL 为 None）
         "error": row[27] if len(row) > 27 else None,
+        # R65D-T5：注入 cassette（None=普通任务）。解析口径与 plan 列一致。
+        "injected_plan": (
+            row[28] if isinstance(row[28], dict)
+            else (json.loads(row[28]) if row[28] else None)
+        ) if len(row) > 28 else None,
     }
 
 
