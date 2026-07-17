@@ -3282,6 +3282,21 @@ async def handle_failure(state: BrainState) -> dict:
     _ledger_mod.ensure_budget(state.get("task_id") or "",
                               min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
     result = await _handle_failure_impl(state)
+    # R65D-T1 处置完备性铁律：入口失败数≡出口处置数 + 处方↔派发闭环核销（唯一咽喉，
+    # 覆盖 impl 全部分支含未来新分支；round65d st-26 静默掉账饿死 90/94 的死因本体）。
+    # 复核 LOW：审计先于 plan 回传——审计可能给 result 注入 dispatch_remaining，回传
+    # 守卫必须看到注入后的终态。猎手 MED：审计自身挂掉=安全网下线，必须 ERROR +
+    # degraded_reasons 机读留痕（绝不 WARNING 静默降级回 pre-T1 行为）。
+    try:
+        from swarm.brain.nodes.failure import audit_failure_disposition
+        audit_failure_disposition(state, result)
+    except Exception as _audit_exc:  # noqa: BLE001 — 审计绝不拖垮失败处置本体
+        logger.error("[HANDLE_FAILURE] R65D-T1 处置完备性审计自身异常（本轮铁律下线，"
+                     "处置结果按 impl 原样放行）", exc_info=True)
+        if isinstance(result, dict):
+            result["degraded_reasons"] = (
+                list(result.get("degraded_reasons") or [])
+                + [f"failure_disposition_audit_error:{type(_audit_exc).__name__}"])
     if isinstance(result, dict) and "dispatch_remaining" in result and "plan" not in result:
         _p = state.get("plan")
         if _p is not None:

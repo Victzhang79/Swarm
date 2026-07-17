@@ -947,11 +947,23 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     subtask_results.pop(fid, None)
                     if fid not in _sh_remaining:
                         _sh_remaining.append(fid)
+                # ★R65D-T1 根修（round65d 死因本体）★：与 _unrecoverable 分支对称——
+                # 同批【未愈未放弃】的其余失败（C9 补边消费者/verify 失败等）放回重派，
+                # 各自重试计数原样保留，下轮再进常规阶梯。旧行为把它们 failed_subtask_ids
+                # 清零+不回队+失败 result 滞留 → st-26 僵尸化被数成"完成态" → 90/94 经
+                # C9 汇流饿死（10:45:30 处理 4 只处置 3 的实锤本体）。
+                _sh_leftover = [f for f in failed_ids
+                                if f not in _healed and f not in _ab]
+                for fid in _sh_leftover:
+                    subtask_results.pop(fid, None)
+                    if fid not in _sh_remaining:
+                        _sh_remaining.append(fid)
                 logger.warning(
                     "[HANDLE_FAILURE] round36 P0 自愈：无生产者内部类型(worker 自造引用) → 把待建类型文件"
                     "纳入 create_files 让消费者本模块补建 + 重派(按子任务熔断 %s/%d)；同批真死上游 %s "
-                    "照常连坐放弃 %d",
-                    {k: _sh_trc[k] for k in _healed}, _sh_max, sorted(_unrecoverable), len(_ab))
+                    "照常连坐放弃 %d；其余失败 %s 放回重派（R65D-T1：绝不静默掉账）",
+                    {k: _sh_trc[k] for k in _healed}, _sh_max, sorted(_unrecoverable),
+                    len(_ab), _sh_leftover)
                 _ret = {
                     "plan": plan_obj,
                     "subtask_results": subtask_results,
@@ -1722,3 +1734,126 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             deepest, max_retries, failed_ids,
         )
     return out
+
+
+def audit_failure_disposition(state, result) -> None:
+    """R65D-T1 处置完备性铁律（round65d 死因本体的结构性防复发闸）。
+
+    唯一咽喉=handle_failure 包装：无论 _handle_failure_impl 走哪条分支（含未来新分支），
+    出口必须满足两条不变量，违反即 fail-loud + 强制兜底，绝不静默：
+
+    ①【入口失败数≡出口处置数】entry failed_subtask_ids 中的每个 fid，要么仍在出口
+      failed_subtask_ids（保留失败态走 retry/escalate 面），要么进 dispatch_remaining
+      （重派），要么进 abandoned（放弃），要么进 give_up_isolated_ids（阶梯三
+      settled-with-product 终局，复核 CRITICAL：全仓其余消费者都把 abandoned∪give_up
+      当"已终局勿动"集，铁律不认桩=毁桩+复活重派无界循环）。四无=掉账（st-26 本体：
+      10:45 处理 4 只处置 3，僵尸 result 被 10:59 数成"完成态"，90/94 经 C9 汇流饿死）
+      → ERROR + 强制回队 + 失败 result 出账 + degraded_reasons 机读留痕
+      （failure_disposition_leak:<fid>）。两类整体豁免：通道未动（result 无
+      failed_subtask_ids 键=全员仍在失败集）；strategy=replan/escalate（交棒 PLAN 全量
+      重规划/人工，旧 fid 语义已尽，复核 HIGH：误报会给健康 replan 永久打上死因签名）。
+
+    ②【处方↔派发闭环核销】本轮回队重派的 fid，其传递依赖必须终结在
+      完成(l1_passed)/在队/仍失败(会再处置)/桩豁免(give_up_mode=stub)——命中已放弃
+      （非桩）上游或【历史僵尸】（有失败 result 却不在队/不在失败集/未放弃——st-26
+      形态本体，猎手 F3）=处方注定落空（10:59 "宣称重派 4 实派 0"形态），ERROR
+      fail-loud + degraded_reasons（recovery_prescription_unsatisfiable:<fid>），绝不等
+      25min 后 R13-4 终态才发声。只告警不改队列（放弃决策归下一轮失败处置/连坐面）。
+
+    就地改 result（dict，checkpoint 前）；自身异常由调用方 fail-loud 记账兜底。
+    """
+    entry = [f for f in (state.get("failed_subtask_ids") or []) if f]
+    if not entry or not isinstance(result, dict):
+        return
+    # 复核 HIGH：replan=交棒 PLAN 节点全量重规划（旧子任务 id 语义已尽，PLAN 重入自会
+    # 重置 dispatch_remaining）；escalate=交棒人工。两者都是合法整体处置，绝不当掉账。
+    _strategy = str(result.get("failure_strategy")
+                    or state.get("failure_strategy") or "")
+    if _strategy in ("replan", "escalate"):
+        return
+    plan_obj = result.get("plan") or state.get("plan")
+    _sr_src = (result.get("subtask_results")
+               if "subtask_results" in result else state.get("subtask_results")) or {}
+    abandoned = (set(result.get("abandoned_subtask_ids") or [])
+                 | set(state.get("abandoned_subtask_ids") or []))
+    # 复核 CRITICAL：阶梯三 give-up（stub/revert 皆 settled 终局）=有效处置，与全仓其余
+    # 消费者（dispatch._is_ready/graph/verify/runner）的 abandoned∪give_up 口径对齐。
+    give_ups = (set(result.get("give_up_isolated_ids") or [])
+                | set(state.get("give_up_isolated_ids") or []))
+    queued = list(result.get("dispatch_remaining")
+                  if "dispatch_remaining" in result
+                  else (state.get("dispatch_remaining") or []))
+    # ① 完备性
+    if "failed_subtask_ids" in result:
+        still_failed = set(result.get("failed_subtask_ids") or [])
+        leaked = [f for f in entry
+                  if f not in still_failed and f not in queued
+                  and f not in abandoned and f not in give_ups]
+        if leaked:
+            logger.error(
+                "[HANDLE_FAILURE] R65D-T1 处置完备性铁律：入口 %d 个失败、%d 个无处置 %s"
+                "（不重派/不放弃/不保留失败态三无=掉账）→ 强制回队重派+失败 result 出账"
+                "（round65d st-26 静默掉账饿死 90/94 的死因本体，绝不静默复发）",
+                len(entry), len(leaked), leaked)
+            _sr = dict(_sr_src)
+            for f in leaked:
+                if f not in queued:
+                    queued.append(f)
+                _sr.pop(f, None)
+            result["dispatch_remaining"] = queued
+            result["subtask_results"] = _sr
+            result["degraded_reasons"] = (
+                list(result.get("degraded_reasons") or [])
+                + [f"failure_disposition_leak:{f}" for f in leaked])
+            _sr_src = _sr
+    # ② 处方核销：本轮回队者的传递依赖不得命中已放弃（非桩）上游
+    requeued = [f for f in entry if f in queued]
+    if not requeued or plan_obj is None:
+        return
+    from swarm.brain.nodes.shared import l1_details_of as _l1d
+    from swarm.brain.nodes.shared import l1_passed as _l1p
+    _stubbed = {
+        sid for sid in give_ups
+        if _l1p(_sr_src.get(sid))
+        and (_l1d(_sr_src.get(sid)) or {}).get("give_up_mode") == "stub"
+    }
+    _dead = abandoned - _stubbed
+    _failed_now = set(result.get("failed_subtask_ids")
+                      if "failed_subtask_ids" in result
+                      else (state.get("failed_subtask_ids") or []))
+
+    def _is_dead_dep(d: str) -> bool:
+        if d in _dead:
+            return True
+        # 猎手 F3：历史僵尸——有失败 result 却不在队/不在失败集/未终局（st-26 形态本体，
+        # 可能来自本闸上线前的轮次或外部通道）＝这条依赖永远不会被满足。
+        return (d in _sr_src and not _l1p(_sr_src.get(d))
+                and d not in queued and d not in _failed_now
+                and d not in give_ups and d not in abandoned)
+
+    _by_id = {s.id: s for s in (getattr(plan_obj, "subtasks", None) or [])}
+    _bad: dict[str, list[str]] = {}
+    for f in requeued:
+        seen: set[str] = set()
+        stack = list(getattr(_by_id.get(f), "depends_on", []) or [])
+        hits: list[str] = []
+        while stack:
+            d = stack.pop()
+            if d in seen:
+                continue
+            seen.add(d)
+            if _is_dead_dep(d):
+                hits.append(d)
+                continue
+            stack.extend(list(getattr(_by_id.get(d), "depends_on", []) or []))
+        if hits:
+            _bad[f] = sorted(hits)
+    if _bad:
+        logger.error(
+            "[HANDLE_FAILURE] R65D-T1 处方核销：重派进队的 %s 传递依赖已放弃（非桩）上游 %s"
+            "——处方注定落空、依赖闸永不放行（round65d '宣称重派 4 实派 0' 形态）。"
+            "fail-loud 留痕交下一轮失败处置/连坐面裁决，绝不静默等饿死",
+            sorted(_bad), sorted({d for ds in _bad.values() for d in ds}))
+        result["degraded_reasons"] = (
+            list(result.get("degraded_reasons") or [])
+            + [f"recovery_prescription_unsatisfiable:{f}" for f in sorted(_bad)])

@@ -178,3 +178,29 @@ test_r65d_t2_h1_exam_source.py 8 条 + fixture 重放 test/fixtures/plan_b583.js
 revert-check 22 红/复原 24 绿（2 常绿=旧行为对照锁）；全量套件绿；lint 零新增。
 st-26 若重跑本代码：模板第二遍刷新剔除反向依赖→考卷从模板重生成（okhttp 系断言）→
 worker 抄模板必过闸；即便旧 plan 直入，H1 覆写后旧 grep jackson 被跳过+留痕不再冤杀。
+
+## #60 R65D-T1 已治（2026-07-17，本地提交）
+
+**病灶钉死（比登记更准的代码级真身）**：
+- 掉账本体=round36 自愈分支 `_healed` 早退 return：只回队已愈项，同批其余失败（st-26
+  verify-fail、仅补 C9 边的 st-30-1/31）failed_subtask_ids 清零+不回队+失败 result 滞留
+  ——对照 _unrecoverable 分支有「其余失败放回重派」对称段，自愈分支缺失；
+- "冻成完成态"=A2 定向恢复 `_kept`（保留 N 个完成态日志）把 subtask_results 里所有
+  非本轮失败条目当完成态计数，滞留的 L1-fail 僵尸 result 被数进去；
+- "宣称重派 4 实派 0"=重派确实进队，但依赖链穿过 st-26 僵尸节点永不可就绪，无人核销。
+
+**治本三面**：
+1. 根修：_healed return 补 `_sh_leftover` 对称回队+result 出账（与 _unrecoverable 同律；
+   重试计数原样保留=同 _unrecoverable 惯例，猎手 F5 记 B 类观察不改）；
+2. 铁律 `audit_failure_disposition`（唯一咽喉=handle_failure 包装，先于 plan 回传）：
+   显式清空失败集时，入口 fid 必须∈ 失败∪重派∪放弃∪give_up（复核 CRITICAL：阶梯三
+   settled-with-product 是终局，不认桩=毁桩+复活无界循环，双复核独立实锤）；replan/
+   escalate 交棒整体豁免（复核 HIGH：误报会给健康 replan 永久打死因签名进 append-only
+   degraded_reasons）；缺账→ERROR+强制回队+result 出账+failure_disposition_leak 机读；
+3. 处方核销：回队者传递依赖命中 已放弃（非桩）∪【历史僵尸】（有失败 result 不在队不在
+   失败集未终局，猎手 F3——st-26 形态本体跨轮残留时核销面也要看得见）→ ERROR +
+   recovery_prescription_unsatisfiable 机读，只告警不改队列。
+   审计自身异常=ERROR+failure_disposition_audit_error 机读（安全网下线绝不静默）。
+
+质量闸：RED 3→GREEN 9；双复核 reviewer(1C/1H/1L·两条 live 复现)+hunter(1C/1M/1LM/2清白)
+全整改全锁；give-up 阶梯/round36/round29 恢复面回归 50/50；revert-check 红；全量绿。
