@@ -1271,7 +1271,8 @@ class _SandboxSyncMixin:
             # 不可区分），提示可能有产物未回传。返回前 cap 个（去掉探测多取的那一个）。
             self._log(
                 f"沙箱 workspace 文件枚举达上限 {_WORKSPACE_LIST_CAP}（真实数更多）→ "
-                f"超出部分未纳入 pull-back，可能漏产物；如常触发请调大 SWARM_WORKSPACE_LIST_CAP"
+                f"超出部分未纳入 pull-back，可能漏产物；如常触发请调大 SWARM_WORKSPACE_LIST_CAP",
+                level="warning",
             )
             files = files[:_WORKSPACE_LIST_CAP]
         return files

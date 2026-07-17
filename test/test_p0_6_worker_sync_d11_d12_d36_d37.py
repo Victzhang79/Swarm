@@ -200,17 +200,23 @@ def test_d36_noop_without_marker(tmp_path):
 
 
 # ═══════════════════════════ D37 ═══════════════════════════
-def test_d37a_workspace_list_truncation_warns_and_caps(tmp_path, monkeypatch):
-    """全树枚举超上限 → 截断可观测（WARN）+ 返回恰好 cap 个（不静默丢在返回值里无声）。"""
+def test_d37a_workspace_list_truncation_warns_and_caps(tmp_path, monkeypatch, caplog):
+    """全树枚举超上限 → 截断可观测（真 warning 级，R65TR-T4⑧：不再用 [WARN]-in-INFO
+    假级别）+ 返回恰好 cap 个（不静默丢在返回值里无声）。"""
+    import logging
     monkeypatch.setattr(_sync, "_WORKSPACE_LIST_CAP", 3)
     ex = _mk_executor(tmp_path, FileScope(allow_any=True))
     mgr = _FakeManager(workspace=["a.java", "b.java", "c.java", "d.java"])  # 4 > cap 3
     ex._sandbox = SimpleNamespace(sandbox_id="sb")
     ex._sandbox_manager = mgr
     ex.execution_log = []
-    out = ex._list_sandbox_workspace_files()
+    with caplog.at_level(logging.WARNING):
+        out = ex._list_sandbox_workspace_files()
     assert len(out) == 3, out
-    assert any("上限" in line and "WARN" in line for line in ex.execution_log), ex.execution_log
+    assert any("上限" in line for line in ex.execution_log), ex.execution_log
+    assert any("上限" in r.getMessage() and r.levelno == logging.WARNING
+               for r in caplog.records), \
+        f"截断必须真 warning 级留痕: {[r.getMessage() for r in caplog.records]}"
 
 
 def test_d37a_marker_file_excluded_from_workspace_list(tmp_path):
