@@ -1271,7 +1271,31 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         )
     if not modules:
         # 阶段1 没给模块 → 退回单次（小需求或 LLM 没按格式）
-        return stage1, validate_file_plan(stage1.get("file_plan", [])), fact_issues, contract
+        _fb_fp = validate_file_plan(stage1.get("file_plan", []))
+        # R65B-LOW1：回退路径不是无规模信号——stage1 自带 file_plan 长度就是信号。
+        # 配置了 per-file 弹性时按文件数放宽，否则大 file_plan 走此路零弹性撞基线预算
+        # （round65b 同病异构面）。窄 try 隔离：记账旁路失败绝不弄丢设计产出。
+        _fb_task_id = state.get("task_id")
+        if _fb_task_id and _fb_fp:
+            try:
+                _fb_cfg = get_config()
+                _fb_base = int(getattr(_fb_cfg, "max_task_tokens", 0) or 0)
+                _fb_per_file = int(getattr(
+                    _fb_cfg, "max_task_tokens_per_planned_file", 0) or 0)
+                if _fb_base > 0 and _fb_per_file > 0:
+                    from swarm.models import ledger as _fb_ledger
+                    _fb_budget = _fb_base + _fb_per_file * len(_fb_fp)
+                    _fb_ledger.widen_budget(_fb_task_id, _fb_budget)
+                    logger.info(
+                        "[TECH_DESIGN] 无模块回退路径预算弹性：%d 文件 → "
+                        "widen_budget(base %d + %d×%d = %d)",
+                        len(_fb_fp), _fb_base, _fb_per_file, len(_fb_fp), _fb_budget)
+            except Exception as _fb_exc:  # noqa: BLE001
+                logger.warning(
+                    "[TECH_DESIGN] 回退路径预算弹性记账失败（%s）——设计产出保留继续，"
+                    "预算未放宽（大 file_plan 可能撞基线预算，请查 ledger/config）",
+                    _fb_exc)
+        return stage1, _fb_fp, fact_issues, contract
 
     # R38-A：模块数是规划期第一个规模信号——立即按 base+per_module×n 放宽 ledger 预算
     # （runner 的 on_chain_end 弹性钩子在节点结束才触发，救不了本节点内的阶段2；per_subtask
@@ -1508,7 +1532,26 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         return {"idx": mi, "name": mod_name, "file_plan": [], "error": _last_err}
 
     _valid = [(mi, mod) for mi, mod in enumerate(modules, start=1) if isinstance(mod, dict)]
-    _results = await _asyncio.gather(*[_gen_one_module(mi, mod) for mi, mod in _valid])
+    # R65-F8：单模块协程的未预期逃逸异常（_gen_one_module 的 try 覆盖 LLM 调用，但如
+    # _await_token_admission 在 except 块之外，自身故障会逃逸）绝不连坐兄弟模块——
+    # return_exceptions 隔离后映射为该模块失败走 stage2_failed_modules 对账；
+    # 取消（CancelledError）是关停语义，必须原样上抛。
+    _results_raw = await _asyncio.gather(
+        *[_gen_one_module(mi, mod) for mi, mod in _valid], return_exceptions=True)
+    _results = []
+    for (mi, mod), r in zip(_valid, _results_raw):
+        if isinstance(r, BaseException):
+            if isinstance(r, _asyncio.CancelledError):
+                raise r
+            _mod_name = mod.get("name") or f"module-{mi}"
+            logger.error(
+                "[TECH_DESIGN-STAGE2] 模块 %d '%s' 未预期异常逃逸"
+                "（gather 已隔离，兄弟模块不连坐，该模块走失败对账）: %r",
+                mi, _mod_name, r)
+            _results.append({"idx": mi, "name": _mod_name, "file_plan": [],
+                             "error": f"unhandled:{r!r}"[:200]})
+        else:
+            _results.append(r)
     # gather 保序：按模块原始顺序聚合，保证 file_plan 稳定可复现
     _results.sort(key=lambda r: r["idx"])
 

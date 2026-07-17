@@ -196,7 +196,9 @@ def test_tech_design_stage1_widens_budget_before_stage2(monkeypatch):
 
 
 def test_tech_design_no_widen_when_no_modules(monkeypatch):
-    """STAGE1 未按格式给模块（退回单次路径）→ 不放宽（无规模信号不放大预算）。"""
+    """STAGE1 未按格式给模块（退回单次路径）且无 per-file 弹性配置 → 不放宽
+    （fail-closed：没有配置的弹性维度绝不放大预算）。
+    R65B-LOW1 后回退路径有 per-file 配置时按 file_plan 规模放宽，见下一测试。"""
     from swarm.brain import planning_nodes as pn
 
     widen_calls: list = []
@@ -216,6 +218,35 @@ def test_tech_design_no_widen_when_no_modules(monkeypatch):
     asyncio.run(pn._tech_design_staged(
         _NoModuleLLM(), "task desc", "medium", True, state, "facts", "", ""))
     assert not widen_calls
+
+
+def test_tech_design_fallback_widens_by_filecount(monkeypatch):
+    """R65B-LOW1：无模块回退路径不是无规模信号——stage1 自带 file_plan 长度就是
+    规模信号。配置了 per-file 弹性时必须按 base+per_planned_file×files 放宽，
+    否则大 file_plan 走回退路径就零弹性撞基线预算（round65b 同病异构面）。"""
+    from swarm.brain import planning_nodes as pn
+
+    widen_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "swarm.models.ledger.widen_budget",
+        lambda task_id, budget: widen_calls.append((task_id, budget)))
+    cfg = type("Cfg", (), {"max_task_tokens": 500_000,
+                           "max_task_tokens_per_module": 200_000,
+                           "max_task_tokens_per_planned_file": 4_000})()
+    monkeypatch.setattr(pn, "get_config", lambda: cfg)
+
+    class _NoModuleBigPlanLLM:
+        async def ainvoke(self, messages):
+            return _FakeResp(json.dumps({"file_plan": [
+                {"path": f"src/f{i}.x", "action": "create", "description": "d"}
+                for i in range(12)]}))
+
+    state = {"task_id": "t-nomod-widen", "clarify_summary": ""}
+    result, file_plan, _fi, _c = asyncio.run(pn._tech_design_staged(
+        _NoModuleBigPlanLLM(), "task desc", "medium", True, state, "facts", "", ""))
+    assert len(file_plan) == 12
+    assert widen_calls == [("t-nomod-widen", 500_000 + 12 * 4_000)], \
+        f"回退路径应按文件数放宽: {widen_calls}"
 
 
 # ─────────── R65B-T1：文件规模二级弹性（round65b token 烧穿治本）───────────

@@ -83,3 +83,46 @@ async def test_staged_module_failure_isolated():
     # m1 失败但 m2 成功，至少拿到 m2 的文件（不全军覆没）
     assert any("m2/F.java" in x.get("path", "") for x in fp), f"m2 应成功: {fp}"
     assert [m["name"] for m in result.get("stage2_failed_modules") or []] == ["m1"]
+
+
+class _TokenDenied(Exception):
+    """模拟账本拒绝（带 usage，走 _await_token_admission 通道）。"""
+
+    def __init__(self):
+        super().__init__("token denied")
+        self.usage = {"required": 1}
+
+
+class _RaisingLLM(_RoutedLLM):
+    """m1 的调用直接抛账本拒绝异常（不返回响应）。"""
+
+    async def ainvoke(self, messages):
+        user = messages[-1]["content"]
+        if "模块名：m1" in user:
+            self.await_count += 1
+            raise _TokenDenied()
+        return await super().ainvoke(messages)
+
+
+@pytest.mark.asyncio
+async def test_staged_unhandled_escape_does_not_kill_siblings():
+    """R65-F8：单模块协程内逃逸出 try 的未预期异常（实证通道=token 拒绝后
+    _await_token_admission 自身故障，该调用在 except 块之外）绝不连坐兄弟模块——
+    gather 必须隔离异常，健康模块产出保住，故障模块走 stage2_failed_modules 对账。"""
+    stage1 = {"architecture": "x", "data_model": "y", "fact_issues": [],
+              "modules": [{"name": "m1", "est_files": 1}, {"name": "m2", "est_files": 1}]}
+    llm = _RaisingLLM(stage1, {
+        "m2": [{"file_plan": [{"path": "m2/F.java", "module": "m2"}]}],
+    })
+    with patch("swarm.brain.planning_nodes._is_token_limit_error",
+               side_effect=lambda e: isinstance(e, _TokenDenied)), \
+         patch("swarm.brain.planning_nodes._await_token_admission",
+               AsyncMock(side_effect=RuntimeError("ledger backend down"))):
+        result, fp, fi, contract = await _tech_design_staged(
+            llm, "需求", "ultra", False, {}, "", "", "")
+    assert any("m2/F.java" in x.get("path", "") for x in fp), \
+        f"m2 健康产出被 m1 逃逸异常连坐丢失: {fp}"
+    _failed = {m["name"]: m for m in result.get("stage2_failed_modules") or []}
+    assert "m1" in _failed, f"m1 应走失败对账: {_failed}"
+    assert "unhandled" in str(_failed["m1"].get("reason", "")), \
+        f"失败原因应机读标注 unhandled: {_failed['m1']}"
