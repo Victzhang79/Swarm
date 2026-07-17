@@ -459,3 +459,29 @@ base/untracked→删除）。protected=完成者 diff 真账∪scope 声明（_f
 **质量闸**：10 测试（#71 3+#72 7，含临时 git repo 实测 checkout/删除/protected/
 unsweepable/mid-loop 隔离）；revert-check 5 红；终态家族定向 35+37 绿；ruff 阻断级 0；
 全量见提交。
+
+## #70 R65REPLAY-T5：滚动补位 BLOCKED 预检秒退解冻（调度饿死案·定性修正后收缩治疗）
+
+**定性修正（治疗中取证推翻原处方一半）**：回放三波批被 [st-27+分片族] 垄断的直接原因
+不是 retry 池排序——C 路实证 st-2 被 #57 消费边挂上对必死分片族的依赖，被依赖闸正当
+扣住，就绪集本就只剩 retry 家族。原处方 a)（同指纹降调度序）b)（retry 池内排序）与
+病因不符，如实作废（修根因非打地鼠）；根源已由 #69+#66 治除。
+
+**实治=原处方 c)**（独立实锤：18:42 后补位零触发、末段 26min 并发≈1）：滚动补位
+_any_bad 一票冻结细化——seed 闸【预检】秒退不冻结补位，判据=blocked_stage=="preflight"
+专属标记（seed 闸 l1_details 新增；worker/executor.py）。BLOCKED 者照常收批交
+HANDLE_FAILURE（C9/重派/R13-4 节奏全不变）；真失败/异常仍立即冻结。
+
+**双向复核处置**（hunter 单 agent 双向，1H/1M/2L）：
+- F1 HIGH CONFIRMED：not_run_kind=blocked+failure_class=transient 对被昂贵路径共用
+  （烧满预算超时 BLOCKED/真 build ≥5min 后 internal_pkg_not_built/R50-2 跳回滚的树
+  改动路径）→ 豁免收窄为 preflight 专属标记（唯一零成本产出点）+ 昂贵 BLOCKED 冻结锁。
+- F2 MED：随 F1 收窄消解（补位风暴上限=count 非 cost 的暴露面只剩零成本预检）。
+- F4 LOW-MED 接受为架构固有（早到好消息触发的补位不被晚到坏消息追溯取消——成功完成
+  同性质，_roll_budget 封顶非 runaway；timing 竞态测试易脆不写，此处文档留痕）。
+- F3 LOW 既存面（transient 批混龄走能力阶梯）记录不动。
+- 异常路径核验（_oc 为 Exception → _det_b={} → 恒冻结）✓；HANDLE_FAILURE/R13-4 节奏
+  核验零绕过 ✓。
+
+**质量闸**：3 新测试（豁免/真失败对照/昂贵 BLOCKED 冻结）共 11 项滚动族全绿；
+revert-check 红；dispatch 家族定向 42 绿；全量见提交。

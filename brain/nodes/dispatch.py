@@ -683,7 +683,23 @@ async def dispatch(state: BrainState) -> dict:
                         except Exception:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
                             pass
                 else:
-                    _any_bad = True   # 失败/异常 → 停止补位，收批交失败处置
+                    # R65REPLAY-T5（回放末段 26min 并发≈1）：seed 闸【预检】秒退
+                    # 不冻结补位——一票冻结让批内全秒退+一个 900s 长尾时机群烧成单
+                    # 线程。判据=blocked_stage=="preflight" 专属标记（复核 F1 HIGH：
+                    # not_run_kind=blocked+failure_class=transient 对被昂贵路径共用
+                    # ——烧满预算的超时 BLOCKED/真 build 后 internal_pkg_not_built
+                    # 同带此对，绝不能凭它豁免）。preflight=执行前秒退、零资源消耗/
+                    # 零树改动的唯一实锤产出点（executor._precheck_upstream_seed）。
+                    # BLOCKED 者照常入 outcomes 收批交 HANDLE_FAILURE（C9 补边/重派
+                    # 语义不变，A2 终身熔断兜底）。真失败/昂贵 BLOCKED 仍立即冻结。
+                    _det_b = (_oc.l1_details or {}) if isinstance(_oc, WorkerOutput) else {}
+                    _fast_blocked = (
+                        isinstance(_oc, WorkerOutput)
+                        and str(_det_b.get("blocked_stage") or "") == "preflight"
+                        and str(_det_b.get("not_run_kind") or "") == "blocked"
+                        and str(_det_b.get("failure_class") or "") == "transient")
+                    if not _fast_blocked:
+                        _any_bad = True   # 真失败/异常/昂贵 BLOCKED → 停止补位
             if (_roll_budget <= 0 or _any_bad
                     or len(_rolled) >= _roll_budget):
                 continue

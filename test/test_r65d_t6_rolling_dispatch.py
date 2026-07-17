@@ -223,3 +223,94 @@ async def test_rolled_worker_exception_stops_rolling(monkeypatch):
     assert "st-b" in (r.get("failed_subtask_ids") or []), r
     assert "st-c" not in r["subtask_results"], \
         "滚动者异常后绝不再补位（异常与 L1 失败同样停滚）"
+
+
+@pytest.mark.asyncio
+async def test_rolling_continues_past_fast_blocked(monkeypatch):
+    """R65REPLAY-T5（回放末段 26min 并发≈1 死型）：seed 闸 BLOCKED 秒退（零资源
+    消耗/零树改动/秒级返回）不冻结补位——批内全是秒退者+一个 900s 长尾时，补位
+    一票冻结把机群烧成单线程。真失败（烧预算/坏产物）仍立即冻结（既有护栏不动）。
+    形态：初始批 [st-a(慢成功), st-blk(秒 BLOCKED)]；st-e 依赖 st-a——st-a 完成后
+    补位必须轮到 st-e，不被 st-blk 的秒退挡死。BLOCKED 者仍入 failed 交 HANDLE_FAILURE。"""
+    monkeypatch.setenv("SWARM_DISPATCH_ROLL_FACTOR", "3")
+    plan = TaskPlan(subtasks=[
+        _subtask("st-a"),
+        _subtask("st-blk"),
+        _subtask("st-e", depends=["st-a"]),
+    ], parallel_groups=[["st-a", "st-blk", "st-e"]])
+    state = _mk_state(plan, ["st-a", "st-blk", "st-e"])
+
+    async def fake_worker(subtask, knowledge_context, project_id="",
+                          task_id="", **kwargs):
+        if subtask.id == "st-blk":
+            return WorkerOutput(
+                subtask_id="st-blk", diff="",
+                summary="[#12·seed闸门] 上游产物缺失，判 BLOCKED 等生产者",
+                confidence=Confidence.LOW, l1_passed=False,
+                l1_details={"pipeline_blocked": "internal_pkg_not_built",
+                            "not_run_kind": "blocked",
+                            "failure_class": "transient",
+                            "blocked_stage": "preflight",
+                            "blocked_on_files": ["m/X.java"]})
+        await asyncio.sleep(0.15 if subtask.id == "st-a" else 0.02)
+        return WorkerOutput(subtask_id=subtask.id,
+                            diff=f"--- a\n+++ b\n+{subtask.id}\n",
+                            summary="ok", confidence=Confidence.HIGH,
+                            l1_passed=True)
+
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker):
+        r = await dispatch(state)
+    assert "st-e" in r["subtask_results"], \
+        f"BLOCKED 秒退冻结补位=回放末段并发 1 死型: {sorted(r['subtask_results'])}"
+    assert "st-blk" in (r.get("failed_subtask_ids") or []), \
+        "BLOCKED 者仍须收批交 HANDLE_FAILURE（只解冻补位，不吞失败处置）"
+
+
+@pytest.mark.asyncio
+async def test_rolling_still_stops_on_real_failure_with_blocked_mix(monkeypatch):
+    """对照锁：混批里出现【真失败】（非 BLOCKED 秒退）→ 补位仍立即冻结。"""
+    monkeypatch.setenv("SWARM_DISPATCH_ROLL_FACTOR", "3")
+    plan = TaskPlan(subtasks=[
+        _subtask("st-a"),
+        _subtask("st-real"),
+        _subtask("st-e", depends=["st-a"]),
+    ], parallel_groups=[["st-a", "st-real", "st-e"]])
+    state = _mk_state(plan, ["st-a", "st-real", "st-e"])
+    fake = _fake(delay_map={"st-a": 0.15, "st-real": 0.0}, fail_ids={"st-real"})
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake):
+        r = await dispatch(state)
+    assert "st-e" not in r["subtask_results"], "真失败必须冻结补位（护栏不回归）"
+
+
+@pytest.mark.asyncio
+async def test_rolling_freezes_on_expensive_blocked_without_preflight(monkeypatch):
+    """复核 F1 HIGH 锁：昂贵 BLOCKED（真 build 后 internal_pkg_not_built/烧满预算
+    超时——同带 not_run_kind=blocked+failure_class=transient 但【无 preflight 标记】）
+    仍必须冻结补位——绝不让"披着 BLOCKED 外衣的真失败"放行补位风暴。"""
+    monkeypatch.setenv("SWARM_DISPATCH_ROLL_FACTOR", "3")
+    plan = TaskPlan(subtasks=[
+        _subtask("st-a"),
+        _subtask("st-exp"),
+        _subtask("st-e", depends=["st-a"]),
+    ], parallel_groups=[["st-a", "st-exp", "st-e"]])
+    state = _mk_state(plan, ["st-a", "st-exp", "st-e"])
+
+    async def fake_worker(subtask, knowledge_context, project_id="",
+                          task_id="", **kwargs):
+        if subtask.id == "st-exp":
+            return WorkerOutput(
+                subtask_id="st-exp", diff="",
+                summary="真 build 5min 后 internal_pkg_not_built（昂贵 BLOCKED）",
+                confidence=Confidence.LOW, l1_passed=False,
+                l1_details={"pipeline_blocked": "internal_pkg_not_built",
+                            "not_run_kind": "blocked",
+                            "failure_class": "transient"})   # 无 blocked_stage
+        await asyncio.sleep(0.15 if subtask.id == "st-a" else 0.02)
+        return WorkerOutput(subtask_id=subtask.id,
+                            diff=f"--- a\n+++ b\n+{subtask.id}\n",
+                            summary="ok", confidence=Confidence.HIGH,
+                            l1_passed=True)
+
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker):
+        r = await dispatch(state)
+    assert "st-e" not in r["subtask_results"],         "昂贵 BLOCKED 凭共用标记对豁免=补位风暴（每个候选再烧 5min build）"

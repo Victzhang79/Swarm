@@ -712,6 +712,10 @@ class WorkerExecutor(
                 "blocked_on_files": sorted(missing),
                 "blocked_on_packages": sorted(blocked_pkgs),
                 "failure_class": "transient",
+                # R65REPLAY-T5 复核 F1：预检秒退专属标记——not_run_kind+failure_class
+                # 对被昂贵路径（烧满预算超时/真 build 后 BLOCKED）共用，滚动补位的
+                # 解冻豁免只认本标记（零资源消耗/零树改动的唯一实锤=本 preflight）。
+                "blocked_stage": "preflight",
             },
         )
 
