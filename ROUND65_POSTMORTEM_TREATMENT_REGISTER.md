@@ -76,3 +76,38 @@ plan 阶段 spent 555k 烧穿顶格，10 批只跑完 ~6 批即 hopeless。round
   - #53：修① 死上游豁免收紧为 **give_up_mode=="stub" 且 l1_passed** 才豁免（reviewer CRITICAL：裸 l1_passed 会把 revert 占位也豁免，round12/13 连坐判官翻红实证→已治+revert 对照锁）；修③ 连坐规模闸 `>max(10, 25%×计划)` → escalate 而非静默清盘（带机读 degraded_reason）；修④ after_monitor 有放弃时打「PARTIAL 交付，绝非全部完成」WARNING；修⑤ monitor 三本账（L1过/失败/放弃）。
 - 质量闸：双复核逮 1 CRITICAL + 1 CONFIRMED HIGH 全治；全量 4666/0/0（skip 5）；revert-check 红面 7/10（余 3=旧行为对照锁，设计使然）→ 复绿 27/0/0。
 - 遗留登记：#54 stub provenance 完备性（种子闸要求的 upstream_artifacts 覆盖）；LOW×2（owner 注入措辞 parent-version 仅 CREATE 相关=表述瑕疵；l1_pipeline.py:2980 自检提示词用原始 description=非写文件路径）。
+
+## 既往债清偿批（round65d 起跑前，用户拍板「先清债再评估起跑信心」）
+- 首次 round65d 起跑（task 31989311）在规划早期（~2min）被用户叫停取消：登记册尚有
+  #47/#49/#51/#54 未清。本批四债全清后再做起跑条件整体评估。
+- **#47 stage2 gather 兄弟连坐**：`_gen_one_module` 的 try 覆盖 LLM 调用，但
+  `_await_token_admission` 在 except 块之外——它一抛就逃逸出协程，gather 无
+  return_exceptions → 整个 stage2 崩、健康兄弟模块产出全丢。治=return_exceptions
+  隔离+逃逸异常映射 `unhandled:` 失败走 stage2_failed_modules 对账（CancelledError
+  关停语义原样上抛）。锁=test_staged_unhandled_escape_does_not_kill_siblings。
+- **#49 无模块回退零 widen**：`if not modules:` 直接 return 在两级弹性之前——回退
+  路径其实有规模信号（stage1 自带 file_plan 长度）。治=回退路径按
+  base+per_planned_file×files 放宽（窄 try 隔离）；既有「无 per-file 配置不放宽」
+  锁语义收窄如实改述。锁=test_tech_design_fallback_widens_by_filecount。
+- **#54 梯三桩 provenance 完备性**（round65c 死链触发端）：`_generate_compile_stub`
+  的 _CODE_EXT 过滤只写代码文件，下游种子闸要求的 pom/配置永远缺席→桩「成功」但
+  下游永堵（#53 修①后还会反复撞闸烧预算）。治=桩硬覆盖目标=代码文件∪【下游
+  upstream_artifacts 声明∩上游足迹】（非代码仅声明才纳入，不乱碰构建文件原则保住）
+  +写后完备性闸：required 有缺→清半桩回退 revert 诚实连坐。复核确认顺手治了潜在
+  豁免洞（不完整桩以前会被 #53 stub 豁免误放行）。
+  猎手二轮逮 2 CONFIRMED HIGH 已整改：①revert_failed 信号被丢弃（半桩毒树账面写
+  「已清」）→l1_details.revert_failed 机读留痕+摘要如实+ERROR 硬告警；②required
+  集用弱归一器（'./'/ 反斜杠漂移=R41 实证真病→闸静默 no-op 零留痕）→两侧过权威
+  _norm_scope_path+声明/匹配计数留痕。
+- **#51 检索质量战役·第一阶段**：真混合候选并集落地（BM25 关键词臂独立供给候选，
+  SWARM_KB_HYBRID_UNION_SCROLL_LIMIT=5000，0=关）+bench 测量口径修正（query_terms
+  原来传整句=BM25 维度一直无效测量，改生产同款 _extract_keywords）。实测
+  0.500/0.364→**0.591/0.432**；池上限 10000 全库覆盖反而更差（0.545/0.386）=瓶颈
+  已转移到 rerank 池内噪声竞争（sql/模板富中文块挤 gold）。地板上调 0.38/0.50。
+  第二阶段（gold 集复审+类型加权，防 22 题基准过拟合）留 #51 继续，非起跑阻断。
+- 猎手三轮（并集/整改面专审）再逮 2 CONFIRMED 已整改：①HIGH=并集候选 score 占位 0.0
+  会被既有 semantic_score_threshold 旋钮（一开）整臂静默过滤（范畴错误：拿向量阈值
+  筛无稠密分的候选）→ kw_union 标记豁免+锁；②连坐放弃下游 pop 后 revert_failed
+  无迹可查 → ERROR 硬告警+degraded_reasons（reducer 通道）机读账
+  cascade_revert_failed:<id>:<files>+锁。LOW 留档：l1_details.revert_failed 目前无
+  下游消费者（L2 只能间接兜真编译毒），后续可接 runner 终态摘要。

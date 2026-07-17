@@ -85,6 +85,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_KB_EMBED_DIMENSION": "project/preprocess.py:627",
     "SWARM_KB_EMBED_FORMAT": "api/routers/config.py:712",
     "SWARM_KB_EMBED_REUSE_PROVIDER": "api/routers/config.py:713",
+    "SWARM_KB_HYBRID_UNION_SCROLL_LIMIT": "config/settings.py:650(R65B-T3 真混合候选并集关键词臂池上限)",
     "SWARM_KB_LOG_RETENTION_DAYS": "api/app.py:1290",
     "SWARM_KB_MAX_PRIORITY_FILES": "api/routers/config.py:766",
     "SWARM_KB_PRIORITY_FILE_TOP_K": "api/routers/config.py:765",

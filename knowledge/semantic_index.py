@@ -592,16 +592,41 @@ class SemanticIndexer:
             project_id, query, top_k=retrieval_top_k, query_vector=query_vector
         )
 
-        # BM25 混合融合（召回后重打分，零额外远端调用）
+        # BM25 混合融合
         bm25_w = getattr(self._kb_config, "hybrid_bm25_weight", 0.0) or 0.0
-        if query_terms and bm25_w > 0 and candidates:
-            try:
-                from swarm.knowledge.hybrid import hybrid_fuse
-                candidates = hybrid_fuse(
-                    candidates, query_terms, bm25_weight=bm25_w, text_key="content"
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("hybrid 融合失败(降级纯向量): %s", exc)
+        if query_terms and bm25_w > 0:
+            # R65B-T3 真混合候选并集：BM25 关键词臂独立供给候选。此前只在稠密 top-K
+            # 内重打分——关键词精确命中若没进稠密候选（R65B-T2 实锤：中文查询被文案
+            # 富集的模板抢占稠密 top-20）就永远救不回。关键词臂失败只降级不阻断。
+            _union_cap = int(getattr(
+                self._kb_config, "hybrid_union_scroll_limit", 0) or 0)
+            if _union_cap > 0:
+                try:
+                    kw_cands = await self.bm25_only_search(
+                        project_id, query_terms=query_terms,
+                        top_k=retrieval_top_k, scroll_limit=_union_cap)
+                    _seen_ids = {c.get("id") for c in candidates}
+                    _extra = [c for c in kw_cands
+                              if c.get("id") not in _seen_ids
+                              and (c.get("bm25_score") or 0.0) > 0.0]
+                    for c in _extra:
+                        # 关键词臂候选无稠密分：向量维度记 0，融合时只凭关键词维度竞争。
+                        # 猎手 F1：kw_union 标记让下游 semantic_score_threshold 过滤豁免
+                        # ——用向量相似度阈值筛无稠密分的候选是范畴错误（阈值一开整臂灭失）。
+                        c["score"] = 0.0
+                        c["kw_union"] = True
+                    if _extra:
+                        candidates = list(candidates) + _extra
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("BM25 候选并集失败(降级稠密候选内重打分): %s", exc)
+            if candidates:
+                try:
+                    from swarm.knowledge.hybrid import hybrid_fuse
+                    candidates = hybrid_fuse(
+                        candidates, query_terms, bm25_weight=bm25_w, text_key="content"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("hybrid 融合失败(降级纯向量): %s", exc)
 
         import asyncio
 

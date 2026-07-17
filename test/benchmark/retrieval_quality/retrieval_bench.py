@@ -115,11 +115,16 @@ async def run_bench(
         for q in questions:
             groups = q.get("relevant") or []
             if use_rerank:
+                # R65B-T3 口径对齐：query_terms 必须用生产同款关键词提取
+                # （英文 token + 中文 2-gram）。旧写法把整句当单个 term——BM25
+                # 文档侧是分词口径，整句永不匹配 → bench 的 BM25 维度一直无效测量
+                # （关键词臂/融合全零分静默空转，测的是纯稠密）。
+                from swarm.knowledge.retriever import _extract_keywords
                 res = await sem.search_with_rerank(
                     PROJECT_ID, q["query"],
                     retrieval_top_k=retrieval_top_k,
                     rerank_top_k=k,
-                    query_terms=[q["query"]],
+                    query_terms=_extract_keywords(q["query"]),
                 )
             else:
                 # --no-rerank: 纯向量(可选 BM25 融合)召回,不过 reranker,取前 k

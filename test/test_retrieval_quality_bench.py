@@ -24,13 +24,20 @@ from test.benchmark.retrieval_quality.retrieval_bench import run_bench
 # 业务 Java 文件（连同幻影模块），中文 NL 查询在纯业务子集里稠密检索天然赢
 # （实测彼时 0.955）。R65-T2 知识层 purge + R65B-T2 源码全文嵌入后，KB 首次
 # 【诚实且可复现】：全部 489 个源文件（含 Thymeleaf 模板/文档）入语义层，
-# 中文查询被中文文案富集的模板系统性抢占稠密 top-20——混合融合只在稠密候选内
-# 重排，救不回没进候选的关键词精确命中（bm25_only_search 原语健在但未接入
-# 主检索=真混合候选并集缺口）。可复现基线实测 Recall@5=0.364 / Hit@5=0.500。
-# 新地板贴着可复现基线设（继续守【回归】），0.75 目标随真混合/类型加权战役
-# 达成后回调——见 ROUND65_POSTMORTEM_TREATMENT_REGISTER.md R65B-T3 战役条目。
-RECALL_FLOOR = 0.30
-HIT_FLOOR = 0.42
+# 中文查询被中文文案富集的模板系统性抢占稠密 top-20。彼时实测 0.364/0.500。
+#
+# R65B-T3 战役第一阶段（同日）两治本后上调地板：
+# ① 真混合候选并集：BM25 关键词臂（bm25_only_search，池上限
+#    SWARM_KB_HYBRID_UNION_SCROLL_LIMIT=5000）独立供给候选，与稠密候选按 id 并集
+#    后融合重排——关键词精确命中不再被稠密 top-20 门槛挡死；
+# ② bench 测量口径修正：query_terms 原来传整句（BM25 文档侧是分词口径，整句永不
+#    匹配=BM25 维度一直无效测量），改用生产同款 _extract_keywords。
+# 实测 Recall@5=0.432 / Hit@5=0.591（池上限 10000 全库覆盖反而更差 0.386/0.545：
+# 瓶颈已从「候选缺席」转移到「rerank 池内噪声竞争」——sql/模板富中文块挤掉 gold）。
+# 0.75 目标属战役第二阶段（gold 集复审+类型加权，避免对 22 题基准裸调参过拟合），
+# 见 ROUND65_POSTMORTEM_TREATMENT_REGISTER.md R65B-T3 条目。地板留安全余量防 flake。
+RECALL_FLOOR = 0.38
+HIT_FLOOR = 0.50
 
 
 @pytest.fixture(scope="module")

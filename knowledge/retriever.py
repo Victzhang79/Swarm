@@ -445,7 +445,12 @@ class SwarmRetriever:
         # 低于此值丢弃，0=不过滤"）。按原始向量相似度 score 判（rerank 前的召回信号）。
         threshold = float(getattr(self._kb_config, "semantic_score_threshold", 0.0) or 0.0)
         if threshold > 0.0:
-            deduped = [r for r in deduped if float(r.get("score", 0.0) or 0.0) >= threshold]
+            # R65B-T3 猎手 F1：BM25 关键词臂并集候选（kw_union）无稠密相似度（score
+            # 占位 0.0），向量阈值对它们是范畴错误——阈值一开整臂静默灭失，恰好杀掉
+            # 并集要救的关键词精确命中。其入池资格已由 bm25_score>0 保证，予以豁免。
+            deduped = [r for r in deduped
+                       if r.get("kw_union")
+                       or float(r.get("score", 0.0) or 0.0) >= threshold]
 
         return deduped
 

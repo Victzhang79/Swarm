@@ -644,6 +644,11 @@ class KnowledgeConfig(BaseSettings):
     priority_file_top_k: int = 3         # priority 文件内每个取几条
     max_priority_files: int = 5          # 最多在几个 priority 文件内细检索
     hybrid_bm25_weight: float = 0.3      # 混合检索 BM25 权重（0=纯向量，1=纯关键词）
+    # R65B-T3 真混合候选并集：BM25 关键词臂独立供给候选（此前仅在稠密 top-K 内重打分，
+    # 关键词精确命中若没进稠密候选就永远救不回）。值=关键词臂 scroll 候选池上限
+    # （覆盖不到全库时为部分关键词检索，仍优于零）；0=关闭并集（回退稠密候选内重打分）。
+    # SWARM_KB_HYBRID_UNION_SCROLL_LIMIT 可调。
+    hybrid_union_scroll_limit: int = 5000
     # 周期全量重预处理（增量更新由 KBScheduler 处理；这里是兜底全量刷新）
     # 0 = 关闭（默认，仅靠增量 + 手动触发）；>0 = 每 N 小时检查一次 stale 项目并重跑。
     auto_reprocess_hours: float = 0.0
