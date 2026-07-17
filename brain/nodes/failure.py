@@ -754,9 +754,22 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             if fid not in dispatch_remaining:
                 dispatch_remaining.append(fid)
         forced_alternate = deepest > max_retries
+        # R65TR-T4⑪：换备宣称接 router 真相（同 #76 B2 阶梯主宣称点）——SIMPLE 也走同一
+        # dispatch 节点的 _has_hetero_alternate 判据，无异构备选时实派仍是同模型+加步数，
+        # 谎称"换备选"与实派永久不符。判据异常保守按"无备选"（诚实优先）。
+        _alt_txt = ""
+        if forced_alternate:
+            try:
+                from swarm.brain.nodes.dispatch import _has_hetero_alternate
+                _by_id_s = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
+                _no_alt_s = [fid for fid in failed_ids if not _has_hetero_alternate(
+                    getattr(_by_id_s.get(fid), "difficulty", None))]
+            except Exception:  # noqa: BLE001
+                _no_alt_s = list(failed_ids)
+            _alt_txt = ("，无异构备选→实派同模型+加步数" if _no_alt_s else "，换备选模型")
         logger.info(
             "[HANDLE_FAILURE] SIMPLE 快速路径 — 重试失败子任务(第 %d 次%s)",
-            deepest, "，换备选模型" if forced_alternate else "",
+            deepest, _alt_txt,
         )
         return {
             "subtask_results": subtask_results,

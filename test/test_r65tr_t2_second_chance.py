@@ -236,6 +236,27 @@ def test_trivial_repair_kill_switch(monkeypatch):
     assert not [s for s, _ in agent_log if "repair" in s or "fix" in s], "开关关闭不修复"
 
 
+def test_trivial_det_none_both_rounds_no_flip(monkeypatch):
+    """R65TR-T4⑩ 测试锁：det_ok=None 双轮（弱自报路径，无确定性证据）——修复轮
+    对该分支是有界 no-op（不无限循环、不误翻盘），终判随弱自报。首轮弱自报 fail
+    → 修复一轮 → 复闸仍 det=None → 维持 fail（不因 det=None 幻觉翻盘）。"""
+    agent_log: list = []
+    # llm 自报不通过（combined 不含通过信号）；det 两轮皆 None（无 diff 可检）
+    gates = [(None, {}), (None, {})]
+    stub = _mk_trivial_stub(gates, agent_log)
+    # 弱自报路径：combined 文本需让 _trivial_llm_self_report_passed 判 False
+    _orig = stub._run_agent
+
+    async def _run(prompt, step=""):
+        agent_log.append((step, prompt))
+        return "验证失败：字段缺失"  # 自报不通过
+    stub._run_agent = _run
+    out = asyncio.run(stub._run_trivial_fast())
+    _repairs = [s for s, _ in agent_log if "repair" in s]
+    assert len(_repairs) <= 1, f"det=None 分支修复轮必须有界（≤1）: {agent_log}"
+    assert not out.l1_passed, "det=None+弱自报不通过→维持 fail，绝不幻觉翻盘"
+
+
 # ── 猎手整改锁 ────────────────────────────────────────────────────────
 
 
