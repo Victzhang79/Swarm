@@ -250,7 +250,11 @@ def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
         owner = next(
             (
                 o for o in subs
-                if o.id != st.id and mod_pom in (
+                # 猎手 R65TR-T3 F3：排除本批 failed_ids——多受害者同批授权时先授权者
+                # 的 scope 已被就地 mutate 含 mod_pom，会被后续迭代当"owner"抓到 →
+                # 首列受害者反被串到全体兄弟后面（恰是要治的病换个座次）。修复中的
+                # 对等者绝不互为 owner；批内序交 _serialize_pom_writers 统一成链。
+                if o.id != st.id and o.id not in failed_ids and mod_pom in (
                     list(getattr(getattr(o, "scope", None), "create_files", []) or [])
                     + list(getattr(getattr(o, "scope", None), "writable", []) or [])
                 )
@@ -258,7 +262,22 @@ def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
             None,
         )
         if owner is not None:
-            _add_dep_safe(by_id, st.id, owner.id)
+            _o_sc = getattr(owner, "scope", None)
+            if mod_pom in (list(getattr(_o_sc, "create_files", []) or [])):
+                # owner 是真 creator（脚手架建 pom）→ 注册序：pom 先在，grantee 在后（原语义）。
+                _add_dep_safe(by_id, st.id, owner.id)
+            else:
+                # R65TR-T3 P1：owner 只是【对等 modify 写者】（基线既有清单，plan 无 creator）——
+                # 旧码把被恢复者挂它后面，而它可能从未派发/困在别的死链（963d78da 实锤：
+                # st-39-1 授权后被串到 st-2 连坐闭包里的 st-29-1 后面，1 小时零派发零日志，
+                # 终态 dispatched_unaccounted）。序不变量只要求有序不要求方向：反转为
+                # 被恢复者先行、停车的对等写者靠后；防环命中则不加边（并发写交 E3 写集锁+MERGE）。
+                _rev = _add_dep_safe(by_id, owner.id, st.id)
+                logger.info(
+                    "[HANDLE_FAILURE] R65TR-T3 pom 写权串边方向：%s（恢复重派）先行，"
+                    "对等写者 %s 靠后（owner 非 creator%s）",
+                    st.id, owner.id, "" if _rev else "；防环守卫命中→不加边",
+                )
     return granted
 
 
@@ -291,7 +310,15 @@ def _serialize_pom_writers(plan_obj, pom_by_id: dict,
                         + list(getattr(getattr(st, "scope", None), "create_files", None) or []))
         } - _excl) | set(members))
         for i in range(1, len(_all_writers)):
-            _add_dep_safe(by_id, _all_writers[i], _all_writers[i - 1])
+            _nxt, _prv = _all_writers[i], _all_writers[i - 1]
+            if _prv in (getattr(by_id.get(_nxt), "depends_on", []) or []):
+                continue  # 既有边，幂等
+            if not _add_dep_safe(by_id, _nxt, _prv):
+                # 猎手 R65TR-T3 F4：防环丢边必须留痕——两套串链机制（本函数 id 序 vs
+                # 写权授予串边）方向相抵时静默丢边=最终图形无人能解释。
+                logger.info(
+                    "[HANDLE_FAILURE] R65TR-T3 pom 写者串链边 %s→%s 被防环守卫拦下"
+                    "（既有反向序在，保留既有方向）", _nxt, _prv)
 
 
 def _insert_module_order_edge(plan_obj, registrant_id: str, scaffold_id: str) -> bool:

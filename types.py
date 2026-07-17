@@ -352,7 +352,9 @@ def edge_is_soft(consumer: "SubTask", producer: "SubTask | None") -> bool:
     ★复核 F1（hunter HIGH）：consumer.readable 与 producer.writable 有交=消费者要读
     的是【存量文件的改造后版本】——生产者死了文件仍在盘上（改造前旧版），R49-2 只查
     存在性兜不住，越过=静默拿旧接口写代码 → 判硬★。ua 有交=seed 闸构建输入=硬；
-    零交集=LLM/脚手架结构边（理由未知）=保守硬；producer 悬空（不在 plan，如重拆
+    R65TR-T3：生产者产出∩消费者写集有交（无任何生产关系）=【共写序边】（pom 写权
+    授予串边/规则1.5 共享写者串行链）=软——只序不连坐，并发写由写集锁+MERGE 收口；
+    其余零交集=LLM/脚手架结构边（理由未知）=保守硬；producer 悬空（不在 plan，如重拆
     旧 id）无法判定=保守硬。栈中立（纯路径/集合逻辑）。
     """
     if producer is None:
@@ -373,7 +375,19 @@ def edge_is_soft(consumer: "SubTask", producer: "SubTask | None") -> bool:
     rd = {_edge_norm_path(f) for f in (getattr(csc, "readable", None) or [])}
     if modified & rd:
         return False   # 读存量文件的改造后版本：死产者留下旧版在盘上，越过=静默陈旧
-    return bool(created & rd)
+    if created & rd:
+        return True
+    # R65TR-T3（对抗双复核 2×HIGH 实弹）：共写序边=软。生产者产出与【消费者写集】
+    # 有交、且上方两臂已排除一切生产关系（ua 构建输入/readable 消费）——两任务只是
+    # 共写同一文件的写序列化边（pom 写权授予串边/规则1.5 共享写者串行链均此形）。
+    # 只序不连坐：死者未产出消费者要消费的任何东西；判硬实测会让 grantee 之死把
+    # 健康共写者拖进 revert 级联（阶梯三无 completed_ids 保护路径=已完成产物被
+    # git 还原的数据损失面）。并发写由 E3 写集锁+MERGE 收口。其余零交叠（理由
+    # 未知的 LLM/结构边）维持保守硬不变。
+    cw = {_edge_norm_path(f) for f in (
+        list(getattr(csc, "create_files", None) or [])
+        + list(getattr(csc, "writable", None) or []))}
+    return bool((created | modified) & cw)
 
 
 class TaskPlan(BaseModel):

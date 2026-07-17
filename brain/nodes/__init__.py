@@ -1459,7 +1459,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_block_signatures: dict | None = None,
                            old_scope_amend_counts: dict | None = None,
                            merged_cover_injections: dict | None = None,
-                           old_dispatch_totals: dict | None = None) -> dict:
+                           old_dispatch_totals: dict | None = None,
+                           old_wait_windows: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -1482,7 +1483,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     if not any((old_results, old_recovery_counts, old_retry_counts,
                 old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
                 old_transient_counts, old_force_strong, old_use_alternate,
-                old_contract_counts, old_block_signatures, old_scope_amend_counts)):
+                old_contract_counts, old_block_signatures, old_scope_amend_counts,
+                old_wait_windows)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -1603,6 +1605,11 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     pruned_scope_amend = {
         sid: n for sid, n in (old_scope_amend_counts or {}).items() if _sig_unchanged(sid)
     }
+    # R65TR-T3：重派承诺账龄同签名剪枝——id 复用继承陈旧账龄=账不可信（观测账，
+    # 复核 MED：premature WARNING 归错主）。
+    pruned_wait_windows = {
+        sid: n for sid, n in (old_wait_windows or {}).items() if _sig_unchanged(sid)
+    }
     logger.info(
         "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber"
         "；记账保留 recovery=%d/%d retry=%d/%d redecompose=%d/%d；放弃标记保留 abandoned=%d/%d "
@@ -1640,6 +1647,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         # B2/B3（round38c）：失败指纹/外科修正配额同签名剪枝
         "subtask_block_signatures": pruned_block_sigs,
         "subtask_scope_amend_counts": pruned_scope_amend,
+        # R65TR-T3：账龄表同签名剪枝
+        "redispatch_wait_windows": pruned_wait_windows,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -1971,7 +1980,8 @@ async def plan(state: BrainState) -> dict:
                                  old_contract_counts=state.get("contract_retry_counts"),
                                  old_block_signatures=state.get("subtask_block_signatures"),
                                  old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
-                                 old_dispatch_totals=state.get("subtask_dispatch_totals")),
+                                 old_dispatch_totals=state.get("subtask_dispatch_totals"),
+                                 old_wait_windows=state.get("redispatch_wait_windows")),
             **plan_touch,
         }
 
@@ -2435,7 +2445,8 @@ async def plan(state: BrainState) -> dict:
                                  old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
                                  # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
                                  merged_cover_injections=_cover_injections,
-                                 old_dispatch_totals=state.get("subtask_dispatch_totals")),
+                                 old_dispatch_totals=state.get("subtask_dispatch_totals"),
+                                 old_wait_windows=state.get("redispatch_wait_windows")),
         **plan_touch,
     }
 

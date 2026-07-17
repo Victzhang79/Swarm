@@ -256,6 +256,7 @@ class BrainState(TypedDict, total=False):
     l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
     l2_missing_fp_history: list[str]    # R46-3：L2 契约缺失符号指纹连击史（三连不变→跳过 D5 归因直接升级，杜绝同缺口空转重跑 L2；指纹变化即重置）
     subtask_dispatch_totals: dict[str, int]  # A2(r48c)：终身派发计数（按 id 单调、绝不签名剪枝）——handle_failure 硬熔断兜底，治 retry_counts 被 scope 加宽/replan 改签名重置后的无界重派
+    redispatch_wait_windows: dict[str, int]  # R65TR-T3 P2：重派承诺账龄 {sid: 连续未兑现窗口数}——曾派发过却持续未被选中者逐窗口计龄，阈值整倍数 WARNING 点名未满足依赖（#71 终态账提前到飞行中）；被选中/离开 remaining 即清
 
     # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
     uploaded_files: list[str]           # 任务创建时上传的文件路径（绝对路径，任务专属目录）
@@ -315,6 +316,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）
     "targeted_recovery_count": "monotonic",
     "targeted_recovery_counts": "monotonic",   # D08 签名剪枝
+    "redispatch_wait_windows": "monotonic",    # R65TR-T3：D08 签名剪枝（观测账；id 复用继承陈旧账龄=账不可信）
     "abandoned_subtask_ids": "monotonic",      # D08 签名剪枝
     "give_up_isolated_ids": "monotonic",       # D08 签名剪枝
     "confirm_reason": "oneshot",        # REVISE 开新轮由 revision 清（3.8 修）

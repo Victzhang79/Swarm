@@ -408,6 +408,45 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
     return plan_obj, remaining, to_dispatch
 
 
+# R65TR-T3 P2：重派承诺账龄告警阈值（每 N 个派发窗口点名一次，不刷屏）。
+_REDISPATCH_AGE_WARN_WINDOWS = 8
+
+
+def _track_redispatch_promise_ages(
+    ages: dict, *, dispatch_remaining: list, selected_ids: set,
+    abandoned: set, plan_obj, completed_ids: set, dispatch_totals: dict,
+) -> dict:
+    """R65TR-T3 P2：重派承诺账龄——曾派发过（dispatch_totals>0）却本窗口未被选中的
+    remaining 子任务逐窗口计龄；达阈值整倍数 WARNING 点名未满足依赖。
+
+    回放实锤：st-39-1 定向恢复明文承诺后 1 小时 ~10 个派发窗口零日志零派发，
+    只能靠终态 dispatched_unaccounted 认账（#71）——把账提前到飞行中。
+    被选中/离开 remaining 即清零；从未派发者不入账（正常依赖等待非本观测对象）。
+    纯函数（入参出参 dict），返回新账供节点回写 state。"""
+    out = dict(ages or {})
+    _remaining = set(dispatch_remaining or [])
+    for sid in list(out):
+        if sid in selected_ids or sid not in _remaining:
+            out.pop(sid, None)
+    _by_id = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
+    for sid in _remaining:
+        if sid in selected_ids or sid in (abandoned or set()):
+            continue
+        if int((dispatch_totals or {}).get(sid, 0) or 0) <= 0:
+            continue
+        out[sid] = int(out.get(sid, 0) or 0) + 1
+        if out[sid] % _REDISPATCH_AGE_WARN_WINDOWS == 0:
+            _st = _by_id.get(sid)
+            _unmet = [d for d in (getattr(_st, "depends_on", []) or [])
+                      if d not in completed_ids]
+            logger.warning(
+                "[DISPATCH] R65TR-T3 重派承诺账龄：%s 已 %d 个派发窗口未兑现"
+                "（未满足依赖=%s）——依赖若长期不动即软掉账候选（终态 dispatched_unaccounted）",
+                sid, out[sid], _unmet[:6],
+            )
+    return out
+
+
 def _has_hetero_alternate(difficulty) -> bool:
     """E1（round38c 主题E）：该难度路由是否存在异构备选（retry_alternate 兑现判据）。
 
@@ -537,6 +576,12 @@ async def dispatch(state: BrainState) -> dict:
             # 否则 last-write-wins 通道残留上一轮（如 contract 失败）的 failed 列表 → monitor 误读
             # 残留失败再进 handle_failure，此时 verification_failure 已清 → 走常规能力阶梯误全量重跑。
             "failed_subtask_ids": list(state.get("failed_subtask_ids", [])),
+            # R65TR-T3 P2：空批窗口=全部承诺者未兑现，账龄照计（饿死恰发生在空批连击）。
+            "redispatch_wait_windows": _track_redispatch_promise_ages(
+                state.get("redispatch_wait_windows") or {},
+                dispatch_remaining=dispatch_remaining, selected_ids=set(),
+                abandoned=_abandoned, plan_obj=plan_obj, completed_ids=completed_ids,
+                dispatch_totals=state.get("subtask_dispatch_totals") or {}),
         }
         if _gate_split or _acct_changed:
             _empty["plan"] = plan_obj  # 闸门拆小/剔账后须回写新 plan，否则变更只活在内存重启即丢
@@ -866,6 +911,13 @@ async def dispatch(state: BrainState) -> dict:
     for _tid in _dispatched_ids:
         _totals[_tid] = _totals.get(_tid, 0) + 1
     result["subtask_dispatch_totals"] = _totals
+    # R65TR-T3 P2：重派承诺账龄——本窗口全 spawn 集（初始批∪滚动补位）为兑现口径。
+    result["redispatch_wait_windows"] = _track_redispatch_promise_ages(
+        state.get("redispatch_wait_windows") or {},
+        dispatch_remaining=list(result.get("dispatch_remaining", dispatch_remaining) or []),
+        selected_ids=_dispatched_ids, abandoned=_abandoned, plan_obj=plan_obj,
+        completed_ids=completed_l1_ids(result.get("subtask_results") or subtask_results),
+        dispatch_totals=_totals)
     return result
 
 
