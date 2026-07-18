@@ -88,3 +88,8 @@ cassettes/
 
 # E2E 陪跑镜像/journal（会话working notes，本地排障用，不入库）
 run_mirrors/
+
+# 内部复盘/治本工作登记册（绝不入库——round65e6 用户纠正：这类文件不能提交）
+*_POSTMORTEM_TREATMENT_REGISTER.md
+*_TREATMENT_REGISTER.md
+*_POSTMORTEM_*.md
