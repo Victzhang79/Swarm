@@ -15,8 +15,8 @@
 """
 from types import SimpleNamespace
 
-from brain.contract_utils import _resolve_module_dirs
-from brain.plan_validator import validate_module_coherence
+from swarm.brain.contract_utils import _resolve_module_dirs
+from swarm.brain.plan_validator import validate_module_coherence
 
 
 def _plan():
