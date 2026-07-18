@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 _MAVEN_GENERIC_SEG = {"org", "com", "net", "io", "cn", "www", "java", "javax",
                       "jakarta", "apache", "springframework", "google"}
+# ★R65E-T4（round65e5 st-53-1 D1）★ 包名【叶】上的通用子包词——它们零区分度，单独命中
+# artifactId 会误绑（`dev.samstevens.totp.generator` 的 `generator` 撞内部模块 `ruoyi-generator`）。
+# 去掉后 groupId 前缀锚（anchor1）仍能命中 groupId 惯例库（zxing.core←com.google.zxing:core），
+# 不伤真匹配。
+_MAVEN_LEAF_NOISE = frozenset({
+    "generator", "generators", "util", "utils", "core", "api", "apis", "common", "commons",
+    "service", "services", "client", "clients", "impl", "internal", "model", "models",
+    "config", "configuration", "base", "support", "helper", "helpers", "exception", "exceptions",
+    "annotation", "annotations", "spi", "type", "types", "constant", "constants", "factory",
+})
 _MISSING_PKG_BRAIN_RE = re.compile(
     r"(?:程序包|package)\s+([\w.]+)\s+(?:不存在|does not exist)", re.I)
 _DEP_BLOCK_RE = re.compile(r"<dependency>([\s\S]*?)</dependency>", re.I)
@@ -34,16 +44,38 @@ _GROUP_RE = re.compile(r"<groupId>\s*([^<\s]+)\s*</groupId>", re.I)
 def _pkg_match_tokens(pkg: str) -> list[str]:
     """从缺失包名提取可匹配 Maven artifactId/groupId 的辨识 token（去通用段、去数字后缀变体）。
     org.quartz→['quartz']；okhttp3.x→['okhttp3','okhttp']；com.fasterxml.jackson.databind→['fasterxml','jackson','databind']。"""
-    toks: list[str] = []
+    raw: list[str] = []
     for s in [s for s in pkg.split(".") if s]:
         if s in _MAVEN_GENERIC_SEG or len(s) <= 2:
             continue
-        if s not in toks:
-            toks.append(s)
+        if s not in raw:
+            raw.append(s)
         st = s.rstrip("0123456789")
-        if st and st != s and st not in toks:
-            toks.append(st)
-    return toks
+        if st and st != s and st not in raw:
+            raw.append(st)
+    # ★复核 HIGH 整改★ 叶噪词零区分度予以去除——但【仅当去后仍留辨识 token】。否则短包唯一
+    # token 被清空、丢失真自证匹配：org.apache.commons.io→仅 'commons'、org.springframework.core→
+    # 仅 'core'、javax.annotation→仅 'annotation' 都会被误清成空集。留 ≥1 才去（generator 因
+    # totp/samstevens 仍在而被去，误绑照治；commons/core 作唯一 token 时保留，真匹配不伤）。
+    non_noise = [t for t in raw if t not in _MAVEN_LEAF_NOISE]
+    return non_noise if non_noise else raw
+
+
+def _dep_provides_pkg(pkg: str, gid: str, aid: str) -> bool:
+    """候选 <dependency>(groupId=gid, artifactId=aid) 是否【提供】缺失包 pkg。锚定匹配，杜绝子串误命中：
+    - anchor1：Maven 惯例——包名以 groupId 为前缀（`org.quartz.*`←`org.quartz`；`com.google.zxing.*`
+      ←`com.google.zxing`）。内部模块 groupId(`com.ruoyi`) 绝不前缀外部包(`dev.samstevens.totp.*`)。
+    - anchor2：辨识 token（去通用段/去叶噪）命中 artifactId 的【整段】(按 -/_/. 切)——治 `okhttp3`←
+      `okhttp` 这类非 groupId 惯例；整段匹配杜绝 `generator` 子串撞 `ruoyi-generator`。"""
+    p = (pkg or "").lower()
+    g = (gid or "").lower().strip()
+    if g and (p == g or p.startswith(g + ".")):
+        return True
+    toks = _pkg_match_tokens(pkg)
+    if not toks:
+        return False
+    aid_segs = {s for s in re.split(r"[-_.]", (aid or "").lower()) if s}
+    return any(t.lower() in aid_segs for t in toks)
 
 
 def _extract_missing_pkgs(blob: str) -> list[str]:
@@ -77,10 +109,10 @@ def _iter_project_poms(project_path: str, limit: int = 80) -> list:
 
 def _find_maven_dep_for_pkg(project_path: str, pkg: str, exclude_pom_rel: str) -> str | None:
     """在项目【其它 pom】找声明了能提供该缺失包的 <dependency> 块（项目自证坐标，不臆造）。
-    辨识 token 命中 artifactId/groupId；多命中取 artifactId 最短（最贴近）。返回 <dependency> 块文本或 None。"""
-    toks = _pkg_match_tokens(pkg)
-    if not toks:
-        return None
+    匹配走 `_dep_provides_pkg`（groupId 前缀锚 / artifactId 整段锚）；多命中取 artifactId 最短。
+    ★复核 HIGH 整改★ 绝不在此提前 `if not toks: return None`——anchor1(groupId 前缀)不需要 toks，
+    早退会让 `javax.annotation`/`org.springframework.core` 这类【段全落叶噪/通用】的包永不进 anchor1、
+    静默拒修真依赖。统一交 `_dep_provides_pkg` 判（其 anchor2 内部已 `if not toks: return False` 安全兜底）。"""
     try:
         excl = (Path(project_path) / exclude_pom_rel).resolve() if exclude_pom_rel else None
     except OSError:
@@ -97,8 +129,7 @@ def _find_maven_dep_for_pkg(project_path: str, pkg: str, exclude_pom_rel: str) -
             block = m.group(0)
             aid = _ARTIFACT_RE.search(block)
             gid = _GROUP_RE.search(block)
-            hay = f"{gid.group(1) if gid else ''} {aid.group(1) if aid else ''}".lower()
-            if aid and any(t.lower() in hay for t in toks):
+            if aid and _dep_provides_pkg(pkg, gid.group(1) if gid else "", aid.group(1)):
                 cands.append((len(aid.group(1)), block.strip()))
     if not cands:
         return None
@@ -146,6 +177,11 @@ def _inject_missing_maven_deps(project_path: str | None, granted: dict, subtask_
         for pkg in _extract_missing_pkgs(blob):
             dep = _find_maven_dep_for_pkg(project_path, pkg, mod_pom)
             if not dep:
+                # ★复核 MEDIUM 整改（降级可观测）★ 提取到缺失包却找不到自证坐标 = 要么真无（外部
+                # 未 provision），要么匹配拒了——必须留痕，否则运维无法把"确定性拒修"与"本就无坐标"
+                # 区分，静默吞掉 Finding-1 类误拒。这也是 D2 外部未 provision 信号的锚点。
+                logger.info("[DEP-REPAIR] A2 未能为缺失包 %r 找到自证坐标（项目其它 pom 未声明）→ "
+                            "跳过注入（不臆造；很可能是未 provision 的外部依赖，交 replan/人工）", pkg)
                 continue
             if _inject_dep_into_pom(Path(project_path) / mod_pom, dep):
                 a = _ARTIFACT_RE.search(dep)

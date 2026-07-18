@@ -35,8 +35,10 @@ def test_pkg_match_tokens_behavior():
     from swarm.brain.nodes.maven_repair import _pkg_match_tokens
 
     assert _pkg_match_tokens("org.quartz") == ["quartz"]
-    # 通用段 org/com 去掉，数字后缀变体保留
-    assert _pkg_match_tokens("okhttp3.client") == ["okhttp3", "okhttp", "client"]
+    # 通用段 org/com 去掉，数字后缀变体保留；★R65E-T4★ 叶噪词（client/util/core/generator…）
+    # 亦去除——零区分度、单独命中 artifactId 会误绑（generator↔ruoyi-generator）。okhttp 仍靠
+    # okhttp 整段命中；groupId 惯例库靠 groupId 前缀锚命中，去叶不伤真匹配。
+    assert _pkg_match_tokens("okhttp3.client") == ["okhttp3", "okhttp"]
 
 
 def test_extract_missing_pkgs_behavior():
