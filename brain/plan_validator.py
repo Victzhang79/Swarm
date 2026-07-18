@@ -692,8 +692,8 @@ def validate_module_coherence(
     # module→dir 扫描（forked-resolver 正是审计①病根；旧实现把尾部包名当第二个物理目录、
     # 确定性打回好 plan）。歧义/撞车的口径与脚手架**完全同源**：resolver 消歧（file_plan/基线
     # 覆盖名字匹配、扫到源码根即停）后仍未解的才是真违规，故绝不误伤惯例命名的单模块 plan。
-    resolved, ambiguous, collision = _resolve_module_dirs(
-        plan, project_path, file_plan, base_ref=base_ref)
+    resolved, ambiguous, collision, cross_res = _resolve_module_dirs(
+        plan, project_path, file_plan, base_ref=base_ref, with_cross_res=True)
 
     # ① 一对多：一个模块散落到多个物理目录 = module≠单一 build 单元（file_plan/基线未能消歧）
     for mod, dirs in sorted(ambiguous.items()):
@@ -716,6 +716,17 @@ def validate_module_coherence(
         result.warn(
             f"{len(_zero)} 个声明的模块在计划里无任何代码落点、且非棕地既有基线目录（可能是幻影"
             f"依赖，也可能缺生产者子任务）：{_zero[:8]}")
+
+    # ★R65E-T2 复核② CONFIRMED HIGH（silent-hunter）整改★ 资源/辅助文件（视图模板/静态 .js/
+    # mapper XML/DDL…）落在模块【构建根之外】的物理目录：按设计【不主张物理根、不硬打回】——否则
+    # round65e4 死因重现（RuoYi 带 UI 的 feature 视图必落 admin webapp、每个都被误杀）。但【运行时
+    # 归属】（资源是否被打进正确模块的 jar/war、是否误路由进无关模块）G1 物理层无法判：升为软 warn
+    # 结构化可观测（"降级可观测"铁律），移交 #67 语义/L1-L2 资源批核验，绝不只剩 logger.info 湮没。
+    for mod, dirs in sorted(cross_res.items()):
+        result.warn(
+            f"模块 {mod!r} 的资源/辅助文件落在其构建根之外的物理目录 {dirs}（视图/静态资源/DDL 等，"
+            f"按设计放行不阻断规划）——但其【运行时模块归属】G1 物理层无法核验，移交 #67 资源绑定/"
+            f"L1-L2 批核验：请确认这些资源确属该模块且被打进正确构建产物、非误路由进无关既有模块。")
     return result
 
 

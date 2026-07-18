@@ -510,7 +510,24 @@ def _evidence_class(path: str) -> str:
     dot = name.rfind(".")
     if dot > 0 and name[dot:].lower() in _AUX_EXTENSIONS:
         return _EV_AUX
-    if any(seg in _SRC_LAYOUT_SEGMENTS for seg in p.split("/")[:-1]):
+    # ★R65E-T2（round65e4 死因物理层收口，#67）★ Maven/Gradle 源集资源根 `src/<sourceSet>/resources/**`
+    # =打包不编译、永不定义/扩张构建单元的**资源根**——其下任意扩展名（含 `.js`/`.png`/未来类型）
+    # 皆不主张模块物理根，整类退位（与 `.html`/`.css`/mapper `.xml` 同性质，只是它们靠扩展名表已
+    # 命中、`.js` 等靠本规则统一收口，不再逐扩展名打地鼠）。死因：RuoYi feature 视图静态资源按
+    # 框架必落 `ruoyi-admin` webapp 的 `src/main/resources/static/js` → 旧分类器撞布局段升 _EV_STRONG →
+    # 误主张第二物理根 → G1 硬打回本可 build 的 plan（每个带 UI 的 feature 必撞）。
+    # ★复核① CONFIRMED HIGH 整改★ 必须锚定 `resources` 为**源集根**（紧跟 `src/<sourceSet>/`，即
+    # 相对某个 `src` 段偏移 +2），绝非"`src` 之后任意位置出现 `resources`"——否则名为 `resources` 的
+    # 【包】里的真编译源码 `…/src/main/java/com/x/resources/Foo.java` 会被误降级为 aux、静默放行真跨模块
+    # 违①（G1 存在的全部意义）。真 JS 工程源码 `web/src/App.js`（无 resources 段）本就不匹配、仍主张根。
+    _dirs = p.split("/")[:-1]   # 末段是文件名，不参与
+    _in_resource_root = any(
+        seg == "src" and i + 2 < len(_dirs) and _dirs[i + 2] == "resources"
+        for i, seg in enumerate(_dirs)
+    )
+    if _in_resource_root:
+        return _EV_AUX
+    if any(seg in _SRC_LAYOUT_SEGMENTS for seg in _dirs):
         return _EV_STRONG
     return _EV_WEAK_CODE
 
@@ -582,8 +599,8 @@ def _module_physical_dirs(plan, project_path: str | None,
 
 def _resolve_module_dirs(
     plan, project_path: str | None, file_plan: list | None = None,
-    *, base_ref: str | None = None,
-) -> tuple[dict[str, str], dict[str, list[str]], dict[str, list[str]]]:
+    *, base_ref: str | None = None, with_cross_res: bool = False,
+):
     """★单一权威 module→物理目录 resolver + 结构化诊断（Task#9 G1/G5 单一事实源）★。
 
     返回 (resolved, ambiguous, collision)：
@@ -647,6 +664,11 @@ def _resolve_module_dirs(
     # 的 `_code_module_root`→None 静默漏判）。out 的解析口径保持 `_common_module_prefix` 不变
     # （脚手架行为零回归）——多根仅额外进 fp_ambiguous 供 G1 闸打回，不改 out。
     fp_ambiguous: dict[str, list[str]] = {}
+    # ★R65E-T2 复核② CONFIRMED HIGH（silent-hunter）★ 资源/辅助文件退位【不主张物理根=按设计
+    # 放行】，但退位一旦【消解掉一个本会成立的多根违①】必须【结构化可观测】（"降级可观测"铁律）：
+    # 记录 {模块 → 落在其构建根之外的资源顶层目录}，由 G1 升为 result.warn（软、不阻断），供 #67
+    # 语义/L1-L2 资源批核验消费——绝不让 .js 等资源的跨模块落点只剩一条 logger.info 湮没。
+    cross_res: dict[str, list[str]] = {}
     _exist_cache: dict[str, bool] = {}   # R65E-T1：既有基线模块 git-pin 存在性缓存
     for mod, paths in _file_plan_module_paths(file_plan).items():
         # ★R64 证据强度分层★：按 _evidence_class 逐文件分类。物理根由代码证据
@@ -676,9 +698,11 @@ def _resolve_module_dirs(
         elif aux:
             _aux_tops = {q.split("/", 1)[0] for q in aux if "/" in q} - _roots
             if _aux_tops:
-                # 猎手 F5：退位必须可观测（fail-open 可观测铁律）
+                # 猎手 F5：退位必须可观测（fail-open 可观测铁律）。★R65E-T2 复核②★ _aux_tops 非空
+                # + 存在代码根 = 退位消解掉了一个本会成立的多根违① → 记入 cross_res 供 G1 结构化 warn。
                 logger.info("[R64-EVIDENCE] 模块 %r file_plan 的辅助文件根 %s 不计入物理根"
                             "判定（代码/清单证据根=%s）", mod, sorted(_aux_tops), sorted(_roots))
+                cross_res[mod] = sorted(_aux_tops)
         # ★R65E-T1★ 改【既有外部基线模块】的构建清单 = 合法跨模块接线（单体 feature 把依赖
         # 注册进 app 壳的 pom，round65e 死因本体），绝不构成本模块跨物理 build 单元。只剔除
         # 【仅由 manifest 证据主张、且 ≠本模块、且是既有基线模块】的根——本模块把真源码
@@ -721,6 +745,11 @@ def _resolve_module_dirs(
     for d in collision:
         for m in collision[d]:
             out.pop(m, None)
+    # 默认 3-tuple（既有全部调用点/测试零改动）；with_cross_res=True 时附第 4 元
+    # cross_res（{模块 → 构建根外资源顶层目录}）供 G1 结构化 warn——单一权威 resolver 出口，
+    # 绝不让 validator fork 一套扫描（审计① forked-resolver 病根）。
+    if with_cross_res:
+        return out, ambiguous, collision, cross_res
     return out, ambiguous, collision
 
 
