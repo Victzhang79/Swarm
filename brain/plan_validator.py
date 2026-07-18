@@ -811,7 +811,7 @@ def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> l
 
 
 def validate_requirement_coverage(
-    plan, requirement_items, baseline_covered=None,
+    plan, requirement_items, baseline_covered=None, baseline_vocab=None,
 ) -> PlanValidationResult:
     """S2-3 确定性覆盖校验维度（validate_plan 内、结构校验+SIMPLE 早退之后调用）。
 
@@ -860,6 +860,22 @@ def validate_requirement_coverage(
             f"baseline_covered 申报 {entry['id']} 缺少 reason 理由"
             f"（申报存量已满足必须给出依据：现有代码何处/如何满足该需求）"
         )
+    # R65E6-T1（round65e6 实锤）：假 baseline_covered 证据闸——申报"存量已满足"但该需求的判别术语
+    # 在基线符号/文件索引里【零命中】= 极可能把【新特性】谎称存量（Google 2FA 嫁接无 2FA 方法的
+    # SysUserController，静默丢出交付）。有 token 且全不在基线 → 打回，逼建子任务或改用有据 reason。
+    # 纯中文/无索引豁免（round37 过严教训）。baseline_vocab=None（老调用点/测试）→ 不启用，行为不变。
+    if baseline_vocab:
+        from swarm.brain.baseline_candidates import baseline_claims_missing_evidence
+        _text_by_id = {str(r.get("id")): str(r.get("text") or "")
+                       for r in (requirement_items or []) if isinstance(r, dict) and r.get("id")}
+        for rid in baseline_claims_missing_evidence(
+                baseline_covered, requirement_items, baseline_vocab):
+            result.add(
+                f"baseline_covered 申报 {rid} 缺乏基线证据 — {_text_by_id.get(rid, '')[:100]}"
+                f"（该需求的判别术语在现有代码符号/文件索引中【零命中】，基线极可能并无此能力："
+                f"若确为新功能→分配子任务实现并 covers 此 ID，切勿谎称存量；"
+                f"若确系存量→reason 必须引用现有代码中【真实出现该能力术语】的位置）"
+            )
     return result
 
 

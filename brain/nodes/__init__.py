@@ -749,6 +749,41 @@ def _previous_plan_repair_block(prev_plan, prev_baseline, done_cover_ids=None) -
     )
 
 
+async def _baseline_vocab_for(state) -> str:
+    """R65E6-T1：基线【符号/文件名】vocab（供假 baseline_covered 证据闸做 token 子串检索）。
+    project_id 缺失/索引未建/任何异常 → ""（fail-open：调用方据空串全豁免，绝不因索引缺失误拒真申报）。
+    与 _baseline_candidates_block_for 同源 fetch_structure_inventory，口径一致。
+
+    ★复核整改★：
+    - fail-open 不再静默——除 logger.warning 外配 record_degrade，令"KB 崩了闸静默关"与"确实没违规"
+      在 /api/metrics 可分（hunter F1：安全闸被基建故障静默关闭是最坏静默失败）。
+    - 索引达上界【被截断】→ 返回 ""（跳过闸，fail-open）：截断按 file_path 字母序整仓切，靠后模块的
+      符号会缺失→会把合法存量申报误判无证据（复核 HIGH#2）。与兄弟 _baseline_candidates_block_for
+      的截断软化哲学一致：大仓宁可不判，绝不误拒。
+    """
+    try:
+        _pid = str(state.get("project_id") or "").strip()
+        if not _pid:
+            return ""
+        from swarm.brain.baseline_candidates import build_baseline_vocab
+        from swarm.knowledge import service as _ksvc
+        _max_files, _max_symbols = 4000, 8000
+        files, symbols = await _ksvc.fetch_structure_inventory(_pid, _max_files, _max_symbols)
+        if len(files) >= _max_files or len(symbols) >= _max_symbols:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.plan.baseline_vocab_truncated")
+            logger.warning(
+                "[PLAN] R65E6-T1 基线索引达上界被截断（files=%d/symbols=%d）→ 证据闸本轮跳过"
+                "（大仓靠后模块符号缺失会误拒合法存量申报，fail-open 宁可不判）", len(files), len(symbols))
+            return ""
+        return build_baseline_vocab(files, symbols)
+    except Exception as e:  # noqa: BLE001 — 证据闸 advisory，绝不阻断规划
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.plan.baseline_vocab_unavailable")   # hunter F1：崩溃≠干净，metrics 可分
+        logger.warning("[PLAN] R65E6-T1 baseline vocab 降级为空（不阻断，证据闸本轮关闭）：%s", e)
+        return ""
+
+
 async def _baseline_candidates_block_for(state) -> str:
     """A7（阶段3.5）：确定性 baseline 候选清单 prompt 块。requirement_items/project_id
     缺失、索引未建、任何异常 → ""（fail-open 零注入，绝不拖垮规划）。"""
@@ -2846,8 +2881,17 @@ async def validate_plan(state: BrainState) -> dict:
     if not _coverage_gate_on or not _req_items:
         pass  # 上方已按跳过分支留痕
     else:
+        _bl_vocab = await _baseline_vocab_for(state)   # R65E6-T1 假 baseline_covered 证据闸
+        if not _bl_vocab and (state.get("baseline_covered") or []):
+            # hunter F2：有 baseline_covered 申报却 vocab 空 = 证据闸对【真实存在的申报】静默失效
+            # （最高危：假申报正是此时溜过）——留机读账，别与"本轮无申报"混同。
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.plan.baseline_claims_unchecked")
+            logger.warning("[PLAN] R65E6-T1 有 %d 条 baseline_covered 申报但基线 vocab 为空 → "
+                           "证据闸本轮未生效（申报未经基线核验放行）",
+                           len(state.get("baseline_covered") or []))
         cov_result = validate_requirement_coverage(
-            plan_obj, _req_items, state.get("baseline_covered"))
+            plan_obj, _req_items, state.get("baseline_covered"), baseline_vocab=_bl_vocab)
         for w in cov_result.warnings:
             _vp_warnings.append(str(w))
             logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)

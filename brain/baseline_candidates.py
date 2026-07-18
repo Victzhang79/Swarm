@@ -129,6 +129,109 @@ def build_baseline_candidates(
     return out
 
 
+# R65E6-T1 复核 MEDIUM 整改：证据判定专用 token（比 extract_req_tokens 宽）——额外纳入【数字打头
+# 但含字母】的技术缩略（2fa/3des/oauth2/sha512），否则 "2FA" 这类需求判别词零 token 会被静默豁免、
+# 令本闸的动机 bug 换措辞复现（复核实锤 `extract_req_tokens("支持2FA") == []`）。仍剔停用词+纯数字。
+# 只用于证据闸，绝不改 extract_req_tokens（candidates 通道行为不动）。
+_EVIDENCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+_CAMEL_WORD_RE = re.compile(r"[A-Z]+[a-z0-9]*|[a-z0-9]+")
+
+
+def extract_evidence_tokens(text: str) -> list[str]:
+    """证据判定 token：数字/字母混合 ≥3 字符、含≥1 字母、去停用词（小写去重保序）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in _EVIDENCE_TOKEN_RE.findall(str(text or "")):
+        low = t.lower()
+        if low in _STOP or low in seen:
+            continue
+        if not any(c.isalpha() for c in low):   # 纯数字无判别力
+            continue
+        seen.add(low)
+        out.append(low)
+    return out
+
+
+def _camel_initials(name: str) -> str:
+    """CamelCase/snake 名 → 首字母缩略（SingleSignOnFilter→ssof / SysUserController→suc）。
+    供证据 blob 让 SSO/RBAC 这类字母缩略 token 匹配到展开命名的存量（复核 HIGH：sso↔SingleSignOn）。"""
+    words = _CAMEL_WORD_RE.findall(str(name or ""))
+    return "".join(w[0] for w in words if w).lower()
+
+
+def build_baseline_vocab(files: list[dict], symbols: list[dict]) -> str:
+    """R65E6-T1：把基线【符号名/类名/文件名 stem/模块名 + 其 CamelCase 首字母缩略】拼成单一小写 blob，
+    供 baseline_covered 证据判定做子串检索（token in blob）。空索引 → 空串（调用方据此 fail-open 全豁免）。
+    缩略入 blob 令字母缩略需求词（sso/rbac/acl）能匹配展开命名（SingleSignOn…）——减少过严误拒（复核 HIGH）。
+    缩略是【增补证据】（只会让闸更宽松=fail-open 方向），绝不引入新的误拒。"""
+    parts: list[str] = []
+    for sym in (symbols or []):
+        if not isinstance(sym, dict):
+            continue
+        for k in ("symbol_name", "class_name"):
+            v = str(sym.get(k) or "")
+            if v:
+                parts.append(v.lower())
+                _ini = _camel_initials(v)
+                if len(_ini) >= 3:            # 太短缩略(≤2)判别力弱、易误命中，不入
+                    parts.append(_ini)
+    for f in (files or []):
+        if not isinstance(f, dict):
+            continue
+        fp = str(f.get("file_path") or "")
+        if fp:
+            parts.append(_basename_stem(fp))
+        m = str(f.get("module_name") or "").lower()
+        if m:
+            parts.append(m)
+    return "\n".join(parts)
+
+
+def baseline_claims_missing_evidence(
+    baseline_covered: list[dict] | None,
+    requirement_items: list[dict] | None,
+    baseline_vocab: str | None,
+) -> list[str]:
+    """R65E6-T1（round65e6 task 3c94e4ea 实锤）：返回【申报 baseline_covered 却在基线无任何证据】的 req-id。
+
+    死因：planner 把 Google 2FA（req-aaecf423）申报 baseline_covered、reason 把幻觉能力嫁接真文件
+    （SysUserController 真存在但无 2FA 方法；基线全库 2fa/totp/authenticator 符号=0）→ 既有闸只校验
+    id∈需求清单+reason 非空 → 假申报直接过 → 2FA 静默丢出交付。
+
+    证据判定（Option D，确定性、narrow，子agent 活体验证 catch 2FA 且 0 误拒合法存量）：
+    - baseline_vocab 空（KB 不可达）→ [] 全豁免（fail-open，绝不因索引缺失误拒真申报）；
+    - 需求文本 `extract_req_tokens` 零 token（纯中文无 ASCII 标识符）→ 豁免（round37 过严教训：
+      通知公告类合法存量申报会被误拒）；
+    - 有 token 且【全部】token 都不作子串出现在 blob → 无证据 → 列入返回（打回：极可能把新特性
+      谎称存量）。悬空 id（不在 requirement_items）不在此判——另有 dangling_baseline 校验。
+    """
+    if not baseline_covered or not baseline_vocab:
+        return []
+    vocab = baseline_vocab.lower()
+    text_by_id: dict[str, str] = {}
+    for it in (requirement_items or []):
+        if isinstance(it, dict) and it.get("id"):
+            text_by_id[str(it["id"])] = str(it.get("text") or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in baseline_covered:
+        if not isinstance(entry, dict):
+            continue
+        rid = str(entry.get("id") or "").strip()
+        if not rid or rid in seen:
+            continue
+        text = text_by_id.get(rid)
+        if text is None:          # 悬空 id → 交 dangling_baseline，本闸不重复判
+            continue
+        toks = extract_evidence_tokens(text)   # 宽口径：含 2fa/oauth2 等数字缩略
+        if not toks:              # 纯中文/无判别 token 豁免（过严会误拒合法存量，round37 教训）
+            continue
+        if not any(tk in vocab for tk in toks):
+            out.append(rid)
+            seen.add(rid)
+    return out
+
+
 def baseline_candidates_prompt_block(candidates: list[dict], *,
                                      truncated: bool = False) -> str:
     """候选申报清单 → PLAN prompt 注入块。空=空串（零噪声）。
