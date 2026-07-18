@@ -2730,7 +2730,8 @@ async def validate_plan(state: BrainState) -> dict:
         _mc_result = _vmc(
             plan_obj,
             project_path=_get_project_path(state.get("project_id") or ""),
-            file_plan=state.get("tech_design_file_plan") or [])
+            file_plan=state.get("tech_design_file_plan") or [],
+            base_ref=state.get("base_commit"))
         for w in _mc_result.warnings:
             _vp_warnings.append(str(w))
             logger.warning("[VALIDATE_PLAN] G1 模块 coherence: %s", w)

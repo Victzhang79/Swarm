@@ -528,6 +528,24 @@ def _evidence_root(path: str, cls: str) -> str | None:
     return None   # aux：不主张（调用方对纯辅助模块另行回退顶层目录）
 
 
+def _is_existing_baseline_module(
+    project_path: str | None, rel: str, cache: dict[str, bool], base_ref: str | None,
+) -> bool:
+    """R65E-T1：`rel` 在【任务钉扎 base 树】里是否为一个既有物理构建单元（目录带构建清单）。
+
+    ★猎手 B CONFIRMED 整改★ 必须读【钉扎 base】（`git cat-file -e <base_commit>:<rel>/<manifest>`）
+    而非实时工作树——project_path 是每轮 merge 累积落盘的持久 git 树，若读实时磁盘，前一轮/前一
+    任务已 merge 的新模块会被误当"既有基线"，让无关模块的 pom 编辑被静默剔除（round59 血泪的
+    跨轮版：判据随磁盘态闪烁）。复用 _exists_in_repo 的 git-pin 口径，与 merge/worker/L2 全链一致。
+    非 git → 退化 os.path.isfile（_exists_in_repo 内建）。base_ref=None → HEAD（零回归兜底）。"""
+    if not rel:
+        return False
+    return any(
+        _exists_in_repo(project_path, f"{rel}/{name}", cache, base_ref)
+        for name in _BUILD_MANIFESTS
+    )
+
+
 def _module_physical_dirs(plan, project_path: str | None,
                           file_plan: list | None = None) -> dict[str, str]:
     """R57-1 + R57-4 合治：契约模块名 → 它在磁盘上的**真实物理目录**（多栈通用，不写死任何栈）。
@@ -564,6 +582,7 @@ def _module_physical_dirs(plan, project_path: str | None,
 
 def _resolve_module_dirs(
     plan, project_path: str | None, file_plan: list | None = None,
+    *, base_ref: str | None = None,
 ) -> tuple[dict[str, str], dict[str, list[str]], dict[str, list[str]]]:
     """★单一权威 module→物理目录 resolver + 结构化诊断（Task#9 G1/G5 单一事实源）★。
 
@@ -628,6 +647,7 @@ def _resolve_module_dirs(
     # 的 `_code_module_root`→None 静默漏判）。out 的解析口径保持 `_common_module_prefix` 不变
     # （脚手架行为零回归）——多根仅额外进 fp_ambiguous 供 G1 闸打回，不改 out。
     fp_ambiguous: dict[str, list[str]] = {}
+    _exist_cache: dict[str, bool] = {}   # R65E-T1：既有基线模块 git-pin 存在性缓存
     for mod, paths in _file_plan_module_paths(file_plan).items():
         # ★R64 证据强度分层★：按 _evidence_class 逐文件分类。物理根由代码证据
         # （strong/weak_code）+ 清单证据（manifest，主张清单所在目录——逮"清单声明错目录"）
@@ -645,11 +665,12 @@ def _resolve_module_dirs(
         prefix = _common_module_prefix(code_paths or paths, project_path)
         if prefix:
             out[mod] = prefix
-        _roots: set[str] = set()
+        _roots_cls: dict[str, set[str]] = {}
         for p, cls in ((q, c) for c, ps in by_cls.items() for q in ps if c != _EV_AUX):
             r = _evidence_root(p, cls)
             if r:
-                _roots.add(r)
+                _roots_cls.setdefault(r, set()).add(cls)
+        _roots: set[str] = set(_roots_cls)
         if not _roots:   # 纯辅助模块：回退顶层目录（多根照打回，flat 兜底不放水）
             _roots = {q.split("/", 1)[0] for q in aux if "/" in q}
         elif aux:
@@ -658,6 +679,33 @@ def _resolve_module_dirs(
                 # 猎手 F5：退位必须可观测（fail-open 可观测铁律）
                 logger.info("[R64-EVIDENCE] 模块 %r file_plan 的辅助文件根 %s 不计入物理根"
                             "判定（代码/清单证据根=%s）", mod, sorted(_aux_tops), sorted(_roots))
+        # ★R65E-T1★ 改【既有外部基线模块】的构建清单 = 合法跨模块接线（单体 feature 把依赖
+        # 注册进 app 壳的 pom，round65e 死因本体），绝不构成本模块跨物理 build 单元。只剔除
+        # 【仅由 manifest 证据主张、且 ≠本模块、且是既有基线模块】的根——本模块把真源码
+        # （strong/weak_code）落进外部模块仍保留为根（那是真跨模块 smell，不放行）；无
+        # project_path 无法证实既有基线 → 保守不剔（fail-closed）；两个都是新落点仍歧义
+        # （round62 alarm-api 保护不破）。
+        if project_path and len(_roots) > 1:
+            _foreign = {
+                r for r in _roots
+                if _roots_cls.get(r) == {_EV_MANIFEST}
+                and _is_existing_baseline_module(project_path, r, _exist_cache, base_ref)
+            }
+            # ★复核①CONFIRMED★ 只在剔除后本模块仍保有【自有锚根】(_own 非空)时才剔——否则
+            # =纯接线模块只改两个既有外部模块的 pom、无任何自有代码归属，本身就是真违①
+            # （哪个目录是它的家无法判），必须保持歧义硬判，绝不静默降级成 zero-dir 软 warn。
+            # （绝不用 `r != mod` 拿物理路径比契约标签——R58-1 二者常不等。）
+            # ★猎手 A 已知边界（移交 #67）★ aux 资源（_EV_AUX：模板/mapper XML/yml）不主张根，
+            # 故本模块把【自己的】资源误路由进外部既有模块（如 alarm 的 Mapper XML 落 ruoyi-admin）
+            # 与【合法】的单体视图模板落 admin 壳，在物理目录层不可分——round65e 合法案必须放行
+            # 模板→admin，无法在此拦误路由 mapper。资源↔模块【运行时绑定】coherence 是语义问题，
+            # 属 #67（MyBatis mapper XML/资源批 L1-L2 盲区）本职，非 G1 物理 build-dir coherence 范畴。
+            _own = _roots - _foreign
+            if _foreign and _own:
+                logger.info("[R65E-COHERENCE] 模块 %r 改既有外部模块 %s 的构建清单=合法接线，"
+                            "不计入本模块物理根判定（本模块自有根=%s）",
+                            mod, sorted(_foreign), sorted(_own))
+                _roots = _own
         if len(_roots) > 1:
             fp_ambiguous[mod] = sorted(_roots)
     # 违①：名字匹配落到 2+ 目录、且 file_plan/基线未把它消解到唯一目录 → 真歧义；file_plan 自身

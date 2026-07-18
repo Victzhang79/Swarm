@@ -655,6 +655,7 @@ def validate_file_plan_ownership(
 
 def validate_module_coherence(
     plan, *, project_path: str | None = None, file_plan: list | None = None,
+    base_ref: str | None = None,
 ) -> PlanValidationResult:
     """G1 ★真治本闸★（Task#9 审计①②）：每个模块解析到【恰好一个物理构建单元】。
 
@@ -691,7 +692,8 @@ def validate_module_coherence(
     # module→dir 扫描（forked-resolver 正是审计①病根；旧实现把尾部包名当第二个物理目录、
     # 确定性打回好 plan）。歧义/撞车的口径与脚手架**完全同源**：resolver 消歧（file_plan/基线
     # 覆盖名字匹配、扫到源码根即停）后仍未解的才是真违规，故绝不误伤惯例命名的单模块 plan。
-    resolved, ambiguous, collision = _resolve_module_dirs(plan, project_path, file_plan)
+    resolved, ambiguous, collision = _resolve_module_dirs(
+        plan, project_path, file_plan, base_ref=base_ref)
 
     # ① 一对多：一个模块散落到多个物理目录 = module≠单一 build 单元（file_plan/基线未能消歧）
     for mod, dirs in sorted(ambiguous.items()):
