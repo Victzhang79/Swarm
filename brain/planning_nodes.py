@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 from swarm.brain.nodes import (  # noqa: E402
     _brain_profile_prompt,
     _get_brain_llm,
+    _get_project_path,
     _parse_json_from_llm,
 )
 from swarm.brain.nodes.shared import parse_and_validate  # noqa: E402
@@ -2595,6 +2596,55 @@ async def elaborate(state: BrainState) -> dict:
     invest_fail = 0
     resplit_rounds = 0
     _max_resplit = _tier_limits()["elaborate_resplit"]
+
+    # ★R65E-T3（效率治本，round65e4 Agent A ~22min 浪费实测）★ 二次拆分的【LLM 环】（round65e4
+    # 每轮 ~11min）结构性改不了模块 coherence 违例——LLM resplit 只在【模块内】拆子任务，绝不动
+    # module 归属 / tech_design_file_plan。若 plan 已带【file_plan 通道】的 G1 硬违例，validate_plan
+    # 必打回本轮、全量重产，这一轮的 LLM resplit 是注定被丢弃的烧钱空转 → 跳过。
+    #
+    # ★复核 HIGH CONFIRMED 整改（soundness 要害）★ 预检【只】据 file_plan 通道（tech_design_file_plan
+    # 驱动的 fp_ambiguous），用【空 subtasks 探针】隔离——该通道 elaborate 全程不碰（state 级），
+    # 故"预检 invalid ⟹ validate_plan invalid"铁成立（validate_plan 的 fp_ambiguous 读同一份 file_plan，
+    # 有此违例 ambiguous 必非空、必 invalid，与 cands 无关）。★绝不据 plan.subtasks 的 cands 通道★：
+    # normalize_plan_scopes Rule-0 幻觉路径重定位会在【尾段】把 writable 迁到真目录、令 cands 违例
+    # invalid→valid 翻转（复核实测复现）；据它抢跳=对一个尾段会自愈的好 plan 误跳 resplit、超预算
+    # 子任务未拆直奔 dispatch。round65e4 死因本体正是 file_plan 通道 fp_ambiguous，覆盖无损。
+    # ★只跳 LLM 环★：确定性文件拆 `_split_oversized_by_files` 照跑（省的只是 LLM ~11min，且 doomed
+    # plan 必被 validate_plan 打回不进 dispatch）。gate 关（SWARM_MODULE_COHERENCE_GATE=0）→ validate
+    # 不据 coherence 打回 → 本预检亦不跳（严格与闸同步）。异常保守照常 resplit（不炸主链）。
+    _skip_llm_resplit_doomed = False
+    _mc_gate_on = os.environ.get(
+        "SWARM_MODULE_COHERENCE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
+    if _mc_gate_on:
+        try:
+            from types import SimpleNamespace as _NS
+
+            from swarm.brain.contract_utils import _resolve_module_dirs as _e_rmd
+            # 空 subtasks 探针 → resolver 的 cands 通道被清空，`ambiguous` 纯由 tech_design_file_plan
+            # 的 fp_ambiguous 驱动。shared_contract 保留以维持模块宇宙。★只据 ambiguous①（fp_ambiguous）★：
+            # 它源自 state 级 file_plan、elaborate 全程不碰 → 100% 不变；validate_plan 的 ambiguous ⊇
+            # 本 fp_ambiguous（读同一 file_plan），故非空 ⟹ validate_plan 必 invalid，铁成立。★绝不据
+            # collision②★：collision 由 out[mod] 物理目录解析得来，加入 plan.subtasks 的代码证据可能改
+            # out[mod]、把 probe 的 collision 解掉 → probe-only collision 非 elaborate-invariant、据它抢
+            # 跳会误伤尾段自愈的好 plan。project_path/base_ref 必须与 validate_plan 同源（#82/R65E-T1
+            # 既有基线接线的 fp_ambiguous 缩减要一致，否则 None 更保守=可能多判 ambiguous 致误跳）。
+            _probe = _NS(subtasks=[], shared_contract=getattr(plan_obj, "shared_contract", None) or {})
+            _e_out, _e_amb, _e_coll = _e_rmd(
+                _probe,
+                _get_project_path(state.get("project_id") or ""),
+                state.get("tech_design_file_plan") or [],
+                base_ref=state.get("base_commit"))
+            if _e_amb:
+                _skip_llm_resplit_doomed = True
+                logger.warning(
+                    "[ELABORATE] R65E-T3 plan 带 file_plan 通道 G1 一对多违①（%d 模块跨多物理目录）→ "
+                    "跳过本轮二次拆分的 LLM 环（validate_plan 必打回、LLM resplit 改不了 file_plan 归属，"
+                    "省一整轮重产烧钱）；确定性文件拆照跑、validate_plan 仍为唯一权威: %s",
+                    len(_e_amb), dict(list(_e_amb.items())[:2]))
+        except Exception as exc:  # noqa: BLE001 — 预检失败保守照常 resplit，绝不炸主链
+            logger.warning("[ELABORATE] R65E-T3 coherence 预检异常，保守照常 resplit（含 LLM 环）: %s",
+                           exc, exc_info=True)
+
     # 多轮：每轮找出"需再拆"的子任务，二次拆分替换，重新检查
     while resplit_rounds < _max_resplit:
         need_resplit = [st for st in plan_obj.subtasks if _needs_resplit(st, budget)]
@@ -2607,6 +2657,10 @@ async def elaborate(state: BrainState) -> dict:
             # 文件数超标 → 确定性按层拆(可复现、精准投喂)；纯上下文预算超标(文件少但大)→ LLM 拆。
             if _oversized_by_files(st):
                 children = _split_oversized_by_files(st)
+            elif _skip_llm_resplit_doomed:
+                # R65E-T3：file_plan-doomed 本轮 → 跳过 LLM 二次拆分（~11min 空转），确定性文件拆已在上
+                # 分支照跑；该 plan 必被 validate_plan 打回、不进 dispatch，未拆的 token 超预算项无外溢风险。
+                continue
             else:
                 children = await _resplit_subtask(st, state, budget)
             if children and len(children) > 1:
