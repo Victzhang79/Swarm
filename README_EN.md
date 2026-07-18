@@ -14,7 +14,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-3800%2B%20passing-brightgreen.svg)](#-how-the-system-itself-is-verified)
+[![Tests](https://img.shields.io/badge/tests-4900%2B%20passing-brightgreen.svg)](#-how-the-system-itself-is-verified)
 [![Version](https://img.shields.io/badge/version-0.9.58-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
@@ -257,7 +257,7 @@ Beneath the ladder sits a full **abort & recovery protocol** for systemic surpri
 
 A system that ships code for you must hold its own code to the same standard. **Swarm's engineering methodology is part of the product**:
 
-- **3800+ behavioral tests** run on a pristine PostgreSQL + Python 3.12 CI; every commit must be green. Tests assert **behavior, not structure** — refactors don't shatter them; bug fixes start with a red reproduction (test-first); when semantics deliberately evolve, old tests are explicitly updated with mechanism annotations, never quietly bent.
+- **4900+ behavioral tests** run on a pristine PostgreSQL + Python 3.12 CI; every commit must be green. Tests assert **behavior, not structure** — refactors don't shatter them; bug fixes start with a red reproduction (test-first); when semantics deliberately evolve, old tests are explicitly updated with mechanism annotations, never quietly bent.
 - **Every fix batch passes adversarial dual review**: an independent code-reviewer and a silent-failure-hunter review from opposite directions — one verifies claimed fixes actually hold, the other hunts swallowed exceptions, bad fallbacks, dead keys nobody reads, and "configured but never effective." Reviews name seven blind-spot classes (lock-key consistency, all call sites, lost work signals in terminal states, probe transience, thread topology, sticky-key lifecycle, fail-open symmetry); everything found is fixed in the same batch.
 - **The configuration surface is frozen with teeth**: all 200+ environment switches are registered in a single source of truth; adding a switch without registering turns CI red — the "every run uses a never-fully-verified config combination" hazard is institutionally eliminated. Frozen dev/e2e/prod profiles ship alongside.
 - **State-channel schema consistency is guarded**: the orchestration framework silently drops undeclared state keys (empirically verified), so "every key a node writes must be declared" is test-enforced — no dead features that write to nobody.
@@ -396,7 +396,7 @@ bash test/run_all.sh                                    # all tests
 .venv/bin/ruff check . --select E9,F63,F7,F82           # critical lint (same as CI)
 ```
 
-CI runs lint plus the full suite on pristine PostgreSQL (pgvector) + Python 3.12 (currently **3800+ passed**),
+CI runs lint plus the full suite on pristine PostgreSQL (pgvector) + Python 3.12 (currently **4900+ passed**),
 plus a Docker Smoke workflow for the three-container compose stack. Test discipline: **behavioral assertions first**,
 red reproduction before every bug fix, adversarial dual review (code-reviewer + silent-failure-hunter) on every batch.
 

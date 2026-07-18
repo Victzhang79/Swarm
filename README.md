@@ -14,7 +14,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-3800%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
+[![Tests](https://img.shields.io/badge/tests-4900%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
 [![Version](https://img.shields.io/badge/version-0.9.58-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
@@ -300,7 +300,7 @@ flowchart LR
 
 一个替你交付代码的系统，自己的代码必须经得起同样的标准。这也是我们最愿意展示的部分——**Swarm 的工程方法论本身就是产品的一部分**：
 
-- **3800+ 行为测试**在全新空 PostgreSQL + Python 3.12 的 CI 上全量跑，每个 commit 必绿才合入。测试写**行为断言**而非结构断言——不焊死实现，重构不脆；修 bug 先写红的复现测试（test-first），语义演进时旧测试按拍板显式更新并标注机制编号，绝不悄悄迁就。
+- **4900+ 行为测试**在全新空 PostgreSQL + Python 3.12 的 CI 上全量跑，每个 commit 必绿才合入。测试写**行为断言**而非结构断言——不焊死实现，重构不脆；修 bug 先写红的复现测试（test-first），语义演进时旧测试按拍板显式更新并标注机制编号，绝不悄悄迁就。
 - **每个修复批次经对抗性双复核**：独立的 code-reviewer 与 silent-failure-hunter 从相反方向审查——前者验证声称的修复真的成立，后者专门狩猎吞异常、坏回退、写了没人读的死键、"配置了但从未生效"。复核点名七类盲区（锁键一致性、全调用点、丢工作信号入终态、探针瞬时性、线程拓扑、粘滞键生命周期、fail-open 对称性），抓到的问题当批全部整改。
 - **配置面冻结有牙**：全部 200+ 环境开关登记为单一事实源，新增开关不登记则 CI 直接红——"每轮跑的是从未整体验证的配置组合"这类隐患被制度性消除；随附 dev/e2e/prod 三套冻结的推荐组合。
 - **状态通道 schema 一致性有守卫**：编排框架对未声明的状态键会静默丢弃（实证过），因此"节点写的每个键必须在 schema 声明"由测试强制——杜绝写了没人收到的死功能。
@@ -513,7 +513,7 @@ bash test/run_all.sh                                    # 全部测试
 .venv/bin/ruff check . --select E9,F63,F7,F82           # 关键 lint（CI 同款）
 ```
 
-CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **3800+ passed**）；
+CI 在全新空 PostgreSQL（pgvector）+ Python 3.12 环境下运行 lint 与全量测试（当前 **4900+ passed**）；
 另有 Docker Smoke 工作流对 compose 三容器栈做端到端冒烟。测试纪律：**行为断言优先**（不焊死实现结构）、
 修 bug 先写红的复现测试、每批改动过独立对抗双复核（code-reviewer + silent-failure-hunter）。
 
