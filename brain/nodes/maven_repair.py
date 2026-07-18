@@ -201,14 +201,14 @@ _DEP_REPAIR_DRIVERS = {
 }
 
 
-def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
-                                  granted: dict, subtask_results: dict) -> dict:
-    """按项目栈分发缺依赖确定性补全 driver。未覆盖栈返回 {}（loud，不静默）。"""
-    # 6.9-RF3：detect_stack 真实画像字段是 build（值=maven/gradle/pip/go/cargo…，
-    # _MANIFEST_BACKEND 口径）——旧键列表 ("build_system","backend","primary") 没有一个
-    # 存在于真实 schema，正常 E2E（画像必在）时 A2 治本被静默关闭、只有无画像才恢复
-    # 旧行为，与设计意图恰好相反（复核活体实证）。build_system 保留兼容测试/外部注入。
-    _keys = []
+def _stack_driver_keys(project_stack: dict | None) -> list[str]:
+    """从 stack 画像解析 dep-repair driver 候选键（inject/classify **共用**，口径不得分叉）。
+
+    6.9-RF3：detect_stack 真实画像字段是 build（值=maven/gradle/pip/go/cargo…，_MANIFEST_BACKEND
+    口径）——旧键列表 ("build_system","backend","primary") 没有一个存在于真实 schema，正常 E2E
+    （画像必在）时 A2 治本被静默关闭、只有无画像才恢复旧行为，与设计意图恰好相反（复核活体实证）。
+    build_system 保留兼容测试/外部注入。"""
+    _keys: list[str] = []
     if isinstance(project_stack, dict):
         for k in ("build", "build_system"):
             v = str(project_stack.get(k) or "").strip().lower()
@@ -221,6 +221,13 @@ def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str 
             _keys.extend(dk for dk in _DEP_REPAIR_DRIVERS if dk in _backend)
     if not _keys:
         _keys = ["maven"]  # 无画像时保留旧行为（Maven 是既有唯一实现）
+    return _keys
+
+
+def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
+                                  granted: dict, subtask_results: dict) -> dict:
+    """按项目栈分发缺依赖确定性补全 driver。未覆盖栈返回 {}（loud，不静默）。"""
+    _keys = _stack_driver_keys(project_stack)
     for k in _keys:
         drv = _DEP_REPAIR_DRIVERS.get(k)
         if drv is not None:
@@ -228,4 +235,61 @@ def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str 
     logger.warning(
         "[DEP-REPAIR] F9 栈 %s 暂无缺依赖补全 driver（Maven-only 现状），跳过确定性注入"
         "（可观测缺口，缺依赖交常规重试阶梯）", _keys[:3])
+    return {}
+
+
+def _classify_missing_maven_deps(project_path: str | None, granted: dict,
+                                 subtask_results: dict) -> dict:
+    """D2（round65e5 st-53-1）：把每个已授权失败子任务的缺失包分成【可自证补全 provisionable】与
+    【全仓无坐标 unprovisioned】两类（确定性、**不 mutate**）。
+
+    unprovisioned = 项目全仓 + 依赖 pom 均无提供该包的 <dependency> 坐标（`_find_maven_dep_for_pkg`
+    返 None）→ 极可能是臆造 import/API（st-53-1 `dev.samstevens.totp.generator` 幻觉子包实锤：jar 在
+    classpath、子包不存在），或真未 provision 的外部库。两者都**不该**靠"补依赖 + 授 pom 写权 + 重派"
+    救——补依赖无坐标可补、授 pom 写权反诱发小模型手改基线 pom 腐化。调用方据此给"改代码别加依赖"guidance。"""
+    out: dict = {}
+    if not project_path:
+        return out
+    for sid, mod_pom in (granted or {}).items():
+        from swarm.brain.nodes.shared import l1_details_of
+        det = l1_details_of((subtask_results or {}).get(sid))  # §3.2 收敛
+        blob = det.get("build_output") if isinstance(det.get("build_output"), str) else ""
+        if not blob:
+            try:
+                blob = json.dumps(det, ensure_ascii=False)
+            except (TypeError, ValueError):
+                blob = str(det)
+        prov: list[str] = []
+        unprov: list[str] = []
+        for pkg in _extract_missing_pkgs(blob):
+            if _find_maven_dep_for_pkg(project_path, pkg, mod_pom):
+                prov.append(pkg)
+            else:
+                unprov.append(pkg)
+        if prov or unprov:
+            out[sid] = {"provisionable": prov, "unprovisioned": unprov}
+    return out
+
+
+# D2：缺失包分类 driver（provisionable vs unprovisioned），与补全 driver 同键空间/同分发口径。
+_CLASSIFY_DRIVERS = {
+    "maven": _classify_missing_maven_deps,
+}
+
+
+def classify_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
+                                    granted: dict, subtask_results: dict) -> dict:
+    """D2：按项目栈分发缺失包分类 driver（provisionable vs unprovisioned）。未覆盖栈返回 {}（loud）。"""
+    _keys = _stack_driver_keys(project_stack)
+    for k in _keys:
+        drv = _CLASSIFY_DRIVERS.get(k)
+        if drv is not None:
+            return drv(project_path, granted, subtask_results)
+    # ★复核 F2 整改★ loud no-op 配 record_degrade（degrade 约定）：非 Maven 栈 D2 静默缺席时
+    # /api/metrics 亦可见，不只埋在 swarm.log。
+    from swarm.infra.degrade import record_degrade
+    record_degrade("brain.dep_classify.stack_uncovered")
+    logger.warning(
+        "[DEP-REPAIR] D2 栈 %s 暂无缺失包分类 driver（Maven-only 现状），跳过分类"
+        "（可观测缺口，退回既有恢复行为）", _keys[:3])
     return {}

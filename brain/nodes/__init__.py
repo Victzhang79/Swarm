@@ -128,12 +128,15 @@ from swarm.brain.nodes.maven_repair import (  # noqa: E402,F401
     _GROUP_RE,
     _MAVEN_GENERIC_SEG,
     _MISSING_PKG_BRAIN_RE,
+    _classify_missing_maven_deps,
     _extract_missing_pkgs,
     _find_maven_dep_for_pkg,
     _inject_dep_into_pom,
     _inject_missing_maven_deps,
     _iter_project_poms,
     _pkg_match_tokens,
+    _stack_driver_keys,
+    classify_missing_deps_for_stack,
 )
 # god-file 簇D：re-export AUDIT 安全审计节点（保 swarm.brain.nodes.X 可寻址；未被 patch）
 from swarm.brain.nodes.audit_node import _run_security_audit  # noqa: E402,F401

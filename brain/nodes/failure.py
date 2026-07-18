@@ -28,7 +28,10 @@ from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.types import Complexity, WorkerOutput
 
-from swarm.brain.nodes.maven_repair import inject_missing_deps_for_stack
+from swarm.brain.nodes.maven_repair import (
+    classify_missing_deps_for_stack,
+    inject_missing_deps_for_stack,
+)
 from swarm.brain.nodes.recovery import (
     _INTERNAL_BLOCKED_KINDS,
     _blocked_pkg_unrecoverable,
@@ -65,6 +68,70 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     """取子任务的 L1 详情（§3.2：委托 shared.l1_details_of 单一实现，本地名保 seam）。"""
     from swarm.brain.nodes.shared import l1_details_of
     return l1_details_of(subtask_results.get(fid))
+
+
+# ── D3（round65e5 st-53-1 R2 实锤）：授 pom 写权后小模型手改基线 pom 腐化 ──
+# R2：A2 授 pom 写权后，worker 把 `<groupId>` 手写成 `<group>`、毁 `<parent>` → 整棵 reactor
+# 解析期崩（`Unrecognised tag: 'group'` / `'parent.groupId' is missing`）。恒给"最小增量铁律"，
+# 从源头掐断手写腐化。★复核 HIGH 整改★ 铁律核心只讲【怎么改】、不臆断"已补好"——"已确定性补入"
+# 是【条件性】事实（unprovisioned-only 那轮 A2 没补任何东西），拆成 `_D3_DEP_ADDED_NOTE` 仅在确有
+# 注入/可自证依赖时才讲，否则会与 D2"此包全仓无坐标"自相矛盾、把假前提当硬约束喂给 worker。
+_D3_POM_IRON_LAW = (
+    "【pom 铁律】若改动 pom.xml，只允许在既有 <dependencies> 内【追加】一个 <dependency>，其余节点"
+    "逐字节不动，绝不重写 <groupId>/<parent>/<modelVersion>（写成 <group> 或毁 <parent> 会让整棵 "
+    "reactor 解析期崩）。"
+)
+_D3_DEP_ADDED_NOTE = (
+    "【依赖已补】本模块所缺的【可自证坐标】依赖已由系统据项目 pom 确定性补入——通常你无需再动 pom.xml"
+    "（如仍需改，严守上述铁律）。"
+)
+# ── D2（round65e5 st-53-1 R3 实锤）：缺失包在全仓+依赖树无坐标 = 臆造 import 或未引入的外部库 ──
+# ★复核 MEDIUM 整改★ 两种可能【等权】给出、由 worker 自判，避免强导向"你臆造了"而压制真需要的
+# 新外部库（首次合法使用某库时也会全仓无坐标）。仍明令"勿凭记忆臆造坐标"。
+_D2_UNPROVISIONED_TMPL = (
+    "【缺失包无坐标】{pkgs} 在项目全仓及依赖树中均无提供它的 Maven 依赖坐标。两种可能，请你自行判定："
+    "①你臆造了 import 或 API（引用了不存在的子包/类）→ 核对该库【真实存在的】API 与包路径、修正 import，"
+    "不要为不存在的包新增依赖坐标；②它是本项目尚未引入的必需外部库 → 在说明中标注你【确信准确】的坐标"
+    "并交人工确认。切勿凭记忆臆造 groupId/version。"
+)
+
+
+def _dep_recovery_retry_guidance(granted: dict, classification: dict,
+                                 injected: dict | None = None) -> dict:
+    """D2/D3（round65e5 st-53-1）：为授 pom 写权的失败子任务构造重派 guidance（纯函数、可测）。
+
+    返回 {sid: guidance_text}。
+    - D3 铁律（`_D3_POM_IRON_LAW`）**恒给**——纯讲"怎么改 pom 不腐化"，任何情形都成立。
+    - `_D3_DEP_ADDED_NOTE`（"已补入"）仅当本 sid 【确有注入】(`injected[sid]` 非空) 或有 provisionable
+      包时才给——否则那是假前提（复核 HIGH：会与 D2"全仓无坐标"矛盾）。
+    - D2（`_D2_UNPROVISIONED_TMPL`）仅当有 unprovisioned 包时给，点名该包、两种可能等权。
+    """
+    injected = injected or {}
+    out: dict = {}
+    for sid in (granted or {}):
+        cls = classification.get(sid) or {}
+        prov = cls.get("provisionable") or []
+        unprov = sorted(set(cls.get("unprovisioned") or []))
+        adds = [_D3_POM_IRON_LAW]
+        if injected.get(sid) or prov:
+            adds.append(_D3_DEP_ADDED_NOTE)
+        if unprov:
+            adds.append(_D2_UNPROVISIONED_TMPL.format(pkgs=unprov))
+        out[sid] = "\n".join(adds)
+    return out
+
+
+# D2/D3 guidance 行前缀标记：逐轮 replace 语义（剔旧标记行→并 fresh，防陈旧包列表堆叠）。
+_DEP_GUIDANCE_MARKERS = ("【pom 铁律】", "【依赖已补】", "【缺失包无坐标】")
+
+
+def _merge_dep_guidance_lines(prev: str, fresh: str) -> str:
+    """D2/D3 guidance replace 语义（纯函数、可测）：从 prev 剔除本机制旧标记行（保留 A4 诊断等其它
+    行），再并入本轮 fresh。★复核 MEDIUM/F4 整改★ 杜绝缺包集跨轮变化时陈旧包列表【堆叠】——旧实现
+    靠 `line not in text` 子串判定，只因模板标点巧合才不误吞，改动模板即脆。"""
+    kept = [ln for ln in (prev or "").split("\n")
+            if ln and not ln.startswith(_DEP_GUIDANCE_MARKERS)]
+    return "\n".join(kept + fresh.split("\n"))
 
 
 def _depends_reaches(plan_obj, src: str, dst: str) -> bool:
@@ -1341,6 +1408,45 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     logger.info(
                         "[HANDLE_FAILURE] 确定性补依赖（治本 A2，据项目自身 pom 自证坐标，"
                         "重派 worker 直接编过、不再耗配额）：%s", _dep_injected,
+                    )
+                # ── round65e5 st-53-1 治本 D2/D3：给授 pom 写权的重派 worker 精准 guidance ──
+                # D3：恒注入"最小增量铁律"防手写 pom 腐化（R2 实锤 <group>/毁 <parent>）。
+                # D2：缺失包在全仓+依赖树无坐标（幻觉/未 provision，如 R3 `.generator`）→ 追加
+                #     "改代码别加依赖"提示 + 记降级信号；补依赖救不了幻觉、授 pom 写权反诱发腐化。
+                try:
+                    _dep_cls = classify_missing_deps_for_stack(
+                        state.get("project_stack"),
+                        _proj_path_from_state(state), granted, subtask_results)
+                except Exception:  # noqa: BLE001 — 分类失败绝不阻断恢复（fail-open）
+                    # ★复核 F1 整改★ except 必配 record_degrade：否则"分类崩了"与"确实没
+                    # unprovisioned"在 /api/metrics 上无从区分（degrade 约定，见 infra/degrade）。
+                    from swarm.infra.degrade import record_degrade
+                    record_degrade("brain.handle_failure.dep_classify_error")
+                    logger.warning("[HANDLE_FAILURE] D2 缺失包分类异常（fail-open，退回既有恢复）",
+                                   exc_info=True)
+                    _dep_cls = {}
+                _rc_guidance = _dep_recovery_retry_guidance(granted, _dep_cls, _dep_injected)
+                for _gid, _gtext in _rc_guidance.items():
+                    _gst = _by_id.get(_gid)
+                    if _gst is None:
+                        # ★复核 F3 整改★ 现结构下不可达（granted ⊆ failed_ids ⊆ _by_id），但一旦未来
+                        # 授权/快照解耦，静默丢弃=R2 抗腐化铁律恰在最需要时消失且无痕——留响亮日志。
+                        logger.warning("[HANDLE_FAILURE] D2/D3 guidance 目标 sid %s 不在 plan → 丢弃"
+                                       "（不应发生，授权与 plan 快照解耦？）", _gid)
+                        continue
+                    if not _gtext:
+                        continue
+                    _gprev = getattr(_gst, "retry_guidance", "") or ""
+                    _gnew = _merge_dep_guidance_lines(_gprev, _gtext)  # replace 语义（可测）
+                    if _gnew != _gprev:
+                        _gst.retry_guidance = _gnew
+                if any((v.get("unprovisioned") for v in _dep_cls.values())):
+                    from swarm.infra.degrade import record_degrade
+                    record_degrade("brain.handle_failure.dep_unprovisioned")  # D2 信号
+                    logger.warning(
+                        "[HANDLE_FAILURE] D2：缺失包在全仓+依赖树无自证坐标（幻觉/未 provision）→ "
+                        "已注入'改代码别加依赖'guidance，不再靠补依赖空烧：%s",
+                        {k: v.get("unprovisioned") for k, v in _dep_cls.items() if v.get("unprovisioned")},
                     )
                 # D2 复核 CONFIRMED：无产出放弃者（revert 路，已 pop 出 subtask_results）
                 # 不得入链——_is_ready 对其永不就绪，入链=新授权任务被自己刚加的边扣死
