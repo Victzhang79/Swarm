@@ -1684,13 +1684,22 @@ def _extract_auth_templates(desc: str) -> list[tuple[str, str]]:
     return out
 
 
+def _strip_pom_exclusions(text: str) -> str:
+    """R65E2-T1（猎手 F1）：剔除 `<exclusions>…</exclusions>` 子区——Maven exclusion 是
+    【禁入某传递依赖】的声明，其 <artifactId> 绝不是本模块的直接依赖，也绝不是"禁入守卫
+    负断言与模板正面矛盾"的证据（禁 log4j 的 exclusion 被误读成"要求 log4j"→剔除合法禁入
+    守卫+注入假正断言）。"""
+    import re as _re
+    return _re.sub(r"<exclusions>.*?</exclusions>", "", text or "", flags=_re.S)
+
+
 def _template_dep_artifacts(tpl: str) -> list[str]:
     """模板 <dependencies> 区的 artifactId 清单（去重保序；parent/自身声明天然不在区内）。"""
     import re as _re
     seg = (tpl or "").split("<dependencies>", 1)
     if len(seg) < 2:
         return []
-    body = seg[1].split("</dependencies>", 1)[0]
+    body = _strip_pom_exclusions(seg[1].split("</dependencies>", 1)[0])   # 猎手 F1：排除 <exclusions>
     return list(dict.fromkeys(
         a.strip() for a in _re.findall(r"<artifactId>([^<]+)</artifactId>", body)
         if a.strip()))
@@ -1721,6 +1730,7 @@ def _is_pom_content_assert(cmd: str, pom: str) -> bool:
             r"(^|[\s'\"=(])" + _re.escape(pom) + r"($|[\s'\")])", c):
         return False
     return bool(c.startswith("grep ")
+                or _re.match(r'^!\s*grep\s', c)   # R65E2-T1：`! grep …` 排除断言（round65e2 死因变体）
                 or _re.match(r'^test\s+-[zn]\s+["\']?\$\(\s*grep', c))
 
 
@@ -1762,6 +1772,7 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
             staged_acc = list(getattr(st, "acceptance_criteria", []) or [])
             for pom, tpl in tpls:
                 deps = _template_dep_artifacts(tpl)
+                _tpl_scan = _strip_pom_exclusions(tpl)   # 猎手 F1：冲突判定不看 <exclusions> 内的禁入项
                 tpl_asserts = [f"grep -q '<artifactId>{a}</artifactId>' {pom}"
                                for a in deps]
                 if h is not None:
@@ -1770,15 +1781,23 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                         if vc in tpl_asserts or not _is_pom_content_assert(vc, pom):
                             kept.append(vc)
                             continue
-                        neg = bool(_re.match(r"^test\s+-[zn]", vc.strip()))
+                        _s = vc.strip()
+                        # R65E2-T1（round65e2 死因）：`! grep X` 与 `test -z/-n "$(grep X)"` 同为
+                        # 负断言。旧识别只认 test -z/-n → st-1 的 `! grep -qE 'ruoyi-(...)'` 被漏识、
+                        # 无条件 KEPT，与模板正断言 grep ruoyi-common 共存=verify 互斥死局。
+                        _is_neg_grep = bool(_re.match(r"^!\s*grep", _s))
+                        neg = bool(_re.match(r"^test\s+-[zn]", _s)) or _is_neg_grep
                         pat = _exam_grep_pattern(vc)
                         if neg:
-                            if (pat and _re.match(r"^test\s+-z", vc.strip())
-                                    and _exam_pattern_hits(pat, tpl)):
+                            # 排除断言（`test -z "$(grep X)"` 或 `! grep X` 皆断言"X 不得出现"）与
+                            # 权威模板正面矛盾（pattern 命中模板=模板要求 X 存在）→ 剔除+留痕。
+                            # `test -n`（断言 X 存在）不是排除断言，不在此列（原语义保持）。
+                            _is_exclusion = _is_neg_grep or bool(_re.match(r"^test\s+-z", _s))
+                            if pat and _is_exclusion and _exam_pattern_hits(pat, _tpl_scan):
                                 logger.warning(
                                     "[R65D-T2] %s 验收负断言与权威模板正面矛盾"
                                     "（pattern=%r 在模板中存在）→ 剔除+留痕"
-                                    "（st-26 四面矛盾死型在规划期现形）: %s",
+                                    "（st-26 四面矛盾死型在规划期现形；round65e2 `! grep` 变体）: %s",
                                     st.id, pat, vc)
                                 rec["dropped_verify"].append(vc)
                             else:
@@ -1801,6 +1820,18 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                             new_acc.append(rule5_line)
                             if a != rule5_line:
                                 rec["acceptance_rewritten"] += 1
+                        continue
+                    # R65E2-T1（猎手 F4）：acceptance 自然语言排除条目（"不包含/不得包含/零 X 依赖"）
+                    # 命名了模板【要求】的依赖 → 与模板正面矛盾（round65e2 st-1 "不包含 ruoyi-common"
+                    # ↔ 模板含 ruoyi-common）→ 剔除+留痕，令 acceptance 与 verify/模板同源自洽（否则
+                    # 下游 CONFIRM/judge 或 worker 读 NL 条目仍被导回原矛盾）。
+                    if (deps and _re.search(r"不包含|不得包含|不应包含|零\s*(?:RuoYi|ruoyi)?\s*依赖", a)
+                            and any(d in a for d in deps)):
+                        logger.info(
+                            "[R65D-T2] %s 验收 NL 排除条目命名了模板要求的依赖 %s → 剔除"
+                            "（acceptance 与模板同源，round65e2 `不包含 X` 变体）: %s",
+                            st.id, [d for d in deps if d in a], a[:80])
+                        rec["acceptance_rewritten"] += 1
                         continue
                     new_acc.append(a)
                 auth_line = (f"依赖清单以 description 中【权威 pom 模板】（{pom}）字面为准"
