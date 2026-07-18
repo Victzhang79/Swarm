@@ -35,7 +35,7 @@ if psql "$PG_URI" -tAc "select 1" >/dev/null 2>&1; then
   ok "PostgreSQL 可达（public 表 ${TBLS:-?} 张）"
   [ "${TBLS:-0}" -lt 3 ] 2>/dev/null && warn "表数偏少，可能未建表：跑 python scripts/init_db.py"
 else
-  bad "PostgreSQL 不可达（$PG_URI）—— 必需，起 brew services start postgresql@16"
+  bad "PostgreSQL 不可达（${PG_URI}）—— 必需，起 brew services start postgresql@16"
 fi
 
 # ── Redis（按开关判定；专检错配）──
@@ -60,7 +60,7 @@ if curl -sf -m3 "$QDRANT_URL/healthz" >/dev/null 2>&1; then
   NC_=$(curl -sf -m3 "$QDRANT_URL/collections" 2>/dev/null | grep -oE '"name"' | wc -l | tr -d ' ')
   ok "Qdrant 可达（${NC_:-?} 个 collection）"
 else
-  warn "Qdrant 不可达（$QDRANT_URL）→ KB 语义检索降级（结构化 KB 仍可用，非硬失败）"
+  warn "Qdrant 不可达（${QDRANT_URL}）→ KB 语义检索降级（结构化 KB 仍可用，非硬失败）"
 fi
 
 # ── Sandbox（worker 执行；root 常返 404=服务在）──
@@ -69,7 +69,7 @@ if [ -n "$SANDBOX_URL" ]; then
   if [ "$scode" != "000" ]; then
     ok "Sandbox 可达（$SANDBOX_URL -> HTTP ${scode}, worker 沙箱执行依赖它）"
   else
-    bad "Sandbox 不可达（$SANDBOX_URL）—— worker 无法执行，确认沙箱机 IP/端口"
+    bad "Sandbox 不可达（${SANDBOX_URL}）—— worker 无法执行，确认沙箱机 IP/端口"
   fi
 else
   warn "SWARM_SANDBOX_API_URL 未设 → worker 走本机执行（须自备目标栈工具链）"
