@@ -320,7 +320,7 @@ def _near_miss_hint(bad_id: str, known_ids) -> str:
 
 
 def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
-                          baseline_vocab=None) -> dict:
+                          baseline_vocab=None, baseline_ineligible=None) -> dict:
     """覆盖矩阵 = 从 plan.subtasks[].covers 现算的【派生数据】。
 
     定案（ACCEPTANCE_DESIGN 新键清单）：矩阵绝不进 state——它完全由 plan 与
@@ -378,13 +378,19 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
         from swarm.brain.baseline_candidates import baseline_claims_missing_evidence
         _evidenceless = set(baseline_claims_missing_evidence(
             baseline_norm, valid_items, baseline_vocab))
+    # R65E9-T1：曾被证据闸判假的 baseline id 单调累积集——【无条件】踢出合法 baseline（不看 vocab/
+    # reason/evidence），逼其落 uncovered→建 covers 子任务。治 round65e9 死钉：被拒 baseline req 陷
+    # limbo（非 covered 非 unplanned）→planner 每 retry 重 declare 同一 req→3-retry 耗尽 FAILED@PLAN。
+    # 缺省 None→逐字节向后兼容（既有调用点行为不变）。
+    _ineligible: set[str] = {str(x).strip() for x in (baseline_ineligible or []) if str(x).strip()}
     baseline_valid: list[dict] = []
     dangling_baseline: list[str] = []
     baseline_ids: set[str] = set()
     for entry in baseline_norm:
         if entry["id"] not in covered_by:
             dangling_baseline.append(entry["id"])
-        elif entry["reason"] and entry["id"] not in _evidenceless:
+        elif (entry["reason"] and entry["id"] not in _evidenceless
+              and entry["id"] not in _ineligible):
             baseline_valid.append(entry)
             baseline_ids.add(entry["id"])
     items_out: list[dict] = []
@@ -823,6 +829,7 @@ def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> l
 
 def validate_requirement_coverage(
     plan, requirement_items, baseline_covered=None, baseline_vocab=None,
+    baseline_ineligible=None,
 ) -> PlanValidationResult:
     """S2-3 确定性覆盖校验维度（validate_plan 内、结构校验+SIMPLE 早退之后调用）。
 
@@ -837,7 +844,10 @@ def validate_requirement_coverage(
     失败 issues 逐条带条目 id+text：D09 回灌反馈的具体性决定 PLAN LLM 能否修对。
     """
     result = PlanValidationResult(valid=True)
-    matrix = build_coverage_matrix(plan, requirement_items, baseline_covered)
+    # R65E9-T1：baseline_ineligible（曾被证据闸判假的 baseline id 单调集）传入矩阵 → pinned id 无条件
+    # 落 uncovered → 走"未覆盖·分配子任务"出口（而非重复陷 baseline limbo）。缺省 None=行为不变。
+    matrix = build_coverage_matrix(plan, requirement_items, baseline_covered,
+                                   baseline_ineligible=baseline_ineligible)
     known_ids = [row["id"] for row in matrix["items"]]
     for item in matrix["uncovered"]:
         # R31-1：文案必须教申报通道——round31 实证 PLAN 拒绝为存量已有能力造子任务

@@ -2083,14 +2083,18 @@ async def _maybe_surgical_coverage_topup(state):
     # 裸抛会经 plan() 冒泡把整任务打成 FAILED。异常时保守让路全量重拆（退回无 vocab 口径）并留痕。
     _bvocab = await _baseline_vocab_for(state)
     _fp_for_gap = state.get("tech_design_file_plan") or []
+    # R65E9-T1 复核 F2：累积 pin 也喂 P1 闸——vocab fail-open("")的轮里，往轮已判假的 baseline
+    # 若无 pin 兜底会在此重新算作已覆盖→uncovered=0→P1「覆盖已满足」return None→limbo 复发。
+    _bineligible = state.get("baseline_ineligible_reqs") or []
     try:
         _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"),
-                                        baseline_vocab=_bvocab)
+                                        baseline_vocab=_bvocab, baseline_ineligible=_bineligible)
     except Exception as exc:  # noqa: BLE001 — vocab 路径异常绝不炸主链
         from swarm.infra.degrade import record_degrade
         record_degrade("brain.plan.p1_baseline_vocab_matrix_error")
         logger.warning("[PLAN] R65E7-L1 P1 闸 baseline_vocab 矩阵异常（退回无 vocab 口径，不炸主链）: %s", exc)
-        _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"))
+        _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"),
+                                        baseline_ineligible=_bineligible)
     if not _matrix["uncovered"] and not _matrix["dangling_covers"]:
         return None  # 覆盖已满足——失败来自别处，回退常规路径
     # R65E7 复核 HIGH（外科 vs 上游根治的排序冲突）：若某未覆盖需求【确属漏排】（file_plan 无落点、
@@ -2722,7 +2726,8 @@ def _confirm_coverage_summary(state: BrainState) -> dict:
         from swarm.brain.plan_validator import build_coverage_matrix
         matrix = build_coverage_matrix(
             state.get("plan"), state.get("requirement_items"),
-            state.get("baseline_covered"))
+            state.get("baseline_covered"),
+            baseline_ineligible=state.get("baseline_ineligible_reqs"))  # R65E9-T1 F2：诚实展示
         return {
             "total": matrix["total_items"],
             "covered": matrix["covered_items"],
@@ -2764,6 +2769,23 @@ def _coverage_gap_allowance(total: int) -> int:
     except ValueError:
         _ratio = 0.03
     return max(max(0, _max), int(max(0, total) * max(0.0, _ratio)))
+
+
+def _r65e9_ineligible_feedback(new_rejected: list[str] | None) -> str:
+    """R65E9-T1：把本轮被证据闸判假的 baseline_covered id 明确回灌 PLAN——告诉 planner 这些 req
+    的存量声明已被判定【缺基线证据】，下一轮【绝不能再申报 baseline_covered】，必须分配子任务并在
+    其 covers 声明该 ID（新功能就老实实现，别再谎称存量）。纯函数、可单测；空→空串（不产噪声）。"""
+    ids = [str(x).strip() for x in (new_rejected or []) if str(x).strip()]
+    if not ids:
+        return ""
+    listed = "、".join(ids[:30])
+    more = f"（另有 {len(ids) - 30} 条同理）" if len(ids) > 30 else ""
+    return (
+        f"\n⛔ 以下 {len(ids)} 条需求的 baseline_covered（存量已满足）申报已被【基线证据闸】判定"
+        f"缺乏基线证据（判别术语在现有代码符号/文件索引中零命中）：{listed}{more}。"
+        "基线【极可能】并无这些能力（更可能是新功能）。下一轮【禁止】再对这些 ID 申报 "
+        "baseline_covered——须为每条分配子任务实现并在其 covers 声明该 ID；"
+        "若确信系存量，其能力术语必与现有代码符号/文件名有别，请改用真实存在该能力的类名/文件名作证。\n")
 
 
 def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
@@ -3054,15 +3076,33 @@ async def validate_plan(state: BrainState) -> dict:
     # H-F5：A6 缺口残差（last-write-wins 键 coverage_gap_residual 的本轮值）——
     # None=本轮未做覆盖裁决不发键；[]=全覆盖清空；非空=gap 放行残差。
     _gap_residual: list[str] | None = None
+    # R65E9-T1：本轮生效的【假 baseline 不合格集】= 状态累积（往轮拒绝）∪ 本轮新拒绝。
+    # 立即生效（非滞后）：本轮新拒的假 baseline 当轮即被踢出合法 baseline→落 uncovered→逼建
+    # covers 子任务，省一轮 retry 预算（round65e9 死钉就死在 3-retry 预算耗尽的边缘）。
+    _pinned_prev = [str(x).strip() for x in (state.get("baseline_ineligible_reqs") or [])
+                    if str(x).strip()]
+    _bl_vocab = None
+    _new_rejected: list[str] = []
+    if _coverage_gate_on and _req_items:
+        _bl_vocab = await _baseline_vocab_for(state)   # R65E6-T1 假 baseline_covered 证据闸
+        if _bl_vocab:
+            from swarm.brain.baseline_candidates import baseline_claims_missing_evidence
+            _new_rejected = list(baseline_claims_missing_evidence(
+                state.get("baseline_covered"), _req_items, _bl_vocab))
+    _pinned_all = _pinned_prev + [r for r in _new_rejected if r not in _pinned_prev]
     if _coverage_gate_on and _req_items:
         from swarm.brain.plan_validator import build_coverage_matrix, covered_req_ids
-        _wm_matrix = build_coverage_matrix(plan_obj, _req_items, state.get("baseline_covered"))
+        _wm_matrix = build_coverage_matrix(plan_obj, _req_items, state.get("baseline_covered"),
+                                           baseline_ineligible=_pinned_all)
         _wm_cov_ids = covered_req_ids(_wm_matrix)
         # 相对水位的丢失（与当前清单求交——陈旧 id 过滤，永不误杀）
         _known_ids = {str(it.get("id") or "").strip() for it in _req_items
                       if isinstance(it, dict)}
-        _lost_ids = (set(str(x) for x in (state.get("coverage_watermark") or []))
-                     & _known_ids) - set(_wm_cov_ids)
+        # R65E9-T1 复核 F3：pinned（不合格 baseline）id 从水位丢失集中排除——它是【故意】被踢成
+        # must-implement，不是"倒退需恢复"。否则 _wm_loss_feedback 会给出"或以 baseline_covered
+        # 重新申报"的补救，而那对 pinned id 已被无条件封死→LLM 在"申报 baseline"与"被拒"间震荡。
+        _lost_ids = ((set(str(x) for x in (state.get("coverage_watermark") or []))
+                      & _known_ids) - set(_wm_cov_ids) - set(_pinned_all))
         if _lost_ids:
             _txt_by_id = {it["id"]: it["text"] for it in _wm_matrix["items"]}
             _wm_lost = [{"id": rid, "text": _txt_by_id.get(rid, "")}
@@ -3083,7 +3123,7 @@ async def validate_plan(state: BrainState) -> dict:
     if not _coverage_gate_on or not _req_items:
         pass  # 上方已按跳过分支留痕
     else:
-        _bl_vocab = await _baseline_vocab_for(state)   # R65E6-T1 假 baseline_covered 证据闸
+        # R65E9-T1：_bl_vocab 已在上方（覆盖矩阵前）算好并据此得 _new_rejected/_pinned_all。
         if not _bl_vocab and (state.get("baseline_covered") or []):
             # hunter F2：有 baseline_covered 申报却 vocab 空 = 证据闸对【真实存在的申报】静默失效
             # （最高危：假申报正是此时溜过）——留机读账，别与"本轮无申报"混同。
@@ -3092,8 +3132,15 @@ async def validate_plan(state: BrainState) -> dict:
             logger.warning("[PLAN] R65E6-T1 有 %d 条 baseline_covered 申报但基线 vocab 为空 → "
                            "证据闸本轮未生效（申报未经基线核验放行）",
                            len(state.get("baseline_covered") or []))
+        if _new_rejected:
+            logger.warning(
+                "[VALIDATE_PLAN] R65E9-T1 假 baseline_covered 钉入不合格集（本轮新增 %d：%s；"
+                "累计 %d）→ 无条件踢出 baseline、逼建 covers 子任务（打断 limbo 死钉）",
+                len(_new_rejected), _new_rejected[:10],
+                len(set(_pinned_all)))
         cov_result = validate_requirement_coverage(
-            plan_obj, _req_items, state.get("baseline_covered"), baseline_vocab=_bl_vocab)
+            plan_obj, _req_items, state.get("baseline_covered"), baseline_vocab=_bl_vocab,
+            baseline_ineligible=_pinned_all)
         for w in cov_result.warnings:
             _vp_warnings.append(str(w))
             logger.info("[VALIDATE_PLAN] 覆盖矩阵警告: %s", w)
@@ -3153,10 +3200,14 @@ async def validate_plan(state: BrainState) -> dict:
                 # A9：超帽按 retry 轮分页轮转（LLM 修不了看不见的条目）。
                 "plan_validation_feedback": (
                     _wm_loss_feedback()
+                    + _r65e9_ineligible_feedback(_new_rejected)
                     + _format_validation_feedback(cov_result.issues, rotate=retry_count)),
                 # 阶段3.1：失败 attempt 已达成的覆盖也入水位（round37 震荡发生在多轮
                 # attempt 之间——不记则下一轮丢了它无人知晓）。reducer 并集，绝不缩水。
                 "coverage_watermark": _wm_cov_ids,
+                # R65E9-T1：本轮新拒的假 baseline id 入单调不合格集（reducer append+dedup 累积）→
+                # 下一轮 planner 再 declare 亦被无条件踢→逼建子任务，打断 limbo 死钉（保证收敛）。
+                "baseline_ineligible_reqs": _new_rejected,
             }
         if _gap_allowed_pass:
             _gap_ids = [u["id"] for u in _wm_matrix["uncovered"]]
@@ -3302,6 +3353,10 @@ async def validate_plan(state: BrainState) -> dict:
         # 只会在有效计划之后消费）。
         **({"coverage_gap_residual": _gap_residual}
            if (plan_valid and _gap_residual is not None) else {}),
+        # R65E9-T1 复核 F1（HIGH）：本轮新拒的假 baseline id 必须在【所有】退出路径持久化——
+        # 尤其 A6 缺口放行落到本 success 返回时（hard-reject 返回已单独 emit）。否则 A6 门放行的
+        # 假 baseline 未入不合格集→后续 replan 又陷 limbo（打地鼠从 A6 门复发）。reducer append+dedup。
+        **({"baseline_ineligible_reqs": _new_rejected} if _new_rejected else {}),
         # F10：结构签名 last-write-wins（重试轮据此跳过未变结构的软校验）。
         # 阶段3.9 复核 H-F6/R-F5（CONFIRMED）：只在真放行时 emit——否决轮也发签名会让
         # 下一轮结构相同的计划命中 _soft_skip 直接 valid（硬 LLM 门被静默转放行；
@@ -4594,7 +4649,8 @@ def _deliver_review_payload(state: BrainState) -> dict:
         from swarm.brain.plan_validator import build_coverage_matrix
         matrix = build_coverage_matrix(
             state.get("plan"), state.get("requirement_items"),
-            state.get("baseline_covered"))
+            state.get("baseline_covered"),
+            baseline_ineligible=state.get("baseline_ineligible_reqs"))  # R65E9-T1 F2：诚实交付报告
         coverage = {
             "total": matrix["total_items"],
             "covered": matrix["covered_items"],

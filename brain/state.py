@@ -178,6 +178,15 @@ class BrainState(TypedDict, total=False):
     # 回灌 D09 feedback + 覆盖闸通过仍倒退时硬 invalid（A6 degraded 放行后 load-bearing
     # 硬地板）。陈旧 id（清单外）在比对时被过滤，永不误杀；本键绝不需要清空（任务级单调）。
     coverage_watermark: Annotated[list[str], _merge_degraded_reasons]
+    # R65E9-T1（round65e9 FAILED@PLAN 三路定案·下游机制根）：被证据闸判为【假 baseline_covered】
+    # （申报存量但基线符号/文件索引零命中）的 req id 全集，单调累积（append+dedup reducer）。
+    # 死因：baseline_covered=last-write-wins/feedback=oneshot（记忆缺失）→被拒 req 陷 limbo（非
+    # covered 非 unplanned）→L2 file-replan 跳过→planner 每 retry 重 declare 同一 req→死钉耗尽
+    # 3-retry→FAILED@PLAN（req-feaae262 Redis 诊断，基线真无 Redis）。治：validate_plan 每轮 emit
+    # 本轮被拒 baseline id → 单调累积；build_coverage_matrix 无条件把 pinned id 踢出合法 baseline →
+    # 落 uncovered → 逼 planner 建 covers 子任务（进 L2 replan），且 PLAN 提示告知不得再 declare。
+    # 陈旧 id（清单外）比对时过滤，永不误杀；任务级单调，绝不需清空。
+    baseline_ineligible_reqs: Annotated[list[str], _merge_degraded_reasons]
     # 阶段3.9 复核 H-F5（CONFIRMED）：A6 缺口 degraded 放行的残差 req id——独立
     # last-write-wins 键（不进 append-only degraded_reasons：那里无人能清，缺口后来被
     # 补齐仍永久拦 L6+deliver 展示陈旧缺口）。validate_plan 真放行时 emit：gap 放行=
@@ -294,6 +303,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "plan_batch_failed_modules": "round",
     "baseline_covered": "round",
     "coverage_watermark": "monotonic",
+    "baseline_ineligible_reqs": "monotonic",  # R65E9-T1：拒掉的假 baseline_covered id 单调累积
     "coverage_gap_residual": "round",   # A6 残差 last-write-wins：gap 放行覆写/全覆盖清空（3.9 H-F5）
     "plan_soft_review_sig": "round",    # 只在真放行时 emit，否决轮发空串（3.9 H-F6/R-F5）
     "plan_validation_prev_structural": "round",  # R64-T3：G1 失败轮整体替换；retry 绑定免疫陈旧残留
