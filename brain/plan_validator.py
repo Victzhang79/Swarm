@@ -319,7 +319,8 @@ def _near_miss_hint(bad_id: str, known_ids) -> str:
     return f"（可能想引用 {matches[0]}？）" if len(matches) == 1 else ""
 
 
-def build_coverage_matrix(plan, requirement_items, baseline_covered=None) -> dict:
+def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
+                          baseline_vocab=None) -> dict:
     """覆盖矩阵 = 从 plan.subtasks[].covers 现算的【派生数据】。
 
     定案（ACCEPTANCE_DESIGN 新键清单）：矩阵绝不进 state——它完全由 plan 与
@@ -367,13 +368,23 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None) -> dic
     # R31-1 T1：baseline 申报分拣——清单内且带理由=合法覆盖；清单外=dangling（臆造）。
     # 空 reason 的申报既不算覆盖也不进 baseline 桶（validate 层对它出专项 issue）。
     baseline_norm = normalize_baseline_covered(baseline_covered)
+    # R65E7-L1（P1 盲区兜底）：传入 baseline_vocab 时，把【无基线证据】的假 baseline 申报（T1 口径
+    # 同源 baseline_claims_missing_evidence）踢出覆盖——否则 P1 外科闸的 build_coverage_matrix 见假
+    # baseline 在 baseline_ids→算已覆盖→uncovered=0→「覆盖已满足」return None→回退全量重拆丢覆盖回归
+    # （round65e7 FAILED@PLAN 振荡真因）。不传 vocab→逐字节向后兼容（既有调用点行为不变）。
+    # fail-open：vocab 空→baseline_claims_missing_evidence 返 []→不踢（缺索引不误伤合法存量申报）。
+    _evidenceless: set[str] = set()
+    if baseline_vocab:
+        from swarm.brain.baseline_candidates import baseline_claims_missing_evidence
+        _evidenceless = set(baseline_claims_missing_evidence(
+            baseline_norm, valid_items, baseline_vocab))
     baseline_valid: list[dict] = []
     dangling_baseline: list[str] = []
     baseline_ids: set[str] = set()
     for entry in baseline_norm:
         if entry["id"] not in covered_by:
             dangling_baseline.append(entry["id"])
-        elif entry["reason"]:
+        elif entry["reason"] and entry["id"] not in _evidenceless:
             baseline_valid.append(entry)
             baseline_ids.add(entry["id"])
     items_out: list[dict] = []

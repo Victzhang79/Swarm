@@ -429,13 +429,16 @@ async def analyze(state: BrainState) -> dict:
     }
 
 
-def _format_tech_design_for_plan(state: BrainState) -> str:
+def _format_tech_design_for_plan(state: BrainState, file_plan_override=None) -> str:
     """把 tech_design 产出（file_plan + 数据模型 + 契约）格式化给 PLAN，作为定 scope 的权威依据。
 
     空（未经 tech_design 或失败）→ 返回提示让 PLAN 回退自推导。
+    file_plan_override（R65E7-L2）：传入时用它替代 state 里的 file_plan——令 L2 补排的新文件进入
+    单发拆解 prompt（否则 prompt 用增广前的旧 file_plan，L2 对非批量路径变哑操作，复核 HIGH）。
     """
     td = state.get("tech_design") or {}
-    file_plan = state.get("tech_design_file_plan") or []
+    file_plan = (file_plan_override if file_plan_override is not None
+                 else state.get("tech_design_file_plan") or [])
     if not file_plan and not td.get("data_model"):
         return "（无技术设计方案——请据项目结构/知识库自行推导要建/改的文件）"
     lines: list[str] = []
@@ -782,6 +785,156 @@ async def _baseline_vocab_for(state) -> str:
         record_degrade("brain.plan.baseline_vocab_unavailable")   # hunter F1：崩溃≠干净，metrics 可分
         logger.warning("[PLAN] R65E6-T1 baseline vocab 降级为空（不阻断，证据闸本轮关闭）：%s", e)
         return ""
+
+
+# ── R65E7-L2（上游根治）：确保 file_plan 覆盖每条已抽取需求 ──────────────────────────
+# round65e7 FAILED@PLAN 真因：tech_design 从 PRD 原文产 file_plan、requirement_items 另路抽取，二者
+# 无覆盖交叉核验；2FA/SHA512 等在 183 file_plan 里 0 文件 → 无子任务能覆盖 → 只能被谎报 baseline →
+# T1 正确连拦 4 pass → 恢复环无法 materialize（无文件可挂）→ 3 retry 耗尽 → CONFIRM fail-fast → FAILED。
+# 治本：PLAN 分批拆解【前】确定性检出"有判别 token 但 file_plan 未排、基线亦无"的需求，定向反馈
+# 设计 LLM 补排文件（栈感知，绝不引栈外技术）→ 合并进 file_plan → plan_batch 自然为其建子任务。
+_PLAN_COVERAGE_DESIGN_SYSTEM = (
+    "你是 file_plan 补排助手。已生成的技术方案 file_plan 漏排了若干【确属新功能、现有代码库中不存在】"
+    "的需求所需的文件。你只为这些漏排需求设计最小 file_plan 条目，严格遵循给定的项目技术栈——绝不引入"
+    "栈外技术（如服务端模板项目里不得设计 Vue/SPA 前端；若需求点名的技术与栈冲突，改设计该栈的等价实现）。"
+)
+
+
+async def _design_files_for_unplanned(llm, unplanned_items, project_stack,
+                                      existing_modules, fallback_llm=None):
+    """对 unplanned 需求做一次定向 file_plan 补排设计。返回新 file_plan 条目 list（可空）。
+    臆造/越权（缺 path/module）由调用方 merge 时校验剔除。栈感知：绝不引栈外技术。"""
+    _req_lines = "\n".join(
+        f"- {it['id']} {str(it.get('text') or '')[:200]}"
+        for it in unplanned_items if isinstance(it, dict) and it.get("id"))
+    _mods = ", ".join(existing_modules) if existing_modules else "（无既有模块）"
+    _user = (
+        f"项目技术栈（权威，必须遵循）：{project_stack or '未知（据既有模块推断）'}\n"
+        f"既有物理模块：{_mods}\n\n"
+        f"## 漏排的新功能需求（现有代码库无此能力，须新建文件实现）\n{_req_lines}\n\n"
+        "为上面每条需求设计实现所需的最小 file_plan 条目（新建文件）。文件应落到最合适的【既有模块】"
+        "（棕地：新功能加进既有模块，绝不另造带独立构建清单的子模块）。路径须符合项目真实栈约定。"
+        "只输出 JSON（不要多余文字）：\n"
+        '{"file_plan":[{"path":"完整相对路径","module":"物理模块名","responsibility":"该文件职责"}]}'
+    )
+    _messages = [
+        {"role": "system", "content": _PLAN_COVERAGE_DESIGN_SYSTEM},
+        {"role": "user", "content": _user},
+    ]
+    try:
+        _resp = await llm.ainvoke(_messages)
+    except TaskTokenLimitExceeded:
+        raise  # 预算耗尽绝不吞成"LLM 失败"（同 P1 外科 H5 纪律）
+    except Exception:  # noqa: BLE001 — 主失败尝试备用
+        if fallback_llm is None:
+            raise
+        _resp = await fallback_llm.ainvoke(_messages)
+    _result = _parse_json_from_llm(_resp.content)
+    if not isinstance(_result, dict):
+        return []
+    return [e for e in (_result.get("file_plan") or []) if isinstance(e, dict)]
+
+
+def _merge_designed_file_plan(file_plan, new_entries, allowed_modules=None):
+    """确定性 merge：把补排设计的新条目并进 file_plan。返回 (merged, added_count, dropped_count)。
+    剔除越权/臆造：path 或 module 为空、path 与既有重复、module 不在 allowed_modules（若给）→ 忽略。
+    绝不改既有条目。allowed_modules（复核 MED）：棕地新功能须落既有模块——LLM 臆造的新模块名会绕过
+    脚手架注入(finish 未见它)→模块 coherence 违例(round46/64/65e G1 前科)，故限定既有模块，臆造即弃。"""
+    _existing = {str(e.get("path") or "").strip()
+                 for e in file_plan if isinstance(e, dict) and e.get("path")}
+    _allowed = {str(m) for m in allowed_modules} if allowed_modules else None
+    merged = list(file_plan)
+    added = 0
+    dropped = 0
+    for e in (new_entries or []):
+        if not isinstance(e, dict):
+            dropped += 1
+            continue
+        p = str(e.get("path") or "").strip()
+        m = str(e.get("module") or "").strip()
+        if not p or not m or p in _existing or (_allowed is not None and m not in _allowed):
+            dropped += 1
+            continue
+        merged.append({"path": p, "module": m, "action": "create",
+                       "responsibility": str(e.get("responsibility") or "")[:300]})
+        _existing.add(p)
+        added += 1
+    return merged, added, dropped
+
+
+async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallback_llm=None):
+    """R65E7-L2 上游根治：确保 file_plan 覆盖每条已抽取需求。返回 (file_plan, augmented: bool)。
+
+    检出"有判别 token 但 file_plan 未排、基线亦无"的 unplanned 需求 → 定向反馈设计 LLM 补排文件 →
+    合并。fail-open 全程：泄压阀关/无 file_plan(简单路径)/无需求/无 unplanned/LLM 失败/无有效产出 →
+    原样返回不阻断（留 L1 兜底 + 覆盖闸），且每条降级路 record_degrade 令 /api/metrics 可分。
+    """
+    if os.environ.get("SWARM_PLAN_COVERAGE_DESIGN", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return file_plan, False
+    req_items = state.get("requirement_items") or []
+    if not file_plan or not req_items:      # 简单/中等路径无 tech_design → 无 file_plan，跳过
+        # 猎手 F4：SIMPLE/MEDIUM 无 file_plan 是设计内（干净 no-op）；但 COMPLEX/ULTRA 到这里还空
+        # =上游 tech_design/extract 静默产空的异常降级，须留痕（否则本闸被静默永久关闭无迹可查）。
+        try:
+            if effective_complexity(state) in (Complexity.COMPLEX, Complexity.ULTRA):
+                from swarm.infra.degrade import record_degrade
+                record_degrade("brain.plan.coverage_design_skipped_missing_input")
+                logger.warning(
+                    "[PLAN] R65E7-L2 跳过（复杂度=%s 却 file_plan=%d/需求=%d 为空——上游异常，非简单路径）",
+                    effective_complexity(state).value, len(file_plan or []), len(req_items))
+        except Exception:  # noqa: BLE001 — 留痕失败绝不阻断
+            pass
+        return file_plan, False
+    from swarm.brain.baseline_candidates import (
+        build_planned_vocab,
+        requirements_missing_from_plan,
+    )
+    try:
+        _baseline_vocab = await _baseline_vocab_for(state)
+        unplanned_ids = requirements_missing_from_plan(
+            req_items, build_planned_vocab(file_plan), _baseline_vocab)
+    except Exception as exc:  # noqa: BLE001 — 检出失败绝不阻断规划
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.plan.coverage_design_detect_error")
+        logger.warning("[PLAN] R65E7-L2 覆盖检出降级（不阻断）：%s", exc)
+        return file_plan, False
+    if not unplanned_ids:                   # 全覆盖 → 快路径（绝大多数轮）
+        return file_plan, False
+    _by_id = {str(it.get("id")): it for it in req_items
+              if isinstance(it, dict) and it.get("id")}
+    _unplanned_items = [_by_id[r] for r in unplanned_ids if r in _by_id]
+    _stack = state.get("project_stack") or ""
+    _mods = sorted({str(e.get("module")) for e in file_plan
+                    if isinstance(e, dict) and e.get("module")})
+    from swarm.infra.degrade import record_degrade
+    try:
+        _new = await _design_files_for_unplanned(
+            llm, _unplanned_items, _stack, _mods, fallback_llm=fallback_llm)
+    except TaskTokenLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 补排设计失败 fail-open
+        record_degrade("brain.plan.coverage_design_llm_error")
+        logger.warning("[PLAN] R65E7-L2 补排设计 LLM 失败（fail-open 留 L1+覆盖闸兜底）：%s", exc)
+        return file_plan, False
+    merged, added, dropped = _merge_designed_file_plan(file_plan, _new, allowed_modules=_mods)
+    if dropped:                             # 越权/臆造条目被剔（含臆造模块）——可观测不静默
+        record_degrade("brain.plan.coverage_design_entries_dropped")
+        logger.warning("[PLAN] R65E7-L2 补排设计 %d 个条目越权被剔（空 path/module、重复、或臆造模块）", dropped)
+    if not added:
+        record_degrade("brain.plan.coverage_design_no_files")
+        logger.warning(
+            "[PLAN] R65E7-L2 补排设计未产出有效文件（%d 个漏排需求仍无落点，留 L1 兜底+覆盖闸）：%s",
+            len(unplanned_ids), unplanned_ids[:8])
+        return file_plan, False
+    _resid = requirements_missing_from_plan(
+        req_items, build_planned_vocab(merged), _baseline_vocab)
+    if _resid:                              # 部分补齐——残余进 metrics（可观测不静默）
+        record_degrade("brain.plan.coverage_design_partial")
+    logger.info(
+        "[PLAN] R65E7-L2 file_plan 覆盖补排：为 %d 个漏排需求补 %d 文件（残余未覆盖 %d）；unplanned=%s",
+        len(unplanned_ids), added, len(_resid), unplanned_ids[:8])
+    return merged, True
 
 
 async def _baseline_candidates_block_for(state) -> str:
@@ -1923,9 +2076,43 @@ async def _maybe_surgical_coverage_topup(state):
                 "[PLAN] R64-T3 P1 外科补齐让路：上一版 plan 存在结构性模块 coherence 违例"
                 "（外科只补覆盖救不了结构）→ 走全量重拆带反馈")
             return None
-    _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"))
+    # R65E7-L1（P1 盲区兜底）：喂 baseline_vocab，令 T1-拒的假 baseline 申报不再被当已覆盖——
+    # 否则假 baseline 令 uncovered=0→P1「覆盖已满足」return None→全量重拆丢覆盖回归振荡（round65e7 真因）。
+    # _baseline_vocab_for fail-open 返 ""→build_coverage_matrix 不踢任何 baseline（向后兼容）。
+    # 猎手 F3：本函数契约=任一前置不满足→None，调用方无 try 包裹——build_coverage_matrix 的 vocab 路径
+    # 裸抛会经 plan() 冒泡把整任务打成 FAILED。异常时保守让路全量重拆（退回无 vocab 口径）并留痕。
+    _bvocab = await _baseline_vocab_for(state)
+    _fp_for_gap = state.get("tech_design_file_plan") or []
+    try:
+        _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"),
+                                        baseline_vocab=_bvocab)
+    except Exception as exc:  # noqa: BLE001 — vocab 路径异常绝不炸主链
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.plan.p1_baseline_vocab_matrix_error")
+        logger.warning("[PLAN] R65E7-L1 P1 闸 baseline_vocab 矩阵异常（退回无 vocab 口径，不炸主链）: %s", exc)
+        _matrix = build_coverage_matrix(prior_plan, _req_items, state.get("baseline_covered"))
     if not _matrix["uncovered"] and not _matrix["dangling_covers"]:
         return None  # 覆盖已满足——失败来自别处，回退常规路径
+    # R65E7 复核 HIGH（外科 vs 上游根治的排序冲突）：若某未覆盖需求【确属漏排】（file_plan 无落点、
+    # 基线亦无=L2 的判据），P1 只能 assign 到无关子任务(静默错覆盖) 或 谎报 baseline(撞 T1 死循环)——
+    # 两条都"派 worker 去失败"。这类需求让路全量重拆：L2 会在 `if task_plan is None` 块补排文件、
+    # 拆解据此建真子任务。P1 仅接【有落点的纯覆盖分歧】。fail-open：vocab/planned 空→_unplanned 空→不让路。
+    try:
+        from swarm.brain.baseline_candidates import (
+            build_planned_vocab,
+            requirements_missing_from_plan,
+        )
+        _unplanned = set(requirements_missing_from_plan(
+            _req_items, build_planned_vocab(_fp_for_gap), _bvocab))
+        _uncov_ids = {u["id"] for u in _matrix["uncovered"]}
+        if _unplanned & _uncov_ids:
+            logger.info(
+                "[PLAN] R65E7 P1 外科让路全量重拆：%d 个未覆盖需求确属漏排（file_plan 无落点+非存量），"
+                "外科补不了、须 L2 补排文件后重拆：%s", len(_unplanned & _uncov_ids),
+                sorted(_unplanned & _uncov_ids)[:8])
+            return None
+    except Exception as exc:  # noqa: BLE001 — 漏排预检异常绝不炸主链，退回常规外科
+        logger.warning("[PLAN] R65E7 P1 漏排预检异常（退回常规外科补齐路径）: %s", exc)
     _valid_ids = {row["id"] for row in _matrix["items"]}
     # P3：注入现有项目结构作 baseline 申报接地依据（棕地存量采纳）
     _proj_struct = _format_project_structure(state.get("knowledge_context"))
@@ -2141,19 +2328,30 @@ async def plan(state: BrainState) -> dict:
             _plan_batch_cache = dict(state.get("plan_batch_cache") or {})
 
     # ── LLM 任务拆解 ──
+    # R65E7-L2：预置 False 覆盖所有到达公共 return 的路径（P1 外科路径设 task_plan→跳过下方 try；
+    # 或 try 内 _l2_augmented 赋值前抛异常被 except 兜底假计划落到公共 return）——防 NameError。
+    _l2_augmented = False
+    _file_plan = None   # R65E7-L2：函数级预置——供公共 return 前的 finish/持久化引用（P1 路径不进下方 try）
     if task_plan is None:
       try:
         llm = _get_brain_llm()
         router = ModelRouter()
         routing_table = router.get_routing_table()
-        # 需求转化层产出注入：把 tech_design 的 file_plan/数据模型/契约喂给 PLAN，
-        # PLAN 据此定 scope（不再从零猜文件）。空则提示回退自推导。
-        tech_design_plan = _format_tech_design_for_plan(state)
 
         # ── ultra 超大需求分批拆解（DESIGN_plan_batch_decompose）──
         # tech_design 产出 file_plan 上百文件时，单次 LLM 拆全量 DAG 会卡死（stream chunk 不超时 +
         # 超长 JSON 极慢）。改：按 10% 比例分批，逐批 LLM 拆解，每批规模可控 + 进度日志。
         _file_plan = state.get("tech_design_file_plan") or []
+        # R65E7-L2 上游根治：分批拆解【前】确保 file_plan 覆盖每条已抽取需求——检出"有判别 token 但
+        # file_plan 未排、基线亦无"的漏排需求（2FA/SHA512 类新功能），定向反馈设计 LLM 补排文件后再拆。
+        # 否则漏排需求无子任务能覆盖→只能被谎报 baseline→T1 拦→恢复环无法 materialize→FAILED@PLAN。
+        # fail-open：泄压阀关/无需求/无 unplanned/LLM 失败→原样返回不阻断（留 L1 兜底+覆盖闸）。
+        _file_plan, _l2_augmented = await _ensure_file_plan_covers_requirements(
+            state, llm, _file_plan, fallback_llm=_get_brain_fallback_llm())
+        # 需求转化层产出注入：把（L2 增广后的）file_plan/数据模型/契约喂给 PLAN，PLAN 据此定 scope。
+        # ★必须在 L2 补排【之后】格式化——否则单发拆解 prompt 看不到补排的新文件（复核 HIGH）。空则回退自推导。
+        tech_design_plan = _format_tech_design_for_plan(
+            state, file_plan_override=_file_plan if _l2_augmented else None)
         _BATCH_TRIGGER = 30  # file_plan 超过此数才分批（中小需求单次最优，零回归）
         # Q5 判定点（第二阶段）：超大到一定程度应切成串行主任务（主任务间依赖，A 合格才走 B）。
         # 本批先留判定与告警，完整串行主任务编排是后续迭代（见 DESIGN_plan_batch_decompose 七）。
@@ -2414,7 +2612,8 @@ async def plan(state: BrainState) -> dict:
     # by_scope 消费）。脚手架 harness 由收尾器自行 bootstrap（错过主循环）。
     from swarm.brain.plan_finisher import finish_plan_deterministic
     _finish_out = finish_plan_deterministic(
-        task_plan, state.get("tech_design_file_plan"),
+        # R65E7-L2：用 L2 增广后的 file_plan（否则 finish 的孤儿承接/脚手架注入看不到补排文件，复核 HIGH）。
+        task_plan, (_file_plan if _l2_augmented else state.get("tech_design_file_plan")),
         project_path=_get_project_path(state.get("project_id") or ""),
         task_description=task_description,
         # R48b-1：③孤儿承接之外，④契约符号安置也进收尾器——P1 命中时 R39-5 符号
@@ -2454,6 +2653,9 @@ async def plan(state: BrainState) -> dict:
         # 无人消费落 {}"的前提（现在有人消费=护栏）。F-4 的 checkpoint 膨胀顾虑改由
         # validate_plan 覆盖+校验【通过】时清空缓存兜住（仅驻留 PLAN 回炉窗口，过闸即清）。★
         "plan_batch_cache": _plan_batch_cache or {},
+        # R65E7-L2：补排文件后持久化增广的 file_plan 到 state——否则下游 validate_plan 的 G1 coherence /
+        # elaborate 仍读旧 file_plan（无补排文件）致口径漂移；仅补排时才发（否则不改既有键，零回归）。
+        **({"tech_design_file_plan": _file_plan} if _l2_augmented else {}),
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）

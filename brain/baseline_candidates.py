@@ -232,6 +232,79 @@ def baseline_claims_missing_evidence(
     return out
 
 
+def build_planned_vocab(file_plan: list[dict] | None) -> str:
+    """R65E7：把 tech_design 的 file_plan 各条目的【路径 stem + CamelCase 首字母缩略 + module +
+    responsibility 文本】拼成单一小写 blob，供 requirements_missing_from_plan 做证据子串检索。
+    空 file_plan → 空串（调用方据此 fail-open）。
+
+    与 build_baseline_vocab 对称：证据来源不同（计划文件 vs 基线符号），判定口径同源
+    （extract_evidence_tokens）。responsibility 文本入 blob 关键——它承载"2fa/google/sha512"这类
+    需求判别词（路径 stem 只有类名 TwoFactorController，不含 "2fa"），令为某需求真排了文件时其
+    token 能命中（不回归）。缩略入 blob 令字母缩略需求词（sso/rbac）匹配展开命名的规划文件。"""
+    parts: list[str] = []
+    for e in (file_plan or []):
+        if not isinstance(e, dict):
+            continue
+        p = str(e.get("path") or "")
+        if p:
+            parts.append(_basename_stem(p))               # 小写 stem
+            _raw = p.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            _ini = _camel_initials(_raw)
+            if len(_ini) >= 3:                              # 太短缩略判别力弱，不入（同 baseline_vocab）
+                parts.append(_ini)
+        m = str(e.get("module") or "").lower()
+        if m:
+            parts.append(m)
+        r = str(e.get("responsibility") or "").lower()
+        if r:
+            parts.append(r)
+    return "\n".join(parts)
+
+
+def requirements_missing_from_plan(
+    requirement_items: list[dict] | None,
+    planned_vocab: str | None,
+    baseline_vocab: str | None,
+) -> list[str]:
+    """R65E7（round65e7 task 044f2caa 实锤）：返回【有判别 token 却在 file_plan 未排任何文件、
+    基线亦无存量证据】的 req-id（unplanned）——上游根治闸据此定向反馈设计 LLM 补排文件。
+
+    死因：tech_design 从 PRD 原文产 file_plan、requirement_items 另路抽取，二者无覆盖交叉核验；
+    2FA/SHA512 等在 183 file_plan 里 0 文件 → 无子任务能覆盖 → 只能被谎报 baseline → T1 拦 →
+    恢复环无法 materialize（无文件可挂）→ 3 retry 耗尽 → FAILED@PLAN。
+
+    判定（证据 token 与 T1 同源，narrow、栈无关）：
+    - planned_vocab 或 baseline_vocab 任一空 → [] 全豁免（fail-open：缺数据绝不臆造补排工作；
+      无 baseline_vocab 无从区分"新特性"与"存量能力"，逼排文件会给存量能力造重复实现）；
+    - 需求 `extract_evidence_tokens` 零 token（纯中文无 ASCII 判别词）→ 豁免（round37 过严教训）；
+    - token 命中 planned_vocab → 已排文件，放行；
+    - 未排文件但命中 baseline_vocab → 合法存量满足，放行（不为存量能力逼排文件）；
+    - 未排文件【且】非存量 → unplanned → 列入返回（逼上游补排，绝不留到下游被谎 baseline 掉）。
+    """
+    if not requirement_items or not planned_vocab or not baseline_vocab:
+        return []
+    pv = planned_vocab.lower()
+    bv = baseline_vocab.lower()
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in requirement_items:
+        if not isinstance(it, dict):
+            continue
+        rid = str(it.get("id") or "").strip()
+        if not rid or rid in seen:
+            continue
+        toks = extract_evidence_tokens(str(it.get("text") or ""))
+        if not toks:                          # 纯中文/无判别 token 豁免（过严会误报，round37 教训）
+            continue
+        if any(tk in pv for tk in toks):      # 已排文件 → 放行
+            continue
+        if any(tk in bv for tk in toks):      # 存量满足 → 放行
+            continue
+        out.append(rid)                        # 无文件无存量 → unplanned
+        seen.add(rid)
+    return out
+
+
 def baseline_candidates_prompt_block(candidates: list[dict], *,
                                      truncated: bool = False) -> str:
     """候选申报清单 → PLAN prompt 注入块。空=空串（零噪声）。
