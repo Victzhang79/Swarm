@@ -74,7 +74,24 @@ def parse_missing_packages(build_output: str) -> list[tuple[str, str]]:
 
 _MISSING_ARTIFACT_RE = re.compile(
     r"(?:Could not find artifact|Failure to find|Could not resolve dependencies for[^\n]*?)\s*"
-    r"([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|pom|war):([A-Za-z0-9_.\-]+)"
+    r"([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|pom|war)"
+    # ★R65E8-T3★ 可选 classifier（Maven 坐标 g:a:type[:classifier]:version）——跳过它取**真正的**
+    # version。旧实现无此段 → `shiro-ehcache:jar:jakarta:2.0.1` 把 classifier `jakarta` 误当 version
+    # 捕获 → version-repair 拿 bad_ver="jakarta" 全程 no-op、classifier 永不被剔（round65e8 死因）。
+    # 贪婪回溯保证无 classifier 的普通形态 `jar:2.0.1` 仍正确取 version=2.0.1。
+    r"(?::[A-Za-z0-9_.\-]+)?"
+    r":([A-Za-z0-9_.\-]+)"
+)
+
+
+# ★R65E8-T3★ 另一半：**带 classifier** 的缺失坐标，专门提取 classifier 供确定性剔除。
+# 只认「Could not find artifact / Failure to find」两种明确 artifact-解析形态；version 段须以数字
+# 起（与 classifier 消歧：`jar:classifier:version` 两段 vs `jar:version` 一段）。
+_MISSING_CLASSIFIED_ARTIFACT_RE = re.compile(
+    r"(?:Could not find artifact|Failure to find)\s*"
+    r"([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|pom|war):"   # 与分支① version-repair 打包型对齐
+    r"([A-Za-z0-9_.\-]+):"          # classifier（如 jakarta / native）
+    r"([0-9][A-Za-z0-9_.\-]*)"      # version（须以数字起，消歧）
 )
 
 
@@ -123,6 +140,24 @@ def parse_missing_versions(build_output: str) -> list[tuple[str, str]]:
         if (g, a) not in seen and g and a:
             seen.add((g, a))
             out.append((g, a))
+    return out
+
+
+def parse_missing_classified_artifacts(
+    build_output: str,
+) -> list[tuple[str, str, str, str]]:
+    """解析【带 classifier 且拉不到】的坐标 =(groupId, artifactId, classifier, version)，去重保序。
+
+    R65E8-T3：worker 给依赖写了仓库里不存在的分类变体（如 shiro-ehcache 的幻觉
+    `jakarta` classifier）→ `Could not find artifact g:a:jar:jakarta:2.0.1`。纯函数、可单测。
+    """
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[tuple[str, str, str, str]] = []
+    for g, a, c, v in _MISSING_CLASSIFIED_ARTIFACT_RE.findall(build_output or ""):
+        key = (g, a, c, v)
+        if key not in seen and all(key):
+            seen.add(key)
+            out.append(key)
     return out
 
 
