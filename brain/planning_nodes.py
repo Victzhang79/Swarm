@@ -891,7 +891,9 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
 # v2: 新增 infra_symbols（基建符号锚点，治本 worker 臆造不存在的框架类如 RedisCache）。
 # v3: jvm 新增 lombok_available/lombok_source（R65TR-T5 基线注解处理器在位性）——不 bump
 #     则已缓存画像永缺该键、硬约束永不渲染（猎手 F3，前例 108676a 同纪律）。
-_STACK_SCHEMA_VERSION = 3
+# v4: 新增 infra_symbol_methods（R65E8-T5 基建类 public 方法签名 grounding，治 method 级幻觉
+#     如缓存类调裸 .set/.get）——不 bump 则已缓存画像永缺该键、方法签名永不渲染（同 F3 纪律）。
+_STACK_SCHEMA_VERSION = 4
 
 
 async def detect_stack(state: BrainState) -> dict:

@@ -165,21 +165,84 @@ def _is_infra_classname(name: str) -> bool:
     return any(match(name) for _label, match in _INFRA_CONCEPTS)
 
 
-def _detect_infra_symbols(infra_class_paths: list[str]) -> dict[str, list[str]]:
-    """扫基建类文件 → {概念: [真实FQN,...]}。供 format_stack_for_prompt 钉死给 design+worker。
+# R65E8-T5：public 方法签名解析——把 grounding 从【类 FQN】升到【类 FQN + 方法签名】。
+# 死因：class 级 grounding 告诉 worker "CacheUtils 存在"，但不给方法签名 → worker 凭惯性调
+# `.set/.get`（裸 RedisTemplate 签名）而非真实的 `get/put/remove` → cannot find symbol 死循环。
+# 确定性解析（不依赖 reranker 天花板）：单行 `public [modifiers] <ret> name(params)`（Allman 花括号
+# 换行安全）→ 记 `[static ]name(params)`。排除 private/构造器/字段（无返回型双 token 判据 + 必带 `{`）。
+_PUBLIC_METHOD_RE = None  # 延迟编译（模块级 re 已在别处 import）
+_MAX_METHODS_PER_CLASS = 12
+
+
+def _strip_comments_and_strings(text: str) -> str:
+    """置空 Java 注释与字符串字面量内容（保留结构）→ 供签名正则免受"注释/字符串里的伪
+    public 方法"污染（复核 F1 CONFIRMED HIGH：javadoc 示例 / 模板字符串里的 `public foo(){`
+    会被当真方法签名喂给 worker、以'硬约束'权威误导——正是本特性要消灭的幻觉）。
+
+    先剥块注释（含 javadoc）→ 行注释 → 字符串内容置空。此序对"字符串里含 // 或 /*"只会
+    多剥（→漏掉真方法=可接受假阴性），绝不会漏剥出伪签名（不产假阳性）。同 lombok 探测器
+    先剥注释再匹配的既有纪律。"""
+    import re as _re
+    text = _re.sub(r"/\*.*?\*/", " ", text or "", flags=_re.S)   # 块注释/javadoc
+    text = _re.sub(r"//[^\n]*", " ", text)                        # 行注释
+    text = _re.sub(r'"(?:\\.|[^"\\\n])*"', '""', text)            # 字符串字面量内容置空
+    return text
+
+
+def _extract_public_method_sigs(text: str) -> list[str]:
+    """从 Java 类源码解析 public 方法签名 → ["[static ]name(params)", ...]，去重保序、封顶。
+
+    纯函数、可单测。保守：先剥注释/字符串（防伪签名），只认单行签名带开花括号的具体方法
+    （排除 interface `;` 声明、字段、构造器<无返回型>、private/protected）。参数折叠空白、
+    单条封顶 140 字防 prefill 爆炸。"""
+    import re as _re
+    global _PUBLIC_METHOD_RE
+    if _PUBLIC_METHOD_RE is None:
+        _PUBLIC_METHOD_RE = _re.compile(
+            r"\bpublic\s+([^\n(){};=]*?)\s*\(([^;{()]*)\)\s*(?:throws[\w.,\s]*?)?\{")
+    text = _strip_comments_and_strings(text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _PUBLIC_METHOD_RE.finditer(text or ""):
+        head = m.group(1).split()
+        if len(head) < 2:          # 只有一个 token = 构造器/无返回型 → 跳过
+            continue
+        name = head[-1]
+        if not name.isidentifier():
+            continue
+        is_static = "static" in head[:-1]
+        params = _re.sub(r"\s+", " ", m.group(2)).strip()
+        sig = ("static " if is_static else "") + f"{name}({params})"
+        if len(sig) > 140:
+            sig = sig[:137] + "…)"
+        if sig not in seen:
+            seen.add(sig)
+            out.append(sig)
+        if len(out) >= _MAX_METHODS_PER_CLASS:
+            break
+    return out
+
+
+def _detect_infra_symbols(
+    infra_class_paths: list[str],
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """扫基建类文件 → ({概念: [真实FQN,...]}, {FQN: [方法签名,...]})。供 format_stack_for_prompt
+    钉死给 design+worker。
 
     包名大小写敏感（worker import 要原样），故用独立 case-preserving 读取，不复用 _read_text。
-    每概念封顶 6 个去重 FQN，防噪声/超长 prefill。
+    每概念封顶 6 个去重 FQN，防噪声/超长 prefill。R65E8-T5：同一次读取顺带解析 public 方法签名
+    （读满 20KB 以覆盖方法体），只为**保留下来的** FQN 记签名，避免为被裁掉的类白解析。
     """
     import re as _re
     by_concept: dict[str, list[str]] = {}
+    methods_by_fqn: dict[str, list[str]] = {}
     seen: set[str] = set()
     pkg_re = _re.compile(r"^\s*package\s+([\w.]+)\s*;", _re.MULTILINE)
     for path in infra_class_paths[:200]:
         cls = os.path.basename(path)[:-5]  # 去 .java
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
-                head = f.read(2000)  # package 在文件头
+                head = f.read(20000)  # package 在文件头；20KB 覆盖 public 方法签名（T5）
         except OSError:
             continue
         m = pkg_re.search(head)
@@ -194,8 +257,11 @@ def _detect_infra_symbols(infra_class_paths: list[str]) -> dict[str, list[str]]:
                 lst = by_concept.setdefault(label, [])
                 if len(lst) < 6:
                     lst.append(fqn)
+                    sigs = _extract_public_method_sigs(head)
+                    if sigs:
+                        methods_by_fqn[fqn] = sigs
                 break
-    return by_concept
+    return by_concept, methods_by_fqn
 
 
 def _detect_auth_variant(java_sample_paths: list[str], build_text: str) -> dict | None:
@@ -500,7 +566,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     needs_adj = confidence < 0.65 or (has_spa and has_server_tmpl)
 
     # ── JVM 系专属事实：jakarta/javax 命名空间 + Boot/Java 版本（worker 写对 import 的硬前提）──
-    infra_symbols = _detect_infra_symbols(infra_class_paths)
+    infra_symbols, infra_symbol_methods = _detect_infra_symbols(infra_class_paths)
     if infra_symbols:
         evidence.append(
             "基建符号锚点（真实存在的基础设施类）：" + "；".join(
@@ -531,6 +597,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         "jvm": jvm or {},
         "auth": auth or {},
         "infra_symbols": infra_symbols,
+        "infra_symbol_methods": infra_symbol_methods,
         "confidence": round(confidence, 2),
         "evidence": evidence,
         "db": db_engines,
@@ -653,16 +720,30 @@ def format_stack_for_prompt(profile: dict | None) -> str:
         )
     infra = profile.get("infra_symbols") or {}
     if infra:
+        _methods = profile.get("infra_symbol_methods") or {}
         lines.append(
             "- 【基建符号·硬约束】本项目真实存在的基础设施类（按概念列真实 FQN，用这些、原样 import）："
         )
+        # R65E8-T5：方法签名块总量封顶（复核 F3）——防大量 *Utils 类把 CacheUtils 这类
+        # 载荷签名淹没/撑爆 prefill；与既有 evidence[:300] 截断纪律对称。
+        _method_budget = 1800
         for concept, fqns in infra.items():
             lines.append(f"  · {concept}：{'、'.join(fqns)}")
+            # R65E8-T5：类级 FQN 不够——补 public 方法签名，杜绝方法级幻觉（调 .set/.get
+            # 而非真实的 get/put/remove）。只渲染有签名的 FQN，逐类封顶已在解析期完成。
+            for _fqn in fqns:
+                _sigs = _methods.get(_fqn)
+                if _sigs and _method_budget > 0:
+                    _short = _fqn.rsplit(".", 1)[-1]
+                    _line = f"    ↳ {_short} 的 public 方法（照抄签名，别臆造方法名）：{'; '.join(_sigs)}"
+                    lines.append(_line[:_method_budget + 80])  # 单行软界，避免半截被丢
+                    _method_budget -= len(_line)
         lines.append(
-            "  ⚠️ 实现新功能需要缓存/响应/鉴权/基类等基础设施时，【必须】复用上面列出的本项目真实类；"
-            "【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）——"
-            "classpath 没有就 `cannot find symbol`/`package 不存在` 编译失败、死循环。需要的类不在列表里时，"
-            "先在项目里 grep 确认它真实存在再 import，绝不臆造。"
+            "  ⚠️ 实现新功能需要缓存/响应/鉴权/基类等基础设施时，【必须】复用上面列出的本项目真实类"
+            "【及其上列方法签名】；【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）"
+            "或未列出的方法名（如在缓存类上调裸 RedisTemplate 的 set/get）——classpath/方法没有就 "
+            "`cannot find symbol`/`package 不存在` 编译失败、死循环。需要的类/方法不在列表里时，"
+            "先在项目里 grep 确认它真实存在再用，绝不臆造。"
         )
     auth = profile.get("auth") or {}
     av = auth.get("variant")
