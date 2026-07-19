@@ -662,8 +662,13 @@ def extract_stack_hints_from_knowledge(knowledge_context: dict | None, max_hits:
     return hits[:max_hits]
 
 
-def format_stack_for_prompt(profile: dict | None) -> str:
-    """把 project_stack 画像渲染成喂给 tech_design 的【权威栈指令】（磁盘优先于文档）。"""
+def format_stack_for_prompt(profile: dict | None, *, include_method_sigs: bool = True) -> str:
+    """把 project_stack 画像渲染成喂给 tech_design 的【权威栈指令】（磁盘优先于文档）。
+
+    include_method_sigs（R65E9-T2）：默认 True——tech_design 逐字不变（含 public 方法签名
+    载荷）。声明步（PLAN baseline_covered 申报）传 False 取【精简版】：保留能力边界硬约束
+    （变体/前端形态/鉴权/基建概念 FQN），裁掉方法签名 payload——声明只需知道"有没有此能力"，
+    不需要方法名，且避免大量 *Utils 签名撑爆 plan prefill。"""
     if not profile:
         return ""
     fe = profile.get("frontend", "未判明")
@@ -731,17 +736,25 @@ def format_stack_for_prompt(profile: dict | None) -> str:
             lines.append(f"  · {concept}：{'、'.join(fqns)}")
             # R65E8-T5：类级 FQN 不够——补 public 方法签名，杜绝方法级幻觉（调 .set/.get
             # 而非真实的 get/put/remove）。只渲染有签名的 FQN，逐类封顶已在解析期完成。
-            for _fqn in fqns:
+            # R65E9-T2：声明步（include_method_sigs=False）跳过方法签名 payload——只保留概念
+            # FQN 作能力边界，避免精简版被大量签名撑爆。
+            for _fqn in (fqns if include_method_sigs else ()):
                 _sigs = _methods.get(_fqn)
                 if _sigs and _method_budget > 0:
                     _short = _fqn.rsplit(".", 1)[-1]
                     _line = f"    ↳ {_short} 的 public 方法（照抄签名，别臆造方法名）：{'; '.join(_sigs)}"
                     lines.append(_line[:_method_budget + 80])  # 单行软界，避免半截被丢
                     _method_budget -= len(_line)
+        # R65E9-T2：方法签名段仅在 include_method_sigs 时渲染——警告措辞随之切换，
+        # 精简版不提"上列方法签名"（那侧无签名，避免引用不存在内容）。
+        _sig_phrase = "【及其上列方法签名】" if include_method_sigs else ""
+        _method_warn = (
+            "或未列出的方法名（如在缓存类上调裸 RedisTemplate 的 set/get）"
+            if include_method_sigs else "")
         lines.append(
-            "  ⚠️ 实现新功能需要缓存/响应/鉴权/基类等基础设施时，【必须】复用上面列出的本项目真实类"
-            "【及其上列方法签名】；【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）"
-            "或未列出的方法名（如在缓存类上调裸 RedisTemplate 的 set/get）——classpath/方法没有就 "
+            f"  ⚠️ 实现新功能需要缓存/响应/鉴权/基类等基础设施时，【必须】复用上面列出的本项目真实类{_sig_phrase}；"
+            "【严禁】凭框架惯性臆造未列出的'标准类'（如某变体的 RedisCache 本项目可能没有）"
+            f"{_method_warn}——classpath/方法没有就 "
             "`cannot find symbol`/`package 不存在` 编译失败、死循环。需要的类/方法不在列表里时，"
             "先在项目里 grep 确认它真实存在再用，绝不臆造。"
         )

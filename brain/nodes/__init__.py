@@ -1028,6 +1028,49 @@ def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = Fal
     )
 
 
+def _lean_stack_directive(state) -> str:
+    """R65E9-T2：detect_stack 权威栈画像的【精简版】能力边界指令（无方法签名 payload）。
+
+    单一渲染入口——供 _baseline_stack_grounding_block（自带申报纪律 header 的完整块）与 P1 外科
+    补齐（_targeted_coverage_topup 自带 header，只吃裸指令，避免双重 header）共用，DRY 且口径一致。
+
+    无画像 → ""；异常 → ""（fail-open，绝不拖垮规划）。★复核整改（hunter CONFIRMED）★：异常路径
+    除 logger.warning 外配 record_degrade——与兄弟 _baseline_vocab_for 同纪律，令"栈画像渲染崩了
+    grounding 静默关"与"确实没画像"在 /api/metrics 可分（否则 T2 修复静默失效、FAILED@PLAN 复发不可见）。
+    """
+    try:
+        from swarm.brain.stack_detect import format_stack_for_prompt
+        return format_stack_for_prompt(
+            state.get("project_stack"), include_method_sigs=False) or ""
+    except Exception as e:  # noqa: BLE001 — grounding advisory，绝不拖垮规划
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.plan.stack_grounding_render_error")
+        logger.warning("[PLAN] R65E9-T2 栈 grounding 渲染失败，降级为空：%s", e)
+        return ""
+
+
+def _baseline_stack_grounding_block(state) -> str:
+    """R65E9-T2：把 detect_stack 权威栈画像的【能力边界硬约束】注入 baseline_covered 声明步。
+
+    round65e9 三路定案：栈画像此前只喂 tech_design（planning_nodes.py:1702），PLAN 声明
+    baseline_covered 时 planner 看不到"本项目无 Redis/用 EhCache/禁 .vue"→凭框架惯性把不存在
+    的能力谎称存量→证据闸拒→limbo 死钉（与 T1 pin 互补：T1=收敛 belt，本块=源头 suspenders）。
+
+    完整块（自带申报纪律 header）：供主 PLAN / 分批 PLAN 直接追加。P1 外科补齐路径改用裸
+    _lean_stack_directive（那侧自带 header，防双重 header——复核 MEDIUM）。无画像 → ""。
+    """
+    _directive = _lean_stack_directive(state)
+    if not _directive:
+        return ""
+    return (
+        "\n\n## 技术栈画像·baseline_covered 申报接地（磁盘探测 ground truth，权威）\n"
+        "★申报 baseline_covered（存量已满足）前必须核对下面的画像：画像未列出、或明确【无】的\n"
+        "能力（如某缓存/前端/鉴权变体），本项目 classpath 里就没有，【绝不申报】它为存量已满足——\n"
+        "那是凭框架惯性的臆造，会被证据核查拒掉并回灌整改、白烧重试。\n"
+        + _directive
+    )
+
+
 async def _plan_ultra_batched(
     llm, state, task_description, knowledge_context, sliding_ctx, file_plan,
 ):
@@ -1094,6 +1137,8 @@ async def _plan_ultra_batched(
         _skills_blk_batched = planner_skills_block(state.get("project_stack"))
     except Exception as e:  # noqa: BLE001 — 经验层绝不拖垮规划
         logger.warning("[skills] planner(分批) 经验注入失败，降级为空：%s", e)
+    # R65E9-T2：栈画像能力边界注入分批 baseline 声明步（计算一次每批复用；无画像=空串）。
+    _stack_grounding_batched = _baseline_stack_grounding_block(state)
 
     # P5：分批前全局去重同名文件
     _before = len(file_plan)
@@ -1308,6 +1353,9 @@ async def _plan_ultra_batched(
         # 成本有界（planner 预算 1500 字符/批）。
         if _skills_blk_batched:
             prompt_user += "\n\n" + _skills_blk_batched
+        # R65E9-T2：每批独立 LLM 调用 → 每批都注入栈画像 grounding（与 _cov_block 同批注入纪律）
+        if _stack_grounding_batched:
+            prompt_user += _stack_grounding_batched
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             # R38b-1 ②：token 拒绝走准入等待（在飞 settle 后有余量→重试不占能力配额，
@@ -1863,6 +1911,7 @@ PLAN_COVERAGE_TOPUP_SYSTEM = (
 async def _targeted_coverage_topup(
     llm, prior_plan, uncovered_items, valid_req_ids,
     prior_baseline=None, fallback_llm=None, project_structure="",
+    stack_directive="",
 ):
     """P1 外科补丁核心：对 uncovered 子集做一次定向补覆盖，绝不重拆/新增子任务。
 
@@ -1920,6 +1969,11 @@ async def _targeted_coverage_topup(
             "无法自动核实的申报会降级呈报人工，故只申报你能从现有结构确认的能力）。\n"
             if _struct else ""
         )
+        # R65E9-T2：外科补齐同样是 baseline 再申报面——注入栈画像能力边界（防再谎称画像外能力）。
+        _stack_block = (
+            "\n## 技术栈画像（申报存量前必核对；画像明确【无】的能力绝不申报为已满足）\n"
+            + stack_directive + "\n" if str(stack_directive or "").strip() else ""
+        )
         _user = (
             "以下执行计划已生成但有若干需求条目【未被任何子任务覆盖】。请【只针对未覆盖条目】"
             "做最小补齐，对每条未覆盖需求二选一：\n"
@@ -1928,7 +1982,8 @@ async def _targeted_coverage_topup(
             "可在现有代码中核实的 reason（何处/如何满足）。\n"
             "绝不新增子任务、绝不改动现有子任务的 scope/描述；subtask_id 只能引用下面清单中的现有 ID。\n\n"
             f"## 现有子任务\n{_sub_lines}\n"
-            f"{_brownfield_block}\n"
+            f"{_brownfield_block}"
+            f"{_stack_block}\n"
             f"## 未覆盖需求条目\n{_uncov_lines}\n\n"
             "只输出 JSON（不要多余文字）：\n"
             '{"assignments":[{"req_id":"req-xxxxxxxx","subtask_id":"st-N"}],'
@@ -2134,6 +2189,8 @@ async def _maybe_surgical_coverage_topup(state):
         prior_baseline=state.get("baseline_covered"),
         fallback_llm=_get_brain_fallback_llm(),
         project_structure=_proj_struct,
+        # 裸精简指令——_targeted_coverage_topup 自带 header（防双重 header，复核 MEDIUM）
+        stack_directive=_lean_stack_directive(state),
     )
 
 
@@ -2388,6 +2445,8 @@ async def plan(state: BrainState) -> dict:
             prompt_user += _requirement_coverage_prompt_block(state.get("requirement_items"))
             # A7（阶段3.5）：确定性存量候选对账清单（棕地申报出口；缺索引/异常=空串 fail-open）
             prompt_user += await _baseline_candidates_block_for(state)
+            # R65E9-T2：技术栈画像能力边界注入 baseline 声明步（无画像=空串 fail-open）
+            prompt_user += _baseline_stack_grounding_block(state)
             # 经验拔插层（advisory）：按 栈×plan 选策展经验追加到规划提示。加法式、永不阻断；
             # 禁用/无命中/异常 → 空串（fail-open，老行为零变化）。
             try:
