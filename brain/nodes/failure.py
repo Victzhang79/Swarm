@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 # 复用 __init__ 的 logger 名 "swarm.brain.nodes"（非 __name__），使 [HANDLE_FAILURE] 策略日志的
 # logger 名与外置前逐字节一致（这些是运维关键日志，避免 name 漂移影响既有日志过滤/聚合配置）。
@@ -68,6 +69,21 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     """取子任务的 L1 详情（§3.2：委托 shared.l1_details_of 单一实现，本地名保 seam）。"""
     from swarm.brain.nodes.shared import l1_details_of
     return l1_details_of(subtask_results.get(fid))
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_DIGIT_RUN_RE = re.compile(r"\d+")
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_fail_sig(text: str) -> str:
+    """R65E8-T2：确定性 L1 失败原因归一成【稳定指纹】——剥 ANSI 转义、数字串→N（版本号/行号/耗时
+    抖动）、折叠空白、小写、截断。令 build/verify 假阴性跨轮同签名【可比】：否则原始 det_fail_reason
+    含时间戳/行号/版本抖动会让指纹永不复现→检测器变哑（同 runtime_smoke plateau 的 log_tail 教训）。"""
+    s = _ANSI_RE.sub("", str(text or ""))
+    s = _DIGIT_RUN_RE.sub("N", s)
+    s = _WS_RE.sub(" ", s).strip().lower()
+    return s[:200]
 
 
 # ── D3（round65e5 st-53-1 R2 实锤）：授 pom 写权后小模型手改基线 pom 腐化 ──
@@ -1814,16 +1830,39 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     for fid in transient_ids:
         _bd = _det_of(subtask_results.get(fid))
         _pb = _bd.get("pipeline_blocked")
-        if not _pb:
-            continue
-        _sig = str(_pb) + "|" + ",".join(sorted(
-            [str(x) for x in (_bd.get("blocked_on_files") or [])]
-            + [str(x) for x in (_bd.get("blocked_on_packages") or [])]
-            + [str(x) for x in (_bd.get("blocked_on_modules") or [])]))
+        if _pb:
+            # 原 B2：blocked 指纹（格式逐字节不动，守既有测试/跨轮签名兼容）
+            _sig = str(_pb) + "|" + ",".join(sorted(
+                [str(x) for x in (_bd.get("blocked_on_files") or [])]
+                + [str(x) for x in (_bd.get("blocked_on_packages") or [])]
+                + [str(x) for x in (_bd.get("blocked_on_modules") or [])]))
+        else:
+            # R65E8-T2（round65e8 死因·纵深防御）：非 blocked 的 transient 中，仅【compile 阶段 build_fail】
+            # 才签名追踪。★复核 HIGH 收窄★：
+            # - verify_failed 的 det_fail_reason 键在【命令串】非失败内容→跨轮恒定，无法辨"签名变=有进展"
+            #   （sibling 落地后同命令换个原因失败仍同签名）→会误短路"等 sibling"的合法重试；且 verify/test
+            #   阶段【无】sibling-wait→pipeline_blocked 检测（仅 compile 阶段有）。test_fail 前 160 字常是
+            #   runner banner 样板→不同真失败塌成同签名。故【排除 verify_failed/test_fail/scope 等】。
+            # - build_fail 是【内容型】(编译器错误文本，归一后版本/行号抖动无害)：真进展→错误变→签名变→连击归 1；
+            #   且 compile 阶段的 sibling-wait 已被 internal_pkg_not_built/upstream_module_broken 路由成
+            #   pipeline_blocked（走上支）→到这里的 build_fail 是【非等待、同输入同输出】的真确定性失败，安全。
+            # - st-3/4/5 的 verify_failed storm 已由 R65E8-T1(验收命令 reactor 归一)从源头治，本 T2 不必兜它。
+            # 纯 infra/网络(无 det_fail_reason)恒不追踪——同输入重试正是其正确语义。env 关：SWARM_TRANSIENT_DET_PLATEAU=0。
+            _dfr = str(_bd.get("det_fail_reason") or "").strip()
+            if (not _dfr or not _dfr.startswith("build_fail")
+                    or os.environ.get("SWARM_TRANSIENT_DET_PLATEAU", "1").strip().lower()
+                    in ("0", "false", "no", "off")):
+                continue
+            _sig = "det|" + _normalize_fail_sig(_dfr)
+            logger.info("[HANDLE_FAILURE] R65E8-T2 %s compile build_fail 确定性指纹追踪（第 %d 连）：%s",
+                        fid, int((_blk_sigs.get(fid) or {}).get("count", 0)) + 1
+                        if (_blk_sigs.get(fid) or {}).get("sig") == _sig else 1, _sig[:80])
         _prev = _blk_sigs.get(fid) or {}
         _cnt = int(_prev.get("count", 0)) + 1 if _prev.get("sig") == _sig else 1
         _blk_sigs[fid] = {"sig": _sig, "count": _cnt}
         _blk_counts[fid] = _cnt
+    # _all_blocked：本批 transient 是否【全部】有稳定重复指纹（blocked 或确定性闸失败）——纯 infra
+    # transient 不入 _blk_counts，故混入 infra 即 False→照常退避重试（不误短路网络抖动，R65E8-T2）。
     _all_blocked = bool(transient_ids) and set(_blk_counts) == set(transient_ids)
     _sig_skip = _all_blocked and min(_blk_counts.values()) >= 2
     _sig_exhausted = _all_blocked and min(_blk_counts.values()) >= 3 \
@@ -1837,7 +1876,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         if _sig_skip:
             # B2：全批 blocked 同签名二连——transient 退避对同输入无意义，直落 capability 阶梯
             logger.warning(
-                "[HANDLE_FAILURE] B2 失败指纹二连不变（全批 blocked）→ 跳过 transient 退避，"
+                "[HANDLE_FAILURE] B2/T2 失败指纹二连不变（全批 blocked 或确定性闸假阴性）→ 跳过 transient 退避，"
                 "直落 capability 阶梯: %s", transient_ids)
         elif deepest_t <= MAX_TRANSIENT_RETRY:
             # 治本 C：流式 stall（模型服务并发拥塞）立即重试会撞同一拥塞 → 给【更长退避】让拥塞散去
