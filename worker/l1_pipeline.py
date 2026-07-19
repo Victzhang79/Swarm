@@ -3181,6 +3181,67 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     return command.replace("mvn", f"mvn -pl {pl}{am}", 1)
 
 
+# R65E8-T1（round65e8 task b4f2fcda PARTIAL 82/124 死因）：cd 进子模块目录裸跑 mvn 的验收命令归一。
+_CD_MVN_RE = re.compile(r'^\s*cd\s+(?P<dir>[^\s&|;]+)\s*&&\s*(?P<rest>.*\bmvn\b.*)$', re.DOTALL)
+
+
+def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[str]) -> str:
+    """R65E8-T1：L1.3.5 验收命令 reactor 归一——治"cd 子模块裸 mvn 假阴性烧正确代码"。
+
+    死因（round65e8 终态坐实）：LLM 授的 acceptance_criteria 常写 `cd <module> && mvn <goal>`——cd 进
+    子模块目录裸跑 mvn（无 -pl/-am），Maven 解析不到 reactor 兄弟（com.<proj>:*）→ 假阴性 fail【本身
+    编译通过、带 -am reactor 构建也成功】的正确代码 → 烧光该子任务重试预算 → abandon → 连坐 38>阈值
+    31 → 计划覆灭 PARTIAL/REJECT。根因=不对称：build_cmd/test_cmd 都过 _scope_maven_command 收窄，唯
+    verify_commands 裸跑；且 `cd <module> &&` 前缀隔离模块，连 -pl -am 都够不着。
+
+    归一（确定性、栈感知仅 Maven、极保守——复核 HIGH/MED/LOW 整改后）：
+    - `cd <已注册 reactor 模块> && <单条干净 mvn goal>`（无 -pl/-f）→ 剥 cd、改写为工程根
+      `mvn -pl <module>[ -am] <goal>`（-am 仅对需上游产物的目标加，validate/clean 不加，守 P0-B）；
+    - 真·无 cd 的单条裸 mvn → 交 _scope_maven_command（与 build/test 对称，用同源 R50-3 过滤基 pl_basis）；
+    - 复合命令(&&/;)/Maven wrapper(mvnw)/多 mvn 调用/`..` traversal/非规范 cd/cd 非注册目录/已 -pl/-f/
+      非 Maven → 一律原样（绝不臆改：子串替换会破坏复合命令语法，非规范 cd 交 _scope 会 -pl 错配 cwd）。
+
+    pl_basis：调用方须传【已按 R50-3 过滤 repaired_file_paths 的 -pl 圈定基】（与 build/test 同源；复核
+    HIGH：裸 modified 会把 repair 触达的外模块拖进 -pl→脚手架被别人在飞坏代码连坐=本 patch 要杀的病复发）。
+    """
+    if not command or "mvn" not in command:
+        return command
+    m = _CD_MVN_RE.match(command)
+    if m is None:
+        # 非规范形若仍含 cd（`;` 分隔 / 带空格引号目录 / env 前缀）→ _scope 不懂 cd 会 -pl 错配 cwd → 原样（MED2）
+        if re.search(r'(?:^|\s|&|;)cd\s', command):
+            return command
+        # wrapper(mvnw)/多 mvn 复合 → _scope 的裸 .replace 会破坏语法（放大既有缺陷）→ 原样（MED1）
+        if re.search(r'/?\bmvnw\b', command) or len(re.findall(r'\bmvn\b', command)) != 1:
+            return command
+        return _scope_maven_command(command, project_path, pl_basis)
+    _dir = m.group("dir").strip().strip('"\'').replace("\\", "/")
+    _dir = _dir.removeprefix("./").rstrip("/")
+    _rest = m.group("rest").strip()
+    # MED1/LOW：只改写【单条干净 mvn 调用】——复合/wrapper/多 mvn/`..` traversal/非 mvn 起手 → 原样。
+    if ("&&" in _rest or ";" in _rest or re.search(r'/?\bmvnw\b', _rest)
+            or len(re.findall(r'\bmvn\b', _rest)) != 1 or not re.match(r'^mvn\b', _rest)
+            or ".." in _dir.split("/")):
+        return command
+    if "-pl" in _rest or re.search(r"-f\s", _rest):
+        return command   # 已 reactor 感知 / 已 -f scoped → 勿重复注入
+    try:
+        registered = set(_maven_modules(project_path).values())
+    except Exception:  # noqa: BLE001 — 读模块失败保守原样，绝不炸 L1 主链
+        return command
+    if _dir not in registered:
+        return command   # cd 进非注册目录（独立工程/脚本目录）→ 原样，绝不臆改
+    needs_upstream = bool(
+        re.search(r"\b(compile|test-compile|test|package|verify|install|deploy)\b", _rest))
+    am = " -am" if needs_upstream else ""
+    scoped = re.sub(r'\bmvn\b', f"mvn -pl {_dir}{am}", _rest, count=1)  # 边界感知，不碰 mvnw/子串
+    logger.info(
+        "[L1.3.5] R65E8-T1 验收命令 reactor 归一：%r → %r"
+        "（cd 子模块裸 mvn 解析不到 reactor 兄弟=假阴性烧正确代码，round65e8 连坐清盘死因）",
+        command, scoped)
+    return scoped
+
+
 def _owning_module_dir(project_path: str, rel: str) -> str:
     """改动文件 rel 的【最近所属模块目录】(含 pom.xml 的最近祖先目录，相对 project)。
 
@@ -3996,6 +4057,12 @@ def run_l1_pipeline(
     if verify_cmds:
         if _deadline_blocked("verify_commands"):
             return True, details
+        # R65E8-T1 复核 HIGH：验收命令 reactor 归一的 -pl 圈定基须与 build/test 同源——过滤掉 repair
+        # 通道触达的外模块（R50-3），否则脚手架被别人在飞坏代码连坐（正是本 patch 要杀的病）。
+        _rfp_v = {str(x).lstrip("./").lstrip("/")
+                  for x in (details.get("repaired_file_paths") or [])}
+        _pl_v = [f for f in modified
+                 if str(f).lstrip("./").lstrip("/") not in _rfp_v] or modified
         # R65D-T2④：H1 覆写文件的内容断言跳过面。猎手 CRITICAL 整改：跳过判据不是
         # 「rel 曾被 H1 覆写」而是「verify 此刻内容仍等于模板」——同一 run 内 R56-5
         # 依赖合法性/version-repair 可能在 H1 之后合法改写该 pom（温差窗口），跨迭代
@@ -4030,11 +4097,14 @@ def run_l1_pipeline(
                     "[L1.3.5] R65D-T2 跳过 H1 权威模板覆写文件的内容断言"
                     "（模板即真值，旧考卷不考新模板）: %s", vc)
                 continue
+            # R65E8-T1：验收命令 reactor 归一（与 build_cmd/test_cmd 对称）——治 `cd 子模块 && 裸 mvn`
+            # 解析不到 reactor 兄弟的假阴性（round65e8 烧正确代码重试预算→abandon 连坐清盘死因）。
+            _vc_run = _reactorize_verify_command(vc, project_path, _pl_v)
             v_ec, v_out = _run_l1_command(
-                vc, project_path, timeout=_stage_timeout(timeout, deadline))
+                _vc_run, project_path, timeout=_stage_timeout(timeout, deadline))
             ok = v_ec == 0
             verify_results.append({
-                "cmd": vc, "ok": ok,
+                "cmd": vc, "cmd_run": _vc_run, "ok": ok,
                 "output": compress_tool_output(v_out, max_chars=500),
             })
             if not ok:
