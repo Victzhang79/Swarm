@@ -107,6 +107,9 @@ function renderTaskList() {
 }
 
 function showTaskDetailEmpty() {
+  // #32：隐藏详情面板时兜底停掉概览实时动画（生长树 rAF + 计时器）——删除活跃任务/切项目
+  // 走此路径而不重渲概览，否则旧循环对隐藏 canvas 空转。集中一处覆盖所有隐藏路径。
+  if (typeof stopSubtaskViewRealtime === 'function') stopSubtaskViewRealtime();
   $('task-detail-empty').classList.remove('hidden');
   $('task-detail-empty').style.display = 'flex';
   const content = $('task-detail-content');
@@ -175,8 +178,9 @@ function renderTaskDetail(task) {
   renderMergeConflictBanner(task);
   setApplyDiffButtonsDisabled(taskHasMergeConflicts(task));
   renderDiff(task.merged_diff || '');
-  renderPlan(task.plan);
-  renderOverviewSubtasks(task);
+  // #32：概览=宏观聚合仪表盘(含生长树小卡)，计划=逐子任务明细表；两视图同源(computeSubtaskView)。
+  renderPlanTable(task);
+  renderOverviewDashboard(task);
   restorePipelineFromStatus(task);
 
   // Q4：规划过程回看（澄清/技术方案/评审）
@@ -375,39 +379,17 @@ function updateReviewBar(task) {
   }
 }
 
+// #32：renderPlan/renderOverviewSubtasks 保留为兼容 shim——真实渲染搬到 subtask_view.js
+// 的 renderPlanTable/renderOverviewDashboard（两视图同源 computeSubtaskView，消除重复列表）。
 function renderPlan(plan) {
-  const container = $('plan-content');
-  plan = normalizePlan(plan);
-  if (!plan || !plan.subtasks || plan.subtasks.length === 0) {
-    container.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px">计划尚未生成</div>';
-    return;
-  }
-  container.innerHTML = plan.subtasks.map(st => `
-    <div class="subtask-row">
-      <span class="subtask-dot ${st.status || 'pending'}"></span>
-      <span class="subtask-desc">${escapeHtml(st.description || st.id)}</span>
-      <span class="subtask-tag">${escapeHtml(st.difficulty || 'medium')}</span>
-      ${st.model ? `<span class="subtask-tag" style="color:var(--accent)">${escapeHtml(st.model)}</span>` : ''}
-    </div>`).join('');
+  const task = (selectedTaskDetail && (!plan || selectedTaskDetail.plan))
+    ? selectedTaskDetail
+    : { plan: normalizePlan(plan) };
+  renderPlanTable(task);
 }
 
 function renderOverviewSubtasks(task) {
-  const container = $('overview-subtasks');
-  const plan = normalizePlan(task.plan);
-  if (!plan || !plan.subtasks || plan.subtasks.length === 0) {
-    container.innerHTML = '';
-    return;
-  }
-  const completed = task.completed_subtasks || 0;
-  const total = task.subtask_count || plan.subtasks.length;
-  container.innerHTML = `
-    <div style="margin-bottom:8px;font-size:12px;color:var(--text-muted)">子任务进度 ${completed}/${total}</div>
-    ${plan.subtasks.map(st => `
-      <div class="subtask-row">
-        <span class="subtask-dot"></span>
-        <span class="subtask-desc">${escapeHtml(st.description || st.id)}</span>
-        <span class="subtask-tag">${escapeHtml(st.difficulty || '')}</span>
-      </div>`).join('')}`;
+  renderOverviewDashboard(task);
 }
 
 function updateNodeStatus(nodeName, status) {
@@ -462,23 +444,18 @@ function restorePipelineFromStatus(task) {
   });
 }
 
+// #32：SSE 实时子任务更新统一走 applySubtaskTick（subtask_view.js）。旧 list 形态兜底：
+// 折算成 subtask_runtime 映射再走同一路径，保证两视图（概览分桶 + 计划明细表）同源刷新。
 function updateSubtaskList(subtasks) {
-  if (!subtasks || !subtasks.length) return;
-  const container = $('overview-subtasks');
-  // 运行中 SSE tick 也要带【分母表头】——此前只重渲列表、把 renderOverviewSubtasks 的
-  // "子任务进度 X/Y" 表头整个覆盖丢掉，导致跑动过程中分母消失、直到选中/完成才回来。
-  // 据本批 subtasks 的状态实时算 done/total（终态计入完成）。
+  if (!subtasks || !subtasks.length || typeof applySubtaskTick !== 'function') return;
   const _DONE = ['done', 'completed', 'success', 'merged'];
-  const done = subtasks.filter(st => _DONE.includes(String(st.status || '').toLowerCase())).length;
-  const total = subtasks.length;
-  container.innerHTML =
-    `<div style="margin-bottom:8px;font-size:12px;color:var(--text-muted)">子任务进度 ${done}/${total}</div>` +
-    subtasks.map(st => `
-    <div class="subtask-row">
-      <span class="subtask-dot ${st.status || 'pending'}"></span>
-      <span class="subtask-desc">${escapeHtml(st.description || st.id)}</span>
-      <span class="subtask-tag">${escapeHtml(st.difficulty || 'medium')}</span>
-    </div>`).join('');
+  const rt = {};
+  subtasks.forEach(st => {
+    if (!st || st.id == null) return;
+    const s = String(st.status || '').toLowerCase();
+    rt[String(st.id)] = { status: _DONE.includes(s) ? 'done' : (s === 'failed' ? 'retrying' : 'pending') };
+  });
+  applySubtaskTick({ subtask_runtime: rt });
 }
 
 function appendLog(level, message) {

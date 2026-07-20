@@ -395,6 +395,76 @@ def _count_completed_in_plan(state: dict[str, Any]) -> int:
     return sum(1 for out in subtask_results.values() if _passed(out))
 
 
+def derive_subtask_runtime(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """从 graph state 单一事实源派生【每个子任务】的运行态（#32 WebUI 可观测）。
+
+    仅覆盖当前 plan 内的子任务 id —— 再拆/replan 改写 plan.subtasks 后 id 集随之更替，
+    旧 id 天然被剔除、新拆子块（st-14-1..）自动纳入（分母与明细表实时增长）。
+
+    status ∈ done|failed|retrying|abandoned|pending：
+      · done      —— 有产出且 L1 通过（_count_completed_in_plan 同口径）
+      · abandoned —— 重试耗尽放弃 或 保 build 隔离放弃（终态 PARTIAL 列明）
+      · retrying  —— handle_failure 已介入（在失败集/换备/强模型/产出未过 L1）
+      · pending   —— 尚未派发/无产出
+    "running/就绪" 不在此派生：brain 不跟踪 worker 沙箱内 CODING/VERIFYING 相位，
+    前端据 depends_on + done 集在【活跃态】推导"当前在做"，保持诚实不臆造相位。
+    """
+    from swarm.brain.nodes.shared import l1_passed as _passed
+
+    plan_ids = _plan_subtask_ids(state)
+    if not plan_ids:
+        return {}
+    results = state.get("subtask_results")
+    results = results if isinstance(results, dict) else {}
+    failed = set(state.get("failed_subtask_ids") or [])
+    abandoned = (
+        set(state.get("abandoned_subtask_ids") or [])
+        | set(state.get("give_up_isolated_ids") or [])
+    )
+    retry_counts = state.get("subtask_retry_counts") or {}
+    contract_counts = state.get("contract_retry_counts") or {}
+    # "换备"必须读【持久账本】subtask_alternate_ever_used（#33-CRITICAL，state.py:268，只增
+    # 单调）——subtask_use_alternate 被 dispatch【派出即清】(dispatch.py:906)，且置它的
+    # handle_failure 不在 _SYNC_ON_NODES：等 sync/emit 跑到时早被下一个 dispatch 消费掉，
+    # 单读它会几乎恒为 False。二者并取：持久账本=曾换过，use_alternate=当前待重路由。
+    ever_alt = state.get("subtask_alternate_ever_used") or {}
+    use_alt = state.get("subtask_use_alternate") or {}
+    force_strong = state.get("subtask_force_strong") or {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for sid in plan_ids:
+        if sid is None:
+            continue
+        res = results.get(sid)
+        passed = _passed(res) if res is not None else False
+        alt = bool(ever_alt.get(sid) or use_alt.get(sid))
+        handled = bool(sid in failed or alt or force_strong.get(sid))
+        if sid in abandoned:
+            status = "abandoned"
+        elif res is not None and passed:
+            status = "done"
+        elif handled or (res is not None and not passed):
+            status = "retrying"
+        else:
+            status = "pending"
+        entry: dict[str, Any] = {
+            "status": status,
+            "retry": int(retry_counts.get(sid, 0) or 0),
+            "l1_passed": bool(passed),
+        }
+        _cr = int(contract_counts.get(sid, 0) or 0)
+        if _cr:
+            entry["contract_retry"] = _cr
+        if handled or (res is not None and not passed):
+            entry["handle_fail"] = True
+        if alt:
+            entry["alternate"] = True
+        if force_strong.get(sid):
+            entry["force_strong"] = True
+        out[str(sid)] = entry
+    return out
+
+
 def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
     """将 Brain 状态片段写回 task_records"""
     updates: dict[str, Any] = {}
@@ -441,6 +511,13 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
         if isinstance(_cnt, int):
             _ab = max(0, min(_ab, _cnt - done))
         updates["abandoned_subtasks"] = _ab
+
+    # #32：每子任务运行态映射（当前 plan 内）——计划明细表 + 概览分桶的单一数据源。
+    # 闸在【派生结果非空】而非 `plan is not None`：plan 存在但 subtasks 为空（降级/部分
+    # resume 快照）时 derive 返回 {}，用空 dict 覆写会静默抹掉已持久化的运行态。
+    _rt_updates = derive_subtask_runtime(state)
+    if _rt_updates:
+        updates["subtask_runtime"] = _rt_updates
 
     merged_diff = state.get("merged_diff")
     if merged_diff:
@@ -711,6 +788,22 @@ async def _stream_brain_events(
                 # round27 perf：同上，DB 回写卸线程池，不卡事件环。
                 # D26：喂【累积全量快照】而非裸增量 output——记账（completed/abandoned/plan）方正确。
                 await asyncio.to_thread(_sync_task_from_state, task_id, dict(_accumulated_state))
+                # #32：实时推送子任务运行态到 WebUI（概览分桶/计划明细表订阅同一 SSE tick）。
+                # 在 sync 节点（plan/elaborate/dispatch/merge…）边界发——正是子任务集/状态/
+                # 重试计数变更的时刻：新拆子块出现、分母增长、状态流转、retry 递增都随此实时反映。
+                _rt = derive_subtask_runtime(_accumulated_state)
+                if _rt:
+                    # 闸在派生结果非空（同 _sync_task_from_state）——空 tick 只会让前端
+                    # 一瞬闪成空表，虽自愈但无意义，且与 DB 侧行为保持一致不漂移。
+                    # 不带 "node" 键：本 tick 仅承载子任务运行态，绝不驱动 pipeline 阶段显示
+                    # （pipeline 由 brain_node 事件 + restorePipelineFromStatus 独立负责）。
+                    await _emit(queue, {
+                        "step": "subtasks",
+                        "mode": "brain",
+                        "subtask_runtime": _rt,
+                        "completed": _count_completed_in_plan(_accumulated_state),
+                        "total": len(_rt),
+                    })
                 # P1-B：规划/拆分揭示子任务数 → 放宽弹性墙钟（只增不减，防大型任务被基线上限误杀）。
                 _plan_out = output.get("plan")
                 _subs = None

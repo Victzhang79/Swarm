@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS task_records (
     subtask_count INTEGER DEFAULT 0,
     completed_subtasks INTEGER DEFAULT 0,
     abandoned_subtasks INTEGER DEFAULT 0,
+    subtask_runtime JSONB DEFAULT '{}',
     human_decision TEXT,
     merged_diff TEXT,
     thread_id TEXT,
@@ -156,6 +157,9 @@ _TASK_RECORDS_MIGRATIONS = [
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
     # round18 P2：进度三本账（完成/放弃/剩余）——放弃单元数,让 web 进度不再误导"卡在 X/N"。
     "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS abandoned_subtasks INTEGER DEFAULT 0",
+    # #32 WebUI 可观测：每子任务运行态映射 {sid: {status, retry, handle_fail, ...}} —— 从
+    # graph state 单一事实源派生（_sync_task_from_state），供计划明细表/概览分桶精确渲染。
+    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS subtask_runtime JSONB DEFAULT '{}'",
     # F6（阶段6 补漏，发版回查）：预处理 LLM 摘要落独立字段，绝不静默覆写用户 description
     "ALTER TABLE projects ADD COLUMN IF NOT EXISTS analysis_summary TEXT DEFAULT ''",
     # R65D-T5 plan 注入端：录制 cassette（swarm-plan-cassette/v1）随任务落库，runner 启动时
@@ -175,7 +179,8 @@ _TASK_SELECT = """
     auto_accept, queue_priority,
     base_commit, retry_prev_thread_id,
     error,
-    injected_plan
+    injected_plan,
+    subtask_runtime
 """
 
 
@@ -944,6 +949,7 @@ def update_task(
     subtask_count: int | None = None,
     completed_subtasks: int | None = None,
     abandoned_subtasks: int | None = None,
+    subtask_runtime: dict[str, Any] | None = None,
     human_decision: str | None = None,
     merged_diff: str | None = None,
     thread_id: str | None = None,
@@ -984,6 +990,10 @@ def update_task(
     if abandoned_subtasks is not None:
         sets.append("abandoned_subtasks = %s")
         params.append(abandoned_subtasks)
+    if subtask_runtime is not None:
+        # #32：整体替换（last-write-wins）——每次 sync 由 graph state 全量派生，无累积语义。
+        sets.append("subtask_runtime = %s")
+        params.append(Jsonb(subtask_runtime))
     if human_decision is not None:
         sets.append("human_decision = %s")
         params.append(human_decision)
@@ -2137,6 +2147,11 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
             row[28] if isinstance(row[28], dict)
             else (json.loads(row[28]) if row[28] else None)
         ) if len(row) > 28 else None,
+        # #32：每子任务运行态映射（缺列/空=空 dict）。解析口径与 plan 列一致。
+        "subtask_runtime": (
+            row[29] if isinstance(row[29], dict)
+            else (json.loads(row[29]) if row[29] else {})
+        ) if len(row) > 29 else {},
     }
 
 

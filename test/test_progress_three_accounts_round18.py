@@ -27,10 +27,12 @@ def test_select_has_26_columns():
     # E1（阶段5）语义演进：末尾追加 retry_prev_thread_id（重试续跑锚点）→ 27 列。
     # R38-E：末尾追加 error（FAILED 终态机读账）→ 28 列。
     # R65D-T5：末尾追加 injected_plan（plan 注入 cassette）→ 29 列（_row_to_task row[28]）。
-    assert cols[-7] == "abandoned_subtasks", cols
-    assert cols[-6:] == ["auto_accept", "queue_priority", "base_commit",
-                         "retry_prev_thread_id", "error", "injected_plan"], cols
-    assert len(cols) == 29, cols
+    # #32：末尾追加 subtask_runtime（每子任务运行态映射）→ 30 列（_row_to_task row[29]）。
+    assert cols[-8] == "abandoned_subtasks", cols
+    assert cols[-7:] == ["auto_accept", "queue_priority", "base_commit",
+                         "retry_prev_thread_id", "error", "injected_plan",
+                         "subtask_runtime"], cols
+    assert len(cols) == 30, cols
 
 
 def test_three_accounts_typical():

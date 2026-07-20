@@ -51,7 +51,12 @@ function handleBrainProgressEvent(data) {
   if (data.node) {
     updateNodeStatus(data.node, data.status === 'done' ? 'done' : 'running');
   }
-  if (data.subtasks) updateSubtaskList(data.subtasks);
+  // #32：实时子任务运行态 tick（step:"subtasks"）——概览分桶/进度环/计划明细表同源刷新。
+  if (data.subtask_runtime && typeof applySubtaskTick === 'function') {
+    applySubtaskTick(data);
+  } else if (data.subtasks) {
+    updateSubtaskList(data.subtasks);
+  }
   if (data.knowledge_stats) showKnowledgeBanner(data.knowledge_stats, data.complexity);
   if (data.node === 'dispatch') refreshSandboxes(selectedProjectId);
 }
