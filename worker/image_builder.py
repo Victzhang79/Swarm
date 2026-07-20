@@ -485,7 +485,9 @@ def _selftest_command(spec: EnvSpec) -> str | None:
             # -o 离线 -am 连带依赖模块 -q 安静；编译整个 reactor（聚合），不指定模块名（通用）
             return "cd /workspace && mvn -o -B -q -Dmaven.test.skip=true compile"
         if tc.name == "java" and tc.build_tool == "gradle":
-            return "cd /workspace && (./gradlew --offline compileJava -q || gradle --offline compileJava -q)"
+            # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Groovy/Java)——compileJava 对
+            # 非 Java JVM 工程编译零源=假过。classes 由任一 JVM 语言插件创建，是严格超集。
+            return "cd /workspace && (./gradlew --offline classes -q || gradle --offline classes -q)"
         if tc.name == "node":
             # 有 build 脚本就跑 build，否则只验证 install 后能解析
             return "cd /workspace && (npm run build --if-present || npm ci --offline || true)"

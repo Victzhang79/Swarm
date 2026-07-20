@@ -2290,7 +2290,9 @@ def _derive_full_build_command(
     if ext(".java", ".kt", ".scala"):
         if build == "gradle" or (not build and not has("pom.xml")
                                  and has("build.gradle", "build.gradle.kts")):
-            return "./gradlew -q compileJava" if has("gradlew") else "gradle -q compileJava"
+            # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Java)——旧 compileJava 对
+            # .kt/.scala 编译零源→假过，或任务不存在→冤杀。classes 由任一 JVM 语言插件创建。
+            return "./gradlew -q classes" if has("gradlew") else "gradle -q classes"
         if build == "maven" or has("pom.xml"):
             return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
     if ext(".go") and (build == "go" or has("go.mod")):

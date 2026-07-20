@@ -85,7 +85,11 @@ def _detect_build_cmd_generic(project_path: str) -> str | None:
     if os.path.isfile(j(project_path, "build.gradle")) or os.path.isfile(
         j(project_path, "build.gradle.kts")
     ):
-        return "./gradlew -q compileJava 2>/dev/null || gradle -q compileJava"
+        # #37 治本：`classes` 任务编译主源集【全部 JVM 语言】(compileJava+compileKotlin+
+        # compileScala+compileGroovy，按已应用插件)。旧 `compileJava` 对 Kotlin/Scala 工程
+        # (build.gradle.kts→Kotlin)编译零源→exit 0【假过自动 ACCEPT 坏构建】，或 java 插件
+        # 缺席时任务不存在→非零【冤杀好构建】。`classes` 由任一 JVM 语言插件创建，跨语言正确。
+        return "./gradlew -q classes 2>/dev/null || gradle -q classes"
     if os.path.isfile(j(project_path, "go.mod")):
         return "go build ./..."
     if os.path.isfile(j(project_path, "Cargo.toml")):
