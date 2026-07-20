@@ -2391,7 +2391,7 @@ wheels = [
 
 [[package]]
 name = "swarm"
-version = "0.9.28"
+version = "0.9.58"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
