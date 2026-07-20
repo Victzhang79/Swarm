@@ -391,6 +391,52 @@ def _detect_jvm_facts(
     }
 
 
+def baseline_lombok_present(project_path: str) -> bool | None:
+    """R65E10-T2：基线是否【真实启用】Lombok（供契约依赖剥除做正确方向判定）。
+
+    与 _detect_jvm_facts 内联探测【同一】识别口径（单一事实源）：剥 XML 注释/Maven exclusion 块/
+    Gradle exclude 行后按真实坐标 org.projectlombok 判构建清单；再看源码 `import lombok.`。
+    猎手 F2 同律：lombok 仅出现在 <exclusions>（挡传递）≠ 启用。
+
+    返回 True/False；project_path 无效/无任何构建清单+源码可读=无法判定 → None（调用方 fail-open
+    保守【不剥】，绝不把"探测不到"当"基线无 lombok"误删真在用依赖致编译断裂）。
+    """
+    try:
+        if not os.path.isdir(project_path):
+            return None
+        # 有限 walk（大 monorepo 封顶）收集 pom/gradle 构建清单 + .java 采样
+        build_texts: list[str] = []
+        java_paths: list[str] = []
+        _seen_dirs = 0
+        for dirpath, dirnames, filenames in os.walk(project_path):
+            _seen_dirs += 1
+            if _seen_dirs > 2400:
+                break
+            dirnames[:] = [d for d in dirnames
+                           if d not in (".git", "target", "node_modules", ".idea", "build")]
+            for fn in filenames:
+                if fn == "pom.xml" or fn in ("build.gradle", "build.gradle.kts"):
+                    if len(build_texts) < 200:
+                        build_texts.append(_read_text(os.path.join(dirpath, fn), limit=20000))
+                elif fn.endswith(".java") and len(java_paths) < 200:
+                    java_paths.append(os.path.join(dirpath, fn))
+        if not build_texts:
+            return None
+        _bt = "\n".join(build_texts)
+        _bt = re.sub(r"<!--.*?-->", " ", _bt, flags=re.S)
+        _bt = re.sub(r"<exclusions?>.*?</exclusions?>", " ", _bt, flags=re.S)
+        _bt = "\n".join(ln for ln in _bt.splitlines() if "exclude" not in ln)
+        if "org.projectlombok" in _bt:
+            return True
+        # 源码实证：采样 .java 的 `import lombok.`（_read_text 已小写，anchor 小写）
+        for jp in java_paths:
+            if "import lombok." in _read_text(jp, limit=4000):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — 探测异常=无法判定→None（调用方 fail-open）
+        return None
+
+
 def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     """确定性磁盘探测 → project_stack 画像 + 置信度 + 证据。不调 LLM、不连 DB。
 

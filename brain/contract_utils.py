@@ -13,6 +13,15 @@ from swarm.types import SubTaskDifficulty, TaskPlan
 
 logger = logging.getLogger(__name__)
 
+
+def _record_degrade_safe(category: str) -> None:
+    """record_degrade 薄封装——degrade 基建缺失/异常绝不炸主链（本模块降级留痕用）。"""
+    try:
+        from swarm.infra.degrade import record_degrade
+        record_degrade(category)
+    except Exception:  # noqa: BLE001
+        pass
+
 # Maven `-pl <module>` 提取（reactor 模块选择）。
 _MVN_PL_RE = re.compile(r"-pl\s+([^\s,]+)")
 
@@ -963,6 +972,74 @@ def prune_contract_dependencies(plan, project_path: str | None) -> dict[str, lis
         "并记入 pruned_artifacts 账本（模板/验收/worker 契约同源，消除'验收逼 worker "
         "复入'——round63 st-5 死型）: %s", len(pruned_now), pruned_now)
     return pruned_now
+
+
+def prune_baseline_absent_dependencies(plan, project_path: str | None) -> dict[str, list[str]]:
+    """R65E10-T2（round65e10 死因②·源头正确方向）：基线【明确无 Lombok】时，从契约依赖剥除
+    lombok 坐标——防 H1 权威 pom 模板据契约 artifacts 把 lombok 注入 pom，撞 T5 grounding 派生的
+    验收 `! grep -rq 'lombok' <module-dir>/`（禁令是【正确侧】：基线 0 lombok）→ 每轮确定性不可赢
+    →st-1 head-of-line 连坐全 92（本轮实证）。
+
+    正确方向：剥【错侧】(lombok 进 pom)、保【对侧】(禁令验收)——交付与基线约定一致（手写 getter），
+    禁令继续守"代码不得用 lombok"。必须跑在模板生成前（同 prune_contract_dependencies 咽喉）。
+
+    栈中立：仅当 baseline_lombok_present 明确返回 False 才剥（Java 特有信号，其他栈恒 None/无 lombok
+    坐标=no-op）。fail-open：无法判定基线（None）/无契约/异常 → 不剥（绝不误删真在用 lombok 致编译
+    断裂）。与 prune_contract_dependencies 同律留 artifacts_pre_prune 快照（瞬时可复原）。
+    返回 {module: [dropped_spec…]}。"""
+    sc = getattr(plan, "shared_contract", None)
+    if not project_path or not isinstance(sc, dict):
+        return {}
+    deps = sc.get("dependencies")
+    if not isinstance(deps, list) or not deps:
+        return {}
+    try:
+        from swarm.brain.stack_detect import baseline_lombok_present
+        _present = baseline_lombok_present(project_path)
+    except Exception:  # noqa: BLE001 — 探测异常绝不误剪
+        _record_degrade_safe("brain.contract.lombok_baseline_undeterminable")
+        logger.warning("[R65E10-T2] 基线 lombok 探测异常（fail-open，不剥）", exc_info=True)
+        return {}
+    if _present is None:
+        # ★复核 MED★ 无法判定（无构建清单/walk 截断/探测异常）≠ 确定无 lombok——record_degrade
+        # 令"探测失败静默不剥→死因可能复发"在 /api/metrics 可分（sibling record_degrade 约定）。
+        _record_degrade_safe("brain.contract.lombok_baseline_undeterminable")
+        logger.info("[R65E10-T2] 基线 lombok 在位性无法判定（fail-open 保守不剥，绝不误删真在用）")
+        return {}
+    if _present is True:
+        return {}  # 基线真在用 lombok → 保留（合法 no-op，静默）
+    # lombok 判据（复核）：与验收 `! grep -rq 'lombok'` 同语义——大小写不敏感【子串】匹配，
+    # 涵盖 org.projectlombok:lombok / 裸 lombok / 任何含 'lombok' 的坐标（如 com.foo:lombok-utils，
+    # 其字面进 pom 同样触发禁令）。基线 0 lombok 时这些都不该在 pom，与禁令口径一致。
+    def _is_lombok(spec: str) -> bool:
+        return "lombok" in str(spec or "").lower()
+
+    # ★复核 HIGH★ 本函数【必须跑在 prune_contract_dependencies 之前】，且把 lombok 从
+    # artifacts_pre_prune（若前轮已建）也剥掉——否则 prune_contract_dependencies 的"历史轮被剪
+    # 本轮全可解析→从 artifacts_pre_prune 复原"分支会把 lombok（可解析坐标）复活，静默抵消本剥除
+    # （hunter 实证再入轮复活）。故不自建含 lombok 的快照，只【清理】既有快照，令复原源永久无 lombok。
+    dropped_all: dict[str, list[str]] = {}
+    for entry in deps:
+        if not isinstance(entry, dict):
+            continue
+        mod = str(entry.get("module") or "").strip().rstrip("/")
+        arts = [a for a in (entry.get("artifacts") or []) if a]
+        _drop = [a for a in arts if _is_lombok(a)]
+        _pre = entry.get("artifacts_pre_prune")
+        _pre_has = isinstance(_pre, list) and any(_is_lombok(a) for a in _pre)
+        if not _drop and not _pre_has:
+            continue
+        entry["artifacts"] = [a for a in arts if not _is_lombok(a)]
+        if isinstance(_pre, list):   # 前轮快照同步清 lombok，杜绝下游复原源复活
+            entry["artifacts_pre_prune"] = [a for a in _pre if not _is_lombok(a)]
+        if _drop:
+            dropped_all[mod or "?"] = _drop
+    if dropped_all:
+        logger.warning(
+            "[R65E10-T2] 基线无 Lombok（磁盘实证）→ 从契约剥除 lombok 坐标 %s"
+            "（防 pom 模板注 lombok 撞 `! grep -rq lombok` 禁令=round65e10 st-1 考卷矛盾死因②；"
+            "交付手写 getter 与基线一致）", dropped_all)
+    return dropped_all
 
 
 def _baseline_module_artifact(root: Path, mod_dir: str) -> str | None:
@@ -1934,6 +2011,14 @@ def _inject_build_scaffold_subtasks_impl(
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
         logger.debug("[SCAFFOLD-INJECT] G9 未检出构建栈证据 → 保守回退 Maven（back-compat）")
+    # R65E10-T2：基线无 Lombok 时剥 lombok 契约坐标——防 pom 注 lombok 撞 `! grep -rq lombok`
+    # 禁令=round65e10 st-1 考卷矛盾死因②。★必须先于 prune_contract_dependencies★（复核 HIGH）：
+    # 后者会从 artifacts_pre_prune 复原可解析坐标，lombok 可解析→若在其后跑会被复活。本函数把
+    # lombok 从 artifacts+既有快照都剥掉，令下游 snapshot/复原源永久无 lombok。fail-open 见函数。
+    try:
+        prune_baseline_absent_dependencies(plan, project_path)
+    except Exception:  # noqa: BLE001 — 绝不炸脚手架注入主链
+        logger.warning("[R65E10-T2] 基线约定剥除失败（fail-open，契约保持原样）", exc_info=True)
     # T6①：契约依赖同源剪除**先于一切消费面**（owner 模板/scaffold 模板/后续规则5 验收
     # 读的都是剪后 entry）——round63 死型=验收要求被剪依赖逼 worker 复入。
     prune_contract_dependencies(plan, project_path)
