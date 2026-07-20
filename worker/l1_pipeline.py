@@ -3164,15 +3164,58 @@ def _reconcile_maven_module_registration(project_path: str, modified: list[str])
     return out
 
 
+_UPSTREAM_GOAL_RE = re.compile(
+    r"\b(compile|test-compile|test|package|verify|install|deploy)\b")
+
+
+def _ensure_reactor_am(command: str) -> str:
+    """R65E10-T1（round65e10 st-1 死因①）：命令【已含 -pl <targets>】但缺 -am 且目标需上游产物
+    → 在 -pl <targets> 之后注入 -am；否则原样。
+
+    死因：plan 自撰 verify `mvn compile -pl <mod> -q`（无 -am）解析不到 reactor 兄弟
+    （com.<proj>:ruoyi-common:jar → Could not find artifact）→ 假阴性烧正确代码。R65E8-T1 只治了
+    `cd <mod> && mvn` 裸形，`_scope_maven_command`/reactorize cd-branch 都把"已 -pl"当"已 reactor
+    感知"原样返回 → 已 -pl 缺 -am 形永不修。此纯函数补该形，供两处共用（DRY，与 build/test 对称）。
+
+    保守边界：无 -pl / 非 mvn / 已 -am(含 --also-make 长形) / 不需上游的目标(validate/clean/help)
+    → 原样（validate 不加 -am 守 P0-B 不连坐 sibling，与既有 needs_upstream 口径一致）。
+    """
+    if "mvn" not in command or "-pl" not in command:
+        return command
+    # 已带 -am / --also-make → 不重复注入
+    if re.search(r"(?:^|\s)-am\b", command) or "--also-make" in command:
+        return command
+    # ★复核 HIGH★ goal 判定必须【先剥掉 -pl <targets>】再扫——否则模块名含 test/package/install/
+    # deploy 等词元子串（如 `-pl ruoyi-quartz-test`）会假触发 needs_upstream→纯 validate 被误加 -am→
+    # 连坐 sibling 违 P0-B（D5(a) 不变量）。剥 -pl 段只为 goal 检测，注入仍作用于原命令。
+    _goal_scan = re.sub(r"-pl\s+\S+", " ", command)
+    if not _UPSTREAM_GOAL_RE.search(_goal_scan):
+        return command  # validate/clean 等不需上游产物 → 不加 -am
+    # -pl 后的 targets（module 列表，逗号/无空格）之后插 -am
+    out = re.sub(r"(-pl\s+\S+)", r"\1 -am", command, count=1)
+    if out != command:
+        # ★复核 MED★ 补齐必留痕（与兄弟 R65E8-T1 归一日志对称）——否则"修复是否触发"在 swarm.log
+        # 不可见，正是 round65e8/e10 难诊断的审计盲区。
+        logger.info(
+            "[L1.3.5] R65E10-T1 已 -pl 缺 -am 补齐：%r → %r"
+            "（无 -am 解析不到 reactor 兄弟=假阴性烧正确代码，round65e10 st-1 死因①）",
+            command, out)
+    return out
+
+
 def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
     """多模块 Maven：把整 reactor 的 mvn 命令改写成只编【改动所在模块】(-pl <mod> -am)。
 
     RuoYi 等多模块工程根 pom 聚合 6 个模块，整 reactor `mvn compile` 需要所有模块
     源码齐备(而 worker 只同步改动模块) → reactor 失败。正确做法是 -pl 限定改动模块、
-    -am 连带构建其依赖的上游模块。已含 -pl 的命令不动；非 mvn 命令原样返回。
+    -am 连带构建其依赖的上游模块。已含 -pl 的命令补齐 -am（R65E10-T1）；非 mvn 命令原样返回。
     """
-    if "mvn" not in command or "-pl" in command:
+    if "mvn" not in command:
         return command
+    if "-pl" in command:
+        # R65E10-T1：已 -pl 不再盲目原样——若 upstream 目标缺 -am 则补（治 round65e10 st-1 死因①：
+        # `mvn compile -pl <mod> -q` 无 -am→sibling 解析不到→假阴性）。已 -am/非 upstream→原样。
+        return _ensure_reactor_am(command)
     modules = _maven_modules(project_path)
     if not modules:
         return command
@@ -3291,8 +3334,12 @@ def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[s
             or len(re.findall(r'\bmvn\b', _rest)) != 1 or not re.match(r'^mvn\b', _rest)
             or ".." in _dir.split("/")):
         return command
-    if "-pl" in _rest or re.search(r"-f\s", _rest):
-        return command   # 已 reactor 感知 / 已 -f scoped → 勿重复注入
+    if re.search(r"-f\s", _rest):
+        return command   # 已 -f scoped → 勿臆改
+    if "-pl" in _rest:
+        # R65E10-T1：cd-branch 同样的"已 -pl 缺 -am"盲区——保守只补 -am，【保留 cd 前缀原样】
+        # （对整条命令 apply helper，仅在 -pl 后插 -am；不臆改其余结构）。已 -am/非 upstream→原样。
+        return _ensure_reactor_am(command)
     try:
         registered = set(_maven_modules(project_path).values())
     except Exception:  # noqa: BLE001 — 读模块失败保守原样，绝不炸 L1 主链
