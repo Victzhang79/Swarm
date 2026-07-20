@@ -2181,7 +2181,10 @@ def _inject_build_scaffold_subtasks_impl(
             scope=FileScope(
                 writable=[pom] if pom_exists else [],
                 create_files=[] if pom_exists else [pom]),
-            contract={"dependencies": [{"module": mod, "artifacts": arts}]},
+            # #31-P2 复核 HIGH：契约 module 是 LLM 逻辑标签（R58-1 可与物理目录不同名，
+            # 如 alarm-admin 实住 ruoyi-admin/）。额外记【物理目录 _mdir】作 ground truth，
+            # 让 L1 依赖完整性闸按物理真相归属 manifest，而非猜标签（否则改名模块闸静默失效）。
+            contract={"dependencies": [{"module": mod, "dir": _mdir, "artifacts": arts}]},
             acceptance_criteria=[
                 f"{pom} 声明契约 dependencies 全部 artifacts，模块构建命令通过"],
         )

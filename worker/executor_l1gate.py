@@ -359,6 +359,61 @@ class _L1GateMixin:
                                  "也不在项目盘上）——归因自身 capability 失败触发重试/换模型；"
                                  "非上游 BLOCKED"),
                     }
+        # #31-P2：逐【声明依赖坐标】完整性闸——契约 contract["dependencies"] 声明模块 manifest
+        # 【必须声明】的坐标（scaffold 注入器写、同源已剪枝），但 worker 产出的 manifest 实际缺
+        # 声明 → 下游兄弟构建期 reactor 读不出 → 连坐（#35 round65e13/e2 实锤）。create_files 闸
+        # 只核验文件在，核验不到"文件在但缺声明坐标"。此处补刀。栈中立（basename→verifier registry：
+        # maven/gradle/npm/go/cargo），匹配忽略 group+version。fail-open 同 create_files 闸：dirty
+        # sync / 读不到 / 未知栈 / 空契约 → 不判死；确凿"声明坐标 C 可证不在本 scope 的 manifest"
+        # 才 fail-closed，归因自身 capability（重试/换模型），非上游 BLOCKED。
+        _contract = getattr(self.subtask, "contract", None)
+        _contract_deps = _contract.get("dependencies") if isinstance(_contract, dict) else None
+        _dep_check_meta: dict = {}
+        if _contract_deps:
+            _sync_clean_dep = (getattr(self, "_sync_skipped_count", 0) == 0
+                               and not getattr(self, "_sync_error_rels", None)
+                               and not getattr(self, "_sync_oversize_rels", None))
+            if not _sync_clean_dep:
+                _dep_check_meta["dep_check_skipped"] = "dirty_sync"
+                logger.warning(
+                    "[#31-P2] sync 不干净 → 声明依赖完整性闸 fail-open 跳过"
+                    "（on-disk manifest 视图不可信，防拉回抖动冤杀）")
+            else:
+                _dep_missing: list[dict] = []
+                try:
+                    from swarm.worker.l1_pipeline import (
+                        _read_project_file,
+                        missing_declared_dependencies,
+                    )
+                    _scope_manifests = (list(getattr(scope, "create_files", None) or [])
+                                        + list(getattr(scope, "writable", None) or []))
+                    _dep_exempt = set(getattr(self, "_repaired_extra_paths", None) or [])
+                    _dep_exempt |= set((getattr(self, "_h1_enforced_templates", None) or {}).keys())
+                    # F2（复核 MEDIUM）：闸engaged 可观测——"跑了没缺"≠"scope 里根本没可核验 manifest"。
+                    _dep_check_meta["dep_check_ran"] = {
+                        "entries": len(_contract_deps) if isinstance(_contract_deps, list) else 1,
+                        "scope_manifests": len(_scope_manifests)}
+                    _dep_missing = missing_declared_dependencies(
+                        _contract_deps, _scope_manifests,
+                        read=lambda _rel: _read_project_file(self.project_path, _rel),
+                        exempt=_dep_exempt)
+                except Exception as _dc_exc:  # noqa: BLE001 — fail-open：核验异常绝不判死
+                    logger.warning(
+                        "[#31-P2] 声明依赖完整性核验异常(fail-open 跳过，闸未生效): %s", _dc_exc)
+                    _dep_check_meta["dep_check_error"] = str(_dc_exc)[:200]
+                    _dep_missing = []
+                if _dep_missing:
+                    _brief = [f"{d['manifest']}←{d['coordinate']}" for d in _dep_missing[:6]]
+                    self._log(
+                        "L1 声明依赖完整性闸：声明坐标未在产出 manifest 中声明（盘上 manifest 无）"
+                        f" → 判 capability 失败: {_brief}")
+                    return False, {
+                        "deterministic_gate": "fail",
+                        "reason": "declared_dependency_missing",
+                        "missing_dependencies": _dep_missing,
+                        "note": ("worker 产出的 manifest 未声明契约要求的依赖坐标（盘上 manifest 里没有）"
+                                 "——归因自身 capability 失败触发重试/换模型；非上游 BLOCKED"),
+                    }
         try:
             from swarm.worker.l1_pipeline import run_l1_pipeline
 
@@ -386,6 +441,9 @@ class _L1GateMixin:
             # 可观测（"闸没跑成"≠"闸跑了没缺"），防 import/逻辑回归让 #31 保护静默复活死型。
             if _cf_check_meta:
                 details.update(_cf_check_meta)
+            # F2（#31-P2）：声明依赖闸的"跳过/异常"元信息同样透传（闸未生效可观测）。
+            if _dep_check_meta:
+                details.update(_dep_check_meta)
             # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程
             # 清单缺失、构建命中 infra 瞬时故障、非空 diff 却解析到 0 文件）。这种 passed-but-blocked
             # 绝不能当真 PASS → 降为 None(BLOCKED)，交裁决器走 transient 退避重试。

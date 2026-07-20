@@ -2484,6 +2484,246 @@ def missing_created_files(
     return missing
 
 
+# ════════════════ #31-P2：声明依赖坐标完整性（栈中立 verifier registry）════════════════
+#
+# 治本 #31/#35（round65e13/round65e2 实锤）：scaffold 子任务的 contract["dependencies"] 声明
+# 模块 manifest【必须声明】的坐标（同源已剪枝，见 contract_utils.resolve_scaffold_artifacts），但
+# worker 产出的 manifest 实际缺声明 → 下游兄弟构建期读不出 → 连坐。create_files 闸只核验文件在，
+# 核验不到"文件在但缺声明坐标"。本组函数补刀。
+#
+# ★栈中立★：manifest basename → verifier；verifier 是【stack-特化 LEAF】（解析 pom vs package.json
+# vs go.mod 天生不同），但 dispatch 层（registry）中立，未知栈 → 无 verifier → 跳（fail-open no-op）。
+# ★匹配按尾名★：artifactId / package-name / module-path，忽略 group + version（免疫 BOM 受管 /
+# 版本范围 / ${project.version} / workspace:* → 绝不因版本写法差异误杀）。
+
+
+def _maven_declared_artifact_ids(text: str) -> set[str]:
+    """pom 的【direct 运行时依赖】artifactId 集（复用 workspace_manifest._maven_direct_deps，
+    已排除 parent/dependencyManagement/build）。受管块里的坐标不算 direct 声明。"""
+    from swarm.worker.workspace_manifest import _maven_direct_deps
+    return {a for (_g, a, _v) in _maven_direct_deps(text or "") if a}
+
+
+_GRADLE_DEP_RE = re.compile(
+    r"""(?:implementation|api|compileOnly|compileOnlyApi|runtimeOnly|testImplementation|"""
+    r"""testRuntimeOnly|annotationProcessor|kapt|ksp|classpath|developmentOnly)\s*"""
+    r"""[\(\s]\s*['"]([^'"]+)['"]""")
+
+
+def _gradle_declared_deps(text: str) -> set[str]:
+    """build.gradle(.kts) 的依赖 artifactId 集（best-effort：配置关键字后引号内 g:a:v → 取 a）。"""
+    out: set[str] = set()
+    for coord in _GRADLE_DEP_RE.findall(text or ""):
+        parts = [p for p in coord.split(":") if p]
+        if len(parts) >= 2:
+            out.add(parts[1])
+        elif parts:
+            out.add(parts[0])
+    return out
+
+
+def _npm_declared_deps(text: str) -> set[str]:
+    """package.json 的依赖包名集（dependencies + dev/peer/optional）。JSON 解析异常 → 由调用方 fail-open。"""
+    import json as _json
+    data = _json.loads(text or "")
+    if not isinstance(data, dict):
+        return set()
+    names: set[str] = set()
+    for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        sect = data.get(key)
+        if isinstance(sect, dict):
+            names |= {str(n).strip() for n in sect if str(n).strip()}
+    return names
+
+
+_GO_REQUIRE_BLOCK_RE = re.compile(r"require\s*\((.*?)\)", re.S)
+_GO_REQUIRE_LINE_RE = re.compile(r"(?m)^\s*require\s+(\S+)\s+\S+")
+
+
+def _go_declared_modules(text: str) -> set[str]:
+    """go.mod 的 require 模块路径集（块形态 + 单行形态）。只收形似模块路径（含 / 或 .）的
+    token——排除块开括号 `(` 等噪声（复核 LOW：单行正则会误捕 `require (` 的 `(`）。"""
+    out: set[str] = set()
+    t = text or ""
+    for blk in _GO_REQUIRE_BLOCK_RE.findall(t):
+        for line in blk.splitlines():
+            s = line.strip()
+            if not s or s.startswith("//"):
+                continue
+            parts = s.split()
+            if parts and ("/" in parts[0] or "." in parts[0]):
+                out.add(parts[0])
+    for m in _GO_REQUIRE_LINE_RE.finditer(t):
+        g = m.group(1)
+        if "/" in g or "." in g:
+            out.add(g)
+    return out
+
+
+def _manifest_complete(backend: str, text: str) -> bool:
+    """结构完整性哨兵（治复核 HIGH：防【截断但非空】的 manifest 被当"零依赖"误杀）。
+
+    正则型 verifier（maven/go）依赖【匹配到闭合标记】才产出坐标；若文本在开/闭标记之间被截断
+    （沙箱 cat 输出被 buffer 截、传输中断而进程仍 exit 0），findall 返回空≠"真无依赖"，会把契约
+    全部坐标误判缺失→冤杀合法产出（Phase1 F1b 同类，换个入口复发）。故【只有结构完整才有资格
+    断言某坐标缺失】；不完整（截断/畸形）→ 视作读不到 → 跳（fail-open）。
+    只做廉价栈特化终止符/括号平衡校验，宁可放过截断也绝不误杀。"""
+    t = text or ""
+    if backend == "maven":
+        return bool(re.search(r"</project\s*>", t))          # pom 必闭合根标签
+    if backend == "go":
+        # go.mod 必有 module 声明；require 块括号平衡（截断在块中 → 左多于右 → 不完整）
+        return ("module " in t) and (t.count("(") <= t.count(")"))
+    if backend == "cargo":
+        return ("[package]" in t) or ("[dependencies]" in t)  # 真 Cargo.toml 必有 [package]
+    # npm：json.loads 自身校验截断（抛异常→上层 fail-open 跳）；gradle：逐行弹性解析，无可靠
+    # 终止符，截断前的条目仍识别（截断后条目若被契约要求会误判——2b 接 gradle scaffold 前补测）。
+    return True
+
+
+def _cargo_declared_deps(text: str) -> set[str]:
+    """Cargo.toml 的依赖 crate 名集（[dependencies]/[dev-dependencies]/[build-dependencies] 表键
+    + [dependencies.foo] 子表名）。"""
+    out: set[str] = set()
+    in_deps = False
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if s.startswith("["):
+            sub = re.match(r"\[(?:dev-|build-)?dependencies\.([A-Za-z0-9_\-]+)\]", s)
+            if sub:
+                out.add(sub.group(1))
+                in_deps = False
+                continue
+            in_deps = s in ("[dependencies]", "[dev-dependencies]", "[build-dependencies]")
+            continue
+        if in_deps and "=" in s and not s.startswith("#"):
+            name = s.split("=", 1)[0].strip().strip('"').strip("'")
+            if name:
+                out.add(name)
+    return out
+
+
+# manifest basename → (backend, verifier)。stack-特化 LEAF 经中立 registry 分派；未知栈 → miss → 跳。
+_DEP_VERIFIER_BY_MANIFEST: dict[str, tuple[str, "callable"]] = {
+    "pom.xml": ("maven", _maven_declared_artifact_ids),
+    "build.gradle": ("gradle", _gradle_declared_deps),
+    "build.gradle.kts": ("gradle", _gradle_declared_deps),
+    "package.json": ("npm", _npm_declared_deps),
+    "go.mod": ("go", _go_declared_modules),
+    "Cargo.toml": ("cargo", _cargo_declared_deps),
+}
+
+
+def _coord_name_for(backend: str, spec: str) -> str:
+    """契约坐标 → 匹配用【尾名】（与 verifier 返回的名空间对齐，忽略 group + version）。
+    maven/gradle: 'g:a[:v]' → a（裸名 → 名本身）；npm/go/cargo: 名即坐标本身（npm 保 @scope/pkg，
+    go 保完整 module path，cargo 保 crate 名）。"""
+    s = str(spec).strip()
+    if backend in ("maven", "gradle"):
+        parts = [p for p in s.split(":") if p]
+        if len(parts) >= 2:
+            return parts[1]
+        return parts[0] if parts else ""
+    return s
+
+
+def _manifest_belongs_to_module(manifest_rel: str, module: str) -> bool:
+    """manifest 是否属于本 contract entry 的 module（R1：绝不跨模块/跨子任务核验）。
+    module 空 → True（scaffold 子任务 1:1，无从区分即放行给下方读/解析闸把关）。"""
+    m = str(manifest_rel).replace("\\", "/").strip("/")
+    mod = str(module).replace("\\", "/").strip("/")
+    if not mod:
+        return True
+    d = m.rsplit("/", 1)[0] if "/" in m else ""
+    return d == mod or d.endswith("/" + mod) or m.startswith(mod + "/")
+
+
+def missing_declared_dependencies(
+    contract_deps: "list | None",
+    scope_manifests: "list[str] | None",
+    *,
+    read: "callable | None" = None,
+    exempt: set[str] | None = None,
+) -> list[dict]:
+    """#31-P2：子任务【声明依赖坐标】完整性核验——返回【确凿缺失】坐标 [{manifest,coordinate,module}]。
+
+    事实源 = subtask.contract["dependencies"]（list[{module, artifacts:[spec...]}]，scaffold 注入器
+    写入，同源已剪枝 → 永不索要模板没写的坐标，#35 陷阱天然免疫）。
+
+    缺失判据（fail-closed 仅在确凿时）：某坐标 C（属 module M 的 manifest）
+      ① manifest 在本子任务 scope 且 basename 有 verifier（未知栈 → 跳），且
+      ② manifest 属于 M（_manifest_belongs_to_module；跨模块 → 跳），且
+      ③ manifest 非白名单豁免（H1 模板/repaired），且
+      ④ read(manifest) 返回【真文本】（None/空/纯空白 → 跳，绝不当"零依赖"误杀），且
+      ⑤ verifier(text) 成功返回坐标名集，且 C 的尾名 ∉ 该集。
+
+    fail-open 铁律：contract_deps 空 / read 未提供或抛异常 / 读不到/空 / 未知栈 / 跨模块 →
+    一律【不判缺失】。★匹配忽略 group+version★（尾名比对）。纯函数、栈中立、可单测。
+    """
+    entries = [e for e in (contract_deps if isinstance(contract_deps, list) else [])
+               if isinstance(e, dict) and [a for a in (e.get("artifacts") or []) if str(a).strip()]]
+    if not entries or read is None:
+        return []
+    manifests = [str(m) for m in (scope_manifests or []) if str(m).strip()]
+    if not manifests:
+        return []
+    exempt_set = {str(e) for e in (exempt or []) if str(e).strip()}
+
+    def _exempted(man: str) -> bool:
+        return any(_scope_match(e, man) or _scope_match(man, e) for e in exempt_set)
+
+    # scope 里【有 verifier 且未豁免】的候选 manifest。用于 R58-1 改名容错：若全 scope 只有唯一
+    # 候选、契约也只有唯一 entry，则按【scope 独占归属】直接信任（scaffold 恒 1:1），不靠猜标签。
+    _known = [m for m in manifests
+              if _DEP_VERIFIER_BY_MANIFEST.get(m.replace("\\", "/").rsplit("/", 1)[-1])
+              and not _exempted(m)]
+    _sole_pair = (len(entries) == 1 and len(_known) == 1)
+
+    missing: list[dict] = []
+    for entry in entries:
+        module = str(entry.get("module") or "").strip()
+        # 复核 HIGH：有【物理目录 dir】（injector 写的 ground truth）→ 严格按物理目录归属
+        # （R58-1 改名下正确，且 dir 不匹配就是真不匹配，绝不被 sole_pair 覆盖）；无 dir
+        # （老 checkpoint）→ 标签匹配，且 sole_pair 时按 scope 独占归属信任（改名容错）。
+        _dir = str(entry.get("dir") or "").strip()
+        target = _dir or module
+        arts = [str(a).strip() for a in (entry.get("artifacts") or []) if str(a).strip()]
+        for man in manifests:
+            base = man.replace("\\", "/").rsplit("/", 1)[-1]
+            spec = _DEP_VERIFIER_BY_MANIFEST.get(base)
+            if not spec:
+                continue                                   # 未知栈 → 跳（fail-open）
+            if _exempted(man):
+                continue                                   # 白名单豁免
+            # 归属判定：有 dir → 严格物理匹配；无 dir → 唯一配对信任 or 标签匹配
+            if _dir:
+                if not _manifest_belongs_to_module(man, _dir):
+                    continue                               # R1：物理目录确不匹配 → 跳
+            elif not (_sole_pair or _manifest_belongs_to_module(man, target)):
+                continue                                   # R1：确非本模块 → 跳
+            backend, verifier = spec
+            try:
+                text = read(man)
+            except Exception:  # noqa: BLE001 — 读异常 fail-open：绝不因探测失败误杀
+                continue
+            if not text or not str(text).strip():
+                continue                                   # 读不到/空 → 跳（不当零依赖）
+            if not _manifest_complete(backend, str(text)):
+                continue                                   # 截断/畸形 → 跳（不当零依赖，防误杀）
+            try:
+                present = verifier(str(text))
+            except Exception:  # noqa: BLE001 — 解析异常 fail-open
+                continue
+            if present is None:
+                continue
+            present_names = {str(p).strip() for p in present if str(p).strip()}
+            for coord in arts:
+                name = _coord_name_for(backend, coord)
+                if name and name not in present_names:
+                    missing.append({"manifest": man, "coordinate": coord, "module": module})
+    return missing
+
+
 def _python_bin() -> str:
     """寻找可用的 Python 解释器。
 

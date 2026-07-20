@@ -170,6 +170,19 @@ class _PromptBuildingMixin:
                 "[必建文件未产出] 你声明要【新建】以下文件但本轮既没产出、盘上也没有，"
                 "请在本轮务必创建它们（勿改动其它文件）:\n"
                 + "\n".join(f"  - {f}" for f in _lst))
+        # #31-P2：声明依赖坐标未在产出 manifest 中声明——逐条列【往哪个 manifest 加哪个坐标】，
+        # 否则模型只被告知"缺依赖"却不知往哪加什么 → 烧光 fix 轮。
+        _mdep = l1_details.get("missing_dependencies")
+        if _mdep and l1_details.get("reason") == "declared_dependency_missing":
+            _dl = _mdep if isinstance(_mdep, (list, tuple)) else [_mdep]
+            _lines = []
+            for d in _dl:
+                if isinstance(d, dict):
+                    _lines.append(f"  - 在 {d.get('manifest')} 中声明依赖坐标 {d.get('coordinate')}")
+            if _lines:
+                parts.append(
+                    "[声明依赖未落地] 契约要求以下 manifest 声明这些依赖坐标，但产出的 manifest 里没有，"
+                    "请在对应 manifest 补上（勿改动其它文件）:\n" + "\n".join(_lines))
         reason = l1_details.get("reason")
         if reason and not parts:
             parts.append(f"[确定性闸门] {reason}: {l1_details.get('note', '')}")

@@ -215,6 +215,13 @@ def _det_fail_reason(details: dict) -> str:
             _ml = list(_m) if isinstance(_m, (list, tuple, set)) else [_m]
             return (f"declared_create_files_missing×{len(_ml)}: "
                     f"{[str(f)[:80] for f in _ml[:6]]}")
+        # #31-P2：声明依赖坐标缺失机读账（照 create_files 处理，brain 侧据此填 retry_guidance）。
+        if d.get("reason") == "declared_dependency_missing" and d.get("missing_dependencies"):
+            _md = d["missing_dependencies"]
+            _mdl = list(_md) if isinstance(_md, (list, tuple, set)) else [_md]
+            _brief = [f"{x.get('manifest')}<-{x.get('coordinate')}"
+                      if isinstance(x, dict) else str(x)[:80] for x in _mdl[:6]]
+            return f"declared_dependency_missing×{len(_mdl)}: {_brief}"
         if d.get("reason"):
             _note = f" | {str(d['note'])[:120]}" if d.get("note") else ""
             return f"reason: {str(d['reason'])[:160]}{_note}"
