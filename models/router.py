@@ -566,6 +566,22 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
         # 既有 aclose→GPU abort 链不受影响（见 cassette_record 铁律）。
         from contextlib import aclosing
 
+        # Task#12：LLM cassette PLAYBACK 钩（env SWARM_CASSETTE_REPLAY_DIR 门控，仅 brain）。
+        # 默认关时零开销直通；开启且带 brain 节点标签才查录像——命中喂回录制 chunks（零云端），
+        # miss 按 SWARM_CASSETTE_REPLAY_MISS 处置（passthrough=直连 live 补 / error=fail-loud）。
+        # 置于录制钩【之前】：命中即返回不再走 live/record；miss+passthrough 落到下方 live 路径
+        # （若同时开 record 还会补录该缺口）。
+        from swarm.models import cassette_playback as _cass_pb
+        if _cass_pb.playback_enabled() and _LLM_NODE_CV.get():
+            _pb_node = _LLM_NODE_CV.get()
+            _pb_model = str(getattr(self, "model_name", "") or "")
+            _hit = _cass_pb.lookup(_pb_node, _pb_model, args, kwargs)
+            if _hit is not None:
+                async for _chunk in _cass_pb.replay_chunks(_hit):
+                    yield _chunk
+                return
+            _cass_pb.on_miss(_pb_node, _pb_model)  # error→抛；passthrough→WARNING 后落 live
+
         from swarm.models import cassette_record as _cass
         if _cass.recording_enabled() and _LLM_NODE_CV.get():
             # 复核 F1：aclosing 把消费者的 aclose 确定性转发给 tee_record（它再转发给

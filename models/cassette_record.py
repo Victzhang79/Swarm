@@ -141,7 +141,9 @@ def _chunk_to_dict(chunk: Any) -> dict:
     }
 
 
-def _new_buf(node: str, model: str, provider: str, args: tuple, kwargs: dict) -> dict:
+def compute_request_sha(args: tuple, kwargs: dict) -> tuple[list, str]:
+    """请求指纹（record/playback 单一事实源，Task#12 playback 复用保证匹配）。
+    返回 (messages_dicts, sha)；异常 → (msgs 或 [], "")（fail-open，绝不炸调用链）。"""
     msgs = _messages_from_args(args, kwargs)
     try:
         sha = hashlib.sha256(
@@ -149,6 +151,11 @@ def _new_buf(node: str, model: str, provider: str, args: tuple, kwargs: dict) ->
         ).hexdigest()
     except Exception:  # noqa: BLE001
         sha = ""
+    return msgs, sha
+
+
+def _new_buf(node: str, model: str, provider: str, args: tuple, kwargs: dict) -> dict:
+    msgs, sha = compute_request_sha(args, kwargs)
     stop = kwargs.get("stop")
     return {
         "schema": _SCHEMA,
