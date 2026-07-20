@@ -1699,6 +1699,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            old_scope_amend_counts: dict | None = None,
                            merged_cover_injections: dict | None = None,
                            old_dispatch_totals: dict | None = None,
+                           old_alternate_ever: dict | None = None,
                            old_wait_windows: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
@@ -1872,6 +1873,12 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         # （A2 病灶）不经本函数，账本对其保持免疫，熔断牙口不丢。
         "subtask_dispatch_totals": {
             sid: n for sid, n in (old_dispatch_totals or {}).items()
+            if _sig_unchanged(sid)},
+        # #33-CRITICAL：换备选持久账本同 subtask_dispatch_totals 签名剪枝——replan 重编号使
+        # id 复用是默认情形，语义全新的同名 id 不该继承旧"已换过备选"标记（会让闸1 误判其已
+        # 换过、跳过病灶换备选）；in-place scope 加宽不经本函数，账本对其保持免疫。
+        "subtask_alternate_ever_used": {
+            sid: v for sid, v in (old_alternate_ever or {}).items()
             if _sig_unchanged(sid)},
         "subtask_redecompose_count": pruned_redecompose,
         "abandoned_subtask_ids": pruned_abandoned,
@@ -2267,6 +2274,7 @@ async def plan(state: BrainState) -> dict:
                                  old_block_signatures=state.get("subtask_block_signatures"),
                                  old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
                                  old_dispatch_totals=state.get("subtask_dispatch_totals"),
+                                 old_alternate_ever=state.get("subtask_alternate_ever_used"),
                                  old_wait_windows=state.get("redispatch_wait_windows")),
             **plan_touch,
         }
@@ -2749,6 +2757,7 @@ async def plan(state: BrainState) -> dict:
                                  # R-F3：A11 ②通道剔除 #6 并回注入，用 LLM 原始申报判等
                                  merged_cover_injections=_cover_injections,
                                  old_dispatch_totals=state.get("subtask_dispatch_totals"),
+                                 old_alternate_ever=state.get("subtask_alternate_ever_used"),
                                  old_wait_windows=state.get("redispatch_wait_windows")),
         **plan_touch,
     }
@@ -3729,6 +3738,19 @@ async def handle_failure(state: BrainState) -> dict:
             result["degraded_reasons"] = (
                 list(result.get("degraded_reasons") or [])
                 + [f"failure_disposition_audit_error:{type(_audit_exc).__name__}"])
+    # #33-CRITICAL：换备选持久账本单一写点（chokepoint）——本轮任何决策把 subtask_use_alternate
+    # 置 True 的 sid，在【dispatch 消费清空之前】记入 subtask_alternate_ever_used（只增单调）。
+    # 闸1 据此持久账本判"病灶从未换过备选"，而非据 dispatch:904 派出即清的 subtask_use_alternate
+    # （后者无法辨"从未换过"vs"换过后被消费"→闸1 每轮无界重触发、架空 A2 熔断，round48c 死型）。
+    if isinstance(result, dict) and "subtask_use_alternate" in result:
+        _ever = dict(state.get("subtask_alternate_ever_used") or {})
+        _changed = False
+        for _sid, _v in (result.get("subtask_use_alternate") or {}).items():
+            if _v and not _ever.get(_sid):
+                _ever[_sid] = True
+                _changed = True
+        if _changed:
+            result["subtask_alternate_ever_used"] = _ever
     if isinstance(result, dict) and "dispatch_remaining" in result and "plan" not in result:
         _p = state.get("plan")
         if _p is not None:

@@ -147,40 +147,40 @@ def test_dispatch_manifest_still_first():
 
 
 def test_ladder_exhausted_mass_abandon_gated(derive_consumer_depends_edges):
-    """★猎手 CRITICAL 锁★：消费边织密图后，高扇出生产者重试耗尽走【部分交付】旁门
-    时，连坐闭包超规模闸必须 escalate 人工——绝不静默清盘成 PARTIAL
-    （round65c 102/107 死型经未设防调用点复活的路径）。"""
+    """★猎手 CRITICAL 锁★：重试耗尽走【部分交付】旁门时，超规模闸必须 escalate 人工——
+    绝不静默清盘成 PARTIAL（round65c 102/107 死型经未设防调用点复活的路径）。
+
+    #33-闸3 口径修正（round65e13 问题①治本）：规模闸计量从 blast-radius 闭包改为【独立
+    根缺陷数】。单个高扇出病灶连坐一大片受害者（根缺陷=1）≠计划覆灭，应部分交付而非
+    escalate（见 test_r65e13_headofline_gates.py）。本不变量以【真·多根缺陷】(>阈值 个
+    独立模块各自编译崩、非同一生产者的受害者)形态构造——大额【根缺陷】必须 escalate 语义
+    本身不变，只是不再把受害者也算进"连坐规模"误判计划覆灭。"""
     import asyncio
     from swarm.brain.nodes import handle_failure
     from swarm.types import WorkerOutput
-    prod = _st("st-p", create=[_API])
-    # R65REPLAY-T1 语义演进：readable-only=软序边不再连坐（那是回放轮 15→72 爆炸
-    # 半径的病根）；本测试锁的"大额连坐必须 escalate"不变量以【硬消费】(ua=seed
-    # 构建输入)形态构造——语义不变量本身不变。
-    consumers = [
-        _st(f"st-c{i}", create=[f"admin/src/main/java/C{i}.java"],
-            readable=[_API], ua=[_API])
-        for i in range(14)
-    ]
-    done = _st("st-done", create=["m/src/main/java/D.java"])
-    plan = _plan([prod, *consumers, done])
-    derive_consumer_depends_edges(plan)
+    # 12 个【独立根缺陷】：各自 create 不同模块文件、各自 build_fail、彼此无依赖（非连坐受害者）
+    roots = [_st(f"st-r{i}", create=[f"m{i}/src/main/java/R{i}.java"]) for i in range(12)]
+    done = _st("st-done", create=["z/src/main/java/D.java"])
+    plan = _plan([*roots, done])   # 计划 13，阈值 max(10, 3)=10；12 根缺陷 > 10 = 计划覆灭
     state = {
         "plan": plan,
-        "failed_subtask_ids": ["st-p"],
+        "failed_subtask_ids": [r.id for r in roots],
         "subtask_results": {
-            "st-p": WorkerOutput(subtask_id="st-p", diff="+x", summary="",
-                                 l1_passed=False,
-                                 l1_details={"verify_failed": "grep"}),
+            **{r.id: WorkerOutput(subtask_id=r.id, diff="+x", summary="",
+                                  l1_passed=False,
+                                  l1_details={"det_fail_reason": "build_fail: x",
+                                              "l1_2_compile_ok": False})
+               for r in roots},
             "st-done": WorkerOutput(subtask_id="st-done", diff="+ok", summary="",
                                     l1_passed=True),
         },
-        "subtask_retry_counts": {"st-p": 99},   # 重试耗尽 → 部分交付旁门
-        "dispatch_remaining": [c.id for c in consumers],
+        "subtask_retry_counts": {r.id: 99 for r in roots},   # 重试耗尽 → 部分交付旁门
+        "subtask_use_alternate": {r.id: True for r in roots},  # 已换过备选 → 闸1 不再插手
+        "dispatch_remaining": [],
     }
     r = asyncio.run(handle_failure(state))
     assert r.get("failure_strategy") == "escalate", \
-        f"连坐 15/16 超阈值必须 escalate 而非静默 abandon: {r.get('failure_strategy')}"
+        f"12 独立根缺陷 > 阈值 10 = 计划覆灭必 escalate 而非静默 abandon: {r.get('failure_strategy')}"
     assert any(str(d).startswith("mass_abandon_gate")
                for d in (r.get("degraded_reasons") or [])), r.get("degraded_reasons")
 

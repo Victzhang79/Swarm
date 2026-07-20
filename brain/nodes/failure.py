@@ -71,6 +71,65 @@ def _l1_details_of(subtask_results: dict, fid: str) -> dict:
     return l1_details_of(subtask_results.get(fid))
 
 
+def _is_pipeline_blocked_victim(details: dict) -> bool:
+    """#33-闸1/闸3：判失败是【连坐受害者】（自产物无错、仅被上游/-am 兄弟模块拖崩）还是
+    【连坐根/病灶】（自模块编译崩/build_fail/拒答/退化）。round65e13 死型本体=单个病灶写坏
+    reactor SPOF → -am 连坐一大片自产物全绿的下游，规模闸把 blast-radius 当"连坐规模"误判
+    计划覆灭 escalate。受害者信号：pipeline_blocked 键真、det_fail_reason 以 pipeline_blocked
+    打头、或自身 compile/build 已通过却仍 transient 失败（被 reactor 里坏兄弟阻塞）。规模闸
+    只数病灶、闸1 只给病灶换备选，绝不因受害者众多误判。"""
+    if not isinstance(details, dict):
+        return False   # 缺证据默认根缺陷（fail-closed，silent-hunter 确认）
+    # F1（silent-hunter HIGH 亲裁）：details["pipeline_blocked"] 是【分类字符串】，值域含自身
+    # 病灶——worker_deadline_exhausted / malformed_diff_zero_files / build_infra_failure /
+    # build_manifest_missing / test_infra_failure / verify_infra_failure。裸真值会把这些自身
+    # 病灶误纳受害者→规模闸少算根缺陷→静默 PARTIAL（round65c 死型复活）。只有
+    # _INTERNAL_BLOCKED_KINDS（upstream_module_broken/internal_pkg_not_built/
+    # module_registered_before_scaffold）才是真·连坐受害者（被坏兄弟模块拖崩，自产物无错）。
+    if details.get("pipeline_blocked") in _INTERNAL_BLOCKED_KINDS:
+        return True
+    _dfr = str(details.get("det_fail_reason") or "")
+    if _dfr.startswith("pipeline_blocked") and any(k in _dfr for k in _INTERNAL_BLOCKED_KINDS):
+        return True
+    # F2（silent-hunter HIGH 亲裁）：删除 `build_ok + transient` 判据——它不要求任何 blocked
+    # 证据，会把自己写的挂死测试（编译过+超时→transient）误判受害者。真受害者已被上面白名单
+    # 覆盖（st-13=upstream_module_broken）。删更安全，缺证据一律当根缺陷（fail-closed）。
+    return False
+
+
+def _root_defect_ids(failed_ids, subtask_results) -> list:
+    """#33-闸1/闸3：连坐根/病灶 id——失败且非纯 pipeline_blocked 受害者。规模闸真计量口径
+    （独立根缺陷数，非 blast-radius 闭包）+ 闸1 换备选目标。受害者（自产物无错、仅被 -am
+    兄弟拖崩）不计入根缺陷：单个高扇出病灶连坐一大片≠计划覆灭。"""
+    return [fid for fid in (failed_ids or [])
+            if not _is_pipeline_blocked_victim(_l1_details_of(subtask_results, fid))]
+
+
+def _is_model_fixable_defect(details: dict) -> bool:
+    """#33-闸1 专用判据（与闸3 计量口径 _root_defect_ids 分离）：仅【换模型能修】的缺陷才
+    给 retry_alternate。round65e13 复核回归实锤：闸1/闸3 必须用不同判据——
+
+    - 闸3（规模计量）用 _root_defect_ids【宽口径】：infra/自身病灶都算根缺陷（fail-closed，
+      该 escalate；silent-hunter 亲裁）。
+    - 闸1（换备选）只对【模型可修】：写坏语法（确定性 build_fail/compile 真错）、refusal_hard_fail、
+      degeneration_hard_fail。任何 pipeline_blocked（infra/env/上游阻塞：sandbox_env_probe_blocked
+      / *_infra_failure / build_manifest_missing / worker_deadline_exhausted / malformed_diff_zero_files
+      / _INTERNAL_BLOCKED_KINDS）换模型都没用，一律【不】给闸1（test_b2_third_strike 实锤：
+      sandbox_env_probe_blocked 是 infra→该走 partial/abandon，闸1 误换模型=白烧）。
+
+    缺证据（l1_details 空）→ 保守【不】给闸1（infra 未知不赌模型换备），但仍进闸3 根缺陷计量。"""
+    if not isinstance(details, dict) or not details:
+        return False   # 缺证据保守不换（infra 未知不赌模型），闸3 仍按 fail-closed 计量
+    if details.get("pipeline_blocked"):
+        return False   # 任何 infra/env/upstream 阻塞非模型可修——换模型没用
+    _src = details.get("l1_decision_source")
+    if _src in ("refusal_hard_fail", "degeneration_hard_fail"):
+        return True    # 拒答/复读退化=模型能力问题，换异构备选有意义
+    if str(details.get("det_fail_reason") or "").startswith("build_fail"):
+        return True    # worker 自己写坏的代码（确定性编译/语法真错）=换模型可修
+    return False
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _DIGIT_RUN_RE = re.compile(r"\d+")
 _WS_RE = re.compile(r"\s+")
@@ -1958,13 +2017,83 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     # 跨 4 次重启反复复读（同上下文大概率复现），链内 fallback 已试过更弱备选仍冒泡到
     # 这里，只有升最强模型才有意义。
     force_strong = dict(state.get("subtask_force_strong", {}))
+    # ── #33-闸2：模型退役——复读退化在最强模型上【重复】发生 → 换异构备选（问题③治本）──
+    # R63-T7 首次复读退化升最强模型（偶发退化换弱备更糟），此处保留。但 round65e13/round63
+    # 死型是【最强模型本身退化】：force_strong 恒钉 routing_complex 且 dispatch line 641 的
+    # `not _fs` 把 use_alternate 吞掉 → 退化模型永不退役、同上下文反复复读。故：degeneration
+    # 且【上一轮已 force_strong】（=已升过最强仍退化）者，判定最强模型不胜任 → 换异构备选、
+    # 清 force_strong（让 dispatch 换 provider），不再复用退化模型。首次退化仍走 R63-T7。
+    _prev_fs = state.get("subtask_force_strong") or {}
+    _degen_retire: list = []
+    _self_forced_fids: set = set()   # #33-F3：本轮由 refusal/degeneration 源置 force_strong 的 fid
     for _fid in failed_ids:
         _res = subtask_results.get(_fid)
         _src = (getattr(_res, "l1_details", {}) or {}).get("l1_decision_source") if _res else None
         if _src in ("refusal_hard_fail", "degeneration_hard_fail"):
             force_strong[_fid] = True
+            _self_forced_fids.add(_fid)   # F3：只有这些 fid 的 force_strong 是本文件自己置的，可清
+        if _src == "degeneration_hard_fail" and _prev_fs.get(_fid):
+            _degen_retire.append(_fid)
 
     if deepest > max_retries + 1:
+        # ── #33-闸1：病灶优先换备选（round65e13 head-of-line 连坐死型·问题②治本）──
+        # round65e13：连坐根（写坏 reactor SPOF 的脚手架子任务）多次 brain 级重试全同模型，
+        # 从没换过异构备选——因 retry_counts 被签名剪枝反复重置（scope 加宽/replan 改签名），
+        # 病灶永远够不到 retry_count==max_retries→retry_alternate 那一档（1920-1922 档位注释），
+        # 而 B2 指纹三连(_sig_exhausted)把 deepest 直跳 max_retries+2 进终局，越过换备选格。
+        # 治本：进终局(escalate/abandon)前，对【经指纹三连进终局、且从未换过备选】的连坐根
+        # （非 pipeline_blocked 受害者），给【一次】retry_alternate 再回 DISPATCH。
+        #
+        # F5（silent-hunter MED）：触发条件【仅 _sig_exhausted】（组织性耗尽=同输入确定性
+        # 白跑，安全换模型），【不含 _over_cap】——_over_cap（终身派发≥6）是硬资源天花板铁律
+        # （A2 round48c 2.8h 空烧），必须绝对，绝不因闸1 再加派。
+        # CRITICAL（code-reviewer）：判"从未换过"用【持久账本 subtask_alternate_ever_used】
+        # （只增、dispatch 绝不消费、仅 replan 签名剪枝），不用 subtask_use_alternate（dispatch
+        # :904 派出即清→无法辨"从未换过"vs"换过被消费"→每轮无界重触发架空 A2）。
+        # F3（code-reviewer MED）：清 force_strong 只清【本轮 refusal/degeneration 源自置】者
+        # （_self_forced_fids），绝不碰 E5(超大不可拆块)等其它来源置的 force_strong（否则超大块
+        # 被降级弱模型）。无法判来源的病灶保留 force_strong（不清=换备选可能被 `not _fs` 吞掉，
+        # 但资源正确性优先）。
+        if _sig_exhausted:
+            _ever_alt = state.get("subtask_alternate_ever_used") or {}
+            # 闸1 目标=连坐根 ∩【模型可修】∩ 从未换过备选（回归实锤：infra/env 阻塞如
+            # sandbox_env_probe_blocked 是根缺陷但换模型没用→不给闸1，走 partial/abandon）。
+            # 闸3 的 _pd_roots 维持宽口径 _root_defect_ids（fail-closed 计量不变）。
+            _never_alt_roots = [
+                fid for fid in _root_defect_ids(failed_ids, subtask_results)
+                if _is_model_fixable_defect(_l1_details_of(subtask_results, fid))
+                and not _ever_alt.get(fid)]
+            if _never_alt_roots and plan_obj is not None:
+                _clearable = set(_never_alt_roots) & _self_forced_fids
+                _fs_g1 = {k: v for k, v in force_strong.items() if k not in _clearable}
+                _g1_remaining = list(state.get("dispatch_remaining") or [])
+                _g1_sr = dict(subtask_results)
+                for fid in failed_ids:
+                    _g1_sr.pop(fid, None)
+                    if fid not in _g1_remaining:
+                        _g1_remaining.append(fid)
+                logger.warning(
+                    "[HANDLE_FAILURE] #33-闸1 病灶优先换备选：连坐根 %s 经指纹三连抄近道进终局、"
+                    "从未换过异构备选（据持久账本）→ 给一次 retry_alternate（清本文件自置的 "
+                    "force_strong=%s 让备选真生效）再回 DISPATCH，不直接 escalate/abandon"
+                    "（round65e13 病灶永锁同模型死型治本；持久账本保证至多一轮、绝不无界重触发）",
+                    _never_alt_roots, sorted(_clearable))
+                return {
+                    **({"plan": plan_obj} if _c9_edges else {}),
+                    "dispatch_remaining": _g1_remaining,
+                    "failed_subtask_ids": [],
+                    "subtask_results": _g1_sr,
+                    "failure_strategy": "retry_alternate",
+                    "failure_escalated": False,
+                    "subtask_use_alternate": _alt_map_update(state, _never_alt_roots, True),
+                    # CRITICAL：同步写持久账本（wrapper chokepoint 亦会合并，此处显式冗余保险）
+                    "subtask_alternate_ever_used": {
+                        **{k: True for k in (state.get("subtask_alternate_ever_used") or {})},
+                        **{fid: True for fid in _never_alt_roots}},
+                    "subtask_force_strong": _fs_g1,
+                    "subtask_retry_counts": {**retry_counts, **next_counts},
+                    "subtask_block_signatures": _blk_sigs,
+                }
         # 重试耗尽。【部分交付】：已有完成子任务 + 开启 partial → 放弃 failed(+传递依赖者)，
         # 继续交付其余，终态 PARTIAL(非 DONE，诚实未完成)。否则(0 完成 / 关闭 partial) →
         # 维持 escalate(整任务失败)，避免无产出却假成功。
@@ -1983,13 +2112,23 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # 耗尽会沿新边一笔连坐全场闭包——本分支此前是四个 _transitive_abandon 消费点
             # 中唯一最常走且完全未设防的旁门（round65c 102/107 静默清盘死型复活路径）。
             _pd_new = abandoned - _abandoned_so_far
-            if len(_pd_new) > mass_abandon_cap(len(plan_obj.subtasks)):
+            # ── #33-闸3：规模闸计量口径 = 独立【根缺陷】数，非 blast-radius 闭包（问题①治本）──
+            # round65e13：单个高扇出病灶（写坏 reactor SPOF）经 -am 连坐下游 50，_pd_new=50 撞
+            # 阈值 escalate——但独立根缺陷只 1 个（其余全是自产物无错、仅被坏兄弟拖崩的
+            # pipeline_blocked 受害者）。单病灶高扇出≠计划覆灭，应先走闸1 换备选/走部分交付，
+            # 绝不因受害者众多误判 escalate。只有【独立根缺陷数】超阈值才算真·计划覆灭。
+            # fail-closed 语义不变（仍 escalate 非静默 PARTIAL），只把计量从闭包收窄到根缺陷。
+            # blast-radius(_pd_new)仍进日志，供复盘辨"根缺陷多"vs"单根高扇出"。
+            _pd_roots = [f for f in _root_defect_ids(failed_ids, subtask_results)
+                         if f in _pd_new or f in set(failed_ids)]
+            if len(_pd_roots) > mass_abandon_cap(len(plan_obj.subtasks)):
                 logger.error(
-                    "[HANDLE_FAILURE] R65D-W2 规模闸（重试耗尽部分交付）：连坐 %d 超阈值 %d"
-                    "（计划 %d，触发源 %s）→ escalate 人工，绝不静默清盘成 PARTIAL"
-                    "；连坐名单=%s",  # R65TR-T4④：名单从不打印=复盘只能靠 fixture 闭包倒推
-                    len(_pd_new), mass_abandon_cap(len(plan_obj.subtasks)),
-                    len(plan_obj.subtasks), failed_ids[:6], sorted(_pd_new)[:40])
+                    "[HANDLE_FAILURE] R65D-W2 规模闸（重试耗尽部分交付）：独立根缺陷 %d 超阈值 %d"
+                    "（计划 %d，连坐闭包 blast-radius=%d，根缺陷=%s）→ escalate 人工，绝不静默"
+                    "清盘成 PARTIAL；连坐名单=%s",  # R65TR-T4④：名单从不打印=复盘只能靠闭包倒推
+                    len(_pd_roots), mass_abandon_cap(len(plan_obj.subtasks)),
+                    len(plan_obj.subtasks), len(_pd_new), sorted(_pd_roots)[:40],
+                    sorted(_pd_new)[:40])
                 return {
                     **({"plan": plan_obj} if _c9_edges else {}),
                     "failure_strategy": "escalate",
@@ -1997,7 +2136,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "failed_subtask_ids": failed_ids,
                     "subtask_retry_counts": {**retry_counts, **next_counts},
                     "degraded_reasons": [
-                        f"mass_abandon_gate:{len(_pd_new)}/{len(plan_obj.subtasks)}"],
+                        f"mass_abandon_gate:{len(_pd_roots)}/{len(plan_obj.subtasks)}"],
                 }
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
             logger.warning(
@@ -2107,6 +2246,29 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "[HANDLE_FAILURE] 策略=retry（第 %d/%d 次）: %s",
             deepest, max_retries, failed_ids,
         )
+    # ── #33-闸2 应用：最强模型重复复读退化者换异构备选、清 force_strong（问题③治本）──
+    # 置于最后：retry 分支的 _alt_map_update(..., False) 会清 failed_ids 的 alternate 标记，
+    # 故必须在其后为 _degen_retire 重新置 True，并从 force_strong 摘除（否则 dispatch `not _fs`
+    # 吞掉换备选）。首次退化不在 _degen_retire，force_strong 原样保留 → R63-T7 语义不回归。
+    if _degen_retire:
+        _fs2 = dict(out.get("subtask_force_strong") or force_strong)
+        _alt2 = dict(out.get("subtask_use_alternate") or {})
+        for _fid in _degen_retire:
+            # F3（code-reviewer MED）：只清【本轮 degeneration 源自置】的 force_strong
+            # （_degen_retire ⊆ _self_forced_fids 恒成立，显式 intersect 防未来改动破 provenance），
+            # 绝不碰 E5 超大块等其它来源置的 force_strong。
+            if _fid in _self_forced_fids:
+                _fs2.pop(_fid, None)
+            _alt2[_fid] = True
+        out["subtask_force_strong"] = _fs2
+        out["subtask_use_alternate"] = _alt2
+        # CRITICAL：换备选写持久账本（防闸1 后续误判"从未换过"；wrapper chokepoint 亦合并）
+        out["subtask_alternate_ever_used"] = {
+            **{k: True for k in (state.get("subtask_alternate_ever_used") or {})},
+            **{fid: True for fid in _degen_retire}}
+        logger.warning(
+            "[HANDLE_FAILURE] #33-闸2 模型退役：%s 在最强模型上重复复读退化 → 换异构备选"
+            "（清 force_strong 让 dispatch 换 provider），不再复用退化模型", _degen_retire)
     return out
 
 

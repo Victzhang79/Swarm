@@ -265,6 +265,7 @@ class BrainState(TypedDict, total=False):
     l2_details: dict[str, Any]          # VERIFY_L2 结构化细节（apply/build/test 输出摘要）
     l2_missing_fp_history: list[str]    # R46-3：L2 契约缺失符号指纹连击史（三连不变→跳过 D5 归因直接升级，杜绝同缺口空转重跑 L2；指纹变化即重置）
     subtask_dispatch_totals: dict[str, int]  # A2(r48c)：终身派发计数（按 id 单调、绝不签名剪枝）——handle_failure 硬熔断兜底，治 retry_counts 被 scope 加宽/replan 改签名重置后的无界重派
+    subtask_alternate_ever_used: dict[str, bool]  # #33-CRITICAL：曾在备选模型上试过的 sid（持久·只增账本）——dispatch 消费 subtask_use_alternate 会派出即清，无法辨"从未换过"；本表单调累积、绝不 dispatch 消费，仅 replan 签名剪枝（同 subtask_dispatch_totals 纪律），闸1 据它判"病灶从未换备选"防无界重触发
     redispatch_wait_windows: dict[str, int]  # R65TR-T3 P2：重派承诺账龄 {sid: 连续未兑现窗口数}——曾派发过却持续未被选中者逐窗口计龄，阈值整倍数 WARNING 点名未满足依赖（#71 终态账提前到飞行中）；被选中/离开 remaining 即清
 
     # ═══ 多模态需求摄取层（设计 v3 B 部分，纯加法，前置于 analyze）═══
@@ -321,6 +322,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "subtask_force_strong": "monotonic",   # D08 签名剪枝（3.8 补）
     "subtask_retry_counts": "monotonic",   # D08 签名剪枝
     "subtask_dispatch_totals": "monotonic",  # A2：终身账本【豁免 D08 剪枝】（剪了=熔断被绕，就是它要治的病）
+    "subtask_alternate_ever_used": "monotonic",  # #33-CRITICAL：曾换备选持久账本（只增，replan 签名剪枝，同 subtask_dispatch_totals）——闸1 据它判"从未换过"防无界重触发
     "contract_retry_counts": "monotonic",  # D08 签名剪枝（D13 独立契约表）
     "subtask_redecompose_count": "monotonic",  # D08 签名剪枝
     "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）
