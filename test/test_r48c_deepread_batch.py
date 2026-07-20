@@ -132,19 +132,23 @@ class TestA2LifetimeCap:
 
 class TestD10FallbackDedupe:
     def test_env_chains_exclude_primary(self):
+        """#30 语义修正：首派权威=worker_parallel_pool（非 tier primary）。真不变量=fallback 链
+        不得含【实际首派=池模型】（否则 with_fallbacks 重试刚失败的同一个）。pool 覆盖下 tier primary
+        本身是合法 fallback（它没被首派）——旧断言"fallback 不含 tier primary"在 pool 编排下不成立。"""
         import re
         from pathlib import Path
         env = Path(__file__).resolve().parent.parent / ".env"
         if not env.is_file():
             return
         text = env.read_text("utf-8")
+        pm = re.search(r"^SWARM_WORKER_WORKER_PARALLEL_POOL=(.+)$", text, re.M)
+        pool = {x.strip() for x in pm.group(1).split(",")} if pm else set()
         for diff in ("TRIVIAL", "MEDIUM", "COMPLEX"):
-            m = re.search(rf"^SWARM_MODEL_ROUTING_{diff}=(.+)$", text, re.M)
             f = re.search(rf"^SWARM_MODEL_ROUTING_{diff}_FALLBACK=(.+)$", text, re.M)
-            if m and f:
-                assert m.group(1).strip() not in [
-                    x.strip() for x in f.group(1).split(",")], \
-                    f"{diff} fallback 链不得含 primary 自身"
+            if f and pool:
+                fb = [x.strip() for x in f.group(1).split(",")]
+                assert not (pool & set(fb)), \
+                    f"{diff} fallback 链不得含实际首派池模型 {pool & set(fb)}（重试同一个=空转）"
 
 
 class TestH2ReviewFixes:

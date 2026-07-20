@@ -1337,8 +1337,14 @@ class ModelRouter:
             _pool = {m for m in (getattr(get_config().worker, "worker_parallel_pool", None) or []) if m}
         except Exception:  # 配置不可用（CI/单测）→ 不排除，退回旧行为
             _pool = set()
+        # #30（round65e12）：`f != primary_name` 排除的本意=不重选"刚失败的首派"。但 worker
+        # 首派权威是 worker_parallel_pool 轮转（非 tier primary）——池激活且 tier primary【不在池里】
+        # 时，tier primary 根本没被首派、是合法异构备选，误排它会把 medium 备选挤到只剩垫底 stepfun
+        # （round65e12 实锤：Qwopus 池失败→medium 备选=stepfun 而非 MiniMax）。故池覆盖 tier primary
+        # 时不再排除它。池含 tier primary（如 complex primary=Qwopus∈池）时照旧排除（它确是首派）。
+        _exclude_primary = None if (_pool and primary_name not in _pool) else primary_name
         _cands = [f for f in (fallback_names or [])
-                  if f and f != primary_name and f != _trivial and f not in _pool]
+                  if f and f != _exclude_primary and f != _trivial and f not in _pool]
         if not _cands and _pool:
             # 排除主力池后无候选 → 说明"备选"只剩主力自己：如实告警（此前是**静默**换回同一个
             # 模型并打印"使用备选模型"，把恢复阶梯骗成有梯子的样子）。

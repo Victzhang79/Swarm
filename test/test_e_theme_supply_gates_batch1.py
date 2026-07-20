@@ -38,6 +38,10 @@ from swarm.types import (  # noqa: E402
 
 def test_e1_router_has_alternate_judged_by_route_table(monkeypatch):
     from swarm.models.router import ModelRouter
+    # #30：清空 worker_parallel_pool，隔离"路由表判据"本身（否则真 pool=Qwopus 会让"链全=primary"
+    # 的 primary 因不在池里而被当合法异构备选——那是 pool-override 语义，非本测试的路由表判据主题）。
+    from swarm.config.settings import get_config as _gc
+    monkeypatch.setattr(_gc().worker, "worker_parallel_pool", [], raising=False)
     monkeypatch.setattr(ModelRouter, "_resolve_route",
                         lambda self, d, m: ("primary-m", ["primary-m", "alt-b"]))
     assert ModelRouter().has_alternate_for_subtask("medium") is True
@@ -304,6 +308,10 @@ def test_e1_alternate_skips_trivial_tier(monkeypatch):
     """复核 C-4（CONFIRMED）：三档 fallback 链统一 trivial 档居首时，「第一个 ≠primary」
     把 medium 重试派到最弱模型（RUN10 顾虑成真）——候选必须排除 trivial 档 primary。"""
     from swarm.models.router import ModelRouter
+    # #30：清空池，隔离"排除 trivial 档"本主题（真 pool=Qwopus 会让 tier primary m-medium 因不在池
+    # 里成为合法备选=pool-override 语义，非本测试的 C-4 主题）。
+    from swarm.config.settings import get_config as _gc
+    monkeypatch.setattr(_gc().worker, "worker_parallel_pool", [], raising=False)
     monkeypatch.setattr(ModelRouter, "_resolve_route",
                         lambda self, d, m="text": ("m-medium", ["m-trivial", "m-medium", "m-strong"]))
     r = ModelRouter()

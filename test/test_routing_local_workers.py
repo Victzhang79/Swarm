@@ -24,13 +24,13 @@ def test_complex_primary_is_strongest_local():
 
 
 def test_complex_fallback_chain_order():
-    """用户编排(2026-06-18，2026-07-15 换装)：complex 兜底链 = 先 ThinkingCap-27B(256k，等效原
-    27B-Saka) → 再另一台大的(保上下文) → 最后 Step-Flash(256k但慢)。并行主力任一挂先上 ThinkingCap。"""
+    """用户编排(2026-07-20 更新·#30)：complex/pool 首派 Qwopus 挂 → 兜底链首=MiniMax(196k 同级大)
+    → ThinkingCap-27B(256k) → 最后 Step-Flash(慢，垫底)。旧序 stepfun 垫底致失败重试落更弱模型。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert "ThinkingCap" in fb[0], f"第一兜底应 ThinkingCap-27B(挂了先上小的): {fb}"
-    assert any("MiniMax" in x for x in fb), f"应含另一台大模型兜底(保上下文): {fb}"
+    assert "MiniMax" in fb[0], f"第一兜底应 MiniMax(Qwopus 失败切同级大模型，#30): {fb}"
+    assert any("ThinkingCap" in x for x in fb), f"应含 ThinkingCap 次级兜底: {fb}"
     assert any("Step" in x for x in fb), f"应含 Step-Flash 最终垫底: {fb}"
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
@@ -77,17 +77,38 @@ def test_alternate_picks_first_non_primary():
         f"非 trivial 难度的 alternate 不得落到 trivial 档 primary: {model_name}")
 
 
-def test_alternate_skips_primary_duplicate():
-    """FINDING-8(task 3e07c592)：fallback 链首=primary 时，备选须跳到下一个≠primary 的模型，
-    绝不重选刚失败的 primary（否则本地引擎崩溃时 retry_alternate 形同虚设、整盘失败）。"""
+def test_alternate_skips_primary_duplicate(monkeypatch):
+    """FINDING-8(task 3e07c592)：fallback 链首=刚失败的首派时，备选须跳到下一个异构模型。
+    #30 语义修正：首派权威=worker_parallel_pool。此处令池={Qwen-40B}（=实际首派），备选须跳过它。"""
     from swarm.config.settings import ModelConfig
     from swarm.models.router import ModelRouter
+    import swarm.config as _cfg
+    _real = _cfg.get_config()
+    monkeypatch.setattr(_real.worker, "worker_parallel_pool", ["Qwen-40B"], raising=False)
     r = ModelRouter(ModelConfig(
         routing_medium="Qwen-40B",
-        routing_medium_fallback="Qwen-40B,Qwen-27B",  # 链首=primary（现场 MEDIUM 链就这样）
+        routing_medium_fallback="Qwen-40B,Qwen-27B",  # 链首=首派(池)
     ))
     _, model_name = r.get_alternate_llm_for_subtask("medium", "text")
-    assert model_name == "Qwen-27B", f"应跳过=primary 的链首、取下一个异构模型: {model_name}"
+    assert model_name == "Qwen-27B", f"应跳过=首派(池)的链首、取下一个异构模型: {model_name}"
+
+
+def test_pool_override_makes_tier_primary_valid_alternate(monkeypatch):
+    """★#30 核心（用户 Qwopus 池→MiniMax）★ 池={Qwopus} 首派所有子任务，medium tier primary=MiniMax
+    不在池里→它没被首派→是合法异构备选。Qwopus 池失败后 medium 备选必须=MiniMax（而非垫底 stepfun）。"""
+    from swarm.config.settings import ModelConfig
+    from swarm.models.router import ModelRouter
+    import swarm.config as _cfg
+    monkeypatch.setattr(_cfg.get_config().worker, "worker_parallel_pool",
+                        ["Qwopus3.6-27B-v2-NVFP4"], raising=False)
+    r = ModelRouter(ModelConfig(
+        routing_trivial="ThinkingCap-Qwen3.6-27B",
+        routing_medium="MiniMax-M2.7-Pro",
+        routing_medium_fallback="MiniMax-M2.7-Pro,ThinkingCap-Qwen3.6-27B,stepfun-ai/Step-3.7-Flash-FP8",
+    ))
+    _, model_name = r.get_alternate_llm_for_subtask("medium", "text")
+    assert model_name == "MiniMax-M2.7-Pro", \
+        f"Qwopus 池失败→medium 备选应=MiniMax(tier primary 未被首派=合法备选)，实为 {model_name}"
 
 
 def test_alternate_falls_back_to_primary_when_no_distinct():

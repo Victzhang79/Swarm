@@ -215,15 +215,15 @@ class ModelConfig(BaseSettings):
         default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwopus3.6-27B-v2-NVFP4"])
     routing_medium: str = "MiniMax-M2.7-Pro"          # 中等任务首选(加API/修bug)，196K
     routing_medium_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["Qwopus3.6-27B-v2-NVFP4", "ThinkingCap-Qwen3.6-27B"])
+        default_factory=lambda: ["ThinkingCap-Qwen3.6-27B", "Qwopus3.6-27B-v2-NVFP4"])
     routing_complex: str = "Qwopus3.6-27B-v2-NVFP4"  # 复杂任务首选(架构/跨模块)，最强本地(256K)
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
-        # 用户编排(2026-06-18，2026-07-15 换装)：complex primary=Qwopus 挂了先上 ThinkingCap-27B
-        # (256k 等效原 Saka，先顶) → 再另一台大的 MiniMax(196k 保上下文) → 最后 Step-Flash(256k 但
-        # 20t/s 慢，最终垫底)。真实机器在 .env 配同款链；此默认值是无 .env 环境(CI/他人)的策略落点。
-        # 全本地大窗口模型；122B-A10B 仅 64K 上下文，已排除出 worker 列表（易撑爆、拖累预算）
+        # 用户编排(2026-07-20 更新·#30)：Qwopus(最强本地/pool 首派)不可用或失败 → 优先切
+        # MiniMax-M2.7-Pro(196k 大窗口，同级)，再 ThinkingCap-27B(256k)，最后 Step-Flash(256k 但
+        # ~20t/s 慢，垫底保覆盖)。旧序把 stepfun 垫底/ThinkingCap 首致失败重试落到更弱模型(round65e12
+        # #30)。真实机器 .env 配同款链；此默认值是无 .env 环境(CI/他人)的策略落点。全本地大窗口模型。
         default_factory=lambda: [
-            "ThinkingCap-Qwen3.6-27B", "MiniMax-M2.7-Pro", "stepfun-ai/Step-3.7-Flash-FP8"])
+            "MiniMax-M2.7-Pro", "ThinkingCap-Qwen3.6-27B", "stepfun-ai/Step-3.7-Flash-FP8"])
     routing_multimodal: str = "ThinkingCap-Qwen3.6-27B"  # 多模态首选(看图/UI截图)，mm✓256K
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["stepfun-ai/Step-3.7-Flash-FP8"])

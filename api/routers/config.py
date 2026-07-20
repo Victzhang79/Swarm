@@ -325,7 +325,7 @@ async def update_config(request: Request):
                     k, _, _ = stripped.partition("=")
                     k = k.strip().upper()
                     if k in update_map:
-                        new_lines.append(f"{k}={update_map[k]}")
+                        new_lines.append(f"{k}={_env_quote(update_map[k])}")  # #28：复杂值加引号
                         updated_keys.add(k)
                     else:
                         new_lines.append(line)
@@ -335,7 +335,7 @@ async def update_config(request: Request):
             # 追加新键
             for k, v in update_map.items():
                 if k not in updated_keys:
-                    new_lines.append(f"{k}={v}")
+                    new_lines.append(f"{k}={_env_quote(v)}")  # #28：复杂值加引号
 
             # P1-D：先快照原值，reload 若被生产安全门禁拒绝（禁 RBAC / 默认凭据 / 清 SECRET_KEY）→
             # 原子回滚 .env + os.environ，不留脏配置（否则 .env 脏 → 下次重启 fail-fast、os.environ 脏 →
@@ -467,7 +467,7 @@ async def update_routing(request: Request):
                 k, _, _ = stripped.partition("=")
                 k = k.strip().upper()
                 if k in update_map:
-                    new_lines.append(f"{k}={update_map[k]}")
+                    new_lines.append(f"{k}={_env_quote(update_map[k])}")  # #28：复杂值加引号
                     updated_keys.add(k)
                 else:
                     new_lines.append(line)
@@ -476,7 +476,7 @@ async def update_routing(request: Request):
 
         for k, v in update_map.items():
             if k not in updated_keys:
-                new_lines.append(f"{k}={v}")
+                new_lines.append(f"{k}={_env_quote(v)}")  # #28：复杂值加引号
 
         content = "\n".join(new_lines) + "\n"
         atomic_write_env(env_path, content)
@@ -602,11 +602,33 @@ async def update_model_providers(request: Request):
     return {"status": "ok", "updated_keys": list(update_map.keys()), **ModelRouter().get_routing_table()}
 
 
+def _env_quote(v: str) -> str:
+    """#28（round65e12 踩坑）：把值写进 .env 时，含 bash 特殊字符者【单引号包裹】。
+
+    根因：JSON 值(SWARM_MODEL_PROVIDERS/MODEL_PROVIDERS/MODEL_SIZES=`[{...}]`/`{...}`)裸拼进 .env
+    → restart-api.sh `set -a; source .env` 时 bash 无法解析 [/{/空格 → command-not-found(127) 起不来。
+    单引号最安全（内无插值/转义）；pydantic-settings 读单引号 JSON 正常（源码已实证）。
+    值内单引号用 `'\''` 收尾-转义-重开。已安全的简单值(纯 [A-Za-z0-9_./:@=+,-] 且非空)不加引号=老行为。
+    """
+    if v == "":
+        return ""
+    import re as _re
+    if _re.fullmatch(r"[A-Za-z0-9_./:@=+,\-]+", v):
+        return v  # 简单值：bash source 安全，不加引号（逐字向后兼容）
+    if "'" not in v:
+        return "'" + v + "'"   # 无单引号：单引号包裹——bash 与 python-dotenv 都按字面读（覆盖全部 JSON 配置值）
+    # 含单引号（罕见）：改双引号包裹并转义 \ 与 "——bash 与 python-dotenv 对这两个转义口径一致。
+    # ★复核 CRITICAL 整改★不用 bash-only 的 `'\''`（python-dotenv 解析不了→静默丢行回退默认值）。
+    # 注：JSON 配置值无 $/反引号，双引号内它们不会被 bash 插值（本用途安全）。
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _persist_env_updates(update_map: dict[str, str]) -> None:
     """写 .env + 同步 os.environ + reload_config（供 model-providers/notify/kb 端点复用）。
 
     D3：reload 被生产安全门禁拒绝(RuntimeError)→ 原子回滚 .env + os.environ（原直接 reload
     无回滚，失败留脏 .env 致重启 fail-fast、脏 os.environ 致后续 reload 全失败）。
+    #28：写值经 _env_quote——复杂 JSON 值单引号包裹，防 `source .env` 报 127（restart-api 起不来）。
     """
     env_path = _app._PROJECT_ROOT / ".env"
     # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与其它写者并发丢键）。
@@ -621,13 +643,13 @@ def _persist_env_updates(update_map: dict[str, str]) -> None:
             if s and not s.startswith("#") and "=" in s:
                 k = s.partition("=")[0].strip().upper()
                 if k in update_map:
-                    new_lines.append(f"{k}={update_map[k]}")
+                    new_lines.append(f"{k}={_env_quote(update_map[k])}")  # #28：复杂值加引号
                     updated_keys.add(k)
                     continue
             new_lines.append(line)
         for k, v in update_map.items():
             if k not in updated_keys:
-                new_lines.append(f"{k}={v}")
+                new_lines.append(f"{k}={_env_quote(v)}")  # #28：复杂值加引号
         atomic_write_env(env_path, "\n".join(new_lines) + "\n")
         for k, v in update_map.items():
             os.environ[k] = v

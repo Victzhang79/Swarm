@@ -26,7 +26,10 @@ from swarm.types import (
 
 _TPL = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
-    "<project>\n    <artifactId>mod-a</artifactId>\n    <dependencies>\n"
+    # #29-B：结构完整（groupId+version），过 L1.1c pom 结构闸——本文件测的是 verify 断言/H1 覆写，
+    # 非 pom 结构；给合法坐标才不会被结构闸提前短路。
+    "<project>\n    <groupId>com.example</groupId>\n    <artifactId>mod-a</artifactId>\n"
+    "    <version>1.0.0</version>\n    <dependencies>\n"
     "        <dependency>\n            <groupId>com.squareup.okhttp3</groupId>\n"
     "            <artifactId>okhttp</artifactId>\n        </dependency>\n"
     "    </dependencies>\n</project>")

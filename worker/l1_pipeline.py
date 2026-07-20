@@ -3626,6 +3626,56 @@ def _is_h1_content_assert(cmd: str, rels) -> bool:
     return any(_cmd_references_path(c, r) for r in rels)
 
 
+def _pom_structure_violations(pom_text: str, rel: str) -> list[str]:
+    """#29-B（round65e12 死因·确定性兜底闸）：校验 worker 写的 Maven pom 是否结构合法。
+
+    死因：worker 把 ruoyi-framework/pom.xml 写成 `<group>`（非 `<groupId>`）+丢 parent.groupId
+    → `Malformed POM`/`parent.groupId is missing` → 毒 reactor → 下游 upstream_module_broken 连坐 10。
+    既有机制只在 mvn compile 时才暴露（已烧沙箱+连坐后）。本闸在写后即校，拦在毒化前。
+
+    校验（Maven 硬要求，栈中立仅 pom）：①XML 良构 ②有 <artifactId> ③groupId 可解析（自身
+    <groupId> 或 <parent><groupId>）④<parent> 若在则 groupId/artifactId/version 齐全。
+    非 *pom.xml → []（不误伤）。返回违规描述列表（空=合法）。"""
+    if not str(rel).endswith("pom.xml"):
+        return []
+    import xml.etree.ElementTree as _ET
+    text = (pom_text or "").strip()
+    if not text:
+        return []  # 空/读失败交调用方，不在此判死
+    try:
+        root = _ET.fromstring(text)
+    except _ET.ParseError as e:
+        return [f"{rel}: pom XML 解析失败（malformed，Maven 读不出）: {e}"]
+
+    def _local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]  # 剥命名空间 {uri}tag → tag
+
+    if _local(root.tag) != "project":
+        return [f"{rel}: 根元素非 <project>（实为 <{_local(root.tag)}>）"]
+    children = {_local(c.tag): c for c in root}
+    viol: list[str] = []
+    has_artifact = "artifactId" in children
+    if not has_artifact:
+        viol.append(f"{rel}: 缺 <artifactId>（Maven 必需）")
+    parent = children.get("parent")
+    parent_groupid = parent_version = False
+    if parent is not None:
+        pkids = {_local(c.tag) for c in parent}
+        for req in ("groupId", "artifactId", "version"):
+            if req not in pkids:
+                viol.append(f"{rel}: <parent> 缺 <{req}>（parent 坐标不全，Maven 解析失败）")
+        parent_groupid = "groupId" in pkids
+        parent_version = "version" in pkids
+    # groupId 可解析：自身 <groupId> 或 parent 继承
+    if "groupId" not in children and not parent_groupid:
+        _hint = "（疑把 <groupId> 误写成 <group> 等标签）" if "group" in children else ""
+        viol.append(f"{rel}: groupId 不可解析（自身无 <groupId> 且 parent 未提供）{_hint}")
+    # version 可解析：自身 <version> 或 parent 继承（复核 MED：Maven 无 version 同样 'version is missing'）
+    if "version" not in children and not parent_version:
+        viol.append(f"{rel}: version 不可解析（自身无 <version> 且 parent 未提供）")
+    return viol
+
+
 def run_l1_pipeline(
     project_path: str,
     subtask: SubTask,
@@ -3714,6 +3764,31 @@ def run_l1_pipeline(
 
     modified = files_from_unified_diff(diff)
     details["modified_files"] = modified
+
+    # ── L1.1c pom 结构闸（#29-B，round65e12 死因）──
+    # worker 改动的 pom.xml 先校 Maven 必备坐标（groupId 可解析/artifactId/parent 完整/XML 良构），
+    # 不合格当轮判死+带证据回灌——拦在毒化 reactor 之前（既有机制要到 mvn compile 才暴露=已连坐）。
+    _pom_viol: list[str] = []
+    _tpl_enforced = template_enforced_rels or {}
+    for _rel in modified:
+        # template_enforced 的 pom 由 H1 确定性模板覆写（模板天生结构合法）→ 校 worker 的
+        # pre-overwrite 版本无意义（round65e12 死因 framework pom【非】template_enforced，仍被本闸拦）。
+        if str(_rel).endswith("pom.xml") and str(_rel) not in _tpl_enforced:
+            _ptxt = _read_project_file(project_path, str(_rel))
+            if _ptxt is not None:  # 读失败(None)不误判，交后续 build 闸
+                _pom_viol.extend(_pom_structure_violations(_ptxt, str(_rel)))
+            else:
+                # 复核（hunter）：改动的 pom 读不出（沙箱 cat 失败/瞬时）→ 本闸静默不校=盲区。
+                # 不误判死（交 build 闸兜底），但【留痕】令"闸真跑过"与"闸没跑"可分。
+                logger.warning("[L1.1c] #29-B 改动的 pom 读取失败，本轮结构闸跳过该文件"
+                               "（交后续 build 闸兜底）: %s", _rel)
+    details["l1_1c_pom_structure_ok"] = not _pom_viol
+    if _pom_viol:
+        details["pom_structure_violations"] = _pom_viol
+        details["reason"] = "pom_structure_invalid"
+        details["note"] = "; ".join(_pom_viol[:5])
+        logger.warning("[L1.1c] #29-B pom 结构闸拦截毒 pom（拦在毒化 reactor 前）: %s", _pom_viol[:5])
+        return False, details
 
     harness = getattr(subtask, "harness", None)
     # N-19：空 diff 短路只有在【没有任何确定性验收命令】时才成立。原代码只看 verify_commands，

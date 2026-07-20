@@ -2158,9 +2158,14 @@ def _inject_build_scaffold_subtasks_impl(
         else:
             _dep_snips = "\n".join(_render_dep_block(d) for d in _kept)
             if _dep_snips:
+                # #29-A（round65e12 治源头）：既有 pom 已合法，worker 只需在 <dependencies> 内【追加】
+                # 缺失依赖。硬化措辞禁止碰结构（round65e12 死因=worker 把 framework pom 写成 `<group>`
+                # +丢 parent.groupId 整体重写毒 reactor）。#29-B L1.1c pom 结构闸做确定性兜底。
                 _tpl_block = (
                     f"\n【缺失依赖片段（并入 {pom} 既有 <dependencies>，"
-                    "绝不整体替换/删除既有内容）】\n```xml\n"
+                    "★仅在其内部【追加】下列 <dependency>、逐字保留其余全部内容★：绝不整体替换/删除/"
+                    "重排，绝不改动 <parent>/<groupId>/<artifactId>/<packaging>/<modelVersion>"
+                    "——它们已合法，改了必毒 reactor 连坐下游）】\n```xml\n"
                     f"{_dep_snips}\n```")
         scaffold = SubTask(
             id=sid,
@@ -2168,6 +2173,8 @@ def _inject_build_scaffold_subtasks_impl(
                 f"【构建脚手架】为模块 {mod} " + ("补齐" if pom_exists else "创建")
                 + f"构建文件 {pom}：一次性声明契约 dependencies 的全部 artifacts"
                 "（写代码的子任务碰不到构建文件，缺一个依赖=整模块编译失败）"
+                + ("\n★既有 pom：只在 <dependencies> 内追加缺失依赖，结构部分逐字不动★"
+                   if pom_exists else "")
                 + _tpl_block),
             intent=TaskIntent.MODIFY if pom_exists else TaskIntent.CREATE,
             difficulty=SubTaskDifficulty.TRIVIAL,
