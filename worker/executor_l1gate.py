@@ -281,6 +281,84 @@ class _L1GateMixin:
             # 此即真 no-op：合法地没东西可验证 → BENIGN，可回退 LLM 弱信号。
             return None, {"deterministic_gate": "skipped: empty diff",
                           "not_run_kind": NotRunKind.BENIGN.value}
+        # #31-P1：逐【必建文件】完整性闸——create_files 语义=必建（types.py:121）。empty_diff
+        # 闸只抓"整子任务零产出"（all-or-nothing）；此处补刀"非空 diff 但缺部分 create_file"
+        # （round46 st-38-1：声明产 3 接口类只产 1，缺的类无本地引用 → compile 不炸 → L1 假绿）。
+        # ★只核验 create_files，永不核验 writable（语义=可改非义务，盲核验误杀合法未改）★。
+        # 到此处 diff 必非空（上方 empty_diff 分支已 return）——不与 empty_diff 双重判死。
+        # fail-open：无 create_files / 探测不到盘 / 探测异常 → 不判死；确凿"声明必建 X 但
+        # diff 新建集无、白名单无、盘上无"才 fail-closed，归因【自身 capability】（触发重试/
+        # 换模型），绝不与上游 BLOCKED 混（返回 (False, …) 而非 (None, blocked)）。
+        _creates = list(getattr(scope, "create_files", None) or [])
+        # F2（闸失效可观测）：把"闸没跑成/被跳过"stamp 进最终 details，与"闸跑了没缺"字节级可辨。
+        _cf_check_meta: dict = {}
+        if _creates:
+            # F1b（治误杀·探测失败冤杀）：on-disk 视图只在【本轮 sync 干净】时可信——有
+            # error/skip/oversize 说明沙箱→本地拉回不完整，"文件不在盘"可能是没拉回而非没产出。
+            # 复用本文件缓存复用同款 dirty-sync 守卫（236-238）：不干净 → 整闸 fail-open 跳过。
+            _sync_clean = (getattr(self, "_sync_skipped_count", 0) == 0
+                           and not getattr(self, "_sync_error_rels", None)
+                           and not getattr(self, "_sync_oversize_rels", None))
+            if not _sync_clean:
+                _cf_check_meta["create_files_check_skipped"] = "dirty_sync"
+                logger.warning(
+                    "[#31-P1] sync 不干净(skip=%s err=%s oversize=%s)→必建文件完整性闸 fail-open "
+                    "跳过（on-disk 视图不可信，防拉回抖动冤杀合法已产文件）",
+                    getattr(self, "_sync_skipped_count", 0),
+                    len(getattr(self, "_sync_error_rels", None) or []),
+                    len(getattr(self, "_sync_oversize_rels", None) or []))
+            else:
+                _missing: list[str] = []
+                try:
+                    import shlex as _shlex
+
+                    from swarm.worker.l1_pipeline import (
+                        _run_check_split,
+                        missing_created_files,
+                    )
+                    # 白名单豁免：H1 权威模板落盘（本文件 _enforce_authoritative_template）+
+                    # 确定性修复触达路径（_repaired_extra_paths）。收尾器 finisher_attached 孤儿件
+                    # 天然是【已在盘】文件（orphan=已产未认领）→ 由下方 on-disk 探测统一豁免，
+                    # 无需把 TaskPlan 级 finisher_attached 透传进 worker。
+                    _exempt = set(getattr(self, "_repaired_extra_paths", None) or [])
+                    _exempt |= set((getattr(self, "_h1_enforced_templates", None) or {}).keys())
+
+                    def _on_disk(rel: str) -> bool:
+                        # F1b 加固：区分【确凿存在/确凿不存在】与【探测失败(infra/超时/连接断)】。
+                        # test -e 真跑起来必打印 __X__/__N__ 之一（ec=0）；沙箱不可达/超时 → 无标记
+                        # → raise → missing_created_files fail-open（不判该文件遗漏）。绝不把探测
+                        # 失败当"确凿不在盘"冤杀合法已产文件（_read_project_file 把 infra 塌成 None 的病）。
+                        _ec, _out, _err = _run_check_split(
+                            f"test -e {_shlex.quote(rel)} && echo __X__ || echo __N__",
+                            self.project_path, timeout=15)
+                        _t = _out or ""
+                        if "__X__" in _t:
+                            return True
+                        if "__N__" in _t:
+                            return False
+                        raise RuntimeError(
+                            f"on-disk 探测无定论(ec={_ec}, err={(_err or '')[:80]})")
+
+                    _missing = missing_created_files(
+                        _creates, diff or "", exists=_on_disk, exempt=_exempt)
+                except Exception as _mc_exc:  # noqa: BLE001 — fail-open：核验异常绝不判死
+                    # F2：闸静默失效可观测——warning（非 debug）+ details 盖区分键
+                    logger.warning(
+                        "[#31-P1] 必建文件完整性核验异常(fail-open 跳过，闸未生效): %s", _mc_exc)
+                    _cf_check_meta["create_files_check_error"] = str(_mc_exc)[:200]
+                    _missing = []
+                if _missing:
+                    self._log(
+                        "L1 必建文件完整性闸：声明必建但未产出（diff 无+盘上无）"
+                        f" → 判 capability 失败: {_missing[:6]}")
+                    return False, {
+                        "deterministic_gate": "fail",
+                        "reason": "declared_create_files_missing",
+                        "missing_create_files": _missing,
+                        "note": ("worker 未产出声明必建的文件（既不在本轮 diff 新建集、"
+                                 "也不在项目盘上）——归因自身 capability 失败触发重试/换模型；"
+                                 "非上游 BLOCKED"),
+                    }
         try:
             from swarm.worker.l1_pipeline import run_l1_pipeline
 
@@ -304,6 +382,10 @@ class _L1GateMixin:
             self._record_repaired_paths(details)
             # audit #5/#29：标记此为 Phase 3 循环内确定性闸门(llm=None，无 LLM 开销)。
             details["l1_phase"] = "phase3_loop_deterministic"
+            # F2（#31-P1-fix）：把必建文件闸的"跳过/异常"元信息透传进 details——闸未生效时
+            # 可观测（"闸没跑成"≠"闸跑了没缺"），防 import/逻辑回归让 #31 保护静默复活死型。
+            if _cf_check_meta:
+                details.update(_cf_check_meta)
             # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程
             # 清单缺失、构建命中 infra 瞬时故障、非空 diff 却解析到 0 文件）。这种 passed-but-blocked
             # 绝不能当真 PASS → 降为 None(BLOCKED)，交裁决器走 transient 退避重试。

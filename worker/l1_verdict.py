@@ -208,6 +208,13 @@ def _det_fail_reason(details: dict) -> str:
         d = details if isinstance(details, dict) else {}
         if d.get("verify_failed"):
             return f"verify_failed: {str(d['verify_failed'])[:160]}"
+        # F3（#31-P1-fix）：必建文件缺失机读账逐字列缺失文件名（照 scope_violations 处理），
+        # brain 侧据此确定性装填 retry_guidance——模型知道缺【哪个】才修得对。
+        if d.get("reason") == "declared_create_files_missing" and d.get("missing_create_files"):
+            _m = d["missing_create_files"]
+            _ml = list(_m) if isinstance(_m, (list, tuple, set)) else [_m]
+            return (f"declared_create_files_missing×{len(_ml)}: "
+                    f"{[str(f)[:80] for f in _ml[:6]]}")
         if d.get("reason"):
             _note = f" | {str(d['note'])[:120]}" if d.get("note") else ""
             return f"reason: {str(d['reason'])[:160]}{_note}"

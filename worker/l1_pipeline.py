@@ -2413,6 +2413,77 @@ def _scope_violations(
     return violations
 
 
+def _created_files_in_diff(diff: str) -> set[str]:
+    """#31-P1：从 unified diff 解析【新建文件】集（`new file mode` / `--- /dev/null` 标记）。
+
+    栈中立纯文本；复用 split_diff_by_file 的分段口径（与 apply 落盘同源）。修改形态
+    （无新建标记）不计入——create_file 若以 modify 出现说明文件本就存在，由调用方
+    on-disk 探测豁免（modify 的前提即文件在盘）。解析异常 → 空集（fail-open：调用方
+    据空集配合 on-disk/exempt，绝不因解析失败误判遗漏）。"""
+    created: set[str] = set()
+    try:
+        from swarm.project.diff_apply import split_diff_by_file
+        for files, text in split_diff_by_file(diff or ""):
+            if "new file mode" in text or "--- /dev/null" in text:
+                for f in files:
+                    if f:
+                        created.add(f)
+    except Exception:  # noqa: BLE001 — 解析异常 fail-open（见 docstring）
+        return set()
+    return created
+
+
+def missing_created_files(
+    create_files: list[str] | None,
+    diff: str,
+    *,
+    exists: "callable | None" = None,
+    exempt: set[str] | None = None,
+) -> list[str]:
+    """#31-P1：子任务【必建文件】完整性核验——返回【确凿遗漏】的 create_files 子集。
+
+    治本 #31（round46 st-38-1）：子任务声明产 N 个文件只产 M<N 个，缺的类【无本地
+    引用】→ 本地 compile 不炸 → L1 假绿 → 假 DONE → 下游连坐。既有 empty_diff 闸只抓
+    "整子任务零产出"（all-or-nothing），抓不住"非空 diff 但缺部分 create_file"。本函数补刀。
+
+    ★只核验 create_files（语义=必建，types.py:121），永不核验 writable★（语义=可改非
+    义务，盲核验会误杀合法未改——#31 原始担忧）。
+
+    遗漏判据（fail-closed 仅在确凿时）：某 create_file
+      ① 不在本轮 diff 新建集（_created_files_in_diff），且
+      ② 不在白名单 exempt（H1 权威模板落盘 / 确定性修复触达路径，wiring 提供），且
+      ③ exists(rel) 探测为【不在盘】（兄弟已产/收尾器孤儿/基线已产 → 在盘即豁免）。
+
+    fail-open 铁律（同 baseline_lombok_present）：create_files 空 / exists 未提供 /
+    exists 探测抛异常 → 该文件【不判遗漏】。只有 exists 明确返回 False（确凿不在盘）
+    且 ①② 均不豁免时才计入遗漏。路径匹配复用 _scope_match（路径段对齐 + 容忍仓库根
+    前缀）。纯函数、栈中立、可单测。
+    """
+    creates = [str(f) for f in (create_files or []) if str(f).strip()]
+    if not creates:
+        return []                      # fail-open：无必建声明
+    created = _created_files_in_diff(diff or "")
+    exempt_set = {str(e) for e in (exempt or []) if str(e).strip()}
+    missing: list[str] = []
+    for cf in creates:
+        # ① 本轮 diff 已新建该文件
+        if any(_scope_match(df, cf) for df in created):
+            continue
+        # ② 白名单豁免（H1 模板 / repaired；双向 _scope_match 容忍根前缀写法差异）
+        if any(_scope_match(e, cf) or _scope_match(cf, e) for e in exempt_set):
+            continue
+        # ③ 磁盘已存在（兄弟/收尾器孤儿/基线已产）——on-disk 即豁免
+        if exists is None:
+            continue                   # fail-open：无探测器 → 不判遗漏
+        try:
+            if exists(cf):
+                continue
+        except Exception:  # noqa: BLE001 — 探测异常 fail-open：绝不因探测失败误杀
+            continue
+        missing.append(cf)             # 确凿：diff 无 + 非豁免 + 盘上无
+    return missing
+
+
 def _python_bin() -> str:
     """寻找可用的 Python 解释器。
 

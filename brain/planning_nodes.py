@@ -2943,6 +2943,7 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                 est=est,
                 budget=budget,
                 files=", ".join(getattr(getattr(st, "scope", None), "writable", []) or []) or "（无）",
+                creates=", ".join(getattr(getattr(st, "scope", None), "create_files", []) or []) or "（无）",
                 readables=", ".join(getattr(getattr(st, "scope", None), "readable", []) or []) or "（无）",
             )},
         ])
@@ -2954,6 +2955,12 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
         base_scope = getattr(st, "scope", None) or FileScope(writable=[], readable=[])
         _parent_w = set(getattr(base_scope, "writable", []) or [])
         _parent_r = set(getattr(base_scope, "readable", []) or [])
+        # #31-P1-fix（F1a·治根因）：父 create_files（=必建文件）此前从不窄化——每个子块
+        # 深拷贝继承父的【完整】create_files → 串行子块 1 只产自己那片，#31 完整性闸却拿
+        # 父全集查它 → 冤杀（缺的文件其实归还没跑的兄弟）。这里按 LLM 的 create_files 分派
+        # 把父待建集【无重叠】拆到各子块，每个必建文件恰好归一个子块（first-claim wins）。
+        _parent_c = set(getattr(base_scope, "create_files", []) or [])
+        _claimed_c: set[str] = set()
         for i, s in enumerate(subs[:4]):
             # 修复别名 bug：每个子节点必须用【独立深拷贝】的 scope，绝不能共享同一
             # base_scope 对象。否则 normalize_plan_scopes 原地改 scope.create_files
@@ -2969,6 +2976,12 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                 child_scope.writable = _cw
             if _cr:
                 child_scope.readable = _cr
+            # #31-P1-fix：create_files【总是】窄化（不像 writable 回退父全集——那正是 F1a 病根）。
+            # 只认父待建集内、且尚未被前序子块认领的文件（first-claim wins，杜绝一文件挂多子块）。
+            _cc = [f for f in (s.get("create_files") or [])
+                   if f in _parent_c and f not in _claimed_c]
+            child_scope.create_files = _cc
+            _claimed_c.update(_cc)
             children.append(SubTask(
                 id=f"{st.id}-{i + 1}",
                 description=s.get("description", "")[:500],
@@ -2984,6 +2997,15 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                 covers=list(getattr(st, "covers", []) or []),
                 est_context_tokens=int(s.get("est_context_tokens", budget // 2) or budget // 2),
             ))
+        # #31-P1-fix（F1a）：LLM 未分派给任何子块的必建文件 → 分给【串行末子块】（它在所有
+        # 兄弟之后跑，兄弟不承接=不会被完整性闸问及该文件，末块作为唯一 owner 诚实负责创建）。
+        # 杜绝"无主必建文件蒸发"（无人产=下游 BLOCKED）与"挂多子块"（冤杀 earlier 子块）两头。
+        if children:
+            _unclaimed = [f for f in (getattr(base_scope, "create_files", []) or [])
+                          if f not in _claimed_c]
+            if _unclaimed:
+                _last = children[-1].scope
+                _last.create_files = list(_last.create_files or []) + _unclaimed
         return children
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ELABORATE] 子任务 %s 二次拆分失败，保留原样: %s", getattr(st, "id", "?"), exc)
@@ -3510,6 +3532,9 @@ RESPLIT_SYSTEM = """你是任务拆解专家。一个子任务预估执行上下
 - 每个子任务只圈定它【真正需要改动】的最小文件子集（writable_files），从"涉及文件"里挑，绝不全量继承。
 - 若多个子任务都要改同一个大文件，说明拆分维度错了——应按【文件】或【独立功能点】拆，让每个子任务面对尽量少的文件，而不是让它们都盯着同一个大文件。
 - readable_files 只列该子任务真正要读的依赖文件，宁少勿多。
+- #31-P1-fix：需【新建】的文件(create_files)也要拆——把"待新建文件"分派给【负责创建它的那一个】
+  子任务的 create_files 字段，每个新建文件【只归一个子任务】（绝不让多个子任务都声明创建同一新文件）。
+  拿不准归属的新建文件不写（系统会兜底分派给串行末子块），但绝不重复分派。
 
 严格输出 JSON：
 {{
@@ -3517,6 +3542,7 @@ RESPLIT_SYSTEM = """你是任务拆解专家。一个子任务预估执行上下
     {{"description": "子任务描述", "acceptance_criteria": ["验收1"],
       "writable_files": ["该子任务真正要改的文件(父scope子集)"],
       "readable_files": ["该子任务真正要读的依赖文件"],
+      "create_files": ["该子任务负责【新建】的文件(父待新建集子集，每个新文件只归一个子任务)"],
       "est_context_tokens": 数字}}
   ]
 }}"""
@@ -3526,10 +3552,11 @@ RESPLIT_USER = """需二次拆分的子任务：
 
 预估上下文：{est} tokens（预算 {budget}）
 可写文件(writable)：{files}
+待新建文件(create)：{creates}
 可读文件(readable)：{readables}
 
-请拆成 2-4 个各自在预算内的子任务。为每个子任务圈定最小必要的 writable_files/readable_files
-（从上面列表里挑子集），让每个子任务面对尽量少的文件。"""
+请拆成 2-4 个各自在预算内的子任务。为每个子任务圈定最小必要的 writable_files/create_files/readable_files
+（从上面列表里挑子集），让每个子任务面对尽量少的文件。每个【待新建文件】只分派给一个子任务的 create_files。"""
 
 
 def _persist_planning_artifacts(state: BrainState) -> None:

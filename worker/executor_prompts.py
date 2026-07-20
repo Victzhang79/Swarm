@@ -161,6 +161,15 @@ class _PromptBuildingMixin:
                     _vout = str(vr.get("output") or "")
                     break
             parts.append(f"[验收命令失败] {vf}\n{_vout}".strip())
+        # F3（#31-P1-fix）：必建文件缺失——逐字列出【哪些】文件，照 scope_violations 的处理，
+        # 否则模型只被告知"你缺了必建文件"却不知缺哪个 → 烧光 fix 轮/改错文件。
+        _mcf = l1_details.get("missing_create_files")
+        if _mcf and l1_details.get("reason") == "declared_create_files_missing":
+            _lst = _mcf if isinstance(_mcf, (list, tuple)) else [_mcf]
+            parts.append(
+                "[必建文件未产出] 你声明要【新建】以下文件但本轮既没产出、盘上也没有，"
+                "请在本轮务必创建它们（勿改动其它文件）:\n"
+                + "\n".join(f"  - {f}" for f in _lst))
         reason = l1_details.get("reason")
         if reason and not parts:
             parts.append(f"[确定性闸门] {reason}: {l1_details.get('note', '')}")
