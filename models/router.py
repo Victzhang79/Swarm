@@ -984,6 +984,11 @@ class EndpointProvider:
             stream_chunk_timeout=getattr(
                 self.config, "first_token_timeout", self.config.stream_chunk_timeout),
         )
+        # provider 固定 temperature（如 Kimi Code 订阅 k3/kimi-for-coding 恒 =1，reasoning 模型
+        # 约束，传 0.1/0.2 直接 400）——覆盖调用方 temperature。留空=老行为。栈中立、provider 声明。
+        _fixed_temp = getattr(self.provider, "fixed_temperature", None)
+        if _fixed_temp is not None:
+            _kwargs["temperature"] = float(_fixed_temp)
         # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens

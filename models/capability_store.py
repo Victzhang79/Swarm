@@ -84,6 +84,10 @@ _CONTEXT_HINTS: list[tuple[str, int]] = [
     ("gpt-3.5", 16_000),
     ("claude-3", 200_000),
     ("claude-4", 200_000),
+    # Kimi Code 订阅端点(api.kimi.com/coding/v1，2026-07-20 接入)：k3 标称 1M、kimi-for-coding 256K。
+    # 须先于泛 "kimi"(128K) 命中，否则被低估。真值仍以探测行为准（soak 会探）；此为无探测兜底。
+    ("k3", 1_048_576),
+    ("kimi-for-coding", 262_144),
     ("kimi", 128_000),
     ("moonshot", 128_000),
     ("glm-4", 128_000),

@@ -131,6 +131,11 @@ class ProviderConfig(BaseSettings):
     # 本地推理服务通常 no_retry（取消后绝不重发，避免占 GPU）；云端可重试。
     # 留空(None)则按 kind 推导：local→0 重试，cloud→max_retries。
     max_retries: int | None = None
+    # 某些 provider 的模型【只接受固定 temperature】（如 Kimi Code 订阅 k3/kimi-for-coding
+    # 恒 temperature=1，reasoning/always-thinking 模型常见约束——传 0.1/0.2 直接 400 invalid
+    # temperature）。设了本值则该 provider 全部模型强制用它，覆盖 brain/worker temperature。
+    # 栈中立：任意 provider 可声明；留空(None)=按调用方 temperature（老行为不变）。
+    fixed_temperature: float | None = None
 
     def display(self) -> str:
         return self.label or self.id
