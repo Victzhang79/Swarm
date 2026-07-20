@@ -88,3 +88,87 @@ def test_no_orphans_returns_input_unchanged():
         diffs, base_module_exists=lambda d: False)
     assert filtered == diffs
     assert dropped == {}
+
+
+# ════════════════ #36 治本：单根项目子目录非构建单元，绝不 orphan-drop ════════════════
+
+def test_36_single_root_go_subdir_not_orphaned():
+    """CRITICAL 治本：Go 单模块(单根 go.mod)——internal/svc/foo.go 的顶层目录 internal 无
+    internal/go.mod，旧行为误判孤儿→整份补丁静默丢弃。is_multimodule=False → 整体让路，保留。"""
+    diffs = [("st-1", _newfile_diff("internal/svc/foo.go", "package svc"))]
+    filtered, dropped = filter_orphan_module_patches(
+        diffs, base_module_exists=lambda d: False, is_multimodule=False)
+    assert {sid for sid, _ in filtered} == {"st-1"}, filtered
+    assert dropped == {}, dropped
+
+
+def test_36_single_root_python_package_kept():
+    """Python 包目录(无 per-dir manifest)不是构建单元 → 补丁保留。"""
+    diffs = [("st-1", _newfile_diff("app/models/user.py", "class User: pass"))]
+    filtered, dropped = filter_orphan_module_patches(
+        diffs, base_module_exists=lambda d: False, is_multimodule=False)
+    assert {sid for sid, _ in filtered} == {"st-1"} and dropped == {}
+
+
+def test_36_multimodule_still_drops_orphan():
+    """回归：多模块布局(is_multimodule=True)下真孤儿仍剔——Maven 保护不减。"""
+    diffs = [("st-5", _newfile_diff("ruoyi-alarm-sdk/src/main/java/B.java"))]
+    filtered, dropped = filter_orphan_module_patches(
+        diffs, base_module_exists=lambda d: False, is_multimodule=True)
+    assert {sid for sid, _ in filtered} == set()
+    assert dropped.get("ruoyi-alarm-sdk") == ["st-5"]
+
+
+def _plan_with(*manifest_paths):
+    from types import SimpleNamespace
+    return SimpleNamespace(subtasks=[
+        SimpleNamespace(scope=SimpleNamespace(create_files=list(manifest_paths), writable=[]))])
+
+
+def test_36_plan_signal_greenfield_multimodule():
+    """复核残留治本：greenfield 首轮磁盘无根 pom(project_path=None)，但 plan 声明 moduleA/pom.xml
+    → 计划信号判多模块 → orphan 过滤仍会跑(不因 scaffold 全失败静默漏 orphan)。"""
+    from swarm.brain.nodes import _detect_multimodule_layout
+    assert _detect_multimodule_layout(None, _plan_with("moduleA/pom.xml")) is True
+
+
+def test_36_plan_signal_single_root_false():
+    """单根：plan 只声明根级/源码文件(非 <dir>/模块清单)→ 计划信号不触发；无磁盘 → False。"""
+    from swarm.brain.nodes import _detect_multimodule_layout
+    assert _detect_multimodule_layout(None, _plan_with("go.mod", "internal/svc/foo.go")) is False
+
+
+def test_36_disk_signal_root_pom_modules(tmp_path):
+    """磁盘信号：根 pom 含 <modules> → 多模块。"""
+    from swarm.brain.nodes import _detect_multimodule_layout
+    (tmp_path / "pom.xml").write_text(
+        "<project><modules><module>a</module></modules></project>", encoding="utf-8")
+    assert _detect_multimodule_layout(str(tmp_path), None) is True
+
+
+def test_36_disk_signal_single_module_maven_false(tmp_path):
+    """单模块 Maven(根 pom 无 <modules>)→ 单根 → False(子目录 src 不该 orphan-drop)。"""
+    from swarm.brain.nodes import _detect_multimodule_layout
+    (tmp_path / "pom.xml").write_text("<project><artifactId>x</artifactId></project>", encoding="utf-8")
+    assert _detect_multimodule_layout(str(tmp_path), None) is False
+
+
+def test_36_disk_signal_subdir_manifest(tmp_path):
+    """磁盘信号：任一顶层子目录已含自己的模块清单(go.mod)→ 每目录模块布局。"""
+    from swarm.brain.nodes import _detect_multimodule_layout
+    (tmp_path / "svc").mkdir()
+    (tmp_path / "svc" / "go.mod").write_text("module x", encoding="utf-8")
+    assert _detect_multimodule_layout(str(tmp_path), None) is True
+
+
+def test_36_defined_overrides_single_root_flag():
+    """即便传 is_multimodule=False，本批确有模块清单落盘(defined 非空)→ 证明每目录模块布局
+    → 过滤照常(真孤儿仍剔)。"""
+    diffs = [
+        ("st-1", _newfile_diff("mod-a/pom.xml", "<project/>")),
+        ("st-2", _newfile_diff("mod-b/src/main/java/B.java")),  # 无 mod-b 骨架 → 孤儿
+    ]
+    filtered, dropped = filter_orphan_module_patches(
+        diffs, base_module_exists=lambda d: False, is_multimodule=False)
+    assert {sid for sid, _ in filtered} == {"st-1"}
+    assert dropped.get("mod-b") == ["st-2"]

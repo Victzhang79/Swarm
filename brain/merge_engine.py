@@ -713,6 +713,7 @@ def _top_module_dir(rel: str) -> str | None:
 def filter_orphan_module_patches(
     subtask_diffs: list[tuple[str, str]],
     base_module_exists,
+    is_multimodule: bool = True,
 ) -> tuple[list[tuple[str, str]], dict[str, list[str]]]:
     """#11(c) MERGE 硬门控：剔除【引用了骨架缺失模块的补丁】。
 
@@ -729,6 +730,13 @@ def filter_orphan_module_patches(
     base_module_exists is None（round21 对抗审计护栏）＝base 路径不可用(project_id 缺失/store 抛错)，
     无法区分【骨架缺失孤儿】与【既有模块】→【跳过过滤】(fail-safe：宁可不剔、由 VERIFY_L2/apply
     护栏兜真问题，也不把既有模块误判孤儿→补丁全剔→误杀交付)。
+
+    is_multimodule（#36 治本，栈中立）：项目是否采用【每目录独立构建模块】布局(Maven reactor /
+    Gradle 子工程 / Cargo workspace / go.work / .NET sln)。**单根项目**(Go 单模块 / Python 包 /
+    Rust 单 crate / 单包 npm)的子目录只是【源码包】而非独立构建单元，引用 <dir>/src 绝不构成
+    "孤儿模块"——此时 orphan 过滤必须整体让路，否则把非 Java 子目录代码静默丢弃(#36 CRITICAL)。
+    仅当【多模块布局】或【本批确有模块清单落盘(defined)】才有"子模块骨架缺失"概念。默认 True
+    保守(既有 Maven 行为不变)；调用方据磁盘布局传实值。
     """
     if base_module_exists is None:
         return subtask_diffs, {}
@@ -745,6 +753,10 @@ def filter_orphan_module_patches(
             referenced.add(d)
             if _is_module_manifest(f):
                 defined.add(d)  # <dir>/pom.xml 等 → 骨架落盘
+    # #36 单根项目护栏：非多模块布局 + 本批也无任何模块清单落盘 → 子目录=源码包非构建单元，
+    # 引用它绝不构成孤儿 → 整体让路(绝不静默丢 Go/Python/Rust单crate/单包npm 的 <dir>/src 补丁)。
+    if not (is_multimodule or defined):
+        return subtask_diffs, {}
     orphan_dirs: set[str] = set()
     for d in referenced:
         if d in defined:

@@ -3912,6 +3912,60 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
     )
 
 
+def _detect_multimodule_layout(project_path: "str | None", plan) -> bool:
+    """#36 治本：项目是否采用【每目录独立构建模块】布局(Maven reactor / Gradle 子工程 /
+    Cargo workspace / go.work / .NET sln)。单根项目(Go 单模块 / Python 包 / Rust 单 crate /
+    单包 npm)的子目录只是【源码包】而非独立构建单元，引用它绝不构成孤儿模块 → orphan 过滤须
+    整体让路(否则静默丢非 Java 子目录代码)。两路信号取【或】：
+
+      ① 计划信号(独立于落盘)：plan 任一子任务 scope 声明【非根级模块清单】(<dir>/pom.xml 等)——
+         即便该 scaffold 子任务本轮失败、根聚合清单尚未落盘(greenfield 首轮)，意图已声明=多模块。
+         治对抗双复核逮的残留：磁盘信号在 greenfield+scaffold 全失败时缺席→误判单根→orphan
+         保护静默丢失。计划信号在磁盘 I/O 之前先判，故 OSError 也不会压掉真多模块的判定。
+      ② 磁盘信号：根聚合清单 或 任一顶层子目录已含自己的模块清单。
+
+    纯函数(仅读 plan 对象 + 磁盘)，可单测。据磁盘/计划确定性判定，不猜。"""
+    from swarm.brain.merge_engine import _is_module_manifest
+    # ① 计划信号(先判，无 project-tree I/O)
+    for _st in (getattr(plan, "subtasks", None) or []):
+        _sc = getattr(_st, "scope", None)
+        for _f in (list(getattr(_sc, "create_files", None) or [])
+                   + list(getattr(_sc, "writable", None) or [])):
+            _fp = str(_f).replace("\\", "/").strip("/")
+            if "/" in _fp and _is_module_manifest(_fp):   # 非根级模块清单
+                return True
+    # ② 磁盘信号
+    if not project_path:
+        return False
+    _root = Path(project_path)
+    try:
+        _rp = _root / "pom.xml"
+        if _rp.is_file() and "<modules>" in _rp.read_text("utf-8", errors="replace"):
+            return True   # Maven reactor
+        _ct = _root / "Cargo.toml"
+        if _ct.is_file() and "[workspace]" in _ct.read_text("utf-8", errors="replace"):
+            return True   # Cargo workspace
+    except OSError:
+        pass
+    for _agg in ("settings.gradle", "settings.gradle.kts", "go.work"):
+        if (_root / _agg).is_file():
+            return True   # Gradle 子工程 / Go workspace
+    try:
+        if any(_root.glob("*.sln")):
+            return True   # .NET solution
+        for _sub in _root.iterdir():   # 任一顶层子目录已含自己的模块清单=每目录模块布局
+            if not _sub.is_dir():
+                continue
+            for _mf in ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod"):
+                if (_sub / _mf).is_file():
+                    return True
+            if any(_sub.glob("*.csproj")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def merge(state: BrainState) -> dict:
     """MERGE 节点 — 合并所有子任务的 diff
 
@@ -3982,9 +4036,18 @@ def merge(state: BrainState) -> dict:
 
     # #11(c) 护栏(round21 对抗审计)：base 项目路径不可用时传 None → filter 跳过过滤，
     # 绝不把既有模块误判孤儿→补丁全剔→误杀交付（真问题仍由 VERIFY_L2/apply 护栏兜）。
+    # #36：多模块布局判定同传(计划信号+磁盘信号)——单根项目(非 Maven 栈常见)子目录非构建单元，
+    # 绝不 orphan-drop；计划信号治 greenfield 首轮 scaffold 全失败的残留(对抗双复核逮)。
+    _is_multimodule = _detect_multimodule_layout(_merge_proj_path, state.get("plan"))
     subtask_diffs, _dropped_orphans = filter_orphan_module_patches(
         subtask_diffs,
-        base_module_exists=_base_has_module if _merge_proj_path else None)
+        base_module_exists=_base_has_module if _merge_proj_path else None,
+        is_multimodule=_is_multimodule)
+    # 可观测(复核 MEDIUM)：区分"无孤儿"与"orphan 闸整体让路(单根/base 不可用)"，
+    # 便于下游 L2 reactor 断裂时反查 MERGE 期到底跑没跑 orphan 过滤。
+    logger.info(
+        "[MERGE] orphan 过滤：multimodule=%s base_probe=%s 剔除孤儿模块数=%d",
+        _is_multimodule, bool(_merge_proj_path), len(_dropped_orphans))
     _orphan_abandoned: list[str] = []
     if _dropped_orphans:
         logger.error(

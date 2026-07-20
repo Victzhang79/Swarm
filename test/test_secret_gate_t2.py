@@ -224,7 +224,7 @@ def _patch_merge_engine(monkeypatch, merged_diff: str):
     monkeypatch.setattr(merge_engine, "merge_diffs", _fake_merge_diffs)
     monkeypatch.setattr(
         merge_engine, "filter_orphan_module_patches",
-        lambda diffs, base_module_exists=None: (diffs, {}),
+        lambda diffs, base_module_exists=None, is_multimodule=True: (diffs, {}),
     )
     monkeypatch.setattr(
         merge_engine, "verify_merged_patch_applies",
@@ -335,7 +335,7 @@ def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
     monkeypatch.setattr(merge_engine, "merge_diffs", _fake_merge_diffs)
     monkeypatch.setattr(
         merge_engine, "filter_orphan_module_patches",
-        lambda diffs, base_module_exists=None: (diffs, {}),
+        lambda diffs, base_module_exists=None, is_multimodule=True: (diffs, {}),
     )
     monkeypatch.setattr(brain_nodes, "_make_base_reader", lambda state: (lambda p: None))
     state = {
