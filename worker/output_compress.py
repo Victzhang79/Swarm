@@ -82,8 +82,20 @@ def compress_tool_output(
     lines = text.splitlines()
     n = len(lines)
 
-    # 极短行数但超长（单行巨串）—— 退化为头尾字符窗口。
+    # 极短行数但超长（单行巨串）—— 退化为字符窗口。
     if n <= head_lines + tail_lines:
+        # DR-04-F5 治本：少行长输出也【先按信号定位】——真因(AssertionError/error TS…)常压在
+        # 单行巨串中段，纯头尾字符窗会把它静默丢弃（正是本模块 docstring 要治的"盲截断丢关键
+        # 错误"在少行长输出形态复发）。命中信号 → 以【首个信号】为中心开一个 max_chars 窗口，
+        # 保证真因不落窗外；无信号才退回头尾窗口。
+        m = _SIGNAL_RE.search(text)
+        if m:
+            s0 = max(0, m.start() - max_chars // 2)
+            s1 = min(len(text), s0 + max_chars)
+            s0 = max(0, s1 - max_chars)  # 贴右边界时回拉左界，用满预算
+            prefix = f"... [压缩省略前 {s0} 字符] ...\n" if s0 > 0 else ""
+            suffix = f"\n... [压缩省略后 {len(text) - s1} 字符] ..." if s1 < len(text) else ""
+            return prefix + text[s0:s1] + suffix
         head_chars = max_chars // 2
         tail_chars = max_chars - head_chars
         omitted = len(text) - head_chars - tail_chars

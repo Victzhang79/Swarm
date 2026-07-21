@@ -1089,6 +1089,14 @@ class _SandboxSyncMixin:
                     ]
                     if _extra_new:
                         rel_files = list(dict.fromkeys(rel_files + _extra_new))
+                        # DR-04-F1 治本：与 D36 兄弟改动（下方 1120 `_repaired_extra_paths.update`）
+                        # 对齐——只进 rel_files（pull-back 清单）而不进 _repaired_extra_paths，则
+                        # _try_local_git_diff 的 diff targets(modify+create+delete+repaired) 不含它们、
+                        # 又是 untracked(未 add -N)→ WorkerOutput.diff 永远缺这些未声明新产物→ 以
+                        # diff 为准的消费者(MERGE Lever-A/provenance/重建路径)集成期 cannot find symbol
+                        #（H-exec1 只治了共享树侧、没治 diff 侧）。登记进 _repaired_extra_paths 使其进
+                        # diff targets + add -N；已被 _scope_violations 的 extra_writable 放行，不误判越权。
+                        self._repaired_extra_paths.update(_extra_new)
                         self._log(
                             f"{reason} H-exec1：纳入 {len(_extra_new)} 个未声明沙箱新建源文件"
                             f"(同包，防 L1 绿但产物不落盘): {_extra_new[:5]}"

@@ -227,8 +227,24 @@ class _AgentLoopMixin:
             # GraphRecursionError 等：agent 撞迭代上限。它在沙箱里已做的改动仍有效，
             # 不当作硬失败——后续 pull-back + 确定性 L1 闸门会按真实文件状态裁决
             # (与"子代理撞步数上限但已产出部分工作"同理，让确定性验证说话)。
-            cls = type(exc).__name__
-            if "Recursion" in cls or "recursion" in str(exc).lower():
+            # DR-04-F2 治本：判 GraphRecursionError 只认【专有 token "GraphRecursionError"】，绝不用
+            # 无词边界子串 `"Recursion" in cls or "recursion" in msg`——后者会命中内置 RecursionError
+            # （真实栈溢出/无限递归 bug，类名即 "RecursionError"）→ 真崩溃被伪装成"撞迭代上限"优雅返回、
+            # 根因从日志蒸发，且 settle_leaked=False 与超时/取消路径不一致致账虚高；偶含 "recursion" 的
+            # provider 异常同理。既认真实例(isinstance)，也认【被包裹重抛】携原类名进 message 的形态
+            # （R63-T7/T9 实测 RuntimeError("GraphRecursionError: …") 是 langgraph 撞上限的真实冒泡形态），
+            # 但 token 必须是专有的 "GraphRecursionError"，故内置 RecursionError 落下方 raise。
+            try:
+                from langgraph.errors import GraphRecursionError as _GRE
+                _is_graph_recursion = isinstance(exc, _GRE)
+            except Exception:  # noqa: BLE001 — 导入失败退回下方 token 判定
+                _is_graph_recursion = False
+            if not _is_graph_recursion:
+                _is_graph_recursion = (
+                    type(exc).__name__ == "GraphRecursionError"
+                    or "GraphRecursionError" in str(exc)
+                )
+            if _is_graph_recursion:
                 _ledger.end_inflight_scope(_scope, settle_leaked=False)
                 self._log(f"Agent 撞迭代上限({_limit})，以沙箱实际产出为准交确定性闸门裁决")
                 if _continuity:

@@ -265,6 +265,13 @@ class _L1GateMixin:
         # unlink → git diff 显示删除）。漏算 delete_files 时，纯删除 scope 恒空 diff →
         # 走下方 BENIGN → 回退 LLM 弱信号假绿（删除从未发生/未传播）。纳入后：删除已
         # 传播成功 → diff 非空正常裁决；未传播/未执行 → 空 diff + expects → 判 False。
+        # DR-04-F4：★对抗双复核裁定处方过激，撤销★——finding 建议把 writable 移出 expects_changes
+        # 以放行"合法 no-op"，但 hunter CONFIRMED CRITICAL：writable-only 是最常见子任务形状，移除后
+        # worker 真 stall（零改动）+ 通用 harness 在【未改动 baseline】上本就编译/测试通过 → stall 被
+        # 判 PASS = 假 DONE，正是本注释上方 A1 记录的 StringUtils stall 历史病复发，违北极星"交付可信
+        # 度不依赖模型自评"。空 diff 语义天然歧义（合法 no-op vs stall 无法从 diff 区分）→ fail-closed
+        # 判死是安全方向（冤杀合法 no-op 只是多一轮重试，远优于假 DONE）。writable 保留在 expects_changes。
+        # 合法 no-op 的正确修法=独立"目标已满足"正向证据信号（如针对本次意图的专项断言），非削弱本闸，推迟。
         expects_changes = bool(
             (getattr(scope, "writable", []) or [])
             or (getattr(scope, "create_files", []) or [])

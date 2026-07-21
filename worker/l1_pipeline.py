@@ -2233,8 +2233,20 @@ _LINT_INFRA_MARKERS: tuple[str, ...] = (
     "no space left on device", "read-only file system", "cannot allocate memory",
     "out of memory", "disk quota exceeded", "too many open files",
     # 工具本身缺失(目标沙箱未必装 go/cargo/checkstyle/eslint)
-    "command not found", "executable file not found", ": not found",
+    # DR-04-F3 治本：去掉裸 `": not found"` 子串——它与测试断言里 echo 的 `<X>: not found`
+    # 同形，会把真实 verify/build 失败(worker 没产出，assert 打印 `artifact: not found`)误判成
+    # infra 瞬时故障→BLOCKED transient 反复退避重试直到配额耗尽才 abandon，真因被掩盖。dash/sh
+    # 报"命令缺失"的形态锚定 shell 前缀，改用 _SHELL_NOT_FOUND_RE 精确匹配(见下)。
+    "command not found", "executable file not found",
     "is not recognized as an internal or external command",
+)
+
+
+# DR-04-F3：dash/sh/busybox 报"命令缺失"的形态是 `<shell>[: 行号]: <cmd>: not found`——必须锚定
+# shell 名/绝对路径前缀，绝不用裸 `": not found"`（会命中 `artifact: not found` 这类断言 echo）。
+_SHELL_NOT_FOUND_RE = re.compile(
+    r"(?mi)^(?:/\S+|sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|busybox)"
+    r"(?::\s*\d+)?:\s+\S.*?:\s*not found\s*$"
 )
 
 
@@ -2243,7 +2255,10 @@ def _is_infra_failure(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
-    return any(mk in low for mk in _LINT_INFRA_MARKERS)
+    if any(mk in low for mk in _LINT_INFRA_MARKERS):
+        return True
+    # shell 缺命令(工具未装)——锚定前缀，不误命中断言 echo 的 `<X>: not found`
+    return bool(_SHELL_NOT_FOUND_RE.search(text))
 
 
 # 构建/测试命令 → 该命令运行所【必需的工程描述文件】。缺这些文件时命令必然失败
@@ -4613,6 +4628,12 @@ def run_l1_pipeline(
             if not ok:
                 details["verify_commands"] = verify_results
                 # TD2606：验收命令命中 infra 瞬时故障 → BLOCKED 转 transient 重试（与 build/test 对称）。
+                # DR-04-F7：★对抗双复核裁定原改动（去 `v_ec != 124`）引入 bounded 回归，撤销★——
+                # verify_commands 常是集成/冒烟轮询(轮询健康端点直到就绪)；被验代码有真实 bug 致端点
+                # 永不就绪时，轮询会反复打印 `connection refused` 直到外层超时(124)。若让 124 过
+                # _is_infra_failure，这类【真 capability 失败】会因输出含 timeout/refused 标记被误判
+                # BLOCKED transient 退避烧配额、稀释真死因可观测性。故 124 显式排除在 infra 外、直判
+                # verify_failed(capability 阶梯)——挂死的 verify 是 fail-closed 安全方向。
                 if v_ec != 124 and _is_infra_failure(v_out):
                     details["pipeline_blocked"] = "verify_infra_failure"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value

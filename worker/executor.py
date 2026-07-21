@@ -414,8 +414,19 @@ class WorkerExecutor(
             from swarm.models.errors import classify_failure
             from swarm.worker.l1_verdict import exception_l1_details
             failure_class = classify_failure(e)
+            # DR-04-F6 治本：异常若发生在 pull-back 之后（produce 内某步抛错），产出已写回共享树，
+            # 硬 `diff=""` 使已落盘产物的 provenance 从 WorkerOutput 蒸发（standalone 无重派→彻底
+            # 丢产物，且与"已改动仍随 diff 回传"承诺不符）。尝试 _get_git_diff 如实带出已落盘改动；
+            # 失败(异常路径工作树可能脏)退回 ""，绝不因取 diff 再抛盖住原始异常。
+            # ★复核 CONFIRMED HIGH★：_get_git_diff 内含 per-project flock(无超时)+ 最多 4 条 git
+            # subprocess(累计 ~150s)——run() 是 async 且多 worker 共享事件循环，裸同步调用会在异常
+            # 风暴期串行阻塞整个事件循环(违 D53 卸线程铁律，与本文件 929/1167/1269 三处对齐)。卸线程。
+            try:
+                _exc_diff = await asyncio.to_thread(self._get_git_diff) or ""
+            except Exception:  # noqa: BLE001 — 取 diff 失败不致命，保留空 diff
+                _exc_diff = ""
             return self._make_output(
-                diff="",
+                diff=_exc_diff,
                 summary=f"执行异常: {e}",
                 confidence=Confidence.LOW,
                 l1_passed=False,
