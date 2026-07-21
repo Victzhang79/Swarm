@@ -533,6 +533,27 @@ async def get_task(task_id: str, request: Request):
     return {"task": jsonable_encoder(task)}
 
 
+@router.get("/api/tasks/{task_id}/progress", tags=["任务管理"])
+async def get_task_progress_endpoint(task_id: str, request: Request):
+    """结构化子任务进度聚合（#106）——剩余/已完成/失败/放弃/total + 子任务级明细。
+
+    数据源=该任务最新 checkpoint state（与 MONITOR 节点单一权威口径逐字一致），只读不推进图、
+    绝不解析 swarm.log。无 checkpoint（未起跑 / 终态无态）或读快照失败 → progress=None，
+    调用方据 task.status 兜底显示粗粒度态。
+    """
+    loop = asyncio.get_running_loop()
+    task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    await _require_task_access_async(request, task, task_id, "task:read")
+    from swarm.brain.runner import get_task_progress
+    progress = await get_task_progress(task_id)
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "task_status": (task or {}).get("status"),
+        "progress": progress,  # None=无 checkpoint 态（据 task_status 兜底）
+    }
+
+
 @router.delete("/api/tasks/{task_id}", tags=["任务管理"])
 async def delete_task_endpoint(task_id: str, request: Request, force: bool = False):
     """删除任务；force=true 时先取消运行中任务；orphaned 活跃任务可直接删除"""

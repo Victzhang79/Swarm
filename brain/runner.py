@@ -1034,6 +1034,84 @@ async def get_pending_interrupt(task_id: str) -> dict[str, Any] | None:
     return {"interrupt_type": itype, "interrupt": info, "label": label}
 
 
+async def get_task_progress(task_id: str) -> dict[str, Any] | None:
+    """读任务最新 checkpoint state，返回结构化子任务进度（DR-11-F3 / #106）。
+
+    ★单一权威口径★——与 MONITOR 节点（brain/nodes/dispatch.py monitor()）【逐字一致】，绝不解析
+    swarm.log（日志是人读的，不是数据源；进度计数本就落在 checkpoint state 字段里）：
+      剩余   remaining  = len(dispatch_remaining)
+      已完成 completed  = len(completed_l1_ids(subtask_results))   # L1 过集合=唯一权威(D23)
+      失败   failed     = len(failed_subtask_ids)
+      放弃   abandoned  = len(abandoned_subtask_ids ∪ give_up_isolated_ids)
+    纯读、不推进图、不触发执行。无 checkpoint（未起跑 / 终态无态）→ 返回 None，端点据此回 task.status
+    兜底。读快照失败（PG 抖动）→ 返回 None（不 500），端点降级。
+    """
+    from swarm.brain.nodes.shared import completed_l1_ids
+    from swarm.tracing import brain_graph_config
+
+    graph = get_compiled_brain_graph()
+    task_rec = store.get_task(task_id) or {}
+    thread_id = task_rec.get("thread_id") or task_id
+    config = brain_graph_config(
+        task_id=task_id,
+        project_id=task_rec.get("project_id") or "",
+        thread_id=thread_id,
+        resume=False,
+        description=(task_rec.get("description") or "")[:200],
+        complexity=task_rec.get("complexity"),
+        subtask_count=None,
+    )
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回 None 端点降级
+        logger.debug("[PROGRESS] 读取快照失败 task=%s: %s", task_id, exc)
+        return None
+    state = dict(snapshot.values) if snapshot and snapshot.values else {}
+    if not state:
+        return None
+
+    remaining = state.get("dispatch_remaining") or []
+    subtask_results = state.get("subtask_results") or {}
+    failed_ids = list(state.get("failed_subtask_ids") or [])
+    abandoned = set(state.get("abandoned_subtask_ids") or []) | set(state.get("give_up_isolated_ids") or [])
+    completed = completed_l1_ids(subtask_results)
+
+    # 子任务级明细：从 plan 的 id 全集映射到同一批 state 集合（不引入第三口径）。
+    # ★对抗复核 HIGH★：checkpoint 里 state["plan"] 是 swarm.types.TaskPlan Pydantic 实例【非 dict】
+    # （本仓约定：把 plan 换成 dict 即视为"损坏 state"，见 brain/nodes/__init__.py:5119），直接
+    # plan.get("subtasks") 会 AttributeError→500，恰好命中本端点要报的所有在飞任务态。复用既有
+    # 转换惯用法（runner.py:476-483）先 model_dump 成 dict 再取。
+    plan = state.get("plan") or task_rec.get("plan") or {}
+    if hasattr(plan, "model_dump"):
+        plan = plan.model_dump(mode="json")
+    elif not isinstance(plan, dict):
+        plan = {}
+    sub_ids = [s.get("id") for s in (plan.get("subtasks") or [])
+               if isinstance(s, dict) and s.get("id")]
+    failed_set = set(failed_ids)
+
+    def _st(sid: str) -> str:
+        if sid in completed:
+            return "done"
+        if sid in failed_set:
+            return "failed"
+        if sid in abandoned:
+            return "abandoned"
+        return "pending"
+
+    subtasks = [{"id": sid, "status": _st(sid)} for sid in sub_ids]
+    total = len(sub_ids) or (len(completed) + len(failed_ids) + len(abandoned) + len(remaining))
+
+    return {
+        "remaining": len(remaining),
+        "completed": len(completed),
+        "failed": len(failed_ids),
+        "abandoned": len(abandoned),
+        "total": total,
+        "subtasks": subtasks,
+    }
+
+
 async def _handle_post_run(
     task_id: str,
     state: dict[str, Any],

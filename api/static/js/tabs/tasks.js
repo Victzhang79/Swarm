@@ -222,7 +222,9 @@ async function loadTaskLogsIntoPanel(taskId) {
   if (!panel) return;
   panel.innerHTML = '<div class="log-line info">加载历史日志…</div>';
   try {
-    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=20000');
+    // B9-#105：初次只拉最近 LOG_PANEL_MAX 行（原 20000 行一次 innerHTML 渲染最多 2 万 div→开页大卡）。
+    // 全量早期历史走「任务日志」浮层（viewTaskLogs，<pre> textContent 单文本节点，扛得住）。
+    const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/logs?limit=' + LOG_PANEL_MAX);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     const lines = data.lines || [];
@@ -230,8 +232,14 @@ async function loadTaskLogsIntoPanel(taskId) {
       panel.innerHTML = `<div class="log-line info">${escapeHtml(data.hint || '暂无该任务日志。')}</div>`;
       return;
     }
+    // 后端可能返回略多于上限（含轮转 backup）——前端再兜一次只渲染最近 LOG_PANEL_MAX 行。
+    const shown = lines.length > LOG_PANEL_MAX ? lines.slice(-LOG_PANEL_MAX) : lines;
+    const omitted = lines.length - shown.length;
+    const note = omitted > 0
+      ? `<div class="log-line info">…已省略较早 ${omitted} 行（仅显示最近 ${LOG_PANEL_MAX} 行，全量见「任务日志」浮层）</div>`
+      : '';
     // 按日志级别上色（ERROR/WARNING/INFO）
-    panel.innerHTML = lines.map(line => {
+    panel.innerHTML = note + shown.map(line => {
       let level = 'info';
       if (/\bERROR\b|\b错误\b|Traceback/i.test(line)) level = 'error';
       else if (/\bWARNING\b|\bWARN\b|警告/i.test(line)) level = 'warn';
@@ -458,21 +466,60 @@ function updateSubtaskList(subtasks) {
   applySubtaskTick({ subtask_runtime: rt });
 }
 
+// B9-#104：#log-panel 长任务（7h ultra 几万行 SSE）性能治本——
+// ① DOM 环形缓冲常驻上限 LOG_PANEL_MAX，超出剔最早，防几万节点撑爆；
+// ② rAF 攒批 + DocumentFragment 一帧一次 append，scrollTop 每帧最多一次（不再逐行强制同步 reflow）；
+// ③ 仅当用户已在底部才自动滚（上滚查看历史时不抢滚）；④ logEntries 数组同样设上限。
+const LOG_PANEL_MAX = 2000;
+let _logPending = [];
+let _logFlushScheduled = false;
+
+function _logPanelAtBottom(panel) {
+  return panel.scrollHeight - panel.scrollTop - panel.clientHeight < 40;
+}
+
+function _flushLogPanel() {
+  _logFlushScheduled = false;
+  const panel = $('log-panel');
+  if (!panel) { _logPending = []; return; }
+  const batch = _logPending;
+  _logPending = [];
+  if (!batch.length) return;
+  const atBottom = _logPanelAtBottom(panel);
+  const frag = document.createDocumentFragment();
+  for (const it of batch) {
+    const line = document.createElement('div');
+    line.className = 'log-line ' + it.level;
+    line.innerHTML = `<span class="log-time">${formatTime(it.time)}</span>${escapeHtml(it.message)}`;
+    frag.appendChild(line);
+  }
+  panel.appendChild(frag);
+  while (panel.childElementCount > LOG_PANEL_MAX) panel.removeChild(panel.firstChild);
+  if (atBottom) panel.scrollTop = panel.scrollHeight;
+}
+
 function appendLog(level, message) {
   const panel = $('log-panel');
+  if (!panel) return;
   if (panel.querySelector('.log-line.info') && panel.textContent.includes('等待执行')) {
     panel.innerHTML = '';
   }
-  const line = document.createElement('div');
-  line.className = 'log-line ' + level;
-  line.innerHTML = `<span class="log-time">${formatTime(new Date())}</span>${escapeHtml(message)}`;
-  panel.appendChild(line);
-  panel.scrollTop = panel.scrollHeight;
+  _logPending.push({ level, message, time: new Date() });
+  if (!_logFlushScheduled) {
+    _logFlushScheduled = true;
+    if (window.requestAnimationFrame) requestAnimationFrame(_flushLogPanel);
+    else setTimeout(_flushLogPanel, 0);
+  }
   logEntries.push({ level, message, time: new Date() });
+  if (logEntries.length > LOG_PANEL_MAX) logEntries.splice(0, logEntries.length - LOG_PANEL_MAX);
 }
 
 function clearLogs() {
   logEntries = [];
+  // B9-#104（对抗复核 MEDIUM）：清空前必须丢弃已排队的 rAF 批渲染缓冲——否则切任务时上一任务
+  // 已入队的 appendLog 会在下一帧把陈旧行刷到"等待执行…"占位之后（面板自我 un-clear）。
+  _logPending = [];
+  _logFlushScheduled = false;
   $('log-panel').innerHTML = '<div class="log-line info">等待执行…</div>';
 }
 
