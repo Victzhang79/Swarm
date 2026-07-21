@@ -856,8 +856,9 @@ def test_g9_detect_stack_from_plan_manifests():
 
 
 def test_g9_non_maven_stack_no_pom_fabrication(caplog):
-    """★G9 治本★ Go 工程（go.mod）即便有 unclaimed 契约依赖，也绝不注入 Maven pom 脚手架
-    （旧行为=凭空造 pom 污染 reactor）。返回 []、LOUD 告警，且计划里不新增任何 st-scaffold。"""
+    """★G9 铁律（#31-P2c 更新）★ Go 工程绝不注入 Maven pom 脚手架（旧行为=凭空造 pom 污染
+    reactor）——这条不变量永久成立。#31-P2c 起 Go 走**自己的 go.mod driver**而非旧整体 no-op；
+    本用例每模块的 go.mod 已由写代码子任务认领 → 无 unclaimed → 无需注入。核心断言：不产 pom。"""
     import logging
     plan = TaskPlan(subtasks=[
         _st("st-1", create=["svc-a/go.mod", "svc-a/a.go"]),
@@ -868,14 +869,35 @@ def test_g9_non_maven_stack_no_pom_fabrication(caplog):
         {"module": "svc-a", "artifacts": ["github.com/x/y"]},
         {"module": "svc-b", "artifacts": ["github.com/x/z"]},
     ]}
-    n_before = len(plan.subtasks)
     with caplog.at_level(logging.WARNING):
         injected = inject_build_scaffold_subtasks(plan, None)
-    assert injected == [], "非 Maven 栈绝不注入 Maven 脚手架"
-    assert len(plan.subtasks) == n_before, "绝不新增 st-scaffold 子任务"
+    # ★永久不变量★：Go 工程绝不产 Maven pom
     assert not any("pom.xml" in f for st in plan.subtasks
                    for f in (st.scope.create_files or [])), "绝不凭空造 pom 污染 Go 工程"
-    assert any("G9" in r.message and "go" in str(r.args) for r in caplog.records)
+    assert not any(str(e.get("stack")) == "maven" for e in injected), "非 Maven 栈绝不走 Maven 脚手架"
+    # go.mod 已被写代码子任务认领 → 无 unclaimed → driver 无需注入（正向注入见 test_p2c_*）
+    assert injected == [], "每模块 go.mod 已有 owner → 无需脚手架"
+
+
+def test_p2c_go_stack_injects_gomod_with_root(tmp_path):
+    """#31-P2c 正向：有根 go.mod（可推导 import 路径）时，Go 工程注入 go.mod 脚手架（非 pom）。"""
+    (tmp_path / "go.mod").write_text("module example.com/app\n\ngo 1.21\n", encoding="utf-8")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["svca/main.go"]),
+        _st("st-2", create=["svcb/main.go"]),
+    ], parallel_groups=[["st-1"], ["st-2"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "svca", "artifacts": []},
+        {"module": "svcb", "artifacts": []},
+    ]}
+    injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
+    assert {e["module"] for e in injected} == {"svca", "svcb"}
+    assert all(e["stack"] == "go" for e in injected)
+    # 建 go.mod、绝不建 pom
+    assert not any("pom.xml" in f for st in plan.subtasks for f in (st.scope.create_files or []))
+    svca = next(st for st in plan.subtasks
+                if st.id == next(e["subtask_id"] for e in injected if e["module"] == "svca"))
+    assert "svca/go.mod" in svca.scope.create_files
 
 
 def test_g9_maven_stack_still_injects(tmp_path):

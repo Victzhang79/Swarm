@@ -1984,6 +1984,458 @@ def inject_build_scaffold_subtasks(
     return injected
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# #31-Phase2b/2c：npm / go 脚手架 driver（栈中立铺开，Maven 路径零改动）
+#
+# 病根（G9 铺开）：round39 起脚手架注入【只认 Maven】——只会造 pom.xml。已知非 Maven 栈此前
+# 明确 no-op（绝不拿 pom 污染异栈），但那留下一个洞：npm/go 工程的规则5 落空模块**没有任何
+# 确定性构建清单出口**，回到"派 worker 去手写 package.json/go.mod + 臆造依赖版本"的 R47/R53 病。
+# 本 driver 给 npm/go 补上等价的确定性 per-module 清单脚手架：版本经 npm/go registry 解析
+# （绝不臆造，见 npm_registry/go_registry），内部包/module 走 workspace:*/replace（零网络）。
+#
+# ★与 Maven 的诚实差异（非偷懒，是栈语义差异）★：Maven 的聚合父 pom / <modules> reactor /
+# 孤儿模块补 pom 全是 **Maven reactor 专属机制**（npm 用根 package.json 的 workspaces glob、
+# go 用 go.work use，二者本就无"父 POM 下钻找子 pom"的失败模式）→ 本 driver 只做**每模块清单
+# 注入**，不复制 reactor 机械。Maven 路径（下方 _inject_build_scaffold_subtasks_impl）保持字节
+# 不变，本 driver 是独立分派分支。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _manifest_owner_subtask(subtasks, manifest_rel: str):
+    """某 manifest 相对路径是否已被某子任务认领（create/writable）。栈中立、路径归一后比。"""
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        files = (list(getattr(sc, "create_files", None) or [])
+                 + list(getattr(sc, "writable", None) or []))
+        if any(_norm_scope_path(f) == manifest_rel for f in files):
+            return st
+    return None
+
+
+def _wire_scaffold_ownership(plan, sid: str, mdir: str, manifest_rel: str) -> None:
+    """R57-6 栈中立复用：脚手架独占本模块清单写权 + 同目录写代码子任务 depends_on 脚手架。
+    （多写者→MERGE 反复 rebase 不收敛；确定性模板会被 LLM 手写版顶掉——收回写权从源头消除。）"""
+    prefix = mdir.rstrip("/") + "/"
+    for st in plan.subtasks:
+        if st.id == sid or str(st.id).startswith("st-scaffold-"):
+            continue   # 绝不从别的脚手架手里抢（R59-2：击鼓传花到没人拥有）
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        for _attr in ("create_files", "writable"):
+            _lst = getattr(sc, _attr, None)
+            if not _lst:
+                continue
+            _keep = [f for f in _lst if _norm_scope_path(f) != manifest_rel]
+            if len(_keep) != len(_lst):
+                logger.warning(
+                    "[SCAFFOLD-INJECT] #31-P2 从 %s 的 %s 收回构建清单写权 %s → 脚手架 %s 独占",
+                    st.id, _attr, manifest_rel, sid)
+                setattr(sc, _attr, _keep)
+    for st in plan.subtasks:
+        if st.id == sid:
+            continue
+        sc = getattr(st, "scope", None)
+        writes = (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or []))
+        if any(str(f).replace("\\", "/").lstrip("/").startswith(prefix)
+               for f in writes) and sid not in st.depends_on:
+            st.depends_on.append(sid)
+
+
+def _npm_module_name(project_path: str | None, mdir: str, module_label: str) -> str:
+    """内部 workspace 包名：磁盘已有 package.json 的 name 字段（事实来源）优先；greenfield →
+    模块标签（我们为**新建包**自定的确定性命名约定，非臆造外部包名——红线是"绝不猜别人发布的
+    包名"，给自己造的新包命名不在此列，且全 driver 统一用同一约定 → 内部互引可自洽匹配）。"""
+    if project_path:
+        pj = Path(project_path) / mdir / "package.json"
+        try:
+            if pj.is_file():
+                name = json.loads(pj.read_text("utf-8", errors="replace")).get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        except (OSError, ValueError):
+            pass
+    return module_label
+
+
+def _render_package_json(name: str, deps) -> str:
+    body: dict = {"name": name, "version": "0.0.0", "private": True}
+    if deps:
+        body["dependencies"] = {d.name: d.spec for d in deps}
+    return json.dumps(body, indent=2, ensure_ascii=False) + "\n"
+
+
+def _contract_dep_entries(plan, dirs) -> list[dict]:
+    """全部【有物理落点】的契约依赖模块 [{module,dir,artifacts}]（含 manifest 已被认领者）。
+
+    ★对抗双复核 HIGH（cr#1/#2、hunter#1/#2）★：owner-backfill 与内部包/module 标识全集都必须看
+    【全物理模块集】，绝不只看 unclaimed——只看 unclaimed 会让【已认领/跨 replan 轮】的内部模块被
+    当第三方送去 registry/proxy 误解析（npm：拉到同名的无关公网包；go：解析失败误报"版本问题"）。"""
+    shared = getattr(plan, "shared_contract", None) or {}
+    deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
+    if not (isinstance(deps_spec, list) and deps_spec):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in deps_spec:
+        if not isinstance(entry, dict):
+            continue
+        mod = (entry.get("module") or "").strip().rstrip("/")
+        if not mod or mod in seen or mod not in dirs:
+            continue
+        seen.add(mod)
+        out.append({"module": mod, "dir": dirs[mod],
+                    "artifacts": [a for a in (entry.get("artifacts") or []) if a]})
+    return out
+
+
+def _prune_scaffold_contract_entry(plan, mod: str, final_names: list[str], dropped: list) -> None:
+    """同源剪 plan.shared_contract（★hunter HIGH #3★：npm/go 分支在 prune_contract_dependencies
+    之前 return，dropped 仍留在【注入每个 worker 的只读契约】里=「模板没有、验收却要求」的 round63
+    考卷矛盾，逼 worker 复入臆造版本）。把该模块契约 artifacts 覆写成【最终落地清单】、dropped 记
+    pruned_artifacts 账。
+
+    ★hunter NEW HIGH（schema 收敛）★ pruned_artifacts 必须与 Maven prune_contract_dependencies
+    (:952-961) **同键同形**——dict `{module: [dropped]}`、按轮重建（复议语义）、全解析则撤账、空则
+    整键删。绝不用 list 撞它的 dict：unknown→Maven 回退轮会先 seed 成 dict，本分支后跑若写 list →
+    ①Maven 侧 `ledger[mod]=` 对 list 崩（TypeError 掀掉整轮 Maven 脚手架），②或本侧 isinstance
+    检查静默丢账。既有非 dict（历史脏值）→ 响亮重置（绝不静默吞 schema 漂移）。"""
+    shared = getattr(plan, "shared_contract", None)
+    if not isinstance(shared, dict):
+        return
+    for entry in (shared.get("dependencies") or []):
+        if isinstance(entry, dict) and (entry.get("module") or "").strip().rstrip("/") == mod:
+            if "artifacts_pre_prune" not in entry:
+                entry["artifacts_pre_prune"] = [a for a in (entry.get("artifacts") or []) if a]
+            entry["artifacts"] = list(final_names)
+    led = shared.get("pruned_artifacts")
+    if led is not None and not isinstance(led, dict):
+        logger.warning("[#31-P2] pruned_artifacts 既有非 dict（%s）→ 重置为 dict（与 Maven 账本 "
+                       "schema 收敛，防跨机制类型冲突）", type(led).__name__)
+        shared.pop("pruned_artifacts", None)
+    led = shared.setdefault("pruned_artifacts", {})
+    if dropped:
+        led[mod] = [str(d) for d in dropped]     # 按轮重建，不跨轮累积（与 Maven 同律）
+        shared.setdefault(
+            "pruned_artifacts_note",
+            "pruned_artifacts 中的坐标已证无法确定性解析，已从模板与验收标准剔除；请勿在构建"
+            "清单手写声明它们——若源码确实需要，构建修复会按真实 import 反查合法坐标补入")
+    else:
+        led.pop(mod, None)                        # 本轮全可解析 → 撤账（瞬时误剪自愈）
+    if not led:
+        shared.pop("pruned_artifacts", None)
+        shared.pop("pruned_artifacts_note", None)
+
+
+def _p2_wrap(manifest_rel: str, block: str) -> str:
+    """sentinel 包裹确定性清单机器块，供 owner-backfill 跨 replan 轮可靠 strip（幂等/刷新）。"""
+    return f"\n<!--#31P2 {manifest_rel}-->{block}\n<!--#31P2-end {manifest_rel}-->"
+
+
+def _refresh_scaffold_owner_contract(owner, mod: str, mdir: str, final_names: list[str]) -> None:
+    """hunter LOW：owner 是【上一轮注入的脚手架子任务】时，backfill 只刷 description、其 contract
+    字段（2a 依赖完整性闸读的就是它）会陈旧。此处把该模块 contract 依赖同步为本轮最终清单——仅
+    当 owner 已带该模块 contract 条目时刷（不给普通写代码 owner 凭空塞 contract）。"""
+    c = getattr(owner, "contract", None)
+    if not isinstance(c, dict):
+        return
+    deps = c.get("dependencies")
+    if not isinstance(deps, list):
+        return
+    for d in deps:
+        if isinstance(d, dict) and (d.get("module") or "").strip().rstrip("/") == mod:
+            d["dir"] = mdir
+            d["artifacts"] = list(final_names)
+
+
+def _upsert_owner_manifest_block(owner, manifest_rel: str, block: str) -> bool:
+    """把确定性清单机器块 upsert 进【已认领 manifest 的 owner 子任务】description。
+
+    ★cr#1 CONFIRMED HIGH（R58-3 npm/go 对应物）★：脚手架只覆盖无人认领的 manifest；一旦某写代码
+    子任务顺手认领了 package.json/go.mod，它就绕过确定性模板由小模型自由发挥→臆造版本/丢内部
+    replace（正是 round58 Maven 死因的 npm/go 变体）。sentinel 包裹→幂等（同块不重复）/刷新（陈旧
+    块不冻结）。
+
+    ★hunter NEW MEDIUM（非桥接 strip）★ `.*?` 用 tempered-dot `(?:(?!<start>).)*?` 挡住【跨越另一个
+    起始 sentinel】——否则外部截断留下的孤儿起始 sentinel（本库有 ELABORATE 期描述截断前科）会让下
+    一轮 strip 从孤儿起始一路吞到下一个良构块的结束 sentinel，误删中间合法内容。tempered 后孤儿起
+    始因其后无配对结束而不匹配（原样留存=无害陈旧文本），良构块照常 strip/重贴，零内容丢失。"""
+    import re as _re
+    esc = _re.escape(manifest_rel)
+    old = owner.description or ""
+    stripped = _re.sub(
+        rf"\n?<!--#31P2 {esc}-->(?:(?!<!--#31P2 {esc}-->).)*?<!--#31P2-end {esc}-->",
+        "", old, flags=_re.S)
+    new = stripped + _p2_wrap(manifest_rel, block)
+    if new == old:
+        return False
+    owner.description = new
+    return True
+
+
+def _npm_dep_block(manifest_rel: str, kept, pkg_name: str, exists: bool) -> str:
+    """npm 清单机器块：CREATE→权威 package.json 模板；MODIFY→修改铁律（+缺失依赖片段，若有）。
+    ★cr#1★ MODIFY 即便零缺失依赖也给铁律护栏（静默无块=owner 无指引自由改 → 丢既有依赖）。"""
+    if not exists:
+        return (f"\n【权威 package.json 模板（确定性生成，原样写入 {manifest_rel}；仅当项目另有"
+                f"明确约定才允许在此基础上增改）】\n```json\n{_render_package_json(pkg_name, kept)}\n```")
+    snip = ""
+    if kept:
+        deps = ",\n".join(f'    "{k.name}": "{k.spec}"' for k in kept)
+        snip = (f"\n【缺失依赖片段（并入 {manifest_rel} 既有 \"dependencies\"，★仅追加下列键、"
+                f"逐字保留其余内容★）】\n```json\n{{\n{deps}\n}}\n```")
+    return (f"\n【既有 package.json 修改铁律（{manifest_rel} 已存在）】只做最小增量：绝不整体替换/"
+            "重写，绝不删除既有 dependencies/字段，仅在 \"dependencies\" 内追加缺失键。" + snip)
+
+
+def _inject_npm_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
+    """npm per-package.json driver（对抗双复核整改版）：内部标识取【全物理模块集】(dirs)、同源剪
+    shared_contract、已认领 manifest 走 owner-backfill、unclaimed 注入脚手架。第三方版本经 npm
+    registry 解析（^ver），内部 workspace 包 → workspace:*（零网络）。解析不到如实丢弃+同源剔除。"""
+    from swarm.brain.npm_registry import resolve_npm_deps
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    mods_all = _contract_dep_entries(plan, dirs)
+    if not mods_all:
+        return []
+    # ★内部包名全集从【全 dirs】取★（磁盘 name 或模块标签约定）——含已认领/跨轮模块，供 workspace:*
+    # 正确分流，绝不让内部包被当第三方去公网 registry 误解析（cr#2/hunter#1）。
+    internal_names = {_npm_module_name(project_path, d, m) for m, d in dirs.items()}
+    injected: list[dict] = []
+    backfilled: list[str] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    for entry in mods_all:
+        mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
+        manifest_rel = f"{mdir}/package.json"
+        exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        kept, dropped = resolve_npm_deps(project_path, arts, internal_names=internal_names)
+        if dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2b 模块 %s 的 %d 个 npm 依赖无法确定性解析版本 → "
+                "模板/契约/验收三处一并剔除（绝不逼 worker 编版本）: %s", mod, len(dropped), dropped)
+        kept_specs = [k.name for k in kept]
+        _prune_scaffold_contract_entry(plan, mod, kept_specs, dropped)   # hunter#3 同源剪契约
+        pkg_name = _npm_module_name(project_path, mdir, mod)
+        block = _npm_dep_block(manifest_rel, kept, pkg_name, exists)
+        owner = _manifest_owner_subtask(plan.subtasks, manifest_rel)
+        if owner is not None:   # cr#1：已认领 → backfill 进 owner，绝不静默留它手写
+            _refresh_scaffold_owner_contract(owner, mod, mdir, kept_specs)   # 2a 闸同步
+            if _upsert_owner_manifest_block(owner, manifest_rel, block):
+                backfilled.append(owner.id)
+            continue
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue
+        scaffold = SubTask(
+            id=sid,
+            description=(f"【构建脚手架】为模块 {mod} " + ("补齐" if exists else "创建")
+                        + f" npm 清单 {manifest_rel}：声明契约依赖全部包"
+                        "（写代码的子任务碰不到构建清单，缺一个=整包装不上）"
+                        + _p2_wrap(manifest_rel, block)),
+            intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(writable=[manifest_rel] if exists else [],
+                            create_files=[] if exists else [manifest_rel]),
+            contract={"dependencies": [{"module": mod, "dir": mdir, "artifacts": kept_specs}]},
+            acceptance_criteria=[f"{manifest_rel} 声明契约依赖全部包，`npm install` 通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        _wire_scaffold_ownership(plan, sid, mdir, manifest_rel)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid, "artifacts": kept_specs,
+                         "manifest_exists": exists, "stack": "npm"})
+    if injected:
+        logger.info("[SCAFFOLD-INJECT] #31-P2b npm 脚手架注入 %d 个: %s",
+                    len(injected), [e["module"] for e in injected])
+    if backfilled:
+        logger.warning("[SCAFFOLD-INJECT] #31-P2b R58-3 npm：%d 个 owner 自认领 package.json → 已把"
+                       "确定性清单块嵌进其 description（有 owner≠有模板）: %s", len(backfilled), backfilled[:8])
+    return injected
+
+
+def _go_root_module_path(project_path: str | None) -> str | None:
+    if not project_path:
+        return None
+    f = Path(project_path) / "go.mod"
+    try:
+        if f.is_file():
+            import re as _re
+            m = _re.search(r"^module\s+(\S+)", f.read_text("utf-8", errors="replace"), _re.M)
+            return m.group(1) if m else None
+    except OSError:
+        pass
+    return None
+
+
+def _go_root_directive(project_path: str | None) -> str:
+    """根 go.mod 的 `go X.Y` 指令（读真值，不猜）；无根 go.mod → 保守 '1.21'（语言指令非依赖版本）。"""
+    if project_path:
+        f = Path(project_path) / "go.mod"
+        try:
+            if f.is_file():
+                import re as _re
+                m = _re.search(r"^go\s+(\d+\.\d+(?:\.\d+)?)",
+                               f.read_text("utf-8", errors="replace"), _re.M)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+    return "1.21"
+
+
+def _go_module_path(project_path: str | None, mdir: str, root_module: str | None) -> str | None:
+    """内部 module import 路径：磁盘 go.mod module 行（事实来源）→ 根 module + reldir（go 惯例，
+    可推导非猜）→ None（无根 go.mod 无从确定 import 路径，绝不臆造一个假路径）。"""
+    if project_path:
+        f = Path(project_path) / mdir / "go.mod"
+        try:
+            if f.is_file():
+                import re as _re
+                m = _re.search(r"^module\s+(\S+)", f.read_text("utf-8", errors="replace"), _re.M)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+    if root_module:
+        return f"{root_module}/{mdir.strip('/')}"
+    return None
+
+
+def _render_go_mod(module_path: str, go_directive: str, kept,
+                   internal: list[tuple[str, str]]) -> str:
+    lines = [f"module {module_path}", "", f"go {go_directive}"]
+    if kept:
+        lines.append("")
+        lines.append("require (")
+        lines += [f"\t{d.module} {d.version}" for d in kept]
+        lines.append(")")
+    for mp, target in internal:
+        lines.append("")
+        lines.append(f"require {mp} v0.0.0")
+        lines.append(f"replace {mp} => {target}")
+    return "\n".join(lines) + "\n"
+
+
+def _go_dep_block(manifest_rel: str, self_path: str, go_directive: str,
+                  kept, replaces: list[tuple[str, str]], exists: bool) -> str:
+    """go 清单机器块：CREATE→权威 go.mod 模板（含 require+replace）；MODIFY→修改铁律 + 缺失
+    require 片段 **+ 内部 replace 指令**。★cr#3 CONFIRMED HIGH★：replace 此前只在 CREATE 落，
+    MODIFY（既有 go.mod）内部依赖的 replace 被整段丢 → 只依赖内部 module 的模块零指引。"""
+    if not exists:
+        return (f"\n【权威 go.mod 模板（确定性生成，原样写入 {manifest_rel}）】"
+                f"\n```\n{_render_go_mod(self_path, go_directive, kept, replaces)}\n```")
+    parts: list[str] = []
+    if kept:
+        reqs = "\n".join(f"\t{k.module} {k.version}" for k in kept)
+        parts.append(f"require (\n{reqs}\n)")
+    for mp, target in replaces:   # cr#3：MODIFY 路径也必须落 replace（内部 module 相对路径）
+        parts.append(f"require {mp} v0.0.0\nreplace {mp} => {target}")
+    snip = ("\n```\n" + "\n\n".join(parts) + "\n```") if parts else ""
+    return (f"\n【既有 go.mod 修改铁律（{manifest_rel} 已存在）】只做最小增量：绝不整体替换/重写，"
+            "绝不删除既有 require/replace，仅追加下列缺失项（内部 module 必须带 replace 指向本地"
+            "相对路径，绝不去 proxy 拉）：" + snip)
+
+
+def _inject_go_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
+    """go per-go.mod driver（对抗双复核整改版）：内部 module 标识取【全物理模块集】(dirs)、同源剪
+    shared_contract、已认领 go.mod 走 owner-backfill、unclaimed 注入脚手架。第三方 require 版本经
+    go proxy 解析（vX.Y.Z），内部 module → replace 指向本地相对路径（零网络）。解析不到如实丢弃；
+    无根 go.mod 时 import 路径不可推导 → 跳过（绝不臆造假路径）。"""
+    from swarm.brain.go_registry import resolve_go_deps
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    mods_all = _contract_dep_entries(plan, dirs)
+    if not mods_all:
+        return []
+    root_module = _go_root_module_path(project_path)
+    go_directive = _go_root_directive(project_path)
+    # ★内部 import 路径全集从【全 dirs】取★（磁盘 go.mod module 或 根 module+reldir 推导）；含已
+    # 认领/跨轮模块，绝不让内部 module 被当第三方去 proxy 误解析（cr#2/hunter#2）。不可推导者不入集。
+    internal_paths: dict[str, str] = {}   # module_label → canonical import path
+    path_to_dir: dict[str, str] = {}      # canonical import path → physical dir
+    for m, d in dirs.items():
+        p = _go_module_path(project_path, d, root_module)
+        if p:
+            internal_paths[m] = p
+            path_to_dir[p] = d
+    internal_ids = set(path_to_dir)       # 只用【规范 import 路径】做内部判定，避免裸标签泄进 replace
+    injected: list[dict] = []
+    backfilled: list[str] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    for entry in mods_all:
+        mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
+        manifest_rel = f"{mdir}/go.mod"
+        exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        # 契约可能用【模块标签】或【import 路径】引用内部 module → 统一归一成规范 import 路径，
+        # 令 resolve_go_deps 的内部判定与下方 replace 生成同用一套规范键（杜绝裸标签泄进 go.mod）。
+        _norm_arts = [internal_paths.get(a, a) for a in arts]
+        kept, internal_mods, dropped = resolve_go_deps(_norm_arts, internal_modules=internal_ids)
+        if dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2c 模块 %s 的 %d 个 go 依赖无法确定性解析版本 → 三处剔除: %s",
+                mod, len(dropped), dropped)
+        # 内部依赖 → replace <import路径> => <相对路径>（本模块目录视角看目标模块目录）
+        replaces = [(im, _go_relpath(mdir, path_to_dir[im]))
+                    for im in internal_mods if im in path_to_dir]
+        final_names = [k.module for k in kept] + list(internal_mods)   # 契约=第三方 + 内部路径
+        self_path = _go_module_path(project_path, mdir, root_module)
+        if not self_path:
+            # hunter LOW：无 self_path=整个 go.mod 脚手架跳过 → 契约**不剪**（本轮该模块无任何清单
+            # 工作，剪了会让契约与"没做的事"错位；下一轮 self_path 可推导时再同源剪）。
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2c 模块 %s 无根 go.mod 可推导 import 路径 → 跳过 go.mod 脚手架"
+                "（绝不臆造一个假 module 路径污染构建）", mod)
+            continue
+        _prune_scaffold_contract_entry(plan, mod, final_names, dropped)   # hunter#3 同源剪契约
+        block = _go_dep_block(manifest_rel, self_path, go_directive, kept, replaces, exists)
+        owner = _manifest_owner_subtask(plan.subtasks, manifest_rel)
+        if owner is not None:   # cr#1：已认领 → backfill 进 owner（含 MODIFY 的 replace，cr#3）
+            _refresh_scaffold_owner_contract(owner, mod, mdir, final_names)   # 2a 闸同步
+            if _upsert_owner_manifest_block(owner, manifest_rel, block):
+                backfilled.append(owner.id)
+            continue
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue
+        scaffold = SubTask(
+            id=sid,
+            description=(f"【构建脚手架】为模块 {mod} " + ("补齐" if exists else "创建")
+                        + f" go 清单 {manifest_rel}：声明契约依赖全部 module"
+                        "（写代码的子任务碰不到构建清单，缺一个=整模块编译失败）"
+                        + _p2_wrap(manifest_rel, block)),
+            intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(writable=[manifest_rel] if exists else [],
+                            create_files=[] if exists else [manifest_rel]),
+            contract={"dependencies": [{"module": mod, "dir": mdir, "artifacts": final_names}]},
+            acceptance_criteria=[f"{manifest_rel} 声明契约依赖全部 module，`go build ./...` 通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        _wire_scaffold_ownership(plan, sid, mdir, manifest_rel)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid, "artifacts": final_names,
+                         "manifest_exists": exists, "stack": "go"})
+    if injected:
+        logger.info("[SCAFFOLD-INJECT] #31-P2c go 脚手架注入 %d 个: %s",
+                    len(injected), [e["module"] for e in injected])
+    if backfilled:
+        logger.warning("[SCAFFOLD-INJECT] #31-P2c R58-3 go：%d 个 owner 自认领 go.mod → 已把确定性"
+                       "清单块嵌进其 description（有 owner≠有模板）: %s", len(backfilled), backfilled[:8])
+    return injected
+
+
+def _go_relpath(from_dir: str, to_dir: str) -> str:
+    """go replace 目标相对路径（from_dir 的 go.mod 视角看 to_dir）；必带 ./ 或 ../ 前缀
+    （go 要求本地 replace 是文件系统相对/绝对路径，裸名会被当 module 路径）。"""
+    import posixpath
+    rel = posixpath.relpath(to_dir.strip("/"), from_dir.strip("/"))
+    return rel if rel.startswith(".") else f"./{rel}"
+
+
 def _inject_build_scaffold_subtasks_impl(
     plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
@@ -2004,10 +2456,33 @@ def _inject_build_scaffold_subtasks_impl(
     # （Go/npm/Rust/Python/Gradle…）→ 明确不伪造 Maven 产物（no-op + 告警），杜绝异栈 reactor 污染。
     _ok, _stack = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
     if not _ok:
+        # #31-P2b/2c：非 Maven 栈不再无条件 no-op——npm/go 走各自的 per-module 清单 driver
+        # （版本经 registry 确定性解析，绝不拿 pom 污染异栈）。其余已知栈（gradle/cargo/python）
+        # 暂无 driver → 保持明确 no-op（绝不伪造清单）。
+        if _stack in ("npm", "go"):
+            try:
+                _p2_dirs = _module_physical_dirs(plan, project_path, file_plan)
+            except Exception:  # noqa: BLE001 — 物理落点解析失败绝不阻断规划
+                logger.warning("[SCAFFOLD-INJECT] #31-P2 物理落点解析失败（fail-open，跳过脚手架）",
+                               exc_info=True)
+                return []
+            if not _p2_dirs:
+                # hunter#4：空 dirs 也留痕（降级可观测；_module_physical_dirs 内部对歧义/撞车已
+                # WARNING，但"全部契约模块名都没匹配上物理落点"这一路径此前无信号）。
+                logger.info("[SCAFFOLD-INJECT] #31-P2 栈=%s 但无契约模块解析到物理落点 → 无脚手架"
+                            "（模块名或未匹配任何 scope 证据）", _stack)
+                return []
+            try:
+                return (_inject_npm_scaffolds if _stack == "npm" else _inject_go_scaffolds)(
+                    plan, project_path, file_plan, _p2_dirs)
+            except Exception:  # noqa: BLE001 — driver 异常 fail-open，绝不炸规划主链
+                logger.warning("[SCAFFOLD-INJECT] #31-P2 %s driver 异常（fail-open）", _stack,
+                               exc_info=True)
+                return []
         logger.warning(
-            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven）→ 跳过 Maven pom 脚手架注入（绝不拿 "
-            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入 "
-            "_AGGREGATOR_SCAFFOLD_STACKS。", _stack)
+            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go）→ 跳过 pom 脚手架注入（绝不拿 "
+            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入。",
+            _stack)
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
         logger.debug("[SCAFFOLD-INJECT] G9 未检出构建栈证据 → 保守回退 Maven（back-compat）")

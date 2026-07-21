@@ -16,6 +16,9 @@ os.environ.setdefault("SWARM_RBAC_ENABLED", "false")
 # 走"解析不到 → 如实省略"的离线降级路径；绝不允许真去 Central 查坐标——那会让结果随
 # 网络与上游版本发布漂移（"网络好就绿"是最坏的一种假绿），且拖慢每一次跑测。
 os.environ.setdefault("SWARM_MAVEN_LOOKUP", "0")
+# #31-P2b/2c：npm/go 版本解析同律默认关闭（栈中立铺开，同上防"网络好就绿"假绿）。
+os.environ.setdefault("SWARM_NPM_LOOKUP", "0")
+os.environ.setdefault("SWARM_GO_LOOKUP", "0")
 
 def install_noop_transaction(mock_store) -> None:
     """A-P1-26：给 AsyncMock 的 MemoryStore 装一个 no-op 的 transaction() 异步上下文。

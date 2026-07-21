@@ -14,6 +14,12 @@ REGISTERED_ENVS: dict[str, str] = {
     # R53-1：Maven 坐标/版本解析（仓库联网）。0=关闭（单测默认关，见 test/conftest.py：
     # 绝不让测试依赖网络，也杜绝"网络好就绿"的假绿）；关闭后行为=解析不到即如实省略。
     "SWARM_MAVEN_LOOKUP": "brain/maven_registry.py:_lookup_enabled",
+    # #31-P2b/2c：npm/go 依赖版本解析（registry/proxy 联网），与 SWARM_MAVEN_LOOKUP 同义栈中立
+    # 铺开。0=关闭（单测默认关：绝不让测试依赖网络/假绿）；关闭后=解析不到即如实丢弃。
+    "SWARM_NPM_LOOKUP": "brain/npm_registry.py:_lookup_enabled",
+    "SWARM_NPM_LOOKUP_TIMEOUT_S": "brain/npm_registry.py:_HTTP_TIMEOUT_S",
+    "SWARM_GO_LOOKUP": "brain/go_registry.py:_lookup_enabled",
+    "SWARM_GO_LOOKUP_TIMEOUT_S": "brain/go_registry.py:_HTTP_TIMEOUT_S",
     # R55-1：思考阶段预算（秒）。云端 reasoning 模型在思维链里原地打转时，max_tokens/stall
     # 看门狗都拦不住，墙钟兜底要先烧满 25 分钟。超此预算且尚未吐出正文 → 就地关 thinking
     # 用同一模型重开流（无损，下游无感）。0=关闭。
