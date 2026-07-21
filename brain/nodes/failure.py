@@ -2196,7 +2196,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     _scope_widened = False
     if plan_obj is not None:
         for fid in failed_ids:
-            new_files = _widen_scope_for_compile_repair(plan_obj, fid, saved_l1_details.get(fid, {}))
+            new_files = _widen_scope_for_compile_repair(
+                plan_obj, fid, saved_l1_details.get(fid, {}), subtask_results=subtask_results)
             if new_files:
                 _scope_widened = True
                 logger.info(

@@ -398,13 +398,31 @@ def dedupe_subtasks(subtasks: list[dict]) -> list[dict]:
             keep_by_sig[sig] = survivor
     if not drop_remap:
         return subtasks
+
+    # DR-01-F1(#47) 治本：drop_remap 可形成链（同签名脚手架被合并 ≥3 次会得 {st1:st2, st2:st3}）。
+    # 旧代码输出依赖只做单跳 drop_remap.get(d,d) → 解析到【已被丢弃的中间 survivor】st2（它也在
+    # drop_remap 内、不会被 emit）→ 随后 break_dependency_cycles 把指向不存在 st2 的边静默过滤 →
+    # 消费者对脚手架（真身 st3）的依赖边彻底丢失 → 与脚手架同波派发缺 pom/BLOCKED（头号死因族）。
+    # 解析成传递闭包终点；drop_remap 天然无环（每次顶替指向更地基/先出现者），seen 集防御性断环。
+    def _resolve_survivor(d: str) -> str:
+        seen: set[str] = set()
+        while d in drop_remap and d not in seen:
+            seen.add(d)
+            d = drop_remap[d]
+        if d in drop_remap:   # 复核整改（猎手）：不变量被破坏才会到这（drop_remap 本应无环）——
+            # 静默返回中间态=精确复现 #47 本要修的丢边 bug，必须响铃而非无声退化。
+            logger.error(
+                "[DEDUPE] _resolve_survivor 检测到 drop_remap 成环（不变量被破坏）：%s 停在仍被丢弃的 %s"
+                "——依赖边可能指向不会 emit 的中间 survivor，请查 dedupe 顶替逻辑", sorted(seen), d)
+        return d
+
     out: list[dict] = []
     for st in order:
         if st["id"] in drop_remap:
             continue
         deps: list[str] = []
         for d in (st.get("depends_on") or []):
-            nd = drop_remap.get(d, d)
+            nd = _resolve_survivor(d)
             if nd != st["id"] and nd not in deps:
                 deps.append(nd)
         out.append({**st, "depends_on": deps})

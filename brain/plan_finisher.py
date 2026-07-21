@@ -60,6 +60,33 @@ def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
         return "\n".join(
             f"- {p}" + (f"：{purpose[p]}" if p in purpose else "") for p in paths)
 
+    def _emit_fileplan_subtask(sid: str, mod: str, chunk: list[str]) -> None:
+        """确定性新建一个 file_plan 承接子任务（调用方保证单片 ≤_MAX_FILES_PER_GROUP，防超 validate 上限）。"""
+        writable, create = [], []
+        for p in chunk:
+            exists = bool(project_path) and (Path(project_path) / p).is_file()
+            (writable if exists else create).append(p)
+        st = SubTask(
+            id=sid,
+            description=(
+                f"【file_plan 承接】技术方案 file_plan 规划了以下 {mod} 模块文件，"
+                "但无子任务承接（收尾器确定性新建本子任务）。按各文件用途完整实现：\n"
+                + _fmt(chunk)),
+            intent=TaskIntent.MODIFY if writable and not create else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.MEDIUM,
+            scope=FileScope(writable=writable, create_files=create),
+            acceptance_criteria=[
+                f"{p} 按 file_plan 用途实现并编译通过" for p in chunk],
+        )
+        scaffold_sid = f"st-scaffold-{mod}"
+        if scaffold_sid in by_id:
+            st.depends_on.append(scaffold_sid)
+        plan.subtasks.append(st)
+        by_id[sid] = st
+        if plan.parallel_groups:
+            plan.parallel_groups.append([sid])
+        created[sid] = chunk
+
     for mod, paths in sorted(groups.items()):
         base_sid = f"st-fileplan-{mod}"
         # 复核 F1：既有承接子任务 → 收养（追加 scope+描述+验收），绝不丢弃
@@ -69,14 +96,32 @@ def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
                      if p not in host.scope.create_files
                      and p not in host.scope.writable]
             if adopt:
-                for p in adopt:
+                # DR-01-F7(#52) 治本：收养也受容量约束。新建分支已按 _MAX_FILES_PER_GROUP 预分片防超
+                # validate 硬上限，收养分支旧代码却无条件 append 全部 adopt → host writable 可超硬上限
+                # → validate 硬失败 → 每轮确定性收养到同一超限 host → D09 盲重试死循环（新建分支的
+                # 预分片守卫这里漏了）。只收养 host 剩余容量内的，溢出的走新建分片路径（base_sid-N）。
+                from swarm.brain.plan_validator import MAX_WRITABLE_FILES_PER_SUBTASK
+                _used = len(host.scope.writable or []) + len(host.scope.create_files or [])
+                _room = max(0, MAX_WRITABLE_FILES_PER_SUBTASK - _used)
+                _take, _overflow = adopt[:_room], adopt[_room:]
+                for p in _take:
                     exists = bool(project_path) and (Path(project_path) / p).is_file()
                     (host.scope.writable if exists
                      else host.scope.create_files).append(p)
                     host.acceptance_criteria.append(
                         f"{p} 按 file_plan 用途实现并编译通过")
-                host.description += "\n【file_plan 承接·追加】\n" + _fmt(adopt)
-                created[base_sid] = adopt
+                if _take:
+                    host.description += "\n【file_plan 承接·追加】\n" + _fmt(_take)
+                    created[base_sid] = _take
+                if _overflow:
+                    _chunks = [_overflow[i:i + _MAX_FILES_PER_GROUP]
+                               for i in range(0, len(_overflow), _MAX_FILES_PER_GROUP)]
+                    _suffix = 2
+                    for _chunk in _chunks:
+                        while f"{base_sid}-{_suffix}" in by_id:
+                            _suffix += 1
+                        _emit_fileplan_subtask(f"{base_sid}-{_suffix}", mod, _chunk)
+                        _suffix += 1
             continue
         # 复核 F2：预分片防超限
         chunks = [paths[i:i + _MAX_FILES_PER_GROUP]
@@ -85,30 +130,7 @@ def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
             sid = base_sid if ci == 0 else f"{base_sid}-{ci + 1}"
             if sid in by_id:
                 continue
-            writable, create = [], []
-            for p in chunk:
-                exists = bool(project_path) and (Path(project_path) / p).is_file()
-                (writable if exists else create).append(p)
-            st = SubTask(
-                id=sid,
-                description=(
-                    f"【file_plan 承接】技术方案 file_plan 规划了以下 {mod} 模块文件，"
-                    "但无子任务承接（收尾器确定性新建本子任务）。按各文件用途完整实现：\n"
-                    + _fmt(chunk)),
-                intent=TaskIntent.MODIFY if writable and not create else TaskIntent.CREATE,
-                difficulty=SubTaskDifficulty.MEDIUM,
-                scope=FileScope(writable=writable, create_files=create),
-                acceptance_criteria=[
-                    f"{p} 按 file_plan 用途实现并编译通过" for p in chunk],
-            )
-            scaffold_sid = f"st-scaffold-{mod}"
-            if scaffold_sid in by_id:
-                st.depends_on.append(scaffold_sid)
-            plan.subtasks.append(st)
-            by_id[sid] = st
-            if plan.parallel_groups:
-                plan.parallel_groups.append([sid])
-            created[sid] = chunk
+            _emit_fileplan_subtask(sid, mod, chunk)
     if created:
         logger.info(
             "[PLAN-FINISH] R48-1 孤儿无候选 → 确定性新建/收养承接子任务 %d 个: %s",

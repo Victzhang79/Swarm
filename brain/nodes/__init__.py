@@ -3019,6 +3019,25 @@ async def validate_plan(state: BrainState) -> dict:
                 _co_result.issues, rotate=retry_count),
         }
 
+    # ── DR-PM66-C2(#112) 考卷同源·接口方法名：契约 signature vs owner 子任务描述方法名不得分叉 ──
+    # round66 st-20-3/st-48-1 死循环真根：契约短名 vs 描述长名两个真值源打架，worker 每轮被误导，
+    # 到 L2 仍 cannot find symbol。规划期确定性打回，比执行期空转 6.5h 便宜。判据保守（近变体+逐字缺
+    # 席才判），不误伤沉默描述。
+    from swarm.brain.plan_validator import validate_contract_signature_source as _vcss
+    _css_result = _vcss(plan_obj, _sc_own)
+    for w in _css_result.warnings:
+        _vp_warnings.append(str(w))
+    if not _css_result.valid:
+        logger.warning("[VALIDATE_PLAN] C2 契约签名↔描述方法名分叉 → 打回 PLAN: %s",
+                       _css_result.issues[:3])
+        return {
+            "plan_valid": False,
+            "plan_retry_count": retry_count,
+            "plan_validation_issues": _css_result.issues,
+            "plan_validation_feedback": _format_validation_feedback(
+                _css_result.issues, rotate=retry_count),
+        }
+
     # ── R40-1 file_plan 归属确定性闸：规划文件必须有 owner 子任务 ──
     # round40 PARTIAL 直接死因：批拆丢 3 件（两个 ServiceImpl+DDL）零校验，执行期
     # 才以 BLOCKED"无生产者的包"→连坐放弃爆发。打回带具体缺件清单（D09），plan

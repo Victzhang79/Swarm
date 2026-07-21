@@ -852,6 +852,41 @@ def _code_module_root(path: str) -> str | None:
     return None
 
 
+# DR-PM66-C1(#110)/DR-09-F1(#101)：JVM 家族【类路径共享命名空间】布局目录。只有 src/.../{java,
+# kotlin,scala,groovy}/ 之下的包路径才构成"全类路径唯一"的 FQN——同 FQN 跨模块 = split-package/
+# 副本遮蔽（类路径上互相遮蔽、消费方解析到错误副本），全局 reactor 编译必炸。Go/Rust/Python/Node
+# 的 import 由模块/crate/包限定，同相对路径落不同模块合法。故靠【布局目录集数据驱动】判定，绝不写死
+# 语言逻辑（CLAUDE.md 铁律①：栈相关行为走 registry/driver 分发）。
+_CLASSPATH_NS_LAYOUT_DIRS = frozenset({"java", "kotlin", "scala", "groovy"})
+# 每模块/每包各自一份、跨模块同相对路径【合法】的 JVM 描述符——绝不当作重复类误杀。
+_PER_MODULE_JVM_DESCRIPTORS = frozenset({"module-info.java", "package-info.java"})
+
+
+def classpath_fqn_key(path: str) -> tuple[str, str] | None:
+    """create_file 路径 → (物理模块根, 包限定 FQN 相对路径)，**仅**对 JVM 类路径共享命名空间源码。
+    非 JVM 布局 / 无法定模块根 / 无包路径（默认包·根级描述符）/ per-module 描述符 → None（不判）。
+    #110（validate REJECT 闸）与 #101（确定性去冲突归一）共用此单一口径，栈中立。"""
+    mod = _code_module_root(path)
+    if not mod:
+        return None                        # 无物理模块根（根级/无布局段）→ 无跨模块可言
+    parts = _norm_scope_path(path).split("/")
+    try:
+        i = next(idx for idx, seg in enumerate(parts) if seg in _SRC_LAYOUT_SEGMENTS)
+    except StopIteration:
+        return None
+    j, saw_ns_lang = i, False              # 跳过 module_root 之后的布局段游程，要求含 JVM 语言目录
+    while j < len(parts) and parts[j] in _SRC_LAYOUT_SEGMENTS:
+        if parts[j] in _CLASSPATH_NS_LAYOUT_DIRS:
+            saw_ns_lang = True
+        j += 1
+    if not saw_ns_lang:
+        return None                        # 非 JVM 类路径命名空间（Go/Rust/Py flat 或资源）→ 不判
+    fqn_parts = parts[j:]                   # 包路径 + 文件名
+    if len(fqn_parts) < 2 or fqn_parts[-1] in _PER_MODULE_JVM_DESCRIPTORS:
+        return None                        # 无包（默认包）或 per-module 描述符 → 不判（避免误伤）
+    return mod, "/".join(fqn_parts)
+
+
 def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:
     """★Task#4 治本★ 计划里**实际收码**的全部物理模块根目录——聚合器 <modules> 完整性的权威。
 
@@ -2003,10 +2038,104 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
     return summary
 
 
+def _narrow_grep_scan_paths(cmd: str, declared: set[str], owned_areas: set[str]) -> str | None:
+    """DR-PM66-C4(#111) 单命令收敛：含 grep 的内容断言命令，剔除【外模块 scope 泄漏】的路径参数。
+
+    ★对抗双复核 CONFIRMED HIGH×2 整改★——正确不变量不是"scope ⊆ writable 文件"（过严，会把
+    合法的【整模块目录级基线断言】如 `! grep -rq lombok <module>/`〔挂脚手架子任务、只 owns pom.xml、
+    却故意扫全模块〕静默收窄成对自身空转；也会把针对 readable 契约文件的验证断言误删）。改为保留：
+      · 本子任务【声明的文件】（writable ∪ create_files ∪ readable，含只读契约文件）；或
+      · 本子任务【自身物理模块区域】内的目录/文件（含整模块基线断言，如 lombok 禁令，合法跨兄弟）。
+    只剔除【外模块】scope 泄漏参数（子任务无立场的另一顶层模块）；全部越界→None（整条剔除）。
+    绝不改写目录扫描的语义（保留原样，不再展开为文件列表）；绝不动构建命令（无 grep）。"""
+    import re as _re
+    if "grep" not in cmd:
+        return cmd
+    # 抽 grep 调用：flags* + 引号 pattern + 其后 path 段（到 ) | ; & > 之前）
+    m = _re.search(
+        r"grep\b(?P<flags>(?:\s+-{1,2}[\w=-]+)*)\s+"
+        r"(?P<q>['\"])(?P<pat>.*?)(?P=q)(?P<paths>[^)|;&>]*)", cmd)
+    if not m:
+        return cmd            # 非常见形态 → 不动（保守 fail-open，绝不误改成永假）
+    toks = [t for t in m.group("paths").split() if t and not t.startswith("-")]
+    if not toks:
+        return cmd            # grep 无显式路径参数（管道/stdin）→ 不动
+    kept: list[str] = []
+    changed = False
+    for p in toks:
+        np = _norm_scope_path(p)
+        top = np.split("/", 1)[0] if "/" in np else np
+        if np in declared or top in owned_areas:
+            kept.append(p)                   # 声明文件 或 本模块区域（含整模块目录级断言）→ 原样保留
+        else:
+            changed = True                   # 外模块 scope 泄漏 → 剔除该参数
+    if not kept:
+        return None          # 全部越出声明 scope + 本模块区域 → 整条剔除（不能被外模块内容判死）
+    if not changed:
+        return cmd
+    seen: set[str] = set()
+    kept = [x for x in kept if not (x in seen or seen.add(x))]
+    return cmd[:m.start("paths")] + " " + " ".join(kept) + cmd[m.end("paths"):]
+
+
+def sanitize_verify_scope(plan) -> dict[str, dict]:
+    """DR-PM66-C4(#111) 治本：源码内容断言（grep/test 类）的扫描路径不得越出【本子任务声明 scope +
+    本子任务自身物理模块区域】。否则一个子任务的成败被【外模块产物】决定=保证性假阴性死局。
+
+    ★对抗双复核整改★：判据从"⊆ writable 文件"放宽为"声明文件（writable∪create_files∪readable）∪
+    本模块区域"——保住合法的整模块基线断言（lombok 禁令）与 readable 契约文件验证，只剔除外模块泄漏。
+    round66 st-32 的真根（负断言未锚定 import 命中注释）由 #102 治，本闸只堵【跨模块】责任错配。
+    确定性、幂等、零 LLM；绝不动构建命令（mvn/gradle/go build，无 grep，模块级合法，见黄灯）。栈中立。
+    返回 {subtask_id: {narrowed, dropped}} 机读摘要。"""
+    summary: dict[str, dict] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        h = getattr(st, "harness", None)
+        vcs = list(getattr(h, "verify_commands", []) or []) if h else []
+        if not vcs:
+            continue
+        sc = getattr(st, "scope", None)
+        _wr = [f for f in (list(getattr(sc, "writable", None) or [])
+                           + list(getattr(sc, "create_files", None) or [])) if str(f).strip()]
+        # 声明文件=可写∪新建∪只读（含 readable 契约文件，猎手 CONFIRMED：只读契约验证断言不得误删）
+        declared = {_norm_scope_path(f) for f in
+                    (_wr + [f for f in (getattr(sc, "readable", None) or []) if str(f).strip()])}
+        # 本模块区域=可写/新建文件的顶层模块段（整模块目录级基线断言合法，复核 CONFIRMED：lombok 禁令）
+        owned_areas = {_norm_scope_path(f).split("/", 1)[0]
+                       for f in _wr if "/" in _norm_scope_path(f)}
+        if not declared and not owned_areas:
+            continue          # 子任务无任何声明 scope（allow_any/纯删除等）→ 无从判定 → 不动
+        new_vcs: list[str] = []
+        rec = {"narrowed": [], "dropped": []}
+        for vc in vcs:
+            try:
+                out = _narrow_grep_scan_paths(vc, declared, owned_areas)
+            except Exception:  # noqa: BLE001 — 单命令解析异常绝不拖垮全 plan，但必留痕（猎手 CONFIRMED）
+                logger.warning(
+                    "[VERIFY-SCOPE] DR-PM66-C4(#111) %s 单命令解析异常，保留原命令不动: %s",
+                    getattr(st, "id", "?"), vc, exc_info=True)
+                new_vcs.append(vc)
+                continue
+            if out is None:
+                rec["dropped"].append(vc)
+                logger.warning(
+                    "[VERIFY-SCOPE] DR-PM66-C4(#111) %s 内容断言扫描路径全部越出【本子任务声明 scope"
+                    "＋本模块区域】=外模块泄漏（会被外模块产物判死）→ 剔除整条: %s",
+                    getattr(st, "id", "?"), vc)
+            elif out != vc:
+                rec["narrowed"].append((vc, out))
+                new_vcs.append(out)
+            else:
+                new_vcs.append(vc)
+        if (rec["narrowed"] or rec["dropped"]) and h is not None:
+            h.verify_commands = new_vcs
+            summary[getattr(st, "id", "?")] = rec
+    return summary
+
+
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None, file_plan: list | None = None,
 ) -> list[dict]:
-    """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile。"""
+    """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile + 验收作用域收敛。"""
     injected = _inject_build_scaffold_subtasks_impl(plan, project_path, file_plan)
     try:
         _exam = reconcile_template_exam(plan)
@@ -2015,6 +2144,13 @@ def inject_build_scaffold_subtasks(
                         len(_exam), sorted(_exam)[:8])
     except Exception:  # noqa: BLE001 — fail-open，考卷维持原样交 worker 侧 H1 兜底
         logger.warning("[R65D-T2] 考卷同源 reconcile 失败（fail-open）", exc_info=True)
+    try:
+        _vs = sanitize_verify_scope(plan)   # DR-PM66-C4(#111)
+        if _vs:
+            logger.info("[VERIFY-SCOPE] #111 验收作用域收敛：%d 个子任务被收敛/剔除 %s",
+                        len(_vs), sorted(_vs)[:8])
+    except Exception:  # noqa: BLE001 — fail-open，越界断言维持原样（不引入新致死面）
+        logger.warning("[VERIFY-SCOPE] #111 验收作用域收敛失败（fail-open）", exc_info=True)
     return injected
 
 
@@ -4166,6 +4302,109 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     return bumped
 
 
+def deconflict_cross_module_creates(plan: TaskPlan) -> int:
+    """DR-09-F1(#101) part(1)：同一 FQN 被多子任务在【不同物理模块】各自 create 时的确定性归一。
+
+    round66/65e14 死因：st-6/16/18 在 ruoyi-alarm 正确 create AlarmTemplate/AlarmNotifyUser/
+    AlarmAppSecret 等；st-45-1-1/46-1-1/47-1 又把同 FQN 重复安排到 ruoyi-admin 下 create → 同
+    FQN 跨模块副本遮蔽 + 语法损坏 + 连坐（normalize_plan_scopes 只按【路径】去冲突，跨模块同 FQN
+    不同路径逃过；symbol_provenance T4 检测到多落点只消极不钉）。
+
+    本 pass 用【契约 defined_in】作唯一权威判 owner 模块（绝不用裸 basename/启发式，防 com.a.Foo
+    与 com.b.Foo 误并——FQN=包路径+类名，见 classpath_fqn_key）：
+      · 契约明确钉某 FQN 的 owner 模块 → 保留 owner 子任务的 create，其余子任务把该文件从
+        create_files 剥除、改 readable（指向 owner 落点）+ 依赖 owner 子任务（带防环）。
+      · 无契约权威可判的歧义 → 【不动】，留给 #110 validate REJECT 硬打回（绝不静默挑一个）。
+    与 #110 REJECT 互补（防御纵深）：能确定性消解的省一轮 replan，消解不了的 fail-closed 打回。
+    返回被归一（剥除）的文件数。栈中立（仅 JVM 类路径共享命名空间适用，见 classpath_fqn_key）。
+    """
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    if len(subtasks) < 2:
+        return 0
+    # FQN → {module -> [subtask]}（仅 create_files）；(id(st),fqn) → 实际 create 路径
+    fqn_index: dict[str, dict[str, list]] = {}
+    file_of: dict[tuple[int, str], str] = {}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        for f in list(getattr(sc, "create_files", None) or []):
+            key = classpath_fqn_key(f)
+            if not key:
+                continue
+            mod, fqn = key
+            fqn_index.setdefault(fqn, {}).setdefault(mod, []).append(st)
+            file_of[(id(st), fqn)] = f
+    # 契约 defined_in 权威：fqn → owner 模块
+    owner_mod: dict[str, str] = {}
+    for e in ((getattr(plan, "shared_contract", None) or {}).get("interfaces") or []):
+        if isinstance(e, dict):
+            key = classpath_fqn_key(str(e.get("defined_in") or ""))
+            if key:
+                owner_mod[key[1]] = key[0]
+    by_id = {getattr(st, "id", None): st for st in subtasks}
+
+    def _reaches_dep(start, target) -> bool:
+        """start 是否经 depends_on 链到达 target（加边 st→owner 前防环）。"""
+        seen, stack = set(), [start]
+        while stack:
+            cur = stack.pop()
+            if cur == target:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            st = by_id.get(cur)
+            if st is not None:
+                stack.extend(getattr(st, "depends_on", None) or [])
+        return False
+
+    changed = 0
+    for fqn, mods in fqn_index.items():
+        if len(mods) < 2:
+            continue
+        auth = owner_mod.get(fqn)
+        if not auth or auth not in mods:
+            continue        # 无契约权威 → 留给 #110 REJECT，绝不静默挑
+        owner_st = mods[auth][0]
+        owner_id = getattr(owner_st, "id", None)
+        owner_file = file_of.get((id(owner_st), fqn))
+        for mod, sts in mods.items():
+            if mod == auth:
+                continue
+            for st in sts:
+                f = file_of.get((id(st), fqn))
+                sc = getattr(st, "scope", None)
+                if not f or sc is None:
+                    continue
+                nf = _norm_scope_path(f)
+                sc.create_files = [x for x in (getattr(sc, "create_files", None) or [])
+                                   if _norm_scope_path(x) != nf]
+                # 复核整改（猎手 PLAUSIBLE）：剥除 create_files 的同时清掉【专门针对该文件】的验收/
+                # 验证条目——否则子任务仍被 "X.java 按用途实现并编译通过" 误导去重建已剥离文件，抵消归一。
+                _ac = getattr(st, "acceptance_criteria", None)
+                if _ac:
+                    st.acceptance_criteria = [a for a in _ac if f not in str(a) and nf not in str(a)]
+                _hh = getattr(st, "harness", None)
+                _vc = getattr(_hh, "verify_commands", None) if _hh is not None else None
+                if _vc:
+                    _hh.verify_commands = [v for v in _vc if f not in str(v) and nf not in str(v)]
+                if owner_file:      # 消费方改 readable 指向 owner 真实落点
+                    rd = list(getattr(sc, "readable", None) or [])
+                    if _norm_scope_path(owner_file) not in {_norm_scope_path(x) for x in rd}:
+                        rd.append(owner_file)
+                        sc.readable = rd
+                sid = getattr(st, "id", None)
+                if owner_id and sid and owner_id != sid and not _reaches_dep(owner_id, sid):
+                    deps = list(getattr(st, "depends_on", None) or [])
+                    if owner_id not in deps:
+                        st.depends_on = deps + [owner_id]
+                changed += 1
+                logger.info(
+                    "[DECONFLICT-XMOD] DR-09-F1(#101) 同 FQN %s 跨模块重复 create：契约 owner 模块=%s"
+                    "（子任务 %s）；从子任务 %s 剥除 %s（改 readable+依赖 owner）",
+                    fqn, auth, owner_id, sid, f)
+    return changed
+
+
 def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
                            base_ref: str | None = None) -> dict[str, int]:
     """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
@@ -4185,6 +4424,8 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
     plan_validator 校验的"每个文件单一写者 + 无悬空依赖"不变量，由本函数确定性满足。返回各 pass 改动计数。
     """
     return {
+        # #101 先跑：剥掉契约有权威 owner 的跨模块重复 create，后续 pass 只看干净 scope。
+        "xmod_creates_deconflicted": deconflict_cross_module_creates(plan),
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),
@@ -4275,8 +4516,15 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
                 # 6.9-HF9：机器追加段用固定定界符——_subtask_signature 含 description 全文，
                 # 两轮 replan 的 dup 集不同（常态）会使 canon 描述串漂移 → 签名不等 →
                 # 外科 reset 把已完成态/配额表误剪（白重跑）。签名侧按定界符剥机器段。
-                canon.description = ((getattr(canon, "description", "") or "")
-                                     + f"{MERGED_DUP_DELIM}{_dd}")[:2000]
+                # DR-01-F5(#50) 治本：绝不对【canon 原有内容】做尾截断。canon 自身 description 可
+                # 已 >2000（内嵌完整权威 pom `\`\`\`xml…</project>\`\`\``），旧 `(canon+DELIM+dup)[:2000]`
+                # 会从 2000 处切掉 canon 模板尾 → worker trivial 快路径写入半截 XML → pom 非法/reactor
+                # 中毒（round65c 同族事故）。改为只截【追加的 dup 片段】；canon 已占满预算则不追加
+                # （dup 语义由 acceptance/covers 并集守恒）。
+                _canon_desc = getattr(canon, "description", "") or ""
+                _room = 2000 - len(_canon_desc) - len(MERGED_DUP_DELIM)
+                if _room > 0:
+                    canon.description = _canon_desc + MERGED_DUP_DELIM + _dd[:_room]
             drop_to_canon[dup.id] = canon.id
             merged += 1
     if not merged:

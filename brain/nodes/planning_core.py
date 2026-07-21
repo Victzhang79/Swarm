@@ -27,7 +27,8 @@ from swarm.types import Confidence, WorkerOutput
 logger = logging.getLogger(__name__)
 
 
-def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[str]:
+def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict,
+                                    subtask_results: dict | None = None) -> list[str]:
     """治本(RUN16 st-20 死循环)：子任务编译失败、但【根因在其 scope 之外】(模块 pom 缺依赖 /
     上游文件签名不符)→ 该子任务 scope 改不到那些文件 → 重试永远编不过 → 死循环。
 
@@ -60,6 +61,21 @@ def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict) -> list[s
     for m in _re.finditer(r"/workspace/([\w./\-]+\.(?:java|xml))", build_out):
         add.add(m.group(1))
     new = sorted(f for f in add if f not in cur)
+    # DR-01-F6(#51) 治本：加宽绝不纳入【其它已完成兄弟拥有的产物】。否则失败子任务重派后可
+    # 直接改写/覆盖兄弟已交付的跨模块文件（如 st-B 拥有的 ruoyi-common/BaseEntity.java），
+    # MERGE 时以失败子任务版本落地、兄弟工作被静默改写。此路径无依赖序守卫（区别于缺依赖恢复臂
+    # _grant_module_pom_writable+_serialize_pom_writers），只能排除；被排除的跨模块修复应由
+    # 缺依赖恢复臂按依赖序安置，而非在此授直接写权。
+    if subtask_results:
+        _owned_by_others = _files_owned_by_completed(
+            plan_obj.subtasks, subtask_results, exclude_ids={fid})
+        _blocked = [f for f in new
+                    if str(f).replace("\\", "/").lstrip("./") in _owned_by_others]
+        if _blocked:
+            logger.warning(
+                "[WIDEN-SCOPE] DR-01-F6(#51) 拒绝把兄弟已完成产物加入失败子任务 %s 的 writable"
+                "（防越权改写/连坐）: %s", fid, _blocked)
+            new = [f for f in new if f not in _blocked]
     if new and st is not None:
         scope.writable = list(getattr(scope, "writable", []) or []) + new
     return new
@@ -165,9 +181,16 @@ _NON_MODULE_TOP = ("src", "test", "target", "build", "dist", "out", "node_module
 def _module_of(files: list) -> str | None:
     """从文件路径列表取顶层【模块目录】（首个含 '/' 且首段不是 src/test 等的路径）。"""
     for f in files or []:
-        if "/" in f:
-            top = f.split("/", 1)[0]
-            if top and top not in _NON_MODULE_TOP:
+        # DR-01-F3(#48)：先归一（剥 './'/'\\'/前导 '/'）。否则 './ruoyi-alarm/X.java' → top='.'
+        # （'.' 不在 _NON_MODULE_TOP）→ 调用方拼出 './pom.xml' 当【模块 pom】授写权，实为
+        # 【根聚合 pom】→ 多恢复子任务双写根 pom = D1 rebase 循环根因。'.'/'..'/空串显式排除。
+        nf = str(f).replace("\\", "/")
+        while nf.startswith("./"):
+            nf = nf[2:]
+        nf = nf.lstrip("/")
+        if "/" in nf:
+            top = nf.split("/", 1)[0]
+            if top and top not in _NON_MODULE_TOP and top not in (".", ".."):
                 return top
     return None
 

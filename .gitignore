@@ -61,6 +61,7 @@ UPSTREAM_DOWNSTREAM_TREATMENT.md
 logs_archive/
 
 # ─── 内部工作文档（不上云端；本地保留）──────────────
+deep_read_findings/
 CLAUDE.md
 docs/archive/
 /DESIGN_*.md

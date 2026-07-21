@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 from swarm.types import SubTask, TaskPlan
@@ -100,6 +101,13 @@ def validate_plan_structure(
         result.add("计划无子任务")
         return result
 
+    # DR-01-F2(#46) 治本：写冲突/并行冲突/根聚合清单三处闸此前用 scope 原始串作键（仅
+    # replace("\\","/")，未剥 './'/前导 '/'）→ 同一文件的路径形态变体（'./pom.xml' vs
+    # 'pom.xml'、'src//A.java'）逃过所有冲突判定，且 './pom.xml' 不在 _ROOT_AGGREGATOR_MANIFESTS
+    # 裸成员集 → 根聚合双写者 backstop 被一个 './' 绕过。统一走 _norm_scope_path 归一（与
+    # normalize_plan_scopes 同一把尺子）。lazy import 沿用本模块既有反循环导入约定。
+    from swarm.brain.contract_utils import _norm_scope_path
+
     # H1 治本(round21 假绿门)：整 plan 必须至少有一个子任务能【产出改动】(writable ∪ create_files
     # 非空)。tech_design/plan 返回【空但合法】JSON(file_plan=[])时，所有子任务写 scope 皆空 → 只能
     # 产空 diff → 在"DONE 零放弃"判据下沿 tech_design→plan→validate→confirm→dispatch 直穿判成功
@@ -172,12 +180,13 @@ def validate_plan_structure(
             if not t:
                 continue
             for fp in t.scope.writable or []:
-                if fp in seen and seen[fp] != tid:
+                nfp = _norm_scope_path(fp)  # DR-01-F2(#46)：归一键，防 './' 前缀绕过
+                if nfp in seen and seen[nfp] != tid:
                     result.add(
-                        f"parallel_groups[{gi}] 中 {seen[fp]} 与 {tid} 同时写 {fp}（并行冲突）"
+                        f"parallel_groups[{gi}] 中 {seen[nfp]} 与 {tid} 同时写 {fp}（并行冲突）"
                     )
                 else:
-                    seen[fp] = tid
+                    seen[nfp] = tid
 
     # 跨子任务写冲突。writable + create_files 都算"写"（B3：每个文件只应属一个子任务）。
     # - 无依赖关系还写同文件 → 硬失败（并行必冲突）。
@@ -189,7 +198,7 @@ def validate_plan_structure(
         # 同一子任务内 writable ∪ create_files 去重：否则文件【既在 writable 又在 create_files】
         # 时同一子任务 id 被记两次 → 下方两两比较会出现 "st-N 与 st-N 同时写"（自己跟自己冲突）。
         for fp in (set(t.scope.writable or []) | set(getattr(t.scope, "create_files", []) or [])):
-            writable_map.setdefault(fp, []).append(t.id)
+            writable_map.setdefault(_norm_scope_path(fp), []).append(t.id)  # DR-01-F2(#46) 归一键
     for fp, ids in writable_map.items():
         ids = list(dict.fromkeys(ids))  # 跨子任务再去重（保序）
         if len(ids) < 2:
@@ -203,7 +212,7 @@ def validate_plan_structure(
         # Cargo.toml）的依赖序双写者只落下方 warn，逃过 backstop → Gradle/Go 重现 pom 早年那条
         # 非加性 rebase 循环。栈中立铺开：根级聚合清单集统一硬失败（路径无前缀=在仓库根）。
         # normalize_plan_scopes 已收敛唯一 owner；此处硬失败仅在收敛失效时兜底（fail-closed）。
-        if fp.replace("\\", "/") in _ROOT_AGGREGATOR_MANIFESTS:
+        if _norm_scope_path(fp) in _ROOT_AGGREGATOR_MANIFESTS:  # DR-01-F2(#46)：fp 已归一，剥 './'
             result.add(
                 f"根聚合清单 {fp} 有 {len(ids)} 个写者: [{joined}]"
                 f"（必须收敛唯一 aggregator-owner；双写者=P0-A 畸形/rebase 循环根因）"
@@ -645,6 +654,98 @@ def validate_contract_ownership(
     return result
 
 
+# ── DR-PM66-C2(#112) 考卷同源·接口方法名（round66 st-20-2/st-48-1 死循环真根）─────────────
+def _camel_words(name: str) -> list[str]:
+    """标识符按 camelCase/PascalCase 切成词序列（selectAlarmList → ['select','Alarm','List']）。"""
+    return re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])", name)
+
+
+def _is_method_name_variant(a: str, b: str) -> bool:
+    """a、b 是否为「插入/删除一个内部大写词」的近变体（selectAlarmScheduleStrategyList ↔
+    selectScheduleStrategyList），且首词/尾词一致。仅用于识别契约签名 vs 描述的方法名分叉——
+    首尾词锚定 + 恰差一个内部词，误配空间极小（不同于 difflib 宽松相似度，round31 F4 教训）。"""
+    wa, wb = _camel_words(a), _camel_words(b)
+    if not wa or not wb or wa[0].lower() != wb[0].lower() or wa[-1] != wb[-1]:
+        return False
+    long_, short_ = (wa, wb) if len(wa) >= len(wb) else (wb, wa)
+    if len(long_) - len(short_) != 1:
+        return False
+    for k in range(1, len(long_) - 1):        # 删一个【内部】词（首尾已锚定一致）
+        if long_[:k] + long_[k + 1:] == short_:
+            # 复核整改（code-reviewer CONFIRMED MED）：要求差异词【之后】仍共享 ≥2 个词——区分
+            # "实体前缀中缀差异"=真分叉（selectScheduleStrategyList ↔ selectAlarmScheduleStrategyList，
+            # 差异词后共享 ScheduleStrategyList=3 词）与"两个恰差一词的【不同】CRUD 方法"=合法（RuoYi
+            # 常见 selectAlarmList vs selectAlarmScheduleList，差异词后仅共享 List=1 词 → 不判分叉，
+            # 防 fail-closed 误杀好 plan 空烧 replan 预算）。
+            if len(long_) - k - 1 >= 2:
+                return True
+    return False
+
+
+def validate_contract_signature_source(plan, shared_contract) -> PlanValidationResult:
+    """DR-PM66-C2(#112) 考卷同源·接口方法名：契约 interface.signature 的方法名与【创建该接口文件的
+    owner 子任务 description】里出现的方法名不得分叉。
+
+    round66 死因：契约用短名 selectScheduleStrategyList，而 owner 子任务 st-20-2 描述用长名
+    selectAlarmScheduleStrategyList（差一个 Alarm 中缀，6 个方法 5 个不一致）→ worker 按描述落长名
+    接口、消费方（Controller/实现类）按契约调短名 → cannot find symbol，st-20-3/st-48-1 连续多轮
+    空转（6.5h 最大黑洞之一）。规划期两个真值源就已分叉，worker 每轮被其中一个误导。
+
+    保守判据（零误伤）：仅当某契约方法【未在 owner 描述里逐字出现】、【且】描述里存在它的【近变体】
+    （_is_method_name_variant，插入/删除一个内部大写词）才判分叉——描述沉默（不列方法名）或完全
+    一致均不触发。栈中立：camelCase 方法名惯例（小写开头），PascalCase 方法栈不受益也不受害。
+    """
+    from swarm.brain.contract_utils import _norm_scope_path
+    result = PlanValidationResult(valid=True)
+    ifaces = (shared_contract or {}).get("interfaces") or []
+    if not isinstance(ifaces, list) or not ifaces:
+        return result
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+
+    def _owner_desc(defined_in: str) -> str | None:
+        di = _norm_scope_path(defined_in)
+        for st in subtasks:
+            sc = getattr(st, "scope", None)
+            files = (list(getattr(sc, "create_files", None) or [])
+                     + list(getattr(sc, "writable", None) or []))
+            if any(_norm_scope_path(f) == di for f in files):
+                return getattr(st, "description", "") or ""
+        return None
+
+    for e in ifaces:
+        if not isinstance(e, dict):
+            continue
+        di = str(e.get("defined_in") or "").strip()
+        sig = str(e.get("signature") or "")
+        if not di or not sig:
+            continue
+        desc = _owner_desc(di)
+        if desc is None:
+            continue        # 无 owner 子任务：另有 file_plan/ownership 闸覆盖，此处不重复报
+        c_methods = re.findall(r"(\w+)\s*\(", sig)
+        desc_tokens = set(re.findall(r"\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b", desc))
+        diverged: list[tuple[str, list[str]]] = []
+        for c in c_methods:
+            if not c or not c[0].islower():
+                continue    # 只查方法名（小写开头惯例），跳过构造/类型名
+            # 复核整改（猎手 PLAUSIBLE）：逐字出现用【词边界】匹配，非裸子串——否则 'get' 命中
+            # 'target'/'budget' 等无关英文单词内部 → 误判"一致"放过真分叉（#112 假阴性）。
+            if c in desc_tokens or re.search(rf"\b{re.escape(c)}\b", desc):
+                continue    # 契约方法在描述里逐字出现 = 一致
+            variants = [t for t in desc_tokens
+                        if t not in c_methods and _is_method_name_variant(t, c)]
+            if variants:
+                diverged.append((c, sorted(variants)))
+        if diverged:
+            _pairs = "; ".join(f"契约 {c!r} vs 描述 {v}" for c, v in diverged[:6])
+            result.add(
+                f"接口 {e.get('name') or di} 的契约方法签名与其 owner 子任务描述【方法名分叉】"
+                f"（考卷两个真值源打架，消费方按契约调用必 cannot find symbol 多轮空转）：{_pairs}。"
+                f"统一为唯一真值：把 owner 子任务描述里的方法名改成与 shared_contract.signature "
+                f"完全逐字一致（或反向修正契约），二者方法名必须相同。")
+    return result
+
+
 def validate_file_plan_ownership(
     plan, file_plan, exclude_test_paths: bool = False,
 ) -> PlanValidationResult:
@@ -681,6 +782,23 @@ def validate_file_plan_ownership(
     return result
 
 
+def _cross_module_class_redefinitions(plan) -> dict[str, dict[str, list[str]]]:
+    """全 plan 的 create_files 建 FQN→{物理模块: [子任务 id]} 倒排；同一 FQN 落 ≥2 物理模块=违规。
+    只看 create_files（重复【创建】同类），modify 既有文件不算。disk-independent、栈中立。
+    FQN 口径与 #101 去冲突归一共用 contract_utils.classpath_fqn_key（单一事实源）。"""
+    from swarm.brain.contract_utils import classpath_fqn_key
+    index: dict[str, dict[str, list[str]]] = {}
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])):
+            key = classpath_fqn_key(f)
+            if not key:
+                continue
+            mod, fqn = key
+            index.setdefault(fqn, {}).setdefault(mod, []).append(getattr(st, "id", "?"))
+    return {fqn: mods for fqn, mods in index.items() if len(mods) >= 2}
+
+
 def validate_module_coherence(
     plan, *, project_path: str | None = None, file_plan: list | None = None,
     base_ref: str | None = None,
@@ -708,6 +826,22 @@ def validate_module_coherence(
     )
 
     result = PlanValidationResult(valid=True)
+
+    # ③ DR-PM66-C1(#110) 治本：同一 FQN（包路径+类名）被多子任务在【不同物理模块】各自 create =
+    # 类路径副本遮蔽/split-package（round66 #101 真根：com.ruoyi.alarm.appkey.domain.AlarmAppSecret
+    # 同时落 ruoyi-alarm 与 ruoyi-admin → 全局 reactor 编译时消费方解析到缺方法的错误副本 → cannot
+    # find symbol）。L1 隔离编译（mvn -pl <mod> -am）看不见，L2 必炸——正是"81 done 是假象"。这是
+    # disk-independent 铁证（纯 create_files 路径推导），fail-closed 打回，与 #101 的 normalize 去冲突
+    # 互补（防御纵深）。仅 JVM 类路径共享命名空间源码适用（栈中立，见 _classpath_fqn_key）。此检查
+    # 不依赖模块声明，故置于 `if not want` 早退之前（跨模块同 FQN 与模块宇宙无关）。
+    _redef = _cross_module_class_redefinitions(plan)
+    for fqn, mods in sorted(_redef.items()):
+        _where = "; ".join(f"{m}（{','.join(ids[:3])}）" for m, ids in sorted(mods.items()))
+        result.add(
+            f"同一全限定类 {fqn!r} 被多个物理模块各自 create：{_where}。同 FQN 跨模块=类路径副本"
+            f"遮蔽/split-package，全局编译时消费方会解析到缺方法的错误副本（cannot find symbol）。"
+            f"该类只能属【一个】模块：其余模块请 import 该模块的 FQN 而非重建，并从其 create_files 移除。")
+
     # 模块宇宙 = 契约依赖声明的模块 ∪ file_plan 声明的模块（两者都是【这是一个模块】的权威声明）。
     deps = ((getattr(plan, "shared_contract", None) or {}).get("dependencies")) or []
     want = {(e.get("module") or "").strip().rstrip("/")
@@ -887,6 +1021,12 @@ def validate_requirement_coverage(
     _declared_valid = {e["id"] for e in matrix["baseline_covered"]}
     for entry in normalize_baseline_covered(baseline_covered):
         if entry["id"] in _declared_valid or entry["id"] in matrix["dangling_baseline"]:
+            continue
+        # DR-01-F4(#49) 治本：只对【真的缺 reason】的空申报报"缺 reason"。条目【带 reason】却未
+        # 进 baseline_valid，是被证据闸/单调集(baseline_ineligible)踢出——它已由 uncovered issue
+        # 或 baseline_claims_missing_evidence 专项 issue 覆盖。此处再报"缺 reason"=与那些 issue
+        # 互斥的矛盾指令（补 reason 无效、仍被单调集再踢），恰复活 R65E9 baseline limbo 振荡。
+        if (entry.get("reason") or "").strip():
             continue
         result.add(
             f"baseline_covered 申报 {entry['id']} 缺少 reason 理由"

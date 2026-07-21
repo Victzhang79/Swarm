@@ -201,12 +201,43 @@ def prepare_injected_state(
     # 注入跳过了 VALIDATE 节点，而 finisher/resolve 全程 fail-open（live 管线里缺口由
     # VALIDATE 权威打回兜底）——注入通道没有这层兜底，重推导若内部静默失败，带病 plan
     # 会直通 DISPATCH。这里用同一把确定性尺子把关：结构非法绝不开跑。
-    from swarm.brain.plan_validator import validate_plan_structure
+    from swarm.brain.plan_validator import (
+        validate_contract_ownership,
+        validate_contract_signature_source,
+        validate_module_coherence,
+        validate_plan_structure,
+    )
     _vres = validate_plan_structure(plan)
     if not _vres.valid:
         raise PlanInjectError(
             "plan_inject_validation_failed",
             f"注入 plan 重推导后结构校验未通过（DAG/写冲突/粒度）：{_vres.issues[:8]}")
+    # DR-01-F8(#53) 治本：闸4 此前只跑 validate_plan_structure（结构闸），跳过 live VALIDATE 节点
+    # 还会跑的 G1 coherence / 契约 owner 对账等【不依赖运行期 state 的确定性维度】。注入通道刻意
+    # 无 VALIDATE 兜底 → finisher 只安置不硬判 G1 → 不coherent 的 plan（逻辑模块散落多物理目录/
+    # 多模块塌进同一目录）直穿 DISPATCH 死在 reactor（round44/57/59/62 家族）。至少把 G1 这把
+    # ★真治本闸★纳入，契约 owner 对账（有 shared_contract 时）一并补齐——与 live VALIDATE 同参。
+    _g1 = validate_module_coherence(
+        plan, project_path=project_path, file_plan=file_plan, base_ref=live_base_commit)
+    if not _g1.valid:
+        raise PlanInjectError(
+            "plan_inject_coherence_failed",
+            f"注入 plan G1 模块 coherence 校验未通过（逻辑模块↔物理构建单元不相交，"
+            f"直穿 DISPATCH 必死 reactor）：{_g1.issues[:8]}")
+    if shared_contract:
+        _cres = validate_contract_ownership(
+            plan, shared_contract, project_path=project_path)
+        if not _cres.valid:
+            raise PlanInjectError(
+                "plan_inject_contract_failed",
+                f"注入 plan 契约 owner 对账未通过（契约符号无子任务承接=两张皮，L2 才爆缺失）："
+                f"{_cres.issues[:8]}")
+        _csres = validate_contract_signature_source(plan, shared_contract)
+        if not _csres.valid:
+            raise PlanInjectError(
+                "plan_inject_contract_signature_diverged",
+                f"注入 plan 契约签名↔owner 描述方法名分叉（考卷两真值源打架，消费方 L2 必 cannot "
+                f"find symbol）：{_csres.issues[:8]}")
 
     n_edges = sum(len(st.depends_on or []) for st in plan.subtasks)
     logger.info(
