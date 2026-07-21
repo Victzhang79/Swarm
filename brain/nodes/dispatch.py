@@ -412,6 +412,50 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
 _REDISPATCH_AGE_WARN_WINDOWS = 8
 
 
+def _redispatch_hard_windows() -> int:
+    """#109 DR-PM66-A3：软掉账兑现【硬阈值】——账龄超此=重派承诺不可兑现（上游长期不动）。保守取
+    3× 告警阈值（默认 24 窗口，黄灯：别过早掉账误杀还能救的）。env SWARM_REDISPATCH_HARD_WINDOWS 覆写。"""
+    try:
+        v = int(os.environ.get("SWARM_REDISPATCH_HARD_WINDOWS", "24") or "24")
+        return v if v > 0 else 0
+    except (TypeError, ValueError):
+        return 24
+
+
+def _soft_drop_enabled() -> bool:
+    """#109 泄压阀：默认开；坏任务/调试可 SWARM_REDISPATCH_SOFT_DROP=0 关（关=退回只告警不兑现旧行为）。"""
+    return os.environ.get("SWARM_REDISPATCH_SOFT_DROP", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _soft_drop_aged_promises(ages: dict, dispatch_remaining: list, abandoned_prev,
+                             plan_obj, completed_ids: set, hard: int):
+    """#109 DR-PM66-A3 纯函数：账龄≥hard 且仍在 remaining 的重派承诺软掉账（+传递放弃下游）。
+    返回 (new_dispatch_remaining, new_abandoned, new_ages, aged_out)。无 aged_out → 原样返回。"""
+    _dr_now = list(dispatch_remaining or [])
+    _dr_set = set(_dr_now)
+    _by_id = {st.id: st for st in (getattr(plan_obj, "subtasks", None) or [])}
+    _done = set(completed_ids or set())
+
+    def _has_unmet_dep(sid: str) -> bool:
+        # 复核整改（两路 PLAUSIBLE）：只软掉账【真被依赖卡死】者——有未满足依赖（上游未完成）。
+        # 无未满足依赖却长期未被选中=并发槽位排队饥饿（健康、下轮就会跑），绝不误杀（守"慢≠故障"）。
+        st = _by_id.get(sid)
+        return any(d not in _done for d in (getattr(st, "depends_on", None) or []))
+
+    aged_out = sorted(sid for sid, w in (ages or {}).items()
+                      if int(w or 0) >= hard and sid in _dr_set and _has_unmet_dep(sid))
+    if not aged_out:
+        return _dr_now, sorted(set(abandoned_prev or [])), dict(ages or {}), []
+    from swarm.brain.nodes.planning_core import _transitive_abandon
+    closure = _transitive_abandon(
+        getattr(plan_obj, "subtasks", None) or [], set(aged_out), completed_ids=completed_ids)
+    new_dr = [s for s in _dr_now if s not in closure]
+    new_ab = sorted(set(abandoned_prev or []) | closure)
+    new_ages = {k: v for k, v in (ages or {}).items() if k not in closure}
+    return new_dr, new_ab, new_ages, aged_out
+
+
 def _track_redispatch_promise_ages(
     ages: dict, *, dispatch_remaining: list, selected_ids: set,
     abandoned: set, plan_obj, completed_ids: set, dispatch_totals: dict,
@@ -931,6 +975,28 @@ async def dispatch(state: BrainState) -> dict:
         selected_ids=_dispatched_ids, abandoned=_abandoned, plan_obj=plan_obj,
         completed_ids=completed_l1_ids(result.get("subtask_results") or subtask_results),
         dispatch_totals=_totals)
+
+    # #109 DR-PM66-A3 治本：软掉账【兑现】。R65TR-T3 账龄机制此前只告警（round66 实锤：账龄 8→16
+    # 窗口翻倍无任何动作）→ 头阻塞子任务既不完成也不掉账 → 任务永挂 dispatch↔monitor 空转（2h15m
+    # 死型），既到不了 MERGE 也收敛不到 PARTIAL。这里兑现：账龄≥硬阈值的重派承诺=上游不可兑现 →
+    # 出终态 dispatched_unaccounted（记入 abandoned=PARTIAL 缺口，fail-honest 守 R65D-T1 掉账铁律，
+    # 绝不静默吞需求）+ 传递放弃其下游，令 dispatch_remaining 收敛、任务诚实进 PARTIAL。阈值保守
+    # （默认 24 窗口）防误杀还能救的；env 可关退回旧行为。
+    _hard = _redispatch_hard_windows()
+    if _soft_drop_enabled() and _hard > 0 and plan_obj is not None:
+        _new_dr, _new_ab, _new_ages, _aged = _soft_drop_aged_promises(
+            result["redispatch_wait_windows"],
+            result.get("dispatch_remaining", dispatch_remaining),
+            state.get("abandoned_subtask_ids") or [], plan_obj,
+            completed_l1_ids(result.get("subtask_results") or subtask_results), _hard)
+        if _aged:
+            result["dispatch_remaining"] = _new_dr
+            result["abandoned_subtask_ids"] = _new_ab
+            result["redispatch_wait_windows"] = _new_ages
+            logger.warning(
+                "[DISPATCH] #109 DR-PM66-A3 软掉账兑现：%d 个重派承诺账龄≥硬阈值 %d 窗口=上游不可兑现"
+                " → dispatched_unaccounted 出终态（计入 PARTIAL 缺口，fail-honest 守 R65D-T1）+ 传递放弃"
+                "下游（含连坐共 %d 个）: %s", len(_aged), _hard, len(_new_ab), sorted(_new_ab)[:8])
     return result
 
 

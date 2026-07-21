@@ -117,3 +117,104 @@ def test_78_real_missing_dep_still_detected():
     res = {"st-1": {"l1_passed": False, "l1_details": {
         "error": "package okhttp3 does not exist", "build_output": "cannot find symbol"}}}
     assert _is_missing_dependency_failure(res, ["st-1"]) is True, "真缺依赖被漏判（#78 过宽）"
+
+
+# ── #109 软掉账兑现（账龄≥硬阈值→掉账+传递放弃下游，fail-honest PARTIAL）─────────────
+def _mk(sid, *, create=None, depends=None):
+    return SubTask(id=sid, description="d",
+                   scope=FileScope(create_files=create or [f"{sid}.java"]),
+                   harness=TaskHarness(language="java"), depends_on=depends or [])
+
+
+def test_109_soft_drop_aged_dep_blocked_cascades_downstream():
+    # A3 死型：st-mid 依赖 st-up（上游卡死未完成），st-mid 重派承诺账龄超硬阈值=上游不可兑现 → 软掉账
+    # + 传递放弃其下游 st-leaf。st-other 独立不受影响。
+    from swarm.brain.nodes.dispatch import _soft_drop_aged_promises
+    plan = TaskPlan(subtasks=[_mk("st-up"), _mk("st-mid", depends=["st-up"]),
+                              _mk("st-leaf", depends=["st-mid"]), _mk("st-other")])
+    ages = {"st-mid": 24, "st-other": 3}
+    dr = ["st-mid", "st-leaf", "st-other"]
+    new_dr, new_ab, new_ages, aged = _soft_drop_aged_promises(ages, dr, [], plan, set(), 24)
+    assert aged == ["st-mid"], aged   # 有未满足依赖 st-up + 账龄超阈值
+    assert "st-mid" in new_ab and "st-leaf" in new_ab, f"下游未传递放弃: {new_ab}"
+    assert "st-other" in new_dr and "st-other" not in new_ab, "误伤独立子任务"
+    assert "st-mid" not in new_dr and "st-leaf" not in new_dr, "掉账后未移出 remaining"
+    assert "st-mid" not in new_ages, "掉账后账龄未清"
+
+
+def test_109_no_unmet_dep_not_dropped_concurrency_starvation():
+    # ★复核 PLAUSIBLE 整改★：无未满足依赖却账龄超阈值=并发槽位排队饥饿（健康、下轮就跑），绝不误杀
+    # （守"慢≠故障"）。只有真被依赖卡死的才软掉账。
+    from swarm.brain.nodes.dispatch import _soft_drop_aged_promises
+    plan = TaskPlan(subtasks=[_mk("st-ready"), _mk("st-done-dep")])
+    # st-ready 依赖 st-done-dep，但 st-done-dep 已完成 → st-ready 无未满足依赖 = 仅排队等槽位。
+    plan.subtasks[0].depends_on = ["st-done-dep"]
+    ages = {"st-ready": 99}   # 账龄极高但依赖已满足
+    new_dr, new_ab, _, aged = _soft_drop_aged_promises(
+        ages, ["st-ready"], [], plan, {"st-done-dep"}, 24)
+    assert aged == [] and new_ab == [], "并发饥饿的健康排队项被误杀（#109 过激）"
+
+
+def test_109_below_hard_threshold_no_drop():
+    from swarm.brain.nodes.dispatch import _soft_drop_aged_promises
+    plan = TaskPlan(subtasks=[_mk("st-up"), _mk("st-mid", depends=["st-up"])])
+    ages = {"st-mid": 23}   # < 24 硬阈值
+    new_dr, new_ab, _, aged = _soft_drop_aged_promises(ages, ["st-up", "st-mid"], [], plan, set(), 24)
+    assert aged == [] and new_ab == [] and new_dr == ["st-up", "st-mid"], "未到硬阈值不得掉账"
+
+
+# ── #108 执行期签名keyed 不收敛熔断（survives ID 增殖）─────────────────────────────
+def test_108_sig_fuse_fires_at_k():
+    from swarm.brain.nodes.failure import _exec_fail_sig_fuse, _normalize_fail_sig
+    dfr = "build_fail: cannot find symbol foo at line 42"
+    sig = _normalize_fail_sig(dfr)
+    res = {"st-32-1-1": {"l1_details": {"det_fail_reason": dfr}}}
+    counts, fused = _exec_fail_sig_fuse(["st-32-1-1"], res, {sig: 5}, 6)
+    assert fused == ["st-32-1-1"], fused
+    assert counts[sig] == 6
+
+
+def test_108_survives_id_proliferation_and_line_jitter():
+    # round66 死型治本点：ID 增殖（st-32→st-32-1→…）+ 行号抖动，per-id 计数器全被架空；
+    # 归一签名跨 id 累计 → 第 6 个不同 id 触发熔断。
+    from swarm.brain.nodes.failure import _exec_fail_sig_fuse
+    c, fused = {}, []
+    for i, sid in enumerate(
+            ["st-32", "st-32-1", "st-32-1-1", "st-32-1-1-1", "st-32-1-1-1-2", "st-x"]):
+        res = {sid: {"l1_details": {"det_fail_reason": f"build_fail: bad thing at line {i}"}}}
+        c, fused = _exec_fail_sig_fuse([sid], res, c, 6)
+    assert fused == ["st-x"], f"6 个不同 id 同归一签名应在第 6 个触发: {fused}"
+
+
+def test_108_blocked_and_infra_not_counted():
+    # blocked=sibling-wait / 纯 infra（无 det_fail_reason）不入账——重试是其正确语义，防误杀合法等待。
+    from swarm.brain.nodes.failure import _exec_fail_sig_fuse
+    res = {"a": {"l1_details": {"pipeline_blocked": "internal_pkg_not_built",
+                                "det_fail_reason": "build_fail: x"}},
+           "b": {"l1_details": {}}}
+    counts, fused = _exec_fail_sig_fuse(["a", "b"], res, {}, 6)
+    assert fused == [] and counts == {}, "blocked/infra 不应入账"
+
+
+def test_108_wrapper_chokepoint_persists_counts_endtoend():
+    # ★复核 CONFIRMED CRITICAL 整改端到端验证★：exec_fail_sig_counts 必须由 handle_failure wrapper
+    # 唯一咽喉回写——无论 impl 走哪条 return（默认重试阶梯/replan/redecompose 等），结果都必须带上此键，
+    # 且跨轮累积。旧实现只在 5 处窄 return 手写→ID 增殖路径漏写→熔断名存实亡。
+    from swarm.brain.nodes import handle_failure
+    st = SubTask(id="st-a", description="d",
+                 scope=FileScope(create_files=["m/src/main/java/A.java"]),
+                 harness=TaskHarness(language="java"))
+    dfr = "build_fail: cannot find symbol Foo"
+    _res = {"st-a": WorkerOutput(subtask_id="st-a", diff="+x", summary="", l1_passed=False,
+                                 l1_details={"det_fail_reason": dfr, "l1_2_compile_ok": False})}
+    state = {"plan": TaskPlan(subtasks=[st]), "failed_subtask_ids": ["st-a"],
+             "subtask_results": _res, "dispatch_remaining": [],
+             "subtask_retry_counts": {"st-a": 99},  # 逼确定性终局路径（避免依赖 LLM 策略）
+             "exec_fail_sig_counts": {}}
+    r = asyncio.run(handle_failure(state))
+    assert "exec_fail_sig_counts" in r, "wrapper 咽喉未回写签名账（熔断名存实亡）"
+    assert sum(r["exec_fail_sig_counts"].values()) >= 1, r["exec_fail_sig_counts"]
+    # 跨轮累积：结果喂回 prior 再调一次，同签名计数增长
+    state2 = {**state, "exec_fail_sig_counts": r["exec_fail_sig_counts"], "subtask_results": _res}
+    r2 = asyncio.run(handle_failure(state2))
+    assert max(r2["exec_fail_sig_counts"].values()) >= 2, f"跨轮未累积: {r2['exec_fail_sig_counts']}"

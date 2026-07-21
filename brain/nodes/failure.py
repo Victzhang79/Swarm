@@ -146,6 +146,30 @@ def _normalize_fail_sig(text: str) -> str:
     return s[:200]
 
 
+def _exec_fail_sig_fuse(failed_ids: list, subtask_results: dict,
+                        prior_counts: dict, k: int):
+    """#108 DR-PM66-A2 纯函数：按【归一失败签名】跨 id 累计出现次数（survives ID 增殖）。
+    blocked=sibling-wait / 纯 infra（无 det_fail_reason）不入账（重试是其正确语义）。返回
+    (new_counts, fused_ids)——fused=当前失败子任务中其签名累计已达 k 者（应强制 give-up）。"""
+    counts = dict(prior_counts or {})
+    if k <= 0:
+        return counts, []
+    # 本轮每个失败子任务的归一签名（blocked=sibling-wait / 纯 infra 不入账）。
+    sid_sig: dict = {}
+    for fid in (failed_ids or []):
+        det = _det_of((subtask_results or {}).get(fid))
+        if det.get("pipeline_blocked") or not str(det.get("det_fail_reason") or "").strip():
+            continue
+        sid_sig[fid] = _normalize_fail_sig(str(det.get("det_fail_reason")))
+    # ★关键★：每个【唯一签名】本轮只 +1（去重），累计的是【跨轮复现次数】——区分"同签名跨轮复现"
+    # （ID 增殖 st-32→st-32-1→…，本闸要治）与"同签名多子任务【同轮】失败"（真·mass 失败，归规模闸
+    # escalate，绝不被本闸抢占）。若按子任务多计，12 个独立根缺陷同轮同签名会在一轮内冲到 k 误熔断。
+    for sig in set(sid_sig.values()):
+        counts[sig] = int(counts.get(sig, 0)) + 1
+    fused = [fid for fid, sig in sid_sig.items() if counts[sig] >= k]
+    return counts, fused
+
+
 # ── D3（round65e5 st-53-1 R2 实锤）：授 pom 写权后小模型手改基线 pom 腐化 ──
 # R2：A2 授 pom 写权后，worker 把 `<groupId>` 手写成 `<group>`、毁 `<parent>` → 整棵 reactor
 # 解析期崩（`Unrecognised tag: 'group'` / `'parent.groupId' is missing`）。恒给"最小增量铁律"，
@@ -491,8 +515,38 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     subtask_results = dict(state.get("subtask_results", {}))
     plan_obj = state.get("plan")
     strategy = "retry"
+    _replan_landed = False  # #107：replan 确定性落地改了 plan 的标记（函数级，供各 plan 回写条件安全引用）
 
     logger.info(f"[HANDLE_FAILURE] 处理 {len(failed_ids)} 个失败子任务")
+
+    # ── #108 DR-PM66-A2：执行期【签名keyed】不收敛熔断【决策】（★置于一切分支之前★）──
+    # round66 死型：每次 replan/redecompose 给同一坏 scope 换新 id（st-32→st-32-1→…），per-id 计数器
+    # （retry_counts/dispatch_totals≥6/redecompose≤1/_sig_exhausted 三连）被新 id 逐一重置架空 → 无界
+    # 空转、放弃恒 0（2h15m 死型）。按【归一失败签名】跨 id 累计（exec_fail_sig_counts，由外层 wrapper
+    # 唯一咽喉回写，见 nodes/__init__.py handle_failure）：同一确定性失败签名全任务复现 ≥K 次=plan 有
+    # worker 不可修的缺陷 → 强制 give-up（fail-honest PARTIAL，守 R65D-T1 掉账铁律）。
+    # ★复核 CONFIRMED 两路整改★：①决策移至【最顶】——否则被 l2/runtime_smoke/contract/SIMPLE 四类
+    # 早退分支跳过（那正是 L2 驱动 replan 循环的死型）；②累积改由 wrapper 唯一咽喉回写——否则默认
+    # 重试阶梯/redecompose/全量 replan 三条真增殖路径不写回 counts → 熔断名存实亡。blocked=sibling-wait
+    # / 纯 infra 不入账（重试正确语义，防误杀）。K 保守（默认 6）；env SWARM_EXEC_SIG_FUSE=0 退旧行为。
+    _sig_fuse_on = os.environ.get("SWARM_EXEC_SIG_FUSE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+    try:
+        _sig_fuse_k = int(os.environ.get("SWARM_EXEC_SIG_FUSE_K", "6") or "6")
+    except (TypeError, ValueError):
+        _sig_fuse_k = 6
+    _, _sig_fused = _exec_fail_sig_fuse(
+        failed_ids, subtask_results, state.get("exec_fail_sig_counts") or {},
+        _sig_fuse_k if _sig_fuse_on else 0)
+    if _sig_fused:
+        logger.warning(
+            "[HANDLE_FAILURE] #108 DR-PM66-A2 签名不收敛熔断：确定性失败签名跨任务复现 ≥%d 次"
+            "（per-id 计数器被 ID 增殖架空）→ 强制 give-up 保 build（fail-honest PARTIAL）: %s",
+            _sig_fuse_k, _sig_fused)
+        _sf_giveup = await _give_up_preserve_build(state, _sig_fused)
+        if _sf_giveup is not None:
+            return _sf_giveup   # exec_fail_sig_counts 由 wrapper 咽喉统一回写
+        # give-up 不可用（无 plan/无足迹）→ 不强返，落常规流程（wrapper 仍会回写 counts）
 
     if state.get("verification_failure") == "runtime_smoke":
         # ── S1-6 运行时失败证据回灌（替换 S1-4 占位）──
@@ -1066,7 +1120,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                         len(_br_new), mass_abandon_cap(len(plan_obj.subtasks)),
                         len(plan_obj.subtasks))
                     return {
-                        **({"plan": plan_obj} if _c9_edges else {}),
+                        **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                         "failure_strategy": "escalate",
                         "failure_escalated": True,
                         "failed_subtask_ids": failed_ids,
@@ -1232,7 +1286,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                         len(_sh_new_ab), mass_abandon_cap(len(plan_obj.subtasks)),
                         len(plan_obj.subtasks))
                     return {
-                        **({"plan": plan_obj} if _c9_edges else {}),
+                        **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                         "failure_strategy": "escalate",
                         "failure_escalated": True,
                         "failed_subtask_ids": failed_ids,
@@ -1305,7 +1359,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     sorted(_unrecoverable)[:6],
                 )
                 return {
-                    **({"plan": plan_obj} if _c9_edges else {}),
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "failure_strategy": "escalate",
                     "failure_escalated": True,
                     "failed_subtask_ids": failed_ids,
@@ -1328,7 +1382,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             return {
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                **({"plan": plan_obj} if _c9_edges else {}),
+                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                 "failure_strategy": "abandon",
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
@@ -1677,6 +1731,32 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         }
 
     if strategy == "replan":
+        # #107 DR-PM66-A1 治本：replan 处方【确定性落地】。round66 死型：Brain 每轮精确诊断（改 verify
+        # 锚定 import / 删错位跨模块 create）但【无代码把处方写回 plan】→ 重派字节未变的同一子任务 →
+        # #101/#102 退化成两小时死循环。这里在 replan 重派前重跑 B1 确定性 pass（§4 黄灯：只做【收敛性】
+        # 变异，绝不新增 create/改松 verify）：sanitize_verify_scope 收敛越界 verify、
+        # deconflict_cross_module_creates 剥【契约权威可判】的跨模块重复 create。执行期新冒出/残留的同类
+        # 缺陷被确定性落地，令重派不再字节相同（真收敛而非空转）。idempotent；无变化则无副作用。
+        # C9：改了 plan 必在可达 return 回写（_replan_landed 已并入下方各 plan 回写条件）。
+        # 泄压阀（复核 LOW，与 #108/#109 自查惯例一致）：SWARM_REPLAN_DETERMINISTIC_LAND=0 关闭落地。
+        _land107_on = os.environ.get("SWARM_REPLAN_DETERMINISTIC_LAND", "1").strip().lower() not in (
+            "0", "false", "no", "off")
+        if plan_obj is not None and _land107_on:
+            try:
+                from swarm.brain.contract_utils import (
+                    deconflict_cross_module_creates,
+                    sanitize_verify_scope,
+                )
+                _vs107 = sanitize_verify_scope(plan_obj)
+                _replan_landed = _replan_landed or bool(_vs107)  # 落地即置位：防第二 pass 抛异常丢第一 pass 变异
+                _xc107 = deconflict_cross_module_creates(plan_obj)
+                _replan_landed = _replan_landed or bool(_xc107)
+                if _vs107 or _xc107:
+                    logger.info(
+                        "[HANDLE_FAILURE] #107 replan 处方确定性落地：verify 作用域收敛 %d 子任务 + "
+                        "跨模块重复 create 归一 %d 文件（重派不再字节相同，真收敛）", len(_vs107), _xc107)
+            except Exception:  # noqa: BLE001 — 落地失败不阻断 replan（fail-open，退回旧重派）
+                logger.warning("[HANDLE_FAILURE] #107 replan 确定性落地失败（fail-open）", exc_info=True)
         # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──
         # 背景(task dab669bb)：medium 任务拆成 st-1(实现)+st-2(测试)，st-1 成功 DONE、
         # st-2 因写错 JUnit L1 失败 → LLM 选 replan → 清空【含成功的 st-1】全部重新规划 ~10min →
@@ -1741,7 +1821,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 return {
                     # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                     # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                    **({"plan": plan_obj} if _c9_edges else {}),
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "subtask_results": subtask_results,
                     "dispatch_remaining": dispatch_remaining,
                     "failed_subtask_ids": [],
@@ -1772,7 +1852,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             return {
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                **({"plan": plan_obj} if _c9_edges else {}),
+                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                 "subtask_results": subtask_results,
                 "failed_subtask_ids": failed_ids,
                 "failure_escalated": True,
@@ -1796,7 +1876,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             return {
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                **({"plan": plan_obj} if _c9_edges else {}),
+                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                 "subtask_results": subtask_results,
                 "failed_subtask_ids": failed_ids,
                 "failure_escalated": True,
@@ -1821,7 +1901,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         return {
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-            **({"plan": plan_obj} if _c9_edges else {}),
+            **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
             "subtask_results": subtask_results,
             "failed_subtask_ids": [],
             "plan_valid": False,
@@ -1842,7 +1922,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         return {
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-            **({"plan": plan_obj} if _c9_edges else {}),
+            **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
             "failure_escalated": True,
             "failure_strategy": "escalate",
             "l2_passed": False,
@@ -1966,7 +2046,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "subtask_transient_counts": {**transient_counts, **next_tcounts},
                 "subtask_block_signatures": _blk_sigs,  # B2：指纹持久化（同签名连击跨轮计数）
                 # C9：补了动态依赖边必须回写 plan（dispatch 依赖闸消费）
-                **({"plan": plan_obj} if _c9_edges else {}),
+                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
             }
         # transient 退避也用尽 → 落入下方 capability 阶梯（基础设施持续不可用，升级人工）
         logger.warning(
@@ -2082,7 +2162,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "（round65e13 病灶永锁同模型死型治本；持久账本保证至多一轮、绝不无界重触发）",
                     _never_alt_roots, sorted(_clearable))
                 return {
-                    **({"plan": plan_obj} if _c9_edges else {}),
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "dispatch_remaining": _g1_remaining,
                     "failed_subtask_ids": [],
                     "subtask_results": _g1_sr,
@@ -2133,7 +2213,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     len(plan_obj.subtasks), len(_pd_new), sorted(_pd_roots)[:40],
                     sorted(_pd_new)[:40])
                 return {
-                    **({"plan": plan_obj} if _c9_edges else {}),
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "failure_strategy": "escalate",
                     "failure_escalated": True,
                     "failed_subtask_ids": failed_ids,
@@ -2149,7 +2229,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             return {
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                **({"plan": plan_obj} if _c9_edges else {}),
+                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                 "failure_strategy": "abandon",
                 "failure_escalated": False,  # 批4c：非 escalate 决策清历史粘滞标记（取证 CONFIRMED，见 DEVLOG）
                 "abandoned_subtask_ids": sorted(abandoned),
@@ -2166,7 +2246,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         return {
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-            **({"plan": plan_obj} if _c9_edges else {}),
+            **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
             "failure_escalated": True,
             "failure_strategy": "escalate",
             "l2_passed": False,

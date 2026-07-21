@@ -124,6 +124,7 @@ class BrainState(TypedDict, total=False):
     subtask_redecompose_count: dict[str, int]  # 卡死子任务恢复阶梯·阶梯二：定点拆小次数（有界，每子任务≤1）
     subtask_transient_counts: dict[str, int]  # P2：每个子任务的累计【瞬时】退避重试次数（与 capability 配额隔离）
     subtask_block_signatures: dict[str, dict]  # B2（round38c）：BLOCKED 失败指纹 {sid: {"sig": str, "count": int}}——同签名重派短路（禁同输入白跑整条阶梯）
+    exec_fail_sig_counts: dict[str, int]  # #108 DR-PM66-A2：执行期【签名keyed】不收敛熔断 {归一失败签名: 全任务累计出现次数}——per-id 计数器被 ID 增殖(st-32→st-32-1→…)架空，本表按失败签名跨 id 累计，≥K 强制 give-up（fail-honest PARTIAL）
     subtask_scope_amend_counts: dict[str, int]  # B3-2/B4-2（round38c）：外科 scope 修正次数（补 create_files/异议改名，每子任务≤1，防修正震荡）
     contract_failed_modules: list[str]  # C4-8（round38c）：共享契约缺片模块名（CONTRACT_MODULE 放弃后机读可见；成功路径清空）
     replan_count: int                   # P0-2：replan 累计次数（熔断上限，防无限重规划）
@@ -326,6 +327,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "contract_retry_counts": "monotonic",  # D08 签名剪枝（D13 独立契约表）
     "subtask_redecompose_count": "monotonic",  # D08 签名剪枝
     "subtask_transient_counts": "monotonic",   # D08 签名剪枝（3.8 补）
+    "exec_fail_sig_counts": "monotonic",   # #108：签名keyed 累计账（键是归一失败签名非 id，D08 id 剪枝天然不匹配→持久累积，正是熔断所需）
     "targeted_recovery_count": "monotonic",
     "targeted_recovery_counts": "monotonic",   # D08 签名剪枝
     "redispatch_wait_windows": "monotonic",    # R65TR-T3：D08 签名剪枝（观测账；id 复用继承陈旧账龄=账不可信）

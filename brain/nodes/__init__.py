@@ -3774,6 +3774,28 @@ async def handle_failure(state: BrainState) -> dict:
         _p = state.get("plan")
         if _p is not None:
             result["plan"] = _p
+    # #108 DR-PM66-A2 唯一咽喉回写（对抗双复核 CONFIRMED CRITICAL 整改）：exec_fail_sig_counts 必须在
+    # 【所有】handle_failure 出口累积——否则 ID 增殖路径（默认重试阶梯/redecompose/全量 replan，恰是
+    # round66 死型 st-32→st-32-1→… 真增殖点）+ L2/runtime/contract/SIMPLE 早退分支都不写回 → 签名账永停
+    # 旧值 → 熔断名存实亡。仿 C9 plan / subtask_alternate_ever_used 咽喉：统一按【输入 state】重算回写
+    # （与 impl 入口决策同源同值），不靠 40+ return 各自记得。counts 计算独立于 fuse 是否触发。
+    if isinstance(result, dict):
+        try:
+            from swarm.brain.nodes.failure import _exec_fail_sig_fuse as _eff108
+            _on108 = os.environ.get("SWARM_EXEC_SIG_FUSE", "1").strip().lower() not in (
+                "0", "false", "no", "off")
+            try:
+                _k108 = int(os.environ.get("SWARM_EXEC_SIG_FUSE_K", "6") or "6")
+            except (TypeError, ValueError):
+                _k108 = 6
+            _c108, _ = _eff108(state.get("failed_subtask_ids") or [],
+                               state.get("subtask_results") or {},
+                               state.get("exec_fail_sig_counts") or {},
+                               _k108 if _on108 else 0)
+            result["exec_fail_sig_counts"] = _c108
+        except Exception:  # noqa: BLE001 — 签名账回写失败不阻断处置（退化=该轮不累积，下轮续，留痕）
+            logger.warning("[HANDLE_FAILURE] #108 exec_fail_sig_counts 咽喉回写异常（fail-open）",
+                           exc_info=True)
     return result
 
 
