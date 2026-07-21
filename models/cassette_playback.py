@@ -173,7 +173,10 @@ def lookup(node: str, model: str, args: tuple, kwargs: dict) -> dict | None:
                 rec = cand
                 break
             if rec is None:
-                _stats["miss_sha"] += 1   # 该指纹只有失败尝试 → 视作 miss
+                # DR-07-F8(#100)：指纹在但只剩失败尝试录像 → 记 miss_error_rec（此前误计 miss_sha，
+                # 使 miss_error_rec 恒 0、sha-miss 虚高，运维误诊"指纹漂移/录像陈旧"而非"该调用当轮
+                # 就没成功过"）。总 miss=miss_sha+miss_error_rec+miss_exc 不变，分项才如实可辨。
+                _stats["miss_error_rec"] += 1
                 return None
             _stats["hit"] += 1
         # node/model 校验（锁外，仅告警不改判）

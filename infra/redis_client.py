@@ -315,6 +315,26 @@ class ModuleLock:
         self._is_project_wide = (module_key == "default") if project_wide is None else bool(project_wide)
         self._gate_held = False
         self._gate_redis_held = False
+        # DR-07-F6(#98)：项目门层的墙钟基准（与 key 层 _last_ok_monotonic 同构）。门续期瞬时失败/
+        # r is None 期间门键 TTL 仍倒计，超 TTL*0.8 一律判失门 fail-closed，杜绝"门键静默过期而进程
+        # 自认持门→另一进程 acquire 成功→跨进程双写"（split-brain）。
+        self._gate_last_ok_monotonic = 0.0
+
+    def _gate_walltime_ok(self) -> bool:
+        """DR-07-F6(#98)：项目门层墙钟闸。曾持 Redis 门(_gate_redis_held)但距上次门确认续期已
+        > TTL*0.8 → 门键极可能已 TTL 过期(另一进程可 acquire→跨进程双写)→判失门 fail-closed。
+        未持 Redis 门层=纯本地门不过期→True。"""
+        if not self._gate_redis_held:
+            return True
+        _elapsed = ((time.monotonic() - self._gate_last_ok_monotonic)
+                    if self._gate_last_ok_monotonic else 0.0)
+        if _elapsed > self.ttl_sec * 0.8:
+            logger.warning(
+                "[ModuleLock] H-3 项目门距上次续期 %.0fs > TTL*0.8(%ds)，门键恐已过期→判失门"
+                " fail-closed(锁=%s)", _elapsed, self.ttl_sec, self.key)
+            self._gate_redis_held = False
+            return False
+        return True
 
     def acquire(self) -> bool:
         # H-2 治本（外部深审 HIGH，对抗复核 F3 收口）：进程内 threading 锁作为【进程级权威
@@ -419,6 +439,7 @@ class ModuleLock:
                     self._release_gate_local(g)
                     return False
                 self._gate_redis_held = True
+                self._gate_last_ok_monotonic = time.monotonic()  # DR-07-F6：门墙钟基准
             except Exception as exc:  # noqa: BLE001
                 # Redis 门 IO 失败 → 作废坏 client；本次退化为进程内门权威（不叠加跨进程层）。
                 _invalidate_redis(exc)
@@ -466,10 +487,13 @@ class ModuleLock:
                 logger.warning("[ModuleLock] H-3 项目门续期确认丢失(锁=%s，role=%s)→判失锁",
                                self.key, "writer" if self._is_project_wide else "reader")
                 return False
+            self._gate_last_ok_monotonic = time.monotonic()  # DR-07-F6：门确认续期→刷墙钟基准
             return True
         except Exception as exc:  # noqa: BLE001
             _invalidate_redis(exc)  # 瞬时失败容忍（门态服务器侧仍在）；下次 get_redis 重探
-            return True
+            # DR-07-F6(#98)：瞬时容忍不再【无界】——门键 TTL 仍在倒计，超 TTL*0.8 判失门 fail-closed
+            # （防门键静默过期而进程自认持门→跨进程双写）。未超阈值仍容忍返 True。
+            return self._gate_walltime_ok()
 
     def renew(self) -> bool:
         """续期持有中的锁 TTL（原子比对+EXPIRE，仅当 value==自己的 token）。
@@ -486,7 +510,9 @@ class ModuleLock:
         # H-3（对抗复核 F2）：项目门续期【独立于】key 的 _redis_held——两层各自的 Redis flag 可能
         # 分叉（门 eval 成功但随后 key SET 抛异常→_gate_redis_held=True 而 _redis_held=False）。
         # 门续期必须无条件先跑，否则长任务持门期间门键静默过期让互斥角色跨进程冒进。
-        gate_ok = self._renew_gate(r) if r is not None else True
+        # DR-07-F6(#98)：r is None（Redis 冷却窗）时，若曾持 Redis 门层，门键可能正 TTL 过期——
+        # 不再无条件 True，走门墙钟闸（超 TTL*0.8 判失门 fail-closed），杜绝跨进程 split-brain。
+        gate_ok = self._renew_gate(r) if r is not None else self._gate_walltime_ok()
         if not gate_ok:
             return False  # F1：Redis 侧确认丢门 → fail-closed
         # H-2：纯进程内锁（Redis 宕机期获取或未叠加 Redis 层）不过期，key renew no-op。否则
@@ -495,6 +521,16 @@ class ModuleLock:
         if not self._redis_held:
             return True
         if r is None:
+            # DR-07-F6(#98) 复核整改：key 层的 r is None 分支也须墙钟闸（与 gate 层对称）——Redis 冷却窗
+            # 期 key TTL 仍倒计，`_gate_redis_held=False 而 _redis_held=True` 的分叉态下 gate 墙钟闸
+            # 不生效，此处旧无条件 True 会让 key 键静默过期而进程自认持锁→跨进程双写。超 TTL*0.8 判失锁。
+            _elapsed = ((time.monotonic() - self._last_ok_monotonic)
+                        if self._last_ok_monotonic else 0.0)
+            if _elapsed > self.ttl_sec * 0.8:
+                logger.warning(
+                    "[ModuleLock] key 层 Redis 冷却窗且距上次续期 %.0fs > TTL*0.8(%ds)，key 恐已过期"
+                    "→判失锁 fail-closed(锁=%s)", _elapsed, self.ttl_sec, self.key)
+                return False
             return True
         try:
             _renew_lua = (
@@ -750,6 +786,11 @@ class MultiModuleLock:
         for lk in self._locks:
             lk._gate_held = True
             lk._gate_redis_held = redis_gate_ok
+            # ★DR-07-F6(#98) 复核 CONFIRMED HIGH 整改★：接管 Redis 门层时【必须】同步 bootstrap 门墙钟
+            # 基准——否则 _gate_last_ok_monotonic 停在 0.0，_gate_walltime_ok 里 `if ... else 0.0` 塌成
+            # elapsed=0 恒 True，门墙钟闸对【每个执行期降级读者锁】彻底失效（upgrade_module_lock 每任务
+            # 出计划后都走此路），split-brain 防护名存实亡。与 _acquire_key_only bootstrap key 层墙钟同理。
+            lk._gate_last_ok_monotonic = time.monotonic() if redis_gate_ok else 0.0
             lk._held = True
         return True
 
@@ -871,7 +912,21 @@ def get_max_active_projects() -> int:
     """读取 SWARM_MAX_ACTIVE_PROJECTS 环境变量（默认 10）。"""
     global _SWARM_MAX_ACTIVE_PROJECTS
     if _SWARM_MAX_ACTIVE_PROJECTS is None:
-        _SWARM_MAX_ACTIVE_PROJECTS = int(os.environ.get("SWARM_MAX_ACTIVE_PROJECTS", "10"))
+        # DR-07-F3(#95)：与本文件兄弟解析器（_redis_socket_timeout 等）对齐——空串/畸形值坏值回默认，
+        # 不裸 int() 崩（key 存在但为空 → os.environ.get 返 "" → int("") ValueError 冒泡出
+        # check_project_limit 炸任务提交路径）。
+        _raw = os.environ.get("SWARM_MAX_ACTIVE_PROJECTS", "10")
+        try:
+            _v = int(_raw or "10")
+            if _v > 0:
+                _SWARM_MAX_ACTIVE_PROJECTS = _v
+            else:
+                # 复核 Finding 4：降级路径至少打一次 WARNING（铁律#3；与 #94/#97 同批一致）
+                logger.warning("SWARM_MAX_ACTIVE_PROJECTS=%r 非正数，回退默认 10", _raw)
+                _SWARM_MAX_ACTIVE_PROJECTS = 10
+        except (TypeError, ValueError):
+            logger.warning("SWARM_MAX_ACTIVE_PROJECTS=%r 非法整数，回退默认 10", _raw)
+            _SWARM_MAX_ACTIVE_PROJECTS = 10
     return _SWARM_MAX_ACTIVE_PROJECTS
 
 

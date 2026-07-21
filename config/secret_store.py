@@ -43,6 +43,7 @@ _cache_lock = threading.Lock()
 # G1-1b（round38c 主题G）：解密失败 warn-once——同 key 同因每次读取都重打（round38c
 # 621 条=52% 全部 WARNING）。首次 WARNING（真运维信号保留），之后同 key 降 DEBUG。
 _decrypt_warned: set[str] = set()
+_db_fail_warned: set[str] = set()   # DR-07-F5(#97)：DB 读失败 warn-once 节流
 _fernet = None
 _fernet_lock = threading.Lock()
 
@@ -75,8 +76,12 @@ def _get_fernet():
     旧完整 URI 种子仅参与解密——两代密文都解得开。
     """
     global _fernet
-    if _fernet is not None:
-        return _fernet
+    # 复核 Finding 6：捕获局部再判——reset_fernet() 使 _fernet 可 value→None 循环（轮换热更），
+    # 无局部时 `if _fernet is not None: return _fernet` 两条 LOAD_GLOBAL 间被 reset 置 None 会返回
+    # None → 调用方 AttributeError。局部快照消除该 TOCTOU（GIL 调度无关），零成本。
+    _f = _fernet
+    if _f is not None:
+        return _f
     with _fernet_lock:
         if _fernet is not None:
             return _fernet
@@ -210,8 +215,16 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
                 )
             return None
     except Exception as exc:  # noqa: BLE001
-        # DB 连接/查询失败（非解密问题）→ debug 即可
-        logger.debug("读取 secret %s 失败（回退 .env）: %s", key_name, exc)
+        # DR-07-F5(#97)：DB 连接/查询失败 → warn-once（比照 decrypt 分支）。纯 DB 部署（.env 无明文）
+        # 下 PG 一抖，每个 get_secret 静默返 None → API key 变空 → 下游 401 一片，但旧 DEBUG 无运维
+        # 可见信号，排查者从模型层错误反查半天才定位 PG。首次 WARNING 明示"密钥因 DB 不可用回退"。
+        if key_name in _db_fail_warned:
+            logger.debug("读取 secret %s 失败（已告警过，回退 .env）: %s", key_name, exc)
+        else:
+            _db_fail_warned.add(key_name)
+            logger.warning(
+                "secret_store DB 不可用，secret %s 回退 .env/None（可能导致下游 401/连接错误；"
+                "同 key 后续降 DEBUG）: %s", key_name, exc)
         return None
 
     with _cache_lock:
@@ -241,10 +254,23 @@ def list_secret_names(conn_str: str | None = None) -> list[str]:
         return []
 
 
+def reset_fernet() -> None:
+    """DR-07-F4(#96)：清 Fernet 引擎缓存，使 SWARM_SECRET_KEY 根密钥轮换热生效。
+
+    `_fernet` 首次构造后全局缓存且无失效钩——轮换根密钥（改 env）后未重启进程继续用旧钥
+    encrypt/decrypt（新进程用新钥，跨进程密文互不可解，且无告警）。reload/显式重置时调用本函数
+    强制下次 _get_fernet 按当前 env 重建。"""
+    global _fernet
+    with _fernet_lock:
+        _fernet = None
+
+
 def invalidate_cache(key_name: str | None = None) -> None:
     """失效缓存（key_name=None 清全部）。配置 reload 后调用。"""
     with _cache_lock:
         if key_name is None:
             _cache.clear()
+            # DR-07-F4(#96)：全量失效=配置 reload → 一并重建 Fernet，使根密钥轮换热生效。
+            reset_fernet()
         else:
             _cache.pop(key_name, None)

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from typing import Any, Protocol, runtime_checkable
@@ -432,7 +433,16 @@ def _provider_slot(provider_id: str, limit: int):
         sem = _PROVIDER_SLOTS.get(key)
         if sem is None:
             if len(_PROVIDER_SLOTS) > 64:
-                _PROVIDER_SLOTS.clear()
+                # DR-07-F7(#99)：绝不整表 clear——在飞流仍持【旧】Semaphore（其 finally.release 释放到
+                # 旧对象），clear 后同 (provider,loop,limit) 新调用拿【全新满额】信号量 → 旧在飞 N 路 +
+                # 新池 limit 路 = 短时最多 2×limit 并发，突破 provider 抗自饱和闸。只剔【无持有者】的
+                # 空闲键（_value 回到初始 limit=key[2]，全部 release 完），在飞键保留（其键留待自然老化）。
+                # 复核 Finding 5（已知残留·可接受）：_value>=limit 判空闲存在极窄 TOCTOU（调用方已取
+                # sem 引用但尚未 await acquire 的几微秒窗内被误剔→新调用建新 sem→短时双池）。严格改进优于
+                # 旧 clear-all（后者每次污染所有在飞 sem），残留窗口微秒级且键基数天然小，接受不再过度工程。
+                for _k in [kk for kk, ss in list(_PROVIDER_SLOTS.items())
+                           if getattr(ss, "_value", -1) >= kk[2]]:
+                    _PROVIDER_SLOTS.pop(_k, None)
             sem = _b6_asyncio.Semaphore(limit)
             _PROVIDER_SLOTS[key] = sem
         return sem
@@ -1224,13 +1234,23 @@ class ModelRouter:
         # 此时只能就地关 thinking 保产出；不标的话它会抛 TransientInfraError 而无人接，
         # 整个 worker 调用直接失败（比 R55-1 之前更糟）。注意链序是 breaker 健康**重排后**的，
         # 所以只能在这里定链尾，不能在构造时静态定。
+        # ★DR-07-F1(#93) CONFIRMED HIGH 整改★：链尾 no_fallback=True 必须落在【本链私有副本】上，
+        # 绝不写共享缓存实例——get_chat_model 值键化缓存对 worker 恒命中同一实例（no_fallback 不入键、
+        # 恒 False），同 difficulty 的并发子任务拿到同一 fbX；旧代码就地写 flag → 并发链把 fbX 的
+        # tail 语义互相翻转（A 标 True、B 重排后标 False），A 链尾正流式时被 B 改 False → A reasoning
+        # runaway 抛 TransientInfraError 而 A 链尾无人接 = 整 worker 调用失败。非链尾恒 False=默认，
+        # 不写共享实例（永不被污染成 True）；仅链尾 model_copy 出私有实例标 True。
+        _last = len(ordered) - 1
+        chained = []
         for _i, (_n, _m) in enumerate(ordered):
-            if hasattr(_m, "swarm_no_fallback"):
+            if _i == _last and hasattr(_m, "swarm_no_fallback"):
                 try:
-                    _m.swarm_no_fallback = (_i == len(ordered) - 1)
-                except Exception:  # noqa: BLE001 —— 非 Dual 模型/不可写 → 保持默认
+                    _mc = _m.model_copy() if hasattr(_m, "model_copy") else copy.copy(_m)
+                    _mc.swarm_no_fallback = True
+                    _m = _mc
+                except Exception:  # noqa: BLE001 — 复制失败退回原实例（宁链尾误切也不污染共享态）
                     pass
-        chained = [_listened(n, m) for n, m in ordered]
+            chained.append(_listened(_n, _m))
         if len(chained) > 1:
             return chained[0].with_fallbacks(chained[1:])
         return chained[0]

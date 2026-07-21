@@ -132,19 +132,32 @@ def test_worker_chain_tail_is_marked_no_fallback():
     """
     from swarm.models.router import ModelRouter
 
+    # DR-07-F1(#93) 整改后契约：链尾标 no_fallback=True 落在【私有副本】上（绝不写共享缓存实例）。
+    # 故断言从"原始 input 实例被就地改 True"改为"①原始实例全不被污染(保持 False) + ②装配出的链尾
+    # 组件(副本)标 True"。给 _Fake 一个 model_copy 返回浅拷贝（模拟 pydantic model_copy）。
     class _Fake:
         def __init__(self, name):
             self.name = name
             self.swarm_no_fallback = False
 
+        def model_copy(self):
+            import copy as _c
+            return _c.copy(self)
+
         def with_listeners(self, **_kw):
             return self
 
         def with_fallbacks(self, others):
-            return ("chain", self, others)
+            return ("chain", self, list(others))
 
     models = [("m1", _Fake("m1")), ("m2", _Fake("m2")), ("m3", _Fake("m3"))]
-    ModelRouter._assemble_worker_chain(models)
+    chain = ModelRouter._assemble_worker_chain(models)
 
-    assert [m.swarm_no_fallback for _n, m in models] == [False, False, True], \
-        "只有链尾可以降级关 thinking；非链尾必须切模型（关 thinking 会漏需求）"
+    # ① 原始 input 实例【全不被污染】——共享缓存实例安全（并发链不互相翻转 tail 语义）
+    assert [m.swarm_no_fallback for _n, m in models] == [False, False, False], \
+        "绝不写共享缓存实例（#93：并发链会互相翻转 tail 语义）"
+    # ② 装配出的链：head=m1 副本(False)，fallbacks 末尾=链尾 m3 副本(no_fallback=True)
+    _tag, _head, _fbs = chain
+    assert _tag == "chain" and _head.swarm_no_fallback is False
+    assert _fbs[-1].swarm_no_fallback is True, \
+        "链尾组件(副本)必须标 no_fallback=True（它再失控无人可接，只能就地关 thinking 保产出）"

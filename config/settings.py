@@ -26,7 +26,19 @@ def _coerce_model_list(v: object) -> list[str]:
             return []
         if s.startswith("["):
             import json
-            return [str(x).strip() for x in json.loads(s) if str(x).strip()]
+            # DR-07-F2(#94)：畸形 JSON 数组（尾逗号 `["A",]` / 无引号 `[A,B]`）绝不炸整个配置层
+            # （旧裸 json.loads → JSONDecodeError → pydantic ValidationError → get_config() 崩、
+            # API 起不来）。解析失败/非 list → 宽松逗号兜底（剥 []"' 逐 token），与其余分支同哲学。
+            try:
+                arr = json.loads(s)
+            except Exception:  # noqa: BLE001
+                arr = None
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr if str(x).strip()]
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "路由链字段 JSON 解析失败，已按逗号宽松兜底: %.80s", s)
+            return [t for t in (x.strip().strip('[]"\' ') for x in s.split(",")) if t]
         return [x.strip() for x in s.split(",") if x.strip()]
     if isinstance(v, (list, tuple)):
         return [str(x).strip() for x in v if str(x).strip()]
