@@ -219,12 +219,26 @@ class SwarmGrowthTree {
     const ctx = this.ctx, t = (now - this.t0) / 1000;
     ctx.clearRect(0, 0, this.CW, this.CH);
     const stem = this._stem();
-    const total = this.counts.total || 1;
-    const tg = 0.5 + 0.45 * ((this.counts.done || 0) / total);
+    // #118 主干"点亮"完善——原主干只随 done/total 生长、且恒用灰 stem 描边（任务进行中/规划期
+    // 主干一片死灰不点亮）。改：①有效进度纳入【进行中】工作(running/retrying 半权)，执行期主干持续
+    // 前进而非只在完成时跳；②已生长段随有效进度渐进【点亮】上色(--green，失败为主转警示色)并柔和呼吸；
+    // ③起跑即有基干 + 规划期(total=0)给低幅萌发基态，不再一片死灰。
+    const total = this.counts.total || 0;
+    const done = this.counts.done || 0;
+    const running = (this.counts.grow || 0) + (this.counts.retry || 0);
+    const failed = this.counts.failed || 0;
+    const prog = total > 0 ? Math.min(1, (done + 0.5 * running) / total) : 0;
+    const tg = total > 0 ? (0.42 + 0.53 * prog) : 0.30;  // 起跑即有基干→满进度点亮
     this.trunkG += (tg - this.trunkG) * 0.05;
     const sway = this.reduce ? 0 : Math.sin(t * 0.7) * 2.5;
 
-    // 主干（锥形分段）
+    // 点亮长度（沿主干）：至少留一点萌发亮，随有效进度增长；失败为主时用警示色。
+    const litFrac = total > 0 ? Math.max(0.08, prog) : 0.08;
+    const litLen = this.trunkG * litFrac;
+    const litCol = (failed > 0 && failed >= done) ? this._col('failed') : this._col('grow');
+    const litPulse = this.reduce ? 1 : (0.72 + 0.28 * (0.6 + 0.4 * Math.sin(t * 2.2)));
+
+    // 主干（锥形分段）——已点亮段上色+呼吸，未点亮段保留灰 stem。
     let prev = this._spineAt(0);
     const SEG = 20;
     for (let i = 1; i <= SEG; i++) {
@@ -232,7 +246,13 @@ class SwarmGrowthTree {
       const p = this._spineAt(f); p.x += sway * (i / SEG);
       ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(p.x, p.y);
       ctx.lineWidth = Math.max(1.3, 6 * (1 - f * 0.8));
-      ctx.strokeStyle = stem; ctx.lineCap = 'round'; ctx.stroke();
+      ctx.lineCap = 'round';
+      if (f <= litLen + 1e-3) {
+        ctx.strokeStyle = litCol; ctx.globalAlpha = litPulse;
+      } else {
+        ctx.strokeStyle = stem; ctx.globalAlpha = 1;
+      }
+      ctx.stroke(); ctx.globalAlpha = 1;
       prev = p;
     }
     // 顶芽
