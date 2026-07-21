@@ -1468,6 +1468,115 @@ def _edit_distance(a: str, b: str, cap: int = 3) -> int:
     return prev[-1]
 
 
+# DR-PM66-C3(#113)：NVFP4 量化模型往源码写【全角 CJK 标点】（U+FF0C，/FF1A：/FF08（/FF09）
+# /FF1B；/3001、/3002。等）→ javac `illegal character`。这些标点在【代码位】恒非法（字符串/注释里
+# 的 CJK 合法，不在此扫）。用 POSIX bracket 直接列全角标点字面(UTF-8)，可移植(GNU/busybox/BSD)，
+# 不用 GNU 扩展 `grep -P '\x{ff0c}'`（busybox 不认→漏扫）。
+_FULLWIDTH_PUNCT_CHARS = "，：（）；、。！？【】｛｝"
+
+
+def _scan_fullwidth_punct(project_path: str, modified, timeout: int) -> list[str]:
+    """#113 诊断预扫：在【本子任务改动的源文件】里定位全角 CJK 标点，返回 `file:line:内容` 精确坐标。
+
+    诊断【不自改】——字符串字面量里的全角标点合法（`"你好，世界"`），逐行区分字符串/注释超 grep 能力，
+    自改有腐蚀字符串风险；故只【surfacing 精确坐标】喂 worker 修复轮（早于/补强 javac 的 illegal
+    character，定位更准）。栈中立、只读、fail-safe（异常/无匹配→空）。"""
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()
+            and str(f).rsplit(".", 1)[-1].lower() in ("java", "kt", "kts", "scala", "go", "ts", "tsx", "js", "cs")}
+    if not mods:
+        return []
+    hits: list[str] = []
+    for rel in sorted(mods):
+        # bracket 内直接列全角字面(UTF-8)——POSIX、可移植；-n 出行号。
+        # ★复核 F4 整改★：显式 `LC_ALL=C.UTF-8` 让 bracket 按【码点】匹配——否则 C/POSIX locale 下
+        # grep 退化为逐字节，全角标点多字节序列被拆碎，与普通 CJK 字（本仓注释/日志遍布）的延续字节
+        # 重叠 → 漏扫或误命中。只读诊断，locale 不支持时 grep 仍跑（最坏退回旧字节行为），不阻断。
+        gcmd = f"LC_ALL=C.UTF-8 grep -n '[{_FULLWIDTH_PUNCT_CHARS}]' {shlex.quote(rel)} 2>/dev/null | head -20"
+        try:
+            ec, out, _ = _cached_scan(gcmd, project_path, timeout=min(timeout, 30))
+        except Exception:  # noqa: BLE001 — 诊断失败不致命
+            continue
+        for line in (out or "").splitlines():
+            if line.strip():
+                hits.append(f"{rel}:{line.strip()[:120]}")
+    return hits[:40]
+
+
+def _attempt_pseudospace_repair(
+    project_path: str, modified, timeout: int
+) -> tuple[int, list[str]]:
+    """DR-10-F2/DR-PM66-A6(#103/#114) 治本：折叠 NVFP4 量化模型注入的【标识符内伪空格】——
+    `groups.is Empty()` / `groups.isE mpty()` → `groups.isEmpty()`。这类畸形令原标识符被空格切成
+    两 token，逃逸 symbol-repair 的编辑距离匹配（`is Empty` 与 `isEmpty` 距离>2），且模型自纠会陷入
+    复读退化循环反复烧流（round66 实证 4 次 abort 各 21-27s）。
+
+    ★黄灯·双闸防误并★（栈中立，C 家族成员调用位）：
+      ① 位置语法非法——只折【成员调用位】`.<w1><空格><w2>(`（`.word word(` 在 C 家族恒非法，
+         合法代码绝不这样写；杜绝误折 `new Foo` / `return x` / 泛型 `List <String>`）。
+      ② 折叠后命中项目高频——`<w1><w2>` 必须是项目现存高频符号(≥5)才折；命中不了=放弃（fail-safe，
+         交编译闸+worker 修复循环兜底）。两闸同时满足才改，绝不赌。只修【本子任务改动文件】。"""
+    # ★复核 F5 整改★：freq 表只扫 `*.java`/`*.kt`（gate② 判据），故 mods 诚实收窄到 JVM 家族
+    # （java/kt/kts/scala）——放宽到 go/ts/cs 会让 gate② 对非 JVM 栈恒不通过=死代码/名实不符。
+    mods = {_norm_src_path(f) for f in (modified or []) if str(f).strip()
+            and str(f).rsplit(".", 1)[-1].lower() in ("java", "kt", "kts", "scala")}
+    if not mods:
+        return 0, []
+    # 复用 symbol-repair 同一 freq 扫描（_cached_scan 按 cmd 缓存，命令字节相同→命中缓存零重扫）
+    mcmd = ("grep -rhoE '[A-Za-z_][A-Za-z0-9_]+' --include='*.java' --include='*.kt' . "
+            "2>/dev/null | sort | uniq -c | sort -rn | head -4000")
+    _ec, gout, _e = _cached_scan(mcmd, project_path, timeout=min(timeout, 60))
+    freq: dict[str, int] = {}
+    for line in (gout or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)", line)
+        if m:
+            freq[m.group(2)] = int(m.group(1))
+    if not freq:
+        return 0, []
+    changed: set[str] = set()
+    seen_fold: set[tuple[str, str, str]] = set()
+    for rel in sorted(mods):
+        # 闸①：抓成员调用位内部空格片段 `.<w1><空白+><w2>...(`（含 `.` 起头、`(` 收尾）
+        gcmd = (f"grep -noE '\\.[A-Za-z_][A-Za-z0-9_]*[[:space:]][[:space:]]*[A-Za-z0-9_]+[[:space:]]*\\(' "
+                f"{shlex.quote(rel)} 2>/dev/null | head -40")
+        try:
+            ec, out, _ = _cached_scan(gcmd, project_path, timeout=min(timeout, 30))
+        except Exception:  # noqa: BLE001
+            continue
+        if ec != 0 or not out:
+            continue
+        for line in out.splitlines():
+            # grep -n 输出 `<lineno>:<match>` —— 抽行号（★复核 F1 整改★：mutation 只落该行）
+            lm = re.match(r"(\d+):", line)
+            mm = re.search(r"\.([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z0-9_]+)", line)
+            if not (lm and mm):
+                continue
+            lineno = int(lm.group(1))
+            w1, w2 = mm.group(1), mm.group(2)
+            # ★复核 F2 整改★：w1 是语言关键字（尤其 `new`——`outer.new Inner(` 是合法内部类实例化，
+            # 精确命中 gate①）→ 绝不折（fold 成 `newInner` 会腐蚀合法语法）。
+            if w1 in _JVM_KEYWORDS:
+                continue
+            folded = w1 + w2
+            if (rel, lineno, w1, w2) in seen_fold:
+                continue
+            seen_fold.add((rel, lineno, w1, w2))
+            if freq.get(folded, 0) < 5:
+                continue  # 闸②：折叠后非项目高频符号 → 不折（fail-safe）
+            # perl 折叠该成员调用位的内部空白：`.<w1><空白+><w2>` → `.<w1><w2>`。
+            # ★复核 F1 整改★：mutation 必须【定点到 gate① 报出的行号】(`$. == lineno`)——否则
+            # `s///g` file-wide 会误折字符串/javadoc 里合法的 `.w1 w2(` 文本（如日志 `"call .get
+            # Value(k)"`，前瞻 `(?=\()` 也拦不住带括号的字符串）。前瞻额外要求后随调用括号（成员调用位）。
+            _pp = re.escape("." + w1) + r"\s+" + re.escape(w2) + r"(?=\s*\()"
+            scmd = (f"perl -i.bak -pe 's#{_pp}#.{w1}{w2}#g if $. == {lineno}' {shlex.quote(rel)} "
+                    f"&& rm -f {shlex.quote(rel + '.bak')}")
+            ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
+            if ec2 == 0:
+                changed.add(rel)
+                logger.info("[L1.2.1·pseudospace] #103 %s: `.%s %s(`→`.%s%s(`（NVFP4 伪空格，"
+                            "折叠后项目高频 %d）", rel, w1, w2, w1, w2, freq[folded])
+    return len(changed), sorted(changed)
+
+
 def _attempt_symbol_repair(
     project_path: str, build_output: str, modified: list[str], timeout: int
 ) -> tuple[int, list[str]]:
@@ -1517,6 +1626,16 @@ def _attempt_symbol_repair(
         if len(top) != 1:
             continue  # 歧义近邻，不赌
         good = top[0]
+        # DR-PM66-A6(#114) 治本：防【两高频真符号间震荡】（StringUtils↔SpringUtils×4 不收敛：两者
+        # 都高频、互为近邻，改 A→B 后 B 处又报错改 B→A）。★复核 F3 整改★：判据不是裸 `freq(name)≥5`
+        # ——那会把"同一 typo 被复读复制 ≥5 次"(RuoYi 模板化 CRUD 常见)误判成真符号而漏修。真震荡的
+        # 签名是【name 与 good 频次相当】(都是既有真符号)；typo→主流纠正是【good 频次远高于 name】
+        # (isEmtpy(5)→isEmpty(128))。仅当 name 高频【且】good 未显著更高频(≤name×3)才判震荡跳过。
+        _fn, _fg = freq.get(name, 0), freq.get(good, 0)
+        if _fn >= 5 and _fg <= _fn * 3:
+            logger.info("[L1.2.1·symbol-repair] #114 %r(频=%d)↔%r(频=%d) 频次相当=两高频真符号→"
+                        "判震荡，不全局改名（防来回不收敛）", name, _fn, good, _fg)
+            continue
         scmd = (f"perl -i.bak -pe 's#\\b{re.escape(name)}\\b#{good}#g' {shlex.quote(rel)} "
                 f"&& rm -f {shlex.quote(rel + '.bak')}")
         ec2, _o = _run_l1_command(scmd, project_path, timeout=20)
@@ -1751,6 +1870,12 @@ def _attempt_build_repair(
             _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
+        # #103/#114：NVFP4 伪空格标识符（`is Empty`）→ 成员调用位空格折叠（双闸防误并）。放在
+        # symbol-repair【前】——折叠后 `isEmpty` 变合法，避免逃逸编辑距离匹配 + 复读退化循环烧流。
+        try:
+            _accum(_attempt_pseudospace_repair(project_path, modified, timeout))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[L1.2.1·repair] pseudospace-repair 异常(跳过): %s", exc)
         # 模型臆造/拼错的方法/类名（isEmtpy→isEmpty 等）→ 据项目现存符号按编辑距离纠近邻
         try:
             _accum(_attempt_symbol_repair(project_path, build_output, modified, timeout))
@@ -4401,6 +4526,16 @@ def run_l1_pipeline(
                     )
                     return True, details
                 details["build_failed"] = build_cmd
+                # #113 诊断：构建失败时预扫改动源文件的全角 CJK 标点（NVFP4 腐坏，javac illegal
+                # character 常见根因）→ 精确坐标进 details，喂 worker 修复轮定位更准（只读，不自改）。
+                try:
+                    _fw = _scan_fullwidth_punct(project_path, modified, timeout)
+                    if _fw:
+                        details["fullwidth_punct_positions"] = _fw
+                        logger.warning("[L1.2.1] #113 改动源文件含全角 CJK 标点（疑 NVFP4 腐坏，"
+                                       "javac illegal character 根因）: %s", _fw[:5])
+                except Exception as _fwexc:  # noqa: BLE001 — 诊断失败不致命
+                    logger.debug("[L1.2.1] #113 全角标点预扫异常(跳过): %s", _fwexc)
                 return False, details
     elif build_cmd:
         # 治本(st-10 npm 误判空转，996db614 实测)：Brain 给【纯静态资源子任务】(只改 .html/.js/.css/
