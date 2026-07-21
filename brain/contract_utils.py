@@ -2078,6 +2078,110 @@ def _narrow_grep_scan_paths(cmd: str, declared: set[str], owned_areas: set[str])
     return cmd[:m.start("paths")] + " " + " ".join(kept) + cmd[m.end("paths"):]
 
 
+# DR-10-F1(#102)：源码 forbidden-import 负断言的【裸包前缀】分支识别正则——【首段小写】(Java/Kotlin/
+# Scala 包名铁律=小写；类名 CamelCase 大写开头) + 纯标识符+转义点、以 `\.` 结尾（如 javax\. /
+# jakarta\. / com\.foo\.），且不含 import 关键字。
+# ★复核 CONFIRMED HIGH 整改★：首段必须小写——排除 `Runtime\.` / `System\.` / `Math\.` 这类
+# 【java.lang.* 类名 API 禁令】（这些类【自动导入·从不写 import`Runtime.exec()`】，若锚定到 import
+# 上下文会令模式【永不匹配】→ 该 API 禁令永久失效=假 DONE）。类名 API 负断言不属"import 禁令"语义，
+# 保持原样（本就该匹配代码任意位置的调用）。方法名(结尾 `(`)/字符串/已锚定(含 import)分支亦不匹配。
+_PKG_PREFIX_BRANCH_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\\\.[A-Za-z0-9_]+)*\\\.$")
+
+
+# DR-10-F1(#102) import 锚定前缀：`^[[:space:]]*import[[:space:]].*`
+# = 行首(可缩进) + import 关键字 + ≥1 空白 + 任意（覆盖 `import static <pkg>`）。
+# ★可移植性铁律★：用 POSIX 字符类 `[[:space:]]` 而非 GNU 扩展 `\s`——负断言在【沙箱】跑(grep 可能
+# 是 busybox/BSD，不认 `\s`)，`\s` 会令模式【永不匹配】→ 真 import javax 也放行=放松禁令假 DONE。
+# `[[:space:]]`/`.*`/`^`/`*` 在 BRE/ERE/GNU/busybox/BSD 全通用（刻意不用 `(?:...)?` 分组——ERE 用
+# `(...)`、BRE 用 `\(...\)`、`(?:)` 是 PCRE，均不可移植；`import[[:space:]].*` 用 `.*` 覆盖 `static`）。
+# 行首锚定(`^`)杜绝"// import javax 是禁止的"这类注释里含 import 关键字的边缘假阴性。
+# ★复核 CONFIRMED（已知取舍·非改动引入死面）★：锚定把语义从"禁 javax 出现在任意位置"收敛为"禁
+# import javax 语句"——【FQN 内联用法】(`javax.servlet.X x=...`、`@lombok.Data`，无 import 行)会逃逸。
+# 但：①0-baseline(javax 不在 classpath)下 FQN 用法【编译必失败】→ 编译闸兜底；②"禁 import 某包"正是
+# 负断言原意；③可靠区分"代码 FQN 用法"vs"注释里的 FQN"超出 grep 能力。故 FQN 逃逸列为已知限制。
+_IMPORT_ANCHOR_PREFIX = r"^[[:space:]]*import[[:space:]].*"
+
+
+def _anchor_forbidden_import_pattern(pattern: str) -> str:
+    """把 grep 负断言 pattern 里的【裸包前缀】分支锚定到 import 上下文，把【已含 import 关键字但未
+    行首锚定】的分支(如 `import lombok`)补行首锚。非包前缀(方法名/字符串/结尾非 `\\.`)/已行首锚定
+    分支原样。
+
+    #102：`javax\\.` 裸包前缀是【行内子串】匹配→命中注释/散文里的 `javax.`（worker 写"本类无
+    javax.*"表功注释被判死=假阴性杀好产出）。#102-复核C（修一类捞 sibling）：同一 pattern 的
+    `import lombok` 分支同病（命中"无需 import lombok"注释），也补行首锚。栈中立。"""
+    import re as _re
+    branches = pattern.split("|")
+    out: list[str] = []
+    changed = False
+    for b in branches:
+        if b.startswith("^"):
+            out.append(b)                                   # 已行首锚定 → 幂等跳过
+        elif _PKG_PREFIX_BRANCH_RE.match(b):
+            out.append(_IMPORT_ANCHOR_PREFIX + b)           # 裸包前缀(javax\.)→ 全 import 上下文锚
+            changed = True
+        elif _re.match(r"^import\s", b):
+            # 复核 C：已含 import 关键字但未行首锚定（`import lombok`）→ 仅补行首锚，杜绝命中
+            # "// 无需 import lombok" 散文；不改其余（它已限定 import 语义，只差行首约束）。
+            out.append(r"^[[:space:]]*" + b)
+            changed = True
+        else:
+            out.append(b)
+    return "|".join(out) if changed else pattern
+
+
+def _anchor_forbidden_import_in_cmd(cmd: str) -> str:
+    """对【负断言】源码命令（`! grep …` / `test -z|-n "$(grep …)"`）的 grep pattern 做 import 锚定。
+    非负断言/非 grep/解析不出 → 原样（fail-open，绝不误改成永假）。仅重写裸包前缀分支。"""
+    import re as _re
+    # 复核 D 整改：只认【真·负断言】——`! grep`（取反）与 `test -z "$(grep …)"`（断言输出为空=
+    # 模式不得出现）。★绝不含 `test -n`★——`test -n` 断言输出【非空】=模式【必须出现】=正面存在
+    # 断言（如"必须 import 某拦截器"），语义与 forbidden-import 相反，锚定它会把"子串出现"要求
+    # 收紧成"必须是 import 语句行"→ 合法 FQN/异形满足被冤杀。
+    if not (_re.match(r"^\s*!\s*grep\b", cmd) or _re.search(r"\btest\s+-z\b.*grep", cmd)):
+        return cmd            # 只锚【负断言】——正面 grep/`test -n` 存在断言语义不同，不动
+    m = _re.search(r"grep\b(?:\s+-{1,2}[\w=-]+)*\s+(?P<q>['\"])(?P<pat>.*?)(?P=q)", cmd)
+    if not m:
+        return cmd
+    new_pat = _anchor_forbidden_import_pattern(m.group("pat"))
+    if new_pat == m.group("pat"):
+        return cmd
+    return cmd[:m.start("pat")] + new_pat + cmd[m.end("pat"):]
+
+
+def anchor_forbidden_import_asserts(plan) -> dict[str, dict]:
+    """DR-10-F1(#102) 治本：源码 forbidden-import 负断言的裸包前缀分支锚定到 import 上下文，
+    杜绝命中注释/散文的假阴性判死好产出（round66 st-29/st-32 实证：worker 写"无 javax.*"注释被杀）。
+
+    确定性、幂等、零 LLM、栈中立、fail-open（解析异常/未知形态原样）。与 sanitize_verify_scope(#111)
+    同咽喉：#111 收敛【扫描范围】(跨模块泄漏)，本闸锚定【匹配模式】(import 上下文)，两者正交互补。
+    返回 {subtask_id: {anchored: [(旧,新)…]}} 机读摘要。"""
+    summary: dict[str, dict] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        h = getattr(st, "harness", None)
+        vcs = list(getattr(h, "verify_commands", []) or []) if h else []
+        if not vcs:
+            continue
+        new_vcs: list[str] = []
+        anchored: list[tuple[str, str]] = []
+        for vc in vcs:
+            try:
+                out = _anchor_forbidden_import_in_cmd(vc)
+            except Exception:  # noqa: BLE001 — 单命令解析异常绝不拖垮全 plan，留痕后保留原命令
+                logger.warning(
+                    "[IMPORT-ANCHOR] #102 %s 负断言 import 锚定异常，保留原命令: %s",
+                    getattr(st, "id", "?"), vc, exc_info=True)
+                new_vcs.append(vc)
+                continue
+            if out != vc:
+                anchored.append((vc, out))
+            new_vcs.append(out)
+        if anchored and h is not None:
+            h.verify_commands = new_vcs
+            summary[getattr(st, "id", "?")] = {"anchored": anchored}
+    return summary
+
+
 def sanitize_verify_scope(plan) -> dict[str, dict]:
     """DR-PM66-C4(#111) 治本：源码内容断言（grep/test 类）的扫描路径不得越出【本子任务声明 scope +
     本子任务自身物理模块区域】。否则一个子任务的成败被【外模块产物】决定=保证性假阴性死局。
@@ -2151,6 +2255,13 @@ def inject_build_scaffold_subtasks(
                         len(_vs), sorted(_vs)[:8])
     except Exception:  # noqa: BLE001 — fail-open，越界断言维持原样（不引入新致死面）
         logger.warning("[VERIFY-SCOPE] #111 验收作用域收敛失败（fail-open）", exc_info=True)
+    try:
+        _ia = anchor_forbidden_import_asserts(plan)   # DR-10-F1(#102)
+        if _ia:
+            logger.info("[IMPORT-ANCHOR] #102 forbidden-import 负断言锚定：%d 个子任务被锚定 %s",
+                        len(_ia), sorted(_ia)[:8])
+    except Exception:  # noqa: BLE001 — fail-open，负断言维持原样（不引入新致死面）
+        logger.warning("[IMPORT-ANCHOR] #102 forbidden-import 锚定失败（fail-open）", exc_info=True)
     return injected
 
 

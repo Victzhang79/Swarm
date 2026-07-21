@@ -1744,17 +1744,21 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         if plan_obj is not None and _land107_on:
             try:
                 from swarm.brain.contract_utils import (
+                    anchor_forbidden_import_asserts,
                     deconflict_cross_module_creates,
                     sanitize_verify_scope,
                 )
                 _vs107 = sanitize_verify_scope(plan_obj)
                 _replan_landed = _replan_landed or bool(_vs107)  # 落地即置位：防第二 pass 抛异常丢第一 pass 变异
+                _ia107 = anchor_forbidden_import_asserts(plan_obj)  # DR-10-F1(#102) 负断言 import 锚定
+                _replan_landed = _replan_landed or bool(_ia107)
                 _xc107 = deconflict_cross_module_creates(plan_obj)
                 _replan_landed = _replan_landed or bool(_xc107)
-                if _vs107 or _xc107:
+                if _vs107 or _ia107 or _xc107:
                     logger.info(
                         "[HANDLE_FAILURE] #107 replan 处方确定性落地：verify 作用域收敛 %d 子任务 + "
-                        "跨模块重复 create 归一 %d 文件（重派不再字节相同，真收敛）", len(_vs107), _xc107)
+                        "forbidden-import 锚定 %d 子任务 + 跨模块重复 create 归一 %d 文件（重派不再字节相同，真收敛）",
+                        len(_vs107), len(_ia107), _xc107)
             except Exception:  # noqa: BLE001 — 落地失败不阻断 replan（fail-open，退回旧重派）
                 logger.warning("[HANDLE_FAILURE] #107 replan 确定性落地失败（fail-open）", exc_info=True)
         # ── 修复 B：replan 守卫 —— 保护已成功的兄弟子任务，避免一个子任务失败就全量推倒重来 ──
