@@ -129,6 +129,29 @@ def test_validator_hard_blocks_double_root_pom_writer():
     assert any("pom.xml" in i for i in res.issues), f"issues 应点名 root pom: {res.issues}"
 
 
+# ── 3b. #39-A 栈中立：非 Maven 根聚合清单双写者同样硬失败（settings.gradle/go.work/Cargo）──
+def test_39a_non_maven_root_aggregator_double_writer_hard_fails():
+    """#39-A 治本：此前只 pom.xml 硬失败，Gradle settings.gradle / Go go.work 的【依赖序】
+    双写者只落 warn 逃过 backstop → include(...)/use 结构重写非加性=rebase 循环。栈中立铺开：
+    根级聚合清单集统一硬失败（即便依赖序）。"""
+    for manifest in ("settings.gradle", "settings.gradle.kts", "go.work", "Cargo.toml"):
+        sts = [_st("st-1", writable=[manifest], depends=[]),
+               _st("st-2", writable=[manifest], depends=["st-1"])]  # 依赖序（旧码只 warn）
+        res = validate_plan_structure(TaskPlan(subtasks=sts))
+        assert not res.valid, f"{manifest} 根聚合双写者(依赖序)必须硬失败，非仅 warn"
+        assert any(manifest in i for i in res.issues), f"issues 应点名 {manifest}: {res.issues}"
+
+
+def test_39a_member_manifest_not_treated_as_root_aggregator():
+    """#39-A 边界：子目录同名清单（member Cargo.toml / 模块 build.gradle）不是【根】聚合，
+    不吃根级单写者硬失败（沿用既有 module-writer 规则，依赖序放行）。"""
+    sts = [_st("st-1", writable=["crates/foo/Cargo.toml"], depends=[]),
+           _st("st-2", writable=["crates/foo/Cargo.toml"], depends=["st-1"])]
+    res = validate_plan_structure(TaskPlan(subtasks=sts))
+    # 依赖序 module 清单 → 不硬失败（走下方 warn 分支，valid 保持）
+    assert res.valid, f"member 清单依赖序双写者不应硬失败: {res.issues}"
+
+
 # ── 4. 收敛后 validator 通过（单 owner 无冲突）──────────────────────────────
 def test_single_owner_passes_validator(tmp_path):
     proj = _repo(tmp_path, {"pom.xml": _ROOT_POM})

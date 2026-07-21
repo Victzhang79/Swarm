@@ -120,6 +120,32 @@ def test_grant_module_pom_writable():
     assert "st-1" in (st24.depends_on or []), "应串到 pom owner 后面防 merge 冲突"
 
 
+def test_38_stack_module_manifest_resolution():
+    """#38 治本：A2 恢复授写权的清单文件名按栈解析（绝不非 Maven 授幻影 pom.xml）。"""
+    from swarm.brain.nodes.maven_repair import stack_module_manifest
+    assert stack_module_manifest({"build": "maven"}) == "pom.xml"
+    assert stack_module_manifest({"build": "go"}) == "go.mod"
+    assert stack_module_manifest({"build": "npm"}) == "package.json"
+    assert stack_module_manifest({"build": "gradle"}) == "build.gradle"
+    assert stack_module_manifest({"build": "cargo"}) == "Cargo.toml"
+    # 未知/无画像 → pom.xml（与 unknown→Maven 既有 back-compat 一致）
+    assert stack_module_manifest(None) == "pom.xml"
+    assert stack_module_manifest({"build": "elixir-mix"}) == "pom.xml"
+
+
+def test_38_grant_go_stack_no_phantom_pom():
+    """#38 治本：Go 工程缺依赖恢复授【go.mod】写权，绝不授幻影 pom.xml。"""
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="go svc",
+                scope=FileScope(create_files=["svc-a/main.go"])),
+    ])
+    granted = _grant_module_pom_writable(plan, ["st-1"], "go.mod")
+    assert granted == {"st-1": "svc-a/go.mod"}
+    st1 = plan.subtasks[0]
+    assert "svc-a/go.mod" in st1.scope.writable
+    assert not any("pom.xml" in f for f in (st1.scope.writable or [])), "绝不授幻影 pom.xml"
+
+
 def test_grant_skips_non_module_top_dir():
     """MEDIUM-1：首段是 src/test 等非模块目录时不误推 'src/pom.xml'。"""
     plan = TaskPlan(subtasks=[

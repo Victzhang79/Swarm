@@ -217,12 +217,16 @@ def _proj_path_from_state(state) -> str | None:
         return None
 
 
-def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
-    """给失败子任务补其模块 <module>/pom.xml 写权，返回 {sid: mod_pom} 已授权映射。
+def _grant_module_pom_writable(plan_obj, failed_ids: list, manifest: str = "pom.xml") -> dict:
+    """给失败子任务补其模块 <module>/<manifest> 写权，返回 {sid: mod_manifest} 已授权映射。
 
-    让重试能真正改 pom 补依赖（原本 pom 不在 scope，重试再多也修不了）。同时让失败子任务
-    depends_on【该 pom 的既有 owner】（HIGH-2）：owner 可能是已 DONE 的脚手架子任务，二者都写
-    同一 pom，必须靠拓扑序让 owner 的 pom-create 在前、coder 的 pom-modify 在后，MERGE 才不冲突。
+    让重试能真正改构建清单补依赖（原本清单不在 scope，重试再多也修不了）。同时让失败子任务
+    depends_on【该清单的既有 owner】（HIGH-2）：owner 可能是已 DONE 的脚手架子任务，二者都写
+    同一清单，必须靠拓扑序让 owner 的 create 在前、coder 的 modify 在后，MERGE 才不冲突。
+
+    ★#38 治本★ manifest 由调用方按项目栈传入（Maven=pom.xml 默认，byte-identical；Go=go.mod、
+    npm=package.json…）——绝不在非 Maven 工程授【幻影 pom.xml】写权烧恢复预算。默认 pom.xml 保
+    既有调用点/测试零改动。
     """
     granted: dict = {}
     if plan_obj is None or not hasattr(plan_obj, "subtasks"):
@@ -239,7 +243,7 @@ def _grant_module_pom_writable(plan_obj, failed_ids: list) -> dict:
         mod = _module_of(files)
         if not mod:
             continue
-        mod_pom = f"{mod}/pom.xml"
+        mod_pom = f"{mod}/{manifest}"
         w = list(getattr(sc, "writable", []) or [])
         cf = list(getattr(sc, "create_files", []) or [])
         if mod_pom not in w and mod_pom not in cf:

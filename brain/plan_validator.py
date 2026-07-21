@@ -19,6 +19,13 @@ MAX_LLM_VALIDATION_PLAN_CHARS = 120_000
 # context_snippets：worker 免探索的注入代码，纯执行辅助，与计划结构无关。
 _SLIM_STRIP_SUBTASK_FIELDS = ("contract", "context_snippets")
 
+# #39-A：各栈【根聚合清单】——单写者硬失败 backstop 覆盖面（路径无前缀=仓库根级）。聚合结构
+# 重写非加性（Maven <modules>、Gradle include、Go go.work use、Cargo [workspace] members），
+# 双写者=rebase 循环根因，栈中立统一硬失败。子目录同名清单（如 member Cargo.toml）不在此列。
+_ROOT_AGGREGATOR_MANIFESTS = frozenset({
+    "pom.xml", "settings.gradle", "settings.gradle.kts", "go.work", "Cargo.toml",
+})
+
 
 def slim_plan_json_for_llm_validation(plan: TaskPlan) -> str:
     """构造喂给 VALIDATE_PLAN 软建议 LLM 的【瘦身 plan_json】。
@@ -188,13 +195,17 @@ def validate_plan_structure(
         if len(ids) < 2:
             continue
         joined = ", ".join(ids)
-        # D1 治本 backstop：Maven 根聚合 pom.xml 永远【单写者】。两份对 <modules>/
-        # <dependencyManagement> 的结构重写无法安全 3-way/union 合并（round18 P0-A 畸形 /
-        # rebase 循环→escalate→FAILED），即便依赖序也不行（各自整段重写、非加性）。
+        # D1 治本 backstop：根聚合清单永远【单写者】。两份对聚合结构（Maven <modules>/
+        # <dependencyManagement>、Gradle settings.gradle include(...)、Go go.work use、Cargo
+        # [workspace] members）的重写都无法安全 3-way/union 合并（round18 P0-A 畸形 / rebase
+        # 循环→escalate→FAILED），即便依赖序也不行（各自整段重写、非加性）。
+        # ★#39-A 治本★ 此前只硬失败 pom.xml → 非 Maven 根聚合（settings.gradle/go.work/根
+        # Cargo.toml）的依赖序双写者只落下方 warn，逃过 backstop → Gradle/Go 重现 pom 早年那条
+        # 非加性 rebase 循环。栈中立铺开：根级聚合清单集统一硬失败（路径无前缀=在仓库根）。
         # normalize_plan_scopes 已收敛唯一 owner；此处硬失败仅在收敛失效时兜底（fail-closed）。
-        if fp.replace("\\", "/") == "pom.xml":
+        if fp.replace("\\", "/") in _ROOT_AGGREGATOR_MANIFESTS:
             result.add(
-                f"根聚合 pom.xml 有 {len(ids)} 个写者: [{joined}]"
+                f"根聚合清单 {fp} 有 {len(ids)} 个写者: [{joined}]"
                 f"（必须收敛唯一 aggregator-owner；双写者=P0-A 畸形/rebase 循环根因）"
             )
             continue

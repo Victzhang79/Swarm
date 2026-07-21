@@ -224,6 +224,27 @@ def _stack_driver_keys(project_stack: dict | None) -> list[str]:
     return _keys
 
 
+# #38 治本：各栈【模块主构建清单】文件名——A2 缺依赖恢复授写权用。此前 _grant_module_pom_writable
+# 无条件授 <module>/pom.xml：非 Maven 工程（Go/npm/Rust/Gradle）compile 失败一旦命中缺依赖特征，
+# 就给它塞一个【幻影 pom.xml】写权 + 烧一格恢复预算（下游 inject driver loud no-op 兜、但预算已耗、
+# 且诱导 worker 建凭空 pom 污染工程）。按栈授【正确清单】（Go→go.mod，让 worker 真能去补），未知
+# 栈→pom.xml（与 unknown→Maven 既有 back-compat 一致）。键口径同 _stack_driver_keys（不得分叉）。
+_STACK_MODULE_MANIFEST = {
+    "maven": "pom.xml", "gradle": "build.gradle", "go": "go.mod",
+    "cargo": "Cargo.toml", "npm": "package.json", "pip": "pyproject.toml",
+    "python": "pyproject.toml",
+}
+
+
+def stack_module_manifest(project_stack: dict | None) -> str:
+    """A2 恢复授写权的【模块主清单】文件名（与 _stack_driver_keys 同口径解析栈键，绝不分叉）。
+    未知/未收录栈 → pom.xml（与 unknown→Maven 既有 back-compat 一致）。"""
+    for k in _stack_driver_keys(project_stack):
+        if k in _STACK_MODULE_MANIFEST:
+            return _STACK_MODULE_MANIFEST[k]
+    return "pom.xml"
+
+
 def inject_missing_deps_for_stack(project_stack: dict | None, project_path: str | None,
                                   granted: dict, subtask_results: dict) -> dict:
     """按项目栈分发缺依赖确定性补全 driver。未覆盖栈返回 {}（loud，不静默）。"""

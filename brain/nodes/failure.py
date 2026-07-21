@@ -32,6 +32,7 @@ from swarm.types import Complexity, WorkerOutput
 from swarm.brain.nodes.maven_repair import (
     classify_missing_deps_for_stack,
     inject_missing_deps_for_stack,
+    stack_module_manifest,
 )
 from swarm.brain.nodes.recovery import (
     _INTERNAL_BLOCKED_KINDS,
@@ -1470,8 +1471,10 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 failed_ids, _tr_max, strategy,
             )
         else:
-            # 仅在配额内才 mutate plan（补 pom 写权 + 串 owner 依赖），杜绝兜底路径留下孤儿 scope 改动。
-            granted = _grant_module_pom_writable(plan_obj, _eligible)
+            # 仅在配额内才 mutate plan（补构建清单写权 + 串 owner 依赖），杜绝兜底路径留下孤儿 scope 改动。
+            # ★#38 治本★ 按项目栈授【正确清单】（Go→go.mod…），绝不在非 Maven 工程授幻影 pom.xml。
+            _recovery_manifest = stack_module_manifest(state.get("project_stack"))
+            granted = _grant_module_pom_writable(plan_obj, _eligible, _recovery_manifest)
             if granted:
                 # 治本 A2：授权后【确定性】据项目自身 pom 把缺失依赖补进失败模块 pom，
                 # 不再指望小模型自己加（实测它加不上 → 耗尽配额 → 全量 replan 砸成功子任务）。
