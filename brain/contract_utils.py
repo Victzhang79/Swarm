@@ -697,10 +697,12 @@ def _resolve_module_dirs(
         if prefix:
             out[mod] = prefix
         _roots_cls: dict[str, set[str]] = {}
+        _root_files: dict[str, list[tuple[str, str]]] = {}   # R65E14-T1：根→[(路径,证据类)]
         for p, cls in ((q, c) for c, ps in by_cls.items() for q in ps if c != _EV_AUX):
             r = _evidence_root(p, cls)
             if r:
                 _roots_cls.setdefault(r, set()).add(cls)
+                _root_files.setdefault(r, []).append((p, cls))
         _roots: set[str] = set(_roots_cls)
         if not _roots:   # 纯辅助模块：回退顶层目录（多根照打回，flat 兜底不放水）
             _roots = {q.split("/", 1)[0] for q in aux if "/" in q}
@@ -719,10 +721,22 @@ def _resolve_module_dirs(
         # project_path 无法证实既有基线 → 保守不剔（fail-closed）；两个都是新落点仍歧义
         # （round62 alarm-api 保护不破）。
         if project_path and len(_roots) > 1:
+            # ★R65E14-T1（#40）★ 豁免判据从"仅 manifest 证据"扩展为其超集："该根的【全部】
+            # 证据文件均为 manifest 或【基线既有文件】（git-pin base，_exists_in_repo 与
+            # R65E-T1 基线模块判定同源同缓存）"。MODIFY 既有外部源码文件（往既有 Shiro 链/
+            # 路由表/DI 注册点写接线，round65e14 死因本体=admin 特性改 framework 的既有
+            # ShiroConfig.java）与改既有外部 pom 是同一类合法 fan-in 接线——文件的家早已确定
+            # （属外部模块），本模块只是去改它，不产生"本模块的家在哪"的歧义。CREATE 新文件
+            # 进外部模块（不在 base）→ all() 不成立 → 根保留仍打回（新文件的家无法判=真
+            # 跨模块 smell，round62 保护不破）。
             _foreign = {
                 r for r in _roots
-                if _roots_cls.get(r) == {_EV_MANIFEST}
-                and _is_existing_baseline_module(project_path, r, _exist_cache, base_ref)
+                if _is_existing_baseline_module(project_path, r, _exist_cache, base_ref)
+                and all(
+                    cls == _EV_MANIFEST
+                    or _exists_in_repo(project_path, p, _exist_cache, base_ref)
+                    for p, cls in (_root_files.get(r) or [("", "")])
+                )
             }
             # ★复核①CONFIRMED★ 只在剔除后本模块仍保有【自有锚根】(_own 非空)时才剔——否则
             # =纯接线模块只改两个既有外部模块的 pom、无任何自有代码归属，本身就是真违①
@@ -739,6 +753,19 @@ def _resolve_module_dirs(
                             "不计入本模块物理根判定（本模块自有根=%s）",
                             mod, sorted(_foreign), sorted(_own))
                 _roots = _own
+                # ★R65E14-T1 猎手 Finding1（CONFIRMED HIGH）整改★ out[mod] 的 prefix 是在
+                # 剔除 foreign 之前用全量 code_paths 算的——标签≠目录字面名时（R58-1：契约
+                # `alarm-admin` 实住 `ruoyi-admin/`）跨 top 段 → prefix=None → out 无此模块；
+                # 豁免又清了 ambiguous → 模块从 resolved/ambiguous 双双消失 → G1 zero-dir
+                # 误诊"幻影依赖"软 warn → 脚手架/依赖推导拿不到根 → 执行期 reactor 死型
+                # 静默复活。剔除后按 _own 内文件重算（口径同构：代码证据优先、无则回退全部；
+                # file_plan 是权威，非空即覆盖名字匹配的旧值——R58-1 既有裁决）。
+                _own_files = [(p, c) for r2 in _own for p, c in (_root_files.get(r2) or [])]
+                _own_code = [p for p, c in _own_files if c != _EV_MANIFEST]
+                _prefix2 = _common_module_prefix(
+                    _own_code or [p for p, _ in _own_files], project_path)
+                if _prefix2:
+                    out[mod] = _prefix2
         if len(_roots) > 1:
             fp_ambiguous[mod] = sorted(_roots)
     # 违①：名字匹配落到 2+ 目录、且 file_plan/基线未把它消解到唯一目录 → 真歧义；file_plan 自身
@@ -1216,6 +1243,13 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
         for r in (getattr(sc, "readable", None) or []):
             rp = _norm_scope_path(str(r))
             if "/" not in rp or not _is_code_path(rp):
+                continue
+            # ★R65E14-T5（#44）★ AUX 资源（static/resources 布局段下的 .js/.html/模板等）
+            # 不构成模块编译依赖证据——round65e14 实测 alarm→admin 的 9 条"证据"全是
+            # admin/static/*.js（垂直切片塞的前端上下文），与真依赖 admin→alarm 凑成互指
+            # → 双向剪除把真依赖也连坐剪掉。复用 R64 证据分层（_evidence_class 判据=路径
+            # 布局，栈中立：npm 的 src/*.js 是 WEAK_CODE 不受影响）。
+            if _evidence_class(rp) == _EV_AUX:
                 continue
             om = _owner_mod(rp)
             for m in write_mods:

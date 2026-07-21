@@ -289,3 +289,55 @@ def test_merge_internal_deps_dedup_table():
         ["ruoyi-common"]
     assert _merge_internal_deps([], ["a", "g:a", "b"]) == ["a", "b"]
     assert _merge_internal_deps(["x:y"], []) == ["x:y"]
+
+
+# ── R65E14-T5（#44）：AUX 资源 readable 不构成模块依赖证据（round65e14 假环来源②）──
+# round65e14 实测：alarm→admin 的 9 条"依赖证据"全是 ruoyi-admin/src/main/resources/static/
+# 下的 .js（垂直特性切片给 readable 塞的前端上下文，_evidence_class=AUX 资源）——Java 模块
+# 编译不需要对方的 static 资源；这些假证据与真依赖 admin→alarm 凑成互指 → T5 双向剪除把
+# 【真依赖也连坐剪掉】。治本=证据过滤复用 R64 证据分层（_evidence_class）：AUX 不算编译
+# 依赖证据。栈中立：npm 项目 src/ 下 .js 是 WEAK_CODE 不受影响，只有资源布局段（static/
+# resources 等）下的才是 AUX。
+
+def test_aux_static_resource_readable_is_not_dependency_evidence(tmp_path):
+    def _pom(art):
+        return ('<?xml version="1.0"?><project>'
+                "<parent><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+                f"<version>4.8.3</version></parent><artifactId>{art}</artifactId></project>")
+    proj = _mk_repo(tmp_path, extra={"ruoyi-admin": _pom("ruoyi-admin"),
+                                     "ruoyi-alarm": _pom("ruoyi-alarm")})
+    plan = _plan(
+        [
+            # alarm 写者 readable 只有 admin 的 static .js（AUX 资源）→ 不得推出 alarm→admin
+            _st("st-alarm", create=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/AlarmTaskController.java"],
+                readable=["ruoyi-admin/src/main/resources/static/ruoyi/alarm/task/task.js"]),
+            # admin 写者 readable 是 alarm 的真 Java 源 → admin→alarm 真依赖须保留
+            _st("st-admin", create=["ruoyi-admin/src/main/java/com/ruoyi/web/filter/F.java"],
+                readable=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/AlarmTaskController.java"]),
+        ],
+        [{"module": "ruoyi-admin", "artifacts": []}, {"module": "ruoyi-alarm", "artifacts": []}])
+    dirs = {"ruoyi-admin": "ruoyi-admin", "ruoyi-alarm": "ruoyi-alarm"}
+    derived = derive_internal_module_deps(plan, dirs, proj)
+    alarm_deps = [d for d in (derived.get("ruoyi-alarm") or [])]
+    assert not any("ruoyi-admin" in d for d in alarm_deps), \
+        f"AUX 静态资源 readable 不构成编译依赖证据（假环来源）: {alarm_deps}"
+    admin_deps = [d for d in (derived.get("ruoyi-admin") or [])]
+    assert any("ruoyi-alarm" in d for d in admin_deps), \
+        f"真 Java 依赖 admin→alarm 不得被假环连坐剪除: {admin_deps}"
+
+
+def test_weak_code_js_under_src_still_counts_as_evidence(tmp_path):
+    """栈中立保护：npm 型布局 src/ 下的 .js 是 WEAK_CODE 真码，仍构成依赖证据。"""
+    def _pom(art):
+        return ('<?xml version="1.0"?><project>'
+                "<parent><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+                f"<version>4.8.3</version></parent><artifactId>{art}</artifactId></project>")
+    proj = _mk_repo(tmp_path, extra={"pkg-core": _pom("pkg-core"), "pkg-web": _pom("pkg-web")})
+    plan = _plan(
+        [_st("st-web", create=["pkg-web/src/pages/App.js"],
+             readable=["pkg-core/src/lib/util.js"])],
+        [{"module": "pkg-web", "artifacts": []}, {"module": "pkg-core", "artifacts": []}])
+    dirs = {"pkg-web": "pkg-web", "pkg-core": "pkg-core"}
+    derived = derive_internal_module_deps(plan, dirs, proj)
+    assert any("pkg-core" in d for d in (derived.get("pkg-web") or [])), \
+        f"src/ 下 .js 是真码（WEAK_CODE），依赖证据不得误剪: {derived}"
