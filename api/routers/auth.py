@@ -17,6 +17,43 @@ from swarm.api._shared import _require_perm, _require_user
 router = APIRouter()
 
 
+def _real_client_ip(request: Request) -> str:
+    """B8-F5：解析真实 client IP 用于登录限流键。
+
+    反代（nginx/ingress）后 request.client.host 是全体用户共享的 proxy IP → 登录限流键塌成
+    一个 IP：(a) 暴破防护失效（全体计一个桶），(b) 第三方用受害者 username 连续失败即锁
+    `username|proxyIP`，受害者同走该 proxy 被账户锁定 DoS。
+
+    按 SWARM_TRUSTED_PROXY_HOPS(N) 从 X-Forwarded-For 取真实 client：我方 N 个可信代理会各自
+    append 上游 TCP peer，故 XFF 最右 N 个条目可信，真实 client = 第 (len-N) 个（其左侧任何条目
+    都是客户端可伪造的，一律不取）。fail-closed：未配可信代理（默认 0）→ XFF 完全不可信 → 退回
+    request.client.host（既有行为，无回归）；链短于 N 跳（异常/绕过）→ 同样退回直连 peer。
+
+    ⚠️ 运维前提（对抗复核 MEDIUM）：SWARM_TRUSTED_PROXY_HOPS>0 只应在【源站端口对外网防火墙隔离、
+    仅可信反代可直连】时设置。本函数不校验直连 TCP peer(request.client.host)是否真为可信代理 IP——
+    若源站可被外网直连绕过反代，攻击者自造恰好 N 段 XFF 即可完全操纵限流键。默认 0 不受影响。
+
+    对抗复核 HIGH：用 getlist 而非 get——同名 X-Forwarded-For 出现多条 header 行时（部分 LB/网关
+    以【追加独立 header 行】而非单行 CSV 拼接转发），Headers.get() 只返回第一条=攻击者自发的伪造行，
+    可信代理追加的真实行被忽略 → 伪造前缀绕过原样复现。按 RFC 7230 §3.2.2 把多条实例 join 成整体解析。
+    """
+    import os
+
+    direct = request.client.host if request.client else "unknown"
+    try:
+        hops = int((os.environ.get("SWARM_TRUSTED_PROXY_HOPS") or "0").strip())
+    except ValueError:
+        hops = 0
+    if hops <= 0:
+        return direct
+    xff = ",".join(request.headers.getlist("x-forwarded-for"))
+    parts = [p.strip() for p in xff.split(",") if p.strip()]
+    idx = len(parts) - hops
+    if idx < 0 or idx >= len(parts):
+        return direct
+    return parts[idx]
+
+
 def _issue_token_cookie(response: Response, request: Request, token: str) -> None:
     """把 token 以 HttpOnly Cookie 下发/续期 —— 登录与 /api/auth/me 引导【共用单一事实源】。
 
@@ -125,7 +162,7 @@ async def auth_login(req: LoginRequest, request: Request, response: Response):
 
     # M8 修复：登录限流/锁定，防默认账户暴力破解。按 用户名+客户端IP 计失败次数，
     # 超阈值在锁定窗口内直接 429，避免无限尝试。
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # B8-F5：反代后取真实 client IP（可信代理跳数门控）
     throttle_key = f"{req.username}|{client_ip}"
     locked, retry_after = _login_throttle.is_locked(throttle_key)
     if locked:

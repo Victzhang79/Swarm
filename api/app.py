@@ -196,7 +196,9 @@ def _init_sidecar() -> None:
 # 组件状态检查
 # ═══════════════════════════════════════════════════
 
-async def _check_component(name: str) -> dict[str, Any]:
+async def _check_component(name: str, is_admin: bool = False) -> dict[str, Any]:
+    # B8-F1（对抗复核 MEDIUM）：安全布尔 fail-closed 缺省 False（铁律#3）——默认掩码内部坐标，
+    # 唯有显式 is_admin=True 才返回完整 detail。杜绝未来新调用点忘传参而静默全量泄露。
     """检查单个组件的运行状态 — 真实连通性检测"""
     import httpx
 
@@ -501,6 +503,14 @@ async def _check_component(name: str) -> dict[str, Any]:
     except Exception as e:
         status["status"] = "error"
         status["detail"] = str(e)[:200]
+
+    # B8-F1：/api/status 无角色闸，任何已认证用户（含 viewer）都能读到 detail。detail 内嵌
+    # 内部基建坐标（worker 主模型名 / sandbox_api_url / 远程沙箱 api_url / PG version / 模型端点）
+    # = 横向移动侦察面。与 sandbox.py D47b（同一 api_url 只给 admin）对齐：非 admin 只保留
+    # 健康红绿灯（status），清空 detail（fail-closed：未来给某分量新增坐标也默认不外泄，
+    # 不靠逐分量维护敏感字段清单）。RBAC-off → anonymous admin → is_admin=True → 全量 detail。
+    if not is_admin:
+        status["detail"] = ""
 
     return status
 
@@ -1507,10 +1517,18 @@ async def health_ready():
 
 # ─── 2. GET /api/status ────────────────────────────
 @app.get("/api/status", tags=["系统"])
-async def get_status():
-    """系统组件运行状态（8 个组件）"""
+async def get_status(request: Request):
+    """系统组件运行状态（8 个组件）。
+
+    B8-F1：仅认证不足以放行内部坐标——非 admin 只得健康态（status），detail 掩空。
+    RBAC-off 时 _require_user 返回 anonymous admin，is_admin=True，行为不变（开箱即用）。
+    """
+    from swarm.api._shared import _require_user
+    from swarm.auth.rbac import Role
+    _user = _require_user(request)
+    _is_admin = _user.global_role == Role.ADMIN.value
     components = ["Brain 状态机", "Worker 执行器", "知识库", "记忆系统", "远程沙箱", "模型路由", "PostgreSQL", "Qdrant"]
-    results = await asyncio.gather(*[_check_component(c) for c in components])
+    results = await asyncio.gather(*[_check_component(c, _is_admin) for c in components])
     overall = "running"
     for r in results:
         if r["status"] == "error":

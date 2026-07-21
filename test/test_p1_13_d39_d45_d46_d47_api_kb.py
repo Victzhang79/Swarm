@@ -399,7 +399,7 @@ def test_d47c_persist_env_updates_holds_env_lock(tmp_path, monkeypatch):
     done = threading.Event()
 
     def _writer():
-        cfg_mod._persist_env_updates({"SWARM_D47_TEST_KEY": "v1"})
+        cfg_mod._persist_env_updates({"SWARM_D47_TEST_KEY": "v1"}, is_admin=True)
         done.set()
 
     with env_file_lock(env_path):

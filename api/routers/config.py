@@ -29,6 +29,50 @@ from swarm.api._shared import (
 router = APIRouter()
 
 
+# B8-F2：provider/沙箱/DB/webhook【出站端点/连接】类键——决定"把解密后的凭据 / 任务数据发往
+# 哪个 host"。被改指向攻击者 host = provider API key / DB 凭据 / webhook token 钓鱼 + 数据 MITM。
+# 全局 owner 亦持 config:write（_require_perm project_id=None → 全局角色），故仅 config:write
+# 不足以放行端点改写：这些键单独提权到 global admin。非端点键（模型名 / 开关 / 预算 / 阈值 /
+# 凭据本身）走原 config:write 语义不变（前端配置页正常编辑）。
+# 对抗复核 HIGH：原只列 _BASE_URL/_API_URL 漏了裸 _URL/_URI（SWARM_GITLAB_URL/SWARM_KB_RERANK_URL/
+# SWARM_DB_POSTGRES_URI/SWARM_NOTIFY_WEBHOOK_URL 等，全是含凭据的出站端点）→ 扩到裸后缀。经审
+# config/env_registry.py，全部 *_URL/*_URI 键均为出站端点/连接串，无误伤（未知 *_URL 键 fail-closed
+# 归 admin 也是正确姿势）。
+_ENDPOINT_KEY_SUFFIXES = ("_URL", "_URI", "_ENDPOINT", "_PROXY_BASE")
+
+
+def _is_endpoint_redirect_key(env_key: str) -> bool:
+    """出站端点/连接类环境变量键（大小写不敏感后缀匹配）。"""
+    return env_key.upper().endswith(_ENDPOINT_KEY_SUFFIXES)
+
+
+def _caller_is_admin(user) -> bool:
+    """调用者是否 global admin（端点键改写授权判定，单一口径）。"""
+    from swarm.auth.rbac import Role
+    return getattr(user, "global_role", None) == Role.ADMIN.value
+
+
+def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) -> dict[str, str]:
+    """B8-F2 单一 chokepoint：剔除非 admin 提交的出站端点键（fail-closed，铁律#3 降级留痕）。
+
+    对抗复核 CRITICAL：F2 初版只在 update_config 的 /api/config 路径设闸，而
+    PUT /api/model-providers、PUT /api/kb/embed-rerank 走独立的 _persist_env_updates 写同样的
+    *_BASE_URL 键、零 admin 闸 → 全绕过（非 admin owner 提交 api_key=*** 保留真 key + base_url
+    指向攻击者 host = provider key 钓鱼）。治本=把闸集中到本 helper，所有 env 写入路径
+    （update_config 内联写 + _persist_env_updates 共享写）统一过它，杜绝"补一个漏一个"。
+    """
+    if is_admin:
+        return update_map
+    out: dict[str, str] = {}
+    for k, v in update_map.items():
+        if _is_endpoint_redirect_key(k):
+            _app.logger.warning(
+                "config:update 非 admin(%s) 尝试改写出站端点键 %s → 已拒绝（仅 admin 可改）", who, k)
+            continue
+        out[k] = v
+    return out
+
+
 def _is_local_or_private_host(url: str) -> bool:
     """P1-20：判断 URL host 是否 localhost/私网（这些常用自签名证书，可跳过 TLS 校验）。
 
@@ -270,7 +314,10 @@ async def update_config(request: Request):
     - {"config": {"siliconflow_api_key": "...", ...}}
     - {"siliconflow_api_key": "...", ...}
     """
-    _require_perm(request, "config:write")
+    _cfg_user = _require_perm(request, "config:write")
+    # B8-F2：出站端点键改写单独提权到 global admin（config:write 全局 owner 也过）。
+    _cfg_is_admin = _caller_is_admin(_cfg_user)
+    _cfg_who = getattr(_cfg_user, "username", "?")
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
@@ -298,11 +345,20 @@ async def update_config(request: Request):
             continue
         update_map[env_key] = str_val
 
+    # B8-F2：出站端点键仅 admin 可改——集中在 _reject_endpoint_keys（与 _persist_env_updates 共用
+    # 同一 chokepoint），非 admin 提交的端点键剔除。对抗复核 HIGH：拒绝不能伪装成"无变更"，
+    # 显式回 rejected_keys 让调用方知情（不回显敏感值，只列 key 名）。
+    _rejected = [k for k in update_map if _is_endpoint_redirect_key(k)] if not _cfg_is_admin else []
+    update_map = _reject_endpoint_keys(update_map, _cfg_is_admin, _cfg_who)
+
     if not update_map:
-        # 所有值都是脱敏值或未修改 — 不算错误
+        # 无有效变更 — 区分"全被安全闸拒绝"与"全是脱敏值/未改"两种语义。
         cfg = _app.get_config()
         raw = cfg.model_dump()
         masked = _mask_config_dict(raw)
+        if _rejected:
+            return {"status": "rejected", "message": "出站端点键仅 admin 可改，已拒绝",
+                    "rejected_keys": _rejected, "config": masked}
         return {"status": "no_changes", "message": "未检测到有效变更（脱敏值已忽略）", "config": masked}
 
     # ★D47c★：.env 读→改→写→（失败回滚）全程持 env_file_lock——原读改写无锁，
@@ -374,6 +430,7 @@ async def update_config(request: Request):
     return {
         "status": "ok",
         "updated_keys": list(update_map.keys()),
+        "rejected_keys": _rejected,  # B8-F2：被安全闸剔除的出站端点键（非 admin 时），调用方可见
         "config": masked,
     }
 
@@ -512,7 +569,8 @@ async def update_model_providers(request: Request):
     }
     api_key 为脱敏值(***)的 provider 会保留原 key（不覆盖）。
     """
-    _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _mp_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _mp_is_admin = _caller_is_admin(_mp_user)  # B8-F2：出站端点键(base_url)仅 admin 可改
     import json as _json
 
     body = await request.json()
@@ -590,7 +648,7 @@ async def update_model_providers(request: Request):
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：持锁文件 IO + reload 卸线程
-    await asyncio.to_thread(_persist_env_updates, update_map)
+    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_mp_is_admin)
     try:
         from swarm.config import secret_store
         secret_store.invalidate_cache()
@@ -623,13 +681,21 @@ def _env_quote(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _persist_env_updates(update_map: dict[str, str]) -> None:
+def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool) -> None:
     """写 .env + 同步 os.environ + reload_config（供 model-providers/notify/kb 端点复用）。
 
     D3：reload 被生产安全门禁拒绝(RuntimeError)→ 原子回滚 .env + os.environ（原直接 reload
     无回滚，失败留脏 .env 致重启 fail-fast、脏 os.environ 致后续 reload 全失败）。
     #28：写值经 _env_quote——复杂 JSON 值单引号包裹，防 `source .env` 报 127（restart-api 起不来）。
+
+    B8-F2（对抗复核 CRITICAL 治本）：is_admin 为【必填】关键字——本函数是所有 provider/kb/notify
+    端点写 .env 的单一 chokepoint，出站端点键的 admin 闸集中在此做 backstop（即便某 caller 忘了
+    在端点层过滤，写入口也会 fail-closed 剔除）。必填参数强制每个（含未来新增）caller 显式表态调用者
+    是否 admin，杜绝"补一个端点漏一个端点"的绕过。
     """
+    update_map = _reject_endpoint_keys(update_map, is_admin, "persist_env")
+    if not update_map:
+        return
     env_path = _app._PROJECT_ROOT / ".env"
     # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与其它写者并发丢键）。
     with env_file_lock(env_path):
@@ -711,7 +777,8 @@ async def update_kb_embed_rerank(request: Request):
     api_key 为 *** 或省略 → 保留原 key（不覆盖）。
     返回 dim_changed 提示：embed 维度可能变化时（模型变了）提醒重新预处理。
     """
-    _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _kb_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _kb_is_admin = _caller_is_admin(_kb_user)  # B8-F2：出站端点键(embed/rerank url)仅 admin 可改
     from swarm.config import secret_store
     from swarm.config.settings import KnowledgeConfig
     from swarm.knowledge.embed_rerank_config import SECRET_EMBED_KEY, SECRET_RERANK_KEY
@@ -806,7 +873,7 @@ async def update_kb_embed_rerank(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
 
-    await asyncio.to_thread(_persist_env_updates, update_map)  # D48：卸线程
+    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin)  # D48：卸线程
     try:
         secret_store.invalidate_cache()
     except Exception:  # noqa: BLE001
@@ -862,7 +929,8 @@ async def update_notify_channels(request: Request):
     Body: {"channels": [{id,type,label,webhook_url,enabled,events,user_id}, ...]}
     webhook_url 为脱敏值(含 …)或空 → 保留原 url（不覆盖）。
     """
-    _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _nc_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _nc_is_admin = _caller_is_admin(_nc_user)  # B8-F2：SWARM_NOTIFY_CHANNELS 非端点键，闸对其 no-op
     import json as _json
     body = await request.json()
     if not isinstance(body, dict) or not isinstance(body.get("channels"), list):
@@ -900,7 +968,7 @@ async def update_notify_channels(request: Request):
     # 写 .env + os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：卸线程
     val = _json.dumps(clean, ensure_ascii=False)
-    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val})
+    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin)
     _app.logger.info("Updated notify channels: %d 个", len(clean))
     return {"status": "ok", "count": len(clean)}
 

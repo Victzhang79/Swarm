@@ -55,7 +55,7 @@ def test_status_kb_component_reports_qdrant_down(monkeypatch):
     fake.TextEmbedding = object
     monkeypatch.setitem(sys.modules, "fastembed", fake)
 
-    status = asyncio.run(app_mod._check_component("知识库"))
+    status = asyncio.run(app_mod._check_component("知识库", is_admin=True))
     assert "qdrant unreachable" in status["detail"], status
     assert status["status"] == "degraded", (
         f"Qdrant 全挂 + embedding 可用应报 degraded，实际 {status['status']}"
@@ -94,5 +94,5 @@ def test_status_kb_component_running_when_qdrant_up(monkeypatch):
     fake.TextEmbedding = object
     monkeypatch.setitem(sys.modules, "fastembed", fake)
 
-    status = asyncio.run(app_mod._check_component("知识库"))
+    status = asyncio.run(app_mod._check_component("知识库", is_admin=True))
     assert status["status"] == "running", status

@@ -103,7 +103,17 @@ def _extract_token_ws(websocket) -> str:
     if not provided:
         provided = websocket.cookies.get("swarm_token") or ""
     if not provided:
-        provided = websocket.query_params.get("token") or ""
+        # B8-F3：?token= 是弃用的最弱兜底（仅无 header/cookie 的程序化 WS 客户端）。握手 URL
+        # 会连 token 一起落 access/proxy 日志/历史，与 HTTP/SSE 已弃 ?token= 的口径倒退。保留兜底
+        # 避免打断非浏览器客户端，但改用即打 deprecation WARNING（铁律#3 降级留痕）——从静默接受
+        # 升级为可观测，给迁移到 header/cookie 施压。
+        q_token = websocket.query_params.get("token") or ""
+        if q_token:
+            logger.warning(
+                "WS 鉴权走弃用的 ?token= URL 参数（凭据会落日志）——请改用 "
+                "x-swarm-token header 或同源 HttpOnly Cookie",
+            )
+        provided = q_token
     return provided.strip()
 
 

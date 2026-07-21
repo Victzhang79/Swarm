@@ -54,7 +54,7 @@ def test_status_remote_qdrant_down_stale_local_dir_not_green(monkeypatch):
     fake.TextEmbedding = object
     monkeypatch.setitem(sys.modules, "fastembed", fake)
 
-    status = asyncio.run(app_mod._check_component("知识库"))
+    status = asyncio.run(app_mod._check_component("知识库", is_admin=True))
     assert "qdrant unreachable" in status["detail"], status
     assert status["status"] == "degraded", (
         f"远端 Qdrant 挂 + 陈旧本地目录必须不健康（与 /ready 对齐），实际 {status['status']}"
@@ -91,7 +91,7 @@ def test_status_standalone_qdrant_component_no_false_green(monkeypatch):
     monkeypatch.setattr(os.path, "exists",
                         lambda p: True if "qdrant" in str(p) else real_exists(p))
 
-    status = asyncio.run(app_mod._check_component("Qdrant"))
+    status = asyncio.run(app_mod._check_component("Qdrant", is_admin=True))
     assert status["status"] != "running" and status["status"] != "ready", status
     assert "unreachable" in status["detail"], status
 

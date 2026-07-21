@@ -190,10 +190,31 @@ def _flatten_model_config(cfg: AppConfig) -> dict[str, Any]:
 
 # ─── 鉴权 ─────────────────────────────────────────
 
+# B8-F4：must_change_password 用户放行白名单（改密/登出/自查）——单一认证入口 _require_user 强制
+# 423 时，这些路径必须可达，否则未改密 admin 无法完成改密即被永久锁死（死锁）。login 是公开端点
+# （无需认证），无需列入。
+_MUST_CHANGE_PW_WHITELIST = frozenset({
+    "/api/auth/change-password",
+    "/api/auth/logout",
+    "/api/auth/me",
+})
+
+
 def _require_user(request: Request):
     from swarm.api.deps import get_current_user
 
-    return get_current_user(request)
+    user = get_current_user(request)
+    # B8-F4：把 must_change_password 的 423 硬闸上提到单一认证入口——原先仅 _require_perm 内有此闸，
+    # 仅走 _require_user 的只读端点（GET /api/config、/api/models、/api/routing、/api/skills、
+    # /api/observability/*）对未改密 admin 仍可达，两 helper 强制口径不对称=可利用的语义缺口。
+    # 此处按【请求路径】白名单放行改密/登出/自查，其余一律 423；_require_perm 内的同名检查保留做纵深。
+    if getattr(user, "must_change_password", False):
+        if request.url.path not in _MUST_CHANGE_PW_WHITELIST:
+            raise HTTPException(
+                status_code=423,
+                detail="Password change required before proceeding",
+            )
+    return user
 
 def _require_perm(request: Request, permission: str, project_id: str | None = None):
     from swarm.auth.store import user_can_on_project
@@ -202,6 +223,9 @@ def _require_perm(request: Request, permission: str, project_id: str | None = No
     # H6: 默认弱密码硬门槛 —— must_change_password=True 时只放行 auth/password 相关权限，
     # 其余操作一律 423 Locked，防止未改密用户越权操作。
     # 改密码端点(auth_change_password)使用 _require_user 而非 _require_perm，不会死锁。
+    # B8-F4（对抗复核 LOW）：主闸已上移到 _require_user 的【路径白名单】——本 perm-prefix 分支现为
+    # 纵深备份（当前无 auth:/password: 前缀权限的调用点，故基本不触发）。两处口径：_require_user 按
+    # 请求路径（权威、先行），此处按权限前缀（备份）。新增改密类端点应走白名单路径，勿依赖本分支。
     if getattr(user, "must_change_password", False):
         perm_prefix = permission.split(":")[0]
         if perm_prefix not in ("auth", "password"):
