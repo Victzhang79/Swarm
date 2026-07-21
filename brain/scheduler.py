@@ -247,12 +247,20 @@ def _project_exec_admission(project_id: str) -> str:
     旧口径 ERROR 项目与 BUILDING 同判"留池"，200 次×3s 重试后【强制放行】——预处理
     已明确失败的项目根本没有可用沙箱/索引，放行=注定失败的执行白烧 10 分钟等待+一整轮
     worker。ERROR → 直接 fail-fast（调用侧标任务 FAILED，可 retry 等项目修复后重跑）。
-    读项目失败/记录缺失保守 "ready"（原语义：DB 抖动不卡死队列，executor 兜底）。"""
+    读项目【异常】保守 "ready"（DB 抖动不卡死队列，executor 兜底）；记录【确实缺失】(读到 None)→
+    "error" fail-fast（#76 DR-02-F3：项目已删/丢失，放行=注定失败白烧；create_task 已硬校验项目
+    存在、无延迟创建窗口，故记录缺失非合法窗口）。两者是 try 内 None 判定 vs except 两条独立路径。"""
     try:
         from swarm.project.store import get_project
         proj = get_project(project_id)
         if not proj:
-            return "ready"  # 项目记录缺失，保守放行交由 runner 处理
+            # #76 DR-02-F3 治本：成功读到但【记录确实缺失】(None)→ fail-fast，不放行注定失败的执行
+            # （无沙箱模板/无索引，worker 空烧一整轮 + 占 max_concurrent 槽位数分钟）。黄灯坐实：
+            # create_task(api/routers/task.py) 已硬校验 get_project 存在、无延迟创建窗口，故记录缺失
+            # =项目被删/丢失，fail-fast 安全（调用侧标 FAILED 可 retry）。【读异常】仍保守 ready（下方
+            # except，DB 抖动不卡队列）——只收紧"确实读到 None"这一条，不动读异常路径。
+            logger.warning("[Scheduler] 准入检查：项目记录缺失(已删/丢失) %s → fail-fast", project_id)
+            return "error"
         status = (proj.get("status") or "").upper()
         if status == "READY":
             return "ready"
@@ -311,6 +319,12 @@ async def start_task_scheduler() -> None:
                         meta = await asyncio.to_thread(_resolve_exec_meta, task_id)
                         if meta is None:
                             logger.info("[Scheduler] 任务 %s 无有效记录或已终态，丢弃陈旧队列项", task_id)
+                            # #75 DR-02-F2 治本：留池任务被取消/终态化后出队走此分支——必须同步清账，
+                            # 否则 _admission_retries/_admission_next_retry/_deferred_cycle 三 dict 永久
+                            # 残留（task_id 不再入队、派发成功清账 385-387 不可达）→ 长跑单进程慢内存泄漏。
+                            _admission_retries.pop(task_id, None)
+                            _admission_next_retry.pop(task_id, None)
+                            _deferred_cycle.discard(task_id)
                             continue
                         # D58：留池任务未到 next-retry → 直接回队尾（不做就绪检查、不计重试、
                         # 不 sleep），后队的就绪任务照常流动（去队头阻塞）。

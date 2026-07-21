@@ -613,7 +613,10 @@ def _subtask_produced_expected(worker_output, subtask) -> bool:
         # AUDIT 不产 diff；空 diff 是预期形态，有效性交由 l1_passed（should_block 反转）判定
         return True
     scope = getattr(subtask, "scope", None)
-    diff = getattr(worker_output, "diff", None) or ""
+    # #74 复核整改：worker_output 可能是 WorkerOutput 或【dict】（checkpoint 反序列化形态）——两者都取 diff，
+    # 否则 dict 结果 getattr 恒 None → 普通子任务被误判"未产出"。
+    diff = (getattr(worker_output, "diff", None)
+            or (worker_output.get("diff") if isinstance(worker_output, dict) else None) or "")
     if _is_pure_delete_scope(scope):
         # 纯删除：删除段即有效产出；若同时含新增行（罕见）也算有产出
         return _diff_has_deletions(diff) or _diff_has_changes(diff)

@@ -161,7 +161,10 @@ def test_e12_admission_tristate():
     assert _with_status("BUILDING") == "wait"
     assert _with_status("ERROR") == "error", (
         "ERROR=预处理已明确失败——留池 200 次×3s 后强制放行=注定失败的执行白烧")
-    assert _with_status(None) == "ready", "记录缺失保守放行（原语义）"
+    # #76 DR-02-F3 治本：记录【确实缺失】(get_project 读到 None) → fail-fast（无沙箱/索引，放行=
+    # 注定失败白烧一整轮 worker + 占槽位）。黄灯坐实 create_task 已硬校验项目存在、无延迟创建窗口。
+    # 注：读【异常】仍保守 ready（DB 抖动不卡队列，走 except 分支，另见 test_b2_orchestration_fixes）。
+    assert _with_status(None) == "error", "记录确实缺失→fail-fast（#76：不放行注定失败的执行）"
 
 
 # ─────────────── E13：挂起态 TTL 提醒 ───────────────

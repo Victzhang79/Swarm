@@ -377,6 +377,12 @@ def _is_missing_dependency_failure(subtask_results: dict, failed_ids: list) -> b
         det = _det_of(subtask_results.get(fid))
         if isinstance(det, dict) and det.get("pipeline_blocked") in _INTERNAL_BLOCKED_KINDS:
             continue  # 内部/上游未就绪 → 不该触发 A2 maven 补依赖
+        # #78 DR-02-F5 治本：对抗复核打回的失败 l1_details 带 adversarial_critique 键——复核 Java
+        # 代码时评语自然含"找不到符号/程序包不存在"字面，会被 _MISSING_DEP_PATTERNS 误命中 → 错走
+        # A2 补 pom/注无关 maven 坐标 + 空烧 targeted_recovery 配额，而非按评语修质量缺陷。带此键=
+        # 质量打回非缺依赖，直接跳过（正常缺依赖失败无此键，不受影响）。
+        if isinstance(det, dict) and det.get("adversarial_critique"):
+            continue
         try:
             blob = json.dumps(det, ensure_ascii=False).lower()
         except (TypeError, ValueError):

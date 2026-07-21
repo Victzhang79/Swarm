@@ -475,6 +475,11 @@ async def adversarial_verify(state: BrainState) -> dict:
                            # 复用既有失败通道（dispatch 置 l1_details["error"]），令 handle_failure
                            # 的 retry_guidance 构造能看见评语，worker 重试不重蹈同类幻觉。
                            "error": critique_text},
+            # ★#78 不变量（recovery._is_missing_dependency_failure 依赖）★：adversarial_critique 键
+            # 只挂在【L1 已通过（编译过）】的子任务上（本节点只复核 l1_passed=True 者，见候选闸），故此
+            # l1_details 绝不【独立携带】编译级缺依赖证据（cannot find symbol/程序包不存在）。recovery.py
+            # 据此 skip 掉带此键的失败、不误路由进 Maven 补依赖臂。若未来改动本合并逻辑或候选闸，令带此
+            # 键的 det 可能同时含真编译缺依赖证据 → 必须回头修 recovery._is_missing_dependency_failure。
         })
     failed = list(state.get("failed_subtask_ids") or [])
     for sid in naughty:

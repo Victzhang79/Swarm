@@ -699,6 +699,19 @@ async def dispatch(state: BrainState) -> dict:
         _roll_factor = 3
     _roll_budget = max_concurrent * max(0, _roll_factor)
     _base_done = len(completed_l1_ids(subtask_results))
+    # #77 DR-02-F4 治本：进度单调水位。L2/契约/runtime 定向恢复会 pop 已完成子任务重跑，令本轮重算的
+    # _base_done 比上轮小 → 直接回写让 DB completed_subtasks 倒退（前端进度条抖动 / 把 completed 当
+    # 单调递增的卡住告警误报）。回写取 max(既有持久水位, 本轮实算)——真实重跑不污染完成计数展示。
+    _progress_floor = _base_done
+    if task_id:
+        try:
+            from swarm.project import store as _store
+            _rec = await asyncio.to_thread(_store.get_task, task_id)
+            _progress_floor = max(_base_done, int((_rec or {}).get("completed_subtasks") or 0))
+        except Exception as _pf_exc:  # noqa: BLE001 — 读水位是增益，失败退化为本轮实算，绝不阻断派发
+            # 复核整改（CONFIRMED）：留痕——否则 DB 抖动期水位读失败静默退化回本轮实算，
+            # 若本轮<持久值仍会倒退（#77 本要治的 bug），且无痕不可诊断（违 CLAUDE.md 降级留痕铁律）。
+            logger.debug("[DISPATCH] #77 进度水位读取失败，退化为本轮实算 task=%s: %s", task_id, _pf_exc)
     _spawned_ids = {st.id for st in to_dispatch}
     _next_idx = len(to_dispatch)
     _rolling_completed = set(completed_ids)
@@ -724,9 +737,9 @@ async def dispatch(state: BrainState) -> dict:
                             from swarm.project import store as _store
                             await asyncio.to_thread(
                                 _store.update_task, task_id,
-                                completed_subtasks=_base_done)
-                        except Exception:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
-                            pass
+                                completed_subtasks=max(_progress_floor, _base_done))  # #77 单调
+                        except Exception as _wr_exc:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
+                            logger.debug("[DISPATCH] #77 进度回写失败 task=%s: %s", task_id, _wr_exc)
                 else:
                     # R65REPLAY-T5（回放末段 26min 并发≈1）：seed 闸【预检】秒退
                     # 不冻结补位——一票冻结让批内全秒退+一个 900s 长尾时机群烧成单

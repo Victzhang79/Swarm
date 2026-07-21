@@ -20,13 +20,15 @@ from swarm.brain.prompts import (
 )
 from swarm.brain.nodes.shared import (
     _diff_has_changes,
+    _diff_has_deletions,
     _l2_test_command_from_criteria,
     _parse_json_from_llm,
+    _subtask_produced_expected,
     attribute_l2_failure,
 )
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
-from swarm.types import Complexity, WorkerOutput
+from swarm.types import Complexity, TaskIntent, WorkerOutput
 
 logger = logging.getLogger(__name__)
 
@@ -110,14 +112,34 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
     if complexity == Complexity.SIMPLE:
         merged = (merged_diff or "").strip()
-        l2_passed = _diff_has_changes(merged)
+        # #74 DR-02-F1 治本：SIMPLE L2 判据与 dispatch D01（_subtask_produced_expected）同口径——
+        # 纯删除 diff（只有 - 行 + +++ /dev/null）与全 AUDIT 计划（结构化审计、空 diff 合法）都是
+        # 合法产出形态。旧判据只认 _diff_has_changes（+ 行）→ 纯删除/AUDIT SIMPLE 任务结构性假失败
+        # → _l2_failure_state → replan 循环 → escalate（FAILED/PARTIAL）。单一事实源=产出形态是否
+        # 符合 intent/scope 预期，非"有无 + 行"。l1_passed 的 and 兜底仍在（AUDIT 有效性由它表达）。
+        _all_audit = bool(plan_obj and getattr(plan_obj, "subtasks", None)
+                          and all(getattr(t, "intent", None) == TaskIntent.AUDIT
+                                  for t in plan_obj.subtasks))
+        l2_passed = _diff_has_changes(merged) or _diff_has_deletions(merged) or _all_audit
         if subtask_results:
-            l2_passed = l2_passed and all(
-                (isinstance(o, WorkerOutput) and o.l1_passed)
-                # #5：dict 结果缺 l1_passed 时保守判 False（默认 True 会把"未验证"当通过）。
-                or (isinstance(o, dict) and o.get("l1_passed", False))
-                for o in subtask_results.values()
-            )
+            # #74 复核整改（对抗双复核 CONFIRMED）：真正与 D01 同口径=【每个子任务】独立满足
+            # _subtask_produced_expected（按其 intent/scope 判产出形态），不只全局 merged diff 形状。
+            # 否则多子任务 SIMPLE 计划里一个 MODIFY 子任务静默空产出（empty diff, l1_passed=True）＋一个
+            # 纯删除兄弟贡献 - 行 → merged 只有删除段 → _diff_has_deletions 误判 l2_passed=True（空产出
+            # 假 DONE 换马甲）。_diff_has_deletions 是 scope-blind 的全局嗅探，必须叠加逐子任务 produced
+            # _expected 兜底。按 sid 取 subtask 逐个核（dict/WorkerOutput 均支持，见 shared 整改）。
+            _by_id = {t.id: t for t in (getattr(plan_obj, "subtasks", None) or [])}
+
+            def _ok(sid, o) -> bool:
+                _lp = ((isinstance(o, WorkerOutput) and o.l1_passed)
+                       # #5：dict 结果缺 l1_passed 时保守判 False（默认 True 会把"未验证"当通过）。
+                       or (isinstance(o, dict) and o.get("l1_passed", False)))
+                if not _lp:
+                    return False
+                _st = _by_id.get(sid)
+                return True if _st is None else _subtask_produced_expected(o, _st)
+
+            l2_passed = l2_passed and all(_ok(sid, o) for sid, o in subtask_results.items())
         logger.info("[VERIFY_L2] SIMPLE 快速路径 — diff+L1 检查: %s", "通过" if l2_passed else "未通过")
         if not l2_passed:
             return _l2_failure_state(subtask_results)
