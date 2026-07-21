@@ -184,6 +184,10 @@ def hydrate_event_changes(event: UpdateEvent) -> UpdateEvent:
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            # ★DR-08-F5(#83) 复核整改★：读文件失败绝不【drop】该 change（旧 continue 使它永不到
+            # _process_change→事件仍标 done→静默丢索引）。保留为 content=None 让它流入 #83 安全网
+            # （_process_change raise→errors→failed→D39 有界重试），使"读失败"如实进重试而非蒸发。
+            hydrated.append(replace(change, content=None))
             continue
         lang = change.language or _language_from_path(change.file_path)
         hydrated.append(replace(change, content=content, language=lang))
@@ -382,13 +386,26 @@ class KnowledgeUpdater:
                     await self._struct.delete_file(project_id, change.old_path)
                 if self._semantic:
                     await self._semantic.delete_by_file(project_id, change.old_path)
-            # 索引新
+            # 索引新（复核 sibling 整改：RENAMED 同 ADDED/MODIFIED——content=None 删旧后不索引新
+            # 会永久丢该文件，必须同口径 raise 进重试，绝不静默 no-op）
             if change.content:
                 await self._index_file(project_id, change)
+            elif change.content is None:
+                raise RuntimeError(
+                    f"RENAMED content 未取到(None)无法索引新路径 {change.file_path}——标 failed 待重试")
 
         else:  # ADDED / MODIFIED
             if change.content:
                 await self._index_file(project_id, change)
+            elif change.content is None:
+                # DR-08-F5(#83)：content 为 None = hydrate 未取到内容（顶层 project_path 解析不出→
+                # 返回未 hydrate 的原事件，content 仍 None；注意 hydrate 内【单文件读失败】走
+                # `except OSError: continue` 直接丢弃该 FileChange，不会以 None 到此）。≠ 真空文件
+                # （content==""）。旧 `if content:` 对 None 静默 no-op → 事件仍标 done → Layer A/B
+                # 永久丢该文件且不可观测。raise → handle_event 计入 result["errors"] →
+                # process_pending_events 标 failed（进 D39 有界重试）。真空文件(content=="")合法 no-op。
+                raise RuntimeError(
+                    f"content 未取到(None，非真空文件)无法索引 {change.file_path}——标 failed 待重试")
 
     async def _index_file(
         self, project_id: str, change: FileChange

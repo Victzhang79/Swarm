@@ -1,16 +1,10 @@
-"""L5 错题集 / L6 成功模式 衰减机制 — 指数衰减，每日调用
+"""L5 错题集 / L6 成功模式 衰减机制
 
-衰减策略:
-- L5 错题集: 每日调用 decay_l5_batch_sql() 执行指数衰减
-  - decay_weight *= decay_factor (默认 0.9)
-  - 多次出现的错题衰减更慢: effective_factor = decay_factor ^ (1 / occurrence_count)
-  - decay_weight 低于 threshold 时删除
-  - 重复遇到的错题会重振权重(increment_mistake_occurrence)
-
-- L6 成功模式集: 每日调用 decay_l6_batch_sql() 执行指数衰减(比 L5 更温和)
-  - decay_weight *= l6_decay_factor (默认 0.95，比 L5 的 0.9 慢)
-  - 高复用次数的衰减更慢: effective_factor = l6_decay_factor ^ (1 / (reuse_count + 1))
-  - decay_weight 低于 threshold 时删除
+★DR-08-F6(#84) 更正★：WS1 起衰减已迁到【query 读时现算】——effective_weight 在读取时按
+last_seen_at 年龄计算（见 store._effective_weight_sql_l5/l6），base 列 decay_weight 不再被后台
+乘减。`decay_l5_batch_sql`/`decay_l6_batch_sql` 是【已废弃的死路径】，误调会与读时衰减叠加成双重
+衰减（错题过早被 purge_expired 删）→ 已改为 raise NotImplementedError。后台维护【唯一入口=
+purge_expired】（start_daily_decay 也只调 purge_expired）。
 """
 
 from __future__ import annotations
@@ -34,12 +28,11 @@ logger = logging.getLogger(__name__)
 class MemoryDecay:
     """L5/L6 衰减管理器
 
-    使用方式:
+    使用方式（★衰减读时现算，后台只 purge★）:
         decay = MemoryDecay(memory_store)
         await decay.connect()
-        await decay.decay_l5_batch_sql()         # 执行一次 L5 衰减
-        await decay.decay_l6_batch_sql()         # 执行一次 L6 衰减
-        await decay.start_daily_decay()          # 启动每日自动衰减(L5+L6)
+        await decay.start_daily_decay()          # 唯一后台维护：周期 purge_expired
+        # decay_l5_batch_sql/decay_l6_batch_sql 已废弃（#84）：会双重衰减 → raise
     """
 
     def __init__(
@@ -85,11 +78,13 @@ class MemoryDecay:
     # ── L5 错题集衰减 ──────────────────────────
 
     async def decay_l5_batch_sql(self) -> dict[str, Any]:
-        """使用 SQL 批量衰减 L5(高效，直接在 DB 层执行)
-
-        对全表执行: UPDATE mem_mistakes SET decay_weight = decay_weight * decay_factor
-        WHERE decay_weight > 0; 然后删除低于阈值的记录。
-        """
+        """★DR-08-F6(#84) 已废弃·禁止调用★：WS1 起衰减迁到【query 读时现算】(effective_weight
+        按 last_seen_at 年龄)，base(decay_weight)不再后台乘减。本方法的 `decay_weight *= factor`
+        UPDATE 会与读时衰减【叠加=双重衰减】，使错题过早跌破阈值被 purge_expired 提前删除。
+        后台维护唯一入口=purge_expired。误调即 fail-loud，绝不静默双衰减。"""
+        raise NotImplementedError(
+            "decay_l5_batch_sql 已废弃（WS1 read-time 衰减）——base 乘减会与读时 effective_weight "
+            "叠加成双重衰减。后台维护请用 purge_expired。")
         conn = self._store._conn_or_raise()
         stats: dict[str, Any] = {
             "total_processed": 0,
@@ -146,8 +141,12 @@ class MemoryDecay:
     async def decay_l6_batch_sql(self) -> dict[str, Any]:
         """使用 SQL 批量衰减 L6 成功模式(高效，直接在 DB 层执行)
 
-        衰减公式: decay_weight = decay_weight * l6_decay_factor ^ (1 / (reuse_count + 1))
+        ★DR-08-F6(#84) 已废弃·禁止调用★：同 decay_l5_batch_sql——WS1 read-time 衰减后 base 乘减=
+        双重衰减，后台维护唯一入口 purge_expired。误调 fail-loud。
         """
+        raise NotImplementedError(
+            "decay_l6_batch_sql 已废弃（WS1 read-time 衰减）——base 乘减会与读时 effective_weight "
+            "叠加成双重衰减。后台维护请用 purge_expired。")
         conn = self._store._conn_or_raise()
         stats: dict[str, Any] = {
             "total_processed": 0,

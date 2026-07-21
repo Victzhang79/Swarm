@@ -43,6 +43,8 @@ import threading  # noqa: E402
 
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
 _CANCEL_EVENTS_LOCK = threading.Lock()
+# DR-08-F4(#82)：扫描期行数统计的文件大小上限——超此不精确计行（防单行超大文本文件 OOM）。
+_SCAN_MAX_TEXT_BYTES = 50 * 1024 * 1024
 
 
 def _register_cancel_event(project_id: str) -> threading.Event:
@@ -318,8 +320,15 @@ def _scan_sync(project_path: str) -> dict[str, Any]:
                 if ext not in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico",
                                ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4",
                                ".zip", ".tar", ".gz", ".db", ".sqlite"}:
-                    with open(abs_file, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = sum(1 for _ in f)
+                    # DR-08-F4(#82)：无 size 守卫 + `sum(1 for _ in f)` 逐行迭代——一个无换行符的
+                    # 超大文本文件（压缩 json/生成 sql dump/minified）会被当【单行】整文件读进内存 OOM。
+                    # ①超 50MB 直接跳过精确计行（不参与，避免拖垮扫描）；②其余按 1MB 块 count(\n)，
+                    # 永不把单行整读进内存（字节级，编码无关）。
+                    _sz = abs_file.stat().st_size
+                    if _sz <= _SCAN_MAX_TEXT_BYTES:
+                        with open(abs_file, "rb") as f:
+                            for _chunk in iter(lambda: f.read(1 << 20), b""):
+                                lines += _chunk.count(b"\n")
             except (OSError, PermissionError):
                 pass
             line_counts[language] = line_counts.get(language, 0) + lines
@@ -988,7 +997,12 @@ def _save_file_index(project_id: str, files: list[dict[str, Any]]) -> None:
                     rows,
                 )
     except Exception as exc:
-        logger.warning("Failed to save file index: %s", exc)
+        # ★DR-08-F1(#79) CONFIRMED HIGH 整改★：file_index 是【最关键持久化】——写失败=索引空表却
+        # 仍走 READY（preprocess_project 无条件标 READY）→ Layer A/B 检索恒空，Brain 却被告知"就绪"，
+        # 在残缺上下文上规划。此处不再吞异常，raise 让其冒泡到 preprocess_project except→status=ERROR
+        # （与 Qdrant 写失败上抛置 ERROR 对称）。0 文件项目在函数首行 early-return 不触此路，无误伤。
+        logger.error("[preprocess] kb_file_index 持久化失败（fail-loud，项目将标 ERROR 非 READY）: %s", exc)
+        raise
 
 
 def _save_symbol_index(project_id: str, symbols: list) -> None:

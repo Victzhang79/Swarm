@@ -49,12 +49,17 @@ def assess_knowledge_readiness(
 
     # R65B-T2 猎手(c)：源码语义嵌入中止也算 partial——否则"签名层成功+源码层死了"
     # 仍报 ready，Brain 在退化语义层上检索却以为正常（正是本机制要治的召回塌陷复发面）。
-    partial = bool(index.get("skipped") or embed.get("skipped")
-                   or embed.get("source_aborted"))
+    # DR-08-F3(#81)：codegraph 失败时 _phase_index 写 index_stats={"ok": False, ...}（无 skipped 键）
+    # 并置 graph_status=DEGRADED，但 preprocess 仍标 READY。旧 partial 只看 skipped → 把"结构索引降级
+    # /0 符号"当 ready，Brain 在 Layer A 恒空的项目上被告知"知识就绪"。补 `ok is False` 检测。
+    partial = bool(index.get("skipped") or (index.get("ok") is False)
+                   or embed.get("skipped") or embed.get("source_aborted"))
     if partial:
         parts: list[str] = []
         if index.get("skipped"):
             parts.append("结构索引(Layer A)已跳过")
+        if index.get("ok") is False:
+            parts.append("结构索引降级(codegraph 失败，符号检索受限)")
         if embed.get("skipped"):
             parts.append("向量嵌入(Layer B)已跳过")
         if embed.get("source_aborted"):

@@ -295,6 +295,12 @@ async def analyze(state: BrainState) -> dict:
                 "[ANALYZE] ⚠️ 知识检索崩溃(非'无知识')，Brain 将在零知识上下文上规划: %s",
                 stats.get("error") or "retrieval_failed",
             )
+        # DR-08-F2(#80) 复核整改：retrieval_partial（部分知识层降级）此前无消费者=死字段。此处消费
+        # 成 WARNING——单层 DB 故障时明示"这些层不可用(0 命中≠真无知识)"，Brain 不把残缺上下文当完整。
+        elif stats.get("retrieval_partial"):
+            logger.warning(
+                "[ANALYZE] ⚠️ 知识检索部分降级：层 %s 不可用（其 0 命中≠该项目真无相关知识，"
+                "Brain 勿当完整上下文）", stats.get("retrieval_partial"))
         logger.info(
             "[ANALYZE] 知识检索完成: struct=%s semantic=%s norms=%s "
             "summary=%s mistakes=%s successes=%s",

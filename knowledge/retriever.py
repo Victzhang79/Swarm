@@ -267,6 +267,13 @@ class SwarmRetriever:
             stats.get("successes_count", 0),
         )
 
+        # DR-08-F2(#80)：各层各自吞异常只写 `<层>_error` 进 stats，但整体正常返回、无顶层降级信号
+        # → Brain 把"索引层挂了(0 命中)"当成"该项目无相关知识"，在残缺上下文上规划却自认完整。
+        # 末尾聚合出可观测降级 retrieval_partial（层名列表），与 retrieval_degraded 同级供 consumer
+        # 明示"部分知识层不可用"，杜绝"失败静默 vs 真无知识"不可分。
+        _partial = sorted(k[:-6] for k in stats if k.endswith("_error"))
+        if _partial:
+            stats["retrieval_partial"] = _partial
         return SwarmRetrieverResult(context=context, stats=stats)
 
     async def _load_project_meta(self, project_id: str) -> dict[str, Any]:
