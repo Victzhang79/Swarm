@@ -25,6 +25,7 @@ from swarm.brain.nodes.shared import (
     _parse_json_from_llm,
     _subtask_produced_expected,
     attribute_l2_failure,
+    parse_marker_rc,
 )
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
@@ -372,6 +373,11 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             if not local_result:
                 return {**_l2_failure_state(subtask_results), **_fp_reset}
             return {"l2_passed": local_result, **_fp_reset}
+        # B3-F8：有 test_cmd 但沙箱 infra + 本地工具链【双 None】（确定性功能测试均未跑成）→
+        # 下方跌落 _verify_l2_via_llm 纯 LLM 判定。旧行为无任何 degraded 留痕（除非 project_path
+        # 为 None），"真测试从未执行却 l2_passed=True"对 gates/人工/L6 完全不可观测。补一条降级，
+        # 与 l2_no_test_executed 同款经由下方 `if _l2_unverified_degraded` return 携出（reducer 去重）。
+        _l2_unverified_degraded = list(_l2_unverified_degraded) + ["l2_test_downgraded_to_llm"]
     elif (merged_diff or "").strip() and not test_cmd.strip():
         # 任务未要求测试（criteria 无显式测试命令）→ 跳过功能测试验证。
         # integration_review（编译+契约+git apply 同源）已作为确定性证据通过，故【放行】
@@ -384,7 +390,12 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             "[VERIFY_L2] 无显式测试命令，integration_review 已通过 → L2 放行"
             "（未跑功能测试，标记 degraded: l2_no_test_executed）"
         )
-        return {"l2_passed": True, "degraded_reasons": ["l2_no_test_executed"], **_fp_reset}
+        # B3-F2：project_path 不可得时 integration_review 整块被跳过（其前提"已通过"不成立），
+        # _l2_unverified_degraded 携 l2_compile_unverified——必须并入本 return，否则"既没编译核验
+        # 也没测试"被静默压成单条 l2_no_test_executed，下游无法与"编译过但没测"区分。
+        return {"l2_passed": True,
+                "degraded_reasons": ["l2_no_test_executed", *_l2_unverified_degraded],
+                **_fp_reset}
 
     l2_passed = await nodes._verify_l2_via_llm(
         task_description,
@@ -395,7 +406,13 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
     logger.info(f"[VERIFY_L2] 结果: {'通过' if l2_passed else '未通过'}")
     if not l2_passed:
-        return {**_l2_failure_state(subtask_results), **_fp_reset}
+        # 复核 CONFIRMED HIGH（DR-03-F8 整改）：LLM 兜底判【失败】时同样必须携 _l2_unverified_degraded
+        # ——否则"L2 降级为纯 LLM 判定/编译未核验"这条留痕只在成功分支携出，失败分支被
+        # _l2_failure_state（不含 degraded_reasons）吞掉，handle_failure/人工/L6 无法区分"确定性测试
+        # 判失败"与"纯 LLM 猜失败(零测试执行)"，污染失败归因与重试预算判读。
+        return {**_l2_failure_state(subtask_results), **_fp_reset,
+                **({"degraded_reasons": _l2_unverified_degraded}
+                   if _l2_unverified_degraded else {})}
     # D6：纯 LLM 放行 + 确定性审查被跳过 → degraded 留痕（reducer 追加去重）
     if _l2_unverified_degraded:
         return {"l2_passed": l2_passed, "degraded_reasons": _l2_unverified_degraded,
@@ -924,10 +941,12 @@ def _acquire_smoke_sandbox(
             )
             out = ((getattr(result, "stdout", "") or "")
                    + (getattr(result, "stderr", "") or ""))
-            if "__RC__0" not in out:
+            # B3-F6：末尾锚点取退出码（构建日志含字面 `__RC__0` 不再假绿）。marker 缺失=infra 中断。
+            _rebuild_rc = parse_marker_rc(out, "__RC__")
+            if _rebuild_rc != 0:
                 # L2 已证编译通过 → 此处失败/未执行(标记缺失)是环境问题 → skipped 非 failed
                 details["rebuild_output"] = out[-1500:]
-                details["rebuild_ran"] = "__RC__" in out
+                details["rebuild_ran"] = _rebuild_rc is not None
                 _kill_sandbox_quiet(sid)
                 return None, "rebuild_failed", details
             details["rebuilt"] = True

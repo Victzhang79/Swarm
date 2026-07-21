@@ -107,6 +107,7 @@ from swarm.brain.nodes.shared import (  # noqa: E402,F401
     _match_files_by_description,
     l1_passed,
     _parse_json_from_llm,
+    parse_marker_rc,
     _planning_triage,
     _worker_profile_prompt,
     parse_and_validate,
@@ -4007,6 +4008,33 @@ def _detect_multimodule_layout(project_path: "str | None", plan) -> bool:
     return False
 
 
+def _escalate_if_folded_diff_invalid(
+    out: dict, folded_diff: str, project_id: str, base_commit: str | None, *, where: str
+) -> bool:
+    """B3-F3：D1 聚合清单折叠改写 merged_diff 后，对 folded diff 重跑 apply-check。
+
+    #1(a) 的"合并 patch 非法就 fail-closed 阻断"守卫在 fold【之前】跑（对原 merged_diff），
+    fold_module_registrations 就地改写根 pom <modules> 段后不复校——若 base 根 pom 上下文与
+    fold 生成的 hunk 不匹配（根 pom 已被同批别的写者改过/base 读到不同源），产出 context 错位
+    的非法根 pom，未复校直送 VERIFY_L2（project_path 空时 L2 复核整块跳过 → 假绿）。这里对 folded
+    diff 复校，失败则复用既有 escalate 出口（verify_merged_patch_applies 已 fail-closed：异常也
+    返回 False；空 diff/无 .git → True 不误报）。返回 apply_ok。"""
+    from swarm.brain.merge_engine import verify_merged_patch_applies
+    from swarm.git_base import resolve_base_ref
+    _pp = _get_project_path(project_id or "")
+    _ok, _err = verify_merged_patch_applies(_pp, folded_diff, resolve_base_ref(base_commit))
+    if not _ok:
+        logger.error(
+            "[MERGE] ⚠️ B3-F3 折叠后 merged_diff git apply --check 失败(%s) → %s；"
+            "fail-closed escalate（聚合清单折叠产出非法根 pom，绝不当干净合并放行假绿）",
+            where, _err)
+        out["failure_escalated"] = True
+        out["failure_strategy"] = "escalate"
+        out["l2_passed"] = False
+        out["verification_failure"] = "merge_apply_invalid"
+    return _ok
+
+
 def merge(state: BrainState) -> dict:
     """MERGE 节点 — 合并所有子任务的 diff
 
@@ -4278,6 +4306,10 @@ def merge(state: BrainState) -> dict:
             if _d1_regs:
                 result.merged_diff = _d1_diff
                 out["merged_diff"] = _d1_diff
+                # B3-F3：折叠改写了 merged_diff → 上方 apply-check(4162) 已对旧 diff 失效，复校 folded。
+                _escalate_if_folded_diff_invalid(
+                    out, _d1_diff, state.get("project_id") or "",
+                    state.get("base_commit"), where="clean-merge")
         except Exception as _d1_exc:  # noqa: BLE001
             logger.error("[MERGE] D1 聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
         _scan_merged_diff_for_secrets(out, result.merged_diff)
@@ -4380,6 +4412,11 @@ def merge(state: BrainState) -> dict:
                     if _d1_regs:
                         result.merged_diff = _d1_diff
                         out["merged_diff"] = _d1_diff
+                        # B3-F3：温和出口同样折叠改写 merged_diff→复校 folded diff（本出口此前
+                        # 未跑过任何 apply-check，是另一个终局交付出口，非法根 pom 同样不放行假绿）。
+                        _escalate_if_folded_diff_invalid(
+                            out, _d1_diff, state.get("project_id") or "",
+                            state.get("base_commit"), where="rebase-over-limit")
                 except Exception as _d1_exc:  # noqa: BLE001
                     logger.error("[MERGE] D1 温和出口聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
                 _scan_merged_diff_for_secrets(out, result.merged_diff)
@@ -4546,21 +4583,31 @@ def _run_l2_in_sandbox(
         patch_path = "/tmp/__swarm_l2_merged.patch"
         write_file_to_sandbox(sandbox, patch_path, merged_diff, manager=manager)
 
+        # B3-F1：与【真实交付 apply】及本地 L2 兄弟 apply_git_diff(project/diff_apply.py:189) 及
+        # apply-check(_apply_check_against_base:1398) 同旗标 --ignore-whitespace——RuoYi 等 CRLF 源
+        # 文件 ↔ LF diff 的行尾差异不阻断（CRLF 铁律，见 merge_engine.py:1391-1393）。旧裸 `git apply`
+        # 与交付 apply 口径不一致 → 编译已过的产物被 L2 假红全量 replan。
+        # ★复核 PLAUSIBLE★：刻意【不加 --3way】——交付路径(apply_git_diff)与本地 L2 均无 --3way，
+        # 沙箱若单独用 --3way 会 salvage 交付 apply 落不了的补丁 → L2 假绿但 accept 期 422，破坏
+        # "verify 忠实预测 deliverability"不变量。宁可与交付同口径（同宽松/同严格），也不做更宽的假预测。
         apply_result = run_command(
             sandbox,
-            f"cd {workdir} && git apply {patch_path}; echo __APPLY_RC__$?",
+            f"cd {workdir} && git apply --ignore-whitespace {patch_path}; echo __APPLY_RC__$?",
             timeout=90,
         )
         apply_out = (getattr(apply_result, "stdout", "") or "") + (getattr(apply_result, "stderr", "") or "")
-        if "__APPLY_RC__" not in apply_out:
+        # B3-F6：退出码取【末尾锚点】marker，不用无锚点子串 `"__APPLY_RC__0" in out`
+        # （补丁内容/路径含该字面串即假成功/假失败）。marker 缺失=命令没跑成=infra → None 降级。
+        _apply_rc = parse_marker_rc(apply_out, "__APPLY_RC__")
+        if _apply_rc is None:
             # 命令没跑成（网关 5xx/沙箱死）= infra 失败 → None 降级，不判测试失败
             logger.warning(
                 "[VERIFY_L2] 沙箱 git apply 未执行(infra，降级本地/LLM): %s",
                 (getattr(apply_result, "error", None) or apply_out)[:300],
             )
             return None
-        if "__APPLY_RC__0" not in apply_out:
-            logger.warning("[VERIFY_L2] 沙箱 git apply 失败: %s", apply_out[:500])
+        if _apply_rc != 0:
+            logger.warning("[VERIFY_L2] 沙箱 git apply 失败(rc=%s): %s", _apply_rc, apply_out[:500])
             return False
 
         test_result = run_command(
@@ -4569,15 +4616,17 @@ def _run_l2_in_sandbox(
             timeout=timeout + 30,
         )
         test_out = (getattr(test_result, "stdout", "") or "") + (getattr(test_result, "stderr", "") or "")
-        if "__RC__" not in test_out:
+        # B3-F6：末尾锚点取退出码（测试名/被测代码回显 `__RC__0` 不再假成功）。marker 缺失=infra → None。
+        _test_rc = parse_marker_rc(test_out, "__RC__")
+        if _test_rc is None:
             logger.warning(
                 "[VERIFY_L2] 沙箱测试未执行(infra，不判测试失败，降级本地/LLM): %s",
                 (getattr(test_result, "error", None) or test_out)[:300],
             )
             return None
-        ok = "__RC__0" in test_out
+        ok = _test_rc == 0
         if not ok:
-            logger.warning("[VERIFY_L2] 沙箱测试未通过: %s", test_out[-1000:])
+            logger.warning("[VERIFY_L2] 沙箱测试未通过(rc=%s): %s", _test_rc, test_out[-1000:])
         return ok
     except Exception as exc:  # noqa: BLE001 — infra 异常 → 降级，不误判失败也不炸 verify 节点
         logger.warning("[VERIFY_L2] 沙箱 L2 验证异常(infra，降级本地/LLM): %s", exc)
@@ -4676,7 +4725,10 @@ def _run_reactor_build_in_sandbox(
             sandbox, f"cd {workdir} && ({build_cmd}); echo __RC__$?", timeout=timeout
         )
         out = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
-        ok = "__RC__0" in out
+        # B3-F6：末尾锚点取退出码（构建日志任意位置的字面 `__RC__0` 不再假绿）。marker 缺失=命令
+        # 没跑成（网关 5xx/沙箱死）→ rc=None → ok=False，与旧 `"__RC__0" in out` 缺失即 False 等价。
+        _build_rc = parse_marker_rc(out, "__RC__")
+        ok = _build_rc == 0
         # R34-7：探针沙箱缺构建工具（round34 实证 verify_l2_compile 模板无 mvn，RC=127
         # "command not found"）→ 这是 infra 非代码失败。ran=False 走"沙箱不可用"退路
         # （本机兜底/如实 fail-loud），绝不把环境缺陷记成集成编译失败误导归因/修复循环。
@@ -5086,6 +5138,22 @@ async def revision(state: BrainState) -> dict:
         # 交付永拒 auto_accept、after_merge:285 残留条件把干净合并再送人工
         # （merge_conflicts 粘滞同族，专项取证 CONFIRMED；escalate 分支会按需重新置 True）。
         "failure_escalated": False,
+        # B3-F4：verification_failure 是"仅失败/升级路径写、成功路径不清"的粘滞键——escalate 到
+        # DELIVER 的交付（merge_apply_invalid / merge_secret_detected / runtime_smoke 等）置它非空，
+        # 人工 REVISE 走 REVISION（不经 HANDLE_FAILURE 的清理）→ last-write-wins 带进修订轮，
+        # 使 can_auto_accept_delivery(gates:248 `if vf: return False`)/should_write_success 对修订
+        # 已恢复的交付判负=冤杀+学错。与 failure_escalated 同族显式清零。附带重置三个 verify 三态
+        # 闸（verify 节点每轮会覆盖，主要风险仍是 verification_failure 这个仅失败写的键）。
+        # ★复核 CONFIRMED HIGH★：三态一律用 None（="本轮未跑"），绝不用 False——runner.py:1550
+        # 靠 `l2_passed is None` 判定"VERIFY_L2 本轮从未执行"（PARTIAL@dispatch 真形态）以兜底恢复
+        # contract_missing_symbols/needs_review 未核验账（R65TR-T4③⑤ 猎手 CONFIRMED HIGH）。若这里
+        # 置 False，修订轮在到达 MERGE/VERIFY_L2 前失败时，终态会把它当"L2 跑过且失败"→跳过该兜底
+        # →重开 R65TR-T4 缺陷。routing(graph:388/gates:160)用 `.get(...,False)` 视 None==False，
+        # 无需 False；与另两个正确用 None 的兄弟键保持一致。
+        "verification_failure": None,
+        "l2_passed": None,
+        "l3_passed": None,
+        "runtime_smoke_passed": None,
         # 3.8 生命周期收敛：修订=新一轮，同族记账/路由/归因键对称重置——瞬时配额与强模型
         # 标记（与 retry_counts 同纪律）；alternate 标记粘滞会让 rev-* 子任务
         # 无端走备选模型；confirm_reason/deliver_auto_reject_reason 陈旧值污染下一轮终态

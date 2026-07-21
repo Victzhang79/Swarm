@@ -41,6 +41,28 @@ _CREATE_HINTS = ("新建", "新增", "创建", "添加文件", "生成", "输出
 _DELETE_HINTS = ("删除", "移除", "去掉", "删掉", "delete", "remove")
 
 
+def parse_marker_rc(output: str | None, marker: str = "__RC__") -> int | None:
+    """从沙箱命令输出解析【末尾】echo 出的退出码标记 `<marker><rc>`。
+
+    B3-F6 治本：旧口径 `"<marker>0" in out` 是无锚点全文子串匹配——构建/测试日志任意位置
+    出现该字面串（测试名/路径/被测代码回显 marker）即假成功/假失败，与真退出码脱钩。
+    这里取【最后一次】匹配的捕获组（`echo <marker>$?` 的输出恒在合并 stdout+stderr 末尾），
+    与既有正确兄弟 migration_verify.py:477 `re.findall(r"__RC__(-?\\d+)", out)[-1]` 同口径。
+
+    返回 int 退出码；marker 从未出现 → None（命令没跑成=infra 中断，调用方据此降级，
+    绝不把 infra 判成测试/编译失败，也绝不据无锚点子串判成功）。
+    """
+    if not output:
+        return None
+    ms = re.findall(rf"{re.escape(marker)}(-?\d+)", output)
+    if not ms:
+        return None
+    try:
+        return int(ms[-1])
+    except (TypeError, ValueError):  # pragma: no cover — 正则已限定 -?\d+
+        return None
+
+
 def l1_passed(out) -> bool:
     """子任务输出 L1 是否通过 —— 单一事实源（round24 A1，替代 4 处副本）。
 

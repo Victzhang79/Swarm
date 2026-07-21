@@ -769,17 +769,61 @@ def filter_orphan_module_patches(
         orphan_dirs.add(d)
     if not orphan_dirs:
         return subtask_diffs, {}
+    from swarm.project.diff_apply import split_diff_by_file
+
     filtered: list[tuple[str, str]] = []
     dropped: dict[str, list[str]] = {}
     for sid, diff in subtask_diffs:
         files = files_by_sid.get(sid, [])
-        # 该补丁触达的孤儿模块（补丁全部文件都落在骨架缺失的模块目录 → 整条剔除）
         hit = {d for f in files if (d := _top_module_dir(f)) in orphan_dirs}
-        if hit and all(_top_module_dir(f) in orphan_dirs for f in files):
+        if not hit:
+            filtered.append((sid, diff))
+            continue
+        if all(_top_module_dir(f) in orphan_dirs for f in files):
+            # 补丁全部文件都落在骨架缺失的孤儿模块目录 → 整条剔除
             for d in hit:
                 dropped.setdefault(d, []).append(sid)
             continue
-        filtered.append((sid, diff))
+        # #58（DR-03-F5）：混合补丁——同时触碰孤儿模块目录【和】真实位置（根 pom/已有模块）。
+        # 旧 `all(...)` 判据让它整条【保留】，孤儿模块 src 文件随之进 merged_diff 但无对应
+        # <dir>/pom.xml 骨架 → reactor "Child module <dir> does not exist"，整包死于门口，
+        # orphan 闸形同虚设。逐【文件段】切分：孤儿段剔除记账、真实段保留重组。
+        kept_segs: list[str] = []
+        _segs = split_diff_by_file(diff)
+        # 复核 CONFIRMED HIGH（DR-03-F5 整改）：split_diff_by_file 依赖 files_from_unified_diff
+        # 从 +++/---/rename 抽路径——【二进制段】(`diff --git a/x.png b/x.png` + `Binary files …
+        # differ`，无 +++/---)与【mode-only 段】抽不到路径→被静默弃，重组 `"".join(kept_segs)`
+        # 就丢了这些文件段且【不记账】（sid 仍进 filtered，dropped 只记孤儿命中）→真实二进制资源
+        # (RuoYi UI 图标等)永久蒸发却显示干净 partial。检测：原始 `diff --git` 文件头数 > split
+        # 可解析段数 = 有段被弃 → 无法安全逐段重组 → fail-closed 整条剔 sid 记账（宁 PARTIAL 不
+        # 静默丢产物）。
+        _orig_headers = sum(1 for _ln in diff.splitlines() if _ln.startswith("diff --git "))
+        if _orig_headers and len(_segs) < _orig_headers:
+            logger.warning(
+                "[MERGE] orphan 过滤：混合补丁 %s 切分丢段(原始文件头 %d > 可解析段 %d，"
+                "疑二进制/mode-only 段)→ 无法安全逐段剔孤儿 → fail-closed 整条剔并记账(诚实 PARTIAL)",
+                sid, _orig_headers, len(_segs))
+            for d in hit:
+                dropped.setdefault(d, []).append(sid)
+            continue
+        _recorded = False
+        for seg_files, seg_text in _segs:
+            seg_orphan_dirs = {d for f in seg_files
+                               if (d := _top_module_dir(f)) in orphan_dirs}
+            if seg_orphan_dirs:
+                # 段内任一文件落孤儿目录 → 整段剔（file 段不可部分 apply），逐目录记账
+                for d in seg_orphan_dirs:
+                    dropped.setdefault(d, []).append(sid)
+                _recorded = True
+            else:
+                kept_segs.append(seg_text)
+        if kept_segs:
+            filtered.append((sid, "".join(kept_segs)))
+        elif not _recorded:
+            # 切分不可行（split 返回空/无可提取段）→ 无法逐段剔 → 整条剔并按 hit 记账
+            # （宁 PARTIAL 不产必崩 reactor；真实文件段随之丢，dropped 记账保证终态诚实）。
+            for d in hit:
+                dropped.setdefault(d, []).append(sid)
     return filtered, dropped
 
 
