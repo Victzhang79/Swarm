@@ -1677,6 +1677,27 @@ def _package_tech_design_output(state: "BrainState", result, file_plan,
             _out["degraded_reasons"] = list(
                 _out.get("degraded_reasons") or state.get("degraded_reasons") or []
             ) + [_ddl_reason]
+    # ── R65E14-T3（#42）：未坐实 advisory（PRD 要求 vs 基线栈/事实冲突）透传 degraded ──
+    # round65e14 复盘：PRD 的"JWT+Redis 黑名单/前后端分离+Vue"被降级 advisory（降级本身正确：
+    # 栈由 detect_stack 磁盘 ground truth 权威、LLM 自由文本不 block），但旧实现只 logger.info
+    # ——注释承诺的"透传 degraded_reasons"缺失，架构级 PRD 妥协不进交付终态账/通知，用户对
+    # "按基线栈交付"零感知。此处补透传（与上面三类同构，单一集散地）。行为边界（消费面全核）：
+    # gates 硬拦均按具体标记→不阻断 auto/交付；pattern_extractor.blocking_degraded_reasons
+    # 会拦 L6 成功学习——方向正确（带架构妥协的交付不学成可复用成功模式，C10 同向）。
+    _advisory = [fi for fi in (fact_issues or [])
+                 if isinstance(fi, dict) and fi.get("verdict") == "false"
+                 and not fi.get("grounded")]
+    if _advisory:
+        _adv_claims = "; ".join(str(a.get("claim", ""))[:60] for a in _advisory[:4])
+        _adv_reason = (
+            f"tech_design_advisory: {len(_advisory)} 条 PRD 要求与基线栈/磁盘事实冲突、"
+            f"未确定性坐实降级 advisory（按基线权威交付，未阻断——交付物可能与 PRD 声明的"
+            f"架构不一致，须人工确认取舍）：{_adv_claims}"
+        )
+        logger.info("[TECH_DESIGN] %s", _adv_reason)
+        _out["degraded_reasons"] = list(
+            _out.get("degraded_reasons") or state.get("degraded_reasons") or []
+        ) + [_adv_reason]
     return _out
 
 
@@ -1822,16 +1843,8 @@ async def tech_design(state: BrainState) -> dict:
         # A2（2026-07-09 登记册）：grounded 判定抽出纯函数 + 豁免 file_plan action=create
         # 的计划新建文件（磁盘不存在是工作本身，不是虚假前提）。
         fact_issues = _label_grounded_fact_issues(fact_issues, file_checks, file_plan)
-        _advisory = [fi for fi in fact_issues
-                     if isinstance(fi, dict) and fi.get("verdict") == "false" and not fi.get("grounded")]
-        if _advisory:
-            # 未坐实的 LLM verdict=false 降级 advisory：记日志 + 透传 degraded_reasons（人可见，不阻断）
-            logger.info(
-                "[TECH_DESIGN] %d 个未确定性坐实的 verdict=false 降级为 advisory（不阻断；框架/栈差异或语义臆测，"
-                "project_stack 权威定栈=%s）：%s",
-                len(_advisory), (state.get("project_stack") or {}).get("frontend"),
-                [str(a.get("claim", ""))[:50] for a in _advisory],
-            )
+        # 未坐实 advisory 的降级日志+degraded_reasons 透传统一在 _package_tech_design_output
+        # 集散地（R65E14-T3，两条产出路径共用——此前只有日志、注释承诺的透传缺失）。
         logger.info(
             "[TECH_DESIGN] 技术方案已产出 (file_plan=%d 文件, fact_issues=%d)",
             len(file_plan or []), len(fact_issues or []),
