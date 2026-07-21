@@ -841,6 +841,12 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
     ("SendGrid API Key", re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"), Severity.CRITICAL),
     # Mailgun API key（key- + 32 hex）
     ("Mailgun API Key", re.compile(r"\bkey-[0-9a-f]{32}\b"), Severity.CRITICAL),
+    # DR-05-F5(#85)：★对抗双复核裁定提级 CRITICAL 处方过激，撤销★——原 finding 提议把这些提到
+    # CRITICAL 以对齐 coding_standards"阻断"承诺，但：①破坏既有【刻意的 ECC 分级契约】(CRITICAL=block
+    # / HIGH=warn 不 block，test_secret_gate_t2 模块级"纪律"固化 + 3 处断言)；②hunter CONFIRMED HIGH
+    # 实证误报——RuoYi 基线 `CSRF_TOKEN = "csrf_token"`(常量名非密钥)会被 Generic Secret 命中→CRITICAL
+    # →冤杀阻断（AUDIT 还扫 readable 未改文件）。HIGH=warn 是【刻意的 FP 控制设计】非缺陷。真缺陷=
+    # coding_standards 措辞过度承诺→改措辞对齐（见 coding_standards.py:25），severity 维持原样。
     ("Slack Token", re.compile(r"xox[bposa]-[0-9a-zA-Z-]{10,}"), Severity.HIGH),
     ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}"), Severity.HIGH),
     ("Stripe Key", re.compile(r"(?:sk|pk)_(?:test|live)_[0-9a-zA-Z]{24,}"), Severity.HIGH),

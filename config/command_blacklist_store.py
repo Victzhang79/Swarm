@@ -36,7 +36,17 @@ CREATE TABLE IF NOT EXISTS command_blacklist (
 
 # 内置默认规则（防误操作）。pattern 为正则，对整条命令 search。
 _DEFAULT_RULES: list[tuple[str, str]] = [
-    (r"\brm\s+-rf?\s+(/|/\*|~|\$HOME)(\s|$)", "递归删除根/家目录"),
+    # DR-05-F7(#86) 整改（★对抗双复核 CONFIRMED HIGH 二次加固★）：真·flag 顺序无关。旧 `-rf?`
+    # 及首版都要求【首个 flag token 即带 r】，被 `rm -f -r /` / `rm --force --recursive /` /
+    # `rm -v -r -f /` / `rm -rf -- /` / `rm -rf --no-preserve-root /` / `rm -rf "/"` 全绕过。
+    # 判据：rm + 任意 flag token 序列中【存在】递归 flag（含 r/R 的短选项束 或 --recursive；靠回溯
+    # 定位，不锚首位）+ 危险目标（裸根/家目录/~user/顶层系统目录本体，可选引号；deep 路径不拦）。
+    # 递归 flag 用 `-[a-zA-Z]*[rR][a-zA-Z]*` 精确匹配短选项束，不误命中 `--force`/`--verbose`
+    # （它们含字母 r 但非递归）；其余 flag token(`--`/`--no-preserve-root`/`-v`)由 `\s+-\S+` 消费。
+    (r'\brm(?:\s+-\S+)*\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s+-\S+)*\s+'
+     r'["\']?(?:/(?:["\'\s]|$)|/\*|~\w*(?:["\'\s]|$)|\$HOME(?:["\'\s]|$)|'
+     r'/(?:etc|usr|var|bin|sbin|lib|lib64|boot|root|home|opt|dev|proc|sys)/?(?:["\'\s]|$))',
+     "递归删除根/家目录/顶层系统目录"),
     (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
     (r"\bdd\b.*\bof=/dev/(sd|nvme|disk|hd)", "dd 覆盖块设备"),
     (r"\bmkfs\b", "格式化文件系统"),

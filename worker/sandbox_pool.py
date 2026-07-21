@@ -124,6 +124,13 @@ class HotSandboxPool:
         kernel(自建语言镜像无 kernel，run_code 探针会误判沙箱全死)。
         """
         try:
+            # DR-05-F3(#89)：优先复用 manager 加固探针——SandboxManager.health_check 对 504/502/
+            # gateway-timeout 瞬时网关错误做 3 次退避重试（区分"网关过载"与"沙箱真死"）。池若单次
+            # echo 判定，高并发时瞬时 504 会误判沙箱死→误杀热沙箱+_create_and_return 创建雪崩，抵消
+            # 热池意义（sandbox.py:892 实测"一个任务因 504 雪崩弃用 17 个沙箱"）。manager 无此方法才回退。
+            hc = getattr(self._manager, "health_check", None)
+            if callable(hc):
+                return bool(hc(sandbox))
             rc = getattr(self._manager, "run_command", None)
             if rc is not None:
                 result = rc(sandbox, "echo ok", timeout=5)
@@ -600,10 +607,15 @@ class HotSandboxPool:
                     self._pool.pop(key, None)
             # 2) borrowed 计数回退：若不在 idle 池里、且曾登记过 created_at，多半是借出态
             known = sandbox_id in self._created_at
+            # DR-05-F2(#88)：temp 沙箱（超 max_total 的 throwaway）在 _create_and_return 里【从不
+            # 计入 _borrowed】——故 forget 也绝不能对它递减 _borrowed（否则每 kill 一个 temp 就净漂移
+            # -1，累积后 total_in_system 低估、池在已超 max_total 时仍判"有容量"持续新建=远端超发）。
+            # 与 release()（先判 is_temp 直接 return 不减 borrowed）对齐。必须在 discard 前捕获。
+            was_temp = sandbox_id in self._temp_sids
             self._created_at.pop(sandbox_id, None)
             self._template_by_sid.pop(sandbox_id, None)
             self._temp_sids.discard(sandbox_id)
-            decr = was_borrowed if was_borrowed is not None else (known and not in_idle)
+            decr = was_borrowed if was_borrowed is not None else (known and not in_idle and not was_temp)
             if decr and self._borrowed > 0:
                 self._borrowed -= 1
                 hit = True

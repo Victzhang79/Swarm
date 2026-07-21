@@ -1323,6 +1323,12 @@ print(json.dumps(files))
             if _should_skip_remote(rel):
                 stats["skipped"] += 1
                 continue
+            # DR-05-F6(#91) 整改：与精准拉回孪生 sync_files_from_sandbox(:1390) 对称——写盘前必过
+            # is_within_root 容器校验。rel 来自远端 os.walk（沙箱内 worker 可任意写/建符号链接），
+            # 前缀计算异常时可能携越界成分 → `local_root / rel` 落到镜像树外 write_bytes（纵深缺口）。
+            if not is_within_root(local_root, rel, join=True):
+                stats.setdefault("errors", []).append(f"{rel}: 越界路径(容器校验失败)，跳过")
+                continue
             local_path = local_root / rel
             try:
                 data = read_file_from_sandbox(sandbox, remote_path, manager=self)

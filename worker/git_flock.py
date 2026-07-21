@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -58,11 +59,25 @@ class _ProjectGitFlock:
             _warn_git_flock_fail_open_once(f"fcntl/锁文件不可用: {type(exc).__name__}")
 
     def __enter__(self) -> "_ProjectGitFlock":
+        # DR-05-F1(#87)：实例级持锁标志，供临界区/provenance 查询"该批 diff 是否无锁产出"。
+        self._locked = False
         if self._lock_f is not None and self._fcntl is not None:
-            try:
-                self._fcntl.flock(self._lock_f, self._fcntl.LOCK_EX)
-            except Exception as exc:  # noqa: BLE001
-                _warn_git_flock_fail_open_once(f"flock(LOCK_EX) 失败: {type(exc).__name__}")
+            # 运行期 LOCK_EX 失败（NFS/ENOLCK/EINTR 瞬时）先短暂重试，仍失败才降级无锁。
+            for _attempt in range(3):
+                try:
+                    self._fcntl.flock(self._lock_f, self._fcntl.LOCK_EX)
+                    self._locked = True
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if _attempt < 2:
+                        time.sleep(0.1 * (_attempt + 1))
+                        continue
+                    # ★DR-05-F1 整改★：运行期 flock 失败=真故障（类 Unix），绝不复用【构造期
+                    # warn-once 静默通道】——每次都 WARNING，令"无锁运行"始终可观测（并发写共享工作
+                    # 树/索引互踩=脏 diff/假过/修复面丢失，运维必须看得见），不再被全局标志掩盖。
+                    logger.warning(
+                        "[GIT_FLOCK] flock(LOCK_EX) 失败 → 无锁进入 git 临界区（并发写共享工作树"
+                        "有互踩风险，diff 可能不可信）: %s", type(exc).__name__)
         return self
 
     def __exit__(self, *exc: object) -> bool:

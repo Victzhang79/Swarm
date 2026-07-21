@@ -188,9 +188,21 @@ class SSHRunner:
     def __enter__(self):
         import io
 
+        import os
+
         import paramiko
         self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # DR-05-F8(#92) 整改：先加载已知主机公钥（known_hosts / 系统），使 pin 过的主机被识别。
+        try:
+            self._client.load_system_host_keys()
+        except Exception:  # noqa: BLE001 — 无 known_hosts 不致命
+            pass
+        # 生产可经 SWARM_SSH_STRICT_HOST_KEY=1 启用 RejectPolicy（拒未知公钥，防 MITM 劫持构建机
+        # 注入镜像/窃密码）；默认保守 AutoAdd（内网可信 + 避免缺 known_hosts 阻断既有构建，需运维
+        # 预置 known_hosts 后再开严格模式）。开关值门控，不写死。
+        _strict = os.environ.get("SWARM_SSH_STRICT_HOST_KEY", "0").strip().lower() in ("1", "true", "yes", "on")
+        self._client.set_missing_host_key_policy(
+            paramiko.RejectPolicy() if _strict else paramiko.AutoAddPolicy())
         kwargs = {"hostname": self.cfg.host, "port": self.cfg.port,
                   "username": self.cfg.user, "timeout": 15}
         if self.cfg.pkey:

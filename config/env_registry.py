@@ -253,6 +253,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_WORKER_COMMAND_WHITELIST": "tools/build_tools.py:366",
     "SWARM_WORKER_CTX_KB_CHARS": "worker/prompts.py:259",
     "SWARM_WORKER_DEP_REPAIR": "worker/l1_pipeline.py:1155",
+    "SWARM_SSH_STRICT_HOST_KEY": "worker/image_builder.py:SSHRunner.__enter__（=1 启用 RejectPolicy 严格主机公钥校验，需预置 known_hosts）",
     "SWARM_WORKER_DISPATCH_MODE": "infra/worker_dispatcher.py:92",
     "SWARM_WORKER_IMPORT_DRIFT_REPAIR": "worker/l1_pipeline.py:1041",
     "SWARM_WORKER_IMPORT_REPAIR": "worker/l1_pipeline.py:2764",

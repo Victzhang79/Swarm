@@ -202,7 +202,12 @@ def _resolve_prefixed_member(name: str, workspace_members: set[str],
         strict = {m for m in cands if name == f"{root_name}-{m}"}
         if len(strict) == 1:
             return next(iter(strict))
-    return next(iter(cands)) if len(cands) == 1 else None
+    # ★DR-05-F4(#90) 整改★：删除宽松单候选兜底——它只保证"候选数=1"，不保证被剥掉的前缀真是
+    # 工程前缀。外部依赖 `jackson-core`/`spring-core`（endswith `-core`）在 workspace 有 `core`
+    # 成员时会被误改名成内部坐标（groupId 仍 com.fasterxml.jackson.core）→ 既非真外部又非合法内部
+    # → manifest 解析崩塌连坐 reactor（违"绝不猜"铁律，注释亦自称"只接受零歧义还原"）。只认
+    # `{root}-{member}` 强证据，无则 None（交回 prune/上游，误接错模块比缺依赖更毒）。
+    return None
 
 
 def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
