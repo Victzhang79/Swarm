@@ -272,8 +272,8 @@ Designed for **intranet multi-user** deployments, with explicit trust boundaries
 | Layer | Mechanism |
 |---|---|
 | **AuthN/AuthZ** | Multi-user tokens + RBAC (global roles + per-project membership); forced password change on first login; tokens stored as SHA256 at-rest hashes with rotation on login; optional `SWARM_TOKEN_TTL_HOURS` |
-| **Browser sessions** | HttpOnly cookies on the main path; no `?token=` URLs over HTTP; programmatic clients use the `Authorization` header; revocation cuts streams immediately |
-| **API surface** | Topology-revealing endpoints require auth; `/docs` `/openapi.json` gated by default in production (`SWARM_DOCS_PUBLIC` overrides both ways, fail-closed on config errors) |
+| **Browser sessions** | HttpOnly cookies on the main path; no `?token=` URLs over HTTP; programmatic clients use the `Authorization` header; WebSocket keeps `?token=` as a weakest fallback but **logs a deprecation warning on use** (prefer header/same-origin cookie); revocation cuts streams immediately; the forced-password-change **423 gate is enforced at the single auth entry** (read-only endpoints included) |
+| **API surface** | `/api/status` requires auth **and is role-masked** — non-admins see only component health, internal coordinates (sandbox/model/DB topology) are admin-only; config-write endpoints gate **outbound-endpoint keys** (`*_URL`/`*_URI` for provider/DB/webhook — redirecting them = credential phishing/MITM) to **admin only**, centralized at a single write chokepoint; login throttling keys on the **real client IP** (reverse-proxy hops trusted via `SWARM_TRUSTED_PROXY_HOPS`, multi-line XFF merged per RFC, fail-closed to the direct peer when unset); `/docs` `/openapi.json` gated by default in production (`SWARM_DOCS_PUBLIC` overrides both ways, fail-closed on config errors) |
 | **Command execution** | Sandbox commands pass a **hardened blocklist** (DB-managed rules; load failure falls back to a built-in baseline — `rm -rf /`-class commands are never released) |
 | **Execution isolation** | Sandbox isolation via CubeSandbox; host and target workspaces protected by path-boundary validation |
 | **Secrets** | LLM keys encrypted at rest via `secret_store`; delivery diffs pass a secret-leak scan (CRITICAL findings block delivery and escalate) |
@@ -288,7 +288,8 @@ Designed for **intranet multi-user** deployments, with explicit trust boundaries
 |---|---|---|
 | `GET /api/health` | Liveness | Anonymous, no component details |
 | `GET /api/health/ready` | Readiness (container HEALTHCHECK) | Fail-closed real probing: PG always, Redis if enabled, Qdrant with local fallback; any enabled dependency unreachable → 503 |
-| `GET /api/status` | Component panel (authenticated) | Real connectivity for 8 components; same probe implementation as `/ready` |
+| `GET /api/status` | Component panel (authenticated) | Real connectivity for 8 components; same probe implementation as `/ready`; **non-admins see health only**, internal coordinates (sandbox/model/DB topology) are admin-only |
+| `GET /api/tasks/{id}/progress` | Structured progress | Aggregates `remaining/completed/failed/abandoned/total` + per-subtask detail from checkpoint state (**single authoritative source, matching the MONITOR node — never parses logs**); read-only, `task:read` gated, falls back to task status when no checkpoint |
 | `GET /api/metrics` | Metrics | Task/sandbox/model-call counters |
 | `GET /api/observability/*` | Latency / slow queries / time series | Model-call and critical-path observation |
 | Task terminal report | Machine-readable `degraded_summary` | What degraded this run and how many times — aggregated by mechanism, full detail preserved |

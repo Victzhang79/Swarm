@@ -15,7 +15,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-5200%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.60-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.61-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -319,8 +319,8 @@ flowchart LR
 | 层 | 机制 |
 |---|---|
 | **认证/授权** | 多用户 Token + RBAC（全局角色 + 项目级成员权限）；首次登录强制改密；Token 存库为 SHA256 at-rest 哈希、登录轮换（明文不落库）；`SWARM_TOKEN_TTL_HOURS` 可选限令牌暴露窗口（默认 0=永不过期，需显式配置；生产模式仅告警不阻断） |
-| **浏览器会话** | 浏览器主路径优先 **HttpOnly Cookie**，HTTP 不再走 `?token=` URL（避免日志/Referer 泄漏）；程序化客户端走 `Authorization` Header；WebSocket 仍保留 `?token=` 最弱兜底。失权即断流，不静默重连 |
-| **API 面收权** | `/api/status` 等暴露基建拓扑的端点需鉴权；`/docs` `/openapi.json` 生产环境默认纳入鉴权（`SWARM_DOCS_PUBLIC` 双向覆盖，配置异常 fail-closed 拒绝而非 500） |
+| **浏览器会话** | 浏览器主路径优先 **HttpOnly Cookie**，HTTP 不再走 `?token=` URL（避免日志/Referer 泄漏）；程序化客户端走 `Authorization` Header；WebSocket 保留 `?token=` 最弱兜底但**改用即打 deprecation 告警**（优先 Header/同源 Cookie）。失权即断流，不静默重连；首次登录强制改密的 **423 硬闸收敛在单一认证入口**，只读端点亦不例外 |
+| **API 面收权** | `/api/status` 需鉴权且**按角色掩码**——非 admin 仅见组件健康态，内部坐标（沙箱/远程沙箱/模型/DB 拓扑）仅 admin 可见；配置写入端点的**出站端点键**（provider/DB/webhook 的 `*_URL`/`*_URI` 类，改指向攻击者 host 即凭据钓鱼/MITM）改写**单独提权 admin**，集中在单一写入 chokepoint 兜底（防非 admin owner 绕过）；登录限流按**真实 client IP**（反代经 `SWARM_TRUSTED_PROXY_HOPS` 取信可信跳、多行 XFF 按 RFC 合并，防共享 proxy IP 致账户锁定 DoS，未配则 fail-closed 退回直连 IP）；`/docs` `/openapi.json` 生产默认纳入鉴权（`SWARM_DOCS_PUBLIC` 双向覆盖，配置异常 fail-closed 拒绝而非 500） |
 | **命令执行** | Worker 沙箱命令过 **hardened 黑名单**（规则库存 DB 可管理，加载异常回退内置基线绝不放行 `rm -rf /` 类）；所有承载 agent 命令的路径统一过闸 |
 | **执行隔离** | 沙箱执行隔离由 CubeSandbox 提供（非 root/网络策略/资源限额取决于远端沙箱与模板配置）；主机与目标项目工作区经路径边界校验，防穿越 |
 | **密钥管理** | LLM Key 等经 `secret_store` 加密落库；提交/日志有敏感信息扫描纪律；交付 diff 过密钥泄漏扫描（检出 CRITICAL 级密钥阻断交付升级人工） |
@@ -335,7 +335,8 @@ flowchart LR
 |---|---|---|
 | `GET /api/health` | 存活探针 | 匿名可达，无组件细节（不泄露拓扑） |
 | `GET /api/health/ready` | 就绪探针（容器 HEALTHCHECK/编排门） | fail-closed 真探活：PG 必查、Redis 按启用判、Qdrant 含本地模式兜底；任一启用依赖不可达 → 503。RBAC 开启时匿名只回状态位，明细归鉴权的 `/api/status` |
-| `GET /api/status` | 组件面板（需鉴权） | 8 组件真实连通性检测，探活与 `/ready` 同一实现（无双源漂移） |
+| `GET /api/status` | 组件面板（需鉴权） | 8 组件真实连通性检测，探活与 `/ready` 同一实现（无双源漂移）；**非 admin 仅见健康态**，内部坐标（沙箱/模型/DB 拓扑）仅 admin |
+| `GET /api/tasks/{id}/progress` | 结构化进度 | 从 checkpoint state 聚合 `剩余/已完成/失败/放弃/total` + 子任务级明细（与执行期 MONITOR **单一权威口径一致，不解析日志**）；只读、`task:read` 鉴权，无 checkpoint 时按任务状态兜底 |
 | `GET /api/metrics` | 指标 | 任务/沙箱/模型调用计量 |
 | `GET /api/observability/*` | 延迟/慢查/时间序列 | 模型调用与关键路径观测 |
 | 任务终态报告 | `degraded_summary` 机读汇总 | 该轮降级了什么、各多少次——按机制聚合一眼判读，明细全量保留供人工审读 |
