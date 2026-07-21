@@ -14,8 +14,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-4900%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.59-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Tests](https://img.shields.io/badge/tests-5200%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
+[![Version](https://img.shields.io/badge/version-0.9.60-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -274,7 +274,11 @@ flowchart LR
 | Lint | 5 语言 | checkstyle / go vet / clippy / eslint / ruff（工具故障≠代码错误，基础设施瞬时故障单独识别） |
 | 确定性修复 | Java/Go/Rust/TS | 按生态委托事实标准工具：Java import/依赖自证、`goimports`、`cargo fix`、`eslint --fix` |
 | 依赖补全 | 多栈 driver 化 | 从**项目自身兄弟 manifest** 找权威坐标注入（只用自证坐标、绝不臆造、fail-closed）；新栈=注册一个 driver |
+| 构建清单脚手架 | Maven/npm/go（含版本解析） | 规划期为落空模块**确定性生成**构建清单：Maven→pom（reactor/聚合父）、npm→package.json（内部 `workspace:*` + 第三方 `^ver`）、go→go.mod（内部 `replace` + 第三方 `vX.Y.Z`）。第三方版本去**权威 registry/proxy 解析**（npmjs/npmmirror、proxy.golang.org/goproxy.cn，本地缓存证据优先），★绝不臆造版本/latest/预发布——解析不到如实丢弃并从验收同源剔除★（免逼小模型编坐标）；异栈路径互不污染，Maven 行为逐字不变 |
+| 交付完整性闸 | 全栈（5 栈 verifier） | 产物必须与**声明**对账：声明必建的文件未产出、声明的依赖坐标未落地进 manifest = 静默漏交付，L1 硬闸拦下。依赖核验按 manifest basename→verifier 分发（pom/gradle/npm/go/cargo），**匹配尾名忽略 group+version** → 免疫 BOM 托管 / `${project.version}` / `workspace:*`；未知栈 fail-open 放行 |
 | 依赖坐标合法性闸 | Java/Maven（可推广） | 构建**之前**扫全树 manifest：每条依赖必须是【本工程模块 / 父级受管 / 仓库真实存在】三者之一，否则**可证永不可解析** → 确定性改回或剪除。**不解析构建工具的报错文本**（那是打地鼠，换个错法就漏一个），只校验坐标状态；仓库不可达则一律放行（fail-open，宁可漏判绝不误剪）。为什么必须前置：坏坐标是**解析期**崩塌，会连坐整棵 reactor，让每个 Worker 的构建闸都误报“错在上游” |
+| 缺依赖恢复授写权 | 按栈授正确清单 | 编译失败缺依赖 → 授对应模块**构建清单**写权重派（Maven→pom、Go→go.mod、npm→package.json…），绝不在非 Maven 工程授【幻影 pom.xml】烧恢复预算 |
+| 根聚合单写者闸 | 全栈根聚合清单 | 根 `pom.xml`/`settings.gradle`/`go.work`/根 `Cargo.toml` 的结构重写非加性、无法安全合并 → 双写者硬失败收敛唯一 owner（此前仅 pom.xml，Gradle/Go 现同护） |
 | 分层模板 | Java/Vue/TS/Go/Python | 新建文件按栈找同类既有文件做范例注入，免全项目探索空烧预算 |
 | 规划去特化 | 全部 | 分组/拆分/prompt 中无任何项目专名或单栈写死（有回归测试锁定不得回流） |
 
