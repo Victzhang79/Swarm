@@ -2995,6 +2995,12 @@ async def _resplit_subtask(st, state: BrainState, budget: int) -> list:
                    if f in _parent_c and f not in _claimed_c]
             child_scope.create_files = _cc
             _claimed_c.update(_cc)
+            # R67-T5a sibling（hunter F2）：与 _split_oversized_by_files 同款病——deep-copy
+            # 整份继承父 ua，含兄弟子块才会创建的文件=账序矛盾（seed 闸死等）。剔父待建集
+            # 全部路径（兄弟串行序由 depends_on 链保障，上游产物注入走 B1/B3 面）。
+            child_scope.upstream_artifacts = [
+                u for u in (getattr(child_scope, "upstream_artifacts", None) or [])
+                if u not in _parent_c]
             children.append(SubTask(
                 id=f"{st.id}-{i + 1}",
                 description=s.get("description", "")[:500],
@@ -3370,10 +3376,22 @@ def _split_oversized_by_files(st, max_files: int = MAX_FILES_PER_SUBTASK) -> lis
 
     children = []
     _upstream_creates: list[str] = []   # 已拆出上游批的 create_files 累积(供串行/协调者批 readable)
+    # R67-T5a(round67 R67-6)：父账整份 deep-copy 继承是账序矛盾的出生地——父的 readable/ua
+    # 若混有自身 create（T4 布线等写入），每个孩子都会继承【全部兄弟分区文件】的账：平行 leaf
+    # 互指=兄弟互读成环（round67 实测 40 边被环守卫跳过），先行批指后行批=seed 闸死等生产者
+    # 在自己下游（reconcile 兜底剔 40 条的来源）。治本=拆分时先剔【全部分区路径】，时序合法
+    # 的上游产物由下方 A1 累积按批序重新加回——账天生与序一致，不再依赖事后对账兜底。
+    _all_partition_paths = {p for b in norm_batches for p, _k in b}
     for i, grp in enumerate(norm_batches):
         child_scope = scope.model_copy(deep=True)
         child_scope.create_files = [p for p, k in grp if k == "create"]
         child_scope.writable = [p for p, k in grp if k == "write"]
+        child_scope.readable = [
+            r for r in (getattr(child_scope, "readable", None) or [])
+            if r not in _all_partition_paths]
+        child_scope.upstream_artifacts = [
+            u for u in (getattr(child_scope, "upstream_artifacts", None) or [])
+            if u not in _all_partition_paths]
         # ── A1 治本(round11)：下游批常 import 上游批产出的类型(数据层 domain/DTO/mapper →
         # 逻辑层 service/impl/controller)。把上游 create_files 并入本批 readable，一处同治
         # ① _decouple_independent_subtasks 不误剥真依赖 ② worker bootstrap 注入兄弟产物(杜绝

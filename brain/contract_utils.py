@@ -2102,19 +2102,29 @@ _PKG_PREFIX_BRANCH_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\\\.[A-Za-z0-9_]+)*\\\.$
 _IMPORT_ANCHOR_PREFIX = r"^[[:space:]]*import[[:space:]].*"
 
 
-def _anchor_forbidden_import_pattern(pattern: str) -> str:
+def _anchor_forbidden_import_pattern(pattern: str, allow_bare_word: bool = False) -> str:
     """把 grep 负断言 pattern 里的【裸包前缀】分支锚定到 import 上下文，把【已含 import 关键字但未
     行首锚定】的分支(如 `import lombok`)补行首锚。非包前缀(方法名/字符串/结尾非 `\\.`)/已行首锚定
     分支原样。
 
     #102：`javax\\.` 裸包前缀是【行内子串】匹配→命中注释/散文里的 `javax.`（worker 写"本类无
     javax.*"表功注释被判死=假阴性杀好产出）。#102-复核C（修一类捞 sibling）：同一 pattern 的
-    `import lombok` 分支同病（命中"无需 import lombok"注释），也补行首锚。栈中立。"""
+    `import lombok` 分支同病（命中"无需 import lombok"注释），也补行首锚。栈中立。
+
+    R67-T7b 扩 sibling（round67 R67-9）：①分支切分兼容 BRE `\\|` 交替（旧 split("|") 会把
+    `vue\\|Vue` 切成尾带反斜杠的碎片，所有分支既锚不上也不放行——幂等失效面）；②allow_bare_word
+    =True（调用方已证目标是 JVM 源码）时，【裸小写单词】禁令分支（lombok/vue）也锚 import——
+    `! grep -rl 'lombok' <java目录>` 命中"不使用 lombok"注释即假阳杀，而 Java 侧真实使用
+    必有 import 行（FQN 内联逃逸=已知限制，0-baseline 编译闸兜底，同 #102 取舍）。"""
     import re as _re
-    branches = pattern.split("|")
+    # R67-T7b①：保分隔符切分（`\|`=BRE 交替 / `|`=ERE 交替），分支与分隔符各归其位
+    parts = _re.split(r"(\\\||\|)", pattern)
     out: list[str] = []
     changed = False
-    for b in branches:
+    for idx, b in enumerate(parts):
+        if idx % 2 == 1:                                    # 分隔符原样
+            out.append(b)
+            continue
         if b.startswith("^"):
             out.append(b)                                   # 已行首锚定 → 幂等跳过
         elif _PKG_PREFIX_BRANCH_RE.match(b):
@@ -2125,9 +2135,16 @@ def _anchor_forbidden_import_pattern(pattern: str) -> str:
             # "// 无需 import lombok" 散文；不改其余（它已限定 import 语义，只差行首约束）。
             out.append(r"^[[:space:]]*" + b)
             changed = True
+        elif allow_bare_word and _re.fullmatch(r"[a-z][a-z0-9_]{2,}|[A-Z][a-z0-9_]{2,}", b):
+            # R67-T7b②：裸词禁令锚 import。判据（全量回归 test_b4b 逮到的真界线）：
+            # 依赖/技术名=全小写（lombok/vue）或单峰首大写（Lombok，注释专属词，复核 MED）
+            # → 锚 import；【内部驼峰】（getGroups/createApp）=方法/API 名负断言（"不得有
+            # 该方法"须匹配代码任意位置），锚 import=永假=放松禁令假过，绝不动。
+            out.append(_IMPORT_ANCHOR_PREFIX + b)
+            changed = True
         else:
             out.append(b)
-    return "|".join(out) if changed else pattern
+    return "".join(out) if changed else pattern
 
 
 def _anchor_forbidden_import_in_cmd(cmd: str) -> str:
@@ -2140,13 +2157,25 @@ def _anchor_forbidden_import_in_cmd(cmd: str) -> str:
     # 收紧成"必须是 import 语句行"→ 合法 FQN/异形满足被冤杀。
     if not (_re.match(r"^\s*!\s*grep\b", cmd) or _re.search(r"\btest\s+-z\b.*grep", cmd)):
         return cmd            # 只锚【负断言】——正面 grep/`test -n` 存在断言语义不同，不动
+    # R67-T7b②：裸词禁令锚 import 仅当扫描目标可证为 JVM 类路径源码（路径含 JVM 布局段或
+    # .java/.kt 后缀）——html/js 等资源目标 import 语义不适用，fail-open 原样（st-52 vue 类
+    # 禁令列为已知限制：资源侧注释假阳交 deliver/manual 面）。
+    _java_target = bool(_re.search(
+        r"/(?:java|kotlin|scala|groovy)/|\.java\b|\.kt\b|\.scala\b|\.groovy\b", cmd))
     m = _re.search(r"grep\b(?:\s+-{1,2}[\w=-]+)*\s+(?P<q>['\"])(?P<pat>.*?)(?P=q)", cmd)
+    if m:
+        new_pat = _anchor_forbidden_import_pattern(m.group("pat"), allow_bare_word=_java_target)
+        if new_pat == m.group("pat"):
+            return cmd
+        return cmd[:m.start("pat")] + new_pat + cmd[m.end("pat"):]
+    # R67-T7b：未引号单词 pattern（`! grep -rq lombok dir/`）——锚定后含 [[:space:]] 必须补引号
+    m = _re.search(r"grep\b(?:\s+-{1,2}[\w=-]+)*\s+(?P<pat>[^\s'\"]+)", cmd)
     if not m:
         return cmd
-    new_pat = _anchor_forbidden_import_pattern(m.group("pat"))
+    new_pat = _anchor_forbidden_import_pattern(m.group("pat"), allow_bare_word=_java_target)
     if new_pat == m.group("pat"):
         return cmd
-    return cmd[:m.start("pat")] + new_pat + cmd[m.end("pat"):]
+    return cmd[:m.start("pat")] + "'" + new_pat + "'" + cmd[m.end("pat"):]
 
 
 def anchor_forbidden_import_asserts(plan) -> dict[str, dict]:
@@ -3333,6 +3362,29 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                 _create_dirs.update(c.rsplit("/", 1)[0] for c in _moved if "/" in c)
             if _new_w != _w:
                 _sc0.writable = _new_w
+            # ── R67-T8（round67 R67-10，规则0 逆向 sibling）：create_files 撞基线既有文件 →
+            # 降级 writable(modify)。实锤：契约符号安置把基线已有 GenTable/GenTableColumn.java
+            # 当 create（worker 按"新建"写=覆写基线代码）；既有模块 pom 入 create（污染"新建"
+            # 统计与 H1 模板路径）。base 树是唯一权威（同规则0 正向口径），命中即降级。
+            _c0 = list(getattr(_sc0, "create_files", None) or [])
+            _demoted = []
+            _kept_c = []
+            for f in _c0:
+                fn = str(f).replace("\\", "/")
+                fn = fn[2:] if fn.startswith("./") else fn
+                if fn in _tree_set:
+                    _demoted.append(fn)
+                else:
+                    _kept_c.append(f)
+            if _demoted:
+                logger.warning(
+                    "[normalize] R67-T8 规则0逆向：%s 的 create_files %s 在 base 树已存在 → "
+                    "降级 writable(modify)（按新建写=覆写基线，round67 GenTable 死型）",
+                    st.id, _demoted)
+                _sc0.create_files = _kept_c
+                _sc0.writable = list(dict.fromkeys(
+                    list(getattr(_sc0, "writable", None) or []) + _demoted))
+                changed = True
 
     # ── 规则 3（先于规则1跑）：Maven 新模块构建闸门可满足性补全（治本 task 69d34b1b）。
     # 放规则1前，使补进来的 pom 也受"同文件写权唯一"去重/串行化（多模块子任务不并发抢写根 pom）。
@@ -4397,6 +4449,9 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     模块 pom 脚手架维持 TRIVIAL 轻量路径，仅根 pom 写者（真多步）保 MEDIUM。
 
     规则：difficulty==TRIVIAL 且 写根 pom.xml（scope 含**裸** `pom.xml`）→ 提到 MEDIUM。
+    R67-T9 sibling（round67 R67-13 实锤 st-17）：TRIVIAL 且 create ≥3 个类路径源码文件
+    （实体簇）→ 提到 MEDIUM——trivial 单发路径（合并定位+编码封顶 30 步）塞不下多源码
+    文件，低估路由弱档=白烧后重派。模块 pom/资源单文件模板落盘不受影响（真 trivial 保留）。
     原地改，返回提升个数。
     """
     bumped = 0
@@ -4404,10 +4459,14 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
         if getattr(st, "difficulty", None) != SubTaskDifficulty.TRIVIAL:
             continue
         sc = getattr(st, "scope", None)
-        writes = set(_st_create_files(st)) | set(getattr(sc, "writable", []) or [])
+        creates = list(_st_create_files(st))
+        writes = set(creates) | set(getattr(sc, "writable", []) or [])
         # 裸 `pom.xml`（根 pom：大文件 + 多模块登记，读改皆重多步）——模块 pom 是 `<dir>/pom.xml`
         writes_root_pom = "pom.xml" in {_norm_scope_path(w) for w in writes}
-        if writes_root_pom:
+        # R67-T9：≥3 个类路径源码 create（classpath_fqn_key 非 None=编译参与源码，
+        # 资源/清单不计——单文件模板落盘仍走 trivial 轻路径）
+        many_sources = sum(1 for f in creates if classpath_fqn_key(f)) >= 3
+        if writes_root_pom or many_sources:
             st.difficulty = SubTaskDifficulty.MEDIUM
             bumped += 1
     return bumped

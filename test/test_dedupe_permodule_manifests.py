@@ -36,15 +36,15 @@ def test_per_module_manifests_all_kept():
     assert len(out) == 12, f"每模块清单/配置不得被 basename 去重丢弃: {paths}"
 
 
-def test_duplicate_source_class_still_deduped():
-    """P5 原保护不回退：两模块重复建同名类仍去重保留首个。"""
+def test_duplicate_source_class_no_longer_silently_deduped():
+    """R67-1 收权：两模块同名类【不再】由 P5 无证据挑边（"保留首个"曾把 duty 域剪错方向）。
+    重复裁决交 #110（同 FQN REJECT）/#101（契约权威消解）/T1b（同名异包 REJECT）有证据闸。"""
     fp = [
         _fp("channel/INotifyService.java", module="channel"),
         _fp("engine/INotifyService.java", module="engine"),
     ]
     out = dedupe_file_plan(fp)
-    assert len(out) == 1
-    assert out[0]["path"] == "channel/INotifyService.java"
+    assert len(out) == 2, [x["path"] for x in out]
 
 
 def test_exact_same_manifest_path_still_deduped():

@@ -1147,11 +1147,12 @@ async def _plan_ultra_batched(
     # R65E9-T2：栈画像能力边界注入分批 baseline 声明步（计算一次每批复用；无画像=空串）。
     _stack_grounding_batched = _baseline_stack_grounding_block(state)
 
-    # P5：分批前全局去重同名文件
+    # P5（R67-1 收权）：分批前去重【仅完全同路径】；跨路径同名一律保留，
+    # 重复裁决交 #110/#101/T1b 有证据闸（旧 basename 全局剪曾误杀 12 UI 模板+duty 剪错方向）
     _before = len(file_plan)
     file_plan = dedupe_file_plan(file_plan)
     if len(file_plan) < _before:
-        logger.info("[PLAN-BATCH] P5 去重：%d → %d 文件（移除 %d 个同名重复）",
+        logger.info("[PLAN-BATCH] P5 去重：%d → %d 文件（移除 %d 个完全同路径重复）",
                     _before, len(file_plan), _before - len(file_plan))
 
     # 模块依赖（tech_design 阶段1 modules.depends_on）供批间排序

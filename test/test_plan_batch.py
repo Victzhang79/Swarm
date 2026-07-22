@@ -78,16 +78,15 @@ def test_progress_line_format():
 
 
 def test_dedupe_same_basename():
-    """P5：不同模块各建同名文件(INotifyService)→去重保留首个。"""
+    """P5（R67-1 收权）：不同路径同名文件【不再】静默剪——"保留首个"是无证据挑边
+    （round67 duty 域剪错方向实锤）。重复裁决交 #110/#101/T1b 有证据闸。"""
     from swarm.brain.plan_batch import dedupe_file_plan
     fp = [_fp("channel/INotifyService.java", module="channel"),
           _fp("engine/INotifyService.java", module="engine"),
           _fp("channel/Foo.java", module="channel")]
     d = dedupe_file_plan(fp)
     paths = [x["path"] for x in d]
-    assert len(d) == 2, f"同名应去重: {paths}"
-    assert "channel/INotifyService.java" in paths  # 保留首个
-    assert "engine/INotifyService.java" not in paths
+    assert len(d) == 3, f"跨路径同名不得静默剪: {paths}"
 
 
 def test_dedupe_exact_path():

@@ -102,11 +102,23 @@ def test_2fa_false_claim_flagged_missing_evidence():
     assert REQ_2FA in missing, f"2FA 假申报应判无证据；实得: {missing}"
 
 
-def test_legit_excel_claim_grounded_passes():
-    """用户管理 token 含 excel，基线 ExcelUtil 命中 → 有证据、不打回。"""
+def test_legit_excel_claim_partial_hit_bounces_then_evidence_passes():
+    """R67-T6 语义升级（round67 R67-7）：REQ_USER 文本 token={crud,excel,2fa}，excel 命中但
+    2fa 零命中——旧 any 语义放行=同款"泛词掩护缺失能力"（JWT 案 token/redis 掩护 jwt）。
+    新语义：无 evidence 的部分命中申报弹一轮；补 evidence 引文（基线真实标识符）实证后放行。"""
     vocab = build_baseline_vocab(_files(), _symbols())
     bc = [{"id": REQ_USER, "reason": "SysUserController + ExcelUtil"}]
-    assert baseline_claims_missing_evidence(bc, _items(), vocab) == []
+    assert REQ_USER in baseline_claims_missing_evidence(bc, _items(), vocab)
+    bc_ev = [{"id": REQ_USER, "reason": "SysUserController + ExcelUtil",
+              "evidence": "SysUserController ExcelUtil"}]
+    assert baseline_claims_missing_evidence(bc_ev, _items(), vocab) == []
+
+
+def test_fabricated_evidence_rejected():
+    """evidence 引文捏造（基线无 GoogleAuthFilter）→ 拒（R67-15 isFrame 死型）。"""
+    vocab = build_baseline_vocab(_files(), _symbols())
+    bc = [{"id": REQ_USER, "reason": "r", "evidence": "GoogleAuthFilter"}]
+    assert REQ_USER in baseline_claims_missing_evidence(bc, _items(), vocab)
 
 
 def test_pure_chinese_req_exempt():
@@ -153,10 +165,11 @@ def test_validate_backward_compat_without_vocab():
 
 
 def test_validate_grounded_baseline_passes_with_vocab():
-    """有证据的 baseline_covered（excel）在证据闸下仍通过。"""
+    """带 evidence 引文实证的 baseline_covered 在证据闸下通过（R67-T6 分层语义）。"""
     p = _plan(_st("st-1", covers=[REQ_2FA]), _st("st-2", covers=[REQ_NOTICE]))
     vocab = build_baseline_vocab(_files(), _symbols())
     res = validate_requirement_coverage(
-        p, _items(), baseline_covered=[{"id": REQ_USER, "reason": "ExcelUtil 存量"}],
+        p, _items(), baseline_covered=[{"id": REQ_USER, "reason": "ExcelUtil 存量",
+                                        "evidence": "ExcelUtil SysUserController"}],
         baseline_vocab=vocab)
-    assert res.valid, f"有证据申报不该被误拒；实得: {res.issues}"
+    assert res.valid, f"带实证 evidence 的申报不该被误拒；实得: {res.issues}"

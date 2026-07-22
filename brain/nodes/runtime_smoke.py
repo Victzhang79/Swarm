@@ -96,6 +96,13 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         r"UnsupportedClassVersionError",
         r"ClassFormatError",
         r"java\.lang\.NoSuchMethodError",
+        # R67-hunter(a)：Spring 容器【纯代码性】启动崩溃——路由双实现/bean 名冲突（③b/③c
+        # 规划期闸的运行期兜底，round67 /notify 双 Controller 死型）。此前不在任何模式族 →
+        # 被吞成 skipped/inconclusive=闸门承诺的兜底不存在。刻意【不加】BeanCreationException/
+        # APPLICATION FAILED TO START——它们常裹外部依赖缺失（DB 连不上），会把环境性 skip
+        # 冤判 code_error（fail-honest：环境绝不伪装代码失败）。
+        r"Ambiguous mapping",
+        r"ConflictingBeanDefinitionException",
     ),
     "node": (
         r"\bSyntaxError\b",

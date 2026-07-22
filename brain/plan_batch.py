@@ -241,10 +241,9 @@ def _toposort(names: list[str], edges: dict[str, set[str]]) -> list[str] | None:
     return out
 
 
-# CODEWALK P1-6：这些文件名是"每模块一份"的生态惯例（构建清单/配置/桶文件）——
-# basename 去重会把 moduleB/pom.xml 静默丢掉（与 contract_utils 规则3"每模块 pom
-# 各自独立"矛盾 → 多模块脚手架残缺）。白名单内只按完全路径去重；
-# 源码文件保持 basename 去重（P5：防 LLM 在两模块重复建同名类）。
+# CODEWALK P1-6 → R67-1 收权后仅存档语义：这些文件名是"每模块一份"的生态惯例。
+# 历史上 P5 按 basename 全局去重时靠本白名单豁免；R67-1 治本后 P5 只按完全同路径去重，
+# 白名单不再参与判定（保留常量供口径追溯/测试引用）。
 _PER_MODULE_FILENAMES = frozenset({
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
     "package.json", "tsconfig.json", "vite.config.ts", "vite.config.js",
@@ -259,15 +258,20 @@ _PER_MODULE_FILENAMES = frozenset({
 
 
 def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
-    """P5：同名文件去重（全局符号表）。
+    """P5（R67-1 收权）：file_plan 去重【仅限完全同路径】。
 
-    分批/分模块拆解时，不同模块可能各建一个同名文件（如 INotifyService.java
-    被 channel 和 engine 各建一次，路径不同）→ 语义冲突 + 编译重复定义。
-    按 basename 去重：保留首个，丢弃后续同名（保留先出现的，通常是更基础的模块）。
-    例外（P1-6）：_PER_MODULE_FILENAMES 内的模块惯例文件只按完全路径去重。
-    路径完全相同的也去重。返回去重后的 file_plan + 记录被去重项数。
+    旧行为按 basename(lower) 全局去重（保留首见）——round67 实锤两类误杀：
+    ① 资源文件目录即命名空间（Thymeleaf 每实体一套 add/edit.html），12 个 UI 模板被当
+      "同名重复"静默剪除 → 6 实体新增/编辑页无人承接=假完整直穿三层闸（R67-1 CRITICAL）；
+    ② 同名异包源码"保留首见"是无证据挑边——duty 域 3 个 Controller 剪错方向（存活侧
+      路由前缀与模板/菜单硬编码不一致 → /duty/* 路由面失主 3 页 404，R67-2 HIGH）。
+    且 validate_file_plan_ownership 分母与本函数同源——P5 剪谁、归属闸就看不见谁，
+    静默瘦身无人问责（审计跟着剪除者走）。
+
+    收权后跨路径同名一律保留，重复裁决交给有证据的确定性闸（防御纵深，绝不静默挑边）：
+    同 FQN 跨模块 → #110 REJECT + #101 契约权威消解；同名异 FQN 跨包 → R67-T1b REJECT
+    打回带双路径反馈（plan_validator._cross_package_same_basename_creates）。
     """
-    seen_base: dict[str, str] = {}  # basename(lower) -> 已保留的 path
     seen_path: set[str] = set()
     out: list[dict] = []
     for fp in file_plan:
@@ -275,14 +279,9 @@ def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
             out.append(fp)
             continue
         path = fp["path"].replace("\\", "/").strip("/")
-        base = os.path.basename(path).lower()
         if path in seen_path:
-            continue  # 完全同路径，跳过
-        if base in seen_base and seen_base[base] != path and base not in _PER_MODULE_FILENAMES:
-            # 同名不同路径 → 疑似重复创建，跳过后者（保留先出现的）
-            continue
+            continue  # 完全同路径 = 唯一确定无疑的重复
         seen_path.add(path)
-        seen_base[base] = path
         out.append(fp)
     return out
 

@@ -254,4 +254,9 @@ def test_g1_accepts_round64_cassette():
     assert any(str(it.get("path", "")).startswith("sql/") for it in fp), \
         "fixture 前提漂移：file_plan 里已无顶层 sql 文件"
     r = validate_module_coherence(plan, file_plan=fp)
-    assert r.valid, f"round64 死因未治愈: {r.issues}"
+    # R67-T7a 说明：该 cassette 的 st-1 desc 里真实存在"禁 lombok vs 模板含 lombok"的
+    # 考卷矛盾文本（live 管线中 R65E10-T2 剪除+考卷同源重生成会在 VALIDATE 前消解；静态
+    # 夹具绕过了该步）——③d 防御纵深对此打回是正确行为，非 #40 回归。本测试只守 #40
+    # 语义（G1 物理根误杀），故剔除 ③d 账目后断言。
+    _non_exam = [i for i in r.issues if "考卷自相矛盾" not in i]
+    assert not _non_exam, f"round64 死因未治愈: {_non_exam}"

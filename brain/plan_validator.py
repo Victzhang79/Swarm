@@ -292,8 +292,10 @@ def normalize_baseline_covered(raw) -> list[dict]:
         if isinstance(entry, dict):
             rid = str(entry.get("id") or "").strip()
             reason = str(entry.get("reason") or "").strip()[:300]
+            # R67-T6：evidence 引文（基线真实标识符/文件名）随申报透传给证据闸，有界防膨胀
+            evidence = str(entry.get("evidence") or "").strip()[:120]
         elif isinstance(entry, str):
-            rid, reason = entry.strip(), ""
+            rid, reason, evidence = entry.strip(), "", ""
         else:
             continue
         if not rid:
@@ -301,12 +303,14 @@ def normalize_baseline_covered(raw) -> list[dict]:
         if rid in index:
             if reason and not out[index[rid]]["reason"]:
                 out[index[rid]]["reason"] = reason
+            if evidence and not out[index[rid]].get("evidence"):
+                out[index[rid]]["evidence"] = evidence
             continue
         if len(out) >= _HARD_MAX_ITEMS:
             _dropped += 1
             continue
         index[rid] = len(out)
-        out.append({"id": rid, "reason": reason})
+        out.append({"id": rid, "reason": reason, "evidence": evidence})
     if _dropped:
         logger.warning(
             "[PLAN-VALIDATE] baseline_covered 申报超同源硬顶 %d，丢弃 %d 条"
@@ -754,9 +758,9 @@ def validate_file_plan_ownership(
     round40 PARTIAL 直接死因：file_plan 43 文件里 3 个（含两个 ServiceImpl=BLOCKED
     "无生产者的包"核心实现类 + DDL）无任何子任务认领，批拆丢件规划期零校验，执行期
     才以 BLOCKED→连坐放弃形态爆发。规则（零 LLM）：
-    - 先过与批拆同一个 P5 dedupe_file_plan（口径同源：同名去重由权威函数裁决，
-      被 P5 丢弃的孪生件本就不该被要求 owner——复核 HIGH：自造 basename 豁免会
-      静默放行真缺件，_PER_MODULE_FILENAMES 内每模块一份的文件按全路径各自硬性）；
+    - 先过与批拆同一个 P5 dedupe_file_plan（口径同源单一事实源）。R67-1 收权后 P5
+      仅剪完全同路径重复——跨路径同名孪生件全部留在分母，失主必报（旧 basename 全局剪
+      曾把 12 个 UI 模板剪出分母 → 本闸静默放行假完整，round67 实锤"审计跟着剪除者走"）；
     - 去重后仍无 owner 的每个文件【逐条】issue 打回（一条一 bullet 让 D09 A9
       分页轮转生效，防"固定截断头部永远修不到看不见的条目"；上限 60 防爆炸）；
     - 单子任务计划（SIMPLE 面自证）/空 file_plan → 跳过。
@@ -797,6 +801,190 @@ def _cross_module_class_redefinitions(plan) -> dict[str, dict[str, list[str]]]:
             mod, fqn = key
             index.setdefault(fqn, {}).setdefault(mod, []).append(getattr(st, "id", "?"))
     return {fqn: mods for fqn, mods in index.items() if len(mods) >= 2}
+
+
+def _cross_package_same_basename_creates(plan) -> dict[str, dict[str, list[str]]]:
+    """R67-T1b：同名（simple name）JVM 源码类被多子任务在【不同包】各自 create 的倒排。
+
+    round66 复盘既定判据"同 FQN/同 basename 跨物理根【或跨包】"中 basename 侧的兑现
+    （round67 前唯一碰它的机制是 P5 basename 静默剪——无证据挑边，已收权）。同名异包
+    新建类=疑似同一逻辑类的重复设计：Spring 类 bean 名冲突（AnnotationBeanNameGenerator
+    用 simple name）、路由/鉴权分裂、消费方语义漂移的温床（round67 9 对 Controller 实锤
+    9/9 全为真重复）。返回 basename → {fqn: [子任务 id]}，仅含 ≥2 个不同 FQN 的组。
+
+    误伤护栏：仅 JVM 类路径命名空间源码（classpath_fqn_key 非 None，资源/非 JVM 天然豁免）；
+    test 布局路径豁免（每模块一份 ApplicationTests 是生态惯例，test classpath 每模块独立）；
+    同 FQN 跨模块组（=1 个 distinct FQN）由 ③ #110 报账，此处结构性不重复报。
+    """
+    from swarm.brain.contract_utils import classpath_fqn_key
+    index: dict[str, dict[str, list[str]]] = {}
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])):
+            norm = str(f).replace("\\", "/")
+            parts = [p for p in norm.split("/") if p]
+            if "test" in parts or "tests" in parts:
+                continue        # test 布局豁免（保守：路径任一段为 test/tests 即豁免）
+            key = classpath_fqn_key(f)
+            if not key:
+                continue
+            _mod, fqn = key
+            base = fqn.rsplit("/", 1)[-1].lower()
+            index.setdefault(base, {}).setdefault(fqn, []).append(getattr(st, "id", "?"))
+    return {b: fqns for b, fqns in index.items() if len(fqns) >= 2}
+
+
+# R67-T3：HTTP 路由处理器文件命名惯例（数据驱动可扩栈；仅作"疑似路由 owner"过滤器，
+# 非语言逻辑写死——不匹配的栈本闸静默不适用，绝不误伤）。
+_ROUTE_HANDLER_MARKERS = frozenset({"controller", "resource"})
+_ROUTE_TOKEN_RE = re.compile(r"(?<![\w/.])(/[a-z][a-z0-9_\-]*(?:/[a-z0-9_\-{}*]+)+)")
+_ROUTE_FILE_EXT_RE = re.compile(
+    r"\.(java|kt|scala|groovy|html|xml|sql|yml|yaml|properties|js|ts|css|md|json|go|py|rs)\b")
+
+
+# R67-T7a（round67 R67-8）：考卷矛盾对账的确定性信号。
+# 全称禁令：明确"任何第三方依赖/仅用 JDK 标准库"级别的零依赖设计声明（收窄措辞防误伤——
+# "不引入任何新依赖"这类相对表述不入，模板列既有依赖不构成矛盾）。
+_UNIVERSAL_DEP_BAN_RE = re.compile(
+    r"任何第三方[^。\n]{0,12}依赖|仅用\s*JDK|只用\s*JDK|零第三方依赖")
+# ★复核 HIGH 整改★软化/例外从句：同句含这些措辞=软偏好非硬禁令（"尽量仅用 JDK…如确有
+# 必要可少量引入"是合法可执行考卷），绝不当矛盾打回。
+_BAN_SOFTENER_RE = re.compile(r"尽量|优先|建议|如确有必要|如需|若需|可少量|可酌情|可引入")
+# 特定禁令：禁/不使用 <具名技术清单>。★整改（回归实锤）★名字字符集必须含连字符/点/下划线
+# ——旧 [A-Za-z0-9]* 把 "ruoyi-common" 截成 "ruoyi" → 子串误配一切 ruoyi-* 坐标（plan_inject
+# 夹具 st-26 假矛盾）。
+_SPECIFIC_DEP_BAN_RE = re.compile(
+    r"(?:禁止使用|禁止引入|不得使用|不得引入|不引入|不使用|不依赖)\s*"
+    r"([A-Za-z][A-Za-z0-9_.\-]*(?:\s*[/、]\s*[A-Za-z][A-Za-z0-9_.\-]*)*)")
+_TEMPLATE_DEP_RE = re.compile(
+    r"<dependency>.*?<artifactId>\s*([^<\s]+)\s*</artifactId>.*?</dependency>", re.S)
+_MAVEN_COORD_RE = re.compile(r"\b([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+:[0-9][A-Za-z0-9_.\-]*)\b")
+
+
+def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
+    """R67-T7a：子任务考卷（description+acceptance）内"依赖禁令 vs 注入依赖"自相矛盾检测。
+
+    round67 实锤（R65E10-T2 lombok 同族未泛化的新变体）：st-1 文字禁"任何第三方运行时依赖，
+    仅用 JDK 标准库"，紧随的权威 pom 模板却注入 ruoyi-quartz/ruoyi-system；st-8-1 desc 要求
+    JDK 手写 TOTP，AC 强制声明 googleauth 坐标——worker 无论怎么写都违反考卷一侧，确定性
+    不可赢。判据（零 LLM）：
+    - 全称禁令（_UNIVERSAL_DEP_BAN_RE）↔ desc 内嵌模板的任意 <dependency> / AC 的任意
+      group:artifact:version 坐标 = 矛盾；
+    - 具名禁令（禁 X/Y/Z）↔ 名字子串命中的模板 artifact / AC 坐标 = 矛盾；具名禁令与
+      无关依赖并存合法（不误伤）。
+    返回 [(subtask_id, 禁令摘录, [冲突坐标…])…]；哪侧错因案而异，交打回反馈让 LLM 显式
+    裁决（剥依赖或删禁令），绝不静默挑边（与 T2 lombok 有磁盘实证可自动剥不同，此处无实证）。
+    """
+    out: list[tuple[str, str, list[str]]] = []
+    for st in getattr(plan, "subtasks", None) or []:
+        desc = str(getattr(st, "description", "") or "")
+        ac_text = "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or []))
+        injected = [a.strip() for a in _TEMPLATE_DEP_RE.findall(desc)]
+        injected += _MAVEN_COORD_RE.findall(ac_text)
+        if not injected:
+            continue
+        # ★复核 HIGH 整改×2★逐命中判软化（二轮复核逮 .search() 首命中短路：前句软化命中
+        # 会掩护后句独立硬禁令）——任一命中所在句无软化措辞即矛盾。
+
+        def _sentence_of(text: str, start: int, end: int) -> str:
+            _s = max(text.rfind("。", 0, start), text.rfind("\n", 0, start)) + 1
+            _e_cands = [i for i in (text.find("。", end), text.find("\n", end)) if i != -1]
+            return text[_s:min(_e_cands) if _e_cands else len(text)]
+
+        _hard_ban = None
+        for m_uni in _UNIVERSAL_DEP_BAN_RE.finditer(desc):
+            if not _BAN_SOFTENER_RE.search(_sentence_of(desc, m_uni.start(), m_uni.end())):
+                _hard_ban = m_uni.group(0)
+                break
+        if _hard_ban is not None:
+            out.append((str(getattr(st, "id", "?")), _hard_ban, injected[:6]))
+            continue
+        # ★hunter(b) 二轮整改★具名禁令同样过软化句窗——"尽量不使用 Lombok，如确有必要可
+        # 少量引入"是软偏好非硬禁令（round65e10 同族措辞），不入 banned_names。
+        banned_names: set[str] = set()
+        for m in _SPECIFIC_DEP_BAN_RE.finditer(desc):
+            if _BAN_SOFTENER_RE.search(_sentence_of(desc, m.start(), m.end())):
+                continue
+            for name in re.split(r"[/、\s]+", m.group(1)):
+                if len(name) >= 3:
+                    banned_names.add(name.lower())
+        if banned_names:
+            hits = [a for a in injected if any(b in a.lower() for b in banned_names)]
+            if hits:
+                out.append((str(getattr(st, "id", "?")),
+                            "禁 " + "/".join(sorted(banned_names)), hits[:6]))
+    return out
+
+
+def _subtask_cluster_root(sid: str) -> str:
+    """deep-copy 拆分簇根：st-34-2 → st-34（拆分兄弟共享继承的描述文本，同簇路由互见
+    是文本血缘不是双设计）。非 st-N-… 形态原样返回。"""
+    parts = str(sid or "").split("-")
+    if len(parts) >= 3 and parts[0] == "st":
+        return f"st-{parts[1]}"
+    return str(sid or "")
+
+
+def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
+    """R67-T3：同一 HTTP 路由被【不同拆分簇】的多个路由处理器创建子任务各自声明的倒排。
+
+    round67 R67-3 实锤：st-34-2 新建 NotifyController、st-43 新建 AlarmOrchestrationController，
+    desc 各自声明 POST /notify/simple|compose|recover|delete —— 两份都建成 = Spring ambiguous
+    mapping 真启动必炸；覆盖矩阵只看"需求有人 covers"，看不见"两人抢同一路由"（双重承接盲区）。
+
+    零误报判据（对 round67 真 plan 校准）：①路由 token 从 description 确定性抽取（排除文件
+    路径样式与本计划物理根前缀）；②只计【create ≥1 个路由处理器命名的类路径源码文件】的
+    子任务（消费者/SDK/渠道实现提及 API 路径不入账——st-31/st-3 引用噪音实测排除）；
+    ③同拆分簇不判（deep-copy 兄弟共享描述文本，st-38 簇实测排除）。
+    返回 route → [子任务 id]（仅跨簇 ≥2 处理器声明者的组）。
+    """
+    from swarm.brain.contract_utils import classpath_fqn_key
+    phys_roots: set[str] = set()
+    claims: dict[str, dict[str, list[str]]] = {}   # route -> cluster -> [sid]
+    handler_sts: list = []
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        creates = list(getattr(sc, "create_files", None) or [])
+        for f in creates + list(getattr(sc, "writable", None) or []):
+            seg = str(f).replace("\\", "/").lstrip("/").split("/", 1)[0]
+            if seg:
+                phys_roots.add(seg)
+        if any(classpath_fqn_key(f)
+               and any(m in str(f).rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+                       for m in _ROUTE_HANDLER_MARKERS)
+               for f in creates):
+            handler_sts.append(st)
+    for st in handler_sts:
+        sid = str(getattr(st, "id", "?"))
+        cluster = _subtask_cluster_root(sid)
+        for tok in set(_ROUTE_TOKEN_RE.findall(str(getattr(st, "description", "") or ""))):
+            if _ROUTE_FILE_EXT_RE.search(tok):
+                continue                        # 文件路径样式
+            if tok.lstrip("/").split("/", 1)[0] in phys_roots:
+                continue                        # 本计划物理根前缀 = 文件路径非 URL
+            claims.setdefault(tok, {}).setdefault(cluster, []).append(sid)
+    # ★复核 HIGH 整改★：单路由碰撞可能是"handler 子任务在 desc 里引用他人既有接口"（消费
+    # 引用，st-12 调 /system/config/list 形态）——文本级无法区分。收紧为【同一对跨簇 handler
+    # 共享 ≥2 条路由】才 REJECT（真双实现必然整组端点相交，round67 st-34-2×st-43=4 条；
+    # 消费引用极少成组）。单条相交降 warning 留痕（诚实局限，交 runtime smoke 硬闸兜底）。
+    pair_routes: dict[tuple[str, str], set[str]] = {}
+    for r, cl in claims.items():
+        clusters = sorted(cl)
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                pair_routes.setdefault((clusters[i], clusters[j]), set()).add(r)
+    strong_pairs = {p for p, rs in pair_routes.items() if len(rs) >= 2}
+    weak = {r: sorted({s for ids in cl.values() for s in ids})
+            for r, cl in claims.items()
+            if len(cl) >= 2 and not any(
+                (a, b) in strong_pairs
+                for idx, a in enumerate(sorted(cl)) for b in sorted(cl)[idx + 1:])}
+    return ({r: sorted({s for ids in cl.values() for s in ids})
+             for r, cl in claims.items()
+             if len(cl) >= 2 and any(
+                 (a, b) in strong_pairs
+                 for idx, a in enumerate(sorted(cl)) for b in sorted(cl)[idx + 1:])},
+            weak)
 
 
 def validate_module_coherence(
@@ -841,6 +1029,59 @@ def validate_module_coherence(
             f"同一全限定类 {fqn!r} 被多个物理模块各自 create：{_where}。同 FQN 跨模块=类路径副本"
             f"遮蔽/split-package，全局编译时消费方会解析到缺方法的错误副本（cannot find symbol）。"
             f"该类只能属【一个】模块：其余模块请 import 该模块的 FQN 而非重建，并从其 create_files 移除。")
+
+    # ③b R67-T1b：同名【异 FQN 跨包】create = 疑似同一逻辑类的重复设计（round67 9 对
+    # Controller 实锤：Spring bean 名冲突/路由分裂/duty 域 3 页 404）。无契约权威可确定性
+    # 消解 → fail-closed 打回带双路径反馈，绝不静默挑边（P5 旧 basename 剪除的反面）。
+    for base, fqns in sorted(_cross_package_same_basename_creates(plan).items()):
+        _where = "; ".join(f"{f}（{','.join(ids[:3])}）" for f, ids in sorted(fqns.items()))
+        result.add(
+            f"同名类 {base!r} 被多个子任务在不同包各自 create：{_where}。同名异包新建类"
+            f"极可能是同一逻辑类的重复设计（Spring 类 bean 名默认取 simple name，两份并存"
+            f"启动即冲突；消费方也会解析到语义漂移的副本）。请裁决唯一 owner：若确属同一"
+            f"逻辑类，保留一处、其余从 create_files 移除并让消费方 import 该 FQN；若确属"
+            f"不同职责的两个类，请改名消歧（不同 simple name）。")
+
+    # ③e R67-T9（R67-12 观测面，warn 不阻断）：纯辅助文件（非类路径源码）子任务却依赖过半
+    # 计划=全图汇聚点（round67 st-14 DDL depends_on 77：上游任一放弃即连坐，消费者拿不到
+    # 参考）。结构建议交 LLM/复盘，确定性面只留痕。
+    _subs_all = list(getattr(plan, "subtasks", None) or [])
+    if len(_subs_all) >= 10:
+        from swarm.brain.contract_utils import classpath_fqn_key as _cfk
+        for _st9 in _subs_all:
+            _deps9 = list(getattr(_st9, "depends_on", None) or [])
+            _c9 = list(getattr(getattr(_st9, "scope", None), "create_files", None) or [])
+            if (len(_deps9) > len(_subs_all) // 2 and _c9
+                    and not any(_cfk(f) for f in _c9)):
+                result.warn(
+                    f"子任务 {getattr(_st9, 'id', '?')} 为纯辅助产物（{[f.rsplit('/', 1)[-1] for f in _c9[:3]]}）"
+                    f"却依赖 {len(_deps9)}/{len(_subs_all)} 个子任务=全图汇聚点：上游任一放弃即"
+                    f"连坐、消费者拿不到该参考。建议前置为生产者或改独立叶（R67-12）。")
+
+    # ③d R67-T7a：考卷内"依赖禁令 vs 注入依赖"自相矛盾 = worker 确定性不可赢（round65e10
+    # lombok 死因②的泛化变体，round67 st-1/st-8-1 实锤）。fail-closed 打回让 LLM 显式裁决。
+    for _sid, _ban, _hits in _exam_dependency_contradictions(plan):
+        result.add(
+            f"子任务 {_sid} 考卷自相矛盾：描述声明依赖禁令『{_ban}』，但其权威模板/验收断言"
+            f"却注入/强制声明依赖 {_hits}。worker 无论怎么写都违反考卷一侧（确定性不可赢，"
+            f"round65e10 st-1 连坐死因同款）。请统一考卷唯一真值：若依赖确属必需→删除/收窄"
+            f"禁令措辞；若零依赖设计为真→从模板与验收中剥除这些坐标。")
+
+    # ③c R67-T3：同一 HTTP 路由被不同拆分簇的多个路由处理器创建子任务各自声明 =
+    # 双实现（round67 /notify 五端点双 Controller 实锤：真启动 ambiguous mapping 必炸）。
+    # 单条相交（消费引用无法文本区分）降 warn 留痕——hunter(a) 整改：兑现"降 warning"
+    # 承诺，运行期兜底=runtime_smoke java 表新增 Ambiguous mapping code_error 模式。
+    _route_dups, _route_weak = _cross_cluster_route_double_claims(plan)
+    for route, sids in sorted(_route_weak.items()):
+        result.warn(
+            f"HTTP 路由 {route!r} 被多个跨簇路由处理器子任务提及（{','.join(sids[:4])}，仅单条"
+            f"相交=可能是消费引用，未打回）——若为真双实现，运行期 Ambiguous mapping 闸兜底。")
+    for route, sids in sorted(_route_dups.items()):
+        result.add(
+            f"HTTP 路由 {route!r} 被多个子任务各自新建的路由处理器重复声明：{','.join(sids[:4])}。"
+            f"同一路由只能有一个实现（两份都建成=运行时路由映射冲突启动必炸；鉴权/语义也会分裂）。"
+            f"请裁决唯一 owner 子任务保留该路由，其余子任务从描述/实现中移除该路由（消费方按"
+            f"契约调用既有接口，绝不重复实现）。")
 
     # 模块宇宙 = 契约依赖声明的模块 ∪ file_plan 声明的模块（两者都是【这是一个模块】的权威声明）。
     deps = ((getattr(plan, "shared_contract", None) or {}).get("dependencies")) or []
@@ -1001,7 +1242,8 @@ def validate_requirement_coverage(
             f"需求条目未被任何子任务覆盖: {item['id']} — {item['text'][:120]}"
             f"（若需新实现：分配给某个子任务并在其 covers 声明此 ID；"
             f"若现有代码已完整满足该需求、本任务无需改动：在计划 JSON 顶层的 "
-            f"baseline_covered 列表申报此 ID 并给出 reason 依据）"
+            f"baseline_covered 列表申报此 ID 并给出 reason 依据，同时附 evidence 字段="
+            f"现有代码中真实存在的标识符/类名/文件名（R67-T6 会逐字核验，捏造即拒））"
         )
     for st_id in sorted(matrix["dangling_covers"]):
         bad = matrix["dangling_covers"][st_id]
@@ -1044,9 +1286,11 @@ def validate_requirement_coverage(
                 baseline_covered, requirement_items, baseline_vocab):
             result.add(
                 f"baseline_covered 申报 {rid} 缺乏基线证据 — {_text_by_id.get(rid, '')[:100]}"
-                f"（该需求的判别术语在现有代码符号/文件索引中【零命中】，基线极可能并无此能力："
+                f"（该需求的判别术语未能【全部】命中现有代码符号/文件索引，基线很可能缺其中"
+                f"关键能力——泛词命中不算证据，R67-7：token/redis 命中掩护不了 jwt 缺失："
                 f"若确为新功能→分配子任务实现并 covers 此 ID，切勿谎称存量；"
-                f"若确系存量→reason 必须引用现有代码中【真实出现该能力术语】的位置）"
+                f"若确系存量→在该申报条目加 evidence 字段，引用现有代码中【真实存在】的"
+                f"标识符/类名/文件名（会被逐字核验，捏造即拒））"
             )
     return result
 

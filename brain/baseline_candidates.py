@@ -198,12 +198,14 @@ def baseline_claims_missing_evidence(
     （SysUserController 真存在但无 2FA 方法；基线全库 2fa/totp/authenticator 符号=0）→ 既有闸只校验
     id∈需求清单+reason 非空 → 假申报直接过 → 2FA 静默丢出交付。
 
-    证据判定（Option D，确定性、narrow，子agent 活体验证 catch 2FA 且 0 误拒合法存量）：
+    证据判定（R67-T6 分层收紧；round67 R67-7 实锤 any 语义被泛词掩护——req"JWT…Token 加入
+    Redis 黑名单"里 token/redis 命中掩护 jwt 零命中 → 假申报放行需求蒸发）：
     - baseline_vocab 空（KB 不可达）→ [] 全豁免（fail-open，绝不因索引缺失误拒真申报）；
-    - 需求文本 `extract_req_tokens` 零 token（纯中文无 ASCII 标识符）→ 豁免（round37 过严教训：
-      通知公告类合法存量申报会被误拒）；
-    - 有 token 且【全部】token 都不作子串出现在 blob → 无证据 → 列入返回（打回：极可能把新特性
-      谎称存量）。悬空 id（不在 requirement_items）不在此判——另有 dangling_baseline 校验。
+    - 需求文本零 token（纯中文无 ASCII 标识符）→ 豁免（round37 过严教训）；
+    - 第一层：申报带 evidence 引文 → 引文 token 全命中 vocab=实证放行；零/部分命中=引文捏造
+      （R67-15 isFrame 死型）→ 列入返回；
+    - 第二层：无 evidence → 需求判别 token 须【全部】命中 vocab，部分命中即列入返回（打回引导
+      补 evidence 或建子任务实现）。悬空 id 不在此判——另有 dangling_baseline 校验。
     """
     if not baseline_covered or not baseline_vocab:
         return []
@@ -223,10 +225,25 @@ def baseline_claims_missing_evidence(
         text = text_by_id.get(rid)
         if text is None:          # 悬空 id → 交 dangling_baseline，本闸不重复判
             continue
+        # R67-T6 第一层：申报自带 evidence 引文（基线中真实存在的标识符/文件名）→ 实证放行/拒。
+        # evidence 的判别 token 全部命中 vocab = 引文真实 → 放行（逃生门是实证不是口说）；
+        # 有 evidence 却零/部分命中 = 引文捏造（R67-15 isFrame 死型）→ 打回。
+        ev = str(entry.get("evidence") or "").strip()
+        if ev:
+            ev_toks = extract_evidence_tokens(ev)
+            if ev_toks and all(tk in vocab for tk in ev_toks):
+                continue
+            out.append(rid)
+            seen.add(rid)
+            continue
         toks = extract_evidence_tokens(text)   # 宽口径：含 2fa/oauth2 等数字缩略
         if not toks:              # 纯中文/无判别 token 豁免（过严会误拒合法存量，round37 教训）
             continue
-        if not any(tk in vocab for tk in toks):
+        # R67-T6 第二层（round67 R67-7 实锤）：无 evidence 时判别 token 须【全部】命中。
+        # 旧 any 语义下 req"JWT登录…Token加入Redis黑名单"里 token/redis 泛词命中掩护了
+        # jwt 零命中 → 假申报放行需求蒸发。部分命中=能力可疑，打回时引导补 evidence 引文
+        # （确系存量）或建子任务实现（确系新功能）。
+        if not all(tk in vocab for tk in toks):
             out.append(rid)
             seen.add(rid)
     return out

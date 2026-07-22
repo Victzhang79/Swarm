@@ -20,6 +20,7 @@ LLM 全量重拆 / ULTRA 分批），进 VALIDATE 前统一跑本收尾器：
 from __future__ import annotations
 
 import logging
+import re as _re
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +516,139 @@ def derive_consumer_depends_edges(plan) -> dict[str, list[str]]:
     return added
 
 
+def _plan_reaches(by_id: dict, start: str, target: str) -> bool:
+    """start 是否经 depends_on 传递到达 target（R67-T4 加边前防环/幂等共用）。"""
+    seen, stack = set(), [start]
+    while stack:
+        cur = stack.pop()
+        if cur == target:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        st = by_id.get(cur)
+        if st is not None:
+            stack.extend(getattr(st, "depends_on", None) or [])
+    return False
+
+
+_DESC_ST_DEP_RE = _re.compile(r"依赖\s*(st-[A-Za-z0-9_-]+)")
+
+
+def wire_described_dependency_tokens(plan) -> dict[str, list[str]]:
+    """R67-T4a（round67 R67-4）：描述里"依赖 st-X"词元 ↔ depends_on 对账，缺边确定性补上。
+
+    round67 实锤：st-48 描述明写"控制器注入…（依赖 st-1 的 pom 装配）"，但 depends_on=[]、
+    readable 全基线——消费意图只活在自然语言里，W2/G2 以 readable 为唯一信号源对它结构性
+    失明 → 首批并行派发即 BLOCKED 白跑一轮。规划 LLM 既然点名了 st-X，这是零歧义的结构
+    信号：存在性校验 + 防环 + 传递可达幂等跳过后直接成边（零 LLM）。
+    返回 {消费者 id: [新增上游 id…]} 机读账。
+    """
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if len(subs) < 2:
+        return {}
+    by_id = {str(getattr(st, "id", "")): st for st in subs}
+    added: dict[str, list[str]] = {}
+    for st in subs:
+        sid = str(getattr(st, "id", ""))
+        for dep in set(_DESC_ST_DEP_RE.findall(str(getattr(st, "description", "") or ""))):
+            if dep == sid or dep not in by_id:
+                continue                    # 自引用/幻影 id 不成边
+            if _plan_reaches(by_id, sid, dep):
+                continue                    # 已传递可达 = 幂等跳过
+            if _plan_reaches(by_id, dep, sid):
+                logger.warning(
+                    "[PLAN-FINISH] R67-T4a 描述点名依赖 %s→%s 会成环 → 跳过（边方向属更深"
+                    "计划错，留 VALIDATE/C9 面）", sid, dep)
+                continue
+            st.depends_on = list(getattr(st, "depends_on", None) or []) + [dep]
+            added.setdefault(sid, []).append(dep)
+    if added:
+        logger.info(
+            "[PLAN-FINISH] R67-T4a 描述词元补边 %d 个消费者共 %d 条（\"依赖 st-X\"只活在"
+            "自然语言=W2 结构盲区，round67 st-48 首批 BLOCKED 真根）: %s",
+            len(added), sum(len(v) for v in added.values()), dict(sorted(added.items())))
+    return added
+
+
+# 符号词元门槛：≥2 个大写字母的驼峰标识（IAlarmRecordService/AlarmRecord），排除普通
+# 英文单词/单驼峰词（Controller/Thymeleaf 仅 1 个大写）误配。
+_SYMBOL_TOKEN_RE = _re.compile(r"\b([A-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)\b")
+
+
+def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
+    """R67-T4b（round67 R67-5）：desc/AC 引用的【本计划他人 create 的类符号】→ 缺边扫描补齐。
+
+    round67 实锤：st-50-1 要注入 ISysGoogleAuthService（st-8-1 同批并行创建），零边、
+    readable 全基线、context 零相关符号 → worker 只能臆造签名或重复实现（编译可过=假过）。
+    判据（护栏随 G2，宁缺毋滥）：符号 token（≥2 大写驼峰）逐字命中【唯一】创建者的类路径
+    源码 basename 词干才成边；多创建者歧义不猜、自引用不成边、防环、传递可达幂等跳过。
+    成边同时把产物路径补进消费者 readable（激活 B1/规则2 上游产物注入面，与 W2 同理）。
+    返回 {消费者 id: [新增上游 id…]} 机读账。
+    """
+    from swarm.brain.contract_utils import classpath_fqn_key
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if len(subs) < 2:
+        return {}
+    by_id = {str(getattr(st, "id", "")): st for st in subs}
+    # 符号词干 → (唯一创建者 sid, 产物路径)；多创建者 → None（歧义哨兵，绝不猜）
+    stem_owner: dict[str, tuple[str, str] | None] = {}
+    for st in subs:
+        sid = str(getattr(st, "id", ""))
+        sc = getattr(st, "scope", None)
+        for f in list(getattr(sc, "create_files", None) or []):
+            if not classpath_fqn_key(f):
+                continue                    # 仅类路径源码构成符号（资源/非 JVM 不判）
+            stem = str(f).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if not _SYMBOL_TOKEN_RE.fullmatch(stem):
+                continue                    # 单驼峰/非符号形态词干不参与（防误配）
+            prev = stem_owner.get(stem)
+            if prev is None and stem in stem_owner:
+                continue                    # 已判歧义
+            if prev is not None and prev[0] != sid:
+                stem_owner[stem] = None     # 多创建者 → 歧义哨兵
+            else:
+                stem_owner[stem] = (sid, str(f))
+    added: dict[str, list[str]] = {}
+    cycle_skipped: list[tuple[str, str, str]] = []
+    for st in subs:
+        sid = str(getattr(st, "id", ""))
+        text = (str(getattr(st, "description", "") or "") + "\n"
+                + "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or [])))
+        for tok in set(_SYMBOL_TOKEN_RE.findall(text)):
+            owner = stem_owner.get(tok)
+            if not owner or owner[0] == sid:
+                continue                    # 无创建者/歧义/自引用
+            producer, path = owner
+            sc = getattr(st, "scope", None)
+            if sc is not None and path in (list(getattr(sc, "create_files", None) or [])
+                                           + list(getattr(sc, "writable", None) or [])):
+                continue                    # 自己也写该文件（共写面由 T3 串行化管）
+            if _plan_reaches(by_id, sid, producer):
+                pass                        # 已可达仍可补 readable（幂等，不重复加边）
+            elif _plan_reaches(by_id, producer, sid):
+                cycle_skipped.append((sid, producer, tok))
+                continue                    # 成环跳过（多为拆分簇兄弟互引且反向边已保序）
+            else:
+                st.depends_on = list(getattr(st, "depends_on", None) or []) + [producer]
+                added.setdefault(sid, []).append(producer)
+            if sc is not None:
+                rd = list(getattr(sc, "readable", None) or [])
+                if path not in rd:
+                    sc.readable = rd + [path]
+    if cycle_skipped:
+        logger.warning(
+            "[PLAN-FINISH] R67-T4b %d 条符号消费边会成环 → 跳过（多为拆分簇兄弟互引且"
+            "反向边已保序；边方向属更深计划错留 VALIDATE/C9 面）: %s",
+            len(cycle_skipped), cycle_skipped[:6])
+    if added:
+        logger.info(
+            "[PLAN-FINISH] R67-T4b 符号消费补边 %d 个消费者共 %d 条（desc/AC 引用他人 create"
+            " 类符号而 readable 未列=G2 盲区，round67 st-50-1 2FA 双实现断裂真根）: %s",
+            len(added), sum(len(v) for v in added.values()), dict(sorted(added.items())))
+    return added
+
+
 def reconcile_upstream_account(plan) -> dict[str, list[str]]:
     """R65REPLAY-T4（round65d 回放轮死因本体）：上游账↔依赖序对账。
 
@@ -717,6 +851,23 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             out["consumer_edges"] = _ce
     except Exception:  # noqa: BLE001 — fail-open
         logger.warning("[PLAN-FINISH] 消费边下推失败（fail-open）", exc_info=True)
+    # R67-T4a/T4b：自然语言消费关系补边（放 W2 之后——readable 推得出的边 W2 已建，
+    # 此处只接 W2 结构盲区）。★hunter F3 整改★两 pass 各自 try（与本函数逐 pass 纪律一致）：
+    # T4b 崩不吞 T4a 成果可见性，日志带已落边账区分"零边"vs"半应用"。
+    try:
+        _t4a = wire_described_dependency_tokens(plan)
+        if _t4a:
+            out["described_dep_edges"] = _t4a
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] R67-T4a 词元补边失败（fail-open；已落边账=%s）",
+                       out.get("described_dep_edges"), exc_info=True)
+    try:
+        _t4b = wire_symbol_consumption_edges(plan)
+        if _t4b:
+            out["symbol_consumption_edges"] = _t4b
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] R67-T4b 符号补边失败（fail-open；已落边账=%s）",
+                       out.get("symbol_consumption_edges"), exc_info=True)
     try:
         # R65REPLAY-T4：上游账对账放【消费边之后】——W2 能成的边先成（生产者转正为
         # 真上游，账合法保留）；只有成环跳过的矛盾账才被剔除。

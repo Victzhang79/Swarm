@@ -69,13 +69,14 @@ def test_all_owned_passes():
 
 
 def test_p5_dedup_single_source_of_truth():
-    """口径同源（复核 HIGH 修）：孪生裁决交给 P5 dedupe_file_plan 权威函数——
-    被 P5 丢弃的同名后件不进分母；保留件仍无 owner = 真缺件硬打回（绝不 warn 放行）。"""
+    """口径同源（复核 HIGH 修 → R67-1 收权升级）：分母仍与 P5 dedupe_file_plan 同一事实源，
+    但 P5 只剪完全同路径——跨路径同名孪生件全部留在分母，失主必报（旧 basename 全局剪
+    曾把 12 个 UI 模板剪出分母 → 本闸静默放行假完整，round67 "审计跟着剪除者走"实锤）。"""
     fp = [
         "mod-a/src/main/java/com/x/AService.java",
-        "mod-b/src/main/java/com/y/AService.java",   # P5 同名后件 → 权威丢弃，不要求 owner
+        "mod-b/src/main/java/com/y/AService.java",   # R67-1：同名孪生留在分母，失主必报
         "mod-a/pom.xml",
-        "mod-b/pom.xml",                             # _PER_MODULE_FILENAMES：按全路径各自硬性
+        "mod-b/pom.xml",                             # 每模块一份，各自硬性
     ]
     plan = TaskPlan(subtasks=[
         _st("st-1", create=["mod-a/src/main/java/com/x/AService.java", "mod-a/pom.xml"]),
@@ -84,8 +85,8 @@ def test_p5_dedup_single_source_of_truth():
     r = validate_file_plan_ownership(plan, fp)
     blob = " ".join(r.issues)
     assert not r.valid and "mod-b/pom.xml" in blob, "每模块一份的文件缺 owner=真缺件"
-    assert "mod-b/src/main/java/com/y/AService.java" not in blob, (
-        "P5 权威丢弃的孪生件不进校验分母（同一事实源，无自造豁免）")
+    assert "mod-b/src/main/java/com/y/AService.java" in blob, (
+        "R67-1：跨路径同名孪生件必须留在分母，失主必报（账不得被剪除者抹掉）")
 
 
 def test_empty_or_single_subtask_skipped():

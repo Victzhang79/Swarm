@@ -105,8 +105,8 @@ def test_normalize_coerces_dedupes_and_drops_garbage():
     ]
     out = normalize_baseline_covered(raw)
     assert out == [
-        {"id": REQ_A, "reason": "现有代码已实现"},
-        {"id": REQ_B, "reason": ""},
+        {"id": REQ_A, "reason": "现有代码已实现", "evidence": ""},
+        {"id": REQ_B, "reason": "", "evidence": ""},
     ]
 
 
@@ -128,7 +128,7 @@ def test_matrix_baseline_declaration_counts_as_covered():
     m = build_coverage_matrix(
         p, _items(), baseline_covered=[{"id": REQ_B, "reason": "存量已有"}])
     assert m["covered_items"] == 2 and m["uncovered"] == []
-    assert m["baseline_covered"] == [{"id": REQ_B, "reason": "存量已有"}]
+    assert m["baseline_covered"] == [{"id": REQ_B, "reason": "存量已有", "evidence": ""}]
     assert m["dangling_baseline"] == []
 
 
@@ -258,7 +258,7 @@ async def test_plan_writes_baseline_covered_state_key(monkeypatch):
         "complexity": Complexity.MEDIUM,
         "requirement_items": _items(),
     })
-    assert out["baseline_covered"] == [{"id": REQ_B, "reason": "现有代码已满足"}]
+    assert out["baseline_covered"] == [{"id": REQ_B, "reason": "现有代码已满足", "evidence": ""}]
     assert not hasattr(out["plan"], "baseline_covered"), \
         "结构性防丢定案：申报绝不挂 TaskPlan 字段（变异路径天然碰不到）"
 
@@ -299,7 +299,7 @@ async def test_plan_batched_unions_baseline_declarations():
     task_plan, failed, baseline, _cache = await _plan_ultra_batched(
         fake, state, "总需求", {}, "", file_plan)
     assert failed == []
-    assert baseline == [{"id": REQ_B, "reason": "存量模块已有"}]
+    assert baseline == [{"id": REQ_B, "reason": "存量模块已有", "evidence": ""}]
     assert task_plan.subtasks[0].covers == [REQ_A]
 
 
@@ -482,7 +482,7 @@ def test_normalize_keeps_best_reason_on_duplicate():
         {"id": REQ_A, "reason": ""},
         {"id": REQ_A, "reason": "后到但有依据"},
     ])
-    assert out == [{"id": REQ_A, "reason": "后到但有依据"}]
+    assert out == [{"id": REQ_A, "reason": "后到但有依据", "evidence": ""}]
 
 
 def test_normalize_caps_total_entries():
