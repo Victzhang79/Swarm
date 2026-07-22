@@ -699,23 +699,45 @@ def validate_contract_signature_source(plan, shared_contract) -> PlanValidationR
     （_is_method_name_variant，插入/删除一个内部大写词）才判分叉——描述沉默（不列方法名）或完全
     一致均不触发。栈中立：camelCase 方法名惯例（小写开头），PascalCase 方法栈不受益也不受害。
     """
-    from swarm.brain.contract_utils import _norm_scope_path
     result = PlanValidationResult(valid=True)
+    # round67e：分叉本可确定性自愈（reconcile_contract_method_names，收尾器已在 C2 闸前对齐
+    # desc/AC/verify 三面）；此闸是最后一道牙齿——自愈也消解不了（如描述反向权威冲突）才打回。
+    for owner, iface_name, diverged in detect_contract_signature_divergences(
+            plan, shared_contract):
+        _pairs = "; ".join(f"契约 {c!r} vs 描述 {v}" for c, v in diverged[:6])
+        result.add(
+            f"接口 {iface_name} 的契约方法签名与其 owner 子任务描述【方法名分叉】"
+            f"（考卷两个真值源打架，消费方按契约调用必 cannot find symbol 多轮空转）：{_pairs}。"
+            f"统一为唯一真值：把 owner 子任务描述里的方法名改成与 shared_contract.signature "
+            f"完全逐字一致（或反向修正契约），二者方法名必须相同。")
+    return result
+
+
+def detect_contract_signature_divergences(plan, shared_contract):
+    """DR-PM66-C2(#112) 分叉的【结构化】检测——validate_contract_signature_source（报 issue）
+    与 reconcile_contract_method_names（round67e 确定性自愈）的共用真值源，判据单一不漂移。
+
+    返回 [(owner_subtask, iface_name, [(契约方法名 c, [描述变体 t...]), ...]), ...]。
+    判据（同 validate 原逻辑，零误伤）：仅当某契约方法【未在 owner 描述逐字出现】、【且】描述
+    存在它的【近变体】（_is_method_name_variant）才判分叉——描述沉默或完全一致均不触发。
+    """
+    from swarm.brain.contract_utils import _norm_scope_path
     ifaces = (shared_contract or {}).get("interfaces") or []
     if not isinstance(ifaces, list) or not ifaces:
-        return result
+        return []
     subtasks = list(getattr(plan, "subtasks", None) or [])
 
-    def _owner_desc(defined_in: str) -> str | None:
+    def _owner(defined_in: str):
         di = _norm_scope_path(defined_in)
         for st in subtasks:
             sc = getattr(st, "scope", None)
             files = (list(getattr(sc, "create_files", None) or [])
                      + list(getattr(sc, "writable", None) or []))
             if any(_norm_scope_path(f) == di for f in files):
-                return getattr(st, "description", "") or ""
+                return st
         return None
 
+    out: list = []
     for e in ifaces:
         if not isinstance(e, dict):
             continue
@@ -723,17 +745,18 @@ def validate_contract_signature_source(plan, shared_contract) -> PlanValidationR
         sig = str(e.get("signature") or "")
         if not di or not sig:
             continue
-        desc = _owner_desc(di)
-        if desc is None:
-            continue        # 无 owner 子任务：另有 file_plan/ownership 闸覆盖，此处不重复报
+        owner = _owner(di)
+        if owner is None:
+            continue        # 无 owner 子任务：另有 file_plan/ownership 闸覆盖
+        desc = getattr(owner, "description", "") or ""
         c_methods = re.findall(r"(\w+)\s*\(", sig)
         desc_tokens = set(re.findall(r"\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b", desc))
         diverged: list[tuple[str, list[str]]] = []
         for c in c_methods:
             if not c or not c[0].islower():
                 continue    # 只查方法名（小写开头惯例），跳过构造/类型名
-            # 复核整改（猎手 PLAUSIBLE）：逐字出现用【词边界】匹配，非裸子串——否则 'get' 命中
-            # 'target'/'budget' 等无关英文单词内部 → 误判"一致"放过真分叉（#112 假阴性）。
+            # 逐字出现用【词边界】匹配，非裸子串——否则 'get' 命中 'target'/'budget' 内部
+            # → 误判"一致"放过真分叉（#112 假阴性）。
             if c in desc_tokens or re.search(rf"\b{re.escape(c)}\b", desc):
                 continue    # 契约方法在描述里逐字出现 = 一致
             variants = [t for t in desc_tokens
@@ -741,13 +764,8 @@ def validate_contract_signature_source(plan, shared_contract) -> PlanValidationR
             if variants:
                 diverged.append((c, sorted(variants)))
         if diverged:
-            _pairs = "; ".join(f"契约 {c!r} vs 描述 {v}" for c, v in diverged[:6])
-            result.add(
-                f"接口 {e.get('name') or di} 的契约方法签名与其 owner 子任务描述【方法名分叉】"
-                f"（考卷两个真值源打架，消费方按契约调用必 cannot find symbol 多轮空转）：{_pairs}。"
-                f"统一为唯一真值：把 owner 子任务描述里的方法名改成与 shared_contract.signature "
-                f"完全逐字一致（或反向修正契约），二者方法名必须相同。")
-    return result
+            out.append((owner, e.get("name") or di, diverged))
+    return out
 
 
 def validate_file_plan_ownership(

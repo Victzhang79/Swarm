@@ -2734,6 +2734,12 @@ async def plan(state: BrainState) -> dict:
             ["upstream_account_reconcile_failed"]
             if _finish_out.get("upstream_account_reconcile_failed") else []
         ) + (
+            # hunter F1(HIGH)：R67E-T1 C2 方法名自愈整体失效=退回 round67e 死因链（C2 分叉
+            # 原样→打回→LLM 重产不收敛熔断），对称进 degraded 可查（否则唯一信号=无人 grep
+            # 的 WARNING，违反"进度查 API 绝不 grep swarm.log"纪律）。
+            ["contract_method_names_reconcile_failed"]
+            if _finish_out.get("contract_method_names_reconcile_failed") else []
+        ) + (
             # round29 真因4：丢模块=交付范围残缺，必须进 degraded（should_write_success 据此
             # 拦 L6 假成功学习；人工 accept 放行后终态仍诚实带痕）。reducer 追加去重。
             [f"plan_batch_module_dropped:{','.join(m.get('name', '?') for m in _plan_batch_failed)}"]

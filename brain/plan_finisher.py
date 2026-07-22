@@ -912,6 +912,24 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         out["upstream_account_reconcile_failed"] = True
         logger.warning("[PLAN-FINISH] 上游账对账失败（fail-open，幽灵死等账可能残留）",
                        exc_info=True)
+    try:
+        # R67E-T1（round67e 死因治本 task 88584950）：C2 契约方法名分叉【确定性自愈】——放
+        # 【末端】（owner description 已被前序 pass 定型）。契约=权威真值源，对齐 owner
+        # description/acceptance_criteria/verify_commands 三面里的方法名变体，消除 C2 分叉，
+        # 免 VALIDATE C2 闸打回 LLM 重产（round67e 5 轮不收敛熔断真根）。fail-open：自愈挂了
+        # C2 闸兜底打回，不更糟。
+        if shared_contract:
+            from swarm.brain.contract_utils import reconcile_contract_method_names
+            _cmn = reconcile_contract_method_names(plan, shared_contract)
+            if _cmn:
+                out["contract_method_names_reconciled"] = _cmn
+    except Exception:  # noqa: BLE001 — fail-open，VALIDATE C2 兜底
+        # hunter F1(HIGH)：整体失效=退回 round67e 死因链（C2 分叉原样→打回→LLM 重产不收敛
+        # 熔断），必须进 degraded_reasons 可查（对称 upstream_account_reconcile_failed）——
+        # 否则唯一信号是无人 grep 的 WARNING，违反"进度查 API 绝不解析 swarm.log"纪律。
+        out["contract_method_names_reconcile_failed"] = True
+        logger.warning("[PLAN-FINISH] R67E-T1 契约方法名自愈失败（fail-open，C2 闸兜底）",
+                       exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):
         logger.info(

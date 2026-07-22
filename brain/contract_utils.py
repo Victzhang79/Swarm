@@ -2120,6 +2120,85 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
     return summary
 
 
+def reconcile_contract_method_names(plan, shared_contract) -> dict[str, list]:
+    """R67E-T1（round67e 死因治本 task 88584950）：C2 契约方法名分叉【确定性自愈】。
+
+    契约 signature 方法名=唯一权威真值源（tech_design/contract_design 产出，比 plan 阶段
+    LLM 复述的 description 更权威）。确定性把 owner 子任务 description + acceptance_criteria
+    + harness.verify_commands 三面里的方法名【变体】逐字对齐到契约方法名——消除 C2 分叉，
+    无需打回 LLM 重产（round67e 5 轮不收敛熔断真根：LLM 会回退重犯已修接口）。
+
+    三面广播对齐：C2 检测只扫 description，若命中的分叉变体也出现在 AC/verify 而只改 desc →
+    下游 CONFIRM/judge/worker 经 AC/verify 导回原分叉=半修复（照 R65D-T2 reconcile_template_exam
+    范式）；故把 description 里判定的分叉变体【广播】到 desc + acceptance_criteria +
+    harness.verify_commands 三面词边界替换。
+
+    ★hunter F3 已知盲区★：变体检测源=owner description（与 C2 闸 detect 同判据源，validate/
+    reconcile 对称）。仅在 AC/verify 里【独有】、description 从未出现的分叉变体不在本 pass 覆盖
+    ——C2 闸与本自愈对此【对称失明】（不存在"本可自愈却只有 C2 发现"的错位），是 C2 体系既有
+    盲区，登记 future 治理（扩展检测面会改 C2 validate 误伤边界，超本次 blast radius）。
+
+    零误伤：只替换 C2 已判分叉的确切 (契约 c, 描述变体 t) 对（复用
+    detect_contract_signature_divergences 单一判据），词边界替换防子串误伤（长变体先替，防
+    短变体是长变体子串时抢替）。暂存区+单子任务 try/except：某子任务畸形绝不让兄弟半变异
+    （R65D-T2 同律）。幂等（对齐后 detect 不再判分叉）。fail-open：自愈挂了 C2 闸兜底打回，
+    整体失效经 out["contract_method_names_reconcile_failed"] 进 degraded_reasons 可查。
+    返回 {subtask_id: [{"from": t, "to": c}, ...]} 机读摘要（调用方消费 + 日志留痕）。
+    """
+    import re as _re
+
+    from swarm.brain.plan_validator import detect_contract_signature_divergences
+    summary: dict[str, list] = {}
+    for owner, iface_name, diverged in detect_contract_signature_divergences(
+            plan, shared_contract):
+        try:
+            # (变体 t → 契约 c) 全量映射；长变体先替，防短变体是长变体子串时抢替（词边界之外
+            # 的额外保险）。
+            repl = sorted(
+                ((t, c) for c, variants in diverged for t in variants),
+                key=lambda p: len(p[0]), reverse=True)
+            if not repl:
+                continue
+
+            def _sub(text: str, _repl=repl) -> str:
+                for t, c in _repl:
+                    text = _re.sub(rf"\b{_re.escape(t)}\b", c, text)
+                return text
+
+            # 暂存区：先算三面全量结果，任一面异常=本 owner 整体放弃（零半变异）。
+            old_desc = getattr(owner, "description", "") or ""
+            new_desc = _sub(old_desc)
+            h = getattr(owner, "harness", None)
+            old_vcs = list(getattr(h, "verify_commands", []) or []) if h is not None else None
+            new_vcs = [_sub(v) for v in old_vcs] if old_vcs is not None else None
+            old_acc = list(getattr(owner, "acceptance_criteria", []) or [])
+            new_acc = [_sub(a) for a in old_acc]
+            # 一次性提交（三面）。
+            if new_desc != old_desc:
+                owner.description = new_desc
+            if h is not None and new_vcs is not None and new_vcs != old_vcs:
+                h.verify_commands = new_vcs
+            if new_acc != old_acc:
+                owner.acceptance_criteria = new_acc
+            # hunter F2(MED)：同一 owner 拥多个契约接口时按 owner.id extend 累积,不覆盖丢账。
+            summary.setdefault(getattr(owner, "id", "?"), []).extend(
+                {"from": t, "to": c} for t, c in repl)
+            logger.info(
+                "[R67E-T1] 契约方法名自愈 %s(接口 %s)：description 分叉变体广播对齐 desc/验收/"
+                "verify 三面 %d 对 %s（考卷同源,消除 C2 分叉无需打回 LLM）",
+                getattr(owner, "id", "?"), iface_name, len(repl),
+                [f"{t}→{c}" for t, c in repl[:4]])
+        except Exception:  # noqa: BLE001 — 单子任务畸形绝不拖垮全计划的自愈（R65D-T2 同律）
+            # hunter F4(LOW/latent)：三面提交是顺序赋值,当前 SubTask/TaskHarness 无
+            # validate_assignment 故计算阶段(全部 _sub 先于任何提交)失败=零半变异、提交阶段不抛;
+            # 措辞用"自愈中止"而非"保持原样"——未来若模型加固 validate_assignment,提交中途异常
+            # 可能留部分字段已变更,此时该子任务仍被 C2 闸复扫兜底(残留分叉如实打回)。
+            logger.warning(
+                "[R67E-T1] %s 契约方法名自愈中止（兄弟不受影响,残留分叉由 C2 闸复扫兜底）",
+                getattr(owner, "id", "?"), exc_info=True)
+    return summary
+
+
 def _narrow_grep_scan_paths(cmd: str, declared: set[str], owned_areas: set[str]) -> str | None:
     """DR-PM66-C4(#111) 单命令收敛：含 grep 的内容断言命令，剔除【外模块 scope 泄漏】的路径参数。
 
