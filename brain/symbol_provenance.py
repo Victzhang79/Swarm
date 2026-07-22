@@ -164,6 +164,69 @@ def pin_contract_symbol_paths(plan) -> int:
     return pinned
 
 
+def detect_contract_classname_divergences(plan) -> list[dict]:
+    """round67e Phase 2（类治）：契约类名 file-path 分叉的【结构化】检测——
+    reconcile_contract_symbol_paths（确定性对齐）的共用真值源，与 pin_contract_symbol_paths
+    的 tier2_only 同一判据原语（basename_symbol_match），绝不造并列副本。
+
+    死型：契约 interfaces/types/dtos 条目 name=X（ScheduleStrategyService）在 plan 内【无 tier0/1
+    精确/惯例命中】、却【恰有一个 code 文件 V】按 tier2（装饰前缀，AlarmX endswith X）命中，且【恰一个
+    owner 子任务 create 该 V】→ 分叉候选（消费方按契约 import X、只建了 V → L2 cannot find symbol）。
+    多命中 tier2 / 多 owner create / 仅 writable（无 create owner）→ 歧义，不返回（reconcile fail-closed）。
+
+    纯结构检测，零磁盘：方向判定/棕地/撞名闸全在 reconcile（单一 blast 边界，检测只报"谁疑似漂"）。
+    返回 [{"key","item","symbol":X,"owner":st,"v_path","v_stem"}]。
+    """
+    sc = getattr(plan, "shared_contract", None)
+    subs = getattr(plan, "subtasks", None) or []
+    if not isinstance(sc, dict) or not sc or not subs:
+        return []
+    full_idx = _location_index(plan, include_writable=True)
+    if not full_idx:
+        return []
+    creators: dict[str, list] = {}   # create 落点 → 建它的子任务们（仅 create，rename 的是 create 权）
+    for st in subs:
+        for p in _scope_paths(st, include_writable=False):
+            creators.setdefault(p, []).append(st)
+    out: list[dict] = []
+    for key in _PIN_KEYS:
+        val = sc.get(key)
+        if not isinstance(val, list):
+            continue
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if len(name) < 3:
+                continue
+            has_exact = False
+            tier2: list[tuple[str, str]] = []      # (stem, path)
+            for stem, paths in full_idx.items():
+                t = basename_symbol_match(stem, name)
+                if t < 0:
+                    continue
+                if t <= 1:
+                    has_exact = True               # 已有精确/惯例落点=正确命名/owned，无事
+                    break
+                if stem != name:                   # tier2 装饰前缀
+                    tier2.extend((stem, p) for p in paths if _is_code_path(p))
+            if has_exact or len(tier2) != 1:
+                continue                           # 无 tier2 或 多命中歧义 → 不动
+            v_stem, v_path = tier2[0]
+            owners = creators.get(v_path) or []
+            if len(owners) != 1:
+                continue                           # 无 create owner / 多 owner create → 歧义
+            out.append({"key": key, "item": item, "symbol": name,
+                        "owner": owners[0], "v_path": v_path, "v_stem": v_stem})
+    # ★round-2 hunter HIGH（Finding A）★：一个物理文件 V 可 tier2 命中【多个】契约名（AlarmScheduleStrategyService
+    # 同时命中 ScheduleStrategyService 与 StrategyService，都≥8 字符装饰边界）→ 两 div 共享同一 v_path/owner，
+    # 该文件的真名歧义。与"多 owner/多 tier2 候选"同属歧义 → fail-closed 丢弃全部共享 v_path 的 div（绝不挑一个；
+    # 否则 reconcile 处理 div1 改名后 div2 空改却仍钉 defined_in=幻影 pin，且 re-detect 也看不到=自掩盖静默死 L2）。
+    from collections import Counter as _Counter
+    _vc = _Counter(o["v_path"] for o in out)
+    return [o for o in out if _vc[o["v_path"]] == 1]
+
+
 def wire_created_type_references(plan) -> dict[str, list]:
     """②跨子任务类型引用 → producer 路径布进 consumer readable+upstream_artifacts。
 

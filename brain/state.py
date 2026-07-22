@@ -246,6 +246,7 @@ class BrainState(TypedDict, total=False):
     tech_design_failed_modules: list    # W1.1：ultra 两阶段 tech_design 中 phase-2 LLM 失败的模块 [{name, idx, reason}]——这些模块文件丢失，file_plan 不完整，绝不能静默 auto_accept 成功，须升级人工
     tech_design_zero_change_modules: list  # R67B-T2：STAGE2 显式申报零改造的既有基线模块 [{name, idx}]——0 文件是诚实申报非丢失（与 failed 三分账），confirm 人工闸/交付对账据此定向核对
     plan_batch_failed_modules: list     # round29 真因4：PLAN-BATCH 分批拆解失败的模块 [{name, files, reason}]——整模块子任务蒸发=交付范围残缺（d37a52a3 'system-enhance' 14 文件实证），can_auto_accept_plan 据此 fail-fast 升人工；plan 节点 always-emit（成功清空不粘滞）
+    contract_symbol_paths_unhealed: list  # R67E-P2（round-2 hunter Finding B）：本轮 finish 后仍未愈的契约类名 file-path 分叉符号名 [X,...]（greenfield 已愈=[]，棕地/歧义 punt 或畸形残留=非空，将死 L2）——★last-write-wins 观测键，绝不进 append-only degraded_reasons（coverage_gap_residual:196 同律：那里无人能清，愈合后陈旧粘滞会永久误拦 should_write_success 学习+误导 deliver）★；plan 节点 always-emit（愈合清空不粘滞）；纯诚实观测非门（未愈将由 L2 真失败兜底门，刻意不硬 REJECT 避免复刻 round67e 名分叉重产不收敛熔断）
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
     design_review: dict                 # {decision: approve|reject, feedback, reject_count}
     # ─── 渐进明细(两层)───
@@ -304,6 +305,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "plan_validation_feedback": "oneshot",
     "plan_batch_cache": "round",
     "plan_batch_failed_modules": "round",
+    "contract_symbol_paths_unhealed": "round",  # R67E-P2：last-write-wins 观测键，愈合清空不粘滞（Finding B）
     "baseline_covered": "round",
     "coverage_watermark": "monotonic",
     "baseline_ineligible_reqs": "monotonic",  # R65E9-T1：拒掉的假 baseline_covered id 单调累积

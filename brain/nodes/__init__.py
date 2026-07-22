@@ -2276,6 +2276,9 @@ async def plan(state: BrainState) -> dict:
             "failure_escalated": False,
             # round29 真因4 always-emit（复核 LOW）：SIMPLE 路径不走分批，恒发 []，保不变量字面自洽。
             "plan_batch_failed_modules": [],
+            # R67E-P2 always-emit（round-3 复核 LOW 一致性）：SIMPLE 无契约类名 file-path 分叉面，恒发 []
+            # 与主路径 always-emit 键风格一致（防跨轮粘滞，同 plan_batch_failed_modules/baseline_covered）。
+            "contract_symbol_paths_unhealed": [],
             # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
             "baseline_covered": [],
             # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
@@ -2747,6 +2750,11 @@ async def plan(state: BrainState) -> dict:
         ),
         # round29 真因4：always-emit（空也发）——防粘滞 + 供 can_auto_accept_plan 闸门消费。
         "plan_batch_failed_modules": _plan_batch_failed,
+        # R67E-P2（round-2 hunter Finding B）：本轮未愈的契约类名 file-path 分叉符号 always-emit
+        # last-write-wins（愈合=[] 整体覆盖清空不粘滞）——★绝不进 append-only degraded_reasons（那里无人
+        # 能清→愈后陈旧永久误拦 should_write_success 学习+误导 deliver，coverage_gap_residual 同律）★；
+        # 纯诚实观测非门（未愈由 L2 真失败兜底），刻意不硬 REJECT 避免复刻 round67e 重产不收敛熔断。
+        "contract_symbol_paths_unhealed": _finish_out.get("contract_symbol_paths_unhealed") or [],
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
         # R32-1 U2 + R35-C always-emit：本轮成功批缓存（非分批/降级路径恒 {}）。

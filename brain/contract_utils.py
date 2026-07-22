@@ -2199,6 +2199,168 @@ def reconcile_contract_method_names(plan, shared_contract) -> dict[str, list]:
     return summary
 
 
+def reconcile_contract_symbol_paths(
+    plan, file_plan, project_path: str | None = None, base_ref: str | None = None,
+) -> dict[str, list]:
+    """round67e Phase 2（类治）：契约类名 file-path 分叉【确定性对齐】（v1 greenfield-only，fail-closed 重）。
+
+    死型（tier2_only 类名分叉）：契约条目 name=X（ScheduleStrategyService），owner 子任务 create_files +
+    file_plan 同漂到装饰变体 V（AlarmScheduleStrategyService.java，basename tier2）→ 契约落单 → 消费方按
+    契约 import X、只建了 V → L2 cannot find symbol X。pin 现状：tier2 故意不钉 → 甩执行期符号接地兜不住。
+
+    治：finish_plan_deterministic 早位（renormalize 之后、孤儿挂靠之前）跑本 pass，把 owner
+    create_files + file_plan + description/AC/verify 三面 + 契约 defined_in 对齐到契约名 X。names 转 tier0
+    后 elaborate 的 pin/wire 原样接管连消费方（下游零改）。检测=detect_contract_classname_divergences（本地
+    import 避免循环）。
+
+    ★方向/撞名 六闸（全 fail-closed，v1 只做纯 greenfield）★（deep_read_findings/18 §三 + 对抗双复核整改）：
+    1. project_path 存在且是目录；1b. **必须是 git repo**（.git 存在）——非 git 时 _exists_in_repo 退化活磁盘
+       isfile（读未构建工作树，非 base 权威），对"改文件"这种高 blast 动作不可信，fail-closed（hunter LOW 整改）。
+    2. V 或目标 T 在 git-pin base（_exists_in_repo，盲区 D）→ 棕地（改契约+消费方高 blast / owner 应 MODIFY）→ punt；
+    3. 目标 stem X 已被别的子任务 create（别包同名）→ G1 _cross_package_same_basename_creates 会 REJECT → punt；
+    4. 目标全路径 T 已被任何子任务 write（create∪writable）→ 写冲突 → punt；
+    5. 检测阶段已保证 tier2 唯一命中 + 唯一 create owner（多命中/多 owner 歧义不返回）；
+    6. **多 div 同调用内目标撞车**：create_stems/all_write 每次提交后【就地更新】——两 div 目标同路径时
+       第二个被闸 3/4 逮住，不再吃陈旧快照（对抗双复核 MEDIUM 整改）。
+    棕地两方向 + 歧义 + 无 project_path/非 git 全 punt（退回 pin tier2_only 现状=零回归；round67c 盲区 I：无实证绝不挑边）。
+
+    ★未愈可见（hunter CRITICAL 整改）★：punt/畸形导致未愈的分叉【绝不静默】——finish 收尾器在本 pass 后
+    重跑 detect（幂等：已愈转 tier0 消失，残留=未愈）写 last-write-wins 观测键 contract_symbol_paths_unhealed
+    （always-emit，愈合=[] 清空不粘滞；★绝不进 append-only degraded_reasons：那里无人能清→陈旧粘滞，Finding B★）。
+    **刻意不加硬 REJECT 回灌闸**（对称 C2 的 validate_contract_signature_source）：round67e 铁证=LLM 重产名分叉
+    5 轮不收敛熔断，硬打回只会复刻该死因；file-path 分叉 LLM 更改不动（改 create_files 归属）。故"能确定性愈的愈，
+    愈不了的诚实上报 degraded"（北极星：honest PARTIAL > false DONE / 熔断），非甩回 LLM。
+
+    ★词边界铁律（reviewer HIGH 整改）★：文本三面替换用 ASCII lookaround `(?<![0-9A-Za-z_])..(?![0-9A-Za-z_])`
+    而非 `\b`——CJK 表意字是 `\w`(category Lo)，`\b` 在【汉字紧贴标识符】(实现XxxService接口，中文无分隔惯例)时
+    【零匹配】→ 结构名改了、三面文本没改=半修复(worker 建 X.java 却按描述命名类 V → public class/文件名不符 L1 崩)。
+    与 plan_validator:565 / symbol_provenance:227 既有 ASCII lookaround 口径同源（C2 reconcile 的 `\b` 同型隐患，
+    登记 future——C2 detect/reconcile 同用 `\b` 对称失明=漏检 punt 非半修复，低一档且属已发版代码，另案）。
+
+    纪律：★原子暂存（hunter LOW/latent 整改）★——三面文本 + 全 scope 路径重写 + file_plan 改动全【先算进 staging】，
+    末尾一次性提交；提交阶段纯赋值不抛（即便未来 SubTask 加 validate_assignment，跨全子任务的 scope 循环也不半变异）。
+    per-div try/except（一条畸形不拖垮兄弟）；幂等；fail-open（整体失效 finish 记 out["...reconcile_failed"] 诊断 +
+    独立 try 重跑 detect 仍把 crash-残留分叉纳入 unhealed 观测键，绝不静默）。
+    返回 {owner_id: [{"from":V_path,"to":T_path,"symbol":X}, ...]} 机读摘要（未愈另由 finish 重跑 detect 上报）。
+    """
+    import os as _os
+    import re as _re
+
+    from swarm.brain.symbol_provenance import detect_contract_classname_divergences
+    divs = detect_contract_classname_divergences(plan)
+    if not divs:
+        return {}
+    subs = getattr(plan, "subtasks", None) or []
+    fp_list = file_plan if isinstance(file_plan, list) else []
+    # 撞名/写冲突全集：所有 create 落点的 stem（G1 别包同名闸口径）+ 所有 write 路径（写冲突口径）。多 div
+    # 每提交一次就地更新（闸 6），故用可变 dict/set 贯穿循环。
+    create_stems: dict[str, set[str]] = {}
+    all_write: set[str] = set()
+    for st in subs:
+        sc = getattr(st, "scope", None)
+        for f in (getattr(sc, "create_files", None) or []):
+            p = _norm_scope_path(f)
+            create_stems.setdefault(p.rsplit("/", 1)[-1].split(".", 1)[0], set()).add(p)
+        all_write |= {_norm_scope_path(f) for f in (
+            list(getattr(sc, "create_files", None) or [])
+            + list(getattr(sc, "writable", None) or []))}
+    cache: dict[str, bool] = {}
+    _is_git = bool(project_path) and _os.path.isdir(_os.path.join(project_path or "", ".git"))
+    summary: dict[str, list] = {}
+    for d in divs:
+        try:
+            X, owner = d["symbol"], d["owner"]
+            v_path, v_stem = _norm_scope_path(d["v_path"]), d["v_stem"]
+            _base = v_path.rsplit("/", 1)[-1]
+            _ext = _base.rsplit(".", 1)[-1] if "." in _base else "java"
+            _dir = v_path.rsplit("/", 1)[0] if "/" in v_path else ""
+            t_path = f"{_dir}/{X}.{_ext}" if _dir else f"{X}.{_ext}"
+            # ── 六闸（全 fail-closed）──
+            if t_path == v_path:
+                continue
+            if not project_path or not _os.path.isdir(project_path) or not _is_git:
+                continue                           # 闸 1/1b：非目录/非 git → 无 base 权威 → 绝不改文件
+            if (_exists_in_repo(project_path, v_path, cache, base_ref)
+                    or _exists_in_repo(project_path, t_path, cache, base_ref)):
+                continue                           # 闸 2：棕地任一方向 → punt
+            if (create_stems.get(X, set()) - {v_path, t_path}):
+                continue                           # 闸 3/6：目标 stem 撞别的子任务 create（含前序 div 已提交）
+            if t_path in (all_write - {v_path}):
+                continue                           # 闸 4/6：目标全路径撞别人 write（含前序 div 已提交）
+            # ── 原子暂存：三面文本 + 全 scope 重写 + file_plan 改动全先算，末尾一次性提交 ──
+            def _sub(text, _v=v_stem, _x=X):       # ASCII lookaround，防 CJK 紧贴半修复（reviewer HIGH）
+                return _re.sub(rf"(?<![0-9A-Za-z_]){_re.escape(_v)}(?![0-9A-Za-z_])", _x, text)
+            old_desc = getattr(owner, "description", "") or ""
+            new_desc = _sub(old_desc)
+            h = getattr(owner, "harness", None)
+            old_vcs = list(getattr(h, "verify_commands", []) or []) if h is not None else None
+            new_vcs = [_sub(v) for v in old_vcs] if old_vcs is not None else None
+            old_acc = list(getattr(owner, "acceptance_criteria", []) or [])
+            new_acc = [_sub(a) for a in old_acc]
+            # 全 scope 路径重写 v_path→t_path（owner create 权不变仅改名；兄弟悬空 readable/upstream/delete
+            # 同步归一，无悬空）——含 delete_files（reviewer LOW：FileScope.is_writable 也查 delete_files）。
+            scope_changes: list = []               # (scope_obj, attr, new_list)
+            for st in subs:
+                sc = getattr(st, "scope", None)
+                if sc is None:
+                    continue
+                for attr in ("create_files", "writable", "readable",
+                             "upstream_artifacts", "delete_files"):
+                    lst = getattr(sc, attr, None)
+                    if not lst:
+                        continue
+                    new, seen, changed = [], set(), False
+                    for f in lst:
+                        nf = t_path if _norm_scope_path(f) == v_path else f
+                        if nf != f:
+                            changed = True
+                        k = _norm_scope_path(nf)
+                        if k not in seen:
+                            seen.add(k)
+                            new.append(nf)
+                    if changed:
+                        scope_changes.append((sc, attr, new))
+            # file_plan 归一（dict {"path":...} 与 bare-str 混合形态都要处理——normalized_file_plan_paths
+            # 两种都读；只改 dict 会漏 str → R40-1 判孤儿把旧名复活成重复，hunter HIGH）。
+            fp_changes: list = []                  # (index, new_value)
+            for _i, e in enumerate(fp_list):
+                if isinstance(e, dict):
+                    if _norm_scope_path(str(e.get("path") or "")) == v_path:
+                        fp_changes.append((_i, {**e, "path": t_path}))
+                elif isinstance(e, str) and _norm_scope_path(e) == v_path:
+                    fp_changes.append((_i, t_path))
+            # ── 一次性提交（纯赋值，不抛；跨全子任务无半变异）──
+            for _sc, _attr, _new in scope_changes:
+                setattr(_sc, _attr, _new)
+            for _i, _val in fp_changes:
+                fp_list[_i] = _val
+            if new_desc != old_desc:
+                owner.description = new_desc
+            if h is not None and new_vcs is not None and new_vcs != old_vcs:
+                h.verify_commands = new_vcs
+            if new_acc != old_acc:
+                owner.acceptance_criteria = new_acc
+            d["item"]["defined_in"] = t_path       # 显式钉，不依赖 elaborate pin 再推导
+            # 闸 6：就地更新撞名/写冲突全集，后续 div 见一致视图
+            create_stems.setdefault(X, set()).add(t_path)
+            _vs = create_stems.get(v_stem)
+            if _vs is not None:
+                _vs.discard(v_path)
+            all_write.discard(v_path)
+            all_write.add(t_path)
+            summary.setdefault(getattr(owner, "id", "?"), []).append(
+                {"from": v_path, "to": t_path, "symbol": X})
+            logger.info(
+                "[R67E-P2] 契约类名 file-path 对齐 %s：%s→%s（契约名权威，greenfield 磁盘判方向）"
+                "——create_files+file_plan+desc/AC/verify 三面+defined_in 同步，names 转 tier0 交 pin/wire 接管消费方",
+                getattr(owner, "id", "?"), v_stem, X)
+        except Exception:  # noqa: BLE001 — 一条畸形不拖垮兄弟（R65D-T2/C2 同律），残留由 finish 重跑 detect 上报 degraded
+            logger.warning(
+                "[R67E-P2] %s 类名 file-path 对齐中止（兄弟不受影响，残留分叉退回 pin tier2_only 现状）",
+                d.get("symbol"), exc_info=True)
+    return summary
+
+
 def _narrow_grep_scan_paths(cmd: str, declared: set[str], owned_areas: set[str]) -> str | None:
     """DR-PM66-C4(#111) 单命令收敛：含 grep 的内容断言命令，剔除【外模块 scope 泄漏】的路径参数。
 

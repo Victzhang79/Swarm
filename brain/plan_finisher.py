@@ -773,6 +773,37 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         logger.warning("[PLAN-FINISH] R67B-T1 归属重规范化失败（fail-open，G1 兜底）",
                        exc_info=True)
     try:
+        # R67E-P2（round67e 类治，类名 file-path 分叉）：必跑在【renormalize 之后、孤儿挂靠/脚手架之前】
+        # ——rename create_files 必须与 file_plan 同串归一（否则 R40-1 判孤儿 + attach 把旧名复活成重复）；
+        # 早于孤儿挂靠读 file_plan。owner create_files+file_plan+desc/AC/verify 三面+contract defined_in 对齐
+        # 到契约名（greenfield 磁盘判方向，fail-closed 重），names 转 tier0 后 elaborate pin/wire 接管消费方。
+        if shared_contract:
+            from swarm.brain.contract_utils import reconcile_contract_symbol_paths
+            _csp = reconcile_contract_symbol_paths(
+                plan, file_plan, project_path=project_path, base_ref=base_ref)
+            if _csp:
+                out["contract_symbol_paths_reconciled"] = _csp
+    except Exception:  # noqa: BLE001 — fail-open，pin tier2_only 现状兜底；残留分叉由下方 always-emit 重跑 detect 观测
+        out["contract_symbol_paths_reconcile_failed"] = True
+        logger.warning("[PLAN-FINISH] R67E-P2 契约类名 file-path 对齐失败（fail-open，pin tier2_only 兜底）",
+                       exc_info=True)
+    if shared_contract:
+        # ★hunter CRITICAL 整改：未愈可见★——独立 try（reconcile 崩了也跑，故 crash-残留也观测到）重跑
+        # detect（幂等：已愈转 tier0 消失，残留=punt/畸形/歧义未愈的分叉，将死 L2）。★Finding B：写
+        # last-write-wins 观测键 always-emit（愈合=[] 清空不粘滞），plan 节点整体替换回 state，绝不进
+        # append-only degraded_reasons（那里无人能清→愈后陈旧粘滞永久误拦 should_write_success+误导 deliver）★。
+        # 刻意不硬 REJECT（会复刻 round67e 名分叉 LLM 重产不收敛熔断；file-path 分叉 LLM 改不动归属），
+        # 诚实观测由 L2 真失败兜底门（北极星：honest PARTIAL > false DONE / 熔断）。
+        try:
+            from swarm.brain.symbol_provenance import (
+                detect_contract_classname_divergences,
+            )
+            out["contract_symbol_paths_unhealed"] = sorted(
+                {d["symbol"] for d in detect_contract_classname_divergences(plan)})
+        except Exception:  # noqa: BLE001
+            logger.warning("[PLAN-FINISH] R67E-P2 未愈分叉 detect 复扫失败（观测缺失，非致命）",
+                           exc_info=True)
+    try:
         # R67C-T3b：pom-写倒挂拆分——必跑在脚手架注入【之前】，R58-3 才会把权威模板嵌进新早叶 owner。
         from swarm.brain.contract_utils import split_manifest_owner_leaf
         _split = split_manifest_owner_leaf(plan)
