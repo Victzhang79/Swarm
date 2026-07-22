@@ -408,7 +408,15 @@ class ModuleLock:
                     r.eval(_LOCK_RELEASE_LUA, 1, self.key, self.token)
                 except Exception as exc:
                     _invalidate_redis(exc)  # H-1：坏 client 作废重探（key 靠 TTL 回收）
-                    logger.debug("[ModuleLock] release: %s", exc)
+                    # round67d 复核（hunter 维度1）：Redis DEL 失败=该 key 留 SET 靠 TTL 回收=
+                    # 【锁泄漏】(其它任务该键 TTL 内不可 acquire)——rebalance 回滚正依赖本函数结果，
+                    # 静默吞 DEBUG 会让回滚泄漏零可见。升 WARNING（与上方 Redis 不可用分支对称，
+                    # 符合"降级路径至少一次 WARNING"纪律）。
+                    logger.warning(
+                        "[ModuleLock] release 时 Redis DEL 失败，锁 %s 的 Redis key 未删除→"
+                        "靠 TTL(%ds)过期回收（此间其它任务无法获取该键）: %s",
+                        self.key, self.ttl_sec, exc,
+                    )
             self._redis_held = False
         if self._local_held:
             try:
@@ -650,11 +658,28 @@ def upgrade_module_lock(
                 f"模块锁降级冲突：{lock.module_key} → {new_key}（模块键异常争用）")
         lock.release()  # 释放旧 default 的 per-key（门已在降级内交出，release 跳过门）
     else:
-        # 窄锁→更宽锁（非写者）：保持 acquire-before-release，避免释放窗口丢已持模块键。
-        if not new_lock.acquire():
+        # 窄→宽（或键集变化，非 project_wide）：绝不 acquire-before-release 重叠键——new_lock 用
+        # 【新 token】去抢【本组合锁自己仍持有的重叠键】=自撞同 key 非重入进程锁(_local_lock_for)
+        # + Redis SET NX 同键 → 100% 冲突 fail-loud（round67d task b54d4bd3 死因："其它任务持有"
+        # 实为同任务旧锁自撞）。改走原地差集 rebalance：kept 复用旧子锁(同 token 不碰)/added 增量
+        # acquire/removed 释放——无自撞、无释放窗口、fail-closed。new_lock 在此路径不使用。
+        _rebal = lock if isinstance(lock, MultiModuleLock) else None
+        if _rebal is None:
+            # 防御：进 else 的旧锁恒为已升级组合锁（首升 default 走降级分支产 MultiModuleLock）。
+            # 理论不可达；把单键旧锁包成组合容器再 rebalance，复用旧子锁 token 不自撞。
+            # 复核 LOW：wrap 前 fail-closed 断言旧锁真持有——否则 kept 复用会当 phantom lock（split-brain）。
+            if not getattr(lock, "_held", False):
+                raise ModuleLockUpgradeConflict(
+                    f"模块锁升级冲突：{lock.module_key} → {new_key}（旧锁未持有，拒绝 phantom 复用）")
+            _rebal = MultiModuleLock(project_id, [lock.module_key], ttl_sec=lock.ttl_sec)
+            _rebal._locks = [lock]
+        _failed = _rebal.rebalance_to(new_keys)
+        if _failed is not None:
             raise ModuleLockUpgradeConflict(
-                f"模块锁升级冲突：{lock.module_key} → {new_key}（目标键被其它任务持有）")
-        lock.release()
+                f"模块锁升级冲突：{lock.module_key} → {new_key}"
+                f"（新增模块键 {_failed} 被其它任务持有）")
+        logger.info("[ModuleLock] upgraded → %s (增量 rebalance)", _rebal.module_key)
+        return _rebal
     logger.info("[ModuleLock] upgraded %s → %s", lock.module_key, new_key)
     return new_lock
 
@@ -793,6 +818,65 @@ class MultiModuleLock:
             lk._gate_last_ok_monotonic = time.monotonic() if redis_gate_ok else 0.0
             lk._held = True
         return True
+
+    def _child_keys(self) -> list[str]:
+        """当前持有的子模块键（有序）。"""
+        return [lk.module_key for lk in self._locks]
+
+    def rebalance_to(self, new_keys: list[str]) -> "str | None":
+        """E3 升级自死锁治本（round67d task b54d4bd3）：原地把持有键集调整到 new_keys，
+        【绝不重新 acquire 已持重叠键】。
+
+        病根：窄→宽升级若新建 MultiModuleLock 全量 acquire，new 子锁用【新 uuid token】去抢
+        【本组合锁自己仍持有的重叠键】(root…)——撞同 key 全局非重入 threading.Lock(_local_lock_for)
+        + Redis SET NX 同键 → 100% 自撞冲突 → fail-loud（"其它任务持有"实为同任务旧锁自撞）。治：差集——
+          kept=new∩old 复用旧子锁(同 token 续持，零动作=消除自撞)；
+          added=new−old 增量有序 acquire(标准路径，门墙钟 _acquire_gate 自 bootstrap，#98 对称)；
+          removed=old−new 待 added 全部到手后释放(缩集=让位，安全侧)。
+        added 任一失败→回滚【本次】added→旧集全键【原样保留】(绝不误放)→返回 False(调用方 fail-loud)。
+        不变量：无自撞(kept 不碰) / 无释放窗口(added 失败时 kept 全持、removed 仅在 added 全成功后释放)
+        / fail-closed(added 失败即返回失败键) / 状态自洽(kept 复用 _held=True reader，added 标准 acquire)。
+
+        返回：None=成功（持有集已调整到 new_keys）；非 None=首个【真获取失败】的新增键名——调用方
+        据此精确报错，绝不把 acquire-then-rollback 的其它新增键误报为"被占"（round67d 复核 reviewer MED）。
+        调用方义务（契约，唯一调用方 runner 已满足）：传入组合锁全子键须【真持有】——kept 复用不重新
+        acquire/不校验存活，依赖调用方前置保证锁未失效（runner 在 plan 节点前 renew+TaskLockLost abort）。
+        违约=split-brain（本函数对 _held=False 的 kept 子锁留 WARNING 痕，reviewer LOW + hunter 维度4）。"""
+        target = sorted(set(new_keys)) or ["default"]
+        cur: dict[str, ModuleLock] = {lk.module_key: lk for lk in self._locks}
+        added_keys = [k for k in target if k not in cur]
+        removed_keys = [k for k in cur if k not in target]
+        # round67d 复核：kept 复用无内部持有校验，依赖调用方契约。对 _held=False 的 kept 子锁留
+        # WARNING 痕（未来违约调用方=split-brain 前兆可观测），不静默复用假持有键。
+        for _k, _lk in cur.items():
+            if _k in target and not getattr(_lk, "_held", False):
+                logger.warning(
+                    "[ModuleLock] E3 rebalance 复用子锁 %s 但 _held=False（调用方未保证存活？"
+                    "split-brain 前兆）——按契约仍复用，请核调用方前置 renew", _k)
+        # 1) 增量获取新增键（有序=无死锁）；任一失败回滚本次已获取，旧集【不动】，fail-loud。
+        newly: list[ModuleLock] = []
+        for k in added_keys:
+            lk = ModuleLock(self.project_id, k, ttl_sec=self.ttl_sec, project_wide=False)
+            if lk.acquire():
+                newly.append(lk)
+                continue
+            for g in reversed(newly):  # 回滚，绝不半持新增键
+                try:
+                    g.release()
+                except Exception:  # noqa: BLE001 — 回滚失败留痕不掩盖 acquire 失败
+                    logger.warning("[ModuleLock] E3 rebalance 回滚释放 %s 失败", g.module_key)
+            return k  # 首个【真获取失败】的新增键（调用方精确报错，不误报已回滚的其它新增键）
+        # 2) 新增键全部到手 → 释放移除键（缩集，安全侧让位；旧集始终不空窗）。
+        for k in removed_keys:
+            try:
+                cur[k].release()
+            except Exception:  # noqa: BLE001 — 单键释放失败不挡其余（TTL 兜底）
+                logger.warning("[ModuleLock] E3 rebalance 释放移除键 %s 失败（TTL 兜底）", k)
+        # 3) 原地更新持有集：kept(复用旧子锁) + newly，按键序稳定排列（renew/release 顺序无关）。
+        kept = [cur[k] for k in target if k in cur]
+        self._locks = sorted(kept + newly, key=lambda _l: _l.module_key)
+        self.module_key = "+".join(target)
+        return None
 
 
 class TaskQueue:
