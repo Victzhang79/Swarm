@@ -346,6 +346,7 @@ class ResolvedDep:
 
 def resolve_artifacts(project_path: str, artifacts: list[str],
                       idx: BaselineIndex | None = None,
+                      extra_module_artifacts: set[str] | None = None,
                       ) -> tuple[list[ResolvedDep], list[str]]:
     """把契约 artifacts（裸名或 g:a[:v]）解析成可写入 pom 的坐标。
 
@@ -361,6 +362,16 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
          Maven 连 reactor 都读不出，是比缺依赖严重一个数量级的全局故障）。
     """
     index = idx if idx is not None else index_baseline(project_path)
+    # R67C-T2（round67c st-37 死型）：index_baseline 读【工作树根 pom <modules>】，只含【base 既有】
+    # 模块。plan 正在【新增】的模块（如 ruoyi-alarm，st-13-1 已登记 com.ruoyi:ruoyi-alarm 进 reactor）
+    # base pom 里还没有 → is_module 返 False → 裸名走 Central 反查查不到 → R53-1 误剔。误剔后模板 pom
+    # 缺该依赖、验收却仍"必须声明" → st-37 fail L1 + ruoyi-admin 不依赖 alarm → 主 app 不 scan alarm
+    # 控制器/引擎/视图 → 运行期全 404（编译绿、启动红）。调用方把 plan 自己在建的模块名传进来，
+    # 认作 reactor 兄弟（${project.version}），与 T5 新兄弟内部依赖派生（contract_utils L1338）同源。
+    if extra_module_artifacts:
+        from dataclasses import replace as _dc_replace
+        index = _dc_replace(
+            index, module_artifacts=index.module_artifacts | set(extra_module_artifacts))
     kept: list[ResolvedDep] = []
     dropped: list[str] = []
     seen: set[tuple[str, str]] = set()

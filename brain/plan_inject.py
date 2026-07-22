@@ -225,6 +225,15 @@ def prepare_injected_state(
             "plan_inject_coherence_failed",
             f"注入 plan G1 模块 coherence 校验未通过（逻辑模块↔物理构建单元不相交，"
             f"直穿 DISPATCH 必死 reactor）：{_g1.issues[:8]}")
+    # R67C-T6（hunter 二/三轮 CONFIRMED）：G1 warn（③e 汇聚点 / ③g R67C-T6 悬空占位孤岛等）在
+    # live VALIDATE 节点会逐条 logger.warning + 折进 state["plan_validation_warnings"]（机读面，
+    # 进 deliver payload、API/盯跑/复盘据它读）。注入通道刻意无 VALIDATE 兜底 → 此前把 .warnings
+    # 整个丢弃。★必须【日志+机读 state 键】两半都镜像★：只 log 不 seed=G3-2 log-and-forget 病复现
+    # （API/机读面仍看不见）。收集结构闸(_vres)+G1(_g1) 全部 warn，随注入 state 以 confirm 名义落键。
+    _inject_warnings = [str(_w) for _w in (getattr(_vres, "warnings", None) or [])]
+    _inject_warnings += [str(_w) for _w in (getattr(_g1, "warnings", None) or [])]
+    for _w in _inject_warnings:
+        logger.warning("[PLAN-INJECT] plan 校验告警（非阻断，回放同 surface）：%s", _w)
     if shared_contract:
         _cres = validate_contract_ownership(
             plan, shared_contract, project_path=project_path)
@@ -252,6 +261,9 @@ def prepare_injected_state(
         "shared_contract": shared_contract,
         "tech_design_file_plan": file_plan,
         "human_decision": HumanDecision.ACCEPT,
+        # R67C-T6：注入通道无 VALIDATE 节点写此机读键→在此 seed（与 live VALIDATE 同键），否则
+        # 注入/回放任务的 plan_validation_warnings 机读面永久空/陈旧（deliver payload/API 看不见）。
+        "plan_validation_warnings": _inject_warnings,
     }
 
 

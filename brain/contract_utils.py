@@ -321,19 +321,46 @@ def _dep_group_from_baseline(project_path: str, artifact_id: str) -> str | None:
     return None
 
 
-def resolve_scaffold_artifacts(project_path: str | None, artifacts: list[str]):
+def _plan_module_artifacts(plan) -> set[str]:
+    """R67C-T2：plan 自己在建/声明的模块 artifactId 集——新模块 base pom 尚无 <module> 登记，
+    坐标解析须认它们为 reactor 兄弟，否则裸名走 Central 反查→R53-1 误剔（round67c st-37 死型：
+    ruoyi-alarm 被误剔→ruoyi-admin 不依赖 alarm→主 app 不 scan→运行期全 404）。来源：契约
+    dependencies 各 entry 的 module ∪ 全子任务 create/writable 的物理模块根。栈中立（模块=物理
+    路径，artifactId=dir 名，与 maven_registry index 的 <module> 口径一致）。"""
+    mods: set[str] = set()
+    sc = getattr(plan, "shared_contract", None)
+    if isinstance(sc, dict):
+        for e in (sc.get("dependencies") or []):
+            if isinstance(e, dict):
+                m = str(e.get("module") or "").strip().rstrip("/")
+                if m:
+                    mods.add(m.rsplit("/", 1)[-1])
+    for st in (getattr(plan, "subtasks", None) or []):
+        _sc = getattr(st, "scope", None)
+        for f in (list(getattr(_sc, "create_files", None) or [])
+                  + list(getattr(_sc, "writable", None) or [])):
+            r = _code_module_root(str(f))
+            if r:
+                mods.add(r.rstrip("/").rsplit("/", 1)[-1])
+    mods.discard("")
+    return mods
+
+
+def resolve_scaffold_artifacts(project_path: str | None, artifacts: list[str],
+                               extra_module_artifacts: set[str] | None = None):
     """R53-1：契约 artifacts → 可写入 pom 的确定性坐标 (kept, dropped)。
 
     模板与验收标准必须**同源**：能解析的才进模板、才进契约/验收；解析不到的一并剔除。
     旧实现把依赖从模板里省略、验收却仍要求"声明契约全部 artifacts" → 自相矛盾 →
     worker 只能手写臆造坐标（round53 实锤：幻影 alarm-interface 无 version，Maven 连
     reactor 都读不出，全体 worker 构建闸 BLOCKED）。project_path 未知/解析器异常 →
-    退回旧行为（全部省略，不阻断规划）。"""
+    退回旧行为（全部省略，不阻断规划）。extra_module_artifacts=plan 新增模块（R67C-T2）。"""
     if not project_path:
         return [], list(artifacts)
     try:
         from swarm.brain.maven_registry import resolve_artifacts
-        return resolve_artifacts(project_path, list(artifacts))
+        return resolve_artifacts(project_path, list(artifacts),
+                                 extra_module_artifacts=extra_module_artifacts)
     except Exception as exc:  # 解析器/网络异常绝不阻断规划期
         logger.warning("[SCAFFOLD-TPL] R53-1 坐标解析不可用（%s）→ 退回省略旧行为", exc)
         return [], list(artifacts)
@@ -409,7 +436,8 @@ def _aggregator_pom_template(agg_dir: str, submodules: list[str],
 def _deterministic_pom_template(mod: str, artifacts: list[str],
                                 project_path: str | None,
                                 resolved: list | None = None,
-                                parent_gav: tuple[str, str, str] | None = None) -> str:
+                                parent_gav: tuple[str, str, str] | None = None,
+                                extra_module_artifacts: set[str] | None = None) -> str:
     """R45-2：从根 pom parent GAV + 契约 artifacts 确定性生成模块 pom 模板。
 
     根 pom 不可解析/无 project_path → 返回空串（scaffold 退回旧行为，不假装精确）。
@@ -444,7 +472,10 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
         # R47-2 铁律不变（绝不伪造工程 groupId），但不再"查不到就一律省略"——省略会让权威
         # 模板变空壳 pom，而验收标准仍要求声明全部依赖 → 逼 worker 手写臆造坐标。
         if resolved is None:
-            resolved, _dropped = resolve_scaffold_artifacts(project_path, artifacts)
+            # R67C-T2 防御纵深：回退解析也须认 plan 新模块（当前调用方均传 resolved= 故此路
+            # 未达，但防未来重构者省略 resolved 时静默退回 pre-T2 行为=新模块误剔复现 st-37 死型）。
+            resolved, _dropped = resolve_scaffold_artifacts(
+                project_path, artifacts, extra_module_artifacts=extra_module_artifacts)
             if _dropped:
                 logger.warning(
                     "[SCAFFOLD-TPL] 模块 %s 的 %d 个契约依赖无法解析坐标/版本 → 从模板省略"
@@ -965,6 +996,7 @@ def prune_contract_dependencies(plan, project_path: str | None) -> dict[str, lis
     staged: list[tuple[dict, list, str, list[str]]] = []
     total_arts = 0
     total_dropped = 0
+    _pma = _plan_module_artifacts(plan)   # R67C-T2：plan 新模块认作 reactor 兄弟，不误剔
     try:
         from swarm.brain.maven_registry import resolve_artifacts
         for entry in deps:
@@ -980,7 +1012,8 @@ def prune_contract_dependencies(plan, project_path: str | None) -> dict[str, lis
             if not mod or not orig:
                 continue
             total_arts += len(orig)
-            _kept, dropped = resolve_artifacts(project_path, list(orig))
+            _kept, dropped = resolve_artifacts(project_path, list(orig),
+                                               extra_module_artifacts=_pma)
             _dropped_set = {str(d).strip() for d in dropped}
             total_dropped += len(_dropped_set)
             if _dropped_set:
@@ -1033,6 +1066,54 @@ def prune_contract_dependencies(plan, project_path: str | None) -> dict[str, lis
         "[T6] R53-1 剪除同源传播：%d 个模块的不可解析契约依赖已从 shared_contract 剪除"
         "并记入 pruned_artifacts 账本（模板/验收/worker 契约同源，消除'验收逼 worker "
         "复入'——round63 st-5 死型）: %s", len(pruned_now), pruned_now)
+    # ── R67C-T5（round67c 开箱）：剔除同源传播到【消费方子任务 desc】──────────────
+    # round67c st-27-4 死型：com.github.submail:submail 被剔（pom/验收已同源剔），但 st-27-*
+    # 父 desc 仍字面"VoiceNotifyService（Submail 语音 API 拨打）"→worker 被 desc 逼着用已剔
+    # 依赖→import 不存在的类编译失败/臆造坐标。pruned_artifacts_note 只随契约进 prompt、不点名
+    # 子任务；此处把负面知识下推到【提及被剔坐标的具体子任务 desc】，与 note 同措辞。
+    # ★hunter 二轮整改（入口对称自愈）★：不用"已有标记就跳过"的单向幂等——那样某 artifact 复原后
+    # 旧通告会永久粘滞、falsely 劝 worker 别用一个已合法的坐标（违 ledger.pop 撤账的自愈对称）。改
+    # 【先剥旧标记→按本轮 pruned_tokens 重算】：本轮仍剔的重新贴、本轮已复原的自动撤，幂等且自愈。
+    # 注：本块仅在 pruned_now 非空（有剔除）时到达（上方 `if not pruned_now: return {}` 早退）；
+    # 全部复原致 pruned_now 空的整撤由 ledger.pop + pruned_artifacts_note 清除覆盖（今 latent：
+    # replan 每轮重生子任务对象、desc 不跨轮；未来 retry 复用子任务对象时本自愈即 live 生效）。
+    _pruned_tokens = set()
+    for _specs in pruned_now.values():
+        for _sp in _specs:
+            _s = str(_sp).strip()
+            if _s:
+                _pruned_tokens.add(_s.split(":")[1] if ":" in _s else _s)  # artifactId
+    _pruned_tokens.discard("")
+    _T5_MARK = "【R67C-T5 依赖剔除通告】"
+
+    def _strip_t5_mark(_d: str) -> str:
+        _p = _d.find(_T5_MARK)
+        if _p == -1:
+            return _d
+        _ls = _d.rfind("\n", 0, _p)
+        _ls = _ls if _ls != -1 else _p
+        _le = _d.find("\n", _p)
+        _le = _le if _le != -1 else len(_d)
+        return (_d[:_ls] + _d[_le:]).rstrip()
+
+    _annotated = []
+    for st in (getattr(plan, "subtasks", None) or []):
+        _d0 = getattr(st, "description", None) or ""
+        _d = _strip_t5_mark(_d0)                           # 先剥旧通告（自愈撤销起点）
+        _hit = sorted(t for t in _pruned_tokens if t.lower() in _d.lower())
+        if _hit:
+            st.description = _d + (
+                f"\n{_T5_MARK}以下契约依赖无法确定性解析坐标、已从构建与验收剔除：{_hit}。"
+                "本子任务若提及它们，请勿 import/声明，改用已在册的可用栈（如 okhttp 直连 "
+                "REST）实现或留占位说明，绝不臆造坐标。")
+            _annotated.append(getattr(st, "id", "?"))
+        elif _d != _d0:
+            st.description = _d                            # 剥了旧通告本轮无命中→落剥后的（撤销）
+    if _annotated:
+        logger.info(
+            "[T5-DESC] R67C-T5 剔除通告下推 %d 个子任务 desc（消费方散文仍提及被剔坐标 %s，"
+            "防 worker 被 desc 逼用已剔依赖）: %s",
+            len(_annotated), sorted(_pruned_tokens), _annotated)
     return pruned_now
 
 
@@ -1473,7 +1554,8 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
         # R65D-T2①：已有机器块不再是跳过理由——终版确定性产物 upsert（幂等/刷新），
         # 陈旧模板（第一遍 T5 推导烤进的反向依赖）绝不冻结上车。
         arts = _merge_internal_deps(arts, _internal_deps.get(mod) or [])   # T5
-        _kept, _ = resolve_scaffold_artifacts(project_path, arts)
+        _kept, _ = resolve_scaffold_artifacts(
+            project_path, arts, extra_module_artifacts=_plan_module_artifacts(plan))  # R67C-T2
         # R65C-T1 毒株(a)：完整模板只给 CREATE（与主入口 1595-1615 同律）——
         # 「原样写入」对**既有** pom = 最小化重写清空基线依赖（round65c 实锤：
         # ruoyi-common 丢 poi / ruoyi-framework 丢 web、aop starter，worker 服从性
@@ -2352,6 +2434,109 @@ def _wire_scaffold_ownership(plan, sid: str, mdir: str, manifest_rel: str) -> No
             st.depends_on.append(sid)
 
 
+def split_manifest_owner_leaf(plan) -> list[dict]:
+    """R67C-T3b（round67c 开箱）：把【混合了代码、且倒挂在同模块编译者之后】的 manifest 写者
+    拆成独立早叶 pom-owner，消除 pom-依赖-写倒挂 + 成环死型。
+
+    实锤：st-7-2-1 唯一写 ruoyi-framework/pom.xml（加 googleauth 外部依赖）却也写
+    SysLoginService.java、且 depends_on st-7-1-1（GoogleAuthUtils 创建者，import googleauth）；
+    st-7-1-1 不依赖 st-7-2-1 → GoogleAuthUtils 先于 googleauth 入 pom 编译 → L1 崩。反加边
+    st-7-1-1→st-7-2-1 会成环（st-7-2-1 已依赖 st-7-1-1）。唯一解=把 pom-写抽成【无代码依赖】早叶
+    W'，同模块全部编译者与原任务皆依赖 W'（复用 _wire_scaffold_ownership），W' 由后续 R58-3 嵌
+    权威模板（本 pass 必跑在 inject_build_scaffold_subtasks 之前）。栈中立：manifest=_BUILD_MANIFESTS，
+    代码=classpath_fqn_key。幂等（W' 已存在则跳）。条件三者全真才拆（避免无谓拆分）：① W 写模块 M
+    的 manifest；② W 另有 classpath 源码产出（混合）；③ M 的某编译者 C 使 W 传递依赖 C（反向 wire 成环）。
+    """
+    from swarm.types import FileScope, SubTask, TaskIntent
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if len(subs) < 2:
+        return []
+    by_id = {s.id: s for s in subs}
+
+    def _reaches(a: str, b: str) -> bool:
+        stack = list(getattr(by_id.get(a), "depends_on", None) or [])
+        seen: set[str] = set()
+        while stack:
+            d = stack.pop()
+            if d == b:
+                return True
+            if d in seen or d not in by_id:
+                continue
+            seen.add(d)
+            stack.extend(getattr(by_id.get(d), "depends_on", None) or [])
+        return False
+
+    existing_ids = {s.id for s in subs}
+    out: list[dict] = []
+    for W in list(subs):
+        sc = getattr(W, "scope", None)
+        if sc is None:
+            continue
+        _all = (list(getattr(sc, "create_files", None) or [])
+                + list(getattr(sc, "writable", None) or []))
+        _manifests = [p for p in _all
+                      if _evidence_class(p) == _EV_MANIFEST]
+        _CODE_CLS = (_EV_STRONG, _EV_WEAK_CODE)
+        # ★"是否代码"一律用 _evidence_class，不用 classpath_fqn_key（后者对默认包 .java 返 None
+        # =误当资源，T3a 全量回归实锤）。混合=有 manifest 也有编译源码。
+        if not _manifests or not any(_evidence_class(p) in _CODE_CLS for p in _all):
+            continue                     # 无 manifest 或非混合（纯 manifest owner 无成环之虞）→ 不拆
+        for man in _manifests:
+            man_rel = _norm_scope_path(man)
+            mdir = man_rel.rsplit("/", 1)[0] if "/" in man_rel else ""
+            mod = mdir.rstrip("/").rsplit("/", 1)[-1] if mdir else ""
+            if not mod:
+                continue
+            _prefix = mdir.rstrip("/") + "/"
+            compilers = [s.id for s in subs if s.id != W.id and any(
+                _evidence_class(f) in _CODE_CLS
+                and str(f).replace("\\", "/").lstrip("/").startswith(_prefix)
+                for f in (list(getattr(getattr(s, "scope", None), "create_files", None) or [])
+                          + list(getattr(getattr(s, "scope", None), "writable", None) or [])))]
+            # ★hunter 二轮整改★：只在【同模块全部编译者都已（传递）依赖 W】时才安全不拆——那时 pom
+            # 必先于所有编译写好。否则（反向边 W→C 成环风险 / 或 W 与 C 无序=无边 race，两者 C 都可能
+            # 先于 pom 编译）都要拆：把 pom 抽早叶，全部编译者经 _wire_scaffold_ownership 依赖它。旧版
+            # 只判反向边 any(_reaches(W,c)) 漏了无边 race（W 与同模块兄弟无 depends 边→并行→C 先编 L1 崩）。
+            if compilers and all(_reaches(c, W.id) for c in compilers):
+                continue                 # 全部编译者已在 W 下游→pom 必先写→安全，不拆
+            if not compilers:
+                continue                 # 本模块无其他编译者→无 race
+            sid = f"{W.id}-pom-{mod}"     # ★含 mod★：一个 W 写多模块 manifest 时每模块各拆一叶
+            if sid in existing_ids:       # （旧 f"{W.id}-pom" 会让第 2 个模块撞名被跳过=静默漏拆）
+                continue
+            _in_create = any(_norm_scope_path(x) == man_rel
+                             for x in (getattr(sc, "create_files", None) or []))
+            leaf = SubTask(
+                id=sid,
+                description=(f"【构建脚手架·T3b 拆分】独立写模块 {mod} 的构建清单 {man_rel}：声明该"
+                            "模块契约依赖全部坐标（含新增外部依赖）。本子任务只写清单、不写代码、无上游"
+                            "依赖，必先于同模块任何编译（权威模板由脚手架注入）。"),
+                intent=TaskIntent.CREATE if _in_create else TaskIntent.MODIFY,
+                difficulty=SubTaskDifficulty.TRIVIAL,
+                scope=FileScope(writable=[] if _in_create else [man_rel],
+                                create_files=[man_rel] if _in_create else []),
+                acceptance_criteria=[f"{man_rel} 声明该模块契约依赖坐标，模块可编译"],
+                depends_on=[],
+            )
+            plan.subtasks.append(leaf)
+            existing_ids.add(sid)
+            subs.append(leaf)
+            by_id[sid] = leaf
+            sc.create_files = [x for x in (getattr(sc, "create_files", None) or [])
+                               if _norm_scope_path(x) != man_rel]
+            sc.writable = [x for x in (getattr(sc, "writable", None) or [])
+                           if _norm_scope_path(x) != man_rel]
+            _wire_scaffold_ownership(plan, sid, mdir, man_rel)   # 编译者+W 皆依赖 W'（W' 无 code dep→不成环）
+            if plan.parallel_groups:
+                plan.parallel_groups.insert(0, [sid])
+            out.append({"orig": W.id, "leaf": sid, "module": mod})
+    if out:
+        logger.warning(
+            "[SCAFFOLD-INJECT] R67C-T3b pom-写倒挂拆分：%d 个混合 manifest 写者的构建清单抽成早叶"
+            "（同模块编译者先拿 pom 再编译，破 googleauth 型倒挂+成环）: %s", len(out), out)
+    return out
+
+
 def _npm_module_name(project_path: str | None, mdir: str, module_label: str) -> str:
     """内部 workspace 包名：磁盘已有 package.json 的 name 字段（事实来源）优先；greenfield →
     模块标签（我们为**新建包**自定的确定性命名约定，非臆造外部包名——红线是"绝不猜别人发布的
@@ -2917,7 +3102,8 @@ def _inject_build_scaffold_subtasks_impl(
         # R53-1：坐标解析【一次】，模板 / 契约 / 验收标准三者同源。解析不到的依赖必须
         # 从三处一并剔除——旧实现只从模板剔除、验收仍要求"声明全部 artifacts"，这条矛盾
         # 直接逼 worker 手写臆造坐标（round53：幻影 alarm-interface 毒死整个 reactor）。
-        _kept, _dropped = resolve_scaffold_artifacts(project_path, arts)
+        _kept, _dropped = resolve_scaffold_artifacts(
+            project_path, arts, extra_module_artifacts=_plan_module_artifacts(plan))  # R67C-T2
         if _dropped:
             logger.warning(
                 "[SCAFFOLD-INJECT] R53-1 模块 %s 的 %d 个契约依赖无法确定性解析 → 模板/契约/"
@@ -3159,11 +3345,34 @@ def wire_readable_provenance(plan) -> tuple[list[tuple[str, str]], list[tuple[st
 
     added: list[tuple[str, str]] = []
     unresolved: list[tuple[str, str]] = []
+    _defanned: list[str] = []
     for b in subs:
         sc = getattr(b, "scope", None)
-        needs = {produced_by.get(_norm_scope_path(f))
-                 for f in list(getattr(sc, "readable", None) or [])
-                 if _norm_scope_path(f) not in _ambig}
+        # ── R67C-T3a（round67c 开箱）：纯资源/DDL 产物读【代码文件】= provenance，非 build 依赖 ──
+        # 实锤：st-13-2/st-4-2 create 只有 sql/*.sql（不编译），却 readable 111~113 个实体 .java
+        # →本 pass 把 provenance 全转成 61~62 条 build 依赖边 → 纯 DDL 变全图汇聚点 sink：上游任一
+        # 放弃即连坐、爆炸半径=整个 2FA 落库（round67 st-14 DDL 77-dep 同型）。.sql/资源不参与编译、
+        # 对 .java 无 build 序依赖（schema 已在 desc 自足）；只有【产物本身是 classpath 源码】的消费者
+        # 读代码才是真 build 依赖。判据：本子任务【全部产出】(create ∪ writable) 皆非 classpath 源码
+        # =纯资源产物 → 跳过它读【代码文件】的补边（保留读【资源】的边：如 .sql 依赖另一 .sql）。
+        # 栈中立：经 _evidence_class（_EV_AUX=不编译资源/_EV_STRONG|_EV_WEAK_CODE=编译源码）。
+        # ★不可用 classpath_fqn_key 判"是否代码"★：它对【默认包】.java（无 com/x/ 路径）也返 None，
+        # 会把真源码误当资源→错误跳过真 build 边（全量回归实锤 test_consumer_edges_prevent_...）。
+        _outs = (list(getattr(sc, "create_files", None) or [])
+                 + list(getattr(sc, "writable", None) or []))
+        _b_pure_resource = bool(_outs) and all(_evidence_class(x) == _EV_AUX for x in _outs)
+        needs = set()
+        for f in list(getattr(sc, "readable", None) or []):
+            k = _norm_scope_path(f)
+            if k in _ambig:
+                continue
+            a = produced_by.get(k)
+            if not a:
+                continue
+            if _b_pure_resource and _evidence_class(f) in (_EV_STRONG, _EV_WEAK_CODE):
+                _defanned.append(b.id)          # 纯资源读代码：provenance 保留、build 边不加
+                continue
+            needs.add(a)
         needs.discard(None)
         needs.discard(b.id)
         for a in sorted(x for x in needs if x):
@@ -3174,6 +3383,13 @@ def wire_readable_provenance(plan) -> tuple[list[tuple[str, str]], list[tuple[st
                 continue
             b.depends_on = list(getattr(b, "depends_on", None) or []) + [a]
             added.append((b.id, a))
+    if _defanned:
+        from collections import Counter
+        _cnt = Counter(_defanned)
+        logger.info(
+            "[contract] R67C-T3a 纯资源/DDL 产物读代码=provenance 非 build 依赖，跳过补边 "
+            "%d 条（防纯 DDL 全图汇聚点连坐；schema 已在 desc 自足，readable 仍留作上下文）: %s",
+            sum(_cnt.values()), dict(_cnt))
     return added, unresolved
 
 

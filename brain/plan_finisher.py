@@ -773,6 +773,21 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         logger.warning("[PLAN-FINISH] R67B-T1 归属重规范化失败（fail-open，G1 兜底）",
                        exc_info=True)
     try:
+        # R67C-T3b：pom-写倒挂拆分——必跑在脚手架注入【之前】，R58-3 才会把权威模板嵌进新早叶 owner。
+        from swarm.brain.contract_utils import split_manifest_owner_leaf
+        _split = split_manifest_owner_leaf(plan)
+        if _split:
+            out["manifest_leaves_split"] = _split
+            from swarm.brain.nodes.shared import bootstrap_subtask_harness
+            _lids = {e["leaf"] for e in _split}
+            for st in plan.subtasks:
+                if st.id in _lids:
+                    bootstrap_subtask_harness(st, task_description or st.description)
+                    if not getattr(st, "est_context_tokens", 0):
+                        st.est_context_tokens = 8000 + 6000   # TRIVIAL 基线+1 文件
+    except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
+        logger.warning("[PLAN-FINISH] R67C-T3b pom-写倒挂拆分失败（fail-open）", exc_info=True)
+    try:
         from swarm.brain.contract_utils import inject_build_scaffold_subtasks
         # R58-1：file_plan 是【模块 → 文件】的权威归属（逻辑模块名 ≠ 物理目录时唯一的证据源）
         injected = inject_build_scaffold_subtasks(plan, project_path, file_plan)

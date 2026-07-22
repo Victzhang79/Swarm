@@ -834,6 +834,82 @@ def _cross_package_same_basename_creates(plan) -> dict[str, dict[str, list[str]]
     return {b: fqns for b, fqns in index.items() if len(fqns) >= 2}
 
 
+def _created_class_shadows_base(
+    plan, project_path: str | None, base_ref: str | None,
+) -> dict[str, dict]:
+    """R67C-T1 兜底：create 的 JVM 类 simple name 撞【base 树已存在】的同名【异路径】类。
+
+    round67c 实锤（task=626e35ae）：st-51 create ruoyi-admin/.../tool/GenController.java，
+    base 已有 ruoyi-generator/.../generator/controller/GenController.java → @Controller bean
+    名默认 simple name → 两份并存启动即 ConflictingBeanDefinitionException（编译期查不出）。
+    st-4-1 SysUser 同型（MyBatis typeAlias 递归扫两处别名撞车）。★本闸【无条件】fail-closed 打回
+    所有 create-vs-base shadow（不分有无他人 modify 佐证）★——早期版本曾在 contract_utils 规则0 加
+    "有 modify 佐证即自愈归位"，经 ecc 复核 HIGH 实锤【全局纯 basename 佐证会误合并合法通用名新类
+    （Config/Result/Constants…）静默腐化无关 base 文件、且绕过本闸】而【删除】，此闸遂成唯一裁决路径。
+
+    归属闸 ③(#110 同 FQN)/③b(R67-T1b 跨子任务同 basename) 只查【跨子任务 create】，本查
+    【create-vs-base】。栈中立：经 classpath_fqn_key（非 JVM 类路径源码天然豁免）＋ base 树
+    唯一同名命中（多义命中=命名空间本就容忍/歧义，保守不判）＋ test 布局豁免。disk-dependent
+    （读 base 树）故与 disk-independent 的 ③/③b 分开、无 base 树时静默跳过（greenfield 不误伤）。
+    返回 {simple: {"create": path, "base": path, "ids": [子任务 id]}}。
+    """
+    from swarm.brain.contract_utils import _base_tree_listing, classpath_fqn_key
+    tree = _base_tree_listing(project_path, base_ref)
+    if not tree:
+        return {}
+    base_by_simple: dict[str, list[str]] = {}
+    for p in tree:
+        k = classpath_fqn_key(p)
+        if not k:
+            continue
+        _m, fqn = k
+        base_by_simple.setdefault(fqn.rsplit("/", 1)[-1].lower(), []).append(p)
+    out: dict[str, dict] = {}
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])):
+            norm = str(f).replace("\\", "/")
+            norm = norm[2:] if norm.startswith("./") else norm
+            parts = [p for p in norm.split("/") if p]
+            if "test" in parts or "tests" in parts:
+                continue
+            if norm in tree:
+                continue                       # 撞同路径 = 规则0 R67-T8 已降级 modify，不到这
+            k = classpath_fqn_key(f)
+            if not k:
+                continue
+            _m, fqn = k
+            simple = fqn.rsplit("/", 1)[-1].lower()
+            hits = base_by_simple.get(simple) or []
+            if len(hits) == 1 and hits[0] != norm:
+                rec = out.setdefault(simple, {"create": norm, "base": hits[0], "ids": []})
+                rec["ids"].append(getattr(st, "id", "?"))
+    return out
+
+
+# R67C-T6：子任务 desc 显式把实现【留给后续/其他子任务】的悬空占位识别（栈中立·纯文本）。
+# 收窄到"deferral 动词 + 子任务"或"后续/其他子任务 + 实现动词"，排除良性"预留扩展点/入口"
+# （round67c st-35-1"升级通知留给后续子任务以占位预留"命中；st-24-2"预留...TODO 扩展点"不命中）。
+_DEFER_TO_SIBLING_RES = (
+    re.compile(r"(留给|交给|交由|移交)[^。；\n]{0,10}子任务"),
+    re.compile(r"(后续|其他|另[一个]?)[^。；\n]{0,3}子任务[^。；\n]{0,12}(实现|承接|负责|补全|补充|完成)"),
+)
+
+
+def _subtasks_deferring_to_sibling(plan) -> list[tuple[str, str]]:
+    """返回 [(子任务 id, 命中片段)]——desc 自认把实现留给一个规划期无法确认存在的兄弟子任务。"""
+    out: list[tuple[str, str]] = []
+    for st in getattr(plan, "subtasks", None) or []:
+        d = getattr(st, "description", None) or ""
+        for pat in _DEFER_TO_SIBLING_RES:
+            m = pat.search(d)
+            if m:
+                _s, _e = max(0, m.start() - 6), min(len(d), m.end() + 8)
+                out.append((getattr(st, "id", "?"), d[_s:_e].strip()))
+                break
+    return out
+
+
 # R67-T3：HTTP 路由处理器文件命名惯例（数据驱动可扩栈；仅作"疑似路由 owner"过滤器，
 # 非语言逻辑写死——不匹配的栈本闸静默不适用，绝不误伤）。
 _ROUTE_HANDLER_MARKERS = frozenset({"controller", "resource"})
@@ -1041,6 +1117,38 @@ def validate_module_coherence(
             f"启动即冲突；消费方也会解析到语义漂移的副本）。请裁决唯一 owner：若确属同一"
             f"逻辑类，保留一处、其余从 create_files 移除并让消费方 import 该 FQN；若确属"
             f"不同职责的两个类，请改名消歧（不同 simple name）。")
+
+    # ③f R67C-T1（round67c 开箱）：create 的 JVM 类 simple name 撞 base 既有同名异路径类。
+    # ③/③b 只查跨子任务 create，此查 create-vs-base（st-51 GenController 撞 base ruoyi-generator
+    # 的 GenController→bean 名冲突启动崩；st-4-1 SysUser 撞 base common/entity/SysUser→MyBatis 别名
+    # 撞车）。★无条件 fail-closed 打回所有 shadow★（原规则0"有佐证即自愈"经 ecc 复核 HIGH 逮到会误
+    # 合并通用名新类静默腐化而删除，见 _created_class_shadows_base docstring），带双路径反馈（modify
+    # base 真身 / 改名消歧），绝不放行编译绿、启动红的重复 bean/别名。base 树不可读→静默跳过不误伤。
+    for _simple, _info in sorted(
+            _created_class_shadows_base(plan, project_path, base_ref).items()):
+        result.add(
+            f"新建类 simple name {_simple!r}（{_info['create']}，"
+            f"{','.join(_info['ids'][:3])}）与 base 既有类 {_info['base']} 同名异路径。JVM 下 "
+            f"Spring bean 名默认取 simple name、MyBatis typeAlias 亦按 simple name 注册"
+            f"（typeAliasesPackage 递归扫），两份同名类并存启动即 bean/别名冲突"
+            f"（ConflictingBeanDefinitionException / SqlSessionFactory 初始化崩，编译期查不出）。"
+            f"请勿新建重复类：若要给既有类加字段/方法，改为 modify base 的 {_info['base']}；"
+            f"若确属不同职责，改 simple name 消歧。")
+
+    # ③g R67C-T6（round67c 开箱）：子任务 desc 显式把实现【留给后续/其他子任务】=悬空占位孤岛。
+    # round67c st-35-1 实锤：AlarmEscalationJob"只负责扫描+判定，升级通知逻辑留给后续子任务以
+    # 占位方法预留"，但全 plan 无子任务承接"升级通知"→P1 告警 15 分钟无人处理永不升级（平台核心
+    # 承诺落空，编译/L1/L2 全绿）。★仅 warn 不阻断★：这是【交付完整性】非【可执行性】问题（plan
+    # 照样编译/起服务），且规划期无法语义确认"哪个子任务承接该子语义"（req 常有多 coverer 但仅覆
+    # 部分）——phrase-alone 硬 REJECT 会误杀真可执行的 happy plan（plan_b583 fixture 实锤）且打死
+    # 回放通道（回放的是固定 plan，无法 replan）。确定性面只 surface 红旗供陪跑/复盘核实接盘者，
+    # 硬阻断留给需求覆盖对账（deliver/L6）；深层"禁 LLM 占位给不存在子任务"=tech_design 提示词面。
+    for _sid, _snip in _subtasks_deferring_to_sibling(plan):
+        result.warn(
+            f"子任务 {_sid} 的描述显式把实现【留给后续/其他子任务】（“…{_snip}…”）=疑似自认不完整、"
+            f"依赖一个规划期无法确认存在的兄弟子任务承接（round67c st-35-1 升级通知占位孤岛：无"
+            f"接盘者→功能永不实现，编译/闸全绿仍缺功能）。请核实：在【本子任务】内实现该逻辑，或"
+            f"确保确有子任务承接该语义并显式连边（depends_on/readable），绝不留悬空占位方法。")
 
     # ③e R67-T9（R67-12 观测面，warn 不阻断）：纯辅助文件（非类路径源码）子任务却依赖过半
     # 计划=全图汇聚点（round67 st-14 DDL depends_on 77：上游任一放弃即连坐，消费者拿不到
