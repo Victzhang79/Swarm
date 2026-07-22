@@ -1155,6 +1155,18 @@ async def _plan_ultra_batched(
         logger.info("[PLAN-BATCH] P5 去重：%d → %d 文件（移除 %d 个完全同路径重复）",
                     _before, len(file_plan), _before - len(file_plan))
 
+    # R67B-T1：跨模块 create 归属重规范化（P5 后、分批前——批次按 module 分组，标签必须先
+    # 归位；"create 进既有基线模块目录"类 G1 违①在此确定性自愈。round67b：标签错位打回
+    # PLAN，而 LLM resplit 结构性改不了 file_plan 归属 → 3 轮空转 rejected）
+    try:
+        from swarm.brain.plan_batch import renormalize_cross_module_creates
+        renormalize_cross_module_creates(
+            file_plan, _get_project_path(state.get("project_id") or ""),
+            base_ref=state.get("base_commit"))
+    except Exception:  # noqa: BLE001 — fail-open，G1 权威兜底打回
+        logger.warning("[PLAN-BATCH] R67B-T1 归属重规范化失败（fail-open，G1 兜底）",
+                       exc_info=True)
+
     # 模块依赖（tech_design 阶段1 modules.depends_on）供批间排序
     module_deps = {}
     for m in (td.get("modules") or []):
@@ -2136,7 +2148,10 @@ async def _maybe_surgical_coverage_topup(state):
             _mc_valid = validate_module_coherence(
                 prior_plan,
                 project_path=_get_project_path(state.get("project_id") or ""),
-                file_plan=state.get("tech_design_file_plan") or []).valid
+                file_plan=state.get("tech_design_file_plan") or [],
+                # R67B hunter 附带同族：与 VALIDATE 期真 G1 闸同钉扎 base 口径——落 HEAD
+                # 兜底会让"外科是否让路"的判定随磁盘态漂移（round59 判据闪烁同款）
+                base_ref=state.get("base_commit")).valid
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[PLAN] R64-T3 外科前置 coherence 核异常（保守让路全量重拆，不炸主链）: %s", exc)
@@ -2699,7 +2714,9 @@ async def plan(state: BrainState) -> dict:
         # 外科被 first-match 短路（round48b 最后一轮实锤：P1 补 13 covers 后 19 个
         # 无主硬符号无人处理→三连耗尽 REJECTED），收尾器是唯一全路径必经点。
         shared_contract=(state.get("shared_contract")
-                         or getattr(task_plan, "shared_contract", None) or {}))
+                         or getattr(task_plan, "shared_contract", None) or {}),
+        # R67B-T1（复核 HIGH）：归属重规范化与 G1/#40 同一 git-pin base 口径
+        base_ref=state.get("base_commit"))
 
     plan_touch = touch_context(
         state,
@@ -3552,6 +3569,8 @@ def confirm_plan(state: BrainState) -> dict:
             "plan_validation_issues": state.get("plan_validation_issues") or [],
             # W1.1：把失败模块/降级原因带进 interrupt，人工审核时能看到"设计不完整"
             "tech_design_failed_modules": state.get("tech_design_failed_modules") or [],
+            # R67B-T2：零改造申报三分账（0 文件=诚实申报≠丢失），人工审核定向核对
+            "tech_design_zero_change_modules": state.get("tech_design_zero_change_modules") or [],
             # round29 真因4（复核 C，与 W1.1 对称）：人工审核须看到结构化的丢失模块明细
             # （name/files/reason），不只 degraded_reasons 里的压缩字符串。
             "plan_batch_failed_modules": state.get("plan_batch_failed_modules") or [],

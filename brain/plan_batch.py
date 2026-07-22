@@ -286,6 +286,93 @@ def dedupe_file_plan(file_plan: list[dict]) -> list[dict]:
     return out
 
 
+def renormalize_cross_module_creates(
+    file_plan: list[dict] | None, project_path: str | None, base_ref: str | None = None,
+) -> dict[str, list[str]]:
+    """R67B-T1（round67b 死因）：create 落在【既有基线构建单元】但 module 标签属别的模块
+    → 标签按物理事实重规范化（`_module_physical_dirs` 铁律：模块=物理路径，标签只是标签）。
+
+    round67b 实锤：2FA 切片把公共工具类 create 进 ruoyi-common/（架构决策正确），标签却写
+    ruoyi-system → G1 违①双根 REJECT；反馈打回 PLAN 而 module 归属属 file_plan 所有，LLM
+    resplit 结构性改不了（R65E-T3 预判过仍空转）→ 3 轮耗尽 rejected。#40 豁免只认 modify
+    既有文件——"create 进既有基线模块目录"是豁免体系缺口，且它可确定性自愈，绝不需要 LLM。
+
+    fail-closed 边界（宁可不动交 G1 权威打回，绝不猜）：
+    - 仅动 action=create；modify 既有文件由 G1 #40 豁免处理，不越权。
+    - 仅当外来根是【钉扎 base 里的既有构建单元】（_is_existing_baseline_module 同源口径）；
+      新目录多根=真歧义，保留给 G1（round62 alarm-api 保护不破）。
+    - 模块自有根不可判（无同名根且无多数根）→ 不动。
+    - 目标标签已被指向其它物理根的模块占用 → 不动。
+    幂等：归位后模块单根，二次调用返回 {}。就地改 entry["module"]（file_plan 与 state 共享
+    同一批 dict，下游批拆/契约注入/G1 全部看到归位后标签）。
+    """
+    if not project_path or not file_plan:
+        return {}
+    # 惰性导入防环（contract_utils 反向惰性导入本模块）；证据分类/根口径与 G1 单一事实源
+    from swarm.brain.contract_utils import (
+        _EV_AUX,
+        _evidence_class,
+        _evidence_root,
+        _is_existing_baseline_module,
+    )
+    # 模块 → {非 aux 证据根 → 该根下的 entries}（与 G1 _resolve_module_dirs 同分类口径）
+    root_entries: dict[str, dict[str, list[dict]]] = {}
+    for e in file_plan:
+        if not (isinstance(e, dict) and e.get("path") and e.get("module")):
+            continue
+        m = str(e["module"]).strip()
+        p = str(e["path"]).replace("\\", "/").strip("/")
+        cls = _evidence_class(p)
+        if cls == _EV_AUX:
+            continue
+        r = _evidence_root(p, cls)
+        if r:
+            root_entries.setdefault(m, {}).setdefault(r, []).append(e)
+    moved: dict[str, list[str]] = {}
+    cache: dict[str, bool] = {}
+    for m, roots in root_entries.items():
+        if len(roots) <= 1:
+            continue
+        # 自有根：优先与标签同名的根（含末段同名，兼容嵌套根）；无则取文件数唯一多数根
+        named = [r for r in roots if r == m or r.rsplit("/", 1)[-1] == m]
+        if len(named) == 1:
+            own = named[0]
+        else:
+            counts = sorted(((len(v), r) for r, v in roots.items()), reverse=True)
+            own = counts[0][1] if counts[0][0] > counts[1][0] else None
+        if not own:
+            continue
+        for r, entries in roots.items():
+            if r == own:
+                continue
+            if not _is_existing_baseline_module(project_path, r, cache, base_ref):
+                continue
+            # 目标标签：复用已单根指向 r 的现有模块标签；否则用根目录名（被占则整根路径，
+            # 仍冲突则弃——绝不抢占别的模块的标签）
+            target = next(
+                (m2 for m2, rs in root_entries.items()
+                 if m2 != m and set(rs) == {r}), None)
+            if target is None:
+                for cand in (r.rsplit("/", 1)[-1], r):
+                    occupied = root_entries.get(cand)
+                    if cand != m and (occupied is None or set(occupied) == {r}):
+                        target = cand
+                        break
+                if target is None:
+                    continue
+            for e in entries:
+                if str(e.get("action") or "").strip().lower() != "create":
+                    continue
+                e["module"] = target
+                moved.setdefault(f"{m}→{target}", []).append(str(e.get("path")))
+    if moved:
+        logger.info(
+            "[PLAN-BATCH] R67B-T1 跨模块 create 归属重规范化 %d 条（create 落既有基线模块"
+            "目录、标签按物理事实归位；round67b：标签错位致 G1 违①打回 PLAN 空转）: %s",
+            sum(len(v) for v in moved.values()), moved)
+    return moved
+
+
 def _norm_paths(st: dict, *keys: str) -> set[str]:
     """取子任务 scope 中若干键的归一化路径集合。"""
     sc = st.get("scope") or {}

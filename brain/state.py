@@ -244,6 +244,7 @@ class BrainState(TypedDict, total=False):
     tech_design_fact_issues: list       # 事实核验问题（虚假前提）：[{claim, verdict(false/already_exists/uncertain), detail, suggestion}]
     tech_design_file_plan: list         # 文件级技术方案：[{path, action(create/modify), responsibility, depends_on}]，喂给 PLAN 定 scope
     tech_design_failed_modules: list    # W1.1：ultra 两阶段 tech_design 中 phase-2 LLM 失败的模块 [{name, idx, reason}]——这些模块文件丢失，file_plan 不完整，绝不能静默 auto_accept 成功，须升级人工
+    tech_design_zero_change_modules: list  # R67B-T2：STAGE2 显式申报零改造的既有基线模块 [{name, idx}]——0 文件是诚实申报非丢失（与 failed 三分账），confirm 人工闸/交付对账据此定向核对
     plan_batch_failed_modules: list     # round29 真因4：PLAN-BATCH 分批拆解失败的模块 [{name, files, reason}]——整模块子任务蒸发=交付范围残缺（d37a52a3 'system-enhance' 14 文件实证），can_auto_accept_plan 据此 fail-fast 升人工；plan 节点 always-emit（成功清空不粘滞）
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
     design_review: dict                 # {decision: approve|reject, feedback, reject_count}

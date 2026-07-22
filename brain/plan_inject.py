@@ -164,7 +164,8 @@ def prepare_injected_state(
     try:
         finish_out = finish_plan_deterministic(
             plan, file_plan, project_path=project_path,
-            task_description=desc, shared_contract=shared_contract)
+            task_description=desc, shared_contract=shared_contract,
+            base_ref=live_base_commit)
         try:
             # resolve_plan_conflicts 内部【无】fail-open 包裹（与 finisher 不同）——
             # 意外异常在这里归一为机读拒绝，绝不裸冒泡成无码 FAILED（猎手 MEDIUM）。

@@ -25,6 +25,9 @@ _ALLOWLIST = {
     # R38-F 外科补齐：tech_design 对局部 result dict 赋值（result["file_plan"]=…），
     # 非 state patch——state 侧同名通道是 tech_design_file_plan/tech_design_failed_modules。
     "file_plan", "stage2_failed_modules",
+    # R67B-T2 同款（hunter③ 补齐重试合并账）：result["stage2_zero_change_modules"]=…
+    # 是局部 result dict，state 侧通道是已声明的 tech_design_zero_change_modules。
+    "stage2_zero_change_modules",
 }
 
 

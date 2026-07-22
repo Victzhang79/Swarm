@@ -1158,6 +1158,29 @@ _STAGE2_MAX_TOTAL_FAILURES = 8
 _RE_EST_DIGITS = re.compile(r"\d+")
 
 
+def _stage2_zero_change_plausible(mod_name: str, project_path: str | None,
+                                  base_ref: str | None = None) -> bool:
+    """R67B-T2：STAGE2 显式零改造申报（file_plan=[]）的物理可信判据（fail-closed）。
+
+    round67b 实锤：模型对 ruoyi-generator 9 次返回结构良好 `{"file_plan": []}` + 充分理由
+    （磁盘既有生成器完整、纯复用零改造），全部被"file_plan 为空"判失败 → 3 轮外科白烧 →
+    degraded 假故障。诚实空申报必须有出口（round31 baseline_covered 无出口死锁同构）。
+
+    只放行【棕地物理可信】的零改造：模块在【任务钉扎 base 树】里是既有构建单元
+    （_is_existing_baseline_module 同 G1/#40 单一权威口径，hunter 复核④整改——读实时磁盘
+    会把并发任务/前轮 merge 落盘的新模块误当既有基线，round59/R65E-T1 同款教训；非 git
+    树该口径内建退化 isfile）。新模块申报空 = 矛盾（待建模块零文件）→ 仍按失败重试。
+    懒模型兜底=est_files 交叉核验（调用侧）+ 下游覆盖闸，本出口不绕过它们。
+    """
+    if not project_path or not mod_name:
+        return False
+    try:
+        from swarm.brain.contract_utils import _is_existing_baseline_module
+        return _is_existing_baseline_module(project_path, mod_name, {}, base_ref)
+    except Exception:  # noqa: BLE001 — 判据自身故障 → fail-closed 走失败重试
+        return False
+
+
 def _fileplan_path_key(path: str) -> str:
     """跨批去重键归一（R65-T1 猎手 F6）：strip + 反斜杠→斜杠 + 剥 ./ 前缀。
     模型续批把 src/A.x 复读成 ./src/A.x 时不得当新文件（污染计数+重复条目）。
@@ -1239,6 +1262,9 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     import time as _time
 
     _t0 = _time.monotonic()
+    # R67B-T2：零改造申报可信判据的磁盘/钉扎 base 事实（闭包给 _gen_one_module）
+    _zc_proj_path = _resolve_project_path(state)
+    _zc_base_ref = state.get("base_commit")
     if preset_stage1 is not None:
         stage1 = dict(preset_stage1)
         modules = stage1.get("modules", []) or []
@@ -1459,6 +1485,44 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                         if _acc:
                             _converged = True
                             break
+                        # R67B-T2：首批【显式空数组】（schema 良好、file_plan 键在且=[]）且模块
+                        # 为【钉扎 base 里的既有构建单元】= 棕地零改造的诚实申报，合法收下
+                        # 0 文件（机读 zero_change，不重试不外科不 degraded；覆盖闸仍按 0 对账）。
+                        # round67b：ruoyi-generator 9 次如实申报全被判失败白烧 3 轮外科。
+                        # fail-closed：解析失败/off-schema/清洗后全无效/新模块 → 仍走失败重试。
+                        # ★复核 MED 整改（est 交叉核验）★ stage1 自估>0 与申报空矛盾时不首听即
+                        # 信——先按失败重试一次（保留旧路径给模型的第二次机会）；重试后仍显式
+                        # 空=模型顶住复核坚持零改造，收下但打 WARNING 供人工/覆盖闸定向核对。
+                        _est_zc = 0
+                        _m_zc = _RE_EST_DIGITS.search(str(mod.get("est_files") or ""))
+                        if _m_zc:
+                            _est_zc = int(_m_zc.group())
+                        if (_raw_list == [] and _ok_batches == 0
+                                and (_est_zc <= 0 or _consec_fail >= 1)
+                                and _stage2_zero_change_plausible(
+                                    mod_name, _zc_proj_path, _zc_base_ref)):
+                            _zc_log = logger.warning if _est_zc > 0 else logger.info
+                            _zc_log(
+                                "[TECH_DESIGN-STAGE2] 模块 %d/%d '%s' 显式申报零改造"
+                                "（file_plan=[] 且为钉扎 base 既有构建单元）→ 合法收下 0 文件"
+                                "（机读 zero_change；自估 est_files=%s%s）",
+                                mi, mod_total, mod_name, mod.get("est_files"),
+                                "，与自估矛盾但模型经重试坚持——须覆盖闸/人工定向核对"
+                                if _est_zc > 0 else "")
+                            return {"idx": mi, "name": mod_name, "file_plan": [],
+                                    "error": None, "zero_change": True}
+                        # hunter② MED 整改：显式空申报被挡（est 矛盾复核/物理不可信）的打回
+                        # 必须与"模型真 0 产出"留痕可辨——两类根因处置完全不同（估算面不准
+                        # vs 模型/提示词故障），_last_err→WARNING→stage2_failed_modules.reason
+                        # 全链携带。
+                        if _raw_list == [] and _ok_batches == 0:
+                            if _est_zc > 0 and _consec_fail < 1:
+                                raise ValueError(
+                                    f"显式空申报与自估 est_files={_est_zc} 矛盾"
+                                    "（零改造候选，打回复核一次）")
+                            raise ValueError(
+                                "显式空申报但模块非钉扎 base 既有构建单元"
+                                "（新模块零文件矛盾，fail-closed）")
                         raise ValueError("file_plan 为空（模块未产出有效文件）")
                     _acc.update(_new)
                     _ok_batches += 1
@@ -1563,6 +1627,7 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     all_file_plan: list[dict] = []
     failed_modules: list[dict] = []
     incomplete_modules: list[dict] = []  # 猎手 F2：触批次上限的模块必须机读可辨，不能只靠日志
+    zero_change_modules: list[dict] = []  # R67B-T2：显式零改造申报同理机读可辨（≠失败≠丢失）
     for r in _results:
         if r["error"]:
             failed_modules.append({"name": r["name"], "idx": r["idx"], "reason": r["error"]})
@@ -1571,6 +1636,13 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
             if r.get("incomplete"):
                 incomplete_modules.append(
                     {"name": r["name"], "idx": r["idx"], "files": len(r["file_plan"])})
+            if r.get("zero_change"):
+                zero_change_modules.append({"name": r["name"], "idx": r["idx"]})
+    if zero_change_modules:
+        logger.info(
+            "[TECH_DESIGN-STAGE2] %d 模块显式零改造 %s——诚实申报非失败，"
+            "不触发外科补齐；下游覆盖闸/交付对账按 0 文件口径核验",
+            len(zero_change_modules), [m["name"] for m in zero_change_modules])
 
     if failed_modules:
         _failed_names = [m["name"] for m in failed_modules]
@@ -1617,6 +1689,7 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
         "file_plan": all_file_plan, "fact_issues": fact_issues,
         "stage2_failed_modules": failed_modules,
         "stage2_incomplete_modules": incomplete_modules,
+        "stage2_zero_change_modules": zero_change_modules,
     }
     logger.info(
         "[TECH_DESIGN-STAGED] 两阶段完成：%d 模块（%d 失败，并发=%d）→ 合计 %d 文件",
@@ -1660,6 +1733,11 @@ def _package_tech_design_output(state: "BrainState", result, file_plan,
         logger.warning("[TECH_DESIGN] %s", _inc_reason)
         _out["degraded_reasons"] = list(
             _out.get("degraded_reasons") or state.get("degraded_reasons") or []) + [_inc_reason]
+    # R67B-T2 复核 MED/hunter② 整改：零改造申报同走专用 state 键（confirm 人工闸可见
+    # "哪些模块 0 文件是模型明确申报而非丢失"），与 failed/incomplete 三分账对齐——
+    # 落账无人看=round67 假完整温床的观测面缺失层。info 性质，不进 degraded_reasons。
+    _zc_mods = (result.get("stage2_zero_change_modules") or []) if isinstance(result, dict) else []
+    _out["tech_design_zero_change_modules"] = _zc_mods
     # ── C3 哨兵（round38c：设计了十几张 alarm_* 新表，全 diff 零 .sql，2FA 列无 DDL）──
     # data_model 设计了表 ∧ file_plan 无任何 schema-migration 形态文件 → warn+degraded
     # （栈无关模式集启发式，warn 级不阻断；prompt 侧已同批加 DDL 硬要求）。
@@ -1773,6 +1851,15 @@ async def tech_design(state: BrainState) -> dict:
                 result = dict(_prior_td)
                 result["file_plan"] = _kept_fp + list(_fp2 or [])
                 result["stage2_failed_modules"] = _residual
+                # R67B-T2 hunter③ 整改：补齐重试里走零改造出口的模块并入账（与上一轮
+                # 既有 zc 账合并去重），否则外科通道产生的 zero_change 永远上不了账
+                _zc2 = (_r2.get("stage2_zero_change_modules") or []) \
+                    if isinstance(_r2, dict) else []
+                _zc_prior = list(_prior_td.get("stage2_zero_change_modules") or [])
+                _zc_seen = {m.get("name") for m in _zc_prior if isinstance(m, dict)}
+                result["stage2_zero_change_modules"] = _zc_prior + [
+                    m for m in _zc2
+                    if isinstance(m, dict) and m.get("name") not in _zc_seen]
                 file_plan = result["file_plan"]
                 fact_issues = list(state.get("tech_design_fact_issues") or [])
                 contract = state.get("shared_contract_draft") or {}
@@ -1870,6 +1957,11 @@ async def tech_design(state: BrainState) -> dict:
             "tech_design_fact_issues": det_issues,
             "tech_design_file_plan": [],
             "tech_design_generation_failed": True,
+            # R67B hunter② CONFIRMED 整改：早退分支也 always-emit 清空——否则整键覆盖语义下
+            # 上一轮的 failed/zero_change 账粘滞进"整体失败"轮，confirm 人工闸展示过期机读账
+            # （审核者误以为本轮设计仍部分可信）。failed_modules 为姊妹既有缺口一并修。
+            "tech_design_failed_modules": [],
+            "tech_design_zero_change_modules": [],
             "degraded_reasons": list(state.get("degraded_reasons") or []) + [_reason],
         }
 

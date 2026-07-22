@@ -743,7 +743,8 @@ def reconcile_upstream_account(plan) -> dict[str, list[str]]:
 
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
-                              shared_contract: dict | None = None) -> dict:
+                              shared_contract: dict | None = None,
+                              base_ref: str | None = None) -> dict:
     """对 plan 原地跑确定性收尾（脚手架注入 + 孤儿挂靠 + 契约符号安置）。
 
     返回机读摘要 {scaffolds, orphans_attached, orphans_left, ...}；任何一步异常
@@ -756,6 +757,21 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
     out: dict = {"scaffolds": [], "orphans_attached": 0, "orphans_left": []}
     if plan is None or not getattr(plan, "subtasks", None):
         return out
+    try:
+        # R67B-T1（对抗双复核 HIGH 整改）：跨模块 create 归属重规范化必须覆盖【全部】plan
+        # 产出路径（单发/ULTRA 分批/P1/R39-5/R40-1 外科都汇入本收尾器）——只挂 ULTRA 分批
+        # 一处时，round67b 原死因（create 落既有基线模块目录但标签错位→G1 违①→打回 PLAN
+        # 空转）在 file_plan≤30 或外科通道上原样复现。ULTRA 路径分批前已跑过一次（批次按
+        # module 分组需先归位），此处幂等重跑对其为 no-op；放脚手架注入之前——标签先归位，
+        # 注入器才不会对错位模块按歧义拒绝脚手架。
+        from swarm.brain.plan_batch import renormalize_cross_module_creates
+        _renorm = renormalize_cross_module_creates(
+            file_plan, project_path, base_ref=base_ref)
+        if _renorm:
+            out["cross_module_creates_renormalized"] = _renorm
+    except Exception:  # noqa: BLE001 — fail-open，G1 权威兜底
+        logger.warning("[PLAN-FINISH] R67B-T1 归属重规范化失败（fail-open，G1 兜底）",
+                       exc_info=True)
     try:
         from swarm.brain.contract_utils import inject_build_scaffold_subtasks
         # R58-1：file_plan 是【模块 → 文件】的权威归属（逻辑模块名 ≠ 物理目录时唯一的证据源）
