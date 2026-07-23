@@ -5246,7 +5246,8 @@ async def revision(state: BrainState) -> dict:
         # 因 project_path=None 短路成 False → base-pin 要防的 pom 多写者缺陷在 revision 期重开。
         resolve_plan_conflicts(updated_plan,  # 原地变更；返回值(计数 dict)丢弃
                                project_path=_get_project_path(state.get("project_id") or ""),
-                               base_ref=state.get("base_commit"))
+                               base_ref=state.get("base_commit"),
+                               file_plan=state.get("tech_design_file_plan") or [])
     except Exception as exc:  # noqa: BLE001
         logger.warning("[REVISION] 计划冲突消解跳过(非致命): %s", exc)
 

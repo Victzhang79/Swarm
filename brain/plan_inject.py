@@ -170,7 +170,8 @@ def prepare_injected_state(
             # resolve_plan_conflicts 内部【无】fail-open 包裹（与 finisher 不同）——
             # 意外异常在这里归一为机读拒绝，绝不裸冒泡成无码 FAILED（猎手 MEDIUM）。
             resolve_counts = resolve_plan_conflicts(
-                plan, project_path=project_path, base_ref=live_base_commit)
+                plan, project_path=project_path, base_ref=live_base_commit,
+                file_plan=file_plan)   # create-vs-base modify-shadow 归位需 file_plan 的 modify 信号
         except Exception as exc:  # noqa: BLE001
             raise PlanInjectError(
                 "plan_inject_rederive_failed",

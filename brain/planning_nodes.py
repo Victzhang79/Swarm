@@ -2828,7 +2828,9 @@ async def elaborate(state: BrainState) -> dict:
     # 顺序固化在 resolve_plan_conflicts（contract_utils），_elaborate 与离线 plan-quality 评测共用同一条
     # 代码，杜绝调用点各写一份导致漂移。RUN17/18/19 三轮治本(脚手架合并/依赖序/单一写者/难度)全在此收口。
     _resolve = resolve_plan_conflicts(plan_obj, project_path=_proj_path,
-                                      base_ref=state.get("base_commit"))  # B6 #2：钉扎 base 非实时 HEAD
+                                      base_ref=state.get("base_commit"),  # B6 #2：钉扎 base 非实时 HEAD
+                                      # create-vs-base modify-shadow 归位需 file_plan 的 action=modify 信号
+                                      file_plan=state.get("tech_design_file_plan") or [])
     if _resolve["dep_reordered"]:
         logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
     if _resolve["difficulty_bumped"]:

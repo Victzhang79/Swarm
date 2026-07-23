@@ -5316,22 +5316,153 @@ def deconflict_file_plan_same_name_creates(
             if _changed:
                 e["depends_on"] = _new
 
-    # ── create-vs-base shadow（SysMenu/SysUser 型）：本轮【不做确定性归位】★ ────────────────
-    # round67g 对抗复核 CRITICAL：以「base 同名唯一即归位」为权威，正是 round67c 已被 ecc 复核判
-    # HIGH 并【删除】的裸 basename 挑边启发式（`plan_validator.py` `_created_class_shadows_base`
-    # docstring 有据）——合法通用名新类（各模块自带 Config/Constants）撞无关模块 base 同名类 →
-    # 被 modify 覆盖【静默腐化】。且经查 round67g 契约把 base 实体位置【幻觉错】（SysUser.defined_in
-    # =ruoyi-system/domain 而非 base ruoyi-common；SysMenu 未声明）→ 无任何安全确定性权威。故 create-
-    # vs-base 交 G1 ③f 显式 REJECT（fail-closed，诚实 FAILED@PLAN 优于静默腐化），作【独立前沿】另治
-    # （需上游 contract/tech_design 不再重建 base 实体，或带独立佐证的 modify-only 归位 + 独立对抗
-    # 复核）。project_path/base_ref 参数保留供该后续治本接入，本轮 T1 不用。
+    # ── create-vs-base shadow（SysMenu/SysUser 型）：本 file_plan 层【不做确定性归位】 ─────────
+    # 以「base 同名唯一即归位」为权威=round67c 已被 ecc 复核判 HIGH【删除】的裸 basename 挑边（合法
+    # 通用名新类 Config/Constants 撞无关 base 同名→被 modify 覆盖【静默腐化】）。★create-vs-base 的
+    # modify-only 安全子集（LLM 显式 action=modify 却把落点写成 base 实体的幻觉异路径，SysUser 型）
+    # 由子任务级 deconflict_create_vs_base_modify_shadow 归位★——它以【file_plan action=modify】为
+    # 唯一安全信号（LLM 自认是"改既有类"，非 create 一个新类），故不复活裸 basename 挑边；create 侧
+    # （SysMenu 型：LLM 认作新类）无此信号 → 仍交 G1 ③f 显式 REJECT（fail-closed，诚实 FAILED@PLAN
+    # 优于静默腐化）+ 上游 contract/tech_design 前沿。project_path/base_ref 供 file_plan 层未来治本接入。
     _ = (project_path, base_ref)
 
     return counts
 
 
+def deconflict_create_vs_base_modify_shadow(
+    plan,
+    file_plan: list | None,
+    project_path: str | None = None,
+    base_ref: str | None = None,
+) -> int:
+    """create-vs-base【modify-only 安全子集】确定性归位（子任务 scope 层，clear G1 ③f）。
+
+    死型（task=b3659ca9 FAILED@PLAN，2026-07-23）：LLM 想【改】base 既有实体（SysUser），却把落点
+    写成【幻觉异路径】——tech_design file_plan 里 `action=modify ruoyi-system/domain/SysUser.java`
+    （真身在 base `ruoyi-common/.../entity/SysUser.java`），而 PLAN batch 把它落进某子任务的
+    `create_files`（st-16-1）→ G1 ③f `_created_class_shadows_base`（读子任务 create_files）判
+    create-vs-base shadow REJECT（MyBatis typeAlias 递归撞别名/两份并存启动崩）→ 重试从恒定 file_plan
+    重拆原样重犯 → 层② 熔断，产不出合法 plan。
+
+    ★唯一安全信号 = file_plan 里该 simple-name 的 action=modify（且【无】create 条目）★——即 LLM
+    自认是"编辑既有类"，非"新建一个类"。凭此才敢把子任务 create_files 里的幻觉异路径归位到 base 真身
+    （改 create→writable/modify）。★绝不复活裸 basename 挑边（round67c 血泪：合法通用名新类 Config/
+    Constants 撞无关 base 同名 → 误合并静默腐化，ecc 复核判 HIGH 删过该自愈）★：SysMenu 型（file_plan
+    action=create，LLM 认作新类）无 modify 信号 → 本 pass 不碰，仍交 G1 ③f 显式 REJECT（诚实
+    FAILED@PLAN + 上游 tech_design 前沿），绝不静默归并。
+
+    fail-closed 铁律（任一判不出唯一确定性证据即不动，留 ③f REJECT 兜底）：
+      · 无 base 树（greenfield/非 git，_base_tree_listing 返 None）→ 整体跳过（不误伤纯新建）；
+      · 无 file_plan → 无 modify 信号源 → 跳过；
+      · base 同名【非唯一】命中（0 或 ≥2 处同 simple-name）→ 命名空间容忍/歧义，绝不挑边；
+      · file_plan 该 simple-name 【无 modify】或【兼有 create】（意图歧义）→ 跳过；
+      · create_files 落点【已精确 ∈ base 树】→ 归 R67-T8 规则0逆向降级 modify，本 pass 不重复处理。
+
+    栈中立：classpath_fqn_key 仅 JVM 类路径命名空间非 None（Go/Py/TS/资源天然豁免）；test 布局
+    路径豁免（同 ③f/层③）。归位为【同子任务内】create_files→writable(modify)、路径改指 base 真身，
+    绝不清空 scope（永有 writable 承接）。depends_on 是子任务 ID 粒度、归位不动它，故无陈旧依赖边。
+
+    ★readable 陈旧边的诚实边界（对抗复核 hunter PLAUSIBLE-2）★：归位只把 base 真身塞进【生产者
+    (owner)】的 writable，不改【消费者】readable。**只有 elaborate 路径**（planning_nodes:2830 后
+    紧跟 prune/provenance(pin/wire)/dangling 兜底）会把消费者 readable 重新布线到 base 真身；
+    revision(nodes:5247)/plan_inject(:172) 调 resolve_plan_conflicts 时其后【不跑】那些兜底 → 消费者
+    可能残留指向已剥幻觉路径的 readable。危害有界=退化的 curated 上下文（base 真身是磁盘既有文件、
+    worker 仍可 cat；非硬失败、非需求丢失），故不在此另造 readable 重布线（避免与 provenance 双实现）。
+    live 主路径(PLAN→ELABORATE→VALIDATE)经 elaborate 兜底，无此残留。返回归位条数（可观测）。
+    """
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    if not subtasks:
+        return 0
+    tree = _base_tree_listing(project_path, base_ref)
+    if not tree or not file_plan:
+        return 0                              # 无 base 权威 / 无 modify 信号源 → fail-closed 跳过
+
+    def _is_test_path(path: str) -> bool:
+        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        return "test" in parts or "tests" in parts
+
+    # base 真身索引：simple-name(lower, 含扩展，同 ③f 口径) → [base 路径…]（仅 JVM 类路径）
+    base_by_simple: dict[str, list[str]] = {}
+    for p in tree:
+        k = classpath_fqn_key(p)
+        if not k:
+            continue
+        _m, fqn = k
+        base_by_simple.setdefault(fqn.rsplit("/", 1)[-1].lower(), []).append(_norm_scope_path(p))
+
+    # file_plan 意图信号【★路径粒度★，对抗双复核 HIGH/PLAUSIBLE-1 整改】：只按 simple-name 匹配
+    # "存在某个同名 modify 条目"会误授权——file_plan 对【另一个不同类】的 modify 会把一个本该新建的
+    # 同名类（如脚手架/契约符号安置注入、其路径不在 file_plan）误归并进无关 base（复活 round67c 腐化）。
+    # 收紧：被归位的 create_files 落点【本身】须在 file_plan 声明为 action=modify（真死型满足：PLAN
+    # batch 从 file_plan 派生 create_files，故 create 路径 == file_plan modify 路径=那个幻觉异路径）。
+    fp_modify_paths: set[str] = set()
+    fp_create_paths: set[str] = set()
+    for e in (file_plan or []):
+        if not isinstance(e, dict):
+            continue
+        _p = str(e.get("path") or "")
+        if not classpath_fqn_key(_p):
+            continue                          # 仅 JVM 类路径（栈中立）
+        if str(e.get("action") or "create") == "modify":
+            fp_modify_paths.add(_norm_scope_path(_p))
+        else:
+            fp_create_paths.add(_norm_scope_path(_p))
+
+    tree_set = {_norm_scope_path(p) for p in tree}
+    relocated = 0
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        creates = list(getattr(sc, "create_files", None) or [])
+        if not creates:
+            continue
+        _new_creates: list = []
+        _to_writable: list = []
+        for f in creates:
+            norm = _norm_scope_path(f)
+            if _is_test_path(norm):
+                _new_creates.append(f)
+                continue
+            k = classpath_fqn_key(f)
+            if not k:
+                _new_creates.append(f)
+                continue
+            _m, fqn = k
+            simple = fqn.rsplit("/", 1)[-1].lower()
+            if norm in tree_set:
+                _new_creates.append(f)        # 精确 ∈ base 树 → R67-T8 逆向处理，本 pass 不碰
+                continue
+            hits = base_by_simple.get(simple) or []
+            if len(hits) != 1 or hits[0] == norm:
+                _new_creates.append(f)        # base 同名非唯一 / 就是自己 → fail-closed 不动
+                continue
+            # ★路径粒度安全信号★：该 create_files 落点【本身】须被 file_plan 声明为 modify（LLM 显式
+            # "改此路径"），且未被同路径 create 声明（同路径兼 create/modify=意图歧义 fail-closed）。
+            if norm not in fp_modify_paths or norm in fp_create_paths:
+                _new_creates.append(f)        # 落点非 file_plan modify / 同路径歧义 → 留 ③f REJECT
+                continue
+            # 安全信号齐备：LLM 显式改既有类却把 create_files 落点写成幻觉异路径 → 归位到 base 真身
+            _base_path = hits[0]
+            _to_writable.append(_base_path)
+            relocated += 1
+            logger.warning(
+                "[DECONFLICT-CVB] create-vs-base modify-shadow 归位：%s 的 create_files %s "
+                "（file_plan action=modify）→ base 真身 %s 改 writable(modify)（G1 ③f 治本）",
+                getattr(st, "id", "?"), norm, _base_path)
+        if _to_writable:
+            sc.create_files = _new_creates
+            _w = list(getattr(sc, "writable", None) or [])
+            for b in _to_writable:
+                if b not in _w:
+                    _w.append(b)
+            sc.writable = _w
+    return relocated
+
+
 def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
-                           base_ref: str | None = None) -> dict[str, int]:
+                           base_ref: str | None = None,
+                           file_plan: list | None = None) -> dict[str, int]:
     """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
 
     顺序是治本要害(RUN18 实证：两 pass 互撤 → 0 交付)，做成单一函数杜绝调用点各写一份导致漂移：
@@ -5354,6 +5485,12 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
         # R67F-T1（层③）紧随 ③ 之后：同名异包（异 FQN 同 simple-name）有契约权威者确定性消解。
         # ★必须在 ③ 之后★：③ 先塌缩同 FQN 跨模块副本 → 本 pass 面对的 owner FQN 恰有唯一创建者。
         "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(plan),
+        # create-vs-base【modify-only 安全子集】：LLM 显式 action=modify 却把子任务 create_files 落点
+        # 写成 base 实体幻觉异路径（SysUser 型）→ 归位到 base 真身（改 modify）。★必须在 normalize
+        # 之前★：归位可能造 st-x/st-y 同文件双写者，交下方 normalize_plan_scopes 串行化收敛。无 file_plan
+        # modify 信号（SysMenu 型 create）不碰，留 G1 ③f REJECT（fail-closed，绝不裸 basename 挑边）。
+        "cvb_modify_shadow_relocated": deconflict_create_vs_base_modify_shadow(
+            plan, file_plan, project_path=project_path, base_ref=base_ref),
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),

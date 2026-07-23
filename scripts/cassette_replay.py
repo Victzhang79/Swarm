@@ -134,7 +134,7 @@ def replay_cassette(cassette: dict, *, verbose: bool = False) -> ReplayResult:
         _emit("resolve_plan_conflicts (elaborate 节点)")
         res.failed_stage = "resolve_plan_conflicts"
         res.resolve_counts = resolve_plan_conflicts(
-            plan, project_path=project_path, base_ref=base_ref)
+            plan, project_path=project_path, base_ref=base_ref, file_plan=file_plan)
 
         res.failed_stage = None
     except BaseException as exc:  # noqa: BLE001 — 复现工具：任何崩溃都要如实呈现，不吞
