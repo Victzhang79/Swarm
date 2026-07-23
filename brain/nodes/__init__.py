@@ -2492,6 +2492,26 @@ async def plan(state: BrainState) -> dict:
         # fail-open：泄压阀关/无需求/无 unplanned/LLM 失败→原样返回不阻断（留 L1 兜底+覆盖闸）。
         _file_plan, _l2_augmented = await _ensure_file_plan_covers_requirements(
             state, llm, _file_plan, fallback_llm=_get_brain_fallback_llm())
+        # R67G-T1：file_plan 层异 FQN 同 simple-name 跨包 create 重复消解（★公共点：单发/分批/重试
+        # 三路径全覆盖★，复核 Hunter#3 整改——原只在 _plan_ultra_batched 内，单发 PLAN 路径裸奔）。
+        # round67g 死因（task=b3659ca9 FAILED@PLAN）：重试从【恒定 tech_design_file_plan】重拆只重新
+        # 分组、LLM 无权删条目 → 异FQN同名跨包 create（枚举 defined_in 在契约 dtos section）renumber
+        # 原样重犯 → 层②熔断产不出合法 plan。用契约 defined_in 唯一权威消解；无权威 fail-closed 留
+        # ③b（绝不裸挑边）。create-vs-base shadow 本轮不归位（复核 CRITICAL：base 同名挑边=round67c
+        # 已删启发式），交 ③f REJECT，独立前沿另治。幂等，故置分批/单发分支【前】一处即全覆盖。
+        try:
+            from swarm.brain.contract_utils import deconflict_file_plan_same_name_creates
+            _dc = deconflict_file_plan_same_name_creates(
+                _file_plan, shared_contract=state.get("shared_contract_draft") or {},
+                project_path=_get_project_path(state.get("project_id") or ""),
+                base_ref=state.get("base_commit"))
+            if _dc.get("samename_creates_deduped"):
+                _l2_augmented = True   # file_plan 被改 → 强制 _format 用 override 反映消解后形态
+                logger.info(
+                    "[PLAN] R67G file_plan 跨包同名重复 create 剥离 %d 条（契约权威，分批/单发前）",
+                    _dc.get("samename_creates_deduped", 0))
+        except Exception:  # noqa: BLE001 — fail-open，G1 ③b 权威兜底打回
+            logger.warning("[PLAN] R67G file_plan 同名消解失败（fail-open，③b 兜底）", exc_info=True)
         # 需求转化层产出注入：把（L2 增广后的）file_plan/数据模型/契约喂给 PLAN，PLAN 据此定 scope。
         # ★必须在 L2 补排【之后】格式化——否则单发拆解 prompt 看不到补排的新文件（复核 HIGH）。空则回退自推导。
         tech_design_plan = _format_tech_design_for_plan(

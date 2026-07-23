@@ -5073,6 +5073,35 @@ def contract_owner_ledger_block(contract: dict | None) -> str:
         f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}")
 
 
+def _contract_owner_authority(
+        shared_contract: dict | None) -> tuple[dict[str, str], set[str]]:
+    """契约 defined_in 唯一权威：simple-name(lower) → owner FQN；同名两 owner=歧义入 set。
+
+    ★R67G 修：扫【所有带 defined_in 的 section】（interfaces + dtos + …），非仅 interfaces★——
+    round67g 铁证：枚举 AlarmLevelEnum/AlarmTypeEnum 的 defined_in 落在契约 `dtos` section
+    （fields 是枚举常量），只读 interfaces 会漏掉 → 同名异包 create 消解无权威→fail-closed→
+    LLM 无限重犯。权威已确定性存在于契约，只是没读。栈中立（classpath_fqn_key 门控）。
+    """
+    owner_fqn_by_base: dict[str, str] = {}
+    ambiguous_base: set[str] = set()
+    for sec in (shared_contract or {}).values():
+        if not isinstance(sec, list):
+            continue
+        for e in sec:
+            if not isinstance(e, dict):
+                continue
+            key = classpath_fqn_key(str(e.get("defined_in") or ""))
+            if not key:
+                continue
+            _m, fqn = key
+            base = fqn.rsplit("/", 1)[-1].lower()
+            prev = owner_fqn_by_base.get(base)
+            if prev is not None and prev != fqn:
+                ambiguous_base.add(base)   # 契约自身给同 simple-name 两个不同 owner → 无唯一权威
+            owner_fqn_by_base[base] = fqn
+    return owner_fqn_by_base, ambiguous_base
+
+
 def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
     """R67F-T1（层③）：同名(simple name)JVM 类被多子任务在【不同包】(异 FQN)各自 create 时，
     契约 defined_in 有唯一权威 owner → 确定性归一（保 owner 落点、其余异包副本剥除+改 readable+依赖 owner）。
@@ -5111,21 +5140,10 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
             _mod, fqn = key
             base = fqn.rsplit("/", 1)[-1].lower()
             base_index.setdefault(base, {}).setdefault(fqn, []).append((st, f))
-    # 契约 defined_in 权威：basename → owner fqn（唯一）；契约自身给同 basename 两个不同 owner=歧义
-    owner_fqn_by_base: dict[str, str] = {}
-    ambiguous_base: set[str] = set()
-    for e in ((getattr(plan, "shared_contract", None) or {}).get("interfaces") or []):
-        if not isinstance(e, dict):
-            continue
-        key = classpath_fqn_key(str(e.get("defined_in") or ""))
-        if not key:
-            continue
-        _m, fqn = key
-        base = fqn.rsplit("/", 1)[-1].lower()
-        prev = owner_fqn_by_base.get(base)
-        if prev is not None and prev != fqn:
-            ambiguous_base.add(base)     # 契约自身对同 basename 给了两个不同 owner → 无唯一权威
-        owner_fqn_by_base[base] = fqn
+    # 契约 defined_in 权威（★R67G：扫所有带 defined_in 的 section，非仅 interfaces——枚举/DTO 在
+    # dtos section，只读 interfaces 会漏权威→同名异包无从消解→LLM 无限重犯★）
+    owner_fqn_by_base, ambiguous_base = _contract_owner_authority(
+        getattr(plan, "shared_contract", None))
     by_id = {getattr(st, "id", None): st for st in subtasks}
 
     def _reaches_dep(start, target) -> bool:
@@ -5196,6 +5214,120 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
                     "（子任务 %s）；从子任务 %s 剥除 %s（异包副本改 readable+依赖 owner）",
                     base, owner_fqn, owner_id, sid, f)
     return changed
+
+
+def deconflict_file_plan_same_name_creates(
+    file_plan: list[dict],
+    *,
+    shared_contract: dict | None = None,
+    project_path: str | None = None,
+    base_ref: str | None = None,
+) -> dict[str, int]:
+    """R67G-T1/T2（file_plan 层·分批前【唯一】确定性杠杆）：同 simple-name JVM class create 消解。
+
+    死因（task=b3659ca9 FAILED@PLAN，2026-07-23）：VALIDATE 期 G1 ③b/③f REJECT 4 违例
+    （AlarmLevelEnum/AlarmTypeEnum 异 FQN 同 simple-name 跨包 create + SysMenu/SysUser
+    create-vs-base shadow）。但重试从【恒定 tech_design_file_plan】重拆、只重新分组，batch LLM
+    无权从 file_plan 删条目 → renumber 后原样重犯 → 层② 违例签名熔断 FAILED@PLAN（诚实止血但
+    产不出合法 plan）。层③(deconflict_same_name_cross_package_creates)在【子任务级】且晚于分批，
+    G1 ③b/③f 只 REJECT 不消解 → 本 pass 填【分批前 file_plan 唯一能改的确定性关口】这个空缺
+    （brain/nodes/__init__.py _plan_ultra_batched：dedupe_file_plan 后、group_into_module_batches 前）。
+
+    T1（本轮唯一确定性消解）异 FQN 同 simple-name 跨包 create 重复 → 【契约 defined_in】唯一权威裁
+    owner，删非 owner 副本条目（同层③口径 classpath_fqn_key + owner_fqn_by_base；剥除后 resync 其它
+    条目 depends_on 改指 owner 落点）。无契约权威/契约歧义 → fail-closed 留 ③b + 层②熔断兜底。
+
+    ★create-vs-base shadow（SysMenu/SysUser 型：create/modify 撞 base 既有同名异路径类）本轮【不做
+    确定性归位】★：以「base 同名唯一即归位」为权威=round67c 已被 ecc 复核判 HIGH 删除的裸 basename
+    挑边（合法通用名新类 Config/Constants 撞无关 base→静默腐化），且 round67g 契约把 base 实体位置
+    幻觉错（无安全权威）→ 交 G1 ③f 显式 REJECT（诚实 FAILED@PLAN 优于静默腐化），作独立前沿另治。
+
+    ★fail-closed 铁律（round67c 血泪：裸 basename 全局佐证误合并合法通用名新类静默腐化，ecc 复核
+    删过该自愈）★：任何"哪个是 owner/真身"判不出唯一确定性权威 → 绝不挑边，留 ③b/③f REJECT +
+    层② 熔断兜底。栈中立：classpath_fqn_key 仅 JVM 类路径命名空间非 None（Go/Py/TS/资源天然豁免）；
+    test 布局豁免（每模块一份 ApplicationTests 生态惯例，同层③）。返回计数 dict（可观测）。
+    """
+    counts = {"samename_creates_deduped": 0}
+    if not file_plan:
+        return counts
+
+    def _is_test_path(path: str) -> bool:
+        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        return "test" in parts or "tests" in parts
+
+    # ── T1：异 FQN 同 simple-name 跨包 create 重复（契约 defined_in 唯一权威消解，同层③口径）──
+    create_index: dict[str, dict[str, list]] = {}
+    for e in file_plan:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("action") or "create") != "create":
+            continue
+        key = classpath_fqn_key(str(e.get("path") or ""))
+        if not key or _is_test_path(str(e.get("path") or "")):
+            continue
+        _mod, fqn = key
+        base = fqn.rsplit("/", 1)[-1].lower()
+        create_index.setdefault(base, {}).setdefault(fqn, []).append(e)
+
+    # 契约 defined_in 权威（★扫所有带 defined_in 的 section——枚举/DTO 在 dtos，非 interfaces★）
+    owner_fqn_by_base, ambiguous_base = _contract_owner_authority(shared_contract)
+
+    _removed: set[int] = set()
+    _removed_path_to_owner: dict[str, str] = {}   # 被剥副本路径 → owner 落点（供 depends_on resync）
+    for base, fqns in create_index.items():
+        if len(fqns) < 2:
+            continue          # 单一 FQN（同 FQN 跨模块由 ③ deconflict_cross_module_creates 处理）
+        if base in ambiguous_base:
+            continue          # 契约歧义 → fail-closed 留 ③b
+        owner_fqn = owner_fqn_by_base.get(base)
+        if not owner_fqn or owner_fqn not in fqns:
+            continue          # 无契约权威 / owner 无人建 → fail-closed（绝不裸挑边）
+        _owner_path = _norm_scope_path(str((fqns[owner_fqn][0]).get("path") or ""))
+        for fqn, entries in fqns.items():
+            if fqn == owner_fqn:
+                continue      # owner 侧不动
+            for ent in entries:
+                _removed.add(id(ent))
+                _rp = _norm_scope_path(str(ent.get("path") or ""))
+                if _rp and _owner_path:
+                    _removed_path_to_owner[_rp] = _owner_path
+                counts["samename_creates_deduped"] += 1
+                logger.info(
+                    "[DECONFLICT-FILEPLAN] R67G-T1 同名 %s 跨包异 FQN 重复 create：契约 owner=%s"
+                    " → 剥离副本条目 %s（file_plan 层，分批前唯一杠杆）",
+                    base, owner_fqn, ent.get("path"))
+    if _removed:
+        file_plan[:] = [e for e in file_plan if id(e) not in _removed]
+        # depends_on resync（复核 Hunter#2）：其它条目若 depends_on 引被剥路径 → 改指 owner 落点，
+        # 否则陈旧边被 group_into_module_batches 的 file 级排序回退【静默丢弃】（无信号）。
+        for e in file_plan:
+            if not isinstance(e, dict) or not e.get("depends_on"):
+                continue
+            _new: list = []
+            _changed = False
+            for d in (e.get("depends_on") or []):
+                _own = _removed_path_to_owner.get(_norm_scope_path(str(d)))
+                if _own:
+                    _changed = True
+                    if _own not in _new:
+                        _new.append(_own)     # 改指 owner（去重）
+                elif d not in _new:
+                    _new.append(d)
+            if _changed:
+                e["depends_on"] = _new
+
+    # ── create-vs-base shadow（SysMenu/SysUser 型）：本轮【不做确定性归位】★ ────────────────
+    # round67g 对抗复核 CRITICAL：以「base 同名唯一即归位」为权威，正是 round67c 已被 ecc 复核判
+    # HIGH 并【删除】的裸 basename 挑边启发式（`plan_validator.py` `_created_class_shadows_base`
+    # docstring 有据）——合法通用名新类（各模块自带 Config/Constants）撞无关模块 base 同名类 →
+    # 被 modify 覆盖【静默腐化】。且经查 round67g 契约把 base 实体位置【幻觉错】（SysUser.defined_in
+    # =ruoyi-system/domain 而非 base ruoyi-common；SysMenu 未声明）→ 无任何安全确定性权威。故 create-
+    # vs-base 交 G1 ③f 显式 REJECT（fail-closed，诚实 FAILED@PLAN 优于静默腐化），作【独立前沿】另治
+    # （需上游 contract/tech_design 不再重建 base 实体，或带独立佐证的 modify-only 归位 + 独立对抗
+    # 复核）。project_path/base_ref 参数保留供该后续治本接入，本轮 T1 不用。
+    _ = (project_path, base_ref)
+
+    return counts
 
 
 def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
