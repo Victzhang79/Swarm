@@ -165,6 +165,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile）。构建/lint 工具链系统会自动推断，但【每条行为类验收标准都要能被确定性验证】：在 harness.verify_commands 里给出针对该标准的烟雾断言命令（如 grep 新接口/实体字段是否落地、编译后跑一条最小校验），这【不是】单元测试、也不受"不主动加测试"约束，是"产出是否合格"的机读证据。单元 test_command 仅任务明确要求测试时才给。
 【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖（Java 如 lombok/各 starter，Node 如运行时+类型依赖）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
 【P8 同名类唯一 owner（仅 JVM 类路径语言，治本：同名异包 bean 冲突）】：绝不在不同包/模块各建同名（simple name 相同）的类（如 alarm.util.AesUtils 与 common.encrypt.AesUtils）——JVM 下 Spring bean 名/MyBatis typeAlias 默认取 simple name，同名异包并存启动即冲突。若上文给出"已认领类唯一 owner"清单，本批需要这些类时只在 scope.readable 引用其 owner 路径（import 该 FQN），【严禁】重新 create 同名类。此约束不适用于 Go/Python/JS/TS。
+【P8b 既有实体不重建 create-vs-base（仅 JVM 类路径语言）】：若某 JVM 类的 simple name 已存在于【base 既有代码库】(如既有实体 SysUser/SysMenu 等)——本批 file_plan 若把它标 modify 就在 scope.writable 放它的【base 真身路径】、若要扩展它则 readable 引用真身，【绝不】把它放进 scope.create_files 在别的模块/包重建同名类（同 P8 的 bean/typeAlias 撞车启动崩，且被确定性闸 ③f 打回重拆）。确需职责不同的新类 → 改名消歧。不适用于 Go/Python/JS/TS。
 
 规则：
 - 只为【本批模块文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。
