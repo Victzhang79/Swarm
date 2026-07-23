@@ -5032,6 +5032,172 @@ def deconflict_cross_module_creates(plan: TaskPlan) -> int:
     return changed
 
 
+def contract_owner_ledger_block(contract: dict | None) -> str:
+    """R67F-T3（层②·fan-out 前硬预算禁写清单）：从 shared_contract 提取已认领符号的【唯一 owner
+    落点】，拼成分批 prompt 的硬约束禁写块——令每批 LLM 在【拆之前】就知道哪些类已有指定归属，
+    从源头杜绝在别包重复 create 同名类（round67f 死因的预防层，与层③消解/层②熔断纵深互补）。
+
+    round67f 死因：分批规划各批独立 LLM 调用、只见本批文件清单，看不到别的模块已认领的符号 →
+    A 模块的 st 与 B 模块的 st 各自 create 同名(simple-name)异包类（AesUtils / AlarmAsyncConfig）→
+    G1 ③b 打回 → 全量重拆 renumber 重犯。本块把契约的 defined_in 权威【前置广播】给每一批：
+    "这些类已有唯一 owner，你若要用就 readable 引用其 FQN，【严禁】在别的包/模块重新 create 同名类"。
+
+    栈中立：仅收 classpath_fqn_key 非 None（JVM 类路径命名空间）的 defined_in——同名异包冲突是
+    JVM simple-name bean 命名空间特有问题（Spring/MyBatis），Go/Py/TS 同名跨包合法故天然不入清单。
+    契约无 JVM 认领符号 → 返回空串（一字不加，不污染非 JVM 栈 prompt）。条目按 basename 去重排序、
+    上限 60 条防 prompt 膨胀（超出静默截断=保守，宁少列不误导）。
+    """
+    interfaces = ((contract or {}).get("interfaces") or [])
+    seen: dict[str, str] = {}       # basename -> owner 展示路径（首见为准，契约内首个权威）
+    for e in interfaces:
+        if not isinstance(e, dict):
+            continue
+        defined_in = str(e.get("defined_in") or "").strip()
+        if not defined_in:
+            continue
+        key = classpath_fqn_key(defined_in)
+        if not key:
+            continue                # 非 JVM 类路径 → 不入禁写清单（栈中立）
+        _mod, fqn = key
+        base = fqn.rsplit("/", 1)[-1]        # 保原样大小写用于展示
+        if base.lower() not in {b.lower() for b in seen}:
+            seen[base] = _norm_scope_path(defined_in)
+    if not seen:
+        return ""
+    rows = "\n".join(f"  - {b} → 唯一 owner：{p}"
+                     for b, p in sorted(seen.items())[:60])
+    return (
+        "\n\n【硬约束-P8 已认领类唯一 owner（禁止同名异包重复创建）】以下类已由契约指定【唯一 owner "
+        "落点】。本批若需使用它们，请在 scope.readable 引用其 owner 路径（import 该 FQN），"
+        "【严禁】在其他包/模块的路径下 create 同名（simple name 相同）的类——JVM 类路径下同名类会导致"
+        f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}")
+
+
+def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
+    """R67F-T1（层③）：同名(simple name)JVM 类被多子任务在【不同包】(异 FQN)各自 create 时，
+    契约 defined_in 有唯一权威 owner → 确定性归一（保 owner 落点、其余异包副本剥除+改 readable+依赖 owner）。
+
+    round67f 死因（task=ad7b1916，k3 连烧 2 轮同类重犯）：st-27-1 create com/ruoyi/alarm/util/
+    AesUtils.java 与 st-6 create com/ruoyi/common/utils/encrypt/AesUtils.java = 同名异包重复设计
+    （Spring bean 名默认取 simple name，两份并存启动即 ConflictingBeanDefinitionException；消费方
+    也会解析到语义漂移的副本）。G1 ③b(R67-T1b，plan_validator._cross_package_same_basename_creates)
+    正确 REJECT，但【纯打回】→LLM 全量重拆→renumber 后同接口原样重犯（轮1 st-27-1 / 轮2 st-11-1）
+    →无限烧。本 pass 用【契约 defined_in】唯一权威（与 ③/#101 deconflict_cross_module_creates 同源
+    判据，★绝不裸 basename 挑边——round67c 血泪：全局 basename 佐证会误合并合法通用名新类静默腐化★）
+    确定性消解【有权威】的违例；无权威者（纯常量类等不在契约 interfaces）仍留 G1 ③b REJECT
+    （fail-closed，绝不静默挑边），配合层② 去 st-id 规范化签名熔断止血。
+
+    与 ③(#101) 互补且互斥：③ 判【同 FQN 跨物理模块】(相同包不同根)，本 pass 判【异 FQN 同
+    simple-name 跨包】——判据（FQN 相等 vs 仅 basename 相等）不重叠。★必须【在 ③ 之后】跑★：③
+    先塌缩同 FQN 跨模块副本，本 pass 面对的 owner FQN 恰有唯一创建者。栈中立（classpath_fqn_key
+    仅 JVM 类路径命名空间非 None，资源/Go/Py/TS 天然豁免）；test 布局豁免（每模块一份
+    ApplicationTests 是生态惯例）。返回被归一（剥除）的文件数。
+    """
+    subtasks = list(getattr(plan, "subtasks", None) or [])
+    if len(subtasks) < 2:
+        return 0
+    # basename → {fqn -> [(subtask, create_path)]}（仅 JVM 源码 create，test 布局豁免）
+    base_index: dict[str, dict[str, list]] = {}
+    for st in subtasks:
+        sc = getattr(st, "scope", None)
+        for f in list(getattr(sc, "create_files", None) or []):
+            norm = str(f).replace("\\", "/")
+            parts = [p for p in norm.split("/") if p]
+            if "test" in parts or "tests" in parts:
+                continue        # test 布局豁免（保守：路径任一段为 test/tests 即豁免）
+            key = classpath_fqn_key(f)
+            if not key:
+                continue        # 非 JVM 类路径源码天然豁免（栈中立）
+            _mod, fqn = key
+            base = fqn.rsplit("/", 1)[-1].lower()
+            base_index.setdefault(base, {}).setdefault(fqn, []).append((st, f))
+    # 契约 defined_in 权威：basename → owner fqn（唯一）；契约自身给同 basename 两个不同 owner=歧义
+    owner_fqn_by_base: dict[str, str] = {}
+    ambiguous_base: set[str] = set()
+    for e in ((getattr(plan, "shared_contract", None) or {}).get("interfaces") or []):
+        if not isinstance(e, dict):
+            continue
+        key = classpath_fqn_key(str(e.get("defined_in") or ""))
+        if not key:
+            continue
+        _m, fqn = key
+        base = fqn.rsplit("/", 1)[-1].lower()
+        prev = owner_fqn_by_base.get(base)
+        if prev is not None and prev != fqn:
+            ambiguous_base.add(base)     # 契约自身对同 basename 给了两个不同 owner → 无唯一权威
+        owner_fqn_by_base[base] = fqn
+    by_id = {getattr(st, "id", None): st for st in subtasks}
+
+    def _reaches_dep(start, target) -> bool:
+        """start 是否经 depends_on 链到达 target（加边 st→owner 前防环）。"""
+        seen, stack = set(), [start]
+        while stack:
+            cur = stack.pop()
+            if cur == target:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            st = by_id.get(cur)
+            if st is not None:
+                stack.extend(getattr(st, "depends_on", None) or [])
+        return False
+
+    changed = 0
+    for base, fqns in base_index.items():
+        if len(fqns) < 2:
+            continue          # 单一 FQN（同 FQN 跨模块由 ③ deconflict_cross_module_creates 处理）
+        if base in ambiguous_base:
+            continue          # 契约自身歧义 → fail-closed 留 ③b REJECT
+        owner_fqn = owner_fqn_by_base.get(base)
+        if not owner_fqn or owner_fqn not in fqns:
+            continue          # 无契约权威 / 权威 owner 无人创建 → fail-closed 留 ③b REJECT（绝不静默挑边）
+        owner_st, owner_file = fqns[owner_fqn][0]
+        owner_id = getattr(owner_st, "id", None)
+        for fqn, entries in fqns.items():
+            if fqn == owner_fqn:
+                continue       # owner 侧不动
+            for st, f in entries:
+                sc = getattr(st, "scope", None)
+                if sc is None:
+                    continue
+                nf = _norm_scope_path(f)
+                sc.create_files = [x for x in (getattr(sc, "create_files", None) or [])
+                                   if _norm_scope_path(x) != nf]
+                # 三面同步（同 ③ 猎手整改）：剥 create 的同时清掉【专门针对该文件】的验收/验证条目，
+                # 否则子任务仍被 "X.java 按用途实现并编译通过" 误导去重建已剥离文件，抵消归一。
+                # ★复核 Hunter#3(MEDIUM) 整改★：同名异包场景 AC/verify 常按【basename 文件名】
+                # （"AesUtils.java 实现并编译"）而非全路径引用被剥文件——除全/规范路径外也按 basename
+                # 剥（basename 含扩展名，误伤 MyAesUtils.java 概率极低且仅作用于本 dup 子任务）。
+                _bn = f.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                _strip_refs = {r for r in (f, nf, _bn) if r}   # 全路径/规范路径/basename 任一命中即剥
+                _ac = getattr(st, "acceptance_criteria", None)
+                if _ac:
+                    st.acceptance_criteria = [a for a in _ac
+                                              if not any(r in str(a) for r in _strip_refs)]
+                _hh = getattr(st, "harness", None)
+                _vc = getattr(_hh, "verify_commands", None) if _hh is not None else None
+                if _vc:
+                    _hh.verify_commands = [v for v in _vc
+                                           if not any(r in str(v) for r in _strip_refs)]
+                if owner_file:      # 消费方改 readable 指向 owner 真实（异包）落点
+                    rd = list(getattr(sc, "readable", None) or [])
+                    if _norm_scope_path(owner_file) not in {_norm_scope_path(x) for x in rd}:
+                        rd.append(owner_file)
+                        sc.readable = rd
+                sid = getattr(st, "id", None)
+                if owner_id and sid and owner_id != sid and not _reaches_dep(owner_id, sid):
+                    deps = list(getattr(st, "depends_on", None) or [])
+                    if owner_id not in deps:
+                        st.depends_on = deps + [owner_id]
+                changed += 1
+                logger.info(
+                    "[DECONFLICT-SAMENAME] R67F-T1 同名 %s 跨包异 FQN 重复 create：契约 owner FQN=%s"
+                    "（子任务 %s）；从子任务 %s 剥除 %s（异包副本改 readable+依赖 owner）",
+                    base, owner_fqn, owner_id, sid, f)
+    return changed
+
+
 def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
                            base_ref: str | None = None) -> dict[str, int]:
     """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
@@ -5051,8 +5217,11 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
     plan_validator 校验的"每个文件单一写者 + 无悬空依赖"不变量，由本函数确定性满足。返回各 pass 改动计数。
     """
     return {
-        # #101 先跑：剥掉契约有权威 owner 的跨模块重复 create，后续 pass 只看干净 scope。
+        # #101 先跑：剥掉契约有权威 owner 的跨模块重复 create（同 FQN），后续 pass 只看干净 scope。
         "xmod_creates_deconflicted": deconflict_cross_module_creates(plan),
+        # R67F-T1（层③）紧随 ③ 之后：同名异包（异 FQN 同 simple-name）有契约权威者确定性消解。
+        # ★必须在 ③ 之后★：③ 先塌缩同 FQN 跨模块副本 → 本 pass 面对的 owner FQN 恰有唯一创建者。
+        "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(plan),
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),

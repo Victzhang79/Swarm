@@ -187,6 +187,150 @@ def build_baseline_vocab(files: list[dict], symbols: list[dict]) -> str:
     return "\n".join(parts)
 
 
+# R67F-P2（专项2·接地核验）：路径样 token——含 "/" 且以代码文件扩展名结尾（保守，防误把
+# 中文/普通词当路径）。用于 evidence_files 缺失时从 reason 自由文本兜底提取引用路径。
+_PATH_LIKE_RE = re.compile(
+    r"(?<![\w./-])((?:[\w.\-]+/)+[\w.\-]+\.(?:java|kt|scala|go|py|ts|tsx|js|jsx|"
+    r"vue|rs|c|cc|cpp|h|hpp|cs|rb|php|xml|sql|yml|yaml|properties))")
+
+
+def _norm_index_path(p: str) -> str:
+    s = str(p or "").replace("\\", "/").strip()
+    return s[2:] if s.startswith("./") else s
+
+
+def build_baseline_file_index(files: list[dict], symbols: list[dict]) -> dict:
+    """R67F-P2（专项2）：把基线 (files, symbols) 拼成【保 per-file 结构】的接地索引——
+    与 build_baseline_vocab（拍平全库单 blob，用于 T6 token 命中）互补：本索引保留
+    "哪个文件有哪些符号"，供接地核验 A（路径∈索引）/ B（该路径符号命中 req token）。
+
+    round67 #2 死型：reason 把幻觉能力嫁接真实文件（"SysUserController 已实现 2FA"），T6
+    全库 blob 命中无法区分"命中 reason 所引文件"与"命中无关文件 B"→ 需要 per-file 结构。
+    返回 {"files": set[归一路径], "symbols_by_file": {归一路径: 小写符号/类名 blob}}。
+    空输入 → 空索引（调用方据此 fail-open 全豁免）。通用多栈：纯字符串结构无语言特判。
+    """
+    file_set: set[str] = set()
+    for f in (files or []):
+        if isinstance(f, dict):
+            fp = _norm_index_path(f.get("file_path") or "")
+            if fp:
+                file_set.add(fp)
+    sym_by_file: dict[str, list[str]] = {}
+    for sym in (symbols or []):
+        if not isinstance(sym, dict):
+            continue
+        fp = _norm_index_path(sym.get("file_path") or "")
+        if not fp:
+            continue
+        bucket = sym_by_file.setdefault(fp, [])
+        for k in ("symbol_name", "class_name"):
+            v = str(sym.get(k) or "").strip().lower()
+            if v:
+                bucket.append(v)
+                _ini = _camel_initials(v)
+                if len(_ini) >= 3:
+                    bucket.append(_ini)
+    # basename stem + 路径段 token 也进各文件 blob（复核 Reviewer HIGH 整改）：子闸 B 改 all()
+    # 后，需求词里的【包/目录域名】（handler/encrypt/sms/auth…）应能经文件路径接地，否则 all()
+    # 会误杀"能力体现在包名而非符号名"的合法申报（如 Go svc-user/internal/handler/user.go 对
+    # 需求词 "handler"）。路径段是语言无关字符串，栈中立。
+    for fp in file_set:
+        bucket = sym_by_file.setdefault(fp, [])
+        bucket.append(_basename_stem(fp))
+        for seg in re.split(r"[/.\-_]+", fp.lower()):
+            if len(seg) >= 3:
+                bucket.append(seg)
+    return {"files": file_set,
+            "symbols_by_file": {fp: "\n".join(toks) for fp, toks in sym_by_file.items()}}
+
+
+def _match_index_path(claimed: str, file_set: set[str]) -> str | None:
+    """归一后：精确命中，或某基线文件以 "/claimed" 结尾（planner 给部分路径）→ 返回命中的基线路径。
+    ★不做纯 basename 匹配★（round67c 血泪：裸 basename 会误命中同名无关文件），要求 claimed
+    含路径分隔或以完整文件名 suffix 命中，保守 fail-closed。"""
+    c = _norm_index_path(claimed)
+    if not c:
+        return None
+    if c in file_set:
+        return c
+    suffix = "/" + c
+    hits = [f for f in file_set if f.endswith(suffix)]
+    return hits[0] if len(hits) == 1 else None      # 多义 suffix 命中=歧义，不认（保守）
+
+
+def baseline_claims_unground(
+    baseline_covered: list[dict] | None,
+    requirement_items: list[dict] | None,
+    file_index: dict | None,
+) -> list[str]:
+    """R67F-P2（专项2·接地核验 A/B）：返回【申报 baseline_covered 但 reason 引用的文件经不起
+    per-file 接地】的 req-id。与 T6（baseline_claims_missing_evidence，全库 blob token 命中）
+    并存不同路径——T6 从不看 reason 引用的【具体文件】、且全库 blob 命中无法定位到 reason 所引
+    的那个文件；本闸补上 reason→文件接地这条路径。
+
+    死型（round67 #2，E 类静默毒交付）：planner 谎报新特性 baseline_covered，reason 把幻觉能力
+    嫁接真实文件路径（"SysUserController 已实现 2FA"）→ 需求静默蒸发→假 DONE 无账。
+
+    两子闸（对每条申报收集候选路径：优先 evidence_files，缺失则从 reason/evidence 正则兜底提）：
+      A 路径∈基线索引：任一候选路径不在索引（捏造路径=最强作假信号）→ REJECT。★path 是 ASCII
+        与 req 语言无关 → 纯中文 req 也走 A（捏造路径不因纯中文豁免）★。
+      B 符号命中 req token：候选路径【全部】命中失败（该文件符号 blob 不含任何 req 判别 token
+        = 嫁接无能力文件）→ REJECT。req 零判别 token（纯中文）→ 豁免 B（round37 过严教训），
+        但 A 已挡捏造路径。
+    fail-open 边界：空索引（KB 不可达）→ [] 全豁免（node 侧 record_degrade 不静默）；申报无任何
+      候选路径 → 跳过（无路径可验，交 T6 token 接地）。通用多栈：无语言特判。
+    """
+    if not baseline_covered or not file_index:
+        return []
+    file_set = file_index.get("files") or set()
+    sym_by_file = file_index.get("symbols_by_file") or {}
+    if not file_set:
+        return []                # 空索引 fail-open（node record_degrade）
+    text_by_id: dict[str, str] = {}
+    for it in (requirement_items or []):
+        if isinstance(it, dict) and it.get("id"):
+            text_by_id[str(it["id"])] = str(it.get("text") or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in baseline_covered:
+        if not isinstance(entry, dict):
+            continue
+        rid = str(entry.get("id") or "").strip()
+        if not rid or rid in seen:
+            continue
+        text = text_by_id.get(rid)
+        if text is None:          # 悬空 id → 交 dangling_baseline，本闸不重复判
+            continue
+        # 候选路径：优先显式 evidence_files，缺失从 reason/evidence 正则兜底
+        ef = entry.get("evidence_files")
+        cand_paths = ([str(p) for p in ef if str(p).strip()]
+                      if isinstance(ef, list) and ef else [])
+        if not cand_paths:
+            blob = f"{entry.get('reason') or ''}\n{entry.get('evidence') or ''}"
+            cand_paths = _PATH_LIKE_RE.findall(blob)
+        if not cand_paths:
+            continue              # 无路径引用 → 跳过（交 T6）
+        # 子闸 A：任一候选路径不在索引 → 捏造 → REJECT
+        matched = [_match_index_path(p, file_set) for p in cand_paths]
+        if any(m is None for m in matched):
+            out.append(rid)
+            seen.add(rid)
+            continue
+        # 子闸 B：req 判别 token 须【全部】命中候选路径符号 blob 的并集；零 token（纯中文）豁免 B。
+        # ★复核 Reviewer HIGH 整改★：从 any() 改 all()（镜像 T6 R67-7 硬化）——any 语义下一个巧合
+        # 泛词（如真实 CRUD 符号 edit/save）会掩护缺失的判别 token（sms/otp/jwt）放行假申报，正是
+        # 本专项要堵的"嫁接真实文件"死型。all() 要求每个判别 token 都在【所列证据文件】的符号/路径
+        # 并集里找到证据，否则=嫁接无能力文件 → REJECT（planner 补齐 evidence_files 是诚实出路）。
+        toks = extract_evidence_tokens(text)
+        if not toks:
+            continue              # 纯中文无判别 token → A 已过，豁免 B（防误杀 round37 教训）
+        _union_blob = "\n".join((sym_by_file.get(m) or "") for m in matched if m).lower()
+        if not all(tk in _union_blob for tk in toks):
+            out.append(rid)       # 有判别 token 在证据文件并集里零证据 = 嫁接无能力文件
+            seen.add(rid)
+    return out
+
+
 def baseline_claims_missing_evidence(
     baseline_covered: list[dict] | None,
     requirement_items: list[dict] | None,

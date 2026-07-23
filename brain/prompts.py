@@ -74,6 +74,11 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
    - 按【接口/契约先行 → 实现 → 装配/调用】的依赖序拆：例如 ①实体+DTO+Service接口（定义契约）→ ②ServiceImpl+Mapper+XML（实现）→ ③Controller（装配调用前两步的接口）。
    - 子任务间用 depends_on 串成【严格串行】依赖序（后序依赖前序），后序子任务能看到前序产出的真实接口签名，避免接口对不上。
    - 【硬约束：子任务之间 writable/create 文件【绝对不可重叠】】——每个文件只能属于一个子任务，否则 MERGE 必冲突。
+   - 【硬约束（仅 JVM 类路径语言 Java/Kotlin/Scala）：同名（simple name 相同）的类【只能有唯一 owner 落点】】——
+     绝不要在不同包/模块各建一个同名类（如 com.a.util.AesUtils 与 com.b.encrypt.AesUtils）。JVM 下类的
+     Spring bean 名、MyBatis typeAlias 默认取 simple name，同名异包两份并存启动即冲突（ConflictingBeanDefinition）。
+     若确是同一逻辑类被多处需要 → 只在契约指定的 owner 落点 create 一次，其余子任务把该 FQN 放 readable 引用（import）；
+     若确属两个不同职责的类 → 必须改名消歧（不同 simple name）。此约束【不适用】于 Go/Python/JS/TS（其同名跨模块合法）。
    - 【聚合/注册类共享文件例外】：父 `pom.xml` 的 `<modules>`、`settings.gradle`、路由 `index` 表、DI 容器注册、i18n bundle 这类【需多处登记】的文件，指定【单一 owner 子任务】统一登记所有条目（如脚手架子任务一次注册全部新模块），其余子任务 depends_on 该 owner 并把该文件放 readable，【绝不】各自写——多写者必争抢。
    - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个 maven/gradle 模块时，建该模块 `pom.xml` 的脚手架子任务【必须】在 pom 里一次性声明【本计划里该模块任何子任务会用到、而父 pom 未传递】的全部依赖（如 lombok、spring-boot-starter-data-redis、各 starter/web/validation 等）。后续写代码的子任务【碰不到 pom】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架 pom 多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"构建清单声明全部所需依赖且对应构建命令通过（如 Maven `mvn compile`、Gradle `gradle build`、npm `npm run build`）"。
    - 每个子功能子任务自身仍是垂直切片（自洽、可验证）。
@@ -159,6 +164,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
 【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile）。构建/lint 工具链系统会自动推断，但【每条行为类验收标准都要能被确定性验证】：在 harness.verify_commands 里给出针对该标准的烟雾断言命令（如 grep 新接口/实体字段是否落地、编译后跑一条最小校验），这【不是】单元测试、也不受"不主动加测试"约束，是"产出是否合格"的机读证据。单元 test_command 仅任务明确要求测试时才给。
 【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖（Java 如 lombok/各 starter，Node 如运行时+类型依赖）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
+【P8 同名类唯一 owner（仅 JVM 类路径语言，治本：同名异包 bean 冲突）】：绝不在不同包/模块各建同名（simple name 相同）的类（如 alarm.util.AesUtils 与 common.encrypt.AesUtils）——JVM 下 Spring bean 名/MyBatis typeAlias 默认取 simple name，同名异包并存启动即冲突。若上文给出"已认领类唯一 owner"清单，本批需要这些类时只在 scope.readable 引用其 owner 路径（import 该 FQN），【严禁】重新 create 同名类。此约束不适用于 Go/Python/JS/TS。
 
 规则：
 - 只为【本批模块文件清单】里的文件生成子任务，scope 的 writable/create_files 只能是本批文件。

@@ -178,14 +178,14 @@ async def test_cached_batch_baseline_decls_survive_reuse(monkeypatch):
                         timeout_mods={"bad"})
     _p, failed1, bl1, cache1 = await _run(
         llm1, _state(), [_fp("ok/ok_main.txt"), _fp("bad/bad_main.txt")], monkeypatch)
-    assert bl1 == [{"id": REQ_A, "reason": "存量已有", "evidence": ""}]
+    assert bl1 == [{"id": REQ_A, "reason": "存量已有", "evidence": "", "evidence_files": []}]
     llm2 = _CountingLLM({"ok": payload, "bad": _payload("bad")})
     state2 = _state({"plan_batch_failed_modules": failed1,
                      "plan_batch_cache": cache1})
     _p2, _f2, bl2, _c2 = await _run(
         llm2, state2, [_fp("ok/ok_main.txt"), _fp("bad/bad_main.txt")], monkeypatch)
     assert llm2.calls == {"bad": 1}
-    assert bl2 == [{"id": REQ_A, "reason": "存量已有", "evidence": ""}], "缓存回放必须带申报"
+    assert bl2 == [{"id": REQ_A, "reason": "存量已有", "evidence": "", "evidence_files": []}], "缓存回放必须带申报"
 
 
 # ═══════════ 双复核整改（F-1/F-2/F-3/F-4）═══════════

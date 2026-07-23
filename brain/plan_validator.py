@@ -294,8 +294,17 @@ def normalize_baseline_covered(raw) -> list[dict]:
             reason = str(entry.get("reason") or "").strip()[:300]
             # R67-T6：evidence 引文（基线真实标识符/文件名）随申报透传给证据闸，有界防膨胀
             evidence = str(entry.get("evidence") or "").strip()[:120]
+            # R67F-P2（专项2）：evidence_files 显式列出 reason 所引基线文件路径——接地核验
+            # 子闸 A（路径∈索引）优于从 reason 自由文本正则猜路径。非 list/非字符串元素丢弃，
+            # 有界（≤20 条、每条 ≤300 字符）防膨胀；缺失=[]（回退从 reason 正则兜底提路径）。
+            # ★复核 Hunter#5(LOW) 整改★：先滤后截——非字符串/空元素先剔除再取前 20，否则前 20 里
+            # 混入垃圾会把靠后的合法路径挤掉。
+            _ef_raw = entry.get("evidence_files")
+            evidence_files = ([str(p).strip()[:300] for p in _ef_raw
+                               if isinstance(p, str) and str(p).strip()][:20]
+                              if isinstance(_ef_raw, list) else [])
         elif isinstance(entry, str):
-            rid, reason, evidence = entry.strip(), "", ""
+            rid, reason, evidence, evidence_files = entry.strip(), "", "", []
         else:
             continue
         if not rid:
@@ -305,12 +314,15 @@ def normalize_baseline_covered(raw) -> list[dict]:
                 out[index[rid]]["reason"] = reason
             if evidence and not out[index[rid]].get("evidence"):
                 out[index[rid]]["evidence"] = evidence
+            if evidence_files and not out[index[rid]].get("evidence_files"):
+                out[index[rid]]["evidence_files"] = evidence_files
             continue
         if len(out) >= _HARD_MAX_ITEMS:
             _dropped += 1
             continue
         index[rid] = len(out)
-        out.append({"id": rid, "reason": reason, "evidence": evidence})
+        out.append({"id": rid, "reason": reason, "evidence": evidence,
+                    "evidence_files": evidence_files})
     if _dropped:
         logger.warning(
             "[PLAN-VALIDATE] baseline_covered 申报超同源硬顶 %d，丢弃 %d 条"
@@ -1079,6 +1091,28 @@ def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
                  (a, b) in strong_pairs
                  for idx, a in enumerate(sorted(cl)) for b in sorted(cl)[idx + 1:])},
             weak)
+
+
+# ★复核 Hunter#2(HIGH) 整改★：左边界锚（负向后顾）——st- 只在 token 边界处匹配，绝不吞
+# 英文违例文本里的子串（如路由 "/api/first-page" 的 "st-page"、"post-list" 的 "st-"）。否则
+# "first-page"/"first-detail" 两个【不同】路由违例会误规范成同一 "first-*" 签名 → R64-T3 误熔断
+# 真在收敛的 plan。真实子任务 id（"（st-27-1）"）前恒为分隔符（括号/冒号/空格），锚不影响其匹配。
+_STRUCTURAL_SIG_SUBTASK_ID_RE = re.compile(r"(?<![0-9A-Za-z_-])st-[0-9A-Za-z_]+(?:-[0-9A-Za-z_]+)*")
+
+
+def normalize_structural_signature(issues) -> list[str]:
+    """R67F-T2（层②）：把 G1 结构违例文本规范成【去子任务 id】的签名，令 R64-T3 收敛熔断
+    对【全量重拆 renumber】免疫。
+
+    round67f 死因（k3 task=ad7b1916 连烧 2 轮同类重犯，用户手动取消）：同名异包违例每轮以【相同
+    basename+相同异包对】复发，但 G1 issue 文本内嵌的子任务 id 随全量重拆 renumber（轮1 st-27-1 /
+    轮2 st-11-1）→ R64-T3 原 `sorted(str(i) for i in issues)` 整份文本签名逐轮不同 → 熔断永不触发
+    → 注定同结果的重产白烧到人工取消。剥掉 st-<id> token（统一占位 st-*）后，签名只反映【结构违例
+    本体】（类名/包/落点/引导语），renumber 不再扰动 → 同一逻辑违例连续两轮即被 R64-T3 正确识别为
+    不收敛并 fail-fast。违例集缩小（层③消解掉一个）→ 规范化签名仍不同 → 不误熔断真进展。
+    栈中立（纯文本 token 替换，无语言特判）。
+    """
+    return sorted(_STRUCTURAL_SIG_SUBTASK_ID_RE.sub("st-*", str(i)) for i in (issues or []))
 
 
 def validate_module_coherence(

@@ -794,6 +794,43 @@ async def _baseline_vocab_for(state) -> str:
         return ""
 
 
+async def _baseline_file_index_for(state) -> dict:
+    """R67F-P2（专项2）：基线【per-file 接地索引】（供 baseline_covered 接地核验 A/B）。
+    与兄弟 _baseline_vocab_for 同源 fetch_structure_inventory + 同截断/降级纪律，但返回保
+    per-file 结构的索引（build_baseline_file_index）而非全库 blob。project_id 缺失/索引未建/
+    截断/异常 → {}（fail-open：调用方据空索引全豁免，绝不因索引缺失误拒真申报）。
+
+    ★为何独立于 _baseline_vocab_for（而非改其返回型）：后者有 3 处调用点+测试 monkeypatch 依赖
+      str 返回型，改型会大面积破坏（B18 教训）。独立函数零耦合；validate_plan 内两次 fetch 的
+      成本有界（每轮≤1 次、任务级≤MAX_PLAN_RETRY+1 次），换取零回归。★
+    """
+    try:
+        _pid = str(state.get("project_id") or "").strip()
+        if not _pid:
+            return {}
+        from swarm.brain.baseline_candidates import build_baseline_file_index
+        from swarm.knowledge import service as _ksvc
+        _max_files, _max_symbols = 4000, 8000
+        files, symbols = await _ksvc.fetch_structure_inventory(_pid, _max_files, _max_symbols)
+        if len(files) >= _max_files or len(symbols) >= _max_symbols:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.plan.baseline_findex_truncated")
+            logger.warning(
+                "[PLAN] R67F-P2 基线索引达上界被截断（files=%d/symbols=%d）→ 接地核验本轮跳过"
+                "（截断=靠后模块符号缺失会误拒合法存量，fail-open 宁可不判）", len(files), len(symbols))
+            return {}
+        _idx = build_baseline_file_index(files, symbols)
+        # ★复核 Hunter#1(HIGH) 整改★：空索引【必返 {}】（假值）而非 {"files":set(),...}（dict 恒真值）——
+        # 否则 node 的 `if _bl_findex:` 误进"可用"分支，"有申报却索引空"的 record_degrade 永不触发
+        # （与兄弟 _baseline_vocab_for 返 "" 假值对称，堵可观测漏洞）。
+        return _idx if _idx.get("files") else {}
+    except Exception as e:  # noqa: BLE001 — 接地核验 advisory，绝不阻断规划
+        from swarm.infra.degrade import record_degrade
+        record_degrade("brain.plan.baseline_findex_unavailable")
+        logger.warning("[PLAN] R67F-P2 baseline 接地索引降级为空（不阻断，接地核验本轮关闭）：%s", e)
+        return {}
+
+
 # ── R65E7-L2（上游根治）：确保 file_plan 覆盖每条已抽取需求 ──────────────────────────
 # round65e7 FAILED@PLAN 真因：tech_design 从 PRD 原文产 file_plan、requirement_items 另路抽取，二者
 # 无覆盖交叉核验；2FA/SHA512 等在 183 file_plan 里 0 文件 → 无子任务能覆盖 → 只能被谎报 baseline →
@@ -1023,8 +1060,12 @@ def _requirement_coverage_prompt_block(requirement_items, *, batched: bool = Fal
         "- 一个子任务可以覆盖多个条目；与该子任务无关的条目不要写进它的 covers。\n"
         "- R31：若某条目已被【现有代码】完整满足、本任务无需为它做任何改动，不要硬造子任务——"
         "改在计划 JSON 顶层用 baseline_covered 字段申报，例如 "
-        "\"baseline_covered\": [{\"id\": \"req-xxxxxxxx\", \"reason\": \"现有代码何处/如何已满足（简要依据）\"}]；\n"
+        "\"baseline_covered\": [{\"id\": \"req-xxxxxxxx\", \"reason\": \"现有代码何处/如何已满足（简要依据）\", "
+        "\"evidence_files\": [\"模块/src/.../XxxController.java\"]}]；\n"
         "- baseline_covered 同样只能引用清单中的 ID，且 reason 必填非空；\n"
+        "- ★evidence_files 必填：列出 reason 所引现有代码的【真实文件路径】（可多个）——系统会确定性核验"
+        "这些路径确实存在于基线、且其符号确实对应该需求能力（捏造路径或嫁接无关文件的假申报会被接地"
+        "核验拒掉并回灌整改）。只列你能在现有代码中定位到的真实文件★；\n"
         "- ★baseline_covered 仅指仓库中【当前已存在】的代码——本计划将要新建的模块/"
         "由其他子任务或其他批次实现的功能【绝不】申报（那属于对应子任务的 covers）；"
         "reason 必须指向可在现有代码中核实的位置★；\n"
@@ -1146,6 +1187,11 @@ async def _plan_ultra_batched(
         logger.warning("[skills] planner(分批) 经验注入失败，降级为空：%s", e)
     # R65E9-T2：栈画像能力边界注入分批 baseline 声明步（计算一次每批复用；无画像=空串）。
     _stack_grounding_batched = _baseline_stack_grounding_block(state)
+    # R67F-T3（层②·fan-out 前硬预算禁写）：契约已认领类的唯一 owner 落点前置广播给每一批——
+    # 各批独立 LLM 调用只见本批文件，看不到别模块已认领符号 → 源头预防同名异包重复 create
+    # （层③消解/层②熔断的上游预防层）。栈中立（仅 JVM 类路径认领符号入清单，无则空串）。
+    from swarm.brain.contract_utils import contract_owner_ledger_block
+    _owner_ledger_batched = contract_owner_ledger_block(state.get("shared_contract_draft") or {})
 
     # P5（R67-1 收权）：分批前去重【仅完全同路径】；跨路径同名一律保留，
     # 重复裁决交 #110/#101/T1b 有证据闸（旧 basename 全局剪曾误杀 12 UI 模板+duty 剪错方向）
@@ -1376,6 +1422,9 @@ async def _plan_ultra_batched(
         # R65E9-T2：每批独立 LLM 调用 → 每批都注入栈画像 grounding（与 _cov_block 同批注入纪律）
         if _stack_grounding_batched:
             prompt_user += _stack_grounding_batched
+        # R67F-T3（层②）：每批注入契约已认领类唯一 owner 禁写清单（同批注入纪律，源头防同名异包）
+        if _owner_ledger_batched:
+            prompt_user += _owner_ledger_batched
         async with _plan_sem:
             # P6a：timeout/error/空 重试（镜像骨架/Stage B），耗尽才返回失败标记。拿到非空子任务即成功。
             # R38b-1 ②：token 拒绝走准入等待（在飞 settle 后有余量→重试不占能力配额，
@@ -3132,7 +3181,11 @@ async def validate_plan(state: BrainState) -> dict:
             # 逐字节相同。连续两轮（retry 严格连续，防跨 replan 周期陈旧签名误熔断）违例签名
             # 一致 → 顶格 retry_count 复用 after_validate 既有 CONFIRM 路由 fail-fast，
             # 绝不再烧一轮注定同结果的全量重产。
-            _t3_sig = sorted(str(i) for i in _mc_result.issues)
+            # ★R67F-T2（层②）★：签名走 normalize_structural_signature【去 st-id】——round67f 死因
+            # 是同名异包违例每轮以相同 basename+异包对复发，但 issue 文本内嵌 st-id 随全量重拆
+            # renumber（st-27-1→st-11-1）→ 原整份文本签名逐轮不同 → 熔断被击穿、k3 连烧 2 轮。
+            from swarm.brain.plan_validator import normalize_structural_signature as _t3_norm
+            _t3_sig = _t3_norm(_mc_result.issues)
             _t3_prev = state.get("plan_validation_prev_structural") or {}
             _t3_retry_out = retry_count
             # 猎手 F4：熔断泄压阀（对照 SWARM_MODULE_COHERENCE_GATE 先例）——"同签名=重试
@@ -3209,12 +3262,28 @@ async def validate_plan(state: BrainState) -> dict:
                     if str(x).strip()]
     _bl_vocab = None
     _new_rejected: list[str] = []
+    _ungrounded: list[str] = []
     if _coverage_gate_on and _req_items:
         _bl_vocab = await _baseline_vocab_for(state)   # R65E6-T1 假 baseline_covered 证据闸
         if _bl_vocab:
             from swarm.brain.baseline_candidates import baseline_claims_missing_evidence
             _new_rejected = list(baseline_claims_missing_evidence(
                 state.get("baseline_covered"), _req_items, _bl_vocab))
+        # R67F-P2（专项2·接地核验 A/B）：reason 嫁接真实文件/捏造路径的假申报——T6 全库 blob
+        # 命中结构上覆盖不了 reason→具体文件接地，本闸补上（per-file 索引：路径∈索引 + 符号命中
+        # req token）。与 T6 并存、判假 id 一并踢入不合格集（复用 ineligible-pin 机制，逼建 covers）。
+        _bl_findex = await _baseline_file_index_for(state)
+        if _bl_findex:
+            from swarm.brain.baseline_candidates import baseline_claims_unground
+            _ungrounded = list(baseline_claims_unground(
+                state.get("baseline_covered"), _req_items, _bl_findex))
+        elif state.get("baseline_covered") or []:
+            # hunter 纪律：有申报却索引空 = 接地核验对真实申报静默失效，留机读账（对称 T6 的
+            # baseline_claims_unchecked），别与"本轮无申报"混同。
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.plan.baseline_grounding_unchecked")
+    # T6 证据闸 ∪ 接地核验 两条独立路径的判假集合并（去重）→ 统一喂 ineligible-pin 机制
+    _new_rejected = _new_rejected + [r for r in _ungrounded if r not in _new_rejected]
     _pinned_all = _pinned_prev + [r for r in _new_rejected if r not in _pinned_prev]
     if _coverage_gate_on and _req_items:
         from swarm.brain.plan_validator import build_coverage_matrix, covered_req_ids
