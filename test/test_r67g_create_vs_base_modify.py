@@ -273,3 +273,244 @@ def test_signal3_ambiguous_contract_fail_closed(monkeypatch):
     n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
     assert n == 0, "契约同名异 owner 歧义却归位（并列副本漏移植 ambiguous 守卫，腐化风险）"
     assert new_menu in (plan.subtasks[0].scope.create_files or [])
+
+
+# ── round67h：归位必须与 file_plan 同串归一（否则 R40-1 判孤儿→attach 复活→成环）──────
+# 死型（task=a259e59b FAILED@PLAN，2026-07-23）：T2 只改子任务 create_files/writable 归位到 base，
+# 却【没同步 file_plan 里那条 shadow 路径条目】→ VALIDATE R40-1 file_plan 归属闸看 file_plan 仍指
+# shadow 路径【无 owner】→ 打回 PLAN → finish 孤儿挂靠把 shadow 重挂回新子任务 create（复活）→ CVB
+# 再归位 → 无限环耗尽 MAX retry。根因=违背仓内既定不变量（plan_finisher:777/contract_utils:2324：
+# "rename create_files 必须与 file_plan 同串归一"）——T2 是家族里唯一没遵守的 relocation pass。
+from swarm.brain.plan_validator import validate_file_plan_ownership  # noqa: E402
+
+
+def _fp_paths(fp):
+    """归一 file_plan 各条目路径（dict/str 两形态）为集合，供断言。"""
+    out = set()
+    for e in fp:
+        p = e.get("path") if isinstance(e, dict) else e
+        out.add(cu._norm_scope_path(str(p)))
+    return out
+
+
+def test_r67h_sysuser_relocation_syncs_file_plan_dict(monkeypatch):
+    """★主治★：SysUser 归位后 file_plan 里 shadow 条目(dict)的 path 也 relocate 到 base 真身、
+    action→modify——否则 R40-1 判 shadow 孤儿成环。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [_fp(_SHADOW_SYSUSER, "modify")]
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 1
+    paths = _fp_paths(fp)
+    assert cu._norm_scope_path(_SHADOW_SYSUSER) not in paths, "file_plan 仍留 shadow 路径（R40-1 判孤儿成环）"
+    assert cu._norm_scope_path(_BASE_SYSUSER) in paths, "file_plan 未联动到 base 真身"
+    moved = [e for e in fp if cu._norm_scope_path(str(e["path"])) == cu._norm_scope_path(_BASE_SYSUSER)]
+    assert moved and moved[0].get("action") == "modify", "归位后 file_plan 条目 action 应为 modify"
+
+
+def test_r67h_r40_ownership_passes_after_relocation(monkeypatch):
+    """★端到端复现死型★：归位后 validate_file_plan_ownership(R40-1) 必须【过】——旧码（不同步
+    file_plan）会在此判 shadow 孤儿打回 → 成环。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    other = "ruoyi-alarm/src/main/java/com/ruoyi/alarm/AlarmTask.java"
+    plan = TaskPlan(subtasks=[
+        _st("st-16-1", create=[_SHADOW_SYSUSER]),
+        _st("st-2", create=[other]),
+    ])
+    fp = [_fp(_SHADOW_SYSUSER, "modify"), _fp(other, "create")]
+    # 归位前：shadow 有 owner(st-16-1 create) → R40-1 过（红灯前提=归位后才炸）
+    assert validate_file_plan_ownership(plan, fp).valid, "红灯前提不成立"
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    res = validate_file_plan_ownership(plan, fp)
+    assert res.valid, f"归位后 R40-1 仍判孤儿（成环死型）: {res.issues}"
+
+
+def test_r67h_file_plan_sync_str_form(monkeypatch):
+    """★"只改 dict 漏 str" 防线（contract_utils:2324 hunter HIGH 同型）★：file_plan bare-str 条目
+    也要 relocate，否则 str 形态 shadow 漏改仍判孤儿。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    # str 形态无 action → 无 file_plan modify 信号，但契约权威(信号3)可触发归位
+    plan.shared_contract = {"dtos": [{"name": "SysUser", "defined_in": _BASE_SYSUSER}]}
+    fp = [_SHADOW_SYSUSER]  # bare-str
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 1
+    assert fp == [_BASE_SYSUSER], f"str 形态 file_plan 未 relocate: {fp}"
+
+
+def test_r67h_file_plan_dedup_base_already_present(monkeypatch):
+    """base 真身已在 file_plan（合法 modify）→ 归位时删 shadow 条目防重，绝不产生重复 base 条目。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [_fp(_SHADOW_SYSUSER, "modify"), _fp(_BASE_SYSUSER, "modify")]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base_entries = [e for e in fp if cu._norm_scope_path(str(e["path"])) == cu._norm_scope_path(_BASE_SYSUSER)]
+    assert len(base_entries) == 1, f"base 条目重复（未防重）: {len(base_entries)}"
+    assert cu._norm_scope_path(_SHADOW_SYSUSER) not in _fp_paths(fp), "shadow 条目未删"
+
+
+def test_r67h_file_plan_mutated_in_place(monkeypatch):
+    """★持久化前提★：归位就地 mutate 传入的同一 list 对象（=state['tech_design_file_plan']）→
+    改动持久化进 state，同一 VALIDATE 内 R40-1 生效、重试不复现 shadow。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [_fp(_SHADOW_SYSUSER, "modify")]
+    fp_id = id(fp)
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert id(fp) == fp_id, "file_plan 被 rebind 非就地 mutate（改动丢失不持久化）"
+    assert cu._norm_scope_path(_BASE_SYSUSER) in _fp_paths(fp)
+
+
+def test_r67h_no_relocation_leaves_file_plan_untouched(monkeypatch):
+    """fail-closed 不归位时（SysMenu create 无信号）→ file_plan 一字不动（无副作用）。"""
+    _tree(monkeypatch, _BASE_SYSMENU)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSMENU])])
+    fp = [_fp(_SHADOW_SYSMENU, "create")]
+    before = [dict(e) for e in fp]
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 0
+    assert fp == before, "未归位却动了 file_plan"
+
+
+def test_r67h_relocation_via_resolve_syncs_file_plan(monkeypatch):
+    """接线核验：经 resolve_plan_conflicts 归位后 file_plan 同步到 base（唯一事实源全链路）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [_fp(_SHADOW_SYSUSER, "modify")]
+    cu.resolve_plan_conflicts(plan, project_path="/x", base_ref="HEAD", file_plan=fp)
+    assert cu._norm_scope_path(_BASE_SYSUSER) in _fp_paths(fp)
+    assert cu._norm_scope_path(_SHADOW_SYSUSER) not in _fp_paths(fp)
+
+
+def test_r67h_dedup_drop_merges_responsibility(monkeypatch):
+    """★对抗复核 hunter MEDIUM 整改★：base 真身已在 file_plan、shadow 归位撞它 → 删 shadow 防重时
+    把 shadow 独有 responsibility 并入保留条目（绝不静默丢需求文本）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [{"path": _BASE_SYSUSER, "action": "modify", "module": "", "responsibility": "改动A"},
+          {"path": _SHADOW_SYSUSER, "action": "modify", "module": "", "responsibility": "改动B-2FA字段"}]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base_entries = [e for e in fp if cu._norm_scope_path(str(e["path"])) == cu._norm_scope_path(_BASE_SYSUSER)]
+    assert len(base_entries) == 1, "base 条目应唯一（防重）"
+    resp = base_entries[0].get("responsibility", "")
+    assert "改动A" in resp and "改动B-2FA字段" in resp, f"shadow responsibility 被静默丢弃: {resp!r}"
+
+
+_SHADOW_SYSUSER2 = "ruoyi-quartz/src/main/java/com/ruoyi/quartz/domain/SysUser.java"
+
+
+def test_r67h_relocated_entry_drops_stale_module(monkeypatch):
+    """★对抗复核 reviewer round2 HIGH 整改★：归位 dict 条目丢 stale module——shadow 的 module 是
+    幻觉错模块，path 改到 base 真身（物理属别模块）后保留旧 module 会令 _file_plan_module_paths 按错
+    模块分桶→G1 coherence 误判 module/path 错配（换 R40-1→G1 又 churn）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [{"path": _SHADOW_SYSUSER, "action": "modify", "module": "ruoyi-system", "responsibility": "2FA"}]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base_e = [e for e in fp if cu._norm_scope_path(str(e["path"])) == cu._norm_scope_path(_BASE_SYSUSER)][0]
+    assert base_e.get("module", "") != "ruoyi-system", "归位条目保留了 shadow 的 stale module（G1 误判 churn）"
+    buckets = cu._file_plan_module_paths(fp)
+    assert cu._norm_scope_path(_BASE_SYSUSER) not in buckets.get("ruoyi-system", []), \
+        "base 路径被错分桶进 shadow 模块 ruoyi-system"
+
+
+def test_r67h_two_shadows_same_base_preserve_both_responsibilities(monkeypatch):
+    """★对抗复核 hunter round2 MEDIUM-A 整改★：两 shadow 归位到同一【新建】base（base 本不在
+    file_plan）→ 两条 responsibility 都保留（pass2 顺序无关合并，绝不丢第二条）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-1", create=[_SHADOW_SYSUSER]),
+                              _st("st-2", create=[_SHADOW_SYSUSER2])])
+    fp = [{"path": _SHADOW_SYSUSER, "action": "modify", "module": "ruoyi-system", "responsibility": "改动A加头像"},
+          {"path": _SHADOW_SYSUSER2, "action": "modify", "module": "ruoyi-quartz", "responsibility": "改动B加手机"}]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base_es = [e for e in fp
+               if cu._norm_scope_path(str(e["path"] if isinstance(e, dict) else e)) == cu._norm_scope_path(_BASE_SYSUSER)]
+    assert len(base_es) == 1, f"base 条目应唯一（防重），实得 {len(base_es)}"
+    resp = base_es[0].get("responsibility", "")
+    assert "改动A加头像" in resp and "改动B加手机" in resp, f"第二条 shadow responsibility 丢失: {resp!r}"
+
+
+def test_r67h_bare_str_base_upgraded_to_preserve_responsibility(monkeypatch):
+    """★对抗复核 hunter round2 MEDIUM-B 整改★：base 真身在 file_plan 是 bare-str 形态 + shadow dict 有
+    responsibility → 删 shadow 时把 bare-str base 升级为 dict 承接 responsibility（绝不丢需求）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    fp = [_BASE_SYSUSER,  # bare-str 预存 base
+          {"path": _SHADOW_SYSUSER, "action": "modify", "module": "ruoyi-system", "responsibility": "改动加2FA"}]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base_es = [e for e in fp
+               if cu._norm_scope_path(str(e["path"] if isinstance(e, dict) else e)) == cu._norm_scope_path(_BASE_SYSUSER)]
+    assert len(base_es) == 1
+    e0 = base_es[0]
+    assert isinstance(e0, dict) and "改动加2FA" in e0.get("responsibility", ""), \
+        f"bare-str base 未升级承接 responsibility（静默丢需求）: {e0!r}"
+
+
+def test_r67h_substring_responsibility_not_dropped(monkeypatch):
+    """★hunter round3 MEDIUM 整改★：第二条 shadow 的 responsibility 恰是已合并文本的【子串】
+    （"2FA" ⊂ "加字段2FA用于登录校验"）→ 精确分段去重不误吞（旧子串判定会静默丢独立需求）。"""
+    _tree(monkeypatch, _BASE_SYSUSER)
+    plan = TaskPlan(subtasks=[_st("st-1", create=[_SHADOW_SYSUSER]),
+                              _st("st-2", create=[_SHADOW_SYSUSER2])])
+    fp = [{"path": _SHADOW_SYSUSER, "action": "modify", "module": "ruoyi-system",
+           "responsibility": "加字段2FA用于登录校验"},
+          {"path": _SHADOW_SYSUSER2, "action": "modify", "module": "ruoyi-quartz", "responsibility": "2FA"}]
+    deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    base = [e for e in fp
+            if cu._norm_scope_path(str(e["path"] if isinstance(e, dict) else e)) == cu._norm_scope_path(_BASE_SYSUSER)][0]
+    segs = base.get("responsibility", "").split(" / ")
+    assert "加字段2FA用于登录校验" in segs and "2FA" in segs, \
+        f"子串 responsibility 被静默吞（旧子串去重复发）: {base.get('responsibility')!r}"
+
+
+# ── round67h：节点级返回契约（对抗双复核 CRITICAL/HIGH：就地 mutate 必须随【返回键】回写 state）──
+# reviewer+hunter 独立同判：elaborate()/revision() 就地 mutate file_plan 但从不把 tech_design_file_plan
+# 放进返回 dict → LangGraph checkpoint 恢复语义下变异丢失 → VALIDATE R40-1 重读旧 shadow → 成环复现。
+# 既有测试全是函数级直调（绕过节点返回契约）=测试盲区。以下断言【节点返回 dict】本身。
+
+async def test_r67h_elaborate_returns_synced_file_plan(monkeypatch):
+    """★复核 CRITICAL 整改★：elaborate() 触发 CVB 归位后返回 dict 必须含 tech_design_file_plan
+    （shadow→base）——否则就地变异 checkpoint 恢复丢失、R40-1 成环。断言【返回契约】非仅局部 list。"""
+    import swarm.brain.planning_nodes as pn
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: [_BASE_SYSUSER])
+    monkeypatch.setattr(pn, "_persist_planning_artifacts", lambda *a, **k: None)
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    state = {"plan": plan, "tech_design_file_plan": [_fp(_SHADOW_SYSUSER, "modify")],
+             "project_id": "", "base_commit": "HEAD"}
+    out = await pn.elaborate(state)
+    assert "tech_design_file_plan" in out, "elaborate 未回写 tech_design_file_plan（就地变异丢失→成环复现）"
+    paths = _fp_paths(out["tech_design_file_plan"])
+    assert cu._norm_scope_path(_BASE_SYSUSER) in paths
+    assert cu._norm_scope_path(_SHADOW_SYSUSER) not in paths
+
+
+async def test_r67h_elaborate_no_relocation_no_file_plan_key(monkeypatch):
+    """未触发 CVB 归位 → elaborate 不返回 tech_design_file_plan（不无谓覆盖恒定通道，避免副作用）。"""
+    import swarm.brain.planning_nodes as pn
+    _new = "ruoyi-alarm/src/main/java/com/ruoyi/alarm/AlarmTask.java"
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: [_BASE_SYSMENU])  # 无 SysUser/AlarmTask 同名
+    monkeypatch.setattr(pn, "_persist_planning_artifacts", lambda *a, **k: None)
+    plan = TaskPlan(subtasks=[_st("st-1", create=[_new])])
+    state = {"plan": plan, "tech_design_file_plan": [_fp(_new, "create")],
+             "project_id": "", "base_commit": "HEAD"}
+    out = await pn.elaborate(state)
+    assert "tech_design_file_plan" not in out, "无归位却回写 tech_design_file_plan（无谓覆盖恒定通道）"
+
+
+async def test_r67h_revision_returns_synced_file_plan(monkeypatch):
+    """★复核 HIGH 整改★：revision() 触发 CVB 归位后返回 dict 同样含 tech_design_file_plan
+    （人工 REVISE 路径同 elaborate 缺陷，同款回写）。LLM 调用 monkeypatch 抛错走默认子任务兜底。"""
+    import swarm.brain.nodes as nodes_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("no-llm-in-test")
+    monkeypatch.setattr(nodes_mod, "_get_brain_llm", _boom, raising=False)
+    monkeypatch.setattr(nodes_mod, "_get_project_path", lambda *a, **k: "/x", raising=False)
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: [_BASE_SYSUSER])
+    plan = TaskPlan(subtasks=[_st("st-16-1", create=[_SHADOW_SYSUSER])])
+    state = {"plan": plan, "revision_feedback": "fix", "merged_diff": "", "task_description": "t",
+             "tech_design_file_plan": [_fp(_SHADOW_SYSUSER, "modify")],
+             "project_id": "", "base_commit": "HEAD"}
+    out = await nodes_mod.revision(state)
+    assert "tech_design_file_plan" in out, "revision 未回写 tech_design_file_plan（就地变异丢失）"
+    assert cu._norm_scope_path(_BASE_SYSUSER) in _fp_paths(out["tech_design_file_plan"])

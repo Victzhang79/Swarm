@@ -5439,6 +5439,7 @@ def deconflict_create_vs_base_modify_shadow(
 
     tree_set = {_norm_scope_path(p) for p in tree}
     relocated = 0
+    relocations: dict[str, str] = {}          # shadow 归一路径 → base 真身路径（file_plan 同步用）
     for st in subtasks:
         sc = getattr(st, "scope", None)
         if sc is None:
@@ -5484,6 +5485,7 @@ def deconflict_create_vs_base_modify_shadow(
                 continue
             _to_writable.append(_base_path)
             relocated += 1
+            relocations[norm] = _base_path        # 记归位（file_plan 同串归一用）
             _sig = "file_plan-modify路径锚定" if _sig_modify else "契约defined_in权威(治法A)"
             logger.warning(
                 "[DECONFLICT-CVB] create-vs-base shadow 归位（信号=%s）：%s 的 create_files %s "
@@ -5496,6 +5498,86 @@ def deconflict_create_vs_base_modify_shadow(
                 if b not in _w:
                     _w.append(b)
             sc.writable = _w
+
+    # ── file_plan 同串归一（round67h·task=a259e59b 成环死型）★仓内既定不变量★──────────────
+    # 归位子任务 create_files→base 后，file_plan 里那条 shadow 路径条目【必须同步 relocate 到 base
+    # 真身】——否则 VALIDATE R40-1 file_plan 归属闸（validate_file_plan_ownership 算 create_files∪
+    # writable）看 file_plan 仍指 shadow 路径【无 owner】→ 打回 PLAN → finish 孤儿挂靠把 shadow 重挂
+    # 回新子任务 create（复活）→ 本 pass 再归位 → 无限环耗尽 MAX retry → FAILED@PLAN。
+    # 既定不变量（本 pass 此前是家族里【唯一】漏它的 relocation）：plan_finisher:777 /
+    # contract_utils:2324「rename create_files 必须与 file_plan 同串归一，否则 R40-1 判孤儿+attach
+    # 复活成重复；只改 dict 会漏 str」。就地 mutate 传入的同一 list（=state['tech_design_file_plan']）
+    # 使改动持久化进 state → 同一 VALIDATE 内 R40-1 生效、重试不复现 shadow。dict/str 两形态都改。
+    if relocations and file_plan is not None:
+        def _entry_norm(e):
+            if isinstance(e, dict):
+                return _norm_scope_path(str(e.get("path") or ""))
+            if isinstance(e, str):
+                return _norm_scope_path(e)
+            return None
+        # 归位前已在 file_plan 的归一路径集：base 真身若已在 → 删 shadow 条目防重（不产生重复 base）
+        _existing = {n for n in (_entry_norm(e) for e in file_plan) if n}
+        # ── pass1：归位 shadow→base（★丢 stale module★）+ 暂存被删 shadow 的 responsibility ──
+        _new_fp: list = []
+        _added: set[str] = set()
+        _dropped_dup = 0
+        _dropped_resp: dict[str, list] = {}    # base 归一路径 → 被删 shadow 的 responsibility 列表
+        for e in file_plan:
+            _p = _entry_norm(e)
+            _target = relocations.get(_p) if _p is not None else None
+            if _target is None:
+                _new_fp.append(e)                 # 非归位条目原样保留（含预存 base）
+                continue
+            _tnorm = _norm_scope_path(_target)
+            if _tnorm in _existing or _tnorm in _added:
+                # base 真身已在（预存/本 pass 首次已转出）→ 删 shadow 防重；responsibility 暂存 pass2 并入
+                if isinstance(e, dict):
+                    _r = str(e.get("responsibility") or "").strip()
+                    if _r:
+                        _dropped_resp.setdefault(_tnorm, []).append(_r)
+                _dropped_dup += 1
+                # ★hunter round3 LOW-③ 整改：恢复 per-drop 观测（旧版聚合计数掩盖个案）——诚实措辞
+                # "暂存待 pass2 合并"而非假称"已并入"（pass2 保证合并，见下）★
+                logger.warning(
+                    "[DECONFLICT-CVB] file_plan 删重复 shadow %s → 归并 base %s（responsibility 暂存待合并，不丢）",
+                    _p, _target)
+                continue
+            _added.add(_tnorm)
+            if isinstance(e, dict):
+                # ★对抗复核 reviewer HIGH 整改：丢 stale `module`★——shadow 的 module 是【幻觉错模块】，
+                # path 改到 base 真身（物理属别的构建模块）后保留旧 module 会令 _file_plan_module_paths
+                # 按错模块分桶 → G1 coherence 误判 module/path 错配（换 R40-1→G1 又成 churn）。base 是既存
+                # 文件的 modify，其 module 归属交路径派生（_file_plan_module_paths 跳空 module，不误伤）。
+                _reloc = {k: v for k, v in e.items() if k != "module"}
+                _reloc["path"] = _target
+                _reloc["action"] = "modify"
+                _new_fp.append(_reloc)
+            else:
+                _new_fp.append(_target)           # bare-str 形态（防"只改 dict 漏 str"）
+        # ── pass2：把被删 shadow 的 responsibility 并进代表 base 条目（★遍历顺序无关★；★hunter
+        #    MEDIUM×2 整改：base 为首次转出/bare-str 时 pass1 无法即时合并，此处统一兜底，绝不丢需求★）──
+        if _dropped_resp:
+            for _i, _e in enumerate(_new_fp):
+                _n = _entry_norm(_e)
+                if _n is None or _n not in _dropped_resp:
+                    continue
+                _extra = _dropped_resp[_n]
+                if isinstance(_e, dict):
+                    # ★hunter round3 MEDIUM 整改：★精确分段★去重（非子串包含）——子串判定会把 "2FA"
+                    # 当作已在 "加字段2FA用于登录校验" 里而静默丢弃独立需求（自然语言短语包含常见）★
+                    _kr = str(_e.get("responsibility") or "")
+                    _segs = _kr.split(" / ") if _kr else []
+                    for _r in _extra:
+                        if _r not in _segs:
+                            _segs.append(_r)
+                    _e["responsibility"] = " / ".join(_segs)
+                else:  # bare-str 代表条目 → 升级为 dict 承接 responsibility（绝不丢；dict.fromkeys=精确去重）
+                    _new_fp[_i] = {"path": _e, "action": "modify",
+                                   "responsibility": " / ".join(dict.fromkeys(_extra))}
+        file_plan[:] = _new_fp                     # ★就地 mutate 同一 list 对象（持久化进 state）★
+        logger.info(
+            "[DECONFLICT-CVB] file_plan 同串归一完成：relocated=%d dropped_dup=%d（%d 条，responsibility 全保留）",
+            len(_added), _dropped_dup, len(file_plan))
     return relocated
 
 

@@ -2927,10 +2927,13 @@ async def elaborate(state: BrainState) -> dict:
     # ── 计划冲突解决【唯一事实源】：dedupe → fix_dep → normalize → bump_difficulty（顺序是治本要害） ──
     # 顺序固化在 resolve_plan_conflicts（contract_utils），_elaborate 与离线 plan-quality 评测共用同一条
     # 代码，杜绝调用点各写一份导致漂移。RUN17/18/19 三轮治本(脚手架合并/依赖序/单一写者/难度)全在此收口。
+    # ★round67h★：绑定 file_plan 变量（非内联），因 CVB 归位会【就地改写】它（shadow→base），
+    # 归位后须随返回键回写进 state（见下方 out 构造），否则 checkpoint 恢复语义下就地变异丢失。
+    _fp_for_resolve = state.get("tech_design_file_plan") or []
     _resolve = resolve_plan_conflicts(plan_obj, project_path=_proj_path,
                                       base_ref=state.get("base_commit"),  # B6 #2：钉扎 base 非实时 HEAD
                                       # create-vs-base modify-shadow 归位需 file_plan 的 action=modify 信号
-                                      file_plan=state.get("tech_design_file_plan") or [])
+                                      file_plan=_fp_for_resolve)
     if _resolve["dep_reordered"]:
         logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
     if _resolve["difficulty_bumped"]:
@@ -3080,6 +3083,13 @@ async def elaborate(state: BrainState) -> dict:
         # 就地变异侥幸存活——LangGraph 只保证【返回键】进 state，checkpoint 恢复语义下
         # 未回写的变异不可依赖，此处一并治了。）
         out["plan"] = plan_obj
+    if _resolve.get("cvb_modify_shadow_relocated"):
+        # ★round67h CRITICAL（对抗双复核 reviewer+hunter 独立同判）★：CVB 归位联动改写了
+        # tech_design_file_plan（shadow 路径→base 真身），必须随【返回键】回写进 state——与上方
+        # out["plan"] 同一类：LangGraph 只保证返回键进 state，就地 mutate 在 checkpoint 恢复语义下
+        # 不可依赖。漏回写→ELABORATE→VALIDATE 跨 checkpoint 边界时 tech_design_file_plan 回退到
+        # 旧 shadow→R40-1 判孤儿→round67h 想根治的成环原样复现（reviewer 直调 elaborate 实测坐实）。
+        out["tech_design_file_plan"] = _fp_for_resolve
     if _t4_pinned:
         # dispatch.py:528 读 state["shared_contract"] 优先于 plan.shared_contract——
         # 钉住的 defined_in 必须随 state 键回写，否则派发面读到旧契约=白钉。

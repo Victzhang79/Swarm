@@ -5240,21 +5240,26 @@ async def revision(state: BrainState) -> dict:
     # 的写权可能与保留的兄弟成果冲突。补做冲突消解（与 plan 路径同源）。
     # ⚠️ resolve_plan_conflicts 【原地变更】plan 并返回计数 dict（内部 step3 已含 normalize_plan_scopes）；
     # 绝不能把返回值赋回 updated_plan（否则 plan 被替换成 dict，state["plan"] 损坏）。
+    _rev_fp = state.get("tech_design_file_plan") or []
+    _rev_resolve: dict = {}
     try:
         from swarm.brain.contract_utils import resolve_plan_conflicts
         # ★复核 H-2★：revision 路径也须传 project_path+钉扎 base，否则 aggregate-vs-新建撞车判定
         # 因 project_path=None 短路成 False → base-pin 要防的 pom 多写者缺陷在 revision 期重开。
-        resolve_plan_conflicts(updated_plan,  # 原地变更；返回值(计数 dict)丢弃
-                               project_path=_get_project_path(state.get("project_id") or ""),
-                               base_ref=state.get("base_commit"),
-                               file_plan=state.get("tech_design_file_plan") or [])
+        # ★round67h HIGH★：绑定 _rev_fp（非内联）并捕获计数——CVB 归位会就地改写 file_plan，
+        # 归位后须随返回键回写（见下方 return），否则同 elaborate 的 checkpoint 恢复丢变异成环。
+        # （单行 `resolve_plan_conflicts(updated_plan,` 形态被 test_b6 结构守卫锚定，勿拆行。）
+        _rev_resolve = resolve_plan_conflicts(updated_plan,  # 原地变更 plan；返回计数 dict（file_plan 亦就地改）
+                                              project_path=_get_project_path(state.get("project_id") or ""),
+                                              base_ref=state.get("base_commit"),
+                                              file_plan=_rev_fp)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[REVISION] 计划冲突消解跳过(非致命): %s", exc)
 
     # 保留已完成子任务的产出 —— 修订只新增一个 rev-* 子任务，不应丢弃此前所有
     # Worker 成果（否则 merge 阶段会丢失未被修订的文件 diff）。仅派发新子任务。
     preserved_results = dict(state.get("subtask_results", {}))
-    return {
+    _rev_out = {
         "plan": updated_plan,
         "dispatch_remaining": [revision_subtask.id],
         "subtask_results": preserved_results,
@@ -5306,6 +5311,11 @@ async def revision(state: BrainState) -> dict:
         "acceptance_passed": None,
         "acceptance_details": {},
     }
+    if _rev_resolve.get("cvb_modify_shadow_relocated"):
+        # ★round67h HIGH（对抗双复核）★：CVB 归位就地改写了 tech_design_file_plan（shadow→base），
+        # 随返回键回写进 state（同 elaborate CRITICAL；漏回写→checkpoint 恢复丢变异→R40-1 成环）。
+        _rev_out["tech_design_file_plan"] = _rev_fp
+    return _rev_out
 
 
 _project_delivery_locks: dict[str, "object"] = {}
