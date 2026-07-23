@@ -14,6 +14,7 @@ LLM 认作新类）无信号 → 不碰，交 G1 ③f REJECT（fail-closed，绝
 import swarm.brain.contract_utils as cu
 from swarm.brain.contract_utils import deconflict_create_vs_base_modify_shadow
 from swarm.brain.plan_validator import _created_class_shadows_base
+from swarm.brain.planning_nodes import _contract_base_entity_hints
 from swarm.types import FileScope, SubTask, TaskHarness, TaskPlan
 
 _BASE_SYSUSER = "ruoyi-common/src/main/java/com/ruoyi/common/core/domain/entity/SysUser.java"
@@ -168,3 +169,107 @@ def test_wired_into_resolve_plan_conflicts(monkeypatch):
     counts = cu.resolve_plan_conflicts(plan, project_path="/x", base_ref="HEAD", file_plan=fp)
     assert counts.get("cvb_modify_shadow_relocated", 0) == 1
     assert _BASE_SYSUSER in (plan.subtasks[0].scope.writable or [])
+
+
+# ── 信号3（SysMenu 型·契约 defined_in 权威·治法A，用户拍板确定性执行层）─────────
+
+def _plan_with_contract(subtasks, contract):
+    p = TaskPlan(subtasks=subtasks)
+    p.shared_contract = contract
+    return p
+
+
+def test_signal3_contract_defined_in_base_relocates(monkeypatch):
+    """SysMenu 死型（file_plan create）：契约【显式声明】defined_in=base 真身 → 信号3 归位、clear ③f。"""
+    _tree(monkeypatch, _BASE_SYSMENU)
+    plan = _plan_with_contract(
+        [_st("st-16-1", create=[_SHADOW_SYSMENU])],
+        {"dtos": [{"name": "SysMenu", "defined_in": _BASE_SYSMENU}]})
+    fp = [_fp(_SHADOW_SYSMENU, "create")]
+    assert "sysmenu.java" in _created_class_shadows_base(plan, "/x", "HEAD"), "红灯前提"
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 1
+    assert _SHADOW_SYSMENU not in (plan.subtasks[0].scope.create_files or [])
+    assert _BASE_SYSMENU in (plan.subtasks[0].scope.writable or [])
+    assert "sysmenu.java" not in _created_class_shadows_base(plan, "/x", "HEAD")
+
+
+def test_signal3_contract_defined_in_new_path_no_relocate(monkeypatch):
+    """★不复活 round67c★：契约声明 defined_in=【新落点】(非 base 实存)→ 合法新类 → 不归位、留 ③f。
+    这正是 SecurityConfig 型合法新类的安全路径：contract 认作新类→defined_in 指新路径→信号3 不触发。"""
+    _tree(monkeypatch, _BASE_SYSMENU)
+    plan = _plan_with_contract(
+        [_st("st-16-1", create=[_SHADOW_SYSMENU])],
+        {"dtos": [{"name": "SysMenu", "defined_in": _SHADOW_SYSMENU}]})  # 契约指新落点(shadow 自身)
+    fp = [_fp(_SHADOW_SYSMENU, "create")]
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 0, "契约未把 defined_in 声明在 base 真身却被归位（腐化风险）"
+    assert _SHADOW_SYSMENU in (plan.subtasks[0].scope.create_files or [])
+
+
+def test_signal3_no_contract_declaration_left_for_g1_3f(monkeypatch):
+    """契约【未声明】该类（现实 SysMenu 状况）→ 无信号3 → 留 ③f（诚实 FAILED@PLAN）。"""
+    _tree(monkeypatch, _BASE_SYSMENU)
+    plan = _plan_with_contract([_st("st-16-1", create=[_SHADOW_SYSMENU])], {})
+    fp = [_fp(_SHADOW_SYSMENU, "create")]
+    assert deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD") == 0
+    assert "sysmenu.java" in _created_class_shadows_base(plan, "/x", "HEAD")
+
+
+def test_signal3_generic_name_legit_new_safe(monkeypatch):
+    """★round67c 血泪红线★：合法模块级新类 SecurityConfig@alarm，base 有单个同名 SecurityConfig@
+    framework，契约声明 defined_in=alarm 新落点 → 信号3 不触发（无 file_plan modify、契约非 base 真身）
+    → 合法新类存活留 ③f，绝不误并进 base（治法A 用契约显式权威而非结构猜测，不复活 signal2 被否决的腐化）。"""
+    base_sc = "ruoyi-framework/src/main/java/com/ruoyi/framework/config/SecurityConfig.java"
+    new_sc = "ruoyi-alarm/src/main/java/com/ruoyi/alarm/config/SecurityConfig.java"
+    _tree(monkeypatch, base_sc)
+    plan = _plan_with_contract(
+        [_st("st-3", create=[new_sc])],
+        {"dtos": [{"name": "SecurityConfig", "defined_in": new_sc}]})   # 契约认作新类→新落点
+    fp = [_fp(new_sc, "create")]
+    assert deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD") == 0
+    assert new_sc in (plan.subtasks[0].scope.create_files or [])
+
+
+# ── contract-side 既有实体提示（治法A·T4）──────────────────────────────────
+
+def test_base_entity_hints_flags_collision(monkeypatch):
+    """既有实体提示：本模块 file_plan create 撞 base 唯一同名 → 输出真身路径 + defined_in 引导。"""
+    import swarm.brain.planning_nodes as pn
+    monkeypatch.setattr(pn.cu if hasattr(pn, "cu") else cu, "_base_tree_listing",
+                        lambda *a, **k: [_BASE_SYSMENU], raising=False)
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: [_BASE_SYSMENU])
+    fp = [{"path": _SHADOW_SYSMENU, "action": "create", "module": "ruoyi-system"}]
+    h = _contract_base_entity_hints(fp, "ruoyi-system", "/x", "HEAD")
+    assert "SysMenu.java" in h and _BASE_SYSMENU in h and "defined_in" in h
+
+
+def test_base_entity_hints_empty_greenfield(monkeypatch):
+    """无 base 树（greenfield/非 git）→ 空串（prompt 无此段，零副作用）。"""
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: None)
+    fp = [{"path": _SHADOW_SYSMENU, "action": "create", "module": "ruoyi-system"}]
+    assert _contract_base_entity_hints(fp, "ruoyi-system", "/x", "HEAD") == ""
+
+
+def test_base_entity_hints_no_collision_empty(monkeypatch):
+    """本模块 create 无 base 同名（纯新类）→ 空串（不误导 contract）。"""
+    monkeypatch.setattr(cu, "_base_tree_listing", lambda *a, **k: [_BASE_SYSMENU])
+    fp = [{"path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/AlarmTask.java",
+           "action": "create", "module": "ruoyi-alarm"}]
+    assert _contract_base_entity_hints(fp, "ruoyi-alarm", "/x", "HEAD") == ""
+
+
+def test_signal3_ambiguous_contract_fail_closed(monkeypatch):
+    """★对抗复核 hunter PLAUSIBLE-HIGH 整改★：契约给同 simple-name 【两个不同 defined_in】(一条 base
+    真身 + 一条新落点=同名异 owner 歧义)→ 集合非 {base真身} → fail-closed 不归位，绝不把职责不同的合法
+    同名新类误并进 base（对齐层③ ambiguous_base 守卫）。"""
+    _tree(monkeypatch, _BASE_SYSMENU)
+    new_menu = "ruoyi-alarm/src/main/java/com/ruoyi/alarm/domain/SysMenu.java"
+    plan = _plan_with_contract(
+        [_st("st-9", create=[new_menu])],                 # 建的是【新落点】的合法新类
+        {"dtos": [{"name": "SysMenu", "defined_in": _BASE_SYSMENU},   # 一条指 base 真身
+                  {"name": "SysMenu", "defined_in": new_menu}]})       # 一条指新落点(歧义)
+    fp = [_fp(new_menu, "create")]
+    n = deconflict_create_vs_base_modify_shadow(plan, fp, project_path="/x", base_ref="HEAD")
+    assert n == 0, "契约同名异 owner 歧义却归位（并列副本漏移植 ambiguous 守卫，腐化风险）"
+    assert new_menu in (plan.subtasks[0].scope.create_files or [])

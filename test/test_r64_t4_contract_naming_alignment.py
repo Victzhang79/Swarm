@@ -60,7 +60,8 @@ def test_template_formats_with_module_files():
         task_description="t", data_model="d", skeleton="s",
         mod_idx=1, mod_total=5, mod_name="alarm-interface",
         mod_responsibility="r", consumed_by="a、b", expected_surface="e",
-        module_files="- SimpleNotifyRequest.java")
+        module_files="- SimpleNotifyRequest.java",
+        base_entity_hints="")   # round67g-T4：治法A 既有实体提示（此测无碰撞→空串）
     assert "SimpleNotifyRequest.java" in out
     assert "命名铁律" in out, "命名指令必须在模板里（round64 死于 LLM 无任何命名指引）"
 

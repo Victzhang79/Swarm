@@ -5335,27 +5335,37 @@ def deconflict_create_vs_base_modify_shadow(
     project_path: str | None = None,
     base_ref: str | None = None,
 ) -> int:
-    """create-vs-base【modify-only 安全子集】确定性归位（子任务 scope 层，clear G1 ③f）。
+    """create-vs-base shadow 确定性归位（子任务 scope 层，clear G1 ③f）——两个互斥【显式权威】信号。
 
-    死型（task=b3659ca9 FAILED@PLAN，2026-07-23）：LLM 想【改】base 既有实体（SysUser），却把落点
-    写成【幻觉异路径】——tech_design file_plan 里 `action=modify ruoyi-system/domain/SysUser.java`
-    （真身在 base `ruoyi-common/.../entity/SysUser.java`），而 PLAN batch 把它落进某子任务的
-    `create_files`（st-16-1）→ G1 ③f `_created_class_shadows_base`（读子任务 create_files）判
-    create-vs-base shadow REJECT（MyBatis typeAlias 递归撞别名/两份并存启动崩）→ 重试从恒定 file_plan
-    重拆原样重犯 → 层② 熔断，产不出合法 plan。
+    死型（task=b3659ca9 FAILED@PLAN，2026-07-23）：LLM 想【用/改】base 既有实体，却把落点写成【幻觉
+    异路径】落进子任务 `create_files`（st-16-1）→ G1 ③f `_created_class_shadows_base`（读子任务
+    create_files）判 create-vs-base shadow REJECT（MyBatis typeAlias 撞别名/bean 名并存启动崩）→ 重试
+    从恒定 file_plan 重拆原样重犯 → 层② 熔断，产不出合法 plan。SysUser：file_plan action=modify；
+    SysMenu：file_plan action=create（LLM 认作新类，下游无 file_plan 信号）。
 
-    ★唯一安全信号 = file_plan 里该 simple-name 的 action=modify（且【无】create 条目）★——即 LLM
-    自认是"编辑既有类"，非"新建一个类"。凭此才敢把子任务 create_files 里的幻觉异路径归位到 base 真身
-    （改 create→writable/modify）。★绝不复活裸 basename 挑边（round67c 血泪：合法通用名新类 Config/
-    Constants 撞无关 base 同名 → 误合并静默腐化，ecc 复核判 HIGH 删过该自愈）★：SysMenu 型（file_plan
-    action=create，LLM 认作新类）无 modify 信号 → 本 pass 不碰，仍交 G1 ③f 显式 REJECT（诚实
-    FAILED@PLAN + 上游 tech_design 前沿），绝不静默归并。
+    ★两个【互斥·显式权威】安全信号，任一成立才归位（改 create→writable/modify 指向 base 真身），否则留
+    ③f REJECT——绝不裸 basename 挑边（round67c 血泪：合法【通用名】新类 Config/Constants 撞无关 base 被
+    误合并静默腐化，含"单次出现的通用名"过唯一性闸，两位对抗复核实证）★：
+      · 信号1（SysUser 型·file_plan 路径粒度 modify）：该 create 落点【本身】被 file_plan 声明 action=
+        modify（LLM 显式"改此路径"），且未被同路径 create 声明。=LLM 自认"编辑既有类"。
+      · 信号3（SysMenu 型·契约 defined_in 权威·治法A）：契约【显式声明】该 simple-name 的 defined_in =
+        base 真身路径（实存于 base 树）。=contract_design（经"既有实体提示"注入认出 base 既有类后）显式把
+        它的权威落点声明在 base 真身 → 影子归位（复用枚举 round67g-T1 的契约权威范式）。
+    ★为何两信号都不复活 round67c★：均要求 LLM【显式声明】(action=modify / defined_in=base 真身)，非结构
+    猜测。round67c 靠纯 basename 佐证误合并；合法新类的 file_plan action=create、contract defined_in=新落点
+    （非 base 实存路径）→ 两信号皆不触发。★曾试的"base 真身被 readable 佐证"信号2 被对抗复核 CONFIRMED
+    HIGH 否决（单次出现通用名 SecurityConfig 复活腐化）已撤★。
 
-    fail-closed 铁律（任一判不出唯一确定性证据即不动，留 ③f REJECT 兜底）：
-      · 无 base 树（greenfield/非 git，_base_tree_listing 返 None）→ 整体跳过（不误伤纯新建）；
-      · 无 file_plan → 无 modify 信号源 → 跳过；
-      · base 同名【非唯一】命中（0 或 ≥2 处同 simple-name）→ 命名空间容忍/歧义，绝不挑边；
-      · file_plan 该 simple-name 【无 modify】或【兼有 create】（意图歧义）→ 跳过；
+    ★诚实边界（对抗复核 LOW/PLAUSIBLE）：本 pass 的【消费/执行】是确定性、离线可证；但信号3 的【归位与否】
+    根仍在 LLM——取决于 contract_design（经 _contract_base_entity_hints advisory 提示）是否把既有实体的
+    defined_in 正确声明在 base 真身、且不把合法新通用名类误声明为 base 真身。故治法A=【一次 LLM 契约声明
+    (live 验) + 确定性执行】，非纯确定性硬保证；correctness 硬底仍是 G1 ③f fail-closed。round67g live 须专盯
+    "合法新类被误声明 defined_in=base 真身"这一 by-design 残余（signal2 同穿透面：归位后 ③f 不再兜底）。★
+
+    fail-closed 铁律（任一判不出【显式权威】即不动，留 ③f REJECT 兜底）：
+      · 无 base 树（greenfield/非 git）→ 整体跳过（不误伤纯新建）；无 file_plan 且无契约 → 跳过；
+      · base 同名【非唯一】命中（0 或 ≥2 处同 simple-name）→ 命名空间容忍/通用名，绝不挑边；
+      · 两信号皆不成立（落点非 file_plan modify、且契约未把 defined_in 声明在 base 真身）→ 留 ③f；
       · create_files 落点【已精确 ∈ base 树】→ 归 R67-T8 规则0逆向降级 modify，本 pass 不重复处理。
 
     栈中立：classpath_fqn_key 仅 JVM 类路径命名空间非 None（Go/Py/TS/资源天然豁免）；test 布局
@@ -5374,12 +5384,31 @@ def deconflict_create_vs_base_modify_shadow(
     if not subtasks:
         return 0
     tree = _base_tree_listing(project_path, base_ref)
-    if not tree or not file_plan:
-        return 0                              # 无 base 权威 / 无 modify 信号源 → fail-closed 跳过
+    if not tree:
+        return 0                              # 无 base 权威 → fail-closed 跳过（greenfield 不误伤）
 
     def _is_test_path(path: str) -> bool:
         parts = [p for p in str(path).replace("\\", "/").split("/") if p]
         return "test" in parts or "tests" in parts
+
+    # 契约 defined_in 权威（信号3·治法A）：simple-name → 契约声明的 defined_in 归一路径集（全 section）。
+    # round67g-T3 治法A：contract_design 认出 base 既有实体后【显式声明 defined_in=base 真身路径】→ 本 pass
+    # 以此为权威把同名 create 影子确定性归位（复用枚举 T1 的契约权威范式）。安全性=契约的【显式声明】而非
+    # 结构猜测：合法新类 contract 会声明 defined_in=新落点（非 base 实存路径），故不触发（不复活 round67c）。
+    contract_defined: dict[str, set[str]] = {}
+    for _sec in (getattr(plan, "shared_contract", None) or {}).values():
+        if not isinstance(_sec, list):
+            continue
+        for _e in _sec:
+            if not isinstance(_e, dict) or not _e.get("defined_in"):
+                continue
+            _ck = classpath_fqn_key(str(_e.get("defined_in") or ""))
+            if not _ck:
+                continue
+            _cs = _ck[1].rsplit("/", 1)[-1].lower()
+            contract_defined.setdefault(_cs, set()).add(_norm_scope_path(str(_e["defined_in"])))
+    if not file_plan and not contract_defined:
+        return 0                              # 两信号源皆无 → fail-closed 跳过
 
     # base 真身索引：simple-name(lower, 含扩展，同 ③f 口径) → [base 路径…]（仅 JVM 类路径）
     base_by_simple: dict[str, list[str]] = {}
@@ -5437,19 +5466,29 @@ def deconflict_create_vs_base_modify_shadow(
             if len(hits) != 1 or hits[0] == norm:
                 _new_creates.append(f)        # base 同名非唯一 / 就是自己 → fail-closed 不动
                 continue
-            # ★路径粒度安全信号★：该 create_files 落点【本身】须被 file_plan 声明为 modify（LLM 显式
-            # "改此路径"），且未被同路径 create 声明（同路径兼 create/modify=意图歧义 fail-closed）。
-            if norm not in fp_modify_paths or norm in fp_create_paths:
-                _new_creates.append(f)        # 落点非 file_plan modify / 同路径歧义 → 留 ③f REJECT
-                continue
-            # 安全信号齐备：LLM 显式改既有类却把 create_files 落点写成幻觉异路径 → 归位到 base 真身
             _base_path = hits[0]
+            # ── 两个【互斥】安全信号，任一成立才归位（否则留 ③f REJECT，绝不裸 basename 挑边）──
+            # 信号1（SysUser 型·路径粒度 modify）：该 create 落点【本身】被 file_plan 声明 action=modify
+            #   （LLM 显式"改此路径"），且未被同路径 create 声明（同路径兼 create/modify=歧义 fail-closed）。
+            _sig_modify = (norm in fp_modify_paths and norm not in fp_create_paths)
+            # 信号3（SysMenu 型·契约权威·治法A）：契约【无歧义地显式声明】该 simple-name 的 defined_in =
+            #   base 真身路径（该 simple-name 的契约 defined_in 集【恰为 {_base_path}】）→ 影子归位。★安全=
+            #   契约显式声明而非结构猜测：合法新类 contract 声明 defined_in=新落点故不触发，不复活 round67c★。
+            #   ★歧义 fail-closed（对抗复核 hunter PLAUSIBLE-HIGH 整改：并列副本漏移植守卫）★：契约给同
+            #   simple-name 多个不同 defined_in（一条 base 真身 + 一条新落点=同名异 owner 歧义）时【集合非
+            #   {_base_path}】→ 不归位，留 ③f REJECT（对齐层③ `_contract_owner_authority` 的 ambiguous_base
+            #   守卫：绝不把职责不同的合法同名新类误并进 base）。与信号1 互斥。
+            _sig_contract = (not _sig_modify and contract_defined.get(simple) == {_base_path})
+            if not (_sig_modify or _sig_contract):
+                _new_creates.append(f)        # 两信号皆不成立 → 留 ③f REJECT（fail-closed）
+                continue
             _to_writable.append(_base_path)
             relocated += 1
+            _sig = "file_plan-modify路径锚定" if _sig_modify else "契约defined_in权威(治法A)"
             logger.warning(
-                "[DECONFLICT-CVB] create-vs-base modify-shadow 归位：%s 的 create_files %s "
-                "（file_plan action=modify）→ base 真身 %s 改 writable(modify)（G1 ③f 治本）",
-                getattr(st, "id", "?"), norm, _base_path)
+                "[DECONFLICT-CVB] create-vs-base shadow 归位（信号=%s）：%s 的 create_files %s "
+                "→ base 真身 %s 改 writable(modify)（G1 ③f 治本）",
+                _sig, getattr(st, "id", "?"), norm, _base_path)
         if _to_writable:
             sc.create_files = _new_creates
             _w = list(getattr(sc, "writable", None) or [])
@@ -5485,10 +5524,11 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
         # R67F-T1（层③）紧随 ③ 之后：同名异包（异 FQN 同 simple-name）有契约权威者确定性消解。
         # ★必须在 ③ 之后★：③ 先塌缩同 FQN 跨模块副本 → 本 pass 面对的 owner FQN 恰有唯一创建者。
         "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(plan),
-        # create-vs-base【modify-only 安全子集】：LLM 显式 action=modify 却把子任务 create_files 落点
-        # 写成 base 实体幻觉异路径（SysUser 型）→ 归位到 base 真身（改 modify）。★必须在 normalize
-        # 之前★：归位可能造 st-x/st-y 同文件双写者，交下方 normalize_plan_scopes 串行化收敛。无 file_plan
-        # modify 信号（SysMenu 型 create）不碰，留 G1 ③f REJECT（fail-closed，绝不裸 basename 挑边）。
+        # create-vs-base shadow 归位（两互斥【显式权威】信号，clear G1 ③f）：LLM 把 base 既有实体当新类
+        # 落进子任务 create_files 幻觉异路径 → 归位到 base 真身（改 modify）。信号1=file_plan 该落点 action=
+        # modify（SysUser 型）；信号3=契约 defined_in 显式声明在 base 真身（SysMenu 型·治法A）。两信号皆不成
+        # 立 → 留 G1 ③f REJECT（fail-closed，绝不裸 basename 挑边）。★必须在 normalize 之前★：归位可能造
+        # st-x/st-y 同文件双写者，交下方 normalize_plan_scopes 串行化收敛。
         "cvb_modify_shadow_relocated": deconflict_create_vs_base_modify_shadow(
             plan, file_plan, project_path=project_path, base_ref=base_ref),
         "scaffolds_merged": dedupe_module_scaffolds(plan),

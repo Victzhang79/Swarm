@@ -2078,7 +2078,7 @@ CONTRACT_MODULE_USER = """总需求（背景）：{task_description}
 AlarmService 是一个东西）：接口条目优先用接口形态的文件名，绝不把 *Impl 实现类名当接口名。
 
 只产出【这个模块 owns 的契约片】JSON，module 字段统一填 "{mod_name}"。
-务必填全 dependencies：列出本模块编译期需声明的全部第三方依赖并集（漏一个即整模块编译失败）。"""
+务必填全 dependencies：列出本模块编译期需声明的全部第三方依赖并集（漏一个即整模块编译失败）。{base_entity_hints}"""
 
 
 def _contract_module_files_block(file_plan: list, mod_name: str, cap: int = 60) -> str:
@@ -2109,6 +2109,68 @@ def _contract_module_files_block(file_plan: list, mod_name: str, cap: int = 60) 
     shown = names[:cap]
     tail = f"\n…（共 {len(names)} 个，仅列前 {cap}）" if len(names) > cap else ""
     return "\n".join(f"- {n}" for n in shown) + tail
+
+
+def _contract_base_entity_hints(file_plan: list, mod_name: str,
+                                project_path: str | None, base_ref: str | None,
+                                cap: int = 20, *, tree: list | None = None) -> str:
+    """round67g-T4（治法A·contract-side）：把本模块 file_plan 里【与 base 既有类同名异路径】的 create
+    确定性检出，注入契约 prompt，让 contract_design（本盲于 base）能【认出既有实体】并显式声明 defined_in=
+    base 真身路径。下游 deconflict_create_vs_base_modify_shadow 信号3 以该【契约显式权威】把同名 create
+    影子确定性归位（clear G1 ③f），绝不裸 basename 挑边（判断权在 LLM 显式声明、非结构猜测）。
+
+    栈中立：仅 JVM 类路径命名空间（classpath_fqn_key 非 None）；base 同名【唯一】命中才提示（多义=通用名/
+    命名空间容忍，不提示）；test 布局豁免；精确 ∈ base 树者（同路径 modify）不在此列（R67-T8 处理）。
+    无 base 树（greenfield/非 git）或无碰撞 → 空串（prompt 无此段，零副作用）。
+    """
+    from swarm.brain.contract_utils import (
+        _base_tree_listing,
+        _norm_scope_path,
+        classpath_fqn_key,
+    )
+    # tree 由调用方一次性算好传入（治法A·对抗复核 hunter LOW：避免每模块×每重试重复 git ls-tree +
+    # 消除"某模块瞬时 git 失败→该模块静默无提示"的时有时无不一致）；未传则退化本地算（向后兼容）。
+    if tree is None:
+        tree = _base_tree_listing(project_path, base_ref)
+    if not tree:
+        return ""
+    base_by_simple: dict[str, list[str]] = {}
+    for p in tree:
+        k = classpath_fqn_key(p)
+        if k:
+            base_by_simple.setdefault(k[1].rsplit("/", 1)[-1].lower(), []).append(_norm_scope_path(p))
+    tree_set = {_norm_scope_path(p) for p in tree}
+    want = str(mod_name or "").strip().rstrip("/")
+    hints: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for it in file_plan or []:
+        mod = (it.get("module") if isinstance(it, dict) else getattr(it, "module", "")) or ""
+        path = (it.get("path") if isinstance(it, dict) else getattr(it, "path", "")) or ""
+        if str(mod).strip().rstrip("/") != want or not path:
+            continue
+        norm = _norm_scope_path(path)
+        parts = [seg for seg in norm.split("/") if seg]
+        if "test" in parts or "tests" in parts or norm in tree_set:
+            continue
+        k = classpath_fqn_key(path)
+        if not k:
+            continue
+        simple = k[1].rsplit("/", 1)[-1].lower()
+        hits = base_by_simple.get(simple) or []
+        if len(hits) == 1 and hits[0] != norm and simple not in seen:
+            seen.add(simple)
+            hints.append((path.replace("\\", "/").rsplit("/", 1)[-1], hits[0]))
+    if not hints:
+        return ""
+    lines = "\n".join(f"- {nm}（base 真身：{bp}）" for nm, bp in hints[:cap])
+    return (
+        "\n\n★既有实体提示（栈中立·base 树实测，仅 JVM 类路径）★：以下本模块已规划文件的 simple-name 与 "
+        "base【既有类】同名（真身路径见括号）。JVM 下同名类撞 Spring bean 名/MyBatis typeAlias 启动即崩。"
+        "请判断每个：\n"
+        "  · 若你要【扩展/复用】该既有类 → 对应契约条目的 defined_in【必须】填其【base 真身路径】"
+        "（绝不填本模块的新路径，否则被确定性闸 ③f 打回重拆）；\n"
+        "  · 若确属【职责不同的全新类】→ 务必【改名消歧】（换一个 simple name）。\n"
+        f"{lines}")
 
 
 def _normalize_contract_dependencies(raw) -> list[dict]:
@@ -2331,6 +2393,32 @@ async def contract_design(state: BrainState) -> dict:
     _valid_mods = [m for m in modules if isinstance(m, dict)]
     mod_total = len(_valid_mods)
     llm = _get_brain_llm()
+    # round67g-T4（治法A·contract-side）：解析 base 权威，供"既有实体提示"确定性检出 base 碰撞
+    # （contract_design 本盲于 base，注入后才能显式声明 defined_in=base 真身供下游信号3 归位）。
+    _cd_proj_path = None
+    try:
+        from swarm.project import store as _cd_store
+        _cd_pid = state.get("project_id") or ""
+        if _cd_pid:
+            _cd_proj = _cd_store.get_project(_cd_pid)
+            _cd_proj_path = _cd_proj.get("path") if _cd_proj else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[CONTRACT_DESIGN] 获取 project_path 失败，既有实体提示退化跳过: %s", exc)
+    _cd_base_ref = state.get("base_commit")
+    _cd_tree = None
+    if not _cd_proj_path:
+        # 降级可观测（CODING_STANDARDS fail-closed·对抗复核 hunter LOW）：无 project_path → 既有实体
+        # 提示整体消失 → contract 盲于 base → 治法A 信号3 本轮不可用（退化到 ③f REJECT，非腐化）。留痕便于 live 归因。
+        logger.warning("[CONTRACT_DESIGN] 无 project_path（%s）→ 既有实体提示本轮退化跳过，"
+                       "create-vs-base 信号3(治法A)不可用，同名 create 将退化到 G1 ③f REJECT",
+                       "project_id 缺失" if not (state.get("project_id") or "") else "项目无 path")
+    else:
+        # base 树【一次性算好】供各模块×各重试复用（hunter LOW：消 N 次 git + 消跨模块时有时无不一致）。
+        try:
+            from swarm.brain.contract_utils import _base_tree_listing as _cd_btl
+            _cd_tree = _cd_btl(_cd_proj_path, _cd_base_ref)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CONTRACT_DESIGN] base 树读取失败 → 既有实体提示本轮退化跳过（信号3 不可用）: %s", exc)
 
     # ── Stage A：全局骨架（1 次小调用）──
     _t0 = _time.monotonic()
@@ -2445,6 +2533,10 @@ async def contract_design(state: BrainState) -> dict:
                             # R64-T4：契约命名对齐真实 file_plan（源头预防命名漂移）
                             module_files=_contract_module_files_block(
                                 state.get("tech_design_file_plan") or [], mod_name),
+                            # round67g-T4（治法A）：base 既有实体提示（确定性检出→引导 defined_in=base 真身）
+                            base_entity_hints=_contract_base_entity_hints(
+                                state.get("tech_design_file_plan") or [], mod_name,
+                                _cd_proj_path, _cd_base_ref, tree=_cd_tree),
                         ) + _retry_brief},
                     ]), timeout=_CONTRACT_STAGE_TIMEOUT)
                     r = _parse_json_from_llm(resp.content)
