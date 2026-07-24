@@ -816,7 +816,11 @@ async def dispatch(state: BrainState) -> dict:
                 _next_batch = [
                     st for st in plan_obj.get_dispatch_batch(
                         _rolling_completed, _rem, _slots,
-                        _abandoned, _deprioritized)
+                        _abandoned, _deprioritized,
+                        # R67J-H3b 复核 M2：在飞集=已派未完成——生产者在飞时其成环消费者
+                        # 必须继续 defer（否则补位轮 p 不在 remaining→就绪集不含 p→软序
+                        # 被绕过，c 与执行中的 p 并跑）
+                        in_flight=_spawned_ids - _rolling_completed)
                     if st.id not in _spawned_ids and not _oversized_by_files(st)
                 ][: _roll_budget - len(_rolled)]
             except Exception:  # noqa: BLE001 — 补位是增益，选批异常绝不拖垮本批

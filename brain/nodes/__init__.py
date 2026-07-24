@@ -3007,6 +3007,60 @@ def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
         "已修好的条目不要回退）\n" + body)
 
 
+def _gate_fuse_and_account(state: dict, gate: str, issues, retry_count: int) -> tuple[int, dict]:
+    """R67J-H5：validate 全闸收敛熔断账（R64-T3 从 G1 泛化到全硬闸）。
+
+    体检 TOP5：逐闸早退共享 plan_retry_count，熔断账此前仅 G1 写——每轮死在不同闸时账链
+    断裂无收敛判定，3 轮各修一闸即预算耗尽（表观死因=最后一闸）。本 helper 把账全局化：
+    每个硬闸失败早退时调用，返回 (可能被顶格的 retry, 新账)。账结构
+    {gate, sig, retry, count, gate_1ago, count_1ago}；两触发均加 gate 相等约束——
+      触发一（R64-T3 原判泛化）：同闸同签名连续两轮=反馈未被执行，重试必然同结果；
+      触发二（round67i 窗口泛化）：同闸 2 轮窗口违例数零净收敛（cur>=count_2ago 且 cur>0），
+        含跨闸弹跳回退（A闸→B闸→A闸 且 A 违例数未减=修 B 打破了 A 或原地重犯）。
+    ★诚实边界（猎手复核点名）：窗口回看仅 2 轮 → 跨闸弹跳侦测只对【周期≤2】有效；
+    周期 ≥3 的轮换（C1→C2→R40-1→C1…）gate_2ago 永不等于当前 gate，结构性抓不到，
+    由 MAX_PLAN_RETRY=3 硬顶格在 CONFIRM 侧兜底（代价有限，非漏抓 bug，复盘勿重查）。
+    跨闸计数异质【绝不互比】（不同闸 issue 语料不可比，2→10→2 的真进展绝不误熔）；
+    "修好一闸进下一闸"前进流 gate 不等 → 两触发皆假，绝不误熔。全 G1 序列严格退化为
+    R64-T3+R67F-T2+round67i 既有行为。签名归一 normalize_structural_signature（去 st-id，
+    renumber 免疫）对 C1/C2/R40-1/G1/覆盖闸 issue 均判别充分（类名/路径/req-id 存留）；
+    structure 闸 issue 去 st-id 后判别力不足（悬空依赖文本互相同化）→ 调用侧排除。
+    旧账兼容：无 gate 键（历史唯一写者是 G1）按 "G1" 论，在飞 checkpoint 升级瞬间不失防护。
+    泄压阀沿用 SWARM_G1_RETRY_FUSE（单一开关覆盖全闸，绝不留半开状态）。
+    """
+    from swarm.brain.plan_validator import normalize_structural_signature as _norm
+    sig = _norm(issues)
+    prev = state.get("plan_validation_prev_structural") or {}
+    count = len(issues or [])
+    consecutive = prev.get("retry") == retry_count - 1
+    prev_gate = prev.get("gate", "G1")
+    retry_out = retry_count
+    fuse_on = os.environ.get(
+        "SWARM_G1_RETRY_FUSE", "1").strip().lower() not in ("0", "false", "no", "off")
+    fuse_sig = consecutive and prev_gate == gate and prev.get("sig") == sig
+    count_2ago = prev.get("count_1ago")
+    gate_2ago = prev.get("gate_1ago", "G1")
+    fuse_window = (
+        consecutive and retry_count >= 2 and count > 0
+        and gate_2ago == gate and count_2ago is not None and count >= count_2ago)
+    if fuse_on and (fuse_sig or fuse_window):
+        from swarm.brain.graph import MAX_PLAN_RETRY as _max
+        retry_out = max(retry_count, _max)
+        _why = (f"{gate} 闸结构违例签名连续两轮未变（同违例重犯）" if fuse_sig
+                else f"{gate} 闸违例数 2 轮窗口零净收敛（{count_2ago}→…→{count} 未减，"
+                     "同族换件/跨闸弹跳回退重犯）")
+        logger.warning(
+            "[VALIDATE_PLAN] R64-T3/H5 %s（带反馈重产未收敛）→ 熔断：retry 顶格 %d，"
+            "直接进 CONFIRM fail-fast（不再烧重产轮）", _why, retry_out)
+    # gate_1ago/count_1ago：仅严格连续时继承上轮（供下一轮算同闸 2 轮窗口）；
+    # 非连续→None 免陈旧误熔（R64-T3 原护栏跨闸保持）。
+    account = {
+        "gate": gate, "sig": sig, "retry": retry_count, "count": count,
+        "gate_1ago": (prev_gate if consecutive else None),
+        "count_1ago": (prev.get("count") if consecutive else None)}
+    return retry_out, account
+
+
 async def validate_plan(state: BrainState) -> dict:
     """VALIDATE_PLAN 节点 — PlanValidator 硬校验 + 可选 LLM 补充
 
@@ -3032,6 +3086,9 @@ async def validate_plan(state: BrainState) -> dict:
     _vp_warnings: list[str] = []
 
     if plan_obj is None:
+        # R67J-H5 排除面（猎手复核点名要求显式说明）：plan 空多为 LLM 超时/截断/解析失败
+        # 等瞬态，重试真可能救——接熔断会在 retry1 掐死合法恢复；不写账=账链自然断裂，
+        # fail-open 保重试，MAX_PLAN_RETRY 兜底。
         return {
             "plan_valid": False,
             "plan_retry_count": retry_count,
@@ -3078,6 +3135,8 @@ async def validate_plan(state: BrainState) -> dict:
     # （_repair_retry：成功批缓存回放、只重烧失败模块）造好了却没有入口。此处打回给足
     # 回炉机会；熔断复用 plan_retry_count/MAX_PLAN_RETRY（after_validate），耗尽仍失败
     # → confirm fail-fast 升人工（原终局保留）。不 emit plan_batch_cache——回炉靠它回放。
+    # R67J-H5 排除面（不接熔断账）：整模块分解失败的重试=U2 补齐型（缓存回放成功批、只重烧
+    # 失败模块），失败原因多为瞬态（超时/截断），重试正是设计的恢复机制——熔断会掐死 U2。
     _pb_failed = state.get("plan_batch_failed_modules") or []
     if _pb_failed:
         _pb_issues = [
@@ -3123,12 +3182,18 @@ async def validate_plan(state: BrainState) -> dict:
     if not _co_result.valid:
         logger.warning("[VALIDATE_PLAN] C1 契约符号对账未通过 → 打回 PLAN: %s",
                        _co_result.issues[:3])
+        # R67J-H5：全闸收敛账（跨闸弹跳/同闸不收敛熔断）+ 早退 always-emit 软警告
+        # （hunter #4 的 sibling 捞净：此前仅 G1 早退带 warnings，其余闸早退该轮软信号丢失）
+        _h5_retry, _h5_acct = _gate_fuse_and_account(
+            state, "C1", _co_result.issues, retry_count)
         return {
             "plan_valid": False,
-            "plan_retry_count": retry_count,
+            "plan_retry_count": _h5_retry,
             "plan_validation_issues": _co_result.issues,
+            "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _co_result.issues, rotate=retry_count),
+            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
         }
 
     # ── DR-PM66-C2(#112) 考卷同源·接口方法名：契约 signature vs owner 子任务描述方法名不得分叉 ──
@@ -3142,12 +3207,16 @@ async def validate_plan(state: BrainState) -> dict:
     if not _css_result.valid:
         logger.warning("[VALIDATE_PLAN] C2 契约签名↔描述方法名分叉 → 打回 PLAN: %s",
                        _css_result.issues[:3])
+        _h5_retry, _h5_acct = _gate_fuse_and_account(          # R67J-H5 全闸收敛账
+            state, "C2", _css_result.issues, retry_count)
         return {
             "plan_valid": False,
-            "plan_retry_count": retry_count,
+            "plan_retry_count": _h5_retry,
             "plan_validation_issues": _css_result.issues,
+            "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _css_result.issues, rotate=retry_count),
+            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
         }
 
     # ── R40-1 file_plan 归属确定性闸：规划文件必须有 owner 子任务 ──
@@ -3166,12 +3235,16 @@ async def validate_plan(state: BrainState) -> dict:
     if not _fp_result.valid:
         logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属未通过 → 打回 PLAN: %s",
                        _fp_result.issues[:3])
+        _h5_retry, _h5_acct = _gate_fuse_and_account(          # R67J-H5 全闸收敛账
+            state, "R40-1", _fp_result.issues, retry_count)
         return {
             "plan_valid": False,
-            "plan_retry_count": retry_count,
+            "plan_retry_count": _h5_retry,
             "plan_validation_issues": _fp_result.issues,
+            "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _fp_result.issues, rotate=retry_count),
+            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
         }
 
     # ── G1 模块 coherence 确定性闸（Task#9 审计①②）：每模块=恰好一个物理构建单元 ──
@@ -3202,52 +3275,18 @@ async def validate_plan(state: BrainState) -> dict:
                 _mc_result.issues[:3])
             # ★R64-T3 同签名收敛熔断★ round64：G1 反馈注入 plan_batch，但其输出 schema 无
             # module/file_plan 字段 + P4 禁改前缀 → 反馈结构性无法执行，全量重产 33min 输出
-            # 逐字节相同。连续两轮（retry 严格连续，防跨 replan 周期陈旧签名误熔断）违例签名
-            # 一致 → 顶格 retry_count 复用 after_validate 既有 CONFIRM 路由 fail-fast，
-            # 绝不再烧一轮注定同结果的全量重产。
-            # ★R67F-T2（层②）★：签名走 normalize_structural_signature【去 st-id】——round67f 死因
-            # 是同名异包违例每轮以相同 basename+异包对复发，但 issue 文本内嵌 st-id 随全量重拆
-            # renumber（st-27-1→st-11-1）→ 原整份文本签名逐轮不同 → 熔断被击穿、k3 连烧 2 轮。
-            from swarm.brain.plan_validator import normalize_structural_signature as _t3_norm
-            _t3_sig = _t3_norm(_mc_result.issues)
-            _t3_prev = state.get("plan_validation_prev_structural") or {}
-            _t3_retry_out = retry_count
-            _t3_count = len(_mc_result.issues or [])       # 本轮结构违例数（收敛信号）
-            _t3_consecutive = _t3_prev.get("retry") == retry_count - 1
-            # 猎手 F4：熔断泄压阀（对照 SWARM_MODULE_COHERENCE_GATE 先例）——"同签名=重试
-            # 必然无效"是 round64 单轮经验推广，若某任务/模型存在部分确定性反例，运维可
-            # 不改代码关掉熔断恢复满额重试。默认开。
-            _t3_fuse_on = os.environ.get(
-                "SWARM_G1_RETRY_FUSE", "1").strip().lower() not in ("0", "false", "no", "off")
-            # 触发一：R64-T3 原判——结构违例签名连续两轮【逐字未变】（同一违例重犯）。
-            _t3_fuse_sig = (_t3_prev.get("sig") == _t3_sig and _t3_consecutive)
-            # ★触发二（round67i 新增·同族换类非收敛）★：round67i 死因=下游 batch 每轮发明【不同】的
-            # 同名异包/create-vs-base 违例（retry0 AppSecret/NotifyMessage/SysMenu→retry1 SysMenu/
-            # SysRole→retry2 全新 3 个 alarm 类），三套签名互不相交 → 触发一（整份签名相等）永假 → 3 轮
-            # 全烧。本触发看【2 轮窗口净收敛】：违例数【未较 2 轮前减少】(cur>=count_2ago) 且当前非空 →
-            # LLM 换着花样重犯、零净进展 → 提前 fail-fast。★保守防误熔慢收敛：只要 2 轮窗口内违例数在
-            # 净下降(cur<count_2ago)就绝不熔（如 5→3→2 让其继续）；须严格连续两轮账才比（防陈旧）★。
-            _t3_count_2ago = _t3_prev.get("count_1ago")     # 2 轮前的违例数（严格连续时才有意义）
-            _t3_fuse_window = (
-                _t3_consecutive and retry_count >= 2 and _t3_count > 0
-                and _t3_count_2ago is not None and _t3_count >= _t3_count_2ago)
-            if _t3_fuse_on and (_t3_fuse_sig or _t3_fuse_window):
-                from swarm.brain.graph import MAX_PLAN_RETRY as _t3_max
-                _t3_retry_out = max(retry_count, _t3_max)
-                _why = ("结构违例签名连续两轮未变（同违例重犯）" if _t3_fuse_sig
-                        else f"结构违例数 2 轮窗口零净收敛（{_t3_count_2ago}→…→{_t3_count} 未减，"
-                             "同族换类重犯）")
-                logger.warning(
-                    "[VALIDATE_PLAN] R64-T3 %s（带反馈全量重产未收敛）→ 熔断：retry 顶格 %d，"
-                    "直接进 CONFIRM fail-fast（不再烧重产轮）", _why, _t3_retry_out)
+            # 逐字节相同 → 触发一（同闸同签名连续两轮顶格 fail-fast）。签名走 R67F-T2
+            # normalize_structural_signature（去 st-id，renumber 免疫）。触发二（round67i）：
+            # 同闸 2 轮窗口违例数零净收敛=同族换类重犯提前熔断（净下降 5→3→2 绝不误熔）。
+            # R67J-H5：两触发泛化进 _gate_fuse_and_account 全闸共用（含泄压阀猎手 F4
+            # SWARM_G1_RETRY_FUSE / 陈旧账防误熔 / gate 相等约束），G1 语义严格保持。
+            _t3_retry_out, _t3_acct = _gate_fuse_and_account(
+                state, "G1", _mc_result.issues, retry_count)
             return {
                 "plan_valid": False,
                 "plan_retry_count": _t3_retry_out,
                 "plan_validation_issues": _mc_result.issues,
-                # count_1ago：仅严格连续时继承上轮 count（供下一轮算 2 轮窗口）；非连续→None 免陈旧误熔。
-                "plan_validation_prev_structural": {
-                    "sig": _t3_sig, "retry": retry_count, "count": _t3_count,
-                    "count_1ago": (_t3_prev.get("count") if _t3_consecutive else None)},
+                "plan_validation_prev_structural": _t3_acct,
                 "plan_validation_feedback": _format_validation_feedback(
                     _mc_result.issues, rotate=retry_count),
                 # silent-hunter #4：早退分支也必须 always-emit 本轮软警告（含 G1 自己的 zero-dir
@@ -3388,13 +3427,23 @@ async def validate_plan(state: BrainState) -> dict:
             logger.warning(
                 "[VALIDATE_PLAN] 单调合同违约：覆盖闸放行但较水位丢失 %d 条（%s）→ 拒绝",
                 len(_wm_lost), [e["id"] for e in _wm_lost[:10]])
+            # 复核 M1 整改：issues 逐条化（一条一 req）——合成汇总串会让 H-5 账 count 恒 1，
+            # 任意两次不相关的单条目倒退落在 2 轮窗口即 1>=1 平凡熔断（真进展被误熔）。
+            # 逐条化后 count/sig 恢复分辨率（req-id 过 normalize 存留）；帽 60 与 R40-1 同律。
+            _wm_issues = [
+                f"coverage_watermark 倒退：{e['id']} 已达成覆盖丢失" for e in _wm_lost[:60]]
+            if len(_wm_lost) > 60:
+                _wm_issues.append(f"coverage_watermark 倒退共 {len(_wm_lost)} 条（仅列前 60）")
+            _h5_retry, _h5_acct = _gate_fuse_and_account(      # R67J-H5 全闸收敛账
+                state, "coverage_watermark", _wm_issues, retry_count)
             return {
                 "plan_valid": False,
-                "plan_retry_count": retry_count,
-                "plan_validation_issues": [
-                    f"coverage_watermark 倒退：丢失 {len(_wm_lost)} 条已达成覆盖"],
+                "plan_retry_count": _h5_retry,
+                "plan_validation_issues": _wm_issues,
+                "plan_validation_prev_structural": _h5_acct,
                 "plan_validation_feedback": _wm_loss_feedback(),
                 "coverage_watermark": _wm_cov_ids,
+                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
             }
         # A6（阶段3.4，2026-07-09 登记册）：覆盖缺口≤阈值 degraded 放行——替代全有全无
         # （round37 实证 2/108 未覆盖=整任务 REJECT）。放行条件全部满足：①已给过≥1 轮
@@ -3429,10 +3478,13 @@ async def validate_plan(state: BrainState) -> dict:
                     "[VALIDATE_PLAN] 覆盖增量：本轮新增未覆盖 %s；较上轮已修复 %s",
                     sorted(_cur_ids - _prev_ids) or "无",
                     sorted(_prev_ids - _cur_ids) or "无")
+            _h5_retry, _h5_acct = _gate_fuse_and_account(      # R67J-H5 全闸收敛账
+                state, "coverage", cov_result.issues, retry_count)
             return {
                 "plan_valid": False,
-                "plan_retry_count": retry_count,
+                "plan_retry_count": _h5_retry,
                 "plan_validation_issues": cov_result.issues,
+                "plan_validation_prev_structural": _h5_acct,
                 # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划；
                 # 阶段3.1：相对水位的丢失以单调合同名义结构化前置（倒退≠一直没做）；
                 # A9：超帽按 retry 轮分页轮转（LLM 修不了看不见的条目）。
@@ -3446,6 +3498,7 @@ async def validate_plan(state: BrainState) -> dict:
                 # R65E9-T1：本轮新拒的假 baseline id 入单调不合格集（reducer append+dedup 累积）→
                 # 下一轮 planner 再 declare 亦被无条件踢→逼建子任务，打断 limbo 死钉（保证收敛）。
                 "baseline_ineligible_reqs": _new_rejected,
+                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
             }
         if _gap_allowed_pass:
             _gap_ids = [u["id"] for u in _wm_matrix["uncovered"]]

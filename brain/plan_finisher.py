@@ -636,11 +636,52 @@ def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
                 rd = list(getattr(sc, "readable", None) or [])
                 if path not in rd:
                     sc.readable = rd + [path]
+    # R67J-H3b①：成环对落 plan 持久账（dispatch 软序兜底/观测消费）。★always-emit 防
+    # 粘滞★：无环轮也必须清空覆写——同 plan 对象 finish 重入/revision 场景下旧对残留
+    # 会让 dispatch 软序 defer 错人（复核盲区四类之 always-emit，见记忆）。
+    try:
+        plan.symbol_cycle_pairs = [
+            list(pr) for pr in sorted({(c, p) for c, p, _ in cycle_skipped})]
+    except Exception:  # noqa: BLE001 — 落账是增益，绝不拖垮 plan-finish 主链
+        logger.warning("[PLAN-FINISH] R67J-H3b 成环对落账失败（fail-open，仅失兜底）",
+                       exc_info=True)
+        # 猎手复核整改：异常路显式归零=自证不变量。当前调用图每轮重建全新 TaskPlan
+        # （默认已空），此行防的是未来"就地 patch 现有 plan 对象"路径下残留上一轮陈旧对。
+        try:
+            plan.symbol_cycle_pairs = []
+        except Exception:  # noqa: BLE001,S110 — 归零再失败只能放行（对象本身异常）
+            pass
     if cycle_skipped:
         logger.warning(
             "[PLAN-FINISH] R67-T4b %d 条符号消费边会成环 → 跳过（多为拆分簇兄弟互引且"
             "反向边已保序；边方向属更深计划错留 VALIDATE/C9 面）: %s",
             len(cycle_skipped), cycle_skipped[:6])
+        # R67J-H3b②：消费者注入确定性提示。round67 64cb44ed 真根：消费者先于生产者执行
+        # 时 worker 面对"引用一个尚不存在的类"只有两条死路——臆造同名类（编译可过=假过，
+        # L1 全盲）或 cannot find symbol（H-3a 后=BLOCKED，但生产者在等消费者=互等结徒劳
+        # 退避）。提示把 worker 钉在第三条活路上：不引用、不臆造、确需则如实报缺符号。
+        try:
+            _note_by_sid: dict[str, set[tuple[str, str]]] = {}
+            for c, p, tok in cycle_skipped:
+                _note_by_sid.setdefault(c, set()).add((p, tok))
+            for c, items in _note_by_sid.items():
+                st = by_id.get(c)
+                if st is None:
+                    continue
+                cur = str(getattr(st, "context_snippets", "") or "")
+                if "R67J-H3b 成环消费" in cur:
+                    continue        # plan-finish 可重入（replan/revision）→ 幂等不堆叠
+                _lines = "；".join(
+                    f"{tok}（由 {p} 在你之后创建）" for p, tok in sorted(items))
+                st.context_snippets = cur + (
+                    "\n\n⚠️ 结构提示（R67J-H3b 成环消费）：以下类由其他子任务在你【之后】"
+                    f"创建，当前尚不存在：{_lines}。你的代码【不得】import/编译期引用它们，"
+                    "也【绝不要】自行创建/臆造同名类（会与后续真身冲突导致启动崩溃）；"
+                    "若你的验收确实需要编译期引用它，如实报告缺符号失败即可（系统会按"
+                    " BLOCKED 序化处理），绝不要编造它的实现。")
+        except Exception:  # noqa: BLE001 — 提示是增益，绝不拖垮 plan-finish 主链
+            logger.warning("[PLAN-FINISH] R67J-H3b 消费者防臆造提示注入失败"
+                           "（fail-open，仅失提示）", exc_info=True)
     if added:
         logger.info(
             "[PLAN-FINISH] R67-T4b 符号消费补边 %d 个消费者共 %d 条（desc/AC 引用他人 create"

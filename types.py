@@ -409,6 +409,13 @@ class TaskPlan(BaseModel):
         default_factory=dict,
         description="收尾器/外科确定性挂靠的孤儿文件（scope 身份配对时剔除）",
     )
+    # R67J-H3b：R67-T4b 符号消费补边时因成环放弃的 (消费者, 生产者) 对。DAG 上生产者
+    # （传递）依赖消费者 → 边不可加；本账供 get_dispatch_batch 软序兜底（放弃/软边松弛
+    # 后二者同批就绪时生产者先行）+ 观测。加法兼容：老 checkpoint 缺字段=默认空。
+    symbol_cycle_pairs: list[list[str]] = Field(
+        default_factory=list,
+        description="成环放弃的符号消费对 [[消费者id, 生产者id], …]（软序账，不改依赖图）",
+    )
 
     def get_ready_tasks(
         self, completed_ids: set[str], abandoned: set[str] | None = None
@@ -441,6 +448,7 @@ class TaskPlan(BaseModel):
         max_concurrent: int,
         abandoned: set[str] | None = None,
         deprioritized: set[str] | None = None,
+        in_flight: set[str] | None = None,
     ) -> list[SubTask]:
         """选取下一批可并行派发的子任务。
 
@@ -519,6 +527,35 @@ class TaskPlan(BaseModel):
 
         fresh.sort(key=_prio)  # list.sort 稳定：同级同扇出保持 subtasks 原序
         ready = fresh + retry
+        # R67J-H3b：符号成环对软序兜底——(消费者 c, 生产者 p) 因成环放弃补边（p 传递依赖
+        # c，DAG 序=c 先行），正常情形二者绝不同批就绪；仅当依赖被放弃/软边旁路松弛后才会
+        # 同批可派。此时 defer c 一批让 p 先落产物，省 c 的一次必然 BLOCKED 白跑。
+        # 护栏：①只 defer 不丢派（c 仍在 remaining，下批 p 完成/在飞后自然释放）；
+        # ②p 不在本轮就绪集也不在飞 → 绝不 defer（p 传递依赖 c 的原生环下 defer=调度自死锁）；
+        # ③互对/链式对按 sorted 确定性处理，"p 未被 defer 才 defer c"保证至少一者保留
+        # （反证：若全被 defer，最后一次 defer 时其 p 未被 defer 且此后无人再 defer 它）；
+        # ④复核 M2 整改：`in_flight`=已派出未完成集（滚动补位传入）——p 在飞时 c 同样要
+        # defer，否则补位轮 p 不在 remaining → 不在就绪集 → 绕过软序，c 与执行中的 p
+        # 并跑（正是本机制要防的"消费者先于生产者产物"）。p 在飞者绝不参与"互 defer"
+        # 判定（它不在本批候选，defer 它无意义也无饿死风险——在飞必然终结）。
+        _cyc_pairs = list(getattr(self, "symbol_cycle_pairs", None) or [])
+        if _cyc_pairs:
+            _ready_ids = {t.id for t in ready}
+            _in_flight = in_flight or set()
+            _deferred: set[str] = set()
+            for _pr in sorted(tuple(p[:2]) for p in _cyc_pairs if len(p) >= 2):
+                _c, _p = str(_pr[0]), str(_pr[1])
+                if _c in _ready_ids and _c not in _deferred and (
+                        (_p in _ready_ids and _p not in _deferred)
+                        or _p in _in_flight):
+                    _deferred.add(_c)
+            if _deferred:
+                # 猎手复核整改：defer 决策必须留痕——被 defer 者不进 to_dispatch，
+                # dispatch_totals=0 连账龄追踪都不覆盖，无日志=完全黑箱。
+                logger.info(
+                    "[DISPATCH] R67J-H3b 软序 defer %d 个成环消费者让生产者先行"
+                    "（只延批不丢派）: %s", len(_deferred), sorted(_deferred))
+                ready = [t for t in ready if t.id not in _deferred]
         return ready[:max_concurrent]
 
     def all_completed(self, completed_ids: set[str]) -> bool:

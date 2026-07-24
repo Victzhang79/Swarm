@@ -1075,6 +1075,18 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     p for p in _prods
                     if p != fid and p in _pending_now
                     and not _depends_reaches(plan_obj, p, fid))
+                # R67J-H3b④：环滤空洞可观测——pending 生产者【全部】被环护栏滤除（生产者
+                # 传递依赖本消费者）= 结构互等结：消费者缺生产者的产物才能编译，生产者等
+                # 消费者完成才会派发，退避等待 provably 徒劳，只会烧满该子任务重试预算后
+                # 连坐。此前静默落入 transient 白跑零留痕。本轮 WARNING 观测（消费侧提示
+                # 已由 plan_finisher R67J-H3b② 注入；自动解结/边向手术另案 H-3c）。
+                if not _pending_prods:
+                    _knot = sorted(p for p in _prods if p != fid and p in _pending_now)
+                    if _knot:
+                        logger.warning(
+                            "[HANDLE_FAILURE] R67J-H3b 结构互等结：%s 阻断在 %s 的产物上，"
+                            "而生产者（传递）依赖它——C9 补边被环护栏全滤，退避等待徒劳"
+                            "（解结自动化另案；plan 侧防臆造提示已注入）", fid, _knot)
                 if _pending_prods:
                     _deps_now = list(getattr(_st, "depends_on", []) or [])
                     _added = [p for p in _pending_prods if p not in _deps_now]
