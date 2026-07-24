@@ -338,8 +338,47 @@ def sweep_baseline_anchor_poison(
     return restored, scan_errors
 
 
+def _class_in_baseline(project_path: str | None, class_fqn: str) -> bool:
+    """H-3a 配套（复核 HIGH 整改）：类 FQN（pkg.Cls 点分）是否已在基线树——【类级】BLOCKED
+    的 futile 假阳性护栏。类级 BLOCKED（internal_pkg_not_built 的"包在树、类未建出"子型）
+    的包必然在树 → _package_in_baseline 恒 True → futile 永假 → 臆造类引用烧满整条重试阶梯
+    （round19 #10 幽灵生产者慢磨复发）。判据=包目录下 {Cls}.java 存在 或 目录内任一 .java
+    含该类声明（共居次级类，与 L1 侧内容级判据对齐）。无从判定/异常 → 保守 True（当存在→
+    不硬失败），同 _package_in_baseline 纪律；阴性方向用新鲜索引。"""
+    if not project_path or not class_fqn or "." not in class_fqn:
+        return True
+    pkg, cls = class_fqn.rsplit(".", 1)
+    rel = pkg.replace(".", "/").strip("/")
+    if not rel or not cls:
+        return True
+    suffix = "/" + rel
+    import re as _re
+    decl = _re.compile(r"\b(?:class|interface|enum|record)\s+" + _re.escape(cls) + r"\b")
+    try:
+        # 阴性判定可能触发 abandon → 用新鲜索引（同 _package_in_baseline 阴性纪律）
+        roots = _baseline_dir_roots(project_path, max_age_s=_BASELINE_NEG_FRESH_S)
+        for r in roots:
+            if not r.endswith(suffix):
+                continue
+            for fn in os.listdir(r):
+                if not fn.endswith(".java"):
+                    continue
+                if fn == cls + ".java":
+                    return True
+                try:
+                    with open(os.path.join(r, fn), encoding="utf-8", errors="ignore") as fh:
+                        if decl.search(fh.read()):
+                            return True
+                except OSError:
+                    return True  # 单文件读失败 → 保守当【存在】
+        return False
+    except OSError:
+        return True  # 扫描异常 → 保守当【存在】，避免误杀
+
+
 def _blocked_pkg_unrecoverable(
     blocked_pkgs, producers, unsat, completed_ok, pending, project_path, self_id,
+    blocked_classes=None,
 ) -> bool:
     """阻断在内部包的子任务，是否【永不可满足】= 全部生产者已终结 且 包仍不在工作树。
 
@@ -364,6 +403,12 @@ def _blocked_pkg_unrecoverable(
 
     if any(not _settled(p) for p in _prods):  # 仍有 active 生产者 → 该等，别误杀
         return False
+    # ★H-3a 复核 HIGH 整改★：类级 BLOCKED（L1 吐了 blocked_on_classes=包在树、类未建出）
+    # 时包级判据结构性失效（包必在树→恒 False→臆造类烧满阶梯）——改用类级树判据：
+    # 全部缺类都不在基线树才判不可满足；任一在树（仅漏 seed/同步）→ False 继续等。
+    _cls = [c for c in (blocked_classes or []) if c]
+    if _cls:
+        return not any(_class_in_baseline(project_path, c) for c in _cls)
     return bool(blocked_pkgs) and not any(
         _package_in_baseline(project_path, p) for p in blocked_pkgs
     )

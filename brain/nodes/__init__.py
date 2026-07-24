@@ -1191,7 +1191,11 @@ async def _plan_ultra_batched(
     # 各批独立 LLM 调用只见本批文件，看不到别模块已认领符号 → 源头预防同名异包重复 create
     # （层③消解/层②熔断的上游预防层）。栈中立（仅 JVM 类路径认领符号入清单，无则空串）。
     from swarm.brain.contract_utils import contract_owner_ledger_block
-    _owner_ledger_batched = contract_owner_ledger_block(state.get("shared_contract_draft") or {})
+    # ★round67i：并入 tech_design_file_plan 唯一 create 落点（契约的补集）——治下游 batch 发明分叉包
+    # 路径背离 tech_design 设计落点（AlarmCallbackController 型：契约漏声明但 tech_design 有权威）。★
+    _owner_ledger_batched = contract_owner_ledger_block(
+        state.get("shared_contract_draft") or {},
+        tech_design_file_plan=state.get("tech_design_file_plan") or [])
 
     # P5（R67-1 收权）：分批前去重【仅完全同路径】；跨路径同名一律保留，
     # 重复裁决交 #110/#101/T1b 有证据闸（旧 basename 全局剪曾误杀 12 UI 模板+duty 剪错方向）
@@ -3208,23 +3212,42 @@ async def validate_plan(state: BrainState) -> dict:
             _t3_sig = _t3_norm(_mc_result.issues)
             _t3_prev = state.get("plan_validation_prev_structural") or {}
             _t3_retry_out = retry_count
+            _t3_count = len(_mc_result.issues or [])       # 本轮结构违例数（收敛信号）
+            _t3_consecutive = _t3_prev.get("retry") == retry_count - 1
             # 猎手 F4：熔断泄压阀（对照 SWARM_MODULE_COHERENCE_GATE 先例）——"同签名=重试
             # 必然无效"是 round64 单轮经验推广，若某任务/模型存在部分确定性反例，运维可
             # 不改代码关掉熔断恢复满额重试。默认开。
             _t3_fuse_on = os.environ.get(
                 "SWARM_G1_RETRY_FUSE", "1").strip().lower() not in ("0", "false", "no", "off")
-            if (_t3_fuse_on and _t3_prev.get("sig") == _t3_sig
-                    and _t3_prev.get("retry") == retry_count - 1):
+            # 触发一：R64-T3 原判——结构违例签名连续两轮【逐字未变】（同一违例重犯）。
+            _t3_fuse_sig = (_t3_prev.get("sig") == _t3_sig and _t3_consecutive)
+            # ★触发二（round67i 新增·同族换类非收敛）★：round67i 死因=下游 batch 每轮发明【不同】的
+            # 同名异包/create-vs-base 违例（retry0 AppSecret/NotifyMessage/SysMenu→retry1 SysMenu/
+            # SysRole→retry2 全新 3 个 alarm 类），三套签名互不相交 → 触发一（整份签名相等）永假 → 3 轮
+            # 全烧。本触发看【2 轮窗口净收敛】：违例数【未较 2 轮前减少】(cur>=count_2ago) 且当前非空 →
+            # LLM 换着花样重犯、零净进展 → 提前 fail-fast。★保守防误熔慢收敛：只要 2 轮窗口内违例数在
+            # 净下降(cur<count_2ago)就绝不熔（如 5→3→2 让其继续）；须严格连续两轮账才比（防陈旧）★。
+            _t3_count_2ago = _t3_prev.get("count_1ago")     # 2 轮前的违例数（严格连续时才有意义）
+            _t3_fuse_window = (
+                _t3_consecutive and retry_count >= 2 and _t3_count > 0
+                and _t3_count_2ago is not None and _t3_count >= _t3_count_2ago)
+            if _t3_fuse_on and (_t3_fuse_sig or _t3_fuse_window):
                 from swarm.brain.graph import MAX_PLAN_RETRY as _t3_max
                 _t3_retry_out = max(retry_count, _t3_max)
+                _why = ("结构违例签名连续两轮未变（同违例重犯）" if _t3_fuse_sig
+                        else f"结构违例数 2 轮窗口零净收敛（{_t3_count_2ago}→…→{_t3_count} 未减，"
+                             "同族换类重犯）")
                 logger.warning(
-                    "[VALIDATE_PLAN] R64-T3 结构违例签名连续两轮未变（带反馈全量重产未收敛）"
-                    "→ 熔断：retry 顶格 %d，直接进 CONFIRM fail-fast（不再烧重产轮）", _t3_retry_out)
+                    "[VALIDATE_PLAN] R64-T3 %s（带反馈全量重产未收敛）→ 熔断：retry 顶格 %d，"
+                    "直接进 CONFIRM fail-fast（不再烧重产轮）", _why, _t3_retry_out)
             return {
                 "plan_valid": False,
                 "plan_retry_count": _t3_retry_out,
                 "plan_validation_issues": _mc_result.issues,
-                "plan_validation_prev_structural": {"sig": _t3_sig, "retry": retry_count},
+                # count_1ago：仅严格连续时继承上轮 count（供下一轮算 2 轮窗口）；非连续→None 免陈旧误熔。
+                "plan_validation_prev_structural": {
+                    "sig": _t3_sig, "retry": retry_count, "count": _t3_count,
+                    "count_1ago": (_t3_prev.get("count") if _t3_consecutive else None)},
                 "plan_validation_feedback": _format_validation_feedback(
                     _mc_result.issues, rotate=retry_count),
                 # silent-hunter #4：早退分支也必须 always-emit 本轮软警告（含 G1 自己的 zero-dir
@@ -5311,9 +5334,11 @@ async def revision(state: BrainState) -> dict:
         "acceptance_passed": None,
         "acceptance_details": {},
     }
-    if _rev_resolve.get("cvb_modify_shadow_relocated"):
+    if (_rev_resolve.get("cvb_modify_shadow_relocated")
+            or _rev_resolve.get("file_plan_entries_stripped")):
         # ★round67h HIGH（对抗双复核）★：CVB 归位就地改写了 tech_design_file_plan（shadow→base），
         # 随返回键回写进 state（同 elaborate CRITICAL；漏回写→checkpoint 恢复丢变异→R40-1 成环）。
+        # H-1 扩：#101/层③ 剥离联动删孤儿条目同律回写。
         _rev_out["tech_design_file_plan"] = _rev_fp
     return _rev_out
 

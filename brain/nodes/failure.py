@@ -516,6 +516,11 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     plan_obj = state.get("plan")
     strategy = "retry"
     _replan_landed = False  # #107：replan 确定性落地改了 plan 的标记（函数级，供各 plan 回写条件安全引用）
+    # ★R3 复核 CRITICAL 整改★：必须【函数级】初始化（同 _replan_landed 纪律）——它被 replan 块
+    # 之后的全部 return 出口消费（含 escalate/abandon/transient/mass-abandon 等非 replan 分支），
+    # 若只在 replan 分支内初始化，非 replan 路径必 UnboundLocalError 崩节点（既有
+    # test_ctodebt_partial_delivery 实测炸穿）。
+    _fp107_out: dict = {}   # H-1：#107 strip 了 file_plan 时的回写载荷
 
     logger.info(f"[HANDLE_FAILURE] 处理 {len(failed_ids)} 个失败子任务")
 
@@ -1048,6 +1053,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 blocked_pkgs=_bpkgs, producers=_prods, unsat=_unsat,
                 completed_ok=_completed_ok, pending=_pending_now,
                 project_path=_proj_path, self_id=fid,
+                # H-3a 复核 HIGH：类级 BLOCKED（包在树类未建出）时包级树判据恒真失效，
+                # 传类 FQN 走 _class_in_baseline 类级判据（防臆造类烧满阶梯=round19 #10 复发）
+                blocked_classes=_det.get("blocked_on_classes") or [],
             )
             if _dep_hit or _prod_hit or _futile:
                 # round36 P0：完全无生产者(_prods 空) 且 非依赖已放弃上游(非 dep_hit) 且 有 scope
@@ -1752,7 +1760,16 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 _replan_landed = _replan_landed or bool(_vs107)  # 落地即置位：防第二 pass 抛异常丢第一 pass 变异
                 _ia107 = anchor_forbidden_import_asserts(plan_obj)  # DR-10-F1(#102) 负断言 import 锚定
                 _replan_landed = _replan_landed or bool(_ia107)
-                _xc107 = deconflict_cross_module_creates(plan_obj)
+                # ★复核 CRITICAL 整改（hunter，H-1 全调用点覆盖盲区）★：执行期 replan 处方路径
+                # 原裸调 deconflict_cross_module_creates(plan_obj) 不传 file_plan → H-1 剥离联动
+                # 静默 no-op、且本函数从不回写 tech_design_file_plan → 被剥路径条目留孤儿 →
+                # HANDLE_FAILURE→PLAN→VALIDATE R40-1 REJECT → 挂靠复活 → round67h 同款环在
+                # 执行期路径复现。修：传 state 的 file_plan，strip 发生即随所有后续出口回写。
+                _fp107 = list(state.get("tech_design_file_plan") or [])
+                _fp107_before = len(_fp107)
+                _xc107 = deconflict_cross_module_creates(plan_obj, file_plan=_fp107)
+                if len(_fp107) != _fp107_before:
+                    _fp107_out = {"tech_design_file_plan": _fp107}
                 _replan_landed = _replan_landed or bool(_xc107)
                 if _vs107 or _ia107 or _xc107:
                     logger.info(
@@ -1801,6 +1818,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                         "create_files（全 plan 无 owner，replan 判决转外科），仅重派失败子任务",
                         _amend["applied"], failed_ids[0])
                     return {
+                        **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                         "plan": plan_obj,
                         "subtask_results": subtask_results,
                         "dispatch_remaining": dispatch_remaining,
@@ -1823,6 +1841,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "，换备选模型" if forced_alternate else "",
                 )
                 return {
+                    **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                     # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                     # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
                     **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -1854,6 +1873,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 failed_ids, len(succeeded_siblings),
             )
             return {
+                **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
                 **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -1878,6 +1898,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 max_replan,
             )
             return {
+                **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
                 **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -1903,6 +1924,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "（已携带失败原因供 PLAN 参考）" if replan_feedback else "",
         )
         return {
+            **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
             **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -1924,6 +1946,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
     if strategy == "escalate":
         logger.info("[HANDLE_FAILURE] 策略=escalate — 上报人工审核")
         return {
+            **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
             **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -2041,6 +2064,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 if fid not in dispatch_remaining:
                     dispatch_remaining.append(fid)
             return {
+                **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                 "dispatch_remaining": dispatch_remaining,
                 "failed_subtask_ids": [],
                 "subtask_results": subtask_results,
@@ -2166,6 +2190,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     "（round65e13 病灶永锁同模型死型治本；持久账本保证至多一轮、绝不无界重触发）",
                     _never_alt_roots, sorted(_clearable))
                 return {
+                    **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                     **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "dispatch_remaining": _g1_remaining,
                     "failed_subtask_ids": [],
@@ -2217,6 +2242,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     len(plan_obj.subtasks), len(_pd_new), sorted(_pd_roots)[:40],
                     sorted(_pd_new)[:40])
                 return {
+                    **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                     **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
                     "failure_strategy": "escalate",
                     "failure_escalated": True,
@@ -2231,6 +2257,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 failed_ids, len(abandoned), len(_remaining),
             )
             return {
+                **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
                 **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
@@ -2248,6 +2275,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             max_retries, failed_ids,
         )
         return {
+            **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
             # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
             # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
             **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),

@@ -212,3 +212,68 @@ def test_f2_multi_interface_owner_account_complete():
         "F2:同 owner 多接口账本被覆盖丢账"
     assert "selectScheduleStrategyList" in owner.description
     assert "selectNotifyUserByPage" in owner.description
+
+
+# ════════ H-2（round67j 体检 TOP3=修复核验 Fix5 缺口）：检测语料扩三面 ════════
+
+def _h2_owner(desc, ac=None, verify=None):
+    _if = "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/IAlarmService.java"
+    return _if, SubTask(
+        id="st-1", description=desc,
+        scope=FileScope(create_files=[_if]),
+        harness=TaskHarness(language="java", verify_commands=verify or []),
+        acceptance_criteria=ac or [])
+
+
+def _h2_contract(defined_in):
+    return {"interfaces": [{"name": "IAlarmService", "defined_in": defined_in,
+                            "signature": "List<X> selectScheduleStrategyList(Query q);"}]}
+
+
+def test_h2_ac_only_variant_detected():
+    """★H-2 主治★ 变体【仅】在 AC 出现（desc 沉默）→ 必须检出（治前假阴性：矛盾考卷
+    静默流向 worker，L1 按 AC 验长名、接口按契约落短名永不可赢）。"""
+    _if, owner = _h2_owner("实现告警服务接口",
+                           ac=["selectAlarmScheduleStrategyList 方法实现并编译通过"])
+    plan = TaskPlan(subtasks=[owner], shared_contract={})
+    d = detect_contract_signature_divergences(plan, _h2_contract(_if))
+    assert len(d) == 1 and d[0][2][0][0] == "selectScheduleStrategyList"
+
+
+def test_h2_verify_only_variant_detected_and_reconciled():
+    """变体仅在 verify_commands 出现 → 检出且自愈把 verify 归一到契约名（考卷同源）。"""
+    _if, owner = _h2_owner("实现告警服务接口",
+                           verify=["grep -q selectAlarmScheduleStrategyList "
+                                   "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/"
+                                   "IAlarmService.java"])
+    plan = TaskPlan(subtasks=[owner], shared_contract={})
+    assert len(detect_contract_signature_divergences(plan, _h2_contract(_if))) == 1
+    reconcile_contract_method_names(plan, _h2_contract(_if))
+    assert "selectScheduleStrategyList" in owner.harness.verify_commands[0]
+    assert "selectAlarmScheduleStrategyList" not in owner.harness.verify_commands[0]
+
+
+def test_h2_contract_name_in_ac_counts_as_consistent():
+    """一致性判定对称扩展：契约名逐字出现在 AC（desc 沉默）= 一致，零误报。"""
+    _if, owner = _h2_owner("实现告警服务接口",
+                           ac=["selectScheduleStrategyList 方法实现并编译通过"])
+    plan = TaskPlan(subtasks=[owner], shared_contract={})
+    assert detect_contract_signature_divergences(plan, _h2_contract(_if)) == []
+
+
+def test_h2_silent_all_faces_not_flagged():
+    """三面全沉默（无方法名）→ 不触发（保守判据不变）。"""
+    _if, owner = _h2_owner("实现告警服务接口", ac=["接口编译通过"])
+    plan = TaskPlan(subtasks=[owner], shared_contract={})
+    assert detect_contract_signature_divergences(plan, _h2_contract(_if)) == []
+
+
+def test_h2_desc_variant_not_masked_by_ac_contract_name():
+    """★复核 MED 整改锁（两面矛盾）★ desc 用变体 + AC 恰用契约名 → 必须检出（逐面独立判据；
+    合并语料会被 AC 的契约名掩蔽=比治前 desc-only 还弱的真退化）。"""
+    _if, owner = _h2_owner("实现 selectAlarmScheduleStrategyList 方法",
+                           ac=["selectScheduleStrategyList 实现并编译通过"])
+    plan = TaskPlan(subtasks=[owner], shared_contract={})
+    d = detect_contract_signature_divergences(plan, _h2_contract(_if))
+    assert len(d) == 1, "desc 面变体绝不被 AC 面的契约名豁免掩蔽"
+    assert d[0][2][0][1] == ["selectAlarmScheduleStrategyList"]

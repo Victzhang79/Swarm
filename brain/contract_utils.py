@@ -2133,10 +2133,9 @@ def reconcile_contract_method_names(plan, shared_contract) -> dict[str, list]:
     范式）；故把 description 里判定的分叉变体【广播】到 desc + acceptance_criteria +
     harness.verify_commands 三面词边界替换。
 
-    ★hunter F3 已知盲区★：变体检测源=owner description（与 C2 闸 detect 同判据源，validate/
-    reconcile 对称）。仅在 AC/verify 里【独有】、description 从未出现的分叉变体不在本 pass 覆盖
-    ——C2 闸与本自愈对此【对称失明】（不存在"本可自愈却只有 C2 发现"的错位），是 C2 体系既有
-    盲区，登记 future 治理（扩展检测面会改 C2 validate 误伤边界，超本次 blast radius）。
+    ★hunter F3 盲区已治（H-2，round67j）★：检测源 detect_contract_signature_divergences 的
+    语料已扩到 desc+AC+verify_commands【逐面独立判据】——仅在 AC/verify 独有的分叉变体现已
+    可检可愈（validate/reconcile 仍同判据源对称）。本段历史盲区描述作废，留此注记防误判复发。
 
     零误伤：只替换 C2 已判分叉的确切 (契约 c, 描述变体 t) 对（复用
     detect_contract_signature_divergences 单一判据），词边界替换防子串误伤（长变体先替，防
@@ -4929,7 +4928,73 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     return bumped
 
 
-def deconflict_cross_module_creates(plan: TaskPlan) -> int:
+def _strip_file_plan_create_entries(
+        file_plan: list | None, removed_path_to_owner: dict[str, str]) -> int:
+    """H-1（round67j 体检 TOP1·round67h CVB 同构 sibling 捞净）：剥离子任务 create 副本后
+    【联动清理 file_plan 同串条目】，否则被剥路径的 file_plan create 条目无 owner → R40-1 判孤儿
+    REJECT → PLAN 重试孤儿挂靠复活副本 → 与 round67h 完全同构的 st-churn 环（离线铁证：
+    #101/层③ 契约权威剥离 + file_plan 双条目场景，resolve→validate_file_plan_ownership 直接复现）。
+
+    处置=【删除】被剥路径的 create 条目（区别于 CVB 的 relocate——副本的 owner 条目已在
+    file_plan，删副本即归一；绝不触碰 owner 侧/modify 条目）；其它条目 depends_on 引用被删
+    路径 → 改指 owner 落点（照 deconflict_file_plan_same_name_creates 的 resync，否则陈旧边
+    被批拆静默丢弃）。bare-str 条目兼容（str 本身即 path）。返回删除条目数（0=无事发生，
+    调用方以此判定是否需要把就地变更的 file_plan 回写 state——round67h R1 CRITICAL 同款教训：
+    就地 mutate 不持久化会在 checkpoint 恢复语义下回退）。
+    """
+    if not removed_path_to_owner:
+        return 0
+    if not file_plan:
+        # ★复核 CRITICAL 配套（降级可观测）★：剥离真的发生了、却没有 file_plan 可联动——调用方
+        # 没传/传空 = H-1 防环保护在该调用点静默失效（若被剥路径恰在 state 的 file_plan 里，
+        # R40-1 孤儿→挂靠复活环仍会发生）。必须至少一次 WARNING，绝不 dead-silent。
+        logger.warning(
+            "[DECONFLICT-FILEPLAN] H-1 剥离发生(%d 路径)但调用方未提供 file_plan → 联动清理"
+            "跳过（若被剥路径在 file_plan 中，R40-1 孤儿复活环保护在此调用点失效）",
+            len(removed_path_to_owner))
+        return 0
+    removed_n = 0
+    kept: list = []
+    for e in file_plan:
+        if isinstance(e, dict):
+            _p = _norm_scope_path(str(e.get("path") or ""))
+            _act = str(e.get("action") or "create")
+        else:
+            _p = _norm_scope_path(str(e))
+            _act = "create"      # bare-str 条目无 action 字段，视作 create（保守：确在剥除集才删）
+        if _act == "create" and _p in removed_path_to_owner:
+            removed_n += 1
+            # ★复核 LOW：bare-str 条目删除单独留痕★——bare-str 无 action 字段（schema 退化形态），
+            # 视作 create 删除；若其真实意图是 modify，删除=该文件从计划消失（round67 P5 静默
+            # 瘦身同族），故与 dict-create 删除分开可审计。
+            logger.info(
+                "[DECONFLICT-FILEPLAN] H-1 剥离联动：删除 file_plan 孤儿 create 条目%s %s"
+                "（owner=%s；防 R40-1 孤儿→挂靠复活环）",
+                "(bare-str 无 action 字段,按 create 处理)" if not isinstance(e, dict) else "",
+                _p, removed_path_to_owner[_p])
+            continue
+        kept.append(e)
+    if removed_n:
+        file_plan[:] = kept
+        for e in file_plan:      # depends_on resync：引用被删路径 → 改指 owner（去重）
+            if not isinstance(e, dict) or not e.get("depends_on"):
+                continue
+            _new: list = []
+            _chg = False
+            for d in (e.get("depends_on") or []):
+                _own = removed_path_to_owner.get(_norm_scope_path(str(d)))
+                if _own:
+                    _chg = True
+                    if _own not in _new:
+                        _new.append(_own)
+                elif d not in _new:
+                    _new.append(d)
+            if _chg:
+                e["depends_on"] = _new
+    return removed_n
+
+
+def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = None) -> int:
     """DR-09-F1(#101) part(1)：同一 FQN 被多子任务在【不同物理模块】各自 create 时的确定性归一。
 
     round66/65e14 死因：st-6/16/18 在 ruoyi-alarm 正确 create AlarmTemplate/AlarmNotifyUser/
@@ -4985,6 +5050,7 @@ def deconflict_cross_module_creates(plan: TaskPlan) -> int:
         return False
 
     changed = 0
+    _removed_to_owner: dict[str, str] = {}   # H-1：被剥路径→owner 落点（file_plan 联动清理用）
     for fqn, mods in fqn_index.items():
         if len(mods) < 2:
             continue
@@ -5025,14 +5091,20 @@ def deconflict_cross_module_creates(plan: TaskPlan) -> int:
                     if owner_id not in deps:
                         st.depends_on = deps + [owner_id]
                 changed += 1
+                if owner_file:
+                    _removed_to_owner[nf] = _norm_scope_path(owner_file)
                 logger.info(
                     "[DECONFLICT-XMOD] DR-09-F1(#101) 同 FQN %s 跨模块重复 create：契约 owner 模块=%s"
                     "（子任务 %s）；从子任务 %s 剥除 %s（改 readable+依赖 owner）",
                     fqn, auth, owner_id, sid, f)
+    # H-1：file_plan 联动清理（被剥路径条目留在 file_plan=R40-1 孤儿→挂靠复活环，round67h 同构）
+    if _removed_to_owner:
+        _strip_file_plan_create_entries(file_plan, _removed_to_owner)
     return changed
 
 
-def contract_owner_ledger_block(contract: dict | None) -> str:
+def contract_owner_ledger_block(
+        contract: dict | None, tech_design_file_plan: list | None = None) -> str:
     """R67F-T3（层②·fan-out 前硬预算禁写清单）：从 shared_contract 提取已认领符号的【唯一 owner
     落点】，拼成分批 prompt 的硬约束禁写块——令每批 LLM 在【拆之前】就知道哪些类已有指定归属，
     从源头杜绝在别包重复 create 同名类（round67f 死因的预防层，与层③消解/层②熔断纵深互补）。
@@ -5042,14 +5114,19 @@ def contract_owner_ledger_block(contract: dict | None) -> str:
     G1 ③b 打回 → 全量重拆 renumber 重犯。本块把契约的 defined_in 权威【前置广播】给每一批：
     "这些类已有唯一 owner，你若要用就 readable 引用其 FQN，【严禁】在别的包/模块重新 create 同名类"。
 
-    栈中立：仅收 classpath_fqn_key 非 None（JVM 类路径命名空间）的 defined_in——同名异包冲突是
-    JVM simple-name bean 命名空间特有问题（Spring/MyBatis），Go/Py/TS 同名跨包合法故天然不入清单。
-    契约无 JVM 认领符号 → 返回空串（一字不加，不污染非 JVM 栈 prompt）。条目按 basename 去重排序、
-    上限 60 条防 prompt 膨胀（超出静默截断=保守，宁少列不误导）。
+    ★round67i 扩：并入 tech_design_file_plan 唯一 create 落点（契约的补集）★——round67i 铁证：契约不
+    声明实现细节类（AlarmCallbackController 非接口面），但 tech_design 文件级设计有其权威落点；下游 batch
+    各批不可见 → 又在别包发明副本（alarminterface/controller/）→ 同名异包累积 ③b。tech_design 落点广播给
+    每批 = 从源头约束 batch 别背离设计落点（Category A 预防层，与层② 确定性归位纵深互补）。契约与 tech_design
+    对同一 basename 冲突时以【契约】为准（更权威、显式 defined_in）；tech_design 自身歧义（同名两落点）
+    不入清单（避免误导 batch）。
+
+    栈中立：仅收 classpath_fqn_key 非 None（JVM 类路径命名空间）——同名异包冲突是 JVM simple-name bean
+    命名空间特有问题（Spring/MyBatis），Go/Py/TS 同名跨包合法故天然不入清单。无 JVM 认领符号 → 返回空串
+    （一字不加，不污染非 JVM 栈 prompt）。条目按 basename 去重排序、上限 60 条防 prompt 膨胀。
     """
-    interfaces = ((contract or {}).get("interfaces") or [])
-    seen: dict[str, str] = {}       # basename -> owner 展示路径（首见为准，契约内首个权威）
-    for e in interfaces:
+    seen: dict[str, str] = {}       # basename -> owner 展示路径（契约首见为准）
+    for e in ((contract or {}).get("interfaces") or []):
         if not isinstance(e, dict):
             continue
         defined_in = str(e.get("defined_in") or "").strip()
@@ -5062,10 +5139,42 @@ def contract_owner_ledger_block(contract: dict | None) -> str:
         base = fqn.rsplit("/", 1)[-1]        # 保原样大小写用于展示
         if base.lower() not in {b.lower() for b in seen}:
             seen[base] = _norm_scope_path(defined_in)
-    if not seen:
+    # ★round67i：并入 tech_design_file_plan 唯一 create 权威（契约的补集；契约已声明的不覆盖）★
+    # ★对抗复核 Hunter HIGH 整改：契约条目与 tech_design 条目【分池预算】★——原先合池后
+    # `sorted(...)[:60]` 纯字母序截断：tech_design 语料（真实 RuoYi 设计 ~218 文件）会把字母序
+    # 靠后的【契约 owner】（round67f 久经战验的主信号）静默挤出台账 = 预防机制静默退化且零信号。
+    # 整改：契约池先占预算（窄策展集，几乎不会满）、tech_design 池只填剩余；任一池发生截断
+    # 必打 WARNING（丢弃数可观测，杜绝静默覆盖缺损）。
+    _td_auth, _td_ambiguous = _tech_design_authority(tech_design_file_plan)
+    _contract_bases = {b.lower() for b in seen}
+    _td_rows: dict[str, str] = {}
+    for base_lower, fqn in _td_auth.items():
+        if base_lower in _contract_bases or base_lower in _td_ambiguous:
+            continue                # 契约已声明（契约优先）/ tech_design 自身歧义 → 不入清单
+        # 从 tech_design 条目还原展示路径（找回原始 create 路径，保大小写与模块前缀）
+        _disp = None
+        for e in (tech_design_file_plan or []):
+            if not isinstance(e, dict) or str(e.get("action") or "create") != "create":
+                continue
+            _k = classpath_fqn_key(str(e.get("path") or ""))
+            if _k and _k[1] == fqn:
+                _disp = _norm_scope_path(str(e.get("path") or ""))
+                break
+        if _disp:
+            _td_rows[fqn.rsplit("/", 1)[-1]] = _disp
+    if not seen and not _td_rows:
         return ""
-    rows = "\n".join(f"  - {b} → 唯一 owner：{p}"
-                     for b, p in sorted(seen.items())[:60])
+    _cap = 60
+    _picked = sorted(seen.items())[:_cap]                       # 契约池先占（保底不被逐出）
+    _td_budget = max(0, _cap - len(_picked))
+    _picked += sorted(_td_rows.items())[:_td_budget]
+    _dropped = max(0, len(seen) - _cap) + max(0, len(_td_rows) - _td_budget)
+    if _dropped:
+        logger.warning(
+            "[OWNER-LEDGER] 禁写台账超预算截断：丢弃 %d 条（契约 %d + tech_design %d 入册 %d/上限 %d）"
+            "——被丢弃类不受台账预防保护，仅靠 G1 ③b/层② 消解兜底",
+            _dropped, len(seen), len(_td_rows), len(_picked), _cap)
+    rows = "\n".join(f"  - {b} → 唯一 owner：{p}" for b, p in _picked)
     return (
         "\n\n【硬约束-P8 已认领类唯一 owner（禁止同名异包重复创建）】以下类已由契约指定【唯一 owner "
         "落点】。本批若需使用它们，请在 scope.readable 引用其 owner 路径（import 该 FQN），"
@@ -5102,7 +5211,44 @@ def _contract_owner_authority(
     return owner_fqn_by_base, ambiguous_base
 
 
-def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
+def _tech_design_authority(
+        tech_design_file_plan: list | None) -> tuple[dict[str, str], set[str]]:
+    """tech_design_file_plan 唯一 create 权威：simple-name(lower) → 唯一 create 落点 FQN；同名两落点=歧义入 set。
+
+    ★round67i 新维（用户拍板"流程/规范约束大模型产出"·治法同契约权威范式）★——round67i 铁证
+    （task=8461797b FAILED@PLAN，录像 llm-90771.jsonl 逐 node 定位）：tech_design 文件级设计**权威**
+    地把 `AlarmCallbackController` 落在 `alarm/controller/`（seq18），但下游 plan_batch/elaborate 各批
+    独立 LLM 调用【自由发明】create 包路径，把同一逻辑类又放到 `alarminterface/controller/`（背离设计）
+    → 同名异包 create 累积 → G1 ③b REJECT 无限重犯。契约不声明这类实现细节类（非接口面）→ 契约权威
+    落空。但 tech_design_file_plan 是【冻结的文件级设计声明】（218 文件覆盖多数类），恰是"这个类的
+    权威落点在哪"的显式 LLM 声明——与契约 defined_in 同材质（显式声明而非结构猜测，故不复活 round67c
+    裸 basename 挑边）。
+
+    仅取 action=create 条目（modify=base 既有类，属 create-vs-base ③f 领域，不做此维权威）。同一
+    simple-name 在 tech_design 出现 ≥2 个不同 create 落点 → tech_design 自身歧义（上游 tech_design bug）
+    → 入 ambiguous 集，fail-closed 不用作权威。栈中立（classpath_fqn_key 仅 JVM 类路径非 None）。
+    """
+    auth_fqn_by_base: dict[str, str] = {}
+    ambiguous_base: set[str] = set()
+    for e in (tech_design_file_plan or []):
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("action") or "create") != "create":
+            continue        # modify=base 既有类，属 ③f/CVB 领域，不做 create 权威
+        key = classpath_fqn_key(str(e.get("path") or ""))
+        if not key:
+            continue        # 非 JVM 类路径天然豁免（栈中立）
+        _m, fqn = key
+        base = fqn.rsplit("/", 1)[-1].lower()
+        prev = auth_fqn_by_base.get(base)
+        if prev is not None and prev != fqn:
+            ambiguous_base.add(base)   # tech_design 自身给同 simple-name 两个落点 → 无唯一权威
+        auth_fqn_by_base[base] = fqn
+    return auth_fqn_by_base, ambiguous_base
+
+
+def deconflict_same_name_cross_package_creates(
+        plan: TaskPlan, tech_design_file_plan: list | None = None) -> int:
     """R67F-T1（层③）：同名(simple name)JVM 类被多子任务在【不同包】(异 FQN)各自 create 时，
     契约 defined_in 有唯一权威 owner → 确定性归一（保 owner 落点、其余异包副本剥除+改 readable+依赖 owner）。
 
@@ -5115,6 +5261,12 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
     判据，★绝不裸 basename 挑边——round67c 血泪：全局 basename 佐证会误合并合法通用名新类静默腐化★）
     确定性消解【有权威】的违例；无权威者（纯常量类等不在契约 interfaces）仍留 G1 ③b REJECT
     （fail-closed，绝不静默挑边），配合层② 去 st-id 规范化签名熔断止血。
+
+    ★round67i 扩：契约权威落空时【后备】tech_design_file_plan 唯一 create 权威（_tech_design_authority）★
+    ——契约不声明实现细节类（AlarmCallbackController 非接口面）但 tech_design 文件级设计有其权威落点，
+    下游 batch 发明的分叉包副本（alarminterface/controller/）归位到 tech_design 落点。同材质（显式设计
+    声明，非结构猜测→不复活 round67c）；契约有权威时不动（纯加治契约漏声明维），契约歧义绝不用 tech_design
+    翻案。tech_design 自身歧义/权威落点无人创建 → fail-closed 留 ③b。
 
     与 ③(#101) 互补且互斥：③ 判【同 FQN 跨物理模块】(相同包不同根)，本 pass 判【异 FQN 同
     simple-name 跨包】——判据（FQN 相等 vs 仅 basename 相等）不重叠。★必须【在 ③ 之后】跑★：③
@@ -5144,6 +5296,11 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
     # dtos section，只读 interfaces 会漏权威→同名异包无从消解→LLM 无限重犯★）
     owner_fqn_by_base, ambiguous_base = _contract_owner_authority(
         getattr(plan, "shared_contract", None))
+    # ★round67i 新维：tech_design_file_plan 唯一 create 权威（契约【后备】）★——契约不声明实现细节类
+    # （AlarmCallbackController 非接口面）→ 契约权威落空；tech_design 文件级设计恰有其权威落点。作契约
+    # 后备（契约有权威时不动，纯加治【契约漏声明但 tech_design 有落点】的 Category A）。契约歧义的 base
+    # 绝不用 tech_design 翻案（契约自身声明两处=强歧义信号，fail-closed 优先）。
+    _td_auth_by_base, _td_ambiguous = _tech_design_authority(tech_design_file_plan)
     by_id = {getattr(st, "id", None): st for st in subtasks}
 
     def _reaches_dep(start, target) -> bool:
@@ -5162,14 +5319,40 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
         return False
 
     changed = 0
+    _removed_to_owner: dict[str, str] = {}   # H-1：被剥路径→owner 落点（file_plan 联动清理用）
     for base, fqns in base_index.items():
         if len(fqns) < 2:
             continue          # 单一 FQN（同 FQN 跨模块由 ③ deconflict_cross_module_creates 处理）
         if base in ambiguous_base:
-            continue          # 契约自身歧义 → fail-closed 留 ③b REJECT
+            continue          # 契约自身歧义 → fail-closed 留 ③b REJECT（tech_design 亦绝不翻案）
         owner_fqn = owner_fqn_by_base.get(base)
+        _authority = "契约"
         if not owner_fqn or owner_fqn not in fqns:
-            continue          # 无契约权威 / 权威 owner 无人创建 → fail-closed 留 ③b REJECT（绝不静默挑边）
+            # 契约无权威/owner 无人建 → 后备 tech_design_file_plan 唯一 create 权威（round67i Category A）。
+            # tech_design 自身歧义（同名两落点）→ 不用（fail-closed）；权威落点须【恰在】创建者集合中
+            # （否则无从确定保哪个），否则留 ③b REJECT（绝不裸挑边=round67c 纪律）。
+            if base in _td_ambiguous:
+                continue
+            _td_owner = _td_auth_by_base.get(base)
+            if not _td_owner or _td_owner not in fqns:
+                continue      # 无任何权威 / 权威落点无人创建 → fail-closed 留 ③b REJECT
+            # ★对抗复核 HIGH 整改（真实函数复现）：附加【同物理构建模块】约束★——tech_design 未经
+            # 语义策展（218 文件宽语料 vs 契约窄集合），若 batch 在【别的模块】发明的同名类是合法异职责
+            # 新类（alarm/domain/Result 权威 + notify/vo/Result 合法新类），裸按 tech_design 唯一性归位
+            # 会静默剥除合法新类改指错类 = round67c 腐化换语料源复现。判据取【结构性】约束而非通用名
+            # denylist（denylist=打地鼠违纪律#5，round67g signal2 撤下同判）：全部分叉创建者（含权威侧）
+            # 须同属一个物理构建模块——同模块内同名双 create 在 JVM classpath 下必然 bean 冲突非法、且
+            # tech_design 对该模块声明了唯一设计落点 → 归位安全；跨模块 → fail-closed 留 ③b（诚实
+            # REJECT 优于静默腐化）。诚实代价：跨模块分叉（round67i AlarmCallbackController 真实案例
+            # ruoyi-alarm vs ruoyi-alarm-interface）本 pass 不治，交层①台账预防+层③熔断止血。
+            _mods: set = set()
+            for _entries2 in fqns.values():
+                for _st2, _f2 in _entries2:
+                    _k2 = classpath_fqn_key(_f2)
+                    _mods.add(_k2[0] if _k2 else None)
+            if len(_mods) != 1 or None in _mods:
+                continue      # 跨物理模块 / 模块不可判 → fail-closed 留 ③b REJECT
+            owner_fqn, _authority = _td_owner, "tech_design"
         owner_st, owner_file = fqns[owner_fqn][0]
         owner_id = getattr(owner_st, "id", None)
         for fqn, entries in fqns.items():
@@ -5209,10 +5392,20 @@ def deconflict_same_name_cross_package_creates(plan: TaskPlan) -> int:
                     if owner_id not in deps:
                         st.depends_on = deps + [owner_id]
                 changed += 1
-                logger.info(
-                    "[DECONFLICT-SAMENAME] R67F-T1 同名 %s 跨包异 FQN 重复 create：契约 owner FQN=%s"
+                if owner_file:
+                    _removed_to_owner[nf] = _norm_scope_path(owner_file)
+                # ★Hunter MEDIUM 整改：tech_design 后备权威（round67i 新启发式）soak 期升 WARNING★
+                # ——与久经战验的契约归位（INFO）分级，独立可审计（grep WARNING [DECONFLICT-SAMENAME]
+                # tech_design 即得全部新路径归位），若未来定位到误合并可快速圈定本路径开火面。
+                _log = logger.warning if _authority == "tech_design" else logger.info
+                _log(
+                    "[DECONFLICT-SAMENAME] R67F-T1 同名 %s 跨包异 FQN 重复 create：%s owner FQN=%s"
                     "（子任务 %s）；从子任务 %s 剥除 %s（异包副本改 readable+依赖 owner）",
-                    base, owner_fqn, owner_id, sid, f)
+                    base, _authority, owner_fqn, owner_id, sid, f)
+    # H-1：file_plan 联动清理（契约权威路径的被剥副本若在 file_plan=R40-1 孤儿→挂靠复活环；
+    # td-fallback 路径已证不可能触发——td 唯一权威与 file_plan 双条目互斥，此处 no-op）
+    if _removed_to_owner:
+        _strip_file_plan_create_entries(tech_design_file_plan, _removed_to_owner)
     return changed
 
 
@@ -5600,12 +5793,17 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
 
     plan_validator 校验的"每个文件单一写者 + 无悬空依赖"不变量，由本函数确定性满足。返回各 pass 改动计数。
     """
-    return {
+    _fp_len_before = len(file_plan or [])   # H-1：剥离联动删 file_plan 条目的回写判定基准
+    out = {
         # #101 先跑：剥掉契约有权威 owner 的跨模块重复 create（同 FQN），后续 pass 只看干净 scope。
-        "xmod_creates_deconflicted": deconflict_cross_module_creates(plan),
+        # H-1：传 file_plan——剥离联动删孤儿条目（防 R40-1 孤儿→挂靠复活环，round67h 同构 sibling）。
+        "xmod_creates_deconflicted": deconflict_cross_module_creates(plan, file_plan=file_plan),
         # R67F-T1（层③）紧随 ③ 之后：同名异包（异 FQN 同 simple-name）有契约权威者确定性消解。
         # ★必须在 ③ 之后★：③ 先塌缩同 FQN 跨模块副本 → 本 pass 面对的 owner FQN 恰有唯一创建者。
-        "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(plan),
+        # ★round67i：传 tech_design_file_plan 作【契约后备】权威——治下游 batch 发明分叉包路径背离
+        # tech_design 设计落点（Category A：AlarmCallbackController 有 tech_design 权威、契约漏声明）。★
+        "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(
+            plan, tech_design_file_plan=file_plan),
         # create-vs-base shadow 归位（两互斥【显式权威】信号，clear G1 ③f）：LLM 把 base 既有实体当新类
         # 落进子任务 create_files 幻觉异路径 → 归位到 base 真身（改 modify）。信号1=file_plan 该落点 action=
         # modify（SysUser 型）；信号3=契约 defined_in 显式声明在 base 真身（SysMenu 型·治法A）。两信号皆不成
@@ -5618,6 +5816,11 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),
         "difficulty_bumped": bump_scaffold_difficulty(plan),
     }
+    # H-1：file_plan 被剥离联动删了条目 → 计数暴露给调用方（elaborate/revision 以此判定把就地
+    # 变更的 file_plan 回写 state——round67h R1 CRITICAL 同款教训：就地 mutate 不回写会在
+    # checkpoint 恢复语义下回退，环复现）。
+    out["file_plan_entries_stripped"] = max(0, _fp_len_before - len(file_plan or []))
+    return out
 
 
 # 6.9-HF9：dedupe_module_scaffolds 机器追加段的固定定界符（签名剥离锚点，勿改措辞）

@@ -50,6 +50,7 @@ from swarm.worker.l1_parse import (  # noqa: F401  (re-export，供既有调用�
     parse_missing_artifacts,
     parse_missing_classified_artifacts,
     parse_missing_packages,
+    parse_missing_symbol_classes,
     parse_missing_versions,
     rewrite_dependency_version,
     rewrite_jvm_namespace,
@@ -1293,6 +1294,64 @@ def _build_blocked_on_unbuilt_internal(
         if (out or "").strip():
             return set()  # 该内部包已在树里却报 does not exist → 真错(非未就绪)，照常 FAIL
     return internal_pkgs
+
+
+def _build_blocked_on_unbuilt_internal_classes(
+    project_path: str, build_output: str, timeout: int
+) -> set[str]:
+    """H-3a（round67j 法证A 横切病灶·_build_blocked_on_unbuilt_internal 的 sibling）：
+    构建失败是否【全因引用了包已在树里、但类本身尚未建出的项目内部类】。
+
+    死因实锤（round67 task 64cb44ed，L1310）：st-50-1 的 GoogleAuthController 引
+    `ISysGoogleAuthService`——其包 `com.ruoyi.system.service` 已存在（有别的类）、类正是
+    st-8-1 的 create 目标还没落地 → javac 报「cannot find symbol: class C / location:
+    package P」而非「package does not exist」→ 走不进 ②（unbuilt_internal 判"包已在树=
+    真错 FAIL"）→ 被判 hard fail 连烧修复轮后弃修；同型整包缺失的 st-48 却判 BLOCKED 退避
+    ——同一"生产者未落地"两种结局。本函数统一口径：类级缺失同判 BLOCKED（internal_pkg_not_built
+    同分类同消费链），待生产者 merge 落地由 transient 重试自然消解。
+
+    判据（保守，宁可不标也不误标，与 ② 同律）：所有「cannot find symbol: class C /
+    location: package P」都满足
+      ① P 是【项目自有 groupId 前缀】（内部包，非第三方/JDK）；且
+      ② 当前项目树里【无任何 C.java 声明 package P】（=类确实还没被任何子任务建出；
+         若树里已有 → 真编译错如 classpath/拼写问题，照常 FAIL）。
+    只要有一个缺符号是第三方、或类已在树里 → 返回空集，照常 FAIL。返回被阻断的
+    【包集合】（复用 blocked_on_packages 语义，brain 反查生产者按包归属零改动）。"""
+    pairs = parse_missing_symbol_classes(build_output)
+    if not pairs:
+        return set()
+    own = _project_own_packages(project_path, timeout)
+    if not own:
+        return set()
+    blocked_pkgs: set[str] = set()
+    for cls, pkg in pairs:
+        if any(pkg == p.rstrip(".") or pkg.startswith(p) for p in _DEP_REPAIR_SKIP_PREFIXES):
+            return set()  # JDK/servlet 命名空间 → 非生产者未落地
+        if not any(pkg == g or pkg.startswith(g + ".") for g in own):
+            return set()  # 第三方缺符号 → 交 dep-repair，照常 FAIL
+        # 类是否已在树里——已在 = 真编译错（classpath/模块序），照常 FAIL。
+        # ★复核 MEDIUM 整改：内容级声明判，非文件名判★——次级（非 public）top-level 类合法
+        # 共居别的 .java 文件（class C{} 写在 Foo.java 里），--include='{cls}.java' 文件名判
+        # 假阴 → 误 BLOCKED 死等永不独立建 C.java 的幽灵生产者（round19 #10 型）。改为两步：
+        # 先取声明 package P 的文件集，再在其中按【类声明】内容匹配（与 sibling 包级判据同为
+        # 内容判，盲区对齐消除）。
+        cmd_pkg = (
+            f"grep -rlE '^[[:space:]]*package[[:space:]]+{re.escape(pkg)}[[:space:]]*;' "
+            f"--include='*.java' . 2>/dev/null | head -50"
+        )
+        _ec, pkg_files, _e = _run_check_split(cmd_pkg, project_path, timeout=min(timeout, 20))
+        _flist = [f for f in (pkg_files or "").strip().splitlines() if f.strip()]
+        if _flist:
+            _quoted = " ".join(shlex.quote(f) for f in _flist[:50])  # R3 MED：跟随本文件 shlex 惯例
+            cmd_cls = (
+                f"grep -lE '\\b(class|interface|enum|record)[[:space:]]+{re.escape(cls)}\\b' "
+                f"{_quoted} 2>/dev/null | head -1"
+            )
+            _ec2, out2, _e2 = _run_check_split(cmd_cls, project_path, timeout=min(timeout, 20))
+            if (out2 or "").strip():
+                return set()  # 类声明已在树（含共居次级类）→ 真错，照常 FAIL
+        blocked_pkgs.add(pkg)
+    return blocked_pkgs
 
 
 def _tool_missing(out: str) -> bool:
@@ -4512,6 +4571,20 @@ def run_l1_pipeline(
                 # 消解，不烧本子任务修复轮 / 不误判 capability 换模型 / 不 escalate 清空已成功成果。
                 # 保守判据见 _build_blocked_on_unbuilt_internal（有第三方缺包/包已在树里→照常 FAIL）。
                 _blocked_pkgs = _build_blocked_on_unbuilt_internal(project_path, b_out, timeout)
+                # H-3a：包级判据未中时再试【类级】——包已在树里但类未建出（cannot find symbol:
+                # class C / location: package P）同属"生产者未落地"，统一 BLOCKED 退避口径
+                # （round67 st-50-1 hard fail vs st-48 BLOCKED 的口径分裂，64cb44ed 实锤）。
+                _blocked_cls: list[str] = []
+                if not _blocked_pkgs:
+                    _blocked_pkgs = _build_blocked_on_unbuilt_internal_classes(
+                        project_path, b_out, timeout)
+                    if _blocked_pkgs:
+                        # ★复核 HIGH 配套★：类级命中必须吐 blocked_on_classes（FQN 点分）——
+                        # 包级 futile 判据（_package_in_baseline）对"包在树类未建出"恒真失效，
+                        # brain 侧 _blocked_pkg_unrecoverable 需类级树判据防臆造类烧满阶梯。
+                        _blocked_cls = sorted({
+                            f"{p}.{c}" for c, p in parse_missing_symbol_classes(b_out)
+                            if p in _blocked_pkgs})
                 if _blocked_pkgs:
                     details["l1_2_1_build_ok"] = None
                     details["build_blocked"] = build_cmd
@@ -4520,6 +4593,8 @@ def run_l1_pipeline(
                     # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
                     # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
                     details["blocked_on_packages"] = sorted(_blocked_pkgs)
+                    if _blocked_cls:
+                        details["blocked_on_classes"] = _blocked_cls  # H-3a 类级 futile 判据用
                     logger.warning(
                         "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
                         "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],

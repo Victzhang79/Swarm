@@ -57,6 +57,33 @@ _MISSING_PKG_RE = re.compile(
     r"([^\s\[]+\.java):\[\d+,\d+\]\s*package\s+([\w.]+)\s+does not exist"
 )
 
+# H-3a（round67j 法证A 横切病灶）：javac「cannot find symbol: class C / location: package P」
+# 三行组——包 P 已在树里（有别的类）但类 C 尚未被生产者子任务建出的形态。与 _MISSING_PKG_RE
+# 的「package does not exist」（整包缺失）互补：round67 task 64cb44ed 实锤 st-50-1 引
+# ISysGoogleAuthService（st-8-1 的 create 目标，包已存在类未建出）被判 hard fail 弃修，
+# 而同型整包缺失的 st-48 判 BLOCKED 退避——同一"生产者未落地"两种结局，口径必须统一。
+# 只认 location: package 形态（location: class X = 成员缺失，属真编译错不收）。
+_MISSING_SYMBOL_CLASS_RE = re.compile(
+    r"cannot find symbol[^\n]*\n"
+    r"[^\n]*?symbol:\s*(?:class|interface|enum)\s+(\w+)\s*\n"
+    r"[^\n]*?location:\s*package\s+([\w.]+)"
+)
+
+
+def parse_missing_symbol_classes(build_output: str) -> list[tuple[str, str]]:
+    """从编译输出解析 (缺失类名 C, 其声明包 P) 对——「cannot find symbol: class C /
+    location: package P」形态（包在树里、类未建出）。去重保序。纯函数、可单测。"""
+    if not build_output:
+        return []
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for m in _MISSING_SYMBOL_CLASS_RE.finditer(build_output):
+        key = (m.group(1), m.group(2))
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
 
 def parse_missing_packages(build_output: str) -> list[tuple[str, str]]:
     """从编译输出解析 (出错文件, 不存在的包) 对，去重保序。纯函数、可单测。"""

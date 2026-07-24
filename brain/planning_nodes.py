@@ -3083,12 +3083,13 @@ async def elaborate(state: BrainState) -> dict:
         # 就地变异侥幸存活——LangGraph 只保证【返回键】进 state，checkpoint 恢复语义下
         # 未回写的变异不可依赖，此处一并治了。）
         out["plan"] = plan_obj
-    if _resolve.get("cvb_modify_shadow_relocated"):
+    if _resolve.get("cvb_modify_shadow_relocated") or _resolve.get("file_plan_entries_stripped"):
         # ★round67h CRITICAL（对抗双复核 reviewer+hunter 独立同判）★：CVB 归位联动改写了
         # tech_design_file_plan（shadow 路径→base 真身），必须随【返回键】回写进 state——与上方
         # out["plan"] 同一类：LangGraph 只保证返回键进 state，就地 mutate 在 checkpoint 恢复语义下
         # 不可依赖。漏回写→ELABORATE→VALIDATE 跨 checkpoint 边界时 tech_design_file_plan 回退到
         # 旧 shadow→R40-1 判孤儿→round67h 想根治的成环原样复现（reviewer 直调 elaborate 实测坐实）。
+        # H-1 扩：#101/层③ 剥离联动删了 file_plan 孤儿条目（file_plan_entries_stripped>0）同律回写。
         out["tech_design_file_plan"] = _fp_for_resolve
     if _t4_pinned:
         # dispatch.py:528 读 state["shared_contract"] 优先于 plan.shared_contract——

@@ -761,20 +761,36 @@ def detect_contract_signature_divergences(plan, shared_contract):
         if owner is None:
             continue        # 无 owner 子任务：另有 file_plan/ownership 闸覆盖
         desc = getattr(owner, "description", "") or ""
+        # ★H-2（round67j 体检 TOP3=修复核验 Fix5 缺口，两路独立收敛）★：检测语料从 desc 扩到
+        # 【desc+AC+verify_commands 三面】——变体【仅】在 AC/verify 出现时原先不检不愈不打回，
+        # 矛盾考卷静默流向 worker（L1 按 AC/verify 验长名、接口按契约落短名→永不可赢空转）。
+        # 本函数是闸(validate)与自愈(reconcile 三面替换)的共用真值源，扩此一处三面自动同步。
+        # ★复核 MED 整改：三面【逐面独立】判据，绝不合并成一袋 token★——合并语料下
+        # "desc 用变体+AC 恰用契约名"会被【别的面】的契约名豁免掩蔽（比治前 desc-only 检测
+        # 还弱=真退化）。逐面判：某面含契约名（逐字词边界）→ 该面一致豁免；某面无契约名且
+        # 含近变体 → 该面贡献分叉。治前行为=desc 单面子集，严格增强无退化。
+        _h2_ac = "\n".join(str(a) for a in (getattr(owner, "acceptance_criteria", None) or []))
+        _h2_hh = getattr(owner, "harness", None)
+        _h2_vc = ("\n".join(str(v) for v in (getattr(_h2_hh, "verify_commands", None) or []))
+                  if _h2_hh is not None else "")
+        _faces = [x for x in (desc, _h2_ac, _h2_vc) if x]
         c_methods = re.findall(r"(\w+)\s*\(", sig)
-        desc_tokens = set(re.findall(r"\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b", desc))
+        _face_tokens = [set(re.findall(r"\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b", f))
+                        for f in _faces]
         diverged: list[tuple[str, list[str]]] = []
         for c in c_methods:
             if not c or not c[0].islower():
                 continue    # 只查方法名（小写开头惯例），跳过构造/类型名
-            # 逐字出现用【词边界】匹配，非裸子串——否则 'get' 命中 'target'/'budget' 内部
-            # → 误判"一致"放过真分叉（#112 假阴性）。
-            if c in desc_tokens or re.search(rf"\b{re.escape(c)}\b", desc):
-                continue    # 契约方法在描述里逐字出现 = 一致
-            variants = [t for t in desc_tokens
-                        if t not in c_methods and _is_method_name_variant(t, c)]
-            if variants:
-                diverged.append((c, sorted(variants)))
+            _vset: set[str] = set()
+            for _face, _toks in zip(_faces, _face_tokens):
+                # 逐字出现用【词边界】匹配，非裸子串——否则 'get' 命中 'target'/'budget' 内部
+                # → 误判"一致"放过真分叉（#112 假阴性）。
+                if c in _toks or re.search(rf"\b{re.escape(c)}\b", _face):
+                    continue    # 契约方法在【该面】逐字出现 = 该面一致
+                _vset |= {t for t in _toks
+                          if t not in c_methods and _is_method_name_variant(t, c)}
+            if _vset:
+                diverged.append((c, sorted(_vset)))
         if diverged:
             out.append((owner, e.get("name") or di, diverged))
     return out
