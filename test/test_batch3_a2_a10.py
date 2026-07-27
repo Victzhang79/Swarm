@@ -198,7 +198,7 @@ def test_a3_unparseable_output_not_upstream():
 
 def _run_pipeline_with_test_out(tmp_path, monkeypatch, test_out: str):
     """公共骨架：run_l1_pipeline 跑到 L1.3 test 闸，_run_l1_command 按命令分流。"""
-    import worker.l1_pipeline as _lp
+    import swarm.worker.l1_pipeline as _lp
     from swarm.types import (
         FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskHarness,
     )
@@ -398,7 +398,7 @@ def test_a5_parse_missing_symbol_classes_strips_ansi():
 def test_a5_blocked_evidence_union(tmp_path, monkeypatch):
     """★A5 主治★「缺内部包 P1 + 缺包在树类 P2.C」同现：包级与类级判据都跑，
     blocked_on_packages=并集、blocked_on_classes 不丢 C（治前互斥消费丢类级证据）。"""
-    import worker.l1_pipeline as _lp
+    import swarm.worker.l1_pipeline as _lp
     from swarm.types import (
         FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskHarness,
     )

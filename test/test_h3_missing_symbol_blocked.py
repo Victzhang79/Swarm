@@ -18,8 +18,8 @@ _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-from worker.l1_parse import parse_missing_symbol_classes  # noqa: E402
-from worker.l1_pipeline import _build_blocked_on_unbuilt_internal_classes  # noqa: E402
+from swarm.worker.l1_parse import parse_missing_symbol_classes  # noqa: E402
+from swarm.worker.l1_pipeline import _build_blocked_on_unbuilt_internal_classes  # noqa: E402
 
 # round67 真实形态（Maven [ERROR] 前缀三行组）
 _MVN_OUT = """\
@@ -79,7 +79,7 @@ def _mk_tree(tmp_path, files: dict[str, str]):
 
 
 def _own(monkeypatch, pkgs):
-    import worker.l1_pipeline as _lp
+    import swarm.worker.l1_pipeline as _lp
     monkeypatch.setattr(_lp, "_project_own_packages", lambda *a, **k: set(pkgs))
 
 
