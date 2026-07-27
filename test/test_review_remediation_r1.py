@@ -157,7 +157,9 @@ def test_gitleaks_parse_failure_not_marked_ran(tmp_path, monkeypatch):
     # rc=0 但报告文件不存在 → 读取 OSError → 解析失败
     monkeypatch.setattr(scan, "_run_tool", lambda *a, **k: (0, "", ""))
     out = scan._secret_gitleaks(str(tmp_path), ctx=ctx)
-    assert out == []
+    # D3（worker 审计）：解析失败返回 None（非 []）——非 None 会让 _run_secret_scan
+    # 判"已有结果"短路 trufflehog/内置正则兜底链（密钥类零扫描）。
+    assert out is None
     assert not getattr(ctx, "scanner_ran", False), \
         "报告解析失败必须按未扫处理（fail-closed），不得置 scanner_ran 伪装零发现"
 

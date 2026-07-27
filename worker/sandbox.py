@@ -838,12 +838,17 @@ class SandboxManager:
             d for d in SANDBOX_CLEANABLE_HOME_DIRS
             if d.split("/", 1)[0] not in SANDBOX_PRESERVE_HOME_DIRS
         )
+        # B1（worker 审计 HIGH）：WORKSPACE_CLEANED 标记必须【闩死在 workdir 清理段】——
+        # 旧版 `;` 分隔下 workdir 的 find -exec rm 失败（root 属主残留+非 root envd）时
+        # for/echo 照常执行 → rc=0 且标记在场 → 双判据同时假真 → 脏沙箱回池污染下一
+        # 子任务 L1。现 workdir 段成功才 echo 标记；/tmp 与 $HOME 缓存清理失败可容忍
+        # （非污染主体），置于标记之后 best-effort。
         cmd = (
             f"mkdir -p {workdir} && "
             f"find {workdir} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
+            f"echo WORKSPACE_CLEANED; "
             f"find /tmp -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null; "
-            f'for d in {cache_dirs}; do rm -rf "$HOME/$d" 2>/dev/null; done; '
-            f"echo WORKSPACE_CLEANED"
+            f'for d in {cache_dirs}; do rm -rf "$HOME/$d" 2>/dev/null; done; true'
         )
         try:
             cr = self.run_command(sandbox, cmd, timeout=45, _skip_blacklist=True)

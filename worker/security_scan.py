@@ -261,12 +261,13 @@ def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_Sc
     if rc == -1:
         logger.warning("SAST(python): bandit execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
+        # D1：输出不可解析=工具跑挂（rc≥1 崩溃形态）——不置 _mark_ran，让 fail-closed
+        # 哨兵按"未扫"处理（gitleaks P2-2 同款姿势），杜绝"跑挂伪装扫过且干净"。
         logger.warning("SAST(python): bandit output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     results = data.get("results", []) if isinstance(data, dict) else []
@@ -302,12 +303,12 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     if rc == -1:
         logger.warning("SAST(node): semgrep execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
+        # D1：不可解析=跑挂（如 --config auto 离线拉不到规则）→ 不置位，哨兵按未扫处理
         logger.warning("SAST(node): semgrep output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     results = data.get("results", []) if isinstance(data, dict) else []
@@ -342,12 +343,11 @@ def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanCo
     if rc == -1:
         logger.warning("SAST(go): gosec execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
         logger.warning("SAST(go): gosec output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     issues = data.get("Issues", []) if isinstance(data, dict) else []
@@ -382,9 +382,9 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     if rc == -1:
         logger.warning("SAST(rust): cargo clippy execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
 
     findings: list[SecurityFinding] = []
+    _parsed_any = False  # D1：流式输出无单点解析——至少一行可解析/rc=0 才算"真跑成"
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -394,6 +394,7 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
             continue
         if not isinstance(data, dict):
             continue
+        _parsed_any = True
         reason = data.get("reason", "")
         if reason not in ("compiler-message", "compiler-artifact"):
             continue
@@ -425,6 +426,8 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
                 tool="cargo-clippy",
                 recommendation="",
             ))
+    if rc == 0 or _parsed_any:
+        _mark_ran(ctx)  # D1：rc=0（文档化成功）或输出可解析才置位——跑挂不解除哨兵
     return findings
 
 
@@ -439,20 +442,21 @@ def _sast_java(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     if rc == -1:
         logger.warning("SAST(java): spotbugs execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     # N-11 修复：spotbugs `-xml` 产 XML，原代码用 _safe_json_parse 当 JSON 解析→恒 None→
     # Java diff 永报零发现(静默失效)。改为正确解析 spotbugs XML(BugCollection/BugInstance)。
     if not stdout.strip():
+        # D1：空输出不视为"扫过"（不置 _mark_ran，spotbugs 成功时必有 XML 骨架）
         return []
     try:
         import xml.etree.ElementTree as ET
 
         root = ET.fromstring(stdout)
     except ET.ParseError as exc:
-        # 解析失败显式告警(而非静默吞)——便于诊断"为何 Java 永远零发现"
+        # 解析失败显式告警(而非静默吞)——便于诊断"为何 Java 永远零发现"；
+        # D1：不置 _mark_ran，哨兵按未扫处理
         logger.warning("SAST(java): spotbugs XML 解析失败: %s", exc)
         return []
+    _mark_ran(ctx)  # D1：XML 成功解析后才置位
 
     findings: list[SecurityFinding] = []
     for bug in root.iter("BugInstance"):
@@ -518,12 +522,11 @@ def _dep_python(project_path: str, *, ctx: "_ScanContext | None" = None) -> list
     if rc == -1:
         logger.warning("Dep(python): pip-audit execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
         logger.warning("Dep(python): pip-audit output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     dependencies = data.get("dependencies", []) if isinstance(data, dict) else []
@@ -561,12 +564,11 @@ def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     if rc == -1:
         logger.warning("Dep(node): npm audit execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
         logger.warning("Dep(node): npm audit output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     vulnerabilities = data.get("vulnerabilities", {}) if isinstance(data, dict) else {}
@@ -607,7 +609,7 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
     if rc == -1:
         logger.warning("Dep(go): govulncheck execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
+    _parsed_any = False  # D1：流式输出——至少一行可解析/rc=0 才算"真跑成"
 
     # govulncheck -json 是 JSONL 流。现代格式（golang.org/x/vuln v1+）每行是
     # {"config":..}/{"progress":..}/{"osv":..}/{"finding":{"osv","fixed_version","trace":[..]}}；
@@ -619,6 +621,7 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
         data = _safe_json_parse(line.strip())
         if data is None or not isinstance(data, dict):
             continue
+        _parsed_any = True
         if data.get("config") is not None or data.get("progress") is not None:
             continue  # 元信息行；"osv" 行是漏洞全文，坐标在 finding 行，此处跳过
         f = data.get("finding")
@@ -677,6 +680,8 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
             tool="govulncheck",
             recommendation=f"Upgrade module affected by {osv}",
         ))
+    if rc == 0 or _parsed_any:
+        _mark_ran(ctx)  # D1：rc=0 或输出可解析才置位——跑挂不解除哨兵
     return list(by_osv.values()) + findings
 
 
@@ -702,12 +707,11 @@ def _dep_rust(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     if rc == -1:
         logger.warning("Dep(rust): cargo audit execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     data = _safe_json_parse(stdout)
     if data is None:
         logger.warning("Dep(rust): cargo audit output not valid JSON, skipping")
         return []
+    _mark_ran(ctx)  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     vulnerabilities = data.get("vulnerabilities", {}) if isinstance(data, dict) else {}
@@ -768,9 +772,9 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     if rc == -1:
         logger.warning("Dep(java): dependency-check execution failed: %s", stderr)
         return []
-    _mark_ran(ctx)  # 工具已成功执行(rc!=-1)
-
     # dependency-check JSON 报告在 out_dir 下
+    # D2：报告存在性/可解析检查【之前】绝不置 _mark_ran——起跑即崩（报告缺失）时
+    # 置位=Java 依赖漏洞 0 覆盖假绿。报告成功读取解析后才算"真跑成"。
     report_path = Path(out_dir) / "dependency-check-report.json"
     if not report_path.exists():
         logger.warning("Dep(java): dependency-check report not found at %s", report_path)
@@ -781,6 +785,7 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Dep(java): failed to read dependency-check report: %s", exc)
         return []
+    _mark_ran(ctx)  # D2：报告成功读取解析后才置位
 
     findings: list[SecurityFinding] = []
     dependencies = data.get("dependencies", []) if isinstance(data, dict) else []
@@ -1004,8 +1009,10 @@ def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) ->
     except (json.JSONDecodeError, OSError) as exc:
         # P2-2：报告解析失败不再"已扫过+零发现"（fail-open）——不置 _mark_ran，让上游
         # fail-closed 哨兵按"未扫"处理（与工具没跑同等对待），杜绝解析坏=漏洞清零假绿。
-        logger.warning("Secret scan: gitleaks report parse failed（按未扫处理，fail-closed）: %s", exc)
-        return []
+        # D3：返回 None 而非 []——非 None 会让 _run_secret_scan 判"已有结果"直接返回，
+        # trufflehog/内置正则兜底链整体被跳过（密钥类零扫描）。None=落入下一级兜底。
+        logger.warning("Secret scan: gitleaks report parse failed（按未扫落兜底链）: %s", exc)
+        return None
     _mark_ran(ctx)  # gitleaks 已成功执行且报告可解析
 
     findings: list[SecurityFinding] = []
@@ -1044,13 +1051,14 @@ def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) 
     if rc == -1:
         logger.warning("Secret scan: trufflehog execution failed: %s", stderr)
         return None
-    _mark_ran(ctx)  # trufflehog 已成功执行
 
     findings: list[SecurityFinding] = []
+    _parsed_any = False  # D1：流式输出——至少一行可解析/rc=0 才算"真跑成"
     for line in stdout.splitlines():
         data = _safe_json_parse(line.strip())
         if data is None or not isinstance(data, dict):
             continue
+        _parsed_any = True
         sev_str = data.get("severity", "high")
         sev = _map_vuln_severity(sev_str) if sev_str else Severity.HIGH
         metadata = data.get("SourceMetadata", {})
@@ -1070,6 +1078,11 @@ def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) 
             tool="trufflehog",
             recommendation="Rotate the exposed secret immediately",
         ))
+    if rc != 0 and not _parsed_any:
+        # D1/D3：跑挂（非 0 且输出不可解析）→ None 落入内置正则兜底链，不置位不假空
+        logger.warning("Secret scan: trufflehog 输出不可解析(rc=%d)，按未扫落兜底", rc)
+        return None
+    _mark_ran(ctx)  # D1：rc=0 或输出可解析才置位
     return findings
 
 

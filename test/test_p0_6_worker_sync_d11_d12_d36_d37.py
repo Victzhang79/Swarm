@@ -47,6 +47,11 @@ class _FakeManager:
             out = "__N__"                          # 删除探测：沙箱里没有（不触发，无 delete scope）
         else:
             out = "\n".join(self._workspace)
+        # F3：真实命令的 oversize 节标记 echo 无条件执行（命令成功即在场）——
+        # fake 同源模拟，否则 C1 的"无节标记=通道中断"三态判定会把 fake 输出误判 infra。
+        from swarm.worker.executor_sync import _OVERSIZE_SECTION_MARKER
+        if "find" in cmd and _OVERSIZE_SECTION_MARKER in cmd:
+            out = (out + "\n" if out else "") + _OVERSIZE_SECTION_MARKER + "\n"
         return SimpleNamespace(stdout=out, error=None)
 
     def sync_files_from_sandbox(self, sandbox, local_root, rel_files, remote):

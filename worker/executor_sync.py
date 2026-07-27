@@ -54,6 +54,21 @@ _WORKSPACE_LIST_CAP = _workspace_list_cap()
 # 否则 allow_any 模式会把这个内部标记当产物拉回本地。
 _BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
 
+# F3（merge 审计）：枚举输出的 oversize 节标记 + 探针上限。三条 find 枚举通道在同一命令里
+# 附带孪生探针（`! -size -<阈值>k`），把被尺寸谓词排除的文件显式列出——旧版静默滤掉零留痕，
+# >阈值的合法产物（全量 SQL dump/lockfile/bundle）永不回传且 A3/D30 全看不见（round40 丢件换皮）。
+_OVERSIZE_SECTION_MARKER = "__SWARM_OVERSIZE__"
+_OVERSIZE_PROBE_CAP = 40
+
+
+def _find_size_kib() -> int:
+    """F3：find 尺寸谓词阈值与 sync 记账上限【同源】（MAX_SYNC_FILE_SIZE，默认 8MiB）。
+
+    旧版写死 `-size -2000k` 与 8MiB 记账阈值倒挂——2~8MB 文件 sync 层本可接收且有账，
+    却在枚举期被更严的静默谓词先行剪掉（"严的无账、宽的有账"fail-closed 倒挂）。"""
+    from swarm.worker.sandbox import MAX_SYNC_FILE_SIZE
+    return max(1, int(MAX_SYNC_FILE_SIZE) // 1024)
+
 
 def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> set[str] | None:
     """一次 `git ls-tree -r --name-only <ref> -- <paths>` 批量判定哪些相对路径
@@ -128,6 +143,21 @@ class _SandboxSyncMixin:
         for rel in self._build_manifest_files():
             if rel not in files and rel not in create and rel not in delete:
                 files.append(rel)
+        # C2（worker 审计）：upstream_artifacts 并入上传清单——baked 分支已显式消费，
+        # 通用池分支原本只靠 _module_source_files 带 JVM 源码（_SRC_EXT 四后缀 + 仅
+        # mvn/gradle 栈）：非源码类上游产物（mapper .xml/.sql/前端）与非 JVM 栈在通用池
+        # 沙箱整体缺席 → worker 看到的工作区与 brain"产物已交付"账面漂移。两分支同口径；
+        # 本地不存在的条目跳过（与 baked 分支 is_file 过滤一致，防 FileNotFoundError）。
+        try:
+            from pathlib import Path as _P
+            _root = _P(self.project_path)
+            for f in list(getattr(scope, "upstream_artifacts", []) or []):
+                rel = str(f).strip()
+                if (rel and rel not in files and rel not in create and rel not in delete
+                        and (_root / rel).is_file()):
+                    files.append(rel)
+        except Exception:  # noqa: BLE001 — 增益并入，异常不拖垮上传主链
+            pass
         # 追加【改动所在模块的完整源码树】——仅当 harness 需真实编译时。
         # 精准 scope 同步只传选中文件，但 mvn/gradle 编译整模块会因缺同级类
         # (DateUtils 依赖 Constants/StringUtils 等)报 cannot find symbol 秒挂。
@@ -1046,6 +1076,7 @@ class _SandboxSyncMixin:
             await self._normalize_jvm_namespace(local_root, reason)
             return
         self._post_sync_contents = {}
+        self._enum_oversize_rels = []  # F3：本轮枚举期 oversize 账（并入 _sync_oversize_rels）
         cfg = get_config()
         rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
         # greenfield/allow_any 模式：scope 没有预设文件，worker 自由创建。
@@ -1054,8 +1085,12 @@ class _SandboxSyncMixin:
             try:
                 rel_files = await asyncio.to_thread(self._list_sandbox_workspace_files)
                 self._log(f"{reason} allow_any 模式：枚举沙箱产物 {len(rel_files)} 个文件")
+            except TransientInfraError:
+                # C1：枚举通道故障必须冒泡为 transient 退避重试（N-06/N-07 同款），
+                # 绝不静默当"无可写文件"——那会把 greenfield 产物整体蒸发成假"无变更"。
+                raise
             except Exception as exc:
-                self._log(f"{reason} allow_any 枚举沙箱文件失败: {exc}")
+                self._log(f"{reason} allow_any 枚举沙箱文件失败: {exc}", level="warning")
         # 并入被确定性修复的文件（去重保序），使其无论是否在写权 scope 内都被拉回本地。
         if extra_repaired:
             rel_files = list(dict.fromkeys(
@@ -1144,6 +1179,10 @@ class _SandboxSyncMixin:
             except Exception as _dexc:  # noqa: BLE001
                 self._log(f"{reason} 删除传播失败（非致命）: {_dexc}")
         if not rel_files:
+            if self._enum_oversize_rels:
+                # F3 极端形态：产物【全部】超限——oversize 账仍须落盘（L1 闸 fail-closed
+                # 消费），绝不带着"无可写文件"的假空账静默通过。
+                self._sync_oversize_rels = list(self._enum_oversize_rels)
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
         try:
@@ -1159,7 +1198,9 @@ class _SandboxSyncMixin:
             self._sync_skipped_count = int(sync_stats.get("skipped") or 0)
             self._sync_error_rels = list(sync_stats.get("errors") or [])
             # D30：确定性尺寸 skip 单独入账（L1 闸门判确定性失败，不当 transient 重试）。
-            self._sync_oversize_rels = list(sync_stats.get("oversize_rels") or [])
+            # F3：并入枚举期 oversize 账（三条 find 通道被尺寸谓词排除的文件，同一消费口径）。
+            self._sync_oversize_rels = list(dict.fromkeys(
+                list(sync_stats.get("oversize_rels") or []) + self._enum_oversize_rels))
             err_count = len(sync_stats.get("errors") or [])
             self._log(
                 f"{reason} 沙箱→本地精准 pull-back: "
@@ -1241,11 +1282,41 @@ class _SandboxSyncMixin:
             except Exception as exc:  # noqa: BLE001
                 self._log(f"{reason} 命名空间归一回传沙箱失败（不致命，build 闸门会暴露）: {exc}")
 
+    def _split_enum_sections(self, out: str, context: str) -> tuple[list[str], bool]:
+        """F3：把枚举输出按 {_OVERSIZE_SECTION_MARKER} 节标记切成（正常清单, 标记是否在场）。
+
+        oversize 节（超单文件同步上限、被主 find 谓词排除的文件）并入
+        self._enum_oversize_rels——pull-back 收尾并进 _sync_oversize_rels
+        （D30 确定性通道，L1 闸门 fail-closed 消费），不再静默丢件零留痕。"""
+        normal: list[str] = []
+        oversize: list[str] = []
+        seen_marker = False
+        for line in (out or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s == _OVERSIZE_SECTION_MARKER:
+                seen_marker = True
+                continue
+            (oversize if seen_marker else normal).append(s)
+        if oversize:
+            _new = [r for r in oversize if r not in self._enum_oversize_rels]
+            self._enum_oversize_rels.extend(_new)
+            self._log(
+                f"{context}：{len(oversize)} 个文件超单文件同步上限被枚举排除"
+                f"（F3 入 D30 oversize 账 → L1 确定性 FAIL，非静默丢件）: {oversize[:5]}",
+                level="warning",
+            )
+        return normal, seen_marker
+
     def _list_sandbox_workspace_files(self) -> list[str]:
         """递归列出沙箱 /workspace 下的相对文件路径（allow_any/greenfield pull-back 用）。
 
         走 shell 端点(run_command + find)——不依赖 Jupyter kernel(自建语言镜像无
-        kernel 会 502)。过滤常见噪声目录，返回相对 remote_workdir 的路径(上限 200)。
+        kernel 会 502)。过滤常见噪声目录，返回相对 remote_workdir 的路径。
+        C1（worker 审计 HIGH）：枚举【通道故障】与【真空 workspace】三态分流——故障侧
+        raise TransientInfraError（与 N-06 上传/N-07 拉回同款升格），绝不静默返回 []
+        把 greenfield 产物整体蒸发成"无变更"（capability 误判换模型 / BENIGN 自报假绿）。
         """
         if not self._sandbox or not self._sandbox_manager:
             return []
@@ -1253,27 +1324,35 @@ class _SandboxSyncMixin:
         remote = cfg.sandbox.sandbox_remote_workdir
         # D37(a) 治本：原 `head -200` 会在 allow_any/greenfield pull-back 场景下静默丢弃第
         # 201+ 个产物（>200 文件的项目模板一次生成即触发）。上限大幅提高至 _WORKSPACE_LIST_CAP，
-        # 且【截断即 warning】可观测——不再"看似枚举全了实则丢一半"。find 排除噪声目录 + 限 2MB。
+        # 且【截断即 warning】可观测——不再"看似枚举全了实则丢一半"。find 排除噪声目录，
+        # 尺寸谓词与记账上限同源（F3 _find_size_kib）+ 孪生 oversize 探针节。
         prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name .pytest_cache \)"
+        _kib = _find_size_kib()
         # +1 用于探测是否发生截断（拿到 cap+1 行即说明真实文件数 > cap）。
         cmd = (
-            f"cd {remote} 2>/dev/null && "
-            f"find . {prune} -prune -o -type f -size -2000k -print 2>/dev/null "
-            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
+            f"cd {remote} 2>/dev/null && {{ "
+            f"find . {prune} -prune -o -type f -size -{_kib}k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}; "
+            f"echo {_OVERSIZE_SECTION_MARKER}; "
+            f"find . {prune} -prune -o -type f ! -size -{_kib}k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_OVERSIZE_PROBE_CAP}; }}"
         )
         rc = getattr(self._sandbox_manager, "run_command", None)
         if rc is None:
-            return []
+            raise TransientInfraError(
+                "allow_any 枚举通道不可用：sandbox manager 无 run_command 端点（无法回传产物）")
         result = rc(self._sandbox, cmd, timeout=30)
         if getattr(result, "error", None) and not getattr(result, "stdout", ""):
-            return []
-        out = (result.stdout or "").strip()
-        if not out:
-            return []
-        files = [
-            line.strip() for line in out.splitlines()
-            if line.strip() and line.strip() != _BOOTSTRAP_MARKER_NAME
-        ]
+            raise TransientInfraError(
+                f"allow_any 沙箱 workspace 枚举失败(infra): {getattr(result, 'error', '')}")
+        lines, marker_seen = self._split_enum_sections(
+            result.stdout or "", "allow_any 全量枚举")
+        if not marker_seen:
+            # 节标记必在成功输出里（echo 无条件执行）——缺失=cd 失败/命令中断=通道故障，
+            # 绝不与"真空 workspace"混同。
+            raise TransientInfraError(
+                "allow_any 沙箱 workspace 枚举未完成(输出无节标记，疑 cd 失败/命令中断)")
+        files = [f for f in lines if f != _BOOTSTRAP_MARKER_NAME]
         if len(files) > _WORKSPACE_LIST_CAP:
             # 截断：真实产物数超过上限 → 第 cap+1 起被丢弃。必须留痕（否则与"恰好 cap 个"
             # 不可区分），提示可能有产物未回传。返回前 cap 个（去掉探测多取的那一个）。
@@ -1343,18 +1422,21 @@ class _SandboxSyncMixin:
         quoted = " ".join(shlex.quote(d) for d in dirs if d)
         if not quoted:
             return []
+        _kib = _find_size_kib()
         cmd = (
-            f"cd {remote} 2>/dev/null && "
-            f"find {quoted} -maxdepth 1 -type f -size -2000k 2>/dev/null "
-            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
+            f"cd {remote} 2>/dev/null && {{ "
+            f"find {quoted} -maxdepth 1 -type f -size -{_kib}k 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}; "
+            f"echo {_OVERSIZE_SECTION_MARKER}; "
+            f"find {quoted} -maxdepth 1 -type f ! -size -{_kib}k 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_OVERSIZE_PROBE_CAP}; }}"
         )
         result = rc(self._sandbox, cmd, timeout=30)
         if getattr(result, "error", None) and not getattr(result, "stdout", ""):
             return []
-        out = (result.stdout or "").strip()
-        if not out:
-            return []
-        files = [line.strip() for line in out.splitlines() if line.strip()]
+        # 补捞是增益通道（声明 scope 主链另有 D30 兜底）——故障侧保持 best-effort []；
+        # oversize 节照常入账（F3），静默丢件面关闭。
+        files, _ = self._split_enum_sections(result.stdout or "", "H-exec1 目录内枚举")
         if len(files) > _WORKSPACE_LIST_CAP:
             self._log(
                 f"H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件"
@@ -1379,18 +1461,21 @@ class _SandboxSyncMixin:
         remote = cfg.sandbox.sandbox_remote_workdir
         prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name target -o -name .pytest_cache \)"
         mq = shlex.quote(marker_rel)
+        _kib = _find_size_kib()
         cmd = (
-            f"cd {remote} 2>/dev/null && "
-            f"find . {prune} -prune -o -type f -newer {mq} -size -2000k -print 2>/dev/null "
-            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}"
+            f"cd {remote} 2>/dev/null && {{ "
+            f"find . {prune} -prune -o -type f -newer {mq} -size -{_kib}k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_WORKSPACE_LIST_CAP + 1}; "
+            f"echo {_OVERSIZE_SECTION_MARKER}; "
+            f"find . {prune} -prune -o -type f -newer {mq} ! -size -{_kib}k -print 2>/dev/null "
+            f"| sed 's|^\\./||' | head -{_OVERSIZE_PROBE_CAP}; }}"
         )
         result = rc(self._sandbox, cmd, timeout=30)
         if getattr(result, "error", None) and not getattr(result, "stdout", ""):
             return []
-        out = (result.stdout or "").strip()
-        if not out:
-            return []
-        files = [line.strip() for line in out.splitlines() if line.strip() and line.strip() != marker_rel]
+        # D36 是增益通道——故障侧保持 best-effort []；oversize 节照常入账（F3）。
+        _lines, _ = self._split_enum_sections(result.stdout or "", "D36 改动兄弟枚举")
+        files = [f for f in _lines if f != marker_rel]
         if len(files) > _WORKSPACE_LIST_CAP:
             self._log(f"沙箱改动文件枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏改动", level="warning")
             files = files[:_WORKSPACE_LIST_CAP]

@@ -688,13 +688,42 @@ def _dependency_fingerprint(project_root: str | Path) -> str:
                 if fn in _DEP_BUILD_FILES:
                     rel = os.path.relpath(os.path.join(root, fn), project_root)
                     found.append(rel)
+        # B3（worker 审计）：指纹与 tarball【同源】——tarball 取 `git archive HEAD`，指纹若
+        # hash 工作区现值，一次「本地≠HEAD」错位（预处理恰逢未提交 dep 残留）后指纹恒匹配
+        # → 镜像永不重建的静默闩锁。git 仓库时读 `HEAD:<rel>` blob（HEAD 无该文件=tarball
+        # 也没有 → 跳过，同源）；非 git/HEAD 不可得回退磁盘现值（行为不劣化）。
+        import subprocess as _sp
+        _use_git = False
+        try:
+            _use_git = _sp.run(
+                ["git", "-C", str(project_root), "rev-parse", "--verify", "HEAD"],
+                capture_output=True, timeout=15,
+            ).returncode == 0
+        except Exception:  # noqa: BLE001
+            _use_git = False
         for rel in sorted(found):
-            try:
-                with open(project_root / rel, "rb") as f:
-                    h.update(rel.encode())
-                    h.update(f.read())
-            except OSError:
-                continue
+            data: bytes | None = None
+            rel_posix = rel.replace(os.sep, "/")
+            if _use_git:
+                try:
+                    _p = _sp.run(
+                        ["git", "-C", str(project_root), "show", f"HEAD:{rel_posix}"],
+                        capture_output=True, timeout=15,
+                    )
+                except Exception:  # noqa: BLE001
+                    _p = None
+                if _p is not None and _p.returncode == 0:
+                    data = _p.stdout
+                else:
+                    continue  # HEAD 没有该文件 = tarball 也没有 → 不进指纹（同源）
+            if data is None:
+                try:
+                    with open(project_root / rel, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+            h.update(rel.encode())
+            h.update(data)
     except Exception:  # noqa: BLE001
         pass
     return h.hexdigest()[:12]

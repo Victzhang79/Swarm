@@ -4702,6 +4702,16 @@ def _sandbox_available() -> bool:
 
 def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout: int = 180,
                   base_ref: str | None = None) -> bool:
+    # F2 sibling（merge 审计）：本机 L2 的 apply→测试→finally reset 同为共享工作树变更窗口，
+    # 与 run_integration_review/交付临界区共用同一把 _ProjectGitFlock（同 canon_path）。
+    from swarm.worker.git_flock import _ProjectGitFlock
+    with _ProjectGitFlock(project_path):
+        return _run_l2_local_locked(
+            project_path, merged_diff, test_cmd, timeout=timeout, base_ref=base_ref)
+
+
+def _run_l2_local_locked(project_path: str, merged_diff: str, test_cmd: str, *,
+                         timeout: int = 180, base_ref: str | None = None) -> bool:
     from swarm.project.diff_apply import apply_git_diff
 
     apply_result = apply_git_diff(project_path, merged_diff)

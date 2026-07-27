@@ -201,8 +201,11 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             if _ab_files:
                 try:
                     import subprocess as _sp
-                    _r = _sp.run(["git", "-C", project_path, "clean", "-f", "--", *_ab_files],
-                                 capture_output=True, text=True, timeout=30)
+                    # F2 sibling：git clean 也是共享工作树写操作，入同一把跨进程锁
+                    from swarm.worker.git_flock import _ProjectGitFlock
+                    with _ProjectGitFlock(project_path):
+                        _r = _sp.run(["git", "-C", project_path, "clean", "-f", "--", *_ab_files],
+                                     capture_output=True, text=True, timeout=30)
                     _purged = [ln for ln in (_r.stdout or "").splitlines() if ln.strip()]
                     if _purged:
                         logger.warning(
@@ -603,8 +606,11 @@ async def verify_runtime(state: BrainState) -> dict:
             {},
         )
 
-    # b. 推导（纯函数层）：工作树路径与 verify_l2 同源取法（_get_project_path）——
-    #    L2 主路径已在该工作树上本地 apply 过 merged_diff，推导读到的是【将交付的形态】。
+    # b. 推导（纯函数层）：工作树路径与 verify_l2 同源取法（_get_project_path）。
+    #    F1 口径修正：L2 的 finally reset 后本地工作树恒为【base 形态】（旧注释"已 apply 过
+    #    merged_diff"是陈旧承诺）——推导读 base 树，greenfield（start_cmd/port 全来自新建文件）
+    #    可能 derivation_incomplete skipped（degraded 留痕，已知诚实边界）；merged 形态的验证
+    #    由 _acquire_smoke_sandbox 自建臂箱内 apply merged_diff 保证（转交臂本就是 merged 树）。
     project_path = nodes._get_project_path(project_id)
     if not project_path:
         logger.warning("[VERIFY_RUNTIME] 项目工作树路径不可得(project_id=%s) → skipped", project_id)
@@ -684,6 +690,7 @@ async def verify_runtime(state: BrainState) -> dict:
         # c. 沙箱获取：优先 L2 延活转交，不成立回退自建+重建（同步阻塞卸线程池，R23-1 口径）
         sandbox, skip_reason, acquire_details = await asyncio.to_thread(
             _acquire_smoke_sandbox, manager, handoff_sid, project_id, project_path, budget,
+            str(state.get("merged_diff") or ""),  # F1：自建臂须 apply merged 树
         )
         if sandbox is None:
             out = _apply_migration_patch(
@@ -877,13 +884,18 @@ def _acquire_smoke_sandbox(
     project_id: str,
     project_path: str,
     budget_sec: int,
+    merged_diff: str = "",
 ) -> tuple[object | None, str | None, dict]:
     """冒烟沙箱获取（同步，供 to_thread）→ (sandbox|None, skip_reason|None, details)。
 
     ① 转交快路径（设计 §2.3）：state 只有 sid 字符串，活对象经进程内 manager._instances
        registry 取；须 try_extend_lifetime 续期成功、或 remaining_lifetime 足额才算成立。
-    ② 回退自建：manager.create + tar sync + _detect_build_cmd_generic 重建构建产物——
-       L2 已证编译通过，这里失败是环境问题 → 调用方按 skipped（rebuild_failed）处理，非 failed。
+       转交沙箱在 L2 apply 窗口内 sync，箱内已是 merged 树——绝不再 apply（防双重应用）。
+    ② 回退自建：manager.create + tar sync + apply merged_diff + 重建构建产物。
+       F1（merge 审计 CRITICAL）：本地工作树在 verify_l2 的 finally reset 后恒为 base 形态，
+       sync 进箱的是 base 树——必须把 merged_diff 在箱内 git apply（与 _run_l2_in_sandbox
+       同旗标 --ignore-whitespace + marker 锚点），冒烟/S2-5 断言才验的是【将交付的形态】。
+       apply 不成/rebuild 失败是环境问题 → 调用方按 skipped 处理，非 failed。
     自建失败路径内部即时销毁自建沙箱；成功返回的沙箱由 verify_runtime finally 统一处置。
     """
     details: dict = {}
@@ -929,6 +941,31 @@ def _acquire_smoke_sandbox(
     details.update({"source": "self_built", "sandbox_id": sid})
     try:
         manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+        # F1（merge 审计 CRITICAL）：sync 进箱的是 base 树（L2 finally reset 后本地工作树
+        # 恒为 base）。merged_diff 非空时在箱内 apply，失败/marker 缺失（命令没跑成）都是
+        # 环境/基线问题 → skipped（smoke_apply_failed），绝不静默带 base 树继续冒烟——
+        # 那正是"假绿直达交付/假红幻影失败"的双向失真根源。
+        if (merged_diff or "").strip():
+            from swarm.worker.sandbox import write_file_to_sandbox
+
+            _patch_path = "/tmp/__swarm_smoke_merged.patch"
+            write_file_to_sandbox(sandbox, _patch_path, merged_diff, manager=manager)
+            _ap = manager.run_command(
+                sandbox,
+                f"cd {workdir} && git apply --ignore-whitespace {_patch_path}; "
+                f"echo __SMOKE_APPLY_RC__$?",
+                timeout=90,
+            )
+            _ap_out = ((getattr(_ap, "stdout", "") or "")
+                       + (getattr(_ap, "stderr", "") or ""))
+            # B3-F6 口径：末尾锚点取退出码；marker 缺失=命令没跑成=infra，同样不冒 base。
+            _ap_rc = parse_marker_rc(_ap_out, "__SMOKE_APPLY_RC__")
+            if _ap_rc != 0:
+                details["smoke_apply_output"] = _ap_out[-800:]
+                details["smoke_apply_ran"] = _ap_rc is not None
+                _kill_sandbox_quiet(sid)
+                return None, "smoke_apply_failed", details
+            details["smoke_diff_applied"] = True
         # 尽力把自建沙箱寿命对齐冒烟预算（D28；默认 900s 通常已够，失败不阻断）
         try:
             manager.try_extend_lifetime(sandbox, int(budget_sec))

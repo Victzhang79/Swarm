@@ -231,6 +231,7 @@ class WorkerExecutor(
         # transient 信号分账——重试不可恢复，L1 闸门对它判确定性失败（走失败阶梯），
         # 绝不当 BLOCKED transient 无限重试（旧行为：package-lock.json >1MiB 永久活锁）。
         self._sync_oversize_rels: list[str] = []
+        self._enum_oversize_rels: list[str] = []  # F3：枚举期被尺寸谓词排除的文件账
         # TD2606-C9：L1 确定性闸门在沙箱里修复（version-repair / import-repair / goimports …）
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。

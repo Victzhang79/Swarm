@@ -214,6 +214,35 @@ def run_integration_review(
     # git apply --check 会因 "改动已存在、context 已变" 报 "补丁未应用"（假阴性，task
     # fdaa1932 实测）。reset 到 HEAD 后工作区与补丁基线一致，check 才有意义。worker 的脏改动
     # 已被 merged_diff 完整捕获，reset 不丢信息（真正 apply 在下方 build_cmd 分支重新做）。
+    #
+    # F2（merge 审计 HIGH）：整个工作树变更窗口（reset→apply-check→apply→reconcile→编译
+    # →finally reset）收进 _ProjectGitFlock——与交付临界区 _deliver_merged_diff_locked、
+    # executor_sync pull-back 同一把跨进程锁（同 canon_path）。E3 降级后同项目不同模块的两任务
+    # 设计上可并行走到 verify_l2（交付侧 docstring 自证），本窗口裸跑会把兄弟任务交付 flock 内
+    # apply 与 commit 之间的树 reset 回 base、或把兄弟 pull-back 半成品扫进本任务的 L2 编译输入。
+    # 锁粒度取"整段持锁"（正确性优先；沙箱编译等待≤timeout，兄弟侧最坏排队同额时长）。
+    from swarm.worker.git_flock import _ProjectGitFlock
+
+    _flk = _ProjectGitFlock(project_path)
+    with _flk:
+        details["worktree_flock"] = bool(getattr(_flk, "_locked", False))
+        return _run_worktree_phase(
+            project_path, merged_diff, details, issues,
+            timeout=timeout, compile_runner=compile_runner, base_ref=base_ref,
+        )
+
+
+def _run_worktree_phase(
+    project_path: str,
+    merged_diff: str,
+    details: dict[str, Any],
+    issues: list[str],
+    *,
+    timeout: int,
+    compile_runner,
+    base_ref: str | None,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """run_integration_review 的工作树变更段（F2：调用方已持 _ProjectGitFlock）。"""
     _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
 
     apply_result = apply_git_diff(project_path, merged_diff, check_only=True)

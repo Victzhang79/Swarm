@@ -39,7 +39,8 @@ _SKIP_DIRS = {
 
 
 def reconcile_workspace_manifests(
-    project_path: str, modified: list[str] | None = None, prune: bool = True
+    project_path: str, modified: list[str] | None = None, prune: bool = True,
+    use_lock: bool = False,
 ) -> dict:
     """对账项目内所有【显式成员列表】型聚合清单，使其枚举磁盘上真实存在的成员模块。
 
@@ -51,12 +52,29 @@ def reconcile_workspace_manifests(
     任一生态的对账抛错都被隔离吞掉(增益层不可拖垮主流程)，其它生态照常对账。
     `prune=False` 只补漏不摘幽灵——L1 调用点必须传 False（对抗复核 F4：活动共享树上
     contract_utils 规则 4 让 root pom owner 先行登记全部新模块，目录物化在后；此时
-    prune 会把先行登记误当幽灵摘掉，且与 pull-back flock 不是同一把锁存在 lost-update）。
+    prune 会把先行登记误当幽灵摘掉）。
     L2(integration_review，reset+apply 定格树)/交付(learn_success，锁内)两处用默认 True。
+
+    C3（worker 审计 HIGH）：`use_lock=True` 时【读-改-写整段】收进 _ProjectGitFlock——
+    L1 调用点在活动共享树上执行且不在任何 flock 内，与并行兄弟 pull-back 的共享清单合并
+    （sandbox.py 锁内）互踩会 lost-update（F4 只关了 prune 半边，add 侧照旧裸写）。
+    已持锁调用点（L2 的 F2 工作树段/交付临界区）必须保持 use_lock=False——fcntl flock
+    同进程【异 fd】不可重入，重复取锁即自死锁。
     """
     root = Path(project_path)
     if not root.is_dir():
         return {"modified_manifests": [], "added": {}, "removed": {}}
+    if use_lock:
+        from swarm.worker.git_flock import _ProjectGitFlock
+        with _ProjectGitFlock(root):
+            return _reconcile_manifests_unlocked(root, modified, prune)
+    return _reconcile_manifests_unlocked(root, modified, prune)
+
+
+def _reconcile_manifests_unlocked(
+    root: Path, modified: list[str] | None, prune: bool
+) -> dict:
+    """reconcile 本体（调用方负责锁语义，见 reconcile_workspace_manifests docstring）。"""
     hint = [str(m or "") for m in (modified or [])]
     modified_manifests: list[str] = []
     added: dict[str, list[str]] = {}
@@ -75,7 +93,7 @@ def reconcile_workspace_manifests(
                 added.setdefault(k, []).extend(v)
     # R46-2：add 侧补漏后跑 prune 侧摘幽灵（目录已不存在的成员条目会毒死 reactor/构建）。
     # 双向镜像同一 ground truth，幂等：add 只加真实存在的，prune 只摘真实不存在的，互不打架。
-    removed = prune_stale_manifest_members(project_path) if prune else {}
+    removed = prune_stale_manifest_members(str(root)) if prune else {}
     for k in removed:
         if k not in modified_manifests:
             modified_manifests.append(k)
@@ -558,8 +576,28 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
     if text is None:
         return [], {}
     used = set()
-    for m in re.finditer(r"use\s+(?:\(\s*)?\.?/?([^\s()]+)", text):
-        used.add(m.group(1).strip("/"))
+
+    def _norm_use(entry: str) -> str:
+        e = entry.split("//", 1)[0].strip().strip('"')
+        if e.startswith("./"):
+            e = e[2:]
+        return e.strip("/")
+
+    # C4（worker 审计 HIGH）：先提取 `use ( ... )` 块【逐行】收集成员——`go work use` 默认产
+    # 块形式，旧正则对每块只捕获首成员 → 第 2+ 成员被误判"未注册" → 文件尾追加重复 use →
+    # go 对 workspace 重复目录硬错（fatal），reconcile 把合法 go.work 改坏成确定性构建失败，
+    # 且坏文件经 repaired_file_paths 回传毒进权威库。与 _pom_modules_span 同思路（块锚定）。
+    for blk in re.finditer(r"use\s*\((.*?)\)", text, re.S):
+        for line in blk.group(1).splitlines():
+            e = _norm_use(line)
+            if e:
+                used.add(e)
+    block_free = re.sub(r"use\s*\(.*?\)", "", text, flags=re.S)
+    # 单行形式 `use ./x`（在剔除块后的文本上匹配，防块头 "use (" 干扰）
+    for m in re.finditer(r"(?m)^\s*use\s+([^\s()]+)", block_free):
+        e = _norm_use(m.group(1))
+        if e:
+            used.add(e)
     new_members: list[str] = []
     add_lines: list[str] = []
     for child in _safe_subdirs(root):

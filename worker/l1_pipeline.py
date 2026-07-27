@@ -161,11 +161,15 @@ def _fetch_maven_versions_probe(
         cmd = (f"curl -s -m 15 -w '\\n__HTTP__%{{http_code}}' {shlex.quote(url)} 2>/dev/null "
                f"|| wget -qO- -T 15 {shlex.quote(url)} 2>/dev/null")
         _ec, out = _run_l1_command(cmd, project_path, timeout=min(timeout, 30))
-        if _tool_missing(out):
-            continue
         body = out or ""
         m = re.search(r"__HTTP__(\d{3})\s*$", body)
         code = m.group(1) if m else ""
+        # A1（worker 审计）：必须【先】解析 __HTTP__ 状态码——404 响应体常含 "Not Found"
+        # 文本（repo1 历史形态），先咨询 _tool_missing 会把「仓库确证 404」吞成「工具缺失」
+        # → continue → reachable 永置不了 True → 确证剪除防线（R53-2/R56-4）该腿被静默旁路。
+        # 仅在【无状态码标记】（wget 兜底/命令层报错形态）时才咨询 _tool_missing。
+        if not code and _tool_missing(out):
+            continue
         versions = re.findall(r"<version>([^<]+)</version>", body)
         if versions:
             return [v.strip() for v in versions if v.strip()], True
@@ -4357,7 +4361,10 @@ def run_l1_pipeline(
             from swarm.worker.workspace_manifest import reconcile_workspace_manifests
             # F4：L1 在【活动共享树】上只补漏不摘幽灵——owner 先行登记(contract_utils 规则4)
             # 的模块目录物化在后，此时 prune 会误摘；幽灵清理留给 L2/交付两处定格树。
-            _wm = reconcile_workspace_manifests(project_path, modified, prune=False)
+            # C3：本调用点不在任何 flock 内，与并行兄弟 pull-back 的锁内清单合并互踩
+            # （lost-update）→ use_lock=True 把读-改-写整段收进 _ProjectGitFlock。
+            _wm = reconcile_workspace_manifests(
+                project_path, modified, prune=False, use_lock=True)
             _manifests = _wm.get("modified_manifests") or []
             if _manifests:
                 logger.info(
