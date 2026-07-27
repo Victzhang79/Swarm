@@ -140,10 +140,81 @@ _SHARED_MANIFEST_BASENAMES = frozenset({
 })
 
 
-def _is_shared_manifest(rel_posix: str) -> bool:
-    """聚合清单（多写者共享态）→ True。其 pull-back 写盘需 flock 守护，非清单文件各子任务独占免锁。"""
+def query_cubemaster_templates(cfg: Any, *, timeout: float = 5.0) -> list[dict] | None:
+    """单一模板查询封装（B9，19号文）：GET {api_url}/templates 全系统只此一处。
+
+    历史上同一端点两套认证头分叉（image_builder 用 Bearer、manager 用 X-API-KEY）——
+    服务端只认其一时另一路径恒 401 → 探活恒判"不复用"→ 每次任务重烤 20min 级专属
+    镜像且日志只见"探活失败"。此处双头并发（服务端忽略未知头），两条调用面行为
+    收敛一致。
+
+    返回：[{"id","status","imageInfo"}]（已归一）；None=查询失败/未配置（调用方保守）。
+    """
+    api_url = (getattr(cfg, "api_url", "") or "").rstrip("/")
+    if not api_url:
+        return None
+    import httpx
+
+    headers: dict[str, str] = {}
+    key = getattr(cfg, "api_key", "") or ""
+    if key:
+        headers["X-API-KEY"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    verify = bool(getattr(cfg, "verify_ssl", True))
+    resp = httpx.get(f"{api_url}/templates", headers=headers, timeout=timeout, verify=verify)
+    if resp.status_code != 200:
+        return None
+    raw = resp.json()
+    items = [
+        {
+            "id": t.get("templateID") or t.get("templateId") or t.get("template_id") or t.get("id"),
+            "status": t.get("status"),
+            "imageInfo": t.get("imageInfo", "") or "",
+        }
+        for t in raw if isinstance(t, dict)
+    ]
+    return [t for t in items if t["id"]]
+
+
+def _is_shared_manifest(rel_posix: str, content: "bytes | str | None" = None) -> bool:
+    """聚合清单（多写者共享态）→ True。其 pull-back 写盘需 flock 守护，非清单文件各子任务独占免锁。
+
+    B7（19号文）：package.json 按【内容】判定——仅含 workspaces 键（npm/pnpm/yarn
+    monorepo 聚合根清单）才算共享清单。workspaces 数组正是"N 个并行 worker 各加一条
+    成员"形态，与 pom <modules> 同死法（last-write-wins 丢成员）；子包自身的
+    package.json 是各子任务独占文件，不纳入（不扩大锁面）。content 缺省（纯 rel
+    旧调用面）→ package.json 保守 False，行为不变。
+    """
     base = rel_posix.rsplit("/", 1)[-1].lower()
-    return base in _SHARED_MANIFEST_BASENAMES or base.endswith(".sln")
+    if base in _SHARED_MANIFEST_BASENAMES or base.endswith(".sln"):
+        return True
+    if base == "package.json" and content is not None:
+        try:
+            import json as _json
+            text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+            obj = _json.loads(text)
+            return isinstance(obj, dict) and "workspaces" in obj
+        except Exception:  # noqa: BLE001 — 解析失败保守不纳入（fail-open 不扩锁面）
+            return False
+    return False
+
+
+def _is_shared_manifest_on_disk(rel_posix: str, local_root) -> bool:
+    """磁盘增强版判定：basename 命中即 True；package.json 读本地内容判 workspaces 键。
+
+    供只有 rel+项目根的调用面（bootstrap 快照/回滚/基线锚扫描）使用——这些面防的是
+    同一 last-write-wins 死法，npm 聚合根漏判=同一洞换栈复发。读取失败保守 False。
+    """
+    if _is_shared_manifest(rel_posix):
+        return True
+    base = rel_posix.rsplit("/", 1)[-1].lower()
+    if base != "package.json":
+        return False
+    try:
+        p = Path(local_root) / rel_posix
+        return p.is_file() and _is_shared_manifest(rel_posix, p.read_bytes())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 _sidecar_initialized = False
@@ -309,14 +380,27 @@ def read_file_from_sandbox(
         # P0-SEC-05(b)：shell 上下文用 shlex.quote 正确转义（{path!r} 是 Python repr，
         # 对含单引号的路径不等价于 shell 引号，有残余注入面）。
         _qp = shlex.quote(path)
+        # B5（19号文）：三态区分——不存在/目录（__NOT_A_FILE__）与【合法空文件】
+        # （__EMPTY_FILE__）不得混为一谈。空 __init__.py/.gitkeep 是 Python 常态，
+        # base64 空输出若一律 raise，文件会从 diff 静默丢失（验收"创建包结构"假失败）。
+        # base64 字母表不含下划线，标记与真实输出无碰撞。
         cr = mgr.run_command(
             sandbox,
-            f"test -f {_qp} && base64 {_qp} | tr -d '\\n' || echo __NOT_A_FILE__",
+            f"if test ! -f {_qp}; then echo __NOT_A_FILE__; "
+            f"elif test ! -s {_qp}; then echo __EMPTY_FILE__; "
+            f"else base64 {_qp} | tr -d '\\n'; fi",
             timeout=30,
         )
         out = (cr.stdout or "").strip()
-        if out == "__NOT_A_FILE__" or not out:
-            raise RuntimeError(f"not a file or empty: {path}")
+        if out == "__NOT_A_FILE__":
+            # 文案必须命中 file_tools._is_not_found_err 键表（"does not exist"）——
+            # 该分类决定 worker 拿到"文件不存在·请勿反复重读"止转信号还是通用瞬时
+            # 错误（hunter R1 HIGH-1：B5 改文案曾静默击穿分类，复活重读空转）。
+            raise RuntimeError(f"not a file or does not exist: {path}")
+        if out == "__EMPTY_FILE__":
+            return b""
+        if not out:
+            raise RuntimeError(f"read produced no output: {path}")
         try:
             return base64.b64decode(out)
         except Exception:
@@ -417,27 +501,11 @@ class SandboxManager:
         if not api_url:
             return cached["items"] or []
         try:
-            import httpx
-
-            headers = {}
-            key = getattr(self.config, "api_key", "") or ""
-            if key:
-                headers["X-API-KEY"] = key
-            verify = bool(getattr(self.config, "verify_ssl", True))
-            resp = httpx.get(f"{api_url}/templates", headers=headers, timeout=5.0, verify=verify)
-            if resp.status_code != 200:
-                logger.warning("[template] 查 /templates 非 200(%s)，沿用上次缓存", resp.status_code)
+            # B9：统一走单一查询封装（认证头已收敛双头并发）。
+            items = query_cubemaster_templates(self.config)
+            if items is None:
+                logger.warning("[template] 查 /templates 失败(非 200/异常)，沿用上次缓存")
                 return cached["items"] or []
-            raw = resp.json()
-            items = [
-                {
-                    "id": t.get("templateID") or t.get("templateId") or t.get("id"),
-                    "status": t.get("status"),
-                    "imageInfo": t.get("imageInfo", "") or "",
-                }
-                for t in raw if isinstance(t, dict)
-            ]
-            items = [t for t in items if t["id"]]
             cached["items"] = items
             cached["ts"] = now
             return items
@@ -445,7 +513,10 @@ class SandboxManager:
             logger.warning("[template] 查 /templates 失败(%s)，沿用上次缓存/原配置", e)
             return cached["items"] or []
 
-    def _resolve_template(self, template: str | None, project_id: str | None) -> str:
+    def _resolve_template(
+        self, template: str | None, project_id: str | None, *,
+        allow_any_ready: bool = True,
+    ) -> str:
         """治本：按 CubeMaster 实际可用模板解析 template，配置漂移时自愈兜底。
 
         背景（2026-06-29 实证）：服务器只剩 3 个 READY 模板，而 .env/DB/默认全配的是早已被
@@ -455,7 +526,11 @@ class SandboxManager:
           ① 配置值在服务器 READY 集 → 直接用（尊重显式配置）；
           ② 否则在 READY 集挑【项目匹配】镜像（imageInfo 含 sandbox-proj-<project_id 前缀>，
              CubeMaster 按项目烤的专属镜像）；
-          ③ 再否则挑任一 READY；
+          ③ 再否则挑任一 READY——仅 allow_any_ready=True（WebUI/手动等无栈期望路径）。
+             B8（19号文）：worker/pool 派发路径必须 False——READY 集首个可能是异栈镜像
+             （项目专属模板被 TTL 清理时拿 python 镜像跑 mvn=127，该任务全子任务连败；
+             D29 只保证后续请求不复用错桶，救不了本次 create）。禁用时 fail-honest
+             抛错（文案带 "is stale" 标记）→ 调用方走 invalidate+重建链路；
           ④ 拿不到服务器清单（网络等）→ 沿用配置值，不擅改（失败按原行为如实暴露）。"""
         configured = template or self.config.default_template
         servers = self._fetch_server_templates()
@@ -472,7 +547,7 @@ class SandboxManager:
                 (t["id"] for t in ready if f"sandbox-proj-{prefix}" in (t.get("imageInfo") or "")),
                 None,
             )
-        if not pick and ready:
+        if not pick and ready and allow_any_ready:
             pick = ready[0]["id"]
         if pick:
             logger.warning(
@@ -481,6 +556,14 @@ class SandboxManager:
                 configured, sorted(ready_ids), pick,
             )
             return pick
+        if not allow_any_ready:
+            # B8：fail-honest。文案含 "is stale" 命中 _TEMPLATE_STALE_MARKERS →
+            # invalidate_project_template_on_stale 作废指纹，下次 preprocess 重建。
+            raise RuntimeError(
+                f"配置模板 {configured} 不在 CubeMaster READY 集 {sorted(ready_ids)}，"
+                f"且项目 {project_id} 无专属 READY 镜像（template is stale / needs rebuild）——"
+                f"派发路径禁用跨栈'任一 READY'兜底（B8），请重建镜像后重试"
+            )
         logger.error("[template] CubeMaster 无任何 READY 模板，沿用配置 %s（create 可能失败）", configured)
         return configured
 
@@ -545,6 +628,9 @@ class SandboxManager:
         self._sandbox_activity.pop(sandbox_id, None)
         self._resolved_templates.pop(sandbox_id, None)
         self._sandbox_deadlines.pop(sandbox_id, None)
+        # B12①：熔断计数同步清理——长活进程 _fail_counts 无界增长；且热池复用时
+        # 旧借用者的失败计数不该跨借用者续存（新借用者背旧账被误熔断）。
+        self._fail_counts.pop(sandbox_id, None)
 
     def get_resolved_template(self, sandbox_id: str) -> str | None:
         """D29：返回该沙箱 create 时的实际解析模板（漂移自愈后的真实镜像 id）。未知返回 None。"""
@@ -616,11 +702,25 @@ class SandboxManager:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    # B12⑤：activity JSONL 轮转上限（单沙箱长会话无限 append = 磁盘缓慢泄漏）。
+    _ACTIVITY_JSONL_MAX_BYTES = 5 * 1024 * 1024
+
     def _persist_activity(self, sandbox_id: str, entry: dict) -> None:
         """把单条活动追加到 ~/.swarm/sandbox_logs/<sid>.jsonl。失败静默。"""
         try:
             import json as _json
             fp = self._activity_log_dir() / f"{sandbox_id}.jsonl"
+            # B12⑤：超上限截尾保留后半（丢弃最旧）——单文件有界，防磁盘缓慢泄漏。
+            try:
+                if fp.is_file() and fp.stat().st_size > self._ACTIVITY_JSONL_MAX_BYTES:
+                    with open(fp, "rb") as _rf:
+                        _rf.seek(-self._ACTIVITY_JSONL_MAX_BYTES // 2, 2)
+                        _tail = _rf.read()
+                    # 从下一个换行起对齐（截断处可能是半行 JSON）
+                    _nl = _tail.find(b"\n")
+                    fp.write_bytes(_tail[_nl + 1:] if _nl >= 0 else b"")
+            except OSError:
+                pass  # 轮转失败不阻断追加
             with open(fp, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:  # noqa: BLE001
@@ -696,12 +796,17 @@ class SandboxManager:
         project_id: str | None = None,
         task_id: str | None = None,
         source: str = "manual",
+        allow_any_ready: bool = True,
     ) -> Any:
         """创建新的沙箱实例。
 
         timeout = 沙箱【生命周期】秒数(到期远端自动销毁)。默认取 worker
         max_execution_time(通常 600s)——原来硬编码 60s 会导致 mvn/npm 等长构建
         跑到一半沙箱就被远端杀，后续 run_code/run_command 打到死沙箱返回 502。
+
+        allow_any_ready=False（worker/pool 派发路径，B8）：禁用模板解析第③级
+        "任一 READY"跨栈兜底，配置/项目专属镜像均不可得时 fail-honest 抛错
+        （走 invalidate+重建链路），绝不拿异栈镜像硬跑。
         """
         from e2b_code_interpreter import Sandbox
 
@@ -713,7 +818,7 @@ class SandboxManager:
                 timeout = 600
         # 治本：随 CubeMaster 真实可用模板解析（配置漂移自愈兜底），杜绝死配不存在的模板 ID
         # 致 create 必炸 130404 / 静默降级本地（2026-06-29 实证根因）。
-        template = self._resolve_template(template_id, project_id)
+        template = self._resolve_template(template_id, project_id, allow_any_ready=allow_any_ready)
         t0 = time.monotonic()
         logger.info("Creating sandbox with template=%s project=%s timeout=%ss", template, project_id, timeout)
 
@@ -1117,10 +1222,13 @@ class SandboxManager:
                     line = line.rstrip()
                     if not line or line.startswith("total "):
                         continue
-                    parts = line.split(None, 4)
-                    if len(parts) < 5:
+                    # B6（19号文）：--time-style=+ 抹掉时间列后是 6 列
+                    # (perms links owner group size name)，按 5 列解包会把 group 当
+                    # size（int() 失败恒 0）、把 "size name" 整体当文件名（假路径）。
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
                         continue
-                    perms, _links, _owner, size_s, name = parts
+                    perms, _links, _owner, _group, size_s, name = parts
                     if name in (".", ".."):
                         continue
                     is_dir = perms.startswith("d") or name.endswith("/")
@@ -1256,10 +1364,7 @@ print(json.dumps(items))
             remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
                 data = path.read_bytes()
-                if use_files_api:
-                    sandbox.files.write(remote_path, data)
-                else:
-                    self._write_file_via_code(sandbox, remote_path, data)
+                self._write_remote_file(sandbox, remote_path, data, use_files_api)
                 stats["uploaded"] += 1
             except Exception as exc:
                 msg = f"{rel_posix}: {exc}"
@@ -1316,11 +1421,43 @@ print(json.dumps(files))
             line = result.stdout.strip().split("\n")[-1]
             return _json.loads(line)
 
+        def _walk_remote_via_shell() -> list[str]:
+            # B10（19号文）：walk 补 run_command 兜底，与 read/list/write 三函数对称——
+            # 自建语言镜像无 Jupyter kernel 时 run_code 确定性 502，无兜底则
+            # downloaded=0、调用方只看 downloaded 即静默丢全部产出。prune 目录集与
+            # run_code 版同集。显式 RC 标记区分"find 失败"与"目录为空"（皆空输出）。
+            # 已知边界：文件名含换行的病态条目会断行（与 find -print 语义同源，生产形态
+            # 不产生此类文件名）。
+            _qr = shlex.quote(remote_root)
+            cr = self.run_command(
+                sandbox,
+                f"find {_qr} -type d \\( -name .git -o -name __pycache__ -o -name .venv "
+                f"-o -name node_modules \\) -prune -o -type f -print 2>/dev/null; "
+                f"echo __WALK_RC__$?",
+                timeout=120,
+            )
+            out = (cr.stdout or "").strip()
+            lines = out.splitlines()
+            if not lines or lines[-1] != "__WALK_RC__0":
+                raise RuntimeError(f"shell walk failed: {lines[-1] if lines else 'no output'}")
+            return [ln for ln in lines[:-1] if ln.strip()]
+
         try:
             remote_files = _walk_remote_via_run_code()
         except Exception as exc:
-            stats["errors"].append(f"walk {remote_root}: {exc}")
-            remote_files = []
+            remote_files = None
+            if hasattr(self, "run_command"):
+                try:
+                    remote_files = _walk_remote_via_shell()
+                    logger.info("walk 经 run_command(shell find) 兜底成功: %s", remote_root)
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning(
+                        "walk run_code 与 shell 兜底双失败: %s: %r / %r",
+                        remote_root, exc, exc2,
+                    )
+            if remote_files is None:
+                stats["errors"].append(f"walk {remote_root}: {exc}")
+                remote_files = []
 
         for remote_path in remote_files:
             prefix = remote_root.rstrip("/")
@@ -1421,15 +1558,7 @@ print(json.dumps(files))
             remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
                 data = local_path.read_bytes()
-                if use_files_api:
-                    self._ensure_remote_dir(
-                        sandbox,
-                        remote_path.rsplit("/", 1)[0],
-                        use_files_api,
-                    )
-                    sandbox.files.write(remote_path, data)
-                else:
-                    self._write_file_via_code(sandbox, remote_path, data)
+                self._write_remote_file(sandbox, remote_path, data, use_files_api)
                 stats["uploaded"] += 1
                 stats["files"].append(rel_posix)
                 self._record_sandbox_success(sandbox.sandbox_id)
@@ -1510,7 +1639,13 @@ print(json.dumps(files))
                 # 保持行尾与 git HEAD 一致 → git diff 同源、apply 必成功。二进制/已是 LF 的不动。
                 data = self._preserve_line_endings(local_path, data)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                if _is_shared_manifest(rel_posix):
+                # reviewer R1 MEDIUM：package.json 只按【incoming 内容】判 workspaces 有
+                # 旁路——worker 整体重写根 package.json 丢掉 workspaces 键（LLM 真实会犯）
+                # → 判 False 走无锁盲写 → 兄弟已注册成员蒸发（恰是 B7 要防的死法从后门
+                # 复现）。OR 上【本地盘内容】判定：本地既有聚合态不因远端重写而失保护
+                # （fail-closed 方向；子包 package.json 本地无 workspaces 键，锁面不扩）。
+                if (_is_shared_manifest(rel_posix, data)
+                        or _is_shared_manifest_on_disk(rel_posix, local_root)):
                     # 主干A：聚合清单写盘与 diff 用同一把 per-project flock 串行，杜绝并发 worker
                     # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
                     # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
@@ -1525,7 +1660,13 @@ print(json.dumps(files))
                             data = self._merge_manifest_with_local(
                                 local_path, rel_posix, data)
                             _atomic_write_bytes(local_path, data)
-                    except Exception:
+                    except Exception as _mf_exc:  # noqa: BLE001
+                        # B4（19号文，R48c-1 sibling）：降级盲覆盖必须可观测——锁不可用/
+                        # merge 抛错时静默退回"并发盲覆盖致修复蒸发"的旧行为，复发不可见。
+                        logger.warning(
+                            "共享清单 flock+merge 降级为盲覆盖（并发修复蒸发风险复活）: %s: %r",
+                            rel_posix, _mf_exc,
+                        )
                         _atomic_write_bytes(local_path, data)
                 else:
                     # A6：非 manifest 文件不加锁（保持并行无开销），但原子写杜绝并发 torn-write。
@@ -1565,7 +1706,11 @@ print(json.dumps(files))
             merged = merge_shared_manifest(
                 local_text, incoming_text, rel_posix, base_dir=local_path.parent)
             return merged.encode("utf-8") if merged != incoming_text else data
-        except Exception:  # noqa: BLE001 — fail-open
+        except Exception as _mm_exc:  # noqa: BLE001 — fail-open
+            # reviewer R1 LOW-2：merge 内部降级（decode/读盘失败）与外层 flock 降级
+            # 分账——此处盲覆盖也要可观测（B4 同纪律）。
+            logger.warning(
+                "共享清单并集合并内部降级为盲覆盖: %s: %r", rel_posix, _mm_exc)
             return data
 
     @staticmethod
@@ -1614,6 +1759,23 @@ print(json.dumps(files))
             f"import os; os.makedirs({remote_root!r}, exist_ok=True)",
             timeout=15,
         )
+
+    def _write_remote_file(
+        self, sandbox: Any, remote_path: str, data: bytes, use_files_api: bool
+    ) -> None:
+        """单文件上传共享逻辑（B11：精准上传与全量同步的逐文件回退两路径对称）。
+
+        envd files.write 不保证自动建父目录——嵌套路径必须先 _ensure_remote_dir，
+        否则 tar 批量失败回退逐文件时嵌套文件全报错（worker 在半截项目树上编译）。
+        run_code 通道自带 makedirs（见 _write_file_via_code），无需额外建目录。
+        """
+        if use_files_api:
+            parent = remote_path.rsplit("/", 1)[0] if "/" in remote_path else ""
+            if parent:
+                self._ensure_remote_dir(sandbox, parent, use_files_api)
+            sandbox.files.write(remote_path, data)
+        else:
+            self._write_file_via_code(sandbox, remote_path, data)
 
     def _write_file_via_code(
         self, sandbox: Any, remote_path: str, data: bytes

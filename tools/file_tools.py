@@ -219,7 +219,7 @@ def _is_not_found_err(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(
         k in s for k in (
-            "not a file or empty", "does not exist", "no such file",
+            "not a file", "does not exist", "no such file",
             "文件不存在", "filenotfounderror", "read failed:",
         )
     ) or isinstance(exc, FileNotFoundError)

@@ -113,7 +113,8 @@ class _FakePoolManager:
         self.killed: list[str] = []
         self._meta: dict[str, dict] = {}
 
-    def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual"):
+    def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual",
+               allow_any_ready=True):
         sbx = _FakeSandbox()
         self.created.append(sbx)
         self._meta[sbx.sandbox_id] = {"project_id": project_id, "task_id": task_id, "source": source}

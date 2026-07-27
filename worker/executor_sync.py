@@ -569,16 +569,20 @@ class _SandboxSyncMixin:
         # 共享清单不在内 → r49 实测 H2 用 HEAD 作基线把兄弟自 HEAD 以来的注册全当本
         # worker 新增剥光。快照=worker 起点视角，兄弟先行贡献天然在内、绝不被误摘。
         try:
-            from swarm.worker.sandbox import _is_shared_manifest
+            from swarm.worker.sandbox import _is_shared_manifest, _is_shared_manifest_on_disk
             _mani: dict[str, str] = {}
             sc = getattr(self.subtask, "scope", None)
             _cands = {str(f).replace("\\", "/").lstrip("/")
                       for f in (list(getattr(sc, "create_files", None) or [])
                                 + list(getattr(sc, "writable", None) or []))
-                      if _is_shared_manifest(str(f).replace("\\", "/"))}
+                      if _is_shared_manifest_on_disk(
+                          str(f).replace("\\", "/").lstrip("/"), local_root)}
+            # B7：package.json 加入根清单扫描（on_disk 版按内容判 workspaces——
+            # 仅聚合根纳入，子包 package.json 不进快照）。
             for _base in ("pom.xml", "settings.gradle", "settings.gradle.kts",
-                          "build.gradle", "build.gradle.kts", "Cargo.toml", "go.work"):
-                if (local_root / _base).is_file():
+                          "build.gradle", "build.gradle.kts", "Cargo.toml", "go.work",
+                          "package.json"):
+                if (local_root / _base).is_file() and _is_shared_manifest_on_disk(_base, local_root):
                     _cands.add(_base)
             for _rel in _cands:
                 _lp = local_root / _rel
@@ -864,12 +868,15 @@ class _SandboxSyncMixin:
         注册（兄弟是加法）。持 per-project flock（读-改-写原子）。任何异常 fail-open 不阻断 pull-back。
         """
         try:
-            from swarm.worker.sandbox import _is_shared_manifest
+            from swarm.worker.sandbox import _is_shared_manifest_on_disk
             from swarm.worker.workspace_manifest import (
                 restore_baseline_version_anchors,
             )
             own = dict(getattr(self, "_post_sync_contents", None) or {})
-            rels = sorted(r for r in own if r and _is_shared_manifest(r))
+            # B7：on_disk 版判定——npm workspaces 聚合根 package.json 纳入候选。
+            # 名实边界（reviewer R1 LOW-1）：锚还原驱动 restore_baseline_version_anchors
+            # 当前仅 pom.xml 消费，npm 面此处纳入暂无实际行为（预留同判据口径，防漂移）。
+            rels = sorted(r for r in own if r and _is_shared_manifest_on_disk(r, local_root))
             if not rels:
                 return
 
@@ -960,7 +967,7 @@ class _SandboxSyncMixin:
         """
         import subprocess as _sp
 
-        from swarm.worker.sandbox import _is_shared_manifest
+        from swarm.worker.sandbox import _is_shared_manifest_on_disk
         from swarm.worker.workspace_manifest import strip_worker_manifest_contribs
         root = self.project_path
         if not root:
@@ -984,7 +991,10 @@ class _SandboxSyncMixin:
         for f in (list(getattr(sc, "create_files", None) or [])
                   + list(getattr(sc, "writable", None) or [])):
             rels.add(str(f).replace("\\", "/").lstrip("/"))
-        manifests = sorted(r for r in rels if r and _is_shared_manifest(r))
+        # B7：on_disk 版判定——npm 聚合根纳入回滚候选。名实边界（reviewer R1 LOW-1）：
+        # strip_worker_manifest_contribs 当前仅 pom.xml 消费；npm 面的有效消费=下方
+        # "HEAD 不存在 → 删除本地文件"分支（清单类型无关，真实生效）。
+        manifests = sorted(r for r in rels if r and _is_shared_manifest_on_disk(r, root))
         if not manifests:
             return
         base = resolve_base_ref(getattr(self, "base_ref", None))
@@ -1633,8 +1643,14 @@ class _SandboxSyncMixin:
                         # 对共享清单：快照与磁盘现文本先并集合并再写（同一内核，锁已持有）。
                         _out = _txt.encode("utf-8")
                         try:
-                            from swarm.worker.sandbox import _is_shared_manifest
-                            if _is_shared_manifest(_f) and _lp.is_file():
+                            from swarm.worker.sandbox import (
+                                _is_shared_manifest, _is_shared_manifest_on_disk,
+                            )
+                            # B7：content 传入判 workspaces——npm 聚合根同享并集合并防盲覆盖。
+                            # reviewer R1 MEDIUM：快照内容丢 workspaces 键（worker 重写整文件）
+                            # 时 OR 本地盘内容判定，防无保护盲写蒸发兄弟注册（fail-closed）。
+                            if (_is_shared_manifest(_f, _txt)
+                                    or _is_shared_manifest_on_disk(_f, root)) and _lp.is_file():
                                 from swarm.worker.workspace_manifest import (
                                     merge_shared_manifest,
                                 )

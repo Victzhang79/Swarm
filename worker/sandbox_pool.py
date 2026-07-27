@@ -92,8 +92,13 @@ class HotSandboxPool:
             from swarm.config.settings import get_config
             if get_config().sandbox.isolate_per_project and project_id:
                 return f"{tpl}@@proj:{project_id}"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _bk_exc:  # noqa: BLE001
+            # B12④：配置读取异常会静默丢 project 隔离（跨项目复用同一沙箱=工作区互染），
+            # 降级必须可观测。
+            logger.warning(
+                "pool _bucket_key 读取 isolate_per_project 配置异常，退化无 project 隔离桶键: %r",
+                _bk_exc,
+            )
         return tpl
 
     def _is_expired_ttl(self, entry: _PoolEntry, now: float) -> bool:
@@ -113,9 +118,13 @@ class HotSandboxPool:
         self, template_id: str | None, *, project_id: str | None = None,
         task_id: str | None = None,
     ) -> Any:
-        """锁外调用：创建沙箱，异常不外泄（失败时 re-raise 让 acquire 处理）。"""
+        """锁外调用：创建沙箱，异常不外泄（失败时 re-raise 让 acquire 处理）。
+
+        B8：池派发路径 allow_any_ready=False——禁用模板解析"任一 READY"跨栈兜底，
+        配置/项目专属镜像均不可得时 fail-honest 抛错走 invalidate+重建链路。"""
         sandbox = self._manager.create(
-            template_id, project_id=project_id, task_id=task_id, source="pool"
+            template_id, project_id=project_id, task_id=task_id, source="pool",
+            allow_any_ready=False,
         )
         return sandbox
 
@@ -321,7 +330,8 @@ class HotSandboxPool:
         sandbox = self._create_sandbox(template_id, project_id=project_id, task_id=task_id)
 
         # D29：读回 create 时 _resolve_template 的【实际】解析结果作为桶键记账值。配置模板被
-        # 回收时 create 会自愈落到任意 READY 镜像（可能异语言）——桶键若仍用请求 template_id，
+        # 回收时 create 会自愈落到项目匹配镜像（B8 后派发路径已禁"任一 READY"跨栈兜底，
+        # 解析不到即 fail-honest 抛错，不会再落异语言镜像）——桶键若仍用请求 template_id，
         # 后续同请求的子任务会复用到错语言镜像（java 复用无 JDK 镜像 → mvn 127）。桶键用实际
         # 镜像后：漂移镜像挂真实桶，java 请求匹配不上 → 新建（fail-closed），不误配。
         actual_tpl = None
@@ -487,7 +497,12 @@ class HotSandboxPool:
             items = getattr(paginator, "sandboxes", None)
             if items is not None:
                 _collect(items)
-                return alive
+                # B2（19号文，D42 sibling）：.sandboxes 分支不得拿到首页即早退——
+                # 若该返回对象同时具备分页能力（has_next/next_items），首页之外仍有
+                # 存活沙箱，半截列表会把落在后页的 idle 误判幽灵剔账（与 D42 描述的
+                # 死法一字不差）。无分页能力才可就此返回，否则落到下方同一分页循环。
+                if not hasattr(paginator, "next_items"):
+                    return alive
             if hasattr(paginator, "next_items"):
                 # D42 治本：分页 API 必须拉【全量】——只取首页时，落在后页的 idle 条目会被
                 # 误判幽灵剔账本且不 kill（远端活沙箱无人管吃配额，池退化持续新建）。
@@ -534,6 +549,10 @@ class HotSandboxPool:
         now = time.monotonic()
 
         # 锁外拉服务端权威存活列表（慢调用不持锁）。None=拉取失败，本轮不清幽灵。
+        # B12③（TOCTOU）：记录拉取时刻——之后新建的极速归还沙箱不在 alive 快照里，
+        # 若照判幽灵会被误剔账（有 TTL 兜底损害有界，但纯属误伤）。只判 created_at
+        # 早于拉取时刻的条目。
+        alive_fetched_at = time.monotonic()
         alive_ids = self._server_alive_ids()
 
         with self._lock:
@@ -544,7 +563,8 @@ class HotSandboxPool:
                     sid = entry.sandbox.sandbox_id
                     if self._is_expired_ttl(entry, now) or self._is_expired_idle(entry, now):
                         to_kill.append(sid)
-                    elif alive_ids is not None and sid not in alive_ids:
+                    elif (alive_ids is not None and sid not in alive_ids
+                          and entry.created_at <= alive_fetched_at):
                         # 幽灵：Swarm 池还留着，但服务端已无此沙箱 → 剔除（无需远端 kill）
                         ghost_sids.append(sid)
                     else:

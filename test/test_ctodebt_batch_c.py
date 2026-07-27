@@ -56,59 +56,43 @@ def test_sandbox_create_fail_with_project_source_is_fail_closed():
 def test_template_exists_probe_distinguishes_missing_vs_present():
     from swarm.worker import image_builder as ib
 
-    class _FakeResp:
-        def __init__(self, body):
-            self._b = body
-        def read(self):
-            return self._b
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-
-    import json as _json
-
     # store 里只有 tpl-present；探活 tpl-missing 应返回 False、tpl-present 返回 True
-    body = _json.dumps([{"templateID": "tpl-present", "status": "READY"}]).encode()
+    # B9 后探活走统一封装 query_cubemaster_templates（sandbox.py，httpx 双认证头），
+    # mock 边界同步上移（行为断言不变：存在→True / 不存在→False / 空 id→False）。
+    import swarm.worker.sandbox as _sb_mod
 
-    # 须给一个有效 api_url：否则无 .env 环境(CI)下 api_url 为空 → 函数早返 None；
-    # 且 Py3.14 起 urllib Request() 对无 scheme 的 "/templates" 在构造期即抛 ValueError。
     from swarm.config import get_config
     _sb = get_config().sandbox
     _old_url = _sb.api_url
     _sb.api_url = "http://cubemaster.test/api"
-
-    # monkeypatch 函数内 import 的 urllib.request.urlopen
-    import urllib.request as _ur
-    _orig = _ur.urlopen
+    _orig = _sb_mod.query_cubemaster_templates
     try:
-        _ur.urlopen = lambda *a, **k: _FakeResp(body)
+        _sb_mod.query_cubemaster_templates = lambda cfg, timeout=10.0: [
+            {"id": "tpl-present", "status": "READY", "imageInfo": ""}]
         assert ib.template_exists_in_cubemaster("tpl-present") is True, "存在的模板应判 True"
         assert ib.template_exists_in_cubemaster("tpl-missing") is False, "被清的模板应判 False（触发重建）"
         assert ib.template_exists_in_cubemaster("") is False, "空 id 直接 False"
     finally:
-        _ur.urlopen = _orig
+        _sb_mod.query_cubemaster_templates = _orig
         _sb.api_url = _old_url
 
 
 def test_template_exists_probe_returns_none_on_network_error():
     """探活本身失败（网络/认证）→ None（无法判定，调用方保守复用+告警，不误触发重建）。"""
     from swarm.worker import image_builder as ib
-    import urllib.request as _ur
+    import swarm.worker.sandbox as _sb_mod
 
     from swarm.config import get_config
     _sb = get_config().sandbox
     _old_url = _sb.api_url
     _sb.api_url = "http://cubemaster.test/api"  # 须有效 url，否则 CI 空 api_url 会先早返 None（绕过本测的网络错误路径）
 
-    _orig = _ur.urlopen
+    _orig = _sb_mod.query_cubemaster_templates
     try:
-        def _boom(*a, **k):
-            raise OSError("connection refused")
-        _ur.urlopen = _boom
+        _sb_mod.query_cubemaster_templates = lambda cfg, timeout=10.0: None  # 查询失败
         assert ib.template_exists_in_cubemaster("tpl-x") is None, "探活失败应返回 None（无法判定）"
     finally:
-        _ur.urlopen = _orig
+        _sb_mod.query_cubemaster_templates = _orig
         _sb.api_url = _old_url
 
 

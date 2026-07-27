@@ -39,6 +39,25 @@ class _SandboxLifecycleMixin:
                     self._log(f"远程沙箱已销毁: {sid}")
             except Exception as e:
                 self._log(f"沙箱释放失败: {e}")
+                # W-5（21 号文）：释放通道抛异常后若直接置空引用，沙箱既不回池也未销毁
+                # =幽灵泄漏（烧远端配额，仅 ghost reap 兜底）。置空前先经【另一通道】
+                # 兜底销毁：池路径失败→manager.kill；非池路径失败→同通道 manager.kill
+                # 重试。双失败如实 WARNING。
+                try:
+                    if from_pool and pool is not None:
+                        self._sandbox_manager.kill(sid)
+                        self._log(f"沙箱释放兜底（manager.kill）成功: {sid}")
+                    else:
+                        # 非池借用（或 pool 引用缺失）→ 唯一另一通道是 manager.kill。
+                        # （hunter R1-L4：pool.release 兜底对外来沙箱会错扣 borrowed
+                        # 计数，且 _sandbox_pool 仅在 from_pool 时赋值，该分支本不可达。）
+                        self._sandbox_manager.kill(sid)
+                        self._log(f"沙箱释放兜底（manager.kill）成功: {sid}")
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning(
+                        "沙箱 %s 释放双通道均失败（幽灵泄漏，待 reap 兜底）: %r / %r",
+                        sid, e, e2,
+                    )
             self._sandbox = None
             self._sandbox_manager = None
             self._sandbox_pool = None

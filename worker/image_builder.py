@@ -46,10 +46,6 @@ def template_exists_in_cubemaster(template_id: str) -> bool | None:
     返回：True=存在；False=确认不存在（store 里没有此 id）；None=探活本身失败
     （网络/认证错误，无法判定）——None 时调用方应保守不复用（按需重建更安全）。
     """
-    import json
-    import ssl
-    import urllib.request
-
     from swarm.config import get_config
 
     if not template_id:
@@ -58,21 +54,18 @@ def template_exists_in_cubemaster(template_id: str) -> bool | None:
         s = get_config().sandbox
         if not getattr(s, "api_url", ""):
             # 没配 CubeMaster 端点(api_url 空)→ 无从探活，返回 None(无法判定，调用方保守不复用)。
-            # 也避免 Py3.14 起 urllib Request() 对无 scheme 的 "/templates" 在构造期即抛 ValueError。
             logger.warning("template_exists_in_cubemaster(%s)：sandbox.api_url 未配置，无法探活", template_id)
             return None
-        url = s.api_url.rstrip("/") + "/templates"
-        headers = {"Authorization": f"Bearer {s.api_key}"} if getattr(s, "api_key", "") else {}
-        req = urllib.request.Request(url, headers=headers)
-        ctx = None
-        if url.lower().startswith("https") and not getattr(s, "verify_ssl", True):
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
-        ids = {t.get("templateID") or t.get("template_id") for t in data} if isinstance(data, list) else set()
-        return template_id in ids
+        # B9（19号文）：收敛到单一模板查询封装——历史上此处用 Bearer、manager 用
+        # X-API-KEY，服务端只认其一时本路径恒 401 → 恒判"不复用"→ 每次任务重烤
+        # 20min 级专属镜像。封装内双头并发，两处行为一致。
+        from swarm.worker.sandbox import query_cubemaster_templates
+
+        items = query_cubemaster_templates(s, timeout=10.0)
+        if items is None:
+            logger.warning("template_exists_in_cubemaster(%s) 探活失败（无法判定）", template_id)
+            return None
+        return template_id in {t["id"] for t in items}
     except Exception as exc:  # noqa: BLE001
         logger.warning("template_exists_in_cubemaster(%s) 探活失败（无法判定）: %s", template_id, exc)
         return None
@@ -412,6 +405,10 @@ _SRC_EXCLUDE_EXTS = {
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
     ".mp3", ".mp4", ".wav", ".avi", ".mov",
 }
+# W-3（21 号文）：tarball 单文件尺寸阈值显式常量。>阈值的合法产物（SQL 种子/
+# 生成代码/bundle 源）会被 skip——必须 WARNING 可观测，否则镜像缺文件→沙箱假编译错
+# 无迹可查。
+_TARBALL_MAX_FILE_BYTES = 5 * 1024 * 1024
 
 
 def _make_source_tarball(project_root: str | Path) -> bytes:
@@ -444,19 +441,36 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 out_buf = io.BytesIO()
                 with tarfile.open(fileobj=src_buf, mode="r:") as src_tar, \
                      tarfile.open(fileobj=out_buf, mode="w:gz") as out_tar:
+                    _skipped_big = 0
+                    _skipped_link = 0
                     for member in src_tar.getmembers():
                         if not member.isfile():
+                            # W-3：symlink/submodule gitlink 不随 tarball 进镜像（git
+                            # archive 对 submodule 只出占位）——计数落账，不静默。
+                            if member.issym() or member.islnk():
+                                _skipped_link += 1
                             continue
                         parts = member.name.split("/")
                         if any(p in _SRC_EXCLUDE_DIRS for p in parts):
                             continue
                         if Path(member.name).suffix.lower() in _SRC_EXCLUDE_EXTS:
                             continue
-                        if member.size > 5 * 1024 * 1024:
+                        if member.size > _TARBALL_MAX_FILE_BYTES:
+                            _skipped_big += 1
+                            logger.warning(
+                                "源码 tarball 跳过超限文件（镜像将缺此文件，沙箱编译错先查此账）"
+                                ": %s size=%d > %d",
+                                member.name, member.size, _TARBALL_MAX_FILE_BYTES,
+                            )
                             continue
                         f = src_tar.extractfile(member)
                         if f is not None:
                             out_tar.addfile(member, f)
+                    if _skipped_link:
+                        logger.warning(
+                            "源码 tarball 跳过 %d 个 symlink/硬链接（镜像内将为缺文件状态）",
+                            _skipped_link,
+                        )
                 return out_buf.getvalue()
         except Exception:  # noqa: BLE001 — git archive 失败回退工作区扫描
             pass
@@ -477,7 +491,12 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 continue
             # 跳过超大文件（>5MB，源码不应有，多半是误置的二进制/数据）
             try:
-                if path.stat().st_size > 5 * 1024 * 1024:
+                if path.stat().st_size > _TARBALL_MAX_FILE_BYTES:
+                    # W-3：合法大产物（SQL 种子/生成代码）被 skip 必须可观测
+                    logger.warning(
+                        "源码 tarball 跳过超限文件（镜像将缺此文件）: %s > %d bytes",
+                        path, _TARBALL_MAX_FILE_BYTES,
+                    )
                     continue
             except OSError:
                 continue
@@ -724,8 +743,16 @@ def _dependency_fingerprint(project_root: str | Path) -> str:
                     continue
             h.update(rel.encode())
             h.update(data)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _fp_exc:  # noqa: BLE001
+        # B12⑦（19号文）：裸 except 静默返回"空指纹"（h 无输入 → 恒定 hexdigest）=
+        # 不同项目/不同依赖状态同指纹 → 潜在误复用陈旧模板。fail-honest：异常返回
+        # 随机指纹（永不匹配 → 强制重建，方向安全）+ WARNING 可观测。
+        import uuid as _uuid
+        logger.warning(
+            "_dependency_fingerprint(%s) 扫描异常，返回随机指纹强制重建（不误复用陈旧模板）: %r",
+            project_root, _fp_exc,
+        )
+        return f"err-{_uuid.uuid4().hex[:12]}"
     return h.hexdigest()[:12]
 
 

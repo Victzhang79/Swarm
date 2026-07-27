@@ -254,7 +254,7 @@ def sweep_baseline_anchor_poison(
     if not project_path or plan_obj is None:
         return [], 0
     from swarm.worker.git_flock import _ProjectGitFlock
-    from swarm.worker.sandbox import _is_shared_manifest
+    from swarm.worker.sandbox import _is_shared_manifest_on_disk
     from swarm.worker.workspace_manifest import restore_baseline_version_anchors
 
     root = str(project_path)
@@ -280,7 +280,10 @@ def sweep_baseline_anchor_poison(
             dirs[:] = [d for d in dirs if d not in _SWEEP_PRUNE_DIRS]
             for fn in files:
                 rel = os.path.relpath(os.path.join(droot, fn), root).replace(os.sep, "/")
-                if _is_shared_manifest(rel):
+                # B7：on_disk 版判定——npm workspaces 聚合根按内容纳入扫描。名实边界
+                # （reviewer R1 LOW-1）：锚还原驱动当前仅 pom.xml 消费，npm 面暂无实际
+                # 行为（预留同判据口径）。
+                if _is_shared_manifest_on_disk(rel, root):
                     candidates.append(rel)
     except OSError as e:
         logger.warning("[T3] 基线锚修复扫描无法遍历项目树（%s）→ 本轮扫描盲", e)

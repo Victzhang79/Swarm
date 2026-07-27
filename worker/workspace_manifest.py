@@ -961,6 +961,51 @@ def restore_baseline_version_anchors(
         return text, []
 
 
+def _merge_npm_workspaces(local_text: str, incoming_text: str, rel_path: str) -> str:
+    """B7（19号文）：npm workspaces 聚合清单并集——local 独有的 workspaces 成员并回
+    incoming（与 pom <modules> 并集同构：并行 worker 各注册一个子包，陈旧副本盲覆盖
+    会丢成员）。
+
+    支持两种 workspaces 形态：数组形（npm/yarn 经典）与 {"packages": [...]} 对象形
+    （yarn 扩展）。仅当两侧都有成员列表时才并；incoming 无 workspaces 键 → 保守返回
+    incoming（不臆造结构，与 pom 侧"无主依赖区不并"同取舍）。合并仅在有真实缺失
+    成员时发生 → 无缺失原样返回 incoming（零 diff churn）；有缺失时整文件经 JSON
+    重序列化（indent=2）——格式归一是已知取舍，换确定性成员并集。加法-only 同 pom 侧
+    债（内容级有意删除会被并回复活）。任何异常 fail-open 返回 incoming。
+    """
+    import json as _json
+
+    try:
+        loc = _json.loads(local_text)
+        inc = _json.loads(incoming_text)
+        if not isinstance(loc, dict) or not isinstance(inc, dict):
+            return incoming_text
+
+        def _ws_list(obj: dict) -> "list | None":
+            w = obj.get("workspaces")
+            if isinstance(w, list):
+                return w
+            if isinstance(w, dict) and isinstance(w.get("packages"), list):
+                return w["packages"]
+            return None
+
+        loc_ws = _ws_list(loc)
+        inc_ws = _ws_list(inc)
+        if not loc_ws or inc_ws is None:
+            return incoming_text
+        missing = [x for x in loc_ws if x not in inc_ws]
+        if not missing:
+            return incoming_text
+        inc_ws.extend(missing)
+        logger.info(
+            "[workspace-manifest] B7 npm workspaces 并集合并 %s：并回 local 独有成员 "
+            "%d 个（陈旧副本覆盖丢注册面）", rel_path, len(missing))
+        return _json.dumps(inc, ensure_ascii=False, indent=2) + "\n"
+    except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
+        logger.warning("[workspace-manifest] B7 npm 合并异常 fail-open: %s", exc)
+        return incoming_text
+
+
 def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
                           base_dir: "Path | None" = None) -> str:
     """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。
@@ -977,6 +1022,8 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
     """
     try:
         name = rel_path.rsplit("/", 1)[-1].lower()
+        if name == "package.json":
+            return _merge_npm_workspaces(local_text, incoming_text, rel_path)
         if name != "pom.xml" or local_text == incoming_text:
             return incoming_text
         merged = incoming_text

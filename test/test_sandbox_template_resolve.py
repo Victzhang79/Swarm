@@ -69,6 +69,42 @@ def test_default_template_used_when_none_passed():
         assert _mgr()._resolve_template(None, project_id=None) in {"tpl-projA", "tpl-projB"}
 
 
+# ── B8：worker/pool 派发路径禁用第③级"任一 READY"跨栈兜底 ──────────────
+
+
+def test_b8_dispatch_path_rejects_any_ready_fallback():
+    """B8：allow_any_ready=False（派发路径）时，配置漂移+无项目匹配 → fail-honest 抛错
+    （带 stale 标记命中 invalidate 链），绝不拿 READY 集首个异栈镜像硬跑。"""
+    import pytest as _pt
+
+    with _patch(_SERVER):
+        with _pt.raises(RuntimeError, match="is stale"):
+            _mgr()._resolve_template(
+                "tpl-default-stale", project_id="ffffffff-0000", allow_any_ready=False)
+
+
+def test_b8_dispatch_path_still_uses_project_match():
+    """B8 不倒：第②级项目匹配在派发路径照常生效。"""
+    with _patch(_SERVER):
+        got = _mgr()._resolve_template(
+            "tpl-default-stale", project_id="5d0e9db8-d000-40f6", allow_any_ready=False)
+    assert got == "tpl-projA"
+
+
+def test_b8_dispatch_path_respects_configured_ready():
+    """B8 不倒：第①级配置命中 READY 在派发路径照常生效。"""
+    with _patch(_SERVER):
+        assert _mgr()._resolve_template(
+            "tpl-projB", project_id=None, allow_any_ready=False) == "tpl-projB"
+
+
+def test_b8_manual_path_keeps_any_ready():
+    """B8 边界：手动/WebUI 路径（默认 allow_any_ready=True）保留任一 READY 自愈。"""
+    with _patch(_SERVER):
+        got = _mgr()._resolve_template("tpl-default-stale", project_id="ffffffff-0000")
+    assert got in {"tpl-projA", "tpl-projB"}
+
+
 if __name__ == "__main__":
     import sys
 

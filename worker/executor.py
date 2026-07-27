@@ -530,6 +530,8 @@ class WorkerExecutor(
                                 project_id=self.project_id,
                                 task_id=self.task_id or self.subtask.id,
                                 source=f"worker:{self.subtask.id}",
+                                # B8：派发路径禁"任一 READY"跨栈兜底（fail-honest 走重建链）
+                                allow_any_ready=False,
                             )
                         # envd 健康探活
                         if _health_on and not self._sandbox_manager.health_check(self._sandbox):

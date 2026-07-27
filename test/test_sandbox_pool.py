@@ -60,7 +60,8 @@ class FakeManager:
         self._cleaned: list[str] = []
         self._clean_fail_ids: set[str] = set()
 
-    def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual"):
+    def create(self, template_id=None, timeout=60, *, project_id=None, task_id=None, source="manual",
+               allow_any_ready=True):
         self._next_id += 1
         sbx = FakeSandbox(f"sbx-{self._next_id}")
         # 刻意不设 sbx.template_id：真实 E2B 对象无此属性（见 FakeSandbox docstring）。
@@ -245,6 +246,24 @@ def test_reap_skips_ghost_when_server_list_unavailable(monkeypatch):
     result = pool.reap()
     assert result["ghosts"] == 0 and result["kept"] == 1
     print("  ✅ 服务端列表不可用时跳过幽灵清理(不误杀)")
+
+
+def test_b12_reap_toctou_new_entry_not_judged_ghost(monkeypatch):
+    """B12③（TOCTOU）：alive 快照拉取【之后】才入池的条目不得按快照判幽灵——
+    新建极速归还的沙箱不在快照里是常态，照判=误剔账。"""
+    mgr = FakeManager()
+    pool = _make_pool(mgr, ttl_seconds=600, idle_seconds=300)
+    sbx = pool.acquire("tpl-a")
+    pool.release(sbx, reusable=True)
+    # 模拟"快照拉取之后才创建归还"：created_at 晚于 reap 内拉取时刻
+    with pool._lock:
+        for entry in pool._pool.get("tpl-a", []):
+            entry.created_at = time.monotonic() + 60
+    monkeypatch.setattr(pool, "_server_alive_ids", lambda: set())  # 快照不含它
+    result = pool.reap()
+    assert result["ghosts"] == 0, f"快照后新建的条目不得判幽灵, got {result}"
+    assert result["kept"] == 1
+    print("  ✅ reap TOCTOU：快照后新建条目不误判幽灵")
 
 
 def test_max_total_temp_sandbox():

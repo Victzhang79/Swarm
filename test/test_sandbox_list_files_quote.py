@@ -32,7 +32,8 @@ def test_list_files_shell_fallback_quotes_path():
 
     def _fake_run_command(sandbox, command, timeout=120, **kw):
         captured["cmd"] = command
-        return _Result("total 0\n-rw-r--r-- 1 u 12 file.txt")
+        # B6 修正：真实 ls -l 恒为 6 列(perms links owner group size name)
+        return _Result("total 0\n-rw-r--r-- 1 u g 12 file.txt")
 
     m.run_command = _fake_run_command
     path = "/workspace/o'dir; rm -rf ~/$(hostname)"
@@ -52,7 +53,8 @@ def test_list_files_plain_path_still_works():
 
     def _fake_run_command(sandbox, command, timeout=120, **kw):
         captured["cmd"] = command
-        return _Result("total 0\n-rw-r--r-- 1 u 34 App.java\ndrwxr-xr-x 2 u 0 src/")
+        # B6 修正：真实 ls -l 恒为 6 列(perms links owner group size name)
+        return _Result("total 0\n-rw-r--r-- 1 u g 34 App.java\ndrwxr-xr-x 2 u g 0 src/")
 
     m.run_command = _fake_run_command
     files = m.list_files("sb-1", "/workspace/proj")

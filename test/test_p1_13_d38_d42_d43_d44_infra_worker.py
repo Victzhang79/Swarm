@@ -247,6 +247,57 @@ def test_d42_alive_ids_flat_list_api_still_works(monkeypatch):
     assert pool._server_alive_ids() == {"a", "b"}
 
 
+class _HybridPaginator:
+    """B2 形态：首页走 .sandboxes 属性，同时具备分页能力（has_next/next_items）。"""
+
+    def __init__(self, first, rest_pages):
+        self.sandboxes = list(first)
+        self._pages = list(rest_pages)
+
+    @property
+    def has_next(self):
+        return bool(self._pages)
+
+    def next_items(self):
+        return self._pages.pop(0)
+
+
+def test_b2_sandboxes_branch_paginates_when_capable(monkeypatch):
+    """B2（D42 sibling）：.sandboxes 分支拿到首页不得早退——对象同时具备分页能力时
+    必须拉全量，否则后页存活 idle 被误判幽灵剔账。"""
+    import e2b_code_interpreter as e2b
+
+    monkeypatch.setattr(
+        e2b.Sandbox, "list",
+        staticmethod(lambda **kw: _HybridPaginator([_SB("p1")], [[_SB("p2")], [_SB("p3")]])),
+    )
+    pool = _pool_obj()
+    assert pool._server_alive_ids() == {"p1", "p2", "p3"}
+
+
+def test_b2_sandboxes_branch_unexhausted_fail_closed(monkeypatch):
+    """B2 fail-closed 面：.sandboxes + 分页能力但分页永不穷尽（超安全上限）→ 返回 None
+    跳过本轮幽灵清理，绝不拿半截列表误清。"""
+    import e2b_code_interpreter as e2b
+
+    class _HybridEndless:
+        sandboxes = [_SB("first")]
+        _n = 0
+
+        @property
+        def has_next(self):
+            return True
+
+        def next_items(self):
+            type(self)._n += 1
+            return [_SB(f"s{type(self)._n}")]
+
+    monkeypatch.setenv("SWARM_POOL_LIST_MAX_PAGES", "3")
+    monkeypatch.setattr(e2b.Sandbox, "list", staticmethod(lambda **kw: _HybridEndless()))
+    pool = _pool_obj()
+    assert pool._server_alive_ids() is None
+
+
 # ── D43: worker 测试文件判定统一口径 ─────────────────────────────────
 
 
