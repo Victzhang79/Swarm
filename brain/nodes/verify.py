@@ -204,6 +204,52 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     # F2 sibling：git clean 也是共享工作树写操作，入同一把跨进程锁
                     from swarm.worker.git_flock import _ProjectGitFlock
                     with _ProjectGitFlock(project_path):
+                        # M-3（21 号文）：git clean 只删 untracked——放弃者对【tracked】文件的
+                        # 脏改永留共享树（本任务 L2/冒烟 sync 前、后续同项目任务的树均被污染）。
+                        # 与 untracked 清理同清单同锁：先按钉扎 base 分出 tracked 子集
+                        # （ls-tree 对 base 树判定，与 _reset_worktree_to_head 基线同源），
+                        # checkout 回 base 版本撤销脏改；untracked 仍走 git clean。
+                        from swarm.git_base import base_ref_exists, resolve_base_ref
+                        _ab_base = resolve_base_ref(state.get("base_commit"))
+                        if state.get("base_commit") and _ab_base != "HEAD" \
+                                and not base_ref_exists(project_path, _ab_base):
+                            # 同 H2 守卫：钉扎 base 不可达(历史重写/GC)退回 HEAD 防误操作
+                            # （批次1 闸门 reviewer LOW：降级留痕，与 integration_review.py H2 同规格）
+                            logger.warning(
+                                "[VERIFY_L2] M-3：钉扎 base %s 不可达(历史被重写/GC?)，tracked "
+                                "回滚退回 HEAD 口径", str(_ab_base)[:12])
+                            _ab_base = "HEAD"
+                        # 批次1 闸门 reviewer MEDIUM：必须 -z——默认 core.quotePath=true 会把
+                        # 非 ASCII 路径输出成 C 风格引号串，该字面串作 checkout pathspec 全不
+                        # 匹配，而 checkout 多 pathspec 全有或全无 → 整批回滚静默失效。
+                        # -z 关 quoting，空格/换行/中文名全免疫。
+                        _lt = _sp.run(
+                            ["git", "-C", project_path, "ls-tree", "-r", "-z", "--name-only",
+                             _ab_base, "--", *_ab_files],
+                            capture_output=True, text=True, timeout=30)
+                        if _lt.returncode == 0:
+                            _tracked = [p for p in (_lt.stdout or "").split("\0") if p.strip()]
+                        else:
+                            # 批次1 闸门 hunter LOW-2：rc!=0 非异常路径——tracked 回滚被跳过=
+                            # 退回修复前污染基线，降级必须留痕（fail-closed 铁律第 3 条）
+                            _tracked = []
+                            logger.warning(
+                                "[VERIFY_L2] M-3：ls-tree 枚举 tracked 失败（rc=%s），tracked "
+                                "脏改回滚跳过（退回 untracked-only 清理基线）: %s",
+                                _lt.returncode, (_lt.stderr or "")[:200])
+                        if _tracked:
+                            _co = _sp.run(
+                                ["git", "-C", project_path, "checkout", _ab_base, "--", *_tracked],
+                                capture_output=True, text=True, timeout=30)
+                            if _co.returncode == 0:
+                                logger.warning(
+                                    "[VERIFY_L2] M-3：%d 个放弃子任务 tracked 脏改已回滚至 base"
+                                    "（防污染本任务 L2/冒烟与后续同项目任务）: %s",
+                                    len(_tracked), _tracked[:5])
+                            else:
+                                logger.warning(
+                                    "[VERIFY_L2] M-3：tracked 脏改回滚失败（非致命，继续 L2）: %s",
+                                    (_co.stderr or "")[:200])
                         _r = _sp.run(["git", "-C", project_path, "clean", "-f", "--", *_ab_files],
                                      capture_output=True, text=True, timeout=30)
                     _purged = [ln for ln in (_r.stdout or "").splitlines() if ln.strip()]
@@ -940,7 +986,14 @@ def _acquire_smoke_sandbox(
     sid = str(getattr(sandbox, "sandbox_id", "") or "")
     details.update({"source": "self_built", "sandbox_id": sid})
     try:
-        manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+        # M-2（21 号文）：sync 读的是共享本地工作树——兄弟任务交付临界区/L2 worktree phase
+        # 的 flock 内 reset/apply 可在 sync 半途撕树 → 箱内半态树 → 冒烟假红/假 skip。
+        # 只护 sync 一瞬（箱内 apply/编译不持锁）；与 F2 同一把跨进程锁（同 canon_path）。
+        # 调用方 verify_runtime 全程不持锁（无 re-entry 死锁；reactor 编译站 4950 在调用方
+        # 已持锁的 worktree phase 内跑，故不在此列）。
+        from swarm.worker.git_flock import _ProjectGitFlock
+        with _ProjectGitFlock(project_path):
+            manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
         # F1（merge 审计 CRITICAL）：sync 进箱的是 base 树（L2 finally reset 后本地工作树
         # 恒为 base）。merged_diff 非空时在箱内 apply，失败/marker 缺失（命令没跑成）都是
         # 环境/基线问题 → skipped（smoke_apply_failed），绝不静默带 base 树继续冒烟——

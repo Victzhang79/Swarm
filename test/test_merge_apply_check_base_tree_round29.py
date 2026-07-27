@@ -60,10 +60,12 @@ def test_create_patch_passes_when_file_only_in_dirty_worktree():
         ["git", "apply", "--check", "-"], cwd=repo,
         input=_NEWFILE_DIFF, capture_output=True, text=True,
     )
-    # locale 无关：本地 git 可能中文输出("已经存在于工作区中")，只断言【失败】这一前提事实
+    # locale 无关：本地 git 可能中文输出("已经存在于工作区中"/繁体"已存在於工作區中")，
+    # 只断言【失败】这一前提事实
     assert direct.returncode != 0, "前提：脏工作树上 create 补丁本应 already-exists 失败"
     _msg = (direct.stderr + direct.stdout).lower()
-    assert "already exists" in _msg or "已经存在" in _msg, f"应为 already-exists 类失败，实际: {_msg!r}"
+    assert ("already exists" in _msg or "已经存在" in _msg or "已存在" in _msg), \
+        f"应为 already-exists 类失败，实际: {_msg!r}"
 
     # 治本：对 base 树校验 → 通过（HEAD 无此文件 → 合法 create 补丁）
     ok, err = verify_merged_patch_applies(repo, _NEWFILE_DIFF, base_ref="HEAD")

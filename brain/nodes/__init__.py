@@ -3976,7 +3976,17 @@ async def handle_failure(state: BrainState) -> dict:
                 _changed = True
         if _changed:
             result["subtask_alternate_ever_used"] = _ever
-    if isinstance(result, dict) and "dispatch_remaining" in result and "plan" not in result:
+    # B-6（21 号文）：回传条件原挂在 "dispatch_remaining" 键上——escalate 系/规模闸出口
+    # （failure.py:1958-1969/2289-2299/2256-2265）不含该键 → 这些出口就地注入 plan 的
+    # retry_guidance 变异随 checkpoint 丢失（checkpoint 在节点入口序列化，就地变异须由
+    # result 重携才落账）。放宽为【result 不含 plan 且 state 有 plan 即回传】：重写同值
+    # 语义无害（清 plan 须显式置 None，不靠缺省），escalate 出口的 guidance 不再蒸发。
+    # 唯一例外=replan（87380de 钉板语义：replan 下游重生成 plan，回传旧 plan 反而错）。
+    # 批次1 闸门 hunter LOW-1：failure.py 各出口的 `**({"plan": plan_obj} if (_c9_edges or
+    # _replan_landed) else {})` 条件位在本咽喉放宽后实质冗余（真假均回传同一对象）——保留
+    # 无害（显式回写仍是正确方向），后来者勿误以为缺省不回传。
+    if isinstance(result, dict) and "plan" not in result \
+            and result.get("failure_strategy") != "replan":
         _p = state.get("plan")
         if _p is not None:
             result["plan"] = _p
@@ -4286,8 +4296,21 @@ def merge(state: BrainState) -> dict:
             len(_l1_rejected), _rej_files)
 
     subtask_diffs: list[tuple[str, str]] = []
+    # M-1（21 号文）纵深：放弃集（abandoned_subtask_ids）滞留结果剔除出合并输入——
+    # 主防线=放弃臂对称 pop（failure.py 四臂一致），本滤是 backstop：任何臂漏 pop 的
+    # stale 结果绝不进合并，杜绝"账面 abandoned 但交付树含其全码"两张皮。
+    # ★give_up_isolated_ids 绝不滤★：give-up 臂刻意留下 l1_passed=True 的桩/revert
+    # WorkerOutput（_give_up_preserve_build 保 build 语义）——桩 diff 是刻意的交付内容
+    # （下游可编译集成赖它），滤掉=交付树该文件回 base → 下游编译崩。
+    _merge_abandoned = set(state.get("abandoned_subtask_ids") or [])
+    _stale_abandoned = sorted(sid for sid in subtask_results if sid in _merge_abandoned)
+    if _stale_abandoned:
+        logger.warning(
+            "[MERGE] M-1：%d 个已放弃子任务的滞留结果剔除出合并输入"
+            "（主防线=放弃臂对称 pop，本滤为纵深 backstop）: %s",
+            len(_stale_abandoned), _stale_abandoned[:20])
     for subtask_id, output in subtask_results.items():
-        if subtask_id in _l1_rejected:
+        if subtask_id in _l1_rejected or subtask_id in _merge_abandoned:
             continue
         if isinstance(output, WorkerOutput):
             subtask_diffs.append((subtask_id, output.diff or ""))
@@ -4792,7 +4815,13 @@ def _run_l2_in_sandbox(
             project_id=project_id or None,
             source="verify_l2",
         )
-        manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+        # M-2（21 号文）：sync 读共享本地工作树，收 _ProjectGitFlock 只护 sync 一瞬——
+        # 防兄弟交付/L2 worktree phase 的锁内 reset/apply 在 sync 半途撕树 → 箱内半态树
+        # → L2 假红全量 replan。调用链 verify_l2→_try_l2_sandbox_verify 不持锁（git clean
+        # 段锁已退出、integration_review 锁已归还），无 re-entry 死锁。
+        from swarm.worker.git_flock import _ProjectGitFlock
+        with _ProjectGitFlock(project_path):
+            manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
 
         # patch 走 envd 文件端点写入（不依赖 Jupyter kernel，也不受 shell 命令行长度限制）
         patch_path = "/tmp/__swarm_l2_merged.patch"

@@ -28,8 +28,22 @@ async def test_wrapper_injects_plan_on_redispatch(monkeypatch):
     assert out["plan"] is plan
 
 
-async def test_wrapper_no_plan_when_not_redispatch(monkeypatch):
-    # escalate/replan 等非再派发返回 → 不注入 plan（replan 会重生成 plan，回传旧 plan 反而错）
+async def test_wrapper_no_plan_when_replan(monkeypatch):
+    # replan 返回 → 不注入 plan（replan 会重生成 plan，回传旧 plan 反而错）。
+    # B-6（21 号文）后 escalate 系出口【会】回传 plan（就地注入的 retry_guidance 须落账），
+    # 本用例钉的是唯一例外=replan；escalate 回传语义见 test_batch1_m2_m3_b6.py。
+    plan = _plan()
+
+    async def _impl(state):
+        return {"failure_strategy": "replan", "l2_passed": False}
+
+    monkeypatch.setattr(nodes, "_handle_failure_impl", _impl)
+    out = await nodes.handle_failure({"plan": plan})
+    assert "plan" not in out
+
+
+async def test_wrapper_injects_plan_on_escalate(monkeypatch):
+    # B-6：escalate 等非再派发返回同样回传 plan——retry_guidance 是就地变异，不重携即蒸发。
     plan = _plan()
 
     async def _impl(state):
@@ -37,7 +51,7 @@ async def test_wrapper_no_plan_when_not_redispatch(monkeypatch):
 
     monkeypatch.setattr(nodes, "_handle_failure_impl", _impl)
     out = await nodes.handle_failure({"plan": plan})
-    assert "plan" not in out
+    assert out["plan"] is plan
 
 
 async def test_wrapper_does_not_override_impl_plan(monkeypatch):

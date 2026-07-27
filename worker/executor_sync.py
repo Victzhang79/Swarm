@@ -57,7 +57,7 @@ _BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
 # F3（merge 审计）：枚举输出的 oversize 节标记 + 探针上限。三条 find 枚举通道在同一命令里
 # 附带孪生探针（`! -size -<阈值>k`），把被尺寸谓词排除的文件显式列出——旧版静默滤掉零留痕，
 # >阈值的合法产物（全量 SQL dump/lockfile/bundle）永不回传且 A3/D30 全看不见（round40 丢件换皮）。
-_OVERSIZE_SECTION_MARKER = "__SWARM_OVERSIZE__"
+_OVERSIZE_SECTION_MARKER = "__OVERSIZE_SECTION__"  # 批次1 闸门：原名带 SWARM_ 前缀被 env_registry 扫描误捕（它是节标记非开关）
 _OVERSIZE_PROBE_CAP = 40
 
 

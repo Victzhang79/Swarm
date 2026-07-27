@@ -2264,6 +2264,15 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                         f"mass_abandon_gate:{len(_pd_roots)}/{len(plan_obj.subtasks)}"],
                 }
             _remaining = [t for t in (state.get("dispatch_remaining") or []) if t not in abandoned]
+            # M-1（21 号文·空转环治本）：部分交付臂与另三条放弃臂对称——放弃者结果必须
+            # pop 出 subtask_results 并回写。旧版本臂是四臂中唯一不 pop 的：merge 冲突型
+            # 失败（delete-vs-modify）的子任务 L1 通过、结果滞留，重跑 merge 时双双重进
+            # → 冲突确定性重演 → 重试计数已尽 → 再落本臂 `_pd_new=∅` 同态返回 →
+            # MERGE↔HANDLE_FAILURE 四节点空转烧满 recursion_limit，承诺的 PARTIAL 变
+            # FAILED（完成兄弟的产物永远到不了交付）。对称 pop 后：幸存者集合=交付面唯一
+            # 来源，放弃者的产物绝不随交付（账面 abandoned 与交付树一致，绝不两张皮）。
+            for _a in abandoned:
+                subtask_results.pop(_a, None)
             logger.warning(
                 "[HANDLE_FAILURE] 部分交付：放弃 %s(+依赖者，共 %d)，继续交付其余 %d 个，终态将 PARTIAL",
                 failed_ids, len(abandoned), len(_remaining),
@@ -2278,6 +2287,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 "abandoned_subtask_ids": sorted(abandoned),
                 "failed_subtask_ids": [],
                 "dispatch_remaining": _remaining,
+                "subtask_results": subtask_results,  # M-1：对称回写（放弃者已 pop）
                 "subtask_force_strong": force_strong,
                 "subtask_retry_counts": {**retry_counts, **next_counts},
             }
