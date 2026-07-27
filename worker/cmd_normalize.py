@@ -46,7 +46,11 @@ def normalize_py_compile_cmd(command: str) -> str:
         toks = [t.strip("'\"") for t in raw.split() if t.strip("'\"")]
         # 仅看位置参数（跳过 -q/-f 等选项），任一不以 .py 结尾即判定含目录。
         pos = [t for t in toks if not t.startswith("-")]
-        has_dir = any(not t.endswith(".py") for t in pos) if pos else True
+        # D14：无位置参数时【不改写】——旧码把 `python -m py_compile`（无参）改写成
+        # 无参 compileall → 编译整个 sys.path（假阴性+超时）。
+        if not pos:
+            return m.group(0)
+        has_dir = any(not t.endswith(".py") for t in pos)
         if has_dir:
             return m.group(0).replace("py_compile", "compileall", 1)
         return m.group(0)

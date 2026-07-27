@@ -19,9 +19,13 @@ import re
 from dataclasses import dataclass, field
 
 # javac/maven `cannot find symbol` 后续的 `symbol: class X` 行。兼容多空格、interface/enum。
+# D14：兼容中文 locale javac（`符号:   类 X`）——沙箱 JDK 中文 locale 下旧正则零命中，
+# 符号接地机制静默失效。中文 kind 词在解析处归一回英文（_KIND_ZH_TO_EN）。
 _SYMBOL_RE = re.compile(
-    r"symbol:\s*(?P<kind>class|interface|enum|method|variable)\s+(?P<name>[A-Za-z_]\w*)",
+    r"(?:symbol|符号)\s*[:：]\s*(?P<kind>class|interface|enum|method|variable|类|接口|枚举|方法|变量)"
+    r"\s+(?P<name>[A-Za-z_]\w*)",
 )
+_KIND_ZH_TO_EN = {"类": "class", "接口": "interface", "枚举": "enum", "方法": "method", "变量": "variable"}
 # Java 源码根标记：.../src/main/java/<pkg path>/<Class>.java
 _JAVA_ROOT_RE = re.compile(r"(?:^|/)(?:src/main/java|src/test/java|java)/(?P<rel>.+\.java)$")
 
@@ -48,7 +52,8 @@ def parse_missing_symbols(build_output: str) -> list[MissingSymbol]:
     seen: set[tuple[str, str]] = set()
     out: list[MissingSymbol] = []
     for m in _SYMBOL_RE.finditer(build_output):
-        kind, name = m.group("kind"), m.group("name")
+        kind = _KIND_ZH_TO_EN.get(m.group("kind"), m.group("kind"))  # D14：中文 locale 归一
+        name = m.group("name")
         key = (kind, name)
         if key in seen:
             continue
@@ -118,10 +123,17 @@ def build_symbol_hints(
                          "请优先在项目中搜索其真实包路径后再引用，切勿据此臆造新类或包名。"),
             ))
         else:
+            # D11（19号文，与 round67 CVB 并案）：codegraph 只索引【项目源码】——查无
+            # 可能是第三方 JAR 类/索引盲区，旧措辞"项目中不存在…需新建该类"直接诱导
+            # worker 重建既有/第三方类 → shadow/重复类（create-vs-base 病灶的 worker 侧
+            # 供给源）。降权：先核依赖库真实 API/近似名，仅确认项目自有且确无才新建。
             hints.append(SymbolHint(
                 name=name, status="absent",
-                message=(f"符号 `{name}` 在整个项目中不存在（codegraph 与 plan 均无）。"
-                         "需新建该类，或改用项目中已存在的等价类——切勿照训练记忆臆造不存在的 API。"),
+                message=(f"符号 `{name}` 在项目源码索引中未见（codegraph 与 plan 均无记录）——"
+                         "注意：它可能是【第三方依赖库中的类】（索引只覆盖项目源码）或索引盲区，"
+                         "不一定真不存在。先核对依赖库真实 API 与项目内近似名；"
+                         "仅当确认它是项目自有类且确不存在时才新建——"
+                         "切勿据此臆造 shadow/重复类或不存在的 API。"),
             ))
     return hints
 
@@ -145,9 +157,12 @@ def format_symbol_hints(hints: list[SymbolHint]) -> str:
 # 调用方(executor，持沙箱)薄包一层。
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_METHOD_SYM_RE = re.compile(r"symbol:\s*method\s+([A-Za-z_]\w*)\s*\(")
-_LOC_CLASS_RE = re.compile(r"location:\s*(?:class|interface)\s+([\w.$]+)")
-_LOC_VAR_RE = re.compile(r"location:\s*variable\s+\w+\s+of\s+type\s+([\w.$]+)")
+# D14：同样兼容中文 locale（`符号: 方法 X(` / `位置: 类 C` / `位置: 类型为 C 的变量 v`）
+_METHOD_SYM_RE = re.compile(r"(?:symbol|符号)\s*[:：]\s*(?:method|方法)\s+([A-Za-z_]\w*)\s*\(")
+_LOC_CLASS_RE = re.compile(r"(?:location|位置)\s*[:：]\s*(?:class|interface|类|接口)\s+([\w.$]+)")
+_LOC_VAR_RE = re.compile(
+    r"(?:location|位置)\s*[:：]\s*(?:variable\s+\w+\s+of\s+type|类型为\s*([\w.$]+)\s*的变量)\s*([\w.$]*)"
+)
 
 
 def parse_missing_methods(build_output: str) -> list[tuple[str, str]]:
@@ -171,7 +186,7 @@ def parse_missing_methods(build_output: str) -> list[tuple[str, str]]:
                 break
             vm = _LOC_VAR_RE.search(lines[j])
             if vm:
-                klass = vm.group(1)
+                klass = vm.group(1) or vm.group(2)  # zh=组1 / en=组2
                 break
         if klass and (method, klass) not in seen:
             seen.add((method, klass))

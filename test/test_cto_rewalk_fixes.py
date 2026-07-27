@@ -76,7 +76,10 @@ def test_security_scan_fail_closed_no_scanner(monkeypatch, tmp_path):
 
     findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
     assert should_block is True, "无扫描器+阻断模式必须 fail-closed"
-    assert any(f.rule_id == "fail-closed-no-scanner" for f in findings)
+    assert any(f.rule_id.startswith("fail-closed-no-") for f in findings)
+    # D4：全工具缺失时 sast+dep 两类哨兵各一条（secret 由内置正则兜底覆盖）
+    assert any(f.rule_id == "fail-closed-no-sast-scanner" for f in findings)
+    assert any(f.rule_id == "fail-closed-no-dep-scanner" for f in findings)
 
 
 def test_security_scan_report_mode_never_blocks(monkeypatch, tmp_path):
@@ -88,7 +91,7 @@ def test_security_scan_report_mode_never_blocks(monkeypatch, tmp_path):
 
     findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
     assert should_block is False
-    assert not any(f.rule_id == "fail-closed-no-scanner" for f in findings)
+    assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)
     # A-P0-2 report-mode 可见性：必须有 INFO 级 coverage-zero 信号（"没扫"≠"干净"），但不阻断。
     cov = [f for f in findings if f.rule_id == "scan-coverage-zero"]
     assert len(cov) == 1, "report-only 模式下无扫描器应注入 scan-coverage-zero 可观测信号"

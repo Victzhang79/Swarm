@@ -103,6 +103,7 @@ def test_enforce_rewrites_whole_tree_deterministically():
     new, actions = enforce(
         {"alarm-core/pom.xml": pom}, root_text=ROOT, namespace=NS, workspace_members=MEMBERS,
         registry_versions=_reg({("cn.hutool", "hutool-all"): ["5.8.47"]}),
+        driver=DRIVERS["maven"],
     )
     out = new["alarm-core/pom.xml"]
     assert "ruoyi-alarm-system" not in out, "幻影模块（有 version）必须剪除"
@@ -128,7 +129,8 @@ def test_enforce_never_touches_anything_when_registry_unreachable():
 """
     new, actions = enforce(
         {"alarm-core/pom.xml": pom}, root_text=ROOT, namespace=NS, workspace_members=MEMBERS,
-        registry_versions=lambda ns, name: None,   # 全程不可达
+        registry_versions=lambda ns, name: None,
+        driver=DRIVERS["maven"],   # 全程不可达
     )
     out = new["alarm-core/pom.xml"]
     assert "hutool-all" in out and "easyexcel" in out, "断网时绝不许剪合法第三方依赖"
@@ -201,6 +203,7 @@ def test_empty_workspace_members_fails_open_entirely():
     new, actions = enforce(
         {"x/pom.xml": pom}, root_text="", namespace=NS, workspace_members=set(),
         registry_versions=_reg({}),
+        driver=DRIVERS["maven"],
     )
     assert not new and not actions, "成员集为空时必须整体 fail-open，绝不剪除任何依赖"
 
@@ -217,6 +220,7 @@ def test_commented_out_dependency_is_ignored_and_real_one_with_inline_comment_is
     new, actions = enforce(
         {"x/pom.xml": pom}, root_text=ROOT, namespace=NS, workspace_members=MEMBERS,
         registry_versions=_reg({}),
+        driver=DRIVERS["maven"],
     )
     out = new["x/pom.xml"]
     assert "ruoyi-phantom" not in out, "含行内注释的真幻影依赖必须被真正剪掉（不能只判不改）"
@@ -275,12 +279,37 @@ def test_enforce_renames_sibling_deps_end_to_end():
         {"alarm-web/pom.xml": pom}, root_text=root, namespace=NS,
         workspace_members={"ruoyi", "alarm-core", "alarm-api", "alarm-web"},
         registry_versions=_reg({}), root_name="ruoyi",
+        driver=DRIVERS["maven"],
     )
     out = new["alarm-web/pom.xml"]
     assert "<artifactId>alarm-core</artifactId>" in out and "ruoyi-alarm-core" not in out
     assert "<artifactId>alarm-api</artifactId>" in out and "ruoyi-alarm-api" not in out
     assert out.count("${project.version}") == 2, "版本引用必须原样保留（由 reactor 承接）"
     assert len(actions) == 2 and all("fix_name" in a for a in actions)
+
+
+def test_enforce_fix_name_syncs_hardcoded_version():
+    """批次6 R1（reviewer HIGH）：fix_name 与 fix_namespace 对称——改名修回真成员后，
+    残留硬编码外部版本同样让 reactor 解析失败 → 同步为 ${project.version}。"""
+    pom = """<project>
+    <artifactId>alarm-web</artifactId>
+    <dependencies>
+        <dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-alarm-core</artifactId><version>1.0.0</version></dependency>
+    </dependencies>
+</project>
+"""
+    root = ("<project><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+            "<modules><module>alarm-core</module><module>alarm-web</module></modules></project>")
+    new, actions = enforce(
+        {"alarm-web/pom.xml": pom}, root_text=root, namespace=NS,
+        workspace_members={"ruoyi", "alarm-core", "alarm-web"},
+        registry_versions=_reg({}), root_name="ruoyi",
+        driver=DRIVERS["maven"],
+    )
+    out = new["alarm-web/pom.xml"]
+    assert "<artifactId>alarm-core</artifactId>" in out, "fix_name 改名必须生效"
+    assert "<version>1.0.0</version>" not in out, "硬编码外部版本绝不留存（reactor 解析失败源）"
+    assert "${project.version}" in out, "版本必须同步为工程版本引用（与 fix_namespace 对称）"
 
 
 def test_reactor_member_is_never_pruned_by_registry_evidence():

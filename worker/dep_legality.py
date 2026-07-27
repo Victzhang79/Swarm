@@ -62,6 +62,10 @@ class ManifestDriver(Protocol):
     """一种依赖清单格式的**栈相关**读写能力（不变量本身与栈无关）。"""
 
     stack: str
+    namespace_mandatory: bool
+    """D9：本栈依赖声明是否**强制**命名空间非空（Maven groupId 必填，缺失=模型构建期
+    必崩连坐 reactor）。True → classify 对"缺命名空间且非成员"走独立 prune 判定，
+    绝不落入"registry 不可达 fail-open"。False（如 npm 无 scope 包属常态）→ 不适用。"""
 
     def parse_deps(self, text: str) -> list[dict]:
         """→ [{namespace, name, version, block}]。`block` 是可在原文里唯一定位的原始片段。
@@ -81,6 +85,14 @@ class ManifestDriver(Protocol):
         """把一条依赖的命名空间改写为工程命名空间（Maven=groupId）。"""
         ...
 
+    def rewrite_version(self, block: str, version: str) -> str:
+        """把一条依赖的硬编码版本改写为给定版本引用（Maven=<version> 标签）。
+        D10：fix_namespace 修好坐标后，内部成员版本必须与 reactor 同步。"""
+        ...
+
+    internal_version_ref: str
+    """D10：本栈"内部成员版本与 reactor 同步"的引用写法（Maven=`${project.version}`）。"""
+
     def rewrite_name(self, block: str, name: str) -> str:
         """把一条依赖的名字改写为真工作区成员名（Maven=artifactId）。R57-2。"""
         ...
@@ -98,6 +110,7 @@ class MavenDriver:
     """Maven/pom.xml driver（第一个 driver；Cargo/npm/Go 按同协议注册即可接入本闸）。"""
 
     stack = "maven"
+    namespace_mandatory = True   # D9：<dependency> 缺 groupId 必崩模型构建
 
     @staticmethod
     def _strip(text: str) -> str:
@@ -106,10 +119,14 @@ class MavenDriver:
     @staticmethod
     def _skip_spans(text: str) -> list[tuple[int, int]]:
         """必须跳过的区间：注释（里面的 <dependency> 是被注释掉的，不是真依赖）+
-        dependencyManagement（那是"版本表"不是本模块依赖，当依赖校验会误剪）。"""
+        dependencyManagement（那是"版本表"不是本模块依赖，当依赖校验会误剪）+
+        build（D14：<build><plugins> 内 plugin 自己的 <dependency> 是插件依赖，不是
+        工程依赖——参与判定会按工程坐标规则误剪/误改插件声明）。"""
         spans = [(m.start(), m.end()) for m in re.finditer(r"<!--.*?-->", text, re.S)]
         spans += [(m.start(), m.end()) for m in
                   re.finditer(r"<dependencyManagement>.*?</dependencyManagement>", text, re.S)]
+        spans += [(m.start(), m.end()) for m in
+                  re.finditer(r"<build>.*?</build>", text, re.S)]
         return spans
 
     def parse_deps(self, text: str) -> list[dict]:
@@ -160,6 +177,13 @@ class MavenDriver:
         return re.sub(r"(<artifactId>\s*)[^<\s]+(\s*</artifactId>)",
                       rf"\g<1>{name}\g<2>", block, count=1)
 
+    internal_version_ref = "${project.version}"   # D10：内部成员版本与 reactor 同步
+
+    def rewrite_version(self, block: str, version: str) -> str:
+        # 仅替换既有 <version> 标签；无标签=版本受管上游，不动（调用方只在确有硬编码版本时调）
+        return re.sub(r"(<version>\s*)[^<]+?(\s*</version>)",
+                      rf"\g<1>{version}\g<2>", block, count=1)
+
     def root_name(self, root_text: str) -> str | None:
         """根 pom 自身 artifactId（剥掉 parent / 依赖 / 受管块后的第一个）。"""
         body = self._strip(root_text)
@@ -178,9 +202,18 @@ DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver()}
 """栈 → driver。**新栈 = 在此注册一个 driver**（实现 ManifestDriver 协议），闸本身不动。"""
 
 
+_driver_absent_warned: set[str] = set()
+
+
 def driver_for(stack: str) -> ManifestDriver | None:
-    """按栈取 driver；没有 driver 的栈 → None（调用方跳过本闸，绝不用别的栈的规则硬套）。"""
-    return DRIVERS.get((stack or "").strip().lower())
+    """按栈取 driver；没有 driver 的栈 → None（调用方跳过本闸，绝不用别的栈的规则硬套）。
+    D14：None 路径 warn-once——无 driver=本闸对该栈零覆盖，静默跳过会与"已校验"混同。"""
+    key = (stack or "").strip().lower()
+    drv = DRIVERS.get(key)
+    if drv is None and key and key not in _driver_absent_warned:
+        _driver_absent_warned.add(key)
+        logger.warning("[dep-legality] 栈 '%s' 无注册 driver → 合法性闸对该栈零覆盖（跳过，非同已校验）", key)
+    return drv
 
 
 def _resolve_prefixed_member(name: str, workspace_members: set[str],
@@ -212,7 +245,8 @@ def _resolve_prefixed_member(name: str, workspace_members: set[str],
 
 def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
              managed: set[str], managed_unknown: bool,
-             registry_versions, root_name: str | None = None) -> tuple[str, str]:
+             registry_versions, root_name: str | None = None,
+             namespace_mandatory: bool = False) -> tuple[str, str]:
     """判定一条依赖的合法性 → (verdict, reason)。**纯函数，零栈耦合。**
 
     verdict ∈ {legal, fix_namespace, fix_name, prune}
@@ -241,6 +275,12 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
         if namespace and ns and ns != namespace:
             return "fix_namespace", (f"{name} 是工作区内部模块，命名空间却写成外部 '{ns}'"
                                      f"（工程模块从不在远程仓库里，此坐标永远拉不到）")
+        # D9：成员缺命名空间（本栈强制非空）→ 确定性补工程命名空间
+        # （rewrite_namespace 已支持"无 groupId 补一个"）；工程命名空间未知则无法确定性修，
+        # 留 legal（不猜——但此形态 Maven 解析期仍会崩，属诚实边界）。
+        if namespace and not ns and namespace_mandatory:
+            return "fix_namespace", (f"{name} 是工作区内部模块却缺命名空间（本栈强制非空，"
+                                     f"manifest 解析期即崩）→ 确定性补工程命名空间")
         return "legal", "工作区成员"
 
     # ②a 名字写错成「工程前缀 + 真成员」（R57-2）→ 确定性改名（**优先于剪除**：能修则修）
@@ -253,6 +293,15 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
     if namespace and ns == namespace:
         return "prune", (f"用工程命名空间 '{ns}' 但 {name} 不是工作区成员"
                          f"（工程模块从不在远程仓库里）→ 可证永不可解析")
+
+    # ②b（D9）命名空间缺失且本栈强制非空 → 独立判定，绝不落入 ③/④ 的
+    # "registry_versions(ns, name) if ns else None → 仓库不可达 fail-open"：
+    # 缺 groupId 是 Maven 模型构建期必崩（'dependencies.dependency.groupId is missing'
+    # 连坐整棵 reactor）——本闸自宣要杀的正是这类，却在 ③/④ 系统性放行。非成员 →
+    # 坐标无法确定性补全（纪律：绝不猜依赖坐标）→ 可证永不可解析。成员已在 ① 修复。
+    if namespace_mandatory and not ns:
+        return "prune", (f"缺命名空间（本栈强制非空，manifest 解析期即崩）且 {name} "
+                         f"非工作区成员，坐标不可猜 → 可证永不可解析")
 
     # ③ 无版本：必须被上游集中管理
     if ver is None:
@@ -280,14 +329,15 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
 
 def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | None,
             workspace_members: set[str], registry_versions,
-            driver: ManifestDriver | None = None, root_name: str | None = None,
+            driver: ManifestDriver, root_name: str | None = None,
             ) -> tuple[dict[str, str], list[str]]:
     """对全工作区 manifest 施加不变量 → (改写后的文本, 处置说明)。纯函数：可确定性单测、可离线。
 
     ★处置必须**真的落到文本上**★：改写/删除若没命中（正则失配、块重复），**绝不**登记为已处置——
     否则上层以为修了、实则原样进构建（静默失败：宣称成功、实际每次失败）。
+    driver 必填（D14）：缺省落 maven 是地雷——忘传 driver 的非 maven 工程会被 maven 规则硬套。
     """
-    drv = driver or DRIVERS["maven"]
+    drv = driver
     managed = drv.managed_names(root_text)
     managed_unknown = drv.managed_unknown(root_text)
     if root_name is None and hasattr(drv, "root_name"):
@@ -302,6 +352,7 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                 dep, namespace=namespace, workspace_members=workspace_members,
                 managed=managed, managed_unknown=managed_unknown,
                 registry_versions=registry_versions, root_name=root_name,
+                namespace_mandatory=getattr(drv, "namespace_mandatory", False),
             )
             if verdict == "legal":
                 continue
@@ -318,12 +369,29 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                 continue
             before = cur
             if verdict == "fix_namespace" and namespace:
-                cur = cur.replace(blk, drv.rewrite_namespace(blk, namespace), 1)
+                _new_blk = drv.rewrite_namespace(blk, namespace)
+                # D10：三面同步——坐标修回工程命名空间后，硬编码版本（臆造/漂移）仍会让
+                # reactor 解析不到 → 同步为工程版本引用；变量引用/受管无版本不动。
+                _ver = dep.get("version")
+                if _ver and not _ver.startswith(_VAR_REF_PREFIXES):
+                    _ref = getattr(drv, "internal_version_ref", None)
+                    if _ref:
+                        _new_blk = drv.rewrite_version(_new_blk, _ref)
+                cur = cur.replace(blk, _new_blk, 1)
             elif verdict == "fix_name":
                 _real = _resolve_prefixed_member(dep["name"], workspace_members, root_name)
                 if not _real:      # 理论上不可能（classify 刚判过）——但绝不盲改
                     continue
-                cur = cur.replace(blk, drv.rewrite_name(blk, _real), 1)
+                _new_blk = drv.rewrite_name(blk, _real)
+                # 批次6 R1（reviewer HIGH）：与 fix_namespace 对称——名字修回真成员后，
+                # 残留的硬编码外部版本同样让 reactor 解析失败（修对名字留下错版本=
+                # 同根病的另一半）→ 同步为工程版本引用；变量引用/受管无版本不动。
+                _ver = dep.get("version")
+                if _ver and not _ver.startswith(_VAR_REF_PREFIXES):
+                    _ref = getattr(drv, "internal_version_ref", None)
+                    if _ref:
+                        _new_blk = drv.rewrite_version(_new_blk, _ref)
+                cur = cur.replace(blk, _new_blk, 1)
             elif verdict == "prune":
                 cur = drv.remove(cur, blk)
             if cur == before:

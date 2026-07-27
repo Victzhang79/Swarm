@@ -271,3 +271,241 @@ def test_cargo_non_utf8_target_failclosed(tmp_path):
     n, _ = repair_from_sibling_manifests(
         str(tmp_path), "error[E0432]: unresolved import `serde`", ["crate-b/src/lib.rs"], "cargo")
     assert n == 0 and (tgt / "Cargo.toml").read_bytes() == raw
+
+
+# ── D12：go 包路径 → 模块路径最长前缀匹配（子包=Go 常态，旧精确匹配恒跳过）──
+
+def test_d12_go_subpackage_matches_module_longest_prefix(tmp_path):
+    """D12 核心：build 报子包 github.com/foo/bar/sub，兄弟 require 模块 github.com/foo/bar
+    → 按最长前缀命中并注入【模块路径】（go.mod require 的是模块不是包）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "go.mod").write_text(
+        "module a\n\ngo 1.21\n\nrequire (\n\tgithub.com/foo/bar v1.2.3\n)\n", encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "go.mod").write_text("module b\n\ngo 1.21\n", encoding="utf-8")
+
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path),
+        "main.go:1: no required module provides package github.com/foo/bar/sub",
+        ["svc-b/main.go"], "go")
+    assert n == 1 and "svc-b/go.mod" in paths
+    out = (tgt / "go.mod").read_text()
+    assert "github.com/foo/bar v1.2.3" in out, "注入键必须是模块路径"
+    assert "github.com/foo/bar/sub" not in out, "绝不能把包路径写进 require"
+
+
+def test_d12_go_longest_prefix_wins(tmp_path):
+    """两兄弟分别声明 github.com/foo 与 github.com/foo/bar → 最长前缀（bar）胜出。"""
+    s1 = tmp_path / "svc-a"
+    s1.mkdir()
+    (s1 / "go.mod").write_text("module a\n\nrequire github.com/foo v0.9.0\n", encoding="utf-8")
+    s2 = tmp_path / "svc-c"
+    s2.mkdir()
+    (s2 / "go.mod").write_text("module c\n\nrequire github.com/foo/bar v1.2.3\n", encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "go.mod").write_text("module b\n\ngo 1.21\n", encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "no required module provides package github.com/foo/bar/sub",
+        ["svc-b/main.go"], "go")
+    assert n == 1
+    out = (tgt / "go.mod").read_text()
+    assert "github.com/foo/bar v1.2.3" in out
+    assert "github.com/foo v0.9.0" not in out
+
+
+def test_d12_go_prefix_boundary_not_substring(tmp_path):
+    """前缀必须落在路径段边界：github.com/foo/barbaz 不得匹配模块 github.com/foo/bar。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "go.mod").write_text("module a\n\nrequire github.com/foo/bar v1.2.3\n", encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    before = "module b\n\ngo 1.21\n"
+    (tgt / "go.mod").write_text(before, encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "no required module provides package github.com/foo/barbaz",
+        ["svc-b/main.go"], "go")
+    assert n == 0 and (tgt / "go.mod").read_text() == before
+
+
+def test_d12_go_unusable_long_prefix_falls_back_to_shorter(tmp_path):
+    """最长前缀带 replace 伴随（坐标不可移植）→ 退到较短但可用的模块坐标，绝不臆造。"""
+    s1 = tmp_path / "svc-a"
+    s1.mkdir()
+    (s1 / "go.mod").write_text(
+        "module a\n\nrequire github.com/foo/bar v0.0.0-00010101000000-000000000000\n"
+        "\nreplace github.com/foo/bar => ../bar\n", encoding="utf-8")
+    s2 = tmp_path / "svc-c"
+    s2.mkdir()
+    (s2 / "go.mod").write_text("module c\n\nrequire github.com/foo v0.9.0\n", encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "go.mod").write_text("module b\n\ngo 1.21\n", encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "no required module provides package github.com/foo/bar/sub",
+        ["svc-b/main.go"], "go")
+    assert n == 1
+    assert "github.com/foo v0.9.0" in (tgt / "go.mod").read_text()
+
+
+# ── D13：cargo 注入保留 features（内联表整体移植）──
+
+def test_d13_cargo_inline_table_transplanted_whole(tmp_path):
+    """D13 核心：兄弟 tokio = { version = "1", features = ["full"] } → 整体移植，
+    不再降成 tokio = "1"（feature-gated API 注入后即可用，不白烧一轮编译）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\nversion = "0.1.0"\n\n'
+        '[dependencies]\ntokio = { version = "1", features = ["full"] }\n', encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "Cargo.toml").write_text(
+        '[package]\nname = "b"\nversion = "0.1.0"\n\n[dependencies]\n', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `tokio`", ["svc-b/src/main.rs"], "cargo")
+    assert n == 1
+    out = (tgt / "Cargo.toml").read_text()
+    assert 'tokio = { version = "1", features = ["full"] }' in out, out
+
+
+def test_d13_cargo_flat_form_still_injected(tmp_path):
+    """平表 serde = "1.0.0" → 注入形态不变（回归）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nserde = "1.0.0"\n', encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "Cargo.toml").write_text(
+        '[package]\nname = "b"\n\n[dependencies]\n', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `serde`", ["svc-b/src/lib.rs"], "cargo")
+    assert n == 1
+    assert 'serde = "1.0.0"' in (tgt / "Cargo.toml").read_text()
+
+
+def test_d13_cargo_path_dep_inline_not_transplanted(tmp_path):
+    """内联表含 path =（本地相对路径）→ 跨目录移植必错 → 不可作坐标源（与 npm file: 同款）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nfoo = { version = "0.2", path = "../foo" }\n',
+        encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    before = '[package]\nname = "b"\n\n[dependencies]\n'
+    (tgt / "Cargo.toml").write_text(before, encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `foo`", ["svc-b/src/lib.rs"], "cargo")
+    assert n == 0 and (tgt / "Cargo.toml").read_text() == before
+
+
+def test_m2_cargo_spaced_section_header_no_duplicate_section(tmp_path):
+    """M-2（批次6 R1 hunter+reviewer）：目标含内空白 section 头（`[ dependencies ]`，
+    合法 TOML）时旧正则不匹配 → 追加第二个同名 section=非法 TOML 毒化目标。
+    section 头容忍内空白 + 移植后 tomllib 校验双保险。"""
+    import tomllib
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\ntokio = { version = "1", features = ["full"] }\n',
+        encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "Cargo.toml").write_text(
+        '[package]\nname = "b"\n\n[ dependencies ]\n', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `tokio`", ["svc-b/src/main.rs"], "cargo")
+    assert n == 1
+    out = (tgt / "Cargo.toml").read_text()
+    parsed = tomllib.loads(out)  # 非法 TOML=毒化交付物，必须抛错红灯
+    assert out.count("[dependencies]") + out.count("[ dependencies ]") == 1, \
+        f"绝不得追加第二个同名 section：{out}"
+    assert parsed["dependencies"]["tokio"]["features"] == ["full"]
+
+
+def test_m2_cargo_broken_target_fail_closed_no_poison(tmp_path):
+    """M-2 fail-closed 臂：目标 manifest 注入前已非法 → 校验不过绝不落笔（不雪上加霜）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nserde = "1.0.0"\n', encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    broken = '[package]\nname = "b"\n\n[dependencies]\nserde = \n'  # 非法 TOML（值缺失）
+    (tgt / "Cargo.toml").write_text(broken, encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `serde`", ["svc-b/src/lib.rs"], "cargo")
+    assert n == 0, "目标已非法时注入必须 fail-closed（校验不过不落笔）"
+    assert (tgt / "Cargo.toml").read_text() == broken, "校验不过绝不改写目标文件"
+
+
+# ── D14：注入落回【来源 section】（dev/build 依赖绝不进运行时区）──
+
+def test_d14_npm_devdep_injected_into_devdependencies(tmp_path):
+    """兄弟 devDependencies 的坐标 → 目标 devDependencies（不进运行时 dependencies）。"""
+    sib = tmp_path / "web-a"
+    sib.mkdir()
+    (sib / "package.json").write_text(
+        '{"name": "a", "devDependencies": {"vitest": "^1.0.0"}}', encoding="utf-8")
+    tgt = tmp_path / "web-b"
+    tgt.mkdir()
+    (tgt / "package.json").write_text('{"name": "b", "dependencies": {}}', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "Error: Cannot find module 'vitest'", ["web-b/src/x.test.ts"], "npm")
+    assert n == 1
+    data = json.loads((tgt / "package.json").read_text())
+    assert data["devDependencies"]["vitest"] == "^1.0.0"
+    assert "vitest" not in data["dependencies"]
+
+
+def test_d14_cargo_devdep_injected_into_dev_section(tmp_path):
+    """兄弟 [dev-dependencies] 的坐标 → 目标 [dev-dependencies]（不进 [dependencies]）。"""
+    sib = tmp_path / "svc-a"
+    sib.mkdir()
+    (sib / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dev-dependencies]\ntempfile = "3"\n', encoding="utf-8")
+    tgt = tmp_path / "svc-b"
+    tgt.mkdir()
+    (tgt / "Cargo.toml").write_text(
+        '[package]\nname = "b"\n\n[dependencies]\n', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "error[E0432]: unresolved import `tempfile`", ["svc-b/tests/t.rs"], "cargo")
+    assert n == 1
+    out = (tgt / "Cargo.toml").read_text()
+    dep_idx = out.index("[dependencies]")
+    dev_idx = out.index("[dev-dependencies]")
+    tf_idx = out.index('tempfile = "3"')
+    assert dev_idx < tf_idx and (dep_idx > tf_idx or dep_idx < dev_idx), out
+
+
+def test_d14_sibling_coord_pick_deterministic(tmp_path):
+    """D14：多兄弟同名不同版本 → 目录排序后首个（确定性，不随文件系统枚举序漂移）。"""
+    for name, ver in (("svc-z", "1.0.0"), ("svc-a", "2.0.0")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "package.json").write_text(
+            json.dumps({"name": name, "dependencies": {"lodash": ver}}), encoding="utf-8")
+    tgt = tmp_path / "web-b"
+    tgt.mkdir()
+    (tgt / "package.json").write_text('{"name": "b", "dependencies": {}}', encoding="utf-8")
+
+    n, _ = repair_from_sibling_manifests(
+        str(tmp_path), "Cannot find module 'lodash'", ["web-b/src/x.ts"], "npm")
+    assert n == 1
+    data = json.loads((tgt / "package.json").read_text())
+    assert data["dependencies"]["lodash"] == "2.0.0", "排序后 svc-a 恒为首个坐标源"

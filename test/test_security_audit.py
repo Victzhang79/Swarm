@@ -242,15 +242,18 @@ def test_clean_project_no_block():
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
         findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
-        real_scanner_present = any(
-            shutil.which(t) for t in ("bandit", "pip-audit", "gitleaks", "trufflehog")
-        )
-        if real_scanner_present:
-            assert should_block is False, f"有扫描器+干净项目不应阻断, findings: {findings}"
+        # D4 per-category 后：不阻断要求 sast+dep 两类都有真实工具覆盖（secret 有内置正则兜底）。
+        sast_covered = shutil.which("bandit")
+        dep_covered = shutil.which("pip-audit")
+        if sast_covered and dep_covered:
+            assert should_block is False, f"全类覆盖+干净项目不应阻断, findings: {findings}"
         else:
-            assert should_block is True, "无任何扫描器→阻断模式必须 fail-closed"
-            assert any(f.rule_id == "fail-closed-no-scanner" for f in findings)
-    print("  ✅ 干净项目: 有扫描器不阻断 / 无扫描器 fail-closed")
+            assert should_block is True, "任一类 0 覆盖→阻断模式必须 fail-closed"
+            assert any(f.rule_id.startswith("fail-closed-no-") for f in findings)
+            if not dep_covered:
+                assert any(f.rule_id == "fail-closed-no-dep-scanner" for f in findings), \
+                    "D4：依赖类 0 覆盖必须有独立哨兵（单布尔时代被 sast 工具掩盖）"
+    print("  ✅ 干净项目: 全类覆盖不阻断 / 任一类 0 覆盖 fail-closed")
 
 
 def test_clean_project_report_mode_never_blocks():
@@ -260,7 +263,7 @@ def test_clean_project_report_mode_never_blocks():
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
         findings, should_block = run_security_scan(tmp, "python", block_severity="none")
         assert should_block is False, "report-only 模式永不阻断"
-        assert not any(f.rule_id == "fail-closed-no-scanner" for f in findings)
+        assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)
     print("  ✅ 报告模式无扫描器也不阻断")
 
 

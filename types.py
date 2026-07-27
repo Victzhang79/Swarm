@@ -133,6 +133,17 @@ class FileScope(BaseModel):
             "不把破工作区交 worker 空烧，先判 BLOCKED 等生产者。"
         ),
     )
+    upstream_products: list[str] = Field(
+        default_factory=list,
+        description=(
+            "C6/H-1（批次6）：【完成态上游产物 ∩ 本任务 writable】账——dispatch 每次派发"
+            "按当前 L1 通过子任务 diff 全集【重算替换】（非累加，防粘滞 provenance 把"
+            "非上游文件永久赦免出防脏 reset）。消费端=worker reset 跳过 + clean_upload "
+            "传本地已合并版（executor_sync）。与 upstream_artifacts 分工：后者是"
+            "plan 布线+完成态的累加账（seed 闸/readable 补传消费），本字段是"
+            "完成态即时账（防脏护栏豁免消费）。"
+        ),
+    )
 
     def is_writable(self, path: str) -> bool:
         if self.allow_any:

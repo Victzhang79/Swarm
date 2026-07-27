@@ -168,8 +168,6 @@ def _inject_upstream_products(to_dispatch, subtask_results: dict,
                     _before - len(product_files))
         except Exception as _exc:  # noqa: BLE001 — 过滤失败按未过滤继续（seed 闸仍有 transient 兜底）
             logger.warning("[DISPATCH] B1 存在性过滤异常（跳过过滤）: %s", _exc)
-    if not product_files:
-        return False
     try:
         _cap = int(os.environ.get("SWARM_UPSTREAM_PRODUCTS_CAP", "800"))
     except (TypeError, ValueError):
@@ -180,11 +178,29 @@ def _inject_upstream_products(to_dispatch, subtask_results: dict,
             "可调 SWARM_UPSTREAM_PRODUCTS_CAP）", len(product_files), _cap)
         product_files = product_files[:_cap]
     _changed = False
+    _product_set = set(product_files)
     for st in to_dispatch:
         sc = getattr(st, "scope", None)
         if sc is None:
             continue
-        _own = set(getattr(sc, "writable", None) or []) | set(getattr(sc, "create_files", None) or [])
+        # H-1（批次6 R1 hunter）：完成态产物 ∩ own writable 记【独立即时账】
+        # scope.upstream_products——每次派发按当前完成态全集【重算替换】（含重算为
+        # 空集，故本步必须先于"无产物早退"执行）：累加账的旧轮残留 provenance 会把
+        # 本地纯脏改文件永久赦免出防脏 reset/clean_upload（脏叠加无法自愈）。
+        # 消费端=executor_sync C6 双点（reset 跳过 + clean_upload 传本地已合并版）。
+        _own_writable = set(getattr(sc, "writable", None) or [])
+        _products = sorted(_product_set & _own_writable)
+        if list(getattr(sc, "upstream_products", None) or []) != _products:
+            sc.upstream_products = _products
+            _changed = True
+            if _products:
+                logger.info("[DISPATCH] C6 完成态产物∩writable 即时账 → %s upstream_products=%d 个",
+                            st.id, len(_products))
+        # C6（19号文）：own writable【不再排除出 upstream_artifacts】——完成态上游对
+        # 【本任务也要改的 base 既有文件】的改动（normalize 串行化的聚合/注册类共享文件
+        # 链）必须有 provenance 账（seed 闸/readable 补传消费面）；create_files 仍排除
+        # （本任务建=无上游产物，normalize 已收敛唯一创建者）。
+        _own = set(getattr(sc, "create_files", None) or [])
         _add = [p for p in product_files if p not in _own]
         if not _add:
             continue

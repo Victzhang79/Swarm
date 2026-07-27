@@ -66,7 +66,7 @@ def test_clean_upload_uses_head_version(tmp_path, monkeypatch):
     stub._sync_to_sandbox = WorkerExecutor._sync_to_sandbox.__get__(stub)
 
     # get_config 需要 remote workdir
-    import swarm.worker.executor as ex_mod
+    import swarm.worker.executor_sync as ex_mod
     monkeypatch.setattr(ex_mod, "get_config", lambda: SimpleNamespace(
         sandbox=SimpleNamespace(sandbox_remote_workdir="/workspace")
     ))

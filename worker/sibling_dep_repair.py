@@ -82,26 +82,30 @@ def _missing_deps(build_output: str, stack: str) -> list[str]:
 
 
 # ── 每栈：从一个 manifest 解析【已声明依赖 → 版本坐标】──────────────────────────
-def _parse_npm(text: str) -> dict[str, str]:
+def _parse_npm(text: str) -> dict[str, tuple[str, str]]:
+    """name → (版本, 来源 section)。D14：记录 section——devDependencies 的坐标注入
+    目标时必须落在 devDependencies（注入运行时 dependencies 会把构建期工具变成
+    生产依赖）。同名多处时 dependencies 优先（循环顺序保证）。"""
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
         return {}
     if not isinstance(data, dict):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, tuple[str, str]] = {}
     for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
         section = data.get(key)
         if isinstance(section, dict):
             for name, ver in section.items():
                 if isinstance(name, str) and isinstance(ver, str) and name not in out:
-                    out[name] = ver
+                    out[name] = (ver, key)
     return out
 
 
-# Cargo：`name = "1.2"` 或 `name = { version = "1.2", ... }`；只取 version 坐标。
-_CARGO_LINE_RE = re.compile(
-    r'^\s*([A-Za-z0-9_\-]+)\s*=\s*(?:"([^"]+)"|\{[^}]*\bversion\s*=\s*"([^"]+)"[^}]*\})', re.M)
+# Cargo：D13 起依赖区解析只走 _CARGO_RAW_LINE_RE（整行原始声明，平表/内联表）——
+# 注入时整体移植，保 features/default-features 等。
+_CARGO_RAW_LINE_RE = re.compile(
+    r'^\s*([A-Za-z0-9_\-]+)\s*=\s*("(?:[^"]+)"|\{[^}]*\})\s*(?:#.*)?$', re.M)
 # 依赖区里任意 `name =` 条目（含 workspace = true / path = ... 等无 version 形态）。
 _CARGO_NAME_RE = re.compile(r'^\s*([A-Za-z0-9_\-]+)\s*=', re.M)
 # `[dependencies.NAME]` 点表段名。
@@ -110,12 +114,16 @@ _CARGO_DOT_SECTION_RE = re.compile(
 _CARGO_DEP_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
-def _parse_cargo(text: str) -> dict[str, tuple[str, str | None]]:
+def _parse_cargo(text: str) -> dict[str, tuple[str, str | None, str | None, str]]:
     """解析 Cargo.toml 依赖区（平表/`{ version = .. }` 内联表/`[dependencies.NAME]` 点表/
     `workspace = true` 继承）。crate 名归一为下划线键（rustc 诊断用下划线，Cargo.toml 常用
-    连字符），值 = (原名, 版本或 None)。版本 None = 已声明但无可移植版本（workspace 继承/
-    path 依赖/点表无 version）——声明检查算已声明，坐标源侧不可用。"""
-    out: dict[str, tuple[str, str | None]] = {}
+    连字符），值 = (原名, 版本或 None, 原始单行声明或 None, 来源 section)。版本 None =
+    已声明但无可移植版本（workspace 继承/path 依赖/点表无 version）——声明检查算已声明，
+    坐标源侧不可用。原始声明（D13）只在单行形态（平表/内联表）捕获，注入时整体移植保
+    features；点表是多行段，移植复杂，维持 version-only（诚实边界）。
+    来源 section（D14）：注入必须落回同类 section（dev/build 依赖绝不进运行时
+    [dependencies]）。"""
+    out: dict[str, tuple[str, str | None, str | None, str]] = {}
     for block in re.split(r'^\s*\[', text, flags=re.M):
         head = block.split("]", 1)
         if len(head) != 2:
@@ -125,19 +133,24 @@ def _parse_cargo(text: str) -> dict[str, tuple[str, str | None]]:
         if m_dot:
             name = m_dot.group(1)
             vm = re.search(r'^\s*version\s*=\s*"([^"]+)"', body, re.M)
-            out.setdefault(name.replace("-", "_"), (name, vm.group(1) if vm else None))
+            out.setdefault(name.replace("-", "_"),
+                           (name, vm.group(1) if vm else None, None, section.split(".")[0]))
             continue
         if section not in _CARGO_DEP_SECTIONS:
             continue
-        for m in _CARGO_LINE_RE.finditer(body):
-            name = m.group(1)
-            ver = m.group(2) or m.group(3)
-            if name and ver:
-                out.setdefault(name.replace("-", "_"), (name, ver))
+        for m in _CARGO_RAW_LINE_RE.finditer(body):
+            name, rhs = m.group(1), m.group(2)
+            raw_line = f"{name} = {rhs}"
+            if rhs.startswith('"'):
+                out.setdefault(name.replace("-", "_"), (name, rhs[1:-1], raw_line, section))
+            else:
+                vm = re.search(r'\bversion\s*=\s*"([^"]+)"', rhs)
+                if vm:
+                    out.setdefault(name.replace("-", "_"), (name, vm.group(1), raw_line, section))
         for m in _CARGO_NAME_RE.finditer(body):
             name = m.group(1)
             if name:
-                out.setdefault(name.replace("-", "_"), (name, None))
+                out.setdefault(name.replace("-", "_"), (name, None, None, section))
     return out
 
 
@@ -204,9 +217,15 @@ def _coord_usable(stack: str, coord) -> bool:
     if coord is None:
         return False
     if stack == "cargo":
-        return isinstance(coord, tuple) and coord[1] is not None
+        if not (isinstance(coord, tuple) and coord[1] is not None):
+            return False
+        # D13：raw 内联表含 path =（本地相对路径）→ 跨目录移植必错，不可作坐标源
+        _raw = coord[2] if len(coord) > 2 else None
+        return not (_raw and re.search(r"\bpath\s*=", _raw))
     if stack == "npm":
-        return isinstance(coord, str) and not coord.startswith(_NPM_NONPORTABLE_VER)
+        # (ver, section) 二元组；版本目录相对协议不可移植
+        return (isinstance(coord, tuple) and isinstance(coord[0], str)
+                and not coord[0].startswith(_NPM_NONPORTABLE_VER))
     return isinstance(coord, str)  # go：replace 伴随的 None 已在上面挡
 
 
@@ -221,7 +240,9 @@ def _iter_manifests(project_path: Path, filename: str, limit: int = 200) -> list
                 "[L1.2.1·repair] A2 manifest 扫描达上限 %d（%s），已截断——超大 monorepo 可能漏坐标",
                 limit, filename)
             break
-    return out
+    # D14：排序确定化——rglob 目录序依赖文件系统，多兄弟声明同名依赖不同版本时
+    # "首个命中" 在旧码下非确定（同输入不同坐标源）。
+    return sorted(out)
 
 
 def _nearest_manifest(project_path: Path, modified: list[str], filename: str) -> Path | None:
@@ -248,7 +269,7 @@ def _nearest_manifest(project_path: Path, modified: list[str], filename: str) ->
 
 
 # ── 每栈：把坐标注入到目标 manifest（目标缺它时）；已声明则跳过。返回是否改动 ──────
-def _inject_npm(path: Path, dep: str, ver: str) -> bool:
+def _inject_npm(path: Path, dep: str, coord) -> bool:
     # npm 产物经 json.loads → json.dumps 重建，errors="ignore" 不会把丢字节写回原文。
     text = path.read_text(encoding="utf-8", errors="ignore")
     if dep in _parse_npm(text):
@@ -261,7 +282,9 @@ def _inject_npm(path: Path, dep: str, ver: str) -> bool:
     if not isinstance(data, dict):
         logger.warning("[L1.2.1·repair] A2 npm 目标 manifest 根不是对象(跳过注入): %s", path)
         return False
-    deps = data.setdefault("dependencies", {})
+    # D14：注入落到【来源 section】——devDependencies 坐标绝不进运行时 dependencies
+    ver, section = coord if isinstance(coord, tuple) else (coord, "dependencies")
+    deps = data.setdefault(section, {})
     if not isinstance(deps, dict) or dep in deps:
         return False
     deps[dep] = ver
@@ -292,14 +315,49 @@ def _inject_cargo(path: Path, dep: str, coord) -> bool:
         logger.warning(
             "[L1.2.1·repair] A2 cargo 目标非 crate manifest(无 [package])，跳过注入: %s", path)
         return False
-    name, ver = coord if isinstance(coord, tuple) else (dep, coord)
-    line = f'{name} = "{ver}"\n'
-    m = re.search(r'^\s*\[dependencies\]\s*$', text, re.M)
-    if m:
-        idx = text.index("\n", m.end()) + 1 if "\n" in text[m.end():] else len(text)
-        new = text[:idx] + line + text[idx:]
-    else:  # 无 [dependencies] 区 → 追加一个（上面已确证是真 crate manifest）
-        new = text.rstrip("\n") + f"\n\n[dependencies]\n{line}"
+    # D13：内联表/平表单行声明整体移植（保 features/default-features）；无 raw（点表）退 version-only
+    # D14：注入落回【来源 section】——dev/build 依赖绝不进运行时 [dependencies]
+    if isinstance(coord, tuple):
+        name, ver = coord[0], coord[1]
+        raw = coord[2] if len(coord) > 2 else None
+        section = coord[3] if len(coord) > 3 and coord[3] else "dependencies"
+    else:
+        name, ver, raw, section = dep, coord, None, "dependencies"
+    if section not in _CARGO_DEP_SECTIONS:
+        section = "dependencies"
+
+    def _insert(dep_line: str) -> str:
+        # 批次6 R1：section 头容忍内空白（`[ dependencies ]` 是合法 TOML）——旧正则
+        # 不匹配会追加第二个同名 section → duplicate-section 非法 TOML 毒化目标。
+        m = re.search(rf'^\s*\[\s*{re.escape(section)}\s*\]\s*$', text, re.M)
+        if m:
+            idx = text.index("\n", m.end()) + 1 if "\n" in text[m.end():] else len(text)
+            return text[:idx] + dep_line + text[idx:]
+        # 无对应 section 区 → 追加一个（上面已确证是真 crate manifest）
+        return text.rstrip("\n") + f"\n\n[{section}]\n{dep_line}"
+
+    # M-2（批次6 R1 hunter+reviewer 双点名）：raw 移植后必须过 tomllib 全量校验——
+    # 内联表正则被字符串内 `}` 截断/兄弟 raw 依赖来源文件上下文时，盲写会产出
+    # 非法 TOML 直接毒化目标 manifest。校验不过 → 回退 version-only 再校；
+    # 再不过 → fail-closed 不注（诚实边界：丢保 features 也不产毒）。
+    import tomllib
+    if raw:
+        candidate = _insert(f"{raw}\n")
+        try:
+            tomllib.loads(candidate)
+        except tomllib.TOMLDecodeError:
+            logger.warning(
+                "[L1.2.1·repair] cargo raw 移植后 TOML 校验不过（内联表截断/上下文依赖），"
+                "回退 version-only 注入: %s -> %s", dep, path)
+            raw = None
+    line = f"{raw}\n" if raw else f'{name} = "{ver}"\n'
+    new = _insert(line) if not raw else candidate
+    try:
+        tomllib.loads(new)
+    except tomllib.TOMLDecodeError:
+        logger.warning(
+            "[L1.2.1·repair] cargo 注入后 TOML 校验不过，fail-closed 不注: %s -> %s", dep, path)
+        return False
     path.write_text(new, encoding="utf-8")
     return True
 
@@ -324,6 +382,28 @@ def _inject_go(path: Path, dep: str, ver: str) -> bool:
 
 
 _INJECT = {"npm": _inject_npm, "cargo": _inject_cargo, "go": _inject_go}
+
+
+def _go_module_lookup(pkg: str, sibling_decls: list[dict]) -> tuple[str | None, str | None]:
+    """D12：go build 报错给的是【包路径】（github.com/x/y/z），go.mod require 的是
+    【模块路径】（github.com/x/y）——子包场景（Go 常态）键恒不相等，旧精确匹配恒跳过。
+
+    按**最长前缀**匹配兄弟声明的模块路径（`pkg == mod` 或 `pkg` 以 `mod/` 为前缀）；
+    多个命中时优先坐标可用者（长前缀带 replace 伴随=None 不可移植时，退到较短但可用的）。
+    返回 (模块路径, 坐标)；无覆盖 → (None, None)。
+    """
+    matches: list[tuple[str, str | None]] = []
+    for decl in sibling_decls:
+        for mod, coord in decl.items():
+            if pkg == mod or pkg.startswith(mod + "/"):
+                matches.append((mod, coord))
+    if not matches:
+        return None, None
+    matches.sort(key=lambda mc: len(mc[0]), reverse=True)  # 最长前缀优先
+    for mod, coord in matches:
+        if _coord_usable("go", coord):
+            return mod, coord
+    return matches[0]  # 全不可用 → 返回最长者让上层如实跳过（绝不退而臆造）
 
 
 def repair_from_sibling_manifests(
@@ -361,18 +441,29 @@ def repair_from_sibling_manifests(
     injected = 0
     touched: list[str] = []
     for dep in deps:
-        coord = next((decl[dep] for decl in sibling_decls if dep in decl), None)
+        if stack == "go":
+            # D12：包路径 → 模块路径最长前缀解析（go.mod require 的是模块不是包）
+            decl_key, coord = _go_module_lookup(dep, sibling_decls)
+            if decl_key is None:
+                logger.info(
+                    "[L1.2.1·repair] A2 go 包路径 %s 无兄弟模块覆盖（精确/前缀皆无）→ 跳过",
+                    dep,
+                )
+                continue
+        else:
+            decl_key = dep
+            coord = next((decl[dep] for decl in sibling_decls if dep in decl), None)
         if not _coord_usable(stack, coord):
             continue  # 兄弟无坐标/坐标不可移植 → 非项目自证，绝不臆造，交回上游（BLOCKED/等生产者）
         try:
-            if _INJECT[stack](target, dep, coord):
+            if _INJECT[stack](target, decl_key, coord):
                 injected += 1
                 rel = str(target.relative_to(root))
                 if rel not in touched:
                     touched.append(rel)
                 logger.info(
                     "[L1.2.1·repair] A2 多栈补依赖(%s)：据兄弟 manifest 自证坐标把 %s 注入 %s",
-                    stack, dep, rel,
+                    stack, decl_key, rel,
                 )
         except (OSError, ValueError) as exc:
             # 写用户 manifest 半途失败必须可见（w 模式先截断，disk-full 半途 = 文件损坏）。

@@ -564,6 +564,23 @@ class _SandboxSyncMixin:
         candidates = set()
         for f in self._writable_files():
             candidates.add(self._norm_rel(local_root, f))
+        # C6（19号文求证+补闸）：writable ∩ upstream_products（dispatch 按当前完成态
+        # 产物全集【重算替换】的即时账，H-1 防粘滞）不参与防脏 reset——其本地≠base 部分
+        # 是【上游已合并产物】（normalize 串行化的聚合/注册类共享文件链的合法传播面），
+        # 抹回 base 会让本子任务沙箱对上游同文件改动全盲（盲改+L1 假红；产物正确性本由
+        # diff 空间 MERGE 3-way/rebase 收口，reset 不救产物只决沙箱输入）。防脏叠加对这类
+        # 文件让位：重试续跑见到自身上轮改动≈fix-round 循环内既有语义，L1 闸+merge rebase
+        # 兜底。无即时账的 writable 维持原 reset 语义（脏叠加根治不回退）。
+        _ua_reset = {self._norm_rel(local_root, u)
+                     for u in (getattr(self.effective_scope, "upstream_products", None) or [])}
+        if _ua_reset:
+            _kept = sorted(c for c in candidates if c in _ua_reset)
+            if _kept:
+                candidates -= set(_kept)
+                self._log(
+                    f"workspace reset: {len(_kept)} 个 writable 带上游产物即时账 "
+                    f"（upstream_products）→ 保留本地已合并版不参与防脏 reset: {_kept[:5]}"
+                )
         if not candidates:
             return 0
 
@@ -614,10 +631,11 @@ class _SandboxSyncMixin:
             if r.returncode == 0:
                 self._log(f"bootstrap 前 workspace reset：{len(tracked)} 个 tracked 文件恢复到钉扎 base（防跨轮脏叠加）")
                 return len(tracked)
-            self._log(f"workspace reset 警告（git checkout 非零）: {r.stderr.strip()[:200]}")
+            self._log(f"workspace reset 警告（git checkout 非零）: {r.stderr.strip()[:200]}",
+                      level="warning")  # C12：防脏 reset 失效=护栏降级，真级别
             return 0
         except Exception as exc:  # noqa: BLE001
-            self._log(f"workspace reset 跳过（异常）: {exc}")
+            self._log(f"workspace reset 跳过（异常）: {exc}", level="warning")  # C12
             return 0
 
     async def _sync_to_sandbox(self, reason: str) -> None:
@@ -854,6 +872,14 @@ class _SandboxSyncMixin:
                 _tracked_writables = _git_tracked_set(
                     local_root, _writable_candidates,
                     resolve_base_ref(getattr(self, 'base_ref', None)))
+                # C6（19号文求证+补闸）：writable ∩ upstream_products（dispatch 按当前完成态
+                # 产物全集重算替换的即时账，H-1 防粘滞）上传【本地已合并版】而非 base 版——
+                # 对称 readable 补传（69d34b1b"本地≠HEAD=上游改动→补传"）语义到 writable
+                # 通道。钉 base 会把上游同文件改动剥出沙箱（下游盲改+L1 假红）。无即时账的
+                # writable 维持 base 版上传（防脏叠加护栏不回退）。
+                _ua_upload = {self._norm_rel(local_root, u)
+                              for u in (getattr(self.effective_scope, "upstream_products", None) or [])}
+                _ua_kept: list[str] = []
                 if _tracked_writables is None:
                     # R65TR-T1 三态分流：None=真 git 故障（判定层已打 [git_tracked_set]
                     # WARNING）→ 护栏确实失效，真 warning 级留痕后降级脏盘上传（fail-open
@@ -880,8 +906,14 @@ class _SandboxSyncMixin:
                     dst = staging_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     is_tracked = rel in _tracked_writables
-                    git_text = self._git_baseline_text(local_root, rel) if is_tracked else None
-                    if is_tracked and git_text is None:
+                    # C6：上游产物 provenance 的 tracked writable → 本地已合并版权威，
+                    # 不取 base 基线（走下方真实磁盘 copy 分支）。
+                    _ua_local = is_tracked and rel in _ua_upload
+                    if _ua_local:
+                        _ua_kept.append(rel)
+                    git_text = (self._git_baseline_text(local_root, rel)
+                                if is_tracked and not _ua_local else None)
+                    if is_tracked and not _ua_local and git_text is None:
                         # 遗漏项#3 复核（hunter#3）：base 树确认存在却取不到基线（git 瞬时故障）
                         # → 单文件退化脏磁盘上传，防脏叠加对该文件失效——必须留痕，不得静默。
                         self._log(f"clean_upload: {rel} 在 base 树但基线读取失败，"
@@ -898,10 +930,16 @@ class _SandboxSyncMixin:
                             shutil.copy2(src, dst)
                         # 源不存在（待新建）→ staging 也不建，上传层跳过
                 upload_root = staging_root
+                if _ua_kept:
+                    self._log(
+                        f"{reason} 上游产物传播：{len(_ua_kept)} 个 writable 带上游产物 "
+                        f"provenance → 上传本地已合并版（非 base 版，C6）: {_ua_kept[:5]}"
+                    )
                 if cleaned:
                     self._log(f"{reason} 干净上传：{cleaned} 个 writable 文件用 git HEAD 版上传（防脏叠加）")
             except Exception as stage_exc:  # noqa: BLE001
-                self._log(f"{reason} staging 构造失败，回退脏磁盘上传: {stage_exc}")
+                self._log(f"{reason} staging 构造失败，回退脏磁盘上传: {stage_exc}",
+                          level="warning")  # C12：clean_upload 护栏整体失效=降级，真级别
                 upload_root = local_root
                 if staging_dir:
                     shutil.rmtree(staging_dir, ignore_errors=True)
@@ -933,7 +971,7 @@ class _SandboxSyncMixin:
                 f"errors={err_count}, files={sync_stats.get('files')}"
             )
             for err in (sync_stats.get("errors") or [])[:5]:
-                self._log(f"上传警告: {err}")
+                self._log(f"上传警告: {err}", level="warning")  # C12：假级别[WARN]-in-INFO→真 warning（G1-4 同族）
         except Exception as sync_exc:
             # N-06：bootstrap 上传失败若吞掉，agent 会对【缺文件的沙箱】空跑→被误判能力失败
             # （空 diff）→错误触发换模型。这是基础设施瞬时失败，显式抛 TransientInfraError →
@@ -1328,7 +1366,7 @@ class _SandboxSyncMixin:
                 f"errors={err_count}"
             )
             for err in (sync_stats.get("errors") or [])[:5]:
-                self._log(f"pull-back 警告: {err}")
+                self._log(f"pull-back 警告: {err}", level="warning")  # C12：假级别[WARN]-in-INFO→真 warning（G1-4 同族）
             self._enforce_baseline_anchor_integrity(local_root, reason)
             await self._normalize_jvm_namespace(local_root, reason)
         except Exception as sync_exc:

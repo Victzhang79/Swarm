@@ -22,10 +22,40 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_CARGO_EDITION_RE = re.compile(r'^\s*edition\s*=\s*"(\d{4})"', re.M)
+
+
+def _rust_edition(project_path: str, rel_fp: str) -> str:
+    """D14：rustfmt edition 取最近祖先 Cargo.toml 的 edition 字段。
+
+    有 Cargo.toml 无 edition 字段 → "2015"（cargo/rustfmt 共同缺省）；向上 8 层找不到
+    Cargo.toml → "2021"（现代 crate 常态，旧行为）。
+    """
+    d = os.path.dirname(os.path.join(project_path, rel_fp))
+    root = Path(project_path).resolve()
+    for _ in range(8):
+        cm = os.path.join(d, "Cargo.toml")
+        if os.path.isfile(cm):
+            try:
+                with open(cm, encoding="utf-8", errors="ignore") as fh:
+                    m = _CARGO_EDITION_RE.search(fh.read())
+            except OSError:
+                m = None
+            return m.group(1) if m else "2015"
+        nd = os.path.dirname(d)
+        # 批次6 R1（reviewer LOW）：边界判定用路径语义 is_relative_to——字符串前缀
+        # 会把 /tmp/test_a 误判为 /tmp/test 内。
+        if nd == d or not Path(d).resolve().is_relative_to(root):
+            break
+        d = nd
+    return "2021"
 
 # 语言 → (探测的可执行名, 构造命令的函数)。命令对【单个文件】原地格式化。
 _FORMATTERS: dict[str, list[tuple[str, list[str]]]] = {
@@ -41,7 +71,9 @@ _FORMATTERS: dict[str, list[tuple[str, list[str]]]] = {
         ("gofmt", ["gofmt", "-w"]),
     ],
     "rust": [
-        ("rustfmt", ["rustfmt", "--edition", "2021"]),
+        # D14：edition 不写死——按每个文件最近祖先 Cargo.toml 的 edition 字段注入
+        # （写死 2021 会把 2018 crate 按 2021 语法误格式化）。
+        ("rustfmt", ["rustfmt"]),
     ],
     "java": [
         ("google-java-format", ["google-java-format", "-i"]),
@@ -53,7 +85,9 @@ _EXT_TO_LANG = {
     ".js": "node", ".jsx": "node", ".ts": "node", ".tsx": "node",
     ".go": "go",
     ".rs": "rust",
-    ".java": "java", ".kt": "java",
+    ".java": "java",
+    # D14：.kt 不再映射 java——google-java-format 不支持 Kotlin，喂进去恒失败空转；
+    # Kotlin 无可用格式化器=诚实不碰（不映射=不进 formatted/skipped 分母）。
 }
 
 
@@ -100,8 +134,11 @@ def format_files(
 
         for fp in lang_files[:50]:
             try:
+                _cmd = chosen
+                if lang == "rust":  # D14：edition 按最近 Cargo.toml，不写死
+                    _cmd = chosen + ["--edition", _rust_edition(project_path, fp)]
                 proc = subprocess.run(
-                    chosen + [fp],
+                    _cmd + [fp],
                     cwd=project_path,
                     capture_output=True,
                     text=True,
@@ -118,6 +155,14 @@ def format_files(
             except Exception as exc:  # noqa: BLE001
                 skipped.append(fp)
                 logger.debug("L0 format 异常 %s: %s", fp, exc)
+        # D14：超出 50 上限的尾巴必须如实进 skipped——否则 status 谎报 "ok"
+        # （第 51+ 文件既没格式化也没记账，调用方以为全量已 format）。
+        if len(lang_files) > 50:
+            skipped.extend(lang_files[50:])
+            logger.warning(
+                "L0 format: %s 超出单批 50 上限，%d 文件未格式化（如实记 skipped）",
+                lang, len(lang_files) - 50,
+            )
 
     status = "ok" if not skipped else ("partial" if formatted else "skipped")
     return {"formatted": formatted, "skipped": skipped, "status": status}

@@ -153,8 +153,13 @@ def test_symbol_hint_truly_absent_unchanged():
     missing = [MissingSymbol(kind="class", name="BarService")]
     hints = build_symbol_hints(missing, resolved={}, plan_create_files=[], query_failed=set())
     assert hints[0].status == "absent"
-    assert "不存在" in hints[0].message
-    print("  ✅ 真查空符号 → status=absent(向后兼容)")
+    # D11（19号文）：措辞降权——不再断言"项目中不存在…需新建"（codegraph 只索引项目源码，
+    # 第三方类/索引盲区会被诱导重建 → shadow/重复类，CVB 病灶 worker 侧供给源）。
+    msg = hints[0].message
+    assert "在整个项目中不存在" not in msg, msg
+    assert "需新建该类" not in msg, msg
+    assert "第三方依赖库" in msg and "索引" in msg, msg
+    print("  ✅ absent 措辞降权（D11：第三方/盲区提示优先于新建引导）")
 
 
 def test_resolve_and_format_query_failure_not_absent():

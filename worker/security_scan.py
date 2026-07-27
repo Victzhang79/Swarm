@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +52,14 @@ def _severity_gte(found: Severity, threshold: str) -> bool:
 # 用一个可变 dict 让各 helper 在【确实跑起了某个真实工具】时置 ran=True。
 _SEVERITY_FAILCLOSED_TITLE = "Security scanning unavailable (fail-closed)"
 
+# D7（19号文，先核有意性结论）：全部 _map_*_severity 对未知/缺失 severity 缺省 MEDIUM 是
+# 【有意】而非疏漏——ECC 分级契约（DR-05-F5(#85) 对抗双复核裁定）：CRITICAL=block / HIGH=warn，
+# "把通用模式提级 CRITICAL"的处方已被裁为【过激】撤销（RuoYi 基线 `CSRF_TOKEN = "csrf_token"`
+# 常量名冤杀实证）。缺省 MEDIUM 同理 = FP 控制：pip-audit 默认 JSON 常无 severity 字段，依赖 CVE
+# 一律提级会让 baseline 老依赖连坐杀新交付。需要更严的环境走配置收紧
+# （security_block_severity=high），绝不在映射层静默提级。单点常量=语义显式化。
+_UNKNOWN_SEVERITY_DEFAULT = Severity.MEDIUM
+
 
 class _ScanContext:
     """跨各扫描器累积执行状态。scanner_ran=True 表示【至少一个真实工具成功执行】
@@ -57,12 +67,19 @@ class _ScanContext:
 
     注意：builtin-regex 密钥兜底【不算】真实扫描器（它在工具全缺时也能跑，会掩盖
     SAST/依赖工具全缺的事实）；只有外部工具真正执行才置位。
+
+    D4（19号文）：per-category 粒度——单布尔时代任一类任一工具跑成即解除哨兵
+    （java 有 spotbugs 无 dependency-check → 依赖漏洞 0 覆盖照常放行）。三类分账，
+    阻断模式任一类 0 覆盖即注合成 finding。
     """
 
-    __slots__ = ("scanner_ran",)
+    __slots__ = ("scanner_ran", "sast_ran", "dep_ran", "secret_ran")
 
     def __init__(self) -> None:
         self.scanner_ran = False
+        self.sast_ran = False
+        self.dep_ran = False
+        self.secret_ran = False
 
 
 # ──────────────────────────────────────────────
@@ -132,12 +149,21 @@ def run_security_scan(
             ))
     else:
         should_block = any(_severity_gte(f.severity, block_severity) for f in findings)
-        # A-P0-2 fail-closed：阻断模式下，若【没有任何真实扫描器执行】（工具全缺/全超时/全解析失败），
-        # 绝不能与"真·零漏洞"混同放行。注入一条 = 阈值级别的合成发现，强制 should_block=True。
-        if not ctx.scanner_ran:
+        # A-P0-2 + D4 per-category fail-closed：阻断模式下，任一【类】0 覆盖（该类所有真实
+        # 工具全缺/全超时/全解析失败）都不能与"真·零漏洞"混同放行——逐类注入 = 阈值级别的
+        # 合成发现并强制阻断。单布尔时代的漏洞：java 有 spotbugs 无 dependency-check →
+        # 依赖漏洞 0 覆盖照常放行。secret 类有内置正则兜底，实践上恒有覆盖（哨兵近于不触发，
+        # 但语义保持正确：兜底失效时仍能 fail-closed）。
+        _missing_cats = [
+            cat
+            for cat, ran in (("sast", ctx.sast_ran), ("dep", ctx.dep_ran), ("secret", ctx.secret_ran))
+            if not ran
+        ]
+        if _missing_cats:
             logger.warning(
-                "Security scan: no real scanner executed for language '%s' in block mode "
-                "(threshold=%s) — failing closed.",
+                "Security scan: 0 coverage for categories %s (language='%s', block mode, "
+                "threshold=%s) — failing closed per-category.",
+                _missing_cats,
                 language,
                 block_severity,
             )
@@ -146,29 +172,34 @@ def run_security_scan(
                 if block_severity in _SEVERITY_ORDER
                 else Severity.CRITICAL
             )
-            findings.append(SecurityFinding(
-                severity=synthetic_sev,  # type: ignore[arg-type]
-                category="sast",
-                rule_id="fail-closed-no-scanner",
-                title=_SEVERITY_FAILCLOSED_TITLE,
-                file="",
-                line=0,
-                tool="swarm-security-gate",
-                recommendation=(
-                    "No security scanner ran for this language (tooling absent/failed). "
-                    "Install the relevant scanners (e.g. bandit/semgrep/gosec/clippy/spotbugs, "
-                    "pip-audit/npm/govulncheck/cargo-audit/dependency-check) or set "
-                    "security_block_severity=none to explicitly accept un-scanned deliveries."
-                ),
-            ))
+            for _cat in _missing_cats:
+                findings.append(SecurityFinding(
+                    severity=synthetic_sev,  # type: ignore[arg-type]
+                    category=_cat,
+                    rule_id=f"fail-closed-no-{_cat}-scanner",
+                    title=f"{_SEVERITY_FAILCLOSED_TITLE} ({_cat} 0 coverage)",
+                    file="",
+                    line=0,
+                    tool="swarm-security-gate",
+                    recommendation=(
+                        f"No real {_cat} scanner ran for this language (tooling absent/failed). "
+                        "Install the relevant scanners (e.g. bandit/semgrep/gosec/clippy/spotbugs, "
+                        "pip-audit/npm/govulncheck/cargo-audit/dependency-check, gitleaks/trufflehog) "
+                        "or set security_block_severity=none to explicitly accept un-scanned deliveries."
+                    ),
+                ))
             should_block = True
 
     logger.info(
-        "Security scan done: %d findings, should_block=%s (threshold=%s, scanner_ran=%s)",
+        "Security scan done: %d findings, should_block=%s (threshold=%s, scanner_ran=%s, "
+        "sast_ran=%s, dep_ran=%s, secret_ran=%s)",
         len(findings),
         should_block,
         block_severity,
         ctx.scanner_ran,
+        ctx.sast_ran,
+        ctx.dep_ran,
+        ctx.secret_ran,
     )
     return findings, should_block
 
@@ -222,10 +253,22 @@ def _safe_json_parse(raw: str) -> Any:
         return None
 
 
-def _mark_ran(ctx: "_ScanContext | None") -> None:
-    """标记：某真实外部扫描器已成功执行（rc != -1）。A-P0-2 fail-closed 判据用。"""
+def _mark_ran(
+    ctx: "_ScanContext | None", category: str | None = None, *, aggregate: bool = True
+) -> None:
+    """标记：某真实扫描器已成功执行（rc != -1）。A-P0-2 fail-closed 判据用。
+    category（D4 per-category 分账）："sast"/"dep"/"secret"，None=只置聚合位。
+    aggregate=False（D4）：只置 category 分账位不置聚合位——内置正则密钥兜底用：
+    它对 secret 类是真实覆盖，但若置聚合位会掩盖 SAST/依赖工具全缺（A-P0-2 原旨）。"""
     if ctx is not None:
-        ctx.scanner_ran = True
+        if aggregate:
+            ctx.scanner_ran = True
+        if category == "sast":
+            ctx.sast_ran = True
+        elif category == "dep":
+            ctx.dep_ran = True
+        elif category == "secret":
+            ctx.secret_ran = True
 
 
 # ──────────────────────────────────────────────
@@ -255,7 +298,14 @@ def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_Sc
         logger.info("SAST(python): bandit not found, skipping")
         return []
 
-    targets = files if files else ["-r", "."]
+    # D8/H-2（批次6 R1 hunter）：files=[]（scope 内无可扫对象）≠ files=None（未限定）——
+    # 空集回退全树会把 baseline 未触碰文件的旧账算到新交付头上（阻断模式连坐误杀）。
+    # 空集=vacuous 覆盖：已尽扫描义务（无可扫对象），置 sast_ran 防哨兵误伤，诚实跳过。
+    if files is not None and not files:
+        logger.info("SAST(python): scope 内无可扫文件（空集），跳过（vacuous 覆盖，不回退全树）")
+        _mark_ran(ctx, "sast")
+        return []
+    targets = files if files is not None else ["-r", "."]
     cmd = ["bandit", "-f", "json"] + targets
     rc, stdout, stderr = _run_tool(cmd, cwd=project_path)
     if rc == -1:
@@ -267,7 +317,7 @@ def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_Sc
         # 哨兵按"未扫"处理（gitleaks P2-2 同款姿势），杜绝"跑挂伪装扫过且干净"。
         logger.warning("SAST(python): bandit output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "sast")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     results = data.get("results", []) if isinstance(data, dict) else []
@@ -289,7 +339,7 @@ def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_Sc
 def _map_bandit_severity(sev: str) -> Severity:
     """Bandit severity: HIGH/MEDIUM/LOW → Severity。"""
     mapping = {"HIGH": Severity.HIGH, "MEDIUM": Severity.MEDIUM, "LOW": Severity.LOW}
-    return mapping.get(sev.upper(), Severity.MEDIUM)
+    return mapping.get(sev.upper(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
@@ -298,7 +348,15 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
         logger.info("SAST(node): semgrep not found, skipping")
         return []
 
-    cmd = ["semgrep", "--json", "--config", "auto", project_path]
+    # D8：files 提供时限定扫描目标——全树扫会把 baseline 未触碰文件的旧账算到新交付头上
+    # （阻断模式下连坐）。semgrep 原生接受文件/目录目标列表（cwd=project_path，相对路径直用）。
+    # H-2（批次6 R1 hunter）：空集≠未限定——vacuous 覆盖置 sast_ran 后诚实跳过，不回退全树。
+    if files is not None and not files:
+        logger.info("SAST(node): scope 内无可扫文件（空集），跳过（vacuous 覆盖，不回退全树）")
+        _mark_ran(ctx, "sast")
+        return []
+    targets = files if files is not None else [project_path]
+    cmd = ["semgrep", "--json", "--config", "auto", *targets]
     rc, stdout, stderr = _run_tool(cmd, cwd=project_path, timeout=300)
     if rc == -1:
         logger.warning("SAST(node): semgrep execution failed: %s", stderr)
@@ -308,7 +366,7 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
         # D1：不可解析=跑挂（如 --config auto 离线拉不到规则）→ 不置位，哨兵按未扫处理
         logger.warning("SAST(node): semgrep output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "sast")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     results = data.get("results", []) if isinstance(data, dict) else []
@@ -329,7 +387,7 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
 
 def _map_semgrep_severity(sev: str) -> Severity:
     mapping = {"ERROR": Severity.HIGH, "WARNING": Severity.MEDIUM, "INFO": Severity.INFO}
-    return mapping.get(sev.upper(), Severity.MEDIUM)
+    return mapping.get(sev.upper(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
@@ -338,7 +396,24 @@ def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanCo
         logger.info("SAST(go): gosec not found, skipping")
         return []
 
-    cmd = ["gosec", "-fmt=json", "./..."]
+    # D8：files 提供时按【包模式】限定——gosec 只收 package pattern 不收文件清单，
+    # 故取 scope 内 .go 文件的父目录去重 → ./dir/... 形式；scope 无 .go 文件=Go SAST
+    # 对本子任务无对象，诚实跳过（不拿全树旧账连坐）。
+    if files is not None:
+        go_dirs = sorted({
+            (str(Path(f).parent) if str(Path(f).parent) != "." else ".")
+            for f in files if f.endswith(".go")
+        })
+        if not go_dirs:
+            # H-2（批次6 R1）：vacuous 覆盖置 sast_ran——无可扫对象≠工具缺席，
+            # 不置位会让 D4 哨兵把"scope 内无 .go"误报成"未扫"（误杀方向）。
+            logger.info("SAST(go): scope 内无 .go 文件，跳过（D8 files 限定，vacuous 覆盖）")
+            _mark_ran(ctx, "sast")
+            return []
+        patterns = [f"./{d}/..." if d != "." else "./..." for d in go_dirs]
+    else:
+        patterns = ["./..."]
+    cmd = ["gosec", "-fmt=json", *patterns]
     rc, stdout, stderr = _run_tool(cmd, cwd=project_path)
     if rc == -1:
         logger.warning("SAST(go): gosec execution failed: %s", stderr)
@@ -347,7 +422,7 @@ def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanCo
     if data is None:
         logger.warning("SAST(go): gosec output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "sast")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     issues = data.get("Issues", []) if isinstance(data, dict) else []
@@ -368,11 +443,14 @@ def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanCo
 
 def _map_gosec_severity(sev: str) -> Severity:
     mapping = {"HIGH": Severity.HIGH, "MEDIUM": Severity.MEDIUM, "LOW": Severity.LOW}
-    return mapping.get(sev.upper(), Severity.MEDIUM)
+    return mapping.get(sev.upper(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
-    """Rust SAST: cargo clippy 安全规则 (warn=->deny)。"""
+    """Rust SAST: cargo clippy 安全规则 (warn=->deny)。
+
+    D8 诚实边界：clippy 走 cargo 编译模型只能整 crate 跑，无文件级目标参数——files
+    限定不适用（baseline 连坐风险由 D8 已治的 semgrep/gosec/bandit 路径覆盖主要场景）。"""
     if not shutil.which("cargo"):
         logger.info("SAST(rust): cargo not found, skipping")
         return []
@@ -414,7 +492,11 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
 
         # 尝试提取安全相关: spans 中有文件位置
         spans = msg.get("spans", [])
-        for sp in spans:
+        # D14：只按 is_primary 归因——非主 span 是 note/related 位置，逐 span 出 finding
+        # 会把一条诊断复制成 N 条噪音。无 primary span 时回落一条（不丢信号）。
+        _primary = [sp for sp in spans if sp.get("is_primary")]
+        _emit = _primary if _primary else [{}]
+        for sp in _emit:
             sev = Severity.HIGH if level == "error" else Severity.MEDIUM
             findings.append(SecurityFinding(
                 severity=sev,
@@ -427,12 +509,15 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
                 recommendation="",
             ))
     if rc == 0 or _parsed_any:
-        _mark_ran(ctx)  # D1：rc=0（文档化成功）或输出可解析才置位——跑挂不解除哨兵
+        _mark_ran(ctx, "sast")  # D1：rc=0（文档化成功）或输出可解析才置位——跑挂不解除哨兵
     return findings
 
 
 def _sast_java(project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
-    """Java SAST: spotbugs。"""
+    """Java SAST: spotbugs。
+
+    D8 诚实边界：spotbugs 分析编译产物（class/jar）按模块跑，无源码文件级目标参数——
+    files 限定不适用。"""
     if not shutil.which("spotbugs"):
         logger.info("SAST(java): spotbugs not found, skipping")
         return []
@@ -456,7 +541,7 @@ def _sast_java(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
         # D1：不置 _mark_ran，哨兵按未扫处理
         logger.warning("SAST(java): spotbugs XML 解析失败: %s", exc)
         return []
-    _mark_ran(ctx)  # D1：XML 成功解析后才置位
+    _mark_ran(ctx, "sast")  # D1：XML 成功解析后才置位
 
     findings: list[SecurityFinding] = []
     for bug in root.iter("BugInstance"):
@@ -489,14 +574,18 @@ def _map_spotbugs_severity(sev: str) -> Severity:
     """SpotBugs priority: 1=High, 2=Medium, 3=Low。"""
     mapping = {"1": Severity.HIGH, "2": Severity.MEDIUM, "3": Severity.LOW,
                "high": Severity.HIGH, "medium": Severity.MEDIUM, "low": Severity.LOW}
-    return mapping.get(sev.lower(), Severity.MEDIUM)
+    return mapping.get(sev.lower(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 # ──────────────────────────────────────────────
 # (b) 依赖漏洞扫描
 # ──────────────────────────────────────────────
 def _run_dependency_scan(project_path: str, language: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
-    """依赖漏洞扫描。"""
+    """依赖漏洞扫描。
+
+    D8 诚实边界：依赖 CVE 归属项目级清单/环境（pip-audit 环境、npm audit 树、
+    dependency-check jar 集），无"按 scope 文件限定"的语义——files 参数不适用；
+    baseline 老依赖 CVE 的连坐治理方向是 baseline 快照 diff（独立机制，未实现）。"""
     dispatch = {
         "python": _dep_python,
         "node": _dep_node,
@@ -526,7 +615,7 @@ def _dep_python(project_path: str, *, ctx: "_ScanContext | None" = None) -> list
     if data is None:
         logger.warning("Dep(python): pip-audit output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "dep")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     dependencies = data.get("dependencies", []) if isinstance(data, dict) else []
@@ -550,7 +639,7 @@ def _dep_python(project_path: str, *, ctx: "_ScanContext | None" = None) -> list
 def _map_pip_audit_severity(sev: str) -> Severity:
     mapping = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                "medium": Severity.MEDIUM, "low": Severity.LOW}
-    return mapping.get(sev.lower(), Severity.MEDIUM)
+    return mapping.get(sev.lower(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
@@ -568,7 +657,7 @@ def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     if data is None:
         logger.warning("Dep(node): npm audit output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "dep")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     vulnerabilities = data.get("vulnerabilities", {}) if isinstance(data, dict) else {}
@@ -595,7 +684,7 @@ def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
 def _map_npm_severity(sev: str) -> Severity:
     mapping = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                "medium": Severity.MEDIUM, "low": Severity.LOW, "info": Severity.INFO}
-    return mapping.get(sev.lower(), Severity.MEDIUM)
+    return mapping.get(sev.lower(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
@@ -681,14 +770,14 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
             recommendation=f"Upgrade module affected by {osv}",
         ))
     if rc == 0 or _parsed_any:
-        _mark_ran(ctx)  # D1：rc=0 或输出可解析才置位——跑挂不解除哨兵
+        _mark_ran(ctx, "dep")  # D1：rc=0 或输出可解析才置位——跑挂不解除哨兵
     return list(by_osv.values()) + findings
 
 
 def _map_vuln_severity(sev: str) -> Severity:
     mapping = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                "medium": Severity.MEDIUM, "low": Severity.LOW}
-    return mapping.get(sev.lower(), Severity.MEDIUM)
+    return mapping.get(sev.lower(), _UNKNOWN_SEVERITY_DEFAULT)
 
 
 def _dep_rust(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding]:
@@ -711,7 +800,7 @@ def _dep_rust(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     if data is None:
         logger.warning("Dep(rust): cargo audit output not valid JSON, skipping")
         return []
-    _mark_ran(ctx)  # D1：输出成功解析后才置位
+    _mark_ran(ctx, "dep")  # D1：输出成功解析后才置位
 
     findings: list[SecurityFinding] = []
     vulnerabilities = data.get("vulnerabilities", {}) if isinstance(data, dict) else {}
@@ -785,7 +874,7 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Dep(java): failed to read dependency-check report: %s", exc)
         return []
-    _mark_ran(ctx)  # D2：报告成功读取解析后才置位
+    _mark_ran(ctx, "dep")  # D2：报告成功读取解析后才置位
 
     findings: list[SecurityFinding] = []
     dependencies = data.get("dependencies", []) if isinstance(data, dict) else []
@@ -819,7 +908,7 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
 # 凭证 ASIA）。判据：结构化 provider token=CRITICAL(误报率低、进交付即真泄露)；通用赋值/宽松式=HIGH
 # (默认 block_severity=critical 不阻断，仅留痕)。全部栈无关、只匹配文本，绝不写死语言/框架。
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
-    ("OpenAI API key", re.compile(r"sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), Severity.CRITICAL),
+    ("OpenAI API key", re.compile(r"(?<![A-Za-z0-9])sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), Severity.CRITICAL),  # D6：左边界——disk-/task- 后随长 id/hash 不再内嵌命中
     # AWS 长期(AKIA)+临时(ASIA)凭证 ID
     ("AWS Access Key ID", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"), Severity.CRITICAL),
     ("AWS Secret Access Key", re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{40}"), Severity.CRITICAL),
@@ -833,8 +922,12 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
     # 带账密的数据库/消息队列连接串 [user]:pass@host（协议无关列举，非写死单一栈）。
     # 用户名可空——`redis://:password@host`（requirepass 无用户名）是 Redis/mongodb/amqp 的
     # 常见默认认证形态，故 user 段用 `*`（对抗复核 reviewer F1：原 `+` 要求非空用户名会漏报此式）。
+    # D5：密码段【整体】为占位形态（${VAR}/$VAR/{{var}}/%s/%d）时不命中——占位恰是本闸
+    # recommendation 教 worker 写的安全形态，命中即"照建议改仍阻断→escalate 成环"。
     ("DB Connection String with Credentials", re.compile(
-        r"(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@\s/]*:[^@\s/]+@[^\s'\"]+"
+        r"(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@\s/]*:"
+        r"(?!(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^}]*\}\}|%[sd])@)"
+        r"[^@\s/]+@[^\s'\"]+"
     ), Severity.CRITICAL),
     # Google OAuth client secret
     ("Google OAuth Client Secret", re.compile(r"GOCSPX-[A-Za-z0-9_-]{10,}"), Severity.CRITICAL),
@@ -962,6 +1055,10 @@ def scan_diff_for_secrets(
         elif raw.startswith("-"):
             # 删除行：不计入新文件行号、不扫描
             continue
+        elif raw.startswith("\\"):
+            # D14：`\ No newline at end of file` 是 diff 元数据而非文件内容行——
+            # 计入行号会让其后所有 finding 行号归因偏移一位。
+            continue
         else:
             # 上下文行（' ' 前缀或空行）：推进新文件行号、不扫描
             new_line_no += 1
@@ -988,8 +1085,12 @@ def _run_secret_scan(
     if findings is not None:
         return findings
 
-    # 内置正则兜底（不标记 scanner_ran）
-    return _secret_builtin_regex(project_path, files=files)
+    # 内置正则兜底：D4 下对 secret 类是【真实覆盖】→置 secret_ran（per-category 哨兵不误伤）；
+    # 但不置聚合 scanner_ran（A-P0-2 原旨：不能让它掩盖 SAST/依赖工具全缺）。
+    # L-1（批次6 R1 hunter）：置位绑定"至少实扫了一个文件"（在 _secret_builtin_regex 内
+    # scan_files 非空时置）——0 文件也置位会让 secret 类哨兵永远失效（假覆盖）。
+    findings = _secret_builtin_regex(project_path, files=files, ctx=ctx)
+    return findings
 
 
 def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
@@ -997,23 +1098,29 @@ def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) ->
     if not shutil.which("gitleaks"):
         return None
 
-    report_path = str(Path(project_path) / ".gitleaks-report.json")
-    cmd = ["gitleaks", "detect", "--report-format", "json", "--report-path", report_path, "--no-git"]
-    rc, stdout, stderr = _run_tool(cmd, cwd=project_path, timeout=180)
-    # gitleaks exit code 1 = leaks found, 0 = no leaks, 其他=错误
-    if rc not in (0, 1):
-        logger.warning("Secret scan: gitleaks execution failed (rc=%d): %s", rc, stderr)
-        return None
+    # D14：报告写到项目树外的临时文件——写进项目树会把 .gitleaks-report.json 混进
+    # worker 交付 diff（污染交付物/触发 scope 外变更告警）。
+    fd, report_path = tempfile.mkstemp(prefix="gitleaks-report-", suffix=".json")
+    os.close(fd)
     try:
-        data = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        # P2-2：报告解析失败不再"已扫过+零发现"（fail-open）——不置 _mark_ran，让上游
-        # fail-closed 哨兵按"未扫"处理（与工具没跑同等对待），杜绝解析坏=漏洞清零假绿。
-        # D3：返回 None 而非 []——非 None 会让 _run_secret_scan 判"已有结果"直接返回，
-        # trufflehog/内置正则兜底链整体被跳过（密钥类零扫描）。None=落入下一级兜底。
-        logger.warning("Secret scan: gitleaks report parse failed（按未扫落兜底链）: %s", exc)
-        return None
-    _mark_ran(ctx)  # gitleaks 已成功执行且报告可解析
+        cmd = ["gitleaks", "detect", "--report-format", "json", "--report-path", report_path, "--no-git"]
+        rc, stdout, stderr = _run_tool(cmd, cwd=project_path, timeout=180)
+        # gitleaks exit code 1 = leaks found, 0 = no leaks, 其他=错误
+        if rc not in (0, 1):
+            logger.warning("Secret scan: gitleaks execution failed (rc=%d): %s", rc, stderr)
+            return None
+        try:
+            data = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            # P2-2：报告解析失败不再"已扫过+零发现"（fail-open）——不置 _mark_ran，让上游
+            # fail-closed 哨兵按"未扫"处理（与工具没跑同等对待），杜绝解析坏=漏洞清零假绿。
+            # D3：返回 None 而非 []——非 None 会让 _run_secret_scan 判"已有结果"直接返回，
+            # trufflehog/内置正则兜底链整体被跳过（密钥类零扫描）。None=落入下一级兜底。
+            logger.warning("Secret scan: gitleaks report parse failed（按未扫落兜底链）: %s", exc)
+            return None
+        _mark_ran(ctx, "secret")  # gitleaks 已成功执行且报告可解析
+    finally:
+        Path(report_path).unlink(missing_ok=True)
 
     findings: list[SecurityFinding] = []
     if isinstance(data, list):
@@ -1082,14 +1189,17 @@ def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) 
         # D1/D3：跑挂（非 0 且输出不可解析）→ None 落入内置正则兜底链，不置位不假空
         logger.warning("Secret scan: trufflehog 输出不可解析(rc=%d)，按未扫落兜底", rc)
         return None
-    _mark_ran(ctx)  # D1：rc=0 或输出可解析才置位
+    _mark_ran(ctx, "secret")  # D1：rc=0 或输出可解析才置位
     return findings
 
 
 def _secret_builtin_regex(
-    project_path: str, *, files: list[str] | None = None
+    project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None
 ) -> list[SecurityFinding]:
-    """内置正则密钥扫描（兜底，不依赖外部工具）。"""
+    """内置正则密钥扫描（兜底，不依赖外部工具）。
+
+    L-1（批次6 R1）：至少实扫一个文件才置 secret_ran（category 覆盖）——0 文件置位
+    会让 secret 类哨兵永久失效（假覆盖）。"""
     findings: list[SecurityFinding] = []
     root = Path(project_path)
 
@@ -1112,6 +1222,10 @@ def _secret_builtin_regex(
             if p.is_file() and p.stat().st_size < 2_000_000:  # 2MB 限制
                 scan_files.append(p)
 
+    if scan_files:
+        # L-1（批次6 R1 hunter）：置位绑定"至少实扫一个文件"——0 文件也置位会让
+        # secret 类 per-category 哨兵永久失效（假覆盖）。
+        _mark_ran(ctx, "secret", aggregate=False)
     for fpath in scan_files:
         try:
             content = fpath.read_text(encoding="utf-8", errors="ignore")

@@ -99,7 +99,7 @@ def _mk_sync_stub(repo: Path, logs: list[tuple[str, str]]):
 
 
 def _patch_cfg(monkeypatch):
-    import swarm.worker.executor as ex_mod
+    import swarm.worker.executor_sync as ex_mod
     monkeypatch.setattr(ex_mod, "get_config", lambda: SimpleNamespace(
         sandbox=SimpleNamespace(sandbox_remote_workdir="/workspace")
     ))
