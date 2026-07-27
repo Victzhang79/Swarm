@@ -2380,6 +2380,10 @@ async def plan(state: BrainState) -> dict:
     # 内做裁决重放+膨胀收缩（见下），R67G 预消解的 dedupe 裁决也追加入账；公共 return
     # always-emit 回写（外科通道路径原样带走，不粘滞不丢失）。
     _fp_adjudications: list = list(state.get("file_plan_adjudications") or [])
+    # 战役级终扫 hunter MEDIUM：reconcile 异常 fail-open 绝不能只剩 WARNING 日志——
+    # 机读降级标记随 degraded_reasons 落 state（API/盯跑/should_write_success 可查，
+    # 与 upstream_account_reconcile_failed 同通道同纪律）。
+    _fp_reconcile_degraded: list[str] = []
     sliding_ctx = sliding_context_prompt(state)
 
     # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
@@ -2515,6 +2519,7 @@ async def plan(state: BrainState) -> dict:
                     len(_fp_adjudications))
         except Exception:  # noqa: BLE001 — fail-open，G1/VALIDATE 权威兜底
             logger.warning("[PLAN] H-6 file_plan 对账收缩失败（fail-open，VALIDATE 兜底）", exc_info=True)
+            _fp_reconcile_degraded.append("file_plan_reconcile_failed")
         # R67G-T1：file_plan 层异 FQN 同 simple-name 跨包 create 重复消解（★公共点：单发/分批/重试
         # 三路径全覆盖★，复核 Hunter#3 整改——原只在 _plan_ultra_batched 内，单发 PLAN 路径裸奔）。
         # round67g 死因（task=b3659ca9 FAILED@PLAN）：重试从【恒定 tech_design_file_plan】重拆只重新
@@ -2822,6 +2827,7 @@ async def plan(state: BrainState) -> dict:
         except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
             logger.warning("[PLAN] H-6 外科路径对账收缩失败（fail-open，VALIDATE 兜底）",
                            exc_info=True)
+            _fp_reconcile_degraded.append("file_plan_reconcile_failed")
     from swarm.brain.plan_finisher import finish_plan_deterministic
     _finish_out = finish_plan_deterministic(
         # R65E7-L2：用 L2 增广后的 file_plan（否则 finish 的孤儿承接/脚手架注入看不到补排文件，复核 HIGH）。
@@ -2859,6 +2865,10 @@ async def plan(state: BrainState) -> dict:
             # 的 WARNING，违反"进度查 API 绝不 grep swarm.log"纪律）。
             ["contract_method_names_reconcile_failed"]
             if _finish_out.get("contract_method_names_reconcile_failed") else []
+        ) + (
+            # 战役级终扫 hunter MEDIUM：H-6 对账收缩自身抛错=裁决复活面可能未关死，
+            # 对称进 degraded 可查（绝不只剩无人 grep 的 WARNING）。
+            _fp_reconcile_degraded
         ) + (
             # round29 真因4：丢模块=交付范围残缺，必须进 degraded（should_write_success 据此
             # 拦 L6 假成功学习；人工 accept 放行后终态仍诚实带痕）。reducer 追加去重。

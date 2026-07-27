@@ -234,3 +234,14 @@ def test_record_adjudication_empty_owner_yields_to_valid():
     assert ledger[0]["owner_path"] == owner, "空 owner 不得遮挡后续有效 owner"
     _, fqns = adjudicated_path_set(ledger)
     assert owner in fqns.values(), "修正后的 owner 必须进 fqn 映射（收缩不失明）"
+
+
+def test_h6_cluster_reexport_addressable():
+    """战役级终扫 reviewer MEDIUM（纪律#9 拆分配套）：H-6 叶簇本体在 file_plan_ledger，
+    contract_utils 经 PEP 562 __getattr__ 惰性 re-export 保可寻址——既有调用点
+    （symbol_surgery/nodes/测试）的 import 路径零改动。"""
+    import swarm.brain.contract_utils as cu
+    import swarm.brain.file_plan_ledger as fl
+    for name in ("_record_adjudication", "adjudicated_path_set",
+                 "reconcile_file_plan_ledger", "_pass_owner"):
+        assert getattr(cu, name) is getattr(fl, name), f"re-export 断裂: {name}"
