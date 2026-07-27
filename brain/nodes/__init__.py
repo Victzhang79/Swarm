@@ -2376,6 +2376,10 @@ async def plan(state: BrainState) -> dict:
     _baseline_covered: list[dict] = []
     # R32-1 U2：本轮成功批缓存（非分批路径恒 {}——last-write-wins 覆写防陈旧）
     _plan_batch_cache: dict = {}
+    # H-6：file_plan 裁决账（跨 retry 轮保持，REVISE/replan 新周期整体清空）——LLM 重拆路径
+    # 内做裁决重放+膨胀收缩（见下），R67G 预消解的 dedupe 裁决也追加入账；公共 return
+    # always-emit 回写（外科通道路径原样带走，不粘滞不丢失）。
+    _fp_adjudications: list = list(state.get("file_plan_adjudications") or [])
     sliding_ctx = sliding_context_prompt(state)
 
     # P0-2：replan 重入时把上轮失败原因拼进上下文，引导 LLM 避开同样的坏计划
@@ -2496,6 +2500,21 @@ async def plan(state: BrainState) -> dict:
         # fail-open：泄压阀关/无需求/无 unplanned/LLM 失败→原样返回不阻断（留 L1 兜底+覆盖闸）。
         _file_plan, _l2_augmented = await _ensure_file_plan_covers_requirements(
             state, llm, _file_plan, fallback_llm=_get_brain_fallback_llm())
+        # H-6 对账收缩总闸（SPEC_h6）：重拆【前】对 file_plan 做裁决重放+膨胀收缩——上一轮
+        # resolve 各 pass 已裁决剥离/归位的路径（strip/relocate/dedupe 账），绝不随全量重拆、
+        # 孤儿挂靠、L2 补排【复活】（元模式1/2 根修：旧违例消新违例冒 + 重产通道无视裁决）。
+        # 放 L2 补排【之后】=补排新增条目同闸过账；幂等（无账/无违例=零改动零成本）。
+        try:
+            from swarm.brain.contract_utils import reconcile_file_plan_ledger
+            _recon = reconcile_file_plan_ledger(_file_plan, _fp_adjudications)
+            if _recon.get("adjudications_replayed") or _recon.get("new_entries_shrunk"):
+                _l2_augmented = True   # file_plan 被收缩 → 强制写回+prompt 用收缩后形态
+                logger.info(
+                    "[PLAN] H-6 file_plan 对账收缩：重放删除 %d + 膨胀收缩 %d（裁决账 %d 条，防重拆复活）",
+                    _recon.get("adjudications_replayed", 0), _recon.get("new_entries_shrunk", 0),
+                    len(_fp_adjudications))
+        except Exception:  # noqa: BLE001 — fail-open，G1/VALIDATE 权威兜底
+            logger.warning("[PLAN] H-6 file_plan 对账收缩失败（fail-open，VALIDATE 兜底）", exc_info=True)
         # R67G-T1：file_plan 层异 FQN 同 simple-name 跨包 create 重复消解（★公共点：单发/分批/重试
         # 三路径全覆盖★，复核 Hunter#3 整改——原只在 _plan_ultra_batched 内，单发 PLAN 路径裸奔）。
         # round67g 死因（task=b3659ca9 FAILED@PLAN）：重试从【恒定 tech_design_file_plan】重拆只重新
@@ -2508,7 +2527,9 @@ async def plan(state: BrainState) -> dict:
             _dc = deconflict_file_plan_same_name_creates(
                 _file_plan, shared_contract=state.get("shared_contract_draft") or {},
                 project_path=_get_project_path(state.get("project_id") or ""),
-                base_ref=state.get("base_commit"))
+                base_ref=state.get("base_commit"),
+                adjudications=_fp_adjudications,
+                round_no=state.get("plan_retry_count", 0))
             if _dc.get("samename_creates_deduped"):
                 _l2_augmented = True   # file_plan 被改 → 强制 _format 用 override 反映消解后形态
                 logger.info(
@@ -2780,6 +2801,27 @@ async def plan(state: BrainState) -> dict:
     # 位置=后处理区末端（复核 F1）：#6 覆盖单调化按 scope 身份配对，收尾器改 scope 必须
     # 在其后；挂靠记录进 plan.finisher_attached 供 #6 跨轮对称剔除（_merge_prior_covers_
     # by_scope 消费）。脚手架 harness 由收尾器自行 bootstrap（错过主循环）。
+    # H-6（批次8 闸门 hunter PLAUSIBLE 整改）：P1/R39-5/R40-1 外科命中时上方 LLM 块的
+    # reconcile 未跑——裁决残留孤儿若仍在 file_plan，finish 的 attach 前置核会拒挂（正确），
+    # 但条目残留 → R40-1 判孤儿 → 外科回退全量重拆 → 下轮 reconcile 才清=短环白烧一轮。
+    # 收尾器挂靠前对所有路径补跑一次（幂等，无残留零成本），拒挂孤儿在挂靠/VALIDATE 前清账。
+    if _fp_adjudications and task_plan is not None:
+        try:
+            from swarm.brain.contract_utils import reconcile_file_plan_ledger as _recon_fp
+            _fp_for_finish = _file_plan if _l2_augmented else state.get("tech_design_file_plan")
+            if _fp_for_finish:
+                _recon2 = _recon_fp(_fp_for_finish, _fp_adjudications)
+                if (_recon2.get("adjudications_replayed")
+                        or _recon2.get("new_entries_shrunk")):
+                    _file_plan = _fp_for_finish
+                    _l2_augmented = True   # 收缩后形态随返回键回写 + finish 用同一份
+                    logger.info(
+                        "[PLAN] H-6 外科路径对账收缩：重放 %d + 收缩 %d（finish 挂靠前清残留孤儿）",
+                        _recon2.get("adjudications_replayed", 0),
+                        _recon2.get("new_entries_shrunk", 0))
+        except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
+            logger.warning("[PLAN] H-6 外科路径对账收缩失败（fail-open，VALIDATE 兜底）",
+                           exc_info=True)
     from swarm.brain.plan_finisher import finish_plan_deterministic
     _finish_out = finish_plan_deterministic(
         # R65E7-L2：用 L2 增广后的 file_plan（否则 finish 的孤儿承接/脚手架注入看不到补排文件，复核 HIGH）。
@@ -2792,7 +2834,9 @@ async def plan(state: BrainState) -> dict:
         shared_contract=(state.get("shared_contract")
                          or getattr(task_plan, "shared_contract", None) or {}),
         # R67B-T1（复核 HIGH）：归属重规范化与 G1/#40 同一 git-pin base 口径
-        base_ref=state.get("base_commit"))
+        base_ref=state.get("base_commit"),
+        # H-6：孤儿挂靠前置核——裁决账 strip/relocate 路径绝不重挂（挂靠=复活已裁决违例）。
+        adjudications=_fp_adjudications)
 
     plan_touch = touch_context(
         state,
@@ -2836,6 +2880,9 @@ async def plan(state: BrainState) -> dict:
         # 无人消费落 {}"的前提（现在有人消费=护栏）。F-4 的 checkpoint 膨胀顾虑改由
         # validate_plan 覆盖+校验【通过】时清空缓存兜住（仅驻留 PLAN 回炉窗口，过闸即清）。★
         "plan_batch_cache": _plan_batch_cache or {},
+        # H-6：file_plan 裁决账 always-emit——本轮 reconcile 重放/R67G 入账的追加随返回键
+        # 回写（外科通道路径原样带走 state 值，不粘滞不丢失；新周期清空在 failure/revision）。
+        "file_plan_adjudications": _fp_adjudications,
         # R65E7-L2：补排文件后持久化增广的 file_plan 到 state——否则下游 validate_plan 的 G1 coherence /
         # elaborate 仍读旧 file_plan（无补排文件）致口径漂移；仅补排时才发（否则不改既有键，零回归）。
         **({"tech_design_file_plan": _file_plan} if _l2_augmented else {}),
@@ -4777,7 +4824,11 @@ def _run_l2_local_locked(project_path: str, merged_diff: str, test_cmd: str, *,
         # 不再用整库 `checkout -- .` + `clean -fd`——后者会抹掉用户在该项目里无关的未提交改动。
         try:
             from swarm.brain.integration_review import _reset_worktree_to_head
-            _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+            _l2rb_failed = _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+            if _l2rb_failed:
+                # F5：回滚半失败=工作区残留（下游沙箱/本地 L2 脏树探测与交付 fail-closed
+                # 兜判定性，此处必须响亮留痕）。
+                logger.warning("[VERIFY_L2] F5 工作树回滚半失败（残留: %s）", _l2rb_failed[:8])
         except Exception as exc:  # noqa: BLE001
             logger.warning("[VERIFY_L2] 工作树回滚失败(非致命): %s", exc)
 
@@ -5005,6 +5056,22 @@ def _run_reactor_build_in_sandbox(
                 logger.debug("[VERIFY_L2] 销毁编译沙箱失败: %s", _exc)
 
 
+def _l2_tree_dirty(project_path: str, merged_diff: str) -> list[str]:
+    """F5（20号文）：L2 功能测试前的本地工作树脏探测——merged_diff 涉及文件仍有未提交
+    改动 = 上游 finally reset 半失败（文件占用/权限）残留。脏树送进沙箱 sync/本地 apply
+    都会把 "already exists/context 不符" 假红归因为代码失败进重试循环。判据在【本地】
+    git（sync 不带 .git，箱内无 porcelain 可用）。探测异常按净树放行（既有行为不变，
+    交付临界区的 fail-closed 是终闸）。返回脏文件清单（空=净）。"""
+    try:
+        from swarm.git_base import uncommitted_changed_files
+        from swarm.project.diff_apply import files_from_unified_diff
+        return sorted(uncommitted_changed_files(
+            project_path, files_from_unified_diff(merged_diff) or []))
+    except Exception as _dexc:  # noqa: BLE001
+        logger.warning("[VERIFY_L2] F5 脏树探测异常（按净树继续，终闸=交付 fail-closed）: %s", _dexc)
+        return []
+
+
 def _try_l2_sandbox_verify(
     project_id: str,
     merged_diff: str,
@@ -5018,6 +5085,12 @@ def _try_l2_sandbox_verify(
         return None
     project_path = _get_project_path(project_id)
     if not project_path:
+        return None
+    _dirty = _l2_tree_dirty(project_path, merged_diff)
+    if _dirty:
+        # F5：脏树 sync 进箱 → 箱内 apply 冲突 → 假红归因代码失败。infra None 降级。
+        logger.warning("[VERIFY_L2] F5 本地工作树残留（reset 半失败: %s）→ 沙箱 L2 "
+                       "infra 降级（不判代码失败）", _dirty[:5])
         return None
     logger.info("[VERIFY_L2] 沙箱 L2 验证: cmd=%s", test_cmd)
     return _run_l2_in_sandbox(
@@ -5040,6 +5113,12 @@ def _try_l2_local_verify(
     """Run L2 locally via git apply + subprocess. Returns None if no project path."""
     project_path = _get_project_path(project_id)
     if not project_path:
+        return None
+    _dirty = _l2_tree_dirty(project_path, merged_diff)
+    if _dirty:
+        # F5 sibling：本地 apply 同病（脏树 apply 冲突 → 假红），infra None 降级走 LLM 兜底。
+        logger.warning("[VERIFY_L2] F5 本地工作树残留（reset 半失败: %s）→ 本地 L2 "
+                       "infra 降级（不判代码失败）", _dirty[:5])
         return None
     logger.info("[VERIFY_L2] 本地 L2 验证: cmd=%s", test_cmd)
     return _run_l2_local(project_path, merged_diff, test_cmd, timeout=timeout, base_ref=base_ref)
@@ -5363,6 +5442,9 @@ async def revision(state: BrainState) -> dict:
     # 绝不能把返回值赋回 updated_plan（否则 plan 被替换成 dict，state["plan"] 损坏）。
     _rev_fp = state.get("tech_design_file_plan") or []
     _rev_resolve: dict = {}
+    # H-6：REVISE=新规划周期 → 裁决账【清空重推导】（同 prev_structural 纪律，防跨周期粘滞
+    # 误拒合法新文件）；本节点的 resolve 会把本轮新裁决追加进新账，随返回键回写。
+    _rev_adjs: list = []
     try:
         from swarm.brain.contract_utils import resolve_plan_conflicts
         # ★复核 H-2★：revision 路径也须传 project_path+钉扎 base，否则 aggregate-vs-新建撞车判定
@@ -5373,7 +5455,8 @@ async def revision(state: BrainState) -> dict:
         _rev_resolve = resolve_plan_conflicts(updated_plan,  # 原地变更 plan；返回计数 dict（file_plan 亦就地改）
                                               project_path=_get_project_path(state.get("project_id") or ""),
                                               base_ref=state.get("base_commit"),
-                                              file_plan=_rev_fp)
+                                              file_plan=_rev_fp,
+                                              adjudications=_rev_adjs)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[REVISION] 计划冲突消解跳过(非致命): %s", exc)
 
@@ -5422,6 +5505,8 @@ async def revision(state: BrainState) -> dict:
         "subtask_scope_amend_counts": {},
         "confirm_reason": "",
         "deliver_auto_reject_reason": "",
+        # H-6：REVISE=新规划周期 → 裁决账清空重推导（上方 resolve 的新裁决已入 _rev_adjs）。
+        "file_plan_adjudications": _rev_adjs,
         # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订
         # （verify_runtime 的幂等复用对已存在 assertions 直接跳过重生成，"reused_existing"）。
         # 清空三键让下一轮 verify_runtime 按修订后的 design/merged_diff 重新生成断言。
@@ -5487,7 +5572,18 @@ def _deliver_merged_diff_locked(
 
     result: dict = {"ap": {}, "wm": {}, "commit": {}, "out_files": list(out_files)}
     with _ProjectGitFlock(proj_path):
-        _reset_worktree_to_head(proj_path, merged_diff, base_commit)
+        _reset_failed = _reset_worktree_to_head(proj_path, merged_diff, base_commit)
+        if _reset_failed:
+            # F5（20号文）：reset 半失败 → 脏树上 resilient apply 会部分跳过 → commit 的
+            # 树混入 pull-back 旧残留（交付腐化）。fail-closed：不 apply 不 commit，
+            # ap.ok=False 交 learn_success 既有降级臂（delivery_apply_failed 入账 +
+            # 不写 L6 成功模式 + KB 不更新）——绝不交付毒树。
+            logger.warning("[LEARN_SUCCESS] F5 交付前 reset 半失败 %d 文件 → fail-closed "
+                           "不 apply 不 commit（防交付混入旧残留）: %s",
+                           len(_reset_failed), _reset_failed[:8])
+            result["ap"] = {"ok": False, "stage": "reset_partial_failure",
+                            "failed": _reset_failed}
+            return result
         result["ap"] = apply_git_diff_resilient(proj_path, merged_diff)
         try:
             from swarm.worker.workspace_manifest import reconcile_workspace_manifests

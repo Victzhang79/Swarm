@@ -509,3 +509,205 @@ def test_d14_sibling_coord_pick_deterministic(tmp_path):
     assert n == 1
     data = json.loads((tgt / "package.json").read_text())
     assert data["dependencies"]["lodash"] == "2.0.0", "排序后 svc-a 恒为首个坐标源"
+
+
+# ── W-4：注入目标由构建失败输出的出错文件确定性定位（不再凭 modified 首文件猜）─────
+def test_w4_cargo_workspace_member_targeted_by_failure_evidence(tmp_path):
+    """workspace 成员失败：cargo `-->` 路径=工作区根相对（实证）→ 注成员 manifest；
+    modified 首文件落在别的 crate 也不被带偏。"""
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/foo", "crates/bar"]\n', encoding="utf-8")
+    bar = tmp_path / "crates" / "bar"
+    (bar / "src").mkdir(parents=True)
+    (bar / "Cargo.toml").write_text(
+        '[package]\nname = "bar"\n\n[dependencies]\nserde = "1.0.197"\n', encoding="utf-8")
+    (bar / "src" / "lib.rs").write_text("pub fn b() {}", encoding="utf-8")
+    foo = tmp_path / "crates" / "foo"
+    (foo / "src").mkdir(parents=True)
+    (foo / "Cargo.toml").write_text(
+        '[package]\nname = "foo"\n\n[dependencies]\n', encoding="utf-8")
+    (foo / "src" / "lib.rs").write_text("use serde::Serialize;", encoding="utf-8")
+    out = ("error[E0432]: unresolved import `serde`\n"
+           " --> crates/foo/src/lib.rs:1:5\n"
+           "  |\n1 | use serde::Serialize;\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["crates/bar/src/lib.rs"], "cargo")  # modified 指向 bar=诱饵
+    assert n == 1 and "crates/foo/Cargo.toml" in paths
+    assert 'serde = "1.0.197"' in (foo / "Cargo.toml").read_text()
+    assert "serde" not in (tmp_path / "Cargo.toml").read_text(), "绝不污染虚拟根"
+
+
+def test_w4_go_nested_module_targeted_not_root(tmp_path):
+    """嵌套 go module：失败证据指向 svc/a → 注 svc/a/go.mod，不注根 go.mod（根注=白烧）。"""
+    (tmp_path / "go.mod").write_text("module example.com/root\n\ngo 1.22\n", encoding="utf-8")
+    (tmp_path / "main.go").write_text("package main\n", encoding="utf-8")
+    a = tmp_path / "svc" / "a"
+    a.mkdir(parents=True)
+    (a / "go.mod").write_text("module example.com/a\n\ngo 1.22\n", encoding="utf-8")
+    (a / "main.go").write_text("package main\n", encoding="utf-8")
+    b = tmp_path / "svc" / "b"
+    b.mkdir(parents=True)
+    (b / "go.mod").write_text(
+        "module example.com/b\n\ngo 1.22\n\nrequire github.com/x/y v1.2.3\n", encoding="utf-8")
+    out = ("svc/a/main.go:4:2: no required module provides package github.com/x/y; "
+           "to add it:\n\tgo get github.com/x/y\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["main.go"], "go")  # modified 指向根=诱饵
+    assert n == 1 and str(Path("svc/a/go.mod")) in paths
+    assert "github.com/x/y v1.2.3" in (a / "go.mod").read_text()
+    assert "github.com/x/y" not in (tmp_path / "go.mod").read_text(), "根 go.mod 不得被注"
+
+
+def test_w4_evidence_unmappable_falls_back(tmp_path):
+    """证据映射不回项目（../ 逃逸=外来/陈旧输出）→ 证据【不可用】而非证据反对：
+    回退 modified 最近 manifest 旧行为（闸门整改：绝不掐死正常修复流）。"""
+    a = tmp_path / "crate-a"
+    a.mkdir()
+    (a / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nserde = "1"\n', encoding="utf-8")
+    tgt = tmp_path / "crate-b"
+    (tgt / "src").mkdir(parents=True)
+    (tgt / "Cargo.toml").write_text('[package]\nname = "b"\n\n[dependencies]\n', encoding="utf-8")
+    (tgt / "src" / "lib.rs").write_text("use serde::Serialize;", encoding="utf-8")
+    out = ("error[E0432]: unresolved import `serde`\n"
+           " --> ../outside/src/lib.rs:9:1\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["crate-b/src/lib.rs"], "cargo")
+    assert n == 1 and str(Path("crate-b/Cargo.toml")) in paths
+
+
+def test_w4_failclosed_when_evidence_maps_but_no_manifest(tmp_path):
+    """证据可用（映射进项目真文件）但祖先链无 manifest → fail-closed 不注：
+    知道哪文件失败却定不出目标模块，猜=注错比不注更糟。"""
+    a = tmp_path / "crate-a"
+    a.mkdir()
+    (a / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nserde = "1"\n', encoding="utf-8")
+    orphan = tmp_path / "loose" / "src"
+    orphan.mkdir(parents=True)
+    (orphan / "lib.rs").write_text("use serde::Serialize;", encoding="utf-8")
+    # 注意：项目根无 Cargo.toml，loose/ 下也无——证据可用但目标定不出
+    out = ("error[E0432]: unresolved import `serde`\n"
+           " --> loose/src/lib.rs:1:5\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["crate-a/src/lib.rs"], "cargo")
+    assert n == 0 and paths == []
+
+
+def test_w4_abs_path_sandbox_suffix_resolves(tmp_path):
+    """沙箱/容器绝对路径输出（/workspace/... 前缀）：逐级剥前缀取后缀命中项目内真文件
+    → 证据可用（reviewer MEDIUM：绝不因'绝对'整条丢弃回退 modified 猜=W-4 原病复发）。"""
+    bar = tmp_path / "crates" / "bar"
+    (bar / "src").mkdir(parents=True)
+    (bar / "Cargo.toml").write_text(
+        '[package]\nname = "bar"\n\n[dependencies]\nserde = "1"\n', encoding="utf-8")
+    foo = tmp_path / "crates" / "foo"
+    (foo / "src").mkdir(parents=True)
+    (foo / "Cargo.toml").write_text('[package]\nname = "foo"\n\n[dependencies]\n', encoding="utf-8")
+    (foo / "src" / "lib.rs").write_text("use serde::Serialize;", encoding="utf-8")
+    out = ("error[E0432]: unresolved import `serde`\n"
+           " --> /workspace/sandbox-17/crates/foo/src/lib.rs:1:5\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["crates/bar/src/lib.rs"], "cargo")  # modified 指向 bar=诱饵
+    assert n == 1 and str(Path("crates/foo/Cargo.toml")) in paths
+
+
+def test_w4_abs_path_local_in_project(tmp_path):
+    """本地绝对输出：路径本身就在项目内 → 直接作证据。"""
+    sib = tmp_path / "api"
+    sib.mkdir()
+    (sib / "package.json").write_text(json.dumps(
+        {"name": "api", "dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    web = tmp_path / "web"
+    (web / "src").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {}}), encoding="utf-8")
+    (web / "src" / "index.ts").write_text("import axios from 'axios';", encoding="utf-8")
+    out = f"{tmp_path}/web/src/index.ts(3,23): error TS2307: Cannot find module 'axios'.\n"
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["api/src/main.ts"], "npm")
+    assert n == 1 and str(Path("web/package.json")) in paths
+
+
+def test_w4_no_evidence_falls_back_to_modified(tmp_path):
+    """输出无出错文件证据（纯模块名报错）→ 维持既有 modified 最近 manifest 回退。"""
+    sib = tmp_path / "api"
+    sib.mkdir()
+    (sib / "package.json").write_text(json.dumps(
+        {"name": "api", "dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    web = tmp_path / "web"
+    (web / "src").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {}}), encoding="utf-8")
+    (web / "src" / "index.ts").write_text("import axios from 'axios';", encoding="utf-8")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), "Cannot find module 'axios'", ["web/src/index.ts"], "npm")
+    assert n == 1 and str(Path("web/package.json")) in paths
+
+
+def test_w4_npm_tsc_evidence_wins_over_modified(tmp_path):
+    """tsc `path(l,c): error TS2307` 证据定位 web 包；modified 首文件在 api=诱饵不生效。"""
+    api = tmp_path / "api"
+    (api / "src").mkdir(parents=True)
+    (api / "package.json").write_text(json.dumps(
+        {"name": "api", "dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    (api / "src" / "main.ts").write_text("export {};", encoding="utf-8")
+    web = tmp_path / "web"
+    (web / "src").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {}}), encoding="utf-8")
+    (web / "src" / "index.ts").write_text("import axios from 'axios';", encoding="utf-8")
+    out = "web/src/index.ts(3,23): error TS2307: Cannot find module 'axios'.\n"
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["api/src/main.ts"], "npm")
+    assert n == 1 and str(Path("web/package.json")) in paths
+    got = json.loads((web / "package.json").read_text())
+    assert got["dependencies"]["axios"] == "^1.6.0"
+
+
+def test_w4_evidence_in_skip_dirs_never_injection_target(tmp_path):
+    """闸门 R2 reviewer MEDIUM①：证据落产物/第三方目录（node_modules）→ 不作注入目标
+    （否则依赖注给第三方包的 package.json=注错还自以为修复）；证据不算项目内可用，
+    回退 modified 最近 manifest。"""
+    third = tmp_path / "node_modules" / "somepkg" / "dist"
+    third.mkdir(parents=True)
+    (third / "index.js").write_text("require('axios');", encoding="utf-8")
+    (tmp_path / "node_modules" / "somepkg" / "package.json").write_text(
+        json.dumps({"name": "somepkg", "dependencies": {}}), encoding="utf-8")
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text(json.dumps(
+        {"name": "api", "dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    web = tmp_path / "web"
+    (web / "src").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {}}), encoding="utf-8")
+    (web / "src" / "index.ts").write_text("import axios from 'axios';", encoding="utf-8")
+    out = ("ERROR in ./node_modules/somepkg/dist/index.js\n"
+           "Module not found: Can't resolve 'axios'\n")
+    n, paths = repair_from_sibling_manifests(
+        str(tmp_path), out, ["web/src/index.ts"], "npm")
+    assert str(Path("node_modules/somepkg/package.json")) not in paths, \
+        "第三方 manifest 绝不作注入目标"
+    assert n == 1 and str(Path("web/package.json")) in paths, \
+        "node_modules 证据不算项目内可用 → 回退 modified 最近 manifest"
+
+
+def test_w4_evidence_cap_truncation_logged(tmp_path, caplog):
+    """闸门 R2 hunter LOW-3：出错文件证据超 cap 截断必须可观测（C13 同型纪律）——
+    病态输出场景被丢弃者可能含项目内报错。"""
+    import logging
+    a = tmp_path / "crate-a"
+    a.mkdir()
+    (a / "Cargo.toml").write_text(
+        '[package]\nname = "a"\n\n[dependencies]\nserde = "1"\n', encoding="utf-8")
+    tgt = tmp_path / "crate-b"
+    (tgt / "src").mkdir(parents=True)
+    (tgt / "Cargo.toml").write_text('[package]\nname = "b"\n\n[dependencies]\n', encoding="utf-8")
+    (tgt / "src" / "lib.rs").write_text("use serde::Serialize;", encoding="utf-8")
+    out = "".join(f"error[E0432]: unresolved import `serde`\n --> ghost{i}/src/lib.rs:1:5\n"
+                  for i in range(25))
+    with caplog.at_level(logging.WARNING):
+        repair_from_sibling_manifests(str(tmp_path), out, ["crate-b/src/lib.rs"], "cargo")
+    assert any("超 cap" in r.message for r in caplog.records), \
+        "证据截断必须 WARNING 可观测"

@@ -795,7 +795,8 @@ def reconcile_upstream_account(plan) -> dict[str, list[str]]:
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
                               shared_contract: dict | None = None,
-                              base_ref: str | None = None) -> dict:
+                              base_ref: str | None = None,
+                              adjudications: list | None = None) -> dict:
     """对 plan 原地跑确定性收尾（脚手架注入 + 孤儿挂靠 + 契约符号安置）。
 
     返回机读摘要 {scaffolds, orphans_attached, orphans_left, ...}；任何一步异常
@@ -905,7 +906,10 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                      exclude_test_paths=not _task_requests_tests(task_description))
                  if len(plan.subtasks) > 1 else [])
         if paths:
-            attached, left = attach_orphan_file_plan_entries(plan, paths)
+            # H-6 前置核：裁决账（strip/relocate/dedupe）命中的路径【不挂靠不新建】——该路径
+            # 是被确定性 pass 裁决剥离的副本，孤儿状态是【正确】的，挂靠=复活（round67h 环根）。
+            attached, left = attach_orphan_file_plan_entries(
+                plan, paths, adjudications=adjudications)
             out["orphans_attached"] = attached
             out["orphans_left"] = left
             # ③ R48-1（round48 死因）：挂靠"无候选"（没有任何子任务碰该模块）时，

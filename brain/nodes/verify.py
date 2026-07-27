@@ -320,6 +320,26 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         )
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         if not ir_ok:
+            _infra_degrade = ("compile_unverified" if ir_details.get("compile_unverified")
+                              else "rollback_reset_failed" if ir_details.get("rollback_reset_failed")
+                              else None)
+            if _infra_degrade:
+                # F5（批次7 hunter R1 CONFIRMED HIGH + 闸门 R2 reviewer MEDIUM②）：infra 降级
+                # （编译未验证=reset 半失败/工具链缺；rollback 半失败=工作区残留）——绝非代码
+                # 失败。绝不走 attribute_l2_failure 定向：F5 issue 文本携带残留文件路径，归因
+                # 会误命中其写者子任务 → 把 infra 伪装成代码失败定向重试无辜者（白烧
+                # capability 配额且掩盖真因=文件占用/权限）。走既有"归因不出"口径全量
+                # replan（与工具链缺降级同路）。
+                logger.warning(
+                    "[VERIFY_L2] F5 %s（infra 降级，涉及文件=%s）→ "
+                    "不归因不定项重试，按 infra 全量 replan（查文件占用/权限/工具链）",
+                    _infra_degrade,
+                    (ir_details.get("reset_failed_files")
+                     or ir_details.get("rollback_reset_failed") or "工具链不可用"))
+                return _l2_failure_state(
+                    subtask_results, attributed_ids=None,
+                    l2_details={"integration_review": ir_details, "issues": ir_issues,
+                                "infra_degrade": _infra_degrade})
             if any("契约" in i for i in ir_issues):
                 # D5（阶段6）+ A1 单调守卫（round38c P0，用户拍板 a+b）：契约失败按缺失
                 # 符号归因 owner 定向重派（语料=全 plan，命中被弃者由 HANDLE_FAILURE 复活）；

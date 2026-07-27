@@ -95,6 +95,14 @@ class BrainState(TypedDict, total=False):
     # +P4 禁改前缀，结构性无法执行）→ 熔断顶格 retry 直接 CONFIRM，省 33min 重产。
     # retry 绑定天然免疫跨 replan 周期的陈旧残留（新周期至少获得一次带反馈重试）。
     plan_validation_prev_structural: dict
+    # H-6（SPEC_h6_file_plan_reconciliation）：file_plan 裁决账——append-only，每条
+    # {round, pass, action(strip|relocate|dedupe), path, owner_path}。写入方=#101/层③/R67G
+    # file_plan 预消解/CVB 归位（经 resolve_plan_conflicts + PLAN 节点 R67G 调用）；
+    # 消费方=PLAN 重拆前 reconcile_file_plan_ledger（裁决重放+膨胀收缩）与孤儿挂靠前置核
+    # （attach_orphan_file_plan_entries）。已裁决的违例绝不随全量重拆/挂靠/L2 补排复活
+    # （元模式1/2 根修）。REVISE/replan 新周期清空（同 prev_structural 纪律）；retry 轮不清
+    # （跨 retry 轮正是其存在意义）。
+    file_plan_adjudications: list[dict]
     shared_contract: dict               # Brain 级共享契约（来自 plan）
     # D10：PLAN 节点对 plan.parallel_groups 剔除悬空引用后，把修剪结果同步写回 state 顶层
     # （dedupe/replan 改了 subtasks 集合时 groups 必须跟着改）。LangGraph 未声明键会被静默
@@ -312,6 +320,10 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "coverage_gap_residual": "round",   # A6 残差 last-write-wins：gap 放行覆写/全覆盖清空（3.9 H-F5）
     "plan_soft_review_sig": "round",    # 只在真放行时 emit，否决轮发空串（3.9 H-F6/R-F5）
     "plan_validation_prev_structural": "round",  # R64-T3：G1 失败轮整体替换；retry 绑定免疫陈旧残留
+    # H-6：file_plan 裁决账。周期内 append-only（跨 validate retry 轮正是其存在意义——重拆
+    # 不复活已裁决违例）；REVISE/replan 新周期【整体清空】后由确定性 pass 重推导（同
+    # prev_structural 纪律；清空安全=同一条 file_plan 同一批确定性 pass 必重判同违例）。
+    "file_plan_adjudications": "monotonic",
     "plan_generation_failed": "round",
     "oversized_subtask_ids": "round",
     "invest_fail_count": "round",

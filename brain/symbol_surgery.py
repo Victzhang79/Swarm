@@ -186,7 +186,8 @@ _SYMBOL_ISSUE_MARKERS = ("契约符号无 owner", "规则5")
 _FILEPLAN_ISSUE_MARKER = "file_plan 文件无 owner"
 
 
-def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[str]]:
+def attach_orphan_file_plan_entries(plan, file_plan_paths, *,
+                                    adjudications: list | None = None) -> tuple[int, list[str]]:
     """R41-1 共享内核：file_plan 孤儿文件按【同顶层模块 + 共享路径前缀最深】确定性
     挂靠到子任务 create_files（零 LLM、幂等）。
 
@@ -197,18 +198,37 @@ def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[st
     - PLAN 确定性收尾器 fail-open 语义（挂不上的留给 VALIDATE 如实打回）。
     返回 (挂上数, 挂不上清单)。构建清单-only 脚手架不作候选（同 R39 CRITICAL 教训，
     _subtask_modules 已滤权重）。
-    """
+
+    H-6 前置核（C-4 治）：待挂靠路径命中裁决账（strip/relocate/dedupe——精确路径或 JVM
+    同 fqn 同串变体，owner 落点豁免）→ 【不挂靠不进 left】（left 会触发孤儿承接新建子任务
+    =另一条复活通道）。该路径是被确定性 pass 裁决剥离的副本，孤儿状态是【正确】的；
+    每条拒绝打 INFO 留痕。"""
     owned: set[str] = set()
     # B-4（21 号文）：归一统一走单一事实源 _norm_scope_path（剥 ./ 前缀）——本函数 owned/
     # missing/挂接深度比较同一条比较链，必须同口径（旧内联 lstrip 不剥 ./ → 假孤儿虚假外科）
-    from swarm.brain.contract_utils import _norm_scope_path
+    from swarm.brain.contract_utils import (
+        _norm_scope_path, adjudicated_path_set, classpath_fqn_key)
+    _adj_paths, _adj_fqns = adjudicated_path_set(adjudications)
     for st in plan.subtasks:
         sc = getattr(st, "scope", None)
         for f in (list(getattr(sc, "create_files", None) or [])
                   + list(getattr(sc, "writable", None) or [])):
             owned.add(_norm_scope_path(f))
-    missing = [f for f in (file_plan_paths or [])
-               if _norm_scope_path(f) not in owned]
+    missing = []
+    for f in (file_plan_paths or []):
+        _nf = _norm_scope_path(f)
+        if _nf in owned:
+            continue
+        if _nf in _adj_paths:
+            logger.info("[FILEPLAN-LEDGER] H-6 挂靠前置核：%s 在裁决账（已裁决剥离/归位）"
+                        "→ 不挂靠不新建（孤儿状态正确，挂靠=复活）", _nf)
+            continue
+        _key = classpath_fqn_key(_nf)   # None=非 JVM 路径（同名跨包合法，只受精确路径约束）
+        if _key and _key[1] in _adj_fqns and _adj_fqns[_key[1]] != _nf:
+            logger.info("[FILEPLAN-LEDGER] H-6 挂靠前置核：%s 与裁决路径同串(fqn=%s，owner=%s)"
+                        "→ 不挂靠不新建（同串变体=复活面）", _nf, _key[1], _adj_fqns[_key[1]])
+            continue
+        missing.append(f)
 
     def _prefix_depth(a: str, b: str) -> int:
         pa, pb = a.split("/"), b.split("/")
@@ -310,7 +330,9 @@ def maybe_file_plan_repair(state, project_path: str | None = None):
     if verdict0.valid:
         return None  # 缺件已不存在（别的维度失败），不越权
     candidate = prior.model_copy(deep=True)
-    attached, left = attach_orphan_file_plan_entries(candidate, file_plan)
+    # H-6：裁决账路径不挂靠（复活=回退全量重拆→PLAN reconcile 收缩 file_plan 后重拆，收敛）。
+    attached, left = attach_orphan_file_plan_entries(
+        candidate, file_plan, adjudications=state.get("file_plan_adjudications"))
     if left:
         # strict 语义：有挂不上的缺件 → 整体回退全量重拆（半修不放行）
         logger.warning("[FILEPLAN-SURGERY] 缺件 %s 无同模块候选 → 回退全量重拆", left[0])

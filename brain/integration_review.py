@@ -13,10 +13,10 @@ from swarm.project.diff_apply import apply_git_diff, files_from_unified_diff
 logger = logging.getLogger(__name__)
 
 
-def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str | None = None) -> None:
+def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str | None = None) -> list[str]:
     """把 merged_diff 涉及的文件 reset 到干净的补丁基线（清除 worker pull-back 写入的脏改动）。
 
-    精准处理补丁涉及的文件（不动工作区其他文件）。非 git 仓库或失败时静默跳过。
+    精准处理补丁涉及的文件（不动工作区其他文件）。非 git 仓库跳过（返回 []）。
     - 【已跟踪文件】（base 有）：checkout 回 base 版本，撤销脏改动。
     - 【新建文件】（base 没有，但 worker pull-back 已写进工作区）：删除工作区残留——
       否则 git apply 要新建该文件时报"文件已存在/补丁未应用"（task 691c1670 实证：
@@ -25,6 +25,13 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str |
     3rd#2：base_ref = 任务钉扎的 base commit（None → "HEAD"，零回归）。merged_diff 是【相对 base】
     生成的补丁，故复位基线必须同源=base，否则运行期 HEAD 漂移后 reset 到 HEAD → 补丁基线不符 →
     apply 失败或覆盖用户中途 commit。L2 与 learn_success 共用本函数，一处钉两处。
+
+    返回 reset【失败】的文件清单（空=全净）。F5（20号文 merge 审计）：旧实现全程
+    best-effort——per-file 非零不查、os.remove 吞 OSError、整段异常只 warning——半失败时
+    下游双向误判（apply --check 假红归因代码失败 / 交付 commit 混入 pull-back 旧残留）。
+    失败清单由调用方分流：L2 pre-check 按"结论不可信"infra 降级、沙箱 L2 以箱内
+    porcelain 脏树判 infra None、交付临界区 fail-closed 不写毒树。整体异常=任意文件
+    状态未知 → 全量记失败（fail-closed 宁多勿漏）。
     """
     import os
     from swarm.git_base import base_ref_exists, resolve_base_ref
@@ -35,16 +42,18 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str |
     if base_ref and _base != "HEAD" and not base_ref_exists(project_path, base_ref):
         logger.warning("[L2] 钉扎 base %s 不可达(历史被重写/GC?)，reset 退回 HEAD 防误删跟踪文件", _base[:12])
         _base = "HEAD"
+    failed: list[str] = []
+    files: list[str] = []
     try:
         files = files_from_unified_diff(merged_diff) or []
         if not files:
-            return
+            return []
         chk = subprocess.run(
             ["git", "-C", project_path, "rev-parse", "--is-inside-work-tree"],
             capture_output=True, text=True, timeout=15,
         )
         if chk.returncode != 0:
-            return
+            return []  # 非 git 仓=无可 reset（既有语义，非失败）
         for f in files:
             # 判断该文件在 base 是否存在（已跟踪 vs 新建）
             in_head = subprocess.run(
@@ -53,25 +62,47 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str |
             ).returncode == 0
             if in_head:
                 # 已跟踪 → reset 到 base 版本
-                subprocess.run(
+                r = subprocess.run(
                     ["git", "-C", project_path, "checkout", _base, "--", f],
                     capture_output=True, text=True, timeout=15,
                 )
+                if r.returncode != 0:
+                    # F5：旧实现不查非零=半失败静默。文件被占用/权限时脏改残留 →
+                    # 下游 apply --check 假红或交付混旧残留。
+                    failed.append(f)
+                    logger.warning("[L2] reset 半失败(已跟踪文件 checkout 非零): %s: %s",
+                                   f, (r.stderr or "").strip()[:200])
             else:
                 # 新建文件 → 删除工作区残留（pull-back 写入的），让 apply 能干净新建
                 abs_f = os.path.join(project_path, f)
                 if os.path.isfile(abs_f):
                     try:
                         os.remove(abs_f)
-                    except OSError:
-                        pass
-                # 也从 git index 撤出（worker checkpoint 可能 git add 过）
-                subprocess.run(
-                    ["git", "-C", project_path, "rm", "--cached", "--force", "-q", f],
+                    except OSError as _oe:
+                        failed.append(f)
+                        logger.warning("[L2] reset 半失败(新建文件删除失败): %s: %s", f, _oe)
+                # 也从 git index 撤出（worker checkpoint 可能 git add 过）——先查 index
+                # 再撤：未 add 过的新文件 `git rm --cached` 恒非零（pathspec 不匹配），
+                # 直接记失败会把每个新建文件 reset 都误报成半失败。
+                _idx = subprocess.run(
+                    ["git", "-C", project_path, "ls-files", "-z", "--", f],
                     capture_output=True, text=True, timeout=15,
                 )
+                if _idx.returncode == 0 and _idx.stdout:
+                    r = subprocess.run(
+                        ["git", "-C", project_path, "rm", "--cached", "--force", "-q", f],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    if r.returncode != 0 and f not in failed:
+                        failed.append(f)
+                        logger.warning("[L2] reset 半失败(index 撤出非零): %s: %s",
+                                       f, (r.stderr or "").strip()[:200])
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[L2] reset worktree to HEAD failed (非致命): %s", exc)
+        # F5：整段异常=任意文件状态未知 → 全量记失败（fail-closed 宁多勿漏），
+        # 绝不返回空清单让调用方误以为工作区已净。
+        logger.warning("[L2] reset worktree to HEAD failed: %s", exc)
+        return list(dict.fromkeys([*failed, *(files or ["<reset-exception>"])]))
+    return failed
 
 
 def _detect_build_cmd_generic(project_path: str) -> str | None:
@@ -243,7 +274,20 @@ def _run_worktree_phase(
     base_ref: str | None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """run_integration_review 的工作树变更段（F2：调用方已持 _ProjectGitFlock）。"""
-    _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+    _reset_failed = _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+    if _reset_failed:
+        # F5（20号文）：reset 半失败 → 工作区残留未知 → apply --check/编译结论双向不可信
+        # （假红=残留致 "补丁未应用" 误判代码失败进重试；假绿=脏基线上编译）。按
+        # compile_unverified 同口径 infra 降级：fail-loud 不判代码失败、绝不假绿放行。
+        details["reset_failed_files"] = _reset_failed
+        details["compile_ok"] = None
+        details["compile_unverified"] = True
+        issues.append(
+            f"L2 infra：工作区 reset 半失败（{len(_reset_failed)} 文件: {_reset_failed[:5]}）"
+            "→ apply/编译结论不可信，按未核验降级（非代码失败；查文件占用/权限后重试）"
+        )
+        logger.warning("[integration_review] F5 reset 半失败 → infra 降级: %s", _reset_failed[:8])
+        return False, issues, details
 
     apply_result = apply_git_diff(project_path, merged_diff, check_only=True)
     if not apply_result.get("ok"):
@@ -321,7 +365,22 @@ def _run_worktree_phase(
             # R1：限定回滚到 merged_diff 涉及的文件（复用 _reset_worktree_to_head 的 scoped 逻辑：
             # 已跟踪→checkout HEAD，新建→删除），不再用整库 `checkout -- .` + `clean -fd`——
             # 后者会抹掉用户在该项目里无关的未提交改动/未跟踪文件。
-            _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+            # F5：回滚半失败=工作区残留 → 后续沙箱 L2/冒烟 sync 的是脏树（箱内 apply 假红）。
+            # 入账 details（消费端=_run_l2_in_sandbox 箱内 porcelain 判据的旁证），绝不静默。
+            _rb_failed = _reset_worktree_to_head(project_path, merged_diff, base_ref=base_ref)
+            if _rb_failed:
+                details["rollback_reset_failed"] = _rb_failed
+                # 闸门 R2（reviewer MEDIUM②/hunter LOW-6 实锤）：只入 details 时无 test_cmd
+                # 的任务 verify_l2 直接 l2_passed=True——工作区残留被记成 L2 通过=假绿，
+                # 且脏树留共享工作区污染后续任务（M-3 家族）。与 compile_unverified 同口径
+                # 升级为 infra 降级 issue（passed=len(issues)==0 自动翻 False；verify.py 侧
+                # 对称 guard 拦在归因前，绝不误定向写者子任务）。
+                issues.append(
+                    "L2 回滚半失败（工作区残留，后续 sync/冒烟将带脏树）: "
+                    + ", ".join(_rb_failed[:8])
+                    + " ——infra 降级（非代码失败），按归因不出全量 replan（查文件占用/权限）")
+                logger.warning("[integration_review] F5 L2 回滚半失败（工作区残留，infra "
+                               "降级翻转 passed）: %s", _rb_failed[:8])
     else:
         details["compile_ok"] = None  # 真无构建文件(纯 docs/config) → 合理跳过，非降级
         logger.info("[integration_review] 无构建文件(纯 docs/config)，跳过全量编译")

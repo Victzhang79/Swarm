@@ -2930,10 +2930,15 @@ async def elaborate(state: BrainState) -> dict:
     # ★round67h★：绑定 file_plan 变量（非内联），因 CVB 归位会【就地改写】它（shadow→base），
     # 归位后须随返回键回写进 state（见下方 out 构造），否则 checkpoint 恢复语义下就地变异丢失。
     _fp_for_resolve = state.get("tech_design_file_plan") or []
+    # H-6：file_plan 裁决账——resolve 各 pass 的 strip/relocate 裁决就地追加进账，随返回键
+    # always-emit 回写 state（round67h 同款教训：就地变异不回写=checkpoint 恢复回退）。
+    _adjs_for_resolve = list(state.get("file_plan_adjudications") or [])
     _resolve = resolve_plan_conflicts(plan_obj, project_path=_proj_path,
                                       base_ref=state.get("base_commit"),  # B6 #2：钉扎 base 非实时 HEAD
                                       # create-vs-base modify-shadow 归位需 file_plan 的 action=modify 信号
-                                      file_plan=_fp_for_resolve)
+                                      file_plan=_fp_for_resolve,
+                                      adjudications=_adjs_for_resolve,
+                                      round_no=state.get("plan_retry_count", 0))
     if _resolve["dep_reordered"]:
         logger.info("[ELABORATE] 依赖序修正：脚手架置根 + SQL 依赖实体跑最后（杜绝 SQL 巨任务成全局根瓶颈卡死）")
     if _resolve["difficulty_bumped"]:
@@ -3091,6 +3096,8 @@ async def elaborate(state: BrainState) -> dict:
         # 旧 shadow→R40-1 判孤儿→round67h 想根治的成环原样复现（reviewer 直调 elaborate 实测坐实）。
         # H-1 扩：#101/层③ 剥离联动删了 file_plan 孤儿条目（file_plan_entries_stripped>0）同律回写。
         out["tech_design_file_plan"] = _fp_for_resolve
+    # H-6：裁决账 always-emit（跨 retry 轮保持；REVISE/replan 新周期由对应节点整体清空重推导）。
+    out["file_plan_adjudications"] = _adjs_for_resolve
     if _t4_pinned:
         # dispatch.py:528 读 state["shared_contract"] 优先于 plan.shared_contract——
         # 钉住的 defined_in 必须随 state 键回写，否则派发面读到旧契约=白钉。

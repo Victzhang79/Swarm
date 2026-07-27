@@ -4931,7 +4931,9 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
 
 
 def _strip_file_plan_create_entries(
-        file_plan: list | None, removed_path_to_owner: dict[str, str]) -> int:
+        file_plan: list | None, removed_path_to_owner: dict[str, str], *,
+        adjudications: list | None = None, pass_name: str = "strip",
+        round_no: int = 0) -> int:
     """H-1（round67j 体检 TOP1·round67h CVB 同构 sibling 捞净）：剥离子任务 create 副本后
     【联动清理 file_plan 同串条目】，否则被剥路径的 file_plan create 条目无 owner → R40-1 判孤儿
     REJECT → PLAN 重试孤儿挂靠复活副本 → 与 round67h 完全同构的 st-churn 环（离线铁证：
@@ -4943,9 +4945,14 @@ def _strip_file_plan_create_entries(
     被批拆静默丢弃）。bare-str 条目兼容（str 本身即 path）。返回删除条目数（0=无事发生，
     调用方以此判定是否需要把就地变更的 file_plan 回写 state——round67h R1 CRITICAL 同款教训：
     就地 mutate 不持久化会在 checkpoint 恢复语义下回退）。
-    """
+
+    H-6：剥离裁决【先入账再联动】——即使 file_plan 缺失/为空（下方早退），裁决账也必须记
+    （attach 前置核/对账收缩读的是账不是 file_plan 现状）。"""
     if not removed_path_to_owner:
         return 0
+    for _rp, _ro in removed_path_to_owner.items():
+        _record_adjudication(adjudications, pass_name=pass_name, action="strip",
+                             path=_rp, owner_path=_ro, round_no=round_no)
     if not file_plan:
         # ★复核 CRITICAL 配套（降级可观测）★：剥离真的发生了、却没有 file_plan 可联动——调用方
         # 没传/传空 = H-1 防环保护在该调用点静默失效（若被剥路径恰在 state 的 file_plan 里，
@@ -4996,7 +5003,140 @@ def _strip_file_plan_create_entries(
     return removed_n
 
 
-def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = None) -> int:
+# ── H-6（SPEC_h6_file_plan_reconciliation）：file_plan 裁决账 + 对账收缩总闸 ─────────────
+def _record_adjudication(ledger: list | None, *, pass_name: str, action: str,
+                         path: str, owner_path: str | None, round_no: int = 0) -> None:
+    """H-6 裁决账追加（append-only）。调用方=各确定性 pass 做出 strip/relocate/dedupe 裁决处。
+
+    (action, path) 去重保首次——同一违例跨 retry 轮被同一 pass 重判是常态（幂等重放前提），
+    不重复入账胀账。path 归一化（_norm_scope_path 同源）后入账；空 path 不入。ledger=None
+    =调用方没接线（离线评测等）→ no-op，绝不炸。"""
+    if ledger is None:
+        return
+    _p = _norm_scope_path(path)
+    if not _p:
+        return
+    _o = _norm_scope_path(owner_path) if owner_path else None
+    for e in ledger:
+        if e.get("action") == action and e.get("path") == _p:
+            # 闸门 R2 reviewer LOW④（与 R1④ 同根）：空 owner 先行不得遮挡后续有效 owner——
+            # 去重保首次但允许 owner 被非空值修正，否则 adjudicated_path_set 对该 fqn 的
+            # 膨胀收缩永久失明（depends_on 改指也会丢目标）。
+            if _o and not e.get("owner_path"):
+                e["owner_path"] = _o
+            return
+    ledger.append({"round": round_no, "pass": pass_name, "action": action,
+                   "path": _p, "owner_path": _o})
+
+
+def adjudicated_path_set(adjudications: list | None) -> tuple[set[str], dict[str, str]]:
+    """H-6 消费侧共用：裁决账 → (精确路径集, JVM fqn→owner 映射)。
+
+    fqn 映射=「同串」判据（同 simple-name 同包）：#101 同 FQN 跨模块副本、层③/R67G 异包
+    副本的同 fqn 变体路径（重拆/L2 补排可能换个目录重发明）都算复活面；同名不同包=
+    不同 fqn 天然放行（复核点名：粘滞误拒合法新文件防的就是这个）。非 JVM 路径
+    classpath_fqn_key=None → 只受精确路径集约束（同名跨包合法，栈中立）。"""
+    paths: set[str] = set()
+    fqns: dict[str, str] = {}
+    for adj in (adjudications or []):
+        if not isinstance(adj, dict):
+            continue
+        p = _norm_scope_path(str(adj.get("path") or ""))
+        if not p:
+            continue
+        paths.add(p)
+        key = classpath_fqn_key(p)
+        if key:
+            # 批次8 闸门 reviewer MEDIUM：owner 为空串也 setdefault 会占位——后续同 fqn 的
+            # 有效 owner 永远无法修正，膨胀收缩对该 fqn 永久失明。空 owner 不入映射
+            # （精确路径集仍约束该 path 本身）。
+            _o = _norm_scope_path(str(adj.get("owner_path") or ""))
+            if _o:
+                fqns.setdefault(key[1], _o)
+    return paths, fqns
+
+
+def reconcile_file_plan_ledger(file_plan: list | None,
+                               adjudications: list | None) -> dict[str, int]:
+    """H-6 对账收缩总闸（PLAN 重拆前 first thing）：裁决重放 + 膨胀收缩，幂等。
+
+    1) 裁决重放：file_plan 里仍残留/已复活的【精确路径】create 条目（checkpoint 回退/
+       上一轮漏回写面）→ 删，depends_on 改指 owner（与 _strip_file_plan_create_entries 同构）。
+    2) 膨胀收缩：同串（JVM 同 fqn）变体路径的 create 条目——除 owner 落点本身外 → 删
+       （重拆/挂靠/L2 补排的复活面在此关死）。owner 落点豁免：owner 是唯一合法 create 者。
+    3) 对账留痕：每条删除打 INFO 带（路径, 裁决来源 pass, 轮次）；计数返回（可观测）。
+    bare-str 条目视作 create（与 _strip_file_plan_create_entries 同口径）。幂等：重放两次
+    =一次（删除后无条目可再删）。"""
+    counts = {"adjudications_replayed": 0, "new_entries_shrunk": 0}
+    if not file_plan or not adjudications:
+        return counts
+    strip_paths, strip_fqns = adjudicated_path_set(adjudications)
+    if not strip_paths:
+        return counts
+    _pass_of = {_norm_scope_path(str(a.get("path") or "")): (a.get("pass"), a.get("round"))
+                for a in adjudications if isinstance(a, dict)}
+    removed: set[int] = set()
+    removed_to_owner: dict[str, str] = {}
+    for e in file_plan:
+        if isinstance(e, dict):
+            _p = _norm_scope_path(str(e.get("path") or ""))
+            _act = str(e.get("action") or "create")
+        else:
+            _p, _act = _norm_scope_path(str(e)), "create"   # bare-str 视作 create（同 H-1 口径）
+        if _act != "create" or not _p:
+            continue
+        _kind = _owner = None
+        if _p in strip_paths:
+            _kind, _owner = "adjudications_replayed", _pass_owner(adjudications, _p)
+        else:
+            _k = classpath_fqn_key(_p)
+            if _k and _k[1] in strip_fqns:
+                _cand = strip_fqns[_k[1]]
+                if _cand and _cand != _p:   # owner 落点本身豁免（唯一合法 create 者）
+                    _kind, _owner = "new_entries_shrunk", _cand
+        if not _kind:
+            continue
+        removed.add(id(e))
+        if _owner:
+            removed_to_owner[_p] = _owner
+        counts[_kind] += 1
+        _src = _pass_of.get(_p) or (None, None)
+        logger.info(
+            "[FILEPLAN-LEDGER] H-6 %s：删除 file_plan create 条目 %s（裁决 pass=%s 轮次=%s "
+            "→ owner=%s；已裁决违例不随重拆复活）",
+            _kind, _p, _src[0], _src[1], _owner)
+    if removed:
+        file_plan[:] = [e for e in file_plan if id(e) not in removed]
+        for e in file_plan:      # depends_on resync：引用被删路径 → 改指 owner（去重）
+            if not isinstance(e, dict) or not e.get("depends_on"):
+                continue
+            _new: list = []
+            _chg = False
+            for d in (e.get("depends_on") or []):
+                _own = removed_to_owner.get(_norm_scope_path(str(d)))
+                if _own:
+                    _chg = True
+                    if _own not in _new:
+                        _new.append(_own)
+                elif d not in _new:
+                    _new.append(d)
+            if _chg:
+                e["depends_on"] = _new
+    return counts
+
+
+def _pass_owner(adjudications: list, norm_path: str) -> str | None:
+    """裁决账里某 path 的 owner 落点（重放改指用）。"""
+    for a in adjudications:
+        if isinstance(a, dict) and _norm_scope_path(str(a.get("path") or "")) == norm_path:
+            _o = _norm_scope_path(str(a.get("owner_path") or ""))
+            return _o or None
+    return None
+
+
+def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = None, *,
+                                    adjudications: list | None = None,
+                                    round_no: int = 0) -> int:
     """DR-09-F1(#101) part(1)：同一 FQN 被多子任务在【不同物理模块】各自 create 时的确定性归一。
 
     round66/65e14 死因：st-6/16/18 在 ruoyi-alarm 正确 create AlarmTemplate/AlarmNotifyUser/
@@ -5101,7 +5241,9 @@ def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = Non
                     fqn, auth, owner_id, sid, f)
     # H-1：file_plan 联动清理（被剥路径条目留在 file_plan=R40-1 孤儿→挂靠复活环，round67h 同构）
     if _removed_to_owner:
-        _strip_file_plan_create_entries(file_plan, _removed_to_owner)
+        _strip_file_plan_create_entries(file_plan, _removed_to_owner,
+                                        adjudications=adjudications,
+                                        pass_name="#101-xmod", round_no=round_no)
     return changed
 
 
@@ -5250,7 +5392,8 @@ def _tech_design_authority(
 
 
 def deconflict_same_name_cross_package_creates(
-        plan: TaskPlan, tech_design_file_plan: list | None = None) -> int:
+        plan: TaskPlan, tech_design_file_plan: list | None = None, *,
+        adjudications: list | None = None, round_no: int = 0) -> int:
     """R67F-T1（层③）：同名(simple name)JVM 类被多子任务在【不同包】(异 FQN)各自 create 时，
     契约 defined_in 有唯一权威 owner → 确定性归一（保 owner 落点、其余异包副本剥除+改 readable+依赖 owner）。
 
@@ -5407,7 +5550,9 @@ def deconflict_same_name_cross_package_creates(
     # H-1：file_plan 联动清理（契约权威路径的被剥副本若在 file_plan=R40-1 孤儿→挂靠复活环；
     # td-fallback 路径已证不可能触发——td 唯一权威与 file_plan 双条目互斥，此处 no-op）
     if _removed_to_owner:
-        _strip_file_plan_create_entries(tech_design_file_plan, _removed_to_owner)
+        _strip_file_plan_create_entries(tech_design_file_plan, _removed_to_owner,
+                                        adjudications=adjudications,
+                                        pass_name="R67F-samename", round_no=round_no)
     return changed
 
 
@@ -5417,6 +5562,8 @@ def deconflict_file_plan_same_name_creates(
     shared_contract: dict | None = None,
     project_path: str | None = None,
     base_ref: str | None = None,
+    adjudications: list | None = None,
+    round_no: int = 0,
 ) -> dict[str, int]:
     """R67G-T1/T2（file_plan 层·分批前【唯一】确定性杠杆）：同 simple-name JVM class create 消解。
 
@@ -5493,6 +5640,11 @@ def deconflict_file_plan_same_name_creates(
                     base, owner_fqn, ent.get("path"))
     if _removed:
         file_plan[:] = [e for e in file_plan if id(e) not in _removed]
+        # H-6：file_plan 层去重裁决入账（重拆/补排同串复活面对账用）
+        for _rp, _ro in _removed_path_to_owner.items():
+            _record_adjudication(adjudications, pass_name="R67G-fileplan",
+                                 action="dedupe", path=_rp, owner_path=_ro,
+                                 round_no=round_no)
         # depends_on resync（复核 Hunter#2）：其它条目若 depends_on 引被剥路径 → 改指 owner 落点，
         # 否则陈旧边被 group_into_module_batches 的 file 级排序回退【静默丢弃】（无信号）。
         for e in file_plan:
@@ -5529,6 +5681,9 @@ def deconflict_create_vs_base_modify_shadow(
     file_plan: list | None,
     project_path: str | None = None,
     base_ref: str | None = None,
+    *,
+    adjudications: list | None = None,
+    round_no: int = 0,
 ) -> int:
     """create-vs-base shadow 确定性归位（子任务 scope 层，clear G1 ③f）——两个互斥【显式权威】信号。
 
@@ -5696,6 +5851,12 @@ def deconflict_create_vs_base_modify_shadow(
                     _w.append(b)
             sc.writable = _w
 
+    # H-6：CVB 归位裁决入账（shadow→base）——重拆/挂靠/补排把 shadow 路径重新 create = 复活
+    # 已裁决的幻觉落点，对账收缩总闸（reconcile_file_plan_ledger）按账拒绝。
+    for _sh, _bp in relocations.items():
+        _record_adjudication(adjudications, pass_name="CVB-relocate", action="relocate",
+                             path=_sh, owner_path=_bp, round_no=round_no)
+
     # B-3（21 号文·家族对称性）：归位后【全 plan】验收/验证/描述里的 shadow 路径引用必须
     # 同步改指 base 真身——shadow 存在性 verify（如 `test -f .../GenController.java`）在归位后
     # 确定性永假（worker 对 shadow 路径无写权）→ L1 烧满配额。③ sibling（:5074-5082）剥
@@ -5853,7 +6014,9 @@ def deconflict_create_vs_base_modify_shadow(
 
 def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
                            base_ref: str | None = None,
-                           file_plan: list | None = None) -> dict[str, int]:
+                           file_plan: list | None = None, *,
+                           adjudications: list | None = None,
+                           round_no: int = 0) -> dict[str, int]:
     """计划冲突解决【唯一事实源】——确定性后处理 pass 的【规范顺序】，_elaborate 与离线评测共用。
 
     顺序是治本要害(RUN18 实证：两 pass 互撤 → 0 交付)，做成单一函数杜绝调用点各写一份导致漂移：
@@ -5874,20 +6037,23 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
     out = {
         # #101 先跑：剥掉契约有权威 owner 的跨模块重复 create（同 FQN），后续 pass 只看干净 scope。
         # H-1：传 file_plan——剥离联动删孤儿条目（防 R40-1 孤儿→挂靠复活环，round67h 同构 sibling）。
-        "xmod_creates_deconflicted": deconflict_cross_module_creates(plan, file_plan=file_plan),
+        "xmod_creates_deconflicted": deconflict_cross_module_creates(
+            plan, file_plan=file_plan, adjudications=adjudications, round_no=round_no),
         # R67F-T1（层③）紧随 ③ 之后：同名异包（异 FQN 同 simple-name）有契约权威者确定性消解。
         # ★必须在 ③ 之后★：③ 先塌缩同 FQN 跨模块副本 → 本 pass 面对的 owner FQN 恰有唯一创建者。
         # ★round67i：传 tech_design_file_plan 作【契约后备】权威——治下游 batch 发明分叉包路径背离
         # tech_design 设计落点（Category A：AlarmCallbackController 有 tech_design 权威、契约漏声明）。★
         "samename_creates_deconflicted": deconflict_same_name_cross_package_creates(
-            plan, tech_design_file_plan=file_plan),
+            plan, tech_design_file_plan=file_plan,
+            adjudications=adjudications, round_no=round_no),
         # create-vs-base shadow 归位（两互斥【显式权威】信号，clear G1 ③f）：LLM 把 base 既有实体当新类
         # 落进子任务 create_files 幻觉异路径 → 归位到 base 真身（改 modify）。信号1=file_plan 该落点 action=
         # modify（SysUser 型）；信号3=契约 defined_in 显式声明在 base 真身（SysMenu 型·治法A）。两信号皆不成
         # 立 → 留 G1 ③f REJECT（fail-closed，绝不裸 basename 挑边）。★必须在 normalize 之前★：归位可能造
         # st-x/st-y 同文件双写者，交下方 normalize_plan_scopes 串行化收敛。
         "cvb_modify_shadow_relocated": deconflict_create_vs_base_modify_shadow(
-            plan, file_plan, project_path=project_path, base_ref=base_ref),
+            plan, file_plan, project_path=project_path, base_ref=base_ref,
+            adjudications=adjudications, round_no=round_no),
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),

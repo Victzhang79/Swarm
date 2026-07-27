@@ -161,17 +161,22 @@ def prepare_injected_state(
                 logging.getLogger("swarm.brain.contract_utils")]
     for _lg in _watched:
         _lg.addHandler(_alarm)
+    # H-6（批次8 hunter R1 CONFIRMED）：注入=新规划周期 → 裁决账从空重推导，finisher/resolve
+    # 的新裁决（剥离/归位）必须入账并随注入 state 落键——否则注入 plan 的裁决不进账，下游
+    # reconcile/attach 前置核对这批违例失明（账与 file_plan 漂移，回退 PLAN 时复活面重开）。
+    _adjs: list = []
     try:
         finish_out = finish_plan_deterministic(
             plan, file_plan, project_path=project_path,
             task_description=desc, shared_contract=shared_contract,
-            base_ref=live_base_commit)
+            base_ref=live_base_commit, adjudications=_adjs)
         try:
             # resolve_plan_conflicts 内部【无】fail-open 包裹（与 finisher 不同）——
             # 意外异常在这里归一为机读拒绝，绝不裸冒泡成无码 FAILED（猎手 MEDIUM）。
             resolve_counts = resolve_plan_conflicts(
                 plan, project_path=project_path, base_ref=live_base_commit,
-                file_plan=file_plan)   # create-vs-base modify-shadow 归位需 file_plan 的 modify 信号
+                file_plan=file_plan,   # create-vs-base modify-shadow 归位需 file_plan 的 modify 信号
+                adjudications=_adjs)
         except Exception as exc:  # noqa: BLE001
             raise PlanInjectError(
                 "plan_inject_rederive_failed",
@@ -265,6 +270,8 @@ def prepare_injected_state(
         # R67C-T6：注入通道无 VALIDATE 节点写此机读键→在此 seed（与 live VALIDATE 同键），否则
         # 注入/回放任务的 plan_validation_warnings 机读面永久空/陈旧（deliver payload/API 看不见）。
         "plan_validation_warnings": _inject_warnings,
+        # H-6：注入周期重推导出的裁决账落键（attach 前置核/回退 PLAN 的 reconcile 消费）。
+        "file_plan_adjudications": _adjs,
     }
 
 

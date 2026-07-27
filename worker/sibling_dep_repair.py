@@ -17,6 +17,10 @@
 - cargo 目标无 `[package]`（workspace 虚拟根）注 `[dependencies]` 会被 cargo 整树拒绝 → 不碰。
 - cargo/go 是全文读改写：目标含非 UTF-8 字节时严格读失败即跳过，绝不 errors="ignore" 后写回
   （那会静默丢字节）。npm 经 json 解析重建，不受此影响。
+- W-4：注入目标由构建失败输出里的【出错文件路径】确定性定位（L1 构建恒以 project_path
+  为 cwd：go 错误路径相对 go 命令 cwd；cargo `-->` 经实证为工作区根相对；tsc 相对
+  tsconfig 所在=构建 cwd）——不再只凭 modified 首文件猜（嵌套 go module 注根 go.mod
+  白烧）。有证据但映射不回项目内 manifest（逃逸/失效路径）→ fail-closed 不注。
 
 纯文件操作（读/写项目自身 manifest），确定性、可离线单测，不依赖任何外部工具/网络。
 """
@@ -157,6 +161,21 @@ def _parse_cargo(text: str) -> dict[str, tuple[str, str | None, str | None, str]
 _GO_DEP_LINE_RE = re.compile(r'([^\s()]+/[^\s()]+)\s+(v[0-9][^\s]*)')
 _GO_REPLACE_LHS_RE = re.compile(r'([^\s()=]+/[^\s()=]+)')
 
+# ── W-4：构建失败输出里的【出错文件路径】提取（注入目标的确定性证据）────────────
+# L1 构建恒以 project_path 为 cwd（go build ./... / cargo build -q / tsc --noEmit），故：
+# - go  `dir/f.go:3:2: no required module ...` 相对 go 命令 cwd = 项目根；
+# - cargo `--> crates/foo/src/lib.rs:1:5` 经实证（cargo 1.84 workspace member）= 工作区根相对；
+# - tsc `src/a.ts(3,23): error TS2307` 相对 tsconfig 所在 = 构建 cwd；webpack `ERROR in ./x`。
+_FAIL_FILE_RE = {
+    "go": [re.compile(r"^([^\s():]+\.go):\d+:\d+:", re.M)],
+    "cargo": [re.compile(r"^\s*-->\s+([^\s:]+\.rs):\d+:\d+", re.M)],
+    "npm": [
+        re.compile(r"^([^\s()]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s*error", re.M),   # tsc
+        re.compile(r"^ERROR in\s+\.?/?([^\s]+\.[cm]?[jt]sx?)\b", re.M),       # webpack
+    ],
+}
+_FAIL_FILE_CAP = 20  # 病态输出截断：前 20 个证据足够定位失败模块
+
 
 def _parse_go(text: str) -> dict[str, str | None]:
     """解析 go.mod：只认 require（单行/block），replace/exclude 块不算声明来源。
@@ -266,6 +285,84 @@ def _nearest_manifest(project_path: Path, modified: list[str], filename: str) ->
             cur = cur.parent
     root_man = project_path / filename
     return root_man if root_man.is_file() else None
+
+
+def _failure_manifest(root: Path, build_output: str, filename: str,
+                      stack: str) -> tuple[Path | None, bool]:
+    """W-4：从构建失败输出提取出错文件 → resolve 到项目根（= L1 构建 cwd）→ 最近祖先 manifest。
+
+    与 _nearest_manifest 的差别：证据来自【失败输出】而非 modified 首文件——后者在跨模块/
+    嵌套 module 场景指向的是 worker 碰巧改的第一个文件，与真正编译失败的模块无关（如嵌套
+    go module 注根 go.mod 白烧）。
+
+    证据分级（批次7+8 闸门 hunter CONFIRMED + reviewer MEDIUM 整改）：
+    - 相对路径 resolve 进项目且 is_file → 可用证据；
+    - 绝对路径：resolve 后落在项目内（本地绝对输出）→ 可用；否则逐级剥前缀取后缀
+      resolve（沙箱/容器 `/workspace/...` 形态， cwd 不是本地根）→ 命中项目内真文件即
+      可用——绝不因"绝对"二字整条丢弃（丢了=回退 modified 猜=W-4 原病复发）；
+    - 有可用证据但祖先链无 manifest → (None, True)：调用方 fail-closed 不注
+      （知道哪文件失败却定不出目标模块，猜=注错比不注更糟）；
+    - 提取到的证据全部映射不回项目（逃逸/失效/外来输出）→ (None, False)：证据不可用
+      而非证据反对——回退 modified 首文件旧行为（绝不掐死正常修复流，hunter CONFIRMED：
+      沙箱绝对路径输出形态下旧实现把 repair 整体关停）。"""
+    resolved = root.resolve()
+    cands: list[str] = []
+    _overflow = 0
+    for rx in _FAIL_FILE_RE.get(stack, []):
+        for m in rx.finditer(build_output or ""):
+            rel = m.group(1)
+            if rel not in cands:
+                if len(cands) >= _FAIL_FILE_CAP:
+                    _overflow += 1   # 闸门 R2 hunter LOW-3：截断必须可观测（C13 同型纪律）
+                    continue
+                cands.append(rel)
+    if _overflow:
+        logger.warning("[L1.2.1·repair] W-4 失败输出出错文件超 cap=%d，丢弃 %d 条证据"
+                       "（病态输出场景被丢弃者可能含项目内报错）", _FAIL_FILE_CAP, _overflow)
+
+    def _walk(cur: Path) -> Path | None:
+        while True:
+            cand = cur / filename
+            if cand.is_file():
+                return cand
+            if cur == resolved or resolved not in cur.parents:
+                return None
+            cur = cur.parent
+
+    def _resolve_evidence(rel: str) -> Path | None:
+        """单条证据 → 项目内真文件（不可用 → None）。"""
+        if rel.startswith(("/", "\\")) or (len(rel) >= 2 and rel[1] == ":"):
+            ap = Path(rel).resolve()
+            if ap.is_file() and (ap == resolved or resolved in ap.parents):
+                return ap                       # 本地绝对输出：项目内直接命中
+            parts = [p for p in Path(rel).parts if p not in ("/", "\\")]
+            for i in range(1, len(parts)):      # 沙箱绝对路径：逐级剥前缀取后缀
+                cand = (resolved / "/".join(parts[i:])).resolve()
+                if (cand == resolved or resolved in cand.parents) and cand.is_file():
+                    return cand
+            return None
+        cand = (resolved / rel).resolve()
+        if cand != resolved and resolved not in cand.parents:
+            return None                         # ../ 逃逸 → 非本项目证据
+        return cand if cand.is_file() else None  # 失效/外来路径（防陈旧输出误导）
+
+    saw_usable = False
+    for rel in cands:
+        f = _resolve_evidence(rel)
+        if f is None:
+            continue
+        # 闸门 R2 reviewer MEDIUM①：证据落进产物/第三方目录（node_modules/vendor/target…）
+        # 时 _walk 会把【第三方 manifest】当注入目标（依赖注给 node_modules 里的包=注错
+        # 还自以为修复）。与 _SKIP_DIRS 同源过滤——这类证据不算"项目内可用"，继续考察
+        # 后续证据，全部如此则回退 modified-nearest（绝不注第三方）。
+        if any(part in _SKIP_DIRS for part in f.relative_to(resolved).parts):
+            logger.info("[L1.2.1·repair] W-4 证据落产物/第三方目录，不作注入目标: %s", rel)
+            continue
+        saw_usable = True
+        man = _walk(f.parent)
+        if man is not None:
+            return man, True
+    return None, saw_usable
 
 
 # ── 每栈：把坐标注入到目标 manifest（目标缺它时）；已声明则跳过。返回是否改动 ──────
@@ -425,7 +522,16 @@ def repair_from_sibling_manifests(
     deps = _missing_deps(build_output or "", stack)
     if not deps:
         return 0, []
-    target = _nearest_manifest(root, modified, filename)
+    target, evidence = _failure_manifest(root, build_output, filename, stack)
+    if target is None:
+        if evidence:
+            # W-4 fail-closed：有出错文件证据但映射不回项目内 manifest（逃逸/失效路径）
+            # → 绝不退而凭 modified 首文件猜目标（注错 manifest 比不注更糟）。
+            logger.warning(
+                "[L1.2.1·repair] A2 %s 出错文件证据映射不回项目内 manifest → fail-closed 不注入",
+                stack)
+            return 0, []
+        target = _nearest_manifest(root, modified, filename)
     if target is None:
         return 0, []
     # 兄弟 manifest 只扫描/解析一遍（每 dep 重扫全树是 O(deps×tree) 浪费）。

@@ -346,3 +346,18 @@ def test_runner_seed_wrapper_type_exists():
     """runner 分支判据=PlanInjectSeed 包装类型（与 Command resume 判据同法）。"""
     seed = PlanInjectSeed(values={"task_id": "x"})
     assert seed.values["task_id"] == "x"
+
+
+def test_prepare_always_emits_adjudication_ledger():
+    """H-6（批次8 hunter R1 CONFIRMED 整改②）：注入=新规划周期从空账重推导，finisher/
+    resolve 的新裁决必须入账并 always-emit 落键——否则回退 PLAN 的 reconcile 与 attach
+    前置核对这批违例失明（账与 file_plan 漂移，复活面重开）。always-emit 防 checkpoint
+    回退丢键（round67h 教训）。"""
+    c = _load_cassette()
+    values = prepare_injected_state(
+        c, live_base_commit=c["base_commit"], project_path=None,
+        task_description=c.get("task_description", ""))
+    assert "file_plan_adjudications" in values, "注入通道必须 always-emit 裁决账键"
+    assert isinstance(values["file_plan_adjudications"], list)
+    for adj in values["file_plan_adjudications"]:
+        assert {"pass", "action", "path"} <= set(adj), f"裁决账条目缺机读字段: {adj}"
