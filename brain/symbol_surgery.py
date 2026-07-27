@@ -199,13 +199,16 @@ def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[st
     _subtask_modules 已滤权重）。
     """
     owned: set[str] = set()
+    # B-4（21 号文）：归一统一走单一事实源 _norm_scope_path（剥 ./ 前缀）——本函数 owned/
+    # missing/挂接深度比较同一条比较链，必须同口径（旧内联 lstrip 不剥 ./ → 假孤儿虚假外科）
+    from swarm.brain.contract_utils import _norm_scope_path
     for st in plan.subtasks:
         sc = getattr(st, "scope", None)
         for f in (list(getattr(sc, "create_files", None) or [])
                   + list(getattr(sc, "writable", None) or [])):
-            owned.add(str(f).replace("\\", "/").lstrip("/"))
+            owned.add(_norm_scope_path(f))
     missing = [f for f in (file_plan_paths or [])
-               if f.replace("\\", "/").lstrip("/") not in owned]
+               if _norm_scope_path(f) not in owned]
 
     def _prefix_depth(a: str, b: str) -> int:
         pa, pb = a.split("/"), b.split("/")
@@ -220,7 +223,7 @@ def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[st
     for f in missing:
         # 口径同源（复核 HIGH 修）：file_plan 已过 P5 权威去重，走到这的全是真缺件
         # ——绝不再按 basename 豁免（自造豁免会静默放行"不同模块同名各建"的合法缺件）
-        p = f.replace("\\", "/").lstrip("/")
+        p = _norm_scope_path(f)
         mod = p.split("/", 1)[0] if "/" in p else ""
         best, best_key = None, (-1, -1)
         for st in plan.subtasks:
@@ -228,7 +231,7 @@ def attach_orphan_file_plan_entries(plan, file_plan_paths) -> tuple[int, list[st
             if not mod or mod not in mods:
                 continue
             sc = st.scope
-            depth = max((_prefix_depth(p, str(w).replace("\\", "/").lstrip("/"))
+            depth = max((_prefix_depth(p, _norm_scope_path(w))
                          for w in (list(sc.create_files) + list(sc.writable))),
                         default=0)
             key = (depth, mods[mod])

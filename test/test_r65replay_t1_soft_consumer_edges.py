@@ -189,5 +189,6 @@ def test_norm_path_parity_with_contract_utils():
     from swarm.brain.contract_utils import _norm_scope_path
     from swarm.types import _edge_norm_path
     for p in ["./mod/A.java", "mod\\sub\\B.xml", "/abs/C.java",
-              "././x/D.java", "plain/E.java", ".hidden/F.java"]:
+              "././x/D.java", "plain/E.java", ".hidden/F.java",
+              "mod/pom.xml/", "./trail/G.java/"]:  # 批次2：尾斜杠形态入 parity 锁
         assert _edge_norm_path(p) == _norm_scope_path(p), p

@@ -215,11 +215,13 @@ def _base_tree_listing(project_path: str | None, base_ref: str | None) -> list[s
 
 
 def _norm_scope_path(f) -> str:
-    """scope 路径归一（R41 复核 F5）：反斜杠→/、剥 './' 前缀与前导 '/'。"""
+    """scope 路径归一（R41 复核 F5）：反斜杠→/、剥 './' 前缀与前导 '/'。
+    批次2 闸门 hunter M-2：补剥尾 '/'——旧调用点内联 .strip("/") 首尾都剥，换本函数后
+    file_plan 写 `x/pom.xml/` vs scope 写 `x/pom.xml` 会假孤儿（同签名两轮不收敛熔断面）。"""
     p = str(f).replace("\\", "/")
     while p.startswith("./"):
         p = p[2:]
-    return p.lstrip("/")
+    return p.lstrip("/").rstrip("/")
 
 
 def unclaimed_contract_deps(plan) -> list[dict]:
@@ -5633,6 +5635,7 @@ def deconflict_create_vs_base_modify_shadow(
     tree_set = {_norm_scope_path(p) for p in tree}
     relocated = 0
     relocations: dict[str, str] = {}          # shadow 归一路径 → base 真身路径（file_plan 同步用）
+    _relocated_raw: list[tuple[str, str]] = []  # (shadow LLM 原样写法, base 真身)——B-3 交替变体用
     for st in subtasks:
         sc = getattr(st, "scope", None)
         if sc is None:
@@ -5677,6 +5680,7 @@ def deconflict_create_vs_base_modify_shadow(
                 _new_creates.append(f)        # 两信号皆不成立 → 留 ③f REJECT（fail-closed）
                 continue
             _to_writable.append(_base_path)
+            _relocated_raw.append((f, _base_path))  # B-3：shadow 原串 → base（清验收变体用）
             relocated += 1
             relocations[norm] = _base_path        # 记归位（file_plan 同串归一用）
             _sig = "file_plan-modify路径锚定" if _sig_modify else "契约defined_in权威(治法A)"
@@ -5691,6 +5695,79 @@ def deconflict_create_vs_base_modify_shadow(
                 if b not in _w:
                     _w.append(b)
             sc.writable = _w
+
+    # B-3（21 号文·家族对称性）：归位后【全 plan】验收/验证/描述里的 shadow 路径引用必须
+    # 同步改指 base 真身——shadow 存在性 verify（如 `test -f .../GenController.java`）在归位后
+    # 确定性永假（worker 对 shadow 路径无写权）→ L1 烧满配额。③ sibling（:5074-5082）剥
+    # create 时显式清验收，CVB 是家族唯一漏的。CVB 实体仍存活于 base 落点（modify），故
+    # 【改指】而非删除——验收意图保留、路径对齐真身。
+    # ★批次2 闸门双 HIGH 整改★：替换必须【单遍 + 路径边界】——
+    #   (a) hunter H-1：模块根撞名（admin vs ruoyi-admin，RuoYi 天然形态）时 shadow 是 base
+    #       的后缀子串，盲 replace 会把【本已正确】的 base 引用绞成双前缀幽灵路径；
+    #   (b) reviewer HIGH：变体循环二次替换会命中刚写入的 base 自身（./config.py→app/config.py
+    #       →app/app/config.py）。
+    #   单条交替正则 + (?<![\w./-])/(?![\w./-]) 边界 + re.sub 单遍（不rescan替换产出）两型俱防。
+    # ★plan 级扫描（hunter M-1/reviewer LOW）：归位映射是 plan 级事实——消费者子任务的
+    #   `test -f <shadow>` 断言同样永假，owner 自身外的引用一并改指。readable 刻意不动
+    #   （见上文诚实边界：elaborate 兜底重布线，避免与 provenance 双实现）。
+    # ★诚实边界（批次2 闸门 hunter R2）：
+    #   · LOW-1：边界把 CJK 当 word char——`存在<shadow>的情况` 这类无分隔中文紧贴写法
+    #     不改指。方向安全：verify 里 CJK 紧贴路径本就是坏 shell token（治前治后同假），
+    #     真正烧 L1 的 `test -f` 形态必有空格/引号边界（实测全改指）；残留仅散文提及。
+    #   · LOW-4：harness 的 build/test/setup 等其它命令字段未入改写面（多由 stack driver
+    #     从 scope 确定性生成，归位后即指 base；LLM 自由文本嵌 shadow 全路径的形态罕见）。
+    if relocations:
+        import re as _re_b3
+        _rel_all: list[tuple[str, str]] = []  # (交替正则, base 真身)
+        # raw 形态（含 ./ 前缀等 LLM 原样写法）与 norm 同入交替，长串优先
+        _raws_by_base: dict[str, set[str]] = {}
+        for _rf, _rb in _relocated_raw:
+            _raws_by_base.setdefault(_rb, set()).add(_rf)
+        for _norm_p, _basep in relocations.items():
+            _vars = sorted({_norm_p} | _raws_by_base.get(_basep, set()),
+                           key=len, reverse=True)
+            _rel_all.append((
+                _re_b3.compile(r"(?<![\w./-])(?:%s)(?![\w./-])"
+                               % "|".join(_re_b3.escape(v) for v in _vars)),
+                _basep))
+
+        def _rewrite_refs(text: str) -> tuple[str, int]:
+            _t, _n = str(text), 0
+            for _pat, _bp in _rel_all:
+                _t, _k = _pat.subn(_bp, _t)
+                _n += _k
+            return _t, _n
+
+        for _st2 in subtasks:
+            _fixed = 0
+            _ac = getattr(_st2, "acceptance_criteria", None)
+            if _ac:
+                _out = []
+                for a in _ac:
+                    _t, _k = _rewrite_refs(str(a))
+                    _fixed += _k
+                    _out.append(_t if _k else a)
+                _st2.acceptance_criteria = _out
+            _hh = getattr(_st2, "harness", None)
+            _vc = getattr(_hh, "verify_commands", None) if _hh is not None else None
+            if _vc:
+                _out = []
+                for cmd in _vc:
+                    _t, _k = _rewrite_refs(str(cmd))
+                    _fixed += _k
+                    _out.append(_t if _k else cmd)
+                _hh.verify_commands = _out
+            _desc = getattr(_st2, "description", None)
+            if _desc:
+                _t, _k = _rewrite_refs(str(_desc))
+                if _k:
+                    _st2.description = _t
+                    _fixed += _k
+            if _fixed:
+                logger.warning(
+                    "[DECONFLICT-CVB] B-3：%s 的 %d 处验收/验证/描述 shadow 引用已改指 base "
+                    "真身（单遍+路径边界；防 shadow 存在性断言确定性永假烧 L1 配额）",
+                    getattr(_st2, "id", "?"), _fixed)
 
     # ── file_plan 同串归一（round67h·task=a259e59b 成环死型）★仓内既定不变量★──────────────
     # 归位子任务 create_files→base 后，file_plan 里那条 shadow 路径条目【必须同步 relocate 到 base

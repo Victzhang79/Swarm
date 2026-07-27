@@ -5344,6 +5344,12 @@ async def revision(state: BrainState) -> dict:
         updated_plan = TaskPlan(
             subtasks=new_subtasks, parallel_groups=new_parallel_groups,
             shared_contract=getattr(plan_obj, "shared_contract", {}) or {},  # B18：保留契约
+            # B-1（21 号文）：revision 重建点同补 plan 级账（与 _rebuild_plan 同治）——
+            # 否则修订一轮即丢 finisher_attached/symbol_cycle_pairs 两账
+            finisher_attached={k: list(v) for k, v in
+                               (getattr(plan_obj, "finisher_attached", None) or {}).items()},
+            symbol_cycle_pairs=[list(p) for p in
+                                (getattr(plan_obj, "symbol_cycle_pairs", None) or [])],
         )
     else:
         updated_plan = TaskPlan(

@@ -130,6 +130,20 @@ def validate_plan_structure(
         )
         return result
 
+    # B-2（21 号文）：重复子任务 id 硬闸——set/last-wins 无声吞并，同 id 双子任务同批并派
+    # 时 subtask_results 互相覆盖、一份产出静默蒸发（静默 PARTIAL 无告警）。fail-closed
+    # 打回重产，绝不派已知会失败的 plan（G1 同取向）。
+    _id_list = [t.id for t in plan.subtasks]
+    _dup_ids = sorted({i for i in _id_list if _id_list.count(i) > 1})
+    if _dup_ids:
+        # 批次2 闸门 hunter L-1：不提前 return——共存问题（DAG 环/scope 失控）一并进反馈，
+        # 防 LLM 修完 id 下一轮才撞下一处白烧一轮（fail-closed 方向不变，subtask_by_id
+        # last-wins 下后续检查不崩）
+        result.add(
+            f"计划含重复子任务 id（{_dup_ids}）——同 id 并发执行会互相覆盖产出账"
+            f"（subtask_results last-wins），一份产出静默蒸发，拒绝放行"
+        )
+
     task_ids = {t.id for t in plan.subtasks}
     subtask_by_id = {t.id: t for t in plan.subtasks}
 
@@ -817,11 +831,14 @@ def validate_file_plan_ownership(
     if len(subtasks) <= 1 or not files:
         return result
     owned_paths: set[str] = set()
+    # B-4（21 号文）：归一口径统一走单一事实源 _norm_scope_path（剥 ./ 前缀）——旧内联
+    # lstrip("/") 不剥 ./，与 DR-01-F2/plan_finisher reconcile 已治面分叉 → 假孤儿→虚假外科
+    from swarm.brain.contract_utils import _norm_scope_path
     for st in subtasks:
         sc = getattr(st, "scope", None)
         for f in (list(getattr(sc, "create_files", None) or [])
                   + list(getattr(sc, "writable", None) or [])):
-            owned_paths.add(str(f).replace("\\", "/").lstrip("/"))
+            owned_paths.add(_norm_scope_path(f))
     missing = [f for f in files if f not in owned_paths]
     for f in missing[:60]:
         result.add(
@@ -1060,15 +1077,19 @@ def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
     ③同拆分簇不判（deep-copy 兄弟共享描述文本，st-38 簇实测排除）。
     返回 route → [子任务 id]（仅跨簇 ≥2 处理器声明者的组）。
     """
-    from swarm.brain.contract_utils import classpath_fqn_key
+    from swarm.brain.contract_utils import classpath_fqn_key, _norm_scope_path
     phys_roots: set[str] = set()
     claims: dict[str, dict[str, list[str]]] = {}   # route -> cluster -> [sid]
+    _excluded_by_root: dict[str, dict[str, list[str]]] = {}  # B-7：phys_roots 排除观察账
     handler_sts: list = []
     for st in getattr(plan, "subtasks", None) or []:
         sc = getattr(st, "scope", None)
         creates = list(getattr(sc, "create_files", None) or [])
         for f in creates + list(getattr(sc, "writable", None) or []):
-            seg = str(f).replace("\\", "/").lstrip("/").split("/", 1)[0]
+            # 批次2 闸门 reviewer MED：必须 _norm_scope_path——内联 lstrip 不剥 ./，
+            # scope 写 ./ruoyi-a/... 时 seg="." 混入物理根、真模块根缺席 → 排除面静默
+            # 失效 → ③c 假双路由误杀（B-4 sibling 补捞）
+            seg = _norm_scope_path(f).split("/", 1)[0]
             if seg:
                 phys_roots.add(seg)
         if any(classpath_fqn_key(f)
@@ -1083,6 +1104,12 @@ def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
             if _ROUTE_FILE_EXT_RE.search(tok):
                 continue                        # 文件路径样式
             if tok.lstrip("/").split("/", 1)[0] in phys_roots:
+                # B-7（21 号文·疑点核验）：顶段=物理根的 token 按"文件路径非 URL"排除——
+                # 若它恰是真路由（首段撞模块目录名）则漏判。排除面改行为风险大于收益
+                # （round67 校准的消噪面），但排除动作必须可观测：入观察账，跨簇 ≥2
+                # handler 共享时被排除 → WARNING 留痕供复盘，不改判（③c ≥2 共享 REJECT
+                # 主判据不变）。
+                _excluded_by_root.setdefault(tok, {}).setdefault(cluster, []).append(sid)
                 continue                        # 本计划物理根前缀 = 文件路径非 URL
             claims.setdefault(tok, {}).setdefault(cluster, []).append(sid)
     # ★复核 HIGH 整改★：单路由碰撞可能是"handler 子任务在 desc 里引用他人既有接口"（消费
@@ -1096,6 +1123,14 @@ def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
             for j in range(i + 1, len(clusters)):
                 pair_routes.setdefault((clusters[i], clusters[j]), set()).add(r)
     strong_pairs = {p for p, rs in pair_routes.items() if len(rs) >= 2}
+    # B-7：phys_roots 排除的 token 若被跨簇 ≥2 handler 共享 → 疑似真路由漏判，WARNING 观察账
+    _ex_cross = {r: sorted({s for ids in cl.values() for s in ids})
+                 for r, cl in _excluded_by_root.items() if len(cl) >= 2}
+    if _ex_cross:
+        logger.warning(
+            "[VALIDATE] B-7 观察账：%d 条路由 token 因顶段撞物理根被排除但跨簇共享 "
+            "（疑似真双路由漏判，留痕不改判）: %s",
+            len(_ex_cross), dict(list(_ex_cross.items())[:5]))
     weak = {r: sorted({s for ids in cl.values() for s in ids})
             for r, cl in claims.items()
             if len(cl) >= 2 and not any(
@@ -1381,7 +1416,10 @@ def normalized_file_plan_paths(file_plan, exclude_test_paths: bool = False) -> l
         elif str(f or "").strip():
             entries.append({"path": str(f)})
     deduped = dedupe_file_plan(entries)
-    paths = [str(e["path"]).replace("\\", "/").strip("/")
+    # B-4（21 号文）：与 R40-1 owner 侧同走 _norm_scope_path（剥 ./）——两侧口径必须同源，
+    # 否则 file_plan 写 ./x.java、scope 写 x.java → 假孤儿打回
+    from swarm.brain.contract_utils import _norm_scope_path
+    paths = [_norm_scope_path(e["path"])
              for e in deduped if isinstance(e, dict) and e.get("path")]
     if exclude_test_paths:
         from swarm.brain.nodes.shared import _is_test_file_path

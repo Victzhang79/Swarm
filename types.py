@@ -332,11 +332,12 @@ class SubTask(BaseModel):
 # ──────────────────────────────────────────────
 def _edge_norm_path(f) -> str:
     """路径归一（与 contract_utils._norm_scope_path 同口径；types 为底层不可反向 import，
-    此处内联同一 3 行规则——两处必须保持一致，改动须同步）。"""
+    此处内联同一规则——两处必须保持一致，改动须同步。批次2 闸门 reviewer R2 LOW-1：
+    尾斜杠剥离随 SSOT 同步）。"""
     p = str(f).replace("\\", "/")
     while p.startswith("./"):
         p = p[2:]
-    return p.lstrip("/")
+    return p.lstrip("/").rstrip("/")
 
 
 def edge_is_soft(consumer: "SubTask", producer: "SubTask | None") -> bool:

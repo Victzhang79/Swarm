@@ -179,14 +179,18 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         _ab_ids = (set(state.get("abandoned_subtask_ids") or [])
                    | set(state.get("give_up_isolated_ids") or []))
         if _ab_ids and plan_obj is not None:
+            # 批次1 闸门 hunter LOW-3（随 B-4 同治）：豁免/清理两集合精确字符串匹配不过
+            # 归一——幸存 scope 写 ./x.java、放弃 scope 写 x.java 时豁免失效误滚幸存文件。
+            # 统一走 _norm_scope_path（剥 ./ 与前导 /，git pathspec 正需仓相对形态）。
+            from swarm.brain.contract_utils import _norm_scope_path as _nsp
             _by_id = {s.id: s for s in plan_obj.subtasks}
             _ab_files: list[str] = []
             for _aid in _ab_ids:
                 _ast = _by_id.get(_aid)
                 _sc = getattr(_ast, "scope", None) if _ast else None
                 if _sc:
-                    _ab_files += list(getattr(_sc, "writable", []) or [])
-                    _ab_files += list(getattr(_sc, "create_files", []) or [])
+                    _ab_files += [_nsp(f) for f in (getattr(_sc, "writable", []) or [])]
+                    _ab_files += [_nsp(f) for f in (getattr(_sc, "create_files", []) or [])]
             # 复核 MEDIUM：绝不清理【存活子任务】scope 内的文件——单写者不变量下本不重叠，但
             # 路径巧合(共享 VO/DTO 包)时防误删存活子任务的真产出(git clean 只删 untracked)。
             _alive_files: set[str] = set()
@@ -195,8 +199,8 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     continue
                 _asc = getattr(_s, "scope", None)
                 if _asc:
-                    _alive_files |= set(getattr(_asc, "writable", []) or [])
-                    _alive_files |= set(getattr(_asc, "create_files", []) or [])
+                    _alive_files |= {_nsp(f) for f in (getattr(_asc, "writable", []) or [])}
+                    _alive_files |= {_nsp(f) for f in (getattr(_asc, "create_files", []) or [])}
             _ab_files = sorted({f for f in _ab_files if f and f not in _alive_files})
             if _ab_files:
                 try:

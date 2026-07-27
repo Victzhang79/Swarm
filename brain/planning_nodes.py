@@ -3751,12 +3751,28 @@ def _prune_dangling_dependencies(subtasks: list) -> int:
 
 
 def _rebuild_plan(plan_obj, new_subtasks):
-    """用新子任务列表重建 TaskPlan，保留 shared_contract，parallel_groups 失效用空(依赖驱动调度)。"""
+    """用新子任务列表重建 TaskPlan，保留 shared_contract，parallel_groups 失效用空(依赖驱动调度)。
+
+    B-1（21 号文）：plan 级账字段必须随重建携带——finisher_attached（R41，消费者=#6 覆盖
+    配对 nodes/__init__.py）与 symbol_cycle_pairs（H-3b，消费者=get_dispatch_batch
+    types.py:541 软序兜底）。旧版四个调用点（elaborate resplit/planning_core redecompose×2/
+    dispatch 预算闸拆小）全丢：revision/合并等【id 保持】路径下账存活关键。
+
+    ★诚实边界（批次2 闸门 hunter M-3）：resplit/拆小把 st-X 换成 st-X-1/st-X-2 时，携带的
+    旧 id 账键【悬空=no-op】（消费者按现存 id 查账查不到即跳过，无误配对、无腐化）——
+    该场景下 #6 配对/软序对拆出子块不生效，与改前"账直接丢"等价（非回归但也非已治）；
+    账键重映射到继承子块是更大改动，登记后续。本修复的真收益面=id 保持的重建路径。
+    """
     from swarm.types import TaskPlan
     return TaskPlan(
         subtasks=new_subtasks,
         parallel_groups=[],  # 拆分后旧分组失效；依赖驱动调度不需要它
         shared_contract=getattr(plan_obj, "shared_contract", {}) or {},
+        # B-1：plan 级账随重建携带（深拷贝防新旧 plan 共享可变对象互相污染）
+        finisher_attached={k: list(v) for k, v in
+                           (getattr(plan_obj, "finisher_attached", None) or {}).items()},
+        symbol_cycle_pairs=[list(p) for p in
+                            (getattr(plan_obj, "symbol_cycle_pairs", None) or [])],
     )
 
 

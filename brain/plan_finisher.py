@@ -532,7 +532,13 @@ def _plan_reaches(by_id: dict, start: str, target: str) -> bool:
     return False
 
 
-_DESC_ST_DEP_RE = _re.compile(r"依赖\s*(st-[A-Za-z0-9_-]+)")
+# B-5（21 号文）：扩英文形态——规划 LLM 用英文描述时 "depends on st-X"/"after st-X"/
+# "requires st-X" 同样是零歧义结构信号，漏配则 readable 唯一信号源对它们结构性失明
+# （fail-safe 方向：C9 运行时补边兜底，但首批并派即 BLOCKED 白跑一轮）。
+# 批次2 闸门 reviewer LOW：英文备选加 \b 左边界（"thereafter st-1" 不误配）；中文侧
+# 绝不能裸加 \b——CJK 表意字在 re 里是 word char，"于依赖st-1" 无边界会回退匹配面。
+_DESC_ST_DEP_RE = _re.compile(
+    r"(?:依赖|\b(?:depends?\s+on|requires?|after))\s*(st-[A-Za-z0-9_-]+)", _re.IGNORECASE)
 
 
 def wire_described_dependency_tokens(plan) -> dict[str, list[str]]:
@@ -548,10 +554,14 @@ def wire_described_dependency_tokens(plan) -> dict[str, list[str]]:
     if len(subs) < 2:
         return {}
     by_id = {str(getattr(st, "id", "")): st for st in subs}
+    # 批次2 闸门 hunter R2 LOW-2：正则 IGNORECASE 捕到的 "ST-1" 必须落到真身 id——
+    # by_id 大小写敏感会把它们当幻影 id 静默跳过（IGNORECASE 一半收益落空）。
+    _canon = {k.lower(): k for k in by_id}
     added: dict[str, list[str]] = {}
     for st in subs:
         sid = str(getattr(st, "id", ""))
         for dep in set(_DESC_ST_DEP_RE.findall(str(getattr(st, "description", "") or ""))):
+            dep = _canon.get(dep.lower(), dep)
             if dep == sid or dep not in by_id:
                 continue                    # 自引用/幻影 id 不成边
             if _plan_reaches(by_id, sid, dep):
