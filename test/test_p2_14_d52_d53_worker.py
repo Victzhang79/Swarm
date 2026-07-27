@@ -67,7 +67,10 @@ def test_d53_trivial_gate_runs_off_loop_and_loop_stays_alive(tmp_path):
 
 
 def test_d53_ls_files_probe_has_timeout(tmp_path, monkeypatch):
-    """_try_local_git_diff 的 ls-files 探测带 timeout（原无超时，git 挂死占死线程）。"""
+    """_try_local_git_diff 的 ls-files 探测带 timeout（原无超时，git 挂死占死线程）。
+
+    hunter F5（批次5）后探测形态=单次批量 `git ls-files -- <targets>`（锁内一次，
+    替代逐文件 --error-unmatch N 次），断言跟随新形态——不变量（必带 timeout）不变。"""
     import subprocess as _sp
 
     # 造一个真实 git 仓库 + 一个 scope 文件，让路径走到 ls-files 探测
@@ -79,7 +82,7 @@ def test_d53_ls_files_probe_has_timeout(tmp_path, monkeypatch):
     real_run = _sp.run
 
     def spy_run(cmd, *a, **kw):
-        if isinstance(cmd, (list, tuple)) and "ls-files" in cmd and "--error-unmatch" in cmd:
+        if isinstance(cmd, (list, tuple)) and "ls-files" in cmd:
             seen["timeout"] = kw.get("timeout")
         return real_run(cmd, *a, **kw)
 

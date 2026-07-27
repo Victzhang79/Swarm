@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401  # 供 async 方法体内 asyncio.* 使用
 import logging
 import os
+import re
 
 from pathlib import Path
 
@@ -53,6 +54,32 @@ _WORKSPACE_LIST_CAP = _workspace_list_cap()
 # D36：bootstrap 上传完成时刻标记文件名（沙箱 remote_workdir 根）。pull-back 的全量枚举须排除它，
 # 否则 allow_any 模式会把这个内部标记当产物拉回本地。
 _BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
+
+# C14（19号文）：构建清单名【栈中立单一事实源】——_build_manifest_files（scope 清单发现）
+# 与"始终补传变更清单"（FINDING-11 泛化）共用同一集合。旧 _BUILD_MANIFESTS 只列 JVM
+# （pom/gradle），npm/cargo/go 的聚合清单（package.json/Cargo.toml/go.mod/go.work）不在
+# "始终补传"集 → 上游注册的聚合清单不进沙箱 → "reactor not found"死法换栈复发。
+_SYNC_MANIFEST_NAMES = (
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "build.xml",                       # JVM
+    "go.mod", "go.sum", "go.work",                            # Go
+    "Cargo.toml", "Cargo.lock",                               # Rust
+    "package.json", "tsconfig.json",                          # JS/TS
+    "pyproject.toml", "setup.py", "requirements.txt",         # Python
+)
+
+# C13（19号文）：截断上限提为模块级——达上限 WARNING 可观测 + 测试可缩小复现。
+_MODULE_SRC_CAP = 800
+_MANIFEST_CAP = 60
+
+
+def _in_ctx_or_under_dirs(f: str, ctx: set[str], ctx_dirs: set[str]) -> bool:
+    """C11：D36 改动兄弟交集判据——f 在 ctx 精确集，或在任一 ctx/声明目录前缀之下
+    （覆盖 worker 在【新建子目录】里创建的文件，路径必不在本地枚举构成的 ctx 精确集）。"""
+    if f in ctx:
+        return True
+    f2 = f.replace("\\", "/")
+    return any(f2.startswith(d + "/") for d in ctx_dirs)
 
 # F3（merge 审计）：枚举输出的 oversize 节标记 + 探针上限。三条 find 枚举通道在同一命令里
 # 附带孪生探针（`! -size -<阈值>k`），把被尺寸谓词排除的文件显式列出——旧版静默滤掉零留痕，
@@ -171,16 +198,54 @@ class _SandboxSyncMixin:
         """改动文件所在【构建模块】的完整源码树(仅编译型语言需要)。
 
         判据：harness.build_command 存在(说明要真实编译)。从改动文件向上找最近的
-        构建清单(pom.xml/build.gradle)确定模块根，再收该模块 src/ 下全部源文件。
+        构建清单确定模块根，再收该模块 src/ 下全部源文件。
         防超大：单模块上限 800 文件。非编译型(无 build_command)返回空，保持精准同步。
+        C14（19号文）：栈分发驱动表（build 命令词元 → 模块锚清单/源扩展名/排除目录），
+        不再 JVM 写死——go/cargo/npm 模块缺同级源同样 cannot find symbol 换栈复发。
         """
         harness = getattr(self.subtask, "harness", None)
         build_cmd = getattr(harness, "build_command", "") if harness else ""
         if not build_cmd or not self.project_path:
             return []
-        # 仅对 JVM 系(mvn/gradle)启用整模块同步；其他语言模块边界不同，暂不扩展
-        if not any(t in build_cmd for t in ("mvn", "gradle")):
+        # 栈驱动表：(build 命令词元, 模块锚清单, 源扩展名, 排除目录段, 排除是否锚定 src/ 之前)
+        # C15（19号文）：目录名泛匹配误伤——JVM 的 target/build 排除若全路径段匹配，会把合法
+        # 包目录 com/x/build/ 里的源文件错排。锚定 src/ 的栈只排 src/ 之前的段（构建产物必在
+        # 模块根/src 之外）；node_modules/vendor 生态约定任何层级都是依赖目录，全段排除。
+        # hunter F2：go 词元必须词边界正则（"re:" 前缀）——子串 "go " 会被 "cargo build"/
+        # "cargo test" 里的 car【go 】截胡，Rust 行锚清单 go.mod 永远找不到 → 静默返回 []
+        # （cannot find symbol 换栈复发零留痕）。cargo 同时排在 go 前双保险。
+        # 诚实边界（reviewer R2 LOW）：词边界把绝对路径调用（/usr/local/go/bin/go build，
+        # "go" 前是 /）也挡在驱动外 → 该形态返回 []（fail-open 等价未知栈）。brain 产出的
+        # build_command 几乎皆裸 `go build`，命中面极小，登记不阻断。
+        _STACK_DRIVERS = (
+            (("mvn", "gradle"), ("pom.xml", "build.gradle", "build.gradle.kts"),
+             (".java", ".kt", ".scala", ".groovy"), ("target", "build"), True),
+            (("cargo",), ("Cargo.toml",),
+             (".rs",), ("target",), True),
+            ((r"re:(?<![\w/.-])go(?:\s|$)",), ("go.mod",),
+             (".go",), ("vendor",), False),
+            (("npm ", "pnpm", "yarn", "tsc", "npx tsc"), ("package.json",),
+             (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"),
+             ("node_modules", "dist", "build"), False),
+        )
+
+        def _token_hit(tokens, cmd: str) -> bool:
+            for t in tokens:
+                if t.startswith("re:"):
+                    if re.search(t[3:], cmd):
+                        return True
+                elif t in cmd:
+                    return True
+            return False
+
+        driver = None
+        for tokens, anchors, exts, skip_parts, src_anchor in _STACK_DRIVERS:
+            if _token_hit(tokens, build_cmd):
+                driver = (anchors, exts, skip_parts, src_anchor)
+                break
+        if driver is None:
             return []
+        _ANCHORS, _SRC_EXT, _SKIP_PARTS, _SRC_ANCHOR = driver
         root = Path(self.project_path).resolve()
         scope = self.effective_scope
         changed = (list(getattr(scope, "writable", []) or [])
@@ -191,32 +256,42 @@ class _SandboxSyncMixin:
         module_roots: set[Path] = set()
         for f in changed:
             cur = (root / str(f).strip()).resolve().parent
-            # 向上找最近含 pom.xml/build.gradle 的目录 = 模块根
+            # 向上找最近含模块锚清单的目录 = 模块根
             while True:
-                if (cur / "pom.xml").is_file() or (cur / "build.gradle").is_file() or (cur / "build.gradle.kts").is_file():
+                if any((cur / a).is_file() for a in _ANCHORS):
                     module_roots.add(cur)
                     break
                 if cur == root or root not in cur.parents:
                     break
                 cur = cur.parent
         out: list[str] = []
-        _SRC_EXT = (".java", ".kt", ".scala", ".groovy")
         for mroot in module_roots:
             src_dir = mroot / "src"
             base = src_dir if src_dir.is_dir() else mroot
-            count = 0
+            # C13（19号文）：先全收再排序确定化后截断——rglob 顺序不定 + 静默 break 会让
+            # >800 源文件模块每轮随机漏不同同级类（cannot find symbol 不可复现零留痕）。
+            collected: list[str] = []
             for p in base.rglob("*"):
-                if count >= 800:
-                    break
                 if not p.is_file() or p.suffix not in _SRC_EXT:
                     continue
-                if "target" in p.relative_to(root).parts or "build" in p.relative_to(root).parts:
+                _parts = p.relative_to(mroot).parts
+                if _SRC_ANCHOR and "src" in _parts:
+                    # 锚定栈：只排 src/ 之前的段（构建产物）；src/ 下的 build/target 是合法包目录
+                    _parts = _parts[:_parts.index("src")]
+                if any(part in _SKIP_PARTS for part in _parts):
                     continue
                 try:
-                    out.append(str(p.relative_to(root)))
-                    count += 1
+                    collected.append(str(p.relative_to(root)))
                 except ValueError:
                     continue
+            collected.sort()
+            if len(collected) > _MODULE_SRC_CAP:
+                self._log(
+                    f"模块 {mroot.relative_to(root)} 源码树 {len(collected)} 个文件超上限 "
+                    f"{_MODULE_SRC_CAP}，按排序截断——超出部分不同步沙箱，编译缺同级类需调大上限",
+                    level="warning")
+                collected = collected[:_MODULE_SRC_CAP]
+            out.extend(collected)
         return out
 
     def _build_manifest_files(self) -> list[str]:
@@ -228,12 +303,8 @@ class _SandboxSyncMixin:
         if not self.project_path:
             return []
         root = Path(self.project_path).resolve()
-        manifest_names = (
-            "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
-            "settings.gradle.kts", "go.mod", "go.sum", "Cargo.toml", "Cargo.lock",
-            "package.json", "tsconfig.json", "pyproject.toml", "setup.py",
-            "requirements.txt", "build.xml",
-        )
+        # C14：manifest_names 收编模块级 _SYNC_MANIFEST_NAMES（单一事实源，两处同口径）。
+        manifest_names = _SYNC_MANIFEST_NAMES
         found: list[str] = []
 
         def _add_dir_manifests(d: Path) -> None:
@@ -274,13 +345,13 @@ class _SandboxSyncMixin:
         # 3) 多模块工程：聚合父 pom 会引用【所有】子模块，mvn -pl/聚合构建需要全部
         #    模块的构建清单在场。项目级 glob 收集所有清单(限 60 个，防超大 monorepo)。
         #    只收清单文件本身(小)，不碰源码，开销可忽略。
+        #    C13（19号文）：先全收排序确定化再截断 + 超限 WARNING——旧实现 rglob 顺序不定
+        #        静默 break，>60 清单 monorepo 每轮随机漏不同 pom 不可复现。
         _SKIP = {".git", "node_modules", "target", "build", ".venv", "venv",
                  "dist", ".gradle", "__pycache__", ".codegraph"}
         manifest_set = set(manifest_names)
-        count = 0
+        candidates: list[str] = []
         for p in root.rglob("*"):
-            if count >= 60:
-                break
             if p.name not in manifest_set or not p.is_file():
                 continue
             if any(part in _SKIP for part in p.relative_to(root).parts):
@@ -290,8 +361,15 @@ class _SandboxSyncMixin:
             except ValueError:
                 continue
             if rel not in found:
-                found.append(rel)
-                count += 1
+                candidates.append(rel)
+        candidates.sort()
+        if len(candidates) > _MANIFEST_CAP:
+            self._log(
+                f"项目构建清单 {len(candidates)} 个超上限 {_MANIFEST_CAP}，按排序截断——"
+                f"超出模块的清单不进沙箱，聚合构建缺模块需调大上限",
+                level="warning")
+            candidates = candidates[:_MANIFEST_CAP]
+        found.extend(candidates)
         return found
 
 
@@ -400,10 +478,16 @@ class _SandboxSyncMixin:
             _ref = resolve_base_ref(getattr(self, 'base_ref', None))
             proc = subprocess.run(
                 ["git", "show", f"{_ref}:{rel}"],
-                cwd=str(local_root), capture_output=True, text=True, timeout=15,
+                # C15（19号文）：text=True 走 universal-newlines 把 CRLF 转 LF——基线与
+                # diff 侧（刻意 bytes 保行尾）不同源，staging 干净上传会把 CRLF 文件刷成
+                # LF 伪变更。改 bytes 后显式 decode（bytes.decode 不行尾转换），与 diff 侧同源。
+                cwd=str(local_root), capture_output=True, timeout=15,
             )
             if proc.returncode == 0:
-                return proc.stdout
+                try:
+                    return proc.stdout.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None  # 二进制/非 UTF-8：与旧 text=True 抛殊途同归 None
             # round29 遗漏项#3 sibling：原按【英文 stderr 文案】判"文件在 HEAD 不存在"——中文等
             # 非英文 locale 下匹配不到 → 新建文件基线错回 None（diff 基线退化回脏工作副本，
             # c592c562 空 diff 病根在非英文环境复发）。改 locale 无关的判定：
@@ -685,10 +769,7 @@ class _SandboxSyncMixin:
                 # 子任务 scope】(上面 readable 循环漏掉)→ 上游脚手架注册的父 pom 不传到本沙箱 → reactor
                 # not found(实测 st-3 跨 replan/retry 全败)。故【始终】补传变更的 build 清单(local≠HEAD)，
                 # 不限 scope——是 69d34b1b 修复的泛化(从"传 scope 内变更"扩到"额外始终传 build-critical")。
-                _BUILD_MANIFESTS = (
-                    "pom.xml", "settings.gradle", "build.gradle",
-                    "settings.gradle.kts", "build.gradle.kts",
-                )
+                _BUILD_MANIFESTS = _SYNC_MANIFEST_NAMES  # C14：栈中立单一事实源（含 npm/cargo/go）
                 try:
                     _ch = _sp.run(
                         ["git", "diff", "--name-only", resolve_base_ref(getattr(self, 'base_ref', None))],
@@ -835,6 +916,17 @@ class _SandboxSyncMixin:
                 cfg.sandbox.sandbox_remote_workdir,
             )
             err_count = len(sync_stats.get("errors") or [])
+            # C7（19号文）：上传侧对称入账（对照 pull-back 侧 _sync_error_rels 的 A3/D30 账）。逐文件上传失败
+            # 不再是"打日志继续跑"——账进 _upload_error_rels，L1 闸门据此拒绝判 PASS（降
+            # BLOCKED transient 重试重传），杜绝 agent 在缺文件沙箱从零重写 → 原内容丢失假绿。
+            self._upload_error_rels = list(sync_stats.get("errors") or [])
+            if self._upload_error_rels:
+                self._log(
+                    f"{reason} 本地→沙箱精准上传逐文件失败 {len(self._upload_error_rels)} 项已入账"
+                    f"（L1 将拒 PASS 降 BLOCKED 重试）: "
+                    + ", ".join(self._upload_error_rels[:5]),
+                    level="warning",
+                )
             self._log(
                 f"{reason} 本地→沙箱精准上传: "
                 f"uploaded={sync_stats.get('uploaded', 0)}, "
@@ -1100,7 +1192,15 @@ class _SandboxSyncMixin:
                 # 绝不静默当"无可写文件"——那会把 greenfield 产物整体蒸发成假"无变更"。
                 raise
             except Exception as exc:
-                self._log(f"{reason} allow_any 枚举沙箱文件失败: {exc}", level="warning")
+                # W-2（21号文，C1 修法残留）：非 TransientInfraError 的枚举异常此前吞成
+                # warning 继续 rel_files=[]——蒸发路径对其它异常类型依旧成立。枚举是
+                # 基础设施操作不是产物判断，统一映射 transient（退避有界，确定性故障
+                # 重试不自愈会走升级阶梯，优于静默蒸发）。
+                self._log(
+                    f"{reason} allow_any 枚举沙箱文件异常（升格 transient 退避重试，"
+                    f"绝不静默当无可写文件）: {exc}", level="warning")
+                raise TransientInfraError(
+                    f"allow_any workspace enumeration failed: {exc}") from exc
         # 并入被确定性修复的文件（去重保序），使其无论是否在写权 scope 内都被拉回本地。
         if extra_repaired:
             rel_files = list(dict.fromkeys(
@@ -1164,10 +1264,20 @@ class _SandboxSyncMixin:
                     self._list_sandbox_modified_files, self._bootstrap_marker)
                 # _context_sibling_rels 内含整模块源码 rglob（大 monorepo 数十 ms 同步 IO）→ 卸线程池。
                 _ctx = await asyncio.to_thread(self._context_sibling_rels, local_root)
+                # C11（19号文）：交集放宽为【ctx 文件 ∪ ctx 目录前缀 ∪ 声明目录前缀】——
+                # worker 在【新建子目录】（如 impl/ 子包）里创建的文件，路径必然不在由本地
+                # 枚举构成的 ctx 集合里（精确匹配永假）→ 沙箱 L1 绿 → 文件不回传 → merge 期
+                # cannot find symbol。前缀匹配覆盖"既有包的新子目录"形态；构建产物目录已被
+                # 枚举侧 find prune（target/build/dist/node_modules 等），不会被前缀误拉。
+                _ctx_dirs = {
+                    str(Path(f).parent).replace("\\", "/")
+                    for f in (_ctx | set(rel_files)) if "/" in f.replace("\\", "/")
+                }
                 _rel_now = set(rel_files)
                 _sib_mods = [
                     f for f in _modified
-                    if f in _ctx and f not in _rel_now
+                    if f not in _rel_now
+                    and _in_ctx_or_under_dirs(f, _ctx, _ctx_dirs)
                 ]
                 if _sib_mods:
                     self._repaired_extra_paths.update(_sib_mods)
@@ -1336,7 +1446,9 @@ class _SandboxSyncMixin:
         # 201+ 个产物（>200 文件的项目模板一次生成即触发）。上限大幅提高至 _WORKSPACE_LIST_CAP，
         # 且【截断即 warning】可观测——不再"看似枚举全了实则丢一半"。find 排除噪声目录，
         # 尺寸谓词与记账上限同源（F3 _find_size_kib）+ 孪生 oversize 探针节。
-        prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name .pytest_cache \)"
+        # C14（19号文）：补 -name target 与 :1487 改动枚举 prune 对称——allow_any pull-back
+        # 原把 target/**（Maven 构建产物，数千 class/jar）拉回本地污染树并挤占枚举 cap。
+        prune = r"\( -name .git -o -name __pycache__ -o -name node_modules -o -name .venv -o -name venv -o -name .codegraph -o -name dist -o -name build -o -name target -o -name .pytest_cache \)"
         _kib = _find_size_kib()
         # +1 用于探测是否发生截断（拿到 cap+1 行即说明真实文件数 > cap）。
         cmd = (
@@ -1521,10 +1633,15 @@ class _SandboxSyncMixin:
         for rel in sorted(post.keys()):
             new_text = post.get(rel)
             old_text = pre.get(rel, "")
-            # 二进制文件
+            # 二进制文件（C10：原样 emitted "二进制文件变更: rel" 非法行——不是 unified diff，
+            # 混进 merged_diff 会让 git apply 整体报"补丁损坏"连坐全部正常 hunk。无字节
+            # 无法构造 GIT binary patch，fail-honest=剔出 diff + WARNING 留痕可观测）
             if new_text is None or old_text is None:
                 if new_text != old_text:
-                    diff_parts.append(f"二进制文件变更: {rel}")
+                    self._log(
+                        f"difflib 兜底无法表达二进制变更 {rel}（无字节可构造 binary patch）"
+                        f"——已从 diff 剔除防毒 git apply，该文件变更需人工/对账核验",
+                        level="warning")
                 continue
             # 行尾归一化：基线(git HEAD/本地)可能是 LF，pull-back 回来可能是 CRLF
             # (RuoYi 原始文件即 Windows CRLF)。不归一会让 difflib 把每行都判为变更，
@@ -1549,6 +1666,59 @@ class _SandboxSyncMixin:
                 lineterm="",
             )
             # 逐元素规范化：hunk头/文件头(lineterm="" 故无换行)补\n；内容行(keepends 已含\n)不动。
+            block = "".join(x if x.endswith("\n") else x + "\n" for x in ud)
+            block = block.rstrip("\n")
+            if block.strip():
+                diff_parts.append(block)
+
+        # C10：删除表达——pre 有 post 无 = 子任务删了该文件。旧实现只遍历 post，纯删除
+        # 子任务 diff 恒"(无变更)"假绿、删除永不进 merged_diff。补 `+++ /dev/null` 删除
+        # 形态（git apply 原生可消费）。
+        # hunter F1：差集必须 ∩ 归一化 scope（writable∪create∪delete∪repaired）——pre 在
+        # 上传期被灌入 readable/构建清单/模块源码超集（:798-812 补基线），裸差集会把整个
+        # 上下文树写成删除 hunk，merge 侧 git apply 真删 readable/父 pom（假过+数据破坏）。
+        # 与路径1 _try_local_git_diff 的 targets 同口径。allow_any（无声明 scope，workspace
+        # 即 scope）不加交集。
+        if getattr(self.effective_scope, "allow_any", False):
+            _del_cands = sorted(set(pre.keys()) - set(post.keys()))
+        else:
+            _dscope = self.effective_scope
+
+            def _norm_decl(p) -> str:
+                # hunter R2-1：lstrip("./") 是字符集语义会吃掉点文件前导点（".env"→"env"，
+                # 声明的点文件删除静默不表达）——必须 "./" 前缀语义剥离。
+                p = str(p).replace("\\", "/")
+                while p.startswith("./"):
+                    p = p[2:]
+                return p.lstrip("/")
+
+            _decl = {
+                _norm_decl(_f)
+                for _f in (list(getattr(_dscope, "writable", []) or [])
+                           + list(getattr(_dscope, "create_files", []) or [])
+                           + list(getattr(_dscope, "delete_files", []) or [])
+                           + sorted(getattr(self, "_repaired_extra_paths", None) or []))
+                if _f
+            }
+            _del_cands = sorted((set(pre.keys()) - set(post.keys())) & _decl)
+        for rel in _del_cands:
+            old_text = pre.get(rel)
+            if old_text is None:
+                # reviewer F-5：二进制删除无字节可 diff，与二进制变更分支对称 WARNING 留痕
+                self._log(
+                    f"difflib 兜底无法表达二进制删除 {rel}（无字节可构造 deletion patch）"
+                    f"——删除未进 diff，需人工/对账核验",
+                    level="warning")
+                continue
+            if not old_text:
+                continue  # 空文件删除对构建无影响
+            old_norm = old_text.replace("\r\n", "\n").replace("\r", "\n")
+            old_lines = old_norm.splitlines(keepends=True)
+            ud = difflib.unified_diff(
+                old_lines, [],
+                fromfile=f"a/{rel}", tofile="/dev/null",
+                lineterm="",
+            )
             block = "".join(x if x.endswith("\n") else x + "\n" for x in ud)
             block = block.rstrip("\n")
             if block.strip():
@@ -1600,20 +1770,27 @@ class _SandboxSyncMixin:
         try:
             # 让新建/未跟踪文件也能进 git diff：对 create_files 做 intent-to-add（-N，不暂存内容，
             # 仅登记路径，使 git diff 能显示其全部新增行）。幂等、无副作用（不真正 commit）。
-            untracked = []
-            for f in targets:
-                p = _P(root) / f
-                if p.is_file():
-                    # 是否已跟踪
-                    # D53：补 timeout——原无超时，git 挂死（NFS/锁竞争）会占死一个线程/环
-                    r = _sp.run(["git", "-C", root, "ls-files", "--error-unmatch", f],
-                                capture_output=True, text=True, timeout=30)
-                    if r.returncode != 0:
-                        untracked.append(f)
             # TD2606-B5/C5/M5：add -N（改共享 index）+ diff 必须在同一 per-project 锁内原子完成，
             # 否则并发 worker 的 intent-to-add 互相泄漏进对方 diff、与他人 reset/diff 互踩。
-            # 锁内只放这两条短命 git 命令；ls-files 探测（只读）与 diff 结果处理在锁外。
+            # C5（19号文）：ls-files 探测虽只读，读的却是【共享 index】——兄弟锁内 add -N 占位
+            # 瞬态会让探测误判"已 tracked"→ 不入 untracked → 兄弟 finally restore 清占位后，
+            # 本 worker 锁内 diff 时该文件纯 untracked 无占位 → diff 为空 → merge 丢文件。
+            # 探测必须挪进同一把 flock（毫秒级只读），与 add -N/diff/restore 构成原子区。
             with _ProjectGitFlock(root):
+                # hunter F5：单次批量 ls-files（路径限 targets）替代逐文件 N 次——N×30s
+                # 超时串行占锁阻塞兄弟的窗口消除；rc≠0（git 故障）时退化"所有现存文件
+                # 皆 untracked"（add -N 对已 tracked 文件幂等无害，宁可多登记绝不漏捞）。
+                _existing = [f for f in targets if (_P(root) / f).is_file()]
+                if _existing:
+                    r = _sp.run(["git", "-C", root, "ls-files", "--", *_existing],
+                                capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        _tracked = set(r.stdout.splitlines())
+                        untracked = [f for f in _existing if f not in _tracked]
+                    else:
+                        untracked = list(_existing)
+                else:
+                    untracked = []
                 # ── 主干A 治本（并行子任务共享聚合态）──
                 # 根因：pull-back 把产物写回【共享】project_path 工作区（一任务一份，N 个并行
                 # worker 共用），而本路径取"工作区当前内容"作 diff 新值。多写者对同一聚合文件

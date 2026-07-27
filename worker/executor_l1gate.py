@@ -269,7 +269,10 @@ class _L1GateMixin:
         # 缺产物」的静默假绿复活。
         _sync_clean = (getattr(self, "_sync_skipped_count", 0) == 0
                        and not getattr(self, "_sync_error_rels", None)
-                       and not getattr(self, "_sync_oversize_rels", None))
+                       and not getattr(self, "_sync_oversize_rels", None)
+                       # reviewer F-4（修一类捞全 sibling）：上传侧账同入守卫——
+                       # 上传不干净时缓存命中=绕 C7 闸（当前不可达，防未来改动开口）。
+                       and not getattr(self, "_upload_error_rels", None))
         if (_sync_clean
                 and _gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
                 and getattr(self, "_last_gate_details", None) is not None):
@@ -339,7 +342,10 @@ class _L1GateMixin:
             # 复用本文件缓存复用同款 dirty-sync 守卫（236-238）：不干净 → 整闸 fail-open 跳过。
             _sync_clean = (getattr(self, "_sync_skipped_count", 0) == 0
                            and not getattr(self, "_sync_error_rels", None)
-                           and not getattr(self, "_sync_oversize_rels", None))
+                           and not getattr(self, "_sync_oversize_rels", None)
+                           # reviewer F-4 sibling：上传账同入（上传不干净=沙箱输入不完整，
+                           # on-disk 视图同样不可信）
+                           and not getattr(self, "_upload_error_rels", None))
             if not _sync_clean:
                 _cf_check_meta["create_files_check_skipped"] = "dirty_sync"
                 logger.warning(
@@ -413,7 +419,9 @@ class _L1GateMixin:
         if _contract_deps:
             _sync_clean_dep = (getattr(self, "_sync_skipped_count", 0) == 0
                                and not getattr(self, "_sync_error_rels", None)
-                               and not getattr(self, "_sync_oversize_rels", None))
+                               and not getattr(self, "_sync_oversize_rels", None)
+                               # reviewer F-4 sibling：上传账同入
+                               and not getattr(self, "_upload_error_rels", None))
             if not _sync_clean_dep:
                 _dep_check_meta["dep_check_skipped"] = "dirty_sync"
                 logger.warning(
@@ -523,6 +531,36 @@ class _L1GateMixin:
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
                 details["pullback_skipped"] = self._sync_skipped_count
                 details["pullback_errors"] = len(self._sync_error_rels)
+                return None, details
+            # C7（19号文）上传侧对称：bootstrap 精准上传有逐文件失败 → agent 是在【缺文件
+            # 沙箱】里跑的（writable 缺失→从零重写→原内容丢失假绿风险），"沙箱绿"同样不代表
+            # 输入完整。与 pull-back 侧同型 fail-closed。
+            # hunter F3：transient/确定性分账（D30 对称臂）——"本地文件不存在/越界路径"是
+            # plan 声明与磁盘事实的确定性矛盾，重试永不自愈，一律 BLOCKED 会烧到配额耗尽
+            # （D30 修掉的超限活锁同型）；这类判确定性 FAIL 走失败阶梯，网络/写入异常留
+            # transient BLOCKED 退避重试（重试会重新 bootstrap 重传，自愈）。
+            _upload_errs = getattr(self, "_upload_error_rels", None) or []
+            if ok and _upload_errs:
+                _det = [e for e in _upload_errs
+                        if any(m in e for m in ("本地文件不存在", "越界路径"))]
+                if _det:
+                    logger.warning(
+                        "[L1] 上传确定性失败(%d/%d：声明文件本地不存在/越界)但沙箱 pipeline "
+                        "判过 → 判 FAIL 走失败阶梯（重试不可自愈，绝不当 transient 空转）",
+                        len(_det), len(_upload_errs),
+                    )
+                    details["deterministic_gate"] = "fail"
+                    details["reason"] = "upload_deterministic_missing"
+                    details["upload_deterministic_errors"] = _det[:10]
+                    return False, details
+                logger.warning(
+                    "[L1] 上传不完整(errors=%d)但沙箱 pipeline 判过 → "
+                    "拒绝判 PASS(降 BLOCKED 重试)，防缺输入假绿",
+                    len(_upload_errs),
+                )
+                details["deterministic_gate"] = "skipped: upload incomplete"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                details["upload_errors"] = len(_upload_errs)
                 return None, details
             details["deterministic_gate"] = "pass" if ok else "fail"
             # T2 观测（silent-hunter #6）：pull-back 三方基线闸还原过的基线共享锚篡改

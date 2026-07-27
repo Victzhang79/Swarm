@@ -227,6 +227,10 @@ class WorkerExecutor(
         # 不完整。_deterministic_l1_gate 据此禁止在 pull-back 不完整时判 True（防沙箱绿本地缺）。
         self._sync_skipped_count: int = 0
         self._sync_error_rels: list[str] = []
+        # C7（19号文）：上传侧对称账——bootstrap 精准上传逐文件 errors 此前只打日志继续跑，
+        # agent 在缺文件沙箱里从零重写 → pull-back 覆盖本地原内容 → 整文件替换假绿进 merge。
+        # 入账后 L1 闸门 fail-closed 消费（与 pull-back 侧 A3 同型，降 BLOCKED 重试自愈）。
+        self._upload_error_rels: list[str] = []
         # D30：最近一次 pull-back 因超过 MAX_SYNC_FILE_SIZE 被【确定性】skip 的文件。与上面
         # transient 信号分账——重试不可恢复，L1 闸门对它判确定性失败（走失败阶梯），
         # 绝不当 BLOCKED transient 无限重试（旧行为：package-lock.json >1MiB 永久活锁）。

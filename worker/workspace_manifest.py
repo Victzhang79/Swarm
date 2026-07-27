@@ -151,10 +151,13 @@ def _reconcile_maven(root: Path, hint: list[str]) -> tuple[list[str], dict[str, 
         text = _read(pom)
         if text is None:
             continue
-        mblock = re.search(r"<modules>(.*?)</modules>", text, re.S)
-        if not mblock:
+        # C8（19号文）：add 侧复用 _pom_modules_span（F2-3 只治了 prune 侧）——全文首匹配
+        # 在 <profiles> 先于主 <modules> 时会把新模块注册进 profile 块，默认构建缺模块。
+        span = _pom_modules_span(text)
+        if span is None:
             continue
-        registered = set(re.findall(r"<module>\s*([^<\s]+)\s*</module>", mblock.group(1)))
+        mblock_inner = text[span[0]:span[1]]
+        registered = set(re.findall(r"<module>\s*([^<\s]+)\s*</module>", mblock_inner))
         new_members: list[str] = []
         for child in _safe_subdirs(agg):
             name = child.name
@@ -172,7 +175,9 @@ def _reconcile_maven(root: Path, hint: list[str]) -> tuple[list[str], dict[str, 
         if not new_members:
             continue
         insert = "".join(f"        <module>{m}</module>\n" for m in new_members)
-        new_text = text.replace("</modules>", insert + "    </modules>", 1)
+        # 插入点同样锚定 span 内的 </modules>（不可全文 replace 首命中——理由同 C8 上注）。
+        close_idx = text.rindex("</modules>", span[0], span[1])
+        new_text = text[:close_idx] + insert + "    " + text[close_idx:]
         try:
             pom.write_text(new_text, encoding="utf-8")
         except OSError:
@@ -494,7 +499,8 @@ def _reconcile_dotnet_sln(root: Path, hint: list[str]) -> tuple[list[str], dict[
 
     GUID 由项目相对路径确定性派生(uuid5)——可复现、幂等。格式异常/无 Global 段一律跳过。
     """
-    slns = [p for p in root.glob("*.sln") if p.is_file()]
+    # C15（19号文）：glob 顺序不定 → 多 .sln 时排序取首（确定性，可复现）。
+    slns = sorted(p for p in root.glob("*.sln") if p.is_file())
     if not slns:
         return [], {}
     sln = slns[0]
@@ -678,9 +684,28 @@ def manifest_member_probes(rel_path: str, text: str) -> list[tuple[str, str]]:
                 if "*" not in e:  # glob 成员自愈，不碰
                     out.append((e, e.rstrip("/")))
     elif name == "go.work":
-        for m in re.finditer(r"use\s+(?:\(\s*)?\.?/?([^\s()]+)", text):
-            tok = m.group(1)
-            out.append((tok, tok.strip("/")))
+        # W-1（21号文）：块形式逐行解析（与 C4 add 侧同思路）——旧正则 `use\s+(?:\(\s*)?...`
+        # 对 `use ( ... )` 块只捕首成员，第 2+ 成员永远不进 probes → 幽灵成员永远摘不掉
+        # → go build 对幽灵 use 硬错 → 修复轮空转。
+        # hunter F6：先剥 `//` 行注释再解析——注释里的字面 `use ( ./old )` 不进候选。
+        text = re.sub(r"(?m)//[^\n]*", "", text)
+
+        def _norm_use(entry: str) -> str:
+            e = entry.split("//", 1)[0].strip().strip('"')
+            if e.startswith("./"):
+                e = e[2:]
+            return e.strip("/")
+
+        for blk in re.finditer(r"use\s*\((.*?)\)", text, re.S):
+            for line in blk.group(1).splitlines():
+                e = _norm_use(line)
+                if e:
+                    out.append((e, e))
+        block_free = re.sub(r"use\s*\(.*?\)", "", text, flags=re.S)
+        for m in re.finditer(r"(?m)^\s*use\s+([^\s()]+)", block_free):
+            e = _norm_use(m.group(1))
+            if e:
+                out.append((e, e))
     return out
 
 
@@ -726,8 +751,21 @@ def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str
                 pat = re.compile(r"[ \t]*['\"]" + re.escape(tok) + r"['\"]\s*,?[ \t]*\r?\n?")
                 new_text, n = _sub_in_span(new_text, marr.span(1), pat)
         elif name == "go.work":
-            pat = re.compile(r"(?m)^[ \t]*use[ \t]+\.?/?" + re.escape(tok) + r"[ \t]*$\n?")
-            new_text, n = pat.subn("", new_text, count=1)
+            # W-1（21号文）：先块内裸行删（`use ( ... )` 块是 go work use 默认产物，删除
+            # 正则必须落在块 span 内匹配无 use 前缀的裸行——旧正则要求行首带 use，块内
+            # 裸行永不命中 hits=0），再单行形式删。删除限定块 span（F2 同纪律）。
+            for m in re.finditer(r"use\s*\((.*?)\)", new_text, re.S):
+                pat = re.compile(
+                    r"(?m)^[ \t]*\.?/?" + re.escape(tok) + r"[ \t]*(?://[^\n]*)?[ \t]*\r?\n?")
+                new_text, n = _sub_in_span(new_text, m.span(1), pat)
+                if n:
+                    break
+            if not n:
+                pat = re.compile(r"(?m)^[ \t]*use[ \t]+\.?/?" + re.escape(tok) + r"[ \t]*$\n?")
+                new_text, n = pat.subn("", new_text, count=1)
+            # 摘空的 `use ( )` 残块整体移除（go.work 解析器对空块报错风险，防御性清理；
+            # \s 含换行，跨行空块同匹配；行首锚定防误删 // 注释里的字面 "use ()"）
+            new_text = re.sub(r"(?m)^[ \t]*use\s*\(\s*\)\r?\n?", "", new_text)
         if n and tok not in removed:
             removed.append(tok)
     return new_text, removed
@@ -1120,6 +1158,26 @@ def strip_worker_manifest_contribs(
         # 逐块扫 local，删除命中 (ga,region) 的块（span 递减序删，避免位移失效）
         hits = [(m.span(), (ga, r)) for m, ga, r in _iter_dep_blocks_with_span(new_text)
                 if (ga, r) in add_set]
+        removed_external: list[str] = []
+        # C9（19号文）：内部/外部依赖分账——内部模块依赖（g=工程自身 groupId 或 a=模块名）
+        # 被摘后 reconcile add 会确定性补回；外部依赖无任何补回路径，若并行兄弟加了同一
+        # (g,a,region)，此处连带把兄弟那份也摘了 → 本地共享树蒸发 → 下游 bootstrap 缺包
+        # BLOCKED 级联（R48c 同型）。三方文本无法区分"本 worker 贡献"与"兄弟同加"（诚实
+        # 边界），至少碰撞面（外部依赖被摘）打 WARNING 可观测。
+        # reviewer F-3：工程 groupId 提取——子模块 pom 自身不声明 groupId（parent 继承），
+        # 剥掉 parent 后首个 <groupId> 会落在某个 dependency 里（随机外部 group，双向误分类）。
+        # 正确口径：先取 project 直属（<dependencies> 等段之前的 region），取不到回退
+        # parent 块内的 groupId（子模块的有效工程 group）。
+        _head_wo_parent = re.sub(r"<parent>.*?</parent>", "", head_text, flags=re.S)
+        _head_region = re.split(
+            r"<(?:dependencies|dependencyManagement|build|properties|profiles)\b",
+            _head_wo_parent, maxsplit=1)[0]
+        _pg = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", _head_region)
+        if not _pg:
+            _pm = re.search(r"<parent>(.*?)</parent>", head_text, re.S)
+            _pg = (re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", _pm.group(1))
+                   if _pm else None)
+        head_project_group = _pg.group(1) if _pg else None
         for (s0, e0), _key in sorted(hits, key=lambda x: -x[0][0]):
             # 连同尾随换行/前导缩进一起删
             line_start = new_text.rfind("\n", 0, s0) + 1
@@ -1129,6 +1187,15 @@ def strip_worker_manifest_contribs(
                 e0 += 1
             new_text = new_text[:s0] + new_text[e0:]
             removed += 1
+            _g, _a = _key[0]
+            if _g != head_project_group and _a not in head_mods:
+                removed_external.append(f"{_g}:{_a}({_key[1]})")
+        if removed_external:
+            logger.warning(
+                "[workspace-manifest] C9 H2 摘除命中外部依赖 %s（reconcile add 只补内部模块，"
+                "外部依赖无确定性补回路径；若并行兄弟加了同坐标依赖已被连带摘除，"
+                "下游缺包需重跑兄弟子任务自愈）: %s",
+                rel_path, ", ".join(sorted(removed_external)))
         for m in added_mods:
             span = _pom_modules_span(new_text)
             if not span:
