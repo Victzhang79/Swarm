@@ -55,6 +55,27 @@ _SIGNAL_PATTERNS = [
 _SIGNAL_RE = re.compile("|".join(f"(?:{p})" for p in _SIGNAL_PATTERNS))
 
 
+def extract_error_lines(text: str, *, max_lines: int = 60) -> list[str]:
+    """从原始工具输出抽取【错误信号行】（未压缩、去重、排序、定长上限）——机读键。
+
+    A4（19_worker_flow_audit）：失败签名/no-progress 比对必须吃【未压缩】错误行集——
+    compress_tool_output 的省略区间（`... [省略 N 行] ...`）会把"本轮真实修掉了若干错"
+    的差异藏进占位符，导致收敛中的修复被误判同签名早停。本函数与压缩展示【分账】：
+    签名/比对消费本机读键，人读展示继续用 compress_tool_output。
+    排序输出保证行序抖动不改变集合语义；max_lines 定长防巨输出撑爆 details。
+    诚实边界（复核 L-1）：超巨错误集（>max_lines 信号行）下截断，排序靠后的真实进展
+    可能对签名不可见 → 假同签名早停。方向保守（早停交 brain 退避，非放行），可接受。
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    for ln in text.splitlines():
+        s = ln.rstrip()
+        if s and _SIGNAL_RE.search(s):
+            seen.add(s)
+    return sorted(seen)[:max_lines]
+
+
 def compress_tool_output(
     text: str,
     *,

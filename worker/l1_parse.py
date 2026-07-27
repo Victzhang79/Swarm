@@ -72,12 +72,17 @@ _MISSING_SYMBOL_CLASS_RE = re.compile(
 
 def parse_missing_symbol_classes(build_output: str) -> list[tuple[str, str]]:
     """从编译输出解析 (缺失类名 C, 其声明包 P) 对——「cannot find symbol: class C /
-    location: package P」形态（包在树里、类未建出）。去重保序。纯函数、可单测。"""
+    location: package P」形态（包在树里、类未建出）。去重保序。纯函数、可单测。
+
+    A5（19_worker_flow_audit）：入口先剥 ANSI——Maven 并行构建(-T)/带色输出会把颜色
+    转义插进三行组里让正则静默失配（与 _attempt_symbol_repair 的剥 ANSI 用法同源）。
+    """
     if not build_output:
         return []
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", build_output)
     seen: set[tuple[str, str]] = set()
     out: list[tuple[str, str]] = []
-    for m in _MISSING_SYMBOL_CLASS_RE.finditer(build_output):
+    for m in _MISSING_SYMBOL_CLASS_RE.finditer(clean):
         key = (m.group(1), m.group(2))
         if key not in seen:
             seen.add(key)

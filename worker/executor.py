@@ -283,7 +283,13 @@ class WorkerExecutor(
             try:
                 scope.create_files = still_create
                 scope.writable = writable
-            except Exception:  # noqa: BLE001
+            except Exception as _scope_exc:  # noqa: BLE001
+                # A9（19_worker_flow_audit）：降级路径至少打一次 WARNING——scope 未来改
+                # frozen model 时静默 return 会让已存在文件仍走 create"新建"路径被整文件
+                # 覆写丢失，且日志零线索。
+                self._log(
+                    f"scope 归一化失败（放弃降级，不阻断）: {_scope_exc!r}",
+                    level="warning")
                 return  # scope 不可变则放弃（不阻断）
             self._log(f"scope 归一化：{len(moved)} 个已存在文件从 create_files 降级为 writable: {moved[:5]}")
 
@@ -305,8 +311,10 @@ class WorkerExecutor(
             # 误伤 latest_/contest_/greatest_ 等普通文件 → 被剔出 writable/create 无权写 →
             # 交付静默不完整；且与 brain 口径分叉。worker 已有多处 lazy import brain 先例
             # （stack_detect/planning_nodes），同进程运行时 brain 必已加载，无环无额外开销。
-            from swarm.brain.nodes.shared import _is_test_file_path as _is_test_path
+            # A7（19_worker_flow_audit）：import 挪进 try——brain 模块不可导入（worker 独立
+            # 进程/循环 import 抖动）时 fail-open 跳过剔除，绝不炸 __init__/归一化，留 WARNING。
             try:
+                from swarm.brain.nodes.shared import _is_test_file_path as _is_test_path
                 w2 = [f for f in (getattr(scope, "writable", []) or []) if not _is_test_path(f)]
                 c2 = [f for f in (getattr(scope, "create_files", []) or []) if not _is_test_path(f)]
                 removed = (len(getattr(scope, "writable", []) or []) - len(w2)) + \
@@ -316,8 +324,10 @@ class WorkerExecutor(
                     scope.writable = w2
                     scope.create_files = c2
                     self._log(f"scope 兜底：任务未要求测试，剔除 {removed} 个测试文件（防 Brain 擅自塞测试）")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _tp_exc:  # noqa: BLE001
+                self._log(
+                    f"scope 测试文件剔除失败（fail-open 跳过，不阻断）: {_tp_exc!r}",
+                    level="warning")
 
     def _log(self, message: str, level: str = "info") -> None:
         """记录执行日志。
@@ -741,6 +751,8 @@ class WorkerExecutor(
         l1_passed = False
         l1_details: dict = {}
         verdict = L1Verdict(passed=None, source="init", reason="未执行验证")
+        # A10（19_worker_flow_audit）：refusal 连续轮计数（专属早停，见循环内判点）。
+        _refusal_streak = 0
 
         if True:
             for fix_round in range(self.max_fix_rounds + 1):
@@ -799,6 +811,9 @@ class WorkerExecutor(
                     # R65D-W3②：去冤案措辞（round65d st-26：worker 产物本合规，败于
                     # H1 覆写后旧考卷——"幻觉"定性会误导复盘）+ ①必带机读 reason
                     self._log(_det_conflict_log_line({**l1_details, **verdict.details}))
+                # A10：refusal 连续轮计数（与上面 elif 链正交，拒答轮 +1、其余清零）
+                _refusal_streak = (_refusal_streak + 1
+                                   if verdict.source == "refusal_hard_fail" else 0)
 
                 self._log(
                     f"L1 验证结果: {'通过 ✅' if l1_passed else '未通过 ❌'} "
@@ -821,6 +836,18 @@ class WorkerExecutor(
                 # 同时这是 TD2606-B6「fix 循环无 no-progress 检测」开的第一刀。
                 if verdict.source == "verification_not_run":
                     self._log("L1 验证未能执行(BLOCKED)，提前结束 fix 循环，转交 brain 退避重试")
+                    break
+
+                # A10（19_worker_flow_audit）：refusal 专属早停——det_ok=None 形态下 verify
+                # agent 每轮拒答时 source=refusal_hard_fail（非 verification_not_run，走不到
+                # 上面的 break），且 _failure_signature 因无 build_output 恒空（同签名早停也
+                # 走不到）→ 旧逻辑无任何早停，烧满 fix 轮（每轮 verify+fix 两次 agent 调用）
+                # 直到 60% 时间 bail。拒答也是稳定"签名"：连续 2 轮即早停交 brain（升档/
+                # 退避由其裁决），不再每轮白烧两次 agent 调用。
+                if _refusal_streak >= 2:
+                    self._log(
+                        "verify 连续 2 轮拒答/截断 → 提前结束 fix 循环交 brain 裁决（A10，"
+                        "不烧满修复轮等时间 bail）")
                     break
 
                 # P1-D（TD2606-B6 第二刀）：no-progress 早停——确定性闸门连轮吐【完全相同的
@@ -1019,8 +1046,30 @@ class WorkerExecutor(
                     self._log(f"DEBUG L1: 执行 failing_test_command 验证修复: {failing_cmd}")
                     debug_l1_ok, debug_l1_detail = self._run_failing_test_gate(failing_cmd)
                     l1_details["debug_failing_test_command"] = failing_cmd
-                    l1_details["debug_failing_test_passed"] = debug_l1_ok
                     l1_details["debug_failing_test_detail"] = debug_l1_detail
+                    l1_details["debug_failing_test_passed"] = debug_l1_ok
+                if failing_cmd and debug_l1_ok is None:
+                    # A2（21_full_sweep）：GREEN 侧基础设施故障（沙箱超时 124/黑名单 126/
+                    # _is_infra_failure 命中）不冒充"未修复"——否则 brain 按 capability
+                    # 阶梯换模型重试同一份本已正确的修复。与 RED 侧（124/126→None 不计
+                    # 红证）及 L1.2.1/L1.3 的 infra BLOCKED 分类同口径：标 transient 交
+                    # brain 退避重试（耗尽才硬 FAIL），不错换模型。
+                    # ★复核 C-1★：None=未知≠通过——l1_passed 必须同步置 False（brain 成功
+                    # 计账只看 l1_passed，成功路径无 pipeline_blocked 复检；保留 True=
+                    # 未验证的"修复"静默交付，比治前更糟）。brain 失败路径读到
+                    # pipeline_blocked → 非 model-fixable → transient 退避，正是本分支语义。
+                    l1_passed = False
+                    l1_details["pipeline_blocked"] = "failing_test_infra_failure"
+                    l1_details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    l1_details["failure_class"] = "transient"
+                    self._log(
+                        "DEBUG L1: failing_test_command 命中基础设施故障（非 capability 失败）"
+                        f"→ 标 BLOCKED/transient 退避重试 | {debug_l1_detail}"
+                    )
+                    output = output.model_copy(
+                        update={"l1_passed": l1_passed, "l1_details": l1_details}
+                    )
+                elif failing_cmd:
                     # T3·红绿闸（ECC §C）：并入编码前基线 RED 三态证据，综合裁决"无红不算绿"。
                     _red_ec = getattr(self, "_tdd_red_exit_code", None)
                     l1_details["tdd_red_exit_code"] = _red_ec
@@ -1165,10 +1214,42 @@ class WorkerExecutor(
             l1_details["raw_refusal"] = combined[:200]
             self._log("trivial: agent 回复为拒答/截断标记，硬否决 L1（产出不可信，覆盖确定性闸门）")
             self.phase = WorkerPhase.PRODUCING
-            await self._sync_from_sandbox("产出")
-            produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
-            # D53：git diff 子进程 + flock 卸线程
-            output = await asyncio.to_thread(self._parse_produce_result, produce_result, False, l1_details)
+            # A6（19_worker_flow_audit）：refusal 分支的 sync/produce 必须享受与修复轮
+            # （R65TR-T2）同款的【保首轮判决】保护——produce agent 再拒答/沙箱抖动抛异常
+            # 时，若冒泡进 run() 的 except，exception_l1_details 会覆盖成通用异常（丢
+            # l1_decision_source=refusal_hard_fail → brain FINDING-12 force_strong 升档
+            # 信号丢失，退化成普通 transient 退避=同弱模型重试，雪上加霜）。异常=保底
+            # 返回带 refusal 标记的 WorkerOutput。
+            try:
+                await self._sync_from_sandbox("产出")
+                produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
+                # D53：git diff 子进程 + flock 卸线程
+                output = await asyncio.to_thread(self._parse_produce_result, produce_result, False, l1_details)
+            except Exception as _prod_exc:  # noqa: BLE001
+                self._log(
+                    "trivial: refusal 判死后产出步异常（保 refusal_hard_fail 判决不劣化成"
+                    f"执行异常）: {_prod_exc}")
+                # 复核 M-3：sync 已把部分产出 pull-back 到本地树时，保底 output 不得用
+                # diff="" 丢弃——抢救可算的 diff（H2 不变量：重试上下文不丢工作，
+                # force_strong 升档重派拿得到前轮部分产出）。异常源若是 diff 计算本身
+                # 则自然落 ""。
+                try:
+                    _rescued_diff = self._get_git_diff() or ""
+                except Exception:  # noqa: BLE001
+                    _rescued_diff = ""
+                # 复核 R2 LOW：_get_git_diff 无变更时返回哨兵 "(无变更)"（executor_sync
+                # 既定口径），抢救语义应归一为空——哨兵串不得当 diff 落进 WorkerOutput。
+                if _rescued_diff.strip() == "(无变更)":
+                    _rescued_diff = ""
+                output = self._make_output(
+                    diff=_rescued_diff,
+                    summary=(
+                        "模型拒答/截断已硬否决 L1；产出步再遇异常（"
+                        f"{str(_prod_exc)[:120]}）——保 refusal_hard_fail 判决交 brain 升档裁决"),
+                    confidence=Confidence.LOW,
+                    l1_passed=False,
+                    l1_details=l1_details,
+                )
             self.phase = WorkerPhase.DONE
             self._l1_passed_flag = False
             self._log(f"trivial 快速路径完成（拒答否决），置信度: {output.confidence.value}")

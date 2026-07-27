@@ -199,8 +199,12 @@ def test_failing_test_gate_graceful_on_exception():
     print("  ✅ _run_failing_test_gate: 执行异常 → 保守失败 False (M1)")
 
 
-def test_failing_test_gate_timeout_returns_false():
-    """命令超时 → 返回 False。"""
+def test_failing_test_gate_timeout_returns_unknown():
+    """命令超时 → 返回 None（A2：infra 三态未知，不冒充"未修复"capability 失败）。
+
+    A2（21_full_sweep）治本前：超时 124 被当 capability fail → brain 换模型重试本已正确的
+    修复。治本后与 RED 侧（124/126→None 不计红证）及 L1.2.1/L1.3 infra 分类同口径。
+    """
     from swarm.worker.executor import WorkerExecutor
 
     subtask = _make_subtask(
@@ -215,9 +219,9 @@ def test_failing_test_gate_timeout_returns_false():
     ):
         ok, detail = executor._run_failing_test_gate("python -m pytest test_bug.py -q")
 
-    assert ok is False, f"超时应返回 False，实际: {ok}"
-    assert "timeout" in detail.lower()
-    print("  ✅ _run_failing_test_gate: 超时 → False")
+    assert ok is None, f"超时应返回 None（infra 未知，A2），实际: {ok}"
+    assert "timeout" in detail.lower(), "detail 必须可诊断（含 timeout 字样）"
+    print("  ✅ _run_failing_test_gate: 超时 → None（A2 infra 三态）")
 
 
 def test_main() -> int:
@@ -231,7 +235,7 @@ def test_main() -> int:
         test_failing_test_gate_passes_when_cmd_succeeds,
         test_failing_test_gate_fails_when_cmd_fails,
         test_failing_test_gate_graceful_on_exception,
-        test_failing_test_gate_timeout_returns_false,
+        test_failing_test_gate_timeout_returns_unknown,
     ]
     passed = failed = 0
     for t in tests:

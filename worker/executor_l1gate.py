@@ -23,9 +23,21 @@ import re
 from pathlib import Path
 
 from swarm.types import Confidence, NotRunKind, WorkerOutput
-from swarm.worker.l1_verdict import _is_refusal_or_truncated
+from swarm.worker.l1_verdict import _FAIL_WORD_RE, _is_refusal_or_truncated
 
 logger = logging.getLogger(__name__)
+
+# A8：弱自报判定的【否定形态】剥离——"no errors found"/"0 failures"/"0 failed"/
+# "without errors" 中的 errors/failures/failed 是【通过】语义，剥掉后再过 _FAIL_WORD_RE，
+# 防误读为 fail。只覆盖"数量词/否定词+失败名词"的确定性形态，不泛化（复杂否定句法交
+# LLM 自报标记）。
+_NEGATED_FAIL_RE = re.compile(
+    r"\b(?:no|without|zero|0)\s+(?:errors?|failures?|fails?|failed|problems?|issues?)\b")
+
+# A8（复核 M-1）：CJK 邻接容忍——Python re 的 \b 在 Unicode 下把 CJK 字算 \w，"有error"/
+# "编译fail" 这类中英混排自报的英文失败词无左词边界会失配（旧裸子串能命中）。本正则
+# 只要求【右】词边界，兜底 CJK 邻接形态；"errorcode"/"failover" 这类右无边界串仍不命中。
+_CJK_ADJ_FAIL_RE = re.compile(r"(?:fails?|failed|failures?|errors?|errored)\b")
 
 
 class _L1GateMixin:
@@ -62,11 +74,18 @@ class _L1GateMixin:
         if m:
             passed = m.group(1).upper() == "PASS"
         else:
-            # 无显式标记时保守判定：出现明确失败信号即视为未通过
+            # 无显式标记时保守判定：出现明确失败信号即视为未通过。
+            # A8（19_worker_flow_audit）：英文失败词与 l1_verdict 共用 _FAIL_WORD_RE 词边界
+            # 正则（单一事实源）——裸子串会把 "errorcode" 之类误读为 fail；另剥【否定形态】
+            # （"no errors found"/"0 failures"/"without errors"——词边界正则仍命中其中的
+            # errors/failures，弱自报被误读为 fail 会白烧一轮修复）。CJK 关键词/emoji 无词界
+            # 问题，保持子串。
             low = text.lower()
-            has_fail = any(
-                kw in low
-                for kw in ("fail", "失败", "未通过", "error", "错误", "❌")
+            low = _NEGATED_FAIL_RE.sub(" ", low)
+            has_fail = (
+                bool(_FAIL_WORD_RE.search(low))
+                or bool(_CJK_ADJ_FAIL_RE.search(low))  # 复核 M-1：CJK 邻接英文失败词
+                or any(kw in low for kw in ("失败", "未通过", "错误", "❌"))
             )
             has_pass = any(
                 kw in low for kw in ("pass", "通过", "成功", "✅")
@@ -87,14 +106,29 @@ class _L1GateMixin:
 
         取 build/test/compile 输出里的错误行，剥掉行列号/绝对路径/ANSI（这些每轮可能抖动但
         不代表进展），对【去重排序后的错误行集合】求 hash。整组错误一字不变 → 同签名 → 无进展。
+
+        A4（19_worker_flow_audit）：优先吃【未压缩】机读键 build_error_lines/test_error_lines
+        ——压缩展示的省略区间（`... [省略 N 行] ...`）会把"本轮修掉了省略区内的若干错"藏掉，
+        导致收敛中的修复被误判同签名早停；机读键与人读展示分账后签名反映真错误集合。
+        机读键缺省（旧调用方/老 checkpoint）→ 回退展示键并剥占位行数字，行为不回归。
         """
         if not isinstance(l1_details, dict):
             return ""
         import hashlib
-        blob = "\n".join(
-            str(l1_details.get(k) or "")
-            for k in ("build_output", "test_output", "compile_message", "reason", "build_failed")
-        )
+        machine: list[str] = []
+        for k in ("build_error_lines", "test_error_lines"):
+            v = l1_details.get(k)
+            if isinstance(v, (list, tuple)):
+                machine.extend(str(x) for x in v if str(x).strip())
+        if machine:
+            blob = "\n".join(machine)
+        else:
+            blob = "\n".join(
+                str(l1_details.get(k) or "")
+                for k in ("build_output", "test_output", "compile_message", "reason", "build_failed")
+            )
+            # 展示键兜底路径：剥压缩占位行（省略行数/字符数每轮抖动会产生假异签名）。
+            blob = re.sub(r"\[[^]]*省略[^]]*\]", "[省略]", blob)
         if not blob.strip():
             return ""
         t = re.sub(r"\x1b\[[0-9;]*m", "", blob)                       # 去 ANSI
@@ -588,12 +622,13 @@ class _L1GateMixin:
             return (False, "red_not_proven_failclosed") if strict else (True, "red_not_proven_observed")
         return True, ("green_after_red" if red_exit_code is not None else "green_red_unknown")
 
-    def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool, str]:
+    def _run_failing_test_gate(self, failing_cmd: str) -> tuple[bool | None, str]:
         """DEBUG 意图专属 L1 闸门：确定性执行 failing_test_command，验证修复后该命令通过。
 
         复用 l1_pipeline 的 _normalize_python_cmd + subprocess 机制，
         与现有 L1 确定性验证共享同样的执行模型（local / sandbox 均可）。
-        返回 (bool, detail_str)：True=命令通过(bug 已修复)，False=命令仍失败。
+        返回 (bool|None, detail_str)：True=命令通过(bug 已修复)，False=命令仍失败，
+        None=基础设施故障无法裁决（超时 124/黑名单 126/_is_infra_failure 命中）。
 
         优雅降级：异常时返回 False（保守失败，M1 修复）——执行环境失败
         不能误判为 bug 已修复，宁可判未通过让其重试/人工复核。
@@ -601,18 +636,33 @@ class _L1GateMixin:
         # TD2606-C2：走 sandbox-first 的 _run_l1_command（与 L1 确定性闸门同执行模型）。
         # 原实现裸 local subprocess，在非 Python 栈(本地无 mvn/go/cargo 工具链)必 except →
         # DEBUG 意图任务的闸门【永远】保守失败、无法验证修复。沙箱可用即在沙箱跑、否则回退本地。
-        from swarm.worker.l1_pipeline import _run_l1_command
+        from swarm.worker.l1_pipeline import _is_infra_failure, _run_l1_command
         from swarm.worker.output_compress import compress_tool_output
 
         try:
             ec, out = _run_l1_command(failing_cmd, self.project_path, timeout=120)
-            ok = ec == 0
-            detail = f"exit_code={ec}, output={compress_tool_output(out or '', max_chars=800)}"
-            return ok, detail
         except Exception as exc:  # noqa: BLE001
             # M1：执行环境异常 → 保守判失败（不能把"验证不了"当"已修复"放过未修坏代码）。
             self._log(f"DEBUG L1: failing_test_command 执行异常，保守判未通过: {exc}")
             return False, f"execution error (conservative fail): {exc}"
+        # A2（21_full_sweep）：基础设施失败三态 None——与 RED 侧（124/126→None 不计红证）
+        # 及 L1.2.1 build/L1.3 test 闸的 infra 分类同口径。沙箱抖动/命令层超时/黑名单拦截
+        # 不是"修复无效"的 capability 证据：判 False 会让 brain 换模型重试一份本已正确的
+        # 修复（烧配额）。诚实边界：真 hang-bug 未修时 GREEN 同样 124——会被归 transient
+        # 退避重试直至耗尽转硬失败（失败方向=慢失败而非错换模型，可观测且不毁产物）。
+        if ec in (124, 126) or _is_infra_failure(out):
+            detail = (
+                f"infra/timeout (non-capability, not counted as green), raw exit={ec}, "
+                f"output={compress_tool_output(out or '', max_chars=800)}"
+            )
+            self._log(
+                f"DEBUG L1: failing_test_command 疑似基础设施失败/超时(exit={ec})，"
+                "三态置 None 不冒充'未修复'"
+            )
+            return None, detail
+        ok = ec == 0
+        detail = f"exit_code={ec}, output={compress_tool_output(out or '', max_chars=800)}"
+        return ok, detail
 
     def _parse_produce_result(
         self,

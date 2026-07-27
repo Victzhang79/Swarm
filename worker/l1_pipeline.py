@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from swarm.project.diff_apply import files_from_unified_diff
 from swarm.types import FileScope, NotRunKind, SubTask
 from swarm.worker.cmd_normalize import normalize_python_cmd
-from swarm.worker.output_compress import compress_tool_output
+from swarm.worker.output_compress import compress_tool_output, extract_error_lines
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -3894,7 +3894,10 @@ def _owning_module_dir(project_path: str, rel: str) -> str:
 # 文件的错"标 BLOCKED 交文件 owner 去修（owner 在自己的全量闸门会抓到，见根因#1），不连坐。
 _POM_ERR_MODULE_RE = re.compile(r"The project [\w.\-]+:([\w.\-]+):")
 _COMPILE_ERR_PATH_RE = re.compile(r"(?:^|[ /])([A-Za-z0-9_.\-]+)/src/(?:main|test)/")
-_ERR_FILE_RE = re.compile(r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala|go|rs|ts|tsx|js|vue|xml))")
+# A3（19号文）：补 py——Python 整树测试形态（pytest FAILED 行/traceback `File "x.py"`）的
+# 报错文件抽取同样走本通道做 scope 归属；对 JVM/Go 等栈纯增量（构建输出提及 .py 才抽取），
+# 裸文件名噪声仍由 _build_error_files 的「必须含 /」过滤拦住。
+_ERR_FILE_RE = re.compile(r"([A-Za-z0-9_./\-]+\.(?:java|kt|scala|go|rs|ts|tsx|js|vue|xml|py))")
 
 
 def _pl_modules_from_cmd(build_cmd: str) -> set[str]:
@@ -3926,13 +3929,45 @@ def _norm_src_path(p: str) -> str:
 
 
 def _build_error_files(build_output: str) -> set[str]:
-    """从构建输出抽【报错的源文件】(归一化模块相对路径)。"""
+    """从构建输出抽【报错的源文件】(归一化模块相对路径)。
+
+    ★复核 R3-1（hunter R3 实跑复现）★：先剔除项目外帧——traceback 深入第三方库/
+    标准库（requests/pandas 等库密集项目常态，异常在库内爆发）时，库路径帧无 plan
+    内 owner 可交，留着既把「自己的坏参数/坏数据在库内爆」误启成 upstream 归属阶梯
+    甩锅（L1.3 A3：非测试源码帧触发），又污染 blocked_on_files 噪声。L1.2.1 build
+    闸同享本函数，编译错名义文件皆工程文件，剔除无害。栈中立：只认安装目录段，
+    不写死语言。
+    """
     out: set[str] = set()
     for m in _ERR_FILE_RE.finditer(build_output or ""):
         f = _norm_src_path(m.group(1))
         if "/" in f or f.endswith("pom.xml"):  # 过滤裸文件名噪声，保留真实路径
-            out.add(f)
+            if not _is_external_frame(f):  # R3-1：项目外帧不参与归属判定
+                out.add(f)
     return out
+
+
+# A3 复核 R3-1（hunter 实跑复现）：第三方/标准库 traceback 帧的已知依赖安装目录段
+# （栈中立清单）。库文件无 plan 内 owner——不是"兄弟产物源码"，留着既误启 upstream
+# 归属阶梯甩锅（自己的坏参数在库内爆发=库密集项目常态），又污染 blocked_on_files 噪声。
+_EXTERNAL_FRAME_SEGS = ("site-packages", "dist-packages", "node_modules")
+
+
+def _is_external_frame(rel: str) -> bool:
+    """报错路径是否为【项目外】第三方/标准库文件（依赖安装目录/系统库路径）。"""
+    r = str(rel or "").replace("\\", "/").lstrip("./").lower()
+    if not r:
+        return False
+    parts = r.split("/")
+    if any(seg in parts for seg in _EXTERNAL_FRAME_SEGS):
+        return True
+    return (
+        r.startswith(("usr/lib/", "usr/local/lib/"))
+        or "go/pkg/mod/" in r            # Go module cache
+        or ".cargo/registry/" in r       # Rust 依赖缓存
+        or ".m2/repository" in r         # Maven 本地仓库
+        or ".gradle/caches" in r         # Gradle 依赖缓存
+    )
 
 
 _RX_MAVEN_CHILD_MODULE = re.compile(
@@ -4442,6 +4477,8 @@ def run_l1_pipeline(
         details["l1_2_1_build_ok"] = build_ok
         details["build_command"] = build_cmd
         details["build_output"] = compress_tool_output(b_out, max_chars=1500)
+        # A4：失败签名/no-progress 比对的机读键——未压缩错误行集，与人读展示分账。
+        details["build_error_lines"] = extract_error_lines(b_out)
         logger.info("[L1.2.1] 构建闸门结果: exit=%s ok=%s", b_ec, build_ok)
         if not build_ok:
             # 治本·通用：据项目自身惯例确定性修正写错的包名前缀/拼错符号后【重跑】构建确认。
@@ -4496,6 +4533,8 @@ def run_l1_pipeline(
             if repaired_paths:
                 details["l1_2_1_build_ok"] = build_ok
                 details["build_output"] = compress_tool_output(b_out, max_chars=1500)
+                # A4：rerun 后同步刷新机读键（签名吃最新错误行集，非首轮残留）。
+                details["build_error_lines"] = extract_error_lines(b_out)
                 details["import_repaired_files"] = len(repaired_paths)
                 # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
                 # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
@@ -4578,20 +4617,24 @@ def run_l1_pipeline(
                 # 消解，不烧本子任务修复轮 / 不误判 capability 换模型 / 不 escalate 清空已成功成果。
                 # 保守判据见 _build_blocked_on_unbuilt_internal（有第三方缺包/包已在树里→照常 FAIL）。
                 _blocked_pkgs = _build_blocked_on_unbuilt_internal(project_path, b_out, timeout)
-                # H-3a：包级判据未中时再试【类级】——包已在树里但类未建出（cannot find symbol:
-                # class C / location: package P）同属"生产者未落地"，统一 BLOCKED 退避口径
+                # H-3a：【类级】判据——包已在树里但类未建出（cannot find symbol: class C /
+                # location: package P）同属"生产者未落地"，统一 BLOCKED 退避口径
                 # （round67 st-50-1 hard fail vs st-48 BLOCKED 的口径分裂，64cb44ed 实锤）。
+                # A5（19_worker_flow_audit）：两判据【都跑】取证据并集——旧 `if not
+                # _blocked_pkgs` 互斥消费会在「缺内部包 P1 + 缺包在树类 P2.C」同现时静默丢掉
+                # 类级证据，brain 侧类级 futile 判据（_package_in_baseline 对该形态恒真失效）
+                # 拿不到 C → 臆造类无法判 futile → BLOCKED 阶梯烧满而非快失败。
+                _blocked_cls_pkgs = _build_blocked_on_unbuilt_internal_classes(
+                    project_path, b_out, timeout)
                 _blocked_cls: list[str] = []
-                if not _blocked_pkgs:
-                    _blocked_pkgs = _build_blocked_on_unbuilt_internal_classes(
-                        project_path, b_out, timeout)
-                    if _blocked_pkgs:
-                        # ★复核 HIGH 配套★：类级命中必须吐 blocked_on_classes（FQN 点分）——
-                        # 包级 futile 判据（_package_in_baseline）对"包在树类未建出"恒真失效，
-                        # brain 侧 _blocked_pkg_unrecoverable 需类级树判据防臆造类烧满阶梯。
-                        _blocked_cls = sorted({
-                            f"{p}.{c}" for c, p in parse_missing_symbol_classes(b_out)
-                            if p in _blocked_pkgs})
+                if _blocked_cls_pkgs:
+                    # ★复核 HIGH 配套★：类级命中必须吐 blocked_on_classes（FQN 点分）——
+                    # 包级 futile 判据（_package_in_baseline）对"包在树类未建出"恒真失效，
+                    # brain 侧 _blocked_pkg_unrecoverable 需类级树判据防臆造类烧满阶梯。
+                    _blocked_cls = sorted({
+                        f"{p}.{c}" for c, p in parse_missing_symbol_classes(b_out)
+                        if p in _blocked_cls_pkgs})
+                _blocked_pkgs = _blocked_pkgs | _blocked_cls_pkgs
                 if _blocked_pkgs:
                     details["l1_2_1_build_ok"] = None
                     details["build_blocked"] = build_cmd
@@ -4772,6 +4815,8 @@ def run_l1_pipeline(
         # 智能压缩：提取关键失败信号行（FAILED/Error/Traceback/assert），
         # 替代盲目硬截断 —— 避免丢失位于输出末尾的 pytest 失败摘要。
         details["test_output"] = compress_tool_output(t_out, max_chars=1500)
+        # A4：失败签名机读键——未压缩错误行集，与人读展示分账。
+        details["test_error_lines"] = extract_error_lines(t_out)
         if t_ec == 124:
             details["test_output"] = "test timeout"
         if not test_ok:
@@ -4782,6 +4827,60 @@ def run_l1_pipeline(
                 details["test_blocked"] = test_cmd
                 details["pipeline_blocked"] = "test_infra_failure"
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
+                return True, details
+            # A3（19_worker_flow_audit）：test 闸补 scope 归属阶梯，与 build(P0-B/R63-T8①)/
+            # lint(D33) 三闸口径统一。整树测试形态（无 harness.test_command 时 _guess_test_cmd
+            # 兜底全量）下，兄弟子任务/基线的坏测试会连坐本子任务 hard FAIL（source=test
+            # sticky 永不翻盘 → 换模型重试同死 → 阶梯烧穿）。报错文件全在写权集外 → 标 BLOCKED
+            # 交 owner 退避，不烧本子任务修复轮。判据内部 fail-open（提取不到报错文件/判定
+            # 异常 → False=不揽 upstream），只改"有正向证据全在写权外"的归类。
+            # ★复核 H-1（hunter 实跑复现）★：test 与 build 有本质因果不对称——编译错报错的
+            # 文件就是要修的文件（因果同体），测试失败报错的文件（测试文件）常常不是要修的
+            # 文件（源码才是）。纯断言失败（traceback 只有测试文件帧）时「自己的回归打破
+            # baseline 测试」与「baseline 测试本身坏」确定性不可分 → 一律归自己（fail-closed，
+            # 保住修复轮拿 test_output 修自己回归的正确归因）。仅当报错文件含【写权集外非
+            # 测试源码帧】（兄弟产物的源码）才启用归属阶梯。诚实边界：baseline 坏测试
+            # （测试文件帧独占）不再享受连坐豁免——该形态 sticky hard FAIL 照旧。
+            _up_ev_t: dict = {}
+            _t_err_files = _build_error_files(t_out)
+            try:
+                from swarm.brain.nodes.shared import _is_test_file_path as _is_test_f
+
+                # ★复核 R2-1（hunter R2 实跑复现）★：共享判据 `_is_test_file_path` 的目录
+                # 分支要求前导斜杠（"/tests/" in pl），本闸输入是归一化相对路径 → 目录分支
+                # 整体失效，tests/helpers.py、conftest.py 等测试辅助帧被误当"源码帧"，
+                # 甩锅通道经 fixture/helper 链（pytest 失败的常态组成）复活。入口归一补
+                # 前导斜杠 + conftest.py（pytest fixture 事实标准，任何层级）basename 特判。
+                # 共享函数的相对路径盲区（A7 scope 剔除同病）已登记后续批 sibling。
+                def _is_testish(f: str) -> bool:
+                    rel = str(f).replace("\\", "/").lstrip("./")
+                    return (_is_test_f("/" + rel)
+                            or rel.rsplit("/", 1)[-1] == "conftest.py")
+
+                _has_src_frame = any(not _is_testish(f) for f in _t_err_files)
+            except Exception as _it_exc:  # noqa: BLE001
+                # 判据不可用 → 不启用阶梯（fail-closed 归自己），但必须可观测
+                logger.warning("[L1.3] A3 测试文件判据导入失败（归属阶梯本轮不启用）: %r", _it_exc)
+                _has_src_frame = False
+            if (_has_src_frame
+                    and _build_error_is_upstream(t_out, test_cmd, modified,
+                                                 scope=getattr(subtask, "scope", None),
+                                                 project_path=project_path,
+                                                 evidence_out=_up_ev_t)):
+                details["l1_3_test_ok"] = None
+                details["test_blocked"] = test_cmd
+                details["pipeline_blocked"] = "upstream_module_broken"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                details["blocked_on_files"] = sorted(_t_err_files)
+                # 复核 MEDIUM：补模块粒度账——brain `_producers_of` 的 mods 通道按顶层目录段
+                # 反查生产者（只吐 blocked_on_files 时生产者链接无输入）。与 build 闸同源
+                # （_build_error_modules layout 感知）；Python 扁平布局抽不出模块 → 如实空集。
+                details["blocked_on_modules"] = sorted(_build_error_modules(t_out))
+                details["upstream_judge_channel"] = _up_ev_t.get("channel") or "unknown"
+                logger.warning(
+                    "[L1.3] A3 测试失败报错文件全在本子任务写权集外（兄弟/基线坏测试连坐）"
+                    "→ 标 BLOCKED 交 owner，不连坐本子任务: %s", (t_out or "")[:200],
+                )
                 return True, details
             return False, details
 
