@@ -640,7 +640,8 @@ def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[st
 
 
 def _attempt_maven_version_repair(
-    project_path: str, build_output: str, timeout: int
+    project_path: str, build_output: str, timeout: int,
+    evidence_out: dict | None = None,
 ) -> tuple[int, list[str]]:
     """治本·通用：pom 依赖【版本】对账——统一处理「模型手写依赖坐标不可靠」整类机械错。
 
@@ -757,6 +758,13 @@ def _attempt_maven_version_repair(
         if _phantom_internal or (_reachable and not available):
             _why = ("用工程 groupId 但非 reactor 模块（工程模块从不在远程仓库）"
                     if _phantom_internal else "仓库确证查无该 artifact 的任何版本")
+            if _phantom_internal and evidence_out is not None:
+                # R67L-B2（22号文批次2，round67l st-14 实锤）：留痕本轮判【永不可解析】的内部
+                # 模块 artifactId——它往往是 plan 声明、由别的子任务生产的内部模块，只是生产者
+                # 尚未 merge 进树（本沙箱 reactor 没有≠永远没有）。verify 阶段拿此账对账验收
+                # 断言：若考卷 grep 必考该 artifactId，则 prune↔考卷确定性自相矛盾（剪→验收挂
+                # →worker 加回→再剪，注定永败），应第一轮即判 BLOCKED 而非烧修复轮死循环。
+                evidence_out.setdefault("pruned_phantom_internal", set()).add(artifact)
             art_esc = artifact.replace(".", r"\.")
             _gc, _gout, _ge = _run_check_split(
                 f"grep -rl '<artifactId>{art_esc}</artifactId>' --include=pom.xml . 2>/dev/null",
@@ -1868,12 +1876,53 @@ def _attempt_internal_import_drift_repair(
     return len(changed), sorted(changed)
 
 
+def _missing_internal_produced_in_scope(
+    scope, blocked_pkgs: set[str], blocked_cls: list[str]
+) -> tuple[set[str], set[str]]:
+    """R67L-B2（22号文批次2 H-3a）：缺失内部包/类中【生产者在本子任务自己 scope 内】的子集。
+
+    scope 文件经 classpath_fqn_key（brain 侧 JVM 门控单一口径，非 JVM 布局返 None 不判，
+    栈中立）解出 FQN 相对路径，与缺失包/类对账：
+      - 包 P：某 scope 源码文件的包路径段 == P 的路径形 → 该包由本子任务自产；
+      - 类 C（FQN 点分）：某 scope 源码文件的 FQN 路径形（去扩展名）== C → 该类由本子任务自产。
+    命中=缺符号是【自己没建出】（capability，修复梯可治），不是【等上游生产者】。
+    返回 (own_pkgs, own_classes)，均为点分 FQN。
+    """
+    own_pkgs: set[str] = set()
+    own_cls: set[str] = set()
+    if scope is None or not (blocked_pkgs or blocked_cls):
+        return own_pkgs, own_cls
+    try:
+        from swarm.brain.contract_utils import classpath_fqn_key
+    except Exception:  # noqa: BLE001 — 口径源不可用时 fail-open 不判（维持原 BLOCKED 语义）
+        return own_pkgs, own_cls
+    files = (list(getattr(scope, "create_files", None) or [])
+             + list(getattr(scope, "writable", None) or []))
+    pkg_paths = {str(p).replace(".", "/") for p in blocked_pkgs}
+    cls_paths = {str(c).replace(".", "/") for c in blocked_cls}
+    for f in files:
+        key = classpath_fqn_key(str(f))
+        if not key:
+            continue
+        _mod, fqn_rel = key            # 形如 com/ruoyi/alarm/sender/dto/AlarmDto.java
+        if "/" not in fqn_rel:
+            continue
+        pkg_rel, fname = fqn_rel.rsplit("/", 1)
+        stem = f"{pkg_rel}/{fname.rsplit('.', 1)[0]}" if "." in fname else fqn_rel
+        if pkg_rel in pkg_paths:
+            own_pkgs.add(pkg_rel.replace("/", "."))
+        if stem in cls_paths:
+            own_cls.add(stem.replace("/", "."))
+    return own_pkgs, own_cls
+
+
 def _attempt_build_repair(
     project_path: str,
     build_output: str,
     modified: list[str],
     timeout: int,
     project_stack: dict | None = None,
+    evidence_out: dict | None = None,
 ) -> tuple[int, list[str]]:
     """跨生态确定性构建修复 dispatcher。返回 (触达文件数, 触达文件相对路径列表)。
 
@@ -1930,7 +1979,8 @@ def _attempt_build_repair(
                 logger.debug("[L1.2.1·repair] dependency-repair 异常(跳过): %s", exc)
         # Maven 依赖版本不存在（worker 凭空写错版本号）→ 校正到最近有效版本
         try:
-            _accum(_attempt_maven_version_repair(project_path, build_output, timeout))
+            _accum(_attempt_maven_version_repair(
+                project_path, build_output, timeout, evidence_out=evidence_out))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[L1.2.1·repair] Maven version-repair 异常(跳过): %s", exc)
         # #103/#114：NVFP4 伪空格标识符（`is Empty`）→ 成员调用位空格折叠（双闸防误并）。放在
@@ -4447,6 +4497,9 @@ def run_l1_pipeline(
                 "[L1.2.1] D3c 脚手架 validate 降级：%d 个源码文件本轮未经编译"
                 "（真编译由注册后的 L2 reactor compile 兜）: %s",
                 len(_src_unverified), _src_unverified[:5])
+    # R67L-B2（22号文批次2）：确定性修复轮的【剪账】——phantom-dep prune 剪掉的 plan 声明
+    # 内部模块 artifactId 集（跨收敛轮累积），供 L1.3.5 验收阶段对账考卷断言（见 verify 段）。
+    _repair_evidence: dict = {}
     if build_cmd and _build_cmd_applicable(build_cmd, project_path):
         if _deadline_blocked("build"):
             return True, details
@@ -4510,7 +4563,8 @@ def run_l1_pipeline(
                         break
                     try:
                         n_round, paths_round = _attempt_build_repair(
-                            project_path, b_out, modified, timeout, project_stack
+                            project_path, b_out, modified, timeout, project_stack,
+                            evidence_out=_repair_evidence,
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("[L1.2.1] build-repair 跳过(异常,不致命): %s", exc)
@@ -4592,25 +4646,37 @@ def run_l1_pipeline(
                                             scope=getattr(subtask, "scope", None),
                                             project_path=project_path,
                                             evidence_out=_up_ev):
-                    details["l1_2_1_build_ok"] = None
-                    details["build_blocked"] = build_cmd
-                    details["pipeline_blocked"] = "upstream_module_broken"
-                    details["not_run_kind"] = NotRunKind.BLOCKED.value
                     # 结构化吐【阻断在哪些上游模块/文件】，供 brain 反查生产者子任务：若生产者已被
                     # 永久放弃(阶梯三打桩/revert)，则本下游不可恢复，应连坐放弃而非无限 replan。
                     _pom_blocked = _unresolved_internal_module_poms(b_out, project_path)
-                    details["blocked_on_modules"] = sorted(
+                    _bom = sorted(
                         _build_error_modules(b_out)
                         | {p.rsplit("/pom.xml", 1)[0] for p in _pom_blocked})
-                    details["blocked_on_files"] = sorted(
+                    _bof = sorted(
                         _build_error_files(b_out) | _pom_blocked)
                     # 猎手 F4：判据通道留痕（scope/file_disjoint/module_fallback），复盘免捞
                     details["upstream_judge_channel"] = _up_ev.get("channel") or "unknown"
-                    logger.warning(
-                        "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
-                        "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
-                    )
-                    return True, details
+                    if not _bom and not _bof:
+                        # R67L-B2（22号文批次2）：判归上游却吐不出任何可指名模块/文件
+                        #（blocked_on 全空）=死端判词——没有可等的生产者，BLOCKED 退避只会
+                        # 烧满重试/熔断配额空转。落回 FAIL 修复梯（fail-honest），留痕可观测。
+                        details["upstream_deadend_no_evidence"] = True
+                        logger.warning(
+                            "[L1.2.1] R67L-B2 构建错判归上游但 blocked_on 全空（死端判词，"
+                            "无可等的生产者）→ 不判 BLOCKED，落 FAIL 修复梯: %s",
+                            (b_out or "")[:200])
+                    else:
+                        details["l1_2_1_build_ok"] = None
+                        details["build_blocked"] = build_cmd
+                        details["pipeline_blocked"] = "upstream_module_broken"
+                        details["not_run_kind"] = NotRunKind.BLOCKED.value
+                        details["blocked_on_modules"] = _bom
+                        details["blocked_on_files"] = _bof
+                        logger.warning(
+                            "[L1.2.1] 构建错全在上游模块(非本子任务 -pl 模块) → 标 BLOCKED 退避，"
+                            "待上游修好再编，不连坐本子任务: %s", (b_out or "")[:200],
+                        )
+                        return True, details
                 # 根因#②（996db614 实测 ~70/213）：构建缺【尚未建出的项目内部包】（别的子任务
                 # 还没产出 com.ruoyi.alarm.sender.dto 等）→ 非本子任务能力问题、本子任务也无权建
                 # 那些包。标 BLOCKED 退避，待生产者子任务落地（merge 进树）后由 transient 重试自然
@@ -4636,20 +4702,40 @@ def run_l1_pipeline(
                         if p in _blocked_cls_pkgs})
                 _blocked_pkgs = _blocked_pkgs | _blocked_cls_pkgs
                 if _blocked_pkgs:
-                    details["l1_2_1_build_ok"] = None
-                    details["build_blocked"] = build_cmd
-                    details["pipeline_blocked"] = "internal_pkg_not_built"
-                    details["not_run_kind"] = NotRunKind.BLOCKED.value
-                    # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
-                    # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
-                    details["blocked_on_packages"] = sorted(_blocked_pkgs)
-                    if _blocked_cls:
-                        details["blocked_on_classes"] = _blocked_cls  # H-3a 类级 futile 判据用
-                    logger.warning(
-                        "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
-                        "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],
-                    )
-                    return True, details
+                    # R67L-B2（22号文批次2 H-3a，round67l st-2 实锤）：缺失包/类若【全部】在
+                    # 本子任务自己 scope 内有生产者（scope 声明了落在该包/该类的源码文件）→
+                    # 是【自己没建出】的 capability 失败，判 BLOCKED 会把可修编译错送进不可修
+                    # 通道、fix 循环短路（worker 无权"等"自己）。落公共 FAIL 尾进修复梯。
+                    _own_pkgs, _own_cls = _missing_internal_produced_in_scope(
+                        getattr(subtask, "scope", None), _blocked_pkgs, _blocked_cls)
+                    _ext_pkgs = _blocked_pkgs - _own_pkgs
+                    _ext_cls = [c for c in _blocked_cls if c not in _own_cls]
+                    if not _ext_pkgs and not _ext_cls:
+                        details["in_scope_producer_fail"] = sorted(
+                            _own_pkgs | set(_own_cls))
+                        logger.warning(
+                            "[L1.2.1] R67L-B2 缺失内部包/类的生产者全在本子任务 scope 内"
+                            "（自己没建出，非等上游）→ 落 FAIL 修复梯，不判 BLOCKED: %s",
+                            sorted(_blocked_pkgs)[:8])
+                    else:
+                        if _own_pkgs or _own_cls:
+                            # 混合：自有部分留痕（FAIL 侧线索），外部部分仍 BLOCKED 等上游。
+                            details["in_scope_producer_suppressed"] = sorted(
+                                _own_pkgs | set(_own_cls))
+                        details["l1_2_1_build_ok"] = None
+                        details["build_blocked"] = build_cmd
+                        details["pipeline_blocked"] = "internal_pkg_not_built"
+                        details["not_run_kind"] = NotRunKind.BLOCKED.value
+                        # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
+                        # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
+                        details["blocked_on_packages"] = sorted(_blocked_pkgs)
+                        if _blocked_cls:
+                            details["blocked_on_classes"] = _blocked_cls  # H-3a 类级 futile 判据用
+                        logger.warning(
+                            "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
+                            "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],
+                        )
+                        return True, details
                 details["build_failed"] = build_cmd
                 # #113 诊断：构建失败时预扫改动源文件的全角 CJK 标点（NVFP4 腐坏，javac illegal
                 # character 常见根因）→ 精确坐标进 details，喂 worker 修复轮定位更准（只读，不自改）。
@@ -4954,6 +5040,26 @@ def run_l1_pipeline(
                     details["pipeline_blocked"] = "verify_infra_failure"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value
                     return True, details
+                # R67L-B2（22号文批次2，round67l st-14 烧 4 轮实锤）：phantom-dep prune 剪掉的
+                # 【plan 声明内部模块】若被本子任务验收命令断言（grep <artifactId>）→ prune 与
+                # 考卷确定性自相矛盾：剪→验收挂→worker 加回→下轮再剪，注定永败。该模块的
+                # 生产者（别的子任务）尚未 merge 进树=等上游，第一轮即判 BLOCKED 交 brain
+                # （C9 动态边等生产者落地；生产者死=既有 futility 连坐放弃通道）——st-14 run-4
+                # 自然进化到的正确处置提前到 run-1，修复轮零白烧。
+                _pruned_pi = set(_repair_evidence.get("pruned_phantom_internal") or ())
+                if _pruned_pi:
+                    _conflict = sorted(a for a in _pruned_pi
+                                       if any(a in str(c) for c in verify_cmds))
+                    if _conflict:
+                        details["pipeline_blocked"] = "upstream_module_broken"
+                        details["not_run_kind"] = NotRunKind.BLOCKED.value
+                        details["blocked_on_modules"] = _conflict
+                        details["prune_acceptance_conflict"] = _conflict
+                        logger.warning(
+                            "[L1.3.5] R67L-B2 prune 判【永不可解析】剪掉的内部模块 %s 被本任务"
+                            "验收断言必考 → prune↔考卷自相矛盾（注定永败），判 BLOCKED 等生产者"
+                            "落地（生产者死则 brain 连坐放弃），不烧修复轮", _conflict)
+                        return True, details
                 details["verify_failed"] = vc
                 return False, details
         details["verify_commands"] = verify_results

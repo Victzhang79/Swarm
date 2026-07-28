@@ -211,7 +211,7 @@ def _patch_repair_loop(l1, *, run_seq, repair_seq):
         i = rc["build"]; rc["build"] += 1
         return run_seq[min(i, len(run_seq) - 1)]
 
-    def fake_repair(pp, out, mods, timeout, stack=None):
+    def fake_repair(pp, out, mods, timeout, stack=None, evidence_out=None):
         i = rc["repair"]; rc["repair"] += 1
         return repair_seq[min(i, len(repair_seq) - 1)]
 
