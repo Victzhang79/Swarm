@@ -940,6 +940,58 @@ def wire_file_plan_depends_edges(plan, file_plan) -> dict[str, list[str]]:
     return added
 
 
+def wire_module_pom_dep_edges(plan, dirs, project_path: str | None = None) -> dict[str, list[str]]:
+    """R67L-B4②（22号文批次4，round67l st-14 未授权序执行实锤）：模块 pom【生产者→消费者】
+    depends_on 边确定性补齐——file_plan depends_on 是 LLM 声明（round67l ruoyi-alarm/pom.xml
+    声明空 → st-14 depends_on=[] 首批即派，生产者 ruoyi-alarm-interface 未建就越权写根 pom
+    毒终态树）。模块 pom 的先后序不该靠 LLM 声明：reactor 解析期就要求被依赖模块 pom 先
+    落地，且证据与 T5 模板注入完全同源（contract_utils.derive_module_pom_producer_edges：
+    跨模块 readable code 文件=编译依赖）。
+
+    成环守卫与 B3②/T4b 同律：已传递可达幂等跳过；生产者传递依赖消费者=会成环 → 跳过
+    +WARNING（留 VALIDATE/C9 面，绝不猜方向）。project_path 缺省/异常 fail-open（跳过本
+    pass，LLM 声明面与 C9 动态边兜底）。返回 {消费者 sid: [新增上游 sid…]} 机读账。
+    """
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if not subs or not dirs:
+        return {}
+    try:
+        from swarm.brain.contract_utils import derive_module_pom_producer_edges
+        spec = derive_module_pom_producer_edges(plan, dirs)
+    except Exception:  # noqa: BLE001 — fail-open：C9 动态边/seed 闸执行期兜底
+        logger.warning("[PLAN-FINISH] R67L-B4② 模块 pom 依赖边推导失败（fail-open）",
+                       exc_info=True)
+        return {}
+    if not spec:
+        return {}
+    by_id = {str(getattr(st, "id", "")): st for st in subs}
+    added: dict[str, list[str]] = {}
+    skipped_cycle: list[tuple[str, str]] = []
+    for consumer, producers in spec.items():
+        st = by_id.get(consumer)
+        if st is None:
+            continue
+        for producer in producers:
+            cur = list(getattr(st, "depends_on", None) or [])
+            if producer in cur or _plan_reaches(by_id, consumer, producer):
+                continue                        # 已有/传递可达 → 幂等跳过
+            if _plan_reaches(by_id, producer, consumer):
+                skipped_cycle.append((consumer, producer))
+                continue                        # 成环不猜（同 T4b，留结构闸面）
+            st.depends_on = cur + [producer]
+            added.setdefault(consumer, []).append(producer)
+    if skipped_cycle:
+        logger.warning(
+            "[PLAN-FINISH] R67L-B4② %d 条模块 pom 依赖边会成环 → 跳过（留 VALIDATE/C9 面）: %s",
+            len(skipped_cycle), skipped_cycle[:6])
+    if added:
+        logger.info(
+            "[PLAN-FINISH] R67L-B4② 模块 pom 生产者→消费者依赖边补齐 %d 个消费者共 %d 条"
+            "（LLM 声明缺口确定性补齐，round67l st-14 未授权序死型）: %s",
+            len(added), sum(len(v) for v in added.values()), dict(sorted(added.items())))
+    return added
+
+
 def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str, list[str]]:
     """R67L-B3⑤（22号文批次3·裸奔闸，round67l st-3-1 实锤）：create pom.xml 的子任务
     零 verify_commands=零确定性闸过闸（st-3-1 零验收过掉 parent 3.8.7 幻觉 pom，
@@ -1266,6 +1318,19 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             out["file_plan_dep_edges"] = _fpde
     except Exception:  # noqa: BLE001 — fail-open
         logger.warning("[PLAN-FINISH] R67L-B3② file_plan 依赖边下推失败（fail-open）",
+                       exc_info=True)
+    try:
+        # R67L-B4②（round67l st-14 未授权序实锤）：模块 pom 生产者→消费者依赖边确定性
+        # 补齐——file_plan depends_on 是 LLM 声明（st-14 声明空→首批即派毒终态树），
+        # 模块 pom 序走 T5 同源证据（跨模块 readable code=编译依赖），不靠 LLM 声明。
+        # 放 B3② 之后：LLM 声明面先下推，本 pass 只补声明缺口的 pom 序（幂等守卫同律）。
+        from swarm.brain.contract_utils import _module_physical_dirs
+        _dirs_b4 = _module_physical_dirs(plan, project_path, file_plan) if project_path else {}
+        _mpde = wire_module_pom_dep_edges(plan, _dirs_b4, project_path)
+        if _mpde:
+            out["module_pom_dep_edges"] = _mpde
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] R67L-B4② 模块 pom 依赖边补齐失败（fail-open）",
                        exc_info=True)
     # R67-T4a/T4b：自然语言消费关系补边（放 W2 之后——readable 推得出的边 W2 已建，
     # 此处只接 W2 结构盲区）。★hunter F3 整改★两 pass 各自 try（与本函数逐 pass 纪律一致）：

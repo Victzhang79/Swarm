@@ -1308,32 +1308,23 @@ def _prune_reverse_contract_internal_deps(plan, dirs: dict[str, str],
             entry["artifacts"] = kept
 
 
-def derive_internal_module_deps(plan, dirs: dict[str, str],
-                                project_path: str | None) -> dict[str, list[str]]:
-    """T5（round63 治本）：从子任务跨模块 readable 证据确定性推导**内部模块依赖**。
+def _collect_module_dep_evidence(plan, dirs: dict[str, str]):
+    """T5 证据收集核（derive_internal_module_deps 与 R67L-B4② pom 序推导【共用单一事实源】，
+    防两处各算各的口径漂移）：模块 M 的子任务（写文件落在 dirs[M] 下）的 readable 里出现
+    **其他模块的 code 文件** = M 编译需要该模块（证据面栈中立）。
 
-    round63 死因：模板 <dependencies> 唯一来源=契约 LLM 自声明的第三方 artifacts，契约从不
-    产内部模块依赖 → st-5 权威模板缺 ruoyi-common → 首波 30+ 次"程序包 com.ruoyi.common.
-    core.domain 不存在"。而推导证据 plan 里现成（ruoyi-alarm 子任务 readable→ruoyi-common
-    code 文件 108 次）从无人消费。
-
-    推导（证据面栈中立）：模块 M 的子任务（写文件落在 dirs[M] 下）的 readable 里出现
-    **其他模块的 code 文件** = M 编译需要该模块。落点两类：
-    - plan 模块（dirs 有映射）：磁盘已有 pom → 按基线模块过滤；尚无 pom（新兄弟）→ 显式
-      `group:模块名:${project.version}`（group 取根 GAV；模板 artifactId=契约模块名同源）。
-      互指（A↔B 都有对方证据）=注入必成环 → 双向跳过+WARNING（更深计划错，交结构闸）。
-    - 基线目录（顶段含构建清单）：经 _baseline_module_artifact 过滤（无 pom/聚合父/war/
-      spring-boot 可执行件不注入）。基线绝不依赖新模块（它出现时新模块还不存在）→ 无环。
-    返回 {契约模块: [artifact spec…]}；注入点合并进契约 artifacts 后走既有
-    resolve_scaffold_artifacts（坐标解析单一权威，R53-1）。fail-open：无 project_path → {}。
-    """
-    if not project_path or not dirs:
-        return {}
-    root = Path(project_path)
+    返回 (evid, mutual, plan_dir_of, writers_of)：
+    - evid: {契约模块: {("plan"|"baseline", 名)}}——plan=plan 内兄弟模块，baseline=基线目录顶段；
+    - mutual: plan 模块互指对（A↔B 都有对方证据=注入/补边必成环，消费方各自双向跳过+WARNING）；
+    - plan_dir_of: {契约模块: 物理目录}（嵌套布局最长目录优先，防内层证据错挂外层）；
+    - writers_of: {模块: {写者子任务 id}}（R65D-T2② 方向校验用）。
+    纯路径/scope 逻辑，不读磁盘；dirs 空 → 全空。"""
     from swarm.brain.symbol_provenance import _is_code_path  # T4 单一 code 判定源
-    plan_dir_of = {m: (d or "").strip("/") for m, d in dirs.items() if d}
+    plan_dir_of = {m: (d or "").strip("/") for m, d in (dirs or {}).items() if d}
+    evid: dict[str, set[tuple[str, str]]] = {m: set() for m in plan_dir_of}
+    writers_of: dict[str, set[str]] = {}
     if not plan_dir_of:
-        return {}
+        return evid, set(), plan_dir_of, writers_of
 
     # 复核 MED：**最长目录优先**——嵌套布局（"mods" 与 "mods/alarm" 同为 plan 模块）下
     # 首配会把内层文件误归外层模块，证据错挂/互指误剪。按目录长度降序保证最具体者赢。
@@ -1345,9 +1336,6 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
                 return m
         return None
 
-    # 证据收集：{module: {("plan"|"baseline", 名)}}；writers_of 供 R65D-T2② 方向校验
-    evid: dict[str, set[tuple[str, str]]] = {m: set() for m in plan_dir_of}
-    writers_of: dict[str, set[str]] = {}
     for st in (getattr(plan, "subtasks", None) or []):
         sc = getattr(st, "scope", None)
         writes = [_norm_scope_path(str(f)) for f in
@@ -1380,9 +1368,92 @@ def derive_internal_module_deps(plan, dirs: dict[str, str],
                     continue
                 evid[m].add(("baseline", top))
 
-    # plan 兄弟互指 = 注入必成环 → 双向剪除（更深计划错，surfaced 不静默）
+    # plan 兄弟互指 = 注入/补边必成环 → 消费方各自双向跳过（更深计划错，surfaced 不静默）
     mutual = {(a, b) for a, deps in evid.items()
               for kind, b in deps if kind == "plan" and ("plan", a) in evid.get(b, set())}
+    return evid, mutual, plan_dir_of, writers_of
+
+
+def derive_module_pom_producer_edges(plan, dirs: dict[str, str]) -> dict[str, list[str]]:
+    """R67L-B4②（22号文批次4，round67l st-14 未授权序实锤）：模块 pom【生产者→消费者】
+    depends_on 边确定性推导。
+
+    实锤链：file_plan depends_on 是 LLM 声明——round67l ruoyi-alarm/pom.xml 声明空
+    （尽管 ruoyi-alarm 编译离不开 ruoyi-alarm-interface）→ st-14 depends_on=[] 首批即派
+    （=未授权序执行），越权写根 pom 钉 3.8.7+注册不存在模块毒终态树。模块 pom 的先后序
+    不该靠 LLM 声明——reactor 解析期就要求被依赖模块的 pom 先落地，证据 plan 里现成
+    （T5 同一证据面：跨模块 readable code 文件=编译依赖）。
+
+    推导：M 消费 N（plan 模块）⇒ owner(M 的 pom) 应 depends_on owner(N 的 pom)。
+    - 互指对（mutual）双向跳过+WARNING（同 T5 律：更深计划错，交结构闸/C9 面）；
+    - baseline 依赖不产边（基线 pom 本就存在，无需等）；
+    - pom owner=scope 声明含 `{dir}/pom.xml` 的子任务（create∪writable，首现为准——与
+      wire_file_plan_depends_edges 的 owner 口径同源）；无 owner（基线 pom/漏声明）跳过；
+    - 自边（同 owner 持两 pom）跳过；成环守卫在 wire 侧（plan_finisher _plan_reaches）判。
+    返回 {消费者 pom owner sid: [生产者 pom owner sid…]}（确定性排序）。纯路径逻辑，栈中立。
+    """
+    evid, mutual, plan_dir_of, _w = _collect_module_dep_evidence(plan, dirs)
+    if not evid:
+        return {}
+    # pom owner 索引：{契约模块: 子任务 id}（首现为准）
+    pom_owner: dict[str, str] = {}
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        _files = {_norm_scope_path(str(f)) for f in
+                  (list(getattr(sc, "create_files", None) or [])
+                   + list(getattr(sc, "writable", None) or []))}
+        for m, d in plan_dir_of.items():
+            if m in pom_owner:
+                continue
+            if f"{d}/pom.xml" in _files:
+                pom_owner[m] = st.id
+    edges: dict[str, set[str]] = {}
+    for m, deps in evid.items():
+        consumer = pom_owner.get(m)
+        if not consumer:
+            continue
+        for kind, n in sorted(deps):
+            if kind != "plan" or (m, n) in mutual:
+                continue
+            producer = pom_owner.get(n)
+            if not producer or producer == consumer:
+                continue
+            edges.setdefault(consumer, set()).add(producer)
+    if mutual:
+        _pm = sorted((a, b) for a, b in mutual
+                     if pom_owner.get(a) and pom_owner.get(b))
+        if _pm:
+            logger.warning(
+                "[R67L-B4②] %d 对 plan 模块互指（pom 序补边必成环）→ 双向都不补"
+                "（同 T5 律：更深计划错，交结构闸/C9 面）: %s", len(_pm), _pm[:4])
+    return {k: sorted(v) for k, v in sorted(edges.items())}
+
+
+def derive_internal_module_deps(plan, dirs: dict[str, str],
+                                project_path: str | None) -> dict[str, list[str]]:
+    """T5（round63 治本）：从子任务跨模块 readable 证据确定性推导**内部模块依赖**。
+
+    round63 死因：模板 <dependencies> 唯一来源=契约 LLM 自声明的第三方 artifacts，契约从不
+    产内部模块依赖 → st-5 权威模板缺 ruoyi-common → 首波 30+ 次"程序包 com.ruoyi.common.
+    core.domain 不存在"。而推导证据 plan 里现成（ruoyi-alarm 子任务 readable→ruoyi-common
+    code 文件 108 次）从无人消费。
+
+    推导（证据面栈中立，收集核=_collect_module_dep_evidence 单一事实源）：落点两类：
+    - plan 模块（dirs 有映射）：磁盘已有 pom → 按基线模块过滤；尚无 pom（新兄弟）→ 显式
+      `group:模块名:${project.version}`（group 取根 GAV；模板 artifactId=契约模块名同源）。
+      互指（A↔B 都有对方证据）=注入必成环 → 双向跳过+WARNING（更深计划错，交结构闸）。
+    - 基线目录（顶段含构建清单）：经 _baseline_module_artifact 过滤（无 pom/聚合父/war/
+      spring-boot 可执行件不注入）。基线绝不依赖新模块（它出现时新模块还不存在）→ 无环。
+    返回 {契约模块: [artifact spec…]}；注入点合并进契约 artifacts 后走既有
+    resolve_scaffold_artifacts（坐标解析单一权威，R53-1）。fail-open：无 project_path → {}。
+    """
+    if not project_path or not dirs:
+        return {}
+    root = Path(project_path)
+    evid, mutual, plan_dir_of, writers_of = _collect_module_dep_evidence(plan, dirs)
+    if not plan_dir_of:
+        return {}
+    # plan 兄弟互指 = 注入必成环 → 双向剪除（更深计划错，surfaced 不静默）
     if mutual:
         logger.warning(
             "[T5] %d 对 plan 模块互相消费对方产物（注入依赖必成环）→ 双向都不注入内部依赖"

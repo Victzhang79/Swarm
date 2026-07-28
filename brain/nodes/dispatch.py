@@ -17,6 +17,7 @@ from swarm.brain.nodes.shared import (
     _worker_profile_prompt,
     completed_l1_ids,
     gather_cancel_on_error,
+    partition_abandoned_account,
 )
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
@@ -352,7 +353,8 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
 
 def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
                                   max_concurrent, to_dispatch, abandoned=None,
-                                  deprioritized=None, force_strong_out=None):
+                                  deprioritized=None, force_strong_out=None,
+                                  dispatch_totals=None):
     """主干B 不变量·DISPATCH 闸门：派发前确保每个工作单元【文件数≤上界】（预防式治本）。
 
     根因：编排允许 oversized 子任务一路派到 worker，撞 900s 墙钟超时后才在恢复阶梯拆小——
@@ -419,7 +421,8 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
         return plan_obj, dispatch_remaining, to_dispatch
     plan_obj = _rebuild_plan(plan_obj, new_subtasks)
     to_dispatch = plan_obj.get_dispatch_batch(
-        completed_ids, remaining, max_concurrent, abandoned, deprioritized
+        completed_ids, remaining, max_concurrent, abandoned, deprioritized,
+        dispatch_totals=dispatch_totals,  # R67L-B4①：拆小后重选批次同享饥饿优先排序
     )
     return plan_obj, remaining, to_dispatch
 
@@ -592,7 +595,10 @@ async def dispatch(state: BrainState) -> dict:
     }
 
     to_dispatch = plan_obj.get_dispatch_batch(
-        completed_ids, dispatch_remaining, max_concurrent, _abandoned, _deprioritized
+        completed_ids, dispatch_remaining, max_concurrent, _abandoned, _deprioritized,
+        # R67L-B4①：retry 组内饥饿者优先/死结降权——A2 终身派发账（单调不剪枝）做排序键，
+        # 少派=更饿先占槽（round67l 骨牌2：st-2/8/14 死结 4 轮占槽、11 个 retry 兑现者饿死 70min）。
+        dispatch_totals=state.get("subtask_dispatch_totals") or {},
     )
 
     # ── 主干B 不变量·DISPATCH 预算闸门：超文件上界的工作单元在派发前确定性拆小，
@@ -602,7 +608,8 @@ async def dispatch(state: BrainState) -> dict:
     _gate_force_strong = dict(state.get("subtask_force_strong") or {})
     plan_obj, dispatch_remaining, to_dispatch = _enforce_dispatch_budget_gate(
         plan_obj, completed_ids, dispatch_remaining, max_concurrent, to_dispatch,
-        _abandoned, _deprioritized, force_strong_out=_gate_force_strong
+        _abandoned, _deprioritized, force_strong_out=_gate_force_strong,
+        dispatch_totals=state.get("subtask_dispatch_totals") or {},
     )
     _gate_split = plan_obj is not _plan_before_gate
     # R65REPLAY-T4 派发侧兜底：执行期写者产生的幽灵 ua 进 seed 闸前剔除。
@@ -836,7 +843,9 @@ async def dispatch(state: BrainState) -> dict:
                         # R67J-H3b 复核 M2：在飞集=已派未完成——生产者在飞时其成环消费者
                         # 必须继续 defer（否则补位轮 p 不在 remaining→就绪集不含 p→软序
                         # 被绕过，c 与执行中的 p 并跑）
-                        in_flight=_spawned_ids - _rolling_completed)
+                        in_flight=_spawned_ids - _rolling_completed,
+                        # R67L-B4①：补位选批同享 retry 组饥饿优先（补位正是饿死集中地）
+                        dispatch_totals=state.get("subtask_dispatch_totals") or {})
                     if st.id not in _spawned_ids and not _oversized_by_files(st)
                 ][: _roll_budget - len(_rolled)]
             except Exception:  # noqa: BLE001 — 补位是增益，选批异常绝不拖垮本批
@@ -1032,12 +1041,16 @@ def monitor(state: BrainState) -> dict:
 
     # R65C-T2 修⑤：三本账统一口径——旧行把滞留的 L1 失败结果也计成"已完成"
     # （round65c 排障时 已完成 在 5↔3 间跳动=两处口径不一的假象），且放弃数不可见。
-    _aband_n = len(set(state.get("abandoned_subtask_ids") or [])
-                   | set(state.get("give_up_isolated_ids") or []))
+    # R67L-B4④：桩完成者（give_up∩completed）不计放弃账（防同 id 双计），单列 桩降级 披露。
+    _aband_true, _stub = partition_abandoned_account(
+        state.get("abandoned_subtask_ids") or [],
+        state.get("give_up_isolated_ids") or [],
+        completed_l1_ids(subtask_results))
     logger.info(
         f"[MONITOR] 剩余={len(dispatch_remaining)}, "
         f"已完成(L1过)={len(completed_l1_ids(subtask_results))}, "
-        f"失败={len(failed_ids)}, 放弃={_aband_n}"
+        f"失败={len(failed_ids)}, 放弃={len(_aband_true)}"
+        + (f", 桩降级={len(_stub)}" if _stub else "")
     )
 
     # 此节点不做状态变更，仅用于条件路由

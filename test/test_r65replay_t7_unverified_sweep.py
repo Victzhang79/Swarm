@@ -150,10 +150,11 @@ def test_midloop_failure_keeps_partial_account(repo, monkeypatch):
     real = __import__("swarm.brain.nodes.planning_core",
                       fromlist=["_local_tree_revert_subtask"])._local_tree_revert_subtask
 
-    def _boom(project_path, st, protected_files=None, base_ref=None):
+    def _boom(project_path, st, protected_files=None, base_ref=None, extra_files=None):
         if getattr(st, "id", "") == "st-bad":
             raise RuntimeError("boom")
-        return real(project_path, st, protected_files=protected_files, base_ref=base_ref)
+        return real(project_path, st, protected_files=protected_files, base_ref=base_ref,
+                    extra_files=extra_files)
 
     import swarm.brain.nodes.planning_core as pc
     monkeypatch.setattr(pc, "_local_tree_revert_subtask", _boom)

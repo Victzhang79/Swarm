@@ -461,6 +461,7 @@ class TaskPlan(BaseModel):
         abandoned: set[str] | None = None,
         deprioritized: set[str] | None = None,
         in_flight: set[str] | None = None,
+        dispatch_totals: dict | None = None,
     ) -> list[SubTask]:
         """选取下一批可并行派发的子任务。
 
@@ -479,6 +480,15 @@ class TaskPlan(BaseModel):
         仅填剩余槽位。生产者先跑→合并→失败子任务下轮重试即真恢复（round15 st-19-1 实证）。
         稳定性：两组各自保持 self.subtasks 序 → 确定性；deprioritized 为空则完全等价旧行为。
         不改放弃集/熔断语义：retry 仍在 remaining 且仍可派发，只是不再独占槽。
+
+        【R67L-B4①·retry 组内饥饿者优先/死结降权】（22号文批次4，round67l 骨牌2 实锤）：
+        retry 组纯保 plan 原序时，早序死结 id（st-2/8/14 终身派发 4 轮仍失败）恒占组头，
+        max_concurrent 截断下 retry 判词兑现者（st-73 等 11 个终身派发仅 1 次）零槽位饿死
+        70min，终态只能 dispatched_unaccounted 认账。`dispatch_totals`=A2 终身派发账
+        （单调不剪枝，subtask_dispatch_totals）——retry 组按其升序重排：少派=更饿先占槽，
+        多派死结沉底填剩余槽。稳定排序保同次数者 plan 原序确定性；fresh 组语义（Fix F
+        新前沿优先）不变。死结降权非放弃：totals 大者仍在组尾，不剥夺重试资格；
+        dispatch_totals 缺省（None）=完全等价旧行为。
         """
         remaining = set(dispatch_remaining)
         if not remaining:
@@ -538,6 +548,10 @@ class TaskPlan(BaseModel):
             return (1, -_fan) if _fan > 0 else (2, 0)
 
         fresh.sort(key=_prio)  # list.sort 稳定：同级同扇出保持 subtasks 原序
+        # R67L-B4①：retry 组内饥饿者优先——按终身派发次数升序（少派=更饿先占槽，死结沉底）。
+        # list.sort 稳定：同次数保持 subtasks 原序确定性。dispatch_totals 缺省=旧行为。
+        if dispatch_totals:
+            retry.sort(key=lambda t: int(dispatch_totals.get(t.id, 0) or 0))
         ready = fresh + retry
         # R67J-H3b：符号成环对软序兜底——(消费者 c, 生产者 p) 因成环放弃补边（p 传递依赖
         # c，DAG 序=c 先行），正常情形二者绝不同批就绪；仅当依赖被放弃/软边旁路松弛后才会

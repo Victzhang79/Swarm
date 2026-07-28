@@ -48,6 +48,7 @@ class ReplayResult:
     b3_pom_min_exam: dict = field(default_factory=dict)    # R67L-B3⑤ 裸奔闸注入
     b3_file_plan_edges: dict = field(default_factory=dict)  # R67L-B3② 依赖边下推
     b3_negated_grep: dict = field(default_factory=dict)    # R67L-B3⑥ 禁令 grep 重写
+    b4_module_pom_edges: dict = field(default_factory=dict)  # R67L-B4② 模块 pom 依赖边
     failed_stage: str | None = None       # 崩在哪一 pass（None=全过）
     error: BaseException | None = None
     traceback_str: str = ""
@@ -162,6 +163,12 @@ def replay_cassette(cassette: dict, *, verbose: bool = False) -> ReplayResult:
         _emit("R67L-B3⑥ sanitize_negated_grep_exam")
         res.failed_stage = "sanitize_negated_grep_exam"
         res.b3_negated_grep = sanitize_negated_grep_exam(plan)
+        _emit("R67L-B4② wire_module_pom_dep_edges")
+        res.failed_stage = "wire_module_pom_dep_edges"
+        from swarm.brain.contract_utils import _module_physical_dirs
+        from swarm.brain.plan_finisher import wire_module_pom_dep_edges
+        _dirs = _module_physical_dirs(plan, project_path, file_plan) if project_path else {}
+        res.b4_module_pom_edges = wire_module_pom_dep_edges(plan, _dirs, project_path)
 
         res.failed_stage = None
     except BaseException as exc:  # noqa: BLE001 — 复现工具：任何崩溃都要如实呈现，不吞
@@ -206,6 +213,8 @@ def _print_report(cassette: dict, res: ReplayResult) -> None:
           f"({sorted(res.b3_pom_min_exam)[:8]})；file_plan 依赖边下推 "
           f"{sum(len(v) for v in res.b3_file_plan_edges.values())} 条；禁令 grep 重写 "
           f"{len(res.b3_negated_grep)} 个 ({sorted(res.b3_negated_grep)[:8]})")
+    print(f"R67L-B4② 模块 pom 依赖边补齐 {sum(len(v) for v in res.b4_module_pom_edges.values())} 条 "
+          f"({sorted(res.b4_module_pom_edges)[:8]})")
 
     print(f"\n依赖 DAG (subtask → depends_on)  共 {len(res.dag)} 个子任务:")
     for sid, deps in res.dag.items():

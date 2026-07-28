@@ -497,16 +497,22 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
         # round18 P2 治本（三本账：完成/放弃/剩余）：进度只显 completed/count 会误导
         # "卡在 12/38"——实则放弃单元(重试耗尽 abandoned + 保 build 放弃 give_up)不计入,
         # 与 MONITOR 口径不一致(round18 教训#3:三盯要三本账)。补 abandoned 计数(限当前 plan)。
-        _abandoned_ids = (
-            set(state.get("abandoned_subtask_ids") or [])
-            | set(state.get("give_up_isolated_ids") or [])
+        # R67L-B4④：桩完成者（give_up∩completed）不计放弃账——同 id 双计会把
+        # "完成 4/放弃 1"算成 5 个单元（round67l st-3-1 实锤），与 MONITOR/progress 同分区口径。
+        from swarm.brain.nodes.shared import (
+            completed_l1_ids as _paa_completed,
+            partition_abandoned_account as _paa,
         )
+        _abandoned_ids, _ = _paa(
+            state.get("abandoned_subtask_ids") or [],
+            state.get("give_up_isolated_ids") or [],
+            _paa_completed(state.get("subtask_results") or {}))
         plan_ids = _plan_subtask_ids(state)
         if plan_ids:
             _ab = sum(1 for sid in _abandoned_ids if sid in plan_ids)
         else:
             _ab = len(_abandoned_ids)
-        # completed 与 abandoned 互斥(放弃者未 passed);夹紧使 completed+abandoned≤count,
+        # completed 与 abandoned 互斥(分区后严格成立);夹紧使 completed+abandoned≤count,
         # 保证派生的 remaining=count-completed-abandoned 永非负。
         if isinstance(_cnt, int):
             _ab = max(0, min(_ab, _cnt - done))
@@ -1042,11 +1048,12 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
       剩余   remaining  = len(dispatch_remaining)
       已完成 completed  = len(completed_l1_ids(subtask_results))   # L1 过集合=唯一权威(D23)
       失败   failed     = len(failed_subtask_ids)
-      放弃   abandoned  = len(abandoned_subtask_ids ∪ give_up_isolated_ids)
+      放弃   abandoned  = len((abandoned_subtask_ids ∪ give_up_isolated_ids) − completed)  # R67L-B4④
+      桩降级 stub_completed = sorted(give_up_isolated_ids ∩ completed)  # 桩完成者披露（计入 completed）
     纯读、不推进图、不触发执行。无 checkpoint（未起跑 / 终态无态）→ 返回 None，端点据此回 task.status
     兜底。读快照失败（PG 抖动）→ 返回 None（不 500），端点降级。
     """
-    from swarm.brain.nodes.shared import completed_l1_ids
+    from swarm.brain.nodes.shared import completed_l1_ids, partition_abandoned_account
     from swarm.tracing import brain_graph_config
 
     graph = get_compiled_brain_graph()
@@ -1073,8 +1080,12 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
     remaining = state.get("dispatch_remaining") or []
     subtask_results = state.get("subtask_results") or {}
     failed_ids = list(state.get("failed_subtask_ids") or [])
-    abandoned = set(state.get("abandoned_subtask_ids") or []) | set(state.get("give_up_isolated_ids") or [])
     completed = completed_l1_ids(subtask_results)
+    # R67L-B4④：桩完成者（give_up∩completed）不计放弃账（防同 id 双计），单列 stub_completed 披露。
+    abandoned, stub_completed = partition_abandoned_account(
+        state.get("abandoned_subtask_ids") or [],
+        state.get("give_up_isolated_ids") or [],
+        completed)
 
     # 子任务级明细：从 plan 的 id 全集映射到同一批 state 集合（不引入第三口径）。
     # ★对抗复核 HIGH★：checkpoint 里 state["plan"] 是 swarm.types.TaskPlan Pydantic 实例【非 dict】
@@ -1107,6 +1118,7 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         "completed": len(completed),
         "failed": len(failed_ids),
         "abandoned": len(abandoned),
+        "stub_completed": sorted(stub_completed),  # R67L-B4④：桩降级完成者诚实披露（计入 completed）
         "total": total,
         "subtasks": subtasks,
     }
@@ -1439,6 +1451,8 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
     终态诚实清扫——PARTIAL/FAILED 结算前，把【派发过（dispatch_totals>0）且未完成
     （非 l1_passed）】的计划内子任务在本地树的足迹清掉（复用 H2 同源
     _local_tree_revert_subtask：tracked→checkout 钉扎 base，untracked→删除）。
+    清扫面=scope footprint ∪ 该子任务自身 result diff 解析文件（R67L-B4③：round67l
+    st-14 越权写 scope 外根 pom 钉 3.8.7+注册不存在模块 → 纯 scope 驱动清不掉的实锤洞）。
 
     protected=完成者 diff 实际产物 ∪ scope 声明归属（_files_owned_by_completed，
     H-exec2 其它调用点同源守卫；纯 diff 解析在同内容 rename/空 hunk 形态会漏保，
@@ -1514,9 +1528,21 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
                 "当前 HEAD（若 HEAD 已漂移可能非任务启动基线）", task_id)
         for sid in sorted(targets):
             try:
+                # R67L-B4③（22号文批次4 T7 清扫洞，round67l st-14 实锤）：失败子任务
+                # 越权写入 scope 外文件（st-14 scope 仅 ruoyi-alarm/pom.xml 却写根 pom/
+                # ruoyi-framework/pom.xml 钉 3.8.7+注册不存在模块 → 终态树不可构建），
+                # scope 驱动的 footprint 够不着 → 把该子任务【自身 result diff】解析出的
+                # 文件并入清扫面（protected 窄守卫同源防误删兄弟好产物）。
+                _tgt_res = results.get(sid)
+                _tgt_diff = (getattr(_tgt_res, "diff", None)
+                             or (_tgt_res.get("diff") if isinstance(_tgt_res, dict) else "")
+                             or "")
+                _extra = [str(getattr(ch, "file_path", "") or "").replace("\\", "/").lstrip("./")
+                          for ch in _changes_from_diff(_tgt_diff)] if _tgt_diff else []
                 r = _local_tree_revert_subtask(
                     project_path, st_map[sid],
-                    protected_files=protected, base_ref=base_ref)
+                    protected_files=protected, base_ref=base_ref,
+                    extra_files=_extra)
                 n = len(r.get("reverted") or []) + len(r.get("removed") or [])
                 if n:
                     out["swept_subtasks"].append(sid)

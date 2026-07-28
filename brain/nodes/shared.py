@@ -655,6 +655,25 @@ def completed_l1_ids(subtask_results: dict) -> set:
     return {sid for sid, out in (subtask_results or {}).items() if l1_passed(out)}
 
 
+def partition_abandoned_account(abandoned_ids, give_up_ids, completed_ids) -> tuple[set, set]:
+    """R67L-B4④（22号文批次4，round67l 账簿双计实锤）：报告层放弃账的互斥分区。
+
+    阶梯三打桩路的生产者【同时在】give_up_isolated 与 completed（桩产出 l1_passed=True——
+    设计意图=让下游对可编译桩照常推进，types.py get_dispatch_batch _is_ready 注释）。
+    旧口径 abandoned=abandoned∪give_up 把桩完成者同 id 双计进两本账（round67l 终态账
+    "完成 4/放弃 1"的 st-3-1 既在 4 又在 1）。报告层分区：真放弃=(abandoned∪give_up)−completed；
+    桩完成单独列出（诚实披露降级产物，不静默）。
+
+    ★口径边界★：本函数只服务【报告/计数】（MONITOR 日志/get_task_progress/进度落库）。
+    PARTIAL 诚实判据（gates.py partial_delivery_ids）与调度门禁（孤儿回填/_is_ready）
+    必须用未分区全集——桩放弃者照样强制 PARTIAL、照样不得复活，绝不因本分区放宽。
+    返回 (真放弃集, 桩完成集)。"""
+    _completed = set(completed_ids or set())
+    _stub = set(give_up_ids or set()) & _completed
+    _true_abandoned = (set(abandoned_ids or set()) | set(give_up_ids or set())) - _completed
+    return _true_abandoned, _stub
+
+
 def _is_test_file_path(p: str) -> bool:
     """判定是否测试文件路径（跨语言：java/py/js/ts/go）。"""
     pl = str(p or "").replace("\\", "/").lower()

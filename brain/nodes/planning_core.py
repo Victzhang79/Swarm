@@ -587,7 +587,8 @@ def _files_owned_by_completed(subtasks, subtask_results: dict, exclude_ids: set)
 
 
 def _local_tree_revert_subtask(project_path: str | None, st, protected_files: set | None = None,
-                               base_ref: str | None = None) -> dict:
+                               base_ref: str | None = None,
+                               extra_files: list | None = None) -> dict:
     """卡死子任务恢复阶梯·阶梯三(revert)：把子任务在【本地树】的足迹清干净。
 
     3rd#2：已跟踪文件 checkout 回【钉扎 base】版（None→HEAD 零回归），与交付链其余站点同源——
@@ -596,6 +597,12 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     protected_files（H-exec2 窄守卫，round21）：被【其它已完成子任务】拥有为有效产物的文件集——
     即便落在本子任务 footprint 内也【跳过删除/回退】，杜绝放弃时误删兄弟已落盘产物(footprint 与兄弟
     scope 重叠场景)。纯加性守卫，不重构 round15 红线的桩+级联恢复逻辑。
+
+    extra_files（R67L-B4③，22号文批次4 T7 清扫洞）：scope 声明【之外】的额外足迹文件
+    （典型来源=调用方从该子任务自身 result diff 解析的越权写入——round67l st-14 scope
+    仅 create ruoyi-alarm/pom.xml 却越权写根 pom/ruoyi-framework/pom.xml，scope 驱动
+    的 footprint 够不着 → 终态树残留毒改动）。与 scope footprint 取并集（归一化去重），
+    同样过 protected_files 窄守卫。缺省 None=纯 scope 驱动（旧行为）。
 
     必要性（第六轮 + L2 源码实证）：worker 的坏文件经 pull-back 已写回本地 project_path
     （新建文件为 untracked）。L2 `run_integration_review` 的 `_reset_worktree_to_head` 只
@@ -616,7 +623,15 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     if not (root / ".git").exists():
         return result
     _protected = protected_files or set()
-    for rel in _subtask_footprint(st):
+    # R67L-B4③：footprint = scope 声明 ∪ extra_files（归一化去重，保序确定性）
+    _footprint = list(_subtask_footprint(st))
+    _seen_fp = {str(rel).replace("\\", "/").lstrip("./") for rel in _footprint}
+    for _ef in (extra_files or []):
+        _n = str(_ef).replace("\\", "/").lstrip("./")
+        if _n and _n not in _seen_fp:
+            _seen_fp.add(_n)
+            _footprint.append(_n)
+    for rel in _footprint:
         # H-exec2 窄守卫：该 footprint 文件是【其它已完成子任务】的有效产物 → 跳过删除/回退。
         if str(rel).replace("\\", "/").lstrip("./") in _protected:
             result["skipped_protected"].append(rel)
