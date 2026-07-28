@@ -5877,6 +5877,18 @@ async def learn_failure(state: BrainState) -> dict:
             {"role": "user", "content": prompt_user},
         ])
         parsed = _parse_json_from_llm(response.content)
+        # R67L-B5（22号文批次5）：LLM 返回合法 JSON 数组/标量时解析不抛但类型非 dict，
+        # 下游 persist dict(parsed) 必炸（round67l 终态实锤）——源头归一默认 payload，
+        # 保住学习动作且绝不穿透终态节点。
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "[LEARN_FAILURE] LLM 输出为 %s 而非对象 → 用默认错题 payload",
+                type(parsed).__name__)
+            parsed = {
+                "mistake_name": "错误模式",
+                "mistake_description": f"任务 '{task_description[:50]}' 的失败模式",
+                "root_cause": revision_feedback[:100] if revision_feedback else "未知",
+            }
         learn_summary = json.dumps(parsed, ensure_ascii=False)
     except json.JSONDecodeError as e:
         logger.warning(f"[LEARN_FAILURE] LLM 输出 JSON 解析失败，使用默认: {e}")

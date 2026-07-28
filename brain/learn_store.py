@@ -205,23 +205,36 @@ async def persist_learn_failure(state: BrainState, parsed: dict[str, Any]) -> di
         logger.warning("[LEARN_STORE] 无 project_id，跳过落库")
         return {"persisted": False, "reason": "no_project_id"}
 
-    parsed = dict(parsed)
-    parsed.setdefault("source", "learn_failure")
-    feedback = state.get("revision_feedback") or ""
-    mistake = build_mistake_payload(state, parsed, feedback=feedback)
-    l2 = build_l2_summary(state, outcome="failure", parsed=parsed)
+    # R67L-B5（22号文批次5，round67l 终态实锤）：锁前段（类型强转/payload 构造）此前裸奔——
+    # LLM 提炼返回合法 JSON 数组时 dict(parsed) 抛 ValueError 穿透终态节点炸穿整个 run
+    # （错误文案顶替真死因）。与下方 DB 段同标准兜底：簿记失败=如实返回 persisted=False，
+    # 绝不拖垮终态主链；parsed 非 dict 先归一到 {}（默认错题 payload 保住学习动作）。
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "[LEARN_STORE] parsed 非 dict（%s）→ 归一默认 payload（防 dict() 强转炸穿终态节点）",
+            type(parsed).__name__)
+        parsed = {}
+    try:
+        parsed = dict(parsed)
+        parsed.setdefault("source", "learn_failure")
+        feedback = state.get("revision_feedback") or ""
+        mistake = build_mistake_payload(state, parsed, feedback=feedback)
+        l2 = build_l2_summary(state, outcome="failure", parsed=parsed)
 
-    metadata = {
-        "mistake_name": parsed.get("mistake_name"),
-        "trigger_conditions": _as_list(parsed.get("trigger_conditions")),
-        "prevention_measures": _as_list(parsed.get("prevention_measures")),
-        "early_warning_signs": _as_list(parsed.get("early_warning_signs")),
-        "tags": mistake.get("tags", []),
-        "code_snippet": mistake.get("code_snippet", ""),
-        "source": "learn_failure",
-    }
+        metadata = {
+            "mistake_name": parsed.get("mistake_name"),
+            "trigger_conditions": _as_list(parsed.get("trigger_conditions")),
+            "prevention_measures": _as_list(parsed.get("prevention_measures")),
+            "early_warning_signs": _as_list(parsed.get("early_warning_signs")),
+            "tags": mistake.get("tags", []),
+            "code_snippet": mistake.get("code_snippet", ""),
+            "source": "learn_failure",
+        }
 
-    idem_key = _idempotency_key(task_id, "failure", l2["summary"])
+        idem_key = _idempotency_key(task_id, "failure", l2["summary"])
+    except Exception as exc:
+        logger.exception("[LEARN_STORE] 错题 payload 构造失败（锁前段兜底，终态主链不受累）: %s", exc)
+        return {"persisted": False, "error": str(exc)}
 
     # B7 + 复核 CR-3：先 acquire 再【在 try 内】建连接——cancel 若发生在 acquire 等待期，try 未
     # 进入、连接未建，无泄漏；acquire 成功后无 await 直接进 try，finally 保证 release + close。
