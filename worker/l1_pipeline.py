@@ -5050,10 +5050,11 @@ def run_l1_pipeline(
                 if _pruned_pi:
                     # 复核 L-5：artifactId 全形匹配（id 字符集 [\w.-] 外边界），防短名
                     # 子串误关联长名依赖（"alarm" 不得命中 "ruoyi-alarm-interface"）。
+                    # 终扫 LOW：空串防御——空 pattern 在任意边界命中会全卷误判冲突。
                     _conflict = sorted(
-                        a for a in _pruned_pi
-                        if any(re.search(r"(?<![\w.-])" + re.escape(a) + r"(?![\w.-])",
-                                         str(c)) for c in verify_cmds))
+                        a for a in _pruned_pi if a
+                        and any(re.search(r"(?<![\w.-])" + re.escape(a) + r"(?![\w.-])",
+                                          str(c)) for c in verify_cmds))
                     if _conflict:
                         details["pipeline_blocked"] = "upstream_module_broken"
                         details["not_run_kind"] = NotRunKind.BLOCKED.value

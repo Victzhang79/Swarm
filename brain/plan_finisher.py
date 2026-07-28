@@ -1018,7 +1018,10 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
         try:
             _bstk = {stk for name, stk in _MANIFEST_TO_STACK.items()
                      if _os.path.exists(_os.path.join(project_path, name))}
-        except Exception:  # noqa: BLE001 — 探测失败按 unknown 保守放行
+        except (OSError, TypeError, ValueError) as _stk_exc:  # 与 _detect_build_stack 同型
+            # 终扫 hunter M-2：降级必须可观测——探测失败按 unknown 保守放行但留痕
+            logger.warning("[PLAN-FINISH] R67L-B3⑤ 基线 manifest 栈探测异常（按 unknown "
+                           "保守放行注入面不变）: %s", _stk_exc)
             _bstk = set()
         if _bstk and "maven" not in _bstk:
             logger.info("[PLAN-FINISH] R67L-B3⑤ 裸奔闸跳过：基线为已知非 Maven 栈 %s"
@@ -1047,8 +1050,10 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
         for pom in poms:
             cmds.append(f"test -f {pom} && echo OK")
             cmds.append(f"! grep -q '<version>${{' {pom}")
-            if _root_ver and pom.lstrip("./") != "pom.xml":
-                # 根 pom 自身无 <parent> 块 → ③ 跳过（复核 M-1：注入即恒败冤杀）
+            if _root_ver and pom not in ("pom.xml", "./pom.xml"):
+                # 根 pom 自身无 <parent> 块 → ③ 跳过（复核 M-1：注入即恒败冤杀）。
+                # 终扫 hunter M-3：显式枚举判定——lstrip("./") 会把 ../pom.xml/.pom.xml
+                # 也削成 "pom.xml" 误判根 pom 逃逸校验。
                 cmds.append(
                     f"grep -A5 '<parent>' {pom} | grep -q '<version>{_root_ver}</version>'")
         h.verify_commands = cmds
@@ -1166,6 +1171,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _renorm:
             out["cross_module_creates_renormalized"] = _renorm
     except Exception:  # noqa: BLE001 — fail-open，G1 权威兜底
+        out["cross_module_renormalize_failed"] = True  # 终扫：崩溃≠零命中，扫尾进 degraded
         logger.warning("[PLAN-FINISH] R67B-T1 归属重规范化失败（fail-open，G1 兜底）",
                        exc_info=True)
     try:
@@ -1225,6 +1231,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                     if not getattr(st, "est_context_tokens", 0):
                         st.est_context_tokens = 8000 + 6000   # TRIVIAL 基线+1 文件
     except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
+        out["manifest_leaf_split_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67C-T3b pom-写倒挂拆分失败（fail-open）", exc_info=True)
     try:
         from swarm.brain.contract_utils import inject_build_scaffold_subtasks
@@ -1240,6 +1247,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                     if not getattr(st, "est_context_tokens", 0):
                         st.est_context_tokens = 8000 + 6000  # TRIVIAL 基线+1 文件
     except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
+        out["scaffold_inject_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] 脚手架注入失败（fail-open）", exc_info=True)
     try:
         # R67L-B3⑤（round67l st-3-1 裸奔实锤）：create-pom 子任务零验收 → 注入最低验收
@@ -1259,6 +1267,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _pruned:
             out["pruned_empty_scope"] = _pruned
     except Exception:  # noqa: BLE001 — fail-open
+        out["prune_empty_scope_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] 空 scope 死子任务剪除失败（fail-open）", exc_info=True)
     try:
         from swarm.brain.nodes.shared import _task_requests_tests
@@ -1300,6 +1309,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                                 st.est_context_tokens = (
                                     50000 + 6000 * max(1, len(created[st.id])))
     except Exception:  # noqa: BLE001
+        out["orphan_attach_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] 孤儿文件挂靠失败（fail-open）", exc_info=True)
     try:
         # ④ R48b-1：契约符号安置（P1 命中会短路 R39-5 符号外科——收尾器全路径必经）
@@ -1317,6 +1327,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                             st.est_context_tokens = (
                                 50000 + 6000 * max(1, len(dom[st.id])))
     except Exception:  # noqa: BLE001
+        out["symbol_domicile_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] 契约符号安置失败（fail-open）", exc_info=True)
     try:
         # R62-Task5：readable 幻影包路径归一到 producer 真实落点（放【末端】——所有
@@ -1326,6 +1337,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _al.get("aligned"):
             out["readable_aligned"] = _al["aligned"]
     except Exception:  # noqa: BLE001 — fail-open
+        out["readable_align_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] readable 落点归一失败（fail-open）", exc_info=True)
     try:
         # R65D-W2①：消费边下推（放 readable 归一之后——落点已定，边才准）
@@ -1333,6 +1345,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _ce:
             out["consumer_edges"] = _ce
     except Exception:  # noqa: BLE001 — fail-open
+        out["consumer_edges_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] 消费边下推失败（fail-open）", exc_info=True)
     try:
         # R67L-B3②（round67l 68 条断链实锤）：file_plan 声明依赖边下推 depends_on——
@@ -1367,6 +1380,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _t4a:
             out["described_dep_edges"] = _t4a
     except Exception:  # noqa: BLE001 — fail-open
+        out["described_dep_edges_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67-T4a 词元补边失败（fail-open；已落边账=%s）",
                        out.get("described_dep_edges"), exc_info=True)
     try:
@@ -1374,6 +1388,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _t4b:
             out["symbol_consumption_edges"] = _t4b
     except Exception:  # noqa: BLE001 — fail-open
+        out["symbol_consumption_edges_failed"] = True  # 终扫：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67-T4b 符号补边失败（fail-open；已落边账=%s）",
                        out.get("symbol_consumption_edges"), exc_info=True)
     try:

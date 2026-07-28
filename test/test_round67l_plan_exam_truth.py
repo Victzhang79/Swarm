@@ -333,6 +333,18 @@ def test_negated_classname_bareword_not_weakened_to_import_anchor():
     assert st.harness.verify_commands == [v1, v2]
 
 
+def test_finish_pass_crash_marks_failed_machine_readable(monkeypatch):
+    """终扫整改：finish 各确定性 pass 崩溃必须落 *_failed 机读标记（通用扫尾进
+    degraded_reasons）——崩溃≠零命中可区分，绝不只剩无人 grep 的 WARNING。"""
+    import swarm.brain.plan_finisher as pf
+    st = _st("s1", create=["m/A.java"], verify=["grep -q 'x' m/A.java"])
+    plan = _plan(st)
+    monkeypatch.setattr(pf, "wire_symbol_consumption_edges",
+                        lambda _p: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = pf.finish_plan_deterministic(plan, None)
+    assert out.get("symbol_consumption_edges_failed") is True, out
+
+
 # ─── ⑦ 显式坐标 LLM 版本主张不得直采（maven_registry）───
 
 
