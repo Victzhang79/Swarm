@@ -2878,6 +2878,9 @@ async def plan(state: BrainState) -> dict:
         # 能清→愈后陈旧永久误拦 should_write_success 学习+误导 deliver，coverage_gap_residual 同律）★；
         # 纯诚实观测非门（未愈由 L2 真失败兜底），刻意不硬 REJECT 避免复刻 round67e 重产不收敛熔断。
         "contract_symbol_paths_unhealed": _finish_out.get("contract_symbol_paths_unhealed") or [],
+        # R67M-T1（复核 A6/hunter F4）：禁令散文自愈成功账 always-emit——成功账零消费=新账
+        # 无人收盲区；last-write-wins（无命中={} 不粘滞），失败侧由 *_failed 通用扫尾进 degraded。
+        "dep_ban_reconciled": _finish_out.get("dep_ban_reconciled") or {},
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
         # R32-1 U2 + R35-C always-emit：本轮成功批缓存（非分批/降级路径恒 {}）。

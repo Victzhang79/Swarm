@@ -1000,6 +1000,90 @@ _TEMPLATE_DEP_RE = re.compile(
 _MAVEN_COORD_RE = re.compile(r"\b([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+:[0-9][A-Za-z0-9_.\-]*)\b")
 
 
+def _ban_sentence_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """禁令命中所在整句的 (起, 止) 下标（句号/换行界）——R67M-T1 提 module 级（③d 与
+    finisher 自愈共用；复核 A5：finisher 不得内联复制句界逻辑，两处口径漂移=两闸判据分叉）。"""
+    _s = max(text.rfind("。", 0, start), text.rfind("\n", 0, start)) + 1
+    _e_cands = [i for i in (text.find("。", end), text.find("\n", end)) if i != -1]
+    return _s, (min(_e_cands) if _e_cands else len(text))
+
+
+def _ban_sentence_of(text: str, start: int, end: int) -> str:
+    """禁令命中所在的整句（句号/换行界）。"""
+    _s, _e = _ban_sentence_span(text, start, end)
+    return text[_s:_e]
+
+
+_JDK_ONLY_BAN_RE = re.compile(r"仅用\s*JDK|只用\s*JDK")
+
+
+def _dep_ban_scope(ban_sentence: str) -> str:
+    """禁令覆盖域（R67M-T1）：句内含"仅用/只用 JDK"→ all（任何坐标皆矛盾，内部模块接线
+    也算）；其余（『零第三方依赖』『任何第三方…』型）→ third_party——内部 reactor 坐标
+    不矛盾（worker 可"零第三方+内部接线"两满足，round67m st-1 型过度旗标精化）。
+    ★复核 A2 整改★all 判定锚 JDK（与 _UNIVERSAL_DEP_BAN_RE 交替形同源），绝不裸子串——
+    『零第三方依赖，只用内部模块接线』『鉴权只用 ShiroUtils』（round67m cassette 高频实语料）
+    会被裸子串误升 all：内部坐标误杀 REJECT 且自愈按设计跳过 all=复刻重产燃烧环。"""
+    return "all" if _JDK_ONLY_BAN_RE.search(ban_sentence) else "third_party"
+
+
+def _coord_artifact(coord: str) -> str:
+    """g:a:v / 裸 artifactId → artifactId（③d/自愈同源）。"""
+    parts = str(coord).split(":")
+    return parts[1] if len(parts) >= 2 else parts[0]
+
+
+def _internal_module_artifacts(plan) -> set[str]:
+    """plan 内模块物理根名集（scope 路径首段，小写）——Maven 惯例 artifactId=模块目录名；
+    栈中立纯路径形态推导（round67m st-1：ruoyi-common/quartz/system 皆内部接线非第三方）。"""
+    from swarm.brain.contract_utils import _norm_scope_path
+    roots: set[str] = set()
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        for lst in ("create_files", "writable", "readable"):
+            for f in (getattr(sc, lst, None) or []):
+                seg = _norm_scope_path(str(f)).split("/", 1)[0]
+                if seg:
+                    roots.add(seg.lower())
+    return roots
+
+
+_TEMPLATE_DEP_FULL_RE = re.compile(
+    r"<dependency>.*?<groupId>\s*([^<\s]+)\s*</groupId>.*?"
+    r"<artifactId>\s*([^<\s]+)\s*</artifactId>.*?</dependency>", re.S)
+
+
+def _internal_dep_groups(plan, internal_arts: set[str]) -> set[str]:
+    """工程 group 证据集（R67M-T1 复核 A3）：plan 各子任务权威 pom 模板中 artifactId 命中
+    模块物理根的 <dependency> 的 groupId——模板是规划期确定性注入的权威块，与模块根配对
+    出现的 group 即 reactor 工程 group（com.ruoyi 型）。全坐标（g:a:v）豁免必须 group∈本集，
+    裸 artifactId 撞模块目录名不够（org.quartz-scheduler:quartz 撞模块目录 quartz 的
+    fail-open 封堵）。诚实边界：第三方 group 仅当其 artifactId 也撞模块根时才可能混入——
+    该形态下模板注入本身就是矛盾一方，属残余非硬保证面（根在 LLM 声明+模板内容）。"""
+    groups: set[str] = set()
+    for st in getattr(plan, "subtasks", None) or []:
+        desc = str(getattr(st, "description", "") or "")
+        for m in _TEMPLATE_DEP_FULL_RE.finditer(desc):
+            if m.group(2).strip().lower() in internal_arts:
+                groups.add(m.group(1).strip().lower())
+    return groups
+
+
+def _is_internal_dep_coord(coord: str, internal_arts: set[str],
+                           internal_groups: set[str]) -> bool:
+    """注入坐标=内部 reactor 接线？（③d/finisher 自愈同源判据，R67M-T1）：artifactId 撞
+    plan 模块物理根 ∧（裸 artifactId（权威 pom 模板注入形态，模板自身即内部接线声明）
+    ｜全坐标 g:a:v 的 group∈工程 group 证据集（复核 A3：防外部 artifactId 撞模块目录名
+    静默过闸））。"""
+    if _coord_artifact(coord).lower() not in internal_arts:
+        return False
+    if ":" not in str(coord):
+        return True
+    return str(coord).split(":", 1)[0].strip().lower() in internal_groups
+
+
 def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
     """R67-T7a：子任务考卷（description+acceptance）内"依赖禁令 vs 注入依赖"自相矛盾检测。
 
@@ -1013,6 +1097,18 @@ def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
       无关依赖并存合法（不误伤）。
     返回 [(subtask_id, 禁令摘录, [冲突坐标…])…]；哪侧错因案而异，交打回反馈让 LLM 显式
     裁决（剥依赖或删禁令），绝不静默挑边（与 T2 lombok 有磁盘实证可自动剥不同，此处无实证）。
+
+    ★R67M-T1 语义精化（round67m 三轮燃烧实证修订，复核 A2/A3/A4 硬化）★：
+    - 禁令 scope 二分（_dep_ban_scope，锚 JDK 与禁令正则同源）：句含"仅用/只用 JDK"→ all
+      （维持全矛盾语义，交 LLM 裁决通道对"仅用 JDK vs 坐标注入"族仍适用）；其余
+      『零第三方依赖』『任何第三方…』型 → third_party——注入坐标判为内部 reactor 接线者
+      【不矛盾】（_is_internal_dep_coord：artifactId 撞模块物理根 ∧ 裸模板形态或全坐标
+      group∈工程 group 证据集；worker 可"零第三方+内部接线"两满足，round67m 轮1 st-1 型
+      过度旗标精化）。豁免动作全豁免 WARNING/部分 INFO 可观测（复核 A4）。
+    - 残余真第三方矛盾（third_party 且坐标为 spring-boot-starter-* 等外部库）仍在此 REJECT，
+      但 R67M-T1 finisher 自愈（reconcile_dep_ban_prose）先于 validate 把禁令句相对化
+      （"除已声明必需依赖外不引入新第三方依赖"），相对句天然命中下方相对表述豁免——
+      真矛盾在规划期确定性消弭，不再交"修一拨冒一拨"的 LLM 重产循环（round67m 死因根）。
     """
     out: list[tuple[str, str, list[str]]] = []
     for st in getattr(plan, "subtasks", None) or []:
@@ -1025,24 +1121,43 @@ def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
         # ★复核 HIGH 整改×2★逐命中判软化（二轮复核逮 .search() 首命中短路：前句软化命中
         # 会掩护后句独立硬禁令）——任一命中所在句无软化措辞即矛盾。
 
-        def _sentence_of(text: str, start: int, end: int) -> str:
-            _s = max(text.rfind("。", 0, start), text.rfind("\n", 0, start)) + 1
-            _e_cands = [i for i in (text.find("。", end), text.find("\n", end)) if i != -1]
-            return text[_s:min(_e_cands) if _e_cands else len(text)]
-
         _hard_ban = None
         for m_uni in _UNIVERSAL_DEP_BAN_RE.finditer(desc):
-            if not _BAN_SOFTENER_RE.search(_sentence_of(desc, m_uni.start(), m_uni.end())):
+            if not _BAN_SOFTENER_RE.search(_ban_sentence_of(desc, m_uni.start(), m_uni.end())):
                 _hard_ban = m_uni.group(0)
+                _hard_ban_sent = _ban_sentence_of(desc, m_uni.start(), m_uni.end())
                 break
         if _hard_ban is not None:
-            out.append((str(getattr(st, "id", "?")), _hard_ban, injected[:6]))
+            # R67M-T1 scope 过滤：third_party 禁令剔除内部 reactor 坐标（模块物理根=artifactId
+            # 惯例+全坐标 group 证据，复核 A3）；all（仅用/只用 JDK）维持全矛盾语义不过滤。
+            if _dep_ban_scope(_hard_ban_sent) == "third_party":
+                internal_arts = _internal_module_artifacts(plan)
+                internal_groups = _internal_dep_groups(plan, internal_arts)
+                exempted: list[str] = []
+                hits = []
+                for a in injected:
+                    (exempted if _is_internal_dep_coord(a, internal_arts, internal_groups)
+                     else hits).append(a)
+                if exempted:
+                    # 复核 A4：豁免路径必须可观测——全豁免=闸门因此放行，撞名误豁时这是
+                    # 唯一观测点（降级路径至少 WARNING 纪律）；部分豁免 REJECT 面仍在，INFO。
+                    logger.log(
+                        logging.WARNING if not hits else logging.INFO,
+                        "[G1-③d] R67M-T1 内部 reactor 坐标豁免：子任务 %s 第三方禁令下 %d 个注入"
+                        "坐标判为内部接线（%s），%s——若属 artifactId 撞名误豁，此处为唯一观测点",
+                        getattr(st, "id", "?"), len(exempted), exempted[:6],
+                        "全部豁免放行" if not hits else f"残余 {len(hits)} 个仍判矛盾")
+                if not hits:
+                    continue
+            else:
+                hits = list(injected)
+            out.append((str(getattr(st, "id", "?")), _hard_ban, hits[:6]))
             continue
         # ★hunter(b) 二轮整改★具名禁令同样过软化句窗——"尽量不使用 Lombok，如确有必要可
         # 少量引入"是软偏好非硬禁令（round65e10 同族措辞），不入 banned_names。
         banned_names: set[str] = set()
         for m in _SPECIFIC_DEP_BAN_RE.finditer(desc):
-            if _BAN_SOFTENER_RE.search(_sentence_of(desc, m.start(), m.end())):
+            if _BAN_SOFTENER_RE.search(_ban_sentence_of(desc, m.start(), m.end())):
                 continue
             for name in re.split(r"[/、\s]+", m.group(1)):
                 if len(name) >= 3:

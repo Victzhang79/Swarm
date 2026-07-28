@@ -1141,6 +1141,99 @@ def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
     return rewritten
 
 
+def reconcile_dep_ban_prose(plan) -> dict[str, dict]:
+    """R67M-T1（round67m FAILED@PLAN 死因治本）：依赖禁令散文 vs 注入坐标的【真矛盾】
+    确定性自愈——把全称硬禁令改写为相对禁令，消弭 ③d 打回面，不再交"修一拨冒一拨"的
+    LLM 重产循环。
+
+    round67m 三轮燃烧实证（轮1 st-1 / 轮2 st-11-1,11-2『零第三方依赖』vs 坐标注入，每轮
+    ~35min k3 全量重产，MAX_PLAN_RETRY 3/3 耗尽终态 FAILED）：③d 原设计"交打回反馈让 LLM
+    显式裁决"对本族不可靠——LLM 每轮修一拨冒一拨。
+
+    自愈边界（保守不挑边，与 ③d 同判据同源代码）：
+      - 只动 ③d 会判【真矛盾】的禁令句：全称禁令命中 ∧ 无软化词 ∧ scope=third_party ∧
+        注入坐标经 ③d 同源过滤（_is_internal_dep_coord：内部 reactor 坐标=模块物理根+
+        全坐标 group 证据，复核 A3）后仍有真第三方冲突（spring-boot-starter-* 型）。
+      - 改写方向=相对化（"除已声明必需依赖外不引入新的第三方依赖"）：既不删禁令（保守卫
+        价值）也不剥坐标（不挑边——与 R65E10-T2 lombok 有磁盘实证可自动剥不同，此处无实证）。
+        相对句天然命中 ③d 相对表述豁免（模板列既有依赖不构成矛盾），规划期确定性消弭。
+      - ★复核 A1（CRITICAL）★原位改写必须保否定：match 前已有禁止动词（不引入/禁止/不得…）
+        才用名词形；否则（『零第三方依赖』型否定在 match 内）用子句形（自带"不引入"）——
+        名词形无条件替换会把『实现X：零第三方依赖。』改成肯定式病句（否定随匹配段被吞），
+        ③d 静默=假过。
+      - "仅用/只用 JDK"（scope=all）不动——该语义下任何坐标注入皆矛盾，改写会架空设计
+        声明；仍交 ③d REJECT（fail-closed）。
+      - 具名禁令面不动（具名禁令与无关依赖并存合法，本就零误杀面）。
+
+    返回 {sid: {"old": 原禁令句, "coords": [冲突坐标…]}} 机读账。
+    """
+    from swarm.brain.plan_validator import (
+        _BAN_SOFTENER_RE, _MAVEN_COORD_RE, _TEMPLATE_DEP_RE, _UNIVERSAL_DEP_BAN_RE,
+        _ban_sentence_span, _dep_ban_scope, _internal_dep_groups,
+        _internal_module_artifacts, _is_internal_dep_coord,
+    )
+    # 相对禁令改写件三形：整句形（裸禁令句整句替换）/子句形（原位替换且自带"不引入"保否定）
+    # /名词形（仅 match 前已有禁止动词时用，否定由残留动词承载，复核 A1）。三形均刻意避开
+    # _UNIVERSAL_DEP_BAN_RE/_SPECIFIC_DEP_BAN_RE 的命中面（无"任何第三方"连续字、无"零第三方
+    # 依赖"、无"仅用/只用"、"不引入"后不接 ASCII 名）——幂等。
+    _REL_SENT = "除本任务已声明的必需依赖外，不引入新的第三方依赖"
+    _REL_CLAUSE = "除本任务已声明的必需依赖外不引入新的第三方依赖"
+    _REL_NOUN = "本任务已声明必需依赖之外的新第三方依赖"
+    _PROHIB_VERB_RE = _re.compile(
+        r"(?:不引入|不使用|不依赖|禁止引入|禁止使用|不得引入|不得使用|严禁引入|严禁使用"
+        r"|禁止|严禁|不得|勿用)$")
+    reconciled: dict[str, dict] = {}
+    internal_arts = _internal_module_artifacts(plan)
+    internal_groups = _internal_dep_groups(plan, internal_arts)
+    for st in getattr(plan, "subtasks", None) or []:
+        desc = str(getattr(st, "description", "") or "")
+        ac_text = "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or []))
+        injected = [a.strip() for a in _TEMPLATE_DEP_RE.findall(desc)]
+        injected += _MAVEN_COORD_RE.findall(ac_text)
+        if not injected:
+            continue
+        # ③d 同源 scope 过滤：内部 reactor 坐标豁免后仍有真第三方冲突才有自愈面
+        hits = [a for a in injected
+                if not _is_internal_dep_coord(a, internal_arts, internal_groups)]
+        if not hits:
+            continue
+        old_sent = None
+        while True:  # 替换改变串长→每轮重扫；替换件不再命中禁令正则，保证收敛
+            m_uni = None
+            sent = None
+            s_lo = s_hi = 0
+            for m in _UNIVERSAL_DEP_BAN_RE.finditer(desc):
+                _s, _e = _ban_sentence_span(desc, m.start(), m.end())  # 复核 A5：共享句界
+                sent = desc[_s:_e]
+                if _BAN_SOFTENER_RE.search(sent):
+                    continue
+                if _dep_ban_scope(sent) == "all":
+                    continue  # 仅用/只用 JDK：改写架空设计声明，留 ③d REJECT（fail-closed）
+                m_uni, s_lo, s_hi = m, _s, _e
+                break
+            if m_uni is None:
+                break
+            if old_sent is None:
+                old_sent = sent
+            if sent.strip() == m_uni.group(0).strip():
+                desc = desc[:s_lo] + _REL_SENT + desc[s_hi:]      # 裸禁令句→整句相对化
+            elif _PROHIB_VERB_RE.search(desc[s_lo:m_uni.start()].rstrip()):
+                desc = desc[:m_uni.start()] + _REL_NOUN + desc[m_uni.end():]  # 前有禁止动词→名词形
+            else:
+                desc = desc[:m_uni.start()] + _REL_CLAUSE + desc[m_uni.end():]  # 否定在 match 内→子句形保否定（A1）
+        if old_sent is not None:
+            st.description = desc
+            reconciled[str(getattr(st, "id", "?"))] = {"old": old_sent.strip(),
+                                                       "coords": hits[:6]}
+    if reconciled:
+        logger.warning(
+            "[PLAN-FINISH] R67M-T1 依赖禁令散文自愈：%d 个子任务的全称硬禁令已相对化"
+            "（除已声明必需依赖外不引入新第三方依赖）——round67m 三轮燃烧死因治本，"
+            "真矛盾不再交 LLM 重产循环: %s",
+            len(reconciled), sorted(reconciled))
+    return reconciled
+
+
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
                               shared_contract: dict | None = None,
@@ -1432,6 +1525,17 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
     except Exception:  # noqa: BLE001 — fail-open，原样考卷留执行期
         out["negated_grep_sanitize_failed"] = True  # 复核 M-2：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67L-B3⑥ 禁令 grep 语义闸失败（fail-open）",
+                       exc_info=True)
+    try:
+        # R67M-T1（round67m 三轮燃烧死因治本）：依赖禁令散文真矛盾确定性自愈——放【末端】
+        # （reconcile_template_exam/H3b 对账已定格考卷注入坐标，本 pass 只把 ③d 会判真矛盾
+        # 的全称禁令句相对化）。fail-open：自愈挂了 ③d 兜底打回，不更糟。
+        _rdb = reconcile_dep_ban_prose(plan)
+        if _rdb:
+            out["dep_ban_reconciled"] = _rdb
+    except Exception:  # noqa: BLE001 — fail-open，③d 兜底
+        out["dep_ban_reconcile_failed"] = True  # 崩溃≠零命中，通用扫尾自动进 degraded
+        logger.warning("[PLAN-FINISH] R67M-T1 依赖禁令散文自愈失败（fail-open，③d 兜底）",
                        exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):

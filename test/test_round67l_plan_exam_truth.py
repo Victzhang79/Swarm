@@ -400,3 +400,149 @@ def test_explicit_reactor_module_pinned_project_version(monkeypatch):
     kept, dropped = mr.resolve_artifacts("/x", ["com.ruoyi:ruoyi-alarm:9.9.9"], idx=idx)
     assert dropped == []
     assert kept[0].version == "${project.version}", "reactor 兄弟钉 ${project.version}"
+
+
+# ─── R67M-T1（round67m FAILED@PLAN 死因治本）：依赖禁令散文真矛盾确定性自愈 ───
+
+from swarm.brain.plan_finisher import reconcile_dep_ban_prose  # noqa: E402
+from swarm.brain.plan_validator import _exam_dependency_contradictions  # noqa: E402
+
+
+def test_dep_ban_reconcile_third_party_vs_external_coord_self_heals():
+    """round67m 轮2 st-11 型：禁令『零第三方依赖』vs AC 强制 spring-boot-starter-web——
+    自愈把禁令相对化（不删不剥不挑边），③d 净、机读账落。"""
+    st = _st("st-11-1", create=["ruoyi-alarm/src/main/java/com/a/Engine.java"],
+             desc="实现预警编排引擎：零第三方依赖。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    assert _exam_dependency_contradictions(plan), "前置：自愈前 ③d 必须判真矛盾"
+    out = reconcile_dep_ban_prose(plan)
+    assert "st-11-1" in out
+    assert out["st-11-1"]["coords"] == ["org.springframework.boot:spring-boot-starter-web:3.2.0"]
+    assert "零第三方依赖" not in st.description
+    # 复核 A1（CRITICAL）：原位改写必须保否定——『零第三方依赖』的否定在 match 内，名词形
+    # 无条件替换会产出肯定式病句『实现X：…的新第三方依赖。』（禁令被删+③d 静默=假过）。
+    assert st.description == "实现预警编排引擎：除本任务已声明的必需依赖外不引入新的第三方依赖。"
+    assert "不引入" in st.description, "禁令须相对化而非删除（保守卫价值）"
+    assert _exam_dependency_contradictions(plan) == [], "自愈后 ③d 必须净（相对表述豁免）"
+
+
+def test_dep_ban_reconcile_bare_ban_sentence_whole_replaced():
+    """裸禁令句（整句=禁令本体）→ 整句替换为完整相对禁令句。"""
+    st = _st("st-1", create=["ruoyi-alarm/src/main/java/com/a/A.java"],
+             desc="零第三方依赖。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    out = reconcile_dep_ban_prose(plan)
+    assert "st-1" in out
+    assert st.description == "除本任务已声明的必需依赖外，不引入新的第三方依赖。"
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_reconcile_idempotent():
+    """幂等：改写件不再命中禁令正则，二次跑零命中。"""
+    st = _st("st-1", create=["ruoyi-alarm/src/main/java/com/a/A.java"],
+             desc="实现引擎：零第三方依赖。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    assert reconcile_dep_ban_prose(plan)
+    assert reconcile_dep_ban_prose(plan) == {}, "二次自愈必须零命中（幂等）"
+
+
+def test_dep_ban_reconcile_jdk_only_untouched_fail_closed():
+    """『仅用 JDK』（scope=all）不动——改写会架空设计声明，留 ③d REJECT（fail-closed）。"""
+    st = _st("st-8-1", create=["m/src/main/java/com/a/Totp.java"],
+             desc="仅用 JDK javax.crypto.Mac 手写 TOTP，不引入任何第三方运行时依赖。",
+             ac=["pom.xml 必须声明 com.warrenstrange:googleauth:1.5.0"])
+    plan = _plan(st, _st("st-2", create=["m2/src/main/java/com/b/B.java"]))
+    assert reconcile_dep_ban_prose(plan) == {}, "仅用 JDK 语义不得自愈（留 ③d 打回）"
+    assert "仅用 JDK" in st.description
+    assert _exam_dependency_contradictions(plan), "③d 硬底必须维持 REJECT"
+
+
+def test_dep_ban_reconcile_softened_ban_untouched():
+    """软化句（尽量/如确有必要）=软偏好非硬禁令，③d 本就不旗，自愈也不动。"""
+    st = _st("st-1", create=["ruoyi-alarm/src/main/java/com/a/A.java"],
+             desc="尽量零第三方依赖，如确有必要可少量引入。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    assert reconcile_dep_ban_prose(plan) == {}
+    assert "尽量零第三方依赖" in st.description
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_reconcile_internal_coords_only_no_heal():
+    """内部 reactor 坐标已被 ③d scope 精化豁免，无真矛盾 → 自愈零命中（不过度改写）。"""
+    desc = ("实现 SDK：零第三方依赖。\n【权威 pom 模板】\n<dependencies>\n"
+            "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId>"
+            "</dependency>\n</dependencies>")
+    st = _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc)
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    assert reconcile_dep_ban_prose(plan) == {}
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_reconcile_prohibitive_prefix_uses_noun_form():
+    """复核 A1 交替面：match 前已有禁止动词（不引入任何第三方…）→ 原位名词化，
+    否定由残留动词承载（不引入本任务已声明必需依赖之外的新第三方依赖）。"""
+    st = _st("st-1", create=["ruoyi-alarm/src/main/java/com/a/A.java"],
+             desc="实现引擎：不引入任何第三方运行时依赖。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    out = reconcile_dep_ban_prose(plan)
+    assert "st-1" in out
+    assert st.description == "实现引擎：不引入本任务已声明必需依赖之外的新第三方依赖。"
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_scope_only_internal_modules_clause_not_misread_as_all():
+    """复核 A2：『只用内部模块接线』不得误判 scope=all（裸子串"只用"误升 all=内部坐标
+    误杀+自愈跳过=复刻 round67m 重产燃烧环；『鉴权只用 ShiroUtils』同族）。"""
+    st = _st("st-1", create=["ruoyi-alarm/src/main/java/com/a/A.java"],
+             desc="实现 SDK：零第三方依赖，只用内部模块接线。",
+             ac=["pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    out = reconcile_dep_ban_prose(plan)
+    assert "st-1" in out, "scope 误判 all 会跳过自愈（复核 A2）"
+    assert "不引入" in st.description
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_external_coord_colliding_module_dir_still_rejected():
+    """复核 A3：全坐标 group 无工程证据时，artifactId 撞模块目录名不得豁免——
+    org.quartz-scheduler:quartz 撞模块目录 quartz=真外部矛盾，静默豁免=fail-open。"""
+    st = _st("st-1", create=["quartz/src/main/java/com/a/A.java"],
+             desc="实现调度桥：零第三方依赖。",
+             ac=["pom.xml 必须声明 org.quartz-scheduler:quartz:2.3.2"])
+    plan = _plan(st, _st("st-2", create=["web/src/main/java/com/b/B.java"]))
+    assert _exam_dependency_contradictions(plan), "撞名全坐标必须维持 REJECT（group 无证据）"
+    assert reconcile_dep_ban_prose(plan), "真矛盾必须自愈（禁令相对化）"
+    assert _exam_dependency_contradictions(plan) == []
+
+
+def test_dep_ban_internal_full_coord_with_group_evidence_exempted():
+    """复核 A3 对称面：全坐标 group∈工程 group 证据集（模板 com.ruoyi:* 配对模块根）
+    ∧ artifact 撞模块根 → 内部接线豁免成立（round67m st-1 型全坐标形态）。"""
+    desc = ("实现 SDK：零第三方依赖。\n【权威 pom 模板】\n<dependencies>\n"
+            "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId>"
+            "</dependency>\n</dependencies>")
+    st = _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc,
+             ac=["pom.xml 必须声明 com.ruoyi:ruoyi-quartz:5.0.0"])
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    assert _exam_dependency_contradictions(plan) == [], "工程 group 证据+模块根的全坐标应豁免"
+    assert reconcile_dep_ban_prose(plan) == {}, "无真矛盾不得改写"
+
+
+def test_dep_ban_exemption_all_exempted_logs_warning(caplog):
+    """复核 A4：全部豁免（闸门因此放行）必须 WARNING 可观测——撞名误豁时这是唯一
+    观测点（降级路径至少 WARNING 纪律）。"""
+    import logging
+    desc = ("实现 SDK：零第三方依赖。\n【权威 pom 模板】\n<dependencies>\n"
+            "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId>"
+            "</dependency>\n</dependencies>")
+    st = _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc)
+    plan = _plan(st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]))
+    with caplog.at_level(logging.INFO):
+        assert _exam_dependency_contradictions(plan) == []
+    assert any("内部 reactor 坐标豁免" in (r.message or "") and r.levelno >= logging.WARNING
+               for r in caplog.records), "全豁免放行必须 WARNING（复核 A4）"

@@ -450,6 +450,62 @@ def test_t7a_no_ban_no_reject():
     assert validate_module_coherence(plan).valid
 
 
+# ── R67M-T1（round67m 死因治本）：③d scope 精化——第三方禁令 vs 内部 reactor 坐标不矛盾 ──
+def test_r67m_third_party_ban_vs_internal_reactor_coords_not_flagged():
+    """round67m 轮1 st-1 型：禁令『零第三方依赖』（句内无"仅用/只用 JDK"）vs 模板注入
+    ruoyi-common/quartz/system——内部 reactor 接线非第三方依赖，worker 可两满足，不再误旗。"""
+    desc = (
+        "实现告警编排客户端 SDK：零第三方依赖。\n【权威 pom 模板】\n<dependencies>\n"
+        "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId></dependency>\n"
+        "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-quartz</artifactId></dependency>\n"
+        "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-system</artifactId></dependency>\n"
+        "</dependencies>")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc),
+        _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"]),
+        _st("st-3", create=["ruoyi-system/src/main/java/com/c/C.java"])])
+    assert validate_module_coherence(plan).valid, \
+        "第三方禁令 vs 内部 reactor 坐标被误判矛盾（R67M-T1 scope 精化未生效）"
+
+
+def test_r67m_jdk_only_ban_still_flags_any_coord():
+    """scope=all 精化不动：『仅用 JDK』语义下任何坐标注入（含内部模块）皆矛盾，仍 REJECT。"""
+    desc = (
+        "本 SDK 仅用 JDK 标准库实现。\n【权威 pom 模板】\n<dependencies>\n"
+        "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId></dependency>\n"
+        "</dependencies>")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc),
+        _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"])])
+    assert not validate_module_coherence(plan).valid, "仅用 JDK vs 坐标注入必须维持 REJECT"
+
+
+def test_r67m_third_party_ban_vs_external_coord_still_rejected():
+    """fail-closed 底：第三方禁令 vs 真外部坐标（spring-boot-starter-web）仍 REJECT
+    （finisher 自愈未跑/未愈时 ③d 硬底不塌）。"""
+    st = _st("st-11-1", create=["ruoyi-alarm/src/main/java/com/a/Engine.java"],
+             desc="实现预警编排引擎：零第三方依赖。")
+    st.acceptance_criteria = [
+        "pom.xml 必须声明 org.springframework.boot:spring-boot-starter-web:3.2.0"]
+    plan = TaskPlan(subtasks=[
+        st, _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"])])
+    assert not validate_module_coherence(plan).valid, "第三方禁令 vs 真外部坐标必须维持 REJECT"
+
+
+def test_r67m_ban_with_only_internal_modules_clause_not_flagged():
+    """复核 A2：禁令句含『只用内部模块接线』不得升 scope=all（裸子串"只用"误升=
+    内部坐标误杀 REJECT+自愈跳过=复刻 round67m 燃烧环；scope 判定锚 JDK 与禁令正则同源）。"""
+    desc = ("实现 SDK：零第三方依赖，只用内部模块接线。\n【权威 pom 模板】\n<dependencies>\n"
+            "<dependency><groupId>com.ruoyi</groupId><artifactId>ruoyi-common</artifactId></dependency>\n"
+            "</dependencies>")
+    plan = TaskPlan(subtasks=[
+        _st("st-1", create=["ruoyi-common/src/main/java/com/a/A.java"], desc=desc),
+        _st("st-2", create=["ruoyi-quartz/src/main/java/com/b/B.java"])])
+    assert validate_module_coherence(plan).valid, \
+        "『只用内部模块』不得误判 scope=all 误杀内部坐标（复核 A2）"
+
+
+
 # ── T7b（R67-9）：负断言锚定扩 sibling——裸词禁令/BRE 交替分支 ─────────────────────
 from swarm.brain.contract_utils import _anchor_forbidden_import_in_cmd  # noqa: E402
 
