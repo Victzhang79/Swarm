@@ -2332,6 +2332,8 @@ async def plan(state: BrainState) -> dict:
             # R67E-P2 always-emit（round-3 复核 LOW 一致性）：SIMPLE 无契约类名 file-path 分叉面，恒发 []
             # 与主路径 always-emit 键风格一致（防跨轮粘滞，同 plan_batch_failed_modules/baseline_covered）。
             "contract_symbol_paths_unhealed": [],
+            # R67M-T2 B5 always-emit：SIMPLE 不走 finish，无 base 查表面，恒 []（防跨轮粘滞）
+            "contract_symbols_base_referenced": [],
             # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
             "baseline_covered": [],
             # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
@@ -2414,6 +2416,10 @@ async def plan(state: BrainState) -> dict:
             f"⚠️ 上一轮生成的执行计划【校验未通过】（第 {state.get('plan_retry_count', 1)} 次重试）。\n"
             f"校验失败的具体问题（本次务必逐条修正，不要重复同样的结构/依赖/缺功能错误）：\n"
             f"{_validation_feedback}\n"
+            # R67M-T2 B1（23号文，round67m 主死因治本）：反回归段——历轮曾暴露而本轮已消失
+            # 的缺陷作"绝不许回归"硬约束注入。round67m 实证：只注上轮反馈+全量重拆=振荡，
+            # 轮4 CVB shadow 与轮1 逐字相同（上轮已修、反馈消失、全量重摇又摇回来）。
+            + _no_regress_feedback_block(state)
             # R31-3 T3：上一版摘要 + 增量修补纪律（治全量重拆掷骰子不收敛）
             + _previous_plan_repair_block(
                 state.get("plan"), state.get("baseline_covered"),
@@ -2697,6 +2703,9 @@ async def plan(state: BrainState) -> dict:
     # worker 可见的完整契约由派发面 build_worker_prompt 以同一 merge 语义（shared 打底 +
     # 子任务覆盖）现场合成，行为等价。
     _contract = state.get("shared_contract_draft") or {}
+    # R2 LOW-N1：本注入只在 task_plan 无自带契约时生效；且 R67M-T2 复核 F2 起，finish/
+    # 回写以【持久契约】（state.shared_contract）为准——重试轮 LLM 自带契约让位
+    # （2709-2713 "其余键以 plan 自身为准"仅首轮成立），防跨轮漂移+防缩契约空过校验。
     if _contract and not (task_plan.shared_contract or {}):
         task_plan.shared_contract = _contract
     elif _contract and isinstance(task_plan.shared_contract, dict):
@@ -2829,6 +2838,21 @@ async def plan(state: BrainState) -> dict:
                            exc_info=True)
             _fp_reconcile_degraded.append("file_plan_reconcile_failed")
     from swarm.brain.plan_finisher import finish_plan_deterministic
+    # R67M-T2 复核 F2（hunter MEDIUM-2，T4 pin 同款对象身份坑=planning_nodes.py:3101 明文
+    # 教训）：finish 消费的契约对象必须【原对象】回写——B5 defined_in 归位就地变异该对象；
+    # 若回写 task_plan.shared_contract（重试轮=draft 反序列化的另一副本），归位被静默覆写
+    # =白归位（dispatch 优先读 state 键=幻影 defined_in 照发 worker，烧 L1/L2 诚实失败）。
+    _finish_contract = (state.get("shared_contract")
+                        or getattr(task_plan, "shared_contract", None) or {})
+    if (state.get("shared_contract") and task_plan.shared_contract
+            and task_plan.shared_contract is not _finish_contract
+            and task_plan.shared_contract != _finish_contract):
+        # R2 LOW-R2-2：重试轮 PLAN LLM 自带【内容不同】的新版契约时，state 键优先会让其
+        # 静默丢弃（方向安全=防"LLM 缩契约让校验空过"，validate 本就 state 优先）——
+        # 但静默违反降级可观测，打 WARNING 暴露。
+        logger.warning(
+            "[PLAN] 重试轮 LLM 自带新版 shared_contract 与 state 键内容不一致 → "
+            "按 state 键优先丢弃 LLM 版（防缩契约空过校验；如属合法契约演进请走 REVISE 新周期）")
     _finish_out = finish_plan_deterministic(
         # R65E7-L2：用 L2 增广后的 file_plan（否则 finish 的孤儿承接/脚手架注入看不到补排文件，复核 HIGH）。
         task_plan, (_file_plan if _l2_augmented else state.get("tech_design_file_plan")),
@@ -2837,12 +2861,15 @@ async def plan(state: BrainState) -> dict:
         # R48b-1：③孤儿承接之外，④契约符号安置也进收尾器——P1 命中时 R39-5 符号
         # 外科被 first-match 短路（round48b 最后一轮实锤：P1 补 13 covers 后 19 个
         # 无主硬符号无人处理→三连耗尽 REJECTED），收尾器是唯一全路径必经点。
-        shared_contract=(state.get("shared_contract")
-                         or getattr(task_plan, "shared_contract", None) or {}),
+        shared_contract=_finish_contract,
         # R67B-T1（复核 HIGH）：归属重规范化与 G1/#40 同一 git-pin base 口径
         base_ref=state.get("base_commit"),
         # H-6：孤儿挂靠前置核——裁决账 strip/relocate 路径绝不重挂（挂靠=复活已裁决违例）。
         adjudications=_fp_adjudications)
+    if _finish_contract:
+        # F2 配套：plan 对象内嵌契约与 state 键同一对象，防两副本漂移（读 plan.shared_contract
+        # 的面与读 state["shared_contract"] 的面必须看到同一份归位结果）。
+        task_plan.shared_contract = _finish_contract
 
     plan_touch = touch_context(
         state,
@@ -2851,7 +2878,7 @@ async def plan(state: BrainState) -> dict:
     )
     return {
         "plan": task_plan,
-        "shared_contract": task_plan.shared_contract or {},
+        "shared_contract": _finish_contract,
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
         ) + (
@@ -2881,6 +2908,10 @@ async def plan(state: BrainState) -> dict:
         # R67M-T1（复核 A6/hunter F4）：禁令散文自愈成功账 always-emit——成功账零消费=新账
         # 无人收盲区；last-write-wins（无命中={} 不粘滞），失败侧由 *_failed 通用扫尾进 degraded。
         "dep_ban_reconciled": _finish_out.get("dep_ban_reconciled") or {},
+        # R67M-T2 B5：安置前 base 查表转换账 always-emit（同 dep_ban_reconciled 口径：
+        # 成功账零消费=新账无人收盲区；last-write-wins 无转换=[] 不粘滞）。
+        "contract_symbols_base_referenced":
+            _finish_out.get("contract_symbols_base_referenced") or [],
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
         # R32-1 U2 + R35-C always-emit：本轮成功批缓存（非分批/降级路径恒 {}）。
@@ -3022,6 +3053,26 @@ def _r65e9_ineligible_feedback(new_rejected: list[str] | None) -> str:
         "基线【极可能】并无这些能力（更可能是新功能）。下一轮【禁止】再对这些 ID 申报 "
         "baseline_covered——须为每条分配子任务实现并在其 covers 声明该 ID；"
         "若确信系存量，其能力术语必与现有代码符号/文件名有别，请改用真实存在该能力的类名/文件名作证。\n")
+
+
+def _no_regress_feedback_block(state) -> str:
+    """R67M-T2 B1（23号文，round67m 主死因治本）：反回归反馈段——历轮校验曾暴露而
+    【本轮已消失】的 issues 列作"绝不许回归"硬约束（纯函数，plan 注入点与测试共用）。
+
+    round67m 四轮打回实证：反馈只注上轮+全量重拆=非单调振荡——轮 n 修好的缺陷在轮 n+1
+    的反馈里消失，全量重摇把它摇回来（轮4 CVB shadow 与轮1 逐字相同=纯回归烧 3h15m）。
+    历史账由 increment_retry 单点累积（plan_validation_issue_history）；本轮仍失败的
+    issues 由"务必逐条修正"段承载，本段只列【已修掉、不得回归】的差集。无差集→空串
+    （首轮重试/历轮缺陷全部未愈时零噪声）。"""
+    hist = [str(h).strip() for h in (state.get("plan_validation_issue_history") or [])]
+    cur = {str(i).strip() for i in (state.get("plan_validation_issues") or [])}
+    no_regress = [h for h in hist if h and h not in cur]
+    if not no_regress:
+        return ""
+    return (
+        "🚫 历轮校验曾暴露的缺陷（此前轮次已修掉，本次重产【绝不许回归】——"
+        "全量重拆时也必须保持这些修复）：\n"
+        + "\n".join(f"- {h}" for h in no_regress) + "\n")
 
 
 def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
@@ -3180,6 +3231,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_retry_count": retry_count,
             "plan_validation_issues": [],
             "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
+            "plan_validation_issue_history": [],  # R67M-T2 B1：通过即清修复记忆（防跨轮粘滞）
             # R35-C 复核（hunter #3）：SIMPLE 通过路径也显式清缓存——结构对称，绝不依赖上游
             # plan() 同轮 SIMPLE 分支的顺带清理（跨节点隐式不变量正是横切盲区，见记忆）。
             "plan_batch_cache": {},
@@ -3684,6 +3736,9 @@ async def validate_plan(state: BrainState) -> dict:
         "plan_validation_issues": _final_issues,
         # D09：LLM/P6b 完整性校验失败原因回灌 PLAN（通过则清空，防跨轮粘滞）
         "plan_validation_feedback": "" if plan_valid else _format_validation_feedback(_final_issues, rotate=retry_count),
+        # R67M-T2 B1：校验【通过】即清空修复记忆（与 feedback/plan_batch_cache 同律——
+        # 过闸后无更多 PLAN 回炉轮，历史账长途漂流只会误导后续周期）。
+        **({"plan_validation_issue_history": []} if plan_valid else {}),
         # R35-C 配套（F-4 膨胀兜底）：校验【通过】即清空 plan-batch 缓存——过闸后进 CONFIRM/
         # DISPATCH 无更多 PLAN 回炉轮，缓存无人再消费，清掉不让数十 KB 死重随后续 checkpoint
         # 长途漂流（D51 病灶同族）。未通过(回炉 PLAN)不清=下一轮护栏要用。
@@ -3846,6 +3901,7 @@ def confirm_plan(state: BrainState) -> dict:
     if human_decision == HumanDecision.REVISE:
         _patch_out["plan_retry_count"] = 0
         _patch_out["plan_validation_prev_structural"] = {}
+        _patch_out["plan_validation_issue_history"] = []  # R67M-T2 B1：新周期清修复记忆（同律对称）
     return _patch_out
 
 

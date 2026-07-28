@@ -291,6 +291,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     _resolved_dir: dict[str, str] = {}
     _resolved_ext: dict[str, str] = {}
     _fp_src: dict[str, list[str]] = {}
+    _fp_paths: dict[str, list[str]] = {}   # B5（R67M-T2）base 查表的模块候选根证据源
     phys: dict[str, str] = {}
     if file_plan:
         from swarm.brain.contract_utils import (
@@ -368,6 +369,122 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             # 单模块布局：模板已是完整目录（含 src 段），前缀模块 + 尾段包名
             return f"{mod}/{mod_dirs[''].most_common(1)[0][0]}/{seg}"
         return f"{mod}/{tpl_dir}/{seg}"
+
+    # ── R67M-T2 B5（23号文·round67m CVB 死因治本）：安置前 base 树查表 ──
+    # round67m 实证：契约符号 ISysJobService 是 base 既有实体，LLM 把 defined_in 染成
+    # 新包幻影路径（quartz/task/…）→ C1 判无主 → 本函数造 st-contract-quartz-task 影子
+    # create → G1 ③f _created_class_shadows_base 硬打回（轮1/轮4 同形复发，烧穿重试）。
+    # 治=安置前对 base 树做确定性查表，认出"该符号实为存量引用"并跳过影子安置：
+    #   Case A：契约 defined_in【已指向盘上实存文件】且过证据卫生判据、stem==符号
+    #     （LLM 显式声明=存量引用，round67g 治法A 同形态）→ 信任声明，直接跳过；
+    #   Case B：defined_in 空/幻影 + purpose/description 显式复用语义 + base 树【唯一】
+    #     stem 命中 + 命中落点在该模块候选物理根（file_plan 首段 ∪ phys 根）内
+    #     → 把 defined_in 归位到 base 真身路径，跳过安置。
+    # ★绝不用 base 结构相似度挑边（round67c 血泪）：唯一命中 + LLM 显式声明/显式复用
+    # 语义，缺一即不动★。两案皆不成立 → 原样安置（影子照造、③f fail-closed 硬打回兜底）。
+    # 下游安全：C1 R39-2 存量豁免（baseline_symbol_files 同 stem 命中即豁免）保证转换后
+    # 不再判无主；defined_in=base 真身是 round67g 治法A 已接线的合法下游形态。
+    _base_refs: list[str] = []
+    if todo and project_path and Path(project_path).is_dir():
+        import os as _os
+        # 复核 LOW-2：bin/obj/vendor 同族产物/依赖目录一并剪（与依赖/构建产物同义）。
+        _PRUNE_DIRS = {".git", "node_modules", "target", "build", "dist", "out",
+                       ".gradle", ".idea", ".vscode", "__pycache__", ".codegraph", ".venv",
+                       "bin", "obj", "vendor"}
+        # 复核 F6（reviewer LOW-1/hunter MEDIUM-3②）：否定语境先行排除——"不复用既有 X"
+        # 含 复用/既有 但语义相反。★语言边界如实声明★：意图语料按中文散文设计，英文
+        # "reuse existing" 不命中=覆盖缺口（方向 fail-closed 安全，扩表需独立证据批）。
+        # ★R2 LOW-R2-1★：否定表为示例非穷尽（"不再复用旧接口"会被"再"字滑过）——
+        # 词表扩表=打地鼠，硬底=复合前提（无主+唯一命中+候选根内）+③f fail-closed。
+        _REUSE_INTENT_RE = _re.compile(r"既有|已有|已建|复用|现存|已存在|不新增|无需新增")
+        _REUSE_NEGATE_RE = _re.compile(r"不复用|不再复用|不再使用|不用既有|并非不新增|不是复用")
+
+        def _is_code_evidence(rel: str) -> bool:
+            """base 证据文件卫生判据（Case A/B 单一事实源，复核 F1 reviewer HIGH-1）：
+            代码扩展名（排 _NON_CODE_EXT/pom.*）+ 非 test/tests 段 + 非产物/依赖目录段
+            + 不逃逸项目根。无此判据 Case A 会把 .xml/测试树/构建产物同名文件当存量真身
+            → 跳过安置+C1 豁免放行=迟发编译失败（③f 秒级打回被换成执行期烧钱）。"""
+            segs = rel.split("/")
+            if any(s in ("", ".", "..") for s in segs):
+                return False
+            if any(s in _PRUNE_DIRS for s in segs[:-1]):
+                return False
+            if any(s in ("test", "tests") for s in segs[:-1]):
+                return False
+            base = segs[-1]
+            if "." not in base or base.startswith("pom."):
+                return False
+            return base.rsplit(".", 1)[-1].lower() not in _NON_CODE_EXT
+
+        def _contract_item_of(e: dict) -> dict | None:
+            for it in (shared_contract.get(e["kind"]) or []):
+                if (isinstance(it, dict)
+                        and str(it.get("name") or it.get("id") or "") == e["symbol"]):
+                    return it
+            return None
+
+        # 复核 F3（hunter MEDIUM-1/reviewer MEDIUM-2）：单次 walk 建 stem→paths 索引——
+        # 逐符号全树 walk 是 O(N×树)（plan 节点内联同步执行，事件循环阻塞 R42 F4 同族）。
+        _stem_idx: dict[str, list[str]] = {e["symbol"]: [] for e in todo}
+        for root, dirs, files in _os.walk(project_path):
+            dirs[:] = [d for d in dirs if d not in _PRUNE_DIRS]
+            for fn in files:
+                stem, dot, _fx = fn.rpartition(".")
+                if dot and stem in _stem_idx:
+                    rel = _os.path.relpath(
+                        _os.path.join(root, fn), project_path).replace(_os.sep, "/")
+                    if _is_code_evidence(rel):
+                        _stem_idx[stem].append(rel)
+
+        _todo_keep: list[dict] = []
+        _punts: dict[str, list[str]] = {}   # 复核 F5：punt 方向聚合观测（原因→符号）
+        for e in todo:
+            item = _contract_item_of(e)
+            if item is None:
+                _todo_keep.append(e)
+                continue
+            _di = str(item.get("defined_in") or "").strip().replace("\\", "/").lstrip("/")
+            if (_di and _is_code_evidence(_di)
+                    and _di.rsplit("/", 1)[-1].rsplit(".", 1)[0] == e["symbol"]
+                    and (Path(project_path) / _di).is_file()):
+                # Case A：defined_in 已显式声明在实存 base 代码文件——再安置=造影子。
+                _base_refs.append(f"{e['symbol']}→{_di}(defined_in 实存)")
+                continue
+            hits = _stem_idx.get(e["symbol"]) or []
+            if len(hits) != 1:
+                _todo_keep.append(e)   # 零命中=真新符号；多命中=歧义，留 ③f 裁
+                if hits:
+                    _punts.setdefault("base 多命中歧义", []).append(e["symbol"])
+                continue
+            _hit = hits[0]
+            _cand_roots = (
+                {p.split("/", 1)[0] for p in _fp_paths.get(e["module"], []) if "/" in p}
+                | ({phys[e["module"]].split("/", 1)[0]} if phys.get(e["module"]) else set()))
+            if (not _cand_roots) or _hit.split("/", 1)[0] not in _cand_roots:
+                _todo_keep.append(e)   # 命中不在该模块候选物理根=跨模块同名，不算归属证据
+                _punts.setdefault("命中不在模块候选根", []).append(e["symbol"])
+                continue
+            _prose = " ".join(str(item.get(k) or "")
+                              for k in ("purpose", "description"))
+            if not _REUSE_INTENT_RE.search(_prose) or _REUSE_NEGATE_RE.search(_prose):
+                _todo_keep.append(e)   # 无显式复用语义（或否定语境）→ 不动（fail-closed 留 ③f）
+                _punts.setdefault("无显式复用语义", []).append(e["symbol"])
+                continue
+            # Case B：幻影/空 defined_in 归位到 base 真身（治法A 形态），跳过影子安置。
+            item["defined_in"] = _hit
+            _base_refs.append(f"{e['symbol']}→{_hit}(defined_in 归位)")
+        if _punts:
+            # 复核 F5（hunter MEDIUM-3①）：punt 方向原本零直接观测，复盘只能反推——
+            # 聚合一条 INFO（转换失败方向=按原路径安置，③f 仍是权威兜底，非告警级）。
+            logger.info(
+                "[PLAN-FINISH] R67M-T2-B5 base 查表 punt（证据不足不转换，留安置/③f 权威）: %s",
+                {k: v[:6] for k, v in sorted(_punts.items())})
+        if _base_refs:
+            todo = _todo_keep
+            logger.warning(
+                "[PLAN-FINISH] R67M-T2-B5 安置前 base 查表：%d 个契约符号实为存量引用，"
+                "转 base 引用并跳过影子安置（防 G1 ③f _created_class_shadows_base 硬打回）: %s",
+                len(_base_refs), _base_refs)
 
     groups: dict[str, list[str]] = {}
     for e in todo:
@@ -473,6 +590,10 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             "[PLAN-FINISH] R48b-1 契约符号安置：无主硬符号 %d 个 → 新建/收养 %d 个"
             "承接子任务: %s", len(todo), len(created),
             {k: v[:4] for k, v in created.items()})
+    if _base_refs:
+        # R67M-T2 B5：base 引用转换账以 "_" 前缀元键带出（调用方弹出独立入账；
+        # 键空间与 sid 不相交，harness bootstrap 按 st.id 遍历不受影响）。
+        created["_base_referenced"] = _base_refs
     return created
 
 
@@ -1409,6 +1530,10 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if shared_contract and len(plan.subtasks) > 1:
             dom = _domicile_contract_symbols(
                 plan, shared_contract, project_path, task_description, file_plan)
+            _bref = dom.pop("_base_referenced", None)
+            if _bref:
+                # R67M-T2 B5：安置前 base 查表转换账（影子安置被拦下的存量引用符号）
+                out["contract_symbols_base_referenced"] = _bref
             if dom:
                 out["symbols_domiciled"] = dom
                 from swarm.brain.nodes.shared import bootstrap_subtask_harness

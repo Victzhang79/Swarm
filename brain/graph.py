@@ -471,8 +471,24 @@ def after_deliver(state: BrainState) -> Literal["learn_success", "revision", "le
 
 
 def _increment_plan_retry(state: BrainState) -> dict:
-    """计划重试计数器递增（用于 VALIDATE_PLAN → PLAN 的循环）"""
-    return {"plan_retry_count": state.get("plan_retry_count", 0) + 1}
+    """计划重试计数器递增（用于 VALIDATE_PLAN → PLAN 的循环）。
+
+    R67M-T2 B1（23号文，round67m FAILED@PLAN 主死因治本）：重试循环的【修复记忆】
+    在此单点累积——历轮校验 issues 去重追加。round67m 四轮打回实证：只注上轮
+    issues+全量重拆=非单调振荡（轮4 CVB shadow 与轮1 逐字相同=纯回归，烧 3h15m
+    k3 全量重产）。本节点是所有 validate 失败→PLAN 重试路径的唯一必经边
+    （validate→increment_retry→plan），在此累积=全闸种覆盖、新闸零接线（不打地鼠）。
+    清空纪律：validate 通过 / REVISE·failure replan 新周期（与
+    plan_validation_prev_structural 同点对称）。"""
+    _hist = list(state.get("plan_validation_issue_history") or [])
+    for _it in (state.get("plan_validation_issues") or []):
+        _s = str(_it).strip()
+        if _s and _s not in _hist:
+            _hist.append(_s)
+    return {
+        "plan_retry_count": state.get("plan_retry_count", 0) + 1,
+        "plan_validation_issue_history": _hist,
+    }
 
 
 # ══════════════════════════════════════════════

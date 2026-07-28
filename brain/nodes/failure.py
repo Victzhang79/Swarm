@@ -725,6 +725,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "plan_retry_count": 0,
             "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             "plan_validation_feedback": "",
+            "plan_validation_issue_history": [],  # R67M-T2 B1：runtime replan=新周期清修复记忆（与 feedback 同律）
             # H-6：runtime replan=新规划周期 → 裁决账整体清空（确定性 pass 会在新周期重推导；
             # 同 prev_structural 纪律）。retry 轮不清（跨 retry 正是其存在意义）。
             "file_plan_adjudications": [],
@@ -823,6 +824,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "plan_retry_count": 0,
             "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             "plan_validation_feedback": "",  # 同清跨轮校验粘滞，防旧覆盖 issue 污染新规划
+            "plan_validation_issue_history": [],  # R67M-T2 B1：L2 replan=新周期清修复记忆（同律）
             "file_plan_adjudications": [],  # H-6：L2 replan=新周期 → 裁决账清空重推导
             # D12（2026-07-09 登记册）：全量 replan 出口清 l2_targeted 粘滞——否则下一轮 L2
             # 归因不出（_l2_failure_state 不 emit 该键）时，粘滞 True 把全员连坐误判成"已归因定向"。
@@ -1957,6 +1959,7 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "plan_validation_prev_structural": {},  # R64-T3 猎手 F1：新周期必须清结构签名（防相邻巧合误熔断）
             # A3 sibling（2026-07-09 登记册）：与 L2 出口对称清旧覆盖 issue，防污染新规划。
             "plan_validation_feedback": "",
+            "plan_validation_issue_history": [],  # R67M-T2 B1：执行失败 replan=新周期清修复记忆（同律）
             "file_plan_adjudications": [],  # H-6：执行失败 replan=新周期 → 裁决账清空重推导
         }
 
