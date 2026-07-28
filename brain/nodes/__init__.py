@@ -2855,16 +2855,12 @@ async def plan(state: BrainState) -> dict:
         "degraded_reasons": list(state.get("degraded_reasons") or []) + (
             [_plan_degraded] if _plan_degraded else []
         ) + (
-            # R65REPLAY-T4 复核 F6：对账 pass 自身挂掉=幽灵死等账可能残留（round65d
-            # 回放死因类），必须进 degraded 可查——否则唯一信号是无人 grep 的 WARNING。
-            ["upstream_account_reconcile_failed"]
-            if _finish_out.get("upstream_account_reconcile_failed") else []
-        ) + (
-            # hunter F1(HIGH)：R67E-T1 C2 方法名自愈整体失效=退回 round67e 死因链（C2 分叉
-            # 原样→打回→LLM 重产不收敛熔断），对称进 degraded 可查（否则唯一信号=无人 grep
-            # 的 WARNING，违反"进度查 API 绝不 grep swarm.log"纪律）。
-            ["contract_method_names_reconcile_failed"]
-            if _finish_out.get("contract_method_names_reconcile_failed") else []
+            # R67L 终闸复核 M-2：finish 各确定性 pass 的 *_failed 机读标记【统一】进
+            # degraded（崩溃≠零命中必须可区分；上游账对账 F6 / C2 方法名自愈 hunter F1
+            # 先例的泛化——新 pass 失败标记零接线自动进账，不再逐键打地鼠）。
+            # 否则唯一信号是无人 grep 的 WARNING，违反"进度查 API 绝不解析 swarm.log"纪律。
+            sorted(k for k, v in _finish_out.items()
+                   if isinstance(k, str) and k.endswith("_failed") and v)
         ) + (
             # 战役级终扫 hunter MEDIUM：H-6 对账收缩自身抛错=裁决复活面可能未关死，
             # 对称进 degraded 可查（绝不只剩无人 grep 的 WARNING）。

@@ -1000,12 +1000,30 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
     最低验收强度（全确定性证据，绝不猜）：
       ① `test -f <pom>` —— 产物存在；
       ② parent 版本字面量断言 `! grep -q '<version>${' <pom>` —— 属性引用=reactor 读不出；
-      ③ 根 pom 版本可读（_root_gav 确定性证据）时：`grep -A5 '<parent>' <pom> | grep -q
-         '<version>{根版}</version>'` —— parent 版本必须=基线根版（3.8.7 幻觉的死法）。
+      ③ 根 pom 版本可读（_root_gav 确定性证据）且所创 pom【非根 pom 自身】时：`grep -A5
+         '<parent>' <pom> | grep -q '<version>{根版}</version>'` —— parent 版本必须=基线根版
+         （3.8.7 幻觉的死法）；根 pom 无 <parent> 块，注入即冤杀（终闸复核 M-1）。
     只补【零 verify】的子任务（已有考卷的不动，绝不削既有闸）；非 pom create 不动。
+    栈门控=基线 manifest 证据（终闸复核 L-栈：栈相关行为走确定性分发）——基线根有
+    已知非 Maven manifest（gradle/npm/go/cargo/python）且无 pom.xml 时，plan 里的
+    create-pom 是 LLM 幻觉（G9 混栈优先保 Maven 会让 plan 侧 pom 证据自证其门，故
+    本闸只信基线），不注入 Maven 专属断言，幻觉留 VALIDATE 权威打回。greenfield
+    （零 manifest）=unknown 保守放行（back-compat）。
     根版读不到 → ③ 省略有 WARNING（fail-open，①②仍在）。返回 {sid: [注入命令…]}。
     """
-    from swarm.brain.contract_utils import _root_gav
+    import os as _os
+
+    from swarm.brain.contract_utils import _MANIFEST_TO_STACK, _root_gav
+    if project_path:
+        try:
+            _bstk = {stk for name, stk in _MANIFEST_TO_STACK.items()
+                     if _os.path.exists(_os.path.join(project_path, name))}
+        except Exception:  # noqa: BLE001 — 探测失败按 unknown 保守放行
+            _bstk = set()
+        if _bstk and "maven" not in _bstk:
+            logger.info("[PLAN-FINISH] R67L-B3⑤ 裸奔闸跳过：基线为已知非 Maven 栈 %s"
+                        "（plan 内 create-pom 疑为幻觉，留 VALIDATE 打回）", sorted(_bstk))
+            return {}
     injected: dict[str, list[str]] = {}
     _root_ver = None
     if project_path:
@@ -1029,7 +1047,8 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
         for pom in poms:
             cmds.append(f"test -f {pom} && echo OK")
             cmds.append(f"! grep -q '<version>${{' {pom}")
-            if _root_ver:
+            if _root_ver and pom.lstrip("./") != "pom.xml":
+                # 根 pom 自身无 <parent> 块 → ③ 跳过（复核 M-1：注入即恒败冤杀）
                 cmds.append(
                     f"grep -A5 '<parent>' {pom} | grep -q '<version>{_root_ver}</version>'")
         h.verify_commands = cmds
@@ -1060,8 +1079,10 @@ def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
     _NEG = _re.compile(r"^!\s*grep\s+(?P<flags>(?:-[a-zA-Z]+\s+)*)"
                        r"(?P<q>['\"])(?P<pat>[^'\"]+)(?P=q)(?P<rest>.*)$")
     _WORD = _re.compile(r"^[A-Za-z0-9_-]+$")
-    # 包形词：段间可带转义点、允许尾点（javax\. / org.springframework.security / lombok）
-    _PKG = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\\?\.[A-Za-z0-9_]*)*\\?\.?$")
+    # 包形词：段间可带转义点、允许尾点（javax\. / org.springframework.security / lombok）。
+    # 起头限小写（复核 M-2）：大写类名（Lombok）不是包形词——锚定 import 会把"不得使用"
+    # 弱化成"不得 import"（new Lombok() 内联用法漏网），宁保守不动。
+    _PKG = _re.compile(r"^[a-z_][A-Za-z0-9_]*(\\?\.[A-Za-z0-9_]*)*\\?\.?$")
     for st in (getattr(plan, "subtasks", None) or []):
         h = getattr(st, "harness", None)
         vcs = list(getattr(h, "verify_commands", None) or []) if h else []
@@ -1075,7 +1096,8 @@ def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
             # 拼回——退出码由左侧 grep 决定（grep 命中→!失败→echo 不跑→非零；未命中→echo
             # 跑→零），语义与裸 `! grep` 完全一致。其余复合形态（||/;/管道）不猜语义。
             suffix = ""
-            _m_sfx = _re.search(r"\s*&&\s*echo\s+\w+\s*$", s)
+            # 复核 L-4：引号形态（echo "NO_LOMBOK"）与 printf 同义后缀也属良性可剥离
+            _m_sfx = _re.search(r"\s*&&\s*(?:echo|printf)\s+(?:['\"][^'\"]*['\"]|\S+)\s*$", s)
             if _m_sfx:
                 suffix = s[_m_sfx.start():]
                 s = s[:_m_sfx.start()].strip()
@@ -1185,6 +1207,8 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _rsa:
             out["scope_actions_reconciled"] = _rsa
     except Exception:  # noqa: BLE001 — fail-open，G1/VALIDATE 兜底
+        # 复核 M-2：崩溃≠零命中，机读标记让审计可区分（对称 upstream_account_reconcile_failed）
+        out["scope_actions_reconcile_failed"] = True
         logger.warning("[PLAN-FINISH] R67L-B3① scope↔file_plan action 对账失败（fail-open）",
                        exc_info=True)
     try:
@@ -1224,6 +1248,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _mpc:
             out["pom_create_min_acceptance"] = sorted(_mpc)
     except Exception:  # noqa: BLE001 — fail-open，L1 闸兜底
+        out["pom_create_min_acceptance_failed"] = True  # 复核 M-2：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67L-B3⑤ 裸奔闸最低验收注入失败（fail-open）",
                        exc_info=True)
     try:
@@ -1317,6 +1342,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _fpde:
             out["file_plan_dep_edges"] = _fpde
     except Exception:  # noqa: BLE001 — fail-open
+        out["file_plan_dep_edges_failed"] = True  # 复核 M-2：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67L-B3② file_plan 依赖边下推失败（fail-open）",
                        exc_info=True)
     try:
@@ -1330,6 +1356,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _mpde:
             out["module_pom_dep_edges"] = _mpde
     except Exception:  # noqa: BLE001 — fail-open
+        out["module_pom_dep_edges_failed"] = True  # 复核 M-2：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67L-B4② 模块 pom 依赖边补齐失败（fail-open）",
                        exc_info=True)
     # R67-T4a/T4b：自然语言消费关系补边（放 W2 之后——readable 推得出的边 W2 已建，
@@ -1388,6 +1415,7 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _snge:
             out["negated_grep_sanitized"] = sorted(_snge)
     except Exception:  # noqa: BLE001 — fail-open，原样考卷留执行期
+        out["negated_grep_sanitize_failed"] = True  # 复核 M-2：崩溃≠零命中
         logger.warning("[PLAN-FINISH] R67L-B3⑥ 禁令 grep 语义闸失败（fail-open）",
                        exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]

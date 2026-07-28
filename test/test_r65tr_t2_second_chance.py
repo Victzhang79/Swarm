@@ -180,6 +180,9 @@ def _mk_trivial_stub(gate_results: list, agent_log: list):
     stub._parse_produce_result = _parse
     stub._rollback_failed_manifest_footprint = lambda d: None
     stub._run_trivial_fast = WorkerExecutor._run_trivial_fast.__get__(stub)
+    # R67L-B1 起 trivial 路径同享 C2 置信度校正（full/trivial 单一事实源）——
+    # 桩必须绑真身，防桩与产线口径再分裂（本批治本初衷）。
+    stub._c2_calibrate_confidence = WorkerExecutor._c2_calibrate_confidence.__get__(stub)
     return stub
 
 

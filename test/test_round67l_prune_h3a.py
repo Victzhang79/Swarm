@@ -269,6 +269,48 @@ def test_prune_without_acceptance_assertion_unchanged(project, monkeypatch, quie
     assert details.get("verify_failed")
 
 
+def test_prune_acceptance_short_name_no_substring_false_positive(
+        project, monkeypatch, quiet_gates):
+    """复核 L-5：被剪短名 "alarm" 不得因子串命中考卷里的 "ruoyi-alarm-interface"
+    误判矛盾（全形匹配：artifactId 字符集外的边界才算）——误拦方向白烧上游等待。"""
+    state = {"build_calls": 0, "repair_calls": 0}
+
+    def _fake_run(cmd, pp, timeout=120):
+        if cmd.strip().startswith("mvn"):
+            state["build_calls"] += 1
+            if state["build_calls"] == 1:
+                return 1, "[ERROR] Could not find artifact com.ruoyi:alarm:jar:4.8.3"
+            return 0, "BUILD SUCCESS"
+        if "grep" in cmd:
+            return 1, ""
+        return 0, ""
+
+    def _fake_repair(project_path, build_output, modified, timeout,
+                     project_stack=None, evidence_out=None):
+        state["repair_calls"] += 1
+        if state["repair_calls"] == 1:
+            if evidence_out is not None:
+                evidence_out.setdefault("pruned_phantom_internal", set()).add("alarm")
+            return 1, ["ruoyi-alarm/pom.xml"]
+        return 0, []
+
+    monkeypatch.setattr(lp, "_run_l1_command", _fake_run)
+    monkeypatch.setattr(lp, "_attempt_build_repair", _fake_repair)
+    monkeypatch.setattr(lp, "_build_error_is_upstream", lambda *a, **k: False)
+
+    scope = FileScope(writable=[_SRC, "ruoyi-alarm/pom.xml"])
+    harness = TaskHarness(
+        language="java", build_command="mvn -q compile",
+        verify_commands=[
+            # 考卷考的是长名 ruoyi-alarm-interface，短名 "alarm" 只是其子串
+            "grep -q '<artifactId>ruoyi-alarm-interface</artifactId>' ruoyi-alarm/pom.xml"],
+    )
+    ok, details = lp.run_l1_pipeline(str(project), _mk(scope, harness), _DIFF, timeout=60)
+    assert ok is False, "短名子串不得误判 prune↔考卷矛盾（维持 verify_failed FAIL 语义）"
+    assert details.get("pipeline_blocked") is None, details
+    assert details.get("verify_failed")
+
+
 # ─── prune 留账：_attempt_maven_version_repair 直测（真 pom、本地命令）───
 
 

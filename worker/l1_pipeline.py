@@ -5048,8 +5048,12 @@ def run_l1_pipeline(
                 # 自然进化到的正确处置提前到 run-1，修复轮零白烧。
                 _pruned_pi = set(_repair_evidence.get("pruned_phantom_internal") or ())
                 if _pruned_pi:
-                    _conflict = sorted(a for a in _pruned_pi
-                                       if any(a in str(c) for c in verify_cmds))
+                    # 复核 L-5：artifactId 全形匹配（id 字符集 [\w.-] 外边界），防短名
+                    # 子串误关联长名依赖（"alarm" 不得命中 "ruoyi-alarm-interface"）。
+                    _conflict = sorted(
+                        a for a in _pruned_pi
+                        if any(re.search(r"(?<![\w.-])" + re.escape(a) + r"(?![\w.-])",
+                                         str(c)) for c in verify_cmds))
                     if _conflict:
                         details["pipeline_blocked"] = "upstream_module_broken"
                         details["not_run_kind"] = NotRunKind.BLOCKED.value

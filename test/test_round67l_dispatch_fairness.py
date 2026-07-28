@@ -265,3 +265,27 @@ def test_partition_real_abandoned_unaffected():
 def test_partition_empty_inputs():
     true_ab, stub = partition_abandoned_account([], [], set())
     assert true_ab == set() and stub == set()
+
+
+def test_derive_subtask_runtime_stub_done_not_abandoned():
+    """复核 H-1（hunter）：报告层派生 derive_subtask_runtime 必须同走分区口径——
+    桩完成者标 done+stub=True，不再是 abandoned（否则明细表与顶层计数口径分裂）。"""
+    from swarm.brain.runner import derive_subtask_runtime
+    from swarm.types import WorkerOutput
+
+    plan = _plan(_st("st-3-1"), _st("st-9"), _st("st-a"))
+    state = {
+        "plan": plan,
+        "subtask_results": {
+            "st-3-1": WorkerOutput(subtask_id="st-3-1", diff="d", summary="桩",
+                                   l1_passed=True),
+            "st-9": WorkerOutput(subtask_id="st-9", diff="d", summary="真完成",
+                                 l1_passed=True),
+        },
+        "abandoned_subtask_ids": ["st-a"],
+        "give_up_isolated_ids": ["st-3-1"],
+    }
+    rt = derive_subtask_runtime(state)
+    assert rt["st-3-1"]["status"] == "done" and rt["st-3-1"].get("stub") is True, rt
+    assert rt["st-9"]["status"] == "done" and "stub" not in rt["st-9"], rt
+    assert rt["st-a"]["status"] == "abandoned" and "stub" not in rt["st-a"], rt

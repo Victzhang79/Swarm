@@ -229,6 +229,32 @@ def test_non_pom_create_untouched(tmp_path):
     assert st.harness.verify_commands == []
 
 
+def test_naked_root_pom_create_skips_parent_version_assertion(tmp_path):
+    """复核 M-1：create【根 pom 自身】（无 <parent> 块）→ ③ parent 版本对账不得注入
+    （注入即恒败冤杀），①② 仍在。"""
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>com.ruoyi</groupId><artifactId>ruoyi</artifactId>"
+        "<version>4.8.3</version></project>")
+    st = _st("st-root", create=["pom.xml"], verify=[])
+    plan = _plan(st)
+    injected = ensure_pom_create_min_acceptance(plan, str(tmp_path))
+    assert "st-root" in injected
+    vcs = st.harness.verify_commands
+    assert any(v.startswith("test -f pom.xml") for v in vcs)
+    assert any("<version>${" in v for v in vcs), "② 字面量断言仍在"
+    assert not any("<parent>" in v for v in vcs), "根 pom 无 parent 块，③ 注入即冤杀"
+
+
+def test_naked_pom_non_maven_stack_skipped(tmp_path):
+    """复核 L-栈：基线为已知非 Maven 栈（npm manifest、无 pom.xml）→ plan 内 create-pom
+    疑为 LLM 幻觉，整 pass 跳过不注入 Maven 专属断言（留 VALIDATE 打回）。"""
+    (tmp_path / "package.json").write_text('{"name": "x", "version": "1.0.0"}')
+    st = _st("s1", create=["pom.xml"], verify=[])
+    plan = _plan(st)
+    assert ensure_pom_create_min_acceptance(plan, str(tmp_path)) == {}
+    assert st.harness.verify_commands == []
+
+
 # ─── ⑥ 禁令 grep 语义闸 ───
 
 
@@ -280,6 +306,31 @@ def test_negated_benign_echo_suffix_preserved_on_rewrite():
                       " && echo NO_LOMBOK")
     assert vcs[1] == ("! grep -qi '<artifactId>spring-boot-starter-security</artifactId>'"
                       " ruoyi-alarm/pom.xml && echo NO_SPRING_SECURITY")
+
+
+def test_negated_quoted_echo_and_printf_suffix_rewritten():
+    """复核 L-4：引号 echo / printf 后缀同属良性可剥离形态（不再漏网留误杀）。"""
+    st = _st("st-q", create=["m/pom.xml"],
+             verify=['! grep -qi \'lombok\' m/pom.xml && echo "NO_LOMBOK"',
+                     "! grep -qi 'guava' m/pom.xml && printf OK"])
+    plan = _plan(st)
+    out = sanitize_negated_grep_exam(plan)
+    assert "st-q" in out
+    vcs = st.harness.verify_commands
+    assert vcs[0] == ('! grep -qi \'<artifactId>lombok</artifactId>\' m/pom.xml'
+                      ' && echo "NO_LOMBOK"')
+    assert vcs[1] == ("! grep -qi '<artifactId>guava</artifactId>' m/pom.xml && printf OK")
+
+
+def test_negated_classname_bareword_not_weakened_to_import_anchor():
+    """复核 M-2（reviewer）：大写类名禁令（Lombok）不是包形词——锚定 import 会把
+    "不得使用"弱化成"不得 import"（new Lombok() 内联漏网）→ 保守不动。"""
+    v1 = "! grep -rn 'Lombok' ruoyi-alarm/src/main/java/"
+    v2 = "! grep -rn 'TwoFactorException' ruoyi-alarm/src/main/java/"
+    st = _st("s1", create=["m/A.java"], verify=[v1, v2])
+    plan = _plan(st)
+    assert sanitize_negated_grep_exam(plan) == {}
+    assert st.harness.verify_commands == [v1, v2]
 
 
 # ─── ⑦ 显式坐标 LLM 版本主张不得直采（maven_registry）───

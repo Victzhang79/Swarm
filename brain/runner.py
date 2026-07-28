@@ -406,10 +406,17 @@ def derive_subtask_runtime(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
       · abandoned —— 重试耗尽放弃 或 保 build 隔离放弃（终态 PARTIAL 列明）
       · retrying  —— handle_failure 已介入（在失败集/换备/强模型/产出未过 L1）
       · pending   —— 尚未派发/无产出
+    桩完成者（give_up∩completed，阶梯三打桩 l1_passed=True 让下游推进）不计 abandoned，
+    落 done 并 stub=True 单列披露（R67L-B4④ 复核 H-1：报告层必须与 progress/MONITOR
+    同走 partition_abandoned_account，否则子任务明细与顶层计数口径分裂）。
     "running/就绪" 不在此派生：brain 不跟踪 worker 沙箱内 CODING/VERIFYING 相位，
     前端据 depends_on + done 集在【活跃态】推导"当前在做"，保持诚实不臆造相位。
     """
-    from swarm.brain.nodes.shared import l1_passed as _passed
+    from swarm.brain.nodes.shared import (
+        completed_l1_ids as _completed_ids,
+        l1_passed as _passed,
+        partition_abandoned_account as _paa,
+    )
 
     plan_ids = _plan_subtask_ids(state)
     if not plan_ids:
@@ -417,9 +424,10 @@ def derive_subtask_runtime(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     results = state.get("subtask_results")
     results = results if isinstance(results, dict) else {}
     failed = set(state.get("failed_subtask_ids") or [])
-    abandoned = (
-        set(state.get("abandoned_subtask_ids") or [])
-        | set(state.get("give_up_isolated_ids") or [])
+    abandoned, stub_done = _paa(
+        state.get("abandoned_subtask_ids") or [],
+        state.get("give_up_isolated_ids") or [],
+        _completed_ids(results),
     )
     retry_counts = state.get("subtask_retry_counts") or {}
     contract_counts = state.get("contract_retry_counts") or {}
@@ -461,6 +469,8 @@ def derive_subtask_runtime(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
             entry["alternate"] = True
         if force_strong.get(sid):
             entry["force_strong"] = True
+        if sid in stub_done:
+            entry["stub"] = True
         out[str(sid)] = entry
     return out
 

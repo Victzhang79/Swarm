@@ -471,6 +471,12 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
                         dropped.append(spec)
                         continue
                 # _exists is None（仓库不可达）→ fail-open 保留（R56-6：证据缺失≠否定证据）
+                # 复核 M-3：降级路径必须留痕（"降级可观测"纪律）——该版本未经仓库证实，
+                # 执行期由 L1 dep-legality/version-repair 同族规则兜底。
+                if _exists is None:
+                    logger.warning(
+                        "[maven-registry] R67L-B3 显式坐标 %s 的版本 %s 仓库不可达，未经证实"
+                        " → fail-open 保留 LLM 主张（执行期 L1 合法性闸兜底）", spec, version)
 
         if version is None:
             if index.is_managed(artifact):
