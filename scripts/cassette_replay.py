@@ -44,6 +44,10 @@ class ReplayResult:
     dag: dict[str, list[str]] = field(default_factory=dict)  # subtask id → depends_on
     stripped_scaffolds: int = 0           # 重放前剥掉的【已注入】脚手架数（还原 pre-scaffold 态）
     decoupled: int = 0                    # decouple pass 剥离的假依赖数
+    b3_scope_actions: dict = field(default_factory=dict)   # R67L-B3① scope↔action 归一
+    b3_pom_min_exam: dict = field(default_factory=dict)    # R67L-B3⑤ 裸奔闸注入
+    b3_file_plan_edges: dict = field(default_factory=dict)  # R67L-B3② 依赖边下推
+    b3_negated_grep: dict = field(default_factory=dict)    # R67L-B3⑥ 禁令 grep 重写
     failed_stage: str | None = None       # 崩在哪一 pass（None=全过）
     error: BaseException | None = None
     traceback_str: str = ""
@@ -136,6 +140,29 @@ def replay_cassette(cassette: dict, *, verbose: bool = False) -> ReplayResult:
         res.resolve_counts = resolve_plan_conflicts(
             plan, project_path=project_path, base_ref=base_ref, file_plan=file_plan)
 
+        # 5) R67L-B3（22号文批次3）：finish_plan_deterministic 新增的四个确定性 pass——
+        # 与主序列同相对序直调（绕开 fail-open 包裹，崩溃在重放里现形，与本工具契约一致）：
+        # scope↔file_plan action 对账 → create-pom 裸奔闸 → file_plan 依赖边下推 →
+        # 禁令 grep 语义闸。主序列顺序见 plan_finisher.finish_plan_deterministic。
+        from swarm.brain.plan_finisher import (
+            ensure_pom_create_min_acceptance,
+            reconcile_scope_actions_with_file_plan,
+            sanitize_negated_grep_exam,
+            wire_file_plan_depends_edges,
+        )
+        _emit("R67L-B3① reconcile_scope_actions_with_file_plan")
+        res.failed_stage = "reconcile_scope_actions_with_file_plan"
+        res.b3_scope_actions = reconcile_scope_actions_with_file_plan(plan, file_plan)
+        _emit("R67L-B3⑤ ensure_pom_create_min_acceptance")
+        res.failed_stage = "ensure_pom_create_min_acceptance"
+        res.b3_pom_min_exam = ensure_pom_create_min_acceptance(plan, project_path)
+        _emit("R67L-B3② wire_file_plan_depends_edges")
+        res.failed_stage = "wire_file_plan_depends_edges"
+        res.b3_file_plan_edges = wire_file_plan_depends_edges(plan, file_plan)
+        _emit("R67L-B3⑥ sanitize_negated_grep_exam")
+        res.failed_stage = "sanitize_negated_grep_exam"
+        res.b3_negated_grep = sanitize_negated_grep_exam(plan)
+
         res.failed_stage = None
     except BaseException as exc:  # noqa: BLE001 — 复现工具：任何崩溃都要如实呈现，不吞
         res.error = exc
@@ -173,6 +200,12 @@ def _print_report(cassette: dict, res: ReplayResult) -> None:
           + ("  ⚠️ 若含 st-scaffold-* 目标边=round62 死因复活" if res.decoupled else ""))
     if res.resolve_counts:
         print(f"resolve_plan_conflicts 计数: {res.resolve_counts}")
+    # R67L-B3（22号文批次3）四 pass 命中面——零命中也要显式可见（防"以为跑了其实没跑"）
+    print(f"\nR67L-B3 批次3 pass 命中: scope↔action 归一 {sum(len(v) for v in res.b3_scope_actions.values())} 处 "
+          f"({sorted(res.b3_scope_actions)[:8]})；裸奔闸注入 {len(res.b3_pom_min_exam)} 个 "
+          f"({sorted(res.b3_pom_min_exam)[:8]})；file_plan 依赖边下推 "
+          f"{sum(len(v) for v in res.b3_file_plan_edges.values())} 条；禁令 grep 重写 "
+          f"{len(res.b3_negated_grep)} 个 ({sorted(res.b3_negated_grep)[:8]})")
 
     print(f"\n依赖 DAG (subtask → depends_on)  共 {len(res.dag)} 个子任务:")
     for sid, deps in res.dag.items():

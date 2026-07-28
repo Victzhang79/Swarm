@@ -6182,6 +6182,10 @@ def correct_misclassified_intent(plan: TaskPlan) -> bool:
     【写代码】(MODIFY/CREATE)，意图必然判错。这里以"有无写文件"硬信号纠正 LLM 自由判断：
       - intent=AUDIT 但有 create_files（无对应 writable）→ CREATE
       - intent=AUDIT 但有 writable → MODIFY
+    R67L-B3③（22号文批次3，round67l 110/139 误标 modify 实锤）：intent=MODIFY 但 scope
+    【纯 create_files、零 writable】→ CREATE——MODIFY 语义让 worker 找"既有文件"下手，
+    面对根本不存在的新建目标只能臆造（与 AUDIT 臂同一判据：scope 硬信号 > LLM 自由心证）。
+    混合（writable+create 皆有）不动——modify 语义对 writable 部分成立。
     返回是否发生校正。
     """
     from swarm.types import TaskIntent
@@ -6195,6 +6199,10 @@ def correct_misclassified_intent(plan: TaskPlan) -> bool:
         create = list(getattr(scope, "create_files", []) or [])
         if st.intent == TaskIntent.AUDIT and (writable or create):
             st.intent = TaskIntent.CREATE if (create and not writable) else TaskIntent.MODIFY
+            changed = True
+        elif st.intent == TaskIntent.MODIFY and create and not writable:
+            # R67L-B3③：纯新建 scope 误标 MODIFY（round67l 95/139 实测形态）
+            st.intent = TaskIntent.CREATE
             changed = True
     return changed
 

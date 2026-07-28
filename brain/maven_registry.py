@@ -315,6 +315,34 @@ def local_m2_latest_version(group: str, artifact: str) -> str | None:
     return max(stable, key=_ver_key) if stable else None
 
 
+def registry_version_exists(group: str, artifact: str, version: str) -> bool | None:
+    """指定版本是否真实存在：本地 ~/.m2 → maven-metadata（aliyun→Central）。
+
+    返回 None=不可达/取数失败（R56-6：证据缺失≠否定证据，调用方绝不据此剪改）；
+    True/False=确证存在/确证查无。与 local_m2_latest_version 同受 SWARM_MAVEN_LOOKUP 约束。
+    """
+    if not _lookup_enabled():
+        return None
+    d = (Path.home() / ".m2" / "repository" / Path(*group.split("."))
+         / artifact / version / f"{artifact}-{version}.pom")
+    try:
+        if d.is_file():
+            return True
+    except OSError:
+        pass
+    gpath = group.replace(".", "/")
+    saw_metadata = False
+    for tpl in _METADATA_MIRRORS:
+        raw = _http_get(tpl.format(gpath=gpath, artifact=artifact))
+        if not raw:
+            continue
+        saw_metadata = True
+        versions = [v.strip() for v in re.findall(r"<version>([^<]+)</version>", raw)]
+        if version in versions:
+            return True
+    return False if saw_metadata else None
+
+
 def registry_latest_version(group: str, artifact: str) -> str | None:
     """版本解析：本地 ~/.m2（确定能构建）→ maven-metadata（aliyun→Central）。查不到 → None。"""
     local = local_m2_latest_version(group, artifact)
@@ -405,6 +433,44 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
         if not group:
             dropped.append(spec)
             continue
+
+        # R67L-B3（22号文批次3，round67l st-2 实锤）：显式 g:a:v 的 v 是 LLM 声明=待验证的
+        # 主张，绝非证据（血规2：坐标/版本只许来自基线 pom/BOM 受管/registry 实测）。旧实现
+        # "显式直采"把 druid-spring-boot-starter:1.2.28 / jjwt:0.13.0 / aop:3.5.16 整包旧版
+        # 坐标烤进缺失依赖片段，对抗 SB4.0.6 基线——规划期注入自己违犯血规 2。
+        # 判定序（与裸名分支同源）：受管剥版本 → reactor 兄弟钉 ${project.version} →
+        # 仓库确证查无该版本=幻觉（校正到最新稳定版/如实丢弃）→ 不可达 fail-open 保留
+        # （证据缺失≠否定证据，L1 dep-legality 同族规则兜底）。${...} 属性引用不判。
+        if version is not None and source == "explicit" and not version.startswith("${"):
+            if index.is_managed(artifact):
+                if index.managed.get(artifact) and index.managed[artifact] != group:
+                    logger.warning(
+                        "[maven-registry] R67L-B3 显式坐标 %s 的 groupId 与受管权威 %s 冲突"
+                        " → 以受管为准（LLM 声明非证据）", spec, index.managed[artifact])
+                    group = index.managed[artifact]
+                logger.warning(
+                    "[maven-registry] R67L-B3 显式坐标 %s 声明版本 %s，但 %s 受父级/BOM 受管"
+                    " → 剥掉 LLM 版本主张（受管权威优先，对抗跨代际旧版注入）",
+                    spec, version, artifact)
+                version = None
+            elif index.is_module(artifact) and group == index.project_group:
+                version = "${project.version}"
+            else:
+                _exists = registry_version_exists(group, artifact, version)
+                if _exists is False:
+                    _latest = registry_latest_version(group, artifact)
+                    if _latest:
+                        logger.warning(
+                            "[maven-registry] R67L-B3 显式坐标 %s 的版本 %s 仓库确证查无"
+                            "（幻觉版本）→ 校正到最新稳定版 %s", spec, version, _latest)
+                        version = _latest
+                    else:
+                        logger.warning(
+                            "[maven-registry] R67L-B3 显式坐标 %s 的版本 %s 仓库确证查无"
+                            "且无可用稳定版 → 如实丢弃（绝不逼 worker 臆造）", spec, version)
+                        dropped.append(spec)
+                        continue
+                # _exists is None（仓库不可达）→ fail-open 保留（R56-6：证据缺失≠否定证据）
 
         if version is None:
             if index.is_managed(artifact):

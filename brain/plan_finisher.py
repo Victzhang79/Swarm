@@ -692,6 +692,46 @@ def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
         except Exception:  # noqa: BLE001 — 提示是增益，绝不拖垮 plan-finish 主链
             logger.warning("[PLAN-FINISH] R67J-H3b 消费者防臆造提示注入失败"
                            "（fail-open，仅失提示）", exc_info=True)
+        # R67L-B3④（22号文批次3，round67l st-2 卷子必死实锤）：H3b 提示与考卷同源对账。
+        # 成环跳过的符号，消费者 verify_commands 里的【正断言】（grep 必考 import/引用该
+        # 符号）与本 pass 刚注入的"【不得】import/编译期引用"提示直接打架——worker 服从
+        # 提示则验收必挂、服从验收则违提示臆造，卷子注定死（st-2 verify#2/#4 vs H3b）。
+        # 剔除成环符号的正断言（fail-honest：该断言此刻不可满足，真判定交 producer 落地后
+        # 的 BLOCKED 软序通道）；【负断言】（禁建同名类，`! grep` / test -z）与提示同向，
+        # 保留不动。词边界匹配防 substring 误伤（Config≠AppConfig）。
+        try:
+            import re as _re
+            _exam_dropped: dict[str, list[str]] = {}
+            _toks_by_sid: dict[str, set[str]] = {}
+            for c, _p, tok in cycle_skipped:
+                _toks_by_sid.setdefault(c, set()).add(tok)
+            for c, toks in _toks_by_sid.items():
+                st = by_id.get(c)
+                h = getattr(st, "harness", None) if st is not None else None
+                vcs = list(getattr(h, "verify_commands", None) or []) if h else []
+                if not vcs:
+                    continue
+                kept: list[str] = []
+                for vc in vcs:
+                    _s = str(vc).strip()
+                    _neg = _s.startswith("!") or bool(_re.match(r"^test\s+-z", _s))
+                    if (not _neg) and any(
+                            _re.search(rf"\b{_re.escape(t)}\b", _s) for t in sorted(toks)):
+                        _exam_dropped.setdefault(c, []).append(_s)
+                        continue
+                    kept.append(vc)
+                if len(kept) != len(vcs):
+                    h.verify_commands = kept
+            if _exam_dropped:
+                logger.warning(
+                    "[PLAN-FINISH] R67L-B3④ H3b↔考卷同源对账：剔除 %d 个子任务对成环符号的"
+                    "验收正断言（与'不得 import'提示打架=卷子必死，round67l st-2 死型）: %s",
+                    len(_exam_dropped),
+                    {k: [v[:60] for v in vs[:2]] for k, vs in
+                     sorted(_exam_dropped.items())})
+        except Exception:  # noqa: BLE001 — 对账是增益，绝不拖垮 plan-finish 主链
+            logger.warning("[PLAN-FINISH] R67L-B3④ H3b↔考卷对账失败"
+                           "（fail-open，矛盾卷留执行期闸兜底）", exc_info=True)
     if added:
         logger.info(
             "[PLAN-FINISH] R67-T4b 符号消费补边 %d 个消费者共 %d 条（desc/AC 引用他人 create"
@@ -792,6 +832,236 @@ def reconcile_upstream_account(plan) -> dict[str, list[str]]:
     return removed
 
 
+def reconcile_scope_actions_with_file_plan(plan, file_plan) -> dict[str, list[str]]:
+    """R67L-B3①（22号文批次3，round67l 11 处实锤）：scope writable/create_files 与
+    file_plan action 对账——file_plan 是经多道确定性 pass 策展的【权威归属】（R58-1），
+    scope 的写权语义必须与之同源。
+
+    st-3-2 死型：file_plan action=create（基线不存在=新建）却落 scope.writable（修改
+    既有）→ worker 拿不到 create 语义（pull-back/上传账/验收三面全按 modify 走），
+    C7 上传账族误杀的规划期同谋。反向（action=modify 落 create_files）同治。
+    返回 {sid: [归一的文件…]} 机读账；幂等。
+    """
+    actions: dict[str, str] = {}
+    for e in (file_plan or []):
+        if isinstance(e, dict):
+            _p = str(e.get("path") or "").replace("\\", "/").lstrip("/")
+            _a = str(e.get("action") or "").strip().lower()
+            if _p and _a in ("create", "modify"):
+                actions.setdefault(_p, _a)   # 首现为准（H-6 已裁决去重，残留 dup 不猜）
+    moved: dict[str, list[str]] = {}
+    if not actions:
+        return moved
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        if sc is None:
+            continue
+        w = list(getattr(sc, "writable", None) or [])
+        cf = list(getattr(sc, "create_files", None) or [])
+        if not w and not cf:
+            continue
+        new_w, new_cf = list(w), list(cf)
+        for f in w:
+            _n = str(f).replace("\\", "/").lstrip("/")
+            if actions.get(_n) == "create" and f not in new_cf:
+                new_w.remove(f)
+                new_cf.append(f)
+                moved.setdefault(str(getattr(st, "id", "")), []).append(f)
+        for f in cf:
+            _n = str(f).replace("\\", "/").lstrip("/")
+            if actions.get(_n) == "modify" and f not in new_w:
+                new_cf.remove(f)
+                new_w.append(f)
+                moved.setdefault(str(getattr(st, "id", "")), []).append(f)
+        if new_w != w or new_cf != cf:
+            sc.writable = new_w
+            sc.create_files = new_cf
+    if moved:
+        logger.warning(
+            "[PLAN-FINISH] R67L-B3① scope 写权语义与 file_plan action 对账归一 %d 处"
+            "（create 错声明 writable=modify 语义三面错配，round67l st-3-2 型）: %s",
+            sum(len(v) for v in moved.values()), moved)
+    return moved
+
+
+def wire_file_plan_depends_edges(plan, file_plan) -> dict[str, list[str]]:
+    """R67L-B3②（22号文批次3，round67l 68 条断链实锤）：file_plan 声明的【文件级依赖边】
+    下推到子任务 depends_on——file_plan 是规划期权威依赖账（html→controller、domain→sql
+    断链实锤），不下推=dispatch 依赖闸看不见，消费者先于生产者执行（幽灵解封同族）。
+
+    判据（与 W2/T4b 同律，宁缺毋滥）：owner(消费文件)≠owner(依赖文件) 才成边；已传递
+    可达幂等跳过；会成环（生产者传递依赖消费者）跳过+WARNING（留 VALIDATE/C9 面）；
+    依赖文件无 owner（孤儿）不猜——孤儿挂靠的是 attach_orphan 的职责。
+    返回 {消费者 id: [新增上游 id…]} 机读账。
+    """
+    subs = list(getattr(plan, "subtasks", None) or [])
+    if not subs or not file_plan:
+        return {}
+    by_id = {str(getattr(st, "id", "")): st for st in subs}
+    owner: dict[str, str] = {}
+    for st in subs:
+        sid = str(getattr(st, "id", ""))
+        sc = getattr(st, "scope", None)
+        for f in (list(getattr(sc, "create_files", None) or [])
+                  + list(getattr(sc, "writable", None) or [])):
+            owner.setdefault(str(f).replace("\\", "/").lstrip("/"), sid)
+    added: dict[str, list[str]] = {}
+    skipped_cycle: list[tuple[str, str]] = []
+    for e in file_plan:
+        if not isinstance(e, dict):
+            continue
+        consumer = owner.get(str(e.get("path") or "").replace("\\", "/").lstrip("/"))
+        if not consumer:
+            continue
+        for d in (e.get("depends_on") or []):
+            producer = owner.get(str(d).replace("\\", "/").lstrip("/"))
+            if not producer or producer == consumer:
+                continue
+            st = by_id.get(consumer)
+            if st is None:
+                continue
+            cur = list(getattr(st, "depends_on", None) or [])
+            if producer in cur or _plan_reaches(by_id, consumer, producer):
+                continue                        # 已有/传递可达 → 幂等跳过
+            if _plan_reaches(by_id, producer, consumer):
+                skipped_cycle.append((consumer, producer))
+                continue                        # 成环不猜（同 T4b，留结构闸面）
+            st.depends_on = cur + [producer]
+            added.setdefault(consumer, []).append(producer)
+    if skipped_cycle:
+        logger.warning(
+            "[PLAN-FINISH] R67L-B3② %d 条 file_plan 依赖边会成环 → 跳过（留 VALIDATE/C9 面）: %s",
+            len(skipped_cycle), skipped_cycle[:6])
+    if added:
+        logger.info(
+            "[PLAN-FINISH] R67L-B3② file_plan 依赖边下推 depends_on %d 个消费者共 %d 条"
+            "（html→controller/domain→sql 断链族，round67l 68 条实锤）: %s",
+            len(added), sum(len(v) for v in added.values()), dict(sorted(added.items())))
+    return added
+
+
+def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str, list[str]]:
+    """R67L-B3⑤（22号文批次3·裸奔闸，round67l st-3-1 实锤）：create pom.xml 的子任务
+    零 verify_commands=零确定性闸过闸（st-3-1 零验收过掉 parent 3.8.7 幻觉 pom，
+    基线真身 4.8.3）——坏产物直送 merge 毒化 reactor。
+
+    最低验收强度（全确定性证据，绝不猜）：
+      ① `test -f <pom>` —— 产物存在；
+      ② parent 版本字面量断言 `! grep -q '<version>${' <pom>` —— 属性引用=reactor 读不出；
+      ③ 根 pom 版本可读（_root_gav 确定性证据）时：`grep -A5 '<parent>' <pom> | grep -q
+         '<version>{根版}</version>'` —— parent 版本必须=基线根版（3.8.7 幻觉的死法）。
+    只补【零 verify】的子任务（已有考卷的不动，绝不削既有闸）；非 pom create 不动。
+    根版读不到 → ③ 省略有 WARNING（fail-open，①②仍在）。返回 {sid: [注入命令…]}。
+    """
+    from swarm.brain.contract_utils import _root_gav
+    injected: dict[str, list[str]] = {}
+    _root_ver = None
+    if project_path:
+        try:
+            _rg = _root_gav(project_path)
+            _root_ver = _rg[2] if _rg else None
+        except Exception:  # noqa: BLE001 — 根版读不到仅少一条断言，绝不阻断
+            logger.warning("[PLAN-FINISH] R67L-B3⑤ 根 pom GAV 读取失败，"
+                           "parent 版本对账断言省略（fail-open，①②仍注入）", exc_info=True)
+    for st in (getattr(plan, "subtasks", None) or []):
+        sc = getattr(st, "scope", None)
+        h = getattr(st, "harness", None)
+        if sc is None or h is None:
+            continue
+        poms = [str(f).replace("\\", "/").lstrip("/")
+                for f in (getattr(sc, "create_files", None) or [])
+                if str(f).replace("\\", "/").endswith("pom.xml")]
+        if not poms or list(getattr(h, "verify_commands", None) or []):
+            continue                        # 非 pom create / 已有考卷 → 不动
+        cmds: list[str] = []
+        for pom in poms:
+            cmds.append(f"test -f {pom} && echo OK")
+            cmds.append(f"! grep -q '<version>${{' {pom}")
+            if _root_ver:
+                cmds.append(
+                    f"grep -A5 '<parent>' {pom} | grep -q '<version>{_root_ver}</version>'")
+        h.verify_commands = cmds
+        injected[str(getattr(st, "id", ""))] = cmds
+    if injected:
+        logger.warning(
+            "[PLAN-FINISH] R67L-B3⑤ 裸奔闸：%d 个 create-pom 子任务零验收 → 注入最低验收"
+            "强度（产物存在+parent 字面量+parent 版本对账根版 %s，st-3-1 型零闸过坏产物死型）: %s",
+            len(injected), _root_ver, sorted(injected))
+    return injected
+
+
+def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
+    """R67L-B3⑥（22号文批次3，round67l st-3 run-1 误杀实锤）：禁令型【未锚定】子串 grep
+    负断言的生成侧语义闸——`! grep -qi 'lombok' pom.xml` 会被 pom 注释散文
+    （"零重依赖：不引入…lombok…"）撞死：禁令散文撞禁令，产物全对被冤杀。
+
+    确定性重写（只改可证更严且语义等价/更准的形态，其余原样保留+WARNING 观测）：
+      - 目标全为 pom.xml 且 pattern 是裸词（无空格/锚点/正则元字符）→
+        `<artifactId>词</artifactId>`（注释散文不含完整标签，依赖禁令语义不变）；
+      - 目标全为 JVM 源码/源码目录且 pattern 是小写包形词（含点，如 javax\\.）→
+        锚定 import 行 `^[[:space:]]*import[[:space:]].*词`（注释行以 ///* 开头天然豁免）。
+    复合命令（&&/|/;）、含空格散文 pattern（'class X'）、已锚定 → 不动。
+    返回 {sid: [改写后命令…]} 机读账。
+    """
+    import re as _re
+    rewritten: dict[str, list[str]] = {}
+    _NEG = _re.compile(r"^!\s*grep\s+(?P<flags>(?:-[a-zA-Z]+\s+)*)"
+                       r"(?P<q>['\"])(?P<pat>[^'\"]+)(?P=q)(?P<rest>.*)$")
+    _WORD = _re.compile(r"^[A-Za-z0-9_-]+$")
+    # 包形词：段间可带转义点、允许尾点（javax\. / org.springframework.security / lombok）
+    _PKG = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\\?\.[A-Za-z0-9_]*)*\\?\.?$")
+    for st in (getattr(plan, "subtasks", None) or []):
+        h = getattr(st, "harness", None)
+        vcs = list(getattr(h, "verify_commands", None) or []) if h else []
+        if not vcs:
+            continue
+        new_vcs: list[str] = []
+        changed: list[str] = []
+        for vc in vcs:
+            s = str(vc).strip()
+            # 良性后缀 `&& echo WORD`（st-14 型：`! grep … && echo NO_LOMBOK`）可剥离再
+            # 拼回——退出码由左侧 grep 决定（grep 命中→!失败→echo 不跑→非零；未命中→echo
+            # 跑→零），语义与裸 `! grep` 完全一致。其余复合形态（||/;/管道）不猜语义。
+            suffix = ""
+            _m_sfx = _re.search(r"\s*&&\s*echo\s+\w+\s*$", s)
+            if _m_sfx:
+                suffix = s[_m_sfx.start():]
+                s = s[:_m_sfx.start()].strip()
+            if any(op in s for op in ("&&", "||", ";", "|")):
+                new_vcs.append(vc)
+                continue                            # 复合命令不猜语义
+            m = _NEG.match(s)
+            if not m:
+                new_vcs.append(vc)
+                continue
+            pat, rest = m.group("pat"), m.group("rest").strip()
+            targets = [t for t in rest.split() if not t.startswith("-")]
+            if not targets:
+                new_vcs.append(vc)
+                continue
+            new_pat = None
+            if all(t.endswith("pom.xml") for t in targets) and _WORD.fullmatch(pat):
+                new_pat = f"<artifactId>{pat}</artifactId>"
+            elif (all(t.endswith((".java", ".kt", ".scala")) or "/src/" in t
+                      for t in targets) and _PKG.fullmatch(pat)):
+                new_pat = f"^[[:space:]]*import[[:space:]].*{pat}"
+            if new_pat is None:
+                new_vcs.append(vc)
+                continue
+            nv = f"! grep {m.group('flags') or ''}'{new_pat}' {rest}{suffix}"
+            new_vcs.append(nv)
+            changed.append(nv)
+        if changed:
+            h.verify_commands = new_vcs
+            rewritten[str(getattr(st, "id", ""))] = changed
+    if rewritten:
+        logger.warning(
+            "[PLAN-FINISH] R67L-B3⑥ 禁令型未锚定子串 grep 语义闸：重写 %d 个子任务的负断言"
+            "为注释豁免形态（st-3 run-1 禁令散文撞禁令误杀死型）: %s",
+            len(rewritten), sorted(rewritten))
+    return rewritten
+
+
 def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                               task_description: str = "",
                               shared_contract: dict | None = None,
@@ -856,6 +1126,16 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             logger.warning("[PLAN-FINISH] R67E-P2 未愈分叉 detect 复扫失败（观测缺失，非致命）",
                            exc_info=True)
     try:
+        # R67L-B3①（round67l 11 处实锤）：scope 写权语义与 file_plan action 对账——放
+        # 【renormalize/契约符号路径对齐之后、脚手架注入之前】：落点与标签都已定格，
+        # create 错声明 writable（st-3-2 型）先归一，后续 pass 看到的 scope 语义才真。
+        _rsa = reconcile_scope_actions_with_file_plan(plan, file_plan)
+        if _rsa:
+            out["scope_actions_reconciled"] = _rsa
+    except Exception:  # noqa: BLE001 — fail-open，G1/VALIDATE 兜底
+        logger.warning("[PLAN-FINISH] R67L-B3① scope↔file_plan action 对账失败（fail-open）",
+                       exc_info=True)
+    try:
         # R67C-T3b：pom-写倒挂拆分——必跑在脚手架注入【之前】，R58-3 才会把权威模板嵌进新早叶 owner。
         from swarm.brain.contract_utils import split_manifest_owner_leaf
         _split = split_manifest_owner_leaf(plan)
@@ -885,6 +1165,15 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
                         st.est_context_tokens = 8000 + 6000  # TRIVIAL 基线+1 文件
     except Exception:  # noqa: BLE001 — fail-open，VALIDATE 兜底
         logger.warning("[PLAN-FINISH] 脚手架注入失败（fail-open）", exc_info=True)
+    try:
+        # R67L-B3⑤（round67l st-3-1 裸奔实锤）：create-pom 子任务零验收 → 注入最低验收
+        # 强度。放【脚手架注入之后】：脚手架注入的 owner 自带考卷的不动，只补真零验收者。
+        _mpc = ensure_pom_create_min_acceptance(plan, project_path)
+        if _mpc:
+            out["pom_create_min_acceptance"] = sorted(_mpc)
+    except Exception:  # noqa: BLE001 — fail-open，L1 闸兜底
+        logger.warning("[PLAN-FINISH] R67L-B3⑤ 裸奔闸最低验收注入失败（fail-open）",
+                       exc_info=True)
     try:
         # R62-Task3：R57-6 收权后确定性剪除空写 scope 死子任务（无人依赖者），
         # 否则一路漏到 dispatch → worker 空转 churn。
@@ -968,6 +1257,16 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             out["consumer_edges"] = _ce
     except Exception:  # noqa: BLE001 — fail-open
         logger.warning("[PLAN-FINISH] 消费边下推失败（fail-open）", exc_info=True)
+    try:
+        # R67L-B3②（round67l 68 条断链实锤）：file_plan 声明依赖边下推 depends_on——
+        # 放【W2 消费边之后、T4a/T4b 之前】：readable 推得出的 W2 已建，file_plan 权威
+        # 依赖账（html→controller/domain→sql）补 W2 盲区；成环守卫与 T4b 同律。
+        _fpde = wire_file_plan_depends_edges(plan, file_plan)
+        if _fpde:
+            out["file_plan_dep_edges"] = _fpde
+    except Exception:  # noqa: BLE001 — fail-open
+        logger.warning("[PLAN-FINISH] R67L-B3② file_plan 依赖边下推失败（fail-open）",
+                       exc_info=True)
     # R67-T4a/T4b：自然语言消费关系补边（放 W2 之后——readable 推得出的边 W2 已建，
     # 此处只接 W2 结构盲区）。★hunter F3 整改★两 pass 各自 try（与本函数逐 pass 纪律一致）：
     # T4b 崩不吞 T4a 成果可见性，日志带已落边账区分"零边"vs"半应用"。
@@ -1015,6 +1314,16 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         # 否则唯一信号是无人 grep 的 WARNING，违反"进度查 API 绝不解析 swarm.log"纪律。
         out["contract_method_names_reconcile_failed"] = True
         logger.warning("[PLAN-FINISH] R67E-T1 契约方法名自愈失败（fail-open，C2 闸兜底）",
+                       exc_info=True)
+    try:
+        # R67L-B3⑥（round67l st-3 run-1 误杀实锤）：禁令型未锚定子串 grep 负断言语义闸——
+        # 放【末端】（reconcile_template_exam/H3b 对账都已定格考卷，本 pass 只做注释豁免
+        # 形态重写，不增删断言面）。
+        _snge = sanitize_negated_grep_exam(plan)
+        if _snge:
+            out["negated_grep_sanitized"] = sorted(_snge)
+    except Exception:  # noqa: BLE001 — fail-open，原样考卷留执行期
+        logger.warning("[PLAN-FINISH] R67L-B3⑥ 禁令 grep 语义闸失败（fail-open）",
                        exc_info=True)
     if (out["scaffolds"] or out["orphans_attached"] or out["orphans_left"]
             or out.get("orphan_subtasks") or out.get("symbols_domiciled")):
