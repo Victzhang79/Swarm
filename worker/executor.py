@@ -932,6 +932,30 @@ class WorkerExecutor(
             self._log(f"L1 自检 LLM 获取失败，跳过自检: {exc}")
             return None
 
+    def _c2_calibrate_confidence(self, output: WorkerOutput) -> WorkerOutput:
+        """C2(task 34fab09e) 确定性置信度校正——full/trivial 两路径单一事实源（R67L-B1 提取）。
+
+        以【确定性结果】校正 LLM 自报置信度，消除"空 diff/未过 L1 却报 high"的假性成功：
+          ① L1 未通过 → 置信度封顶 LOW（不让自报 high 掩盖失败）；
+          ② diff 为空但本应有改动 → 置信度强制 LOW（撞上限空转的典型特征）。
+        校正异常绝不拖垮产出主链（fail-open 保原 output 并留痕）。
+        """
+        try:
+            _diff_empty = not (getattr(output, "diff", "") or "").strip()
+            _l1_ok = bool(getattr(output, "l1_passed", False))
+            if (not _l1_ok or _diff_empty) and output.confidence != Confidence.LOW:
+                _old = output.confidence.value
+                output = output.model_copy(update={"confidence": Confidence.LOW})
+                self._log(
+                    f"置信度校正：{_old} → low（"
+                    + ("L1未通过" if not _l1_ok else "")
+                    + ("+空diff" if _diff_empty else "")
+                    + "，确定性结果覆盖自报置信度）"
+                )
+        except Exception as _ce:  # noqa: BLE001
+            self._log(f"置信度校正跳过（非致命）: {_ce}")
+        return output
+
     async def _phase_produce(
         self, l1_passed: bool, l1_details: dict, prior: L1Verdict | None = None,
     ) -> WorkerOutput:
@@ -1119,24 +1143,8 @@ class WorkerExecutor(
             # 非 DEBUG 意图完全不受影响
 
             # ── C2 修复(task 34fab09e)：消除"空 diff/未过 L1 却报 high 置信度"的假性成功 ──
-            # worker 撞迭代上限(50)后可能产出空 diff，但 confidence 仍是 LLM 自报的 high，
-            # 误导 handle_failure 与人工审核。这里以【确定性结果】校正自报置信度：
-            #   ① L1 未通过 → 置信度封顶 LOW（不让自报 high 掩盖失败）；
-            #   ② diff 为空但本应有改动 → 置信度强制 LOW（撞上限空转的典型特征）。
-            try:
-                _diff_empty = not (getattr(output, "diff", "") or "").strip()
-                _l1_ok = bool(getattr(output, "l1_passed", False))
-                if (not _l1_ok or _diff_empty) and output.confidence != Confidence.LOW:
-                    _old = output.confidence.value
-                    output = output.model_copy(update={"confidence": Confidence.LOW})
-                    self._log(
-                        f"置信度校正：{_old} → low（"
-                        + ("L1未通过" if not _l1_ok else "")
-                        + ("+空diff" if _diff_empty else "")
-                        + "，确定性结果覆盖自报置信度）"
-                    )
-            except Exception as _ce:  # noqa: BLE001
-                self._log(f"置信度校正跳过（非致命）: {_ce}")
+            # 校正逻辑单一事实源=_c2_calibrate_confidence（R67L-B1 提取，trivial 路径同享）。
+            output = self._c2_calibrate_confidence(output)
 
             self.phase = WorkerPhase.DONE
             self._log(f"执行完成，置信度: {output.confidence.value}")
@@ -1358,6 +1366,10 @@ class WorkerExecutor(
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
         # D53：git diff 子进程 + flock 卸线程
         output = await asyncio.to_thread(self._parse_produce_result, produce_result, l1_passed, l1_details)
+        # R67L-B1（22号文批次1，round67l 沙箱路实锤）：trivial 路径此前无 C2 校正——
+        # 判死+修复轮拒答后仍按 LLM 自报 high 收尾（l1_passed=False 却"完成 置信度 high"），
+        # 与 full 路径口径分裂。入口对称：同享 _c2_calibrate_confidence 单一事实源。
+        output = self._c2_calibrate_confidence(output)
         self.phase = WorkerPhase.DONE
         # 记录 L1 结果供 kill_sandbox 决定 reusable（脏沙箱不回池）。
         # trivial 快速路径直接 return，不经过 run() 末尾的 _l1_passed_flag 赋值，

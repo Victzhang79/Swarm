@@ -945,6 +945,26 @@ class _SandboxSyncMixin:
                     shutil.rmtree(staging_dir, ignore_errors=True)
                     staging_dir = None
 
+        # R67L-B1（22号文批次1，round67l 三路复盘定案·头号骨牌）：create_files 语义=【待新建】，
+        # 本地不存在是定义使然而非上传失败。staging 层设计意图本就写明"源不存在（待新建）→
+        # staging 也不建，上传层跳过"（931 行），但断链在最后一公里：sync_files_to_sandbox
+        # 拿全量 rel_files 对缺失照记 errors → C7 账（_upload_error_rels）→ hunter-F3 分账判
+        # 确定性 FAIL——round67l 12+ 个子任务（模板/pom/controller）产物全对、verify 全绿仍被
+        # 冤杀，且与 H2 回滚互锁（FAIL→删本地→下轮必再入账）永不收敛，假签名再喂 #108 熔断。
+        # 治：上传清单剔除【scope.create_files 且 upload_root 下不存在】的条目（存在的=上轮
+        # 产出续作，照传不断链）；writable/readable/构建清单缺失维持入账（真矛盾臂不动）。
+        _create_rels = {self._norm_rel(local_root, f)
+                        for f in (getattr(self.effective_scope, "create_files", None) or [])}
+        if _create_rels:
+            _pending_create = [r for r in rel_files
+                               if r in _create_rels and not (upload_root / r).is_file()]
+            if _pending_create:
+                _pc_set = set(_pending_create)
+                rel_files = [r for r in rel_files if r not in _pc_set]
+                self._log(
+                    f"{reason} 待新建 create_files 本地不存在=定义使然，跳过上传（不入账）: "
+                    + ", ".join(_pending_create[:5]))
+
         try:
             sync_stats = await asyncio.to_thread(
                 self._sandbox_manager.sync_files_to_sandbox,
