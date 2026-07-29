@@ -362,7 +362,9 @@ async def _check_component(name: str, is_admin: bool = False) -> dict[str, Any]:
                     from swarm.config.settings import get_config as _get_cfg
                     sc = _get_cfg().sandbox
                     os.environ["E2B_API_URL"] = sc.api_url
-                    os.environ["E2B_API_KEY"] = sc.api_key
+                    # C1-B 复核 S1：与 apply_sandbox_env 同源（凭据按 env 名全仓收口）
+                    from swarm.config.secret_store import resolve_credential as _rc
+                    os.environ["E2B_API_KEY"] = _rc("SWARM_SANDBOX_API_KEY", sc.api_key)
                     os.environ["CUBE_REMOTE_PROXY_BASE"] = sc.proxy_base
                     os.environ["CUBE_REMOTE_PROXY_VERIFY_SSL"] = str(sc.verify_ssl).lower()
                     os.environ.pop("E2B_DOMAIN", None)

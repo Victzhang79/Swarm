@@ -65,6 +65,35 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_CONTRACT_STAGE_TIMEOUT": "brain/planning_nodes.py:1421",
     "SWARM_DB_": "config/settings.py:105",
     "SWARM_DB_CONNECT_TIMEOUT": "infra/db.py:95",
+    # C1-C 复核 MEDIUM-8：根级模块此前不在扫描面内，这 4 个真开关一直逃逸
+    "SWARM_BRAIN_RECURSION_LIMIT": "tracing.py:31",
+    "SWARM_LANGSMITH_CONNECT_TIMEOUT_MS": "tracing.py:120",
+    "SWARM_LANGSMITH_READ_TIMEOUT_MS": "tracing.py:121",
+    "SWARM_PER_TASK_LOGS": "logging_config.py:220",
+    # ── C1-B：扩登记册扫描面后收编的 19 个逃逸开关（含 3 个凭据类）──
+    # 原扫描面漏了 knowledge/ memory/ cli/ auth/ observability/ 五个包，于是这些开关
+    # 有强制测试却从未被它看见——"有闸"的安全感与闸的真实覆盖面是两回事。
+    "SWARM_API_URL": "cli/__init__.py:18",
+    "SWARM_TOKEN": "cli/__init__.py:25",
+    "SWARM_DEMO_ENABLED": "cli/__init__.py:512",
+    "SWARM_CONTEXT_MAX_TOKENS": "memory/sliding_window.py:26",
+    "SWARM_CONTEXT_RESERVE_TOKENS": "memory/sliding_window.py:30",
+    "SWARM_RECALL_SIMILARITY_FLOOR": "knowledge/service.py:361",
+    "SWARM_KB_SYNC_TIMEOUT_SEC": "knowledge/service.py:94",
+    "SWARM_KB_CONNECT_ALL_TIMEOUT_SEC": "knowledge/service.py:111",
+    "SWARM_KB_AUTO_REPROCESS_HOURS": "knowledge/scheduler.py:120",
+    "SWARM_KB_STALE_PROCESSING_SEC": "knowledge/updater.py:786",
+    "SWARM_KB_FAILED_MAX_RETRIES": "knowledge/updater.py:797",
+    "SWARM_OBS_CLICKHOUSE_PASSWORD": "observability/clickhouse.py:36（凭据，走 secret_store 解析链）",
+    # 知识采集远端源（当前为 stub，只做存在性检查）——3 个凭据类此前完全在治理面之外
+    "SWARM_INGEST_FEISHU_APP_ID": "knowledge/ingest/sources.py:210",
+    "SWARM_INGEST_FEISHU_APP_SECRET": "knowledge/ingest/sources.py:211（凭据）",
+    "SWARM_INGEST_FEISHU_SPACE_ID": "knowledge/ingest/sources.py:195",
+    "SWARM_INGEST_TENCENT_CLIENT_ID": "knowledge/ingest/sources.py:246",
+    "SWARM_INGEST_TENCENT_CLIENT_SECRET": "knowledge/ingest/sources.py:232（凭据）",
+    "SWARM_INGEST_TENCENT_ACCESS_TOKEN": "knowledge/ingest/sources.py:233（凭据）",
+    # 消费方是 shell 而非 Python：scripts/e2e_login.sh 直接 grep .env 读取（见 E2E_RUNBOOK）
+    "SWARM_E2E_PASSWORD": "scripts/e2e_login.sh:29（shell 消费，合理留文件）",
     "SWARM_DB_POOL_MAX": "infra/db.py:22",
     "SWARM_DB_POOL_MAX_LIFETIME": "infra/db.py:85",
     "SWARM_DB_POOL_MIN": "infra/db.py:21",

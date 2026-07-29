@@ -13,23 +13,39 @@ from pathlib import Path
 from swarm.config.env_registry import REGISTERED_ENVS
 
 _ROOT = Path(__file__).resolve().parent.parent
+# ★C1-B：扫描面必须覆盖全部含 SWARM_* 的包★
+# 26 号文复核实证：原表漏了 knowledge/ memory/ cli/ auth/ observability/ 与两个根级
+# 模块，导致 **26 个开关逃过登记而测试全绿**，其中含 SWARM_INGEST_FEISHU_APP_SECRET /
+# SWARM_INGEST_TENCENT_CLIENT_SECRET / SWARM_INGEST_TENCENT_ACCESS_TOKEN 三个凭据类
+# ——"有强制测试"本身给了虚假的安全感，而闸的扫描面才是它的真实覆盖。
 _SCAN_DIRS = ("brain", "worker", "models", "project", "api", "tools", "infra",
-              "config", "experience")
+              "config", "experience", "knowledge", "memory", "cli", "auth",
+              "observability")
 _ENV_RE = re.compile(r"SWARM_[A-Z0-9_]+")
+# 文案里的通配写法（`请检查 SWARM_KB_EMBED_* 配置`）会被正则截成 `SWARM_KB_EMBED_`——
+# 真变量名不会以下划线结尾，据此排除，避免把假变量登记进册（C1-B 扩扫描面时暴露）。
+_ENV_FALSE_POSITIVE = re.compile(r"_$")
 
 
 def _scan_code_envs() -> set[str]:
     found: set[str] = set()
     files = [p for d in _SCAN_DIRS for p in (_ROOT / d).rglob("*.py")]
-    files += [_ROOT / "types.py", _ROOT / "audit.py"]
+    # ★根级模块整体纳入（复核 MEDIUM-8）★：原先逐个补根级文件（types.py/audit.py），
+    # 而 tracing.py / logging_config.py 就漏在外面——实测 4 个真开关因此逃逸且测试全绿
+    # （SWARM_BRAIN_RECURSION_LIMIT / SWARM_LANGSMITH_*_TIMEOUT_MS / SWARM_PER_TASK_LOGS）。
+    # 逐个补是打地鼠，allowlist 才是根因：改成"根级 *.py 全扫"。
+    files += list(_ROOT.glob("*.py"))
     for p in files:
+        # 排除登记册【自身】（复核 LOW-1）：把它算进"代码扫描结果"会让反向 stale 检查
+        # 自满足——任何写进册的键都能在册里被找到，于是"死条目"永不报警，双向同步实为单向。
         if not p.exists() or "env_registry" in p.name:
             continue
         try:
             text = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        found.update(_ENV_RE.findall(text))
+        found.update(m for m in _ENV_RE.findall(text)
+                     if not _ENV_FALSE_POSITIVE.search(m))
     return found
 
 
@@ -41,7 +57,11 @@ def test_f3_every_code_env_is_registered():
 
 
 def test_f3_registry_has_no_stale_entries():
-    stale = sorted(set(REGISTERED_ENVS) - _scan_code_envs())
+    # 登记册里以 `_` 结尾的条目是 **env_prefix 登记**（如 `SWARM_DB_` → settings.py 的
+    # BaseSettings env_prefix），不是变量名；代码扫描侧已按同一规则排除（_ENV_FALSE_POSITIVE），
+    # 反向检查必须对称排除，否则前缀条目会被误判成"代码里已消失"。
+    registered = {k for k in REGISTERED_ENVS if not _ENV_FALSE_POSITIVE.search(k)}
+    stale = sorted(registered - _scan_code_envs())
     assert not stale, (
         f"登记册存在代码里已消失的死条目：{stale}——冻结面必须与代码双向同步")
 

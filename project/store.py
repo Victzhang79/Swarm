@@ -641,6 +641,17 @@ def purge_old_task_audit(retention_days: int = 180, conn_str: str | None = None)
     try:
         with _get_conn(conn_str) as conn:
             with conn.cursor() as cur:
+                # C1-C 复核 MEDIUM-5：config_audit_log 与 task_audit_log 同族（都是
+                # append-only 审计），必须一起裁——此前迁移注释声称"随 task_audit_log
+                # 同族清理"但实现只删了 task_audit_log，是一句会误导下一个维护者的假声明。
+                try:
+                    cur.execute(
+                        "DELETE FROM config_audit_log "
+                        "WHERE changed_at < NOW() - make_interval(days => %s)",
+                        (retention_days,),
+                    )
+                except Exception:  # noqa: BLE001 — 旧库尚无该表时不阻断主清理
+                    conn.rollback()
                 cur.execute(
                     "DELETE FROM task_audit_log WHERE at < NOW() - make_interval(days => %s)",
                     (int(retention_days),),

@@ -28,9 +28,13 @@ def _query(sql: str) -> list[dict[str, Any]] | None:
     if not base:
         return None
     import requests
+
+    # C1-B：凭据统一解析（secret_store 优先，miss 回退 .env 明文）
+    from swarm.config.secret_store import resolve_credential
     params = {
         "user": cfg.clickhouse_user,
-        "password": cfg.clickhouse_password,
+        "password": resolve_credential("SWARM_OBS_CLICKHOUSE_PASSWORD",
+                                       cfg.clickhouse_password),
         "database": cfg.clickhouse_database,
         "default_format": "JSON",
     }

@@ -144,12 +144,50 @@ def _migration_v5_kb_file_index_last_modified(conn) -> None:
         )
 
 
+
+def _migration_v6_config_audit_log(conn) -> None:
+    """v6（C1-C）：配置变更审计表。
+
+    病灶（26 号文调查）：改配置**零审计**——`api/routers/config.py` 通篇无 audit 写入，
+    唯一痕迹是一行 `logger.info("Updated .env + os.environ with keys: [...]")`，
+    **不记 who、不记 old→new**（只有非 admin 被拒时才记 who）。改坏了没有回滚点，
+    也回答不了"谁在什么时候把这个开关关了"。`task_audit_log` 是任务维度的，管不到配置。
+
+    值一律脱敏后入库（只留前 4 字符 + 长度），绝不存明文——这张表本身不能成为新泄露面。
+    append-only，由 project/store.py:purge_old_task_audit 与 task_audit_log 一起按天裁剪
+    （C1-C 复核：该清理是本批补上的；此前这句是假声明，实现只删了 task_audit_log）。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config_audit_log (
+                id           BIGSERIAL PRIMARY KEY,
+                changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                who          TEXT        NOT NULL,
+                source       TEXT        NOT NULL,
+                key_name     TEXT        NOT NULL,
+                old_masked   TEXT,
+                new_masked   TEXT
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_config_audit_changed_at "
+            "ON config_audit_log (changed_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_config_audit_key "
+            "ON config_audit_log (key_name, changed_at DESC)"
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
     (3, "add_base_commit", _migration_v3_base_commit),
     (4, "hash_api_tokens", _migration_v4_token_hash),
     (5, "kb_file_index_last_modified", _migration_v5_kb_file_index_last_modified),
+    (6, "config_audit_log", _migration_v6_config_audit_log),
     # 未来迁移在此追加，例如:
     # (5, "add_xxx_column", _migration_add_xxx_column),
 ]

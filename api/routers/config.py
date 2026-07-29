@@ -413,8 +413,18 @@ async def update_config(request: Request):
             # 致 pydantic ValidationError）不回滚、留脏 .env+os.environ。_reload_with_rollback 广捕
             # Exception + 泛化文案不泄漏 exc + 门禁 400／其余 500。回滚写在锁内，防插队写被回滚覆盖。
             _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
+            return _prev_env          # C1-C：把写盘前快照交给外层审计（old→new 所需）
 
-    await asyncio.to_thread(_apply_env_updates)
+    _prev_env = await asyncio.to_thread(_apply_env_updates) or {}
+    # C1-C 复核 S4：本端点是"把任意 KEY=VALUE 写进 .env"的那个（最常被用来关闸），
+    # 审计只接 _persist_env_updates 会让主力路径的变更查不到——比没有审计更危险，
+    # 因为下一个人会以为查过了。_prev_env 是写盘前的旧值快照，正是 old→new 所需。
+    try:
+        from swarm.config.config_audit import record_config_changes
+        record_config_changes(_cfg_who, "put_config",
+                              {k: (_prev_env.get(k), v) for k, v in update_map.items()})
+    except Exception as _aexc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-AUDIT] put_config 审计失败（变更已生效）: %s", _aexc)
     _app.configure_langsmith(reload=True)
     try:
         from swarm.worker.sandbox import reset_sandbox_manager
@@ -449,7 +459,8 @@ async def get_routing(request: Request):
 @router.put("/api/routing", tags=["配置"])
 async def update_routing(request: Request):
     """更新模型路由表配置 — 写入 .env 并重载"""
-    _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _rt_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
+    _rt_who = getattr(_rt_user, "username", "?") if _rt_user else "?"  # C1-C 审计
     body = await request.json()
 
     # 兼容前端旧格式 { routes: { tiers: "..." } }
@@ -543,6 +554,13 @@ async def update_routing(request: Request):
         # 重新加载配置（D3：失败回滚 .env + os.environ）
         _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
     _app.logger.info("Config reloaded after routing update")
+    # C1-C 复核 S4：路由变更同样入审计（改模型路由=改行为，必须可追溯谁改的）
+    try:
+        from swarm.config.config_audit import record_config_changes
+        record_config_changes(_rt_who, "put_routing",
+                              {k: (_prev_env.get(k), v) for k, v in update_map.items()})
+    except Exception as _aexc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-AUDIT] put_routing 审计失败（变更已生效）: %s", _aexc)
 
     from swarm.models.router import ModelRouter
     router = ModelRouter()
@@ -570,7 +588,8 @@ async def update_model_providers(request: Request):
     api_key 为脱敏值(***)的 provider 会保留原 key（不覆盖）。
     """
     _mp_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
-    _mp_is_admin = _caller_is_admin(_mp_user)  # B8-F2：出站端点键(base_url)仅 admin 可改
+    _mp_is_admin = _caller_is_admin(_mp_user)
+    _mp_who = getattr(_mp_user, "username", "?") if _mp_user else "?"  # C1-C 审计  # B8-F2：出站端点键(base_url)仅 admin 可改
     import json as _json
 
     body = await request.json()
@@ -648,7 +667,7 @@ async def update_model_providers(request: Request):
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：持锁文件 IO + reload 卸线程
-    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_mp_is_admin)
+    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_mp_is_admin, who=_mp_who)
     try:
         from swarm.config import secret_store
         secret_store.invalidate_cache()
@@ -681,12 +700,15 @@ def _env_quote(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool) -> None:
+def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str) -> None:
     """写 .env + 同步 os.environ + reload_config（供 model-providers/notify/kb 端点复用）。
 
     D3：reload 被生产安全门禁拒绝(RuntimeError)→ 原子回滚 .env + os.environ（原直接 reload
     无回滚，失败留脏 .env 致重启 fail-fast、脏 os.environ 致后续 reload 全失败）。
     #28：写值经 _env_quote——复杂 JSON 值单引号包裹，防 `source .env` 报 127（restart-api 起不来）。
+
+    C1-C：`who` 同为【必填】关键字，理由与 is_admin 一致——审计缺了 who 就等于没有审计，
+    必填参数强制每个（含未来新增）caller 显式表态"这次变更是谁发起的"。
 
     B8-F2（对抗复核 CRITICAL 治本）：is_admin 为【必填】关键字——本函数是所有 provider/kb/notify
     端点写 .env 的单一 chokepoint，出站端点键的 admin 闸集中在此做 backstop（即便某 caller 忘了
@@ -721,6 +743,17 @@ def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool) -> None:
             os.environ[k] = v
         from swarm.config.settings import reload_config as _reload_config
         _reload_with_rollback(env_path, prev_content, prev_env, _reload_config)
+
+    # C1-C 审计：在【锁外】写（审计是旁路观测，不占 .env 锁；写失败也绝不回滚已生效的变更）。
+    # prev_env 就是本次变更前的旧值快照，正是 old→new 所需——不必再读一次文件。
+    # 只记真正变化的键（record_config_changes 内部再做一次 old!=new 差集，双保险）。
+    try:
+        from swarm.config.config_audit import record_config_changes
+        record_config_changes(
+            who, "persist_env",
+            {k: (prev_env.get(k), v) for k, v in update_map.items()})
+    except Exception as exc:  # noqa: BLE001 — 审计绝不阻断配置变更
+        _app.logger.warning("[CONFIG-AUDIT] 记录失败（变更已生效）: %s", exc)
 
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
@@ -778,7 +811,8 @@ async def update_kb_embed_rerank(request: Request):
     返回 dim_changed 提示：embed 维度可能变化时（模型变了）提醒重新预处理。
     """
     _kb_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
-    _kb_is_admin = _caller_is_admin(_kb_user)  # B8-F2：出站端点键(embed/rerank url)仅 admin 可改
+    _kb_is_admin = _caller_is_admin(_kb_user)
+    _kb_who = getattr(_kb_user, "username", "?") if _kb_user else "?"  # C1-C 审计  # B8-F2：出站端点键(embed/rerank url)仅 admin 可改
     from swarm.config import secret_store
     from swarm.config.settings import KnowledgeConfig
     from swarm.knowledge.embed_rerank_config import SECRET_EMBED_KEY, SECRET_RERANK_KEY
@@ -873,7 +907,7 @@ async def update_kb_embed_rerank(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
 
-    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin)  # D48：卸线程
+    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin, who=_kb_who)  # D48：卸线程
     try:
         secret_store.invalidate_cache()
     except Exception:  # noqa: BLE001
@@ -930,7 +964,8 @@ async def update_notify_channels(request: Request):
     webhook_url 为脱敏值(含 …)或空 → 保留原 url（不覆盖）。
     """
     _nc_user = _require_perm(request, "config:write")  # S4 修复：补鉴权
-    _nc_is_admin = _caller_is_admin(_nc_user)  # B8-F2：SWARM_NOTIFY_CHANNELS 非端点键，闸对其 no-op
+    _nc_is_admin = _caller_is_admin(_nc_user)
+    _nc_who = getattr(_nc_user, "username", "?") if _nc_user else "?"  # C1-C 审计  # B8-F2：SWARM_NOTIFY_CHANNELS 非端点键，闸对其 no-op
     import json as _json
     body = await request.json()
     if not isinstance(body, dict) or not isinstance(body.get("channels"), list):
@@ -968,7 +1003,7 @@ async def update_notify_channels(request: Request):
     # 写 .env + os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：卸线程
     val = _json.dumps(clean, ensure_ascii=False)
-    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin)
+    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin, who=_nc_who)
     _app.logger.info("Updated notify channels: %d 个", len(clean))
     return {"status": "ok", "count": len(clean)}
 
@@ -1316,3 +1351,217 @@ def _clear_plaintext_keys_locked(env_path) -> list[str]:
             if k in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY"):
                 os.environ[k] = ""
     return cleared
+
+
+# ══════════════════════════════════════════════
+# C1-A：手改 .env 的热生效（消灭 os.environ 影子）
+# ══════════════════════════════════════════════
+
+# ★运行期自有权的 SWARM_ 键（复核 S9）★：这些键在运行期由代码按当前上下文写入，
+# .env 里的静态值只是兜底。reload 若把它们刷回静态值，会让【任务跑到一半时】fork 出的
+# 子进程拿到错项目的工作根——而端点还会把它当"影子已修复"报出来，语义完全颠倒。
+# 全仓枚举运行期写 os.environ 的点后，只有这一个是 SWARM_ 前缀且真受影响
+# （tools/paths.py:set_workspace_root ← brain/runner.py、worker/runner.py 每任务调用）。
+_RUNTIME_OWNED_ENVS: frozenset[str] = frozenset({"SWARM_WORKSPACE_ROOT"})
+
+
+def _dotenv_pairs(env_path: str) -> dict[str, str]:
+    """解析 .env → {KEY: VALUE}。**直接用 python-dotenv，绝不自研第二套解析器。**
+
+    ★复核 BLOCKER-2★：初版自研解析（只剥外层引号）与 `bash source`、python-dotenv
+    四处语义分歧，且分歧直通"砖化链"：
+      | `FOO_A=1  # 行尾注释` | 自研 `'1  # 行尾注释'` | dotenv/bash `'1'` |
+      | `export FOO_B=2`       | 自研【键被静默丢弃】   | dotenv/bash `'2'`  |
+      | `FOO_C="he said \\"hi\\""`   | 自研留下反斜杠   | dotenv/bash 正确反转义 |
+      | 多行引号值             | 自研只取首行         | dotenv/bash 完整     |
+    **行尾注释是手改 .env 最常见的写法，而本端点的全部立项理由就是服务手改 .env**——
+    自研解析会把畸形值写进 os.environ，再撞上 reload 校验失败，就是"本想免重启、结果
+    配置面瘫痪到重启为止"。而且 `_env_quote` 写出的转义行按 python-dotenv 口径整改过，
+    自研解析读不回自己写出去的东西。
+    pydantic 的文件源用的就是 python-dotenv，改用它同时消掉"reload 后进程态 ≠ 重启后
+    进程态"这个更隐蔽的分歧。
+    """
+    try:
+        from dotenv import dotenv_values
+        return {k: (v or "") for k, v in dotenv_values(env_path).items() if k}
+    except Exception as exc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-RELOAD] 解析 .env 失败: %s", exc)
+        return {}
+
+
+@router.post("/api/config/reload", tags=["配置"])
+async def reload_env_from_file(request: Request):
+    """★重读 .env 并【覆盖】os.environ，再 reload_config——让手改 .env 无需重启即生效★
+
+    为什么需要它（26 号文调查结论）：`scripts/restart-api.sh` 用 `set -a; source .env`
+    把全部键导出成**真实环境变量**，而 pydantic-settings 的源优先级是
+    `init > os.environ > .env 文件 > 默认值`——于是启动时冻结的 os.environ 影子
+    **永远盖过** .env 文件。`reload_config()` 确实重读了文件，但读到的值被影子盖掉，
+    **且全静默**（没有任何日志说"你改的值没生效"）。这就是"改 .env 必须重启"的真正根因，
+    与"配置存在文件还是数据库"无关。
+
+    而重启的代价是实打实的：`stop-api.sh` 3 秒不退即 SIGKILL，重启后
+    `reconcile_orphan_tasks` 把活跃执行态一律判 FAILED(orphaned_on_restart)——
+    改一个配置可能打死一个已经跑了 6 小时的任务。
+
+    仅 admin：能让文件里的任意值生效（含出站端点键），权限面等同于 `PUT /api/config`
+    的 admin 面。诚实边界：**它不能让 §C 类"import 时固化的模块常量"与"启动期构造的
+    长寿对象"（checkpointer/连接池/uvicorn 监听）生效**，那些仍需重启——响应里如实列出。
+    """
+    _require_perm(request, "config:write")
+    _user = getattr(request.state, "user", None)
+    if not _caller_is_admin(_user):
+        raise HTTPException(status_code=403, detail="仅 admin 可重载 .env（可让任意配置值生效）")
+    _who = getattr(_user, "username", "?") if _user else "?"
+
+    env_path = str(_app._PROJECT_ROOT / ".env")   # app 级符号统一走 _app.（见模块头注）
+
+    def _do_reload() -> dict:
+        # ★全程持 env_file_lock（复核 S3）★：不持锁会与 `_persist_env_updates` 的
+        # 失败回滚竞态——A 持锁写新 .env→写 environ→reload 撞门禁→回滚 .env 与 environ；
+        # 本端点若在 A 回滚【前】读到新文件、在 A 回滚 environ【后】写入，终态就是
+        # `.env`=旧值 / `os.environ`=新值 / AppConfig=新值：**一个方向相反的永久影子**，
+        # 重启后配置突变回旧值且全程无信号。治法本身复现病灶，必须同锁串行。
+        with env_file_lock(_app._PROJECT_ROOT / ".env"):
+            return _do_reload_locked()
+
+    def _do_reload_locked() -> dict:
+        pairs = _dotenv_pairs(env_path)
+        shadowed: list[str] = []
+        applied: list[str] = []
+        prev_env: dict[str, str | None] = {}
+        for k, v in pairs.items():
+            if not k.startswith("SWARM_"):
+                continue
+            if k in _RUNTIME_OWNED_ENVS:
+                # 运行期自有权：刷回 .env 静态值会污染在跑任务的子进程（见常量注释）
+                _app.logger.info("[CONFIG-RELOAD] 跳过运行期自有权键 %s（.env 静态值仅作兜底）", k)
+                continue
+            cur = os.environ.get(k)
+            if cur == v:
+                continue
+            prev_env[k] = cur          # 快照必须在写之前取
+            os.environ[k] = v
+            applied.append(k)
+            if cur is not None:
+                # 这正是"影子遮蔽"：文件已改、进程内仍是旧值
+                shadowed.append(k)
+        # ★失败必须回滚 os.environ（D3 同款，本端点原样复发过一次）★
+        # `_reload_with_rollback` 的 docstring 记着这条教训："reload 失败会留下脏 .env
+        # （下次重启 fail-fast）+ 脏 os.environ（后续所有 reload 都失败）"。本端点不改文件，
+        # 故只需回滚 environ；不回滚就会留下"environ 是新值、AppConfig 是旧值"的半应用态，
+        # 且这批脏值会让后续每一次 reload 都撞同一个门禁失败。
+        # ★删键/注释掉的键（复核 S7）★：只遍历文件里【有】的键，则"注释掉某行想回落
+        # 默认值"这个最自然的动作完全不生效——environ 影子原样保留、响应还报 ok，
+        # 同类静默失败残留一半。这类键不能擅自 pop（有 §S9 那种运行期自有权的键），
+        # 但必须 fail-loud 列出来。
+        _file_keys = {k for k in pairs if k.startswith("SWARM_")}
+        stale_shadow = sorted(
+            k for k in os.environ
+            if k.startswith("SWARM_") and k not in _file_keys and k not in _RUNTIME_OWNED_ENVS)
+
+        try:
+            _app.reload_config()
+        except Exception:
+            for _k, _prev in prev_env.items():
+                if _prev is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _prev
+            raise
+        return {"applied": applied, "shadowed": shadowed, "stale_shadow": stale_shadow}
+
+    try:
+        res = await asyncio.to_thread(_do_reload)
+    except Exception as exc:  # noqa: BLE001 — 生产安全门禁可能 raise（P1-D），如实回传
+        _app.logger.warning("[CONFIG-RELOAD] by=%s 失败: %s", _who, exc)
+        # 复核 MEDIUM-2：detail 不回传原始 exc（pydantic 报文含 input_value 会泄漏配置值），
+        # 与 _reload_with_rollback 的泛化文案同纪律；全文只进日志。
+        raise HTTPException(
+            status_code=400,
+            detail="重载失败：配置未通过校验（已回滚，进程内配置未变更）；详见服务端日志",
+        ) from exc
+
+    # ★收尾三件套必须与 PUT /api/config 同源（复核 S8）★：`reload_config()` 动不了
+    # 进程内单例——`SandboxManager` 构造时吃走了 SandboxConfig、langsmith 客户端同理。
+    # sibling 路径（:417-423）早就知道要做这两件，新路径没抄=改完 SANDBOX_API_URL /
+    # LANGSMITH_* 后返回 ok 但沙箱仍连老 host、tracing 仍用老 key，且不在 note 的诚实
+    # 边界里——用户会据此相信它们已生效。
+    _app.configure_langsmith(reload=True)
+    try:
+        from swarm.worker.sandbox import reset_sandbox_manager
+        reset_sandbox_manager()
+    except Exception as exc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-RELOAD] 重置 sandbox manager 失败: %s", exc)
+
+    if res["shadowed"]:
+        # always-emit：影子被覆盖的键必须留痕——此前这个失效是全静默的
+        _app.logger.warning(
+            "[CONFIG-RELOAD] by=%s 覆盖了 %d 个被 os.environ 影子遮蔽的键（文件已改但进程内仍是旧值）: %s",
+            _who, len(res["shadowed"]), res["shadowed"][:20])
+    if res.get("stale_shadow"):
+        _app.logger.warning(
+            "[CONFIG-RELOAD] %d 个键已从 .env 移除/注释但进程内影子仍在（本端点不擅自 pop，"
+            "需重启才能回落默认值）: %s", len(res["stale_shadow"]), res["stale_shadow"][:20])
+    # C1-C 复核 S4：本端点能一次改掉进程内全部 SWARM_ 键，必须入审计（此前是唯一一个
+    # 自己新增却不审计的写入点）。值取自文件，old 为进程内旧值。
+    try:
+        from swarm.config.config_audit import record_config_changes
+        record_config_changes(_who, "config_reload",
+                              {k: (None, "(from .env)") for k in res["applied"]})
+    except Exception as exc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-AUDIT] reload 审计失败（变更已生效）: %s", exc)
+
+    _app.logger.info("[CONFIG-RELOAD] by=%s 重载 .env 完成，应用 %d 键", _who, len(res["applied"]))
+    return {
+        "ok": True,
+        "applied_count": len(res["applied"]),
+        "shadowed_keys": res["shadowed"],
+        "stale_shadow_keys": res.get("stale_shadow", []),
+        "note": (
+            "已让 .env 的当前值在本进程生效。以下两类仍需重启："
+            "① import 时固化的模块常量（连接池/SSE 队列上限/契约并发等）；"
+            "② 启动期构造的长寿对象（PG checkpointer、连接池、uvicorn 监听地址）。"
+        ),
+    }
+
+@router.post("/api/secrets/env/{name}", tags=["配置"])
+async def set_env_credential(name: str, request: Request):
+    """把某个 `SWARM_*` 凭据写进 secret_store（加密），供 `resolve_credential` 优先读取。
+
+    ★复核 MEDIUM-7★：`resolve_credential` 的解析链做好了，但 `env:<NAME>` **没有任何
+    写入路径**——全仓 `set_secret` 的调用点只有 provider key / embed / rerank / SSH，
+    于是 docstring 教的迁移第一步（"先写入 secret_store，验证生效后再清 .env 明文"）
+    根本没有工具，B 就成了恒 miss 的空链：多一次 DB 查、安全收益为 0。
+
+    仅 admin：写的是凭据。值只从请求体取，绝不回显。写完立即失效缓存，使其即时生效
+    （secret_store 30s TTL，不失效的话最长 30s 内仍读旧值/明文）。
+    """
+    _require_perm(request, "config:write")
+    _u = getattr(request.state, "user", None)
+    if not _caller_is_admin(_u):
+        raise HTTPException(status_code=403, detail="仅 admin 可写入凭据")
+    _who = getattr(_u, "username", "?") if _u else "?"
+
+    key = (name or "").strip().upper()
+    if not key.startswith("SWARM_") or not key.replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="name 必须是合法的 SWARM_* 键名")
+
+    body = await request.json()
+    value = str((body or {}).get("value") or "")
+    if not value:
+        raise HTTPException(status_code=400, detail="value 不能为空（清除请用 DELETE 语义的迁移端点）")
+
+    from swarm.config import secret_store
+    await asyncio.to_thread(secret_store.set_secret, f"env:{key}", value)
+    await asyncio.to_thread(secret_store.invalidate_cache, f"env:{key}")
+    # 审计（值不入库，只记键名与 who）
+    try:
+        from swarm.config.config_audit import record_config_changes
+        record_config_changes(_who, "set_env_credential", {key: (None, "(stored in secret_store)")})
+    except Exception as exc:  # noqa: BLE001
+        _app.logger.warning("[CONFIG-AUDIT] set_env_credential 审计失败: %s", exc)
+    _app.logger.warning("[SECRET-STORE] by=%s 写入凭据 env:%s（.env 明文如仍存在，验证生效后再清）",
+                        _who, key)
+    return {"ok": True, "key": key,
+            "note": "已加密入库；resolve_credential 会优先读它。验证生效后可清 .env 明文。"}

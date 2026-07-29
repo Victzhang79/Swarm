@@ -156,7 +156,10 @@ def query_cubemaster_templates(cfg: Any, *, timeout: float = 5.0) -> list[dict] 
     import httpx
 
     headers: dict[str, str] = {}
-    key = getattr(cfg, "api_key", "") or ""
+    # C1-B：凭据统一解析（secret_store 优先，miss 回退 .env 明文）——与 provider key
+    # 早已走的 _resolve_api_key 同范式，让非 provider 凭据也能脱离 .env 明文。
+    from swarm.config.secret_store import resolve_credential
+    key = resolve_credential("SWARM_SANDBOX_API_KEY", getattr(cfg, "api_key", "") or "")
     if key:
         headers["X-API-KEY"] = key
         headers["Authorization"] = f"Bearer {key}"
@@ -235,7 +238,13 @@ def apply_sandbox_env(config: SandboxConfig | None = None) -> SandboxConfig:
     os.environ["E2B_API_URL"] = cfg.api_url
     os.environ["CUBE_REMOTE_PROXY_BASE"] = cfg.proxy_base
     os.environ["CUBE_REMOTE_SANDBOX_DOMAIN"] = cfg.sandbox_domain
-    os.environ["E2B_API_KEY"] = cfg.api_key
+    # ★C1-B 复核 S1★：这里才是真正喂 e2b SDK 的主路径——凭据解析必须与
+    # query_cubemaster_templates 同源。此前只接了后者（列模板的辅助调用），于是按
+    # resolve_credential docstring 的迁移步骤走（写 secret_store → 用"模板列表能拉到"
+    # 验证 → 清 .env 明文）会让【验证那条绿着、所有沙箱创建 401】。凭据消费点必须按
+    # env 名全仓收口，不能按文件补。
+    from swarm.config.secret_store import resolve_credential as _rc
+    os.environ["E2B_API_KEY"] = _rc("SWARM_SANDBOX_API_KEY", cfg.api_key)
     os.environ["CUBE_REMOTE_PROXY_VERIFY_SSL"] = str(cfg.verify_ssl).lower()
     os.environ.pop("E2B_DOMAIN", None)
     logger.info(

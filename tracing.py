@@ -43,8 +43,13 @@ def langsmith_status() -> dict[str, str | bool]:
     from swarm.config.settings import get_config
 
     cfg = get_config()
+    # C1-B 复核 S1 同族：状态判定也必须走同一条解析链，否则迁进 secret_store 后
+    # tracing 实际已配置、状态端点却静默报 configured=False。
+    from swarm.config.secret_store import resolve_credential as _rc
+    _ls_key = _rc("SWARM_LANGSMITH_API_KEY",
+                  cfg.langsmith_api_key or os.environ.get("LANGSMITH_API_KEY", ""))
     return {
-        "configured": cfg.langsmith_tracing and bool(cfg.langsmith_api_key),
+        "configured": cfg.langsmith_tracing and bool(_ls_key),
         "active": is_langsmith_active(),
         "project": os.environ.get("LANGCHAIN_PROJECT")
         or os.environ.get("LANGSMITH_PROJECT")
@@ -65,7 +70,11 @@ def configure_langsmith(*, reload: bool = False) -> bool:
         "1",
         "yes",
     )
-    api_key = cfg.langsmith_api_key or os.environ.get("LANGSMITH_API_KEY", "")
+    # C1-B：凭据统一解析（secret_store 优先，miss 回退 .env 明文/上游 LANGSMITH_API_KEY）
+    from swarm.config.secret_store import resolve_credential
+    api_key = resolve_credential(
+        "SWARM_LANGSMITH_API_KEY",
+        cfg.langsmith_api_key or os.environ.get("LANGSMITH_API_KEY", ""))
     project = cfg.langsmith_project or os.environ.get("LANGSMITH_PROJECT", "swarm-dev")
     endpoint = cfg.langsmith_endpoint or os.environ.get(
         "LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"

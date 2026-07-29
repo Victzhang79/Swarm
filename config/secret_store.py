@@ -274,3 +274,43 @@ def invalidate_cache(key_name: str | None = None) -> None:
             reset_fernet()
         else:
             _cache.pop(key_name, None)
+
+
+# ══════════════════════════════════════════════
+# 通用凭据解析（批 C1-B）
+# ══════════════════════════════════════════════
+
+def resolve_credential(env_name: str, env_fallback: str = "") -> str:
+    """凭据统一解析：**secret_store 优先，miss 回退 .env 明文**。
+
+    背景（26 号文调查）：`ModelConfig._resolve_api_key` 早已用这个范式把 provider key
+    迁进了加密存储（`.env` 里那两项现已为空），但**非 provider 类凭据没有对等通道**——
+    `SWARM_SANDBOX_API_KEY` / `SWARM_LANGSMITH_API_KEY` / `SWARM_OBS_CLICKHOUSE_PASSWORD`
+    仍以明文躺在 `.env` 里。而 `.env` 明文的现实风险已被实证：它曾被整份切块向量化进
+    知识库（26 号文 S-3）。本函数是 provider 版的通用化，供任意凭据字段复用，
+    命名约定 `env:<ENV_NAME>`。
+
+    与 `_resolve_api_key` 逐字同语义（db 命中即用、miss/异常均回退），因此迁移是
+    **渐进且可回滚**的：先写入 secret_store，验证生效后再清 `.env` 明文；任何一步出问题
+    回退到明文即可。绝不引入"必须先迁移否则起不来"的硬依赖。
+
+    ★"合理留文件"清单（迁移前必须先确认消费方，别把活配置当死配置搬走）★
+      - `SWARM_SECRET_KEY`：解密 secret_store 的根密钥（鸡生蛋）
+      - `SWARM_BOOTSTRAP_ADMIN_PASSWORD`：DB 里还没有 admin 时就要用（鸡生蛋）
+      - `SWARM_E2E_PASSWORD`：**消费方是 shell**——`scripts/e2e_login.sh` 直接
+        `grep '^SWARM_E2E_PASSWORD=' .env` 读文件（见 docs/E2E_RUNBOOK.md）。迁进
+        secret_store 等于要让 shell 去连 PG 解密，是倒退。
+      - `SWARM_DB_*` / `SWARM_ENV` / `SWARM_API_HOST|PORT`：进程启动前就要存在。
+
+    ★方法论疤痕（本次迁移调查连错三次）★：判断"某凭据有没有真实消费点"时，grep 字段名
+    极易漏判——① 嵌套访问 `cfg.sandbox.api_key` 与扁平名 `cfg.sandbox_api_key` 不同；
+    ② 子配置实例上直接就是 `cfg.api_key`（cfg 已经是 SandboxConfig）；③ 消费方可能
+    **根本不是 Python**（shell 脚本 grep .env）。结论必须交叉验证后再动手删改。
+    """
+    try:
+        val = get_secret(f"env:{env_name}")
+        if val:
+            return val
+    except Exception:  # noqa: BLE001 — 与 _resolve_api_key 同：任何异常都回退明文
+        pass
+    return env_fallback
