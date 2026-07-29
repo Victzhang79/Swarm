@@ -848,20 +848,51 @@ _PLAN_COVERAGE_DESIGN_SYSTEM = (
 )
 
 
+# 补排设计单条需求的文件数软上限——超过即说明模型在"重造整套设计"而不是"补一两个漏排文件"。
+_COVERAGE_DESIGN_EXISTING_CAP = 400     # 既有 file_plan 展示条数上限（防 prompt 撑爆）
+
+
 async def _design_files_for_unplanned(llm, unplanned_items, project_stack,
-                                      existing_modules, fallback_llm=None):
+                                      existing_modules, fallback_llm=None,
+                                      existing_file_plan=None):
     """对 unplanned 需求做一次定向 file_plan 补排设计。返回新 file_plan 条目 list（可空）。
-    臆造/越权（缺 path/module）由调用方 merge 时校验剔除。栈感知：绝不引栈外技术。"""
+    臆造/越权（缺 path/module）由调用方 merge 时校验剔除。栈感知：绝不引栈外技术。
+
+    ★prompt 必须带上【既有 file_plan】（26 号文 C-7 的另一半）★
+    原 prompt 只给"栈 + 既有模块名 + 漏排需求"，**不含任何既有文件**。于是模型不知道
+    这套设计里已经有了什么，只能从零想象一整套实现——round67m2 实测三轮分别造了
+    69/48/64 个文件、三套互不相同的命名（Alarm 与 Alert 都换了），file_plan 234→303→350
+    单调膨胀。它不是在"补排漏掉的文件"，是在"每轮重新设计一遍这个系统"。
+    带上既有清单后，模型的任务才回到它本来的语义：**在这套已有设计上补最小增量**。
+    """
     _req_lines = "\n".join(
         f"- {it['id']} {str(it.get('text') or '')[:200]}"
         for it in unplanned_items if isinstance(it, dict) and it.get("id"))
     _mods = ", ".join(existing_modules) if existing_modules else "（无既有模块）"
+    _exist_block = ""
+    _fp = [e for e in (existing_file_plan or []) if isinstance(e, dict) and e.get("path")]
+    if _fp:
+        _shown = _fp[:_COVERAGE_DESIGN_EXISTING_CAP]
+        _lines = "\n".join(
+            f"- {e.get('path')}（模块 {e.get('module') or '?'}）" for e in _shown)
+        _more = (f"\n…（另有 {len(_fp) - len(_shown)} 个文件未列出）"
+                 if len(_fp) > len(_shown) else "")
+        _exist_block = (
+            f"\n## 本方案【已设计】的文件（共 {len(_fp)} 个，**绝不要重复设计、绝不要改名重造**）\n"
+            f"{_lines}{_more}\n\n"
+            "上面这些文件已经在方案里了。你的任务是**在这套设计之上补最小增量**，不是重新设计系统：\n"
+            "· 若某条漏排需求其实已由上面某个文件承担 → 该需求【不需要新文件】，直接跳过不输出；\n"
+            "· 若确需新文件 → 命名/分层/包路径必须与上面既有文件保持一致的风格与术语"
+            "（**绝不要**把既有的概念换个近义词重起一套，如 Alarm→Alert）。\n")
     _user = (
         f"项目技术栈（权威，必须遵循）：{project_stack or '未知（据既有模块推断）'}\n"
-        f"既有物理模块：{_mods}\n\n"
+        f"既有物理模块：{_mods}\n"
+        f"{_exist_block}\n"
         f"## 漏排的新功能需求（现有代码库无此能力，须新建文件实现）\n{_req_lines}\n\n"
         "为上面每条需求设计实现所需的最小 file_plan 条目（新建文件）。文件应落到最合适的【既有模块】"
         "（棕地：新功能加进既有模块，绝不另造带独立构建清单的子模块）。路径须符合项目真实栈约定。"
+        "**只补真正缺的文件**——宁可少补也绝不成套重造；若判断这些需求都已被既有文件覆盖，"
+        '输出 {"file_plan":[]}。\n'
         "只输出 JSON（不要多余文字）：\n"
         '{"file_plan":[{"path":"完整相对路径","module":"物理模块名","responsibility":"该文件职责"}]}'
     )
@@ -966,15 +997,30 @@ def _log_reject_issues(tag: str, issues) -> None:
 
 
 async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallback_llm=None):
-    """R65E7-L2 上游根治：确保 file_plan 覆盖每条已抽取需求。返回 (file_plan, augmented: bool)。
+    """R65E7-L2 上游根治：确保 file_plan 覆盖每条已抽取需求。
+    返回 (file_plan, augmented: bool, attempted_reqs: list[str])。
 
     检出"有判别 token 但 file_plan 未排、基线亦无"的 unplanned 需求 → 定向反馈设计 LLM 补排文件 →
     合并。fail-open 全程：泄压阀关/无 file_plan(简单路径)/无需求/无 unplanned/LLM 失败/无有效产出 →
     原样返回不阻断（留 L1 兜底 + 覆盖闸），且每条降级路 record_degrade 令 /api/metrics 可分。
+
+    ★C-7（26 号文）：本闸曾是【自激的幻觉放大器】，必须带"试过了"的记忆★
+    round67m2 一手证据链：伞形需求 req-27e9b283 的判别 token 退化到只剩 ['prd']——
+    **结构上永不可能被 planned_vocab 匹配满足**（没有哪个文件名会含 "prd"），于是每一轮
+    都判 unplanned、每一轮都触发补排；而补排 prompt 里【不含既有 file_plan / architecture /
+    base 清单】，LLM 只能凭空造一套平行设计：三轮 69/48/64 个文件、三套互不相同的命名
+    （Alarm 与 Alert 都换了），file_plan 234→303→350 单调膨胀 → 大量 create 撞 base 既有类
+    → ③f 全部准确 REJECT → 同签名不收敛 → 熔断 FAILED@PLAN。
+    **闸从头到尾判得全对，问题是被打回的东西上游结构上必然会再产生一遍。**
+    治法两条，缺一仍会复发：
+      ① 本函数：attempted 账（本轮试过且仍未覆盖的 req 不再重试，与 B1 修复记忆同族——
+         没有"试过了"的记忆就会无界重入）；
+      ② `_design_files_for_unplanned`：prompt 带上既有 file_plan，让它【扩写】而不是【重造】。
     """
+    _attempted = [str(x) for x in (state.get("coverage_design_attempted_reqs") or [])]
     if os.environ.get("SWARM_PLAN_COVERAGE_DESIGN", "1").strip().lower() in (
             "0", "false", "no", "off"):
-        return file_plan, False
+        return file_plan, False, _attempted
     req_items = state.get("requirement_items") or []
     if not file_plan or not req_items:      # 简单/中等路径无 tech_design → 无 file_plan，跳过
         # 猎手 F4：SIMPLE/MEDIUM 无 file_plan 是设计内（干净 no-op）；但 COMPLEX/ULTRA 到这里还空
@@ -988,7 +1034,7 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
                     effective_complexity(state).value, len(file_plan or []), len(req_items))
         except Exception:  # noqa: BLE001 — 留痕失败绝不阻断
             pass
-        return file_plan, False
+        return file_plan, False, _attempted
     from swarm.brain.baseline_candidates import (
         build_planned_vocab,
         requirements_missing_from_plan,
@@ -1001,9 +1047,25 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
         from swarm.infra.degrade import record_degrade
         record_degrade("brain.plan.coverage_design_detect_error")
         logger.warning("[PLAN] R65E7-L2 覆盖检出降级（不阻断）：%s", exc)
-        return file_plan, False
+        return file_plan, False, _attempted
     if not unplanned_ids:                   # 全覆盖 → 快路径（绝大多数轮）
-        return file_plan, False
+        return file_plan, False, _attempted
+
+    # ★C-7：剔掉"上一轮已经试过补排、试完仍没覆盖住"的需求★
+    # 这类需求要么结构上不可被 vocab 满足（伞形需求 token 只剩 'prd'），要么 LLM 确实
+    # 设计不出——无论哪种，再试一次的产出都是【又一套凭空平行设计】，只会把 file_plan
+    # 越吹越大、把 create 越撞越多。留给下游：覆盖闸仍会如实报缺口、L1 仍兜底。
+    _retry_skipped = [r for r in unplanned_ids if r in set(_attempted)]
+    if _retry_skipped:
+        from swarm.infra.degrade import record_degrade as _rd
+        _rd("brain.plan.coverage_design_retry_suppressed")
+        logger.warning(
+            "[PLAN] C-7 补排闸自激抑制：%d 个需求上一轮已试过补排且仍未覆盖 → 本轮不再重试"
+            "（再试只会产出又一套凭空平行设计；缺口由覆盖闸如实呈现）: %s",
+            len(_retry_skipped), _retry_skipped[:8])
+        unplanned_ids = [r for r in unplanned_ids if r not in set(_attempted)]
+    if not unplanned_ids:
+        return file_plan, False, _attempted
     _by_id = {str(it.get("id")): it for it in req_items
               if isinstance(it, dict) and it.get("id")}
     _unplanned_items = [_by_id[r] for r in unplanned_ids if r in _by_id]
@@ -1013,13 +1075,15 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
     from swarm.infra.degrade import record_degrade
     try:
         _new = await _design_files_for_unplanned(
-            llm, _unplanned_items, _stack, _mods, fallback_llm=fallback_llm)
+            llm, _unplanned_items, _stack, _mods, fallback_llm=fallback_llm,
+            existing_file_plan=file_plan)      # C-7：让它扩写，别让它重造
     except TaskTokenLimitExceeded:
         raise
     except Exception as exc:  # noqa: BLE001 — 补排设计失败 fail-open
         record_degrade("brain.plan.coverage_design_llm_error")
         logger.warning("[PLAN] R65E7-L2 补排设计 LLM 失败（fail-open 留 L1+覆盖闸兜底）：%s", exc)
-        return file_plan, False
+        # LLM 失败不记 attempted：那是基建故障不是"设计不出来"，下一轮该重试（fail-open）
+        return file_plan, False, _attempted
     merged, added, dropped = _merge_designed_file_plan(file_plan, _new, allowed_modules=_mods)
     if dropped:                             # 越权/臆造条目被剔（含臆造模块）——可观测不静默
         record_degrade("brain.plan.coverage_design_entries_dropped")
@@ -1031,7 +1095,8 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
         logger.warning(
             "[PLAN] R65E7-L2 补排设计未产出有效文件（%d 个漏排需求仍无落点，留 L1 兜底+覆盖闸）：%s",
             len(unplanned_ids), unplanned_ids[:8])
-        return file_plan, False
+        # 试过了、没产出 → 记账，下一轮不再对同一批重试（C-7 自激环的关键一环）
+        return file_plan, False, sorted(set(_attempted) | set(unplanned_ids))
     _resid = requirements_missing_from_plan(
         req_items, build_planned_vocab(merged), _baseline_vocab)
     if _resid:                              # 部分补齐——残余进 metrics（可观测不静默）
@@ -1046,17 +1111,76 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
     logger.info(
         "[PLAN] R65E7-L2 file_plan 覆盖补排：为 %d 个漏排需求补 %d 文件（残余未覆盖 %d）；unplanned=%s",
         len(unplanned_ids), added, len(_resid), unplanned_ids[:8])
-    return merged, True
+    # 只把【本轮试过但仍残余】的记进账；真被补上的不记（它们已覆盖，下轮压根不会再判 unplanned，
+    # 记了反而会在需求被改写后误伤）。
+    return merged, True, sorted(set(_attempted) | (set(unplanned_ids) & set(_resid)))
+
+
+def _already_exists_prompt_block(state) -> str:
+    """★把 tech_design 判定的 already_exists 送到规划期（26 号文 C-8 治本）★
+
+    病灶：`already_exists` 只出现在 3 处 prompt 文本 + 1 处 state 注释，**全仓零读取点**——
+    两个消费者（graph.after_tech_design / planning_nodes.clarify）都写死 `verdict == "false"`。
+    round67m2 一手证据：tech_design STAGE1 在 FAILED 前 2h 就正确答出
+
+        「ruoyi-system + ruoyi-admin 已完整提供…不重复实现」
+        「代码生成器直接复用既有 ruoyi-generator（已含 GenTable/VelocityUtils）…不新建」
+
+    **系统把答案扔了**。随后 extract_requirements 抽出的 16 条 base 已有能力全程无棕地对账，
+    A7 对它们召回≈2 条且候选全是噪声，覆盖闸要求每条必须被 covers → planner 只能硬造
+    子任务 → plan 出现 create GenController/GenTable/SysRole/SysMenu → ③f 全部准确 REJECT
+    → 同签名不收敛熔断 FAILED@PLAN。**闸判得全对，问题是上游结构上必然会再产生一遍。**
+
+    ★为什么是"送到申报通道"而不是"直接标 baseline_covered"★
+    already_exists 是 **LLM 的判断**，不是确定性证据。直接据此跳过实现＝fail-open
+    （真该做的活被静默跳过，且无人知晓）。故与 A7 候选严格同构：作为**申报候选**呈现，
+    仍要求 planner 给出可核实的文件路径+满足方式，仍过 validate 侧接地校验。
+    改变的只是"这条线索存不存在"——原先它根本到不了规划期。
+    """
+    try:
+        hits = [fi for fi in (state.get("tech_design_fact_issues") or [])
+                if isinstance(fi, dict) and fi.get("verdict") == "already_exists"]
+        if not hits:
+            return ""
+        logger.info(
+            "[PLAN] C-8：tech_design 判定 %d 条能力【基线已有】，送入 baseline 申报通道"
+            "（此前该判定全仓零消费者，被直接丢弃）: %s",
+            len(hits), [str(h.get("claim", "?"))[:40] for h in hits][:5])
+        lines = []
+        for h in hits:
+            _claim = str(h.get("claim", "")).strip()[:200]
+            _detail = str(h.get("detail", "")).strip()[:300]
+            _sugg = str(h.get("suggestion", "")).strip()[:200]
+            _tail = "；".join(x for x in (_detail, _sugg) if x)
+            lines.append(f"- {_claim}" + (f" → {_tail}" if _tail else ""))
+        return (
+            "\n\n## 技术方案阶段判定【基线已有】的能力（共 %d 条）\n"
+            "上一阶段（tech_design）基于项目磁盘事实与知识库，判定以下能力**基线已经实现**。"
+            "请把它们与需求条目逐条对照：\n"
+            "(a) 确认基线确已满足 → 列入顶层 \"baseline_covered\"，reason 给出**可核实的具体"
+            "文件路径 + 如何满足**（与存量候选清单同一要求，仍会被接地校验）；\n"
+            "(b) 判断基线只部分满足 → 照常拆子任务补齐差额部分，绝不整条跳过；\n"
+            "**绝不要**为这些能力新建与基线同名的类/控制器/服务——那正是启动期 bean 冲突的来源。\n%s\n"
+        ) % (len(hits), "\n".join(lines))
+    except Exception as e:  # noqa: BLE001 — advisory 通道，绝不阻断规划
+        logger.warning("[PLAN] C-8 already_exists 注入降级为空（不阻断）：%s", e)
+        return ""
 
 
 async def _baseline_candidates_block_for(state) -> str:
     """A7（阶段3.5）：确定性 baseline 候选清单 prompt 块。requirement_items/project_id
-    缺失、索引未建、任何异常 → ""（fail-open 零注入，绝不拖垮规划）。"""
+    缺失、索引未建、任何异常 → ""（fail-open 零注入，绝不拖垮规划）。
+
+    C-8：并入 tech_design 的 already_exists 判定块。**故意合并在这一个函数里**——
+    本轮深扫的元结论之一是"新原语造对了只接主调用点"（已列 5 个新实例）；A7 块有两个
+    注入点（分批路径 :1249 与单发路径 :2662），另起一个块必然漏接其中一个。
+    """
     try:
+        _ae_block = _already_exists_prompt_block(state)
         _req_items = state.get("requirement_items") or []
         _pid = str(state.get("project_id") or "").strip()
         if not _req_items or not _pid:
-            return ""
+            return _ae_block   # A7 不可用不影响 already_exists 送达（两者独立来源）
         from swarm.brain.baseline_candidates import (
             baseline_candidates_prompt_block,
             build_baseline_candidates,
@@ -1067,16 +1191,25 @@ async def _baseline_candidates_block_for(state) -> str:
             _pid, _max_files, _max_symbols)
         cands = build_baseline_candidates(_req_items, files, symbols)
         if cands:
+            # 分开计数：unsearchable 是"本通道查不了"（纯中文需求恒 0 ASCII token），
+            # 与"查了、有命中"是完全不同的两件事，混在一个数字里会让召回率看起来虚高。
+            _hit_n = sum(1 for c in cands if c.get("candidates"))
+            _uns_n = len(cands) - _hit_n
             logger.info(
-                "[PLAN] A7 存量候选对账清单：%d/%d 条需求检索到确定性存量疑似位置",
-                len(cands), len(_req_items))
+                "[PLAN] A7 存量候选对账清单：%d/%d 条需求检索到确定性存量疑似位置"
+                "（另有 %d 条本通道检索能力不覆盖，已在清单中解除'清单外不得申报'禁令）",
+                _hit_n, len(_req_items), _uns_n)
         # 复核 F4：达上界=清单被确定性截断（路径序），>上界文件永不产候选——「清单外
         # 不要申报」对大仓从少提示升级为主动禁止合法申报，必须自述并放开。
         _truncated = len(files) >= _max_files or len(symbols) >= _max_symbols
-        return baseline_candidates_prompt_block(cands, truncated=_truncated)
+        return _ae_block + baseline_candidates_prompt_block(cands, truncated=_truncated)
     except Exception as e:  # noqa: BLE001 — 候选通道 advisory，绝不阻断
         logger.warning("[PLAN] A7 存量候选通道降级为空（不阻断）：%s", e)
-        return ""
+        # A7 挂了也不能连累 already_exists——两条线索来源独立，别一起丢
+        try:
+            return _already_exists_prompt_block(state)
+        except Exception:  # noqa: BLE001
+            return ""
 
 
 def _done_cover_ids_from_state(state) -> list[str]:
@@ -2569,6 +2702,9 @@ async def plan(state: BrainState) -> dict:
     # R65E7-L2：预置 False 覆盖所有到达公共 return 的路径（P1 外科路径设 task_plan→跳过下方 try；
     # 或 try 内 _l2_augmented 赋值前抛异常被 except 兜底假计划落到公共 return）——防 NameError。
     _l2_augmented = False
+    # C-7 补排"试过了"账：与 _l2_augmented 同处兜底初始化（异常路径防 NameError），
+    # 默认原样带走 state 值——绝不用本地空列表覆盖（否则自激抑制账每轮被抹＝治本失效）。
+    _cov_attempted = [str(x) for x in (state.get("coverage_design_attempted_reqs") or [])]
     _file_plan = None   # R65E7-L2：函数级预置——供公共 return 前的 finish/持久化引用（P1 路径不进下方 try）
     if task_plan is None:
       try:
@@ -2584,7 +2720,7 @@ async def plan(state: BrainState) -> dict:
         # file_plan 未排、基线亦无"的漏排需求（2FA/SHA512 类新功能），定向反馈设计 LLM 补排文件后再拆。
         # 否则漏排需求无子任务能覆盖→只能被谎报 baseline→T1 拦→恢复环无法 materialize→FAILED@PLAN。
         # fail-open：泄压阀关/无需求/无 unplanned/LLM 失败→原样返回不阻断（留 L1 兜底+覆盖闸）。
-        _file_plan, _l2_augmented = await _ensure_file_plan_covers_requirements(
+        _file_plan, _l2_augmented, _cov_attempted = await _ensure_file_plan_covers_requirements(
             state, llm, _file_plan, fallback_llm=_get_brain_fallback_llm())
         # H-6 对账收缩总闸（SPEC_h6）：重拆【前】对 file_plan 做裁决重放+膨胀收缩——上一轮
         # resolve 各 pass 已裁决剥离/归位的路径（strip/relocate/dedupe 账），绝不随全量重拆、
@@ -3006,6 +3142,10 @@ async def plan(state: BrainState) -> dict:
         # R65E7-L2：补排文件后持久化增广的 file_plan 到 state——否则下游 validate_plan 的 G1 coherence /
         # elaborate 仍读旧 file_plan（无补排文件）致口径漂移；仅补排时才发（否则不改既有键，零回归）。
         **({"tech_design_file_plan": _file_plan} if _l2_augmented else {}),
+        # C-7：补排"试过了"账无条件回写（monotonic，窗口内单调累积）。绝不用条件 emit——
+        # LangGraph 对缺席键保留旧值，条件 emit 在"本轮没跑补排"时看似等价，实则会让
+        # 异常路径上的账静默陈旧（ACCOUNTING_KEY_LIFECYCLE 血泪）。
+        "coverage_design_attempted_reqs": _cov_attempted,
         # TD2606-A5：规划 LLM 失败时上面产出的是空 scope「无验证」兜底假计划。打专用标记，
         # 让 can_auto_accept_plan fail-fast 拦下，绝不让它静默 dispatch → 空 diff → 假 DONE。
         # （_plan_degraded 仅在两条 except 失败分支被赋值，故等价于"规划生成失败"。）
@@ -3476,6 +3616,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": [],
             "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
             "plan_validation_issue_history": [],  # R67M-T2 B1：通过即清修复记忆（防跨轮粘滞）
+            "coverage_design_attempted_reqs": [],  # C-7：补排"试过了"账同律同点清（新周期重新给机会）
             "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
             # R35-C 复核（hunter #3）：SIMPLE 通过路径也显式清缓存——结构对称，绝不依赖上游
             # plan() 同轮 SIMPLE 分支的顺带清理（跨节点隐式不变量正是横切盲区，见记忆）。
@@ -3991,6 +4132,7 @@ async def validate_plan(state: BrainState) -> dict:
         # R67M-T2 B1：校验【通过】即清空修复记忆（与 feedback/plan_batch_cache 同律——
         # 过闸后无更多 PLAN 回炉轮，历史账长途漂流只会误导后续周期）。
         **({"plan_validation_issue_history": []} if plan_valid else {}),
+        **({"coverage_design_attempted_reqs": []} if plan_valid else {}),  # C-7 同律
         # R35-C 配套（F-4 膨胀兜底）：校验【通过】即清空 plan-batch 缓存——过闸后进 CONFIRM/
         # DISPATCH 无更多 PLAN 回炉轮，缓存无人再消费，清掉不让数十 KB 死重随后续 checkpoint
         # 长途漂流（D51 病灶同族）。未通过(回炉 PLAN)不清=下一轮护栏要用。
@@ -4157,6 +4299,7 @@ def confirm_plan(state: BrainState) -> dict:
         _patch_out["plan_retry_count"] = 0
         _patch_out["plan_validation_prev_structural"] = {}
         _patch_out["plan_validation_issue_history"] = []  # R67M-T2 B1：新周期清修复记忆（同律对称）
+        _patch_out["coverage_design_attempted_reqs"] = []  # C-7 同律对称
         # R67M2-T1（hunter R2-N1）：REVISE 新周期同步清校验反馈——否则残留 feedback 与
         # replan_feedback 同轮注入 sliding_ctx，尾部截断时用户反馈可能被静默吞掉。
         _patch_out["plan_validation_feedback"] = ""

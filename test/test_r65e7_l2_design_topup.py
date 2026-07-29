@@ -10,6 +10,9 @@ import json
 
 import pytest
 
+# 返回值第三元＝C-7 补排"试过了"账（26 号文：伞形需求每轮触发补排 → LLM 每轮凭空造
+# 一套平行设计 → file_plan 234→303→350 单调膨胀 → create 撞 base → 熔断）。本文件的
+# 用例只关心前两元，故统一解到 `_`；账本身的行为由 test_g_batch_selfexcitation 守。
 from swarm.brain.baseline_candidates import build_baseline_vocab
 from swarm.brain.nodes import (
     _ensure_file_plan_covers_requirements,
@@ -109,7 +112,7 @@ async def test_unplanned_2fa_gets_files(monkeypatch):
         {"path": "ruoyi-admin/src/main/java/com/ruoyi/web/controller/TwoFactorController.java",
          "module": "ruoyi-admin", "responsibility": "Google 2FA 绑定/解绑/验证"}]}))
     state = {"requirement_items": _items(), "project_stack": "Java/Thymeleaf 服务端模板", "project_id": "p"}
-    fp, aug = await _ensure_file_plan_covers_requirements(state, llm, _file_plan())
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(state, llm, _file_plan())
     assert aug is True, "2FA 漏排应触发补排"
     assert llm.calls == 1, "应恰调一次设计 LLM"
     assert any("TwoFactor" in e["path"] for e in fp), f"补排后 file_plan 应含 2FA 文件；fp={fp}"
@@ -124,7 +127,7 @@ async def test_all_planned_fast_path_no_llm(monkeypatch):
         "responsibility": "Google 2FA 双因素认证"}]
     llm = _LLM("{}")
     state = {"requirement_items": _items(), "project_id": "p"}
-    fp, aug = await _ensure_file_plan_covers_requirements(state, llm, fp_with_2fa)
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(state, llm, fp_with_2fa)
     assert aug is False and llm.calls == 0, "全覆盖不该调 LLM"
     assert fp == fp_with_2fa
 
@@ -134,7 +137,7 @@ async def test_env_off_skips(monkeypatch):
     monkeypatch.setenv("SWARM_PLAN_COVERAGE_DESIGN", "0")
     _patch_vocab(monkeypatch, _vocab_no_2fa())
     llm = _LLM("{}")
-    fp, aug = await _ensure_file_plan_covers_requirements(
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(
         {"requirement_items": _items(), "project_id": "p"}, llm, _file_plan())
     assert aug is False and llm.calls == 0, "泄压阀关时不触发"
 
@@ -144,7 +147,7 @@ async def test_llm_failure_fail_open(monkeypatch):
     """设计 LLM 挂（无备用）→ fail-open，原样返回 augmented=False，不阻断规划。"""
     _patch_vocab(monkeypatch, _vocab_no_2fa())
     fp0 = _file_plan()
-    fp, aug = await _ensure_file_plan_covers_requirements(
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(
         {"requirement_items": _items(), "project_id": "p"}, _BoomLLM(), fp0)
     assert aug is False and fp == fp0, "LLM 失败应 fail-open 不改 file_plan"
 
@@ -155,7 +158,7 @@ async def test_llm_empty_output_no_files(monkeypatch):
     _patch_vocab(monkeypatch, _vocab_no_2fa())
     llm = _LLM(json.dumps({"file_plan": [{"path": "", "module": ""}]}))
     fp0 = _file_plan()
-    fp, aug = await _ensure_file_plan_covers_requirements(
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(
         {"requirement_items": _items(), "project_id": "p"}, llm, fp0)
     assert aug is False and fp == fp0
 
@@ -165,7 +168,7 @@ async def test_empty_file_plan_simple_path_skips(monkeypatch):
     """简单/中等路径无 tech_design → file_plan 空 → 跳过（不无中生有补排）。"""
     _patch_vocab(monkeypatch, _vocab_no_2fa())
     llm = _LLM("{}")
-    fp, aug = await _ensure_file_plan_covers_requirements(
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(
         {"requirement_items": _items(), "project_id": "p"}, llm, [])
     assert aug is False and llm.calls == 0 and fp == []
 
@@ -176,6 +179,6 @@ async def test_empty_baseline_vocab_fail_open(monkeypatch):
     _patch_vocab(monkeypatch, "")
     llm = _LLM("{}")
     fp0 = _file_plan()
-    fp, aug = await _ensure_file_plan_covers_requirements(
+    fp, aug, _ = await _ensure_file_plan_covers_requirements(
         {"requirement_items": _items(), "project_id": "p"}, llm, fp0)
     assert aug is False and llm.calls == 0 and fp == fp0
