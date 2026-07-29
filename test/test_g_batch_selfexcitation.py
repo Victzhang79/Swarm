@@ -275,10 +275,19 @@ def test_owner_ledger_and_authority_share_the_section_scan():
 
 
 def test_methodology_hard_checks_are_written_down():
-    """★元教训必须写进 checked-in 的纪律文档，否则下一轮重犯★
-    CLAUDE.md 每次会话都会加载，是杠杆最高的落点（而复盘文档 gitignore 不入库）。"""
+    """★元教训必须落在会被再次读到的地方，否则下一轮重犯★
+
+    CLAUDE.md 每次会话都会加载，是杠杆最高的落点——但它**被 gitignore**（本仓
+    `.gitignore:65`，与 DEVLOG/复盘文档同族的"内部文档绝不入库"纪律）。所以：
+    · CLAUDE.md 是本机的加载点，可能不存在（新 clone / CI）→ 缺失即 skip，绝不因它红；
+    · **入库的落点是 `test/test_methodology_hard_checks.py`**（测试是本仓唯一入库的
+      散文载体），那条断言在下面单独一条，无条件生效。
+    """
     from pathlib import Path
-    md = (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text()
+    md_path = Path(__file__).resolve().parent.parent / "CLAUDE.md"
+    if not md_path.exists():
+        pytest.skip("CLAUDE.md 未入库（.gitignore），本机不存在时跳过")
+    md = md_path.read_text()
     for anchor in ("接线覆盖 ≠ 机制存在",
                    "测试要证\"被接上了\"",
                    "复用单一事实源 ≠ 复用其消费契约",
