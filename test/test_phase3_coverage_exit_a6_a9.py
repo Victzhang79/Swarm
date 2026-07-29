@@ -7,6 +7,9 @@ A6：CONFIRM 全有全无（2/108 未覆盖=整任务 REJECT）→ 缺口≤阈�
   水位倒退（3.1 硬地板）绝不放行——缺口只许是"从未覆盖"，不许是"倒退出来的"。
 A9：覆盖反馈 8000 字符截断 → 每轮暴露另一批震荡（round34 实证 18→12→18）。
   改分页轮转：超帽时按 retry_count 轮转页窗，页头自述（未列出≠已解决）。
+  R67M2-T1 A1（24号文）：帽 8000→32000——打回池全是阻断级 issue，现实池（数十条）
+  藏任何一条=重产对该死因失明（round67m2：17 条池分 2 页藏 3 条致命 ③b→熔断误
+  顶格）；分页轮转仅剩病态池（数百条+）安全阀语义。
   外科补齐（P1 topup）从 ULTRA-only 放开到 MEDIUM/COMPLEX（仅 SIMPLE 除外）。
 """
 
@@ -115,20 +118,23 @@ async def test_gap_allowance_kill_switch(monkeypatch):
     assert out["plan_valid"] is False, "两阈值归零=回到全有全无（运维泄压阀）"
 
 
-# ─────────────── A9：反馈分页轮转 ───────────────
+# ─────────────── A9：反馈分页轮转（R67M2-T1 后=病态池安全阀） ───────────────
 
-def _many_issues(n=300):
+def _many_issues(n=900):
+    # R67M2-T1 A1：全量可见帽 8000→32000——900 条 × ~45 字符 ≈ 40K 才触发安全阀分页
     return [f"需求条目 req-{i:06d} 未被任何子任务的 covers 覆盖：功能描述占位文本{i}"
             for i in range(n)]
 
 
 def test_feedback_pagination_rotates_windows():
     issues = _many_issues()
+    full = "\n".join(f"- {s}" for s in issues)
     p0 = _format_validation_feedback(issues, rotate=0)
     p1 = _format_validation_feedback(issues, rotate=1)
-    assert len(p0) < 9000 and len(p1) < 9000
+    assert len(p0) < len(full) and len(p1) < len(full), "超帽必须分页（单页显著小于全量）"
     assert p0 != p1, "不同重试轮必须轮转不同页窗（否则 LLM 永远修不了看不见的条目）"
     assert "轮转" in p0 and "轮转" in p1, "页头必须自述分页（未列出≠已解决）"
+    assert "阻断级" in p0, "R67M2-T1：页头必须明示未展示页同为本轮打回的阻断级原因"
     assert "req-000000" in p0 and "req-000000" not in p1
 
 
@@ -148,14 +154,35 @@ def test_feedback_short_list_unchanged():
 
 
 async def test_validate_plan_rotates_feedback_by_retry_round():
+    # R67M2-T1：全量帽 32000 → 800 条（×~50 字符 ≈ 40K）才进入安全阀分页
     items = [{"id": f"req-{i:06d}", "text": f"功能描述占位文本很长很长很长很长{i}",
               "kind": "functional", "source_quote": "q", "source": "d"}
-             for i in range(400)]
+             for i in range(800)]
     plan = _plan_covering([])
     o0 = await _run(plan, retry=0, items=items)
     o1 = await _run(plan, retry=1, items=items)
     assert o0["plan_validation_feedback"] != o1["plan_validation_feedback"], (
         "validate_plan 必须按 retry 轮轮转反馈页窗（round34 震荡治本）")
+
+
+# ─────────────── R67M2-T1 A1：阻断级打回池全量可见（round67m2 死因治本） ───────────────
+
+async def test_validate_plan_realistic_reject_pool_fully_visible():
+    """round67m2 失明面治本：约 1.5 万字符的打回池在旧 8000 帽下会被分 2 页、
+    retry=1 只展示其中一页（round67m2：3 条致命 ③b 全在未展示页 → 21/21 重产
+    prompt 失明）。A1 治本后：现实打回池任何 retry 轮都【全量可见】，绝不进分页。
+    （100 条 × ~148 字符 ≈ 14.8K：超旧帽 8000 → 旧码必分页；低于新帽 32000 → 全显）"""
+    items = [{"id": f"req-{i:06d}", "text": f"功能描述占位文本{i}" + "长" * 110,
+              "kind": "functional", "source_quote": "q", "source": "d"}
+             for i in range(100)]
+    plan = _plan_covering([])
+    out = await _run(plan, retry=1, items=items)
+    fb = out["plan_validation_feedback"]
+    assert out["plan_valid"] is False
+    assert len(fb) > 8000, "夹具必须真的超旧帽（否则本测试对旧码也绿=没钉住回归）"
+    assert "轮转" not in fb, "现实打回池（百条内≈万字符级）绝不许分页藏阻断级 issue"
+    for i in range(100):
+        assert f"req-{i:06d}" in fb, f"第 {i} 条阻断级 issue 必须对重产可见（round67m2 失明面）"
 
 
 # ─────────────── A9-2：外科补齐放开 MEDIUM ───────────────

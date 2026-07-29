@@ -1164,9 +1164,13 @@ async def _plan_ultra_batched(
     # 不受 8K 分页帽约束）+ 修补块 9.2K（新增 D1 done 段）≈ 24K，修补纪律/D1 硬约束
     # 从 offset ~14.7K 起=整块被截没 → 重试轮 LLM 看不到"不要全量重拆" → 全量重拆 →
     # 水位闸硬拒 → 白烧 MAX_PLAN_RETRY（round31 H-1 同族回归，结构性烧钱环）。
-    # 上界放到 32000：三段各自已定界（wm 50 条帽/feedback 分页/修补块分段帽，合计
-    # ≤25K），32K 保证结构块全存活 + 余量给 sliding 原文，截断只落在原文尾部。
-    sliding_ctx_text = (sliding_ctx or "").strip()[:32000] or "（无）"
+    # R67M2-T1（hunter H-2）分段预算隔离：A1 把主反馈帽提到 32K 后，原 32000 总帽
+    # 已装不下"反馈 32K + 反回归段 + 修补纪律块"——盲截会把反回归硬约束/修补纪律
+    # 静默整块截没（H-1 失明面复发）。各段独立定界：主反馈 ≤_FEEDBACK_FULL_VIS_BUDGET
+    # （分页页 ≤_FEEDBACK_PAGE_BUDGET）+ 反回归段 ≤_NO_REGRESS_BLOCK_BUDGET（12K，
+    # bullet 截断计数明示）+ 修补纪律块自带分段帽 ~9K + 水位/资格块自带条数帽 ≈ 55K；
+    # 总帽 56K 保证全部结构块存活，截断只落在 sliding 原文尾部（最低优先级）。
+    sliding_ctx_text = (sliding_ctx or "").strip()[:_SLIDING_CTX_BUDGET] or "（无）"
     # S2-3：分批路径同样注入需求条目清单（items 空=一字不加）。batched=True 提示本批只
     # 声明相关条目——全覆盖由 merge 后 validate_plan 的覆盖矩阵整体校验兜底。
     # A7（阶段3.5）：确定性存量候选对账清单（kb 索引检索，计算一次每批复用）——棕地底座
@@ -3063,16 +3067,87 @@ def _no_regress_feedback_block(state) -> str:
     的反馈里消失，全量重摇把它摇回来（轮4 CVB shadow 与轮1 逐字相同=纯回归烧 3h15m）。
     历史账由 increment_retry 单点累积（plan_validation_issue_history）；本轮仍失败的
     issues 由"务必逐条修正"段承载，本段只列【已修掉、不得回归】的差集。无差集→空串
-    （首轮重试/历轮缺陷全部未愈时零噪声）。"""
+    （首轮重试/历轮缺陷全部未愈时零噪声）。
+
+    R67M2-T1（hunter H-2）：本段定界 _NO_REGRESS_BLOCK_BUDGET——A1 把主反馈帽提到
+    32K 后，prompt 组装实行分段预算隔离（见 plan() 分批路径 _SLIDING_CTX_BUDGET
+    注释），本段若无界（病态池历轮账可达数百条）会把 prev_plan 修补纪律/sliding 原文
+    挤出总帽=H-1 失明面复发。超帽按 bullet 截断+计数明示（截掉的是【已修掉】的旧伤
+    提醒——真回归了当轮闸会重新抓回当前 issues 面，不致盲；绝不许截当前打回反馈）。"""
     hist = [str(h).strip() for h in (state.get("plan_validation_issue_history") or [])]
     cur = {str(i).strip() for i in (state.get("plan_validation_issues") or [])}
     no_regress = [h for h in hist if h and h not in cur]
     if not no_regress:
         return ""
+    # bullet 适配预算：超出即截，尾部计数明示（绝不静默丢）；单条封顶 400 字符
+    # （hunter R2-N2：病态超长单条不得独自吃穿整段预算）。
+    kept: list[str] = []
+    used = 0
+    for h in no_regress:
+        h = h[:400] + ("…" if len(h) > 400 else "")
+        if kept and used + len(h) + 3 > _NO_REGRESS_BLOCK_BUDGET:
+            break
+        kept.append(h)
+        used += len(h) + 3
+    dropped = len(no_regress) - len(kept)
+    tail = (f"- …及其余 {dropped} 条历轮已修缺陷（全量见 plan_validation_issue_history 账，"
+            "同样绝不许回归）\n" if dropped else "")
     return (
         "🚫 历轮校验曾暴露的缺陷（此前轮次已修掉，本次重产【绝不许回归】——"
         "全量重拆时也必须保持这些修复）：\n"
-        + "\n".join(f"- {h}" for h in no_regress) + "\n")
+        + "\n".join(f"- {h}" for h in kept) + "\n" + tail)
+
+
+# R67M2-T1（hunter H-2）：反回归段字符预算——prompt 组装分段预算隔离的一段
+# （主反馈 32K + 本段 12K + 修补纪律块 ~9K ≈ 53.5K ≤ _SLIDING_CTX_BUDGET）。
+_NO_REGRESS_BLOCK_BUDGET = 12000
+
+
+# R67M2-T1 A1（24号文，round67m2 CRITICAL 主死因治本）：阻断级反馈全量可见预算。
+# A9 的 8000 字符帽来自小上下文时代；round67m2 实证其致命面——G1 打回池 17 条
+# （③b 同名异包×6 + ③f shadow×11，约 1 万字符）刚超帽被分 2 页，retry=1 只展示第
+# 2/2 页（2 条非致命），3 条致命 ③b 全在未展示页 → 21/21 重产 prompt 对主死因失明
+# → 签名不变被 H-5 以"带反馈未收敛"误判熔断顶格。此函数的调用点传入的都是【本轮
+# 打回的阻断级 issue】——藏任何一条=重产对该死因结构性失明。当代脑模型上下文
+# ≥200K，现实打回池（数十条≈万字符级）全量展示的代价远低于白烧一轮全量重产；
+# 分页轮转只保留为【病态池】（数百条以上）安全阀，且熔断前提随动（A2，见
+# _gate_fuse_and_account 的 over_budget 账）。
+_FEEDBACK_FULL_VIS_BUDGET = 32000
+# 安全阀启用时的单页字符预算：贴近全量帽（留页头余量）——页数最少化，保证
+# MAX_PLAN_RETRY 轮次内轮转必能把全池送达（60K 内 2 页必达）。
+_FEEDBACK_PAGE_BUDGET = 28000
+# 分批路径 sliding_ctx 总帽（R67M2-T1 hunter H-2 分段预算隔离）：主反馈 ≤32K +
+# 反回归段 ≤_NO_REGRESS_BLOCK_BUDGET（12K）+ 修补纪律块自带分段帽 ~9K + 水位/资格块
+# 条数帽 ≈ 55K → 总帽 56K 保证全部结构块存活，截断只落 sliding 原文尾部（最低优先级）。
+# 纪律：新增注入段必须先自带独立预算才准进本帽，绝不许裸拼（否则 H-1 失明面复发）。
+_SLIDING_CTX_BUDGET = 56000
+
+
+def _dedup_issues(issues: list) -> list[str]:
+    """issue 去重单一事实源：逐条字符串化，去空/去重保序（返回裸串，无 bullet 前缀）。
+
+    _format_validation_feedback（展示面）与 _gate_fuse_and_account（熔断 count/sig 面）
+    同源——hunter H-5：count 未去重而 LLM 所见是去重文本时，900 条重复串会把窗口/签名
+    触发虚撑到熔断（LLM 实际只被告知 1 条）；口径必须统一为"LLM 实际所见"。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in (issues or []):
+        s = str(it).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _dedup_issue_lines(issues: list) -> list[str]:
+    """D09 反馈行：_dedup_issues 加 bullet。展示面与熔断面同源（口径漂移=A2 前提再证伪）。"""
+    return [f"- {s}" for s in _dedup_issues(issues)]
+
+
+def _feedback_over_budget(issues: list) -> bool:
+    """该 issues 池交给 _format_validation_feedback 是否会触发分页轮转（=阻断级
+    issue 本轮无法全量送达）。A2 熔断前提判定与反馈格式化同源同帽。"""
+    return len("\n".join(_dedup_issue_lines(issues))) > _FEEDBACK_FULL_VIS_BUDGET
 
 
 def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
@@ -3083,23 +3158,20 @@ def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
     A9（阶段3.4，2026-07-09 登记册）：超帽时【分页轮转】而非固定截断头部——固定截断使
     LLM 永远修不了看不见的条目，每轮暴露另一批（round34 实证 uncovered 18→12→18 震荡）。
     rotate（调用方传 plan_retry_count）决定本轮展示哪一页；页头自述"未列出≠已解决"。
-    未超帽（≤8000 字符）时 rotate 无效、输出零变化。"""
-    seen: set[str] = set()
-    lines: list[str] = []
-    for it in (issues or []):
-        s = str(it).strip()
-        if s and s not in seen:
-            seen.add(s)
-            lines.append(f"- {s}")
+
+    R67M2-T1 A1（24号文）：帽 8000→_FEEDBACK_FULL_VIS_BUDGET（见常量注释）。现实打回
+    池全量可见、rotate 无效；分页轮转仅剩病态池安全阀语义，页头明示未展示页【同为
+    阻断级】，且 H-5 熔断前提随动（A2：历轮超帽分页期间同签名/窗口触发暂缓）。"""
+    lines = _dedup_issue_lines(issues)
     out = "\n".join(lines)
-    if len(out) <= 8000:
+    if len(out) <= _FEEDBACK_FULL_VIS_BUDGET:
         return out
-    # 按字符预算切页（每页 ~7500，留页头余量）
+    # 病态池安全阀：按字符预算切页（页预算取 _FEEDBACK_PAGE_BUDGET，页数最少化）
     pages: list[list[str]] = []
     cur: list[str] = []
     cur_len = 0
     for ln in lines:
-        if cur and cur_len + len(ln) + 1 > 7500:
+        if cur and cur_len + len(ln) + 1 > _FEEDBACK_PAGE_BUDGET:
             pages.append(cur)
             cur, cur_len = [], 0
         cur.append(ln)
@@ -3109,9 +3181,9 @@ def _format_validation_feedback(issues: list, rotate: int = 0) -> str:
     pi = int(rotate) % len(pages)
     body = "\n".join(pages[pi])
     return (
-        f"（反馈分页轮转 第{pi + 1}/{len(pages)}页：共 {len(lines)} 条问题，本页列 "
-        f"{len(pages[pi])} 条；其余页在后续重试轮轮转展示——未列出的问题【同样存在且未解决】，"
-        "已修好的条目不要回退）\n" + body)
+        f"（反馈分页轮转 第{pi + 1}/{len(pages)}页：共 {len(lines)} 条问题，均为【本轮打回的"
+        f"阻断级原因】，本页列 {len(pages[pi])} 条；其余页在后续重试轮轮转展示——未列出的"
+        "问题【同样存在且全部未解决，一条都不能漏】，已修好的条目不要回退）\n" + body)
 
 
 def _gate_fuse_and_account(state: dict, gate: str, issues, retry_count: int) -> tuple[int, dict]:
@@ -3120,7 +3192,8 @@ def _gate_fuse_and_account(state: dict, gate: str, issues, retry_count: int) -> 
     体检 TOP5：逐闸早退共享 plan_retry_count，熔断账此前仅 G1 写——每轮死在不同闸时账链
     断裂无收敛判定，3 轮各修一闸即预算耗尽（表观死因=最后一闸）。本 helper 把账全局化：
     每个硬闸失败早退时调用，返回 (可能被顶格的 retry, 新账)。账结构
-    {gate, sig, retry, count, gate_1ago, count_1ago}；两触发均加 gate 相等约束——
+    {gate, sig, retry, count, over_budget, over_budget_1ago, gate_1ago, count_1ago}；
+    两触发均加 gate 相等约束——
       触发一（R64-T3 原判泛化）：同闸同签名连续两轮=反馈未被执行，重试必然同结果；
       触发二（round67i 窗口泛化）：同闸 2 轮窗口违例数零净收敛（cur>=count_2ago 且 cur>0），
         含跨闸弹跳回退（A闸→B闸→A闸 且 A 违例数未减=修 B 打破了 A 或原地重犯）。
@@ -3134,35 +3207,63 @@ def _gate_fuse_and_account(state: dict, gate: str, issues, retry_count: int) -> 
     structure 闸 issue 去 st-id 后判别力不足（悬空依赖文本互相同化）→ 调用侧排除。
     旧账兼容：无 gate 键（历史唯一写者是 G1）按 "G1" 论，在飞 checkpoint 升级瞬间不失防护。
     泄压阀沿用 SWARM_G1_RETRY_FUSE（单一开关覆盖全闸，绝不留半开状态）。
+
+    ★R67M2-T1 A2（24号文）熔断前提随动★：两触发的共同前提=【反馈已送达而未收敛】。
+    round67m2 实证前提可被证伪——打回池超帽分页时（A1 安全阀），未展示页的阻断级
+    issue 对重产失明，"签名不变/计数不降"是反馈失明的必然结果而非 LLM 不收敛；此时
+    熔断=把"还没被告知"误判"告诉了不改"（round67m2 在轮转即将送回致命页的前一轮
+    被顶格）。账增 over_budget/over_budget_1ago（与 _format_validation_feedback 同源
+    同帽 _feedback_over_budget）：上轮（窗口触发含上上轮）曾超帽分页 → 对应触发暂缓，
+    给轮转送达留轮次；烧算上界仍由 MAX_PLAN_RETRY 硬顶格兜底，暂缓面打 WARNING
+    （降级可观测，绝不静默）。旧账无 over_budget 键 → None=未超帽，行为不变。
+    （over_budget* 是 plan_validation_prev_structural 内部字段，随该键 round 级
+    生命周期/清空点走，非独立 state 键——hunter LOW#4。）
     """
     from swarm.brain.plan_validator import normalize_structural_signature as _norm
-    sig = _norm(issues)
+    # hunter H-5（R67M2-T1）：count/sig 一律走"LLM 实际所见"的去重口径——900 条重复串
+    # 未去重会把窗口计数虚撑到熔断，而重产 prompt 里它只是一行。
+    deduped = _dedup_issues(issues)
+    sig = _norm(deduped)
     prev = state.get("plan_validation_prev_structural") or {}
-    count = len(issues or [])
+    count = len(deduped)
     consecutive = prev.get("retry") == retry_count - 1
     prev_gate = prev.get("gate", "G1")
     retry_out = retry_count
     fuse_on = os.environ.get(
         "SWARM_G1_RETRY_FUSE", "1").strip().lower() not in ("0", "false", "no", "off")
-    fuse_sig = consecutive and prev_gate == gate and prev.get("sig") == sig
     count_2ago = prev.get("count_1ago")
     gate_2ago = prev.get("gate_1ago", "G1")
-    fuse_window = (
+    # A2：历轮反馈是否曾超帽分页（=阻断级 issue 未曾全量送达）。prev_partial=上轮
+    # （塑造本轮 plan 的那份反馈）；prev_partial_1ago=上上轮（窗口触发跨两轮取证）。
+    prev_partial = bool(prev.get("over_budget"))
+    prev_partial_1ago = bool(prev.get("over_budget_1ago"))
+    raw_sig = consecutive and prev_gate == gate and prev.get("sig") == sig
+    raw_window = (
         consecutive and retry_count >= 2 and count > 0
         and gate_2ago == gate and count_2ago is not None and count >= count_2ago)
+    fuse_sig = raw_sig and not prev_partial
+    fuse_window = raw_window and not (prev_partial or prev_partial_1ago)
+    if fuse_on and (raw_sig or raw_window) and not (fuse_sig or fuse_window):
+        logger.warning(
+            "[VALIDATE_PLAN] R67M2-T1 A2：%s 闸收敛信号成立，但历轮反馈曾超帽分页"
+            "（阻断级 issue 未全量送达，'未收敛'前提证伪）→ 熔断暂缓，给轮转送达留轮次"
+            "（MAX_PLAN_RETRY 硬顶格兜底）", gate)
     if fuse_on and (fuse_sig or fuse_window):
         from swarm.brain.graph import MAX_PLAN_RETRY as _max
         retry_out = max(retry_count, _max)
-        _why = (f"{gate} 闸结构违例签名连续两轮未变（同违例重犯）" if fuse_sig
+        _why = (f"{gate} 闸结构违例签名连续两轮未变（反馈已全量送达仍同违例重犯）"
+                if fuse_sig
                 else f"{gate} 闸违例数 2 轮窗口零净收敛（{count_2ago}→…→{count} 未减，"
-                     "同族换件/跨闸弹跳回退重犯）")
+                     "同族换件/跨闸弹跳回退重犯，历轮反馈均已全量送达）")
         logger.warning(
-            "[VALIDATE_PLAN] R64-T3/H5 %s（带反馈重产未收敛）→ 熔断：retry 顶格 %d，"
+            "[VALIDATE_PLAN] R64-T3/H5 %s → 熔断：retry 顶格 %d，"
             "直接进 CONFIRM fail-fast（不再烧重产轮）", _why, retry_out)
-    # gate_1ago/count_1ago：仅严格连续时继承上轮（供下一轮算同闸 2 轮窗口）；
-    # 非连续→None 免陈旧误熔（R64-T3 原护栏跨闸保持）。
+    # gate_1ago/count_1ago/over_budget_1ago：仅严格连续时继承上轮（供下一轮算同闸
+    # 2 轮窗口/A2 前提）；非连续→None 免陈旧误熔/误暂缓（R64-T3 原护栏跨闸保持）。
     account = {
         "gate": gate, "sig": sig, "retry": retry_count, "count": count,
+        "over_budget": _feedback_over_budget(issues),
+        "over_budget_1ago": (prev.get("over_budget") if consecutive else None),
         "gate_1ago": (prev_gate if consecutive else None),
         "count_1ago": (prev.get("count") if consecutive else None)}
     return retry_out, account
@@ -3902,6 +4003,9 @@ def confirm_plan(state: BrainState) -> dict:
         _patch_out["plan_retry_count"] = 0
         _patch_out["plan_validation_prev_structural"] = {}
         _patch_out["plan_validation_issue_history"] = []  # R67M-T2 B1：新周期清修复记忆（同律对称）
+        # R67M2-T1（hunter R2-N1）：REVISE 新周期同步清校验反馈——否则残留 feedback 与
+        # replan_feedback 同轮注入 sliding_ctx，尾部截断时用户反馈可能被静默吞掉。
+        _patch_out["plan_validation_feedback"] = ""
     return _patch_out
 
 

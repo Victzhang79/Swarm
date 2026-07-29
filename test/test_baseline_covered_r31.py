@@ -493,15 +493,16 @@ def test_normalize_caps_total_entries():
 
 
 def test_feedback_formatter_bounded_and_self_describing():
-    """复核 L-5：60 条 issue ≈15K 字符无界 → 8K 定界且自述（不静默）。
-    A9（阶段3.4）语义演进：固定截断改分页轮转（LLM 修不了看不见的条目），
-    ★意图不变：有界 + 明示"未列出的问题同样存在"★。"""
+    """复核 L-5：病态池无界 → 定界且自述（不静默）。
+    A9（阶段3.4）语义演进：固定截断改分页轮转（LLM 修不了看不见的条目）。
+    R67M2-T1 A1 语义再演进：全量可见帽 8000→32000（现实打回池全显=治本，分页仅剩
+    病态池安全阀）——300 条 ≈46K 才超帽，★意图不变：有界 + 明示"未列出的问题同样存在"★。"""
     from swarm.brain.nodes import _format_validation_feedback
     issues = [f"需求条目未被任何子任务覆盖: req-{i:08x} — " + "描述" * 60
-              for i in range(60)]
+              for i in range(300)]
     out = _format_validation_feedback(issues)
-    assert len(out) < 8500
-    assert "轮转" in out and "未列出" in out
+    assert len(out) < 30000, "病态池安全阀必须定界（单页远小于全量）"
+    assert "轮转" in out and "未列出" in out and "阻断级" in out
 
 
 def test_near_miss_ambiguous_prefix_no_hint():
