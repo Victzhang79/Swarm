@@ -305,6 +305,16 @@ async def analyze(state: BrainState) -> dict:
             logger.warning(
                 "[ANALYZE] ⚠️ 知识检索部分降级：层 %s 不可用（其 0 命中≠该项目真无相关知识，"
                 "Brain 勿当完整上下文）", stats.get("retrieval_partial"))
+        # ★"这一层这轮什么都没给"必须机读可查（26 号文 F-H1）★
+        # Layer C（工程规范）对生产项目自 07-18 起恒为 0，跨 5+ 轮 live 全程零信号——
+        # 因为"空返回是正常返回而非异常"，没有任何一条日志/字段会因此变化。
+        # 零命中本身可能正常（项目确实没沉淀规范），但它必须是可被发现的事实。
+        _empty_layers = [k[:-6] for k in ("norms_empty",) if stats.get(k)]
+        if _empty_layers:
+            logger.warning(
+                "[ANALYZE] ⚠️ 知识层零命中：%s（若持续多轮为 0，多半是该层的入库通道已死，"
+                "而非项目真无此类知识——本仓实测 norms 层曾连续 12 天跨 5+ 轮全零无人发现）",
+                _empty_layers)
         logger.info(
             "[ANALYZE] 知识检索完成: struct=%s semantic=%s norms=%s "
             "summary=%s mistakes=%s successes=%s",

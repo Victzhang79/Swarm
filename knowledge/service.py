@@ -380,6 +380,15 @@ def _above_similarity_floor(item: dict[str, Any], floor: float) -> bool:
     return val >= floor
 
 
+def _with_seen_at(title: str, item: dict[str, Any]) -> str:
+    """给记忆层条目附「最近一次出现」——三个月前与昨天的错题绝不该等价（F-H3）。"""
+    _ts = item.get("last_seen_at") or item.get("updated_at") or item.get("created_at")
+    if not _ts:
+        return str(title)
+    _d = str(_ts)[:10]
+    return f"{title}（最近出现 {_d}）" if _d else str(title)
+
+
 def format_layer_items(layer: str, items: list[dict[str, Any]], top_k: int) -> list[dict[str, str]]:
     """将检索结果格式化为 Tool 输出条目"""
     # G11：真·余弦相似度层先过地板再截 top_k（items 已按相似度降序，过滤低分噪声召回）。
@@ -400,7 +409,15 @@ def format_layer_items(layer: str, items: list[dict[str, Any]], top_k: int) -> l
             title = f"{item.get('symbol_name', '?')} ({item.get('file_path', '')})"
             content = item.get("signature") or item.get("docstring") or item.get("symbol_type", "")
         elif layer == "semantic":
+            # ★provenance 不能丢（26 号文 F-H3）★
+            # payload 里有 start_line/end_line 却只取 file_path，于是大模型拿到的是
+            # "某文件里的一段话"，无从核对也无从引用——而相邻块把项目结构标为
+            # "事实依据，ground truth"。这与"需求条目必须带原文引文防幻觉"的既定标准
+            # **明显不对称**：同一个系统，对需求要求可核实引文，对召回却主动抹掉行号。
             title = item.get("file_path") or item.get("chunk_id", "semantic")
+            _s_ln, _e_ln = item.get("start_line"), item.get("end_line")
+            if _s_ln:
+                title = f"{title}:{_s_ln}" + (f"-{_e_ln}" if _e_ln and _e_ln != _s_ln else "")
             content = (item.get("content") or item.get("signature") or item.get("text") or "")[:300]
         elif layer == "norms":
             title = item.get("title", "Harness 规则")
@@ -409,10 +426,14 @@ def format_layer_items(layer: str, items: list[dict[str, Any]], top_k: int) -> l
             title = item.get("file_path") or item.get("trigger_file") or "behavior"
             content = f"co_count={item.get('co_count', item.get('mod_count', ''))}"
         elif layer == "mistakes":
+            # F-H3：带上最近一次出现时间——"三个月前的错题"与"昨天的错题"等价对待，
+            # 会让大模型把早已修好的历史坑当现行约束。
             title = item.get("error_type") or item.get("description", "")[:40]
+            title = _with_seen_at(title, item)
             content = item.get("fix_description") or item.get("description", "")
         elif layer == "successes":
             title = item.get("pattern_name") or item.get("description", "")[:40]
+            title = _with_seen_at(title, item)
             content = item.get("approach") or item.get("description", "")
         else:
             title = str(item.get("title", item.get("id", "item")))
@@ -467,6 +488,11 @@ def format_brain_knowledge_prompt(
     parts: list[str] = [
         f"> 以下内容由 SwarmRetriever 按任务「{query[:120]}」检索，"
         f"非全库 dump；各层有数量上限。",
+        # ★F-H3：召回是【线索】不是 ground truth★
+        # 相邻块把项目结构标为"事实依据，ground truth"，而召回层全无免责——大模型会把
+        # 一段可能陈旧的片段当权威。带行号的条目可回原文核对；不带的只能当线索。
+        "> ⚠️ 本节内容来自**索引快照**，可能滞后于当前代码：带 `文件:行号` 的条目可回原文"
+        "核对，请以磁盘/diff 实况为准；记忆层条目标注了最近出现时间，久远条目未必仍然适用。",
     ]
 
     from swarm.config.settings import get_config

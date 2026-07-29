@@ -112,6 +112,12 @@ class DependencyEdge:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+# Layer A 文件名通道的判别力阈值：命中超过全项目文件的这个比例 = 无判别力
+# （项目名/公共路径段）。0.30 是保守取值——真正精确的模块名（parser/cli）命中率
+# 通常 <5%，而项目名类关键词直接 100%。栈中立（纯占比，不涉语言）。
+_FILE_KEYWORD_MAX_HIT_RATIO = 0.30
+
+
 class StructureIndexer:
     """Layer A — 结构索引管理器
 
@@ -397,19 +403,58 @@ class StructureIndexer:
         补 Layer A 盲区：关键词常是模块/文件名（如 'parser'、'cli'），它不是
         任何符号名，但精确指向 src/dotenv/parser.py。按符号名查会全空，按文件
         路径模糊查才能命中。
+
+        ★两条确定性纠偏（26 号文 F-C1）★
+        实测 `kw='ruo'` 命中 **3523 条＝全库**（项目名在每条路径里），25 个槽位被第一个
+        关键词吃光；返回的是 `RuoYiApplication`、6 条重复包声明、demo 域 `GoodsModel`
+        ——`SysLoginController` 一次都没出现。5745 条历史日志里 `struct=25` 恒定饱和。
+        **一处噪声污染四层**（→ located_files → 依赖图扩展 +63 → affected_files=86 →
+        又作 Layer B priority_files 与 Layer D 种子）。
+        ① **无判别力关键词直接弃用**：命中数占全项目文件比超过阈值 = 它是项目名/公共
+           路径段，留着只会把槽位吃光。判据是【占比】而非绝对数，故对大小仓一致。
+        ② **按匹配特异性排序**而不是字母序：basename stem 全等 > basename 含 > 路径含。
+           字母序让 `AlarmXxx` 恒排在 `SysLoginController` 前，与相关性无关。
         """
         conn = self._conn_or_raise()
+        _kw = f"%{keyword}%"
         async with conn.cursor() as cur:
+            # ① 判别力预检：先只数文件数（DISTINCT file_path），一次廉价 COUNT
+            await cur.execute(
+                "SELECT count(DISTINCT file_path) FROM kb_symbol_index WHERE project_id = %s",
+                (project_id,),
+            )
+            _total = (await cur.fetchone() or [0])[0] or 0
+            await cur.execute(
+                "SELECT count(DISTINCT file_path) FROM kb_symbol_index "
+                "WHERE project_id = %s AND file_path ILIKE %s",
+                (project_id, _kw),
+            )
+            _hit = (await cur.fetchone() or [0])[0] or 0
+            if _total and _hit / _total > _FILE_KEYWORD_MAX_HIT_RATIO:
+                logger.info(
+                    "[KB] Layer A 文件名通道弃用无判别力关键词 %r（命中 %d/%d 文件＝%.0f%%，"
+                    "超过 %.0f%% 阈值——多半是项目名/公共路径段，留着会把召回槽位吃光）",
+                    keyword, _hit, _total, 100 * _hit / _total,
+                    100 * _FILE_KEYWORD_MAX_HIT_RATIO)
+                return []
+            # ② 按匹配特异性排序：basename stem 全等(0) > basename 含(1) > 仅路径含(2)
             await cur.execute(
                 """
                 SELECT file_path, symbol_name, symbol_type, start_line, end_line,
                        signature, docstring, class_name, metadata_json
                 FROM kb_symbol_index
                 WHERE project_id = %s AND file_path ILIKE %s
-                ORDER BY file_path, start_line
+                ORDER BY
+                  CASE
+                    WHEN lower(split_part(regexp_replace(file_path, '^.*/', ''), '.', 1))
+                         = lower(%s) THEN 0
+                    WHEN regexp_replace(file_path, '^.*/', '') ILIKE %s THEN 1
+                    ELSE 2
+                  END,
+                  file_path, start_line
                 LIMIT %s
                 """,
-                (project_id, f"%{keyword}%", limit),
+                (project_id, _kw, keyword, _kw, limit),
             )
             rows = await cur.fetchall()
         return [self._row_to_symbol_dict(r) for r in rows]

@@ -33,6 +33,15 @@ def _is_zero_vec(vec: list[float] | None, sample_size: int = 8) -> bool:
     return all(abs(x) < 1e-12 for x in vec[:sample_size])
 
 
+def _mark_partial(stats: dict, layer: str) -> str:
+    """把降级层名累加进 retrieval_partial（多层同时降级要都看得见，不能后写覆盖先写）。"""
+    _prev = str(stats.get("retrieval_partial") or "")
+    _names = [x for x in _prev.split(",") if x]
+    if layer not in _names:
+        _names.append(layer)
+    return ",".join(_names)
+
+
 @dataclass
 class SwarmRetrieverResult:
     """检索结果封装"""
@@ -197,6 +206,9 @@ class SwarmRetriever:
         except Exception as exc:
             logger.warning("Layer B retrieval failed: %s", exc)
             stats["semantic_error"] = str(exc)
+            # F-C3：消费者（nodes/__init__.py:304）打的是"层 %s 不可用"——必须传【层名】，
+            # 传 True 会打出"层 True 不可用"，等于把机读信号写成噪声。
+            stats["retrieval_partial"] = _mark_partial(stats, "semantic")
 
         # 补充: 语义检索命中的文件也纳入共现分析
         all_files = located_files + [
@@ -211,9 +223,16 @@ class SwarmRetriever:
             )
             context["norms"] = norms_results
             stats["norms_count"] = len(norms_results)
+            # ★"空返回是正常返回而非异常" ＝ 这一层可以死 12 天没人知道（26 号文 F-H1）★
+            # 实测 Layer C 对生产项目自 07-18 起恒为 0，跨 5+ 轮 live 全程零信号
+            # （kb_norms 对两个 RuoYi 项目各 0 行）。零命中本身可能正常（项目确实没沉淀
+            # 规范），但"这一层这轮什么都没给"必须是**机读**的，否则无从发现它已经死了。
+            if not norms_results:
+                stats["norms_empty"] = True
         except Exception as exc:
             logger.warning("Layer C retrieval failed: %s", exc)
             stats["norms_error"] = str(exc)
+            stats["retrieval_partial"] = _mark_partial(stats, "norms")
 
         # ── Layer D: 共现分析 ──────────────────
         try:
@@ -315,6 +334,10 @@ class SwarmRetriever:
 
     # ── 各层检索 ──────────────────────────────
 
+    # Layer A 返回上限（Brain 侧还会再截断）。分桶轮转保证每个关键词都能进货，
+    # 不再被第一个无判别力关键词吃光（26 号文 F-C1）。
+    _LAYER_A_MAX = 25
+
     async def _retrieve_layer_a(
         self, project_id: str, keywords: list[str]
     ) -> list[dict[str, Any]]:
@@ -322,34 +345,49 @@ class SwarmRetriever:
         if not self._struct:
             return []
 
-        results: list[dict[str, Any]] = []
+        # ★按关键词分桶而不是一锅拼接（26 号文 F-C1）★
+        # 原实现把所有关键词的命中顺序 extend 进一个列表，末尾 `[:25]` 硬截——于是
+        # **第一个关键词就把 25 个槽位吃光**（实测 kw='ruo' 命中全库 3523 条），
+        # 后面每一个关键词的命中一条都进不来。5745 条历史日志 `struct=25` 恒定饱和。
+        # 改为分桶 + 轮转（round-robin）取：每个关键词至少保底一条，与
+        # `validate_assertions` 的 D8② 分桶配额同一思路（本仓既有惯例）。
+        buckets: list[list[dict[str, Any]]] = []
         for kw in keywords[:10]:  # 限制关键词数量
+            _bucket: list[dict[str, Any]] = []
             # 按名称查符号
-            symbols = await self._struct.query_symbols_by_name(project_id, kw)
-            results.extend(symbols)
-
+            _bucket.extend(await self._struct.query_symbols_by_name(project_id, kw))
             # 按类名查
-            class_symbols = await self._struct.query_symbols_by_class(project_id, kw)
-            results.extend(class_symbols)
-
+            _bucket.extend(await self._struct.query_symbols_by_class(project_id, kw))
             # 按文件路径模糊查（补盲区：关键词是模块/文件名而非符号名时，
             # 如 'parser'→src/dotenv/parser.py，前两种查法全空但这个能命中）
             if len(kw) >= 3 and not _is_cjk(kw):  # 仅对英文 token 做文件名匹配，避免中文 2-gram 噪声
-                file_symbols = await self._struct.query_symbols_by_file_keyword(
-                    project_id, kw, limit=15
-                )
-                results.extend(file_symbols)
+                _bucket.extend(await self._struct.query_symbols_by_file_keyword(
+                    project_id, kw, limit=15))
+            if _bucket:
+                buckets.append(_bucket)
 
-        # 去重(按 file_path + symbol_name)
+        # 去重(按 file_path + symbol_name) + 跨桶轮转
         seen: set[str] = set()
         deduped: list[dict[str, Any]] = []
-        for r in results:
-            key = f"{r.get('file_path', '')}:{r.get('symbol_name', '')}"
-            if key not in seen:
-                seen.add(key)
-                deduped.append(r)
+        _idx = 0
+        while buckets and len(deduped) < self._LAYER_A_MAX:
+            _progressed = False
+            for _b in buckets:
+                if _idx >= len(_b):
+                    continue
+                _progressed = True
+                r = _b[_idx]
+                key = f"{r.get('file_path', '')}:{r.get('symbol_name', '')}"
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(r)
+                    if len(deduped) >= self._LAYER_A_MAX:
+                        break
+            if not _progressed:
+                break
+            _idx += 1
 
-        return deduped[:25]  # 限制数量（Brain 侧还会再截断）
+        return deduped
 
     async def _expand_dependency_files(
         self,
@@ -411,8 +449,12 @@ class SwarmRetriever:
                 )
                 return bm25_results
             except Exception as exc:  # noqa: BLE001
+                # ★层内自吞异常＝外层 try 永远收不到（26 号文 F-C3）★
+                # Qdrant 全宕时 semantic 返回 []，而 `semantic_error` 不产生、
+                # `retrieval_partial` 不设置 → prompt 与"该项目无相关知识"**逐字不可分**。
+                # 重抛让外层的 `stats["semantic_error"]` 真正落账（外层已 catch，不会炸）。
                 logger.warning("[Layer B] BM25 降级检索失败: %s", exc)
-                return []
+                raise
 
         # 在指定文件中优先检索(若 Layer A 有结果)
         results: list[dict[str, Any]] = []
