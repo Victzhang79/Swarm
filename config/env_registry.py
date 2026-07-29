@@ -53,6 +53,9 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_BREAKER_THRESHOLD": "models/breaker.py:17",
     "SWARM_CASSETTE_RECORD_DIR": "models/cassette_record.py:_ENV_DIR",
     "SWARM_CASSETTE_REPLAY_DIR": "models/cassette_playback.py:_ENV_DIR",   # Task#12 LLM 回放门控
+    # E-M3（26 号文）：默认严格匹配 model，=1 回到旧宽匹配（跨模型也命中）。
+    # 默认宽松正是"验换模型改动时静默返回旧录像"的成因，故逃生门默认关。
+    "SWARM_CASSETTE_LAX_MATCH": "models/cassette_playback.py:_lax_match",
     "SWARM_CASSETTE_REPLAY_MISS": "models/cassette_playback.py:_ENV_MISS",  # 回放 miss 策略(默认 error)
     "SWARM_CHECKPOINT_TTL_DAYS": "infra/checkpoint_gc.py:16",
     "SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY": "models/router.py:392",

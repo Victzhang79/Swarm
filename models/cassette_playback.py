@@ -43,7 +43,11 @@ _lock = threading.Lock()
 _index: dict[str, deque] | None = None   # request_sha -> FIFO deque[record]
 _indexed_dir: str | None = None
 _empty_warned: str | None = None         # 已对该 dir 发过"0 录像"告警（去重）
-_stats = {"hit": 0, "miss_sha": 0, "miss_error_rec": 0, "miss_exc": 0}
+# miss_model（E-M3）：命中了指纹但录像是【别的模型】录的 → 判 miss。
+# 单列而不是并进 miss_sha：两者的运维处置完全不同（前者=该换新录像，
+# 后者=指纹漂移/录像陈旧），混在一起会误诊。
+_stats = {"hit": 0, "miss_sha": 0, "miss_error_rec": 0, "miss_exc": 0,
+          "miss_model": 0}
 
 
 class CassetteReplayMiss(RuntimeError):
@@ -141,6 +145,17 @@ def reset_index() -> None:
             _stats[k] = 0
 
 
+def _lax_match() -> bool:
+    """SWARM_CASSETTE_LAX_MATCH=1 → 回到旧的宽匹配（model 不符仅告警）。
+
+    留逃生门而不是无声收紧：历史录像可能缺 model 字段或跨模型复用是刻意的；
+    但**默认必须严格**——默认宽松正是 E-M3 那条"验了个寂寞"的成因。
+    """
+    import os
+    return os.environ.get("SWARM_CASSETTE_LAX_MATCH", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def lookup(node: str, model: str, args: tuple, kwargs: dict) -> dict | None:
     """按 request_sha 查录像并【消费】（FIFO）。命中返回 clean record，miss 返回 None。
     ★复核整改★：
@@ -179,12 +194,29 @@ def lookup(node: str, model: str, args: tuple, kwargs: dict) -> dict | None:
                 _stats["miss_error_rec"] += 1
                 return None
             _stats["hit"] += 1
-        # node/model 校验（锁外，仅告警不改判）
-        if (rec.get("node") not in (None, "", node)) or (rec.get("model") not in (None, "", model)):
+        # ★model 不符 = miss，不是告警（26 号文 E-M3）★
+        # 命中判据只哈希 messages，于是**跨模型/跨采样参数照样命中**：复核实测不同模型 +
+        # 不同节点 + temperature 1.9 全部命中旧录像。而离线重放是拍板的"验治本主力手段"——
+        # 验"换模型 / 关 thinking"这类改动时静默返回旧结果，等于验了个寂寞，
+        # 且结论方向与真实完全相反。
+        # 只对 **model** 判死（那是被验证的对象本身）；node 名会随重构改动、且不影响模型
+        # 返回什么，保持 WARNING。录像无 model 字段（旧格式）→ 放行，不砸历史录像。
+        _rec_model = rec.get("model")
+        if _rec_model not in (None, "", model) and not _lax_match():
+            with _lock:
+                _stats["hit"] -= 1
+                _stats["miss_model"] = _stats.get("miss_model", 0) + 1
+                dq.appendleft(rec)          # 未消费：还回队列，供真正同模型的调用命中
             logger.warning(
-                "[cassette-playback] 命中 record 的 node/model 与本调用不符（FIFO 错位？）："
-                "调用 node=%s model=%s vs 录像 node=%s model=%s",
-                node, model, rec.get("node"), rec.get("model"))
+                "[cassette-playback] 命中录像的 model 与本调用不符 → 判 miss（绝不用 A 模型的"
+                "录像冒充 B 模型的结果；这正是'验换模型改动'时的静默假绿面）："
+                "调用 model=%s vs 录像 model=%s（SWARM_CASSETTE_LAX_MATCH=1 可放宽）",
+                model, _rec_model)
+            return None
+        if rec.get("node") not in (None, "", node):
+            logger.warning(
+                "[cassette-playback] 命中 record 的 node 与本调用不符（FIFO 错位？）："
+                "调用 node=%s vs 录像 node=%s", node, rec.get("node"))
         return rec
     except Exception as e:  # noqa: BLE001 — playback 绝不拖垮模型层
         with _lock:

@@ -50,10 +50,13 @@ def _cooldown_s() -> float:
 
 
 class _BState:
-    __slots__ = ("consecutive_failures", "opened_at", "probing", "probe_started_at")
+    __slots__ = ("consecutive_failures", "opened_at", "probing", "probe_started_at",
+                 "recent")
 
     def __init__(self) -> None:
         self.consecutive_failures = 0
+        # ★E-H2：滑窗成败序列 [(ts, ok)]——"连续"在并发下不成立★
+        self.recent: list[tuple[float, bool]] = []
         self.opened_at: float | None = None  # None=closed
         self.probing = False  # half-open 探针在飞
         self.probe_started_at = 0.0  # 探针放行时刻（TTL 自愈用）
@@ -61,6 +64,22 @@ class _BState:
 
 _lock = threading.Lock()
 _states: dict[str, _BState] = {}
+
+
+# 滑窗容量上限——防病理高频调用把列表撑爆（窗口按时间裁剪，这里是内存兜底）。
+_WINDOW_MAX = 200
+
+
+def _prune_window(st: "_BState", now: float) -> None:
+    """裁掉窗口外（早于一个冷却期）的成败记录 + 容量兜底。"""
+    _lo = now - _cooldown_s()
+    st.recent = [r for r in st.recent if r[0] >= _lo][-_WINDOW_MAX:]
+
+
+def _window_counts(st: "_BState") -> tuple[int, int]:
+    """窗口内 (失败数, 成功数)。"""
+    _f = sum(1 for _, ok in st.recent if not ok)
+    return _f, len(st.recent) - _f
 
 
 def _reset_for_tests() -> None:
@@ -118,10 +137,29 @@ def record_success(key: str) -> None:
     with _lock:
         st = _states.get(key)
         if st is None:
+            # ★成功也必须建状态（E-H2）★：否则窗口里只记得下失败——首次成功被丢弃会让
+            # 交替成败序列算成"失败多一个"，50/50 的模型被误熔断（实测踩到）。
+            # 状态本身只是几个计数，按模型名有界。
+            st = _BState()
+            _states[key] = st
+        if st.opened_at is not None and not st.probing:
+            # 对称面（E-H1）：熔断前在飞的调用成功返回，不代表模型已恢复——
+            # "一次早发成功即提前复位"会让刚熔断的死模型立刻被重新打满。
+            # 只清失败计数（它确实证明了那一刻还有成功），不动 open 状态。
+            logger.info(
+                "[breaker] 模型 %s 熔断期内收到【熔断前在飞】调用的成功回报"
+                "（非半开探针）→ 不提前复位，冷却照走", key)
+            st.consecutive_failures = 0
+            _sn = time.monotonic()
+            _prune_window(st, _sn)
+            st.recent.append((_sn, True))
             return
         if st.opened_at is not None:
             logger.info("[breaker] 模型 %s 探针成功 → 熔断闭合复位", key)
         st.consecutive_failures = 0
+        _now = time.monotonic()
+        _prune_window(st, _now)
+        st.recent.append((_now, True))     # E-H2：成功也进窗口，否则窗口里只剩失败
         st.opened_at = None
         st.probing = False
 
@@ -151,6 +189,18 @@ def record_failure(key: str) -> None:
             st = _BState()
             _states[key] = st
         if st.opened_at is not None:
+            # ★只有【真拿到探针名额】的调用才算探针结果（26 号文 E-H1）★
+            # 原判据只看 `opened_at is not None`，于是**熔断之前就已在飞**的并发调用
+            # （straggler）失败落到这里，被当成"探针失败"：① 冷却被无限续期
+            # （每个 straggler 都重置 opened_at）；② 日志谎报"探针失败 → 重新熔断"，
+            # 而探针**从未被放行**。生产日志实证：open 那行之后紧跟"探针失败"，中间没有
+            # "冷却期满→放行探针"——round67m 复盘把 k3 事故压缩成"三连超时"很可能就是被
+            # 这条假日志误导的。
+            if not st.probing:
+                logger.info(
+                    "[breaker] 模型 %s 熔断期内收到【熔断前在飞】调用的失败回报"
+                    "（非半开探针，未持探针名额）→ 不重计冷却、不改判（straggler）", key)
+                return
             # half-open 探针失败 → 重新 open 冷却重计
             st.opened_at = time.monotonic()
             st.probing = False
@@ -158,12 +208,32 @@ def record_failure(key: str) -> None:
                            key, _cooldown_s())
             return
         st.consecutive_failures += 1
-        if st.consecutive_failures >= _threshold():
-            st.opened_at = time.monotonic()
+        _now = time.monotonic()
+        _prune_window(st, _now)
+        st.recent.append((_now, False))
+        _fails, _oks = _window_counts(st)
+        # ★判据从"严格连续"改成"滑窗内失败占优"（26 号文 E-H2）★
+        # `consecutive_failures` 是**进程级**计数，而调用是并发交织的：实测 12 次失败 +
+        # 6 次成功交错到达 → 每次成功都把计数清零 → `consecutive_failures=0` **永不熔断**；
+        # 反向地，一次饱和里 3 个并发 stall 连着回来就立刻 open。**既误伤又漏检**，
+        # 且因为状态是进程级的，跨任务还会互相影响。
+        # 新判据：窗口（=一个冷却期）内失败数达阈值 **且** 失败多于成功才熔断——
+        # 交织场景下失败真的占优时才断，偶发并发抖动不误断。
+        # 旧计数保留：它仍是"连着挂"的强信号，任一成立即熔断（不削弱既有防护）。
+        # ★滑窗判据需要【足够样本】才生效（否则把误伤换个方向再犯一遍）★
+        # 3 次失败 + 1 次成功也满足"失败占优"，但那是小样本噪声——既有语义"一次成功
+        # 证明模型还活着"在这个规模上是对的（test_success_resets_breaker_counter 编码的
+        # 正是它）。样本不足时退回严格连续判据（保守），够了才用比例判据抓交织场景。
+        _enough = len(st.recent) >= 2 * _threshold()
+        if st.consecutive_failures >= _threshold() or (
+                _enough and _fails >= _threshold() and _fails > _oks):
+            st.opened_at = _now
             st.probing = False
+            st.recent.clear()
             logger.warning(
-                "[breaker] 模型 %s 连续 %d 次超时/stall → 熔断开启（冷却 %.0fs 内直接走备，"
-                "不再对死模型烧墙钟全款）", key, st.consecutive_failures, _cooldown_s())
+                "[breaker] 模型 %s 超时/stall 熔断开启（连续 %d 次；近 %.0fs 窗口内 "
+                "%d 失败 / %d 成功）→ 冷却 %.0fs 内直接走备，不再对死模型烧墙钟全款",
+                key, st.consecutive_failures, _cooldown_s(), _fails, _oks, _cooldown_s())
 
 
 def snapshot() -> dict:
