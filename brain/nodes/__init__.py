@@ -4971,6 +4971,25 @@ def merge(state: BrainState) -> dict:
         ),
     )
     out: dict = {"merged_diff": result.merged_diff, **merge_touch}
+    # ★C-4（26 号文）：owner 裁决丢件必须留机读账 + 进 degraded_reasons★
+    # owner 通道整份丢弃非 owner 写者的版本且【刻意不进 rebase】——理由正当（它们只是
+    # 确定性修复"碰过"该文件，重做多少次还会被碰到，那正是 rebase 不收敛的根源），
+    # 但丢弃这件事此前全仓只有一行 WARNING、零机读账：复盘要靠 grep 日志，而日志会轮转
+    # （V3 取证污染同一课）。且 owner 的判据来自 **plan 声明的写权**——若 plan 声明错了，
+    # 被丢的可能正是真产出，而交付面对此完全无感。
+    # 无条件写 state（clean 路径写 [] ——ACCOUNTING_KEY_LIFECYCLE：条件 emit 会让上一轮
+    # 的丢件账粘滞到本轮，看起来像"这轮也丢了"）。
+    _owner_drops = list(getattr(result, "owner_drops", None) or [])
+    out["merge_owner_drops"] = _owner_drops
+    if _owner_drops:
+        out["degraded_reasons"] = (
+            list(out.get("degraded_reasons") or [])
+            + [f"merge_owner_drop:{d['file']}<-{d['owner']}(丢弃 {len(d['dropped'])} 版)"
+               for d in _owner_drops[:10]])
+        logger.warning(
+            "[MERGE] C-4 owner 裁决共丢弃 %d 处非 owner 版本（已落机读账 merge_owner_drops，"
+            "并进 degraded_reasons）：%s",
+            len(_owner_drops), [d["file"] for d in _owner_drops[:5]])
     if _orphan_abandoned or _l1_rejected:
         # D7：被剔孤儿 sid 并入 abandoned（终态诚实 PARTIAL）+ pop 完成态（不再算 DONE）。
         # R65D-T3：L1-fail 被剔者同口径入账 + degraded_reasons 机读留痕。
@@ -5720,6 +5739,9 @@ def _deliver_review_payload(state: BrainState) -> dict:
                     "error": str(exc)[:200]}
 
     return {
+        # C-4：owner 裁决丢件——人工闸必须看得到"哪个文件最后用了谁的版本、丢了谁的"。
+        # owner 判据来自 plan 声明的写权；plan 声明错时被丢的可能正是真产出。
+        "merge_owner_drops": list(state.get("merge_owner_drops") or [])[:_DELIVER_ASSERT_ROWS_MAX],
         "runtime_smoke": {
             "passed": state.get("runtime_smoke_passed", None),
             "skipped": state.get("runtime_smoke_skipped", None),

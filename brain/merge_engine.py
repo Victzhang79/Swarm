@@ -40,6 +40,14 @@ class MergeResult:
     # new_file=选中版已在 merged_diff（丢的是落选写者版本）→ D7 口径 abandoned+PARTIAL 继续
     # 交付；three_way=真源码 hunk 被丢 → escalate。缺省视作 three_way（fail-closed）。
     rebase_origin: dict = field(default_factory=dict)
+    # ★owner 裁决丢件账（26 号文 C-4）★
+    # owner 通道把非 owner 写者的版本【整份丢弃】且**刻意不进 rebase**（理由正当：它们
+    # 只是确定性修复"碰过"该文件，重做多少次还会被碰到，那正是 rebase 不收敛的根源）。
+    # 但丢弃这件事此前**全仓只有一行 WARNING、零机读账**——复盘要靠 grep 日志，
+    # 而日志会轮转（V3 取证污染的同一课）。这里落结构化账：
+    #   [{"file": str, "owner": sid, "dropped": [sid,...], "dropped_lines": int}]
+    # 消费面：merge 节点写进 degraded_reasons/state，交付报告可见"哪些产出被判给了谁"。
+    owner_drops: list = field(default_factory=list)
 
 
 @dataclass
@@ -1093,6 +1101,7 @@ def merge_diffs(
     auto_resolved_files: list[str] = []
     rebase_subtask_ids_all: list[str] = []   # 全局累加需要 rebase 重生成的子任务 ID
     rebase_origin_all: dict[str, str] = {}   # 6.9-HF3：sid → "new_file"|"three_way"（终点分流）
+    owner_drops_all: list[dict] = []         # C-4：owner 裁决丢件机读账（见 MergeResult.owner_drops）
     conflict_render_parts: list[str] = []    # D11：硬冲突渲染（诊断专用，绝不进 merged_diff）
     merged_parts: list[str] = []
 
@@ -1212,11 +1221,21 @@ def merge_diffs(
                     if _owner in by_sid_new:
                         chosen_sid = _owner
                         _dropped_new_sids = []      # 非 owner 只是"碰过" → 丢弃其内容即可，不重做
+                        _non_owner = [s for s in by_sid_new if s != _owner]
+                        # C-4：丢件必须留【机读】账——原先只有这行 WARNING，而日志会轮转，
+                        # 复盘时"这个文件当初是谁的版本、丢了谁的"无从查证。
+                        owner_drops_all.append({
+                            "file": file_path,
+                            "owner": _owner,
+                            "dropped": _non_owner,
+                            "dropped_lines": sum(
+                                len(h.lines) for s in _non_owner for h in by_sid_new[s]),
+                        })
                         logger.warning(
                             "[MERGE] R57-6 新文件 %s 多写者：取**声明写权的 owner** %s；"
                             "其余 %s 只是确定性修复碰过（非 owner）→ 丢弃其版本、**不进 rebase**"
                             "（它们重做多少次还会被修复碰到 → 那正是 rebase 不收敛的根源）",
-                            file_path, _owner, [s for s in by_sid_new if s != _owner])
+                            file_path, _owner, _non_owner)
                     else:
                         chosen_sid = min(                          # 无 owner 证据 → 退回拓扑最上游
                             by_sid_new,
@@ -1356,6 +1375,7 @@ def merge_diffs(
         rebase_subtask_ids=list(dict.fromkeys(rebase_subtask_ids_all)),
         conflict_render="\n\n".join(conflict_render_parts),
         rebase_origin=dict(rebase_origin_all),
+        owner_drops=list(owner_drops_all),
     )
 
 
