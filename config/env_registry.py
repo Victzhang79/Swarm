@@ -50,6 +50,9 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_BRAIN_JSON_MODE": "brain/nodes/__init__.py:203",
     "SWARM_BRAIN_OFFLINE": "models/router.py:_raise_if_brain_offline",  # R65D-T5 注入调试轮零云端闸（构造点 fail-closed）
     "SWARM_BREAKER_COOLDOWN_S": "models/breaker.py:18",
+    # provider key 多槽轮换：某槽命中配额形态后的冷却时长（默认 6h）。额度通常按
+    # 小时/天恢复——太短会反复撞墙、太长会白等一把已恢复的 key。
+    "SWARM_KEY_ROTATION_COOLDOWN_S": "models/key_rotation.py:_cooldown_s",
     "SWARM_BREAKER_THRESHOLD": "models/breaker.py:17",
     "SWARM_CASSETTE_RECORD_DIR": "models/cassette_record.py:_ENV_DIR",
     "SWARM_CASSETTE_REPLAY_DIR": "models/cassette_playback.py:_ENV_DIR",   # Task#12 LLM 回放门控

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import PrivateAttr, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _logger = logging.getLogger(__name__)
@@ -333,19 +333,40 @@ class ModelConfig(BaseSettings):
     tier: str = ""
 
     # ── 接入点解析 ────────────────────────────────────────────
-    def _resolve_api_key(self, provider_id: str, env_fallback: str) -> str:
-        """provider 的 api_key：优先从 db secret_store 解密读，回退 .env 明文值。
+    # provider_id → 本次生效的 key 槽号（供错误回调定位"是哪把 key 撞的额度"）。
+    # pydantic BaseSettings 的非字段属性须走 PrivateAttr，否则会被当成配置项。
+    _active_key_slot: dict = PrivateAttr(default_factory=dict)
 
-        敏感信息加密存 db（用户需求）；db 没有该项时无缝回退 .env，保证向后兼容、
-        渐进迁移。延迟 import 避免与 secret_store 循环依赖。
-        secret key 命名约定：provider_api_key:<provider_id>。
+    # 每 provider 最多探测的 key 槽数（槽1=既有命名，#2..#N 为备用）。
+    # 探测是 get_secret 调用，已有 30s 负缓存，故未配备用槽时开销可忽略。
+    _KEY_SLOT_MAX = 4
+
+    def _resolve_api_key(self, provider_id: str, env_fallback: str) -> str:
+        """provider 的 api_key：多槽 + 配额感知轮换，回退 .env 明文值。
+
+        敏感信息加密存 db；db 没有该项时无缝回退 .env，保证向后兼容、渐进迁移。
+        延迟 import 避免与 secret_store 循环依赖。
+
+        ★多槽轮换（用户拍板）★：`provider_api_key:<pid>` 是槽 1（**既有命名不动，
+        零迁移**），`…#2`/`…#3` 是备用槽。某槽命中配额形态（429/配额类 403）后进冷却，
+        本函数自动跳过它选下一把；冷却期满自动回池——**额度恢复无需任何人工动作**。
+        未配备用槽时行为与改动前逐字等价（只有槽 1 可选）。
         """
         try:
             from swarm.config import secret_store
+            from swarm.models import key_rotation as _kr
 
-            val = secret_store.get_secret(f"provider_api_key:{provider_id}")
-            if val:
-                return val
+            slots: dict[int, str] = {}
+            for _slot in range(1, self._KEY_SLOT_MAX + 1):
+                _v = secret_store.get_secret(_kr.secret_name(provider_id, _slot))
+                if _v:
+                    slots[_slot] = _v
+            if slots:
+                _pick = _kr.select_slot(provider_id, list(slots))
+                if _pick is not None:
+                    # 选中槽号随值带出，供错误回调把"是哪把 key 撞的额度"定位回来
+                    self._active_key_slot[provider_id] = _pick
+                    return slots[_pick]
         except Exception:  # noqa: BLE001
             pass
         return env_fallback

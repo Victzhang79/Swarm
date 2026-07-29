@@ -106,7 +106,17 @@ async def _extract(task_id: str, thread_id: str | None) -> dict:
         or plan_dump.get("shared_contract") or {},
         "file_plan": state.get("tech_design_file_plan") or [],
         "module_dirs": state.get("module_dirs") or state.get("module_physical_dirs") or {},
-        "task_description": (state.get("task_description") or state.get("description") or "")[:2000],
+        # ★快照绝不静默截需求原文（2026-07-30 重放实证）★
+        # 原实现 `[:2000]` 让夹具**看起来完整、实则有损**：重放时 `clip_for_prompt(t, 9000)`
+        # 见 len==2000 直接原样返回，C-9（模块级 prompt 截断）这一维根本验不到；
+        # 更巧的是它截出的尾行恰好是 `| 渠道类型 | Slack / 企`——与 26 号文引作"STAGE2
+        # 在 markdown 表格中间腰斩"的证据一模一样，读快照的人无从分辨那是**被测行为**
+        # 还是**取证工具自己**造的。这与本轮治的取证污染（V3 镜像灌串）同族。
+        # 快照是本地 fixture（cassettes/ 全 gitignored），存全文没有体积顾虑。
+        "task_description": state.get("task_description") or state.get("description") or "",
+        # 存长度是给读快照的人的自证：与 task_description 实际长度不符即快照被改过
+        "task_description_len": len(
+            state.get("task_description") or state.get("description") or ""),
     }
     return cassette
 
