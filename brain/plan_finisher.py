@@ -361,10 +361,19 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
         seg = mod.replace("_", "-").split("-")[-1]
         if mod not in _guessed_mods:
             _guessed_mods.add(mod)
+            # 复核 MEDIUM-4（"豁免即失明"补偿观测）：G4 落点本身可能是幽灵布局
+            # （tpl_dir 退化默认 src 时 mod/src/seg 不过可编译布局）——豁免照建
+            # （防死循环）但必须如实标注幽灵面，与证据面闸住的 punt 可区分。
+            _g4_probe = f"{mod}/{mod_dirs[''].most_common(1)[0][0] if ('' in mod_dirs and mod_dirs['']) else tpl_dir}/{seg}/X.{_ext_for(mod)}"
+            _g4_ghost = (_ext_for(mod).lower() in _JVM_CODE_EXTS
+                         and not _jvm_compilable_layout(_g4_probe))
             logger.warning(
                 "[PLAN-FINISH] G4 契约模块 %r 零物理证据（file_plan/scaffold/基线全无）→ "
                 "按新模块名兜底安置到 %s/…（存疑：若非真·新模块，计划欠指定其物理落点）；"
-                "交 G1 coherence 闸/coverage 面暴露，绝不静默丢符号", mod, mod)
+                "交 G1 coherence 闸/coverage 面暴露，绝不静默丢符号%s", mod, mod,
+                "。★落点本身非可编译源码布局（mvn 不编译=幻影文件面，C1 basename owner "
+                "判据对此失明）——布局闸刻意豁免 G4 防死循环，此 WARNING 是唯一观测面★"
+                if _g4_ghost else "")
         if "" in mod_dirs and mod_dirs[""]:
             # 单模块布局：模板已是完整目录（含 src 段），前缀模块 + 尾段包名
             return f"{mod}/{mod_dirs[''].most_common(1)[0][0]}/{seg}"
@@ -384,6 +393,12 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # 语义，缺一即不动★。两案皆不成立 → 原样安置（影子照造、③f fail-closed 硬打回兜底）。
     # 下游安全：C1 R39-2 存量豁免（baseline_symbol_files 同 stem 命中即豁免）保证转换后
     # 不再判无主；defined_in=base 真身是 round67g 治法A 已接线的合法下游形态。
+    # R67M2-T2 C1（24号文）：Case C/布局闸的 JVM 判定面（B5 块与下方安置布局闸共用
+    # 单一事实源）——栈中立走 classpath_fqn_key；扩展名判据保证只触 JVM 代码文件，
+    # 异栈（_ext_for 不产这些扩展名）零行为变化。
+    from swarm.brain.contract_utils import classpath_fqn_key as _classpath_fqn_key
+    from swarm.brain.contract_utils import jvm_compilable_layout as _jvm_compilable_layout
+    _JVM_CODE_EXTS = {"java", "kt", "scala", "groovy"}
     _base_refs: list[str] = []
     if todo and project_path and Path(project_path).is_dir():
         import os as _os
@@ -459,13 +474,43 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             _hit = hits[0]
             _cand_roots = (
                 {p.split("/", 1)[0] for p in _fp_paths.get(e["module"], []) if "/" in p}
-                | ({phys[e["module"]].split("/", 1)[0]} if phys.get(e["module"]) else set()))
+                | ({phys[e["module"]].split("/", 1)[0]} if phys.get(e["module"]) else set())
+                # R67M2-T2 C1：模块名本身=base 树【盘上实存】顶层目录时即候选根（磁盘实证
+                # 非名字臆造——round67m2 SysJob：模块 ruoyi-quartz 在 file_plan 零条目、
+                # phys 未映射，但 base 树确有 ruoyi-quartz/ 目录=该模块物理根最强证据）。
+                # 复核 LOW-3：段净化——模块名含 / 或 . 段时 is_dir 可逃逸项目根，与
+                # _is_code_evidence 同卫生（判据同质，绝不拿脏名做磁盘判定）。
+                | ({e["module"]} if ("/" not in e["module"]
+                                     and e["module"] not in ("", ".", "..")
+                                     and (Path(project_path) / e["module"]).is_dir())
+                   else set()))
             if (not _cand_roots) or _hit.split("/", 1)[0] not in _cand_roots:
                 _todo_keep.append(e)   # 命中不在该模块候选物理根=跨模块同名，不算归属证据
                 _punts.setdefault("命中不在模块候选根", []).append(e["symbol"])
                 continue
             _prose = " ".join(str(item.get(k) or "")
                               for k in ("purpose", "description"))
+            # R67M2-T2 C1/C3（24号文）Case C：幽灵布局 defined_in 对账——契约 defined_in
+            # 是 JVM 代码扩展名却不在可编译源码布局内（jvm_compilable_layout=False=自证
+            # 幻觉，如 round67m2 SysJob 的 ruoyi-quartz/SysJob.java 无 src 布局段），且
+            # base 唯一 stem 命中落本模块候选根 → 不需要复用散文（幻觉声明自损信用），
+            # 直接归位 base 真身（IGenTableColumnService controller/→service/ 错包族同治）。
+            # round67c 护栏保持：唯一命中+候选根内，跨模块命中绝不凭名对账（上面 punt）。
+            # 复核 HIGH-1：判据从 classpath_fqn_key=None 收紧为 jvm_compilable_layout——
+            # 根级 src 单模块工程（模块根为空串）FQN key 恒 None 但完全可编译，绝不当幽灵。
+            # 复核 LOW-1：显式否定复用语境（"不复用既有 X"）→ 尊重 LLM 声明不越权归位，
+            # punt 留安置/布局闸/③f 权威链（fail-closed）。
+            _di_ext = _di.rsplit(".", 1)[-1].lower() if "." in _di.rsplit("/", 1)[-1] else ""
+            if (_di and _di_ext in _JVM_CODE_EXTS
+                    and not _jvm_compilable_layout(_di)
+                    and not (Path(project_path) / _di).is_file()):
+                if _REUSE_NEGATE_RE.search(_prose):
+                    _todo_keep.append(e)
+                    _punts.setdefault("显式否定复用语义", []).append(e["symbol"])
+                    continue
+                item["defined_in"] = _hit
+                _base_refs.append(f"{e['symbol']}→{_hit}(幽灵布局 defined_in 对账归位)")
+                continue
             if not _REUSE_INTENT_RE.search(_prose) or _REUSE_NEGATE_RE.search(_prose):
                 _todo_keep.append(e)   # 无显式复用语义（或否定语境）→ 不动（fail-closed 留 ③f）
                 _punts.setdefault("无显式复用语义", []).append(e["symbol"])
@@ -489,6 +534,45 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     groups: dict[str, list[str]] = {}
     for e in todo:
         groups.setdefault(e["module"], []).append(e["symbol"])
+    # R67M2-T2 C1（24号文，round67m2 SysJob 幽灵治本）安置落点布局闸：JVM 代码扩展名
+    # 的安置落点必须在可编译源码布局内（jvm_compilable_layout）。round67m2 实证幽灵面：
+    # 落点 ruoyi-quartz/SysJob.java 无 src 布局段 → mvn 不编译=验收假过，且
+    # classpath_fqn_key=None 使 ③b/③f/samename 结构性失明、安置出 owner 使 C1 也盲。
+    # 闸住=不建安置（符号留契约无主 + punt 账带出交 C1 owner 闸【硬打回】——复核
+    # HIGH-2：punt 符号不占 0.4 无主宽容，防胖契约下静默蒸发），聚合 WARNING 可观测。
+    # 栈中立：仅 JVM 代码扩展名参与（异栈零行为变化）。
+    # ★复核 HIGH-1★：判据是 jvm_compilable_layout（布局段判定）而非 classpath_fqn_key
+    # ——根级 src 单模块工程（src/main/java/... 直接在仓库根，模块根为空串）FQN key 恒
+    # None 但完全可编译，拿 FQN key 当判据会整类误杀=新确定性死循环。
+    # ★边界（r48b 既有行为保持）★：只闸【证据解析】落点（_resolved_dir/mod_dirs 命
+    # 中——证据本身是幽灵布局，SysJob 族）；G4 零证据名兜底（mod/src/seg 最后手段，
+    # 自有 G4 WARNING+G1 coherence 面、无更优确定性落点）不接——闸它=owner 闸确定
+    # 性死循环（重试永远同样零证据），比半幽灵更糟。
+    _evidence_dirs = set(_resolved_dir) | set(mod_dirs)
+    _layout_punted: list[str] = []
+    for mod in list(groups):
+        if mod not in _evidence_dirs:
+            continue
+        _d0, _e0 = _dir_for(mod), _ext_for(mod)
+        if _e0.lower() not in _JVM_CODE_EXTS:
+            continue
+        _kept0: list[str] = []
+        for s in groups[mod]:
+            if not _jvm_compilable_layout(f"{_d0}/{s}.{_e0}"):
+                _layout_punted.append(f"{s}→{_d0}/{s}.{_e0}")
+            else:
+                _kept0.append(s)
+        if _kept0:
+            groups[mod] = _kept0
+        else:
+            del groups[mod]
+    if _layout_punted:
+        logger.warning(
+            "[PLAN-FINISH] R67M2-T2-C1 安置落点布局闸：%d 个契约符号的安置落点不在可编译"
+            "源码布局内（幽灵路径=mvn 不编译验收假过+③b/③f 结构性失明）→ 不建安置，"
+            "符号留契约无主+punt 账交 C1 owner 闸硬打回（不占 0.4 宽容，A1 全量可见反馈"
+            "驱动重规划给真落点）: %s",
+            len(_layout_punted), _layout_punted[:8])
     by_id = {st.id: st for st in plan.subtasks}
     created: dict[str, list[str]] = {}
     _MAX = 6
@@ -586,14 +670,24 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
                 plan.parallel_groups.append([sid])
             created[sid] = chunk
     if created:
+        # 复核 LOW-8：分子分母都只算实际安置（len(todo) 含布局闸 punt 的、created 含
+        # "_" 元键，都会虚报）。
+        _placed_n = sum(len(v) for k, v in created.items() if not k.startswith("_"))
+        _n_hosts = sum(1 for k in created if not k.startswith("_"))
         logger.info(
-            "[PLAN-FINISH] R48b-1 契约符号安置：无主硬符号 %d 个 → 新建/收养 %d 个"
-            "承接子任务: %s", len(todo), len(created),
-            {k: v[:4] for k, v in created.items()})
+            "[PLAN-FINISH] R48b-1 契约符号安置：无主硬符号 %d 个（安置 %d/布局闸 punt %d）"
+            " → 新建/收养 %d 个承接子任务: %s", len(todo), _placed_n,
+            len(_layout_punted), _n_hosts,
+            {k: v[:4] for k, v in created.items() if not k.startswith("_")})
     if _base_refs:
         # R67M-T2 B5：base 引用转换账以 "_" 前缀元键带出（调用方弹出独立入账；
         # 键空间与 sid 不相交，harness bootstrap 按 st.id 遍历不受影响）。
         created["_base_referenced"] = _base_refs
+    if _layout_punted:
+        # R67M2-T2 C1（复核 HIGH-2/MEDIUM-3）：布局闸 punt 账以 "_" 前缀元键带出——
+        # punt 符号是确定性知道"按现有证据永不可安置"的，必须进 state 账交 C1 owner
+        # 闸硬打回（不占 0.4 无主宽容），绝不只活在日志里（日志级别调高即蒸发）。
+        created["_layout_punted"] = _layout_punted
     return created
 
 
@@ -1534,6 +1628,11 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
             if _bref:
                 # R67M-T2 B5：安置前 base 查表转换账（影子安置被拦下的存量引用符号）
                 out["contract_symbols_base_referenced"] = _bref
+            _punted = dom.pop("_layout_punted", None)
+            if _punted:
+                # R67M2-T2 C1（复核 HIGH-2）：布局闸 punt 账——确定性永不可安置的符号，
+                # 进 state 交 C1 owner 闸硬打回（不占 0.4 无主宽容，防胖契约静默蒸发）
+                out["contract_symbols_layout_punted"] = _punted
             if dom:
                 out["symbols_domiciled"] = dom
                 from swarm.brain.nodes.shared import bootstrap_subtask_harness

@@ -895,19 +895,14 @@ _CLASSPATH_NS_LAYOUT_DIRS = frozenset({"java", "kotlin", "scala", "groovy"})
 _PER_MODULE_JVM_DESCRIPTORS = frozenset({"module-info.java", "package-info.java"})
 
 
-def classpath_fqn_key(path: str) -> tuple[str, str] | None:
-    """create_file 路径 → (物理模块根, 包限定 FQN 相对路径)，**仅**对 JVM 类路径共享命名空间源码。
-    非 JVM 布局 / 无法定模块根 / 无包路径（默认包·根级描述符）/ per-module 描述符 → None（不判）。
-    #110（validate REJECT 闸）与 #101（确定性去冲突归一）共用此单一口径，栈中立。"""
-    mod = _code_module_root(path)
-    if not mod:
-        return None                        # 无物理模块根（根级/无布局段）→ 无跨模块可言
-    parts = _norm_scope_path(path).split("/")
+def _jvm_ns_tail(parts: list[str]) -> list[str] | None:
+    """路径段序列 → JVM 类路径命名空间尾段（包路径+文件名）；不在 JVM 源码布局内 → None。
+    classpath_fqn_key 与 jvm_compilable_layout 共用的段判定单一事实源（防两处分叉）。"""
     try:
         i = next(idx for idx, seg in enumerate(parts) if seg in _SRC_LAYOUT_SEGMENTS)
     except StopIteration:
         return None
-    j, saw_ns_lang = i, False              # 跳过 module_root 之后的布局段游程，要求含 JVM 语言目录
+    j, saw_ns_lang = i, False              # 跳过布局段游程，要求含 JVM 语言目录
     while j < len(parts) and parts[j] in _SRC_LAYOUT_SEGMENTS:
         if parts[j] in _CLASSPATH_NS_LAYOUT_DIRS:
             saw_ns_lang = True
@@ -916,8 +911,44 @@ def classpath_fqn_key(path: str) -> tuple[str, str] | None:
         return None                        # 非 JVM 类路径命名空间（Go/Rust/Py flat 或资源）→ 不判
     fqn_parts = parts[j:]                   # 包路径 + 文件名
     if len(fqn_parts) < 2 or fqn_parts[-1] in _PER_MODULE_JVM_DESCRIPTORS:
-        return None                        # 无包（默认包）或 per-module 描述符 → 不判（避免误伤）
+        # 无包（默认包，如 src/main/java/S.java）或 per-module 描述符 → 不判（避免误伤）。
+        # 复核 R2 LOW-R2-2 如实声明边界：默认包 root-src 布局 javac 可编但 Spring 无法
+        # 组件扫描=病态形态，jvm_compilable_layout=False → 布局闸 punt → C1 硬打回，
+        # 打回方向正确（逼规划给真包路径），非误杀。
+        return None
+    return fqn_parts
+
+
+def classpath_fqn_key(path: str) -> tuple[str, str] | None:
+    """create_file 路径 → (物理模块根, 包限定 FQN 相对路径)，**仅**对 JVM 类路径共享命名空间源码。
+    非 JVM 布局 / 无法定模块根 / 无包路径（默认包·根级描述符）/ per-module 描述符 → None（不判）。
+    #110（validate REJECT 闸）与 #101（确定性去冲突归一）共用此单一口径，栈中立。"""
+    mod = _code_module_root(path)
+    if not mod:
+        return None                        # 无物理模块根（根级/无布局段）→ 无跨模块可言
+    fqn_parts = _jvm_ns_tail(_norm_scope_path(path).split("/"))
+    if fqn_parts is None:
+        return None
     return mod, "/".join(fqn_parts)
+
+
+def jvm_compilable_layout(path: str) -> bool:
+    """路径是否落在 JVM 可编译源码布局内（…/src/<布局段游程含 java|kotlin|scala|groovy>/<包路径>/
+    <文件>）——与 classpath_fqn_key 同段口径但【不要求物理模块根】。
+
+    R67M2-T2 复核 HIGH-1：classpath_fqn_key 对根级 src（模块根为空串，_code_module_root→
+    None=根模块不算聚合子模块）恒返 None；若拿"FQN key is None"当"幽灵布局"判据，会把系统
+    显式支持的单模块 Maven/Gradle 工程（src/main/java/... 直接在仓库根）整类误判成幽灵→
+    布局闸全 punt=确定性死循环。真幽灵（round67m2 SysJob 族 ruoyi-quartz/SysJob.java）=
+    【有模块根前缀却无任何 src 布局段】。可编译性判据只看布局段，不看模块根。
+    ★诚实边界（复核 R2 LOW-R2-2）★：默认包形态（…/src/main/java/Foo.java 无包目录）判
+    False——javac/mvn 实会编译它，但默认包类无法被带包消费者 import（Spring 无法组件
+    扫描）=病态形态；对契约符号按"不可编译"punt 交 C1 硬打回（逼规划给真包路径），
+    fail-closed 方向正确。"""
+    p = _norm_scope_path(path)
+    if not p or "/" not in p:
+        return False
+    return _jvm_ns_tail(p.split("/")) is not None
 
 
 def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:

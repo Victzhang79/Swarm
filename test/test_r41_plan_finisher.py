@@ -452,7 +452,7 @@ def test_r48b_adopt_into_existing_contract_subtask():
     plan = TaskPlan(
         task_id="t-48e", subtasks=[
             _st("st-contract-alarm-robot",
-                create=["alarm-robot/src/x/RobotQueryService.java"]),
+                create=["alarm-robot/src/main/java/x/RobotQueryService.java"]),
             _st("st-1", create=["m/a.java"]), _st("st-2", create=["m/b.java"])],
         parallel_groups=[["st-contract-alarm-robot", "st-1", "st-2"]])
     sc = {"interfaces": [
@@ -512,7 +512,7 @@ def test_r48b_f4_adopt_overflow_shards():
     plan = TaskPlan(
         task_id="t-48i", subtasks=[
             _st("st-contract-alarm-robot",
-                create=[f"alarm-robot/src/S{i}.java" for i in range(6)]),
+                create=[f"alarm-robot/src/main/java/s/S{i}.java" for i in range(6)]),
             _st("st-1", create=["m/src/a.java"]), _st("st-2", create=["m/src/b.java"])],
         parallel_groups=[["st-contract-alarm-robot", "st-1", "st-2"]])
     sc = {"interfaces": [

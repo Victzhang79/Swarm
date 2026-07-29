@@ -120,6 +120,32 @@ def _is_transient_instance(exc: BaseException) -> bool:
     )
 
 
+# R67M2-T2 A3（24号文，round67m2 模型面治本）：凭据类错误字符串特征（单一事实源）。
+# round67m2 实证：k3 每调用 403 PermissionDenied 持续 2h20m 至任务终结，swarm.log 零
+# WARNING——403/401 非瞬时故障（fallback 会一直兜底、主模型不会自愈），必须与瞬时
+# 超时分级可观测（凭据事故=人工可修事件）。brain/nodes 的 P1 外科判形同源委托本函数。
+# 复核 MEDIUM-2/MEDIUM-5（reviewer+hunter 双逮）：数字码绝不裸子串——供应商业务
+# 错误码（errcode=40302/40125）、端口/trace id（2401s、4030）会误判凭据类，且本函数
+# 接 router 全流量回调，误伤半径大（升 ERROR 还把 ops 指向"查凭据"的错误方向）。
+# 纪律同 router._breaker_error_transient：只取【首行】+ 数字码词边界正则。
+import re as _re
+
+_AUTH_CODE_RE = _re.compile(r"(?<![0-9])40[13](?![0-9])")
+_AUTH_MARKERS = (
+    "unauthorized", "forbidden", "invalid api key",
+    "invalid_api_key", "api key", "authentication", "permission denied",
+)
+
+
+def is_auth_shaped_error(exc: BaseException | str) -> bool:
+    """凭据/权限类错误判形（401/403/无效 key/PermissionDenied）——配置错需 ops 介入，
+    与瞬时基建错分级（round65d：规划期 401×5 淹没在 WARNING 噪声；round67m2：k3 403
+    静默 2h20m）。刻意【不】入 classify_failure 的 transient 类：凭据错重试无意义，
+    fallback 链兜底即可，但每一次都必须高级别可观测。"""
+    first = (str(exc).splitlines() or [""])[0].lower()
+    return bool(_AUTH_CODE_RE.search(first)) or any(k in first for k in _AUTH_MARKERS)
+
+
 def classify_failure(err: BaseException | str | None) -> str | None:
     """把失败归类为 transient / capability / None（无法判定）。
 

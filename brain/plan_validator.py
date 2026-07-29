@@ -598,6 +598,7 @@ def unowned_contract_symbols(plan, symbols: list[str]) -> list[str]:
 
 def validate_contract_ownership(
     plan, shared_contract, project_path: str | None = None,
+    layout_punted: list[str] | None = None,
 ) -> PlanValidationResult:
     """C1（round38c 主题C）：契约符号→owner 确定性对账——D5 从 VERIFY_L2 前移到 PLAN 期。
 
@@ -606,6 +607,8 @@ def validate_contract_ownership(
     规则（零 LLM）：owner 判据见 unowned_contract_symbols（单一口径）。
     无主符号占比 > SWARM_CONTRACT_UNOWNED_RATIO（默认 0.4，与 L2 缺失阈值同源）→
     invalid 走 D09 回灌打回（feedback 教 PLAN 怎么修）；否则逐条 warn（可观测不烧重试）。
+    layout_punted（R67M2-T2 C1）：finish 布局闸确定性判死（落点非可编译布局）的符号
+    账——仍无主时不占 0.4 宽容直接硬打回（复核 HIGH-2：宽容=胖契约下静默蒸发假过）。
     规则5 落空依赖（unclaimed_contract_deps）并入 warnings（旧纯 log 无人消费）。
     R39-2 存量豁免：project_path 非空时，基线树已有 `<Symbol>.<ext>` 同名文件的
     符号视为存量承接不算 unowned（round39：棕地存量符号被判无主是误伤面）。"""
@@ -659,6 +662,24 @@ def validate_contract_ownership(
             hard_unowned = [s for s in unowned if not _is_soft(s)]
             soft_unowned = [s for s in unowned if _is_soft(s)]
             hard_total = sum(1 for s in symbols if not _is_soft(s))
+            # R67M2-T2 C1（复核 HIGH-2，reviewer+hunter 双逮）：布局闸 punt 的符号
+            # （finish 确定性判死"落点不在可编译布局内=建安置即 mvn 不编译假过"）
+            # 【不占 0.4 无主宽容】——宽容它们=胖契约下符号静默蒸发（不建安置、无
+            # owner、占比内仅 warn 放行，爆点后移到 L2/交付=本批要防的假过）。
+            # 复核 R2 MEDIUM-R2-1：匹配从 unowned（不分软硬）——domicile 把【被接口
+            # 签名/apis 引用的 dto】当硬符号安置（T6② 幻影 DTO 族，round63 cannot-
+            # find-symbol×8），C1 若按 kind=dtos 降软仅 warn=打回链留缝；安置侧视其
+            # 为必安置，打回侧必须对称。
+            _punted_set = {p.split("→", 1)[0] for p in (layout_punted or [])}
+            _punted_hit = [s for s in unowned if s in _punted_set]
+            if _punted_hit:
+                result.add(
+                    f"契约符号安置落点非可编译源码布局（finish 布局闸 punt，"
+                    f"建安置=mvn 不编译验收假过，不占无主宽容直接打回）: "
+                    f"{', '.join(_punted_hit[:12])}——请在 file_plan 给这些模块"
+                    f"真实 src 布局落点（…/src/main/<lang>/…），或修正契约 defined_in")
+            hard_unowned = [s for s in hard_unowned if s not in _punted_set]
+            soft_unowned = [s for s in soft_unowned if s not in _punted_set]
             try:
                 ratio_cap = float(_os.environ.get("SWARM_CONTRACT_UNOWNED_RATIO", "0.4"))
             except (TypeError, ValueError):

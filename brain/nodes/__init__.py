@@ -470,11 +470,11 @@ def _format_tech_design_for_plan(state: BrainState, file_plan_override=None) -> 
 
 def _is_auth_shaped_error(exc: BaseException) -> bool:
     """R65D-W3⑤：auth 类错误判形（401/403/无效 key）——配置错需 ops 立即介入，
-    与瞬时基建错分级（round65d 复盘：规划期 401×5 淹没在 WARNING 噪声里）。"""
-    t = str(exc).lower()
-    return any(k in t for k in (
-        "401", "403", "unauthorized", "forbidden", "invalid api key",
-        "invalid_api_key", "api key", "authentication", "permission denied"))
+    与瞬时基建错分级（round65d 复盘：规划期 401×5 淹没在 WARNING 噪声里）。
+    R67M2-T2 A3：判据单一事实源上提 models.errors.is_auth_shaped_error（router
+    回调同源），此处薄委托保既有调用点。"""
+    from swarm.models.errors import is_auth_shaped_error as _auth
+    return _auth(exc)
 
 
 async def _invoke_llm_abortable(llm, messages, total_timeout: float, fallback_llm=None,
@@ -883,13 +883,37 @@ def _merge_designed_file_plan(file_plan, new_entries, allowed_modules=None):
     """确定性 merge：把补排设计的新条目并进 file_plan。返回 (merged, added_count, dropped_count)。
     剔除越权/臆造：path 或 module 为空、path 与既有重复、module 不在 allowed_modules（若给）→ 忽略。
     绝不改既有条目。allowed_modules（复核 MED）：棕地新功能须落既有模块——LLM 臆造的新模块名会绕过
-    脚手架注入(finish 未见它)→模块 coherence 违例(round46/64/65e G1 前科)，故限定既有模块，臆造即弃。"""
+    脚手架注入(finish 未见它)→模块 coherence 违例(round46/64/65e G1 前科)，故限定既有模块，臆造即弃。
+
+    R67M2-T2 B1（24号文，round67m2 证据层治本）合流闸：后补 create 条目与既有 create
+    【同 simple-name 异 FQN】即拒收（首写者=tech_design 原始权威优先）。round67m2 实证：
+    原始组+后补组双落点 create 合流 414 条 → _tech_design_authority 自判 ambiguous →
+    td 后备权威全灭、两个 deconflict pass 双失据 fail-closed（只能靠 ③b 打回烧轮）。
+    栈中立：仅新旧路径均可解析 classpath FQN（JVM 类路径）才判撞（非 JVM 不参与）；
+    被拒条目进 dropped 计数 + 聚合 WARNING（需求落点缺口由 R65E7-L2 残余 WARNING
+    可观测——复核 R2 LOW-R2-3 如实声明：需求级覆盖闸看 subtask covers 对文件级缺口
+    结构性失明，驱动重设计的是 WARNING 面+执行期 L1 兜底，非覆盖闸），
+    fail-closed 绝不静默合流）。"""
+    from swarm.brain.contract_utils import classpath_fqn_key as _fq
     _existing = {str(e.get("path") or "").strip()
                  for e in file_plan if isinstance(e, dict) and e.get("path")}
+    _create_fqns: dict[str, set] = {}
+    for e in file_plan:
+        # 复核 HIGH-1/MEDIUM-1（reviewer+hunter 双逮）：判据必须与 _tech_design_authority
+        # 逐字同源——action 缺省即 create（全仓 5+ 处既定约定 str(e.get("action") or
+        # "create")，LLM JSON 常漏字段=生产真实形态），stem 键 lower 归一（AlarmService
+        # /alarmservice 变体对逃逸判撞=闸要防的 ambiguous 崩塌原样复发）。
+        if isinstance(e, dict) and str(e.get("action") or "create") == "create":
+            _p0 = str(e.get("path") or "")
+            _k0 = _fq(_p0)
+            if _k0:
+                _create_fqns.setdefault(
+                    _p0.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower(), set()).add(_k0[1])
     _allowed = {str(m) for m in allowed_modules} if allowed_modules else None
     merged = list(file_plan)
     added = 0
     dropped = 0
+    _collided: list[str] = []
     for e in (new_entries or []):
         if not isinstance(e, dict):
             dropped += 1
@@ -899,10 +923,24 @@ def _merge_designed_file_plan(file_plan, new_entries, allowed_modules=None):
         if not p or not m or p in _existing or (_allowed is not None and m not in _allowed):
             dropped += 1
             continue
+        # B1 合流闸：同 simple-name 异 FQN 的第二个 create 落点拒收（首写者权威优先）
+        _k = _fq(p)
+        _stem = p.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        if _k and _create_fqns.get(_stem) and _k[1] not in _create_fqns[_stem]:
+            dropped += 1
+            _collided.append(f"{_stem}: {p}（撞既有 {sorted(_create_fqns[_stem])[:2]}）")
+            continue
         merged.append({"path": p, "module": m, "action": "create",
                        "responsibility": str(e.get("responsibility") or "")[:300]})
         _existing.add(p)
+        if _k:
+            _create_fqns.setdefault(_stem, set()).add(_k[1])
         added += 1
+    if _collided:
+        logger.warning(
+            "[PLAN] R67M2-T2-B1 file_plan 合流闸：拒收 %d 条同 simple-name 异 FQN 的后补 "
+            "create（保 tech_design 原始权威，防 _tech_design_authority 自判歧义全灭）: %s",
+            len(_collided), _collided[:6])
     return merged, added, dropped
 
 
@@ -964,7 +1002,9 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
     merged, added, dropped = _merge_designed_file_plan(file_plan, _new, allowed_modules=_mods)
     if dropped:                             # 越权/臆造条目被剔（含臆造模块）——可观测不静默
         record_degrade("brain.plan.coverage_design_entries_dropped")
-        logger.warning("[PLAN] R65E7-L2 补排设计 %d 个条目越权被剔（空 path/module、重复、或臆造模块）", dropped)
+        logger.warning(
+            "[PLAN] R65E7-L2 补排设计 %d 个条目被剔（空 path/module、重复、臆造模块、"
+            "或 R67M2-T2-B1 合流闸同名撞车拒收）", dropped)
     if not added:
         record_degrade("brain.plan.coverage_design_no_files")
         logger.warning(
@@ -975,6 +1015,13 @@ async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallba
         req_items, build_planned_vocab(merged), _baseline_vocab)
     if _resid:                              # 部分补齐——残余进 metrics（可观测不静默）
         record_degrade("brain.plan.coverage_design_partial")
+        # 复核 MEDIUM-6（hunter）：B1 合流闸拒收/越权剔除可致需求落点缺口，而
+        # validate_requirement_coverage 看 subtask covers 不看 file_plan=结构性
+        # 看不见文件级缺口——残余必须 WARNING（原仅 INFO+metrics，复盘按文案归因会漏）。
+        logger.warning(
+            "[PLAN] R65E7-L2 补排后 %d 个需求仍无 file_plan 落点（含合流闸拒收/剔除所致"
+            "缺口；需求级覆盖闸看 subtask covers 对此结构性失明，此 WARNING 是规划期唯一"
+            "观测面，执行期 L1/覆盖闸兜底）: %s", len(_resid), _resid[:8])
     logger.info(
         "[PLAN] R65E7-L2 file_plan 覆盖补排：为 %d 个漏排需求补 %d 文件（残余未覆盖 %d）；unplanned=%s",
         len(unplanned_ids), added, len(_resid), unplanned_ids[:8])
@@ -2338,6 +2385,8 @@ async def plan(state: BrainState) -> dict:
             "contract_symbol_paths_unhealed": [],
             # R67M-T2 B5 always-emit：SIMPLE 不走 finish，无 base 查表面，恒 []（防跨轮粘滞）
             "contract_symbols_base_referenced": [],
+            # R67M2-T2 C1 always-emit：SIMPLE 不走 finish，无布局闸 punt 面，恒 []（防跨轮粘滞）
+            "contract_symbols_layout_punted": [],
             # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
             "baseline_covered": [],
             # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
@@ -2916,6 +2965,10 @@ async def plan(state: BrainState) -> dict:
         # 成功账零消费=新账无人收盲区；last-write-wins 无转换=[] 不粘滞）。
         "contract_symbols_base_referenced":
             _finish_out.get("contract_symbols_base_referenced") or [],
+        # R67M2-T2 C1（复核 HIGH-2）：布局闸 punt 账 always-emit（同口径：last-write-wins
+        # 无 punt=[] 不粘滞）——validate_plan C1 owner 闸消费=硬打回面。
+        "contract_symbols_layout_punted":
+            _finish_out.get("contract_symbols_layout_punted") or [],
         # R31-1 T1 always-emit：本轮申报（LLM 未申报/降级兜底=[]），validate_plan 覆盖校验消费
         "baseline_covered": _baseline_covered,
         # R32-1 U2 + R35-C always-emit：本轮成功批缓存（非分批/降级路径恒 {}）。
@@ -3377,7 +3430,9 @@ async def validate_plan(state: BrainState) -> dict:
     import asyncio as _vco_aio
     _co_result = await _vco_aio.to_thread(
         _vco, plan_obj, _sc_own,
-        project_path=_get_project_path(state.get("project_id") or ""))
+        project_path=_get_project_path(state.get("project_id") or ""),
+        # R67M2-T2 C1（复核 HIGH-2）：布局闸 punt 账——仍无主即硬打回不占 0.4 宽容
+        layout_punted=state.get("contract_symbols_layout_punted") or [])
     for w in _co_result.warnings:
         _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] C1 契约对账: %s", w)

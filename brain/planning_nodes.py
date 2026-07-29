@@ -2049,10 +2049,16 @@ CONTRACT_MODULE_SYSTEM = """你是系统架构师，正在为【一个模块】�
      定时/调度→quartz、JSON 序列化→fastjson2 或 jackson、工具类→hutool-all、参数校验→
      spring-boot-starter-validation、日志/样板→lombok、HTTP 客户端→okhttp/httpclient。
      按职责把【所有】会用到的第三方库一次列全，宁多勿漏（漏一个整模块编译失败）。
+5. defined_in 落点策展（R67M2-T2 B2，治法A 范式）：interfaces/dtos 每条【必须】带
+   defined_in=该类的【唯一落点文件路径】（与下方文件清单逐字一致）。实现细节类
+   （*Impl 实现类/entity/mapper/controller/SPI 等）只要会被【多个子任务/多个批】引用，
+   也必须进 interfaces 或 dtos 声明并带 defined_in——不声明=同名类被多个子任务各自
+   create 到不同包（Spring bean/MyBatis typeAlias 启动冲突），确定性闸会打回重拆。
+   复用 base 既有类时 defined_in 填【base 真身路径】（见下方既有实体提示）。
 
 所有条目的 module 字段都填【当前模块名】。严格输出 JSON：
-{"interfaces":[{"name","module","signature":"完整方法签名","purpose"}],
- "dtos":[{"name","module","fields":["类型 字段名"]}],
+{"interfaces":[{"name","module","signature":"完整方法签名","purpose","defined_in":"唯一落点路径"}],
+ "dtos":[{"name","module","fields":["类型 字段名"],"defined_in":"唯一落点路径"}],
  "apis":[{"path","method","request","response"}],
  "dependencies":[{"module":"当前模块名","artifacts":["artifactId 或 groupId:artifactId 并集"]}]}"""
 
@@ -2076,6 +2082,8 @@ CONTRACT_MODULE_USER = """总需求（背景）：{task_description}
 清单里已有承载该概念的文件时【绝不】另起新名字（那会造出同一概念的重复文件）；只有清单里
 确实没有对应文件的全新概念才允许新名字。I 前缀与去前缀视为同一概念（IAlarmService 与
 AlarmService 是一个东西）：接口条目优先用接口形态的文件名，绝不把 *Impl 实现类名当接口名。
+★落点铁律（R67M2-T2 B2）★：每条 interfaces/dtos 必须带 defined_in，逐字取自上述文件清单的
+路径（接口=接口文件、实现细节类=其实现文件）；复用 base 既有类时填其 base 真身路径。
 
 只产出【这个模块 owns 的契约片】JSON，module 字段统一填 "{mod_name}"。
 务必填全 dependencies：列出本模块编译期需声明的全部第三方依赖并集（漏一个即整模块编译失败）。{base_entity_hints}"""

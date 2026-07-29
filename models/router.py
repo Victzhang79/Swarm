@@ -100,6 +100,16 @@ class ModelInvocationLogger(BaseCallbackHandler):
         )
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        # R67M2-T2 A3（24号文）：凭据类错误（401/403/PermissionDenied）升 ERROR——
+        # 非瞬时故障（fallback 持续兜底但主模型不会自愈，round67m2 k3 403 静默 2h20m
+        # 至任务终结零高级别日志），每失败一次报一次=持续面可观测，人工凭据事故可修。
+        from swarm.models.errors import is_auth_shaped_error as _auth
+        if _auth(error):
+            logger.error(
+                "[模型调用] role=%s 模型=%s 凭据/权限类错误（非瞬时，fallback 兜底中，"
+                "主模型不会自愈——请人工核查凭据/订阅/端点权限）: %s",
+                self.role, self.model_name, str(error)[:200])
+            return
         logger.warning(
             "[模型调用] role=%s 模型=%s 调用失败(可能触发 fallback): %s",
             self.role, self.model_name, str(error)[:200],
