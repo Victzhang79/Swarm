@@ -307,12 +307,37 @@ class SemanticIndexer:
         index_generation：本次写入代际标记。配合 prune_file_stale 实现 write-then-prune
         （先 upsert 新 chunk 打代际，再删本文件旧代际残留），消除"先删后索引"的空窗。
         """
-        client = self._client_or_raise()
         # D13 fail-closed：project_id 缺失/为空 → 拒绝索引（在任何 embed/upsert 之前）。
         # 静默放行会让 point 落进无项目隔离的 ID 空间，跨项目覆盖复发。
         if not (isinstance(project_id, str) and project_id.strip()):
             logger.warning("index_chunks: project_id 缺失/为空，拒绝索引（fail-closed）")
             raise ValueError("index_chunks requires a non-empty project_id (D13 fail-closed)")
+
+        # ★内容准入闸（W1 复核 HIGH-4）★：这里才是 Layer B 的**真正唯一 sink**——
+        # `reindex_file_atomic → index_source_file → index_chunks`，而 KB 文档采集
+        # （`knowledge/ingest/pipeline.py` ← `POST /api/projects/{id}/knowledge/ingest`，
+        # 吃用户上传文件与远端文档）**直调 index_chunks**，此前完全裸奔。闸设在上一层
+        # 就漏掉了它，这正是"唯一收口点"论断的事实错误。
+        # 只拒 CRITICAL 档（见 ingest_guard.content_secret_hits 的分档说明），
+        # 逐 chunk 判定：一个 chunk 有凭据不牵连整份文档的其余部分。
+        from swarm.knowledge.ingest_guard import reject_reason_by_content
+        _kept: list[Chunk] = []
+        _dropped: list[str] = []
+        for _c in chunks:
+            _r = reject_reason_by_content(getattr(_c, "file_path", "") or "?", _c.content or "")
+            if _r:
+                _dropped.append(f"{getattr(_c, 'file_path', '?')}:{_r}")
+            else:
+                _kept.append(_c)
+        if _dropped:
+            logger.warning("[INGEST-GUARD] index_chunks 丢弃 %d 个含 CRITICAL 凭据的 chunk: %s",
+                           len(_dropped), _dropped[:5])
+        chunks = _kept
+        if not chunks:
+            return 0
+
+        # 闸通过后才建连接：拒绝路径不需要 Qdrant 可用（也不该因它不可用而变成异常）
+        client = self._client_or_raise()
         total = 0
 
         for i in range(0, len(chunks), batch_size):
@@ -393,7 +418,26 @@ class SemanticIndexer:
 
         替代"delete_by_file 然后 index_source_file"的先删后索引——后者在 index 失败时留下
         向量空窗。本法 index 失败则抛出且不 prune，旧 chunk 原样保留（无空窗），由调用方重试兜底。
+
+        ★入库准入闸·文件级（26 号文 S-3；W1 复核 HIGH-4 整改后定稿）★
+        这里做**文件名层**判定并顺带清存量；**内容层已下沉到 `index_chunks`**——那才是
+        Layer B 的真正唯一 sink（KB 文档采集 pipeline 直调 index_chunks，不经本方法）。
+        分工理由：文件级语义（"这个文件整体不该入库"+"删掉它已有的向量"）只有这一层
+        有；chunk 级内容判定放在 sink 层才能覆盖全部写入者。
+        拒绝时清掉该文件已有向量＝断源同时自愈存量，无需一次性清理脚本。
         """
+        from swarm.knowledge.ingest_guard import reject_reason_by_name
+        _rej = reject_reason_by_name(file_path)
+        if _rej:
+            logger.warning(
+                "[INGEST-GUARD] 拒绝语义入库 project=%s file=%s 原因=%s（并清除其已有向量）",
+                project_id, file_path, _rej)
+            try:
+                await self.delete_by_file(project_id, file_path)
+            except Exception as exc:  # noqa: BLE001 — 清理尽力而为，拒绝本身已生效
+                logger.warning("[INGEST-GUARD] 清除既有向量失败 %s: %s", file_path, exc)
+            return 0
+
         import time as _time
         gen = str(_time.time_ns())
         n = await self.index_source_file(

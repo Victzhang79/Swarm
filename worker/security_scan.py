@@ -954,20 +954,46 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
 ]
 
 
-def scan_text_for_secrets(text: str) -> list[tuple[str, str]]:
+def scan_text_for_secrets(
+    text: str, *, min_severity: str | None = None,
+) -> list[tuple[str, str]]:
     """在任意文本里检出泄露密钥（复用 _SECRET_PATTERNS，栈无关）。
 
     返回 [(pattern_name, 脱敏后的命中片段), ...]；无命中 → []。供经验技能【导入准入闸】
     校验技能正文不得内嵌密钥（与 diff 扫描同一 20+ pattern 源）。
+
+    ★min_severity（W1 复核 HIGH-2 整改）★：本表的 HIGH 档是【刻意的 FP 控制设计】——
+    见 _SECRET_PATTERNS 上方注释：`Generic Secret Assignment` 会把 RuoYi 基线的
+    `CSRF_TOKEN = "csrf_token"`（常量名非密钥）命中，故 DR-05-F5(#85) 对抗复核裁定
+    HIGH=warn 不阻断；本函数原先丢弃 severity（`for name, pat, _sev`），调用方拿不到档位
+    只能"命中即拒"。这对**有人工复核**的消费端（MERGE 走 escalate、技能导入由人放行）
+    是安全的宁误报；但对**无人工复核、直接丢弃**的消费端（知识库入库闸）就是冤杀，
+    且误杀不可见。故暴露档位让各消费端按自身后果严重性选阈值——
+    共享模式表（单一事实源）不变，**消费契约随后果分档**。
+    语义＝【最低档】（含更高档），不是精确匹配：`min_severity="high"` 返回 HIGH∪CRITICAL。
+    传 None（默认）＝全档返回，保持既有调用方行为逐字不变。
     """
     out: list[tuple[str, str]] = []
     if not text:
         return out
+    _floor = _SEVERITY_RANK.get(str(min_severity).lower(), 0) if min_severity else 0
     for name, pat, _sev in _SECRET_PATTERNS:
+        if _floor and _SEVERITY_RANK.get(_severity_key(_sev), 0) < _floor:
+            continue
         m = pat.search(text)
         if m:
             out.append((name, _redact_secret(m.group(0))))
     return out
+
+
+# 档位序（W1 复核 HIGH-2）：供 min_severity 做"≥ 阈值"过滤。取值与 Severity 枚举同源，
+# 未知档位按 0 处理＝不被任何 floor 过滤掉（fail-open 方向：宁可多报给调用方去判）。
+_SEVERITY_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _severity_key(sev: object) -> str:
+    """Severity 枚举/字符串 → 小写档位名（兼容 Enum.value 与裸串）。"""
+    return str(getattr(sev, "value", sev)).lower()
 
 
 def _redact_secret(value: str) -> str:

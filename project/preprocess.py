@@ -284,12 +284,18 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
 
 def _scan_sync(project_path: str) -> dict[str, Any]:
     """同步扫描项目目录"""
+    from swarm.knowledge.ingest_guard import (
+        GitignoreFilter,
+        reject_reason_by_name as _guard_reject_by_name,
+    )
+
     root = Path(project_path)
     file_count = 0
     dir_count = 0
     language_breakdown: dict[str, int] = {}
     line_counts: dict[str, int] = {}
     file_list: list[dict[str, Any]] = []
+    _rejected_by_name: list[tuple[str, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
         # 排除特定目录（原地修改 dirnames 控制 os.walk 递归）
@@ -306,6 +312,14 @@ def _scan_sync(project_path: str) -> dict[str, Any]:
 
             abs_file = abs_dir / filename
             rel_file = str(rel_dir / filename) if str(rel_dir) != "." else filename
+
+            # ★入库准入·层1 安全（26 号文 S-3）★：敏感文件名/隐藏文件在【扫描期】就挡，
+            # 不进 kb_file_index 也就不会驱动后续嵌入（:1206 是按 kb_file_index 全表取文件
+            # 嵌入的）。判据走 ingest_guard 单一事实源，与增量/一致性通道同源。
+            _rej = _guard_reject_by_name(rel_file)
+            if _rej:
+                _rejected_by_name.append((rel_file, _rej))
+                continue
 
             # 语言识别
             language = LANGUAGE_MAP.get(ext, "Other")
@@ -349,12 +363,49 @@ def _scan_sync(project_path: str) -> dict[str, Any]:
                 "hash": file_hash,
             })
 
+    # ★入库准入·层2 降噪（26 号文 S-3）★：遵守 .gitignore。项目自己已经声明忽略的东西
+    # （日志/录像/构建产物）本就不该进知识库——审计实测这一条占了向量库 86.3%，且噪声
+    # 会挤占 Layer A 的 25 个精确定位槽位、污染下游依赖图扩展。
+    # 批量一次 `git check-ignore --stdin`，与文件数无关；非 git 仓库/git 不可用则整体放行
+    # （降噪层 fail-open——安全由层1 独立兜底，绝不让 git 缺席变成安全缺口）。
+    _ignored: set[str] = set()
+    if file_list:
+        try:
+            _ignored = GitignoreFilter(root).filter_ignored([f["rel_path"] for f in file_list])
+        except Exception as exc:  # noqa: BLE001 — 降噪层 fail-open
+            logger.info("[INGEST-GUARD] gitignore 降噪不可用（放行全部）: %s", exc)
+    if _ignored:
+        file_list = [f for f in file_list if f["rel_path"] not in _ignored]
+        # ★三项统计必须一起重算（W1 复核 MEDIUM）★：初版只重算 file_count，注释写
+        # "语言/行数是展示用"——**错的**。它们经 analysis_input 直接拼进 analyze 的
+        # LLM prompt（`## Language Breakdown` / `- Total files:` / `- Line counts:`
+        # 三行相邻），不重算就是把一组自相矛盾的统计喂给模型（file_count=0 而
+        # language_breakdown 非空），且噪声语言分布会盖过真实构成——与降噪意图相反。
+        file_count = len(file_list)
+        language_breakdown = {}
+        line_counts = {}
+        for _f in file_list:
+            _lang = _f.get("language") or "Other"
+            language_breakdown[_lang] = language_breakdown.get(_lang, 0) + 1
+            line_counts[_lang] = line_counts.get(_lang, 0) + int(_f.get("lines") or 0)
+        logger.info("[INGEST-GUARD] .gitignore 降噪：%d 个文件不入库（项目已声明忽略）", len(_ignored))
+    if _rejected_by_name:
+        # always-emit：拒绝必须可观测，绝不静默少索引（本仓纪律：降级路径至少一次 WARNING）
+        _by_reason: dict[str, int] = {}
+        for _p, _r in _rejected_by_name:
+            _by_reason[_r] = _by_reason.get(_r, 0) + 1
+        logger.warning(
+            "[INGEST-GUARD] 安全闸拒绝 %d 个文件入库（按原因：%s；样本：%s）",
+            len(_rejected_by_name), _by_reason, [p for p, _ in _rejected_by_name[:8]])
+
     return {
         "file_count": file_count,
         "dir_count": dir_count,
         "language_breakdown": language_breakdown,
         "line_counts": line_counts,
         "files": file_list,
+        "ingest_rejected_by_name": len(_rejected_by_name),
+        "ingest_ignored_by_gitignore": len(_ignored),
     }
 
 
@@ -396,6 +447,12 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
         "dirs": scan_result["dir_count"],
         "languages": list(scan_result["language_breakdown"].keys()),
         "line_counts": scan_result["line_counts"],
+        # ★准入闸账必须有人消费（W1 复核 C7）★：初版这两个键只留在 _scan_sync 的返回值里，
+        # 全仓零生产消费者＝死账，于是"这轮拒了多少、降噪了多少"只能 grep 日志，
+        # 违反"进度/状态绝不解析 swarm.log"（#106）。挂进 scan_stats 随 upsert_progress
+        # 落库，E2E 陪跑与复盘可经进度接口直接读。
+        "ingest_rejected_by_name": scan_result.get("ingest_rejected_by_name", 0),
+        "ingest_ignored_by_gitignore": scan_result.get("ingest_ignored_by_gitignore", 0),
     }
     await asyncio.to_thread(
         upsert_progress,

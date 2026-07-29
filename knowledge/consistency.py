@@ -20,14 +20,50 @@ def _conn_str() -> str:
     return get_config().db.postgres_uri
 
 
-def _is_source_file(path: Path) -> bool:
+def _is_source_file(path: Path, *, root: Path, gate: Any | None = None) -> bool:
+    """本通道的入库候选判据——★必须与全量/增量通道同源★（26 号文 S-3）。
+
+    历史病灶：本函数原本只查 EXCLUDED_DIRS/EXCLUDED_EXTENSIONS，**没有** hidden-file 检查，
+    于是全量 preprocess 挡掉的 `.claude/*`、`.hermes/plans/*`、`.env` 等被一致性修复
+    当作 `missing_index` **重新塞回索引**——准入面倒挂，三套过滤不同源的必然结果。
+    接上 ingest_guard 后还有第二层意义：入库闸拒绝的文件若在此仍被判 missing，就会
+    形成"巡检入队 → 入库闸拒绝 → 下次仍判 missing"的**无限重试环**。同源即杜绝该环。
+
+    ★W1 复核 HIGH-1/MEDIUM 整改★：① 判据必须含**降噪层**（.gitignore）——否则
+    `logs/*.log` 这类每天都在变的文件恒判 stale/missing、恒入队、恒被重新嵌入，
+    正是"每天打满 200 预算从不收敛"的机制本体；② `root` 改**必填**（原先默认 None 时
+    `rel` 退化成 `path.name`，hidden_dir 判据永久失效——安全 backstop 的 kwarg 必填是
+    B8-F2 定下的范式）；③ 异常不再静默 `pass`。
+    """
     if not path.is_file():
         return False
     if any(part in EXCLUDED_DIRS for part in path.parts):
         return False
     if path.suffix.lower() in EXCLUDED_EXTENSIONS:
         return False
-    return True
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        logger.warning("[CONSISTENCY] 路径越出项目根，跳过：%s（root=%s）", path, root)
+        return False
+    try:
+        if gate is None:
+            from swarm.knowledge.ingest_guard import reject_reason_by_name
+            return reject_reason_by_name(rel) is None
+        return gate.reject_for_indexing(rel) is None
+    except Exception as exc:  # noqa: BLE001
+        _warn_once_guard_unavailable(exc)
+        return False   # fail-closed：判据不可用时不把文件当入库候选（绝不反向灌库）
+
+
+_guard_warned = False
+
+
+def _warn_once_guard_unavailable(exc: object) -> None:
+    global _guard_warned
+    if not _guard_warned:
+        _guard_warned = True
+        logger.warning("[CONSISTENCY] 入库判据不可用 → 本轮不产出入库候选（fail-closed）: %s", exc)
 
 
 def check_project_consistency(
@@ -65,11 +101,20 @@ def check_project_consistency(
     missing_index: list[str] = []
     checked = 0
 
+    # 一次构造、全程复用：GitignoreFilter 内含仓库归属缓存，逐文件重建会退化成
+    # 每文件一次 git 调用（W1 复核 HIGH-1）。
+    try:
+        from swarm.knowledge.ingest_guard import IngestGate
+        _gate = IngestGate(root)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once_guard_unavailable(exc)
+        _gate = None
+
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
-        if not _is_source_file(path):
+        if not _is_source_file(path, root=root, gate=_gate):
             continue
         checked += 1
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)

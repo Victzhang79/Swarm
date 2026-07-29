@@ -265,6 +265,10 @@ class KnowledgeUpdater:
         # 用 in-process dict（最简健壮）：重启即重置不影响正确性——增量已删自身
         # 出边兜底，重建只是纠正缺边的尽力而为优化。
         self._depgraph_dirty: dict[str, int] = {}
+        # 入库准入闸按项目缓存（W1 复核 HIGH-1）：IngestGate 内含 GitignoreFilter 的
+        # 仓库归属缓存，逐文件重建会退化成"每文件一次 git 调用"。None=该项目 root
+        # 解析不出，降级为只用名字层（安全层仍在，降噪层缺席）。
+        self._gate_cache: dict[str, Any] = {}
         # 持后台重建 task 强引用，防 GC 中途回收（与 api.app._spawn_bg 同纪律）；
         # 完成即从集合 discard。
         self._depgraph_tasks: set = set()
@@ -407,10 +411,50 @@ class KnowledgeUpdater:
                 raise RuntimeError(
                     f"content 未取到(None，非真空文件)无法索引 {change.file_path}——标 failed 待重试")
 
+    def _reject_for_indexing(self, project_id: str, file_path: str) -> str | None:
+        """本通道的准入判据——与全量/一致性同源（名字层 + 降噪层）。
+
+        root 解析不出时降级为只用名字层：安全层（凭据）绝不因此失效，只是降噪层缺席。
+        """
+        from swarm.knowledge.ingest_guard import IngestGate, reject_reason_by_name
+        # 懒初始化而非依赖 __init__：既有测试用 `KnowledgeUpdater.__new__(...)` 绕过
+        # __init__ 构造实例（全量闸实证 2 例），属性不存在会 AttributeError 打断索引。
+        # 准入闸绝不能因为"实例构造方式"而失效。
+        if getattr(self, "_gate_cache", None) is None:
+            self._gate_cache = {}
+        if project_id not in self._gate_cache:
+            gate = None
+            try:
+                _root = _lookup_project_path(project_id) if project_id else None
+                if _root:
+                    gate = IngestGate(_root)
+                else:
+                    logger.info("[INGEST-GUARD] project=%s 解析不出 root → 增量通道降噪层缺席"
+                                "（安全层仍生效）", project_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[INGEST-GUARD] project=%s 构造准入闸失败 → 降噪层缺席: %s",
+                               project_id, exc)
+            self._gate_cache[project_id] = gate
+        gate = self._gate_cache.get(project_id)
+        if gate is None:
+            return reject_reason_by_name(file_path)
+        return gate.reject_for_indexing(file_path)
+
     async def _index_file(
         self, project_id: str, change: FileChange
     ) -> None:
         """索引一个文件到 Layer A + Layer B"""
+        # ★入库准入闸（26 号文 S-3；W1 复核 HIGH-1 整改）★：本通道原本【不 import 任何
+        # 排除表】，准入面比全量还宽（连 .png/.zip/.so 都不挡，`.env` 更是直穿）。
+        # 判据走 ingest_guard 单一事实源，**含降噪层**——只过名字层是不够的：
+        # `logs/*.log` 这类每天都在变的文件会被一致性巡检恒判 stale → 入队 → 到这里
+        # 被放行 → 重新嵌入，正是"每天打满 200 预算从不收敛"的机制本体。
+        _rej = self._reject_for_indexing(project_id, change.file_path)
+        if _rej:
+            logger.warning("[INGEST-GUARD] 拒绝增量入库 project=%s file=%s 原因=%s",
+                           project_id, change.file_path, _rej)
+            return
+
         # Layer A: 提取结构信息并写入
         if self._struct:
             file_info = FileInfo(

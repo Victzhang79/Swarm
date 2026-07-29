@@ -528,10 +528,15 @@ mkdir -p "$QDRANT_DIR" "$QDRANT_BIN_DIR"
 ok "Qdrant 本地存储: $QDRANT_DIR"
 
 if ! curl -sf "http://localhost:6333/collections" >/dev/null 2>&1; then
+    # ★安全：绑回环，绝不监听 0.0.0.0（与 scripts/start-services.sh 同源）★
+    # Qdrant 社区版无内置认证；实测未指定 host 时默认 0.0.0.0 → 同网段任意主机可无认证
+    # 直读整个向量库。本服务只被本机 API 进程消费，绑回环零功能损失。
+    QDRANT_BIND_HOST="${SWARM_QDRANT_BIND_HOST:-127.0.0.1}"
     if command -v docker >/dev/null 2>&1; then
-        info "Docker 启动 Qdrant..."
+        info "Docker 启动 Qdrant（绑 ${QDRANT_BIND_HOST}）..."
         docker rm -f swarm-qdrant 2>/dev/null || true
-        docker run -d --name swarm-qdrant -p 6333:6333 -p 6334:6334 \
+        docker run -d --name swarm-qdrant \
+            -p "${QDRANT_BIND_HOST}:6333:6333" -p "${QDRANT_BIND_HOST}:6334:6334" \
             -v "$QDRANT_DIR:/qdrant/storage" qdrant/qdrant >/dev/null || warn "Docker Qdrant 启动失败"
     fi
     if ! curl -sf "http://localhost:6333/collections" >/dev/null 2>&1; then
@@ -557,8 +562,9 @@ if ! curl -sf "http://localhost:6333/collections" >/dev/null 2>&1; then
             fi
         fi
         if [[ -x "$QDRANT_BIN_DIR/qdrant" ]]; then
-            info "启动 Qdrant 二进制 (6333)..."
-            nohup env QDRANT__STORAGE__STORAGE_PATH="$QDRANT_DIR" "$QDRANT_BIN_DIR/qdrant" \
+            info "启动 Qdrant 二进制 (绑 ${QDRANT_BIND_HOST:-127.0.0.1})..."
+            nohup env QDRANT__STORAGE__STORAGE_PATH="$QDRANT_DIR" \
+                QDRANT__SERVICE__HOST="${QDRANT_BIND_HOST:-127.0.0.1}" "$QDRANT_BIN_DIR/qdrant" \
                 >> "$PROJECT_ROOT/qdrant.log" 2>&1 &
             sleep 2
         fi
