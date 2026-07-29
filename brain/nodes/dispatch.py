@@ -889,12 +889,27 @@ async def dispatch(state: BrainState) -> dict:
         # 复盘与运维据 event=dispatch_aborted 可还原本批到底派了谁。
         # best-effort：审计失败绝不改变异常传播（append_task_audit 自身已吞异常）。
         try:
+            # ★绝不在事件循环里做同步 PG 写（对抗双复核 HIGH，同文件 :806 既有姿势是
+            # `await asyncio.to_thread`）★ append_task_audit → sync_pool().connection()，
+            # 池 timeout 实测 30s + check_connection 一次往返。而本分支的目标场景恰是
+            # cancel / 墙钟 / 预算——常伴大并发与 PG 压力、池易耗尽；brain graph 跑在 API
+            # 进程事件循环里，一次 30s 阻塞＝整个 API（SSE/进度/心跳）冻结，且 cancel 变慢。
+            # 也不能 `await asyncio.to_thread`：本分支捕的可能就是 CancelledError，await
+            # 会立即再抛、留痕永远做不完。故起 daemon 线程 fire-and-forget——留痕是旁路，
+            # 它做没做完都不该影响异常传播时序。
+            import threading
+
             from swarm.project import store as _pstore
-            _pstore.append_task_audit(
-                str(state.get("task_id") or ""), "dispatch_aborted",
-                project_id=str(state.get("project_id") or "") or None,
-                description=f"dispatch 异常退出，本批已派发 {len(_spawned_ids)} 个子任务",
-                detail=json.dumps({"spawned": sorted(_spawned_ids)}, ensure_ascii=False))
+            _payload = json.dumps({"spawned": sorted(_spawned_ids)}, ensure_ascii=False)
+            _args = (str(state.get("task_id") or ""), "dispatch_aborted")
+            _kw = {
+                "project_id": str(state.get("project_id") or "") or None,
+                "description": f"dispatch 异常退出，本批已派发 {len(_spawned_ids)} 个子任务",
+                "detail": _payload,
+            }
+            threading.Thread(
+                target=lambda: _pstore.append_task_audit(*_args, **_kw),
+                name="dispatch-abort-audit", daemon=True).start()
             logger.warning(
                 "[DISPATCH] C-14 异常退出：本批 %d 个已派发子任务不会进 state 账"
                 "（LangGraph 丢弃本 superstep 写）→ 已落 task_audit_log(dispatch_aborted)："

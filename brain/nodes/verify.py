@@ -846,7 +846,8 @@ async def verify_runtime(state: BrainState) -> dict:
     # S2-5：accept phase 判定（纯函数——证据已随冒烟输出收割，杀箱后判定安全）
     accept_patch = _run_accept_phase(
         assertions, accept_gen_info, res.status,
-        str((res.details or {}).get("accept_output") or ""))
+        str((res.details or {}).get("accept_output") or ""),
+        res.classification)
     accept_keys = {k: v for k, v in accept_patch.items() if not k.startswith("_")}
     accept_keys["acceptance_assertions"] = list(assertions)
     accept_degraded = (
@@ -1392,6 +1393,7 @@ def _baseline_unverified_degraded(state: BrainState, accept_patch: dict) -> list
 
 def _run_accept_phase(
     assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
+    smoke_classification: str | None = None,
 ) -> dict:
     """S2-5 accept phase 判定（纯函数，无沙箱 IO——证据已随冒烟输出收割，杀箱后判定安全）。
 
@@ -1400,7 +1402,8 @@ def _run_accept_phase(
     调用方并入 runtime 失败通道）/`_degraded`/`_message`（`_` 前缀绝不写进 state）。
     """
     try:
-        return _accept_phase_verdict(assertions, gen_info, smoke_status, accept_output)
+        return _accept_phase_verdict(assertions, gen_info, smoke_status, accept_output,
+                                     smoke_classification)
     except Exception as exc:  # noqa: BLE001 — accept phase 异常绝不污染冒烟结论
         logger.warning("[VERIFY_RUNTIME] accept phase 异常 → skipped: %s", exc)
         return {"acceptance_passed": None,
@@ -1450,8 +1453,15 @@ def _d5_attribute_owners(missing: list, plan_obj, subtask_results: dict) -> tupl
     return owners, sym_owners, unattributed
 
 
+# 这些冒烟分类意味着**应用应答过**（脚本里的 accept_block 条件是 SMOKE_OK=1，
+# 即探活成功）——断言已执行、证据已收割，必须照常判定。
+# 冒烟结论本身仍按各自语义（http_server_error 仍 skipped，不因断言过就改判通过）。
+_ACCEPT_ANSWERED_CLASSES = frozenset({"http_server_error", "started_tcp_only"})
+
+
 def _accept_phase_verdict(
     assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
+    smoke_classification: str | None = None,
 ) -> dict:
     from swarm.brain.acceptance_spec import evaluate_probe_result, parse_probe_output
     from swarm.brain.nodes.runtime_smoke import MARK_ACCEPT_TOOL_MISSING
@@ -1476,7 +1486,17 @@ def _accept_phase_verdict(
                 "acceptance_details": {
                     **base, "reason": str(gen_info.get("reason") or "no_assertions")}}
 
-    if smoke_status != "passed":
+    # ★断言可判定的前提是【应用应答了】，不是【冒烟判过】（对抗复核 HIGH）★
+    # C-5 把 5xx 从 passed 改判 skipped:http_server_error 之后，本判据把**已经在沙箱里
+    # 跑完、证据已收割**的接口断言整体丢弃不判：实测同一份 accept_output，
+    #   ok:200 → acceptance_passed=False（硬拦交付）
+    #   ok:503 → acceptance_passed=None（不拦）
+    # 而 Spring 的 /actuator/health 只要任一 indicator DOWN（沙箱无 DB/Redis 即默认）
+    # 就返 503——恰恰是主力栈常态。净效果＝把第三道闸拧硬的同时把第四道闸拧成 fail-open，
+    # 与本批"四道闸只剩一道是硬的"的立项方向相反。
+    # 而 5xx 场景下断言的信息量恰恰最大：health 503 但业务接口 200，正能证伪"应用坏了"。
+    # 故前提改为"应用应答过"——这些分类都意味着 accept_block 已在脚本里执行完。
+    if smoke_status != "passed" and smoke_classification not in _ACCEPT_ANSWERED_CLASSES:
         # 冒烟本身 failed/skipped/未执行 → 断言未执行，跟随 skip（migration phase 同语义）
         reason = f"smoke_{smoke_status or 'not_executed'}"
         patch: dict = {"acceptance_passed": None,

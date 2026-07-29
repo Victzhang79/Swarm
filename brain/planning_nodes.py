@@ -3083,6 +3083,9 @@ async def elaborate(state: BrainState) -> dict:
         # 故置标记走 degraded（append+dedup reducer），让阴性空账在机读面可被证伪。★
         _t4_ambiguous = []
         _t4_wire_failed = True
+        # 同上：注释自陈"半应用状态"（已钉 defined_in N 条但 consumer 未获 readable），
+        # 即变异确已发生而 _t4_wired 留空 → 回写旗不置＝跨 checkpoint 把已钉的也丢了。
+        _plan_mutated = True
         logger.warning(
             "[ELABORATE] T4: 类型引用布线异常中断（非致命；注意半应用状态：本轮已钉 defined_in "
             "%d 条但 consumer 未获 readable/依赖边——worker 侧靠 seed 闸/符号接地兜底；"
@@ -3105,6 +3108,10 @@ async def elaborate(state: BrainState) -> dict:
             logger.warning("[ELABORATE] G2: %d 对 readable 消费加边会成环（更深计划错，未补边、未制造环）: %s",
                            len(_prov_cycle), _prov_cycle[:5])
     except Exception as exc:  # noqa: BLE001 — 自愈尽力而为，绝不因它拖垮规划（与兄弟 pass 对称）
+        # ★异常路径上"变异已发生但旗未并"（复核 MEDIUM）★：本 pass 就地改 plan，
+        # 抛异常时可能已改了一半而 _prov_added 留 []——旗不置＝跨 checkpoint 回退，
+        # 正是本轮要堵的 T4 洞在失败路径上原样保留。保守置旗（多回写一次同值无害）。
+        _plan_mutated = True
         logger.warning("[ELABORATE] G2: provenance 接线失败（非致命，跳过）: %s", exc)
 
     # 最终检查：仍超预算/缺验收的标记出来（人工介入信号）

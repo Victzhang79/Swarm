@@ -3223,15 +3223,10 @@ def _confirm_coverage_summary(state: BrainState) -> dict:
                 for u in matrix["uncovered"][:30]
             ],
             "baseline_covered_count": len(matrix["baseline_covered"]),
-            # C-3：仅由"没真正兑现的子任务"（桩/放弃/丢弃）覆盖的需求——人工闸必须看到
-            # "这几条虽然计划里有人认领，但落地的是抛 not-implemented 的桩"。
-            "covered_by_unfulfilled_only": [
-                {"id": u.get("id"), "text": str(u.get("text") or "")[:120],
-                 "covered_by": u.get("covered_by")}
-                for u in matrix.get("covered_by_unfulfilled_only", [])[:_DELIVER_ASSERT_ROWS_MAX]
-            ],
-            "covered_by_unfulfilled_only_count": len(
-                matrix.get("covered_by_unfulfilled_only", [])),
+            # C-3 注：本摘要是【规划期】人工闸——此时还没有任何子任务跑过，
+            # unfulfilled 恒空，故刻意不传 unfulfilled_subtask_ids、也不展示该字段
+            # （初版误加在此：既是恒空死字段，又与 deliver 侧算出两份不同的 covered）。
+            # "计划覆盖 vs 真兑现"的对账在 _deliver_review_payload。
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("[CONFIRM] 覆盖摘要现算失败(payload 降级为空): %s", exc)
@@ -4655,7 +4650,10 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
         out["failure_strategy"] = "escalate"
         out["l2_passed"] = False
         out["verification_failure"] = "merge_secret_scan_error"
-        out["degraded_reasons"] = ["merge_secret_scan_error"]
+        # ★追加不覆写（复核 MEDIUM）★：本函数在 merge 出口【之后】被调用，直接赋值会把
+        # C-4 的 merge_owner_drop:* 从本轮 degraded_reasons 里整体抹掉（本轮既有 owner
+        # 丢件、又检出密钥时命中）。与 verify.py 的 _append_degraded 既有约定同源。
+        out["degraded_reasons"] = list(out.get("degraded_reasons") or []) + ["merge_secret_scan_error"]
         return
     if not findings:
         return
@@ -4672,7 +4670,8 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
         out["verification_failure"] = "merge_secret_detected"
         # degraded 留痕：observability + L6 抑制（前缀不在 INFORMATIONAL 白名单→自动挡假学习）。
         _summary = sorted({f"{f.rule_id}@{f.file}:{f.line}" for f in _blocking})
-        out["degraded_reasons"] = [f"merge_secret_detected:{s}" for s in _summary[:20]]
+        out["degraded_reasons"] = (list(out.get("degraded_reasons") or [])
+                                   + [f"merge_secret_detected:{s}" for s in _summary[:20]])
         logger.error(
             "[MERGE] ⚠️ 交付 diff 检出密钥泄露(≥%s %d 处) → escalate 人工 fail-closed 阻断交付；"
             "命中(已脱敏)=%s",
@@ -4684,7 +4683,8 @@ def _scan_merged_diff_for_secrets(out: dict, merged_diff: str) -> None:
     # 否则"扫过=干净"的假象会让 HIGH 密钥静默随交付蒸发（hunter F2）。degraded 前缀同样不在
     # INFORMATIONAL 白名单→挡 L6 假学习（含疑似密钥的交付不该被学成金标准成功模式）。
     _high_summary = sorted({f"{f.severity.value}:{f.rule_id}@{f.file}:{f.line}" for f in findings})
-    out["degraded_reasons"] = [f"merge_secret_reported:{s}" for s in _high_summary[:20]]
+    out["degraded_reasons"] = (list(out.get("degraded_reasons") or [])
+                               + [f"merge_secret_reported:{s}" for s in _high_summary[:20]])
     logger.warning(
         "[MERGE] 交付 diff 检出疑似密钥(HIGH，不阻断但留痕可审计)；命中(已脱敏)=%s",
         [f.title for f in findings][:20],
@@ -5737,6 +5737,16 @@ def _deliver_review_payload(state: BrainState) -> dict:
                 for b in matrix["baseline_covered"][:_DELIVER_ASSERT_ROWS_MAX]
             ],
             "baseline_covered_count": len(matrix["baseline_covered"]),
+            # ★C-3：仅由"没真正兑现的子任务"（桩/放弃/丢弃）覆盖的需求★
+            # 缺了这个键，人工闸拿到的是 total=2/covered=1/uncovered=0 —— 一个无法解释的
+            # 算术窟窿，比改动前更难判读（对抗双复核独立实证）。
+            "covered_by_unfulfilled_only": [
+                {"id": u.get("id"), "text": str(u.get("text") or "")[:120],
+                 "covered_by": u.get("covered_by")}
+                for u in matrix.get("covered_by_unfulfilled_only", [])[:_DELIVER_ASSERT_ROWS_MAX]
+            ],
+            "covered_by_unfulfilled_only_count": len(
+                matrix.get("covered_by_unfulfilled_only", [])),
             # 3.9 H-F5：A6 gap 放行的残差（last-write-wins，全覆盖过闸即清）——人工闸
             # 必须看到"最终计划是带着哪些未覆盖需求 degraded 放行的"（非陈旧快照）。
             "gap_residual": list(state.get("coverage_gap_residual") or []),

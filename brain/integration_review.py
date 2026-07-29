@@ -176,6 +176,17 @@ def _run_cmd(project_path: str, cmd: str, *, timeout: int = 300) -> tuple[bool, 
         return False, str(exc)
 
 
+# API 路径末段退化出的泛词——它们在任何 diff 里都必然命中，作为"契约已实现"的证据
+# 判别力为零（26 号文 I-H3）。本表只用于**如实报告闸门的失明面**，不用于剔除符号：
+# 剔除会缩小分母把通过率做得更好看，与诚实相反。栈中立（纯 REST/CRUD 通用动词与名词）。
+_NON_DISCRIMINATING_SYMBOLS = frozenset({
+    "list", "add", "edit", "get", "set", "put", "post", "delete", "remove", "save",
+    "update", "create", "new", "index", "detail", "info", "data", "item", "items",
+    "query", "search", "find", "all", "one", "page", "count", "check", "test",
+    "export", "import", "upload", "download", "id", "type", "name", "value", "status",
+})
+
+
 def check_contract_in_diff(
     merged_diff: str,
     shared_contract: dict[str, Any] | None,
@@ -190,11 +201,39 @@ def check_contract_in_diff(
     symbols = contract_symbols(shared_contract)
     if not symbols:
         return True, []
-    diff_lower = (merged_diff or "").lower()
+    # ★只在【新增行与上下文行】里找，绝不认删除行（26 号文 I-H3）★
+    # 原判据是整份 diff 的大小写不敏感子串——**删除行与注释都算"存在"**。
+    # 复核实测：5/5 契约符号全部只出现在 `-` 行（即这次变更把它们删了），闸门仍判 True。
+    # 符号只在删除行出现，语义恰恰是"它被移除了"，与"契约已实现"完全相反。
+    # 上下文行（前导空格）保留为有效证据：symbol 已在基线、本次只改其内部实现是合法形态。
+    _hay: list[str] = []
+    for _ln in (merged_diff or "").splitlines():
+        if not _ln:
+            continue
+        _c = _ln[0]
+        if _c == "-" or _ln.startswith("---"):
+            continue                      # 删除行 / 文件头
+        if _ln.startswith("+++") or _ln.startswith("@@") or _ln.startswith("diff --git"):
+            continue                      # diff 元信息（文件名里的词不算实现证据）
+        _hay.append((_ln[1:] if _c in "+ " else _ln).lower())
+    diff_lower = "\n".join(_hay)
     # R43 复核 F4：I 前缀符号接受基名子串（与 C1 惯例等价口径对称，防两张皮位移到 L2）
     from swarm.brain.contract_utils import symbol_diff_variants
     missing = [s for s in symbols
                if not any(v in diff_lower for v in symbol_diff_variants(s))]
+    # ★无判别力符号必须如实报告，绝不假装验过（26 号文 I-H3 第一重）★
+    # `contract_symbols` 对 API 条目取路径末段：`GET /system/device/list` → `list`。
+    # 这种泛词在整份 diff 里必然命中，等于该契约条目**根本没被验证**——而它此前被计入
+    # "已覆盖"的分子，把闸门的通过率虚高。
+    # ★刻意不改 contract_symbols 本身★：它是 C1 规划期对账的共享单一事实源，C1 的消费
+    # 契约（做符号 owner 归属）里泛词是可用的。共享表不动，**消费契约随后果分档**——
+    # 这正是本轮 W1 复核 HIGH-2 的教训（详见 swarm-reuse-contract-not-just-source）。
+    _blind = sorted({s for s in symbols
+                     if s.lower() in _NON_DISCRIMINATING_SYMBOLS and s not in missing})
+    if _blind:
+        logger.warning(
+            "[CONTRACT] %d 个契约符号无判别力（API 路径末段退化成泛词，本闸对其结构性失明，"
+            "不构成'已实现'证据）：%s", len(_blind), _blind[:10])
     if not missing:
         return True, []
     import os

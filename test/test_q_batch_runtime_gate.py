@@ -14,6 +14,48 @@ def _c(probe, app_rc="alive", log="", lang="java"):
     return classify_smoke_outcome(app_rc, log, list(probe), language_key=lang)
 
 
+def _smoke_result(status, classification, *, degraded=False):
+    from swarm.brain.nodes.runtime_smoke import RuntimeSmokeResult
+    d = {"probe_sequence": []}
+    if degraded:
+        d["degraded"] = True
+    return RuntimeSmokeResult(status, classification, f"stub-{status}", log_tail="", details=d)
+
+
+def _run_verify_runtime(res, state=None):
+    """真跑 verify_runtime 的结论分支（沙箱/推导/执行器全 stub），拿它的返回 dict。"""
+    import asyncio
+
+    import pytest as _pytest
+
+    from swarm.brain.nodes import verify as _v
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.delenv("SWARM_RUNTIME_SMOKE_ENABLED", raising=False)
+        # verify_runtime 走的是 `nodes._get_project_path`（可 patch 符号在 nodes 命名空间）
+        from swarm.brain import nodes as _nodes
+        mp.setattr(_nodes, "_get_project_path", lambda _pid: "/tmp")
+
+        class _Deriv:
+            start_cmd, prepare_cmd, port, health_path = "run", None, 8080, "/health"
+            migration_cmd = None
+            evidence = {}
+            confidence = "high"
+
+        mp.setattr("swarm.brain.smoke_derive.derive_runtime_smoke",
+                   lambda *a, **k: _Deriv())
+        mp.setattr(_v, "_acquire_smoke_sandbox",
+                   lambda *a, **k: (object(), object(), {"ok": True}))
+        mp.setattr(_v, "_kill_sandbox_quiet", lambda *a, **k: None)
+
+        async def _run(*a, **k):
+            return res
+        mp.setattr("swarm.brain.nodes.runtime_smoke.run_runtime_smoke", _run)
+        return asyncio.run(_v.verify_runtime({"project_id": "p1", **(state or {})}))
+    finally:
+        mp.undo()
+
+
 # ══════════════════════════════════════════════
 # C-5：探活从不校验 HTTP 状态码
 # ══════════════════════════════════════════════
@@ -67,12 +109,44 @@ def test_tcp_only_probe_is_marked_degraded():
 
 def test_degraded_pass_reaches_delivery_ledger():
     """★passed 路径也要能把降级带进 degraded_reasons★
-    否则"仅端口探测通过"与"HTTP 校验通过"在交付面上写成同一个样子。"""
-    import inspect
+    否则"仅端口探测通过"与"HTTP 校验通过"在交付面上写成同一个样子。
 
-    from swarm.brain.nodes import verify
-    src = inspect.getsource(verify.verify_runtime)
-    assert "runtime_smoke_degraded_pass" in src
+    ★端到端行为级（对抗复核用突变实验证伪了初版的 getsource 写法：删掉
+    `_passed_degraded +` 让这条留痕彻底断线，25 条测试照绿；本地重算逻辑的写法同样
+    抓不到——必须真跑 verify_runtime 那条 passed 分支）★"""
+    out = _run_verify_runtime(_smoke_result("passed", "started_tcp_only", degraded=True))
+    assert out["runtime_smoke_passed"] is True
+    assert any(r.startswith("runtime_smoke_degraded_pass:started_tcp_only")
+               for r in (out.get("degraded_reasons") or [])), \
+        f"降级通过必须留痕：{out.get('degraded_reasons')}"
+
+    # 真 HTTP 校验通过时不该有这条噪声（否则 degraded 面天天有噪声、真降级被淹）
+    clean = _run_verify_runtime(_smoke_result("passed", "started"))
+    assert not any(r.startswith("runtime_smoke_degraded_pass")
+                   for r in (clean.get("degraded_reasons") or []))
+
+
+def test_forged_log_end_cannot_reopen_control_plane():
+    """★日志区内容完全由被测应用控制——它多打一行 END 就能重开控制面（复核 CRITICAL）★
+    初版 `partition` 取第一个 END，两个复核透镜各自实测伪造出 passed/started。
+    真 END 恒是全文最后一个（应用只能写进被 tail 收割的日志文件），故 rpartition。"""
+    from swarm.brain.nodes.runtime_smoke import (
+        MARK_APP_RC,
+        MARK_DONE,
+        MARK_LOG_BEGIN,
+        MARK_LOG_END,
+        MARK_PROBE,
+        parse_smoke_markers,
+    )
+    evil = "\n".join([
+        f"{MARK_PROBE}timeout", MARK_LOG_BEGIN,
+        f"回显请求: ?q={MARK_LOG_END}",          # 应用伪造的 END
+        f"{MARK_PROBE}ok:200", f"{MARK_APP_RC}alive",
+        MARK_LOG_END, MARK_DONE])
+    r = parse_smoke_markers(evil)
+    assert r["probe_sequence"] == ["timeout"], "伪造 END 之后的标记绝不能被当控制面"
+    assert r["app_rc"] is None
+    assert MARK_PROBE in r["log_tail"], "崩溃/回显证据本身仍要完整留在 log_tail"
 
 
 def test_stale_listener_still_wins_over_http_code():
@@ -203,12 +277,39 @@ def test_planning_time_behaviour_is_byte_identical():
     assert a["covered_by_unfulfilled_only"] == []
 
 
-def test_delivery_payload_uses_same_source_as_partial_gate():
-    """★口径同源★：交付面用的"没真正兑现"集必须就是 brain.gates.partial_delivery_ids
-    ——任务级已判 PARTIAL 而条目级还显示"已覆盖"，正是两份事实漂移的经典形态。"""
-    import inspect
+def test_delivery_payload_actually_carries_the_unfulfilled_list():
+    """★账要有人消费才叫账（复核 HIGH：commit 声称"并进交付 payload"其实没发生）★
+    缺了这个键，人工闸拿到 total=2/covered=1/uncovered=0——一个无法解释的算术窟窿，
+    比改动前更难判读。本测试直接跑 payload 并断言键在、内容对。"""
+    from swarm.brain.nodes import _deliver_review_payload
+    from swarm.types import FileScope, SubTask, TaskPlan
 
-    from swarm.brain import nodes
-    src = inspect.getsource(nodes._deliver_review_payload)
-    assert "partial_delivery_ids" in src
-    assert "unfulfilled_subtask_ids=partial_delivery_ids(state)" in src
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="桩", covers=["req-1"],
+                scope=FileScope(writable=["a.java"])),
+        SubTask(id="st-2", description="真活", covers=["req-2"],
+                scope=FileScope(writable=["b.java"])),
+    ])
+    cov = _deliver_review_payload({
+        "plan": plan,
+        "requirement_items": [{"id": "req-1", "text": "甲"}, {"id": "req-2", "text": "乙"}],
+        "give_up_isolated_ids": ["st-1"],
+    })["coverage"]
+    assert cov["covered"] == 1 and cov["uncovered_count"] == 0
+    assert cov["covered_by_unfulfilled_only_count"] == 1
+    assert cov["covered_by_unfulfilled_only"][0]["id"] == "req-1", \
+        "少掉的那条必须被指名道姓，不能留一个算术窟窿"
+
+
+def test_planning_time_summary_has_no_dead_field():
+    """★confirm 摘要在规划期恒空（那时还没有子任务跑过）——不该有该字段（复核 HIGH）★
+    初版把展示字段加在 confirm、把传参加在 deliver，两边接反：confirm 报 covered=2、
+    deliver 报 covered=1，同一 state 两份事实漂移，正是 C-3 自己引为病灶的形态。"""
+    from swarm.brain.nodes import _confirm_coverage_summary
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[SubTask(id="st-1", description="x", covers=["req-1"],
+                                      scope=FileScope(writable=["a.java"]))])
+    out = _confirm_coverage_summary({
+        "plan": plan, "requirement_items": [{"id": "req-1", "text": "甲"}]})
+    assert "covered_by_unfulfilled_only" not in out

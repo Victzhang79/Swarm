@@ -202,7 +202,20 @@ def _patch_llm(monkeypatch, payloads: list) -> _FakeLLM:
     return fake
 
 
+# ★I-H2 语义适配（26 号文）：F7 grounding 现在【也校验 path】——evidence 回指得上
+# 不等于路径没编（实测 `/totally/made/up/endpoint` + 任意真 evidence 即可通过）。
+# 生产语料 `_accept_design_context` 含 merged_diff 的路由承载段，真路径必然在内；
+# 本文件的夹具语料原先只有一行 "port=8080, health_path=/health"，故补一段带路由注解的
+# merged_diff 让夹具贴近生产形态（不改任何测试的判定语义）。
+# 走 tech_design 而不是 merged_diff：后者会让 _acquire_smoke_sandbox 改走"自建臂内
+# apply merged 树"分支，在本文件的 stub manager 下取不到沙箱 → 整批用例被跳过。
+# 两者都是 _accept_design_context 的语料来源，此处取无副作用的那个。
+_ROUTE_DESIGN = {"apis": ["GET /api/ping 健康探测", "GET /api/status 状态",
+                          "GET /api/secret 需鉴权"]}
+
+
 def _run_node(state: dict) -> dict:
+    state = {"tech_design": _ROUTE_DESIGN, **state}
     return asyncio.run(verify_mod.verify_runtime(state))
 
 

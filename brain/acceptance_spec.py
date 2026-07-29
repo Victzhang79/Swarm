@@ -89,8 +89,18 @@ def _validate_path(path: Any) -> str | None:
     return path
 
 
+# ★断言不得被写成"一定过"（26 号文 I-H1）★
+# 实测 `status=[200,…,500]` 能过 validate_assertions，随后接口真返回 404 也判 passed——
+# 断言闸门是北极星的第四道确定性闸，一条恒真断言等于这条需求根本没被验证，而交付报告里
+# 它显示为"已通过"。两条确定性约束（都不依赖 LLM 自觉）：
+#   ① 期待集不得含 4xx/5xx——"接口能正常工作"的验收不可能以错误码为成功；真要验错误处理
+#      （如"未授权返回 401"）请用 kind=manual 交人工，本通道只做正向可用性验证。
+#   ② 期待集长度封顶——列全 2xx 段等价于"随便返回什么都算过"。
+_STATUS_LIST_MAX = 4
+
+
 def _validate_status_list(raw: Any) -> list[int] | None:
-    """expect.status：int 或 [int...] → 归一化列表；非法码（含 bool）→ None。"""
+    """expect.status：int 或 [int...] → 归一化列表；非法码/恒真形态 → None。"""
     values = raw if isinstance(raw, list) else [raw]
     out: list[int] = []
     for v in values:
@@ -98,7 +108,11 @@ def _validate_status_list(raw: Any) -> list[int] | None:
             return None
         if not (100 <= v <= 599):
             return None
+        if v >= 400:
+            return None          # I-H1 ①：错误码绝不能作为成功期待
         out.append(v)
+    if len(set(out)) > _STATUS_LIST_MAX:
+        return None              # I-H1 ②：期待集过宽＝恒真
     return out or None
 
 
@@ -135,6 +149,35 @@ def _fold_ws(text: str) -> str:
     """空白归一（F7 grounding 比对用）：去全部空白后比 substring——排版换行/缩进
     不该让真 evidence 被误拒（requirements_extract 的 quote 回指同口径）。"""
     return "".join(ch for ch in str(text) if not ch.isspace())
+
+
+# 路径里没有判别力的段——每个 Web 项目都有，出现与否说明不了任何事。
+_GENERIC_PATH_SEGMENTS = frozenset({
+    "api", "v1", "v2", "v3", "web", "app", "rest", "service", "services",
+    "index", "home", "main", "public", "static", "admin", "system", "common",
+})
+
+
+def _path_grounded(path: str, folded_context: str) -> bool:
+    """★path 必须能回指生成语料（26 号文 I-H2）★
+
+    原 F7 只校验 evidence 回指得上，**完全不看 path**：复核实测
+    `path="/totally/made/up/endpoint"` + evidence 取语料里任意一句真话即可通过——
+    防臆造闸防的恰恰是"路径是编的"，却唯独不校验路径。
+
+    ★判据是【路径段】而不是整条路径★（否则必然误杀合法断言）：
+    Spring 的 `@RequestMapping("/api")` + `@GetMapping("/ping")` 拆分注解下，
+    `/api/ping` 这个完整字面量在 diff 里根本不存在；Django 的 urlpatterns 前缀嵌套、
+    Express 的 `app.use('/api', router)` 同理。要求整条路径出现＝把这些主流写法全判臆造。
+    故只要求：**至少一个有判别力的路径段**出现在语料里。
+    路径段全是泛词（`/api/v1`）→ 无从判别，放行（宁可漏一个也不误杀合法断言；
+    该形态本身也不像臆造，臆造的路径通常带业务词）。
+    """
+    segs = [seg for seg in str(path or "").split("/")
+            if seg and "{" not in seg and seg.lower() not in _GENERIC_PATH_SEGMENTS]
+    if not segs:
+        return True
+    return any(_fold_ws(seg) in folded_context for seg in segs)
 
 
 def validate_assertions(
@@ -266,7 +309,9 @@ def validate_assertions(
             continue
         status = _validate_status_list(expect.get("status"))
         if status is None:
-            _reject(rejected, item, "expect.status 非法：须为 100-599 的 int 列表")
+            _reject(rejected, item,
+                    f"expect.status 非法：须为 100-399 的 int 列表且不超过 {_STATUS_LIST_MAX} 个"
+                    "（4xx/5xx 不得作为成功期待；期待集过宽=恒真断言，验错误处理请用 manual）")
             continue
         body_contains = _validate_body_contains(expect.get("body_contains"))
         if body_contains is None:
@@ -294,6 +339,20 @@ def validate_assertions(
                     normalized, item,
                     "evidence 缺失或未回指生成语料（防臆造 API 路径）→ 降级 manual"
                     "（留痕，人工验证）")
+                continue
+            # ★F7 必须约束 path 本身（26 号文 I-H2）★
+            # 原判据只看 evidence 回指得上，**完全不看 path**：实测
+            # `path="/totally/made/up/endpoint"` + evidence 取 context 里任意一句真话
+            # 即可通过——防臆造闸防的恰恰是"路径是编的"，却唯独不校验路径。
+            # 判据：http_probe 的 path 必须在生成语料里出现（同一空白归一口径）。
+            # 回指不上 → 降级 manual（与 evidence 分支同处置：留痕交人工，绝不静默丢，
+            # 也绝不当成"验证通过"）。
+            if str(normalized.get("kind")) == "http_probe" and not _path_grounded(
+                    norm_request.get("path") or "", folded_context):
+                _coerce_manual(
+                    normalized, item,
+                    f"path {norm_request.get('path')!r} 的路径段均未在生成语料中出现"
+                    "（防臆造 API 路径：evidence 回指得上不等于路径没编）→ 降级 manual")
                 continue
 
         seen_ids.add(spec_id)

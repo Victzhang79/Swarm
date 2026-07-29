@@ -1459,10 +1459,45 @@ def _attach_observability_account(token_usage: dict[str, Any],
     # 一个静默丢了子任务的 DONE 不会。
     # 判据与 FAILED 路径逐字同源（totals − results − abandoned），不另造第二把尺子。
     try:
-        _tot = st.get("subtask_dispatch_totals") or {}
+        _tot = dict(st.get("subtask_dispatch_totals") or {})
+        # ★把 dispatch 异常批并进 totals 视图（复核 MEDIUM：新账必须有人消费）★
+        # C-14 上半把异常批落进了 task_audit_log(dispatch_aborted)——因为 LangGraph 会
+        # 丢弃那次 superstep 的 channel 写，state 里的 totals 表结构性看不见它们。
+        # 只写不读＝半程治本（原 commit 自陈"请据审计行人工核验"）。这里把它接上：
+        # 审计行里的 spawned id 并进视图，守恒对账才对这批不失明。
+        # 读失败/无 DB → 跳过（旁路观测绝不阻断终态）。
+        try:
+            from swarm.project import store as _abst
+            for _row in (_abst.list_task_audit(task_id=_tid, limit=50) or []):
+                if str(_row.get("event") or "") != "dispatch_aborted":
+                    continue
+                _d = _row.get("detail")
+                if isinstance(_d, str):
+                    import json as _abjson
+                    _d = _abjson.loads(_d)
+                for _sid in ((_d or {}).get("spawned") or []):
+                    _tot.setdefault(str(_sid), 1)
+        except Exception:  # noqa: BLE001 — 审计并入失败只降低覆盖面，绝不阻断
+            logger.debug("[RUNNER] dispatch_aborted 审计行并入 totals 失败（跳过）",
+                         exc_info=True)
         _sres = st.get("subtask_results") or {}
-        _abn = set(st.get("abandoned_subtask_ids") or [])
-        _lost_ids = sorted(sid for sid in _tot if sid not in _sres and sid not in _abn)
+        # ★排除集用单一事实源 partial_delivery_ids（复核 MEDIUM）★
+        # 原先只排 abandoned；而"有账的处置"在本仓的单一事实源是 gates.partial_delivery_ids
+        # （含 give_up / merge_rebase_dropped / dispatch_remaining）。多数分支下它们仍在
+        # subtask_results 里所以不误报，但那是巧合不是契约。
+        from swarm.brain.gates import partial_delivery_ids as _pdi
+        _abn = set(_pdi(st))
+        # ★只对【当前 plan 里的】子任务报蒸发（复核 MEDIUM）★
+        # subtask_dispatch_totals 是终身账、豁免剪枝且刻意收编"plan 外旧 id（重拆前父）"
+        # ——FAILED 上过报无害（本来就要人查），DONE 上过报就是噪声，而噪声会把真蒸发淹掉。
+        # 陈旧 id 单列另一个键，事实不丢。
+        _plan_ids = {str(getattr(_s, "id", "")) for _s in
+                     (getattr(st.get("plan"), "subtasks", None) or [])}
+        _cand = [sid for sid in _tot if sid not in _sres and sid not in _abn]
+        _stale_ids = sorted(sid for sid in _cand if _plan_ids and sid not in _plan_ids)
+        if _stale_ids and "dispatched_unaccounted_stale" not in token_usage:
+            token_usage["dispatched_unaccounted_stale"] = _stale_ids
+        _lost_ids = sorted(sid for sid in _cand if not _plan_ids or sid in _plan_ids)
         if _lost_ids and "dispatched_unaccounted" not in token_usage:
             token_usage["dispatched_unaccounted"] = _lost_ids
             logger.warning(

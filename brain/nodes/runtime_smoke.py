@@ -137,6 +137,14 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
 # startup_crash_unattributed —— 仍 skipped（不阻断、不冤枉代码），但 degraded 可见、
 # 消息里明说"启动确实崩了"，让交付面与复盘一眼可辨。
 _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
+    # ★必须有 generic 键（复核 HIGH，兄弟表 _ENV_MISSING/_BIND_SUCCESS 都有）★
+    # `_match_family` 在 language_key 为空时【只回 generic】；而 language_key 来自
+    # normalize_language_key(project_stack.backend)，detect_stack 失手/前端型/多栈项目即 None
+    # → 整族静默失效（实测 lang=None + "APPLICATION FAILED TO START" 仍落 inconclusive）。
+    # 跨栈字面（不含语言假设）放这里。
+    "generic": (
+        r"APPLICATION FAILED TO START",
+    ),
     "java": (
         r"APPLICATION FAILED TO START",
         r"BeanCreationException",
@@ -153,7 +161,10 @@ _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
         r"Traceback \(most recent call last\)",
     ),
     "go": (
-        r"^panic:",
+        # ★不用 `^` 锚（复核 HIGH）★：log_text 是 `tail -n 200` 的日志尾，几乎不可能以
+        # panic 起始；而 _match_family 此处 flags=0，`^` 只匹配字符串开头 → 对 go 完全没生效。
+        # 两个透镜都实测：真实多行 panic 落 inconclusive，而测试喂的单行形态恰好在 index 0。
+        r"\bpanic: ",
     ),
     "rust": (
         r"thread '.*' panicked at",
@@ -585,13 +596,21 @@ def _strip_app_log_region(out: str) -> str:
     （首标记占位、后到伪造行不覆盖），smoke 侧一直没做——**家族不对称**正是本仓
     "修一类先全仓捞 sibling"纪律要防的形态。
     这里用脚本自己的分隔标记做确定性切除：控制面标记只认日志区【之外】的。
+    ★收尾必须取【最后一个】END（对抗双复核独立实证的 CRITICAL）★
+    初版用 `partition` 取第一个 END——而日志区的内容**完全由被测应用控制**：应用打一行
+    含 `__SMOKE_LOG_TAIL_END__` 的字样（回显请求 URL/query、框架 banner、恶意注入），
+    控制面就被重新打开，其后的 `__SMOKE_PROBE__ok:200` 照样生效。两个复核透镜各自实测
+    伪造出 `passed/started`——**本修复对它自称的威胁模型不成立**，与本轮"治本自己也会
+    静默失效"的元教训同型。
+    真 END 恒是全文最后一个：应用只能写进被 `tail -n` 收割的日志文件，物理上无法在真 END
+    之后输出（脚本里 END 之后只剩 `echo MARK_DONE`）。故 `rpartition`。
     未闭合（脚本被掐断）→ 从 BEGIN 起全部视作日志区（fail-closed：宁可少认几个探活
     标记判 inconclusive，也绝不把应用回显当探活成功）。
     """
     if MARK_LOG_BEGIN not in out:
         return out
     head, _, rest = out.partition(MARK_LOG_BEGIN)
-    _, sep, tail = rest.partition(MARK_LOG_END)
+    _, sep, tail = rest.rpartition(MARK_LOG_END)
     return head + (tail if sep else "")
 
 
@@ -613,7 +632,7 @@ def parse_smoke_markers(output: str) -> dict[str, Any]:
     else:
         app_rc = int(rc_m.group(1))
     b = out.find(MARK_LOG_BEGIN)
-    e = out.find(MARK_LOG_END)
+    e = out.rfind(MARK_LOG_END)      # 同上：取最后一个，否则应用回显一行 END 就截断崩溃证据
     log_tail = out[b + len(MARK_LOG_BEGIN):e].strip("\n") if (b != -1 and e > b) else ""
     # I-M1：其余控制面标记同源——都只认日志区之外（port_busy/done 是判据，phases 是相位机
     # 状态，被应用回显伪造同样有害；log_tail 本身当然仍从原文取）。

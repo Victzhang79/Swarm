@@ -29,14 +29,31 @@ def test_merge_writes_plan_back_after_d4_injection():
     """★D4 把保留方内容就地写进 SubTask.retry_guidance，而 merge 出口没有 plan 返回键★
     跨 interrupt/resume 边界即蒸发 → 重派 worker 拿不到"基于保留方重生成"的硬约束，
     在同一钉扎 base 上重生成同形 diff → 3 轮必再撞同冲突落 D3。
-    handle_failure 早有这条咽喉（B-6：result 无 plan 且 state 有 plan 即回传），merge 一直缺。"""
+    handle_failure 早有这条咽喉（B-6：result 无 plan 且 state 有 plan 即回传），merge 一直缺。
+
+    ★行为级（对抗复核突变实验证伪了初版的 getsource 写法：把 `if plan is not None`
+    改成 `is None` 让整条治本作废，9 条测试照绿）★"""
     from swarm.brain import nodes
-    src = inspect.getsource(nodes.merge)
-    i_d4 = src.index("_st.retry_guidance = (")
-    i_wb = src.index('out["plan"] = plan')
-    assert i_d4 < i_wb, "回写必须在 D4 注入之后"
-    # 且在 rebase 分支内（clean 路径不该无谓回写）
-    assert 'out["dispatch_remaining"] = dispatch_remaining' in src[:i_wb]
+    from swarm.types import Confidence, FileScope, SubTask, TaskPlan, WorkerOutput
+
+    _NEW = ("diff --git a/S.java b/S.java\nnew file mode 100644\n--- /dev/null\n"
+            "+++ b/S.java\n@@ -0,0 +1,{n} @@\n{body}")
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="a", scope=FileScope(writable=["S.java"])),
+        SubTask(id="st-2", description="b", scope=FileScope(writable=["S.java"])),
+    ])
+    results = {
+        "st-1": WorkerOutput(subtask_id="st-1", summary="s", l1_passed=True, confidence=Confidence.HIGH,
+                             diff=_NEW.format(n=1, body="+class S {}\n")),
+        "st-2": WorkerOutput(subtask_id="st-2", summary="s", l1_passed=True, confidence=Confidence.HIGH,
+                             diff=_NEW.format(n=2, body="+class S {\n+  void b() {}\n")),
+    }
+    out = nodes.merge({"plan": plan, "subtask_results": results,
+                       "dispatch_remaining": [], "project_id": ""})
+    if not out.get("rebase_subtask_ids"):
+        pytest.skip("本次未走 rebase 分支（D4 注入不发生）")
+    assert "plan" in out, "走了 rebase 分支就必须回写 plan——否则 retry_guidance 跨 resume 蒸发"
+    assert out["plan"] is plan, "必须回写【原对象】（T4 pin 对象身份坑的本体）"
 
 
 # ══════════════════════════════════════════════
