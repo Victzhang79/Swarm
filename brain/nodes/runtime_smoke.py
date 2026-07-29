@@ -574,14 +574,37 @@ echo "{MARK_DONE}"
 exit 0"""
 
 
+def _strip_app_log_region(out: str) -> str:
+    """剔掉 stdout 里的【被测应用日志】区段（MARK_LOG_BEGIN…MARK_LOG_END 之间）。
+
+    ★回显注入面（26 号文 I-M1）★
+    探活序列原先在【全量 stdout】上 findall——而脚本尾部会把应用自己的日志 tail 进来。
+    应用只要打印一行字面 `__SMOKE_PROBE__ok`（日志里回显请求 URL、框架 banner、
+    甚至恶意注入），就被计入探活序列 → 直接判 passed。
+    兄弟机制 `acceptance_spec.parse_probe_output` 早已为同一注入面做了 F9 加固
+    （首标记占位、后到伪造行不覆盖），smoke 侧一直没做——**家族不对称**正是本仓
+    "修一类先全仓捞 sibling"纪律要防的形态。
+    这里用脚本自己的分隔标记做确定性切除：控制面标记只认日志区【之外】的。
+    未闭合（脚本被掐断）→ 从 BEGIN 起全部视作日志区（fail-closed：宁可少认几个探活
+    标记判 inconclusive，也绝不把应用回显当探活成功）。
+    """
+    if MARK_LOG_BEGIN not in out:
+        return out
+    head, _, rest = out.partition(MARK_LOG_BEGIN)
+    _, sep, tail = rest.partition(MARK_LOG_END)
+    return head + (tail if sep else "")
+
+
 def parse_smoke_markers(output: str) -> dict[str, Any]:
     """从沙箱 stdout+stderr 解析结构化标记（纯函数）。"""
     out = output or ""
+    # I-M1：控制面标记只在【应用日志区之外】解析，防被测应用回显伪造探活成功
+    ctrl = _strip_app_log_region(out)
     # `ok:200` 形态需带冒号——`\w+` 会把状态码切掉，令 C-5 的 HTTP 校验静默退化回端口闸
-    probe_sequence = re.findall(rf"{MARK_PROBE}([\w:]+)", out)
-    tool_m = re.search(rf"{MARK_PROBE_TOOL}(\w+)", out)
+    probe_sequence = re.findall(rf"{MARK_PROBE}([\w:]+)", ctrl)
+    tool_m = re.search(rf"{MARK_PROBE_TOOL}(\w+)", ctrl)
     probe_tool = tool_m.group(1) if tool_m else None
-    rc_m = re.search(rf"{MARK_APP_RC}(alive|-?\d+)", out)
+    rc_m = re.search(rf"{MARK_APP_RC}(alive|-?\d+)", ctrl)
     app_rc: str | int | None
     if rc_m is None:
         app_rc = None
@@ -592,17 +615,19 @@ def parse_smoke_markers(output: str) -> dict[str, Any]:
     b = out.find(MARK_LOG_BEGIN)
     e = out.find(MARK_LOG_END)
     log_tail = out[b + len(MARK_LOG_BEGIN):e].strip("\n") if (b != -1 and e > b) else ""
-    prep_m = re.search(rf"{MARK_PREPARE_RC}(-?\d+)", out)
+    # I-M1：其余控制面标记同源——都只认日志区之外（port_busy/done 是判据，phases 是相位机
+    # 状态，被应用回显伪造同样有害；log_tail 本身当然仍从原文取）。
+    prep_m = re.search(rf"{MARK_PREPARE_RC}(-?\d+)", ctrl)
     return {
         "probe_sequence": probe_sequence,
         "probe_tool": probe_tool,
-        "probe_tool_missing": (MARK_PROBE_TOOL_MISSING in out) or (probe_tool == "MISSING"),
+        "probe_tool_missing": (MARK_PROBE_TOOL_MISSING in ctrl) or (probe_tool == "MISSING"),
         "app_rc": app_rc,
         "prepare_rc": int(prep_m.group(1)) if prep_m else None,   # F1
-        "port_busy": MARK_PORT_BUSY in out,                        # F4
+        "port_busy": MARK_PORT_BUSY in ctrl,                       # F4
         "log_tail": log_tail,
-        "phases": re.findall(rf"{MARK_PHASE}(\w+)", out),
-        "done": MARK_DONE in out,
+        "phases": re.findall(rf"{MARK_PHASE}(\w+)", ctrl),
+        "done": MARK_DONE in ctrl,
     }
 
 

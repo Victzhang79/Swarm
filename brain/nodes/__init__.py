@@ -5239,6 +5239,15 @@ def merge(state: BrainState) -> dict:
                 logger.warning("[MERGE] D4 retry_guidance 注入失败（sid=%s）：%s", sid, _d4_e)
         out["subtask_results"] = remaining_results
         out["dispatch_remaining"] = dispatch_remaining
+        # ★T4 pin 对象身份坑第三例（26 号文 H-C1）★
+        # D4 把保留方内容【就地】写进 SubTask.retry_guidance，而 merge 出口**没有 plan
+        # 返回键**——LangGraph 只保证【返回键】进 state，checkpoint 在节点入口序列化，
+        # 就地变异跨 interrupt/resume 边界即蒸发。于是重派 worker 拿不到"基于保留方重生成"
+        # 的硬约束，在同一钉扎 base 上重生成同形 diff → 3 轮必再撞同冲突落 D3。
+        # handle_failure 早有这条咽喉（本文件 B-6：result 无 plan 且 state 有 plan 即回传），
+        # merge 一直缺。此处显式回写同一对象。
+        if plan is not None:
+            out["plan"] = plan
 
     return out
 

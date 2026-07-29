@@ -2992,6 +2992,7 @@ async def elaborate(state: BrainState) -> dict:
     # → 空写 scope 死任务漏到 dispatch（round62 empty-diff churn 仍可达那条路）。此处 demote 之后
     # 重剪，幂等、栈中立、绝不剪空计划（守卫见 prune_empty_scope_subtasks）。
     _repruned = prune_empty_scope_subtasks(plan_obj)
+    _plan_mutated = bool(_repruned)      # ★H-H3：本 pass 起，所有就地改 plan 的 pass 都要计入回写旗
     if _repruned:
         logger.info("[ELABORATE] G3: demote 后重剪 %d 个空写 scope 死子任务（防漏到 dispatch）: %s",
                     len(_repruned), _repruned)
@@ -2999,6 +3000,7 @@ async def elaborate(state: BrainState) -> dict:
     # ── 意图校正(task dbfc265f)：LLM 把功能需求误判 AUDIT 但 scope 有写文件 → 纠正为
     # MODIFY/CREATE，避免走 security_audit 不产 diff → findings=0 假失败 → retry 死循环。
     if correct_misclassified_intent(plan_obj):
+        _plan_mutated = True
         logger.info("[ELABORATE] 意图校正：AUDIT 子任务含写文件 → 纠正为 MODIFY/CREATE（确定性信号覆盖 LLM 误判）")
 
     # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
@@ -3010,6 +3012,7 @@ async def elaborate(state: BrainState) -> dict:
     # 注入子任务 context_snippets，随 worker prompt 下发 → worker 不必 cat 探索耗尽步数。
     try:
         snippets_injected = enrich_context_snippets(plan_obj, _proj_path)
+        _plan_mutated = _plan_mutated or bool(snippets_injected)
         if snippets_injected:
             logger.info("[ELABORATE] 方案A: 已为子任务预注入 scope 文件代码片段（worker 免 cat 探索）")
     except Exception as exc:  # noqa: BLE001
@@ -3019,6 +3022,7 @@ async def elaborate(state: BrainState) -> dict:
     # 消除本地小模型对第三方库(如 okhttp3.OkHttpClient)类名/方法名的幻觉退化死循环（round18 st-16）。
     try:
         if inject_api_knowledge(plan_obj):
+            _plan_mutated = True
             logger.info("[ELABORATE] D4(b): 已按声明依赖注入外部库正确 API 签名（消库名幻觉）")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ELABORATE] 外部库 API 知识注入失败（非致命）: %s", exc)
@@ -3152,8 +3156,16 @@ async def elaborate(state: BrainState) -> dict:
         # 证伪信号（degraded_reasons 是 append+dedup reducer，故条件发射无粘滞面）。
         **({"degraded_reasons": ["t4_wire_failed"]} if _t4_wire_failed else {}),
     }
+    # ★T4 pin 对象身份坑第四例（26 号文 H-H3）★
+    # 原条件漏了四个【同样就地改 plan】的 pass：G3 空 scope 重剪（直接改 plan.subtasks！）、
+    # 意图校正、context_snippets 注入、API 知识注入。LangGraph 只保证【返回键】进 state，
+    # checkpoint 在节点入口序列化——漏回写时这些变异跨 checkpoint 恢复即回退。
+    # 其中 G3 最要命：剪掉的空写 scope 死子任务会**复活漏到 dispatch**，正是它想根治的
+    # round62 empty-diff churn 原样复发。
+    # 纪律：本节点此后新增任何就地改 plan 的 pass，都必须把结果并进 _plan_mutated
+    # （测试 test_a_batch_plan_writeback 守着这条）。
     if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or java_enriched
-            or dangling_fixed or _t4_pinned or _t4_wired or _prov_added):
+            or dangling_fixed or _t4_pinned or _t4_wired or _prov_added or _plan_mutated):
         # 拆分 / 剥离假依赖 / 冲突解决(合并·依赖序·归一·难度) / Java 同包入域 / 悬空依赖兜底 /
         # T4 钉落点·布线 / G2 补边 改变了 plan，回写。（T4 之前 G2 加的依赖边靠 plan_obj
         # 就地变异侥幸存活——LangGraph 只保证【返回键】进 state，checkpoint 恢复语义下
