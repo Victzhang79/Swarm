@@ -911,7 +911,11 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
     ("OpenAI API key", re.compile(r"(?<![A-Za-z0-9])sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), Severity.CRITICAL),  # D6：左边界——disk-/task- 后随长 id/hash 不再内嵌命中
     # AWS 长期(AKIA)+临时(ASIA)凭证 ID
     ("AWS Access Key ID", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"), Severity.CRITICAL),
-    ("AWS Secret Access Key", re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{40}"), Severity.CRITICAL),
+    # S-6b：容忍可选引号——原 `[=:]\s*[A-Za-z0-9/+=]{40}` 撞上引号即失配，回落到
+    # HIGH 档的 Generic 规则（默认 block_severity=critical 下**不阻断**），于是"加个引号"
+    # 就成了绕过 CRITICAL 闸的手段。而 YAML/JSON/Java 里带引号才是主流写法。
+    ("AWS Secret Access Key", re.compile(
+        r"""(?i)aws_secret_access_key\s*[=:]\s*['"]?[A-Za-z0-9/+=]{40}"""), Severity.CRITICAL),
     ("GitHub PAT", re.compile(r"ghp_[a-zA-Z0-9]{36}"), Severity.CRITICAL),
     # GitHub fine-grained PAT + oauth/server/user-to-server/refresh token
     ("GitHub fine-grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{22,}"), Severity.CRITICAL),
@@ -951,6 +955,39 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
     ("Generic Secret Assignment", re.compile(
         r"""(?i)(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)\s*[=:]\s*['"][^'"]{8,}['"]"""
     ), Severity.HIGH),
+    # ── 26 号文 S-6 召回补齐（本表是 MERGE 交付 diff / AUDIT 项目扫描 / 经验技能导入准入
+    #    【三闸的唯一共享事实源】，实测下列形态召回率为 0）──
+    # 1) 现代 provider key：原 `sk-[a-zA-Z0-9]{20,}` 在第一个连字符处断裂，
+    #    2024 起 OpenAI 默认发的就是 `sk-proj-…`，Anthropic/OpenRouter 同带连字符。
+    ("OpenAI project key", re.compile(
+        r"(?<![A-Za-z0-9])sk-proj-[A-Za-z0-9_-]{20,}"), Severity.CRITICAL),
+    ("Anthropic API key", re.compile(
+        r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9-]{2,}-[A-Za-z0-9_-]{20,}"), Severity.CRITICAL),
+    ("OpenRouter API key", re.compile(
+        r"(?<![A-Za-z0-9])sk-or-v1-[A-Za-z0-9]{32,}"), Severity.CRITICAL),
+    ("Groq API key", re.compile(r"(?<![A-Za-z0-9])gsk_[A-Za-z0-9]{40,}"), Severity.CRITICAL),
+    ("HuggingFace token", re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"), Severity.CRITICAL),
+    ("xAI API key", re.compile(r"(?<![A-Za-z0-9])xai-[A-Za-z0-9]{40,}"), Severity.CRITICAL),
+    # 2) 加密私钥头：原表只有未加密的 PEM 头
+    ("Encrypted private key", re.compile(
+        r"-----BEGIN (?:ENCRYPTED|RSA ENCRYPTED) PRIVATE KEY-----"), Severity.CRITICAL),
+    # 3) ★无引号 kv 形态★：Java/Spring（本仓 E2E 基线 RuoYi 的栈）最常见的凭据写法，
+    #    而 Generic Secret Assignment 强制要求引号 → properties/YAML/env/export 全漏。
+    #    值排除 `${...}`/`{{...}}` 占位与纯注释（D5 同款抑制），长度≥6 防误报常量名。
+    ("Unquoted secret assignment", re.compile(
+        # 前导不用 \b：`DB_PASSWORD`/`MY_SECRET` 里下划线是单词字符，\b 不成立会整类漏掉
+        r"""(?im)^[^\n#]*(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b"""
+        # 值必须"像密钥"而不像代码：排除函数调用/传参（含 ()、,）与纯小写标识符
+        # （`password=password,`、`api_key = resolve_credential(` 这类正常赋值实测占误报
+        # 全部——全仓 18 个非 test 命中无一是真泄露），并要求至少含一个数字/大写/符号。
+        r"""\s*[=:]\s*(?!['"]|\$\{|\{\{|<|\s*$)"""
+        # 断言只在【值本身的字符集】内扫，不跨括号/逗号——否则 `api_key = f(\"CFG_NAME\")`
+        # 里后面的大写会让断言成立（实测这是残留误报的全部来源）。
+        r"""(?=[^\s'"#(),]{6,})[^\s'"#(),]*[0-9!@#$%^&*+/][^\s'"#(),]*"""
+    ), Severity.HIGH),
+    # 4) jdbc/query-param 口令：DB 连接串的主流写法，原表只认 `scheme://user:pass@host`
+    ("DB URL password param", re.compile(
+        r"""(?i)[?&](?:password|pwd)=(?!\$\{|\{\{)[^&\s'"]{6,}"""), Severity.CRITICAL),
 ]
 
 

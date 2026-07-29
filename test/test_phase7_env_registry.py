@@ -27,7 +27,7 @@ _ENV_RE = re.compile(r"SWARM_[A-Z0-9_]+")
 _ENV_FALSE_POSITIVE = re.compile(r"_$")
 
 
-def _scan_code_envs() -> set[str]:
+def _scan_code_envs(*, skip_comments: bool = False) -> set[str]:
     found: set[str] = set()
     files = [p for d in _SCAN_DIRS for p in (_ROOT / d).rglob("*.py")]
     # ★根级模块整体纳入（复核 MEDIUM-8）★：原先逐个补根级文件（types.py/audit.py），
@@ -44,13 +44,21 @@ def _scan_code_envs() -> set[str]:
             text = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        found.update(m for m in _ENV_RE.findall(text)
+        # ★两个方向的过滤【刻意不对称】★（本轮实证）：
+        #   正向"有没有新开关没登记" → 注释里举例写的 `SWARM_X` 不是新开关，跳过注释；
+        #     （本轮连踩两次：docstring 表格示例、行内注释示例）
+        #   反向"登记的还在不在"     → 注释里提到就说明它还在（13 个既有条目的字面量本就
+        #     只出现在注释里），跳过注释会把它们全误判成死条目。
+        # 初版把两侧做成对称的，反向检查当场误报——对称是直觉，语义才是判据。
+        code = ("\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+                if skip_comments else text)
+        found.update(m for m in _ENV_RE.findall(code)
                      if not _ENV_FALSE_POSITIVE.search(m))
     return found
 
 
 def test_f3_every_code_env_is_registered():
-    missing = sorted(_scan_code_envs() - set(REGISTERED_ENVS))
+    missing = sorted(_scan_code_envs(skip_comments=True) - set(REGISTERED_ENVS))
     assert not missing, (
         f"新增 SWARM_* 开关未登记进 config/env_registry.py：{missing}——"
         "未登记开关=从未整体验证的配置组合的又一来源；登记一行（值=file:line）即可")

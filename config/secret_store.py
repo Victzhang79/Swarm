@@ -213,6 +213,14 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
                     "（同 key 后续降 DEBUG）: %s",
                     key_name, dec_exc,
                 )
+            # ★负结果也必须进缓存★：只有成功路径写缓存 → 解不开的密文（key 轮换/损坏）
+            # 会让【每一次】get_secret 都重新连 PG + 重试解密 + 失败。实测：get_config()
+            # 内 _resolve_api_key 按 provider 数调用，一个测试里 71 次 get_config
+            # = 213 次 PG 往返，dispatch 节点耗时从 ~0.08s 涨到 0.6s（生产同受影响）。
+            # 缓存 None 与"真 miss"同语义（调用方都回退 .env），TTL 到期自然重试，
+            # 故修好密文后最长 30s 生效——可接受。
+            with _cache_lock:
+                _cache[key_name] = (None, now)
             return None
     except Exception as exc:  # noqa: BLE001
         # DR-07-F5(#97)：DB 连接/查询失败 → warn-once（比照 decrypt 分支）。纯 DB 部署（.env 无明文）
@@ -225,6 +233,10 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
             logger.warning(
                 "secret_store DB 不可用，secret %s 回退 .env/None（可能导致下游 401/连接错误；"
                 "同 key 后续降 DEBUG）: %s", key_name, exc)
+        # 同上：DB 不可用时也缓存负结果，避免每次调用都撞一次连接超时
+        # （PG 黑洞场景下这会把 get_config 拖成秒级）。
+        with _cache_lock:
+            _cache[key_name] = (None, now)
         return None
 
     with _cache_lock:

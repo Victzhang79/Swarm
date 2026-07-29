@@ -8,6 +8,7 @@ app 级符号(_PROJECT_ROOT/configure_langsmith/reload_config/get_config/logger)
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
 import re
 from typing import Any
@@ -69,8 +70,57 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) 
             _app.logger.warning(
                 "config:update 非 admin(%s) 尝试改写出站端点键 %s → 已拒绝（仅 admin 可改）", who, k)
             continue
+        # ★值层 backstop（26 号文 S-1/S-2 治本）★
+        # 原闸是【键名】分类器，而权威真相源把端点藏在【值】里：
+        #   - `SWARM_MODEL_PROVIDERS` 是 JSON，每个 provider 的 base_url 由请求体控制，
+        #     键名不匹配任何 `*_URL/_URI/_ENDPOINT/_PROXY_BASE` 后缀 → 直接落盘；
+        #     而 settings 的 `_effective_providers` 以该 JSON 为准（providers 非空即用它），
+        #     `_resolve_api_key` 还会把 secret_store 解密的真 key 挂到攻击者 base_url 上。
+        #   - `SWARM_NOTIFY_CHANNELS` 同型（代码注释原本自陈"闸对其 no-op"却没意识到是绕过）。
+        # 实测：非 admin owner（持 config:write）提交时扁平键被拒、JSON 键放行——扁平键被拒
+        # 反而制造了"闸生效了"的假象。故按【值里的出站 URL 集合】比对：只要新旧不同就整键
+        # 剔除（fail-closed）。非 URL 字段的改动一并被拒是刻意的代价——精细到字段级回退
+        # 易错，而这条路径的后果是全部 provider 凭据 + 每一次 prompt 发往攻击者 host。
+        _new_urls = _outbound_urls_in_value(v)
+        if _new_urls and _new_urls != _outbound_urls_in_value(os.environ.get(k, "")):
+            _app.logger.warning(
+                "config:update 非 admin(%s) 尝试经【值】改写出站端点（键 %s 内含 URL 变更）"
+                " → 已整键拒绝（仅 admin 可改）", who, k)
+            continue
         out[k] = v
     return out
+
+
+def _outbound_urls_in_value(value: str) -> set[str]:
+    """抽出配置值里的全部出站 URL——裸 URL 值 或 JSON 内任意层级的 URL 字段。
+
+    只看"有没有 `://`"而不认字段名：`base_url`/`webhook_url`/`endpoint`/未来新增字段
+    一视同仁，避免又变成一张要逐个补的名单（键名闸就是这么漏的）。
+    """
+    s = (value or "").strip()
+    if not s or "://" not in s:
+        return set()
+    if not s.startswith(("[", "{")):
+        return {s}                       # 裸 URL 值
+    try:
+        data = _json.loads(s)
+    except Exception:  # noqa: BLE001 — 畸形 JSON 但含 ://：整体当一个端点面，fail-closed
+        return {s}
+
+    found: set[str] = set()
+
+    def _walk(node) -> None:
+        if isinstance(node, dict):
+            for _v in node.values():
+                _walk(_v)
+        elif isinstance(node, list):
+            for _it in node:
+                _walk(_it)
+        elif isinstance(node, str) and "://" in node:
+            found.add(node)
+
+    _walk(data)
+    return found
 
 
 def _is_local_or_private_host(url: str) -> bool:
