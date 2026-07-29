@@ -194,3 +194,73 @@ def test_module_level_prompts_no_longer_use_bare_slices():
     assert "task_description=task_desc[:2500]" not in src
     assert "task_description=task_desc[:1500]" not in src
     assert src.count('_clip(task_desc') >= 3
+
+
+# ══════════════════════════════════════════════
+# G-H6：多构建清单冲突无裁决——"首个 walk 命中即定栈"
+# ══════════════════════════════════════════════
+
+def _mk_project(manifests, sources):
+    import pathlib
+    import tempfile
+    t = tempfile.mkdtemp()
+    for name, content in manifests:
+        pathlib.Path(t, name).write_text(content)
+    for rel in sources:
+        p = pathlib.Path(t, rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    return t
+
+
+_POM = ("pom.xml", "<project/>")
+_GOMOD = ("go.mod", "module x")
+_PKG = ("package.json", "{}")
+
+
+def test_multi_manifest_no_longer_picks_by_walk_order():
+    """★实测 pom + go.mod + package.json 并存 → `backend='go' confidence=0.75
+    needs_adj=False` 的【高置信错答案】（26 号文 G-H6）★
+    后果链已 grep 实证：给 Java 工程下发 `go build ./...`。
+    walk 序取决于文件系统枚举顺序——等于用随机数定栈。"""
+    p = _mk_project([_POM, _GOMOD, _PKG],
+                    [f"src/main/java/{n}.java" for n in "ABC"])
+    r = detect_stack_deterministic(p)
+    assert r["backend"].lower().startswith(("java", "spring")) or "java" in r["backend"].lower()
+    assert r["build"] == "maven"
+
+
+def test_real_go_project_still_detected():
+    """闸不能矫枉过正：真 Go 工程（有 .go 源文件）照常判 go。"""
+    r = detect_stack_deterministic(_mk_project([_GOMOD, _PKG], ["a.go", "b.go"]))
+    assert r["backend"].lower().startswith("go") and r["build"] == "go"
+
+
+def test_tie_yields_low_confidence_and_adjudication():
+    """★分不出胜负时绝不硬选★——那正是"高置信错答案"的来源。
+    降置信 + needs_model_adjudication，让模型据证据裁而不是让 walk 序裁。"""
+    r = detect_stack_deterministic(_mk_project([_POM, _GOMOD], []))
+    assert r["confidence"] <= 0.4
+    assert r["needs_model_adjudication"] is True
+    assert any("多个构建清单" in e for e in r["evidence"]), "冲突必须写进证据面"
+
+
+def test_single_manifest_path_is_unchanged():
+    """单一清单（绝大多数项目）逐字节零变化。"""
+    r = detect_stack_deterministic(_mk_project([_POM], ["src/main/java/A.java"]))
+    assert r["build"] == "maven" and r["needs_model_adjudication"] is False
+
+
+def test_same_language_multiple_manifests_is_not_a_conflict():
+    """pom + build.gradle 是【构建工具】之争不是【栈】之争——不该触发歧义裁决。"""
+    r = detect_stack_deterministic(_mk_project(
+        [_POM, ("build.gradle", "")], ["src/main/java/A.java"]))
+    assert r["needs_model_adjudication"] is False
+
+
+def test_lang_source_ext_table_covers_every_manifest_language():
+    """★两张表必须同步（新增语言时一起加）★
+    裁决依赖 `_LANG_SOURCE_EXTS`，漏一个语言 = 该语言在冲突里恒得 0 分、必然输掉。"""
+    from swarm.brain.stack_detect import _LANG_SOURCE_EXTS, _MANIFEST_BACKEND
+    missing = {lang for lang, _b in _MANIFEST_BACKEND.values()} - set(_LANG_SOURCE_EXTS)
+    assert not missing, f"_LANG_SOURCE_EXTS 漏登记语言：{missing}（它们在多清单冲突里恒输）"

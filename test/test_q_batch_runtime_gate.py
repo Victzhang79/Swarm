@@ -313,3 +313,35 @@ def test_planning_time_summary_has_no_dead_field():
     out = _confirm_coverage_summary({
         "plan": plan, "requirement_items": [{"id": "req-1", "text": "甲"}]})
     assert "covered_by_unfulfilled_only" not in out
+
+
+# ══════════════════════════════════════════════
+# 登记册纠错：#30「配置对象反复构造」前提被证伪
+# ══════════════════════════════════════════════
+
+def test_get_config_is_a_real_singleton():
+    """★#30 登记的前提"pydantic BaseSettings 每次重读 .env"是**错的**★
+    实测：`get_config` 早已是正确单例，预热后 200 次调用合计 0.01ms（稳态 ~0μs）；
+    首次 ~50ms 全是**一次性构造**。当初把 50ms/200 平均成"每次 0.25ms"是测量方法错误
+    （没预热），由此推出的"反复重读 .env"结论不成立。
+
+    真正的开销是 `config.secret_store.get_secret` 不缓存负结果 → 每次 get_config()
+    里的 `_resolve_api_key` 按 provider 数打 PG（实测 71 次 get_config = 213 次往返，
+    dispatch 0.08s→0.6s）。那条已在 P0 安全批修掉（decrypt 失败 + 真 miss 双分支），
+    症状用例现为 0.14s（阈值 0.25s）。
+    本条守住"单例没被改回每次构造"这个事实——它是那条性能结论的前提。"""
+    import time
+
+    from swarm.config.settings import get_config
+    get_config()                       # 预热：把一次性构造排除在测量之外
+    t = time.perf_counter()
+    for _ in range(200):
+        get_config()
+    per_call_us = (time.perf_counter() - t) / 200 * 1_000_000
+    assert per_call_us < 20, f"get_config 稳态单次 {per_call_us:.1f}μs——单例被改坏了？"
+
+
+def test_get_config_returns_the_same_object():
+    """单例的行为面断言（比计时更稳）：同一进程内恒是同一对象。"""
+    from swarm.config.settings import get_config
+    assert get_config() is get_config()

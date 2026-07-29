@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 # ── 信号表（框架无关的探测，但内置常见框架 marker 以提高判定精度）──
 
 # 构建/依赖清单文件 → 后端语言+构建工具
+# 语言 → 源文件扩展名（多清单裁决用：清单能并存，源文件分布不会说谎）。
+# 与 _MANIFEST_BACKEND 的 value[0] 同名域，新增语言时两处一起加。
+_LANG_SOURCE_EXTS: dict[str, tuple[str, ...]] = {
+    "java": (".java",),
+    "kotlin": (".kt", ".kts"),
+    "scala": (".scala",),
+    "python": (".py",),
+    "go": (".go",),
+    "rust": (".rs",),
+    "csharp": (".cs",),
+    "php": (".php",),
+    "ruby": (".rb",),
+    "javascript/typescript": (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"),
+    "elixir": (".ex", ".exs"),
+    "dart": (".dart",),
+}
+
 _MANIFEST_BACKEND = {
     "pom.xml": ("java", "maven"),
     "build.gradle": ("java", "gradle"),
@@ -560,15 +577,46 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     # ── 后端语言/构建/框架 ──
     backend_lang = ""
     build_tool = ""
+    multi_manifest_ambiguous = False
     backend_fw = ""
+    # ★多构建清单冲突必须裁决，不能"首个 walk 命中即定栈"（26 号文 G-H6）★
+    # 实测 pom.xml + go.mod + package.json 并存 → `backend='go' confidence=0.75
+    # needs_adj=False` 的**高置信错答案**，后果链已实证：给 Java 工程下发 `go build ./...`。
+    # walk 序取决于文件系统枚举顺序，等于用随机数定栈。
+    # 裁决判据（确定性、栈中立）：以【该栈源文件数】为准——清单能并存（多语言仓、
+    # 工具链残留），源文件分布不会说谎。分不出胜负（并列/无源文件）→ 不硬选，
+    # 交 needs_model_adjudication 让模型据证据裁，并把冲突写进 evidence。
+    _cands: list[tuple[str, str, str]] = []      # (lang, build, 清单名)
     for mf in manifests:
         base = os.path.basename(mf)
         if base in _MANIFEST_BACKEND:
-            backend_lang, build_tool = _MANIFEST_BACKEND[base]
-            break
-        if base.endswith(".csproj"):
-            backend_lang, build_tool = "csharp", "dotnet"
-            break
+            _l, _b = _MANIFEST_BACKEND[base]
+            _cands.append((_l, _b, base))
+        elif base.endswith(".csproj"):
+            _cands.append(("csharp", "dotnet", base))
+    # 同语言多清单（pom + build.gradle）去重保序：只是构建工具之争，不是栈之争
+    _by_lang: dict[str, tuple[str, str, str]] = {}
+    for _c in _cands:
+        _by_lang.setdefault(_c[0], _c)
+    if len(_by_lang) == 1:
+        backend_lang, build_tool, _ = next(iter(_by_lang.values()))
+    elif len(_by_lang) > 1:
+        _scored = sorted(
+            ((sum(ext_counts.get(e, 0) for e in _LANG_SOURCE_EXTS.get(_l, ())), _l, _c)
+             for _l, _c in _by_lang.items()),
+            key=lambda x: (-x[0], x[1]))
+        _top, _second = _scored[0], _scored[1]
+        evidence.append(
+            "⚠️ 检出多个构建清单（%s）——按各栈源文件数裁决：%s" % (
+                ", ".join(c[2] for c in _by_lang.values()),
+                "; ".join(f"{l}={n}" for n, l, _c in _scored)))
+        if _top[0] > _second[0]:
+            backend_lang, build_tool, _ = _top[2]
+        else:
+            # 并列/双方都没有源文件 → 绝不硬选（那正是"高置信错答案"的来源）
+            multi_manifest_ambiguous = True
+            evidence.append(
+                "多清单且源文件数无法分出主栈 → 不确定性定栈，交模型据证据裁决")
     if not backend_lang and "package.json" in manifest_texts:
         backend_lang, build_tool = "javascript/typescript", "npm"
     all_manifest_text = " ".join(manifest_texts.values())
@@ -668,7 +716,11 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     if frontend_kind == "none" and not manifests:
         confidence -= 0.3  # 啥都没扫到
     confidence = max(0.0, min(1.0, confidence))
-    needs_adj = confidence < 0.65 or (has_spa and has_server_tmpl)
+    # G-H6：多清单无法分出主栈 → 必须降置信 + 交模型裁决，绝不给"高置信错答案"
+    if multi_manifest_ambiguous:
+        confidence = min(confidence, 0.4)
+    needs_adj = (confidence < 0.65 or (has_spa and has_server_tmpl)
+                 or multi_manifest_ambiguous)
 
     # ── JVM 系专属事实：jakarta/javax 命名空间 + Boot/Java 版本（worker 写对 import 的硬前提）──
     infra_symbols, infra_symbol_methods = _detect_infra_symbols(infra_class_paths)
