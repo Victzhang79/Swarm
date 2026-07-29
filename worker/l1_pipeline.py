@@ -3820,6 +3820,71 @@ _UPSTREAM_GOAL_RE = re.compile(
     r"\b(compile|test-compile|test|package|verify|install|deploy)\b")
 
 
+# ★Maven 命令的【唯一】词元判据与改写口径（X-C1 治本）★
+# 病灶：`_scope_maven_command` 用裸子串 `"mvn" in command` 判、用 `str.replace("mvn", …)` 改，
+# 无词边界。实测被改烂的形态（每一条都会让命令不存在或参数畸形 → exit 127 →
+# `_is_infra_failure` 判 True → BLOCKED **无限退避重试、每轮同死、零诊断线索** → 烧穿预算连坐）：
+#     ./mvnw -q compile        → ./mvn -pl m -amw -q compile     ← 命令不存在 + 垃圾参数
+#     sh mvnw verify           → sh mvn -pl m -amw verify
+#     npm run build:mvn        → npm run build:mvn -pl m -am     ← 与 Maven 毫无关系
+#     docker run mvn-builder…  → docker run mvn -pl m -am-builder…
+# `./mvnw` 是 Spring Boot 生态默认形态；RuoYi 基线恰好不用 wrapper，所以这条从未暴露。
+# ★不对称铁证★：兄弟函数 `_reactorize_verify_command` 早已显式挡掉 mvnw，其注释更是明写
+# "_scope 的裸 .replace 会破坏语法（放大既有缺陷）"——**知道病灶在哪，却只在自己这半边绕开**。
+# 治法不是再加一处守卫，是把判据与改写收敛成本模块两个函数，三个调用面共用（DRY + 单一事实源）。
+# 前后排除面都必须含 `:`（还有前置的 `=`）：`npm run build:mvn` 的 mvn 前是冒号、
+# `yarn mvn:check` 后是冒号、`TOOL=mvn` 是赋值右值——**都不是"要执行 mvn"**。
+# 实证过程本身就是教训：初版只排 `\w./-` → `build:mvn` 漏；补前置 `:` → `mvn:check` 漏；
+# 补后置 `:` → `mvn.cmd` 漏。脚本名/任务名/扩展名里嵌工具名是极常见形态，判据必须两侧对称。
+# 前置刻意**不排** `/` 与 `.`：`/usr/bin/mvn` 是合法调用（替换只动 mvn 词元，路径前缀保留），
+# 而 `./mvnw` 由 `_MVNW_RE` 专门挡——挡 wrapper 不该靠"顺带把带路径的 mvn 也挡了"。
+_MVN_TOKEN_RE = re.compile(r"(?<![\w:=-])mvn(?![\w.:-])")
+_MVNW_RE = re.compile(r"(?<![\w.])\.?/?mvnw(?![\w-])")
+
+
+def is_plain_mvn_command(command: str) -> bool:
+    """该命令是否为【可安全改写】的裸 mvn 调用。
+
+    三条排除，任一成立即不可改写（原样返回比改烂强得多——改烂是 127 空转，
+    不改只是少一层模块收窄）：
+      · Maven wrapper（`mvnw` / `./mvnw` / `sh mvnw`）——它不是 `mvn`，替换必毁；
+      · 出现多次 mvn 词元（复合命令）——`count=1` 的替换会改错那一个；
+      · 根本没有 mvn 词元（`npm run build:mvn` 这类只是字符串里带 mvn）。
+    """
+    cmd = command or ""
+    if _MVNW_RE.search(cmd):
+        return False
+    return len(_MVN_TOKEN_RE.findall(cmd)) == 1
+
+
+def is_maven_family_command(command: str) -> bool:
+    """该命令是不是 **Maven 系构建**（`mvn` 或 `./mvnw` 皆算）。
+
+    ★与 `is_plain_mvn_command` 是【两档】判据，绝不可互相顶替（对抗复核 HIGH，血泪同族
+      "复用单一事实源 ≠ 复用其消费契约"）★
+
+    | 判据 | 问的问题 | 判错的后果 |
+    |---|---|---|
+    | `is_plain_mvn_command` | 能不能**安全替换 mvn 词元** | 判宽=命令被改烂 |
+    | 本函数 | 这是不是一次 **Maven 构建** | 判窄=Maven 专属修复/闸门对 wrapper 工程整类失效 |
+
+    实锤：`_ensure_reactor_am` 只在 `-pl <targets>` 之后插 `-am`，**不碰命令头**，对
+    `./mvnw` 完全安全。一度把它的守卫收敛到 `is_plain_mvn_command` → wrapper 工程
+    `./mvnw compile -pl mod-a` 不再补 `-am` → 解析不到 reactor 兄弟 → **假阴性烧正确代码**
+    （round65e10 st-1 死因① 原样复活），且恰好砸在这个 patch 本要拯救的人群头上。
+    """
+    cmd = command or ""
+    return bool(_MVN_TOKEN_RE.search(cmd) or _MVNW_RE.search(cmd))
+
+
+def _sub_mvn_token(command: str, replacement: str) -> str:
+    """把【唯一那个 mvn 词元】替换掉——词边界感知，绝不碰 mvnw / 子串。
+
+    调用前必须先过 `is_plain_mvn_command`（本函数不重复判，避免两处判据漂移）。
+    """
+    return _MVN_TOKEN_RE.sub(replacement, command, count=1)
+
+
 def _ensure_reactor_am(command: str) -> str:
     """R65E10-T1（round65e10 st-1 死因①）：命令【已含 -pl <targets>】但缺 -am 且目标需上游产物
     → 在 -pl <targets> 之后注入 -am；否则原样。
@@ -3832,7 +3897,10 @@ def _ensure_reactor_am(command: str) -> str:
     保守边界：无 -pl / 非 mvn / 已 -am(含 --also-make 长形) / 不需上游的目标(validate/clean/help)
     → 原样（validate 不加 -am 守 P0-B 不连坐 sibling，与既有 needs_upstream 口径一致）。
     """
-    if "mvn" not in command or "-pl" not in command:
+    if "-pl" not in command or not is_maven_family_command(command):
+        # ★X-C1 分档（对抗复核 HIGH）★ 这里问的是"是不是 Maven 构建"，不是"能不能替换词元"。
+        # 本函数只在 `-pl <targets>` 后插 `-am`，不碰命令头 → 对 `./mvnw` 同样安全且同样必要。
+        # 用 `is_plain_mvn_command` 门控会让 wrapper 工程整类丢掉 -am 修复（死因① 复活）。
         return command
     # 已带 -am / --also-make → 不重复注入
     if re.search(r"(?:^|\s)-am\b", command) or "--also-make" in command:
@@ -3855,19 +3923,40 @@ def _ensure_reactor_am(command: str) -> str:
     return out
 
 
-def _scope_maven_command(command: str, project_path: str, modified: list[str]) -> str:
+def _scope_maven_command(command: str, project_path: str, modified: list[str],
+                         details: dict | None = None, phase: str = "") -> str:
     """多模块 Maven：把整 reactor 的 mvn 命令改写成只编【改动所在模块】(-pl <mod> -am)。
 
     RuoYi 等多模块工程根 pom 聚合 6 个模块，整 reactor `mvn compile` 需要所有模块
     源码齐备(而 worker 只同步改动模块) → reactor 失败。正确做法是 -pl 限定改动模块、
     -am 连带构建其依赖的上游模块。已含 -pl 的命令补齐 -am（R65E10-T1）；非 mvn 命令原样返回。
+
+    details/phase（X-C1 复核 MED-2）：跳过收窄时落**机读账**，见下。可缺省（旧调用点不变）。
     """
-    if "mvn" not in command:
-        return command
-    if "-pl" in command:
+    if "-pl" in (command or "") and is_maven_family_command(command):
         # R65E10-T1：已 -pl 不再盲目原样——若 upstream 目标缺 -am 则补（治 round65e10 st-1 死因①：
         # `mvn compile -pl <mod> -q` 无 -am→sibling 解析不到→假阴性）。已 -am/非 upstream→原样。
+        # ★这一分支必须在 is_plain 门之【前】（对抗复核 HIGH）★：-am 补齐不改命令头，对
+        # wrapper 安全且必要；放在门后会让 `./mvnw compile -pl mod-a` 整类丢掉该修复。
         return _ensure_reactor_am(command)
+    if not is_plain_mvn_command(command):
+        # X-C1：wrapper / 复合 / 多词元 → 原样返回（原实现在此把命令改烂）。
+        # ★留痕必须覆盖【全部会被跳过收窄的 mvn 形态】，不只 wrapper（复核 MED-2）★
+        # 旧行为"改烂"至少会 127 炸出来；新行为是**看起来正常地失败**——整 reactor 缺
+        # 兄弟模块源码 → L1 FAIL，而日志里没有一句说"模块收窄被跳过了"。这正是本仓
+        # 反复吃亏的"降级无痕"。故：含 mvn 词元却不可改写 → WARNING + details 机读键。
+        _cmd = command or ""
+        if _MVN_TOKEN_RE.search(_cmd) or _MVNW_RE.search(_cmd):
+            _reason = ("wrapper" if _MVNW_RE.search(_cmd)
+                       else ("multi_token" if len(_MVN_TOKEN_RE.findall(_cmd)) > 1
+                             else "not_plain"))
+            logger.warning(
+                "[L1] Maven 模块收窄跳过（reason=%s，该命令将以整 reactor 跑；"
+                "多模块工程可能因缺兄弟模块源码假阴性失败）：%s", _reason, _cmd[:160])
+            if isinstance(details, dict):
+                details.setdefault("maven_scope_skipped", []).append(
+                    {"phase": phase or "?", "reason": _reason, "cmd": _cmd[:200]})
+        return command
     modules = _maven_modules(project_path)
     if not modules:
         return command
@@ -3914,7 +4003,7 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
         # 不需 sibling 产物——正是脚手架该验的范围（模块代码真编译由注册后的内容子任务经
         # reactor -pl -am 拉齐 sibling 完成，round34 计划 acceptance 本就用 `mvn validate -f`）。
         # 故需上游产物的目标(compile/test/package/…)降级 validate；validate/clean 等原样。★
-        scoped = command.replace("mvn", f"mvn -f {self_scaffold[0]}/pom.xml", 1)
+        scoped = _sub_mvn_token(command, f"mvn -f {self_scaffold[0]}/pom.xml")
         if re.search(r"\b(compile|test-compile|test|package|verify|install|deploy)\b", scoped):
             scoped = re.sub(
                 r"\b(compile|test-compile|test|package|verify|install|deploy)\b",
@@ -3941,7 +4030,7 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str]) -
     )
     am = " -am" if needs_upstream else ""
     # 插到 mvn 之后：mvn <args> → mvn -pl <pl> [-am] <args>
-    return command.replace("mvn", f"mvn -pl {pl}{am}", 1)
+    return _sub_mvn_token(command, f"mvn -pl {pl}{am}")
 
 
 # R65E8-T1（round65e8 task b4f2fcda PARTIAL 82/124 死因）：cd 进子模块目录裸跑 mvn 的验收命令归一。
@@ -3974,16 +4063,27 @@ def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[s
         # 非规范形若仍含 cd（`;` 分隔 / 带空格引号目录 / env 前缀）→ _scope 不懂 cd 会 -pl 错配 cwd → 原样（MED2）
         if re.search(r'(?:^|\s|&|;)cd\s', command):
             return command
-        # wrapper(mvnw)/多 mvn 复合 → _scope 的裸 .replace 会破坏语法（放大既有缺陷）→ 原样（MED1）
-        if re.search(r'/?\bmvnw\b', command) or len(re.findall(r'\bmvn\b', command)) != 1:
+        # X-C1 治本后：判据统一走 `is_plain_mvn_command`（本函数原有的 mvnw 守卫是当年
+        # 复核在这半边打的补丁，其注释已明写"_scope 的裸 .replace 会破坏语法"——
+        # 病灶在 _scope 却只在这里绕开。现在两处同源，绝不再各自维护一套。）
+        # ★分档（对抗复核 HIGH）★：Maven 系但不可改写词元（wrapper / 已 -pl）仍要进
+        # `_scope_maven_command`——它内部先走 -am 补齐（对 wrapper 安全且必要），
+        # 再走 is_plain 门做词元收窄。在这里提前 return 会把 -am 修复整类砍掉。
+        if not is_maven_family_command(command):
             return command
-        return _scope_maven_command(command, project_path, pl_basis)
+        return _scope_maven_command(command, project_path, pl_basis, phase="verify")
     _dir = m.group("dir").strip().strip('"\'').replace("\\", "/")
     _dir = _dir.removeprefix("./").rstrip("/")
     _rest = m.group("rest").strip()
     # MED1/LOW：只改写【单条干净 mvn 调用】——复合/wrapper/多 mvn/`..` traversal/非 mvn 起手 → 原样。
-    if ("&&" in _rest or ";" in _rest or re.search(r'/?\bmvnw\b', _rest)
-            or len(re.findall(r'\bmvn\b', _rest)) != 1 or not re.match(r'^mvn\b', _rest)
+    # ★X-C1 复核 HIGH-1：这里曾是【第四处】自建判据（`\bmvn\b` 计数），与 _sub_mvn_token 口径不同★
+    # `\bmvn\b` 认 `mvn.cmd`/`mvn:check`/`mvn-wrapper` 是完整词、`_MVN_TOKEN_RE` 不认 → 判"可改写"
+    # 进来后 sub 成 no-op，而函数已决定改写 → **返回剥掉 cd 前缀的 _rest**：
+    #   "cd mod-a && mvn.cmd -q compile" → "mvn.cmd -q compile"（作用域从模块目录变成工程根）
+    # 比旧病灶更毒：旧的产垃圾参数会 127 炸出来，这个"看起来合法"且日志还宣称归一成功。
+    # 现在与 _scope/_ensure 同源——`is_plain_mvn_command` 是唯一判据，`_sub_mvn_token` 不再可能 no-op。
+    if ("&&" in _rest or ";" in _rest
+            or not is_plain_mvn_command(_rest) or not _MVN_TOKEN_RE.match(_rest)
             or ".." in _dir.split("/")):
         return command
     if re.search(r"-f\s", _rest):
@@ -4001,7 +4101,7 @@ def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[s
     needs_upstream = bool(
         re.search(r"\b(compile|test-compile|test|package|verify|install|deploy)\b", _rest))
     am = " -am" if needs_upstream else ""
-    scoped = re.sub(r'\bmvn\b', f"mvn -pl {_dir}{am}", _rest, count=1)  # 边界感知，不碰 mvnw/子串
+    scoped = _sub_mvn_token(_rest, f"mvn -pl {_dir}{am}")   # 与 _scope 同源的词边界改写
     logger.info(
         "[L1.3.5] R65E8-T1 验收命令 reactor 归一：%r → %r"
         "（cd 子模块裸 mvn 解析不到 reactor 兄弟=假阴性烧正确代码，round65e8 连坐清盘死因）",
@@ -4585,7 +4685,8 @@ def run_l1_pipeline(
                     for x in (details.get("repaired_file_paths") or [])}
         _pl_basis = [f for f in modified
                      if str(f).lstrip("./").lstrip("/") not in _rfp_set] or modified
-        build_cmd = _scope_maven_command(build_cmd, project_path, _pl_basis)
+        build_cmd = _scope_maven_command(build_cmd, project_path, _pl_basis,
+                                         details=details, phase="build")
         # D3c（round38c 主题D 分流）：脚手架窗口 validate 降级【可见性】——validate 不编译
         # 源码，scaffold 子任务同批新建 .java 时这些源码零编译即 l1_passed=True。降级本身
         # 是 R34-6/Death B 的故意治法（脚手架契约=模块良构可注册；真编译由 L2 reactor
@@ -4607,7 +4708,12 @@ def run_l1_pipeline(
             return True, details
         # R56-5：构建**之前**先过依赖合法性闸——坏坐标在进 Maven 前就被消掉（state-driven），
         # 而不是等它炸出 `Could not resolve` 再按错误文本逐形态打补丁（error-driven=打地鼠）。
-        if str(build_cmd).lstrip().startswith("mvn"):
+        # ★X-C1 分档（对抗复核 MED）★ 判据从 `startswith("mvn")` 换成 Maven 系词元判断：
+        # 旧判据下 `./mvnw …`（Spring Boot 生态默认形态）与 `cd m && mvn …` 都不 startswith
+        # "mvn" → wrapper 工程**整类**绕过 R58-2 parent 字面量闸与 R56-5 依赖合法性闸，
+        # 少两道确定性闸且零留痕。这两道闸都只读改工程 pom、与命令怎么写无关，
+        # 唯一正确的门控就是"这是不是一次 Maven 构建"。
+        if is_maven_family_command(build_cmd):
             try:
                 # R58-2：parent 版本必须是字面量——它比依赖合法性更早、更致命（parent 解析不了
                 # 连 pom 都读不出，谈不上依赖）。故排在合法性闸**之前**。
@@ -4985,7 +5091,8 @@ def run_l1_pipeline(
                   for x in (details.get("repaired_file_paths") or [])}
         _pl_t = [f for f in modified
                  if str(f).lstrip("./").lstrip("/") not in _rfp_t] or modified
-        test_cmd = _scope_maven_command(test_cmd, project_path, _pl_t)
+        test_cmd = _scope_maven_command(test_cmd, project_path, _pl_t,
+                                       details=details, phase="test")
     details["test_cmd"] = test_cmd
     details["test_cmd_source"] = "harness" if harness_test else "heuristic"
     if not test_cmd:
