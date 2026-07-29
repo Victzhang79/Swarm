@@ -28,7 +28,7 @@ def _clean():
     "Error code: 429 - Too Many Requests",
     "Error code: 403 - insufficient_quota",
     "quota exceeded for this month",
-    "rate limit reached",
+    "HTTP 429 rate limit reached",   # 真限流必带 429；裸 `rate limit` 刻意不作独立判据
     "Insufficient Balance",
 ])
 def test_quota_shapes_detected(msg):
@@ -125,38 +125,113 @@ def test_snapshot_is_observable():
 
 
 # ══════════════════════════════════════════════
-# 接线：所有构造点都要带 slot（元教训①）
+# 接线：★行为级★（两个透镜的突变实验都证明初版是结构焊死的假绿）
 # ══════════════════════════════════════════════
-
-def test_every_logger_construction_carries_the_slot():
-    """★接线覆盖 ≠ 机制存在（本轮元教训①，已有 3 个实例）★
-    漏一处，那条路径上的配额耗尽就会把**别的槽**（或默认槽1）打进冷却——
-    轮换在该路径上不仅无效，还有害。"""
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "models" / "router.py").read_text()
-    lines = src.splitlines()
-    missing = []
-    for i, ln in enumerate(lines):
-        if "ModelInvocationLogger(" not in ln or ln.lstrip().startswith("class "):
-            continue
-        if "key_slot" not in "\n".join(lines[i:i + 4]):
-            missing.append(i + 1)
-    assert not missing, f"这些 ModelInvocationLogger 构造点没带 key_slot：行 {missing}"
+#
+# 初版两条守卫全是源码文本断言，突变实验里 4/9 存活：
+#   · `_KEY_SLOT_MAX = 1`（多槽整个删掉、备用 key 永远选不到）→ 全绿
+#   · `_active_slot` 恒返 1（归因整个删掉）→ 全绿
+#   · 逐行扫 router.py 找 `key_slot` 字面量 → 改成 `key_slot=0`（语义已坏）照绿；
+#     把构造点格式化成 6 行（超出 4 行窗口）→ 正确代码反被判红。双向失灵。
+# 下面这条一发同时杀掉全部四个突变。
 
 
-def test_resolve_api_key_enumerates_slots():
-    """接线事实：配置侧必须真去枚举多个槽（否则备用 key 永远选不到）。"""
-    from swarm.config import settings
-    src = inspect.getsource(settings.ModelConfig._resolve_api_key)
-    assert "_KEY_SLOT_MAX" in src and "select_slot" in src
+def _fake_slots(monkeypatch, values: dict[int, str], pid="p-rot"):
+    """给指定 provider 造多槽 secret；其余键返回 None。"""
+    from swarm.config import secret_store as ss
+    from swarm.models import key_rotation as _kr
+    names = {_kr.secret_name(pid, sl): v for sl, v in values.items()}
+    monkeypatch.setattr(ss, "get_secret", lambda name, *a, **k: names.get(name))
 
 
-def test_active_slot_is_recorded_for_error_attribution():
-    """选中的槽号必须落地——否则错误回调无从知道"是哪把 key 撞的额度"。"""
-    from swarm.config.settings import get_config
-    cfg = get_config().model
-    cfg._effective_providers()
-    assert isinstance(cfg._active_key_slot, dict)
+def test_rotation_actually_changes_the_key_in_use(monkeypatch):
+    """★真配槽2 → 断言取出的 key 变了（这是唯一能证明机制活着的断言）★
+    冷却槽1 后，`_resolve_api_key` 必须返回**槽2 的那把 key**，且槽号随之变。"""
+    from swarm.config.settings import ModelConfig
+    cfg = ModelConfig()
+    _fake_slots(monkeypatch, {1: "KEY-A", 2: "KEY-B"})
+
+    assert cfg._resolve_api_key("p-rot", "env") == ("KEY-A", 1)
+    kr.mark_exhausted("p-rot", 1, "429")
+    assert cfg._resolve_api_key("p-rot", "env") == ("KEY-B", 2), \
+        "槽1 冷却后必须真的换到槽2 的 key"
+
+
+def test_slot_travels_with_the_key_not_through_globals(monkeypatch):
+    """★槽号必须与 key 同生命周期同对象（对抗双复核 CRITICAL：并发 3 秒 64 次串槽）★
+    初版槽号写在 ModelConfig 的 PrivateAttr、回调回查【全局】get_config()——
+    reload 会 new 一个 AppConfig 让它归零，于是把**健康槽**打进冷却、
+    真正耗尽的那槽永不冷却，轮换永不推进。"""
+    from swarm.config.settings import ModelConfig, ProviderConfig
+    from swarm.models.router import _active_slot
+
+    cfg = ModelConfig(providers=[ProviderConfig(id="p-rot", base_url="http://x")])
+    _fake_slots(monkeypatch, {1: "KEY-A", 2: "KEY-B"})
+    kr.mark_exhausted("p-rot", 1, "429")
+
+    prov = cfg._effective_providers()[0]
+    assert (prov.api_key, prov.key_slot) == ("KEY-B", 2), "槽号必须落在 provider 对象上"
+    assert _active_slot(prov) == 2, "回调必须从 provider 取槽，不查任何全局态"
+
+
+def test_no_multislot_means_no_cooldown_at_all(monkeypatch):
+    """★没走多槽解析的 provider 撞 429 → 不冷却任何槽（hunter H4）★
+    初版默认按槽1 冷却——冷却一个**根本不存在的槽**，还打一条"已切换到下一个可用槽"
+    的 ERROR（作假宣称）。本地 vLLM 队列满返 429 同样中招。"""
+    from swarm.config.settings import ModelConfig
+    from swarm.models.router import ModelInvocationLogger
+    cfg = ModelConfig()
+    _fake_slots(monkeypatch, {})                    # secret_store 里一个槽都没有
+    assert cfg._resolve_api_key("p-env", "env-key") == ("env-key", 0)
+
+    ModelInvocationLogger("brain/primary", "m", "p-env",
+                          key_slot=0).on_llm_error(RuntimeError("429 too many requests"))
+    assert not kr.snapshot()["cooling"], "无槽可换时绝不冷却任何东西"
+    assert "p-env" not in kr.snapshot()["rotations"]
+
+
+def test_callback_does_not_rebuild_global_config():
+    """★回调里绝不 reload_config（对抗双复核 HIGH，两个透镜独立实证）★
+    实证：不 reload 换槽照样生效（`_effective_providers` 每次重跑解析）；
+    而它 49ms/次、无节流无上界、连带清空 5 个与 key 毫无关系的缓存。"""
+    # 行为级：spy 掉 reload_config，喂一条配额错，断言它一次都没被调
+    # （初版断源码里没有 `reload_config` 字面量——被自己的解释性注释坑红了；
+    #   文本从来不是行为，这正是"禁结构焊死测试"要防的。）
+    import swarm.config.settings as _st
+    from swarm.models.router import ModelInvocationLogger
+    calls = []
+    _orig = _st.reload_config
+    _st.reload_config = lambda *a, **k: calls.append(1) or _orig()
+    try:
+        ModelInvocationLogger("brain/primary", "m", "p-noreload",
+                              key_slot=1).on_llm_error(RuntimeError("429 too many requests"))
+    finally:
+        _st.reload_config = _orig
+    assert not calls, "回调绝不能重建全局配置（49ms/次 + 清 5 个无关缓存 + 无上界）"
+
+
+def test_credential_error_still_reaches_the_human_channel():
+    """★配额判据抢在 auth 之前——判宽了就会顶掉 A3 的凭据 ERROR★
+    无效 key 的 401 被判成配额去静默轮换，等于把 round67m2「k3 403 静默 2h20m」
+    那个刚治好的洞重新打开。"""
+    from swarm.models.errors import is_auth_shaped_error
+    msg = "Error code: 401 - {'code':'invalid_api_key'}, 'id':'chatcmpl-b429c'"
+    assert not kr.is_quota_shaped_error(msg), "确定的凭据错绝不能走轮换"
+    assert is_auth_shaped_error(msg), "它必须落到 auth 通道等人修"
+
+
+def test_credential_marker_wins_when_both_shapes_present():
+    """★两种形态同现时【凭据优先】——这是 fail-safe 方向，也是唯一能鉴别该排除的用例★
+    （上一条其实鉴别不了：`\b429\b` 修完后 `chatcmpl-b429c` 本就不命中，
+      删掉凭据排除它照样绿——突变实验当场证伪。真正的判据是"两者都在时谁赢"。）
+    换一把同样无效的 key 只是把故障换个地方发生，还会顶掉 A3 的凭据 ERROR。"""
+    both = "Error code: 403 - invalid_api_key; quota exceeded for this key"
+    assert not kr.is_quota_shaped_error(both), "凭据错必须压过配额判据"
+
+
+def test_transient_marker_wins_over_quota_code():
+    """同理另一侧：`read timeout=429` 是瞬时基建故障，归 breaker 不归轮换。"""
+    assert not kr.is_quota_shaped_error("Read timed out. (read timeout=429)")
 
 
 def test_rotation_env_is_registered():

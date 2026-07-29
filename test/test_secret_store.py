@@ -124,8 +124,11 @@ def test_provider_key_from_db_overrides_env(_clean):
     secret_store.invalidate_cache()
     try:
         cfg = ModelConfig()
-        resolved = cfg._resolve_api_key(test_pid, "env-plaintext-key")
+        # 返回值现在是 (key, slot)：槽号必须与 key 同生命周期同对象
+        # （对抗双复核 CRITICAL——初版槽号写全局态，并发下实测 3 秒 64 次串槽）
+        resolved, slot = cfg._resolve_api_key(test_pid, "env-plaintext-key")
         assert resolved == "db-encrypted-key", "应优先用 db 的 key"
+        assert slot == 1, "既有命名就是槽 1（零迁移）"
     finally:
         secret_store.delete_secret(f"provider_api_key:{test_pid}")
         secret_store.invalidate_cache()
@@ -145,8 +148,9 @@ def test_provider_key_falls_back_to_env(_clean):
     secret_store.delete_secret(f"provider_api_key:{test_pid}")  # 确保不存在
     secret_store.invalidate_cache()
     cfg = ModelConfig()
-    resolved = cfg._resolve_api_key(test_pid, "env-local-key")
+    resolved, slot = cfg._resolve_api_key(test_pid, "env-local-key")
     assert resolved == "env-local-key", "db 无则回退 .env"
+    assert slot == 0, "回退 .env = 未走多槽解析 → 槽号 0，回调据此不冷却任何槽"
     print("  ✅ 集成: db 无 key → 回退 .env(向后兼容)")
 
 

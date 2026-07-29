@@ -129,6 +129,11 @@ class DatabaseConfig(BaseSettings):
     qdrant_collection: str = "swarm_kb"
 
 
+def _kv(resolved: tuple[str, int]) -> dict:
+    """`_resolve_api_key` 的 (key, slot) → ProviderConfig 构造 kwargs（两者绝不分家）。"""
+    return {"api_key": resolved[0], "key_slot": resolved[1]}
+
+
 class ProviderConfig(BaseSettings):
     """单个模型接入点（云端 API 或本地推理服务）。
 
@@ -136,6 +141,12 @@ class ProviderConfig(BaseSettings):
     每个模型显式声明归属哪个 provider —— 不再靠"模型名含 / 就是云端"这种脆弱启发式。
     """
     id: str = ""                 # 唯一标识，如 siliconflow / deepseek / local
+    # ★本条 api_key 来自哪个 key 槽——必须与 key 【同生命周期同对象】（对抗双复核 CRITICAL）★
+    # 初版把槽号写进 ModelConfig 的 PrivateAttr、回调却回查【全局】get_config()：
+    # reload 会 new 一个 AppConfig 使其归零，并发下实测 3 秒 64 次串槽——
+    # 后果是把**健康槽**打进冷却、真正耗尽的那槽永不冷却，轮换永不推进。
+    # 0 = 未走多槽解析（回退 .env 明文）→ 回调据此**不冷却任何槽**（fail-closed）。
+    key_slot: int = 0
     label: str = ""              # 展示名（前端用），留空回退 id
     kind: str = "cloud"          # cloud | local —— 决定默认重试/超时策略
     base_url: str = ""
@@ -333,15 +344,11 @@ class ModelConfig(BaseSettings):
     tier: str = ""
 
     # ── 接入点解析 ────────────────────────────────────────────
-    # provider_id → 本次生效的 key 槽号（供错误回调定位"是哪把 key 撞的额度"）。
-    # pydantic BaseSettings 的非字段属性须走 PrivateAttr，否则会被当成配置项。
-    _active_key_slot: dict = PrivateAttr(default_factory=dict)
-
     # 每 provider 最多探测的 key 槽数（槽1=既有命名，#2..#N 为备用）。
     # 探测是 get_secret 调用，已有 30s 负缓存，故未配备用槽时开销可忽略。
     _KEY_SLOT_MAX = 4
 
-    def _resolve_api_key(self, provider_id: str, env_fallback: str) -> str:
+    def _resolve_api_key(self, provider_id: str, env_fallback: str) -> tuple[str, int]:
         """provider 的 api_key：多槽 + 配额感知轮换，回退 .env 明文值。
 
         敏感信息加密存 db；db 没有该项时无缝回退 .env，保证向后兼容、渐进迁移。
@@ -364,12 +371,11 @@ class ModelConfig(BaseSettings):
             if slots:
                 _pick = _kr.select_slot(provider_id, list(slots))
                 if _pick is not None:
-                    # 选中槽号随值带出，供错误回调把"是哪把 key 撞的额度"定位回来
-                    self._active_key_slot[provider_id] = _pick
-                    return slots[_pick]
+                    # 槽号随 key 一起返回——绝不写进任何全局态（见 ProviderConfig.key_slot）
+                    return slots[_pick], _pick
         except Exception:  # noqa: BLE001
             pass
-        return env_fallback
+        return env_fallback, 0        # 0 = 未走多槽（回退 .env）→ 回调不冷却任何槽
 
     def _effective_providers(self) -> list[ProviderConfig]:
         """返回生效的 provider 列表。
@@ -382,9 +388,11 @@ class ModelConfig(BaseSettings):
             # 显式 providers：每个的 key 优先从 db 读（回退该 provider 自带的 .env 值）
             resolved: list[ProviderConfig] = []
             for p in self.providers:
-                key = self._resolve_api_key(p.id, p.api_key)
-                if key != p.api_key:
-                    resolved.append(p.model_copy(update={"api_key": key}))
+                key, slot = self._resolve_api_key(p.id, p.api_key)
+                # 槽号必须随 key 一起落到【同一个 ProviderConfig 对象】上——
+                # 回调从 provider 取槽，不再回查任何全局态（CRITICAL：串槽）。
+                if key != p.api_key or slot != p.key_slot:
+                    resolved.append(p.model_copy(update={"api_key": key, "key_slot": slot}))
                 else:
                     resolved.append(p)
             return resolved
@@ -393,13 +401,13 @@ class ModelConfig(BaseSettings):
             synthesized.append(ProviderConfig(
                 id="siliconflow", label="SiliconFlow", kind="cloud",
                 base_url=self.siliconflow_base_url,
-                api_key=self._resolve_api_key("siliconflow", self.siliconflow_api_key),
+                **_kv(self._resolve_api_key("siliconflow", self.siliconflow_api_key)),
             ))
         if self.local_base_url:
             synthesized.append(ProviderConfig(
                 id="local", label="本地推理", kind="local",
                 base_url=self.local_base_url,
-                api_key=self._resolve_api_key("local", self.local_api_key),
+                **_kv(self._resolve_api_key("local", self.local_api_key)),
             ))
         return synthesized
 

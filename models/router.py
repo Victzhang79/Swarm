@@ -76,19 +76,20 @@ def _breaker_error_transient(err: str) -> bool:
     import re as _re
     return bool(_re.search(r"\b50[234]\b", first))
 
-def _active_slot(provider_id: str) -> int:
-    """本次生效的 key 槽号——单一事实源在 config（_resolve_api_key 选槽时写入）。
+def _active_slot(prov: Any) -> int:
+    """本次生效的 key 槽号——**从 provider 对象上取，与它的 api_key 同生命周期**。
 
-    ★所有 ModelInvocationLogger 构造点都必须带上它★：漏一处，那条路径上的配额耗尽
-    就会把**别的槽**打进冷却（或默认槽1），轮换机制在该路径上不仅无效还有害。
-    这正是本轮元教训第①条"接线覆盖 ≠ 机制存在"——故本函数是唯一取法，
-    测试 test_key_rotation 有一条守着 9 个构造点全带。
+    ★初版从全局 `get_config()` 回查，是对抗双复核逮到的 CRITICAL★：
+    槽号写在 router 构造时那个 ModelConfig 实例上，而回调回查的是全局单例；
+    `reload_config()` 会 new 一个 AppConfig 让它归零，并发下实测 3 秒 64 次串槽。
+    后果是把**健康槽**打进冷却、真正耗尽的那槽永不冷却 → 轮换永不推进且健康 key 被摘。
+    该 commit 自己写的"漏一处…不仅无效还有害"防住了漏写，没防住事实源指向另一个对象。
+    0 = 该 provider 没走多槽解析（回退 .env 明文）→ 回调据此**不冷却任何槽**。
     """
     try:
-        from swarm.config.settings import get_config
-        return int((get_config().model._active_key_slot or {}).get(provider_id, 1) or 1)
-    except Exception:  # noqa: BLE001 — 取不到就按槽1（与改动前等价）
-        return 1
+        return int(getattr(getattr(prov, "provider", prov), "key_slot", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 class ModelInvocationLogger(BaseCallbackHandler):
@@ -124,15 +125,24 @@ class ModelInvocationLogger(BaseCallbackHandler):
         from swarm.models.key_rotation import is_quota_shaped_error as _quota
         if _quota(error) and self.provider_id:
             from swarm.models import key_rotation as _kr
-            _slot = self.key_slot or 1
+            _slot = self.key_slot or 0
+            if _slot <= 0:
+                # ★没走多槽解析（key 来自 .env 明文 / 无 secret_store 条目）★
+                # 初版默认按槽1 冷却——冷却一个**根本不存在的槽**，还打一条
+                # "已切换到下一个可用槽"的 ERROR（作假宣称）。本地 vLLM 队列满返 429
+                # 同样中招，并提示"请补 provider_api_key:local#2"（对本地端点是错误指引）。
+                logger.warning(
+                    "[模型调用] role=%s provider=%s 命中配额形态，但该 provider 未走多槽解析"
+                    "（key 来自 .env 或无 secret_store 条目）→ 无槽可换、不冷却任何槽。"
+                    "如需自动轮换请把 key 存进 secret_store 并补 provider_api_key:%s#2: %s",
+                    self.role, self.provider_id, self.provider_id, str(error)[:160])
+                return
+            # ★这里【不】调 reload_config（对抗双复核 HIGH，两个透镜独立实证）★
+            # 初版注释称"配置对象缓存了已解析的 key"——不成立：`_effective_providers()`
+            # 每次都重跑 `_resolve_api_key` → `select_slot`，换槽本就自动生效。
+            # 而它的代价实测 49ms/次、无节流无上界、连带清空 5 个与 key 毫无关系的缓存
+            # （secret/sandbox/blacklist/skill/experience）——配额风暴下每个 429 触发一次。
             _kr.mark_exhausted(self.provider_id, _slot, str(error)[:200])
-            # 让下一次 _effective_providers 重新选槽（配置对象缓存了已解析的 key）
-            try:
-                from swarm.config.settings import reload_config
-                reload_config()
-            except Exception:  # noqa: BLE001 — 换槽失败不改变错误传播
-                logger.warning("[key-rotation] 换槽后 reload_config 失败（下次构造仍会重选）",
-                               exc_info=True)
             logger.error(
                 "[模型调用] role=%s 模型=%s provider=%s 槽%d 额度/限流耗尽 → 已冷却该 key "
                 "并切换到下一个可用槽（若无备用槽则本 provider 将持续失败，请补 "
@@ -1236,7 +1246,7 @@ class ModelRouter:
             self.config.brain_primary, temperature=self.config.brain_temperature,
             max_tokens=_bmt, wallclock_budget=_wc,
             callbacks=[ModelInvocationLogger(
-                "brain/primary", self.config.brain_primary, _p_prov.provider.id, key_slot=_active_slot(_p_prov.provider.id))],
+                "brain/primary", self.config.brain_primary, _p_prov.provider.id, key_slot=_active_slot(_p_prov))],
         )
         _f_prov = self._get_provider_for_model(self.config.brain_fallback)
         fallback = _f_prov.get_chat_model(
@@ -1244,7 +1254,7 @@ class ModelRouter:
             max_tokens=_bmt, wallclock_budget=_wc,
             no_fallback=True,   # R56-1：链尾——它再失控就没人可切了，只能关 thinking 保产出
             callbacks=[ModelInvocationLogger(
-                "brain/fallback", self.config.brain_fallback, _f_prov.provider.id, key_slot=_active_slot(_f_prov.provider.id))],
+                "brain/fallback", self.config.brain_fallback, _f_prov.provider.id, key_slot=_active_slot(_f_prov))],
         )
         return primary.with_fallbacks([fallback])
 
@@ -1282,7 +1292,7 @@ class ModelRouter:
             no_fallback=chain_tail,
             callbacks=[ModelInvocationLogger(
                 "brain/fallback-explicit" if chain_tail else "brain/reviewer-b",
-                self.config.brain_fallback, _prov.provider.id, key_slot=_active_slot(_prov.provider.id))],
+                self.config.brain_fallback, _prov.provider.id, key_slot=_active_slot(_prov))],
         )
 
     @staticmethod
@@ -1372,7 +1382,7 @@ class ModelRouter:
         primary = p_prov.get_chat_model(
             primary_name,
             temperature=self.config.worker_temperature,
-            callbacks=[ModelInvocationLogger(role, primary_name, p_prov.provider.id, key_slot=_active_slot(p_prov.provider.id))],
+            callbacks=[ModelInvocationLogger(role, primary_name, p_prov.provider.id, key_slot=_active_slot(p_prov))],
             max_tokens=_wmax, wallclock_budget=_wwc,
         )
         fallback_llms = []
@@ -1383,7 +1393,7 @@ class ModelRouter:
             fallback_llms.append(f_prov.get_chat_model(
                 fb_name,
                 temperature=self.config.worker_temperature,
-                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id, key_slot=_active_slot(f_prov.provider.id))],
+                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id, key_slot=_active_slot(f_prov))],
                 max_tokens=_wmax, wallclock_budget=_wwc,
             ))
         # F-F（阶段4）：接 breaker 健康重排 + 成败记账（见 _assemble_worker_chain）
@@ -1407,7 +1417,7 @@ class ModelRouter:
         primary = p_prov.get_chat_model(
             model_name,
             temperature=self.config.worker_temperature,
-            callbacks=[ModelInvocationLogger(role, model_name, p_prov.provider.id, key_slot=_active_slot(p_prov.provider.id))],
+            callbacks=[ModelInvocationLogger(role, model_name, p_prov.provider.id, key_slot=_active_slot(p_prov))],
             max_tokens=_wmax, wallclock_budget=_wwc,
         )
         # 复用该难度的 fallback 链（排除掉 override 模型自己，避免重复）
@@ -1420,7 +1430,7 @@ class ModelRouter:
             fallback_llms.append(f_prov.get_chat_model(
                 fb_name,
                 temperature=self.config.worker_temperature,
-                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id, key_slot=_active_slot(f_prov.provider.id))],
+                callbacks=[ModelInvocationLogger(f"{role}/fallback{i + 1}", fb_name, f_prov.provider.id, key_slot=_active_slot(f_prov))],
                 max_tokens=_wmax, wallclock_budget=_wwc,
             ))
         # F-F（阶段4）：同 get_llm_for_subtask——健康重排 + 记账
@@ -1507,7 +1517,7 @@ class ModelRouter:
         llm = prov.get_chat_model(
             model_name,
             temperature=self.config.worker_temperature,
-            callbacks=[ModelInvocationLogger(role, model_name, prov.provider.id, key_slot=_active_slot(prov.provider.id))],
+            callbacks=[ModelInvocationLogger(role, model_name, prov.provider.id, key_slot=_active_slot(prov))],
             max_tokens=(getattr(self.config, "worker_max_tokens", 0) or None),
             wallclock_budget=float(
                 getattr(self.config, "worker_stream_wallclock_s", 0.0) or 0.0),
@@ -1657,7 +1667,7 @@ class ModelRouter:
             temperature,
             callbacks=[ModelInvocationLogger(
                 role=f"worker/{kind_label}", model_name=model_name, provider_id=prov.provider.id,
-                key_slot=_active_slot(prov.provider.id),
+                key_slot=_active_slot(prov),
             )],
             # worker 输出上限：防改大文件时全文重写撑爆 context（worker agent 走此路径，
             # 非 get_llm_for_subtask；之前只在后者加 max_tokens 故未生效，必须在此也加）。
