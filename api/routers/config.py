@@ -78,14 +78,21 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) 
         #     `_resolve_api_key` 还会把 secret_store 解密的真 key 挂到攻击者 base_url 上。
         #   - `SWARM_NOTIFY_CHANNELS` 同型（代码注释原本自陈"闸对其 no-op"却没意识到是绕过）。
         # 实测：非 admin owner（持 config:write）提交时扁平键被拒、JSON 键放行——扁平键被拒
-        # 反而制造了"闸生效了"的假象。故按【值里的出站 URL 集合】比对：只要新旧不同就整键
-        # 剔除（fail-closed）。非 URL 字段的改动一并被拒是刻意的代价——精细到字段级回退
-        # 易错，而这条路径的后果是全部 provider 凭据 + 每一次 prompt 发往攻击者 host。
+        # 反而制造了"闸生效了"的假象。故按【值里的出站 URL 集合】判定。
+        #
+        # ★判据是【方向性】的，不是"新旧不等"（复核 HIGH）★
+        # 初版 `_new_urls != _old_urls` 把"集合变了"当危险，于是删一个 provider、改
+        # 某 provider 的 model 名导致条目重排、乃至任何令 URL 集合收缩的编辑全被拒——
+        # 非 admin owner 连"删掉一个已下线的 provider"都做不到，而这些操作没有任何
+        # 重定向风险。真正的危害只有一种：**把流量指向旧集合里没有的 host**（凭据钓鱼
+        # /MITM）。故只拒 `_new_urls - _old_urls`；沿用旧 host、删除、改非 URL 字段放行。
+        # 首次配置一个全新 host 仍会被拒——那正是"引入新出站端点"，本就该 admin 拍板。
         _new_urls = _outbound_urls_in_value(v)
-        if _new_urls and _new_urls != _outbound_urls_in_value(os.environ.get(k, "")):
+        _added_urls = _new_urls - _outbound_urls_in_value(os.environ.get(k, ""))
+        if _added_urls:
             _app.logger.warning(
-                "config:update 非 admin(%s) 尝试经【值】改写出站端点（键 %s 内含 URL 变更）"
-                " → 已整键拒绝（仅 admin 可改）", who, k)
+                "config:update 非 admin(%s) 尝试经【值】引入新出站端点（键 %s 新增 %s）"
+                " → 已整键拒绝（仅 admin 可改）", who, k, sorted(_added_urls))
             continue
         out[k] = v
     return out
@@ -98,20 +105,29 @@ def _outbound_urls_in_value(value: str) -> set[str]:
     一视同仁，避免又变成一张要逐个补的名单（键名闸就是这么漏的）。
     """
     s = (value or "").strip()
-    if not s or "://" not in s:
+    if not s:
         return set()
-    if not s.startswith(("[", "{")):
-        return {s}                       # 裸 URL 值
-    try:
-        data = _json.loads(s)
-    except Exception:  # noqa: BLE001 — 畸形 JSON 但含 ://：整体当一个端点面，fail-closed
-        return {s}
+    # ★短路判据必须在【解码之后】（复核 CRITICAL-1）★
+    # 初版先判 `"://" not in s` 再 json.loads——而 JSON 允许 `\/` 与 `\uXXXX` 转义，
+    # `https:\/\/evil/v1` 的原始文本里根本没有 `://` → 短路返回空集 → 整键放行。
+    # 复核已端到端实证：转义载荷经 PUT /api/config 落盘后，_effective_providers()
+    # 吐出的就是攻击者 base_url。闸的判据层与攻击者的编码层必须对齐。
+    if s.startswith(("[", "{")):
+        try:
+            data = _json.loads(s)
+        except Exception:  # noqa: BLE001 — 畸形 JSON：整体当端点面，fail-closed
+            return {s} if "://" in s else set()
+    else:
+        # 非 JSON：裸值。仅此处可用原始文本判断（没有转义层）
+        return {s} if "://" in s else set()
 
     found: set[str] = set()
 
     def _walk(node) -> None:
         if isinstance(node, dict):
-            for _v in node.values():
+            for _k, _v in node.items():
+                if isinstance(_k, str) and "://" in _k:
+                    found.add(_k)        # 复核 LOW-6：key 也可能是端点
                 _walk(_v)
         elif isinstance(node, list):
             for _it in node:
@@ -563,54 +579,15 @@ async def update_routing(request: Request):
         router = ModelRouter()
         return {"status": "no_changes", "message": "未检测到有效变更", **router.get_routing_table()}
 
-    # D3：写盘前快照，供 reload 被生产安全门禁拒绝时原子回滚。
-    # ★D47c★：读→改→写→回滚全程持 env_file_lock（与 PUT /api/config 同口径，防丢键）。
-    env_path = _app._PROJECT_ROOT / ".env"
-    with env_file_lock(env_path):
-        _prev_content = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-        _prev_env = {k: os.environ.get(k) for k in update_map}
-
-        # 更新 os.environ
-        for k, v in update_map.items():
-            os.environ[k] = v
-
-        # 写入 .env 文件
-        existing_lines = _prev_content.splitlines() if _prev_content is not None else []
-
-        updated_keys: set[str] = set()
-        new_lines: list[str] = []
-        for line in existing_lines:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#") and "=" in stripped:
-                k, _, _ = stripped.partition("=")
-                k = k.strip().upper()
-                if k in update_map:
-                    new_lines.append(f"{k}={_env_quote(update_map[k])}")  # #28：复杂值加引号
-                    updated_keys.add(k)
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        for k, v in update_map.items():
-            if k not in updated_keys:
-                new_lines.append(f"{k}={_env_quote(v)}")  # #28：复杂值加引号
-
-        content = "\n".join(new_lines) + "\n"
-        atomic_write_env(env_path, content)
-
-        _app.logger.info(f"Updated routing .env + os.environ with keys: {list(update_map.keys())}")
-
-        # 重新加载配置（D3：失败回滚 .env + os.environ）
-        _reload_with_rollback(env_path, _prev_content, _prev_env, _app.reload_config)
-    _app.logger.info("Config reloaded after routing update")
-    # C1-C 复核 S4：路由变更同样入审计（改模型路由=改行为，必须可追溯谁改的）
-    try:
-        from swarm.config.config_audit import record_config_changes
-        record_config_changes(_rt_who, "put_routing",
-                              {k: (_prev_env.get(k), v) for k, v in update_map.items()})
-    except Exception as _aexc:  # noqa: BLE001
-        _app.logger.warning("[CONFIG-AUDIT] put_routing 审计失败（变更已生效）: %s", _aexc)
+    # ★走单一咽喉 _persist_env_updates，不再内联复制一份写盘逻辑（复核 MEDIUM）★
+    # 原先本端点自己抄了一份"读 .env→改行→原子写→回滚→审计"，与咽喉逐字重复，
+    # 于是端点闸（_reject_endpoint_keys）与审计口径各修各的——CLAUDE.md 写明的
+    # "补一个漏一个"绕过就是这么来的。路由键本身不是出站端点键（闸对其 no-op），
+    # 但少一条旁路就少一处将来会漏的地方。
+    _rt_is_admin = _caller_is_admin(_rt_user)
+    await asyncio.to_thread(_persist_env_updates, update_map,
+                            is_admin=_rt_is_admin, who=_rt_who)
+    _app.logger.info("Config reloaded after routing update: %s", list(update_map))
 
     from swarm.models.router import ModelRouter
     router = ModelRouter()
@@ -714,6 +691,19 @@ async def update_model_providers(request: Request):
 
     if not update_map:
         raise HTTPException(status_code=400, detail="无 providers/model_providers/model_sizes 字段")
+
+    # ★裁决必须在【任何副作用之前】（复核 HIGH）★
+    # 原顺序：先 _store_provider_keys 把请求体里的 api_key 写进 secret_store（upsert，
+    # 原值不可恢复），再过闸。值层闸拦住 base_url 重定向后 .env 不变，但 **secret_store
+    # 已被覆盖**——而 _resolve_api_key 里 secret_store 优先于 .env、且 .env 那侧的
+    # api_key 本就被清空 → 非 admin 提交一次垃圾 key 即可静默销毁全部 provider 凭据，
+    # 响应还是 200 ok。改为：被拒即 403 早退并明示被拒键（不再"拒绝伪装成成功"）。
+    _mp_kept = _reject_endpoint_keys(dict(update_map), _mp_is_admin, _mp_who)
+    _mp_rejected = sorted(set(update_map) - set(_mp_kept))
+    if _mp_rejected:
+        raise HTTPException(
+            status_code=403,
+            detail=f"出站端点仅 admin 可改；被拒键: {_mp_rejected}（配置未变更）")
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：持锁文件 IO + reload 卸线程
@@ -1053,6 +1043,12 @@ async def update_notify_channels(request: Request):
     # 写 .env + os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：卸线程
     val = _json.dumps(clean, ensure_ascii=False)
+    # 同上：被拒即 403，绝不报 ok（复核 HIGH-2：原返回 {"status":"ok","count":N} 撒谎）
+    _nc_kept = _reject_endpoint_keys({"SWARM_NOTIFY_CHANNELS": val}, _nc_is_admin, _nc_who)
+    if not _nc_kept:
+        raise HTTPException(
+            status_code=403,
+            detail="通知渠道含出站 webhook 变更，仅 admin 可改（配置未变更）")
     await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin, who=_nc_who)
     _app.logger.info("Updated notify channels: %d 个", len(clean))
     return {"status": "ok", "count": len(clean)}

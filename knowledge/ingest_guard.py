@@ -241,6 +241,49 @@ class GitignoreFilter:
 # ──────────────────────────────────────────────
 # 统一判据入口
 # ──────────────────────────────────────────────
+# 众所周知的【凭据目录】——`.docker/config.json`、`.kube/config` 这类文件名本身不敏感，
+# 敏感的是它所在的目录。刻意用【短黑名单】而非"隐藏目录全拒"：见 credential_reject_reason。
+_CREDENTIAL_DIRS = frozenset({
+    ".ssh", ".aws", ".gnupg", ".gpg", ".docker", ".kube", ".azure", ".gcloud",
+    ".config/gcloud", ".chef", ".subversion",
+})
+
+
+def credential_reject_reason(rel_path: str) -> str | None:
+    """**只判凭据**的路径闸——给"必须保持项目可构建"的消费方用（如源码 tarball）。
+
+    与 `reject_reason_by_name` 的差别只有一条：**不拒隐藏目录**。
+    这条差别是被实证逼出来的（R2 复核 MEDIUM）：把入库闸整个搬去做镜像 tarball 剔除后，
+    `.mvn/wrapper/maven-wrapper.properties` 与 `.yarn/releases/yarn-*.cjs` 双双被判
+    `hidden_dir` 剔除 → 用 `./mvnw` / yarn Berry 的项目在沙箱里必然构建失败，且失败信息
+    指向"找不到 wrapper jar"，与"tarball 少打了文件"毫无关联，排查成本极高。同时违反
+    多栈中立（只打击 Maven wrapper / Yarn Berry 两个生态）。
+
+    根因是**消费契约不同**，不是判据写错：对知识库，隐藏目录是噪声；对构建 tarball，
+    隐藏目录可能是工具链本体。故按契约分函数，而不是给共用函数加开关参数（同一个名字
+    在两种语义间漂移，正是当初把入库闸整块复用过来的那个错误）。
+
+    凭据目录仍然拦（`.ssh/`、`.aws/`、`.docker/config.json`）——用短黑名单而非
+    "构建目录白名单"：凭据目录是一张封闭的、业界公认的短表；而构建工具链的隐藏目录
+    随生态无限增长，白名单必然变成"补一个漏一个"。
+    """
+    base = os.path.basename(rel_path)
+    if is_sensitive_filename(base):
+        return "sensitive_filename"
+    parts = Path(rel_path).parts
+    lowered = [seg.lower() for seg in parts[:-1]]
+    for i, seg in enumerate(lowered):
+        if seg in _CREDENTIAL_DIRS or "/".join(lowered[i:i + 2]) in _CREDENTIAL_DIRS:
+            return "credential_dir"
+    if base.startswith("."):
+        if base.lower() in _HIDDEN_FILE_ALLOW:
+            return None
+        if any(r.search(base) for r in _SENSITIVE_NAME_ALLOW_RES):
+            return None
+        return "hidden_file"
+    return None
+
+
 def reject_reason_by_name(rel_path: str) -> str | None:
     """仅按【路径/文件名】判定是否拒绝入库；返回拒绝原因，None=该层放行。
 

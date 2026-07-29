@@ -196,7 +196,13 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
                 )
                 row = cur.fetchone()
         if not row:
-            # 真正的 miss（无此 secret）→ 静默返回 None，回退 .env 是预期行为
+            # 真正的 miss（无此 secret）→ 静默返回 None，回退 .env 是预期行为。
+            # ★但必须进缓存★（复核 MEDIUM）：真 miss 是【最常见】的路径——大多数部署
+            # 根本没往 secret_store 写过东西，于是每次 get_secret 都是一次完整 PG 往返。
+            # 只给 decrypt 失败补负缓存等于只治了罕见分支。语义与解密失败一致（调用方都
+            # 回退 .env），TTL 30s 到期自然重试，故新写入的 secret 最长 30s 生效。
+            with _cache_lock:
+                _cache[key_name] = (None, now)
             return None
         try:
             plaintext = decrypt(row[0])
@@ -219,6 +225,11 @@ def get_secret(key_name: str, conn_str: str | None = None) -> str | None:
             # = 213 次 PG 往返，dispatch 节点耗时从 ~0.08s 涨到 0.6s（生产同受影响）。
             # 缓存 None 与"真 miss"同语义（调用方都回退 .env），TTL 到期自然重试，
             # 故修好密文后最长 30s 生效——可接受。
+            try:
+                from swarm.infra.degrade import record_degrade
+                record_degrade("config.secret_store.decrypt_failed")
+            except Exception:  # noqa: BLE001
+                pass
             with _cache_lock:
                 _cache[key_name] = (None, now)
             return None

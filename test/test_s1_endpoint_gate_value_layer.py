@@ -178,3 +178,139 @@ def test_unquoted_rule_does_not_flag_normal_code(text):
     from swarm.worker.security_scan import _SECRET_PATTERNS
     pat = dict((n, p) for n, p, _ in _SECRET_PATTERNS)["Unquoted secret assignment"]
     assert not pat.search(text), f"正常代码被误报: {text}"
+
+
+# ══════════════════════════════════════════════
+# R2 复核整改：编码层绕过 / git 主路径 / 拒绝不得伪装成功
+# ══════════════════════════════════════════════
+
+@pytest.mark.parametrize("payload,desc", [
+    (r'[{"base_url":"https:\/\/evil.example\/v1"}]', "JSON 转义斜杠 \\/"),
+    (r'[{"base_url":"https://evil.example/v1"}]', "unicode 转义冒号"),
+    (r'[{"base_url":"https://evil.example/v1"}]', "unicode 转义斜杠"),
+    ('{"http://evil.example/x":"v"}', "URL 出现在 dict 的 key 上"),
+])
+def test_gate_not_bypassed_by_encoding(payload, desc):
+    """★闸的判据层必须与攻击者的编码层对齐（R2 复核 CRITICAL-1）★
+    初版在 json.loads【之前】判 `"://" not in s` 就短路——而 JSON 允许 \\/ 与 \\uXXXX，
+    转义后原始文本里没有 `://` → 返回空集 → 整键放行。复核已端到端实证：转义载荷落盘后
+    _effective_providers() 吐出的就是攻击者 base_url。"""
+    assert _outbound_urls_in_value(payload), f"{desc} 绕过了闸"
+
+
+def test_source_tarball_excludes_credentials_on_git_path(tmp_path):
+    """★git archive 是【主路径】，真实场景全走它（R2 复核 CRITICAL/HIGH-1）★
+    初版剔除只加在工作区扫描【回退】分支，而任何 git 仓库（E2E 基线 RuoYi、worker clone
+    出的客户仓库）都走 git archive 并提前 return。当时的测试用 tmp_path（非 git 仓库）
+    必然走回退分支 → 恒绿，给出了与实际防护面【相反】的保证。"""
+    import io
+    import subprocess
+    import tarfile
+
+    from swarm.worker.image_builder import _make_source_tarball
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "A.java").write_text("class A {}")
+    for f in (".env", "id_rsa", ".npmrc", "deploy.pem"):
+        (tmp_path / f).write_text("SECRET=x")
+    subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A", "-f"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=tmp_path, check=True, capture_output=True)
+
+    names = set(tarfile.open(fileobj=io.BytesIO(_make_source_tarball(tmp_path))).getnames())
+    assert (tmp_path / ".git").exists(), "本用例必须走 git archive 主路径"
+    assert not (names & {".env", "id_rsa", ".npmrc", "deploy.pem"}), \
+        f"git archive 主路径未剔除凭据：{names}"
+    assert "src/A.java" in names
+
+
+def test_rejection_is_not_disguised_as_success():
+    """★拒绝不能伪装成成功（B8-F2 当年的对抗复核原话，R2 复核 HIGH-2 指出它被打破）★
+    被值层闸拒的键此前仍出现在 `updated_keys` 里、响应 status=ok，用户以为改了实际没改。
+    现在两个端点在裁决后被拒即 403 并明示被拒键。"""
+    import inspect
+
+    from swarm.api.routers import config as _cfg
+    src = inspect.getsource(_cfg)
+    assert "被拒键" in src, "被拒必须明示键名"
+    # 裁决必须发生在 set_secret 副作用之前（否则非 admin 可静默销毁 provider 凭据）
+    i_gate = src.index("_mp_kept = _reject_endpoint_keys")
+    i_persist = src.index("_persist_env_updates, update_map, is_admin=_mp_is_admin")
+    assert i_gate < i_persist
+
+
+def test_value_gate_is_directional_not_set_inequality(monkeypatch):
+    """★只拒"引入旧集合里没有的 host"，别把删除/改非 URL 字段一并拒掉（R2 复核 HIGH）★
+    初版判"新旧集合不等"，于是非 admin owner 删一个已下线 provider 也被拒——那没有任何
+    重定向风险。闸过宽的代价不是"更安全"，是使用者绕开它。"""
+    old = '[{"name":"a","base_url":"https://api.a.com/v1"},{"name":"b","base_url":"https://api.b.com/v1"}]'
+    monkeypatch.setenv("SWARM_MODEL_PROVIDERS", old)
+
+    # 删掉 b（URL 集合收缩）→ 放行
+    shrink = '[{"name":"a","base_url":"https://api.a.com/v1"}]'
+    assert _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": shrink}, False, "owner")
+
+    # 改非 URL 字段（沿用旧 host）→ 放行
+    same = '[{"name":"a","base_url":"https://api.a.com/v1","model":"新模型"},{"name":"b","base_url":"https://api.b.com/v1"}]'
+    assert _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": same}, False, "owner")
+
+    # 引入新 host → 仍然拒（本闸的唯一目的）
+    evil = old.replace("api.b.com", "evil.example")
+    assert not _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": evil}, False, "owner")
+    # admin 全放行
+    assert _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": evil}, True, "admin")
+
+
+def test_safe_subdir_regex_rejects_trailing_newline_injection():
+    """★`$` 匹配行尾换行之前，`\\Z` 才是真串尾（R2 复核 MEDIUM）★
+    该值随后拼进沙箱 shell 命令，`ok\\nrm -rf /` 过了 `$` 版正则就是一条独立命令。"""
+    from swarm.worker.image_builder import _SAFE_SUBDIR_RE
+    assert _SAFE_SUBDIR_RE.match("svc/api")
+    assert not _SAFE_SUBDIR_RE.match("ok\nrm -rf /")
+    assert not _SAFE_SUBDIR_RE.match("../etc")
+    assert not _SAFE_SUBDIR_RE.match("/abs")
+
+
+def test_get_secret_caches_true_miss(monkeypatch):
+    """★真 miss 是最常见路径，不缓存 = 每次调用一次 PG 往返（R2 复核 MEDIUM）★
+    实测 71 次 get_config = 213 次往返，dispatch 从 0.08s 涨到 0.6s。"""
+    from swarm.config import secret_store as ss
+
+    ss._cache.clear()
+    calls = {"n": 0}
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): calls["n"] += 1
+        def fetchone(self): return None
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+
+    monkeypatch.setattr(ss, "_get_conn", lambda *a, **k: _Conn())
+    assert ss.get_secret("SWARM_不存在的键") is None
+    assert ss.get_secret("SWARM_不存在的键") is None
+    assert calls["n"] == 1, f"真 miss 未进缓存，第二次又打了 PG（共 {calls['n']} 次）"
+    ss._cache.clear()
+
+
+def test_image_tarball_gate_keeps_build_toolchain_hidden_dirs():
+    """★复用单一事实源必须连它的【消费契约】一起读（R2 复核 MEDIUM，第二例）★
+    tarball 剔除初版直接调 `reject_reason_by_name`（知识库入库闸），它会拒隐藏【目录】——
+    那是"隐藏目录是噪声"的知识库语义。对构建 tarball，隐藏目录可能是工具链本体：
+    `.mvn/wrapper/*`（mvnw）与 `.yarn/releases/*`（yarn Berry）被剔 → 沙箱构建失败，
+    报错指向"找不到 wrapper jar"，与"tarball 少打文件"毫无关联；且只打击这两个生态
+    = 违反多栈中立。故按契约分函数：credential_reject_reason 只判凭据。"""
+    from swarm.worker.image_builder import _sensitive_reject_reason as g
+
+    for keep in (".mvn/wrapper/maven-wrapper.properties", ".yarn/releases/yarn-4.cjs",
+                 ".gradle/wrapper/gradle-wrapper.properties", ".github/workflows/ci.yml",
+                 "src/main/java/A.java"):
+        assert g(keep) is None, f"{keep} 是构建/源码内容，不该被剔除"
+    for drop in (".env", "id_rsa", ".npmrc", "deploy.pem", ".ssh/known_hosts",
+                 ".aws/credentials", ".docker/config.json", ".kube/config"):
+        assert g(drop), f"{drop} 是凭据，必须剔除"

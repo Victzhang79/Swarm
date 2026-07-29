@@ -90,6 +90,13 @@ def record_config_changes(
                     who, source, len(rows), [r[2] for r in rows][:10])
         return len(rows)
     except Exception as exc:  # noqa: BLE001 — 审计是旁路，绝不阻断配置变更本身
+        # 降级必须可观测：审计静默失效 = 合规面全盲，而配置照改不误——只看日志谁也不会
+        # 发现"审计表已经三周没进过一行"。计数进 /api/metrics 的降级面。
+        try:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("config.audit.write_failed")
+        except Exception:  # noqa: BLE001
+            pass
         logger.warning("[CONFIG-AUDIT] 写审计失败（配置变更本身已生效，不回滚）by=%s source=%s: %s",
                        who, source, exc)
         return 0

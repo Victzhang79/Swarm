@@ -37,7 +37,9 @@ _NODE_DEFAULT = "20"
 
 # 安全：dep_source 子目录名白名单（S-5）——只允许常规相对路径字符；拒 `..` 逃逸、
 # 拒绝对路径、拒一切 shell 元字符。仓库内容即攻击者可控，故是"允许什么"而非"禁止什么"。
-_SAFE_SUBDIR_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+# 结尾用 \Z 而非 $：$ 也匹配【行尾换行前】，`ok\nrm -rf /` 能过 $ 版正则，
+# 而该值随后拼进沙箱 shell 命令（复核 MEDIUM）。
+_SAFE_SUBDIR_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._][A-Za-z0-9._/-]*\Z")
 
 
 def template_exists_in_cubemaster(template_id: str) -> bool | None:
@@ -436,6 +438,8 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
     避免"工作区未提交改动进了镜像、但 worker 覆盖的是 HEAD 版"导致镜像内文件不一致。
     非 git 仓库回退工作区当前内容。
     """
+    # 两路（git archive 主路径 / 工作区扫描回退）共用同一本剔除账
+    _skipped_sensitive: list[tuple[str, str]] = []
     import io
     import subprocess
     import tarfile
@@ -470,6 +474,17 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                             continue
                         if Path(member.name).suffix.lower() in _SRC_EXCLUDE_EXTS:
                             continue
+                        # ★敏感剔除必须在【这条主路径】上（复核 CRITICAL/HIGH-1）★
+                        # 初版只加在下方的工作区扫描【回退】分支，而任何 git 仓库都走这里
+                        # 并提前 return——E2E 基线 RuoYi、worker clone 出的客户仓库全是 git
+                        # 仓库。只要凭据文件被 commit 过（这正是密钥闸存在的前提），就原样
+                        # 进 tarball → COPY → chmod 0777 → push 到无认证 registry → 固化为
+                        # 可复用模板。而当时的新测试用 pytest tmp_path（非 git 仓库）必然走
+                        # 回退分支 → 恒绿，给出了与实际防护面【相反】的保证。
+                        _sens_m = _sensitive_reject_reason(member.name)
+                        if _sens_m:
+                            _skipped_sensitive.append((member.name, _sens_m))
+                            continue
                         if member.size > _TARBALL_MAX_FILE_BYTES:
                             _skipped_big += 1
                             logger.warning(
@@ -486,6 +501,7 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                             "源码 tarball 跳过 %d 个 symlink/硬链接（镜像内将为缺文件状态）",
                             _skipped_link,
                         )
+                _report_skipped_sensitive(_skipped_sensitive)
                 return out_buf.getvalue()
         except Exception as _ga_exc:  # noqa: BLE001 — git archive 失败回退工作区扫描
             # 26 号文 J-H：原先 `except: pass` 零日志，既打破 docstring 承诺的
@@ -496,7 +512,6 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 "git HEAD（未提交改动会一并入镜像）: %s", _ga_exc)
 
     # 非 git 仓库 / git archive 失败 → 扫工作区当前内容
-    _skipped_sensitive: list[tuple[str, str]] = []
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in project_root.rglob("*"):
@@ -534,12 +549,23 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 continue
             arcname = "/".join(path.relative_to(project_root).parts)
             tar.add(str(path), arcname=arcname)
-    if _skipped_sensitive:
-        # always-emit：安全剔除必须留痕（本仓纪律：降级路径至少一次 WARNING）
-        logger.warning(
-            "源码 tarball 剔除 %d 个敏感文件（绝不入镜像）: %s",
-            len(_skipped_sensitive), [p for p, _ in _skipped_sensitive[:8]])
+    _report_skipped_sensitive(_skipped_sensitive)
     return buf.getvalue()
+
+
+def _report_skipped_sensitive(skipped: list[tuple[str, str]]) -> None:
+    """always-emit 剔除账（两路共用）。安全剔除与"隐藏路径降噪"分两条措辞——
+    复核 LOW-3：把 .github/workflows/ci.yml 报成"敏感文件"会让排查者想不到构建缺文件。"""
+    if not skipped:
+        return
+    _sec = [p for p, r in skipped if r == "sensitive_filename"]
+    _hid = [p for p, r in skipped if r != "sensitive_filename"]
+    if _sec:
+        logger.warning("源码 tarball 剔除 %d 个【凭据类】文件（绝不入镜像）: %s",
+                       len(_sec), _sec[:8])
+    if _hid:
+        logger.warning("源码 tarball 剔除 %d 个【隐藏路径】文件（镜像将缺它们，"
+                       "沙箱构建报缺文件先查此账）: %s", len(_hid), _hid[:8])
 
 
 def _sensitive_reject_reason(rel_path: str) -> str | None:
@@ -550,9 +576,20 @@ def _sensitive_reject_reason(rel_path: str) -> str | None:
     判据不可用时 **fail-closed 拒绝该文件**——凭据进镜像不可撤销，宁可少打一个文件。
     """
     try:
-        from swarm.knowledge.ingest_guard import reject_reason_by_name
-        return reject_reason_by_name(rel_path)
+        # ★用 credential_reject_reason 而非 reject_reason_by_name（复核 MEDIUM）★
+        # 后者会拒【隐藏目录】——那是知识库的降噪语义。实测它会剔掉
+        # `.mvn/wrapper/maven-wrapper.properties` 与 `.yarn/releases/*`，
+        # 用 mvnw / yarn Berry 的项目在沙箱里直接构建失败（且违反多栈中立）。
+        from swarm.knowledge.ingest_guard import credential_reject_reason
+        return credential_reject_reason(rel_path)
     except Exception as exc:  # noqa: BLE001
+        # 降级必须可观测：判据不可用会把【整棵源码树】剔空（每个文件都命中本分支），
+        # 沙箱里表现为"项目是空的"，只看日志会淹没在逐文件 warning 里。
+        try:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("worker.image_builder.sensitive_guard_unavailable")
+        except Exception:  # noqa: BLE001 — 观测绝不阻断
+            pass
         logger.warning("敏感文件判据不可用 → fail-closed 剔除 %s: %s", rel_path, exc)
         return "guard_unavailable"
 
