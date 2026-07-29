@@ -5249,20 +5249,29 @@ def contract_owner_ledger_block(
     （R67M2-T3 B5）：详情层 60 条带 owner 路径（高危后缀族优先入册），其余进简表层（仅类名、
     上限 300）——禁重名硬约束对简表层同样生效，两层均爆才丢弃且必 WARNING 带样本。
     """
+    # ★必须扫【全部 section】而不只是 interfaces（26 号文 G-H9：登记称已治但代码未治）★
+    # 同文件的 `_contract_owner_authority` 早已按 R67G 修成扫全 section，本函数漏跟：
+    # 枚举/DTO 的 defined_in 放在 `dtos`/`types` 时（round67g 铁证 `AlarmLevelEnum`），
+    # 分批 prompt 的 owner 清单里**没有它们** → 各批继续在别包 create 同名枚举 → ③b REJECT。
+    # 而当时的测试全用 `{"interfaces": [...]}` 造数据，回归零覆盖——"登记册打了 ✅ 而代码
+    # 只治了一半"正是本轮的元问题。此处与权威侧同源：遍历所有 list 型 section。
     seen: dict[str, str] = {}       # basename -> owner 展示路径（契约首见为准）
-    for e in ((contract or {}).get("interfaces") or []):
-        if not isinstance(e, dict):
+    for _sec in (contract or {}).values():
+        if not isinstance(_sec, list):
             continue
-        defined_in = str(e.get("defined_in") or "").strip()
-        if not defined_in:
-            continue
-        key = classpath_fqn_key(defined_in)
-        if not key:
-            continue                # 非 JVM 类路径 → 不入禁写清单（栈中立）
-        _mod, fqn = key
-        base = fqn.rsplit("/", 1)[-1]        # 保原样大小写用于展示
-        if base.lower() not in {b.lower() for b in seen}:
-            seen[base] = _norm_scope_path(defined_in)
+        for e in _sec:
+            if not isinstance(e, dict):
+                continue
+            defined_in = str(e.get("defined_in") or "").strip()
+            if not defined_in:
+                continue
+            key = classpath_fqn_key(defined_in)
+            if not key:
+                continue            # 非 JVM 类路径 → 不入禁写清单（栈中立）
+            _mod, fqn = key
+            base = fqn.rsplit("/", 1)[-1]    # 保原样大小写用于展示
+            if base.lower() not in {b.lower() for b in seen}:
+                seen[base] = _norm_scope_path(defined_in)
     # ★round67i：并入 tech_design_file_plan 唯一 create 权威（契约的补集；契约已声明的不覆盖）★
     # ★对抗复核 Hunter HIGH 整改：契约条目与 tech_design 条目【分池预算】★——原先合池后
     # `sorted(...)[:60]` 纯字母序截断：tech_design 语料（真实 RuoYi 设计 ~218 文件）会把字母序

@@ -235,3 +235,52 @@ def test_attempted_ledger_write_back_is_unconditional():
 
 if not hasattr(pytest, "mark") or not hasattr(pytest.mark, "asyncio"):  # pragma: no cover
     asyncio  # noqa: B018 — 保持 import 被使用（无 pytest-asyncio 时的兜底）
+
+
+# ══════════════════════════════════════════════
+# G-H9：登记称已治但代码只治了一半
+# ══════════════════════════════════════════════
+
+def test_owner_ledger_scans_every_contract_section():
+    """★"登记册打了 ✅ 而代码只治了一半"——本轮的元问题之一（26 号文 G-H9）★
+    同文件的 `_contract_owner_authority` 早已按 R67G 修成扫全 section，而
+    `contract_owner_ledger_block` 仍只扫 `interfaces`：枚举/DTO 的 defined_in 放在
+    `dtos`/`types` 时（round67g 铁证 `AlarmLevelEnum`），分批 prompt 的 owner 清单里
+    **没有它们** → 各批继续在别包 create 同名枚举 → ③b REJECT。
+    ★当时的测试全用 `{"interfaces": [...]}` 造数据，回归零覆盖★——所以这条用例
+    **刻意把 defined_in 放在非 interfaces 段**。"""
+    from swarm.brain.contract_utils import contract_owner_ledger_block
+    out = contract_owner_ledger_block({
+        "interfaces": [{"defined_in": "m/src/main/java/com/x/AlarmService.java"}],
+        "dtos": [{"defined_in": "m/src/main/java/com/x/AlarmLevelEnum.java"}],
+        "types": [{"defined_in": "m/src/main/java/com/x/AlarmDTO.java"}],
+    })
+    for name in ("AlarmService", "AlarmLevelEnum", "AlarmDTO"):
+        assert name in out, f"{name} 未进 owner 台账（section 覆盖面漏了）"
+
+
+def test_owner_ledger_and_authority_share_the_section_scan():
+    """★口径同源★：台账与权威两侧对"契约里哪些段带 defined_in"必须同口径，
+    否则一侧防住的另一侧照样放行——这正是 G-H9 的形态。"""
+    from swarm.brain.contract_utils import (
+        _contract_owner_authority,
+        contract_owner_ledger_block,
+    )
+    ct = {"dtos": [{"defined_in": "m/src/main/java/com/x/OnlyInDtos.java"}]}
+    owners, _amb = _contract_owner_authority(ct)
+    # 权威侧的 base 键含扩展名（`onlyindtos.java`），台账侧按类名展示——两者键形态不同
+    # 是刻意的（用途不同），此处只断言"同一段里的 defined_in 两侧都认得出"。
+    assert any(k.startswith("onlyindtos") for k in owners), "权威侧本就该认（R67G 已修）"
+    assert "OnlyInDtos" in contract_owner_ledger_block(ct), "台账侧必须跟上"
+
+
+def test_methodology_hard_checks_are_written_down():
+    """★元教训必须写进 checked-in 的纪律文档，否则下一轮重犯★
+    CLAUDE.md 每次会话都会加载，是杠杆最高的落点（而复盘文档 gitignore 不入库）。"""
+    from pathlib import Path
+    md = (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text()
+    for anchor in ("接线覆盖 ≠ 机制存在",
+                   "测试要证\"被接上了\"",
+                   "复用单一事实源 ≠ 复用其消费契约",
+                   "必须机读可辨"):
+        assert anchor in md, f"CLAUDE.md 缺方法论硬检查项：{anchor}"
