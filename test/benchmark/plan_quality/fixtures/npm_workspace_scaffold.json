@@ -1,0 +1,59 @@
+{
+  "_note": "★合成夹具（非真实 E2E 快照）★——run18/run19 是真实 live 现场固化，本条不是。它把 RUN19 的**结构**（根清单脚手架被误判 trivial + 多写者争抢根清单 + 一批源码文件挤进单发路径）原样平移到 npm workspaces 布局，用来暴露确定性 pass 的栈中立缺口。合成性质必须写在这里，别让后人拿它当现场证据。",
+  "subtasks": [
+    {
+      "id": "st-1",
+      "description": "创建 packages/alarm 工作区脚手架：新建 packages/alarm/package.json（name=@acme/alarm，依赖 @acme/common），并把 packages/alarm 注册进根 package.json 的 workspaces 数组。创建基础目录结构。",
+      "difficulty": "trivial",
+      "depends_on": [],
+      "scope": {
+        "create_files": ["packages/alarm/package.json"],
+        "writable": ["package.json"],
+        "readable": ["packages/common/package.json", "packages/api/package.json"]
+      }
+    },
+    {
+      "id": "st-2",
+      "description": "创建 packages/notify 工作区脚手架并注册进根 package.json 的 workspaces。",
+      "difficulty": "trivial",
+      "depends_on": [],
+      "scope": {
+        "create_files": ["packages/notify/package.json"],
+        "writable": ["package.json"],
+        "readable": ["packages/common/package.json"]
+      }
+    },
+    {
+      "id": "st-3",
+      "description": "实现告警领域模型与服务：AlarmRule / AlarmEvent / AlarmService / AlarmDispatcher 四个 TypeScript 源文件。",
+      "difficulty": "trivial",
+      "depends_on": ["st-1"],
+      "scope": {
+        "create_files": [
+          "packages/alarm/src/model/AlarmRule.ts",
+          "packages/alarm/src/model/AlarmEvent.ts",
+          "packages/alarm/src/service/AlarmService.ts",
+          "packages/alarm/src/service/AlarmDispatcher.ts"
+        ],
+        "writable": [],
+        "readable": ["packages/common/src/index.ts"]
+      }
+    },
+    {
+      "id": "st-4",
+      "description": "实现通知渠道适配：Slack 与 Webhook 两个适配器。",
+      "difficulty": "medium",
+      "depends_on": ["st-2"],
+      "scope": {
+        "create_files": [
+          "packages/notify/src/channel/SlackChannel.ts",
+          "packages/notify/src/channel/WebhookChannel.ts"
+        ],
+        "writable": [],
+        "readable": ["packages/common/src/index.ts"]
+      }
+    }
+  ],
+  "parallel_groups": [],
+  "shared_contract": {}
+}

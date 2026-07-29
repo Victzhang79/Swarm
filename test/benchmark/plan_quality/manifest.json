@@ -7,10 +7,14 @@
       "subtasks": 33,
       "bug": "两脚手架(st-1 建 ruoyi-alarm/pom、st-24 建 alarm-sdk/pom)皆写根 pom <modules> 注册。pass 序若为 normalize→fix_dep，fix_dep 的'脚手架置根'清空脚手架 depends_on → 抹掉 normalize 给根 pom 写者补的串行化依赖 → 退回'N 个无依赖子任务同时写 pom' → plan_validator 硬失败 → auto_accept fail-fast → 0/33 交付。",
       "fix": "resolve_plan_conflicts 固定 fix_dep→normalize 顺序(normalize 最后定锤单一写者不变量)。",
-      "aggregate_files": ["pom.xml"],
+      "aggregate_files": [
+        "pom.xml"
+      ],
       "expect_before_valid": false,
       "expect_after_valid": true,
-      "invariants": ["no_parallel_file_writers"]
+      "invariants": [
+        "no_parallel_file_writers"
+      ]
     },
     {
       "file": "run19_scaffold_trivial.json",
@@ -18,10 +22,64 @@
       "subtasks": 13,
       "bug": "根脚手架 st-1(建模块 pom + 编辑庞大根 pom 注册)被 LLM 误判 difficulty=trivial → worker 走单发快速路径(封顶 30 步)单次塞不下读改大根 pom → 40B 吐 'Sorry, need more steps' 拒答 → 根脚手架失败 → 全依赖链卡死(3/13 被看守取消)。此外原始 plan 有 3 个根 pom 写者(st-1/st-7/st-10)——D1 后属结构不合法(双写者=P0-A 根因),故 before_valid=false;resolve_plan_conflicts 收敛唯一 owner 后 after_valid=true。",
       "fix": "bump_scaffold_difficulty 把【写根 pom.xml】者 trivial→MEDIUM 走结构化多步路径(R62-Task6 收窄:只根 pom 是 RUN19 多步本质;模块 pom 脚手架单文件模板落盘维持 trivial 轻量路径);D1 normalize_plan_scopes 收敛根 pom 唯一 aggregator-owner(收敛后 st-10 非根 pom 写者→合法 trivial)。",
-      "aggregate_files": ["pom.xml"],
+      "aggregate_files": [
+        "pom.xml"
+      ],
       "expect_before_valid": false,
       "expect_after_valid": true,
-      "invariants": ["no_trivial_scaffold", "no_parallel_file_writers"]
+      "invariants": [
+        "no_trivial_scaffold",
+        "no_parallel_file_writers"
+      ]
+    },
+    {
+      "file": "npm_workspace_scaffold.json",
+      "run": "NPM-WS",
+      "subtasks": 4,
+      "synthetic": true,
+      "bug": "★B-0 红灯先行·合成夹具（非真实 E2E 快照）★ 把 RUN19 结构平移到 npm workspaces。实测三条破防：①根聚合清单硬失败闸 _ROOT_AGGREGATOR_MANIFESTS 里【没有 package.json】→ 两个子任务并发重写根 package.json 的 workspaces 数组只被通用写者闸串行化即放行，而聚合结构重写是非加性的 → 后写者覆盖前写者的注册 → 丢 workspace（D1 要防的 rebase 循环在 npm 上敞开）；②bump_scaffold_difficulty 判据是裸 pom.xml，npm 根清单脚手架保持 trivial → RUN19 单发路径卡死原样复活；③many_sources 判据走 classpath_fqn_key（JVM 门控，对 .ts 恒 None）→ 一次 create 4 个 .ts 也不提难度。",
+      "fix": "B-3 STACK_SPEC 事实表：根聚合清单/模块清单/源码后缀收敛成单一事实源，硬失败闸与 normalize 规则4 的 owner 收敛共用同一张表。",
+      "root_manifest": "package.json",
+      "source_exts": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".mjs"
+      ],
+      "aggregate_files": [
+        "package.json"
+      ],
+      "expect_before_valid": false,
+      "expect_after_valid": true,
+      "invariants": [
+        "no_parallel_file_writers",
+        "no_trivial_scaffold",
+        "no_trivial_multi_source"
+      ],
+      "known_gap": "B-3 R-1/R-2/R-3：package.json 不在根聚合清单名单 + 难度提升 Maven 专属 + many_sources JVM 门控"
+    },
+    {
+      "file": "go_module_scaffold.json",
+      "run": "GO-WORK",
+      "subtasks": 4,
+      "synthetic": true,
+      "bug": "★B-0 红灯先行·合成夹具★ go.work 多模块。★最硬的一条：确定性死锁★——go.work 【在】_ROOT_AGGREGATOR_MANIFESTS 里（判死），但 normalize_plan_scopes 规则4 的 root-owner 收敛【只认 pom.xml】（不救）→ 实测 before.valid=False → resolve 跑完 → after.valid=False，issue 逐字不变。规划期硬闸永不收敛 → 同签名连续两轮 → 熔断 fail-fast → 任何 Go/Gradle/Cargo 多模块工程只要 LLM 让两个子任务都注册模块就 100% 死在规划期，且死状是熔断、日志里看不出根因是『没人会收敛 go.work』。另含与 npm 同源的难度提升两条。",
+      "fix": "同上 B-3。判死的名单与收敛的名单必须是同一张表——这是本轮多栈重设计的第一顺位。",
+      "root_manifest": "go.work",
+      "source_exts": [
+        ".go"
+      ],
+      "aggregate_files": [
+        "go.work"
+      ],
+      "expect_before_valid": false,
+      "expect_after_valid": true,
+      "invariants": [
+        "no_parallel_file_writers",
+        "no_trivial_scaffold",
+        "no_trivial_multi_source"
+      ],
+      "known_gap": "B-3 R-1（确定性死锁：判死名单 ⊅ 收敛名单）+ R-2/R-3"
     }
   ]
 }

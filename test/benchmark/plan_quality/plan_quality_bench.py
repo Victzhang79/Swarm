@@ -51,8 +51,17 @@ def _load_plan(path: str) -> TaskPlan:
                     shared_contract=raw.get("shared_contract") or {})
 
 
-def _check_invariants(plan: TaskPlan, invariants: list[str]) -> list[str]:
-    """按 manifest 声明的不变量逐条核查，返回违反项(空=全过)。"""
+def _check_invariants(plan: TaskPlan, invariants: list[str],
+                      entry: dict | None = None) -> list[str]:
+    """按 manifest 声明的不变量逐条核查，返回违反项(空=全过)。
+
+    ★栈中立（B-0）★：不变量本身是【计划质量断言】，与技术栈无关——"根聚合清单的脚手架
+    不能是 trivial"对 pom.xml / package.json / go.work 同样成立。故根清单名与源码后缀
+    从夹具 entry 取（`root_manifest` / `source_exts`），缺省退回 Maven 口径（既有夹具零改动）。
+    """
+    entry = entry or {}
+    root_manifest = entry.get("root_manifest") or "pom.xml"
+    source_exts = tuple(entry.get("source_exts") or (".java",))
     violations: list[str] = []
     for inv in invariants:
         if inv == "no_trivial_scaffold":
@@ -68,10 +77,26 @@ def _check_invariants(plan: TaskPlan, invariants: list[str]) -> list[str]:
                 sc = getattr(s, "scope", None)
                 _w = (set(getattr(sc, "create_files", []) or [])
                       | set(getattr(sc, "writable", []) or []))
-                if "pom.xml" in {_norm_scope_path(x) for x in _w}:
+                if root_manifest in {_norm_scope_path(x) for x in _w}:
                     bad.append(s.id)
             if bad:
-                violations.append(f"no_trivial_scaffold: 仍有 trivial 根 pom 脚手架 {bad}")
+                violations.append(
+                    f"no_trivial_scaffold: 仍有 trivial 根 {root_manifest} 脚手架 {bad}")
+        elif inv == "no_trivial_multi_source":
+            # R67-T9 的不变量表述（**不复刻实现判据**，纪律 6）：一次 create ≥3 个源码文件
+            # 的子任务不能是 trivial——worker trivial 单发路径合并定位+编码、封顶 30 步，
+            # 塞不下多文件 → 低估路由弱档 = 白烧后重派。此判据与语言无关，只与"要写几个
+            # 源文件"有关；源码后缀由夹具声明（Maven .java / npm .ts / go .go）。
+            bad = []
+            for s in plan.subtasks:
+                if s.difficulty != SubTaskDifficulty.TRIVIAL:
+                    continue
+                n = sum(1 for f in (getattr(getattr(s, "scope", None), "create_files", []) or [])
+                        if str(f).endswith(source_exts))
+                if n >= 3:
+                    bad.append(f"{s.id}({n} 个源文件)")
+            if bad:
+                violations.append(f"no_trivial_multi_source: {bad}")
         elif inv == "no_parallel_file_writers":
             # 任一文件的多个写者必须有依赖序(不能并发写)；用 validator 的同款判定兜底
             r = validate_plan_structure(plan)
@@ -91,6 +116,10 @@ class FixtureResult:
     violations: list[str] = field(default_factory=list)
     expectations_met: bool = True
     notes: list[str] = field(default_factory=list)
+    # ★已知缺口（B-0 红灯先行）★：夹具写的是【正确期望】，当前实现还达不到 → 这里记原因。
+    # CI 侧对它 xfail(strict=True)：既不假绿（缺口一直可见），修好后又会 XPASS 逼人来摘标记，
+    # 不会变成"修完了没人知道"的僵尸标记。绝不允许把期望改成迁就现状——那才是真假绿。
+    known_gap: str = ""
 
 
 def run_fixture(entry: dict) -> FixtureResult:
@@ -114,11 +143,12 @@ def run_fixture(entry: dict) -> FixtureResult:
         cu._exists_in_repo = orig
 
     after = validate_plan_structure(plan).valid
-    violations = _check_invariants(plan, entry.get("invariants") or [])
+    violations = _check_invariants(plan, entry.get("invariants") or [], entry)
 
     res = FixtureResult(run=entry.get("run", "?"), file=entry["file"],
                         before_valid=before, after_valid=after,
-                        resolve_counts=counts, violations=violations)
+                        resolve_counts=counts, violations=violations,
+                        known_gap=entry.get("known_gap", "") or "")
 
     # 期望核对
     if before != entry.get("expect_before_valid", before):
@@ -143,8 +173,10 @@ def _scorecard(results: list[FixtureResult]) -> str:
     for r in results:
         ok = r.expectations_met and not r.violations
         passed += ok
-        mark = "✅" if ok else "❌"
+        mark = "✅" if ok else ("🟡" if r.known_gap else "❌")
         lines.append(f"{mark} {r.run:6} {r.file}")
+        if r.known_gap:
+            lines.append(f"      🟡 已知缺口（红灯先行，非回归）: {r.known_gap}")
         lines.append(f"      valid: 解决前={r.before_valid} → 解决后={r.after_valid}  "
                      f"| resolve={r.resolve_counts}")
         for n in r.notes:
@@ -160,5 +192,7 @@ def _scorecard(results: list[FixtureResult]) -> str:
 if __name__ == "__main__":
     results = run_all()
     print(_scorecard(results))
-    failed = [r for r in results if not (r.expectations_met and not r.violations)]
+    # 已知缺口不计失败（它们有 xfail 守着，且缺口本身在跑分卡上以 🟡 常驻可见）
+    failed = [r for r in results
+              if not (r.expectations_met and not r.violations) and not r.known_gap]
     raise SystemExit(1 if failed else 0)

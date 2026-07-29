@@ -1,0 +1,59 @@
+{
+  "_note": "★合成夹具（非真实 E2E 快照）★——同 npm_workspace_scaffold 的说明。Go 侧取 go.work 多模块布局：根 go.work 就是聚合清单（等价根 pom 的 <modules>），子模块各有 go.mod。",
+  "subtasks": [
+    {
+      "id": "st-1",
+      "description": "创建 internal/alarm 模块脚手架：新建 internal/alarm/go.mod（module github.com/acme/svc/internal/alarm），并把 ./internal/alarm 注册进根 go.work 的 use 块。",
+      "difficulty": "trivial",
+      "depends_on": [],
+      "scope": {
+        "create_files": ["internal/alarm/go.mod"],
+        "writable": ["go.work"],
+        "readable": ["internal/common/go.mod", "go.mod"]
+      }
+    },
+    {
+      "id": "st-2",
+      "description": "创建 internal/notify 模块脚手架并注册进根 go.work。",
+      "difficulty": "trivial",
+      "depends_on": [],
+      "scope": {
+        "create_files": ["internal/notify/go.mod"],
+        "writable": ["go.work"],
+        "readable": ["internal/common/go.mod"]
+      }
+    },
+    {
+      "id": "st-3",
+      "description": "实现告警领域模型与服务：rule / event / service / dispatcher 四个 Go 源文件。",
+      "difficulty": "trivial",
+      "depends_on": ["st-1"],
+      "scope": {
+        "create_files": [
+          "internal/alarm/rule.go",
+          "internal/alarm/event.go",
+          "internal/alarm/service.go",
+          "internal/alarm/dispatcher.go"
+        ],
+        "writable": [],
+        "readable": ["internal/common/types.go"]
+      }
+    },
+    {
+      "id": "st-4",
+      "description": "实现通知渠道适配：Slack 与 Webhook。",
+      "difficulty": "medium",
+      "depends_on": ["st-2"],
+      "scope": {
+        "create_files": [
+          "internal/notify/slack.go",
+          "internal/notify/webhook.go"
+        ],
+        "writable": [],
+        "readable": ["internal/common/types.go"]
+      }
+    }
+  ],
+  "parallel_groups": [],
+  "shared_contract": {}
+}
