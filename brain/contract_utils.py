@@ -2095,6 +2095,33 @@ def _is_pom_content_assert(cmd: str, pom: str) -> bool:
                 or _re.match(r'^test\s+-[zn]\s+["\']?\$\(\s*grep', c))
 
 
+# 权威模板的栈判据——按【模板落点文件名】认，与 _MANIFEST_BACKEND 同族口径。
+# 只用于"本轮有没有本机制不支持的栈"这一条可观测判定，不参与任何裁决。
+_TEMPLATE_STACK_BY_MANIFEST: dict[str, str] = {
+    "pom.xml": "maven",
+    "build.gradle": "gradle", "build.gradle.kts": "gradle",
+    "package.json": "npm",
+    "go.mod": "go",
+    "cargo.toml": "cargo",
+    "pyproject.toml": "python", "requirements.txt": "python",
+    "composer.json": "composer",
+    "gemfile": "bundler",
+}
+
+
+def _authoritative_template_stacks(plan) -> set[str]:
+    """本轮子任务里带「原样写入」权威模板的落点各属哪个栈（G-H11 可观测用）。"""
+    out: set[str] = set()
+    for st in (getattr(plan, "subtasks", None) or []):
+        _desc = str(getattr(st, "description", "") or "")
+        if "原样写入" not in _desc:
+            continue
+        for _name, _stack in _TEMPLATE_STACK_BY_MANIFEST.items():
+            if _name in _desc.lower():
+                out.add(_stack)
+    return out
+
+
 def reconcile_template_exam(plan) -> dict[str, dict]:
     """R65D-T2③（round65d 主治）：考卷与权威模板同源——模板即真值，考卷必须从模板生成。
 
@@ -2701,6 +2728,25 @@ def inject_build_scaffold_subtasks(
         if _exam:
             logger.info("[R65D-T2] 考卷同源对账完成：%d 个子任务被重写 %s",
                         len(_exam), sorted(_exam)[:8])
+        else:
+            # ★缺席必须机读可辨（26 号文 G-H11 + 方法论硬检查④）★
+            # 本机制是 **Maven 独有**（正则锚 `pom` 字面 + ```xml 围栏），npm/go/cargo 的
+            # 权威模板恒不被识别 → 对这些栈它是**永久 no-op**，而"没有可对账的模板"与
+            # "有模板但我认不出来"在日志上逐字不可分。多栈中立铁律要求它对所有栈生效，
+            # 补齐是重设计（每栈一套"权威模板→考卷断言"驱动），**本轮未做**；
+            # 但绝不让它继续静默——有权威模板痕迹却零对账时如实告警 + record_degrade。
+            _tpl_hint = _authoritative_template_stacks(plan)
+            if _tpl_hint - {"maven"}:
+                try:
+                    from swarm.infra.degrade import record_degrade
+                    record_degrade("brain.template_exam.non_maven_stack_unsupported")
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(
+                    "[R65D-T2] 考卷同源对账对本轮的权威模板栈 %s **不支持**（该机制目前是"
+                    "Maven 独有：正则锚 pom 字面 + xml 围栏）→ 这些栈的考卷未经同源对账，"
+                    "陈旧正断言会照旧送 worker 送死（G-H11，待多栈驱动化重设计）",
+                    sorted(_tpl_hint - {"maven"}))
     except Exception:  # noqa: BLE001 — fail-open，考卷维持原样交 worker 侧 H1 兜底
         logger.warning("[R65D-T2] 考卷同源 reconcile 失败（fail-open）", exc_info=True)
     try:

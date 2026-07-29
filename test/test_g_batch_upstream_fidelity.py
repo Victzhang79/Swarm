@@ -264,3 +264,55 @@ def test_lang_source_ext_table_covers_every_manifest_language():
     from swarm.brain.stack_detect import _LANG_SOURCE_EXTS, _MANIFEST_BACKEND
     missing = {lang for lang, _b in _MANIFEST_BACKEND.values()} - set(_LANG_SOURCE_EXTS)
     assert not missing, f"_LANG_SOURCE_EXTS 漏登记语言：{missing}（它们在多清单冲突里恒输）"
+
+
+# ══════════════════════════════════════════════
+# G-H11：考卷同源对账是 Maven 独有——★本轮只做"缺席可辨"，重设计待拍板★
+# ══════════════════════════════════════════════
+#
+# `reconcile_template_exam` 用正则锚 `pom` 字面 + ```xml 围栏识别权威模板，于是对
+# npm/go/cargo 是**永久 no-op**——而"没有可对账的模板"与"有模板但我认不出来"在日志上
+# 逐字不可分（正是方法论硬检查④要防的形态）。
+# 补齐需要每栈一套"权威模板 → 考卷断言"驱动（package.json deps → `grep '"x":'`、
+# go.mod → module 断言、Cargo.toml → …），属**重设计而非逐点补**（26 号文原文建议），
+# 需先拍板范围。本轮只做一件不可省的事：**让缺席变成机读可辨**。
+
+def _plan_with(desc):
+    class _S:
+        def __init__(self, d):
+            self.description = d
+    class _P:
+        def __init__(self, x):
+            self.subtasks = x
+    return _P([_S(desc)])
+
+
+def test_non_maven_template_stack_is_detected():
+    """有权威模板痕迹但本机制不支持的栈，必须能被认出来（否则告警无从触发）。"""
+    from swarm.brain.contract_utils import _authoritative_template_stacks as f
+    assert f(_plan_with("创建 package.json（原样写入下述权威模板）")) == {"npm"}
+    assert f(_plan_with("创建 go.mod（原样写入下述权威模板）")) == {"go"}
+
+
+def test_maven_template_is_the_supported_stack():
+    """Maven 是当前唯一被支持的栈——判据本身也要能认出它（否则会误报"不支持"）。"""
+    from swarm.brain.contract_utils import _authoritative_template_stacks as f
+    assert f(_plan_with("创建 pom.xml（原样写入下述权威模板）")) == {"maven"}
+
+
+def test_no_template_no_noise():
+    """无权威模板的普通子任务 → 空集，绝不产生噪声告警。"""
+    from swarm.brain.contract_utils import _authoritative_template_stacks as f
+    assert f(_plan_with("实现 AlarmService 的发送逻辑")) == set()
+
+
+def test_unsupported_stack_absence_is_reported():
+    """★接线事实：不支持的栈必须在咽喉处告警 + record_degrade★
+    否则这个 Maven 独有的机制会对 npm/go 工程永久静默失效——
+    "空返回是正常返回"正是 norms 层死了 12 天没人知道的同一个形态。"""
+    import inspect
+
+    from swarm.brain import contract_utils
+    src = inspect.getsource(contract_utils.inject_build_scaffold_subtasks)
+    assert "_authoritative_template_stacks" in src
+    assert "non_maven_stack_unsupported" in src
