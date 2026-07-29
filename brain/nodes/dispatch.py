@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 
@@ -876,6 +877,31 @@ async def dispatch(state: BrainState) -> dict:
             if not _t.done():
                 _t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        # ★异常退出时把本批派发落到【持久】通道（26 号文 C-14）★
+        # 病灶：subtask_dispatch_totals 的唯一写点在正常出口（下方 ~999 行）；此处 raise 后
+        # LangGraph **丢弃该 superstep 的全部 channel 写**，于是本批派发在账上从未发生过。
+        # 而 runner 的两个消费者都以该表为唯一驱动：
+        #   ① 幽灵件清扫（runner:1489）→ 本批子任务的沙箱产物不被清扫；
+        #   ② 终态账务守恒（runner:1637）→ "派发过却无账"的蒸发不可见；
+        #   并且 salvage 据此算 completed 会与 DB 的 completed_subtasks 公开矛盾。
+        # 精确命中 cancel / 墙钟 / 预算三条最常见的非正常退出。
+        # 治法：走 append-only 的 task_audit_log（不进 state，故不受 superstep 丢弃影响），
+        # 复盘与运维据 event=dispatch_aborted 可还原本批到底派了谁。
+        # best-effort：审计失败绝不改变异常传播（append_task_audit 自身已吞异常）。
+        try:
+            from swarm.project import store as _pstore
+            _pstore.append_task_audit(
+                str(state.get("task_id") or ""), "dispatch_aborted",
+                project_id=str(state.get("project_id") or "") or None,
+                description=f"dispatch 异常退出，本批已派发 {len(_spawned_ids)} 个子任务",
+                detail=json.dumps({"spawned": sorted(_spawned_ids)}, ensure_ascii=False))
+            logger.warning(
+                "[DISPATCH] C-14 异常退出：本批 %d 个已派发子任务不会进 state 账"
+                "（LangGraph 丢弃本 superstep 写）→ 已落 task_audit_log(dispatch_aborted)："
+                "%s；幽灵件清扫/终态守恒对本批失明，请据审计行人工核验",
+                len(_spawned_ids), sorted(_spawned_ids)[:8])
+        except Exception:  # noqa: BLE001 — 留痕绝不改变异常传播
+            logger.warning("[DISPATCH] C-14 异常退出留痕失败（不影响异常传播）", exc_info=True)
         raise
 
     def _worker_batch_context() -> dict:

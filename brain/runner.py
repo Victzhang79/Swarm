@@ -1452,6 +1452,25 @@ def _attach_observability_account(token_usage: dict[str, Any],
             token_usage["validate_downgraded_subtasks"] = _vd[:30]
     except Exception:  # noqa: BLE001 — 观测账增强面，绝不阻断终态写
         pass
+    # ★账务守恒必须在【三终态共同出口】做（26 号文 C-14）★
+    # 原先 dispatched_unaccounted 只在 _failed_machine_account 里算——那是 FAILED 专路。
+    # 于是"派发过却无账"的蒸发在 DONE / PARTIAL 终态**完全不检查**：任务标 DONE、
+    # 掉的那几个子任务无人提。而 DONE 恰恰是最需要这条守恒的终态——FAILED 本来就会被人查，
+    # 一个静默丢了子任务的 DONE 不会。
+    # 判据与 FAILED 路径逐字同源（totals − results − abandoned），不另造第二把尺子。
+    try:
+        _tot = st.get("subtask_dispatch_totals") or {}
+        _sres = st.get("subtask_results") or {}
+        _abn = set(st.get("abandoned_subtask_ids") or [])
+        _lost_ids = sorted(sid for sid in _tot if sid not in _sres and sid not in _abn)
+        if _lost_ids and "dispatched_unaccounted" not in token_usage:
+            token_usage["dispatched_unaccounted"] = _lost_ids
+            logger.warning(
+                "[RUNNER] 终态账务守恒（三终态共同出口）：%d 个子任务派发过却无账"
+                "——它们的产出蒸发了且此前在 DONE/PARTIAL 路径完全不被检查: %s",
+                len(_lost_ids), _lost_ids[:8])
+    except Exception:  # noqa: BLE001 — 对账失败绝不阻断终态写
+        logger.warning("[RUNNER] 终态账务守恒对账异常（跳过）", exc_info=True)
     return token_usage
 
 
