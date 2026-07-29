@@ -125,6 +125,41 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# ★启动崩溃【已发生】但归因不明族（26 号文 C-6）★
+# 病灶：本项目头号启动崩形态（Spring 的 BeanCreationException / APPLICATION FAILED TO
+# START）被【刻意】排除在 _CODE_ERROR_PATTERNS 之外——那个决定是对的（它们常裹外部依赖
+# 缺失，判 code_error 会把环境冤枉成代码）。但排除之后它们落进了 `inconclusive`，
+# 而 inconclusive 的语义是"探活窗口耗尽/无任何已知形态命中"——于是
+#   「应用明确崩了，我们看见了崩溃日志，只是不确定怪谁」
+#   「什么都没发生，什么也没看到」
+# 被写成了**同一个结果**，两者在交付面上都只是一行 skipped。
+# 治法不是改判 failed（那会重新引入冤枉），是给它一个**自己的名字**：
+# startup_crash_unattributed —— 仍 skipped（不阻断、不冤枉代码），但 degraded 可见、
+# 消息里明说"启动确实崩了"，让交付面与复盘一眼可辨。
+_STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
+    "java": (
+        r"APPLICATION FAILED TO START",
+        r"BeanCreationException",
+        r"BeanInstantiationException",
+        r"UnsatisfiedDependencyException",
+        r"BeanDefinitionStoreException",
+        r"ApplicationContextException",
+    ),
+    "node": (
+        r"\bUnhandledPromiseRejection\b",
+        r"code:\s*'ERR_",
+    ),
+    "python": (
+        r"Traceback \(most recent call last\)",
+    ),
+    "go": (
+        r"^panic:",
+    ),
+    "rust": (
+        r"thread '.*' panicked at",
+    ),
+}
+
 # F2：import/模块/类加载缺失族——捕获组提取缺失符号名（模块名/类 FQN，按语言表）。
 # 判定不再硬归类1：符号解析为【项目内】→ code_error failed；【项目外/无法解析】→
 # dependency_missing skipped（沙箱不保证装项目第三方运行时依赖，环境绝不伪装代码失败）。
@@ -464,9 +499,19 @@ if [ -z "$PROBE_TOOL" ]; then
 else
   echo "{MARK_PROBE_TOOL}$PROBE_TOOL"
 fi
+# ★探活必须取回 HTTP 状态码（26 号文 C-5）★
+# 原判据是 `curl -s -o /dev/null`——**没有 -f**，curl 对 500 一样退 0。于是"应用起来了但
+# 每个接口都 500"与"应用健康"在闸门眼里完全相同，"真启动"实际只证明了"端口通"。
+# 这里把状态码写进 SMOKE_HTTP_CODE，由上层分类器裁决；TCP 兜底路径（无 curl）如实
+# 置 000 并在结果里标注"本轮只做了端口探测"，绝不让降级探测冒充 HTTP 校验。
+SMOKE_HTTP_CODE=""
 smoke_probe_once() {{
+  SMOKE_HTTP_CODE=""
   case "$PROBE_TOOL" in
-    curl) curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${{SMOKE_PORT}}${{SMOKE_HEALTH}}" ;;
+    curl)
+      SMOKE_HTTP_CODE=$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 \
+        "http://127.0.0.1:${{SMOKE_PORT}}${{SMOKE_HEALTH}}" 2>/dev/null) || return 1
+      [ -n "$SMOKE_HTTP_CODE" ] && [ "$SMOKE_HTTP_CODE" != "000" ] ;;
     devtcp) (exec 3<>"/dev/tcp/127.0.0.1/${{SMOKE_PORT}}") 2>/dev/null ;;
     python3) python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',${{SMOKE_PORT}}))==0 else 1)" ;;
     *) return 1 ;;
@@ -504,7 +549,7 @@ if [ -n "$PROBE_TOOL" ]; then
       break
     fi
     if smoke_probe_once; then
-      echo "{MARK_PROBE}ok"
+      echo "{MARK_PROBE}ok:${{SMOKE_HTTP_CODE:-none}}"
       SMOKE_OK=1
       break
     fi
@@ -532,7 +577,8 @@ exit 0"""
 def parse_smoke_markers(output: str) -> dict[str, Any]:
     """从沙箱 stdout+stderr 解析结构化标记（纯函数）。"""
     out = output or ""
-    probe_sequence = re.findall(rf"{MARK_PROBE}(\w+)", out)
+    # `ok:200` 形态需带冒号——`\w+` 会把状态码切掉，令 C-5 的 HTTP 校验静默退化回端口闸
+    probe_sequence = re.findall(rf"{MARK_PROBE}([\w:]+)", out)
     tool_m = re.search(rf"{MARK_PROBE_TOOL}(\w+)", out)
     probe_tool = tool_m.group(1) if tool_m else None
     rc_m = re.search(rf"{MARK_APP_RC}(alive|-?\d+)", out)
@@ -608,10 +654,48 @@ def classify_smoke_outcome(
         "probe_sequence": list(probe_sequence),
         "language_key": language_key,
     }
-    if "ok" in probe_sequence:
+    # ★探活 ok 只是"有人应答"，还要看【应答了什么】（26 号文 C-5）★
+    # 标记形态：`ok`（TCP 兜底，无状态码）| `ok:<http_code>`（curl 路径）。
+    _ok_tokens = [t for t in probe_sequence if t == "ok" or t.startswith("ok:")]
+    _http_code: str | None = None
+    for _t in _ok_tokens:
+        if ":" in _t:
+            _http_code = _t.split(":", 1)[1]
+    if _http_code and _http_code not in ("none", "000"):
+        details["probe_http_code"] = _http_code
+    if _ok_tokens:
         if app_rc == "alive":
+            # 5xx = 服务起来了但在报错。**刻意不判 failed**：沙箱内无 DB/无外部服务，
+            # 500 极可能是环境缺失（fail-honest 铁律：环境绝不伪装代码失败）。但也**绝不
+            # 判 passed**——原判据 `curl -s -o /dev/null` 没有 -f，对 500 一样退 0，于是
+            # "每个接口都 500"与"应用健康"在闸门眼里完全相同，"真启动"实际只证明了端口通。
+            # 独立 outcome + degraded，让交付面看得见"这次没验到应用真的能服务"。
+            if _http_code and _http_code[:1] == "5":
+                details["degraded"] = True
+                logger.warning(
+                    "[RUNTIME_SMOKE] 探活应答 HTTP %s（5xx）——服务在跑但健康端点报错。"
+                    "沙箱无外部依赖时 5xx 常为环境所致，故不判代码失败；但也绝不判通过",
+                    _http_code)
+                return RuntimeSmokeResult(
+                    "skipped", "http_server_error",
+                    f"应用已监听且应答，但健康端点返回 HTTP {_http_code}（5xx）——"
+                    "服务未真正可用；沙箱缺外部依赖时 5xx 常为环境所致，不判代码失败也不判通过",
+                    log_tail=log_text, details=details)
+            if not _http_code or _http_code in ("none", "000"):
+                # curl 缺席 → 只做了 TCP 连通性探测。这不是 HTTP 校验，如实标注 degraded，
+                # 别让降级探测冒充"真启动"（北极星的第三道确定性闸就是靠它立信）。
+                details["degraded"] = True
+                details["probe_depth"] = "tcp_only"
+                logger.warning(
+                    "[RUNTIME_SMOKE] 环境无 curl → 本轮只做了 TCP 端口探测（未校验 HTTP "
+                    "状态码）：通过结论的强度低于 HTTP 校验，已标 degraded")
+                return RuntimeSmokeResult(
+                    "passed", "started_tcp_only",
+                    "运行时冒烟通过（**仅端口探测**：环境无 curl，未校验 HTTP 状态码）",
+                    log_tail=log_text, details=details)
             return RuntimeSmokeResult(
-                "passed", "started", "运行时冒烟通过：应用启动且探活应答",
+                "passed", "started",
+                f"运行时冒烟通过：应用启动且健康端点应答 HTTP {_http_code}",
                 log_tail=log_text, details=details)
         # F4：探活曾 ok 但被测进程已退出——应答者可能是残留 listener/其他进程，不假绿
         logger.warning(
@@ -692,6 +776,19 @@ def classify_smoke_outcome(
             log_tail=log_text, details=details)
 
     details["degraded"] = True
+    # C-6：崩溃【已发生】≠ 什么都没观测到。给它自己的名字，别与"窗口耗尽"混为一谈。
+    crash_hits = _match_family(_STARTUP_CRASH_PATTERNS, language_key, log_text)
+    if crash_hits:
+        details["startup_crash_hits"] = crash_hits
+        logger.warning(
+            "[RUNTIME_SMOKE] 启动确实崩溃（命中 %s）但归因不明——该族常裹外部依赖缺失，"
+            "判 code_error 会把环境冤枉成代码，故仍 skipped；但绝不与"
+            "'什么都没观测到'共用 inconclusive", crash_hits[:3])
+        return RuntimeSmokeResult(
+            "skipped", "startup_crash_unattributed",
+            f"应用启动过程中确实崩溃（命中 {crash_hits[:3]}），但该形态常裹外部依赖缺失，"
+            "无法确定性归因到代码——不判失败（绝不冤枉代码），也绝不当作'未观测到问题'",
+            log_tail=log_text, details=details)
     return RuntimeSmokeResult(
         "skipped", "inconclusive",
         "探活窗口耗尽/进程退出但无任何已知形态命中，不确定（绝不默认判代码错），降级跳过",

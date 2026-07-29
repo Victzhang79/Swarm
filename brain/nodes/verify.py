@@ -917,6 +917,14 @@ async def verify_runtime(state: BrainState) -> dict:
         }, mig_degraded + accept_degraded)
     if res.status == "passed":
         logger.info("[VERIFY_RUNTIME] 冒烟通过: %s", res.message)
+        # ★"通过"也可能是降级的通过（26 号文 C-5）★
+        # started_tcp_only = 环境没有 curl，本轮只做了端口连通性探测、没校验 HTTP 状态码。
+        # 结论方向仍是 passed（应用确实起来并在监听），但强度低于 HTTP 校验——北极星的
+        # 第三道确定性闸靠它立信，"验到了什么"必须在交付面如实可见，不能与真 HTTP 校验
+        # 通过写成同一个样子。
+        _passed_degraded: list[str] = []
+        if res.details.get("degraded") or res.classification != "started":
+            _passed_degraded.append(f"runtime_smoke_degraded_pass:{res.classification}")
         out = {
             "runtime_smoke_passed": True,
             "runtime_smoke_skipped": False,
@@ -929,7 +937,7 @@ async def verify_runtime(state: BrainState) -> dict:
             **mig_keys,
             **accept_keys,
         }
-        return _append_degraded(out, mig_degraded + accept_degraded)
+        return _append_degraded(out, _passed_degraded + mig_degraded + accept_degraded)
     if res.status == "failed":
         logger.warning("[VERIFY_RUNTIME] 冒烟失败(%s): %s", res.classification, res.message)
         out = {

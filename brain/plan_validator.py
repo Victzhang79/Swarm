@@ -370,7 +370,8 @@ def _near_miss_hint(bad_id: str, known_ids) -> str:
 
 
 def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
-                          baseline_vocab=None, baseline_ineligible=None) -> dict:
+                          baseline_vocab=None, baseline_ineligible=None,
+                          unfulfilled_subtask_ids=None) -> dict:
     """覆盖矩阵 = 从 plan.subtasks[].covers 现算的【派生数据】。
 
     定案（ACCEPTANCE_DESIGN 新键清单）：矩阵绝不进 state——它完全由 plan 与
@@ -386,7 +387,18 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
         "dangling_covers": {subtask_id: [req_id,...]},  # 悬空引用（指向不存在的条目 ID）
         "baseline_covered": [{"id","reason"}],  # R31-1 T1：合法的"存量已满足"申报（reason 非空）
         "dangling_baseline": [req_id,...],      # 申报了清单外 ID（臆造，校验拒绝）
+        "covered_by_unfulfilled_only": [{"id","text","covered_by"}],  # 见下 unfulfilled_subtask_ids
       }
+
+    ★unfulfilled_subtask_ids（26 号文 C-3 治本，仅交付面传）★
+    本矩阵一直是"从 plan.subtasks[].covers 现算"——它只知道**计划打算让谁覆盖**，
+    完全不看那个子任务最后有没有真的干成。于是恢复阶梯三的 give-up 桩
+    （`l1_passed=True` + 方法体 `throw new UnsupportedOperationException`）覆盖的需求，
+    在交付报告里与真正实现的需求写成同一个样子：`covered`。
+    传入"没真正兑现的子任务 id 集"（桩/放弃/rebase 丢弃）后，**仅由这些子任务覆盖**的
+    需求被移出 covered_items、单列 covered_by_unfulfilled_only，交付面才诚实。
+    缺省 None → 逐字节向后兼容：规划期调用（validate_requirement_coverage）此时还没有
+    任何子任务跑过，本参数恒空，行为完全不变。
 
     R31-1 T1 覆盖口径：条目"被覆盖" = 被子任务 covers 引用 ∪ 被合法 baseline 申报
     （id 在清单内且 reason 非空——fail-closed，无依据申报不算覆盖）。
@@ -443,8 +455,10 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
               and entry["id"] not in _ineligible):
             baseline_valid.append(entry)
             baseline_ids.add(entry["id"])
+    _unfulfilled = {str(x).strip() for x in (unfulfilled_subtask_ids or []) if str(x).strip()}
     items_out: list[dict] = []
     uncovered: list[dict] = []
+    stub_only: list[dict] = []
     for it in valid_items:
         rid = str(it["id"]).strip()
         text = str(it.get("text") or "")
@@ -456,11 +470,17 @@ def build_coverage_matrix(plan, requirement_items, baseline_covered=None,
         })
         if not covered_by[rid] and rid not in baseline_ids:
             uncovered.append({"id": rid, "text": text})
+        elif (_unfulfilled and covered_by[rid] and rid not in baseline_ids
+              and set(covered_by[rid]) <= _unfulfilled):
+            # 覆盖它的子任务【全部】没真正兑现（桩/放弃/丢弃）——计划说覆盖了，产物没有。
+            # 只要还有一个真干成的子任务覆盖它，就仍算 covered（不苛求）。
+            stub_only.append({"id": rid, "text": text, "covered_by": covered_by[rid]})
     return {
         "total_items": len(items_out),
-        "covered_items": len(items_out) - len(uncovered),
+        "covered_items": len(items_out) - len(uncovered) - len(stub_only),
         "items": items_out,
         "uncovered": uncovered,
+        "covered_by_unfulfilled_only": stub_only,
         "dangling_covers": dangling,
         "baseline_covered": baseline_valid,
         "dangling_baseline": dangling_baseline,

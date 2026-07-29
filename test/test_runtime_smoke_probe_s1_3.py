@@ -115,12 +115,15 @@ def _run(manager, *, language_key=None, script="<script>"):
 # ───────────────────────── passed ─────────────────────────
 
 def test_passed_when_probe_ok():
+    # `ok:200` = curl 路径取回了 HTTP 状态码（26 号文 C-5：原探活 `curl -s -o /dev/null`
+    # 没有 -f，对 500 一样退 0 → "每个接口都 500"与"应用健康"在闸门眼里完全相同）
     mgr = _StubManager(stdout=_smoke_output(
-        probe=("refused", "ok"), app_rc="alive",
+        probe=("refused", "ok:200"), app_rc="alive",
         log="Started DemoApplication in 8.2 seconds"))
     res = _run(mgr, language_key="java")
     assert res.status == "passed"
     assert res.classification == "started"
+    assert res.details.get("probe_http_code") == "200"
     assert res.details.get("ran") is True
 
 
@@ -277,11 +280,17 @@ def test_panic_env_morphology_is_env_skipped(lang, log):
     ("rust", "thread 'main' panicked at src/main.rs:3:5:\nboom"),
 ])
 def test_bare_panic_without_subform_is_inconclusive(lang, log):
-    """裸 panic 无子形态命中 → inconclusive skipped（绝不默认判代码错）。"""
+    """裸 panic 无子形态命中 → **绝不判代码错**（本条不变，是本用例的真不变量）。
+
+    ★分类名变更（26 号文 C-6）：inconclusive → startup_crash_unattributed★
+    方向完全没变（仍 skipped、仍不冤枉代码），变的是它不再与"什么都没观测到"共用一个名字。
+    inconclusive 的语义是"探活窗口耗尽/无任何已知形态命中"；而裸 panic 是**我们确实看见了
+    崩溃日志，只是不确定怪谁**。两者在交付面上曾都只是一行 skipped，复盘无从分辨。"""
     mgr = _StubManager(stdout=_smoke_output(probe=("exited",), app_rc="2", log=log))
     res = _run(mgr, language_key=lang)
     assert res.status == "skipped", f"{lang}: {log}"
-    assert res.classification == "inconclusive"
+    assert res.classification == "startup_crash_unattributed"
+    assert res.details.get("degraded") is True, "崩溃归因不明必须 degraded 可见"
 
 
 # ───────────────── 类2 外部依赖缺失/环境 → skipped ─────────────────

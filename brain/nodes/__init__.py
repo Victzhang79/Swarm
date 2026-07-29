@@ -3223,6 +3223,15 @@ def _confirm_coverage_summary(state: BrainState) -> dict:
                 for u in matrix["uncovered"][:30]
             ],
             "baseline_covered_count": len(matrix["baseline_covered"]),
+            # C-3：仅由"没真正兑现的子任务"（桩/放弃/丢弃）覆盖的需求——人工闸必须看到
+            # "这几条虽然计划里有人认领，但落地的是抛 not-implemented 的桩"。
+            "covered_by_unfulfilled_only": [
+                {"id": u.get("id"), "text": str(u.get("text") or "")[:120],
+                 "covered_by": u.get("covered_by")}
+                for u in matrix.get("covered_by_unfulfilled_only", [])[:_DELIVER_ASSERT_ROWS_MAX]
+            ],
+            "covered_by_unfulfilled_only_count": len(
+                matrix.get("covered_by_unfulfilled_only", [])),
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("[CONFIRM] 覆盖摘要现算失败(payload 降级为空): %s", exc)
@@ -5673,10 +5682,18 @@ def _deliver_review_payload(state: BrainState) -> dict:
 
     try:
         from swarm.brain.plan_validator import build_coverage_matrix
+        # ★C-3（26 号文）：交付面必须区分"计划说覆盖了"与"产物真的兑现了"★
+        # 矩阵一直只从 plan.subtasks[].covers 现算，不看那个子任务最后干成没有。
+        # 恢复阶梯三的 give-up 桩 `l1_passed=True` + 方法体抛 UnsupportedOperationException，
+        # 覆盖的需求在交付报告里与真正实现的写成同一个样子。
+        # 口径与 brain.gates.partial_delivery_ids 同源——那里已把这些 id 纳入 PARTIAL 判据，
+        # 此处让它们在【需求级】也诚实（任务级已 PARTIAL，条目级不能还显示"已覆盖"）。
+        from swarm.brain.gates import partial_delivery_ids
         matrix = build_coverage_matrix(
             state.get("plan"), state.get("requirement_items"),
             state.get("baseline_covered"),
-            baseline_ineligible=state.get("baseline_ineligible_reqs"))  # R65E9-T1 F2：诚实交付报告
+            baseline_ineligible=state.get("baseline_ineligible_reqs"),  # R65E9-T1 F2：诚实交付报告
+            unfulfilled_subtask_ids=partial_delivery_ids(state))
         coverage = {
             "total": matrix["total_items"],
             "covered": matrix["covered_items"],
