@@ -82,7 +82,7 @@ class BrainState(TypedDict, total=False):
     plan_valid: bool                    # 计划验证结果
     plan_retry_count: int               # 计划重试次数
     plan_validation_issues: list[str]   # PlanValidator 问题列表
-    plan_validation_warnings: list[str]  # G3-2：规划期软警告（规则5 落空/C1 无主符号）机读面
+    plan_validation_warnings: list[str]  # G3-2：规划期软警告（规则5 落空/C1 无主符号）机读面——★R67M2-T3：validate_plan 全部 11 个 return【恒发】（含各早退与成功轮），空列表=本轮无软警告的如实表达；此前"非空才带"的条件发射与本键 round 注册相矛盾（LangGraph 对缺席键保持原值→上轮 warnings 粘滞进 payload 白名单/API/复盘面，B3 的 T4 文案自带本轮计数语义，粘滞即假信号）★
     # D09：VALIDATE_PLAN 失败原因回灌 PLAN——校验失败时写入本轮 issues 摘要，PLAN 重试时读它注入
     # LLM prompt（否则 after_validate 失败→increment_retry→plan 是【盲重试】，LLM 看不到上轮为何被否
     # →原样重生成同样坏计划→烧光 MAX_PLAN_RETRY→confirm/REJECT）。校验通过时清空，防跨轮粘滞。
@@ -257,6 +257,7 @@ class BrainState(TypedDict, total=False):
     contract_symbol_paths_unhealed: list  # R67E-P2（round-2 hunter Finding B）：本轮 finish 后仍未愈的契约类名 file-path 分叉符号名 [X,...]（greenfield 已愈=[]，棕地/歧义 punt 或畸形残留=非空，将死 L2）——★last-write-wins 观测键，绝不进 append-only degraded_reasons（coverage_gap_residual:196 同律：那里无人能清，愈合后陈旧粘滞会永久误拦 should_write_success 学习+误导 deliver）★；plan 节点 always-emit（愈合清空不粘滞）；纯诚实观测非门（未愈将由 L2 真失败兜底门，刻意不硬 REJECT 避免复刻 round67e 名分叉重产不收敛熔断）
     dep_ban_reconciled: dict            # R67M-T1（复核 A6/hunter F4）：本轮 finish 依赖禁令散文自愈成功账 {sid: {old, coords}}——always-emit last-write-wins 观测键（无命中={} 清空不粘滞），成功账零消费=新账无人收盲区；失败侧 dep_ban_reconcile_failed 走 *_failed 通用扫尾进 degraded（崩溃≠零命中）
     contract_symbols_base_referenced: list[str]  # R67M-T2 B5（23号文，round67m CVB 死因治本）：本轮 finish 安置前 base 查表转换账 ["符号→base路径(案由)"]——被认出为存量引用而跳过影子安置的契约符号（防 G1 ③f _created_class_shadows_base 硬打回）。always-emit last-write-wins 观测键（无转换=[] 不粘滞），成功账零消费=新账无人收盲区
+    t4_ambiguous_types: list[str]   # R67M2-T3 B3（24号文，round67m2 已见未治治本）：elaborate T4 布线检出的多落点歧义类型账——round67m2 实证"跳过布线"WARNING 轮2/3 各一次却零账可查（已见未治）。always-emit last-write-wins 观测键（无歧义=[] 不粘滞）；ambiguity 本体交 ③b fail-closed，此账只解决复盘盲区（24号文拍板先观测不单开闸）
     contract_symbols_layout_punted: list[str]  # R67M2-T2 C1（24号文，复核 HIGH-2）：本轮 finish 安置落点布局闸 punt 账 ["符号→落点路径"]——落点不在 JVM 可编译源码布局内（幽灵路径=mvn 不编译假过）而【确定性永不建安置】的契约符号。validate_plan C1 owner 闸消费：punt 符号仍无主时【不占 0.4 无主宽容直接硬打回】（防胖契约下符号静默蒸发）。always-emit last-write-wins（无 punt=[] 不粘滞）
     plan_validation_issue_history: list[str]  # R67M-T2 B1（23号文，round67m 主死因治本）：VALIDATE→PLAN 重试循环的【修复记忆】——历轮校验 issues 去重累积（increment_retry 单点，全闸种必经）。round67m 实证：只注上轮 issues+全量重拆=非单调振荡（轮4 CVB shadow=轮1 逐字回归烧 3h15m）；PLAN 注入点把"历轮曾现而本轮已消失"的缺陷作"绝不许回归"硬约束注入。清空纪律：validate 通过 / REVISE·failure replan 新周期（与 plan_validation_prev_structural 同点对称）
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
@@ -320,6 +321,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "contract_symbol_paths_unhealed": "round",  # R67E-P2：last-write-wins 观测键，愈合清空不粘滞（Finding B）
     "dep_ban_reconciled": "round",  # R67M-T1（复核 A6）：自愈成功账 last-write-wins 观测键，无命中={} 不粘滞
     "contract_symbols_base_referenced": "round",  # R67M-T2 B5：base 查表转换账 last-write-wins 观测键，无转换=[] 不粘滞
+    "t4_ambiguous_types": "round",  # R67M2-T3 B3：T4 多落点观测账 last-write-wins，无歧义=[] 不粘滞
     "contract_symbols_layout_punted": "round",  # R67M2-T2 C1：布局闸 punt 账 last-write-wins，无 punt=[] 不粘滞（C1 owner 闸消费=硬打回面）
     "plan_validation_issue_history": "monotonic",  # R67M-T2 B1：重试窗口内单调累积（increment_retry 单点）；validate 通过/REVISE·replan 新周期整体清空（与 prev_structural 同点）。复核 LOW-4 口径注：prev_structural 注册 "round" 因其值每轮【重算覆盖】（last-write-wins），本键值在窗口内【只增不改】——累积语义差异故分类不同，非同律漂移
     "baseline_covered": "round",

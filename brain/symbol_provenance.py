@@ -234,6 +234,9 @@ def wire_created_type_references(plan) -> dict[str, list]:
     通道 b：跨子任务 create 的唯一 code stem（round63 真死因 AlarmSendLog 不在契约里）。
     依赖边交本 pass 之后的既有 G2（wire_readable_provenance）。
     返回 {"wired": [(sid, path)], "skipped_ambiguous": [...], "skipped_fanout": [...]}。
+    R67M2-T3 B3（24号文）：skipped_ambiguous=多落点观测账——round67m2 实证"跳过布线"
+    WARNING 轮2/3 各一次【已见未治】（不上账复盘只能反推），elaborate 落 state
+    always-emit 观测键；ambiguity 本体交 ③b fail-closed（同 simple-name 异 FQN）。
     """
     res: dict[str, list] = {"wired": [], "skipped_ambiguous": [], "skipped_fanout": []}
     subs = list(getattr(plan, "subtasks", None) or [])

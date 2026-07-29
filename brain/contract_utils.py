@@ -5245,7 +5245,9 @@ def contract_owner_ledger_block(
 
     栈中立：仅收 classpath_fqn_key 非 None（JVM 类路径命名空间）——同名异包冲突是 JVM simple-name bean
     命名空间特有问题（Spring/MyBatis），Go/Py/TS 同名跨包合法故天然不入清单。无 JVM 认领符号 → 返回空串
-    （一字不加，不污染非 JVM 栈 prompt）。条目按 basename 去重排序、上限 60 条防 prompt 膨胀。
+    （一字不加，不污染非 JVM 栈 prompt）。条目按 basename 去重，【分两层】防 prompt 膨胀
+    （R67M2-T3 B5）：详情层 60 条带 owner 路径（高危后缀族优先入册），其余进简表层（仅类名、
+    上限 300）——禁重名硬约束对简表层同样生效，两层均爆才丢弃且必 WARNING 带样本。
     """
     seen: dict[str, str] = {}       # basename -> owner 展示路径（契约首见为准）
     for e in ((contract or {}).get("interfaces") or []):
@@ -5287,21 +5289,82 @@ def contract_owner_ledger_block(
     if not seen and not _td_rows:
         return ""
     _cap = 60
-    _picked = sorted(seen.items())[:_cap]                       # 契约池先占（保底不被逐出）
+    # ★R67M2-T3 B5（24号文；复核 reviewer HIGH 整改后定稿）：帽打爆的治本=【分层】而非
+    # 换排序★。round67m2 实证 218 文件大 plan 台账 136 条撞帽 60、81 条预防保护静默蒸发；
+    # 初版只把"高危后缀族"排到帽内，被复核用本仓 ③b 历史实证证伪——45 次同名异包命中里
+    # 初版后缀表只覆盖 29%，而 TOP-2（AlarmLevelEnum/AlarmChannelSender 各 5 次）恰好落表外，
+    # 且新模块类天然字母靠前 → 换排序对经验主力撞车族是【净退化】。
+    # 定稿两层：
+    #   详情层（_cap 60，带 owner 路径）：高危族优先——供 batch 直接 import 的可执行指引；
+    #   简表层（_cap_brief，仅 simple name 无路径）：其余全部——【禁止别包 create 同名】这条
+    #     硬约束本身不需要路径即可执行，token 成本约为详情行的 1/5。
+    # 于是"完全掉出台账=零保护"从此只发生在两层总帽都爆的病态语料（仍 WARNING 带样本）。
+    # 后缀表按本仓 ③b 历史命中扩容（enum/sender/template/constants/registry/request 族均系
+    # 实锤 TOP，初版全盲）。诚实边界：表非穷尽，但分层后表的准确度只决定"谁拿到路径指引"，
+    # 不再决定"谁有没有保护"——赌错的代价从静默失守降为指引降级。
+    _cap_brief = 300
+    _HIGH_RISK_SUFFIXES = (
+        "service", "serviceimpl", "impl", "controller", "config", "configuration",
+        "mapper", "repository", "dao", "util", "utils", "manager", "factory",
+        "client", "gateway", "listener", "handler",
+        # ↓ round67m2 复核实证扩容（本仓 ③b 历史 45 次命中的 TOP 族，初版表外）
+        "enum", "enums", "constant", "constants", "sender", "registry",
+        "request", "response", "message", "dto", "vo", "entity", "model",
+        "template", "interceptor", "filter", "aspect", "properties",
+        "job", "task", "strategy", "engine", "provider", "resolver",
+        "validator", "converter", "adapter")
+
+    def _priority(item) -> tuple:
+        # 键形态两源同构：契约池/td 池 basename 均来自 classpath_fqn_key，【带扩展名】
+        # （AlarmService.java）——统一剥扩展名再配后缀（带扩展名时 .endswith("service")
+        # 永假=高危优先形同虚设，测试逮到的真 bug）。次键 lower 全序保确定性。
+        base = item[0].lower().rsplit(".", 1)[0]
+        return (0 if base.endswith(_HIGH_RISK_SUFFIXES) else 1, item[0].lower())
+
+    _picked = sorted(seen.items(), key=_priority)[:_cap]        # 契约池先占（保底不被逐出）
     _td_budget = max(0, _cap - len(_picked))
-    _picked += sorted(_td_rows.items())[:_td_budget]
-    _dropped = max(0, len(seen) - _cap) + max(0, len(_td_rows) - _td_budget)
+    _picked += sorted(_td_rows.items(), key=_priority)[:_td_budget]
+    # 详情层之外的全部落简表层（契约池溢出优先于 td 池，同 _priority 序）
+    _detail_keys = {b for b, _ in _picked}
+    _rest = ([(b, p) for b, p in sorted(seen.items(), key=_priority)
+              if b not in _detail_keys]
+             + [(b, p) for b, p in sorted(_td_rows.items(), key=_priority)
+                if b not in _detail_keys])
+    _brief = _rest[:_cap_brief]
+    _dropped = max(0, len(_rest) - _cap_brief)
     if _dropped:
         logger.warning(
-            "[OWNER-LEDGER] 禁写台账超预算截断：丢弃 %d 条（契约 %d + tech_design %d 入册 %d/上限 %d）"
-            "——被丢弃类不受台账预防保护，仅靠 G1 ③b/层② 消解兜底",
-            _dropped, len(seen), len(_td_rows), len(_picked), _cap)
+            "[OWNER-LEDGER] 禁写台账两层预算均爆：丢弃 %d 条（契约 %d + tech_design %d；"
+            "详情层 %d/%d + 简表层 %d/%d）——被丢弃类【不受台账预防保护】，仅靠 G1 ③b/层② "
+            "消解兜底；样本：%s",
+            _dropped, len(seen), len(_td_rows), len(_picked), _cap,
+            len(_brief), _cap_brief, [b for b, _ in _rest[_cap_brief:][:8]])
+    elif _brief:
+        logger.info(
+            "[OWNER-LEDGER] 禁写台账分层：详情层 %d 条（带 owner 路径）+ 简表层 %d 条"
+            "（仅类名，禁重名约束同样生效）", len(_picked), len(_brief))
     rows = "\n".join(f"  - {b} → 唯一 owner：{p}" for b, p in _picked)
+    _brief_block = ""
+    if _brief:
+        # 简表条目=`类名@模块`（剥扩展名——"以下类"说的是类名，`Foo.java` 是文件名不是类名，
+        # 且 300 条扩展名纯耗 token）。★带模块名（R2 复核 hunter L-8）：batch prompt 里
+        # 没有 file_plan，只说"落点见 tech_design 设计"等于无处可查 → LLM 要么放弃、要么
+        # 【臆造 import 路径】，撞"绝不逼 worker 臆造"硬纪律。模块名是能确定性给出的最小
+        # 可执行线索（+约 15% token，仍远低于详情行）；跨子任务引用的实际 readable/依赖边
+        # 由 elaborate 的 T4 布线确定性补，故简表层不给全路径不构成失能。★
+        _brief_items = [
+            f"{b.rsplit('.', 1)[0]}@{p.split('/', 1)[0]}" if "/" in p else b.rsplit(".", 1)[0]
+            for b, p in _brief]
+        _brief_block = (
+            "\n以下类同样【已有唯一 owner】（格式=类名@所属模块，本清单从简不列全路径）——"
+            "同样【严禁】在别包/别模块 create 同名类；需使用时按其所属模块的设计落点 import，"
+            "【不确定路径时不要臆造】，在子任务描述中声明该依赖即可（跨子任务引用会被确定性"
+            "布线补齐）：\n  " + "、".join(_brief_items))
     return (
         "\n\n【硬约束-P8 已认领类唯一 owner（禁止同名异包重复创建）】以下类已由契约指定【唯一 owner "
         "落点】。本批若需使用它们，请在 scope.readable 引用其 owner 路径（import 该 FQN），"
         "【严禁】在其他包/模块的路径下 create 同名（simple name 相同）的类——JVM 类路径下同名类会导致"
-        f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}")
+        f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}{_brief_block}")
 
 
 def _contract_owner_authority(

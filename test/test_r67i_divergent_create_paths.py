@@ -257,17 +257,25 @@ def test_l1_ledger_empty_when_nothing():
 
 def test_l1_ledger_contract_never_evicted_by_td_flood(caplog):
     """★Hunter HIGH 整改锁（真实复现的反例）★ 契约 owner（Z 开头字母序最末）+ 100 条 tech_design
-    条目 → 契约条目【保底不被逐出】台账（分池预算，契约池先占）；截断必打 WARNING 可观测。"""
+    条目 → 契约条目【保底不被逐出】详情层（分池预算，契约池先占）。
+
+    R67M2-T3 B5 语义更新：溢出详情帽的条目不再【丢弃】而是落【简表层】（仅类名、禁重名
+    约束同样生效）——故本例不再打"截断 WARNING"，改断言溢出条目确实拿到简表层保护
+    （守护意图未削弱：契约保底 + 溢出可观测两条都在，且从"可观测地丢失"升级为"不丢失"）。
+    两层总帽都爆才 WARNING，见 test_round67m2_batch3_polish 的分层用例。"""
     import logging
     contract = {"interfaces": [{
         "name": "ZOwnerInterface",
         "defined_in": "ruoyi-common/src/main/java/com/ruoyi/common/ZOwnerInterface.java"}]}
     fp = [_td(f"ruoyi-alarm/src/main/java/com/ruoyi/alarm/gen/AClass{i:03d}.java")
           for i in range(100)]
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         block = contract_owner_ledger_block(contract, tech_design_file_plan=fp)
     assert "ZOwnerInterface" in block, "契约条目绝不被 tech_design 洪泛挤出（分池保底）"
-    assert any("截断" in r.message for r in caplog.records), "截断丢弃必须 WARNING 可观测"
+    _detail = [l for l in block.splitlines() if "→ 唯一 owner：" in l]
+    assert any("ZOwnerInterface" in l for l in _detail), "契约条目须在【详情层】（带 owner 路径）"
+    assert "AClass099" in block, "溢出详情帽的条目落简表层，绝不静默蒸发"
+    assert any("分层" in r.message for r in caplog.records), "分层入册必须可观测"
 
 
 def test_l1_ledger_no_warning_under_budget(caplog):

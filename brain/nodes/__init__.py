@@ -944,6 +944,23 @@ def _merge_designed_file_plan(file_plan, new_entries, allowed_modules=None):
     return merged, added, dropped
 
 
+def _log_reject_issues(tag: str, issues) -> None:
+    """R67M2-T3 A4（24号文）：打回日志带计数头——issues[:3] 截断曾致陪跑误判
+    （round67m2 轮1：headline 3 条/池≥7，journal 按 3 条定因漏全貌）。
+    打回面条数=重产反馈池规模（A1 治本后全量送达），计数头是复盘唯一锚点。
+
+    锚点覆盖面（复核 reviewer LOW 如实登记）：本 helper 只统一 validate_plan 的四把
+    确定性闸（C1/C2/R40-1/G1）。同节点其余 plan_valid=False 出口本就各带计数或全量
+    （struct 全量 join / plan_batch_failed 带 len+模块名 / coverage_watermark 带 len /
+    coverage 带"（%d 条 issue）"），语义不失明但不匹配"共 N 条"这个 grep 锚点——按
+    该锚点扫日志时须知覆盖面仅四闸。
+    计数口径（复核 reviewer LOW）：N=【去重前】原始 issues 数；LLM 实收反馈经
+    _format_validation_feedback 的 _dedup_issue_lines 去重，页头自报数可小于此 N，
+    两者差值即重复条目数——文案已显式标注，避免复盘再把两个数字读成矛盾。
+    """
+    logger.warning("%s → 打回 PLAN（共 %d 条，去重前）: %s", tag, len(issues), issues[:3])
+
+
 async def _ensure_file_plan_covers_requirements(state, llm, file_plan, *, fallback_llm=None):
     """R65E7-L2 上游根治：确保 file_plan 覆盖每条已抽取需求。返回 (file_plan, augmented: bool)。
 
@@ -2387,6 +2404,8 @@ async def plan(state: BrainState) -> dict:
             "contract_symbols_base_referenced": [],
             # R67M2-T2 C1 always-emit：SIMPLE 不走 finish，无布局闸 punt 面，恒 []（防跨轮粘滞）
             "contract_symbols_layout_punted": [],
+            # R67M2-T3 B3 always-emit：SIMPLE 不走 elaborate，无 T4 歧义面，恒 []（防跨轮粘滞）
+            "t4_ambiguous_types": [],
             # R31-1 T1 always-emit：SIMPLE 单 trivial 子任务自证覆盖（覆盖校验早退），无申报面。
             "baseline_covered": [],
             # R32-1 U2 always-emit：SIMPLE 不走分批，恒 {}
@@ -3344,7 +3363,24 @@ async def validate_plan(state: BrainState) -> dict:
     # G3-2（round38c 主题G）：规则5 落空/C1 契约无主符号等 warnings 此前只 logger 无
     # state 键=API/盯跑不可见。累积进 plan_validation_warnings（成功 return 带上，进
     # payload 白名单）——让规划期软警告对盯跑脚本可见。
+    # ★R67M2-T3（复核 hunter HIGH 整改）：本键注册表声明 round（last-write-wins 每轮重算），
+    # 但此前 8 个 return 全是"非空才带"的条件发射——LangGraph 对 update 里缺席的键【保持原值】，
+    # 于是"本轮零 warning"= 上轮 warnings 原封粘滞，还会经 runner payload 白名单进 API/复盘。
+    # B3 新增的 T4 文案自带本轮计数语义（"检出 N 个"），粘滞即最坏形态的假信号——正是 B3 要消灭
+    # 的"按错证据定因"。全部改恒发（含各早退分支），空列表就是"本轮无软警告"的如实表达。
     _vp_warnings: list[str] = []
+    # R67M2-T3 B3（24号文；复核 hunter MEDIUM 整改后【上移】至此）：T4 多落点歧义观测账升
+    # 可见面。原位置在 C1 之后 → 结构校验失败/整模块分解失败两条早退轮完全绕过它，而那两轮
+    # 恰是 plan 最破碎、最该看见符号漂移的轮。本块只读 state 无任何前置依赖，故前移到所有
+    # 早退之前（SIMPLE 轮不走 elaborate，账恒 [] 无副作用）。24号文拍板"先观测不单开闸"：
+    # ambiguity 本体由 G1 ③b（同 simple-name 异 FQN）fail-closed 裁，此账只解决复盘盲区。
+    _t4_amb = state.get("t4_ambiguous_types") or []
+    if _t4_amb:
+        _vp_warnings.append(
+            f"T4 检出 {len(_t4_amb)} 个被引用类型存在多个落点（跳过布线=已见未治面，"
+            f"歧义本体交 ③b fail-closed）: {', '.join(map(str, _t4_amb[:8]))}")
+        logger.warning("[VALIDATE_PLAN] B3 T4 多落点观测账（共 %d 个）: %s",
+                       len(_t4_amb), _t4_amb[:8])
 
     if plan_obj is None:
         # R67J-H5 排除面（猎手复核点名要求显式说明）：plan 空多为 LLM 超时/截断/解析失败
@@ -3355,6 +3391,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_retry_count": retry_count,
             "plan_validation_issues": ["计划为空"],
             "plan_validation_feedback": "- 计划为空（PLAN 未产出任何子任务，请重新生成完整的子任务 DAG）",
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
 
     struct_result = validate_plan_structure(
@@ -3376,6 +3413,9 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": struct_result.issues,
             # D09：结构校验失败原因回灌 PLAN（悬空依赖/环/parallel_groups 悬空引用等）供重试修正
             "plan_validation_feedback": _format_validation_feedback(struct_result.issues, rotate=retry_count),
+            # R67M2-T3（hunter MEDIUM）：此前该早退连结构校验自己的 warnings 都丢（R67J-H5
+            # "其余闸早退软信号丢失"的漏网点）——恒发补齐
+            "plan_validation_warnings": _vp_warnings,
         }
 
     if effective_complexity(state) == Complexity.SIMPLE:  # 修复 12.3：澄清后定级优先
@@ -3386,6 +3426,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issues": [],
             "plan_validation_feedback": "",  # 通过即清空，防跨轮粘滞
             "plan_validation_issue_history": [],  # R67M-T2 B1：通过即清修复记忆（防跨轮粘滞）
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
             # R35-C 复核（hunter #3）：SIMPLE 通过路径也显式清缓存——结构对称，绝不依赖上游
             # plan() 同轮 SIMPLE 分支的顺带清理（跨节点隐式不变量正是横切盲区，见记忆）。
             "plan_batch_cache": {},
@@ -3416,6 +3457,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_retry_count": retry_count,
             "plan_validation_issues": _pb_issues,
             "plan_validation_feedback": _format_validation_feedback(_pb_issues, rotate=retry_count),
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
 
     # ── C1（round38c 主题C）：契约符号→owner 确定性对账（D5 前移到 PLAN 期）──
@@ -3444,8 +3486,7 @@ async def validate_plan(state: BrainState) -> dict:
             "C1 对账/L2 D5 对其不可见，交付验收以 degraded_summary 如实呈现",
             len(_cf_mods), _cf_mods[:5])
     if not _co_result.valid:
-        logger.warning("[VALIDATE_PLAN] C1 契约符号对账未通过 → 打回 PLAN: %s",
-                       _co_result.issues[:3])
+        _log_reject_issues("[VALIDATE_PLAN] C1 契约符号对账未通过", _co_result.issues)
         # R67J-H5：全闸收敛账（跨闸弹跳/同闸不收敛熔断）+ 早退 always-emit 软警告
         # （hunter #4 的 sibling 捞净：此前仅 G1 早退带 warnings，其余闸早退该轮软信号丢失）
         _h5_retry, _h5_acct = _gate_fuse_and_account(
@@ -3457,7 +3498,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _co_result.issues, rotate=retry_count),
-            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
 
     # ── DR-PM66-C2(#112) 考卷同源·接口方法名：契约 signature vs owner 子任务描述方法名不得分叉 ──
@@ -3469,8 +3510,7 @@ async def validate_plan(state: BrainState) -> dict:
     for w in _css_result.warnings:
         _vp_warnings.append(str(w))
     if not _css_result.valid:
-        logger.warning("[VALIDATE_PLAN] C2 契约签名↔描述方法名分叉 → 打回 PLAN: %s",
-                       _css_result.issues[:3])
+        _log_reject_issues("[VALIDATE_PLAN] C2 契约签名↔描述方法名分叉", _css_result.issues)
         _h5_retry, _h5_acct = _gate_fuse_and_account(          # R67J-H5 全闸收敛账
             state, "C2", _css_result.issues, retry_count)
         return {
@@ -3480,7 +3520,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _css_result.issues, rotate=retry_count),
-            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
 
     # ── R40-1 file_plan 归属确定性闸：规划文件必须有 owner 子任务 ──
@@ -3497,8 +3537,7 @@ async def validate_plan(state: BrainState) -> dict:
         _vp_warnings.append(str(w))
         logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属: %s", w)
     if not _fp_result.valid:
-        logger.warning("[VALIDATE_PLAN] R40-1 file_plan 归属未通过 → 打回 PLAN: %s",
-                       _fp_result.issues[:3])
+        _log_reject_issues("[VALIDATE_PLAN] R40-1 file_plan 归属未通过", _fp_result.issues)
         _h5_retry, _h5_acct = _gate_fuse_and_account(          # R67J-H5 全闸收敛账
             state, "R40-1", _fp_result.issues, retry_count)
         return {
@@ -3508,7 +3547,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _fp_result.issues, rotate=retry_count),
-            **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+            "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
 
     # ── G1 模块 coherence 确定性闸（Task#9 审计①②）：每模块=恰好一个物理构建单元 ──
@@ -3534,9 +3573,9 @@ async def validate_plan(state: BrainState) -> dict:
             _vp_warnings.append(str(w))
             logger.warning("[VALIDATE_PLAN] G1 模块 coherence: %s", w)
         if not _mc_result.valid:
-            logger.warning(
-                "[VALIDATE_PLAN] G1 模块 coherence 未通过 → 打回 PLAN（模块≠单一物理构建单元）: %s",
-                _mc_result.issues[:3])
+            _log_reject_issues(
+                "[VALIDATE_PLAN] G1 模块 coherence 未通过（模块≠单一物理构建单元）",
+                _mc_result.issues)
             # ★R64-T3 同签名收敛熔断★ round64：G1 反馈注入 plan_batch，但其输出 schema 无
             # module/file_plan 字段 + P4 禁改前缀 → 反馈结构性无法执行，全量重产 33min 输出
             # 逐字节相同 → 触发一（同闸同签名连续两轮顶格 fail-fast）。签名走 R67F-T2
@@ -3556,7 +3595,7 @@ async def validate_plan(state: BrainState) -> dict:
                 # silent-hunter #4：早退分支也必须 always-emit 本轮软警告（含 G1 自己的 zero-dir
                 # warn + 上游 C1/R40-1 累积）——plan_validation_warnings 是 round 级键，早退漏带
                 # = 该轮软信号对 API/盯跑不可见。
-                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+                "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
             }
 
     # ── G7+G8 颗粒度/难度路由 smell（Task#9 审计④）：仅告警、绝不打回 ──
@@ -3707,7 +3746,7 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_validation_prev_structural": _h5_acct,
                 "plan_validation_feedback": _wm_loss_feedback(),
                 "coverage_watermark": _wm_cov_ids,
-                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+                "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
             }
         # A6（阶段3.4，2026-07-09 登记册）：覆盖缺口≤阈值 degraded 放行——替代全有全无
         # （round37 实证 2/108 未覆盖=整任务 REJECT）。放行条件全部满足：①已给过≥1 轮
@@ -3762,7 +3801,7 @@ async def validate_plan(state: BrainState) -> dict:
                 # R65E9-T1：本轮新拒的假 baseline id 入单调不合格集（reducer append+dedup 累积）→
                 # 下一轮 planner 再 declare 亦被无条件踢→逼建子任务，打断 limbo 死钉（保证收敛）。
                 "baseline_ineligible_reqs": _new_rejected,
-                **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+                "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
             }
         if _gap_allowed_pass:
             _gap_ids = [u["id"] for u in _wm_matrix["uncovered"]]
@@ -3902,8 +3941,11 @@ async def validate_plan(state: BrainState) -> dict:
         # S2-3：覆盖矩阵因 items 缺失被跳过时诚实留痕（degraded_reasons 是 reducer 键，
         # 追加去重；无跳过时不发键，零噪声）。
         **({"degraded_reasons": _coverage_degraded} if _coverage_degraded else {}),
-        # G3-2：规划期软警告（规则5 落空/C1 无主符号等）机读可见（无警告不发键）
-        **({"plan_validation_warnings": _vp_warnings} if _vp_warnings else {}),
+        # G3-2：规划期软警告（规则5 落空/C1 无主符号等）机读可见。
+        # R67M2-T3：★恒发★（原注释"无警告不发键"已随整改作废）——本 return 是【成功轮】，
+        # 也正是粘滞最常发生的场景：上轮打回带 warnings、本轮通过零 warnings，不发键=旧文案
+        # 原封留在 API/复盘面。空列表就是"本轮无软警告"的如实表达。
+        "plan_validation_warnings": _vp_warnings,
         # 阶段3.1：本轮覆盖集入水位（跳过覆盖闸的轮不发键——无口径可对账）
         **({"coverage_watermark": _wm_cov_ids} if _wm_cov_ids is not None else {}),
         # H-F5：A6 缺口残差（last-write-wins）——只在【本轮计划真放行】时发：gap 放行=

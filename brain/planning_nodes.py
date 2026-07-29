@@ -2805,7 +2805,18 @@ async def elaborate(state: BrainState) -> dict:
     """
     plan_obj = state.get("plan")
     if not plan_obj or not getattr(plan_obj, "subtasks", None):
-        return {"plan_elaborated": True}
+        # R67M2-T3 B3（复核双方 MEDIUM）：唯一早退也须 always-emit round 级观测账——
+        # 否则轮 N 落账、轮 N+1 plan 空 → 该键保留上轮值进 checkpoint，复盘读到陈旧账
+        # （正是 B3 要消灭的盲区形态；validate 侧虽被上游早退挡住不误报，账本身仍脏）。
+        # ★R2 复核 hunter M-3 当场逮到"补一个漏一个"复发：本早退还缺主返回的另两个
+        # ACCOUNTING_KEY_LIFECYCLE round 键（oversized_subtask_ids/invest_fail_count），
+        # 同构粘滞面——本批既然编辑这一行，就把该族一次补齐（纪律：全调用点覆盖）。★
+        return {
+            "plan_elaborated": True,
+            "t4_ambiguous_types": [],
+            "oversized_subtask_ids": [],
+            "invest_fail_count": 0,
+        }
 
     budget = _context_budget()
     invest_fail = 0
@@ -3008,6 +3019,8 @@ async def elaborate(state: BrainState) -> dict:
         wire_created_type_references,
     )
     _t4_pinned, _t4_wired = 0, []
+    _t4_ambiguous: list = []   # R67M2-T3 B3：多落点观测账（always-emit 防粘滞）
+    _t4_wire_failed = False    # R67M2-T3（R2 复核 M-4）：布线崩溃机读标记（崩溃≠零命中）
     # pin 与 wire 分开 try（hunter#1 HIGH）：pin 已就地提交 defined_in 后 wire 再抛，
     # 共用一条"跳过"日志=半应用状态被谎报成全无事发生——worker 拿到权威落点指令却没有
     # readable/依赖边，比 round63 前的裸猜更害人。分开 catch、各自留痕、带栈（hunter#4）。
@@ -3020,14 +3033,35 @@ async def elaborate(state: BrainState) -> dict:
         logger.warning("[ELABORATE] T4: 契约符号钉落点失败（非致命，本轮无新增 defined_in）: %s",
                        exc, exc_info=True)
     try:
-        _t4_wired = wire_created_type_references(plan_obj).get("wired") or []
+        _t4_res = wire_created_type_references(plan_obj)
+        # R67M2-T3 B3（24号文，round67m2 已见未治治本）：多落点歧义观测账——
+        # 检出"跳过布线"即落 state（last-write-wins 不粘滞），不再只活在日志。
+        # 刻意【不】单开闸（24号文拍板"先观测"）：ambiguity 本体由 ③b（同
+        # simple-name 异 FQN fail-closed）裁；此账只解决复盘盲区。
+        # ★取账紧跟调用、排在 wired 日志【之前】（复核 reviewer LOW）：日志后端抛异常
+        # 不该把已确定性拿到的账清成"本轮无歧义"（观测键的 fail-open 方向最恶心）。
+        _t4_ambiguous = _t4_res.get("skipped_ambiguous") or []
+        _t4_wired = _t4_res.get("wired") or []
         if _t4_wired:
             logger.info("[ELABORATE] T4: 跨子任务类型引用布线 %d 条（readable+upstream_artifacts，"
                         "依赖边交 G2）: %s", len(_t4_wired), _t4_wired[:5])
     except Exception as exc:  # noqa: BLE001
+        # always-emit 防粘滞（异常=本轮无账）。★诚实边界（复核 hunter MEDIUM）：歧义检出
+        # 发生在 wire 函数【前段】、异常风险集中在后段 scope 变更循环——若在后段抛，本轮
+        # 其实【已检出】歧义却拿不到（res 未返回），此处置空即"账说没有、日志说有"。故日志
+        # 明说本轮账不可信，让复盘以同秒的 T4 WARNING 为准，别把空账当阴性结论。★
+        # ★R2 复核双方 MEDIUM：光有诚实注释+日志【不够】——本仓 R67L 终闸 M-2 已把
+        # "*_failed 机读标记统一进 degraded"定为纪律（nodes/__init__.py:2954，理由=
+        # 唯一信号是无人 grep 的 WARNING 就违反"进度查 API 绝不解析 swarm.log"）。
+        # B3 的立项理由本身就是"已见未治=只活在日志"，异常路径不落机读信号=机制自噬。
+        # 故置标记走 degraded（append+dedup reducer），让阴性空账在机读面可被证伪。★
+        _t4_ambiguous = []
+        _t4_wire_failed = True
         logger.warning(
             "[ELABORATE] T4: 类型引用布线异常中断（非致命；注意半应用状态：本轮已钉 defined_in "
-            "%d 条但 consumer 未获 readable/依赖边——worker 侧靠 seed 闸/符号接地兜底）: %s",
+            "%d 条但 consumer 未获 readable/依赖边——worker 侧靠 seed 闸/符号接地兜底；"
+            "★本轮 t4_ambiguous_types 账置空【不可信】：歧义可能已检出但随异常丢失，"
+            "以本节点 T4 多落点 WARNING 为准★）: %s",
             _t4_pinned, exc, exc_info=True)
 
     # ── G2（Task#9 审计③ GAP1）：readable 消费 → 补 provenance 依赖边 ──
@@ -3088,6 +3122,13 @@ async def elaborate(state: BrainState) -> dict:
         "plan_elaborated": True,
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
+        # R67M2-T3 B3（24号文）：T4 多落点歧义观测账 always-emit（last-write-wins
+        # 无歧义=[] 不粘滞）——round67m2 实证"跳过布线"WARNING 已见未治，落 state 账
+        # 让复盘/validate warnings 可查；ambiguity 本体交 ③b fail-closed（不另开闸）。
+        "t4_ambiguous_types": _t4_ambiguous,
+        # R67M2-T3（R2 复核 M-4）：布线崩溃=本轮 t4_ambiguous_types 空账【不可信】的机读
+        # 证伪信号（degraded_reasons 是 append+dedup reducer，故条件发射无粘滞面）。
+        **({"degraded_reasons": ["t4_wire_failed"]} if _t4_wire_failed else {}),
     }
     if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or java_enriched
             or dangling_fixed or _t4_pinned or _t4_wired or _prov_added):

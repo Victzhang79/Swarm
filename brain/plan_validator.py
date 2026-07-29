@@ -1350,8 +1350,20 @@ def validate_module_coherence(
     # 消解 → fail-closed 打回带双路径反馈，绝不静默挑边（P5 旧 basename 剪除的反面）。
     for base, fqns in sorted(_cross_package_same_basename_creates(plan).items()):
         _where = "; ".join(f"{f}（{','.join(ids[:3])}）" for f, ids in sorted(fqns.items()))
+        # ★R67M2-T3 B6（24号文；复核 reviewer LOW 整改后定稿）：主句【恒定无分支】★
+        # 病灶：原文案写死"被多个子任务"，但检出器的同名组可以整组落在【同一子任务】内
+        # （round67m2 st-9 channel/iface 双接口=B4 定案的有意设计），陪跑照文案误判责任面。
+        # 初版按 sid 数量切两种措辞，被复核逮到二阶伤：R67F-T2 要求签名只反映【结构违例本体】
+        # ——文案随"分组"翻转会让同一逻辑违例在全量重拆前后签名不同，R64-T3/H-5 同签名熔断
+        # 少认一次、多烧一轮。定稿改为零分支恒定主句：归属本就逐条写在 _where 里（单子任务
+        # 形态两条都标同一个 st-id，读者一眼可辨），既对两形态都准确、又不引入任何签名扰动。
+        # R2 复核 reviewer LOW-3：检出器的 base 是【lower + 带扩展名】的文件 basename
+        # （_cross_package_same_basename_creates 归一化产物）——直接打印成"同名类
+        # 'alarmsender.java'"对 LLM 是【事实错误】（那是文件名不是类名，且大小写已丢）。
+        # 真 simple name 从任一 fqn 的 basename 去扩展名还原（保原样大小写）。
+        _simple = (sorted(fqns)[0].rsplit("/", 1)[-1].rsplit(".", 1)[0] or base)
         result.add(
-            f"同名类 {base!r} 被多个子任务在不同包各自 create：{_where}。同名异包新建类"
+            f"同名类 {_simple!r} 在不同包被各自 create（落点→归属子任务：{_where}）。同名异包新建类"
             f"极可能是同一逻辑类的重复设计（Spring 类 bean 名默认取 simple name，两份并存"
             f"启动即冲突；消费方也会解析到语义漂移的副本）。请裁决唯一 owner：若确属同一"
             f"逻辑类，保留一处、其余从 create_files 移除并让消费方 import 该 FQN；若确属"
