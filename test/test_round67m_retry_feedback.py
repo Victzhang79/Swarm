@@ -24,33 +24,42 @@ from swarm.brain.nodes import _no_regress_feedback_block  # noqa: E402
 # ─── ① increment_retry 单点累积（修复记忆入账） ───
 
 
+def _texts(hist):
+    """账目文本视图——账里存的是 {"gate","text"}（复核 H-3：不记 gate 就会把'本轮压根
+    没跑过的闸'的历轮缺陷当成'已修掉'）。旧 checkpoint 的裸串仍被读侧兼容。"""
+    return [h["text"] if isinstance(h, dict) else h for h in hist]
+
+
 def test_increment_retry_accumulates_issue_history():
     """历轮 issues 去重累积：轮1 [a,b] → 轮2 [b,c] 得 [a,b,c]（保序去重）。"""
-    out1 = _increment_plan_retry({"plan_retry_count": 0,
+    out1 = _increment_plan_retry({"plan_retry_count": 0, "plan_validation_gate": "G1",
                                   "plan_validation_issues": ["缺陷A", "缺陷B"]})
     assert out1["plan_retry_count"] == 1
-    assert out1["plan_validation_issue_history"] == ["缺陷A", "缺陷B"]
+    assert _texts(out1["plan_validation_issue_history"]) == ["缺陷A", "缺陷B"]
     out2 = _increment_plan_retry({
         "plan_retry_count": out1["plan_retry_count"],
         "plan_validation_issue_history": out1["plan_validation_issue_history"],
+        "plan_validation_gate": "G1",
         "plan_validation_issues": ["缺陷B", "缺陷C"]})
     assert out2["plan_retry_count"] == 2
-    assert out2["plan_validation_issue_history"] == ["缺陷A", "缺陷B", "缺陷C"], \
+    assert _texts(out2["plan_validation_issue_history"]) == ["缺陷A", "缺陷B", "缺陷C"], \
         "历轮 issues 必须去重累积（round67m 轮4 CVB=轮1 回归的反面）"
 
 
 def test_increment_retry_blank_issues_filtered_and_no_history_key_safe():
     """空/空白 issue 不入账；state 无历史键（旧 checkpoint）安全起算。"""
-    out = _increment_plan_retry({"plan_validation_issues": ["", "  ", "真缺陷"]})
-    assert out["plan_validation_issue_history"] == ["真缺陷"]
+    out = _increment_plan_retry({"plan_validation_gate": "G1",
+                                 "plan_validation_issues": ["", "  ", "真缺陷"]})
+    assert _texts(out["plan_validation_issue_history"]) == ["真缺陷"]
     assert out["plan_retry_count"] == 1
 
 
 def test_increment_retry_no_issues_keeps_history():
     """本轮 issues 空（边界）→ 历史账原样保留不清。"""
     out = _increment_plan_retry({"plan_validation_issue_history": ["旧缺陷"],
+                                 "plan_validation_gate": "G1",
                                  "plan_validation_issues": []})
-    assert out["plan_validation_issue_history"] == ["旧缺陷"]
+    assert _texts(out["plan_validation_issue_history"]) == ["旧缺陷"]
 
 
 # ─── ② 反回归反馈段（绝不许回归差集） ───
@@ -59,20 +68,45 @@ def test_increment_retry_no_issues_keeps_history():
 def test_no_regress_block_lists_fixed_issues_only():
     """差集=历轮账−本轮 issues：已修掉的列出、本轮仍失败的不列（由"务必逐条修正"段承载）。"""
     state = {
-        "plan_validation_issue_history": ["CVB shadow 撞 base", "st-1 考卷矛盾", "st-11 考卷矛盾"],
+        # 历轮缺陷都出自 G1；本轮死在 coverage（第 8/9 闸）→ G1 本轮跑过且通过了，
+        # "已修掉"这个断言才立得住（复核 H-3：不带 gate 时无从判断，fail-closed 不报）
+        "plan_validation_issue_history": [
+            {"gate": "G1", "text": "CVB shadow 撞 base"},
+            {"gate": "G1", "text": "同名异包 AlarmSender（st-1）"},
+            {"gate": "G1", "text": "st-11 考卷矛盾"}],
         "plan_validation_issues": ["st-11 考卷矛盾"],
+        "plan_validation_gate": "coverage",
     }
     block = _no_regress_feedback_block(state)
     assert "绝不许回归" in block
-    assert "CVB shadow 撞 base" in block and "st-1 考卷矛盾" in block
+    assert "CVB shadow 撞 base" in block and "同名异包 AlarmSender" in block
     assert "st-11 考卷矛盾" not in block, "本轮仍失败的 issue 归修正段，不得在反回归段重复"
+
+
+def test_no_regress_treats_same_violation_across_subtasks_as_one():
+    """★26 号文 P0-1 治本带来的语义（刻意保守）★：差集按 normalize_structural_signature
+    比对（与 H-5 熔断同源），而它把 st-id 归一成 st-*。于是"同一违例文本出现在多个子任务"
+    被视为**同一个缺陷**——只要还有一个没修，就都不算"已修"。
+
+    这是刻意的保守方向：B1 的危害是【谎报已修】（round67m2 实证 10/10 假阳性，把从未修复
+    的缺陷告诉 LLM"你已经修好了"）；而"少报一条已修"只是少一句提醒，无害。宁可少报。"""
+    from swarm.brain.nodes import _no_regress_feedback_block as _blk
+    state = {
+        "plan_validation_issue_history": [{"gate": "G1", "text": "st-1 考卷矛盾"},
+                                          {"gate": "G1", "text": "st-11 考卷矛盾"}],
+        "plan_validation_issues": ["st-11 考卷矛盾"],
+        "plan_validation_gate": "coverage",
+    }
+    assert not _blk(state), "同违例不同 st-id：只要有一个仍失败，就不得报'已修'"
 
 
 def test_no_regress_block_empty_when_no_history_or_all_current():
     """首轮重试（无历史账）/历轮缺陷全部未愈 → 空串零噪声。"""
-    assert _no_regress_feedback_block({"plan_validation_issues": ["x"]}) == ""
+    assert _no_regress_feedback_block(
+        {"plan_validation_issues": ["x"], "plan_validation_gate": "coverage"}) == ""
     assert _no_regress_feedback_block({
-        "plan_validation_issue_history": ["x"], "plan_validation_issues": ["x"]}) == ""
+        "plan_validation_issue_history": [{"gate": "G1", "text": "x"}],
+        "plan_validation_issues": ["x"], "plan_validation_gate": "coverage"}) == ""
 
 
 def test_no_regress_block_round67m_wheel4_shape():
@@ -81,8 +115,11 @@ def test_no_regress_block_round67m_wheel4_shape():
     state = {
         # 轮4 起点：历轮账=轮1 的 CVB×1 + st-1 + 轮2 的 st-11（去重后）；本轮 issues=st-11
         # 残留一条（注入发生在重产前，已修好的 CVB/st-1 必须落入"绝不许回归"差集段）
-        "plan_validation_issue_history": ["CVB shadow", "st-1 考卷矛盾", "st-11 考卷矛盾"],
+        "plan_validation_issue_history": [{"gate": "G1", "text": "CVB shadow"},
+                                          {"gate": "G1", "text": "st-1 考卷矛盾"},
+                                          {"gate": "G1", "text": "st-11 考卷矛盾"}],
         "plan_validation_issues": ["st-11 考卷矛盾"],
+        "plan_validation_gate": "coverage",
     }
     block = _no_regress_feedback_block(state)
     assert "CVB shadow" in block, "修好的 CVB 必须在反回归段（round67m 轮4 死因的正面证据）"

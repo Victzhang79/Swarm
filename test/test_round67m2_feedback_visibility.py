@@ -188,15 +188,18 @@ def test_no_regress_block_bounded_with_count_marker():
     """hunter H-2：反回归段定界——病态历轮账（300 条）超预算按 bullet 截断+计数明示，
     绝不静默丢、绝不出界把 prev_plan/sliding 原文挤出总帽（H-1 失明面复发）。"""
     from swarm.brain.nodes import _NO_REGRESS_BLOCK_BUDGET, _no_regress_feedback_block
-    hist = [f"历轮缺陷{i:04d}-" + "长" * 90 for i in range(300)]
+    # 账目形状带 gate（复核 H-3）；本轮死在 coverage → G1 出的历轮缺陷本轮已验过
+    hist = [{"gate": "G1", "text": f"历轮缺陷{i:04d}-" + "长" * 90} for i in range(300)]
     block = _no_regress_feedback_block({
-        "plan_validation_issue_history": hist, "plan_validation_issues": []})
+        "plan_validation_issue_history": hist, "plan_validation_issues": [],
+        "plan_validation_gate": "coverage"})
     assert len(block) <= _NO_REGRESS_BLOCK_BUDGET + 200, "反回归段必须定界（页头余量内）"
     assert "及其余" in block and "绝不许回归" in block, "截断必须计数明示（绝不静默）"
     assert "历轮缺陷0000" in block, "头部 bullet 存活"
     # 小账零变化（无截断噪声）
     small = _no_regress_feedback_block({
-        "plan_validation_issue_history": ["缺陷甲"], "plan_validation_issues": []})
+        "plan_validation_issue_history": [{"gate": "G1", "text": "缺陷甲"}],
+        "plan_validation_issues": [], "plan_validation_gate": "coverage"})
     assert "及其余" not in small and "缺陷甲" in small
 
 
@@ -212,9 +215,9 @@ def test_sliding_ctx_budget_isolation_invariant():
     assert len(feedback_max) <= _FEEDBACK_PAGE_BUDGET + 300, "主反馈分页页自带预算"
     from swarm.brain.nodes import _no_regress_feedback_block
     no_regress_max = _no_regress_feedback_block({
-        "plan_validation_issue_history": [f"历轮缺陷{i:04d}-" + "长" * 90
+        "plan_validation_issue_history": [{"gate": "G1", "text": f"历轮缺陷{i:04d}-" + "长" * 90}
                                           for i in range(300)],
-        "plan_validation_issues": []})
+        "plan_validation_issues": [], "plan_validation_gate": "coverage"})
     guidance = len(feedback_max) + len(no_regress_max) + 9200 + 500  # 修补块帽+头部余量
     assert guidance <= _SLIDING_CTX_BUDGET, (
         f"结构块最坏合计 {guidance} 必须装进总帽 {_SLIDING_CTX_BUDGET}"

@@ -17,6 +17,7 @@ import re
 
 from langgraph.types import interrupt
 
+from swarm.brain.prompt_clip import clip_for_prompt as _clip
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.types import Complexity
@@ -937,6 +938,20 @@ async def detect_stack(state: BrainState) -> dict:
 
     # ② 确定性磁盘探测
     profile = detect_stack_deterministic(proj_path)
+    # ★扫描失败 ≠ 这个项目没有栈（26 号文 C-11）★
+    # 三条后果必须一起断掉，缺一条链就重新接上：
+    #   ① 不交 LLM 裁决（profile 里 needs_model_adjudication 已置 False）——空证据裁决
+    #      只能靠训练先验，那正是 task 8537fa5e "RuoYi=Vue" 死代码的产地；
+    #   ② 不写 projects.config 缓存——缓存键是 repo 指纹，而扫不到时指纹恒为空指纹，
+    #      一旦写入，后续每一次同样扫不到都会命中它，幻觉画像转永久；
+    #   ③ 不作为 project_stack 下发——与本函数开头"无磁盘路径 → return {}"同口径，
+    #      让 tech_design 回退到原有 project_facts，而不是拿一份"未判明"当权威事实。
+    if profile.get("scan_failed"):
+        logger.error(
+            "[DETECT_STACK] 磁盘探测失败（%s）→ 本轮不下发 project_stack、不缓存、不裁决；"
+            "tech_design 将回退 project_facts。请查项目路径/挂载/权限: %s",
+            profile.get("scan_failed_reason"), proj_path)
+        return {}
     # 合流 KB 已爬的项目架构/技术栈知识（如"[RuoYi规范] SpringBoot+Shiro+Thymeleaf"）——
     # 我们爬了 wiki/规范进库，这里显式拎出来作高优先证据，别让它埋在 query-dependent 层（8537fa5e 续）。
     kb_hints = extract_stack_hints_from_knowledge(state.get("knowledge_context"))
@@ -1436,9 +1451,15 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
                         llm.ainvoke([
                             {"role": "system", "content": TECH_DESIGN_STAGE2_SYSTEM},
                             {"role": "user", "content": TECH_DESIGN_STAGE2_USER.format(
-                                task_description=task_desc[:2000],
-                                architecture=str(architecture)[:1500],
-                                data_model=str(data_model)[:2500],
+                                # ★决定"这个模块建哪些文件"的节点，此前只看到需求前 2000
+                                # 字符（26 号文 C-9 实测：STAGE1 拿到 ~12200 字符，第一跳
+                                # 丢约 85%，且切点落在 markdown 表格中间 `| 渠道类型 |
+                                # Slack / 企`——模型收到的是一份"看起来完整、实则中途断掉"
+                                # 的畸形文档）。上限抬到 9000 并走 clip_for_prompt：切在
+                                # 结构边界、截断显式告知模型。
+                                task_description=_clip(task_desc, 9000, what="需求原文"),
+                                architecture=_clip(str(architecture), 4000, what="架构设计"),
+                                data_model=_clip(str(data_model), 4000, what="数据模型"),
                                 project_facts=project_facts,
                                 mod_idx=mi, mod_total=mod_total,
                                 mod_name=mod_name,
@@ -2443,9 +2464,10 @@ async def contract_design(state: BrainState) -> dict:
             respA = await _asyncio.wait_for(llm.ainvoke([
                 {"role": "system", "content": CONTRACT_SKELETON_SYSTEM},
                 {"role": "user", "content": CONTRACT_SKELETON_USER.format(
-                    task_description=task_desc[:2500],
-                    modules=json.dumps(_valid_mods, ensure_ascii=False)[:2500],
-                    data_model=data_model[:2000],
+                    task_description=_clip(task_desc, 9000, what="需求原文"),
+                    modules=_clip(json.dumps(_valid_mods, ensure_ascii=False), 6000,
+                                  what="模块清单"),
+                    data_model=_clip(data_model, 4000, what="数据模型"),
                 )},
             ]), timeout=_CONTRACT_SKELETON_TIMEOUT)
             skel_raw = _parse_json_from_llm(respA.content)
@@ -2531,7 +2553,7 @@ async def contract_design(state: BrainState) -> dict:
                     resp = await _asyncio.wait_for(llm.ainvoke([
                         {"role": "system", "content": CONTRACT_MODULE_SYSTEM},
                         {"role": "user", "content": CONTRACT_MODULE_USER.format(
-                            task_description=task_desc[:1500],
+                            task_description=_clip(task_desc, 6000, what="需求原文"),
                             data_model=data_model[:_dm_quota],
                             skeleton=_sk_payload,
                             mod_idx=mi, mod_total=mod_total, mod_name=mod_name,

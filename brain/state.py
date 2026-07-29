@@ -82,6 +82,7 @@ class BrainState(TypedDict, total=False):
     plan_valid: bool                    # 计划验证结果
     plan_retry_count: int               # 计划重试次数
     plan_validation_issues: list[str]   # PlanValidator 问题列表
+    plan_validation_gate: str          # ★本轮 validate 死在【哪道闸】（复核 H-3）★ validate_plan 是 9 道顺序早退闸，plan_validation_issues 只含【第一个失败闸】的 issues。反回归段若不知产出闸，就会把"本轮压根没跑过的闸"的历轮 issue 当成"已修掉、绝不许回归"（跨闸弹跳假阳性，与被治的 renumber 假阳性同危害不同根）。取值见 nodes/__init__.py:_VALIDATE_GATE_ORDER
     plan_validation_warnings: list[str]  # G3-2：规划期软警告（规则5 落空/C1 无主符号）机读面——★R67M2-T3：validate_plan 全部 11 个 return【恒发】（含各早退与成功轮），空列表=本轮无软警告的如实表达；此前"非空才带"的条件发射与本键 round 注册相矛盾（LangGraph 对缺席键保持原值→上轮 warnings 粘滞进 payload 白名单/API/复盘面，B3 的 T4 文案自带本轮计数语义，粘滞即假信号）★
     # D09：VALIDATE_PLAN 失败原因回灌 PLAN——校验失败时写入本轮 issues 摘要，PLAN 重试时读它注入
     # LLM prompt（否则 after_validate 失败→increment_retry→plan 是【盲重试】，LLM 看不到上轮为何被否
@@ -314,6 +315,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     # 规划闸
     "plan_retry_count": "round",
     "plan_validation_issues": "round",
+    "plan_validation_gate": "round",   # 与 plan_validation_issues 严格同生命周期（同一次早退一起写、一起被下轮覆盖）
     "plan_validation_warnings": "round",  # G3-2：last-write-wins（每轮重算）
     "plan_validation_feedback": "oneshot",
     "plan_batch_cache": "round",

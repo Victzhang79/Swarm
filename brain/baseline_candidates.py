@@ -26,6 +26,15 @@ _STOP = {
 }
 
 
+_CAMEL_WORD_RE = re.compile(r"[A-Z]+[a-z0-9]*|[a-z0-9]+")
+
+
+def _identifier_segments(value: str) -> list[str]:
+    """标识符 → 小写段序列：`isLacksPermitted`→[is,lacks,permitted]、
+    `user_manage_service`→[user,manage,service]、`GenTableColumn`→[gen,table,column]。"""
+    return [w.lower() for w in _CAMEL_WORD_RE.findall(str(value or "").replace("_", " ").replace("-", " "))]
+
+
 def extract_req_tokens(text: str) -> list[str]:
     """需求文本 → 判别性 ASCII token（小写去重保序）。"""
     out: list[str] = []
@@ -73,18 +82,53 @@ def build_baseline_candidates(
             continue
         tokens = extract_req_tokens(text)
         if not tokens:
+            # ★"检索不了" ≠ "检索过、没有"（26 号文 C-10 实测）★
+            # 本通道只认 ASCII token，而中文需求（"菜单管理：支持动态路由、按钮权限"）
+            # 恒产 0 token → 恒 0 候选。原先直接 continue，于是该条目在清单里【不出现】，
+            # 而清单尾部写着"清单外的条目不要凭空申报 baseline_covered"——
+            # **一次检索能力的缺席，被渲染成了一条对模型的禁令**。本轮 16 条 base 已有
+            # 能力的需求正是这样被逼着重新实现的。
+            # 故显式标记 unsearchable 带出去，由 prompt block 对这些条目单独解除禁令。
+            out.append({"id": rid, "text": text[:120], "candidates": [],
+                        "unsearchable": True})
+            total += 1
+            if total >= max_total:
+                break
             continue
         score_by_file: dict[str, float] = {}
         best_symbol: dict[str, str] = {}
 
         def _hit(token: str, value: str) -> int:
+            """token 与标识符的匹配度：2=全等，1=对齐【标识符段边界】，0=不匹配。
+
+            ★子串匹配必须对齐段边界（26 号文 C-10 实测）★
+            原判据是裸 `token in v`：`'slack' ⊂ 'isLacksPermitted'`（is|Lacks|Permitted），
+            于是本轮 6 条需求的"存量疑似实现"全部指向同一个 `PermissionService.
+            isLacksPermitted`——候选清单被噪声填满，真正的存量（ruoyi-generator）一条没进。
+            而这份清单还带着"清单外不要凭空申报 baseline_covered"的禁令，噪声候选因此不是
+            "多几条无用提示"，是把大模型往错误的既有实现上引。
+            段边界判据栈中立：camelCase / snake_case / kebab 在所有语言里都是标识符的
+            天然分词，`_CAMEL_WORD_RE` 是本模块既有的同一把尺子。
+            """
             v = str(value or "").lower()
             if not v:
                 return 0
             if token == v:
                 return 2
-            if len(token) >= 4 and token in v:
-                return 1
+            if len(token) < 4:
+                return 0        # 短 token 只认全等，段匹配噪声太大
+            segs = _identifier_segments(value)
+            if not segs:
+                return 0
+            # token 等于某个段，或等于若干【连续】段的拼接（usermanage ↔ UserManageService）
+            for i in range(len(segs)):
+                joined = ""
+                for j in range(i, len(segs)):
+                    joined += segs[j]
+                    if joined == token:
+                        return 1
+                    if len(joined) > len(token):
+                        break
             return 0
 
         for sym in symbols:
@@ -109,10 +153,13 @@ def build_baseline_candidates(
             fp = str(f.get("file_path") or "")
             if not fp:
                 continue
+            # ★段界匹配必须拿到【原始大小写】（`GenTableController` 的段界只有大小写能看出）★
+            # `_basename_stem` 返回小写（其余三个调用点依赖该语义，故不动它），这里单独取原名。
+            stem_raw = str(fp).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
             stem = _basename_stem(fp)
             mod = str(f.get("module_name") or "").lower()
             for tk in tokens:
-                h = _hit(tk, stem)
+                h = _hit(tk, stem_raw) or _hit(tk, stem)
                 if h:
                     score_by_file[fp] = score_by_file.get(fp, 0.0) + 1.0 * h
                 if mod and tk == mod:
@@ -133,8 +180,7 @@ def build_baseline_candidates(
 # 但含字母】的技术缩略（2fa/3des/oauth2/sha512），否则 "2FA" 这类需求判别词零 token 会被静默豁免、
 # 令本闸的动机 bug 换措辞复现（复核实锤 `extract_req_tokens("支持2FA") == []`）。仍剔停用词+纯数字。
 # 只用于证据闸，绝不改 extract_req_tokens（candidates 通道行为不动）。
-_EVIDENCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
-_CAMEL_WORD_RE = re.compile(r"[A-Z]+[a-z0-9]*|[a-z0-9]+")
+_EVIDENCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")  # _CAMEL_WORD_RE 见文件上部（段界匹配共用）
 
 
 def extract_evidence_tokens(text: str) -> list[str]:
@@ -189,9 +235,28 @@ def build_baseline_vocab(files: list[dict], symbols: list[dict]) -> str:
 
 # R67F-P2（专项2·接地核验）：路径样 token——含 "/" 且以代码文件扩展名结尾（保守，防误把
 # 中文/普通词当路径）。用于 evidence_files 缺失时从 reason 自由文本兜底提取引用路径。
+#
+# ★两处必须同时成立，缺一即误判（26 号文 C-12，实测）★
+# ① **尾边界 `(?![\w])`**：正则交替是最左优先，`ts|tsx` 里 `ts` 先匹配且原先没有尾边界，
+#    于是 `a/b/Foo.tsx` 被截成 `a/b/Foo.ts`；同族 `x.cpp→x.c`、`x.kts→x.kt`、`x.jsp→x.js`。
+# ② **扩展名覆盖**：原表只有后端源码族，`.html/.jsp/.ftl/.vm` 全不匹配——而 E2E 基线
+#    RuoYi 正是 Thymeleaf/Velocity 单体，前端就在 templates 里。
+# 两者的后果都不是"少提一条候选"：抽不出路径 → 合法的 baseline 申报被判"凭空捏造" →
+# 并进 `baseline_ineligible_reqs`，而该键是 **monotonic 单调累积**（ACCOUNTING_KEY_LIFECYCLE）
+# → 一次误判此后每一轮都在，不可撤销。故此处宁可多认几个扩展名（多认的代价只是多一条
+# 待核验候选，随后还要过存在性校验），也不能漏认。
+# 扩展名族与 planning_nodes 的 tmpl_exts/spa_exts 同源对齐（服务端模板族 + SPA 组件族）。
 _PATH_LIKE_RE = re.compile(
-    r"(?<![\w./-])((?:[\w.\-]+/)+[\w.\-]+\.(?:java|kt|scala|go|py|ts|tsx|js|jsx|"
-    r"vue|rs|c|cc|cpp|h|hpp|cs|rb|php|xml|sql|yml|yaml|properties))")
+    r"(?<![\w./-])((?:[\w.\-]+/)+[\w.\-]+\.(?:"
+    # 后端/通用源码
+    r"java|kt|kts|scala|groovy|go|py|rs|c|cc|cpp|cxx|h|hpp|cs|rb|php|swift|m|mm|"
+    # 前端脚本与 SPA 组件族（长扩展名靠尾边界保证不被短支截断）
+    r"ts|tsx|js|jsx|mjs|cjs|vue|svelte|css|scss|less|"
+    # 服务端模板族（与 planning_nodes.tmpl_exts 同源）
+    r"html|htm|ftl|jsp|jspx|erb|ejs|twig|vm|mustache|hbs|cshtml|gohtml|"
+    # 配置/资源/构建
+    r"xml|sql|yml|yaml|json|properties|toml|ini|conf|gradle|sh|bat|md"
+    r"))(?![\w])")
 
 
 def _norm_index_path(p: str) -> str:
@@ -480,26 +545,48 @@ def baseline_candidates_prompt_block(candidates: list[dict], *,
     """
     if not candidates:
         return ""
-    lines = []
+    # ★"检索不了"的条目单独成段，并对它们解除禁令（26 号文 C-10）★
+    # 本通道只认 ASCII token，纯中文需求恒 0 候选。把它们混在"检索到疑似存量"清单里
+    # （或干脆不出现）都会让下面那句禁令误伤：禁令的前提是"我们确实替你查过了"。
+    hit_lines, unsearchable = [], []
     for c in candidates:
+        if c.get("unsearchable"):
+            unsearchable.append(f"- {c['id']} {c.get('text', '')}")
+            continue
         refs = "; ".join(
             f"{d['file']}" + (f"（{d['symbol']}）" if d.get("symbol") else "")
             for d in (c.get("candidates") or []))
-        lines.append(f"- {c['id']} {c.get('text', '')} → 存量疑似: {refs}")
+        hit_lines.append(f"- {c['id']} {c.get('text', '')} → 存量疑似: {refs}")
     if truncated:
         _outside = (
             "注意：代码索引清单已达上界被截断——清单外的条目【允许】申报"
             " baseline_covered，但 reason 必须给出可核实的具体文件路径+满足方式，"
             "不确定就照常拆子任务。\n")
     else:
-        _outside = "清单外的条目不要凭空申报 baseline_covered。\n"
+        _outside = ("清单外的条目不要凭空申报 baseline_covered"
+                    "（下面【检索能力不覆盖】段内的条目除外）。\n")
+    _unsearch_block = ""
+    if unsearchable:
+        _unsearch_block = (
+            "\n### 本通道【检索能力不覆盖】的条目（共 %d 条）——上面的禁令对它们不适用\n"
+            "这些条目的描述里没有可供代码索引匹配的标识符（例如纯中文表述），"
+            "**本通道没有查过，不代表存量里没有**。请你按对项目的理解自行判断：\n"
+            "若确信基线已实现 → 照常申报 baseline_covered，reason 给出具体文件路径+满足方式；\n"
+            "若不确信 → 照常拆子任务实现。\n%s\n"
+        ) % (len(unsearchable), "\n".join(unsearchable))
+    if not hit_lines and not unsearchable:
+        return ""
+    _hit_block = ""
+    if hit_lines:
+        _hit_block = (
+            "以下需求条目在现有代码索引中检索到疑似已实现的存量位置。请逐条核对：\n"
+            "(a) 现有实现【确已满足】该需求 → 将其列入顶层 \"baseline_covered\"："
+            "[{\"id\": \"req-xxxxxxxx\", \"reason\": \"<指向下面列出的具体文件+如何满足>\"}]，"
+            "reason 必须引用清单中的文件路径；\n"
+            "(b) 现有实现不满足/仅部分满足 → 照常拆子任务实现并 covers 该条目，绝不因"
+            "存在相似代码就跳过实现。\n"
+            + _outside
+            + "\n".join(hit_lines) + "\n")
     return (
         "\n\n## 存量候选对账清单（确定性代码索引检索所得——棕地申报通道）\n"
-        "以下需求条目在现有代码索引中检索到疑似已实现的存量位置。请逐条核对：\n"
-        "(a) 现有实现【确已满足】该需求 → 将其列入顶层 \"baseline_covered\"："
-        "[{\"id\": \"req-xxxxxxxx\", \"reason\": \"<指向下面列出的具体文件+如何满足>\"}]，"
-        "reason 必须引用清单中的文件路径；\n"
-        "(b) 现有实现不满足/仅部分满足 → 照常拆子任务实现并 covers 该条目，绝不因"
-        "存在相似代码就跳过实现。\n"
-        + _outside
-        + "\n".join(lines) + "\n")
+        + _hit_block + _unsearch_block)

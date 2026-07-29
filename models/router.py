@@ -844,6 +844,16 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
                     "→ 退到关闭 thinking 用同一模型重开流（有产出胜过烧穿墙钟；**质量降级已知**：实测会漏需求）",
                     _llm_node_tag(), getattr(self, "model_name", None) or "model", now - t0, n_chunks,
                 )
+                # ★降级必须留可查计数，不能只有一行 WARNING（复核 M-2）★
+                # 这条路自己的上一行注释就写着"质量降级已知：实测会漏需求"
+                # （round56：106 条 → 92 条，整块功能消失）。而 E-H4 把 brain 切备路径
+                # 的最后一根稻草从"响亮的主备双失败"换成了这条"安静地少产出"——
+                # 一次 WARNING 会淹在流式日志里，降级面必须能被 /api/metrics 查到。
+                try:
+                    from swarm.infra.degrade import record_degrade
+                    record_degrade("models.router.thinking_off_reopen")
+                except Exception:  # noqa: BLE001 — 观测绝不阻断产出
+                    pass
                 _eb = dict(kwargs.get("extra_body") or {})
                 _eb["thinking"] = {"type": "disabled"}
                 kwargs["extra_body"] = _eb
@@ -1175,30 +1185,64 @@ class ModelRouter:
         _raise_if_brain_offline("get_brain_llm")
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
         _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
-        primary = self._get_provider_for_model(self.config.brain_primary).get_chat_model(
+        # ★A3 可观测必须挂到 brain（26 号文 C-13）★：A3 治本（403/401 凭据类错误升 ERROR）
+        # 挂在 ModelInvocationLogger.on_llm_error 上，而 brain 三处 get_chat_model 此前
+        # 【都不传 callbacks】（worker 侧六处全传）→ 该回调在 brain 永不触发。
+        # 而 round67m2 的 403 恰恰发生在 brain（k3 是 brain primary）：每次调用 403 持续
+        # 2h20m、swarm.log 零 WARNING、GLM 静默全量兜底。即"A3 已治"在事故自己的那条
+        # 路径上一行日志都不会产生。
+        _p_prov = self._get_provider_for_model(self.config.brain_primary)
+        primary = _p_prov.get_chat_model(
             self.config.brain_primary, temperature=self.config.brain_temperature,
             max_tokens=_bmt, wallclock_budget=_wc,
+            callbacks=[ModelInvocationLogger(
+                "brain/primary", self.config.brain_primary, _p_prov.provider.id)],
         )
-        fallback = self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
+        _f_prov = self._get_provider_for_model(self.config.brain_fallback)
+        fallback = _f_prov.get_chat_model(
             self.config.brain_fallback, temperature=self.config.brain_temperature,
             max_tokens=_bmt, wallclock_budget=_wc,
             no_fallback=True,   # R56-1：链尾——它再失控就没人可切了，只能关 thinking 保产出
+            callbacks=[ModelInvocationLogger(
+                "brain/fallback", self.config.brain_fallback, _f_prov.provider.id)],
         )
         return primary.with_fallbacks([fallback])
 
-    def get_brain_fallback_llm(self) -> BaseChatModel:
+    def get_brain_fallback_llm(self, *, chain_tail: bool = True) -> BaseChatModel:
         """R35-A：Brain 备用模型（brain_fallback，默认 Kimi）单独取用——供调用方在【外层
         墙钟超时】后【显式切备】。get_brain_llm 的 with_fallbacks 仅在 primary 于流【内】抛
         异常时触发；而 _invoke_llm_abortable 的外层 wait_for 总超时在【消费者帧】抛
         asyncio.TimeoutError，绕过 with_fallbacks（round35 实证：SiliconFlow 饱和时 GLM-5.2
         稳定慢产 >300s→外层墙钟掐断→不切 Kimi→同模型空重试仍超时）。故备用模型须单独暴露，
-        由调用方在外层超时后主动切一次（备用 fresh 预算）。与 get_brain_llm 同构造（同看门狗）。"""
+        由调用方在外层超时后主动切一次（备用 fresh 预算）。与 get_brain_llm 同构造（同看门狗）。
+
+        ★chain_tail 必须由调用方表态（复核 H3：本方法有两类语义完全不同的消费者）★
+        - `chain_tail=True`（PLAN-BATCH 等切备路径）：本实例是恢复阶梯的最后一环，它再挂
+          就是"主备双失败整批失败"。故标 `no_fallback=True`，让 reasoning runaway 走
+          R56-1 的"关 thinking 同模型重开"保住产出——**降级换产出，此处是对的**。
+        - `chain_tail=False`（adversarial_verify 的 reviewer B）：它把本实例当 primary 用，
+          语义是"独立第二双眼睛"。R56-1 自己的注释写明关 thinking "实测会漏需求
+          （round56：106→92 条，整块功能消失）"。若这里也标链尾，reviewer B 就从
+          "挂了 → 记 single_reviewer degraded → 挡 auto_accept" 静默变成
+          "带着降级的推理照常出 verdict、账不写、auto_accept 不挡"——**对抗复核的职责
+          恰恰是抓缺陷，让它静默降级并按满编独立性记账是 fail-open 方向**。
+        默认 True 保持既有切备路径行为；对独立性有要求的消费者必须显式传 False。
+        """
         _raise_if_brain_offline("get_brain_fallback_llm")
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
         _wc = getattr(self.config, "brain_stream_wallclock_s", 0.0)
-        return self._get_provider_for_model(self.config.brain_fallback).get_chat_model(
+        _prov = self._get_provider_for_model(self.config.brain_fallback)
+        return _prov.get_chat_model(
             self.config.brain_fallback, temperature=self.config.brain_temperature,
             max_tokens=_bmt, wallclock_budget=_wc,
+            # 26 号文 E-H4：本方法是 _invoke_llm_abortable 的【最后一根稻草】（外层墙钟
+            # 超时后显式切备），却漏标 no_fallback → 备用再 reasoning runaway 时抛出
+            # 无人接的 TransientInfraError，记"主备双失败"整批失败；标了才会走"关 thinking
+            # 同模型重开"保住产出。get_brain_llm 的内嵌 fallback 早就标了，这里是漏网。
+            no_fallback=chain_tail,
+            callbacks=[ModelInvocationLogger(
+                "brain/fallback-explicit" if chain_tail else "brain/reviewer-b",
+                self.config.brain_fallback, _prov.provider.id)],
         )
 
     @staticmethod

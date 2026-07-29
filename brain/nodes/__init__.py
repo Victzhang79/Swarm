@@ -219,10 +219,14 @@ def _get_brain_llm():
     return llm
 
 
-def _get_brain_fallback_llm():
+def _get_brain_fallback_llm(*, chain_tail: bool = True):
     """R35-A：Brain 备用模型（brain_fallback，默认 Kimi）——PLAN-BATCH 外层墙钟超时后
     显式切备（见 _invoke_llm_abortable）。可 patch 符号。取用失败/未配置返回 None，
-    调用方降级为无切备的原行为（绝不因备用取用失败打挂整个规划）。"""
+    调用方降级为无切备的原行为（绝不因备用取用失败打挂整个规划）。
+
+    chain_tail 透传 router.get_brain_fallback_llm——语义见那边的 docstring（复核 H3）：
+    切备路径要链尾语义（降级换产出），adversarial reviewer B 要 primary 语义
+    （挂了就记 degraded 挡 auto_accept，绝不静默降级出 verdict）。"""
     try:
         router = ModelRouter()
         _cfg = getattr(router, "config", None)
@@ -233,7 +237,7 @@ def _get_brain_fallback_llm():
                 "[PLAN-BATCH] R35-A brain_fallback==brain_primary(%r)——切备等于换回同模型，"
                 "本轮跳过切备（配置应设不同备用模型）", getattr(_cfg, "brain_primary", ""))
             return None
-        return router.get_brain_fallback_llm()
+        return router.get_brain_fallback_llm(chain_tail=chain_tail)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[PLAN-BATCH] R35-A 备用模型取用失败(%s)——本轮无切备（退化原行为）", exc)
@@ -3131,6 +3135,21 @@ def _r65e9_ineligible_feedback(new_rejected: list[str] | None) -> str:
         "若确信系存量，其能力术语必与现有代码符号/文件名有别，请改用真实存在该能力的类名/文件名作证。\n")
 
 
+# ★validate_plan 九道顺序早退闸的流水线次序（单一事实源）★
+# 顺序即语义：位置 i 的闸失败早退时，位置 < i 的闸【本轮已跑过且全部通过】，位置 > i 的
+# 闸【本轮压根没执行】。反回归段据此判断"某条历轮缺陷本轮是不是真的被验过了"。
+# 新增/调整闸时必须同步本表与各早退点的 plan_validation_gate 取值（测试 test_g_batch 有闸）。
+_VALIDATE_GATE_ORDER = (
+    "empty_plan", "structure", "module_decompose",
+    "C1", "C2", "R40-1", "G1", "coverage_watermark", "coverage",
+)
+
+# H-5 熔断已裁定：structure 闸 issue 去 st-id 后判别力不足（悬空依赖文本互相同化，
+# 'st-3 依赖未知任务 st-99' 与 'st-7 依赖未知任务 st-40' 同签名）→ 签名去重会吞掉真缺陷。
+# 累积账（brain/graph.py:_increment_plan_retry）复用同一把尺子，必须复用同一条排除面。
+STRUCTURE_SIG_UNRELIABLE_GATES = frozenset({"structure"})
+
+
 def _no_regress_feedback_block(state) -> str:
     """R67M-T2 B1（23号文，round67m 主死因治本）：反回归反馈段——历轮校验曾暴露而
     【本轮已消失】的 issues 列作"绝不许回归"硬约束（纯函数，plan 注入点与测试共用）。
@@ -3146,9 +3165,38 @@ def _no_regress_feedback_block(state) -> str:
     注释），本段若无界（病态池历轮账可达数百条）会把 prev_plan 修补纪律/sliding 原文
     挤出总帽=H-1 失明面复发。超帽按 bullet 截断+计数明示（截掉的是【已修掉】的旧伤
     提醒——真回归了当轮闸会重新抓回当前 issues 面，不致盲；绝不许截当前打回反馈）。"""
-    hist = [str(h).strip() for h in (state.get("plan_validation_issue_history") or [])]
-    cur = {str(i).strip() for i in (state.get("plan_validation_issues") or [])}
-    no_regress = [h for h in hist if h and h not in cur]
+    # ★差集口径必须与 H-5 熔断同源（26 号文 P0-1）★：原按【原始字符串】比对，而全量重拆
+    # 每轮 renumber st-id → 同一缺陷跨轮原串不等 → 恒判"已修" → 把**从未修复**的缺陷
+    # 写进"此前轮次已修掉、绝不许回归"段（round67m2 实证 10/10 全是假阳性）。
+    # 按 normalize_structural_signature（剥 st-id）比对，展示仍用历轮原文。
+    from swarm.brain.plan_validator import normalize_structural_signature as _nsig
+
+    # ★"本轮已消失" 只对【本轮真跑过的闸】成立（复核 H-3）★
+    # validate_plan 是 9 道顺序早退闸，plan_validation_issues 只含第一个失败闸的 issues。
+    # 轮 N 死在 G1（第 7 闸）、轮 N+1 死在 structure（第 2 闸）→ 本轮 issues 里没有任何
+    # G1 条目 → 历轮全部 G1 issue 被写进"已修掉、绝不许回归"，**而 G1 本轮根本没跑过**。
+    # 这与被治的 renumber 假阳性同危害（谎报已修）、不同根。
+    # 判据：产出该条目的闸在流水线里【严格早于】本轮失败闸 = 本轮跑过且通过了。
+    # fail-closed：gate 未知（旧 checkpoint 的裸字符串条目）一律不进本段——宁可少一句
+    # 提醒，也绝不谎报"你已经修好了"。
+    _cur_gate = str(state.get("plan_validation_gate") or "").strip()
+    _cur_pos = _VALIDATE_GATE_ORDER.index(_cur_gate) if _cur_gate in _VALIDATE_GATE_ORDER else -1
+
+    def _passed_this_round(entry) -> bool:
+        if _cur_pos < 0:
+            return False                       # 本轮闸未知 → 全部不放行
+        g = str(entry.get("gate", "") if isinstance(entry, dict) else "").strip()
+        return g in _VALIDATE_GATE_ORDER and _VALIDATE_GATE_ORDER.index(g) < _cur_pos
+
+    _raw_hist = state.get("plan_validation_issue_history") or []
+    _cur_sigs = set(_nsig([str(i).strip() for i in (state.get("plan_validation_issues") or [])]))
+    no_regress = []
+    for _e in _raw_hist:
+        _txt = str(_e.get("text", "") if isinstance(_e, dict) else _e).strip()
+        if not _txt or not _passed_this_round(_e):
+            continue
+        if _nsig([_txt])[0] not in _cur_sigs:
+            no_regress.append(_txt)
     if not no_regress:
         return ""
     # bullet 适配预算：超出即截，尾部计数明示（绝不静默丢）；单条封顶 400 字符
@@ -3390,6 +3438,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": ["计划为空"],
+            "plan_validation_gate": "empty_plan",
             "plan_validation_feedback": "- 计划为空（PLAN 未产出任何子任务，请重新生成完整的子任务 DAG）",
             "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
@@ -3411,6 +3460,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": struct_result.issues,
+            "plan_validation_gate": "structure",
             # D09：结构校验失败原因回灌 PLAN（悬空依赖/环/parallel_groups 悬空引用等）供重试修正
             "plan_validation_feedback": _format_validation_feedback(struct_result.issues, rotate=retry_count),
             # R67M2-T3（hunter MEDIUM）：此前该早退连结构校验自己的 warnings 都丢（R67J-H5
@@ -3456,6 +3506,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": retry_count,
             "plan_validation_issues": _pb_issues,
+            "plan_validation_gate": "module_decompose",
             "plan_validation_feedback": _format_validation_feedback(_pb_issues, rotate=retry_count),
             "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
         }
@@ -3495,6 +3546,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": _h5_retry,
             "plan_validation_issues": _co_result.issues,
+            "plan_validation_gate": "C1",
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _co_result.issues, rotate=retry_count),
@@ -3517,6 +3569,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": _h5_retry,
             "plan_validation_issues": _css_result.issues,
+            "plan_validation_gate": "C2",
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _css_result.issues, rotate=retry_count),
@@ -3544,6 +3597,7 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_valid": False,
             "plan_retry_count": _h5_retry,
             "plan_validation_issues": _fp_result.issues,
+            "plan_validation_gate": "R40-1",
             "plan_validation_prev_structural": _h5_acct,
             "plan_validation_feedback": _format_validation_feedback(
                 _fp_result.issues, rotate=retry_count),
@@ -3589,6 +3643,7 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_valid": False,
                 "plan_retry_count": _t3_retry_out,
                 "plan_validation_issues": _mc_result.issues,
+                "plan_validation_gate": "G1",
                 "plan_validation_prev_structural": _t3_acct,
                 "plan_validation_feedback": _format_validation_feedback(
                     _mc_result.issues, rotate=retry_count),
@@ -3743,6 +3798,7 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_valid": False,
                 "plan_retry_count": _h5_retry,
                 "plan_validation_issues": _wm_issues,
+                "plan_validation_gate": "coverage_watermark",
                 "plan_validation_prev_structural": _h5_acct,
                 "plan_validation_feedback": _wm_loss_feedback(),
                 "coverage_watermark": _wm_cov_ids,
@@ -3787,6 +3843,7 @@ async def validate_plan(state: BrainState) -> dict:
                 "plan_valid": False,
                 "plan_retry_count": _h5_retry,
                 "plan_validation_issues": cov_result.issues,
+                "plan_validation_gate": "coverage",
                 "plan_validation_prev_structural": _h5_acct,
                 # D09：未覆盖条目 id+text / 悬空 covers 清单回灌 PLAN 重规划；
                 # 阶段3.1：相对水位的丢失以单调合同名义结构化前置（倒退≠一直没做）；

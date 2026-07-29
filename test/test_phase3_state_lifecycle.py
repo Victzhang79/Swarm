@@ -102,7 +102,7 @@ def test_adversarial_round_resets_on_convergence(monkeypatch):
             return R()
 
     monkeypatch.setattr(nodes, "_get_brain_llm", lambda: _PassReviewer())
-    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda: _PassReviewer())
+    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda **kw: _PassReviewer())
     from swarm.brain.nodes.adversarial import adversarial_verify
     st = {
         "complexity": "complex",

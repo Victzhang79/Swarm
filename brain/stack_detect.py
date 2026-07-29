@@ -14,9 +14,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 from collections import Counter
+
+logger = logging.getLogger(__name__)
 
 # ── 信号表（框架无关的探测，但内置常见框架 marker 以提高判定精度）──
 
@@ -437,6 +440,28 @@ def baseline_lombok_present(project_path: str) -> bool | None:
         return None
 
 
+def _scan_failed_profile(reason: str) -> dict:
+    """磁盘探测失败时的画像——**与"探测到了但信息少"严格区分**（26 号文 C-11）。
+
+    三条约束由本形状承载，下游据 `scan_failed` 判定，不必各自再推断：
+      · `confidence=0.0` + `scan_failed=True`：调用方一眼可判"这不是事实，是缺席"。
+      · `needs_model_adjudication=False`：**绝不**把空证据交给 LLM 裁决——那正是幻觉
+        画像的产地（拿不到证据时模型只能靠训练先验，而先验恰是 task 8537fa5e 的死因）。
+      · 调用方据此**跳过缓存写入**：缓存键是 repo 指纹，而扫不到时指纹恒为空指纹，
+        一旦写入就会被后续同样扫不到的场次命中，幻觉转永久。
+    """
+    return {
+        "frontend": "未判明", "frontend_kind": "none", "backend": "未判明", "build": "未判明",
+        "jvm": {}, "auth": {}, "infra_symbols": {}, "infra_symbol_methods": {},
+        "confidence": 0.0, "evidence": [f"⚠️ 磁盘探测失败：{reason}"], "db": [],
+        "signals": {"manifests": [], "server_template_files": 0, "spa_files": 0,
+                    "frontend_project_dirs": []},
+        "needs_model_adjudication": False,
+        "scan_failed": True, "scan_failed_reason": reason,
+        "source": "scan_failed",
+    }
+
+
 def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     """确定性磁盘探测 → project_stack 画像 + 置信度 + 证据。不调 LLM、不连 DB。
 
@@ -444,6 +469,27 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
       {frontend, backend, build, frontend_kind('server-template'|'spa'|'separated'|'none'),
        confidence(0-1), evidence[list[str]], signals{...}, needs_model_adjudication(bool)}
     """
+    # ★路径不可读 = 扫描失败，绝不当"这个项目没有栈"（26 号文 C-11）★
+    # 实测 detect_stack_deterministic("/nonexistent") 返回 backend='未判明' confidence=0.2，
+    # 零异常零日志。os.walk 对不存在的目录只是不产出任何项，走完全部判据后自然得到一个
+    # "什么都没有"的画像——而"没扫到"与"没有"在下游是完全不同的两件事：
+    #   低置信 → needs_model_adjudication=True → LLM 拿着【空证据】凭训练先验裁决 →
+    #   写进 projects.config，并按 compute_repo_fingerprint("")（一个稳定值）缓存 →
+    #   **下次同样扫不到时指纹相同、缓存命中，幻觉画像永久复用**，且 tech_design/plan/worker
+    #   全都以 project_stack 为单一权威事实。
+    # 对称反证：同文件 baseline_lombok_present:401 早就有 isdir 守卫返回 None（调用方
+    # fail-open 不剥）——同一模块内两个探测函数对"路径不可读"的处置本该一致。
+    if not os.path.isdir(project_path):
+        logger.warning(
+            "[STACK-DETECT] 项目路径不可读 → 判定为【扫描失败】而非'无栈'（scan_failed，"
+            "画像不缓存、不交 LLM 裁决）: %s", project_path)
+        try:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.stack_detect.path_unreadable")
+        except Exception:  # noqa: BLE001
+            pass
+        return _scan_failed_profile(f"项目路径不存在或不可读: {project_path}")
+
     manifests: list[str] = []
     manifest_texts: dict[str, str] = {}
     ext_counts: Counter = Counter()
@@ -597,6 +643,19 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         f"jsx/tsx×{jsx_count} angular={has_angular} next={has_next} vite={has_vite}; "
         + ("独立前端工程目录=" + ",".join(sorted(set(frontend_proj_dirs))[:4]) if frontend_proj_dirs else "无独立前端工程")
     )
+
+    # 目录存在但【一个文件都没扫到】——空目录/权限拒绝/挂载未就绪。与路径不可读同性质：
+    # 是"没看到"不是"没有"。放行会得到同一个空画像 → 同一条幻觉缓存链。
+    if dir_count <= 1 and not ext_counts and not manifests:
+        logger.warning(
+            "[STACK-DETECT] 目录可读但零文件（空目录/权限/挂载未就绪）→ 判定为【扫描失败】: %s",
+            project_path)
+        try:
+            from swarm.infra.degrade import record_degrade
+            record_degrade("brain.stack_detect.empty_scan")
+        except Exception:  # noqa: BLE001
+            pass
+        return _scan_failed_profile(f"目录可读但未扫到任何文件: {project_path}")
 
     # ── 置信度 ──
     confidence = 0.5

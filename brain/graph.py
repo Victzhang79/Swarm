@@ -480,11 +480,59 @@ def _increment_plan_retry(state: BrainState) -> dict:
     （validate→increment_retry→plan），在此累积=全闸种覆盖、新闸零接线（不打地鼠）。
     清空纪律：validate 通过 / REVISE·failure replan 新周期（与
     plan_validation_prev_structural 同点对称）。"""
+    # ★口径必须与 H-5 熔断同源（26 号文 P0-1 / 路 D #1）★
+    # 病灶：累积与差集都用【原始字符串】精确比对，而 B1 的设计前提正是 R64-T3 的
+    # 「全量重拆」——重拆每轮 renumber 子任务 id（实测 st-91-1→st-128-1、st-12-1-1→st-15-1）。
+    # st-id 一变原始串就不等 → 同一缺陷每轮都被判"已修" → 进"绝不许回归"段。
+    # round67m2 报文级实证：轮3 的 46 个 plan_batch 全带该段、块内 10 条 **10/10 仍在
+    # 当轮打回池里**（即从未修复），却被告知 LLM"你已经修好了"。假阳性率在目标场景下
+    # 结构性趋近 100%，与被分页藏起的真实反馈叠加＝"真问题看不见 + 假已解决看得见"。
+    # 治法：去重/差集一律按 normalize_structural_signature（剥 st-id，与 H-5 同一事实源），
+    # 但**累积存原文**——展示给 LLM 的必须是可读的当轮原句。
+    from swarm.brain.nodes import STRUCTURE_SIG_UNRELIABLE_GATES
+    from swarm.brain.plan_validator import normalize_structural_signature as _nsig
+
+    _gate = str(state.get("plan_validation_gate") or "").strip()
+    # ★账里必须带 gate（复核 H-3）★ validate_plan 是 9 道顺序早退闸，本轮 issues 只来自
+    # 【第一个失败闸】。不记 gate，反回归段就会把"本轮压根没被执行过的闸"的历轮 issue
+    # 当作"已修掉、绝不许回归"——与被治的 renumber 假阳性同危害、不同根（跨闸弹跳，
+    # _gate_fuse_and_account 的 docstring 早把该形态列为实际发生过）。
+    # 存储形状：{"gate": str, "text": str}。**旧 checkpoint 里是裸字符串**，读侧兼容
+    # （见 _hist_entry），且裸串一律按"gate 未知"处理 → fail-closed 不进反回归段。
     _hist = list(state.get("plan_validation_issue_history") or [])
+
+    def _entry_text(e) -> str:
+        return str(e.get("text", "") if isinstance(e, dict) else e).strip()
+
+    def _entry_gate(e) -> str:
+        return str(e.get("gate", "") if isinstance(e, dict) else "").strip()
+
+    # ★signature 去重的适用面必须与 H-5 严格对齐（复核 M1）★
+    # `_gate_fuse_and_account` 的 docstring 写明："structure 闸 issue 去 st-id 后判别力
+    # 不足（悬空依赖文本互相同化）→ 调用侧排除"。累积账用了同一把尺子却没带上这条排除面，
+    # 实测 6 条互异的真结构违例（'st-3 依赖未知任务 st-99' vs 'st-7 依赖未知任务 st-40'…）
+    # 只留下 4 条——账不再是全量，而 _no_regress_feedback_block 的尾注还宣称"全量见此账"。
+    _sig_unreliable = _gate in STRUCTURE_SIG_UNRELIABLE_GATES
+
+    # 复核 L-3：两侧都走 _entry_text（内含 strip），口径一致——否则带尾空白的历史条目
+    # 会与同一缺陷的新条目算成两条，账重复膨胀。
+    _hist_sigs = {_nsig([_entry_text(h)])[0] for h in _hist if _entry_text(h)}
+    _hist_raw = {_entry_text(h) for h in _hist}
     for _it in (state.get("plan_validation_issues") or []):
         _s = str(_it).strip()
-        if _s and _s not in _hist:
-            _hist.append(_s)
+        if not _s:
+            continue
+        if _sig_unreliable:
+            # 签名判别力不足的闸：退回【原串】去重，宁可账里多几条也不吞掉真缺陷
+            if _s in _hist_raw:
+                continue
+        else:
+            _sig = _nsig([_s])[0]
+            if _sig in _hist_sigs:
+                continue
+            _hist_sigs.add(_sig)
+        _hist.append({"gate": _gate, "text": _s})
+        _hist_raw.add(_s)
     return {
         "plan_retry_count": state.get("plan_retry_count", 0) + 1,
         "plan_validation_issue_history": _hist,

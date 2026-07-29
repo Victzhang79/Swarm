@@ -348,7 +348,12 @@ async def adversarial_verify(state: BrainState) -> dict:
                 {"role": "user", "content": user_msg}]
 
     primary = nodes._get_brain_llm()
-    fallback = nodes._get_brain_fallback_llm()
+    # ★reviewer B 不是恢复阶梯的链尾，是独立的第二双眼睛（复核 H3）★
+    # 标了链尾语义就会走 R56-1 "关 thinking 同模型重开"——而那条路自己的注释写明
+    # "实测会漏需求（106→92 条，整块功能消失）"。对抗复核带着降级推理照常出 verdict、
+    # single_reviewer degraded 不写、auto_accept 不挡 = fail-open。故显式 chain_tail=False：
+    # 它挂就让它挂，走下面既有的"退化单 reviewer + 记 degraded"路径。
+    fallback = nodes._get_brain_fallback_llm(chain_tail=False)
     reviewer_llms: list[tuple[str, object]] = [("A", primary)]
     single_reviewer_degraded: str | None = None
     if fallback is not None:

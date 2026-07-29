@@ -49,14 +49,22 @@ def test_candidates_matched_by_symbol_and_class():
     assert any("CaptchaService.java" in d["file"]
                for d in by_id["req-aaaa1111"]["candidates"])
     assert "req-bbbb2222" in by_id
-    assert "req-cccc3333" not in by_id, "检索不到=零候选（绝不臆造，防推卸型假申报）"
+    # ★契约细化（26 号文 C-10）：原断言是"检索不到的条目根本不出现"★
+    # "绝不臆造候选"这条不变、且下面仍在断言；变的是**缺席的表达方式**：条目彻底不出现，
+    # 会与下游"清单外的条目不要凭空申报 baseline_covered"那句禁令合成一条错误推论——
+    # 一次检索能力的缺席被渲染成对模型的禁令（本轮 16 条 base 已有能力的需求因此被逼着
+    # 重新实现）。故改为显式带 unsearchable 标记出现、candidates 恒空。
+    assert by_id["req-cccc3333"]["candidates"] == [], "绝不臆造候选（防推卸型假申报）"
+    assert by_id["req-cccc3333"]["unsearchable"] is True, "缺席必须可辨识，不能静默"
 
 
 def test_pure_cjk_requirement_yields_no_candidate():
+    """纯中文无标识符条目：候选恒空（宁缺毋滥），但**标记为检索不了**而非静默消失。"""
     cands = build_baseline_candidates(
         [{"id": "req-dddd4444", "text": "系统应当支持岗位管理的增删改查"}],
         _FILES, _SYMBOLS)
-    assert cands == [], "纯中文无标识符条目宁缺毋滥"
+    assert [c["candidates"] for c in cands] == [[]], "绝不臆造候选"
+    assert cands[0]["unsearchable"] is True
 
 
 def test_empty_inventory_yields_empty():

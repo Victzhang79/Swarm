@@ -86,7 +86,9 @@ def _state(ids=("st-1", "st-2"), complexity=Complexity.COMPLEX, **extra):
 
 def _wire(monkeypatch, primary, fallback):
     monkeypatch.setattr(nodes, "_get_brain_llm", lambda: primary)
-    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda: fallback)
+    # **kw：adversarial 现在显式传 chain_tail=False（复核 H3——reviewer B 不是恢复阶梯的
+    # 链尾，不能走"关 thinking 重开"静默降级出 verdict）。stub 必须跟上真实签名。
+    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda **kw: fallback)
 
 
 def _run(state):
