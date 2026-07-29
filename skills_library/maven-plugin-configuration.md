@@ -11,6 +11,11 @@ max_chars: 2200
 tags: ["maven", "plugin", "compiler", "surefire", "packaging", "jacoco", "build", "pom"]
 ---
 
+> ⚠️ **本篇示例里的 `<version>` 一律写成占位符，是刻意的**：技能跨项目复用，写死的版本号
+> 必然在某些项目里是错的，而 worker 会照抄。版本只能来自确定性证据（父/BOM 查表、本地
+> 仓库实测、registry 查询）——铁律**绝不猜依赖坐标**。示例教的是**语法与判据**，不是数字。
+
+
 插件是 Maven 真正干活的地方。三条铁律：**版本钉死、配置集中、绑对阶段**。
 
 ## 版本必须钉死
@@ -24,7 +29,7 @@ tags: ["maven", "plugin", "compiler", "surefire", "packaging", "jacoco", "build"
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.12.1</version>
+        <version>«填确定性解析出的版本»</version>
         <configuration><release>17</release></configuration>
       </plugin>
     </plugins>
@@ -44,7 +49,7 @@ tags: ["maven", "plugin", "compiler", "surefire", "packaging", "jacoco", "build"
 <plugin>
   <groupId>org.apache.maven.plugins</groupId>
   <artifactId>maven-compiler-plugin</artifactId>
-  <version>3.12.1</version>
+  <version>«填确定性解析出的版本»</version>
   <configuration>
     <release>17</release>            <!-- 优于 source/target 各写一遍 -->
     <encoding>UTF-8</encoding>
@@ -53,7 +58,7 @@ tags: ["maven", "plugin", "compiler", "surefire", "packaging", "jacoco", "build"
       <path>
         <groupId>org.projectlombok</groupId>
         <artifactId>lombok</artifactId>
-        <version>1.18.30</version>
+        <version>«填确定性解析出的版本»</version>
       </path>
     </annotationProcessorPaths>
   </configuration>
@@ -70,7 +75,7 @@ tags: ["maven", "plugin", "compiler", "surefire", "packaging", "jacoco", "build"
 <plugin>
   <groupId>org.apache.maven.plugins</groupId>
   <artifactId>maven-surefire-plugin</artifactId>
-  <version>3.2.3</version>
+  <version>«填确定性解析出的版本»</version>
   <configuration>
     <includes><include>**/*Test.java</include></includes>
     <excludes><exclude>**/*IT.java</exclude></excludes>

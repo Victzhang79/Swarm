@@ -1,7 +1,7 @@
 ---
 id: java-2fa-totp-shiro
 title: 双因子认证 2FA/TOTP 与 Shiro 自定义过滤器（Java）
-description: "当你在 Java 项目里实现双因子认证/两步验证/2FA/TOTP/一次性验证码/Google Authenticator，用 dev.samstevens.totp 库生成/校验验证码，或写 Shiro 自定义登录过滤器（AccessControlFilter）时调用。返回正确的 totp 1.7.1 API、Shiro 过滤器骨架、以及'引入第三方库前先补坐标'与 pom 最小增量铁律。"
+description: "当你在 Java 项目里实现双因子认证/两步验证/2FA/TOTP/一次性验证码/Google Authenticator，用 dev.samstevens.totp 库生成/校验验证码，或写 Shiro 自定义登录过滤器（AccessControlFilter）时调用。返回 totp 的正确 API 形状、Shiro 过滤器骨架、以及'引入第三方库前先补坐标'与 pom 最小增量铁律。"
 applies_to_stacks: ["java"]
 applies_to_intents: ["create", "modify", "debug"]
 applies_to_phases: ["code", "produce"]
@@ -15,17 +15,22 @@ tags: ["java", "2fa", "totp", "otp", "shiro", "auth", "security", "filter", "dep
 
 `import dev.samstevens.totp.*`（或任何第三方包）能编译的前提是**该库的 Maven 坐标已在可达 pom 里声明**。基线项目**默认没有** totp 库——只写 import 不加坐标 = `package ... does not exist`，换几个模型都编不过（jar 不在 classpath，不是代码问题）。
 
-所以：**先在本模块 `pom.xml` 的 `<dependencies>` 里追加坐标（带显式 version），再写 import 和用法**。totp 的坐标：
+所以：**先在本模块 `pom.xml` 的 `<dependencies>` 里追加坐标，再写 import 和用法**。totp 的坐标是：
 
 ```xml
 <dependency>
     <groupId>dev.samstevens.totp</groupId>
     <artifactId>totp</artifactId>
-    <version>1.7.1</version>
 </dependency>
 ```
 
-## 正确的 dev.samstevens.totp 1.7.1 API（照抄，别臆造）
+### ⚠️ 版本号：本技能【故意不给】
+
+本技能是跨项目复用的经验，**无从知道你这个项目的 parent/BOM 管到哪个版本**——写死一个版本号必然在某些项目里是错的，而且违反本仓头号铁律**绝不猜依赖坐标**（版本只能来自确定性证据：本地 Maven 仓库实测、registry 查询）。
+
+判据见 [maven-dependency-management]：**父/BOM 管得到就不写 version；管不到才写，且版本必须来自确定性解析结果，绝不凭记忆填**。解析不出就如实丢弃该依赖并从验收里剔除（fail-honest），绝不臆造。
+
+## dev.samstevens.totp 的 API 形状（照抄形状，别臆造方法名）
 
 ```java
 import dev.samstevens.totp.code.*;                 // CodeGenerator/CodeVerifier/DefaultCodeGenerator/DefaultCodeVerifier/HashingAlgorithm

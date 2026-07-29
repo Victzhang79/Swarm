@@ -11,6 +11,11 @@ max_chars: 2400
 tags: ["maven", "pom", "dependency", "bom", "version", "scope", "reactor", "artifact"]
 ---
 
+> ⚠️ **本篇示例里的 `<version>` 一律写成占位符，是刻意的**：技能跨项目复用，写死的版本号
+> 必然在某些项目里是错的，而 worker 会照抄。版本只能来自确定性证据（父/BOM 查表、本地
+> 仓库实测、registry 查询）——铁律**绝不猜依赖坐标**。示例教的是**语法与判据**，不是数字。
+
+
 在 pom.xml 里写依赖，第一位的问题永远是：**这条依赖的版本从哪来**。写错的代价不对称——版本缺失会让 Maven 在 **POM 解析期**就失败，整个 reactor 一个模块都读不出来；而少一条依赖只是本模块编译报错，可归因、可修。
 
 ## 决定 `<version>` 写不写：只有三种合法情况
@@ -22,7 +27,7 @@ tags: ["maven", "pom", "dependency", "bom", "version", "scope", "reactor", "arti
    <dependency>
        <groupId>cn.hutool</groupId>
        <artifactId>hutool-all</artifactId>
-       <version>5.8.47</version>   <!-- BOM 不管它 → 不写就是解析期硬错 -->
+       <version>«查父/BOM 确认管不到后，填确定性解析出的版本»</version>   <!-- BOM 不管它 → 不写就是解析期硬错 -->
    </dependency>
    ```
 3. **reactor 内部兄弟模块** → `<version>${project.version}</version>`（与父同版），且该模块必须真实存在于根 pom 的 `<modules>` 里。

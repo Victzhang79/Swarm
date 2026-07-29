@@ -189,6 +189,39 @@ def validate_skill_text(
     return validate_skill_doc(doc, use_llm_judge=use_llm_judge, llm_judge_fn=llm_judge_fn)
 
 
+# Maven/Gradle/npm/Cargo 的显式版本坐标形态（栈中立地覆盖主流生态）
+_GAV_XML_RE = re.compile(
+    r"<artifactId>\s*([\w.\-]+)\s*</artifactId>\s*<version>\s*([\w.\-]+)\s*</version>",
+    re.S | re.I)
+_GAV_LINE_RE = re.compile(
+    r"^\s*<version>\s*(?!\$\{)([0-9][\w.\-]*)\s*</version>", re.M)
+# groupId/artifactId 段必须【含字母】——否则 `127.0.0.1:5432:5432`（docker 端口映射）、
+# `1:2:3` 这类会被当成坐标（实测 docker-patterns.md 首个误报就是端口映射）。
+_COORD_COLON_RE = re.compile(
+    r"\b(?=[\w.\-]*[A-Za-z])[\w.\-]+:(?=[\w.\-]*[A-Za-z])[\w.\-]+:(?!\$\{)[0-9][\w.\-]*\b")
+
+
+def _hardcoded_dependency_versions(body: str) -> list[str]:
+    """抽正文里写死的第三方依赖【版本】坐标（26 号文 F-H4）。
+
+    只认带**具体数字版本**的形态；`${...}` 占位符、纯 groupId:artifactId（无版本）
+    一律放行——那正是我们希望技能写的样子（给坐标不给版本，版本交确定性通道）。
+    覆盖 Maven XML（`<version>1.7.1</version>`）与冒号式（`g:a:1.7.1`，Gradle/sbt/
+    文档常用）。npm/Cargo 的 `"pkg": "^1.2.3"` 形态由同一条冒号式规则的补充判据留给
+    LLM 裁判——本闸只做确定性的、零误判的那部分。
+    """
+    hits: list[str] = []
+    for m in _GAV_XML_RE.finditer(body or ""):
+        hits.append(f"{m.group(1)}:{m.group(2)}")
+    for m in _GAV_LINE_RE.finditer(body or ""):
+        hits.append(f"<version>{m.group(1)}")
+    for m in _COORD_COLON_RE.finditer(body or ""):
+        hits.append(m.group(0))
+    # 去重保序
+    seen: set[str] = set()
+    return [h for h in hits if not (h in seen or seen.add(h))]
+
+
 def validate_skill_doc(
     doc: SkillDoc,
     *,
@@ -263,6 +296,21 @@ def validate_skill_doc(
     for pat, label in _DANGEROUS:
         if pat.search(scan_text):
             errors.append(f"含危险操作指令:{label}")
+
+    # ── L2b 铁律冲突：写死依赖坐标（26 号文 F-H4）──
+    # 技能正文写死完整 GAV（如 `dev.samstevens.totp:totp:1.7.1`）并明令"先在 pom 追加
+    # 坐标（带显式 version）"，与本仓头号铁律**绝不猜依赖坐标**（版本/包名只能来自确定性
+    # 证据：本地仓库、registry 实测）正面对冲。技能是【跨项目复用】的经验，它不可能知道
+    # 目标项目的 BOM/parent 管到什么版本——写死的版本号必然在某些项目里是错的，而它以
+    # "照抄"的口吻下发给 worker。实测该形态的技能在 1034 次 worker_push 里被推了 375 次。
+    # 判死而非告警：这是铁律冲突，且修法很轻（去掉 <version> 行，指向确定性解析通道）。
+    _hardcoded = _hardcoded_dependency_versions(body)
+    if _hardcoded:
+        errors.append(
+            "正文写死第三方依赖版本号:" + ", ".join(_hardcoded[:5])
+            + "——与铁律【绝不猜依赖坐标】冲突（技能跨项目复用，无从知道目标项目的 "
+            "BOM/parent 管到哪个版本）。请只给 groupId:artifactId 与用法，版本交由"
+            "确定性解析通道（本地仓库/registry 实测）决定。")
 
     # ── L3 意图一致性 ──
     decl = _keywords(f"{doc.title} {doc.summary}")
