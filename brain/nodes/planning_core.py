@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 
 from pathlib import Path
@@ -707,6 +708,62 @@ def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str |
         return ""
 
 
+_VERSION_TAG_RE = re.compile(r"<version>\s*([^<>\s]+)\s*</version>", re.I)
+
+
+def _strip_ungrounded_manifest_coords(
+    stub_diff: str | None, project_path: str | None, fid: str,
+) -> str | None:
+    """★阶梯三桩写构建清单时，剔掉基线里查无实据的版本号（26 号文 C-3）★
+
+    桩是 LLM 产物且 `l1_passed=True` 零编译零验收就解锁下游——它是全流程里唯一一条
+    "LLM 直接产出构建清单且不过任何确定性闸"的通路，与铁律"绝不猜依赖坐标"正面冲突。
+    round67m2 实证：桩写的父 POM 版本 3.8.7 而 base 是 4.8.3，解析必失败。
+
+    判据（确定性、纯文本、栈中立）：桩新增行里出现的每个 `<version>` 值，必须在**基线的
+    构建清单**里真实出现过；查无实据即删除该行（属性/占位符 `${...}` 放行——那是引用不是坐标）。
+    删行而不是删整份桩：桩的价值是让下游可编译，保住骨架、剔掉臆造坐标才是 fail-honest。
+    非 JVM 栈（无 pom）自然零命中，不误伤。project_path 不可读 → 原样返回（fail-open：
+    读不到基线就无从判定，绝不凭空剥离真坐标）。
+    """
+    if not stub_diff or not project_path:
+        return stub_diff
+    try:
+        import os as _os
+        _known: set[str] = set()
+        for _root, _dirs, _files in _os.walk(project_path):
+            _dirs[:] = [d for d in _dirs if not d.startswith(".")][:80]
+            for _f in _files:
+                if _f.lower() not in ("pom.xml", "build.gradle", "build.gradle.kts"):
+                    continue
+                try:
+                    with open(_os.path.join(_root, _f), encoding="utf-8",
+                              errors="ignore") as _fh:
+                        _known.update(_VERSION_TAG_RE.findall(_fh.read(200_000)))
+                except OSError:
+                    continue
+        if not _known:
+            return stub_diff          # 无基线清单可比 → 不判（fail-open）
+        _kept, _dropped = [], []
+        for _ln in stub_diff.splitlines(keepends=True):
+            if _ln.startswith("+") and not _ln.startswith("+++"):
+                _m = _VERSION_TAG_RE.search(_ln)
+                if _m and not _m.group(1).startswith("${") and _m.group(1) not in _known:
+                    _dropped.append(_m.group(1))
+                    continue
+            _kept.append(_ln)
+        if _dropped:
+            logger.warning(
+                "[阶梯三·桩] %s 桩里 %d 个版本号在基线构建清单中查无实据 → 已剥离该行"
+                "（铁律：绝不猜依赖坐标；桩零编译零验收，臆造坐标会一路交付）: %s",
+                fid, len(_dropped), _dropped[:6])
+            return "".join(_kept)
+        return stub_diff
+    except Exception as exc:  # noqa: BLE001 — 剥离是加固面，失败保留原桩（fail-open）
+        logger.warning("[阶梯三·桩] 坐标接地校验异常（保留原桩）: %s", exc)
+        return stub_diff
+
+
 async def _generate_compile_stub(
     state: BrainState, st, project_path: str | None,
     protected_files: set[str] | None = None,
@@ -887,6 +944,13 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
             stub_diff = await _generate_compile_stub(state, st, project_path,
                                                      protected_files=_prot_stub,
                                                      required_files=_required_by_downstream)
+            # ★桩里的构建清单必须过"绝不猜依赖坐标"铁律（26 号文 C-3）★
+            # R65C-T3 例外让桩去写 pom（下游种子闸的硬要求，理由正当），但桩是 LLM 产物、
+            # 零编译零验收就 l1_passed=True 解锁下游。round67m2 实证 st-3-1：桩写的父 POM
+            # 版本 3.8.7 而 base 是 4.8.3 → 解析必失败，且四道闸全瞎一路交付。
+            # 治法不是禁止写清单（那会让下游永堵），而是**把 LLM 臆造的坐标确定性剔掉**：
+            # 桩里出现的 version 必须在基线的构建清单里真实存在过，否则该行剥离并留痕。
+            stub_diff = _strip_ungrounded_manifest_coords(stub_diff, project_path, fid)
         if stub_diff:
             mode = "stub"
             subtask_results[fid] = WorkerOutput(

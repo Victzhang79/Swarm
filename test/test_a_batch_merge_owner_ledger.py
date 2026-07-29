@@ -98,3 +98,67 @@ def test_state_key_declared_with_lifecycle():
     from swarm.brain.state import ACCOUNTING_KEY_LIFECYCLE, BrainState
     assert "merge_owner_drops" in BrainState.__annotations__
     assert ACCOUNTING_KEY_LIFECYCLE["merge_owner_drops"] == "round"
+
+
+# ══════════════════════════════════════════════
+# C-4 的【真数据丢失面】：新建聚合清单并集不可达
+# ══════════════════════════════════════════════
+
+def _pom(dep, artifact="alarm-task"):
+    body = ["<project>", f"  <artifactId>{artifact}</artifactId>", "  <dependencies>",
+            f"    <dependency>{dep}</dependency>", "  </dependencies>", "</project>"]
+    return (f"diff --git a/{artifact}/pom.xml b/{artifact}/pom.xml\n"
+            "new file mode 100644\n--- /dev/null\n"
+            f"+++ b/{artifact}/pom.xml\n@@ -0,0 +1,{len(body)} @@\n"
+            + "".join("+" + ln + "\n" for ln in body))
+
+
+def _merge_pom(*diffs, owner="st-1"):
+    return merge_diffs([(f"st-{i + 1}", d) for i, d in enumerate(diffs)],
+                       base_reader=lambda f: None, file_owner=lambda f: owner)
+
+
+def test_new_manifest_multiwriter_unions_instead_of_dropping():
+    """★这才是 C-4 的真数据丢失面（26 号文原文）★
+    实跑：两写者各向【新建】 alarm-task/pom.xml 加不同 `<dependency>` → owner 独占、
+    另一份整份蒸发，写者账面仍 DONE。而同一 pom 若 base 已存在，走的是
+    `merge_insert_only_changes(allow_anchor_union=True)` 正确并集——
+    **新文件专路在任何 3-way/union 之前 continue，并集机制对新建模块 pom 结构性不可达**。
+    真实日志该分支命中 17 次，落点 100% 是 module pom，co-writer 多达 8 个。"""
+    r = _merge_pom(_pom("alarm-core"), _pom("alarm-notify"))
+    assert "alarm-core" in r.merged_diff
+    assert "alarm-notify" in r.merged_diff, "非 owner 写者加的依赖绝不能凭空蒸发"
+
+
+def test_unioned_manifest_stays_structurally_valid():
+    """并集绝不能产出畸形清单（两个 `<project>` 根会让 git apply 整包连坐）。"""
+    r = _merge_pom(_pom("a"), _pom("b"), _pom("c"))
+    body = [ln[1:] for ln in r.merged_diff.splitlines() if ln.startswith("+")
+            and not ln.startswith("+++")]
+    assert body.count("<project>") == 1 and body.count("</project>") == 1
+    assert sum(1 for ln in body if "<dependency>" in ln) == 3, "三个写者的条目都要在"
+
+
+def test_union_falls_back_when_it_would_forge_duplicate_singletons():
+    """★救不回来就如实认，绝不产畸形（round18 P0-A 守卫复用）★
+    两份【各自整段重写】的版本并集会伪造重复结构单例 → 放弃并集回退 owner 独占，
+    丢件账仍记（不静默）。"""
+    other = ("diff --git a/alarm-task/pom.xml b/alarm-task/pom.xml\n"
+             "new file mode 100644\n--- /dev/null\n+++ b/alarm-task/pom.xml\n"
+             "@@ -0,0 +1,3 @@\n+<project>\n+  <完全不同的骨架/>\n+</project>\n")
+    r = _merge_pom(_pom("alarm-core"), other)
+    body = [ln[1:] for ln in r.merged_diff.splitlines() if ln.startswith("+")
+            and not ln.startswith("+++")]
+    assert body.count("<project>") == 1, "宁可丢件也绝不产出重复根标签"
+    assert r.owner_drops, "回退 owner 独占时丢件账必须仍在"
+
+
+def test_non_manifest_new_file_keeps_owner_only():
+    """并集只对【聚合清单】开（条目并存是它的语义）；普通源码同名新文件仍 owner 独占
+    ——两份 Java 类拼在一起是畸形，绝不能并。"""
+    java = ("diff --git a/A.java b/A.java\nnew file mode 100644\n--- /dev/null\n"
+            "+++ b/A.java\n@@ -0,0 +1,1 @@\n+class A { void x() {} }\n")
+    java2 = java.replace("void x()", "void y()")
+    r = _merge_pom(java, java2)
+    assert "void x()" in r.merged_diff and "void y()" not in r.merged_diff
+    assert r.owner_drops, "丢件必须记账"

@@ -3067,6 +3067,92 @@ def _validate_downgrade_unverified_sources(build_cmd: str, modified: list) -> li
 _PKG_DECL_RE = re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*)\s*;")
 
 
+# 成对定界符——任何有块结构的语言都有（Java/JS/Go/Rust/C/C#/PHP/Velocity/JSON…）；
+# 纯缩进语言（Python/YAML）天然平衡，本闸对其恒不命中（不误杀）。
+_BALANCE_PAIRS = (("{", "}"), ("(", ")"), ("[", "]"))
+
+
+_LITERAL_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'      # 双引号串
+    r"|'(?:\\.|[^'\\])*'"     # 单引号串
+    r"|//[^\n]*"                # 行注释（C 族）
+    r"|#[^\n]*"                 # 行注释（shell/py/ruby）
+)
+
+
+def _strip_literals(line: str) -> str:
+    """剔除字符串字面量与行注释——`logger.info("}")` 这类会给定界符收支造成假差额。"""
+    return _LITERAL_RE.sub("", line)
+
+
+def _truncated_artifacts(diff: str) -> list[dict]:
+    """★被截断销毁的产物必须在 L1 拦住（26 号文 C-1）★
+
+    round67m2 实测 st-8：修复轮撞 Agent 迭代上限 50 被强行截断，文件停在**半个标识符**上
+    （`return new ToStringBuilder(this,To` + 末行无换行标记），base 105 行的
+    最后两个闭合括号连同方法体一起被删。而四道 L1 闸全瞎：
+      · `.vm` 是 resource 不进 javac；
+      · `test_cmd=null → l1_3_test_ok=true`；
+      · 4 条 verify_commands 全是文件【顶部】的存在性 grep（尾部被砍一条都不会失败）。
+    若任务未 escalate，此文件会进 merge，L2 同样不碰 .vm、L3 不跑代码生成器 →
+    **一路交付到用户手里**。
+
+    判据（确定性、栈中立、零外部工具）：本次变更是否**改变了文件的成对定界符收支**。
+      · 比的是【变更前后的差额之差】而不是绝对平衡——hunk 窗口本就可能只覆盖半个块
+        （st-8 的窗口里 old 侧就是 -1），要求窗口内绝对平衡会把所有局部改动误杀。
+        合法改动无论怎么增删，都不该改变整个文件的收支：delta(new) - delta(old) == 0。
+      · 字符串字面量与行注释先剔除——`logger.info("}")` 这类会造成假差额。
+      · 纯缩进语言（Python/YAML）天然无定界符 → 差额恒 0，本闸对其不命中（不误杀）。
+    返回 [{file, pair, delta, evidence}]；无法解析/无变化 → []。
+    """
+    out: list[dict] = []
+    try:
+        # ★split_diff_by_file 返回 list[(paths:list[str], text)] 而非 dict★
+        # 初版按 dict 写 `.items()` → 每次都抛进下方 fail-open 的 except，
+        # **闸从未生效而测试若只断言"不误杀"就会全绿**——正是本轮反复栽的假绿形态。
+        from swarm.project.diff_apply import split_diff_by_file
+        for _paths, fdiff in (split_diff_by_file(diff) or []):
+            fpath = (_paths or ["?"])[-1]
+            old_lines: list[str] = []
+            new_lines: list[str] = []
+            no_newline = False
+            for ln in fdiff.splitlines():
+                if ln.startswith("\\"):
+                    no_newline = True
+                    continue
+                if ln.startswith(("+++", "---", "diff --git", "index ", "@@",
+                                  "new file", "deleted file", "similarity",
+                                  "rename ", "old mode", "new mode")):
+                    continue
+                if ln.startswith("+"):
+                    new_lines.append(ln[1:])
+                elif ln.startswith("-"):
+                    old_lines.append(ln[1:])
+                elif ln.startswith(" "):
+                    old_lines.append(ln[1:])
+                    new_lines.append(ln[1:])
+            if not new_lines:
+                continue          # 纯删除文件：不是"截断"，由别的闸管
+            _old_c = [_strip_literals(x) for x in old_lines]
+            _new_c = [_strip_literals(x) for x in new_lines]
+            for opener, closer in _BALANCE_PAIRS:
+                _old_delta = sum(x.count(opener) - x.count(closer) for x in _old_c)
+                _new_delta = sum(x.count(opener) - x.count(closer) for x in _new_c)
+                _shift = _new_delta - _old_delta
+                if _shift:
+                    out.append({
+                        "file": fpath,
+                        "pair": opener + closer,
+                        "delta": _shift,
+                        "evidence": ("末行无换行符（典型的写到一半被掐断）"
+                                     if no_newline else "本次变更改变了定界符收支"),
+                    })
+                    break
+    except Exception:  # noqa: BLE001 — 纯文本启发式，解析失败绝不阻断（fail-open）
+        return []
+    return out
+
+
 def _package_decl_mismatches(diff: str) -> list[dict]:
     """E6①：diff 内【新建 .java】的包声明与 src/main|test/java 路径反推包比对。
 
@@ -4349,6 +4435,22 @@ def run_l1_pipeline(
     # 新建 .java 的 `package X;` 与 src/main/java 路径反推包不符时，maven-compiler
     # 不报错（class 落错包），毒发在下游子任务 import 时（producer-gate 不对称——
     # 既有机制全在 import 消费侧修复）。确定性闸：不符即 fail，worker 当轮改对。
+    # ── L1.1c 结构截断闸（26 号文 C-1）──
+    # 撞 Agent 迭代上限被强行截断的半成品此前一路放行到交付（实测 st-8）。
+    # 与 L1.1b 同构：确定性、栈中立、纯文本零外部工具、判死带 reason 进重试 prompt。
+    _trunc = _truncated_artifacts(diff)
+    details["l1_1c_not_truncated"] = not _trunc
+    if _trunc:
+        details["truncated_artifacts"] = _trunc[:10]
+        details["reason"] = "truncated_artifact"
+        details["note"] = (
+            "产物结构不完整（成对定界符收支从平衡变为不平衡）——多半是写到一半被掐断："
+            + "；".join(f"{t['file']} {t['pair']} 差 {t['delta']}（{t['evidence']}）"
+                       for t in _trunc[:3])
+            + "。请重新完整输出该文件，绝不要留半个方法/半个标识符。")
+        logger.warning("[L1] L1.1c 结构截断闸判死：%s", details["note"][:300])
+        return False, details
+
     _pkg_mis = _package_decl_mismatches(diff)
     details["l1_1b_package_decl_ok"] = not _pkg_mis
     if _pkg_mis:

@@ -921,6 +921,75 @@ def _lines_to_unified_diff(file_path: str, base: str, merged: str) -> str:
     return f"diff --git a/{file_path} b/{file_path}\n{block}"
 
 
+def _synthesize_common_base(versions: list[list[str]]) -> list[str]:
+    """多份【新文件】版本 → 合成"共同骨架"作为伪 base（各版对它都是纯插入）。
+
+    新文件没有 merge base，而两份 LLM 产出的模块清单通常是【同源骨架 + 各自条目】：
+    对 owner 版而言，另一版是"同位置替换"（各自的 <dependency> 占同一行）而非纯插入，
+    故直接拿 owner 版当 base 做 merge_insert_only_changes 必然失败。
+    取所有版本的最长公共子序列即骨架，此后每一版相对它都只剩插入。
+    栈中立：纯行序列运算，不含任何 XML/pom 语义。
+    """
+    import difflib
+
+    common = list(versions[0])
+    for nxt in versions[1:]:
+        sm = difflib.SequenceMatcher(a=common, b=nxt, autojunk=False)
+        common = [ln for blk in sm.get_matching_blocks()
+                  for ln in common[blk.a:blk.a + blk.size]]
+        if not common:
+            break
+    return common
+
+
+def _union_new_manifest(
+    file_path: str, owner_sid: str, bodies: dict[str, list[str]]
+) -> list[str] | None:
+    """★新建聚合清单多写者 → 并集而非整份丢弃（26 号文 C-4 的真数据丢失面）★
+
+    实跑：两写者各向【新建】 alarm-task/pom.xml 加不同 <dependency> → owner 独占、
+    另一份整份蒸发，写者账面仍 DONE。而同一 pom 若 base 已存在，走的是
+    `merge_insert_only_changes(allow_anchor_union=True)` 正确并集——**新文件专路在任何
+    3-way/union 之前 continue，聚合清单并集机制对新建模块 pom 结构性不可达**。
+    真实日志该分支命中 17 次，落点 100% 是 module pom，co-writer 多达 8 个。
+
+    解法：合成共同骨架当伪 base，复用既有并集单一事实源；并沿用 round18 P0-A 的
+    重复单例守卫（防把两份各自整段重写的版本背靠背拼成畸形清单）。
+    并不成 / 反而伪造重复单例 → 返回 None，回退 owner 独占（此时丢件账仍会记，
+    不会静默）——fail-honest：救不回来就如实认，绝不产出畸形清单让 apply 整包连坐。
+    """
+    if owner_sid not in bodies or len(bodies) < 2:
+        return None
+    try:
+        base_lines = _synthesize_common_base(list(bodies.values()))
+        if not base_lines:
+            return None
+        base_text = "\n".join(base_lines)
+        version_texts = [
+            "\n".join(bodies[owner_sid]),          # owner 版优先（其条目排在前）
+            *["\n".join(v) for k, v in bodies.items() if k != owner_sid],
+        ]
+        merged = merge_insert_only_changes(
+            base_text, *version_texts, allow_anchor_union=True)
+        if merged is None or merged == "\n".join(bodies[owner_sid]):
+            return None
+        _dup = _aggregate_merge_duplicated_singleton(base_text, version_texts, merged)
+        if _dup:
+            logger.warning(
+                "[MERGE] C-4 新建聚合清单 %s 并集会伪造重复结构单例 %r → 放弃并集回退 "
+                "owner 独占（畸形清单会让 git apply 整包连坐，宁可丢件也不产畸形）",
+                file_path, _dup)
+            return None
+        logger.warning(
+            "[MERGE] C-4 新建聚合清单 %s 多写者 → 以共同骨架并集各写者条目"
+            "（owner=%s，共 %d 写者；原行为是整份丢弃，实测会让别的写者加的依赖凭空蒸发"
+            "而账面仍 DONE）", file_path, owner_sid, len(bodies))
+        return merged.split("\n")
+    except Exception as exc:  # noqa: BLE001 — 并集是挽救增益，失败回退既有行为
+        logger.warning("[MERGE] C-4 新建聚合清单并集异常（回退 owner 独占）: %s", exc)
+        return None
+
+
 def _aggregate_merge_duplicated_singleton(
     base: str, versions: list[str], merged: str
 ) -> str | None:
@@ -1198,6 +1267,7 @@ def merge_diffs(
             by_sid_new: dict[str, list[_Hunk]] = {}
             for h in hunks:
                 by_sid_new.setdefault(h.subtask_id, []).append(h)
+            _union_lines = None
             if len(by_sid_new) >= 2:
                 bodies = {sid: _new_side_lines(sh) for sid, sh in by_sid_new.items()}
                 distinct = list({tuple(v) for v in bodies.values()})
@@ -1222,6 +1292,21 @@ def merge_diffs(
                         chosen_sid = _owner
                         _dropped_new_sids = []      # 非 owner 只是"碰过" → 丢弃其内容即可，不重做
                         _non_owner = [s for s in by_sid_new if s != _owner]
+                        # ★聚合清单必须先试并集，别直接丢（26 号文 C-4 的真数据丢失面）★
+                        # 实跑：两写者各向【新建】 alarm-task/pom.xml 加不同 <dependency> →
+                        # owner 独占、另一份整份蒸发，写者账面仍 DONE。而同一 pom 若 base
+                        # 已存在，走的是 merge_insert_only_changes(allow_anchor_union=True)
+                        # 正确并集——**新文件专路在任何 3-way/union 之前 continue，聚合清单
+                        # 并集机制对新建模块 pom 结构性不可达**。真实日志该分支命中 17 次，
+                        # 落点 100% 是 module pom。
+                        # 解法（栈中立，复用既有单一事实源）：以 owner 版为基底，看其余写者
+                        # 的版本是否是它的【纯插入】（各自加了不同的 <dependency>/<module>
+                        # 条目，骨架同源 → 成立）；成立即并集，不成立才回退 owner 独占。
+                        if _is_aggregate_manifest(file_path):
+                            _union_lines = _union_new_manifest(
+                                file_path, _owner,
+                                {sid: _new_side_lines(sh)
+                                 for sid, sh in by_sid_new.items()})
                         # C-4：丢件必须留【机读】账——原先只有这行 WARNING，而日志会轮转，
                         # 复盘时"这个文件当初是谁的版本、丢了谁的"无从查证。
                         owner_drops_all.append({
@@ -1255,6 +1340,13 @@ def merge_diffs(
                         file_path, chosen_sid, _dropped_new_sids,
                     )
                 chosen_hunks = by_sid_new[chosen_sid]
+                if _union_lines is not None:
+                    # 并集结果整体替换为一个新文件 hunk（新文件无 base，形状即全量新增）。
+                    # `_union_lines` 的元素已带 `+` 前缀（来自 _new_side_lines 的口径），
+                    # 且 _Hunk.lines[0] 按约定是 @@ 头——两处口径都不能想当然。
+                    chosen_hunks = [_Hunk(
+                        0, 0, 1, len(_union_lines),
+                        [f"@@ -0,0 +1,{len(_union_lines)} @@", *_union_lines], chosen_sid)]
             else:
                 chosen_hunks = hunks
             merged_parts.append(
