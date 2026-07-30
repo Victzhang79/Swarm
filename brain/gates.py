@@ -158,6 +158,25 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
         return False, f"failed_subtasks: 仍有未恢复的失败子任务 {failed}"
 
     if not state.get("l2_passed", False):
+        # ★V-C1（B-4a）如实归因★ L2 未通过可能是"编译真失败"，也可能是"这个栈的编译闸本仓
+        # 没实现"（`integration_review` 对有构建面却派生不出命令的栈 fail-closed 产 issue）。
+        # 两者对人的意思完全不同：后者不是代码坏了，是**我们没验**。沿用上方
+        # clarify_blocked_by_facts 的先例——专类先判、如实归因，绝不让人按错的根因去查。
+        # `l2_details` 的形状是 `{"integration_review": ir_details, "issues": [...]}`
+        # （verify.py 的多个写点都这样包），少数早退分支只有 `issues`。两层都查——
+        # 只查一层就是"接线覆盖 ≠ 机制存在"（本仓四条硬检查①）。
+        _l2d = state.get("l2_details")
+        _l2d = _l2d if isinstance(_l2d, dict) else {}
+        _ir = _l2d.get("integration_review")
+        _ir = _ir if isinstance(_ir, dict) else {}
+        _unsup = (_ir.get("compile_gate_unsupported_stack")
+                  or _l2d.get("compile_gate_unsupported_stack"))
+        if _unsup:
+            return False, (
+                f"verification_unsupported_stack:{_unsup}: 该栈的 L2 集成编译闸本仓未实现"
+                "（磁盘上有构建面却派生不出编译命令）→ 交付未经自动编译验证，拒绝 auto_accept；"
+                "请人工确认后用 --no-auto-accept 放行，或补该栈的 BuildDriver"
+            )
         return False, "l2_failed: L2 集成验证未通过"
 
     # l3_passed 三态：None=跳过(不算失败)，False=失败，True=通过
