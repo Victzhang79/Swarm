@@ -235,6 +235,9 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_RUNTIME_SMOKE_PLATEAU_STRICT": "brain/nodes/failure.py:185",
     "SWARM_RUNTIME_SMOKE_PREPARE_TIMEOUT_SEC": "brain/nodes/runtime_smoke.py:39",
     "SWARM_RUNTIME_SMOKE_TIMEOUT_SEC": "brain/nodes/runtime_smoke.py:37",
+    # V-H2 端口反解窗口（秒）。C-1 后语义＝**恒等满**该时长（整窗取并集判多监听），
+    # 故它是反解路径的固定成本；调小可加速非 Maven 冒烟测试，调大用于慢启动应用。
+    "SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC": "brain/nodes/runtime_smoke.py:50",
     "SWARM_SANDBOX_": "config/settings.py:444",
     "SWARM_WORKER_RUN_QUEUE_MAX": "worker/runner.py:_worker_run_queue_max",
     "SWARM_WORKER_RUN_RETENTION_S": "worker/runner.py:_worker_run_retention_s",

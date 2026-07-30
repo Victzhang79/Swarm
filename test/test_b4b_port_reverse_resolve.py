@@ -58,6 +58,16 @@ from swarm.brain.nodes.runtime_smoke import (  # noqa: E402
 # ① 脚本生成：已知端口逐字节不变 / 未知端口才注入反解
 # ══════════════════════════════════════════════
 
+@pytest.fixture(autouse=True)
+def _shrink_resolve_window(monkeypatch):
+    """C-1 后反解窗口是**恒定成本**（整窗取并集），生产默认 30s → 端到端用例逐条付 30s。
+
+    本文件统一缩到 8s：窗口长度本身不是被测机制，但必须 **> 错时 bind 的偏移**
+    （skewed 用例 5s），否则会把 C-1 那条测成"根本没看见第二个 listener"的弱命题。
+    """
+    monkeypatch.setenv("SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC", "8")
+
+
 def test_known_port_script_has_no_resolve_traces():
     """★对照臂★ 已知端口路径必须**一点反解痕迹都没有**，且 F4 预检在位。
 
@@ -289,6 +299,54 @@ def test_end_to_end_two_listeners_is_ambiguous_not_a_guess(tmp_path):
     assert not parsed["probe_sequence"], "歧义时不得探活"
 
 
+def test_end_to_end_listeners_bound_at_different_times_is_ambiguous(tmp_path):
+    """★C-1（reviewer 复核，CRITICAL 假过）★ 两个 listener **错时** bind 也必须 AMBIGUOUS。
+
+    上面那条同型测试把两个 socket **背靠背**bind，于是"多监听 fail-closed"在旧实现
+    （首轮见到唯一端口就 `break`）下也恒绿——夹具形状让被测命题变成了另一个更弱的命题。
+    真实形态是错时的：metrics/admin 端口进程一起来就 bind，业务 server 要等 async runtime
+    就绪 / DB 连上才 bind。旧实现首轮只看见 metrics → 采纳它 → 探 `/` 得 404 →
+    `passed:started`，**业务 server 一次都没被探过**。
+
+    突变判据：把 resolve 循环改回"见到单端口即 break"，本条必红（实得单个数字端口）。
+    """
+    app = tmp_path / "skewed.py"
+    app.write_text(
+        "import socket, time\n"
+        # 先 bind「metrics」端口——旧实现会在首轮就采纳它
+        "a = socket.socket(); a.bind(('127.0.0.1', 0)); a.listen(1)\n"
+        # 业务 server 晚 5s 才 bind（> 一个轮询间隔，确保首轮看不到它）
+        "time.sleep(5)\n"
+        "b = socket.socket(); b.bind(('127.0.0.1', 0)); b.listen(1)\n"
+        "time.sleep(60)\n", encoding="utf-8")
+    script = build_smoke_script(f"{sys.executable} {app}", None, "/",
+                               timeout_sec=8, workdir=str(tmp_path))
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=180)
+    parsed = parse_smoke_markers(r.stdout)
+    assert (parsed["port_resolved"] or "").startswith("AMBIGUOUS:"), (
+        "错时 bind 的多监听被当成单监听采纳了（＝C-1 假过通道复活），"
+        f"实得 {parsed['port_resolved']!r}")
+    assert not parsed["probe_sequence"], "歧义时不得探活"
+
+
+def test_end_to_end_single_listener_still_resolves_after_full_window(tmp_path):
+    """C-1 对照臂：单监听应用**照旧**解得出端口并探活成功（整窗取并集不误杀单监听）。
+
+    C-1 的治法是"窗口结束才裁决"，代价是恒付满窗口——这条锁住"代价只是时间、不是结论"。
+    """
+    app = tmp_path / "single.py"
+    app.write_text(_APP, encoding="utf-8")
+    script = build_smoke_script(f"{sys.executable} {app}", None, "/",
+                               timeout_sec=8, workdir=str(tmp_path))
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=180)
+    parsed = parse_smoke_markers(r.stdout)
+    assert (parsed["port_resolved"] or "").isdigit(), (
+        f"单监听反解失败，实得 {parsed['port_resolved']!r}")
+    assert parsed["probe_sequence"], "解出端口后必须真探活"
+    assert parsed["port_resolve_tier_answered"] not in (None, "none_answered"), (
+        f"作答档未留痕（M-1）：{parsed['port_resolve_tier_answered']!r}")
+
+
 def test_end_to_end_child_listens_parent_does_not(tmp_path):
     """★进程树遍历本尊★ 父进程不监听、子进程监听（wrapper 脚本 → 真 server，
     `cargo run` / `npm start` / `go run` 全是这个形态）。
@@ -309,3 +367,24 @@ def test_end_to_end_child_listens_parent_does_not(tmp_path):
     assert parsed["port_resolved"] and parsed["port_resolved"].isdigit(), (
         f"子进程监听未被树遍历找到（得 {parsed['port_resolved']!r}）——"
         f"wrapper→server 是最常见形态:\n{r.stdout[-1200:]}")
+
+
+def test_end_to_end_dead_app_on_reverse_path_reports_exit_code(tmp_path, monkeypatch):
+    """★M-4★ 反解路径应用**已退出**时，收尾块也要回显退出码（与已知端口路径同构）。
+
+    原实现是 `if kill -0 …; then echo APP_RC alive; fi`——没有 else 分支，应用已死时
+    什么都不输出 → `app_rc=None`，"崩在第几步"的归因信号整条丢失。
+    这条**跑真脚本**（不是往 stdout 里塞合成标记），否则测的是解析器而非产出标记的 shell。
+
+    突变判据：删掉 `else wait "$SMOKE_PID"; echo APP_RC $?`，本条必红。
+    """
+    monkeypatch.setenv("SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC", "6")
+    app = tmp_path / "dies.py"
+    app.write_text("import sys\nsys.stderr.write('boom\\n')\nsys.exit(3)\n", encoding="utf-8")
+    script = build_smoke_script(f"{sys.executable} {app}", None, "/",
+                               timeout_sec=8, workdir=str(tmp_path))
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    parsed = parse_smoke_markers(r.stdout)
+    assert parsed["port_resolved"] == "NONE", parsed["port_resolved"]
+    assert parsed["app_rc"] == 3, (
+        f"应用已退出但退出码没带回来（归因信号丢失）：app_rc={parsed['app_rc']!r}")

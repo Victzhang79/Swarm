@@ -781,6 +781,13 @@ async def verify_runtime(state: BrainState) -> dict:
     # ——那才是 V-H2 要救的东西。断言可执行化留 B-4b 后续（把片段改用 $SMOKE_PORT）。
     _accept_skipped_no_port = bool(assertions) and _reverse_resolve_port
     if _accept_skipped_no_port:
+        # ★M-5（reviewer 复核）★ 反解路径整块跳过了下面的 `if assertions and not …` 块，
+        # 而 `auth_login_available` 只在那块里赋值 → `_accept_phase_verdict` 里 `_login_ok`
+        # 恒 False → **全 bearer** 的断言集被归成 `all_manual`（语义＝"鉴权边界故不自动执行"），
+        # 而真相是"端口构建时未知"。这行与端口无关（只问运维配了没配 SWARM_SMOKE_LOGIN_*），
+        # 提到闸外赋值即可让 M-2 的分档覆盖全 bearer 集，不再借用错标签。
+        from swarm.brain.acceptance_spec import smoke_login_cmd as _smoke_login_cmd
+        accept_gen_info["auth_login_available"] = bool(_smoke_login_cmd())
         logger.warning(
             "[VERIFY_RUNTIME] V-H2 反解路径：端口构建时未知 → %d 条验收断言本轮不执行"
             "（冒烟本体照跑）；断言可执行化待 B-4b 后续", len(assertions))
@@ -1586,6 +1593,15 @@ def _accept_phase_verdict(
         return patch
 
     if not executable:
+        # ★M-5（reviewer 复核）★ 判序必须在 `all_manual` **之前**：反解路径上端口构建时未知，
+        # **任何**断言都没生成执行片段——与鉴权边界无关。原判序下"全 bearer 且未配登录"的
+        # 断言集报 `all_manual`（语义＝"鉴权边界故不自动执行"），把真因（端口未知）盖掉了，
+        # M-2 的分档只覆盖到含至少一条 `auth=none` 的集合。缺席归因必须唯一。
+        if skipped_no_port:
+            return {"acceptance_passed": None,
+                    "acceptance_details": {**base, "reason": "port_unknown_at_build_time",
+                                           "assertions": manual_rows},
+                    "_degraded": "acceptance_skipped:port_unknown_at_build_time"}
         # 全 manual：阶段2 不自动执行（鉴权边界，ACCEPTANCE_DESIGN §5.3），可观测降级
         return {"acceptance_passed": None,
                 "acceptance_details": {**base, "reason": "all_manual",
