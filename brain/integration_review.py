@@ -124,14 +124,19 @@ Python/无 build script 的 Node **L2 永久 no-op 且判通过**，坏产物直
 # 本函数派生不出编译命令、但**确实是个工程**的清单 → 归 UNSUPPORTED_STACK（fail-closed）。
 # 这些栈根本不在 `stacks.STACK_SPEC` 里（B-7 的"新栈准入闸"要对账的正是这张表）；
 # 在此显式列出，是为了让"没实现"与"没有构建"分开，绝不让前者伪装成后者。
+#
+# ★刻意【不收】`Makefile` 与 `CMakeLists.txt`（双复核 HIGH-3 实证误杀）★
+# 它们是**构建工具**而非**栈**，且 `Makefile` 作任务运行器在纯 docs 仓/脚本仓极常见
+# （Sphinx 的 `make html` 就是）。实测：纯 docs 仓 + Sphinx Makefile → `unsupported_stack:make`
+# → 按当时的产 issue 实现会烧完 replan 后 FAILED。要正确收它们必须有"该栈源码在场"的旁证
+# （`*.c`/`*.cpp`/`*.h`），那是 B-7 源码证据闸的活，不在本批。宁可漏报不误杀——漏报由
+# `unregistered_aggregate_stacks()` 一类的覆盖面登记继续兜（B-7）。
 _UNSUPPORTED_STACK_MANIFESTS: tuple[tuple[str, str], ...] = (
     ("composer.json", "php"),
     ("Gemfile", "ruby"),
     ("mix.exs", "elixir"),
     ("pubspec.yaml", "dart"),
     ("build.sbt", "scala-sbt"),
-    ("CMakeLists.txt", "cmake"),
-    ("Makefile", "make"),
 )
 _UNSUPPORTED_STACK_GLOBS: tuple[tuple[str, str], ...] = (
     ("*.sln", "csharp"),
@@ -140,45 +145,64 @@ _UNSUPPORTED_STACK_GLOBS: tuple[tuple[str, str], ...] = (
 )
 
 
-def detect_build_surface(project_path: str) -> tuple[str | None, str]:
-    """构建面三态：返回 `(build_cmd | None, reason)`。
+def detect_build_surface(project_path: str) -> tuple[str | None, str, list[str]]:
+    """构建面三态：返回 `(build_cmd | None, reason, matched_manifests)`。
 
-    - `(cmd, "ok")` —— 派生出全量编译命令
-    - `(None, NO_BUILD_SURFACE)` —— 磁盘上真没有构建清单（纯 docs）→ 合理跳过
-    - `(None, "unsupported_stack:<key>")` —— **有**构建面但没有编译闸 → 调用方**必须产 issue**
+    - `(cmd, "ok", [...])` —— 派生出全量编译命令
+    - `(None, NO_BUILD_SURFACE, [])` —— 磁盘上真没有构建清单（纯 docs）→ 合理跳过
+    - `(None, "unsupported_stack:<key>", [...])` —— **有**构建面但没有编译闸
 
     第三态的存在就是 V-C1 的治本：`compile_ok=None` 此前同时表示"合理跳过"与"没实现"，
     而 `passed=len(issues)==0` 让后者静默变成 PASS。
+
+    ★第三个返回值是全部命中清单（双复核 MEDIUM-3）★ 短路首命中会让混栈仓报错栈：实测
+    `Rails(Gemfile)+requirements.txt → python`、`Laravel(composer.json)+package.json → npm`
+    ——人按 python/npm 去查，真问题在 ruby/php。栈键仍取确定性首命中（判序稳定），但把全集
+    一并交出，让判读的人看得见"其实同时命中了这些"。
+
+    ★只查工程根（诚实边界，双复核 HIGH-1）★ 后端在子目录的 monorepo（根上无清单、
+    `backend/pom.xml`）仍落 `NO_BUILD_SURFACE` → 仍是假过，**与治本前逐字相同**。
+    §1 矩阵"任意栈 + 后端在子目录"那一行本批**未动**，归 B-4b 的 V-H1（有界子树探测）。
+    本批关的是"根上有清单的未收录栈"，不是 V-C1 全集。
     """
     cmd = _detect_build_cmd_generic(project_path)
-    if cmd:
-        return cmd, "ok"
-
     j = os.path.join
-    # ① 已收录栈（`stacks.STACK_SPEC` 单一事实源）的根清单在场 → 有构建面却派生不出命令。
-    #    这里**刻意读 STACK_SPEC 而不是再抄一张表**：正是它照出了 python 的漂移——
-    #    `requirements.txt` 在 STACK_SPEC 的 root_manifests 里（Django/Flask 常态），
-    #    而 `_detect_build_cmd_generic` 只认 pyproject.toml/setup.py → 返 None → 判 PASS。
+    import glob as _glob
+
+    matched: list[str] = []
+    first_key: str | None = None
+
+    # ① 已收录栈（`stacks.STACK_SPEC` 单一事实源）的根清单
     try:
         from swarm.stacks import STACK_SPEC
         for spec in STACK_SPEC.values():
             for m in spec.root_manifests:
                 if os.path.isfile(j(project_path, m)):
-                    return None, f"{UNSUPPORTED_STACK}:{spec.key}"
+                    matched.append(m)
+                    if first_key is None:
+                        first_key = spec.key
     except Exception as exc:  # noqa: BLE001 — 事实表不可用不该让 L2 崩，但要留痕
         logger.warning("[integration_review] V-C1 STACK_SPEC 探测异常（降级为仅查未收录栈表）: %s",
                        exc)
 
-    # ② 未收录栈的清单在场（PHP/Ruby/C#/Elixir/Dart…）→ 同样是"有构建面、没编译闸"。
+    # ② 未收录栈的清单（PHP/Ruby/Elixir/Dart/sbt + C# 的 glob）
     for name, key in _UNSUPPORTED_STACK_MANIFESTS:
         if os.path.isfile(j(project_path, name)):
-            return None, f"{UNSUPPORTED_STACK}:{key}"
-    import glob as _glob
+            matched.append(name)
+            if first_key is None:
+                first_key = key
     for pattern, key in _UNSUPPORTED_STACK_GLOBS:
-        if _glob.glob(j(project_path, pattern)):
-            return None, f"{UNSUPPORTED_STACK}:{key}"
+        # LOW-1：路径含 `[`/`]` 时 glob 会把它当字符类 → 漏检 → 退回假过。
+        if _glob.glob(j(_glob.escape(project_path), pattern)):
+            matched.append(pattern)
+            if first_key is None:
+                first_key = key
 
-    return None, NO_BUILD_SURFACE
+    if cmd:
+        return cmd, "ok", matched
+    if first_key:
+        return None, f"{UNSUPPORTED_STACK}:{first_key}", matched
+    return None, NO_BUILD_SURFACE, matched
 
 
 def _detect_build_cmd_generic(project_path: str) -> str | None:
@@ -193,15 +217,21 @@ def _detect_build_cmd_generic(project_path: str) -> str | None:
     j = os.path.join
     if os.path.isfile(j(project_path, "pom.xml")):
         return "mvn -q -DskipTests compile"
-    if os.path.isfile(j(project_path, "build.gradle")) or os.path.isfile(
-        j(project_path, "build.gradle.kts")
-    ):
+    # ★也认 `settings.gradle(.kts)`（双复核 HIGH-2）★ 只有 settings.gradle 而无【根】
+    # build.gradle 的多模块 Gradle 工程是常态，旧判据返 None → 被新三态误判成"闸未实现"
+    # → 烧完 replan 后 FAILED。`./gradlew classes` 对它本来就跑得通——漂移的是**派生表太窄**，
+    # 不是这个栈没闸。
+    if any(os.path.isfile(j(project_path, n)) for n in
+           ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")):
         # #37 治本：`classes` 任务编译主源集【全部 JVM 语言】(compileJava+compileKotlin+
         # compileScala+compileGroovy，按已应用插件)。旧 `compileJava` 对 Kotlin/Scala 工程
         # (build.gradle.kts→Kotlin)编译零源→exit 0【假过自动 ACCEPT 坏构建】，或 java 插件
         # 缺席时任务不存在→非零【冤杀好构建】。`classes` 由任一 JVM 语言插件创建，跨语言正确。
         return "./gradlew -q classes 2>/dev/null || gradle -q classes"
-    if os.path.isfile(j(project_path, "go.mod")):
+    # ★也认 `go.work`（双复核 HIGH-2）★ go.work 多模块仓根上**没有** go.mod，旧判据返 None
+    # → 新三态误判"闸未实现"。实证打到了本仓自己的 B-0 `go_work` 夹具头上。
+    # `go build ./...` 在 workspace 根同样正确（workspace 模式下它构建全部 use 的模块）。
+    if os.path.isfile(j(project_path, "go.mod")) or os.path.isfile(j(project_path, "go.work")):
         return "go build ./..."
     if os.path.isfile(j(project_path, "Cargo.toml")):
         return "cargo build -q"
@@ -221,9 +251,12 @@ def _detect_build_cmd_generic(project_path: str) -> str | None:
         if os.path.isfile(j(project_path, "tsconfig.json")):
             return "npx tsc --noEmit --pretty false"
         return None
-    if os.path.isfile(j(project_path, "pyproject.toml")) or os.path.isfile(
-        j(project_path, "setup.py")
-    ):
+    # ★也认 `requirements.txt` / `Pipfile`（双复核 HIGH-2）★ 仅 requirements.txt 是
+    # Django/Flask 的常态；`compileall` **不读任何清单**，对它与 pyproject 仓逐字同命令，
+    # 所以旧判据返 None 纯属派生表太窄。我上一版把这条读成了"STACK_SPEC 照出 python 漂移
+    # → 如实报 unsupported"——方向读反了：漂移的是派生表，不是 python 没闸。
+    if any(os.path.isfile(j(project_path, n)) for n in
+           ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile")):
         return "python -m compileall -q ."
     return None
 
@@ -415,7 +448,7 @@ def _run_worktree_phase(
         return False, issues, details
     details["apply_check"] = True
 
-    build_cmd, _surface_reason = detect_build_surface(project_path)
+    build_cmd, _surface_reason, _surface_manifests = detect_build_surface(project_path)
     details["build_cmd"] = build_cmd
     details["compile_skip_reason"] = None if build_cmd else _surface_reason
     if build_cmd:
@@ -501,30 +534,37 @@ def _run_worktree_phase(
                     + " ——infra 降级（非代码失败），按归因不出全量 replan（查文件占用/权限）")
                 logger.warning("[integration_review] F5 L2 回滚半失败（工作区残留，infra "
                                "降级翻转 passed）: %s", _rb_failed[:8])
-    elif _surface_reason.startswith(UNSUPPORTED_STACK):
-        # ★V-C1 治本（B-4a）★ 磁盘上**有**构建面，但本仓没给这个栈实现 L2 编译闸。
-        # 旧行为：与"纯 docs"共用 `compile_ok=None` 且**不产 issue** → `passed=len(issues)==0`
-        # → **判 PASS** → PHP/Ruby/C#/Elixir/仅 requirements.txt 的 Python/无 build script 的
-        # Node 全部"L2 永久 no-op 且判通过"，坏产物直达交付（27 号文 §1 矩阵里那一列 ✖判PASS）。
-        # 现在 fail-closed：产 issue（passed 自动翻 False）+ 机读键 + record_degrade + WARNING。
-        # 诚实边界：这**不是**判代码失败，是拒绝"没验过却当验过"——文案必须说清是闸缺失。
-        _stack_key = _surface_reason.split(":", 1)[1] if ":" in _surface_reason else "unknown"
+    elif _surface_reason.startswith(UNSUPPORTED_STACK + ":"):
+        # ★V-C1 治本（B-4a，双复核整改后的形态）★ 磁盘上**有**构建面，但本仓没给这个栈实现
+        # L2 编译闸。旧行为：与"纯 docs"共用 `compile_ok=None` 且**不产 issue** →
+        # `passed=len(issues)==0` → **判 PASS** → 坏产物直达交付（§1 矩阵那一列 ✖判PASS）。
+        #
+        # ★为什么这里【不产 issue】（双复核 CRITICAL-3，两路独立证伪我上一版）★
+        # 产 issue → `passed=False` → `l2_passed=False` → `after_verify_l2` **强制**
+        # `handle_failure` → replan ×2 → escalate → DELIVER → FAILED/PARTIAL。而"这个栈的
+        # 编译闸没实现"是**磁盘事实**，与 worker 产出无关，replan **零修复力**：重规划后 L2
+        # 必逐字复现同一 issue，每轮都在烧钱重跑一件确定修不好的事。更坏的是 escalate 出态
+        # 必带 `failure_escalated=True`，人看到的拒因变成"子任务重试耗尽已升级人工"——把
+        # "我们没验"说成"worker 没干好"，归因错得比原来更远，还会连坐重派无辜子任务。
+        #
+        # §6.3 原则 3 原文要的就是另一条路：**不是拦交付，是拒绝 auto_accept、强制人工确认**。
+        # 所以这里只留【机读事实】，由 verify_l2 转成 `degraded_reasons`（state 键、进
+        # checkpoint、已有 build_degraded_summary 与 deliver payload 两个现成消费者），
+        # 再由 `can_auto_accept_delivery` 据此拒放行。`record_degrade` 保留作运维计数，
+        # 但**它不是那条通道**（进程内 counter、重启即丢、无任务维度）。
+        _stack_key = _surface_reason.split(":", 1)[1] or "unknown"
         details["compile_ok"] = None
         details["compile_gate_unsupported_stack"] = _stack_key
-        issues.append(
-            f"L2 集成编译闸未实现（栈={_stack_key}）：磁盘上有该栈构建面，但本仓派生不出全量"
-            "编译命令 → 本次交付的编译正确性**完全未经验证**。这不是代码失败，是验证能力缺失；"
-            "拒绝当作通过（fail-closed）。补该栈的 BuildDriver，或人工确认后用 "
-            "--no-auto-accept 放行"
-        )
+        details["compile_surface_manifests"] = _surface_manifests
         try:
             from swarm.infra.degrade import record_degrade
             record_degrade(f"brain.l2.compile_gate_unsupported_stack.{_stack_key}")
-        except Exception:  # noqa: BLE001 — 计数失败绝不影响主判定
-            pass
+        except Exception as _dexc:  # noqa: BLE001 — 计数失败绝不影响主判定，但不静默
+            logger.warning("[integration_review] degrade 计数失败（不影响判定）: %s", _dexc)
         logger.warning(
-            "[integration_review] V-C1 L2 编译闸对栈 %s 未实现（有构建面却无编译命令）"
-            "→ fail-closed 产 issue，绝不静默判 PASS", _stack_key)
+            "[integration_review] V-C1 L2 编译闸对栈 %s 未实现（有构建面 %s 却无编译命令）"
+            "→ 不产 issue（replan 修不了磁盘事实），转 degraded_reasons 拒 auto_accept",
+            _stack_key, _surface_manifests)
     else:
         details["compile_ok"] = None  # 真无构建文件(纯 docs/config) → 合理跳过，非降级
         logger.info("[integration_review] 无构建文件(纯 docs/config)，跳过全量编译")

@@ -158,25 +158,6 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
         return False, f"failed_subtasks: 仍有未恢复的失败子任务 {failed}"
 
     if not state.get("l2_passed", False):
-        # ★V-C1（B-4a）如实归因★ L2 未通过可能是"编译真失败"，也可能是"这个栈的编译闸本仓
-        # 没实现"（`integration_review` 对有构建面却派生不出命令的栈 fail-closed 产 issue）。
-        # 两者对人的意思完全不同：后者不是代码坏了，是**我们没验**。沿用上方
-        # clarify_blocked_by_facts 的先例——专类先判、如实归因，绝不让人按错的根因去查。
-        # `l2_details` 的形状是 `{"integration_review": ir_details, "issues": [...]}`
-        # （verify.py 的多个写点都这样包），少数早退分支只有 `issues`。两层都查——
-        # 只查一层就是"接线覆盖 ≠ 机制存在"（本仓四条硬检查①）。
-        _l2d = state.get("l2_details")
-        _l2d = _l2d if isinstance(_l2d, dict) else {}
-        _ir = _l2d.get("integration_review")
-        _ir = _ir if isinstance(_ir, dict) else {}
-        _unsup = (_ir.get("compile_gate_unsupported_stack")
-                  or _l2d.get("compile_gate_unsupported_stack"))
-        if _unsup:
-            return False, (
-                f"verification_unsupported_stack:{_unsup}: 该栈的 L2 集成编译闸本仓未实现"
-                "（磁盘上有构建面却派生不出编译命令）→ 交付未经自动编译验证，拒绝 auto_accept；"
-                "请人工确认后用 --no-auto-accept 放行，或补该栈的 BuildDriver"
-            )
         return False, "l2_failed: L2 集成验证未通过"
 
     # l3_passed 三态：None=跳过(不算失败)，False=失败，True=通过
@@ -221,6 +202,27 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
         return False, (
             "acceptance_failed: 验收断言未通过（应用已启动但接口行为不符预期，"
             "非启动/探活失败）"
+        )
+
+    # ★V-C1（B-4a）★ 该栈的 L2 集成编译闸**本仓未实现** → 交付未经自动编译验证 → 拒
+    # auto_accept、强制人工确认（§6.3 原则 3：**不是拦交付**，是拒绝自动放行）。
+    #
+    # ★判序与载体都是双复核整改的结果（CRITICAL-1/CRITICAL-3）★
+    # 上一版把这条接在 `not l2_passed` 分支里，而到达 DELIVER 且 l2_passed=False 的唯一路径
+    # 是 escalate 出口，它**必带** `failure_escalated=True` + 非空 `failed_subtask_ids`
+    # ——两者在本函数里都排在更前面 → 那条分支**在生产路径上永不执行**（L6"治本被静默关闭"
+    # 的复发形态：闸造好了，接在没人走的路上）。现在改成：L2 侧不产 issue（l2_passed 仍 True），
+    # 事实走 `degraded_reasons`，本判定放在"其它闸都过了"之后——此时前面那些 return 都不会
+    # 抢先，分支真正可达。
+    _unsup = [str(d) for d in (state.get("degraded_reasons") or [])
+              if str(d).startswith("l2_unsupported_stack:")]
+    if _unsup:
+        _keys = sorted({d.split(":", 1)[1] for d in _unsup if ":" in d})
+        return False, (
+            f"verification_unsupported_stack:{','.join(_keys) or 'unknown'}: "
+            "该栈的 L2 集成编译闸本仓未实现（磁盘上有构建面却派生不出编译命令）→ 本次交付的"
+            "编译正确性**未经自动验证**，拒绝 auto_accept。这不是代码失败、也不是 worker 的错；"
+            "请人工确认后用 --no-auto-accept 放行，或补该栈的 BuildDriver"
         )
 
     # ★G12（Task#9 审计⑥）★ baseline_covered 被【运行时断言证伪】→ 无条件硬拦 auto_accept

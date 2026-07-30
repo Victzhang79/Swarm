@@ -319,6 +319,21 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             base_ref=state.get("base_commit"),  # 3rd#2：L2 reset/apply-check 相对钉扎 base
         )
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
+        # ★V-C1（B-4a，双复核 CRITICAL-3/MEDIUM-1 整改）★ 该栈的 L2 编译闸未实现 →
+        # 走 `degraded_reasons`（state 键、进 checkpoint、有 build_degraded_summary 与
+        # deliver payload 两个现成消费者），**不产 L2 issue**：产 issue 会让 l2_passed=False
+        # → 强制 handle_failure → replan ×2 → escalate → FAILED，而 replan 对"闸没实现"
+        # 这种磁盘事实零修复力，且拒因会变成"子任务重试耗尽"（把"我们没验"说成"worker
+        # 没干好"，还连坐重派无辜者）。§6.3 原则 3 原文：**不是拦交付，是拒绝 auto_accept**。
+        # 与 :172 的 l2_compile_unverified、:470 的 l2_no_test_executed 同族同通道。
+        _unsup_stack = ir_details.get("compile_gate_unsupported_stack")
+        if _unsup_stack:
+            _l2_unverified_degraded = list(_l2_unverified_degraded) + [
+                f"l2_unsupported_stack:{_unsup_stack}"]
+            logger.warning(
+                "[VERIFY_L2] V-C1 栈 %s 的集成编译闸未实现（命中构建面 %s）→ degraded 留痕，"
+                "拒 auto_accept（不阻断交付、不烧 replan）", _unsup_stack,
+                ir_details.get("compile_surface_manifests"))
         if not ir_ok:
             _infra_degrade = ("compile_unverified" if ir_details.get("compile_unverified")
                               else "rollback_reset_failed" if ir_details.get("rollback_reset_failed")
@@ -1009,7 +1024,7 @@ def _acquire_smoke_sandbox(
         return None, "sandbox_unavailable", details
     from pathlib import Path
 
-    from swarm.brain.integration_review import _detect_build_cmd_generic
+    from swarm.brain.integration_review import detect_build_surface as _detect_build_surface
 
     workdir = get_config().sandbox.sandbox_remote_workdir
     try:
@@ -1057,7 +1072,16 @@ def _acquire_smoke_sandbox(
             manager.try_extend_lifetime(sandbox, int(budget_sec))
         except Exception:  # noqa: BLE001
             pass
-        build_cmd = _detect_build_cmd_generic(project_path)
+        # ★MEDIUM-2（双复核）：本调用点必须与 L2 同批三态化★ 此前它靠"unsupported 已被 L2
+        # 拦死"而不可达；CRITICAL-3 改成不阻断后，这里立刻变成真假过——"有构建面 → 不建产物
+        # → 直接冒烟"（冒烟测的是陈旧/不存在的产物）。故此处也读三态并留痕。
+        build_cmd, _rb_reason, _rb_manifests = _detect_build_surface(project_path)
+        if not build_cmd and _rb_reason.startswith("unsupported_stack:"):
+            details["rebuild_skipped_unsupported_stack"] = _rb_reason.split(":", 1)[1]
+            details["rebuild_surface_manifests"] = _rb_manifests
+            logger.warning(
+                "[SMOKE] V-C1 栈 %s 无派生编译命令 → 冒烟前不重建产物（测的可能是陈旧产物）；"
+                "该事实已由 L2 的 degraded_reasons 携出", _rb_reason.split(":", 1)[1])
         if build_cmd:
             result = manager.run_command(
                 sandbox, f"cd {workdir} && ({build_cmd}); echo __RC__$?", timeout=600,
