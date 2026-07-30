@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,45 @@ _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _path)
 assert _spec and _spec.loader
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# B-0：共享**非 Maven workspace 夹具**（27 号文 §7 B-0 硬前提）
+#
+# 27 号文 §4.3 实测：非 Maven 侧零回归网，工程树全是各文件现场造的 1~5 文件微型树，
+# 而那些微型树恰好绕开了 `_reconcile_*` / `_safe_subdirs` 的前提句 → 测试走不进被测分支。
+# 四型真实拓扑（+single-root +Maven 对照臂）一次造对，供 sandbox_spec / workspace_manifest /
+# l1_pipeline / plan_validator 复用。造树逻辑在 test/stack_workspaces.py。
+#
+# `--import-mode=importlib`（pyproject addopts）下 test/ 不进 sys.path，故按路径加载并
+# 注册进 sys.modules —— 与本仓 swarm_bootstrap / test_cassette_replay 同款既有范式，
+# 让测试模块能 `import stack_workspaces` 拿 builders 做 collection 期 parametrize。
+# ──────────────────────────────────────────────────────────────────────
+
+_sw_path = Path(__file__).parent / "stack_workspaces.py"
+_sw_spec = importlib.util.spec_from_file_location("stack_workspaces", _sw_path)
+assert _sw_spec and _sw_spec.loader
+stack_workspaces = importlib.util.module_from_spec(_sw_spec)
+sys.modules["stack_workspaces"] = stack_workspaces
+_sw_spec.loader.exec_module(stack_workspaces)
+
+
+@pytest.fixture
+def make_workspace(tmp_path):
+    """工厂夹具：`make_workspace("go_work")` → 造好树的 `WorkspaceFixture`。
+
+    同一测试内可造多棵（各自独立子目录），供混栈场景用。
+    """
+    def _make(name: str, subdir: str | None = None):
+        root = tmp_path / (subdir or name)
+        return stack_workspaces.build_workspace(name, root)
+    return _make
+
+
+# 注：**刻意不提供** `params=NON_MAVEN_WORKSPACES` 的参数化夹具。消费者要遍历时用
+# `@pytest.mark.parametrize(..., indirect=True)` 自带的本地夹具（见
+# test_b0_workspace_fixture_matrix.py 的 `fx`）——那样 parametrize id 与覆盖范围都在
+# 用它的文件里一目了然。本仓纪律：新账没有消费者＝没造，别先摆一个"将来会有人用"的夹具。
 
 
 # ──────────────────────────────────────────────────────────────────────
