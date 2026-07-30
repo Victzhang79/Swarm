@@ -134,7 +134,12 @@ def test_39a_non_maven_root_aggregator_double_writer_hard_fails():
     """#39-A 治本：此前只 pom.xml 硬失败，Gradle settings.gradle / Go go.work 的【依赖序】
     双写者只落 warn 逃过 backstop → include(...)/use 结构重写非加性=rebase 循环。栈中立铺开：
     根级聚合清单集统一硬失败（即便依赖序）。"""
-    for manifest in ("settings.gradle", "settings.gradle.kts", "go.work", "Cargo.toml"):
+    # ★B-3 复核 F-7 整改：参数表改从 STACK_SPEC 派生★ 旧码手抄 4 条、**漏 package.json**
+    # ——恰是 R-1 里"判死名单漏 npm"那条洞，而这个测试本该是它的守卫。派生后新增一栈/别名
+    # 自动进本测试，不再靠谁记得来加一行。
+    from swarm.stacks import root_aggregate_manifests
+
+    for manifest in sorted(root_aggregate_manifests()):
         sts = [_st("st-1", writable=[manifest], depends=[]),
                _st("st-2", writable=[manifest], depends=["st-1"])]  # 依赖序（旧码只 warn）
         res = validate_plan_structure(TaskPlan(subtasks=sts))

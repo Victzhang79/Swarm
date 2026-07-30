@@ -75,6 +75,7 @@ packages = [
     "swarm.observability",
     "swarm.project",
     "swarm.scripts",
+    "swarm.stacks",
     "swarm.tools",
     "swarm.worker",
 ]

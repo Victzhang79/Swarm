@@ -9,6 +9,16 @@ import re
 from pathlib import Path
 from typing import Any
 
+from swarm.stacks import (
+    aggregate_manifests_of_stack,
+    demote_safety_net,
+    is_compilable_source,
+    is_structural_build_manifest,
+    module_manifests_of_stack,
+    spec_for_stack,
+    stack_of_structural_manifest,
+    structural_manifests,
+)
 from swarm.types import SubTaskDifficulty, TaskPlan
 
 logger = logging.getLogger(__name__)
@@ -38,15 +48,24 @@ def _is_root_pom(rel: str) -> bool:
 
 
 def _is_pom_file(rel: str) -> bool:
-    """是否为 Maven pom（根或模块 pom，basename == pom.xml）。
+    """是否为【结构性构建清单】（根或模块，任意已收录栈）。
 
     #11(a) 治本：任何 pom 都是【结构性全文件】——两个写者各自整段重写 <modules>/
     <dependencyManagement>/<dependencies>，union/3-way 合并无法收口（round18 P0-A 根 pom
     畸形闭标签 / round19 模块 pom 双 <project> 根拼接 → apply 后不可解析、交付死于门口）。
     故【任何 pom】都须单写者，非首写者一律 demote+依赖 owner（不止根 pom）。不同模块的 pom
-    是不同文件（各有 first_writer），互不干扰——本判据只把"同一个 pom 的多写者"收敛。
+    是不同文件（各有 first_writer），互不干扰——本判据只把"同一个清单的多写者"收敛。
+
+    ★B-3 R-1 栈中立化★ 这条道理与 XML 无关：`package.json`(JSON) / `go.work`(块语法) /
+    `Cargo.toml`(TOML) / `settings.gradle`(Groovy) 同样是整段重写、同样不可 union 合并。
+    此前只认 `pom.xml` → 非 Maven 的根聚合清单双写者落到"串行化保留写权"分支 → 写者仍是
+    2 个 → plan_validator 的根聚合硬失败闸（认 5 条）判死 → **收敛器救不了它判死的东西**
+    → 规划期硬闸永不收敛 → 熔断 fail-fast。名单现由 STACK_SPEC 派生，两侧不可能再分叉。
+
+    收录面按【demote 是否安全】分档，见 `stacks.spec.structural_manifests` 的消费契约
+    （python 刻意不在其中：既无 reconcile 也无规则4 登记，demote 必丢贡献）。
     """
-    return str(rel).replace("\\", "/").rsplit("/", 1)[-1] == "pom.xml"
+    return is_structural_build_manifest(rel)
 
 
 def _exists_in_repo(project_path: str | None, rel: str, cache: dict[str, bool],
@@ -2019,6 +2038,40 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
     return sorted(seen)[0]
 
 
+def _rule4_stack(plan, project_path: str | None) -> str:
+    """规则4（根聚合登记收敛）该按**哪个栈**判 → 栈键（'unknown' = 无证据）。
+
+    ★与 `_detect_build_stack` 刻意分档（复核 F-4 整改）★
+    那个函数答的是"**要不要伪造 Maven 脚手架**"，它的 `_has_jvm_src` 护栏刻意把【歧义混栈】
+    （plan 里有 .java + package.json、根上还没 pom）判成 unknown→保守回退 Maven，防后端模块
+    静默丢 pom（round62 家族级回归）。但规则4 复用那个返回值就成了：unknown → 聚合清单为
+    None → **整条规则静默跳过**，npm 侧的 workspaces 登记一个字都不写，且无任何日志——
+    而彼时 demote 留痕还照旧宣称"登记仅靠规则4 owner 一道网"，实际是**零道网**。
+
+    本函数只问"plan 里实际出现了谁的结构清单"（登记是**加性**动作，按证据走没有伪造风险）：
+    plan 路径里出现的聚合/模块清单 → 该栈。多栈同时有证据时**保 Maven 优先**（与今日
+    `_detect_build_stack` 的混栈序一致，back-compat）；无清单证据时回退 `_detect_build_stack`
+    （它还会看磁盘根清单）。
+    ★诚实边界★：本函数仍是【单栈】的——真混栈 monorepo（同时加 Maven 模块与 npm workspace）
+    只有优先栈拿到登记意图，另一栈靠各自 `_reconcile_*` 兜底。多栈并行登记已登记为 B-5 待办。
+    """
+    paths: list[str] = []
+    for st in getattr(plan, "subtasks", None) or []:
+        sc = getattr(st, "scope", None)
+        paths += list(getattr(sc, "create_files", None) or [])
+        paths += list(getattr(sc, "writable", None) or [])
+    seen: set[str] = set()
+    for p in paths:
+        stk = stack_of_structural_manifest(_norm_scope_path(p))
+        if stk:
+            seen.add(stk)
+    if not seen:
+        return _detect_build_stack(plan, project_path)
+    if "maven" in seen:
+        return "maven"
+    return sorted(seen)[0]
+
+
 def _should_fabricate_maven_scaffold(
     plan, project_path: str | None, file_plan: list | None = None,
 ) -> tuple[bool, str]:
@@ -3911,9 +3964,11 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
     # 按 basename 撞根 pom=击穿 D1 单写者+脚手架蒸发，一律走"挪 create_files"；
     # ③目录上下文：writable 所在目录有本 plan 的 create_files 兄弟=新目录新文件
     # （合法同名分层复制），不重定位。非 git/清单失败 → 整条跳过（greenfield 不误伤）。
-    _RULE0_MANIFESTS = {"pom.xml", "build.gradle", "build.gradle.kts",
-                        "settings.gradle", "settings.gradle.kts",
-                        "package.json", "go.mod", "cargo.toml"}
+    # ★复核 F-5 整改：改从 STACK_SPEC 派生★ 旧手抄名单**漏 go.work**（`Cargo.toml` 靠
+    # `.lower()` 侥幸兜住）→ 幻觉 writable `go.work` 会被按 basename 重定位到 base 树同名
+    # 命中处，正是本块注释②自述的"击穿 D1 单写者 + 脚手架蒸发"。小写比对（本块判的是
+    # LLM 写的 plan 路径，大小写不可信）。`go.mod` 也在集内（structural 含模块清单）。
+    _RULE0_MANIFESTS = {m.lower() for m in structural_manifests()}
     _tree = _base_tree_listing(project_path, base_ref)
     if _tree:
         _tree_set = set(_tree)
@@ -4121,6 +4176,35 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                 # 独立并发 + 新建撞车：降级 readable，杜绝并发抢建同一文件。
                 demoted.append(f)
 
+        # ★B-3：无兜底网的清单 demote 必须留痕（纪律 3 + 硬检查④）★
+        # demote 收回写权。是否安全**按档看**（复核 M-3 整改，两档不可互换）：
+        #   · 根聚合档 → `has_aggregate_reconcile`：`_reconcile_*` 据磁盘 ground-truth 补回注册；
+        #   · 模块清单档 → `has_module_scaffold_driver`：owner 按契约一次建全（#11a doctrine），
+        #     非 owner 本无合法贡献。只有 maven 有。
+        # 早先版本拿聚合档的 reconcile 事实当"该栈任何清单都有网"用 → gradle/cargo/go 的
+        # 模块清单（mod-a/build.gradle、成员 Cargo.toml、mod-a/go.mod）被 demote 时丢的是
+        # **真实编辑**（该子任务想加的依赖/插件），却连一句 WARNING 都没有。
+        for _f in demoted:
+            _fstk = stack_of_structural_manifest(_f)
+            if _fstk is None:
+                continue                      # 不是结构清单（普通文件撞车）→ 与本留痕无关
+            _safe, _tier = demote_safety_net(_f, _fstk)
+            if _safe:
+                continue
+            logger.warning(
+                "[normalize] 规则1 demote 清单 %s（%s，栈=%s，档=%s）→ **该档无兜底网**"
+                "（%s）；该子任务对此文件的编辑（如自加依赖/插件）会静默蒸发。"
+                "依赖应由契约驱动进 owner 脚手架，别指望 worker 徒手补。",
+                _f, st.id, _fstk, _tier,
+                "无 _reconcile_* 补回根注册" if _tier == "aggregate"
+                else "无脚手架 driver 一次建全模块清单")
+            try:
+                from swarm.infra.degrade import record_degrade
+                record_degrade(
+                    f"brain.normalize.manifest_demote_no_net:{_fstk}:{_tier}")
+            except Exception:  # noqa: BLE001 — 观测绝不阻断规划
+                pass
+
         # serialize_after 也要进：聚合文件保留写权时 scope 内容不变，但仍需补串行依赖。
         if (new_creates != creates or new_writables != writables or demoted or serialize_after):
             for f in demoted:
@@ -4153,24 +4237,47 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         plan.parallel_groups = []
         changed = True
 
-    # ── 规则 4：Maven 根 pom 单 owner 登记全部新模块（D1 配套：owner 恒登记，非仅 unowned 时）──
-    # 规则3 只补各模块【自己的】pom；根 `<modules>` 注册是 N 个新模块往同一文件追加。规则1 已把
-    # 根 pom 收敛为【唯一 owner】(非首写者 demote)。本规则确保【那个 owner】(或无人 own 时指派一个)
-    # 登记全部新模块——包括被 demote 写者的模块，杜绝注册落空。additive、去重、带防环。
-    # 注：<modules> 最终仍由 reconcile_workspace_manifests 据磁盘 ground-truth 兜底补齐；此处
+    # ── 规则 4：根聚合清单单 owner 登记全部新模块（D1 配套：owner 恒登记，非仅 unowned 时）──
+    # 规则3 只补各模块【自己的】清单；根聚合注册是 N 个新模块往同一文件追加。规则1 已把
+    # 根聚合清单收敛为【唯一 owner】(非首写者 demote)。本规则确保【那个 owner】(或无人 own 时
+    # 指派一个)登记全部新模块——包括被 demote 写者的模块，杜绝注册落空。additive、去重、带防环。
+    # 注：注册最终仍由 reconcile_workspace_manifests 据磁盘 ground-truth 兜底补齐；此处
     # 令 owner 显式登记是【计划意图】层的收口(worker 一次建全、验收可查)，与 reconcile 双保险。
+    #
+    # ★B-3 R-1 栈驱动化（治"判死的名单 ⊅ 收敛的名单"确定性死锁）★
+    # 本规则此前**只认 pom.xml**，而 plan_validator 的根聚合硬失败闸认 5 条 → go.work /
+    # settings.gradle / Cargo.toml 被判死却无人收敛 → 规划期硬闸永不收敛 → 同签名两轮 →
+    # 熔断 fail-fast → 那三个栈的多模块工程 100% 死在规划期。现在两侧同读 STACK_SPEC。
+    # Maven 工程行为**逐字节不变**（agg=module="pom.xml"，与旧字面量等价）。
+    #
+    # ★清单取【全集】不取单数字段（复核 M-1/F-1 整改）★ spec 声明了 `.kts` 别名与 canonical
+    # 同档消费，而本规则曾只比 `aggregate_manifest`/`module_manifest` 单数字段 →
+    # settings.gradle.kts / build.gradle.kts 工程的登记意图整列落空（实测：owner 无任何登记
+    # 验收条目，只剩 _reconcile_gradle 一道网，spec 宣称的"双保险"是假的）。
+    _stk = _rule4_stack(plan, project_path)
+    _agg_manifests = aggregate_manifests_of_stack(_stk)          # canonical 在首
+    _agg_manifests_lc = frozenset(m.lower() for m in _agg_manifests)
+    _mod_manifests_lc = frozenset(m.lower() for m in module_manifests_of_stack(_stk))
+    _agg_field = (spec_for_stack(_stk).aggregate_field if spec_for_stack(_stk) else "")
     new_modules: set[str] = set()
     root_pom_owner = None
 
+    def _is_agg_path(rel: str) -> bool:
+        """rel 是否为**根级**聚合清单（含别名，大小写不敏感——LLM 写的路径大小写不可信）。"""
+        p = _norm_scope_path(rel)          # L-3：走归一（'./go.work' 曾漏判 → 退回 backstop）
+        return "/" not in p and p.lower() in _agg_manifests_lc
+
     def _module_dir_of_pom(rel: str) -> str | None:
-        """rel 若是模块 pom（任意嵌套深度的 <dir>/pom.xml，根 pom 不算）→ 返回模块目录。
+        """rel 若是模块清单（任意嵌套深度的 <dir>/<module_manifest>，根级不算）→ 返回模块目录。
         round29 复核整改（猎人#5）：旧判定 count("/")==1 使嵌套模块（backend/svc-a/pom.xml）
         对规则 4 完全不可见 → 零序约束，d37a52a3 类 reactor 中毒在 monorepo 布局原样复现。"""
-        fn = str(rel).replace("\\", "/").lstrip("./")
+        if not _mod_manifests_lc:
+            return None
+        fn = _norm_scope_path(rel)
         if "/" not in fn:
             return None
         d, base = fn.rsplit("/", 1)
-        return d if base == "pom.xml" and d else None
+        return d if base.lower() in _mod_manifests_lc and d else None
 
     for st in subtasks:
         scope = getattr(st, "scope", None)
@@ -4178,7 +4285,8 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             continue
         creates = list(getattr(scope, "create_files", []) or [])
         writables = list(getattr(scope, "writable", []) or [])
-        if root_pom_owner is None and ("pom.xml" in creates or "pom.xml" in writables):
+        if (_agg_manifests and root_pom_owner is None
+                and any(_is_agg_path(f) for f in creates + writables)):
             root_pom_owner = st  # 规则1 收敛后唯一 owner（列表序首个）
         for cf in creates:
             d = _module_dir_of_pom(cf)
@@ -4191,8 +4299,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             if d and not _exists_in_repo(
                     project_path, str(wf).replace("\\", "/").lstrip("./"), _exist_cache, base_ref):
                 new_modules.add(d)
-    # 有新模块 + 根 pom 已存在于 repo（真·注册进父 pom 场景）。
-    if new_modules and _exists_in_repo(project_path, "pom.xml", _exist_cache, base_ref):
+    # 有新模块 + 根聚合清单已存在于 repo（真·注册进父清单场景）。
+    # 别名解析：按 canonical 优先序取**磁盘上真实存在**的那一个（Gradle 工程可能是 .kts）。
+    _agg_manifest = next(
+        (m for m in _agg_manifests
+         if _exists_in_repo(project_path, m, _exist_cache, base_ref)),
+        None,
+    )
+    if new_modules and _agg_manifest:
         # owner = 已收敛的根 pom owner；无人 own 时 backstop 指派首个建模块 pom 的子任务。
         owner = root_pom_owner or next(
             (
@@ -4207,12 +4321,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         if owner is not None and getattr(owner, "scope", None) is not None:
             w = list(getattr(owner.scope, "writable", []) or [])
             _owner_creates = list(getattr(owner.scope, "create_files", []) or [])
-            if "pom.xml" not in w and "pom.xml" not in _owner_creates:
-                w.append("pom.xml")
+            # 已持有任一别名形态即算在位（别拿 canonical 名硬塞第二个清单进 scope）
+            if not any(_is_agg_path(f) for f in w + _owner_creates):
+                w.append(_agg_manifest)
                 owner.scope.writable = w
                 changed = True
             ac = list(getattr(owner, "acceptance_criteria", []) or [])
-            note = f"在根 pom.xml 的 <modules> 中登记全部新模块: {sorted(new_modules)}"
+            note = (f"在根 {_agg_manifest} 的 {_agg_field} 中登记全部新模块: "
+                    f"{sorted(new_modules)}")
             if note not in ac:
                 ac.append(note)
                 owner.acceptance_criteria = ac
@@ -4228,11 +4344,14 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             # 脚手架自身的 -pl 构建不需注册先行：清单 reconcile 在沙箱内自愈注册
             # （l1_pipeline._push_manifests_to_sandbox），两向均带 _depends_transitively 防环。
             _owner_scope = getattr(owner, "scope", None)
+            # 排除聚合清单**全部别名形态**（plan 里的拼写未必等于磁盘解析出的那一个）
             _owner_other_files = {
-                str(f).replace("\\", "/").lstrip("./")
-                for f in (list(getattr(_owner_scope, "writable", []) or [])
-                          + list(getattr(_owner_scope, "create_files", []) or []))
-            } - {"pom.xml"}
+                f2 for f2 in (
+                    str(f).replace("\\", "/").lstrip("./")
+                    for f in (list(getattr(_owner_scope, "writable", []) or [])
+                              + list(getattr(_owner_scope, "create_files", []) or []))
+                ) if not _is_agg_path(f2)
+            }
             for st in subtasks:
                 if st.id == owner.id:
                     continue
@@ -4254,12 +4373,13 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                     # 复核护栏（reviewer#2）：st 与 owner 还共享【其它非根 pom 文件】的写序时，
                     # 既有 demote/串行边可能承载那份文件的物理写序——保守跳过规范化（不删不加），
                     # 该模块的注册序交 reconcile/运行期序修复阶梯兜底。
-                    if _owner_other_files & (_st_norm - {"pom.xml"}):
+                    _st_other = {f2 for f2 in _st_norm if not _is_agg_path(f2)}
+                    if _owner_other_files & _st_other:
                         logger.info(
                             "[contract] 规则4 跳过 %s↔%s 序规范化：两者共享其它文件写序（%s），"
                             "保守保留既有边，注册序交 reconcile/运行期阶梯兜底",
                             owner.id, st.id,
-                            sorted(_owner_other_files & (_st_norm - {"pom.xml"}))[:3],
+                            sorted(_owner_other_files & _st_other)[:3],
                         )
                         continue
                     deps_st = list(getattr(st, "depends_on", []) or [])
@@ -5036,8 +5156,8 @@ def _is_sql_subtask(st) -> bool:
     return bool(cf) and all(f.endswith(".sql") for f in cf)
 
 
-def bump_scaffold_difficulty(plan: TaskPlan) -> int:
-    """治本(RUN19 根脚手架卡死)：脚手架 / 写根 pom 的子任务，难度下限提到 MEDIUM。
+def bump_scaffold_difficulty(plan: TaskPlan, project_path: str | None = None) -> int:
+    """治本(RUN19 根脚手架卡死)：脚手架 / 写根聚合清单的子任务，难度下限提到 MEDIUM。
 
     RUN19 现场：st-1 是"建模块 pom.xml + 编辑庞大根 pom 的 <modules> 注册 + 建目录"的根脚手架，
     被 LLM 误判 difficulty=trivial → 走 worker 的【trivial 单发快速路径】(合并定位+编码于一次 agent
@@ -5060,6 +5180,18 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
     文件，低估路由弱档=白烧后重派。模块 pom/资源单文件模板落盘不受影响（真 trivial 保留）。
     原地改，返回提升个数。
     """
+    # ★B-3 R-2/R-3 栈驱动化★ 两条判据此前都是 Java 专属：
+    #   R-2 判裸 `"pom.xml"` → npm/go/gradle/cargo 的根清单脚手架保持 trivial
+    #       → RUN19 那条"读大根清单塞不下 → 拒答 → 全依赖链卡死"在非 Maven 栈原样复活；
+    #   R-3 `classpath_fqn_key` 对非 JVM 布局**恒返 None** → 一次 create 4 个 .ts/.go 也判 0
+    #       → R67-T9 这条治本对所有非 JVM 栈**从未生效过**（不是弱，是零）。
+    # 现按 STACK_SPEC 分派。Maven 工程行为逐字节不变（agg="pom.xml"、JVM 走 classpath_fqn_key）。
+    # 清单取【全集】（复核 M-2 整改）：只比 canonical 单数字段时，写根 `settings.gradle.kts`
+    # 的 TRIVIAL 脚手架实测 bumped=0 保持 trivial —— RUN19 那条"读大根清单塞不下 → 单发拒答
+    # → 全依赖链卡死"在 Gradle KTS 上原样活着，而这正是 R-2 声称治掉的病。
+    _stk = _detect_build_stack(plan, project_path)
+    _spec = spec_for_stack(_stk)
+    _aggs_lc = frozenset(m.lower() for m in aggregate_manifests_of_stack(_stk))
     bumped = 0
     for st in getattr(plan, "subtasks", []) or []:
         if getattr(st, "difficulty", None) != SubTaskDifficulty.TRIVIAL:
@@ -5067,11 +5199,17 @@ def bump_scaffold_difficulty(plan: TaskPlan) -> int:
         sc = getattr(st, "scope", None)
         creates = list(_st_create_files(st))
         writes = set(creates) | set(getattr(sc, "writable", []) or [])
-        # 裸 `pom.xml`（根 pom：大文件 + 多模块登记，读改皆重多步）——模块 pom 是 `<dir>/pom.xml`
-        writes_root_pom = "pom.xml" in {_norm_scope_path(w) for w in writes}
-        # R67-T9：≥3 个类路径源码 create（classpath_fqn_key 非 None=编译参与源码，
-        # 资源/清单不计——单文件模板落盘仍走 trivial 轻路径）
-        many_sources = sum(1 for f in creates if classpath_fqn_key(f)) >= 3
+        # 裸根聚合清单（大文件 + 多模块登记，读改皆重多步）——模块清单是 `<dir>/<manifest>`
+        writes_root_pom = bool(_aggs_lc) and any(
+            _norm_scope_path(w).lower() in _aggs_lc and "/" not in _norm_scope_path(w)
+            for w in writes)
+        # R67-T9：≥3 个参与编译的源码 create（资源/清单不计——单文件模板落盘仍走 trivial 轻路径）。
+        # JVM 系用 classpath_fqn_key（它还额外要求可定位物理模块根，是 JVM 的既有更严口径，
+        # 保持不动）；非 JVM 系没有类路径命名空间这个概念，按该栈的源码后缀判。
+        if _spec is not None and not _spec.shares_classpath_namespace:
+            many_sources = sum(1 for f in creates if is_compilable_source(f, _stk)) >= 3
+        else:
+            many_sources = sum(1 for f in creates if classpath_fqn_key(f)) >= 3
         if writes_root_pom or many_sources:
             st.difficulty = SubTaskDifficulty.MEDIUM
             bumped += 1
@@ -6155,7 +6293,7 @@ def resolve_plan_conflicts(plan: TaskPlan, project_path: str | None = None,
         "scaffolds_merged": dedupe_module_scaffolds(plan),
         "dep_reordered": int(fix_dependency_ordering(plan)),
         "scope_normalized": int(normalize_plan_scopes(plan, project_path=project_path, base_ref=base_ref)),
-        "difficulty_bumped": bump_scaffold_difficulty(plan),
+        "difficulty_bumped": bump_scaffold_difficulty(plan, project_path),
     }
     # H-1：file_plan 被剥离联动删了条目 → 计数暴露给调用方（elaborate/revision 以此判定把就地
     # 变更的 file_plan 回写 state——round67h R1 CRITICAL 同款教训：就地 mutate 不回写会在

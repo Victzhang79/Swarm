@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from swarm.stacks import is_root_aggregate_manifest
 from swarm.types import SubTask, TaskPlan
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,17 @@ MAX_LLM_VALIDATION_PLAN_CHARS = 120_000
 _SLIM_STRIP_SUBTASK_FIELDS = ("contract", "context_snippets")
 
 # #39-A：各栈【根聚合清单】——单写者硬失败 backstop 覆盖面（路径无前缀=仓库根级）。聚合结构
-# 重写非加性（Maven <modules>、Gradle include、Go go.work use、Cargo [workspace] members），
-# 双写者=rebase 循环根因，栈中立统一硬失败。子目录同名清单（如 member Cargo.toml）不在此列。
-_ROOT_AGGREGATOR_MANIFESTS = frozenset({
-    "pom.xml", "settings.gradle", "settings.gradle.kts", "go.work", "Cargo.toml",
-})
+# 重写非加性（Maven <modules>、Gradle include、Go go.work use、Cargo [workspace] members、
+# npm workspaces），双写者=rebase 循环根因，栈中立统一硬失败。子目录同名清单不在此列。
+#
+# ★B-3 R-1：本闸与【收敛器】(contract_utils 规则1/规则4) 必须读同一张表★
+# 曾经是两份手抄名单：本闸 5 条（漏 package.json）、收敛器只认 pom.xml。后果实测——
+#   · go.work/settings.gradle/Cargo.toml：本闸判死、收敛器不救 → 规划期硬闸永不收敛
+#     → 同签名连续两轮 → 熔断 fail-fast → Go/Gradle/Cargo 多模块工程 100% 死在规划期；
+#   · package.json：本闸漏判 → npm workspaces 双写者放行 → 非加性覆盖丢注册。
+# 现在两侧都从 STACK_SPEC 派生，名单不可能再分叉。判定走 `is_root_aggregate_manifest()`
+# ——**在调用时**读表，绝不在 import 期冻结成模块常量（复核 F-7：冻结让"新增一栈只加一条
+# 表项"的承诺在闸侧失效，且当时那条 toy 栈测试的前提句是被通用写者闸假过的）。
 
 
 def slim_plan_json_for_llm_validation(plan: TaskPlan) -> str:
@@ -226,7 +233,7 @@ def validate_plan_structure(
         # Cargo.toml）的依赖序双写者只落下方 warn，逃过 backstop → Gradle/Go 重现 pom 早年那条
         # 非加性 rebase 循环。栈中立铺开：根级聚合清单集统一硬失败（路径无前缀=在仓库根）。
         # normalize_plan_scopes 已收敛唯一 owner；此处硬失败仅在收敛失效时兜底（fail-closed）。
-        if _norm_scope_path(fp) in _ROOT_AGGREGATOR_MANIFESTS:  # DR-01-F2(#46)：fp 已归一，剥 './'
+        if is_root_aggregate_manifest(_norm_scope_path(fp)):  # DR-01-F2(#46)：fp 已归一，剥 './'
             result.add(
                 f"根聚合清单 {fp} 有 {len(ids)} 个写者: [{joined}]"
                 f"（必须收敛唯一 aggregator-owner；双写者=P0-A 畸形/rebase 循环根因）"
