@@ -147,10 +147,30 @@ def test_incomplete_derivation_skips_with_missing_and_evidence(wired):
     assert not wired["smoke_calls"]  # 不猜：缺证据绝不起探针
 
 
-def test_incomplete_derivation_missing_port_only(wired):
+def test_missing_port_only_no_longer_skips_goes_to_reverse_resolve(wired):
+    """★V-H2（B-4b）契约变更★ 端口推不出**不再** skip，改为起进程后反解实际监听端口。
+
+    旧断言是 `missing == ["port"]`（port 缺席即判"推导不全"→ skipped）。那正是 27 号文
+    V-H2 那条 HIGH 的病灶：`_FRAMEWORK_DEFAULT_PORTS` 里 **Rust 一个框架都没有**、Go
+    **只有 Gin** → axum/actix/rocket/echo/fiber/chi/net-http 全部 port=None →
+    **这些栈的冒烟 100% 从未跑过**。而它们的 `start_cmd` 本来就推得出。
+
+    现在 port 缺席仍放行（`missing` 只看 start_cmd），端口由冒烟脚本内的 resolve_port
+    phase 反解；反解不出/歧义再 fail-closed 判 skipped（见
+    `test_b4b_port_reverse_resolve.py`）。
+    """
     wired["derivation"] = SmokeDerivation(start_cmd="x", port=None)
     out = _run_node({"project_id": "p1"})
-    assert out["runtime_smoke_details"]["missing"] == ["port"]
+    assert out["runtime_smoke_details"].get("missing") != ["port"], (
+        "port 缺席仍被判推导不全 → V-H2 整条失效，Rust/非 Gin Go 继续 100% skip")
+    assert out["runtime_smoke_details"].get("reason") != "derivation_incomplete"
+
+
+def test_incomplete_derivation_missing_start_cmd_still_skips(wired):
+    """对照臂：**没有启动方式**仍是死路（反解无从谈起），照旧 fail-closed skipped。"""
+    wired["derivation"] = SmokeDerivation(start_cmd=None, port=8080)
+    out = _run_node({"project_id": "p1"})
+    assert out["runtime_smoke_details"]["missing"] == ["start_cmd"]
 
 
 # ───────────────────────── 节点级：沙箱获取 ─────────────────────────

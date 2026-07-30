@@ -45,6 +45,9 @@ RUN_TIMEOUT_BUFFER_SEC = 90
 DEFAULT_LOG_TAIL_LINES = 200
 # 探活轮询间隔（秒）
 PROBE_INTERVAL_SEC = 2
+# ★V-H2（B-4b）★ 端口反解窗口（秒）：应用 bind 端口远早于健康就绪，故独立且短于探活窗口。
+# 反解不出即 fail-closed skipped，绝不占用整个冒烟预算去等一个可能永不出现的 listener。
+PORT_RESOLVE_WINDOW_SEC = 30
 
 # ── 结构化输出标记（与 L2 的 __RC__ 口径同族） ──
 MARK_PHASE = "__SMOKE_PHASE__"
@@ -60,6 +63,15 @@ MARK_PROBE_TOOL_MISSING = "PROBE_TOOL_MISSING"  # 环境缺探活工具 → 上�
 # S2-5：assert 段执行工具缺失标记（断言片段是 curl 形态——acceptance_spec 契约；curl 缺失
 # 时脚本如实输出本标记，phase 侧判 skipped:assert_tool_missing，环境缺失绝不伪装断言失败）
 MARK_ACCEPT_TOOL_MISSING = "__ACCEPT_TOOL_MISSING__"
+
+# ★V-H2（B-4b）端口反解★ 端口推不出时不再直接 skip，改为【起进程后反解它实际监听的端口】。
+# 值域：`<int>`（唯一端口→采用）| `AMBIGUOUS:<p1,p2,…>`（同进程树多监听，不猜）| `NONE`。
+#
+# 为什么这条一次救活一大片：`_FRAMEWORK_DEFAULT_PORTS` 里 **Rust 一个框架都没有**，Go 只有
+# Gin —— echo/fiber/chi/net-http 全退化成裸 `"go"` → port None → 冒烟 100% skip。而
+# `_derive_start_rust`/`_derive_start_go` **本来就推得出 start_cmd**，缺的只有端口。
+# 与其逐个框架往表里塞默认端口（是猜，且永远追不完），不如问进程自己。
+MARK_PORT_RESOLVED = "__SMOKE_PORT_RESOLVED__"
 # S2-5：accept 标记行透传令牌——executor 只按此令牌原样透传断言证据行（不解析；解析由
 # acceptance_spec.parse_probe_output 在 verify_runtime accept phase 侧做）
 ACCEPT_MARK_TOKEN = "__ACCEPT_"
@@ -417,9 +429,95 @@ def normalize_language_key(backend: str | None) -> str | None:
     return None
 
 
+# ★V-H2 端口反解 shell 段★ 只在 `port is None` 时注入。四条设计要点都有实测依据：
+# ① **按进程树限定**：沙箱里可能有别的 listener（前轮残留/sidecar）。全局扫端口会把无关
+#    listener 当成"应用起来了"＝假绿。只认 `$SMOKE_PID` 及其后代持有的 socket。
+#    （实测：父不监听、子监听的 wrapper→server 形态必须靠树遍历才找得到。）
+# ② **工具四级降级**：ss → netstat → lsof → `/proc/net/tcp`+`/proc/<pid>/fd`。末条零外部
+#    依赖，是最小容器里唯一可用的路径（与探活工具自适应同款口径）。
+# ③ **多监听 fail-closed**：同树监听多端口（app + metrics）→ 报 AMBIGUOUS，不猜。
+# ④ **每个 helper 自吞 stderr**：日志尾要喂崩溃分类器，探测噪声混进去＝给分类器喂假证据
+#    （实测 macOS netstat 无 -p 时 awk 会吐 "newline in string"）。
+_PORT_RESOLVE_FUNCS = """smoke_pid_tree() {
+  local root="$1" queue="$1" out="" cur kids
+  while [ -n "$queue" ]; do
+    cur="${queue%% *}"
+    if [ "$cur" = "$queue" ]; then queue=""; else queue="${queue#* }"; fi
+    [ -z "$cur" ] && continue
+    out="$out $cur"
+    kids=$(pgrep -P "$cur" 2>/dev/null | tr '\\n' ' ')
+    [ -n "$kids" ] && queue="$queue $kids"
+  done
+  echo "$out" | tr ' ' '\\n' | grep -E '^[0-9]+$' | sort -u
+}
+smoke_ports_ss() {
+  command -v ss >/dev/null 2>&1 || return 1
+  local p out=""
+  for p in $1; do
+    out="$out $(ss -ltnpH 2>/dev/null | awk -v pid="$p" '$0 ~ ("pid="pid",") {print $4}' 2>/dev/null)"
+  done
+  echo "$out" | tr ' ' '\\n' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u
+}
+smoke_ports_netstat() {
+  command -v netstat >/dev/null 2>&1 || return 1
+  local p out=""
+  for p in $1; do
+    out="$out $(netstat -ltnp 2>/dev/null | awk -v pid="$p" '$NF ~ ("^"pid"/") {print $4}' 2>/dev/null)"
+  done
+  echo "$out" | tr ' ' '\\n' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u
+}
+smoke_ports_lsof() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  local csv
+  csv=$(echo "$1" | tr '\\n' ',' | sed 's/,$//')
+  [ -z "$csv" ] && return 1
+  lsof -nP -iTCP -sTCP:LISTEN -a -p "$csv" 2>/dev/null \
+    | awk 'NR>1 {print $9}' 2>/dev/null | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u
+}
+smoke_ports_proc() {
+  [ -r /proc/net/tcp ] || return 1
+  local p fd ln inodes="" f
+  for p in $1; do
+    for fd in /proc/"$p"/fd/*; do
+      ln=$(readlink "$fd" 2>/dev/null) || continue
+      case "$ln" in socket:\\[*\\]) inodes="$inodes ${ln#socket:[}";; esac
+    done
+  done
+  inodes=$(echo "$inodes" | tr -d ']' | tr ' ' '\\n' | grep -E '^[0-9]+$' | sort -u)
+  [ -z "$inodes" ] && return 1
+  for f in /proc/net/tcp /proc/net/tcp6; do
+    [ -r "$f" ] || continue
+    tail -n +2 "$f" 2>/dev/null | while read -r _sl laddr _rest_line; do
+      set -- $_rest_line
+      [ "$2" = "0A" ] || continue
+      _inode=$(echo "$_rest_line" | awk '{print $10}')
+      echo "$inodes" | grep -qx "$_inode" || continue
+      printf '%d\\n' "0x${laddr##*:}" 2>/dev/null
+    done
+  done | grep -E '^[0-9]+$' | sort -u
+}
+smoke_resolve_port() {
+  local pids ports n
+  pids=$(smoke_pid_tree "$1")
+  [ -z "$pids" ] && { echo "NONE"; return 1; }
+  ports=$(smoke_ports_ss "$pids")
+  [ -z "$ports" ] && ports=$(smoke_ports_netstat "$pids")
+  [ -z "$ports" ] && ports=$(smoke_ports_lsof "$pids")
+  [ -z "$ports" ] && ports=$(smoke_ports_proc "$pids")
+  ports=$(echo "$ports" | grep -E '^[0-9]+$' | sort -u)
+  [ -z "$ports" ] && { echo "NONE"; return 1; }
+  n=$(echo "$ports" | wc -l | tr -d ' ')
+  if [ "$n" != "1" ]; then
+    echo "AMBIGUOUS:$(echo "$ports" | tr '\\n' ',' | sed 's/,$//')"; return 1
+  fi
+  echo "$ports"
+}
+"""
+
+
 def build_smoke_script(
     start_cmd: str,
-    port: int | str,
+    port: int | str | None,
     health_path: str = "/",
     *,
     prepare_cmd: str | None = None,
@@ -447,7 +545,10 @@ def build_smoke_script(
     """
     window = timeout_sec if (isinstance(timeout_sec, int) and timeout_sec > 0) \
         else resolve_smoke_timeout_sec()
-    port_num = int(port)
+    # ★V-H2★ port=None ＝"推不出，起进程后反解"。已知端口路径**逐字节不变**
+    # （resolve_funcs/resolve_block 为空串、F4 预检照旧、SMOKE_PORT 直接赋值）。
+    resolve_port = port is None
+    port_num = 0 if resolve_port else int(port)
     hp = str(health_path or "/")
     if not hp.startswith("/"):
         hp = "/" + hp
@@ -474,6 +575,53 @@ if [ "$SMOKE_PREPARE_RC" != "0" ]; then
   exit 0
 fi
 """
+    resolve_funcs = _PORT_RESOLVE_FUNCS if resolve_port else ""
+    # F4 端口预检**只在端口已知时**可做（未知端口无从预检）。已知路径逐字节不变。
+    # 诚实边界：反解路径因此没有 PORT_BUSY 保护——但按进程树限定（①）保证不会误采残留
+    # listener；代价是"应用因端口被占起不来"退化成 resolve=NONE → skipped，而非明确 PORT_BUSY。
+    port_busy_block = "" if resolve_port else f"""if [ -n "$PROBE_TOOL" ] && smoke_probe_once; then
+  echo "{MARK_PORT_BUSY}"
+  echo "{MARK_PHASE}collect"
+  echo "{MARK_LOG_BEGIN}"
+  echo "{MARK_LOG_END}"
+  echo "{MARK_DONE}"
+  exit 0
+fi
+"""
+    # ★反解段必须在 `trap smoke_cleanup` **之后**★ 它会 `exit 0`；放在 trap 之前，
+    # 反解失败退出时应用进程会泄漏（自己写的时候就踩了一次）。
+    resolve_block = ""
+    if resolve_port:
+        resolve_block = f"""echo "{MARK_PHASE}resolve_port"
+SMOKE_RESOLVE_DEADLINE=$(( $(date +%s) + {PORT_RESOLVE_WINDOW_SEC} ))
+SMOKE_PORT_RAW="NONE"
+while [ "$(date +%s)" -lt "$SMOKE_RESOLVE_DEADLINE" ]; do
+  if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+    SMOKE_PORT_RAW="NONE"
+    break
+  fi
+  SMOKE_PORT_RAW=$(smoke_resolve_port "$SMOKE_PID")
+  case "$SMOKE_PORT_RAW" in
+    [0-9]*) break ;;
+    AMBIGUOUS:*) break ;;
+  esac
+  sleep "$SMOKE_INTERVAL"
+done
+echo "{MARK_PORT_RESOLVED}$SMOKE_PORT_RAW"
+case "$SMOKE_PORT_RAW" in
+  [0-9]*) SMOKE_PORT="$SMOKE_PORT_RAW" ;;
+  *)
+    # 反解不出/歧义 → 不猜端口、不探活（探未知端口必 refused=假红）。收尾标记照常输出，
+    # 上层按 skipped 处理（fail-closed，绝不把"我们没探"伪装成"启动失败"）。
+    echo "{MARK_PHASE}collect"
+    echo "{MARK_LOG_BEGIN}"
+    tail -n {tail_n} "$SMOKE_LOG" 2>/dev/null
+    echo "{MARK_LOG_END}"
+    if kill -0 "$SMOKE_PID" 2>/dev/null; then echo "{MARK_APP_RC}alive"; fi
+    echo "{MARK_DONE}"
+    exit 0 ;;
+esac
+"""
     accept_block = ""
     accept_cmds = [str(c) for c in (assert_cmds or []) if str(c).strip()]
     if accept_cmds:
@@ -493,7 +641,7 @@ SMOKE_PORT={port_num}
 SMOKE_HEALTH={q_health}
 SMOKE_TIMEOUT={window}
 SMOKE_INTERVAL={PROBE_INTERVAL_SEC}
-cd {q_workdir} || {{ echo "{MARK_PHASE}workdir_unavailable"; exit 96; }}
+{resolve_funcs}cd {q_workdir} || {{ echo "{MARK_PHASE}workdir_unavailable"; exit 96; }}
 SMOKE_LOG=".swarm_smoke_app.log"
 : > "$SMOKE_LOG"
 PROBE_TOOL=""
@@ -528,15 +676,7 @@ smoke_probe_once() {{
     *) return 1 ;;
   esac
 }}
-if [ -n "$PROBE_TOOL" ] && smoke_probe_once; then
-  echo "{MARK_PORT_BUSY}"
-  echo "{MARK_PHASE}collect"
-  echo "{MARK_LOG_BEGIN}"
-  echo "{MARK_LOG_END}"
-  echo "{MARK_DONE}"
-  exit 0
-fi
-{prepare_block}echo "{MARK_PHASE}start"
+{port_busy_block}{prepare_block}echo "{MARK_PHASE}start"
 if command -v setsid >/dev/null 2>&1; then
   setsid bash -c "$SMOKE_START_CMD" >"$SMOKE_LOG" 2>&1 &
 else
@@ -550,7 +690,7 @@ smoke_cleanup() {{
   return 0
 }}
 trap smoke_cleanup EXIT INT TERM
-echo "{MARK_PHASE}probe"
+{resolve_block}echo "{MARK_PHASE}probe"
 SMOKE_OK=0
 if [ -n "$PROBE_TOOL" ]; then
   SMOKE_DEADLINE=$(( $(date +%s) + SMOKE_TIMEOUT ))
@@ -644,6 +784,12 @@ def parse_smoke_markers(output: str) -> dict[str, Any]:
         "app_rc": app_rc,
         "prepare_rc": int(prep_m.group(1)) if prep_m else None,   # F1
         "port_busy": MARK_PORT_BUSY in ctrl,                       # F4
+        # ★V-H2★ 反解结果。**从 ctrl（剥掉应用日志区）取**——与其它控制面标记同源：
+        # 被测应用回显一行伪造的 `__SMOKE_PORT_RESOLVED__80` 就能把探活指向别的端口
+        # （I-M1 那族）。`None`=本轮未走反解（端口已知）。
+        "port_resolved": (m.group(1)
+                          if (m := re.search(rf"{MARK_PORT_RESOLVED}([\w:,]+)", ctrl))
+                          else None),
         "log_tail": log_tail,
         "phases": re.findall(rf"{MARK_PHASE}(\w+)", ctrl),
         "done": MARK_DONE in ctrl,
@@ -919,6 +1065,29 @@ async def run_runtime_smoke(
             log_tail=parsed["log_tail"],
             details={"ran": True, "probe_tool": parsed["probe_tool"],
                      "probe_port": probe_port, "timeout_sec": window})
+    # ★V-H2★ 端口反解结果裁决。判序：在 prepare/probe 之前——反解不出时脚本根本没探活，
+    # 拿 probe_sequence 去分类会得出"timeout"这种**错误且自信**的结论（实际是我们没探）。
+    _pr = parsed.get("port_resolved")
+    if _pr is not None:
+        if _pr.isdigit():
+            # 反解成功 → 用真实端口覆盖 probe_port（None），让下游"端口推导错配"提示与
+            # 断言 evidence 指向真端口，而不是继续显示 None。
+            probe_port = int(_pr)
+        else:
+            _reason = "port_ambiguous" if _pr.startswith("AMBIGUOUS") else "port_unresolved"
+            _detail = (f"同一进程树监听多个端口（{_pr.split(':', 1)[1]}），不猜"
+                       if _pr.startswith("AMBIGUOUS")
+                       else "进程树内无任何 TCP listener（可能启动即退/未 bind/仅 unix socket）")
+            logger.warning("[RUNTIME_SMOKE] V-H2 端口反解未得唯一端口(%s) → skipped：%s",
+                           _pr, _detail)
+            return RuntimeSmokeResult(
+                "skipped", _reason,
+                f"端口推导不出且反解未得唯一端口（{_pr}）：{_detail}——未探活，"
+                "按环境/推导缺口跳过（fail-closed，绝不把'我们没探'判成启动失败）",
+                log_tail=parsed["log_tail"],
+                details={"ran": True, "probe_tool": parsed["probe_tool"],
+                         "port_resolved_raw": _pr, "app_rc": parsed["app_rc"],
+                         "timeout_sec": window})
     prepare_rc = parsed.get("prepare_rc")
     if prepare_rc is not None and prepare_rc != 0:
         # F1：prepare（构建产物）失败——L2 已证编译通过，package 阶段失败大概率是

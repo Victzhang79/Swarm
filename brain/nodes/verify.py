@@ -648,6 +648,33 @@ async def verify_l3(state: BrainState) -> dict:
     }
 
 
+def smoke_derivation_missing(derivation) -> list[str]:
+    """冒烟推导缺哪些**必需**项 → 名字清单（空=够用）。
+
+    ★V-H2（B-4b）：`port` 不再是必需项★ 端口推不出时改为起进程后反解它实际监听的端口
+    （`_FRAMEWORK_DEFAULT_PORTS` 里 Rust 一个框架都没有、Go 只有 Gin —— 那些栈的
+    `start_cmd` 本来就推得出，缺的只有端口，旧闸让它们的冒烟 100% skip）。
+    没有 `start_cmd` 才是死路：没有启动方式，反解无从谈起。
+    """
+    return [name for name, val in (("start_cmd", getattr(derivation, "start_cmd", None)),)
+            if not val]
+
+
+def smoke_derivation_usable(derivation) -> bool:
+    """推导是否够用于起冒烟（fail-closed：缺必需项即 False）。"""
+    return not smoke_derivation_missing(derivation)
+
+
+def should_reverse_resolve_port(derivation) -> bool:
+    """本轮是否走**端口反解**路径：有启动方式、但端口推不出。
+
+    抽成函数是为了让测试能调生产判据本体（而不是在测试里重写一遍条件自证——那种断言
+    对"闸被改回旧判据"零区分力，B-4a CRITICAL-1 同族）。
+    """
+    return (smoke_derivation_usable(derivation)
+            and getattr(derivation, "port", None) is None)
+
+
 async def verify_runtime(state: BrainState) -> dict:
     """VERIFY_RUNTIME 节点 — 运行时冒烟闸门（S1-4 接线；推导层 task#16 + 探针层 task#17）。
 
@@ -711,11 +738,25 @@ async def verify_runtime(state: BrainState) -> dict:
         return _runtime_skipped_state(
             "derivation_error", f"冒烟推导异常，未执行: {str(exc)[:200]}", {})
 
-    if not derivation.start_cmd or derivation.port is None:
+    # ★V-H2（B-4b）★ 端口推不出**不再直接 skip**：起进程后反解它实际监听的端口。
+    # 判据抽成模块级函数（下方三个 `smoke_derivation_*`/`should_reverse_resolve_port`），
+    # 好让测试能调**生产代码本体**——内联在这里的话，测试只能重写一遍条件自证（我第一版
+    # 就写了那种恒真断言，突变改回旧闸它照样绿）。
+    # 只有 `start_cmd` 缺失才是死路（没有启动方式，反解无从谈起）。
+    #
+    # 为什么这条值得动这道闸：`_FRAMEWORK_DEFAULT_PORTS` 里 Rust **一个框架都没有**、
+    # Go 只有 Gin → echo/fiber/chi/net-http/axum/actix/rocket 全部 port=None → 冒烟
+    # **100% skip**（27 号文 V-H2）。而它们的 `start_cmd` 本来就推得出，缺的只有端口。
+    #
+    # ★这个分支在生产上什么 state 会走到（B-4a CRITICAL-1 的教训：必须先答这个）★
+    # `derive_runtime_smoke` 对 Rust/非 Gin Go 工程返回 `start_cmd=<cargo run|go run ...>`
+    # + `port=None`（`_derive_start_rust`/`_derive_start_go` 在 `_ENTRY_DERIVERS` 里，
+    # 端口表无对应框架条目）。这是**真实工程形态**，不是手工构造——测试用真实 derive 输出
+    # 走到这里，不用手写 derivation。
+    _reverse_resolve_port = should_reverse_resolve_port(derivation)
+    if not smoke_derivation_usable(derivation):
         # fail-closed：推不出就不猜（smoke_derive 铁律），如实报缺哪个 + 已有 evidence。
-        missing = [name for name, val in
-                   (("start_cmd", derivation.start_cmd), ("port", derivation.port))
-                   if val is None]
+        missing = smoke_derivation_missing(derivation)
         logger.info("[VERIFY_RUNTIME] 推导不全(缺 %s) → skipped；evidence=%s",
                     missing, derivation.evidence)
         await _release_handoff()
@@ -733,7 +774,17 @@ async def verify_runtime(state: BrainState) -> dict:
     assertions, accept_gen_degraded, accept_gen_info = \
         await _generate_acceptance_assertions(state, derivation)
     assert_cmds: list[str] = []
-    if assertions:
+    # ★诚实边界（V-H2）★ 反解路径上端口到**运行时**才知道，而 `assertion_to_probe_cmd`
+    # 在**构建时**把端口烤进 curl 片段（它对 None 直接 ValueError）。本批**不**改
+    # acceptance_spec 的契约（那会把改动面扩到断言层+其测试，违反"一批一范围"）：
+    # 断言在反解路径上如实降级为未执行，并留机读 degraded。冒烟本体（真启动验证）照跑
+    # ——那才是 V-H2 要救的东西。断言可执行化留 B-4b 后续（把片段改用 $SMOKE_PORT）。
+    _accept_skipped_no_port = bool(assertions) and _reverse_resolve_port
+    if _accept_skipped_no_port:
+        logger.warning(
+            "[VERIFY_RUNTIME] V-H2 反解路径：端口构建时未知 → %d 条验收断言本轮不执行"
+            "（冒烟本体照跑）；断言可执行化待 B-4b 后续", len(assertions))
+    if assertions and not _reverse_resolve_port:
         from swarm.brain.acceptance_spec import assertion_to_probe_cmd, smoke_login_cmd
 
         # D8①（阶段6）：冒烟内登录取凭据——运维配置 SWARM_SMOKE_LOGIN_* 后，bearer
