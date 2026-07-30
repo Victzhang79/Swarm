@@ -121,6 +121,18 @@ _LANGUAGE_ALIASES: tuple[tuple[str, str], ...] = (
     ("golang", "go"),
     ("go", "go"),
     ("rust", "rust"),
+    # ★V-C2（27 号文 §3.3 CRITICAL 假过）★ 缺这四个键 → language_key=None → `_match_family`
+    # 只取 `generic`，而 `_CODE_ERROR_PATTERNS` **刻意无 generic 键**（无表命中绝不默认判代码错）
+    # → 这些栈**任何启动崩溃都落 inconclusive(skipped)** → auto_accept → 交付坏产物。
+    # token 取自**确定性生产者的词表**（`stack_detect._LANG_EXTS` 的键，经
+    # `profile["backend"] = f"{backend_fw} ({backend_lang})"` 落盘）——不是我猜的拼法。
+    # 本表契约＝**语言别名**，刻意不收框架名（laravel/rails/phoenix）：那是 §2.1"backend 是
+    # LLM 可写裸 str"的独立缺口，混进来会把本表语义悄悄改成"语言或框架"（消费契约漂移）。
+    ("csharp", "csharp"),
+    ("php", "php"),
+    ("ruby", "ruby"),
+    ("elixir", "elixir"),
+    ("dart", "dart"),
 )
 
 # 类1：代码错误族（纯语法/类格式/链接失败——与依赖安装状态无关的确定性代码故障）
@@ -162,6 +174,44 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         r"index out of bounds",
         r"unwrap\(\)`? on (an? )?(`?Err`?|`?None`?)",
         r"attempt to .{0,40}overflow",
+    ),
+    # ★V-C2★ 以下四栈同 F5 口径：只收**与依赖安装/外部服务无关**的确定性代码故障。
+    # 刻意不收的（会把环境冤枉成代码，fail-honest）：PHP `Class not found`（多为 autoload/
+    # 扩展缺失）· Ruby `LoadError`（gem 未装）· C# `Could not load file or assembly`
+    # （NuGet 未还原）· Elixir `** (Mix)`（依赖未 deps.get）——它们属类2/import 缺失族。
+    "php": (
+        r"PHP Parse error",
+        r"Parse error: syntax error",
+        r"Uncaught TypeError",
+        r"Uncaught ArgumentCountError",
+        r"Uncaught DivisionByZeroError",
+    ),
+    "ruby": (
+        r"syntax error, unexpected",
+        r"\bSyntaxError\b",
+        r"\bNoMethodError\b",          # nil 上调方法＝典型代码缺陷
+        r"\bZeroDivisionError\b",
+    ),
+    "csharp": (
+        r"\berror CS\d{4}\b",          # Roslyn 编译错（CS0246 类型找不到亦属之）
+        r"System\.NullReferenceException",
+        r"System\.IndexOutOfRangeException",
+        r"System\.InvalidCastException",
+    ),
+    "elixir": (
+        r"\*\* \(CompileError\)",
+        r"\*\* \(SyntaxError\)",
+        r"\*\* \(FunctionClauseError\)",
+        r"\*\* \(MatchError\)",
+        r"\*\* \(ArithmeticError\)",
+    ),
+    "dart": (
+        # ★不用 `^` 锚★ 同 go 那条血泪（本表下方 _STARTUP_CRASH_PATTERNS["go"] 有全文）：
+        # log_text 是 `tail -n 200` 的日志尾，`_match_family` 此处 flags=0 → `^` 只匹配
+        # **整串开头**，几乎恒不命中。写死锚点＝这一档静默失效。
+        r"Error: Expected",
+        r"\bNoSuchMethodError\b",
+        r"is not a subtype of type",
     ),
 }
 
@@ -208,6 +258,29 @@ _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "rust": (
         r"thread '.*' panicked at",
+    ),
+    # ★V-C2★ 这四栈原先连"崩了但归不到代码"这个名字都没有（language_key=None 时只有
+    # generic 那条 Spring 字面串）→ 崩溃与"什么都没发生"共用 inconclusive。
+    # 与 _CODE_ERROR_PATTERNS 分工：这里收**已确认崩了但可能裹着环境因**的形态。
+    "php": (
+        r"PHP Fatal error",
+        r"Uncaught Exception",
+    ),
+    "ruby": (
+        r"rails aborted!",
+        r"bundler: failed to load command",
+    ),
+    "csharp": (
+        r"Unhandled exception\. System\.",
+        r"Application startup exception",
+    ),
+    "elixir": (
+        r"\*\* \(Mix\) ",
+        r"Application \w+ exited",
+        r"GenServer .{0,80} terminating",
+    ),
+    "dart": (
+        r"Unhandled exception:",
     ),
 }
 
@@ -273,6 +346,31 @@ _ENV_MISSING_PATTERNS: dict[str, tuple[str, ...]] = {
         r"missing .{0,60}(env|environment) variable",
         r"No such file or directory \(os error 2\)",
         r"environment variable not found",
+    ),
+    # ★V-C2★ 各栈**驱动层**连接失败形态——它们的报错里常**不含**字面
+    # `Connection refused`（generic 那条抓不到）→ 不补就会落进 code_error/inconclusive，
+    # 把"沙箱没有 DB"冤枉成代码问题（fail-honest 的反方向同样致命）。
+    "php": (
+        r"SQLSTATE\[",
+        r"could not find driver",
+    ),
+    "ruby": (
+        r"PG::ConnectionBad",
+        r"Mysql2::Error",
+        r"Redis::CannotConnectError",
+    ),
+    "csharp": (
+        r"System\.Net\.Sockets\.SocketException",
+        r"A network-related or instance-specific error",
+    ),
+    "elixir": (
+        r"DBConnection\.ConnectionError",
+        r"Postgrex\.Error",
+        r"\beconnrefused\b",
+    ),
+    "dart": (
+        # Dart VM 的裸形态（不带 `System.Net.Sockets.` 前缀，那是 C#）
+        r"\bSocketException\b",
     ),
 }
 
