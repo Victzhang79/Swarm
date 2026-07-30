@@ -47,11 +47,19 @@ _spec_bs = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod_bs = importlib.util.module_from_spec(_spec_bs)
 _spec_bs.loader.exec_module(_mod_bs)
 
-# 夹具 builders（conftest 已注册进 sys.modules；此处按路径独立加载，不依赖加载序）。
-_sw = Path(__file__).resolve().parent / "stack_workspaces.py"
-_spec_sw = importlib.util.spec_from_file_location("stack_workspaces", _sw)
-sw = importlib.util.module_from_spec(_spec_sw)
-_spec_sw.loader.exec_module(sw)
+# 夹具 builders：**复用 conftest 注册的那一份**（复核 L-5）。原先无条件再 exec 一遍 →
+# 同进程两个 `WorkspaceFixture` 类，而本文件同时用 `fx`（本地 exec 的）与 `make_workspace`
+# （conftest 的）两条来源。今天无 `isinstance` 依赖故无害，但那是巧合不是设计。
+import sys  # noqa: E402
+
+if "stack_workspaces" in sys.modules:
+    sw = sys.modules["stack_workspaces"]
+else:                                     # 单独跑本文件（无 conftest 时）的兜底
+    _sw = Path(__file__).resolve().parent / "stack_workspaces.py"
+    _spec_sw = importlib.util.spec_from_file_location("stack_workspaces", _sw)
+    sw = importlib.util.module_from_spec(_spec_sw)
+    sys.modules["stack_workspaces"] = sw
+    _spec_sw.loader.exec_module(sw)
 
 from swarm.stacks import (  # noqa: E402
     STACK_SPEC,
@@ -145,16 +153,41 @@ def test_compilable_source_covers_sources_and_excludes_noise(fx):
 
 @pytest.mark.parametrize("fx", ALL, indirect=True)
 def test_multi_source_signal_is_not_jvm_gated(fx):
-    """R-3 回归（矩阵档）：**每型**都必须数得出"这个子任务写了几个源码文件"。
+    """R-3 回归（矩阵档）：一次 create ≥3 个该栈源码的 TRIVIAL 子任务**必须被提难度**。
 
     R-3 原病：`many_sources` 走 `classpath_fqn_key`（JVM 门控，对 `.ts`/`.go`/`.rs` 恒
-    None）→ 非 JVM 栈判 0 个源码文件 → 难度永不提升 → R67-T9 这条治本**对所有非 JVM 栈
-    从未生效过**。这里直接数夹具的源码集：任何一型数出 0 就是门控回来了。
+    None）→ 非 JVM 栈判 0 个源码文件 → 难度永不提升 → worker 走 trivial 单发路径（封顶
+    30 步）塞不下 → 拒答 → 全依赖链卡死（RUN19 死型）。R67-T9 这条治本**对所有非 JVM 栈
+    从未生效过**。
+
+    ★必须真调 `bump_scaffold_difficulty`（双路复核 HIGH-1/MEDIUM-1）★ 本测试原先只是把
+    `is_compilable_source` 又数一遍——那是上一条测试的弱化重复，**对 R-3 零区分力**：
+    两路复核各自独立把 R-3 治本撤回（`many_sources` 改回只用 `classpath_fqn_key`），
+    矩阵 54 项全绿。真锁在 `test_b3::test_difficulty_bump_follows_the_table_not_java`，
+    于是"矩阵档 + B-3 档双保险"是**账面双保险、实际单保险**。矩阵档的增量价值＝六型覆盖
+    比 B-3 的两栈更宽。
     """
-    n = sum(1 for s in fx.sources if is_compilable_source(s, fx.stack))
-    assert n >= 2, (
-        f"{fx.name}: 只数出 {n} 个源码文件（夹具有 {len(fx.sources)} 个）"
+    from swarm.brain.contract_utils import bump_scaffold_difficulty
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
+
+    srcs = [s for s in fx.sources if is_compilable_source(s, fx.stack)][:3]
+    assert len(srcs) >= 3, (
+        f"{fx.name}: 夹具只提供 {len(srcs)} 个可编译源码，凑不出 ≥3 的判据前提"
+        "（夹具得改，不是判据得改）")
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="一次建多个源码文件",
+                difficulty=SubTaskDifficulty.TRIVIAL,
+                scope=FileScope(create_files=list(srcs)), acceptance_criteria=["ok"]),
+    ], parallel_groups=[["st-1"]], shared_contract={})
+
+    bumped = bump_scaffold_difficulty(plan, str(fx.root))
+
+    assert bumped >= 1, (
+        f"{fx.name}: 一次 create {len(srcs)} 个源码文件仍判 trivial（bumped={bumped}）"
         "——JVM 门控回归？R-3 就是这么对非 JVM 栈全程失效的")
+    assert plan.subtasks[0].difficulty != SubTaskDifficulty.TRIVIAL, (
+        f"{fx.name}: 难度没真被改（bumped 计数对了但没落到子任务上——判据正确 ≠ 编排正确）")
 
 
 # ══════════════════════════════════════════════
@@ -183,10 +216,31 @@ def test_reconcile_adds_unregistered_members_per_declared_tier(fx):
         assert fx.aggregate_manifest in added, (
             f"{fx.name}: spec 声明有聚合 reconcile，却没补 {fx.unregistered}；"
             f"实得 added={added} modified={r.get('modified_manifests')}")
+        # ★断【相等】不是超集（复核 HIGH-1）★ 只断"该补的补了"会让**过度登记全程隐形**：
+        # 实测把 `_SKIP_DIRS` 清空，`target/staging/Cargo.toml` 当场被登记成 workspace
+        # 成员（R46-2 幽灵成员 / L8 泄漏那一族），而原先的超集断言照旧全绿。而且那张表
+        # 此前**全仓无人锁**——清空它，既有的 workspace_manifest 测试也全绿。
+        got = {str(m).strip("./") for m in added[fx.aggregate_manifest]}
+        want = {d.strip("./") for d in fx.unregistered}
+        assert got == want, (
+            f"{fx.name}: 登记集不相等。多登记的={sorted(got - want)}（诱饵清单被当成员？"
+            f"`_SKIP_DIRS` 失效？）少登记的={sorted(want - got)}")
+        # 夹具自报的 `registered` 必须**真的已登记**（复核 L-6：原先只验它是个目录）。
+        # 声明错了会让 `unregistered` 的相等断言在错的基准上成立＝假绿。
+        already = {d.strip("./") for d in fx.registered}
+        assert not (already & got), (
+            f"{fx.name}: 夹具说 {sorted(already & got)} 已登记，reconcile 却又补了一遍"
+            "——夹具声明与聚合清单实际内容分叉")
         for d in fx.unregistered:
             leaf = Path(d).name
             assert leaf in agg_text or d in agg_text, (
                 f"{fx.name}: {d} 未写进 {fx.aggregate_manifest}:\n{agg_text}")
+        # 诱饵绝不许出现在聚合清单里（按目录段判，不靠 basename 子串）
+        for decoy in fx.decoy_manifests:
+            seg = decoy.replace("\\", "/").split("/")[0]
+            assert seg not in agg_text, (
+                f"{fx.name}: 被排除目录 {seg}/ 的诱饵清单 {decoy} 进了聚合清单"
+                f"（幽灵成员会毒死构建）:\n{agg_text}")
         # 幂等（对账器的硬契约：跑两遍不得再动）
         r2 = reconcile_workspace_manifests(str(fx.root))
         assert r2["modified_manifests"] == [], f"{fx.name}: 非幂等，二次跑又改了 {r2}"
@@ -201,12 +255,16 @@ def test_reconcile_adds_unregistered_members_per_declared_tier(fx):
 
 
 @pytest.mark.parametrize("fx", AGG, indirect=True)
-def test_demote_safety_net_is_tiered_on_a_real_tree(fx):
-    """M-3 回归（矩阵档）：同一棵真实树上，**根档与模块档的兜底结论必须能不同**。
+def test_demote_safety_net_tier_is_derived_from_the_path_shape(fx):
+    """M-3 回归（矩阵档）：根档与模块档的兜底结论**必须能不同**，且档位由路径形状判出。
 
     原病：`has_manifest_reconcile` 一个布尔被消费成"该栈任何清单 demote 都有兜底" →
-    go/gradle/cargo 的**模块**清单丢真实编辑连 WARNING 都没有。这里逐型验两档各自读
-    各自的事实源；`maven` 是唯一两档皆 True 的栈，正好当对照。
+    go/gradle/cargo 的**模块**清单丢真实编辑连 WARNING 都没有。
+
+    ★已改名并收窄声称（复核 note）★ 原名带 `on_a_real_tree`，但本测试**只传路径字符串、
+    根本不碰磁盘**；且前两条断言是把被测函数实现原样复述（函数体就是那个三元式）。真正有
+    区分力的只有**档位判定**与"非 maven 栈模块档必须无兜底"。行为档的强锁在
+    `test_b3::test_demote_observability_is_tiered_not_one_boolean`（5 栈 × 两档探针矩阵）。
     """
     spec = spec_for_stack(fx.stack)
     safe_agg, tier_agg = demote_safety_net(fx.aggregate_manifest, fx.stack)
@@ -256,6 +314,49 @@ def test_expected_toolchain_table_covers_every_registered_stack():
     """准入闸（B-7 的雏形）：新增一栈必须在本表有期望值，不许悄悄漏出矩阵。"""
     missing = sorted(set(STACK_SPEC) - set(_EXPECTED_TOOLCHAIN))
     assert not missing, f"新栈 {missing} 未登记期望工具链——矩阵会静默漏掉它"
+
+
+def test_every_registered_stack_has_a_workspace_fixture():
+    """★真正的覆盖闸（两路复核 HIGH-2/MEDIUM-3）★ 每个已收录栈都必须有夹具。
+
+    原先两道准入闸只管"**表**里有没有这一行"，而 ②③④⑤⑥ 全部消费者跑的是
+    `WORKSPACE_BUILDERS` —— 两个集合**无对账**：加一栈只需加表项（有闸），加夹具（无闸）。
+    python 当时正是此状态：`STACK_SPEC` 六栈里缺口最多的一个（`aggregate_manifest=None`、
+    两档 reconcile/driver 皆无、R-3 曾对 `.py` 全程失效），却**唯一没有夹具**。
+    B-0 的使命是红灯先行，少一型夹具＝**少点亮一条本该当场亮的红灯**。
+
+    豁免要写进 `_FIXTURE_EXEMPT` 并注明理由——**别靠沉默**。
+    """
+    # 夹具覆盖了哪些栈，由各 builder **自报**（不手抄第二份名单）
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        stacks_covered = {
+            sw.build_workspace(n, Path(td) / n).stack for n in sw.WORKSPACE_BUILDERS
+        }
+    missing = sorted(set(STACK_SPEC) - stacks_covered - _FIXTURE_EXEMPT)
+    assert not missing, (
+        f"已收录栈 {missing} 没有 workspace 夹具 → ②③④⑤⑥ 全部消费者对它零覆盖，"
+        f"而两道'表'准入闸照旧绿。补 builder，或写进 _FIXTURE_EXEMPT 并注明理由")
+
+
+_FIXTURE_EXEMPT: frozenset[str] = frozenset()
+"""显式豁免"无夹具"的栈键 —— 当前空。加进来必须在此注明理由。"""
+
+
+def test_aggregate_param_set_matches_fixture_facts():
+    """`AGGREGATE_WORKSPACES` 的手抄排除名单必须与夹具自报的 `aggregate_manifest` 对账。
+
+    两者分叉会**静默漏测一整型**（聚合档不跑它），而参数计数看起来毫无异常。
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for name in sw.WORKSPACE_BUILDERS:
+            fx = sw.build_workspace(name, Path(td) / name)
+            in_agg = name in sw.AGGREGATE_WORKSPACES
+            has_agg = fx.aggregate_manifest is not None
+            assert in_agg == has_agg, (
+                f"{name}: 在 AGGREGATE_WORKSPACES={in_agg}，但夹具自报 "
+                f"aggregate_manifest={fx.aggregate_manifest!r}——名单与事实分叉")
 
 
 @pytest.mark.parametrize("fx", ALL, indirect=True)
@@ -308,7 +409,13 @@ def test_full_build_command_derives_from_disk_evidence_alone(fx, request):
     if fx.name == "go_work":
         request.node.add_marker(pytest.mark.xfail(
             strict=True, reason="N-2（B-5）：清单探测只看工程根 + _BUILD_TOOL_MANIFESTS 无 "
-                                "go.work → go.work 多模块仓零构建闸"))
+                                "go.work → go.work 多模块仓零构建闸（**仅本地兜底档**，"
+                                "沙箱分支见 test_n2_is_local_fallback_only_...）"))
+    if fx.name == "python_workspace":
+        request.node.add_marker(pytest.mark.xfail(
+            strict=True, reason="N-4（B-4/B-5）：`.py` 在 _derive_full_build_command 里"
+                                "**没有任何分支** → python 工程零构建闸（27 号文 V-C1 的 "
+                                "python 行：'▲ 仅语法'/'✖ 判 PASS'）"))
 
     for src in fx.sources:
         cmd = _derive_full_build_command(str(fx.root), [src], None)
@@ -337,6 +444,69 @@ def test_go_work_gap_is_the_manifest_table_not_the_derivation(make_workspace):
         "go.work 已进清单表 → N-2 的一半已治，请同步更新本测试")
 
 
+def test_n2_is_local_fallback_only_sandbox_branch_does_derive(make_workspace, monkeypatch):
+    """★N-2 的后果**分档**（复核 HIGH-3，纠正 §7.8 原文说过头）★
+
+    `_manifest_present` 有两条路：**沙箱优先**（`find -maxdepth 3`）与**本地兜底**
+    （`os.path.isfile(root/m)`）。上面那条 xfail 跑在本地兜底上，而 worker L1 在真实沙箱
+    拓扑下走前者——它翻得到 `auth/go.mod` → 派生出 `go build ./...`。**所以"go.work 多模块仓
+    零构建闸"只在本地兜底成立，不是生产结论。**
+
+    ★顺带钉住一条更值钱的★ 那条 depth-3 find 正是 **X-H1 跨栈污染**的载体："Maven 工程里
+    有个 `tools/go.mod` 且只改 `.go` → 在工程根跑 `go build ./...`"。本测试把这条也实测出来，
+    免得 B-5 照 §7.8 原文只修本地那半边、还拿这张网自证。
+    """
+    import subprocess
+
+    from swarm.worker import l1_pipeline as l1p
+
+    fx = make_workspace("go_work")
+
+    class _Mgr:
+        """按沙箱真实执行的那条 find 语义应答（不是想当然的 stub）。"""
+        def run_command(self, sandbox, cmd, timeout=None):
+            real = cmd.replace("/workspace", str(fx.root))
+            out = subprocess.run(["bash", "-c", real], capture_output=True, text=True)
+            return type("R", (), {"stdout": out.stdout})()
+
+    monkeypatch.setattr(l1p, "_sandbox_ctx", lambda: (object(), _Mgr(), str(fx.root)))
+    l1p._MANIFEST_PRESENT_CACHE.clear()
+    try:
+        assert l1p._manifest_present(("go.mod",), str(fx.root)) is True, (
+            "沙箱分支的 depth-3 find 应翻得到子模块 auth/go.mod")
+        l1p._MANIFEST_PRESENT_CACHE.clear()
+        assert l1p._derive_full_build_command(
+            str(fx.root), ["auth/token.go"], None) == "go build ./...", (
+            "沙箱分支应派生得出构建命令——N-2 的'零构建闸'仅限本地兜底档")
+    finally:
+        l1p._MANIFEST_PRESENT_CACHE.clear()
+
+
+def test_n1_localization_npm_manifests_are_discovered_only_root_scripts_are_read(
+        make_workspace):
+    """★N-1 定位锁（复核 MEDIUM-5）★ 把 finding 钉在"只读根"这一点上。
+
+    `xfail(strict=True)` 会让同一测试内**所有先行断言失去区分力**——npm 那格被吞掉的包括
+    `assert bf`（`find_build_files` 到底认不认 `package.json`）与全部夹具形状前提。实测：
+    把 `sandbox_spec._NPM` 改成不匹配名（npm 构建文件识别整条失效），B-0 三个文件**全绿**。
+    N-2 有定位锁、N-2b/N-3 的前提句碰巧被同文件兄弟测试覆盖，**N-1 两者皆无**。
+    """
+    from swarm.project.sandbox_spec import _infer_npm, find_build_files
+
+    fx = make_workspace("npm_workspaces")
+    pkgs = find_build_files(fx.root).get("npm") or []
+    # 前提①：根与子包的 package.json 都被发现（这才是 N-1 说"只读根"的对照面）
+    assert "package.json" in pkgs, f"根 package.json 未被发现：{pkgs}"
+    assert any("/" in p for p in pkgs), f"子包 package.json 未被发现：{pkgs}"
+    # 前提②：子包确有 build script（形状不对就测成另一条命题了——本批教训 2）
+    import json
+    child = json.loads((fx.root / "packages/web/package.json").read_text(encoding="utf-8"))
+    assert child.get("scripts", {}).get("build"), "夹具子包缺 build script，N-1 前提不成立"
+    # 病灶：清单都在、子包有 build，`_infer_npm` 仍返 None —— 因为它只读根
+    assert _infer_npm(fx.root, pkgs) is None, (
+        "N-1 已被修好（_infer_npm 认了子包 scripts）→ 请摘掉上面那条 xfail(strict)")
+
+
 # ══════════════════════════════════════════════
 # ⑥ R-1 收敛闭环：判死的必须能被收敛（真实磁盘树档）
 # ══════════════════════════════════════════════
@@ -349,9 +519,12 @@ def test_r1_condemned_aggregate_writers_converge_on_a_real_tree(fx):
     `go.work`/`settings.gradle`/`Cargo.toml` **判死却无人收敛** → 规划期硬闸永不收敛 →
     同签名连续两轮 → **熔断 fail-fast** → 那三栈的多模块工程 100% 死在规划期。
 
-    与 `test_b3_stack_spec_single_source.py` 的差别：那边用合成 plan（`_exists_in_repo`
-    打桩），这边跑在**真实磁盘树**上——规则4 的 owner 探测、聚合-vs-新建分流都读真磁盘，
-    夹具让这些取证走真实路径（"非 git 目录测 git 路径"那类假绿的反面）。
+    ★增量价值是**六型覆盖**，不是"真实磁盘树"（复核 MEDIUM-2 纠正）★
+    本测试原 docstring 声称"跑在真实磁盘树上，规则4 owner 探测与聚合-vs-新建分流都读真磁盘"。
+    实测证伪：对全部 AGG 夹具，`(before.valid, after.valid, writers)` 在**真实树**与**空目录**
+    上逐字相同（全部 `(False, True, ['st-1'])`）——观测面对磁盘完全不敏感。R-1 收敛本身是真锁
+    （突变 M2/M11 验红），但"真实树"这个增量为零，别再拿它当双保险的第二重。
+    真正的差别只有一条：这里**逐型**跑（六型），`test_b3` 那边是两栈合成 plan。
     """
     from swarm.brain.contract_utils import resolve_plan_conflicts
     from swarm.brain.plan_validator import validate_plan_structure

@@ -68,9 +68,15 @@ def _st(sid: str, desc: str, create: list[str], writable: list[str]) -> dict:
             "scope": {"create_files": create, "writable": writable, "readable": []}}
 
 
-def _npm(root: Path) -> dict:
-    """npm workspaces：两个子任务都注册进根 package.json（R-1 的 npm 侧：非加性覆盖）。"""
-    sw.build_workspace("npm_workspaces", root)
+def _npm(root: Path) -> tuple[dict, object]:
+    """npm workspaces：两个子任务都注册进根 package.json（R-1 的 npm 侧：非加性覆盖）。
+
+    返回 `(cassette, WorkspaceFixture)`——★测试直接 import 本函数★，让 cassette 载荷
+    **只有这一份**。此前树共用 builders 但 plan/file_plan/shared_contract 在脚本与测试里
+    各写一份（`description`/`difficulty`/`readable` 都不同，而 description 是多个确定性
+    pass 的输入）→ 正是 R-1 那个"两份名单互为对方反证"的形状，且**等价性无锁**。
+    """
+    fx = sw.build_workspace("npm_workspaces", root)
     contract = {"dependencies": [
         {"module": "alarm", "artifacts": ["axios"]},
         {"module": "notify", "artifacts": ["alarm"]},     # 内部包 → workspace:*
@@ -89,12 +95,15 @@ def _npm(root: Path) -> dict:
             "file_plan": [{"module": "alarm", "path": "packages/alarm/src/index.ts"},
                           {"module": "notify", "path": "packages/notify/src/index.ts"}],
             "task_description": "npm workspaces 多写者争抢根 package.json",
-            "_synthetic": _SYNTHETIC_NOTE}
+            "_synthetic": _SYNTHETIC_NOTE}, fx
 
 
-def _go(root: Path) -> dict:
-    """go.work：两个子任务都注册进 go.work（R-1 的 go 侧：曾判死却无人收敛）。"""
-    sw.build_workspace("go_work", root)
+def _go(root: Path) -> tuple[dict, object]:
+    """go.work：两个子任务都注册进 go.work（R-1 的 go 侧：曾判死却无人收敛）。
+
+    返回 `(cassette, WorkspaceFixture)`，理由同 `_npm`。
+    """
+    fx = sw.build_workspace("go_work", root)
     contract = {"dependencies": [
         {"module": "billing", "artifacts": ["github.com/gin-gonic/gin"]},
         {"module": "report", "artifacts": ["billing"]},   # 内部模块 → replace
@@ -110,7 +119,7 @@ def _go(root: Path) -> dict:
             "file_plan": [{"module": "billing", "path": "billing/handler.go"},
                           {"module": "report", "path": "report/handler.go"}],
             "task_description": "go.work 多写者争抢根 go.work（R-1 死锁现场）",
-            "_synthetic": _SYNTHETIC_NOTE}
+            "_synthetic": _SYNTHETIC_NOTE}, fx
 
 
 _BUILDERS = {"synthetic-npm-workspaces": _npm, "synthetic-go-work": _go}
@@ -128,16 +137,28 @@ def main() -> int:
 
     for name in names:
         tree = out_dir / name
+        # ★先在临时目录建全，再原子替换★（复核 L-2）：旧实现先 rmtree+mkdir 再写 JSON，
+        # builder 中途抛异常就留下"空树 + 旧 JSON"——正是它自己声称要防的半新半旧。
+        staging = out_dir / f".{name}.partial"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        try:
+            cassette, _fx = _BUILDERS[name](staging)
+            payload = json.dumps(cassette, ensure_ascii=False, indent=2) + "\n"
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         if tree.exists():
-            shutil.rmtree(tree)      # 幂等重生成：树必须与 JSON 同一批，绝不半新半旧
-        tree.mkdir(parents=True)
-        cassette = _BUILDERS[name](tree)
-        path = out_dir / f"{name}.json"
-        path.write_text(json.dumps(cassette, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
-        print(f"[synth] {path}  （工程树 {tree}）")
-    print("\n重放：python scripts/cassette_replay.py "
-          f"{out_dir.name}/{names[0]}.json")
+            shutil.rmtree(tree)
+        staging.rename(tree)
+        # project_path 在 staging 下算出来的，替换后要指向最终路径
+        cassette["project_path"] = str(tree)
+        payload = json.dumps(cassette, ensure_ascii=False, indent=2) + "\n"
+        (out_dir / f"{name}.json").write_text(payload, encoding="utf-8")
+        print(f"[synth] {out_dir / f'{name}.json'}  （工程树 {tree}）")
+    # 复核 L-1：旧实现打印 `out_dir.name/...`，`--out-dir` 非默认时相对 cwd 不存在
+    print(f"\n重放：python scripts/cassette_replay.py {out_dir / f'{names[0]}.json'}")
     return 0
 
 

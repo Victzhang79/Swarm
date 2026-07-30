@@ -68,59 +68,50 @@ def _st(sid, create=None, writable=None):
                    acceptance_criteria=["ok"])
 
 
-def _cassette(task_id: str, root: Path, plan: TaskPlan, file_plan: list[dict]) -> dict:
-    """落成与 `cassette_extract.py` 逐键同构的 cassette（好让它能直接落盘手动重放）。"""
-    return {
-        "schema": SCHEMA,
-        "task_id": task_id,
-        "thread_id": None,
-        "project_id": "b0-synthetic",
-        "project_path": str(root),
-        "base_commit": None,
-        "plan": plan.model_dump(mode="json"),
-        "shared_contract": plan.shared_contract,
-        "file_plan": file_plan,
-        "task_description": f"★合成夹具（非真实 E2E 现场）★ {task_id}",
-    }
+# ★cassette 载荷只有一份：入库生成器本身★（双路复核 MEDIUM-4/MEDIUM-2 整改）
+#
+# 此前树共用 builders，但 plan / file_plan / shared_contract 在脚本与测试里**各写一份**
+# （`description`/`difficulty`/`readable` 都不同，而 description 是多个确定性 pass 的输入）
+# → 正是 R-1 那个"两份名单互为对方反证"的形状，且**等价性无锁**：B-5/B-6 让脚本产出的
+# cassette 无法重放时，全量照旧全绿，而那个脚本是 runbook 里让人跑的那条回路、也是唯一
+# 持久件（`cassettes/` 已 gitignore）。现在测试直接 import 它 → "能生成→能重放→断言成立"
+# 一条链锁死。加载范式与本文件加载 cassette_replay.py 同款（scripts/ 不是包）。
+_synth_path = Path(__file__).resolve().parent.parent / "scripts" / "cassette_synth_non_maven.py"
+_s_synth = importlib.util.spec_from_file_location("cassette_synth_non_maven", _synth_path)
+synth = importlib.util.module_from_spec(_s_synth)
+sys.modules["cassette_synth_non_maven"] = synth
+_s_synth.loader.exec_module(synth)
 
 
 @pytest.fixture
-def npm_cassette(make_workspace):
+def npm_cassette(tmp_path):
     """npm workspaces：两个子任务各建一个包并**都注册进根 `package.json`**（R-1 的 npm 侧）。"""
-    fx = make_workspace("npm_workspaces")
-    plan = TaskPlan(subtasks=[
-        _st("st-1", create=["packages/alarm/src/index.ts",
-                            "packages/alarm/src/rule.ts",
-                            "packages/alarm/src/dispatch.ts"], writable=["package.json"]),
-        _st("st-2", create=["packages/notify/src/index.ts"], writable=["package.json"]),
-    ], parallel_groups=[["st-1", "st-2"]])
-    plan.shared_contract = {"dependencies": [
-        {"module": "alarm", "artifacts": ["axios"]},
-        {"module": "notify", "artifacts": ["alarm"]},   # 内部包 → workspace:*
-    ]}
-    return fx, _cassette("synthetic-npm-workspaces", fx.root, plan, [
-        {"module": "alarm", "path": "packages/alarm/src/index.ts"},
-        {"module": "notify", "path": "packages/notify/src/index.ts"},
-    ])
+    cassette, fx = synth._npm(tmp_path / "npm_workspaces")
+    return fx, cassette
 
 
 @pytest.fixture
-def go_cassette(make_workspace):
+def go_cassette(tmp_path):
     """go.work：两个子任务各建一个模块并**都注册进 `go.work`**（R-1 的 go 侧）。"""
-    fx = make_workspace("go_work")
-    plan = TaskPlan(subtasks=[
-        _st("st-1", create=["billing/handler.go", "billing/repo.go",
-                            "billing/model.go"], writable=["go.work"]),
-        _st("st-2", create=["report/handler.go"], writable=["go.work"]),
-    ], parallel_groups=[["st-1", "st-2"]])
-    plan.shared_contract = {"dependencies": [
-        {"module": "billing", "artifacts": ["github.com/gin-gonic/gin"]},
-        {"module": "report", "artifacts": ["billing"]},
-    ]}
-    return fx, _cassette("synthetic-go-work", fx.root, plan, [
-        {"module": "billing", "path": "billing/handler.go"},
-        {"module": "report", "path": "report/handler.go"},
-    ])
+    cassette, fx = synth._go(tmp_path / "go_work")
+    return fx, cassette
+
+
+def test_synth_generator_and_replay_agree_on_the_schema():
+    """生成器产出的 cassette 必须与 `cassette_extract.py` 的落盘键集同构。
+
+    生成器是唯一持久件（`cassettes/` gitignore），schema 漂移了没人会知道——除了这条。
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for fn in (synth._npm, synth._go):
+            cassette, _fx = fn(Path(td) / fn.__name__.strip("_"))
+            for key in ("schema", "task_id", "project_path", "base_commit",
+                        "plan", "shared_contract", "file_plan", "task_description"):
+                assert key in cassette, f"{fn.__name__} 缺 cassette 键 {key}"
+            assert cassette["schema"] == SCHEMA
+            assert "_synthetic" in cassette, "合成性质必须机读可辨，别只写在散文里"
+            assert Path(cassette["project_path"]).is_dir(), "project_path 必须指向真实树"
 
 
 # ══════════════════════════════════════════════

@@ -208,25 +208,36 @@ def test_go_no_root_gomod_skips_scaffold(tmp_path, monkeypatch):
 # `test_driver_matrix_covers_every_registered_stack` 强制——新增一栈时若不给它一格，
 # 那条会红。这挡的是"新栈悄悄漏出矩阵"（B-7 新栈准入闸的雏形）。
 
-# (matrix_id, 根清单名, 根清单内容, 模块源码相对路径, 期望造出的清单 basename 或 None)
+# (matrix_id, 根清单名, 根清单内容, 契约模块标签, 模块源码相对路径, 期望清单 basename 或 None)
+#
+# ★"契约模块标签"这一列是复核 HIGH-2 的整改★ 原先所有行都写死标签 `mod-a`，而 python 行的
+# 目录是 `mod_a`（下划线）→ 标签对不上；更致命的是原 python 源码路径 `pkg/mod_a/__init__.py`
+# **无标准源码布局段** → `_module_physical_dirs` 恒返 `{}` → `injected==[]` 与栈路由**无关地
+# 恒成立**。实测：把 `pyproject.toml` 从 `_MANIFEST_TO_STACK` 摘掉（真实故障"根清单没接进
+# 路由表"）→ 纯 python 仓落进 `(True,'unknown')` Maven 兜底，而那一格照旧绿——正是该格
+# 准入闸 docstring 逐字声称要防的事。对照组：摘 settings.gradle → 只有 gradle 格红；
+# 摘 Cargo.toml → 只有 cargo 格红。
 _DRIVER_MATRIX = [
     ("maven", "pom.xml",
      "<project><groupId>g</groupId><artifactId>root</artifactId><version>1.0</version></project>",
-     "mod-a/src/main/java/A.java", "pom.xml"),
+     "mod-a", "mod-a/src/main/java/com/demo/A.java", "pom.xml"),
     ("npm", "package.json", '{"name":"root","private":true,"workspaces":["packages/*"]}',
-     "packages/mod-a/src/index.ts", "package.json"),
+     "mod-a", "packages/mod-a/src/index.ts", "package.json"),
     ("go", "go.mod", "module example.com/app\n\ngo 1.22\n",
-     "svc/mod-a/main.go", "go.mod"),
+     "mod-a", "svc/mod-a/main.go", "go.mod"),
     # ★P-H4 诚实边界★ 认出来了却零脚手架出口 —— 期望值写 None 是**如实记录现状**，
     # 不是"应该如此"。B-6 给这三栈补 driver 那天，这三格要改成对应清单名。
     ("gradle", "settings.gradle", "include ':mod-a'\n",
-     "mod-a/src/main/kotlin/A.kt", None),
+     "mod-a", "mod-a/src/main/kotlin/com/demo/A.kt", None),
     ("cargo", "Cargo.toml", '[workspace]\nmembers = ["crates/mod-a"]\n',
-     "crates/mod-a/src/lib.rs", None),
+     "mod-a", "crates/mod-a/src/lib.rs", None),
+    # python 用 `services/<mod>/` 多服务布局：标准 `src/<pkg>/` 与 `pkg/<mod>/` 都解析不出
+    # 物理落点（"src"/"pkg" 都在 `_SRC_LAYOUT_SEGMENTS` 里会被当布局段剥掉——"pkg" 是当年为
+    # Go 的 cmd/internal/pkg 塞进去的，27 号文 P-M4 已把那张表标成补丁磁铁）。
     ("python", "pyproject.toml", '[project]\nname = "root"\nversion = "0.1.0"\n',
-     "pkg/mod_a/__init__.py", None),
+     "mod_a", "services/mod_a/service.py", None),
     # 无任何清单证据 → 保守回退 Maven（back-compat，下游 R57-1 pom 取证二次把关）
-    ("unknown", None, None, "mod-a/src/main/java/A.java", "pom.xml"),
+    ("unknown", None, None, "mod-a", "mod-a/src/main/java/com/demo/A.java", "pom.xml"),
 ]
 
 
@@ -244,15 +255,19 @@ def test_driver_matrix_covers_every_registered_stack():
     assert "unknown" in covered, "缺 unknown 格：无清单证据的兜底方向必须被锁死"
 
 
-@pytest.mark.parametrize("stack,manifest,content,src,expect_manifest", _DRIVER_MATRIX,
+@pytest.mark.parametrize("stack,manifest,content,label,src,expect_manifest", _DRIVER_MATRIX,
                          ids=[r[0] for r in _DRIVER_MATRIX])
 def test_scaffold_driver_dispatch_matrix(tmp_path, monkeypatch, stack, manifest, content,
-                                         src, expect_manifest):
+                                         label, src, expect_manifest):
     """满矩阵：根清单决定栈，栈决定**谁造清单**，且**绝不跨栈污染**。
 
-    最要紧的一条断言是最后那个 `not any(...)`：非 Maven 栈**一个 pom.xml 都不许出现**。
-    L4/L8 血泪——Maven 产物泄漏（幻影 pom 写权、根聚合闸放过 `settings.gradle`/`go.work`）
-    是本仓反复复发的一族。
+    两条最要紧的断言：
+    - **正向前提**（复核 HIGH-2 整改）：`_module_physical_dirs` 必须非空。没有它，
+      `expect_manifest is None` 的格子就是"什么都没发生"——而那既是期望值、**也是任何故障
+      的表现**（栈路由整个坏掉也长这样）。有了它，那些格断的才是"模块确实解析出来了，
+      只是**没人给它建清单**"。这正是本批教训 2（夹具形状决定测的是哪条命题）的同型复发。
+    - **零跨栈污染**：非 Maven 栈一个 `pom.xml` 都不许出现（L4/L8 血泪：幻影 pom 写权、
+      根聚合闸放过 `settings.gradle`/`go.work`，是本仓反复复发的一族）。
     """
     monkeypatch.setenv("SWARM_NPM_LOOKUP", "0")   # 离线：解析不到就如实丢弃，绝不臆造
     monkeypatch.setenv("SWARM_GO_LOOKUP", "0")
@@ -260,7 +275,13 @@ def test_scaffold_driver_dispatch_matrix(tmp_path, monkeypatch, stack, manifest,
         (tmp_path / manifest).write_text(content, encoding="utf-8")
 
     plan = TaskPlan(subtasks=[_st("st-1", create=[src])], parallel_groups=[["st-1"]])
-    plan.shared_contract = {"dependencies": [{"module": "mod-a", "artifacts": []}]}
+    plan.shared_contract = {"dependencies": [{"module": label, "artifacts": []}]}
+
+    # ★正向前提：模块得先解析得出物理落点★（见 docstring）
+    dirs = cu._module_physical_dirs(plan, str(tmp_path))
+    assert label in dirs, (
+        f"{stack}: 契约模块 {label!r} 解析不出物理落点（实得 {dirs}）→ 本行任何"
+        f"'没注入'的结论都与栈路由无关地恒真，测不出东西。修夹具路径/标签，别改断言")
 
     injected = inject_build_scaffold_subtasks(plan, str(tmp_path))
     created = [f for st in plan.subtasks

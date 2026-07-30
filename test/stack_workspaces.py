@@ -77,7 +77,23 @@ class WorkspaceFixture:
     """参与编译的源码相对路径（`is_compilable_source` 必须全判 True）。"""
 
     noise: tuple[str, ...] = field(default_factory=tuple)
-    """**不**参与编译的文件（vendored / 产物 / 纯声明）——必须全判 False。"""
+    """**不**参与编译的文件（vendored / 产物 / 纯声明）——必须全判 False。
+
+    ★必须含**该栈真源码后缀**的产物★（复核 MEDIUM-1）：只放 `.class` 之类本就不在
+    `source_exts` 的文件，判 False 与 `source_exclude_dirs` **无关** → 那一格的排除目录
+    删掉也不会红（maven/gradle 两型当初就是这样恒真的）。真实危害面是
+    `target/generated-sources/**/*.java`、`build/generated/**/*.kt` 这类
+    annotation processor / kapt 产物：被当人写源码会让 R67-T9 难度虚高，且
+    `classpath_fqn_key` 给生成类算出 FQN → 跨模块同名判据误伤。"""
+
+    decoy_manifests: tuple[str, ...] = field(default_factory=tuple)
+    """埋在**被排除目录**里、形状足以骗过 `_reconcile_*` 成员判据的清单。
+
+    ★为什么必须有（复核 HIGH-1）★ `_reconcile_*` 只"补漏"不"防多"，而矩阵原先只断
+    `unregistered ⊆ added`（超集），于是**过度登记全程隐形**：实测把 `_SKIP_DIRS` 清空，
+    `target/staging/Cargo.toml` 当场被登记成 workspace 成员（＝R46-2 幽灵成员 / L8 泄漏
+    那一族），而测试照旧全绿。这些诱饵 + `added` **断相等**才锁得住 `_SKIP_DIRS`
+    ——那张表此前**全仓无人锁**。"""
 
     topology: str = "workspace"
     """reactor | workspace | single-root（L5：模块观不可跨栈外推）。"""
@@ -133,7 +149,51 @@ def build_npm_workspaces(root: Path) -> WorkspaceFixture:
                  "packages/web/src/app.ts", "packages/web/src/app.spec.ts"),
         noise=("node_modules/lodash/index.js", "packages/core/dist/index.js",
                "packages/core/src/types.d.ts"),
+        # 诱饵：装出来的包本身就是个合法 package.json，`_SKIP_DIRS` 是唯一拦它的东西
+        decoy_manifests=("node_modules/lodash/package.json",),
         topology="workspace",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# python —— 缺口最多的栈，此前**唯一无夹具**的已收录栈
+# ══════════════════════════════════════════════════════════════════
+
+def build_python_workspace(root: Path) -> WorkspaceFixture:
+    """`pyproject.toml` + `src/` 布局。
+
+    ★为什么必须补（复核 HIGH-2/MEDIUM-3）★ python 是 `STACK_SPEC` 六栈里缺口最多的一个
+    （`aggregate_manifest=None`、两档 reconcile/driver 皆无、R-3 曾对 `.py` 全程失效），
+    而它此前**唯一没有夹具**，两道准入闸都只管"表里有没有这一行"、不管"夹具矩阵里有没有
+    这一型" → B-0 的使命是红灯先行，少这一型＝**少点亮一条本该当场亮的红灯**
+    （实测：python 工程 `_derive_full_build_command` 返 `''` ＝ 27 号文 V-C1/X-H1 的 python 行）。
+
+    ★源码必须落在**可解析的布局段**下★（`src/`）——`_module_physical_dirs` 对无标准布局段的
+    路径恒返 `{}`，那会让"没注入脚手架"变成**与栈路由无关地恒真**（reviewer HIGH-2 实测：
+    把 `pyproject.toml` 从路由表摘掉、纯 py 仓落进 Maven 兜底，而矩阵那格照旧绿）。
+    """
+    _w(root, "pyproject.toml",
+       '[project]\nname = "demo"\nversion = "0.1.0"\n'
+       'requires-python = ">=3.11"\n')
+    _w(root, "src/mod_a/__init__.py", '"""mod_a."""\n')
+    _w(root, "src/mod_a/service.py", "def serve() -> int:\n    return 1\n")
+    _w(root, "src/mod_a/repo.py", "def fetch() -> None:\n    return None\n")
+    _w(root, "src/mod_b/__init__.py", '"""mod_b."""\n')
+    # 噪声：构建产物 / 虚拟环境（`.py` 后缀，真源码后缀 → 排除目录是唯一拦它的东西）
+    _w(root, "build/lib/mod_a/service.py", "def serve() -> int:\n    return 1\n")
+    _w(root, "dist/mod_a/service.py", "def serve() -> int:\n    return 1\n")
+    _w(root, ".venv/lib/site-packages/dep/mod.py", "X = 1\n")
+    return WorkspaceFixture(
+        name="python_workspace", root=root, stack="python", lang="python",
+        # ★刻意 None★ poetry/uv/hatch 的 workspace 机制互不兼容，STACK_SPEC 显式未收录
+        aggregate_manifest=None,
+        registered=(), unregistered=(),
+        module_manifests=(),
+        sources=("src/mod_a/__init__.py", "src/mod_a/service.py",
+                 "src/mod_a/repo.py", "src/mod_b/__init__.py"),
+        noise=("build/lib/mod_a/service.py", "dist/mod_a/service.py",
+               ".venv/lib/site-packages/dep/mod.py"),
+        topology="single-root",
     )
 
 
@@ -148,22 +208,30 @@ def build_go_work(root: Path) -> WorkspaceFixture:
     `use (...)` 用**块形式**（`go work use` 的默认产物），正是 C4 那条"块内只捕获首成员 →
     重复 use → go fatal"治本的现场；夹具沿用块形式才测得到它。
     """
-    _w(root, "go.work", "go 1.22\n\nuse (\n\t./auth\n)\n")
+    # ★块里必须**两个**成员（复核 MEDIUM-3）★ C4 的病灶是"块内只捕获**首**成员"——
+    # 单成员块下病灶版与治本版结果**完全一样**，夹具"沿用块形式才测得到它"这句话就落空了。
+    _w(root, "go.work", "go 1.22\n\nuse (\n\t./auth\n\t./shared\n)\n")
     _w(root, "auth/go.mod", "module example.com/app/auth\n\ngo 1.22\n")
+    _w(root, "shared/go.mod", "module example.com/app/shared\n\ngo 1.22\n")
     _w(root, "gateway/go.mod", "module example.com/app/gateway\n\ngo 1.22\n")
     _w(root, "auth/token.go", "package auth\n\nfunc Token() string { return \"t\" }\n")
     _w(root, "auth/token_test.go", "package auth\n\nimport \"testing\"\n\nfunc TestToken(t *testing.T) {}\n")
+    _w(root, "shared/util.go", "package shared\n\nfunc Util() {}\n")
     _w(root, "gateway/main.go", "package main\n\nfunc main() {}\n")
     # 噪声：vendored 依赖（从不由人手写）
     _w(root, "auth/vendor/github.com/x/y/y.go", "package y\n")
+    # 诱饵：根级 vendor 里放个合法 go.mod —— `_SKIP_DIRS` 是唯一拦它进 `use` 的东西
+    _w(root, "vendor/github.com/x/y/go.mod", "module github.com/x/y\n\ngo 1.22\n")
     return WorkspaceFixture(
         name="go_work", root=root, stack="go", lang="go",
         aggregate_manifest="go.work",
-        registered=("auth",),
+        registered=("auth", "shared"),
         unregistered=("gateway",),
-        module_manifests=("auth/go.mod", "gateway/go.mod"),
-        sources=("auth/token.go", "auth/token_test.go", "gateway/main.go"),
+        module_manifests=("auth/go.mod", "shared/go.mod", "gateway/go.mod"),
+        sources=("auth/token.go", "auth/token_test.go", "shared/util.go",
+                 "gateway/main.go"),
         noise=("auth/vendor/github.com/x/y/y.go",),
+        decoy_manifests=("vendor/github.com/x/y/go.mod",),
         topology="workspace",
     )
 
@@ -214,6 +282,11 @@ def build_cargo_workspace(root: Path) -> WorkspaceFixture:
     _w(root, "crates/api/src/routes.rs", "pub fn routes() {}\n")
     # 噪声：构建产物
     _w(root, "target/debug/build.rs", "fn main() {}\n")
+    # 诱饵：`target/staging` 里放个带 [package] 的 Cargo.toml。**实测**（复核 HIGH-1）：
+    # 把 `_SKIP_DIRS` 清空 → added 变成 ['crates/api', 'target/staging']，产物目录被登记
+    # 成 workspace 成员，而原先只断超集的测试照旧全绿。
+    _w(root, "target/staging/Cargo.toml",
+       '[package]\nname = "staging"\nversion = "0.1.0"\nedition = "2021"\n')
     return WorkspaceFixture(
         name="cargo_workspace", root=root, stack="cargo", lang="rust",
         aggregate_manifest="Cargo.toml",
@@ -223,6 +296,7 @@ def build_cargo_workspace(root: Path) -> WorkspaceFixture:
         sources=("crates/core/src/lib.rs", "crates/api/src/main.rs",
                  "crates/api/src/routes.rs"),
         noise=("target/debug/build.rs",),
+        decoy_manifests=("target/staging/Cargo.toml",),
         topology="workspace",
     )
 
@@ -247,21 +321,37 @@ def build_gradle_kts(root: Path) -> WorkspaceFixture:
     _w(root, "build.gradle.kts", 'plugins {\n    kotlin("jvm") version "1.9.22"\n}\n')
     _w(root, "app/build.gradle.kts", 'plugins {\n    kotlin("jvm")\n}\n')
     _w(root, "lib/build.gradle.kts", 'plugins {\n    kotlin("jvm")\n}\n')
-    _w(root, "app/src/main/kotlin/App.kt", "fun main() {}\n")
-    _w(root, "lib/src/main/kotlin/Lib.kt", "class Lib\n")
-    _w(root, "lib/src/main/java/Legacy.java", "class Legacy {}\n")
-    # 噪声：构建产物
+    # ★源码必须在**包目录**下★ `classpath_fqn_key`（JVM 系的难度判据）要求源码根之后还有
+    # 包路径：`com/demo/App.kt` 可解析，裸 `App.kt` 返 None。裸包文件在 Kotlin 里合法且常见，
+    # 但 JVM 侧那条"额外要求可定位物理模块根"是**刻意的既有更严口径**（R67-T9 原注写明保持
+    # 不动），不是本批要翻的账——夹具按主流形态给包目录，让矩阵量到 R-3 真正那条命题。
+    _w(root, "app/src/main/kotlin/com/demo/App.kt", "package com.demo\n\nfun main() {}\n")
+    _w(root, "app/src/main/kotlin/com/demo/Cfg.kt", "package com.demo\n\nclass Cfg\n")
+    _w(root, "lib/src/main/kotlin/com/demo/Lib.kt", "package com.demo\n\nclass Lib\n")
+    _w(root, "lib/src/main/java/com/demo/Legacy.java",
+       "package com.demo;\nclass Legacy {}\n")
+    # 噪声：构建产物。★必须含真源码后缀★（复核 MEDIUM-1）——`.class` 本就不在 source_exts，
+    # 判 False 与排除目录无关；kapt 产物的 `.kt` 才是这一栈真实的危害面。
     _w(root, "app/build/classes/App.class", "\n")
     _w(root, "build/reports/index.html", "<html></html>\n")
+    _w(root, "app/build/generated/source/kapt/main/Gen.kt", "class Gen\n")
+    _w(root, "lib/build/generated/source/kapt/main/GenLib.java", "class GenLib {}\n")
+    # 诱饵：产物目录里放个 build.gradle.kts（`_safe_subdirs` 是唯一拦它被 include 的东西）
+    _w(root, "build/staging/build.gradle.kts", 'plugins {\n    kotlin("jvm")\n}\n')
     return WorkspaceFixture(
         name="gradle_kts", root=root, stack="gradle", lang="java",
         aggregate_manifest="settings.gradle.kts",
         registered=("app",),
         unregistered=("lib",),
         module_manifests=("app/build.gradle.kts", "lib/build.gradle.kts"),
-        sources=("app/src/main/kotlin/App.kt", "lib/src/main/kotlin/Lib.kt",
-                 "lib/src/main/java/Legacy.java"),
-        noise=("app/build/classes/App.class",),
+        sources=("app/src/main/kotlin/com/demo/App.kt",
+                 "app/src/main/kotlin/com/demo/Cfg.kt",
+                 "lib/src/main/kotlin/com/demo/Lib.kt",
+                 "lib/src/main/java/com/demo/Legacy.java"),
+        noise=("app/build/classes/App.class",
+               "app/build/generated/source/kapt/main/Gen.kt",
+               "lib/build/generated/source/kapt/main/GenLib.java"),
+        decoy_manifests=("build/staging/build.gradle.kts",),
         topology="workspace",
     )
 
@@ -290,6 +380,16 @@ def build_maven_reactor(root: Path) -> WorkspaceFixture:
     _w(root, "svc-web/src/main/java/com/demo/Web.java", "package com.demo;\nclass Web {}\n")
     _w(root, "svc-web/src/main/kotlin/com/demo/Ext.kt", "package com.demo\nclass Ext\n")
     _w(root, "svc-core/target/classes/Core.class", "\n")
+    # ★真源码后缀的产物★（复核 MEDIUM-1）：annotation processor 生成的 `.java` 是这一栈
+    # 真实存在的危害面——被当人写源码则 R67-T9 难度虚高，且 classpath_fqn_key 会给生成类
+    # 算出 FQN → 跨模块同名判据误伤。只放 `.class` 时这一格恒真（删掉 target 排除也不红）。
+    _w(root, "svc-core/target/generated-sources/annotations/com/demo/Gen.java",
+       "package com.demo;\nclass Gen {}\n")
+    # 诱饵：产物目录里放个带 <parent> 的 pom（`_safe_subdirs` 是唯一拦它进 <modules> 的东西）
+    _w(root, "target/staging/pom.xml",
+       "<project>\n  <parent><groupId>com.demo</groupId>"
+       "<artifactId>demo</artifactId><version>1.0.0</version></parent>\n"
+       "  <artifactId>staging</artifactId>\n</project>\n")
     return WorkspaceFixture(
         name="maven_reactor", root=root, stack="maven", lang="java",
         aggregate_manifest="pom.xml",
@@ -299,7 +399,9 @@ def build_maven_reactor(root: Path) -> WorkspaceFixture:
         sources=("svc-core/src/main/java/com/demo/Core.java",
                  "svc-web/src/main/java/com/demo/Web.java",
                  "svc-web/src/main/kotlin/com/demo/Ext.kt"),
-        noise=("svc-core/target/classes/Core.class",),
+        noise=("svc-core/target/classes/Core.class",
+               "svc-core/target/generated-sources/annotations/com/demo/Gen.java"),
+        decoy_manifests=("target/staging/pom.xml",),
         topology="reactor",
     )
 
@@ -314,16 +416,24 @@ WORKSPACE_BUILDERS = {
     "go_single_root": build_go_single_root,
     "cargo_workspace": build_cargo_workspace,
     "gradle_kts": build_gradle_kts,
+    "python_workspace": build_python_workspace,
     "maven_reactor": build_maven_reactor,
 }
 
-NON_MAVEN_WORKSPACES = tuple(k for k in WORKSPACE_BUILDERS if k != "maven_reactor")
-"""非 Maven 型（B-0 的红灯面）。Maven 单独作对照臂，不混进"异栈"参数集。"""
+# 注：**刻意不提供** `NON_MAVEN_WORKSPACES`。它此前零消费者（全仓唯一出现处是一句注释），
+# 而同一批 commit 还专门以"新账没有消费者＝没造"为由删掉了用它的参数化夹具——纪律没执行
+# 到底（复核 LOW-1/L-4）。要遍历异栈的消费者请就地写 parametrize，覆盖范围一目了然。
+
+NO_AGGREGATE_WORKSPACES = ("go_single_root", "python_workspace")
+"""**无**根聚合清单的型：go 单根仓没用 go.work；python 的聚合机制 STACK_SPEC 显式未收录。"""
 
 AGGREGATE_WORKSPACES = tuple(
-    k for k in WORKSPACE_BUILDERS if k != "go_single_root"
+    k for k in WORKSPACE_BUILDERS if k not in NO_AGGREGATE_WORKSPACES
 )
-"""有根聚合清单的型（single-root 无聚合，聚合档断言对它无意义）。"""
+"""有根聚合清单的型（聚合档断言只对它们有意义）。
+
+★这份手抄排除名单由 `test_aggregate_param_set_matches_fixture_facts` 与夹具自报的
+`aggregate_manifest is None` 对账★——两者分叉就会静默漏测一整型，而参数计数看起来毫无异常。"""
 
 
 def build_workspace(name: str, root: Path) -> WorkspaceFixture:
