@@ -72,6 +72,10 @@ MARK_ACCEPT_TOOL_MISSING = "__ACCEPT_TOOL_MISSING__"
 # `_derive_start_rust`/`_derive_start_go` **本来就推得出 start_cmd**，缺的只有端口。
 # 与其逐个框架往表里塞默认端口（是猜，且永远追不完），不如问进程自己。
 MARK_PORT_RESOLVED = "__SMOKE_PORT_RESOLVED__"
+# 反解**用了哪一档工具**（复核 M-1）。值域 ss|netstat|lsof|proc|none_available。
+# `none_available` ＝四档全废 → 那时"反解不出"必须报独立 reason，绝不与"应用没 bind"
+# 共用一个名字（后者会让判读的人去查应用，而真相是我们没有探测工具）。
+MARK_PORT_RESOLVE_TIER = "__SMOKE_PORT_RESOLVE_TIER__"
 # S2-5：accept 标记行透传令牌——executor 只按此令牌原样透传断言证据行（不解析；解析由
 # acceptance_spec.parse_probe_output 在 verify_runtime accept phase 侧做）
 ACCEPT_MARK_TOKEN = "__ACCEPT_"
@@ -446,6 +450,23 @@ _PORT_RESOLVE_FUNCS = """smoke_pid_tree() {
     [ -z "$cur" ] && continue
     out="$out $cur"
     kids=$(pgrep -P "$cur" 2>/dev/null | tr '\\n' ' ')
+    # ★procps 缺席兜底（复核 C-2）★ 沙箱镜像不装 procps；而 `bash -c '<单条简单命令>'`
+    # 会 exec 优化 → SMOKE_PID 就是 cargo/go 本体，而 `cargo run`/`go run` 的真监听者
+    # **恒是它们 fork 的子进程** → 树遍历是 V-H2 目标人群的**必经步骤**，不是可选优化。
+    # `pkill -P` 早就软依赖 procps，但清理失败无害、从不承重；V-H2 让同一缺失工具**换了
+    # 后果档**（"复用单一事实源 ≠ 复用其消费契约"的又一形态）。
+    # PPid 取法：comm 可含空格/括号 → 从**最后一个** `)` 之后再切字段（$1=state $2=ppid）。
+    if [ -z "$kids" ]; then
+      for _st in /proc/[0-9]*/stat; do
+        [ -r "$_st" ] || continue
+        _line=$(cat "$_st" 2>/dev/null) || continue
+        _cpid=${_line%% *}                 # 字段1＝pid（取自行内，不从路径反推）
+        _after=${_line##*\\) }              # comm 可含空格/括号 → 从最后一个 `) ` 之后切
+        set -- $_after
+        [ "${2:-}" = "$cur" ] || continue   # $1=state $2=PPid
+        kids="$kids $_cpid"
+      done
+    fi
     [ -n "$kids" ] && queue="$queue $kids"
   done
   echo "$out" | tr ' ' '\\n' | grep -E '^[0-9]+$' | sort -u
@@ -462,7 +483,8 @@ smoke_ports_netstat() {
   command -v netstat >/dev/null 2>&1 || return 1
   local p out=""
   for p in $1; do
-    out="$out $(netstat -ltnp 2>/dev/null | awk -v pid="$p" '$NF ~ ("^"pid"/") {print $4}' 2>/dev/null)"
+    # 扫**全行**而非 $NF（复核 M-3）：真实输出 `1234/nginx: master` 的 $NF 是 `master` → 失配。
+    out="$out $(netstat -ltnp 2>/dev/null | awk -v pid="$p" '$0 ~ ("(^| )"pid"/") {print $4}' 2>/dev/null)"
   done
   echo "$out" | tr ' ' '\\n' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u
 }
@@ -490,11 +512,27 @@ smoke_ports_proc() {
     tail -n +2 "$f" 2>/dev/null | while read -r _sl laddr _rest_line; do
       set -- $_rest_line
       [ "$2" = "0A" ] || continue
-      _inode=$(echo "$_rest_line" | awk '{print $10}')
+      # ★字段序（复核 C-1：原取 $10 是 sk 指针，该档在任何真 Linux 上恒返空）★
+      # `read -r _sl laddr _rest_line` 已吃掉前 2 列 → `_rest_line` 的 $N ＝绝对第 N+2 列。
+      # 内核 get_tcp4_sock 格式：… st(3) tx:rx(4) tr:when(5) retrnsmt(6) uid(7) timeout(8)
+      # inode(9=abs 10) → **inode 是 _rest_line 的 $8**；$10 ＝abs 12 ＝ `%pK` sk 指针
+      # （kptr_restrict=1 恒 16 个 0；放开也是十六进制指针，永不等于十进制 inode——两种
+      # 配置都确定失败，不是概率性）。
+      _inode=$(echo "$_rest_line" | awk '{print $8}')
       echo "$inodes" | grep -qx "$_inode" || continue
       printf '%d\\n' "0x${laddr##*:}" 2>/dev/null
     done
   done | grep -E '^[0-9]+$' | sort -u
+}
+smoke_resolve_tier() {
+  # ★哪一档工具可用（复核 M-1）★ 四档全无时，"反解不出"的真相是"探测工具全废"，
+  # 而不是"应用没 bind"——两者共用一个 reason 会给出**自信且错误**的结论（B-4a
+  # CRITICAL-3 同族）。探活侧有 MARK_PROBE_TOOL 输出用了哪个工具，反解侧也得有。
+  if command -v ss >/dev/null 2>&1; then echo ss
+  elif command -v netstat >/dev/null 2>&1; then echo netstat
+  elif command -v lsof >/dev/null 2>&1; then echo lsof
+  elif [ -r /proc/net/tcp ]; then echo proc
+  else echo none_available; fi
 }
 smoke_resolve_port() {
   local pids ports n
@@ -593,6 +631,7 @@ fi
     resolve_block = ""
     if resolve_port:
         resolve_block = f"""echo "{MARK_PHASE}resolve_port"
+echo "{MARK_PORT_RESOLVE_TIER}$(smoke_resolve_tier)"
 SMOKE_RESOLVE_DEADLINE=$(( $(date +%s) + {PORT_RESOLVE_WINDOW_SEC} ))
 SMOKE_PORT_RAW="NONE"
 while [ "$(date +%s)" -lt "$SMOKE_RESOLVE_DEADLINE" ]; do
@@ -787,6 +826,11 @@ def parse_smoke_markers(output: str) -> dict[str, Any]:
         # ★V-H2★ 反解结果。**从 ctrl（剥掉应用日志区）取**——与其它控制面标记同源：
         # 被测应用回显一行伪造的 `__SMOKE_PORT_RESOLVED__80` 就能把探活指向别的端口
         # （I-M1 那族）。`None`=本轮未走反解（端口已知）。
+        # 反解用了哪一档工具（复核 M-1）。`none_available` ＝四档全废，那时"反解不出"
+        # 必须报独立 reason，绝不与"应用没 bind"共用一个名字。
+        "port_resolve_tier": (t.group(1)
+                              if (t := re.search(rf"{MARK_PORT_RESOLVE_TIER}(\w+)", ctrl))
+                              else None),
         "port_resolved": (m.group(1)
                           if (m := re.search(rf"{MARK_PORT_RESOLVED}([\w:,]+)", ctrl))
                           else None),
@@ -1074,10 +1118,37 @@ async def run_runtime_smoke(
             # 断言 evidence 指向真端口，而不是继续显示 None。
             probe_port = int(_pr)
         else:
-            _reason = "port_ambiguous" if _pr.startswith("AMBIGUOUS") else "port_unresolved"
-            _detail = (f"同一进程树监听多个端口（{_pr.split(':', 1)[1]}），不猜"
-                       if _pr.startswith("AMBIGUOUS")
-                       else "进程树内无任何 TCP listener（可能启动即退/未 bind/仅 unix socket）")
+            # ★H-1（复核）：先过崩溃分类器，再落 skipped★
+            # 我原来的"判序在 probe 分类之前"论证只对 `probe_sequence` 成立（确实没探活），
+            # 但**过度纠正**了：`_CODE_ERROR_PATTERNS`/`_STARTUP_CRASH_PATTERNS` 只吃
+            # `log_tail`，与 probe_sequence 无关，而 log_tail 在本分支里**已经收割在手**。
+            # 不过一遍分类器 → V-H2 对目标栈**结构上产不出 `failed`**，而"启动就崩"恰是
+            # 这道闸存在的头号理由（与 C-6 原话"崩溃已发生 ≠ 什么都没观测到"直接冲突）。
+            _cls = classify_smoke_outcome(
+                parsed["app_rc"], parsed["log_tail"], [], language_key=language_key)
+            if _cls.status == "failed":
+                logger.warning(
+                    "[RUNTIME_SMOKE] V-H2 端口反解未得端口(%s)，但日志尾命中确定性崩溃形态"
+                    "(%s) → 如实判 failed（绝不因'没探活'把已观测到的崩溃降级成 skipped）",
+                    _pr, _cls.classification)
+                return _cls
+            _tier = parsed.get("port_resolve_tier")
+            if _pr.startswith("AMBIGUOUS"):
+                _reason = "port_ambiguous"
+            elif _tier == "none_available":
+                # ★M-1★ 四档探测工具全废 ≠ 应用没 bind。共用一个 reason 会让判读的人去查
+                # 应用，而真相是我们没有探测手段（沙箱镜像不装 iproute2/net-tools/lsof，
+                # 且 /proc 不可读时连保底档也没有）。
+                _reason = "port_resolve_tooling_missing"
+            else:
+                _reason = "port_unresolved"
+            if _pr.startswith("AMBIGUOUS"):
+                _detail = f"同一进程树监听多个端口（{_pr.split(':', 1)[1]}），不猜"
+            elif _reason == "port_resolve_tooling_missing":
+                _detail = ("沙箱内四档端口探测工具全不可用（ss/netstat/lsof 未装且 "
+                           "/proc/net/tcp 不可读）——这是**环境缺探测手段**，不是应用没监听")
+            else:
+                _detail = "进程树内无任何 TCP listener（可能启动即退/未 bind/仅 unix socket）"
             logger.warning("[RUNTIME_SMOKE] V-H2 端口反解未得唯一端口(%s) → skipped：%s",
                            _pr, _detail)
             return RuntimeSmokeResult(
@@ -1086,8 +1157,8 @@ async def run_runtime_smoke(
                 "按环境/推导缺口跳过（fail-closed，绝不把'我们没探'判成启动失败）",
                 log_tail=parsed["log_tail"],
                 details={"ran": True, "probe_tool": parsed["probe_tool"],
-                         "port_resolved_raw": _pr, "app_rc": parsed["app_rc"],
-                         "timeout_sec": window})
+                         "port_resolved_raw": _pr, "port_resolve_tier": _tier,
+                         "app_rc": parsed["app_rc"], "timeout_sec": window})
     prepare_rc = parsed.get("prepare_rc")
     if prepare_rc is not None and prepare_rc != 0:
         # F1：prepare（构建产物）失败——L2 已证编译通过，package 阶段失败大概率是

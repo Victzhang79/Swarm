@@ -913,7 +913,10 @@ async def verify_runtime(state: BrainState) -> dict:
     accept_patch = _run_accept_phase(
         assertions, accept_gen_info, res.status,
         str((res.details or {}).get("accept_output") or ""),
-        res.classification)
+        res.classification,
+        # 复核 M-2：V-H2 反解路径上断言是**主动没生成**（端口构建时未知），
+        # 与 infra 语义的 markers_missing 分档留痕。
+        skipped_no_port=_accept_skipped_no_port)
     accept_keys = {k: v for k, v in accept_patch.items() if not k.startswith("_")}
     accept_keys["acceptance_assertions"] = list(assertions)
     accept_degraded = (
@@ -1468,7 +1471,7 @@ def _baseline_unverified_degraded(state: BrainState, accept_patch: dict) -> list
 
 def _run_accept_phase(
     assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
-    smoke_classification: str | None = None,
+    smoke_classification: str | None = None, *, skipped_no_port: bool = False,
 ) -> dict:
     """S2-5 accept phase 判定（纯函数，无沙箱 IO——证据已随冒烟输出收割，杀箱后判定安全）。
 
@@ -1478,7 +1481,8 @@ def _run_accept_phase(
     """
     try:
         return _accept_phase_verdict(assertions, gen_info, smoke_status, accept_output,
-                                     smoke_classification)
+                                     smoke_classification,
+                                     skipped_no_port=skipped_no_port)
     except Exception as exc:  # noqa: BLE001 — accept phase 异常绝不污染冒烟结论
         logger.warning("[VERIFY_RUNTIME] accept phase 异常 → skipped: %s", exc)
         return {"acceptance_passed": None,
@@ -1536,7 +1540,7 @@ _ACCEPT_ANSWERED_CLASSES = frozenset({"http_server_error", "started_tcp_only"})
 
 def _accept_phase_verdict(
     assertions: list[dict], gen_info: dict, smoke_status: str | None, accept_output: str,
-    smoke_classification: str | None = None,
+    smoke_classification: str | None = None, *, skipped_no_port: bool = False,
 ) -> dict:
     from swarm.brain.acceptance_spec import evaluate_probe_result, parse_probe_output
     from swarm.brain.nodes.runtime_smoke import MARK_ACCEPT_TOOL_MISSING
@@ -1658,10 +1662,16 @@ def _accept_phase_verdict(
                 "acceptance_details": {**details, "reason": "assertion_failed"},
                 "_failed": True, "_message": msg}
     if not_executed:
-        # 部分/全部断言无证据（infra）→ 不能担保 True，也不冤枉成 False
+        # 部分/全部断言无证据 → 不能担保 True，也不冤枉成 False。
+        # ★复核 M-2：分档★ `markers_missing` 的语义是 **infra/输出截断**（判读的人会去查
+        # 沙箱输出被不被截断）。而 V-H2 反解路径上是我们**主动没生成**执行片段
+        # （`assertion_to_probe_cmd` 构建时要烤端口，反解值到运行时才有），且这是每一次
+        # 带断言的 V-H2 冒烟的**常态**输出——复用 infra 语义会让常态噪声盖过真 infra 事故。
+        _ne_reason = ("port_unknown_at_build_time" if skipped_no_port
+                      else "markers_missing")
         return {"acceptance_passed": None,
-                "acceptance_details": {**details, "reason": "markers_missing"},
-                "_degraded": "acceptance_skipped:markers_missing"}
+                "acceptance_details": {**details, "reason": _ne_reason},
+                "_degraded": f"acceptance_skipped:{_ne_reason}"}
     if inconclusive:
         # S2 复核 F6：无 fail 但有 inconclusive（000/超时）→ 诚实不确定 None + degraded
         # （不假绿也不冤枉——连接失败可能是应用瞬时抖动/HEAD 干等等 infra 形态）
