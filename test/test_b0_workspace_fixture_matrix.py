@@ -403,16 +403,9 @@ def test_full_build_command_derives_from_disk_evidence_alone(fx, request):
     """
     from swarm.worker.l1_pipeline import _build_cmd_applicable, _derive_full_build_command
 
-    if fx.name == "go_work":
-        request.node.add_marker(pytest.mark.xfail(
-            strict=True, reason="N-2（B-5）：清单探测只看工程根 + _BUILD_TOOL_MANIFESTS 无 "
-                                "go.work → go.work 多模块仓零构建闸（**仅本地兜底档**，"
-                                "沙箱分支见 test_n2_is_local_fallback_only_...）"))
-    if fx.name == "python_workspace":
-        request.node.add_marker(pytest.mark.xfail(
-            strict=True, reason="N-4（B-4/B-5）：`.py` 在 _derive_full_build_command 里"
-                                "**没有任何分支** → python 工程零构建闸（27 号文 V-C1 的 "
-                                "python 行：'▲ 仅语法'/'✖ 判 PASS'）"))
+    # ★N-2 / N-4 已治（X-H 批：`go.work` 进判据 + python 补 compileall 分支）★
+    # 原先这两格挂 xfail(strict)，修好即 XPASS ⇒ 硬失败 ⇒ 逼人回来摘标记（B-0 记分板设计如此）。
+    # 已摘：现在**每一型**工程都必须派生得出构建命令，没有豁免格。
 
     for src in fx.sources:
         cmd = _derive_full_build_command(str(fx.root), [src], None)
@@ -432,13 +425,16 @@ def test_go_work_gap_is_the_manifest_table_not_the_derivation(make_workspace):
     from swarm.worker.l1_pipeline import _BUILD_TOOL_MANIFESTS, _derive_full_build_command
 
     fx = make_workspace("go_work")
-    assert _derive_full_build_command(str(fx.root), ["auth/token.go"], None) == "", (
-        "N-2 已被修好 → 请摘掉上面那条 xfail(strict) 并把本测试翻成正向断言")
+    # 治后：**只凭磁盘**（画像=None）就必须派生得出——`go.work` 现在是 go 工程的确定性证据。
+    assert _derive_full_build_command(str(fx.root), ["auth/token.go"], None) \
+        == "go build ./...", "go.work 多模块仓仍派生不出 ⇒ N-2 未真治"
+    # 给了画像当然也行（原判据保留：证明病根是证据源而非派生逻辑）
     assert _derive_full_build_command(
-        str(fx.root), ["auth/token.go"], {"build": "go"}) == "go build ./...", (
-        "派生逻辑本身也坏了（不只是证据源缺 go.work）——B-5 范围要扩")
-    assert "go.work" not in (_BUILD_TOOL_MANIFESTS.get("go") or ()), (
-        "go.work 已进清单表 → N-2 的一半已治，请同步更新本测试")
+        str(fx.root), ["auth/token.go"], {"build": "go"}) == "go build ./..."
+    # ★清单表仍刻意**不含** go.work★：`_BUILD_TOOL_MANIFESTS` 回答的是"跑 `go` 这个命令需要
+    # 什么清单"——`go build` 要的是 go.mod（go.work 只在 workspace 模式附加）。N-2 的治法是让
+    # **派生判据**认 go.work（`has("go.mod", "go.work")` + 锚到 work 根），不是往工具表里塞。
+    assert "go.work" not in (_BUILD_TOOL_MANIFESTS.get("go") or ())
 
 
 def test_n2_is_local_fallback_only_sandbox_branch_does_derive(make_workspace, monkeypatch):

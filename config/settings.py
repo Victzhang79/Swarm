@@ -522,6 +522,24 @@ class WorkerConfig(BaseSettings):
         return _coerce_model_list(v)
 
 
+# ── X-H7：自由文本语言 → 模板语言族（单一事实源，`canonical_template_language` 消费）──
+# 键＝预建模板表真正有的 5 个族；值＝该族的别名/近亲。判据是"**跑它需要哪套工具链**"：
+# kotlin/scala/groovy 要 JDK ⇒ java 族；vue/react/ts 要 node ⇒ node 族。
+_TEMPLATE_LANG_FAMILIES: frozenset[str] = frozenset(
+    {"python", "node", "java", "go", "rust"})
+_TEMPLATE_LANG_ALIASES: dict[str, tuple[str, ...]] = {
+    "java": ("kotlin", "kt", "scala", "groovy", "jvm", "maven", "gradle",
+             "spring", "springboot", "spring boot", "quarkus", "micronaut"),
+    "node": ("nodejs", "javascript", "js", "typescript", "ts", "tsx", "jsx",
+             "vue", "react", "angular", "svelte", "next", "nextjs", "nuxt",
+             "npm", "yarn", "pnpm", "express", "nest", "nestjs", "bun"),
+    "python": ("py", "python3", "django", "flask", "fastapi", "pip", "poetry",
+               "pytest", "uv"),
+    "go": ("golang", "gin", "echo", "fiber"),
+    "rust": ("rs", "cargo", "axum", "actix", "rocket"),
+}
+
+
 class SandboxConfig(BaseSettings):
     """CubeSandbox / E2B 远程沙箱配置"""
     model_config = SettingsConfigDict(
@@ -608,6 +626,35 @@ class SandboxConfig(BaseSettings):
     # 根治方案（按实例标签过滤）见 B 事项，落地后此开关可退役。
     sweep_orphans_on_startup: bool = True
 
+    @staticmethod
+    def canonical_template_language(language: str) -> str:
+        """自由文本语言 → 预建模板的**语言族**键（`python|node|java|go|rust`）。
+
+        ★X-H7（27 号文 §3.2 HIGH）★ `harness.language` 是 LLM 可写的自由文本，而模板表只有
+        5 个精确键 ⇒ `typescript`/`vue`/`kotlin`/`csharp` 全部回退 `default_template`。
+        **Kotlin/Scala 尤其刺眼：它们是 JVM 栈，却拿不到带 JDK/Maven 的 java 镜像** ⇒ 子任务
+        在没有编译器的镜像里跑 → 127 / 编译不了（与 X-C2 同族的"工具不在场"）。
+
+        归一到"**跑它需要哪套工具链**"：kotlin/scala/groovy 要 JDK ⇒ java；
+        vue/react/ts 要 node ⇒ node；django/flask 要 python ⇒ python。
+        真不认识的 → 返空串，调用方回退 default（fail-honest，不硬塞一个族）。
+        """
+        lang = (language or "").strip().lower()
+        if not lang:
+            return ""
+        if lang in _TEMPLATE_LANG_FAMILIES:
+            return lang
+        for fam, aliases in _TEMPLATE_LANG_ALIASES.items():
+            if lang in aliases:
+                return fam
+        # 复合写法（"Spring Boot (java)"/"TypeScript + Vue"）：按词边界找已知别名
+        import re as _re
+        for fam, aliases in _TEMPLATE_LANG_ALIASES.items():
+            for a in aliases:
+                if _re.search(rf"\b{_re.escape(a)}\b", lang):
+                    return fam
+        return ""
+
     def template_for_language(self, language: str, purpose: str = "exec") -> str:
         """语言 + 用途 → 预建模板 ID。
 
@@ -617,16 +664,24 @@ class SandboxConfig(BaseSettings):
 
         让 worker 按子任务语言+性质起合适镜像（执行省资源，验证用带缓存的完整环境）。
         """
-        lang = (language or "").lower()
+        raw = (language or "").lower()
+        # X-H7：先按**原文**查 db（运维可能就是按 `typescript` 这种自由文本配的，必须尊重），
+        # 查不到再用归一后的族键查一次；两者都不中才回退默认值表。
+        fam = self.canonical_template_language(raw)
         # 1) 优先 db（落库的系统级配置）
-        try:
-            from swarm.config import sandbox_store
+        for _key in (raw, fam):
+            if not _key:
+                continue
+            try:
+                from swarm.config import sandbox_store
 
-            db_val = sandbox_store.get_template(lang, purpose=purpose)
-            if db_val:
-                return db_val
-        except Exception:  # noqa: BLE001
-            pass
+                db_val = sandbox_store.get_template(_key, purpose=purpose)
+                if db_val:
+                    return db_val
+            except Exception:  # noqa: BLE001
+                pass
+        # 归一后的族键用于下面两张默认值表（`kotlin`→`java` 才拿得到带 JDK 的镜像）
+        lang = fam or raw
         # 2) 回退 SandboxConfig 默认值
         if purpose == "verify":
             verify_map = {

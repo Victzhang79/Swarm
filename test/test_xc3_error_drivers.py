@@ -816,8 +816,18 @@ def test_wiring_python_test_gate_reaches_blocked(tmp_path, monkeypatch, quiet_ga
         "from app.services.user import list_users\n")
     (tmp_path / "pyproject.toml").write_text("[project]\nname='shop'\n")
     monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "compile ok"))
-    monkeypatch.setattr(lp, "_run_l1_command",
-                        lambda cmd, pp, timeout=120: (1, PY_MODULE_NOT_FOUND))
+
+    # ★夹具必须复现"只有 L1.3 看得见 ModuleNotFoundError"这个前提★（X-H 批实测逼出来的）
+    # N-4 治好之后 python 也有构建闸了（`python3 -m compileall -q .`）。若打桩让**所有**命令都
+    # 吐 ModuleNotFoundError，构建闸会先把证据吃掉 ⇒ BLOCKED 在 L1.2.1 产生 ⇒ 删掉 L1.3 的
+    # 调用点测试照旧绿（零区分力）。而生产事实恰恰是本文件 C-2 自己论证过的：
+    # `compileall` 对缺 import **恒 rc=0**，只有真 import（pytest）才报。夹具照此分派。
+    def _run(cmd, pp, timeout=120):
+        if "compileall" in cmd or "py_compile" in cmd:
+            return 0, ""                      # 与生产一致：语法检查看不见缺 import
+        return 1, PY_MODULE_NOT_FOUND         # 测试命令才吐 ModuleNotFoundError
+
+    monkeypatch.setattr(lp, "_run_l1_command", _run)
     # `app` 是工程内顶层包（`is_internal` 据此判自有）；`app/services/user` **未**建出
     monkeypatch.setattr(lp, "_run_check_split", _fake_probe(present={"app"}))
     monkeypatch.setattr(lp, "_build_cmd_applicable", lambda *a, **k: True)

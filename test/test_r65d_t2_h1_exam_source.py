@@ -16,6 +16,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from swarm.types import (
     FileScope,
     SubTask,
@@ -47,6 +49,28 @@ def _mk_subtask(verify, desc="", create=None):
 def _pom_diff():
     return ("--- /dev/null\n+++ b/mod-a/pom.xml\n@@ -0,0 +1,2 @@\n"
             "+<project>\n+</project>\n")
+
+
+@pytest.fixture(autouse=True)
+def _neutral_build_gate(monkeypatch):
+    """把 L1.2.1 构建闸置为**显式中立**——本文件测的是 verify 阶段 / H1 考卷同源，不是构建闸。
+
+    ★为什么必须显式★（X-H 批实测）本文件夹具是"只改 `mod-a/pom.xml`、无可编译源"，正好命中
+    `_derive_full_build_command` 的 `mvn -q validate` 兜底分支。此前这些测试之所以绿，是因为
+    `_manifest_present` 的**本地兜底只看工程根**（`mod-a/pom.xml` 判 False）⇒ 派生返 `''` ⇒
+    构建闸整块跳过。而它的**沙箱分支一直是递归的**，也就是说**生产早就在跑这条 validate**，
+    只有本地测试路径没跑 —— 这些测试的前提是"本地/沙箱行为分叉"这个 bug。
+
+    X-H1 把本地兜底与沙箱对齐后，真 `mvn` 在测试机上不存在/无 reactor ⇒ 构建闸判死 ⇒ 六条测试
+    到不了 verify 阶段。治法不是把对齐改回去（那是把生产的假绿留着），而是让这些测试**明确声明**
+    "构建闸在本组里不参与"。
+
+    ★只掐**派生**这一处，绝不整体打桩 `_run_l1_command`★ 后者会连 verify 命令一起变成恒成功
+    （实测：`grep -q jackson` 也"通过"了）⇒ 那几条"断言必须如实失败"的测试反而假绿——本文件
+    存在的意义正是防那种冤案，把它自己弄成假绿就本末倒置了。
+    """
+    from swarm.worker import l1_pipeline as _lp
+    monkeypatch.setattr(_lp, "_derive_full_build_command", lambda *a, **k: "")
 
 
 def test_l1_skips_content_assert_on_h1_enforced_rel():

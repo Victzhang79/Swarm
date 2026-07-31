@@ -1462,6 +1462,11 @@ def _repair_ts(project_path: str, ts_files: list[str], timeout: int) -> tuple[in
     return 0, []
 
 
+# X-H8：构建输出里是否出现 JVM 源文件（javac/kotlinc 的报错恒带文件名）。用来把 Java 修复族的
+# file_signal 从写死的 `True` 换成真判据——无栈画像时不再对 Go/Rust/Python 工程恒真。
+_JVM_SRC_IN_TEXT_RE = re.compile(r"[\w./\\-]+\.(?:java|kt|scala)\b")
+
+
 def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
     """据【权威栈画像】(detect_stack：小模型识别→大模型确认→KB 持久化) 选 repair 生态集合。
 
@@ -2166,8 +2171,18 @@ def _attempt_build_repair(
             if f and f not in paths:
                 paths.append(f)
 
-    # Java：错误信息里就带 .java 文件，无需 modified 列出 → file_signal=True
-    if eligible("java", True):
+    # ★X-H8（27 号文 §3.2 HIGH）★ 这里原先写死 `eligible("java", True)`。原意是对的
+    # （"错误信息里就带 .java 文件，无需 modified 列出"），但 `True` 让它变成**无条件**：
+    # 无栈画像时（`stack_langs is None` → 回退 file_signal）Go/Rust/Python 工程**每轮**都要跑
+    # 一遍 Java 修复族，其中 `_attempt_dependency_repair` 会**联网打 Maven Central 全文检索** ⇒
+    # 白付网络往返与超时预算，且无栈画像恰恰是最该省的时候。
+    # 治法：把"错误信息里带 JVM 源文件"变成**真判据**而不是常量——它既保住原意（modified 没列
+    # 出也认），又不再对非 JVM 工程恒真。判据只读已有的 build_output，零额外探测。
+    _jvm_signal = bool(
+        any(f.endswith((".java", ".kt", ".scala")) for f in mods)
+        or _JVM_SRC_IN_TEXT_RE.search(build_output or "")
+    )
+    if eligible("java", _jvm_signal):
         try:
             _accum(_attempt_import_repair(project_path, build_output, timeout))
         except Exception as exc:  # noqa: BLE001
@@ -2658,7 +2673,28 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
             return present
         except Exception:  # noqa: BLE001
             return False  # 异常不缓存：保守 False 且下次重探（与旧行为一致）
-    return any(os.path.isfile(os.path.join(project_path, m)) for m in manifests)
+    # ★本地兜底必须与沙箱分支同口径（X-H1 实测发现两者不一致）★
+    # 沙箱侧是 `find -maxdepth 3 \( -name a -o -name b \)`：**递归到深度 3** 且 `-name` **支持
+    # glob**。原本地实现是 `os.path.isfile(root/m)`——只看工程根、且把 `*.csproj` 当字面名 ⇒
+    #   · `tools/go.mod`（子目录清单）本地判 False、沙箱判 True；
+    #   · `*.csproj`/`*.sln` 本地**永远**False ⇒ C# 整栈在本地路径零构建闸。
+    # 两个环境对同一棵树给出不同答案＝测试在本地绿而生产另一套行为（本战役反复吃的形态）。
+    _root = Path(project_path)
+    for m in manifests:
+        if any(ch in m for ch in "*?["):
+            for _p in _root.glob(m):          # 根级 glob
+                if _p.is_file():
+                    return True
+            for _d in range(1, 3):            # 深度 2..3，与沙箱 maxdepth 3 对齐
+                if any(p.is_file() for p in _root.glob("/".join(["*"] * _d) + "/" + m)):
+                    return True
+        else:
+            if os.path.isfile(os.path.join(project_path, m)):
+                return True
+            for _d in range(1, 3):
+                if any(p.is_file() for p in _root.glob("/".join(["*"] * _d) + "/" + m)):
+                    return True
+    return False
 
 
 # ── 基础设施/工具瞬时错误识别（A-P1-09）──
@@ -2714,15 +2750,99 @@ def _is_infra_failure(text: str) -> bool:
 # (如 mvn 无 pom.xml、npm 无 package.json)，应优雅跳过而非误判为产出不合格。
 _BUILD_TOOL_MANIFESTS: dict[str, tuple[str, ...]] = {
     "mvn": ("pom.xml",),
+    # ★X-H6★ wrapper 形态必须在表里：`./mvnw`/`./gradlew` 是**最常见**的 JVM 构建入口
+    # （Spring Boot 生态默认），漏了它们等于对整类 wrapper 工程放行"明知必失败"的命令。
+    "./mvnw": ("pom.xml",),
+    "mvnw": ("pom.xml",),
     "gradle": ("build.gradle", "build.gradle.kts", "settings.gradle"),
     "./gradlew": ("build.gradle", "build.gradle.kts", "settings.gradle"),
+    "gradlew": ("build.gradle", "build.gradle.kts", "settings.gradle"),
     "npm": ("package.json",),
     "yarn": ("package.json",),
     "pnpm": ("package.json",),
     "npx": ("package.json",),
+    "bun": ("package.json",),
+    "tsc": ("tsconfig.json", "package.json"),
     "go": ("go.mod",),
     "cargo": ("Cargo.toml",),
+    # 以下是 X-H6 点名的"漏了半个世界"——空项目下原先全 applicable=True ⇒ 明知必失败仍执行
+    # → 127 → BLOCKED 死循环（与 X-C1/X-C2 同族）。
+    "dotnet": ("*.csproj", "*.sln", "*.fsproj"),
+    "msbuild": ("*.csproj", "*.sln"),
+    "sbt": ("build.sbt",),
+    "composer": ("composer.json",),
+    "bundle": ("Gemfile",),
+    "rake": ("Rakefile", "Gemfile"),
+    "mix": ("mix.exs",),
+    "poetry": ("pyproject.toml",),
+    "pipenv": ("Pipfile",),
+    "flutter": ("pubspec.yaml",),
+    "dart": ("pubspec.yaml",),
+    "make": ("Makefile", "makefile", "GNUmakefile"),
+    "cmake": ("CMakeLists.txt",),
+    "swift": ("Package.swift",),
 }
+
+# ★X-H6 的另一半★ 这些工具**本就不需要工程清单**（直接跑解释器/测试器），故"未知工具放行"
+# 对它们是**正确**的，不能一并 fail-closed。显式登记，好让"真未知"与"已知无需清单"可分——
+# 否则要么误杀 python/pytest，要么继续对 dotnet/sbt 放行（原实现选了后者）。
+_NO_MANIFEST_TOOLS: frozenset[str] = frozenset({
+    "python", "python3", "py", "pytest", "tox", "nox", "unittest",
+    "sh", "bash", "zsh", "env", "true", "echo", "cd", "test",
+    "javac", "kotlinc", "scalac", "rustc", "gcc", "g++", "clang", "clang++",
+    "node", "deno", "ruby", "php", "perl", "elixir", "erl", "java",
+    "grep", "ls", "cat", "find", "awk", "sed",
+})
+
+
+def _manifest_dir(names: tuple[str, ...], project_path: str) -> str | None:
+    """清单所在**目录**（工程根相对；根返 `""`）；找不到返 None。沙箱优先。
+
+    ★为什么需要它（X-H1 跨栈污染）★ `_manifest_present` 只回答"深度≤3 内**有没有**"，而派生的
+    命令要在**某个目录**里跑。实测污染形态：Maven 单体里有个 `tools/go.mod`，子任务只改了
+    `.go` ⇒ 旧实现下发 `go build ./...` 并在**工程根**执行 ⇒ 根没有 go.mod，命令必失败。
+    有了目录就能 `cd tools && go build ./...`，或在只允许根级时如实放弃。
+    """
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        _names = " -o ".join(f"-name {shlex.quote(n)}" for n in names)
+        try:
+            cr = manager.run_command(
+                sandbox,
+                f"cd {shlex.quote(remote)} && find . -maxdepth 3 \\( {_names} \\) "
+                f"-print 2>/dev/null | sed 's|^\\./||' | "
+                f"awk '{{print gsub(/\\//,\"/\"), length($0), $0}}' | sort -n -k1,1 -k2,2 | "
+                f"head -1 | cut -d' ' -f3-",
+                timeout=20)
+            rel = (cr.stdout or "").strip()
+            if not rel:
+                return None
+            return rel.rsplit("/", 1)[0] if "/" in rel else ""
+        except Exception:  # noqa: BLE001 — 探测失败当找不到（不猜目录）
+            return None
+    root = Path(project_path)
+    best: str | None = None
+    for n in names:
+        for p in sorted(root.rglob(n)):
+            try:
+                rel = "/".join(p.relative_to(root).parts)
+            except ValueError:
+                continue
+            if any(seg in _SRC_EXCLUDE_DIRS_FOR_DERIVE for seg in rel.split("/")):
+                continue
+            if best is None or (rel.count("/"), len(rel)) < (best.count("/"), len(best)):
+                best = rel
+    if best is None:
+        return None
+    return best.rsplit("/", 1)[0] if "/" in best else ""
+
+
+# 派生构建命令时忽略的目录（依赖树/产物里的清单不是本工程的构建入口）
+_SRC_EXCLUDE_DIRS_FOR_DERIVE = frozenset({
+    "node_modules", "vendor", "third_party", "target", "build", "dist",
+    ".git", ".venv", "venv", "__pycache__", "testdata", "example", "examples",
+})
 
 
 def _derive_full_build_command(
@@ -2759,12 +2879,61 @@ def _derive_full_build_command(
             return "./gradlew -q classes" if has("gradlew") else "gradle -q classes"
         if build == "maven" or has("pom.xml"):
             return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
-    if ext(".go") and (build == "go" or has("go.mod")):
-        return "go build ./..."
+    def at(names: tuple[str, ...], cmd: str) -> str:
+        """把命令锚到**清单所在目录**（X-H1 跨栈污染治法）。
+
+        根级清单 → 原样返回；子目录清单 → `cd <dir> && <cmd>`；找不到清单 → `''`（不臆造）。
+        实测污染形态：Maven 单体里有个 `tools/go.mod` 且只改了 `.go` ⇒ 旧实现在**工程根**
+        下发 `go build ./...` ⇒ 根无 go.mod，必失败。
+        """
+        d = _manifest_dir(names, project_path)
+        if not d:
+            # ★`None`（定位不出）与 `""`（就在根）都走根级命令★
+            # 调用点已经用 `has()` 确认清单**存在**；若 `_manifest_dir` 又说定位不出，那是两个
+            # 探针不一致（探测瞬时失败/mock 只打了一个）。此时退回"按根跑"＝**原行为**，
+            # 而不是返 `''`：后者会把闸整块关掉（"跳过＝通过"，正是本批在治的假过），
+            # 代价不对称——错锚目录只是 127 → BLOCKED 可重试，没闸是坏产物直接放行。
+            # 只有**positively 知道**清单在子目录时才改锚，故污染治法不受影响。
+            return cmd
+        if not _SAFE_REL_DIR_RE.match(d):
+            # 目录名来自工程树（外部输入）→ 形态不安全就不拼进命令（S-5 同源判据）
+            logger.warning("[L1] 清单所在目录名形态不安全，放弃派生构建命令: %r", d)
+            return ""
+        return f"cd {shlex.quote(d)} && {cmd}"
+
+    if ext(".go") and (build == "go" or has("go.mod", "go.work")):
+        # N-2：`go.work` 多模块仓——`go build ./...` 在 work 根即可编译全部 use 模块
+        if has("go.work"):
+            return at(("go.work",), "go build ./...")
+        return at(("go.mod",), "go build ./...")
     if ext(".rs") and (build == "cargo" or has("Cargo.toml")):
-        return "cargo build -q"
+        return at(("Cargo.toml",), "cargo build -q")
+    # X-H1：前端不能只认 `.ts/.tsx`+tsconfig —— npm 工程改 `.js/.jsx/.vue` 原先**零构建闸**。
+    # 优先 tsc（有 tsconfig 时它是最强的确定性类型闸），否则退到 package.json 的 build 脚本。
     if ext(".ts", ".tsx") and has("tsconfig.json"):
-        return "tsc --noEmit"
+        return at(("tsconfig.json",), "tsc --noEmit")
+    if ext(".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs", ".cjs"):
+        if has("tsconfig.json"):
+            return at(("tsconfig.json",), "tsc --noEmit")
+        if _npm_has_build_script(project_path):
+            return at(("package.json",), "npm run build --if-present")
+    # N-4：python 原先**没有任何分支** ⇒ python 工程零构建闸（＝27 号文 V-C1 的 python 行）。
+    # `compileall` 是唯一跨 python 工程通用且零依赖的确定性编译闸（语法/字节码级）；
+    # 它不查 import（那由 L1.3 的 X-C3 第三调用点兜），但比"什么都不跑"强得多。
+    if ext(".py") and (build in ("pip", "poetry", "uv", "python")
+                       or has("pyproject.toml", "setup.py", "requirements.txt", "Pipfile")):
+        return "python3 -m compileall -q ."
+    # X-H1：C#/PHP/Ruby/Elixir/Dart —— 原先全返 ''。只在**清单在场**时出命令（纪律 2 不臆造）。
+    if ext(".cs") and has("*.csproj", "*.sln"):
+        return at(("*.csproj", "*.sln"), "dotnet build --nologo -v q")
+    if ext(".php") and has("composer.json"):
+        return at(("composer.json",), "php -l $(git ls-files '*.php' | head -200)")
+    if ext(".rb") and has("Gemfile"):
+        return at(("Gemfile",), "ruby -c $(git ls-files '*.rb' | head -200)")
+    if ext(".ex", ".exs") and has("mix.exs"):
+        return at(("mix.exs",), "mix compile --warnings-as-errors")
+    if ext(".dart") and has("pubspec.yaml"):
+        return at(("pubspec.yaml",), "dart analyze")
     # round18 P2 治本：纯 pom/无可编译源码子任务——"无 Java 即判负"会返回 None→维持 prior 未通过
     # →BLOCKED 空转（st-30 变体 5065fe04/st-29-2 现场，产物其实 mvn validate 通过）。改走
     # `mvn validate` 给真确定性校验（pom 结构 + reactor 可解析性）——版本缺失/reactor 断裂会
@@ -2790,7 +2959,18 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
     tool = tokens[0]
     manifests = _BUILD_TOOL_MANIFESTS.get(tool)
     if not manifests:
-        return True  # 未知工具(如直接 python/pytest)不做工程文件校验，照常跑
+        # ★X-H6★ 未知工具仍放行（`python`/`pytest` 这类本就不需要清单，fail-closed 会误杀整类），
+        # 但**必须可观测**：原实现连一行日志都没有，于是 `dotnet build`/`sbt compile` 在空项目上
+        # 被判 applicable → 真去跑 → 127 → BLOCKED → 每轮撞同一个"命令不存在"（硬检查④：
+        # 降级路径至少一次 WARNING）。已知无需清单的工具（`_NO_MANIFEST_TOOLS`）不响，
+        # 免得把正常路径刷成噪声；**真未知**的响一次，好让"表该补了"这件事被看见。
+        _base = tool.rsplit("/", 1)[-1].lstrip("./")
+        if _base not in _NO_MANIFEST_TOOLS:
+            logger.warning(
+                "[L1] 构建/测试命令的工具 %r 不在清单表里（_BUILD_TOOL_MANIFESTS）也不在"
+                "『无需清单』白名单里 → 放行执行。若该工具其实需要工程清单，缺清单时会 127 → "
+                "BLOCKED 空转：请把它登记进表（X-H6）: %s", tool, command[:120])
+        return True
     # 沙箱优先：在远程工作目录递归找工程文件
     sandbox = manager = None
     try:
@@ -3966,20 +4146,125 @@ def _run_self_review(
 
 # ── 主流水线 ──
 
+def _project_file_exists(rel: str, project_path: str) -> bool:
+    """**指定相对路径**的文件是否存在（沙箱优先）。
+
+    与 `_manifest_present` 的区别（别混用，X-H2 实测踩过）：那个是"树里深度≤3 内**任意位置**
+    有没有叫这个名字的清单"，本地兜底只查**工程根下同名文件**；而 scoped 测试探测要问的是
+    "`svc/user_test.go` 这个**具体路径**在不在"。用前者会漏掉一切子目录里的测试文件。
+    """
+    r = str(rel or "").replace("\\", "/").lstrip("/")
+    if not r or ".." in r.split("/"):
+        return False
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        try:
+            cr = manager.run_command(
+                sandbox, f"test -f {shlex.quote(remote + '/' + r)} && echo y", timeout=20)
+            return bool((cr.stdout or "").strip())
+        except Exception:  # noqa: BLE001 — 探测失败保守当不存在（不猜测试命令）
+            return False
+    return os.path.isfile(os.path.join(project_path, r))
+
+
+# X-H1：清单所在目录要拼进 shell 命令，形态白名单（与 image_builder._SAFE_SUBDIR_RE 同源判据：
+# 仓库内容即攻击者可控，故是"允许什么"而非"禁止什么"；`\Z` 而非 `$`，防尾随换行绕过）。
+_SAFE_REL_DIR_RE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9._][A-Za-z0-9._/-]*\Z")
+
+
+def _npm_has_build_script(project_path: str) -> bool:
+    """根 package.json 是否真有 `scripts.build`（纪律 2：没有就不下发 `npm run build`）。
+
+    注：命令用 `--if-present` 已能容忍缺失（退出 0），但那等于"闸门静默不跑"＝假过；
+    这里显式查一次，好让"没有 build 脚本"走到返回 `''` 的诚实分支。
+    """
+    import json
+    txt = _read_project_file(project_path, "package.json")
+    if not txt:
+        return False
+    try:
+        return bool((json.loads(txt) or {}).get("scripts", {}).get("build"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _npm_has_test_script(project_path: str) -> bool:
+    """根 package.json 是否真有 `scripts.test`（且不是 npm init 那句占位符）。
+
+    ★为什么必须查★ 纪律 2（绝不猜）：`npm test` 在无 `scripts.test` 时报
+    `Missing script: "test"` 退出 1 ⇒ 我们会把"项目没测试"误判成"测试失败"。
+    npm init 生成的默认值是 `echo "Error: no test specified" && exit 1`——它**存在但必失败**，
+    等价于没有，必须一起排除。
+    """
+    import json
+    txt = _read_project_file(project_path, "package.json")
+    if not txt:
+        return False
+    try:
+        scripts = (json.loads(txt) or {}).get("scripts") or {}
+    except Exception:  # noqa: BLE001 — 读不出就当没有（fail-honest，不猜）
+        return False
+    t = str(scripts.get("test") or "").strip()
+    return bool(t) and "no test specified" not in t
+
+
 def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
-    for fp in modified:
+    """无 harness.test_command 时按栈猜一条 scoped 测试命令；猜不出返 None。
+
+    ★X-H2（27 号文 §3.2 HIGH）★ 原实现**只认 `.py`**，其余栈一律返 None ⇒ L1.3 落
+    `l1_3_test_ok=True` + `test_skipped` ⇒ **跳过＝通过**，测试面对 npm/go/rust 整类不存在。
+
+    ★三条硬约束★
+    1. **绝不臆造命令**（纪律 2）：只在有**确定性证据**（真有测试文件 / 真有 `scripts.test`）
+       时才出命令。猜错的代价是把"没测试"误判成"测试失败"，比不猜更坏。
+    2. **JVM 刻意不猜**：`brain/nodes/shared.py` 给 java 的 `test_command` 是**故意留空**的
+       （S1 注释："RuoYi 等项目常无测试依赖，强跑必失败"）。在这里补 `mvn test` 会绕过那个
+       决定，且直接打在唯一跑过 E2E 的栈上。要改得连同 S1 一起改，不在本函数私自放行。
+    3. **清单探测走沙箱优先**：`_manifest_present`/`_read_project_file` 而非 `os.path.isfile`
+       ——沙箱模式下本地树只有 pull-back 的文件，用本地判存在会漏（`_derive_full_build_command`
+       的 A4 治本同源教训）。
+    """
+    mods = [str(f) for f in (modified or []) if str(f).strip()]
+
+    # ① scoped：与改动源码同名的测试文件（最省、最准）
+    for fp in mods:
         base = Path(fp).stem
         if fp.endswith(".py"):
-            candidates = [
-                f"tests/test_{base}.py",
-                f"test/test_{base}.py",
-                f"test_{base}.py",
-            ]
-            for c in candidates:
-                if os.path.isfile(os.path.join(project_path, c)):
+            for c in (f"tests/test_{base}.py", f"test/test_{base}.py", f"test_{base}.py"):
+                if _project_file_exists(c, project_path):
                     return f"python -m pytest -q {c}"
-    if os.path.isfile(os.path.join(project_path, "pyproject.toml")):
+        elif fp.endswith(".go"):
+            # Go 的测试与被测源**同目录同包**：`svc/user.go` → `svc/user_test.go`
+            _dir = fp.rsplit("/", 1)[0] if "/" in fp else "."
+            _cand = f"{_dir}/{base}_test.go" if _dir != "." else f"{base}_test.go"
+            if _project_file_exists(_cand, project_path):
+                return f"go test ./{_dir}/..." if _dir != "." else "go test ./..."
+        elif fp.endswith((".ts", ".tsx", ".js", ".jsx")):
+            _d = fp.rsplit("/", 1)[0] + "/" if "/" in fp else ""
+            for c in (f"{_d}{base}.test.ts", f"{_d}{base}.spec.ts", f"{_d}{base}.test.tsx",
+                      f"{_d}{base}.test.js", f"{_d}{base}.spec.js",
+                      f"{_d}__tests__/{base}.test.ts", f"{_d}__tests__/{base}.test.js"):
+                if _project_file_exists(c, project_path):
+                    # 有测试文件仍要求 `scripts.test` 在场——否则 `npm test` 必报 Missing script
+                    return "npm test --silent" if _npm_has_test_script(project_path) else None
+        elif fp.endswith(".rs"):
+            # Rust 单元测试常内联在源文件里（`#[cfg(test)] mod tests`），文件级探测不可靠；
+            # 交下面的工程级兜底（cargo test 对无测试的 crate 是 0 退出，安全）。
+            pass
+
+    # ② 工程级兜底：只在有确定性证据时出命令
+    if _manifest_present(("pyproject.toml",), project_path):
         return "python -m pytest -q --maxfail=1"
+    if _manifest_present(("go.mod",), project_path) and any(f.endswith(".go") for f in mods):
+        # `go test ./...` 对没有测试文件的包是 `ok ... [no test files]` + 0 退出 ⇒ 安全兜底
+        return "go test ./..."
+    if _manifest_present(("Cargo.toml",), project_path) and any(f.endswith(".rs") for f in mods):
+        # 同理：无测试的 crate `cargo test` 也是 0 退出
+        return "cargo test --offline -q"
+    if (any(f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue")) for f in mods)
+            and _npm_has_test_script(project_path)):
+        return "npm test --silent"
     return None
 
 
