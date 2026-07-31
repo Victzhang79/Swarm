@@ -1877,7 +1877,9 @@ def _attempt_internal_import_drift_repair(
 
 
 def _missing_internal_produced_in_scope(
-    scope, blocked_pkgs: set[str], blocked_cls: list[str]
+    scope, blocked_pkgs: set[str], blocked_cls: list[str],
+    *, language_key: str | None = None, project_path: str | None = None,
+    timeout: int = 60, run=None,
 ) -> tuple[set[str], set[str]]:
     """R67L-B2（22号文批次2 H-3a）：缺失内部包/类中【生产者在本子任务自己 scope 内】的子集。
 
@@ -1887,11 +1889,34 @@ def _missing_internal_produced_in_scope(
       - 类 C（FQN 点分）：某 scope 源码文件的 FQN 路径形（去扩展名）== C → 该类由本子任务自产。
     命中=缺符号是【自己没建出】（capability，修复梯可治），不是【等上游生产者】。
     返回 (own_pkgs, own_classes)，均为点分 FQN。
+
+    ★X-C3：非 JVM 半边（language_key/project_path/run 三者齐备时启用）★
+    上面那条 `classpath_fqn_key` 通道是 **JVM-only**——它对 go/rust/node/python 布局恒返
+    None ⇒ own 集恒空 ⇒ 本闸对非 JVM 栈**静默失效**。X-C3 之前非 JVM 到不了调用点（缺口
+    潜伏无害），X-C3 让它们到得了，于是缺口变成真 fail-open：子任务自己漏建 `internal/svc`
+    会被判 BLOCKED 去等永不到来的生产者（#10 幽灵生产者，烧满退避阶梯）。补 driver 半边
+    （`l1_error_drivers.produced_in_scope`，ref↔路径是唯一栈相关部分，判据仍在本函数）。
+    缺参数（老调用方）→ 只走 JVM 通道，零回归。
     """
     own_pkgs: set[str] = set()
     own_cls: set[str] = set()
     if scope is None or not (blocked_pkgs or blocked_cls):
         return own_pkgs, own_cls
+    if language_key and project_path and run is not None:
+        try:
+            from swarm.worker.l1_error_drivers import produced_in_scope
+            _files = (list(getattr(scope, "create_files", None) or [])
+                      + list(getattr(scope, "writable", None) or []))
+            own_pkgs |= produced_in_scope(
+                language_key, set(blocked_pkgs), _files, project_path, timeout, run)
+            # 符号级：容器自产 ⇒ 该容器下的符号也归本子任务（容器是它建的，符号缺就是它漏建）
+            for _c in blocked_cls:
+                if any(str(_c).startswith(f"{p}") for p in own_pkgs):
+                    own_cls.add(str(_c))
+        except Exception as _exc:  # noqa: BLE001 — driver 半边异常绝不阻断裁决
+            logger.warning(
+                "[L1.2.1] X-C3 步骤4 driver 半边异常（退回 JVM 通道，维持 BLOCKED 语义）: %r",
+                _exc)
     try:
         from swarm.brain.contract_utils import classpath_fqn_key
     except Exception:  # noqa: BLE001 — 口径源不可用时 fail-open 不判（维持原 BLOCKED 语义）
@@ -1914,6 +1939,64 @@ def _missing_internal_produced_in_scope(
         if stem in cls_paths:
             own_cls.add(stem.replace("/", "."))
     return own_pkgs, own_cls
+
+
+def decide_unbuilt_internal_verdict(
+    details: dict, scope, blocked_pkgs: set[str], blocked_cls: list[str],
+    *, cmd: str, stage: str, output: str = "",
+    language_key: str | None = None, project_path: str | None = None,
+    timeout: int = 60, run=None,
+) -> bool:
+    """步骤 4+5 的**共用裁决尾**：BLOCKED（返 True）还是落 FAIL 修复梯（返 False）。
+
+    ★为什么必须是模块级共用函数（不是内联两份）★ X-C3 需要**两个**调用点：L1.2.1 build 闸
+    （go/rust——它们在 L1.2 无逐文件检查器）与 L1.2 compile 闸（node/ts——`tsc --noEmit`
+    在 L1.2 就 hard-fail，build 闸永不执行 ⇒ 内联在 build 闸里的 TS 分支是**死代码**，
+    B-4a CRITICAL-1 原型）。步骤 4 的"worker 无权等自己"边界与步骤 5 的类级 FQN（brain 侧
+    防臆造类 futile 判据的唯一输入）都是"重复实现即失守"的横切不变量——故抽成单一实现，
+    两个调用点共用，测试可直接调本体。
+
+    `stage`（`build`/`compile`）决定写哪个 ok 键：两者都必须置 **None 而非 False**——
+    `l1_verdict._det_fail_source` 把 `is False` 读成 capability「编译失败」，写 False
+    会让 BLOCKED 被归成能力失败去换模型（正是本机制要防的）。
+    """
+    if not blocked_pkgs:
+        return False
+    # R67L-B2（22号文批次2 H-3a，round67l st-2 实锤）：缺失包/类若【全部】在本子任务自己
+    # scope 内有生产者 → 是【自己没建出】的 capability 失败，判 BLOCKED 会把可修编译错送进
+    # 不可修通道、fix 循环短路（worker 无权"等"自己）。落公共 FAIL 尾进修复梯。
+    # X-C3：非 JVM 栈必须传 language_key/run，否则步骤 4 只有 JVM 通道 = 对 go/rust/node/
+    # python 恒空过（fail-open，去等永不到来的生产者）。
+    _own_pkgs, _own_cls = _missing_internal_produced_in_scope(
+        scope, blocked_pkgs, blocked_cls,
+        language_key=language_key, project_path=project_path,
+        timeout=timeout, run=run)
+    _ext_pkgs = blocked_pkgs - _own_pkgs
+    _ext_cls = [c for c in blocked_cls if c not in _own_cls]
+    if not _ext_pkgs and not _ext_cls:
+        details["in_scope_producer_fail"] = sorted(_own_pkgs | set(_own_cls))
+        logger.warning(
+            "[L1.%s] R67L-B2 缺失内部包/类的生产者全在本子任务 scope 内（自己没建出，"
+            "非等上游）→ 落 FAIL 修复梯，不判 BLOCKED: %s",
+            "2.1" if stage == "build" else "2", sorted(blocked_pkgs)[:8])
+        return False
+    if _own_pkgs or _own_cls:
+        # 混合：自有部分留痕（FAIL 侧线索），外部部分仍 BLOCKED 等上游。
+        details["in_scope_producer_suppressed"] = sorted(_own_pkgs | set(_own_cls))
+    details["l1_2_1_build_ok" if stage == "build" else "l1_2_compile_ok"] = None
+    details["build_blocked"] = cmd
+    details["pipeline_blocked"] = "internal_pkg_not_built"
+    details["not_run_kind"] = NotRunKind.BLOCKED.value
+    # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
+    # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
+    details["blocked_on_packages"] = sorted(blocked_pkgs)
+    if blocked_cls:
+        details["blocked_on_classes"] = blocked_cls   # H-3a 类级 futile 判据用
+    logger.warning(
+        "[L1.%s] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 BLOCKED "
+        "退避待生产者落地，不连坐本子任务: %s",
+        "2.1" if stage == "build" else "2", (output or "")[:200])
+    return True
 
 
 def _attempt_build_repair(
@@ -2995,7 +3078,15 @@ def _python_bin() -> str:
     return "python"  # 回退，让后续报错自然暴露
 
 
-def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) -> tuple[bool, str]:
+def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
+                   raw_out: dict | None = None) -> tuple[bool, str]:
+    """返回 (ok, 人读消息)。
+
+    `raw_out`（X-C3）：可选 out 参数，把**未截断**的工具原始输出放进 `raw_out["text"]`。
+    ★为什么必须分账★ 第二个返回值给 worker 看、被截到 1000 字符；而 X-C3 的"全或无"判据
+    （有一条第三方缺失 → 全盘不标 BLOCKED）读的是**同一份文本**——截断若正好切掉那条第三方
+    缺失行，求解器只看见内部缺失 → 误判 BLOCKED = fail-open。故分类器必须吃全文。
+    """
     py_files = [f for f in files if f.endswith(".py")]
     if py_files:
         py_bin = _python_bin()
@@ -3024,6 +3115,8 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60) ->
             rc, out, err = _run_check_split("npx tsc --noEmit --pretty false", project_path, timeout=timeout)
             combined = (out or "") + (("\n" + err) if err else "")
             # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
+            if isinstance(raw_out, dict):
+                raw_out["text"] = combined      # X-C3：分类器吃全文（人读消息才截断）
             if rc != 0 and _is_infra_failure(combined):
                 logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
             elif rc != 0:
@@ -4619,10 +4712,43 @@ def run_l1_pipeline(
     # 仍可越线跑 5-10 分钟（整树 lint 240s+/逐文件 30s×20）。
     if _deadline_blocked("compile"):
         return True, details
-    compile_ok, compile_msg = _compile_files(project_path, modified, timeout=timeout)
+    _compile_raw: dict = {}
+    compile_ok, compile_msg = _compile_files(
+        project_path, modified, timeout=timeout, raw_out=_compile_raw)
     details["l1_2_compile_ok"] = compile_ok
     details["compile_message"] = compile_msg
     if not compile_ok:
+        # ★X-C3 第二个调用点（27 号文 §3.2）★ 没有它，node/ts 的 driver 就是死代码：
+        # `_compile_files` 对 .ts 跑 `npx tsc --noEmit`，TS2307「Cannot find module
+        # './routes/users'」→ rc≠0 且非 infra → 本处 hard-fail 早返 ⇒ 下面 L1.2.1 build 闸
+        # （X-C3 的另一个调用点）**永不执行**。于是"引用了别的子任务还没建出的内部模块"这一
+        # 头号死法在 node/ts 上原样保留：落 compile capability FAIL → 烧修复轮 → abandon →
+        # 连坐。★这正是 B-4a CRITICAL-1（"治本接在哪条路上"必须用真实路由函数走一遍）的同族★，
+        # 该批已为它赔过一整批，故本处按"数调用点、一个不落"补齐。
+        # 判据与裁决全部复用 build 闸同一实现（`decide_unbuilt_internal_verdict`），
+        # 分类器吃**未截断**原文（`_compile_raw`）——compile_msg 截到 1000 字符可能正好切掉
+        # 那条第三方缺失行，"全或无"就会 fail-open 误标 BLOCKED。
+        try:
+            from swarm.brain.nodes.runtime_smoke import normalize_language_key
+            from swarm.worker.l1_error_drivers import blocked_on_unbuilt_internal
+            _c_lang = normalize_language_key((project_stack or {}).get("backend"))
+            _c_text = _compile_raw.get("text") or compile_msg or ""
+            _c_pkgs, _c_syms = blocked_on_unbuilt_internal(
+                _c_lang, _c_text, project_path, timeout, _run_check_split)
+            if _c_pkgs:
+                details["blocked_via_error_driver"] = _c_lang
+                if decide_unbuilt_internal_verdict(
+                        details, getattr(subtask, "scope", None), _c_pkgs, _c_syms,
+                        cmd="(L1.2 compile)", stage="compile", output=_c_text,
+                        language_key=_c_lang, project_path=project_path,
+                        timeout=timeout, run=_run_check_split):
+                    logger.warning(
+                        "[L1.2] X-C3 %s 栈编译闸缺【尚未建出的项目内部标识】(error driver 判据)"
+                        " → 与 JVM build 闸同口径标 BLOCKED 退避: containers=%s symbols=%s",
+                        _c_lang, sorted(_c_pkgs)[:6], _c_syms[:6])
+                    return True, details
+        except Exception as _xc3_exc:  # noqa: BLE001 — 归因失败绝不改变原判（照常 FAIL）
+            logger.debug("[L1.2] X-C3 编译闸归因跳过(异常,不致命): %r", _xc3_exc)
         return False, details
 
     # ── L1.2.1 harness.build_command 编译闸门（Java/Go/Rust 等需工具链语言）──
@@ -4909,41 +5035,40 @@ def run_l1_pipeline(
                         f"{p}.{c}" for c, p in parse_missing_symbol_classes(b_out)
                         if p in _blocked_cls_pkgs})
                 _blocked_pkgs = _blocked_pkgs | _blocked_cls_pkgs
-                if _blocked_pkgs:
-                    # R67L-B2（22号文批次2 H-3a，round67l st-2 实锤）：缺失包/类若【全部】在
-                    # 本子任务自己 scope 内有生产者（scope 声明了落在该包/该类的源码文件）→
-                    # 是【自己没建出】的 capability 失败，判 BLOCKED 会把可修编译错送进不可修
-                    # 通道、fix 循环短路（worker 无权"等"自己）。落公共 FAIL 尾进修复梯。
-                    _own_pkgs, _own_cls = _missing_internal_produced_in_scope(
-                        getattr(subtask, "scope", None), _blocked_pkgs, _blocked_cls)
-                    _ext_pkgs = _blocked_pkgs - _own_pkgs
-                    _ext_cls = [c for c in _blocked_cls if c not in _own_cls]
-                    if not _ext_pkgs and not _ext_cls:
-                        details["in_scope_producer_fail"] = sorted(
-                            _own_pkgs | set(_own_cls))
+                # ★X-C3（27 号文 §3.2 CRITICAL）★ 上面两条判据的正则锚死 `.java` + Maven
+                # `[行,列]` / javac 三行组 → Go `no required module provides package`、
+                # TS `TS2307`、Rust `E0432`、Python `ModuleNotFoundError` **全部识别不出**
+                # → 拿不到 internal_pkg_not_built → 落 build_failed capability 硬 FAIL →
+                # 烧修复轮 → abandon → 连坐。**这正是 round38/round67 在 Java 上花十几轮治的
+                # 头号死法，换栈完全复发。**
+                # 走 `l1_error_drivers.ERROR_DRIVERS`（栈驱动层，判据与 JVM 同律：有第三方缺失
+                # 或已在树里 → 全盘不标）。★JVM 恒走上面的专用链★——它的 driver 是 self-handled、
+                # 通用求解器对 java 恒返空，故 **Java 路径逐字节不变**（唯一跑过 E2E 的栈）。
+                _xc3_lang: str | None = None
+                if not _blocked_pkgs:
+                    from swarm.brain.nodes.runtime_smoke import normalize_language_key
+                    from swarm.worker.l1_error_drivers import (
+                        blocked_on_unbuilt_internal as _xc3_solve,
+                    )
+                    _xc3_lang = normalize_language_key(
+                        (project_stack or {}).get("backend"))
+                    _xc3_pkgs, _xc3_syms = _xc3_solve(
+                        _xc3_lang, b_out, project_path, timeout, _run_check_split)
+                    if _xc3_pkgs:
+                        details["blocked_via_error_driver"] = _xc3_lang
+                        _blocked_pkgs = _xc3_pkgs
+                        _blocked_cls = _xc3_syms
                         logger.warning(
-                            "[L1.2.1] R67L-B2 缺失内部包/类的生产者全在本子任务 scope 内"
-                            "（自己没建出，非等上游）→ 落 FAIL 修复梯，不判 BLOCKED: %s",
-                            sorted(_blocked_pkgs)[:8])
-                    else:
-                        if _own_pkgs or _own_cls:
-                            # 混合：自有部分留痕（FAIL 侧线索），外部部分仍 BLOCKED 等上游。
-                            details["in_scope_producer_suppressed"] = sorted(
-                                _own_pkgs | set(_own_cls))
-                        details["l1_2_1_build_ok"] = None
-                        details["build_blocked"] = build_cmd
-                        details["pipeline_blocked"] = "internal_pkg_not_built"
-                        details["not_run_kind"] = NotRunKind.BLOCKED.value
-                        # 结构化吐【缺哪些项目内部包】，供 brain 反查生产者子任务（按 scope/目标包归属）：
-                        # 生产者已被永久放弃 → 本下游不可恢复，连坐放弃而非无限 BLOCKED→replan。
-                        details["blocked_on_packages"] = sorted(_blocked_pkgs)
-                        if _blocked_cls:
-                            details["blocked_on_classes"] = _blocked_cls  # H-3a 类级 futile 判据用
-                        logger.warning(
-                            "[L1.2.1] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 "
-                            "BLOCKED 退避待生产者落地，不连坐本子任务: %s", (b_out or "")[:200],
-                        )
-                        return True, details
+                            "[L1.2.1] X-C3 %s 栈缺【尚未建出的项目内部标识】(error driver 判据) "
+                            "→ 与 JVM 同口径标 BLOCKED 退避: containers=%s symbols=%s",
+                            _xc3_lang, sorted(_xc3_pkgs)[:6], _xc3_syms[:6])
+                if decide_unbuilt_internal_verdict(
+                        details, getattr(subtask, "scope", None),
+                        _blocked_pkgs, _blocked_cls,
+                        cmd=build_cmd, stage="build", output=b_out,
+                        language_key=_xc3_lang, project_path=project_path,
+                        timeout=timeout, run=_run_check_split):
+                    return True, details
                 details["build_failed"] = build_cmd
                 # #113 诊断：构建失败时预扫改动源文件的全角 CJK 标点（NVFP4 腐坏，javac illegal
                 # character 常见根因）→ 精确坐标进 details，喂 worker 修复轮定位更准（只读，不自改）。
