@@ -26,7 +26,8 @@ MUTATIONS = [
         "F1: 删掉 L1.2 的 X-C3 归因整块（node/ts 退回死代码）",
         PIPE,
         "            _c_pkgs, _c_syms = blocked_on_unbuilt_internal(\n"
-        "                _c_lang, _c_text, project_path, timeout, _run_check_split)",
+        "                _c_lang, _c_text, project_path, timeout, _run_check_split,\n"
+        "                refs_out=_c_refs)",
         "            _c_pkgs, _c_syms = (set(), [])",
         ["test_wiring_ts_compile_gate_reaches_blocked",
          "test_wiring_ts_own_scope_producer_falls_to_fail"],
@@ -49,9 +50,10 @@ MUTATIONS = [
     (
         "F2: 删掉步骤4 的 driver 半边（非 JVM 栈退回 fail-open：去等自己）",
         PIPE,
-        "            own_pkgs |= produced_in_scope(\n"
-        "                language_key, set(blocked_pkgs), _files, project_path, timeout, run)",
-        "            own_pkgs |= set()",
+        "            _own, _unres = produced_in_scope(\n"
+        "                language_key, driver_refs or list(blocked_pkgs), _files,\n"
+        "                project_path, timeout, run)",
+        "            _own, _unres = set(), set()",
         ["test_step4_shared_layer_consults_driver_half",
          "test_step4_symbol_inherits_container_ownership",
          "test_produced_in_scope_detects_own_container",
@@ -110,6 +112,84 @@ MUTATIONS = [
         '    symbol_sep = "::"',
         '    symbol_sep = "."',
         ["test_rust_symbol_fqn_uses_stack_separator"],
+    ),
+    # ── 以下为复核整改新增（每条对应一个已实测复现的 finding）──
+    (
+        "CRITICAL-2: UNKNOWN 归属不再拦 BLOCKED（解不出就敢断言外部生产者）",
+        PIPE,
+        '    if _unres:\n'
+        '        # ★复核 CRITICAL-2 的裁决半边★ 归属**解不出**时不敢断言"生产者在外部"——',
+        '    if False:\n'
+        '        # ★复核 CRITICAL-2 的裁决半边★ 归属**解不出**时不敢断言"生产者在外部"——',
+        ["test_wiring_ts_unresolved_owner_falls_to_fail"],
+    ),
+    (
+        "CRITICAL-2: TS 相对导入退回『工程根相对』（scope 词干永不匹配 → 等自己）",
+        DRV,
+        '        base_dir = str(src).replace("\\\\", "/").rsplit("/", 1)[0] if "/" in str(src) else ""',
+        '        base_dir = ""',
+        ["test_produced_in_scope_detects_own_container",
+         "test_wiring_ts_own_scope_producer_falls_to_fail"],
+    ),
+    (
+        "HIGH-1: Rust 主形态退回按段数 rpartition（crate::svc → 容器 crate）",
+        DRV,
+        "            if leaf in _leaves and container:",
+        "            if container:",
+        ["test_rust_primary_form_is_whole_container_not_split"],
+    ),
+    (
+        "HIGH-2: Go 包别名不再反解（qualifier 当容器 → 清盘同批裸 undefined）",
+        DRV,
+        '            _p = self._resolve_qualifier(r.ref, r.src, project_path, timeout, run)\n'
+        "            return r._replace(ref=_p) if _p else r",
+        "            return r",
+        ["test_go_qualified_undefined_resolves_alias"],
+    ),
+    (
+        "MED-2: Go 裸 `package` 分支恢复过宽（噪声行静默关掉整个闸）",
+        DRV,
+        '    r"|package\\s+([A-Za-z0-9_./\\-]+)(?=\\s+is not in\\b))"',
+        '    r"|package\\s+([A-Za-z0-9_./\\-]+))"',
+        ["test_go_bare_package_noise_does_not_disarm_gate"],
+    ),
+    (
+        "MED-1: bundler 形第三方看不见（全或无被静默解除武装）",
+        DRV,
+        "        for m in _NODE_BUNDLER_RESOLVE_RE.finditer(text):\n"
+        "            out.append(MissingRef(ref=m.group(1), symbol=None, src=None))",
+        "        pass",
+        ["test_solver_sees_bundler_third_party"],
+    ),
+    (
+        "MED-1: GOPATH 形第三方看不见（同上，Go 侧）",
+        DRV,
+        "        for m in _GO_CANNOT_FIND_PKG_RE.finditer(text):\n"
+        "            out.append(MissingRef(ref=m.group(1), symbol=None, src=None))",
+        "        pass",
+        ["test_solver_sees_gopath_third_party"],
+    ),
+    (
+        "LOW-3: _norm_rel 退回 lstrip('./')（吃掉 .github/.mvn 前导点）",
+        DRV,
+        '    while p.startswith("./"):\n        p = p[2:]\n    return p.lstrip("/")',
+        '    return p.lstrip("./")',
+        ["test_norm_rel_preserves_dotfile_dirs"],
+    ),
+    (
+        "去重：同一行多正则命中时留了 src=None 那条（步骤4 整批落 UNKNOWN）",
+        DRV,
+        "        elif best[k].src is None and r.src:\n"
+        "            best[k] = r",
+        "        elif False:\n            best[k] = r",
+        ["test_dedupe_prefers_evidence_with_source_file"],
+    ),
+    (
+        "LOW-2: 符号继承退回裸 startswith（容器 svc 吞 svcutil.Foo）",
+        PIPE,
+        "                if any(_cs == p or _cs.startswith(p + _sep) for p in own_pkgs):",
+        "                if any(_cs.startswith(p) for p in own_pkgs):",
+        ["test_step4_symbol_inheritance_rejects_sibling_container"],
     ),
 ]
 

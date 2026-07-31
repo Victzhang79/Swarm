@@ -140,7 +140,12 @@ class _PromptBuildingMixin:
         if sv:
             parts.append(f"[scope 越权] 改了 scope 外的文件: {sv}")
         cm = (l1_details.get("compile_message") or "").strip()
-        if cm and not l1_details.get("l1_2_compile_ok", True):
+        # ★X-C3 复核 MED-3★ 判据必须是 `is False`，不能是 `not …get(…, True)`：
+        # BLOCKED 路径把 ok 键置 **None**（"该验证的环节被阻塞"，非能力失败），而 `not None`
+        # 为真 ⇒ 会给 worker 下"[编译失败] 去修 Cannot find module './routes/users'"的指令，
+        # 而那个模块**本就该由别的子任务建、本子任务无权建**。相邻的 build 分支（下面那条）
+        # 用的正是 `is False`——本处是同一约定上的行为分叉（被抄的那条路径免疫，这条不免疫）。
+        if cm and l1_details.get("l1_2_compile_ok") is False:
             parts.append(f"[编译失败]\n{cm}")
         lint = l1_details.get("lint") or {}
         if isinstance(lint, dict) and lint.get("message") and lint.get("status") == "error":

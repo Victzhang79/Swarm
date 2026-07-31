@@ -39,6 +39,10 @@ GO_MISSING_PKG = (
     "github.com/acme/shop/internal/svc; to add it:\n\tgo get github.com/acme/shop/internal/svc\n"
 )
 GO_UNDEFINED_BARE = "internal/handler/user.go:19:9: undefined: ListUsers\n"
+GO_QUALIFIED_UNDEFINED = (
+    "# github.com/acme/shop/internal/handler\n"
+    "internal/handler/user.go:20:9: undefined: svc.GetUser\n"
+)
 GO_THIRD_PARTY = (
     "internal/handler/user.go:8:2: no required module provides package "
     "github.com/gin-gonic/gin; to add it:\n"
@@ -50,9 +54,17 @@ TS_MISSING_MODULE = (
 TS_MISSING_EXPORT = (
     "src/app.ts(5,10): error TS2305: Module '\"./svc\"' has no exported member 'listUsers'.\n"
 )
+# ★主形态★（`mod svc;` 未声明 —— 即"生产者未就绪"的真实形态）
 RUST_UNRESOLVED = (
+    "error[E0432]: unresolved import `crate::svc`\n"
+    " --> src/handler.rs:2:5\n  |\n2 | use crate::svc::list_users;\n"
+    "  |     ^^^^^^^^^^ use of undeclared crate or module `svc`\n"
+)
+# 模块在、其中的项缺失（rustc 带尾注 `no \`X\` in \`Y\``）
+RUST_UNRESOLVED_WITH_NOTE = (
     "error[E0432]: unresolved import `crate::svc::list_users`\n"
     " --> src/handler.rs:2:5\n  |\n2 | use crate::svc::list_users;\n"
+    "  |     ^^^^^^^^^^^^^^^^^^^^^^ no `list_users` in `svc`\n"
 )
 PY_MODULE_NOT_FOUND = (
     "Traceback (most recent call last):\n"
@@ -126,9 +138,102 @@ def test_ts_parses_module_and_export():
     assert ("./svc", "listUsers") in pairs
 
 
-def test_rust_splits_container_and_leaf():
+def test_rust_primary_form_is_whole_container_not_split():
+    """★复核 HIGH-1★ `mod svc;` 未声明时 rustc 报的是 `unresolved import \\`crate::svc\\``
+    ——这是**主形态**。按段数 rpartition 会切成容器 `crate` + 符号 `svc`，`is_internal("crate")`
+    为假 ⇒ 全或无当场清盘 ⇒ Rust 臂在目标场景下实质零覆盖（原语料用全路径形态，那只在
+    svc 已存在时才出现＝已经不是"生产者未就绪"）。判据只认 rustc 自己的尾注。"""
     refs = ed.RustErrorDriver().parse_missing(RUST_UNRESOLVED)
+    assert [(r.ref, r.symbol) for r in refs] == [("crate::svc", None)]
+    pkgs, _ = ed.blocked_on_unbuilt_internal(
+        "rust", RUST_UNRESOLVED, "/p", 60, _fake_probe())
+    assert pkgs == {"crate::svc"}, "主形态必须能标出来，否则整个 Rust 臂是装饰"
+
+
+def test_rust_splits_container_and_leaf_only_with_rustc_note():
+    """有尾注 `no \\`X\\` in \\`Y\\`` 才拆容器+符号（模块在、项缺失）。"""
+    refs = ed.RustErrorDriver().parse_missing(RUST_UNRESOLVED_WITH_NOTE)
     assert [(r.ref, r.symbol) for r in refs] == [("crate::svc", "list_users")]
+
+
+def test_dedupe_prefers_evidence_with_source_file():
+    """★整改过程中实测撞到的★ tsc 的 TS2307 整行**同时**匹配 TS 式与 require 式正则，
+    后者拿不到报错文件。若去重留下 src=None 那条，步骤 4 就解不出相对导入的归属 → 整批落
+    UNKNOWN → 刚治好的 CRITICAL-2 通道又被关掉（且表现为"归属解不出"这种无辜文案）。
+    """
+    # ★夹具必须把 src=None 那条排在**前面**★ 正则遍历顺序恰好让带 src 的先入时，收敛分支
+    # 根本不执行——那样的夹具对本机制零区分力（突变实测：仍全绿）。
+    refs = [
+        ed.MissingRef(ref="./routes/users", symbol=None, src=None),
+        ed.MissingRef(ref="./routes/users", symbol=None, src="src/app.ts"),
+    ]
+    got = [(r.ref, r.src) for r in ed._dedupe(refs)]
+    assert got == [("./routes/users", "src/app.ts")], \
+        f"同一 ref 必须收敛到带报错文件的那条证据: {got}"
+    # 管线级：同一 TS2307 行被 TS 式与 require 式两条正则同时命中，最终仍须带 src
+    parsed = ed.NodeErrorDriver().parse_missing(TS_MISSING_MODULE)
+    assert [(r.ref, r.src) for r in parsed if r.ref == "./routes/users"] == \
+        [("./routes/users", "src/app.ts")]
+
+
+def test_go_qualified_undefined_resolves_alias():
+    """★复核 HIGH-2★ `undefined: svc.GetUser` 里 `svc` 是**包别名**不是 import path。
+    原实现直接当容器 → `is_internal("svc")` 恒假 → 全或无把**同批的裸 undefined 一起清盘**
+    ⇒ Go 符号通道在跨包调用（Go 的常态写法）下实质零覆盖。治法＝从报错文件的 import 块
+    确定性反解，解不出则保持 fail-closed（`svc` 也可能根本不是包）。"""
+    imports = '\tsvc "github.com/acme/shop/internal/svc"\n'
+
+    def run(cmd, pp, timeout=60):
+        if "go.mod" in cmd and "awk" in cmd:
+            return 0, "github.com/acme/shop\n", ""
+        if "grep -oE" in cmd:
+            return 0, imports, ""
+        return 1, "", ""
+
+    pkgs, syms = ed.blocked_on_unbuilt_internal("go", GO_QUALIFIED_UNDEFINED, "/p", 60, run)
+    assert "github.com/acme/shop/internal/svc" in pkgs
+    assert "github.com/acme/shop/internal/svc.GetUser" in syms
+
+    def run_no_imports(cmd, pp, timeout=60):
+        if "go.mod" in cmd and "awk" in cmd:
+            return 0, "github.com/acme/shop\n", ""
+        return 1, "", ""
+
+    assert ed.blocked_on_unbuilt_internal(
+        "go", GO_QUALIFIED_UNDEFINED, "/p", 60, run_no_imports) == (set(), []), \
+        "别名解不出 → 全盘不标（fail-closed），绝不臆造容器"
+
+
+def test_go_bare_package_noise_does_not_disarm_gate():
+    """★复核 MED-2★ `main.go:3:8: package main` 这类普通诊断行若被当成缺失包解析出来，
+    `is_internal` 会拒它 → 全或无**把该轮 X-C3 整个关掉，且零日志**（上一批三条 CRITICAL
+    的同型：过宽 marker 静默解除下游武装）。"""
+    noise = ("main.go:3:8: package main\n"
+             "internal/handler/user.go:7:2: no required module provides package "
+             "github.com/acme/shop/internal/svc\n")
+    refs = ed.GoErrorDriver().parse_missing(noise)
+    assert [r.ref for r in refs] == ["github.com/acme/shop/internal/svc"], \
+        "裸 package 诊断行不得进解析结果"
+    pkgs, _ = ed.blocked_on_unbuilt_internal("go", noise, "/p", 60, _fake_probe())
+    assert pkgs == {"github.com/acme/shop/internal/svc"}
+
+
+def test_solver_sees_gopath_third_party():
+    """★复核 MED-1★ 全或无只对**解析器认出的** ref 生效——GOPATH 形第三方缺失行原先
+    完全看不见 ⇒ 第三方那一票不存在 ⇒ 照标 BLOCKED（武装被静默解除）。"""
+    mixed = ('main.go:8:2: cannot find package "github.com/gin-gonic/gin" in any of:\n'
+             "internal/handler/user.go:7:2: no required module provides package "
+             "github.com/acme/shop/internal/svc\n")
+    assert ed.blocked_on_unbuilt_internal(
+        "go", mixed, "/p", 60, _fake_probe()) == (set(), [])
+
+
+def test_solver_sees_bundler_third_party():
+    """★复核 MED-1（Node 侧）★ vite/rollup/webpack 形态原先解析器看不见。"""
+    mixed = (TS_MISSING_MODULE +
+             '[vite]: Rollup failed to resolve import "express" from "src/app.ts".\n')
+    assert ed.blocked_on_unbuilt_internal(
+        "node", mixed, "/p", 60, _fake_probe()) == (set(), [])
 
 
 def test_python_parses_module_not_found():
@@ -140,7 +245,7 @@ def test_rust_symbol_fqn_uses_stack_separator():
     """★分隔符按栈取★ 混用会让 brain 侧类级 futile 判据的前缀匹配失配
     （它按容器名前缀反查生产者子任务）。Rust 必须是 `::` 而不是 `.`。"""
     pkgs, syms = ed.blocked_on_unbuilt_internal(
-        "rust", RUST_UNRESOLVED, "/p", 60, _fake_probe())
+        "rust", RUST_UNRESOLVED_WITH_NOTE, "/p", 60, _fake_probe())
     assert pkgs == {"crate::svc"}
     assert syms == ["crate::svc::list_users"]
 
@@ -203,23 +308,66 @@ def test_stem_matches_rejects_sibling_prefix():
     assert not ed._stem_matches("routes/users_admin.ts", "routes/users")
 
 
-@pytest.mark.parametrize("lang,ref,own_file,other_file", [
-    ("go", "github.com/acme/shop/internal/svc",
+@pytest.mark.parametrize("lang,ref,src,own_file,other_file", [
+    ("go", "github.com/acme/shop/internal/svc", None,
      "internal/svc/user.go", "internal/other/x.go"),
-    ("node", "./routes/users", "routes/users.ts", "routes/admin.ts"),
-    ("rust", "crate::svc", "src/svc/mod.rs", "src/other.rs"),
-    ("python", "app.services.user", "app/services/user.py", "app/other.py"),
+    # ★复核 CRITICAL-2★ `./routes/users` 从 `src/app.ts` 引用 → 真实解析到
+    # `src/routes/users.ts`（相对**报错文件**，不是工程根）。原夹具写 `routes/users.ts`
+    # ＝夹具把 bug 当成布局前提，替 `ref_tree_paths` 背书。
+    ("node", "./routes/users", "src/app.ts",
+     "src/routes/users.ts", "src/routes/admin.ts"),
+    # `../` 形态：从 `src/api/app.ts` 看 `../svc/user` → `src/svc/user`
+    ("node", "../svc/user", "src/api/app.ts",
+     "src/svc/user.ts", "src/api/svc/user.ts"),
+    ("rust", "crate::svc", None, "src/svc/mod.rs", "src/other.rs"),
+    ("python", "app.services.user", None, "app/services/user.py", "app/other.py"),
 ])
-def test_produced_in_scope_detects_own_container(lang, ref, own_file, other_file):
+def test_produced_in_scope_detects_own_container(lang, ref, src, own_file, other_file):
     """scope 里有该容器的源码 ⇒ 生产者是自己 ⇒ 不该判 BLOCKED（否则等自己=幽灵生产者）。"""
-    assert ed.produced_in_scope(lang, {ref}, [own_file], "/p", 60, _fake_probe()) == {ref}
-    assert ed.produced_in_scope(lang, {ref}, [other_file], "/p", 60, _fake_probe()) == set()
+    mr = ed.MissingRef(ref=ref, symbol=None, src=src)
+    own, unres = ed.produced_in_scope(lang, [mr], [own_file], "/p", 60, _fake_probe())
+    assert own == {ref} and not unres
+    own2, unres2 = ed.produced_in_scope(lang, [mr], [other_file], "/p", 60, _fake_probe())
+    assert own2 == set() and not unres2, "别的文件不得算自产，且必须是【确定】不自产"
 
 
 def test_produced_in_scope_fail_closed_for_unknown_and_java():
     for key in ("java", "elixir", None):
         assert ed.produced_in_scope(
-            key, {"x"}, ["a/b.go"], "/p", 60, _fake_probe()) == set()
+            key, {"x"}, ["a/b.go"], "/p", 60, _fake_probe()) == (set(), set())
+
+
+def test_produced_in_scope_reports_unresolved_separately():
+    """★复核 CRITICAL-2 的三态★ "解不出"必须与"确定不自产"分账——塌成同一个空集时，
+    上层会把它当"生产者在外部"→ 判 BLOCKED → worker 去等自己。
+
+    node 的相对导入缺 `src` 上下文（bundler/require 形态没有报错文件）即解不出。
+    """
+    mr = ed.MissingRef(ref="./routes/users", symbol=None, src=None)
+    own, unres = ed.produced_in_scope(
+        "node", [mr], ["src/routes/users.ts"], "/p", 60, _fake_probe())
+    assert own == set() and unres == {"./routes/users"}
+
+
+def test_go_root_package_stem_is_root_only():
+    """★复核 CRITICAL-2 变体★ Go 根包（`main.go` 里的裸 undefined）原返 [] 自称
+    fail-closed，实际被读成"非自产"→ 去等自己。现在返根词干，且**只**认工程根直下文件。"""
+    mr = ed.MissingRef(ref="github.com/acme/shop", symbol="buildRouter", src="main.go")
+    own, unres = ed.produced_in_scope("go", [mr], ["main.go"], "/p", 60, _fake_probe())
+    assert own == {"github.com/acme/shop"} and not unres
+    # 子目录文件绝不算根包自产（否则整棵树都算）
+    own2, _ = ed.produced_in_scope(
+        "go", [mr], ["internal/svc/user.go"], "/p", 60, _fake_probe())
+    assert own2 == set()
+
+
+def test_norm_rel_preserves_dotfile_dirs():
+    """★复核 LOW-3★ `lstrip("./")` 会把 `.github/x` 剥成 `github/x`、`.mvn/wrapper` 剥成
+    `mvn/wrapper`——本仓已被这个惯用法坑过（`.mvn/wrapper`/`.yarn/releases` 被剔没）。"""
+    assert ed._norm_rel("./a/b.ts") == "a/b.ts"
+    assert ed._norm_rel(".github/workflows/ci.yml") == ".github/workflows/ci.yml"
+    assert ed._norm_rel(".mvn/wrapper/maven-wrapper.properties") == \
+        ".mvn/wrapper/maven-wrapper.properties"
 
 
 def test_step4_shared_layer_consults_driver_half():
@@ -325,11 +473,43 @@ def test_wiring_ts_own_scope_producer_falls_to_fail(
         ts_project, monkeypatch, quiet_gates):
     """★F2 在管线上的验证★ 缺的模块本就该由自己建（在 create_files 里）→ 落 FAIL 修复梯。
     没有 driver 半边时这里会误判 BLOCKED = 去等自己（#10 幽灵生产者）。"""
-    scope = FileScope(writable=["src/app.ts"], create_files=["routes/users.ts"])
+    # ★路径必须是真实解析结果★ `./routes/users` 从 `src/app.ts` 引用 → `src/routes/users.ts`。
+    # 写 `routes/users.ts`（工程根相对）就是复核 CRITICAL-2 逮到的夹具自我背书。
+    scope = FileScope(writable=["src/app.ts"], create_files=["src/routes/users.ts"])
     ok, details = _run_ts(ts_project, monkeypatch, scope, TS_MISSING_MODULE)
     assert ok is False, f"自己该建的 → FAIL 进修复梯，不判 BLOCKED: {details}"
     assert details.get("pipeline_blocked") is None
     assert details.get("in_scope_producer_fail") == ["./routes/users"]
+
+
+def test_wiring_ts_unresolved_owner_falls_to_fail(
+        ts_project, monkeypatch, quiet_gates):
+    """★复核 CRITICAL-2 的管线级验证★ 归属解不出时不得判 BLOCKED。
+
+    用 `require` 形态（`Cannot find module './routes/users'`，**无报错文件**）→ 相对导入
+    无锚点 → UNKNOWN。此时判 BLOCKED 就可能让 worker 去等自己（#10 幽灵生产者）；
+    落 FAIL 修复梯只是退回现状。两侧代价不对称。
+    """
+    scope = FileScope(writable=["src/app.ts"])
+    node_require = "Error: Cannot find module './routes/users'\n"
+    ok, details = _run_ts(ts_project, monkeypatch, scope, node_require)
+    assert ok is False, f"归属未知 → FAIL，不判 BLOCKED: {details}"
+    assert details.get("pipeline_blocked") is None
+    assert details.get("blocked_owner_unresolved") == ["./routes/users"], \
+        "降级必须留机读账（否则这一层可以死很久没人知道）"
+
+
+def test_step4_symbol_inheritance_rejects_sibling_container():
+    """★复核 LOW-2★ 符号继承容器归属时用裸 startswith 会让容器 `…/svc` 吞掉
+    `…/svcutil.Foo` —— 正是 `_stem_matches` 存在的理由所禁止的形态。"""
+    scope = FileScope(writable=["internal/svc/user.go"])
+    ref = "github.com/acme/shop/internal/svc"
+    sibling = "github.com/acme/shop/internal/svcutil.Foo"
+    _own_p, own_c = lp._missing_internal_produced_in_scope(
+        scope, {ref}, [f"{ref}.ListUsers", sibling], language_key="go",
+        project_path="/p", timeout=60, run=_fake_probe())
+    assert f"{ref}.ListUsers" in own_c
+    assert sibling not in own_c, "sibling 容器的符号不得被算成自产"
 
 
 def test_wiring_ts_third_party_stays_plain_compile_fail(
@@ -352,6 +532,61 @@ def test_wiring_ts_already_in_tree_stays_compile_fail(
                           present={"routes/users"})
     assert ok is False
     assert details.get("pipeline_blocked") is None
+
+
+@pytest.mark.parametrize("stack,manifest,mf_body,src_rel,src_body,build_out,expect_pkg", [
+    ("Gin (go)", "go.mod", "module github.com/acme/shop\n\ngo 1.22\n",
+     "internal/handler/user.go", "package handler\n",
+     "internal/handler/user.go:7:2: no required module provides package "
+     "github.com/acme/shop/internal/svc\n",
+     "github.com/acme/shop/internal/svc"),
+    ("Axum (rust)", "Cargo.toml", "[package]\nname = \"shop\"\nversion = \"0.1.0\"\n",
+     "src/handler.rs", "// handler\n",
+     "error[E0432]: unresolved import `crate::svc`\n --> src/handler.rs:2:5\n"
+     "  |     ^^^^^^^^^^ use of undeclared crate or module `svc`\n",
+     "crate::svc"),
+])
+def test_wiring_go_rust_build_gate_reaches_blocked(
+        tmp_path, monkeypatch, quiet_gates, stack, manifest, mf_body,
+        src_rel, src_body, build_out, expect_pkg):
+    """★复核 LOW-1★ go/rust 走的是 **L1.2.1 build 闸**（另一个调用点），此前"可达"只有
+    散文声称、零测试钉住——而本批**正是因为可达性误判**（node/ts 死代码）才返工的。
+
+    走真实 `run_l1_pipeline`：真实 `_derive_full_build_command`（据清单+改动文件派生
+    `go build ./...` / `cargo build -q`）、真实 `_build_cmd_applicable`、真实 driver。
+    只假造 `_run_l1_command`（构建执行）与 `_run_check_split`（只读探针）。
+    """
+    (tmp_path / manifest).write_text(mf_body)
+    p = tmp_path / src_rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(src_body)
+    monkeypatch.setattr(lp, "_run_l1_command", lambda cmd, pp, timeout=120: (1, build_out))
+    monkeypatch.setattr(lp, "_attempt_build_repair", lambda *a, **k: (0, []))
+    monkeypatch.setattr(lp, "_build_error_is_upstream", lambda *a, **k: False)
+    monkeypatch.setattr(lp, "_scan_fullwidth_punct", lambda *a, **k: [])
+    import swarm.worker.workspace_manifest as wm
+    monkeypatch.setattr(wm, "reconcile_workspace_manifests",
+                        lambda *a, **k: {"modified_manifests": [], "added": []})
+
+    def _split(cmd, project_path, timeout=60):
+        if "go.mod" in cmd and "awk" in cmd:
+            return 0, "github.com/acme/shop\n", ""
+        return 1, "", ""
+
+    monkeypatch.setattr(lp, "_run_check_split", _split)
+    diff = f"--- a/{src_rel}\n+++ b/{src_rel}\n@@ -1 +1 @@\n-old\n+new\n"
+    st = SubTask(id="st-xc3-br", description="X-C3 build gate",
+                 difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=[src_rel]),
+                 harness=TaskHarness(language=stack.split("(")[-1].rstrip(")")))
+    ok, details = lp.run_l1_pipeline(str(tmp_path), st, diff, timeout=60,
+                                     project_stack={"backend": stack})
+    assert details.get("build_command_derived"), \
+        f"派生不出构建命令 ⇒ build 闸整块跳过 ⇒ 该栈根本到不了 X-C3: {details}"
+    assert ok is True, f"BLOCKED 契约=ok=True + pipeline_blocked: {details}"
+    assert details.get("pipeline_blocked") == "internal_pkg_not_built"
+    assert details.get("blocked_on_packages") == [expect_pkg]
+    assert details.get("l1_2_1_build_ok") is None
 
 
 def test_wiring_compile_classifier_eats_untruncated_output(

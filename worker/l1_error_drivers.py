@@ -88,9 +88,18 @@ class ErrorDriver(Protocol):
         """该标识是否属于**本工程自己 build 的东西**（而非第三方/标准库）。"""
         ...
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
         """ref → 该容器在树里**应当落**的相对路径**词干**集（不含扩展名）。
+
+        ★三态（复核 CRITICAL-2）★ `None` = **解不出**（UNKNOWN），`[]` = 确定无词干，
+        非空 = 词干集。原实现只有两态，`[]` 被两个消费者**同侧**解读（步骤 3：不在树里→
+        推向 BLOCKED；步骤 4：非自产→推向 BLOCKED）⇒ 这条原语**没有任何一侧是 fail-closed**，
+        docstring 里写的"fail-closed"是假的。三态让步骤 4 能把 UNKNOWN 与"确定不自产"分开：
+        解不出时**不敢断言外部生产者**，裁决落回 FAIL 修复梯（误 BLOCKED 才是贵的那一侧）。
+
+        `src` = 报错文件（相对工程根）。TS/JS 的相对导入是**相对报错文件**而非工程根
+        （`src/app.ts` 里的 `./routes/users` → `src/routes/users`），无它必错。
 
         ★这条原语是"树内是否已有"（步骤 3）与"生产者是否在本子任务 scope 内"（步骤 4）
         的**共同**路径口径★。步骤 4 留在共用层（`_missing_internal_produced_in_scope`），
@@ -119,23 +128,78 @@ def _stem_matches(rel_path: str, stem: str) -> bool:
     `routes/users_admin.ts` vs 词干 `routes/users` → **False**（★不许裸 startswith★，
     否则 `svc` 会吃掉 `svc_test`/`svcutil`＝把别人的文件算成自己的产出、误抑 BLOCKED）
     """
-    p = str(rel_path or "").replace("\\", "/").lstrip("./").lstrip("/")
-    s = str(stem or "").replace("\\", "/").lstrip("./").lstrip("/")
-    if not p or not s:
+    p = _norm_rel(rel_path)
+    s = _norm_rel(stem)
+    if not p:
+        return False
+    if stem == "":
+        # 根词干（Go 根包）：只认**工程根直下**的文件，绝不吃子目录（否则整棵树都算自产）
+        return "/" not in p
+    if not s:
         return False
     if p.startswith(s + "/"):
         return True
     return p.rsplit(".", 1)[0] == s if "." in p.rsplit("/", 1)[-1] else p == s
 
 
+def _norm_rel(path: str | None) -> str:
+    """归一相对路径：只剥**前导 `./`** 与前导 `/`。
+
+    ★复核 LOW-3★ 原写法 `lstrip("./")` 会剥掉任意 `.`/`/` 组合 → `.github/x` 变
+    `github/x`、`.mvn/wrapper` 变 `mvn/wrapper`。本仓已被这个惯用法坑过一次
+    （`.mvn/wrapper`、`.yarn/releases` 被当噪声剔没）。
+    """
+    p = str(path or "").replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
+def _memoized(run: RunProbe) -> RunProbe:
+    """按 (cmd, project_path) 记忆只读探针结果——同一次求解内工程树不变，结果必相同。
+
+    只读命令（`awk go.mod` / `ls` / `grep`）无副作用，memo 语义安全。作用域＝一次调用，
+    绝不跨任务（那会缓存过期的工程树状态）。
+    """
+    cache: dict[tuple[str, str], tuple[int, str, str]] = {}
+
+    def _run(cmd: str, project_path: str, timeout: int = 60):
+        key = (cmd, project_path)
+        if key not in cache:
+            cache[key] = run(cmd, project_path, timeout)
+        return cache[key]
+    return _run
+
+
 def _dedupe(refs: list[MissingRef]) -> list[MissingRef]:
-    """按 (ref, symbol) 去重保序——同一缺失在多文件报错时只留一条证据。"""
-    seen: set[tuple[str, str | None]] = set()
-    out: list[MissingRef] = []
+    """按 (ref, symbol, src) 去重保序——同一缺失在多文件报错时每个报错文件各留一条。
+
+    ★复核 LOW-4★ 键原为 (ref, symbol)，会把两个**不同文件**里的同名裸 `undefined: X`
+    塌成一条 → 只按第一个文件的目录反解容器（Go 的 `resolve_ref` 依赖 `src`），另一个
+    文件所在包的缺失证据静默丢失。src 进键即可，代价只是多一条同名证据。
+
+    ★同一 ref 既有带 src 的证据又有不带的 → 收敛到带 src 的那条★ 各栈的多条正则会
+    命中**同一行**（如 tsc 的 `… error TS2307: Cannot find module './x'` 整行同时匹配 TS 式
+    与 require 式，后者拿不到报错文件）。留下 src=None 的那条 ⇒ 步骤 4 解不出归属 ⇒ 整批
+    落 UNKNOWN，把治好的 CRITICAL-2 通道又关掉。故先按 (ref, symbol) 分组取**证据最全**者。
+    """
+    best: dict[tuple[str, str | None], MissingRef] = {}
+    order: list[tuple[str, str | None]] = []
     for r in refs:
         k = (r.ref, r.symbol)
-        if k not in seen:
-            seen.add(k)
+        if k not in best:
+            best[k] = r
+            order.append(k)
+        elif best[k].src is None and r.src:
+            best[k] = r          # 同一缺失：带报错文件的证据胜出（src 是反解/归属的输入）
+    out: list[MissingRef] = [best[k] for k in order]
+    # 同一 (ref, symbol) 出现在**不同**报错文件时各留一条（LOW-4：Go 反解按 src 定容器）
+    seen: set[tuple[str, str | None, str | None]] = {
+        (r.ref, r.symbol, r.src) for r in out}
+    for r in refs:
+        k3 = (r.ref, r.symbol, r.src)
+        if r.src and k3 not in seen:
+            seen.add(k3)
             out.append(r)
     return out
 
@@ -153,11 +217,19 @@ def _strip_ansi(text: str) -> str:
 # vet/list 路径下可能裸出）：
 #   main.go:5:2: no required module provides package github.com/x/y/internal/svc
 #   main.go:5:2: package github.com/x/y/internal/svc is not in std (/usr/.../svc)
+# ★MED-2（复核实测）★ 原式的裸 `|package` 分支过宽：`main.go:3:8: package main` 这类
+# 普通诊断行会被解析成 ref=`main` → `is_internal` 拒 → **全或无把该轮 X-C3 整个关掉，且零
+# 日志**（上一批三条 CRITICAL 的同型：过宽 marker 静默解除下游武装）。故裸 `package` 分支
+# 必须锚死 go 自己的两个句式尾部（`is not in std` / `is not in GOROOT`），不吃任何裸 package 行。
 _GO_MISSING_PKG_RE = re.compile(
     r"(?:^|\n)(?:([^\s:]+\.go):\d+:\d+:\s*)?"
-    r"(?:no required module provides package|package)\s+"
-    r"([A-Za-z0-9_./\-]+)"
-    r"(?=[\s;]|\s+is not in|$)"
+    r"(?:no required module provides package\s+([A-Za-z0-9_./\-]+)"
+    r"|package\s+([A-Za-z0-9_./\-]+)(?=\s+is not in\b))"
+)
+# GOPATH 时代/vendor 形态的第三方缺失（MED-1：解析器漏了它 ⇒ 第三方行不存在 ⇒ 全或无
+# 被静默解除）。只用来**参与全或无判据**，与上式同吃。
+_GO_CANNOT_FIND_PKG_RE = re.compile(
+    r"cannot find package\s+\"([^\"]+)\""
 )
 # 同包内符号未建出（容器在、符号缺）——Go 的类级同型：
 #   ./handler.go:12:9: undefined: ListUsers
@@ -178,9 +250,13 @@ class GoErrorDriver:
         text = _strip_ansi(build_output)
         out: list[MissingRef] = []
         for m in _GO_MISSING_PKG_RE.finditer(text):
-            ref = m.group(2)
+            ref = m.group(2) or m.group(3)
+            if not ref:
+                continue
             # 过滤明显非 import path 的噪声（无点无斜杠＝标准库短名，交由 is_internal 拒掉）
             out.append(MissingRef(ref=ref, symbol=None, src=m.group(1)))
+        for m in _GO_CANNOT_FIND_PKG_RE.finditer(text):
+            out.append(MissingRef(ref=m.group(1), symbol=None, src=None))
         for m in _GO_UNDEFINED_RE.finditer(text):
             qualifier, sym = m.group(2), m.group(3)
             # `undefined: svc.ListUsers` → 容器是 svc（同模块内的包别名，无法从这行还原
@@ -196,6 +272,34 @@ class GoErrorDriver:
         _ec, out, _e = run(cmd, project_path, min(timeout, 20))
         return (out or "").strip()
 
+    def _resolve_qualifier(self, qualifier: str, src: str, project_path: str,
+                           timeout: int, run: RunProbe) -> str | None:
+        """★HIGH-2（复核实测）★ `undefined: svc.GetUser` 里的 `svc` 是**包别名**，不是
+        import path。原实现把它直接当容器 → `is_internal("svc")` 恒假 → 全或无把**同批的
+        裸 undefined 一起清盘** ⇒ Go 符号通道在跨包调用（Go 的常态写法）下实质零覆盖。
+
+        治法＝从报错文件自己的 import 块**确定性反解**（别名或路径末段匹配 qualifier），
+        而不是猜。解不出 → 返 None，调用方保持原样（qualifier 当容器 → is_internal 拒 →
+        全盘不标）：那是 fail-closed 方向，因为 `svc` 也可能根本不是包（局部变量/类型）。
+        """
+        if not src or "/" in qualifier or "." in qualifier:
+            return None
+        # 取 import 块里形如 `alias "path"` 或 `"path"` 的行；末段==qualifier 或 别名==qualifier
+        cmd = (f"grep -oE '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*[[:space:]]+)?\"[^\"]+\"' "
+               f"{_sh_quote(src)} 2>/dev/null | head -40")
+        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if '"' not in line:
+                continue
+            alias = line.split('"', 1)[0].strip()
+            path = line.split('"')[1]
+            if not path:
+                continue
+            if alias == qualifier or path.rsplit("/", 1)[-1] == qualifier:
+                return path
+        return None
+
     def resolve_ref(self, r: MissingRef, project_path: str, timeout: int,
                     run: RunProbe) -> MissingRef:
         """把裸 `undefined: X` 的容器补成**报错文件自己所在包**的 import path。
@@ -208,6 +312,11 @@ class GoErrorDriver:
         不做的话该形态恒 fail-closed 落 FAIL 修复梯 = worker 反复去修一个"别人还没建"的
         符号，正是 X-C3 要治的病在 Go 上原样保留。
         """
+        if r.ref and r.src and "/" not in r.ref and "." not in r.ref:
+            # HIGH-2：ref 是**包别名**形态（`undefined: svc.GetUser` 的 `svc`）→ 反解成
+            # 真 import path；解不出就原样留着（→ is_internal 拒 → 全盘不标，fail-closed）
+            _p = self._resolve_qualifier(r.ref, r.src, project_path, timeout, run)
+            return r._replace(ref=_p) if _p else r
         if r.ref or not r.src:
             return r
         mod = self._module_path(project_path, timeout, run)
@@ -227,14 +336,18 @@ class GoErrorDriver:
             return False          # 读不出 module path → fail-closed
         return ref == mod or ref.startswith(mod + "/")
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
         """Go import path → 相对 module root 的目录（Go 的包**恒是目录**）。"""
         mod = self._module_path(project_path, timeout, run)
         if not mod or not (ref == mod or ref.startswith(mod + "/")):
-            return []
-        rel = ref[len(mod) + 1:] if ref != mod else ""
-        return [rel] if rel else []      # ref==mod（根包）→ 无词干可锚，fail-closed
+            return None                  # 读不出 module / 非本模块 → UNKNOWN
+        if ref == mod:
+            # ★复核 CRITICAL-2 变体★ 根包：词干是"工程根下的 .go 文件"（不含子目录）。
+            # 原实现返 [] 并自称 fail-closed，实际推向 BLOCKED ⇒ `main.go` 里的裸
+            # `undefined: buildRouter` 会去等自己。用 "" 表根，由 _stem_matches 特判。
+            return [""]
+        return [ref[len(mod) + 1:]]
 
     def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
                         timeout: int, run: RunProbe) -> bool:
@@ -280,6 +393,14 @@ _TS_MISSING_EXPORT_RE = re.compile(
 _NODE_REQUIRE_RE = re.compile(
     r"Cannot find module\s*['\"](\.[^'\"]+)['\"]"
 )
+# ★MED-1（复核实测）★ bundler 形态的缺失（vite/rollup/webpack）原先解析器完全看不见 →
+# 混合批里的**第三方**缺失行不存在 ⇒ "全或无"被静默解除武装 ⇒ 照标 BLOCKED。
+# 相对路径与裸包名都收（裸包名会被 is_internal 判第三方，正是全或无要的那一票）。
+_NODE_BUNDLER_RESOLVE_RE = re.compile(
+    r"(?:failed to resolve import|Could not resolve|Module not found:[^\n]*?)\s*"
+    r"['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 
 
 class NodeErrorDriver:
@@ -300,6 +421,8 @@ class NodeErrorDriver:
             out.append(MissingRef(ref=m.group(2), symbol=None, src=m.group(1)))
         for m in _NODE_REQUIRE_RE.finditer(text):
             out.append(MissingRef(ref=m.group(1), symbol=None, src=None))
+        for m in _NODE_BUNDLER_RESOLVE_RE.finditer(text):
+            out.append(MissingRef(ref=m.group(1), symbol=None, src=None))
         for m in _TS_MISSING_EXPORT_RE.finditer(text):
             out.append(MissingRef(ref=m.group(2), symbol=m.group(3), src=m.group(1)))
         return _dedupe(out)
@@ -309,16 +432,30 @@ class NodeErrorDriver:
         # 只认相对路径。`express`/`@scope/pkg` → 第三方；`~/x`、`@/x` 等别名 → 不标（诚实边界）
         return ref.startswith("./") or ref.startswith("../")
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
-        """`./routes/users` → 词干 `routes/users`（既可是 `.ts` 文件也可是 `/index.ts` 目录）。
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
+        """`./routes/users` **相对报错文件所在目录**归一 → `src/routes/users`。
 
-        ★`../` 不返词干★ 它相对**报错文件**而非工程根，无 src 上下文无法归一 → fail-closed。
+        ★复核 CRITICAL-2★ 原实现把 `./x` 当**工程根**相对（返 `['routes/users']`），而
+        TS/JS 的模块说明符是相对**导入文件**的：`src/app.ts` 里的 `./routes/users` 解析到
+        `src/routes/users.ts`。scope 是工程根相对 ⇒ 词干永不匹配 ⇒ 步骤 4 恒判"非自产" ⇒
+        worker 去等自己（#10 幽灵生产者）。`../` 同理，原实现直接返 []＝同一 fail-open。
+        无 `src` 上下文（bundler/require 形态可能没有报错文件）→ UNKNOWN，不硬猜。
         """
-        if not ref.startswith("./"):
-            return []
-        base = ref[2:].strip("/")
-        return [base] if base else []
+        if not (ref.startswith("./") or ref.startswith("../")):
+            return None                       # 裸包名/别名 → 非相对导入，UNKNOWN
+        if not src:
+            return None                       # 无报错文件 → 解不出，UNKNOWN（不当根相对）
+        base_dir = str(src).replace("\\", "/").rsplit("/", 1)[0] if "/" in str(src) else ""
+        parts = [p for p in (base_dir.split("/") if base_dir else []) if p and p != "."]
+        for seg in ref.split("/"):
+            if seg == "..":
+                if not parts:
+                    return None               # 爬出工程根 → 解不出
+                parts.pop()
+            elif seg not in (".", ""):
+                parts.append(seg)
+        return ["/".join(parts)] if parts else None
 
     def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
                         timeout: int, run: RunProbe) -> bool:
@@ -351,6 +488,18 @@ class NodeErrorDriver:
 _RUST_UNRESOLVED_IMPORT_RE = re.compile(
     r"error\[E0432\]:\s*unresolved import\s*`([^`]+)`"
 )
+# ★HIGH-1（复核实测）★ rustc 对 E0432 有**两种**形态，且靠段数分不开：
+#   模块整个不存在（`mod svc;` 未声明）→ unresolved import `crate::svc`      ← **主形态**
+#   模块在、其中的项缺失          → unresolved import `crate::svc::list_users`
+#                                    + 尾注 `no `list_users` in `svc``
+# 原实现一律 `rpartition("::")` ⇒ 主形态被切成容器 `crate` + 符号 `svc`，而
+# `is_internal("crate")` 为假 ⇒ **全或无当场清盘** ⇒ Rust 臂在目标场景下实质零覆盖
+# （原语料用的是全路径形态，那只在 svc 已存在时才出现＝已经不是"生产者未就绪"）。
+# 判据改成**只认 rustc 自己的尾注**：有 `no X in Y` ⇒ X 是叶符号、拆；无 ⇒ 整条是容器。
+# 绝不靠段数猜（`crate::a::b` 既可能是缺模块 a::b，也可能是缺 a 里的 b）。
+_RUST_NO_ITEM_IN_MOD_RE = re.compile(
+    r"no\s+`([A-Za-z_]\w*)`\s+in\s+`([^`]+)`"
+)
 # error[E0433]: failed to resolve: use of undeclared crate or module `svc`
 _RUST_UNDECLARED_RE = re.compile(
     r"error\[E0433\]:\s*failed to resolve:[^\n`]*`([^`]+)`"
@@ -376,11 +525,14 @@ class RustErrorDriver:
     def parse_missing(self, build_output: str) -> list[MissingRef]:
         text = _strip_ansi(build_output)
         out: list[MissingRef] = []
+        # HIGH-1：先收 rustc 尾注声明的"缺项"叶名集——它是拆/不拆的**唯一权威**依据
+        _leaves = {m.group(1) for m in _RUST_NO_ITEM_IN_MOD_RE.finditer(text)}
         for m in _RUST_UNRESOLVED_IMPORT_RE.finditer(text):
             path = m.group(1)
-            # `crate::svc::list_users` → 容器 crate::svc、符号 list_users
-            if "::" in path:
-                container, _, leaf = path.rpartition("::")
+            container, _, leaf = path.rpartition("::")
+            # 只有 rustc 明说"`leaf` 不在 `mod` 里"时才拆成 容器+符号；否则整条是缺失容器
+            # （主形态 `crate::svc`：模块本身不存在，拆了会得到 `crate` 这个非法容器）。
+            if leaf in _leaves and container:
                 out.append(MissingRef(ref=container, symbol=leaf, src=None))
             else:
                 out.append(MissingRef(ref=path, symbol=None, src=None))
@@ -400,11 +552,15 @@ class RustErrorDriver:
             return ""
         return ref[len("crate::"):].replace("::", "/")
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
-        """`crate::a::b` → 词干 `src/a/b`（`src/a/b.rs` 或 `src/a/b/mod.rs` 都落在它上）。"""
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
+        """`crate::a::b` → 词干 `src/a/b`（`src/a/b.rs` 或 `src/a/b/mod.rs` 都落在它上）。
+
+        `self::`/`super::` 无上下文无法定位 → **UNKNOWN**（原实现返 []＝被读成"非自产"
+        ⇒ 推向 BLOCKED，方向错了；复核 CRITICAL-2 同族）。
+        """
         rel = self._mod_rel(ref)
-        return [f"src/{rel}"] if rel else []
+        return [f"src/{rel}"] if rel else None
 
     def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
                         timeout: int, run: RunProbe) -> bool:
@@ -470,14 +626,14 @@ class PythonErrorDriver:
         _ec, out, _e = run(cmd, project_path, min(timeout, 20))
         return bool((out or "").strip())
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
         """`app.services.user` → 词干 `app/services/user` + src-layout 变体 `src/…`。
 
         两个词干都返（`is_internal` 已认这两种布局）——它是**候选**集，任一命中即算owner。
         """
         rel = ref.replace(".", "/").strip("/")
-        return [rel, f"src/{rel}"] if rel else []
+        return [rel, f"src/{rel}"] if rel else None
 
     def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
                         timeout: int, run: RunProbe) -> bool:
@@ -534,8 +690,8 @@ class JvmErrorDriver:
         raise NotImplementedError(
             "JVM 路径由 l1_pipeline._build_blocked_on_unbuilt_internal* 承担（刻意不搬）")
 
-    def ref_tree_paths(self, ref: str, project_path: str, timeout: int,
-                       run: RunProbe) -> list[str]:
+    def ref_tree_paths(self, ref: str, src: str | None, project_path: str,
+                       timeout: int, run: RunProbe) -> list[str] | None:
         raise NotImplementedError(
             "JVM 步骤 4 走 classpath_fqn_key（JVM 类路径命名空间口径，刻意不搬）")
 
@@ -567,7 +723,7 @@ def driver_for(language_key: str | None) -> ErrorDriver | None:
 
 def blocked_on_unbuilt_internal(
     language_key: str | None, build_output: str, project_path: str,
-    timeout: int, run: RunProbe,
+    timeout: int, run: RunProbe, refs_out: list | None = None,
 ) -> tuple[set[str], list[str]]:
     """通用求解器（步骤 1-3）→ `(被阻断的容器集合, 符号级 FQN 列表)`。
 
@@ -577,8 +733,16 @@ def blocked_on_unbuilt_internal(
     ★这个"全或无"是刻意的★ 混合形态下标 BLOCKED 会让 worker 去等一个不存在的生产者，
     而漏标只是退回 FAIL 修复梯——两种错的代价不对称。
 
-    返回的两个值分别喂 `blocked_on_packages` / `blocked_on_classes`（与 JVM 同键同消费链，
-    brain 侧反查生产者与类级 futile 判据零改动）。
+    返回的两个值分别喂 `blocked_on_packages` / `blocked_on_classes`。
+
+    ★注意（复核 CRITICAL-1，尚未闭合）★ 这两个键的 brain 侧消费者
+    （`recovery._producers_of` / `recovery._package_in_baseline` /
+    `failure._derive_missing_type_files`）**写死 Java 点分 FQN → 路径**口径，非 JVM 的 ref
+    进去恒解不开（实测四栈全灭）⇒ 无生产者 + 不在基线 + 推不出该建啥 = 首轮连坐放弃。
+    在那三个消费者按栈解之前，本模块产出的 ref 只对 worker 侧退避有意义。
+
+    `refs_out`：可选 out 参数，回填**解析并反解后**的 `MissingRef` 列表——步骤 4 需要其中的
+    `src` 来解相对导入（TS/JS 的 `./x` 相对报错文件），拿裸 ref 字符串解不出。
     """
     drv = driver_for(language_key)
     if drv is None or drv.key in _SELF_HANDLED_KEYS:
@@ -586,9 +750,16 @@ def blocked_on_unbuilt_internal(
     refs = drv.parse_missing(build_output)
     if not refs:
         return set(), []
+    # ★复核 MED-6★ 探针放大：10 个 ref 实测 30 次调用，其中 20 次是重复读同一个 go.mod
+    # （is_internal 与 present_in_tree 各读一次）。E2E 下每次是一趟远程沙箱 run_command，
+    # 且本函数处在**失败路径**上。同一命令在一次求解内结果不变 → 按 (cmd, path) memo。
+    # 只活在本次调用的闭包里，绝不跨任务缓存（工程树会变）。
+    run = _memoized(run)
     resolve = getattr(drv, "resolve_ref", None)
     if resolve is not None:
         refs = [resolve(r, project_path, timeout, run) for r in refs]
+    if refs_out is not None:
+        refs_out.extend(refs)          # 步骤 4 要 src 解相对导入（裸 ref 解不出）
     containers: set[str] = set()
     symbols: list[str] = []
     for r in refs:
@@ -606,9 +777,9 @@ def blocked_on_unbuilt_internal(
 
 
 def produced_in_scope(
-    language_key: str | None, refs: set[str], scope_files: list[str],
+    language_key: str | None, refs, scope_files: list[str],
     project_path: str, timeout: int, run: RunProbe,
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
     """步骤 4 的**非 JVM 半边**：`refs` 里哪些容器的生产者就在本子任务 scope 内。
 
     ★为什么必须有这个函数★ 步骤 4 的判据（"worker 无权等自己"）刻意留在共用层，但共用层
@@ -618,23 +789,36 @@ def produced_in_scope(
     （#10 幽灵生产者，烧满退避阶梯）。X-C3 之前非 JVM 到不了裁决点，缺口潜伏无害；X-C3
     把它激活了。这是"复用单一事实源 ≠ 复用其消费契约"的又一实例——判据共享，实现必须分栈。
 
-    返回命中的容器 ref 集（**原样 ref**，非路径——调用方要拿它做集合差）。
-    未收录栈 / self-handled / 取不到词干 → 空集（fail-closed 维持 BLOCKED 语义，与
-    共用层 `classpath_fqn_key` 不可用时的 fail-open 取向一致：宁可多等一轮，不误判 capability）。
+    `refs` 接受 `MissingRef` 序列（需要 `src` 解相对导入）或裸 ref 字符串序列（后者对
+    TS/JS 会拿不到报错文件 ⇒ 落 UNKNOWN，不静默当根相对）。
+
+    返回 `(自产的 ref 集, 归属解不出的 ref 集)`。
+    ★三态的理由（复核 CRITICAL-2）★ 原实现只返自产集，"解不出"与"确定不自产"塌成同一个
+    空集 → 上层把它当"外部生产者"→ 判 BLOCKED = worker 去等自己。现在解不出单独回传，
+    由裁决层决定（见 `decide_unbuilt_internal_verdict`：有 UNKNOWN 就不敢断言外部生产者）。
     """
     drv = driver_for(language_key)
-    if drv is None or drv.key in _SELF_HANDLED_KEYS or not refs or not scope_files:
-        return set()
+    if drv is None or drv.key in _SELF_HANDLED_KEYS or not refs:
+        return set(), set()
     get_paths = getattr(drv, "ref_tree_paths", None)
     if get_paths is None:
-        return set()
+        return set(), set()
     rels = [str(f) for f in scope_files if str(f).strip()]
     own: set[str] = set()
-    for ref in refs:
+    unresolved: set[str] = set()
+    for r in refs:
+        ref = r.ref if isinstance(r, MissingRef) else str(r)
+        src = r.src if isinstance(r, MissingRef) else None
+        if not ref:
+            continue
         try:
-            stems = get_paths(ref, project_path, timeout, run) or []
-        except Exception:  # noqa: BLE001 — 路径映射异常不得阻断裁决，退回"非自产"
+            stems = get_paths(ref, src, project_path, timeout, run)
+        except Exception:  # noqa: BLE001 — 路径映射异常 → 归属未知（绝不当"非自产"）
+            unresolved.add(ref)
+            continue
+        if stems is None:
+            unresolved.add(ref)
             continue
         if any(_stem_matches(f, s) for s in stems for f in rels):
             own.add(ref)
-    return own
+    return own, unresolved

@@ -1879,7 +1879,7 @@ def _attempt_internal_import_drift_repair(
 def _missing_internal_produced_in_scope(
     scope, blocked_pkgs: set[str], blocked_cls: list[str],
     *, language_key: str | None = None, project_path: str | None = None,
-    timeout: int = 60, run=None,
+    timeout: int = 60, run=None, driver_refs=None, unresolved_out: set | None = None,
 ) -> tuple[set[str], set[str]]:
     """R67L-B2（22号文批次2 H-3a）：缺失内部包/类中【生产者在本子任务自己 scope 内】的子集。
 
@@ -1907,12 +1907,22 @@ def _missing_internal_produced_in_scope(
             from swarm.worker.l1_error_drivers import produced_in_scope
             _files = (list(getattr(scope, "create_files", None) or [])
                       + list(getattr(scope, "writable", None) or []))
-            own_pkgs |= produced_in_scope(
-                language_key, set(blocked_pkgs), _files, project_path, timeout, run)
+            _own, _unres = produced_in_scope(
+                language_key, driver_refs or list(blocked_pkgs), _files,
+                project_path, timeout, run)
+            own_pkgs |= _own
+            if unresolved_out is not None:
+                unresolved_out.update(_unres)
             # 符号级：容器自产 ⇒ 该容器下的符号也归本子任务（容器是它建的，符号缺就是它漏建）
+            # ★复核 LOW-2★ 用词干匹配而非裸 startswith——后者会让容器 `svc` 吞掉
+            # `svcutil.Foo`（正是 `_stem_matches` 存在的理由，在为它建原语的地方留裸
+            # startswith 就是复发种子）。符号 FQN 用栈分隔符拼，故按前缀+分隔符判。
+            from swarm.worker.l1_error_drivers import driver_for as _dfor
+            _sep = getattr(_dfor(language_key), "symbol_sep", ".") or "."
             for _c in blocked_cls:
-                if any(str(_c).startswith(f"{p}") for p in own_pkgs):
-                    own_cls.add(str(_c))
+                _cs = str(_c)
+                if any(_cs == p or _cs.startswith(p + _sep) for p in own_pkgs):
+                    own_cls.add(_cs)
         except Exception as _exc:  # noqa: BLE001 — driver 半边异常绝不阻断裁决
             logger.warning(
                 "[L1.2.1] X-C3 步骤4 driver 半边异常（退回 JVM 通道，维持 BLOCKED 语义）: %r",
@@ -1945,7 +1955,7 @@ def decide_unbuilt_internal_verdict(
     details: dict, scope, blocked_pkgs: set[str], blocked_cls: list[str],
     *, cmd: str, stage: str, output: str = "",
     language_key: str | None = None, project_path: str | None = None,
-    timeout: int = 60, run=None,
+    timeout: int = 60, run=None, driver_refs=None,
 ) -> bool:
     """步骤 4+5 的**共用裁决尾**：BLOCKED（返 True）还是落 FAIL 修复梯（返 False）。
 
@@ -1967,10 +1977,21 @@ def decide_unbuilt_internal_verdict(
     # 不可修通道、fix 循环短路（worker 无权"等"自己）。落公共 FAIL 尾进修复梯。
     # X-C3：非 JVM 栈必须传 language_key/run，否则步骤 4 只有 JVM 通道 = 对 go/rust/node/
     # python 恒空过（fail-open，去等永不到来的生产者）。
+    _unres: set[str] = set()
     _own_pkgs, _own_cls = _missing_internal_produced_in_scope(
         scope, blocked_pkgs, blocked_cls,
         language_key=language_key, project_path=project_path,
-        timeout=timeout, run=run)
+        timeout=timeout, run=run, driver_refs=driver_refs, unresolved_out=_unres)
+    if _unres:
+        # ★复核 CRITICAL-2 的裁决半边★ 归属**解不出**时不敢断言"生产者在外部"——
+        # 判 BLOCKED 就可能让 worker 去等自己（#10 幽灵生产者，烧满退避阶梯）；落 FAIL
+        # 修复梯只是退回现状。两侧代价不对称，故 UNKNOWN 一律不 BLOCKED（fail-closed）。
+        details["blocked_owner_unresolved"] = sorted(_unres)[:8]
+        logger.warning(
+            "[L1.%s] X-C3 缺失标识的归属解不出（%s）→ 不敢断言外部生产者，落 FAIL 修复梯"
+            "（误判 BLOCKED 会让 worker 去等自己）",
+            "2.1" if stage == "build" else "2", sorted(_unres)[:4])
+        return False
     _ext_pkgs = blocked_pkgs - _own_pkgs
     _ext_cls = [c for c in blocked_cls if c not in _own_cls]
     if not _ext_pkgs and not _ext_cls:
@@ -4733,22 +4754,30 @@ def run_l1_pipeline(
             from swarm.worker.l1_error_drivers import blocked_on_unbuilt_internal
             _c_lang = normalize_language_key((project_stack or {}).get("backend"))
             _c_text = _compile_raw.get("text") or compile_msg or ""
+            _c_refs: list = []
             _c_pkgs, _c_syms = blocked_on_unbuilt_internal(
-                _c_lang, _c_text, project_path, timeout, _run_check_split)
+                _c_lang, _c_text, project_path, timeout, _run_check_split,
+                refs_out=_c_refs)
             if _c_pkgs:
                 details["blocked_via_error_driver"] = _c_lang
                 if decide_unbuilt_internal_verdict(
                         details, getattr(subtask, "scope", None), _c_pkgs, _c_syms,
                         cmd="(L1.2 compile)", stage="compile", output=_c_text,
                         language_key=_c_lang, project_path=project_path,
-                        timeout=timeout, run=_run_check_split):
+                        timeout=timeout, run=_run_check_split,
+                        driver_refs=_c_refs):
                     logger.warning(
                         "[L1.2] X-C3 %s 栈编译闸缺【尚未建出的项目内部标识】(error driver 判据)"
                         " → 与 JVM build 闸同口径标 BLOCKED 退避: containers=%s symbols=%s",
                         _c_lang, sorted(_c_pkgs)[:6], _c_syms[:6])
                     return True, details
         except Exception as _xc3_exc:  # noqa: BLE001 — 归因失败绝不改变原判（照常 FAIL）
-            logger.debug("[L1.2] X-C3 编译闸归因跳过(异常,不致命): %r", _xc3_exc)
+            # ★复核 MED-4★ 原为 debug 级 + 零机读键 ⇒ X-C3 在 compile 闸整体死掉时与
+            # "真没有内部缺失"不可分（硬检查四："空返回/缺席必须机读可辨"，norms 层实测
+            # 死 12 天跨 5+ 轮全零无信号就是这么来的）。降级路径至少一个机读键 + 一次 WARNING。
+            details["xc3_compile_attrib_error"] = f"{type(_xc3_exc).__name__}: {_xc3_exc}"[:200]
+            logger.warning(
+                "[L1.2] X-C3 编译闸归因异常（本轮不判 BLOCKED，照常 FAIL）: %r", _xc3_exc)
         return False, details
 
     # ── L1.2.1 harness.build_command 编译闸门（Java/Go/Rust 等需工具链语言）──
@@ -5045,29 +5074,42 @@ def run_l1_pipeline(
                 # 或已在树里 → 全盘不标）。★JVM 恒走上面的专用链★——它的 driver 是 self-handled、
                 # 通用求解器对 java 恒返空，故 **Java 路径逐字节不变**（唯一跑过 E2E 的栈）。
                 _xc3_lang: str | None = None
+                _xc3_refs: list = []
                 if not _blocked_pkgs:
-                    from swarm.brain.nodes.runtime_smoke import normalize_language_key
-                    from swarm.worker.l1_error_drivers import (
-                        blocked_on_unbuilt_internal as _xc3_solve,
-                    )
-                    _xc3_lang = normalize_language_key(
-                        (project_stack or {}).get("backend"))
-                    _xc3_pkgs, _xc3_syms = _xc3_solve(
-                        _xc3_lang, b_out, project_path, timeout, _run_check_split)
-                    if _xc3_pkgs:
-                        details["blocked_via_error_driver"] = _xc3_lang
-                        _blocked_pkgs = _xc3_pkgs
-                        _blocked_cls = _xc3_syms
+                    # ★复核 MED-5★ 必须包 try：本段有 import + 沙箱探针 + 正则，异常会逃出
+                    # run_l1_pipeline（相邻的 #113 全角预扫、module-reg 对账、L1.2 同族调用点
+                    # 都包了 try——本处原先是这条约定上的唯一裸奔者）。
+                    try:
+                        from swarm.brain.nodes.runtime_smoke import normalize_language_key
+                        from swarm.worker.l1_error_drivers import (
+                            blocked_on_unbuilt_internal as _xc3_solve,
+                        )
+                        _xc3_lang = normalize_language_key(
+                            (project_stack or {}).get("backend"))
+                        _xc3_pkgs, _xc3_syms = _xc3_solve(
+                            _xc3_lang, b_out, project_path, timeout, _run_check_split,
+                            refs_out=_xc3_refs)
+                        if _xc3_pkgs:
+                            details["blocked_via_error_driver"] = _xc3_lang
+                            _blocked_pkgs = _xc3_pkgs
+                            _blocked_cls = _xc3_syms
+                            logger.warning(
+                                "[L1.2.1] X-C3 %s 栈缺【尚未建出的项目内部标识】(error driver "
+                                "判据) → 与 JVM 同口径标 BLOCKED 退避: containers=%s symbols=%s",
+                                _xc3_lang, sorted(_xc3_pkgs)[:6], _xc3_syms[:6])
+                    except Exception as _xc3_bexc:  # noqa: BLE001 — 归因失败不改原判
+                        details["xc3_build_attrib_error"] = (
+                            f"{type(_xc3_bexc).__name__}: {_xc3_bexc}")[:200]
                         logger.warning(
-                            "[L1.2.1] X-C3 %s 栈缺【尚未建出的项目内部标识】(error driver 判据) "
-                            "→ 与 JVM 同口径标 BLOCKED 退避: containers=%s symbols=%s",
-                            _xc3_lang, sorted(_xc3_pkgs)[:6], _xc3_syms[:6])
+                            "[L1.2.1] X-C3 构建闸归因异常（本轮不判 BLOCKED，照常 FAIL）: %r",
+                            _xc3_bexc)
                 if decide_unbuilt_internal_verdict(
                         details, getattr(subtask, "scope", None),
                         _blocked_pkgs, _blocked_cls,
                         cmd=build_cmd, stage="build", output=b_out,
                         language_key=_xc3_lang, project_path=project_path,
-                        timeout=timeout, run=_run_check_split):
+                        timeout=timeout, run=_run_check_split,
+                        driver_refs=_xc3_refs):
                     return True, details
                 details["build_failed"] = build_cmd
                 # #113 诊断：构建失败时预扫改动源文件的全角 CJK 标点（NVFP4 腐坏，javac illegal
