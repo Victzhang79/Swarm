@@ -305,6 +305,8 @@ def test_xh8_jvm_repair_signal_requires_real_evidence():
 # X-H1 + N-4 + N-2：_derive_full_build_command 多栈化 + 跨栈污染
 # ══════════════════════════════════════════════
 
+_PY_COMPILEALL = ("python3 -m compileall -q -x '(^|/)(\\.venv|venv|node_modules|vendor|\\.git|build|dist|target|__pycache__)(/|$)' .")
+
 _XH1_CASES = [
     # X-H1：npm 改 .js/.jsx/.vue —— 原先只认 .ts/.tsx+tsconfig ⇒ 这些形态零构建闸
     ("npm-js", {"package.json": '{"scripts":{"build":"vite build"}}', "src/a.js": "x"},
@@ -317,22 +319,25 @@ _XH1_CASES = [
     ("ts-prefers-tsc", {"tsconfig.json": "{}", "package.json": '{"scripts":{"build":"x"}}',
                         "src/a.ts": "x"}, ["src/a.ts"], "tsc --noEmit"),
     # N-4：python 原先**没有任何分支**
+    # 复核 M-2：命令带 `-x` 排除依赖树（`.venv` 里的第三方源码会让闸永久冤枉）
     ("py-pyproject", {"pyproject.toml": "[project]", "app/a.py": "x"},
-     ["app/a.py"], "python3 -m compileall -q ."),
+     ["app/a.py"], _PY_COMPILEALL),
     ("py-requirements", {"requirements.txt": "flask", "app/a.py": "x"},
-     ["app/a.py"], "python3 -m compileall -q ."),
+     ["app/a.py"], _PY_COMPILEALL),
     ("py-setuppy", {"setup.py": "from setuptools import setup", "app/a.py": "x"},
-     ["app/a.py"], "python3 -m compileall -q ."),
+     ["app/a.py"], _PY_COMPILEALL),
     # N-2：go.work 多模块仓
     ("go-work", {"go.work": "use ./a\n", "a/go.mod": "module a", "a/m.go": "package a"},
      ["a/m.go"], "go build ./..."),
     # X-H1：其余栈
     ("csharp-root", {"Api.csproj": "<Project/>", "A.cs": "class A{}"},
      ["A.cs"], "dotnet build --nologo -v q"),
+    # 复核 M-5：不把 warning 致命化——既有工程一片 warning 会让闸每轮判死，且混淆
+    # "代码质量"与"能不能编译"（其余栈的 go build/cargo build/dotnet build 都不这么做）
     ("elixir", {"mix.exs": "defmodule X do end", "lib/a.ex": "x"},
-     ["lib/a.ex"], "mix compile --warnings-as-errors"),
+     ["lib/a.ex"], "mix compile"),
     ("dart", {"pubspec.yaml": "name: x", "lib/a.dart": "x"},
-     ["lib/a.dart"], "dart analyze"),
+     ["lib/a.dart"], "dart analyze --no-fatal-warnings"),
     # 回归臂：JVM 基线逐字节不变
     ("regress-maven", {"pom.xml": "<project/>", "src/main/java/A.java": "class A{}"},
      ["src/main/java/A.java"], "mvn -q compile"),
@@ -394,8 +399,164 @@ def test_xh1_manifest_present_local_matches_sandbox_semantics(tmp_path):
     沙箱是 `find -maxdepth 3 \\( -name a -o -name b \\)`：递归到深度 3 且 `-name` 支持 glob。
     原本地实现只看工程根、且把 `*.csproj` 当字面名 ⇒ 子目录清单与整个 C# 栈在本地判 False，
     而沙箱判 True ⇒ **测试在本地绿而生产另一套行为**（本战役反复吃的形态）。"""
-    _tree(tmp_path, {"tools/go.mod": "module t", "src/Api.csproj": "<Project/>",
-                     "deep/a/b/far.mod": "x"})
+    _tree(tmp_path, {"tools/go.mod": "module t", "src/Api.csproj": "<Project/>"})
     assert lp._manifest_present(("go.mod",), str(tmp_path)) is True, "子目录清单漏判"
     assert lp._manifest_present(("*.csproj",), str(tmp_path)) is True, "glob 不生效"
     assert lp._manifest_present(("nope.toml",), str(tmp_path)) is False
+    # ★复核 M-4★ 上面两个正例都在**深度 2**（`_d=1` 就满足）⇒ 深度上界根本没被断言。
+    # 沙箱是 `find -maxdepth 3`，故必须钉住"深度 3 命中、深度 4 不命中"这条边界，
+    # 否则 `range(1,3)` 写成 `range(1,2)` 也照旧全绿（夹具形状没编码边界）。
+    _tree(tmp_path, {"a/b/deep3.toml": "x", "a/b/c/deep4.toml": "x",
+                     "a/b/d3.csproj": "<Project/>", "a/b/c/d4.csproj": "<Project/>"})
+    assert lp._manifest_present(("deep3.toml",), str(tmp_path)) is True, "深度 3 漏判"
+    assert lp._manifest_present(("deep4.toml",), str(tmp_path)) is False, "深度 4 竟命中"
+    assert lp._manifest_present(("d3.csproj",), str(tmp_path)) is True
+    # glob 分支的深度覆盖必须与非 glob 分支一致
+    assert lp._manifest_present(("d4.csproj",), str(tmp_path)) is False, \
+        "glob 分支的深度上界与非 glob 分支不一致"
+
+
+# ══════════════════════════════════════════════
+# reviewer 复核整改（C-1/C-2/H-3/H-4/M-2/M-3/M-7）
+# ══════════════════════════════════════════════
+
+def test_c1_php_ruby_gate_actually_checks_every_modified_file(tmp_path):
+    """★复核 C-1★ 原写法 `ruby -c $(git ls-files '*.rb' | head -200)` 是**必然假过**，三重叠加：
+    ① 沙箱 `/workspace` 不是 git 仓库（`.git` 在 `_SRC_EXCLUDE_DIRS`、`git archive` 也不带）
+       ⇒ `git ls-files` 失败、命令替换为空；
+    ② `ruby -c`/`php -l` **零参数读 stdin** ⇒ 空 stdin ⇒ `Syntax OK` **退出 0**；
+    ③ `ruby -c a.rb b.rb` **只检查 a.rb**（实测 b.rb 有语法错仍 rc=0）。
+    后果比改动前更坏：改前是 `build_skipped` 留痕，改后闸"跑了"且 PASS，**零机读键说明什么都没查**。
+    """
+    import subprocess
+    root = _tree(tmp_path, {"Gemfile": 'source "x"', "ok.rb": "puts 1\n",
+                            "bad.rb": "def x(\n"})
+    cmd_ok = lp._derive_full_build_command(str(root), ["ok.rb"], None)
+    assert "git ls-files" not in cmd_ok, "仍依赖 git（沙箱里不是 git 仓库）"
+    assert subprocess.run(["sh", "-c", cmd_ok], cwd=root, capture_output=True,
+                          stdin=subprocess.DEVNULL).returncode == 0
+    # ★坏文件排在第二个★ 原实现只查第一个参数 ⇒ 这条能抓到那个缺陷
+    cmd_bad = lp._derive_full_build_command(str(root), ["ok.rb", "bad.rb"], None)
+    assert subprocess.run(["sh", "-c", cmd_bad], cwd=root, capture_output=True,
+                          stdin=subprocess.DEVNULL).returncode != 0, \
+        "第二个文件的语法错没被抓到 ⇒ 逐文件检查没落地"
+
+
+def test_c1_no_gate_when_no_such_source_modified(tmp_path):
+    """只改了非 PHP 文件时不该出 PHP 命令（`for f in ; do` 是空循环＝假过）。"""
+    root = _tree(tmp_path, {"composer.json": "{}", "README.md": "x"})
+    assert lp._derive_full_build_command(str(root), ["README.md"], None) == ""
+
+
+_C2_CASES = [
+    ("java 子任务", {"pom.xml": "<project/>", "tools/pyproject.toml": "[project]",
+                     "src/main/java/A.java": "class A{}"}, ["src/main/java/A.java"]),
+    ("前端子任务", {"pom.xml": "<project/>", "backend/pyproject.toml": "[project]",
+                    "web/src/a.js": "x"}, ["web/src/a.js"]),
+]
+
+
+@pytest.mark.parametrize("name,files,mods", _C2_CASES, ids=[c[0] for c in _C2_CASES])
+def test_c2_nested_pyproject_does_not_hijack_other_stacks(name, files, mods, tmp_path):
+    """★复核 C-2★ python 测试兜底原先**没有语言守卫**且排在最前 ⇒ 任何深度≤3 的
+    `pyproject.toml`（含 `tools/`、`node_modules/**`）劫持**所有栈**的测试闸 ⇒ java/前端子任务
+    被下发根级 `pytest` ⇒ 收集不到用例 rc=5 ⇒ 非 infra ⇒ **硬 FAIL**（sticky，换模型同死）。
+    而 `backend/pyproject.toml` + `frontend/` 正是本战役的目标形态。"""
+    root = _tree(tmp_path, files)
+    got = lp._guess_test_cmd(str(root), mods)
+    assert got is None or "pytest" not in got, f"非 python 子任务被下发了 pytest: {got!r}"
+
+
+def test_c2_python_subtask_still_gets_pytest(tmp_path):
+    """反向臂：真改 `.py` 仍要拿到 pytest（别把守卫拧成恒关）。"""
+    root = _tree(tmp_path, {"pyproject.toml": "[project]", "app/a.py": "x"})
+    assert lp._guess_test_cmd(str(root), ["app/a.py"]) == "python -m pytest -q --maxfail=1"
+
+
+def test_h3_ts_arm_does_not_kill_later_fallbacks(tmp_path):
+    """★复核 H-3★ `.ts` 臂原来是 `return ... else None`：没有 `scripts.test` 时**直接 return
+    None**，把后面 go/rust/python 的工程级兜底整块掐死 ⇒ 混栈子任务静默退回 `test_skipped`
+    ＝跳过即通过，正是 X-H2 要治的假过。"""
+    root = _tree(tmp_path, {"package.json": '{"name":"x"}',      # 无 scripts.test
+                            "src/a.ts": "x", "src/a.test.ts": "x",
+                            "go.mod": "module x", "svc/user.go": "package svc"})
+    assert lp._guess_test_cmd(str(root), ["src/a.ts", "svc/user.go"]) == "go test ./...", \
+        ".ts 臂的 return 掐死了 go 兜底"
+
+
+_H4_COMPOSITE = [("Java 17", "java"), ("Go 1.21 service", "go"),
+                 ("Python 3.11", "python"), ("Rust (edition 2021)", "rust"),
+                 ("Kotlin 1.9 / JVM 17", "java")]
+
+
+@pytest.mark.parametrize("raw,fam", _H4_COMPOSITE, ids=[r for r, _ in _H4_COMPOSITE])
+def test_h4_composite_form_matches_family_key_itself(raw, fam):
+    """★复核 H-4★ 复合写法必须**连族键本身一起搜**——`_TEMPLATE_LANG_ALIASES["java"]` 里没有
+    `"java"`，原实现只搜别名 ⇒ `"Java 17"`/`"Python 3.11"` 这些**最常见**的形态全部归不出族
+    → 回退 default（没有 JDK/Go 工具链）＝X-H7 的病原样存在。
+    ★既有测试之所以绿是夹具形状掩盖★：每条复合写法都恰好命中了一个非族键别名
+    （`"Spring Boot (java)"`→`spring`、`"Gin (go)"`→`gin`）。"""
+    assert SandboxConfig.canonical_template_language(raw) == fam
+
+
+def test_m2_compileall_excludes_dependency_trees(tmp_path):
+    """★复核 M-2★ `compileall` 默认递归整棵树，会钻进 `.venv`/`node_modules` 里的第三方源码
+    （实测：`.venv` 下一个 py2 语法文件就让整个闸 rc=1）⇒ 永久冤枉。"""
+    import subprocess
+    import sys as _sys
+    root = _tree(tmp_path, {"pyproject.toml": "[project]", "app/a.py": "x = 1\n",
+                            ".venv/lib/py/old.py": "print 'py2'\n"})
+    cmd = lp._derive_full_build_command(str(root), ["app/a.py"], None)
+    assert "-x" in cmd, "没有排除模式 ⇒ 会编译依赖树"
+    real = cmd.replace("python3", _sys.executable)
+    assert subprocess.run(["sh", "-c", real], cwd=root,
+                          capture_output=True).returncode == 0, ".venv 未被排除"
+    # 反向臂：工程内真语法错必须仍被抓（别把闸拧成恒过）
+    (root / "app" / "bad.py").write_text("def f(\n")
+    assert subprocess.run(["sh", "-c", real], cwd=root,
+                          capture_output=True).returncode != 0, "闸没牙了"
+
+
+def test_m3_both_probes_exclude_dependency_trees(tmp_path):
+    """★复核 M-3★ 两个探针必须同口径：`_manifest_present` 若从 `node_modules/**` 判 True 而
+    `_manifest_dir` 返 None ⇒ `at()` 退回根级命令 ⇒ `dotnet build` 在没有工程文件的根上跑 ⇒
+    127 → BLOCKED，正是本批要治的死循环。"""
+    root = _tree(tmp_path, {"node_modules/foo/package.json": "{}",
+                            "vendor/x/Gemfile": "source 'x'",
+                            "target/gen/pom.xml": "<project/>",
+                            ".venv/x/pyproject.toml": "[project]"})
+    for names in (("package.json",), ("Gemfile",), ("pom.xml",), ("pyproject.toml",)):
+        assert lp._manifest_present(names, str(root)) is False, f"{names} 从依赖树里判 True"
+        assert lp._manifest_dir(names, str(root)) is None
+
+
+_M7_WRAPPED = ["cd sub && mvn -q compile", "sh -c 'mvn -q compile'",
+               "bash -c \"dotnet build\"", "env FOO=1 mvn -q compile",
+               "cd web && npm ci"]
+
+
+@pytest.mark.parametrize("cmd", _M7_WRAPPED)
+def test_m7_shell_wrapper_prefix_does_not_bypass_gate(cmd, tmp_path):
+    """★复核 M-7★ `cd`/`sh`/`env` 都在"无需清单"白名单里，而工具取的是 `tokens[0]` ⇒ 实测
+    `cd sub && mvn -q compile` 在空项目上判 **applicable=True** ⇒ X-H6 那道闸被一个前缀绕过。
+    而本批的 `at()` 自己就**会产出** `cd <dir> && <cmd>` 形态，所以这是自伤。"""
+    assert lp._build_cmd_applicable(cmd, str(tmp_path)) is False, \
+        f"{cmd!r} 被前缀绕过了清单闸"
+
+
+def test_m7_wrapped_command_still_passes_when_manifest_present(tmp_path):
+    """反向臂：清单在场时包装形态仍必须适用（别把闸拧成对 `cd` 恒拒——本批自己会产出它）。"""
+    root = _tree(tmp_path, {"sub/pom.xml": "<project/>"})
+    assert lp._build_cmd_applicable("cd sub && mvn -q compile", str(root)) is True
+
+
+def test_c1_php_gate_shape_without_requiring_php_installed(tmp_path):
+    """php 未必装在测试机上，故只断**命令形态**：不许依赖 git、必须逐文件、必须 `|| exit 1`。
+    （C-1 的三重缺陷里，前两条只看形态就能钉住。）"""
+    root = _tree(tmp_path, {"composer.json": "{}", "a.php": "<?php echo 1;",
+                            "b.php": "<?php echo 2;"})
+    cmd = lp._derive_full_build_command(str(root), ["a.php", "b.php"], None)
+    assert cmd, "php 工程派生不出命令"
+    assert "git ls-files" not in cmd, "仍依赖 git（沙箱 /workspace 不是 git 仓库）"
+    assert "for f in" in cmd and "|| exit 1" in cmd, "不是逐文件检查 ⇒ 只会查第一个"
+    assert "a.php" in cmd and "b.php" in cmd, "改动文件没全进命令"

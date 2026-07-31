@@ -647,10 +647,15 @@ class SandboxConfig(BaseSettings):
         for fam, aliases in _TEMPLATE_LANG_ALIASES.items():
             if lang in aliases:
                 return fam
-        # 复合写法（"Spring Boot (java)"/"TypeScript + Vue"）：按词边界找已知别名
+        # 复合写法（"Spring Boot (java)"/"TypeScript + Vue"/"Java 17"）：按词边界找已知词。
+        # ★复核 H-4★ 必须**连族键本身一起搜**——`_TEMPLATE_LANG_ALIASES["java"]` 里没有 `"java"`，
+        # 原实现只搜别名 ⇒ `"Java 17"`/`"Go 1.21 service"`/`"Python 3.11"` 这些**最常见**的自由文本
+        # 形态全部归不出族 → 回退 default（没有 JDK/Go 工具链）＝X-H7 的病原样存在。
+        # 既有测试之所以绿，是因为夹具里每条复合写法都恰好命中了一个**非族键**别名
+        # （`"Spring Boot (java)"` 命中 `spring`、`"Gin (go)"` 命中 `gin`）——夹具形状掩盖了缺口。
         import re as _re
         for fam, aliases in _TEMPLATE_LANG_ALIASES.items():
-            for a in aliases:
+            for a in (fam, *aliases):
                 if _re.search(rf"\b{_re.escape(a)}\b", lang):
                     return fam
         return ""

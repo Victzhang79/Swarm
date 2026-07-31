@@ -2680,20 +2680,29 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     #   · `*.csproj`/`*.sln` 本地**永远**False ⇒ C# 整栈在本地路径零构建闸。
     # 两个环境对同一棵树给出不同答案＝测试在本地绿而生产另一套行为（本战役反复吃的形态）。
     _root = Path(project_path)
+
+    def _ok(p: Path) -> bool:
+        # ★复核 M-3★ 与 `_manifest_dir` 同口径排除依赖树/产物目录。两个探针若不一致，
+        # 会出现 `has("*.csproj")` 从 `node_modules/**` 判 True、而 `_manifest_dir` 返 None ⇒
+        # `at()` 退回根级命令 ⇒ `dotnet build` 在没有工程文件的根上跑 ⇒ 127 → BLOCKED，
+        # 正是本批要治的死循环。
+        if not p.is_file():
+            return False
+        try:
+            rel = p.relative_to(_root)
+        except ValueError:
+            return False
+        return not any(seg in _SRC_EXCLUDE_DIRS_FOR_DERIVE for seg in rel.parts)
+
     for m in manifests:
+        if _ok(_root / m):                    # 根级（含字面名）
+            return True
         if any(ch in m for ch in "*?["):
-            for _p in _root.glob(m):          # 根级 glob
-                if _p.is_file():
-                    return True
-            for _d in range(1, 3):            # 深度 2..3，与沙箱 maxdepth 3 对齐
-                if any(p.is_file() for p in _root.glob("/".join(["*"] * _d) + "/" + m)):
-                    return True
-        else:
-            if os.path.isfile(os.path.join(project_path, m)):
+            if any(_ok(x) for x in _root.glob(m)):
                 return True
-            for _d in range(1, 3):
-                if any(p.is_file() for p in _root.glob("/".join(["*"] * _d) + "/" + m)):
-                    return True
+        for _d in range(1, 3):                # 深度 2..3，与沙箱 maxdepth 3 对齐
+            if any(_ok(x) for x in _root.glob("/".join(["*"] * _d) + "/" + m)):
+                return True
     return False
 
 
@@ -2922,18 +2931,45 @@ def _derive_full_build_command(
     # 它不查 import（那由 L1.3 的 X-C3 第三调用点兜），但比"什么都不跑"强得多。
     if ext(".py") and (build in ("pip", "poetry", "uv", "python")
                        or has("pyproject.toml", "setup.py", "requirements.txt", "Pipfile")):
-        return "python3 -m compileall -q ."
+        # ★复核 M-2★ `compileall` 默认递归**整棵树**，会钻进 `.venv`/`node_modules`/`vendor`
+        # 里的第三方源码（实测：`.venv` 下放一个 py2 语法文件就让整个闸 rc=1）⇒ 永久冤枉。
+        # `-x` 收正则排除；同时锚到清单目录，别在多语言仓的根上编译全树。
+        return at(("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
+                  "python3 -m compileall -q -x '(^|/)(\\.venv|venv|node_modules|vendor|"
+                  "\\.git|build|dist|target|__pycache__)(/|$)' .")
     # X-H1：C#/PHP/Ruby/Elixir/Dart —— 原先全返 ''。只在**清单在场**时出命令（纪律 2 不臆造）。
     if ext(".cs") and has("*.csproj", "*.sln"):
         return at(("*.csproj", "*.sln"), "dotnet build --nologo -v q")
+    # ★复核 C-1★ PHP/Ruby 原写法 `php -l $(git ls-files '*.php' | head -200)` 是**必然假过**，
+    # 实测两个独立缺陷叠加：
+    #   ① 沙箱 `/workspace` **不是 git 仓库**（`.git` 在 `_SRC_EXCLUDE_DIRS`、`git archive` 也不带）
+    #      ⇒ `git ls-files` 失败、命令替换为空；
+    #   ② `ruby -c` / `php -l` **零参数时读 stdin** ⇒ 空 stdin ⇒ 打印 `Syntax OK`、**退出 0**。
+    #   ③ 更糟：`ruby -c a.rb b.rb` **只检查 a.rb**（实测 b.rb 有语法错仍 rc=0）——即便在 git 仓库里，
+    #      `head -200` 也只查了一个文件。
+    # 后果比改动前**更坏**：改动前 derive 返 `''` → 闸跳过 + 留 `build_skipped` 痕；改后
+    # `build_command_derived` 置位、闸"跑了"、退出 0、**没有任何机读键说明什么都没查**
+    # ⇒ worker 交任意破 PHP/Ruby 都能拿 L1 PASS（硬检查④）。
+    # 治法：不依赖 git、不依赖"全项目枚举"，直接逐个检查**本子任务改动的那些文件**——
+    # 那正是 L1 该管的范围，且确定性、有界、无截断（`|| exit 1` 保证任一失败即失败）。
+    def _per_file(cmd: str, exts: tuple[str, ...]) -> str:
+        files = [f for f in mods if f.endswith(exts)]
+        if not files:
+            return ""
+        quoted = " ".join(shlex.quote(f) for f in files[:100])
+        return f"for f in {quoted}; do {cmd} \"$f\" || exit 1; done"
+
     if ext(".php") and has("composer.json"):
-        return at(("composer.json",), "php -l $(git ls-files '*.php' | head -200)")
+        return _per_file("php -l", (".php",))
     if ext(".rb") and has("Gemfile"):
-        return at(("Gemfile",), "ruby -c $(git ls-files '*.rb' | head -200)")
+        return _per_file("ruby -c", (".rb",))
     if ext(".ex", ".exs") and has("mix.exs"):
-        return at(("mix.exs",), "mix compile --warnings-as-errors")
+        # ★复核 M-5★ 不加 `--warnings-as-errors`：既有工程一片 warning 会让闸每轮判死，且把
+        # "代码质量"混进"能不能编译"（其余栈的 `go build`/`cargo build`/`dotnet build` 都不这么做）。
+        return at(("mix.exs",), "mix compile")
     if ext(".dart") and has("pubspec.yaml"):
-        return at(("pubspec.yaml",), "dart analyze")
+        # 同上：`dart analyze` 默认对 warning 也非零退出 → 显式关掉致命化
+        return at(("pubspec.yaml",), "dart analyze --no-fatal-warnings")
     # round18 P2 治本：纯 pom/无可编译源码子任务——"无 Java 即判负"会返回 None→维持 prior 未通过
     # →BLOCKED 空转（st-30 变体 5065fe04/st-29-2 现场，产物其实 mvn validate 通过）。改走
     # `mvn validate` 给真确定性校验（pom 结构 + reactor 可解析性）——版本缺失/reactor 断裂会
@@ -2947,6 +2983,51 @@ def _derive_full_build_command(
     return ""
 
 
+_CMD_PREFIX_NOISE = frozenset({"cd", "sh", "bash", "zsh", "env", "sudo", "time", "nice"})
+
+
+def _effective_tool_token(tokens: list[str]) -> str:
+    """跳过 shell 包装前缀，取**真正的构建工具**词元。
+
+    ★复核 M-7★ 原实现直接用 `tokens[0]`，而 `cd`/`sh`/`env` 都在"无需清单"白名单里 ⇒
+    实测 `cd sub && mvn -q compile` / `sh -c "mvn -q compile"` 在空项目上都判 **applicable=True**
+    ⇒ X-H6 那道"拒绝明知必失败的命令"整块被一个前缀绕过。而本批的 `at()` 自己就**会产出**
+    `cd <dir> && <cmd>` 形态，所以这条从"外部可达"变成了自伤。
+    判据：逐个跳过噪声词元与 `&&`/`;`/`-c` 之类连接符，取第一个像工具的词。
+    """
+    # `sh -c "mvn -q compile"` 里整条命令是**一个带引号的词元**——用 shlex 拆开才看得见 `mvn`。
+    # 拆不动（引号不闭合等）就退回原 tokens，绝不因解析失败而放行/拒绝得更宽。
+    try:
+        flat: list[str] = []
+        for tok in tokens:
+            flat.extend(shlex.split(tok) if any(q in tok for q in "\"'") else [tok])
+        tokens = flat or tokens
+    except ValueError:
+        pass
+    _skip_next_flag = False
+    for tok in tokens:
+        t = tok.strip().strip("\"'")
+        if not t or t in ("&&", "||", ";", "|", "-c", "--"):
+            continue
+        base = t.rsplit("/", 1)[-1]
+        if base in _CMD_PREFIX_NOISE:
+            _skip_next_flag = True          # `cd <dir>` / `env A=B` 的下一个词是它的实参
+            continue
+        if _skip_next_flag:
+            # `cd sub` 的 `sub`、`env FOO=1` 的赋值——不是工具名，跳过
+            if "=" in t or not t.startswith("-"):
+                _skip_next_flag = False
+                if "=" in t:
+                    continue
+                # `cd sub` 的 sub 之后才是真命令；但若它本身就在工具表里（如 `sudo mvn`），认它
+                if t in _BUILD_TOOL_MANIFESTS or base in _BUILD_TOOL_MANIFESTS:
+                    return t
+                continue
+            continue
+        return t
+    return tokens[0]
+
+
 def _build_cmd_applicable(command: str, project_path: str) -> bool:
     """判断 build/test 命令的工具链工程文件是否存在(沙箱优先)。
 
@@ -2956,7 +3037,7 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
     tokens = command.strip().split()
     if not tokens:
         return False
-    tool = tokens[0]
+    tool = _effective_tool_token(tokens)
     manifests = _BUILD_TOOL_MANIFESTS.get(tool)
     if not manifests:
         # ★X-H6★ 未知工具仍放行（`python`/`pytest` 这类本就不需要清单，fail-closed 会误杀整类），
@@ -4246,15 +4327,27 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
                       f"{_d}{base}.test.js", f"{_d}{base}.spec.js",
                       f"{_d}__tests__/{base}.test.ts", f"{_d}__tests__/{base}.test.js"):
                 if _project_file_exists(c, project_path):
-                    # 有测试文件仍要求 `scripts.test` 在场——否则 `npm test` 必报 Missing script
-                    return "npm test --silent" if _npm_has_test_script(project_path) else None
+                    # 有测试文件仍要求 `scripts.test` 在场——否则 `npm test` 必报 Missing script。
+                    # ★复核 H-3★ 这里原来是 `return ... else None`：没有 test 脚本时**直接 return
+                    # None**，把后面 go/rust/python 的工程级兜底整块掐死 ⇒ 混栈子任务
+                    # （同时改了 `.ts` 与 `.go`）静默退回 `test_skipped`＝跳过即通过，正是 X-H2
+                    # 要治的假过。改成只在**真能出命令**时 return，否则继续往下找。
+                    if _npm_has_test_script(project_path):
+                        return "npm test --silent"
+                    break
         elif fp.endswith(".rs"):
             # Rust 单元测试常内联在源文件里（`#[cfg(test)] mod tests`），文件级探测不可靠；
             # 交下面的工程级兜底（cargo test 对无测试的 crate 是 0 退出，安全）。
             pass
 
     # ② 工程级兜底：只在有确定性证据时出命令
-    if _manifest_present(("pyproject.toml",), project_path):
+    # ★复核 C-2★ 这条原先**没有语言守卫**且排在最前 ⇒ 任何深度≤3 的 `pyproject.toml`
+    # （含 `tools/`、`node_modules/**`）都会劫持**所有栈**的测试闸：java 子任务、前端子任务
+    # 全被下发根级 `pytest` ⇒ 收集不到用例 rc=5 ⇒ `t_ec == 0` 为假 ⇒ 非 infra ⇒ **硬 FAIL**，
+    # sticky 且换模型重试同死。而多栈仓（`backend/pyproject.toml` + `frontend/`）正是本战役的
+    # 目标形态。加守卫：只有真改了 `.py` 才走 python 兜底。
+    if (any(f.endswith(".py") for f in mods)
+            and _manifest_present(("pyproject.toml",), project_path)):
         return "python -m pytest -q --maxfail=1"
     if _manifest_present(("go.mod",), project_path) and any(f.endswith(".go") for f in mods):
         # `go test ./...` 对没有测试文件的包是 `ok ... [no test files]` + 0 退出 ⇒ 安全兜底
