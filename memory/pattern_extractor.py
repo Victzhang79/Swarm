@@ -35,6 +35,11 @@ INFORMATIONAL_DEGRADED_PREFIXES = (
     # ★分档边界★ 证据推出的健康端点返非 2xx 是**真信号**，走
     # `runtime_smoke_degraded_pass:started_health_unverified`，**刻意不在**本白名单里。
     "runtime_smoke_degraded_pass:started_no_health_contract",
+    # ★C-3★「端点应答了但被鉴权/重定向挡住」（401/403/3xx）——HTTP 栈 + 路由 + filter chain
+    # demonstrably 在工作，证据强度**高于** 404；且"健康端点被 Security 保护"是**永久性、
+    # 不可行动**的条件（Spring Boot + actuator + `anyRequest().authenticated()` ＝主力栈常态）。
+    # 走阻断档会让**唯一跑过 E2E 的 JVM 基线** L6 成功学习永久归零。
+    "runtime_smoke_degraded_pass:started_health_gated",
 )
 
 

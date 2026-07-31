@@ -94,6 +94,30 @@ MARK_PORT_RESOLVE_TIER_ANSWERED = "__SMOKE_PORT_RESOLVE_TIER_ANSWERED__"
 # 否则落回 port_* 归因，绝不静默继承）。刻意排除：
 #   `network_anomaly`——消息断言"探活不通"，而反解路径从未探活（会给出自信且错误的归因）；
 #   `inconclusive`——语义正是"什么都没观测到"，该由 port_* 三档接手归因。
+# ★I-2★「依赖没装/包没还原」形态——它们**会级联出伴生的编译/解析错误码**，那些伴生码长得
+# 像代码缺陷但根因是环境。本表在场时，该语言本轮不进类1（见 classify_smoke_outcome）。
+# 与 `_STARTUP_CRASH_PATTERNS` 有意重叠：那张表管"崩溃事实机读可辨"，这张管"别把伴生码当代码错"
+# ——**同一事实、两个消费契约**，故分表而非共用（复用单一事实源 ≠ 复用其消费契约）。
+_DEPENDENCY_ABSENT_PATTERNS: dict[str, tuple[str, ...]] = {
+    "csharp": (
+        r"\berror CS(0246|0234)\b",
+        r"Could not load file or assembly",
+        r"error NU\d{4}",              # NuGet restore 自身的错误码
+    ),
+    "ruby": (
+        r"Could not find gem ",
+        r"Bundler::GemNotFound",
+        r"\bLoadError\b",
+    ),
+    "php": (
+        r"Class \"[^\"]+\" not found",
+        r"Failed opening required",
+    ),
+    "elixir": (
+        r"\*\* \(Mix\) ",
+    ),
+}
+
 _LOG_DERIVED_CLASSIFICATIONS = frozenset({
     "code_error",                   # failed：确定性代码缺陷（H-1 的硬拦通道）
     "startup_crash_unattributed",   # skipped：崩了但归不到具体代码
@@ -193,7 +217,12 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         # 而 `ENV["DATABASE_URL"].split(":")` 在无该 env 的沙箱里恒 nil-deref ＝**环境形态**
         # （go/rust 表刻意把 env 缺失形态放进类2 来化解同一个坑，ruby/dart 当时没有对称保险）。
         # 收窄成"接收者**不是** nil"的真·方法不存在：Ruby 两版格式都印 `for nil`/`for nil:NilClass`。
-        r"undefined method [^\n]{0,80} for (?!nil)",
+        # ★C-1（reviewer 复核）★ 原写 `[^\n]{0,80}` **贪婪且能跨空格**，回溯会把 `(?!nil)`
+        # 落到同一行靠后的**另一个** " for " 上 → nil-deref 又变回 code_error。实证绕过形态：
+        #   `... for nil:NilClass for request /api/users`（Rails rescue 日志惯用法）
+        #   `{"msg":"... for nil:NilClass","tag":"retry for queue default"}`（单行 JSON 日志）
+        # 用 `\S` 收死：方法名不含空格，故量词无法跨过 " for " 前的那个空格去回溯。
+        r"undefined method \S{1,80} for (?!nil)",
         r"\bZeroDivisionError\b",
     ),
     "csharp": (
@@ -221,7 +250,11 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         # **整串开头**，几乎恒不命中。写死锚点＝这一档静默失效。
         r"Error: Expected",
         # 同 F-3：`was called on null` 是 nil-deref（多为缺 env/配置），不判代码错
-        r"NoSuchMethodError(?![^\n]{0,80}called on null)",
+        # ★I-3（reviewer 复核）★ Dart 对 null 接收者有**两套措辞**，原来只排除了一套：
+        #   `The method 'x' was called on null.` / `Class 'Null' has no instance getter 'x'`
+        # 后者与"真·无此方法"（`Class 'Report' has no instance method`）字面同构、只差类名，
+        # 故只能按接收者类名 `'Null'` 排除。
+        r"NoSuchMethodError(?![^\n]{0,90}(called on null|Class 'Null' has no instance))",
         r"is not a subtype of type",
     ),
 }
@@ -375,6 +408,13 @@ _ENV_MISSING_PATTERNS: dict[str, tuple[str, ...]] = {
         r"missing .{0,60}(env|environment) variable",
         r"No such file or directory \(os error 2\)",
         r"environment variable not found",
+        # ★I-4（reviewer 复核）★ `env::var("X").unwrap()` 是 Rust 官方读 env 的标准写法，
+        # panic 打印的是 `VarError` 的 **Debug**（`NotPresent`），而上面那条是 **Display**
+        # → 环境族兜不住 → 类1 的 `unwrap() on Err` 直接判 code_error（把缺 env 冤枉成代码）。
+        # 补 Debug 形态让双命中走 `ambiguous`（保守 skipped）。**类1 那条不动**（既有条目，
+        # 全面收窄 go/rust nil 形态跨范围，转登记册 O-7）。
+        r"\bNotPresent\b",
+        r"\bVarError\b",
     ),
     # ★V-C2★ 各栈**驱动层**连接失败形态——它们的报错里常**不含**字面
     # `Connection refused`（generic 那条抓不到）→ 不补就会落进 code_error/inconclusive，
@@ -383,7 +423,17 @@ _ENV_MISSING_PATTERNS: dict[str, tuple[str, ...]] = {
         # ★F-4（hunter 复核，假过）★ 原写前缀 `SQLSTATE\[` 通吃全域，把 `SQLSTATE[42000]`
         # （SQL 语法错）/`[42S02]`（表不存在）这类**纯代码/迁移缺陷**判成"沙箱没有外部服务"
         # → skipped → auto_accept 放行坏产物。收窄到**连接类** class code。
-        r"SQLSTATE\[(08|28|3D|HY000)",
+        # ★C-2（reviewer 复核，假过）★ `HY000` **不是连接类，是"通用错误"桶**——PDO_SQLITE 把
+        # 所有错误都映射成它（SQLite 无原生 SQLSTATE），MySQL 也把大量非连接错放这里。实证：
+        # `SQLSTATE[HY000]: General error: 1 no such table: users`（worker 漏写 migration）
+        # 原判 env_missing → skipped → auto_accept 放行。而 SQLite 恰是沙箱里**唯一不需要外部
+        # 服务就能真跑**的配置＝最可能实际执行到的那个。故 HY000 必须看**驱动码**再分。
+        r"SQLSTATE\[(08|28|3D)",                    # 连接/鉴权/库不存在：class code 即足够
+        r"SQLSTATE\[57P03",                          # PG cannot_connect_now（DB 正在启动）
+        # MySQL 连接类驱动码；1049=Unknown database（沙箱没建库＝环境，与保留的 `3D`
+        # invalid_catalog_name 同源语义），1045=Access denied 已由 generic 族覆盖。
+        r"SQLSTATE\[HY000\][^\n]{0,40}\[(1049|2002|2003|2005|2006|2013)\]",
+
         r"could not find driver",
     ),
     "ruby": (
@@ -1171,7 +1221,26 @@ def classify_smoke_outcome(
                 #    （norms 层死 12 天无人知的同型）。故走信息性档：留痕可见、不拦 L6。
                 # ★这正是"复用单一事实源 ≠ 复用其消费契约"★——账可以共享，后果不同必须分档。
                 # 顺带：这给 `probe_target_derived` 接上了真消费者（不再只有测试读它）。
-                if health_path_derived:
+                # ★C-3（reviewer 复核）★ 只按 provenance 分档**改到了 JVM 基线**：探活 curl
+                # 不带 `-L`（3xx 原样返回），而 Spring Security `anyRequest().authenticated()`
+                # 下 `/actuator/health` 返 302→/login 或 401 —— actuator 恰是主力栈常态
+                # → 原实现给它扣上阻断性 degraded → `should_write_success` 恒 False →
+                # **唯一跑过 E2E 的栈 L6 成功学习永久归零**（违反"JVM 既有路径行为不变"）。
+                # 且这与 F-2 自己的判据冲突：F-2 说"永久性、不可行动的条件不能走阻断档"，
+                # 而"健康端点被鉴权保护"正是这种条件——我当时只把该推理用在了 derived=False 一支。
+                #
+                # 分档判据改成**证据强度**，不只是 provenance：
+                #  · 401/403/3xx ＝ 端点**应答了**，只是被鉴权/重定向挡住 → HTTP 栈 + 路由 +
+                #    filter chain demonstrably 在工作，比 404 证据更强 → 信息性，不拦 L6。
+                #  · 证据推出的端点返 **404** ＝ 声明了却没注册 → 真信号 → 阻断（唯一阻断档）。
+                #  · 压根没推出端点（探回退 `/`）→ marker 覆盖缺口，非本次降级 → 信息性。
+                if _http_code in ("401", "403"):
+                    _cls_name, _where = ("started_health_gated",
+                                         "健康端点（被鉴权拦截，未读到健康状态）")
+                elif _http_code[:1] == "3":
+                    _cls_name, _where = ("started_health_gated",
+                                         "健康端点（被重定向，未读到健康状态）")
+                elif health_path_derived:
                     _cls_name, _where = ("started_health_unverified",
                                          "证据推导出的健康端点")
                 else:
@@ -1219,6 +1288,22 @@ def classify_smoke_outcome(
     if import_hits:
         details["import_missing_hits"] = [
             {"pattern": p, "symbol": s} for p, s in import_hits]
+
+    # ★I-2（reviewer 复核）★ `code_hits and env_hits → ambiguous` 有兜底，但
+    # `code_hits and crash_hits` **没有**——而我把 CS0246/CS0234（NuGet 未 restore）刻意放进了
+    # 崩溃族。真相：restore 失败会**级联**出伴生错误码——`using Newtonsoft.Json;` 未还原时
+    # 声明处报 CS0246，而表达式处 Roslyn 报 **CS0103**（简单名查找失败）、扩展方法处报 CS1061。
+    # 二者共存是 restore 失败的**常态**，于是类1 的 `\d{4}` 黑名单命中伴生码 → 判 code_error
+    # → 环境冤枉成代码。故：依赖缺失形态在场时，本轮该语言**不进类1**（与 ambiguous 同族的
+    # 保守规则；fail-honest 方向）。
+    _dep_absent_hits = _match_family(_DEPENDENCY_ABSENT_PATTERNS, language_key, log_text)
+    if code_hits and _dep_absent_hits:
+        details["dependency_absent_hits"] = _dep_absent_hits
+        logger.warning(
+            "[RUNTIME_SMOKE] 依赖缺失形态在场(%s) → 代码错误族命中(%s)很可能是它的**级联伴生码**"
+            "（如 NuGet 未 restore 时 CS0246 伴随 CS0103/CS1061），保守不判 code_error",
+            _dep_absent_hits, code_hits[:3])
+        code_hits = []
 
     if code_hits and env_hits:
         logger.warning(

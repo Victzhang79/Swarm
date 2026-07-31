@@ -181,3 +181,39 @@ def test_broad_markers_still_recall_gin_when_no_competition():
     ctx = _accept_design_context({"merged_diff": ROUTE_SEGS["go-gin"]}, None)
     assert "路由/接口承载段优选" in ctx
     assert 'r.GET("/api/users"' in ctx
+
+
+def test_specific_tier_holds_only_low_ambiguity_tokens():
+    """★I-1（reviewer 复核）★ 反向：真路由段只命中**宽档**、噪声只命中**特异档**时也不许饿死。
+
+    我第一版把整张旧表原封不动塞进"特异档"，但其中 `path(`/`path:`/`router.`/`route(`/
+    `routes:` 并非零歧义（`Path(__file__)`、Go `ConfigPath:`、`router.push('/login')`、
+    Laravel 的 `route('users.index')` 全命中）→ config/util 段抢在 Gin/Echo/Chi 之前吃满预算
+    → **恰好抵消 V-H4 对这些栈的修复**。原 `test_specific_markers_outrank_broad_ones_in_budget`
+    是反方向（路由段在特异档、噪声在宽档），测不到这一面。
+    突变判据：把那 5 个 token 移回 `_ROUTE_MARKERS_SPECIFIC`，本条必红。
+    """
+    # 噪声：Go 配置段，只命中（曾经的）特异档 `path:`，且每段撑过 2000 字符
+    noise = "".join(
+        _diff(f"internal/config/cfg{n}.go",
+              # ★字面必须是 `Path:`★ 原写 `ConfigPath{i}:` → 小写后是 `configpath0:`，
+              # **数字把 `path:` 这个 token 隔断了**，夹具从未命中它要命中的东西（突变 R-I1b 证实）
+              "\n".join(f'\tConfigPath: "/etc/app/conf{i}.yaml",  // entry {i}'
+                        for i in range(70)))
+        for n in range(3))
+    # 真路由段：Gin，只命中宽档 `.get("/`
+    diff = noise + ROUTE_SEGS["go-gin"]
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "路由/接口承载段优选" in ctx
+    assert 'r.GET("/api/users"' in ctx, (
+        f"真 Gin 路由段被配置段（含 `Path:`）挤出 evidence —— V-H4 对 Gin/Echo/Chi 的修复被"
+        f"分档抵消（I-1 复发）；ctx 长度={len(ctx)}")
+
+
+def test_ambiguous_legacy_tokens_are_not_in_specific_tier():
+    """接线事实：那 5 个歧义 token 必须不在特异档（断的是档位归属，不是字面量清单）。"""
+    from swarm.brain.nodes.verify import _ROUTE_MARKERS_SPECIFIC as SP
+    for probe in ["Path(__file__).parent", 'ConfigPath: "/etc/app"',
+                  "router.push('/login')", "route('users.index')"]:
+        assert not [m for m in SP if m in probe.lower()], (
+            f"特异档命中了非路由代码：{probe} → {[m for m in SP if m in probe.lower()]}")

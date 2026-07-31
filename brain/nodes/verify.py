@@ -1331,10 +1331,9 @@ _ROUTE_MARKERS_SPECIFIC: tuple[str, ...] = (
     "mapping(", "@getmapping", "@postmapping", "@putmapping", "@deletemapping",
     "@requestmapping", "@controller", "@restcontroller",
     # Python：Flask/FastAPI 装饰器 + Django urlconf（原有）
-    "@app.route", "@router", "urlpatterns", "path(",
-    # Node/前端（原有；`routes:`/`path:`/`createrouter(` 是 Vue Router 的 6.9-HF11）
-    "router.", "app.get(", "app.post(", "app.use(", "route(",
-    "createrouter(", "routes:", "path:",
+    "@app.route", "@router", "urlpatterns",
+    # Node/前端（原有；`createrouter(` 是 Vue Router 的 6.9-HF11）
+    "app.get(", "app.post(", "app.use(", "createrouter(",
     # ★Go net/http★ 零歧义（客户端侧不会出现）
     "handlefunc(", "http.handle(",
     # ★PHP / Laravel★ `Route::get('/x')` —— 原 `route(` 要求紧跟括号，`Route::` 漏掉
@@ -1351,10 +1350,27 @@ _ROUTE_MARKERS_BROAD: tuple[str, ...] = (
     ".get(\"/", ".get('/", ".post(\"/", ".post('/", ".put(\"/", ".put('/",
     ".delete(\"/", ".delete('/", ".patch(\"/", ".patch('/",
     ".group(\"/", ".group('/",
+    # ★I-1（reviewer 复核）★ 以下五个是**既有** token，但它们并非零歧义——我第一版把整张旧表
+    # 原封不动塞进"特异档"，于是它们抢在 Gin/Echo/Chi 之前吃满预算，**恰好抵消 V-H4 对这些栈
+    # 的修复**（实证：4 个含 `ConfigPath:` 的 Go 配置段就能让真 Gin 路由段进不去 evidence）：
+    #   `path(`   ← `Path(__file__).parent`（pathlib，FastAPI 工程遍地）
+    #   `path:`   ← 任意 `*Path:` 字段（Go `ConfigPath: "/etc/app"`）、YAML/JSON 配置
+    #   `router.` ← 前端客户端导航 `router.push('/login')`
+    #   `route(`  ← Laravel 视图里的 URL 生成器 `route('users.index')`
+    #   `routes:` ← 任意 `*routes:` 字段
+    # 召回不丢：Vue Router 由 `createrouter(` 承担、Django 由 `urlpatterns`、Laravel 由
+    # `route::`、C# `[Route(` 由 `[httpget`/`mapget(` 一族承担。
+)
+# 第三档：**历史遗留的高歧义** token。全量回归当场证明只分两档不够——把这些从特异档挪到宽档后，
+# 它们与 Gin 的 `.get("/` **同档**，档内按 diff 原序 → 3 个含 `Path:` 的配置段照旧先吃满 6000
+# → 真路由段仍然饿死（我的两档版修复不完整，是全量闸抓到的，突变 harness 结构上抓不到：
+# 它只验"突变→红"，不复验"基线→绿"）。故独立成最低优先档。
+_ROUTE_MARKERS_WEAK: tuple[str, ...] = (
+    "path(", "path:", "router.", "route(", "routes:",
 )
 # 全集（保留单一事实源语义：判"是不是路由承载段"用它；排序用上面两档）
 ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
-    _ROUTE_MARKERS_SPECIFIC + _ROUTE_MARKERS_BROAD
+    _ROUTE_MARKERS_SPECIFIC + _ROUTE_MARKERS_BROAD + _ROUTE_MARKERS_WEAK
 )
 
 
@@ -1387,12 +1403,16 @@ def _accept_design_context(state: BrainState, derivation) -> str:
         # 零命中会使后端段命中后前端路由段被排除出 evidence，页面断言无据可指）。
         # ★F-1 整改★ 特异档优先吃预算，宽档补位（见 ROUTE_EVIDENCE_MARKERS 上方论证）。
         # 稳定排序：同档内保持 diff 原序（判序可复现，别让 evidence 随字典序抖动）。
+        # 三档按特异性依次吃预算（档内保持 diff 原序，判序可复现）
         _specific = [g for g in _segs
                      if any(k in g.lower() for k in _ROUTE_MARKERS_SPECIFIC)]
         _broad_only = [g for g in _segs
                        if g not in _specific
                        and any(k in g.lower() for k in _ROUTE_MARKERS_BROAD)]
-        _route_segs = _specific + _broad_only
+        _weak_only = [g for g in _segs
+                      if g not in _specific and g not in _broad_only
+                      and any(k in g.lower() for k in _ROUTE_MARKERS_WEAK)]
+        _route_segs = _specific + _broad_only + _weak_only
         _budget = 6000
         _picked: list[str] = []
         for g in _route_segs:

@@ -23,17 +23,25 @@ def _probe(code: str) -> list[str]:
     return [f"ok:{code}"]
 
 
-@pytest.mark.parametrize("code", ["404", "403", "401", "302", "301"])
-def test_non_2xx_answer_is_passed_but_degraded(code):
-    """★V-H3 本尊★ 3xx/4xx → 仍 passed（不误杀）但必须 degraded + 独立 classification。
+@pytest.mark.parametrize("code,expect_cls", [
+    # 证据推出的端点返 404 ＝ 声明了却没注册 → 真信号 → 唯一阻断档
+    ("404", "started_health_unverified"),
+    ("400", "started_health_unverified"),
+    # 401/403/3xx ＝ 端点**应答了**、只是被鉴权/重定向挡住 → HTTP 栈+路由+filter chain
+    # demonstrably 在工作，证据强度高于 404 → 信息性（C-3：否则 JVM 基线 L6 永久归零）
+    ("401", "started_health_gated"),
+    ("403", "started_health_gated"),
+    ("302", "started_health_gated"),
+    ("301", "started_health_gated"),
+])
+def test_non_2xx_answer_is_passed_but_degraded(code, expect_cls):
+    """★V-H3 本尊★ 3xx/4xx → 仍 passed（不误杀）但必须 degraded + 按证据强度分档。
 
     突变判据：把 `if _http_code[:1] in ("3", "4")` 整块删掉 → 回到 `passed:started`，本条必红。
     """
-    # provenance 显式给 True：F-2 后两档分开（回退 `/` 走 started_no_health_contract），
-    # 本条锁的是"3xx/4xx 不再冒充满格通过"这件事，故固定在信号更强的那一档上断言。
     res = classify_smoke_outcome("alive", "", _probe(code), health_path_derived=True)
     assert res.status == "passed", f"3xx/4xx 被判 {res.status}＝误杀方向"
-    assert res.classification == "started_health_unverified", res.classification
+    assert res.classification == expect_cls, res.classification
     assert res.details.get("degraded") is True, res.details
     assert res.details.get("probe_health_verified") is False, res.details
 
@@ -140,3 +148,43 @@ def test_derived_health_endpoint_failing_still_blocks_l6():
     reasons = _run_verify_runtime(res).get("degraded_reasons") or []
     assert blocking_degraded_reasons(reasons), (
         f"证据推出的健康端点坏了是真信号，必须拦 L6：{reasons}")
+
+
+def test_jvm_actuator_behind_security_does_not_block_l6():
+    """★C-3（reviewer 复核）★ JVM 基线行为不变：actuator 被 Spring Security 拦住不许拦 L6。
+
+    探活 curl 不带 `-L` → 3xx 原样返回；Spring Boot + actuator +
+    `anyRequest().authenticated()` 下 `/actuator/health` 返 302→/login 或 401 —— 这是**主力栈
+    常态**且是**永久性、不可行动**的条件。原实现给它扣阻断性 degraded → `should_write_success`
+    恒 False → **唯一跑过 E2E 的栈 L6 成功学习永久归零**（违反"JVM 既有路径行为不变"），
+    且与 F-2 自己的判据自相矛盾（F-2 只把该推理用在了 derived=False 一支）。
+    突变判据：把 `started_health_gated` 从 `INFORMATIONAL_DEGRADED_PREFIXES` 删掉，本条必红。
+    """
+    from swarm.memory.pattern_extractor import blocking_degraded_reasons
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_q_batch_runtime_gate import _run_verify_runtime
+
+    for code in ("302", "401"):
+        res = classify_smoke_outcome("alive", "", _probe(code), health_path_derived=True)
+        assert res.classification == "started_health_gated", (code, res.classification)
+        reasons = _run_verify_runtime(res).get("degraded_reasons") or []
+        assert any("started_health_gated" in r for r in reasons), (code, reasons)
+        assert not blocking_degraded_reasons(reasons), (
+            f"HTTP {code}（鉴权/重定向）拦了 L6 → JVM 主力栈成功学习永久归零：{reasons}")
+
+
+def test_derived_endpoint_404_is_still_the_one_blocking_arm():
+    """★C-3 对照臂★ 证据推出的端点返 404 ＝声明了却没注册 → **仍是唯一阻断档**。
+
+    没有这条，"把所有 3xx/4xx 都列进信息性"也能满足上面（那会让 V-H3 的阻断力整体归零）。
+    """
+    from swarm.memory.pattern_extractor import blocking_degraded_reasons
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_q_batch_runtime_gate import _run_verify_runtime
+
+    res = classify_smoke_outcome("alive", "", _probe("404"), health_path_derived=True)
+    assert res.classification == "started_health_unverified", res.classification
+    reasons = _run_verify_runtime(res).get("degraded_reasons") or []
+    assert blocking_degraded_reasons(reasons), reasons

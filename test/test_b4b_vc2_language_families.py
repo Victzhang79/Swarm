@@ -163,9 +163,13 @@ def test_alias_keys_and_pattern_families_do_not_drift_apart():
     崩溃族/环境族有 generic 兜底、不在此约束内，但也一并列出缺口便于下轮补齐。
     """
     alias_keys = {v for _, v in _LANGUAGE_ALIASES}
-    missing_code = alias_keys - set(_CODE_ERROR_PATTERNS)
-    assert not missing_code, (
-        f"这些语言有别名但无 code_error 族 → 恒不产 failed（静默失效）：{sorted(missing_code)}")
+    # ★I-5（reviewer 复核）★ 原来只判**键在不在**，而 `{"x": ()}` 空 tuple 满足包含判定、
+    # 却完整复现 V-C2 病灶（该表无 generic 兜底 → 空＝该语言恒不产 failed）。空 tuple 不是
+    # 假想形态：`_ENV_MISSING_PATTERNS["node"]`、`_BIND_SUCCESS_PATTERNS` 里已有先例，
+    # 下一个人照抄很自然。故判**非空**。
+    weak = {k for k in alias_keys if not _CODE_ERROR_PATTERNS.get(k)}
+    assert not weak, (
+        f"这些语言的 code_error 族缺失或为空 → 恒不产 failed（静默失效）：{sorted(weak)}")
     # 崩溃/环境两族允许只吃 generic，但缺口要可见（当前应为空；新增语言时刻意打红提醒）
     assert not (alias_keys - set(_STARTUP_CRASH_PATTERNS)), sorted(
         alias_keys - set(_STARTUP_CRASH_PATTERNS))
@@ -296,3 +300,82 @@ def test_dependency_absence_is_crash_not_nothing_observed(lang, log, why):
     res = classify_smoke_outcome("1", log, [], language_key=lang)
     assert res.status == "skipped", f"{why}: {res.status}"
     assert res.classification == "startup_crash_unattributed", f"{why}: {res.classification}"
+
+
+# ══════════════════════════════════════════════
+# reviewer 复核整改：C-1 / C-2 / I-2 / I-3
+# ══════════════════════════════════════════════
+
+@pytest.mark.parametrize("log", [
+    # Rails `rescue => e; logger.error "#{e.class}: #{e.message} for request #{path}"`
+    "NoMethodError: undefined method `split' for nil:NilClass (NoMethodError) for "
+    "request /api/users",
+    # lograge / semantic_logger 的单行 JSON
+    '{"msg":"undefined method `fetch\' for nil:NilClass (NoMethodError)",'
+    '"tag":"retry for queue default"}',
+])
+def test_greedy_backtrack_cannot_bypass_nil_receiver_exclusion(log):
+    """★C-1★ 同一行里出现**第二个** " for " 时，否定预查不许被回溯绕过。
+
+    原 `[^\\n]{0,80}` 贪婪且能跨空格 → `(?!nil)` 落到靠后那个 " for " 上 → nil-deref
+    又变回 `failed:code_error` → 硬拦交付 + 回灌重派写者去修一个环境问题（F-3 原病复发）。
+    突变判据：把 `\\S{1,80}` 改回 `[^\\n]{0,80}`，本条必红。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key="ruby")
+    assert res.status != "failed", (
+        f"贪婪回溯绕过了 nil 排除 → {res.status}/{res.classification}")
+
+
+def test_sqlite_general_error_bucket_is_not_env_missing():
+    """★C-2★ `SQLSTATE[HY000]` 是"通用错误"桶（PDO_SQLITE 全映射到它），不是连接类。
+
+    SQLite 恰是沙箱里唯一不需要外部服务就能真跑的配置＝最可能实际执行到的那个。
+    worker 漏写 migration → `no such table` → 原判 env_missing → skipped → auto_accept 放行。
+    突变判据：把 HY000 的驱动码限定去掉、退回裸 `SQLSTATE\\[HY000`，本条必红。
+    """
+    res = classify_smoke_outcome(
+        "1", "SQLSTATE[HY000]: General error: 1 no such table: users", [],
+        language_key="php")
+    assert res.classification != "env_missing", (
+        f"SQLite 迁移缺陷被归成『沙箱没有外部服务』：{res.classification}")
+
+
+@pytest.mark.parametrize("log,why", [
+    # 样本刻意不含 generic 族的字面（`Connection refused` 等）——否则通用族替语言族背书，
+    # 删掉 HY000 驱动码那行本条照旧绿（本会话第 4 次同型，突变 R-C2b 当场证实）
+    ("SQLSTATE[HY000] [2005] Unknown MySQL server host 'db' (-2)", "MySQL 连接类驱动码"),
+    ("SQLSTATE[08006] [7] server closed the connection unexpectedly", "08 连接类"),
+    ("SQLSTATE[57P03]: the database system is starting up", "PG cannot_connect_now"),
+])
+def test_real_connection_failures_still_env_missing(log, why):
+    """★C-2 对照臂★ 真连接失败照旧 env_missing（收窄没把这档砍掉）。"""
+    res = classify_smoke_outcome("1", log, [], language_key="php")
+    assert res.classification == "env_missing", f"{why}: {res.classification}"
+
+
+def test_nuget_restore_cascade_companion_codes_are_not_code_error():
+    """★I-2★ NuGet 未 restore 会**级联**出伴生码：声明处 CS0246，表达式处 **CS0103**。
+
+    共存是 restore 失败的常态 → 类1 的 `\\d{4}` 黑名单命中伴生码 → 判 code_error →
+    环境冤枉成代码。治法＝依赖缺失形态在场时本轮不进类1（与 ambiguous 同族的保守规则）。
+    突变判据：把 `code_hits and _dep_absent_hits` 那段删掉，本条必红。
+    """
+    log = ("/src/Api/Svc.cs(4,7): error CS0246: The type or namespace name 'Newtonsoft' "
+           "could not be found\n"
+           "/src/Api/Svc.cs(19,13): error CS0103: The name 'JsonConvert' does not exist "
+           "in the current context")
+    res = classify_smoke_outcome("1", log, [], language_key="csharp")
+    assert res.status != "failed", (
+        f"restore 失败的级联伴生码被判代码缺陷：{res.status}/{res.classification}")
+
+
+def test_dart_null_receiver_second_wording_is_excluded():
+    """★I-3★ Dart 对 null 接收者有两套措辞，`Class 'Null' has no instance …` 也要排除。
+
+    它与"真·无此方法"（`Class 'Report' has no instance method`）**字面同构、只差类名**。
+    突变判据：把 `Class 'Null' has no instance` 从否定预查里删掉，本条必红。
+    """
+    res = classify_smoke_outcome(
+        "1", "NoSuchMethodError: Class 'Null' has no instance getter 'databaseUrl'.",
+        [], language_key="dart")
+    assert res.status != "failed", f"{res.status}/{res.classification}"
