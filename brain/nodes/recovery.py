@@ -47,16 +47,34 @@ def _det_of(out) -> dict:
     return l1_details_of(out)
 
 
-def _producers_of(plan_obj, packages, modules) -> set[str]:
+def _producers_of(plan_obj, packages, modules, paths=None) -> set[str]:
     """反查【生产某内部包/某模块的子任务 id】：按 plan 子任务 scope.writable 文件路径归属匹配。
 
     治本 replan 死循环关键：下游因引用上游模块/包而 BLOCKED 时，跨模块 import 依赖的 depends_on
     在 plan 期常拿不到（见 l1_pipeline 自注），无法靠 depends_on 反查上游。改用运行时 worker 吐出的
     blocked_on_packages/modules，按【谁的 scope.writable 落在该模块目录 / 含该包目录段】归属到生产者
-    子任务。通用跨栈、非项目写死（纯路径归属，不含任何硬编码 FQN/模块名）。"""
+    子任务。通用跨栈、非项目写死（纯路径归属，不含任何硬编码 FQN/模块名）。
+
+    ★X-C3-A（治法 B）★ `paths` = worker 侧 `blocked_on_paths`（**已是路径口径**的词干集）。
+    下面那句 `"/".join(p.split("."))` 是 **Java 点分 FQN 专属**转换：非 JVM 的 ref 按它转出来
+    无一命中（`github.com/a/s/internal/svc`→`github/com/…`、`./routes/users`、`crate::svc`
+    原样、`app.services.user`→只当目录段比而 `user` 其实是**文件**）⇒ 反查不到生产者 ⇒
+    `_futile=True` → 推不出该建啥 → `_unrecoverable` ⇒ **首轮连坐放弃**（比 X-C3 之前更坏）。
+    给了 `paths` 就用它，**缺席逐字节走老路**（java 恒缺席 ⇒ 唯一跑过 E2E 的栈零改动）。"""
     out: set[str] = set()
-    pkg_paths = ["/".join(p.split(".")) for p in (packages or []) if p]
+    _use_paths = [str(p).strip("/") for p in (paths or []) if str(p).strip()]
+    pkg_paths = _use_paths or ["/".join(p.split(".")) for p in (packages or []) if p]
     mods = {str(m).strip().strip("/") for m in (modules or []) if str(m).strip()}
+
+    def _hit(fn: str, pp: str) -> bool:
+        # 目录段命中（两种口径共用）：`internal/svc` ⊂ `internal/svc/user.go`
+        if ("/" + pp + "/") in ("/" + fn):
+            return True
+        # ★路径口径专属★：词干也可以是**文件**（python `app/services/user` →
+        # `app/services/user.py`、TS `src/routes/users` → `src/routes/users.ts`）。
+        # 老的点分口径下词干恒是包目录，故此分支只对 paths 开（不改 JVM 行为）。
+        return bool(_use_paths) and fn.rsplit(".", 1)[0] == pp
+
     for s in getattr(plan_obj, "subtasks", []):
         scope = getattr(s, "scope", None)
         writ = list(getattr(scope, "writable", []) or []) if scope else []
@@ -66,7 +84,7 @@ def _producers_of(plan_obj, packages, modules) -> set[str]:
             if top in mods:
                 out.add(s.id)
                 break
-            if any(("/" + pp + "/") in ("/" + fn) for pp in pkg_paths):
+            if any(_hit(fn, pp) for pp in pkg_paths):
                 out.add(s.id)
                 break
     return out
@@ -168,8 +186,16 @@ def _baseline_dir_roots(project_path: str, *, max_age_s: float) -> frozenset[str
     return frozen
 
 
-def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
+def _package_in_baseline(project_path: str | None, pkg: str,
+                         path_stems=None) -> bool:
     """点分包名 pkg 是否已存在于【基线项目树】任一模块 src 下（确定性、零 LLM）。
+
+    ★X-C3-A（治法 B）★ `path_stems` = 该 ref 的**路径口径**词干（worker 侧
+    `blocked_on_paths_by_ref[ref]`）。下面 `pkg.replace(".", "/")` 是 Java 点分专属：
+    go 的 `github.com/a/s/internal/svc` 会被转成 `github/com/…` ⇒ 目录**确实存在**也判 False
+    ⇒ 假阳性护栏失效 ⇒ 判"臆造/永不可满足" ⇒ 首轮连坐放弃。给了词干就用词干，
+    **缺席逐字节走老路**（java 恒缺席）。词干可能指向**文件**（python/TS），故除目录集外
+    再查一次文件存在性。
 
     #R13-2 治本关键：worker 臆造一个基线里根本不存在的包(如 com.ruoyi.common.core.redis)时，
     L1 会误判 internal_pkg_not_built(transient，等一个【永不会来的生产者】)，白烧整条重试阶梯。
@@ -181,6 +207,24 @@ def _package_in_baseline(project_path: str | None, pkg: str) -> bool:
     完全等价（同剪枝、同 endswith 后缀匹配）。"""
     if not project_path or not pkg:
         return True  # 无从判定 → 保守当【存在】，不据此硬失败
+    _stems = [str(s).strip("/") for s in (path_stems or []) if str(s).strip()]
+    if _stems:
+        # 路径口径：词干可指向目录**或**文件（`app/services/user` → `user.py`）。
+        # 任一命中即"在树里"（保守方向＝继续等，与老路一致）。
+        import os as _os
+        for _s in _stems:
+            _abs = _os.path.join(project_path, _s)
+            if _os.path.isdir(_abs):
+                return True
+            _d, _b = _os.path.split(_abs)
+            try:
+                if _b and _os.path.isdir(_d) and any(
+                        f == _b or f.rsplit(".", 1)[0] == _b
+                        for f in _os.listdir(_d)):
+                    return True
+            except OSError:
+                return True   # 扫不动 → 保守当【存在】，绝不据此硬失败
+        return False
     rel = pkg.replace(".", "/").strip("/")
     if not rel:
         return True
@@ -381,7 +425,7 @@ def _class_in_baseline(project_path: str | None, class_fqn: str) -> bool:
 
 def _blocked_pkg_unrecoverable(
     blocked_pkgs, producers, unsat, completed_ok, pending, project_path, self_id,
-    blocked_classes=None,
+    blocked_classes=None, paths_by_ref=None,
 ) -> bool:
     """阻断在内部包的子任务，是否【永不可满足】= 全部生产者已终结 且 包仍不在工作树。
 
@@ -412,8 +456,11 @@ def _blocked_pkg_unrecoverable(
     _cls = [c for c in (blocked_classes or []) if c]
     if _cls:
         return not any(_class_in_baseline(project_path, c) for c in _cls)
+    # X-C3-A：每个 ref 各带自己的路径词干（缺席 → 该 ref 走老的点分口径）
+    _pbr = paths_by_ref or {}
     return bool(blocked_pkgs) and not any(
-        _package_in_baseline(project_path, p) for p in blocked_pkgs
+        _package_in_baseline(project_path, p, path_stems=_pbr.get(p))
+        for p in blocked_pkgs
     )
 
 

@@ -2060,6 +2060,32 @@ def decide_unbuilt_internal_verdict(
     details["blocked_on_packages"] = sorted(blocked_pkgs)
     if blocked_cls:
         details["blocked_on_classes"] = blocked_cls   # H-3a 类级 futile 判据用
+    # ★X-C3-A（治法 B）★ 非 JVM ref 的**路径口径**——brain 侧三个消费者内部都是"先把 Java
+    # 点分 FQN 转成路径再比"，非 JVM ref 按那个口径转出来无一命中 ⇒ _prods=∅ → _futile
+    # → 推不出该建啥 → _unrecoverable ⇒ 首轮连坐放弃（比 X-C3 之前更坏）。故一并吐路径，
+    # 消费者优先读它、缺席回落原路 ⇒ **JVM 侧逐字节不变**（blocked_on_paths 对 java 恒缺席）。
+    if language_key and project_path and run is not None:
+        # X-C3-A：栈键由**裁决层**写（它有 language_key）。原先只有三个调用点各写一遍 ⇒
+        # 新调用点漏写就静默丢栈 ⇒ brain 侧 `_derive_missing_type_files` 取不到扩展名 → 返 []
+        # → 连坐放弃。写在这里＝与路径键同源，不可能只落一半。
+        details.setdefault("blocked_via_error_driver", language_key)
+        try:
+            from swarm.worker.l1_error_drivers import ref_path_stems
+            _paths = ref_path_stems(language_key, driver_refs or list(blocked_pkgs),
+                                    project_path, timeout, run)
+            # ★这里刻意**没有** else 分支★ 我原先写了个 `blocked_on_paths_absent` 降级账，
+            # 突变 harness 证明它锁不住 —— 复查后确认那条分支**不可达**：本块与上面步骤 4 的
+            # 归属判定用**同一个** `ref_tree_paths` 且门控条件逐字相同，任何"词干解不出"的 ref
+            # 都会先落进 `_unres` → 在 `if _unres:` 处早返 FAIL（CRITICAL-2 的闸）→ 永远走不到
+            # 这里。故到得了本行就必有词干。留个不可达的账＝制造"有人消费的假象"，删掉更诚实。
+            if _paths:
+                details["blocked_on_paths"] = sorted(
+                    {s for stems in _paths.values() for s in stems})
+                details["blocked_on_paths_by_ref"] = {k: sorted(v)
+                                                      for k, v in _paths.items()}
+        except Exception as _pexc:  # noqa: BLE001 — 路径口径失败绝不改变 BLOCKED 裁决
+            details["blocked_on_paths_error"] = f"{type(_pexc).__name__}: {_pexc}"[:200]
+            logger.warning("[L1] X-C3-A 路径口径计算异常（brain 侧回落老路）: %r", _pexc)
     logger.warning(
         "[L1.%s] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 BLOCKED "
         "退避待生产者落地，不连坐本子任务: %s",

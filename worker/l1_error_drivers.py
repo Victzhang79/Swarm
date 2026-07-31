@@ -824,6 +824,47 @@ def blocked_on_unbuilt_internal(
     return containers, sorted(set(symbols))
 
 
+def ref_path_stems(
+    language_key: str | None, refs, project_path: str, timeout: int, run: RunProbe,
+) -> dict[str, list[str]]:
+    """X-C3-A（治法 B）：`ref → 树内路径词干集`，供 brain 侧消费者直接用**路径**归属。
+
+    ★为什么必须有这个出口★ `blocked_on_packages` 的三个 brain 消费者
+    （`recovery._producers_of` / `recovery._package_in_baseline` /
+    `failure._derive_missing_type_files`）内部一律是"先把 **Java 点分 FQN** 转成路径再比"。
+    非 JVM 的 ref（`github.com/a/s/internal/svc` / `./routes/users` / `crate::svc` /
+    `app.services.user`）按那个口径转出来的东西无一命中（实测四栈全灭，java 唯一通）⇒
+    `_prods=∅` → `_futile=True` → 推不出该建啥 → `_unrecoverable` ⇒ **首轮连坐放弃**，
+    即"烧修复轮→abandon"变成"零修复轮→abandon"，**比 X-C3 之前更坏**。
+
+    治法 B：worker 把**路径口径**一并吐出（`blocked_on_paths`），brain 侧优先读它、缺席回落
+    原有点分转换 ⇒ **JVM 侧逐字节走老路**（唯一跑过 E2E 的栈零风险）。路径来源就是
+    `ref_tree_paths` —— 与步骤 3/步骤 4 同一口径，不引入第三套路径规则（C-1 的教训）。
+
+    返回 `{ref: [词干…]}`；解不出的 ref **不出现在结果里**（缺席即"无路径口径可用"，
+    brain 侧对该 ref 自然回落老路，不会拿到半个错答案）。
+    """
+    drv = driver_for(language_key)
+    if drv is None or drv.key in _SELF_HANDLED_KEYS or not refs:
+        return {}
+    get_paths = getattr(drv, "ref_tree_paths", None)
+    if get_paths is None:
+        return {}
+    out: dict[str, list[str]] = {}
+    for r in refs:
+        ref = r.ref if isinstance(r, MissingRef) else str(r)
+        src = r.src if isinstance(r, MissingRef) else None
+        if not ref:
+            continue
+        try:
+            stems = get_paths(ref, src, project_path, timeout, run)
+        except Exception:  # noqa: BLE001 — 路径映射异常 → 该 ref 无路径口径（缺席即回落）
+            continue
+        if stems:
+            out[ref] = [s for s in stems if s]
+    return {k: v for k, v in out.items() if v}
+
+
 def produced_in_scope(
     language_key: str | None, refs, scope_files: list[str],
     project_path: str, timeout: int, run: RunProbe,

@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""X-C3-A（27 号文 §7.13，治法 B）：`blocked_on_packages` 的 brain 侧消费者口径分栈。
+
+## 治的是什么
+
+X-C3 让非 JVM 栈也能判 `internal_pkg_not_built` BLOCKED，但 `blocked_on_packages` 的三个
+brain 侧消费者**内部一律是「先把 Java 点分 FQN 转成路径再比」**：
+
+  · `recovery._producers_of`         `"/".join(p.split("."))`
+  · `recovery._package_in_baseline`  `pkg.replace(".", "/")`
+  · `failure._derive_missing_type_files`  只认 `/src/main/java|kotlin/` 标记
+
+非 JVM 的 ref 按那个口径转出来**无一命中**（`github.com/a/s/internal/svc` →
+`github/com/…`、`./routes/users` 原样、`crate::svc` 原样、`app.services.user` 只当目录段比
+而 `user` 其实是**文件**）⇒ `_prods=∅` → `_futile=True` → 推不出该建啥 → `_unrecoverable`
+⇒ **首轮连坐放弃**。即"烧修复轮→abandon"变成"**零修复轮→abandon**"，**比 X-C3 之前更坏**。
+
+## 治法 B（用户拍板）
+
+worker 侧一并吐**路径口径**（`blocked_on_paths` / `blocked_on_paths_by_ref`，来源＝driver 的
+`ref_tree_paths`，不引入第三套路径规则）；三个消费者**优先读它、缺席回落原路**。
+`ref_path_stems` 对 java 恒返空 ⇒ 键缺席 ⇒ **JVM 侧逐字节走老路**（唯一跑过 E2E 的栈零风险）。
+
+## 本文件的断言
+
+每个消费者都断**两条**：非 JVM 用新口径能解开（治前不能）· JVM 在键缺席时行为不变（零回归）。
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+from pathlib import Path
+
+import pytest
+
+_bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
+_spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+import swarm.worker.l1_error_drivers as ed  # noqa: E402
+from swarm.brain.nodes.failure import _derive_missing_type_files  # noqa: E402
+from swarm.brain.nodes.recovery import (_blocked_pkg_unrecoverable,  # noqa: E402
+                                        _package_in_baseline, _producers_of)
+from swarm.types import (FileScope, SubTask, SubTaskDifficulty)  # noqa: E402
+
+# (栈键, ref, 报错文件, 生产者文件, 期望词干, 自愈该建的文件)
+CASES = [
+    ("go", "github.com/acme/shop/internal/svc", "internal/handler/u.go",
+     "internal/svc/user.go", "internal/svc", "internal/svc/svc.go"),
+    ("node", "./routes/users", "src/app.ts",
+     "src/routes/users.ts", "src/routes/users", "src/routes/users.ts"),
+    ("rust", "crate::svc", None,
+     "src/svc/mod.rs", "src/svc", "src/svc.rs"),
+    ("python", "app.services.user", None,
+     "app/services/user.py", "app/services/user", "app/services/user.py"),
+]
+_IDS = [c[0] for c in CASES]
+
+JVM_REF = "com.acme.svc"
+JVM_PROD = "mod/src/main/java/com/acme/svc/Svc.java"
+
+
+def _probe(module: str = "github.com/acme/shop"):
+    def _run(cmd, pp, timeout=60):
+        if "go.mod" in cmd and "awk" in cmd:
+            return 0, module + "\n", ""
+        return 1, "", ""
+    return _run
+
+
+def _stems(lang: str, ref: str, src: str | None) -> list[str]:
+    mr = ed.MissingRef(ref=ref, symbol=None, src=src)
+    return ed.ref_path_stems(lang, [mr], "/p", 20, _probe()).get(ref, [])
+
+
+def _plan(files: list[str]):
+    st = SubTask(id="st-producer", description="p",
+                 difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=files))
+
+    class _P:
+        subtasks = [st]
+    return _P()
+
+
+@pytest.fixture()
+def tree(tmp_path):
+    """真工程树：四栈的生产者文件 + JVM 对照臂都物化在磁盘上。"""
+    for _lang, _ref, _src, prod, _stem, _new in CASES:
+        (tmp_path / prod).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / prod).write_text("x\n")
+    (tmp_path / JVM_PROD).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / JVM_PROD).write_text("x\n")
+    return tmp_path
+
+
+# ═══════════════════════════════════════════════════════════════
+# worker 侧：路径口径的产出（java 必须缺席）
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
+def test_worker_emits_path_stems(lang, ref, src, prod, stem, new):
+    assert stem in _stems(lang, ref, src)
+
+
+def test_worker_emits_nothing_for_jvm():
+    """★JVM 零风险的根据★ 键缺席 ⇒ 三个消费者全部回落老路，行为逐字节不变。"""
+    assert ed.ref_path_stems("java", [ed.MissingRef(ref=JVM_REF)], "/p", 20,
+                             _probe()) == {}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 消费者 1：_producers_of（反查生产者子任务）
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
+def test_producers_of_resolves_with_paths(lang, ref, src, prod, stem, new):
+    """治前：老口径对四栈全空 ⇒ `_prods=∅` ⇒ `_futile=True` ⇒ 首轮连坐放弃。"""
+    plan = _plan([prod])
+    assert _producers_of(plan, [ref], []) == set(), \
+        "夹具前提变了：老口径竟然反查到了，本条命题需重估"
+    assert _producers_of(plan, [ref], [], paths=_stems(lang, ref, src)) == {"st-producer"}
+
+
+def test_producers_of_jvm_unchanged_without_paths():
+    assert _producers_of(_plan([JVM_PROD]), [JVM_REF], []) == {"st-producer"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 消费者 2：_package_in_baseline（假阳性护栏）
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
+def test_package_in_baseline_sees_existing_tree(lang, ref, src, prod, stem, new, tree):
+    """护栏语义＝"包在树里（只是漏 seed）→ 继续等，别硬失败"。老口径对非 JVM 恒 False
+    ⇒ 护栏失效 ⇒ 判臆造 ⇒ 连坐放弃。"""
+    assert _package_in_baseline(str(tree), ref) is False, \
+        "夹具前提变了：老口径竟然认出来了"
+    assert _package_in_baseline(str(tree), ref,
+                               path_stems=_stems(lang, ref, src)) is True
+
+
+def test_package_in_baseline_still_negative_when_truly_absent(tmp_path):
+    """★别把闸拧成恒不触发★ 真不在树里时必须仍返 False（否则 #10 幽灵生产者无人拦）。"""
+    assert _package_in_baseline(
+        str(tmp_path), "github.com/acme/shop/internal/nope",
+        path_stems=["internal/nope"]) is False
+
+
+def test_package_in_baseline_jvm_unchanged(tree):
+    assert _package_in_baseline(str(tree), JVM_REF) is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# 消费者 2b：_blocked_pkg_unrecoverable（futile 判据）
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
+def test_futile_no_longer_true_for_existing_tree(lang, ref, src, prod, stem, new, tree):
+    kw = dict(blocked_pkgs=[ref], producers=set(), unsat=set(), completed_ok=set(),
+              pending=set(), project_path=str(tree), self_id="st-x")
+    assert _blocked_pkg_unrecoverable(**kw) is True, "夹具前提变了"
+    assert _blocked_pkg_unrecoverable(
+        **kw, paths_by_ref={ref: _stems(lang, ref, src)}) is False
+
+
+def test_futile_still_true_when_truly_hallucinated(tmp_path):
+    """回归臂：ref 真不在树里 + 无生产者 ⇒ 仍判永不可满足（快失败，不烧退避阶梯）。"""
+    assert _blocked_pkg_unrecoverable(
+        blocked_pkgs=["github.com/acme/shop/internal/nope"], producers=set(),
+        unsat=set(), completed_ok=set(), pending=set(), project_path=str(tmp_path),
+        self_id="st-x", paths_by_ref={"github.com/acme/shop/internal/nope":
+                                      ["internal/nope"]}) is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# 消费者 3：_derive_missing_type_files（自愈：该建哪个文件）
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
+def test_derive_missing_files_for_non_jvm(lang, ref, src, prod, stem, new):
+    """治前：JVM 推导锚死 `/src/main/java|kotlin/` + 类名＝文件名 ⇒ 非 JVM 一个 marker
+    都不命中 ⇒ 返 [] ⇒ `_unrecoverable` ⇒ 首轮连坐放弃。"""
+    assert _derive_missing_type_files([prod], [ref], "cannot find symbol: class Foo") \
+        == [], "夹具前提变了：老推导竟然推出了东西"
+    assert _derive_missing_type_files(
+        [prod], [ref], "", path_stems=_stems(lang, ref, src), stack=lang) == [new]
+
+
+def test_derive_go_package_is_a_directory():
+    """★Go 的包是目录★ 词干 `internal/svc` 该建 `internal/svc/svc.go`，
+    不是 `internal/svc.go`（后者建出与包同名的**文件**，编译仍缺包）。"""
+    assert _derive_missing_type_files(
+        [], [], "", path_stems=["internal/svc"], stack="go") == ["internal/svc/svc.go"]
+
+
+def test_derive_picks_shortest_stem_not_both():
+    """python 的双候选（`app/x` 与 `src/app/x`）只能建**一个**（否则种出两棵真值树）。
+    取最短＝顶层布局优先，按深度+长度定序，不靠字典序碰巧。"""
+    got = _derive_missing_type_files(
+        [], [], "", path_stems=["src/app/services/user", "app/services/user"],
+        stack="python")
+    assert got == ["app/services/user.py"]
+
+
+def test_derive_returns_empty_for_unregistered_stack():
+    """未收录栈 → 不猜扩展名（fail-honest，交连坐放弃），绝不建出个 `x.unknown`。"""
+    assert _derive_missing_type_files([], [], "", path_stems=["a/b"],
+                                     stack="elixir") == []
+
+
+def test_derive_jvm_unchanged_without_stems():
+    got = _derive_missing_type_files([JVM_PROD], [JVM_REF],
+                                     "symbol: class Foo")
+    assert got == ["mod/src/main/java/com/acme/svc/Foo.java"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 端到端：worker 裁决写出的 details 能被 brain 直接消费
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_verdict_details_carry_path_keys_consumable_by_brain(tmp_path):
+    """★接线证明★ 走 `decide_unbuilt_internal_verdict` 本体拿 details，再把 details 里的键
+    原样喂给三个 brain 消费者 —— 证"worker 写的键 brain 真解得开"，不是各测一半。"""
+    import swarm.worker.l1_pipeline as lp
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    (tmp_path / "internal" / "svc" / "user.go").write_text("package svc\n")
+    ref = "github.com/acme/shop/internal/svc"
+    details: dict = {}
+    blocked = lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["internal/handler/u.go"]), {ref}, [],
+        cmd="go build ./...", stage="build", output="",
+        language_key="go", project_path=str(tmp_path), timeout=20,
+        run=_probe(), driver_refs=[ed.MissingRef(ref=ref, symbol=None,
+                                                 src="internal/handler/u.go")])
+    assert blocked is True
+    assert details["blocked_on_paths"] == ["internal/svc"]
+    assert details["blocked_on_paths_by_ref"] == {ref: ["internal/svc"]}
+    # brain 侧三个消费者直接吃 details 里的键
+    assert _producers_of(_plan(["internal/svc/user.go"]),
+                         details["blocked_on_packages"], [],
+                         paths=details["blocked_on_paths"]) == {"st-producer"}
+    assert _package_in_baseline(
+        str(tmp_path), ref,
+        path_stems=details["blocked_on_paths_by_ref"][ref]) is True
+    assert _derive_missing_type_files(
+        [], details["blocked_on_packages"], "",
+        path_stems=details["blocked_on_paths_by_ref"][ref],
+        stack=details["blocked_via_error_driver"]) == ["internal/svc/svc.go"]
+
+
+def test_verdict_marks_absence_when_no_path_stems(tmp_path):
+    """缺席必须可辨（否则"没路径口径"与"忘了算"不可分；brain 会回落老路 → 大概率连坐）。"""
+    import swarm.worker.l1_pipeline as lp
+    ref = "./routes/users"           # 无 src ⇒ 相对导入解不出 ⇒ 无词干
+    details: dict = {}
+    lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["src/app.ts"]), {ref}, [],
+        cmd="(L1.2 compile)", stage="compile", output="",
+        language_key="node", project_path=str(tmp_path), timeout=20,
+        run=_probe(), driver_refs=[ed.MissingRef(ref=ref, symbol=None, src=None)])
+    # ★词干解不出 ⇒ 必然先在 CRITICAL-2 的 UNKNOWN 闸落 FAIL★ 两处用同一个
+    # `ref_tree_paths` 且门控逐字相同，所以"到了 BLOCKED 尾却没词干"不可能发生
+    # （原先我在那儿写了个 `blocked_on_paths_absent` 降级账，突变证明锁不住＝不可达，已删）。
+    assert details.get("blocked_owner_unresolved") == [ref]
+    assert details.get("pipeline_blocked") is None
+    assert "blocked_on_paths" not in details
+
+
+def test_jvm_verdict_writes_no_path_keys(tmp_path):
+    """★JVM 零回归的接线证明★ java 走专用链时 `language_key` 恒 None ⇒ 路径键整块不写。"""
+    import swarm.worker.l1_pipeline as lp
+    details: dict = {}
+    blocked = lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["mod/src/main/java/com/acme/a/A.java"]),
+        {JVM_REF}, [], cmd="mvn -q compile", stage="build", output="")
+    assert blocked is True
+    assert "blocked_on_paths" not in details
+    assert "blocked_on_paths_by_ref" not in details
+    assert details["blocked_on_packages"] == [JVM_REF]
+    assert os.sep is not None      # 占位：确保 import 被用到（ruff F401 防呆）
+

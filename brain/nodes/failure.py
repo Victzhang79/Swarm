@@ -434,13 +434,47 @@ def _stdlib_missing_classes(build_output: str) -> set[str]:
             if c in _JDK_COMMON_TYPES and not evidenced.get(c)}
 
 
-def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str) -> list:
+_XC3A_STACK_EXTS = {
+    "go": (".go",), "node": (".ts", ".js"), "rust": (".rs",), "python": (".py",),
+}
+
+
+def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str,
+                               path_stems=None, stack: str | None = None) -> list:
     """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
-    推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built（本就 JVM 包语义）；推不出→空
+    推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built；推不出→空
     （调用方回落连坐放弃，绝不空烧自愈预算）。★把文件加进 create_files（而非 allow_any）：既让
     scope 闸门放行 worker 新建，又使 _writable_files 把它拉回本地（allow_any 在非空声明 scope 下
-    拉不回=复核 HIGH#2），且放弃时 #7 purge 也认得它★。"""
+    拉不回=复核 HIGH#2），且放弃时 #7 purge 也认得它★。
+
+    ★X-C3-A（治法 B）★ 下面整段推导锚死 JVM：`_MARKERS` 只认 `/src/main/java|kotlin/`，
+    且靠"public 类名＝文件名"把类名种进包路径。非 JVM 的 scope 一个 marker 都不命中 → 返 []
+    → 调用方 `_unrecoverable` ⇒ **首轮连坐放弃**。而非 JVM 根本不需要那套推导：worker 侧
+    `blocked_on_paths` 给的**词干本身就是该建的文件**，只差一个扩展名。故 `path_stems` 在场
+    时走短路径（按 `stack` 取扩展名）；缺席则逐字节走老的 JVM 推导（java 恒缺席）。
+    """
     import re
+    _stems = [str(s).strip("/") for s in (path_stems or []) if str(s).strip()]
+    if _stems:
+        exts = _XC3A_STACK_EXTS.get(str(stack or "").lower())
+        if not exts:
+            return []          # 未收录栈 → 不猜扩展名（fail-honest，交连坐放弃）
+        out: list[str] = []
+        for s in _stems:
+            if "." in s.rsplit("/", 1)[-1]:
+                out.append(s)          # 词干已带扩展名（少见）→ 原样
+                continue
+            if str(stack).lower() == "go":
+                # ★Go 的包是**目录**★ 词干 `internal/svc` 该建的是 `internal/svc/<name>.go`，
+                # 不是 `internal/svc.go`（后者会建出一个和包同名的**文件**，编译仍缺包）。
+                out.append(f"{s}/{s.rsplit('/', 1)[-1]}{exts[0]}")
+            else:
+                out.append(f"{s}{exts[0]}")
+        # 多候选词干（python 的 `app/x` 与 `src/app/x`）→ 取**最短**的那个（顶层布局优先），
+        # 绝不两个都建（会种出两棵真值树）。按路径深度+长度定序，不靠字典序碰巧。
+        if len(out) > 1:
+            out = [min(out, key=lambda p: (p.count("/"), len(p)))]
+        return out
     _MARKERS = ("/src/main/java/", "/src/test/java/",
                 "/src/main/kotlin/", "/src/test/kotlin/")
     srcroot = None
@@ -1042,7 +1076,12 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             _st = _by_id.get(fid)
             _bpkgs = _det.get("blocked_on_packages") or []
             _bmods = _det.get("blocked_on_modules") or []
-            _prods = _producers_of(plan_obj, _bpkgs, _bmods)
+            # X-C3-A（治法 B）：worker 侧路径口径（非 JVM 栈才有；java 恒缺席 → 全部消费者
+            # 逐字节走老路）。缺席时 `_bpaths`/`_bpbr` 为空 ⇒ 三个消费者行为一字不变。
+            _bpaths = _det.get("blocked_on_paths") or []
+            _bpbr = _det.get("blocked_on_paths_by_ref") or {}
+            _bstack = _det.get("blocked_via_error_driver")
+            _prods = _producers_of(plan_obj, _bpkgs, _bmods, paths=_bpaths)
             # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
             # R65REPLAY-T1 复核 F2：只算【硬】依赖——软序边（edge_is_soft，readable
             # 驱动消费）的死产者与本次 pipeline_blocked 无因果（真因由 _prods/_futile
@@ -1064,6 +1103,9 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 # H-3a 复核 HIGH：类级 BLOCKED（包在树类未建出）时包级树判据恒真失效，
                 # 传类 FQN 走 _class_in_baseline 类级判据（防臆造类烧满阶梯=round19 #10 复发）
                 blocked_classes=_det.get("blocked_on_classes") or [],
+                # X-C3-A：非 JVM ref 的假阳性护栏必须用路径口径查，否则"目录确实在树里"
+                # 也判 False → 判臆造 → 首轮连坐放弃。
+                paths_by_ref=_bpbr,
             )
             if _dep_hit or _prod_hit or _futile:
                 # round36 P0：完全无生产者(_prods 空) 且 非依赖已放弃上游(非 dep_hit) 且 有 scope
@@ -1247,8 +1289,15 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 _sc = _st.scope
                 _decl = (list(getattr(_sc, "writable", []) or [])
                          + list(getattr(_sc, "create_files", []) or []))
+                # X-C3-A：非 JVM 栈的"该建哪个文件"直接来自 worker 侧路径词干（JVM 推导那套
+                # 锚死 /src/main/java|kotlin/ + 类名＝文件名，非 JVM 一个 marker 都不命中 → []
+                # → _unrecoverable ⇒ 首轮连坐放弃）。缺席则逐字节走老推导。
                 _new_files = _derive_missing_type_files(
-                    _decl, _bpkgs, _det2.get("build_output") or "")
+                    _decl, _bpkgs, _det2.get("build_output") or "",
+                    path_stems=[s for stems in
+                                (_det2.get("blocked_on_paths_by_ref") or {}).values()
+                                for s in stems],
+                    stack=_det2.get("blocked_via_error_driver"))
                 if not _new_files:
                     # R65D-T4 改道：缺失类全是 JDK 标准库类型=worker 缺 import 语句——
                     # 治得了的病绝不放弃、更绝不下"新建同名类型"毒指令（round65d
