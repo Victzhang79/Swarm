@@ -27,7 +27,7 @@ MUTATIONS = [
         PIPE,
         "            _c_pkgs, _c_syms = blocked_on_unbuilt_internal(\n"
         "                _c_lang, _c_text, project_path, timeout, _run_check_split,\n"
-        "                refs_out=_c_refs)",
+        "                refs_out=_c_refs, disarm_out=_c_disarm)",
         "            _c_pkgs, _c_syms = (set(), [])",
         ["test_wiring_ts_compile_gate_reaches_blocked",
          "test_wiring_ts_own_scope_producer_falls_to_fail"],
@@ -42,8 +42,8 @@ MUTATIONS = [
     (
         "F1: BLOCKED 时把 ok 键写成 False（被 l1_verdict 读成 capability 失败）",
         PIPE,
-        '    details["l1_2_1_build_ok" if stage == "build" else "l1_2_compile_ok"] = None',
-        '    details["l1_2_1_build_ok" if stage == "build" else "l1_2_compile_ok"] = False',
+        '    details[{"build": "l1_2_1_build_ok", "compile": "l1_2_compile_ok",\n             "test": "l1_3_test_ok"}[stage]] = None',
+        '    details[{"build": "l1_2_1_build_ok", "compile": "l1_2_compile_ok",\n             "test": "l1_3_test_ok"}[stage]] = False',
         ["test_wiring_ts_blocked_not_read_as_capability_failure",
          "test_wiring_ts_compile_gate_reaches_blocked"],
     ),
@@ -54,9 +54,11 @@ MUTATIONS = [
         "                language_key, driver_refs or list(blocked_pkgs), _files,\n"
         "                project_path, timeout, run)",
         "            _own, _unres = set(), set()",
+        # ★不含 test_produced_in_scope_detects_own_container★ 它直调 driver 本体，与 PIPE 侧
+        # 这处突变无关（hunter 实测：该条在此突变下全绿）。混进零区分力的名字会让整条突变
+        # 变成"看起来锁住了"——严格粒度下它会如实报失败，故这里如实收窄。
         ["test_step4_shared_layer_consults_driver_half",
          "test_step4_symbol_inherits_container_ownership",
-         "test_produced_in_scope_detects_own_container",
          "test_wiring_ts_own_scope_producer_falls_to_fail"],
     ),
     (
@@ -70,20 +72,19 @@ MUTATIONS = [
     (
         "求解器：第三方缺失不再全盘不标（混合形态误标 BLOCKED）",
         DRV,
-        "        if not drv.is_internal(r.ref, project_path, timeout, run):\n"
-        "            return set(), []      # 有第三方 → 全盘不标",
-        "        if not drv.is_internal(r.ref, project_path, timeout, run):\n"
+        '            return _disarm("third_party", r.ref)      # 有第三方 → 全盘不标',
         "            continue",
-        ["test_solver_all_or_nothing_third_party_present",
-         "test_wiring_ts_third_party_stays_plain_compile_fail",
-         "test_wiring_compile_classifier_eats_untruncated_output"],
+        # ★只留真有区分力的那条★ 两条 wiring 测试在此突变下**仍绿，但原因不同**：泄漏出的
+        # `./routes/users` 会被**第二道闸**（`express` 非相对导入 → 归属 UNKNOWN → 落 FAIL）
+        # 接住。它们证不了"是全或无拦住的"（"通用并行写闸替漏判的根聚合闸背书"同型）。
+        # 严格粒度把这件事如实暴露出来了，故按事实收窄。
+        ["test_solver_all_or_nothing_third_party_present"],
     ),
     (
         "求解器：已在树里不再全盘不标（真编译错被当成未就绪）",
         DRV,
-        "        if drv.present_in_tree(r.ref, r.symbol, project_path, timeout, run):\n"
-        "            return set(), []      # 有已在树里的 → 真编译错，全盘不标",
-        "        if False:\n            return set(), []",
+        '            return _disarm("already_in_tree", r.ref)  # 有已在树里的 → 真编译错，全盘不标',
+        "            pass",
         ["test_solver_all_or_nothing_already_in_tree",
          "test_wiring_ts_already_in_tree_stays_compile_fail"],
     ),
@@ -91,11 +92,13 @@ MUTATIONS = [
         "求解器：未收录栈不再 fail-closed（臆造 BLOCKED）",
         DRV,
         "    drv = driver_for(language_key)\n"
-        "    if drv is None or drv.key in _SELF_HANDLED_KEYS:\n"
-        "        return set(), []",
+        "    if drv is None:\n"
+        '        return _disarm("unregistered_stack", str(language_key or ""))',
         "    drv = driver_for(language_key) or GoErrorDriver()\n"
-        "    if drv is None:\n        return set(), []",
-        ["test_solver_unregistered_stack_fail_closed", "test_solver_java_is_self_handled"],
+        "    if drv is None:\n        pass",
+        # java 那条对本突变零区分力（突变只改 `drv is None` 分支，java 仍走
+        # `_SELF_HANDLED_KEYS` 那条）——留着会让整条突变"看起来锁住了"。
+        ["test_solver_unregistered_stack_fail_closed"],
     ),
     (
         "Go: 裸 undefined 的容器反解删掉（Go 最常见形态恒 fail-closed）",
@@ -113,7 +116,74 @@ MUTATIONS = [
         '    symbol_sep = "."',
         ["test_rust_symbol_fqn_uses_stack_separator"],
     ),
-    # ── 以下为复核整改新增（每条对应一个已实测复现的 finding）──
+    # ── hunter 复核整改新增 ──
+    (
+        "C-1: 步骤3 不再与步骤4 同口径（present_in_tree 自己按工程根解）",
+        DRV,
+        "    stems = drv.ref_tree_paths(ref, src, project_path, timeout, run)\n"
+        "    if not stems:\n        return False",
+        "    stems = [ref[2:] if ref.startswith('./') else ref]\n"
+        "    if not stems:\n        return False",
+        ["test_present_in_tree_uses_same_path_convention_as_ref_tree_paths"],
+    ),
+    (
+        "C-2: 删掉 L1.3 test 闸的 X-C3 归因（python 退回死代码）",
+        PIPE,
+        "                _t_pkgs, _t_syms = blocked_on_unbuilt_internal(\n"
+        "                    _t_lang, t_out, project_path, timeout, _run_check_split,\n"
+        "                    refs_out=_t_refs, disarm_out=_t_disarm)",
+        "                _t_pkgs, _t_syms = (set(), [])",
+        ["test_wiring_python_test_gate_reaches_blocked"],
+    ),
+    (
+        "H-1: 解除武装不再留机读账（返空与『真没有』不可分）",
+        DRV,
+        '        if disarm_out is not None:\n'
+        '            disarm_out["reason"] = reason',
+        "        if False:\n            disarm_out[\"reason\"] = reason",
+        ["test_disarm_reason_is_machine_readable",
+         "test_wiring_ts_already_in_tree_stays_compile_fail"],
+    ),
+    (
+        "H-2: Rust E0433 裸模块名不再归一成 crate::（调用形清盘同批）",
+        DRV,
+        '                ref=name if "::" in name else f"crate::{name}", symbol=None, src=None))',
+        "                ref=name, symbol=None, src=None))",
+        ["test_rust_e0433_call_forms_normalize_to_crate_path",
+         "test_rust_mixed_use_and_call_forms_not_cleared"],
+    ),
+    (
+        "H-4: ref_tree_paths 返 [] 又塌进『确定不自产』（CRITICAL-2 复发种子）",
+        DRV,
+        "        if not stems:\n"
+        "            # ★复核 H-4★ `None`（UNKNOWN）与 `[]` 一律记为\"归属未知\"",
+        "        if stems is None:\n"
+        "            # ★复核 H-4★ `None`（UNKNOWN）与 `[]` 一律记为\"归属未知\"",
+        ["test_produced_in_scope_treats_empty_stems_as_unresolved"],
+    ),
+    (
+        "M-3: 符号级探测递归整树（跨包同名短名被当成已建出）",
+        DRV,
+        "    cmd = f\"grep -lE {_sh_quote(pat)} {files} 2>/dev/null | head -1\"",
+        "    cmd = f\"grep -rlE {_sh_quote(pat)} . 2>/dev/null | head -1\"",
+        ["test_symbol_probe_does_not_cross_package_boundary"],
+    ),
+    (
+        "M-4: 裁决翻转成 FAIL 后仍留 blocked_via_error_driver 粘滞键",
+        PIPE,
+        '        details.pop("blocked_via_error_driver", None)   # M-4：裁决翻转成 FAIL → 不留粘滞键',
+        "        pass",
+        ["test_wiring_ts_own_scope_producer_falls_to_fail"],
+    ),
+    (
+        "H-3: 步骤4 异常退回 fail-open（判 BLOCKED 去等自己）",
+        PIPE,
+        "            if unresolved_out is not None:\n"
+        "                unresolved_out.update(str(p) for p in blocked_pkgs)",
+        "            pass",
+        ["test_step4_driver_exception_falls_to_fail_not_blocked"],
+    ),
+    # ── 以下为 reviewer 复核整改新增（每条对应一个已实测复现的 finding）──
     (
         "CRITICAL-2: UNKNOWN 归属不再拦 BLOCKED（解不出就敢断言外部生产者）",
         PIPE,
@@ -202,6 +272,14 @@ def run_tests(names: list[str] | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+def run_one(name: str) -> int:
+    """跑**单条**测试名，返回 pytest rc。rc=5（没选到）由调用方判为失败。"""
+    p = subprocess.run(
+        [PY, "-m", "pytest", TEST, "-p", "no:warnings", "-q", "--tb=no", "-k", name],
+        cwd=ROOT, capture_output=True, text=True)
+    return p.returncode
+
+
 def main() -> int:
     print("═" * 70)
     print("步骤 0：基线必须全绿（不验基线的突变 harness 会让修得不全的整改蒙过去）")
@@ -227,14 +305,26 @@ def main() -> int:
             continue
         path.write_text(src.replace(old, new, 1))
         try:
-            rc_m, out_m = run_tests(should_red)
-            ok = rc_m != 0
-            print(f"[{i}/{len(MUTATIONS)}] {name}\n"
-                  f"    {'✓ 该红的红了' if ok else '✗ 突变后仍全绿 = 这些测试对该机制零区分力'}"
-                  f"  (exit={rc_m}, 锁定 {should_red})")
-            if not ok:
-                print("    " + out_m.strip().splitlines()[-1][:160])
-                failures.append((name, "突变后仍绿"))
+            # ★M-2（hunter 实测两条自伤）★
+            # (a) 粒度必须是"**指名的每一条**都红"，不是"整组任一条红"——否则 should_red 里
+            #     混进零区分力的测试名永远不会被发现（实测：F2 突变下 4 条里有 1 条全绿，
+            #     harness 仍打印 ✓）。
+            # (b) rc=5（-k 一条都没选到，如测试被重命名/typo）**不是红**，原判据 rc!=0
+            #     会把它读成"该红的红了"⇒ 那条突变永久假绿。
+            per: list[tuple[str, int]] = [(n, run_one(n)) for n in should_red]
+            bad = [(n, rc) for n, rc in per if rc == 5]
+            green = [(n, rc) for n, rc in per if rc == 0]
+            ok = not bad and not green
+            print(f"[{i}/{len(MUTATIONS)}] {name}")
+            if ok:
+                print(f"    ✓ 指名的 {len(per)} 条全红  (锁定 {should_red})")
+            else:
+                if bad:
+                    print(f"    ✗ 测试名选不到（重命名/typo，rc=5）: {[n for n, _ in bad]}")
+                    failures.append((name, "测试名选不到"))
+                if green:
+                    print(f"    ✗ 突变后仍绿 = 对该机制零区分力: {[n for n, _ in green]}")
+                    failures.append((name, "突变后仍绿"))
         finally:
             path.write_text(src)
 

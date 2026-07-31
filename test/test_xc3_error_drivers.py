@@ -83,18 +83,39 @@ def _fake_probe(*, module: str = "github.com/acme/shop", present: set[str] = fro
     def _run(cmd: str, project_path: str, timeout: int = 60):
         if "go.mod" in cmd and "awk" in cmd:
             return 0, module + "\n", ""
-        if cmd.startswith("ls ") or cmd.startswith("ls -d "):
+        if cmd.startswith("ls ") or "grep" in cmd:
+            # ★路径必须**精确**命中，不能子串匹配（复核 C-1 就是被子串假探针放过的）★
+            # 子串匹配下 `ls 'routes/users'.ts…`（错口径）与 `ls 'src/routes/users'.ts…`
+            # （对口径）都会返命中 ⇒ 夹具替 present_in_tree 的路径口径背书，
+            # `present_in_tree` 用错路径也照旧绿。
             for p in present:
-                if p in cmd:
-                    return 0, p + "\n", ""
-            return 1, "", ""
-        if "grep" in cmd:
-            for p in present:
-                if p in cmd:
+                if any(_tok_matches(p, t) for t in _shell_path_tokens(cmd)):
                     return 0, p + "\n", ""
             return 1, "", ""
         return 1, "", ""
     return _run
+
+
+def _shell_path_tokens(cmd: str) -> list[str]:
+    """抽出命令里被单引号包起来的路径实参（driver 一律经 `_sh_quote` 拼）。"""
+    import re as _re
+    toks = _re.findall(r"'([^']+)'", cmd)
+    # glob 实参不经 _sh_quote（`internal/svc/*.go`），单独捞
+    toks += _re.findall(r"(?<![\w'/])([\w./-]*\*[\w.*/-]*)", cmd)
+    return [t for t in toks if t and t not in ("-d", "-lE", "-l")]
+
+
+def _tok_matches(present_stem: str, token: str) -> bool:
+    """token（如 `src/routes/users.ts` / `internal/svc/*.go`）是否落在已存在的词干上。"""
+    t = token.rstrip("/")
+    for suffix in ("/*.go", "/index.ts", "/index.js", "/mod.rs", "/__init__.py"):
+        if t.endswith(suffix):
+            t = t[: -len(suffix)]
+            break
+    else:
+        if "." in t.rsplit("/", 1)[-1]:
+            t = t.rsplit(".", 1)[0]
+    return t == present_stem
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -236,6 +257,29 @@ def test_solver_sees_bundler_third_party():
         "node", mixed, "/p", 60, _fake_probe()) == (set(), [])
 
 
+@pytest.mark.parametrize("txt", [
+    # 真 cargo 的两种 E0433 文案（都吐**裸**模块名，无 crate:: 前缀）
+    "error[E0433]: failed to resolve: could not find `svc` in the crate root\n"
+    " --> src/main.rs:4:12\n",
+    "error[E0433]: failed to resolve: use of undeclared crate or module `svc`\n"
+    " --> src/main.rs:4:5\n",
+])
+def test_rust_e0433_call_forms_normalize_to_crate_path(txt):
+    """★复核 H-2★ 调用形（`svc::f()` / `crate::svc::f()`）报的是 E0433 + **裸** `svc`。
+    原实现直接当容器 → `is_internal("svc")` 恒假（只认 `crate::` 前缀）→ 全或无当场清盘，
+    连同批的合法 E0432 证据一起清掉（A+B 混用是工程常态）⇒ Rust 臂近零覆盖。"""
+    pkgs, _ = ed.blocked_on_unbuilt_internal("rust", txt, "/p", 60, _fake_probe())
+    assert pkgs == {"crate::svc"}
+
+
+def test_rust_mixed_use_and_call_forms_not_cleared():
+    """A（use 形 E0432）+ B（调用形 E0433）混用时，B 不得把 A 的证据清盘。"""
+    mixed = RUST_UNRESOLVED + (
+        "error[E0433]: failed to resolve: could not find `svc` in the crate root\n")
+    pkgs, _ = ed.blocked_on_unbuilt_internal("rust", mixed, "/p", 60, _fake_probe())
+    assert pkgs == {"crate::svc"}
+
+
 def test_python_parses_module_not_found():
     refs = ed.PythonErrorDriver().parse_missing(PY_MODULE_NOT_FOUND)
     assert [(r.ref, r.symbol) for r in refs] == [("app.services.user", None)]
@@ -331,10 +375,132 @@ def test_produced_in_scope_detects_own_container(lang, ref, src, own_file, other
     assert own2 == set() and not unres2, "别的文件不得算自产，且必须是【确定】不自产"
 
 
+def test_present_in_tree_uses_same_path_convention_as_ref_tree_paths(tmp_path):
+    """★复核 C-1★ 步骤 3（`present_in_tree`）与步骤 4（`ref_tree_paths`）必须同口径。
+
+    原先各算一遍：CRITICAL-2 只修了步骤 4，步骤 3 仍按**工程根**解 `./x` ⇒ TS 的 `src/`
+    布局（业界常态）下「已在树里 → 全盘不标」这道保险丝**恒不触发** ⇒ 真编译错
+    （tsconfig paths 配错/缺 .d.ts/循环依赖）被判成"生产者未就绪"BLOCKED = 最贵的那一侧。
+
+    ★用真 shell 探针 + 真工程树★ —— 假探针的子串匹配正是 C-1 的藏身处。
+    """
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "src" / "routes").mkdir(parents=True)
+    (tmp_path / "src" / "app.ts").write_text("import {x} from './routes/users';\n")
+    (tmp_path / "src" / "routes" / "users.ts").write_text("export const x = 1;\n")
+    drv = ed.NodeErrorDriver()
+    assert drv.ref_tree_paths("./routes/users", "src/app.ts", str(tmp_path), 20,
+                              real_run) == ["src/routes/users"]
+    assert drv.present_in_tree("./routes/users", None, "src/app.ts", str(tmp_path),
+                               20, real_run) is True, \
+        "模块就在 src/routes/users.ts —— 判不出=保险丝失效"
+    # 端到端：已在树里 ⇒ 求解器必须全盘不标（真编译错，交修复梯）
+    pkgs, _ = ed.blocked_on_unbuilt_internal(
+        "node", TS_MISSING_MODULE, str(tmp_path), 20, real_run)
+    assert pkgs == set(), "已在树里的模块被标 BLOCKED = 去等一个永不到来的生产者"
+
+
+def test_disarm_reason_is_machine_readable(tmp_path):
+    """★复核 H-1★ "全或无"解除武装必须留机读原因——五种返空成因对调用方同形时，
+    "机制一次都没触发"与"本轮真没有内部缺失"不可分（解析器漏形态的唯一症状就是返空）。"""
+    cases = [
+        ("elixir", GO_MISSING_PKG, "unregistered_stack"),
+        ("java", "[ERROR] package com.acme.x does not exist", "self_handled"),
+        ("go", "some unrelated build noise\n", "no_refs_parsed"),
+        ("go", GO_MISSING_PKG + GO_THIRD_PARTY, "third_party"),
+    ]
+    for lang, out, expect in cases:
+        d: dict = {}
+        ed.blocked_on_unbuilt_internal(lang, out, "/p", 20, _fake_probe(), disarm_out=d)
+        assert d.get("reason") == expect, f"{lang}/{expect}: 实得 {d}"
+
+
 def test_produced_in_scope_fail_closed_for_unknown_and_java():
     for key in ("java", "elixir", None):
         assert ed.produced_in_scope(
             key, {"x"}, ["a/b.go"], "/p", 60, _fake_probe()) == (set(), set())
+
+
+def test_produced_in_scope_treats_empty_stems_as_unresolved():
+    """★复核 H-4★ `[]` 与 `None` 都必须记为"归属未知"。Protocol 曾教人用 `[]` 表"解不出"
+    并自称 fail-closed，而 `[]` 静默 fall-through 成"确定不自产"→ 推向 BLOCKED（去等自己）。
+    当前 4 个 driver 都不返 `[]`，但留着就是 CRITICAL-2 的复发种子，故按契约锁死。"""
+    class _EmptyStemDriver:
+        key = "go"
+        symbol_sep = "."
+
+        def parse_missing(self, out):
+            return []
+
+        def is_internal(self, ref, pp, t, run):
+            return True
+
+        def ref_tree_paths(self, ref, src, pp, t, run):
+            return []          # ← 契约上的"确定无词干"，绝不能被读成"确定不自产"
+
+        def present_in_tree(self, ref, sym, src, pp, t, run):
+            return False
+
+    import unittest.mock as _mock
+    with _mock.patch.dict(ed.ERROR_DRIVERS, {"go": _EmptyStemDriver()}):
+        own, unres = ed.produced_in_scope(
+            "go", [ed.MissingRef(ref="x/y", symbol=None, src="x/y/z.go")],
+            ["x/y/z.go"], "/p", 60, _fake_probe())
+    assert own == set() and unres == {"x/y"}, \
+        "空词干必须落 unresolved（裁决层会据此落 FAIL），不能塌成『确定不自产』"
+
+
+def test_symbol_probe_does_not_cross_package_boundary(tmp_path):
+    """★复核 M-3★ 符号级探测原用 `grep -r … .`（根包＝递归整树），而 Go 的子目录是**不同的
+    包**，短名（New/Run/Handler/buildRouter）跨包重名是常态 ⇒ 别包的同名符号会被当成"已建出"
+    → 漏标（且无痕）。现在只搜容器自己的文件。"""
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "go.mod").write_text("module github.com/acme/shop\n\ngo 1.22\n")
+    (tmp_path / "main.go").write_text("package main\n\nfunc main() {}\n")
+    (tmp_path / "internal" / "unrelated").mkdir(parents=True)
+    (tmp_path / "internal" / "unrelated" / "r.go").write_text(
+        "package unrelated\n\nfunc buildRouter() {}\n")   # ★别的包里有同名 func★
+    drv = ed.GoErrorDriver()
+    assert drv.present_in_tree(
+        "github.com/acme/shop", "buildRouter", "main.go", str(tmp_path), 20,
+        real_run) is False, "别包的同名符号不得算作『根包里已建出』"
+
+
+def test_step4_driver_exception_falls_to_fail_not_blocked():
+    """★复核 H-3★ 步骤 4 的 driver 半边抛异常时原先 fail-**open**（own 集空 → 判 BLOCKED），
+    日志还写"维持 BLOCKED 语义"——与 CRITICAL-2 的结论（归属解不出 → 不敢断言外部生产者）
+    方向相反。异常吞在 except 里 ⇒ unresolved_out 永远收不到 ⇒ 外层判不到 ⇒ 静默。"""
+    import swarm.worker.l1_error_drivers as _ed_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("driver 半边炸了")
+
+    _orig = _ed_mod.produced_in_scope
+    _ed_mod.produced_in_scope = _boom
+    try:
+        details: dict = {}
+        blocked = lp.decide_unbuilt_internal_verdict(
+            details, FileScope(writable=["internal/svc/user.go"]),
+            {"github.com/acme/shop/internal/svc"}, [],
+            cmd="go build ./...", stage="build", output="",
+            language_key="go", project_path="/p", timeout=60, run=_fake_probe())
+    finally:
+        _ed_mod.produced_in_scope = _orig
+    assert blocked is False, "归属探测炸了却判 BLOCKED = 可能让 worker 去等自己"
+    assert details.get("pipeline_blocked") is None
+    assert details.get("blocked_owner_unresolved"), "降级必须留机读账"
 
 
 def test_produced_in_scope_reports_unresolved_separately():
@@ -480,6 +646,9 @@ def test_wiring_ts_own_scope_producer_falls_to_fail(
     assert ok is False, f"自己该建的 → FAIL 进修复梯，不判 BLOCKED: {details}"
     assert details.get("pipeline_blocked") is None
     assert details.get("in_scope_producer_fail") == ["./routes/users"]
+    # M-4：裁决翻转成 FAIL ⇒ BLOCKED 侧的键不得粘滞（本仓在别处维持"存在⟺判死"不变量）
+    assert "blocked_via_error_driver" not in details, \
+        "判 FAIL 却留着 blocked_via_error_driver = 陈键，下游读它会误判"
 
 
 def test_wiring_ts_unresolved_owner_falls_to_fail(
@@ -528,10 +697,15 @@ def test_wiring_ts_already_in_tree_stays_compile_fail(
         ts_project, monkeypatch, quiet_gates):
     """回归臂：模块已在树里 ⇒ 真编译错 ⇒ 照常 FAIL（不是"生产者未就绪"）。"""
     scope = FileScope(writable=["src/app.ts"])
+    # ★路径口径（复核 C-1）★ `./routes/users` 从 `src/app.ts` 引用 → 树里的真实位置是
+    # `src/routes/users`。原来写 `routes/users` 也能绿，只因假探针是**子串**匹配 —— 那让
+    # `present_in_tree` 用错口径（工程根相对）照旧过，正是 C-1 藏身之处。
     ok, details = _run_ts(ts_project, monkeypatch, scope, TS_MISSING_MODULE,
-                          present={"routes/users"})
+                          present={"src/routes/users"})
     assert ok is False
     assert details.get("pipeline_blocked") is None
+    assert (details.get("xc3_disarm") or {}).get("reason") == "already_in_tree", \
+        "武装被解除必须留机读账（H-1：返空不留痕 ⇒ 解析器漏形态时无信号）"
 
 
 @pytest.mark.parametrize("stack,manifest,mf_body,src_rel,src_body,build_out,expect_pkg", [
@@ -587,6 +761,57 @@ def test_wiring_go_rust_build_gate_reaches_blocked(
     assert details.get("pipeline_blocked") == "internal_pkg_not_built"
     assert details.get("blocked_on_packages") == [expect_pkg]
     assert details.get("l1_2_1_build_ok") is None
+
+
+def test_wiring_python_test_gate_reaches_blocked(tmp_path, monkeypatch, quiet_gates):
+    """★复核 C-2★ python 的 `ModuleNotFoundError` **只**在真 import 时出现：`py_compile`
+    与 `compileall`（brain 给 python 的默认 build_command）都只做语法检查、缺 import 恒 rc=0
+    （实测）。所以 PythonErrorDriver 在 compile/build 两个调用点都不可达＝**死代码**，而
+    registry 把 python 报成"已覆盖" —— 与本批已赔过一整批的 node/ts 死代码完全同型。
+    治法＝在 L1.3 test 闸接第三个调用点（那是该形态唯一的产出地）。
+
+    突变判据：把 L1.3 那段 X-C3 归因整块删掉 → 本条红。
+    """
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("")
+    (tmp_path / "app" / "main.py").write_text(
+        "from app.services.user import list_users\n")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='shop'\n")
+    monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "compile ok"))
+    monkeypatch.setattr(lp, "_run_l1_command",
+                        lambda cmd, pp, timeout=120: (1, PY_MODULE_NOT_FOUND))
+    # `app` 是工程内顶层包（`is_internal` 据此判自有）；`app/services/user` **未**建出
+    monkeypatch.setattr(lp, "_run_check_split", _fake_probe(present={"app"}))
+    monkeypatch.setattr(lp, "_build_cmd_applicable", lambda *a, **k: True)
+    diff = ("--- a/app/main.py\n+++ b/app/main.py\n@@ -1 +1 @@\n-old\n+new\n")
+    st = SubTask(id="st-xc3-py", description="X-C3 python test gate",
+                 difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["app/main.py"]),
+                 harness=TaskHarness(language="python", test_command="pytest -q"))
+    ok, details = lp.run_l1_pipeline(str(tmp_path), st, diff, timeout=60,
+                                     project_stack={"backend": "FastAPI (python)"})
+    assert ok is True, f"BLOCKED 契约=ok=True + pipeline_blocked: {details}"
+    assert details.get("pipeline_blocked") == "internal_pkg_not_built"
+    assert details.get("blocked_on_packages") == ["app.services.user"]
+    assert details.get("blocked_via_error_driver") == "python"
+    assert details.get("l1_3_test_ok") is None, \
+        "BLOCKED 必须写 None——False 会被 l1_verdict 读成 capability 失败去换模型"
+
+
+def test_python_build_gates_cannot_see_import_errors(tmp_path):
+    """C-2 的前提事实（别让下一个人以为 compile/build 闸能接住 python）：
+    `py_compile`/`compileall` 对缺 import 恒 rc=0，输出里没有 ModuleNotFoundError。"""
+    import subprocess
+    import sys as _sys
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("")
+    (tmp_path / "app" / "main.py").write_text("from app.nope.missing import x\n")
+    for cmd in ([_sys.executable, "-m", "compileall", "-q", "."],
+                [_sys.executable, "-m", "py_compile", "app/main.py"]):
+        p = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True)
+        combined = (p.stdout or "") + (p.stderr or "")
+        assert p.returncode == 0, f"{cmd}: 竟然非零退出（前提变了，C-2 结论要重估）"
+        assert "ModuleNotFoundError" not in combined
 
 
 def test_wiring_compile_classifier_eats_untruncated_output(

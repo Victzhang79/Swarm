@@ -110,13 +110,22 @@ class ErrorDriver(Protocol):
 
         词干语义（各栈同构）：`a/b` 既可物化为 `a/b.<ext>`，也可物化为目录 `a/b/`。
         匹配一律走 `_stem_matches`（词干相等 或 落在 `<词干>/` 下），绝不逐扩展名穷举。
-        无法定位（`self::`/`super::` 无上下文、读不出 go.mod）→ 返 `[]`（fail-closed）。
+        ★无法定位（`self::`/`super::` 无上下文、读不出 go.mod）必须返 `None`，绝不返 `[]`★
+        —— `[]` 会被步骤 4 读成"确定不自产"→ 推向 BLOCKED（复核 H-4：这条 docstring 原先
+        自己教人返 `[]` 并称 fail-closed，与上面三态定义自相矛盾，是 CRITICAL-2 的复发种子）。
         """
         ...
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
-        """标识是否**已在当前工程树里**。True ⇒ 真编译错（非未就绪）⇒ 照常 FAIL。"""
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
+        """标识是否**已在当前工程树里**。True ⇒ 真编译错（非未就绪）⇒ 照常 FAIL。
+
+        ★必须与 `ref_tree_paths` 同口径（复核 C-1）★ 本方法原先各栈自己算一遍路径，于是
+        CRITICAL-2 只修了 `ref_tree_paths` 那一半：node 的 `present_in_tree` 仍按工程根解
+        `./x`，而 TS 相对导入是相对报错文件的 ⇒ `src/` 布局（业界常态）下**「已在树里 →
+        全盘不标」这道保险丝恒不触发** ⇒ 真编译错（tsconfig paths 配错/缺 .d.ts/循环依赖）
+        被判成"生产者未就绪"BLOCKED，方向是最贵的那一侧。故统一走 `ref_tree_paths` 取词干。
+        """
         ...
 
 
@@ -129,14 +138,17 @@ def _stem_matches(rel_path: str, stem: str) -> bool:
     否则 `svc` 会吃掉 `svc_test`/`svcutil`＝把别人的文件算成自己的产出、误抑 BLOCKED）
     """
     p = _norm_rel(rel_path)
-    s = _norm_rel(stem)
+    s = _norm_rel(stem).rstrip("/")
+    if s == ".":
+        s = ""                    # L-2：`.` / `./` 与 `""` 同义（都表工程根）
     if not p:
         return False
-    if stem == "":
-        # 根词干（Go 根包）：只认**工程根直下**的文件，绝不吃子目录（否则整棵树都算自产）
-        return "/" not in p
     if not s:
-        return False
+        # ★复核 L-2★ 根词干判据必须用**归一后**的 `s`：driver 若返 `"."`/`"./"` 表根，
+        # 原实现（判原始 `stem == ""`）会掉进下面的 `not s → False` ⇒ 判"非自产" ⇒ BLOCKED。
+        # 归一后 `""`/`"."`/`"./"` 三种写法等价，只认**工程根直下**的文件（不吃子目录，
+        # 否则整棵树都算自产）。
+        return "/" not in p
     if p.startswith(s + "/"):
         return True
     return p.rsplit(".", 1)[0] == s if "." in p.rsplit("/", 1)[-1] else p == s
@@ -169,6 +181,53 @@ def _memoized(run: RunProbe) -> RunProbe:
             cache[key] = run(cmd, project_path, timeout)
         return cache[key]
     return _run
+
+
+def _present_via_stems(
+    drv, ref: str, symbol: str | None, src: str | None, project_path: str,
+    timeout: int, run: RunProbe,
+) -> bool:
+    """步骤 3 的**共用**实现：词干由 `ref_tree_paths` 给，各栈只提供扩展名与声明式。
+
+    ★这是 C-1 的治法★ 步骤 3 与步骤 4 原先各算一遍路径 ⇒ CRITICAL-2 的整改只落在步骤 4，
+    步骤 3 的保险丝（"已在树里 → 全盘不标"）在 node 的 `src/` 布局下恒不触发。现在两步
+    **同源**：`ref_tree_paths` 是唯一路径口径，改一处两步一起动。
+
+    UNKNOWN（词干解不出）→ 返 False：不敢断言"已在树里"。注意这方向本身推向 BLOCKED，
+    但步骤 4 会独立把 UNKNOWN 拦成 FAIL（`produced_in_scope` 回传 unresolved），两道合起来
+    才是 fail-closed —— 单看这一层不是。
+    """
+    stems = drv.ref_tree_paths(ref, src, project_path, timeout, run)
+    if not stems:
+        return False
+    exts = getattr(drv, "tree_exts", ())
+    idx = getattr(drv, "tree_index_names", ())
+    cands: list[str] = []
+    for s in stems:
+        base = s if s else "."
+        cands += [f"{base}{e}" for e in exts]
+        cands += [f"{base}/{n}" for n in idx]
+        if not s:
+            cands += [f"*{e}" for e in exts]      # 根词干：工程根直下的源文件
+    if not cands:
+        return False
+    cmd = "ls -d " + " ".join(_sh_quote(c) if "*" not in c else c
+                              for c in cands) + " 2>/dev/null | head -1"
+    _ec, out, _e = run(cmd, project_path, min(timeout, 20))
+    found = bool((out or "").strip())
+    if symbol is None or not found:
+        return found
+    decl = getattr(drv, "symbol_decl_re", None)
+    if not decl:
+        return found
+    # 符号级：容器在，问该符号是否已被声明。★只搜容器自己的文件，不递归子树★
+    # （复核 M-3：Go 根包原用 `grep -r .` 递归整树，而 Go 里子目录是**不同的包**，
+    # 短名 New/Run/Handler 跨包重名是常态 ⇒ 会把别包的同名符号当成"已建出"而漏标。）
+    files = " ".join(_sh_quote(c) if "*" not in c else c for c in cands)
+    pat = decl.replace("{sym}", re.escape(symbol))
+    cmd = f"grep -lE {_sh_quote(pat)} {files} 2>/dev/null | head -1"
+    _ec, out, _e = run(cmd, project_path, min(timeout, 20))
+    return bool((out or "").strip())
 
 
 def _dedupe(refs: list[MissingRef]) -> list[MissingRef]:
@@ -349,23 +408,15 @@ class GoErrorDriver:
             return [""]
         return [ref[len(mod) + 1:]]
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
-        mod = self._module_path(project_path, timeout, run)
-        if not mod or not (ref == mod or ref.startswith(mod + "/")):
-            return False
-        rel = "." if ref == mod else ref[len(mod) + 1:]
-        if symbol is None:
-            # 整包缺失：该目录下有任何 .go 文件即"已在树里"（→ 真编译错）
-            cmd = (f"ls {_sh_quote(rel)}/*.go 2>/dev/null | head -1")
-            _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-            return bool((out or "").strip())
-        # 符号级：该目录下是否已有源码声明该标识（func/type/var/const）
-        cmd = (f"grep -rlE '^[[:space:]]*(func|type|var|const)[[:space:]]+"
-               f"{re.escape(symbol)}\\b' --include='*.go' {_sh_quote(rel)} "
-               f"2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        return bool((out or "").strip())
+    # 步骤 3 走共用 `_present_via_stems`（与步骤 4 同一路径口径，见 C-1）。Go 的包恒是目录，
+    # 故词干本身就是目录；`tree_index_names` 用 `*.go` 表示"该目录下任何 go 源文件"。
+    tree_exts = ()
+    tree_index_names = ("*.go",)
+    symbol_decl_re = r"^[[:space:]]*(func|type|var|const)[[:space:]]+\(?[^)]*\)?[[:space:]]*{sym}\b"
+
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
+        return _present_via_stems(self, ref, symbol, src, project_path, timeout, run)
 
 
 def _sh_quote(p: str) -> str:
@@ -457,27 +508,16 @@ class NodeErrorDriver:
                 parts.append(seg)
         return ["/".join(parts)] if parts else None
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
-        if not (ref.startswith("./") or ref.startswith("../")):
-            return False
-        base = ref[2:] if ref.startswith("./") else ref
-        # 模块解析：<base>.{ts,tsx,js,jsx,mjs,cjs} 或 <base>/index.*
-        cmd = (f"ls {_sh_quote(base)}.ts {_sh_quote(base)}.tsx {_sh_quote(base)}.js "
-               f"{_sh_quote(base)}.jsx {_sh_quote(base)}.mjs {_sh_quote(base)}.cjs "
-               f"{_sh_quote(base)}/index.* 2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        found = bool((out or "").strip())
-        if symbol is None:
-            return found
-        if not found:
-            return False   # 容器都不在 → 容器级缺失，交由 symbol=None 那条证据处理
-        # 容器在：是否已导出该符号（`export … symbol` / `export { symbol }`）
-        cmd = (f"grep -rlE 'export[^\\n]*\\b{re.escape(symbol)}\\b' "
-               f"{_sh_quote(base)}.ts {_sh_quote(base)}.js {_sh_quote(base)}/index.* "
-               f"2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        return bool((out or "").strip())
+    # ★C-1★ 步骤 3 改走共用 `_present_via_stems`——原实现自己按**工程根**解 `./x`，与
+    # `ref_tree_paths` 的"相对报错文件"口径分叉，导致 `src/` 布局下保险丝恒不触发。
+    tree_exts = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+    tree_index_names = ("index.ts", "index.tsx", "index.js", "index.jsx",
+                        "index.mjs", "index.cjs")
+    symbol_decl_re = r"export[^\n]*\b{sym}\b"
+
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
+        return _present_via_stems(self, ref, symbol, src, project_path, timeout, run)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -500,9 +540,18 @@ _RUST_UNRESOLVED_IMPORT_RE = re.compile(
 _RUST_NO_ITEM_IN_MOD_RE = re.compile(
     r"no\s+`([A-Za-z_]\w*)`\s+in\s+`([^`]+)`"
 )
-# error[E0433]: failed to resolve: use of undeclared crate or module `svc`
+# ★复核 H-2（真 cargo 输出实测）★ E0433 有两种文案，且都吐**裸模块名**（无 `crate::` 前缀）：
+#   failed to resolve: use of undeclared crate or module `svc`      （写 `svc::f()`）
+#   failed to resolve: could not find `svc` in the crate root       （写 `crate::svc::f()`）
+# 原实现把裸 `svc` 直接当容器 → `is_internal("svc")` 恒假（它只认 `crate::` 前缀）→ 全或无
+# **当场清盘**，连同批的合法 E0432 证据一起清掉（A+B 混用是工程常态）⇒ Rust 臂近零覆盖。
+# 治法：这两种文案都明示"在 crate root 找不到"，语义等价于 `crate::<name>` → 归一加前缀。
+# 只对 `in the crate root` / `undeclared crate or module` 两种明示 crate-root 的文案归一；
+# 其它 E0433（`in module \`x\``＝深层路径，无法从这行还原全路径）不碰 → fail-closed。
 _RUST_UNDECLARED_RE = re.compile(
-    r"error\[E0433\]:\s*failed to resolve:[^\n`]*`([^`]+)`"
+    r"error\[E0433\]:\s*failed to resolve:\s*"
+    r"(?:use of undeclared crate or module\s*`([^`]+)`"
+    r"|could not find\s*`([^`]+)`\s*in the crate root)"
 )
 # error[E0425]: cannot find function `list_users` in module `crate::svc`
 _RUST_CANNOT_FIND_IN_MOD_RE = re.compile(
@@ -537,7 +586,13 @@ class RustErrorDriver:
             else:
                 out.append(MissingRef(ref=path, symbol=None, src=None))
         for m in _RUST_UNDECLARED_RE.finditer(text):
-            out.append(MissingRef(ref=m.group(1), symbol=None, src=None))
+            name = m.group(1) or m.group(2)
+            if not name:
+                continue
+            # 两种文案都明示"crate root 里没有它" ⇒ 语义等价 `crate::<name>`（H-2）。
+            # 已带路径分隔符的（`a::b`）原样留（is_internal 自己判）。
+            out.append(MissingRef(
+                ref=name if "::" in name else f"crate::{name}", symbol=None, src=None))
         for m in _RUST_CANNOT_FIND_IN_MOD_RE.finditer(text):
             out.append(MissingRef(ref=m.group(2), symbol=m.group(1), src=None))
         return _dedupe(out)
@@ -562,25 +617,14 @@ class RustErrorDriver:
         rel = self._mod_rel(ref)
         return [f"src/{rel}"] if rel else None
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
-        rel = self._mod_rel(ref)
-        if not rel:
-            return False
-        # 模块解析：src/<rel>.rs 或 src/<rel>/mod.rs
-        cmd = (f"ls src/{_sh_quote(rel)}.rs src/{_sh_quote(rel)}/mod.rs "
-               f"2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        found = bool((out or "").strip())
-        if symbol is None:
-            return found
-        if not found:
-            return False
-        cmd = (f"grep -rlE '\\b(fn|struct|enum|trait|type|const|static|mod)"
-               f"[[:space:]]+{re.escape(symbol)}\\b' "
-               f"src/{_sh_quote(rel)}.rs src/{_sh_quote(rel)}/mod.rs 2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        return bool((out or "").strip())
+    tree_exts = (".rs",)
+    tree_index_names = ("mod.rs",)
+    symbol_decl_re = (r"\b(fn|struct|enum|trait|type|const|static|mod)"
+                      r"[[:space:]]+{sym}\b")
+
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
+        return _present_via_stems(self, ref, symbol, src, project_path, timeout, run)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -635,25 +679,13 @@ class PythonErrorDriver:
         rel = ref.replace(".", "/").strip("/")
         return [rel, f"src/{rel}"] if rel else None
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
-        rel = ref.replace(".", "/")
-        cmd = (f"ls -d {_sh_quote(rel)}.py {_sh_quote(rel)}/__init__.py "
-               f"src/{_sh_quote(rel)}.py src/{_sh_quote(rel)}/__init__.py "
-               f"2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        found = bool((out or "").strip())
-        if symbol is None:
-            return found
-        if not found:
-            return False
-        cmd = (f"grep -rlE '^[[:space:]]*(def|class|{re.escape(symbol)}[[:space:]]*=)"
-               f"[[:space:]]*{re.escape(symbol)}?\\b' "
-               f"{_sh_quote(rel)}.py {_sh_quote(rel)}/__init__.py "
-               f"src/{_sh_quote(rel)}.py src/{_sh_quote(rel)}/__init__.py "
-               f"2>/dev/null | head -1")
-        _ec, out, _e = run(cmd, project_path, min(timeout, 20))
-        return bool((out or "").strip())
+    tree_exts = (".py",)
+    tree_index_names = ("__init__.py",)
+    symbol_decl_re = r"^[[:space:]]*(def[[:space:]]+{sym}\b|class[[:space:]]+{sym}\b|{sym}[[:space:]]*=)"
+
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
+        return _present_via_stems(self, ref, symbol, src, project_path, timeout, run)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -695,8 +727,8 @@ class JvmErrorDriver:
         raise NotImplementedError(
             "JVM 步骤 4 走 classpath_fqn_key（JVM 类路径命名空间口径，刻意不搬）")
 
-    def present_in_tree(self, ref: str, symbol: str | None, project_path: str,
-                        timeout: int, run: RunProbe) -> bool:
+    def present_in_tree(self, ref: str, symbol: str | None, src: str | None,
+                        project_path: str, timeout: int, run: RunProbe) -> bool:
         raise NotImplementedError(
             "JVM 路径由 l1_pipeline._build_blocked_on_unbuilt_internal* 承担（刻意不搬）")
 
@@ -724,6 +756,7 @@ def driver_for(language_key: str | None) -> ErrorDriver | None:
 def blocked_on_unbuilt_internal(
     language_key: str | None, build_output: str, project_path: str,
     timeout: int, run: RunProbe, refs_out: list | None = None,
+    disarm_out: dict | None = None,
 ) -> tuple[set[str], list[str]]:
     """通用求解器（步骤 1-3）→ `(被阻断的容器集合, 符号级 FQN 列表)`。
 
@@ -743,13 +776,28 @@ def blocked_on_unbuilt_internal(
 
     `refs_out`：可选 out 参数，回填**解析并反解后**的 `MissingRef` 列表——步骤 4 需要其中的
     `src` 来解相对导入（TS/JS 的 `./x` 相对报错文件），拿裸 ref 字符串解不出。
+
+    `disarm_out`（★复核 H-1★）：可选 out 参数，回填**返空的原因**。返空有五种成因
+    （未收录栈 / java self-handled / 一条都没解析出 / 有第三方票 / 有已在树里的），而调用方
+    只看 `if pkgs:` ⇒ "机制一次都没触发"与"本轮真没有内部缺失"**机读不可分**。上一轮实测
+    到的两条 MED-1（GOPATH 形、bundler 形第三方看不见 → 武装被静默解除）唯一症状就是这里
+    返空，而返空不留痕 —— 正是 norms 层死 12 天跨 5+ 轮全零无信号的形状（硬检查④）。
     """
-    drv = driver_for(language_key)
-    if drv is None or drv.key in _SELF_HANDLED_KEYS:
+    def _disarm(reason: str, detail: str = "") -> tuple[set[str], list[str]]:
+        if disarm_out is not None:
+            disarm_out["reason"] = reason
+            if detail:
+                disarm_out["ref"] = detail
         return set(), []
+
+    drv = driver_for(language_key)
+    if drv is None:
+        return _disarm("unregistered_stack", str(language_key or ""))
+    if drv.key in _SELF_HANDLED_KEYS:
+        return _disarm("self_handled", drv.key)
     refs = drv.parse_missing(build_output)
     if not refs:
-        return set(), []
+        return _disarm("no_refs_parsed")
     # ★复核 MED-6★ 探针放大：10 个 ref 实测 30 次调用，其中 20 次是重复读同一个 go.mod
     # （is_internal 与 present_in_tree 各读一次）。E2E 下每次是一趟远程沙箱 run_command，
     # 且本函数处在**失败路径**上。同一命令在一次求解内结果不变 → 按 (cmd, path) memo。
@@ -764,9 +812,9 @@ def blocked_on_unbuilt_internal(
     symbols: list[str] = []
     for r in refs:
         if not drv.is_internal(r.ref, project_path, timeout, run):
-            return set(), []      # 有第三方 → 全盘不标
-        if drv.present_in_tree(r.ref, r.symbol, project_path, timeout, run):
-            return set(), []      # 有已在树里的 → 真编译错，全盘不标
+            return _disarm("third_party", r.ref)      # 有第三方 → 全盘不标
+        if drv.present_in_tree(r.ref, r.symbol, r.src, project_path, timeout, run):
+            return _disarm("already_in_tree", r.ref)  # 有已在树里的 → 真编译错，全盘不标
         containers.add(r.ref)
         if r.symbol:
             # 分隔符按栈取（Rust 是 `::`、ESM 用 `#`）——混用会让 brain 侧类级 futile
@@ -816,7 +864,10 @@ def produced_in_scope(
         except Exception:  # noqa: BLE001 — 路径映射异常 → 归属未知（绝不当"非自产"）
             unresolved.add(ref)
             continue
-        if stems is None:
+        if not stems:
+            # ★复核 H-4★ `None`（UNKNOWN）与 `[]` 一律记为"归属未知"——原实现只判 None，
+            # `[]` 静默 fall-through 成"确定不自产"→ 推向 BLOCKED。当前 4 个 driver 都不返
+            # `[]`，但 Protocol 曾教人这么写，留着就是 CRITICAL-2 的复发种子。
             unresolved.add(ref)
             continue
         if any(_stem_matches(f, s) for s in stems for f in rels):

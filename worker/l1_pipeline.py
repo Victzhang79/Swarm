@@ -1924,9 +1924,16 @@ def _missing_internal_produced_in_scope(
                 if any(_cs == p or _cs.startswith(p + _sep) for p in own_pkgs):
                     own_cls.add(_cs)
         except Exception as _exc:  # noqa: BLE001 — driver 半边异常绝不阻断裁决
+            # ★复核 H-3★ 原实现在此 fail-**open**（异常 → own 集空 → 判 BLOCKED），日志还写
+            # "维持 BLOCKED 语义"，与 CRITICAL-2 的整改结论（归属解不出 → 不敢断言外部生产者）
+            # 方向相反：同一函数两条降级路径反向。且异常吞在这里 ⇒ `unresolved_out` 永远收不到
+            # ⇒ 外层 `if _unres:` 判不到 ⇒ 静默。改成把全部 blocked_pkgs 记为"归属未知"，
+            # 由裁决层统一拦成 FAIL（与 unresolved 同一出口，单一方向）。
+            if unresolved_out is not None:
+                unresolved_out.update(str(p) for p in blocked_pkgs)
             logger.warning(
-                "[L1.2.1] X-C3 步骤4 driver 半边异常（退回 JVM 通道，维持 BLOCKED 语义）: %r",
-                _exc)
+                "[L1] X-C3 步骤4 driver 半边异常 → 归属全部记为未知（裁决层将落 FAIL 修复梯，"
+                "绝不据此判 BLOCKED 让 worker 去等自己）: %r", _exc)
     try:
         from swarm.brain.contract_utils import classpath_fqn_key
     except Exception:  # noqa: BLE001 — 口径源不可用时 fail-open 不判（维持原 BLOCKED 语义）
@@ -1949,6 +1956,38 @@ def _missing_internal_produced_in_scope(
         if stem in cls_paths:
             own_cls.add(stem.replace("/", "."))
     return own_pkgs, own_cls
+
+
+# L-1：stage → 日志阶段号的单一口径（原为 2 路三元，接了第三个 stage 后会把 test 标成 "2"）
+_XC3_STAGE_TAG = {"build": "2.1", "compile": "2", "test": "3"}
+
+_XC3_DISARM_EXPECTED = frozenset({"self_handled", "unregistered_stack"})
+
+
+def _record_xc3_disarm(details: dict, disarm: dict, *, stage: str,
+                       lang: str | None) -> None:
+    """★复核 H-1★ 把 X-C3 求解器"返空的原因"落成机读账 + 一次 WARNING。
+
+    没有它，五种返空成因（未收录栈 / java self-handled / 一条都没解析出 / 有第三方票 /
+    有已在树里的）对调用方**完全同形**，于是"机制一次都没触发"与"本轮真没有内部缺失"
+    机读不可分——解析器一旦漏掉某种真实形态（上一轮实测到 GOPATH 形与 bundler 形两例），
+    唯一症状就是这里返空，而返空不留痕。norms 层死 12 天跨 5+ 轮全零无信号即此形状。
+
+    `self_handled`（java 走专用链）与 `unregistered_stack`（本就不支持）是**预期**的返空，
+    只落账不 WARNING；其余三种是"武装被解除"，必须响。
+    """
+    reason = (disarm or {}).get("reason")
+    if not reason:
+        return
+    details["xc3_disarm"] = {"stage": stage, "reason": reason,
+                             **({"ref": disarm["ref"]} if disarm.get("ref") else {})}
+    if reason in _XC3_DISARM_EXPECTED:
+        return
+    logger.warning(
+        "[L1.%s] X-C3 归因未产出 BLOCKED（栈=%s 原因=%s%s）——若这是解析器漏了该栈的真实"
+        "错误形态，本条是唯一信号（返空本身与『真没有内部缺失』不可分）",
+        _XC3_STAGE_TAG.get(stage, "?"), lang, reason,
+        f" ref={disarm.get('ref')}" if disarm.get("ref") else "")
 
 
 def decide_unbuilt_internal_verdict(
@@ -1986,11 +2025,15 @@ def decide_unbuilt_internal_verdict(
         # ★复核 CRITICAL-2 的裁决半边★ 归属**解不出**时不敢断言"生产者在外部"——
         # 判 BLOCKED 就可能让 worker 去等自己（#10 幽灵生产者，烧满退避阶梯）；落 FAIL
         # 修复梯只是退回现状。两侧代价不对称，故 UNKNOWN 一律不 BLOCKED（fail-closed）。
-        details["blocked_owner_unresolved"] = sorted(_unres)[:8]
+        # L-3：账要能与 blocked 集对账 → 全量落（外加计数），不截断
+        details["blocked_owner_unresolved"] = sorted(_unres)
+        details["blocked_owner_unresolved_n"] = len(_unres)
+        details.pop("blocked_via_error_driver", None)   # M-4：同上，不留粘滞键
         logger.warning(
-            "[L1.%s] X-C3 缺失标识的归属解不出（%s）→ 不敢断言外部生产者，落 FAIL 修复梯"
-            "（误判 BLOCKED 会让 worker 去等自己）",
-            "2.1" if stage == "build" else "2", sorted(_unres)[:4])
+            "[L1.%s] X-C3 缺失标识的归属解不出（%d/%d 条：%s）→ 不敢断言外部生产者，落 FAIL "
+            "修复梯（误判 BLOCKED 会让 worker 去等自己）",
+            _XC3_STAGE_TAG.get(stage, "?"), len(_unres), len(blocked_pkgs),
+            sorted(_unres)[:4])
         return False
     _ext_pkgs = blocked_pkgs - _own_pkgs
     _ext_cls = [c for c in blocked_cls if c not in _own_cls]
@@ -1999,12 +2042,16 @@ def decide_unbuilt_internal_verdict(
         logger.warning(
             "[L1.%s] R67L-B2 缺失内部包/类的生产者全在本子任务 scope 内（自己没建出，"
             "非等上游）→ 落 FAIL 修复梯，不判 BLOCKED: %s",
-            "2.1" if stage == "build" else "2", sorted(blocked_pkgs)[:8])
+            _XC3_STAGE_TAG.get(stage, "?"), sorted(blocked_pkgs)[:8])
+        details.pop("blocked_via_error_driver", None)   # M-4：裁决翻转成 FAIL → 不留粘滞键
         return False
     if _own_pkgs or _own_cls:
         # 混合：自有部分留痕（FAIL 侧线索），外部部分仍 BLOCKED 等上游。
         details["in_scope_producer_suppressed"] = sorted(_own_pkgs | set(_own_cls))
-    details["l1_2_1_build_ok" if stage == "build" else "l1_2_compile_ok"] = None
+    # 三个 stage 各写自己的 ok 键，一律 **None 而非 False**（`l1_verdict._det_fail_source`
+    # 把 `is False` 读成 capability 失败 → BLOCKED 会被归成能力失败去换模型）。
+    details[{"build": "l1_2_1_build_ok", "compile": "l1_2_compile_ok",
+             "test": "l1_3_test_ok"}[stage]] = None
     details["build_blocked"] = cmd
     details["pipeline_blocked"] = "internal_pkg_not_built"
     details["not_run_kind"] = NotRunKind.BLOCKED.value
@@ -2016,7 +2063,7 @@ def decide_unbuilt_internal_verdict(
     logger.warning(
         "[L1.%s] 构建缺【尚未建出的项目内部包】(②跨模块/跨子任务未就绪) → 标 BLOCKED "
         "退避待生产者落地，不连坐本子任务: %s",
-        "2.1" if stage == "build" else "2", (output or "")[:200])
+        _XC3_STAGE_TAG.get(stage, "?"), (output or "")[:200])
     return True
 
 
@@ -4755,9 +4802,11 @@ def run_l1_pipeline(
             _c_lang = normalize_language_key((project_stack or {}).get("backend"))
             _c_text = _compile_raw.get("text") or compile_msg or ""
             _c_refs: list = []
+            _c_disarm: dict = {}
             _c_pkgs, _c_syms = blocked_on_unbuilt_internal(
                 _c_lang, _c_text, project_path, timeout, _run_check_split,
-                refs_out=_c_refs)
+                refs_out=_c_refs, disarm_out=_c_disarm)
+            _record_xc3_disarm(details, _c_disarm, stage="compile", lang=_c_lang)
             if _c_pkgs:
                 details["blocked_via_error_driver"] = _c_lang
                 if decide_unbuilt_internal_verdict(
@@ -5086,9 +5135,12 @@ def run_l1_pipeline(
                         )
                         _xc3_lang = normalize_language_key(
                             (project_stack or {}).get("backend"))
+                        _xc3_disarm: dict = {}
                         _xc3_pkgs, _xc3_syms = _xc3_solve(
                             _xc3_lang, b_out, project_path, timeout, _run_check_split,
-                            refs_out=_xc3_refs)
+                            refs_out=_xc3_refs, disarm_out=_xc3_disarm)
+                        _record_xc3_disarm(details, _xc3_disarm, stage="build",
+                                           lang=_xc3_lang)
                         if _xc3_pkgs:
                             details["blocked_via_error_driver"] = _xc3_lang
                             _blocked_pkgs = _xc3_pkgs
@@ -5290,6 +5342,40 @@ def run_l1_pipeline(
                 details["pipeline_blocked"] = "test_infra_failure"
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
                 return True, details
+            # ★X-C3 第三个调用点（复核 C-2）★ python 的 `ModuleNotFoundError` **只**在真 import
+            # 时出现：`py_compile`/`compileall`（brain 给 python 的默认 build_command）都只做
+            # 语法检查、缺 import 恒 rc=0（实测）。于是 PythonErrorDriver 原先在两个调用点都
+            # 不可达＝死代码，而 registry 把 python 报成"已覆盖"——与本批已赔过一整批的
+            # node/ts 死代码完全同型（硬检查①"接线覆盖 ≠ 机制存在"）。
+            # 放在 infra 判据之后、scope 归属阶梯之前：缺内部模块既非 infra，也不该被
+            # "报错文件全在写权外"的启发式先吞掉（那会丢结构化的 blocked_on_packages）。
+            try:
+                from swarm.brain.nodes.runtime_smoke import normalize_language_key
+                from swarm.worker.l1_error_drivers import blocked_on_unbuilt_internal
+                _t_lang = normalize_language_key((project_stack or {}).get("backend"))
+                _t_refs: list = []
+                _t_disarm: dict = {}
+                _t_pkgs, _t_syms = blocked_on_unbuilt_internal(
+                    _t_lang, t_out, project_path, timeout, _run_check_split,
+                    refs_out=_t_refs, disarm_out=_t_disarm)
+                _record_xc3_disarm(details, _t_disarm, stage="test", lang=_t_lang)
+                if _t_pkgs:
+                    details["blocked_via_error_driver"] = _t_lang
+                    if decide_unbuilt_internal_verdict(
+                            details, getattr(subtask, "scope", None), _t_pkgs, _t_syms,
+                            cmd=test_cmd, stage="test", output=t_out,
+                            language_key=_t_lang, project_path=project_path,
+                            timeout=timeout, run=_run_check_split,
+                            driver_refs=_t_refs):
+                        logger.warning(
+                            "[L1.3] X-C3 %s 栈测试闸缺【尚未建出的项目内部标识】→ 与 build 闸"
+                            "同口径标 BLOCKED 退避: containers=%s", _t_lang,
+                            sorted(_t_pkgs)[:6])
+                        return True, details
+            except Exception as _t_xc3:  # noqa: BLE001 — 归因失败不改原判（照常 FAIL）
+                details["xc3_test_attrib_error"] = f"{type(_t_xc3).__name__}: {_t_xc3}"[:200]
+                logger.warning(
+                    "[L1.3] X-C3 测试闸归因异常（本轮不判 BLOCKED，照常 FAIL）: %r", _t_xc3)
             # A3（19_worker_flow_audit）：test 闸补 scope 归属阶梯，与 build(P0-B/R63-T8①)/
             # lint(D33) 三闸口径统一。整树测试形态（无 harness.test_command 时 _guess_test_cmd
             # 兜底全量）下，兄弟子任务/基线的坏测试会连坐本子任务 hard FAIL（source=test
