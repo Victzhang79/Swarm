@@ -370,11 +370,8 @@ def test_sandbox_spec_infers_a_toolchain_for_every_stack(fx, request):
     """
     from swarm.project.sandbox_spec import find_build_files, infer_env_spec
 
-    if fx.name == "npm_workspaces":
-        request.node.add_marker(pytest.mark.xfail(
-            strict=True, reason="N-1（B-5）：_infer_npm 只看根 package.json 的 scripts，"
-                                "workspaces 根无 scripts → 零 node 工具链 → 镜像没装 node"))
-
+    # ★N-1 已修（X-C2/N-1 批，`_infer_npm` 改扫全部清单）★ 原先此处对 npm_workspaces 挂
+    # xfail(strict)；修好即 XPASS ⇒ 硬失败 ⇒ 逼人回来摘标记（B-0 记分板设计如此）。已摘。
     bf = find_build_files(fx.root)
     assert bf, f"{fx.name}: 一个构建文件都没发现"
     env = infer_env_spec(str(fx.root), project_id="p")
@@ -482,9 +479,15 @@ def test_n2_is_local_fallback_only_sandbox_branch_does_derive(make_workspace, mo
         l1p._MANIFEST_PRESENT_CACHE.clear()
 
 
-def test_n1_localization_npm_manifests_are_discovered_only_root_scripts_are_read(
-        make_workspace):
-    """★N-1 定位锁（复核 MEDIUM-5）★ 把 finding 钉在"只读根"这一点上。
+def test_n1_npm_toolchain_inferred_from_child_package_scripts(make_workspace):
+    """★N-1 已修（原定位锁转正向断言）★ `_infer_npm` 必须扫**全部** package.json。
+
+    原病灶：只读根清单的 scripts，而 npm workspaces 的根常常只有
+    `{name, private, workspaces}`、构建脚本全在子包 ⇒ 返 None ⇒ 镜像不装 node ⇒
+    任何 npm 命令 127 → BLOCKED 无限退避。与 X-C2（Gradle 工程没装 gradle）同型换栈。
+
+    下面的前提断言（清单都被发现、子包确有 build）保留——它们原是被 xfail(strict) 吞掉
+    区分力的那批（复核 MEDIUM-5：把 `_NPM` 改成不匹配名会让 B-0 三个文件全绿）。
 
     `xfail(strict=True)` 会让同一测试内**所有先行断言失去区分力**——npm 那格被吞掉的包括
     `assert bf`（`find_build_files` 到底认不认 `package.json`）与全部夹具形状前提。实测：
@@ -502,9 +505,40 @@ def test_n1_localization_npm_manifests_are_discovered_only_root_scripts_are_read
     import json
     child = json.loads((fx.root / "packages/web/package.json").read_text(encoding="utf-8"))
     assert child.get("scripts", {}).get("build"), "夹具子包缺 build script，N-1 前提不成立"
-    # 病灶：清单都在、子包有 build，`_infer_npm` 仍返 None —— 因为它只读根
-    assert _infer_npm(fx.root, pkgs) is None, (
-        "N-1 已被修好（_infer_npm 认了子包 scripts）→ 请摘掉上面那条 xfail(strict)")
+    # 治后：子包有 build ⇒ 必须推出 node 工具链（否则镜像不装 node → 127 死循环）
+    tc = _infer_npm(fx.root, pkgs)
+    assert tc is not None, "子包有 build script 却推不出 node 工具链 ⇒ 镜像不装 node ⇒ 127"
+    assert tc.name == "node" and tc.build_tool == "npm"
+    # workspaces 的依赖提升到根 ⇒ warmup 必须在**根**跑 npm ci
+    assert tc.dep_source == "package.json", (
+        f"workspaces 根声明了 workspaces，dep_source 应指根清单，实得 {tc.dep_source!r}")
+
+
+def test_n1_static_resources_still_get_no_node(tmp_path):
+    """★回归臂：别把"不装"整类放宽掉★ 无任何构建脚本的 package.json（Maven 单体里的
+    Thymeleaf/admin 静态资源）仍不装 node —— 那是 st-10 的治法（装了会误派 npm 构建 →
+    BLOCKED 空转）。N-1 的修法只把判据从"根有没有"放宽到"任一有没有"，不碰这条结论。"""
+    from swarm.project.sandbox_spec import _infer_npm
+
+    (tmp_path / "src" / "main" / "resources" / "static").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"name": "static", "private": true}')
+    (tmp_path / "src" / "main" / "resources" / "static" / "package.json").write_text(
+        '{"name": "vendor-assets", "dependencies": {"jquery": "3.7.1"}}')
+    assert _infer_npm(tmp_path, ["package.json",
+                                 "src/main/resources/static/package.json"]) is None
+
+
+def test_n1_single_frontend_in_subdir_points_warmup_at_it(tmp_path):
+    """根无 workspaces 且根无脚本、只有子目录前端有脚本（`ui/package.json` 常见形态）→
+    `dep_source` 必须指那个子目录，否则 npm warmup 会 cd 到工程根跑 `npm ci` 装错地方。"""
+    from swarm.project.sandbox_spec import _infer_npm
+
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "package.json").write_text('{"name": "root", "private": true}')
+    (tmp_path / "ui" / "package.json").write_text(
+        '{"name": "ui", "scripts": {"build": "vite build"}}')
+    tc = _infer_npm(tmp_path, ["package.json", "ui/package.json"])
+    assert tc is not None and tc.dep_source == "ui/package.json"
 
 
 # ══════════════════════════════════════════════

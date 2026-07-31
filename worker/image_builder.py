@@ -266,12 +266,30 @@ class SSHRunner:
 # Dockerfile + warmup 生成（EnvSpec → 文本）
 # ──────────────────────────────────────────────
 def _toolchain_install(tc: Toolchain) -> str:
-    """单工具链的 apt/安装 Dockerfile 片段。"""
+    """单工具链的 apt/安装 Dockerfile 片段。
+
+    ★X-C2（27 号文 §3.2 CRITICAL）★ java 分支原先**只看 `tc.name`、完全不看 `tc.build_tool`**，
+    一律只装 `maven`。而 `_selftest_command` 同一份 spec 上**是**按 build_tool 分派的
+    （gradle → `./gradlew --offline classes || gradle --offline classes`）⇒ Gradle 工程的镜像里
+    根本没有 gradle：无 wrapper 时自测 127、运行时任何 gradle 命令 127 → 与 X-C1 同型的
+    BLOCKED 死循环（每轮重试撞同一个"命令不存在"，代码其实没问题）。
+    ★判据不对称就是病根★：一处按 build_tool 分派、另一处不分派，两处必然分叉。
+    """
     if tc.name == "java":
         ver = tc.version or _JDK_DEFAULT
+        # gradle 工程装 gradle，maven 工程装 maven；**混编两个 toolchain 各装各的**
+        # （`infer_env_spec` 对同时有 pom 与 build.gradle 的工程会产两条 java toolchain）。
+        # build_tool 缺失（老 spec / 探测不出）→ 保守两个都装：多装一个包的代价远小于 127 死循环。
+        _bt = (tc.build_tool or "").strip().lower()
+        if _bt == "gradle":
+            _pkgs = "gradle"
+        elif _bt == "maven":
+            _pkgs = "maven"
+        else:
+            _pkgs = "maven gradle"
         return (
             f"RUN apt-get update && apt-get install -y --no-install-recommends "
-            f"openjdk-{ver}-jdk maven ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+            f"openjdk-{ver}-jdk {_pkgs} ca-certificates && rm -rf /var/lib/apt/lists/*\n"
             f"ENV JAVA_HOME=/usr/lib/jvm/java-{ver}-openjdk-amd64\n"
             f'ENV PATH="${{JAVA_HOME}}/bin:${{PATH}}"\n'
         )
@@ -373,6 +391,28 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
                          "&& echo '✅ warmup 离线编译通过：.m2 已填满构建插件+依赖' "
                          "|| echo '⚠️ warmup 离线编译仍有缺漏：运行时联网兜底') "
                          "&& find . -type d -name target -exec rm -rf {} + 2>/dev/null || true")
+
+        # ── Gradle warmup（X-C2 配套）──
+        # 缺它的话：镜像里即便装了 gradle，依赖与插件仍未落盘 ⇒ `_selftest_command` 的
+        # `--offline classes` 必失败（自测软诊断不阻断发布，但沙箱运行时**每次**都要联网拉依赖，
+        # 而 L1 构建闸在离线/弱网沙箱里就会假失败）。与 maven 填 .m2、npm 填 node_modules 同理：
+        # 联网跑一次真编译，把 ~/.gradle 缓存固化进镜像层。
+        if any(t.name == "java" and (t.build_tool or "").lower() == "gradle"
+               for t in spec.toolchains):
+            lines.append("# warmup：真项目联网编译预热 ~/.gradle（含插件+依赖），固化进镜像层")
+            # wrapper 优先（工程钉的 gradle 版本才是权威）；无 wrapper 用系统 gradle。
+            # `classes` 编译主源集全部 JVM 语言（与 _selftest_command 同口径，见 #37）。
+            # --no-daemon：守护进程会在镜像层里留下无用状态且拖慢构建。
+            lines.append(
+                "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes 2>&1 | tail -5) "
+                "|| (gradle --no-daemon classes 2>&1 | tail -5) || true) "
+                "&& find . -type d -name build -prune -exec rm -rf {} + 2>/dev/null || true")
+            # 离线自检（软诊断，与 maven 侧对称：只报告，不阻断发布）
+            lines.append(
+                "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --offline --no-daemon classes -q) "
+                "|| (gradle --offline --no-daemon classes -q)) "
+                "&& echo '✅ warmup gradle 离线编译通过' "
+                "|| echo '⚠️ warmup gradle 离线编译仍有缺漏：运行时联网兜底'")
 
         # ── Node warmup：对每个前端工程跑一次 npm 安装，把 node_modules 烤进镜像层 ──
         # 混合项目（前后端分离）主场：前端子任务的 `npm run build` 与 L1 的 TS/eslint repair

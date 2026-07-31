@@ -151,25 +151,72 @@ def _infer_maven(root: Path, poms: list[str]) -> Toolchain:
     )
 
 
+_NPM_BUILD_SCRIPTS = ("build", "test", "start")
+_NPM_SCAN_CAP = 200          # 巨型 monorepo 防爆：只读最浅的 N 个清单（够判"要不要装 node"）
+
+
 def _infer_npm(root: Path, pkgs: list[str]) -> Toolchain | None:
-    """有 package.json 且含 build/test script 才装 node；纯静态资源(无build脚本)不装。"""
-    root_pkg = min(pkgs, key=lambda p: (p.count("/") + p.count("\\"), len(p)))
-    has_build = False
+    """有 package.json 且**任一**清单含 build/test/start script 才装 node；纯静态资源不装。
+
+    ★N-1（27 号文 §7.5 R-1）★ 原实现**只读根** `package.json` 的 scripts。而 npm workspaces
+    的根常常只有 `{name, private, workspaces}`、构建脚本全在各子包（turbo/nx 之外的常态形态）
+    ⇒ `has_build=False` ⇒ 返 None ⇒ **镜像里根本不装 node** ⇒ 任何 npm 命令 127 →
+    BLOCKED 无限退避（每轮重试撞同一个"命令不存在"）。与 X-C2（Gradle 工程镜像没装 gradle）
+    同型换栈。
+
+    ★刻意保留的既有行为★："无任何构建脚本 → 不装 node"是 st-10 的治法（Maven 单体里的
+    Thymeleaf/admin 静态资源带个 package.json，装 node 纯浪费且会误派 npm 构建）。扫全部清单
+    只是把判据从"根有没有"放宽到"**有没有**"，静态资源那条结论不变。
+
+    `dep_source` 决定 npm warmup 在哪个目录跑 `npm ci`：
+      · 根声明了 `workspaces`（依赖提升到根）或根自己有脚本 → 根清单；
+      · 否则 → **最浅的那个有脚本的清单**（单前端在子目录的常见形态，如 `ui/package.json`）。
+    """
+    import json
+
+    def _read(rel: str) -> dict | None:
+        try:
+            data = json.loads((root / rel).read_text(encoding="utf-8", errors="ignore"))
+            return data if isinstance(data, dict) else None
+        except Exception:  # noqa: BLE001 — 单个清单读不出不代表整体结论
+            return None
+
+    ordered = sorted(pkgs, key=lambda p: (p.count("/") + p.count("\\"), len(p)))
+    root_pkg = ordered[0]
+    scanned = ordered[:_NPM_SCAN_CAP]
+
     node_version: str | None = None
-    try:
-        import json
-        data = json.loads((root / root_pkg).read_text(encoding="utf-8", errors="ignore"))
-        scripts = data.get("scripts", {}) or {}
-        has_build = bool(scripts.get("build") or scripts.get("test") or scripts.get("start"))
-        engines = data.get("engines", {}) or {}
-        if isinstance(engines, dict) and engines.get("node"):
-            m = re.search(r"(\d+)", str(engines["node"]))
-            node_version = m.group(1) if m else None
-    except Exception:  # noqa: BLE001
-        has_build = True  # 解析失败保守装 node
-    if not has_build:
-        return None  # 纯静态资源，无需 node 工具链
-    return Toolchain(name="node", version=node_version, build_tool="npm", dep_source=root_pkg)
+    with_scripts: list[str] = []
+    unreadable = False
+    root_declares_workspaces = False
+    for rel in scanned:
+        data = _read(rel)
+        if data is None:
+            unreadable = True
+            continue
+        scripts = data.get("scripts") or {}
+        if isinstance(scripts, dict) and any(scripts.get(k) for k in _NPM_BUILD_SCRIPTS):
+            with_scripts.append(rel)
+        if rel == root_pkg and data.get("workspaces"):
+            root_declares_workspaces = True
+        if node_version is None:
+            engines = data.get("engines") or {}
+            if isinstance(engines, dict) and engines.get("node"):
+                m = re.search(r"(\d+)", str(engines["node"]))
+                node_version = m.group(1) if m else None
+
+    if not with_scripts:
+        if unreadable:
+            # 解析失败保守装 node（维持原行为）——但只在**没有任何**可读清单给出结论时。
+            return Toolchain(name="node", version=node_version, build_tool="npm",
+                             dep_source=root_pkg)
+        return None  # 纯静态资源，无需 node 工具链（st-10 治法，刻意保留）
+
+    if root_declares_workspaces or root_pkg in with_scripts:
+        dep = root_pkg          # workspaces 的依赖提升到根，warmup 必须在根跑
+    else:
+        dep = with_scripts[0]   # 已按深度排序 ⇒ 最浅的那个有脚本的清单
+    return Toolchain(name="node", version=node_version, build_tool="npm", dep_source=dep)
 
 
 def _infer_simple(name: str, build_tool: str, root: Path, files: list[str]) -> Toolchain:
