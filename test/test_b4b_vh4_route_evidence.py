@@ -1,0 +1,126 @@
+"""B-4b V-H4：断言 evidence 语料供给侧补 Go/PHP/Rails/C#（27 号文 §3.3 HIGH）。
+
+`assertion_to_probe_cmd` / `evaluate_probe_result` 本身真栈中立，破防全在**语料侧**：
+`_accept_design_context` 用 `ROUTE_EVIDENCE_MARKERS` 挑"路由承载段"喂给断言生成 LLM，
+挑不中 → 无据可回指 → 合法断言被防臆造闸**确定性判成臆造** → 降 manual →
+`acceptance_passed=None` → 不阻断交付（第四道确定性闸对该栈整体失效）。
+
+★用**真实框架源码形态**造 diff 段喂生产函数本体★，不断言 marker 表的字面量（纪律 6）。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from swarm.brain.nodes.verify import _accept_design_context  # noqa: E402
+
+
+def _diff(path: str, body: str) -> str:
+    return (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            + "\n".join("+" + ln for ln in body.strip().splitlines()) + "\n")
+
+
+# 噪声段：**该栈的真源码后缀**且确实不含路由定义（夹具形状要让命题唯一——
+# 用 .md/.txt 当噪声会让"只是过滤了非代码文件"这个更弱的命题也成立）
+NOISE = {
+    "go": _diff("internal/util/str.go",
+                "package util\nfunc Trim(s string) string { return s }"),
+    "php": _diff("app/Models/User.php",
+                 "<?php\nclass User extends Model { protected $table = 'users'; }"),
+    "ruby": _diff("app/models/user.rb",
+                  "class User < ApplicationRecord\n  validates :email, presence: true\nend"),
+    "csharp": _diff("Models/User.cs",
+                    "namespace Api.Models;\npublic class User { public int Id { get; set; } }"),
+}
+
+ROUTE_SEGS = {
+    # ★路径刻意不含 `router.`★ 原写 internal/router/router.go —— 该路径本身命中既有
+    # marker `router.`，于是删掉全部 Go marker 这条照旧绿（突变 T1 实证）。
+    "go-gin": _diff("internal/server/setup.go",
+                    'r := gin.Default()\nr.GET("/api/users", handlers.ListUsers)\n'
+                    'r.POST("/api/users", handlers.CreateUser)'),
+    "go-echo": _diff("server/routes.go",
+                     'e := echo.New()\ne.GET("/api/orders", ListOrders)'),
+    "go-chi": _diff("api/mux.go",
+                    'r := chi.NewRouter()\nr.Get("/api/items", listItems)'),
+    "go-nethttp": _diff("cmd/server/main.go",
+                        'http.HandleFunc("/api/health", healthHandler)'),
+    # 仅建路由组、方法注册在别文件（真实拆分形态）——故**只有** `.group("/` 能命中；
+    # 原夹具带 `v1.GET("/ping")` 会被 `.get("/` 顺带命中，证不了 group token（突变 T7）
+    "go-gin-group": _diff("internal/api/groups.go",
+                          'v1 := r.Group("/api/v1")\nregisterUserRoutes(v1)'),
+    "php-laravel": _diff("routes/api.php",
+                         "<?php\nRoute::get('/users', [UserController::class, 'index']);\n"
+                         "Route::post('/users', [UserController::class, 'store']);"),
+    "rails": _diff("config/routes.rb",
+                   "Rails.application.routes.draw do\n  resources :users\n"
+                   "  namespace :api do\n    resources :orders\n  end\nend"),
+    "csharp-attr": _diff("Controllers/UserController.cs",
+                         '[ApiController]\n[Route("api/[controller]")]\npublic class '
+                         'UserController : ControllerBase {\n  [HttpGet]\n'
+                         '  public IActionResult List() => Ok();\n}'),
+    # 约定式路由控制器：**没有** `[Route(...)]`，故只能靠新增的 `[httpget` 命中
+    # （上面那条 attr 夹具含 `[Route(` → 被既有 marker `route(` 命中，证不了新 token）
+    "csharp-attr-only": _diff("Controllers/OrderController.cs",
+                              'public class OrderController : ControllerBase {\n'
+                              '  [HttpGet("orders")]\n'
+                              '  public IActionResult List() => Ok();\n}'),
+    "csharp-minimal": _diff("Program.cs",
+                            'app.MapGet("/api/users", () => Results.Ok());'),
+}
+
+
+# 路由段 → 同栈噪声段的键（显式映射，别从名字前缀推——`rails` 的噪声键是 `ruby`）
+NOISE_KEY = {"go-gin": "go", "go-echo": "go", "go-chi": "go", "go-nethttp": "go",
+             "go-gin-group": "go", "php-laravel": "php", "rails": "ruby",
+             "csharp-attr": "csharp", "csharp-attr-only": "csharp",
+             "csharp-minimal": "csharp"}
+
+
+@pytest.mark.parametrize("name", sorted(ROUTE_SEGS))
+def test_route_segment_is_selected_into_evidence(name):
+    """★V-H4 本尊★ 各栈真实路由定义段必须被选进 evidence（且走"优选"分支，非盲切回退）。
+
+    夹具刻意把**噪声段放在前面**：若路由段选不中，`_picked` 为空 → 回退 `diff[:4000]` 盲切，
+    大 diff 下路由定义就落在 4000 字符之外 = 防臆造纪律空转（原病）。
+    突变判据：删掉该栈的 marker，对应参数化用例必红。
+    """
+    lang = NOISE_KEY[name]
+    diff = NOISE[lang] * 3 + ROUTE_SEGS[name]
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "路由/接口承载段优选" in ctx, (
+        f"{name} 路由段未被选中 → 回退盲切（断言将无据可回指）\n{ctx[:400]}")
+    assert "diff --git" in ctx
+
+
+@pytest.mark.parametrize("lang", sorted(NOISE))
+def test_pure_noise_does_not_hit_route_markers(lang):
+    """★对照臂（区分力）★ 同栈的**非路由**源码段不得命中 marker。
+
+    没有这条，"marker 表匹配一切"的错实现也能满足上面全部用例——而那会把真路由段挤出
+    6000 预算（误杀方向，比漏更隐蔽）。
+    """
+    ctx = _accept_design_context({"merged_diff": NOISE[lang] * 3}, None)
+    assert "路由/接口承载段优选" not in ctx, (
+        f"{lang} 纯噪声段命中了路由 marker（表过宽 → 真路由段会被挤出预算）")
+
+
+def test_route_segment_wins_budget_against_many_noise_segments():
+    """预算竞争：噪声再多也不许把路由段挤出——`_route_segs` 先过滤再吃预算。"""
+    diff = "".join(NOISE.values()) * 6 + ROUTE_SEGS["rails"]
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "路由/接口承载段优选" in ctx
+    assert "resources :users" in ctx, "路由段被噪声挤出了 evidence"
+
+
+def test_jvm_markers_still_work():
+    """对照臂：JVM（唯一跑过 E2E 的栈）原有 marker 一条都没被本批改动破坏。"""
+    diff = _diff("src/main/java/com/x/UserController.java",
+                 '@RestController\n@RequestMapping("/api/users")\npublic class '
+                 'UserController {\n  @GetMapping\n  public List<User> list() { return null; }\n}')
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "路由/接口承载段优选" in ctx

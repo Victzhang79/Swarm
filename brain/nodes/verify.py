@@ -1299,6 +1299,38 @@ MAX_ACCEPT_GEN_RETRIES = 2
 ACCEPT_PER_ASSERT_BUFFER_SEC = 2
 
 
+# ★V-H4（27 号文 §3.3 HIGH）★ 断言 evidence 的**语料供给侧**——决定哪些 diff 段进
+# `_accept_design_context`。`assertion_to_probe_cmd`/`evaluate_probe_result` 本身是真栈中立的，
+# 破防全在这里：路由定义段选不中 → LLM 无据可回指 → 合法断言被防臆造闸**确定性判成臆造**
+# → 降 manual → `acceptance_passed=None` → 不阻断交付（第四道闸对该栈整体失效）。
+#
+# ★选 token 的判据：宁具体勿宽★ 这是**子串 OR 匹配 + 6000 字符预算**，过宽的 token 会让
+# 无关段也命中，把真路由段挤出预算（误杀方向，比漏更隐蔽）。故方法注册一律带上**路径字面量
+# 的引号+斜杠**（`.get("/`），它对 Gin/Echo/Chi/Express/Minimal-API 全命中，而
+# `cache.get("key")` 这类噪声不含 `/` 开头故不误命中。
+ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
+    # JVM（原有，勿动——RuoYi 基线唯一跑过 E2E 的栈）
+    "mapping(", "@getmapping", "@postmapping", "@putmapping", "@deletemapping",
+    "@requestmapping", "@controller", "@restcontroller",
+    # Python：Flask/FastAPI 装饰器 + Django urlconf（原有）
+    "@app.route", "@router", "urlpatterns", "path(",
+    # Node/前端（原有；`routes:`/`path:`/`createrouter(` 是 Vue Router 的 6.9-HF11）
+    "router.", "app.get(", "app.post(", "app.use(", "route(",
+    "createrouter(", "routes:", "path:",
+    # ★Go：Gin/Echo/Chi 的方法注册 + net/http★ 带引号斜杠故不误命中 `map.get(k)`
+    ".get(\"/", ".get('/", ".post(\"/", ".post('/", ".put(\"/", ".put('/",
+    ".delete(\"/", ".delete('/", ".patch(\"/", ".patch('/",
+    ".group(\"/", ".group('/", "handlefunc(", "http.handle(",
+    # ★PHP / Laravel★ `Route::get('/x')` —— 原 `route(` 要求紧跟括号，`Route::` 漏掉
+    "route::",
+    # ★Ruby / Rails★ config/routes.rb 的 DSL（无括号无装饰器，原表一条都不命中）
+    "resources :", "resource :", "namespace :", "root to:", "root :",
+    # ★C# / ASP.NET★ 属性路由 + Minimal API（`[Route(` 恰好被 `route(` 命中，其余全漏）
+    "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch",
+    "mapget(", "mappost(", "mapput(", "mapdelete(", "mapcontrollers(",
+)
+
+
 def _accept_design_context(state: BrainState, derivation) -> str:
     """断言生成 prompt 的设计/接口上下文（有界截断）。
 
@@ -1326,12 +1358,8 @@ def _accept_design_context(state: BrainState, derivation) -> str:
         _segs = ["diff --git " + p_ for p_ in diff.split("diff --git ")[1:]] or [diff]
         # 6.9-HF11：补前端路由定义 marker（Vue Router 的 createRouter({routes:[{path:'/x'}]})
         # 零命中会使后端段命中后前端路由段被排除出 evidence，页面断言无据可指）。
-        _route_markers = ("mapping(", "@getmapping", "@postmapping", "@putmapping",
-                          "@deletemapping", "@requestmapping", "@app.route", "@router",
-                          "router.", "app.get(", "app.post(", "app.use(", "urlpatterns",
-                          "@controller", "@restcontroller", "path(", "route(",
-                          "createrouter(", "routes:", "path:")
-        _route_segs = [g for g in _segs if any(k in g.lower() for k in _route_markers)]
+        _route_segs = [g for g in _segs
+                       if any(k in g.lower() for k in ROUTE_EVIDENCE_MARKERS)]
         _budget = 6000
         _picked: list[str] = []
         for g in _route_segs:
