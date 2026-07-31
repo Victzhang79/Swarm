@@ -121,10 +121,10 @@ _LANGUAGE_ALIASES: tuple[tuple[str, str], ...] = (
     ("golang", "go"),
     ("go", "go"),
     ("rust", "rust"),
-    # ★V-C2（27 号文 §3.3 CRITICAL 假过）★ 缺这四个键 → language_key=None → `_match_family`
+    # ★V-C2（27 号文 §3.3 CRITICAL 假过）★ 缺这五个键 → language_key=None → `_match_family`
     # 只取 `generic`，而 `_CODE_ERROR_PATTERNS` **刻意无 generic 键**（无表命中绝不默认判代码错）
     # → 这些栈**任何启动崩溃都落 inconclusive(skipped)** → auto_accept → 交付坏产物。
-    # token 取自**确定性生产者的词表**（`stack_detect._LANG_EXTS` 的键，经
+    # token 取自**确定性生产者的词表**（`stack_detect._LANG_SOURCE_EXTS` 的键，经
     # `profile["backend"] = f"{backend_fw} ({backend_lang})"` 落盘）——不是我猜的拼法。
     # 本表契约＝**语言别名**，刻意不收框架名（laravel/rails/phoenix）：那是 §2.1"backend 是
     # LLM 可写裸 str"的独立缺口，混进来会把本表语义悄悄改成"语言或框架"（消费契约漂移）。
@@ -175,7 +175,7 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         r"unwrap\(\)`? on (an? )?(`?Err`?|`?None`?)",
         r"attempt to .{0,40}overflow",
     ),
-    # ★V-C2★ 以下四栈同 F5 口径：只收**与依赖安装/外部服务无关**的确定性代码故障。
+    # ★V-C2★ 以下五栈同 F5 口径：只收**与依赖安装/外部服务无关**的确定性代码故障。
     # 刻意不收的（会把环境冤枉成代码，fail-honest）：PHP `Class not found`（多为 autoload/
     # 扩展缺失）· Ruby `LoadError`（gem 未装）· C# `Could not load file or assembly`
     # （NuGet 未还原）· Elixir `** (Mix)`（依赖未 deps.get）——它们属类2/import 缺失族。
@@ -189,7 +189,11 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
     "ruby": (
         r"syntax error, unexpected",
         r"\bSyntaxError\b",
-        r"\bNoMethodError\b",          # nil 上调方法＝典型代码缺陷
+        # ★F-3（hunter 复核，误杀）★ 原写裸 `NoMethodError` ＝把 nil 解引用一律判代码错，
+        # 而 `ENV["DATABASE_URL"].split(":")` 在无该 env 的沙箱里恒 nil-deref ＝**环境形态**
+        # （go/rust 表刻意把 env 缺失形态放进类2 来化解同一个坑，ruby/dart 当时没有对称保险）。
+        # 收窄成"接收者**不是** nil"的真·方法不存在：Ruby 两版格式都印 `for nil`/`for nil:NilClass`。
+        r"undefined method [^\n]{0,80} for (?!nil)",
         r"\bZeroDivisionError\b",
     ),
     "csharp": (
@@ -201,7 +205,6 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         # 一律判环境会造出假过。故留空不归类 → 落 inconclusive skipped（fail-honest）；
         # 真正的分档要靠 _IMPORT_MISSING_PATTERNS + project_symbols，见登记册 O-5。
         r"\berror CS(?!0246\b|0234\b)\d{4}\b",
-        r"System\.NullReferenceException",
         r"System\.IndexOutOfRangeException",
         r"System\.InvalidCastException",
     ),
@@ -217,7 +220,8 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         # log_text 是 `tail -n 200` 的日志尾，`_match_family` 此处 flags=0 → `^` 只匹配
         # **整串开头**，几乎恒不命中。写死锚点＝这一档静默失效。
         r"Error: Expected",
-        r"\bNoSuchMethodError\b",
+        # 同 F-3：`was called on null` 是 nil-deref（多为缺 env/配置），不判代码错
+        r"NoSuchMethodError(?![^\n]{0,80}called on null)",
         r"is not a subtype of type",
     ),
 }
@@ -266,7 +270,7 @@ _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
     "rust": (
         r"thread '.*' panicked at",
     ),
-    # ★V-C2★ 这四栈原先连"崩了但归不到代码"这个名字都没有（language_key=None 时只有
+    # ★V-C2★ 这五栈原先连"崩了但归不到代码"这个名字都没有（language_key=None 时只有
     # generic 那条 Spring 字面串）→ 崩溃与"什么都没发生"共用 inconclusive。
     # 与 _CODE_ERROR_PATTERNS 分工：这里收**已确认崩了但可能裹着环境因**的形态。
     "php": (
@@ -276,10 +280,26 @@ _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
     "ruby": (
         r"rails aborted!",
         r"bundler: failed to load command",
+        # ★F-5（hunter 复核）★ gem 未装是 ruby 沙箱最高频失败形态，原先落 `inconclusive`
+        # ——语义是"什么都没观测到"，与"崩了"共用一个机读值（本文件 C-6 批判的病灶本身）。
+        # 归到"崩了但归不到代码"：仍 skipped 不冤枉代码，但**崩溃这个事实机读可辨**。
+        r"\bLoadError\b",
+        r"Could not find gem ",
+        r"Bundler::GemNotFound",
+        # nil-deref（类1 已按 F-3 收窄成非 nil 接收者）——应用**确实崩了**，只是归因待定。
+        # 不落这里就会回到 `inconclusive`＝与"什么都没观测到"同值（C-6 病灶复发）。
+        r"\bNoMethodError\b",
     ),
     "csharp": (
         r"Unhandled exception\. System\.",
         r"Application startup exception",
+        # ★F-5★ CS0246/CS0234 被类1 的否定预查刻意排除（NuGet 未 restore 的编译期形态），
+        # 但"连编译都没过"绝不能与"什么都没发生"同判 inconclusive。落此族＝崩了、归因待定。
+        r"\berror CS(0246|0234)\b",
+        r"The build failed",
+        # ★F-3 次级★ NRE 从消息辨不出接收者是不是 null-config（`Configuration["X"]` 返 null
+        # 在无 env 的沙箱是常态）→ 移出类1 落此族，避免把环境冤枉成代码。
+        r"System\.NullReferenceException",
     ),
     "elixir": (
         r"\*\* \(Mix\) ",
@@ -288,6 +308,8 @@ _STARTUP_CRASH_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "dart": (
         r"Unhandled exception:",
+        # 同上：`called on null` 已从类1 排除，但崩溃事实要机读可辨
+        r"\bNoSuchMethodError\b",
     ),
 }
 
@@ -358,7 +380,10 @@ _ENV_MISSING_PATTERNS: dict[str, tuple[str, ...]] = {
     # `Connection refused`（generic 那条抓不到）→ 不补就会落进 code_error/inconclusive，
     # 把"沙箱没有 DB"冤枉成代码问题（fail-honest 的反方向同样致命）。
     "php": (
-        r"SQLSTATE\[",
+        # ★F-4（hunter 复核，假过）★ 原写前缀 `SQLSTATE\[` 通吃全域，把 `SQLSTATE[42000]`
+        # （SQL 语法错）/`[42S02]`（表不存在）这类**纯代码/迁移缺陷**判成"沙箱没有外部服务"
+        # → skipped → auto_accept 放行坏产物。收窄到**连接类** class code。
+        r"SQLSTATE\[(08|28|3D|HY000)",
         r"could not find driver",
     ),
     "ruby": (
@@ -1135,14 +1160,29 @@ def classify_smoke_outcome(
                 details["degraded"] = True
                 details["probe_health_verified"] = False
                 details["probe_target_derived"] = bool(health_path_derived)
-                _where = ("证据推导出的健康端点" if health_path_derived
-                          else "回退路径 `/`（未推出健康端点）")
+                # ★F-2（hunter 复核）★ 必须按 **provenance 分档**，两档后果不同：
+                # ① 证据推出的健康端点返非 2xx ＝ 真信号（路由没注册/端点坏了）→ 沿用
+                #    `started_health_unverified`，经 verify.py 产阻断性 degraded 账、拦 L6。
+                # ② 压根没推出健康端点、探的是回退 `/` ＝ 我们**从来没有健康契约**，这不是
+                #    本次交付的降级，而是 `_HEALTH_ENDPOINT_MARKERS` 只认 4 条（全 JVM/Nest）
+                #    的既有覆盖缺口。而"裸 API 对 `/` 返 404"正是 V-H3 的立项论据＝**常态**
+                #    → 若也走阻断档，`degraded_reasons` 对所有非 actuator 栈恒非空 →
+                #    `should_write_success` 恒 False → **L6 成功学习通道永久归零且无信号**
+                #    （norms 层死 12 天无人知的同型）。故走信息性档：留痕可见、不拦 L6。
+                # ★这正是"复用单一事实源 ≠ 复用其消费契约"★——账可以共享，后果不同必须分档。
+                # 顺带：这给 `probe_target_derived` 接上了真消费者（不再只有测试读它）。
+                if health_path_derived:
+                    _cls_name, _where = ("started_health_unverified",
+                                         "证据推导出的健康端点")
+                else:
+                    _cls_name, _where = ("started_no_health_contract",
+                                         "回退路径 `/`（未推出健康端点）")
                 logger.warning(
                     "[RUNTIME_SMOKE] V-H3 探活应答 HTTP %s（3xx/4xx）于%s——应用在监听但"
                     "**未验到它真能服务**，判 passed 但标 degraded（对 `/` 返 404 合法，"
                     "判失败即误杀）", _http_code, _where)
                 return RuntimeSmokeResult(
-                    "passed", "started_health_unverified",
+                    "passed", _cls_name,
                     f"运行时冒烟通过（**未验到应用健康**：{_where}返回 HTTP {_http_code}，"
                     "非 2xx——只证明了端口在监听）",
                     log_tail=log_text, details=details)

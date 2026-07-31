@@ -38,7 +38,7 @@ BACKEND_DISPLAY = [
 
 @pytest.mark.parametrize("display,expect", BACKEND_DISPLAY)
 def test_producer_display_string_resolves_to_a_language_key(display, expect):
-    """★接线的起点★ 这些 token 取自 `stack_detect._LANG_EXTS` 的键，不是猜的拼法。
+    """★接线的起点★ 这些 token 取自 `stack_detect._LANG_SOURCE_EXTS` 的键，不是猜的拼法。
 
     突变判据：从 `_LANGUAGE_ALIASES` 删掉任一条，对应参数化用例必红。
     """
@@ -51,19 +51,20 @@ CODE_ERROR_LOGS = [
             "/app/routes/web.php on line 42"),
     ("php", "PHP Fatal error:  Uncaught TypeError: App\\Http\\UserController::show(): "
             "Argument #1 ($id) must be of type int, string given"),
-    ("ruby", "app/models/user.rb:17:in `full_name': undefined method `upcase' for nil "
-             "(NoMethodError)"),
+    # ★F-3 整改★ 原样本是 `for nil` ＝ nil-deref（`ENV["X"].split` 在无 env 的沙箱恒如此）
+    # ＝**环境形态**，原先判 code_error 是误杀，而这条测试正替它背书。换成真·方法不存在。
+    ("ruby", "app/models/user.rb:17:in `full_name': undefined method `upcase' for "
+             "an instance of User (NoMethodError)"),
     ("ruby", "/app/config/routes.rb:8: syntax error, unexpected ')', expecting "
              "end-of-input"),
     ("csharp", "/src/Controllers/UserController.cs(23,17): error CS0103: The name "
                "'_repo' does not exist in the current context"),
-    ("csharp", "Unhandled exception. System.NullReferenceException: Object reference "
-               "not set to an instance of an object."),
     ("elixir", "** (CompileError) lib/app_web/router.ex:12: undefined function get/2"),
     ("elixir", "** (FunctionClauseError) no function clause matching in "
                "AppWeb.UserController.show/2"),
-    ("dart", "Unhandled exception:\nNoSuchMethodError: The method 'toUpperCase' was "
-             "called on null."),
+    # 同 F-3：`called on null` 是 nil-deref，换成真·无此方法
+    ("dart", "Unhandled exception:\nNoSuchMethodError: Class 'Report' has no instance "
+             "method 'toUpperCase'."),
 ]
 
 
@@ -193,6 +194,10 @@ def test_nuget_unrestored_compile_errors_are_not_code_error(log):
     res = classify_smoke_outcome("1", log, [], language_key="csharp")
     assert res.status != "failed", (
         f"NuGet 未还原被冤判 {res.status}/{res.classification}（环境伪装成代码）")
+    # ★F-5 整改★ 原来只断 `!= "failed"` ＝零区分力：`inconclusive`（什么都没观测到）与
+    # `startup_crash_unattributed`（崩了但归因待定）都满足，于是测试**主动允许**了
+    # "连编译都没过"被写成"什么都没发生"——正是本文件 C-6 批判的病灶。
+    assert res.classification == "startup_crash_unattributed", res.classification
 
 
 def test_genuine_cs_compile_error_still_fails():
@@ -205,3 +210,89 @@ def test_genuine_cs_compile_error_still_fails():
         "does not exist in the current context", [], language_key="csharp")
     assert res.status == "failed", f"{res.status}/{res.classification}"
     assert res.classification == "code_error"
+
+
+# ══════════════════════════════════════════════
+# hunter 复核整改：F-3 / F-4 / F-5 边界
+# ══════════════════════════════════════════════
+
+@pytest.mark.parametrize("lang,log", [
+    ("ruby", "/app/config/database.rb:7:in `<main>': undefined method `split' for nil"
+             ":NilClass (NoMethodError)"),
+    ("ruby", "/app/config/app.rb:3: undefined method `upcase' for nil (NoMethodError)"),
+    ("dart", "Unhandled exception:\nNoSuchMethodError: The method 'split' was called "
+             "on null."),
+])
+def test_nil_deref_is_not_code_error(lang, log):
+    """★F-3★ nil/null 解引用不判 code_error——沙箱缺 ENV 时 `ENV["X"].split(":")` 恒如此。
+
+    `failed:code_error` 会硬拦交付 + 回灌重派写者，把环境问题变成烧预算的重试循环
+    （fail-honest 铁律：环境绝不伪装代码失败）。
+    突变判据：把否定预查 `(?!nil)` / `(?!...called on null)` 去掉，本条必红。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key=lang)
+    assert res.status != "failed", (
+        f"{lang} nil-deref 被冤判 {res.status}/{res.classification}（环境伪装成代码）")
+    # 但"崩了"这个事实必须机读可辨（否则回到 C-6：崩溃与"什么都没发生"同值）
+    assert res.classification == "startup_crash_unattributed", res.classification
+
+
+@pytest.mark.parametrize("lang,log", [
+    ("ruby", "app/models/user.rb:17: undefined method `upcase' for an instance of User "
+             "(NoMethodError)"),
+    ("dart", "NoSuchMethodError: Class 'Report' has no instance method 'toUpperCase'."),
+])
+def test_genuine_missing_method_still_code_error(lang, log):
+    """★F-3 对照臂★ 真·方法不存在（接收者非 nil）照旧 `failed:code_error`。
+
+    没有这条，"把 NoMethodError 整条删掉"也能满足上面那组（零区分力）。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key=lang)
+    assert res.status == "failed" and res.classification == "code_error", \
+        f"{res.status}/{res.classification}"
+
+
+@pytest.mark.parametrize("log", [
+    "SQLSTATE[42000]: Syntax error or access violation: 1064 You have an error in your "
+    "SQL syntax near 'SELECT * FORM users'",
+    "SQLSTATE[42S02]: Base table or view not found: 1146 Table 'app.orders' doesn't exist",
+])
+def test_sql_syntax_and_missing_table_are_not_env_missing(log):
+    """★F-4（假过）★ `SQLSTATE[42xxx]` 是 SQL 语法错/表不存在＝代码或迁移缺陷，不是"环境缺失"。
+
+    原前缀 `SQLSTATE\\[` 通吃全域 → 判 env_missing → skipped → auto_accept 放行坏产物，
+    且消息自信地写"沙箱内无外部服务"。收窄到连接类 class code（08/28/3D/HY000）。
+    突变判据：把 class code 限定去掉退回 `SQLSTATE\\[`，本条必红。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key="php")
+    assert res.classification != "env_missing", (
+        f"SQL 缺陷被归成环境缺失（自信且错误的归因）：{res.classification}")
+
+
+def test_connection_class_sqlstate_still_env_missing():
+    """★F-4 对照臂★ 连接类 SQLSTATE 照旧 env_missing（收窄没把这档一起砍掉）。"""
+    # ★样本刻意不含字面 `Connection refused`★ 那是 `_ENV_MISSING_PATTERNS["generic"]`
+    # 抓的——**通用族会替语言族背书**，删掉 php 条目本条照旧绿（突变 H4b 当场证实，
+    # 与本文件上方 Q7/Q8 同一个坑）。08xxx 是连接类 class code。
+    res = classify_smoke_outcome(
+        "1", "SQLSTATE[08006] [7] server closed the connection unexpectedly",
+        [], language_key="php")
+    assert res.classification == "env_missing", res.classification
+
+
+@pytest.mark.parametrize("lang,log,why", [
+    ("ruby", "Could not find gem 'pg' in locally installed gems", "gem 未装（ruby 最高频）"),
+    ("ruby", "/usr/lib/ruby/rubygems.rb:275:in `to_spec': LoadError", "LoadError 裸形态"),
+    ("csharp", "/src/Api/UserController.cs(4,7): error CS0246: The type or namespace "
+               "name 'Newtonsoft' could not be found\nThe build failed.", "NuGet 未 restore"),
+])
+def test_dependency_absence_is_crash_not_nothing_observed(lang, log, why):
+    """★F-5★ "依赖没装/编译没过"必须机读可辨为**崩了**，不许落 `inconclusive`。
+
+    `inconclusive` 的语义是"探活窗口耗尽/无任何已知形态命中"——把「日志明写 error CS0246 +
+    The build failed」与「什么都没发生」写成同一个值，正是本文件 C-6 批判的病灶。
+    仍 skipped（不冤枉代码），但交付面与复盘能一眼看出应用没起来。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key=lang)
+    assert res.status == "skipped", f"{why}: {res.status}"
+    assert res.classification == "startup_crash_unattributed", f"{why}: {res.classification}"

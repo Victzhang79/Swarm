@@ -868,10 +868,22 @@ async def verify_runtime(state: BrainState) -> dict:
             # 应用的执行路径（应用进程只活在单次 run_command 内，ACCEPTANCE_DESIGN 定案1）
             assert_cmds=assert_cmds or None,
         )
+        # ★F-6（hunter 复核）★ V-C2 三张崩溃归因族表的前提是 language_key 非 None。确定性
+        # 生产者（stack_detect）没问题，但 `planning_nodes` 允许**模型裁决覆写** backend 为
+        # 裸自由文本（`adj.backend or profile["backend"]`），写成 "Laravel"/"ASP.NET Core"
+        # 这类**只有框架名**的串时 normalize 返 None → 整族退回改动前（全 inconclusive）。
+        # 降级路径必须至少一次 WARNING（否则这条前提静默失守，无人知道闸没在跑）。
+        _lang_key = normalize_language_key(project_stack.get("backend"))
+        _backend_raw = str(project_stack.get("backend") or "").strip()
+        if _lang_key is None and _backend_raw and _backend_raw != "未判明":
+            logger.warning(
+                "[VERIFY_RUNTIME] backend=%r 解析不出语言键 → 崩溃归因族（code_error/"
+                "startup_crash/env_missing）**整体不在场**，本轮冒烟只能落 inconclusive。"
+                "多为 LLM 裁决把 backend 覆写成了纯框架名（缺 `(语言)` 后缀）", _backend_raw[:80])
         res = await run_runtime_smoke(
             manager, sandbox, script,
             timeout_sec=smoke_window,
-            language_key=normalize_language_key(project_stack.get("backend")),
+            language_key=_lang_key,
             prepare_timeout_sec=prepare_budget or None,
             project_symbols=project_symbols,
             probe_port=derivation.port,
@@ -1304,11 +1316,17 @@ ACCEPT_PER_ASSERT_BUFFER_SEC = 2
 # 破防全在这里：路由定义段选不中 → LLM 无据可回指 → 合法断言被防臆造闸**确定性判成臆造**
 # → 降 manual → `acceptance_passed=None` → 不阻断交付（第四道闸对该栈整体失效）。
 #
-# ★选 token 的判据：宁具体勿宽★ 这是**子串 OR 匹配 + 6000 字符预算**，过宽的 token 会让
-# 无关段也命中，把真路由段挤出预算（误杀方向，比漏更隐蔽）。故方法注册一律带上**路径字面量
-# 的引号+斜杠**（`.get("/`），它对 Gin/Echo/Chi/Express/Minimal-API 全命中，而
-# `cache.get("key")` 这类噪声不含 `/` 开头故不误命中。
-ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
+# ★选 token 的判据：命中面积是设计变量（F-1 复核血泪）★ 这是**子串 OR 匹配 + 6000 字符预算**
+# 的先到先得，过宽的 token 会让无关段也命中、把真路由段挤出预算（误杀方向，比漏更隐蔽）。
+# 我第一版论证只考察了 `cache.get("key")`（不含 `/` 故不误命中）就收了工，而**全世界的 HTTP
+# 客户端调用都长成 `.get("/path")`**：axios/requests/httpx/supertest 全部命中。实测后果——
+# 4 个 axios 服务层文件段就能吃光 6000 预算，真路由段一个字都进不去（且这会改变**既有已工作
+# 栈**的行为：Node 项目的 `src/api/*.ts` 从此与路由段抢预算）。
+#
+# 治法不是删掉这些 token（那会丢 Gin/Echo/Chi 的召回），而是**分层 + 按特异性排序吃预算**：
+# 零歧义 token（`handlefunc(`/`mapget(`/`resources :`/`@getmapping`…）先吃，宽 token
+# （`.get("/` 这类"方法+路径字面量"）只在还有余量时补位。召回不变、优先级可控。
+_ROUTE_MARKERS_SPECIFIC: tuple[str, ...] = (
     # JVM（原有，勿动——RuoYi 基线唯一跑过 E2E 的栈）
     "mapping(", "@getmapping", "@postmapping", "@putmapping", "@deletemapping",
     "@requestmapping", "@controller", "@restcontroller",
@@ -1317,10 +1335,8 @@ ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
     # Node/前端（原有；`routes:`/`path:`/`createrouter(` 是 Vue Router 的 6.9-HF11）
     "router.", "app.get(", "app.post(", "app.use(", "route(",
     "createrouter(", "routes:", "path:",
-    # ★Go：Gin/Echo/Chi 的方法注册 + net/http★ 带引号斜杠故不误命中 `map.get(k)`
-    ".get(\"/", ".get('/", ".post(\"/", ".post('/", ".put(\"/", ".put('/",
-    ".delete(\"/", ".delete('/", ".patch(\"/", ".patch('/",
-    ".group(\"/", ".group('/", "handlefunc(", "http.handle(",
+    # ★Go net/http★ 零歧义（客户端侧不会出现）
+    "handlefunc(", "http.handle(",
     # ★PHP / Laravel★ `Route::get('/x')` —— 原 `route(` 要求紧跟括号，`Route::` 漏掉
     "route::",
     # ★Ruby / Rails★ config/routes.rb 的 DSL（无括号无装饰器，原表一条都不命中）
@@ -1328,6 +1344,17 @@ ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
     # ★C# / ASP.NET★ 属性路由 + Minimal API（`[Route(` 恰好被 `route(` 命中，其余全漏）
     "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch",
     "mapget(", "mappost(", "mapput(", "mapdelete(", "mapcontrollers(",
+)
+# 宽档：Gin/Echo/Chi 的方法注册**与 HTTP 客户端调用同形**，无法靠字面区分（区别在接收者是
+# 路由器还是 http client，而那要真解析）。故保留召回但排在后面吃预算。
+_ROUTE_MARKERS_BROAD: tuple[str, ...] = (
+    ".get(\"/", ".get('/", ".post(\"/", ".post('/", ".put(\"/", ".put('/",
+    ".delete(\"/", ".delete('/", ".patch(\"/", ".patch('/",
+    ".group(\"/", ".group('/",
+)
+# 全集（保留单一事实源语义：判"是不是路由承载段"用它；排序用上面两档）
+ROUTE_EVIDENCE_MARKERS: tuple[str, ...] = (
+    _ROUTE_MARKERS_SPECIFIC + _ROUTE_MARKERS_BROAD
 )
 
 
@@ -1358,8 +1385,14 @@ def _accept_design_context(state: BrainState, derivation) -> str:
         _segs = ["diff --git " + p_ for p_ in diff.split("diff --git ")[1:]] or [diff]
         # 6.9-HF11：补前端路由定义 marker（Vue Router 的 createRouter({routes:[{path:'/x'}]})
         # 零命中会使后端段命中后前端路由段被排除出 evidence，页面断言无据可指）。
-        _route_segs = [g for g in _segs
-                       if any(k in g.lower() for k in ROUTE_EVIDENCE_MARKERS)]
+        # ★F-1 整改★ 特异档优先吃预算，宽档补位（见 ROUTE_EVIDENCE_MARKERS 上方论证）。
+        # 稳定排序：同档内保持 diff 原序（判序可复现，别让 evidence 随字典序抖动）。
+        _specific = [g for g in _segs
+                     if any(k in g.lower() for k in _ROUTE_MARKERS_SPECIFIC)]
+        _broad_only = [g for g in _segs
+                       if g not in _specific
+                       and any(k in g.lower() for k in _ROUTE_MARKERS_BROAD)]
+        _route_segs = _specific + _broad_only
         _budget = 6000
         _picked: list[str] = []
         for g in _route_segs:

@@ -124,3 +124,60 @@ def test_jvm_markers_still_work():
                  'UserController {\n  @GetMapping\n  public List<User> list() { return null; }\n}')
     ctx = _accept_design_context({"merged_diff": diff}, None)
     assert "路由/接口承载段优选" in ctx
+
+
+# ══════════════════════════════════════════════
+# F-1 / F-7（hunter 复核）：命中型噪声才会真的抢预算
+# ══════════════════════════════════════════════
+
+# ★这些**命中** marker 却不是路由定义★——HTTP 客户端调用与路由注册字面同形
+# （区别在接收者是路由器还是 http client，靠字面无法区分）。原"预算竞争"用例用的噪声
+# （Model 类/util 函数）命中零个 marker，在过滤阶段就被剔掉、从没进过预算循环，
+# 所以它证明的是"过滤在预算之前"，不是"噪声挤不出路由段"。F-1 正是从这个缺口漏过去的。
+HITTING_NOISE = {
+    "axios": _diff("src/api/userClient.ts",
+                   "\n".join(f'export const get{i} = () => axios.get("/api/thing{i}");'
+                             for i in range(60))),
+    "supertest": _diff("tests/api/user.spec.ts",
+                       "\n".join(f"await request(app).get('/users/{i}');"
+                                 for i in range(60))),
+    # 每段必须 > 单段预算上限 2000，三段才吃满 6000——原来 httpx 段只 1829 字符，
+    # 剩 171 字节仍够塞进 118 字符的路由段，于是突变 H1a 照旧绿（夹具没造出真实压力）。
+    "httpx": _diff("tests/test_api.py",
+                   "\n".join(f'r = client.get("/items/{i}", timeout=30)  # case {i}'
+                             for i in range(60))),
+}
+
+
+def test_client_call_noise_does_not_crowd_out_real_route_segment():
+    """★F-1（HIGH 误杀，实证）★ 客户端调用段吃光预算 → 真路由段一个字进不去 evidence。
+
+    段序按路径：`src/api/` < `src/routes/`、`tests/` 亦在前 → 先到先得下路由段饿死
+    → 断言无据可回指 → 合法断言被判臆造 → 第四道闸对该任务整体 fail-open。
+    治法＝特异档优先吃预算、宽档补位。
+    突变判据：把 `_specific + _broad_only` 改回单一 `any(... ROUTE_EVIDENCE_MARKERS)`，本条必红。
+    """
+    diff = "".join(HITTING_NOISE.values()) + ROUTE_SEGS["csharp-minimal"]
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "路由/接口承载段优选" in ctx
+    # ★无 `or` 逃生门★ 原写 `'…/api/orders' in ctx or "mapget" in ctx.lower()`——夹具里是
+    # `/api/users`，第一子句恒 False，整条靠 or 右支恒真（H-2 同一个坑，突变 H1a 当场暴露）。
+    assert 'app.MapGet("/api/users"' in ctx, (
+        f"真路由段被客户端调用段挤出了 evidence（F-1 复发）；ctx 长度={len(ctx)}")
+
+
+def test_specific_markers_outrank_broad_ones_in_budget():
+    """特异档（`mapget(`/`resources :`/`@getmapping`）必须排在宽档（`.get("/`）之前。
+
+    夹具：命中型噪声 ×3（只命中宽档）+ Rails 路由段（只命中特异档，且排在最后）。
+    """
+    diff = "".join(HITTING_NOISE.values()) + ROUTE_SEGS["rails"]
+    ctx = _accept_design_context({"merged_diff": diff}, None)
+    assert "resources :users" in ctx, "特异档没有优先吃到预算"
+
+
+def test_broad_markers_still_recall_gin_when_no_competition():
+    """宽档不是被删掉、只是排在后面：无竞争时 Gin 的 `r.GET("/x")` 照旧进 evidence。"""
+    ctx = _accept_design_context({"merged_diff": ROUTE_SEGS["go-gin"]}, None)
+    assert "路由/接口承载段优选" in ctx
+    assert 'r.GET("/api/users"' in ctx

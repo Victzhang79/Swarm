@@ -29,7 +29,9 @@ def test_non_2xx_answer_is_passed_but_degraded(code):
 
     突变判据：把 `if _http_code[:1] in ("3", "4")` 整块删掉 → 回到 `passed:started`，本条必红。
     """
-    res = classify_smoke_outcome("alive", "", _probe(code))
+    # provenance 显式给 True：F-2 后两档分开（回退 `/` 走 started_no_health_contract），
+    # 本条锁的是"3xx/4xx 不再冒充满格通过"这件事，故固定在信号更强的那一档上断言。
+    res = classify_smoke_outcome("alive", "", _probe(code), health_path_derived=True)
     assert res.status == "passed", f"3xx/4xx 被判 {res.status}＝误杀方向"
     assert res.classification == "started_health_unverified", res.classification
     assert res.details.get("degraded") is True, res.details
@@ -85,7 +87,7 @@ def test_degraded_pass_reason_reaches_state_and_blocks_l6():
     # 于是把生产里的 classification 改回 `"started"` 时本条照旧绿（突变 S2 当场证实）——
     # 测的是"verify.py 会把非 started 变成账"，而不是"V-H3 的新档位真的流到了账上"。
     # 这正是 B-4a CRITICAL-1 那一族（手工构造 state → 测不到生产接线）。
-    res = classify_smoke_outcome("alive", "", _probe("404"))
+    res = classify_smoke_outcome("alive", "", _probe("404"), health_path_derived=True)
     assert res.classification == "started_health_unverified", res.classification
     out = _run_verify_runtime(res)
     reasons = out.get("degraded_reasons") or []
@@ -93,3 +95,48 @@ def test_degraded_pass_reason_reaches_state_and_blocks_l6():
                for r in reasons), reasons
     assert blocking_degraded_reasons(reasons), (
         f"降级通过没有阻断 L6 成功学习（会把『没验到健康』学成成功模式）：{reasons}")
+
+
+# ══════════════════════════════════════════════
+# F-2（hunter 复核）：按 provenance 分档——两档消费契约不同
+# ══════════════════════════════════════════════
+
+def test_no_health_contract_is_informational_not_l6_blocking():
+    """★F-2★「压根没推出健康端点、探的是回退 `/`」→ 信息性档，**不**拦 L6。
+
+    `_HEALTH_ENDPOINT_MARKERS` 只认 4 条（全 JVM/Nest），而"裸 API 对 `/` 返 404"正是
+    V-H3 的立项论据＝**常态**。若它也走阻断档，`degraded_reasons` 对所有非 actuator 栈
+    恒非空 → `should_write_success` 恒 False → L6 成功学习通道**永久归零且无信号**。
+    这就是"复用单一事实源 ≠ 复用其消费契约"：账可共享，后果不同必须分档。
+    突变判据：把该档从 `INFORMATIONAL_DEGRADED_PREFIXES` 删掉，本条必红。
+    """
+    from swarm.memory.pattern_extractor import blocking_degraded_reasons
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_q_batch_runtime_gate import _run_verify_runtime
+
+    res = classify_smoke_outcome("alive", "", _probe("404"), health_path_derived=False)
+    assert res.classification == "started_no_health_contract", res.classification
+    out = _run_verify_runtime(res)
+    reasons = out.get("degraded_reasons") or []
+    assert any("started_no_health_contract" in r for r in reasons), (
+        f"降级事实必须仍然可见（只是不拦 L6）：{reasons}")
+    assert not blocking_degraded_reasons(reasons), (
+        f"覆盖缺口档不该拦 L6（会把非 actuator 栈的成功学习永久归零）：{reasons}")
+
+
+def test_derived_health_endpoint_failing_still_blocks_l6():
+    """★F-2 对照臂★ 证据推出的健康端点返非 2xx ＝**真信号**（路由没注册/端点坏了）→ 仍拦 L6。
+
+    没有这条，"把两档都列进信息性白名单"也能满足上面（那会让 V-H3 的阻断力整体归零）。
+    """
+    from swarm.memory.pattern_extractor import blocking_degraded_reasons
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_q_batch_runtime_gate import _run_verify_runtime
+
+    res = classify_smoke_outcome("alive", "", _probe("404"), health_path_derived=True)
+    assert res.classification == "started_health_unverified", res.classification
+    reasons = _run_verify_runtime(res).get("degraded_reasons") or []
+    assert blocking_degraded_reasons(reasons), (
+        f"证据推出的健康端点坏了是真信号，必须拦 L6：{reasons}")

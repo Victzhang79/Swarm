@@ -28,6 +28,13 @@ INFORMATIONAL_DEGRADED_PREFIXES = (
     "requirements_extract:rejected=",
     "acceptance_generation:rejected=",
     "plan_coverage:skipped(no_requirement_items)",
+    # ★V-H3/F-2★「压根没推出健康端点、探的是回退 `/`」——这不是本次交付的降级，而是
+    # `_HEALTH_ENDPOINT_MARKERS` 只认 4 条（全 JVM/Nest）的**既有覆盖缺口**，且"裸 API 对
+    # `/` 返 404"是常态 → 若按阻断处理，degraded_reasons 对所有非 actuator 栈恒非空，
+    # L6 成功学习通道**永久归零且无信号**。故列入信息性：deliver payload 仍可见、不拦 L6。
+    # ★分档边界★ 证据推出的健康端点返非 2xx 是**真信号**，走
+    # `runtime_smoke_degraded_pass:started_health_unverified`，**刻意不在**本白名单里。
+    "runtime_smoke_degraded_pass:started_no_health_contract",
 )
 
 
