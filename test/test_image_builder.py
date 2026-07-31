@@ -288,9 +288,19 @@ def test_selftest_and_install_read_the_same_registry():
         assert st == entry.selftest, (
             f"({name},{bt}) 的自测命令不是从 registry 取的 ⇒ 又出现第二套表")
         install = _toolchain_install(tc)
+        # ★复核 CRITICAL-2★ 不能只断"工具名出现在片段里"——`_toolchain_install` 对未收录栈
+        # 返回的是 `# (未知工具链 elixir，跳过)`，**注释里就带着那个名字** ⇒ 断言被注释满足＝
+        # 零区分力（实测：往 registry 塞 ("elixir","mix") 后该断言照旧通过，而镜像里啥也没装）。
+        # 改为结构性判据：片段必须真的有 RUN/ENV 指令，且工具名出现在**非注释行**上。
+        assert "未知工具链" not in install, (
+            f"({name},{bt}) 在 registry 里却走了『未知工具链』分支 ⇒ 镜像啥也不装 ⇒ 127")
+        effective = "\n".join(ln for ln in install.splitlines()
+                              if ln.strip() and not ln.lstrip().startswith("#"))
+        assert any(ln.startswith(("RUN ", "ENV ", "COPY ")) for ln in effective.splitlines()), (
+            f"({name},{bt}) 安装片段没有任何 RUN/ENV/COPY 指令 ⇒ 什么都没装")
         for tool in entry.apt_packages:
-            assert tool in install, (
-                f"({name},{bt}) registry 声明必须在场 {tool!r}，但安装片段里没有 ⇒ "
+            assert tool in effective, (
+                f"({name},{bt}) registry 声明必须在场 {tool!r}，但安装片段的**非注释行**里没有 ⇒ "
                 f"命令必 127 → BLOCKED 死循环（X-C2 同型）")
 
 
@@ -358,7 +368,13 @@ def test_wrapper_jars_survive_source_tarball(tmp_path):
     (tmp_path / ".mvn" / "wrapper").mkdir(parents=True)
     (tmp_path / "src").mkdir()
     (tmp_path / "gradle" / "wrapper" / "gradle-wrapper.jar").write_bytes(b"PK\x03\x04g")
+    (tmp_path / "gradle" / "wrapper" / "gradle-wrapper.properties").write_text(
+        "distributionUrl=https\\://x/gradle-8.7-bin.zip\n")
     (tmp_path / ".mvn" / "wrapper" / "maven-wrapper.jar").write_bytes(b"PK\x03\x04m")
+    (tmp_path / ".mvn" / "wrapper" / "maven-wrapper.properties").write_text(
+        "distributionUrl=https\\://x/apache-maven-3.9.6-bin.zip\n")
+    (tmp_path / ".mvn" / "maven.config").write_text("-T 1C\n")
+    (tmp_path / ".mvn" / "jvm.config").write_text("-Xmx2g\n")
     (tmp_path / "libs").mkdir()
     (tmp_path / "libs" / "vendored.jar").write_bytes(b"PK\x03\x04v")   # 真构建产物，仍该剥
     (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
@@ -375,6 +391,13 @@ def test_wrapper_jars_survive_source_tarball(tmp_path):
         names = {_norm(n) for n in t.getnames()}
     assert "gradle/wrapper/gradle-wrapper.jar" in names, "gradlew 的 jar 被剥了 ⇒ ./gradlew 必崩"
     assert ".mvn/wrapper/maven-wrapper.jar" in names, "mvnw 的 jar 被剥了 ⇒ ./mvnw 必崩"
+    # ★复核 HIGH-1★ 只留 jar **不够**：`./mvnw` 启动时要读 properties 取 `distributionUrl`，
+    # 而 `.mvn` 整目录被 `_SRC_EXCLUDE_DIRS` 排除 ⇒ jar 留下了、properties 还是没了 ⇒ 照旧起不来。
+    # `maven.config`/`jvm.config` 是**工程钉的构建参数**（`-T 1C` / `-Xmx`），丢了会让镜像里的
+    # 构建行为与工程作者意图不一致（内存不够直接 OOM）。
+    for need in (".mvn/wrapper/maven-wrapper.properties", ".mvn/maven.config",
+                 ".mvn/jvm.config", "gradle/wrapper/gradle-wrapper.properties"):
+        assert need in names, f"{need} 被剥了 ⇒ wrapper/构建参数不完整"
     assert "libs/vendored.jar" not in names, "普通 jar 仍该按构建产物剥掉（别把排除整类放宽）"
 
 
@@ -428,3 +451,123 @@ def test_undetermined_java_still_gets_warmup_and_settings():
     assert "mvn -B -T 1C" in df, "未定 build_tool 的 java 没有任何 warmup"
     from swarm.worker.image_builder import _selftest_command
     assert _selftest_command(spec), "未定 build_tool 的 java 连自测都没有（零构建期验证）"
+
+
+# ══════════════════════════════════════════════
+# X-C2 CRITICAL-1（治法 D）：harness 命令不适用 → L1 按真实清单改派
+# ══════════════════════════════════════════════
+
+
+def test_harness_maven_command_overridden_on_gradle_project(tmp_path, monkeypatch):
+    """★复核 CRITICAL-1（治法 D，用户拍板）★ `_infer_harness` 对整个 JVM 族恒发
+    `mvn -q compile`（那一层只有 task_description + scope，**拿不到工程事实**）⇒ gradle 工程
+    收到 mvn 命令 → `_build_cmd_applicable` 为 False → build 闸**整块跳过** ⇒ 零构建闸。
+    而 `_derive_full_build_command` 的判据是真实清单，实测能给出 `./gradlew -q classes`。
+    """
+    import swarm.worker.l1_pipeline as lp
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskHarness
+
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+    (tmp_path / "gradlew").write_text("#!/bin/sh\n")
+    (tmp_path / "gradlew").chmod(0o755)
+    src = tmp_path / "src" / "main" / "java"
+    src.mkdir(parents=True)
+    (src / "A.java").write_text("class A {}\n")
+
+    # 先证前提：harness 的 mvn 命令对本工程确实不适用（否则本条测的是别的命题）
+    assert lp._build_cmd_applicable("mvn -q compile", str(tmp_path)) is False
+    assert lp._derive_full_build_command(
+        str(tmp_path), ["src/main/java/A.java"], None) == "./gradlew -q classes"
+
+    seen: list[str] = []
+    monkeypatch.setattr(lp, "_run_l1_command",
+                        lambda cmd, pp, timeout=120: (seen.append(cmd), (0, ""))[1])
+    monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(lp, "_run_check_split", lambda *a, **k: (1, "", ""))
+    monkeypatch.setenv("SWARM_WORKER_L1_LINT", "false")
+    monkeypatch.setenv("SWARM_WORKER_L1_FORMAT", "false")
+    import swarm.worker.workspace_manifest as wm
+    monkeypatch.setattr(wm, "reconcile_workspace_manifests",
+                        lambda *a, **k: {"modified_manifests": [], "added": []})
+
+    diff = ("--- a/src/main/java/A.java\n+++ b/src/main/java/A.java\n"
+            "@@ -1 +1 @@\n-old\n+new\n")
+    st = SubTask(id="st-d", description="gradle", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["src/main/java/A.java"]),
+                 harness=TaskHarness(language="java", build_command="mvn -q compile"))
+    _ok, details = lp.run_l1_pipeline(str(tmp_path), st, diff, timeout=30)
+
+    assert details.get("build_command") == "./gradlew -q classes", \
+        f"gradle 工程仍在跑 harness 的 mvn 命令（或闸被跳过）: {details.get('build_command')}"
+    assert details.get("build_command_overridden"), "改派没留痕（闸跑的是哪条命令无从追溯）"
+    assert any("gradlew" in c for c in seen), f"实际执行的命令里没有 gradlew: {seen}"
+
+
+def test_harness_maven_command_untouched_on_maven_project(tmp_path, monkeypatch):
+    """★maven 零回归（治法 D 的立论）★ `mvn` 对有 pom 的工程 applicable 恒 True ⇒ 第二个
+    条件恒假 ⇒ derive 不被调用 ⇒ 路径逐字节不变，`build_command_derived`/`_overridden`
+    都不该置位。这是唯一跑过 E2E 的栈，必须钉死。"""
+    import swarm.worker.l1_pipeline as lp
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskHarness
+
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>g</groupId><artifactId>a</artifactId>"
+        "<version>1</version></project>\n")
+    src = tmp_path / "src" / "main" / "java"
+    src.mkdir(parents=True)
+    (src / "A.java").write_text("class A {}\n")
+
+    assert lp._build_cmd_applicable("mvn -q compile", str(tmp_path)) is True
+
+    monkeypatch.setattr(lp, "_run_l1_command", lambda cmd, pp, timeout=120: (0, ""))
+    monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(lp, "_enforce_parent_version_literals", lambda *a, **k: (0, []))
+    monkeypatch.setattr(lp, "_enforce_dep_legality", lambda *a, **k: (0, []))
+    monkeypatch.setenv("SWARM_WORKER_L1_LINT", "false")
+    monkeypatch.setenv("SWARM_WORKER_L1_FORMAT", "false")
+    import swarm.worker.workspace_manifest as wm
+    monkeypatch.setattr(wm, "reconcile_workspace_manifests",
+                        lambda *a, **k: {"modified_manifests": [], "added": []})
+
+    diff = ("--- a/src/main/java/A.java\n+++ b/src/main/java/A.java\n"
+            "@@ -1 +1 @@\n-old\n+new\n")
+    st = SubTask(id="st-m", description="maven", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["src/main/java/A.java"]),
+                 harness=TaskHarness(language="java", build_command="mvn -q compile"))
+    _ok, details = lp.run_l1_pipeline(str(tmp_path), st, diff, timeout=30)
+
+    assert "build_command_overridden" not in details, "maven 工程被改派了 ⇒ JVM 基线回归"
+    assert "build_command_derived" not in details, "maven 工程走了 derive 路径 ⇒ 语义面变了"
+    assert (details.get("build_command") or "").startswith("mvn"), \
+        f"maven 工程的构建命令被换掉了: {details.get('build_command')}"
+
+
+def test_gradle_build_time_verification():
+    """★复核 MED-3★ 钉版下载那串是 `curl A || curl B`；两个源都失败时后面的 unzip 会拿着一个
+    空/半截文件继续，而**镜像照样发布成功** ⇒ 运行时才 127，回到本批要治的死循环。
+    `RUN gradle -v`（无 `|| true`）把"装没装上"从运行时提前到构建期。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="gv", toolchains=[
+            Toolchain(name="java", build_tool="gradle", dep_source="build.gradle")]),
+        src_included=True)
+    assert "RUN gradle -v" in df, "缺构建期硬闸 ⇒ 下载失败也会发布出一个没有 gradle 的镜像"
+    # 必须是硬闸：后面不能挂 `|| true` / `|| echo`
+    for ln in df.splitlines():
+        if ln.startswith("RUN gradle -v"):
+            assert "||" not in ln, f"构建期验证被软化成软诊断: {ln}"
+
+
+def test_gradle_warmup_observability():
+    """★复核 MED-4★ warmup 是否填上了 `~/.gradle` 只能靠这条日志判断：5 行装不下 gradle 的
+    失败摘要（`* What went wrong` / `* Try:` 好几段），且没有机读键时无法机器判读。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="gw", toolchains=[
+            Toolchain(name="java", build_tool="gradle", dep_source="build.gradle")]),
+        src_included=True)
+    assert "tail -40" in df, "日志尾太短，装不下 gradle 的失败摘要"
+    assert "[swarm:gradle-warmup=failed]" in df, "warmup 失败无机读标记"
+    assert ("[swarm:gradle-offline=ok]" in df
+            and "[swarm:gradle-offline=degraded]" in df), \
+        "离线自检结果无机读标记（两个方向都要有，否则只能看出一半）"
+    # 标记不许用 `SWARM_*=` 形态：那是 config/env_registry 的配置开关命名空间
+    assert "SWARM_GRADLE" not in df, "日志标记占用了配置开关命名空间（会被登记闸判成未登记）"

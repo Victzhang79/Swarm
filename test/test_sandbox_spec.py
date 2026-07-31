@@ -119,3 +119,67 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as d:
             fn(Path(d))
     print("\n✅ sandbox_spec 全部测试通过")
+
+
+# ══════════════════════════════════════════════
+# X-C2/N-1 hunter 复核整改
+# ══════════════════════════════════════════════
+
+
+def test_notes_do_not_affect_deps_hash():
+    """★复核 HIGH-3 配套★ `notes` 是**诊断文本**，却在 `to_dict()` 里 ⇒ 进 `deps_hash()` ⇒
+    进 `compute_project_fingerprint` ⇒ 改一个字就触发一次多分钟的镜像重建，而镜像内容一模一样。
+    本批给 `_infer_npm` 加了三类 note 之后这条尤其要紧（诊断越详细，误触发越频繁）。"""
+    from swarm.project.sandbox_spec import EnvSpec, Toolchain
+
+    tc = [Toolchain(name="node", build_tool="npm", dep_source="package.json")]
+    a = EnvSpec(project_id="p", toolchains=tc, notes=["随便一句诊断"])
+    b = EnvSpec(project_id="p", toolchains=tc, notes=["完全不同的诊断", "还有第二条"])
+    assert a.deps_hash() == b.deps_hash(), "诊断文本变化改变了指纹 ⇒ 无谓的镜像重建"
+    # 但工具链真的变了必须改变指纹（别把闸拧成恒等）
+    c = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="node", build_tool="npm", dep_source="ui/package.json")])
+    assert a.deps_hash() != c.deps_hash(), "dep_source 变了指纹却没变 ⇒ 该重建的不重建"
+
+
+def test_depth_ceiling_hint_is_deterministic(tmp_path):
+    """★复核 HIGH-4★ `rglob` 顺序＝OS scandir 顺序 ⇒ 不排序则同一棵树在不同机器给出不同的
+    hint 列表（它进 note 文本，人读时会以为工程变了）。"""
+    from swarm.project.sandbox_spec import _npm_depth_ceiling_hint
+
+    for name in ("zzz", "aaa", "mmm"):
+        d = tmp_path / "packages" / name / "web"
+        d.mkdir(parents=True)
+        (d / "package.json").write_text('{"name":"x","scripts":{"build":"x"}}')
+    got = _npm_depth_ceiling_hint(tmp_path, ["package.json"])
+    assert got == sorted(got), f"hint 未排序 ⇒ 结果依赖文件系统顺序: {got}"
+    assert got == _npm_depth_ceiling_hint(tmp_path, ["package.json"])
+
+
+def test_child_package_decision_is_noted(tmp_path):
+    """★复核 MED-2★ 装 node 的**正常**路径原先零留痕 ⇒ 运维分不清"根有 build"与"只有子包有
+    build"（后者正是 N-1 的形态、也是本批唯一改动的判据面）。"""
+    from swarm.project.sandbox_spec import _infer_npm
+
+    (tmp_path / "packages" / "web").mkdir(parents=True)
+    (tmp_path / "package.json").write_text(
+        '{"name":"r","private":true,"workspaces":["packages/*"]}')
+    (tmp_path / "packages" / "web" / "package.json").write_text(
+        '{"name":"w","scripts":{"build":"x"}}')
+    notes: list[str] = []
+    tc = _infer_npm(tmp_path, ["package.json", "packages/web/package.json"], notes=notes)
+    assert tc is not None
+    assert any("子包" in n for n in notes), f"『据子包脚本判定』这个决定依据无留痕: {notes}"
+
+
+def test_unreadable_manifest_noted_even_when_others_have_scripts(tmp_path):
+    """★复核 MED-1★ 原先只在"一个带脚本的都没找到"那条分支留痕；`with_scripts` 非空时读不出的
+    清单被静默丢弃 ⇒ 那个子包的 scripts/engines 没参与判定，而外部看不出发生过。"""
+    from swarm.project.sandbox_spec import _infer_npm
+
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "package.json").write_text('{"name":"r","scripts":{"build":"x"}}')
+    (tmp_path / "ui" / "package.json").write_text("{ this is not json")
+    notes: list[str] = []
+    assert _infer_npm(tmp_path, ["package.json", "ui/package.json"], notes=notes)
+    assert any("解析失败" in n for n in notes), f"读不出的清单被静默丢弃: {notes}"

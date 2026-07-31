@@ -67,10 +67,18 @@ class EnvSpec:
         }
 
     def deps_hash(self) -> str:
-        """规格指纹 —— 依赖/工具链变了才重建镜像（批2 缓存判断）。"""
+        """规格指纹 —— 依赖/工具链变了才重建镜像（批2 缓存判断）。
+
+        ★`notes` 不进指纹★ 它是**诊断文本**（"因为某清单读不出才保守装 node"这类），改一个字
+        就会让指纹变化 → 触发一次多分钟的镜像重建，而镜像内容一模一样。本批给 `_infer_npm`
+        加了截断/解析失败/子包命中三类 note 之后这条尤其要紧：诊断信息越详细，误触发越频繁。
+        `project_id` 同理排除（同一工程不同 id 的镜像内容相同，且它已在 tag/路径里）。
+        """
         import hashlib
         import json
-        payload = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        payload = json.dumps(
+            {k: v for k, v in self.to_dict().items() if k not in ("notes", "project_id")},
+            sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -89,7 +97,9 @@ def _npm_depth_ceiling_hint(root: Path, found_pkgs: list[str]) -> list[str]:
     known = set(found_pkgs or [])
     out: list[str] = []
     try:
-        for p in root.rglob("package.json"):
+        # ★复核 HIGH-4★ `rglob` 顺序＝OS scandir 顺序 ⇒ 不排序的话同一棵树在不同机器上
+        # 给出不同的 hint 列表（它进 note 文本，人读时会以为工程变了）。排序即确定。
+        for p in sorted(root.rglob("package.json")):
             rel_parts = p.relative_to(root).parts
             if any(seg in _SKIP_DIRS for seg in rel_parts):
                 continue
@@ -270,10 +280,21 @@ def _infer_npm(root: Path, pkgs: list[str], notes: list[str] | None = None
                          f"（{unreadable_paths[:2]}）")
         return None  # 纯静态资源，无需 node 工具链（st-10 治法，刻意保留）
 
+    if unreadable_paths:
+        # ★复核 MED-1★ 原先只在"一个带脚本的都没找到"那条分支留痕；`with_scripts` 非空时
+        # 读不出的清单被静默丢弃 ⇒ 那个子包的 scripts/engines 没参与判定（可能漏了 node 版本、
+        # 也可能漏了唯一的 build），而外部看不出发生过这件事。
+        _note(notes, f"package.json 解析失败 {len(unreadable_paths)} 个"
+                     f"（{unreadable_paths[:2]}）→ 其 scripts/engines 未参与判定")
     if root_declares_workspaces or root_pkg in with_scripts:
         dep = root_pkg          # workspaces 的依赖提升到根，warmup 必须在根跑
     else:
         dep = with_scripts[0]   # 已按深度排序 ⇒ 最浅的那个有脚本的清单
+    # ★复核 MED-2★ 装 node 的**正常**路径原先零留痕 ⇒ 运维分不清"根有 build"与"只有子包有
+    # build"（后者正是 N-1 的形态，也是本批唯一改动的判据面）。无条件落一条决定依据。
+    if root_pkg not in with_scripts:
+        _note(notes, f"node 工具链据**子包**脚本判定（根 package.json 无 build/test/start）："
+                     f"命中 {with_scripts[:3]}，warmup 目录={dep}")
     return Toolchain(name="node", version=node_version, build_tool="npm", dep_source=dep)
 
 

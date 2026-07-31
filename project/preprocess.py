@@ -847,6 +847,17 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
         )
 
         spec = infer_env_spec(project_path, project_id=project_id)
+        # ★X-C2/N-1 复核 HIGH-3★ `EnvSpec.notes` 是 `sandbox_spec` 的**唯一**可观测通道
+        # （该模块无 logger），里面装的是"因为某清单读不出才保守装 node"/"清单数超上限只扫了
+        # 前 N 个"/"存在超出深度上限的 package.json，可能是漏发现而非静态资源"这类**决定依据**。
+        # 在这之前它零消费者——按硬检查④"新账没有消费者＝没造"，工具链推断错了没人看得见，
+        # 而后果是镜像缺工具 → 127 → BLOCKED 死循环。故在此打进日志。
+        if spec.notes:
+            logger.info("项目 %s 工具链推断依据/降级说明：%s",
+                        project_id, " | ".join(spec.notes[:6]))
+        _tc_desc = ", ".join(
+            f"{t.name}({t.build_tool or '未定'})" for t in spec.toolchains) or "无"
+        logger.info("项目 %s 推断工具链：%s", project_id, _tc_desc)
         if spec.base_only:
             logger.info("项目 %s 无构建文件(全新项目)，跳过专属沙箱，等首个任务需求分析", project_id)
             return

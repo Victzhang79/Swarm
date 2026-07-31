@@ -396,7 +396,12 @@ def _toolchain_install(tc: Toolchain) -> str:
                 "&& ln -sf /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle "
                 "&& rm -rf /var/lib/apt/lists/*\n"
                 "RUN mkdir -p /root/.gradle\n"
-                f"COPY warmup/init.gradle /root/.gradle/init.gradle\n"
+                "COPY warmup/init.gradle /root/.gradle/init.gradle\n"
+                # ★复核 MED-3★ 构建期**硬闸**：下载源双双失败/解包出半截文件时，前面那串
+                # `curl … || curl …` 之后的 unzip 会拿着一个空文件继续，而镜像照样发布成功
+                # ⇒ 运行时才 127，回到本批要治的死循环。`gradle -v` 失败即构建失败（无 `|| true`），
+                # 把"装没装上"从运行时提前到构建期。
+                "RUN gradle -v\n"
             )
         return out
     if tc.name == "node":
@@ -517,8 +522,15 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
             lines.append(
                 f"RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes "
                 f"> {_log} 2>&1) || (gradle --no-daemon classes > {_log} 2>&1) "
-                f"|| echo '⚠️ warmup gradle 联网编译失败（见下方日志尾）') "
-                f"; tail -5 {_log} 2>/dev/null || true")
+                # ★复核 MED-4★ 机读标记 + 更长的日志尾：5 行装不下 gradle 的失败摘要
+                # ★标记刻意不用 `SWARM_*=` 形态★ 那个命名空间被 `config/env_registry`
+                # 当作【配置开关清册】管着（`test_f3_every_code_env_is_registered` 全仓扫
+                # `SWARM_*` 并要求登记）——日志标记塞进去会被误当成未登记开关。共享命名
+                # 空间但消费契约不同，改用 `[swarm:key=value]`（同样可 grep，不撞清册）。
+                # （它的报错常带 `* What went wrong` / `* Try:` 好几段），而这是**唯一**能
+                # 事后判断"~/.gradle 到底填没填上"的痕迹。
+                f"|| echo '[swarm:gradle-warmup=failed] ⚠️ warmup gradle 联网编译失败（日志尾如下）') "
+                f"; tail -40 {_log} 2>/dev/null || true")
             # 离线自检（软诊断，与 maven 侧对称：只报告，不阻断发布）
             # ★复核 H-5★ 收尾必须清 `build/`：`chmod -R 0777 /workspace` 发生在 warmup **之前**，
             # 留下的 build/ 与 .gradle/ 是 root 所有 + 默认权限，而 worker 可能以非 root 跑 gradle
@@ -527,8 +539,8 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
             lines.append(
                 "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --offline --no-daemon classes -q) "
                 "|| (gradle --offline --no-daemon classes -q)) "
-                "&& echo '✅ warmup gradle 离线编译通过' "
-                "|| echo '⚠️ warmup gradle 离线编译仍有缺漏：运行时联网兜底' "
+                "&& echo '[swarm:gradle-offline=ok] ✅ warmup gradle 离线编译通过' "
+                "|| echo '[swarm:gradle-offline=degraded] ⚠️ 离线编译仍有缺漏：运行时联网兜底' "
                 "; find /workspace -type d -name build -prune -exec rm -rf {} + 2>/dev/null "
                 "; rm -rf /workspace/.gradle 2>/dev/null || true")
 
@@ -590,14 +602,31 @@ _SRC_EXCLUDE_EXTS = {
 # 兜底** ⇒ 每轮硬失败 → BLOCKED → 重试 → 同样失败。127 换成 ClassNotFound，死循环不变。
 # 这也证伪了"wrapper 优先＝工程钉的版本才是权威"这个前提——在这个镜像里 wrapper 根本跑不了。
 # 故：wrapper 目录下的 jar 必须留。它们是**构建工具本体**，不是构建产物（几十 KB，不影响体积）。
-_SRC_KEEP_JAR_SUFFIXES = (
+#
+# ★复核 HIGH-1（实测）★ 只留 jar **不够**：`./mvnw` 启动时要读
+# `.mvn/wrapper/maven-wrapper.properties` 取 `distributionUrl`，而 `.mvn` 整目录被
+# `_SRC_EXCLUDE_DIRS` 排除 ⇒ jar 留下了、properties 还是没了 ⇒ mvnw 照旧起不来。
+# `.mvn/maven.config`（如 `-T 1C`）与 `.mvn/jvm.config`（如 `-Xmx`）同理：它们是**工程钉的
+# 构建参数**，丢了会让镜像里的构建行为与工程作者的意图不一致（内存不够直接 OOM）。
+# 判据统一成"wrapper/构建器配置白名单"，不再只盯 jar。
+_SRC_KEEP_PATH_SUFFIXES = (
+    # gradle wrapper：脚本 + jar + 版本声明
     "gradle/wrapper/gradle-wrapper.jar",
+    "gradle/wrapper/gradle-wrapper.properties",
+    # maven wrapper：jar + distributionUrl 声明
     ".mvn/wrapper/maven-wrapper.jar",
+    ".mvn/wrapper/maven-wrapper.properties",
+    # maven 工程钉的构建参数（丢了会让镜像里的构建与工程意图不一致）
+    ".mvn/maven.config",
+    ".mvn/jvm.config",
+    ".mvn/extensions.xml",
 )
+# 旧名保留一轮（外部若有引用不至于当场断），指向同一份清单。
+_SRC_KEEP_JAR_SUFFIXES = _SRC_KEEP_PATH_SUFFIXES
 
 
 def _is_wrapper_jar(rel_path: str) -> bool:
-    """该路径是否是构建工具的 wrapper jar（必须保留，见 `_SRC_KEEP_JAR_SUFFIXES`）。
+    """该路径是否是构建工具本体/构建器配置（必须保留，见 `_SRC_KEEP_PATH_SUFFIXES`）。
 
     ★只剥**前导 `./`**，绝不用 `lstrip("./")`★ 后者会剥掉任意 `.`/`/` 组合，把
     `.mvn/wrapper/maven-wrapper.jar` 变成 `mvn/wrapper/...` ⇒ 匹配不上 ⇒ mvnw 的 jar 照旧被剥。
@@ -608,7 +637,7 @@ def _is_wrapper_jar(rel_path: str) -> bool:
     while p.startswith("./"):
         p = p[2:]
     p = p.lstrip("/")
-    return any(p == s or p.endswith("/" + s) for s in _SRC_KEEP_JAR_SUFFIXES)
+    return any(p == s or p.endswith("/" + s) for s in _SRC_KEEP_PATH_SUFFIXES)
 # W-3（21 号文）：tarball 单文件尺寸阈值显式常量。>阈值的合法产物（SQL 种子/
 # 生成代码/bundle 源）会被 skip——必须 WARNING 可观测，否则镜像缺文件→沙箱假编译错
 # 无迹可查。

@@ -4900,9 +4900,28 @@ def run_l1_pipeline(
     # 炸——下游修不动别人的文件 → 无限 replan → escalate → FAILED。
     # 治本：子任务改了 .java 但 brain 没下发 build_command 时，确定性派生【全量 mvn 编译】，
     # 让生产者闸门与下游一样强，把错堵在源头当场修。
-    if not build_cmd:
-        build_cmd = _derive_full_build_command(project_path, modified, project_stack)
-        if build_cmd:
+    # ★X-C2 复核 CRITICAL-1（治法 D，用户拍板）★ 判据不能只是"harness 没给命令"，还要
+    # "harness 给的命令对**这个工程**适用"。`_infer_harness`（brain/nodes/shared.py）对整个
+    # JVM 族恒发 `mvn -q compile`——它那一层只有 task_description + scope，**拿不到工程事实**
+    # （有没有 pom / build.gradle），所以这不是疏忽而是信息上限。后果：gradle 工程收到 mvn 命令
+    # → `_build_cmd_applicable` 实测 False → build 闸**整块跳过** ⇒ 零构建闸（改坏了也没人拦）。
+    # 而下面的 `_derive_full_build_command` 判据是**真实清单 + 改动文件语言**（确定性），实测对
+    # 同一个 gradle 工程给出正确的 `./gradlew -q classes` —— 正确答案一直在，只是被 harness 的
+    # 兜底值挡住了。
+    # ★maven 零回归可证★：`mvn` 对有 pom 的工程 applicable 恒 True ⇒ 第二个条件恒假 ⇒
+    # derive 不被调用 ⇒ 唯一跑过 E2E 的栈路径逐字节不变（`build_command_derived` 也不会置位）。
+    if not build_cmd or not _build_cmd_applicable(build_cmd, project_path):
+        _derived = _derive_full_build_command(project_path, modified, project_stack)
+        if _derived and _derived != build_cmd:
+            if build_cmd:
+                # 覆盖了 harness 的命令 ⇒ 必须留痕（否则"闸跑的是哪条命令"无从追溯）
+                details["build_command_overridden"] = {"harness": build_cmd,
+                                                       "derived": _derived}
+                logger.warning(
+                    "[L1.2.1] harness 下发的构建命令对本工程不适用（缺对应清单）→ 按真实清单"
+                    "改派: %r → %r（X-C2 治法 D：否则 build 闸整块跳过＝零构建闸）",
+                    build_cmd, _derived)
+            build_cmd = _derived
             details["build_command_derived"] = build_cmd
     if build_cmd:
         # 治本(round8)：先把改动涉及的内部子模块补注册进根 pom <modules>(对账被跨子任务冲掉的

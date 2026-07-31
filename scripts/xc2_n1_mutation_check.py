@@ -19,6 +19,7 @@ TESTS = ["test/test_image_builder.py", "test/test_b0_workspace_fixture_matrix.py
 
 IMG = ROOT / "worker" / "image_builder.py"
 SPEC = ROOT / "project" / "sandbox_spec.py"
+PIPE = ROOT / "worker" / "l1_pipeline.py"
 
 MUTATIONS = [
     # ── X-C2：安装/自测同读 registry ──
@@ -50,8 +51,8 @@ MUTATIONS = [
     (
         "X-C2 复核 H-2: 去掉 gradle 镜像源（构建机网络受限 → warmup 静默空转）",
         IMG,
-        'f"COPY warmup/init.gradle /root/.gradle/init.gradle\\n"',
-        '                f"# no init.gradle (mutated)\\n"',
+        '"COPY warmup/init.gradle /root/.gradle/init.gradle\\n"',
+        '                "# no init.gradle (mutated)\\n"',
         ["test_gradle_project_image_installs_gradle",
          "test_gradle_init_script_uploaded_when_gradle_present"],
     ),
@@ -73,7 +74,7 @@ MUTATIONS = [
     (
         "X-C2 复核 C-2: wrapper jar 又被 tarball 剥掉（./gradlew 必 ClassNotFound）",
         IMG,
-        "    return any(p == s or p.endswith(\"/\" + s) for s in _SRC_KEEP_JAR_SUFFIXES)",
+        'return any(p == s or p.endswith("/" + s) for s in _SRC_KEEP_PATH_SUFFIXES)',
         "    return False",
         ["test_wrapper_jars_survive_source_tarball"],
     ),
@@ -107,6 +108,57 @@ MUTATIONS = [
         "        if False:",
         ["test_has_build_tool_single_normalization",
          "test_undetermined_java_still_gets_warmup_and_settings"],
+    ),
+    # ── hunter 复核整改新增 ──
+    (
+        "HIGH-1: .mvn 下 wrapper properties/config 又被剥（mvnw 读不到 distributionUrl）",
+        IMG,
+        '    ".mvn/wrapper/maven-wrapper.jar",\n'
+        '    ".mvn/wrapper/maven-wrapper.properties",',
+        '    ".mvn/wrapper/maven-wrapper.jar",',
+        ["test_wrapper_jars_survive_source_tarball"],
+    ),
+    (
+        "MED-3: 去掉构建期 `gradle -v` 硬闸（下载失败仍发布 → 运行时才 127）",
+        IMG,
+        '"RUN gradle -v\\n"',
+        '                "# no build-time gradle check\\n"',
+        ["test_gradle_build_time_verification"],
+    ),
+    (
+        "MED-4: warmup 日志尾退回 5 行 + 去掉机读键",
+        IMG,
+        'f"; tail -40 {_log} 2>/dev/null || true")',
+        'f"; tail -5 {_log} 2>/dev/null || true")',
+        ["test_gradle_warmup_observability"],
+    ),
+    (
+        "HIGH-3 配套: notes 又进指纹（诊断文本变化即触发多分钟重建）",
+        SPEC,
+        '{k: v for k, v in self.to_dict().items() if k not in ("notes", "project_id")},',
+        "            self.to_dict(),",
+        ["test_notes_do_not_affect_deps_hash"],
+    ),
+    (
+        "HIGH-4: 深度上限 hint 又不排序（同树不同机结论不同）",
+        SPEC,
+        'for p in sorted(root.rglob("package.json")):',
+        '        for p in root.rglob("package.json"):',
+        ["test_depth_ceiling_hint_is_deterministic"],
+    ),
+    (
+        "MED-2: 装 node 的正常路径又零留痕（分不清根有 build vs 只有子包有）",
+        SPEC,
+        '_note(notes, f"node 工具链据**子包**脚本判定（根 package.json 无 build/test/start）："',
+        '        _note(notes, "")',
+        ["test_child_package_decision_is_noted"],
+    ),
+    (
+        "CRITICAL-1: 判据退回『harness 没给才 derive』（gradle 工程零构建闸）",
+        PIPE,
+        'if not build_cmd or not _build_cmd_applicable(build_cmd, project_path):',
+        "    if not build_cmd:",
+        ["test_harness_maven_command_overridden_on_gradle_project"],
     ),
     # ★一条刻意不做的突变（诚实记账）★
     # "gradle warmup 在无源码时也注入"：非等价。整个 warmup 段在 `generate_dockerfile` 的
