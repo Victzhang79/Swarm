@@ -439,8 +439,70 @@ _XC3A_STACK_EXTS = {
 }
 
 
+def _sanitize_stems(path_stems, project_path: str | None = None) -> list[str]:
+    """X-C3-A 复核 HIGH-5：路径词干**源头是构建输出＝外部输入**，进 create_files 前必须净化。
+
+    ★为什么必须有★ 词干来自 driver 解析构建输出（`_GO_MISSING_PKG_RE` 的字符类含 `.` 和 `/`），
+    实测 `no required module provides package github.com/acme/shop/../../../tmp/pwn` 能让
+    `is_internal` 放行（前缀匹配）、`ref_tree_paths` 吐出 `../../../tmp/pwn`，自愈据此往
+    `create_files` 塞 `../../../tmp/pwn/pwn.go` ⇒ **写到工程树外**。
+
+    校验照抄同文件 sibling `_amend_scope_with_missing_files`（同样是往 create_files 塞文件，
+    纪律 5：修一类先全仓捞 sibling）：绝对路径 / `..` 段 / 空 → 丢弃。
+    另加**已存在文件**过滤——sibling 的注释写明来源（对抗复核#5）："补进 create_files 会让
+    worker 从零重写覆掉基线/上游内容"。实测容器已在树里时 derive 仍会指一个 300 行的既有
+    实现为"该新建"，而 `missing_created_files` 闸只查"不存在"，存在的一律放行。
+    """
+    out: list[str] = []
+    for s in (path_stems or []):
+        fn = str(s).replace("\\", "/").strip()
+        if not fn or fn.startswith("/") or ".." in fn.split("/"):
+            continue                      # 绝对/越界 → 丢弃（fail-honest，不猜不修正）
+        fn = fn.strip("/")
+        if not fn:
+            continue
+        out.append(fn)
+    if project_path:
+        # 已存在的落点不再"新建"（防覆写既有实现）。判据同 sibling：文件在即丢。
+        out = [s for s in out
+               if not any(os.path.isfile(os.path.join(project_path, s + e))
+                          for e in (".go", ".ts", ".tsx", ".js", ".rs", ".py", ""))]
+    return out
+
+
+def _pick_stem_by_evidence(stems: list[str], scope_files, project_path) -> str | None:
+    """多候选词干里据**证据**挑一个（X-C3-A 复核 HIGH-4）；定不了返 None（fail-honest）。
+
+    单候选直接返。多候选（python `app/x` vs `src/app/x`）判据依次：
+      ① **父目录在树里真实存在**（唯一命中才算——两个都存在＝真歧义，不猜）；
+      ② scope 已声明的文件落在哪个候选的顶层段下（worker 的写权就是布局的权威声明）；
+      ③ 都定不了 → None。**绝不"取最短"** ——那在 src-layout 工程上会把文件建到根下、
+        种出第二棵顶层包污染工程树（PyPA 现行推荐布局，不是边角）。
+    """
+    if not stems:
+        return None
+    if len(stems) == 1:
+        return stems[0]
+    if project_path:
+        alive = [s for s in stems
+                 if os.path.isdir(os.path.join(project_path,
+                                               os.path.dirname(s) or "."))]
+        if len(alive) == 1:
+            return alive[0]
+        if len(alive) > 1:
+            stems = alive          # 收窄后继续用 scope 证据裁
+    tops = {str(f).replace("\\", "/").lstrip("./").split("/", 1)[0]
+            for f in (scope_files or []) if str(f).strip()}
+    if tops:
+        hit = [s for s in stems if s.split("/", 1)[0] in tops]
+        if len(hit) == 1:
+            return hit[0]
+    return None
+
+
 def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_output: str,
-                               path_stems=None, stack: str | None = None) -> list:
+                               path_stems=None, stack: str | None = None,
+                               project_path: str | None = None) -> list:
     """round36 P0 自愈：从子任务声明文件推源根 + blocked 内部包 + 编译错误里的缺失类名，
     推出【应新建的类型文件路径】。仅服务 internal_pkg_not_built；推不出→空
     （调用方回落连坐放弃，绝不空烧自愈预算）。★把文件加进 create_files（而非 allow_any）：既让
@@ -454,27 +516,46 @@ def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_outp
     时走短路径（按 `stack` 取扩展名）；缺席则逐字节走老的 JVM 推导（java 恒缺席）。
     """
     import re
-    _stems = [str(s).strip("/") for s in (path_stems or []) if str(s).strip()]
-    if _stems:
+    # ★X-C3-A 复核 HIGH-3★ `path_stems` 现在按 **ref 分组**传入（`{ref: [词干…]}`），不再是
+    # 摊平的池：候选二选一（python 的 `app/x` vs `src/app/x`）是**单个 ref 内**的事，摊平后
+    # 全局只留一个 ⇒ 缺 3 个包只建 1 个 ⇒ retry_guidance 说"已纳入"实际没纳入 ⇒ worker 再失败
+    # 或 SCOPE_OBJECTION ⇒ 自愈配额（默认 2）耗尽 → abandon。兼容裸列表（视作单个 ref）。
+    # 裸列表（老签名/直调）语义＝**每个词干各自独立**，不是同一个 ref 的多候选——
+    # 后者会让"多候选二选一"误吞掉真正独立的缺失（HIGH-3 的形状）。
+    _by_ref: dict = (path_stems if isinstance(path_stems, dict)
+                     else {s: [s] for s in (path_stems or [])})
+    if _by_ref:
         exts = _XC3A_STACK_EXTS.get(str(stack or "").lower())
         if not exts:
             return []          # 未收录栈 → 不猜扩展名（fail-honest，交连坐放弃）
         out: list[str] = []
-        for s in _stems:
-            if "." in s.rsplit("/", 1)[-1]:
-                out.append(s)          # 词干已带扩展名（少见）→ 原样
+        for _ref, _raw in _by_ref.items():
+            stems = _sanitize_stems(_raw, project_path)
+            if not stems:
+                continue
+            # ★复核 HIGH-4★ 多候选（python 顶层布局 vs src-layout）**不许猜**。
+            # 原实现"取最短＝顶层优先"在真 src-layout 工程（根下无 `app/`）上给出
+            # `app/services/user.py` ⇒ 落点错、还在根下种出第二棵顶层包污染工程树。
+            # 改为按**证据**定档：① 父目录真实存在的候选优先（要 project_path）；
+            # ② 否则看 scope 声明落在哪个前缀；③ 两者都定不了 → fail-honest 丢弃该 ref
+            # （纪律 2：解析不出→如实丢弃，绝不逼 worker 臆造）。
+            pick = _pick_stem_by_evidence(stems, scope_files, project_path)
+            if pick is None:
+                logger.warning(
+                    "[HANDLE_FAILURE] X-C3-A 词干多候选无法据证据定档（布局不明）→ 该 ref 不进"
+                    "自愈（fail-honest，绝不猜落点在根下种影子包）: ref=%s 候选=%s",
+                    _ref, stems[:4])
+                continue
+            if "." in pick.rsplit("/", 1)[-1]:
+                out.append(pick)           # 词干已带扩展名（少见）→ 原样
                 continue
             if str(stack).lower() == "go":
                 # ★Go 的包是**目录**★ 词干 `internal/svc` 该建的是 `internal/svc/<name>.go`，
                 # 不是 `internal/svc.go`（后者会建出一个和包同名的**文件**，编译仍缺包）。
-                out.append(f"{s}/{s.rsplit('/', 1)[-1]}{exts[0]}")
+                out.append(f"{pick}/{pick.rsplit('/', 1)[-1]}{exts[0]}")
             else:
-                out.append(f"{s}{exts[0]}")
-        # 多候选词干（python 的 `app/x` 与 `src/app/x`）→ 取**最短**的那个（顶层布局优先），
-        # 绝不两个都建（会种出两棵真值树）。按路径深度+长度定序，不靠字典序碰巧。
-        if len(out) > 1:
-            out = [min(out, key=lambda p: (p.count("/"), len(p)))]
-        return out
+                out.append(f"{pick}{exts[0]}")
+        return list(dict.fromkeys(out))
     _MARKERS = ("/src/main/java/", "/src/test/java/",
                 "/src/main/kotlin/", "/src/test/kotlin/")
     srcroot = None
@@ -1080,7 +1161,6 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # 逐字节走老路）。缺席时 `_bpaths`/`_bpbr` 为空 ⇒ 三个消费者行为一字不变。
             _bpaths = _det.get("blocked_on_paths") or []
             _bpbr = _det.get("blocked_on_paths_by_ref") or {}
-            _bstack = _det.get("blocked_via_error_driver")
             _prods = _producers_of(plan_obj, _bpkgs, _bmods, paths=_bpaths)
             # (B round13) 上游已永久放弃 → 依赖它的下游不可恢复(传递闭包)。
             # R65REPLAY-T1 复核 F2：只算【硬】依赖——软序边（edge_is_soft，readable
@@ -1292,12 +1372,13 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                 # X-C3-A：非 JVM 栈的"该建哪个文件"直接来自 worker 侧路径词干（JVM 推导那套
                 # 锚死 /src/main/java|kotlin/ + 类名＝文件名，非 JVM 一个 marker 都不命中 → []
                 # → _unrecoverable ⇒ 首轮连坐放弃）。缺席则逐字节走老推导。
+                # ★复核 HIGH-3★ 按 **ref 分组**传（原先 `.values()` 摊平 ⇒ 全批只建一个）；
+                # ★复核 HIGH-4/HIGH-5★ 传 project_path 供布局定档 + 已存在文件过滤。
                 _new_files = _derive_missing_type_files(
                     _decl, _bpkgs, _det2.get("build_output") or "",
-                    path_stems=[s for stems in
-                                (_det2.get("blocked_on_paths_by_ref") or {}).values()
-                                for s in stems],
-                    stack=_det2.get("blocked_via_error_driver"))
+                    path_stems=(_det2.get("blocked_on_paths_by_ref") or {}),
+                    stack=_det2.get("blocked_via_error_driver"),
+                    project_path=_proj_path)
                 if not _new_files:
                     # R65D-T4 改道：缺失类全是 JDK 标准库类型=worker 缺 import 语句——
                     # 治得了的病绝不放弃、更绝不下"新建同名类型"毒指令（round65d

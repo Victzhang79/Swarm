@@ -62,8 +62,14 @@ def _producers_of(plan_obj, packages, modules, paths=None) -> set[str]:
     `_futile=True` → 推不出该建啥 → `_unrecoverable` ⇒ **首轮连坐放弃**（比 X-C3 之前更坏）。
     给了 `paths` 就用它，**缺席逐字节走老路**（java 恒缺席 ⇒ 唯一跑过 E2E 的栈零改动）。"""
     out: set[str] = set()
-    _use_paths = [str(p).strip("/") for p in (paths or []) if str(p).strip()]
-    pkg_paths = _use_paths or ["/".join(p.split(".")) for p in (packages or []) if p]
+    # ★复核 HIGH-2★ `""` 是 Go 根包的合法词干，`if str(p).strip()` 会把它滤掉 ⇒ 根包整类
+    # 回落点分口径。用 `is not None` 判在场，只剥 `/`（保留空串这个哨兵）。
+    _use_paths = ([str(p).strip("/") for p in paths] if paths is not None else [])
+    _root_stem = "" in _use_paths
+    _use_paths = [p for p in _use_paths if p]
+    _has_paths = bool(_use_paths) or _root_stem
+    pkg_paths = (_use_paths if _has_paths
+                 else ["/".join(p.split(".")) for p in (packages or []) if p])
     mods = {str(m).strip().strip("/") for m in (modules or []) if str(m).strip()}
 
     def _hit(fn: str, pp: str) -> bool:
@@ -73,7 +79,7 @@ def _producers_of(plan_obj, packages, modules, paths=None) -> set[str]:
         # ★路径口径专属★：词干也可以是**文件**（python `app/services/user` →
         # `app/services/user.py`、TS `src/routes/users` → `src/routes/users.ts`）。
         # 老的点分口径下词干恒是包目录，故此分支只对 paths 开（不改 JVM 行为）。
-        return bool(_use_paths) and fn.rsplit(".", 1)[0] == pp
+        return _has_paths and fn.rsplit(".", 1)[0] == pp
 
     for s in getattr(plan_obj, "subtasks", []):
         scope = getattr(s, "scope", None)
@@ -82,6 +88,10 @@ def _producers_of(plan_obj, packages, modules, paths=None) -> set[str]:
             fn = str(f).replace("\\", "/").lstrip("./")
             top = fn.split("/", 1)[0]
             if top in mods:
+                out.add(s.id)
+                break
+            # 根词干（Go 根包）：只认**工程根直下**的源文件（不吃子目录，否则整棵树都算）
+            if _root_stem and "/" not in fn:
                 out.add(s.id)
                 break
             if any(_hit(fn, pp) for pp in pkg_paths):
@@ -207,12 +217,20 @@ def _package_in_baseline(project_path: str | None, pkg: str,
     完全等价（同剪枝、同 endswith 后缀匹配）。"""
     if not project_path or not pkg:
         return True  # 无从判定 → 保守当【存在】，不据此硬失败
-    _stems = [str(s).strip("/") for s in (path_stems or []) if str(s).strip()]
+    # 复核 HIGH-2：`""`（Go 根包）是合法词干，不能被 `if str(s).strip()` 滤掉
+    _stems = ([str(s).strip("/") for s in path_stems] if path_stems is not None else [])
     if _stems:
         # 路径口径：词干可指向目录**或**文件（`app/services/user` → `user.py`）。
         # 任一命中即"在树里"（保守方向＝继续等，与老路一致）。
         import os as _os
         for _s in _stems:
+            if _s == "":
+                # Go 根包：工程根直下有任何源文件即"在树里"（保守方向＝继续等）
+                try:
+                    return any(_os.path.isfile(_os.path.join(project_path, f))
+                               for f in _os.listdir(project_path))
+                except OSError:
+                    return True
             _abs = _os.path.join(project_path, _s)
             if _os.path.isdir(_abs):
                 return True
@@ -453,11 +471,26 @@ def _blocked_pkg_unrecoverable(
     # ★H-3a 复核 HIGH 整改★：类级 BLOCKED（L1 吐了 blocked_on_classes=包在树、类未建出）
     # 时包级判据结构性失效（包必在树→恒 False→臆造类烧满阶梯）——改用类级树判据：
     # 全部缺类都不在基线树才判不可满足；任一在树（仅漏 seed/同步）→ False 继续等。
-    _cls = [c for c in (blocked_classes or []) if c]
-    if _cls:
-        return not any(_class_in_baseline(project_path, c) for c in _cls)
     # X-C3-A：每个 ref 各带自己的路径词干（缺席 → 该 ref 走老的点分口径）
     _pbr = paths_by_ref or {}
+    _cls = [c for c in (blocked_classes or []) if c]
+    if _cls:
+        # ★X-C3-A 复核 CRITICAL-1★ 这条类级臂原先**抢先 return**，把整个符号级通道挡在
+        # 新口径之外：`_class_in_baseline` 是 JVM-only（`endswith(".java")` + `\b(class|
+        # interface|enum|record)\s+`），非 JVM 符号恒返 False ⇒ futile=True ⇒ 而 `_prods`
+        # 已被本批修成非空 ⇒ 走 `_unrecoverable` 而非 `_selfheal` ⇒ **首轮连坐放弃**。
+        # 覆盖面不是边角：四个非 JVM driver **全部**产符号级 ref（Go `undefined:`、
+        # TS TS2305、Rust `no X in Y`/E0425、Python `cannot import name`），且 Go 那条
+        # driver 的注释自己写着该形态"比 Java 更常见（同包多文件是 Go 的常态组织方式）"。
+        #
+        # 治法与包级同构：符号的**容器**若能用路径口径判在树里 → 继续等（保守方向，与
+        # `_class_in_baseline` 阳性同义）；容器判不出 → 落回 JVM 类级判据（java 原样）。
+        _sym_paths = [s for c in _cls for s in (_pbr.get(c) or [])]
+        if _sym_paths:
+            return not any(
+                _package_in_baseline(project_path, c, path_stems=_pbr.get(c))
+                for c in _cls if _pbr.get(c))
+        return not any(_class_in_baseline(project_path, c) for c in _cls)
     return bool(blocked_pkgs) and not any(
         _package_in_baseline(project_path, p, path_stems=_pbr.get(p))
         for p in blocked_pkgs

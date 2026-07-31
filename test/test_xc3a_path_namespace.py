@@ -169,6 +169,92 @@ def test_futile_no_longer_true_for_existing_tree(lang, ref, src, prod, stem, new
         **kw, paths_by_ref={ref: _stems(lang, ref, src)}) is False
 
 
+def test_symbol_level_arm_uses_path_namespace(tmp_path):
+    """★复核 CRITICAL-1★ 类级臂原先**抢先 return**，把整个符号级通道挡在新口径之外：
+    `_class_in_baseline` 是 JVM-only（`endswith(".java")` + `\\b(class|interface|enum|
+    record)\\s+`），非 JVM 符号恒返 False ⇒ futile=True ⇒ 而 `_prods` 已被本批修成非空 ⇒
+    走 `_unrecoverable` 而非 `_selfheal` ⇒ **首轮连坐放弃**。
+
+    覆盖面不是边角：四个非 JVM driver **全部**产符号级 ref（Go `undefined:`、TS TS2305、
+    Rust `no X in Y`/E0425、Python `cannot import name`），Go 那条 driver 的注释还写着该形态
+    "比 Java 更常见（同包多文件是 Go 的常态组织方式）"。
+    """
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    (tmp_path / "internal" / "svc" / "user.go").write_text("package svc\n")
+    ref = "github.com/acme/shop/internal/svc"
+    cls = f"{ref}.NewUserSvc"
+    kw = dict(blocked_pkgs=[ref], producers=set(), unsat=set(), completed_ok=set(),
+              pending=set(), project_path=str(tmp_path), self_id="st-x",
+              blocked_classes=[cls])
+    # 老路（无路径口径）：JVM-only 类级判据 → 恒 futile
+    assert _blocked_pkg_unrecoverable(**kw) is True, "夹具前提变了"
+    # 新路：符号的容器用路径口径判在树里 → 继续等
+    assert _blocked_pkg_unrecoverable(
+        **kw, paths_by_ref={ref: ["internal/svc"], cls: ["internal/svc"]}) is False
+
+
+def test_worker_emits_path_stems_for_symbol_fqns(tmp_path):
+    """CRITICAL-1 的配套接线：worker 必须给**符号 FQN**也发路径口径，否则 brain 类级臂
+    `_pbr.get(cls)` 恒空 → 仍走 JVM-only 判据 → 修复形同没做。"""
+    import swarm.worker.l1_pipeline as lp
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    ref = "github.com/acme/shop/internal/svc"
+    cls = f"{ref}.NewUserSvc"
+    details: dict = {}
+    lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["internal/handler/u.go"]), {ref}, [cls],
+        cmd="go build ./...", stage="build", output="", language_key="go",
+        project_path=str(tmp_path), timeout=20, run=_probe(),
+        driver_refs=[ed.MissingRef(ref=ref, symbol="NewUserSvc",
+                                   src="internal/handler/u.go")])
+    assert details["blocked_on_paths_by_ref"].get(cls) == ["internal/svc"], \
+        "符号 FQN 无路径口径 ⇒ brain 类级臂拿不到 ⇒ CRITICAL-1 未真修"
+
+
+def test_go_root_stem_survives_to_all_consumers(tmp_path):
+    """★复核 HIGH-2★ Go 根包词干是 `""`（`ref_tree_paths` 刻意返 `[""]`，由 `_stem_matches`
+    特判成"只认工程根直下"）。它是**合法词干**，不是"解不出"。原实现 `[s for s in stems if s]`
+    把它过滤成键缺席 ⇒ 三个消费者回落 Java 点分（`github.com/acme/shop` → `github/com/…`
+    无一命中）⇒ 首轮连坐放弃，**且零留痕**。触发条件毫不刁钻：`main.go` 里任何 `undefined: X`。
+    """
+    (tmp_path / "main.go").write_text("package main\n")
+    mr = ed.MissingRef(ref="github.com/acme/shop", symbol="buildRouter", src="main.go")
+    assert ed.ref_path_stems("go", [mr], "/p", 20, _probe()) == \
+        {"github.com/acme/shop": [""]}, "根词干被过滤掉了"
+    # 三个消费者都认它
+    assert _producers_of(_plan(["main.go"]), ["github.com/acme/shop"], [],
+                         paths=[""]) == {"st-producer"}
+    assert _package_in_baseline(str(tmp_path), "github.com/acme/shop",
+                                path_stems=[""]) is True
+    assert _blocked_pkg_unrecoverable(
+        blocked_pkgs=["github.com/acme/shop"], producers=set(), unsat=set(),
+        completed_ok=set(), pending=set(), project_path=str(tmp_path), self_id="st-x",
+        paths_by_ref={"github.com/acme/shop": [""]}) is False
+
+
+def test_root_stem_does_not_swallow_subdirs(tmp_path):
+    """根词干只认工程根**直下**文件——否则整棵树都算自产/在树里。"""
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    (tmp_path / "internal" / "svc" / "user.go").write_text("x\n")
+    assert _producers_of(_plan(["internal/svc/user.go"]), ["github.com/acme/shop"], [],
+                         paths=[""]) == set()
+
+
+def test_blocked_without_path_namespace_leaves_account(tmp_path):
+    """★复核 HIGH-2 配套★ "判了 BLOCKED 却无路径口径"必须留机读键 + WARNING——那等价于
+    "本 ref 大概率会被连坐放弃"，是该情形的唯一信号。我原先删过这条账并断言"不可达"，
+    HIGH-2 证伪（漏了"词干解得出但被过滤空"第三态）。"""
+    import swarm.worker.l1_pipeline as lp
+    details: dict = {}
+    # 未收录栈 → driver 为 None → 无路径口径，但裁决仍走 BLOCKED（口径缺席不改判）
+    lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["a/b.ex"]), {"Foo.Bar"}, [],
+        cmd="mix compile", stage="build", output="", language_key="elixir",
+        project_path=str(tmp_path), timeout=20, run=_probe())
+    assert details.get("blocked_on_paths_absent") == "elixir"
+    assert "blocked_on_paths" not in details
+
+
 def test_futile_still_true_when_truly_hallucinated(tmp_path):
     """回归臂：ref 真不在树里 + 无生产者 ⇒ 仍判永不可满足（快失败，不烧退避阶梯）。"""
     assert _blocked_pkg_unrecoverable(
@@ -184,13 +270,19 @@ def test_futile_still_true_when_truly_hallucinated(tmp_path):
 
 
 @pytest.mark.parametrize("lang,ref,src,prod,stem,new", CASES, ids=_IDS)
-def test_derive_missing_files_for_non_jvm(lang, ref, src, prod, stem, new):
+def test_derive_missing_files_for_non_jvm(lang, ref, src, prod, stem, new, tmp_path):
     """治前：JVM 推导锚死 `/src/main/java|kotlin/` + 类名＝文件名 ⇒ 非 JVM 一个 marker
-    都不命中 ⇒ 返 [] ⇒ `_unrecoverable` ⇒ 首轮连坐放弃。"""
+    都不命中 ⇒ 返 [] ⇒ `_unrecoverable` ⇒ 首轮连坐放弃。
+
+    ★按 ref 分组传 + 给 project_path★（HIGH-3/HIGH-4）：多候选据真实布局定档，
+    故夹具必须**真的物化那个布局**，否则测的是"猜"而不是"据证据"。
+    """
+    (tmp_path / stem).parent.mkdir(parents=True, exist_ok=True)
     assert _derive_missing_type_files([prod], [ref], "cannot find symbol: class Foo") \
         == [], "夹具前提变了：老推导竟然推出了东西"
     assert _derive_missing_type_files(
-        [prod], [ref], "", path_stems=_stems(lang, ref, src), stack=lang) == [new]
+        [prod], [ref], "", path_stems={ref: _stems(lang, ref, src)}, stack=lang,
+        project_path=str(tmp_path)) == [new]
 
 
 def test_derive_go_package_is_a_directory():
@@ -200,13 +292,65 @@ def test_derive_go_package_is_a_directory():
         [], [], "", path_stems=["internal/svc"], stack="go") == ["internal/svc/svc.go"]
 
 
-def test_derive_picks_shortest_stem_not_both():
-    """python 的双候选（`app/x` 与 `src/app/x`）只能建**一个**（否则种出两棵真值树）。
-    取最短＝顶层布局优先，按深度+长度定序，不靠字典序碰巧。"""
+@pytest.mark.parametrize("layout,expect", [
+    ("src/app/services", "src/app/services/user.py"),   # 真 src-layout（PyPA 推荐）
+    ("app/services", "app/services/user.py"),           # 真顶层布局
+])
+def test_derive_picks_layout_by_evidence_not_by_guess(tmp_path, layout, expect):
+    """★复核 HIGH-4★ 双候选（`app/x` vs `src/app/x`）**不许猜**。原实现"取最短＝顶层优先"
+    在真 src-layout 工程（根下无 `app/`）上给出 `app/services/user.py` ⇒ 落点错、还在根下
+    种出**第二棵顶层包**污染工程树。改为按证据定档：父目录真实存在的那个候选胜出。"""
+    (tmp_path / layout).mkdir(parents=True)
     got = _derive_missing_type_files(
-        [], [], "", path_stems=["src/app/services/user", "app/services/user"],
-        stack="python")
-    assert got == ["app/services/user.py"]
+        [], ["app.services.user"], "",
+        path_stems={"app.services.user": ["app/services/user",
+                                          "src/app/services/user"]},
+        stack="python", project_path=str(tmp_path))
+    assert got == [expect]
+
+
+def test_derive_fails_honest_when_layout_undecidable():
+    """两个候选都定不了档（无 project_path、scope 也不指向任一前缀）→ **丢弃该 ref**
+    （纪律 2：解析不出→如实丢弃，绝不逼 worker 臆造落点）。"""
+    assert _derive_missing_type_files(
+        [], ["app.services.user"], "",
+        path_stems={"app.services.user": ["app/services/user",
+                                          "src/app/services/user"]},
+        stack="python") == []
+
+
+def test_derive_keeps_every_independent_ref(tmp_path):
+    """★复核 HIGH-3★ "多候选二选一"是**单个 ref 内**的事。原实现在调用点把所有 ref 的候选
+    摊平进一个池、再 `min()` 取全局一个 ⇒ 缺 3 个包只建 1 个 ⇒ `retry_guidance` 说"已纳入
+    可写范围"而实际没纳入 ⇒ worker 再失败/SCOPE_OBJECTION ⇒ 自愈配额（默认 2）耗尽 → abandon。"""
+    got = _derive_missing_type_files(
+        [], ["a", "b"], "",
+        path_stems={"a": ["internal/svc"], "b": ["internal/repo"]},
+        stack="go", project_path=str(tmp_path))
+    assert got == ["internal/svc/svc.go", "internal/repo/repo.go"]
+
+
+def test_derive_rejects_path_traversal_stems(tmp_path):
+    """★复核 HIGH-5★ 词干源头是**构建输出＝外部输入**。实测
+    `no required module provides package github.com/acme/shop/../../../tmp/pwn` 能让
+    `is_internal` 放行、`ref_tree_paths` 吐 `../../../tmp/pwn`，自愈据此往 create_files 塞
+    `../../../tmp/pwn/pwn.go` ⇒ **写到工程树外**。校验照抄 sibling
+    `_amend_scope_with_missing_files`（纪律 5：修一类先全仓捞 sibling）。"""
+    for bad in ("../../../tmp/pwn", "/etc/passwd", "a/../../b"):
+        assert _derive_missing_type_files(
+            [], ["x"], "", path_stems={"x": [bad]}, stack="go",
+            project_path=str(tmp_path)) == [], f"{bad} 不该进 create_files"
+
+
+def test_derive_skips_already_existing_file(tmp_path):
+    """★复核 HIGH-5 第二道★ 落点**已存在**时不再指为"该新建"——sibling 的注释写明来源
+    （对抗复核#5）："补进 create_files 会让 worker 从零重写覆掉基线/上游内容"。
+    而 `missing_created_files` 闸只查"不存在"，存在的一律放行 ⇒ 覆写无人拦。"""
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    (tmp_path / "internal" / "svc" / "svc.go").write_text("// 300 行既有实现\n")
+    assert _derive_missing_type_files(
+        [], ["x"], "", path_stems={"x": ["internal/svc/svc"]}, stack="go",
+        project_path=str(tmp_path)) == []
 
 
 def test_derive_returns_empty_for_unregistered_stack():
@@ -250,10 +394,13 @@ def test_verdict_details_carry_path_keys_consumable_by_brain(tmp_path):
     assert _package_in_baseline(
         str(tmp_path), ref,
         path_stems=details["blocked_on_paths_by_ref"][ref]) is True
+    # ★必须用**生产的**传法★（复核指出原写法按 ref 索引单条，而生产是整个 dict——
+    # "测试构造了生产代码从不产生的取值"是本仓记过的第 2 类假绿，HIGH-3 正是从那个缺口逃逸的）
     assert _derive_missing_type_files(
         [], details["blocked_on_packages"], "",
-        path_stems=details["blocked_on_paths_by_ref"][ref],
-        stack=details["blocked_via_error_driver"]) == ["internal/svc/svc.go"]
+        path_stems=details["blocked_on_paths_by_ref"],
+        stack=details["blocked_via_error_driver"],
+        project_path=str(tmp_path)) == ["internal/svc/svc.go"]
 
 
 def test_verdict_marks_absence_when_no_path_stems(tmp_path):

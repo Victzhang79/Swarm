@@ -2068,21 +2068,45 @@ def decide_unbuilt_internal_verdict(
         # X-C3-A：栈键由**裁决层**写（它有 language_key）。原先只有三个调用点各写一遍 ⇒
         # 新调用点漏写就静默丢栈 ⇒ brain 侧 `_derive_missing_type_files` 取不到扩展名 → 返 []
         # → 连坐放弃。写在这里＝与路径键同源，不可能只落一半。
-        details.setdefault("blocked_via_error_driver", language_key)
+        # ★复核 LOW-10★ 这里是栈键的**唯一**写点。原先三个调用点各写一遍、这里再
+        # setdefault ⇒ 生产上本行是 no-op，"裁决层是权威"只在测试里成立（直调本体才走到）。
+        # 三处旧写点已删：多写点＝新调用点必然漏写（本战役已因此返工三次）。
+        details["blocked_via_error_driver"] = language_key
         try:
             from swarm.worker.l1_error_drivers import ref_path_stems
             _paths = ref_path_stems(language_key, driver_refs or list(blocked_pkgs),
                                     project_path, timeout, run)
-            # ★这里刻意**没有** else 分支★ 我原先写了个 `blocked_on_paths_absent` 降级账，
-            # 突变 harness 证明它锁不住 —— 复查后确认那条分支**不可达**：本块与上面步骤 4 的
-            # 归属判定用**同一个** `ref_tree_paths` 且门控条件逐字相同，任何"词干解不出"的 ref
-            # 都会先落进 `_unres` → 在 `if _unres:` 处早返 FAIL（CRITICAL-2 的闸）→ 永远走不到
-            # 这里。故到得了本行就必有词干。留个不可达的账＝制造"有人消费的假象"，删掉更诚实。
+            # ★复核 HIGH-2 恢复的降级账★ 我原先删了它并断言"不可达"，理由是"解不出的 ref 必先
+            # 在 UNKNOWN 闸早返"。那个推理**漏了第三态**：词干**解得出但被过滤成空**（Go 根包
+            # 返 `[""]`）。此时 UNKNOWN 闸不拦、路径键又缺席 ⇒ brain 全部回落 Java 点分 ⇒ 首轮
+            # 连坐放弃且零信号。词干过滤已修（`""` 保留），但这条账必须在：它是"BLOCKED 了却
+            # 没有路径口径"的唯一信号，而那等价于"本 ref 大概率会被连坐放弃"。
+            if not _paths:
+                details["blocked_on_paths_absent"] = language_key
+                logger.warning(
+                    "[L1.%s] X-C3-A 非 JVM 栈 %s 判了 BLOCKED 却**无路径口径** → brain 侧将回落"
+                    "Java 点分转换（大概率反查不到生产者 → 首轮连坐放弃）。这是该情形的唯一"
+                    "信号: %s", _XC3_STAGE_TAG.get(stage, "?"), language_key,
+                    sorted(blocked_pkgs)[:4])
             if _paths:
                 details["blocked_on_paths"] = sorted(
                     {s for stems in _paths.values() for s in stems})
-                details["blocked_on_paths_by_ref"] = {k: sorted(v)
-                                                      for k, v in _paths.items()}
+                _by_ref = {k: sorted(v) for k, v in _paths.items()}
+                # ★复核 CRITICAL-1 配套★ 符号级 FQN（`<容器><sep><符号>`）也要有路径口径，
+                # 否则 brain 的类级臂 `_pbr.get(cls)` 恒空 → 仍走 JVM-only 的
+                # `_class_in_baseline` → 非 JVM 恒 futile → 首轮连坐放弃。符号的落点就是
+                # **其容器**的落点（容器没建出来，符号自然也不在），故复用容器词干。
+                from swarm.worker.l1_error_drivers import driver_for as _dfor2
+                _sym_sep = getattr(_dfor2(language_key), "symbol_sep", ".") or "."
+                for _c in blocked_cls:
+                    _cs = str(_c)
+                    for _ref, _stems in _paths.items():
+                        # 分隔符取自 driver（Rust `::`、ESM `#`）——与产 FQN 时同源，
+                        # 别在这里另猜一套（口径分叉是本批 C-1 的病根）。
+                        if _cs == _ref or _cs.startswith(_ref + _sym_sep):
+                            _by_ref.setdefault(_cs, sorted(_stems))
+                            break
+                details["blocked_on_paths_by_ref"] = _by_ref
         except Exception as _pexc:  # noqa: BLE001 — 路径口径失败绝不改变 BLOCKED 裁决
             details["blocked_on_paths_error"] = f"{type(_pexc).__name__}: {_pexc}"[:200]
             logger.warning("[L1] X-C3-A 路径口径计算异常（brain 侧回落老路）: %r", _pexc)
@@ -4834,7 +4858,6 @@ def run_l1_pipeline(
                 refs_out=_c_refs, disarm_out=_c_disarm)
             _record_xc3_disarm(details, _c_disarm, stage="compile", lang=_c_lang)
             if _c_pkgs:
-                details["blocked_via_error_driver"] = _c_lang
                 if decide_unbuilt_internal_verdict(
                         details, getattr(subtask, "scope", None), _c_pkgs, _c_syms,
                         cmd="(L1.2 compile)", stage="compile", output=_c_text,
@@ -5168,7 +5191,6 @@ def run_l1_pipeline(
                         _record_xc3_disarm(details, _xc3_disarm, stage="build",
                                            lang=_xc3_lang)
                         if _xc3_pkgs:
-                            details["blocked_via_error_driver"] = _xc3_lang
                             _blocked_pkgs = _xc3_pkgs
                             _blocked_cls = _xc3_syms
                             logger.warning(
@@ -5386,7 +5408,6 @@ def run_l1_pipeline(
                     refs_out=_t_refs, disarm_out=_t_disarm)
                 _record_xc3_disarm(details, _t_disarm, stage="test", lang=_t_lang)
                 if _t_pkgs:
-                    details["blocked_via_error_driver"] = _t_lang
                     if decide_unbuilt_internal_verdict(
                             details, getattr(subtask, "scope", None), _t_pkgs, _t_syms,
                             cmd=test_cmd, stage="test", output=t_out,

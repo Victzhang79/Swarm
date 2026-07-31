@@ -860,9 +860,16 @@ def ref_path_stems(
             stems = get_paths(ref, src, project_path, timeout, run)
         except Exception:  # noqa: BLE001 — 路径映射异常 → 该 ref 无路径口径（缺席即回落）
             continue
+        if stems is None:
+            continue           # UNKNOWN（解不出）→ 无路径口径
+        # ★复核 HIGH-2★ `""` 是**合法词干**（Go 根包，`GoErrorDriver.ref_tree_paths` 刻意返
+        # `[""]`，由 `_stem_matches` 特判成"只认工程根直下文件"）。原实现 `[s for s in stems
+        # if s]` + 丢空 value 把它过滤成"键缺席" ⇒ 三个消费者回落 Java 点分
+        # （`github.com/acme/shop` → `github/com/…` 无一命中）⇒ 首轮连坐放弃，**且零留痕**。
+        # 这也证伪了我原先"absent 分支不可达"的推理（漏了"解得出但被过滤空"这第三态）。
         if stems:
-            out[ref] = [s for s in stems if s]
-    return {k: v for k, v in out.items() if v}
+            out[ref] = list(stems)
+    return out
 
 
 def produced_in_scope(
