@@ -206,58 +206,64 @@ def detect_build_surface(project_path: str) -> tuple[str | None, str, list[str]]
 
 
 def _detect_build_cmd_generic(project_path: str) -> str | None:
-    """据构建文件确定【全量编译命令】——**不** gate 本机工具可用性（编译在项目沙箱按检测版本
-    工具链跑；本机是退回路径）。多栈通用。返回 None 仅当【无任何已知构建文件】(如纯 docs)→合理
-    跳过编译，非降级。治本 round21：原 `_detect_build_cmd` 把"本机没装工具"和"没有构建"混为一谈
-    都返 None → L2 静默跳过编译→假绿。现分离二者：有构建文件即返命令，工具在哪跑由调用方决定。
+    """据构建文件确定【整工程全量编译命令】——**不** gate 本机工具可用性（编译在项目沙箱按检测
+    版本工具链跑；本机是退回路径）。返回 None 仅当【无任何已知构建文件】(如纯 docs)→合理跳过
+    编译，非降级。治本 round21：原 `_detect_build_cmd` 把"本机没装工具"和"没有构建"混为一谈都返
+    None → L2 静默跳过编译→假绿。现分离二者：有构建文件即返命令，工具在哪跑由调用方决定。
 
     ★返回 None 的**语义已不足以判断"能否跳过"**★ —— 用 `detect_build_surface()` 拿三态。
-    本函数保留原样（多处调用方与测试依赖它，Maven 路径字节等价）。
+
+    ★M-1/M-6（用户拍板"L2 复用 L1 的实现"）★ 本函数原是一条**手写 if 链**，与
+    `l1_pipeline._derive_full_build_command` 同职责却各存一份 ⇒ 必然漂移：实测它当时仍是
+    root-only、无锚定、且不认 C#/PHP/Ruby/Elixir/Dart（L1 已认）。本会话被同型分叉咬过三次
+    （`_manifest_present` 本地/沙箱、`_build_cmd_applicable` 漏调用点、两探针排除表）。
+
+    治法＝**共享事实、各自投影**：栈→整工程命令这份事实搬进 `stacks.STACK_SPEC`
+    （`whole_project_build_cmd`），本函数只做"匹配根清单 → 取该栈命令"。
+    ★两层 scope 语义不同，故不直接互调★：L1 是子任务级（锚到改动文件所在清单目录，python 只编
+    改动文件），L2 是整工程级（merge 后必须编译全部代码）。共享的是命令事实，不是 scope 策略。
+
+    Maven/Gradle/Go/Cargo/Python 路径与旧实现**逐字等价**（命令串是从旧 if 链原样搬进表的）。
     """
     j = os.path.join
-    if os.path.isfile(j(project_path, "pom.xml")):
-        return "mvn -q -DskipTests compile"
-    # ★也认 `settings.gradle(.kts)`（双复核 HIGH-2）★ 只有 settings.gradle 而无【根】
-    # build.gradle 的多模块 Gradle 工程是常态，旧判据返 None → 被新三态误判成"闸未实现"
-    # → 烧完 replan 后 FAILED。`./gradlew classes` 对它本来就跑得通——漂移的是**派生表太窄**，
-    # 不是这个栈没闸。
-    if any(os.path.isfile(j(project_path, n)) for n in
-           ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")):
-        # #37 治本：`classes` 任务编译主源集【全部 JVM 语言】(compileJava+compileKotlin+
-        # compileScala+compileGroovy，按已应用插件)。旧 `compileJava` 对 Kotlin/Scala 工程
-        # (build.gradle.kts→Kotlin)编译零源→exit 0【假过自动 ACCEPT 坏构建】，或 java 插件
-        # 缺席时任务不存在→非零【冤杀好构建】。`classes` 由任一 JVM 语言插件创建，跨语言正确。
-        return "./gradlew -q classes 2>/dev/null || gradle -q classes"
-    # ★也认 `go.work`（双复核 HIGH-2）★ go.work 多模块仓根上**没有** go.mod，旧判据返 None
-    # → 新三态误判"闸未实现"。实证打到了本仓自己的 B-0 `go_work` 夹具头上。
-    # `go build ./...` 在 workspace 根同样正确（workspace 模式下它构建全部 use 的模块）。
-    if os.path.isfile(j(project_path, "go.mod")) or os.path.isfile(j(project_path, "go.work")):
-        return "go build ./..."
-    if os.path.isfile(j(project_path, "Cargo.toml")):
-        return "cargo build -q"
-    if os.path.isfile(j(project_path, "package.json")):
-        # I1-#13（round38c 主题I·外部深审）：旧命令尾部 `|| true` 把 Node 真编译失败
-        # 全部吞成 exit 0=L2 假绿假 DONE。改确定性选择：有 build script 用 npm run
-        # build；否则有 tsconfig 用 tsc；两者皆无=纯 JS 无确定性编译面，诚实返回
-        # None（合理跳过，与"强制成功"有本质区别）。
-        try:
-            import json as _json
-            with open(j(project_path, "package.json"), encoding="utf-8") as _f:
-                _pkg = _json.loads(_f.read() or "{}")
-            if (_pkg.get("scripts") or {}).get("build"):
-                return "npm run build"
-        except Exception:  # noqa: BLE001 — package.json 坏 → 按无 build script 处理
-            pass
-        if os.path.isfile(j(project_path, "tsconfig.json")):
-            return "npx tsc --noEmit --pretty false"
+    try:
+        from swarm.stacks import STACK_SPEC
+    except Exception as exc:  # noqa: BLE001 — 事实表不可用不该让 L2 崩，但要留痕
+        logger.warning("[integration_review] STACK_SPEC 不可用，构建命令探测降级为 None: %s", exc)
         return None
-    # ★也认 `requirements.txt` / `Pipfile`（双复核 HIGH-2）★ 仅 requirements.txt 是
-    # Django/Flask 的常态；`compileall` **不读任何清单**，对它与 pyproject 仓逐字同命令，
-    # 所以旧判据返 None 纯属派生表太窄。我上一版把这条读成了"STACK_SPEC 照出 python 漂移
-    # → 如实报 unsupported"——方向读反了：漂移的是派生表，不是 python 没闸。
-    if any(os.path.isfile(j(project_path, n)) for n in
-           ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile")):
-        return "python -m compileall -q ."
+
+    # 判序按**清单特异性**：maven/gradle/go/cargo 的清单互不重叠，python 的 requirements.txt
+    # 可能与别的栈共存（Django + 前端），故 python 放最后——与旧 if 链的先后一致。
+    for key in ("maven", "gradle", "go", "cargo", "npm", "python"):
+        spec = STACK_SPEC.get(key)
+        if spec is None:
+            continue
+        if not any(os.path.isfile(j(project_path, m)) for m in spec.root_manifests):
+            continue
+        if key == "npm":
+            # npm 是**条件式**、要读 package.json 内容，不是纯静态事实，故不进表：
+            # I1-#13（round38c 主题I·外部深审）：旧命令尾部 `|| true` 把 Node 真编译失败全部
+            # 吞成 exit 0=L2 假绿假 DONE。改确定性选择：有 build script 用 npm run build；
+            # 否则有 tsconfig 用 tsc；两者皆无=纯 JS 无确定性编译面，诚实返回 None。
+            try:
+                import json as _json
+                with open(j(project_path, "package.json"), encoding="utf-8") as _f:
+                    _pkg = _json.loads(_f.read() or "{}")
+                if (_pkg.get("scripts") or {}).get("build"):
+                    return "npm run build"
+            except Exception:  # noqa: BLE001 — package.json 坏 → 按无 build script 处理
+                pass
+            if os.path.isfile(j(project_path, "tsconfig.json")):
+                return "npx tsc --noEmit --pretty false"
+            return None
+        if spec.whole_project_build_cmd:
+            return spec.whole_project_build_cmd
+        # 表里有这个栈却没给整工程命令 ⇒ 事实缺失，必须可见（硬检查④），不静默当"没有构建"
+        logger.warning(
+            "[integration_review] STACK_SPEC['%s'] 匹配到根清单但 whole_project_build_cmd 为空"
+            "⇒ L2 拿不到整工程编译命令。请补表（M-1：本表是 L1/L2 共享的单一事实源）", key)
+        return None
+    return None
     return None
 
 

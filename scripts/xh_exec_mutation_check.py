@@ -228,13 +228,9 @@ MUTATIONS = [
         '            for a in aliases:',
         ['test_h4_composite_form_matches_family_key_itself'],
     ),
-    (
-        'M-2: compileall 去掉排除模式（钻进 .venv → 永久冤枉）',
-        PIPE,
-        '                  "python3 -m compileall -q -x \'(^|/)(\\\\.venv|venv|node_modules|vendor|"\n                  "\\\\.git|build|dist|target|__pycache__)(/|$)\' .")',
-        '                  "python3 -m compileall -q .")',
-        ['test_m2_compileall_excludes_dependency_trees'],
-    ),
+    # ★M-2 的突变随决定 1 删除★ 病灶（整树 compileall 钻进 .venv）与治法（`-x` 排除表）
+    # 都已被『只编译改动文件』取代 —— 排除表整个不存在，无从突变。现由
+    # `test_m2_per_file_needs_no_exclusion_table` 正向钉住『别退回整树』。
     (
         'M-3: _manifest_present 不再排除依赖树（两探针分叉 → at() 退回根 → 127）',
         PIPE,
@@ -262,14 +258,15 @@ MUTATIONS = [
         PIPE,
         '        d = _manifest_dir_for(mods, names, project_path, evidence=_ev)',
         '        d = _manifest_dir(names, project_path)',
-        ['test_hc1_anchor_comes_from_modified_not_shortest_manifest', 'test_hc1_go_anchor_follows_the_changed_module'],
+        # python 走决定 1 的逐文件形态、不再锚定 ⇒ 只有 go 那条真在测锚点
+        ['test_hc1_go_anchor_follows_the_changed_module'],
     ),
     (
         'CRITICAL-1: 改动落在锚点外时不再退根（闸覆盖不到改动文件）',
         PIPE,
         '        if _ev.get("uncovered"):',
         '        if False:',
-        ['test_hc1_anchor_comes_from_modified_not_shortest_manifest'],
+        ['test_hc1_uncovered_changes_fall_back_to_root'],
     ),
     (
         'CRITICAL-1: 跨多清单时硬挑一个（静默只覆盖一半）',
@@ -347,6 +344,14 @@ MUTATIONS = [
         '    "econnrefused\\n", "getaddrinfo enotfound", "eai_again",',
         '    "econnrefused", "enotfound", "eai_again",',
         ["test_infra_markers_do_not_swallow_missing_internal_symbols"],
+    ),
+    # ── 用户拍板的四条决定 ──
+    (
+        "决定 1：python 闸退回整树 compileall（linter 仓的坏语法夹具永久判死）",
+        PIPE,
+        '        return _per_file("python3 -m compileall -q", (".py",))',
+        '        return "python3 -m compileall -q ."',
+        ["test_d1_python_gate_only_compiles_changed_files"],
     ),
 ]
 

@@ -449,7 +449,12 @@ def test_detection_table_drift_is_accounted():
     """
     spec_names = {n for s in STACK_SPEC.values() for n in s.root_manifests}
     missing = {n for n in spec_names if n.lower() not in cu._MANIFEST_TO_STACK_LC}
-    assert missing == {"requirements.txt", "setup.py"}, (
+    # `Pipfile` 于 2026-07-31（决定 2 合表）加入 spec.root_manifests——旧
+    # `integration_review` 的 if 链认它、spec 不认，合表当场炸出那处漂移（Pipfile 工程被误判
+    # `no_build_surface`＝"闸未实现"）。它与 requirements.txt/setup.py **同档处置**：
+    # 只进 spec、**不进检测表**（进检测表会把 `_should_fabricate_maven_scaffold` 对纯 python 仓
+    # 从 True 翻成 False，那是"要不要伪造 pom"的后果档，属 B-6 范围）。
+    assert missing == {"requirements.txt", "setup.py", "Pipfile"}, (
         f"两表差集变了（实得 {sorted(missing)}）。加进检测表会改 pom 伪造闸的行为档，"
         f"请按 B-6 的口径处置后再更新本断言，别默默改表。")
 

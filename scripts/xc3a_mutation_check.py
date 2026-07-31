@@ -139,11 +139,11 @@ MUTATIONS = [
         ["test_root_stem_does_not_swallow_subdirs"],
     ),
     (
-        "HIGH-2 账: 『判了 BLOCKED 却无路径口径』不再留痕",
-        PIPE,
-        '                details["blocked_on_paths_absent"] = language_key',
-        "                pass",
-        ["test_blocked_without_path_namespace_leaves_account"],
+        "决定 3：ref_path_stems 又过滤掉合法词干（Go 根包 `\"\"`）⇒ 第三态复活、『BLOCKED 却无路径口径』重现",
+        DRV,
+        '        if stems:\n            out[ref] = list(stems)',
+        '        if stems:\n            out[ref] = [s for s in stems if s]',
+        ["test_absent_branch_is_unreachable_by_construction"],
     ),
     (
         "HIGH-3: 多候选二选一又跨 ref 施加（缺 N 个只建 1 个）",

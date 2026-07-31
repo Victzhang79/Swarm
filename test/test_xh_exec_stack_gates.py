@@ -306,7 +306,10 @@ def test_xh8_jvm_repair_signal_requires_real_evidence():
 # X-H1 + N-4 + N-2：_derive_full_build_command 多栈化 + 跨栈污染
 # ══════════════════════════════════════════════
 
-_PY_COMPILEALL = ("python3 -m compileall -q -x '(^|/)(\\.venv|venv|node_modules|vendor|\\.git|build|dist|target|__pycache__)(/|$)' .")
+def _PY_PER_FILE(*files: str) -> str:
+    """决定 1 后 python 闸的命令形态（逐个编译改动文件）。"""
+    return ("for f in " + " ".join(files)
+            + ' ; do python3 -m compileall -q "$f" || exit 1; done').replace(" ; ", "; ")
 
 _XH1_CASES = [
     # X-H1：npm 改 .js/.jsx/.vue —— 原先只认 .ts/.tsx+tsconfig ⇒ 这些形态零构建闸
@@ -320,13 +323,15 @@ _XH1_CASES = [
     ("ts-prefers-tsc", {"tsconfig.json": "{}", "package.json": '{"scripts":{"build":"x"}}',
                         "src/a.ts": "x"}, ["src/a.ts"], "tsc --noEmit"),
     # N-4：python 原先**没有任何分支**
-    # 复核 M-2：命令带 `-x` 排除依赖树（`.venv` 里的第三方源码会让闸永久冤枉）
+    # ★决定 1（用户拍板）★ python 闸只编译**改动文件**（与 PHP/Ruby 同口径）。
+    # 演进：整树 → 加 `-x` 排除表 → 逐文件。逐文件之后**不需要任何排除表**，
+    # 也不会被 linter 仓刻意 ship 的坏语法夹具冤枉（见 test_d1_...）。
     ("py-pyproject", {"pyproject.toml": "[project]", "app/a.py": "x"},
-     ["app/a.py"], _PY_COMPILEALL),
+     ["app/a.py"], _PY_PER_FILE("app/a.py")),
     ("py-requirements", {"requirements.txt": "flask", "app/a.py": "x"},
-     ["app/a.py"], _PY_COMPILEALL),
+     ["app/a.py"], _PY_PER_FILE("app/a.py")),
     ("py-setuppy", {"setup.py": "from setuptools import setup", "app/a.py": "x"},
-     ["app/a.py"], _PY_COMPILEALL),
+     ["app/a.py"], _PY_PER_FILE("app/a.py")),
     # N-2：go.work 多模块仓
     ("go-work", {"go.work": "use ./a\n", "a/go.mod": "module a", "a/m.go": "package a"},
      ["a/m.go"], "go build ./..."),
@@ -503,23 +508,27 @@ def test_h4_composite_form_matches_family_key_itself(raw, fam):
     assert SandboxConfig.canonical_template_language(raw) == fam
 
 
-def test_m2_compileall_excludes_dependency_trees(tmp_path):
-    """★复核 M-2★ `compileall` 默认递归整棵树，会钻进 `.venv`/`node_modules` 里的第三方源码
-    （实测：`.venv` 下一个 py2 语法文件就让整个闸 rc=1）⇒ 永久冤枉。"""
+def test_m2_per_file_needs_no_exclusion_table(tmp_path):
+    """★M-2 的最终形态（决定 1 之后）★ 原病灶是 `compileall` 递归整树会钻进 `.venv`
+    （实测一个 py2 语法文件就让闸 rc=1）。当时的治法是 `-x` 排除表，复核随即指出**排除表是
+    补不完的黑名单**（linter 仓刻意 ship 坏语法夹具，目录名无通用约定）。
+    用户拍板改成逐文件后，这个问题**从根上不存在**——依赖树、坏夹具、`.tox` 都不在面内，
+    命令里也不再需要任何排除模式。本条同时钉住"别退回整树"。"""
     import subprocess
     import sys as _sys
     root = _tree(tmp_path, {"pyproject.toml": "[project]", "app/a.py": "x = 1\n",
-                            ".venv/lib/py/old.py": "print 'py2'\n"})
+                            ".venv/lib/py/old.py": "print 'py2'\n",
+                            "tests/fixtures/bad.py": "def f(\n"})
     cmd = lp._derive_full_build_command(str(root), ["app/a.py"], None)
-    assert "-x" in cmd, "没有排除模式 ⇒ 会编译依赖树"
+    assert "compileall -q ." not in cmd, "退回整树编译了"
+    assert "-x" not in cmd, "逐文件形态不该再需要排除表"
     real = cmd.replace("python3", _sys.executable)
     assert subprocess.run(["sh", "-c", real], cwd=root,
-                          capture_output=True).returncode == 0, ".venv 未被排除"
-    # 反向臂：工程内真语法错必须仍被抓（别把闸拧成恒过）
-    (root / "app" / "bad.py").write_text("def f(\n")
-    assert subprocess.run(["sh", "-c", real], cwd=root,
-                          capture_output=True).returncode != 0, "闸没牙了"
-
+                          capture_output=True).returncode == 0
+    (root / "app" / "bad.py").write_text("def g(\n")
+    cmd2 = lp._derive_full_build_command(str(root), ["app/a.py", "app/bad.py"], None)
+    assert subprocess.run(["sh", "-c", cmd2.replace("python3", _sys.executable)],
+                          cwd=root, capture_output=True).returncode != 0, "闸没牙了"
 
 def test_m3_both_probes_exclude_dependency_trees(tmp_path):
     """★复核 M-3★ 两个探针必须同口径：`_manifest_present` 若从 `node_modules/**` 判 True 而
@@ -587,10 +596,12 @@ def test_hc1_anchor_comes_from_modified_not_shortest_manifest(tmp_path):
     r = subprocess.run(["sh", "-c", cmd.replace("python3", _sys.executable)],
                        cwd=root, capture_output=True)
     assert r.returncode != 0, "改动文件的语法错没被抓到 ⇒ 闸跑了也是白跑"
-    # 反向臂：改动**在**锚点之内时必须精确锚定（别为了覆盖面把锚定整个放弃）
-    (root / "backend" / "bad.py").write_text("def g(\n")
-    cmd2 = lp._derive_full_build_command(str(root), ["backend/bad.py"], None)
-    assert cmd2.startswith("cd backend &&"), f"该锚定时没锚定: {cmd2!r}"
+    # 反向臂：改动**在**锚点之内时必须精确锚定（别为了覆盖面把锚定整个放弃）。
+    # ★用 go 断这一条★：python 走决定 1 的逐文件形态、天然不需要锚点，
+    # 而 go/C#/elixir 这些**整目录**命令才是 `at()` 的服务对象。
+    go = _tree(tmp_path / "go1", {"svc/go.mod": "module svc", "svc/a.go": "package svc"})
+    assert lp._derive_full_build_command(str(go), ["svc/a.go"], None) \
+        == "cd svc && go build ./...", "该锚定时没锚定"
 
 
 def test_hc1_go_anchor_follows_the_changed_module(tmp_path):
@@ -741,3 +752,57 @@ def test_infra_markers_do_not_swallow_missing_internal_symbols(label, txt):
     这正是本会话记过的"加 token 前先估它在真实语料里的命中面积"。
     本条把五个栈的"缺内部标识"形态钉死为**非 infra**——它们必须走 X-C3 的归因链。"""
     assert lp._is_infra_failure(txt) is False, f"{label} 被 infra 化 ⇒ X-C3 归因链失效"
+
+
+# ══════════════════════════════════════════════
+# 用户拍板的决定（决定 1：python 闸只编译改动文件）
+# ══════════════════════════════════════════════
+
+def test_d1_python_gate_only_compiles_changed_files(tmp_path):
+    """★决定 1（用户拍板）★ python 构建闸只编译**改动文件**，与 PHP/Ruby 同口径。
+
+    演进史：`compileall -q .`（整树）→ 复核 M-2 指出它钻进 `.venv`（实测一个 py2 语法文件就让
+    整个闸 rc=1）→ 加 `-x` 排除表 → 复核再指出**排除表是补不完的黑名单**：linter/parser/
+    formatter 工程会**刻意 ship 坏语法夹具**（`tests/fixtures/bad_syntax.py`），而"刻意坏语法"
+    的目录名没有通用约定，换个名就复发（本仓纪律反对 denylist 式打补丁）。
+    ★只碰 worker 自己改的文件＝可证不误杀★，且不需要任何排除表。
+    """
+    import subprocess
+    import sys as _sys
+    root = _tree(tmp_path, {
+        "pyproject.toml": "[project]",
+        "app/ok.py": "x = 1\n",
+        "tests/fixtures/bad_syntax.py": "def f(\n",      # linter 仓刻意 ship 的坏夹具
+        ".venv/lib/old.py": "print 'py2'\n",             # 依赖树里的 py2 源码
+        "node_modules/x/setup.py": "def g(\n",           # 依赖树里的坏语法
+    })
+    cmd = lp._derive_full_build_command(str(root), ["app/ok.py"], None)
+    assert "for f in" in cmd and "app/ok.py" in cmd, f"不是逐文件形态: {cmd!r}"
+    assert "compileall -q ." not in cmd, "又变回整树编译了"
+    real = cmd.replace("python3", _sys.executable)
+    assert subprocess.run(["sh", "-c", real], cwd=root,
+                          capture_output=True).returncode == 0, \
+        "坏语法夹具/依赖树被卷进编译面 ⇒ 该仓每个 python 子任务永久判死"
+    # 反向臂：改动里**真有**语法错必须被抓（别把闸拧成恒过）
+    (root / "app" / "bad.py").write_text("def g(\n")
+    cmd2 = lp._derive_full_build_command(str(root), ["app/ok.py", "app/bad.py"], None)
+    assert subprocess.run(["sh", "-c", cmd2.replace("python3", _sys.executable)],
+                          cwd=root, capture_output=True).returncode != 0, "闸没牙了"
+    # 只改非 .py → 不出命令（不臆造）
+    assert lp._derive_full_build_command(str(root), ["README.md"], None) == ""
+
+
+def test_hc1_uncovered_changes_fall_back_to_root(tmp_path):
+    """★复核 CRITICAL-1 的"覆盖不到就退根"这一半★（决定 1 之后只有整目录命令的栈能观测到）
+
+    go 双模块仓，改动文件落在**任何 go.mod 之上**（仓根的脚本）：锚到某个子模块会把它排除在
+    编译面之外 ⇒ 闸跑了 rc=0 也是白跑。正确行为是退到工程根（覆盖面最大）。
+    """
+    root = _tree(tmp_path, {"svc/go.mod": "module svc", "svc/a.go": "package svc",
+                            "main.go": "package main\nfunc main(){}"})
+    # `main.go` 在根，其上没有 go.mod（go.mod 在 svc/）⇒ 锚不到 ⇒ 必须退根
+    cmd = lp._derive_full_build_command(str(root), ["main.go"], None)
+    assert cmd == "go build ./...", f"没退到根: {cmd!r}"
+    # 反向臂：改动在 svc/ 之内时仍要精确锚定
+    assert lp._derive_full_build_command(str(root), ["svc/a.go"], None) \
+        == "cd svc && go build ./..."

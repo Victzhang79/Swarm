@@ -28,9 +28,23 @@ _CARGO = "Cargo.toml"
 _DOCKER = ("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yaml")
 
 # 扫描时跳过的目录（与 preprocess EXCLUDED_DIRS 对齐核心项）
+# 清单**发现**时跳过的目录。判据是「这里的清单不是本工程的构建入口」——
+# ★按目录语义列，不按"是否隐藏"★（CLAUDE.md 血泪：拿"隐藏目录=噪声"去做镜像 tarball 剔除，
+# 把 `.mvn/wrapper`、`.yarn/releases` 剔没了）。
+#
+# ★注意本表与 `image_builder._SRC_EXCLUDE_DIRS` 的**消费契约不同**★（"复用单一事实源 ≠ 复用其
+# 消费契约"）：本表只影响"哪个 package.json 算构建入口"，**不影响镜像里带什么文件**。所以把
+# `.yarn` 列进来不会让 yarn 起不来——`.yarn/releases`（yarn 自己的发行版，属构建工具本体）
+# 仍照常进镜像，那由 image_builder 侧的 wrapper 白名单负责。
 _SKIP_DIRS = {
     "node_modules", "target", "build", "dist", ".git", ".idea", ".vscode",
     "__pycache__", ".venv", "venv", "vendor", ".gradle", ".mvn",
+    # X-C2 遗留（用户拍板补齐）：依赖/vendored 产物里的清单一律不算构建入口。
+    # 同型危害本会话已实测：`node_modules/**/pyproject.toml` 劫持了**所有栈**的测试闸、
+    # `node_modules/**/*.csproj` 让 `dotnet build` 在错目录跑 → 127 → BLOCKED。
+    "third_party", "third-party", "3rdparty", ".yarn", ".pnpm-store",
+    "bower_components", "Pods", "packages_cache", ".tox", ".eggs",
+    "site-packages", ".mypy_cache", ".pytest_cache", ".next", ".nuxt",
 }
 
 

@@ -118,6 +118,21 @@ class StackSpec:
     source_exclude_dirs: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的目录段（vendored / 产物目录，从不由人手写）。"""
 
+    whole_project_build_cmd: str = ""
+    """**整工程**全量编译命令（L2/集成复核用）。空串＝本表未收录该栈的整工程命令。
+
+    ★为什么放在这里（M-1/M-6，用户拍板"L2 复用 L1 的实现"）★
+    `integration_review._detect_build_cmd_generic` 与 `l1_pipeline._derive_full_build_command`
+    是**同职责 sibling**（清单→构建命令），此前各写一份 if 链 ⇒ 必然漂移。本会话已被同类分叉
+    咬过三次（`_manifest_present` 本地/沙箱、`_build_cmd_applicable` 漏调用点、两探针排除表）。
+
+    ★但两层的 scope 语义**不同**，不能直接互调★：
+      · L1 是**子任务级**——命令要锚到改动文件所在清单目录，python 甚至只编译改动的那几个文件
+        （用户拍板：linter 仓刻意 ship 坏语法夹具，整树必永久冤枉）；
+      · L2 是**整工程级**——merge 后必须编译**全部**代码，只编改动文件等于没验。
+    所以共享的是"**哪个栈用什么命令**"这份事实，而不是 scope 策略：L2 读本字段，L1 在自己的
+    scope 逻辑里读同一张表挑栈。一份事实、两种投影。"""
+
     source_exclude_suffixes: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的后缀（如 `.d.ts` 只是类型声明，无编译产物）。"""
 
@@ -138,6 +153,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         # ★唯一有确定性 aggregator/模块脚手架 driver 的栈★（_AGGREGATOR_SCAFFOLD_STACKS）
         has_module_scaffold_driver=True,
         source_exclude_dirs=("target",),
+        whole_project_build_cmd="mvn -q -DskipTests compile",
     ),
     "gradle": StackSpec(
         key="gradle", lang="java",
@@ -152,6 +168,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         has_aggregate_reconcile=True,      # _reconcile_gradle（认 .kts）
         # 模块 build.gradle 无脚手架 driver（P-H4）→ 模块清单 demote 必须留痕
         source_exclude_dirs=("build",),
+        whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
     ),
     "npm": StackSpec(
         key="npm", lang="node",
@@ -173,6 +190,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exts=(".go",),
         has_aggregate_reconcile=True,      # _reconcile_go_work（模块 go.mod 无网）
         source_exclude_dirs=("vendor",),
+        whole_project_build_cmd="go build ./...",
     ),
     "cargo": StackSpec(
         key="cargo", lang="rust",
@@ -182,16 +200,22 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exts=(".rs",),
         has_aggregate_reconcile=True,      # _reconcile_cargo（成员 Cargo.toml 无网）
         source_exclude_dirs=("target",),
+        whole_project_build_cmd="cargo build -q",
     ),
     "python": StackSpec(
         key="python", lang="python",
-        root_manifests=("pyproject.toml", "setup.py", "requirements.txt"),
+        # `Pipfile` 是 M-1 合表时补的：旧 `integration_review` 的 if 链认它、本表原先不认
+        # ⇒ 合表当场炸出 `test_supported_stacks_with_wider_manifests_are_not_misjudged`
+        # （Pipfile 工程被误判 no_build_surface＝"闸未实现"）。这正是"两份实现必然漂移"
+        # 的实证——合表之后这类漂移不可能再无声无息。
+        root_manifests=("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
         module_manifest="pyproject.toml",
         # ★刻意 None（诚实边界）★ poetry / uv / hatch 的 workspace 机制互不兼容，
         # 收录任何一种都是猜。缺席由 unregistered_aggregate_stacks() 机读可辨。
         aggregate_manifest=None, aggregate_field="",
         source_exts=(".py",),
         source_exclude_dirs=("build", "dist", ".venv", "site-packages"),
+        whole_project_build_cmd="python -m compileall -q .",
     ),
 }
 

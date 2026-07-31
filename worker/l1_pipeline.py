@@ -2081,18 +2081,22 @@ def decide_unbuilt_internal_verdict(
             from swarm.worker.l1_error_drivers import ref_path_stems
             _paths = ref_path_stems(language_key, driver_refs or list(blocked_pkgs),
                                     project_path, timeout, run)
-            # ★复核 HIGH-2 恢复的降级账★ 我原先删了它并断言"不可达"，理由是"解不出的 ref 必先
-            # 在 UNKNOWN 闸早返"。那个推理**漏了第三态**：词干**解得出但被过滤成空**（Go 根包
-            # 返 `[""]`）。此时 UNKNOWN 闸不拦、路径键又缺席 ⇒ brain 全部回落 Java 点分 ⇒ 首轮
-            # 连坐放弃且零信号。词干过滤已修（`""` 保留），但这条账必须在：它是"BLOCKED 了却
-            # 没有路径口径"的唯一信号，而那等价于"本 ref 大概率会被连坐放弃"。
-            if not _paths:
-                details["blocked_on_paths_absent"] = language_key
-                logger.warning(
-                    "[L1.%s] X-C3-A 非 JVM 栈 %s 判了 BLOCKED 却**无路径口径** → brain 侧将回落"
-                    "Java 点分转换（大概率反查不到生产者 → 首轮连坐放弃）。这是该情形的唯一"
-                    "信号: %s", _XC3_STAGE_TAG.get(stage, "?"), language_key,
-                    sorted(blocked_pkgs)[:4])
+            # ★这里**刻意没有** else 分支（"BLOCKED 却无路径口径"的降级账已删）★
+            #
+            # 这条账我加过、删过、又加过、现在再删——值得把因果写清，免得下一个人重走：
+            #   · 最初删掉：理由是"词干解不出的 ref 必先在上面的 UNKNOWN 闸早返 FAIL"。
+            #   · reviewer 证伪：那个推理漏了**第三态**——词干*解得出但被过滤成空*。当时
+            #     `ref_path_stems` 写的是 `[s for s in stems if s]`，把 Go 根包的合法词干 `[""]`
+            #     过滤没了 ⇒ UNKNOWN 闸不拦、路径键又缺席 ⇒ 静默。于是恢复。
+            #   · hunter 又指它"生产不可达 + 零消费者"＝空账。
+            #   ★两人都对，只是**针对的代码状态不同**★：我在 HIGH-2 那轮把过滤修了（`""` 保留），
+            #     第三态就此消失，分支重新变成不可达。
+            # 现按**实测**定案（穷举 go 根包/非本模块、node `./`+`../`+裸包名、rust
+            # `self::`/`super::`、python 正常共 8 种形态走裁决本体）：`absent` 恒为 None，
+            # 因为"没词干"与"归属未知"读的是**同一个** `ref_tree_paths` ⇒ 前者必然蕴含后者 ⇒
+            # 永远在 `if _unres:` 处早返。故到得了本行就必有词干。
+            # ★维持这个不变量的责任在 `ref_path_stems`：它不许再把合法词干过滤掉★
+            # （`test_absent_branch_is_unreachable_by_construction` 锁它）。
             if _paths:
                 details["blocked_on_paths"] = sorted(
                     {s for stems in _paths.values() for s in stems})
@@ -2988,6 +2992,13 @@ def _derive_full_build_command(
             return "./gradlew -q classes" if has("gradlew") else "gradle -q classes"
         if build == "maven" or has("pom.xml"):
             return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
+    def _per_file(cmd: str, exts: tuple[str, ...]) -> str:
+        files = [f for f in mods if f.endswith(exts)]
+        if not files:
+            return ""
+        quoted = " ".join(shlex.quote(f) for f in files[:100])
+        return f"for f in {quoted}; do {cmd} \"$f\" || exit 1; done"
+
     def at(names: tuple[str, ...], cmd: str) -> str:
         """把命令锚到**清单所在目录**（X-H1 跨栈污染治法）。
 
@@ -3049,12 +3060,18 @@ def _derive_full_build_command(
     # 它不查 import（那由 L1.3 的 X-C3 第三调用点兜），但比"什么都不跑"强得多。
     if ext(".py") and (build in ("pip", "poetry", "uv", "python")
                        or has("pyproject.toml", "setup.py", "requirements.txt", "Pipfile")):
-        # ★复核 M-2★ `compileall` 默认递归**整棵树**，会钻进 `.venv`/`node_modules`/`vendor`
-        # 里的第三方源码（实测：`.venv` 下放一个 py2 语法文件就让整个闸 rc=1）⇒ 永久冤枉。
-        # `-x` 收正则排除；同时锚到清单目录，别在多语言仓的根上编译全树。
-        return at(("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
-                  "python3 -m compileall -q -x '(^|/)(\\.venv|venv|node_modules|vendor|"
-                  "\\.git|build|dist|target|__pycache__)(/|$)' .")
+        # ★用户拍板：只编译**改动文件**★（与 PHP/Ruby 同口径）
+        # 演进史值得留：最初是 `compileall -q .`（整树）→ 复核 M-2 指出它钻进 `.venv`
+        # （实测一个 py2 语法文件就让整个闸 rc=1）→ 加 `-x` 排除表 → 复核又指出**排除表是
+        # 补不完的黑名单**：linter/parser/formatter 工程会**刻意 ship 坏语法夹具**
+        # （`tests/fixtures/bad_syntax.py`），而"刻意坏语法"的目录名没有通用约定，换个名就复发
+        # （本仓纪律明确反对 denylist 式打补丁）。
+        # ★只碰 worker 自己改的文件＝可证不误杀★：坏语法夹具/依赖树/`.tox`/`site-packages`
+        # 全都不在面内，且不需要维护任何排除表。
+        # 诚实边界：**跨文件的 import 错抓不到**——那本就不是 compileall 的能力
+        # （`py_compile` 只做语法/字节码级），由 L1.3 的 X-C3 第三调用点（真 import 时的
+        # `ModuleNotFoundError` 归因）承担。
+        return _per_file("python3 -m compileall -q", (".py",))
     # X-H1：C#/PHP/Ruby/Elixir/Dart —— 原先全返 ''。只在**清单在场**时出命令（纪律 2 不臆造）。
     if ext(".cs") and has("*.csproj", "*.sln"):
         return at(("*.csproj", "*.sln"), "dotnet build --nologo -v q")
@@ -3070,12 +3087,6 @@ def _derive_full_build_command(
     # ⇒ worker 交任意破 PHP/Ruby 都能拿 L1 PASS（硬检查④）。
     # 治法：不依赖 git、不依赖"全项目枚举"，直接逐个检查**本子任务改动的那些文件**——
     # 那正是 L1 该管的范围，且确定性、有界、无截断（`|| exit 1` 保证任一失败即失败）。
-    def _per_file(cmd: str, exts: tuple[str, ...]) -> str:
-        files = [f for f in mods if f.endswith(exts)]
-        if not files:
-            return ""
-        quoted = " ".join(shlex.quote(f) for f in files[:100])
-        return f"for f in {quoted}; do {cmd} \"$f\" || exit 1; done"
 
     if ext(".php") and has("composer.json"):
         return _per_file("php -l", (".php",))

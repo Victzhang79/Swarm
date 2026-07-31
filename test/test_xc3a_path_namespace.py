@@ -39,6 +39,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 import swarm.worker.l1_error_drivers as ed  # noqa: E402
+import swarm.worker.l1_pipeline as lp  # noqa: E402
 from swarm.brain.nodes.failure import _derive_missing_type_files  # noqa: E402
 from swarm.brain.nodes.recovery import (_blocked_pkg_unrecoverable,  # noqa: E402
                                         _package_in_baseline, _producers_of)
@@ -240,20 +241,29 @@ def test_root_stem_does_not_swallow_subdirs(tmp_path):
                          paths=[""]) == set()
 
 
-def test_blocked_without_path_namespace_leaves_account(tmp_path):
-    """★复核 HIGH-2 配套★ "判了 BLOCKED 却无路径口径"必须留机读键 + WARNING——那等价于
-    "本 ref 大概率会被连坐放弃"，是该情形的唯一信号。我原先删过这条账并断言"不可达"，
-    HIGH-2 证伪（漏了"词干解得出但被过滤空"第三态）。"""
-    import swarm.worker.l1_pipeline as lp
-    details: dict = {}
-    # 未收录栈 → driver 为 None → 无路径口径，但裁决仍走 BLOCKED（口径缺席不改判）
-    lp.decide_unbuilt_internal_verdict(
-        details, FileScope(writable=["a/b.ex"]), {"Foo.Bar"}, [],
-        cmd="mix compile", stage="build", output="", language_key="elixir",
-        project_path=str(tmp_path), timeout=20, run=_probe())
-    assert details.get("blocked_on_paths_absent") == "elixir"
-    assert "blocked_on_paths" not in details
+def test_unregistered_stack_never_reaches_blocked_tail(tmp_path):
+    """（原 `test_blocked_without_path_namespace_leaves_account`，随决定 3 改写）
 
+    原测试断言"未收录栈判 BLOCKED 时要落 `blocked_on_paths_absent`"——但它是**直调裁决本体
+    硬塞** `language_key="elixir"` + 非空 `blocked_pkgs` 才走到的，生产上到不了：未收录栈在
+    `blocked_on_unbuilt_internal` 就会以 `disarm=unregistered_stack` 返空 ⇒ `blocked_pkgs`
+    恒空 ⇒ 裁决层立刻短路。这正是"构造了生产代码从不产生的取值"那类假绿。
+    改为断言**生产事实本身**：未收录栈根本进不了 BLOCKED 尾。
+    """
+    disarm: dict = {}
+    pkgs, syms = ed.blocked_on_unbuilt_internal(
+        "elixir", "** (CompileError) lib/a.ex:3: undefined function foo/0",
+        str(tmp_path), 20, _probe(), disarm_out=disarm)
+    assert (pkgs, syms) == (set(), []), "未收录栈竟产出了 blocked ref"
+    assert disarm.get("reason") == "unregistered_stack"
+    # 因此裁决层收到空集 → 立刻返 False，`blocked_on_paths*` 一个都不写
+    details: dict = {}
+    assert lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["a/b.ex"]), pkgs, syms,
+        cmd="mix compile", stage="build", output="", language_key="elixir",
+        project_path=str(tmp_path), timeout=20, run=_probe()) is False
+    assert "blocked_on_paths" not in details
+    assert "blocked_on_paths_absent" not in details
 
 def test_symbol_fqn_inherits_longest_matching_container(tmp_path):
     """★hunter 复核 HIGH-2★ 两个 ref 互为点分前缀时（`app.services` 与 `app.services.user`
@@ -542,3 +552,51 @@ def test_jvm_verdict_writes_no_path_keys(tmp_path):
     assert details["blocked_on_packages"] == [JVM_REF]
     assert os.sep is not None      # 占位：确保 import 被用到（ruff F401 防呆）
 
+
+
+# ══════════════════════════════════════════════
+# 决定 3（用户拍板"按真实可达性重判"）
+# ══════════════════════════════════════════════
+
+_ABSENT_SHAPES = [
+    ("go", "github.com/acme/shop", None, "根包 ref==module"),
+    ("go", "github.com/other/x", None, "非本模块"),
+    ("node", "./routes/users", None, "相对导入无 src"),
+    ("node", "../svc/user", None, "../ 无 src"),
+    ("node", "express", None, "裸包名"),
+    ("rust", "self::helper", None, "self:: 无上下文"),
+    ("rust", "super::helper", None, "super:: 无上下文"),
+    ("python", "app.services.user", None, "正常（有词干）"),
+]
+
+
+@pytest.mark.parametrize("lang,ref,src,label", _ABSENT_SHAPES,
+                         ids=[c[3] for c in _ABSENT_SHAPES])
+def test_absent_branch_is_unreachable_by_construction(lang, ref, src, label, tmp_path):
+    """★决定 3：`blocked_on_paths_absent` 按**实测**定案为不可达，本条锁住那个不变量★
+
+    这条账加过、删过、又加过、最后删掉。因果值得留：
+      · 最初删：推理是"词干解不出的 ref 必先在 UNKNOWN 闸早返"。
+      · reviewer 证伪：漏了**第三态**——词干*解得出但被过滤成空*（当时
+        `ref_path_stems` 的 `[s for s in stems if s]` 把 Go 根包的合法词干 `[""]` 滤没了）。
+      · hunter 又指它"生产不可达 + 零消费者"＝空账。
+      ★两人都对，只是针对的代码状态不同★：HIGH-2 那轮把过滤修了，第三态消失，分支重新不可达。
+
+    本条穷举八种形态走**裁决本体**，断言：要么有词干（走 BLOCKED 尾），要么落
+    `blocked_owner_unresolved`（早返 FAIL）—— **绝不出现"BLOCKED 了却没有路径口径"**。
+    维持它的责任在 `ref_path_stems`：不许再把合法词干过滤掉。谁破了这条不变量，本条即红。
+    """
+    mr = ed.MissingRef(ref=ref, symbol=None, src=src)
+    details: dict = {}
+    blocked = lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["a/b.txt"]), {ref}, [],
+        cmd="x", stage="build", output="", language_key=lang,
+        project_path=str(tmp_path), timeout=20, run=_probe(), driver_refs=[mr])
+    assert "blocked_on_paths_absent" not in details, \
+        "第三态又出现了（词干被过滤成空却没落 unresolved）⇒ 这条降级账得恢复"
+    if blocked:
+        assert details.get("blocked_on_paths"), \
+            "判了 BLOCKED 却没有路径口径 ⇒ brain 会回落 Java 点分 → 首轮连坐放弃"
+    else:
+        assert details.get("blocked_owner_unresolved"), \
+            "落 FAIL 却没说明原因（归属未知）⇒ 降级无痕"
