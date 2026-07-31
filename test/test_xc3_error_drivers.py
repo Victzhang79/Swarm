@@ -651,6 +651,44 @@ def test_wiring_ts_own_scope_producer_falls_to_fail(
         "判 FAIL 却留着 blocked_via_error_driver = 陈键，下游读它会误判"
 
 
+def test_stale_stack_key_from_earlier_gate_is_cleared(ts_project, monkeypatch,
+                                                     quiet_gates):
+    """★hunter 复核 HIGH-3★ 上一批的 M-4 锁（"裁决翻转成 FAIL 不留粘滞键"）被 LOW-10 整改
+    静默拆掉了：栈键的唯一写点移到 BLOCKED 尾、在两处 pop **之后** ⇒ 那两处 pop 成死代码、
+    守卫断言恒真（把 pop 整块删掉测试仍全绿）。
+
+    **根因是前提缺失**：`details` 在 `run_l1_pipeline` 里只初始化一次、被 compile/build/test
+    三个闸**共用**。真正要 pop 的是**前一个闸**判 BLOCKED 时写下的栈键——而原测试的 details
+    空进空出，那个前提根本没造出来。本条按生产形状预置陈键。
+    """
+    details = {"blocked_via_error_driver": "node"}   # ← 前一个闸留下的陈键
+    blocked = lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["src/app.ts"], create_files=["src/routes/users.ts"]),
+        {"./routes/users"}, [], cmd="(L1.2 compile)", stage="compile", output="",
+        language_key="node", project_path=str(ts_project), timeout=20,
+        run=_fake_probe(),
+        driver_refs=[ed.MissingRef(ref="./routes/users", symbol=None, src="src/app.ts")])
+    assert blocked is False, "生产者在自己 scope 内 → FAIL 修复梯"
+    assert "blocked_via_error_driver" not in details, \
+        "前一个闸的陈键没被清 ⇒ 下游会以为本轮也是 error-driver 判的 BLOCKED"
+
+
+def test_stale_stack_key_cleared_on_unresolved_owner_exit(ts_project, monkeypatch,
+                                                         quiet_gates):
+    """M-4b：另一条 FAIL 出口（归属 UNKNOWN）同样不许留粘滞键。两条出口各自锁——
+    只锁一条时另一条被拆掉不会红（本批 HIGH-3 就是"锁与前提对不上"的形状）。"""
+    details = {"blocked_via_error_driver": "node"}   # ← 前一个闸留下的陈键
+    blocked = lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["src/app.ts"]), {"./routes/users"}, [],
+        cmd="(L1.2 compile)", stage="compile", output="", language_key="node",
+        project_path=str(ts_project), timeout=20, run=_fake_probe(),
+        # src=None ⇒ 相对导入解不出 ⇒ 归属 UNKNOWN ⇒ 走那条 FAIL 出口
+        driver_refs=[ed.MissingRef(ref="./routes/users", symbol=None, src=None)])
+    assert blocked is False
+    assert details.get("blocked_owner_unresolved") == ["./routes/users"]
+    assert "blocked_via_error_driver" not in details
+
+
 def test_wiring_ts_unresolved_owner_falls_to_fail(
         ts_project, monkeypatch, quiet_gates):
     """★复核 CRITICAL-2 的管线级验证★ 归属解不出时不得判 BLOCKED。

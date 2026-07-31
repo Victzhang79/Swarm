@@ -169,11 +169,23 @@ MUTATIONS = [
         ["test_symbol_probe_does_not_cross_package_boundary"],
     ),
     (
-        "M-4: 裁决翻转成 FAIL 后仍留 blocked_via_error_driver 粘滞键",
+        # ★hunter 复核 HIGH-3★ 原锁的是 `test_wiring_ts_own_scope_producer_falls_to_fail`，
+        # 但它的 details **空进空出** ⇒ pop 是 no-op ⇒ 突变后仍绿（X-C3-A 的 LOW-10 整改把
+        # 栈键唯一写点移到两处 pop 之后，恰好让这个前提缺失暴露出来）。真正的前提是：
+        # `details` 在 run_l1_pipeline 只初始化一次、被 compile/build/test 三闸**共用**，
+        # 要 pop 的是**前一个闸**留下的陈键。新测试按生产形状预置陈键，故有区分力。
+        "M-4: 裁决翻转成 FAIL 后仍留 blocked_via_error_driver 粘滞键（in-scope 出口）",
         PIPE,
         '        details.pop("blocked_via_error_driver", None)   # M-4：裁决翻转成 FAIL → 不留粘滞键',
         "        pass",
-        ["test_wiring_ts_own_scope_producer_falls_to_fail"],
+        ["test_stale_stack_key_from_earlier_gate_is_cleared"],
+    ),
+    (
+        "M-4b: UNKNOWN 归属出口也不许留粘滞键",
+        PIPE,
+        '        details.pop("blocked_via_error_driver", None)   # M-4：同上，不留粘滞键',
+        "        pass",
+        ["test_stale_stack_key_cleared_on_unresolved_owner_exit"],
     ),
     (
         "H-3: 步骤4 异常退回 fail-open（判 BLOCKED 去等自己）",

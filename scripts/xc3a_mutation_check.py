@@ -79,8 +79,8 @@ MUTATIONS = [
     (
         "消费者3 Go 包当成文件（建出与包同名的 .go，编译仍缺包）",
         FAIL,
-        "                out.append(f\"{pick}/{pick.rsplit('/', 1)[-1]}{exts[0]}\")",
-        "                out.append(f\"{pick}{exts[0]}\")",
+        "        return f\"{stem}/{stem.rsplit('/', 1)[-1]}{exts[0]}\"",
+        "        return f\"{stem}{exts[0]}\"",
         ["test_derive_go_package_is_a_directory",
          "test_derive_missing_files_for_non_jvm"],
     ),
@@ -102,18 +102,17 @@ MUTATIONS = [
     (
         "CRITICAL-1: 类级臂又抢先 return（符号级通道整块绕过路径口径）",
         REC,
-        "        _sym_paths = [s for c in _cls for s in (_pbr.get(c) or [])]\n"
-        "        if _sym_paths:",
-        "        _sym_paths = []\n        if _sym_paths:",
+        "        return not any(_cls_in_tree(c) for c in _cls)",
+        "        return not any(_class_in_baseline(project_path, c) for c in _cls)",
         ["test_symbol_level_arm_uses_path_namespace"],
     ),
     (
         "CRITICAL-1 配套: worker 不给符号 FQN 发路径口径（brain 类级臂恒空）",
         PIPE,
-        "                        if _cs == _ref or _cs.startswith(_ref + _sym_sep):\n"
-        "                            _by_ref.setdefault(_cs, sorted(_stems))",
-        "                        if False:\n"
-        "                            _by_ref.setdefault(_cs, sorted(_stems))",
+        "                    if _best is not None:\n"
+        "                        _by_ref.setdefault(_cs, sorted(_paths[_best]))",
+        "                    if False:\n"
+        "                        _by_ref.setdefault(_cs, sorted(_paths[_best]))",
         # 不含 test_symbol_level_arm_uses_path_namespace：它直接**手传** paths_by_ref，
         # 看不见 worker 侧这处突变（零区分力，严格粒度如实报出）。
         ["test_worker_emits_path_stems_for_symbol_fqns"],
@@ -172,19 +171,67 @@ MUTATIONS = [
     (
         "HIGH-5: 越界词干校验被拆（../ 能写到工程树外）",
         FAIL,
-        '        if not fn or fn.startswith("/") or ".." in fn.split("/"):\n'
+        '        if fn.startswith("/") or ".." in fn.split("/"):\n'
+        "            _bad.append(fn)               # 绝对/越界 → 丢弃（fail-honest，不猜不修正）\n"
         "            continue",
-        "        if not fn:\n            continue",
+        "        if False:\n            continue",
         ["test_derive_rejects_path_traversal_stems"],
     ),
     (
         "HIGH-5: 已存在文件过滤被拆（自愈指着 300 行既有实现说『该新建』）",
         FAIL,
-        "        out = [s for s in out\n"
-        "               if not any(os.path.isfile(os.path.join(project_path, s + e))\n"
-        "                          for e in (\".go\", \".ts\", \".tsx\", \".js\", \".rs\", \".py\", \"\"))]",
-        "        pass",
+        "            stems = [s for s in stems\n"
+        "                     if not (project_path and os.path.isfile(\n"
+        "                         os.path.join(project_path, _landing_path(s, stack, exts))))]",
+        "            stems = list(stems)",
         ["test_derive_skips_already_existing_file"],
+    ),
+    # ── 以下为 hunter 复核整改新增 ──
+    (
+        "HIGH-2: 符号 FQN 又取『首命中』容器（顺序依赖 + 护栏答错容器）",
+        PIPE,
+        "                            if _best is None or len(_ref) > len(_best):\n"
+        "                                _best = _ref",
+        "                            if _best is None:\n"
+        "                                _best = _ref",
+        ["test_symbol_fqn_inherits_longest_matching_container"],
+    ),
+    (
+        "HIGH-1: 指导文案又列全量 ref（承诺没给的可写范围）",
+        FAIL,
+        "    kept = [p for p in (blocked_pkgs or [])\n"
+        "            if any(s in granted or any(g.startswith(s + \"/\") for g in granted)\n"
+        "                   for s in (paths_by_ref.get(p) or []))]",
+        "    kept = list(blocked_pkgs or [])",
+        ["test_selfheal_guidance_lists_only_granted_refs"],
+    ),
+    (
+        "MED-1: 已存在过滤又按 stem+ext 判（对 Go 恒不生效）",
+        FAIL,
+        "    if str(stack or \"\").lower() == \"go\":",
+        "    if False:",
+        ["test_derive_skips_already_existing_file"],
+    ),
+    (
+        "MED-4: 类级臂又剔除无词干的类（方向翻转）",
+        REC,
+        "        return not any(_cls_in_tree(c) for c in _cls)",
+        "        return not any(_cls_in_tree(c) for c in _cls if _pbr.get(c))",
+        ["test_class_arm_falls_back_per_class_not_by_dropping"],
+    ),
+    (
+        "MED-2: ref_path_stems 不再复用 memo（探针放大 + 视图分叉）",
+        DRV,
+        "    run = _memoized(run)\n    out: dict[str, list[str]] = {}",
+        "    out: dict[str, list[str]] = {}",
+        ["test_ref_path_stems_shares_memo_with_solver"],
+    ),
+    (
+        "MED-5: 越界词干又被静默丢弃（攻击信号零取证）",
+        FAIL,
+        '            "[HANDLE_FAILURE] X-C3-A 词干越界被丢弃（绝对路径/`..` 段，源自构建输出＝外部"',
+        '            "",',
+        ["test_sanitize_drops_are_observable"],
     ),
 ]
 

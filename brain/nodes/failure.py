@@ -454,20 +454,57 @@ def _sanitize_stems(path_stems, project_path: str | None = None) -> list[str]:
     实现为"该新建"，而 `missing_created_files` 闸只查"不存在"，存在的一律放行。
     """
     out: list[str] = []
+    _bad: list[str] = []
     for s in (path_stems or []):
         fn = str(s).replace("\\", "/").strip()
-        if not fn or fn.startswith("/") or ".." in fn.split("/"):
-            continue                      # 绝对/越界 → 丢弃（fail-honest，不猜不修正）
-        fn = fn.strip("/")
-        if not fn:
+        if fn.startswith("/") or ".." in fn.split("/"):
+            _bad.append(fn)               # 绝对/越界 → 丢弃（fail-honest，不猜不修正）
             continue
-        out.append(fn)
-    if project_path:
-        # 已存在的落点不再"新建"（防覆写既有实现）。判据同 sibling：文件在即丢。
-        out = [s for s in out
-               if not any(os.path.isfile(os.path.join(project_path, s + e))
-                          for e in (".go", ".ts", ".tsx", ".js", ".rs", ".py", ""))]
+        fn = fn.strip("/")
+        out.append(fn)                    # 空串＝Go 根包的合法词干，保留
+    if _bad:
+        # ★复核 MED-5★ 词干源头是构建输出＝**外部输入**，越界形态（实测
+        # `github.com/acme/shop/../../../tmp/pwn`）是攻击/污染信号。丢弃方向对，但静默丢弃
+        # ＝零取证痕迹：下游只看到"自愈没给这个文件"，分不出是"推不出"还是"被拦了"。
+        logger.warning(
+            "[HANDLE_FAILURE] X-C3-A 词干越界被丢弃（绝对路径/`..` 段，源自构建输出＝外部"
+            "输入，可能是污染或攻击信号，绝不进 create_files）: %s", _bad[:4])
     return out
+
+
+def _granted_refs(blocked_pkgs: list, new_files: list, paths_by_ref: dict
+                  ) -> tuple[list, list]:
+    """X-C3-A hunter 复核 HIGH-1：把 blocked ref 分成"落点真被放行的"与"被丢弃的"。
+
+    ★为什么抽成模块级函数★ 指导文案必须只列**真被放行**的 ref：原文案列全量 `blocked_pkgs`
+    而 create_files 只放行 `new_files` ⇒ 词干被丢弃（定不了档/越界/已存在）时出现"要求建
+    2 个、只放行 1 个"⇒ worker 建不了第二个 → 再失败/SCOPE_OBJECTION → 自愈配额（默认 2）
+    耗尽 → abandon。这是 reviewer HIGH-3（摊平通道）的失败形状经"丢弃"通道复发。
+    抽出来是为了让测试**调生产本体**而不是照抄一遍判据（本仓记过的假绿形态）。
+    """
+    granted = {str(p).rsplit(".", 1)[0] for p in (new_files or [])}
+    kept = [p for p in (blocked_pkgs or [])
+            if any(s in granted or any(g.startswith(s + "/") for g in granted)
+                   for s in (paths_by_ref.get(p) or []))]
+    dropped = [p for p in (blocked_pkgs or []) if p not in kept]
+    return kept, dropped
+
+
+def _landing_path(stem: str, stack: str | None, exts: tuple) -> str:
+    """词干 → **该栈真正的落点**（单一口径，供生成与"已存在"过滤共用）。
+
+    ★复核 MED-1★ 原先"已存在"过滤按 `stem + ext` 判，而 Go 的落点是
+    `<stem>/<basename>.go`（包是目录）——两者不是同一路径 ⇒ 那道防覆写闸**对 Go 恒不生效**
+    （实测 `internal/svc/svc.go` 有 300 行既有实现仍被指为"该新建"）。抽成单一函数，
+    生成与过滤同源，口径不可能再分叉（本批 C-1 的教训）。
+    """
+    if "." in stem.rsplit("/", 1)[-1]:
+        return stem                       # 词干已带扩展名（少见）→ 原样
+    if str(stack or "").lower() == "go":
+        # ★Go 的包是**目录**★ 词干 `internal/svc` 该建 `internal/svc/svc.go`，
+        # 不是 `internal/svc.go`（后者建出与包同名的**文件**，编译仍缺包）。
+        return f"{stem}/{stem.rsplit('/', 1)[-1]}{exts[0]}"
+    return f"{stem}{exts[0]}"
 
 
 def _pick_stem_by_evidence(stems: list[str], scope_files, project_path) -> str | None:
@@ -539,6 +576,14 @@ def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_outp
             # 改为按**证据**定档：① 父目录真实存在的候选优先（要 project_path）；
             # ② 否则看 scope 声明落在哪个前缀；③ 两者都定不了 → fail-honest 丢弃该 ref
             # （纪律 2：解析不出→如实丢弃，绝不逼 worker 臆造）。
+            # MED-1：已存在的**落点**（按该栈真实路径算）不再"新建"——防 worker 从零重写
+            # 覆掉基线/上游内容（sibling 注释：来源=对抗复核#5）。放在定档**之后**、按真实
+            # 落点判，故 Go 的 `<stem>/<base>.go` 也被覆盖（原先按 stem+ext 判，Go 恒漏）。
+            stems = [s for s in stems
+                     if not (project_path and os.path.isfile(
+                         os.path.join(project_path, _landing_path(s, stack, exts))))]
+            if not stems:
+                continue
             pick = _pick_stem_by_evidence(stems, scope_files, project_path)
             if pick is None:
                 logger.warning(
@@ -546,15 +591,7 @@ def _derive_missing_type_files(scope_files: list, blocked_pkgs: list, build_outp
                     "自愈（fail-honest，绝不猜落点在根下种影子包）: ref=%s 候选=%s",
                     _ref, stems[:4])
                 continue
-            if "." in pick.rsplit("/", 1)[-1]:
-                out.append(pick)           # 词干已带扩展名（少见）→ 原样
-                continue
-            if str(stack).lower() == "go":
-                # ★Go 的包是**目录**★ 词干 `internal/svc` 该建的是 `internal/svc/<name>.go`，
-                # 不是 `internal/svc.go`（后者会建出一个和包同名的**文件**，编译仍缺包）。
-                out.append(f"{pick}/{pick.rsplit('/', 1)[-1]}{exts[0]}")
-            else:
-                out.append(f"{pick}{exts[0]}")
+            out.append(_landing_path(pick, stack, exts))   # 与"已存在"过滤同源口径
         return list(dict.fromkeys(out))
     _MARKERS = ("/src/main/java/", "/src/test/java/",
                 "/src/main/kotlin/", "/src/test/kotlin/")
@@ -1419,8 +1456,29 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     if _nf not in _cf:
                         _cf.append(_nf)
                 _sc.create_files = _cf  # ★纳入 create_files：scope 放行新建 + _writable_files 拉回本地★
+                # ★X-C3-A hunter 复核 HIGH-1★ 指导文案里的类型清单必须只列**真被放行**的那些。
+                # 原文案列全量 `_bpkgs`、而 create_files 只放行 `_new_files` ⇒ 词干被丢弃
+                # （定不了档 / 越界 / 已存在）时会出现"要求建 2 个、只放行 1 个"⇒ worker 建不了
+                # 第二个 → 再失败/SCOPE_OBJECTION → 自愈配额（默认 2）耗尽 → abandon。
+                # 这正是 reviewer HIGH-3（摊平通道）的失败形状经"**丢弃**通道"复发。
+                # 无词干可对账（JVM 老推导路径）时退回全量文案，行为不变。
+                _pbr2 = _det2.get("blocked_on_paths_by_ref") or {}
+                if _pbr2:
+                    _kept, _dropped = _granted_refs(_bpkgs, _new_files, _pbr2)
+                    if _dropped:
+                        # 硬检查④：丢弃必须机读可辨——下游只看到"自愈给了几个文件"，
+                        # 分不出"本来就只缺这些"与"有几个被丢了"。
+                        _det2["selfheal_dropped_refs"] = sorted(_dropped)
+                        logger.warning(
+                            "[HANDLE_FAILURE] X-C3-A 自愈只放行 %d/%d 个缺失 ref 的落点"
+                            "（其余定不了档/越界/已存在被丢弃）→ 指导文案只列已放行的那些，"
+                            "不许承诺没给的可写范围: 已放行=%s 丢弃=%s",
+                            len(_kept), len(_bpkgs), _kept[:4], sorted(_dropped)[:4])
+                    _bpkgs_say = _kept or _bpkgs
+                else:
+                    _bpkgs_say = _bpkgs
                 _st.retry_guidance = (
-                    f"你的代码引用了项目内不存在、且无任何子任务负责生产的内部类型 {_bpkgs}"
+                    f"你的代码引用了项目内不存在、且无任何子任务负责生产的内部类型 {_bpkgs_say}"
                     f"（编译报 package does not exist / cannot find symbol）。这是本功能自身需要的类型，"
                     f"已把待建文件 {[p.rsplit('/', 1)[-1] for p in _new_files][:6]} 纳入你的可写范围——"
                     f"请在本模块内【新建】它们（VO/DTO/枚举/请求响应对象等）使编译通过，而非假设已存在。"

@@ -255,6 +255,102 @@ def test_blocked_without_path_namespace_leaves_account(tmp_path):
     assert "blocked_on_paths" not in details
 
 
+def test_symbol_fqn_inherits_longest_matching_container(tmp_path):
+    """★hunter 复核 HIGH-2★ 两个 ref 互为点分前缀时（`app.services` 与 `app.services.user`
+    同批缺失），符号 FQN 必须继承**最长**匹配容器的词干。原实现"首命中即 break"取决于 dict
+    插入序 ⇒ 可能继承 `app/services` ⇒ `_package_in_baseline` 拿**错容器**查 → 它存在 →
+    futile=False「继续等」而真容器其实不在 ⇒ 烧满退避阶梯（最贵那侧），且结果非确定性。"""
+    import swarm.worker.l1_pipeline as lp
+    (tmp_path / "app" / "services").mkdir(parents=True)
+    details: dict = {}
+    lp.decide_unbuilt_internal_verdict(
+        details, FileScope(writable=["app/main.py"]),
+        {"app.services", "app.services.user"}, ["app.services.user.list_users"],
+        cmd="pytest -q", stage="test", output="", language_key="python",
+        project_path=str(tmp_path), timeout=20, run=_probe(),
+        driver_refs=[ed.MissingRef(ref="app.services", symbol=None, src=None),
+                     ed.MissingRef(ref="app.services.user", symbol="list_users",
+                                   src=None)])
+    got = details["blocked_on_paths_by_ref"]["app.services.user.list_users"]
+    assert got == ["app/services/user", "src/app/services/user"], \
+        f"符号 FQN 继承了错的容器词干（该取最长前缀）: {got}"
+
+
+def test_selfheal_guidance_lists_only_granted_refs(tmp_path):
+    """★hunter 复核 HIGH-1★ 词干被丢弃（定不了档/越界/已存在）时，只有部分 ref 的落点进了
+    create_files —— 而指导文案原先列**全量**，等于承诺了没给的可写范围 ⇒ worker 建不了那些
+    → 再失败/SCOPE_OBJECTION → 自愈配额（默认 2）耗尽 → abandon。这是 reviewer HIGH-3
+    的失败形状经"丢弃"通道复发。丢弃必须留机读键（下游只看到"给了几个文件"，分不出成因）。
+    """
+    (tmp_path / "src" / "app" / "services").mkdir(parents=True)   # user 定得了档
+    got = _derive_missing_type_files(
+        [], ["app.services.user", "app.repo.order"], "",
+        path_stems={"app.services.user": ["app/services/user",
+                                          "src/app/services/user"],
+                    "app.repo.order": ["app/repo/order", "src/app/repo/order"]},
+        stack="python", project_path=str(tmp_path))
+    assert got == ["src/app/services/user.py"], "夹具前提变了"
+    # ★调生产本体★（不照抄一遍判据——那样改坏生产也不会红）
+    from swarm.brain.nodes.failure import _granted_refs
+    _pbr = {"app.services.user": ["app/services/user", "src/app/services/user"],
+            "app.repo.order": ["app/repo/order", "src/app/repo/order"]}
+    kept, dropped = _granted_refs(["app.services.user", "app.repo.order"], got, _pbr)
+    assert kept == ["app.services.user"], \
+        "对账没把被丢弃的 ref 剔出文案 ⇒ 会承诺没给的可写范围"
+    assert dropped == ["app.repo.order"], "被丢弃的 ref 必须能被指名（机读账要用它）"
+
+
+def test_class_arm_falls_back_per_class_not_by_dropping(tmp_path):
+    """★hunter 复核 MED-4★ 类级臂原先把**没有词干**的类整条剔除（`for c in _cls if
+    _pbr.get(c)`），而被剔的恰是可能投 False 票（"在树里→继续等"）的那些 ⇒ futile 从 False
+    翻成 True ⇒ 该等的变成判永不可满足 → 连坐放弃（方向翻转）。逐个类各选口径才对。"""
+    (tmp_path / "mod" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (tmp_path / "mod" / "src" / "main" / "java" / "com" / "acme" / "B.java").write_text(
+        "package com.acme;\npublic class B {}\n")
+    ref = "github.com/acme/shop/internal/svc"
+    c_with = f"{ref}.A"                  # 有词干，容器**不在**树里 → 该投 True
+    c_without = "com.acme.B"             # 无词干，走 JVM 类级判据 → **在**树里 → 投 False
+    got = _blocked_pkg_unrecoverable(
+        blocked_pkgs=[ref], producers=set(), unsat=set(), completed_ok=set(),
+        pending=set(), project_path=str(tmp_path), self_id="st-x",
+        blocked_classes=[c_with, c_without],
+        paths_by_ref={c_with: ["internal/svc"]})
+    assert got is False, \
+        "无词干的类被整条剔除 ⇒ 它的 False 票丢了 ⇒ 该等的被判永不可满足→连坐"
+
+
+def test_ref_path_stems_shares_memo_with_solver():
+    """★hunter 复核 MED-2★ 两个理由：① 探针放大（实测 10 个 ref 读 go.mod 10 次，而求解器
+    内部 memo 只读 1 次，且这里是失败路径 + 远程沙箱）；② **视图分叉**——步骤 3/4 吃 memo
+    快照、本函数重新实探时，探针瞬时失败只发生在这一侧 ⇒ 该 ref 静默缺席 ⇒ brain 回落
+    Java 点分 ⇒ 首轮连坐放弃。同一轮内对同一棵树必须给同一答案。"""
+    calls = {"n": 0}
+
+    def counting(cmd, pp, t=60):
+        if "go.mod" in cmd and "awk" in cmd:
+            calls["n"] += 1
+            return 0, "github.com/acme/shop\n", ""
+        return 1, "", ""
+
+    refs = [ed.MissingRef(ref=f"github.com/acme/shop/internal/p{i}", symbol=None,
+                          src=None) for i in range(10)]
+    ed.ref_path_stems("go", refs, "/p", 20, counting)
+    assert calls["n"] == 1, f"10 个 ref 读了 {calls['n']} 次 go.mod（没复用 memo）"
+
+
+def test_sanitize_drops_are_observable(tmp_path, caplog):
+    """★hunter 复核 MED-5★ 越界词干是**外部输入的攻击信号**（实测形态
+    `github.com/acme/shop/../../../tmp/pwn`），丢弃方向对，但原先零日志零键＝零取证痕迹。"""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        assert _derive_missing_type_files(
+            [], ["x"], "", path_stems={"x": ["../../../tmp/pwn"]}, stack="go",
+            project_path=str(tmp_path)) == []
+    assert any("越界" in r.message or "traversal" in r.message.lower()
+               or "sanitize" in r.message.lower() for r in caplog.records), \
+        "越界词干被静默丢弃 ⇒ 攻击信号零取证痕迹"
+
+
 def test_futile_still_true_when_truly_hallucinated(tmp_path):
     """回归臂：ref 真不在树里 + 无生产者 ⇒ 仍判永不可满足（快失败，不烧退避阶梯）。"""
     assert _blocked_pkg_unrecoverable(
@@ -345,11 +441,23 @@ def test_derive_rejects_path_traversal_stems(tmp_path):
 def test_derive_skips_already_existing_file(tmp_path):
     """★复核 HIGH-5 第二道★ 落点**已存在**时不再指为"该新建"——sibling 的注释写明来源
     （对抗复核#5）："补进 create_files 会让 worker 从零重写覆掉基线/上游内容"。
-    而 `missing_created_files` 闸只查"不存在"，存在的一律放行 ⇒ 覆写无人拦。"""
+    而 `missing_created_files` 闸只查"不存在"，存在的一律放行 ⇒ 覆写无人拦。
+
+    ★词干必须用生产真会产出的形状★（hunter 复核 MED-1）：`GoErrorDriver.ref_tree_paths`
+    **恒返包目录**、永不带文件名。原夹具传 `internal/svc/svc`（带文件名）⇒ 测的是生产不产生
+    的取值 ⇒ 那道闸对 Go 其实恒不生效（落点是 `<stem>/<base>.go`，而过滤按 `stem+ext` 判，
+    两者不是同一路径），突变却假锁通过。
+    """
     (tmp_path / "internal" / "svc").mkdir(parents=True)
     (tmp_path / "internal" / "svc" / "svc.go").write_text("// 300 行既有实现\n")
     assert _derive_missing_type_files(
-        [], ["x"], "", path_stems={"x": ["internal/svc/svc"]}, stack="go",
+        [], ["x"], "", path_stems={"x": ["internal/svc"]}, stack="go",
+        project_path=str(tmp_path)) == [], "Go 的落点已存在却仍指为『该新建』⇒ 会覆写既有实现"
+    # 非 Go 栈同场景（落点＝stem+ext）也必须拦住
+    (tmp_path / "src" / "routes").mkdir(parents=True)
+    (tmp_path / "src" / "routes" / "users.ts").write_text("export const x = 1;\n")
+    assert _derive_missing_type_files(
+        [], ["y"], "", path_stems={"y": ["src/routes/users"]}, stack="node",
         project_path=str(tmp_path)) == []
 
 

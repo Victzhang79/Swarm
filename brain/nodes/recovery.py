@@ -485,12 +485,17 @@ def _blocked_pkg_unrecoverable(
         #
         # 治法与包级同构：符号的**容器**若能用路径口径判在树里 → 继续等（保守方向，与
         # `_class_in_baseline` 阳性同义）；容器判不出 → 落回 JVM 类级判据（java 原样）。
-        _sym_paths = [s for c in _cls for s in (_pbr.get(c) or [])]
-        if _sym_paths:
-            return not any(
-                _package_in_baseline(project_path, c, path_stems=_pbr.get(c))
-                for c in _cls if _pbr.get(c))
-        return not any(_class_in_baseline(project_path, c) for c in _cls)
+        # ★复核 MED-4★ 逐个类各自选口径，**绝不因"有些类没词干"就把它们整条剔除**：
+        # 被剔的恰是可能投 False 票（"在树里→继续等"）的那些 ⇒ futile 从 False 翻成 True
+        # ⇒ 该等的变成判永不可满足 → 连坐放弃（方向翻转，最贵那侧）。
+        # 有词干 → 按路径口径判其容器；无词干 → 回落 JVM 类级判据（java 原样）。
+        def _cls_in_tree(c: str) -> bool:
+            _st = _pbr.get(c)
+            if _st:
+                return _package_in_baseline(project_path, c, path_stems=_st)
+            return _class_in_baseline(project_path, c)
+
+        return not any(_cls_in_tree(c) for c in _cls)
     return bool(blocked_pkgs) and not any(
         _package_in_baseline(project_path, p, path_stems=_pbr.get(p))
         for p in blocked_pkgs

@@ -2100,12 +2100,22 @@ def decide_unbuilt_internal_verdict(
                 _sym_sep = getattr(_dfor2(language_key), "symbol_sep", ".") or "."
                 for _c in blocked_cls:
                     _cs = str(_c)
-                    for _ref, _stems in _paths.items():
+                    # ★复核 HIGH-2★ 必须取**最长**匹配容器，不能"首命中即 break"：
+                    # 两个 ref 互为前缀时（`app.services` 与 `app.services.user` 同批缺失）
+                    # 首命中取决于 dict 插入序 ⇒ FQN `app.services.user.list_users` 可能继承
+                    # `app/services` 的词干 ⇒ `_package_in_baseline` 拿**错容器**去查 →
+                    # `app/services` 存在 → 返 True → futile=False「继续等」，而真容器
+                    # `app/services/user` 其实不在 ⇒ 烧满退避阶梯（#10 幽灵生产者，最贵那侧）。
+                    # 且结果依赖插入序＝非确定性。前缀关系下最长匹配唯一，无平局。
+                    _best = None
+                    for _ref in _paths:
                         # 分隔符取自 driver（Rust `::`、ESM `#`）——与产 FQN 时同源，
                         # 别在这里另猜一套（口径分叉是本批 C-1 的病根）。
                         if _cs == _ref or _cs.startswith(_ref + _sym_sep):
-                            _by_ref.setdefault(_cs, sorted(_stems))
-                            break
+                            if _best is None or len(_ref) > len(_best):
+                                _best = _ref
+                    if _best is not None:
+                        _by_ref.setdefault(_cs, sorted(_paths[_best]))
                 details["blocked_on_paths_by_ref"] = _by_ref
         except Exception as _pexc:  # noqa: BLE001 — 路径口径失败绝不改变 BLOCKED 裁决
             details["blocked_on_paths_error"] = f"{type(_pexc).__name__}: {_pexc}"[:200]

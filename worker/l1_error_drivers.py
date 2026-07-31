@@ -850,6 +850,13 @@ def ref_path_stems(
     get_paths = getattr(drv, "ref_tree_paths", None)
     if get_paths is None:
         return {}
+    # ★复核 MED-2★ 与 `blocked_on_unbuilt_internal` 同样 memo。两个理由：
+    # ① 探针放大——实测 10 个 ref 读 go.mod **10 次**（对照：求解器内部 memo 只读 1 次），
+    #    而这里是**失败路径 + 远程沙箱**，每次是一趟 run_command；
+    # ② 更要紧的是**视图分叉**——步骤 3/4 吃的是各自 memo 的快照，本函数若重新实探，
+    #    探针瞬时失败只发生在这一侧时该 ref 会**静默缺席** ⇒ brain 回落 Java 点分 ⇒
+    #    首轮连坐放弃。同一轮内对同一棵树必须得出同一答案。
+    run = _memoized(run)
     out: dict[str, list[str]] = {}
     for r in refs:
         ref = r.ref if isinstance(r, MissingRef) else str(r)
