@@ -15,6 +15,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from swarm.config import secret_store
 from swarm.project.sandbox_spec import EnvSpec, Toolchain
@@ -34,6 +35,30 @@ BASE_IMAGE = "ghcr.io/tencentcloud/cubesandbox-base:latest"
 # 各语言工具链的 apt/安装片段 + warmup 命令模板
 _JDK_DEFAULT = "17"
 _NODE_DEFAULT = "20"
+# ★复核 H-3★ apt 的 gradle 在 Debian 稳定版是 4.x，跑不了 Java 17 ⇒ 必须钉发行版下载。
+# 8.7 支持 Java 8~22（覆盖 _JDK_DEFAULT=17 与常见的 8/11/21）。
+_GRADLE_DEFAULT = "8.7"
+
+# ★复核 H-2★ gradle 是唯一没有依赖镜像的栈，而本仓实测构建机网络受限（go 分支注释：
+# go.dev 被墙）。默认打 repo1.maven.org / plugins.gradle.org 大概率拉不动 → warmup 静默空转
+# → 离线 classes 必失败 → L1 构建闸在离线沙箱假失败。与 maven 的 settings.xml 对称。
+_GRADLE_INIT = """\
+// Swarm 自动生成：gradle 依赖/插件镜像源（与 Maven settings.xml 同口径）。
+// 构建机网络受限时 repo1.maven.org / plugins.gradle.org 常拉不动，故 aliyun 优先、官方兜底。
+def swarmRepos = { org.gradle.api.artifacts.dsl.RepositoryHandler h ->
+    h.maven { url 'https://maven.aliyun.com/repository/public' }
+    h.maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+    h.mavenCentral()
+    h.gradlePluginPortal()
+}
+settingsEvaluated { s ->
+    s.pluginManagement { pm -> swarmRepos(pm.repositories) }
+}
+allprojects { p ->
+    p.buildscript { bs -> swarmRepos(bs.repositories) }
+    swarmRepos(p.repositories)
+}
+"""
 
 # 安全：dep_source 子目录名白名单（S-5）——只允许常规相对路径字符；拒 `..` 逃逸、
 # 拒绝对路径、拒一切 shell 元字符。仓库内容即攻击者可控，故是"允许什么"而非"禁止什么"。
@@ -265,6 +290,70 @@ class SSHRunner:
 # ──────────────────────────────────────────────
 # Dockerfile + warmup 生成（EnvSpec → 文本）
 # ──────────────────────────────────────────────
+class _StackEntry(NamedTuple):
+    """一个 (name, build_tool) 组合的**全部**构建期事实。单一事实源。"""
+    apt_packages: tuple[str, ...]      # 该组合必须在镜像里在场的工具（apt 包名/可执行名）
+    selftest: str | None               # 构建期离线自测命令（None=暂无，不阻断发布）
+
+
+# ★X-C2 复核 H-4 的治法★ 安装片段与自测命令原先是**两张各自手写的分派**：
+# `_toolchain_install` 只看 `tc.name`（一律装 maven），`_selftest_command` 按 build_tool 分派
+# （gradle → `./gradlew --offline classes`）⇒ 两处对同一份 spec 得出不同结论 ⇒ Gradle 工程镜像
+# 里没有 gradle ⇒ 127 → BLOCKED 死循环。**病根是"同一件事有两张表"**，故合成一张：
+# 两个函数都从这里取，物理上不可能再分叉。加新栈/新 build_tool 只能改这一处。
+_STACK_REGISTRY: dict[tuple[str, str], _StackEntry] = {
+    ("java", "maven"): _StackEntry(
+        ("maven",),
+        "cd /workspace && mvn -o -B -q -Dmaven.test.skip=true compile"),
+    ("java", "gradle"): _StackEntry(
+        # ★复核 H-3★ 不用 apt 的 gradle：Debian 稳定版常年是 4.x，跑不了 Java 17
+        # （`Unsupported class file major version` / `Could not determine java version`），
+        # 属"装了但不可用"。照 go 分支的成例钉发行版下载（可复现、版本自主）。
+        ("gradle",),
+        # #37：`classes` 编译主源集全部 JVM 语言（Kotlin/Scala/Groovy/Java），是 compileJava
+        # 的严格超集。wrapper 优先——但 wrapper **必须真能跑**，见 `_SRC_KEEP_JAR_SUFFIXES`。
+        "cd /workspace && ((test -x ./gradlew && ./gradlew --offline --no-daemon classes -q) "
+        "|| (gradle --offline --no-daemon classes -q))"),
+    ("node", "npm"): _StackEntry(
+        ("nodejs",),
+        "cd /workspace && (npm run build --if-present || npm ci --offline || true)"),
+    ("python", "pip"): _StackEntry(
+        ("python3",), "cd /workspace && python3 -m compileall -q ."),
+    ("go", "go"): _StackEntry(
+        ("/usr/local/go",),
+        "(command -v goimports >/dev/null 2>&1 && echo 'goimports: present' "
+        "|| echo 'goimports: MISSING') && cd /workspace && go build ./... 2>&1 | head -40"),
+    ("rust", "cargo"): _StackEntry(
+        ("rustup",),
+        "(cargo fix --help >/dev/null 2>&1 && echo 'cargo fix: present' "
+        "|| echo 'cargo fix: MISSING') && cd /workspace && cargo build --offline 2>&1 | head -40"),
+}
+
+
+def _has_build_tool(spec: EnvSpec, build_tool: str) -> bool:
+    """spec 里是否有该 build_tool 的工具链。**归一口径的唯一实现**（复核 L-1）。
+
+    原先 `has_maven` 用精确 `== "maven"`、新加的 gradle 门用 `(x or "").lower()`——同一个字段
+    两种归一，正是本批在治的"判据不对称"。另：`build_tool` 缺失时 java 会同时装 maven+gradle
+    （fail-safe），故那种 spec 对两个 build_tool 都算"有"，warmup/settings 才不会两头落空（L-2）。
+    """
+    want = build_tool.strip().lower()
+    for t in spec.toolchains:
+        bt = (t.build_tool or "").strip().lower()
+        if bt == want:
+            return True
+        # java 且 build_tool 未定 → 安装片段装了 maven+gradle，两个 warmup 都该配上
+        if not bt and (t.name or "").lower() == "java" and want in ("maven", "gradle"):
+            return True
+    return False
+
+
+def stack_entry(name: str, build_tool: str | None) -> _StackEntry | None:
+    """(name, build_tool) → 该组合的构建期事实。未收录返 None（调用方 fail-honest）。"""
+    return _STACK_REGISTRY.get((str(name or "").lower(),
+                                str(build_tool or "").strip().lower()))
+
+
 def _toolchain_install(tc: Toolchain) -> str:
     """单工具链的 apt/安装 Dockerfile 片段。
 
@@ -277,22 +366,39 @@ def _toolchain_install(tc: Toolchain) -> str:
     """
     if tc.name == "java":
         ver = tc.version or _JDK_DEFAULT
-        # gradle 工程装 gradle，maven 工程装 maven；**混编两个 toolchain 各装各的**
-        # （`infer_env_spec` 对同时有 pom 与 build.gradle 的工程会产两条 java toolchain）。
-        # build_tool 缺失（老 spec / 探测不出）→ 保守两个都装：多装一个包的代价远小于 127 死循环。
         _bt = (tc.build_tool or "").strip().lower()
-        if _bt == "gradle":
-            _pkgs = "gradle"
-        elif _bt == "maven":
-            _pkgs = "maven"
-        else:
-            _pkgs = "maven gradle"
-        return (
+        # build_tool 缺失（探测不出）→ 保守两个都装：多装一个工具的代价远小于 127 死循环。
+        _want_maven = _bt in ("maven", "")
+        _want_gradle = _bt in ("gradle", "")
+        _apt = "maven " if _want_maven else ""
+        out = (
             f"RUN apt-get update && apt-get install -y --no-install-recommends "
-            f"openjdk-{ver}-jdk {_pkgs} ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+            f"openjdk-{ver}-jdk {_apt}curl ca-certificates && rm -rf /var/lib/apt/lists/*\n"
             f"ENV JAVA_HOME=/usr/lib/jvm/java-{ver}-openjdk-amd64\n"
             f'ENV PATH="${{JAVA_HOME}}/bin:${{PATH}}"\n'
         )
+        if _want_gradle:
+            # ★复核 H-3★ **不用 apt 的 gradle**：Debian 稳定版常年 4.x，在 Java 17 下跑不起来
+            # （`Unsupported class file major version` / `Could not determine java version`）＝
+            # "装了但不可用"，127 只是换成版本错，BLOCKED 照旧。照 go 分支的成例钉发行版下载。
+            # ★复核 H-2★ 同时写 init.gradle 镜像源：gradle 是唯一没有依赖镜像的栈，而本仓实测
+            # 构建机网络受限（go.dev 被墙），默认打 repo1.maven.org/plugins.gradle.org 大概率拉不动
+            # → warmup 静默空转 → 离线 classes 必失败 → L1 构建闸在离线沙箱假失败。
+            out += (
+                f"ENV GRADLE_VERSION={_GRADLE_DEFAULT}\n"
+                "ENV GRADLE_USER_HOME=/root/.gradle\n"
+                "RUN curl -fsSL -o /tmp/gradle.zip "
+                "https://mirrors.cloud.tencent.com/gradle/gradle-${GRADLE_VERSION}-bin.zip "
+                "|| curl -fsSL -o /tmp/gradle.zip "
+                "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip\n"
+                "RUN apt-get update && apt-get install -y --no-install-recommends unzip "
+                "&& unzip -q /tmp/gradle.zip -d /opt && rm -f /tmp/gradle.zip "
+                "&& ln -sf /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle "
+                "&& rm -rf /var/lib/apt/lists/*\n"
+                "RUN mkdir -p /root/.gradle\n"
+                f"COPY warmup/init.gradle /root/.gradle/init.gradle\n"
+            )
+        return out
     if tc.name == "node":
         ver = tc.version or _NODE_DEFAULT
         return (
@@ -357,7 +463,7 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
         lines.append(f"# --- toolchain: {tc.name} ({tc.build_tool}) ---")
         lines.append(_toolchain_install(tc).rstrip())
 
-    has_maven = any(t.name == "java" and t.build_tool == "maven" for t in spec.toolchains)
+    has_maven = _has_build_tool(spec, "maven")
     if has_maven:
         # settings.xml 配镜像源（aliyun）。warmup 真正发生在 COPY 源码之后（见下方），
         # 因为只有对【真实项目】跑一次 mvn compile，才能把编译生命周期插件
@@ -397,22 +503,34 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
         # `--offline classes` 必失败（自测软诊断不阻断发布，但沙箱运行时**每次**都要联网拉依赖，
         # 而 L1 构建闸在离线/弱网沙箱里就会假失败）。与 maven 填 .m2、npm 填 node_modules 同理：
         # 联网跑一次真编译，把 ~/.gradle 缓存固化进镜像层。
-        if any(t.name == "java" and (t.build_tool or "").lower() == "gradle"
-               for t in spec.toolchains):
+        if _has_build_tool(spec, "gradle"):
             lines.append("# warmup：真项目联网编译预热 ~/.gradle（含插件+依赖），固化进镜像层")
             # wrapper 优先（工程钉的 gradle 版本才是权威）；无 wrapper 用系统 gradle。
             # `classes` 编译主源集全部 JVM 语言（与 _selftest_command 同口径，见 #37）。
             # --no-daemon：守护进程会在镜像层里留下无用状态且拖慢构建。
+            # ★复核 H-1★ 绝不在判成败的那一臂后面接管道：`cmd 2>&1 | tail -5` 的退出码是
+            # **tail 的**（恒 0）⇒ `|| (系统 gradle)` 兜底臂成为**死代码**。而 wrapper 那一臂
+            # 恰恰是"恒失败"的（C-2：tarball 剥掉 wrapper jar 前 `./gradlew` 必崩），于是
+            # warmup 每次都"看起来成功"、`~/.gradle` 全空、且因 `|| true` 完全静默。
+            # 治法：把输出重定向到文件、用 `tail` 单独打印，判成败只看命令本身的退出码。
+            _log = "/tmp/gradle-warmup.log"
             lines.append(
-                "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes 2>&1 | tail -5) "
-                "|| (gradle --no-daemon classes 2>&1 | tail -5) || true) "
-                "&& find . -type d -name build -prune -exec rm -rf {} + 2>/dev/null || true")
+                f"RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes "
+                f"> {_log} 2>&1) || (gradle --no-daemon classes > {_log} 2>&1) "
+                f"|| echo '⚠️ warmup gradle 联网编译失败（见下方日志尾）') "
+                f"; tail -5 {_log} 2>/dev/null || true")
             # 离线自检（软诊断，与 maven 侧对称：只报告，不阻断发布）
+            # ★复核 H-5★ 收尾必须清 `build/`：`chmod -R 0777 /workspace` 发生在 warmup **之前**，
+            # 留下的 build/ 与 .gradle/ 是 root 所有 + 默认权限，而 worker 可能以非 root 跑 gradle
+            # ⇒ "could not create parent directories / Permission denied 编译失败"（本文件
+            # :375 的注释就是在说这个）。maven 侧两条 RUN 都清了 target/，gradle 侧要对称。
             lines.append(
                 "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --offline --no-daemon classes -q) "
                 "|| (gradle --offline --no-daemon classes -q)) "
                 "&& echo '✅ warmup gradle 离线编译通过' "
-                "|| echo '⚠️ warmup gradle 离线编译仍有缺漏：运行时联网兜底'")
+                "|| echo '⚠️ warmup gradle 离线编译仍有缺漏：运行时联网兜底' "
+                "; find /workspace -type d -name build -prune -exec rm -rf {} + 2>/dev/null "
+                "; rm -rf /workspace/.gradle 2>/dev/null || true")
 
         # ── Node warmup：对每个前端工程跑一次 npm 安装，把 node_modules 烤进镜像层 ──
         # 混合项目（前后端分离）主场：前端子任务的 `npm run build` 与 L1 的 TS/eslint repair
@@ -462,6 +580,35 @@ _SRC_EXCLUDE_EXTS = {
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
     ".mp3", ".mp4", ".wav", ".avi", ".mov",
 }
+
+# ★X-C2 复核 C-2（实测）★ `.jar` 的排除会连**构建工具自己的 wrapper jar** 一起剥掉：
+#     gradle/wrapper/gradle-wrapper.jar   ← ./gradlew 的全部实现就在这个 jar 里
+#     .mvn/wrapper/maven-wrapper.jar      ← ./mvnw 同理（X-C1 同族，此前潜伏）
+# 后果：镜像里 `gradlew` 脚本在、jar 不在 ⇒ `./gradlew` 报
+# `找不到或无法载入主要类别 org.gradle.wrapper.GradleWrapperMain` ⇒ 而 L1 的
+# `_derive_full_build_command` 见到 `gradlew` 就发 `./gradlew -q classes`、**没有 `|| gradle`
+# 兜底** ⇒ 每轮硬失败 → BLOCKED → 重试 → 同样失败。127 换成 ClassNotFound，死循环不变。
+# 这也证伪了"wrapper 优先＝工程钉的版本才是权威"这个前提——在这个镜像里 wrapper 根本跑不了。
+# 故：wrapper 目录下的 jar 必须留。它们是**构建工具本体**，不是构建产物（几十 KB，不影响体积）。
+_SRC_KEEP_JAR_SUFFIXES = (
+    "gradle/wrapper/gradle-wrapper.jar",
+    ".mvn/wrapper/maven-wrapper.jar",
+)
+
+
+def _is_wrapper_jar(rel_path: str) -> bool:
+    """该路径是否是构建工具的 wrapper jar（必须保留，见 `_SRC_KEEP_JAR_SUFFIXES`）。
+
+    ★只剥**前导 `./`**，绝不用 `lstrip("./")`★ 后者会剥掉任意 `.`/`/` 组合，把
+    `.mvn/wrapper/maven-wrapper.jar` 变成 `mvn/wrapper/...` ⇒ 匹配不上 ⇒ mvnw 的 jar 照旧被剥。
+    本仓已被这个惯用法坑过两次（`.mvn/wrapper`、`.yarn/releases` 被当噪声剔没；本会话
+    `l1_error_drivers._norm_rel` 同型）——它是**同一个**惯用法陷阱，不是巧合。
+    """
+    p = str(rel_path or "").replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    return any(p == s or p.endswith("/" + s) for s in _SRC_KEEP_JAR_SUFFIXES)
 # W-3（21 号文）：tarball 单文件尺寸阈值显式常量。>阈值的合法产物（SQL 种子/
 # 生成代码/bundle 源）会被 skip——必须 WARNING 可观测，否则镜像缺文件→沙箱假编译错
 # 无迹可查。
@@ -510,10 +657,12 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                                 _skipped_link += 1
                             continue
                         parts = member.name.split("/")
-                        if any(p in _SRC_EXCLUDE_DIRS for p in parts):
-                            continue
-                        if Path(member.name).suffix.lower() in _SRC_EXCLUDE_EXTS:
-                            continue
+                        if (any(p in _SRC_EXCLUDE_DIRS for p in parts)
+                                and not _is_wrapper_jar(member.name)):
+                            continue   # C-2：`.mvn` 整目录被排除，但 wrapper jar 必须留
+                        if (Path(member.name).suffix.lower() in _SRC_EXCLUDE_EXTS
+                                and not _is_wrapper_jar(member.name)):
+                            continue   # C-2：wrapper jar 是构建工具本体，必须留
                         # ★敏感剔除必须在【这条主路径】上（复核 CRITICAL/HIGH-1）★
                         # 初版只加在下方的工作区扫描【回退】分支，而任何 git 仓库都走这里
                         # 并提前 return——E2E 基线 RuoYi、worker clone 出的客户仓库全是 git
@@ -559,12 +708,14 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                 rel_parts = path.relative_to(project_root).parts
             except ValueError:
                 continue
-            if any(p in _SRC_EXCLUDE_DIRS for p in rel_parts):
-                continue
+            if (any(p in _SRC_EXCLUDE_DIRS for p in rel_parts)
+                    and not _is_wrapper_jar("/".join(rel_parts))):
+                continue   # C-2：`.mvn` 整目录被排除，但 wrapper jar 必须留
             if not path.is_file():
                 continue
-            if path.suffix.lower() in _SRC_EXCLUDE_EXTS:
-                continue
+            if (path.suffix.lower() in _SRC_EXCLUDE_EXTS
+                    and not _is_wrapper_jar("/".join(rel_parts))):
+                continue   # C-2：wrapper jar 是构建工具本体，必须留
             # ★敏感文件绝不进镜像（26 号文 S-4）★：_SRC_EXCLUDE_* 是纯构建产物清单、
             # 无任何安全语义，实测 tarball 曾含 .env / .git-credentials / .npmrc /
             # deploy.pem / id_rsa。而链路是 COPY → chmod -R 0777 → docker push 到
@@ -640,26 +791,17 @@ def _selftest_command(spec: EnvSpec) -> str | None:
     在镜像内的 /workspace（已 COPY 项目源码）执行，证明完整项目能离线编译。
     返回 None 表示该工具链暂无自测（不阻断发布）。
     """
+    # ★复核 H-4★ 自测命令与安装片段**同读 `_STACK_REGISTRY`**。原先两处各手写一张分派表，
+    # 于是"自测发 gradle 命令、安装只装 maven"这种分叉能长期存在（正是 X-C2 本体）。
+    # 现在加新栈/新 build_tool 只能改 registry 一处，物理上不可能只落一半。
     for tc in spec.toolchains:
-        if tc.name == "java" and tc.build_tool == "maven":
-            # -o 离线 -am 连带依赖模块 -q 安静；编译整个 reactor（聚合），不指定模块名（通用）
-            return "cd /workspace && mvn -o -B -q -Dmaven.test.skip=true compile"
-        if tc.name == "java" and tc.build_tool == "gradle":
-            # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Groovy/Java)——compileJava 对
-            # 非 Java JVM 工程编译零源=假过。classes 由任一 JVM 语言插件创建，是严格超集。
-            return "cd /workspace && (./gradlew --offline classes -q || gradle --offline classes -q)"
-        if tc.name == "node":
-            # 有 build 脚本就跑 build，否则只验证 install 后能解析
-            return "cd /workspace && (npm run build --if-present || npm ci --offline || true)"
-        if tc.name == "python":
-            return "cd /workspace && python3 -m compileall -q ."
-        if tc.name == "go":
-            # 软诊断：顺带探 goimports 是否在场（L1 _repair_go 依赖它），不阻断发布
-            return ("(command -v goimports >/dev/null 2>&1 && echo 'goimports: present' "
-                    "|| echo 'goimports: MISSING') && cd /workspace && go build ./... 2>&1 | head -40")
-        if tc.name == "rust":
-            return ("(cargo fix --help >/dev/null 2>&1 && echo 'cargo fix: present' "
-                    "|| echo 'cargo fix: MISSING') && cd /workspace && cargo build --offline 2>&1 | head -40")
+        entry = stack_entry(tc.name, tc.build_tool)
+        if entry is None and (tc.name or "").lower() == "java" and not tc.build_tool:
+            # build_tool 未定的 java（安装片段已保守装 maven+gradle）→ 用 maven 自测兜底：
+            # 有 pom 就真编译；无 pom 时命令自身失败，属软诊断不阻断（复核 L-2）。
+            entry = stack_entry("java", "maven")
+        if entry is not None and entry.selftest:
+            return entry.selftest
     return None
 
 
@@ -797,7 +939,8 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "7"  # v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像
+_BUILDER_VERSION = "8"  # v8: X-C2——java 按 build_tool 装(Gradle 工程原先镜像里没 gradle→127 死循环)+钉 gradle 发行版+init.gradle 镜像源+gradle warmup；wrapper jar 不再被 tarball 剥掉(./gradlew/./mvnw 原必 ClassNotFound)；强制重建所有专属镜像
+#                       v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像
 #                       v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像
 #                              （CubeEgress MITM 出网信任）+ --allow-internet-access。0.3.x 旧模板
 #                              snapshot 与 0.4.0 guest-image 不匹配(image version not eq)起不来，
@@ -919,7 +1062,8 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
     remote_dir = f"/tmp/swarm-build/{spec.project_id[:12]}-{full_hash}"
 
     dockerfile = generate_dockerfile(spec, src_included=True)
-    has_maven = any(t.name == "java" and t.build_tool == "maven" for t in spec.toolchains)
+    has_maven = _has_build_tool(spec, "maven")
+    has_gradle = _has_build_tool(spec, "gradle")
     selftest = _selftest_command(spec)
 
     try:
@@ -930,6 +1074,10 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
             #    不再需要精简 warmup pom（v3：真项目编译才能拉全构建插件，见 generate_dockerfile）。
             if has_maven:
                 r.put_text(_MAVEN_SETTINGS, f"{remote_dir}/warmup/settings.xml")
+            # 2b) Gradle init.gradle（镜像源，与 settings.xml 对称）。★Dockerfile 里有 COPY，
+            #     不传就是构建失败★——两处必须同源判据，故都走 `_has_build_tool`。
+            if has_gradle:
+                r.put_text(_GRADLE_INIT, f"{remote_dir}/warmup/init.gradle")
             # 3) 传源码 tarball 并在沙箱机解包进 build context 的 project_src/
             import base64
             r.run(f"mkdir -p {shlex.quote(remote_dir)}/project_src", timeout=30)

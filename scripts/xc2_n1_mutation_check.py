@@ -21,51 +21,92 @@ IMG = ROOT / "worker" / "image_builder.py"
 SPEC = ROOT / "project" / "sandbox_spec.py"
 
 MUTATIONS = [
-    # ── X-C2：安装片段按 build_tool 分派 ──
+    # ── X-C2：安装/自测同读 registry ──
     (
-        "X-C2: java 分支退回只装 maven（Gradle 工程镜像没 gradle → 127 死循环）",
+        "X-C2: java 分支退回无条件只装 maven（Gradle 工程镜像没 gradle → 127 死循环）",
         IMG,
-        '        _bt = (tc.build_tool or "").strip().lower()',
-        '        _bt = "maven"   # 突变：退回无条件只装 maven（X-C2 的真病灶形态）',
+        '        _want_gradle = _bt in ("gradle", "")',
+        "        _want_gradle = False",
         ["test_gradle_project_image_installs_gradle",
-         "test_selftest_and_install_dispatch_on_the_same_build_tools",
+         "test_selftest_and_install_read_the_same_registry",
          "test_mixed_maven_and_gradle_installs_both"],
     ),
     (
         "X-C2: build_tool 缺失时不再保守两个都装（探测不出即 127）",
         IMG,
-        '            _pkgs = "maven gradle"',
-        '            _pkgs = "maven"',
+        '        _want_maven = _bt in ("maven", "")',
+        '        _want_maven = _bt == "maven"',
+        # 不含 test_undetermined_java_still_gets_warmup_and_settings：`_has_build_tool` 仍把
+        # 未定 build_tool 的 java 当"两个都有"⇒ warmup/settings 照旧注入，它看不见这处突变。
         ["test_java_without_build_tool_installs_both"],
     ),
     (
-        "X-C2: maven 工程被搭上 gradle（JVM 基线镜像变胖/语义漂移）",
+        "X-C2 复核 H-3: 退回用 apt 的 gradle（Debian 4.x 跑不了 Java 17＝装了但不可用）",
         IMG,
-        '        elif _bt == "maven":\n            _pkgs = "maven"',
-        '        elif False:\n            _pkgs = "maven"',
-        ["test_maven_project_image_unchanged"],
+        'f"ENV GRADLE_VERSION={_GRADLE_DEFAULT}\\n"',
+        '                f"# apt gradle (mutated)\\n"',
+        ["test_gradle_project_image_installs_gradle"],
     ),
     (
-        "X-C2 配套: gradle warmup 整块删掉（--offline classes 必失败/运行时每次联网）",
+        "X-C2 复核 H-2: 去掉 gradle 镜像源（构建机网络受限 → warmup 静默空转）",
         IMG,
-        '        if any(t.name == "java" and (t.build_tool or "").lower() == "gradle"\n'
-        "               for t in spec.toolchains):",
-        '        if False:',
+        'f"COPY warmup/init.gradle /root/.gradle/init.gradle\\n"',
+        '                f"# no init.gradle (mutated)\\n"',
+        ["test_gradle_project_image_installs_gradle",
+         "test_gradle_init_script_uploaded_when_gradle_present"],
+    ),
+    (
+        "X-C2 复核 H-4: 自测命令改回手写分派（两张表又分叉）",
+        IMG,
+        "        entry = stack_entry(tc.name, tc.build_tool)",
+        '        entry = stack_entry(tc.name, "maven") if tc.name == "java" else stack_entry(tc.name, tc.build_tool)',
+        ["test_selftest_and_install_read_the_same_registry",
+         "test_new_build_tool_in_registry_is_installed_and_selftested"],
+    ),
+    (
+        "X-C2 复核 C-1: _BUILDER_VERSION 不递增（复用老镜像 → 修复不落地）",
+        IMG,
+        '_BUILDER_VERSION = "8"',
+        '_BUILDER_VERSION = "7"',
+        ["test_builder_version_bumped_so_old_images_are_invalidated"],
+    ),
+    (
+        "X-C2 复核 C-2: wrapper jar 又被 tarball 剥掉（./gradlew 必 ClassNotFound）",
+        IMG,
+        "    return any(p == s or p.endswith(\"/\" + s) for s in _SRC_KEEP_JAR_SUFFIXES)",
+        "    return False",
+        ["test_wrapper_jars_survive_source_tarball"],
+    ),
+    (
+        "X-C2 复核 C-2: _is_wrapper_jar 退回 lstrip('./')（.mvn 被剥成 mvn ⇒ mvnw 仍崩）",
+        IMG,
+        '    p = str(rel_path or "").replace("\\\\", "/")\n    while p.startswith("./"):\n        p = p[2:]\n    p = p.lstrip("/")',
+        '    p = str(rel_path or "").replace("\\", "/").lstrip("./")',
+        ["test_wrapper_jars_survive_source_tarball"],
+    ),
+    (
+        "X-C2 复核 H-1: 判成败的臂后面又接管道（兜底臂成死代码，且静默）",
+        IMG,
+        'f"RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes "\n'
+        '                f"> {_log} 2>&1) || (gradle --no-daemon classes > {_log} 2>&1) "',
+        'f"RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes "\n'
+        '                f"2>&1 | tail -5) || (gradle --no-daemon classes 2>&1 | tail -5) "',
         ["test_gradle_warmup_present_and_wrapper_first"],
     ),
     (
-        "X-C2 配套: gradle warmup 不再 wrapper 优先（工程钉的版本被绕过）",
+        "X-C2 复核 H-5: gradle warmup 不清 build/（root 所有 → 非 root 编译 Permission denied）",
         IMG,
-        '                "RUN cd /workspace && ((test -x ./gradlew && ./gradlew --no-daemon classes 2>&1 | tail -5) "',
-        '                "RUN cd /workspace && ((gradle --no-daemon classes 2>&1 | tail -5) "',
-        ["test_gradle_warmup_present_and_wrapper_first"],
+        '                "; find /workspace -type d -name build -prune -exec rm -rf {} + 2>/dev/null "',
+        '                "; true "',
+        ["test_gradle_warmup_cleans_build_dir"],
     ),
     (
-        "X-C2 配套: gradle warmup 漏了离线自检（与 maven 侧不对称）",
+        "X-C2 复核 L-1: has_maven 退回精确 == 比较（同字段两种归一）",
         IMG,
-        '                "|| (gradle --offline --no-daemon classes -q)) "',
-        '                "|| true) "',
-        ["test_gradle_warmup_present_and_wrapper_first"],
+        '        if not bt and (t.name or "").lower() == "java" and want in ("maven", "gradle"):',
+        "        if False:",
+        ["test_has_build_tool_single_normalization",
+         "test_undetermined_java_still_gets_warmup_and_settings"],
     ),
     # ★一条刻意不做的突变（诚实记账）★
     # "gradle warmup 在无源码时也注入"：非等价。整个 warmup 段在 `generate_dockerfile` 的

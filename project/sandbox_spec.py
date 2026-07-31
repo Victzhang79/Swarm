@@ -77,7 +77,36 @@ class EnvSpec:
 # ──────────────────────────────────────────────
 # 构建文件发现
 # ──────────────────────────────────────────────
-def find_build_files(project_path: str | Path, max_depth: int = 3) -> dict[str, list[str]]:
+_FIND_MAX_DEPTH = 3          # 构建文件发现的深度上限（`find_build_files` 默认值，单一事实源）
+
+
+def _npm_depth_ceiling_hint(root: Path, found_pkgs: list[str]) -> list[str]:
+    """复核 M-1：工程里是否存在**超出深度上限**、因此没被发现的 package.json。
+
+    只在"一个带脚本的清单都没找到"时调用，用来把"真静态资源"与"漏发现"两种成因分开——
+    后者的正确文案是"可能漏发现"，指向深度上限，而不是把人指去查 st-10。
+    """
+    known = set(found_pkgs or [])
+    out: list[str] = []
+    try:
+        for p in root.rglob("package.json"):
+            rel_parts = p.relative_to(root).parts
+            if any(seg in _SKIP_DIRS for seg in rel_parts):
+                continue
+            if len(rel_parts) <= _FIND_MAX_DEPTH:
+                continue
+            rel = "/".join(rel_parts)
+            if rel not in known:
+                out.append(rel)
+                if len(out) >= 5:
+                    break
+    except OSError:
+        return []
+    return out
+
+
+def find_build_files(project_path: str | Path,
+                     max_depth: int = _FIND_MAX_DEPTH) -> dict[str, list[str]]:
     """扫描项目，按类型归集构建文件（相对路径）。限制深度避免扫到依赖目录深处。"""
     root = Path(project_path)
     found: dict[str, list[str]] = {}
@@ -155,8 +184,20 @@ _NPM_BUILD_SCRIPTS = ("build", "test", "start")
 _NPM_SCAN_CAP = 200          # 巨型 monorepo 防爆：只读最浅的 N 个清单（够判"要不要装 node"）
 
 
-def _infer_npm(root: Path, pkgs: list[str]) -> Toolchain | None:
-    """有 package.json 且**任一**清单含 build/test/start script 才装 node；纯静态资源不装。
+def _note(notes: list[str] | None, msg: str) -> None:
+    """把降级/截断原因写进 `EnvSpec.notes`（本模块无 logger，notes 是唯一可观测通道）。"""
+    if notes is not None and msg not in notes:
+        notes.append(msg)
+
+
+def _infer_npm(root: Path, pkgs: list[str], notes: list[str] | None = None
+               ) -> Toolchain | None:
+    """**已发现的**任一 package.json 含 build/test/start script 即装 node；纯静态资源不装。
+
+    ★注意覆盖面边界（复核 M-1）★ "已发现的"＝`find_build_files` 给的集合，而它有**深度上限**
+    （`_FIND_MAX_DEPTH`=3）。`packages/@scope/web/package.json` 这类 4 段路径根本进不来 ⇒ 本函数
+    看不到它的 scripts ⇒ 仍会返 None。调用方据 `_npm_depth_ceiling_hint` 把这种情形与"真静态
+    资源"分开落 note（两者的排查方向完全不同）。放宽深度上限属独立改动（会拖慢全仓扫描）。
 
     ★N-1（27 号文 §7.5 R-1）★ 原实现**只读根** `package.json` 的 scripts。而 npm workspaces
     的根常常只有 `{name, private, workspaces}`、构建脚本全在各子包（turbo/nx 之外的常态形态）
@@ -181,18 +222,22 @@ def _infer_npm(root: Path, pkgs: list[str]) -> Toolchain | None:
         except Exception:  # noqa: BLE001 — 单个清单读不出不代表整体结论
             return None
 
-    ordered = sorted(pkgs, key=lambda p: (p.count("/") + p.count("\\"), len(p)))
+    # ★复核 M-4★ 排序键必须含路径本身：仅按 (深度, 长度) 排时，等长清单的先后由
+    # `Path.rglob` 顺序（＝OS scandir 顺序）决定 ⇒ 同一个仓库在不同机器上得出不同的
+    # `dep_source` ⇒ 它进 `deps_hash()` → `compute_project_fingerprint` ⇒ 无谓的镜像重建，
+    # 且双前端仓库每次在不同前端跑 `npm ci`。加 `p` 作末位键即确定。
+    ordered = sorted(pkgs, key=lambda p: (p.count("/") + p.count("\\"), len(p), p))
     root_pkg = ordered[0]
     scanned = ordered[:_NPM_SCAN_CAP]
 
     node_version: str | None = None
     with_scripts: list[str] = []
-    unreadable = False
+    unreadable_paths: list[str] = []
     root_declares_workspaces = False
     for rel in scanned:
         data = _read(rel)
         if data is None:
-            unreadable = True
+            unreadable_paths.append(rel)
             continue
         scripts = data.get("scripts") or {}
         if isinstance(scripts, dict) and any(scripts.get(k) for k in _NPM_BUILD_SCRIPTS):
@@ -205,11 +250,24 @@ def _infer_npm(root: Path, pkgs: list[str]) -> Toolchain | None:
                 m = re.search(r"(\d+)", str(engines["node"]))
                 node_version = m.group(1) if m else None
 
+    if len(ordered) > _NPM_SCAN_CAP:
+        # ★复核 M-2★ 截断必须可观测：被截掉的清单里若恰好只有它有 scripts，结论就从
+        # "装 node"翻成"不装 node"——而"不装 node"正是本批要治的 127 死循环。
+        _note(notes, f"package.json 数量 {len(ordered)} 超过扫描上限 {_NPM_SCAN_CAP}，"
+                     f"仅据最浅的 {_NPM_SCAN_CAP} 个判定 node 工具链（可能漏判）")
     if not with_scripts:
-        if unreadable:
-            # 解析失败保守装 node（维持原行为）——但只在**没有任何**可读清单给出结论时。
+        if unreadable_paths:
+            # ★复核 M-3★ 解析失败保守装 node（维持原行为）——但必须留痕：否则"因为某个清单
+            # 读不出才装的 node"与"真 node 工程"不可分。且语义比原来宽（原先只有**根**读不出
+            # 才装，现在任一读不出都装）⇒ Maven 单体里一个损坏的 vendored package.json 就会
+            # 把 st-10 的病招回来，故这条账必须能被人看见。
+            _note(notes, f"package.json 解析失败 {len(unreadable_paths)} 个"
+                         f"（{unreadable_paths[:2]}）→ 保守装 node（可能是多余的）")
             return Toolchain(name="node", version=node_version, build_tool="npm",
                              dep_source=root_pkg)
+        if unreadable_paths:
+            _note(notes, f"package.json 解析失败 {len(unreadable_paths)} 个"
+                         f"（{unreadable_paths[:2]}）")
         return None  # 纯静态资源，无需 node 工具链（st-10 治法，刻意保留）
 
     if root_declares_workspaces or root_pkg in with_scripts:
@@ -245,11 +303,23 @@ def infer_env_spec(project_path: str | Path, project_id: str = "") -> EnvSpec:
     if "gradle" in bf:
         spec.toolchains.append(_infer_simple("java", "gradle", root, bf["gradle"]))
     if "npm" in bf:
-        tc = _infer_npm(root, bf["npm"])
+        tc = _infer_npm(root, bf["npm"], notes=spec.notes)
         if tc:
             spec.toolchains.append(tc)
         else:
-            spec.notes.append("package.json 无 build/test/start 脚本 → 视为静态资源，不装 node")
+            # ★复核 M-1★ 原文案只说"视为静态资源"，把未来的排查者指向 st-10，而真凶可能是
+            # `find_build_files` 的**深度上限**（默认 3）——`packages/@scope/web/package.json`
+            # 这类 4 段路径根本没被发现过。两种成因必须在文案里可分。
+            _deep = _npm_depth_ceiling_hint(root, bf["npm"])
+            if _deep:
+                spec.notes.append(
+                    f"未发现任何带 build/test/start 的 package.json，但工程内存在更深层的 "
+                    f"package.json（{_deep[:2]}，超出 find_build_files 深度上限 "
+                    f"{_FIND_MAX_DEPTH}）→ 可能是**漏发现**而非静态资源；不装 node 会让 npm "
+                    f"命令 127")
+            else:
+                spec.notes.append(
+                    "package.json 无 build/test/start 脚本 → 视为静态资源，不装 node")
     if "python" in bf:
         spec.toolchains.append(_infer_simple("python", "pip", root, bf["python"]))
     if "go" in bf:

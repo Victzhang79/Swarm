@@ -15,7 +15,8 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 from swarm.project.sandbox_spec import EnvSpec, Toolchain, infer_env_spec
-from swarm.worker.image_builder import generate_dockerfile, generate_maven_warmup_pom
+from swarm.worker.image_builder import (_GRADLE_DEFAULT, generate_dockerfile,
+                                        generate_maven_warmup_pom)
 
 
 def test_dockerfile_java_jdk_version():
@@ -169,9 +170,18 @@ def test_gradle_project_image_installs_gradle():
             Toolchain(name="java", version="17", build_tool="gradle",
                       dep_source="build.gradle")]),
         src_included=True)
-    assert "gradle" in df, "Gradle 工程的镜像里没装 gradle ⇒ 任何 gradle 命令 127"
-    # 装的是 apt 包而不只是出现在自测命令里
-    assert "openjdk-17-jdk gradle" in df
+    # ★复核 H-3★ 不用 apt 的 gradle（Debian 稳定版是 4.x，跑不了 Java 17＝装了但不可用），
+    # 照 go 分支成例钉发行版下载 + 软链进 PATH。
+    assert "gradle-${GRADLE_VERSION}-bin.zip" in df, "没钉 gradle 发行版下载"
+    # ★变量必须真被定义★ 只断 URL 里的 `${GRADLE_VERSION}` 字面量是零区分力的：删掉
+    # `ENV GRADLE_VERSION=` 那行，URL 文本照旧在，而构建期展开成
+    # `gradle--bin.zip` → 404 → 没装上 gradle → 127 死循环（突变实测该断言不红）。
+    assert f"ENV GRADLE_VERSION={_GRADLE_DEFAULT}" in df, \
+        "GRADLE_VERSION 未定义 ⇒ 下载 URL 展开成 gradle--bin.zip ⇒ 404 ⇒ 没装上"
+    assert "ln -sf /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle" in df, \
+        "gradle 没进 PATH ⇒ 命令仍 127"
+    # ★复核 H-2★ gradle 是唯一没有依赖镜像的栈，而构建机网络受限（go.dev 实测被墙）
+    assert "COPY warmup/init.gradle /root/.gradle/init.gradle" in df, "缺 gradle 镜像源"
 
 
 def test_maven_project_image_unchanged():
@@ -181,8 +191,8 @@ def test_maven_project_image_unchanged():
             Toolchain(name="java", version="17", build_tool="maven",
                       dep_source="pom.xml")]),
         src_included=True)
-    assert "openjdk-17-jdk maven ca-certificates" in df
-    assert "openjdk-17-jdk maven gradle" not in df
+    assert "openjdk-17-jdk maven curl ca-certificates" in df
+    assert "gradle" not in df, "maven 工程不该被搭上 gradle（JVM 基线零回归）"
 
 
 def test_java_without_build_tool_installs_both():
@@ -191,7 +201,9 @@ def test_java_without_build_tool_installs_both():
     df = generate_dockerfile(
         EnvSpec(project_id="j0", toolchains=[Toolchain(name="java", version="17")]),
         src_included=True)
-    assert "maven gradle" in df
+    # maven 走 apt、gradle 走钉版下载 ⇒ 两者都在场
+    assert "openjdk-17-jdk maven curl" in df
+    assert "gradle-${GRADLE_VERSION}-bin.zip" in df
 
 
 def test_mixed_maven_and_gradle_installs_both():
@@ -203,8 +215,8 @@ def test_mixed_maven_and_gradle_installs_both():
             Toolchain(name="java", version="17", build_tool="gradle",
                       dep_source="build.gradle")]),
         src_included=True)
-    assert "openjdk-17-jdk maven ca-certificates" in df
-    assert "openjdk-17-jdk gradle ca-certificates" in df
+    assert "openjdk-17-jdk maven curl ca-certificates" in df
+    assert "gradle-${GRADLE_VERSION}-bin.zip" in df
 
 
 def test_gradle_warmup_present_and_wrapper_first():
@@ -225,8 +237,13 @@ def test_gradle_warmup_present_and_wrapper_first():
         "离线自检缺 wrapper 臂"
     assert "|| (gradle --offline --no-daemon classes -q)" in df, \
         "离线自检缺系统 gradle 兜底臂（无 wrapper 的 gradle 工程就没自检了）"
-    assert "|| (gradle --no-daemon classes 2>&1 | tail -5)" in df, \
+    # ★复核 H-1★ 判成败那一臂后面绝不能接管道——`cmd | tail` 的退出码是 tail 的（恒 0）⇒
+    # `|| 系统 gradle` 兜底臂成死代码，而 wrapper 臂恰是"恒失败"的（C-2）⇒ warmup 每次
+    # 看起来成功、~/.gradle 全空、且 `|| true` 让它完全静默。
+    assert "|| (gradle --no-daemon classes > /tmp/gradle-warmup.log 2>&1)" in df, \
         "预热缺系统 gradle 兜底臂"
+    assert "classes 2>&1 | tail" not in df, \
+        "判成败的臂后面接了管道 ⇒ 退出码被 tail 吞掉 ⇒ 兜底臂是死代码"
     assert "--daemon" not in df.replace("--no-daemon", ""), "不该起 daemon（会在镜像层留状态）"
 
 
@@ -249,34 +266,54 @@ def test_maven_project_gets_no_gradle_warmup():
     assert "gradlew" not in df
 
 
-def test_selftest_and_install_dispatch_on_the_same_build_tools():
-    """★X-C2 的根因是**判据不对称**，故直接锁"对称"这件事★
+def test_selftest_and_install_read_the_same_registry():
+    """★X-C2 的根因是**同一件事有两张表**，故锁"只有一张表"★
 
-    病根不是"少装了 gradle"，而是 `_selftest_command` 按 `build_tool` 分派、
-    `_toolchain_install` 不分派 —— 两处对同一份 spec 得出不同结论，必然分叉。
-    本条枚举 `_selftest_command` 会分派的每个 (name, build_tool)，断言安装片段里真有那个工具。
-    将来任何人给自测加一个新 build_tool 分支而忘了给安装片段加，本条即红。
+    病根不是"少装了 gradle"：`_selftest_command` 按 build_tool 分派、`_toolchain_install`
+    不分派，两处对同一份 spec 得出不同结论 ⇒ 自测发 gradle 命令而镜像只装 maven ⇒ 127。
+
+    ★复核 H-4 的整改★ 本条原先枚举一张**手写** `expect_tool` 表——实测给
+    `_selftest_command` 加一个 `("java","sbt")` 分支而不动安装片段，测试**照旧全绿**：
+    它只锁反向、不锁正向，而那张手写表本身就是第二套真相源（正是它要防的那个形态）。
+    现在两个函数同读 `_STACK_REGISTRY`，本条改为**从 registry 派生**遍历。
     """
-    from swarm.worker.image_builder import _selftest_command, _toolchain_install
+    from swarm.worker.image_builder import (_STACK_REGISTRY, _selftest_command,
+                                            _toolchain_install)
 
-    # (name, build_tool) → 安装片段里必须出现的工具名
-    expect_tool = {
-        ("java", "maven"): "maven",
-        ("java", "gradle"): "gradle",
-        ("node", "npm"): "nodejs",
-        ("python", "pip"): "python3",
-        ("go", "go"): "/usr/local/go",
-        ("rust", "cargo"): "rustup",
-    }
-    for (name, bt), tool in expect_tool.items():
+    assert _STACK_REGISTRY, "registry 空了？"
+    for (name, bt), entry in _STACK_REGISTRY.items():
         tc = Toolchain(name=name, version="17" if name == "java" else None,
                        build_tool=bt, dep_source="x")
         st = _selftest_command(EnvSpec(project_id="s", toolchains=[tc]))
-        assert st, f"({name},{bt}) 无自测命令——本表该更新了"
+        assert st == entry.selftest, (
+            f"({name},{bt}) 的自测命令不是从 registry 取的 ⇒ 又出现第二套表")
         install = _toolchain_install(tc)
-        assert tool in install, (
-            f"({name},{bt}) 的自测命令是 {st[:60]!r}，但安装片段里没有 {tool!r} ⇒ "
-            f"命令必 127 → BLOCKED 死循环（X-C2 同型）")
+        for tool in entry.apt_packages:
+            assert tool in install, (
+                f"({name},{bt}) registry 声明必须在场 {tool!r}，但安装片段里没有 ⇒ "
+                f"命令必 127 → BLOCKED 死循环（X-C2 同型）")
+
+
+def test_new_build_tool_in_registry_is_installed_and_selftested():
+    """★正向区分力（H-4 的真判据）★ 往 registry 加一个新 (name, build_tool)，两个函数都必须
+    立刻认它——这才证明"改一处两处都动"。原实现下这条不可能通过（两张表各写各的）。"""
+    from swarm.worker import image_builder as ib
+
+    tc = Toolchain(name="java", version="17", build_tool="sbt", dep_source="build.sbt")
+    # 加之前：registry 没有它 ⇒ 无自测（fail-honest，不臆造命令）
+    assert _sel(ib, tc) is None
+    ib._STACK_REGISTRY[("java", "sbt")] = ib._StackEntry(
+        ("sbt",), "cd /workspace && sbt -batch compile")
+    try:
+        assert _sel(ib, tc) == "cd /workspace && sbt -batch compile", \
+            "registry 里加了自测命令，_selftest_command 却没认 ⇒ 两张表又分叉了"
+    finally:
+        ib._STACK_REGISTRY.pop(("java", "sbt"), None)
+
+
+def _sel(ib, tc):
+    from swarm.project.sandbox_spec import EnvSpec as _E
+    return ib._selftest_command(_E(project_id="s", toolchains=[tc]))
 
 
 def test_unknown_toolchain_is_observable():
@@ -286,3 +323,108 @@ def test_unknown_toolchain_is_observable():
 
     out = _toolchain_install(Toolchain(name="elixir", build_tool="mix"))
     assert "elixir" in out and "未知工具链" in out
+
+
+def test_builder_version_bumped_so_old_images_are_invalidated():
+    """★复核 C-1★ `_BUILDER_VERSION` 是"构建逻辑变了"的**唯一**信号：
+    `compute_project_fingerprint = f"v{_BUILDER_VERSION}-{deps_hash}-{dep_hash}"`。
+    gradle 工程的 `deps_hash`（来自 sandbox_spec）与 `build.gradle` 内容都没变 ⇒ 不递增它，
+    `_phase_build_sandbox` 就走"依赖+源码未变且模板存在 → 复用专属模板"⇒ **老的没装 gradle 的
+    镜像继续被复用**，X-C2 的修复一行都到不了生产。
+
+    本条钉住"改了 Dockerfile 生成逻辑就必须递增"这条契约（≥8 即本批已递增）。
+    """
+    from swarm.worker.image_builder import _BUILDER_VERSION
+
+    assert int(_BUILDER_VERSION) >= 8, (
+        "改了 Dockerfile 生成/warmup 却没递增 _BUILDER_VERSION ⇒ 旧模板指纹不失效 ⇒ "
+        "复用老镜像 ⇒ 修复不落地（复核 C-1）")
+
+
+def test_wrapper_jars_survive_source_tarball(tmp_path):
+    """★复核 C-2★ `.jar` 的排除会连**构建工具自己的 wrapper jar** 一起剥掉：
+    `gradle/wrapper/gradle-wrapper.jar` 是 `./gradlew` 的全部实现。剥掉后镜像里
+    脚本在、jar 不在 ⇒ `./gradlew` 报 `找不到或无法载入主要类别
+    org.gradle.wrapper.GradleWrapperMain` ⇒ 而 L1 的 `_derive_full_build_command` 见到
+    `gradlew` 就发 `./gradlew -q classes`、**没有 `|| gradle` 兜底** ⇒ 每轮硬失败 → BLOCKED
+    → 重试 → 同样失败。127 换成 ClassNotFound，死循环不变。
+    `.mvn/wrapper/maven-wrapper.jar` 同型（X-C1 同族，此前潜伏）。
+    """
+    import tarfile
+
+    from swarm.worker.image_builder import _make_source_tarball
+
+    (tmp_path / "gradle" / "wrapper").mkdir(parents=True)
+    (tmp_path / ".mvn" / "wrapper").mkdir(parents=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "gradle" / "wrapper" / "gradle-wrapper.jar").write_bytes(b"PK\x03\x04g")
+    (tmp_path / ".mvn" / "wrapper" / "maven-wrapper.jar").write_bytes(b"PK\x03\x04m")
+    (tmp_path / "libs").mkdir()
+    (tmp_path / "libs" / "vendored.jar").write_bytes(b"PK\x03\x04v")   # 真构建产物，仍该剥
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+    (tmp_path / "src" / "A.java").write_text("class A {}\n")
+
+    # ★归一只剥前导 `./`★ 用 `lstrip("./")` 会把 `.mvn/...` 剥成 `mvn/...`，于是断言看起来
+    # 失败而其实 tarball 是对的（本会话第三次撞上同一个惯用法陷阱：生产两处 + 这条测试）。
+    def _norm(n: str) -> str:
+        while n.startswith("./"):
+            n = n[2:]
+        return n.lstrip("/")
+
+    with tarfile.open(fileobj=__import__("io").BytesIO(_make_source_tarball(tmp_path))) as t:
+        names = {_norm(n) for n in t.getnames()}
+    assert "gradle/wrapper/gradle-wrapper.jar" in names, "gradlew 的 jar 被剥了 ⇒ ./gradlew 必崩"
+    assert ".mvn/wrapper/maven-wrapper.jar" in names, "mvnw 的 jar 被剥了 ⇒ ./mvnw 必崩"
+    assert "libs/vendored.jar" not in names, "普通 jar 仍该按构建产物剥掉（别把排除整类放宽）"
+
+
+def test_gradle_warmup_cleans_build_dir():
+    """★复核 H-5★ `chmod -R 0777 /workspace` 在 warmup **之前**跑，warmup 留下的 `build/`
+    与 `.gradle/` 是 root 所有 + 默认权限；而 worker 可能以非 root 跑 gradle ⇒
+    "could not create parent directories / Permission denied 编译失败"（本文件自己的注释
+    就是在说这个）。maven 侧两条 RUN 都清了 `target/`，gradle 侧必须对称。"""
+    df = generate_dockerfile(
+        EnvSpec(project_id="g4", toolchains=[
+            Toolchain(name="java", build_tool="gradle", dep_source="build.gradle")]),
+        src_included=True)
+    assert "-name build -prune -exec rm -rf {} +" in df, "gradle warmup 没清 build/"
+    assert "rm -rf /workspace/.gradle" in df, "gradle warmup 没清 .gradle/（root 所有）"
+
+
+def test_gradle_init_script_uploaded_when_gradle_present():
+    """Dockerfile 里有 `COPY warmup/init.gradle`，**不传这个文件就是构建失败**。
+    故上传判据与生成判据必须同源（都走 `_has_build_tool`）。"""
+    from swarm.worker.image_builder import _GRADLE_INIT, _has_build_tool
+
+    spec = EnvSpec(project_id="g5", toolchains=[
+        Toolchain(name="java", build_tool="gradle", dep_source="build.gradle")])
+    df = generate_dockerfile(spec, src_included=True)
+    assert "COPY warmup/init.gradle" in df
+    assert _has_build_tool(spec, "gradle") is True, "上传闸判不出 gradle ⇒ COPY 缺文件 ⇒ 构建失败"
+    assert "aliyun" in _GRADLE_INIT and "pluginManagement" in _GRADLE_INIT
+
+
+def test_has_build_tool_single_normalization():
+    """★复核 L-1★ 同一字段两种归一（`== "maven"` vs `(x or "").lower()`）正是本批在治的
+    "判据不对称"。统一走 `_has_build_tool`，且 build_tool 未定的 java 对两者都算"有"——
+    因为安装片段给它装了 maven+gradle，warmup/settings 不能两头落空（L-2）。"""
+    from swarm.worker.image_builder import _has_build_tool
+
+    undetermined = EnvSpec(project_id="u", toolchains=[Toolchain(name="java", version="17")])
+    assert _has_build_tool(undetermined, "maven") is True
+    assert _has_build_tool(undetermined, "gradle") is True
+    assert _has_build_tool(undetermined, "npm") is False
+    assert _has_build_tool(
+        EnvSpec(project_id="n", toolchains=[Toolchain(name="node", build_tool="NPM")]),
+        "npm") is True, "大小写归一失效"
+
+
+def test_undetermined_java_still_gets_warmup_and_settings():
+    """★复核 L-2★ build_tool 未定的 java：装了两个工具却"两个缓存都没填、也没自测"＝
+    半接线。至少 maven 侧的 settings/warmup 与自测要在（有 pom 就真编译，无 pom 软失败）。"""
+    spec = EnvSpec(project_id="u2", toolchains=[Toolchain(name="java", version="17")])
+    df = generate_dockerfile(spec, src_included=True)
+    assert "COPY warmup/settings.xml" in df, "未定 build_tool 的 java 连 settings 都没有"
+    assert "mvn -B -T 1C" in df, "未定 build_tool 的 java 没有任何 warmup"
+    from swarm.worker.image_builder import _selftest_command
+    assert _selftest_command(spec), "未定 build_tool 的 java 连自测都没有（零构建期验证）"
