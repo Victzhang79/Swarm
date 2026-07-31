@@ -170,3 +170,38 @@ def test_alias_keys_and_pattern_families_do_not_drift_apart():
         alias_keys - set(_STARTUP_CRASH_PATTERNS))
     assert not (alias_keys - set(_ENV_MISSING_PATTERNS)), sorted(
         alias_keys - set(_ENV_MISSING_PATTERNS))
+
+
+# ══════════════════════════════════════════════
+# 自查整改：CS0246/CS0234 被 `error CS\d{4}` 吞掉 → 环境被冤枉成代码
+# ══════════════════════════════════════════════
+
+@pytest.mark.parametrize("log", [
+    "/src/Api/UserController.cs(4,7): error CS0246: The type or namespace name "
+    "'Newtonsoft' could not be found (are you missing a using directive or an "
+    "assembly reference?)",
+    "/src/Api/UserController.cs(4,7): error CS0234: The type or namespace name "
+    "'Json' does not exist in the namespace 'Newtonsoft'",
+])
+def test_nuget_unrestored_compile_errors_are_not_code_error(log):
+    """CS0246/CS0234 ＝ NuGet 未 restore 的**编译期**形态 → 绝不判 code_error。
+
+    本表已按"环境不许伪装代码失败"把 `Could not load file or assembly`（运行期同义形态）
+    排除，而原 `\\berror CS\\d{4}\\b` 把编译期形态又收回来了＝自相矛盾。
+    突变判据：把否定预查 `(?!0246\\b|0234\\b)` 去掉，本条必红。
+    """
+    res = classify_smoke_outcome("1", log, [], language_key="csharp")
+    assert res.status != "failed", (
+        f"NuGet 未还原被冤判 {res.status}/{res.classification}（环境伪装成代码）")
+
+
+def test_genuine_cs_compile_error_still_fails():
+    """★对照臂★ 真代码错（CS0103 未定义名）照旧 `failed:code_error`。
+
+    没有这条，"把整条 CS 规则删掉"也能满足上面那条（零区分力——Q7/Q8 同一个坑）。
+    """
+    res = classify_smoke_outcome(
+        "1", "/src/Api/UserController.cs(23,17): error CS0103: The name '_repo' "
+        "does not exist in the current context", [], language_key="csharp")
+    assert res.status == "failed", f"{res.status}/{res.classification}"
+    assert res.classification == "code_error"

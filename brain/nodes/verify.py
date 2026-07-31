@@ -876,6 +876,10 @@ async def verify_runtime(state: BrainState) -> dict:
             project_symbols=project_symbols,
             probe_port=derivation.port,
             accept_budget_sec=accept_budget or None,
+            # ★V-H3★ 探的到底是"证据推出的健康端点"还是"回退的 `/`"——单一事实源就是
+            # `derivation.health_path`（`derive_health_path` 无 manifest marker 证据即返 None，
+            # 上面 build_smoke_script 也正是靠 `or "/"` 回退）。只影响 3xx/4xx 的归因文案。
+            health_path_derived=bool(derivation.health_path),
         )
         # d2. S1-5：migration phase——必须在 finally 杀箱【之前】（直接执行通道复用同一
         #     沙箱）。_run_migration_phase 承诺不抛，绝不把冒烟结论污染成 node_exception。

@@ -193,7 +193,14 @@ _CODE_ERROR_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bZeroDivisionError\b",
     ),
     "csharp": (
-        r"\berror CS\d{4}\b",          # Roslyn 编译错（CS0246 类型找不到亦属之）
+        # Roslyn 编译错。★排除 CS0246/CS0234★：这两个是"类型/命名空间找不到"，而
+        # **NuGet 未 restore 时正是这个形态**——沙箱不保证还原第三方包，判 code_error 就是
+        # 把环境冤枉成代码（本表上方注释已把 `Could not load file or assembly` 按同一理由
+        # 排除，原 `\d{4}` 却把它的编译期同义形态又收了回来＝自相矛盾）。
+        # 它们**不进** _ENV_MISSING：CS0246 也可能是 worker 漏建项目内类型（C-2 那族真缺陷），
+        # 一律判环境会造出假过。故留空不归类 → 落 inconclusive skipped（fail-honest）；
+        # 真正的分档要靠 _IMPORT_MISSING_PATTERNS + project_symbols，见登记册 O-5。
+        r"\berror CS(?!0246\b|0234\b)\d{4}\b",
         r"System\.NullReferenceException",
         r"System\.IndexOutOfRangeException",
         r"System\.InvalidCastException",
@@ -1056,6 +1063,7 @@ def classify_smoke_outcome(
     language_key: str | None = None,
     project_symbols: dict[str, Any] | None = None,
     probe_port: int | None = None,
+    health_path_derived: bool = False,
 ) -> RuntimeSmokeResult:
     """三分类器（纯函数）：只吃 (进程侧, 日志文本, 探活序列) 通用三元组
     + 可选证据面（project_symbols=项目内符号索引，probe_port=探测端口留痕）。
@@ -1110,6 +1118,33 @@ def classify_smoke_outcome(
                 return RuntimeSmokeResult(
                     "passed", "started_tcp_only",
                     "运行时冒烟通过（**仅端口探测**：环境无 curl，未校验 HTTP 状态码）",
+                    log_tail=log_text, details=details)
+            # ★V-H3（27 号文 §3.3 HIGH）★ 3xx/4xx **不是**"健康端点应答"的证据。
+            # 旧判据只拦 5xx，于是 404/302 与真 200 写成同一个 `passed:started`：
+            # `_HEALTH_ENDPOINT_MARKERS` 只认 4 条（全 JVM/Nest）→ Django/Flask/FastAPI/
+            # Gin/Express/Rails/Laravel/.NET 一律回退探 `/`，而裸 API 对 `/` 返 404 是常态
+            # → 第三道确定性闸对这些栈实际只证明了"端口通"（与 started_tcp_only 同强度），
+            # 却报了满格通过。
+            # 方向刻意仍是 **passed + degraded**（不是 failed）：对 `/` 返 404 完全合法，
+            # 判失败即误杀（本仓最忌）。降级账走**既有**消费者——verify.py 对
+            # `classification != "started"` 自动产 `runtime_smoke_degraded_pass:<cls>`，
+            # 它不在 L6 信息性白名单里 → 阻断"降级通过"被学成成功模式。不新造账。
+            # provenance 只影响**归因文案**：探的是证据推出的健康端点、还是回退的 `/`，
+            # 判读的人要能一眼分清（前者 404 疑路由没注册，后者多半只是没有根路由）。
+            if _http_code[:1] in ("3", "4"):
+                details["degraded"] = True
+                details["probe_health_verified"] = False
+                details["probe_target_derived"] = bool(health_path_derived)
+                _where = ("证据推导出的健康端点" if health_path_derived
+                          else "回退路径 `/`（未推出健康端点）")
+                logger.warning(
+                    "[RUNTIME_SMOKE] V-H3 探活应答 HTTP %s（3xx/4xx）于%s——应用在监听但"
+                    "**未验到它真能服务**，判 passed 但标 degraded（对 `/` 返 404 合法，"
+                    "判失败即误杀）", _http_code, _where)
+                return RuntimeSmokeResult(
+                    "passed", "started_health_unverified",
+                    f"运行时冒烟通过（**未验到应用健康**：{_where}返回 HTTP {_http_code}，"
+                    "非 2xx——只证明了端口在监听）",
                     log_tail=log_text, details=details)
             return RuntimeSmokeResult(
                 "passed", "started",
@@ -1226,6 +1261,7 @@ async def run_runtime_smoke(
     project_symbols: dict[str, Any] | None = None,
     probe_port: int | None = None,
     accept_budget_sec: int | None = None,
+    health_path_derived: bool = False,
 ) -> RuntimeSmokeResult:
     """在沙箱内执行冒烟脚本并三分类（唯一通道 manager.run_command，禁 run_code）。
 
@@ -1394,7 +1430,7 @@ async def run_runtime_smoke(
     res = classify_smoke_outcome(
         parsed["app_rc"], parsed["log_tail"], parsed["probe_sequence"],
         language_key=language_key, project_symbols=project_symbols,
-        probe_port=probe_port)
+        probe_port=probe_port, health_path_derived=health_path_derived)
     res.details.update({
         "ran": True,
         "probe_tool": parsed["probe_tool"],
