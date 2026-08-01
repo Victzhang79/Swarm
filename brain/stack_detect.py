@@ -87,30 +87,142 @@ _BACKEND_FRAMEWORK_MARKERS = {
 }
 
 # 服务端模板扩展名 → 模板引擎候选
+#
+# ★P-C3：加一栈 = 加一条表项（栈中立，绝不写死语言分支）★ 原表只覆盖 JVM + Rails/Symfony/
+# Razor 少数几种，实测四个主流栈落在表外并被判成"无独立前端"：Express+`.ejs`、Gin+`.tmpl`、
+# Laravel+`.blade.php`、Django/Flask 的 `templates/*.html`。后果不是"少认一个引擎"，而是
+# `frontend_kind="none"` ⇒ `format_stack_for_prompt` **一条前端约定都不发**（`server-template`
+# 那档才会明确禁止产 `.vue`/独立 SPA 工程）⇒ task 8537fa5e 的 SPA 死代码病在四栈原样复发。
 _TEMPLATE_EXT_ENGINE = {
+    # ── JVM ──
     ".jsp": "JSP",
     ".ftl": "FreeMarker",
     ".ftlh": "FreeMarker",
     ".vm": "Velocity",
-    ".erb": "ERB",
-    ".twig": "Twig",
-    ".cshtml": "Razor",
-    ".gohtml": "Go template",
-    ".mustache": "Mustache",
+    # ── node ──
+    ".ejs": "EJS",
+    ".pug": "Pug",
+    ".jade": "Pug",
+    ".njk": "Nunjucks",
     ".hbs": "Handlebars",
+    ".handlebars": "Handlebars",
+    ".mustache": "Mustache",
+    ".liquid": "Liquid",
+    # ── ruby ──
+    ".erb": "ERB",
+    ".haml": "Haml",
+    ".slim": "Slim",
+    # ── php ──
+    ".twig": "Twig",
+    # ── python ──
+    ".j2": "Jinja2",
+    ".jinja": "Jinja2",
+    ".jinja2": "Jinja2",
+    # ── go ──
+    ".gohtml": "Go template",
+    ".tmpl": "Go template",
+    ".gotmpl": "Go template",
+    # ── dotnet ──
+    ".cshtml": "Razor",
+    ".razor": "Razor",
+    # ── elixir ──
+    ".eex": "EEx",
+    ".heex": "HEEx",
+    ".leex": "LEEx",
+    # ── rust ──
+    ".tera": "Tera",
+}
+# ★复合后缀★ 只登记**splitext 之后会失去模板身份**的形态。
+#
+# `os.path.splitext` 只取最后一段：`x.blade.php` → `.php`（当成 PHP 源码，不是模板）——这是
+# Laravel 整栈判不出前端形态的直接原因，必须登记。
+# ★刻意不登记 `.html.erb` / `.html.twig` / `.html.heex` 这类★ 它们 splitext 后是
+# `.erb`/`.twig`/`.heex`，主表里本来就有，登记进来是**冗余条目**：谁都测不出它的存在
+# （首版我登记了 `.html.heex`/`.html.eex`，突变实验当场证明删掉它们没有任何测试会红——
+# 冗余防御互相兜底、两处都不可证伪，[[swarm-redundant-defense-unfalsifiable]]）。
+# 判定按键长度降序匹配（多段后缀优先于少段）。
+_TEMPLATE_COMPOUND_SUFFIX = {
+    ".blade.php": "Blade",
 }
 # .html 归到服务端模板需结合 templates 目录 + 后端模板依赖佐证（见下）
 _TEMPLATE_EXTS = set(_TEMPLATE_EXT_ENGINE) | {".html", ".htm"}
 _SPA_EXTS = {".vue": "Vue", ".svelte": "Svelte"}  # .jsx/.tsx 需配 react 依赖
 _SPA_JSX_EXTS = {".jsx", ".tsx"}
 
-# 前端模板依赖 marker（出现在后端清单 → .html 可判为服务端模板而非静态/SPA 产物）
+# 后端模板依赖 marker（出现在后端清单 → `templates/` 下的 .html 可判为服务端模板而非
+# 静态资源/SPA 构建产物）。
+#
+# ★P-C3：这张表专治"模板文件后缀就是 .html"的栈★ Django/Flask(Jinja2)/Rails(部分)/
+# Askama(Rust) 都把模板写成 `.html`，靠后缀永远认不出来，只能靠依赖坐标佐证。
+# 判据与 `_TEMPLATE_EXT_ENGINE` **刻意分档**：那张表答"这个后缀是哪种模板"，本表答
+# "这个工程的 .html 到底是模板还是静态资源"——后果不同（前者判错=引擎名错，后者判错=
+# 整个前端形态错成 none）。
 _SERVER_TEMPLATE_DEP = {
+    # ── JVM ──
     "thymeleaf": "Thymeleaf",
     "freemarker": "FreeMarker",
     "velocity": "Velocity",
     "jstl": "JSP/JSTL",
+    # `taglibs-standard-jstlel` 是真实 Maven 坐标（JSTL 的 EL 实现）。旧的裸子串匹配靠
+    # `jstl` 顺带命中它；改成词边界后必须**单独登记**，否则这类工程从"认得"退成"认不得"
+    # ＝误杀方向的静默回归。
+    "jstlel": "JSP/JSTL",
+    # ── python ──（Django 内置模板引擎；Jinja2 被 Flask/FastAPI 共用）
+    "django": "Django Template",
+    "jinja2": "Jinja2",
+    # ── node ──（清单里出现引擎包名 ⇒ 该工程确有服务端渲染）
+    "ejs": "EJS",
+    "pug": "Pug",
+    "express-handlebars": "Handlebars",
+    "nunjucks": "Nunjucks",
+    # ── php ──
+    "laravel/framework": "Blade",
+    "twig/twig": "Twig",
+    # ── ruby ──
+    "haml": "Haml",
+    "slim": "Slim",
+    # ── rust ──（Askama/Tera 把模板写成 .html 放 templates/）
+    "askama": "Askama",
+    "tera": "Tera",
+    # ── elixir ──
+    "phoenix": "Phoenix (EEx/HEEx)",
 }
+# ★匹配必须按词边界，不能裸子串★ P-C3 扩表引入了短 marker，裸 `in` 的命中面积当场失控：
+# `tera` 命中 `iterate`/`literal`/`iterare`、`slim` 命中 `slimmer`、`django` 命中
+# `djangorestframework`（纯 API 工程，没有模板）。误命中的后果是把静态 `.html`/前端产物
+# 当服务端模板 ⇒ 形态判成 server-template ⇒ 禁止产 SPA 的硬约束发给一个真 SPA 工程。
+# 实测：词边界对既有四条 JVM marker 零回归（`spring-boot-starter-thymeleaf` 等仍命中，
+# 唯一掉的 `taglibs-standard-jstlel` 已单独登记）。
+_SERVER_TEMPLATE_DEP_RE = {
+    dep: re.compile(r"\b" + re.escape(dep) + r"\b") for dep in _SERVER_TEMPLATE_DEP
+}
+
+
+def _template_engine_of(filename: str) -> str | None:
+    """文件名 → 模板引擎名（`None`=不是已知模板后缀）。
+
+    **先试复合后缀再退单段**：`os.path.splitext` 只取最后一段，`x.blade.php` → `.php`
+    会被当成 PHP 源码而不是模板（Laravel 整栈判不出前端形态的直接原因）。
+    """
+    low = filename.lower()
+    for suf in sorted(_TEMPLATE_COMPOUND_SUFFIX, key=len, reverse=True):
+        if low.endswith(suf):
+            return _TEMPLATE_COMPOUND_SUFFIX[suf]
+    return _TEMPLATE_EXT_ENGINE.get(os.path.splitext(low)[1])
+
+
+# ★P-C3 第二层：模板形态的"认不得"必须机读可辨★ 目录名证据——这些目录名是**跨栈**的服务端
+# 渲染惯例（Django/Flask `templates/`、Express `views/`、Laravel `resources/views/`、
+# Rails `app/views/`、Phoenix `templates/`、Hugo/Jekyll `layouts/`）。
+# 用途**只有一个**：当目录里有网页形态文件却**一个引擎都认不出来**时，把
+# `frontend_kind="none"` 从"真没有前端"区分出来——那是"我不认得"，是扫描失败而非答案。
+# 绝不用它单独判 server-template（目录名是弱证据，判形态仍需后缀或依赖坐标硬证据）。
+_TEMPLATE_DIR_NAMES = frozenset({
+    "templates", "template", "views", "view", "layouts", "partials", "_layouts", "pages",
+})
+# 网页形态后缀：出现在模板目录下且引擎认不出来 ⇒ 触发"认不得"信号。刻意只收**页面**后缀，
+# 不收 .css/.js（静态资源目录也叫 views 的项目存在，收进来会把噪声当证据）。
+_WEBPAGE_EXTS = frozenset({".html", ".htm", ".xhtml", ".php", ".tpl", ".shtml"})
 
 _NOISE_DIRS = {".git", "node_modules", "target", "dist", "build", ".venv",
                "__pycache__", ".idea", ".codegraph", "vendor", ".gradle"}
@@ -471,8 +583,13 @@ def _scan_failed_profile(reason: str) -> dict:
         "frontend": "未判明", "frontend_kind": "none", "backend": "未判明", "build": "未判明",
         "jvm": {}, "auth": {}, "infra_symbols": {}, "infra_symbol_methods": {},
         "confidence": 0.0, "evidence": [f"⚠️ 磁盘探测失败：{reason}"], "db": [],
+        # P-C3 两个键显式给 False/0：形状与正常画像一致，杜绝下游直读 KeyError。语义上也
+        # 必须是 False——扫描失败是"什么都没看到"，不是"看到模板但认不出引擎"（后者会让
+        # 下游发出"别当没前端"的提示，而这里连目录都没读到，那提示是凭空的）。
         "signals": {"manifests": [], "server_template_files": 0, "spa_files": 0,
-                    "frontend_project_dirs": []},
+                    "frontend_project_dirs": [],
+                    "tmpl_engine_unrecognized": False,
+                    "unengined_template_dir_files": 0},
         "needs_model_adjudication": False,
         "scan_failed": True, "scan_failed_reason": reason,
         "source": "scan_failed",
@@ -512,6 +629,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     ext_counts: Counter = Counter()
     tmpl_count = 0
     template_engine_hits: Counter = Counter()
+    unengined_tmpl_dir_files = 0   # P-C3：模板目录下认不出引擎的网页文件数
     spa_files: Counter = Counter()
     jsx_count = 0
     has_angular = False
@@ -564,14 +682,21 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             if low.startswith("vite.config."):
                 has_vite = True
             # 模板/SPA 形态计数
-            if ext in _TEMPLATE_EXTS:
+            _eng = _template_engine_of(f)     # P-C3：含复合后缀（.blade.php 等）
+            if _eng or ext in _TEMPLATE_EXTS:
                 tmpl_count += 1
-                if ext in _TEMPLATE_EXT_ENGINE:
-                    template_engine_hits[_TEMPLATE_EXT_ENGINE[ext]] += 1
+                if _eng:
+                    template_engine_hits[_eng] += 1
             elif ext in _SPA_EXTS:
                 spa_files[_SPA_EXTS[ext]] += 1
             elif ext in _SPA_JSX_EXTS:
                 jsx_count += 1
+            # ★P-C3 第二层证据★ 模板目录下的网页文件，且引擎认不出来 → 记账（供"认不得"信号）。
+            # 只在这里累计，判定留到下方形态裁决处，避免"收集"与"裁决"混在一起。
+            if _eng is None and ext in _WEBPAGE_EXTS:
+                _segs = {s.lower() for s in rel.replace(os.sep, "/").split("/") if s}
+                if _segs & _TEMPLATE_DIR_NAMES:
+                    unengined_tmpl_dir_files += 1
 
     evidence: list[str] = []
     # ── 后端语言/构建/框架 ──
@@ -639,7 +764,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     # ── 前端形态裁决 ──
     server_tmpl_dep = ""
     for dep, name in _SERVER_TEMPLATE_DEP.items():
-        if dep in all_manifest_text:
+        if _SERVER_TEMPLATE_DEP_RE[dep].search(all_manifest_text):   # P-C3：词边界，非裸子串
             server_tmpl_dep = name
             break
     spa_total = sum(spa_files.values()) + (jsx_count if "react" in all_manifest_text else 0)
@@ -652,6 +777,7 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
 
     frontend = ""
     frontend_kind = "none"
+    tmpl_engine_unrecognized = False   # P-C3：`none` 的两种成因必须机读可辨
     if has_spa and has_server_tmpl:
         frontend_kind = "separated"
         spa_name = (spa_files.most_common(1)[0][0] if spa_files else
@@ -677,6 +803,17 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         eng = server_tmpl_dep or (template_engine_hits.most_common(1)[0][0]
                                   if template_engine_hits else "HTML 模板")
         frontend = f"服务端模板（{eng}）"
+    elif unengined_tmpl_dir_files > 0:
+        # ★P-C3 第二层：fail-closed 方向★ 模板目录里有网页文件，却一个引擎都认不出来。
+        # 这**不是**"没有前端"，是"我不认得这个前端"——两者塌成同一个 `none` 值时，未收录的栈
+        # 会拿到**高置信错答案**（实测 Django/Gin/Laravel 都是 conf=0.75、needs_adj=False，
+        # 连 LLM 兜底都不触发）。故单立一档：形态仍报 none（不臆造引擎名，血规 2），但
+        # 置信度下调 + 强制交模型裁决 + evidence 写明真因。
+        # ★为什么不直接判 server-template★ 目录名是弱证据（静态站点/前端产物也叫 views/pages）。
+        # 认定形态需要硬证据（模板后缀或依赖坐标）；这里只诚实报告"看到了但认不出"。
+        frontend_kind = "none"
+        frontend = "无法判明前端形态（模板目录下有网页文件，但未识别出模板引擎）"
+        tmpl_engine_unrecognized = True
     else:
         frontend_kind = "none"
         frontend = "无独立前端（API/后端为主，或前端未在本仓）"
@@ -685,6 +822,19 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         evidence.append(
             f"服务端模板信号: 引擎依赖={server_tmpl_dep or '无'}; "
             f"模板专用扩展={dict(template_engine_hits) or '无'}; .html×{ext_counts.get('.html',0)}"
+        )
+    if tmpl_engine_unrecognized:
+        # 机读键 `tmpl_engine_unrecognized` 的人读面（降级路径至少一次 WARNING，血规 10 第四条）。
+        logger.warning(
+            "[STACK-DETECT] P-C3 模板目录下有 %d 个网页文件，但**未识别出任何模板引擎** → "
+            "前端形态判定为【认不得】而非【无前端】：降置信 + 强制交模型裁决。"
+            "若这是本仓真实使用的引擎，请给 _TEMPLATE_EXT_ENGINE / _SERVER_TEMPLATE_DEP "
+            "加表项（加一栈=加一条）。project_path=%r", unengined_tmpl_dir_files, project_path)
+        evidence.append(
+            f"★前端形态未判明★ 模板目录下有 {unengined_tmpl_dir_files} 个网页文件"
+            f"（.html/.php 等），但既无已知模板后缀、清单里也无已知模板引擎依赖 → "
+            f"无法确定是服务端模板还是静态资源。**请据仓库实际情况裁决**，勿默认为"
+            f"「无前端」（那会导致新增页面被规划成独立 SPA 工程＝死代码）。"
         )
     evidence.append(
         f"SPA 信号: .vue×{spa_files.get('Vue',0)} svelte×{spa_files.get('Svelte',0)} "
@@ -715,12 +865,25 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         confidence += 0.1
     if frontend_kind == "none" and not manifests:
         confidence -= 0.3  # 啥都没扫到
+    if tmpl_engine_unrecognized:
+        # P-C3：不是答案而是"没看清"，必须降到兜底线以下（needs_adj 阈值 0.65）。
+        confidence -= 0.2
     confidence = max(0.0, min(1.0, confidence))
     # G-H6：多清单无法分出主栈 → 必须降置信 + 交模型裁决，绝不给"高置信错答案"
     if multi_manifest_ambiguous:
         confidence = min(confidence, 0.4)
+    # ★P-C3：`tmpl_engine_unrecognized` 直接进 needs_adj，不靠"降置信恰好跌破阈值"★
+    # 只靠 -0.2 是脆的：置信度公式将来加一档正分（或 0.65 阈值调整）就会让它重新变成
+    # 高置信错答案，而那次改动的人不会知道自己拆了这道闸。两个都写＝意图显式。
+    #
+    # ★诚实记录：这条 `or` 今天【无法被突变实验隔离】★ 按当前公式算上界——`unrecognized`
+    # 蕴含 `frontend_kind == "none"`（拿不到 +0.2/+0.1 两档前端分），故最高
+    # 0.5 + 0.25 - 0.2 = 0.55 < 0.65 ⇒ 前一个条件恒真，删掉这条没有任何测试会红。
+    # 不给它造假锁（[[swarm-redundant-defense-unfalsifiable]]：冗余防御互相兜底时，编个
+    # 能红的测试等于把"哪道闸在生效"这一维从命题里抹掉）。保留它是**刻意**的前瞻冗余：
+    # 改置信度公式的人不必先想通这条推导，闸也不会静默失效。改这段时请一起复核上面那笔算术。
     needs_adj = (confidence < 0.65 or (has_spa and has_server_tmpl)
-                 or multi_manifest_ambiguous)
+                 or multi_manifest_ambiguous or tmpl_engine_unrecognized)
 
     # ── JVM 系专属事实：jakarta/javax 命名空间 + Boot/Java 版本（worker 写对 import 的硬前提）──
     infra_symbols, infra_symbol_methods = _detect_infra_symbols(infra_class_paths)
@@ -763,6 +926,11 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             "server_template_files": real_server_tmpl,
             "spa_files": spa_total,
             "frontend_project_dirs": sorted(set(frontend_proj_dirs))[:4],
+            # ★P-C3 机读键★ `frontend_kind == "none"` 的两种成因判别：True＝"看到网页文件但
+            # 认不出引擎"（扫描失败），False/缺席＝"真没有前端"（合法答案）。消费者见
+            # `format_stack_for_prompt`（发"别当没前端"的提示）与 needs_adj。
+            "tmpl_engine_unrecognized": tmpl_engine_unrecognized,
+            "unengined_template_dir_files": unengined_tmpl_dir_files,
         },
         "needs_model_adjudication": needs_adj,
         "source": "deterministic",
@@ -847,6 +1015,16 @@ def format_stack_for_prompt(profile: dict | None, *, include_method_sigs: bool =
         lines.append("- 前端落地约定：新增页面用该 SPA 框架的单文件组件/路由，落在既有前端工程目录。")
     elif kind == "separated":
         lines.append("- 前端落地约定：前后端分离，前端进 SPA 工程目录、后端只出 API；按各自既有约定落地。")
+    elif (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):
+        # ★P-C3 机读键的消费者★ `kind == "none"` 有两种成因，此前它们塌成同一个"什么都不发"：
+        # 真没前端时不发是对的，而"认不出引擎"时不发＝默许 LLM 规划独立 SPA 工程 ⇒ 死代码
+        # （task 8537fa5e 病灶）。这里把不确定性**显式**传下去，而不是替它猜一个引擎名。
+        lines.append(
+            "- 【前端形态未判明·须先取证】本仓模板目录下有网页文件，但确定性探测**未识别出**"
+            "模板引擎（可能是本系统尚未收录的引擎）。【禁止】据此认定「本项目无前端」并新建"
+            "独立 SPA 工程——若本仓实为服务端渲染，那将是永不被引用的死代码。请先读该目录下"
+            "的实际文件与后端视图层代码确定渲染方式，再决定新增页面的落点；沿用既有形态。"
+        )
     jvm = profile.get("jvm") or {}
     ns = jvm.get("servlet_namespace")
     if ns:

@@ -989,6 +989,18 @@ async def detect_stack(state: BrainState) -> dict:
                     "confidence": adj.confidence or profile["confidence"],
                     "source": "deterministic+model",
                 })
+                # ★P-C3：裁决已发生 ⇒ 清掉"认不得"标（否则是粘滞信号）★
+                # `tmpl_engine_unrecognized` 的**唯一用途**是把不确定性抬到这次裁决前；裁决
+                # 一旦给出形态，问题就已解决。留着它会让 `format_stack_for_prompt` 继续发
+                # "我看不清、别当没前端"——触发它的机制已经把它答完了，它还在响。
+                # 只在裁决**真的落定**（adj.frontend 非空、已 update）时清，裁决失败/形状非法
+                # 走 except 沿用确定性结果时**不清**（那时不确定性依然真实存在）。
+                if (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):
+                    profile["signals"]["tmpl_engine_unrecognized"] = False
+                    profile["signals"]["tmpl_engine_unrecognized_adjudicated"] = True
+                    logger.info(
+                        "[DETECT_STACK] P-C3 模板引擎「认不得」已由模型裁决落定为 kind=%s"
+                        "（清标，避免粘滞信号继续喊「看不清」）", profile["frontend_kind"])
                 logger.info("[DETECT_STACK] 大模型裁决后：前端=%s 后端=%s 置信=%.2f",
                             profile["frontend"], profile["backend"], profile["confidence"])
         except Exception as exc:  # noqa: BLE001
