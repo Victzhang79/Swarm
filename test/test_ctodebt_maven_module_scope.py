@@ -146,7 +146,14 @@ def test_rule5_no_owner_logs_warning_no_crash():
     )
     with patch("swarm.brain.contract_utils.logger.warning") as mock_warn:
         normalize_plan_scopes(plan)
-    assert any("无 pom owner 承接" in str(c.args[0]) for c in mock_warn.call_args_list), \
+    # N-3：清单名已栈驱动化（`%s`）→ 断**渲染后**的消息，别断 format 串（Maven 侧渲染结果
+    # 逐字不变；断 format 串会让"栈驱动化"这类纯参数化改动假红，也测不出真实人读文本）
+    def _rendered(c) -> str:
+        try:
+            return str(c.args[0]) % tuple(c.args[1:]) if len(c.args) > 1 else str(c.args[0])
+        except (TypeError, ValueError):
+            return str(c.args[0])
+    assert any("无 pom.xml owner 承接" in _rendered(c) for c in mock_warn.call_args_list), \
         mock_warn.call_args_list
     assert not any("必须声明依赖" in c for c in (plan.subtasks[0].acceptance_criteria or []))
 

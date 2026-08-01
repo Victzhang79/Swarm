@@ -725,10 +725,26 @@ def validate_contract_ownership(
             for sym in soft_unowned[:20]:
                 result.warn(f"契约软性符号 {sym} 无 owner（dtos/fields/methods/成员符号"
                             "随宿主文件落地，不计入打回比率；L2 D5 仍全量核验）")
-    for entry in unclaimed_contract_deps(plan):
+    # ★N-3 栈驱动化★ 规则5 的机读面此前写死 `<mod>/pom.xml` ⇒ npm/go driver 明明已把模块清单
+    # 建出、依赖落地、验收挂上，这里仍逐模块刷"无 pom owner 承接" → VALIDATE_PLAN 假警报（方向
+    # 是**误报**，`warn` 不阻断，故是噪声污染不是死锁）。告警面要**最宽**的 owner 认定：栈感知
+    # 清单名 + R57-1 物理落点（契约标签 `alarm` 的包真身在 `packages/alarm/package.json`）。
+    # 注入面（`inject_build_scaffold_subtasks`）刻意**不**传这两个参数——见该函数 docstring。
+    # ★诚实边界★ 本函数签名里没有 `file_plan`，而它是 `_resolve_module_dirs` 覆盖名字匹配的
+    # 权威证据源 ⇒ 这里的落点证据**弱于** `inject_build_scaffold_subtasks`（那边传了）。后果=
+    # 部分模块解析不出、退回标签口径 ⇒ 与治前一致（可能多刷一条噪声 warn），**绝不会少报**。
+    _r5_stack, _r5_dirs = "unknown", {}
+    try:
+        from swarm.brain.contract_utils import _resolve_module_dirs, _rule4_stack
+        _r5_stack = _rule4_stack(plan, project_path)
+        _r5_dirs, _, _ = _resolve_module_dirs(plan, project_path)
+    except Exception:  # noqa: BLE001 — 取证失败退回 Maven 口径（＝治前行为，方向是照旧报）
+        logger.warning("[C1] 规则5 栈/落点取证失败（退回 pom.xml 口径，方向=照旧报不静默）",
+                       exc_info=True)
+    for entry in unclaimed_contract_deps(plan, stack=_r5_stack, dirs=_r5_dirs):
         result.warn(
             f"规则5：模块 {entry['module']} 的 {len(entry['artifacts'])} 个依赖契约"
-            "无 pom owner 承接（编译期可能缺依赖）")
+            "无模块构建清单 owner 承接（编译期可能缺依赖）")
     return result
 
 

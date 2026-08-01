@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from swarm.stacks import DEPENDENCY_TREE_DIRS
+
 # 构建文件 → 工具链标识
 _MAVEN_POM = "pom.xml"
 _GRADLE = ("build.gradle", "build.gradle.kts")
@@ -36,16 +38,20 @@ _DOCKER = ("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.y
 # 消费契约"）：本表只影响"哪个 package.json 算构建入口"，**不影响镜像里带什么文件**。所以把
 # `.yarn` 列进来不会让 yarn 起不来——`.yarn/releases`（yarn 自己的发行版，属构建工具本体）
 # 仍照常进镜像，那由 image_builder 侧的 wrapper 白名单负责。
-_SKIP_DIRS = {
-    "node_modules", "target", "build", "dist", ".git", ".idea", ".vscode",
-    "__pycache__", ".venv", "venv", "vendor", ".gradle", ".mvn",
-    # X-C2 遗留（用户拍板补齐）：依赖/vendored 产物里的清单一律不算构建入口。
-    # 同型危害本会话已实测：`node_modules/**/pyproject.toml` 劫持了**所有栈**的测试闸、
-    # `node_modules/**/*.csproj` 让 `dotnet build` 在错目录跑 → 127 → BLOCKED。
-    "third_party", "third-party", "3rdparty", ".yarn", ".pnpm-store",
-    "bower_components", "Pods", "packages_cache", ".tox", ".eggs",
-    "site-packages", ".mypy_cache", ".pytest_cache", ".next", ".nuxt",
+#
+# ★本表 = 依赖树目录 ∪ 产物/工具目录（N-2b 复核整改）★
+# 两半的**语义不同**，故依赖树那半提到 `stacks.DEPENDENCY_TREE_DIRS` 单独命名：另一类消费者
+# （"谁的模块声明能用来推兄弟模块的约定" —— go module 前缀取证）**只能**读依赖树那半。拿整张表
+# 去过滤会把 `build/tool/go.mod` 这类【本仓自己的】模块也剔掉 → 前缀推不出 → 整栈零脚手架（误杀）。
+# 本表自身的消费契约不变：这两类目录里的清单都不算构建入口。
+# 注：`out` 刻意**不在**表内——拆表是纯结构改动，集合必须与拆前逐元素相等（顺手加一项就是
+# 在"行为不变"的幌子下扩了闸的作用域）。要加它另开一条，带自己的判据与测试。
+_PRODUCT_DIRS = {
+    "target", "build", "dist", ".git", ".idea", ".vscode",
+    "__pycache__", ".gradle", ".mvn", ".mypy_cache", ".pytest_cache",
+    ".next", ".nuxt",
 }
+_SKIP_DIRS = set(DEPENDENCY_TREE_DIRS) | _PRODUCT_DIRS
 
 
 @dataclass

@@ -22,18 +22,24 @@ RUN19/round62 的**结构**（多写者争抢根聚合清单 + 模块清单脚�
 工程树复用 B-0 共享夹具（`conftest` 的 `make_workspace`）：replay 会读磁盘做
 aggregate-vs-新建分流、模板取证，微型树走不进那些分支。
 
-## ★本文件落地当场抓到的两条（实测，非推演）★
+## ★本文件落地当场抓到的两条（实测，非推演）——均已治（B-6）★
 
 - **N-2b** go.work 多模块仓：`_inject_go_scaffolds` 只认**根** `go.mod` 推导 import 路径，
   根上只有 `go.work` 时**整栈零脚手架**（`scaffolds=[]`）。而 module path 本可从兄弟
   `go.mod` 或 `go.work` 的 `use` 确定性推出——不是"推不出"，是**没接这条证据源**。
-  归 B-6（DependencyResolver / 脚手架 driver）。
-- **N-3** `unclaimed_contract_deps` 写死 `f"{mod}/pom.xml"`：npm driver 已把清单建出、
-  依赖落地、验收挂上，它**仍报每个模块"依赖契约无 pom owner 承接"** → VALIDATE_PLAN
-  刷假警报（`result.warn`，**不阻断**，故是噪声不是死锁）。另有隐性耦合：
-  `inject_build_scaffold_subtasks` 拿它当**入口清单**，异栈能进 driver 只因"无 pom owner"
-  对非 Maven 模块恒真（歪打正着）——将来谁把它改成栈感知却漏改注入入口，npm/go 脚手架会
-  **静默停摆**。归 B-6。
+  治：`_go_module_path_prefix` 两条证据源（根 go.mod → 工作区成员反推），互斥前缀 → 歧义
+  fail-closed（绝不挑边臆造 module 路径）。同批 `_go_root_directive` 补读 `go.work` 的
+  `go` 指令（go.work 仓恒落 '1.21' 兜底会低于工作区真值 → `go.work requires go >= 1.22`）。
+- **N-3** 规则5 三处**各自**写死 `f"{mod}/pom.xml"`：npm driver 已把清单建出、依赖落地、
+  验收挂上，它们**仍报每个模块"依赖契约无 pom owner 承接"** → VALIDATE_PLAN 刷假警报
+  （`result.warn`，**不阻断**，故是噪声不是死锁）。治：`_rule5_manifests(stack)` 单一事实源
+  + `_module_manifest_candidates`（补 R57-1 物理落点：契约标签 `alarm` 的包真身在
+  `packages/alarm/package.json`，只按标签找恒 miss）。**两个消费者后果不同 → 参数显式分档**：
+  告警面（plan_validator）传 stack+dirs 要最宽认定；注入面（`inject_build_scaffold_subtasks`，
+  Maven 专属）不传，维持逐字今日行为——那一侧漏报=该模块没人建构建文件=整模块编译失败。
+  原登记里"异栈能进 driver 只因无 pom owner 恒真（歪打正着）"这句**不准确**：npm/go driver
+  走的是 `_contract_dep_entries`，在 `_should_fabricate_maven_scaffold` 分流处就已早返，
+  从不经过 `unclaimed_contract_deps`（`test_npm_go_driver_does_not_depend_on_unclaimed` 钉住）。
 """
 
 from __future__ import annotations
@@ -206,13 +212,11 @@ def test_r1_convergence_survives_the_whole_replay_sequence(which, npm_cassette, 
 # ③ N-2b / N-3：抓到就钉死（xfail strict，不留待办注释）
 # ══════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=True, reason="N-2b（B-6）：_inject_go_scaffolds 只认根 go.mod，"
-                                       "go.work 多模块仓 → 整栈零脚手架")
 def test_go_work_modules_get_manifest_scaffolds(go_cassette):
-    """go.work 多模块仓的新模块**也该拿到 `go.mod` 脚手架**。
+    """go.work 多模块仓的新模块**也该拿到 `go.mod` 脚手架**（N-2b，已治）。
 
     module path 并非推不出：兄弟 `auth/go.mod` 写着 `example.com/app/auth`、`go.work` 的
-    `use` 也列着成员——确定性证据就在磁盘上，只是没接这条源。当前行为=跳过整栈脚手架
+    `use` 也列着成员——确定性证据就在磁盘上，只是没接这条源。治前=跳过整栈脚手架
     → 回到 R47/R53 病（派 worker 手写清单 + 臆造版本），正是 L4 说的"栈中立≠一律跳过"。
     """
     fx, cassette = go_cassette
@@ -221,24 +225,36 @@ def test_go_work_modules_get_manifest_scaffolds(go_cassette):
     mods = {s["module"] for s in res.scaffolds}
     assert {"billing", "report"} <= mods, (
         f"go.work 多模块仓零脚手架（N-2b），实得 {res.scaffolds}")
+    # 前缀必须来自**兄弟证据**（`example.com/app`），不是某个兜底常量：错前缀 = import 全仓
+    # 对不上，且盖着"权威模板"章发给 worker（R47 血泪）。
+    descs = {s["module"]: st.description for s in res.scaffolds
+             for st in res.plan.subtasks if st.id == s["subtask_id"]}
+    for m in ("billing", "report"):
+        assert f"module example.com/app/{m}" in descs[m], (
+            f"{m} 的 go.mod 模板 module 行不是从兄弟 go.mod 推出的前缀：{descs[m]}")
 
 
-@pytest.mark.xfail(strict=True, reason="N-3（B-6）：unclaimed_contract_deps 写死 mod/pom.xml，"
-                                       "npm 清单已建仍报落空 → VALIDATE_PLAN 假警报")
 def test_unclaimed_contract_deps_is_stack_aware(npm_cassette):
-    """npm driver 把清单建出、依赖落地、验收挂上之后，规则5 机读面**不该**再报落空。
+    """npm driver 把清单建出、依赖落地、验收挂上之后，规则5 机读面**不该**再报落空（N-3，已治）。
 
-    当前 `unclaimed_contract_deps` 只找 `f"{mod}/pom.xml"` → 异栈恒"无 owner" →
+    治前 `unclaimed_contract_deps` 只找 `f"{mod}/pom.xml"` → 异栈恒"无 owner" →
     VALIDATE_PLAN 每个模块刷一条假警报。方向是**误报**（`result.warn` 不阻断），所以是
-    噪声污染而非死锁——但它同时是 `inject_build_scaffold_subtasks` 的**入口清单**，
-    改它必须同步改注入入口，否则 npm/go 脚手架静默停摆。
+    噪声污染而非死锁。
+
+    ★这条测试的两个断言是【一对】，缺一即假绿★ 只断"stack-aware 调用返回空"会被"把
+    `unclaimed_contract_deps` 改成无条件返 []"通过；第二个断言（Maven 口径仍报落空）钉住
+    "空是**因为按 npm 口径找到了 owner**"，而不是因为整个函数被拧成了 fail-open。
     """
-    from swarm.brain.contract_utils import unclaimed_contract_deps
+    from swarm.brain.contract_utils import _resolve_module_dirs, unclaimed_contract_deps
 
     fx, cassette = npm_cassette
     res = cassette_replay.replay_cassette(cassette)
     assert res.ok
     created = [f for st in res.plan.subtasks for f in st.scope.create_files]
     assert "packages/alarm/package.json" in created, "前提：npm 清单确已被建出"
-    assert unclaimed_contract_deps(res.plan) == [], (
+    dirs, _, _ = _resolve_module_dirs(res.plan, cassette["project_path"])
+    assert unclaimed_contract_deps(res.plan, stack="npm", dirs=dirs) == [], (
         "清单已建、依赖已落地，规则5 机读面仍报落空（N-3 假警报）")
+    assert unclaimed_contract_deps(res.plan) != [], (
+        "缺省（Maven）口径也返空 ⇒ 上一条的绿不是'按 npm 口径找到 owner'，"
+        "而是函数被拧成了无条件 fail-open（注入面靠它决定给谁建构建文件，漏报=整模块编译失败）")

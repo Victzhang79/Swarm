@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from swarm.stacks import (
+    DEPENDENCY_TREE_DIRS,
     aggregate_manifests_of_stack,
     demote_safety_net,
     is_compilable_source,
@@ -191,10 +192,49 @@ def enrich_plan_with_shared_contract(plan: TaskPlan) -> TaskPlan:
     return plan
 
 
-def _module_pom_owners(subtasks: list) -> dict[str, object]:
-    """{物理模块名: 拥有该模块 `<模块>/pom.xml` 写权的子任务}（不含根 pom）。
+def _rule5_manifests(stack: str | None) -> tuple[str, ...]:
+    """规则5（契约依赖 → 模块清单 owner）该找**哪些清单名** → 全集（含别名）。
 
-    用于规则5 A5 归并：判断 plan 是否单物理模块（唯一 owner）。通用，不写死模块名。
+    ★N-3 单一事实源★ 规则5 有三个消费点（`unclaimed_contract_deps` 的机读面、
+    `_module_manifest_owners` 的 A5 归并、`normalize_plan_scopes` 的验收行注入），此前**各自**
+    写死 `pom.xml` ⇒ 任何非 Maven 栈里"模块清单无 owner"恒真：npm driver 明明已把
+    `packages/alarm/package.json` 建出、依赖落地、验收挂上，规则5 仍逐模块刷"无 pom owner 承接"。
+
+    ★unknown → Maven（back-compat，与 `_should_fabricate_maven_scaffold` 同序）★ 无证据时
+    维持今日行为，绝不因为判不出栈就静默放弃整条规则（那是 R-1 那类"闸在但不生效"）。
+    """
+    if stack and stack != "unknown":
+        names = module_manifests_of_stack(stack)
+        if names:
+            return names
+    return ("pom.xml",)
+
+
+def _module_manifest_candidates(mod: str, manifests: tuple[str, ...],
+                                dirs: dict[str, str] | None) -> list[str]:
+    """契约模块 → 它的模块清单**候选路径**（归一后，按确定性序）。
+
+    两条候选源，缺一不可：
+      · `<mod>/<manifest>`——契约模块名当目录（Maven 扁平惯例，今日行为）；
+      · `<物理目录>/<manifest>`——R57-1 取证出的真实落点。★npm 侧非它不可★：契约标签 `alarm`
+        的包真身在 `packages/alarm/package.json`，只按标签找恒 miss ⇒ 假警报照旧。
+    """
+    out: list[str] = []
+    base = mod.strip().rstrip("/")
+    for d in ([base] + ([dirs[mod]] if dirs and mod in dirs else [])):
+        for name in manifests:
+            p = _norm_scope_path(f"{d}/{name}")
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def _module_manifest_owners(subtasks: list,
+                            manifests: tuple[str, ...] = ("pom.xml",)) -> dict[str, object]:
+    """{物理模块名: 拥有该模块清单（`<模块>/<manifest>`）写权的子任务}（不含**根**清单）。
+
+    用于规则5 A5 归并：判断 plan 是否单物理模块（唯一 owner）。通用，不写死模块名；
+    清单名由 `_rule5_manifests(stack)` 给（N-3：此前写死 pom.xml ⇒ 异栈恒零 owner）。
     """
     owners: dict[str, object] = {}
     for st in subtasks:
@@ -204,10 +244,13 @@ def _module_pom_owners(subtasks: list) -> dict[str, object]:
         files = list(getattr(sc, "create_files", []) or []) + list(getattr(sc, "writable", []) or [])
         for f in files:
             ff = str(f).replace("\\", "/")
-            if ff.endswith("/pom.xml"):  # 模块 pom（有目录前缀），排除根 pom.xml
-                modname = ff[: -len("/pom.xml")].rsplit("/", 1)[-1]
-                if modname:
-                    owners.setdefault(modname, st)
+            for name in manifests:
+                suffix = f"/{name}"
+                if ff.endswith(suffix):   # 模块清单（有目录前缀），排除根清单
+                    modname = ff[: -len(suffix)].rsplit("/", 1)[-1]
+                    if modname:
+                        owners.setdefault(modname, st)
+                    break
     return owners
 
 
@@ -243,16 +286,27 @@ def _norm_scope_path(f) -> str:
     return p.lstrip("/").rstrip("/")
 
 
-def unclaimed_contract_deps(plan) -> list[dict]:
-    """C1/规则5 机读面（round38c：98 条 artifacts 落空纯 log 无消费）：返回无 pom owner
+def unclaimed_contract_deps(plan, stack: str | None = None,
+                           dirs: dict[str, str] | None = None) -> list[dict]:
+    """C1/规则5 机读面（round38c：98 条 artifacts 落空纯 log 无消费）：返回无模块清单 owner
     承接且无法归并（多物理模块歧义）的契约依赖 entries [{module, artifacts}]，供
-    VALIDATE_PLAN 升 warn 可观测。单物理模块场景规则5 已确定性归并 → 恒空。"""
+    VALIDATE_PLAN 升 warn 可观测。单物理模块场景规则5 已确定性归并 → 恒空。
+
+    ★两个消费者、后果不同 → 参数显式而非内部猜（N-3）★
+      · `plan_validator.validate_contract_ownership`（**告警面**）传 `stack`+`dirs`：多认一个
+        owner 只会少刷一条噪声警报，认漏了才是病 ⇒ 要**最宽**的 owner 认定；
+      · `inject_build_scaffold_subtasks`（**注入面**，Maven 专属，其上游 `_should_fabricate_
+        maven_scaffold` 已确保只有 maven/unknown 能走到）不传 ⇒ 维持 `pom.xml` + 标签当目录的
+        **逐字今日行为**。这里反了方向才是真事故：漏报一个模块=该模块没人建构建文件=整模块编译
+        失败。同一份事实，两种消费契约（本仓血泪：共享表可共享，后果不同必须分档）。
+    """
     shared = getattr(plan, "shared_contract", None) or {}
     deps_spec = shared.get("dependencies") if isinstance(shared, dict) else None
     if not (isinstance(deps_spec, list) and deps_spec):
         return []
     subtasks = list(getattr(plan, "subtasks", None) or [])
-    _mod_owners = _module_pom_owners(subtasks)
+    manifests = _rule5_manifests(stack)
+    _mod_owners = _module_manifest_owners(subtasks, manifests)
     _distinct = list({id(o): o for o in _mod_owners.values()}.values())
     if len(_distinct) == 1:
         return []
@@ -264,14 +318,14 @@ def unclaimed_contract_deps(plan) -> list[dict]:
         arts = [a for a in (entry.get("artifacts") or []) if a]
         if not mod or not arts:
             continue
-        mod_pom = f"{mod}/pom.xml"
+        cands = set(_module_manifest_candidates(mod, manifests, dirs))
         # R41 复核 F5：归一后再比（./mod/pom.xml、反斜杠等写法的 owner 此前会被漏判
         # → 重复注入 pom 写者 → T3 单写者归一把脚手架降成空 scope 壳子任务）
-        owner = next((st for st in subtasks if mod_pom in (
+        owner = next((st for st in subtasks if cands & {
             _norm_scope_path(f)
             for f in (list(getattr(getattr(st, "scope", None), "create_files", []) or [])
                       + list(getattr(getattr(st, "scope", None), "writable", []) or []))
-        )), None)
+        }), None)
         if owner is None:
             out.append({"module": mod, "artifacts": arts})
     return out
@@ -3208,24 +3262,141 @@ def _go_root_module_path(project_path: str | None) -> str | None:
 
 
 def _go_root_directive(project_path: str | None) -> str:
-    """根 go.mod 的 `go X.Y` 指令（读真值，不猜）；无根 go.mod → 保守 '1.21'（语言指令非依赖版本）。"""
+    """工作区级 `go X.Y` 指令（读真值，不猜）：根 `go.mod` → 根 `go.work` → 保守 '1.21'。
+
+    ★N-2b 配套★ go.work 多模块仓根上**没有** go.mod，而 `go.work` 自己带 `go 1.22` 指令
+    （`go work init` 的产物）——那就是工作区权威版本。旧实现只认根 go.mod ⇒ 这类仓恒落
+    '1.21' 兜底：比工作区真值低时，成员 go.mod 写 1.21 而工作区要求 1.22，go 会报
+    `go.work requires go >= 1.22`。指令是**语言版本**不是依赖版本，磁盘上有真值就该读。
+    """
     if project_path:
-        f = Path(project_path) / "go.mod"
-        try:
-            if f.is_file():
-                import re as _re
-                m = _re.search(r"^go\s+(\d+\.\d+(?:\.\d+)?)",
-                               f.read_text("utf-8", errors="replace"), _re.M)
-                if m:
-                    return m.group(1)
-        except OSError:
-            pass
+        import re as _re
+        for name in ("go.mod", "go.work"):
+            f = Path(project_path) / name
+            try:
+                if f.is_file():
+                    m = _re.search(r"^go\s+(\d+\.\d+(?:\.\d+)?)",
+                                   f.read_text("utf-8", errors="replace"), _re.M)
+                    if m:
+                        return m.group(1)
+            except OSError:
+                continue
     return "1.21"
 
 
-def _go_module_path(project_path: str | None, mdir: str, root_module: str | None) -> str | None:
-    """内部 module import 路径：磁盘 go.mod module 行（事实来源）→ 根 module + reldir（go 惯例，
-    可推导非猜）→ None（无根 go.mod 无从确定 import 路径，绝不臆造一个假路径）。"""
+def _go_work_use_dirs(project_path: str | None) -> list[str]:
+    """根 `go.work` 的 `use` 成员目录（相对根，已归一）。无 go.work/读不到 → []。
+
+    块形式 `use (\\n\\t./a\\n\\t./b\\n)` 与单行 `use ./a` 都收——★块内只捕获首成员是
+    C4 那条治本的病灶形状★（`worker/workspace_manifest._reconcile_go_work` 同款逐行解析）。
+    """
+    if not project_path:
+        return []
+    f = Path(project_path) / "go.work"
+    try:
+        if not f.is_file():
+            return []
+        text = f.read_text("utf-8", errors="replace")
+    except OSError:
+        return []
+    import re as _re
+
+    def _norm(entry: str) -> str:
+        e = entry.split("//", 1)[0].strip().strip('"')
+        if e.startswith("./"):
+            e = e[2:]
+        return e.strip("/")
+
+    out: list[str] = []
+    for blk in _re.finditer(r"use\s*\((.*?)\)", text, _re.S):
+        for line in blk.group(1).splitlines():
+            e = _norm(line)
+            if e:
+                out.append(e)
+    for m in _re.finditer(r"(?m)^\s*use\s+(?!\()(\S+)", text):
+        e = _norm(m.group(1))
+        if e:
+            out.append(e)
+    return list(dict.fromkeys(out))
+
+
+def _go_module_path_prefix(project_path: str | None) -> str | None:
+    """内部模块 import 路径的**前缀**（新模块 `<prefix>/<reldir>` 即其 module path）。
+
+    ★N-2b 治本（B-0 夹具落地当场抓到）★ 旧实现只认根 `go.mod` 的 module 行，而 **go.work
+    多模块仓根上没有 go.mod**（`go work init` 只产 go.work）⇒ prefix=None ⇒ 每个新模块
+    `self_path=None` ⇒ `continue` ⇒ **整栈零脚手架**，回到 R47/R53 病（派 worker 手写清单 +
+    臆造版本）。而前缀并非推不出：兄弟 `auth/go.mod` 写着 `example.com/app/auth`、它躺在
+    `auth/` ⇒ 前缀 `example.com/app` 是**磁盘上的确定性事实**，只是没接这条证据源
+    （L4："栈中立 ≠ 一律跳过"）。
+
+    证据序（都不成立才 None）：
+      ① 根 `go.mod` 的 module 行——单根仓/带根模块的工作区，最强证据；
+      ② 兄弟成员 `<dir>/go.mod` 的 module 行**去掉自己的 reldir 尾巴**后的公共前缀。
+         成员集来自 `go.work` 的 `use`（权威），无 go.work 时退化为根下一层子目录扫描。
+
+    ★歧义即 None（fail-closed，绝不挑边）★ 成员给出**多个不同**前缀（真多仓合并、或某成员
+    module 路径与目录名无关）→ WARNING + None：宁可这一轮不建脚手架（下游 VALIDATE 打回、
+    worker 拿不到清单模板），也绝不臆造一个假 module 路径——假路径会让 import 全仓对不上，
+    且盖着"权威模板"章发出去（R47 血泪）。成员 module 路径不以自己 reldir 结尾时该成员
+    **不产前缀证据**（它没说任何关于兄弟的事），不因此把整体判成歧义。
+    """
+    if not project_path:
+        return None
+    root_mod = _go_root_module_path(project_path)
+    if root_mod:
+        return root_mod
+    members = _go_work_use_dirs(project_path)
+    if not members:
+        try:
+            members = sorted(p.name for p in Path(project_path).iterdir()
+                             if p.is_dir() and (p / "go.mod").is_file())
+        except OSError:
+            return None
+    # 依赖树目录的剔除**只在下面这一处**（本循环的 `_SKIP_DIRS` 判据），两条成员来源都过它。
+    # 此前上面那个分支里还过滤了一遍 ⇒ 两处过滤同一件事 ⇒ 任一处单独突变都被另一处兜住 ⇒
+    # 两条都不可证伪（突变 harness 当场逮到两条零区分力）。冗余防御看着"更安全"，实际是让
+    # 机制失效时无人知晓。
+    prefixes: dict[str, str] = {}      # 前缀 → 首个给出它的成员目录（诊断用）
+    for rel in members:
+        rel_n = str(rel).replace("\\", "/").strip("/")
+        # ★只剔【依赖树】目录，不剔产物目录（复核整改）★ 这一档问的是"谁的 module 声明能用来推
+        # 兄弟约定"：`vendor/x` 是第三方命名（不能），而 `build/tool` 是**本仓自己的**模块
+        # （monorepo 把工具放 build/ 不违法，其 module 路径照样是本仓约定的证据）。原实现读
+        # `sandbox_spec._SKIP_DIRS`（依赖树 ∪ 产物）＝把合法证据也剔了 → 前缀推不出 → 整栈零
+        # 脚手架（误杀，比不治更坏）。两表关系见 `stacks.DEPENDENCY_TREE_DIRS` 的 docstring。
+        # `..` 开头＝go.work 指向工程外（合法但越界）：不读工程外文件，也不拿它当前缀证据。
+        if (not rel_n or rel_n.startswith("..")
+                or any(seg in DEPENDENCY_TREE_DIRS for seg in rel_n.split("/"))):
+            continue
+        mp = _go_module_path(project_path, rel_n, None)   # 只读磁盘事实，禁递归推导
+        if not mp:
+            continue
+        if mp == rel_n or not mp.endswith("/" + rel_n):
+            # 该成员的 module 路径与它的落点无关（合法：go 不要求两者一致）→ 无前缀证据。
+            continue
+        prefixes.setdefault(mp[: -(len(rel_n) + 1)], rel_n)
+    if len(prefixes) == 1:
+        prefix = next(iter(prefixes))
+        logger.info(
+            "[SCAFFOLD-INJECT] N-2b 无根 go.mod → 从工作区成员确定性推出 module 前缀 %r"
+            "（证据：%s/go.mod 的 module 行）", prefix, prefixes[prefix])
+        return prefix
+    if len(prefixes) > 1:
+        logger.warning(
+            "[SCAFFOLD-INJECT] N-2b 工作区成员给出 %d 个互斥 module 前缀 %s → 歧义，"
+            "拒绝推导（绝不挑边臆造 module 路径：假路径让全仓 import 对不上，还盖着权威模板章）",
+            len(prefixes), sorted(prefixes))
+    return None
+
+
+def _go_module_path(project_path: str | None, mdir: str, mod_prefix: str | None) -> str | None:
+    """内部 module import 路径：磁盘 go.mod module 行（事实来源）→ `mod_prefix + reldir`
+    （go 惯例，可推导非猜）→ None（无从确定 import 路径，绝不臆造一个假路径）。
+
+    `mod_prefix` 由 `_go_module_path_prefix` 统一取证（根 go.mod → 工作区成员反推）；
+    ★本函数内部传 None 用于"只读磁盘事实"★（前缀取证自身必须不递归，否则循环论证）。
+    """
     if project_path:
         f = Path(project_path) / mdir / "go.mod"
         try:
@@ -3236,8 +3407,8 @@ def _go_module_path(project_path: str | None, mdir: str, root_module: str | None
                     return m.group(1)
         except OSError:
             pass
-    if root_module:
-        return f"{root_module}/{mdir.strip('/')}"
+    if mod_prefix:
+        return f"{mod_prefix}/{mdir.strip('/')}"
     return None
 
 
@@ -3287,14 +3458,16 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
     mods_all = _contract_dep_entries(plan, dirs)
     if not mods_all:
         return []
-    root_module = _go_root_module_path(project_path)
+    # ★N-2b★ 前缀取证走 `_go_module_path_prefix`（根 go.mod → go.work 成员反推），不再只认
+    # 根 go.mod——go.work 仓根上没有 go.mod，旧口径下这类仓 100% 零脚手架。
+    mod_prefix = _go_module_path_prefix(project_path)
     go_directive = _go_root_directive(project_path)
     # ★内部 import 路径全集从【全 dirs】取★（磁盘 go.mod module 或 根 module+reldir 推导）；含已
     # 认领/跨轮模块，绝不让内部 module 被当第三方去 proxy 误解析（cr#2/hunter#2）。不可推导者不入集。
     internal_paths: dict[str, str] = {}   # module_label → canonical import path
     path_to_dir: dict[str, str] = {}      # canonical import path → physical dir
     for m, d in dirs.items():
-        p = _go_module_path(project_path, d, root_module)
+        p = _go_module_path(project_path, d, mod_prefix)
         if p:
             internal_paths[m] = p
             path_to_dir[p] = d
@@ -3318,12 +3491,13 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
         replaces = [(im, _go_relpath(mdir, path_to_dir[im]))
                     for im in internal_mods if im in path_to_dir]
         final_names = [k.module for k in kept] + list(internal_mods)   # 契约=第三方 + 内部路径
-        self_path = _go_module_path(project_path, mdir, root_module)
+        self_path = _go_module_path(project_path, mdir, mod_prefix)
         if not self_path:
             # hunter LOW：无 self_path=整个 go.mod 脚手架跳过 → 契约**不剪**（本轮该模块无任何清单
             # 工作，剪了会让契约与"没做的事"错位；下一轮 self_path 可推导时再同源剪）。
             logger.warning(
-                "[SCAFFOLD-INJECT] #31-P2c 模块 %s 无根 go.mod 可推导 import 路径 → 跳过 go.mod 脚手架"
+                "[SCAFFOLD-INJECT] #31-P2c 模块 %s 无 module 前缀可推导 import 路径（根 go.mod 与"
+                " go.work 成员两条证据源都不成立/互斥）→ 跳过 go.mod 脚手架"
                 "（绝不臆造一个假 module 路径污染构建）", mod)
             continue
         _prune_scaffold_contract_entry(plan, mod, final_names, dropped)   # hunter#3 同源剪契约
@@ -4467,9 +4641,27 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         # 无 owner → 原逻辑只告警、依赖落空 → 编译期缺依赖。修法：仅当全 plan 存在【唯一】物理模块
         # pom owner(单模块项目，无歧义)时，把无独立 owner 的契约依赖确定性归并到它，杜绝落空 + 消除
         # false-alarm。多 owner(真多模块)歧义 → 保守只告警(行为不变)。通用，不写死模块名。
-        _mod_owners = _module_pom_owners(subtasks)
+        # ★N-3 栈驱动化★ 清单名走 `_rule5_manifests(_stk)`（规则4 已算出 `_stk`，同栈同源）。
+        # 此前写死 `pom.xml` ⇒ 非 Maven 栈里 owner 恒 None、`_sole_owner` 恒 None ⇒ 逐模块刷
+        # "无 pom owner 承接"假警报，且**依赖声明验收条目一条都不注入**（npm/go 的模块清单
+        # owner 明明就在 plan 里）。Maven 行为逐字节不变（manifests=("pom.xml",)）。
+        _r5_manifests = _rule5_manifests(_stk)
+        _r5_primary = _r5_manifests[0]
+        _mod_owners = _module_manifest_owners(subtasks, _r5_manifests)
         _distinct = list({id(o): o for o in _mod_owners.values()}.values())
         _sole_owner = _distinct[0] if len(_distinct) == 1 else None
+        # 物理落点（R57-1 取证）：契约标签 `alarm` 的 npm 包真身在 `packages/alarm/package.json`,
+        # 只按标签找恒 miss。取证失败退回纯标签口径（＝治前行为，方向是"照旧报/照旧不注入"，
+        # 不是静默放行）。
+        # ★诚实边界★ 本处**没有** `file_plan`（本函数签名里没有），而它是 `_resolve_module_dirs`
+        # 覆盖名字匹配的权威证据源 ⇒ 这里的落点证据**弱于** `inject_build_scaffold_subtasks`
+        # （那边传了）。后果=部分模块解析不出、退回标签口径，与治前一致；绝不会因此少报。
+        _r5_dirs: dict[str, str] = {}
+        try:
+            _r5_dirs, _, _ = _resolve_module_dirs(plan, project_path)
+        except Exception:  # noqa: BLE001 — 落点取证绝不阻断归一主链
+            logger.warning("[normalize] 规则5 物理落点取证失败（fail-open，退回契约标签口径）",
+                           exc_info=True)
         for entry in deps_spec:
             if not isinstance(entry, dict):
                 continue
@@ -4477,40 +4669,55 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             arts = [a for a in (entry.get("artifacts") or []) if a]
             if not mod or not arts:
                 continue
-            mod_pom = f"{mod}/pom.xml"
-            owner = next(
-                (
-                    st for st in subtasks
-                    if mod_pom in (
-                        list(getattr(getattr(st, "scope", None), "create_files", []) or [])
-                        + list(getattr(getattr(st, "scope", None), "writable", []) or [])
-                    )
-                ),
-                None,
-            )
+            _cands = _module_manifest_candidates(mod, _r5_manifests, _r5_dirs)
+            # 验收行/告警必须点名**真的那个文件**：候选序是"标签在首、物理落点在后"（Maven
+            # 惯例优先，back-compat），但落点才是 R57-1 的权威答案。命中时用命中的那条，
+            # 未命中时优先建议物理落点（`alarm` 的包真身在 `packages/alarm/`，叫人去建
+            # `alarm/package.json` 是把落点错误再传播一次）。
+            mod_manifest = _cands[-1]
+            owner = None
+            for st in subtasks:
+                _writes = {
+                    _norm_scope_path(f)
+                    for f in (list(getattr(getattr(st, "scope", None), "create_files", []) or [])
+                              + list(getattr(getattr(st, "scope", None), "writable", []) or []))}
+                _hit = [c for c in _cands if c in _writes]
+                if _hit:
+                    owner, mod_manifest = st, _hit[0]
+                    break
             reconciled = False
             if owner is None:
                 if _sole_owner is not None:
                     owner = _sole_owner
                     reconciled = True
                     logger.info(
-                        "[normalize] 规则5：契约模块 %s 无独立 pom owner → 逻辑模块落进单物理模块，"
-                        "依赖确定性归并到唯一物理模块 pom owner %s（杜绝依赖落空+消除 false-alarm）",
-                        mod, getattr(_sole_owner, "id", "?"),
+                        "[normalize] 规则5：契约模块 %s 无独立 %s owner → 逻辑模块落进单物理模块，"
+                        "依赖确定性归并到唯一物理模块 owner %s（杜绝依赖落空+消除 false-alarm）",
+                        mod, _r5_primary, getattr(_sole_owner, "id", "?"),
                     )
                 else:
                     logger.warning(
-                        "[normalize] 规则5：模块 %s 的依赖契约无 pom owner 承接（%d 个 artifacts 落空）"
+                        "[normalize] 规则5：模块 %s 的依赖契约无 %s owner 承接（%d 个 artifacts 落空）"
                         "——编译期可能缺依赖，请确认有脚手架子任务建 %s",
-                        mod, len(arts), mod_pom,
+                        mod, _r5_primary, len(arts), mod_manifest,
                     )
                     continue
             ac = list(getattr(owner, "acceptance_criteria", []) or [])
+            # ★验收行必须点名 owner **真写的那条**路径（`mod_manifest` 上面已置成命中项）★
+            # Maven 侧措辞逐字不变（既有测试断的就是这串字面量）：标签与落点一致时
+            # `mod_manifest == f"{mod}/pom.xml"`，字节等价；**不一致时（R57-1 错位：pom 真身在
+            # `nested/mod-a/`）旧写法会叫 owner 去改一个它 scope 里没有的文件** → scope_guard
+            # 拦 → empty_diff。那是本条的真修复面，不是措辞美化。
             if reconciled:
-                note = (f"本模块 pom.xml 必须声明 {mod} 所需依赖: {sorted(arts)}"
+                note = (f"本模块 {_r5_primary} 必须声明 {mod} 所需依赖: {sorted(arts)}"
+                        f"（{mod} 的代码落在本物理模块，缺一即整模块编译失败）"
+                        if _stk not in ("maven", "unknown") else
+                        f"本模块 pom.xml 必须声明 {mod} 所需依赖: {sorted(arts)}"
                         f"（{mod} 的代码落在本物理模块，缺一即 mvn compile 失败）")
             else:
-                note = f"{mod}/pom.xml 必须声明依赖: {sorted(arts)}（缺一即整模块 mvn compile 失败）"
+                note = (f"{mod_manifest} 必须声明依赖: {sorted(arts)}（缺一即整模块编译失败）"
+                        if _stk not in ("maven", "unknown") else
+                        f"{mod_manifest} 必须声明依赖: {sorted(arts)}（缺一即整模块 mvn compile 失败）")
             if note not in ac:
                 ac.append(note)
                 owner.acceptance_criteria = ac

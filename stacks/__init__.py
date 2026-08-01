@@ -5,6 +5,7 @@ L0 键层 / L1 事实表 / L2 能力驱动三层。本包**只放栈知识**，�
 """
 
 from swarm.stacks.spec import (  # noqa: F401
+    DEPENDENCY_TREE_DIRS,
     STACK_SPEC,
     StackSpec,
     aggregate_manifest_of_stack,

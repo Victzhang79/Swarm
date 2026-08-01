@@ -389,6 +389,30 @@ def module_manifest_of_stack(stack: str | None) -> str | None:
     return spec.module_manifest if spec else None
 
 
+DEPENDENCY_TREE_DIRS: frozenset[str] = frozenset({
+    # ★这里只放【第三方代码躺的树】★ 判据："这个目录里的代码不是本仓写的，也不由本仓的版本
+    # 约定管"。vendored 依赖、包管理器缓存、虚拟环境、语言 runtime 的第三方落点。
+    "node_modules", "vendor", "third_party", "third-party", "3rdparty",
+    ".yarn", ".pnpm-store", "bower_components", "Pods", "packages_cache",
+    ".tox", ".eggs", "site-packages", ".venv", "venv",
+})
+"""**依赖树**目录（第三方代码），与"产物/工具目录"（`target`/`build`/`dist`/`.gradle`…）刻意分表。
+
+★为什么必须分（"复用单一事实源 ≠ 复用其消费契约"）★
+`sandbox_spec._SKIP_DIRS` = 依赖树 ∪ 产物/工具，它答的是"**哪个清单算构建入口**"——产物目录里
+的清单不是入口，所以两类都该跳。但另一类消费者问的是**别的问题**："这个目录里的模块声明，能不能
+用来推**兄弟模块**的约定？"（N-2b 的 go module 前缀取证）。对这个问题：
+  · 依赖树目录 → **不能**（`vendor/x` 的 module 路径是 `github.com/third/x`，第三方的命名约定
+    与本仓无关，拿它推兄弟前缀必然错）；
+  · 产物/工具目录 → 与本问题无关。`build/tool/go.mod` 若真存在，它是**本仓自己的**模块（monorepo
+    里把工具放 `build/` 并不违法），它的 module 路径照样是本仓约定的证据。拿 `_SKIP_DIRS` 整张表
+    去过滤，就把这类合法证据也剔了 → 前缀推不出 → 整栈零脚手架（**误杀**，比不治更坏）。
+
+所以：`_SKIP_DIRS` 由本集合 ∪ 产物集合**组合**而成（单一事实源不破），而前缀取证这类
+"谁的声明可信"的消费者只读本集合。改本表前先问：新消费者的后果和老消费者一样吗？
+"""
+
+
 def unregistered_aggregate_stacks() -> tuple[str, ...]:
     """聚合机制**未收录**的栈键——缺席必须机读可辨（纪律：`return []` 与"真没有"不可分
     时，那一层可以死很久没人知道）。有消费者：见 test 的两表对账与 B-7 的覆盖面登记。"""
