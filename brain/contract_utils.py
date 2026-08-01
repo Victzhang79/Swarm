@@ -16,7 +16,9 @@ from swarm.stacks import (
     is_compilable_source,
     is_structural_build_manifest,
     module_manifests_of_stack,
+    root_manifests_by_stack,
     spec_for_stack,
+    stack_of_manifest,
     stack_of_structural_manifest,
     structural_manifests,
 )
@@ -2034,14 +2036,15 @@ def _inject_orphan_module_scaffolds(plan, phys: set[str], dirs: dict[str, str],
 # ★键用 manifest 的【规范大小写】★（Cargo.toml 首字母大写）——基线 os.path.exists 在
 # 大小写敏感文件系统（Linux）上必须用真实文件名，否则漏检 Cargo 工程。计划路径匹配走下方
 # 小写映射（LLM 写的路径大小写不可信）。
-_MANIFEST_TO_STACK = {
-    "pom.xml": "maven",
-    "build.gradle": "gradle", "build.gradle.kts": "gradle",
-    "settings.gradle": "gradle", "settings.gradle.kts": "gradle",
-    "package.json": "npm", "go.mod": "go", "go.work": "go",
-    "Cargo.toml": "cargo", "pyproject.toml": "python",
-}
-_MANIFEST_TO_STACK_LC = {k.lower(): v for k, v in _MANIFEST_TO_STACK.items()}
+# ★P-C1（27 号文 §3.1）：本处原有 `_MANIFEST_TO_STACK`（10 条手抄表）已删★
+# 它是 `stacks/spec.py:STACK_SPEC` 的**第二事实源**，且已实测漂移：python 的
+# `requirements.txt`/`setup.py`/`Pipfile` 在 spec 的 `root_manifests` 里、手抄表里没有
+# ⇒ 纯 pip / Django 工程判 `unknown` ⇒ `_should_fabricate_maven_scaffold` 返 True
+# ⇒ 注入 `reporting/pom.xml`，`pandas`/`celery` 走 Maven Central 查无 → 从契约永久剪除，
+# 且每轮重解析仍是 Maven ⇒ **不可自愈**（P-C1 原文实证）。
+# 栈识别一律走 `root_manifests_by_stack()`（磁盘探测档，规范大小写）与
+# `stack_of_manifest`/`stack_of_structural_manifest`（plan 路径档，小写匹配）。
+# B-3 那批留的交接账 `test_detection_table_drift_is_accounted` 已随本批改写。
 # 目前具备【确定性 aggregator 脚手架实现】的栈（其余已知栈明确不伪造，交后续 driver）。
 _AGGREGATOR_SCAFFOLD_STACKS = frozenset({"maven"})
 
@@ -2054,7 +2057,8 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
     seen: set[str] = set()
     if project_path:
         try:
-            for name, stk in _MANIFEST_TO_STACK.items():
+            # P-C1：磁盘探测走 spec 的规范大小写（`Gemfile`/`Pipfile` 小写化探不到）
+            for name, stk in root_manifests_by_stack():
                 if os.path.exists(os.path.join(project_path, name)):
                     seen.add(stk)
         except (OSError, TypeError, ValueError) as exc:  # os.path.join 对非法输入可抛
@@ -2073,12 +2077,20 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
     for p in paths:
         pn = _norm_scope_path(p)
         base = pn.rsplit("/", 1)[-1].lower()
-        if base in _MANIFEST_TO_STACK_LC:
-            seen.add(_MANIFEST_TO_STACK_LC[base])
+        # P-C1：两档都问——结构档（`stack_of_structural_manifest`，覆盖 `.kts` 等别名）优先，
+        # root 档兜底。后者是本批新增覆盖面：`requirements.txt`/`setup.py`/`Pipfile` 没有
+        # 「整段结构区」故不在结构档，但 plan 里建它**就是** python 工程证据。
+        _stk_hit = stack_of_structural_manifest(base) or stack_of_manifest(base)
+        if _stk_hit:
+            seen.add(_stk_hit)
         if base.rsplit(".", 1)[-1] in ("java", "kt", "kts", "scala"):
             _has_jvm_src = True
     if not seen:
-        return "unknown"          # 无任何 manifest 证据 → 保守回退 Maven（调用方 log）
+        # 无任何 manifest 证据 → 保守回退 Maven。告警由 `_should_fabricate_maven_scaffold`
+        # 统一打（P-C1：原注释写"调用方 log"但两个调用点都没打＝承诺没兑现，现已兑现）。
+        # ★此路径刻意**不带** stack_unknown_cause=ambiguous_mixed 键★——那个键专指"证据充足
+        # 但互相矛盾"，粘到零证据上就等于恒亮，两种 unknown 又不可辨了。
+        return "unknown"
     if "maven" in seen:
         return "maven"            # pom 证据 → Maven 脚手架适用（混栈优先保 Maven）
     if "gradle" in seen:
@@ -2088,6 +2100,16 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
     # 后端 pom 尚未建 + 前端 package.json；此时【绝不】按 npm 跳过 Maven 脚手架（否则后端 Java
     # 模块静默丢 pom = round62 家族级回归），回退 unknown→Maven（与今日行为一致，下游 R57-1 把关）。
     if _has_jvm_src:
+        # ★P-C1 自查★ 这条 unknown 与"零证据"那条**原因不同**，不许塌成同一个信号：
+        # 此处证据充足（异栈清单 + JVM 源码），是护栏**刻意**判的歧义混栈。用 `AMBIGUOUS`
+        # 前缀让调用方能分档告警——否则日志说"栈证据为空、请给 STACK_SPEC 加条目"，读者
+        # 会往 php/ruby 未收录栈方向找，而真因是"这个 plan 同时像两个栈"。
+        # 机读键 `stack_unknown_cause=ambiguous_mixed`（**本条独占**）：外层 WARNING 为并列
+        # 两因，散文里也会出现"歧义混栈"四字 ⇒ 按散文子串分不开两个信号（自查时被反向锁当场
+        # 抓到：那正是"假探针宽度"——子串匹配把"是哪条信号"这一维抹掉）。键只在这里出现。
+        logger.info("[SCAFFOLD-INJECT] G9 stack_unknown_cause=ambiguous_mixed：异栈清单证据 %s "
+                    "与 JVM 源码同时存在 → 保守回退 Maven（防后端模块静默丢 pom，round62 家族级回归）",
+                    sorted(seen))
         return "unknown"
     return sorted(seen)[0]
 
@@ -2135,7 +2157,25 @@ def _should_fabricate_maven_scaffold(
     ★局限（诚实记录）★：本判据是【整计划级】——零证据【新模块】落在 Maven 根工程里时无法逐模块
     辨栈，随根工程按 Maven 处理（无证据即随根约定，是合理默认；root pom 存在性由下游模板再把关）。"""
     stk = _detect_build_stack(plan, project_path, file_plan)
-    return (stk == "unknown" or stk in _AGGREGATOR_SCAFFOLD_STACKS), stk
+    _should = (stk == "unknown" or stk in _AGGREGATOR_SCAFFOLD_STACKS)
+    # ★P-C1 LOUD（血规 3：降级路径至少打一次 WARNING）★ `unknown → 伪造 Maven` 是**降级**，
+    # 治前全程零日志（`_detect_build_stack` 的 `return "unknown"` 注释写着"调用方 log"，而两个
+    # 调用点都没 log，`plan_finisher:583` 连栈值都丢弃 ⇒ 承诺没兑现，Django 工程被塞 pom 无声）。
+    # 打在本函数内而非各调用点＝"单一权威闸"名副其实，杜绝"补一个漏一个"（血规 10 第一条）。
+    # 已知栈（含新覆盖的 python 全套清单）走正常分派，不触发本告警。
+    if stk == "unknown":
+        # ★两因并列，不猜是哪个★ unknown 只有两个来源：①零清单证据（可能是 greenfield，也
+        # 可能是 php/ruby/csharp 等**未收录栈**——后者 pom 就是错产物）；②歧义混栈护栏刻意
+        # 判的（异栈清单 + JVM 源码并存）。②在 `_detect_build_stack` 里**自己打了一条 INFO**
+        # 说明真因，故读者按"上方有没有那条 G9 歧义混栈 INFO"即可分档。这里绝不替它断言是哪个。
+        logger.warning(
+            "[SCAFFOLD-INJECT] P-C1 栈判定为 unknown → 保守回退 Maven 脚手架（back-compat）。"
+            "两种可能：①零清单证据（greenfield 或**未收录栈**如 php/ruby/csharp——若是后者，"
+            "pom 是错产物，请给 STACK_SPEC 加条目或显式登记 unsupported，见 B-7 新栈准入闸）；"
+            "②护栏对【异栈清单 + JVM 源码并存】刻意回退（判别：上方应有一条带 "
+            "stack_unknown_cause 键的 G9 INFO，其取值说明真因）。project_path=%r",
+            project_path)
+    return _should, stk
 
 
 def _extract_auth_templates(desc: str) -> list[tuple[str, str]]:

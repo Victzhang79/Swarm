@@ -1228,10 +1228,15 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
     """
     import os as _os
 
-    from swarm.brain.contract_utils import _MANIFEST_TO_STACK, _root_gav
+    from swarm.brain.contract_utils import _root_gav
+    from swarm.stacks import root_manifests_by_stack
     if project_path:
         try:
-            _bstk = {stk for name, stk in _MANIFEST_TO_STACK.items()
+            # P-C1：原读 contract_utils 的手抄表 `_MANIFEST_TO_STACK`（已删，第二事实源）。
+            # 本闸是**栈识别**档（"基线根上有这个文件 ⇒ 是该栈工程"）⇒ 走 root_manifests。
+            # 覆盖面同步变宽：纯 pip/Pipfile 工程从此不再判 unknown 保守放行，而是认出 python
+            # → `_bstk={'python'}` 且无 maven ⇒ 裸奔闸正确跳过（plan 内 create-pom 留 VALIDATE 打回）。
+            _bstk = {stk for name, stk in root_manifests_by_stack()
                      if _os.path.exists(_os.path.join(project_path, name))}
         except (OSError, TypeError, ValueError) as _stk_exc:  # 与 _detect_build_stack 同型
             # 终扫 hunter M-2：降级必须可观测——探测失败按 unknown 保守放行但留痕

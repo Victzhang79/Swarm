@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from swarm.brain import contract_utils as cu
@@ -33,6 +35,7 @@ from swarm.stacks import (
     is_structural_build_manifest,
     module_manifests_of_stack,
     root_aggregate_manifests,
+    root_manifests_by_stack,
     spec_for_stack,
     structural_manifests,
     unregistered_aggregate_stacks,
@@ -438,25 +441,199 @@ def test_rule4_registers_by_plan_evidence_not_by_fabrication_gate():
     assert cu._detect_build_stack(plan, None) == "unknown"
 
 
-def test_detection_table_drift_is_accounted():
-    """`_detect_build_stack` 的 `_MANIFEST_TO_STACK` 与 `spec.root_manifests` 的差集必须**有账**。
+def test_detection_has_no_second_source_of_truth():
+    """★P-C1（B-6）★ 栈检测**不得**再有第二份清单表——差集不是"有账"，而是**不存在**。
 
-    ★复核 F-6★ 两表已漂移：python 的 `requirements.txt`/`setup.py` 在 spec 里、检测表里没有
-    → 只写 requirements.txt 的 python plan 判 unknown → R-3（多源码提难度）对 .py 无声失效。
-    **本批刻意不动检测表**：把它们加进去会让 `_should_fabricate_maven_scaffold` 对纯 python
-    仓从 True 翻成 False（后果档不同——那是"要不要伪造 pom"，不是"这是哪个栈"），属 B-6 范围。
-    本测试把这份差集**钉成显式清单**：将来任何一侧变动都会红，逼人当场决定而不是继续漂。
+    本测试的前身 `test_detection_table_drift_is_accounted` 把差集钉成冻结集合
+    `{requirements.txt, setup.py, Pipfile}`，并在 docstring 里显式交接："加进检测表会把
+    `_should_fabricate_maven_scaffold` 对纯 python 仓从 True 翻成 False……属 B-6 范围，
+    请按 B-6 的口径处置后再更新本断言"。B-6 已到，那次翻转**正是 P-C1 要的**——治前
+    Django/纯 pip 工程判 unknown → 被塞 `reporting/pom.xml` → pandas/celery 走 Maven
+    Central 查无 → 从契约永久剪除且每轮重解析仍是 Maven ⇒ 不可自愈。
+
+    故断言从"差集等于某集合"升级为"**手抄表已删**"：任何人重新引入本地清单表都会红。
     """
-    spec_names = {n for s in STACK_SPEC.values() for n in s.root_manifests}
-    missing = {n for n in spec_names if n.lower() not in cu._MANIFEST_TO_STACK_LC}
-    # `Pipfile` 于 2026-07-31（决定 2 合表）加入 spec.root_manifests——旧
-    # `integration_review` 的 if 链认它、spec 不认，合表当场炸出那处漂移（Pipfile 工程被误判
-    # `no_build_surface`＝"闸未实现"）。它与 requirements.txt/setup.py **同档处置**：
-    # 只进 spec、**不进检测表**（进检测表会把 `_should_fabricate_maven_scaffold` 对纯 python 仓
-    # 从 True 翻成 False，那是"要不要伪造 pom"的后果档，属 B-6 范围）。
-    assert missing == {"requirements.txt", "setup.py", "Pipfile"}, (
-        f"两表差集变了（实得 {sorted(missing)}）。加进检测表会改 pom 伪造闸的行为档，"
-        f"请按 B-6 的口径处置后再更新本断言，别默默改表。")
+    assert not hasattr(cu, "_MANIFEST_TO_STACK"), (
+        "`_MANIFEST_TO_STACK` 又出现了——栈识别的单一事实源是 stacks/spec.py:STACK_SPEC，"
+        "手抄第二份表必然漂移（P-C1 就是漂移的产物）。请走 root_manifests_by_stack() / "
+        "stack_of_manifest() / stack_of_structural_manifest()。")
+    assert not hasattr(cu, "_MANIFEST_TO_STACK_LC"), "同上（小写派生表亦不得复活）"
+
+
+@pytest.mark.parametrize("manifest,expect_stack", [
+    ("requirements.txt", "python"), ("setup.py", "python"), ("Pipfile", "python"),
+    ("pyproject.toml", "python"), ("pom.xml", "maven"), ("go.mod", "go"),
+    ("Cargo.toml", "cargo"), ("package.json", "npm"), ("settings.gradle.kts", "gradle"),
+])
+def test_every_spec_root_manifest_is_recognized_on_disk(tmp_path, manifest, expect_stack):
+    """★P-C1★ `spec.root_manifests` 里的**每一个**清单，磁盘上存在时都必须被认出该栈。
+
+    逐条 parametrize 而非集合断言＝每个清单单独承重（血规：夹具的多余成员会替被测代码背书；
+    一条 `for` 里任一命中即过的写法会让新漏的清单被其他清单兜住）。
+    `Gemfile`/`Pipfile` 是**大写**的 ⇒ 本测试同时锁住"磁盘探测走规范大小写"这一档
+    （小写化会让 Linux 上 `os.path.exists` 探不到，见 `root_manifests_by_stack` docstring）。
+    """
+    (tmp_path / manifest).write_text("", encoding="utf-8")
+
+    class _P:
+        subtasks: list = []
+
+    assert cu._detect_build_stack(_P(), str(tmp_path)) == expect_stack
+
+
+@pytest.mark.parametrize("manifest", ["requirements.txt", "setup.py", "Pipfile",
+                                      "pyproject.toml"])
+def test_pure_python_repo_is_never_given_fabricated_pom(tmp_path, manifest):
+    """★P-C1 病灶本体★ 纯 python 工程**绝不**被伪造 Maven 脚手架。
+
+    治前实测：`_should_fabricate_maven_scaffold=(True,'unknown')` → 注入 `reporting/pom.xml`
+    → `pandas`/`celery` 走 Maven Central 查无 → **从契约永久剪除**，且每轮重解析仍是 Maven
+    ⇒ 不可自愈（27 号文 P-C1 原文）。四种 python 清单逐条锁死。
+    """
+    (tmp_path / manifest).write_text("", encoding="utf-8")
+
+    class _P:
+        subtasks: list = []
+
+    should, stack = cu._should_fabricate_maven_scaffold(_P(), str(tmp_path))
+    assert stack == "python"
+    assert should is False, f"{manifest} 工程仍会被伪造 pom（P-C1 复发）"
+
+
+def test_root_manifests_by_stack_preserves_canonical_case():
+    """★P-C1 大小写档★ 磁盘探测视图必须返回**规范大小写**，不得小写化。
+
+    ★为什么不用"造 Pipfile 再探 pipfile"来测（harness 逮到的假绿）★ 本仓开发机是 macOS
+    (APFS **大小写不敏感**)，`os.path.exists('/tmp/x/pipfile')` 对 `Pipfile` 也返 True
+    ⇒ 那种夹具在本机对这一维**零区分力**，只在 Linux（生产/CI）才承重。测试的承重能力
+    随平台漂移＝本地永远看不出，是最坏的假绿形状。
+    故把不变量提到**平台无关**的层：本视图是纯函数，"不小写化"是它自己的属性。
+    真实后果（Linux 上）：小写化 ⇒ `Gemfile`/`Pipfile` 恒探不到 ⇒ 判 unknown ⇒ 塞 pom。
+    """
+    names = [n for n, _ in root_manifests_by_stack()]
+    _mixed = [n for n in names if n != n.lower()]
+    assert _mixed, ("spec 里已无任何含大写的根清单名——若确实如此，本测试失去意义；"
+                    "但 `Pipfile` 在表内，出现这条断言红说明它被小写化了")
+    assert "Pipfile" in names, "Pipfile 被小写化（Linux 上 os.path.exists 探不到）"
+
+
+def test_root_manifests_by_stack_covers_every_spec_entry():
+    """★P-C1★ 派生视图必须**逐条**覆盖 `spec.root_manifests`，一个不落。
+
+    与上一条配对：那条锁大小写，这条锁覆盖面。突变"只出 maven"必须在这里红——
+    否则"派生视图"这层可以整块残缺而只有下游行为测试报警（信号离病灶太远）。
+    """
+    expect = {(n, s.key) for s in STACK_SPEC.values() for n in s.root_manifests}
+    assert set(root_manifests_by_stack()) == expect
+
+
+@pytest.mark.parametrize("manifest", ["requirements.txt", "setup.py", "Pipfile"])
+def test_plan_path_root_only_manifest_is_python_evidence(manifest):
+    """★P-C1 第二个调用点（plan 路径档）★ plan 里**建** `requirements.txt` 也是 python 证据。
+
+    这三个清单没有"整段结构区"（不像 pom 的 `<modules>`），故**不在**结构档
+    `stack_of_structural_manifest`（实测该档对它们答 None，设计正确）。若只接结构档，
+    greenfield python 工程（磁盘上还没有任何清单、plan 里才建）仍会判 unknown → 塞 pom。
+    故本档是 `结构档 or root 档` 两问，本测试锁住那个 `or` 右侧。
+    """
+    plan = _plan(_st("st-1", create=[manifest, "svc/app.py"]))
+    assert cu._detect_build_stack(plan, None) == "python"
+    assert cu._should_fabricate_maven_scaffold(plan, None)[0] is False
+
+
+def test_pc1_bare_pom_gate_recognizes_python_baseline(tmp_path):
+    """★P-C1 第三个调用点★ `plan_finisher` 的 R67L-B3⑤ 裸奔闸也必须认全 python 清单。
+
+    这个消费者是**数调用点时逮到的**——它直接 `import _MANIFEST_TO_STACK` 自己探磁盘，
+    不走 `_detect_build_stack`，只看 `_detect_build_stack` 会整个漏掉它（血规 10 第一条：
+    加机制先数调用点，一个不落地列出来）。
+
+    行为：基线是纯 pip python 仓 + plan 里有 create-pom（LLM 幻觉）⇒ 认出 `{'python'}`
+    且无 maven ⇒ 闸**跳过注入**（返回 {}），把幻觉留给 VALIDATE 权威打回。治前判不出栈
+    ⇒ `_bstk=set()` ⇒ 按 unknown 保守放行 ⇒ 给幻觉 pom 注入裸奔断言＝为错产物背书。
+    """
+    from swarm.brain.plan_finisher import ensure_pom_create_min_acceptance as _gate
+
+    (tmp_path / "requirements.txt").write_text("django==5.0\n", encoding="utf-8")
+    plan = _plan(_st("st-1", create=["reporting/pom.xml"]))
+    assert _gate(plan, str(tmp_path)) == {}, \
+        "纯 python 基线仍给幻觉 pom 注入裸奔断言（P-C1 第三调用点未接）"
+
+
+def test_unknown_stack_fallback_is_loud(tmp_path, caplog):
+    """★P-C1 LOUD（血规 3）★ `unknown → 回退 Maven` 是降级，必须至少一次 WARNING。
+
+    治前全程零日志：`_detect_build_stack` 的 `return "unknown"` 注释写着"调用方 log"，而
+    两个调用点都没 log（`plan_finisher:583` 连栈值都丢弃 `_maven_scaffold_ok, _ =`）
+    ⇒ 承诺没兑现，php/ruby 工程被塞 pom **无声**。
+
+    告警打在 `_should_fabricate_maven_scaffold` **函数内**而非各调用点，故本测试同时是
+    "单一权威闸名副其实"的锁——新增调用点自动获得告警，不会"补一个漏一个"（血规 10 第一条）。
+    """
+    (tmp_path / "composer.json").write_text("{}", encoding="utf-8")   # php：整栈未收录
+
+    class _P:
+        subtasks: list = []
+
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.contract_utils"):
+        should, stack = cu._should_fabricate_maven_scaffold(_P(), str(tmp_path))
+    assert (should, stack) == (True, "unknown")      # 行为保持 back-compat
+    _warns = [r for r in caplog.records if r.levelno >= logging.WARNING
+              and "P-C1" in r.getMessage()]
+    assert _warns, "unknown 回退 Maven 无 WARNING（降级不可观测＝血规 3 违反）"
+
+
+def test_ambiguous_mixed_stack_unknown_is_distinguishable_from_no_evidence(caplog):
+    """★P-C1 自查整改★ 两种 unknown 必须**机读可辨**，不许塌成同一个信号。
+
+    `unknown` 只有两个来源：①零清单证据（greenfield 或未收录栈如 php/ruby）；②歧义混栈
+    护栏刻意回退（异栈清单 + JVM 源码并存，防 round62 家族级回归）。二者**处置完全不同**——
+    ①要么正常要么该给 STACK_SPEC 加条目，②是设计如此不需要动。
+
+    自查发现的问题：整改前那条 WARNING 单说"栈证据为空……请给 STACK_SPEC 加条目"，而混栈
+    这条路径证据其实**充足**（requirements.txt + .java 都在）⇒ 日志把读者指向 php/ruby
+    方向，真因却是"这个 plan 同时像两个栈"。现由 `_detect_build_stack` 对②自打一条 INFO。
+    """
+    plan = _plan(_st("st-1", create=["requirements.txt", "svc/src/main/java/A.java"]))
+    with caplog.at_level(logging.INFO, logger="swarm.brain.contract_utils"):
+        should, stack = cu._should_fabricate_maven_scaffold(plan, None)
+    # 行为不变：歧义混栈仍保守回退 Maven（round62 防线，绝不因 P-C1 松动）
+    assert (should, stack) == (True, "unknown")
+    # ★按**机读键**判而非散文子串★ 外层 WARNING 并列两因，散文里也含"歧义混栈"四字 ⇒ 子串
+    # 匹配把两个信号又混成一个（本测试第一版就这么写的，反向锁当场抓到＝假探针宽度）。
+    assert [r for r in caplog.records
+            if "stack_unknown_cause=ambiguous_mixed" in r.getMessage()], \
+        "歧义混栈回退没有自己的机读键 ⇒ 与'零证据'不可辨（血规 10 第四条）"
+
+
+def test_no_evidence_unknown_does_not_claim_mixed_stack(caplog):
+    """★反向锁★ 零证据那条**不得**打歧义混栈 INFO——否则该信号恒亮＝零信息量。
+
+    与上一条配对（always-emit 一族）：只验"混栈会打"会让"无条件打"的实现也全绿。
+    """
+    plan = _plan(_st("st-1", create=["README.md"]))       # 零清单、零 JVM 源
+    with caplog.at_level(logging.INFO, logger="swarm.brain.contract_utils"):
+        assert cu._should_fabricate_maven_scaffold(plan, None) == (True, "unknown")
+    assert not [r for r in caplog.records
+                if "stack_unknown_cause=ambiguous_mixed" in r.getMessage()], \
+        "零证据也带歧义混栈机读键（粘滞信号）"
+
+
+def test_known_stack_does_not_emit_unknown_warning(tmp_path, caplog):
+    """★反向锁★ 已知栈**不得**触发 P-C1 告警——否则告警变噪声，没人再读它。
+
+    与上一条配对：只验"unknown 会告警"会让"恒告警"的实现也全绿（粘滞告警＝等于没有告警，
+    复核盲区清单 always-emit 一族）。
+    """
+    (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
+
+    class _P:
+        subtasks: list = []
+
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.contract_utils"):
+        cu._should_fabricate_maven_scaffold(_P(), str(tmp_path))
+    assert not [r for r in caplog.records if "P-C1" in r.getMessage()], \
+        "Maven 工程也打 P-C1 降级告警（粘滞告警）"
 
 
 @pytest.mark.parametrize("manifest", sorted(structural_manifests()))

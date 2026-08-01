@@ -213,8 +213,10 @@ def test_go_no_root_gomod_skips_scaffold(tmp_path, monkeypatch):
 # ★"契约模块标签"这一列是复核 HIGH-2 的整改★ 原先所有行都写死标签 `mod-a`，而 python 行的
 # 目录是 `mod_a`（下划线）→ 标签对不上；更致命的是原 python 源码路径 `pkg/mod_a/__init__.py`
 # **无标准源码布局段** → `_module_physical_dirs` 恒返 `{}` → `injected==[]` 与栈路由**无关地
-# 恒成立**。实测：把 `pyproject.toml` 从 `_MANIFEST_TO_STACK` 摘掉（真实故障"根清单没接进
-# 路由表"）→ 纯 python 仓落进 `(True,'unknown')` Maven 兜底，而那一格照旧绿——正是该格
+# 恒成立**。实测：把 `pyproject.toml` 从栈识别表摘掉（真实故障"根清单没接进路由表"；当年是
+# `contract_utils._MANIFEST_TO_STACK`，P-C1 已删该第二事实源，现落点＝`stacks/spec.py` 的
+# `STACK_SPEC["python"].root_manifests`）→ 纯 python 仓落进 `(True,'unknown')` Maven 兜底，
+# 而那一格照旧绿——正是该格
 # 准入闸 docstring 逐字声称要防的事。对照组：摘 settings.gradle → 只有 gradle 格红；
 # 摘 Cargo.toml → 只有 cargo 格红。
 _DRIVER_MATRIX = [

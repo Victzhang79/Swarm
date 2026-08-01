@@ -245,6 +245,27 @@ def root_aggregate_manifests() -> frozenset[str]:
     return frozenset(out)
 
 
+def root_manifests_by_stack() -> tuple[tuple[str, str], ...]:
+    """全部已收录的**根清单** → [(规范大小写清单名, 栈键)]（确定性序：栈键序 + 表内序）。
+
+    ★消费契约＝"磁盘上有这个文件 ⇒ 这是该栈的工程"（栈**识别**档）★ 与
+    `root_aggregate_manifests`（聚合单写者档）、`structural_manifests`（demote 收敛档）
+    **后果不同**，别互换：本档判错 = 栈识别错（P-C1 病灶：判 unknown → 兜底伪造 Maven）。
+
+    ★为什么返回规范大小写★ 唯一消费场景是 `os.path.exists` 探测，而 Linux 大小写敏感，
+    `Gemfile`/`Pipfile` 小写化后探不到。plan 路径匹配请走 `stack_of_manifest`（内部
+    `_plan_basename` 小写化，因为"LLM 写的路径大小写不可信"）——两档口径刻意不同。
+
+    ★为什么是函数不是模块常量★ 与 `is_root_aggregate_manifest` 同款理由（复核 F-7）：
+    冻结成 import 期常量会让"新增一栈只需加一条表项"的承诺在消费侧失效。
+    """
+    out: list[tuple[str, str]] = []
+    for key in sorted(STACK_SPEC):
+        for name in STACK_SPEC[key].root_manifests:
+            out.append((name, key))
+    return tuple(out)
+
+
 def _plan_basename(path: str) -> str:
     """plan 路径 → **小写** basename。
 

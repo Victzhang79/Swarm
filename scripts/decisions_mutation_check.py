@@ -45,9 +45,14 @@ MUTATIONS = [
         ['test_d2_table_gap_is_observable'],
     ),
     (
+        # ★落点于 2026-08-01（P-C1 批复跑）修正★ 原打 `project/sandbox_spec.py` 的 `_SKIP_DIRS`
+        # 字面。N-2b/N-3 批（c2941b2）把依赖树那半提到 `stacks.DEPENDENCY_TREE_DIRS` 单独命名
+        # （消费契约分档），该字面随之搬家 ⇒ 本条落点失效、报"落点未命中"。
+        # ★这正是"改共享代码必复跑兄弟 harness"要抓的东西——而上批收尾我报"六 harness 全锁"
+        # 时没核到这一条（自伤守卫尽责了，是我漏读）。落点跟着单一事实源走。
         '决定 4：依赖树目录不再进 _SKIP_DIRS（node_modules/vendor 里的清单又算构建入口）',
-        SBX,
-        '    "third_party", "third-party", "3rdparty", ".yarn", ".pnpm-store",',
+        SPEC,
+        '    "node_modules", "vendor", "third_party", "third-party", "3rdparty",',
         '',
         ['test_d4_dependency_tree_manifests_are_not_build_entrypoints'],
     ),
