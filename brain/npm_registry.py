@@ -152,6 +152,127 @@ def registry_latest_version(pkg: str, project_path: str | None = None) -> str | 
     return None
 
 
+def registry_all_versions(pkg: str) -> frozenset[str] | None:
+    """该包 registry 上**全部**已发布版本号（含预发布）。
+
+    ★返回值三态，调用方必须分辨（P-C2 的核心）★
+      · `frozenset(...)` 非空 —— 拿到权威版本集，可据此判"某区间是否可满足"；
+      · `None` —— registry **不可达**（离线/超时/包不存在都归此），**证据缺失≠否定证据**
+        （R56-6）⇒ 调用方必须 fail-open 保留 LLM 主张 + 留痕，绝不据此判幻觉；
+      · `frozenset()` 空集 —— 拿到文档但 `versions` 字段为空/畸形，同样按不可达处置
+        （已在下方归一成 None，不让"空"与"真没有"塌成一个值）。
+
+    与 `registry_latest_version` 刻意分开：那个答"该写哪个版本"（只要稳定版），本函数答
+    "这个版本存在过吗"（**必须含预发布**——LLM 写 `1.2.3-rc.1` 时它确实存在，不该判幻觉；
+    我们不主动注入预发布是另一档决定，见模块 docstring）。
+    """
+    if not _lookup_enabled():
+        return None
+    encoded = _encode_pkg(pkg)
+    for tpl in _REGISTRY_MIRRORS:
+        raw = _http_get(tpl.format(pkg=encoded))
+        if not raw:
+            continue
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        versions = doc.get("versions")
+        if isinstance(versions, dict) and versions:
+            return frozenset(v for v in versions if isinstance(v, str) and v)
+    return None
+
+
+# ── 显式区间的可满足性判定（P-C2：R67L-B3 口径平移） ────────────────────────
+# ★不判的形态（Maven 侧 `${...}` 属性引用的对应物）★ 这些不是"版本主张"，是**协议/别名**，
+# 拿版本集去判它们只会误杀：workspace 协议、本地路径、git/tarball URL、npm 别名、
+# GitHub 简写、Yarn 的 portal/patch 协议。
+_NON_REGISTRY_PROTOCOLS = ("workspace:", "file:", "link:", "git+", "git:", "http://",
+                           "https://", "npm:", "github:", "portal:", "patch:")
+# dist-tag 与通配：语法合法但**不可复现**（模块 docstring 明列 `latest` 为要治的病之一）。
+_DIST_TAGS = ("latest", "next", "*", "x", "canary", "beta", "alpha", "rc")
+# 我们**有能力**判定的简单区间形态。复合区间（`||`、`<`、连字符区间、空格并列）交给
+# "不判"分支——无 semver 库时猜语义的风险是**误杀真依赖**，比放过一个幻觉更坏。
+_SIMPLE_RANGE = re.compile(r"^(\^|~|>=|=|>|v)?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?"
+                           r"(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
+
+
+def _range_kind(spec: str) -> str:
+    """显式 spec 的可判性分类 → `protocol` | `dist_tag` | `simple` | `complex`。"""
+    s = (spec or "").strip()
+    if not s:
+        return "dist_tag"
+    low = s.lower()
+    if low.startswith(_NON_REGISTRY_PROTOCOLS):
+        return "protocol"
+    if low in _DIST_TAGS:
+        return "dist_tag"
+    return "simple" if _SIMPLE_RANGE.match(s) else "complex"
+
+
+def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
+    """简单区间 `spec` 是否被 `versions` 里任一已发布版本满足。
+
+    ★只在 `_range_kind == "simple"` 时调用★ 语义按 npm semver：
+      · 无前缀 / `=` / `v` → **精确**匹配（`1.2.3` 必须真有 1.2.3）；缺位补零式前缀匹配
+        （`1.2` 视作 `1.2.x`，`1` 视作 `1.x` —— npm 对 `1.2` 的语义正是 `>=1.2.0 <1.3.0`）；
+      · `^` → 同 major 且 ≥ floor；**major 0 特例**：`^0.2.3` 是 `>=0.2.3 <0.3.0`（semver
+        规定 0.x 的次版本视作破坏性），故要求同 major.minor；`^0.0.3` 要求精确 0.0.3；
+      · `~` → 同 major.minor 且 ≥ floor（`~1.2` = `>=1.2.0 <1.3.0`，退化为同 major.minor）；
+      · `>=` / `>` → ≥（>）floor 即可。
+
+    ★诚实边界：预发布尾段不参与比较★ 复用 `_SEMVER_CORE` 只取三元组，故 `1.2.3-rc.1` 与
+    `1.2.3` 在本函数眼里同值。三种越界都朝**判可满足**（不判幻觉）倾斜：LLM 写
+    `1.2.3-rc.1` 而仓库只有 `1.2.3`、写 `^1.2.3` 而仓库只有 `1.2.4-rc.1`（npm 的 caret
+    实际不匹配预发布）等。**方向是刻意的**——本函数的返回值只用来"判是否幻觉"，假阴性
+    （漏判一个幻觉）由执行期 L1 dep-legality 兜底，假阳性（误杀真依赖）无人兜底。真要收紧
+    得引入完整 semver 比较，那是另一档决定，别顺手把这里改严。
+    """
+    m = _SIMPLE_RANGE.match((spec or "").strip())
+    if not m:
+        return True                      # 防御：非简单形态不该走到这里，宁可放行不误杀
+    op = (m.group(1) or "").strip()
+    maj, mnr, pat = m.group(2), m.group(3), m.group(4)
+    floor = (int(maj), int(mnr or 0), int(pat or 0))
+    for v in versions:
+        vm = _SEMVER_CORE.match(v.strip())
+        if not vm:
+            continue
+        cur = tuple(int(g) if g and g.isdigit() else 0 for g in vm.groups())
+        if op in ("", "=", "v"):
+            # 缺位 = 前缀区间；写全 x.y.z = 精确（按 semver 三元组比，忽略 build 元数据 `+…`）
+            if pat is not None:
+                if cur == floor:                       # `1.2.3` = 精确
+                    return True
+            elif mnr is not None:
+                if cur[0] == floor[0] and cur[1] == floor[1]:   # `1.2` = `1.2.x`
+                    return True
+            elif cur[0] == floor[0]:                   # `1` = `1.x`
+                return True
+        elif op == "^":
+            if floor[0] == 0:
+                # 0.x：次版本即破坏性；0.0.z 更严（精确）
+                if floor[1] == 0:
+                    if cur == floor:
+                        return True
+                elif cur[0] == 0 and cur[1] == floor[1] and cur >= floor:
+                    return True
+            elif cur[0] == floor[0] and cur >= floor:
+                return True
+        elif op == "~":
+            if cur[0] == floor[0] and cur[1] == floor[1] and cur >= floor:
+                return True
+        elif op == ">=":
+            if cur >= floor:
+                return True
+        elif op == ">":
+            if cur > floor:
+                return True
+    return False
+
+
 # ── 对外主入口 ──────────────────────────────────────────────────────────────
 @dataclass
 class ResolvedNpmDep:
@@ -185,7 +306,11 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
 
     判定序（每步都有权威证据，无一步靠猜）：
       1. 内部 workspace 包（name ∈ internal_names）→ `workspace:*`（零网络，兄弟包不在 registry）。
-      2. 显式 `name@range` → 直采该 range（LLM/契约已给定，尊重之）。
+      2. 显式 `name@range` → **按 P-C2 验证后**采用（旧行为"直采/尊重之"已废，见下）：
+         · dist-tag/通配（`latest`/`*`）→ 解析成具体稳定版（不可复现是模块要治的病）；
+         · 协议/别名（`workspace:` `file:` `git+` `npm:` …）/ 复合区间 → **不判**，原样保留；
+         · 简单区间 → 取全量版本集判可满足性：不可满足＝确证幻觉 → 校正/如实丢弃；
+           registry 不可达 → **fail-open 保留**（R56-6 证据缺失≠否定证据）。
       3. 裸名 → 本地 node_modules 版本 → registry 最新稳定版 → 加 `^` 前缀。查不到 → drop。
     """
     internal = internal_names or set()
@@ -202,6 +327,60 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
             kept.append(ResolvedNpmDep(name=name, spec="workspace:*", source="workspace"))
             continue
         if explicit:
+            # ★P-C2（27 号文 §3.1）：R67L-B3 口径平移★ 旧实现一句"契约已给定，尊重之"直采，
+            # 零验证 ⇒ `axios@^99.0.0` / `lodash@nonsense` 原样烤进**权威 package.json 模板**
+            # 要 worker"原样写入"，而模板即真值 worker 无权改 → `npm install` 整包装不上。
+            # **规划期自己在猜坐标 = 正面违反血规 2**。Maven 侧 R67L-B3 早已定论"显式版本是
+            # 待验证的主张，绝非证据"，此处补齐。
+            _kind = _range_kind(explicit)
+            if _kind == "dist_tag":
+                # `latest`/`*`/`next`＝语法合法但**不可复现**（模块 docstring 明列为要治的病）。
+                # 它不需要全量版本集——直接解析具体版本即可；解析不到则保留原样（不可达时
+                # 丢弃才是误杀，而我们没有能力把它变成可复现的东西，如实留痕）。
+                _lv = registry_latest_version(name, project_path)
+                seen.add(name)
+                if _lv:
+                    logger.warning("[npm-registry] P-C2 %s@%s 是不可复现的 dist-tag/通配 → "
+                                   "解析到具体最新稳定版 ^%s（LLM 声明非证据）", name, explicit, _lv)
+                    kept.append(ResolvedNpmDep(name=name, spec=f"^{_lv}", source="registry"))
+                else:
+                    logger.warning("[npm-registry] P-C2 %s@%s 是不可复现的 dist-tag/通配，但"
+                                   "registry 不可达无法解析成具体版本 → fail-open 保留原样"
+                                   "（执行期 L1 合法性闸兜底）", name, explicit)
+                    kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                continue
+            if _kind in ("protocol", "complex"):
+                # 不判（Maven `${...}` 的对应物）：协议/别名不是版本主张；复合区间无 semver 库
+                # 判不准，**猜语义的风险是误杀真依赖**，比放过一个幻觉更坏（fail-open 但留痕）。
+                logger.info("[npm-registry] P-C2 %s@%s 属【%s】形态，不做可满足性判定"
+                            "（保留原样；执行期 L1 dep-legality 兜底）", name, explicit, _kind)
+                seen.add(name)
+                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                continue
+            _vers = registry_all_versions(name)
+            if _vers is None:
+                # registry 不可达 → fail-open 保留（R56-6 证据缺失≠否定证据），必须留痕。
+                logger.warning("[npm-registry] P-C2 %s@%s 未经证实（registry 不可达/包查不到）"
+                               " → fail-open 保留 LLM 主张（执行期 L1 合法性闸兜底）",
+                               name, explicit)
+                seen.add(name)
+                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                continue
+            if not _range_is_satisfiable(explicit, _vers):
+                # 区间不可满足＝**确证幻觉**（版本集是权威证据，已排除不可达）。
+                _why = "仓库确证无任何版本可满足"
+                _latest = registry_latest_version(name, project_path)
+                if _latest:
+                    logger.warning("[npm-registry] P-C2 %s@%s %s → 校正到最新稳定版 ^%s"
+                                   "（LLM 声明非证据）", name, explicit, _why, _latest)
+                    seen.add(name)
+                    kept.append(ResolvedNpmDep(name=name, spec=f"^{_latest}", source="registry"))
+                else:
+                    logger.warning("[npm-registry] P-C2 %s@%s %s 且无可用稳定版 → 如实丢弃"
+                                   "（绝不逼 worker 臆造；调用方须同时从验收剔除）",
+                                   name, explicit, _why)
+                    dropped.append(str(raw).strip())
+                continue
             seen.add(name)
             kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
             continue

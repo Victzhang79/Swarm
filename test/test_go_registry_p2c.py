@@ -18,8 +18,10 @@ def _clear(monkeypatch):
     monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
     monkeypatch.setenv("GOPATH", "/nonexistent-gopath-for-tests")  # 本地 cache 恒空
     gr._http_cache.clear()
+    gr._probe_cache.clear()   # P-C2 新缓存：不清会把上一条的探测三态漏给下一条
     yield
     gr._http_cache.clear()
+    gr._probe_cache.clear()
 
 
 def _latest(ver):
@@ -134,14 +136,37 @@ def test_resolve_internal_never_hits_proxy(monkeypatch):
     assert internal == ["example.com/app/shared"]
 
 
-def test_resolve_explicit_version_respected(monkeypatch):
+def test_resolve_explicit_version_kept_after_verification(monkeypatch):
+    """显式版本**经 proxy 证实存在**后原样保留（版本与 source 都不动）。
+
+    ★契约已随 P-C2 变更★ 本测试原名 `..._respected`、前提是"显式版本无需查 proxy，直采"，
+    那正是 P-C2（27 号文 §3.1）作废的东西：显式版本是**待验证的主张**，绝非证据（R67L-B3
+    口径平移）。此处保住的残值是"证实之后不篡改"——只验证、不多事。
+    误杀/幻觉/不可达三个方向在 test_pc2_explicit_version_is_a_claim.py 里。
+    """
+    monkeypatch.setattr(gr, "_http_probe", lambda url: True)
+
     def boom(url):
-        raise AssertionError("显式版本无需查 proxy")
+        raise AssertionError("存在性已由 probe 答出，不该再走 /@latest 文本取值")
 
     monkeypatch.setattr(gr, "_http_get", boom)
     kept, internal, dropped = gr.resolve_go_deps(["github.com/x/y@v1.2.3"])
     assert kept[0].module == "github.com/x/y" and kept[0].version == "v1.2.3"
     assert kept[0].source == "explicit"
+    assert dropped == []
+
+
+def test_resolve_explicit_version_never_probes_when_lookup_disabled(monkeypatch):
+    """开关关闭 = 全线不联网，显式版本 fail-open 原样保留（离线绝不批量误杀）。"""
+    monkeypatch.setenv("SWARM_GO_LOOKUP", "0")
+
+    def boom(*a, **kw):
+        raise AssertionError("SWARM_GO_LOOKUP=0 时绝不联网")
+
+    monkeypatch.setattr(gr.urllib.request, "urlopen", boom)
+    kept, internal, dropped = gr.resolve_go_deps(["github.com/x/y@v1.2.3"])
+    assert kept[0].version == "v1.2.3" and kept[0].source == "explicit"
+    assert dropped == []
 
 
 def test_resolve_bare_third_party(monkeypatch):

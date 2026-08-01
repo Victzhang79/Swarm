@@ -146,14 +146,33 @@ def test_resolve_internal_workspace_never_hits_registry(monkeypatch):
     assert kept[0].source == "workspace"
 
 
-def test_resolve_explicit_range_respected(monkeypatch):
-    def boom(url):
-        raise AssertionError("显式 range 无需查 registry")
+def test_resolve_explicit_range_kept_after_verification(monkeypatch):
+    """显式 range **经 registry 证实可满足**后原样保留（range 文本与 source 都不动）。
 
-    monkeypatch.setattr(nr, "_http_get", boom)
+    ★契约已随 P-C2 变更★ 本测试原名 `..._respected`、前提是"显式 range 无需查 registry，
+    直采"，那正是 P-C2（27 号文 §3.1）作废的东西：显式版本是**待验证的主张**，绝非证据
+    （R67L-B3 口径平移）。此处保住的残值是"证实之后不篡改"——`^1.6.0` 不会被换成 `^1.7.2`。
+    误杀/幻觉/不可达三个方向在 test_pc2_explicit_version_is_a_claim.py 里。
+    """
+    monkeypatch.setattr(nr, "_http_get",
+                        lambda url: _mk_registry_doc(latest="1.7.2",
+                                                     versions=["1.5.0", "1.6.0", "1.6.8"]))
     kept, dropped = nr.resolve_npm_deps(None, ["axios@^1.6.0"])
     assert dropped == []
     assert kept[0].name == "axios" and kept[0].spec == "^1.6.0" and kept[0].source == "explicit"
+
+
+def test_resolve_explicit_range_never_queries_when_lookup_disabled(monkeypatch):
+    """开关关闭 = 全线不联网，显式 range fail-open 原样保留（离线绝不批量误杀）。"""
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "0")
+
+    def boom(*a, **kw):
+        raise AssertionError("SWARM_NPM_LOOKUP=0 时绝不联网")
+
+    monkeypatch.setattr(nr.urllib.request, "urlopen", boom)
+    kept, dropped = nr.resolve_npm_deps(None, ["axios@^1.6.0"])
+    assert dropped == []
+    assert kept[0].spec == "^1.6.0" and kept[0].source == "explicit"
 
 
 def test_resolve_bare_third_party_caret_prefixed(monkeypatch):
