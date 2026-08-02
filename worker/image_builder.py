@@ -292,8 +292,24 @@ class SSHRunner:
 # ──────────────────────────────────────────────
 class _StackEntry(NamedTuple):
     """一个 (name, build_tool) 组合的**全部**构建期事实。单一事实源。"""
-    apt_packages: tuple[str, ...]      # 该组合必须在镜像里在场的工具（apt 包名/可执行名）
+    verify_cmd: str                    # 构建期【在场硬闸】：装完必须跑得通，失败＝镜像构建失败
     selftest: str | None               # 构建期离线自测命令（None=暂无，不阻断发布）
+
+
+# ★27 号文 #8（apt_packages 半）★ 这一列原名 `apt_packages`，语义是"该组合必须在镜像里在场
+# 的工具"，**唯一消费者是一条子串断言**（test_image_builder.py：`tool in effective`）。实测那条
+# 断言在 6 个组合里有 2 个是**必然假过**、1 个是侥幸：
+#   · go   声明 `/usr/local/go`，非注释行里唯一命中是 `ENV PATH="/usr/local/go/bin:…"`
+#          ⇒ 把整条 `RUN curl … | tar -C /usr/local -xz` 安装删掉，断言照旧绿。
+#   · gradle 声明 `gradle`，命中 6 行，5 行是顺带的（`/root/.gradle`、`/tmp/gradle.zip`、
+#          `init.gradle`）⇒ 删掉真安装仍剩 5 行命中。
+#   · rust 声明 `rustup`，唯一命中行**同时**含 URL `sh.rustup.rs` 和执行 `| sh -s -- -y`；
+#          整行删才红（侥幸同行），只删执行、留 URL ⇒ 照旧绿。
+# 病根是"声明在场"和"验证在场"用了两种**不同强度**的语言：声明是数据，验证只是让文本里出现
+# 一个子串——而子串在 ENV/URL/路径里到处都是。gradle 分支早已给出正确形状：`RUN gradle -v`
+# 是**构建期硬闸**（无 `|| true`），装不上当场构建失败，把"装没装上"从运行时 127 提前到构建期。
+# 故本列改为 `verify_cmd` 并对 6 个组合一律接上该形状：声明本身就是可执行的验证，
+# 不再需要（也不再可能有）一条替它背书的子串断言。全部命令都是本地 `-v/--version`，不联网。
 
 
 # ★X-C2 复核 H-4 的治法★ 安装片段与自测命令原先是**两张各自手写的分派**：
@@ -303,28 +319,33 @@ class _StackEntry(NamedTuple):
 # 两个函数都从这里取，物理上不可能再分叉。加新栈/新 build_tool 只能改这一处。
 _STACK_REGISTRY: dict[tuple[str, str], _StackEntry] = {
     ("java", "maven"): _StackEntry(
-        ("maven",),
+        "mvn -v",
         "cd /workspace && mvn -o -B -q -Dmaven.test.skip=true compile"),
     ("java", "gradle"): _StackEntry(
         # ★复核 H-3★ 不用 apt 的 gradle：Debian 稳定版常年是 4.x，跑不了 Java 17
         # （`Unsupported class file major version` / `Could not determine java version`），
         # 属"装了但不可用"。照 go 分支的成例钉发行版下载（可复现、版本自主）。
-        ("gradle",),
+        # `gradle -v` 同时验"在场"与"能跑起来"（4.x + Java 17 会在这里就炸，正是要的）。
+        "gradle -v",
         # #37：`classes` 编译主源集全部 JVM 语言（Kotlin/Scala/Groovy/Java），是 compileJava
         # 的严格超集。wrapper 优先——但 wrapper **必须真能跑**，见 `_SRC_KEEP_JAR_SUFFIXES`。
         "cd /workspace && ((test -x ./gradlew && ./gradlew --offline --no-daemon classes -q) "
         "|| (gradle --offline --no-daemon classes -q))"),
     ("node", "npm"): _StackEntry(
-        ("nodejs",),
+        # npm 与 nodejs 同包但**分别**可执行；自测发的是 `npm`，故验 npm 而非 node。
+        "node -v && npm -v",
         "cd /workspace && (npm run build --if-present || npm ci --offline || true)"),
     ("python", "pip"): _StackEntry(
-        ("python3",), "cd /workspace && python3 -m compileall -q ."),
+        "python3 -V && python3 -m pip --version",
+        "cd /workspace && python3 -m compileall -q ."),
     ("go", "go"): _StackEntry(
-        ("/usr/local/go",),
+        # 原声明是路径 `/usr/local/go`（apt 包名意义上根本不存在），验的是**可执行**。
+        "go version",
         "(command -v goimports >/dev/null 2>&1 && echo 'goimports: present' "
         "|| echo 'goimports: MISSING') && cd /workspace && go build ./... 2>&1 | head -40"),
     ("rust", "cargo"): _StackEntry(
-        ("rustup",),
+        # 原声明 `rustup`，但下游自测/修复用的是 `cargo`；验真正被用的那个。
+        "cargo --version && rustc --version",
         "(cargo fix --help >/dev/null 2>&1 && echo 'cargo fix: present' "
         "|| echo 'cargo fix: MISSING') && cd /workspace && cargo build --offline 2>&1 | head -40"),
 }
@@ -354,6 +375,21 @@ def stack_entry(name: str, build_tool: str | None) -> _StackEntry | None:
                                 str(build_tool or "").strip().lower()))
 
 
+def _verify_block(name: str, build_tool: str) -> str:
+    """(name, build_tool) → 构建期在场硬闸的 Dockerfile 片段。未收录返 ""（fail-honest）。
+
+    ★为什么注入点在 `_toolchain_install` 内部、而不是 `generate_dockerfile` 外面★
+    java 的"装 maven 还是 gradle 还是都装"这个决策只在 `_toolchain_install` 里（`_want_maven`
+    /`_want_gradle`，build_tool 缺失时**两个都装**）。放外面就得把同一个决策抄第二遍 ⇒
+    正是本文件 X-C2 在治的"同一件事两张表"。故由持有决策的那一处顺手接上。
+    """
+    e = stack_entry(name, build_tool)
+    if e is None or not e.verify_cmd:
+        return ""
+    # 无 `|| true`：这是硬闸。装不上就让镜像构建当场失败，而不是等运行时 127 → BLOCKED 死循环。
+    return f"RUN {e.verify_cmd}\n"
+
+
 def _toolchain_install(tc: Toolchain) -> str:
     """单工具链的 apt/安装 Dockerfile 片段。
 
@@ -377,6 +413,9 @@ def _toolchain_install(tc: Toolchain) -> str:
             f"ENV JAVA_HOME=/usr/lib/jvm/java-{ver}-openjdk-amd64\n"
             f'ENV PATH="${{JAVA_HOME}}/bin:${{PATH}}"\n'
         )
+        if _want_maven:
+            # JAVA_HOME/PATH 已在上面写好 ⇒ `mvn -v` 此刻可跑（它要 JAVA_HOME）。
+            out += _verify_block("java", "maven")
         if _want_gradle:
             # ★复核 H-3★ **不用 apt 的 gradle**：Debian 稳定版常年 4.x，在 Java 17 下跑不起来
             # （`Unsupported class file major version` / `Could not determine java version`）＝
@@ -397,12 +436,14 @@ def _toolchain_install(tc: Toolchain) -> str:
                 "&& rm -rf /var/lib/apt/lists/*\n"
                 "RUN mkdir -p /root/.gradle\n"
                 "COPY warmup/init.gradle /root/.gradle/init.gradle\n"
-                # ★复核 MED-3★ 构建期**硬闸**：下载源双双失败/解包出半截文件时，前面那串
-                # `curl … || curl …` 之后的 unzip 会拿着一个空文件继续，而镜像照样发布成功
-                # ⇒ 运行时才 127，回到本批要治的死循环。`gradle -v` 失败即构建失败（无 `|| true`），
-                # 把"装没装上"从运行时提前到构建期。
-                "RUN gradle -v\n"
             )
+            # ★复核 MED-3★ 构建期**硬闸**：下载源双双失败/解包出半截文件时，前面那串
+            # `curl … || curl …` 之后的 unzip 会拿着一个空文件继续，而镜像照样发布成功
+            # ⇒ 运行时才 127，回到本批要治的死循环。失败即构建失败（无 `|| true`），
+            # 把"装没装上"从运行时提前到构建期。
+            # ★#8★ 这一行原是**字面**写在这里的 `RUN gradle -v`——即"正确形状只有 gradle 有"。
+            # 现在改从 registry 取：6 个组合共用同一形状，加新栈时不写 verify_cmd 会被闸拦下。
+            out += _verify_block("java", "gradle")
         return out
     if tc.name == "node":
         ver = tc.version or _NODE_DEFAULT
@@ -411,11 +452,13 @@ def _toolchain_install(tc: Toolchain) -> str:
             f"&& curl -fsSL https://deb.nodesource.com/setup_{ver}.x | bash - "
             f"&& apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*\n"
             f"RUN npm config set registry https://registry.npmmirror.com\n"
+            + _verify_block("node", "npm")
         )
     if tc.name == "python":
         return (
             "RUN apt-get update && apt-get install -y --no-install-recommends "
             "python3 python3-pip ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+            + _verify_block("python", "pip")
         )
     if tc.name == "go":
         return (
@@ -430,7 +473,11 @@ def _toolchain_install(tc: Toolchain) -> str:
             # 确定性修复工具：goimports（Go 事实标准 import autofix，L1 _repair_go 用）。
             # GOBIN=/usr/local/bin 落在每个非登录 shell 的 PATH 上（sandbox.commands.run 不读 profile）。
             # 钉版本可复现；|| true 让构建期偶发拉取失败不阻断镜像（repair 缺工具会优雅跳过）。
-            "RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@v0.24.0 || true\n"
+            # ★#8★ 在场硬闸放在 goimports 之前：goimports 那行**刻意**带 `|| true`（缺它
+            # repair 会优雅跳过，不该阻断镜像），而 go 本体缺失是死循环级故障，必须硬失败。
+            # 这也是"复用单一事实源 ≠ 复用其消费契约"——同一条 RUN 序列上两种后果分档。
+            + _verify_block("go", "go")
+            + "RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@v0.24.0 || true\n"
         )
     if tc.name == "rust":
         return (
@@ -438,6 +485,8 @@ def _toolchain_install(tc: Toolchain) -> str:
             "build-essential && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y "
             "&& rm -rf /var/lib/apt/lists/*\n"
             'ENV PATH="/root/.cargo/bin:${PATH}"\n'
+            # PATH 已含 /root/.cargo/bin ⇒ 此刻 cargo 可寻址（rustup 安装脚本静默失败时正是这里红）。
+            + _verify_block("rust", "cargo")
         )
     return f"# (未知工具链 {tc.name}，跳过)\n"
 
@@ -968,7 +1017,8 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "8"  # v8: X-C2——java 按 build_tool 装(Gradle 工程原先镜像里没 gradle→127 死循环)+钉 gradle 发行版+init.gradle 镜像源+gradle warmup；wrapper jar 不再被 tarball 剥掉(./gradlew/./mvnw 原必 ClassNotFound)；强制重建所有专属镜像
+_BUILDER_VERSION = "9"  # v9: 27 号文 #8——在场硬闸从「只有 gradle 有的一行字面量」推广到全部 6 个 (name,build_tool)（apt_packages 子串断言实测 2 条必然假过：go 只命中 ENV PATH、gradle 5/6 行是顺带命中）；Dockerfile 每个栈多一条 `RUN <verify>` ⇒ 生成物变了必须递增，否则复用老镜像=修复不落地
+# v8: X-C2——java 按 build_tool 装(Gradle 工程原先镜像里没 gradle→127 死循环)+钉 gradle 发行版+init.gradle 镜像源+gradle warmup；wrapper jar 不再被 tarball 剥掉(./gradlew/./mvnw 原必 ClassNotFound)；强制重建所有专属镜像
 #                       v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像
 #                       v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像
 #                              （CubeEgress MITM 出网信任）+ --allow-internet-access。0.3.x 旧模板

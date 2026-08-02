@@ -119,10 +119,13 @@ MUTATIONS = [
         ["test_wrapper_jars_survive_source_tarball"],
     ),
     (
+        # ★#8 落点迁移★ 原落点是**字面** `"RUN gradle -v\n"`；#8 把在场硬闸从"只有 gradle 有
+        # 的一行字面量"推广成 registry 驱动的 `_verify_block`，故落点改为拧那次调用。
+        # 语义不变：拧掉后 gradle 分支不再产出构建期硬闸。
         "MED-3: 去掉构建期 `gradle -v` 硬闸（下载失败仍发布 → 运行时才 127）",
         IMG,
-        '"RUN gradle -v\\n"',
-        '                "# no build-time gradle check\\n"',
+        '            out += _verify_block("java", "gradle")',
+        '            out += ""  # no build-time gradle check',
         ["test_gradle_build_time_verification"],
     ),
     (

@@ -298,10 +298,25 @@ def test_selftest_and_install_read_the_same_registry():
                               if ln.strip() and not ln.lstrip().startswith("#"))
         assert any(ln.startswith(("RUN ", "ENV ", "COPY ")) for ln in effective.splitlines()), (
             f"({name},{bt}) 安装片段没有任何 RUN/ENV/COPY 指令 ⇒ 什么都没装")
-        for tool in entry.apt_packages:
-            assert tool in effective, (
-                f"({name},{bt}) registry 声明必须在场 {tool!r}，但安装片段的**非注释行**里没有 ⇒ "
-                f"命令必 127 → BLOCKED 死循环（X-C2 同型）")
+        # ★27 号文 #8★ 这里原是 `for tool in entry.apt_packages: assert tool in effective`，
+        # 实测 6 个组合里 2 条**必然假过**、1 条侥幸（详见 image_builder.py `_StackEntry` 上方）：
+        # go 声明 `/usr/local/go` 而唯一命中是 `ENV PATH=…/usr/local/go/bin…`（删掉整条
+        # `curl|tar` 安装照旧绿）；gradle 声明 `gradle` 命中 6 行、5 行是 `/root/.gradle`
+        # 之类顺带命中。病根：声明是数据，而"验证"只是让文本里出现一个子串，子串到处都是。
+        # 改为断言 registry 的 `verify_cmd` 作为**构建期硬闸**真被接上。
+        # ★这条测试证的是"接线"，不是"工具真装上了"★——后者由镜像构建时 docker 跑这条
+        # `RUN` 来证（装不上即构建失败）。区分力：把任一 `_verify_block(...)` 调用拧掉，
+        # 该栈这条立刻红（原断言拧掉真安装都不红）。
+        assert entry.verify_cmd, (
+            f"({name},{bt}) registry 没写 verify_cmd ⇒ 该栈没有构建期在场硬闸 ⇒ "
+            f"装不上要等到运行时 127 → BLOCKED 死循环（X-C2 同型）")
+        assert f"RUN {entry.verify_cmd}" in install, (
+            f"({name},{bt}) registry 声明硬闸 {entry.verify_cmd!r}，但安装片段里没接上 ⇒ "
+            f"该栈的『装没装上』又退回运行时才发现")
+        for ln in install.splitlines():
+            if ln.startswith(f"RUN {entry.verify_cmd}"):
+                assert "||" not in ln.split(entry.verify_cmd, 1)[1], (
+                    f"({name},{bt}) 在场硬闸被软化成软诊断（挂了 `||`）: {ln}")
 
 
 def test_new_build_tool_in_registry_is_installed_and_selftested():
@@ -313,7 +328,7 @@ def test_new_build_tool_in_registry_is_installed_and_selftested():
     # 加之前：registry 没有它 ⇒ 无自测（fail-honest，不臆造命令）
     assert _sel(ib, tc) is None
     ib._STACK_REGISTRY[("java", "sbt")] = ib._StackEntry(
-        ("sbt",), "cd /workspace && sbt -batch compile")
+        "sbt -version", "cd /workspace && sbt -batch compile")
     try:
         assert _sel(ib, tc) == "cd /workspace && sbt -batch compile", \
             "registry 里加了自测命令，_selftest_command 却没认 ⇒ 两张表又分叉了"
@@ -342,13 +357,32 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
     `_phase_build_sandbox` 就走"依赖+源码未变且模板存在 → 复用专属模板"⇒ **老的没装 gradle 的
     镜像继续被复用**，X-C2 的修复一行都到不了生产。
 
-    本条钉住"改了 Dockerfile 生成逻辑就必须递增"这条契约（≥8 即本批已递增）。
+    ★27 号文 #8 的守卫形状整改★ 本条原来断的是 `int(_BUILDER_VERSION) >= 8`——**下界断言是
+    永绿的**：递增到 9/10 它照旧过，而它要防的恰恰是"改了生成逻辑却**不**递增"，那种情况下
+    版本号停在 8、`>= 8` 依然成立 ⇒ 这条守卫对它要防的事零区分力。同型缺陷在 P-C3 的
+    `_STACK_SCHEMA_VERSION >= 3` 上已实证过一次，属同一个"缓存键不含代码版本"族。
+    正确形状＝把**被缓存内容的摘要**与版本常量钉成一对：生成物变了摘要必变，两者必须同时改。
     """
-    from swarm.worker.image_builder import _BUILDER_VERSION
+    import hashlib
 
-    assert int(_BUILDER_VERSION) >= 8, (
-        "改了 Dockerfile 生成/warmup 却没递增 _BUILDER_VERSION ⇒ 旧模板指纹不失效 ⇒ "
-        "复用老镜像 ⇒ 修复不落地（复核 C-1）")
+    from swarm.worker.image_builder import (_BUILDER_VERSION, _STACK_REGISTRY,
+                                            _toolchain_install)
+
+    parts = []
+    for (nm, bt), e in sorted(_STACK_REGISTRY.items()):
+        tc = Toolchain(name=nm, version="17" if nm == "java" else None,
+                       build_tool=bt, dep_source="x")
+        parts.append(f"{nm}|{bt}|{e.verify_cmd}|{e.selftest}|{_toolchain_install(tc)}")
+    # build_tool 缺失（java 两个都装）也是一种生成形态，必须进摘要
+    parts.append("java|<none>|" + _toolchain_install(
+        Toolchain(name="java", version="17", build_tool=None, dep_source="x")))
+    digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+    assert (_BUILDER_VERSION, digest) == ("9", "68483ed7a0bc940a"), (
+        f"镜像生成物或 registry 变了（当前摘要 {digest}，版本 {_BUILDER_VERSION}）。\n"
+        "这不是让你改数字对付过去：**必须递增 `_BUILDER_VERSION` 并同步更新本条的摘要**。\n"
+        "只改摘要不递增版本 ⇒ `compute_project_fingerprint` 不变 ⇒ 已有专属镜像模板继续被复用 ⇒ "
+        "改动一行都到不了生产（X-C2 复核 C-1 的原始事故就是这个）。")
 
 
 def test_wrapper_jars_survive_source_tarball(tmp_path):
