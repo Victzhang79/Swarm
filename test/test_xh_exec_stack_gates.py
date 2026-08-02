@@ -187,6 +187,71 @@ def test_xh2_project_file_exists_is_path_exact(tmp_path):
 
 
 # ══════════════════════════════════════════════
+# M-8：modified 派生路径进 shell 必须 quote
+# ══════════════════════════════════════════════
+#
+# 27 号文 M-8：`_guess_test_cmd` 把 `modified` 的路径段**裸拼**进命令串，而同文件两个
+# sibling（`:1570` 全角标点扫、`:1616` 伪空格扫）与 `_anchor` 都已 `shlex.quote`
+# ——判据不对称。文件名含空格是完全合法的，裸拼会被 shell 切成两个 argv ⇒ 工具报的错
+# 与真因无关 ⇒ 必被误诊成"测试失败"（非 infra ⇒ 硬 FAIL，sticky、换模型同死）。
+#
+# ★两条各锁一道闸，且都用 `shlex.split` 还原 argv 而非子串匹配★
+# 子串匹配（`"'tests/test_a b.py'" in cmd`）会把"分词结果"这一维抹掉，是假探针宽度：
+# 断言的是引号这个**字面量**而不是"shell 会不会切错"。还原 argv 断的才是真命题。
+
+
+def test_m8_py_scoped_path_survives_shell_word_splitting(tmp_path):
+    """py 臂：带空格的测试文件名必须作为**单个** argv 抵达 pytest。
+
+    突变判据：把 `shlex.quote(c)` 换回裸 `{c}`，还原出的 argv 会变成
+    ['python','-m','pytest','-q','tests/test_a','b.py'] ⇒ 本条红。
+    """
+    import shlex as _sh
+    root = _tree(tmp_path, {"pyproject.toml": "[project]", "app/a b.py": "x",
+                            "tests/test_a b.py": "x"})
+    cmd = lp._guess_test_cmd(str(root), ["app/a b.py"])
+    assert cmd is not None, "有同名 scoped 测试文件却没出命令"
+    argv = _sh.split(cmd)
+    assert argv[:4] == ["python", "-m", "pytest", "-q"]
+    assert argv[4:] == ["tests/test_a b.py"], \
+        f"路径被 shell 切碎或未 quote：{argv!r}"
+
+
+def test_m8_go_scoped_pattern_survives_shell_word_splitting(tmp_path):
+    """go 臂：带空格的目录段必须作为**单个** argv 抵达 go test。
+
+    这里刻意**不**用 `_SAFE_REL_DIR_RE` 白名单挡：穿越面已被上游
+    `_project_file_exists`（拒 `..`／绝对路径）拦掉，白名单唯一还活着的一格就是空格，
+    而对这一格白名单只会把 scoped 退化成整仓兜底，quote 才保住精准。
+
+    突变判据：去掉 quote → argv 变 ['go','test','./my','svc/...'] ⇒ 本条红。
+    """
+    import shlex as _sh
+    root = _tree(tmp_path, {"go.mod": "module x", "my svc/user.go": "package svc",
+                            "my svc/user_test.go": "package svc"})
+    cmd = lp._guess_test_cmd(str(root), ["my svc/user.go"])
+    assert cmd is not None, "有同包测试文件却没出命令（白名单把 scoped 退化成兜底了？）"
+    argv = _sh.split(cmd)
+    assert argv == ["go", "test", "./my svc/..."], \
+        f"pattern 被 shell 切碎或未 quote：{argv!r}"
+
+
+def test_m8_ordinary_paths_are_left_byte_identical(tmp_path):
+    """★反向锁：quote 不得给常规路径引入引号★
+
+    `shlex.quote` 对 `[A-Za-z0-9._/-]` 恒为恒等变换，所以既有断言（`go test ./svc/...`、
+    `python -m pytest -q tests/test_a.py`）必须**逐字节不变**。这条同时是防"过度 quote"
+    ——若有人改成无条件加引号，日志可读性与既有 7 格 parametrize 会一起碎。
+    """
+    root = _tree(tmp_path, {"go.mod": "module x", "svc/user.go": "package svc",
+                            "svc/user_test.go": "package svc"})
+    assert lp._guess_test_cmd(str(root), ["svc/user.go"]) == "go test ./svc/..."
+    root2 = _tree(tmp_path / "p2", {"pyproject.toml": "[project]", "app/a.py": "x",
+                                    "tests/test_a.py": "x"})
+    assert lp._guess_test_cmd(str(root2), ["app/a.py"]) == "python -m pytest -q tests/test_a.py"
+
+
+# ══════════════════════════════════════════════
 # X-H5：跨栈误派（治法 D 之后的剩余面）
 # ══════════════════════════════════════════════
 

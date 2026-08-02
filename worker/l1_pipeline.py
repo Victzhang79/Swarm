@@ -4491,13 +4491,34 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
         if fp.endswith(".py"):
             for c in (f"tests/test_{base}.py", f"test/test_{base}.py", f"test_{base}.py"):
                 if _project_file_exists(c, project_path):
-                    return f"python -m pytest -q {c}"
+                    # ★M-8★ 路径段来自 plan 授权的 `modified`，**必须 quote 才进 shell**：
+                    # 文件名含空格/shell 元字符是合法的，裸拼会被 shell 切成两个参数 ⇒
+                    # pytest 报 file not found ⇒ 非 infra ⇒ 硬 FAIL。同文件两个 sibling
+                    # （`:1570` 全角标点扫、`:1616` 伪空格扫）与 `_anchor`（本函数尾部，
+                    # `cd {shlex.quote(d)} && …`）早已 quote，
+                    # 此处原是唯一漏网＝27 号文 M-8 说的"判据不对称"。
+                    # 目录段固定为 `tests/`/`test/`/根，`Path.stem` 不含 `/` ⇒ 无穿越面，
+                    # quote 即足（与 go 臂的分档理由不同，见下）。
+                    return f"python -m pytest -q {shlex.quote(c)}"
         elif fp.endswith(".go"):
             # Go 的测试与被测源**同目录同包**：`svc/user.go` → `svc/user_test.go`
             _dir = fp.rsplit("/", 1)[0] if "/" in fp else "."
             _cand = f"{_dir}/{base}_test.go" if _dir != "." else f"{base}_test.go"
             if _project_file_exists(_cand, project_path):
-                return f"go test ./{_dir}/..." if _dir != "." else "go test ./..."
+                if _dir == ".":
+                    return "go test ./..."
+                # ★M-8★ `_dir` 是 `modified` 的目录段**原样**进 shell，必须 quote。
+                # ★为什么这里是 quote 而不是 `_SAFE_REL_DIR_RE` 白名单★
+                # 穿越面已被**上游**拦掉：`_project_file_exists` 对 `_cand` 判
+                # `".." in r.split("/")` 且 `lstrip("/")`，而 `_cand` 与 `_dir` 同源
+                # ⇒ 带 `..`／绝对路径的 fp 在候选探测那一步就返 False，走不到这里。
+                # 于是白名单唯一还活着的一格是"空格/元字符"，而对这一格 quote 严格更优：
+                # 白名单会把它退化成整仓兜底（丢掉 scoped 的省时与精准），quote 则照常
+                # 出正确的 scoped 命令。`go test` 的 pattern 由它**自己**解析，shell 只需
+                # 把整串当**一个** argv 交给它。（`go test` 对含空格目录到底成不成功，本机
+                # 无 go 工具链未实测——但那是 go 该如实报的错；不 quote 则 shell 先把它切成
+                # `./my` + `svc/...` 两个 argv，报的错与真因无关、必被误诊。）
+                return f"go test {shlex.quote(f'./{_dir}/...')}"
         elif fp.endswith((".ts", ".tsx", ".js", ".jsx")):
             _d = fp.rsplit("/", 1)[0] + "/" if "/" in fp else ""
             for c in (f"{_d}{base}.test.ts", f"{_d}{base}.spec.ts", f"{_d}{base}.test.tsx",
