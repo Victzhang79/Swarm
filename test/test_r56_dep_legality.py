@@ -327,3 +327,195 @@ def test_reactor_member_is_never_pruned_by_registry_evidence():
         v, why = classify(dep, namespace=NS, workspace_members=MEMBERS, managed=set(),
                           managed_unknown=False, registry_versions=_boom)
         assert v == "legal", f"reactor 成员(version={ver}) 必须直接判合法：{why}"
+
+
+# ── X-M10（27 号文 §3.2）：npm driver + 调用方按 manifest 分派 ─────────────
+
+NPM_ROOT = """{
+  "name": "@acme/shop",
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "vue": "^3.4.0",
+    "lodash-fake-xyz": "^1.0.0",
+    "@acme/web": "*",
+    "@acme/lib": "^2.0.0",
+    "mytool": "file:../tools/mytool"
+  },
+  "devDependencies": {
+    "typescript": "~5.5.0"
+  }
+}
+"""
+NPM_MEMBER = '{"name": "@acme/web", "dependencies": {"vue": "^3.4.0"}}'
+NPM_MEMBERS = {"@acme/shop", "@acme/web"}
+
+
+def _npm_reg(known: dict, reachable: bool = True):
+    """npm 仓库桩：known → 版本列表；否则 []（确证查无）。reachable=False → None（没连上）。"""
+    if not reachable:
+        return lambda ns, name: None
+    return lambda ns, name: known.get(name, [])
+
+
+def test_xm10_npm_parse_deps_sections_scopes_and_blocks():
+    deps = DRIVERS["npm"].parse_deps(NPM_ROOT)
+    by_name = {d["name"]: d for d in deps}
+    assert set(by_name) == {"vue", "lodash-fake-xyz", "@acme/web", "@acme/lib",
+                            "mytool", "typescript"}
+    assert by_name["@acme/lib"]["namespace"] == "@acme"
+    assert by_name["vue"]["namespace"] == ""
+    assert by_name["typescript"]["version"] == "~5.5.0"
+    # block 必须能在原文定位（enforce 的改写/删除全靠它）
+    for d in deps:
+        assert d["block"] in NPM_ROOT, d["name"]
+
+
+def test_xm10_npm_remove_keeps_json_valid_middle_and_last():
+    import json as _json
+    drv = DRIVERS["npm"]
+    deps = {d["name"]: d for d in drv.parse_deps(NPM_ROOT)}
+    # 删中间条目（vue）
+    t1 = drv.remove(NPM_ROOT, deps["vue"]["block"])
+    _json.loads(t1)
+    # 删 dependencies 末条目（mytool，后面是 devDependencies → 必须连前导逗号处置）
+    t2 = drv.remove(NPM_ROOT, deps["mytool"]["block"])
+    parsed = _json.loads(t2)
+    assert "mytool" not in parsed["dependencies"]
+    assert "@acme/lib" in parsed["dependencies"]
+
+
+def test_xm10_npm_enforce_prunes_phantom_keeps_legit():
+    """端到端：幻影包（registry 确证查无）→ 剪；真包/工作区成员/已发布 scoped → 留。"""
+    reg = _npm_reg({"vue": ["3.4.0"], "@acme/lib": ["2.0.0"], "typescript": ["5.5.0"]})
+    new_texts, actions = enforce(
+        {"package.json": NPM_ROOT, "packages/web/package.json": NPM_MEMBER},
+        root_text=NPM_ROOT, namespace=None, workspace_members=NPM_MEMBERS,
+        registry_versions=reg, driver=DRIVERS["npm"])
+    import json as _json
+    parsed = _json.loads(new_texts["package.json"])
+    assert "lodash-fake-xyz" not in parsed["dependencies"], "幻影包必须被剪"
+    assert parsed["dependencies"]["vue"] == "^3.4.0"
+    assert parsed["dependencies"]["@acme/web"] == "*", "工作区成员不动"
+    assert parsed["dependencies"]["@acme/lib"] == "^2.0.0", \
+        "已发布 scoped 包不动（分档①：@scope ≠ 工程命名空间，规则②不得误剪）"
+    assert any("prune" in a for a in actions)
+
+
+def test_xm10_npm_registry_unreachable_never_prunes():
+    """fail-open 铁律贯通 npm 臂：registry 没连上（None）→ 一条都不动。"""
+    new_texts, actions = enforce(
+        {"package.json": NPM_ROOT}, root_text=NPM_ROOT, namespace=None,
+        workspace_members=NPM_MEMBERS,
+        registry_versions=_npm_reg({}, reachable=False), driver=DRIVERS["npm"])
+    assert new_texts == {} and actions == []
+
+
+def test_xm10_npm_protocol_versions_never_probed():
+    """file:/link:/git+/workspace: 版本由工程自身承接——registry 里本来就没有，
+    拿探针查=必 E404=误剪合法本地依赖（self_hosted_prefixes 分档）。"""
+    probed: list[str] = []
+
+    def _reg(ns, name):
+        probed.append(name)
+        return []   # 即便"确证查无"也不许剪 file: dep
+
+    new_texts, actions = enforce(
+        {"package.json": NPM_ROOT}, root_text=NPM_ROOT, namespace=None,
+        workspace_members=NPM_MEMBERS, registry_versions=_reg, driver=DRIVERS["npm"])
+    import json as _json
+    assert _json.loads(new_texts.get("package.json", NPM_ROOT))["dependencies"]["mytool"] \
+        == "file:../tools/mytool"
+    assert "mytool" not in probed, "协议引用版本绝不送探针"
+
+
+# ── 调用方（l1_pipeline）分派接线 ──
+
+
+def _wire_npm_project(monkeypatch, files: dict, npm_views: dict):
+    """把 l1_pipeline 的沙箱读写/扫描/探针全部桩成本地 dict。
+    npm_views: 包名 → `npm view` 输出（未登记的包给 E404）。"""
+    import shlex as _shlex
+
+    import swarm.worker.l1_pipeline as lp
+
+    monkeypatch.setattr(lp, "_read_project_file",
+                        lambda pp, rel, timeout=20: files.get(rel))
+    written: dict = {}
+    monkeypatch.setattr(lp, "_write_project_file",
+                        lambda pp, rel, content, timeout=20: (files.__setitem__(rel, content),
+                                                              written.__setitem__(rel, content),
+                                                              True)[-1])
+    monkeypatch.setattr(lp, "_run_check_split",
+                        lambda cmd, pp, timeout=60:
+                        (0, "".join(f"{r}\n" for r in files if r.endswith("package.json")), ""))
+
+    def _fake_l1(cmd, pp, timeout=60):
+        for name, out in npm_views.items():
+            if _shlex.quote(name) in cmd:
+                return (0, out)
+        return (0, "npm error code E404\nnpm error 404 Not Found")
+
+    monkeypatch.setattr(lp, "_run_l1_command", _fake_l1)
+    return lp, written
+
+
+def test_xm10_gate_dispatches_to_npm_by_manifest_presence(monkeypatch):
+    """接线锁：无 pom、只有 package.json 的工程 → npm 臂真跑（幻影被剪）。
+    突变「分派器删掉 npm 分支 / driver 从 DRIVERS 摘除」→ 本条红。"""
+    pkg = ('{"name": "shop", "dependencies": {"phantom-xyz-abc": "^1.0.0", '
+           '"vue": "^3.0.0", "@acme/lib": "^2.0.0"}}')
+    files = {"package.json": pkg}
+    lp, written = _wire_npm_project(monkeypatch, files,
+                                    {"vue": '["3.0.0"]', "@acme/lib": '["2.0.0"]'})
+    n, changed = lp._enforce_dep_legality("/tmp/x", 60)
+    assert n == 1 and changed == ["package.json"]
+    import json as _json
+    deps = _json.loads(files["package.json"])["dependencies"]
+    assert "phantom-xyz-abc" not in deps
+    assert deps["vue"] == "^3.0.0"
+
+
+def test_xm10_gate_keeps_published_scoped_package(monkeypatch):
+    """分档①接线锁：已发布 scoped 包（registry 有版本、非工作区成员）必须留——
+    突变「npm 臂 namespace=None 回传 @scope」→ 规则② 不查探针直接剪 → 本条红。"""
+    pkg = '{"name": "@acme/shop", "dependencies": {"@acme/lib": "^2.0.0"}}'
+    files = {"package.json": pkg}
+    lp, written = _wire_npm_project(monkeypatch, files, {"@acme/lib": '["2.0.0"]'})
+    n, changed = lp._enforce_dep_legality("/tmp/x", 60)
+    assert n == 0 and changed == [], f"已发布 scoped 包被误处置: {changed}"
+    import json as _json
+    assert _json.loads(files["package.json"])["dependencies"]["@acme/lib"] == "^2.0.0"
+
+
+def test_xm10_go_project_warns_driver_absent(monkeypatch, caplog):
+    """无 driver 的栈：零覆盖必须机读可辨（D14 warn-once），绝不与「已校验」混同。"""
+    import logging
+
+    import swarm.worker.dep_legality as dl
+    dl._driver_absent_warned.discard("go")   # warn-once 是模块态，顺序无关化
+    files = {"go.mod": "module example.com/shop\n"}
+    lp, _ = _wire_npm_project(monkeypatch, files, {})
+    with caplog.at_level(logging.WARNING):
+        n, changed = lp._enforce_dep_legality("/tmp/x", 60)
+    assert n == 0
+    assert any("无注册 driver" in r.message and "'go'" in r.message
+               for r in caplog.records), f"零覆盖必须 warn: {[r.message for r in caplog.records]}"
+
+
+def test_xm10_npm_probe_contract():
+    """探针契约：E404→([],True) 可剪；拿到版本→(vers,True)；工具缺失→([],False) fail-open。"""
+    import swarm.worker.l1_pipeline as lp
+
+    def _probe(out):
+        orig = lp._run_l1_command
+        lp._run_l1_command = lambda cmd, pp, timeout=60: (0, out)
+        try:
+            return lp._fetch_npm_versions_probe("x", "/tmp", 30)
+        finally:
+            lp._run_l1_command = orig
+
+    assert _probe("npm error code E404\n404 Not Found") == ([], True)
+    assert _probe('["1.0.0","1.1.0"]') == (["1.0.0", "1.1.0"], True)
+    assert _probe('"2.3.4"') == (["2.3.4"], True)          # 单版本=裸字符串形态
+    assert _probe("sh: npm: command not found") == ([], False)
+    assert _probe("npm error network ETIMEDOUT") == ([], False)

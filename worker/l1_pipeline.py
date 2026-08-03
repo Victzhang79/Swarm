@@ -568,15 +568,37 @@ def _enforce_parent_version_literals(project_path: str, timeout: int) -> tuple[i
 
 
 def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[str]]:
-    """R56-5：构建**之前**对全树 pom 施加依赖合法性不变量（state-driven，不看 Maven 报什么错）。
+    """R56-5：构建**之前**对全树 manifest 施加依赖合法性不变量（state-driven，不看报错文本）。
 
-    收敛 R53-2/R54-5/R54-6/R56-4 四条 error-driven 分支——它们全是"等 Maven 报出一种新错法，
+    收敛 R53-2/R54-5/R54-6/R56-4 四条 error-driven 分支——它们全是"等构建工具报出一种新错法，
     再针对那句错误文本加一条分支"，**换个错法就漏一个**（用户点破：这就是打地鼠）。
-    本闸只看 pom 的**状态**：每条依赖必须满足「reactor 模块 / 父级受管 / 仓库真实存在」三者之一，
-    否则确定性处置。旧分支保留为兜底（网络抖动/边角），但问题在进 Maven 之前就已被消掉。
+    本闸只看 manifest 的**状态**：每条依赖必须满足「工作区成员 / 上游受管 / 仓库真实存在」
+    三者之一，否则确定性处置。旧分支保留为兜底（网络抖动/边角），但问题在进构建前就已被消掉。
 
     fail-open 铁律：仓库不可达 → 一律放行（宁可漏判，绝不误剪合法依赖）。
+
+    ★X-M10（27 号文 §3.2）★ 治前本函数【写死】`driver_for("maven")` + 只扫 pom.xml——
+    npm/go 工程的依赖合法性**零覆盖**，且因为根本没调用 driver_for("npm")/("go")，
+    连 D14 的「无 driver warn-once」都不触发 = 零覆盖还不留痕（硬检查④）。
+    治法：按【manifest 在场】分派（混合工程多栈各过各的闸），无 driver 的栈显式
+    driver_for 一次让 warn-once 响（零覆盖机读可辨）。
     """
+    from swarm.worker.dep_legality import driver_for
+
+    changed: list[str] = []
+    if _read_project_file(project_path, "pom.xml", timeout=20):
+        _n, _f = _enforce_dep_legality_maven(project_path, timeout)
+        changed.extend(_f)
+    if _read_project_file(project_path, "package.json", timeout=20):
+        _n, _f = _enforce_dep_legality_npm(project_path, timeout)
+        changed.extend(_f)
+    if _read_project_file(project_path, "go.mod", timeout=20):
+        driver_for("go")   # 无 driver → warn-once：零覆盖机读可辨（D14），绝不静默
+    return len(set(changed)), sorted(set(changed))
+
+
+def _enforce_dep_legality_maven(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Maven 臂（R56-5 原实现，X-M10 拆出为分派的一支）。"""
     from swarm.worker.dep_legality import driver_for, enforce
 
     drv = driver_for("maven")   # 新栈=注册 driver（dep_legality.DRIVERS），闸与不变量本身零栈耦合
@@ -635,6 +657,108 @@ def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[st
         logger.warning(
             "[L1.2.1·dep-legality] R56-5 构建前依赖合法性闸：处置 %d 条（%d pom 改写）——"
             "不变量=每条依赖须满足【reactor 模块 / 父级受管 / 仓库真实存在】三者之一：\n  %s",
+            len(actions), len(changed), "\n  ".join(actions[:12]))
+    return len(changed), sorted(changed)
+
+
+def _fetch_npm_versions_probe(name: str, project_path: str, timeout: int
+                              ) -> tuple[list[str], bool]:
+    """npm registry 查包 → **(versions, reachable)**，契约同 `_fetch_maven_versions_probe`：
+    不可达 → ([], False)（fail-open 绝不剪）；E404 确证查无 → ([], True)（才可剪）。
+
+    ★走 `npm view` 而非另维护一份 registry URL 清单★：沙箱内 npm 用的就是项目真实配置的
+    registry（镜像/.npmrc/私服）——「权威仓库」的定义是**构建工具实际访问的那个**，
+    硬编码 registry.npmjs.org 会在私有 registry 工程上把合法内部包误判"查无"（误剪）。
+    """
+    _ec, out = _run_l1_command(
+        f"npm view {shlex.quote(name)} versions --json 2>&1", project_path,
+        timeout=min(timeout, 60))
+    body = out or ""
+    # A1 同纪律（maven 探针同款）：必须先判 E404——404 响应体含 "Not Found"，
+    # 先咨询 _tool_missing 会把「registry 确证查无」吞成「工具缺失」→ 确证剪除被旁路。
+    if "E404" in body or "404 Not Found" in body:
+        return [], True    # registry 确证答复"没有它"——可据以剪除的肯定证据
+    if _tool_missing(body):
+        return [], False
+    m = re.search(r"\[.*?\]", body, re.S)
+    if m:
+        try:
+            vers = json.loads(m.group(0))
+            if isinstance(vers, list) and vers:
+                return [str(v) for v in vers], True
+        except (ValueError, TypeError):
+            pass
+    m2 = re.search(r'"(\d[^"]*)"', body)   # 单版本包：--json 输出裸字符串而非数组
+    if m2:
+        return [m2.group(1)], True
+    return [], False
+
+
+def _enforce_dep_legality_npm(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """npm 臂（X-M10）：扫全树 package.json（排除 node_modules），施加同一不变量。
+
+    与 maven 臂的消费契约分档（血规 10③，详见 NpmDriver docstring）：
+    namespace 恒传 **None**——npm 的 @scope 不是工程命名空间，scoped 包可合法发布；
+    幻影依赖一律由 registry 探针的确证 404 定罪，绝不走"非成员即剪"的捷径。
+    """
+    from swarm.worker.dep_legality import driver_for, enforce
+
+    drv = driver_for("npm")
+    if drv is None:
+        return 0, []
+    root_text = _read_project_file(project_path, "package.json", timeout=20)
+    if not root_text:
+        return 0, []
+    _ec, gout, _e = _run_check_split(
+        "find . -name package.json -not -path '*/node_modules/*' 2>/dev/null",
+        project_path, timeout=30)
+    if _ec != 0:
+        logger.warning("[L1.2.1·dep-legality] npm manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
+                       _ec, (_e or "")[:200])
+        return 0, []
+    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    if not rels:
+        return 0, []
+    texts: dict[str, str] = {}
+    for rel in rels[:60]:
+        t = _read_project_file(project_path, rel, timeout=20)
+        if t:
+            texts[rel] = t
+    if not texts:
+        return 0, []
+    # 工作区成员 = 每个 package.json 的 name（monorepo/workspaces 的全部内部包）
+    members: set[str] = set()
+    for t in texts.values():
+        _m = re.search(r'"name"\s*:\s*"([^"]+)"', t)
+        if _m:
+            members.add(_m.group(1))
+
+    _cache: dict[str, list[str] | None] = {}
+
+    def _versions(_ns: str, name: str):
+        """契约同 maven 臂：不可达 → None；确证查无 → []。"""
+        if name not in _cache:
+            try:
+                vers, reachable = _fetch_npm_versions_probe(name, project_path, timeout)
+                _cache[name] = vers if (vers or reachable) else None
+            except Exception as _fx:  # noqa: BLE001
+                logger.warning("[L1.2.1·dep-legality] npm 仓库查询异常（按不可达 fail-open）"
+                               "%s → %s", name, _fx)
+                _cache[name] = None
+        return _cache[name]
+
+    new_texts, actions = enforce(
+        texts, root_text=root_text, namespace=None,   # 分档①：@scope ≠ 工程命名空间
+        workspace_members=members, registry_versions=_versions, driver=drv,
+    )
+    changed: list[str] = []
+    for rel, txt in new_texts.items():
+        if _write_project_file(project_path, rel, txt, timeout=20):
+            changed.append(rel)
+    if actions:
+        logger.warning(
+            "[L1.2.1·dep-legality] X-M10 构建前依赖合法性闸（npm）：处置 %d 条（%d package.json "
+            "改写）——不变量=每条依赖须满足【工作区成员 / 仓库真实存在】之一：\n  %s",
             len(actions), len(changed), "\n  ".join(actions[:12]))
     return len(changed), sorted(changed)
 
@@ -5661,14 +5785,20 @@ def run_l1_pipeline(
                     for _f in _pv_files:
                         if _f not in _rfp:
                             _rfp.append(_f)
-                _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout)
-                if _dl_files:
-                    _rfp = details.setdefault("repaired_file_paths", [])
-                    for _f in _dl_files:
-                        if _f not in _rfp:
-                            _rfp.append(_f)   # 随 pull-back 回传本地，否则修复只活在沙箱
-            except Exception as _dl_exc:  # noqa: BLE001 —— 闸门自身绝不阻断构建
-                logger.warning("[L1.2.1·dep-legality] 合法性闸异常（跳过，不阻断）: %s", _dl_exc)
+            except Exception as _pv_exc:  # noqa: BLE001 —— 闸门自身绝不阻断构建
+                logger.warning("[L1.2.1·parent-version] 字面量闸异常（跳过，不阻断）: %s", _pv_exc)
+        # ★X-M10★ dep_legality 不再绑 Maven 命令族——闸内部按 manifest 在场分派
+        # （pom/package.json/go.mod 各过各的），混合工程（java+npm 前后端分离）在 maven
+        # 构建轮里 npm 侧同样过闸；无 driver 的栈 warn-once（D14 零覆盖可辨）。
+        try:
+            _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout)
+            if _dl_files:
+                _rfp = details.setdefault("repaired_file_paths", [])
+                for _f in _dl_files:
+                    if _f not in _rfp:
+                        _rfp.append(_f)   # 随 pull-back 回传本地，否则修复只活在沙箱
+        except Exception as _dl_exc:  # noqa: BLE001 —— 闸门自身绝不阻断构建
+            logger.warning("[L1.2.1·dep-legality] 合法性闸异常（跳过，不阻断）: %s", _dl_exc)
         logger.info("[L1.2.1] 执行构建闸门: %s", build_cmd)
         b_ec, b_out = _run_l1_command(
             build_cmd, project_path, timeout=_stage_timeout(max(timeout, 300), deadline))

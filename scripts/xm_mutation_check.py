@@ -21,10 +21,12 @@ PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_image_builder.py",
          "test/test_e_theme_supply_gates_batch1.py",
          "test/test_xm8_vue_type_gate.py",
-         "test/test_xc3_error_drivers.py"]
+         "test/test_xc3_error_drivers.py",
+         "test/test_r56_dep_legality.py"]
 
 IMG = ROOT / "worker" / "image_builder.py"
 PIPE = ROOT / "worker" / "l1_pipeline.py"
+DL = ROOT / "worker" / "dep_legality.py"
 
 MUTATIONS = [
     (
@@ -144,6 +146,53 @@ MUTATIONS = [
         '(?:java|kt|scala|go|rs|ts|tsx|js|vue|xml|py)',
         '(?:java|kt|scala|rs|ts|tsx|js|vue|xml|py)',
         ['test_xm3_file_level_attribution_covers_non_jvm_stacks'],
+    ),
+    (
+        "X-M10a：NpmDriver 从 DRIVERS 摘除（npm 工程依赖合法性回退零覆盖；"
+        "接线锁必须红——driver_for('npm') → None → 臂直接返回）",
+        DL,
+        'DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver(), "npm": NpmDriver()}',
+        'DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver()}',
+        ['test_xm10_gate_dispatches_to_npm_by_manifest_presence'],
+    ),
+    (
+        "X-M10b：self_hosted_prefixes 摘 file:（本地协议依赖被送探针 ⇒ registry 必 E404"
+        " ⇒ 误剪合法 file: 依赖——本批最重要的分档）",
+        DL,
+        '''self_hosted_prefixes = ("${", "$", "file:", "link:", "git+", "git:",''',
+        '''self_hosted_prefixes = ("${", "$", "link:", "git+", "git:",''',
+        ['test_xm10_npm_protocol_versions_never_probed'],
+    ),
+    (
+        "X-M10c：npm 臂 namespace=None 回传 @scope（分档①被违反 ⇒ 规则②「非成员即剪」"
+        "误剪合法已发布 scoped 包——Maven 消费契约硬套 npm）",
+        PIPE,
+        "        texts, root_text=root_text, namespace=None,   # 分档①：@scope ≠ 工程命名空间",
+        '        texts, root_text=root_text, namespace="@acme",',
+        ['test_xm10_gate_keeps_published_scoped_package'],
+    ),
+    (
+        "X-M10d：探针先判 _tool_missing 后判 E404（A1 同型复发：404 响应体的 "
+        "'Not Found' 把「确证查无」吞成「工具缺失」⇒ 确证剪除被旁路）",
+        PIPE,
+        '''    if "E404" in body or "404 Not Found" in body:
+        return [], True    # registry 确证答复"没有它"——可据以剪除的肯定证据
+    if _tool_missing(body):
+        return [], False''',
+        '''    if _tool_missing(body):
+        return [], False
+    if "E404" in body or "404 Not Found" in body:
+        return [], True    # registry 确证答复"没有它"——可据以剪除的肯定证据''',
+        ['test_xm10_npm_probe_contract'],
+    ),
+    (
+        "X-M10e：probe_without_namespace 门回退成 `if ns`（无 scope 包永不送探针 ⇒ "
+        "无 scope 幻影包零判定——npm 的名字即完整坐标这一分档被抹）",
+        DL,
+        "\n    vers = (registry_versions(ns, name)\n                   if (ns or probe_without_namespace) else None)",
+        "\n    vers = registry_versions(ns, name) if ns else None",
+        ['test_xm10_gate_dispatches_to_npm_by_manifest_presence',
+         'test_xm10_npm_enforce_prunes_phantom_keeps_legit'],
     ),
 ]
 

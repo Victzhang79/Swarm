@@ -198,7 +198,122 @@ class MavenDriver:
         return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
 
 
-DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver()}
+class NpmDriver:
+    """npm/package.json driver（X-M10，27 号文 §3.2）。
+
+    ★复用不变量 ≠ 复用消费契约（血规 10③）——npm 与 Maven 的三处分档★：
+      ① namespace=scope，但**调用方必须传 namespace=None**：`@scope` 不是工程命名空间。
+        Maven 的「工程模块从不在远程仓库」在 npm **不成立**——scoped 包可以合法发布在
+        registry（私有/公开）。若按 Maven 契约传 namespace，规则②（用工程命名空间但非
+        成员 → 直接 prune，不查仓库）会**误剪合法已发布 scoped 包**。幻影 scoped 依赖
+        由规则④的 registry 探针兜底（E404 确证查无才剪）。
+      ② 版本值是 semver range——classify 只验「包存在」（仓库有任何版本），**不验 range
+        可满足性**：`^99.0.0` 判 legal 是刻意边界（npm install 的 ETARGET 是可归因局部错，
+        不会像坏坐标那样 manifest 解析期连坐全工作区）。
+      ③ 无集中版本管理（overrides/resolutions 是覆盖表不是 BOM）→ managed_names 恒空、
+        managed_unknown 恒 False（缺版本即非法的判定在 npm 不适用——npm 依赖必带 range）。
+    """
+
+    stack = "npm"
+    namespace_mandatory = False   # npm 无 scope 包属常态（D9 不适用）
+
+    # 版本值由工程自身承接、无需查仓库的前缀（registry 里本来就没有，查=必 E404=误剪）
+    self_hosted_prefixes = ("${", "$", "file:", "link:", "git+", "git:",
+                            "http://", "https://", "workspace:", "portal:")
+
+    internal_version_ref = "*"   # npm workspaces 内部引用：星号 range 由 workspaces 链接承接
+    # npm 的名字即完整坐标（无 scope 包是常态）——空 namespace 也要送探针；
+    # Maven 坐标须 group:artifact 成对，缺 groupId 不查（D9）。两概念两档，不混用。
+    probe_without_namespace = True
+
+    _SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
+    _ENTRY_RE = re.compile(r'"((?:@[\w.\-]+/)?[\w.\-]+)"\s*:\s*"([^"]+)"')
+    _KEY_RE = re.compile(r'"((?:@[\w.\-]+/)?[\w.\-]+)"(\s*:)')
+
+    @classmethod
+    def _section_spans(cls, text: str) -> list[tuple[int, int]]:
+        """各 dependencies 段的【花括号内】区间。花括号配平且尊重字符串字面量
+        （段内值都是字符串，但字符串里可能含 `{`/`}`/`\\"`——不识别字符串会配错平）。"""
+        spans: list[tuple[int, int]] = []
+        for sec in cls._SECTIONS:
+            m = re.search(rf'"{sec}"\s*:\s*\{{', text)
+            if not m:
+                continue
+            depth, i = 1, m.end()
+            in_str = esc = False
+            while i < len(text) and depth:
+                c = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                elif c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                i += 1
+            if depth == 0:
+                spans.append((m.end(), i - 1))
+        return spans
+
+    def parse_deps(self, text: str) -> list[dict]:
+        """→ [{namespace=scope(可空), name=含 scope 全名, version=range 原文, block}]。
+
+        ★block 带逗号上下文★：JSON 删条目必须连逗号一起处置——尾随有逗号 → 带上；
+        无（末条目）→ 带【前导】逗号。否则 remove 后留下 `, }` / `{ ,` = 非法 JSON，
+        修依赖修出 manifest 解析崩塌（与坏坐标同罪）。
+        已知边界（诚实登记）：同名同版本条目同时出现在 dependencies 与 devDependencies
+        时 block 文本相同 → enforce 只处置首个、第二个按「已被带走」跳过（日志可辨）。
+        """
+        out: list[dict] = []
+        for s, e in self._section_spans(text):
+            seg = text[s:e]
+            for m in self._ENTRY_RE.finditer(seg):
+                name, ver = m.group(1), m.group(2)
+                a_start, a_end = s + m.start(), s + m.end()
+                tm = re.match(r"\s*,", text[a_end:a_end + 64])
+                if tm:
+                    block = text[a_start:a_end + tm.end()]
+                else:
+                    pm = re.search(r",\s*$", text[:a_start])
+                    block = (text[pm.start():a_end] if pm
+                             else text[a_start:a_end])
+                ns = name.split("/", 1)[0] if name.startswith("@") and "/" in name else ""
+                out.append({"namespace": ns, "name": name,
+                            "version": ver.strip(), "block": block})
+        return out
+
+    def managed_names(self, root_text: str) -> set[str]:
+        return set()   # npm 无 BOM 对应物（分档③）
+
+    def managed_unknown(self, root_text: str) -> bool:
+        return False
+
+    def rewrite_namespace(self, block: str, namespace: str) -> str:
+        # 替换 key 的 scope 段（调用方传 namespace=None 时本路径不会被 classify 触发）
+        return re.sub(r'"@[\w.\-]+/', f'"{namespace}/', block, count=1)
+
+    def rewrite_name(self, block: str, name: str) -> str:
+        return self._KEY_RE.sub(rf'"{name}"\g<2>', block, count=1)
+
+    def rewrite_version(self, block: str, version: str) -> str:
+        return re.sub(r'(:\s*")[^"]+(")', rf"\g<1>{version}\g<2>", block, count=1)
+
+    def root_name(self, root_text: str) -> str | None:
+        m = re.search(r'"name"\s*:\s*"([^"]+)"', root_text)
+        return m.group(1) if m else None
+
+    def remove(self, text: str, block: str) -> str:
+        # block 已含逗号上下文（parse_deps 契约）——连同周边空白删，JSON 仍然合法
+        return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
+
+
+DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver(), "npm": NpmDriver()}
 """栈 → driver。**新栈 = 在此注册一个 driver**（实现 ManifestDriver 协议），闸本身不动。"""
 
 
@@ -246,7 +361,9 @@ def _resolve_prefixed_member(name: str, workspace_members: set[str],
 def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
              managed: set[str], managed_unknown: bool,
              registry_versions, root_name: str | None = None,
-             namespace_mandatory: bool = False) -> tuple[str, str]:
+             namespace_mandatory: bool = False,
+             self_hosted_prefixes: tuple[str, ...] = _VAR_REF_PREFIXES,
+             probe_without_namespace: bool = False) -> tuple[str, str]:
     """判定一条依赖的合法性 → (verdict, reason)。**纯函数，零栈耦合。**
 
     verdict ∈ {legal, fix_namespace, fix_name, prune}
@@ -262,6 +379,10 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
       · list  —— 仓库**确证**答复：这些是可用版本（空列表 = 确证"查无此物"）
       · None  —— 仓库**没连上**（网络/工具故障）→ **一律 fail-open 判 legal**
       ★证据缺失 ≠ 否定证据★ 误剪一条合法依赖 ≫ 漏过一条坏坐标（后者下游还有闸，前者直接毁产物）。
+
+    self_hosted_prefixes（X-M10）：版本值由【工程自身承接】、无需查仓库的前缀——
+    Maven 是 `${...}` 属性引用；npm 还有 `file:`/`link:`/`git+:`/`workspace:` 等本地/
+    协议引用（这类 dep 在 registry 里**本来就没有**，拿探针查=必 E404=误剪合法依赖）。
     """
     ns, name, ver = dep["namespace"], dep["name"], dep["version"]
 
@@ -307,7 +428,8 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
     if ver is None:
         if name in managed or managed_unknown:
             return "legal", "上游受管（或受管集未知 → fail-open 不误判）"
-        vers = registry_versions(ns, name) if ns else None
+        vers = (registry_versions(ns, name)
+                   if (ns or probe_without_namespace) else None)
         if vers is None:
             return "legal", "仓库不可达 → fail-open（宁可放行，绝不误剪）"
         if not vers:
@@ -315,11 +437,13 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
         # 仓库有，但上游不管它 → 缺版本会让 manifest 解析期就炸（比缺依赖严重一个数量级）
         return "legal", "仓库存在但上游不受管 → 交 version-repair 注入显式版本"
 
-    # ④ 有版本：变量引用交由工程自身承接
-    if ver.startswith(_VAR_REF_PREFIXES):
-        return "legal", "版本走属性/变量引用"
+    # ④ 有版本：变量引用/协议引用交由工程自身承接（X-M10：前缀表随 driver 分档——
+    # npm 的 file:/git+/workspace: 在 registry 里本来就没有，拿探针查=必 E404=误剪）
+    if ver.startswith(self_hosted_prefixes):
+        return "legal", "版本走属性/变量/协议引用"
 
-    vers = registry_versions(ns, name) if ns else None
+    vers = (registry_versions(ns, name)
+                   if (ns or probe_without_namespace) else None)
     if vers is None:
         return "legal", "仓库不可达 → fail-open"
     if not vers:
@@ -342,6 +466,8 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
     managed_unknown = drv.managed_unknown(root_text)
     if root_name is None and hasattr(drv, "root_name"):
         root_name = drv.root_name(root_text)   # 工程根名自证（识别"工程前缀 + 真成员"的错名）
+    _prefixes = getattr(drv, "self_hosted_prefixes", _VAR_REF_PREFIXES)  # X-M10：随栈分档
+    _probe_no_ns = getattr(drv, "probe_without_namespace", False)    # 同上
     new_texts: dict[str, str] = {}
     actions: list[str] = []
 
@@ -353,7 +479,8 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                 managed=managed, managed_unknown=managed_unknown,
                 registry_versions=registry_versions, root_name=root_name,
                 namespace_mandatory=getattr(drv, "namespace_mandatory", False),
-            )
+                self_hosted_prefixes=_prefixes,
+                probe_without_namespace=_probe_no_ns)
             if verdict == "legal":
                 continue
             blk = dep["block"]
@@ -373,7 +500,7 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                 # D10：三面同步——坐标修回工程命名空间后，硬编码版本（臆造/漂移）仍会让
                 # reactor 解析不到 → 同步为工程版本引用；变量引用/受管无版本不动。
                 _ver = dep.get("version")
-                if _ver and not _ver.startswith(_VAR_REF_PREFIXES):
+                if _ver and not _ver.startswith(_prefixes):
                     _ref = getattr(drv, "internal_version_ref", None)
                     if _ref:
                         _new_blk = drv.rewrite_version(_new_blk, _ref)
@@ -387,7 +514,7 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                 # 残留的硬编码外部版本同样让 reactor 解析失败（修对名字留下错版本=
                 # 同根病的另一半）→ 同步为工程版本引用；变量引用/受管无版本不动。
                 _ver = dep.get("version")
-                if _ver and not _ver.startswith(_VAR_REF_PREFIXES):
+                if _ver and not _ver.startswith(_prefixes):
                     _ref = getattr(drv, "internal_version_ref", None)
                     if _ref:
                         _new_blk = drv.rewrite_version(_new_blk, _ref)
