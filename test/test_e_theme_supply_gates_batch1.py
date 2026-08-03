@@ -398,6 +398,40 @@ def test_e6_package_decl_match_and_nonstandard_layout_pass():
     assert _package_decl_mismatches(mod_diff) == []
 
 
+def _new_kotlin_diff(path: str, pkg: str) -> str:
+    return (f"diff --git a/{path} b/{path}\n"
+            f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,3 @@\n"
+            f"+package {pkg}\n"
+            "+\n"
+            "+class Foo\n")
+
+
+def test_e6_kotlin_package_decl_mismatch_caught():
+    """★X-M2（27 号文 §3.2）★ 包声明对账原先只认 `.java`——Kotlin 同语义（`package a.b.c`）
+    但源根是 src/main|test/kotlin、声明行**无分号**，共用 java 判据会对全部 .kt 抽不到
+    声明 ⇒ 对账静默跳过（与没接上同效）。"""
+    from swarm.worker.l1_pipeline import _package_decl_mismatches
+    diff = _new_kotlin_diff("mod-a/src/main/kotlin/com/x/alarm/service/Foo.kt",
+                            "com.x.other.wrong")
+    mis = _package_decl_mismatches(diff)
+    assert len(mis) == 1 and mis[0]["declared"] == "com.x.other.wrong" \
+        and mis[0]["expected"] == "com.x.alarm.service", \
+        "新建 .kt 包声明与 kotlin 源根路径不符必须同样抓获（X-M2）"
+
+
+def test_e6_kotlin_package_decl_match_and_mixed_root_pass():
+    from swarm.worker.l1_pipeline import _package_decl_mismatches
+    # kotlin 源根命中且声明一致 → 不冤杀
+    ok = _new_kotlin_diff("mod-a/src/main/kotlin/com/x/alarm/Foo.kt", "com.x.alarm")
+    assert _package_decl_mismatches(ok) == []
+    # 官方支持的混放布局（.kt 住 src/main/java 根）也要认得
+    mixed = _new_kotlin_diff("mod-a/src/main/java/com/x/alarm/Foo.kt", "com.x.alarm")
+    assert _package_decl_mismatches(mixed) == []
+    # 无源根标记的非常规布局 → 保守跳过
+    odd = _new_kotlin_diff("scripts/Foo.kt", "whatever.pkg")
+    assert _package_decl_mismatches(odd) == []
+
+
 # ══════════════ D3c ══════════════
 
 def test_d3c_validate_downgrade_marks_unverified_sources():

@@ -3728,6 +3728,20 @@ def _validate_downgrade_unverified_sources(build_cmd: str, modified: list) -> li
 
 _PKG_DECL_RE = re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*)\s*;")
 
+# ★X-M2（27 号文 §3.2）★ 包声明对账按栈分派：后缀 → (源根正则, 声明行正则)。
+# Kotlin 与 Java 包声明语义全同（`package a.b.c`、路径反推包），但①源根惯例是
+# src/main|test/kotlin（官方也支持混放 java 根）②声明行**无分号**——共用 `_PKG_DECL_RE`
+#（要求 `;`）会对全部 .kt 抽不到声明 ⇒ 对账静默跳过，与"没接上"同效。
+# 刻意不含 go：`package main` 是**包名**不是导入路径，与目录无确定性对应
+# （包名≠末段目录名合法且常见）——判据不确定就 fail-honest 不猜（纪律 2）。
+_PKG_DECL_RULES: dict[str, tuple[re.Pattern, re.Pattern]] = {
+    ".java": (re.compile(r"(?:^|/)(?:src/main/java|src/test/java|java)/(?P<rel>.+\.java)$"),
+              _PKG_DECL_RE),
+    ".kt": (re.compile(r"(?:^|/)(?:src/main/kotlin|src/test/kotlin|src/main/java|src/test/java)"
+                       r"/(?P<rel>.+\.kt)$"),
+            re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*?)\s*;?\s*(?://.*)?$")),
+}
+
 
 # 成对定界符——任何有块结构的语言都有（Java/JS/Go/Rust/C/C#/PHP/Velocity/JSON…）；
 # 纯缩进语言（Python/YAML）天然平衡，本闸对其恒不命中（不误杀）。
@@ -3816,27 +3830,34 @@ def _truncated_artifacts(diff: str) -> list[dict]:
 
 
 def _package_decl_mismatches(diff: str) -> list[dict]:
-    """E6①：diff 内【新建 .java】的包声明与 src/main|test/java 路径反推包比对。
+    """E6①：diff 内【新建 JVM 源文件】的包声明与源根路径反推包比对（X-M2 起按
+    `_PKG_DECL_RULES` 分派：.java / .kt；go 等无确定性路径↔包对应的栈刻意不猜）。
 
-    返回不符清单 [{file, declared, expected}]。路径不含 java 源根标记（file_path_to_fqn
-    返回 None）或抽不到声明行 → 跳过（保守，不误杀非常规布局）。纯文本零外部工具。"""
+    返回不符清单 [{file, declared, expected}]。路径不含该栈源根标记（正则未命中）或
+    抽不到声明行 → 跳过（保守，不误杀非常规布局）。纯文本零外部工具。"""
     out: list[dict] = []
     try:
         from swarm.project.diff_apply import split_diff_by_file
-        from swarm.worker.symbol_resolver import file_path_to_fqn
         for files, text in split_diff_by_file(diff or ""):
             if "--- /dev/null" not in text and "new file mode" not in text:
                 continue
             for f in files:
-                if not f.endswith(".java"):
+                _norm = str(f).replace("\\", "/")
+                _ext = "." + _norm.rsplit(".", 1)[-1] if "." in _norm else ""
+                rule = _PKG_DECL_RULES.get(_ext)
+                if rule is None:
                     continue
-                fqn = file_path_to_fqn(f)
-                if not fqn or "." not in fqn:
+                _root_re, _decl_re = rule
+                _rm = _root_re.search(_norm)
+                if not _rm:
                     continue
-                expected = fqn.rsplit(".", 1)[0]
+                dotted = _rm.group("rel")[: -len(_ext)].replace("/", ".")
+                if "." not in dotted:
+                    continue
+                expected = dotted.rsplit(".", 1)[0]
                 declared = None
                 for ln in text.splitlines():
-                    m = _PKG_DECL_RE.match(ln)
+                    m = _decl_re.match(ln)
                     if m:
                         declared = m.group(1)
                         break

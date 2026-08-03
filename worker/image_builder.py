@@ -488,6 +488,12 @@ def _toolchain_install(tc: Toolchain) -> str:
             # PATH 已含 /root/.cargo/bin ⇒ 此刻 cargo 可寻址（rustup 安装脚本静默失败时正是这里红）。
             + _verify_block("rust", "cargo")
         )
+    # ★X-M7（27 号文 §3.2）★ 未知工具链治前只在 Dockerfile 里留一行注释——降级路径
+    # 至少一次 WARNING（血规 3）：工具链没被识别 = 镜像里没有它的构建工具 = L1 构建闸
+    # 在沙箱里整类 127/skip，注释没人看得到。
+    logger.warning("[IMAGE-BUILD] X-M7 未知工具链 %r（build_tool=%r）：镜像不装它的构建"
+                   "工具，L1 构建/测试闸在该栈上不可用——若这是真实栈，请给 "
+                   "_STACK_REGISTRY/_toolchain_install 加表项", tc.name, tc.build_tool)
     return f"# (未知工具链 {tc.name}，跳过)\n"
 
 
@@ -868,19 +874,26 @@ def _selftest_command(spec: EnvSpec) -> str | None:
 
     在镜像内的 /workspace（已 COPY 项目源码）执行，证明完整项目能离线编译。
     返回 None 表示该工具链暂无自测（不阻断发布）。
+
+    ★X-M5（27 号文 §3.2）★ 混编工程必须**逐栈**自测——治前首个命中即 return，
+    java+npm 工程只自测 maven，npm 侧坏掉（如 node 装错版本）要等到运行时才炸。
+    多栈用 ` && ` 链：任一栈自测失败整条失败（自测是软诊断不阻断发布，语义不变；
+    是哪一段炸的见 /tmp/st.log）。同一条自测去重（java 的 build_tool 未定会与
+    显式 maven 撞同一条）。
     """
     # ★复核 H-4★ 自测命令与安装片段**同读 `_STACK_REGISTRY`**。原先两处各手写一张分派表，
     # 于是"自测发 gradle 命令、安装只装 maven"这种分叉能长期存在（正是 X-C2 本体）。
     # 现在加新栈/新 build_tool 只能改 registry 一处，物理上不可能只落一半。
+    cmds: list[str] = []
     for tc in spec.toolchains:
         entry = stack_entry(tc.name, tc.build_tool)
         if entry is None and (tc.name or "").lower() == "java" and not tc.build_tool:
             # build_tool 未定的 java（安装片段已保守装 maven+gradle）→ 用 maven 自测兜底：
             # 有 pom 就真编译；无 pom 时命令自身失败，属软诊断不阻断（复核 L-2）。
             entry = stack_entry("java", "maven")
-        if entry is not None and entry.selftest:
-            return entry.selftest
-    return None
+        if entry is not None and entry.selftest and entry.selftest not in cmds:
+            cmds.append(entry.selftest)
+    return " && ".join(cmds) if cmds else None
 
 
 # ──────────────────────────────────────────────
@@ -1017,7 +1030,8 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "9"  # v9: 27 号文 #8——在场硬闸从「只有 gradle 有的一行字面量」推广到全部 6 个 (name,build_tool)（apt_packages 子串断言实测 2 条必然假过：go 只命中 ENV PATH、gradle 5/6 行是顺带命中）；Dockerfile 每个栈多一条 `RUN <verify>` ⇒ 生成物变了必须递增，否则复用老镜像=修复不落地
+_BUILDER_VERSION = "10"  # v10: X-M5——混编工程 `_selftest_command` 从「首个命中即 return」改为逐栈自测（` && ` 链+去重）⇒ 多工具链镜像的构建期自测脚本变了必须递增，否则复用老镜像=混编自测修复不落地（X-C2/P-C3 同形状；摘要守卫同批把组合逻辑纳入）
+#                       v9: 27 号文 #8——在场硬闸从「只有 gradle 有的一行字面量」推广到全部 6 个 (name,build_tool)（apt_packages 子串断言实测 2 条必然假过：go 只命中 ENV PATH、gradle 5/6 行是顺带命中）；Dockerfile 每个栈多一条 `RUN <verify>` ⇒ 生成物变了必须递增，否则复用老镜像=修复不落地
 # v8: X-C2——java 按 build_tool 装(Gradle 工程原先镜像里没 gradle→127 死循环)+钉 gradle 发行版+init.gradle 镜像源+gradle warmup；wrapper jar 不再被 tarball 剥掉(./gradlew/./mvnw 原必 ClassNotFound)；强制重建所有专属镜像
 #                       v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像
 #                       v6: 烤确定性 repair 工具——Go goimports(GOBIN=/usr/local/bin) + 前端 npm 预装；强制重建所有专属镜像

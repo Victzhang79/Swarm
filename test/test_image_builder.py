@@ -366,7 +366,7 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
     import hashlib
 
     from swarm.worker.image_builder import (_BUILDER_VERSION, _STACK_REGISTRY,
-                                            _toolchain_install)
+                                            _selftest_command, _toolchain_install)
 
     parts = []
     for (nm, bt), e in sorted(_STACK_REGISTRY.items()):
@@ -376,13 +376,61 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
     # build_tool 缺失（java 两个都装）也是一种生成形态，必须进摘要
     parts.append("java|<none>|" + _toolchain_install(
         Toolchain(name="java", version="17", build_tool=None, dep_source="x")))
+    # ★X-M5★ `_selftest_command` 的**组合逻辑**（混编逐栈自测 vs 首个命中即 return）也是
+    # 生成物的一部分，但上面两行盖不到（registry 各条的 selftest 串不变、digest 就不变）——
+    # 本批改动正是这一类，若摘要不含它，不递增版本时这条守卫**不响**，修复复用老镜像
+    # 一行都到不了生产（X-C2/P-C3 同形状事故，第三次）。用混编 spec 把组合输出纳入摘要。
+    mixed = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="java", version="17", build_tool="maven", dep_source="x"),
+        Toolchain(name="node", version=None, build_tool="npm", dep_source="x"),
+        Toolchain(name="java", version="17", build_tool=None, dep_source="x"),
+    ])
+    parts.append("selftest|mixed|" + str(_selftest_command(mixed)))
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
-    assert (_BUILDER_VERSION, digest) == ("9", "68483ed7a0bc940a"), (
+    assert (_BUILDER_VERSION, digest) == ("10", "82fb54cd2919214c"), (
         f"镜像生成物或 registry 变了（当前摘要 {digest}，版本 {_BUILDER_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_BUILDER_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ `compute_project_fingerprint` 不变 ⇒ 已有专属镜像模板继续被复用 ⇒ "
         "改动一行都到不了生产（X-C2 复核 C-1 的原始事故就是这个）。")
+
+
+def test_selftest_covers_every_toolchain_in_a_mixed_spec():
+    """★X-M5（27 号文 §3.2）★ 混编工程必须**逐栈**自测——治前 `_selftest_command`
+    首个命中即 return：java+npm 只自测 maven，npm 侧坏掉要等运行时才炸。"""
+    from swarm.worker.image_builder import _selftest_command
+
+    mixed = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="java", version="17", build_tool="maven", dep_source="x"),
+        Toolchain(name="node", version=None, build_tool="npm", dep_source="x"),
+        Toolchain(name="java", version="17", build_tool=None, dep_source="x"),
+    ])
+    cmd = _selftest_command(mixed)
+    assert cmd is not None
+    assert "mvn -o" in cmd, "maven 自测必须在场"
+    assert "npm run build" in cmd, "npm 自测必须在场（混编只自测一个栈=X-M5 本体）"
+    assert cmd.count("mvn -o") == 1, "java build_tool 未定的兜底与显式 maven 撞同一条 ⇒ 去重"
+    # 对照：单栈 spec 输出与治前一致（就是 registry 单条原文，无链接）
+    from swarm.worker.image_builder import stack_entry
+    single = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="go", version=None, build_tool="go", dep_source="x")])
+    assert _selftest_command(single) == stack_entry("go", "go").selftest
+
+
+def test_unknown_toolchain_emits_warning(caplog):
+    """★X-M7（27 号文 §3.2）★ 未知工具链治前只在 Dockerfile 里留一行注释——降级路径
+    至少一次 WARNING（血规 3），否则「镜像里没装它的构建工具 ⇒ L1 闸整类 127/skip」
+    这层降级谁都看不见。"""
+    import logging
+
+    from swarm.worker.image_builder import _toolchain_install
+
+    with caplog.at_level(logging.WARNING, logger="swarm.worker.image_builder"):
+        frag = _toolchain_install(Toolchain(name="php", version=None, build_tool="composer",
+                                            dep_source="composer.json"))
+    assert "未知工具链" in frag, "Dockerfile 注释保留（人读面）"
+    assert any("未知工具链" in r.getMessage() and "php" in r.getMessage()
+               for r in caplog.records), "降级必须 WARNING（机读可观测，X-M7）"
 
 
 def test_wrapper_jars_survive_source_tarball(tmp_path):
