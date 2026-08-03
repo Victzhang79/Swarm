@@ -3676,34 +3676,59 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
             logger.warning("[L1.2] py_compile 执行异常: %s", exc, exc_info=True)
             return False, f"py_compile execution error: {exc}"
 
-    js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]
+    js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue"))]
     # tsc --noEmit 需要【完整工程树+node_modules】才能解析 import → 走沙箱优先(A-P1-10)。
     # 沙箱模式下 package.json 不在本地，用 _manifest_present 沙箱感知判定。
     if js_ts and _manifest_present(("package.json",), project_path):
-        try:
-            rc, out, err = _run_check_split("npx tsc --noEmit --pretty false", project_path, timeout=timeout)
-            combined = (out or "") + (("\n" + err) if err else "")
-            # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
-            if isinstance(raw_out, dict):
-                raw_out["text"] = combined      # X-C3：分类器吃全文（人读消息才截断）
-            if rc != 0 and _is_infra_failure(combined):
-                logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
-            elif rc != 0:
-                # A2 治本(fail-closed)：任何【非 infra】的 tsc 失败都判编译不过——
-                # 不再依赖字面 "error TS" 子串。解析错误/声明错误/本地化(中文)输出/自定义报错
-                # 都不含该串，旧代码会落到末尾 return True 静默假绿。rc!=0 且非 infra = 真失败。
-                return False, (combined.strip()[:1000] or f"tsc failed rc={rc}")
-        except Exception as exc:
-            # R23-2 治本：tsc 执行【异常】旧代码只 log 后落到末尾 return True 假绿。区分：
-            # 明确 infra（npx/tsc 缺失、无网装 typescript）→ 跳过闸门(非能力失败)；其余(超时/意外崩溃)
-            # → fail-closed 判不过（超时可能掩盖真 hang，不能当编译通过）。
-            _exc_txt = f"{type(exc).__name__}: {exc}"
-            # FileNotFoundError=工具/命令缺失(npx/node 不在)=明确 infra；再叠加文本模式判定。
-            if isinstance(exc, FileNotFoundError) or _is_infra_failure(_exc_txt):
-                logger.warning("[L1.2] tsc 工具/基础设施异常，跳过编译闸门(非能力失败): %s", exc)
-            else:
-                logger.warning("[L1.2] tsc 执行异常(非 infra)，fail-closed 判未通过: %s", exc)
-                return False, f"tsc 执行异常: {_exc_txt}"[:1000]
+        # ★X-M8（27 号文 §3.2）★ tsc 解析不了 .vue SFC（单文件组件要 vue-tsc）——治前
+        # 触发集连 .vue 都不含：Vue 工程的 .vue 改动**零类型闸**。有 .vue 时先试
+        # `vue-tsc`（Vue 官方维护的 tsc 封装，覆盖 .vue+.ts 超集）；项目没装 vue-tsc
+        # → 退 tsc + WARNING（.vue 无类型覆盖=降级，必须机读可观测，血规 10④）。
+        _used_vue_tsc = False
+        if any(f.endswith(".vue") for f in js_ts):
+            try:
+                _vrc, _vout, _verr = _run_check_split(
+                    "npx --no-install vue-tsc --noEmit --pretty false",
+                    project_path, timeout=timeout)
+                _vcomb = (_vout or "") + (("\n" + _verr) if _verr else "")
+                if isinstance(raw_out, dict):
+                    raw_out["text"] = _vcomb      # X-C3：分类器吃全文
+                if _tool_missing(_vcomb) or _is_infra_failure(_vcomb):
+                    logger.warning(
+                        "[L1.2] X-M8 项目缺 vue-tsc（或基础设施瞬时错误）→ .vue 改动"
+                        "**无类型覆盖**，退 tsc（只覆盖 .ts/.js）: %s", _vcomb[:200])
+                elif _vrc != 0:
+                    # 与 tsc 同口径（A2 fail-closed）：非 infra 的 vue-tsc 失败即编译不过
+                    return False, (_vcomb.strip()[:1000] or f"vue-tsc failed rc={_vrc}")
+                else:
+                    _used_vue_tsc = True
+            except FileNotFoundError as exc:
+                logger.warning("[L1.2] X-M8 vue-tsc 执行工具缺失，退 tsc（.vue 无类型覆盖）: %s", exc)
+        if not _used_vue_tsc:
+            try:
+                rc, out, err = _run_check_split("npx tsc --noEmit --pretty false", project_path, timeout=timeout)
+                combined = (out or "") + (("\n" + err) if err else "")
+                # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
+                if isinstance(raw_out, dict):
+                    raw_out["text"] = combined      # X-C3：分类器吃全文（人读消息才截断）
+                if rc != 0 and _is_infra_failure(combined):
+                    logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
+                elif rc != 0:
+                    # A2 治本(fail-closed)：任何【非 infra】的 tsc 失败都判编译不过——
+                    # 不再依赖字面 "error TS" 子串。解析错误/声明错误/本地化(中文)输出/自定义报错
+                    # 都不含该串，旧代码会落到末尾 return True 静默假绿。rc!=0 且非 infra = 真失败。
+                    return False, (combined.strip()[:1000] or f"tsc failed rc={rc}")
+            except Exception as exc:
+                # R23-2 治本：tsc 执行【异常】旧代码只 log 后落到末尾 return True 假绿。区分：
+                # 明确 infra（npx/tsc 缺失、无网装 typescript）→ 跳过闸门(非能力失败)；其余(超时/意外崩溃)
+                # → fail-closed 判不过（超时可能掩盖真 hang，不能当编译通过）。
+                _exc_txt = f"{type(exc).__name__}: {exc}"
+                # FileNotFoundError=工具/命令缺失(npx/node 不在)=明确 infra；再叠加文本模式判定。
+                if isinstance(exc, FileNotFoundError) or _is_infra_failure(_exc_txt):
+                    logger.warning("[L1.2] tsc 工具/基础设施异常，跳过编译闸门(非能力失败): %s", exc)
+                else:
+                    logger.warning("[L1.2] tsc 执行异常(非 infra)，fail-closed 判未通过: %s", exc)
+                    return False, f"tsc 执行异常: {_exc_txt}"[:1000]
 
     # E3（round38c 主题E，register #31）：非编译数据文件确定性语法校验。此前只产
     # .md/.sql/.yml/.properties/.html 的子任务除 L1.1 scope 检查外零确定性面（本函数

@@ -7,6 +7,7 @@
 
 ★锁的命题★ X-M 批一（27 号文 §3.2 X-M2/M5/M7）：多栈覆盖的「快赢」三条——
 .kt 包声明对账 / 混编逐栈自测 / 未知工具链降级可观测。
+X-M 批二（X-M8）：.vue 进类型闸触发集 + vue-tsc 优选 + 缺 vue-tsc 降级 WARNING。
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_image_builder.py",
-         "test/test_e_theme_supply_gates_batch1.py"]
+         "test/test_e_theme_supply_gates_batch1.py",
+         "test/test_xm8_vue_type_gate.py"]
 
 IMG = ROOT / "worker" / "image_builder.py"
 PIPE = ROOT / "worker" / "l1_pipeline.py"
@@ -50,6 +52,30 @@ MUTATIONS = [
         '    logger.warning("[IMAGE-BUILD] X-M7 未知工具链 %r（build_tool=%r）：镜像不装它的构建"',
         '    logger.debug("[IMAGE-BUILD] X-M7 未知工具链 %r（build_tool=%r）：镜像不装它的构建"',
         ['test_unknown_toolchain_emits_warning'],
+    ),
+    (
+        "X-M8a：触发集删掉 .vue（.vue 改动回退到「js_ts 为空 → 类型闸整段跳过」＝零覆盖）",
+        PIPE,
+        'js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue"))]',
+        'js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]',
+        ['test_vue_change_is_type_checked_by_vue_tsc'],
+    ),
+    (
+        "X-M8b：vue-tsc 优选被摘（.vue 直接喂 tsc —— tsc 解析不了 SFC，要么假红要么靠"
+        " infra 豁免假绿，两种都是错答案）",
+        PIPE,
+        'if any(f.endswith(".vue") for f in js_ts):',
+        'if False:',
+        ['test_vue_change_is_type_checked_by_vue_tsc'],
+    ),
+    (
+        "X-M8c：缺 vue-tsc 的降级 WARNING 降成 DEBUG（.vue 无类型覆盖这一降级不可观测，血规 3）",
+        PIPE,
+        '''logger.warning(
+                        "[L1.2] X-M8 项目缺 vue-tsc''',
+        '''logger.debug(
+                        "[L1.2] X-M8 项目缺 vue-tsc''',
+        ['test_missing_vue_tsc_falls_back_to_tsc_with_warning'],
     ),
 ]
 
