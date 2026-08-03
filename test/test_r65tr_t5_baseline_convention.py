@@ -230,6 +230,12 @@ def _stack_cache_payload_digest() -> str:
                         "main.go": "package main\nfunc main(){}\n",
                         "deploy/chart/Chart.yaml": "apiVersion: v2\nname: api\n",
                         "deploy/chart/templates/_helpers.tpl": "{{- end -}}\n"}),
+        # P-C3 复核 R2-H1：Chart.yaml 在**仓根**（chart 仓标准布局）——与前一个夹具唯一
+        # 差异是 chart 位置；排除判据对根目录的处理只有这个夹具捕得到（治前恒假⇒unrec=True）。
+        ("helm_chart_root", {"go.mod": "module example.com/api\n\ngo 1.21\n",
+                             "main.go": "package main\nfunc main(){}\n",
+                             "Chart.yaml": "apiVersion: v2\nname: api\n",
+                             "templates/_helpers.tpl": "{{- end -}}\n"}),
     ):
         with tempfile.TemporaryDirectory() as d:
             for rel, body in files.items():
@@ -268,8 +274,12 @@ def test_stack_schema_version_paired_with_cached_payload():
     # + #20 四栈扩表（_TEMPLATE_EXT_ENGINE/_SERVER_TEMPLATE_DEP/_TEMPLATE_DIR_NAMES 三张表）。
     # v6→v7：#21 LOW-6 删零消费者键（signals.unengined_template_dir_files ⇒ key_paths 变）
     # + MEDIUM-5 Helm chart 排除（新增 verdict[helm_chart] 夹具位）。
+    # v7→v8：P-C3 复核 R2-H1 根级 Helm chart 排除修复（新增 verdict[helm_chart_root] 夹具位，
+    # 其结论从 unrec:True 翻回 False）+ R2-H3 半截采纳收口（节点裁决行为，摘要盖不到，
+    # 但同属「已缓存项目正确答案变了」⇒ 必须同批 bump）。常量本体同批迁至 stack_detect.py
+    # （R2-H4：worker 第二读取路径同源消费），planning_nodes re-export 保可寻址。
     # 摘要跨 hash 种子稳定（实测 PYTHONHASHSEED=0/1/12345/random 四轮同值）。
-    assert (_STACK_SCHEMA_VERSION, digest) == (7, "18b2a5446dd19112"), (
+    assert (_STACK_SCHEMA_VERSION, digest) == (8, "649bdaf5c0d45b2f"), (
         f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"

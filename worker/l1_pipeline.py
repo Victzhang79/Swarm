@@ -1476,6 +1476,9 @@ def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
     """
     if not project_stack:
         return None
+    # P-C3 复核 R2-H5：SPA-like 子集走单一事实源（lazy import 防 worker→brain 顶层成环；
+    # llm_schemas 仅依赖 pydantic+swarm.types，无传递重量）。
+    from swarm.brain.llm_schemas import SPA_LIKE_KINDS
     build = (project_stack.get("build") or "").strip().lower()
     fe = (project_stack.get("frontend") or "").lower()
     fe_kind = (project_stack.get("frontend_kind") or "").lower()
@@ -1488,7 +1491,7 @@ def _stack_repair_langs(project_stack: dict | None) -> set[str] | None:
         langs.add("rust")
     if build in ("npm", "yarn", "pnpm"):
         langs.add("ts")
-    if fe_kind in ("spa", "separated") or any(
+    if fe_kind in SPA_LIKE_KINDS or any(
         x in fe for x in ("vue", "react", "angular", "svelte", "next")
     ):
         langs.add("ts")

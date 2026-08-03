@@ -99,11 +99,23 @@ class _AgentLoopMixin:
         if fp_drifted:
             logger.info("[STACK] 缓存技术栈指纹漂移(%s→%s)，整画像重探（B20）",
                         profile.get("fingerprint"), cur_fp)
-        need_disk = fp_drifted or not profile or not (
+        # ★P-C3 复核 R2-H4★ 缓存画像的【第二道版本闸】：本路径是 projects.config 画像在
+        # detect_stack 节点之外的第二读取点，此前只看指纹漂移/jvm 两键——v7 前的旧 schema
+        # 画像（缺 MEDIUM-4/5 修复）在 detect_stack 未重跑的路径（独立 worker/回放/异常跳过）
+        # 上继续当硬前提喂 worker prompt，而本函数注释一度自称"与 _STACK_SCHEMA_VERSION
+        # 双保险"实则从未引用该常量（闸存在 ≠ 接上了）。schema 不符 ⇒ 整画像重探（同
+        # fp_drifted：旧画像的前后端裁决一并作废，绝不新旧字段混拼）。
+        from swarm.brain.stack_detect import _STACK_SCHEMA_VERSION as _ssv
+        stale_schema = bool(profile) and profile.get("schema_version") != _ssv
+        if stale_schema:
+            logger.info("[STACK] 缓存技术栈画像 schema_version=%r ≠ 当前 %s，整画像重探（R2-H4）",
+                        (profile or {}).get("schema_version"), _ssv)
+        need_disk = fp_drifted or stale_schema or not profile or not (
             (profile.get("jvm") or {}).get("servlet_namespace")
         ) or (
             # R65TR-T5 猎手 F3：老缓存画像缺新 jvm 事实键 → 补探（否则 lombok 基线
-            # 约束对已建档项目永不生效；与 _STACK_SCHEMA_VERSION=3 双保险）。
+            # 约束对已建档项目永不生效；与 _STACK_SCHEMA_VERSION 双保险——自 R2-H4 起
+            # 此处真的引用该常量，见上方 stale_schema）。
             profile.get("jvm") is not None
             and "lombok_available" not in (profile.get("jvm") or {})
         )
@@ -111,8 +123,8 @@ class _AgentLoopMixin:
             try:
                 from swarm.brain.stack_detect import detect_stack_deterministic
                 fresh = detect_stack_deterministic(self.project_path)
-                if fp_drifted:
-                    profile = fresh  # 指纹漂移 → 整画像重取，不保留旧前后端裁决
+                if fp_drifted or stale_schema:
+                    profile = fresh  # 指纹漂移 / schema 过旧 → 整画像重取，不保留旧前后端裁决
                     if cur_fp:
                         profile["fingerprint"] = cur_fp
                 elif profile and (fresh.get("jvm") or {}).get("servlet_namespace"):

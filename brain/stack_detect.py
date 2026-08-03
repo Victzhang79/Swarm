@@ -266,6 +266,49 @@ _NOISE_DIRS = {".git", "node_modules", "target", "dist", "build", ".venv",
                "__pycache__", ".idea", ".codegraph", "vendor", ".gradle"}
 
 
+# 栈画像 schema 版本：探测逻辑/画像字段变更时递增，使按指纹缓存的旧画像失效重探。
+# 仅指纹（repo 内容）相同不足以复用——画像结构变了（如新增 infra_symbols），旧缓存缺字段。
+# ★常量本体住本模块（画像生产侧），不住 planning_nodes★：worker 的 _resolve_project_stack
+# 是缓存画像的【第二读取路径】，也必须过这道闸（P-C3 复核 R2-H4：它一度只看指纹漂移/jvm 键，
+# 旧 schema 画像在 detect_stack 未重跑的路径上继续当硬前提喂 worker）。planning_nodes
+# re-export 保可寻址。
+# v2: 新增 infra_symbols（基建符号锚点，治本 worker 臆造不存在的框架类如 RedisCache）。
+# v3: jvm 新增 lombok_available/lombok_source（R65TR-T5 基线注解处理器在位性）——不 bump
+#     则已缓存画像永缺该键、硬约束永不渲染（猎手 F3，前例 108676a 同纪律）。
+# v4: 新增 infra_symbol_methods（R65E8-T5 基建类 public 方法签名 grounding，治 method 级幻觉
+#     如缓存类调裸 .set/.get）——不 bump 则已缓存画像永缺该键、方法签名永不渲染（同 F3 纪律）。
+# v5: P-C3（fee9a2a）模板引擎事实表多栈化 + 新增机读键 signals.tmpl_engine_unrecognized。
+#     ★该 commit 漏了这次 bump，本条是补票（27 号文 #19 / P-C3 复核 CRITICAL-2）★
+#     实测受害：项目 5d0e9db8（RuoYi E2E 基线）缓存里 schema_version=4 == 当时常量 4 ⇒
+#     缓存命中早返 ⇒ fee9a2a 那 198 行探测逻辑一行都不执行，且其画像里没有
+#     tmpl_engine_unrecognized 键。后果形态是**静默 no-op 而非崩溃**：消费者
+#     （format_stack_for_prompt、detect_stack 的裁决后清标）都用 `.get(...)` 读，缺键得
+#     None＝假值 ⇒ 那条 fail-closed 分支永不进 ⇒ Django/Flask/Gin/Laravel 的服务端渲染
+#     继续判 frontend_kind="none"，"禁止产 .vue" 的约定继续发不出去。
+#     ⇒ 扩事实表**改变了已缓存项目的正确答案**，这类改动必须 bump，不只是"加字段才 bump"。
+# v6: #18 判据计数范围收敛（全仓任意 .html → 模板目录作用域）+ #20 四栈扩表（JSF/WebForms/
+#     Magento/Grails）。★这次同样是"改变了已缓存项目的正确答案"那一类★：
+#     #18 让 DRF 纯 API 工程从 server-template/0.95（错）翻回 none；#20 让四栈从 none/0.75
+#     （错）翻成 server-template。已建档项目缓存里存的正是那批**旧的错答案**，不 bump ⇒ 命中
+#     缓存早返 ⇒ 治法对所有已建档项目一行不生效（同 v5 的 CRITICAL-2 形态，第二次）。
+# v7: #21（P-C3 复核 MEDIUM-4/5 + LOW-6）。MEDIUM-4：清标判据锁到被消费的 frontend_kind
+#     上（schema validator 拦非枚举非空值 + 清标合取拦漏字段）——治前已采纳的劣化裁决
+#     （kind='server_template' 等，标已清、一条约定都不发）**已按指纹写进缓存**，而缓存命中
+#     路径不重看 needs_model_adjudication ⇒ 不 bump 那些项目永远钉在"什么都不发"。
+#     MEDIUM-5：Helm chart 的 templates/_helpers.tpl 不再误触发「认不得」（Chart.yaml
+#     排除）⇒ 带 Helm chart 的仓的正确答案从 adj=True 翻回不裁决——同样是"改变了已缓存
+#     项目的正确答案"那一类（v5/v6 同形状，第三次）。LOW-6：删两个零消费者键
+#     （signals.unengined_template_dir_files / tmpl_engine_unrecognized_adjudicated），
+#     画像字段变化本身也要 bump。
+# v8: P-C3 复核 R2（hunter 第二轮）。① 根级 Helm chart（Chart.yaml 在仓根——chart 仓的
+#     标准布局）排除失效修复：治前根 chart 仓的 templates/*.tpl 照旧触发「认不得」（rel=""
+#     时前缀判据恒假），正确答案从 adj=True 翻回不裁决。② 裁决「半截采纳」收口：kind
+#     漏字段/不可消费时不再单独采纳 frontend 自由文本（治前画像同时挂「前端=Twig」与
+#     「形态=none+认不得未清」，自矛盾且**已按指纹写进缓存**）——已缓存的那批自矛盾
+#     画像不 bump 永不刷新。两者同属"改变了已缓存项目的正确答案"（v5/v6/v7 同形状，第四次）。
+_STACK_SCHEMA_VERSION = 8
+
+
 def compute_repo_fingerprint(project_path: str) -> str:
     """repo 指纹：构建/清单文件的(相对路径+大小) + 顶层目录名集合 的稳定哈希。
 
@@ -673,6 +716,11 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     # 硬约定命中词 ⇒ 纯 API + Helm chart 的仓被误拉进「认不得」，白烧一轮 LLM 裁决）。
     helm_chart_dirs: set[str] = set()   # Chart.yaml/values.yaml 所在目录（rel，"/" 分隔）
     unengined_candidates: list[str] = []  # 候选 rel 路径（封顶 200 防巨仓）
+    # ★P-C3 复核 R2-H2★ 超出 200 上限被丢弃的候选数——截断必须留痕（血规 10④：
+    # 「空返回/缺席」与「真没有」必须机读可辨）。治前第 201 个起静默丢弃，WARNING/evidence
+    # 把下界当真数报（实测 250 个文件报「200 个」）。机器裁决只消费 `>0`（两处），截断不改
+    # 裁决方向，只改人读面的诚实性——故不新增机读键（新账没有消费者＝没造）。
+    unengined_candidates_dropped = 0
     spa_files: Counter = Counter()
     jsx_count = 0
     has_angular = False
@@ -746,15 +794,28 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
                     if len(unengined_candidates) < 200:
                         unengined_candidates.append(
                             (rel.replace(os.sep, "/") + "/" + f) if rel else f)
+                    else:
+                        unengined_candidates_dropped += 1   # R2-H2：截断留痕
 
     # MEDIUM-5：Helm chart 内的网页后缀文件（`_helpers.tpl` 等）一律不计——它们是 K8s
     # manifest 模板片段，不是网页。判定＝候选文件的目录落在某个 chart 根之下（含嵌套
     # 子目录，如 `<chart>/templates/sub/`）。
+    # ★P-C3 复核 R2-H1★ `_h == ""`＝Chart.yaml 在**仓根**（chart 仓的标准布局：Chart.yaml +
+    # values.yaml + templates/ 全在根）⇒ 全仓皆在该 chart 之下，必须视作匹配一切候选——
+    # 治前 `_cdir.startswith("" + "/")` 恒假，根 chart 仓的 templates/*.tpl 照旧触发
+    # 「认不得」（hunter 实测：同结构放根目录 unrec=True，放 deploy/chart/ 下 unrec=False）。
     for _cand in unengined_candidates:
         _cdir = _cand.rsplit("/", 1)[0] if "/" in _cand else ""
-        if any(_cdir == _h or _cdir.startswith(_h + "/") for _h in helm_chart_dirs):
+        if any(_h == "" or _cdir == _h or _cdir.startswith(_h + "/")
+               for _h in helm_chart_dirs):
             continue
         unengined_tmpl_dir_files += 1
+    if unengined_candidates_dropped:
+        logger.warning(
+            "[STACK-DETECT] P-C3 复核 R2-H2：模板目录网页文件候选超出记账上限 200，"
+            "另 %d 个被丢弃未逐一核对——下方「认不得」计数为**下界**（机器裁决只消费 >0，"
+            "方向不受影响；人读面不得把下界当真数）。project_path=%r",
+            unengined_candidates_dropped, project_path)
 
     evidence: list[str] = []
     # ── 后端语言/构建/框架 ──
@@ -897,13 +958,16 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         )
     if tmpl_engine_unrecognized:
         # 机读键 `tmpl_engine_unrecognized` 的人读面（降级路径至少一次 WARNING，血规 10 第四条）。
+        _cap_note = (f"（候选记账达上限 200、另 {unengined_candidates_dropped} 个未核对，"
+                     f"计数为下界）" if unengined_candidates_dropped else "")
         logger.warning(
-            "[STACK-DETECT] P-C3 模板目录下有 %d 个网页文件，但**未识别出任何模板引擎** → "
+            "[STACK-DETECT] P-C3 模板目录下有 %d 个网页文件%s，但**未识别出任何模板引擎** → "
             "前端形态判定为【认不得】而非【无前端】：降置信 + 强制交模型裁决。"
             "若这是本仓真实使用的引擎，请给 _TEMPLATE_EXT_ENGINE / _SERVER_TEMPLATE_DEP "
-            "加表项（加一栈=加一条）。project_path=%r", unengined_tmpl_dir_files, project_path)
+            "加表项（加一栈=加一条）。project_path=%r",
+            unengined_tmpl_dir_files, _cap_note, project_path)
         evidence.append(
-            f"★前端形态未判明★ 模板目录下有 {unengined_tmpl_dir_files} 个网页文件"
+            f"★前端形态未判明★ 模板目录下有 {unengined_tmpl_dir_files} 个网页文件{_cap_note}"
             f"（.html/.php 等），但既无已知模板后缀、清单里也无已知模板引擎依赖 → "
             f"无法确定是服务端模板还是静态资源。**请据仓库实际情况裁决**，勿默认为"
             f"「无前端」（那会导致新增页面被规划成独立 SPA 工程＝死代码）。"

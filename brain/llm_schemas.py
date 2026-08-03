@@ -55,6 +55,13 @@ class ComplexityAssessmentResponse(BaseModel):
 # 清标合取三处同源（MEDIUM-4：判据必须锁在被消费的那个字段上）。
 FRONTEND_KINDS = ("server-template", "spa", "separated", "none")
 
+# SPA-like 子集：有【独立前端工程】（需要 npm 类构建/lint 闸门、ts 语言推断）的形态。
+# 消费契约与 FRONTEND_KINDS 不同（后者是全枚举）：worker/l1_pipeline._stack_repair_langs
+# 按它把 ts 纳入 repair 语言集。新增 kind 时须显式拍板是否归此子集——不自动获得是刻意的
+# （kind 的语义后果逐个判断，fail-closed：漏接=少发闸门，可观测；错接=给无前端工程发
+# npm 闸门，冤杀）。P-C3 复核 R2-H5：此前该子集是 l1_pipeline 里的手写字面量。
+SPA_LIKE_KINDS = ("spa", "separated")
+
 
 class StackAdjudicateResponse(BaseModel):
     """DETECT_STACK 大模型裁决响应。frontend 为载荷关键(调用方据其决定是否采纳裁决)。"""

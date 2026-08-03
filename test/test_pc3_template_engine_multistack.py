@@ -329,6 +329,148 @@ def test_lone_tpl_without_a_chart_marker_is_still_unrecognized(tmp_path):
     assert prof["needs_model_adjudication"] is True
 
 
+def test_root_level_helm_chart_is_also_excluded(tmp_path):
+    """★P-C3 复核 R2-H1（病灶本体）★ Chart.yaml 在**仓根**＝chart 仓的标准布局
+    （Chart.yaml + values.yaml + templates/ 全在根），治前排除判据
+    `_cdir.startswith("" + "/")` 恒假 ⇒ 根 chart 仓照旧被判「认不得」白烧裁决。
+
+    hunter 实测对照：同一结构放 `deploy/chart/` 下 unrec=False，放根 unrec=True。
+    """
+    prof = detect(_mk(tmp_path, {
+        "go.mod": "module example.com/api\n\ngo 1.21\n",
+        "main.go": "package main\nfunc main(){}\n",
+        "Chart.yaml": "apiVersion: v2\nname: api\n",
+        "values.yaml": "replicas: 2\n",
+        "templates/_helpers.tpl": "{{- define \"api.name\" -}}api{{- end -}}\n",
+        "templates/deployment.yaml": "apiVersion: apps/v1\n",
+    }))
+    assert prof["frontend_kind"] == "none"
+    assert prof["signals"]["tmpl_engine_unrecognized"] is False, \
+        "根级 Helm chart（chart 仓标准布局）的 templates/*.tpl 不是网页文件（R2-H1）"
+    assert prof["needs_model_adjudication"] is False, "不得白烧一轮 LLM 裁决"
+
+
+def test_unengined_candidates_cap_leaves_a_trace(tmp_path, caplog):
+    """★P-C3 复核 R2-H2★ 候选记账封顶 200 后，超出部分必须留痕（血规 10④：截断不得
+    静默）。治前第 201 个起直接丢弃，WARNING/evidence 把下界当真数报（250 个文件报
+    「200 个」）。机器裁决只消费 `>0`，本锁只钉人读面的诚实性。"""
+    import logging as _log
+    files = {"go.mod": "module example.com/api\n\ngo 1.21\n",
+             "main.go": "package main\nfunc main(){}\n"}
+    # 250 个未知引擎网页文件（.xhtml 在 _WEBPAGE_EXTS 而不在任何引擎表）
+    for i in range(250):
+        files[f"templates/page{i:03d}.xhtml"] = "<html>#{x}</html>\n"
+    with caplog.at_level(_log.WARNING, logger="swarm.brain.stack_detect"):
+        prof = detect(_mk(tmp_path, files))
+    assert prof["signals"]["tmpl_engine_unrecognized"] is True, "下界>0 ⇒ 裁决方向不变"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("下界" in m and "50" in m for m in msgs), \
+        "截断必须 WARNING 留痕（含被丢弃数），不得把下界 200 当真数"
+    assert any("下界" in e for e in prof.get("evidence") or []), \
+        "evidence 人读面同样不得把下界当真数"
+
+
+# ── R2-H4：worker 侧缓存画像第二读取路径必须过 schema 闸 ────────────────────
+
+
+def test_worker_stack_resolution_reprobes_on_stale_schema(tmp_path, monkeypatch):
+    """★P-C3 复核 R2-H4（病灶本体）★ worker 的 `_resolve_project_stack` 是 projects.config
+    缓存画像的**第二读取路径**（detect_stack 之外的独立 worker/回放/异常跳过路径），治前
+    只看指纹漂移 + jvm 两键——v7 前的旧 schema 画像继续当硬前提喂 worker prompt，而代码
+    注释自称「与 _STACK_SCHEMA_VERSION 双保险」实则从未引用该常量（闸存在 ≠ 接上了）。
+
+    判据：缓存画像 schema_version 过旧 ⇒ 返回的是【当场重探】的画像而非缓存旧画像。
+    把 stale_schema 分支删掉（突变），本条必须红。
+    """
+    from swarm.worker import executor_agent as ea
+
+    proj = _mk(tmp_path, {
+        "go.mod": "module example.com/api\n\ngo 1.21\n",
+        "main.go": "package main\nfunc main(){}\n",
+    })
+    stale = {"frontend": "陈旧裁决文本", "frontend_kind": "server-template",
+             "backend": "go", "build": "go", "confidence": 0.9,
+             "schema_version": 4,  # 旧 schema（当前常量 8）
+             "jvm": {"servlet_namespace": "javax", "lombok_available": False}}
+
+    class _Store:
+        @staticmethod
+        def get_project(pid):
+            return {"config": {"project_stack": stale}}
+
+    monkeypatch.setattr("swarm.project.store.get_project", _Store.get_project)
+    ea._PROJECT_STACK_CACHE.clear()
+    try:
+        ex = object.__new__(ea._AgentLoopMixin)
+        ex.project_path = str(proj)
+        ex.project_id = "p-stale-schema"
+        prof = ex._resolve_project_stack()
+    finally:
+        ea._PROJECT_STACK_CACHE.clear()
+    assert prof is not None
+    assert prof.get("frontend") != "陈旧裁决文本", \
+        "旧 schema 画像必须整画像重探，不得把缓存的陈旧裁决继续喂 worker（R2-H4）"
+
+
+def test_worker_stack_resolution_keeps_current_schema_profile(tmp_path, monkeypatch):
+    """★对照方向★ schema_version 匹配且指纹一致 ⇒ 直接用缓存画像（不重探、不白扫盘）。"""
+    from swarm.brain.stack_detect import _STACK_SCHEMA_VERSION
+    from swarm.worker import executor_agent as ea
+
+    proj = _mk(tmp_path, {
+        "go.mod": "module example.com/api\n\ngo 1.21\n",
+        "main.go": "package main\nfunc main(){}\n",
+    })
+    from swarm.brain.stack_detect import compute_repo_fingerprint
+    current = {"frontend": "缓存裁决文本", "frontend_kind": "none",
+               "backend": "go", "build": "go", "confidence": 0.9,
+               "schema_version": _STACK_SCHEMA_VERSION,
+               "fingerprint": compute_repo_fingerprint(str(proj)),
+               "jvm": {"servlet_namespace": "javax", "lombok_available": False}}
+
+    class _Store:
+        @staticmethod
+        def get_project(pid):
+            return {"config": {"project_stack": current}}
+
+    monkeypatch.setattr("swarm.project.store.get_project", _Store.get_project)
+    ea._PROJECT_STACK_CACHE.clear()
+    try:
+        ex = object.__new__(ea._AgentLoopMixin)
+        ex.project_path = str(proj)
+        ex.project_id = "p-current-schema"
+        prof = ex._resolve_project_stack()
+    finally:
+        ea._PROJECT_STACK_CACHE.clear()
+    assert prof is not None and prof.get("frontend") == "缓存裁决文本", \
+        "schema 匹配 + 指纹一致 ⇒ 权威缓存画像必须原样沿用（不得误伤主路径）"
+
+
+# ── R2-H5：SPA-like 子集单一事实源 ──────────────────────────────────────────
+
+
+def test_spa_like_kinds_is_a_subset_of_frontend_kinds():
+    """SPA_LIKE_KINDS 必须是 FRONTEND_KINDS 的真子集（否则 schema 放不进一个 l1 当作
+    有前端工程的 kind，或反之）。"""
+    from swarm.brain.llm_schemas import FRONTEND_KINDS, SPA_LIKE_KINDS
+    assert 0 < len(SPA_LIKE_KINDS) < len(FRONTEND_KINDS)
+    assert set(SPA_LIKE_KINDS) <= set(FRONTEND_KINDS)
+
+
+def test_stack_repair_langs_consumes_the_spa_like_subset():
+    """l1_pipeline._stack_repair_langs 的 fe_kind 分档必须消费 SPA_LIKE_KINDS 单一事实源
+    （治前是手写 ("spa","separated") 字面量，新增 kind 时静默漏接——R2-H5）。"""
+    from swarm.brain.llm_schemas import FRONTEND_KINDS, SPA_LIKE_KINDS
+    from swarm.worker.l1_pipeline import _stack_repair_langs
+
+    for kind in SPA_LIKE_KINDS:
+        langs = _stack_repair_langs({"build": "", "frontend": "", "frontend_kind": kind})
+        assert langs == {"ts"}, f"SPA-like kind={kind} 必须推出 ts（独立前端工程）"
+    for kind in set(FRONTEND_KINDS) - set(SPA_LIKE_KINDS):
+        langs = _stack_repair_langs({"build": "", "frontend": "", "frontend_kind": kind})
+        assert langs is None, f"非 SPA-like kind={kind} 不得推出 ts（无独立前端工程）"
+
+
 def test_vue_spa_with_views_dir_is_not_flagged_unrecognized(tmp_path):
     """`src/views/*.vue` 是 SPA 的常见布局，目录名恰好撞上模板目录惯例名。
 
@@ -544,8 +686,13 @@ async def test_adjudication_with_non_enum_kind_is_rejected_at_the_schema(tmp_pat
 async def test_adjudication_with_missing_kind_does_not_clear_the_flag(tmp_path, monkeypatch,
                                                                      caplog):
     """★MEDIUM-4 劣化形态二★ **漏字段**（`frontend_kind` 缺席 ⇒ 默认 ""）——schema 放行
-    （空串是"模型没答"的合法形状），由清标合取分档：采纳 frontend 文本、kind 保留初判、
-    **不清标** + WARNING，让"认不得"提示继续发。
+    （空串是"模型没答"的合法形状），由清标合取分档：kind 保留初判、**不清标** + WARNING，
+    让"认不得"提示继续发。
+
+    ★P-C3 复核 R2-H3 行为变更★ frontend 文本也不再单独采纳——kind 漏字段时只采纳文本
+    会造出自矛盾画像（`前端=服务端模板（Hamlet）` 与 `形态=none + 认不得标未清` 同挂，
+    hunter 实测 format_stack_for_prompt 输出两行互相矛盾），且按指纹写进缓存钉死。
+    前端字段成对不采纳，裁决文本记入 evidence 备查。
     """
     from swarm.brain import planning_nodes as pn
 
@@ -570,7 +717,13 @@ async def test_adjudication_with_missing_kind_does_not_clear_the_flag(tmp_path, 
     with caplog.at_level(logging.WARNING, logger="swarm.brain.planning_nodes"):
         out = await pn.detect_stack(state)
     prof = out["project_stack"]
-    assert prof["frontend"] == "服务端模板（Hamlet）", "frontend 文本裁决应采纳"
+    # R2-H3：kind 漏字段 ⇒ frontend 文本**不**单独采纳（成对原则）
+    assert prof["frontend"] != "服务端模板（Hamlet）", \
+        "kind 不可消费时采纳文本 ⇒ 自矛盾画像（前端=Hamlet 与 形态=none+认不得 同挂）"
+    assert "无法判明" in prof["frontend"], "必须保留确定性初判文本"
+    assert any("Hamlet" in e and "不采纳" in e for e in prof.get("evidence") or []), \
+        "被弃的裁决文本必须记入 evidence 备查（不静默丢弃模型信息）"
+    assert prof["backend"] == "Yesod (haskell)", "backend/build/confidence 不受前端成对闸影响"
     assert prof["frontend_kind"] == "none", "漏字段 ⇒ kind 保留确定性初判"
     assert prof["signals"]["tmpl_engine_unrecognized"] is True, \
         "漏字段 ⇒ 不清标（认不得提示继续发，绝不把「什么都不发」钉成永久状态）"

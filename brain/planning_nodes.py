@@ -888,37 +888,10 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
  "backend":"后端栈(如 Spring Boot (java) / Django (python))","build":"构建工具",
  "confidence":0.0-1.0,"reason":"判定依据(引用证据)"}"""
 
-# 栈画像 schema 版本：探测逻辑/画像字段变更时递增，使按指纹缓存的旧画像失效重探。
-# 仅指纹（repo 内容）相同不足以复用——画像结构变了（如新增 infra_symbols），旧缓存缺字段。
-# v2: 新增 infra_symbols（基建符号锚点，治本 worker 臆造不存在的框架类如 RedisCache）。
-# v3: jvm 新增 lombok_available/lombok_source（R65TR-T5 基线注解处理器在位性）——不 bump
-#     则已缓存画像永缺该键、硬约束永不渲染（猎手 F3，前例 108676a 同纪律）。
-# v4: 新增 infra_symbol_methods（R65E8-T5 基建类 public 方法签名 grounding，治 method 级幻觉
-#     如缓存类调裸 .set/.get）——不 bump 则已缓存画像永缺该键、方法签名永不渲染（同 F3 纪律）。
-# v5: P-C3（fee9a2a）模板引擎事实表多栈化 + 新增机读键 signals.tmpl_engine_unrecognized。
-#     ★该 commit 漏了这次 bump，本条是补票（27 号文 #19 / P-C3 复核 CRITICAL-2）★
-#     实测受害：项目 5d0e9db8（RuoYi E2E 基线）缓存里 schema_version=4 == 常量 4 ⇒ 下面 ①
-#     的相等判据成立 ⇒ 直接 return 缓存画像 ⇒ fee9a2a 那 198 行探测逻辑一行都不执行，且其
-#     画像里没有 tmpl_engine_unrecognized 键。后果形态是**静默 no-op 而非崩溃**：消费者
-#     （stack_detect.py 尾部 format_stack_for_prompt、本文件 detect_stack 的裁决后清标）都用
-#     `.get(...)` 读，缺键得 None＝假值 ⇒ 那条 fail-closed 分支永不进 ⇒ Django/Flask/Gin/
-#     Laravel 的服务端渲染继续判 frontend_kind="none"，"禁止产 .vue" 的约定继续发不出去。
-#     ⇒ 扩事实表**改变了已缓存项目的正确答案**，这类改动必须 bump，不只是"加字段才 bump"。
-# v6: #18 判据计数范围收敛（全仓任意 .html → 模板目录作用域）+ #20 四栈扩表（JSF/WebForms/
-#     Magento/Grails）。★这次同样是"改变了已缓存项目的正确答案"那一类★：
-#     #18 让 DRF 纯 API 工程从 server-template/0.95（错）翻回 none；#20 让四栈从 none/0.75
-#     （错）翻成 server-template。已建档项目缓存里存的正是那批**旧的错答案**，不 bump ⇒ 命中
-#     缓存早返 ⇒ 治法对所有已建档项目一行不生效（同 v5 的 CRITICAL-2 形态，第二次）。
-# v7: #21（P-C3 复核 MEDIUM-4/5 + LOW-6）。MEDIUM-4：清标判据锁到被消费的 frontend_kind
-#     上（schema validator 拦非枚举非空值 + 清标合取拦漏字段）——治前已采纳的劣化裁决
-#     （kind='server_template' 等，标已清、一条约定都不发）**已按指纹写进缓存**，而缓存命中
-#     路径不重看 needs_model_adjudication ⇒ 不 bump 那些项目永远钉在"什么都不发"。
-#     MEDIUM-5：Helm chart 的 templates/_helpers.tpl 不再误触发「认不得」（Chart.yaml
-#     排除）⇒ 带 Helm chart 的仓的正确答案从 adj=True 翻回不裁决——同样是"改变了已缓存
-#     项目的正确答案"那一类（v5/v6 同形状，第三次）。LOW-6：删两个零消费者键
-#     （signals.unengined_template_dir_files / tmpl_engine_unrecognized_adjudicated），
-#     画像字段变化本身也要 bump。
-_STACK_SCHEMA_VERSION = 7
+# 栈画像 schema 版本：常量本体已迁至 brain/stack_detect.py（画像生产侧；worker 的
+# _resolve_project_stack 是缓存画像的第二读取路径，须同源消费——P-C3 复核 R2-H4），
+# 此处 re-export 保可寻址（版本史注释随本体，v2..v8 全在 stack_detect.py）。
+from swarm.brain.stack_detect import _STACK_SCHEMA_VERSION  # noqa: E402,F401
 
 
 async def detect_stack(state: BrainState) -> dict:
@@ -1005,9 +978,21 @@ async def detect_stack(state: BrainState) -> dict:
             # 形状非法 → 抛出 → 下方 except 沿用确定性结果（不静默吞错形裁决）。
             adj = parse_and_validate(resp.content, StackAdjudicateResponse)
             if adj.frontend:
+                # ★P-C3 复核 R2-H3（半截采纳收口）★ frontend 自由文本与 frontend_kind 必须
+                # **成对**采纳：kind 漏字段/不可消费时若只采纳文本，画像同时挂着
+                # 「前端=服务端模板（Twig）」与「形态=none + 认不得标未清」——同一份画像
+                # 对下游既说"是服务端模板"又说"未判明"（hunter 实测 format_stack_for_prompt
+                # 输出两行互相矛盾），且该自矛盾画像会按指纹写进缓存钉死。kind 不可消费
+                # ⇒ 模型并未真正承诺形态 ⇒ 前端字段整体不采纳，裁决文本记入 evidence 备查。
+                _kind_ok = adj.frontend_kind in FRONTEND_KINDS
+                if not _kind_ok:
+                    profile.setdefault("evidence", []).append(
+                        f"模型裁决称前端为「{adj.frontend}」，但未给出可消费的 frontend_kind"
+                        f"（{adj.frontend_kind!r}，枚举 {'|'.join(FRONTEND_KINDS)}）→ "
+                        "前端字段成对不采纳，保留确定性初判（避免文本与形态错配的自矛盾画像）")
                 profile.update({
-                    "frontend": adj.frontend or profile["frontend"],
-                    "frontend_kind": adj.frontend_kind or profile["frontend_kind"],
+                    "frontend": adj.frontend if _kind_ok else profile["frontend"],
+                    "frontend_kind": adj.frontend_kind if _kind_ok else profile["frontend_kind"],
                     "backend": adj.backend or profile["backend"],
                     "build": adj.build or profile["build"],
                     "confidence": adj.confidence or profile["confidence"],
@@ -1029,7 +1014,7 @@ async def detect_stack(state: BrainState) -> dict:
                 # `tmpl_engine_unrecognized_adjudicated` 机读键零生产消费者，已删——
                 # 新账没有消费者＝没造，血规 10 第四条）。
                 if (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):
-                    if adj.frontend_kind in FRONTEND_KINDS:
+                    if _kind_ok:
                         profile["signals"]["tmpl_engine_unrecognized"] = False
                         logger.info(
                             "[DETECT_STACK] P-C3 模板引擎「认不得」已由模型裁决落定为 kind=%s"

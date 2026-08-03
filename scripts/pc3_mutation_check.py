@@ -30,6 +30,7 @@ TESTS = ["test/test_pc3_template_engine_multistack.py",
 SD = ROOT / "brain" / "stack_detect.py"
 PN = ROOT / "brain" / "planning_nodes.py"
 LS = ROOT / "brain" / "llm_schemas.py"
+EA = ROOT / "worker" / "executor_agent.py"
 
 MUTATIONS = [
     # ── ① 事实表扩栈 ──
@@ -232,10 +233,10 @@ MUTATIONS = [
         'prompt 对已裁决的画像继续发"我看不清、别当没前端"）',
         PN,
         '                if (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):\n'
-        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                    if _kind_ok:\n'
         '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
         '                if False:\n'
-        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                    if _kind_ok:\n'
         '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
         ['test_adjudication_clears_the_flag_so_it_is_not_sticky'],
     ),
@@ -252,7 +253,7 @@ MUTATIONS = [
         'MEDIUM-4：清标合取删除（漏字段 kind="" 也清标 ⇒ 「认不得」兜底提示消失，'
         '「什么都不发」钉成永久状态——缓存命中不重裁决）',
         PN,
-        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                    if _kind_ok:\n'
         '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
         '                    if True:\n'
         '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
@@ -262,7 +263,8 @@ MUTATIONS = [
         'MEDIUM-5：Helm chart 排除删除（`templates/_helpers.tpl` 重新误触发「认不得」⇒ '
         '带 Helm chart 的纯 API 仓白烧一轮 LLM 裁决 + prompt 发事实错误描述）',
         SD,
-        '        if any(_cdir == _h or _cdir.startswith(_h + "/") for _h in helm_chart_dirs):\n'
+        '        if any(_h == "" or _cdir == _h or _cdir.startswith(_h + "/")\n'
+        '               for _h in helm_chart_dirs):\n'
         '            continue',
         '        if False:\n'
         '            continue',
@@ -410,9 +412,11 @@ MUTATIONS = [
         '#19：改了事实表却**不**递增 schema 版本（已缓存项目命中缓存早返 ⇒ 治法对所有已建档'
         '项目一行不生效，且是静默 no-op：消费者 `.get()` 读缺键得 None＝假值。这是 v5 那次'
         '事故的原形态，第二次）',
-        PN,
+        # R2-H4 起常量本体迁到 stack_detect.py（worker 同源消费），planning_nodes 只剩
+        # re-export——落点同步迁，别打一个已经不住的地址。
+        SD,
+        '_STACK_SCHEMA_VERSION = 8',
         '_STACK_SCHEMA_VERSION = 7',
-        '_STACK_SCHEMA_VERSION = 6',
         ['test_stack_schema_version_paired_with_cached_payload'],
     ),
     (
@@ -423,6 +427,48 @@ MUTATIONS = [
         '    "webapp",\n    "wwwroot",\n',
         ['test_stack_schema_version_paired_with_cached_payload',
          'test_jsf_xhtml_in_war_root_is_only_reachable_via_the_webapp_dir_name'],
+    ),
+    # ── ⑥ P-C3 复核 R2（hunter 第二轮）────────────────────────────────────
+    (
+        'R2-H1：根级 Helm chart 排除失效（`_h == ""` 匹配一切候选的判据被删 ⇒ chart 仓标准'
+        '布局[Chart.yaml 在仓根]的 templates/*.tpl 照旧触发「认不得」白烧裁决。hunter 实测'
+        '形态：同结构放 deploy/chart/ 下 unrec=False、放根 unrec=True）',
+        SD,
+        '        if any(_h == "" or _cdir == _h or _cdir.startswith(_h + "/")\n'
+        '               for _h in helm_chart_dirs):',
+        '        if any(_cdir == _h or _cdir.startswith(_h + "/")\n'
+        '               for _h in helm_chart_dirs):',
+        ['test_root_level_helm_chart_is_also_excluded',
+         # 摘要守卫也锁得住：helm_chart_root 夹具的 verdict 从 unrec:False 翻回 True ⇒
+         # 摘要变 ⇒ (8, 摘要) 配对破。两向都锁，防"测试被改废而守卫不响"。
+         'test_stack_schema_version_paired_with_cached_payload'],
+    ),
+    (
+        'R2-H2：候选封顶 200 后截断不留痕（第 201 个起静默丢弃，WARNING/evidence 把下界当真'
+        '数报——血规 10④「空返回/缺席必须机读可辨」的计数版）',
+        SD,
+        '                    else:\n'
+        '                        unengined_candidates_dropped += 1   # R2-H2：截断留痕',
+        '                    else:\n'
+        '                        pass',
+        ['test_unengined_candidates_cap_leaves_a_trace'],
+    ),
+    (
+        'R2-H3：裁决「半截采纳」回潮（kind 漏字段/不可消费时单独采纳 frontend 自由文本 ⇒ '
+        '画像同挂「前端=Twig」与「形态=none+认不得未清」，自矛盾且按指纹写进缓存钉死）',
+        PN,
+        '                    "frontend": adj.frontend if _kind_ok else profile["frontend"],',
+        '                    "frontend": adj.frontend,',
+        ['test_adjudication_with_missing_kind_does_not_clear_the_flag'],
+    ),
+    (
+        'R2-H4：worker 第二读取路径不过 schema 闸（_resolve_project_stack 只看指纹漂移/jvm '
+        '两键 ⇒ detect_stack 未重跑的路径上旧 schema 画像继续当硬前提喂 worker prompt，注释'
+        '自称「双保险」实则从未引用常量——闸存在 ≠ 接上了）',
+        EA,
+        '        need_disk = fp_drifted or stale_schema or not profile or not (',
+        '        need_disk = fp_drifted or not profile or not (',
+        ['test_worker_stack_resolution_reprobes_on_stale_schema'],
     ),
 ]
 
