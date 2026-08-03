@@ -60,6 +60,9 @@ _http_cache: dict[str, str | None] = {}
 # ★P-C2 复核 F-1★ `_http_cache` 里 `None` 条目的到期时刻（与它平行，不并入——那个 dict 的
 # 值形状是承重契约，见 brain/dep_http_cache.py 模块 docstring）。
 _http_neg_until: dict[str, float] = {}
+# 探测缓存与文本缓存**分开**：值域不同（三态 bool|None vs 文本|None），混用会让
+# "404 确证" 与 "取到空文本" 撞进同一个键（P-C2）。
+_probe_cache: dict[str, bool | None] = {}
 
 
 def _lookup_enabled() -> bool:
@@ -105,6 +108,63 @@ def _ver_key(v: str) -> tuple:
 def _encode_pkg(pkg: str) -> str:
     """registry URL 路径编码：scoped 包 `@scope/name` 的 `/` 必须转义成 `%2f`。"""
     return urllib.parse.quote(pkg, safe="@")
+
+
+def _http_probe(url: str) -> bool | None:
+    """存在性探测 → `True`（2xx）/ `False`（**404/410 确证不存在**）/ `None`（不可达）。
+
+    ★为什么不能复用 `_http_get`★ 它把"404 包不存在"与"离线/超时"都返 `None` ⇒ 拿它判存在性，
+    离线跑一次就会把**所有**显式依赖判成幻觉、批量误杀真依赖（P-C2 治理里最危险的方向）。
+    三态是硬要求：只有 `False` 才允许判幻觉，`None` 必须 fail-open（R56-6 证据缺失≠否定证据）。
+    ★npm 的 404 语义与 go proxy 不同★ npm registry 的 404 是"包不存在"（权威），
+    不是 go proxy 那种"proxy 不提供"（go 命令拿到 404 会 fallback direct，不是判定不存在）。
+    故本侧 404/410 可以直接升格为"确证不存在"，与 go 侧"全部镜像都答得上且都说没有"不同。
+    """
+    if not _lookup_enabled():
+        return None
+    _key = f"probe::{url}"
+    if _key in _probe_cache:
+        return _probe_cache[_key]
+    out: bool | None = None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "swarm-npm-resolver"})
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:  # noqa: S310
+            out = 200 <= getattr(resp, "status", 200) < 300
+    except urllib.error.HTTPError as exc:      # 必须在 URLError 之前——它是其子类
+        out = False if getattr(exc, "code", None) in (404, 410) else None
+        logger.debug("[npm-registry] PROBE %s → HTTP %s", url, getattr(exc, "code", "?"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        logger.debug("[npm-registry] PROBE %s 不可达: %s", url, exc)
+    # ★P-C2 复核 F5★ `None` **不入缓存**。原实现无条件 `_probe_cache[_key] = out`，而命中判据是
+    # `if _key in _probe_cache`（`None` 也算命中）＋生产侧无任何清理点＋brain 是长驻进程
+    # ⇒ 一次网络抖动就把该包 **永久**钉成"不可达"，此后再不重验。
+    # 缓存的目的是省掉重复 I/O，不是记住失败——只缓存**确定性结论**（True/False）。
+    if out is not None:
+        _probe_cache[_key] = out
+    return out
+
+
+def registry_package_exists(pkg: str) -> bool | None:
+    """该包在 registry 上是否存在 → True / False（确证不存在）/ None（不可达）。
+
+    多镜像语义：任一镜像答 True → True；**全部**镜像答 False → False（确证）；
+    只要有一个不可达且无人答 True → None（宁可未证实，绝不据不完整证据判幻觉）。
+    """
+    enc = _encode_pkg(pkg)
+    saw_false = False
+    saw_unreachable = False
+    for tpl in _REGISTRY_MIRRORS:
+        got = _http_probe(tpl.format(pkg=enc))
+        if got is True:
+            return True
+        if got is False:
+            saw_false = True
+        else:
+            saw_unreachable = True
+            continue
+    if saw_false and not saw_unreachable:
+        return False               # 全部镜像都答得上且都说没有 → 确证
+    return None                    # 有镜像不可达 → 证据不完整，绝不据此判幻觉
 
 
 # ── 本地证据（零网络） ──────────────────────────────────────────────────────
@@ -419,6 +479,20 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                 continue
             _vers = registry_all_versions(name)
             if _vers is None:
+                # ★P-C2 复核 F3★ `registry_all_versions` 返 `None` 时"包不存在"与"不可达"
+                # 不可分 ⇒ 同一 WARNING 措辞下藏着两种性质相反的事实。先 probe 存在性：
+                #   · 确证不存在（False）→ 如实丢弃（幻觉包名，npm install 必然失败）；
+                #   · 存在（True）→ 说明是 registry 文档格式异常/超时，按不可达 fail-open；
+                #   · 不可达（None）→ 证据不完整，fail-open 保留（R56-6）。
+                _exists = registry_package_exists(name)
+                if _exists is False:
+                    logger.warning("[npm-registry] P-C2-F3 %s@%s registry 确证**包不存在**"
+                                   "（404/410，npm registry 的 404 是权威『包不存在』，"
+                                   "与 go proxy 的『proxy 不提供』不同）→ 如实丢弃"
+                                   "（绝不逼 worker 臆造；调用方须同时从验收剔除）",
+                                   name, explicit)
+                    dropped.append(str(raw).strip())
+                    continue
                 # registry 不可达 → fail-open 保留（R56-6 证据缺失≠否定证据），必须留痕。
                 logger.warning("[npm-registry] P-C2 %s@%s 未经证实（registry 不可达/包查不到）"
                                " → fail-open 保留 LLM 主张（执行期 L1 合法性闸兜底）",

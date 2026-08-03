@@ -271,6 +271,51 @@ MUTATIONS = [
         '    "dep_versions_unverified": "task",',
         ["test_f2_state_key_is_declared_in_brainstate"],
     ),
+    # ── R3：go 侧 latest/分支名/裸 SHA 写不进 go.mod ──
+    (
+        "R3: _UNGO_MODDABLE_VERSION 闸整块消失（latest/master/main/裸SHA 原样保留 ⇒ go build 解析期全灭）",
+        GO,
+        '                if _UNGO_MODDABLE_VERSION.match(_exp):\n',
+        '                if False:\n',
+        ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
+    ),
+    (
+        "R3: 校正不到时 fail-open 保留（把解析错误烤进权威 go.mod）",
+        GO,
+        '                    else:\n                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态，"\n                                       "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"\n                                       "烤进权威 go.mod）", mod, explicit)\n                        dropped.append(str(raw).strip())',
+        '                    else:\n                        kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit",\n                                                  verified="unverified"))',
+        ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
+    ),
+    (
+        "R3: 校正成功却记成 unverified（机读账与事实不符）",
+        GO,
+        '                                                  verified="verified"))',
+        '                                                  verified="unverified"))',
+        ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
+    ),
+    # ── F3：npm 侧"包不存在"必须与"不可达"机读可辨 ──
+    (
+        "F3: probe 存在性判据整块消失（registry_all_versions=None 时不再问'包是否存在'）",
+        NPM,
+        '                _exists = registry_package_exists(name)\n',
+        '                _exists = None\n',
+        ["test_f3_npm_package_not_found_is_dropped_not_kept",
+         "test_f3_npm_package_unreachable_is_fail_open_kept"],
+    ),
+    (
+        "F3: 确证不存在却 fail-open 保留（幻觉包名原样烤进 package.json）",
+        NPM,
+        '                if _exists is False:\n',
+        '                if False:\n',
+        ["test_f3_npm_package_not_found_is_dropped_not_kept"],
+    ),
+    (
+        "F3: probe 的 None 也进缓存（一次抖动把该包永久钉成不可达，npm 侧 F5 同型复发）",
+        NPM,
+        '    if out is not None:\n        _probe_cache[_key] = out',
+        '    _probe_cache[_key] = out',
+        ["test_f3_probe_cache_has_no_negative_stickiness"],
+    ),
 ]
 
 

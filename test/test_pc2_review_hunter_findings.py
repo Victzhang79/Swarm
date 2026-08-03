@@ -32,11 +32,13 @@ def _clean_caches():
         mod._http_cache.clear()
         mod._http_neg_until.clear()
     gr._probe_cache.clear()
+    nr._probe_cache.clear()
     yield
     for mod in (gr, nr):
         mod._http_cache.clear()
         mod._http_neg_until.clear()
     gr._probe_cache.clear()
+    nr._probe_cache.clear()
 
 
 class _Resp:

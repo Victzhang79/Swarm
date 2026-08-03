@@ -29,6 +29,7 @@ def _no_network(monkeypatch):
     nr._http_cache.clear()
     gr._http_cache.clear()
     gr._probe_cache.clear()
+    nr._probe_cache.clear()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -409,8 +410,6 @@ def test_go_unreachable_proxy_fails_open(monkeypatch, caplog):
     "v0.0.0-20230101120000-abcdef123456",         # ① 无 base tag（最常见）
     "v1.2.3-beta.0.20230101120000-abcdef123456",  # ② base 是预发布（golang.org/x/*、k8s.io/* 大量）
     "v1.2.4-0.20230101120000-abcdef123456",       # ③ base 是正式版（patch 递增 + `-0.` 段）
-    "latest", "master", "main",              # 分支名/别名
-    "abcdef1234567890",                      # 裸 commit SHA
     "v1.2",                                  # 非规范（go.mod 要三段）
 ])
 def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
@@ -418,6 +417,8 @@ def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
 
     逐条 parametrize + 把探测换成会炸的实现＝同时锁"不判时不查网"。伪版本尤其重要：
     它是真实可用的形态，判它必然 404 → 误杀。
+    ★R3 之后 `latest`/分支名/裸 SHA 不再归此档★ 它们写不进 go.mod（语法错误），
+    走校正/丢弃分支（见 test_go_ungomoddable_versions_*）。
     """
     def _boom(m, v):
         raise AssertionError(f"不该为 {ver} 探测 proxy（不判形态）")
@@ -425,6 +426,115 @@ def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
     kept, _, dropped = gr.resolve_go_deps([f"github.com/x/y@{ver}"])
     assert dropped == []
     assert [(d.module, d.version) for d in kept] == [("github.com/x/y", ver)]
+
+
+@pytest.mark.parametrize("ver", ["latest", "master", "main", "abcdef1234567890"])
+def test_go_ungomoddable_versions_are_corrected_or_dropped(monkeypatch, ver):
+    """★R3★ `latest`/分支名/裸 SHA 在 go.mod 里是**语法错误**（`go build` 解析期全灭），
+    与伪版本同性质（不可复现）但**不能**原样保留——保留等于把解析错误烤进权威模板。
+
+    治法：先尝试 `proxy_latest_version` 校正到可解析稳定版；校正不到 → 如实丢弃。
+    与 npm 不对称是对的：npm 的 `latest` 是合法语法（装最新），go 的不是。
+    """
+    # 有可用稳定版 → 校正
+    monkeypatch.setattr(gr, "proxy_latest_version", lambda m: "v1.9.1")
+    kept, _, dropped = gr.resolve_go_deps([f"github.com/x/y@{ver}"])
+    assert dropped == []
+    assert [(d.module, d.version, d.source, d.verified) for d in kept] == \
+        [("github.com/x/y", "v1.9.1", "proxy", "verified")]
+    # 无可用稳定版（离线）→ 如实丢弃（fail-honest，血规 2）
+    monkeypatch.setattr(gr, "proxy_latest_version", lambda m: None)
+    kept, _, dropped = gr.resolve_go_deps([f"github.com/x/y@{ver}"])
+    assert kept == []
+    assert dropped == [f"github.com/x/y@{ver}"]
+
+
+# ══════════════════════════════════════════════════════════════════
+# ③ F3：npm 侧"包根本不存在"必须与"不可达"机读可辨
+# ══════════════════════════════════════════════════════════════════
+
+def test_f3_npm_package_not_found_is_dropped_not_kept(monkeypatch):
+    """★F3★ `registry_all_versions` 返 `None` 时"包不存在"与"不可达"原先不可分——
+    同一 WARNING 措辞下藏着两种性质相反的事实。
+
+    治法：`registry_package_exists` 先 probe 存在性。npm registry 的 404 是**权威**的
+    "包不存在"（与 go proxy 的"proxy 不提供"不同——go 命令拿到 404 会 fallback direct）。
+    确证不存在 ⇒ 幻觉包名 ⇒ npm install 必然失败 ⇒ 必须丢弃，不能 fail-open 保留。
+    """
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "1")
+    monkeypatch.setattr(nr, "_http_get", lambda url: None)   # registry_all_versions 返 None
+    monkeypatch.setattr(nr, "_http_probe", lambda url: False)  # 404 确证不存在
+    kept, dropped = nr.resolve_npm_deps(None, ["ghost-pkg@^1.0.0"])
+    assert kept == []
+    assert dropped == ["ghost-pkg@^1.0.0"]
+
+
+def test_f3_npm_package_unreachable_is_fail_open_kept(monkeypatch):
+    """反向锁：不可达（不是"不存在"）必须 fail-open 保留，绝不能据不完整证据判幻觉。
+
+    ★断言宽度★ 必须断 `verified`（F-2 的机读账），否则"校正成功却记成 unverified"
+    的突变照样绿（harness 实测）。
+    ★接线可证伪★ `_http_probe` 返 None 时 `registry_package_exists` 也返 None，
+    与"probe 判据整块消失"（`_exists = None`）**行为相同**——整块删掉后 fail-open
+    分支照样进，只是少了一次网络调用。判据必须是"probe 被调用过"，否则这是
+    血规 10 第四条的形状（`return None` 与"没跑"不可分）。"""
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "1")
+    monkeypatch.setattr(nr, "_http_get", lambda url: None)
+    called = []
+    monkeypatch.setattr(nr, "registry_package_exists",
+                        lambda name: called.append(name) or None)
+    kept, dropped = nr.resolve_npm_deps(None, ["axios@^1.6.0"])
+    assert called == ["axios"], "probe 存在性判据没被调用 ⇒ 整块消失后无人发现"
+    assert [(k.name, k.spec, k.verified) for k in kept] == \
+        [("axios", "^1.6.0", "unverified")]
+    assert dropped == []
+
+
+def test_f3_npm_package_exists_but_versions_malformed_is_fail_open(monkeypatch):
+    """第三态：probe 答"包存在"但 `versions` 字段为空/畸形 ⇒ 说明是 registry 文档格式异常，
+    按不可达 fail-open（不是"包不存在"）。"""
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "1")
+    monkeypatch.setattr(nr, "_http_get", lambda url: json.dumps({"name": "axios"}))
+    monkeypatch.setattr(nr, "_http_probe", lambda url: True)
+    kept, dropped = nr.resolve_npm_deps(None, ["axios@^1.6.0"])
+    assert [(k.name, k.spec, k.verified) for k in kept] == \
+        [("axios", "^1.6.0", "unverified")]
+    assert dropped == []
+
+
+def test_f3_probe_cache_has_no_negative_stickiness(monkeypatch):
+    """★F5 同型回归锁★ npm 侧新增的 `_probe_cache` 也不能把 `None` 永久钉死。"""
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "1")
+    fn, calls = _flaky_then_ok(99, "")
+    monkeypatch.setattr(urllib.request, "urlopen", fn)
+
+    assert nr._http_probe("https://registry.npmjs.org/axios") is None
+    n1 = calls["n"]
+    assert nr._http_probe("https://registry.npmjs.org/axios") is None
+    assert calls["n"] > n1, "None 进 _probe_cache 了（F5 病在 npm 侧复发）"
+    assert not nr._probe_cache, "None 不该进 _probe_cache"
+
+
+def _flaky_then_ok(fail_times: int, body: str):
+    """前 `fail_times` 次抛 URLError，之后成功。返回 (fn, 调用计数 dict)。"""
+    calls = {"n": 0}
+
+    def fn(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            raise urllib.error.URLError("模拟网络抖动")
+        class _R:
+            status = 200
+            def read(self): return body.encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return _R()
+
+    return fn, calls
+
+
+import json  # noqa: E402  (文件内首次使用在上方测试中)
+import urllib.request  # noqa: E402
 
 
 @pytest.mark.parametrize("ver", [

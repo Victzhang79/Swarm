@@ -62,6 +62,14 @@ _SEMVER_CORE = re.compile(r"^v(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 # P-C2 可判形态：规范 `vX.Y.Z`（可带 `-prerelease` / `+incompatible`）。go.mod 的 require
 # 只接受这种；分支名/`latest`/裸 commit SHA 都进"不判"分支（判它们只会误杀）。
 _JUDGEABLE_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+incompatible)?$")
+# ★P-C2 复核 R3★ 还有一档介于"不判"与"可判"之间：**写不进 go.mod 的形态**。
+# `latest` / 分支名 / 裸 SHA 在 go.mod 的 require 里是**语法错误**（`go build` 解析期全灭，
+# 连坐全模块），与"伪版本"同性质（不可复现）但**不能**简单原样保留——保留等于把解析错误
+# 烤进权威模板。治法：先尝试 `proxy_latest_version` 校正到可解析的稳定版；校正不到
+# （离线/不可达）→ **如实丢弃**（fail-honest，血规 2 方向）。npm 的 `latest` 是合法语法
+# （装最新），go 的不是 ⇒ 两栈同型不同治，不对称是对的。
+_UNGO_MODDABLE_VERSION = re.compile(
+    r"^(?:latest|master|main|[0-9a-f]{7,40})$")
 # P-C2 专用伪版本判别：**Go 官方定义三种形态，三种都要认**。
 # 权威来源：`cmd/go` 文档 "Pseudo-versions"（go.dev/ref/mod#pseudo-versions）——形态由
 # **base version（该 commit 之前最近的 tag）** 决定：
@@ -322,10 +330,27 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
             # 整体失败连坐全模块。**规划期自己在猜坐标 = 正面违反血规 2**。
             _exp = explicit.strip()
             if not _JUDGEABLE_VERSION.match(_exp) or _PSEUDO_ANY.search(_exp):
-                # 不判（Maven `${...}` 的对应物）：伪版本编码的是 commit（proxy 常不列）、
-                # 分支名/`latest`/裸 SHA 都不是"版本主张"。判它们只会误杀。
-                logger.info("[go-registry] P-C2 %s@%s 非规范 semver tag（伪版本/分支/SHA）"
-                            " → 不做存在性判定，保留原样（执行期 L1 dep-legality 兜底）",
+                # ★P-C2 复核 R3★ `latest`/分支名/裸 SHA 在 go.mod 里是**语法错误**（go build
+                # 解析期全灭），与伪版本同性质（不可复现）但**不能**原样保留——保留等于把
+                # 解析错误烤进权威模板。治法：先尝试校正到可解析稳定版；校正不到 → 如实丢弃。
+                if _UNGO_MODDABLE_VERSION.match(_exp):
+                    _lv = proxy_latest_version(mod)
+                    if _lv:
+                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态"
+                                       "（latest/分支名/裸 SHA）→ 校正到可解析稳定版 %s",
+                                       mod, explicit, _lv)
+                        seen.add(mod)
+                        kept.append(ResolvedGoDep(module=mod, version=_lv, source="proxy",
+                                                  verified="verified"))
+                    else:
+                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态，"
+                                       "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"
+                                       "烤进权威 go.mod）", mod, explicit)
+                        dropped.append(str(raw).strip())
+                    continue
+                # 伪版本（`v0.0.0-<ts>-<hash>`）：真实可用形态，判必然 404 → 误杀，原样保留。
+                logger.info("[go-registry] P-C2 %s@%s 伪版本（真实可用形态）→ 不做存在性判定，"
+                            "保留原样（执行期 L1 dep-legality 兜底）",
                             mod, explicit)
                 seen.add(mod)
                 kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit",
