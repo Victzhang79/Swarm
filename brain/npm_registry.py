@@ -300,8 +300,10 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
     `1.2.3` 在本函数眼里同值。三种越界都朝**判可满足**（不判幻觉）倾斜：LLM 写
     `1.2.3-rc.1` 而仓库只有 `1.2.3`、写 `^1.2.3` 而仓库只有 `1.2.4-rc.1`（npm 的 caret
     实际不匹配预发布）等。**方向是刻意的**——本函数的返回值只用来"判是否幻觉"，假阴性
-    （漏判一个幻觉）由执行期 L1 dep-legality 兜底，假阳性（误杀真依赖）无人兜底。真要收紧
-    得引入完整 semver 比较，那是另一档决定，别顺手把这里改严。
+    （漏判一个幻觉）**无下游兜底**（npm/go 的 L1 dep-legality 是空转：`worker/l1_pipeline.py`
+    硬写 `driver_for("maven")`，npm/go 工程走到那里 100% 空转——见 27 号文 P-C2 R2），
+    止于 WARNING。假阳性（误杀真依赖）同样无人兜底。真要收紧得引入完整 semver 比较，
+    那是另一档决定，别顺手把这里改严。
     """
     m = _SIMPLE_RANGE.match((spec or "").strip())
     if not m:
@@ -394,7 +396,9 @@ class ResolvedNpmDep:
     # 要的是"版本从哪来"，与"验没验过"是两个问题；复用单一事实源 ≠ 复用其消费契约，
     # 后果不同必须分档（血规 10 第三条）。
     #   verified   —— 有确定性证据（registry 版本集可满足 / 解析自 registry / 本地 node_modules）
-    #   unverified —— 证据不完整，fail-open 保留了 LLM 主张（执行期 L1 兜底）
+    #   unverified —— 证据不完整，fail-open 保留了 LLM 主张
+    #                 （无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality 是空转，
+    #                 见 27 号文 P-C2 R2）
     #   unjudgeable—— 刻意不判（协议/别名/复合区间；判它们的风险是误杀）
     verified: str = "verified"
 
@@ -464,15 +468,18 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                 else:
                     logger.warning("[npm-registry] P-C2 %s@%s 是不可复现的 dist-tag/通配，但"
                                    "registry 不可达无法解析成具体版本 → fail-open 保留原样"
-                                   "（执行期 L1 合法性闸兜底）", name, explicit)
+                                   "（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
+                                   "是空转，见 27 号文 P-C2 R2）", name, explicit)
                     kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
                                                verified="unverified"))
                 continue
             if _kind in ("protocol", "complex"):
                 # 不判（Maven `${...}` 的对应物）：协议/别名不是版本主张；复合区间无 semver 库
                 # 判不准，**猜语义的风险是误杀真依赖**，比放过一个幻觉更坏（fail-open 但留痕）。
+                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
                 logger.info("[npm-registry] P-C2 %s@%s 属【%s】形态，不做可满足性判定"
-                            "（保留原样；执行期 L1 dep-legality 兜底）", name, explicit, _kind)
+                            "（保留原样；无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
+                            "是空转，见 27 号文 P-C2 R2）", name, explicit, _kind)
                 seen.add(name)
                 kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
                                            verified="unjudgeable"))
@@ -494,8 +501,11 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                     dropped.append(str(raw).strip())
                     continue
                 # registry 不可达 → fail-open 保留（R56-6 证据缺失≠否定证据），必须留痕。
+                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
                 logger.warning("[npm-registry] P-C2 %s@%s 未经证实（registry 不可达/包查不到）"
-                               " → fail-open 保留 LLM 主张（执行期 L1 合法性闸兜底）",
+                               " → fail-open 保留 LLM 主张"
+                               "（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
+                               "是空转，见 27 号文 P-C2 R2）",
                                name, explicit)
                 seen.add(name)
                 kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",

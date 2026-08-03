@@ -148,16 +148,20 @@ def test_npm_hallucinated_range_is_corrected_to_latest(monkeypatch, caplog):
 
 
 def test_npm_hallucinated_range_with_no_stable_is_dropped_honestly(monkeypatch, caplog):
-    """确证幻觉 + 无可用稳定版 → **如实丢弃**（血规 2 的 fail-honest），绝不逼 worker 臆造。
+    """版本区间无已发布版本可满足 + 无可用稳定版 → **如实丢弃**（血规 2 的 fail-honest），
+    绝不逼 worker 臆造。
 
     dropped 必须回传，调用方据此**同时从验收剔除**——否则又造出"模板没有、验收却要求"的矛盾。
     """
     monkeypatch.setattr(nr, "registry_all_versions", lambda pkg: _PUBLISHED)
     monkeypatch.setattr(nr, "registry_latest_version", lambda pkg, pp=None: None)
     with caplog.at_level(logging.WARNING, logger="swarm.brain.npm_registry"):
-        kept, dropped = nr.resolve_npm_deps(None, ["ghost-pkg@^99.0.0"])
+        # ★P-C2 复核 F6★ 包名不得暗示"包不存在"——本用例锁的是另一条生产可达路径：
+        # 包**存在**且版本非空，但全是预发布版（latest 解析为 None）。真·幻觉包名
+        # （registry 404）由 F3 的 test_f3_npm_package_not_found_is_dropped_not_kept 锁。
+        kept, dropped = nr.resolve_npm_deps(None, ["real-pkg-with-only-prereleases@^99.0.0"])
     assert kept == []
-    assert dropped == ["ghost-pkg@^99.0.0"]
+    assert dropped == ["real-pkg-with-only-prereleases@^99.0.0"]
     assert [r for r in caplog.records if "如实丢弃" in r.getMessage()]
 
 
@@ -177,7 +181,11 @@ def test_npm_unreachable_registry_fails_open_and_keeps_the_claim(monkeypatch, ca
 
 
 def test_npm_satisfiable_range_is_kept_verbatim(monkeypatch):
-    """真实可满足的区间原样保留——治理**不得**顺手改写合法声明（那是另一种误杀）。"""
+    """真实可满足的区间原样保留——治理**不得**顺手改写合法声明（那是另一种误杀）。
+
+    ★P-C2 复核 R5★ 本条在治前代码上同样绿（治前＝无脑保留），价值是防未来收紧的
+    回归锁，**不能**作为"P-C2 机制已接线"的证据——那落在 test_npm_hallucinated_* 上。
+    """
     monkeypatch.setattr(nr, "registry_all_versions", lambda pkg: _PUBLISHED)
     kept, dropped = nr.resolve_npm_deps(None, ["axios@^1.6.0"])
     assert dropped == []
@@ -191,6 +199,7 @@ def test_npm_unjudgeable_forms_are_never_touched(monkeypatch, spec):
 
     逐条 parametrize：任一形态漏进判定分支都会被拿去比对版本集 → 必然"不可满足" → 误杀。
     同时锁住"不判时不查网"——`registry_all_versions` 被换成会炸的实现。
+    ★P-C2 复核 R5★ 治前代码（无脑保留）本条同样绿——回归锁，非接线证据。
     """
     def _boom(pkg):
         raise AssertionError(f"不该为 {spec} 查 registry（不判形态）")
@@ -212,6 +221,7 @@ def test_npm_workspace_internal_still_wins_over_version_judgement(monkeypatch):
     """内部 workspace 包的分流**在**版本判定之前——它们根本不在 registry 上，查必然查不到。
 
     顺序错的后果：内部包被判"幻觉"→ 校正成某个同名公网包的版本，或被丢弃 → monorepo 崩。
+    ★P-C2 复核 R5★ 治前代码（workspace 分流先于一切）本条同样绿——回归锁，非接线证据。
     """
     def _boom(pkg):
         raise AssertionError("内部包不该查 registry")
@@ -300,6 +310,10 @@ def test_proxy_version_exists_requires_all_mirrors_to_confirm_absence(monkeypatc
 
     "官方 404 + 镜像超时"这种组合在国内网络是常态。若据此判 False，就会把真实存在但官方
     暂时抽风的版本判成幻觉 → 误杀。只有**全部**镜像都答 404 才算确证。
+
+    ★R4 之后 `False` 这一档取消★ go proxy 的 404/410 语义是"proxy 不提供，可能别处有"
+    （go.dev/ref/mod），与 npm registry 的 404（权威"包不存在"）不同。⇒ 两镜像都 404
+    也只归 None（不可达），由调用方 fail-open 保留 + 记 `unverified`。
     """
     monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
     seq = iter([False, None])            # 第一个镜像确证无、第二个不可达
@@ -307,7 +321,8 @@ def test_proxy_version_exists_requires_all_mirrors_to_confirm_absence(monkeypatc
     assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is None
 
     monkeypatch.setattr(gr, "_http_probe", lambda url: False)
-    assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is False
+    # ★R4★ 两镜像都 404 不再升格成"确证不存在"（proxy 不提供 ≠ 包不存在）
+    assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is None
 
     monkeypatch.setattr(gr, "_http_probe", lambda url: True)
     assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is True
@@ -370,24 +385,31 @@ def test_proxy_version_exists_with_no_mirrors_is_none_not_false(monkeypatch):
 
 
 def test_go_hallucinated_version_is_corrected(monkeypatch, caplog):
-    """★病灶本体（go 侧）★ proxy 确证查无 → 校正到 `/@latest`，绝不原样烤进 go.mod 模板。"""
-    monkeypatch.setattr(gr, "proxy_version_exists", lambda m, v: False)
+    """★R4 之后★ `proxy_version_exists` 不再返 `False`（go proxy 的 404 语义是
+    "proxy 不提供，可能别处有"，与 npm 的 404 不同）⇒ 幻觉版本与私有包同归 None ⇒
+    fail-open 保留 + 记 `unverified`，**不再校正**。
+
+    真幻觉版本（公共 proxy 上真不存在的版本）会被保留——但 worker 侧 `go mod download`
+    会失败，归因清楚；误杀（丢弃真依赖）比假过（保留幻觉版本）更糟。
+    """
+    monkeypatch.setattr(gr, "proxy_version_exists", lambda m, v: None)
     monkeypatch.setattr(gr, "proxy_latest_version", lambda m: "v1.9.1")
     with caplog.at_level(logging.WARNING, logger="swarm.brain.go_registry"):
         kept, internal, dropped = gr.resolve_go_deps(["github.com/gin-gonic/gin@v99.0.0"])
     assert (internal, dropped) == ([], [])
-    assert [(d.module, d.version, d.source) for d in kept] == \
-        [("github.com/gin-gonic/gin", "v1.9.1", "proxy")]
-    assert [r for r in caplog.records if "P-C2" in r.getMessage()]
+    assert [(d.module, d.version, d.source, d.verified) for d in kept] == \
+        [("github.com/gin-gonic/gin", "v99.0.0", "explicit", "unverified")]
+    assert [r for r in caplog.records if "未经证实" in r.getMessage()]
 
 
 def test_go_hallucinated_version_no_latest_is_dropped(monkeypatch):
-    """确证查无 + 无可用版本 → 如实丢弃（调用方须同时从验收剔除）。"""
-    monkeypatch.setattr(gr, "proxy_version_exists", lambda m, v: False)
+    """★R4 之后★ 同上：`False` 档取消 ⇒ 不再丢弃，fail-open 保留 + 记 `unverified`。"""
+    monkeypatch.setattr(gr, "proxy_version_exists", lambda m, v: None)
     monkeypatch.setattr(gr, "proxy_latest_version", lambda m: None)
     kept, _, dropped = gr.resolve_go_deps(["example.com/ghost@v99.0.0"])
-    assert kept == []
-    assert dropped == ["example.com/ghost@v99.0.0"]
+    assert [(d.module, d.version, d.source, d.verified) for d in kept] == \
+        [("example.com/ghost", "v99.0.0", "explicit", "unverified")]
+    assert dropped == []
 
 
 def test_go_unreachable_proxy_fails_open(monkeypatch, caplog):
@@ -419,6 +441,7 @@ def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
     它是真实可用的形态，判它必然 404 → 误杀。
     ★R3 之后 `latest`/分支名/裸 SHA 不再归此档★ 它们写不进 go.mod（语法错误），
     走校正/丢弃分支（见 test_go_ungomoddable_versions_*）。
+    ★P-C2 复核 R5★ 治前代码（无脑保留）本条同样绿——回归锁，非接线证据。
     """
     def _boom(m, v):
         raise AssertionError(f"不该为 {ver} 探测 proxy（不判形态）")

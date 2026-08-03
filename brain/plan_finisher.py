@@ -1565,7 +1565,8 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         if _unverified:
             logger.warning(
                 "[PLAN-FINISH] P-C2 F-2：%d 个模块存在未经证实/不判的依赖坐标（闸 fail-open "
-                "保留了 LLM 主张，执行期 L1 兜底）→ 已记 dep_versions_unverified: %s",
+                "保留了 LLM 主张；无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
+                "是空转，见 27 号文 P-C2 R2）→ 已记 dep_versions_unverified: %s",
                 len(_unverified), {m: v[:3] for m, v in list(_unverified.items())[:4]})
         if injected:
             from swarm.brain.nodes.shared import bootstrap_subtask_harness

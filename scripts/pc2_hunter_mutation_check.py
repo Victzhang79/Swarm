@@ -316,6 +316,31 @@ MUTATIONS = [
         '    _probe_cache[_key] = out',
         ["test_f3_probe_cache_has_no_negative_stickiness"],
     ),
+    # ── R4：go proxy 404/410 ≠ 包不存在（False 档取消）──
+    (
+        "R4: 恢复 False 档（两镜像都 404 ⇒ 确证查无 ⇒ 私有 module 被误杀丢弃）",
+        GO,
+        '    return None                    # 无一镜像能证实存在 → 证据不完整，绝不据此判幻觉',
+        '    return False                   # 无一镜像答 True → 确证查无',
+        ["test_proxy_version_exists_requires_all_mirrors_to_confirm_absence",
+         "test_f1_second_mirror_is_actually_queried"],
+    ),
+    (
+        "R4: 单镜像 404 即判不存在（F1 多镜像冗余与 R4 语义双破坏）",
+        GO,
+        '        if got is True:\n            return True\n',
+        '        if got is True:\n            return True\n        if got is False:\n            return False\n',
+        ["test_proxy_version_exists_requires_all_mirrors_to_confirm_absence",
+         "test_f1_second_mirror_is_actually_queried"],
+    ),
+    (
+        "R4: 不可达却记 verified=verified（unverified 机读账说谎 ⇒ dep_versions_unverified 永远空）",
+        GO,
+        '                verified="unverified" if _unverified else "verified"))',
+        '                verified="verified"))',
+        ["test_go_hallucinated_version_no_latest_is_dropped",
+         "test_go_hallucinated_version_is_corrected"],
+    ),
 ]
 
 

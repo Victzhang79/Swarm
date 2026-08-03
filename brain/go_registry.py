@@ -173,32 +173,33 @@ def _http_probe(url: str) -> bool | None:
 
 
 def proxy_version_exists(mod: str, ver: str) -> bool | None:
-    """该 module 的该版本在 proxy 上是否存在 → True / False（确证查无）/ None（不可达）。
+    """该 module 的该版本在 proxy 上是否存在 → True（存在）/ None（不可达或 proxy 不提供）。
 
-    多镜像语义：任一镜像答 True → True；**全部**镜像答 False → False（确证）；
-    只要有一个不可达且无人答 True → None（宁可未证实，绝不据不完整证据判幻觉）。
+    ★P-C2 复核 R4★ go proxy 的 404/410 语义是**"proxy 不提供，可能别处有"**（go.dev/ref/mod：
+    "the requested module or version is not available on the proxy, but it may be found
+    elsewhere"），与 npm registry 的 404（权威"包不存在"）**不同**。go 命令拿到 404 的动作
+    是 fallback direct，不是判定不存在。
+
+    原实现把"两镜像都 404"升格成"确证查无"（`False`），后果是私有 module（不在
+    `internal_modules` 里、属别的 repo）被误判幻觉丢弃——治前该显式版本原样保留、worker
+    侧设了 `GOPRIVATE` 就能拉到，这是一个真实存在过的能力被本批干掉。
+
+    ⇒ `False` 这一档**取消**：proxy 不提供 ≠ 包不存在。所有"不是 True"的结局都归 `None`
+    （不可达），由调用方 fail-open 保留 + 记 `unverified`（机读账）。真幻觉版本（公共 proxy
+    上真不存在的版本）会被保留——但 worker 侧 `go mod download` 会失败，归因清楚；误杀
+    （丢弃真依赖）比假过（保留幻觉版本）更糟。
     """
     enc, encv = _encode_mod(mod), _encode_mod(ver)
-    saw_false = False
     saw_unreachable = False
     for tpl in _PROXY_INFO_MIRRORS:
         got = _http_probe(tpl.format(mod=enc, ver=encv))
         if got is True:
             return True
-        if got is False:
-            saw_false = True
-        else:
-            # ★P-C2 复核 F1★ 原实现这里是 `return None`——首个镜像不可达即早返，**第二个镜像
-            # 永不被问**，多镜像冗余形同虚设，而上面 docstring 承诺的"任一镜像答 True → True"
-            # 是假的。方向没错（None 仍 fail-open），但把"冗余"这一维整个抹掉了：
-            # goproxy.cn 抖一下，proxy.golang.org 明明能答 True 也拿不到。
-            # 改为记账后继续，裁决挪到循环外。同文件 `proxy_latest_version` 的 `continue`
-            # 早就是正确对照——**同一个文件里两个多镜像循环，一个对一个错**。
-            saw_unreachable = True
-            continue
-    if saw_false and not saw_unreachable:
-        return False               # 全部镜像都答得上且都说没有 → 确证
-    return None                    # 有镜像不可达 → 证据不完整，绝不据此判幻觉
+        # ★R4★ 404/410（`got is False`）与不可达（`got is None`）同归"proxy 不提供/不可达"，
+        # 都不再升格成"确证不存在"。go proxy 的 404 语义是"可能别处有"，不是"包不存在"。
+        saw_unreachable = True
+        continue
+    return None                    # 无一镜像能证实存在 → 证据不完整，绝不据此判幻觉
 
 
 def _is_stable(version: str) -> bool:
@@ -349,8 +350,12 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                         dropped.append(str(raw).strip())
                     continue
                 # 伪版本（`v0.0.0-<ts>-<hash>`）：真实可用形态，判必然 404 → 误杀，原样保留。
+                # ★P-C2 复核 R2★ 伪版本无下游兜底（go 的 L1 dep-legality 是空转：
+                # `worker/l1_pipeline.py` 硬写 `driver_for("maven")`，go 工程 100% 空转），
+                # 止于 WARNING。判它必然 404 → 误杀，故宁可放行。
                 logger.info("[go-registry] P-C2 %s@%s 伪版本（真实可用形态）→ 不做存在性判定，"
-                            "保留原样（执行期 L1 dep-legality 兜底）",
+                            "保留原样（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
+                            "是空转，见 27 号文 P-C2 R2）",
                             mod, explicit)
                 seen.add(mod)
                 kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit",
@@ -372,8 +377,10 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
             _unverified = _exists is None
             if _unverified:
                 # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。
+                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
                 logger.warning("[go-registry] P-C2 %s@%s 未经证实（proxy 不可达）→ fail-open "
-                               "保留 LLM 主张（执行期 L1 合法性闸兜底）", mod, explicit)
+                               "保留 LLM 主张（无下游兜底，止于 WARNING——npm/go 的 L1 "
+                               "dep-legality 是空转，见 27 号文 P-C2 R2）", mod, explicit)
             seen.add(mod)
             kept.append(ResolvedGoDep(
                 module=mod, version=explicit, source="explicit",
