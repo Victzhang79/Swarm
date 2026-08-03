@@ -77,6 +77,57 @@ MUTATIONS = [
                         "[L1.2] X-M8 项目缺 vue-tsc''',
         ['test_missing_vue_tsc_falls_back_to_tsc_with_warning'],
     ),
+    (
+        "X-M4a：warmup 分派表删 rust 条目（cargo registry 永不预热 ⇒ --offline 自测回到"
+        "恒 degraded 死信；摘要守卫同红——生成物变了）",
+        IMG,
+        '    "rust": "cargo fetch",\n',
+        '',
+        ['test_xm4_warmup_covers_go_rust_python',
+         'test_builder_version_bumped_so_old_images_are_invalidated'],
+    ),
+    (
+        "X-M4b：python 的 requirements.txt 形态闸被摘（pyproject.toml 也臆造 pip install -r"
+        " ⇒ 血规 2 破；且 pyproject 工程连 requirements.txt 都没有 ⇒ warmup 必假败）",
+        IMG,
+        '    if name == "python":\n'
+        '        dep = (tc.dep_source or "").replace("\\\\", "/").rsplit("/", 1)[-1]\n'
+        '        if dep != "requirements.txt":\n'
+        '            return None\n',
+        '    if name == "python":\n'
+        '        pass\n',
+        ['test_xm4_python_warmup_only_for_requirements_txt',
+         'test_builder_version_bumped_so_old_images_are_invalidated'],
+    ),
+    (
+        "X-M4c：go/rust/python warmup 的 S-5 子目录安全闸被摘（dep_source 来自被扫描仓库"
+        " ⇒ `..`/注入目录名以 root 拼进 RUN，与 npm 段 S-5 同型）",
+        IMG,
+        '            if sub and not _SAFE_SUBDIR_RE.match(sub):\n'
+        '                logger.warning(\n'
+        '                    "跳过 %s warmup：dep_source 子目录名不安全（可能是注入载荷或路径逃逸）: %r",\n',
+        '            if sub and _SAFE_SUBDIR_RE.match(sub):\n'
+        '                logger.warning(\n'
+        '                    "跳过 %s warmup：dep_source 子目录名不安全（可能是注入载荷或路径逃逸）: %r",\n',
+        ['test_xm4_warmup_unsafe_subdir_skipped_with_warning'],
+    ),
+    (
+        "X-M4d：npm warmup 退回管道形态（`npm ci | tail || npm install` ⇒ 判的是 tail 的"
+        "退出码，install 兜底臂回死代码，H-1 同型复发）",
+        IMG,
+        'f"RUN cd {_wd_q} && (npm ci > {shlex.quote(_npm_log)} 2>&1 || "',
+        'f"RUN cd {_wd_q} && (npm ci 2>&1 | tail -5 || "',
+        ['test_xm4_npm_warmup_fallback_arm_is_live',
+         'test_builder_version_bumped_so_old_images_are_invalidated'],
+    ),
+    (
+        "X-M4e：_BUILDER_VERSION 11→10（改了镜像生成物不递增版本 ⇒ 复用老镜像，修复一行"
+        "到不了生产——X-C2/P-C3/X-M5 同形状第四次，配对守卫必须响）",
+        IMG,
+        '_BUILDER_VERSION = "11"',
+        '_BUILDER_VERSION = "10"',
+        ['test_builder_version_bumped_so_old_images_are_invalidated'],
+    ),
 ]
 
 

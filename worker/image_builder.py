@@ -458,6 +458,11 @@ def _toolchain_install(tc: Toolchain) -> str:
         return (
             "RUN apt-get update && apt-get install -y --no-install-recommends "
             "python3 python3-pip ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+            # X-M4 配套：构建机网络受限（go.dev/maven central 实测被墙，npm/maven/go 均已
+            # 配国内镜像）——不配镜像的 pip warmup 是死信。`pip config` 老版本没有 →
+            # || true，warmup 失败另有 echo 标记（降级可观测，不静默）。
+            "RUN python3 -m pip config set global.index-url "
+            "https://mirrors.aliyun.com/pypi/simple/ || true\n"
             + _verify_block("python", "pip")
         )
     if tc.name == "go":
@@ -495,6 +500,36 @@ def _toolchain_install(tc: Toolchain) -> str:
                    "工具，L1 构建/测试闸在该栈上不可用——若这是真实栈，请给 "
                    "_STACK_REGISTRY/_toolchain_install 加表项", tc.name, tc.build_tool)
     return f"# (未知工具链 {tc.name}，跳过)\n"
+
+
+# ★X-M4（27 号文 §3.2）★ go/rust/python 的 warmup 命令分派表（血规 1：栈行为走表，
+# 加新栈只加表项）。预热目标：go→GOPATH/pkg/mod（GOPROXY 已在安装段配 goproxy.cn）、
+# rust→/root/.cargo/registry（让 `--offline` 自测不再是死信）、python→系统 site-packages。
+_SIMPLE_WARMUP_CMDS = {
+    "go": "go mod download",
+    "rust": "cargo fetch",
+    # python 唯一可确定性预热的清单形态（血规 2：只为有权威命令的形态产命令）：
+    # `pip install -r` 对 requirements.txt；pyproject/setup.py/Pipfile 由
+    # _simple_warmup_command 返 None + 生成物留痕。--break-system-packages 在前：
+    # Debian 12+ 的 PEP 668 拒系统级安装；老 pip 不认此旗标会报错 → 落到第二臂。
+    "python": "python3 -m pip install --break-system-packages -r requirements.txt "
+              "|| python3 -m pip install -r requirements.txt",
+}
+
+
+def _simple_warmup_command(tc: Toolchain) -> str | None:
+    """go/rust/python 的 warmup 命令（X-M4 分派表消费点）。未收录/形态不符返 None。
+
+    python 只在 dep_source 恰为 requirements.txt 时出命令（basename 判定，与
+    `_is_pom_manifest_path` 同纪律：Pipfile/requirements-dev.txt 都不算）。
+    """
+    name = (tc.name or "").lower()
+    if name == "python":
+        dep = (tc.dep_source or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if dep != "requirements.txt":
+            return None
+    return _SIMPLE_WARMUP_CMDS.get(name)
+
 
 
 def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
@@ -622,9 +657,56 @@ def generate_dockerfile(spec: EnvSpec, *, src_included: bool = False) -> str:
             _wd_q = shlex.quote(wd)
             lines.append(f"# warmup：前端 {wd} 联网装依赖，固化 node_modules 进镜像层")
             # npm ci 要求 lock 文件齐全；缺 lock 退化 npm install；都失败不阻断（运行时联网兜底）
+            # ★X-M4 同批（H-1 sibling）★ 原写法 `npm ci | tail -5 || npm install | tail -5 || echo`
+            # 的 `||` 判的是 **tail** 的退出码（恒 0）⇒ npm install 兜底臂与 echo 臂全是
+            # 死代码（gradle 段 H-1 已治过的同型，此处是漏网 sibling）。改日志文件形态：
+            # 判成败只看命令本身退出码，tail 只负责打印。
+            _npm_log = "/tmp/npm-warmup.log"
             lines.append(
-                f"RUN cd {_wd_q} && (npm ci 2>&1 | tail -5 || npm install 2>&1 | tail -5 || "
-                f"echo 'npm 预装失败：运行时联网兜底')"
+                f"RUN cd {_wd_q} && (npm ci > {shlex.quote(_npm_log)} 2>&1 || "
+                f"npm install > {shlex.quote(_npm_log)} 2>&1 || "
+                f"echo 'npm 预装失败：运行时联网兜底') ; tail -5 {shlex.quote(_npm_log)} "
+                f"2>/dev/null || true"
+            )
+
+        # ── go/rust/python warmup（X-M4，27 号文 §3.2）──
+        # 治前 warmup 只覆盖 maven/gradle/npm：go 模块缓存 / cargo registry / python 依赖
+        # 从不进镜像层 ⇒ 沙箱运行时首次构建全部现网拉（离线/弱网沙箱直接假失败——正是
+        # gradle warmup 注释里"L1 构建闸在离线/弱网沙箱假失败"的同款）；rust 的
+        # `cargo build --offline` 自测更是【恒 degraded】——缓存永远为空，"离线编译通过"
+        # 对任何带依赖的 rust 工程都是死信（机制存在 ≠ 接得上：自测口径与 warmup 面错位）。
+        # 与 npm 同形状：dep_source 定位清单目录逐个预热，失败不阻断（运行时联网兜底）
+        # 但留机读 echo 标记（降级可观测，血规 3/10④）。
+        # 命令模板走分派表（血规 1），加新栈只加表项。
+        for tc in spec.toolchains:
+            _wcmd = _simple_warmup_command(tc)
+            if _wcmd is None:
+                if (tc.name or "").lower() == "python":
+                    # fail-honest：pyproject.toml/setup.py/Pipfile 无确定性预热形态
+                    # （`pip install .` 依赖构建后端、可能执行任意 setup 代码）——
+                    # 在生成物里留痕，而不是静默零预热（硬检查④）。
+                    lines.append(
+                        f"# X-M4：python 依赖清单为 {tc.dep_source or '?'}（非 requirements.txt）"
+                        "——无确定性预热形态，依赖运行时解析（边界已登记）")
+                continue
+            dep = (tc.dep_source or "").replace("\\", "/").lstrip("/")
+            sub = dep.rsplit("/", 1)[0] if "/" in dep else ""
+            # S-5 同源判据：dep_source 来自被扫描仓库内容（攻击者可控），与 npm 段同闸
+            if sub and not _SAFE_SUBDIR_RE.match(sub):
+                logger.warning(
+                    "跳过 %s warmup：dep_source 子目录名不安全（可能是注入载荷或路径逃逸）: %r",
+                    tc.name, sub)
+                continue
+            wd = "/workspace" + (f"/{sub}" if sub else "")
+            lines.append(f"# warmup（X-M4）：{tc.name} 依赖进镜像层（{wd}）")
+            # H-1 同纪律：判成败绝不接管道（`cmd | tail` 的退出码是 tail 的 ⇒ 失败臂成
+            # 死代码）。输出落日志文件、tail 只负责打印；模板内部可能自带 `||`（python
+            # 的 PEP668 双臂），故 `{}` 成组后整体判一次退出码。
+            _log = f"/tmp/xm4-warmup-{tc.name}.log"
+            lines.append(
+                f"RUN cd {shlex.quote(wd)} && ({{ {_wcmd}; }} > {shlex.quote(_log)} 2>&1 || "
+                f"echo '[swarm:warmup=failed] ⚠️ {tc.name} 预热失败：运行时联网兜底'"
+                f") ; tail -5 {shlex.quote(_log)} 2>/dev/null || true"
             )
 
     lines.append("# envd 由 base entrypoint 拉起；无前台 CMD。")
@@ -1030,7 +1112,8 @@ class BuildResult:
 
 # 构建器逻辑版本：Dockerfile 生成逻辑/warmup/权限处理等变更时递增，
 # 使旧模板指纹失效触发重建（仅 deps+src 指纹无法感知构建逻辑变化）。
-_BUILDER_VERSION = "10"  # v10: X-M5——混编工程 `_selftest_command` 从「首个命中即 return」改为逐栈自测（` && ` 链+去重）⇒ 多工具链镜像的构建期自测脚本变了必须递增，否则复用老镜像=混编自测修复不落地（X-C2/P-C3 同形状；摘要守卫同批把组合逻辑纳入）
+_BUILDER_VERSION = "11"  # v11: X-M4——warmup 从「仅 maven/gradle/npm」扩到 go/rust/python（go mod download / cargo fetch / pip install -r）+ python 安装段配 aliyun 镜像 ⇒ 生成 Dockerfile 变了必须递增，否则复用老镜像=预热修复不落地（X-C2/P-C3/X-M5 同形状第四次；摘要守卫同批把 generate_dockerfile 全输出纳入）
+#                       v10: X-M5——混编工程 `_selftest_command` 从「首个命中即 return」改为逐栈自测（` && ` 链+去重）⇒ 多工具链镜像的构建期自测脚本变了必须递增，否则复用老镜像=混编自测修复不落地（X-C2/P-C3 同形状；摘要守卫同批把组合逻辑纳入）
 #                       v9: 27 号文 #8——在场硬闸从「只有 gradle 有的一行字面量」推广到全部 6 个 (name,build_tool)（apt_packages 子串断言实测 2 条必然假过：go 只命中 ENV PATH、gradle 5/6 行是顺带命中）；Dockerfile 每个栈多一条 `RUN <verify>` ⇒ 生成物变了必须递增，否则复用老镜像=修复不落地
 # v8: X-C2——java 按 build_tool 装(Gradle 工程原先镜像里没 gradle→127 死循环)+钉 gradle 发行版+init.gradle 镜像源+gradle warmup；wrapper jar 不再被 tarball 剥掉(./gradlew/./mvnw 原必 ClassNotFound)；强制重建所有专属镜像
 #                       v7: _MAVEN_SETTINGS 加 Maven Central 直连兜底——治本 aliyun 缺失第三方包(googleauth)致 warmup 静默漏依赖、运行时 build fail；强制重建所有专属镜像

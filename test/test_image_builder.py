@@ -386,9 +386,25 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
         Toolchain(name="java", version="17", build_tool=None, dep_source="x"),
     ])
     parts.append("selftest|mixed|" + str(_selftest_command(mixed)))
+    # ★X-M4★ 同理：`generate_dockerfile` 的 **warmup 生成逻辑**也是生成物，上面的
+    # registry/selftest 摘要盖不到它（本批的 go/rust/python warmup 与 npm 兜底臂修复
+    # 都改在这里）——这是 X-M5 之后的第四次同形状。直接钉全输出（含全部 warmup 分支
+    # 的 spec：go/rust/python 不在上面的 mixed 里，漏了它们=新 warmup 代码改动守卫不响）。
+    from swarm.worker.image_builder import generate_dockerfile
+
+    all_stacks = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="java", version="17", build_tool="maven", dep_source="pom.xml"),
+        Toolchain(name="java", version="17", build_tool="gradle", dep_source="build.gradle"),
+        Toolchain(name="node", version=None, build_tool="npm", dep_source="ui/package.json"),
+        Toolchain(name="go", version=None, build_tool="go", dep_source="go.mod"),
+        Toolchain(name="rust", version=None, build_tool="cargo", dep_source="Cargo.toml"),
+        Toolchain(name="python", version=None, build_tool="pip", dep_source="api/requirements.txt"),
+        Toolchain(name="python", version=None, build_tool="pip", dep_source="pyproject.toml"),
+    ])
+    parts.append("dockerfile|all|" + generate_dockerfile(all_stacks, src_included=True))
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
-    assert (_BUILDER_VERSION, digest) == ("10", "82fb54cd2919214c"), (
+    assert (_BUILDER_VERSION, digest) == ("11", "b6a79b5430acccfc"), (
         f"镜像生成物或 registry 变了（当前摘要 {digest}，版本 {_BUILDER_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_BUILDER_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ `compute_project_fingerprint` 不变 ⇒ 已有专属镜像模板继续被复用 ⇒ "
@@ -653,3 +669,65 @@ def test_gradle_warmup_observability():
         "离线自检结果无机读标记（两个方向都要有，否则只能看出一半）"
     # 标记不许用 `SWARM_*=` 形态：那是 config/env_registry 的配置开关命名空间
     assert "SWARM_GRADLE" not in df, "日志标记占用了配置开关命名空间（会被登记闸判成未登记）"
+
+
+# ── X-M4（27 号文 §3.2）：warmup 扩栈 go/rust/python ─────────────────────
+
+
+def _xm4_spec(dep_source: str = "requirements.txt") -> EnvSpec:
+    return EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="go", version=None, build_tool="go", dep_source="go.mod"),
+        Toolchain(name="rust", version=None, build_tool="cargo", dep_source="Cargo.toml"),
+        Toolchain(name="python", version=None, build_tool="pip", dep_source=dep_source),
+    ])
+
+
+def test_xm4_warmup_covers_go_rust_python():
+    """治前 warmup 仅 maven/gradle/npm——go/rust/python 依赖不进镜像层，
+    离线/弱网沙箱运行时现网拉（rust 的 --offline 自测更是恒 degraded 死信）。
+    突变「分派表删任一条目/循环整块删掉」→ 本条红。"""
+    df = generate_dockerfile(_xm4_spec(), src_included=True)
+    assert "go mod download" in df, "go 模块缓存未预热"
+    assert "cargo fetch" in df, "cargo registry 未预热（--offline 自测仍是死信）"
+    assert "pip install" in df and "-r requirements.txt" in df, "python 依赖未预热"
+    # 降级必须机读可观测（血规 3）：预热失败的 echo 标记在场
+    assert df.count("[swarm:warmup=failed]") >= 3, "go/rust/python 各缺失败标记"
+
+
+def test_xm4_python_warmup_only_for_requirements_txt():
+    """pyproject.toml/setup.py/Pipfile 无确定性预热形态（血规 2 不臆造）→ 不出
+    pip install 命令，但必须在生成物里留痕（缺席机读可辨，硬检查④）。"""
+    df = generate_dockerfile(_xm4_spec("pyproject.toml"), src_included=True)
+    assert "pip install" not in df, "pyproject.toml 不该臆造 pip install -r"
+    assert "# X-M4：python 依赖清单为 pyproject.toml" in df, "无预热形态必须留痕"
+
+
+def test_xm4_warmup_unsafe_subdir_skipped_with_warning(caplog):
+    """dep_source 来自被扫描仓库（攻击者可控）——`..` 逃逸/非常规目录名一律拒，
+    与 npm 段 S-5 同闸；拒绝必须 WARNING（降级可观测）。"""
+    import logging
+
+    spec = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="go", version=None, build_tool="go", dep_source="../evil/go.mod")])
+    with caplog.at_level(logging.WARNING):
+        df = generate_dockerfile(spec, src_included=True)
+    assert "go mod download" not in df, "不安全子目录必须跳过 warmup"
+    assert any("子目录名不安全" in r.message for r in caplog.records), \
+        "跳过必须 WARNING 留痕"
+
+
+def test_xm4_npm_warmup_fallback_arm_is_live():
+    """H-1 sibling 同批治：旧写法 `npm ci | tail || npm install | tail || echo`
+    判的是 tail 的退出码（恒 0）⇒ install 兜底臂+echo 臂全死。新形态判命令本身。"""
+    df = generate_dockerfile(EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="node", version=None, build_tool="npm", dep_source="package.json")]),
+        src_included=True)
+    assert "npm ci > /tmp/npm-warmup.log 2>&1 || npm install" in df, \
+        "npm install 兜底臂必须真能轮到（退出码来自命令而非管道尾）"
+    assert "npm ci 2>&1 | tail" not in df, "判成败的臂后面接管道=死代码（H-1 同型）"
+
+
+def test_xm4_pip_mirror_configured():
+    """构建机网络受限（npm/maven/go 均已配国内镜像）——不配镜像的 pip warmup 是死信。"""
+    df = generate_dockerfile(_xm4_spec(), src_included=True)
+    assert "pip config set global.index-url" in df, "pip 未配镜像=warmup 在受限网络里必败"
