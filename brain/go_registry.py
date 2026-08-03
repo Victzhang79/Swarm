@@ -246,6 +246,84 @@ def local_module_cache_version(mod: str) -> str | None:
     return max(stable, key=_ver_key) if stable else None
 
 
+def project_go_mod_requires(project_path: str) -> dict[str, str]:
+    """工程**自己的** go.mod 里 require 钉的版本（mod → version，零网络证据）。
+
+    ★P-H3（27 号文）★ 治前裸 module 解析只认 `$GOPATH/pkg/mod`（已下载）与 proxy（联网）——
+    E2E 沙箱是新 clone（cache 空）、proxy 一抖，契约依赖被**如实丢弃**，而工程自己 go.mod
+    的 require 行就是钉死的可解析版本（比 proxy 最新更贴合本工程）。
+    读根 + 单层子目录 go.mod（与 maven `index_baseline`「根+单层」同形状；go.work 深层
+    成员不在面内=诚实边界）。根优先。`// indirect` 行同样收录——版本钉是真实的，
+    被解析的契约依赖本就是直接依赖，采用其钉版不改变直接/间接语义。
+    与 `local_module_cache_version` 同契约：同受 SWARM_GO_LOOKUP 门控——开关文档口径是
+    「关闭后=解析不到→如实丢弃」，本层不门控就会在离线模式里静默破约。
+    """
+    if not _lookup_enabled():
+        return {}
+    out: dict[str, str] = {}
+    root = Path(project_path)
+    mods: list[Path] = []
+    if (root / "go.mod").is_file():
+        mods.append(root / "go.mod")
+    try:
+        # ★Path.glob 会静默吞 OSError 返回 []（实测）——异常≠缺席（硬检查④），
+        # 枚举必须用会抛的 iterdir，失败与「真没有子目录 go.mod」才可辨
+        mods += sorted(d / "go.mod" for d in root.iterdir()
+                       if d.is_dir() and (d / "go.mod").is_file())
+    except OSError:
+        logger.warning("[go-registry] P-H3 子目录 go.mod 枚举失败（目录不可读），"
+                       "仅采根 go.mod: %s", root)
+    _REQ_LINE = re.compile(r"^([\w.\-/]+)\s+(v[\w.\-+]+)\s*(?://.*)?$")
+    _REQUIRE_OPEN = re.compile(r"^require\s*\(\s*(?://.*)?$")
+    _OTHER_OPEN = re.compile(r"^(?:exclude|replace|retract)\s*\(\s*(?://.*)?$")
+    _BLOCK_CLOSE = re.compile(r"^\)\s*(?://.*)?$")   # R2-2：`) // 注释` 也是合法块结束
+    for gm in mods:
+        try:
+            txt = gm.read_text("utf-8", errors="replace")
+        except OSError:
+            # 异常≠缺席（硬检查④）：读不出与「真没有 require」必须可辨
+            logger.warning("[go-registry] P-H3 go.mod 读取失败，其 require 钉版不参与取证: %s", gm)
+            continue
+        # require 两种形态：单行 `require mod vX.Y.Z` 与块 `require ( … )`。
+        # ★复核 R1-1★ 前缀剥除法补不了 exclude 块——剥掉 `exclude (` 后块内行与 require
+        # 块内行逐字相同（`mod vX.Y.Z`），坏版本/下架版本（retract）会冒充钉版。故小状态机：
+        # 只收 require 上下文里的行，其他指令块（exclude/replace/retract）整段跳过，
+        # 其余行（module/go/toolchain/裸行）一律不收。
+        in_require = False
+        in_other = False
+        for line in txt.splitlines():
+            s = line.strip()
+            if not s or s.startswith("//"):
+                continue
+            if in_require:
+                if _BLOCK_CLOSE.match(s):
+                    in_require = False
+                    continue
+                candidate = s
+            elif in_other:
+                if _BLOCK_CLOSE.match(s):
+                    in_other = False
+                continue
+            elif _REQUIRE_OPEN.match(s):
+                in_require = True
+                continue
+            elif _OTHER_OPEN.match(s):
+                in_other = True
+                continue
+            elif s[:7] == "require" and len(s) > 7 and s[7].isspace():
+                # R2-1：directive 与 module 间可以是 tab/多空格（gofmt 会归一，
+                # 手写/LLM 写的 go.mod 不保证），剥前缀必须容忍任意空白
+                candidate = s[7:].lstrip()
+            else:
+                # module/go/toolchain/单行 exclude/retract/replace（后者尾部 `=>` 或
+                # 无前缀版本本就过不了 _REQ_LINE，这里一并挡）——非 require 上下文绝不收
+                continue
+            m = _REQ_LINE.match(candidate)
+            if m:
+                out.setdefault(m.group(1), m.group(2))
+    return out
+
+
 def proxy_latest_version(mod: str) -> str | None:
     """版本解析：本地 module cache（确定能拉）→ proxy `/@latest`（过滤伪版本/预发布）→ 镜像。
     查不到/仅伪版本 → None（绝不臆造/latest 字面量）。"""
@@ -294,6 +372,7 @@ def _split_mod_version(raw: str) -> tuple[str, str | None]:
 
 
 def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
+                    project_path: str | None = None,
                     ) -> tuple[list[ResolvedGoDep], list[str], list[str]]:
     """把契约 Go 依赖（module 路径或 mod@ver）解析成 require 项。
 
@@ -309,13 +388,15 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
            保留（它们是真实可用形态，判必然 404 → 误杀）；
          · 规范 `vX.Y.Z(-pre)(+incompatible)` → proxy `/@v/<ver>.info` 探测：确证查无＝幻觉
            → 校正到 `/@latest` 或如实丢弃；**不可达 → fail-open 保留**（R56-6）。
-      3. 裸 module → 本地 cache → proxy `/@latest`。查不到 → drop。
+      3. 裸 module → 本地 cache → **工程自身 go.mod require 钉版**（P-H3，零网络）
+         → proxy `/@latest`。查不到 → drop。
     """
     internal_set = internal_modules or set()
     kept: list[ResolvedGoDep] = []
     internal: list[str] = []
     dropped: list[str] = []
     seen: set[str] = set()
+    _go_mod_pins: dict[str, str] | None = None
 
     for raw in specs:
         mod, explicit = _split_mod_version(raw)
@@ -350,8 +431,8 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                         dropped.append(str(raw).strip())
                     continue
                 # 伪版本（`v0.0.0-<ts>-<hash>`）：真实可用形态，判必然 404 → 误杀，原样保留。
-                # ★P-C2 复核 R2★ 伪版本无下游兜底（go 的 L1 dep-legality 是空转：
-                # `worker/l1_pipeline.py` 硬写 `driver_for("maven")`，go 工程 100% 空转），
+                # ★P-C2 复核 R2★ 伪版本无下游兜底（go 的 L1 dep-legality 仍无 driver——
+                # X-M10 后调用方已按 manifest 分派，go 触发 warn-once 零覆盖可辨），
                 # 止于 WARNING。判它必然 404 → 误杀，故宁可放行。
                 logger.info("[go-registry] P-C2 %s@%s 伪版本（真实可用形态）→ 不做存在性判定，"
                             "保留原样（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
@@ -377,7 +458,7 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
             _unverified = _exists is None
             if _unverified:
                 # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。
-                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
+                # ★P-C2 复核 R2★ go 侧无下游兜底（go 的 L1 dep-legality 仍无 driver），止于 WARNING。
                 logger.warning("[go-registry] P-C2 %s@%s 未经证实（proxy 不可达）→ fail-open "
                                "保留 LLM 主张（无下游兜底，止于 WARNING——npm/go 的 L1 "
                                "dep-legality 是空转，见 27 号文 P-C2 R2）", mod, explicit)
@@ -387,13 +468,31 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                 # `_exists is True` 才算验过；None＝证据不完整（F-2：这两种结局原先不可区分）
                 verified="unverified" if _unverified else "verified"))
             continue
+        # ★P-H3★ 裸 module 判定序：本地 cache（已下载）→ 工程自身 go.mod require 钉版
+        # （同仓零网络）→ proxy。治前中间这层不存在：新 clone 沙箱（cache 空）+ proxy
+        # 抖动 ⇒ 契约依赖被如实丢弃，答案却写在同仓 go.mod 里。
+        _cached = local_module_cache_version(mod)
+        if _cached:
+            seen.add(mod)
+            kept.append(ResolvedGoDep(module=mod, version=_cached, source="local"))
+            continue
+        if project_path and _go_mod_pins is None:
+            _go_mod_pins = project_go_mod_requires(project_path)
+        _pinned = (_go_mod_pins or {}).get(mod)
+        if _pinned:
+            # ★诚实边界（双复核 R1-3/R2-2）★钉版=具体版本且本工程曾可 build，证据强度
+            # 高于 npm 的区间声明；但 go.mod 若被上一轮 LLM 污染，本层照样保留——
+            # go 侧 L1 仍无 dep-legality driver（warn-once 可辨，X-M10），止于此边界。
+            seen.add(mod)
+            kept.append(ResolvedGoDep(module=mod, version=_pinned,
+                                      source="go_mod", verified="verified"))
+            continue
         ver = proxy_latest_version(mod)
         if not ver:
             dropped.append(str(raw).strip())
             continue
         seen.add(mod)
-        source = "local" if local_module_cache_version(mod) == ver else "proxy"
-        kept.append(ResolvedGoDep(module=mod, version=ver, source=source))
+        kept.append(ResolvedGoDep(module=mod, version=ver, source="proxy"))
 
     if dropped:
         logger.warning(

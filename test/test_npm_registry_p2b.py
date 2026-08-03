@@ -212,3 +212,144 @@ def test_resolve_offline_all_third_party_dropped(monkeypatch):
     kept, dropped = nr.resolve_npm_deps(None, ["@app/x", "react"], internal_names={"@app/x"})
     assert [k.name for k in kept] == ["@app/x"]
     assert dropped == ["react"]
+
+
+# ══════════════════════════════════════════════════════════════════
+# P-H3（27 号文）：工程**自身** package.json 声明 = 裸名解析的零网络证据层
+# ══════════════════════════════════════════════════════════════════
+# 治前裸名只认 node_modules（已安装）与 registry（联网）——E2E 沙箱是新 clone（无
+# node_modules）、registry 一抖，契约里写着的依赖被如实丢弃，答案却写在同仓
+# package.json 里（曾经装上过的声明，比 registry 最新版更贴合本工程）。
+# 判定序：node_modules → 工程自身清单声明（本层）→ registry。
+
+
+def test_ph3_manifest_specs_root_and_one_level(tmp_path):
+    """取证面：根 + 单层子目录；node_modules 里的清单是安装产物不是工程声明；根优先。"""
+    (tmp_path / "package.json").write_text(json.dumps({
+        "dependencies": {"axios": "^1.6.0", "shared": "^2.0.0"},
+        "devDependencies": {"vitest": "^1.0.0"},
+    }), encoding="utf-8")
+    sub = tmp_path / "web"   # 单层子目录（packages/web 两层深=诚实边界外，不收录）
+    sub.mkdir()
+    (sub / "package.json").write_text(
+        json.dumps({"dependencies": {"shared": "^9.9.9", "vue": "^3.4.0"}}), encoding="utf-8")
+    # node_modules/package.json 正好被「*/package.json」glob 到——跳过谓词的承重夹具
+    nm = tmp_path / "node_modules"
+    nm.mkdir()
+    (nm / "package.json").write_text(json.dumps({"dependencies": {"ghost": "1.0.0"}}),
+                                     encoding="utf-8")
+    specs = nr.project_manifest_specs(str(tmp_path))
+    assert specs["axios"] == "^1.6.0" and specs["vitest"] == "^1.0.0"
+    assert specs["vue"] == "^3.4.0", "单层子目录的清单也要收录"
+    assert specs["shared"] == "^2.0.0", "根优先：子模块同名声明不得覆盖根"
+    assert "ghost" not in specs, "node_modules 里的清单是安装产物，不是工程声明"
+
+
+def test_ph3_manifest_specs_malformed_json_warns_and_skips(tmp_path, caplog):
+    """残缺证据=没有证据（缺席即默认态），但必须可观测（硬检查④）——静默跳过会让
+    「清单坏了」与「真没有声明」不可分。"""
+    import logging
+
+    (tmp_path / "package.json").write_text("{ not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        specs = nr.project_manifest_specs(str(tmp_path))
+    assert specs == {}
+    assert any("P-H3" in r.getMessage() for r in caplog.records), \
+        "清单解析失败零信号 ⇒ 这层可以死很久没人知道"
+
+
+def test_ph3_manifest_specs_skips_empty_and_nonstr_specs(tmp_path):
+    """非字符串/空白 spec 不是有效钉版证据（`"a": ""` 写进 package.json 必然装不上）。"""
+    (tmp_path / "package.json").write_text(json.dumps({
+        "dependencies": {"a": "  ", "b": 3, "c": "^1.0.0"},
+        "devDependencies": ["not-a-dict"],
+    }), encoding="utf-8")
+    assert nr.project_manifest_specs(str(tmp_path)) == {"c": "^1.0.0"}
+
+
+def test_ph3_manifest_layer_respects_lookup_switch(tmp_path, monkeypatch):
+    """★消费契约★ 开关文档口径=「关闭后=解析不到→如实丢弃」（`local_node_modules_version`
+    同契约）。本层不门控就会在离线模式里静默破约——离线是** operator 要零解析**的场景，
+    不是「多找一条证据」的场景。"""
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    monkeypatch.setenv("SWARM_NPM_LOOKUP", "0")
+    assert nr.project_manifest_specs(str(tmp_path)) == {}
+    kept, dropped = nr.resolve_npm_deps(str(tmp_path), ["axios"])
+    assert kept == [] and dropped == ["axios"]
+
+
+def test_ph3_bare_name_resolves_from_project_manifest(tmp_path, monkeypatch):
+    """裸名 + 工程清单有声明（无 node_modules）→ 采用声明原文（不加 `^`、不改成别的
+    版本），registry 零咨询。"""
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+
+    def boom(pkg, pp=None):
+        raise AssertionError("清单已答 ⇒ registry 不该被咨询")
+
+    monkeypatch.setattr(nr, "registry_latest_version", boom)
+    kept, dropped = nr.resolve_npm_deps(str(tmp_path), ["axios"])
+    assert dropped == []
+    assert [(k.name, k.spec, k.source, k.verified) for k in kept] == \
+        [("axios", "^1.6.0", "project_manifest", "verified")]
+
+
+def test_ph3_node_modules_beats_manifest(tmp_path, monkeypatch):
+    """★判定序锁★ node_modules（已安装=最强证据）> 工程清单声明。顺序反了会把「确定
+    能装的版本」换成「声明区间」——解析能力没变，证据强度降档。"""
+    nm = tmp_path / "node_modules" / "axios"
+    nm.mkdir(parents=True)
+    (nm / "package.json").write_text(json.dumps({"version": "1.5.0"}), encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+
+    def boom(pkg, pp=None):
+        raise AssertionError("本地已答 ⇒ registry 不该被咨询")
+
+    monkeypatch.setattr(nr, "registry_latest_version", boom)
+    kept, _ = nr.resolve_npm_deps(str(tmp_path), ["axios"])
+    assert [(k.spec, k.source) for k in kept] == [("^1.5.0", "local")]
+
+
+def test_ph3_manifest_miss_falls_through_to_registry(tmp_path, monkeypatch):
+    """清单没声明 ⇒ 照旧落 registry：本层只加证据，不改既有出口。"""
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"other": "1.0.0"}}), encoding="utf-8")
+    monkeypatch.setattr(nr, "_http_get", lambda url: _mk_registry_doc(latest="4.18.2"))
+    kept, dropped = nr.resolve_npm_deps(str(tmp_path), ["express"])
+    assert dropped == []
+    assert [(k.spec, k.source) for k in kept] == [("^4.18.2", "registry")]
+
+
+def test_ph3_manifest_miss_and_registry_dead_still_drops(tmp_path, monkeypatch):
+    """fail-honest 方向不变：清单无、registry 查无 ⇒ 如实丢弃——本层绝不变成兜底造假源
+    （血规 2）。"""
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {}}), encoding="utf-8")
+    monkeypatch.setattr(nr, "_http_get", lambda url: None)
+    kept, dropped = nr.resolve_npm_deps(str(tmp_path), ["ghost-pkg"])
+    assert kept == [] and dropped == ["ghost-pkg"]
+
+
+def test_ph3_manifest_enum_oserror_warns_and_degrades(tmp_path, caplog):
+    """★复核 R2-1★ 子目录枚举失败（目录不可读）≠「真没有子目录清单」——必须 WARNING
+    可辨（硬检查④）。夹具用真 chmod 000（`Path.glob` 会静默吞 OSError，iterdir 才抛，
+    这是实现选型的承重前提，不打桩 pathlib 内部）。"""
+    import logging
+    import os
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+    sub = tmp_path / "web"
+    sub.mkdir()
+    (sub / "package.json").write_text(
+        json.dumps({"dependencies": {"vue": "^3.4.0"}}), encoding="utf-8")
+    os.chmod(tmp_path, 0o000)
+    try:
+        with caplog.at_level(logging.WARNING):
+            specs = nr.project_manifest_specs(str(tmp_path))
+    finally:
+        os.chmod(tmp_path, 0o755)
+    assert specs == {}, "目录不可读时根清单也读不到（is_file 假阴性）⇒ 只能剩 WARNING 这一条信号"
+    assert any("枚举失败" in r.getMessage() for r in caplog.records), \
+        "枚举异常被层内自吞 ⇒ 「目录坏了」与「真没有子包」不可分"

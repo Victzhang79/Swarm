@@ -3602,7 +3602,8 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
         # 契约可能用【模块标签】或【import 路径】引用内部 module → 统一归一成规范 import 路径，
         # 令 resolve_go_deps 的内部判定与下方 replace 生成同用一套规范键（杜绝裸标签泄进 go.mod）。
         _norm_arts = [internal_paths.get(a, a) for a in arts]
-        kept, internal_mods, dropped = resolve_go_deps(_norm_arts, internal_modules=internal_ids)
+        kept, internal_mods, dropped = resolve_go_deps(
+            _norm_arts, internal_modules=internal_ids, project_path=project_path)
         # F-2：先于任何 continue 记账（go driver 同样三条出口，含 self_path=None 那条）
         _record_unverified_deps(unverified_out, mod, kept)
         if dropped:

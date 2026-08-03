@@ -205,3 +205,158 @@ def test_resolve_offline_third_party_dropped(monkeypatch):
         internal_modules={"example.com/app/x"})
     assert internal == ["example.com/app/x"]
     assert dropped == ["github.com/gin-gonic/gin"]
+
+
+# ══════════════════════════════════════════════════════════════════
+# P-H3（27 号文）：工程**自身** go.mod 的 require 钉版 = 裸 module 的零网络证据层
+# ══════════════════════════════════════════════════════════════════
+# 治前裸 module 只认 `$GOPATH/pkg/mod`（已下载）与 proxy（联网）——E2E 沙箱是新
+# clone（cache 空）、proxy 一抖，契约依赖被如实丢弃，而工程自己 go.mod 的 require 行
+# 就是钉死的可解析版本（比 proxy 最新更贴合本工程）。
+# 判定序：本地 module cache → 工程自身 go.mod 钉版（本层）→ proxy。
+
+
+def test_ph3_go_mod_requires_parses_both_require_forms(tmp_path):
+    """取证面：单行 + 块两种 require 形态、`// indirect` 行、根优先、replace 行不收。"""
+    (tmp_path / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\n"
+        "require github.com/gin-gonic/gin v1.9.1\n\n"
+        "require (\n"
+        "\tgithub.com/golang-jwt/jwt/v5 v5.2.0\n"
+        "\tgolang.org/x/text v0.14.0 // indirect\n"
+        ") // 块结束也允许带注释（R2-2：不识它会把后续 exclude 块当 require 收）\n\n"
+        "require\tgithub.com/tabby/dep v1.0.0\n"     # R2-1：tab 分隔是合法形态
+        "require  github.com/spacy/dep v2.0.0\n"    # R2-1：多空格也是
+        "exclude (\n"
+        "\tgithub.com/bad2/pkg v3.0.0\n"
+        ")\n\n"
+        "exclude (\n"
+        "\tgithub.com/bad/pkg v1.0.0\n"
+        ")\n\n"
+        "replace example.com/old v1.0.0 => ../old\n\n"
+        "retract v2.0.0\n", encoding="utf-8")
+    sub = tmp_path / "svc"   # 单层子目录
+    sub.mkdir()
+    (sub / "go.mod").write_text(
+        "module example.com/app/svc\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v9.9.9\n",
+        encoding="utf-8")
+    pins = gr.project_go_mod_requires(str(tmp_path))
+    assert pins["github.com/gin-gonic/gin"] == "v1.9.1", "根优先：子目录同名钉版不得覆盖根"
+    assert pins["github.com/golang-jwt/jwt/v5"] == "v5.2.0"
+    assert pins["golang.org/x/text"] == "v0.14.0", "// indirect 行同样收录（钉版是真实证据）"
+    assert "example.com/old" not in pins, "replace 行不是 require 钉版（`=>` 尾必须挡住）"
+    assert "github.com/bad/pkg" not in pins, \
+        "★复核 R1-1★ exclude 块内行是【被排除的坏版本】，剥前缀法会把它冒充钉版——必须整段跳过"
+    assert "github.com/bad2/pkg" not in pins, \
+        "★复核 R2-2★ `) // 注释` 也是合法块结束——不识它，后续 exclude 块会被当 require 收"
+    assert "retract" not in pins, "★复核 R1-1★ retract 单行是【下架声明】，不是 require 钉版"
+    assert pins["github.com/tabby/dep"] == "v1.0.0", "★复核 R2-1★ tab 分隔的单行 require 必须收"
+    assert pins["github.com/spacy/dep"] == "v2.0.0", "★复核 R2-1★ 多空格分隔的单行 require 必须收"
+
+
+def test_ph3_go_mod_layer_respects_lookup_switch(tmp_path, monkeypatch):
+    """★消费契约★ 开关文档口径=「关闭后=解析不到→如实丢弃」（`local_module_cache_version`
+    同契约）。本层不门控就会在离线模式里静默破约。"""
+    (tmp_path / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+        encoding="utf-8")
+    monkeypatch.setenv("SWARM_GO_LOOKUP", "0")
+    assert gr.project_go_mod_requires(str(tmp_path)) == {}
+    kept, _, dropped = gr.resolve_go_deps(["github.com/gin-gonic/gin"],
+                                          project_path=str(tmp_path))
+    assert kept == [] and dropped == ["github.com/gin-gonic/gin"]
+
+
+def test_ph3_bare_module_resolves_from_go_mod_pin(tmp_path, monkeypatch):
+    """裸 module + 工程 go.mod 有钉版（cache 空）→ 采用钉版，proxy 零咨询。"""
+    (tmp_path / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+        encoding="utf-8")
+
+    def boom(mod):
+        raise AssertionError("go.mod 已答 ⇒ proxy 不该被咨询")
+
+    monkeypatch.setattr(gr, "proxy_latest_version", boom)
+    kept, _, dropped = gr.resolve_go_deps(["github.com/gin-gonic/gin"],
+                                          project_path=str(tmp_path))
+    assert dropped == []
+    assert [(k.module, k.version, k.source, k.verified) for k in kept] == \
+        [("github.com/gin-gonic/gin", "v1.9.1", "go_mod", "verified")]
+
+
+def test_ph3_local_cache_beats_go_mod_pin(tmp_path, monkeypatch):
+    """★判定序锁★ 本地 module cache（已下载=最强证据）> go.mod 钉版。"""
+    gopath = tmp_path / "gopath"
+    cache = gopath / "pkg" / "mod" / "github.com" / "gin-gonic"
+    cache.mkdir(parents=True)
+    (cache / "gin@v1.8.0").mkdir()
+    monkeypatch.setenv("GOPATH", str(gopath))
+    (tmp_path / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+        encoding="utf-8")
+
+    def boom(mod):
+        raise AssertionError("cache 已答 ⇒ proxy 不该被咨询")
+
+    monkeypatch.setattr(gr, "proxy_latest_version", boom)
+    kept, _, _ = gr.resolve_go_deps(["github.com/gin-gonic/gin"], project_path=str(tmp_path))
+    assert [(k.version, k.source) for k in kept] == [("v1.8.0", "local")]
+
+
+def test_ph3_go_mod_miss_falls_through_to_proxy(tmp_path, monkeypatch):
+    """go.mod 没钉 ⇒ 照旧落 proxy：本层只加证据，不改既有出口。"""
+    (tmp_path / "go.mod").write_text("module example.com/app\n\ngo 1.22\n", encoding="utf-8")
+    monkeypatch.setattr(gr, "_http_get", lambda url: _latest("v1.10.0"))
+    kept, _, dropped = gr.resolve_go_deps(["github.com/gin-gonic/gin"],
+                                          project_path=str(tmp_path))
+    assert dropped == []
+    assert [(k.version, k.source) for k in kept] == [("v1.10.0", "proxy")]
+
+
+def test_ph3_go_mod_miss_and_proxy_dead_still_drops(tmp_path, monkeypatch):
+    """fail-honest 方向不变：go.mod 无、proxy 查无 ⇒ 如实丢弃（血规 2，绝不兜底造假）。"""
+    (tmp_path / "go.mod").write_text("module example.com/app\n\ngo 1.22\n", encoding="utf-8")
+    monkeypatch.setattr(gr, "_http_get", lambda url: None)
+    kept, _, dropped = gr.resolve_go_deps(["example.com/ghost"], project_path=str(tmp_path))
+    assert kept == [] and dropped == ["example.com/ghost"]
+
+
+def test_ph3_go_mod_enum_oserror_warns_and_degrades(tmp_path, caplog):
+    """★复核 R2-1★ 枚举失败（目录不可读）≠「真没有子目录 go.mod」——必须 WARNING 可辨。"""
+    import logging
+    import os
+
+    (tmp_path / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+        encoding="utf-8")
+    sub = tmp_path / "svc"
+    sub.mkdir()
+    (sub / "go.mod").write_text("module example.com/app/svc\n", encoding="utf-8")
+    os.chmod(tmp_path, 0o000)
+    try:
+        with caplog.at_level(logging.WARNING):
+            pins = gr.project_go_mod_requires(str(tmp_path))
+    finally:
+        os.chmod(tmp_path, 0o755)
+    assert pins == {}
+    assert any("枚举失败" in r.getMessage() for r in caplog.records), \
+        "枚举异常被层内自吞 ⇒ 「目录坏了」与「真没有」不可分"
+
+
+def test_ph3_go_mod_read_oserror_warns_and_skips(tmp_path, caplog):
+    """★复核 R2-1★ go.mod 存在但读不出 ≠「没有 require」——必须 WARNING 可辨（硬检查④）。"""
+    import logging
+    import os
+
+    gm = tmp_path / "go.mod"
+    gm.write_text("module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+                  encoding="utf-8")
+    os.chmod(gm, 0o000)
+    try:
+        with caplog.at_level(logging.WARNING):
+            pins = gr.project_go_mod_requires(str(tmp_path))
+    finally:
+        os.chmod(gm, 0o644)
+    assert pins == {}, "读不出还采到了钉版 ⇒ 夹具没压到目标分支"
+    assert any("读取失败" in r.getMessage() for r in caplog.records), \
+        "读取异常被层内自吞 ⇒ 「文件坏了」与「真没有 require」不可分"

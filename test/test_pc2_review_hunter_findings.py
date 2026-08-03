@@ -627,3 +627,35 @@ def test_f2_plan_finisher_emits_the_key_always(_npm_root, monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ═══════════════════ P-H3：go.mod 钉版层必须经真实调用链接上 ═══════════════════
+
+def test_ph3_go_mod_pin_reaches_scaffold_via_real_caller(_go_root, monkeypatch):
+    """★P-H3 接线锁（血规 10 第一条）★ go.mod 钉版层加在 `resolve_go_deps` 里，唯一生产
+    调用点是 `_inject_go_scaffolds`——它不传 `project_path`，这层就是零调用点死代码。
+
+    判据：proxy 全程 boom；裸 module（无 @版本）仍被解析 ⇒ 唯一可能是 go.mod 钉版经
+    真实调用链到达。突变调用方的 `project_path=project_path` → `None`，本条必红
+    （裸 module 被 drop ⇒ 权威 go.mod 模板里找不到钉版行）。
+    """
+    from swarm.brain.contract_utils import inject_build_scaffold_subtasks
+
+    (_go_root / "go.mod").write_text(
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+        encoding="utf-8")
+
+    def boom(url):
+        raise AssertionError("go.mod 已答 ⇒ proxy 不该被咨询（接线断了才会走到这里）")
+
+    monkeypatch.setattr(gr, "_http_get", boom)
+    monkeypatch.setattr(gr, "_http_probe", boom)
+    plan = TaskPlan(subtasks=[_st("st-1", ["svc/auth/main.go"])],
+                    parallel_groups=[["st-1"]])
+    plan.shared_contract = {"dependencies": [
+        {"module": "auth", "artifacts": ["github.com/gin-gonic/gin"]}]}   # 裸 module（无 @版）
+    injected = inject_build_scaffold_subtasks(plan, str(_go_root), None)
+    assert injected, "夹具没走到 go driver（零注入 ⇒ 这条测试什么也没证明）"
+    scaffold = next(st for st in plan.subtasks if st.id == "st-scaffold-auth")
+    assert "github.com/gin-gonic/gin v1.9.1" in scaffold.description, \
+        "钉版没进权威 go.mod 模板 ⇒ P-H3 证据层在生产链路上是断的"

@@ -187,6 +187,54 @@ def local_node_modules_version(project_path: str, pkg: str) -> str | None:
     return ver if isinstance(ver, str) and _is_stable(ver) else None
 
 
+def project_manifest_specs(project_path: str) -> dict[str, str]:
+    """工程**自己的** package.json 声明的依赖区间（name → spec，零网络证据）。
+
+    ★P-H3（27 号文）★ 治前裸名解析只认 `node_modules/`（已安装）与 registry（联网）——
+    E2E 沙箱是新 clone（无 node_modules）、registry 一抖，契约里写着的依赖被**如实丢弃**，
+    而答案就写在同仓 `package.json` 里（曾经装上过的声明，比 registry 最新版更贴合本工程）。
+    读根 + 单层子目录（与 maven `index_baseline`「根+单层」同形状；workspaces 深层
+    子包不在面内=诚实边界），跳过 node_modules。根优先（就近覆盖与子模块同名声明）。
+    与 `local_node_modules_version` 同契约：同受 SWARM_NPM_LOOKUP 门控——开关文档口径是
+    「关闭后=解析不到→如实丢弃」，本层不门控就会在离线模式里静默破约（消费契约随开关，
+    不随「零网络」取证方式）。
+    """
+    if not _lookup_enabled():
+        return {}
+    out: dict[str, str] = {}
+    root = Path(project_path)
+    manifests: list[Path] = []
+    if (root / "package.json").is_file():
+        manifests.append(root / "package.json")
+    try:
+        # ★Path.glob 会静默吞 OSError 返回 []（实测）——异常≠缺席（硬检查④），
+        # 枚举必须用会抛的 iterdir，失败与「真没有子目录清单」才可辨
+        subdirs = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        logger.warning("[npm-registry] P-H3 子目录 package.json 枚举失败（目录不可读），"
+                       "仅采根清单: %s", root)
+        subdirs = []
+    manifests += [d / "package.json" for d in subdirs
+                  if d.name != "node_modules" and (d / "package.json").is_file()]
+    for pj in manifests:
+        try:
+            data = json.loads(pj.read_text("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            # 证据收集层的残缺证据=没有证据（缺席即默认态），但必须可观测（硬检查④）
+            logger.warning("[npm-registry] P-H3 工程清单解析失败，其依赖声明不参与取证: %s", pj)
+            continue
+        if not isinstance(data, dict):
+            continue
+        for sec in ("dependencies", "devDependencies"):
+            deps = data.get(sec)
+            if not isinstance(deps, dict):
+                continue
+            for name, spec in deps.items():
+                if isinstance(name, str) and isinstance(spec, str) and spec.strip():
+                    out.setdefault(name, spec.strip())
+    return out
+
+
 def registry_latest_version(pkg: str, project_path: str | None = None) -> str | None:
     """版本解析：本地 node_modules（确定能装）→ registry dist-tags.latest（过滤预发布，
     非稳定则回退全量 versions 里的最大稳定版）→ 镜像兜底。查不到 → None（绝不臆造/latest）。"""
@@ -300,8 +348,8 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
     `1.2.3` 在本函数眼里同值。三种越界都朝**判可满足**（不判幻觉）倾斜：LLM 写
     `1.2.3-rc.1` 而仓库只有 `1.2.3`、写 `^1.2.3` 而仓库只有 `1.2.4-rc.1`（npm 的 caret
     实际不匹配预发布）等。**方向是刻意的**——本函数的返回值只用来"判是否幻觉"，假阴性
-    （漏判一个幻觉）**无下游兜底**（npm/go 的 L1 dep-legality 是空转：`worker/l1_pipeline.py`
-    硬写 `driver_for("maven")`，npm/go 工程走到那里 100% 空转——见 27 号文 P-C2 R2），
+    （漏判一个幻觉）下游只剩 X-M10 的 L1 dep-legality npm 臂（go 仍无 driver——见 27 号文
+    §7.11），
     止于 WARNING。假阳性（误杀真依赖）同样无人兜底。真要收紧得引入完整 semver 比较，
     那是另一档决定，别顺手把这里改严。
     """
@@ -395,10 +443,12 @@ class ResolvedNpmDep:
     # ★为什么不改 `source` 的取值而另开字段★ `source` 的既有消费者（模板渲染、15 处测试断言）
     # 要的是"版本从哪来"，与"验没验过"是两个问题；复用单一事实源 ≠ 复用其消费契约，
     # 后果不同必须分档（血规 10 第三条）。
-    #   verified   —— 有确定性证据（registry 版本集可满足 / 解析自 registry / 本地 node_modules）
+    #   verified   —— 有确定性证据（registry 版本集可满足 / 解析自 registry / 本地
+    #                 node_modules / 工程自身清单声明（P-H3：同仓 package.json 的
+    #                 dependencies 原文——项目是 dependency 的权威声明方，证据在盘上））
     #   unverified —— 证据不完整，fail-open 保留了 LLM 主张
-    #                 （无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality 是空转，
-    #                 见 27 号文 P-C2 R2）
+    #                 （npm 侧下游已有 X-M10 L1 dep-legality 臂；go 仍无 driver，
+    #                 warn-once 可辨，见 27 号文 §7.11）
     #   unjudgeable—— 刻意不判（协议/别名/复合区间；判它们的风险是误杀）
     verified: str = "verified"
 
@@ -433,12 +483,14 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
          · 协议/别名（`workspace:` `file:` `git+` `npm:` …）/ 复合区间 → **不判**，原样保留；
          · 简单区间 → 取全量版本集判可满足性：不可满足＝确证幻觉 → 校正/如实丢弃；
            registry 不可达 → **fail-open 保留**（R56-6 证据缺失≠否定证据）。
-      3. 裸名 → 本地 node_modules 版本 → registry 最新稳定版 → 加 `^` 前缀。查不到 → drop。
+      3. 裸名 → 本地 node_modules 版本 → **工程自身 package.json 声明**（P-H3，零网络）
+         → registry 最新稳定版 → 加 `^` 前缀。查不到 → drop。
     """
     internal = internal_names or set()
     kept: list[ResolvedNpmDep] = []
     dropped: list[str] = []
     seen: set[str] = set()
+    _manifest_specs: dict[str, str] | None = None
 
     for raw in specs:
         name, explicit = _split_name_range(raw)
@@ -469,17 +521,17 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                     logger.warning("[npm-registry] P-C2 %s@%s 是不可复现的 dist-tag/通配，但"
                                    "registry 不可达无法解析成具体版本 → fail-open 保留原样"
                                    "（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
-                                   "是空转，见 27 号文 P-C2 R2）", name, explicit)
+                                   "npm 臂已接（X-M10），go 仍空转，见 27 号文 §7.11）", name, explicit)
                     kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
                                                verified="unverified"))
                 continue
             if _kind in ("protocol", "complex"):
                 # 不判（Maven `${...}` 的对应物）：协议/别名不是版本主张；复合区间无 semver 库
                 # 判不准，**猜语义的风险是误杀真依赖**，比放过一个幻觉更坏（fail-open 但留痕）。
-                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
+                # ★P-C2 复核 R2★ npm 侧下游有 X-M10 dep-legality 臂（go 仍空转），止于 WARNING。
                 logger.info("[npm-registry] P-C2 %s@%s 属【%s】形态，不做可满足性判定"
                             "（保留原样；无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
-                            "是空转，见 27 号文 P-C2 R2）", name, explicit, _kind)
+                            "npm 臂已接（X-M10），go 仍空转，见 27 号文 §7.11）", name, explicit, _kind)
                 seen.add(name)
                 kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
                                            verified="unjudgeable"))
@@ -501,11 +553,11 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                     dropped.append(str(raw).strip())
                     continue
                 # registry 不可达 → fail-open 保留（R56-6 证据缺失≠否定证据），必须留痕。
-                # ★P-C2 复核 R2★ 无下游兜底（npm/go 的 L1 dep-legality 是空转），止于 WARNING。
+                # ★P-C2 复核 R2★ npm 侧下游有 X-M10 dep-legality 臂（go 仍空转），止于 WARNING。
                 logger.warning("[npm-registry] P-C2 %s@%s 未经证实（registry 不可达/包查不到）"
                                " → fail-open 保留 LLM 主张"
                                "（无下游兜底，止于 WARNING——npm/go 的 L1 dep-legality "
-                               "是空转，见 27 号文 P-C2 R2）",
+                               "npm 臂已接（X-M10），go 仍空转，见 27 号文 §7.11）",
                                name, explicit)
                 seen.add(name)
                 kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
@@ -529,14 +581,33 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
             seen.add(name)
             kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
             continue
-        ver = registry_latest_version(name, project_path)
+        # ★P-H3★ 裸名判定序：node_modules（已安装）→ 工程自身 package.json 声明
+        # （同仓零网络，曾经装上过的版本）→ registry。治前中间这层不存在：新 clone 沙箱
+        # （无 node_modules）+ registry 抖动 ⇒ 契约依赖被如实丢弃，答案却写在同仓清单里。
+        _local = local_node_modules_version(project_path, name) if project_path else None
+        if _local:
+            seen.add(name)
+            kept.append(ResolvedNpmDep(name=name, spec=f"^{_local}", source="local"))
+            continue
+        if project_path and _manifest_specs is None:
+            _manifest_specs = project_manifest_specs(project_path)
+        _decl = (_manifest_specs or {}).get(name)
+        if _decl:
+            # ★诚实边界（双复核 R1-3/R2-2）★「工程是 dependency 的权威声明方」是设计假设：
+            # 清单若被上一轮 LLM 污染（不存在的包/不可满足区间），本层照样当 verified 保留
+            # ——零网络层的存在意义就是 registry 不可达时也能答，判可满足就必须联网，二者
+            # 不可兼得。下游 X-M10 L1 npm 臂在线时仍查包存在性（区间可满足性是该臂刻意
+            # 不查的文档边界），幻觉区间最坏在构建期暴露，不在规划期臆造。
+            seen.add(name)
+            kept.append(ResolvedNpmDep(name=name, spec=_decl,
+                                       source="project_manifest", verified="verified"))
+            continue
+        ver = registry_latest_version(name, None)   # local 层上面已判过，别重复探测
         if not ver:
             dropped.append(str(raw).strip())
             continue
         seen.add(name)
-        source = "local" if (project_path and local_node_modules_version(project_path, name)
-                             == ver) else "registry"
-        kept.append(ResolvedNpmDep(name=name, spec=f"^{ver}", source=source))
+        kept.append(ResolvedNpmDep(name=name, spec=f"^{ver}", source="registry"))
 
     if dropped:
         logger.warning(
