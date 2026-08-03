@@ -108,12 +108,18 @@ class StackSpec:
 
     has_module_scaffold_driver: bool = False
     """该栈是否有**确定性脚手架 driver 一次建全模块清单**（= contract_utils
-    `_AGGREGATOR_SCAFFOLD_STACKS`，由 `test_scaffold_driver_facts_match_reality` 对账防漂移）。
+    `_MODULE_SCAFFOLD_DRIVER_STACKS`——maven 聚合 driver ∪ `_P2_SCAFFOLD_DRIVERS`，
+    由 `test_scaffold_driver_facts_match_reality` 对账防漂移）。
 
     ★这是"模块清单 demote 安不安全"的事实依据★：owner 按契约一次建全模块清单时，非 owner
     写者本就没有该文件的合法贡献，demote 无损（#11a doctrine）。没有 driver 的栈里 demote
     掉的是**真实编辑**（该子任务想加的依赖/插件），且无任何 reconcile 覆盖模块清单
-    → 必须 WARNING + record_degrade（纪律 3）。实测：只有 maven 有。"""
+    → 必须 WARNING + record_degrade（纪律 3）。
+
+    ★已知边界（hunter R2 M-3，登记不改）★ 这是**栈级**事实，而 driver 只覆盖【契约
+    dependencies 里的模块】——契约外模块的清单 demote 仍无网（G1 coherence 大概率先把
+    无契约模块的 plan 打回，实际可达性低）。拿栈级事实当"任何模块清单都有网"与 M-3
+    原病同形，只是可达性低一档；真收窄需要 demote 留痕点能反查模块契约归属，待 P-M。"""
 
     source_exclude_dirs: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的目录段（vendored / 产物目录，从不由人手写）。"""
@@ -176,9 +182,12 @@ STACK_SPEC: dict[str, StackSpec] = {
         module_manifest="package.json",
         aggregate_manifest="package.json", aggregate_field="workspaces",
         source_exts=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
-        # ★npm 是唯一【两档都无网】的已收录栈★ 聚合无 `_reconcile_npm`、模块无脚手架 driver
-        # → 任何 package.json demote 都必须可观测（B-5 ManifestDriver 待补）。
+        # ★npm 聚合档无网（无 `_reconcile_npm`）★ 根 package.json demote 必须可观测
+        # （B-5 ManifestDriver 待补）；模块档有 #31-P2b 脚手架 driver（owner 按契约
+        # 一次建全+owner-backfill）→ 模块 package.json demote 安全（P-H4a 复核补翻——
+        # driver 落地时漏翻，正是对账锁要逮的漂移）。
         has_aggregate_reconcile=False,
+        has_module_scaffold_driver=True,
         source_exclude_dirs=("node_modules", "dist", "build", "out", ".next"),
         source_exclude_suffixes=(".d.ts",),
     ),
@@ -188,7 +197,10 @@ STACK_SPEC: dict[str, StackSpec] = {
         module_manifest="go.mod",
         aggregate_manifest="go.work", aggregate_field="use(...)",
         source_exts=(".go",),
-        has_aggregate_reconcile=True,      # _reconcile_go_work（模块 go.mod 无网）
+        has_aggregate_reconcile=True,      # _reconcile_go_work
+        # 模块档有 #31-P2c 脚手架 driver（owner 按契约一次建全+owner-backfill）→
+        # 模块 go.mod demote 安全（P-H4a 复核补翻，同 npm）。
+        has_module_scaffold_driver=True,
         source_exclude_dirs=("vendor",),
         whole_project_build_cmd="go build ./...",
     ),
@@ -210,6 +222,9 @@ STACK_SPEC: dict[str, StackSpec] = {
         # 的实证——合表之后这类漂移不可能再无声无息。
         root_manifests=("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
         module_manifest="pyproject.toml",
+        # ★P-H4a★ python per-pyproject driver 已落地（contract_utils `_P2_SCAFFOLD_DRIVERS`
+        # 派生集对账，test_b3 防漂移）——owner 按契约一次建全模块清单，demote 安全。
+        has_module_scaffold_driver=True,
         # ★刻意 None（诚实边界）★ poetry / uv / hatch 的 workspace 机制互不兼容，
         # 收录任何一种都是猜。缺席由 unregistered_aggregate_stacks() 机读可辨。
         aggregate_manifest=None, aggregate_field="",
@@ -333,8 +348,11 @@ def structural_manifests() -> frozenset[str]:
       · npm —— **无 `_reconcile_npm`**，只剩规则4 的 owner 登记这**一道**网（已登记为
         B-5 ManifestDriver 待补项，不假装双保险）；
       · python —— `aggregate_manifest is None`（workspace 机制生态碎片化，未收录）＝
-        **既无 reconcile 也无规则4 登记** → demote 必丢贡献 → **刻意不收录本集合**，
-        维持既有"串行化保留写权"行为（零改动）。
+        **根档既无 reconcile 也无规则4 登记** → 根 pyproject.toml demote 必丢贡献。
+        模块档虽已（P-H4a）有确定性脚手架 driver（`has_module_scaffold_driver=True`，
+        新建撞车 demote 安全），但本集合是 basename 判据、**无法区分根/模块
+        pyproject.toml**——收录会把根档也拖进 demote → **刻意不收录本集合**，
+        双写者维持"串行化保留写权"（比 demote 丢贡献安全）。
     """
     out: set[str] = set()
     for spec in STACK_SPEC.values():

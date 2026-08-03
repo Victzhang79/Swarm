@@ -20,6 +20,9 @@ os.environ.setdefault("SWARM_MAVEN_LOOKUP", "0")
 # #31-P2b/2c：npm/go 版本解析同律默认关闭（栈中立铺开，同上防"网络好就绿"假绿）。
 os.environ.setdefault("SWARM_NPM_LOOKUP", "0")
 os.environ.setdefault("SWARM_GO_LOOKUP", "0")
+# P-H4：python 脚手架 driver 的 registry 解析同纪律（绝不让测试依赖网络/假绿）。
+# ★cr LOW-7★ cargo 的开关等 cargo_registry 落地时随消费者一起加（新账没有消费者＝没造）。
+os.environ.setdefault("SWARM_PYPI_LOOKUP", "0")
 
 def install_noop_transaction(mock_store) -> None:
     """A-P1-26：给 AsyncMock 的 MemoryStore 装一个 no-op 的 transaction() 异步上下文。

@@ -228,7 +228,8 @@ _DRIVER_MATRIX = [
     ("go", "go.mod", "module example.com/app\n\ngo 1.22\n",
      "mod-a", "svc/mod-a/main.go", "go.mod"),
     # ★P-H4 诚实边界★ 认出来了却零脚手架出口 —— 期望值写 None 是**如实记录现状**，
-    # 不是"应该如此"。B-6 给这三栈补 driver 那天，这三格要改成对应清单名。
+    # 不是"应该如此"。B-6 给这两栈补 driver 那天，这两格要改成对应清单名。
+    # （python 格已于 P-H4a 从 None 改为 pyproject.toml——driver 已落地）
     ("gradle", "settings.gradle", "include ':mod-a'\n",
      "mod-a", "mod-a/src/main/kotlin/com/demo/A.kt", None),
     ("cargo", "Cargo.toml", '[workspace]\nmembers = ["crates/mod-a"]\n',
@@ -237,7 +238,7 @@ _DRIVER_MATRIX = [
     # 物理落点（"src"/"pkg" 都在 `_SRC_LAYOUT_SEGMENTS` 里会被当布局段剥掉——"pkg" 是当年为
     # Go 的 cmd/internal/pkg 塞进去的，27 号文 P-M4 已把那张表标成补丁磁铁）。
     ("python", "pyproject.toml", '[project]\nname = "root"\nversion = "0.1.0"\n',
-     "mod_a", "services/mod_a/service.py", None),
+     "mod_a", "services/mod_a/service.py", "pyproject.toml"),
     # 无任何清单证据 → 保守回退 Maven（back-compat，下游 R57-1 pom 取证二次把关）
     ("unknown", None, None, "mod-a", "mod-a/src/main/java/com/demo/A.java", "pom.xml"),
 ]

@@ -279,12 +279,18 @@ def _capture_demote(contested, *, exists):
 @pytest.mark.parametrize("agg,mod,warn_agg,warn_mod", [
     # 栈, 根聚合档, 模块档 —— 两档**分别**判，别用一个布尔管两件事
     ("pom.xml", "mod-a/pom.xml", False, False),        # maven：两档都有网
-    ("package.json", "packages/a/package.json", True, True),   # npm：两档都无网
-    # ★复核 M-3 本尊★ gradle/go/cargo 有【聚合】reconcile 但**没有模块清单的网**：
+    # ★复核 M-3 本尊★ gradle/cargo 有【聚合】reconcile 但**没有模块清单的网**：
     # 早先版本拿聚合档的事实当"该栈任何清单都有网"，模块清单 demote 丢真实编辑却零告警。
     ("settings.gradle", "mod-a/build.gradle", False, True),
-    ("go.work", "internal/a/go.mod", False, True),
     ("Cargo.toml", "crates/a/Cargo.toml", False, True),
+    # npm/go/python 模块档已有 #31-P2 确定性 driver（owner 按契约一次建全+backfill，
+    # P-H4a 复核补翻 spec）→ 模块清单 demote 安全不刷告警；npm 聚合档仍无 reconcile。
+    ("package.json", "packages/a/package.json", True, False),
+    ("go.work", "internal/a/go.mod", False, False),
+    # ★python 刻意不在本矩阵★（hunter R2 L-5：空转行零区分力——python 不在
+    # structural_manifests，writable 双写走串行化不 demote，两探针恒零告警）。
+    # python 模块档 has_module_scaffold_driver=True 的真实消费者=【新建撞车 demote
+    # 路径】，判别锁在 test_python_module_manifest_create_collision_demote_is_silent。
 ])
 def test_demote_observability_is_tiered_not_one_boolean(agg, mod, warn_agg, warn_mod):
     """★demote 收回写权，**该档**无兜底网就必须留痕（纪律 3 + "缺席须机读可辨"）★
@@ -292,7 +298,8 @@ def test_demote_observability_is_tiered_not_one_boolean(agg, mod, warn_agg, warn
     两档事实不同、后果不同，故必须分别判：
       · 根聚合档 → `has_aggregate_reconcile`（`_reconcile_*` 据磁盘补回根注册）；
       · 模块清单档 → `has_module_scaffold_driver`（owner 按契约一次建全，非 owner 本无
-        合法贡献 = #11a doctrine）。只有 maven 有后者。
+        合法贡献 = #11a doctrine）。有确定性 driver 的栈（maven 聚合 driver +
+        #31-P2 npm/go/python 模块 driver）才有后者，对账锁防"driver 落地忘翻字段"。
     把前者当"该栈任何清单都有网"用，gradle/cargo/go 的模块清单被 demote 时丢的是**真实
     编辑**（该子任务想加的依赖/插件），却连一句 WARNING 都没有——那正是"降级无痕"。
 
@@ -311,6 +318,51 @@ def test_demote_observability_is_tiered_not_one_boolean(agg, mod, warn_agg, warn
     if warn_mod:
         assert all("档=module" in w for w in warns2), warns2
         assert any(k.endswith(":module") for k in degraded2), degraded2
+
+
+def test_python_module_manifest_create_collision_demote_is_silent():
+    """★P-H4a 复核 hunter#1 的真实消费者★ python 模块 pyproject.toml【新建撞车】的 demote
+    （非首写者收写权）在 driver 落地后是安全的（owner 按契约一次建全+backfill，#11a
+    doctrine）→ 不得再刷「无兜底网」告警/记 degrade 账。
+
+    判别力：①demote 本身【必须发生】（st-2 失去新建权）——否则「不告警」只是「根本没
+    demote」的空转通过；②把 spec 的 has_module_scaffold_driver 翻回 False 本测试必须红
+    （突变判据）；③python 不在 structural_manifests（根档无网、basename 无法分根/模块），
+    所以本路径走的是「新建撞车 demote」而非 `_is_pom_file` 整段重写闸。"""
+    contested = "pkg-a/pyproject.toml"
+    import logging
+    logging.disable(logging.NOTSET)
+    lg = logging.getLogger(cu.__name__)
+    seen: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    degraded: list[str] = []
+    from swarm.infra import degrade as dg
+    orig_rec, orig_exists = dg.record_degrade, cu._exists_in_repo
+    dg.record_degrade = lambda k, *a, **kw: degraded.append(k)
+    h = _H(level=logging.WARNING)
+    lg.addHandler(h)
+    old_level = lg.level
+    lg.setLevel(logging.WARNING)
+    try:
+        cu._exists_in_repo = lambda pp, rel, cache, base_ref=None: False  # 纯新建撞车
+        # st-2 必须再带一个代码文件：纯清单副本会先被 dedupe_module_scaffolds 合并删除
+        # （那是 R-2 修法的行为），到不了规则1 demote——本测试锁的是 demote 的留痕档。
+        plan = _plan(_st("st-1", create=[contested]),
+                     _st("st-2", create=[contested, "pkg-a/main.py"]))
+        cu.resolve_plan_conflicts(plan, project_path="/fixture/repo")
+    finally:
+        dg.record_degrade, cu._exists_in_repo = orig_rec, orig_exists
+        lg.removeHandler(h); lg.setLevel(old_level)
+    st2 = next(s for s in plan.subtasks if s.id == "st-2")
+    # ① demote 确实发生（非首写者失去新建权）——这条红了说明测的是空转
+    assert contested not in list(getattr(st2.scope, "create_files", []) or [])
+    # ② driver 就是网 → 不刷「无兜底网」、不记降级账
+    assert not [w for w in seen if "无兜底网" in w], seen
+    assert not [k for k in degraded if ":python:" in k], degraded
 
 
 def test_reconcile_facts_match_reality():
@@ -334,14 +386,15 @@ def test_reconcile_facts_match_reality():
 def test_scaffold_driver_facts_match_reality():
     """`has_module_scaffold_driver` 同样是**事实**——与 contract_utils 的脚手架栈集对账。
 
-    只有该集合里的栈才有"owner 按契约一次建全模块清单"这个前提；没有它，模块清单
-    demote 掉的是真实编辑。将来谁给 gradle 写了 aggregator/模块脚手架 driver（B-5/B-6），
-    这条会红，提醒他同步把 spec 的 False 翻成 True（否则白刷告警）。
+    只有 `_MODULE_SCAFFOLD_DRIVER_STACKS`（maven 聚合 driver ∪ `_P2_SCAFFOLD_DRIVERS`）
+    里的栈才有"owner 按契约一次建全模块清单"这个前提；没有它，模块清单 demote 掉的是
+    真实编辑。将来谁给 gradle/cargo 写了模块脚手架 driver（P-H4 剩余），这条会红，
+    提醒他同步把 spec 的 False 翻成 True（否则白刷告警）。
     """
     for key, spec in STACK_SPEC.items():
-        assert spec.has_module_scaffold_driver is (key in cu._AGGREGATOR_SCAFFOLD_STACKS), (
+        assert spec.has_module_scaffold_driver is (key in cu._MODULE_SCAFFOLD_DRIVER_STACKS), (
             f"{key}: spec 写 {spec.has_module_scaffold_driver}，"
-            f"_AGGREGATOR_SCAFFOLD_STACKS={sorted(cu._AGGREGATOR_SCAFFOLD_STACKS)}")
+            f"_MODULE_SCAFFOLD_DRIVER_STACKS={sorted(cu._MODULE_SCAFFOLD_DRIVER_STACKS)}")
 
 
 # ══════════════════════════════════════════════

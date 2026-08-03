@@ -11,6 +11,7 @@ from typing import Any
 
 from swarm.stacks import (
     DEPENDENCY_TREE_DIRS,
+    STACK_SPEC,
     aggregate_manifests_of_stack,
     build_manifest_basenames,
     demote_safety_net,
@@ -3296,6 +3297,18 @@ def _record_unverified_deps(unverified_out: dict | None, mod: str, kept: list) -
         unverified_out.setdefault(mod, []).extend(bad)
 
 
+def _contract_module_labels(plan) -> set[str]:
+    """契约 shared_contract.dependencies 声明的【全部模块标签】（含解析不出物理落点的）。
+
+    内部判定的第二事实源（hunter R2 H-1）：未解析模块不在 `dirs` 里，但它**仍是内部
+    模块**——internal 集只从 dirs 构造时，别的模块对它的依赖会被当第三方送公网
+    registry，同名公网包被物化进「确定性生成」的权威模板（实测 ghost→`ghost>=9.9.9`
+    写入模板）= 内部依赖静默换成无关/潜在恶意公网包。三个 driver 共用本集防再分叉。"""
+    return {(e.get("module") or "").strip().rstrip("/")
+            for e in ((getattr(plan, "shared_contract", None) or {}).get("dependencies") or [])
+            if isinstance(e, dict)} - {""}
+
+
 def _inject_npm_scaffolds(plan, project_path, file_plan, dirs,
                           unverified_out: dict | None = None) -> list[dict]:
     """npm per-package.json driver（对抗双复核整改版）：内部标识取【全物理模块集】(dirs)、同源剪
@@ -3310,6 +3323,10 @@ def _inject_npm_scaffolds(plan, project_path, file_plan, dirs,
     # ★内部包名全集从【全 dirs】取★（磁盘 name 或模块标签约定）——含已认领/跨轮模块，供 workspace:*
     # 正确分流，绝不让内部包被当第三方去公网 registry 误解析（cr#2/hunter#1）。
     internal_names = {_npm_module_name(project_path, d, m) for m, d in dirs.items()}
+    # ★hunter R2 H-1★ 契约声明了但解析不出物理落点的模块【也是内部模块】（dirs 只含已
+    # 解析者）——pre-split 扣下：绝不送公网 registry（同名包会被物化进权威模板），也不
+    # 物化 workspace:*（目标不存在=必炸清单），留契约 + WARNING（python 不物化同律）。
+    _labels = _contract_module_labels(plan)
     injected: list[dict] = []
     backfilled: list[str] = []
     existing_ids = {st.id for st in plan.subtasks}
@@ -3317,6 +3334,16 @@ def _inject_npm_scaffolds(plan, project_path, file_plan, dirs,
         mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
         manifest_rel = f"{mdir}/package.json"
         exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        from swarm.brain.npm_registry import _split_name_range
+        held = [a for a in arts
+                if _split_name_range(a)[0] in _labels
+                and _split_name_range(a)[0] not in internal_names]
+        if held:
+            arts = [a for a in arts if a not in held]
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2b 模块 %s 的 %d 个内部 npm 依赖无物理落点 → 不送"
+                " registry 也不物化 workspace:*（留契约，物理落点补齐后再物化）: %s",
+                mod, len(held), held)
         kept, dropped = resolve_npm_deps(project_path, arts, internal_names=internal_names)
         # F-2：先于任何 continue 记账（本 driver 三条出口，只记注入那条＝又只接主调用点）
         _record_unverified_deps(unverified_out, mod, kept)
@@ -3324,7 +3351,7 @@ def _inject_npm_scaffolds(plan, project_path, file_plan, dirs,
             logger.warning(
                 "[SCAFFOLD-INJECT] #31-P2b 模块 %s 的 %d 个 npm 依赖无法确定性解析版本 → "
                 "模板/契约/验收三处一并剔除（绝不逼 worker 编版本）: %s", mod, len(dropped), dropped)
-        kept_specs = [k.name for k in kept]
+        kept_specs = [k.name for k in kept] + held
         _prune_scaffold_contract_entry(plan, mod, kept_specs, dropped)   # hunter#3 同源剪契约
         pkg_name = _npm_module_name(project_path, mdir, mod)
         block = _npm_dep_block(manifest_rel, kept, pkg_name, exists)
@@ -3592,6 +3619,10 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
             internal_paths[m] = p
             path_to_dir[p] = d
     internal_ids = set(path_to_dir)       # 只用【规范 import 路径】做内部判定，避免裸标签泄进 replace
+    # ★hunter R2 H-1★ 契约声明了但解析不出物理落点的模块【也是内部模块】——pre-split 扣下：
+    # 绝不送 proxy（同名公网 module 会被物化进权威 go.mod），也不生成 replace（无落点=
+    # 臆造路径），留契约 + WARNING（python 不物化同律）。
+    _labels = _contract_module_labels(plan)
     injected: list[dict] = []
     backfilled: list[str] = []
     existing_ids = {st.id for st in plan.subtasks}
@@ -3601,7 +3632,13 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
         exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
         # 契约可能用【模块标签】或【import 路径】引用内部 module → 统一归一成规范 import 路径，
         # 令 resolve_go_deps 的内部判定与下方 replace 生成同用一套规范键（杜绝裸标签泄进 go.mod）。
-        _norm_arts = [internal_paths.get(a, a) for a in arts]
+        held = [a for a in arts if a in _labels and a not in internal_paths]
+        if held:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2c 模块 %s 的 %d 个内部 go 依赖无物理落点 → 不送"
+                " proxy 也不生成 replace（留契约，物理落点补齐后再物化）: %s",
+                mod, len(held), held)
+        _norm_arts = [internal_paths.get(a, a) for a in arts if a not in held]
         kept, internal_mods, dropped = resolve_go_deps(
             _norm_arts, internal_modules=internal_ids, project_path=project_path)
         # F-2：先于任何 continue 记账（go driver 同样三条出口，含 self_path=None 那条）
@@ -3613,7 +3650,7 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
         # 内部依赖 → replace <import路径> => <相对路径>（本模块目录视角看目标模块目录）
         replaces = [(im, _go_relpath(mdir, path_to_dir[im]))
                     for im in internal_mods if im in path_to_dir]
-        final_names = [k.module for k in kept] + list(internal_mods)   # 契约=第三方 + 内部路径
+        final_names = [k.module for k in kept] + list(internal_mods) + held   # 契约=第三方+内部路径+held
         self_path = _go_module_path(project_path, mdir, mod_prefix)
         if not self_path:
             # hunter LOW：无 self_path=整个 go.mod 脚手架跳过 → 契约**不剪**（本轮该模块无任何清单
@@ -3663,6 +3700,185 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
     return injected
 
 
+def _py_module_name(project_path: str | None, mdir: str, module_label: str) -> str:
+    """python 包名：磁盘已有 pyproject [project].name（事实来源）优先；greenfield → PEP 503
+    归一化模块标签（我们为**新建包**自定的确定性命名约定，与 _npm_module_name 同立场）。"""
+    if project_path:
+        pj = Path(project_path) / mdir / "pyproject.toml"
+        try:
+            if pj.is_file():
+                import tomllib
+                name = (tomllib.loads(pj.read_text("utf-8", errors="replace"))
+                        .get("project") or {}).get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        except (OSError, ValueError):
+            pass
+    from swarm.brain.pypi_registry import normalize_name
+    return normalize_name(module_label)
+
+
+def _py_root_requires_python(project_path: str | None) -> str:
+    """根 pyproject 的 requires-python 真值（磁盘有就读）；没有 → ''（模板**省略**该字段——
+    血规 2：版本下界绝不猜一个写进权威清单）。"""
+    if not project_path:
+        return ""
+    pj = Path(project_path) / "pyproject.toml"
+    try:
+        if pj.is_file():
+            import tomllib
+            rp = (tomllib.loads(pj.read_text("utf-8", errors="replace"))
+                  .get("project") or {}).get("requires-python")
+            if isinstance(rp, str) and rp.strip():
+                return rp.strip()
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _toml_escape(s: str) -> str:
+    """TOML 基本串（双引号）转义——spec/marker 的规范形态带双引号（`python_version>"3.8"`）、
+    extras 也可能含引号（`flask["async"]`），不转义插值=「确定性生成，原样写入」的权威
+    模板产出非法 TOML（worker 照写 → pip 无法解析 → 验收必炸，cr R3 HIGH 实测两条链路）。"""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _render_pyproject_toml(pkg_name: str, kept, requires_python: str = "") -> str:
+    lines = ["[project]", f'name = "{_toml_escape(pkg_name)}"', 'version = "0.1.0"']
+    if requires_python:
+        lines.append(f'requires-python = "{_toml_escape(requires_python)}"')
+    if kept:
+        deps = "\n".join(f'    "{_toml_escape(f"{k.name}{k.extras}{k.spec}")}",' for k in kept)
+        lines.append(f"dependencies = [\n{deps}\n]")
+    return "\n".join(lines) + "\n"
+
+
+def _py_dep_block(manifest_rel: str, kept, pkg_name: str, exists: bool,
+                  requires_python: str = "") -> str:
+    """python 清单机器块：CREATE→权威 pyproject.toml 模板；MODIFY→修改铁律（+缺失依赖片段）。
+    与 _npm_dep_block 同构（cr#1：MODIFY 零缺失也给铁律护栏）。"""
+    if not exists:
+        return (f"\n【权威 pyproject.toml 模板（确定性生成，原样写入 {manifest_rel}；仅当项目另有"
+                f"明确约定才允许在此基础上增改）】\n```toml\n"
+                f"{_render_pyproject_toml(pkg_name, kept, requires_python)}\n```")
+    snip = ""
+    if kept:
+        deps = "\n".join(f'    "{_toml_escape(f"{k.name}{k.extras}{k.spec}")}",' for k in kept)
+        snip = (f"\n【缺失依赖片段（并入 {manifest_rel} 既有 [project] 的 dependencies，"
+                f"★仅追加下列条目、逐字保留其余内容★）】\n```toml\n{deps}\n```")
+    return (f"\n【既有 pyproject.toml 修改铁律（{manifest_rel} 已存在）】只做最小增量：绝不整体替换/"
+            "重写，绝不删除既有 dependencies/字段，仅在 [project] 的 dependencies 内追加缺失条目。"
+            + snip)
+
+
+def _inject_python_scaffolds(plan, project_path, file_plan, dirs,
+                             unverified_out: dict | None = None) -> list[dict]:
+    """python per-pyproject.toml driver（P-H4，27 号文「pyproject 工程实测 injected=[]」治本）。
+
+    与 npm/go driver 同构：内部标识取【全物理模块集】(dirs)、同源剪 shared_contract、已认领
+    pyproject.toml 走 owner-backfill、unclaimed 注入脚手架。第三方版本经 PyPI 解析（`>=` 下限），
+    工程自身清单声明优先（零网络中间层）。解析不到如实丢弃+三处剔除（模板/契约/验收）。
+
+    ★内部模块【不物化】（本 driver 与 npm/go 的最大差异）★ pyproject 没有确定性的相对路径
+    内部引用机制：PEP 508 `file:` 相对引用按 **pip 调用时 cwd** 解析（2026-08 实测，非按清单
+    所在目录）；uv/poetry/hatch 各有私有 workspace 协议，STACK_SPEC 对 python aggregate 刻意
+    None（收录任何一种都是猜）——同一立场：不猜。内部依赖【留在契约里】（不剪——剪了=契约与
+    「没做的事」错位，go self_path 先例）+ WARNING 机读可辨；import 正确性由源码与 L1
+    compileall 闸兜底。★P-H2 考卷对账多栈化时必须知道：python 契约 artifacts 里的内部模块
+    不会出现在 manifest 声明里，不是矛盾★。"""
+    from swarm.brain.pypi_registry import normalize_name, resolve_pypi_deps
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    mods_all = _contract_dep_entries(plan, dirs)
+    if not mods_all:
+        return []
+    # ★内部包名全集从【全 dirs】取（磁盘 [project].name 或归一化标签约定）★——含已认领/跨轮
+    # 模块，绝不让内部包被当第三方送 PyPI 误解析同名公网包（cr#2/hunter#1 同律）。
+    # ★P-H4a 复核 hunter#2★ 契约 artifact 写的是【模块标签】不是磁盘 [project].name——
+    # 两者不同（标签 `auth` vs 磁盘名 `my-auth-service`）时只认磁盘名会把内部模块送上
+    # PyPI。标签归一化后同样算内部（go driver `internal_paths.get(a, a)` 同律）。
+    internal_names = {_py_module_name(project_path, d, m) for m, d in dirs.items()}
+    # ★hunter#2 + hunter R2 H-1★ 内部名第二事实源=【契约模块标签全集】（含解析不出物理
+    # 落点的）：契约 artifact 写的是标签不是磁盘 [project].name（auth vs my-auth-service），
+    # 且未解析模块不在 dirs 里——两者缺一都会被当第三方送 PyPI 误解析同名公网包
+    # （go driver `internal_paths.get(a, a)` 同律）。dirs 键 ⊆ 契约标签（resolver 的
+    # `_want` 同源自 `_contract_module_labels`），无需再单独并 dirs 标签。
+    internal_names |= {normalize_name(m) for m in _contract_module_labels(plan)}
+    injected: list[dict] = []
+    backfilled: list[str] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    requires_python = _py_root_requires_python(project_path)
+    for entry in mods_all:
+        mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
+        manifest_rel = f"{mdir}/pyproject.toml"
+        exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        kept, internal_mods, dropped = resolve_pypi_deps(
+            arts, internal_modules=internal_names, project_path=project_path)
+        # F-2：先于任何 continue 记账（本 driver 同样多条出口）
+        _record_unverified_deps(unverified_out, mod, kept)
+        if dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2d 模块 %s 的 %d 个 python 依赖无法确定性解析版本 → "
+                "模板/契约/验收三处一并剔除（绝不逼 worker 编版本）: %s", mod, len(dropped), dropped)
+        if internal_mods:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2d 模块 %s 的 %d 个内部 python 依赖不物化进 pyproject"
+                "（无确定性相对引用机制——file: 相对引用按 pip cwd 解析，实测）——import 关系"
+                "由源码与 L1 编译闸兜底: %s", mod, len(internal_mods), internal_mods)
+        # 契约=第三方 + 内部（内部不物化但依赖关系真实存在，留契约=诚实；验收措辞只管第三方）
+        final_names = [k.name for k in kept] + list(internal_mods)
+        _prune_scaffold_contract_entry(plan, mod, final_names, dropped)   # hunter#3 同源剪契约
+        pkg_name = _py_module_name(project_path, mdir, mod)
+        block = _py_dep_block(manifest_rel, kept, pkg_name, exists, requires_python)
+        owner = _manifest_owner_subtask(plan.subtasks, manifest_rel)
+        if owner is not None:   # cr#1：已认领 → backfill 进 owner，绝不静默留它手写
+            _refresh_scaffold_owner_contract(owner, mod, mdir, final_names)   # 2a 闸同步
+            if _upsert_owner_manifest_block(owner, manifest_rel, block):
+                backfilled.append(owner.id)
+            continue
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue
+        scaffold = SubTask(
+            id=sid,
+            description=(f"【构建脚手架】为模块 {mod} " + ("补齐" if exists else "创建")
+                        + f" python 清单 {manifest_rel}：声明契约依赖全部第三方包"
+                        "（写代码的子任务碰不到构建清单，缺一个=整包装不上）"
+                        + _p2_wrap(manifest_rel, block)),
+            intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(writable=[manifest_rel] if exists else [],
+                            create_files=[] if exists else [manifest_rel]),
+            contract={"dependencies": [{"module": mod, "dir": mdir, "artifacts": final_names}]},
+            acceptance_criteria=[
+                f"{manifest_rel} 声明契约依赖全部第三方包，`pip install --dry-run .` 元数据解析通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        _wire_scaffold_ownership(plan, sid, mdir, manifest_rel)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid, "artifacts": final_names,
+                         "manifest_exists": exists, "stack": "python"})
+    if injected:
+        logger.info("[SCAFFOLD-INJECT] #31-P2d python 脚手架注入 %d 个: %s",
+                    len(injected), [e["module"] for e in injected])
+    if backfilled:
+        logger.warning("[SCAFFOLD-INJECT] #31-P2d R58-3 python：%d 个 owner 自认领 pyproject.toml →"
+                       " 已把确定性清单块嵌进其 description（有 owner≠有模板）: %s",
+                       len(backfilled), backfilled[:8])
+    return injected
+
+
+# #31-P2b/2c/2d：非 Maven 栈的 per-module 清单 driver 分派表（模块级单一事实源——
+# stacks/spec.py 的 `has_module_scaffold_driver` 与本表派生集对账，test_b3 防漂移）。
+_P2_SCAFFOLD_DRIVERS = {"npm": _inject_npm_scaffolds, "go": _inject_go_scaffolds,
+                        "python": _inject_python_scaffolds}
+# 有【确定性模块清单脚手架 driver】的栈全集：maven 走聚合 driver 一次建全模块 pom，
+# npm/go/python 走 _P2_SCAFFOLD_DRIVERS。demote 模块清单安不安全就看这个集。
+_MODULE_SCAFFOLD_DRIVER_STACKS = frozenset({"maven"}) | frozenset(_P2_SCAFFOLD_DRIVERS)
+
+
 def _go_relpath(from_dir: str, to_dir: str) -> str:
     """go replace 目标相对路径（from_dir 的 go.mod 视角看 to_dir）；必带 ./ 或 ../ 前缀
     （go 要求本地 replace 是文件系统相对/绝对路径，裸名会被当 module 路径）。"""
@@ -3692,16 +3908,26 @@ def _inject_build_scaffold_subtasks_impl(
     # （Go/npm/Rust/Python/Gradle…）→ 明确不伪造 Maven 产物（no-op + 告警），杜绝异栈 reactor 污染。
     _ok, _stack = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
     if not _ok:
-        # #31-P2b/2c：非 Maven 栈不再无条件 no-op——npm/go 走各自的 per-module 清单 driver
-        # （版本经 registry 确定性解析，绝不拿 pom 污染异栈）。其余已知栈（gradle/cargo/python）
+        # #31-P2b/2c/2d：非 Maven 栈不再无条件 no-op——npm/go/python 走各自的 per-module 清单
+        # driver（版本经 registry 确定性解析，绝不拿 pom 污染异栈）。其余已知栈（gradle/cargo）
         # 暂无 driver → 保持明确 no-op（绝不伪造清单）。
-        if _stack in ("npm", "go"):
+        if _stack in _P2_SCAFFOLD_DRIVERS:
             try:
                 _p2_dirs = _module_physical_dirs(plan, project_path, file_plan)
             except Exception:  # noqa: BLE001 — 物理落点解析失败绝不阻断规划
                 logger.warning("[SCAFFOLD-INJECT] #31-P2 物理落点解析失败（fail-open，跳过脚手架）",
                                exc_info=True)
                 return []
+            # ★P-H4a 复核 hunter#4★ 契约里解析不出唯一物理落点的模块【不注入脚手架】——
+            # 此前静默跳过（src-layout 的 `src/<pkg>/` 形态：模块名段在布局段之后，名字匹配
+            # 通道结构性抓不到）。「没注入」必须与「不需要注入」机读可辨（硬检查④）；
+            # src-layout 物理落点语义是登记在案的诚实边界（27 号文 P-H4 剩余）。
+            _p2_unresolved = sorted(m for m in _contract_module_labels(plan) if m not in _p2_dirs)
+            if _p2_unresolved:
+                logger.warning(
+                    "[SCAFFOLD-INJECT] #31-P2 %s 栈 %d 个契约模块无确定物理落点 → 不注入"
+                    "脚手架（src-layout 等未支持形态，诚实边界）: %s",
+                    _stack, len(_p2_unresolved), _p2_unresolved)
             if not _p2_dirs:
                 # hunter#4：空 dirs 也留痕（降级可观测；_module_physical_dirs 内部对歧义/撞车已
                 # WARNING，但"全部契约模块名都没匹配上物理落点"这一路径此前无信号）。
@@ -3709,15 +3935,16 @@ def _inject_build_scaffold_subtasks_impl(
                             "（模块名或未匹配任何 scope 证据）", _stack)
                 return []
             try:
-                return (_inject_npm_scaffolds if _stack == "npm" else _inject_go_scaffolds)(
+                return _P2_SCAFFOLD_DRIVERS[_stack](
                     plan, project_path, file_plan, _p2_dirs, unverified_out=unverified_out)
             except Exception:  # noqa: BLE001 — driver 异常 fail-open，绝不炸规划主链
                 logger.warning("[SCAFFOLD-INJECT] #31-P2 %s driver 异常（fail-open）", _stack,
                                exc_info=True)
                 return []
         logger.warning(
-            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go）→ 跳过 pom 脚手架注入（绝不拿 "
-            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入。",
+            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go/python）→ 跳过 pom 脚手架注入（绝不拿 "
+            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入"
+            "（P-H4 剩余：gradle/cargo）。",
             _stack)
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
@@ -5430,6 +5657,35 @@ def _is_scaffold_subtask(st) -> bool:
     return has_pom and not builds_entity
 
 
+# ★P-H4a 复核 R-1/R-2★ 模块清单 basename 全栈并集（STACK_SPEC 派生，含 .kts 别名）——
+# 脚手架身份/去重不再只认 pom.xml：npm/go/python driver 注入的脚手架边曾被 decouple 当
+# 假依赖剥掉（code 子任务抢跑在清单之前，R62 Maven 同型死因的异栈复现），重复脚手架也
+# 不合并（nodes/__init__.py:1600 早已登记该洞）。
+_MODULE_MANIFEST_BASENAMES = frozenset(
+    n for _k in STACK_SPEC for n in module_manifests_of_stack(_k))
+
+
+def _is_pure_module_manifest_scaffold(st) -> bool:
+    """非 Maven 栈的结构性脚手架判据（P-H4a 复核 R-1 补位）：create_files **非空且全是**
+    目录限定模块清单（全栈并集 basename，排除裸根——与 pom 判据同口径）。
+
+    「全是」是关键：认领清单【又写代码】的真子任务不匹配——它的边是普通依赖边，不受
+    脚手架保护（否则 decouple 过度保护、dedupe 会把代码子任务当脚手架合并掉=丢真工作）。
+    Maven 走 `_is_scaffold_subtask`+`_creates_module_pom` 原判据（行为逐字节不变，本
+    判据对 pom-only 子任务同样为真、与原判据结论一致）。"""
+    cf = _st_create_files(st)
+    if not cf:
+        return False
+    has_dir_manifest = False
+    for f in cf:
+        fn = str(f).replace("\\", "/").lstrip("./")
+        if fn.rsplit("/", 1)[-1] not in _MODULE_MANIFEST_BASENAMES:
+            return False
+        if "/" in fn:
+            has_dir_manifest = True
+    return has_dir_manifest
+
+
 def _module_pom_dirs(st) -> set[str]:
     """该子任务创建的所有【目录限定 module pom】的模块目录集（排除裸根 `pom.xml`）。"""
     out: set[str] = set()
@@ -5482,8 +5738,14 @@ def is_structural_scaffold_dep(dep_st) -> bool:
     仓库既有 `bump_scaffold_difficulty` 用 `_is_scaffold_subtask(st) or writes_root_pom` 早已区分
     "建根 pom"≠"是模块脚手架"；此处同口径：只有【目录限定 module pom】才是继承地基。
 
-    dep_st=None（悬空依赖，目标不存在）→ False（不臆断，交既有悬空处理）。"""
-    return dep_st is not None and _is_scaffold_subtask(dep_st) and _creates_module_pom(dep_st)
+    dep_st=None（悬空依赖，目标不存在）→ False（不臆断，交既有悬空处理）。
+
+    ★P-H4a 复核 R-1★ 非 Maven 栈补位：`_is_pure_module_manifest_scaffold`（create 全是
+    目录限定模块清单）同样算结构性脚手架——npm/go/python 注入器脚手架的边曾被 decouple
+    剥掉（pom↔代码零重叠的盲区对 package.json/go.mod/pyproject.toml 一模一样）。"""
+    return dep_st is not None and (
+        (_is_scaffold_subtask(dep_st) and _creates_module_pom(dep_st))
+        or _is_pure_module_manifest_scaffold(dep_st))
 
 
 def _is_sql_subtask(st) -> bool:
@@ -6665,14 +6927,17 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
     subs = list(getattr(plan, "subtasks", None) or [])
     if len(subs) < 2:
         return 0
-    # 按【模块 pom 路径】给脚手架子任务分组(只认带目录前缀的模块 pom,排除根 pom.xml)
+    # 按【模块清单路径】给脚手架子任务分组(只认带目录前缀的模块清单,排除根清单)。
+    # ★P-H4a 复核 R-2★ 非 Maven 栈同洞（nodes/__init__.py:1600 登记）：分组 basename 从
+    #  STACK_SPEC 并集取；非 Maven 侧闸用 `_is_pure_module_manifest_scaffold`（「全是清单」
+    # 才并——认领清单又写代码的真子任务绝不并掉=丢真工作）。
     groups: "collections.OrderedDict[str, list]" = collections.OrderedDict()
     for st in subs:
-        if not _is_scaffold_subtask(st):
+        if not (_is_scaffold_subtask(st) or _is_pure_module_manifest_scaffold(st)):
             continue
         for f in _st_create_files(st):
             norm = f.replace("\\", "/")
-            if norm.rsplit("/", 1)[-1] == "pom.xml" and "/" in norm:
+            if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES and "/" in norm:
                 groups.setdefault(norm, []).append(st)
                 break
     drop_to_canon: dict[str, str] = {}

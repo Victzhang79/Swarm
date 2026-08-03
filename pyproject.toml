@@ -26,6 +26,9 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "psycopg-pool>=3.0",
     "qdrant-client>=1.7",
+    # P-H4：PEP 440 版本/区间语义的权威实现（pypi_registry 稳定版判定与显式版本核验）——
+    # 不自造 PEP 440 解析（预发布/epoch/本地段全有坑）
+    "packaging>=23",
     "fastembed>=0.7",
     "e2b-code-interpreter>=2.0",
     "click>=8.1",

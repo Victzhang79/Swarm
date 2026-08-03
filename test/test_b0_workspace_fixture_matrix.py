@@ -263,7 +263,8 @@ def test_demote_safety_net_tier_is_derived_from_the_path_shape(fx):
 
     ★已改名并收窄声称（复核 note）★ 原名带 `on_a_real_tree`，但本测试**只传路径字符串、
     根本不碰磁盘**；且前两条断言是把被测函数实现原样复述（函数体就是那个三元式）。真正有
-    区分力的只有**档位判定**与"非 maven 栈模块档必须无兜底"。行为档的强锁在
+    区分力的只有**档位判定**与"无 driver 栈模块档必须无兜底"（maven/python 有 driver 的
+    由 spec 字段对账锁）。行为档的强锁在
     `test_b3::test_demote_observability_is_tiered_not_one_boolean`（5 栈 × 两档探针矩阵）。
     """
     spec = spec_for_stack(fx.stack)
@@ -276,9 +277,9 @@ def test_demote_safety_net_tier_is_derived_from_the_path_shape(fx):
         safe_mod, tier_mod = demote_safety_net(mm, fx.stack)
         assert tier_mod == "module", f"{fx.name}: {mm} 档位判错 {tier_mod}"
         assert safe_mod is spec.has_module_scaffold_driver
-        if fx.stack != "maven":
+        if not spec.has_module_scaffold_driver:
             assert safe_mod is False, (
-                f"{fx.name}: 非 maven 栈的模块清单不该有脚手架 driver 兜底"
+                f"{fx.name}: 无脚手架 driver 栈的模块清单不该有兜底网"
                 "（有了就得给 spec 翻 True，否则白刷告警）")
 
 

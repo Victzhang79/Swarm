@@ -165,6 +165,36 @@ def test_r62_llm_owned_pom_edge_preserved_r58_3():
     print("  ✅ R58-3 LLM 认领 pom 者的入边保留（结构判据 > id 前缀）")
 
 
+def test_ph4a_python_scaffold_ordering_edge_never_stripped():
+    """★P-H4a 复核 R-1★ 非 Maven 栈同型洞：`is_structural_scaffold_dep` 旧判据只认
+    pom.xml → python 注入器脚手架（create=[pkg/pyproject.toml]）的排序边被 decouple
+    当假依赖剥掉 → 代码子任务抢跑在清单之前（round62 Maven 死因的异栈复现）。
+    补位判据=`_is_pure_module_manifest_scaffold`（create **全是**目录限定模块清单）。
+
+    判别力三向：①纯清单脚手架的入边必须保留（把判据改回只认 pom.xml 即红）；
+    ②「清单+源码」混合子任务的入边**不受**此保护（它是普通代码任务，防过度保护
+    把假依赖焊死）；③裸根清单（无目录前缀）不算模块脚手架（与 pom 判据同口径）。
+    """
+    scaffold = _st("st-scaffold-core", create=["core/pyproject.toml"])
+    code = _st("st-impl-1", create=["core/service.py"], depends_on=["st-scaffold-core"])
+    mixed = _st("st-9", create=["other/pyproject.toml", "other/app.py"])
+    code2 = _st("st-impl-2", create=["other/views.py"], depends_on=["st-9"])
+    root_only = _st("st-10", create=["pyproject.toml"])
+    code3 = _st("st-impl-3", create=["main.py"], depends_on=["st-10"])
+    plan = _plan([scaffold, code, mixed, code2, root_only, code3])
+    removed = _decouple_independent_subtasks(plan)
+    by_id = {st.id: st for st in plan.subtasks}
+    # ① 纯清单脚手架的入边保留（code 无 contract、零文件重叠——剥了就是 R-1 复活）
+    assert by_id["st-impl-1"].depends_on == ["st-scaffold-core"], \
+        "python 纯清单脚手架的排序边被误剥 = P-H4a R-1 复活"
+    # ② 混合（清单+源码）=普通代码任务：零重叠零契约照旧剥
+    assert by_id["st-impl-2"].depends_on == []
+    # ③ 裸根清单不是模块脚手架（同 pom 判据）：照旧剥
+    assert by_id["st-impl-3"].depends_on == []
+    assert removed == 2
+    print("  ✅ python 纯清单脚手架边保留 / 混合与裸根不过度保护")
+
+
 if __name__ == "__main__":
     import sys
     import pytest
