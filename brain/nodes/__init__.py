@@ -3130,6 +3130,9 @@ async def plan(state: BrainState) -> dict:
         # R67M-T1（复核 A6/hunter F4）：禁令散文自愈成功账 always-emit——成功账零消费=新账
         # 无人收盲区；last-write-wins（无命中={} 不粘滞），失败侧由 *_failed 通用扫尾进 degraded。
         "dep_ban_reconciled": _finish_out.get("dep_ban_reconciled") or {},
+        # P-C2 复核 F-2：依赖版本闸"未能证实"账 always-emit（同上口径）——三种结局原先全塌成
+        # source="explicit"，闸整轮静默失效时交付物与闸正常时逐字相同。纯诚实观测非门。
+        "dep_versions_unverified": _finish_out.get("dep_versions_unverified") or {},
         # R67M-T2 B5：安置前 base 查表转换账 always-emit（同 dep_ban_reconciled 口径：
         # 成功账零消费=新账无人收盲区；last-write-wins 无转换=[] 不粘滞）。
         "contract_symbols_base_referenced":

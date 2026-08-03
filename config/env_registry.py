@@ -20,6 +20,10 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_NPM_LOOKUP_TIMEOUT_S": "brain/npm_registry.py:_HTTP_TIMEOUT_S",
     "SWARM_GO_LOOKUP": "brain/go_registry.py:_lookup_enabled",
     "SWARM_GO_LOOKUP_TIMEOUT_S": "brain/go_registry.py:_HTTP_TIMEOUT_S",
+    # P-C2 复核 F-1/F-3：HTTP 文本缓存里【失败(None)】条目的存活秒数（三个 registry 共用）。
+    # 永久缓存 None ⇒ 一次抖动把坐标永久钉成"查不到"（误杀且与"真没这个包"不可区分）；
+    # 完全不缓存 ⇒ per-module 调用下 8s 超时 × 镜像数 × 模块数反复烧网。TTL 两头都收。
+    "SWARM_DEP_LOOKUP_NEG_TTL_S": "brain/dep_http_cache.py:NEG_TTL_S",
     # R55-1：思考阶段预算（秒）。云端 reasoning 模型在思维链里原地打转时，max_tokens/stall
     # 看门狗都拦不住，墙钟兜底要先烧满 25 分钟。超此预算且尚未吐出正文 → 就地关 thinking
     # 用同一模型重开流（无损，下游无感）。0=关闭。

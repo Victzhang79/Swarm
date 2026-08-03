@@ -1549,8 +1549,24 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
     try:
         from swarm.brain.contract_utils import inject_build_scaffold_subtasks
         # R58-1：file_plan 是【模块 → 文件】的权威归属（逻辑模块名 ≠ 物理目录时唯一的证据源）
-        injected = inject_build_scaffold_subtasks(plan, project_path, file_plan)
+        # ★P-C2 复核 F-2★ `_unverified` 收集 P-C2 闸【没能证实】的坐标。三种结局原先全塌成
+        # `source="explicit"`：确证存在 / registry·proxy 不可达 fail-open / 刻意不判。
+        # 塌成一个值的后果不是标签不好看——国内环境 proxy.golang.org 常不可达时，F1 收紧后
+        # `proxy_version_exists` 永不返 False ⇒ 闸**整轮静默失效**，而交付物与闸正常时逐字
+        # 相同，唯一信号是每依赖一条 WARNING（纪律 #106 禁止解析 swarm.log ⇒ 等于没有信号）。
+        _unverified: dict = {}
+        injected = inject_build_scaffold_subtasks(plan, project_path, file_plan,
+                                                 unverified_out=_unverified)
         out["scaffolds"] = [e["module"] for e in injected]
+        # always-emit（空也发）：同 dep_ban_reconciled/contract_symbol_paths_unhealed 口径，
+        # last-write-wins 不粘滞。刻意**不做成闸**：不可达是环境常态，拿它拦 auto_accept 会
+        # 让每个 plan 都 degraded ⇒ 使用者必然绕开（"过宽的闸使用者会绕开"）。纯诚实观测。
+        out["dep_versions_unverified"] = {m: sorted(set(v)) for m, v in _unverified.items()}
+        if _unverified:
+            logger.warning(
+                "[PLAN-FINISH] P-C2 F-2：%d 个模块存在未经证实/不判的依赖坐标（闸 fail-open "
+                "保留了 LLM 主张，执行期 L1 兜底）→ 已记 dep_versions_unverified: %s",
+                len(_unverified), {m: v[:3] for m, v in list(_unverified.items())[:4]})
         if injected:
             from swarm.brain.nodes.shared import bootstrap_subtask_harness
             _ids = {e["subtask_id"] for e in injected}

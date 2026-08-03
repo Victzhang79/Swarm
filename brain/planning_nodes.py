@@ -894,7 +894,16 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
 #     则已缓存画像永缺该键、硬约束永不渲染（猎手 F3，前例 108676a 同纪律）。
 # v4: 新增 infra_symbol_methods（R65E8-T5 基建类 public 方法签名 grounding，治 method 级幻觉
 #     如缓存类调裸 .set/.get）——不 bump 则已缓存画像永缺该键、方法签名永不渲染（同 F3 纪律）。
-_STACK_SCHEMA_VERSION = 4
+# v5: P-C3（fee9a2a）模板引擎事实表多栈化 + 新增机读键 signals.tmpl_engine_unrecognized。
+#     ★该 commit 漏了这次 bump，本条是补票（27 号文 #19 / P-C3 复核 CRITICAL-2）★
+#     实测受害：项目 5d0e9db8（RuoYi E2E 基线）缓存里 schema_version=4 == 常量 4 ⇒ 下面 ①
+#     的相等判据成立 ⇒ 直接 return 缓存画像 ⇒ fee9a2a 那 198 行探测逻辑一行都不执行，且其
+#     画像里没有 tmpl_engine_unrecognized 键。后果形态是**静默 no-op 而非崩溃**：消费者
+#     （stack_detect.py 尾部 format_stack_for_prompt、本文件 detect_stack 的裁决后清标）都用
+#     `.get(...)` 读，缺键得 None＝假值 ⇒ 那条 fail-closed 分支永不进 ⇒ Django/Flask/Gin/
+#     Laravel 的服务端渲染继续判 frontend_kind="none"，"禁止产 .vue" 的约定继续发不出去。
+#     ⇒ 扩事实表**改变了已缓存项目的正确答案**，这类改动必须 bump，不只是"加字段才 bump"。
+_STACK_SCHEMA_VERSION = 5
 
 
 async def detect_stack(state: BrainState) -> dict:

@@ -37,6 +37,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from swarm.brain.dep_http_cache import text_cache_lookup, text_cache_store
+
 logger = logging.getLogger("swarm.brain.npm_registry")
 
 # 网络超时短而硬：规划期不容许被 registry 拖死；查不通=丢弃，不阻断。
@@ -55,6 +57,9 @@ _PRERELEASE = re.compile(r"-(?:alpha|beta|rc|next|canary|dev|pre|snapshot|nightl
 _SEMVER_CORE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 
 _http_cache: dict[str, str | None] = {}
+# ★P-C2 复核 F-1★ `_http_cache` 里 `None` 条目的到期时刻（与它平行，不并入——那个 dict 的
+# 值形状是承重契约，见 brain/dep_http_cache.py 模块 docstring）。
+_http_neg_until: dict[str, float] = {}
 
 
 def _lookup_enabled() -> bool:
@@ -67,8 +72,13 @@ def _http_get(url: str) -> str | None:
     """GET 文本；任何失败（离线/超时/404）→ None。结果缓存（规划期同一包会被多模块问到）。"""
     if not _lookup_enabled():
         return None
-    if url in _http_cache:
-        return _http_cache[url]
+    # ★P-C2 复核 F-1（go/npm/maven 三处同型，一起改）★ 原实现永久缓存 `None`：一次抖动
+    # 把该包钉成"查不到"，网络恢复后不重试。npm 侧后果最隐蔽——fail-open 是设计好的正确
+    # 行为、日志逐字相同，于是同一个幻觉版本在后续所有任务里都免检通过。
+    # 策略（TTL 负缓存，兼顾 F-3 的代价放大）见 brain/dep_http_cache.py。
+    hit, cached = text_cache_lookup(_http_cache, _http_neg_until, url)
+    if hit:
+        return cached
     text: str | None = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "swarm-npm-resolver"})
@@ -77,7 +87,7 @@ def _http_get(url: str) -> str | None:
                 text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("[npm-registry] GET %s 失败: %s", url, exc)
-    _http_cache[url] = text
+    text_cache_store(_http_cache, _http_neg_until, url, text)
     return text
 
 
@@ -287,10 +297,25 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
             elif cur[0] == floor[0] and cur[1] == floor[1] and cur >= floor:
                 return True
         elif op == ">=":
+            # `>=1` ≡ `>=1.0.0`：补零的 floor 正是下界本身，缺位无需特殊处理。
             if cur >= floor:
                 return True
         elif op == ">":
-            if cur > floor:
+            # ★P-C2 复核 F-4★ 缺位时 `>` **不能**拿补零的 floor 当下界。npm 官方原文：
+            # "The comparator `>1` is equivalent to `>=2.0.0`"，并明列 `1.0.1`/`1.1.0`
+            # 为不匹配。原实现 `cur > floor` 把 `>1` 当成 `>1.0.0` ⇒ `1.0.1` 判 True（错）。
+            # 语义：`>` 作用于**整个已声明的 X-range**，即"超过该 range 的上界"⇒ 下界 =
+            # 最右已声明段 +1、更细的段归零。`>1`→`>=2.0.0`、`>1.2`→`>=1.3.0`。
+            # ★R1 收了 `^`/`~` 却漏了这一臂——同函数内第三种口径（commit b194e79 自伤）★
+            # 诚实边界：`>1` ≡ `>=2.0.0` 是官方**明文**；`>1.2`→`>=1.3.0` 官方无明文，
+            # 是按 desugaring 表（`1.2 := >=1.2.0 <1.3.0-0`）与 `>1` 同规则推出的。
+            if prec == 1:
+                if cur >= (floor[0] + 1, 0, 0):
+                    return True
+            elif prec == 2:
+                if cur >= (floor[0], floor[1] + 1, 0):
+                    return True
+            elif cur > floor:
                 return True
     return False
 
@@ -301,6 +326,17 @@ class ResolvedNpmDep:
     name: str
     spec: str      # 写入 package.json 的版本区间：内部=workspace:* / 第三方=^x.y.z
     source: str    # workspace | local | registry | explicit
+    # ★P-C2 复核 F-2★ P-C2 闸对这一条**实际做到了什么**。三种结局原先全塌成
+    # `source="explicit"`：① 探测确证存在、② registry 不可达 fail-open 保留（闸没起作用）、
+    # ③ dist-tag 解析不到/协议·复合区间不判。塌成一个值的后果不是"标签不好看"——
+    # 国内环境 registry/proxy 常不可达时闸会**整轮静默失效**，而交付物与闸正常时逐字相同。
+    # ★为什么不改 `source` 的取值而另开字段★ `source` 的既有消费者（模板渲染、15 处测试断言）
+    # 要的是"版本从哪来"，与"验没验过"是两个问题；复用单一事实源 ≠ 复用其消费契约，
+    # 后果不同必须分档（血规 10 第三条）。
+    #   verified   —— 有确定性证据（registry 版本集可满足 / 解析自 registry / 本地 node_modules）
+    #   unverified —— 证据不完整，fail-open 保留了 LLM 主张（执行期 L1 兜底）
+    #   unjudgeable—— 刻意不判（协议/别名/复合区间；判它们的风险是误杀）
+    verified: str = "verified"
 
 
 def _split_name_range(raw: str) -> tuple[str, str | None]:
@@ -369,7 +405,8 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                     logger.warning("[npm-registry] P-C2 %s@%s 是不可复现的 dist-tag/通配，但"
                                    "registry 不可达无法解析成具体版本 → fail-open 保留原样"
                                    "（执行期 L1 合法性闸兜底）", name, explicit)
-                    kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                    kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
+                                               verified="unverified"))
                 continue
             if _kind in ("protocol", "complex"):
                 # 不判（Maven `${...}` 的对应物）：协议/别名不是版本主张；复合区间无 semver 库
@@ -377,7 +414,8 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                 logger.info("[npm-registry] P-C2 %s@%s 属【%s】形态，不做可满足性判定"
                             "（保留原样；执行期 L1 dep-legality 兜底）", name, explicit, _kind)
                 seen.add(name)
-                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
+                                           verified="unjudgeable"))
                 continue
             _vers = registry_all_versions(name)
             if _vers is None:
@@ -386,7 +424,8 @@ def resolve_npm_deps(project_path: str | None, specs: list[str],
                                " → fail-open 保留 LLM 主张（执行期 L1 合法性闸兜底）",
                                name, explicit)
                 seen.add(name)
-                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit"))
+                kept.append(ResolvedNpmDep(name=name, spec=explicit, source="explicit",
+                                           verified="unverified"))
                 continue
             if not _range_is_satisfiable(explicit, _vers):
                 # 区间不可满足＝**确证幻觉**（版本集是权威证据，已排除不可达）。

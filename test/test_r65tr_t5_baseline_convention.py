@@ -140,11 +140,130 @@ def test_submodule_pom_declaration_detected(tmp_path):
     assert jvm.get("lombok_available") is True, jvm
 
 
-def test_stack_schema_version_bumped():
-    """猎手 F3：画像新增字段必 bump schema 版本（前例 108676a 纪律）——
-    否则已缓存画像永缺 lombok 键、硬约束永不渲染。"""
+def _stack_cache_payload_digest() -> str:
+    """被缓存内容的摘要：① 画像字段集（含 signals 嵌套键）② 决定答案的事实表。
+
+    只盖"决定被缓存内容的东西"，**不盖整个模块源码**——否则改个注释都要 bump，
+    使用者迟早绕开这道闸（本项目对"过宽的闸"有明确判据：使用者会绕开）。
+    字段集从**真跑一次探测**取（测默认行为，不用 getsource 扫源码，纪律 6）。
+    """
+    import hashlib
+    import os
+    import tempfile
+
+    from swarm.brain import stack_detect as sd
+
+    parts: list[str] = []
+    # ① 画像字段集。★两个夹具，不是一个（复核 A-4）★ 单个 Django 夹具下 `prof["jvm"]` 恒为
+    # 空 dict ⇒ 代码即便新增 `jvm.<key>`，这个夹具也从不产生它 ⇒ 递归取键集也白搭。
+    # 必须让每条**会被缓存的子结构**都真有内容：Django 覆盖 signals/frontend 侧，
+    # Maven（含 lombok 坐标）覆盖 jvm 侧（v3 bump 的原因就住在那里）。
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "requirements.txt"), "w") as fh:
+            fh.write("Django==5.0.6\n")
+        prof_py = sd.detect_stack_deterministic(d)
+    with tempfile.TemporaryDirectory() as d:
+        # 形状与本文件 `_mk_maven` + `test_submodule_pom_declaration_detected` 同源
+        # （那是已跑通的真夹具：根 pom 需 modelVersion/groupId/version/properties，
+        #  lombok 坐标声明在**子模块** pom —— 自己编一个精简 pom 探不出 jvm）。
+        with open(os.path.join(d, "pom.xml"), "w") as fh:
+            fh.write("<project><modelVersion>4.0.0</modelVersion>"
+                     "<groupId>g</groupId><artifactId>a</artifactId><version>1</version>"
+                     "<properties><java.version>8</java.version></properties></project>")
+        sub = os.path.join(d, "mod-b")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "pom.xml"), "w") as fh:
+            fh.write("<project><artifactId>mod-b</artifactId><dependencies>"
+                     "<dependency><groupId>org.projectlombok</groupId>"
+                     "<artifactId>lombok</artifactId></dependency>"
+                     "</dependencies></project>")
+        prof_jvm = sd.detect_stack_deterministic(d)
+    for nm, prof in (("py", prof_py), ("jvm", prof_jvm)):
+        assert not prof.get("scan_failed"), f"{nm} 夹具走进扫描失败兜底，键集不完整"
+    assert prof_jvm.get("jvm"), "Maven 夹具没产生 jvm 子字典 ⇒ A-4 的缺口又回来了"
+
+    # ★递归取键集，不只取顶层 + signals（复核 A-4）★
+    # 只取 `sorted(prof)` + `sorted(prof["signals"])` 会漏掉**嵌套子字典**的键集，而
+    # v3 那次 bump 的原因（`lombok_available`）恰好住在 `prof["jvm"]` 里。实测：往 jvm 加键
+    # 摘要不变 ⇒ 守卫不红 ⇒ 猎手 F3 的原型事故可原样复发。这道守卫当时只防住了 v5 那类
+    # （顶层键 + signals + 事实表），没防住 v3 那类。
+    def _key_paths(node, prefix: str = "") -> list[str]:
+        if not isinstance(node, dict):
+            return []
+        out: list[str] = []
+        for k in sorted(node):
+            path = f"{prefix}{k}"
+            out.append(path)
+            out.extend(_key_paths(node[k], f"{path}."))
+        return out
+
+    parts.append("profile_key_paths_py=" + ",".join(_key_paths(prof_py)))
+    parts.append("profile_key_paths_jvm=" + ",".join(_key_paths(prof_jvm)))
+    # ② 决定答案的事实表（扩表会改变**已缓存项目的正确答案**，与新增字段同等必须 bump）
+    for name in ("_TEMPLATE_EXT_ENGINE", "_TEMPLATE_COMPOUND_SUFFIX", "_SERVER_TEMPLATE_DEP",
+                 "_WEBPAGE_EXTS", "_TEMPLATE_DIR_NAMES", "_MANIFEST_BACKEND"):
+        t = getattr(sd, name)
+        body = (";".join(f"{k}={t[k]!r}" for k in sorted(t)) if isinstance(t, dict)
+                else ";".join(sorted(t)))
+        parts.append(f"{name}={body}")
+    # 值是编译后 Pattern，repr 含内存地址不稳定 ⇒ 取 .pattern
+    rt = sd._SERVER_TEMPLATE_DEP_RE
+    parts.append("_SERVER_TEMPLATE_DEP_RE="
+                 + ";".join(f"{k}={rt[k].pattern}" for k in sorted(rt)))
+
+    # ③ ★判定逻辑的输出值，不只是事实表（复核 A-5）★
+    # 只盖表会漏掉**逻辑侧**改动：P-C3 复核的 CRITICAL-1 正是"全仓 `.html` 计数把 DRF 纯 API
+    # 的正确答案翻成 conf=0.95 错答案"——改的是计数/阈值，一张表都没动 ⇒ 摘要不变 ⇒ 不 bump
+    # ⇒ 已缓存项目继续吃旧画像。这里把三个代表形态的**结论**纳入摘要：结论变了就必须 bump，
+    # 因为"已缓存项目的正确答案变了"正是 bump 的定义。
+    # 仍刻意不盖整个模块源码（改注释不该触发 bump —— 过宽的闸使用者会绕开）。
+    for nm, files in (
+        ("drf_api_only", {"requirements.txt": "Django==5.0.6\ndjangorestframework==3.15.2\n",
+                          "docs/index.html": "<html></html>"}),
+        ("django_templates", {"requirements.txt": "Django==5.0.6\n",
+                              "templates/base.html": "{% block content %}{% endblock %}"}),
+        ("spa", {"package.json": '{"dependencies":{"vue":"^3.4.0"}}',
+                 "src/App.vue": "<template></template>"}),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            for rel, body in files.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w") as fh:
+                    fh.write(body)
+            pr = sd.detect_stack_deterministic(d)
+        parts.append(
+            f"verdict[{nm}]=kind:{pr.get('frontend_kind')}|conf:{pr.get('confidence')}"
+            f"|adj:{pr.get('needs_model_adjudication')}"
+            f"|unrec:{(pr.get('signals') or {}).get('tmpl_engine_unrecognized')}")
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def test_stack_schema_version_paired_with_cached_payload():
+    """★27 号文 #19 / P-C3 复核 CRITICAL-2★ `_STACK_SCHEMA_VERSION` 是"画像内容变了"的
+    **唯一**失效信号：`detect_stack` 的缓存命中判据是 `cached["schema_version"] == 常量`
+    且指纹相同即 `return` 缓存画像。
+
+    ★本条原来断的是 `_STACK_SCHEMA_VERSION >= 3`——下界断言是**永绿**的★：值停在 4 时
+    `>= 3` 成立、递增到 5/6 也成立 ⇒ 它对自己要防的事（改了画像逻辑却**不**递增）零区分力。
+    实证：fee9a2a 扩了模板引擎事实表 198 行、新增机读键 `signals.tmpl_engine_unrecognized`，
+    `git show fee9a2a | grep -c _STACK_SCHEMA_VERSION` = **0**，而这条守卫全程绿。
+    受害项目 5d0e9db8（RuoYi E2E 基线）缓存 schema_version=4 == 当时常量 4 ⇒ 命中缓存早返
+    ⇒ P-C3 对它一行不执行；且缺键被消费者的 `.get()` 读成 None＝假值 ⇒ **静默 no-op 不报错**。
+
+    正确形状＝把**被缓存内容的摘要**与版本常量钉成一对（同型守卫在 `_BUILDER_VERSION` 上
+    已跑通：test/test_image_builder.py 的 `test_builder_version_bumped_so_old_images_are_invalidated`，
+    4/4 突变全红）。生成物变了摘要必变，两者必须同时改。
+    """
     from swarm.brain.planning_nodes import _STACK_SCHEMA_VERSION
-    assert _STACK_SCHEMA_VERSION >= 3
+
+    digest = _stack_cache_payload_digest()
+    assert (_STACK_SCHEMA_VERSION, digest) == (5, "a320efc720891a39"), (
+        f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
+        "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
+        "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"
+        "早返 ⇒ 你的改动对**所有已建档项目**一行都不生效（P-C3 复核 CRITICAL-2 的原始事故），\n"
+        "而且是静默的：消费者用 `.get()` 读缺失的新键，得到 None 当假值，不会 KeyError。")
 
 
 def test_non_jvm_unpolluted(tmp_path):

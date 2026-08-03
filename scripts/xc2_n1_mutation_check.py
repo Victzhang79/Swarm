@@ -65,10 +65,13 @@ MUTATIONS = [
          "test_new_build_tool_in_registry_is_installed_and_selftested"],
     ),
     (
+        # ★落点随 #8 同步★ 该常量已递增到 "9"（#8 把在场硬闸推广到全部 6 个 (name,build_tool)，
+        # Dockerfile 生成物变了）。字面量停在 "8" 会被 harness 判"落点未命中（代码已漂移）"
+        # ——那是它刻意的失败态（拒绝在漂移代码上给假绿），不是误报。
         "X-C2 复核 C-1: _BUILDER_VERSION 不递增（复用老镜像 → 修复不落地）",
         IMG,
+        '_BUILDER_VERSION = "9"',
         '_BUILDER_VERSION = "8"',
-        '_BUILDER_VERSION = "7"',
         ["test_builder_version_bumped_so_old_images_are_invalidated"],
     ),
     (

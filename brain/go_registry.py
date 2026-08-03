@@ -34,6 +34,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from swarm.brain.dep_http_cache import text_cache_lookup, text_cache_store
+
 logger = logging.getLogger("swarm.brain.go_registry")
 
 # 网络超时短而硬：规划期不容许被 proxy 拖死；查不通=丢弃，不阻断。
@@ -74,11 +76,28 @@ _JUDGEABLE_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+incomp
 # ★为什么不复用 `_PSEUDO`（血规 10 第三条：复用事实源≠复用消费契约）★ `_PSEUDO` 只认 ③，
 # 它唯一的消费者 `_is_stable` 靠末句"主体含 `-` 即非稳定"把 ①② 一并兜住了，所以那边的窄口径
 # 从来不是 bug。而本档的后果**相反**（判漏＝误杀），故另立一条覆盖三形态的模式，`_PSEUDO` 不动。
-# 形态 ② 的 `<pre>` 段允许点号（`beta.0` / `rc.1`），故前缀部分放宽成"可选的、以点结尾的串"。
+# ★P-C2 复核 F-5：放宽过头了★ 上一版前缀写成 `(?:[0-9A-Za-z.-]+\.)?`（任意串 + 点），
+# 比官方三形态宽得多，成了跳闸通道——实测这三个都被当成伪版本从而**跳过存在性核验**：
+#   `v1.2.3-beta.7.<ts>-<hash>`（`.0.` 变 `.7.`）、`v1.2.3-totally.made.up.<ts>-<hash>`、
+#   `v1.2.3-ABCDEF.<ts>-ABCDEF123456`（大写 hash，go 自己直接拒）。
+# 形态 ② 的 `.0.` **是规范的一部分**（base 是预发布时，pseudo 在其后补 `.0.`），不是任意段。
+# 收成：可选的 `<pre>`（点分段，各段 `[0-9A-Za-z-]+`）后必须紧跟字面 `.0.`。
+# 另：`re.IGNORECASE` 对 hash 段是**错的**——go 只接受小写 12 位 hex，大写该走"不判"分支
+# 交给存在性核验，而非被当成合法伪版本放行。故整条去掉 IGNORECASE。
+# 三形态（go.dev/ref/mod#pseudo-versions，本轮实测核对）：
+#   ① `vX.0.0-<ts>-<hash>`                  无 base tag        → 前缀段缺席
+#   ② `vX.Y.Z-<pre>.0.<ts>-<hash>`          base 是预发布版    → 前缀段 = `<pre>.0.`
+#   ③ `vX.Y.(Z+1)-0.<ts>-<hash>`            base 是正式版      → 前缀段 = `0.`
 _PSEUDO_ANY = re.compile(
-    r"-(?:[0-9A-Za-z.-]+\.)?\d{14}-[0-9a-f]{12}(?:\+incompatible)?$", re.IGNORECASE)
+    r"-(?:(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*\.)?0\.)?\d{14}-[0-9a-f]{12}"
+    r"(?:\+incompatible)?$")
 
 _http_cache: dict[str, str | None] = {}
+# ★P-C2 复核 F-1★ `_http_cache` 里 `None` 条目的到期时刻（`time.monotonic()` 基准）。
+# 与 `_http_cache` **平行**而非合并进去：那个 dict 的值形状 `str | None` 是承重契约
+# （`test_pc2_explicit_version_is_a_claim.py:493-497` 直接写入 None 并断言其值，用来锁
+# "文本缓存与探测缓存不得混用"）。策略见 brain/dep_http_cache.py。
+_http_neg_until: dict[str, float] = {}
 # 探测缓存与文本缓存**分开**：值域不同（三态 bool|None vs 文本|None），混用会让
 # "404 确证" 与 "取到空文本" 撞进同一个键（P-C2）。
 _probe_cache: dict[str, bool | None] = {}
@@ -94,8 +113,13 @@ def _http_get(url: str) -> str | None:
     """GET 文本；任何失败（离线/超时/404）→ None。结果缓存（规划期同一 module 会被多处问到）。"""
     if not _lookup_enabled():
         return None
-    if url in _http_cache:
-        return _http_cache[url]
+    # ★P-C2 复核 F-1★ 原实现 `if url in _http_cache: return ...` + 末尾无条件
+    # `_http_cache[url] = text` ⇒ **`None` 被永久缓存**，一次抖动把该坐标钉死（详见
+    # brain/dep_http_cache.py 的模块 docstring：两个方向的实测后果与为什么用 TTL）。
+    # F5 治 `_probe_cache` 时漏了同文件这个兄弟函数（纪律 5：修一类先全仓捞 sibling）。
+    hit, cached = text_cache_lookup(_http_cache, _http_neg_until, url)
+    if hit:
+        return cached
     text: str | None = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "swarm-go-resolver"})
@@ -104,7 +128,7 @@ def _http_get(url: str) -> str | None:
                 text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("[go-registry] GET %s 失败: %s", url, exc)
-    _http_cache[url] = text
+    text_cache_store(_http_cache, _http_neg_until, url, text)
     return text
 
 
@@ -243,6 +267,12 @@ class ResolvedGoDep:
     module: str
     version: str        # require 版本：`vX.Y.Z`
     source: str         # local | proxy | explicit
+    # ★P-C2 复核 F-2★ 见 npm_registry.ResolvedNpmDep.verified 的同款注释（两栈同口径）。
+    # go 侧 fail-open 尤其容易整轮静默失效：F1 收紧后 `False` 要求"全部镜像都答得上"，
+    # 而 `proxy.golang.org` 在国内常不可达 ⇒ `proxy_version_exists` 永不返 False
+    # ⇒ 闸对该部署全程无效，唯一信号是每依赖一条 WARNING（而纪律 #106 禁止解析 swarm.log）。
+    #   verified / unverified / unjudgeable —— 同 npm 三档
+    verified: str = "verified"
 
 
 def _split_mod_version(raw: str) -> tuple[str, str | None]:
@@ -298,7 +328,8 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                             " → 不做存在性判定，保留原样（执行期 L1 dep-legality 兜底）",
                             mod, explicit)
                 seen.add(mod)
-                kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit"))
+                kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit",
+                                          verified="unjudgeable"))
                 continue
             _exists = proxy_version_exists(mod, explicit)
             if _exists is False:
@@ -313,12 +344,16 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                                    "（绝不逼 worker 臆造；调用方须同时从验收剔除）", mod, explicit)
                     dropped.append(str(raw).strip())
                 continue
-            if _exists is None:
+            _unverified = _exists is None
+            if _unverified:
                 # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。
                 logger.warning("[go-registry] P-C2 %s@%s 未经证实（proxy 不可达）→ fail-open "
                                "保留 LLM 主张（执行期 L1 合法性闸兜底）", mod, explicit)
             seen.add(mod)
-            kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit"))
+            kept.append(ResolvedGoDep(
+                module=mod, version=explicit, source="explicit",
+                # `_exists is True` 才算验过；None＝证据不完整（F-2：这两种结局原先不可区分）
+                verified="unverified" if _unverified else "verified"))
             continue
         ver = proxy_latest_version(mod)
         if not ver:

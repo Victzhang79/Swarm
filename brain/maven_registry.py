@@ -40,6 +40,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from swarm.brain.dep_http_cache import text_cache_lookup, text_cache_store
+
 logger = logging.getLogger("swarm.brain.maven_registry")
 
 # 网络超时短而硬：规划期不容许被仓库拖死；查不通=退回"省略"，不阻断。
@@ -59,6 +61,9 @@ _PRERELEASE = re.compile(
     r"(?i)(?:^|[.\-_])(?:snapshot|alpha|beta|rc\d*|m\d+|cr\d+|ea|preview|pre|dev)(?:[.\-_]|\d|$)")
 
 _http_cache: dict[str, str | None] = {}
+# ★P-C2 复核 F-1★ `_http_cache` 里 `None` 条目的到期时刻（与它平行，不并入——那个 dict 的
+# 值形状是承重契约，见 brain/dep_http_cache.py 模块 docstring）。
+_http_neg_until: dict[str, float] = {}
 
 
 def _lookup_enabled() -> bool:
@@ -71,8 +76,12 @@ def _http_get(url: str) -> str | None:
     """GET 文本；任何失败（离线/超时/404）→ None。结果缓存（规划期同一 artifact 会被多模块问到）。"""
     if not _lookup_enabled():
         return None
-    if url in _http_cache:
-        return _http_cache[url]
+    # ★P-C2 复核 F-1（go/npm/maven 三处同型，一起改）★ 原实现永久缓存 `None`：一次抖动
+    # 把该 artifact 钉成"查不到"，网络恢复后不重试，且与"Central 真没这个坐标"不可区分。
+    # 策略（TTL 负缓存，兼顾 F-3 的代价放大）见 brain/dep_http_cache.py。
+    hit, cached = text_cache_lookup(_http_cache, _http_neg_until, url)
+    if hit:
+        return cached
     text: str | None = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "swarm-maven-resolver"})
@@ -81,7 +90,7 @@ def _http_get(url: str) -> str | None:
                 text = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("[maven-registry] GET %s 失败: %s", url, exc)
-    _http_cache[url] = text
+    text_cache_store(_http_cache, _http_neg_until, url, text)
     return text
 
 
@@ -370,6 +379,11 @@ class ResolvedDep:
     artifact: str
     version: str | None   # None = 父级受管，按 Maven 惯例不写版本
     source: str           # baseline | reactor | registry | explicit
+    # ★复核 A-1 + A-7★ 与 npm/go 同款三档（verified|unverified|unjudgeable）。maven 原先
+    # 完全不入 dep_versions_unverified 账，而 RuoYi 基线正是 Maven＝本项目主栈：Central
+    # 不可达时显式版本全 fail-open 保留，账却是 {} ⇒ 与"全部证实"逐字相同，F-2 要治的病
+    # 在主栈原封不动。默认取悲观值（fail-closed）：新增构造点忘传 ⇒ 进账而非静默记已证实。
+    verified: str = "unverified"
 
 
 def resolve_artifacts(project_path: str, artifacts: list[str],
@@ -441,6 +455,9 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
         # 判定序（与裸名分支同源）：受管剥版本 → reactor 兄弟钉 ${project.version} →
         # 仓库确证查无该版本=幻觉（校正到最新稳定版/如实丢弃）→ 不可达 fail-open 保留
         # （证据缺失≠否定证据，L1 dep-legality 同族规则兜底）。${...} 属性引用不判。
+        # ★复核 A-1★ 本条坐标的"闸做到了什么"。默认悲观（A-7 / 纪律 3：正确性缺省取悲观值），
+        # 只在**确有确定性证据**的分支显式抬成 verified；`${...}` 属性引用刻意不判。
+        _verified = "unjudgeable" if (version or "").startswith("${") else "unverified"
         if version is not None and source == "explicit" and not version.startswith("${"):
             if index.is_managed(artifact):
                 if index.managed.get(artifact) and index.managed[artifact] != group:
@@ -453,10 +470,15 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
                     " → 剥掉 LLM 版本主张（受管权威优先，对抗跨代际旧版注入）",
                     spec, version, artifact)
                 version = None
+                # 受管权威剥掉版本＝确定性证据（父级/BOM 说了算），不是"未证实"
+                _verified = "verified"
             elif index.is_module(artifact) and group == index.project_group:
                 version = "${project.version}"
+                _verified = "verified"      # reactor 兄弟：与父同版，零网络确定性
             else:
                 _exists = registry_version_exists(group, artifact, version)
+                if _exists is True:
+                    _verified = "verified"   # 仓库确证该版本存在
                 if _exists is False:
                     _latest = registry_latest_version(group, artifact)
                     if _latest:
@@ -464,6 +486,7 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
                             "[maven-registry] R67L-B3 显式坐标 %s 的版本 %s 仓库确证查无"
                             "（幻觉版本）→ 校正到最新稳定版 %s", spec, version, _latest)
                         version = _latest
+                        _verified = "verified"   # 校正后的版本来自仓库实测，非 LLM 主张
                     else:
                         logger.warning(
                             "[maven-registry] R67L-B3 显式坐标 %s 的版本 %s 仓库确证查无"
@@ -481,13 +504,19 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
         if version is None:
             if index.is_managed(artifact):
                 version = None            # 父级（含 BOM）管得到 → 按惯例不写
+                _verified = "verified"    # 受管＝确定性证据
             elif index.is_module(artifact) and group == index.project_group:
                 version = "${project.version}"   # reactor 兄弟：与父同版，确定性且不写死
+                _verified = "verified"
             elif not (index.known and index.managed_complete):
                 # 基线未知 / 受管集不完整（BOM 拉不到）→ 无资格判"必炸" → 保持旧行为（不写版本）
                 version = None
+                # ★这条正是"证据不完整"★ 基线/受管集都没拿到就不写版本，是保守兜底不是确证，
+                # 保持默认 unverified ⇒ 进账（原先它和"受管确证"塌成同一个 source）。
             else:
                 version = registry_latest_version(group, artifact)
+                if version:
+                    _verified = "verified"   # 解析自仓库
                 if not version:
                     # 确知不受管 + 版本解析不到 = **可证必炸**（pom 解析期错，整 reactor 读不出）→
                     # 如实丢弃。安全性来自下游：worker 的 L1 防线④会按源码里**真实的 import**
@@ -498,7 +527,8 @@ def resolve_artifacts(project_path: str, artifacts: list[str],
         if (group, artifact) in seen:
             continue
         seen.add((group, artifact))
-        kept.append(ResolvedDep(group=group, artifact=artifact, version=version, source=source))
+        kept.append(ResolvedDep(group=group, artifact=artifact, version=version,
+                                source=source, verified=_verified))
 
     if dropped:
         logger.warning(

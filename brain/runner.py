@@ -1131,6 +1131,21 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         "stub_completed": sorted(stub_completed),  # R67L-B4④：桩降级完成者诚实披露（计入 completed）
         "total": total,
         "subtasks": subtasks,
+        # ★P-C2 复核 A-3：这是 dep_versions_unverified 的【消费者】★
+        # 血规 10 第四条：新账没有消费者＝没造。该键此前只有声明/写入/转发三处，零读点
+        # ——而我当初拿 `dep_ban_reconciled` 当口径先例，它同样零读点＝循环背书。
+        # 落在本端点的理由：它是"任务结构化进度"的**唯一权威出口**（纪律 #106：绝不解析
+        # swarm.log），而 P-C2 闸整轮静默失效恰恰是"日志里有 WARNING、机读面什么都没有"。
+        # 刻意只报不拦（非门）：proxy/registry 不可达是环境常态，拿它拦 auto_accept 会让
+        # 每个 plan 都 degraded ⇒ 使用者必然绕开（"过宽的闸使用者会绕开"）。
+        # always-emit：无命中也发 {}，让"本轮全证实"与"这版代码还没这个账"可区分。
+        "dep_versions_unverified": state.get("dep_versions_unverified") or {},
+        # ★同批消掉"循环背书"★ 下面两条是我当初引为口径先例的键，复核 A-3 实测它们**自己**
+        # 也零读点（`grep` 生产侧只有声明/写入/转发）。拿一个没有消费者的键去论证另一个没有
+        # 消费者的键合理，是同族缺陷互相背书——先例必须自己先满足纪律，否则引用它等于没论证。
+        # 三条同为 last-write-wins 纯观测账，消费面同一处，语义都是"本轮规划期发生了什么降级"。
+        "dep_ban_reconciled": state.get("dep_ban_reconciled") or {},
+        "contract_symbol_paths_unhealed": state.get("contract_symbol_paths_unhealed") or [],
     }
 
 

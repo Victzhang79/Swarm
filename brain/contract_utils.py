@@ -2867,9 +2867,19 @@ def sanitize_verify_scope(plan) -> dict[str, dict]:
 
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None, file_plan: list | None = None,
+    unverified_out: dict | None = None,
 ) -> list[dict]:
-    """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile + 验收作用域收敛。"""
-    injected = _inject_build_scaffold_subtasks_impl(plan, project_path, file_plan)
+    """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile + 验收作用域收敛。
+
+    ★P-C2 复核 F-2★ `unverified_out`：可选 out 参数，传入一个 dict 即收集本次注入里
+    **未经证实/不判**的依赖坐标 `{module: ["pkg@spec(unverified)", ...]}`。
+    为什么用 out 参数而不是改返回值：返回值 `list[dict]` 是约 60 处调用点的承重契约
+    （`injected = inject_build_scaffold_subtasks(...)` 后当列表用），改成元组会一次全打翻；
+    TaskPlan 是 pydantic BaseModel 且拒绝未声明字段（实测 ValueError），挂不上 plan。
+    默认 `None`＝不收集，对既有调用点零影响。
+    """
+    injected = _inject_build_scaffold_subtasks_impl(plan, project_path, file_plan,
+                                                    unverified_out=unverified_out)
     try:
         _exam = reconcile_template_exam(plan)
         if _exam:
@@ -3220,7 +3230,43 @@ def _npm_dep_block(manifest_rel: str, kept, pkg_name: str, exists: bool) -> str:
             "重写，绝不删除既有 dependencies/字段，仅在 \"dependencies\" 内追加缺失键。" + snip)
 
 
-def _inject_npm_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
+def _record_unverified_deps(unverified_out: dict | None, mod: str, kept: list) -> None:
+    """★P-C2 复核 F-2★ 把本模块 `verified != "verified"` 的坐标记进 out 账。
+
+    ★为什么记在这里、而不是只记进 `injected` 记录★ 本 driver 有**三条**出口：
+    ① 注入新脚手架（有 injected 记录）② owner-backfill（`continue`，无记录）
+    ③ 无 self_path/无 owner 跳过（`continue`，无记录）。②③ 的依赖照样进了 plan
+    （owner 的 description 内嵌清单块），只记①就又是"只接主调用点"（血规 10 第一条，
+    本会话已因此吃过 F-1）。故本函数在 `resolve_*_deps` 之后立刻调用，先于任何 `continue`。
+
+    `unverified_out is None` ⇒ 整个机制无开销 no-op（既有约 60 个调用点默认不收集）。
+    """
+    if unverified_out is None or not kept:
+        return
+    bad = []
+    for k in kept:
+        # ★默认取悲观值（A-7 / 纪律 3）★ 缺 `verified` 属性的类型宁可进账也不静默算已证实。
+        # 三栈的 ResolvedXxxDep 现在都显式带这个字段；将来第四栈忘加 ⇒ 进账（可见）而非消失。
+        v = getattr(k, "verified", "unverified")
+        if v == "verified":
+            continue
+        # ★三栈字段名各不相同，一个都不能漏（复核 A-1）★
+        #   go   : module / version      npm : name / spec      maven : group+artifact / version
+        # 漏一栈的后果不是崩溃而是记成 `?@?`——账在、却认不出是哪个依赖＝这笔账没用
+        # （go 侧就是这么被突变实验逮到的，见 test_f2_ledger_is_stack_neutral_go_side）。
+        coord = (getattr(k, "module", None) or getattr(k, "name", None)
+                 or (f"{k.group}:{k.artifact}" if getattr(k, "artifact", None) else None)
+                 or "?")
+        # maven 受管依赖按惯例不写版本（version=None）且那是**确定性证据**⇒ 已在上面被
+        # `verified` 滤掉；能走到这里的 None 是"基线/受管集都没拿到"那支，标记要能看出区别。
+        ver = getattr(k, "version", None) or getattr(k, "spec", None) or "<无版本>"
+        bad.append(f"{coord}@{ver}({v})")
+    if bad:
+        unverified_out.setdefault(mod, []).extend(bad)
+
+
+def _inject_npm_scaffolds(plan, project_path, file_plan, dirs,
+                          unverified_out: dict | None = None) -> list[dict]:
     """npm per-package.json driver（对抗双复核整改版）：内部标识取【全物理模块集】(dirs)、同源剪
     shared_contract、已认领 manifest 走 owner-backfill、unclaimed 注入脚手架。第三方版本经 npm
     registry 解析（^ver），内部 workspace 包 → workspace:*（零网络）。解析不到如实丢弃+同源剔除。"""
@@ -3241,6 +3287,8 @@ def _inject_npm_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
         manifest_rel = f"{mdir}/package.json"
         exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
         kept, dropped = resolve_npm_deps(project_path, arts, internal_names=internal_names)
+        # F-2：先于任何 continue 记账（本 driver 三条出口，只记注入那条＝又只接主调用点）
+        _record_unverified_deps(unverified_out, mod, kept)
         if dropped:
             logger.warning(
                 "[SCAFFOLD-INJECT] #31-P2b 模块 %s 的 %d 个 npm 依赖无法确定性解析版本 → "
@@ -3487,7 +3535,8 @@ def _go_dep_block(manifest_rel: str, self_path: str, go_directive: str,
             "相对路径，绝不去 proxy 拉）：" + snip)
 
 
-def _inject_go_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
+def _inject_go_scaffolds(plan, project_path, file_plan, dirs,
+                         unverified_out: dict | None = None) -> list[dict]:
     """go per-go.mod driver（对抗双复核整改版）：内部 module 标识取【全物理模块集】(dirs)、同源剪
     shared_contract、已认领 go.mod 走 owner-backfill、unclaimed 注入脚手架。第三方 require 版本经
     go proxy 解析（vX.Y.Z），内部 module → replace 指向本地相对路径（零网络）。解析不到如实丢弃；
@@ -3523,6 +3572,8 @@ def _inject_go_scaffolds(plan, project_path, file_plan, dirs) -> list[dict]:
         # 令 resolve_go_deps 的内部判定与下方 replace 生成同用一套规范键（杜绝裸标签泄进 go.mod）。
         _norm_arts = [internal_paths.get(a, a) for a in arts]
         kept, internal_mods, dropped = resolve_go_deps(_norm_arts, internal_modules=internal_ids)
+        # F-2：先于任何 continue 记账（go driver 同样三条出口，含 self_path=None 那条）
+        _record_unverified_deps(unverified_out, mod, kept)
         if dropped:
             logger.warning(
                 "[SCAFFOLD-INJECT] #31-P2c 模块 %s 的 %d 个 go 依赖无法确定性解析版本 → 三处剔除: %s",
@@ -3590,6 +3641,7 @@ def _go_relpath(from_dir: str, to_dir: str) -> str:
 
 def _inject_build_scaffold_subtasks_impl(
     plan, project_path: str | None = None, file_plan: list | None = None,
+    unverified_out: dict | None = None,
 ) -> list[dict]:
     """R39-4：规则5 落空模块 → 确定性注入构建文件脚手架子任务（零 LLM）。
 
@@ -3626,7 +3678,7 @@ def _inject_build_scaffold_subtasks_impl(
                 return []
             try:
                 return (_inject_npm_scaffolds if _stack == "npm" else _inject_go_scaffolds)(
-                    plan, project_path, file_plan, _p2_dirs)
+                    plan, project_path, file_plan, _p2_dirs, unverified_out=unverified_out)
             except Exception:  # noqa: BLE001 — driver 异常 fail-open，绝不炸规划主链
                 logger.warning("[SCAFFOLD-INJECT] #31-P2 %s driver 异常（fail-open）", _stack,
                                exc_info=True)
@@ -3761,6 +3813,11 @@ def _inject_build_scaffold_subtasks_impl(
         # 直接逼 worker 手写臆造坐标（round53：幻影 alarm-interface 毒死整个 reactor）。
         _kept, _dropped = resolve_scaffold_artifacts(
             project_path, arts, extra_module_artifacts=_plan_module_artifacts(plan))  # R67C-T2
+        # ★复核 A-1★ maven 也要入账。原先本机制只接了 npm/go 两个 driver，而 RuoYi 基线正是
+        # Maven＝本项目主栈：Central 不可达时显式版本全部 fail-open 保留，账却是 {}，与"全部
+        # 证实"逐字相同 ⇒ F-2 要治的病在主栈原封不动。位置同 npm/go：紧跟 resolve 之后、
+        # 先于任何 continue（本函数下方有多条提前 continue 的出口）。
+        _record_unverified_deps(unverified_out, mod, _kept)
         if _dropped:
             logger.warning(
                 "[SCAFFOLD-INJECT] R53-1 模块 %s 的 %d 个契约依赖无法确定性解析 → 模板/契约/"
