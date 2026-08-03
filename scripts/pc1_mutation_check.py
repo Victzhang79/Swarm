@@ -26,6 +26,7 @@ TESTS = ["test/test_b3_stack_spec_single_source.py",
 CU = ROOT / "brain" / "contract_utils.py"
 PF = ROOT / "brain" / "plan_finisher.py"
 SPEC = ROOT / "stacks" / "spec.py"
+SS = ROOT / "brain" / "symbol_surgery.py"
 
 MUTATIONS = [
     # ── 识别覆盖面 ──
@@ -103,6 +104,69 @@ MUTATIONS = [
         '    if stk == "unknown":\n        # ★两因并列，不猜是哪个★',
         '    if True:\n        # ★两因并列，不猜是哪个★',
         ['test_known_stack_does_not_emit_unknown_warning'],
+    ),
+    # ── P-C1 复核 F1：「清单不是实现证据」第四档派生视图（#16）──
+    (
+        'F1：symbol_surgery 改回手抄 5 条（go/cargo/gradle-kts/python 清单脚手架'
+        '照旧是挂靠候选 ⇒ 幻影 ownership 复活）',
+        SS,
+        '_BUILD_MANIFESTS = frozenset(n.lower() for n in _build_manifest_basenames())',
+        '_BUILD_MANIFESTS = frozenset({"pom.xml", "build.gradle", "build.gradle.kts",\n'
+        '                              "settings.gradle", "package.json"})',
+        ['test_every_build_manifest_is_not_implementation_evidence',
+         'test_symbol_surgery_and_contract_utils_share_the_derived_set'],
+    ),
+    (
+        'F1：contract_utils 改回手抄 7 条（settings.gradle/go.work 判 weak_code ⇒ '
+        '聚合清单被当 flat 真源码参与物理根歧义判定）',
+        CU,
+        '_BUILD_MANIFESTS = frozenset(build_manifest_basenames())',
+        '_BUILD_MANIFESTS = frozenset({"pom.xml", "build.gradle", "build.gradle.kts",\n'
+        '                                     "Cargo.toml", "go.mod", "package.json",\n'
+        '                                     "pyproject.toml"})',
+        ['test_every_build_manifest_is_not_implementation_evidence',
+         'test_symbol_surgery_and_contract_utils_share_the_derived_set'],
+    ),
+    (
+        'F1：第四档复用 demote 门控（python 掉出 ⇒ pyproject.toml 脚手架照旧是挂靠候选；'
+        '血规 10 第三条：两档后果不同绝不互换）。★指名不含 parametrize 那条★：它的夹具'
+        '从同一张表派生——python 掉出并集后**参数格同步消失**，全绿（夹具与被测同源收缩，'
+        '[[swarm-fallback-must-not-share-the-gap]] 同型；harness 实测存活）。防收缩锁是'
+        'strict_superset 那条（手抄字面量 pyproject.toml/requirements.txt）。',
+        SPEC,
+        '    out: set[str] = set()\n    for spec in STACK_SPEC.values():\n'
+        '        out.update(spec.root_manifests)',
+        '    out: set[str] = set()\n    for spec in STACK_SPEC.values():\n'
+        '        if not spec.aggregate_manifest:\n            continue\n'
+        '        out.update(spec.root_manifests)',
+        ['test_build_manifest_basenames_is_a_strict_superset_of_the_demote_tier'],
+    ),
+    (
+        'F1：_evidence_class 的 manifest 判定整块消失（清单全判 weak_code/aux ⇒ '
+        '物理根证据链被清单污染）',
+        CU,
+        '    if name.lower() in _BUILD_MANIFESTS_LC:\n        return _EV_MANIFEST',
+        '    if False:\n        return _EV_MANIFEST',
+        ['test_every_build_manifest_is_not_implementation_evidence'],
+    ),
+    (
+        'F1：_subtask_modules 的清单过滤整块消失（纯清单脚手架子任务重新获得挂靠权重）。'
+        '★指名不含反向锁★：反向锁的夹具全是真源码（过滤消失与否返回值相同），'
+        '它对「过窄」方向结构性零区分力——它锁的是「过宽」（harness 实测存活）。',
+        SS,
+        '        if rest.strip().lower() in _BUILD_MANIFESTS:\n'
+        '            continue  # 模块根构建清单：不构成"能实现符号"的证据',
+        '        if False:\n'
+        '            continue  # 模块根构建清单：不构成"能实现符号"的证据',
+        ['test_every_build_manifest_is_not_implementation_evidence'],
+    ),
+    (
+        'F1 near-miss：基线磁盘探测误用小写集（cargo.toml 在大小写敏感 FS 上探不到 '
+        'Cargo.toml ⇒ 既有基线模块判不出）。本机 APFS 零区分力 ⇒ 锁查询形状',
+        CU,
+        '        for name in _BUILD_MANIFESTS\n    )',
+        '        for name in _BUILD_MANIFESTS_LC\n    )',
+        ['test_baseline_probe_queries_canonical_case_names'],
     ),
 ]
 

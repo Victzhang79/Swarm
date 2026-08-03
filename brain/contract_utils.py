@@ -12,6 +12,7 @@ from typing import Any
 from swarm.stacks import (
     DEPENDENCY_TREE_DIRS,
     aggregate_manifests_of_stack,
+    build_manifest_basenames,
     demote_safety_net,
     is_compilable_source,
     is_structural_build_manifest,
@@ -587,8 +588,17 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
 # 标准源码布局段：它们是**布局**不是模块（Maven/Gradle: src/main/java；Cargo: src；Go: cmd/internal…）
 _SRC_LAYOUT_SEGMENTS = frozenset({"src", "main", "java", "kotlin", "scala", "resources",
                                   "test", "tests", "webapp", "cmd", "internal", "pkg"})
-_BUILD_MANIFESTS = ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml",
-                    "go.mod", "package.json", "pyproject.toml")
+# ★P-C1 复核 F1★ 这里曾是手抄 7 条，缺口与 symbol_surgery 那份**互不相同**
+# （缺 go.work/settings.gradle/settings.gradle.kts，多 pyproject.toml）——同一概念两处手抄、
+# 后果面是并集。实测 `settings.gradle`/`go.work` 被判 weak_code ⇒ Gradle/Go 聚合清单
+# 被当"flat 布局真源码"参与物理根歧义判定。现接 STACK_SPEC 第四档派生视图
+# `build_manifest_basenames()`（消费契约＝"清单不是实现证据"，宁滥勿缺=保守方向）。
+# ★两个常量两种消费契约（血规 10 第三条，本文件内就有两档）★：
+#   `_BUILD_MANIFESTS`    规范大小写——拼路径去 git 树/磁盘**探测存在性**（`cargo.toml`
+#                         小写在大小写敏感 FS 上探不到真实的 `Cargo.toml`，P-C1 磁盘档同因）；
+#   `_BUILD_MANIFESTS_LC` 小写——判定"这个路径是不是清单"（大小写不敏感=多判=保守）。
+_BUILD_MANIFESTS = frozenset(build_manifest_basenames())
+_BUILD_MANIFESTS_LC = frozenset(n.lower() for n in _BUILD_MANIFESTS)
 
 
 # ★R64★ 辅助交付物扩展名（多栈通用）：DDL/文档/图片/脚本/纯配置——不参与构建 reactor、
@@ -621,9 +631,12 @@ def _evidence_class(path: str) -> str:
     被当第二物理根 → G1 三验三拒好 plan（issues 反馈"归到同一模块目录"对棕地顶层 sql
     惯例结构性不可满足 → LLM 永不收敛 → FAILED@PLAN）。多栈中立，不写死任何单一栈。"""
     p = _norm_scope_path(path)
-    if p.endswith(_BUILD_MANIFESTS):
-        return _EV_MANIFEST
     name = p.rsplit("/", 1)[-1]
+    # ★P-C1 复核 F1★ basename 相等（原 endswith 会把 `xpom.xml` 这类同后缀文件名误判
+    # manifest）+ 大小写不敏感（`cargo.toml` 小写变体同样是清单）。方向=多判 manifest=
+    # 不主张根=保守。
+    if name.lower() in _BUILD_MANIFESTS_LC:
+        return _EV_MANIFEST
     dot = name.rfind(".")
     if dot > 0 and name[dot:].lower() in _AUX_EXTENSIONS:
         return _EV_AUX
@@ -748,7 +761,7 @@ def _resolve_module_dirs(
                  + list(getattr(sc, "writable", []) or []))
         for f in files:
             p = _norm_scope_path(f)
-            if "/" not in p or p.endswith(_BUILD_MANIFESTS):
+            if "/" not in p or p.rsplit("/", 1)[-1].lower() in _BUILD_MANIFESTS_LC:
                 continue   # 构建清单不算名字匹配证据（它正是我们要造的东西）
             bucket = (cands_aux if _evidence_class(p) == _EV_AUX else cands_code)
             parts = p.split("/")
@@ -950,7 +963,8 @@ def _code_module_root(path: str) -> str | None:
     边界，多栈通用）→ None（fail-closed：绝不凭一个字符串在磁盘上切出模块）。
     """
     p = _norm_scope_path(path)
-    if not p or "/" not in p or p.endswith(_BUILD_MANIFESTS):
+    # P-C1 复核 F1：与 `_evidence_class` 同判据（basename 相等 + 大小写不敏感）
+    if not p or "/" not in p or p.rsplit("/", 1)[-1].lower() in _BUILD_MANIFESTS_LC:
         return None
     parts = p.split("/")
     for i, seg in enumerate(parts):
@@ -1049,7 +1063,7 @@ def _physical_code_module_dirs(plan, file_plan: list | None = None) -> set[str]:
         d = _code_module_root(f)
         if d:
             out.add(d)
-        elif "/" in p and not p.endswith(_BUILD_MANIFESTS):
+        elif "/" in p and p.rsplit("/", 1)[-1].lower() not in _BUILD_MANIFESTS_LC:
             _unrooted.add(p.rsplit("/", 1)[0])   # 无源码布局段 → 记其所在目录，待覆盖判定
 
     for st in getattr(plan, "subtasks", []) or []:

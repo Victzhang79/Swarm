@@ -29,9 +29,17 @@ _DEFAULT_MAX_PER_SUBTASK = 8
 
 # 模块根构建清单（不计入挂靠候选权重）：只会产出构建文件的子任务（如 R39-4 注入的
 # 脚手架）结构上永远实现不了接口——把符号挂给它=幻影 ownership 骗过 C1，两张皮复活
-# （对抗复核 CONFIRMED，带复现）。栈公平的小集合，与规则5 的 Maven 决策同族。
-_BUILD_MANIFESTS = {"pom.xml", "build.gradle", "build.gradle.kts",
-                    "settings.gradle", "package.json"}
+# （对抗复核 CONFIRMED，带复现）。
+# ★P-C1 复核 F1★ 这里曾是手抄 5 条（pom/gradle×3/package.json）自称"栈公平的小集合"，
+# 实为 JVM+npm 独占——go/cargo/gradle-kts/python 栈的清单脚手架子任务照旧是挂靠候选
+# （实测 `mod/go.mod` `mod/Cargo.toml` `mod/settings.gradle.kts` `mod/pyproject.toml`
+# 全返 `{'mod': 1}`）。现接 STACK_SPEC 第四档派生视图（消费契约＝"清单不是实现证据"，
+# 与 structural_manifests 的 demote 档后果不同，绝不复用——血规 10 第三条）。
+from swarm.stacks import build_manifest_basenames as _build_manifest_basenames
+
+# 小写化存储：判定处 `.lower()` 后命中——`mod/cargo.toml` 小写变体同样不是实现证据
+# （大小写不敏感与 spec.stack_of_structural_manifest 的既有先例对齐；方向=多滤=保守）。
+_BUILD_MANIFESTS = frozenset(n.lower() for n in _build_manifest_basenames())
 
 
 def _subtask_modules(st) -> dict[str, int]:
@@ -51,7 +59,7 @@ def _subtask_modules(st) -> dict[str, int]:
         mod = mod.strip()
         if not mod:
             continue
-        if rest.strip() in _BUILD_MANIFESTS:
+        if rest.strip().lower() in _BUILD_MANIFESTS:
             continue  # 模块根构建清单：不构成"能实现符号"的证据
         counts[mod] = counts.get(mod, 0) + 1
     return counts
@@ -120,7 +128,7 @@ def surgical_symbol_attach(
                 continue
             # R39 CRITICAL 红线同源：构建清单不构成"能实现符号"的证据——脚手架
             # <module>/pom.xml 的目录名天然含模块词元，不滤则幻影 ownership 复活
-            if p.rsplit("/", 1)[-1].strip() in _BUILD_MANIFESTS:
+            if p.rsplit("/", 1)[-1].strip().lower() in _BUILD_MANIFESTS:
                 continue
             dirs.append(p.rsplit("/", 1)[0].lower().replace("-", "").replace("_", ""))
         _dir_files[st.id] = dirs

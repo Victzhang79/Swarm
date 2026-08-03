@@ -32,6 +32,7 @@ from swarm.brain.plan_validator import validate_plan_structure
 from swarm.stacks import (
     STACK_SPEC,
     aggregate_manifests_of_stack,
+    build_manifest_basenames,
     is_structural_build_manifest,
     module_manifests_of_stack,
     root_aggregate_manifests,
@@ -458,6 +459,99 @@ def test_detection_has_no_second_source_of_truth():
         "手抄第二份表必然漂移（P-C1 就是漂移的产物）。请走 root_manifests_by_stack() / "
         "stack_of_manifest() / stack_of_structural_manifest()。")
     assert not hasattr(cu, "_MANIFEST_TO_STACK_LC"), "同上（小写派生表亦不得复活）"
+
+
+# ══════════════════════════════════════════════
+# ①.5 P-C1 复核 F1：「清单不是实现证据」第四档派生视图——两个消费落点逐条对账
+# ══════════════════════════════════════════════
+
+@pytest.mark.parametrize("manifest", sorted(build_manifest_basenames()))
+def test_every_build_manifest_is_not_implementation_evidence(manifest):
+    """★P-C1 复核 F1★ 派生集**每一条**都必须同时被两个消费落点认成「非实现证据」。
+
+    落点 1（`symbol_surgery._subtask_modules`）：只写 `mod/<清单>` 的纯脚手架子任务
+    必须返 `{}`——否则它是符号挂靠候选 ⇒ 幻影 ownership 骗过 C1、两张皮复活
+    （F1 实测手抄 5 条时 `go.mod`/`Cargo.toml`/`settings.gradle.kts`/`pyproject.toml`
+    全返 `{'mod': 1}`）。
+    落点 2（`contract_utils._evidence_class`）：必须分类 `manifest`——手抄 7 条时
+    `settings.gradle`/`go.work` 被判 `weak_code` ⇒ Gradle/Go 聚合清单被当 flat 真源码
+    参与物理根歧义判定。
+
+    逐条 parametrize（派生自单一事实源，不手抄——新增一栈自动获得覆盖，
+    [[swarm-enumeration-needs-authoritative-source]] 的正面形态）。
+    """
+    from swarm.brain.symbol_surgery import _subtask_modules
+
+    st = _st("s1", create=(f"mod/{manifest}",))
+    assert _subtask_modules(st) == {}, (
+        f"只写 {manifest} 的脚手架子任务成了挂靠候选 ⇒ 幻影 ownership（F1）")
+    assert cu._evidence_class(f"mod/{manifest}") == "manifest", (
+        f"{manifest} 没被分类成 manifest ⇒ 构建清单被当真源码参与物理根判定（F1）")
+
+
+def test_real_source_files_are_not_swallowed_by_the_manifest_set():
+    """反向锁（防过宽）：真源码文件**不得**被第四档吞掉。
+
+    「宁滥勿缺」的边界是清单集合本身——把 `main.py`/`App.java` 也判成 manifest 会让
+    真源码子任务失去挂靠权重（该挂的挂不上）且物理根证据静默消失。哪个突变能红：
+    把 `_evidence_class` 的 manifest 判定放宽成「任意文件」/把 `_subtask_modules`
+    的过滤改成无条件 skip。
+    """
+    from swarm.brain.symbol_surgery import _subtask_modules
+
+    st = _st("s1", create=("mod/main.py", "mod/App.java", "web/App.js"))
+    assert _subtask_modules(st) == {"mod": 2, "web": 1}
+    assert cu._evidence_class("mod/main.py") != "manifest"
+    assert cu._evidence_class("mod/App.java") != "manifest"
+
+
+def test_build_manifest_basenames_is_a_strict_superset_of_the_demote_tier():
+    """集合关系锁：第四档（实现证据排除）⊋ demote 档（`structural_manifests`）。
+
+    python 的 `pyproject.toml`/`requirements.txt` **必须在本档**（它不构成实现证据）
+    而**刻意不在** demote 档（无 reconcile 路径，demote 必丢贡献）——两档后果不同，
+    绝不互换（血规 10 第三条）。哪个突变能红：把 `build_manifest_basenames()`
+    的实现换成复用 `structural_manifests()` 的门控循环 ⇒ python 两清单立即掉出本档。
+    """
+    assert structural_manifests() <= build_manifest_basenames()
+    assert "pyproject.toml" in build_manifest_basenames()
+    assert "requirements.txt" in build_manifest_basenames()
+    assert "pyproject.toml" not in structural_manifests()  # 既有分档不被本档侵蚀
+
+
+def test_symbol_surgery_and_contract_utils_share_the_derived_set():
+    """★同一概念两处手抄的根治锁★ 两个落点必须读**同一个**派生视图——
+    F1 的病根就是两份手抄表缺口互不相同、后果面是并集。哪个突变能红：
+    任一侧改回手抄字面量集合（只要与派生集有差集即红）。
+
+    消费契约分档（血规 10 第三条）：判定用小写集（`ss._BUILD_MANIFESTS` /
+    `cu._BUILD_MANIFESTS_LC`），磁盘探测用规范大小写集（`cu._BUILD_MANIFESTS`）——
+    两者都必须逐字派生自 `build_manifest_basenames()`，不许有任何增删。
+    """
+    from swarm.brain import symbol_surgery as ss
+
+    derived_lc = frozenset(n.lower() for n in build_manifest_basenames())
+    assert ss._BUILD_MANIFESTS == derived_lc
+    assert cu._BUILD_MANIFESTS_LC == derived_lc
+    assert cu._BUILD_MANIFESTS == frozenset(build_manifest_basenames())
+
+
+def test_baseline_probe_queries_canonical_case_names(monkeypatch):
+    """★P-C1 F1 整改 near-miss 锁★ git 树/磁盘探测必须用**规范大小写**集——
+    拿小写集拼路径时 `mod/cargo.toml` 在大小写敏感 FS（CI ubuntu）上探不到真实的
+    `Cargo.toml` ⇒ 既有 cargo 基线模块判不出 ⇒ 清单被当新证据，幻影 ownership 换皮复活。
+
+    本机 APFS 大小写不敏感 ⇒ 断文件存在性零区分力（P-C1 小写化突变已踩过此坑，
+    落点必须选平台无关属性），故断**查询形状**：派生集里唯一的规范大写清单是
+    `Cargo.toml`/`Pipfile`，探询必须原样发出。
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cu, "_exists_in_repo",
+                        lambda pp, rel, cache, base_ref=None: seen.append(rel) or False)
+    cu._is_existing_baseline_module("/fixture/repo", "mod", {}, None)
+    assert "mod/Cargo.toml" in seen, "探测被换成小写集 ⇒ 大小写敏感 FS 上探不到真实清单"
+    assert "mod/Pipfile" in seen
+    assert "mod/cargo.toml" not in seen
 
 
 @pytest.mark.parametrize("manifest,expect_stack", [

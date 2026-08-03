@@ -344,6 +344,40 @@ def structural_manifests() -> frozenset[str]:
     return frozenset(out)
 
 
+def build_manifest_basenames() -> frozenset[str]:
+    """【实现证据排除档】全栈构建清单 basename 并集（第四档派生视图，P-C1 复核 F1）。
+
+    消费契约（与另三档**不同档**，别互换）＝
+    "该 basename 是构建清单本身 ⇒ 写它**不构成『实现了接口/符号』的证据**"。
+    消费者：符号挂靠候选过滤（`symbol_surgery._subtask_modules`）、物理根证据分类
+    （`contract_utils._evidence_class`）——问的都是"这个文件能不能作证"，不是
+    "要不要 demote"（`structural_manifests`）也不是"这是不是该栈的工程"（`root_manifests`）。
+
+    ★为什么不能用 `structural_manifests()`（血规 10 第三条正例）★ 那档有
+    `aggregate_manifest` 门控（python 刻意不收录——demote 必丢贡献）。但本档问的是
+    另一件事：清单永远不是实现。python 的 `pyproject.toml`/`requirements.txt` 不在
+    本档 ⇒ 只写 `backend/pyproject.toml` 的纯脚手架子任务照旧是符号挂靠候选
+    ⇒ 幻影 ownership 骗过 C1、两张皮复活（F1 实测 `mod/go.mod`/`mod/Cargo.toml`/
+    `mod/settings.gradle.kts`/`mod/pyproject.toml` 全部返 `{'mod': 1}`）。
+
+    ★方向性：本档宁滥勿缺★ 多收一个只会让某子任务少一个挂靠候选（保守方向，
+    缺席 ⇒ 不挂 ⇒ C1 打回，fail-closed）；少收一个直接造幻影 ownership（静默放行）。
+    与 `root_manifests_by_stack`（少收＝栈识别错）方向相反，故绝不共用。
+
+    定义＝全栈并集：`root_manifests` ∪ `module_manifest` ∪ `module_extra_manifests`
+    ∪ `aggregate_manifest` ∪ `aggregate_extra_manifests`，**无任何门控**。
+    """
+    out: set[str] = set()
+    for spec in STACK_SPEC.values():
+        out.update(spec.root_manifests)
+        out.add(spec.module_manifest)
+        out.update(spec.module_extra_manifests)
+        if spec.aggregate_manifest:
+            out.add(spec.aggregate_manifest)
+            out.update(spec.aggregate_extra_manifests)
+    return frozenset(out)
+
+
 def is_structural_build_manifest(path: str) -> bool:
     """路径（根或任意嵌套模块）是否为结构性构建清单。见 `structural_manifests` 的消费契约。"""
     return _plan_basename(path) in _lc(structural_manifests())

@@ -10,6 +10,7 @@ from swarm.stacks.spec import (  # noqa: F401
     StackSpec,
     aggregate_manifest_of_stack,
     aggregate_manifests_of_stack,
+    build_manifest_basenames,
     demote_safety_net,
     is_compilable_source,
     is_root_aggregate_manifest,
