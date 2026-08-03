@@ -22,7 +22,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_pc3_template_engine_multistack.py",
-         "test/test_stack_detect.py"]
+         "test/test_stack_detect.py",
+         # #19 的 (版本, 摘要) 配对守卫住在这里——不纳入则末两条突变的 `-k` 选不到，
+         # 会以 rc=5「测试名选不到」判失败（而不是静默当成绿）。
+         "test/test_r65tr_t5_baseline_convention.py"]
 
 SD = ROOT / "brain" / "stack_detect.py"
 PN = ROOT / "brain" / "planning_nodes.py"
@@ -42,8 +45,12 @@ MUTATIONS = [
         # 首版还指名了 `test_template_suffix_table_covers_common_engines` → 突变后仍绿：
         # 它那些多段用例（`.html.erb`/`.html.heex`）splitext 后就是模板后缀，主表直接认得，
         # **不经复合表**。这个"仍绿"暴露的是我自己的冗余表项（已删两条），不是测试的错。
+        # `test_server_rendered_stacks_are_recognized` 对 Laravel 不敏感：该夹具有
+        # `laravel/framework` marker，即使没有复合后缀，`.php`+`resources/views/` 仍让
+        # detect 路径判 server-template。这不是测试缺陷，是 Laravel 真实有多条路径到达结论。
+        # 真正锁复合后缀接线的两条：纯函数 `_template_engine_of` + 无 marker 夹具的引擎名。
         ['test_blade_compound_suffix_is_recognized',
-         'test_server_rendered_stacks_are_recognized'],
+         'test_blade_is_recognized_without_a_laravel_framework_marker'],
     ),
     (
         'P-C3：复合表塞回冗余条目（`.html.heex` 主表已认得 ⇒ 该条目删掉没人会红＝不可证伪）',
@@ -229,6 +236,155 @@ MUTATIONS = [
         '                if False:\n'
         '                    profile["signals"]["tmpl_engine_unrecognized"] = False',
         ['test_adjudication_clears_the_flag_so_it_is_not_sticky'],
+    ),
+    # ── ③ #18：判据的**计数范围**（P-C3 复核 CRITICAL-1）──────────────────────────
+    (
+        '#18：addend 退回"全仓任意 .html"（DRF 纯 API 工程被一个 docs/index.html 翻成 '
+        'server-template/0.95/needs_adj=False ＝ 高置信错答案，连 LLM 兜底都不触发）',
+        SD,
+        '    if server_tmpl_dep and unengined_tmpl_dir_files > 0:\n'
+        '        real_server_tmpl += unengined_tmpl_dir_files',
+        '    if server_tmpl_dep and ext_counts.get(".html", 0) > 0:\n'
+        '        real_server_tmpl += ext_counts.get(".html", 0)',
+        ['test_api_only_project_is_not_flipped_by_a_stray_html',
+         'test_moving_the_html_into_a_template_dir_is_what_flips_the_verdict'],
+    ),
+    (
+        '#18：★误杀方向★ addend 整块消失（真 Django/Flask 模板工程——模板后缀就是 .html、'
+        '靠后缀永远认不出——回到判 none，"禁止产 .vue" 的约定发不出去）',
+        SD,
+        '    if server_tmpl_dep and unengined_tmpl_dir_files > 0:\n'
+        '        real_server_tmpl += unengined_tmpl_dir_files',
+        '    if False:\n'
+        '        real_server_tmpl += unengined_tmpl_dir_files',
+        ['test_moving_the_html_into_a_template_dir_is_what_flips_the_verdict',
+         'test_server_rendered_stacks_are_recognized'],
+    ),
+    (
+        '#18：重复计数复发（addend 改成"模板目录下全部网页文件、不论引擎认不认得"——`sum(hits)` '
+        '已含引擎认得的那批 ⇒ Laravel 的 2 个 .blade.php 被数成 4。这是首版实现的形状）',
+        SD,
+        '            if _eng is None and ext in _WEBPAGE_EXTS:',
+        '            if ext in _WEBPAGE_EXTS:',
+        ['test_template_files_are_not_counted_twice'],
+    ),
+    (
+        '#18：模板目录作用域整块失效（网页文件不论在哪都算证据 ⇒ 覆盖率报告/构建产物成了'
+        '"服务端模板"，且纯 API 工程被拉进"认不得"去烧模型裁决）',
+        SD,
+        '                if _segs & _TEMPLATE_DIR_NAMES:',
+        '                if True:',
+        ['test_api_only_project_is_not_flipped_by_a_stray_html',
+         'test_no_template_dir_means_no_flag_even_with_stray_html'],
+    ),
+    # ── ④ #20：四个已存在主流栈的兜底缺口 ───────────────────────────────────────
+    (
+        '#20：`.aspx` 从一档表消失（ASP.NET Web Forms 整栈判不出——它没有模板目录惯例，'
+        '二档的"目录名+后缀+dep marker"对它结构性失效）',
+        SD,
+        '    ".aspx": "ASP.NET Web Forms",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_webforms_is_recognized_with_zero_template_dir_convention',
+         'test_newly_registered_suffixes_are_in_the_first_tier_table'],
+    ),
+    (
+        '#20：`.gsp` 从一档表消失（Grails 的 grails-app/views/*.gsp 回到判 none）',
+        SD,
+        '    ".gsp": "GSP",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_newly_registered_suffixes_are_in_the_first_tier_table'],
+    ),
+    (
+        '#20：`.phtml` 从一档表消失（Magento 2 的 view/frontend/templates/*.phtml 回到判 none。'
+        '★也证明分档选对了★ 落到二档要 dep marker 佐证，而表里没有 magento marker）',
+        SD,
+        '    ".phtml": "PHP template",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_phtml_is_a_template_but_plain_php_source_is_not',
+         'test_newly_registered_suffixes_are_in_the_first_tier_table'],
+    ),
+    (
+        '#20：`.vbhtml` 从一档表消失（Razor 的 VB.NET 方言——与已登记的 .cshtml 同引擎'
+        '不同语言，缺了它 VB 工程整栈认不出）',
+        SD,
+        '    ".vbhtml": "Razor",\n',
+        '',
+        ['test_newly_registered_suffixes_are_in_the_first_tier_table'],
+    ),
+    (
+        '#20：`.ascx` 塞进一档表（不可证伪的冗余条目——user control 不能被单独请求，'
+        '有它必有 .aspx ⇒ 造不出"有它/没它结论不同"的夹具。同不登记 .html.erb 的判据）',
+        SD,
+        '    ".aspx": "ASP.NET Web Forms",\n',
+        '    ".aspx": "ASP.NET Web Forms",\n    ".ascx": "ASP.NET Web Forms",\n',
+        ['test_webforms_coverage_does_not_depend_on_ascx_or_master'],
+    ),
+    (
+        '#20：`webapp` 从目录表消失（JSF 的 Facelets 默认扫 **war 根** src/main/webapp，'
+        '页面不进任何 templates 子目录 ⇒ 该栈的 .xhtml 一个都不入账）',
+        SD,
+        '    "webapp",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_jsf_xhtml_in_war_root_is_only_reachable_via_the_webapp_dir_name'],
+    ),
+    (
+        '#20：JSF 五条 marker 整块消失（.xhtml 靠后缀永远认不出——静态 XHTML 同后缀——'
+        '只能靠依赖坐标佐证，与 Django/Askama 同性质）',
+        SD,
+        '    "myfaces": "JSF (Facelets)",\n    "jakarta.faces": "JSF (Facelets)",\n'
+        '    "javax.faces": "JSF (Facelets)",\n    "jsf-api": "JSF (Facelets)",\n'
+        '    "primefaces": "JSF (Facelets)",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_each_jsf_marker_is_independently_load_bearing'],
+    ),
+    (
+        '#20：只删 `primefaces` 一条（★最容易被误判为冗余的一条★ 跑在 Jakarta EE 容器上的 '
+        'PrimeFaces 工程 pom 里只有 jakartaee-web-api(provided) + primefaces，前者字符串'
+        '**不含** jakarta.faces ⇒ 删了它该工程一个 marker 都命中不了）',
+        SD,
+        '    "primefaces": "JSF (Facelets)",\n',
+        '',
+        ['test_four_existing_stacks_no_longer_get_a_confident_wrong_answer',
+         'test_each_jsf_marker_is_independently_load_bearing'],
+    ),
+    (
+        '#20：只删 `javax.faces` 一条（Java EE 时代坐标 org.glassfish:javax.faces。'
+        '"五条互不支配"这句话必须逐条可证伪，否则被支配的那条是冗余项）',
+        SD,
+        '    "javax.faces": "JSF (Facelets)",\n',
+        '',
+        ['test_each_jsf_marker_is_independently_load_bearing'],
+    ),
+    (
+        '#20：只删 `myfaces` 一条（MyFaces 的 api/impl 由这一条同时盖住）',
+        SD,
+        '    "myfaces": "JSF (Facelets)",\n',
+        '',
+        ['test_each_jsf_marker_is_independently_load_bearing'],
+    ),
+    # ── ⑤ #19 配对守卫的两向区分力（(版本, 摘要) 必须同时改）────────────────────
+    (
+        '#19：改了事实表却**不**递增 schema 版本（已缓存项目命中缓存早返 ⇒ 治法对所有已建档'
+        '项目一行不生效，且是静默 no-op：消费者 `.get()` 读缺键得 None＝假值。这是 v5 那次'
+        '事故的原形态，第二次）',
+        PN,
+        '_STACK_SCHEMA_VERSION = 6',
+        '_STACK_SCHEMA_VERSION = 5',
+        ['test_stack_schema_version_paired_with_cached_payload'],
+    ),
+    (
+        '#19：往目录表塞条目而摘要守卫不响（证明摘要**盖得住**新扩的三张表；顺带证明 '
+        '`wwwroot` 这类非模板目录不该进表）',
+        SD,
+        '    "webapp",\n',
+        '    "webapp",\n    "wwwroot",\n',
+        ['test_stack_schema_version_paired_with_cached_payload',
+         'test_jsf_xhtml_in_war_root_is_only_reachable_via_the_webapp_dir_name'],
     ),
 ]
 

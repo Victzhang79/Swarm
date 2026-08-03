@@ -903,7 +903,12 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
 #     `.get(...)` 读，缺键得 None＝假值 ⇒ 那条 fail-closed 分支永不进 ⇒ Django/Flask/Gin/
 #     Laravel 的服务端渲染继续判 frontend_kind="none"，"禁止产 .vue" 的约定继续发不出去。
 #     ⇒ 扩事实表**改变了已缓存项目的正确答案**，这类改动必须 bump，不只是"加字段才 bump"。
-_STACK_SCHEMA_VERSION = 5
+# v6: #18 判据计数范围收敛（全仓任意 .html → 模板目录作用域）+ #20 四栈扩表（JSF/WebForms/
+#     Magento/Grails）。★这次同样是"改变了已缓存项目的正确答案"那一类★：
+#     #18 让 DRF 纯 API 工程从 server-template/0.95（错）翻回 none；#20 让四栈从 none/0.75
+#     （错）翻成 server-template。已建档项目缓存里存的正是那批**旧的错答案**，不 bump ⇒ 命中
+#     缓存早返 ⇒ 治法对所有已建档项目一行不生效（同 v5 的 CRITICAL-2 形态，第二次）。
+_STACK_SCHEMA_VERSION = 6
 
 
 async def detect_stack(state: BrainState) -> dict:

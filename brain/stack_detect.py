@@ -114,6 +114,10 @@ _TEMPLATE_EXT_ENGINE = {
     ".slim": "Slim",
     # ── php ──
     ".twig": "Twig",
+    # Magento 2 / Zend / 裸 PHP 的模板后缀（Magento：`view/frontend/templates/**/*.phtml`）。
+    # 与 `.php` 刻意分档：`.php` 是源码后缀（收进本表会把纯后端 PHP 工程判成有前端模板），
+    # `.phtml` 按约定**只**用于 PHP+HTML 渲染模板，无歧义。
+    ".phtml": "PHP template",
     # ── python ──
     ".j2": "Jinja2",
     ".jinja": "Jinja2",
@@ -125,6 +129,19 @@ _TEMPLATE_EXT_ENGINE = {
     # ── dotnet ──
     ".cshtml": "Razor",
     ".razor": "Razor",
+    # Razor 的 VB.NET 方言，与 .cshtml 同族（MS 文档："create a web page with a .vbhtml
+    # filename extension"）。两者是**不同语言**下的同一引擎，缺了它 VB 工程整栈认不出。
+    ".vbhtml": "Razor",
+    # ASP.NET Web Forms。★这是 #20 唯一必须靠"一档表"救的栈★ 二档（目录名+网页后缀）对它
+    # 结构性失效：WebForms 没有模板目录惯例，页面就散在工程根和任意业务目录下
+    # （`Account/Login.aspx`），没有任何目录名可作证据。
+    # ★刻意不登记 `.ascx`/`.master`★ 两者都**不能被单独请求**，必须挂在 `.aspx` 或母版页上
+    # （MS：user control "cannot use by itself, it must be placed onto an aspx or Master
+    # page"）⇒ 有它们必有 `.aspx` ⇒ 登记进来无法构造出"有它/没它"结论不同的夹具＝不可证伪
+    # 条目。同 `_TEMPLATE_COMPOUND_SUFFIX` 里不登记 `.html.erb` 的判据。
+    ".aspx": "ASP.NET Web Forms",
+    # ── groovy ──（Grails：grails-app/views/xxx.gsp）
+    ".gsp": "GSP",
     # ── elixir ──
     ".eex": "EEx",
     ".heex": "HEEx",
@@ -167,6 +184,20 @@ _SERVER_TEMPLATE_DEP = {
     # `jstl` 顺带命中它；改成词边界后必须**单独登记**，否则这类工程从"认得"退成"认不得"
     # ＝误杀方向的静默回归。
     "jstlel": "JSP/JSTL",
+    # ★JSF/Facelets★ 模板后缀是 `.xhtml`，靠后缀永远认不出（静态 XHTML 同后缀）——与
+    # Django/Askama 同性质，只能靠依赖坐标佐证。四条都是**实测存在**的真实坐标，且互不支配：
+    #   myfaces        → org.apache.myfaces.core:myfaces-api / myfaces-impl（一条盖两个）
+    #   jakarta.faces  → Jakarta EE 9+ 时代坐标
+    #   javax.faces    → Java EE 时代坐标（org.glassfish:javax.faces，Mojarra）
+    #   primefaces     → org.primefaces:primefaces。★不可省★ 跑在 Jakarta EE 容器上的
+    #     PrimeFaces 工程 pom 里只有 `jakarta.jakartaee-web-api`(provided) + `primefaces`，
+    #     那串**不含** `jakarta.faces` ⇒ 少了这条该工程无 marker 可命中。
+    # 刻意不登记 `jsf-impl`：有 impl 必有 api（api 常单独 provided 出现，反向不成立）＝被支配。
+    "myfaces": "JSF (Facelets)",
+    "jakarta.faces": "JSF (Facelets)",
+    "javax.faces": "JSF (Facelets)",
+    "jsf-api": "JSF (Facelets)",
+    "primefaces": "JSF (Facelets)",
     # ── python ──（Django 内置模板引擎；Jinja2 被 Flask/FastAPI 共用）
     "django": "Django Template",
     "jinja2": "Jinja2",
@@ -219,6 +250,13 @@ def _template_engine_of(filename: str) -> str | None:
 # 绝不用它单独判 server-template（目录名是弱证据，判形态仍需后缀或依赖坐标硬证据）。
 _TEMPLATE_DIR_NAMES = frozenset({
     "templates", "template", "views", "view", "layouts", "partials", "_layouts", "pages",
+    # JVM war 布局的 web 根（Maven/Gradle 皆为 `src/main/webapp`）。JSF 的 Facelets 默认就
+    # 扫这里（"scanned in the web root folder of the WAR"），页面直接躺在根下、不进任何
+    # templates 子目录 ⇒ 缺这一条时 JSF 工程的 `.xhtml` 一个都不入账。
+    # ★刻意不登记 `web-inf`★ 源码树里 `WEB-INF` 恒在 `src/main/webapp` **之下**（两大构建
+    # 工具的 war 布局都是），已被 webapp 支配；仓根出现 WEB-INF 的只有 exploded war＝构建
+    # 产物，而 target/build 已在 _NOISE_DIRS 里剪掉 ⇒ 造不出区分夹具＝不可证伪条目。
+    "webapp",
 })
 # 网页形态后缀：出现在模板目录下且引擎认不出来 ⇒ 触发"认不得"信号。刻意只收**页面**后缀，
 # 不收 .css/.js（静态资源目录也叫 views 的项目存在，收进来会把噪声当证据）。
@@ -771,8 +809,22 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     has_spa = bool(spa_total or has_angular or has_next or (has_vite and "vue" in all_manifest_text))
     # 真服务端模板：有模板专用扩展名(jsp/ftl/vm...) 或 (templates 下的 .html + 后端模板依赖)
     real_server_tmpl = sum(template_engine_hits.values())
-    if server_tmpl_dep and ext_counts.get(".html", 0) > 0:
-        real_server_tmpl += ext_counts.get(".html", 0)
+    # ★#18（P-C3 复核 CRITICAL-1）：注释与代码曾经不符★ 上一行注释写的是"**templates 下的**
+    # .html"，而实现用 `ext_counts.get(".html")`＝**全仓任意** .html。后果是把正确答案翻成
+    # 高置信错答案（回归）：DRF 纯 API 工程只要有一个 `docs/index.html`（甚至
+    # `coverage/index.html`、`static/dist/report.html` 这类构建产物/覆盖率报告）就被判
+    # frontend_kind="server-template"、conf=0.95、needs_adj=False ⇒ 连 LLM 兜底裁决都不触发。
+    # ★词边界治不了这个★ `\bdjango\b` 确实拒了单独出现的 `djangorestframework`（实测），
+    # 但 DRF 工程**必然**同时含真的 `Django==5.0.6`，marker 由那条**合法坐标**命中——
+    # 问题从来不在 marker，在计数范围。改用模板目录作用域的计数（与注释同源）。
+    #
+    # ★为什么加的是 unengined 而不是"模板目录下全部网页文件"★ 上一行 `sum(hits)` 已经把
+    # **引擎认得的**文件全数在内，再加一个"不论认不认得"的计数就是同一批文件数两遍
+    # （唯一同属两表的形态是 `.blade.php`）。且"目录下有网页文件但 hits==0"必然意味着
+    # 那些文件引擎都认不出来 ⇒ 两个口径在 `>0` 上恒等，多出来的计数器不可证伪
+    # （[[swarm-redundant-defense-unfalsifiable]]）。故直接复用 unengined 计数。
+    if server_tmpl_dep and unengined_tmpl_dir_files > 0:
+        real_server_tmpl += unengined_tmpl_dir_files
     has_server_tmpl = real_server_tmpl > 0
 
     frontend = ""

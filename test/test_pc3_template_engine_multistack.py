@@ -120,6 +120,30 @@ def test_blade_compound_suffix_is_recognized(tmp_path):
     assert sd._template_engine_of("HomeController.php") is None
 
 
+def test_blade_is_recognized_without_a_laravel_framework_marker(tmp_path):
+    """★复合后缀档的接线（不是"表里有这条"）★ 上一条直接调 `_template_engine_of`；这条走完整
+    `detect()`，且刻意**拿掉** `laravel/framework` marker。
+
+    为什么必须拿掉：#18 把 addend 接通后出现了通往同一结论的**第二条路径**——`.blade.php`
+    经 splitext 退成 `.php`，而 `.php` 在 `_WEBPAGE_EXTS`、文件又在 `resources/views/` 下，
+    只要 marker 在，即使复合后缀表整块死掉也照样判出 `server-template（Blade）`。实测：
+    `_FIXTURES["laravel"]` 那条参数化测试因此对"复合表整块失效"归零区分力（harness 逮到）。
+
+    夹具形状是真实的：Laravel **扩展包/模块**仓（而非应用本体）依赖 `illuminate/support`
+    而不是 `laravel/framework`，却同样发 blade 视图。此时复合后缀是**唯一**证据。
+    """
+    prof = detect(_mk(tmp_path, {
+        "composer.json": json.dumps({"name": "acme/blog",
+                                     "require": {"illuminate/support": "^10.0"}}),
+        "src/BlogServiceProvider.php": "<?php class BlogServiceProvider {}",
+        "resources/views/index.blade.php": "@extends('layouts.app')",
+    }))
+    assert prof["frontend_kind"] == "server-template", (
+        f"没有 laravel/framework marker 时 blade 认不出来了（{prof['frontend']}）"
+        "⇒ 复合后缀档没被接上，或只在有 marker 时才生效")
+    assert "Blade" in prof["frontend"]
+
+
 @pytest.mark.parametrize("name,engine", [
     # ★这些多段后缀**不经**复合表★ splitext 取最后一段就已经是模板后缀，主表直接认得。
     # 把它们登记进复合表是冗余条目（删掉没有任何测试会红），故刻意不登记。
@@ -169,14 +193,20 @@ def test_word_boundary_is_actually_wired_into_detection(tmp_path):
 
     突变实验实证：把调用点从 `_SERVER_TEMPLATE_DEP_RE[dep].search(...)` 改回
     `dep in all_manifest_text`，上一条照样绿——它测的是表，不是接线。
-    这里走完整 `detect()`：清单里只有 `iterare`（含子串 `tera`）等无关包 + 一个静态 `.html`，
+    这里走完整 `detect()`：清单里只有 `iterare`（含子串 `tera`）等无关包 + 一个 `.html`，
     裸子串口径会把它判成服务端模板（Tera 引擎），词边界口径不会。
+
+    ★`.html` 必须放在模板目录下（#18 之后）★ 首版放在 `public/report.html`。#18 把判据的
+    计数范围从"全仓任意 .html"收敛到"模板目录作用域"以后，`public/` 下的文件**不再是证据**
+    ⇒ marker 误不误命中都判 `none` ⇒ 这条测试对裸子串突变归零区分力（改共享代码必复跑
+    sibling harness，[[swarm-rerun-sibling-harnesses]]，本次由 harness 逮到）。
+    放进 `views/` 后，marker 成了裁决的**唯一**剩余合取项，接线才重新可证伪。
     """
     prof = detect(_mk(tmp_path, {
         "package.json": json.dumps({"name": "ui", "dependencies": {
             "iterare": "^1.2.1", "literal-parser": "^1.0.0", "slimmer": "^1.0.0"}}),
         "src/index.js": "console.log(1)\n",
-        "public/report.html": "<html>static</html>",
+        "views/report.html": "<html>static</html>",
     }))
     assert "服务端模板" not in prof["frontend"], \
         f"无关包被当成模板引擎依赖（裸子串口径的病）: {prof['frontend']}"
@@ -435,3 +465,261 @@ def test_template_dir_names_are_stack_neutral():
     for name in sd._TEMPLATE_DIR_NAMES:
         assert "/" not in name and os.sep not in name, f"{name!r} 是路径片段而非目录名"
         assert name == name.lower(), f"{name!r} 必须小写（比较前已 lower）"
+
+
+# ── ③ #18：判据的**计数范围**（注释与实现同源）─────────────────────────────────
+_REQ_DRF = "Django==5.0.6\ndjangorestframework==3.15.2\n"
+
+
+@pytest.mark.parametrize("stray", [
+    "docs/index.html",            # 手写文档站
+    "coverage/index.html",        # 覆盖率报告
+    "static/dist/report.html",    # 前端构建产物
+    "htmlcov/index.html",         # pytest-cov 默认输出目录
+])
+def test_api_only_project_is_not_flipped_by_a_stray_html(tmp_path, stray):
+    """★#18 病灶本体★ DRF 纯 API 工程只要仓里**任意**位置有一个 `.html`，判据就把
+    **正确答案** `none` 翻成 `server-template` + conf=0.95 + needs_adj=False。
+
+    根因是计数范围：`:772` 的注释写"**templates 下的** .html"，实现却用
+    `ext_counts[".html"]`＝全仓任意 .html。四个落点都是真实工程里必然出现的产物。
+
+    ★为什么这条比"词边界"更根本★ `\\bdjango\\b` 确实拒得了 `djangorestframework`
+    （见 test_word_boundary_is_actually_wired_into_detection），但 DRF 工程**必然**同时
+    声明真的 `Django==5.0.6` ⇒ marker 由那条**合法坐标**命中 ⇒ 收窄 marker 治不了它。
+    """
+    prof = detect(_mk(tmp_path, {
+        "requirements.txt": _REQ_DRF,
+        "api/views.py": "from rest_framework import viewsets\n",
+        stray: "<html>not a template</html>",
+    }))
+    assert prof["frontend_kind"] == "none", (
+        f"{stray} 把纯 API 工程翻成了 {prof['frontend_kind']}：{prof['frontend']}")
+    assert prof["signals"]["tmpl_engine_unrecognized"] is False
+    assert ".vue" not in format_stack_for_prompt(prof), \
+        "纯 API 工程收到了「禁止产 .vue」的服务端模板硬约束"
+
+
+def test_moving_the_html_into_a_template_dir_is_what_flips_the_verdict(tmp_path):
+    """★判据唯一性★ 同一份工程、同一个文件名、**只改所在目录**：`docs/` 下不算证据，
+    `templates/` 下算。
+
+    这条把"计数范围"这一个变量单独隔出来——只断"DRF 判 none"会让把整条 addend 删掉的突变
+    照样绿（删了以后 Django 模板工程也判 none，但那条命题在另一个测试里）。两个方向必须
+    由**同一对夹具**的差分来锁，否则中间那档（范围改成别的东西）漏得过去。
+    """
+    common = {"requirements.txt": "Django==5.0.6\n", "app/views.py": "from django.db import x\n"}
+    outside = detect(_mk(tmp_path / "a", {**common, "docs/page.html": "<html>x</html>"}))
+    inside = detect(_mk(tmp_path / "b", {**common, "templates/page.html": "<html>x</html>"}))
+    assert outside["frontend_kind"] == "none", "模板目录外的 .html 被当成了模板证据"
+    assert inside["frontend_kind"] == "server-template", "模板目录内的 .html 没被当成证据"
+    assert "Django" in inside["frontend"]
+
+
+def test_template_files_are_not_counted_twice(tmp_path):
+    """★冗余计数★ `real_server_tmpl` 已含"引擎认得的文件数"，addend 只能加**认不得的**那批。
+
+    Laravel 的 `.blade.php` 同时属于两张表（`_TEMPLATE_COMPOUND_SUFFIX` 认得它，`.php` 又在
+    `_WEBPAGE_EXTS` 里）——若 addend 用"模板目录下全部网页文件"，这 2 个文件会被数成 4。
+    首版实现正是那样（我自己引入的），这条测试是它的判据。
+    """
+    prof = detect(_laravel(tmp_path))
+    assert prof["frontend_kind"] == "server-template"
+    assert prof["signals"]["server_template_files"] == 2, (
+        "服务端模板文件数与真实文件数不符 ⇒ 同一批文件被两个口径各数了一遍")
+
+
+# ── ④ #20：四个**已存在**主流栈的假答案（兜底缺口）──────────────────────────────
+def _pom_war(dep_xml: str) -> str:
+    return (f"<project><modelVersion>4.0.0</modelVersion><groupId>com.acme</groupId>"
+            f"<artifactId>web</artifactId><version>1.0</version><packaging>war</packaging>"
+            f"<dependencies>{dep_xml}</dependencies></project>")
+
+
+def _dep(group: str, artifact: str) -> str:
+    return f"<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId></dependency>"
+
+
+def _jsf(tmp_path):
+    """JSF/PrimeFaces：Facelets 默认扫 **war 根**（`src/main/webapp`），页面不进任何
+    `templates/` 子目录；`.xhtml` 靠后缀永远认不出（静态 XHTML 同后缀）。"""
+    return _mk(tmp_path, {
+        "pom.xml": _pom_war(_dep("jakarta.platform", "jakarta.jakartaee-web-api")
+                            + _dep("org.primefaces", "primefaces")),
+        "src/main/webapp/index.xhtml": "<ui:composition xmlns:ui='jakarta.faces.facelets'/>",
+        "src/main/webapp/WEB-INF/web.xml": "<web-app/>",
+        "src/main/java/com/acme/UserBean.java": "package com.acme; public class UserBean {}",
+    })
+
+
+def _webforms(tmp_path):
+    """ASP.NET Web Forms：页面散在工程根与任意业务目录，**没有**模板目录惯例。"""
+    return _mk(tmp_path, {
+        "App.csproj": "<Project><PropertyGroup><TargetFramework>net48</TargetFramework>"
+                      "</PropertyGroup></Project>",
+        "Default.aspx": "<%@ Page Language='C#' %>",
+        "Account/Login.aspx": "<%@ Page Language='C#' %>",
+        "Account/Login.aspx.cs": "public partial class Login {}",
+    })
+
+
+def _magento(tmp_path):
+    """Magento 2：`<Module>/view/frontend/templates/**/*.phtml`。"""
+    return _mk(tmp_path, {
+        "composer.json": json.dumps({"require": {"magento/product-community-edition": "2.4.6"}}),
+        "app/code/Acme/Blog/registration.php": "<?php ?>",
+        "app/code/Acme/Blog/view/frontend/templates/post/list.phtml": "<?php echo $x; ?>",
+    })
+
+
+def _grails(tmp_path):
+    """Grails：`grails-app/views/**/*.gsp`（Grails 3+ 用 Gradle）。"""
+    return _mk(tmp_path, {
+        "build.gradle": "plugins { id 'org.grails.grails-web' }\n",
+        "grails-app/views/book/list.gsp": "<g:each in='${books}'>${it}</g:each>",
+        "grails-app/controllers/BookController.groovy": "class BookController {}",
+    })
+
+
+_NEW_FIXTURES = {"jsf": _jsf, "webforms": _webforms, "magento": _magento, "grails": _grails}
+
+
+@pytest.mark.parametrize("stack,engine", [
+    ("jsf", "JSF"), ("webforms", "ASP.NET Web Forms"),
+    ("magento", "PHP template"), ("grails", "GSP"),
+])
+def test_four_existing_stacks_no_longer_get_a_confident_wrong_answer(tmp_path, stack, engine):
+    """★兜底缺口的实证★ 这四个栈**在治法上线前就已经存在**，却全部拿 `none` + conf=0.75
+    + needs_adj=False ＝ 高置信错答案（连 LLM 兜底都不触发）。
+
+    为什么它们能一起漏掉：P-C3 当初为"未收录的下一个栈"造的兜底网，和主判据表是我**同一时刻
+    凭印象列的**两张表 ⇒ 缺口重合（[[swarm-fallback-must-not-share-the-gap]]）。
+    四栈的缺口各自落在**不同**的表上，所以"扩后缀 + 扩目录"这句话只对了一半：
+      Grails  `grails-app/views/*.gsp`     → `views` 早在目录表里 ⇒ 只缺后缀
+      Magento `view/frontend/templates/*.phtml` → `templates` 早在表里 ⇒ 只缺后缀
+      JSF     `src/main/webapp/*.xhtml`    → `.xhtml` 早在后缀表里 ⇒ 只缺目录 + dep marker
+      WebForms `Account/Login.aspx`        → **目录法对它结构性失效**（无模板目录惯例）
+    """
+    prof = detect(_NEW_FIXTURES[stack](tmp_path))
+    assert prof["frontend_kind"] == "server-template", (
+        f"{stack} 仍判 {prof['frontend_kind']}/conf={prof['confidence']}："
+        f"{prof['frontend']}")
+    assert engine.lower() in prof["frontend"].lower(), prof["frontend"]
+
+
+@pytest.mark.parametrize("stack", list(_NEW_FIXTURES))
+def test_four_existing_stacks_get_the_no_spa_instruction(tmp_path, stack):
+    """★真后果★ 与五栈那条同源：认出形态的**目的**是发出"禁止产独立 SPA"的硬约束。
+    只断 `frontend_kind` 会漏掉"分类对了但指令没发"。"""
+    txt = format_stack_for_prompt(detect(_NEW_FIXTURES[stack](tmp_path)))
+    assert "服务端模板" in txt
+    assert ".vue" in txt and "禁止" in txt, "缺少禁止产独立 SPA 工程的硬约束"
+
+
+@pytest.mark.parametrize("stack", list(_NEW_FIXTURES))
+def test_four_existing_stacks_never_set_unrecognized_flag(tmp_path, stack):
+    """认出引擎的工程绝不该同时带"认不得"键（两档互斥，粘滞信号无信息量）。"""
+    prof = detect(_NEW_FIXTURES[stack](tmp_path))
+    assert prof["signals"]["tmpl_engine_unrecognized"] is False
+
+
+def test_webforms_is_recognized_with_zero_template_dir_convention(tmp_path):
+    """★这是 `.aspx` 必须进"一档表"而不是 `_WEBPAGE_EXTS` 的判据★
+
+    二档（目录名 + 网页后缀 + 依赖 marker）对 WebForms **结构性失效**：它没有模板目录惯例，
+    页面就躺在工程根和任意业务目录下。这条夹具里一个模板目录名都没有——若把 `.aspx` 放进
+    二档，它必然判不出来。
+    """
+    prof = detect(_webforms(tmp_path))
+    paths = {"Default.aspx", "Account/Login.aspx"}
+    assert not any(seg in sd._TEMPLATE_DIR_NAMES
+                   for p in paths for seg in p.lower().split("/")[:-1]), \
+        "夹具自身失去了「零模板目录」这个前提，本条测试不再测它要测的东西"
+    assert prof["frontend_kind"] == "server-template"
+
+
+def test_webforms_coverage_does_not_depend_on_ascx_or_master(tmp_path):
+    """★刻意不登记 `.ascx`/`.master` 的判据★ 两者都**不能被单独请求**（MS：user control
+    "must be placed onto an aspx or Master page"）⇒ 有它们必有 `.aspx`。
+
+    所以带全套 `.aspx` + `.ascx` + `.master` 的工程，判定只靠 `.aspx` 就已经成立——那两个
+    后缀登记进表里造不出"有它/没它结论不同"的夹具＝不可证伪条目
+    （同 `_TEMPLATE_COMPOUND_SUFFIX` 不登记 `.html.erb` 的判据）。
+    """
+    prof = detect(_mk(tmp_path, {
+        "App.csproj": "<Project><PropertyGroup/></Project>",
+        "Default.aspx": "<%@ Page %>",
+        "Site.master": "<%@ Master %>",
+        "Controls/Nav.ascx": "<%@ Control %>",
+    }))
+    assert prof["frontend_kind"] == "server-template"
+    assert prof["signals"]["server_template_files"] == 1, (
+        "判定应只由 .aspx 贡献；若这里 >1 说明 .ascx/.master 也被登记了 ⇒ 那两条现在有了"
+        "行为，需各自补一条能证伪它的测试，而不是靠本条顺带背书")
+
+
+def test_jsf_xhtml_in_war_root_is_only_reachable_via_the_webapp_dir_name(tmp_path):
+    """★`webapp` 这一表项的可证伪性★ 同一份 pom（primefaces 在）、同一个 `.xhtml`，
+    **只改所在目录**：war 根 `src/main/webapp/` 下算证据，`src/main/wwwroot/` 下不算。
+
+    删掉 `webapp` 表项 ⇒ 第一个断言红。这条也顺带说明为什么**不**登记 `web-inf`：源码树里
+    `WEB-INF` 恒在 `src/main/webapp` 之下（Maven/Gradle war 布局皆然）＝已被 webapp 支配，
+    仓根出现 WEB-INF 的只有 exploded war 而 `target/build` 已在 `_NOISE_DIRS` 里剪掉。
+    """
+    pom = _pom_war(_dep("org.primefaces", "primefaces"))
+    in_root = detect(_mk(tmp_path / "a",
+                         {"pom.xml": pom, "src/main/webapp/index.xhtml": "<ui:composition/>"}))
+    elsewhere = detect(_mk(tmp_path / "b",
+                           {"pom.xml": pom, "src/main/wwwroot/index.xhtml": "<ui:composition/>"}))
+    assert in_root["frontend_kind"] == "server-template", "war 根下的 .xhtml 没被当成证据"
+    assert elsewhere["frontend_kind"] == "none", \
+        "非模板目录下的 .xhtml 也被当成证据 ⇒ 目录作用域失效"
+
+
+@pytest.mark.parametrize("group,artifact", [
+    # 五条都是**实测存在**的真实坐标，且互不支配——每条单独出现时都必须命中。
+    ("org.apache.myfaces.core", "myfaces-api"),      # MyFaces（一条盖 api/impl）
+    ("jakarta.faces", "jakarta.faces-api"),          # Jakarta EE 9+
+    ("org.glassfish", "javax.faces"),                # Java EE 时代（Mojarra）
+    ("com.sun.faces", "jsf-api"),                    # 更早的 Mojarra 坐标
+    ("org.primefaces", "primefaces"),                # ★不可省：见下方 docstring
+])
+def test_each_jsf_marker_is_independently_load_bearing(tmp_path, group, artifact):
+    """★"枚举穷举"必须逐条可证伪★ 声称"五条互不支配"，就得每条单独出现时都能命中——否则
+    被支配的那条是不可证伪的冗余项（[[swarm-enumeration-needs-authoritative-source]]）。
+
+    `primefaces` 是最容易被误删的一条：跑在 Jakarta EE 容器上的 PrimeFaces 工程，pom 里只有
+    `jakarta.jakartaee-web-api`(provided) + `primefaces`，前者的字符串**不含** `jakarta.faces`
+    ⇒ 少了 `primefaces` 这条，该工程一个 marker 都命中不了。见 `_jsf` 夹具（正是这个形状）。
+    """
+    prof = detect(_mk(tmp_path, {
+        "pom.xml": _pom_war(_dep(group, artifact)),
+        "src/main/webapp/index.xhtml": "<ui:composition/>",
+    }))
+    assert prof["frontend_kind"] == "server-template", \
+        f"{group}:{artifact} 单独出现时未被认出 ⇒ 该 marker 缺位或被别的条目支配"
+    assert "JSF" in prof["frontend"]
+
+
+def test_phtml_is_a_template_but_plain_php_source_is_not(tmp_path):
+    """★分档★ `.phtml` 按约定**只**用于 PHP+HTML 渲染模板（Magento/Zend），无歧义 ⇒ 一档表。
+    `.php` 是源码后缀，收进一档表会把纯后端 PHP 工程判成有前端模板。"""
+    assert sd._template_engine_of("list.phtml") == "PHP template"
+    assert sd._template_engine_of("HomeController.php") is None
+    # 纯后端 PHP（无 .phtml、无 blade）不该被判成服务端模板
+    prof = detect(_mk(tmp_path, {
+        "composer.json": json.dumps({"require": {"slim/slim": "^4.0"}}),
+        "src/Controller/UserController.php": "<?php class UserController {}",
+    }))
+    assert prof["frontend_kind"] == "none"
+
+
+@pytest.mark.parametrize("name,engine", [
+    ("Index.vbhtml", "Razor"),        # Razor 的 VB.NET 方言，与已有 .cshtml 同族
+    ("Default.aspx", "ASP.NET Web Forms"),
+    ("list.gsp", "GSP"),
+    ("list.phtml", "PHP template"),
+])
+def test_newly_registered_suffixes_are_in_the_first_tier_table(name, engine):
+    """一档表答"这个后缀是哪种模板"——四个新后缀都无歧义（不可能是静态资源），故进一档。"""
+    assert sd._template_engine_of(name) == engine

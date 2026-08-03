@@ -258,7 +258,10 @@ def test_stack_schema_version_paired_with_cached_payload():
     from swarm.brain.planning_nodes import _STACK_SCHEMA_VERSION
 
     digest = _stack_cache_payload_digest()
-    assert (_STACK_SCHEMA_VERSION, digest) == (5, "a320efc720891a39"), (
+    # v5→v6：#18 判据计数范围收敛（`verdict[drf_api_only]` 从 server-template/0.95 翻回 none）
+    # + #20 四栈扩表（_TEMPLATE_EXT_ENGINE/_SERVER_TEMPLATE_DEP/_TEMPLATE_DIR_NAMES 三张表）。
+    # 摘要跨 hash 种子稳定（实测 PYTHONHASHSEED=0/1/12345/random 四轮同值）。
+    assert (_STACK_SCHEMA_VERSION, digest) == (6, "5363ff4066986248"), (
         f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"
