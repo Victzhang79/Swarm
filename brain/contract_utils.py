@@ -2071,7 +2071,8 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
     seen: set[str] = set()
     if project_path:
         try:
-            # P-C1：磁盘探测走 spec 的规范大小写（`Gemfile`/`Pipfile` 小写化探不到）
+            # P-C1：磁盘探测走 spec 的规范大小写（`Cargo.toml`/`Pipfile` 小写化探不到——
+            # F5 更正：原举例 Gemfile 属 ruby，不在 STACK_SPEC，不经过本条路径）
             for name, stk in root_manifests_by_stack():
                 if os.path.exists(os.path.join(project_path, name)):
                     seen.add(stk)
@@ -2121,6 +2122,11 @@ def _detect_build_stack(plan, project_path: str | None, file_plan: list | None =
         # 机读键 `stack_unknown_cause=ambiguous_mixed`（**本条独占**）：外层 WARNING 为并列
         # 两因，散文里也会出现"歧义混栈"四字 ⇒ 按散文子串分不开两个信号（自查时被反向锁当场
         # 抓到：那正是"假探针宽度"——子串匹配把"是哪条信号"这一维抹掉）。键只在这里出现。
+        # ★P-C1 复核 F4 如实标注★ 本键的消费者是**人工 grep**（外层 WARNING 散文直接引用
+        # 键名指引判读），**无机读统计消费者**——"两种 unknown 各占多少"没有任何机读面。
+        # 刻意不落 finish_out 账：成因传递要改 `_detect_build_stack` 的返回值签名并波及全部
+        # 调用点，而收益只是观测性统计（外层 WARNING 已在，血规 3 已兑现），代价不成比例。
+        # 若未来需要机读统计，正确做法是返回值带成因（str → tuple），别加全局状态（粘滞）。
         logger.info("[SCAFFOLD-INJECT] G9 stack_unknown_cause=ambiguous_mixed：异栈清单证据 %s "
                     "与 JVM 源码同时存在 → 保守回退 Maven（防后端模块静默丢 pom，round62 家族级回归）",
                     sorted(seen))

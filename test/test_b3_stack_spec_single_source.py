@@ -564,8 +564,10 @@ def test_every_spec_root_manifest_is_recognized_on_disk(tmp_path, manifest, expe
 
     逐条 parametrize 而非集合断言＝每个清单单独承重（血规：夹具的多余成员会替被测代码背书；
     一条 `for` 里任一命中即过的写法会让新漏的清单被其他清单兜住）。
-    `Gemfile`/`Pipfile` 是**大写**的 ⇒ 本测试同时锁住"磁盘探测走规范大小写"这一档
+    `Cargo.toml`/`Pipfile` 是**大写**的 ⇒ 本测试同时锁住"磁盘探测走规范大小写"这一档
     （小写化会让 Linux 上 `os.path.exists` 探不到，见 `root_manifests_by_stack` docstring）。
+    ★F5 更正★ 原举例 `Gemfile` 不在 STACK_SPEC（ruby 是刻意的未收录栈）——
+    本档真承重的大写清单只有 `Cargo.toml`/`Pipfile`。
     """
     (tmp_path / manifest).write_text("", encoding="utf-8")
 
@@ -602,7 +604,8 @@ def test_root_manifests_by_stack_preserves_canonical_case():
     ⇒ 那种夹具在本机对这一维**零区分力**，只在 Linux（生产/CI）才承重。测试的承重能力
     随平台漂移＝本地永远看不出，是最坏的假绿形状。
     故把不变量提到**平台无关**的层：本视图是纯函数，"不小写化"是它自己的属性。
-    真实后果（Linux 上）：小写化 ⇒ `Gemfile`/`Pipfile` 恒探不到 ⇒ 判 unknown ⇒ 塞 pom。
+    真实后果（Linux 上）：小写化 ⇒ `Cargo.toml`/`Pipfile` 恒探不到 ⇒ 判 unknown ⇒ 塞 pom。
+    （★F5 更正★ 原举例 `Gemfile` 不在 STACK_SPEC——ruby 是刻意的未收录栈补集。）
     """
     names = [n for n, _ in root_manifests_by_stack()]
     _mixed = [n for n in names if n != n.lower()]
@@ -636,22 +639,30 @@ def test_plan_path_root_only_manifest_is_python_evidence(manifest):
 
 
 def test_pc1_bare_pom_gate_recognizes_python_baseline(tmp_path):
-    """★P-C1 第三个调用点★ `plan_finisher` 的 R67L-B3⑤ 裸奔闸也必须认全 python 清单。
+    """★P-C1 复核 F2 升级（真 fail-open）后反转★ 裸奔闸对**任何**基线的 create-pom
+    零 verify 子任务都注入栈无关断言 ①②。
 
-    这个消费者是**数调用点时逮到的**——它直接 `import _MANIFEST_TO_STACK` 自己探磁盘，
-    不走 `_detect_build_stack`，只看 `_detect_build_stack` 会整个漏掉它（血规 10 第一条：
-    加机制先数调用点，一个不落地列出来）。
-
-    行为：基线是纯 pip python 仓 + plan 里有 create-pom（LLM 幻觉）⇒ 认出 `{'python'}`
-    且无 maven ⇒ 闸**跳过注入**（返回 {}），把幻觉留给 VALIDATE 权威打回。治前判不出栈
-    ⇒ `_bstk=set()` ⇒ 按 unknown 保守放行 ⇒ 给幻觉 pom 注入裸奔断言＝为错产物背书。
+    治前本测试断 `== {}`（跳过）——它锁死了"跳过"这个行为本身，从不问下游有没有人接
+    （F2 实证：VALIDATE 没有那条闸，L1 对零 verify 只打 needs_review 不阻断 ⇒ 跳过＝
+    零确定性验收直送 worker＝st-3-1 原病复活）。
+    反转后的不变量：① `test -f` 与 ② `! grep '<version>${'` 是**栈无关**断言
+    （产物存在性 + 对所创 pom 自身的字面量检查），对合法多语言新模块
+    （python 根 + service-java/pom.xml）同样无害且有益 ⇒ 无条件注入；
+    ③（parent 版本对账）栈相关，靠 `_root_gav` 自门控——纯 python 基线无根 pom ⇒
+    自动省略（本夹具断言这一点：注入的命令里没有 parent 对账）。
     """
     from swarm.brain.plan_finisher import ensure_pom_create_min_acceptance as _gate
 
     (tmp_path / "requirements.txt").write_text("django==5.0\n", encoding="utf-8")
     plan = _plan(_st("st-1", create=["reporting/pom.xml"]))
-    assert _gate(plan, str(tmp_path)) == {}, \
-        "纯 python 基线仍给幻觉 pom 注入裸奔断言（P-C1 第三调用点未接）"
+    injected = _gate(plan, str(tmp_path))
+    assert set(injected) == {"st-1"}, \
+        "非 Maven 基线的 create-pom 零 verify 直送 worker＝st-3-1 原病复活（F2）"
+    cmds = injected["st-1"]
+    assert any(c.startswith("test -f reporting/pom.xml") for c in cmds), "①产物存在性未注入"
+    assert any("<version>${" in c for c in cmds), "②字面量检查未注入"
+    assert not any("<parent>" in c for c in cmds), \
+        "纯 python 基线无根 pom ⇒ ③必须自门控省略（注入即冤杀，终闸复核 M-1）"
 
 
 def test_unknown_stack_fallback_is_loud(tmp_path, caplog):

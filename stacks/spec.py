@@ -253,7 +253,10 @@ def root_manifests_by_stack() -> tuple[tuple[str, str], ...]:
     **后果不同**，别互换：本档判错 = 栈识别错（P-C1 病灶：判 unknown → 兜底伪造 Maven）。
 
     ★为什么返回规范大小写★ 唯一消费场景是 `os.path.exists` 探测，而 Linux 大小写敏感，
-    `Gemfile`/`Pipfile` 小写化后探不到。plan 路径匹配请走 `stack_of_manifest`（内部
+    `Cargo.toml`/`Pipfile` 小写化后探不到（★F5 更正★：本档真正承重的大写清单只有这两条；
+    原举例 `Gemfile` 属 ruby，**不在** STACK_SPEC——在 `integration_review.
+    _UNSUPPORTED_STACK_MANIFESTS`＝刻意的未收录栈补集，它不经过本条路径）。
+    plan 路径匹配请走 `stack_of_manifest`（内部
     `_plan_basename` 小写化，因为"LLM 写的路径大小写不可信"）——两档口径刻意不同。
 
     ★为什么是函数不是模块常量★ 与 `is_root_aggregate_manifest` 同款理由（复核 F-7）：

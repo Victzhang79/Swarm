@@ -21,7 +21,8 @@ TESTS = ["test/test_b3_stack_spec_single_source.py",
          "test/test_scaffold_npm_go_driver_p2.py",
          "test/test_b0_non_maven_cassette_replay.py",
          "test/test_r39_build_scaffold_inject.py",
-         "test/test_n2b_n3_go_prefix_and_rule5_stack.py"]
+         "test/test_n2b_n3_go_prefix_and_rule5_stack.py",
+         "test/test_round67l_plan_exam_truth.py"]
 
 CU = ROOT / "brain" / "contract_utils.py"
 PF = ROOT / "brain" / "plan_finisher.py"
@@ -40,7 +41,8 @@ MUTATIONS = [
          'test_root_manifests_by_stack_covers_every_spec_entry'],
     ),
     (
-        'P-C1：派生视图小写化清单名（Linux 上 `Gemfile`/`Pipfile` 恒探不到 ⇒ 判 unknown ⇒ 塞 pom）。'
+        'P-C1：派生视图小写化清单名（Linux 上 `Cargo.toml`/`Pipfile` 恒探不到 ⇒ 判 unknown ⇒ 塞 pom；'
+        'F5 更正：原举例 Gemfile 不在 STACK_SPEC）。'
         '★本机 macOS 大小写不敏感，故落点必须选平台无关的纯函数属性——用"造 Pipfile 探 pipfile"'
         '的夹具在本机零区分力（harness 第一轮实测逮到）★',
         SPEC,
@@ -63,13 +65,10 @@ MUTATIONS = [
         '    _should = True',
         ['test_pure_python_repo_is_never_given_fabricated_pom'],
     ),
-    (
-        'P-C1：第三个消费者（plan_finisher 裸奔闸）退回窄表口径 ⇒ python 基线判不出栈',
-        PF,
-        '            _bstk = {stk for name, stk in root_manifests_by_stack()\n                     if _os.path.exists(_os.path.join(project_path, name))}',
-        '            _bstk = {stk for name, stk in [("pom.xml", "maven")]\n                     if _os.path.exists(_os.path.join(project_path, name))}',
-        ['test_pc1_bare_pom_gate_recognizes_python_baseline'],
-    ),
+    # （已删：旧突变「第三个消费者（plan_finisher 裸奔闸）退回窄表口径」的落点是 `_bstk`
+    #  探测块——P-C1 复核 F2 实证该早返＝真 fail-open，#17 已把探测块随早返整体删除，
+    #  该突变防护的代码不复存在。原测试 test_pc1_bare_pom_gate_recognizes_python_baseline
+    #  已反转为 F2 形状，由本表末条 F2 突变锁。）
     # ── 降级可观测（血规 3）──
     (
         'P-C1：unknown 回退不再告警（降级静默 ⇒ php/ruby 被塞 pom 无声）',
@@ -167,6 +166,21 @@ MUTATIONS = [
         '        for name in _BUILD_MANIFESTS\n    )',
         '        for name in _BUILD_MANIFESTS_LC\n    )',
         ['test_baseline_probe_queries_canonical_case_names'],
+    ),
+    # ── P-C1 复核 F2：裸奔闸 _bstk 早返＝真 fail-open（#17）──
+    (
+        'F2：非 Maven 基线早返复活（npm 基线 create-pom 零 verify ⇒ 零确定性验收直送 '
+        'worker＝st-3-1 原病，且旧注释承诺的 VALIDATE 闸不存在）',
+        PF,
+        '    from swarm.brain.contract_utils import _root_gav\n'
+        '    injected: dict[str, list[str]] = {}',
+        '    import os as _os\n'
+        '    from swarm.brain.contract_utils import _root_gav\n'
+        '    if project_path and _os.path.exists(_os.path.join(project_path, "package.json")) \\\n'
+        '            and not _os.path.exists(_os.path.join(project_path, "pom.xml")):\n'
+        '        return {}\n'
+        '    injected: dict[str, list[str]] = {}',
+        ['test_naked_pom_non_maven_stack_skipped'],
     ),
 ]
 

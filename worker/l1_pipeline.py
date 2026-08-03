@@ -6213,8 +6213,13 @@ def run_l1_pipeline(
 
     # C4（阶段6，登记册 §五）：非空 diff 但既无 test_command 也无 verify_commands 的
     # 子任务——确定性验证面只剩编译（test skip 判过），语义正确性零覆盖。打 needs_review
-    # 标记（deliver/人工闸可见；阻断语义由 det+llm conflict 分支承担——Phase-4 自检判
-    # False 时 evaluate_l1 已 fail，见 deterministic_llm_conflict）。
+    # 标记（deliver/人工闸可见）。
+    # ★P-C1 复核 F2 ②'★ 旧注释自称"阻断语义由 det+llm conflict 分支承担"——**默认配置下
+    # 该分支不存在**：`deterministic_llm_conflict`（l1_verdict.py）要求 `llm_ok is False`，
+    # 而 LLM 自检 R63-T9 默认关闭（`_self_review_llm` 返 None ⇒ executor 侧 `llm_ok`
+    # 保持 True 初值）⇒ conflict 永不触发。本标记在默认配置下**没有任何下游阻断**，
+    # 止于 needs_review 可观测——create-pom 零验收直送 merge 的正经闸是规划期
+    # `ensure_pom_create_min_acceptance`（R67L-B3⑤），不在本层。
     # 猎手 HIGH 整改（R65D-T2④伴生）：判据用【实际执行】的 verify 结果，不用 harness
     # 原始清单——全部内容断言被 H1 跳过时清单非空但零命令真跑，语义正确性零覆盖，
     # 必须打 needs_review（原样放行=假绿盲区）。

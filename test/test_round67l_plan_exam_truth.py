@@ -246,13 +246,23 @@ def test_naked_root_pom_create_skips_parent_version_assertion(tmp_path):
 
 
 def test_naked_pom_non_maven_stack_skipped(tmp_path):
-    """复核 L-栈：基线为已知非 Maven 栈（npm manifest、无 pom.xml）→ plan 内 create-pom
-    疑为 LLM 幻觉，整 pass 跳过不注入 Maven 专属断言（留 VALIDATE 打回）。"""
+    """★P-C1 复核 F2 升级后反转★ 非 Maven 基线**不再**整 pass 跳过——早返撤掉的 ①②
+    是栈无关断言（产物存在性 + 对所创 pom 自身的字面量检查），跳过＝零确定性验收直送
+    worker＝st-3-1 原病复活，且旧注释承诺的"留 VALIDATE 打回"那条闸不存在（F2 实证）。
+
+    反转后：npm 基线 + create 根 pom 零 verify ⇒ ①② 注入；③ parent 对账自门控省略
+    （`_root_gav` 在无根 pom.xml 的基线上返 None + 所创即根 pom 自身，双门控）。
+    合法多语言新模块（python 根 + service-java/pom.xml）同形受益——REJECT 式治法会
+    误杀它，注入式不会。"""
     (tmp_path / "package.json").write_text('{"name": "x", "version": "1.0.0"}')
     st = _st("s1", create=["pom.xml"], verify=[])
     plan = _plan(st)
-    assert ensure_pom_create_min_acceptance(plan, str(tmp_path)) == {}
-    assert st.harness.verify_commands == []
+    injected = ensure_pom_create_min_acceptance(plan, str(tmp_path))
+    assert "s1" in injected, "非 Maven 基线整 pass 跳过＝F2 的 fail-open 复活"
+    vcs = st.harness.verify_commands
+    assert any(v.startswith("test -f pom.xml") for v in vcs), "① 产物存在性未注入"
+    assert any("<version>${" in v for v in vcs), "② 字面量断言未注入"
+    assert not any("<parent>" in v for v in vcs), "③ 必须自门控省略（无根 pom 基线 + 根 pom 自身）"
 
 
 # ─── ⑥ 禁令 grep 语义闸 ───

@@ -1219,34 +1219,21 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
          '<parent>' <pom> | grep -q '<version>{根版}</version>'` —— parent 版本必须=基线根版
          （3.8.7 幻觉的死法）；根 pom 无 <parent> 块，注入即冤杀（终闸复核 M-1）。
     只补【零 verify】的子任务（已有考卷的不动，绝不削既有闸）；非 pom create 不动。
-    栈门控=基线 manifest 证据（终闸复核 L-栈：栈相关行为走确定性分发）——基线根有
-    已知非 Maven manifest（gradle/npm/go/cargo/python）且无 pom.xml 时，plan 里的
-    create-pom 是 LLM 幻觉（G9 混栈优先保 Maven 会让 plan 侧 pom 证据自证其门，故
-    本闸只信基线），不注入 Maven 专属断言，幻觉留 VALIDATE 权威打回。greenfield
-    （零 manifest）=unknown 保守放行（back-compat）。
+
+    ★P-C1 复核 F2（升级版：不是"话说宽了"，是真 fail-open）★ 本函数曾有
+    `_bstk` 早返（基线为已知非 Maven 栈 ⇒ 整 pass 返 {}）——它撤掉的 ①② 是**栈无关**
+    断言（产物存在性 + 对所创 pom 自身的字面量检查，对任何 pom 都成立），③ 早已
+    自门控（`_root_gav` 在无根 pom.xml 时返 None ⇒ 非 Maven 基线自动省略 + WARNING）。
+    早返对 ③ 冗余、对 ①② 有害：非 Maven 基线 + 幻觉 create-pom + 零 verify ⇒
+    零确定性验收直送 worker＝st-3-1 原病复活，且注释自称"留 VALIDATE 打回"的那条闸
+    **不存在**（plan_validator 全部 REJECT 无一管"非 Maven 基线里 create pom"）。
+    ★为什么不是补一条 VALIDATE REJECT★ "非 Maven 基线里 create pom"不总是幻觉——
+    多语言仓（python 根 + 新增 service-java/pom.xml）是合法形态，REJECT 会误杀它；
+    ①② 在合法形态下无害且有益。没有确定性判据区分"幻觉 create-pom"与"合法多语言
+    新模块"之前，绝不把幻想的闸写进注释（承诺比落地宽）。
     根版读不到 → ③ 省略有 WARNING（fail-open，①②仍在）。返回 {sid: [注入命令…]}。
     """
-    import os as _os
-
     from swarm.brain.contract_utils import _root_gav
-    from swarm.stacks import root_manifests_by_stack
-    if project_path:
-        try:
-            # P-C1：原读 contract_utils 的手抄表 `_MANIFEST_TO_STACK`（已删，第二事实源）。
-            # 本闸是**栈识别**档（"基线根上有这个文件 ⇒ 是该栈工程"）⇒ 走 root_manifests。
-            # 覆盖面同步变宽：纯 pip/Pipfile 工程从此不再判 unknown 保守放行，而是认出 python
-            # → `_bstk={'python'}` 且无 maven ⇒ 裸奔闸正确跳过（plan 内 create-pom 留 VALIDATE 打回）。
-            _bstk = {stk for name, stk in root_manifests_by_stack()
-                     if _os.path.exists(_os.path.join(project_path, name))}
-        except (OSError, TypeError, ValueError) as _stk_exc:  # 与 _detect_build_stack 同型
-            # 终扫 hunter M-2：降级必须可观测——探测失败按 unknown 保守放行但留痕
-            logger.warning("[PLAN-FINISH] R67L-B3⑤ 基线 manifest 栈探测异常（按 unknown "
-                           "保守放行注入面不变）: %s", _stk_exc)
-            _bstk = set()
-        if _bstk and "maven" not in _bstk:
-            logger.info("[PLAN-FINISH] R67L-B3⑤ 裸奔闸跳过：基线为已知非 Maven 栈 %s"
-                        "（plan 内 create-pom 疑为幻觉，留 VALIDATE 打回）", sorted(_bstk))
-            return {}
     injected: dict[str, list[str]] = {}
     _root_ver = None
     if project_path:
