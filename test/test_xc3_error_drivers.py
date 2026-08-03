@@ -881,3 +881,43 @@ def test_wiring_compile_classifier_eats_untruncated_output(
     ok, details = _run_ts(ts_project, monkeypatch, scope, tsc_out)
     assert ok is False, "全文里有第三方缺失（express）→ 全盘不标 BLOCKED"
     assert details.get("pipeline_blocked") is None
+
+
+# ── X-M3（27 号文 §3.2，消费点契约分析定案）：模块归属非 JVM 恒空=安全方向 ──
+
+
+def test_xm3_module_extraction_is_jvm_only_by_design():
+    """`_build_error_modules` 只认 JVM 形态；go/npm 输出恒空是【刻意】——非 JVM 无权威
+    模块名行格式，凭印象造正则=纪律 2 臆造。本条锁这个边界的两个方向：
+    JVM 形态照常抽出 / 非 JVM 形态不臆造。"""
+    jvm_out = "[ERROR] The project com.x:ruoyi-alarm:1.0 (.../pom.xml) has 1 error\n"
+    assert lp._build_error_modules(jvm_out) == {"ruoyi-alarm"}
+    go_out = "# github.com/acme/shop/order\ngo: module github.com/acme/shop: reading go.mod: unexpected\n"
+    assert lp._build_error_modules(go_out) == set(), \
+        "非 JVM 形态绝不臆造模块名（造错比恒空更坏）"
+
+
+def test_xm3_unparseable_non_jvm_error_fails_closed_not_blocked():
+    """消费点①契约：非 JVM 构建错（无文件路径、无 JVM 模块形态）→ 模块回退道
+    own/errs 双空 → channel=none → False（不判上游=烧自己修复轮，绝不假 BLOCKED）。
+    突变判据：给 `_build_error_modules` 塞个 go 形态正则 → 本条红（own 仍空→False…
+    不对，own 空本就 False——见下条锁真正承重的方向）。"""
+    ev: dict = {}
+    go_out = "go: module github.com/acme/shop: reading go.mod: unexpected\n"
+    assert lp._build_error_is_upstream(
+        go_out, "go build ./...", modified=["order/x.go"], evidence_out=ev) is False
+    assert ev.get("channel") == "none", f"恒空必须落 none 通道留痕, got {ev}"
+
+
+def test_xm3_file_level_attribution_covers_non_jvm_stacks():
+    """消费点①的主力通道是【文件级】（`_ERR_FILE_RE` 已覆盖 .go/.ts/.vue）——
+    非 JVM 栈的归属不靠模块回退：报错文件全在自己改动集外 → 判上游 True；
+    在自己集内 → False。两方向都锁（这是 X-M3 定案「恒空可接受」的前提）。"""
+    # go：别人的文件炸了 → True（不连坐我）
+    assert lp._build_error_is_upstream(
+        "./other/broken.go:3:1: syntax error: unexpected }\n",
+        "go build ./...", modified=["mine/ok.go"]) is True
+    # ts：我自己的文件炸了 → False（不推给上游）
+    assert lp._build_error_is_upstream(
+        "src/app.ts(3,1): error TS2304: Cannot find name 'foo'.\n",
+        "npm run build", modified=["src/app.ts"]) is False

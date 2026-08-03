@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_image_builder.py",
          "test/test_e_theme_supply_gates_batch1.py",
-         "test/test_xm8_vue_type_gate.py"]
+         "test/test_xm8_vue_type_gate.py",
+         "test/test_xc3_error_drivers.py"]
 
 IMG = ROOT / "worker" / "image_builder.py"
 PIPE = ROOT / "worker" / "l1_pipeline.py"
@@ -127,6 +128,22 @@ MUTATIONS = [
         '_BUILDER_VERSION = "11"',
         '_BUILDER_VERSION = "10"',
         ['test_builder_version_bumped_so_old_images_are_invalidated'],
+    ),
+    (
+        "X-M3a：`_build_error_modules` 的 pom 解析错抽取被摘（JVM 模块归属回退道残废——"
+        "X-M3 定案锁的是「JVM 方向照常工作 + 非 JVM 不臆造」两个方向，本条压第一方向）",
+        PIPE,
+        '    mods = {m.group(1) for m in _POM_ERR_MODULE_RE.finditer(build_output or "")}',
+        '    mods = set()',
+        ['test_xm3_module_extraction_is_jvm_only_by_design'],
+    ),
+    (
+        "X-M3b：`_ERR_FILE_RE` 摘 .go（非 JVM 归属主力=文件级通道；摘了它 go 构建错"
+        "跌回模块回退道=恒空 ⇒ 连坐假 FAIL——X-M3 定案「恒空可接受」的前提塌了）",
+        PIPE,
+        '(?:java|kt|scala|go|rs|ts|tsx|js|vue|xml|py)',
+        '(?:java|kt|scala|rs|ts|tsx|js|vue|xml|py)',
+        ['test_xm3_file_level_attribution_covers_non_jvm_stacks'],
     ),
 ]
 

@@ -5012,7 +5012,22 @@ def _pl_modules_from_cmd(build_cmd: str) -> set[str]:
 
 
 def _build_error_modules(build_output: str) -> set[str]:
-    """从构建输出抽【报错所在模块】：pom 解析错的 `The project G:art` + 编译错的文件路径段。"""
+    """从构建输出抽【报错所在模块】：pom 解析错的 `The project G:art` + 编译错的文件路径段。
+
+    ★X-M3 消费契约（27 号文 §3.2，消费点契约分析定案）★ 本函数【刻意】只认 JVM 形态
+    （`The project G:art` / `…/src/main|test/…` 路径段）——go/npm 等栈的错误没有权威、
+    文档化的"模块名"行格式，凭印象造正则=纪律 2 禁止的臆造（造错比恒空更坏：会把别人的
+    错归到自己模块头上=假 FAIL，或反之假 BLOCKED）。恒空在两个消费点上都是【安全方向】：
+      ① `_build_error_is_upstream` 模块回退道：`own`（-pl，非 Maven 恒空）或本函数为空
+        → channel="none" → return False（不判上游）=fail-closed，宁可烧自己修复轮也
+        不假 BLOCKED；且文件级两道（scope/file_disjoint）在模块回退【之前】，`_ERR_FILE_RE`
+        已覆盖 .go/.ts/.js/.vue/.py 等 → 非 JVM 的归属主力是文件级，模块回退只是 JVM 兜底。
+      ② 上游证据装配（:5784）：本函数为空时 `_bof`（文件集）仍可非空；两皆空有
+        R67L-B2 死端闸（判上游却吐不出证据 → 落回 FAIL，不假 BLOCKED 空等）。
+    判定通道由 `upstream_judge_channel` 留痕（猎手 F4），"none" 机读可辨。
+    若日后要给非 JVM 栈加模块级归属：先拿**真实捕获**的该栈构建输出取证错误形态
+    （OFFLINE_REPLAY/cassette），按栈分派进表，不在此凭印象扩正则。
+    """
     mods = {m.group(1) for m in _POM_ERR_MODULE_RE.finditer(build_output or "")}
     mods |= {m.group(1) for m in _COMPILE_ERR_PATH_RE.finditer(build_output or "")}
     return {x for x in mods if x}
