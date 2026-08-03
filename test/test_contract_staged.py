@@ -228,3 +228,161 @@ def test_contract_design_bypass_non_ultra(monkeypatch):
 
 if __name__ == "__main__":
     print("use pytest（含 monkeypatch/caplog fixtures）")
+
+
+# ══════════════════════════════════════════════════════════════════
+# P-H5（27 号文）：CONTRACT_MODULE_SYSTEM 的 dependencies 指引按栈注入
+# ══════════════════════════════════════════════════════════════════
+# 治前第 4 条写死 Maven artifactId/spring 映射表：npm 工程被引导产 Maven 坐标 →
+# 下游 resolve_npm_deps 全部如实丢弃（上游污染下游闭环）。核心=【默认不再是 Maven】。
+
+
+def test_ph5_guidance_dispatch_by_build_field():
+    from swarm.brain.planning_nodes import _contract_dep_guidance as g
+
+    assert "artifactId" in g({"build": "maven"}, None)[0]
+    npm_g = g({"build": "npm"}, None)[0]
+    assert "package.json" in npm_g and "spring-boot-starter" not in npm_g \
+        and "Java/Maven" not in npm_g, "npm 工程拿到 Maven 映射表 = P-H5 没治"
+    go_g = g({"build": "go"}, None)[0]
+    assert "go.mod" in go_g and "module 路径" in go_g \
+        and "spring-boot-starter" not in go_g and "Java/Maven" not in go_g
+    assert "PyPI" in g({"build": "pip"}, None)[0]
+    assert "crate" in g({"build": "cargo"}, None)[0]
+
+
+def test_ph5_unknown_stack_gets_generic_not_maven():
+    """★核心修复★ 判不出栈 → 栈中立指引，【绝不】拿 Maven 映射表当兜底
+    （默认=Maven 正是 npm 工程被污染的病根）。"""
+    from swarm.brain.planning_nodes import _contract_dep_guidance as g
+
+    for empty in (None, {}, {"build": "未判明"}, {"build": ""}):
+        g0, labels = g(empty, None)
+        assert labels == ["generic"]
+        assert "本栈构建清单的原生坐标形态" in g0
+        assert "spring-boot-starter" not in g0, "未判明栈拿到 Maven spring 映射表 = 兜底回到 Maven"
+        assert "jjwt" not in g0
+
+
+def test_ph5_tree_manifests_compensate_missing_build_field():
+    """build 字段缺席/未判明时，base 树清单文件是第二证据源（两路并集）。"""
+    from swarm.brain.planning_nodes import _contract_dep_guidance as g
+
+    g0 = g({"build": "未判明"}, ["web/package.json", "svc/go.mod", "README.md"])[0]
+    assert "package.json" in g0 and "go.mod" in g0 \
+        and "spring-boot-starter" not in g0 and "Java/Maven" not in g0
+    # 多栈并集：build=maven + 树里还有 package.json → 两段都要
+    g1 = g({"build": "maven"}, ["web/package.json"])[0]
+    assert "artifactId" in g1 and "npm 包名" in g1
+
+
+class _RecordingLLM:
+    """录下 Stage B 的 system prompt（骨架 system 提 consumer_map，模块 system 不提）。"""
+    def __init__(self):
+        self.module_systems: list[str] = []
+
+    async def ainvoke(self, messages):
+        sys = messages[0]["content"]
+        if "consumer_map" in sys:
+            return _FakeResp('{"skeleton": {"conventions": [], "constants": [], '
+                             '"consumer_map": []}}')
+        self.module_systems.append(sys)
+        return _FakeResp('{"interfaces": [], "dtos": [], "apis": [], "dependencies": []}')
+
+
+def _ph5_state(stack):
+    s = _state([{"name": "modA", "responsibility": "A"}, {"name": "modB", "responsibility": "B"}])
+    if stack is not None:
+        s["project_stack"] = stack
+    return s
+
+
+def test_ph5_npm_project_system_prompt_has_no_maven_leak(monkeypatch):
+    """★接线锁（经真节点真调用链）★ project_stack.build=npm ⇒ Stage B system prompt
+    必须是 npm 指引且零 Maven 映射表——只测纯函数证不了「节点真的用了它」。"""
+    import swarm.brain.planning_nodes as pn
+    llm = _RecordingLLM()
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda: llm)
+    asyncio.run(contract_design(_ph5_state({"build": "npm"})))
+    assert llm.module_systems, "夹具没走到 Stage B（什么也没证明）"
+    for sys in llm.module_systems:
+        assert "@@DEP_GUIDANCE@@" not in sys, "占位符没替换就进了 prompt"
+        assert "npm 包名" in sys
+        assert "spring-boot-starter" not in sys and "Java/Maven：" not in sys, \
+            "npm 工程的契约 prompt 含 Maven 映射表 = P-H5 接线断"
+
+
+def test_ph5_maven_project_system_prompt_keeps_maven_guidance(monkeypatch):
+    """反向锁：Maven 工程的指引不被动摇（治的是「默认 Maven」，不是「去掉 Maven」）。"""
+    import swarm.brain.planning_nodes as pn
+    llm = _RecordingLLM()
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda: llm)
+    asyncio.run(contract_design(_ph5_state({"build": "maven"})))
+    assert llm.module_systems and all("artifactId" in s for s in llm.module_systems)
+
+
+def test_ph5_placeholder_exists_exactly_once():
+    """结构锁：占位符必须恰好在常量里出现一次（丢了=replace 静默 no-op，指引整段消失）。"""
+    import swarm.brain.planning_nodes as pn
+    assert pn.CONTRACT_MODULE_SYSTEM.count("@@DEP_GUIDANCE@@") == 1
+
+
+def test_ph5_every_detectable_build_has_guidance_or_form():
+    """★枚举缺口锁（双复核 R1-2）★ stack_detect 能判出的每个 build 都必须有专属指引段
+    或坐标形态行——已知栈静默退 generic 且与「真未判明」不可辨 = P-H5 半治。
+    判据从单一事实源 _MANIFEST_BACKEND 派生（绝不手抄第二份枚举编兜底网）。"""
+    from swarm.brain.planning_nodes import (
+        _CONTRACT_DEP_GUIDANCE_FORMS, _CONTRACT_DEP_GUIDANCE_KEYS)
+    from swarm.brain.stack_detect import _MANIFEST_BACKEND
+
+    for manifest, (_lang, build) in _MANIFEST_BACKEND.items():
+        assert build in _CONTRACT_DEP_GUIDANCE_KEYS or build in _CONTRACT_DEP_GUIDANCE_FORMS, \
+            f"{manifest} 的 build={build!r} 既无专属指引也无形态行 ⇒ 已知栈静默退 generic"
+
+
+def test_ph5_known_stack_without_section_gets_form_line():
+    """sbt/composer 等：无专属段 → 至少给坐标形态行（只写形态不列包例——凭印象
+    列例子=幻觉源），分档标签机读可辨。"""
+    from swarm.brain.planning_nodes import _contract_dep_guidance as g
+
+    text, labels = g({"build": "sbt"}, None)
+    assert "groupId % artifactId" in text and labels == ["sbt"]
+    text2, labels2 = g({"build": "composer"}, None)
+    assert "vendor/package" in text2 and labels2 == ["composer"]
+    # dotnet 走 stack_detect 独立分支（不在 _MANIFEST_BACKEND）——枚举锁盖不到，单独锁
+    text_dn, labels_dn = g({"build": "dotnet"}, None)
+    assert "NuGet" in text_dn and labels_dn == ["dotnet"]
+    # 形态行与专属段并集共存（sbt 后端 + npm 前端仓）
+    text3, labels3 = g({"build": "sbt"}, ["web/package.json"])
+    assert "groupId % artifactId" in text3 and "npm 包名" in text3
+    assert labels3 == ["npm", "sbt"]
+
+
+def test_ph5_unmappable_build_warns_visibly(caplog):
+    """★硬检查④★ build 判出来了但 KEYS/FORMS 都没它的档（未来枚举漂移）→
+    必须 WARNING，与「真未判明→generic」机读可辨。"""
+    import logging
+
+    from swarm.brain.planning_nodes import _contract_dep_guidance as g
+
+    with caplog.at_level(logging.WARNING):
+        text, labels = g({"build": "future-stack-2099"}, None)
+    assert text is not None and labels == ["generic"]
+    assert any("枚举缺口" in r.getMessage() and "future-stack-2099" in r.getMessage()
+               for r in caplog.records), "已知栈无档静默退 generic ⇒ 枚举缺口永远没人补"
+
+
+def test_ph5_plan_prompt_dependencies_example_is_stack_neutral():
+    """★双复核 R1-3（hunter 6b）★ plan 节点的 dependencies 示例与拆分铁律不得
+    Maven-only——contract_design 治好后，plan prompt 是残留污染源（全路径都过它）。
+    ★R2 增补★ PLAN_BATCH_SYSTEM 的 P7 是第三个 plan 级 prompt（我自查漏掉的 sibling，
+    复核逮住）——锁必须覆盖它。"""
+    from swarm.brain import prompts as _pr
+
+    assert "org.projectlombok" not in _pr.PLAN_USER, \
+        "plan 的 dependencies 示例仍把 Maven 全坐标当唯一形态"
+    assert "本栈原生依赖坐标" in _pr.PLAN_USER
+    assert "npm=包名" in _pr.PLAN_SYSTEM, "拆分铁律的清单形态枚举不含 npm = Maven-only 残留"
+    p7 = _pr.PLAN_BATCH_SYSTEM
+    assert "Go 如 gin/gorm" in p7 and "Rust 如 serde/tokio" in p7, \
+        "P7 依赖示例退回 Java/Node-only = go/rust 工程无形态指引"

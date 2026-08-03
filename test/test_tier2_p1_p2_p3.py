@@ -27,13 +27,17 @@ def test_p1_cloud_brain_not_flagged_unreachable():
 # ── P3：契约依赖 prompt 改为【职责驱动】+ 功能→依赖映射 ──
 
 def test_p3_contract_prompt_responsibility_driven():
-    from swarm.brain.planning_nodes import CONTRACT_MODULE_SYSTEM
+    from swarm.brain.planning_nodes import (
+        _CONTRACT_DEP_GUIDANCE, CONTRACT_MODULE_SYSTEM)
 
     # 契约阶段代码未写 → 据职责推断（非 import）
     assert "职责" in CONTRACT_MODULE_SYSTEM
     assert "代码尚未写" in CONTRACT_MODULE_SYSTEM or "据本模块" in CONTRACT_MODULE_SYSTEM
     # 给出常见功能→依赖映射，引导枚举全
-    assert "jjwt" in CONTRACT_MODULE_SYSTEM and "redis" in CONTRACT_MODULE_SYSTEM
+    # ★P-H5 后映射按栈分档注入（@@DEP_GUIDANCE@@ 占位符）：Maven 映射在 maven 段，
+    # 接线（占位符替换进真 system prompt）由 test_contract_staged.py 的 P-H5 接线锁证明。
+    assert "jjwt" in _CONTRACT_DEP_GUIDANCE["maven"] and \
+        "redis" in _CONTRACT_DEP_GUIDANCE["maven"]
     assert "宁多勿漏" in CONTRACT_MODULE_SYSTEM
 
 

@@ -2096,16 +2096,12 @@ CONTRACT_MODULE_SYSTEM = """你是系统架构师，正在为【一个模块】�
 1. interfaces：本模块对外暴露的跨模块接口名 + 完整方法签名（参数/返回类型）+ purpose。
 2. dtos：本模块定义、被其他模块引用的数据结构 + 字段。
 3. apis：本模块对外的 URL 路径 + HTTP 方法 + 请求/响应结构。
-4. dependencies：本模块 pom.xml/构建文件【必须声明的全部】第三方依赖（编译期硬约束）。
-   多个 worker 并行写本模块，谁建 pom 谁就得把整模块用到的依赖一次声明全——漏一个
-   （如用了 RedisTemplate/@Slf4j/Validation 而 pom 没声明）整模块 mvn compile 必败、全量返工。
-   - Java/Maven：用 artifactId（spring-boot-starter-data-redis、lombok、
-     spring-boot-starter-validation、hutool-all、fastjson2…），跨 group 同名写 groupId:artifactId。
-   - 契约阶段【代码尚未写】→ 据本模块【职责/功能】推断需要哪些库（非靠 import）。常见映射：
-     JWT/令牌鉴权→io.jsonwebtoken:jjwt-api、缓存/会话→spring-boot-starter-data-redis、
-     定时/调度→quartz、JSON 序列化→fastjson2 或 jackson、工具类→hutool-all、参数校验→
-     spring-boot-starter-validation、日志/样板→lombok、HTTP 客户端→okhttp/httpclient。
+4. dependencies：本模块构建清单（pom.xml/package.json/go.mod 等，按本栈）【必须声明的
+   全部】第三方依赖（编译期硬约束）。多个 worker 并行写本模块，谁建清单谁就得把整模块
+   用到的依赖一次声明全——漏一个（用了某个库而清单没声明）整模块编译必败、全量返工。
+   - 契约阶段【代码尚未写】→ 据本模块【职责/功能】推断需要哪些库（非靠 import）。
      按职责把【所有】会用到的第三方库一次列全，宁多勿漏（漏一个整模块编译失败）。
+@@DEP_GUIDANCE@@
 5. defined_in 落点策展（R67M2-T2 B2，治法A 范式）：interfaces/dtos 每条【必须】带
    defined_in=该类的【唯一落点文件路径】（与下方文件清单逐字一致）。实现细节类
    （*Impl 实现类/entity/mapper/controller/SPI 等）只要会被【多个子任务/多个批】引用，
@@ -2117,7 +2113,102 @@ CONTRACT_MODULE_SYSTEM = """你是系统架构师，正在为【一个模块】�
 {"interfaces":[{"name","module","signature":"完整方法签名","purpose","defined_in":"唯一落点路径"}],
  "dtos":[{"name","module","fields":["类型 字段名"],"defined_in":"唯一落点路径"}],
  "apis":[{"path","method","request","response"}],
- "dependencies":[{"module":"当前模块名","artifacts":["artifactId 或 groupId:artifactId 并集"]}]}"""
+ "dependencies":[{"module":"当前模块名","artifacts":["本栈原生依赖坐标（见第 4 条指引）"]}]}"""
+
+# ── P-H5（27 号文）：dependencies 指引按栈注入 ─────────────────────────────
+# 治前第 4 条写死 Maven artifactId/spring 映射表：npm/go 工程被引导产 Maven 坐标 →
+# 下游 resolve_*_deps 全部如实丢弃（上游污染下游闭环）。核心修复=【默认不再是 Maven】：
+# 判不出栈给栈中立指引，绝不拿 Maven 映射表当兜底。
+_CONTRACT_DEP_GUIDANCE: dict[str, str] = {
+    "maven": """   - Java/Maven：用 artifactId（spring-boot-starter-data-redis、lombok、
+     spring-boot-starter-validation、hutool-all、fastjson2…），跨 group 同名写 groupId:artifactId。
+     常见映射：JWT/令牌鉴权→io.jsonwebtoken:jjwt-api、缓存/会话→spring-boot-starter-data-redis、
+     定时/调度→quartz、JSON 序列化→fastjson2 或 jackson、工具类→hutool-all、参数校验→
+     spring-boot-starter-validation、日志/样板→lombok、HTTP 客户端→okhttp/httpclient。""",
+    "gradle": """   - Java/Kotlin Gradle（build.gradle[.kts]）：坐标形态与 Maven 相同，用
+     groupId:artifactId 全坐标（org.springframework.boot:spring-boot-starter-data-redis…）。""",
+    "npm": """   - Node/npm（package.json）：用 npm 包名（express、jsonwebtoken、redis、zod、
+     lodash…），scoped 包写全 @scope/name；内部 workspace 包写本仓 scope 全名。常见映射：
+     JWT/令牌鉴权→jsonwebtoken 或 jose、缓存/会话→redis 或 ioredis、HTTP 服务→express/fastify、
+     参数校验→zod、ORM→prisma/typeorm、工具类→lodash、HTTP 客户端→axios。
+     【绝不】写 Maven 坐标（groupId:artifactId 不是 npm 包名，会被确定性解析全部丢弃）。""",
+    "go": """   - Go（go.mod）：用 module 路径（github.com/gin-gonic/gin、
+     github.com/golang-jwt/jwt/v5…），带 major 后缀的路径必须写全（/v5）。常见映射：
+     HTTP 服务→gin/echo、JWT→golang-jwt/jwt、ORM→gorm.io/gorm、配置→spf13/viper、
+     日志→sirupsen/logrus 或 zap。【绝不】写 Maven 坐标（会被确定性解析全部丢弃）。""",
+    "python": """   - Python（requirements.txt/pyproject.toml）：用 PyPI 包名（fastapi、
+     sqlalchemy、redis、pydantic、requests…）。常见映射：Web→fastapi/flask/django、
+     ORM→sqlalchemy、校验→pydantic、HTTP 客户端→requests/httpx、任务队列→celery。""",
+    "cargo": """   - Rust（Cargo.toml）：用 crate 名（serde、tokio、axum、reqwest…）。""",
+}
+_CONTRACT_DEP_GUIDANCE_GENERIC = """   - 用【本栈构建清单的原生坐标形态】（各栈不同：npm=包名、go=module 路径、
+     Maven=artifactId、PyPI=包名、cargo=crate 名）。【绝不】跨栈借用坐标形态——例如给
+     npm 工程写 groupId:artifactId，会被确定性解析全部丢弃，等于这个依赖没声明。"""
+
+# detect_stack 的 build 字段值 → 指引键（单一事实源=stack_detect 的 build 产出口径）
+_CONTRACT_DEP_GUIDANCE_KEYS: dict[str, str] = {
+    "maven": "maven", "gradle": "gradle", "npm": "npm", "go": "go",
+    "pip": "python", "pipenv": "python", "django-cli": "python", "cargo": "cargo",
+}
+# ★双复核 R1-2★ 有专属段之外的已知栈也得有【坐标形态行】——只给 generic 会让
+# 「已知栈缺指引」与「真未判明」不可辨，且 LLM 仍可能凭训练惯性写错形态。
+# 只写坐标形态（高置信事实），不列包例（凭印象列例子=幻觉源，纪律 2）。
+_CONTRACT_DEP_GUIDANCE_FORMS: dict[str, str] = {
+    "sbt": "Scala/sbt：用 groupId % artifactId 坐标（Maven 坐标族）",
+    "composer": "PHP/composer：用 vendor/package 包名（Packagist）",
+    "bundler": "Ruby/bundler：用 gem 名",
+    "mix": "Elixir/mix：用 hex 包名",
+    "pub": "Dart/pub：用 pub.dev 包名",
+    "dotnet": "C#/.NET：用 NuGet 包名",
+}
+# package.json 刻意不在 stack_detect._MANIFEST_BACKEND（那表只判后端语言，package.json
+# 走前端/后端另一条路径）——树扫描在这里补这一条，注释指向单一事实源，不手抄整表。
+_TREE_EXTRA_MANIFEST_KEYS: dict[str, str] = {"package.json": "npm"}
+
+
+def _contract_dep_guidance(project_stack: dict | None, tree: list | None) -> tuple[str, list[str]]:
+    """P-H5：按栈取 dependencies 指引，返回 (指引文本, 分档标签)。
+
+    证据两路并集：detect_stack 的 build 字段 + base 树清单文件（manifest 表复用
+    stack_detect._MANIFEST_BACKEND 单一事实源，绝不手抄第二份——P-C1 F1 手抄表漂移的
+    教训）。优先级：专属段 > 形态行 > 栈中立 generic（【默认不再是 Maven】是本批核心）。
+    标签供日志让「未判明 / 已知栈仅形态行 / 专属指引」机读可辨（双复核 R1-1）。
+    """
+    from swarm.brain.stack_detect import _MANIFEST_BACKEND
+
+    keys: list[str] = []
+    forms: list[str] = []
+
+    def _dispatch(build: str) -> None:
+        k = _CONTRACT_DEP_GUIDANCE_KEYS.get(build)
+        if k:
+            if k not in keys:
+                keys.append(k)
+        elif build in _CONTRACT_DEP_GUIDANCE_FORMS and build not in forms:
+            forms.append(build)
+
+    build_raw = str((project_stack or {}).get("build") or "")
+    _dispatch(build_raw)
+    for p in tree or []:
+        base = str(p).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        mb = _MANIFEST_BACKEND.get(base)
+        if mb:
+            _dispatch(mb[1])
+        else:
+            kk = _TREE_EXTRA_MANIFEST_KEYS.get(base)
+            if kk and kk not in keys:
+                keys.append(kk)
+    if not keys and not forms:
+        if build_raw and build_raw != "未判明":
+            # 枚举缺口必须可辨（硬检查④）：stack_detect 判出了栈而这里没有它的档——
+            # 与「真未判明」是两种事实，静默混同=缺口长期没人补
+            logger.warning("[CONTRACT_DESIGN] P-H5 build=%r 无专属指引/形态行（枚举缺口），"
+                           "退化栈中立指引", build_raw)
+        return _CONTRACT_DEP_GUIDANCE_GENERIC, ["generic"]
+    parts = [_CONTRACT_DEP_GUIDANCE[x] for x in keys]
+    parts += [f"   - {_CONTRACT_DEP_GUIDANCE_FORMS[x]}。" for x in forms]
+    return "\n".join(parts), keys + forms
+
 
 CONTRACT_MODULE_USER = """总需求（背景）：{task_description}
 
@@ -2561,6 +2652,12 @@ async def contract_design(state: BrainState) -> dict:
     )
 
     # ── Stage B：逐模块并发产契约片（仿 _tech_design_staged Stage2：Semaphore + gather + 重试）──
+    # P-H5：dependencies 指引按栈注入（detect_stack build + base 树清单两路证据并集；
+    # 判不出栈给栈中立指引——默认不再是 Maven，那是 npm 工程产 Maven 坐标全 drop 的病根）
+    _dep_guidance, _dep_labels = _contract_dep_guidance(state.get("project_stack"), _cd_tree)
+    logger.info("[CONTRACT_DESIGN] P-H5 依赖指引按栈注入：build=%r 指引分档=%s",
+                (state.get("project_stack") or {}).get("build"), _dep_labels)
+    _module_system = CONTRACT_MODULE_SYSTEM.replace("@@DEP_GUIDANCE@@", _dep_guidance)
     _sem = _asyncio.Semaphore(_CONTRACT_CONCURRENCY)
 
     async def _gen_one_module_contract(mi: int, mod: dict) -> dict:
@@ -2587,7 +2684,7 @@ async def contract_design(state: BrainState) -> dict:
             async with _sem:
                 try:
                     resp = await _asyncio.wait_for(llm.ainvoke([
-                        {"role": "system", "content": CONTRACT_MODULE_SYSTEM},
+                        {"role": "system", "content": _module_system},
                         {"role": "user", "content": CONTRACT_MODULE_USER.format(
                             task_description=_clip(task_desc, 6000, what="需求原文"),
                             data_model=data_model[:_dm_quota],

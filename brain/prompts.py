@@ -80,7 +80,7 @@ PLAN_SYSTEM = """你是一个任务规划专家。你需要将一个复杂任务
      若确是同一逻辑类被多处需要 → 只在契约指定的 owner 落点 create 一次，其余子任务把该 FQN 放 readable 引用（import）；
      若确属两个不同职责的类 → 必须改名消歧（不同 simple name）。此约束【不适用】于 Go/Python/JS/TS（其同名跨模块合法）。
    - 【聚合/注册类共享文件例外】：父 `pom.xml` 的 `<modules>`、`settings.gradle`、路由 `index` 表、DI 容器注册、i18n bundle 这类【需多处登记】的文件，指定【单一 owner 子任务】统一登记所有条目（如脚手架子任务一次注册全部新模块），其余子任务 depends_on 该 owner 并把该文件放 readable，【绝不】各自写——多写者必争抢。
-   - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个 maven/gradle 模块时，建该模块 `pom.xml` 的脚手架子任务【必须】在 pom 里一次性声明【本计划里该模块任何子任务会用到、而父 pom 未传递】的全部依赖（如 lombok、spring-boot-starter-data-redis、各 starter/web/validation 等）。后续写代码的子任务【碰不到 pom】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架 pom 多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"构建清单声明全部所需依赖且对应构建命令通过（如 Maven `mvn compile`、Gradle `gradle build`、npm `npm run build`）"。
+   - 【新建模块的依赖清单必须前置且齐全（治本：编译期缺依赖）】：当新建一个模块时，建该模块构建清单（maven/gradle→`pom.xml`/`build.gradle`、npm→`package.json`、go→`go.mod`、python→`requirements.txt`、rust→`Cargo.toml` 等，按本栈）的脚手架子任务【必须】在清单里一次性声明【本计划里该模块任何子任务会用到、而父清单/工作区未传递】的全部依赖——坐标按本栈原生形态（Maven=artifactId 如 lombok/spring-boot-starter-data-redis、npm=包名、go=module 路径、PyPI=包名、cargo=crate 名），【绝不】跨栈借用坐标形态（给 npm 工程写 groupId:artifactId 会被确定性解析全部丢弃）。后续写代码的子任务【碰不到构建清单】，无法补依赖 → 缺一个就整模块编译失败。宁可在脚手架清单多声明常用依赖，也不要漏。把这些依赖列进 shared_contract.dependencies（见下），并在脚手架子任务 acceptance_criteria 写明"构建清单声明全部所需依赖且对应构建命令通过（如 Maven `mvn compile`、Gradle `gradle build`、npm `npm run build`、Go `go build ./...`、cargo `cargo build`）"。
    - 每个子功能子任务自身仍是垂直切片（自洽、可验证）。
    - ⚠️ 不满足"≥7文件或多组件"的功能【不要】用此拆分——4-6 文件的普通功能（如单个导出接口）仍是【一个】子任务，由一个 worker 一次改完（worker 内部会自动分阶段写，不需你拆）。
 默认倾向【少拆/不拆】：能一个子任务做完的功能就不要拆。拆分的代价（依赖/合并/失败面）通常高于收益。
@@ -163,7 +163,7 @@ PLAN_BATCH_SYSTEM = """你是任务规划专家，正在【按功能模块分批
 
 【P4 路径规范】：本批所有文件路径前缀必须统一（用文件清单里给出的完整路径，不要改前缀）。
 【P6 验收标准】：每个子任务必须给 acceptance（验收标准），首选项目技术栈对应的【确定性编译/构建命令】（如 Maven/Gradle/npm/go/cargo 的 build/compile）。构建/lint 工具链系统会自动推断，但【每条行为类验收标准都要能被确定性验证】：在 harness.verify_commands 里给出针对该标准的烟雾断言命令（如 grep 新接口/实体字段是否落地、编译后跑一条最小校验），这【不是】单元测试、也不受"不主动加测试"约束，是"产出是否合格"的机读证据。单元 test_command 仅任务明确要求测试时才给。
-【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖（Java 如 lombok/各 starter，Node 如运行时+类型依赖）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
+【P7 模块依赖前置（治本：编译期缺依赖）】：若本批新建模块构建清单（pom.xml/build.gradle/package.json/go.mod/Cargo.toml 等），建清单的子任务【必须】一次性声明本模块全部子任务会用到、而父级清单未传递的依赖——坐标按本栈原生形态（Java 如 lombok/各 starter、Node 如运行时+类型依赖、Go 如 gin/gorm 等 module 路径、Python 如 sqlalchemy/pydantic、Rust 如 serde/tokio），【绝不】跨栈借用坐标形态（给 npm 工程写 groupId:artifactId 会被确定性解析全部丢弃）——写代码的子任务碰不到构建清单，缺一个依赖即整模块编译/构建失败。宁多勿漏。
 【P8 同名类唯一 owner（仅 JVM 类路径语言，治本：同名异包 bean 冲突）】：绝不在不同包/模块各建同名（simple name 相同）的类（如 alarm.util.AesUtils 与 common.encrypt.AesUtils）——JVM 下 Spring bean 名/MyBatis typeAlias 默认取 simple name，同名异包并存启动即冲突。若上文给出"已认领类唯一 owner"清单，本批需要这些类时只在 scope.readable 引用其 owner 路径（import 该 FQN），【严禁】重新 create 同名类。此约束不适用于 Go/Python/JS/TS。
 【P8b 既有实体不重建 create-vs-base（仅 JVM 类路径语言）】：若某 JVM 类的 simple name 已存在于【base 既有代码库】(如既有实体 SysUser/SysMenu 等)——本批 file_plan 若把它标 modify 就在 scope.writable 放它的【base 真身路径】、若要扩展它则 readable 引用真身，【绝不】把它放进 scope.create_files 在别的模块/包重建同名类（同 P8 的 bean/typeAlias 撞车启动崩，且被确定性闸 ③f 打回重拆）。确需职责不同的新类 → 改名消歧。不适用于 Go/Python/JS/TS。
 
@@ -226,9 +226,9 @@ PLAN_USER = """## 任务描述
     "interfaces": ["InterfaceName"],
     "fields": ["fieldName"],
     "dependencies": [
-      {{"module": "<模块目录名=含单一构建清单的目录，既有优先复用、勿按功能拆新模块>", "artifacts": ["groupId:artifactId", "org.projectlombok:lombok"], "reason": "本模块子任务用到 @Slf4j/RedisTemplate 等，父 pom 未传递"}}
+      {{"module": "<模块目录名=含单一构建清单的目录，既有优先复用、勿按功能拆新模块>", "artifacts": ["本栈原生依赖坐标（Maven=groupId:artifactId / npm=包名 / go=module 路径 / PyPI=包名 / cargo=crate 名）"], "reason": "本模块子任务用到的库，父清单/工作区未传递"}}
     ],
-    "description": "Brain 统一定义的跨子任务接口契约。dependencies：每个【物理构建模块】需在其构建清单声明的依赖并集（建构建文件的脚手架子任务负责落地，写代码的子任务碰不到构建文件）"
+    "description": "Brain 统一定义的跨子任务接口契约。dependencies：每个【物理构建模块】需在其构建清单声明的依赖并集（建构建文件的脚手架子任务负责落地，写代码的子任务碰不到构建文件；坐标绝不跨栈借用——给 npm 工程写 groupId:artifactId 会被确定性解析全部丢弃）"
   }},
   "subtasks": [
     {{
