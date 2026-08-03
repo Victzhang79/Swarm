@@ -52,6 +52,9 @@ _PUBLISHED = frozenset({"1.6.0", "1.6.7", "1.7.2", "2.0.0",
     ("^0.0.3", True), ("^0.0.4", False),
     # tilde：同 major.minor 且 ≥ floor
     ("~1.6.0", True), ("~1.9.0", False), ("~0.2.3", True),
+    # ★R1 缺位＝通配★ 这三格对本集**有区分力**（补零口径下全判 False）：`~1` 要的是 1.x
+    # 而集里只有 1.6/1.7/1.8，补零会去找 1.0.x；`^0`/`^0.0` 同理去找 0.0.0。
+    ("~1", True), ("^0", True), ("^0.0", True),
     # 比较运算
     (">=1.0.0", True), (">=99.0.0", False), (">2.0.0", False), (">1.9.0", True),
     # 预发布版本存在过 → 不判幻觉（我们不主动注入预发布是**另一档**决定）
@@ -64,6 +67,44 @@ def test_range_satisfiability_semantics(spec, expect):
     故两个方向都有用例，尤其 caret 的 major-0 特例（最容易写错的一格）。
     """
     assert nr._range_is_satisfiable(spec, _PUBLISHED) is expect
+
+
+@pytest.mark.parametrize("spec,published,expect", [
+    # ── 缺位必须判"可满足"（原实现全判 False ⇒ 误杀）──────────────────────
+    ("~18", ["18.3.1"], True),          # React 18 系最常见写法
+    ("~5", ["5.1.0"], True),
+    ("^0", ["0.21.1"], True),           # `^0` = `>=0.0.0 <1.0.0`
+    ("^0.0", ["0.0.7"], True),          # `^0.0` = `<0.1.0`
+    ("~0", ["0.4.2"], True),
+    ("~4", ["4.18.2"], True),           # `express@~4` 的真实形态
+    # ── 缺位**仍有上界**：治法不许把闸拧成恒 True ─────────────────────────
+    ("~18", ["19.0.0"], False),
+    ("~18", ["17.9.9"], False),
+    ("~0", ["1.0.0"], False),
+    ("^0", ["1.0.0"], False),           # 0.x 的 caret 绝不跨到 1.x
+    ("^0.0", ["0.1.0"], False),         # `^0.0` 的上界是 0.1.0
+    # ── 写全段位的既有语义不得回归（同一函数两条口径的对照组）─────────────
+    ("~4.18", ["4.18.2"], True),
+    ("~4.18", ["4.19.0"], False),
+    ("~4.18", ["4.17.9"], False),
+])
+def test_r1_missing_segments_are_wildcards_not_zeros(spec, published, expect):
+    """★P-C2 复核 R1★ npm semver 里缺位是**通配**（X-range），不是 0。
+
+    原实现 `floor = (maj, mnr or 0, pat or 0)` 把补出来的 0 当成对**未声明段位**的
+    **相等**约束（`~18` 要求 `cur[1] == 0`），于是 `~18` vs `18.3.1` 判 False。
+    `""`/`=` 臂早就按 `pat is not None`/`mnr is not None` 分了档，`^`/`~` 漏了——
+    **同一个函数里两种口径**。
+
+    ★为什么误杀比丢弃重★ 判 False ⇒ 走"确证幻觉"分支 ⇒ 校正成 latest ⇒
+    `express@~4` 被改成 `^5.1.0` ⇒ npm install 成功、worker 却按 4.x API 写码
+    ＝**静默跨大版本漂移**，且校正不记账。
+
+    ★为什么不复用 `_PUBLISHED`★ 那个共享集里有 `0.2.3`，`^0` 对它两版实现都返 True
+    （区分力被集合内容吃掉）；"缺位的上界"必须用**只含越界版本**的集来证。
+    逐案自带版本集 ⇒ 每格的被测命题唯一（[[swarm-fixture-shape-must-encode-time-skew]] 同理）。
+    """
+    assert nr._range_is_satisfiable(spec, frozenset(published)) is expect
 
 
 @pytest.mark.parametrize("spec,kind", [
@@ -271,6 +312,43 @@ def test_proxy_version_exists_requires_all_mirrors_to_confirm_absence(monkeypatc
     assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is True
 
 
+@pytest.mark.parametrize("seq,expect,expect_calls", [
+    # ★区分力核心★ 首个镜像不可达、第二个答 True：早返版本返 None，正确版本返 True。
+    ([None, True], True, 2),
+    # 首个不可达、第二个答 404：返回值两版都是 None（fail-open 一致），
+    # **但调用次数不同**——早返版本只问 1 个镜像。次数断言是"冗余真的在工作"的唯一证据。
+    ([None, False], None, 2),
+    # 对照：第一个就答 True ⇒ 短路，第二个**不该**被问（省 I/O 是刻意的）。
+    ([True, False], True, 1),
+])
+def test_f1_second_mirror_is_actually_queried(monkeypatch, seq, expect, expect_calls):
+    """★P-C2 复核 F1★ 首个镜像不可达时，**第二个镜像必须仍被问**。
+
+    原实现在 `got is None` 分支里 `return None` 即早返 ⇒ 多镜像冗余形同虚设，而 docstring
+    承诺的"任一镜像答 True → True"是假的：goproxy.cn 抖一下，proxy.golang.org 明明能答
+    True 也拿不到 ⇒ 真实存在的版本判不出来。方向没错（None 仍 fail-open），但把**冗余**
+    这一维整个抹掉了。
+
+    ★为什么原有那条测试证不了这个★ 它的夹具是 `iter([False, None])`——先确证无、后不可达。
+    这个顺序下早返版本（第二轮才 return None）与修好的版本（`saw_false and not
+    saw_unreachable` 不成立）**都返 None** ⇒ 零区分力，是唯一藏得住这个 bug 的顺序。
+    实测两版实现在该夹具下逐字同结果。故本条把顺序翻成 `[None, True]`，
+    并额外断**探测次数**（[[swarm-test-must-prove-wiring-not-correctness]]：
+    断言必须能区分"哪道闸"，返回值相同时就去断可观测的副作用）。
+    """
+    monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
+    it, calls = iter(seq), []
+
+    def _probe(url):
+        calls.append(url)
+        return next(it)
+
+    monkeypatch.setattr(gr, "_http_probe", _probe)
+    assert gr.proxy_version_exists("github.com/x/y", "v1.0.0") is expect
+    assert len(calls) == expect_calls, calls
+    assert len(set(calls)) == len(calls), f"同一镜像被问了两次: {calls}"
+
+
 def test_proxy_version_exists_with_no_mirrors_is_none_not_false(monkeypatch):
     """★零镜像 = 零证据 → None，绝不 False★ 单独立一条，因为它是**唯一**能触发末行
     `return False if saw_false else None` 里 `else` 分支的入口。
@@ -323,11 +401,14 @@ def test_go_unreachable_proxy_fails_open(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("ver", [
-    # ★伪版本两种形态都要认★ 只认下面第二种（`_PSEUDO` 的窄口径）会漏掉**更常见**的第一种。
-    # 那条窄模式的老消费者 `_is_stable` 靠"主体含 `-` 即非稳定"兜住了第二形态，所以窄口径在
-    # 那边不是 bug；本档判漏的后果相反 = 误杀（血规 10 第三条）。
-    "v0.0.0-20230101120000-abcdef123456",     # 无前置 tag（最常见）
-    "v1.2.3-0.20230101120000-abcdef123456",   # 有前置 tag
+    # ★伪版本**三种**形态都要认（复核 F2）★ 形态由 base version（该 commit 前最近的 tag）
+    # 决定，权威来源 go.dev/ref/mod#pseudo-versions。原注释写"两种"并据此收口——那不是笔误
+    # 而是**枚举本身错了**（[[swarm-enumeration-needs-authoritative-source]]）。
+    # `_PSEUDO` 的窄口径只认 ③，其老消费者 `_is_stable` 靠"主体含 `-` 即非稳定"把 ①② 兜住了，
+    # 所以那边不是 bug；本档判漏的后果相反 = 误杀（血规 10 第三条）。
+    "v0.0.0-20230101120000-abcdef123456",         # ① 无 base tag（最常见）
+    "v1.2.3-beta.0.20230101120000-abcdef123456",  # ② base 是预发布（golang.org/x/*、k8s.io/* 大量）
+    "v1.2.4-0.20230101120000-abcdef123456",       # ③ base 是正式版（patch 递增 + `-0.` 段）
     "latest", "master", "main",              # 分支名/别名
     "abcdef1234567890",                      # 裸 commit SHA
     "v1.2",                                  # 非规范（go.mod 要三段）
@@ -342,6 +423,30 @@ def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
         raise AssertionError(f"不该为 {ver} 探测 proxy（不判形态）")
     monkeypatch.setattr(gr, "proxy_version_exists", _boom)
     kept, _, dropped = gr.resolve_go_deps([f"github.com/x/y@{ver}"])
+    assert dropped == []
+    assert [(d.module, d.version) for d in kept] == [("github.com/x/y", ver)]
+
+
+@pytest.mark.parametrize("ver", [
+    "v0.0.0-2023010112000-abcdef123456",      # 时间戳 13 位（伪版本恒 14 位）
+    "v0.0.0-20230101120000-abcdef12345",      # hash 11 位（恒 12 位）
+    "v0.0.0-20230101120000-zzzzzz123456",     # hash 非 16 进制
+    "v1.2.3",                                 # 普通 semver
+    "v1.2.3-beta.1",                          # 普通预发布（**不是**伪版本）
+])
+def test_f2_pseudo_lookalikes_are_still_judged(monkeypatch, ver):
+    """★F2 的反向锁★ 放宽 `_PSEUDO_ANY` 不许把闸拧成"什么都不判"。
+
+    这五种长得像伪版本但**不是**（时间戳/hash 位数不符、hash 非 16 进制、普通预发布）。
+    若它们也落进"不判"分支，Go 侧的幻觉版本治理就整体免检了——那比 F2 原病灶更坏。
+    故本条断它们**仍被送去探测**（与上一条的 `_boom` 恰好反向）。
+    ★为什么必须有这一档★ 只验"三形态被认出来"的话，把正则改成 `.*` 也全绿
+    （[[swarm-mutation-harness-must-check-baseline-green.md]] 同族：单向断言放过过宽治法）。
+    """
+    seen = []
+    monkeypatch.setattr(gr, "proxy_version_exists", lambda m, v: seen.append((m, v)) or True)
+    kept, _, dropped = gr.resolve_go_deps([f"github.com/x/y@{ver}"])
+    assert seen == [("github.com/x/y", ver)], f"{ver} 被误划进「不判」形态"
     assert dropped == []
     assert [(d.module, d.version) for d in kept] == [("github.com/x/y", ver)]
 
@@ -398,3 +503,58 @@ def test_go_probe_cache_is_separate_from_text_cache(monkeypatch):
     monkeypatch.setattr(gr.urllib.request, "urlopen",
                         _fake_urlopen(status=200, body='{"Version":"v1.0.0"}'))
     assert gr._http_get("https://x/z.info") == '{"Version":"v1.0.0"}'
+
+
+def test_f5_unreachable_is_not_cached_but_verdicts_are(monkeypatch):
+    """★P-C2 复核 F5★ `None`（不可达）**不入探测缓存**，`True`/`False` 仍入。
+
+    原实现无条件 `_probe_cache[_key] = out`，而命中判据是 `if _key in _probe_cache`
+    （`None` 也算命中）＋生产侧无任何清理点＋brain 是长驻进程 ⇒ 一次网络抖动就把该
+    module@version **永久**钉成"不可达"，此后再不重验，且它长得和"真的一直不可达"
+    一模一样（血规 10 第四条：缺席必须机读可辨）。
+
+    ★两个方向都要断★ 只验"`None` 不入缓存"的话，把缓存整个关掉（或每次都 `clear()`）
+    也全绿——那把治法退化成"取消缓存"，白丢省 I/O 的收益。故后半段锁住确定性结论**仍然**
+    只查一次网（[[swarm-redundant-defense-unfalsifiable]] 的反面：每条断言各自承重）。
+    """
+    monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
+    gr._probe_cache.clear()
+    gr._http_cache.clear()
+    url = "https://x/flaky.info"
+
+    # ① 抖动一次 → None，且**不留痕**
+    calls = []
+
+    def _flaky(req, timeout=None):
+        calls.append(1)
+        raise gr.urllib.error.URLError("connection reset")
+
+    monkeypatch.setattr(gr.urllib.request, "urlopen", _flaky)
+    assert gr._http_probe(url) is None
+    # 键名与生产实现同源（`_http_probe` 内 `_key = f"probe::{url}"`）。单句直断，不用
+    # `A or B` ——`or` 是逃生门：空 dict 也能满足"没有 None 值"那半句 ⇒ 零区分力。
+    assert f"probe::{url}" not in gr._probe_cache, \
+        f"不可达被写进缓存 → 该 module@version 被永久钉死: {gr._probe_cache}"
+
+    # ② 网络恢复 → 必须**重新探测**并拿到真结论（原实现在这里返回缓存的 None）
+    monkeypatch.setattr(gr.urllib.request, "urlopen", _fake_urlopen(status=200))
+    assert gr._http_probe(url) is True, "抖动被永久缓存 → 恢复后仍判不可达"
+
+    # ③ 反向锁：确定性结论**仍要**缓存——再问一次不得再发请求
+    before = len(calls)
+    monkeypatch.setattr(gr.urllib.request, "urlopen", _flaky)
+    assert gr._http_probe(url) is True, "确定性结论没入缓存 ⇒ 治法退化成「把缓存关了」"
+    assert len(calls) == before, "命中缓存却仍发了请求"
+
+    # ④ 404（确证不存在）同样要缓存
+    gr._probe_cache.clear()
+    hits = []
+
+    def _404(req, timeout=None):
+        hits.append(1)
+        raise gr.urllib.error.HTTPError(url, 404, "nf", {}, None)
+
+    monkeypatch.setattr(gr.urllib.request, "urlopen", _404)
+    assert gr._http_probe(url) is False
+    assert gr._http_probe(url) is False
+    assert len(hits) == 1, "False 没入缓存"

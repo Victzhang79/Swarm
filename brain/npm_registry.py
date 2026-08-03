@@ -220,7 +220,10 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
         （`1.2` 视作 `1.2.x`，`1` 视作 `1.x` —— npm 对 `1.2` 的语义正是 `>=1.2.0 <1.3.0`）；
       · `^` → 同 major 且 ≥ floor；**major 0 特例**：`^0.2.3` 是 `>=0.2.3 <0.3.0`（semver
         规定 0.x 的次版本视作破坏性），故要求同 major.minor；`^0.0.3` 要求精确 0.0.3；
-      · `~` → 同 major.minor 且 ≥ floor（`~1.2` = `>=1.2.0 <1.3.0`，退化为同 major.minor）；
+        ★缺位＝通配（R1）★ `^0` = `<1.0.0`（任意 0.x.y）、`^0.0` = `<0.1.0`——上界由**已声明**
+        段位里的最左非零段决定，未声明的段位不施加相等约束；
+      · `~` → 同 major.minor 且 ≥ floor（`~1.2` = `>=1.2.0 <1.3.0`）；★`~1` 只锁 major★
+        （npm 语义等同 `^1`），别拿补出来的 0 当 minor 约束（R1）；
       · `>=` / `>` → ≥（>）floor 即可。
 
     ★诚实边界：预发布尾段不参与比较★ 复用 `_SEMVER_CORE` 只取三元组，故 `1.2.3-rc.1` 与
@@ -236,6 +239,14 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
     op = (m.group(1) or "").strip()
     maj, mnr, pat = m.group(2), m.group(3), m.group(4)
     floor = (int(maj), int(mnr or 0), int(pat or 0))
+    # ★P-C2 复核 R1★ `prec` = **声明了几段**（1/2/3）。npm semver 里缺位是**通配**（X-range），
+    # 不是 0：`~18` = `>=18.0.0 <19.0.0`，`^0` = `>=0.0.0 <1.0.0`。上面 `floor` 的补零作为
+    # **下界**是对的，但绝不能当成对**未声明段位**的相等约束——原实现的 `^`/`~` 两臂正是这么用的
+    # （`~18` 要求 `cur[1] == 0` ⇒ `18.3.1` 判 False）。`""`/`=` 臂早就按 `pat is not None` /
+    # `mnr is not None` 分了档，`^`/`~` 漏了，**同函数内两种口径**。
+    # 后果比"丢弃"重：判 False ⇒ 走"确证幻觉"分支 ⇒ 校正成 latest ⇒ `express@~4` 变 `^5.1.0`
+    # ⇒ npm install 成功但 worker 按 4.x API 写码＝静默跨大版本漂移。
+    prec = 3 if pat is not None else (2 if mnr is not None else 1)
     for v in versions:
         vm = _SEMVER_CORE.match(v.strip())
         if not vm:
@@ -252,17 +263,28 @@ def _range_is_satisfiable(spec: str, versions: frozenset[str]) -> bool:
             elif cur[0] == floor[0]:                   # `1` = `1.x`
                 return True
         elif op == "^":
-            if floor[0] == 0:
+            # caret 的上界由**最左非零段**决定，而"最左非零"只在**已声明**的段位里找（R1）。
+            if prec == 1:
+                if cur[0] == floor[0]:                     # `^1`=`1.x` / `^0`=`0.x`（<1.0.0）
+                    return True
+            elif floor[0] == 0:
                 # 0.x：次版本即破坏性；0.0.z 更严（精确）
                 if floor[1] == 0:
-                    if cur == floor:
+                    if prec == 2:
+                        if cur[0] == 0 and cur[1] == 0:    # `^0.0` = `>=0.0.0 <0.1.0`
+                            return True
+                    elif cur == floor:                     # `^0.0.3` = 精确
                         return True
                 elif cur[0] == 0 and cur[1] == floor[1] and cur >= floor:
                     return True
             elif cur[0] == floor[0] and cur >= floor:
                 return True
         elif op == "~":
-            if cur[0] == floor[0] and cur[1] == floor[1] and cur >= floor:
+            # `~1` 退化为同 major（npm 语义等同 `^1`）；写了两段以上才锁 major.minor。
+            if prec == 1:
+                if cur[0] == floor[0]:
+                    return True
+            elif cur[0] == floor[0] and cur[1] == floor[1] and cur >= floor:
                 return True
         elif op == ">=":
             if cur >= floor:

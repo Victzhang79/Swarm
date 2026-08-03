@@ -60,14 +60,23 @@ _SEMVER_CORE = re.compile(r"^v(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 # P-C2 可判形态：规范 `vX.Y.Z`（可带 `-prerelease` / `+incompatible`）。go.mod 的 require
 # 只接受这种；分支名/`latest`/裸 commit SHA 都进"不判"分支（判它们只会误杀）。
 _JUDGEABLE_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+incompatible)?$")
-# P-C2 专用伪版本判别：**两种形态都要认**。
-#   · `v1.2.3-0.20240101000000-abcdef123456`（有前置 tag，带 `-<N>.` 段）
-#   · `v0.0.0-20240101000000-abcdef123456`  （无前置 tag，**无** `-<N>.` 段，最常见）
-# ★为什么不复用 `_PSEUDO`（血规 10 第三条：复用事实源≠复用消费契约）★ `_PSEUDO` 只认第一种，
-# 它唯一的消费者 `_is_stable` 靠末句"主体含 `-` 即非稳定"把第二种一并兜住了，所以那边的窄口径
-# 从来不是 bug。而本档的后果**相反**：判漏 ⇒ 把真实可用的伪版本送去存在性探测，proxy 对它
-# 常不作答 → 当成幻觉校正掉 = 误杀。故另立一条覆盖两形态的模式，`_PSEUDO` 保持不动。
-_PSEUDO_ANY = re.compile(r"-(?:\d+\.)?\d{14}-[0-9a-f]{12}(?:\+incompatible)?$", re.IGNORECASE)
+# P-C2 专用伪版本判别：**Go 官方定义三种形态，三种都要认**。
+# 权威来源：`cmd/go` 文档 "Pseudo-versions"（go.dev/ref/mod#pseudo-versions）——形态由
+# **base version（该 commit 之前最近的 tag）** 决定：
+#   ① 无 base tag             `vX.0.0-<ts>-<hash>`            （最常见，如 v0.0.0-2024…）
+#   ② base 是**预发布**版      `vX.Y.Z-<pre>.0.<ts>-<hash>`    （如 v1.2.3-beta.0.2024…）
+#   ③ base 是**正式**版        `vX.Y.(Z+1)-0.<ts>-<hash>`      （patch 递增 + `-0.` 段）
+# ★P-C2 复核 F2：原注释写"两种形态都要认"并据此收口，漏了 ②★ 那不是笔误而是**枚举本身错了**
+# ——我为修窄口径新造这张表时凭印象列了两种，而官方是三种。② 在 `golang.org/x/*`、`k8s.io/*`
+# 的 beta/rc 系里大量出现。漏判的后果是**误杀**：`v1.2.3-beta.0.…` 能过 `_JUDGEABLE_VERSION`
+# ⇒ 被送去存在性探测 ⇒ 在线且 proxy 确证查无时判"幻觉版本"校正掉（离线才侥幸 fail-open）。
+# ⇒ [[swarm-enumeration-needs-authoritative-source]]：声称"穷举全部形态"必须指出权威来源。
+# ★为什么不复用 `_PSEUDO`（血规 10 第三条：复用事实源≠复用消费契约）★ `_PSEUDO` 只认 ③，
+# 它唯一的消费者 `_is_stable` 靠末句"主体含 `-` 即非稳定"把 ①② 一并兜住了，所以那边的窄口径
+# 从来不是 bug。而本档的后果**相反**（判漏＝误杀），故另立一条覆盖三形态的模式，`_PSEUDO` 不动。
+# 形态 ② 的 `<pre>` 段允许点号（`beta.0` / `rc.1`），故前缀部分放宽成"可选的、以点结尾的串"。
+_PSEUDO_ANY = re.compile(
+    r"-(?:[0-9A-Za-z.-]+\.)?\d{14}-[0-9a-f]{12}(?:\+incompatible)?$", re.IGNORECASE)
 
 _http_cache: dict[str, str | None] = {}
 # 探测缓存与文本缓存**分开**：值域不同（三态 bool|None vs 文本|None），混用会让
@@ -121,7 +130,13 @@ def _http_probe(url: str) -> bool | None:
         logger.debug("[go-registry] PROBE %s → HTTP %s", url, getattr(exc, "code", "?"))
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("[go-registry] PROBE %s 不可达: %s", url, exc)
-    _probe_cache[_key] = out
+    # ★P-C2 复核 F5★ `None` **不入缓存**。原实现无条件 `_probe_cache[_key] = out`，而命中判据是
+    # `if _key in _probe_cache`（`None` 也算命中）＋生产侧无任何清理点＋brain 是长驻进程
+    # ⇒ 一次网络抖动就把该 module@version **永久**钉成"不可达"，此后再不重验，
+    # 且它长得和"真的一直不可达"一模一样（血规 10 第四条：缺席必须机读可辨）。
+    # 缓存的目的是省掉重复 I/O，不是记住失败——只缓存**确定性结论**（True/False）。
+    if out is not None:
+        _probe_cache[_key] = out
     return out
 
 
@@ -133,6 +148,7 @@ def proxy_version_exists(mod: str, ver: str) -> bool | None:
     """
     enc, encv = _encode_mod(mod), _encode_mod(ver)
     saw_false = False
+    saw_unreachable = False
     for tpl in _PROXY_INFO_MIRRORS:
         got = _http_probe(tpl.format(mod=enc, ver=encv))
         if got is True:
@@ -140,8 +156,17 @@ def proxy_version_exists(mod: str, ver: str) -> bool | None:
         if got is False:
             saw_false = True
         else:
-            return None            # 有镜像不可达 → 证据不完整
-    return False if saw_false else None
+            # ★P-C2 复核 F1★ 原实现这里是 `return None`——首个镜像不可达即早返，**第二个镜像
+            # 永不被问**，多镜像冗余形同虚设，而上面 docstring 承诺的"任一镜像答 True → True"
+            # 是假的。方向没错（None 仍 fail-open），但把"冗余"这一维整个抹掉了：
+            # goproxy.cn 抖一下，proxy.golang.org 明明能答 True 也拿不到。
+            # 改为记账后继续，裁决挪到循环外。同文件 `proxy_latest_version` 的 `continue`
+            # 早就是正确对照——**同一个文件里两个多镜像循环，一个对一个错**。
+            saw_unreachable = True
+            continue
+    if saw_false and not saw_unreachable:
+        return False               # 全部镜像都答得上且都说没有 → 确证
+    return None                    # 有镜像不可达 → 证据不完整，绝不据此判幻觉
 
 
 def _is_stable(version: str) -> bool:
