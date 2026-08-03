@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -306,7 +307,11 @@ _NOISE_DIRS = {".git", "node_modules", "target", "dist", "build", ".venv",
 #     漏字段/不可消费时不再单独采纳 frontend 自由文本（治前画像同时挂「前端=Twig」与
 #     「形态=none+认不得未清」，自矛盾且**已按指纹写进缓存**）——已缓存的那批自矛盾
 #     画像不 bump 永不刷新。两者同属"改变了已缓存项目的正确答案"（v5/v6/v7 同形状，第四次）。
-_STACK_SCHEMA_VERSION = 8
+# v9: 27 号文 P-H1——非 JVM 栈等价接地事实三键（npm_facts/go_facts/python_facts）进画像
+#     + format_stack_for_prompt 对三栈渲染硬约束。画像字段变化=「已缓存项目的正确答案
+#     变了」（v5/v6/v7/v8 同形状，第五次）：不 bump 则已建档项目命中缓存早返，对它们
+#     一行不生效且静默（消费者 .get() 读缺席键得 None 当假值）。
+_STACK_SCHEMA_VERSION = 9
 
 
 def compute_repo_fingerprint(project_path: str) -> str:
@@ -602,6 +607,154 @@ def _detect_jvm_facts(
         "lombok_available": lombok_available,  # R65TR-T5：基线注解处理器在位性
         "lombok_source": lombok_source,
     }
+
+
+# ── P-H1（27 号文 B-6）：非 JVM 栈的等价接地事实 ──
+# JVM 侧已有 jakarta/javax 命名空间/Lombok/基建符号/鉴权变体四类硬约束，而 npm/go/python
+# 工程此前一条都没有（format_stack_for_prompt 对它们只渲染三行概述）——但等价硬约束
+# 【真实存在且价值同等】：npm 的 ESM/CJS 写错=运行时即崩；go 内部 import 前缀臆造=编译期
+# 即崩；python 顶层包根臆造（PyPI 发行名≠import 名）=ModuleNotFoundError。
+# 三个探测器各自【自门控】：无对应清单 → None，不污染异栈画像（与 _detect_jvm_facts 同律）。
+# 三处都读原文而非 _read_text：小写化会腐蚀硬约束事实（go module 路径可含大小写，如
+# github.com/BurntSushi/toml；package.json 的 name/engines 同理）。
+
+
+def _detect_npm_facts(project_path: str) -> dict | None:
+    """npm 系专属事实：模块系统（ESM vs CommonJS）+ node 运行时下界。
+
+    写错模块系统是运行时确定性崩：ESM 工程里 `require()` 即 `require is not defined`，
+    CJS 工程顶层 `import` 即 SyntaxError、require 只发 ESM 的包即 ERR_REQUIRE_ESM——
+    与 JVM 的 jakarta/javax 同等级硬约束。
+    只读【根】package.json：manifest_texts 的同名拼接文本无法把 "type" 归因到具体包
+    （monorepo 子包可与根不同），归因不了的事实不猜（诚实边界：子包形态不钉）。
+    """
+    root_pj = os.path.join(project_path, "package.json")
+    if not os.path.isfile(root_pj):
+        return None
+    try:
+        with open(root_pj, encoding="utf-8", errors="ignore") as f:
+            data = json.loads(f.read(200_000))
+    except (OSError, ValueError):
+        # 硬检查④：解析失败 ≠ 没有该事实——层内自吞异常=外层永远收不到
+        logger.warning("[STACK_DETECT] P-H1 根 package.json 解析失败（%s），npm 接地事实缺席", root_pj)
+        return None
+    if not isinstance(data, dict):
+        return None
+    t = data.get("type")
+    facts: dict = {
+        # npm 缺省=CommonJS（官方语义）；来源机读标出：显式声明 vs 缺省推断
+        "module_system": "esm" if t == "module" else "cjs",
+        "module_system_source": "explicit" if t in ("module", "commonjs") else "default",
+    }
+    engines = data.get("engines")
+    if isinstance(engines, dict):
+        node = engines.get("node")
+        if isinstance(node, str) and node.strip():
+            facts["node_engines"] = node.strip()
+    return facts
+
+
+_GO_MODULE_LINE = re.compile(r"(?m)^module\s+(\S+)")
+_GO_VERSION_LINE = re.compile(r"(?m)^go\s+([0-9]+(?:\.[0-9]+){0,2})\s*(?://.*)?$")
+
+
+def _detect_go_facts(project_path: str) -> dict | None:
+    """go 系专属事实：根 go.mod 的 module 路径前缀 + go 指令版本。
+
+    内部包 import 必须以 module 路径为前缀；worker 凭仓名/目录名臆造
+    `github.com/<组织>/<仓>` 假路径=编译期确定性失败，且会把它当外部依赖去 proxy 拉
+    （P-H3 治的是版本解析侧，这里治画像钉死侧）。
+    诚实边界：只读【根】go.mod。go.work 多模块仓的成员路径推断在
+    contract_utils._go_module_path_prefix（go.work 感知）；本函数刻意不复制那份逻辑
+    （画像钉根前缀已够硬约束用），两处 go.mod 解析的统一收口登记在 27 号文 B-8。
+    """
+    root_mod = os.path.join(project_path, "go.mod")
+    if not os.path.isfile(root_mod):
+        return None
+    try:
+        with open(root_mod, encoding="utf-8", errors="ignore") as f:
+            text = f.read(200_000)
+    except OSError:
+        logger.warning("[STACK_DETECT] P-H1 根 go.mod 读取失败（%s），go 接地事实缺席", root_mod)
+        return None
+    facts: dict = {}
+    m = _GO_MODULE_LINE.search(text)
+    if m:
+        facts["module_path"] = m.group(1)
+    m = _GO_VERSION_LINE.search(text)
+    if m:
+        facts["go_version"] = m.group(1)
+    return facts or None
+
+
+# python 顶层包枚举的排除名：这些目录即使带 __init__.py 也不是产品 import 根
+_PY_ROOT_SKIP_DIRS = frozenset({
+    "test", "tests", "docs", "doc", "scripts", "bin", "node_modules",
+    "venv", "env", "__pycache__", "dist", "build",
+})
+
+
+def _detect_python_facts(project_path: str, manifest_texts: dict[str, str]) -> dict | None:
+    """python 系专属事实：requires-python 下界 + 真实可 import 顶层包根（+ src 布局位）。
+
+    「PyPI 发行名 ≠ import 名」是 python 栈特有幻觉源（pip install pillow 但 import PIL）；
+    本项目侧的等价硬约束=顶层包根集合：import 只能以真实存在的包为根，凭项目名直译/
+    目录名臆造（flat 布局写 `from src.xxx`、src 布局加 `src.` 前缀）即
+    ModuleNotFoundError——与 JVM 的 jakarta/javax 同等级。
+    清单判据复用 _MANIFEST_BACKEND 已收录的 python 族 basename（单一事实源，不另造表）。
+    诚实边界：PEP 420 namespace 包（无 __init__.py）不在此列。
+    """
+    is_py = any(k in manifest_texts for k in (
+        "requirements.txt", "pyproject.toml", "setup.py", "Pipfile", "manage.py"))
+    if not is_py:
+        return None
+    facts: dict = {}
+
+    # 1) requires-python：pyproject.toml 原文优先，setup.py 的 python_requires 兜底
+    #    （manifest_texts 已小写——版本约束串不含大小写信息，不受影响）
+    pj_path = os.path.join(project_path, "pyproject.toml")
+    pyproject = ""
+    if os.path.isfile(pj_path):
+        try:
+            with open(pj_path, encoding="utf-8", errors="ignore") as f:
+                pyproject = f.read(200_000)
+        except OSError:
+            logger.warning("[STACK_DETECT] P-H1 pyproject.toml 读取失败（%s）", pj_path)
+    m = re.search(r"requires-python\s*=\s*[\"']([^\"']+)", pyproject)
+    if not m:
+        m = re.search(r"python_requires\s*=\s*[\"']([^\"']+)", manifest_texts.get("setup.py", ""))
+    if m:
+        facts["requires_python"] = m.group(1).strip()
+
+    # 2) 顶层包根：根目录 + src/ 下含 __init__.py 的目录名（import 的真实根）。
+    #    用 scandir/iterdir 而非 glob：py3.13 实测 Path.glob 静默吞 OSError 返 []（P-H3
+    #    同教训）——「枚举失败」必须与「真没有包」机读可辨（硬检查④）。
+    roots: list[str] = []
+    src_layout = False
+    for base, is_src in ((project_path, False), (os.path.join(project_path, "src"), True)):
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = list(os.scandir(base))
+            found = sorted(
+                e.name for e in entries
+                if e.is_dir() and not e.name.startswith(".") and e.name not in _PY_ROOT_SKIP_DIRS
+                and os.path.isfile(os.path.join(e.path, "__init__.py"))
+            )
+        except OSError:
+            # REV-1：scandir 成功≠逐条 stat 安全——DirEntry.is_dir() 文档契约会抛
+            # PermissionError（scandir 与 stat 之间权限翻转/NFS 瞬断）。「枚举中途失败」
+            # 同样降级为 WARNING+跳过，绝不把整次 detect_stack_deterministic 打崩。
+            logger.warning("[STACK_DETECT] P-H1 顶层包枚举失败（%s），python 包根事实不完整", base)
+            continue
+        if found and is_src:
+            src_layout = True
+        roots.extend(found)
+    if roots:
+        facts["import_roots"] = sorted(set(roots))[:10]  # 封顶防 monorepo 撑爆 prefill
+    if src_layout:
+        facts["src_layout"] = True
+    return facts or None
 
 
 def baseline_lombok_present(project_path: str) -> bool | None:
@@ -1045,6 +1198,27 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             f"鉴权变体: {auth['variant']}（shiro_hits={auth['shiro_hits']}, springsec_hits={auth['springsec_hits']}）"
         )
 
+    # ── P-H1：非 JVM 栈的等价接地事实（npm 模块系统 / go module 前缀 / python 包根）──
+    npm_facts = _detect_npm_facts(project_path)
+    if npm_facts:
+        evidence.append(
+            f"npm 模块系统: {npm_facts['module_system']}（{npm_facts['module_system_source']}）"
+            + (f"; node engines={npm_facts['node_engines']}" if npm_facts.get("node_engines") else "")
+        )
+    go_facts = _detect_go_facts(project_path)
+    if go_facts:
+        evidence.append(
+            f"go module 前缀: {go_facts.get('module_path') or '未判明'}"
+            f"; go={go_facts.get('go_version') or '未判明'}"
+        )
+    python_facts = _detect_python_facts(project_path, manifest_texts)
+    if python_facts:
+        evidence.append(
+            "python 顶层包根: " + ",".join(python_facts.get("import_roots") or ["未判明"])
+            + (f"; requires-python={python_facts['requires_python']}" if python_facts.get("requires_python") else "")
+            + ("; src 布局" if python_facts.get("src_layout") else "")
+        )
+
     return {
         "frontend": frontend,
         "frontend_kind": frontend_kind,
@@ -1052,6 +1226,11 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
         "build": build_tool or "未判明",
         "jvm": jvm or {},
         "auth": auth or {},
+        # P-H1：非 JVM 栈等价接地事实（键恒在场——空 dict=「该栈不在/无事实」，与 jvm/auth 同律；
+        # 渲染侧键缺席（老画像/回放 profile）不猜不渲染）
+        "npm_facts": npm_facts or {},
+        "go_facts": go_facts or {},
+        "python_facts": python_facts or {},
         "infra_symbols": infra_symbols,
         "infra_symbol_methods": infra_symbol_methods,
         "confidence": round(confidence, 2),
@@ -1245,6 +1424,52 @@ def format_stack_for_prompt(profile: dict | None, *, include_method_sigs: bool =
             "- 【鉴权变体·硬约束】本项目用 Spring Security：权限注解用 `@PreAuthorize(...)`，取当前用户/权限"
             "【只用上方〖基建符号·鉴权/安全工具〗里列出的本项目真实类】，绝不臆造未列出的鉴权类。"
             "【严禁】Apache Shiro 写法：`@RequiresPermissions`、`org.apache.shiro.*`——本项目 classpath 无 Shiro。"
+        )
+    # ── P-H1：非 JVM 栈等价硬约束——键缺席（老画像/回放 profile）不猜不渲染（lombok 同律）──
+    npm_f = profile.get("npm_facts") or {}
+    ms = npm_f.get("module_system")
+    if ms == "esm":
+        lines.append(
+            "- 【模块系统·硬约束】本项目根 package.json 显式声明 `\"type\": \"module\"`（ESM）："
+            "源码一律 `import`/`export`；【严禁】`require()`/`module.exports`（运行即 "
+            "`require is not defined`）；import 本地文件必须带 `.js` 扩展名（ESM 不自动补全）。"
+        )
+    elif ms == "cjs":
+        _ms_why = ("显式声明 `\"type\": \"commonjs\"`"
+                   if npm_f.get("module_system_source") == "explicit"
+                   else "未声明 `\"type\"` 字段（npm 缺省即 CommonJS）")
+        lines.append(
+            f"- 【模块系统·硬约束】本项目是 CommonJS（{_ms_why}）：源码一律 `require()`/"
+            "`module.exports`；【严禁】顶层 `import` 语句（运行即 SyntaxError），也【严禁】"
+            "`require()` 只发 ESM 的包（`ERR_REQUIRE_ESM`）——除非落 .mjs 或工程已有转译链。"
+        )
+    if ms and npm_f.get("node_engines"):
+        lines.append(
+            f"- 【运行时·硬约束】engines.node = `{npm_f['node_engines']}`：语法与标准库 API "
+            "不得超出该下界版本的支持范围（超出即运行环境直接报错）。"
+        )
+    go_f = profile.get("go_facts") or {}
+    if go_f.get("module_path"):
+        _gv = f"（go {go_f['go_version']}）" if go_f.get("go_version") else ""
+        lines.append(
+            f"- 【module 路径·硬约束】本仓 go module 前缀 `{go_f['module_path']}`{_gv}："
+            "内部包 import 必须以它为前缀；【严禁】凭仓名/目录名臆造 `github.com/...` 假路径"
+            "（编译期即失败）；本仓内部 module 之间用 `replace` 指本地相对路径，绝不去 proxy 拉。"
+        )
+    py_f = profile.get("python_facts") or {}
+    if py_f.get("import_roots"):
+        _src_note = ("包在 `src/` 下，但 import 路径【不含】`src.` 前缀——`from src.xxx import` 必炸；"
+                     if py_f.get("src_layout") else "")
+        lines.append(
+            "- 【包结构·硬约束】本项目真实可 import 的顶层包根："
+            + "、".join(f"`{r}`" for r in py_f["import_roots"])
+            + f"——import 只能以这些为根；{_src_note}【严禁】凭发行包名/目录名臆造 import 路径"
+            "（PyPI 发行名≠import 名，写错即 ModuleNotFoundError）。"
+        )
+    if py_f.get("requires_python"):
+        lines.append(
+            f"- 【运行时·硬约束】requires-python = `{py_f['requires_python']}`："
+            "语法/标准库不得越此下界（越界即目标环境起不来）。"
         )
     kb_hints = profile.get("kb_stack_hints") or []
     if kb_hints:

@@ -248,6 +248,27 @@ def _stack_cache_payload_digest() -> str:
             f"verdict[{nm}]=kind:{pr.get('frontend_kind')}|conf:{pr.get('confidence')}"
             f"|adj:{pr.get('needs_model_adjudication')}"
             f"|unrec:{(pr.get('signals') or {}).get('tmpl_engine_unrecognized')}")
+
+    # ④ ★值层覆盖（P-H1 复核 hunter H-1）★ key_paths 只锁「有哪些键」，锁不住「键里值的
+    # 语义」——把 npm_facts/go_facts/python_facts 的取值重命名/改口径而不加键时 key_paths
+    # 与 verdict 都不变 ⇒ 摘要不变 ⇒ 忘 bump ⇒ 已缓存项目继续吃旧值（P-C3 CRITICAL-2 同型）。
+    # 三个代表夹具把三键的【完整值】纳入摘要：值变了摘要必变。
+    for nm, files in (
+        ("npm_esm", {"package.json": '{"name":"web","type":"module","engines":{"node":">=18"}}'}),
+        ("go_mod", {"go.mod": "module github.com/BurntSushi/toml\n\ngo 1.21\n"}),
+        ("py_src", {"pyproject.toml": '[project]\nrequires-python = ">=3.10"\n',
+                    "src/mypkg/__init__.py": ""}),
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            for rel, body in files.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w") as fh:
+                    fh.write(body)
+            pr = sd.detect_stack_deterministic(d)
+        parts.append(
+            f"facts[{nm}]=npm:{pr.get('npm_facts')!r}|go:{pr.get('go_facts')!r}"
+            f"|py:{pr.get('python_facts')!r}")
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
 
@@ -278,8 +299,12 @@ def test_stack_schema_version_paired_with_cached_payload():
     # 其结论从 unrec:True 翻回 False）+ R2-H3 半截采纳收口（节点裁决行为，摘要盖不到，
     # 但同属「已缓存项目正确答案变了」⇒ 必须同批 bump）。常量本体同批迁至 stack_detect.py
     # （R2-H4：worker 第二读取路径同源消费），planning_nodes re-export 保可寻址。
+    # v8→v9：27 号文 P-H1 非 JVM 接地事实三键（npm_facts/go_facts/python_facts）进画像
+    # ⇒ py/jvm 两夹具的 profile_key_paths 都变（键恒在场，空 dict 也占 key_path）。
+    # hunter H-1 同批：摘要补④值层夹具——key_paths 锁不住「键里值的语义」，三键完整值
+    # 纳入摘要（值变了摘要必变，忘 bump 会被本条拦住）。
     # 摘要跨 hash 种子稳定（实测 PYTHONHASHSEED=0/1/12345/random 四轮同值）。
-    assert (_STACK_SCHEMA_VERSION, digest) == (8, "649bdaf5c0d45b2f"), (
+    assert (_STACK_SCHEMA_VERSION, digest) == (9, "748b21d90d025ba6"), (
         f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"
