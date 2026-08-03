@@ -209,6 +209,51 @@ def test_baseline_pinned_to_base_commit_not_live_tree(tmp_path):
         f"base 后才落盘的模块绝不算既有基线（判据钉扎 base_commit 非实时树，round59 闭合）: {amb_b}"
 
 
+# ── ⑦ P-C1 复核 R2-3 双向行为锁：`_is_existing_baseline_module` 用清单全集为何成立 ──
+#    唯一消费点=本豁免，且第二合取（该根全部证据须 manifest/基线既有）把风险面挡死：
+#    MODIFY 既有外部依赖清单=合法 fan-in（与 pom modify 同类）；CREATE 新代码进该目录
+#    =真跨模块 smell，必须仍歧义。
+
+def test_modify_existing_external_requirements_txt_is_legit_wiring(tmp_path):
+    """python 栈形态：基线 `docs/requirements.txt`（docs 依赖清单，非可构建单元）被
+    MODIFY ⇒ 与改既有 pom 同类，合法接线豁免必须成立（全集判据的可辩护方向）。"""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "requirements.txt").write_text("sphinx==7.0\n", encoding="utf-8")
+    base = str(tmp_path)
+    plan = _plan(
+        [_st("st-biz", ["svc/app.py"]),
+         _st("st-wire", ["docs/requirements.txt"])],  # 给 docs 加依赖（既有文件 MODIFY）
+        ["svc"],
+    )
+    fp = [{"module": "svc", "path": "svc/app.py"},
+          {"module": "svc", "path": "docs/requirements.txt"}]
+    resolved, ambiguous, collision = _resolve_module_dirs(plan, base, fp)
+    assert "svc" not in ambiguous, \
+        f"MODIFY 基线既有依赖清单=合法 fan-in（与 pom modify 同类，R2-3）: {ambiguous}"
+    assert resolved.get("svc") == "svc", f"应解析到自有源码根: {resolved}"
+
+
+def test_create_new_code_in_that_dir_is_still_rejected(tmp_path):
+    """★fail-closed 方向不破★ 同一目录若被 CREATE 进**新代码**（家无法判=真跨模块
+    smell），第二合取不成立 ⇒ 必须仍歧义打回——全集判据没有把这个方向放掉。"""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "requirements.txt").write_text("sphinx==7.0\n", encoding="utf-8")
+    base = str(tmp_path)
+    plan = _plan(
+        [_st("st-biz", ["svc/app.py"]),
+         _st("st-wire", ["docs/requirements.txt"]),
+         _st("st-code", ["docs/helper.py"])],  # CREATE 新代码进非本模块目录
+        ["svc"],
+    )
+    fp = [{"module": "svc", "path": "svc/app.py"},
+          {"module": "svc", "path": "docs/requirements.txt"},
+          {"module": "svc", "path": "docs/helper.py"}]
+    resolved, ambiguous, collision = _resolve_module_dirs(plan, base, fp)
+    assert "svc" in ambiguous, \
+        f"CREATE 新代码进外部目录=真跨模块 smell，第二合取必须挡住（R2-3 fail-closed）: " \
+        f"resolved={resolved}"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

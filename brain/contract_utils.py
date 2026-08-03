@@ -684,7 +684,18 @@ def _is_existing_baseline_module(
     而非实时工作树——project_path 是每轮 merge 累积落盘的持久 git 树，若读实时磁盘，前一轮/前一
     任务已 merge 的新模块会被误当"既有基线"，让无关模块的 pom 编辑被静默剔除（round59 血泪的
     跨轮版：判据随磁盘态闪烁）。复用 _exists_in_repo 的 git-pin 口径，与 merge/worker/L2 全链一致。
-    非 git → 退化 os.path.isfile（_exists_in_repo 内建）。base_ref=None → HEAD（零回归兜底）。"""
+    非 git → 退化 os.path.isfile（_exists_in_repo 内建）。base_ref=None → HEAD（零回归兜底）。
+
+    ★P-C1 复核 R2-3：为什么本函数用 `build_manifest_basenames()`【全集】是成立的★
+    （复用单一事实源 ≠ 复用消费契约，血规 10 第三条——这条是把论证写出来，不是改集合）。
+    本函数全仓**唯一**消费点是 G1 跨模块 coherence 的「合法接线豁免」（`_foreign` 合取），
+    且豁免还有第二合取：该根的**全部**证据文件须为 manifest 或基线既有文件——CREATE 新
+    代码进该目录 ⇒ all() 不成立 ⇒ 根保留仍打回（fail-closed 方向不破）。故全集里
+    `requirements.txt`/`Pipfile` 这类「目录未必是可构建单元」的条目，唯一后果是
+    「MODIFY 一个基线里既有依赖清单」被认作合法 fan-in 接线——与 round65e 的 pom
+    modify 本体同类，方向正确；`settings.gradle`（聚合器注册新模块）/`setup.py`/`go.work`
+    更是修正而非风险。收窄回「模块级清单子集」=再造一张手抄表（#16/F1 漂移陷阱），
+    刻意不为。双向行为锁：test_r65e_t1_coherence_foreign_module_wiring.py。"""
     if not rel:
         return False
     return any(

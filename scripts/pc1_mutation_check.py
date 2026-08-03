@@ -28,6 +28,7 @@ CU = ROOT / "brain" / "contract_utils.py"
 PF = ROOT / "brain" / "plan_finisher.py"
 SPEC = ROOT / "stacks" / "spec.py"
 SS = ROOT / "brain" / "symbol_surgery.py"
+ES = ROOT / "worker" / "executor_sync.py"
 
 MUTATIONS = [
     # ── 识别覆盖面 ──
@@ -181,6 +182,29 @@ MUTATIONS = [
         '        return {}\n'
         '    injected: dict[str, list[str]] = {}',
         ['test_naked_pom_non_maven_stack_skipped'],
+    ),
+    # ── P-C1 复核 R2（code-reviewer 第二轮）──
+    (
+        'R2-1：pom 判定退回 endswith（`xpom.xml` 被当 pom create ⇒ 注入 Maven 专属断言'
+        '给非 pom 产物虚假背书；同 F1 误命中原理的漏网现场）',
+        PF,
+        '    return path.replace("\\\\", "/").rsplit("/", 1)[-1].strip().lower() == "pom.xml"',
+        '    return path.replace("\\\\", "/").endswith("pom.xml")',
+        ['test_xpom_xml_is_not_a_pom_create',
+         'test_negated_grep_rewrite_does_not_touch_xpom_xml'],
+    ),
+    (
+        'R2-2：sync 清单退回手抄表（派生断开 ⇒ spec 新增栈/清单不再到达 sync 层，'
+        '「加一栈=加一条」的承诺在 sync 层落空——Pipfile 是第一件实证）',
+        ES,
+        '_SYNC_MANIFEST_NAMES = tuple(sorted(\n'
+        '    set(build_manifest_basenames()) | set(_SYNC_MANIFEST_EXTRA)))',
+        '_SYNC_MANIFEST_NAMES = tuple(sorted(\n'
+        '    set(_SYNC_MANIFEST_EXTRA) | {\n'
+        '        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",\n'
+        '        "settings.gradle.kts", "go.mod", "go.work", "Cargo.toml",\n'
+        '        "package.json", "pyproject.toml", "setup.py", "requirements.txt"}))',
+        ['test_sync_manifest_names_derives_from_the_single_source'],
     ),
 ]
 

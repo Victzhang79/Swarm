@@ -665,6 +665,54 @@ def test_pc1_bare_pom_gate_recognizes_python_baseline(tmp_path):
         "纯 python 基线无根 pom ⇒ ③必须自门控省略（注入即冤杀，终闸复核 M-1）"
 
 
+def test_xpom_xml_is_not_a_pom_create(tmp_path):
+    """★P-C1 复核 R2-1（F1 同型误命中的收口）★ pom 判定必须 **basename 相等**——
+    `endswith("pom.xml")` 会把 `xpom.xml` 误判为 pom create，注入 `test -f`/
+    `! grep '<version>${'` 等 Maven 专属断言给非 pom 产物虚假背书。
+    """
+    from swarm.brain.plan_finisher import ensure_pom_create_min_acceptance as _gate
+
+    plan = _plan(_st("st-1", create=["module/xpom.xml"]))
+    assert _gate(plan, str(tmp_path)) == {}, \
+        "xpom.xml 不是 pom create——同后缀误命中必须收口（R2-1，与 F1 同原理）"
+    # 对照方向：真 pom.xml 仍注入（防「整条闸删掉」式突变拿本测试当假绿）
+    plan2 = _plan(_st("st-2", create=["module/pom.xml"]))
+    assert set(_gate(plan2, str(tmp_path))) == {"st-2"}, "真 pom.xml 必须仍注入①②"
+
+
+def test_negated_grep_rewrite_does_not_touch_xpom_xml():
+    """★R2-1 同型第二现场★ `sanitize_negated_grep_exam` 的 pom 判定同口径收口——
+    对 xpom.xml 的负断言不得被重写成 `<artifactId>` 锚定形（误分类）；真 pom.xml 仍重写。"""
+    from swarm.brain.plan_finisher import sanitize_negated_grep_exam as _san
+
+    plan = _plan(_st("st-1", create=[]))
+    plan.subtasks[0].harness.verify_commands = [
+        "! grep -q 'lombok' module/xpom.xml",
+        "! grep -q 'lombok' module/pom.xml",
+    ]
+    _san(plan)
+    vcs = plan.subtasks[0].harness.verify_commands
+    assert vcs[0] == "! grep -q 'lombok' module/xpom.xml", \
+        "xpom.xml 不是 pom——不得按 pom 语义重写（R2-1）"
+    assert "<artifactId>lombok</artifactId>" in vcs[1], "真 pom.xml 必须仍被锚定重写"
+
+
+def test_sync_manifest_names_derives_from_the_single_source():
+    """★P-C1 复核 R2-2★ `_SYNC_MANIFEST_NAMES` 基础集必须从 `build_manifest_basenames()`
+    派生（#16「加一栈=加一条」的承诺到达 sync 层），extras（lockfile/ant/tsconfig）是
+    消费契约刻意的显式附加——两层都锁，防手抄表漂移回潮。"""
+    from swarm.stacks import build_manifest_basenames
+    from swarm.worker.executor_sync import _SYNC_MANIFEST_EXTRA, _SYNC_MANIFEST_NAMES
+
+    assert frozenset(_SYNC_MANIFEST_NAMES) >= build_manifest_basenames(), \
+        f"sync 层漏了 spec 里的清单: {sorted(build_manifest_basenames() - frozenset(_SYNC_MANIFEST_NAMES))}"
+    # extras 逐字锁：每件都必须是被审过的刻意附加（增删要过这条，别随手塞）
+    assert frozenset(_SYNC_MANIFEST_EXTRA) == frozenset(
+        {"build.xml", "go.sum", "Cargo.lock", "tsconfig.json"})
+    # 派生承诺的实证：spec 有而旧手抄表漏的 Pipfile 现在必须到场
+    assert "Pipfile" in _SYNC_MANIFEST_NAMES
+
+
 def test_unknown_stack_fallback_is_loud(tmp_path, caplog):
     """★P-C1 LOUD（血规 3）★ `unknown → 回退 Maven` 是降级，必须至少一次 WARNING。
 

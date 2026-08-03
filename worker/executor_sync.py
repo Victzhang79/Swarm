@@ -32,6 +32,7 @@ from swarm.config.settings import get_config
 from swarm.git_base import resolve_base_ref
 from swarm.models.errors import TransientInfraError
 from swarm.paths import is_within_root
+from swarm.stacks import build_manifest_basenames
 from swarm.worker.git_flock import _ProjectGitFlock
 
 logger = logging.getLogger(__name__)
@@ -59,14 +60,20 @@ _BOOTSTRAP_MARKER_NAME = ".swarm_bootstrap_marker"
 # 与"始终补传变更清单"（FINDING-11 泛化）共用同一集合。旧 _BUILD_MANIFESTS 只列 JVM
 # （pom/gradle），npm/cargo/go 的聚合清单（package.json/Cargo.toml/go.mod/go.work）不在
 # "始终补传"集 → 上游注册的聚合清单不进沙箱 → "reactor not found"死法换栈复发。
-_SYNC_MANIFEST_NAMES = (
-    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
-    "settings.gradle.kts", "build.xml",                       # JVM
-    "go.mod", "go.sum", "go.work",                            # Go
-    "Cargo.toml", "Cargo.lock",                               # Rust
-    "package.json", "tsconfig.json",                          # JS/TS
-    "pyproject.toml", "setup.py", "requirements.txt",         # Python
+#
+# ★P-C1 复核 R2-2★ 基础集从 STACK_SPEC 派生（`build_manifest_basenames()`——#16「加一栈
+# =加一条表项」的承诺自此到达 sync 层，不再手抄一份会漂移的表）。extras 是本层消费契约
+# 【刻意的】附加（血规 10 第三条：复用单一事实源 ≠ 复用消费契约）——sync 要的是
+# 「沙箱构建必需文件」宁滥勿缺，lockfile/工程配置不是 spec 语义上的"构建清单"但缺了
+# 构建就死：
+_SYNC_MANIFEST_EXTRA = (
+    "build.xml",       # Ant（JVM 元老构建工具，STACK_SPEC 未收录该栈）
+    "go.sum",          # Go 依赖锁定——沙箱可复现构建必需，非清单语义
+    "Cargo.lock",      # Rust 依赖锁定——同上
+    "tsconfig.json",   # TS 工程配置——tsc/eslint 闸门输入，非依赖清单
 )
+_SYNC_MANIFEST_NAMES = tuple(sorted(
+    set(build_manifest_basenames()) | set(_SYNC_MANIFEST_EXTRA)))
 
 # C13（19号文）：截断上限提为模块级——达上限 WARNING 可观测 + 测试可缩小复现。
 _MODULE_SRC_CAP = 800

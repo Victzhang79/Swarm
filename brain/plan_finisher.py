@@ -1207,6 +1207,14 @@ def wire_module_pom_dep_edges(plan, dirs, project_path: str | None = None) -> di
     return added
 
 
+def _is_pom_manifest_path(path: str) -> bool:
+    """P-C1 复核 R2-1：pom 判定一律 **basename 相等**（与 #16/F1 `_evidence_class` 口径
+    同源）——`endswith("pom.xml")` 会把 `xpom.xml` 这类同后缀文件误判为 pom create，
+    注入 `test -f`/`! grep '<version>${'` 等 Maven 专属断言给非 pom 产物虚假背书。
+    """
+    return path.replace("\\", "/").rsplit("/", 1)[-1].strip().lower() == "pom.xml"
+
+
 def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str, list[str]]:
     """R67L-B3⑤（22号文批次3·裸奔闸，round67l st-3-1 实锤）：create pom.xml 的子任务
     零 verify_commands=零确定性闸过闸（st-3-1 零验收过掉 parent 3.8.7 幻觉 pom，
@@ -1250,7 +1258,7 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
             continue
         poms = [str(f).replace("\\", "/").lstrip("/")
                 for f in (getattr(sc, "create_files", None) or [])
-                if str(f).replace("\\", "/").endswith("pom.xml")]
+                if _is_pom_manifest_path(str(f))]
         if not poms or list(getattr(h, "verify_commands", None) or []):
             continue                        # 非 pom create / 已有考卷 → 不动
         cmds: list[str] = []
@@ -1326,7 +1334,7 @@ def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
                 new_vcs.append(vc)
                 continue
             new_pat = None
-            if all(t.endswith("pom.xml") for t in targets) and _WORD.fullmatch(pat):
+            if all(_is_pom_manifest_path(t) for t in targets) and _WORD.fullmatch(pat):
                 new_pat = f"<artifactId>{pat}</artifactId>"
             elif (all(t.endswith((".java", ".kt", ".scala")) or "/src/" in t
                       for t in targets) and _PKG.fullmatch(pat)):
