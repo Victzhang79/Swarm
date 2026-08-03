@@ -257,7 +257,11 @@ def test_unrecognized_engine_is_distinguishable_from_no_frontend(tmp_path, caplo
     with caplog.at_level(logging.WARNING, logger="swarm.brain.stack_detect"):
         prof = detect(path)
     assert prof["signals"]["tmpl_engine_unrecognized"] is True
-    assert prof["signals"]["unengined_template_dir_files"] == 2
+    # LOW-6：signals 里的计数镜像键已删（零生产消费者）——计数的人读面由 WARNING/
+    # evidence 文本承担，锁人读面即可。
+    assert any("2 个网页文件" in e for e in prof["evidence"]), "计数的人读面（evidence）丢了"
+    assert "unengined_template_dir_files" not in prof["signals"], \
+        "零消费者键复活（血规 10 第四条：新账没有消费者＝没造）"
     assert prof["needs_model_adjudication"] is True, "认不得必须交模型裁决，绝不高置信定案"
     assert "无独立前端" not in prof["frontend"], "认不得 ≠ 没有，人读面也不许谎称"
     assert [r for r in caplog.records if "P-C3" in r.getMessage()], "降级路径必须留 WARNING"
@@ -286,6 +290,43 @@ def test_real_api_only_project_is_not_flagged_unrecognized(tmp_path, files):
     assert prof["needs_model_adjudication"] is False
     assert "无独立前端" in prof["frontend"]
     assert "前端形态未判明" not in format_stack_for_prompt(prof)
+
+
+def test_helm_chart_templates_dir_is_not_flagged_unrecognized(tmp_path):
+    """★P-C3 复核 MEDIUM-5（病灶本体）★ 带 Helm chart 的纯 API 仓不得被拉进「认不得」。
+
+    Helm 硬约定 `<chart>/templates/_helpers.tpl`（K8s manifest 模板**片段**，不是网页
+    文件），而 `templates` 恰是 `_TEMPLATE_DIR_NAMES` 的命中词、`.tpl` 恰在
+    `_WEBPAGE_EXTS`——治前：unrecognized=True、conf 0.75→0.55、强制裁决 ⇒ 每次白烧
+    一轮 LLM + prompt 发一段事实错误的描述（`_helpers.tpl` 不是网页文件）。
+    排除判据＝`Chart.yaml`/`values.yaml`（Helm 的确定性标记，栈中立——跨栈部署工具）。
+    """
+    prof = detect(_mk(tmp_path, {
+        "go.mod": "module example.com/api\n\ngo 1.21\n",
+        "main.go": "package main\nfunc main(){}\n",
+        "deploy/chart/Chart.yaml": "apiVersion: v2\nname: api\n",
+        "deploy/chart/values.yaml": "replicas: 2\n",
+        "deploy/chart/templates/_helpers.tpl": "{{- define \"api.name\" -}}api{{- end -}}\n",
+        "deploy/chart/templates/deployment.yaml": "apiVersion: apps/v1\n",
+    }))
+    assert prof["frontend_kind"] == "none"
+    assert prof["signals"]["tmpl_engine_unrecognized"] is False, \
+        "Helm chart 的 templates/_helpers.tpl 不是网页文件（MEDIUM-5）"
+    assert prof["needs_model_adjudication"] is False, "不得白烧一轮 LLM 裁决"
+    assert "无独立前端" in prof["frontend"]
+
+
+def test_lone_tpl_without_a_chart_marker_is_still_unrecognized(tmp_path):
+    """★对照方向★ 没有 Chart.yaml/values.yaml 的 `templates/x.tpl` 仍是「认不得」——
+    排除判据只认 Helm 确定性标记，不许把"模板目录下恰好是 .tpl"整类豁免
+    （Smarty 等未收录引擎靠这条通道拿到裁决）。"""
+    prof = detect(_mk(tmp_path, {
+        "app.cabal": "build-depends: base, yesod\n",
+        "src/Main.hs": "main = return ()\n",
+        "templates/page.tpl": "<html>{$title}</html>\n",
+    }))
+    assert prof["signals"]["tmpl_engine_unrecognized"] is True
+    assert prof["needs_model_adjudication"] is True
 
 
 def test_vue_spa_with_views_dir_is_not_flagged_unrecognized(tmp_path):
@@ -418,7 +459,6 @@ def test_scan_failed_profile_has_the_same_signals_shape(tmp_path):
     assert prof["scan_failed"] is True
     assert prof["frontend_kind"] == "none"
     assert prof["signals"]["tmpl_engine_unrecognized"] is False
-    assert prof["signals"]["unengined_template_dir_files"] == 0
     assert prof["needs_model_adjudication"] is False, "空证据绝不交 LLM 裁决"
     assert "前端形态未判明" not in format_stack_for_prompt(prof)
 
@@ -455,8 +495,86 @@ async def test_adjudication_clears_the_flag_so_it_is_not_sticky(tmp_path, monkey
     out = await pn.detect_stack(state)
     prof = out["project_stack"]
     assert prof["signals"]["tmpl_engine_unrecognized"] is False, "裁决后仍粘滞"
-    assert prof["signals"]["tmpl_engine_unrecognized_adjudicated"] is True, "清标要留痕"
+    # LOW-6：`tmpl_engine_unrecognized_adjudicated` 机读键零生产消费者已删——
+    # 清标留痕由 INFO 日志承担（人读面），不造没人消费的账（血规 10 第四条）。
+    assert "tmpl_engine_unrecognized_adjudicated" not in prof["signals"], "零消费者键复活"
     assert "前端形态未判明" not in format_stack_for_prompt(prof)
+
+
+@pytest.mark.asyncio
+async def test_adjudication_with_non_enum_kind_is_rejected_at_the_schema(tmp_path, monkeypatch,
+                                                                        caplog):
+    """★P-C3 复核 MEDIUM-4（病灶本体）★ 清标判据必须锁在**被消费的** `frontend_kind` 上。
+
+    劣化形态一：`server_template`（下划线）/`服务端模板`（中文）——非空非法值被 schema
+    validator 拦在类型边界 ⇒ 整裁决作废沿用确定性结果（与"形状非法→抛→沿用"同构）。
+    治前：kind 不进枚举 ⇒ `format_stack_for_prompt` 一条约定都不发（与病灶逐字相同），
+    而标已被清掉 ⇒ 连"认不得"兜底提示都没了，且缓存命中不重裁决 ⇒ 永久钉死。
+    """
+    from swarm.brain import planning_nodes as pn
+
+    class _Resp:
+        content = json.dumps({"frontend": "服务端模板（Twig）",
+                              "frontend_kind": "server_template",   # ← 下划线：非枚举
+                              "backend": "Yesod (haskell)", "build": "cabal", "confidence": 0.8})
+
+    class _LLM:
+        async def ainvoke(self, msgs):
+            return _Resp()
+
+    proj = _mk(tmp_path, {
+        "app.cabal": "build-depends: base, yesod\n",
+        "templates/home.html": "<html>#{title}</html>",
+    })
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda *a, **kw: _LLM())
+    monkeypatch.setattr(pn, "_resolve_project_path", lambda state: proj)
+    assert detect(proj)["signals"]["tmpl_engine_unrecognized"] is True
+
+    state = {"project_id": "p-pc3b", "task_id": "t-pc3b", "knowledge_context": None}
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.planning_nodes"):
+        out = await pn.detect_stack(state)
+    prof = out["project_stack"]
+    assert prof["signals"]["tmpl_engine_unrecognized"] is True, \
+        "非枚举 kind 被采纳 ⇒ 标被清 ⇒ 「什么都不发」钉成永久状态（MEDIUM-4）"
+    assert prof["frontend_kind"] == "none", "确定性初判必须保留（裁决整废）"
+    assert [r for r in caplog.records if "裁决失败" in r.getMessage()], "整废无留痕"
+
+
+@pytest.mark.asyncio
+async def test_adjudication_with_missing_kind_does_not_clear_the_flag(tmp_path, monkeypatch,
+                                                                     caplog):
+    """★MEDIUM-4 劣化形态二★ **漏字段**（`frontend_kind` 缺席 ⇒ 默认 ""）——schema 放行
+    （空串是"模型没答"的合法形状），由清标合取分档：采纳 frontend 文本、kind 保留初判、
+    **不清标** + WARNING，让"认不得"提示继续发。
+    """
+    from swarm.brain import planning_nodes as pn
+
+    class _Resp:
+        # 注意：没有 frontend_kind 键（真实 LLM 漏字段是常态，schema 默认值 "" 为此而设）
+        content = json.dumps({"frontend": "服务端模板（Hamlet）",
+                              "backend": "Yesod (haskell)", "build": "cabal", "confidence": 0.8})
+
+    class _LLM:
+        async def ainvoke(self, msgs):
+            return _Resp()
+
+    proj = _mk(tmp_path, {
+        "app.cabal": "build-depends: base, yesod\n",
+        "templates/home.html": "<html>#{title}</html>",
+    })
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda *a, **kw: _LLM())
+    monkeypatch.setattr(pn, "_resolve_project_path", lambda state: proj)
+    assert detect(proj)["signals"]["tmpl_engine_unrecognized"] is True
+
+    state = {"project_id": "p-pc3c", "task_id": "t-pc3c", "knowledge_context": None}
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.planning_nodes"):
+        out = await pn.detect_stack(state)
+    prof = out["project_stack"]
+    assert prof["frontend"] == "服务端模板（Hamlet）", "frontend 文本裁决应采纳"
+    assert prof["frontend_kind"] == "none", "漏字段 ⇒ kind 保留确定性初判"
+    assert prof["signals"]["tmpl_engine_unrecognized"] is True, \
+        "漏字段 ⇒ 不清标（认不得提示继续发，绝不把「什么都不发」钉成永久状态）"
+    assert [r for r in caplog.records if "MEDIUM-4" in r.getMessage()], "不清标必须 WARNING"
 
 
 def test_template_dir_names_are_stack_neutral():

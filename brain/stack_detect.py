@@ -626,8 +626,7 @@ def _scan_failed_profile(reason: str) -> dict:
         # 下游发出"别当没前端"的提示，而这里连目录都没读到，那提示是凭空的）。
         "signals": {"manifests": [], "server_template_files": 0, "spa_files": 0,
                     "frontend_project_dirs": [],
-                    "tmpl_engine_unrecognized": False,
-                    "unengined_template_dir_files": 0},
+                    "tmpl_engine_unrecognized": False},
         "needs_model_adjudication": False,
         "scan_failed": True, "scan_failed_reason": reason,
         "source": "scan_failed",
@@ -668,6 +667,12 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     tmpl_count = 0
     template_engine_hits: Counter = Counter()
     unengined_tmpl_dir_files = 0   # P-C3：模板目录下认不出引擎的网页文件数
+    # ★P-C3 复核 MEDIUM-5★ unengined 改两阶段：walk 时记候选路径，walk 后排除 Helm chart
+    # 再计数（Chart.yaml/values.yaml 是 Helm 的确定性标记；`<chart>/templates/_helpers.tpl`
+    # 是 K8s manifest 模板片段不是网页文件，而 `templates` 恰是 _TEMPLATE_DIR_NAMES 的
+    # 硬约定命中词 ⇒ 纯 API + Helm chart 的仓被误拉进「认不得」，白烧一轮 LLM 裁决）。
+    helm_chart_dirs: set[str] = set()   # Chart.yaml/values.yaml 所在目录（rel，"/" 分隔）
+    unengined_candidates: list[str] = []  # 候选 rel 路径（封顶 200 防巨仓）
     spa_files: Counter = Counter()
     jsx_count = 0
     has_angular = False
@@ -700,6 +705,10 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             if ext == ".java" and len(infra_class_paths) < 200 and _is_infra_classname(f[:-5]):
                 infra_class_paths.append(os.path.join(root, f))
             low = f.lower()
+            if f in ("Chart.yaml", "values.yaml"):
+                # MEDIUM-5：Helm chart 确定性标记（栈中立——Helm 是跨栈部署工具）。
+                # 只记目录；候选排除在 walk 后统一做（不依赖 walk 内文件顺序）。
+                helm_chart_dirs.add(rel.replace(os.sep, "/"))
             if f in _MANIFEST_BACKEND or f.endswith(".csproj"):
                 manifests.append(os.path.join(rel, f) if rel else f)
                 # R65TR-T5 猎手 F1：按 basename【累积】而非覆盖——多模块工程每个子模块
@@ -734,7 +743,18 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             if _eng is None and ext in _WEBPAGE_EXTS:
                 _segs = {s.lower() for s in rel.replace(os.sep, "/").split("/") if s}
                 if _segs & _TEMPLATE_DIR_NAMES:
-                    unengined_tmpl_dir_files += 1
+                    if len(unengined_candidates) < 200:
+                        unengined_candidates.append(
+                            (rel.replace(os.sep, "/") + "/" + f) if rel else f)
+
+    # MEDIUM-5：Helm chart 内的网页后缀文件（`_helpers.tpl` 等）一律不计——它们是 K8s
+    # manifest 模板片段，不是网页。判定＝候选文件的目录落在某个 chart 根之下（含嵌套
+    # 子目录，如 `<chart>/templates/sub/`）。
+    for _cand in unengined_candidates:
+        _cdir = _cand.rsplit("/", 1)[0] if "/" in _cand else ""
+        if any(_cdir == _h or _cdir.startswith(_h + "/") for _h in helm_chart_dirs):
+            continue
+        unengined_tmpl_dir_files += 1
 
     evidence: list[str] = []
     # ── 后端语言/构建/框架 ──
@@ -981,8 +1001,9 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
             # ★P-C3 机读键★ `frontend_kind == "none"` 的两种成因判别：True＝"看到网页文件但
             # 认不出引擎"（扫描失败），False/缺席＝"真没有前端"（合法答案）。消费者见
             # `format_stack_for_prompt`（发"别当没前端"的提示）与 needs_adj。
+            # LOW-6：原 `unengined_template_dir_files` 计数键零生产消费者已删（血规 10
+            # 第四条）——计数的人读面由 WARNING/evidence 文本承担。
             "tmpl_engine_unrecognized": tmpl_engine_unrecognized,
-            "unengined_template_dir_files": unengined_tmpl_dir_files,
         },
         "needs_model_adjudication": needs_adj,
         "source": "deterministic",

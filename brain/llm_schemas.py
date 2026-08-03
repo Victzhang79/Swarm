@@ -51,6 +51,11 @@ class ComplexityAssessmentResponse(BaseModel):
         return []
 
 
+# ★单一事实源★ `frontend_kind` 的可消费取值——schema 校验、裁决 prompt 契约、
+# 清标合取三处同源（MEDIUM-4：判据必须锁在被消费的那个字段上）。
+FRONTEND_KINDS = ("server-template", "spa", "separated", "none")
+
+
 class StackAdjudicateResponse(BaseModel):
     """DETECT_STACK 大模型裁决响应。frontend 为载荷关键(调用方据其决定是否采纳裁决)。"""
     model_config = {"extra": "ignore"}
@@ -69,6 +74,21 @@ class StackAdjudicateResponse(BaseModel):
             return float(v)
         except (TypeError, ValueError):
             return 0.5
+
+    @field_validator("frontend_kind")
+    @classmethod
+    def _kind_must_be_consumable(cls, v):
+        """★P-C3 复核 MEDIUM-4★ `frontend_kind` 是**被消费的**字段（`format_stack_for_prompt`
+        按它分档发前端约定），自由文本形态（`server_template` 下划线/`服务端模板` 中文）
+        会让消费者一条约定都不发——与病灶原状态逐字相同，而标已被清掉 ⇒ 连"认不得"
+        兜底提示都没了。非枚举值 ⇒ ValidationError ⇒ 调用方沿用确定性结果（整裁决作废，
+        与"形状非法→抛→沿用"的 TD2606-B1 路径同构）。空串（漏字段）放行——由调用方的
+        清标合取分档（不采纳 kind、不清标、WARNING）。"""
+        if v and v not in FRONTEND_KINDS:
+            raise ValueError(
+                f"frontend_kind={v!r} 不在消费枚举 {FRONTEND_KINDS}——自由文本形态"
+                "会让下游一条前端约定都不发（MEDIUM-4），整条裁决作废沿用确定性结果")
+        return v
 
 
 class FailureStrategyResponse(BaseModel):

@@ -29,6 +29,7 @@ TESTS = ["test/test_pc3_template_engine_multistack.py",
 
 SD = ROOT / "brain" / "stack_detect.py"
 PN = ROOT / "brain" / "planning_nodes.py"
+LS = ROOT / "brain" / "llm_schemas.py"
 
 MUTATIONS = [
     # ── ① 事实表扩栈 ──
@@ -187,8 +188,9 @@ MUTATIONS = [
         SD,
         '                _segs = {s.lower() for s in rel.replace(os.sep, "/").split("/") if s}\n'
         '                if _segs & _TEMPLATE_DIR_NAMES:\n'
-        '                    unengined_tmpl_dir_files += 1',
-        '                unengined_tmpl_dir_files += 1',
+        '                    if len(unengined_candidates) < 200:',
+        '                if True:\n'
+        '                    if len(unengined_candidates) < 200:',
         # 首版还指名了 `..._real_api_only_project_...` → 突变后仍绿：那两个夹具**一个网页
         # 文件都没有**（纯 go / 纯 Maven API），去掉目录条件也改不动它们。真正锁住这条的是
         # 带散落 `docs/coverage.html` 的那个夹具。
@@ -220,10 +222,8 @@ MUTATIONS = [
         'P-C3：★误伤★ 扫描失败画像也带上"认不得"（连目录都没读到却发"别当没前端"，'
         '且可能把空证据推给 LLM 裁决＝幻觉画像产地）',
         SD,
-        '                    "tmpl_engine_unrecognized": False,\n'
-        '                    "unengined_template_dir_files": 0},',
-        '                    "tmpl_engine_unrecognized": True,\n'
-        '                    "unengined_template_dir_files": 1},',
+        '                    "tmpl_engine_unrecognized": False},',
+        '                    "tmpl_engine_unrecognized": True},',
         ['test_scan_failed_profile_has_the_same_signals_shape'],
     ),
     # ── 粘滞信号（读裁决路径时逮到的自伤）──
@@ -232,10 +232,48 @@ MUTATIONS = [
         'prompt 对已裁决的画像继续发"我看不清、别当没前端"）',
         PN,
         '                if (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):\n'
-        '                    profile["signals"]["tmpl_engine_unrecognized"] = False',
+        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
         '                if False:\n'
-        '                    profile["signals"]["tmpl_engine_unrecognized"] = False',
+        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
         ['test_adjudication_clears_the_flag_so_it_is_not_sticky'],
+    ),
+    # ── ④ #21：MEDIUM-4/5（P-C3 复核）──────────────────────────────
+    (
+        'MEDIUM-4：schema validator 删除（`server_template` 下划线/中文形态穿过类型边界 ⇒ '
+        'kind 不可消费 ⇒ 一条约定都不发 + 整裁决被采纳）',
+        LS,
+        '        if v and v not in FRONTEND_KINDS:',
+        '        if False:',
+        ['test_adjudication_with_non_enum_kind_is_rejected_at_the_schema'],
+    ),
+    (
+        'MEDIUM-4：清标合取删除（漏字段 kind="" 也清标 ⇒ 「认不得」兜底提示消失，'
+        '「什么都不发」钉成永久状态——缓存命中不重裁决）',
+        PN,
+        '                    if adj.frontend_kind in FRONTEND_KINDS:\n'
+        '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
+        '                    if True:\n'
+        '                        profile["signals"]["tmpl_engine_unrecognized"] = False',
+        ['test_adjudication_with_missing_kind_does_not_clear_the_flag'],
+    ),
+    (
+        'MEDIUM-5：Helm chart 排除删除（`templates/_helpers.tpl` 重新误触发「认不得」⇒ '
+        '带 Helm chart 的纯 API 仓白烧一轮 LLM 裁决 + prompt 发事实错误描述）',
+        SD,
+        '        if any(_cdir == _h or _cdir.startswith(_h + "/") for _h in helm_chart_dirs):\n'
+        '            continue',
+        '        if False:\n'
+        '            continue',
+        ['test_helm_chart_templates_dir_is_not_flagged_unrecognized'],
+    ),
+    (
+        'MEDIUM-5：Chart.yaml 收集删除（排除判据的证据源断了 ⇒ 同上后果）',
+        SD,
+        '            if f in ("Chart.yaml", "values.yaml"):',
+        '            if False:',
+        ['test_helm_chart_templates_dir_is_not_flagged_unrecognized'],
     ),
     # ── ③ #18：判据的**计数范围**（P-C3 复核 CRITICAL-1）──────────────────────────
     (
@@ -373,8 +411,8 @@ MUTATIONS = [
         '项目一行不生效，且是静默 no-op：消费者 `.get()` 读缺键得 None＝假值。这是 v5 那次'
         '事故的原形态，第二次）',
         PN,
+        '_STACK_SCHEMA_VERSION = 7',
         '_STACK_SCHEMA_VERSION = 6',
-        '_STACK_SCHEMA_VERSION = 5',
         ['test_stack_schema_version_paired_with_cached_payload'],
     ),
     (

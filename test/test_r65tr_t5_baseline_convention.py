@@ -224,6 +224,12 @@ def _stack_cache_payload_digest() -> str:
                               "templates/base.html": "{% block content %}{% endblock %}"}),
         ("spa", {"package.json": '{"dependencies":{"vue":"^3.4.0"}}',
                  "src/App.vue": "<template></template>"}),
+        # #21/MEDIUM-5：Helm chart 的 `templates/_helpers.tpl` 不得触发「认不得」——
+        # 判定逻辑改动（Chart.yaml 排除）只有这个夹具捕得到，前三个对它零区分力。
+        ("helm_chart", {"go.mod": "module example.com/api\n\ngo 1.21\n",
+                        "main.go": "package main\nfunc main(){}\n",
+                        "deploy/chart/Chart.yaml": "apiVersion: v2\nname: api\n",
+                        "deploy/chart/templates/_helpers.tpl": "{{- end -}}\n"}),
     ):
         with tempfile.TemporaryDirectory() as d:
             for rel, body in files.items():
@@ -260,8 +266,10 @@ def test_stack_schema_version_paired_with_cached_payload():
     digest = _stack_cache_payload_digest()
     # v5→v6：#18 判据计数范围收敛（`verdict[drf_api_only]` 从 server-template/0.95 翻回 none）
     # + #20 四栈扩表（_TEMPLATE_EXT_ENGINE/_SERVER_TEMPLATE_DEP/_TEMPLATE_DIR_NAMES 三张表）。
+    # v6→v7：#21 LOW-6 删零消费者键（signals.unengined_template_dir_files ⇒ key_paths 变）
+    # + MEDIUM-5 Helm chart 排除（新增 verdict[helm_chart] 夹具位）。
     # 摘要跨 hash 种子稳定（实测 PYTHONHASHSEED=0/1/12345/random 四轮同值）。
-    assert (_STACK_SCHEMA_VERSION, digest) == (6, "5363ff4066986248"), (
+    assert (_STACK_SCHEMA_VERSION, digest) == (7, "18b2a5446dd19112"), (
         f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"

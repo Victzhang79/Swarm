@@ -33,6 +33,7 @@ from swarm.brain.nodes import (  # noqa: E402
 )
 from swarm.brain.nodes.shared import parse_and_validate  # noqa: E402
 from swarm.brain.llm_schemas import (  # noqa: E402
+    FRONTEND_KINDS,
     ComplexityAssessmentResponse,
     StackAdjudicateResponse,
     validate_file_plan,
@@ -883,7 +884,7 @@ async def assess(state: BrainState) -> dict:
 STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓库的【磁盘客观证据】，"""\
 """请据此判定它的真实技术栈（不要靠框架名先验，只看证据）。严格输出 JSON：
 {"frontend":"前端栈(如 Vue / React / 服务端模板(Thymeleaf) / 无)",
- "frontend_kind":"server-template|spa|separated|none",
+ "frontend_kind":\"""" + "|".join(FRONTEND_KINDS) + """\",
  "backend":"后端栈(如 Spring Boot (java) / Django (python))","build":"构建工具",
  "confidence":0.0-1.0,"reason":"判定依据(引用证据)"}"""
 
@@ -908,7 +909,16 @@ STACK_ADJUDICATE_SYSTEM = """你是资深架构师。下面是对一个代码仓
 #     #18 让 DRF 纯 API 工程从 server-template/0.95（错）翻回 none；#20 让四栈从 none/0.75
 #     （错）翻成 server-template。已建档项目缓存里存的正是那批**旧的错答案**，不 bump ⇒ 命中
 #     缓存早返 ⇒ 治法对所有已建档项目一行不生效（同 v5 的 CRITICAL-2 形态，第二次）。
-_STACK_SCHEMA_VERSION = 6
+# v7: #21（P-C3 复核 MEDIUM-4/5 + LOW-6）。MEDIUM-4：清标判据锁到被消费的 frontend_kind
+#     上（schema validator 拦非枚举非空值 + 清标合取拦漏字段）——治前已采纳的劣化裁决
+#     （kind='server_template' 等，标已清、一条约定都不发）**已按指纹写进缓存**，而缓存命中
+#     路径不重看 needs_model_adjudication ⇒ 不 bump 那些项目永远钉在"什么都不发"。
+#     MEDIUM-5：Helm chart 的 templates/_helpers.tpl 不再误触发「认不得」（Chart.yaml
+#     排除）⇒ 带 Helm chart 的仓的正确答案从 adj=True 翻回不裁决——同样是"改变了已缓存
+#     项目的正确答案"那一类（v5/v6 同形状，第三次）。LOW-6：删两个零消费者键
+#     （signals.unengined_template_dir_files / tmpl_engine_unrecognized_adjudicated），
+#     画像字段变化本身也要 bump。
+_STACK_SCHEMA_VERSION = 7
 
 
 async def detect_stack(state: BrainState) -> dict:
@@ -1007,14 +1017,29 @@ async def detect_stack(state: BrainState) -> dict:
                 # `tmpl_engine_unrecognized` 的**唯一用途**是把不确定性抬到这次裁决前；裁决
                 # 一旦给出形态，问题就已解决。留着它会让 `format_stack_for_prompt` 继续发
                 # "我看不清、别当没前端"——触发它的机制已经把它答完了，它还在响。
-                # 只在裁决**真的落定**（adj.frontend 非空、已 update）时清，裁决失败/形状非法
-                # 走 except 沿用确定性结果时**不清**（那时不确定性依然真实存在）。
+                # ★P-C3 复核 MEDIUM-4★ 判据必须锁在**被消费的那个字段**上：清标条件原来是
+                # `adj.frontend`（自由文本）非空，而消费者按 `frontend_kind` 分档——模型回
+                # `server_template`（下划线）/`服务端模板`（中文）/漏字段时，kind 不进枚举 ⇒
+                # `format_stack_for_prompt` 一条约定都不发（与病灶原状态逐字相同），标却已被
+                # 清掉 ⇒ 连"认不得"兜底提示都没了，且缓存命中路径不重裁决 ⇒ 永久钉死。
+                # ⇒ 清标加合取：kind 必须落在可消费枚举内（FRONTEND_KINDS 单一事实源）。
+                # 非空非法值已被 schema validator 拦在类型边界（整裁决作废走 except）；
+                # 这里挡的是**漏字段**（kind="" 默认值穿过校验）那一支：不清标 + WARNING，
+                # 让"认不得"提示继续发。清标留痕由两侧日志承担（LOW-6：原
+                # `tmpl_engine_unrecognized_adjudicated` 机读键零生产消费者，已删——
+                # 新账没有消费者＝没造，血规 10 第四条）。
                 if (profile.get("signals") or {}).get("tmpl_engine_unrecognized"):
-                    profile["signals"]["tmpl_engine_unrecognized"] = False
-                    profile["signals"]["tmpl_engine_unrecognized_adjudicated"] = True
-                    logger.info(
-                        "[DETECT_STACK] P-C3 模板引擎「认不得」已由模型裁决落定为 kind=%s"
-                        "（清标，避免粘滞信号继续喊「看不清」）", profile["frontend_kind"])
+                    if adj.frontend_kind in FRONTEND_KINDS:
+                        profile["signals"]["tmpl_engine_unrecognized"] = False
+                        logger.info(
+                            "[DETECT_STACK] P-C3 模板引擎「认不得」已由模型裁决落定为 kind=%s"
+                            "（清标，避免粘滞信号继续喊「看不清」）", profile["frontend_kind"])
+                    else:
+                        logger.warning(
+                            "[DETECT_STACK] P-C3 复核 MEDIUM-4：裁决未给出可消费的 "
+                            "frontend_kind（%r，漏字段）→ 保留确定性初判 %r、**不清标**"
+                            "（「认不得」提示继续发，绝不把「什么都不发」钉成永久状态）",
+                            adj.frontend_kind, profile.get("frontend_kind"))
                 logger.info("[DETECT_STACK] 大模型裁决后：前端=%s 后端=%s 置信=%.2f",
                             profile["frontend"], profile["backend"], profile["confidence"])
         except Exception as exc:  # noqa: BLE001
