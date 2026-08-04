@@ -236,6 +236,11 @@ def _stack_cache_payload_digest() -> str:
                              "main.go": "package main\nfunc main(){}\n",
                              "Chart.yaml": "apiVersion: v2\nname: api\n",
                              "templates/_helpers.tpl": "{{- end -}}\n"}),
+        # P-M1（27 号文）：纯 npm API（无前端）的正确答案从 adj=True（零清单证据 -0.3 罚）
+        # 翻回不裁决——改的是置信罚判据的消费面（manifests 含不含 package.json），
+        # 表侧/_LANG_SOURCE_EXTS 都盖不到这一格（v5~v9 同形状，逻辑侧改动）。
+        ("npm_api_only", {"package.json": '{"name":"api","dependencies":{"express":"^4"}}',
+                          "src/mod0.ts": "export {}", "src/mod1.ts": "export {}"}),
     ):
         with tempfile.TemporaryDirectory() as d:
             for rel, body in files.items():
@@ -303,8 +308,11 @@ def test_stack_schema_version_paired_with_cached_payload():
     # ⇒ py/jvm 两夹具的 profile_key_paths 都变（键恒在场，空 dict 也占 key_path）。
     # hunter H-1 同批：摘要补④值层夹具——key_paths 锁不住「键里值的语义」，三键完整值
     # 纳入摘要（值变了摘要必变，忘 bump 会被本条拦住）。
+    # v9→v10：27 号文 P-M1——package.json 进 _MANIFEST_BACKEND（表变摘要即变）+
+    # 新增 verdict[npm_api_only] 夹具位（纯 npm API 正确答案从 adj=True 翻回不裁决，
+    # 置信罚判据的消费面=逻辑侧改动，表侧锁不到）。
     # 摘要跨 hash 种子稳定（实测 PYTHONHASHSEED=0/1/12345/random 四轮同值）。
-    assert (_STACK_SCHEMA_VERSION, digest) == (9, "748b21d90d025ba6"), (
+    assert (_STACK_SCHEMA_VERSION, digest) == (10, "719533d24a2bc6ec"), (
         f"栈画像的字段集或事实表变了（当前摘要 {digest}，版本 {_STACK_SCHEMA_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_STACK_SCHEMA_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ 已缓存项目的 schema_version 仍等于常量 ⇒ detect_stack 命中缓存\n"

@@ -54,6 +54,13 @@ _MANIFEST_BACKEND = {
     "manage.py": ("python", "django-cli"),
     "go.mod": ("go", "go"),
     "Cargo.toml": ("rust", "cargo"),
+    # P-M1（27 号文）：package.json 进表=进 manifests（signals/evidence/置信罚判据）。
+    # ★但它【不参与后端仲裁候选】（下方候选循环显式跳过）★——它是唯一同时充当
+    # 【前端子工程清单】的清单名，而仲裁按全仓源文件数投票：django+react 根布局
+    # （根 package.json + backend/pom.xml）里前端 .ts/.vue 票仓会把 backend 从
+    # python/java 翻成 npm（复用单一事实源≠复用其消费契约，血规 10③）。纯 npm
+    # 工程由 manifest_texts fallback 定栈（原逻辑保留），行为与治前逐字节一致。
+    "package.json": ("javascript/typescript", "npm"),
     "composer.json": ("php", "composer"),
     "Gemfile": ("ruby", "bundler"),
     "mix.exs": ("elixir", "mix"),
@@ -311,7 +318,11 @@ _NOISE_DIRS = {".git", "node_modules", "target", "dist", "build", ".venv",
 #     + format_stack_for_prompt 对三栈渲染硬约束。画像字段变化=「已缓存项目的正确答案
 #     变了」（v5/v6/v7/v8 同形状，第五次）：不 bump 则已建档项目命中缓存早返，对它们
 #     一行不生效且静默（消费者 .get() 读缺席键得 None 当假值）。
-_STACK_SCHEMA_VERSION = 9
+# v10: 27 号文 P-M1——package.json 进 _MANIFEST_BACKEND（signals.manifests/evidence
+#     清单行/置信罚判据三个消费面）。已缓存的 npm 工程画像里是旧答案
+#     （manifests=[]+confidence 0.45+needs_adj=True），不 bump 则这些项目命中缓存早返，
+#     继续拿空证据白烧 LLM 裁决（v5~v9 同形状，第六次）。
+_STACK_SCHEMA_VERSION = 10
 
 
 def compute_repo_fingerprint(project_path: str) -> str:
@@ -334,7 +345,7 @@ def compute_repo_fingerprint(project_path: str) -> str:
                 dirs[:] = []
                 continue
             for f in files:
-                if f in _MANIFEST_BACKEND or f in ("package.json", "angular.json") \
+                if f in _MANIFEST_BACKEND or f == "angular.json" \
                         or f.endswith((".csproj", "next.config.js", "vite.config.js")):
                     p = os.path.join(root, f)
                     try:
@@ -919,8 +930,9 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
                     manifest_texts[f] = (
                         manifest_texts.get(f, "") + " " + _read_text(os.path.join(root, f)))
             if f == "package.json":
-                manifest_texts.setdefault("package.json", "")
-                manifest_texts["package.json"] += _read_text(os.path.join(root, f))
+                # P-M1：文本累积已由上方 _MANIFEST_BACKEND 统一分支承担（带 200k 帽，
+                # 治前此处无帽双写）；此分支只剩【前端子工程目录】记账（根 package.json
+                # 不算前端工程——`if rel` 刻意）。
                 if rel:
                     frontend_proj_dirs.append(rel)
             if f == "angular.json":
@@ -986,6 +998,12 @@ def detect_stack_deterministic(project_path: str, max_dirs: int = 2400) -> dict:
     _cands: list[tuple[str, str, str]] = []      # (lang, build, 清单名)
     for mf in manifests:
         base = os.path.basename(mf)
+        # P-M1：package.json 收进 manifests（证据/置信/signals）但【不进后端仲裁
+        # 候选】——它同时是前端子工程清单，仲裁按全仓源文件数投票时前端 .ts/.vue
+        # 票仓会把分离工程的 backend 翻成 npm（消费契约不同）。纯 npm 工程走下方
+        # manifest_texts fallback 定栈，与治前逐字节一致。
+        if base == "package.json":
+            continue
         if base in _MANIFEST_BACKEND:
             _l, _b = _MANIFEST_BACKEND[base]
             _cands.append((_l, _b, base))
