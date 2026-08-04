@@ -294,13 +294,28 @@ def _real_l2_success_state(stack_key: str) -> dict:
 
     现在 L2 不再失败（CRITICAL-3 换层），真实出态就是"通过 + 带 degraded 留痕"，
     形状取自 `verify.py` 的 `if _l2_unverified_degraded: return {...}` 那条分支。
+    ★B-7 分族★ 生产侧自 B-7 起写 `verification_unsupported_stack:<栈>:l2` 新族名
+    （闸清单进族名），且 verify_l2 薄包装同时写 `verification_coverage` 格——
+    两个键都在真实出态里，夹具必须同步（旧前缀的兼容由下方专条锁）。
     """
     return {
         "l2_passed": True,
-        "degraded_reasons": [f"l2_unsupported_stack:{stack_key}"],
+        "degraded_reasons": [f"verification_unsupported_stack:{stack_key}:l2"],
         "failed_subtask_ids": [],
         "l2_details": {"integration_review": {"compile_gate_unsupported_stack": stack_key}},
+        "verification_coverage": {"l2": f"unsupported_stack:{stack_key}"},
     }
+
+
+def test_auto_accept_refuses_on_legacy_l2_prefix_from_old_checkpoint():
+    """★checkpoint 兼容锁（B-7 分族）★ 升级前 checkpoint 里的旧前缀
+    `l2_unsupported_stack:<栈>` 条目必须【仍然】拒 auto_accept——改名只改生产侧，
+    闸不认旧条目=把硬闸对存量任务静默拆掉。"""
+    allow, reason = can_auto_accept_delivery(
+        {"l2_passed": True, "failed_subtask_ids": [],
+         "degraded_reasons": ["l2_unsupported_stack:php"]})
+    assert allow is False
+    assert reason.startswith("verification_unsupported_stack:php"), reason
 
 
 def test_auto_accept_refuses_on_unsupported_stack_with_honest_attribution():
@@ -352,8 +367,8 @@ def test_auto_accept_still_says_l2_failed_for_a_real_compile_failure():
 def test_auto_accept_reports_all_matched_stacks_not_just_the_first():
     """MEDIUM-3：混栈仓要报全集，别让人按错的栈去查。"""
     state = {"l2_passed": True, "failed_subtask_ids": [],
-             "degraded_reasons": ["l2_unsupported_stack:php",
-                                  "l2_unsupported_stack:ruby"]}
+             "degraded_reasons": ["verification_unsupported_stack:php:l2",
+                                  "verification_unsupported_stack:ruby:l2"]}
     allow, reason = can_auto_accept_delivery(state)
     assert allow is False
     assert "php" in reason and "ruby" in reason, reason

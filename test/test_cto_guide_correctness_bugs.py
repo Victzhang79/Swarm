@@ -45,7 +45,11 @@ def test_n03_batch_prompt_uses_acceptance_criteria():
 # ── N-04 verify_l3 返回 l3_branch ──
 def test_n04_verify_l3_returns_branch():
     import swarm.brain.nodes.verify as v
-    src = inspect.getsource(v.verify_l3) if hasattr(v, "verify_l3") else inspect.getsource(v)
+    # B-7：verify_l3 拆成薄包装（写 verification_coverage 格）+ _verify_l3_impl（本体），
+    # l3_branch 的产出在本体——结构断言必须指向本体，断包装会把"实现挪了窝"误报成"实现没了"。
+    src = inspect.getsource(v._verify_l3_impl) if hasattr(v, "_verify_l3_impl") \
+        else inspect.getsource(v.verify_l3) if hasattr(v, "verify_l3") \
+        else inspect.getsource(v)
     assert '"l3_branch"' in src, "verify_l3 应返回 l3_branch（否则 MR 指向未推送分支）"
 
 

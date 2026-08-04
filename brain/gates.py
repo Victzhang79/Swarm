@@ -204,25 +204,48 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             "非启动/探活失败）"
         )
 
-    # ★V-C1（B-4a）★ 该栈的 L2 集成编译闸**本仓未实现** → 交付未经自动编译验证 → 拒
-    # auto_accept、强制人工确认（§6.3 原则 3：**不是拦交付**，是拒绝自动放行）。
+    # ★V-C1（B-4a）+ B-7 分族（27 号文 §6.3 原则 3）★ 该栈的确定性验证闸**本仓未实现**
+    # → 交付未经自动验证 → 拒 auto_accept、强制人工确认（§6.3 原则 3：**不是拦交付**，
+    # 是拒绝自动放行）。族名 `verification_unsupported_stack:<栈>:<闸清单>`（B-7 起生产侧
+    # 只写新族名；旧前缀 `l2_unsupported_stack:` 仍认——升级前 checkpoint 里的存量条目
+    # 不得因改名失效，那是把硬闸静默拆掉的复发形态）。
     #
     # ★判序与载体都是双复核整改的结果（CRITICAL-1/CRITICAL-3）★
     # 上一版把这条接在 `not l2_passed` 分支里，而到达 DELIVER 且 l2_passed=False 的唯一路径
     # 是 escalate 出口，它**必带** `failure_escalated=True` + 非空 `failed_subtask_ids`
     # ——两者在本函数里都排在更前面 → 那条分支**在生产路径上永不执行**（L6"治本被静默关闭"
     # 的复发形态：闸造好了，接在没人走的路上）。现在改成：L2 侧不产 issue（l2_passed 仍 True），
-    # 事实走 `degraded_reasons`，本判定放在"其它闸都过了"之后——此时前面那些 return 都不会
+    # 事实走 `degraded_reasons`（留痕）+ `verification_coverage`（本轮判据，见下方 H-1 注），
+    # 本判定放在"其它闸都过了"之后——此时前面那些 return 都不会
     # 抢先，分支真正可达。
-    _unsup = [str(d) for d in (state.get("degraded_reasons") or [])
-              if str(d).startswith("l2_unsupported_stack:")]
+    # ★B-7 R2（hunter H-1）★ 判据分两层：verification_coverage 的 l2 格是【本轮事实】
+    # （reducer 每轮覆写该格，verify_l2 每轮必写）；degraded_reasons 是【append-only
+    # 审计账】——replan 后栈已变 / 升级后该栈已支持时，旧轮写入的 unsupported 条目在
+    # degraded 里永久粘滞（reducer 无人能清，与 coverage_gap_residual 的设立动机同源），
+    # 拿它当判据 = 把"历史某轮没验"误拦成"本轮没验"。故覆盖账在场即以格为准；
+    # 旧 checkpoint 无覆盖账 → 回退 degraded 扫描（兼容存量，含旧前缀）。
+    _cov = state.get("verification_coverage") or {}
+    _l2_cell = str(_cov.get("l2") or "")
+    if _l2_cell:
+        _unsup = ([f"verification_unsupported_stack:{_l2_cell.split(':', 1)[1]}:l2"]
+                  if _l2_cell.startswith("unsupported_stack:") else [])
+    else:
+        _unsup = [str(d) for d in (state.get("degraded_reasons") or [])
+                  if str(d).startswith("verification_unsupported_stack:")
+                  or str(d).startswith("l2_unsupported_stack:")]
     if _unsup:
-        _keys = sorted({d.split(":", 1)[1] for d in _unsup if ":" in d})
+        # 族格式：<lang> 在 [1]、闸清单在 [2]（旧前缀无 [2]，按 l2 计）。
+        _keys = sorted({d.split(":")[1] for d in _unsup if len(d.split(":")) > 1})
+        _gates_hit = sorted({d.split(":")[2] if len(d.split(":")) > 2 else "l2"
+                             for d in _unsup})
+        # B-7：覆盖账进拒因——"本栈哪几道闸没验"人读即得，不用再回去翻 degraded 散文。
+        _cov_note = "；".join(f"{g}={v}" for g, v in sorted(_cov.items())) or "（无覆盖账）"
         return False, (
             f"verification_unsupported_stack:{','.join(_keys) or 'unknown'}: "
-            "该栈的 L2 集成编译闸本仓未实现（磁盘上有构建面却派生不出编译命令）→ 本次交付的"
-            "编译正确性**未经自动验证**，拒绝 auto_accept。这不是代码失败、也不是 worker 的错；"
-            "请人工确认后用 --no-auto-accept 放行，或补该栈的 BuildDriver"
+            f"该栈的确定性验证闸本仓未实现（未实现闸={','.join(_gates_hit)}；"
+            f"验证覆盖账：{_cov_note}）→ 本次交付**未经完整自动验证**，拒绝 auto_accept。"
+            "这不是代码失败、也不是 worker 的错；请人工确认后用 --no-auto-accept 放行，"
+            "或补该栈的 BuildDriver"
         )
 
     # ★G12（Task#9 审计⑥）★ baseline_covered 被【运行时断言证伪】→ 无条件硬拦 auto_accept

@@ -45,6 +45,22 @@ def _merge_degraded_reasons(
     return merged
 
 
+def _merge_verification_coverage(
+    old: dict[str, str] | None, new: dict[str, str] | None
+) -> dict[str, str]:
+    """LangGraph reducer for ``verification_coverage``（B-7/V-C3）—— 浅合并按格覆写。
+
+    为什么是 reducer 而非 last-write-wins：各验证节点（verify_l2 / verify_runtime /
+    verify_l3）【各写各的格】，last-write-wins 会让后写者把先写者的格整表抹掉。
+    同格覆写=重入/重试取最新轮次（与 runtime_smoke 键族"整体替换防粘滞"同哲学，
+    粒度从整表细到格）。任一侧 None 容错为 {}。
+    """
+    out = dict(old or {})
+    for k, v in (new or {}).items():
+        out[str(k)] = str(v)
+    return out
+
+
 class BrainState(TypedDict, total=False):
     """Swarm Brain 状态机的完整状态。
 
@@ -161,6 +177,21 @@ class BrainState(TypedDict, total=False):
     l3_message: str                     # L3 验证说明
     l3_branch: str                      # N-04：verify_l3 实际推送的分支，供 learn_success MR 指向正确分支
     verification_failure: str | None    # l2 / l3 / runtime_smoke 等验证失败来源（handle_failure 专类分支据此归因）
+    # ★B-7/V-C3（27 号文 §6.3 原则 3）★ 验证覆盖账：每道确定性验证闸写一格
+    # （l2 / runtime_smoke / l3），值域 passed | passed:unverified | failed | skipped |
+    # unsupported_stack:<栈键>（★R2 hunter M-1★ passed:unverified = l2_passed=True 但
+    # 无测试命令/测试降级 LLM/编译未核验——"放行"与"验过"必须机读可分，否则消费者
+    # 谎称"验过"）。治前"四闸全 None（都没验）仍 auto_accept 放行"只靠人读
+    # degraded_reasons 散文可辨；本账让"验了没有/验了几道/哪道没实现"机读可查。
+    # 声明先行铁律同下：不声明则被 LangGraph 静默丢弃。reducer=浅合并按格覆写
+    # （各闸各写各格，重入取最新轮——★R2 hunter H-1★ 这正是它相对 append-only 的
+    # degraded_reasons 的价值：本账是【本轮事实】，gates 的未支持栈判据在场即以本账
+    # 为准，旧轮粘滞条目不再误拦）。
+    # 消费者：deliver payload 明示（runner._build_result_payload）+ gates 拒因文案
+    # 与未支持栈判据（can_auto_accept_delivery）。本键的 passed:unverified 格是
+    # 【观测账】不是新硬闸——那三族本来就不硬拦 auto_accept（拦 L6 假学习走
+    # should_write_success 的 degraded 通道）。
+    verification_coverage: Annotated[dict[str, str], _merge_verification_coverage]
 
     # ═══ S1-4 运行时冒烟闸门（VERIFY_RUNTIME，docs/RUNTIME_SMOKE_DESIGN.md §4）═══
     # 为什么必须声明：LangGraph 未声明键=【静默丢弃】（本文件下方 schema 补全段实证）——不声明则

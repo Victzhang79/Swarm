@@ -249,7 +249,15 @@ STACK_SPEC: dict[str, StackSpec] = {
         # ⇒ 合表当场炸出 `test_supported_stacks_with_wider_manifests_are_not_misjudged`
         # （Pipfile 工程被误判 no_build_surface＝"闸未实现"）。这正是"两份实现必然漂移"
         # 的实证——合表之后这类漂移不可能再无声无息。
-        root_manifests=("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
+        root_manifests=("pyproject.toml", "setup.py", "requirements.txt", "Pipfile",
+                        # ★B-7 准入闸（27 号文）★ `manage.py` 是 Django 工程的确定性证据，
+                        # 一直在 `stack_detect._MANIFEST_BACKEND`（检测侧认它）却不在本表
+                        # （driver 侧不认）→ 准入对账的唯一缺口。后果是实的：manage.py-only
+                        # 工程在 `_detect_build_stack` 落 unknown→Maven 兜底造 pom、在
+                        # detect_build_surface 落 NO_BUILD_SURFACE（"真没有"谎报）。
+                        # 消费后果审计：①构建命令=compileall（Django 安全）②栈识别 python
+                        # 优先于 unknown 兜底（正确方向）③plan 路径 manage.py 归 python（正确）。
+                        "manage.py"),
         module_manifest="pyproject.toml",
         # ★P-H4a★ python per-pyproject driver 已落地（contract_utils `_P2_SCAFFOLD_DRIVERS`
         # 派生集对账，test_b3 防漂移）——owner 按契约一次建全模块清单，demote 安全。

@@ -24,10 +24,30 @@ from swarm.stacks import DEPENDENCY_TREE_DIRS
 _MAVEN_POM = "pom.xml"
 _GRADLE = ("build.gradle", "build.gradle.kts")
 _NPM = "package.json"
-_PY_REQ = ("requirements.txt", "pyproject.toml", "setup.py", "Pipfile")
+# ★B-7 R2（hunter M-2）★ manage.py 必须进发现面：stacks/spec.py 的 python
+# root_manifests 已含 manage.py（B-7 准入闸，Django 确定性证据），integration_review
+# 的 detect_build_surface 也认它出 compileall 构建命令——沙箱发现面不认 = 纯 Django
+# 工程镜像 base_only 无 python 工具链，而 L2 侧却认为"有构建面"，两面口径漂移。
+# warmup 安全：image_builder 的 python 预热【只在】 dep_source basename 恰为
+# requirements.txt 时出 pip 命令（X-M4），manage.py 命中只会装工具链、不会拿它当
+# 依赖清单喂 pip。
+_PY_REQ = ("requirements.txt", "pyproject.toml", "setup.py", "Pipfile", "manage.py")
 _GO_MOD = "go.mod"
 _CARGO = "Cargo.toml"
 _DOCKER = ("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yaml")
+
+# ★B-7 准入闸 + X-M6（27 号文）★ find_build_files 能【发现】但本仓无工具链 driver
+# 的栈。发现面与准入必须同批扩——只扩发现面而不扩准入 = 新栈被静默当已知栈处理
+# （base_only 谎称"无构建文件"），比不扩更坏。本表即【显式 unsupported 登记】：
+# infer_env_spec 对每个命中 kind 落 `unsupported_toolchain:<kind>:` 机读 note
+# （消费者=preprocess 的 notes→WARNING 通道，本模块无 logger，notes 是唯一可观测
+# 通道），绝不静默跳过、绝不猜工具链版本（血规 2）。新栈要给真工具链 = 加
+# _infer_* 分派并从本表移除（test_b7 准入对账强制两表互斥）。
+_UNSUPPORTED_TOOLCHAIN_KINDS: dict[str, str] = {
+    "csharp": "*.csproj/*.sln",
+    "php": "composer.json",
+    "ruby": "Gemfile",
+}
 
 # 扫描时跳过的目录（与 preprocess EXCLUDED_DIRS 对齐核心项）
 # 清单**发现**时跳过的目录。判据是「这里的清单不是本工程的构建入口」——
@@ -170,6 +190,12 @@ def find_build_files(project_path: str | Path,
             _add("go", rel)
         elif name == _CARGO:
             _add("rust", rel)
+        elif name == "composer.json":
+            _add("php", rel)       # B-7/X-M6：发现面扩三栈（无工具链 driver，显式登记）
+        elif name == "Gemfile":
+            _add("ruby", rel)
+        elif name.endswith((".csproj", ".sln")):
+            _add("csharp", rel)
         elif name in _DOCKER:
             _add("docker", rel)
     return found
@@ -368,8 +394,22 @@ def infer_env_spec(project_path: str | Path, project_id: str = "") -> EnvSpec:
     if "rust" in bf:
         spec.toolchains.append(_infer_simple("rust", "cargo", root, bf["rust"]))
 
+    # ★B-7/X-M6★ 发现得了但不支持的栈：显式 unsupported 登记（机读键 + WARNING 通道
+    # 有消费者），绝不静默落入 base_only 的"无构建文件"谎报。
+    for _kind, _hint in _UNSUPPORTED_TOOLCHAIN_KINDS.items():
+        if _kind in bf:
+            spec.notes.append(
+                f"unsupported_toolchain:{_kind}: 发现 {_hint}（{bf[_kind][:3]}）但本仓无该栈"
+                "工具链 driver（B-7 准入闸登记）→ 镜像不装该工具链；面向该栈的构建/测试"
+                "命令会在沙箱 127——如实暴露，绝不静默当已知栈")
+
     if not spec.toolchains:
         spec.base_only = True
-        spec.notes.append("无构建文件 → 基础镜像；全新项目等首个任务需求分析再补装工具链")
+        if any(k in bf for k in _UNSUPPORTED_TOOLCHAIN_KINDS):
+            spec.notes.append(
+                "仅发现未支持栈构建文件 → 基础镜像（见 unsupported_toolchain 注记；"
+                "与「无构建文件」严格区分——前者是「认得了但不支持」，后者是「真没有」）")
+        else:
+            spec.notes.append("无构建文件 → 基础镜像；全新项目等首个任务需求分析再补装工具链")
 
     return spec

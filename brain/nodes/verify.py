@@ -76,6 +76,10 @@ async def verify_l2(state: BrainState) -> dict:
     结论】处收口：L2 通过 → sid 写入 state（runtime_smoke_sandbox_id，对象经进程内
     manager._instances registry 转交 verify_runtime）；L2 未通过/异常 → verify_runtime
     不会执行，本节点是最后责任人，立即销毁，不留 900s 泄漏窗。
+
+    B-7/V-C3：在此单一收口写 `verification_coverage` 的 l2 格（实现体的 ~10 个出口
+    不必各写各的）。格值【只】从实现体返回的机读事实推导（degraded 增量里的
+    verification_unsupported_stack 族 + l2_passed），绝不另起第二判据。
     """
     handoff: list[str] = []
     try:
@@ -90,7 +94,26 @@ async def verify_l2(state: BrainState) -> dict:
             result = {**result, "runtime_smoke_sandbox_id": sid}
         else:
             await asyncio.to_thread(_kill_sandbox_quiet, sid)
-    return result
+    _unsup = next(
+        (str(d).split(":")[1] for d in (result.get("degraded_reasons") or [])
+         if str(d).startswith("verification_unsupported_stack:")), None)
+    if _unsup:
+        _cell = f"unsupported_stack:{_unsup}"
+    elif result.get("l2_passed") is True:
+        # ★B-7 R2（hunter M-1）★ 「passed」必须分出「真验过」与「放行但未验」——
+        # 无测试命令 / 测试降级为 LLM 判定 / 编译未核验三族都是 l2_passed=True 但
+        # 交付【未经确定性验证】；账值混成 passed 会让消费者（gates 拒因 / deliver
+        # payload）谎称"验过"。分档值 passed:unverified，与 unsupported_stack 族
+        # 同通道（观测账，不新造硬闸——这三族本来也不硬拦 auto_accept）。
+        _deg = [str(d) for d in (result.get("degraded_reasons") or [])]
+        _cell = ("passed:unverified" if any(d.startswith(
+            ("l2_no_test_executed", "l2_test_downgraded_to_llm",
+             "l2_compile_unverified")) for d in _deg) else "passed")
+    elif result.get("l2_passed") is False:
+        _cell = "failed"
+    else:
+        _cell = "skipped"
+    return {**result, "verification_coverage": {"l2": _cell}}
 
 
 async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
@@ -328,8 +351,11 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         # 与 :172 的 l2_compile_unverified、:470 的 l2_no_test_executed 同族同通道。
         _unsup_stack = ir_details.get("compile_gate_unsupported_stack")
         if _unsup_stack:
+            # ★B-7 分族（27 号文 §6.3 原则 3）★ 族名 `verification_unsupported_stack:<栈>:<闸>`
+            # ——闸清单进族名，gates 硬拦认族前缀（旧前缀 l2_unsupported_stack: 仍认，
+            # 升级前 checkpoint 兼容）。verify_l2 薄包装据此格化 verification_coverage。
             _l2_unverified_degraded = list(_l2_unverified_degraded) + [
-                f"l2_unsupported_stack:{_unsup_stack}"]
+                f"verification_unsupported_stack:{_unsup_stack}:l2"]
             logger.warning(
                 "[VERIFY_L2] V-C1 栈 %s 的集成编译闸未实现（命中构建面 %s）→ degraded 留痕，"
                 "拒 auto_accept（不阻断交付、不烧 replan）", _unsup_stack,
@@ -351,10 +377,17 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     _infra_degrade,
                     (ir_details.get("reset_failed_files")
                      or ir_details.get("rollback_reset_failed") or "工具链不可用"))
-                return _l2_failure_state(
-                    subtask_results, attributed_ids=None,
-                    l2_details={"integration_review": ir_details, "issues": ir_issues,
-                                "infra_degrade": _infra_degrade})
+                return {
+                    **_l2_failure_state(
+                        subtask_results, attributed_ids=None,
+                        l2_details={"integration_review": ir_details, "issues": ir_issues,
+                                    "infra_degrade": _infra_degrade}),
+                    # ★B-7 R2（reviewer HIGH）★ 未支持栈与 infra 降级【可同现】（编译闸未实现
+                    # ≠ compile_unverified 不置位）；本出口先前吞 _l2_unverified_degraded →
+                    # 族留痕/覆盖账推导静默丢失。与 :446/:466 出口同口径携出。
+                    **({"degraded_reasons": _l2_unverified_degraded}
+                       if _l2_unverified_degraded else {}),
+                }
             if any("契约" in i for i in ir_issues):
                 # D5（阶段6）+ A1 单调守卫（round38c P0，用户拍板 a+b）：契约失败按缺失
                 # 符号归因 owner 定向重派（语料=全 plan，命中被弃者由 HANDLE_FAILURE 复活）；
@@ -425,14 +458,21 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                     "failed_subtask_ids": _ctr_failed,
                     "l2_missing_fp_history": _fp_hist,
                     "l2_details": _l2d,
+                    # B-7：未支持栈与契约失败可同现（编译闸未实现≠契约对账不跑），
+                    # 族留痕在失败出口同样不丢（同 :466 接线修复口径）。
+                    **({"degraded_reasons": _l2_unverified_degraded}
+                       if _l2_unverified_degraded else {}),
                 }
             # TD2606-B8：把集成编译失败归因到具体子任务（编译输出已含出错文件路径），
             # 能定位则只重做相关子任务、保留成功兄弟；定位不了回退现状（全量 replan）。
             _l2_details = {"integration_review": ir_details, "issues": ir_issues}
             attributed = attribute_l2_failure(plan_obj, _l2_details, subtask_results)
-            return _l2_failure_state(
-                subtask_results, attributed_ids=attributed, l2_details=_l2_details
-            )
+            return {
+                **_l2_failure_state(
+                    subtask_results, attributed_ids=attributed, l2_details=_l2_details),
+                **({"degraded_reasons": _l2_unverified_degraded}
+                   if _l2_unverified_degraded else {}),
+            }
         # F5（对抗复核，T5 粘滞同构）：契约对账通过=旧缺失集已解决 → 指纹历史必须清零，
         # 否则跨"失败→修好→回归"的历史残留会让新一轮首次契约失败被误凑成三连直升级。
         if state.get("l2_missing_fp_history"):
@@ -445,11 +485,17 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         sandbox_result = await asyncio.to_thread(
             nodes._try_l2_sandbox_verify, project_id, merged_diff, test_cmd, timeout=180
         )
+        # ★B-7 接线修复★ 本支路两个通过出口原先【不携】_l2_unverified_degraded——
+        # 未支持栈工程带 test_cmd 且测试通过时，verification_unsupported_stack 族留痕
+        # 在此丢失 → gates 拒 auto_accept 臂整段不可达（B-4a 闸造好了接在没人走的路上，
+        # 血规 10① 又一实例）。与 :501/:506 的 LLM 兜底路径同口径补齐。
+        _deg_carry = ({"degraded_reasons": _l2_unverified_degraded}
+                      if _l2_unverified_degraded else {})
         if sandbox_result is not None:
             logger.info("[VERIFY_L2] 沙箱结果: %s", "通过" if sandbox_result else "未通过")
             if not sandbox_result:
-                return {**_l2_failure_state(subtask_results), **_fp_reset}
-            return {"l2_passed": sandbox_result, **_fp_reset}
+                return {**_l2_failure_state(subtask_results), **_fp_reset, **_deg_carry}
+            return {"l2_passed": sandbox_result, **_fp_reset, **_deg_carry}
 
         local_result = await asyncio.to_thread(
             nodes._try_l2_local_verify,
@@ -459,8 +505,8 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         if local_result is not None:
             logger.info("[VERIFY_L2] 本地结果: %s", "通过" if local_result else "未通过")
             if not local_result:
-                return {**_l2_failure_state(subtask_results), **_fp_reset}
-            return {"l2_passed": local_result, **_fp_reset}
+                return {**_l2_failure_state(subtask_results), **_fp_reset, **_deg_carry}
+            return {"l2_passed": local_result, **_fp_reset, **_deg_carry}
         # B3-F8：有 test_cmd 但沙箱 infra + 本地工具链【双 None】（确定性功能测试均未跑成）→
         # 下方跌落 _verify_l2_via_llm 纯 LLM 判定。旧行为无任何 degraded 留痕（除非 project_path
         # 为 None），"真测试从未执行却 l2_passed=True"对 gates/人工/L6 完全不可观测。补一条降级，
@@ -509,6 +555,15 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
 
 async def verify_l3(state: BrainState) -> dict:
+    """VERIFY_L3 薄包装（B-7/V-C3）：写 `verification_coverage` 的 l3 格——
+    格值只从实现体返回的机读事实推导（l3_passed 三态），绝不另起第二判据。"""
+    result = await _verify_l3_impl(state)
+    _l3 = result.get("l3_passed")
+    _cell = "passed" if _l3 is True else "failed" if _l3 is False else "skipped"
+    return {**result, "verification_coverage": {"l3": _cell}}
+
+
+async def _verify_l3_impl(state: BrainState) -> dict:
     """VERIFY_L3 节点 — L3 预发/扩展验证（COMPLEX/ULTRA）
 
     输入: merged_diff, complexity, task_description
@@ -676,6 +731,16 @@ def should_reverse_resolve_port(derivation) -> bool:
 
 
 async def verify_runtime(state: BrainState) -> dict:
+    """VERIFY_RUNTIME 薄包装（B-7/V-C3）：写 `verification_coverage` 的
+    runtime_smoke 格——格值只从实现体返回的机读事实推导（runtime_smoke_passed
+    三态），绝不另起第二判据。"""
+    result = await _verify_runtime_impl(state)
+    _rt = result.get("runtime_smoke_passed")
+    _cell = "passed" if _rt is True else "failed" if _rt is False else "skipped"
+    return {**result, "verification_coverage": {"runtime_smoke": _cell}}
+
+
+async def _verify_runtime_impl(state: BrainState) -> dict:
     """VERIFY_RUNTIME 节点 — 运行时冒烟闸门（S1-4 接线；推导层 task#16 + 探针层 task#17）。
 
     输入: project_stack, project_id, runtime_smoke_sandbox_id(L2 编译沙箱延活转交，可缺)
