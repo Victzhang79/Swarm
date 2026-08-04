@@ -287,32 +287,52 @@ def _plan_with(desc):
     return _P([_S(desc)])
 
 
-def test_non_maven_template_stack_is_detected():
-    """有权威模板痕迹但本机制不支持的栈，必须能被认出来（否则告警无从触发）。"""
-    from swarm.brain.contract_utils import _authoritative_template_stacks as f
-    assert f(_plan_with("创建 package.json（原样写入下述权威模板）")) == {"npm"}
-    assert f(_plan_with("创建 go.mod（原样写入下述权威模板）")) == {"go"}
+def _fence(path: str, body: str = "x") -> str:
+    """与生产注入的【权威 X 模板】围栏块同形（散文提及≠模板证据）。"""
+    return (f"【权威 {path.rsplit('/', 1)[-1]} 模板（确定性生成，原样写入 {path}）】"
+            f"\n```\n{body}\n```")
 
 
-def test_maven_template_is_the_supported_stack():
-    """Maven 是当前唯一被支持的栈——判据本身也要能认出它（否则会误报"不支持"）。"""
-    from swarm.brain.contract_utils import _authoritative_template_stacks as f
-    assert f(_plan_with("创建 pom.xml（原样写入下述权威模板）")) == {"maven"}
+def test_template_manifest_detected_from_real_fence_block():
+    """权威模板落点必须能被认出（判据与 reconcile 同源=_extract_auth_templates，
+    返回落点 basename——driver 按清单名注册，「认不得」按同一粒度报）。"""
+    from swarm.brain.contract_utils import _authoritative_template_manifests as f
+    assert f(_plan_with(_fence("web/package.json"))) == {"package.json"}
+    assert f(_plan_with(_fence("svc/go.mod"))) == {"go.mod"}
+    assert f(_plan_with(_fence("svc/requirements.txt"))) == {"requirements.txt"}
+
+
+def test_maven_manifest_detected():
+    """pom.xml 在驱动表内——判据本身也要能认出它（否则差集恒真、误报"不支持"）。"""
+    from swarm.brain.contract_utils import _authoritative_template_manifests as f
+    assert f(_plan_with(_fence("ruoyi-admin/pom.xml"))) == {"pom.xml"}
+
+
+def test_prose_mention_is_not_template_evidence():
+    """★P-H2 R2 reviewer F3★ 散文提到 package.json（甚至带「原样写入」字样）但没有
+    真实围栏块 = 零模板证据——治前的第二口子串扫描会把它认成 npm 模板，把同一描述里
+    真 unsupported 落点（stack.toml）的 G-H11 告警压掉。"""
+    from swarm.brain.contract_utils import _authoritative_template_manifests as f
+    assert f(_plan_with("参考 package.json 写法，原样写入下述权威模板")) == set()
+    mixed = "参考 package.json 写法\n" + _fence("svc/stack.toml")
+    assert f(_plan_with(mixed)) == {"stack.toml"}, \
+        "散文里的 package.json 绝不许压掉 stack.toml 的真落点"
 
 
 def test_no_template_no_noise():
     """无权威模板的普通子任务 → 空集，绝不产生噪声告警。"""
-    from swarm.brain.contract_utils import _authoritative_template_stacks as f
+    from swarm.brain.contract_utils import _authoritative_template_manifests as f
     assert f(_plan_with("实现 AlarmService 的发送逻辑")) == set()
 
 
 def test_unsupported_stack_absence_is_reported():
-    """★接线事实：不支持的栈必须在咽喉处告警 + record_degrade★
-    否则这个 Maven 独有的机制会对 npm/go 工程永久静默失效——
-    "空返回是正常返回"正是 norms 层死了 12 天没人知道的同一个形态。"""
+    """★接线事实：不支持的落点必须在咽喉处告警 + record_degrade★
+    否则这个机制会对 driver 表外的栈永久静默失效——
+    "空返回是正常返回"正是 norms 层死了 12 天没人知道的同一个形态。
+    （P-H2 多栈化后：支持集=_EXAM_DRIVERS 键域单一事实源，键名随之改如实。）"""
     import inspect
 
     from swarm.brain import contract_utils
     src = inspect.getsource(contract_utils.inject_build_scaffold_subtasks)
-    assert "_authoritative_template_stacks" in src
-    assert "non_maven_stack_unsupported" in src
+    assert "_authoritative_template_manifests" in src
+    assert "stack_unsupported" in src

@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from swarm.stacks import (
     DEPENDENCY_TREE_DIRS,
@@ -2211,14 +2211,17 @@ def _should_fabricate_maven_scaffold(
 
 
 def _extract_auth_templates(desc: str) -> list[tuple[str, str]]:
-    """description → [(pom 路径, 模板 XML)]（仅「原样写入」CREATE 形态；MODIFY 片段
-    是增量语义、文件终态不确定，考卷同源不适用）。"""
+    """description → [(清单路径, 模板体)]（仅「原样写入」CREATE 形态；MODIFY 片段
+    是增量语义、文件终态不确定，考卷同源不适用）。
+    ★P-H2★ 头标签与围栏语言全栈通吃（pom/package.json/go.mod/pyproject.toml/
+    Cargo.toml/build.gradle(.kts)，go 是裸围栏）——栈分派在落点 basename
+    （`_EXAM_DRIVERS`），不在头标签字面。"""
     import re as _re
     out: list[tuple[str, str]] = []
     for m in _re.finditer(
             # 复核 CONFIRMED：路径捕获必须排除全角）——聚合父/孤儿脚手架措辞
             # 「原样写入 {pom}）】」无限定语，漏排会把 ）粘进路径 → 断言永远考错文件
-            r"【权威 pom 模板（[^】]*?原样写入 ([^\s;；)）】]+)[^】]*】\n```xml\n(.*?)\n?```",
+            r"【权威 [^】]*?模板（[^】]*?原样写入 ([^\s;；)）】]+)[^】]*】\n```[a-zA-Z]*\n(.*?)\n?```",
             desc or "", flags=_re.S):
         out.append((m.group(1).strip(), m.group(2)))
     return out
@@ -2274,30 +2277,196 @@ def _is_pom_content_assert(cmd: str, pom: str) -> bool:
                 or _re.match(r'^test\s+-[zn]\s+["\']?\$\(\s*grep', c))
 
 
-# 权威模板的栈判据——按【模板落点文件名】认，与 _MANIFEST_BACKEND 同族口径。
-# 只用于"本轮有没有本机制不支持的栈"这一条可观测判定，不参与任何裁决。
-_TEMPLATE_STACK_BY_MANIFEST: dict[str, str] = {
-    "pom.xml": "maven",
-    "build.gradle": "gradle", "build.gradle.kts": "gradle",
-    "package.json": "npm",
-    "go.mod": "go",
-    "cargo.toml": "cargo",
-    "pyproject.toml": "python", "requirements.txt": "python",
-    "composer.json": "composer",
-    "gemfile": "bundler",
+# ═══════════════════════════════════════════════════════════════════════════════
+# P-H2（27 号文施工 + 26 号文 G-H11）：考卷同源对账【多栈驱动表】。
+# 此前 reconcile_template_exam 是 Maven 独有（锚「权威 pom 模板」字面 + ```xml 围栏），
+# npm/go/python/cargo/gradle 的权威模板恒不被识别 → 这些栈考卷永不同源，陈旧正断言照旧
+# 送 worker 送死（st-26 死型的异栈复制品）。现按【模板落点 basename】分派：依赖抽取器
+# + 正断言格式 + 规则5 措辞 + 负断言冲突扫描面。★Maven 行为逐字节不变★（同函数、同
+# 格式串、同标签；断言格式是既有测试断的字面量）。血规①：新栈=表加一行，绝不加 if。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _exam_deps_npm(tpl: str) -> list[str] | None:
+    """package.json 模板 → dependencies 键名清单（保序）。解析失败 → None（fail-honest：
+    绝不用空清单把考卷重生成成零断言——那是比不对账更坏的假同源）。
+    ★二分判据（R2 双透镜 F2/F3）★ `dependencies` 键【缺席】=真零依赖（渲染器零依赖
+    即整键缺席）→ []；键在场但结构违例（非对象/顶层非对象）=认不得 → None——
+    「真没有」与「认不得」塌成一个值，空清单就会拿去做重生成（静默失效温床）。"""
+    try:
+        data = json.loads(tpl)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "dependencies" not in data:
+        return []
+    deps = data["dependencies"]
+    if not isinstance(deps, dict):
+        return None
+    return [str(k) for k in deps]
+
+
+def _exam_deps_go(tpl: str) -> list[str] | None:
+    """go.mod 模板 → require 的 module path 清单（块/单行两形态，保序去重；
+    内部 module 的 `require x v0.0.0`+replace 同样进考卷——模板即真值不分内外）。
+    ★二分判据（R2 hunter F4）★ 零 require=真零依赖 → []；require 行/块内条目形状
+    认不得（合法 go.mod 恒 `module version` 双元）→ None（fail-honest，与 npm 同律）。"""
+    import re as _re
+    out: list[str] = []
+    in_block = False
+    for line in (tpl or "").splitlines():
+        s = line.strip()
+        if s.startswith("require ("):
+            in_block = True
+            continue
+        if in_block and s == ")":
+            in_block = False
+            continue
+        m = None
+        if in_block:
+            if not s or s.startswith("//"):
+                continue   # 块内空行/独立注释行合法（治前 `// x` 会被抓成 module "//"）
+            m = _re.match(r"(\S+)\s+\S+", s)
+            if m is None:
+                return None   # 块内认不得的行=解析失败，绝不静默丢弃
+        elif s.startswith("require "):
+            m = _re.match(r"require\s+(\S+)\s+\S+", s)
+            if m is None:
+                return None   # 裸 `require x`（无版本）=形状认不得
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def _exam_deps_python(tpl: str) -> list[str] | None:
+    """pyproject.toml 模板 → [project] dependencies 条目的包名清单（PEP 508 名=条目
+    首段，保序去重；`flask[async]>=2` → `flask`）。
+    ★二分判据（R2 双透镜 F2）★ `dependencies` 键【缺席】=真零依赖（渲染器零依赖即
+    整键缺席）→ []；键在场但形状认不得（单行数组/非数组/体非空却零条目）→ None
+    （fail-honest，与 npm 同律）。"""
+    import re as _re
+    m = _re.search(r"(?ms)^dependencies\s*=\s*\[\s*(.*?)^\]", tpl or "")
+    if not m:
+        if _re.search(r"(?m)^dependencies\s*=", tpl or ""):
+            return None   # 有键但形状认不得（单行/非数组）≠ 真没有
+        return []
+    out: list[str] = []
+    for raw in _re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+        entry = raw.replace('\\"', '"').replace("\\\\", "\\")
+        name = _re.split(r"[<>=!~\[;\s]", entry, maxsplit=1)[0].strip()
+        if name and name not in out:
+            out.append(name)
+    if not out and m.group(1).strip():
+        return None   # 体非空却一个 quoted 条目都认不得=形状认不得
+    return out
+
+
+def _exam_deps_cargo(tpl: str) -> list[str]:
+    """Cargo.toml 模板 → [dependencies] 键名清单（保序去重；path 内部依赖同进考卷）。"""
+    import re as _re
+    out: list[str] = []
+    in_deps = False
+    for line in (tpl or "").splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            in_deps = s == "[dependencies]"
+            continue
+        if in_deps:
+            m = _re.match(r"([A-Za-z0-9_\-]+)\s*=", s)
+            if m and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
+def _exam_deps_gradle(tpl: str) -> list[str]:
+    """build.gradle(.kts) 模板 → 外部坐标 `group:artifact` 清单（保序去重）。
+    ★复用 gradle_registry 的有界正则（同一坐标语法绝不第二份实现，两份必漂移）★。
+    ★边界（登记）★ `project(":a:b")` 内部依赖不进依赖考卷——内部模块的存在性由
+    编译本身响亮保证（project 引用解析失败=L1 必炸），考卷只管外部坐标。
+    `platform()/enforcedPlatform()` 包裹坐标同样不抽取（R2 hunter F5 登记）：权威
+    渲染器（P-H4c）永不产这些形态，模板即真值=考卷只与渲染器产物同源；模板里出现
+    它们=已偏离权威产物，属篡改面不归本机制（刻意不加解析臂）。"""
+    from swarm.brain import gradle_registry as _gr
+    specs: dict[str, tuple[str, str]] = {}
+    _gr._collect_text_specs(tpl, "权威模板", specs)
+    # 带版本则全坐标（raw classifier 超集 `g:a:1.0:test-fixtures` 的尾巴在 v 里完整
+    # 保留——只断 g:a=raw 依赖考卷失真）；受管省略版本（v=""）→ 无版本坐标
+    return [f"{g}:{a}:{v}" if v else f"{g}:{a}" for a, (g, v) in specs.items()]
+
+
+def _exam_assert_npm(dep: str, path: str) -> str:
+    return f"grep -q '\"{dep}\":' {path}"
+
+
+def _exam_assert_go(dep: str, path: str) -> str:
+    return f"grep -q '{dep} ' {path}"
+
+
+def _exam_assert_python(dep: str, path: str) -> str:
+    # 名后必须是条目边界符（`"pydantic"` 不得被 `"pydantic-core"` 假过）——
+    # 探针窄于真断言会冤报/假过（战役记忆：探针宽度两个方向都出过硬仗）。
+    import re as _re
+    return f"grep -qE '\"{_re.escape(dep)}[\"\\[<>=!~ ;]' {path}"
+
+
+def _exam_assert_cargo(dep: str, path: str) -> str:
+    # 抽取器已限定 `[A-Za-z0-9_-]+`（无正则元字符），无需转义——re.escape 会画蛇
+    # 添足产出 `my\-core`（ERE 未定义转义，断言字面量失真）
+    return f"grep -qE '^{dep} ' {path}"
+
+
+def _exam_assert_gradle(dep: str, path: str) -> str:
+    # 坐标字符集收尾边界（R2 hunter F6：`g:a:1.0` 不得被 `g:a:1.0-rc1`/`g:a-extra`
+    # 假过）——裸子串断言必然假过（#8 apt_packages 族；npm/python/cargo 各臂均有边界符）。
+    return f"grep -qE '{dep}[^A-Za-z0-9_.:-]' {path}"
+
+
+class _ExamStackDriver(NamedTuple):
+    stack: str
+    extract: Any           # tpl → deps 清单 | None（None=解析失败→fail-honest 跳过）
+    assert_of: Any         # (dep, path) → grep 正断言
+    rule5_suffix: str      # 规则5 机器行尾巴（Maven 措辞逐字节保留）
+    label: str | None = None    # 模板标签（None → f"{basename} 模板"）
+    scan: Any = None            # 负断言冲突判定扫描面（None=原文；maven 剥 exclusions）
+
+
+_RULE5_SUFFIX_GENERIC = "（缺一即整模块编译失败）"   # 与 normalize 规则5 非 Maven 措辞同源
+
+_EXAM_DRIVERS: dict[str, _ExamStackDriver] = {
+    "pom.xml": _ExamStackDriver(
+        "maven", _template_dep_artifacts,
+        lambda a, p: f"grep -q '<artifactId>{a}</artifactId>' {p}",
+        "（缺一即整模块 mvn compile 失败）",
+        label="pom 模板", scan=_strip_pom_exclusions),
+    "package.json": _ExamStackDriver("npm", _exam_deps_npm, _exam_assert_npm,
+                                     _RULE5_SUFFIX_GENERIC),
+    "go.mod": _ExamStackDriver("go", _exam_deps_go, _exam_assert_go,
+                               _RULE5_SUFFIX_GENERIC),
+    "pyproject.toml": _ExamStackDriver("python", _exam_deps_python, _exam_assert_python,
+                                       _RULE5_SUFFIX_GENERIC),
+    "cargo.toml": _ExamStackDriver("cargo", _exam_deps_cargo, _exam_assert_cargo,
+                                   _RULE5_SUFFIX_GENERIC),
+    "build.gradle": _ExamStackDriver("gradle", _exam_deps_gradle, _exam_assert_gradle,
+                                     _RULE5_SUFFIX_GENERIC),
+    "build.gradle.kts": _ExamStackDriver("gradle", _exam_deps_gradle, _exam_assert_gradle,
+                                         _RULE5_SUFFIX_GENERIC),
 }
 
+def _authoritative_template_manifests(plan) -> set[str]:
+    """本轮子任务【实际带权威模板围栏块】的落点 basename 集（G-H11 可观测用）。
 
-def _authoritative_template_stacks(plan) -> set[str]:
-    """本轮子任务里带「原样写入」权威模板的落点各属哪个栈（G-H11 可观测用）。"""
+    ★与 reconcile 同源=_extract_auth_templates★（单一事实源，R2 reviewer F3）：绝不
+    第二口子串扫描——散文里提到 package.json 会被当成模板证据，把真 unsupported 落点
+    （如 stack.toml）的告警压掉。★判定粒度=落点 basename★（_EXAM_DRIVERS 的键域，
+    R2 双透镜 F1）：栈粒度会让 requirements.txt 借 python 栈之名压掉告警——driver
+    是按清单名注册的，「认不得」必须按同一粒度报。无需维护「已知缺口清单」：提取
+    即证据，任何表外落点天然落在差集里（兜底与主判据枚举缺口重合族，免疫）。"""
     out: set[str] = set()
     for st in (getattr(plan, "subtasks", None) or []):
-        _desc = str(getattr(st, "description", "") or "")
-        if "原样写入" not in _desc:
-            continue
-        for _name, _stack in _TEMPLATE_STACK_BY_MANIFEST.items():
-            if _name in _desc.lower():
-                out.add(_stack)
+        for _path, _tpl in _extract_auth_templates(
+                str(getattr(st, "description", "") or "")):
+            out.add(_path.rsplit("/", 1)[-1].lower())
     return out
 
 
@@ -2310,14 +2479,18 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
     并集 pom（矛盾卷唯一最优解）被 H1 覆写销毁，再被旧考卷杀死=规划期注定的冤案。
 
     确定性对账（零 LLM，纯文本，幂等）——对每个带「原样写入」权威模板的子任务：
-    - verify_commands 中针对该 pom 的【正断言】剔除、由模板 <dependencies> 逐条重新
-      生成 grep '<artifactId>…</artifactId>'（陈旧正断言=考错卷，st-26 死型）；
+    - verify_commands 中针对该清单的【正断言】剔除、由模板依赖逐条重新生成
+      （陈旧正断言=考错卷，st-26 死型）；
     - 【负断言】（test -z "$(grep…)"）与模板正面冲突 → 剔除+WARNING（规划期自曝矛盾，
       绝不留给 worker 送死）；与模板不冲突 → ★保留★（猎手 CRITICAL：负断言是
       "禁入依赖不得出现"的守卫，模板被后续机制改写时它是最后一道牙齿）；
     - acceptance 的规则5 机器行（"必须声明依赖: […]"）改写为模板依赖清单；
       追加「模板即真值」权威验收行（下游 L2/CONFIRM 判官消歧用）。
     构建/工具类命令与针对其他文件的断言绝不误动。
+    ★P-H2（27 号文+G-H11）★ 多栈化：模板识别/依赖抽取/断言格式/规则5 措辞按落点
+    basename 走 `_EXAM_DRIVERS` 驱动表（maven 逐字节不变；npm/go/python/cargo/gradle
+    各有 arm）；表外栈（composer/bundler 等）机读告警不静默。依赖抽取失败→该模板
+    fail-honest 跳过（绝不用空清单重生成考卷）。
     猎手 MED 整改：每子任务先在暂存区算全量结果、末尾一次性提交+独立 try/except——
     某子任务模板畸形绝不让已处理/未处理的兄弟处于半变异态（prune_contract_dependencies
     同律）。
@@ -2338,10 +2511,24 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
             staged_vcs = list(getattr(h, "verify_commands", []) or []) if h else []
             staged_acc = list(getattr(st, "acceptance_criteria", []) or [])
             for pom, tpl in tpls:
-                deps = _template_dep_artifacts(tpl)
-                _tpl_scan = _strip_pom_exclusions(tpl)   # 猎手 F1：冲突判定不看 <exclusions> 内的禁入项
-                tpl_asserts = [f"grep -q '<artifactId>{a}</artifactId>' {pom}"
-                               for a in deps]
+                # ★P-H2★ 按落点 basename 分派各栈 driver（无条目=机制缺口，机读可辨
+                # 绝不静默；extract 返 None=模板解析失败→fail-honest 跳过该模板，
+                # 绝不用空清单把考卷重生成成零断言）
+                _mf_base = pom.rsplit("/", 1)[-1]
+                _drv = _EXAM_DRIVERS.get(_mf_base.lower())
+                if _drv is None:
+                    logger.warning(
+                        "[R65D-T2] %s 权威模板落点 %s 无考卷同源 driver（_EXAM_DRIVERS 未收录）"
+                        " → 该模板跳过（G-H11 机读可辨）", st.id, pom)
+                    continue
+                deps = _drv.extract(tpl)
+                if deps is None:
+                    logger.warning(
+                        "[R65D-T2] %s 权威模板 %s 解析失败 → 该模板考卷同源跳过"
+                        "（fail-honest：用空清单重生成考卷=比不对账更坏的假同源）", st.id, pom)
+                    continue
+                _tpl_scan = _drv.scan(tpl) if _drv.scan else tpl
+                tpl_asserts = [_drv.assert_of(a, pom) for a in deps]
                 if h is not None:
                     kept: list[str] = []
                     for vc in staged_vcs:
@@ -2372,16 +2559,17 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                             continue
                         rec["dropped_verify"].append(vc)   # 陈旧正断言 → 模板重生成
                     staged_vcs = list(dict.fromkeys(kept + tpl_asserts))
-                rule5_line = (f"{pom} 必须声明依赖: {sorted(deps)}"
-                              "（缺一即整模块 mvn compile 失败）") if deps else ""
+                rule5_line = (f"{pom} 必须声明依赖: {sorted(deps)}{_drv.rule5_suffix}") if deps else ""
                 _single_tpl = len(tpls) == 1
                 new_acc: list[str] = []
                 for a in staged_acc:
                     # 复核 LOW：契约模块名≠物理目录（R58-1）时规则5 行的路径对不上
                     # pom——唯一模板子任务兜底匹配任何规则5 机器行，杜绝新旧两行并存
+                    # （P-H2：「本模块 {basename}」按落点原名匹配——normalize 规则5 的
+                    # `_r5_primary` 同栈同源；maven=pom.xml 逐字节不变）
                     if (("必须声明依赖" in a or "所需依赖" in a)
                             and _re.search(r"依赖: \[", a)
-                            and (pom in a or a.startswith("本模块 pom.xml")
+                            and (pom in a or a.startswith(f"本模块 {_mf_base}")
                                  or _single_tpl)):
                         if rule5_line and rule5_line not in new_acc:
                             new_acc.append(rule5_line)
@@ -2401,8 +2589,8 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                         rec["acceptance_rewritten"] += 1
                         continue
                     new_acc.append(a)
-                auth_line = (f"依赖清单以 description 中【权威 pom 模板】（{pom}）字面为准"
-                             "——模板即真值，其他验收条目与模板冲突时以模板为准")
+                auth_line = (f"依赖清单以 description 中【权威 {_drv.label or (_mf_base + ' 模板')}】（{pom}）"
+                             "字面为准——模板即真值，其他验收条目与模板冲突时以模板为准")
                 if auth_line not in new_acc:
                     new_acc.append(auth_line)
                     rec["acceptance_rewritten"] += 1
@@ -2424,6 +2612,7 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                         st.id, len(rec["dropped_verify"]), rec["dropped_verify"][:4],
                         rec["added_verify"])
         except Exception:  # noqa: BLE001 — 单子任务畸形绝不拖垮全计划的对账
+            _record_degrade_safe("brain.template_exam.reconcile_failed")
             logger.warning(
                 "[R65D-T2] %s 考卷同源对账失败（该子任务保持原样，兄弟不受影响）",
                 getattr(st, "id", "?"), exc_info=True)
@@ -2918,25 +3107,28 @@ def inject_build_scaffold_subtasks(
             logger.info("[R65D-T2] 考卷同源对账完成：%d 个子任务被重写 %s",
                         len(_exam), sorted(_exam)[:8])
         else:
-            # ★缺席必须机读可辨（26 号文 G-H11 + 方法论硬检查④）★
-            # 本机制是 **Maven 独有**（正则锚 `pom` 字面 + ```xml 围栏），npm/go/cargo 的
-            # 权威模板恒不被识别 → 对这些栈它是**永久 no-op**，而"没有可对账的模板"与
-            # "有模板但我认不出来"在日志上逐字不可分。多栈中立铁律要求它对所有栈生效，
-            # 补齐是重设计（每栈一套"权威模板→考卷断言"驱动），**本轮未做**；
-            # 但绝不让它继续静默——有权威模板痕迹却零对账时如实告警 + record_degrade。
-            _tpl_hint = _authoritative_template_stacks(plan)
-            if _tpl_hint - {"maven"}:
+            # ★缺席必须机读可辨（26 号文 G-H11 → 27 号文 P-H2 已多栈化）★
+            # 考卷同源现按落点 basename 分派 `_EXAM_DRIVERS`（maven/npm/go/python/
+            # cargo/gradle）；表外落点（composer.json/requirements.txt/stack.toml 等
+            # 无 driver 清单）仍是永久 no-op，而"没有可对账的模板"与"有模板但我认
+            # 不出来"在日志上不可分——有权威模板块却零对账时如实告警 + record_degrade，
+            # 绝不静默。判据与 reconcile 同源（实际提取的落点 basename，R2 双透镜
+            # F1/F3：栈粒度+子串扫描会把 requirements.txt/stack.toml 的告警压掉）。
+            _tpl_mfs = _authoritative_template_manifests(plan)
+            _unsup = sorted(_tpl_mfs - set(_EXAM_DRIVERS))
+            if _unsup:
                 try:
                     from swarm.infra.degrade import record_degrade
-                    record_degrade("brain.template_exam.non_maven_stack_unsupported")
+                    record_degrade("brain.template_exam.stack_unsupported")
                 except Exception:  # noqa: BLE001
                     pass
                 logger.warning(
-                    "[R65D-T2] 考卷同源对账对本轮的权威模板栈 %s **不支持**（该机制目前是"
-                    "Maven 独有：正则锚 pom 字面 + xml 围栏）→ 这些栈的考卷未经同源对账，"
-                    "陈旧正断言会照旧送 worker 送死（G-H11，待多栈驱动化重设计）",
-                    sorted(_tpl_hint - {"maven"}))
+                    "[R65D-T2] 考卷同源对账对本轮的权威模板落点 %s **不支持**（_EXAM_DRIVERS "
+                    "未收录；已收录 %s）→ 这些模板的考卷未经同源对账，陈旧正断言会照旧送 "
+                    "worker 送死（G-H11：补 driver=表加一行）",
+                    _unsup, sorted(_EXAM_DRIVERS))
     except Exception:  # noqa: BLE001 — fail-open，考卷维持原样交 worker 侧 H1 兜底
+        _record_degrade_safe("brain.template_exam.reconcile_failed")
         logger.warning("[R65D-T2] 考卷同源 reconcile 失败（fail-open）", exc_info=True)
     try:
         _vs = sanitize_verify_scope(plan)   # DR-PM66-C4(#111)
