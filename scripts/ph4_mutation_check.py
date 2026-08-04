@@ -329,7 +329,11 @@ def main() -> int:
         path.write_text(src.replace(old, new, 1))
         _clear_pyc(path)
         try:
-            if path.suffix == ".py" and ast.parse(path.read_text()) is None:
+            # ★P-H4b cr R1 #3 sibling★ ast.parse 失败是【抛 SyntaxError】而非返回
+            # None——判空是死代码（P-H4a 期间该检查从未能触发）
+            try:
+                ast.parse(path.read_text())
+            except SyntaxError:
                 print(f"[{i}/{len(MUTATIONS)}] {name}\n    ✗ 突变后 ast.parse 失败")
                 failures.append((name, "突变后不可解析"))
                 continue

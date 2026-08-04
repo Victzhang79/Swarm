@@ -104,7 +104,8 @@ class StackSpec:
 
     ★不可外推到模块清单★ 这些函数只补聚合登记（modules/include/members/use），
     模块清单档看 `has_module_scaffold_driver`（复核 M-3：字段事实=聚合级，被消费成"任何
-    清单 demote 都有兜底"→ go/gradle/cargo 的模块清单丢贡献连 WARNING 都没有）。"""
+    清单 demote 都有兜底"→ 当时 go/gradle/cargo 的模块清单丢贡献连 WARNING 都没有；
+    go/cargo 后由 #31-P2c/2e driver 补齐，gradle 仍无）。"""
 
     has_module_scaffold_driver: bool = False
     """该栈是否有**确定性脚手架 driver 一次建全模块清单**（= contract_utils
@@ -211,6 +212,9 @@ STACK_SPEC: dict[str, StackSpec] = {
         aggregate_manifest="Cargo.toml", aggregate_field="[workspace] members",
         source_exts=(".rs",),
         has_aggregate_reconcile=True,      # _reconcile_cargo（成员 Cargo.toml 无网）
+        # 模块档有 #31-P2e 脚手架 driver（owner 按契约一次建全+owner-backfill，内部 crate
+        # 物化 path 相对引用）→ 模块 Cargo.toml demote 安全（P-H4b）。
+        has_module_scaffold_driver=True,
         source_exclude_dirs=("target",),
         whole_project_build_cmd="cargo build -q",
     ),
@@ -429,8 +433,9 @@ def demote_safety_net(path: str, stack: str | None) -> tuple[bool, str]:
         ground-truth 补回**注册**；
       · 模块级 → 模块档，看 `has_module_scaffold_driver`：owner 按契约一次建全模块清单，
         非 owner 本无合法贡献（#11a doctrine），demote 无损。
-    把聚合档的 reconcile 事实当"该栈任何清单都有网"用，会让 go/gradle/cargo 的模块清单
-    丢真实编辑（该子任务想加的依赖）时连一句 WARNING 都没有。
+    把聚合档的 reconcile 事实当"该栈任何清单都有网"用，会让 gradle 的模块清单
+    丢真实编辑（该子任务想加的依赖）时连一句 WARNING 都没有（M-3 原话 go/gradle/cargo，
+    go/cargo 已由 #31-P2c/2e driver 补齐）。
     """
     spec = spec_for_stack(stack)
     p = str(path or "").replace("\\", "/").lstrip("./").lstrip("/")

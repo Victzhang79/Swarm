@@ -279,14 +279,14 @@ def _capture_demote(contested, *, exists):
 @pytest.mark.parametrize("agg,mod,warn_agg,warn_mod", [
     # 栈, 根聚合档, 模块档 —— 两档**分别**判，别用一个布尔管两件事
     ("pom.xml", "mod-a/pom.xml", False, False),        # maven：两档都有网
-    # ★复核 M-3 本尊★ gradle/cargo 有【聚合】reconcile 但**没有模块清单的网**：
+    # ★复核 M-3 本尊★ gradle 有【聚合】reconcile 但**没有模块清单的网**：
     # 早先版本拿聚合档的事实当"该栈任何清单都有网"，模块清单 demote 丢真实编辑却零告警。
     ("settings.gradle", "mod-a/build.gradle", False, True),
-    ("Cargo.toml", "crates/a/Cargo.toml", False, True),
-    # npm/go/python 模块档已有 #31-P2 确定性 driver（owner 按契约一次建全+backfill，
-    # P-H4a 复核补翻 spec）→ 模块清单 demote 安全不刷告警；npm 聚合档仍无 reconcile。
+    # npm/go/python/cargo 模块档已有 #31-P2 确定性 driver（owner 按契约一次建全+backfill，
+    # P-H4a/b 复核补翻 spec）→ 模块清单 demote 安全不刷告警；npm 聚合档仍无 reconcile。
     ("package.json", "packages/a/package.json", True, False),
     ("go.work", "internal/a/go.mod", False, False),
+    ("Cargo.toml", "crates/a/Cargo.toml", False, False),
     # ★python 刻意不在本矩阵★（hunter R2 L-5：空转行零区分力——python 不在
     # structural_manifests，writable 双写走串行化不 demote，两探针恒零告警）。
     # python 模块档 has_module_scaffold_driver=True 的真实消费者=【新建撞车 demote
@@ -299,8 +299,8 @@ def test_demote_observability_is_tiered_not_one_boolean(agg, mod, warn_agg, warn
       · 根聚合档 → `has_aggregate_reconcile`（`_reconcile_*` 据磁盘补回根注册）；
       · 模块清单档 → `has_module_scaffold_driver`（owner 按契约一次建全，非 owner 本无
         合法贡献 = #11a doctrine）。有确定性 driver 的栈（maven 聚合 driver +
-        #31-P2 npm/go/python 模块 driver）才有后者，对账锁防"driver 落地忘翻字段"。
-    把前者当"该栈任何清单都有网"用，gradle/cargo/go 的模块清单被 demote 时丢的是**真实
+        #31-P2 npm/go/python/cargo 模块 driver）才有后者，对账锁防"driver 落地忘翻字段"。
+    把前者当"该栈任何清单都有网"用，gradle 的模块清单被 demote 时丢的是**真实
     编辑**（该子任务想加的依赖/插件），却连一句 WARNING 都没有——那正是"降级无痕"。
 
     机读账走 `record_degrade`（**有真实消费者**：`/api/metrics` 降级面），不是新造没人读的键。
@@ -388,7 +388,7 @@ def test_scaffold_driver_facts_match_reality():
 
     只有 `_MODULE_SCAFFOLD_DRIVER_STACKS`（maven 聚合 driver ∪ `_P2_SCAFFOLD_DRIVERS`）
     里的栈才有"owner 按契约一次建全模块清单"这个前提；没有它，模块清单 demote 掉的是
-    真实编辑。将来谁给 gradle/cargo 写了模块脚手架 driver（P-H4 剩余），这条会红，
+    真实编辑。将来谁给 gradle 写了模块脚手架 driver（P-H4 剩余），这条会红，
     提醒他同步把 spec 的 False 翻成 True（否则白刷告警）。
     """
     for key, spec in STACK_SPEC.items():

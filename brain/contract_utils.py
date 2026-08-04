@@ -3712,8 +3712,11 @@ def _py_module_name(project_path: str | None, mdir: str, module_label: str) -> s
                         .get("project") or {}).get("name")
                 if isinstance(name, str) and name.strip():
                     return name.strip()
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            # 硬检查④（hunter R1 F-3，P-H4a 同型 sibling）：清单存在却读不出 ≠ 没有 name
+            logger.warning("[SCAFFOLD-INJECT] #31-P2d %s 读取/解析失败（%s）→ 包名"
+                           "降级为归一化标签 %r（与磁盘 [project].name 可能错位）", pj, exc,
+                           module_label)
     from swarm.brain.pypi_registry import normalize_name
     return normalize_name(module_label)
 
@@ -3731,8 +3734,11 @@ def _py_root_requires_python(project_path: str | None) -> str:
                   .get("project") or {}).get("requires-python")
             if isinstance(rp, str) and rp.strip():
                 return rp.strip()
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as exc:
+        # 硬检查④（hunter R1 F-3，P-H4a 同型 sibling）：根清单存在却读不出 →
+        # requires-python 被省略必须有信号
+        logger.warning("[SCAFFOLD-INJECT] #31-P2d 根 %s 读取/解析失败（%s）→ "
+                       "requires-python 证据缺席（模板省略该字段，血规 2 不猜）", pj, exc)
     return ""
 
 
@@ -3870,18 +3876,229 @@ def _inject_python_scaffolds(plan, project_path, file_plan, dirs,
     return injected
 
 
-# #31-P2b/2c/2d：非 Maven 栈的 per-module 清单 driver 分派表（模块级单一事实源——
+def _cargo_crate_name(project_path: str | None, mdir: str, module_label: str) -> str:
+    """crate 名：磁盘已有 [package].name（事实来源）优先；greenfield → 归一化模块标签
+    （我们为**新建 crate** 自定的确定性命名约定，与 _py_module_name 同立场）。"""
+    if project_path:
+        ct = Path(project_path) / mdir / "Cargo.toml"
+        try:
+            if ct.is_file():
+                import tomllib
+                name = (tomllib.loads(ct.read_text("utf-8", errors="replace"))
+                        .get("package") or {}).get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        except (OSError, ValueError) as exc:
+            # 硬检查④（hunter R1 F-3）：清单存在却读不出 ≠ 没有 name——静默降级会让
+            # path 依赖名与磁盘真名错位（cargo metadata 才炸，且不知道为何）
+            logger.warning("[SCAFFOLD-INJECT] #31-P2e %s 读取/解析失败（%s）→ crate 名"
+                           "降级为归一化标签 %r（与磁盘 [package].name 可能错位）", ct, exc,
+                           module_label)
+    from swarm.brain.cargo_registry import normalize_crate_name
+    return normalize_crate_name(module_label)
+
+
+def _cargo_root_edition(project_path: str | None) -> str:
+    """根 Cargo.toml 的 edition 真值（[workspace.package].edition → [package].edition）；
+    没有 → ''（模板**省略**该字段——血规 2：工具链版本绝不猜一个写进权威清单；
+    缺席时 cargo 默认 2015，async 代码会在 L1 cargo build 响亮编译失败，不是静默漂移）。"""
+    if not project_path:
+        return ""
+    ct = Path(project_path) / "Cargo.toml"
+    try:
+        if ct.is_file():
+            import tomllib
+            data = tomllib.loads(ct.read_text("utf-8", errors="replace"))
+            ws_pkg = (data.get("workspace") or {}).get("package") or {}
+            ed = ws_pkg.get("edition") or (data.get("package") or {}).get("edition")
+            if isinstance(ed, str) and ed.strip():
+                return ed.strip()
+    except (OSError, ValueError) as exc:
+        # 硬检查④（hunter R1 F-3）：根清单存在却读不出 → edition 被省略必须有信号
+        # （「证据坏了」与「真没声明」不可分=降级无痕）
+        logger.warning("[SCAFFOLD-INJECT] #31-P2e 根 %s 读取/解析失败（%s）→ edition 证据"
+                       "缺席（模板省略该字段，血规 2 不猜）", ct, exc)
+    return ""
+
+
+def _cargo_dep_line(k) -> str:
+    """单条第三方依赖的 Cargo.toml 行（CREATE 模板与 MODIFY 片段共用——两份实现必漂移）。
+    表形态触发：有 features 或 default_features=False（hunter R1 F-2：`default-features
+    = false` 静默丢=重新打开默认特性，换语义）；皆无 → 裸字符串（`serde = "1.0"`）。"""
+    if not k.features and k.default_features:
+        return f'{k.name} = "{_toml_escape(k.spec)}"'
+    parts = [f'version = "{_toml_escape(k.spec)}"']
+    if not k.default_features:
+        parts.append("default-features = false")
+    if k.features:
+        feats = ", ".join(f'"{_toml_escape(f)}"' for f in k.features)
+        parts.append(f"features = [{feats}]")
+    return f"{k.name} = {{ {', '.join(parts)} }}"
+
+
+def _render_cargo_toml(pkg_name: str, kept, path_deps: list[tuple[str, str]],
+                       edition: str = "") -> str:
+    """成员 Cargo.toml 权威模板。kept=ResolvedCargoDep 列表；path_deps=[(crate名, 相对路径)]。
+    全部插值走 `_toml_escape`（crate 名/req/features 都可能带 TOML 特殊字符——
+    P-H4a cr R3 同律）。"""
+    lines = ["[package]", f'name = "{_toml_escape(pkg_name)}"', 'version = "0.1.0"']
+    if edition:
+        lines.append(f'edition = "{_toml_escape(edition)}"')
+    body: list[str] = [_cargo_dep_line(k) for k in kept]
+    for crate, rel in path_deps:
+        body.append(f'{crate} = {{ path = "{_toml_escape(rel)}" }}')
+    if body:
+        lines.append("[dependencies]")
+        lines.extend(body)
+    return "\n".join(lines) + "\n"
+
+
+def _cargo_dep_block(manifest_rel: str, kept, path_deps: list[tuple[str, str]],
+                     pkg_name: str, exists: bool, edition: str = "") -> str:
+    """cargo 清单机器块：CREATE→权威 Cargo.toml 模板；MODIFY→修改铁律（+缺失依赖片段）。
+    与 _py_dep_block 同构（cr#1：MODIFY 零缺失也给铁律护栏）。"""
+    if not exists:
+        return (f"\n【权威 Cargo.toml 模板（确定性生成，原样写入 {manifest_rel}；仅当项目另有"
+                f"明确约定才允许在此基础上增改）】\n```toml\n"
+                f"{_render_cargo_toml(pkg_name, kept, path_deps, edition)}\n```")
+    frag: list[str] = [_cargo_dep_line(k) for k in kept]
+    for crate, rel in path_deps:
+        frag.append(f'{crate} = {{ path = "{_toml_escape(rel)}" }}')
+    snip = ""
+    if frag:
+        snip = (f"\n【缺失依赖片段（并入 {manifest_rel} 既有 [dependencies]，"
+                f"★仅追加下列条目、逐字保留其余内容★）】\n```toml\n" + "\n".join(frag) + "\n```")
+    return (f"\n【既有 Cargo.toml 修改铁律（{manifest_rel} 已存在）】只做最小增量：绝不整体替换/"
+            "重写，绝不删除既有 dependencies/字段，仅在 [dependencies] 内追加缺失条目。"
+            + snip)
+
+
+def _inject_cargo_scaffolds(plan, project_path, file_plan, dirs,
+                            unverified_out: dict | None = None) -> list[dict]:
+    """cargo per-Cargo.toml driver（P-H4b，27 号文「cargo 零脚手架出口」治本）。
+
+    与 go driver 最同构：内部 crate **物化**为 `path = "../rel"` 相对引用（cargo 的 path
+    依赖按清单所在目录解析=确定性，区别于 python 的 pip `file:` cwd 语义）；第三方版本经
+    crates.io 解析（写最新稳定版字面量=caret 语义），工程自身清单/Cargo.lock 声明优先
+    （零网络中间层）。解析不到如实丢弃+三处剔除（模板/契约/验收）。
+    根 workspace 成员登记由 `_reconcile_cargo`（has_aggregate_reconcile）兜底，本 driver
+    只建成员清单。"""
+    from swarm.brain.cargo_registry import normalize_crate_name, resolve_cargo_deps
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    mods_all = _contract_dep_entries(plan, dirs)
+    if not mods_all:
+        return []
+    # ★内部 crate 名全集从【全 dirs】取（磁盘 [package].name 或归一化标签约定）★——含已
+    # 认领/跨轮模块，绝不让内部 crate 被当第三方送 crates.io 误解析同名公网 crate
+    # （cr#2/hunter#1 同律）。
+    crate_by_label: dict[str, str] = {}     # 模块标签 → crate 名
+    dir_by_label: dict[str, str] = {}       # 模块标签 → 物理目录
+    norm_to_label: dict[str, str] = {}      # 归一化 crate 名 → 模块标签
+    for m, d in dirs.items():
+        cn = _cargo_crate_name(project_path, d, m)
+        crate_by_label[m] = cn
+        dir_by_label[m] = d
+        norm_to_label[cn] = m
+    internal_names = set(crate_by_label.values())
+    # ★hunter R2 H-1 同律★ 契约声明了但解析不出物理落点的模块【也是内部 crate】——
+    # 归一化标签并入内部判定集（不送 crates.io）；但【不物化】path 依赖（无落点=臆造
+    # 路径），留契约 + WARNING（go held/python 不物化同律）。
+    _labels = _contract_module_labels(plan)
+    internal_names |= {normalize_crate_name(m) for m in _labels}
+    edition = _cargo_root_edition(project_path)
+    injected: list[dict] = []
+    backfilled: list[str] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    for entry in mods_all:
+        mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
+        manifest_rel = f"{mdir}/Cargo.toml"
+        exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        # 契约 artifact 写的是【模块标签】——held=契约标签里无物理落点的（labels−dirs），
+        # 先扣下不送 resolve（否则被当第三方送 crates.io）。
+        held = [a for a in arts if a in _labels and a not in dirs]
+        if held:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2e 模块 %s 的 %d 个内部 cargo 依赖无物理落点 → 不送"
+                " crates.io 也不生成 path 引用（留契约，物理落点补齐后再物化）: %s",
+                mod, len(held), held)
+        # ★内部标签先归一成 crate 名再 resolve★（go `internal_paths.get(a, a)` 同律）——
+        # 裸标签（可能含空格等 crate 名非法字符）直接送 resolve 会被解析闸判死成
+        # dropped=把真内部依赖当幻觉丢；归一后 resolve 的内部判定与下方 path 生成同用
+        # 一套规范键（杜绝裸标签泄进 Cargo.toml）。
+        _norm_arts = [crate_by_label.get(a, a) for a in arts if a not in held]
+        kept, internal_crates, dropped = resolve_cargo_deps(
+            _norm_arts, internal_modules=internal_names, project_path=project_path)
+        # F-2：先于任何 continue 记账（本 driver 同样多条出口）
+        _record_unverified_deps(unverified_out, mod, kept)
+        if dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2e 模块 %s 的 %d 个 cargo 依赖无法确定性解析版本 → "
+                "模板/契约/验收三处一并剔除（绝不逼 worker 编版本）: %s", mod, len(dropped), dropped)
+        # 内部 crate → path 相对引用（本模块目录视角看目标模块目录；仅物化【有落点】的）
+        path_deps = [(ic, _go_relpath(mdir, dir_by_label[norm_to_label[ic]]))
+                     for ic in internal_crates
+                     if ic in norm_to_label and norm_to_label[ic] in dir_by_label]
+        internal_final = list(internal_crates)
+        final_names = [k.name for k in kept] + internal_final + held   # 契约=第三方+内部+held
+        _prune_scaffold_contract_entry(plan, mod, final_names, dropped)   # hunter#3 同源剪契约
+        pkg_name = _cargo_crate_name(project_path, mdir, mod)
+        block = _cargo_dep_block(manifest_rel, kept, path_deps, pkg_name, exists, edition)
+        owner = _manifest_owner_subtask(plan.subtasks, manifest_rel)
+        if owner is not None:   # cr#1：已认领 → backfill 进 owner，绝不静默留它手写
+            _refresh_scaffold_owner_contract(owner, mod, mdir, final_names)   # 2a 闸同步
+            if _upsert_owner_manifest_block(owner, manifest_rel, block):
+                backfilled.append(owner.id)
+            continue
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue
+        scaffold = SubTask(
+            id=sid,
+            description=(f"【构建脚手架】为模块 {mod} " + ("补齐" if exists else "创建")
+                        + f" cargo 清单 {manifest_rel}：声明契约依赖全部 crate"
+                        "（写代码的子任务碰不到构建清单，缺一个=整 crate 编不过）"
+                        + _p2_wrap(manifest_rel, block)),
+            intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(writable=[manifest_rel] if exists else [],
+                            create_files=[] if exists else [manifest_rel]),
+            contract={"dependencies": [{"module": mod, "dir": mdir, "artifacts": final_names}]},
+            acceptance_criteria=[
+                f"{manifest_rel} 声明契约依赖全部 crate（内部模块用 path 相对引用），"
+                "`cargo metadata --format-version 1` 解析通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        _wire_scaffold_ownership(plan, sid, mdir, manifest_rel)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid, "artifacts": final_names,
+                         "manifest_exists": exists, "stack": "cargo"})
+    if injected:
+        logger.info("[SCAFFOLD-INJECT] #31-P2e cargo 脚手架注入 %d 个: %s",
+                    len(injected), [e["module"] for e in injected])
+    if backfilled:
+        logger.warning("[SCAFFOLD-INJECT] #31-P2e R58-3 cargo：%d 个 owner 自认领 Cargo.toml →"
+                       " 已把确定性清单块嵌进其 description（有 owner≠有模板）: %s",
+                       len(backfilled), backfilled[:8])
+    return injected
+
+
+# #31-P2b/2c/2d/2e：非 Maven 栈的 per-module 清单 driver 分派表（模块级单一事实源——
 # stacks/spec.py 的 `has_module_scaffold_driver` 与本表派生集对账，test_b3 防漂移）。
 _P2_SCAFFOLD_DRIVERS = {"npm": _inject_npm_scaffolds, "go": _inject_go_scaffolds,
-                        "python": _inject_python_scaffolds}
+                        "python": _inject_python_scaffolds,
+                        "cargo": _inject_cargo_scaffolds}
 # 有【确定性模块清单脚手架 driver】的栈全集：maven 走聚合 driver 一次建全模块 pom，
-# npm/go/python 走 _P2_SCAFFOLD_DRIVERS。demote 模块清单安不安全就看这个集。
+# npm/go/python/cargo 走 _P2_SCAFFOLD_DRIVERS。demote 模块清单安不安全就看这个集。
 _MODULE_SCAFFOLD_DRIVER_STACKS = frozenset({"maven"}) | frozenset(_P2_SCAFFOLD_DRIVERS)
 
 
 def _go_relpath(from_dir: str, to_dir: str) -> str:
-    """go replace 目标相对路径（from_dir 的 go.mod 视角看 to_dir）；必带 ./ 或 ../ 前缀
-    （go 要求本地 replace 是文件系统相对/绝对路径，裸名会被当 module 路径）。"""
+    """本地相对路径（from_dir 清单视角看 to_dir）；必带 ./ 或 ../ 前缀——go 要求本地
+    replace 是文件系统相对/绝对路径（裸名会被当 module 路径）；cargo path 依赖同形
+    复用（P-H4b：`../rel` 是 cargo 内部引用的规范形态，纯 posixpath 数学与栈无关）。"""
     import posixpath
     rel = posixpath.relpath(to_dir.strip("/"), from_dir.strip("/"))
     return rel if rel.startswith(".") else f"./{rel}"
@@ -3908,9 +4125,9 @@ def _inject_build_scaffold_subtasks_impl(
     # （Go/npm/Rust/Python/Gradle…）→ 明确不伪造 Maven 产物（no-op + 告警），杜绝异栈 reactor 污染。
     _ok, _stack = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
     if not _ok:
-        # #31-P2b/2c/2d：非 Maven 栈不再无条件 no-op——npm/go/python 走各自的 per-module 清单
-        # driver（版本经 registry 确定性解析，绝不拿 pom 污染异栈）。其余已知栈（gradle/cargo）
-        # 暂无 driver → 保持明确 no-op（绝不伪造清单）。
+        # #31-P2b/2c/2d/2e：非 Maven 栈不再无条件 no-op——npm/go/python/cargo 走各自的
+        # per-module 清单 driver（版本经 registry 确定性解析，绝不拿 pom 污染异栈）。
+        # 其余已知栈（gradle）暂无 driver → 保持明确 no-op（绝不伪造清单）。
         if _stack in _P2_SCAFFOLD_DRIVERS:
             try:
                 _p2_dirs = _module_physical_dirs(plan, project_path, file_plan)
@@ -3942,9 +4159,9 @@ def _inject_build_scaffold_subtasks_impl(
                                exc_info=True)
                 return []
         logger.warning(
-            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go/python）→ 跳过 pom 脚手架注入（绝不拿 "
-            "pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 driver 待接入"
-            "（P-H4 剩余：gradle/cargo）。",
+            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go/python/cargo）→ 跳过 pom 脚手架"
+            "注入（绝不拿 pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 "
+            "driver 待接入（P-H4 剩余：gradle）。",
             _stack)
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）
@@ -4710,9 +4927,9 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         # demote 收回写权。是否安全**按档看**（复核 M-3 整改，两档不可互换）：
         #   · 根聚合档 → `has_aggregate_reconcile`：`_reconcile_*` 据磁盘 ground-truth 补回注册；
         #   · 模块清单档 → `has_module_scaffold_driver`：owner 按契约一次建全（#11a doctrine），
-        #     非 owner 本无合法贡献。只有 maven 有。
-        # 早先版本拿聚合档的 reconcile 事实当"该栈任何清单都有网"用 → gradle/cargo/go 的
-        # 模块清单（mod-a/build.gradle、成员 Cargo.toml、mod-a/go.mod）被 demote 时丢的是
+        #     非 owner 本无合法贡献（maven 聚合 driver + #31-P2 npm/go/python/cargo）。
+        # 早先版本拿聚合档的 reconcile 事实当"该栈任何清单都有网"用 → gradle 等的
+        # 模块清单（mod-a/build.gradle）被 demote 时丢的是
         # **真实编辑**（该子任务想加的依赖/插件），却连一句 WARNING 都没有。
         for _f in demoted:
             _fstk = stack_of_structural_manifest(_f)

@@ -25,6 +25,11 @@ REGISTERED_ENVS: dict[str, str] = {
     # （注释里绝不写 SWARM_XXX 裸词头——登记扫描会把散文里的词头当成未登记开关）
     "SWARM_PYPI_LOOKUP": "brain/pypi_registry.py:_lookup_enabled",
     "SWARM_PYPI_LOOKUP_TIMEOUT_S": "brain/pypi_registry.py:_HTTP_TIMEOUT_S",
+    # P-H4b：crates.io 依赖版本解析（cargo 脚手架 driver），与 npm/go/pypi 三栈 LOOKUP
+    # 开关同义栈中立铺开。0=关闭（单测默认关）；关闭后=解析不到即如实丢弃（含工程清单
+    # 与 Cargo.lock 证据层）。
+    "SWARM_CARGO_LOOKUP": "brain/cargo_registry.py:_lookup_enabled",
+    "SWARM_CARGO_LOOKUP_TIMEOUT_S": "brain/cargo_registry.py:_HTTP_TIMEOUT_S",
     # P-C2 复核 F-1/F-3：HTTP 文本缓存里【失败(None)】条目的存活秒数（三个 registry 共用）。
     # 永久缓存 None ⇒ 一次抖动把坐标永久钉成"查不到"（误杀且与"真没这个包"不可区分）；
     # 完全不缓存 ⇒ per-module 调用下 8s 超时 × 镜像数 × 模块数反复烧网。TTL 两头都收。

@@ -259,7 +259,8 @@ def test_demote_safety_net_tier_is_derived_from_the_path_shape(fx):
     """M-3 回归（矩阵档）：根档与模块档的兜底结论**必须能不同**，且档位由路径形状判出。
 
     原病：`has_manifest_reconcile` 一个布尔被消费成"该栈任何清单 demote 都有兜底" →
-    go/gradle/cargo 的**模块**清单丢真实编辑连 WARNING 都没有。
+    当时 go/gradle/cargo 的**模块**清单丢真实编辑连 WARNING 都没有（go/cargo 后由
+    #31-P2c/2e driver 补齐，gradle 仍无）。
 
     ★已改名并收窄声称（复核 note）★ 原名带 `on_a_real_tree`，但本测试**只传路径字符串、
     根本不碰磁盘**；且前两条断言是把被测函数实现原样复述（函数体就是那个三元式）。真正有
