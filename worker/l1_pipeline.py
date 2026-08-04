@@ -5474,7 +5474,7 @@ def run_l1_pipeline(
     project_stack: dict | None = None,
     extra_writable_paths: set[str] | None = None,
     deadline: float | None = None,
-    template_enforced_rels: set[str] | None = None,
+    template_enforced_rels: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """L1.1 scope → L1.2 compile → L1.2.5 lint → L1.3 scoped test → L1.4 LLM 自检。
 
@@ -5496,7 +5496,9 @@ def run_l1_pipeline(
         extra_writable_paths: round18 P0-B——确定性修复机制合法触达的 scope 外文件
             (executor._repaired_extra_paths，如 module-registration 自愈改的父 pom)，
             scope 复核时视为允许，避免把非 worker 越权写的修复文件误判越权整份判死。
-        template_enforced_rels: R65D-T2④——H1 权威模板确定性覆写过的文件（内容即模板）。
+        template_enforced_rels: R65D-T2④——H1 权威模板确定性覆写过的文件（内容即模板），
+            形如 `{rel: 模板内容}`（X-M9 复核整改：注解曾是 `set[str]` 类型谎报，
+            消费侧 6327 行起一直按 dict.items() 取内容做温差重比，本次仅修正注解）。
             对这些文件的内容断言（grep / test -z "$(grep…)"）是旧考卷考新模板，
             跳过并记 details["verify_skipped_h1"]（round65d st-26 冤案兜底；断言同源
             由规划期 reconcile_template_exam 保证）。其余 verify 命令照常执行。

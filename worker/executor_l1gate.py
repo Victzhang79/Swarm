@@ -16,16 +16,51 @@ run_l1_pipeline/_run_l1_command/compress_tool_output/hashlib 保持方法内 laz
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 
 from pathlib import Path
 
+from swarm.stacks import STACK_SPEC
 from swarm.types import Confidence, NotRunKind, WorkerOutput
 from swarm.worker.l1_verdict import _FAIL_WORD_RE, _is_refusal_or_truncated
 
 logger = logging.getLogger(__name__)
+
+# X-M9：H1 权威模板落盘的已知清单集——STACK_SPEC 派生（module_manifest ∪ 别名，
+# 加栈=加表行），绝不手抄。消费契约=「这名字的清单模板允许确定性覆写 CREATE 目标」。
+_H1_KNOWN_MANIFEST_BASENAMES: frozenset[str] = frozenset(
+    mf for s in STACK_SPEC.values()
+    for mf in (s.module_manifest, *s.module_extra_manifests))
+
+
+def _h1_template_shape_ok(base: str, tpl: str) -> bool:
+    """H1 落盘前按 basename 的最小形状校验（fail-closed：截取错位/空模板绝不覆写）。
+
+    ★各档判据 = brain 侧确定性渲染器（contract_utils `_render_*`）的【首行契约】★
+    （reviewer R1 MEDIUM-3：此前 pyproject/Cargo/gradle 非空即过、`[]` 也算合法
+    package.json——截取错位拿到任意非空文本都会 fail-open 覆写）。渲染器首行变了
+    这里必须同步（test_xm9 有渲染器同源锁：真渲染器产物必须过本校验）。这仍是
+    登记边界（最小形状）而非完整语法校验——完整正确性由渲染器确定性背书。"""
+    if not tpl:
+        return False
+    if base == "pom.xml":
+        return tpl.startswith("<?xml") or "<project" in tpl[:200]
+    if base == "package.json":
+        try:
+            return isinstance(json.loads(tpl), dict)  # 渲染器恒产 dict（`{"name":…}`）
+        except ValueError:
+            return False
+    if base == "go.mod":
+        return tpl.startswith("module ")
+    if base == "pyproject.toml":
+        return tpl.startswith("[project]")            # _render_pyproject_toml 首行
+    if base == "Cargo.toml":
+        return tpl.startswith("[package]")            # _render_cargo_toml 首行
+    # build.gradle(.kts)：_render_build_gradle 双方言首行恒 `plugins {`
+    return tpl.startswith("plugins")
 
 # A8：弱自报判定的【否定形态】剥离——"no errors found"/"0 failures"/"0 failed"/
 # "without errors" 中的 errors/failures/failed 是【通过】语义，剥掉后再过 _FAIL_WORD_RE，
@@ -186,44 +221,89 @@ class _L1GateMixin:
                         self._pre_sync_contents[rel] = ""
 
     def _enforce_authoritative_template(self) -> None:
-        """H1：description 含【权威 pom 模板…```xml】且 scope 目标是 CREATE 单 pom
-        → 模板直接覆写沙箱+本地（write-through，同 repaired 通道），不赌 worker 抄写。
+        """H1（X-M9 多栈化）：description 含【权威 <清单> 模板…原样写入 <路径>…】
+        且 scope 目标是 CREATE 单清单 → 模板直接覆写沙箱+本地（write-through，
+        同 repaired 通道），不赌 worker 抄写。
 
+        治前只认「权威 pom 模板」+ pom.xml 落点——P-H4 五栈 driver（npm/go/python/
+        cargo/gradle）产的权威模板在 worker 侧零 deterministic write-through，机械
+        产物照旧赌 LLM 服从度（round48c alarm-sdk 徒手改写 pom 的同型死法在异栈敞着）。
+        ★栈中立★：已知清单集从 STACK_SPEC 派生（module_manifest ∪ 别名，加栈=加表行）；
+        标记正则通用（```json/```toml/``` 裸围栏都认）；按 basename 最小形状校验
+        （判据=brain 渲染器首行契约，见 `_h1_template_shape_ok`）。认不得的清单名/
+        形状不符 → fail-closed 不落盘。
+        ★落点=标记路径与 create_files【归一化精确匹配】★（hunter R1 CRITICAL：同
+        basename 不同目录——web/package.json 与 api/package.json 并存——basename 匹配
+        会 len(cands)=2 整栈全跳；reviewer R1 MEDIUM-2：只按 basename 会把 backend
+        的模板写进 frontend）。路径对不上=不落盘，绝不写到别处。登记边界：路径含
+        空格/括号会被标记正则截断 → 精确匹配不上 → fail-closed skip（宁可不落不错落）。
+        ★skip 全路径机读可辨★（hunter R1 HIGH）：每类 skip 落 `h1_skip:<reason>` 进
+        执行日志（消费者=任务结果/E2E 判读）；异常类（认不得/无围栏/形状不符）再加
+        WARNING——「模板在而没落盘」绝不允许零信号。
+        一个子任务带多个清单模板时逐块处理（各落各的，互不遮蔽）。
         仅 CREATE 形态（新建无可失，R41-F5 铁律：MODIFY 覆写=clobber 比漏改更致命，
         MODIFY 面维持依赖片段+并入语义）。幂等：内容一致即跳过。
         """
         desc = str(getattr(self.subtask, "description", "") or "")
-        if "权威 pom 模板" not in desc or "```xml" not in desc:
-            return
         sc = getattr(self.subtask, "scope", None)
         creates = [str(f).replace("\\", "/").lstrip("/")
                    for f in (getattr(sc, "create_files", None) or [])]
-        poms = [f for f in creates if f.rsplit("/", 1)[-1] == "pom.xml"]
-        if len(poms) != 1 or (getattr(sc, "writable", None) or []):
-            return
-        tpl = desc.split("```xml", 1)[1].split("```", 1)[0].strip()
-        if not tpl.startswith("<?xml") and "<project" not in tpl[:200]:
-            return
-        rel = poms[0]
-        from swarm.worker.l1_pipeline import (
-            _read_project_file, _write_project_file,
-        )
-        # R65D-T2④：登记被 H1 覆写的文件→模板内容映射——verify 阶段对这些文件的内容
-        # 断言是旧考卷考新模板（round65d st-26：worker 徒手 pom 本可过自己的卷，被 H1
-        # 覆写后 grep jackson 考模板必死=冤案），pipeline 在 verify 时点【重比内容仍
-        # 等于模板】才跳过（猎手 CRITICAL：同 run 内 R56-5/version-repair 可能在 H1 后
-        # 合法改写该 pom——温差窗口内断言必须保有牙齿）。写失败不登记，fail-open。
-        if not hasattr(self, "_h1_enforced_templates"):
-            self._h1_enforced_templates: dict[str, str] = {}
-        cur = _read_project_file(self.project_path, rel, timeout=15)
-        if cur is not None and cur.strip() == tpl:
-            self._h1_enforced_templates[rel] = tpl
-            return  # 幂等
-        if _write_project_file(self.project_path, rel, tpl + "\n", timeout=20):
-            self._h1_enforced_templates[rel] = tpl
-            self._log(
-                f"[H1] 权威 pom 模板确定性落盘 {rel}"
-                "（机械产物不赌 LLM 服从度，worker 徒手版本被模板覆写）")
+        _writable = list(getattr(sc, "writable", None) or [])
+        for m in re.finditer(
+                r"【权威 [^】]*?模板（[^】]*?原样写入 ([^\s;；)）】]+)", desc):
+            marker_rel = m.group(1).replace("\\", "/").lstrip("/")
+            base = marker_rel.rsplit("/", 1)[-1]
+            if base not in _H1_KNOWN_MANIFEST_BASENAMES:
+                # 认不得的清单名：fail-closed 不落盘（新栈=STACK_SPEC 加行）。
+                # brain 产了块而 worker 落不了=异常 → WARNING（hunter R1 HIGH）。
+                logger.warning(
+                    "[H1] 权威模板落盘跳过：认不得的清单名 %r（不在 STACK_SPEC 派生集）", base)
+                self._log(f"[H1] h1_skip:unknown_manifest:{base}（认不得的清单名不落盘）")
+                continue
+            if marker_rel not in creates:
+                # 标记路径不在必建集（含路径含空格/括号被正则截断的形态）：绝不按
+                # basename 猜落点（reviewer R1 MEDIUM-2 的 backend→frontend 错写）。
+                self._log(f"[H1] h1_skip:path_not_created:{marker_rel}"
+                          "（标记路径不在 create_files，绝不按 basename 猜落点）")
+                continue
+            if _writable:
+                # CREATE-only 守约（R41-F5）：scope 含 writable=MODIFY 混合形态，覆写=clobber。
+                self._log(f"[H1] h1_skip:mixed_scope:{marker_rel}"
+                          "（scope 含 writable，CREATE-only 守约不落盘）")
+                continue
+            fm = re.search(r"```[a-zA-Z]*\n(.*?)\n?```", desc[m.end():], re.S)
+            if not fm:
+                logger.warning("[H1] 权威模板落盘跳过：%s 标记后无代码围栏（块形态异常）",
+                               marker_rel)
+                self._log(f"[H1] h1_skip:no_fence:{marker_rel}")
+                continue
+            tpl = fm.group(1).strip()
+            if not _h1_template_shape_ok(base, tpl):
+                logger.warning(
+                    "[H1] 权威模板落盘跳过：%s 形状校验不符（截取错位/畸形，绝不覆写）",
+                    marker_rel)
+                self._log(f"[H1] h1_skip:shape_mismatch:{marker_rel}")
+                continue
+            rel = marker_rel
+            from swarm.worker.l1_pipeline import (
+                _read_project_file, _write_project_file,
+            )
+            # R65D-T2④：登记被 H1 覆写的文件→模板内容映射——verify 阶段对这些文件的内容
+            # 断言是旧考卷考新模板（round65d st-26：worker 徒手 pom 本可过自己的卷，被 H1
+            # 覆写后 grep jackson 考模板必死=冤案），pipeline 在 verify 时点【重比内容仍
+            # 等于模板】才跳过（猎手 CRITICAL：同 run 内 R56-5/version-repair 可能在 H1 后
+            # 合法改写该清单——温差窗口内断言必须保有牙齿）。写失败不登记，fail-open。
+            if not hasattr(self, "_h1_enforced_templates"):
+                self._h1_enforced_templates: dict[str, str] = {}
+            cur = _read_project_file(self.project_path, rel, timeout=15)
+            if cur is not None and cur.strip() == tpl:
+                self._h1_enforced_templates[rel] = tpl
+                continue  # 幂等
+            if _write_project_file(self.project_path, rel, tpl + "\n", timeout=20):
+                self._h1_enforced_templates[rel] = tpl
+                self._log(
+                    f"[H1] 权威 {base} 模板确定性落盘 {rel}"
+                    "（机械产物不赌 LLM 服从度，worker 徒手版本被模板覆写）")
 
     def _deterministic_l1_gate(self) -> tuple[bool | None, dict]:
         """循环内确定性 L1 闸门：用真实 compile/lint/scope 结果驱动修复轮次。
