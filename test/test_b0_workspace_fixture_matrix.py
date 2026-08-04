@@ -245,13 +245,13 @@ def test_reconcile_adds_unregistered_members_per_declared_tier(fx):
         r2 = reconcile_workspace_manifests(str(fx.root))
         assert r2["modified_manifests"] == [], f"{fx.name}: 非幂等，二次跑又改了 {r2}"
     else:
-        assert fx.stack == "npm", (
-            f"{fx.name}: 除 npm 外不该有【无聚合 reconcile】的已收录栈（表变了？）")
-        assert fx.aggregate_manifest not in added, (
-            f"{fx.name}: spec 说无 reconcile 却补了 {added}——事实表与实现漂移")
-        for d in fx.unregistered:
-            assert d not in agg_text, (
-                f"{fx.name}: 意外补进了 {d}，spec 该翻 True 了")
+        # ★X-H3（B-5）后全部已收录栈都有聚合 reconcile★ npm 是最后一个缺口
+        # （`_reconcile_npm` 落地前本分支断言它的诚实缺口）。此分支现在应当不可达——
+        # 若你【刻意】新增一个无 reconcile 的栈：把 spec 写 False 并在此恢复
+        # 「诚实缺口」断言（不许假装它有网），别顺手删分支让缺口变静默。
+        raise AssertionError(
+            f"{fx.name}: spec 声明无聚合 reconcile（{fx.stack}）——全部已收录栈"
+            "都该有网；刻意新增无网关的栈请恢复本分支的诚实缺口断言")
 
 
 @pytest.mark.parametrize("fx", AGG, indirect=True)
@@ -271,7 +271,10 @@ def test_demote_safety_net_tier_is_derived_from_the_path_shape(fx):
     spec = spec_for_stack(fx.stack)
     safe_agg, tier_agg = demote_safety_net(fx.aggregate_manifest, fx.stack)
     assert tier_agg == "aggregate", f"{fx.name}: 根清单档位判错 {tier_agg}"
-    assert safe_agg is spec.has_aggregate_reconcile
+    # ★X-H3 R2★ members_only 档（npm）：reconcile 只补成员注册、整文件其它字段
+    # 无兜底 → safe 判据 = 有 reconcile ∧ 非 members_only。
+    assert safe_agg is (spec.has_aggregate_reconcile
+                        and not spec.aggregate_reconcile_members_only)
 
     if fx.module_manifests:
         mm = fx.module_manifests[0]

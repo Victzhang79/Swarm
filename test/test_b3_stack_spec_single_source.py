@@ -284,7 +284,10 @@ def _capture_demote(contested, *, exists):
     # P-H4c 起 gradle 模块档也有 #31-P2f 确定性 driver → (False, False)（M-3 原格已翻）。
     ("settings.gradle", "mod-a/build.gradle", False, False),
     # npm/go/python/cargo 模块档已有 #31-P2 确定性 driver（owner 按契约一次建全+backfill，
-    # P-H4a/b 复核补翻 spec）→ 模块清单 demote 安全不刷告警；npm 聚合档仍无 reconcile。
+    # P-H4a/b 复核补翻 spec）→ 模块清单 demote 安全不刷告警。
+    # ★X-H3 R2 hunter CRITICAL★ npm 聚合档=`aggregate_reconcile_members_only`：
+    # _reconcile_npm 只补 workspaces 成员注册，scripts/dependencies 等整文件编辑无兜底
+    # → (True, False)：WARNING 照刷（文案说明注册有网、其它字段没有）。
     ("package.json", "packages/a/package.json", True, False),
     ("go.work", "internal/a/go.mod", False, False),
     ("Cargo.toml", "crates/a/Cargo.toml", False, False),

@@ -107,6 +107,19 @@ class StackSpec:
     清单 demote 都有兜底"→ 当时 go/gradle/cargo 的模块清单丢贡献连 WARNING 都没有；
     后由 #31-P2c/2e/2f driver 全部补齐——P-H4 三臂落地，gradle 是最后一臂）。"""
 
+    aggregate_reconcile_members_only: bool = False
+    """该栈的 `_reconcile_*` 是否**只补成员注册**（不兜底整文件其它字段的编辑）。
+
+    ★X-H3 R2 hunter CRITICAL★ npm 的 `_reconcile_npm` 只补 `workspaces` 成员列表；
+    demote 收回的是【整个文件的写权】——scripts/dependencies/devDependencies 的真实
+    编辑 reconcile 补不回。`has_aggregate_reconcile=True` 是事实（函数存在），但拿它
+    当"demote 整文件安全"用 = 「复用单一事实源 ≠ 复用其消费契约」复发：WARNING 被
+    静默关掉，scripts/dependencies 编辑蒸发零信号。本字段=True 时
+    `demote_safety_net` 聚合档仍判【不安全】（照常 WARNING，文案说明注册有兜底、
+    其它字段没有）。maven/gradle/cargo/go 的聚合清单本身就是纯结构文件
+    （modules/include/members/use 之外几乎无独立编辑面）→ False。
+    """
+
     has_module_scaffold_driver: bool = False
     """该栈是否有**确定性脚手架 driver 一次建全模块清单**（= contract_utils
     `_MODULE_SCAFFOLD_DRIVER_STACKS`——maven 聚合 driver ∪ `_P2_SCAFFOLD_DRIVERS`，
@@ -203,11 +216,16 @@ STACK_SPEC: dict[str, StackSpec] = {
         module_manifest="package.json",
         aggregate_manifest="package.json", aggregate_field="workspaces",
         source_exts=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
-        # ★npm 聚合档无网（无 `_reconcile_npm`）★ 根 package.json demote 必须可观测
-        # （B-5 ManifestDriver 待补）；模块档有 #31-P2b 脚手架 driver（owner 按契约
+        # ★X-H3（27 号文 B-5）★ `_reconcile_npm` 已落地：workspaces【显式列表】
+        # 形态三面（add/prune/probes）收编（glob 形态自愈不碰）；根 package.json
+        # demote 的聚合档缺口闭合。模块档有 #31-P2b 脚手架 driver（owner 按契约
         # 一次建全+owner-backfill）→ 模块 package.json demote 安全（P-H4a 复核补翻——
         # driver 落地时漏翻，正是对账锁要逮的漂移）。
-        has_aggregate_reconcile=False,
+        has_aggregate_reconcile=True,
+        # ★X-H3 R2★ _reconcile_npm 只补 workspaces 成员注册；demote 收回整文件写权
+        # 时 scripts/dependencies 等编辑无兜底 → demote_safety_net 聚合档仍判不安全
+        # （WARNING 照刷，文案说明注册有兜底、其它字段没有）。
+        aggregate_reconcile_members_only=True,
         has_module_scaffold_driver=True,
         source_exclude_dirs=("node_modules", "dist", "build", "out", ".next"),
         source_exclude_suffixes=(".d.ts",),
@@ -464,7 +482,9 @@ def demote_safety_net(path: str, stack: str | None) -> tuple[bool, str]:
 
     ★两档不可互换（复核 M-3：这正是本仓"复用单一事实源 ≠ 复用其消费契约"的复发）★
       · 根级（无目录前缀）→ 聚合档，看 `has_aggregate_reconcile`：`_reconcile_*` 据磁盘
-        ground-truth 补回**注册**；
+        ground-truth 补回**注册**；★X-H3 R2★ 但 `aggregate_reconcile_members_only`
+        （npm）的 reconcile 只补成员注册——整文件其它字段（scripts/dependencies…）的
+        demote 编辑补不回，聚合档仍判【不安全】（WARNING 照刷）；
       · 模块级 → 模块档，看 `has_module_scaffold_driver`：owner 按契约一次建全模块清单，
         非 owner 本无合法贡献（#11a doctrine），demote 无损。
     把聚合档的 reconcile 事实当"该栈任何清单都有网"用，会让 gradle 的模块清单
@@ -476,7 +496,13 @@ def demote_safety_net(path: str, stack: str | None) -> tuple[bool, str]:
     tier = "aggregate" if "/" not in p else "module"
     if spec is None:
         return False, tier
-    safe = spec.has_aggregate_reconcile if tier == "aggregate" else spec.has_module_scaffold_driver
+    if tier == "aggregate":
+        # ★X-H3 R2★ members_only 档（npm）：reconcile 只补成员注册，整文件其它
+        # 字段（scripts/dependencies…）的 demote 编辑无兜底 → 判不安全（WARNING 照刷）。
+        safe = (spec.has_aggregate_reconcile
+                and not spec.aggregate_reconcile_members_only)
+    else:
+        safe = spec.has_module_scaffold_driver
     return safe, tier
 
 

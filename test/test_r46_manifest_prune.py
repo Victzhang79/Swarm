@@ -48,7 +48,17 @@ class TestManifestMemberProbes:
         pairs = manifest_member_probes("go.work", "go 1.22\n\nuse ./svc\n")
         assert ("svc", "svc") in pairs
 
-    def test_sln_not_handled(self):
+    def test_sln_boundary(self):
+        """X-H3 后 .sln 收编：已知工程后缀（.csproj）被处理；解决方案文件夹 /
+        URL 网站工程 / 未知后缀 不处理（边界锁，原 test_sln_not_handled 只拿
+        不可解析输入当假绿）。"""
+        sln = (
+            'Project("{T}") = "Web", "src\\Web\\Web.csproj", "{G1}"\nEndProject\n'
+            'Project("{F}") = "infra", "infra", "{G2}"\nEndProject\n'
+            'Project("{U}") = "Site", "http://localhost/site", "{G3}"\nEndProject\n'
+            'Project("{W}") = "Setup", "setup\\setup.wixproj", "{G4}"\nEndProject\n')
+        pairs = manifest_member_probes("app.sln", sln)
+        assert pairs == [("src/Web/Web.csproj", "src/Web/Web.csproj")], pairs
         assert manifest_member_probes("app.sln", "Project(...)") == []
 
 

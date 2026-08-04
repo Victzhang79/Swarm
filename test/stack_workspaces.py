@@ -18,7 +18,7 @@
 
 | builder | topology | 聚合清单 | 造它为了照出什么 |
 |---|---|---|---|
-| `npm_workspaces` | workspace | `package.json` `workspaces` | 唯一**两档都无网**的已收录栈（无 `_reconcile_npm`、无模块脚手架 driver） |
+| `npm_workspaces` | workspace | `package.json` `workspaces` | X-H3 现场：显式列表形态不自愈（`_reconcile_npm` 落地前新子包 `npm ci` 装不到） |
 | `go_work` | workspace | `go.work` `use(...)` | R-1 主犯之一：曾判死却无人收敛 |
 | `cargo_workspace` | workspace | `Cargo.toml` `[workspace] members` | 同上；且 glob 成员覆盖语义 |
 | `gradle_kts` | workspace | `settings.gradle.kts` | `.kts` **别名**档（F-1 实测别名整列落空的现场） |
@@ -112,9 +112,10 @@ def _w(root: Path, rel: str, text: str) -> None:
 def build_npm_workspaces(root: Path) -> WorkspaceFixture:
     """`packages/*` 布局；根 `workspaces` 只登记了 core，web 在磁盘上但未登记。
 
-    ★npm 的 `unregistered` 是**真缺口**★ 无 `_reconcile_npm`（spec
-    `has_aggregate_reconcile=False`）→ 没人会补 web，`npm ci` 装不到它（X-H3）。
-    夹具如实造出这个形状，别替实现圆场。
+    ★npm 的 `unregistered` 曾是**真缺口**★（X-H3：无 `_reconcile_npm` 时没人补 web，
+    `npm ci` 装不到它）。`_reconcile_npm` 落地（B-5）后本夹具转成 reconcile 的
+    正向锁：显式列表形态必须补 web（glob 形态自愈不在此列）。夹具如实造出
+    显式列表形状，别替实现圆场。
     """
     # ★根**无** scripts、子包**有** build★ 这是 workspaces 的常见形态（根只做编排，
     # 构建脚本在各包；用 turbo/nx 的仓根才有 scripts）。形状必须是这个——`_infer_npm`

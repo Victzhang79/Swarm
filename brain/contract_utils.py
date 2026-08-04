@@ -5390,13 +5390,21 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             _safe, _tier = demote_safety_net(_f, _fstk)
             if _safe:
                 continue
+            # ★X-H3 R2★ members_only 档（npm 根 package.json）：成员注册有
+            # _reconcile_npm 兜底，但整文件其它字段（scripts/dependencies…）无——
+            # 文案必须说清「哪半张网有、哪半张没有」，别把编辑蒸发说成全无网。
+            _mo = (_tier == "aggregate" and _fstk
+                   and getattr(spec_for_stack(_fstk),
+                               "aggregate_reconcile_members_only", False))
             logger.warning(
                 "[normalize] 规则1 demote 清单 %s（%s，栈=%s，档=%s）→ **该档无兜底网**"
                 "（%s）；该子任务对此文件的编辑（如自加依赖/插件）会静默蒸发。"
                 "依赖应由契约驱动进 owner 脚手架，别指望 worker 徒手补。",
                 _f, st.id, _fstk, _tier,
-                "无 _reconcile_* 补回根注册" if _tier == "aggregate"
-                else "无脚手架 driver 一次建全模块清单")
+                ("成员注册有 _reconcile_npm 兜底，但 scripts/dependencies 等"
+                 "其它字段编辑无兜底" if _mo
+                 else "无 _reconcile_* 补回根注册" if _tier == "aggregate"
+                 else "无脚手架 driver 一次建全模块清单"))
             try:
                 from swarm.infra.degrade import record_degrade
                 record_degrade(

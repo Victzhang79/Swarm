@@ -6,6 +6,7 @@
   - Rust    : 根 Cargo.toml `[workspace] members`
   - .NET    : *.sln `Project(...)` 条目
   - Go      : go.work `use ./x`（多模块工作区）
+  - npm     : 根 package.json `workspaces`【显式列表】形态（X-H3，27 号文 B-5）
 
 并行子任务各自在【独立沙箱】里改这个共享清单 → pull-back 整文件覆盖 → 后注册的把先注册的
 【冲掉】(last-write-wins) → 成员丢失 → reactor/构建找不到该模块 → 确定性失败（与代码无关）。
@@ -17,13 +18,17 @@
   ② L2 集成验证(合并库 apply 后、构建前，使集成构建不因被冲掉的清单【假失败】)；
   ③ 交付 commit 前(合并库上，把对账结果写进交付产物，持久化、杜绝 race 残留)。
 
-仅处理【显式成员列表】型清单——glob 型(Node `"workspaces": ["packages/*"]`、pnpm、Python
-`pyproject` workspace globs)会自愈，不碰。保守、绝不臆造结构：聚合清单不存在/格式异常/疑似
-【动态枚举】一律跳过，绝不创建新清单、绝不改写既有非成员区。全程无 LLM、幂等、可复现。
+仅处理【显式成员列表】型清单/条目——glob 条目(Node `"workspaces": ["packages/*"]`、pnpm、
+Python `pyproject` workspace globs)会自愈，不碰；但 npm workspaces 的**显式列表**形态
+（`["packages/web", "packages/api"]`）【不自愈】——新子包永不进列表 → `npm ci` 装不到
+（X-H3 实证），故显式条目同样三面（add/prune/probes）收编。保守、绝不臆造结构：聚合清单
+不存在/格式异常/疑似【动态枚举】一律跳过，绝不创建新清单、绝不改写既有非成员区。
+全程无 LLM、幂等、可复现。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -74,12 +79,14 @@ def reconcile_workspace_manifests(
 def _reconcile_manifests_unlocked(
     root: Path, modified: list[str] | None, prune: bool
 ) -> dict:
-    """reconcile 本体（调用方负责锁语义，见 reconcile_workspace_manifests docstring）。"""
+    """reconcile 本体（调用方负责锁语义，见 reconcile_workspace_manifests docstring）。
+
+    add 面分派表=模块级 `_RECONCILE_DISPATCH`（★X-H3 R2★ 单一事实源给测试断
+    「接线事实」用——禁 getsource 扫函数体，纪律 6）。"""
     hint = [str(m or "") for m in (modified or [])]
     modified_manifests: list[str] = []
     added: dict[str, list[str]] = {}
-    for fn in (_reconcile_maven, _reconcile_maven_dep_versions, _reconcile_gradle,
-               _reconcile_cargo, _reconcile_dotnet_sln, _reconcile_go_work):
+    for fn in _RECONCILE_DISPATCH:
         try:
             mods, adds = fn(root, hint)
         except Exception as exc:  # noqa: BLE001 —— 增益层：单生态失败不影响其它与主流程
@@ -520,7 +527,7 @@ def _reconcile_dotnet_sln(root: Path, hint: list[str]) -> tuple[list[str], dict[
             for c in d.iterdir():
                 if c.is_dir() and c.name not in _SKIP_DIRS and not c.name.startswith("."):
                     stack.append(c)
-                elif c.is_file() and c.suffix in _SLN_TYPE_GUID:
+                elif c.is_file() and c.suffix.lower() in _SLN_TYPE_GUID:
                     proj_files.append(c)
         except OSError:
             pass
@@ -533,7 +540,7 @@ def _reconcile_dotnet_sln(root: Path, hint: list[str]) -> tuple[list[str], dict[
         if relp.lower() in referenced:
             continue
         name = proj.stem
-        type_guid = _SLN_TYPE_GUID[proj.suffix]
+        type_guid = _SLN_TYPE_GUID[proj.suffix.lower()]
         proj_guid = str(uuid.uuid5(_SLN_NS, relp.lower())).upper()
         win_path = relp.replace("/", "\\")
         proj_blocks.append(
@@ -625,6 +632,84 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
     return [rel], {rel: new_members}
 
 
+# ─────────────────── npm（workspaces 显式列表形态，X-H3 27 号文 B-5）───────────────────
+def _reconcile_npm(root: Path, hint: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """根 package.json workspaces【显式列表】：同容器内磁盘新包须有条目。
+
+    X-H3 实证：显式列表形态（`["packages/web", "packages/api"]`）【不自愈】——
+    新子包永不进列表 → `npm ci` 装不到 → import 确定性失败（glob 形态自愈，不碰）。
+    容器推断【只】凭既有显式条目的父目录（"packages/web" → 容器 "packages"；顶层
+    条目 "web" → 容器=根），绝不臆测约定目录名（血规 2）。已被 glob 条目覆盖的
+    目录不加（自愈范围）。无 workspaces 字段=单包工程，绝不擅自创建（与 go.work
+    「绝不创建」同哲学）。JSON round-trip 写回（缩进 2，_merge_npm_workspaces 先例）。
+    """
+    pkg = root / "package.json"
+    if not pkg.is_file():
+        return [], {}
+    text = _read(pkg)
+    if text is None:
+        return [], {}
+    entries = _npm_workspaces_entries(text)
+    if entries is None:
+        return [], {}
+    explicit = _npm_explicit_members(text)
+    if not explicit:
+        # 纯 glob/空列表：glob 自愈无缺口（不是「认不得」），无容器证据也不猜
+        # 约定目录名。留 debug 痕——运维排查「reconcile 怎么没动」时可辨（R2 hunter）。
+        logger.debug("[workspace-manifest] npm workspaces 纯 glob/空列表 ⇒ "
+                     "无显式成员对账缺口（glob 自愈），跳过 add 面")
+        return [], {}
+    globs = [e for e in entries if "*" in e]
+    containers = {e.rsplit("/", 1)[0] for e in explicit if "/" in e}
+    if any("/" not in e for e in explicit):
+        # ★R2 reviewer MEDIUM：顶层显式条目（"web"）的容器=根——但根目录的
+        # package.json 子目录鱼龙混杂（scripts/e2e/docs 工具包），凭「有一员在根」
+        # 推断「根的 package.json 子目录皆是成员」误杀面太大 → fail-closed 不加。
+        logger.debug(
+            "[workspace-manifest] npm workspaces 含顶层条目 ⇒ 容器=根，根级新包"
+            "不做自动登记（误杀面大，fail-closed；多层容器照常对账）")
+    listed = set(explicit)
+    new_members: list[str] = []
+    for c in sorted(containers):
+        base = root / c
+        for child in _safe_subdirs(base):
+            rel = _rel(root, child)
+            if rel in listed or rel in containers:
+                continue
+            if any(_npm_glob_covers(g, rel) for g in globs):
+                continue  # glob 已覆盖=自愈范围
+            if not (child / "package.json").is_file():
+                continue
+            new_members.append(rel)
+    if not new_members:
+        return [], {}
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return [], {}
+    ws = obj.get("workspaces")
+    target = ws.get("packages") if isinstance(ws, dict) else ws
+    if not isinstance(target, list):
+        return [], {}
+    target.extend(sorted(new_members))
+    try:
+        pkg.write_text(
+            json.dumps(obj, indent=_detect_json_indent(text), ensure_ascii=False) + "\n",
+            encoding="utf-8")
+    except OSError as _exc:
+        logger.debug("[workspace-manifest] npm workspaces 写回失败（不致命）: %s", _exc)
+        return [], {}
+    return ["package.json"], {"package.json": sorted(new_members)}
+
+
+# ★add 面分派单一事实源（X-H3 R2）★ `_reconcile_manifests_unlocked` 的唯一驱动；
+# 测试断「接线事实」就断这里（纪律 6：单一事实源就是给测试用的），禁 getsource。
+_RECONCILE_DISPATCH = (
+    _reconcile_maven, _reconcile_maven_dep_versions, _reconcile_gradle,
+    _reconcile_cargo, _reconcile_dotnet_sln, _reconcile_go_work, _reconcile_npm,
+)
+
+
 # ══════════════════ R46 治本：成员条目 ↔ 磁盘存在 双向镜像（prune 侧）══════════════════
 # round46 实锤两面同根：
 #   R46-1  reconcile 按【本地共享树】注册的聚合清单被原样推进【沙箱】——沙箱里没有并行兄弟
@@ -635,8 +720,11 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
 # 治本不变量：显式成员清单的条目必须与【目标树】上真实存在的成员双向镜像——add 侧(上方
 # reconcile)补漏，prune 侧(本节)摘幽灵。probe 语义统一为「相对清单所在目录的存在性探针」，
 # 存在性判定由调用方注入(本地 FS / 沙箱批量 test -e)，核心解析只此一份、多栈复用。
-# 保守边界与 add 侧一致：.sln 不碰(格式复杂)；glob 型成员不碰；member_exists 返回 None
+# 保守边界与 add 侧一致：glob 型成员不碰；member_exists 返回 None
 # (未知，如沙箱探测失败)一律保留条目 fail-open——绝不因探测通道故障误删成员。
+# ★X-H3（27 号文 B-5）★ 原「.sln 不碰（格式复杂）」边界已收编：.sln 与 npm 显式
+# 列表的 probes/prune 已落地（三面同源——add 早有的栈只补 probes/prune 两面）；
+# .sln 仍只收工程文件后缀已知的 Project，解决方案文件夹/URL 工程不碰。
 
 def _pom_modules_span(text: str) -> tuple[int, int] | None:
     """首个【不在 <profiles> 内】的 <modules> 块 span（含标签）。
@@ -652,18 +740,121 @@ def _pom_modules_span(text: str) -> tuple[int, int] | None:
     return None
 
 
+# ── npm workspaces 显式条目解析（X-H3：add/prune/probes 三面共享同一解析，绝不各写一份）──
+def _npm_workspaces_entries(text: str) -> list[str] | None:
+    """package.json 的 workspaces 成员条目（数组形或 {"packages": [...]} 形）。
+
+    返回 None=无 workspaces 字段/JSON 解析失败（调用方自然跳过）；返回列表【含】
+    glob/否定条目（调用方按形态分档）。仅根 package.json 的 workspaces 有聚合语义。
+    """
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    ws = obj.get("workspaces")
+    if isinstance(ws, dict):
+        ws = ws.get("packages")
+    if not isinstance(ws, list):
+        return None
+    return [e for e in ws if isinstance(e, str)]
+
+
+def _npm_norm_entry(entry: str) -> str:
+    """workspaces 条目归一化：剥 ./ 前缀与首尾 /，反斜杠归一（与 go.work _norm_use 同思路）。
+
+    ★路径逃逸拒收（X-H3 R2 reviewer HIGH）★：含 `..` 段或以 `/` 开头的条目返回 ""——
+    恶意/破损 package.json 的 `"workspaces": ["../sibling"]` 会让 add 面把根目录外
+    路径写进 workspaces（已实测复现）。三面（probes/prune/add）同走本函数，一处拒收
+    三面免疫。"""
+    e = entry.strip().replace("\\", "/")
+    if e.startswith("./"):
+        e = e[2:]
+    # 绝对路径判定必须先于 strip("/")——"/abs/evil" 先剥首 / 会伪装成合法相对路径
+    if e.startswith("/") or ".." in e.split("/"):
+        return ""
+    return e.strip("/")
+
+
+def _npm_explicit_members(text: str) -> list[str]:
+    """workspaces 的【显式成员】条目（归一化后）。glob（含 *）与 yarn 否定（! 前缀）
+    条目剔除——前者自愈不碰、后者语义复杂不臆解。"""
+    out: list[str] = []
+    for e in _npm_workspaces_entries(text) or []:
+        if "*" in e or e.strip().startswith("!"):
+            continue
+        e = _npm_norm_entry(e)
+        if e:
+            out.append(e)
+    return out
+
+
+def _npm_glob_covers(glob_entry: str, rel: str) -> bool:
+    """workspaces glob 条目是否覆盖成员目录 rel（`**`=跨层，`*`=单层）。"""
+    pat = re.escape(_npm_norm_entry(glob_entry))
+    pat = pat.replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+    return re.match("^" + pat + "$", rel) is not None
+
+
+def _detect_json_indent(text: str) -> "int | str":
+    """探测 JSON 文件的既有缩进（X-H3 R2 hunter：round-trip 保真，别把 4 空格/tab
+    的原文件全量重排成 2 空格污染交付 diff）。探测失败回退 2（npm 主流约定）。"""
+    for line in text.splitlines()[1:20]:
+        stripped = line.lstrip(" \t")
+        if not stripped:
+            continue
+        lead = line[:len(line) - len(stripped)]
+        if lead:
+            return "\t" if "\t" in lead else len(lead)
+    return 2
+
+
+# .sln 的 Project 块头行（捕获：工程名 / 工程文件路径 / 工程 GUID——prune 侧需要 GUID
+# 清理 ProjectConfigurationPlatforms 里的配置行，add 侧 reconcile 只用路径）。
+_SLN_PROJECT_RE = re.compile(
+    r'Project\("\{[^}]+\}"\)\s*=\s*"([^"]*)",\s*"([^"]+)",\s*"\{([^}]+)\}"')
+
+
+def _sln_path_pattern(norm_path: str) -> str:
+    """归一化工程路径 → 匹配两种斜杠写法的正则片段（.sln 惯例用反斜杠）。"""
+    return "[\\\\/]".join(re.escape(seg) for seg in norm_path.split("/"))
+
+
 def manifest_member_probes(rel_path: str, text: str) -> list[tuple[str, str]]:
     """解析清单的显式成员 → [(成员原始 token, 存在性探针相对路径)]。
 
     探针相对【清单所在目录】：Maven=<module 值>/pom.xml（reactor 两者缺一即硬错）；
-    Gradle include ':a:b'=a/b 目录；Cargo 显式 member=目录；go.work use=目录。
+    Gradle include ':a:b'=a/b 目录；Cargo 显式 member=目录；go.work use=目录；
+    npm workspaces 显式条目=目录（探针=<条目>/package.json）；.sln Project=工程文件本身。
     未识别的清单类型返回 []（调用方自然跳过剪枝）。
     保守边界（对抗复核 F2）：pom 只看主 <modules> 块（profiles 不碰）；Gradle 只收
     【单 token 独占一行】的 include（多工程单行 include 整行跳过，避免截断腐蚀）；
-    Cargo 只在 members 数组 span 内取显式项。
+    Cargo 只在 members 数组 span 内取显式项；npm 只收【根】package.json 的显式条目
+    （glob/否定条目不碰）；.sln 只收工程文件后缀已知的 Project（解决方案文件夹/
+    URL 网站工程不碰）。
     """
     name = rel_path.rsplit("/", 1)[-1]
     out: list[tuple[str, str]] = []
+    if name == "package.json" and "/" not in rel_path:
+        # X-H3：仅根 package.json 的 workspaces 有聚合语义（成员包自己的同名文件
+        # 不是聚合清单）；glob/否定条目已被 _npm_explicit_members 剔除。
+        for e in _npm_explicit_members(text):
+            out.append((e, f"{e}/package.json"))
+        return out
+    if name.lower().endswith(".sln"):
+        # X-H3：token=归一化工程路径（不用工程名——同名工程不同路径会撞键，基线
+        # 对账会冤杀其一）。探针=工程文件本身（.sln 引用的是文件而非目录）。
+        for m in _SLN_PROJECT_RE.finditer(text):
+            proj_path = m.group(2).replace("\\", "/")
+            if "://" in proj_path:
+                continue  # 网站工程（URL 路径）非磁盘成员
+            # 大小写不敏感（X-H3 R2 reviewer HIGH：Windows 生态常见 Web.CSPROJ；
+            # add 侧 _reconcile_dotnet_sln 同口径，两面不得分叉）
+            if Path(proj_path).suffix.lower() not in _SLN_TYPE_GUID:
+                continue  # 解决方案文件夹（path=名字无文件）/未知工程类型
+            out.append((proj_path, proj_path))
+        return out
     if name == "pom.xml":
         span = _pom_modules_span(text)
         if span:
@@ -728,6 +919,17 @@ def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str
     removed: list[str] = []
     new_text = text
     name = rel_path.rsplit("/", 1)[-1]
+    if name == "package.json" and "/" not in rel_path:
+        # ★R2 hunter★ npm 的 probes 返回 [] 有两种成因：无 workspaces 字段（合法，
+        # 非聚合清单）vs JSON 损坏（幽灵可能漏摘）。removed=[] 时两者不可分 =
+        # 「缺席必须机读可辨」失守。解析失败 → fail-open 原文返回 + WARNING。
+        try:
+            json.loads(text)
+        except (ValueError, TypeError) as _jexc:
+            logger.warning(
+                "[workspace-manifest] npm workspaces prune 跳过：%s JSON 解析失败"
+                "（幽灵成员可能漏摘；文件保留原文未动）: %s", rel_path, _jexc)
+            return text, []
     for tok, probe in manifest_member_probes(rel_path, text):
         exists = member_exists(probe)
         if exists is not False:
@@ -739,6 +941,48 @@ def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str
                 pat = re.compile(
                     r"[ \t]*<module>\s*" + re.escape(tok) + r"\s*</module>[ \t]*\r?\n?")
                 new_text, n = _sub_in_span(new_text, span, pat)
+        elif name == "package.json" and "/" not in rel_path:
+            # X-H3：JSON round-trip（_merge_npm_workspaces 已有先例）——文本手术对
+            # JSON 数组 brittle，round-trip 确定性且只动 workspaces 列表。解析失败/
+            # 形态缺席 → n=0 保留（绝不产出损坏 JSON）。缩进探测原文保真 + 末尾换行。
+            try:
+                _obj = json.loads(new_text)
+            except (ValueError, TypeError):
+                # 入口处已做整文件解析闸（损坏即 fail-open + WARNING 返回）——
+                # 走到这里 JSON 必合法；本 try 只是防御 round-trip 中间态。
+                _obj = None
+            if isinstance(_obj, dict):
+                _ws = _obj.get("workspaces")
+                _lst = _ws.get("packages") if isinstance(_ws, dict) else _ws
+                if isinstance(_lst, list):
+                    _kept = [x for x in _lst
+                             if not (isinstance(x, str) and _npm_norm_entry(x) == tok)]
+                    if len(_kept) != len(_lst):
+                        if isinstance(_ws, dict):
+                            _ws["packages"] = _kept
+                        else:
+                            _obj["workspaces"] = _kept
+                        new_text = (json.dumps(
+                            _obj, indent=_detect_json_indent(text),
+                            ensure_ascii=False) + "\n")
+                        n = 1
+        elif name.lower().endswith(".sln"):
+            # X-H3：摘 Project...EndProject 整块 + ProjectConfigurationPlatforms 里
+            # 该工程 GUID 的全部配置行（只摘块会把 GUID 配置留成悬挂引用）。tok=
+            # 归一化工程路径，匹配两种斜杠。NestedProjects 的 GUID 悬挂引用 VS/msbuild
+            # 容忍（仅影响解决方案树展示），保守不碰。
+            pat = re.compile(
+                r'(?m)^Project\("\{[^}]+\}"\)\s*=\s*"[^"]*",\s*"'
+                + _sln_path_pattern(tok)
+                + r'",\s*"\{([^}]+)\}"[^\n]*\r?\n[ \t]*EndProject\r?\n?')
+            m = pat.search(new_text)
+            if m:
+                guid = m.group(1)
+                new_text = new_text[:m.start()] + new_text[m.end():]
+                new_text = re.sub(
+                    r"(?m)^[ \t]*\{" + re.escape(guid) + r"\}\.[^\n]*\r?\n?",
+                    "", new_text)
+                n = 1
         elif name in ("settings.gradle", "settings.gradle.kts"):
             # 整行锚定：只删「单 token 独占一行」形态，多 token 行/注释行天然不匹配
             pat = re.compile(
@@ -784,10 +1028,15 @@ def prune_stale_manifest_members(project_path: str) -> dict[str, list[str]]:
     removed_all: dict[str, list[str]] = {}
     try:
         cands: list[Path] = [d / "pom.xml" for d in _maven_aggregators(root)]
-        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work"):
+        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work",
+                  "package.json"):
             p = root / n
             if p.is_file():
                 cands.append(p)
+        # X-H3：.sln 与 reconcile 同约定（C15：多 sln 排序取首，确定性可复现）
+        _slns = sorted(p for p in root.glob("*.sln") if p.is_file())
+        if _slns:
+            cands.append(_slns[0])
         for mf in cands:
             text = _read(mf)
             if text is None:
@@ -1038,7 +1287,9 @@ def _merge_npm_workspaces(local_text: str, incoming_text: str, rel_path: str) ->
         logger.info(
             "[workspace-manifest] B7 npm workspaces 并集合并 %s：并回 local 独有成员 "
             "%d 个（陈旧副本覆盖丢注册面）", rel_path, len(missing))
-        return _json.dumps(inc, ensure_ascii=False, indent=2) + "\n"
+        # X-H3 R2：缩进探测 incoming 原文保真（4 空格/tab 文件不被重排成 2 空格）
+        return _json.dumps(
+            inc, ensure_ascii=False, indent=_detect_json_indent(incoming_text)) + "\n"
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
         logger.warning("[workspace-manifest] B7 npm 合并异常 fail-open: %s", exc)
         return incoming_text
@@ -1135,9 +1386,55 @@ def strip_worker_manifest_contribs(
 ) -> tuple[str, int]:
     """从 local 摘除【worker 相对 HEAD 新增】的清单条目 → (新文本, 摘除数)。
 
-    仅 Maven pom（毒性实证面）；其它清单返回原文。fail-open。"""
+    Maven pom（毒性实证面）+ npm workspaces 显式成员 + .sln Project 条目
+    （X-H3 R2 hunter HIGH：FAIL 子任务对根 package.json/.sln 的新增贡献残留
+    本地共享树——旧实现非 pom 恒原样返回且零信号）。其它清单返回原文。fail-open。
+    """
+    _name = rel_path.rsplit("/", 1)[-1]
     try:
-        if rel_path.rsplit("/", 1)[-1].lower() != "pom.xml":
+        if _name == "package.json" and "/" not in rel_path:
+            # npm：worker 相对 HEAD 新增的显式成员 → 从 local 摘除（复用 prune 臂，
+            # 三面同源）。glob/否定条目不参与（probes 本就不收）。
+            _added = (set(_npm_explicit_members(worker_text))
+                      - set(_npm_explicit_members(head_text)))
+            if not _added:
+                return local_text, 0
+            removed_n = 0
+            new_text = local_text
+            for tok in sorted(_added):
+                new_text, _rm = prune_manifest_members(
+                    rel_path, new_text, lambda p, _t=tok: False if p == f"{_t}/package.json" else None)
+                removed_n += len(_rm)
+            if removed_n:
+                logger.info(
+                    "[workspace-manifest] H2 npm workspaces 摘除 FAIL 子任务新增成员 %s"
+                    "（残留会让 npm ci 去装从未合入的包）: %s", sorted(_added), rel_path)
+            return new_text, removed_n
+        if _name.lower().endswith(".sln"):
+            # .sln：worker 相对 HEAD 新增的工程路径 → 从 local 摘 Project 块+GUID 配置行
+            _head_paths = {p for _, p in manifest_member_probes(rel_path, head_text)}
+            _added = [p for _, p in manifest_member_probes(rel_path, worker_text)
+                      if p not in _head_paths]
+            if not _added:
+                return local_text, 0
+            removed_n = 0
+            new_text = local_text
+            for tok in sorted(_added):
+                new_text, _rm = prune_manifest_members(
+                    rel_path, new_text, lambda p, _t=tok: False if p == _t else None)
+                removed_n += len(_rm)
+            if removed_n:
+                logger.info(
+                    "[workspace-manifest] H2 .sln 摘除 FAIL 子任务新增工程 %s"
+                    "（残留幽灵工程条目会让 msbuild 硬错）: %s", sorted(_added), rel_path)
+            return new_text, removed_n
+        if _name.lower() != "pom.xml":
+            # ★缺席可辨（R2 hunter）★ 非 pom/npm/.sln 的共享清单 H2 剥离未实现——
+            # 至少留 WARNING（settings.gradle/Cargo.toml/go.work 的残留形态登记）。
+            logger.warning(
+                "[workspace-manifest] H2 回滚：%s 的 worker 贡献剥离未实现（仅 "
+                "pom/package.json/.sln 有臂）→ 可能残留，交 reconcile/prune 对账自愈",
+                rel_path)
             return local_text, 0
         head_deps = {(ga, r) for ga, _, r in _pom_dep_blocks(head_text)}
         added = [(ga, r) for ga, _, r in _pom_dep_blocks(worker_text)
