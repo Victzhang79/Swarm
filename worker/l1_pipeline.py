@@ -5041,9 +5041,24 @@ def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[s
 
     pl_basis：调用方须传【已按 R50-3 过滤 repaired_file_paths 的 -pl 圈定基】（与 build/test 同源；复核
     HIGH：裸 modified 会把 repair 触达的外模块拖进 -pl→脚手架被别人在飞坏代码连坐=本 patch 要杀的病复发）。
+
+    X-M1（27 号文 B-5 BuildDriver 验收臂）：非 Maven 命令交 `l1_verify_drivers`
+    栈驱动层归一（gradle cd+wrapper / npm 根裸 script / go.work 根裸 go test 三形，
+    同「只改 positively-known」契约）；下方 Maven 臂一字不动（唯一跑过 E2E 的栈）。
     """
-    if not command or "mvn" not in command:
+    if not command:
         return command
+    if not is_maven_family_command(command):
+        # X-M1（R1 hunter F1）：非 Maven 系直进驱动层——判据与 _scope/_ensure 同源
+        # （治前用 "mvn" 子串粗筛，`npm run test-mvn` 这类词元不含 mvn 的命令会被
+        # 子串挡在 Maven 臂里原样返回=归一覆盖漏面；反向含 mvn 词元的非构建命令
+        # 仍由 Maven 臂内 family 闸原样放行，路由结果两形等价）。
+        from swarm.worker.l1_verify_drivers import VerifyIO, normalize_verify_command
+        return normalize_verify_command(
+            command, project_path, pl_basis,
+            VerifyIO(read_file=_read_project_file,
+                     file_exists=_project_file_exists,
+                     anchor_for=_manifest_dir_for))
     m = _CD_MVN_RE.match(command)
     if m is None:
         # 非规范形若仍含 cd（`;` 分隔 / 带空格引号目录 / env 前缀）→ _scope 不懂 cd 会 -pl 错配 cwd → 原样（MED2）
