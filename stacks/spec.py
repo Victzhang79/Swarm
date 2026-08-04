@@ -105,7 +105,7 @@ class StackSpec:
     ★不可外推到模块清单★ 这些函数只补聚合登记（modules/include/members/use），
     模块清单档看 `has_module_scaffold_driver`（复核 M-3：字段事实=聚合级，被消费成"任何
     清单 demote 都有兜底"→ 当时 go/gradle/cargo 的模块清单丢贡献连 WARNING 都没有；
-    go/cargo 后由 #31-P2c/2e driver 补齐，gradle 仍无）。"""
+    后由 #31-P2c/2e/2f driver 全部补齐——P-H4 三臂落地，gradle 是最后一臂）。"""
 
     has_module_scaffold_driver: bool = False
     """该栈是否有**确定性脚手架 driver 一次建全模块清单**（= contract_utils
@@ -173,7 +173,9 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exts=(".java", ".kt", ".scala", ".groovy"),
         shares_classpath_namespace=True,
         has_aggregate_reconcile=True,      # _reconcile_gradle（认 .kts）
-        # 模块 build.gradle 无脚手架 driver（P-H4）→ 模块清单 demote 必须留痕
+        # 模块 build.gradle(.kts) 有 #31-P2f 脚手架 driver（P-H4c：坐标经 maven_registry
+        # 原语解析——同坐标同仓库，BOM 受管省略版本）→ 模块清单 demote 安全
+        has_module_scaffold_driver=True,
         source_exclude_dirs=("build",),
         whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
     ),

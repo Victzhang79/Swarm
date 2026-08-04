@@ -3288,6 +3288,10 @@ def _record_unverified_deps(unverified_out: dict | None, mod: str, kept: list) -
         # （go 侧就是这么被突变实验逮到的，见 test_f2_ledger_is_stack_neutral_go_side）。
         coord = (getattr(k, "module", None) or getattr(k, "name", None)
                  or (f"{k.group}:{k.artifact}" if getattr(k, "artifact", None) else None)
+                 # gradle raw（classifier 超集等不判形态）：group/artifact 为空，
+                 # 没这一档就记成 `?@?`——账在、却认不出是哪个依赖＝这笔账没用
+                 # （hunter R1 HIGH，与 go 侧 `?@?` 同型）
+                 or getattr(k, "raw", None)
                  or "?")
         # maven 受管依赖按惯例不写版本（version=None）且那是**确定性证据**⇒ 已在上面被
         # `verified` 滤掉；能走到这里的 None 是"基线/受管集都没拿到"那支，标记要能看出区别。
@@ -4085,13 +4089,211 @@ def _inject_cargo_scaffolds(plan, project_path, file_plan, dirs,
     return injected
 
 
-# #31-P2b/2c/2d/2e：非 Maven 栈的 per-module 清单 driver 分派表（模块级单一事实源——
+def _gradle_dialect(project_path: str | None, mdir: str,
+                    plan_files: set[str] | None = None) -> str:
+    """模块清单 DSL 方言（确定性证据链，按事实强度排序）：
+    ① 模块已有清单 → 从其扩展名（磁盘事实）；② plan 明确要建的模块清单名（plan 事实，
+    reviewer R1 #6：根 Groovy 而 plan 在该模块建 .kts 时，根证据不能盖 plan）；
+    ③ 根 kts 证据（settings/build 任一）→ 'kts'；④ Groovy（gradle 官方默认 DSL——
+    跟证据走，绝不把方言当全局约定写死）。"""
+    if project_path:
+        if (Path(project_path) / mdir / "build.gradle.kts").is_file():
+            return "kts"
+        if (Path(project_path) / mdir / "build.gradle").is_file():
+            return "groovy"
+    if plan_files:
+        rel = mdir.strip("/") + "/"
+        if rel + "build.gradle.kts" in plan_files:
+            return "kts"
+        if rel + "build.gradle" in plan_files:
+            return "groovy"
+    if project_path:
+        for name in ("settings.gradle.kts", "build.gradle.kts"):
+            if (Path(project_path) / name).is_file():
+                return "kts"
+    return "groovy"
+
+
+def _gradle_project_path(mdir: str) -> str:
+    """gradle 工程路径（`:a:b` 冒号段镜像目录嵌套——settings include 的规范形态）。
+    边界登记：settings.gradle 可 rename 工程名，driver 按目录名物化（默认约定）。"""
+    return ":" + mdir.strip("/").replace("/", ":")
+
+
+def _gradle_dep_line(d, dialect: str) -> str:
+    """单条第三方依赖的 build 文件行（CREATE 模板与 MODIFY 片段共用——两份实现必漂移）。
+    受管省略版本（version is None）→ 无版本坐标（R67L-B3 gradle 形态：写显式版本=
+    对抗 BOM 受管对齐）；raw（不判形态）原样保留。"""
+    coord = d.raw or (f"{d.group}:{d.artifact}" + (f":{d.version}" if d.version else ""))
+    return f'implementation("{coord}")' if dialect == "kts" else f'implementation "{coord}"'
+
+
+def _gradle_project_line(rel_path: str, dialect: str) -> str:
+    return (f'implementation(project("{rel_path}"))' if dialect == "kts"
+            else f'implementation project("{rel_path}")')
+
+
+def _render_build_gradle(dialect: str, kept, project_paths: list[str]) -> str:
+    """成员 build 文件权威模板。kept=ResolvedGradleDep；project_paths=内部 `:a:b` 路径。
+    插件只写 `java`（greenfield 最小确定性选择；项目另有插件约定走 MODIFY 增量）。
+    ★repositories（reviewer R1 #3）★ gradle 零默认仓库——greenfield 工程根上可能
+    还没有任何 repositories 声明，缺了它外部坐标全解析不出=造出自败脚手架（验收的
+    gradlew dependencies 必炸）。mavenCentral 与坐标来源同一仓库；项目用镜像/强制
+    根级仓库时，dependencyResolutionManagement 会【响亮】拒绝项目级仓库而非静默
+    漂移（fail-closed 方向可接受）。"""
+    if dialect == "kts":
+        lines = ["plugins {", "    java", "}"]
+    else:
+        lines = ["plugins {", "    id 'java'", "}"]
+    lines += ["", "repositories {", "    mavenCentral()", "}"]
+    body = [_gradle_dep_line(k, dialect) for k in kept]
+    body += [_gradle_project_line(p, dialect) for p in project_paths]
+    if body:
+        lines += ["", "dependencies {"] + [f"    {b}" for b in body] + ["}"]
+    return "\n".join(lines) + "\n"
+
+
+def _gradle_dep_block(manifest_rel: str, kept, project_paths: list[str],
+                      dialect: str, exists: bool) -> str:
+    """gradle 清单机器块：CREATE→权威 build 文件模板；MODIFY→修改铁律（+缺失依赖片段）。
+    与 _cargo_dep_block 同构（cr#1：MODIFY 零缺失也给铁律护栏）。"""
+    fname = "build.gradle.kts" if dialect == "kts" else "build.gradle"
+    fence = "kotlin" if dialect == "kts" else "groovy"
+    if not exists:
+        return (f"\n【权威 {fname} 模板（确定性生成，原样写入 {manifest_rel}；仅当项目另有"
+                f"明确约定才允许在此基础上增改）】\n```{fence}\n"
+                f"{_render_build_gradle(dialect, kept, project_paths)}\n```")
+    frag = [_gradle_dep_line(k, dialect) for k in kept]
+    frag += [_gradle_project_line(p, dialect) for p in project_paths]
+    snip = ""
+    if frag:
+        snip = (f"\n【缺失依赖片段（并入 {manifest_rel} 既有 dependencies 块，"
+                f"★仅追加下列条目、逐字保留其余内容★）】\n```{fence}\n"
+                + "\n".join(frag) + "\n```")
+    return (f"\n【既有 {fname} 修改铁律（{manifest_rel} 已存在）】只做最小增量：绝不整体替换/"
+            "重写，绝不删除既有 dependencies/字段，仅在 dependencies 块内追加缺失条目。"
+            + snip)
+
+
+def _inject_gradle_scaffolds(plan, project_path, file_plan, dirs,
+                             unverified_out: dict | None = None) -> list[dict]:
+    """gradle per-build 文件 driver（P-H4c，27 号文「gradle 零脚手架出口」治本——
+    「认出来了却直接 no-op」的最刺眼一栈）。
+
+    与 cargo driver 同构：内部模块**物化** `project(":a:b")`（gradle 工程路径按目录
+    嵌套镜像=确定性）；第三方坐标经 maven_registry 原语解析（gradle 与 maven 同坐标
+    同仓库），工程自身清单/版本目录声明优先（零网络中间层）；BOM 受管 → 省略版本
+    （R67L-B3 gradle 形态）。解析不到如实丢弃+三处剔除（模板/契约/验收）。根
+    settings include 由 `_reconcile_gradle`（has_aggregate_reconcile）兜底，本 driver
+    只建成员清单。"""
+    from swarm.brain.gradle_registry import resolve_gradle_deps
+    from swarm.types import FileScope, SubTask, TaskIntent
+
+    mods_all = _contract_dep_entries(plan, dirs)
+    if not mods_all:
+        return []
+    # ★内部工程名全集从【全 dirs】取（目录名=gradle 默认工程名）★——含已认领/跨轮
+    # 模块，绝不让内部模块被当第三方送 Central 误解析同名公网坐标（cr#2/hunter#1 同律）。
+    name_by_label: dict[str, str] = {m: Path(d).name for m, d in dirs.items()}
+    dir_by_name: dict[str, str] = {Path(d).name: d for d in dirs.values()}
+    internal_names = set(name_by_label.values())
+    # ★hunter R2 H-1 同律★ 契约声明了但解析不出物理落点的模块【也是内部模块】——
+    # 标签并入内部判定集（不送仓库）；但【不物化】project 引用（无落点=臆造路径），
+    # 留契约 + WARNING（go held/cargo held 同律）。
+    _labels = _contract_module_labels(plan)
+    internal_names |= set(_labels)   # 兜底防线（held 臂是主信号，本行是 registry 安全
+    # 冗余：held 被改坏时标签仍绝不送仓库；P-H4c-k 突变锁的是 held 的 WARNING，
+    # 两臂的失效后果不同——冗余≠可删，hunter R1 LOW 登记保留）
+    injected: list[dict] = []
+    backfilled: list[str] = []
+    existing_ids = {st.id for st in plan.subtasks}
+    # reviewer R2 #6：scope 可能为 None（getattr 防御，否则一个无 scope 子任务让整个
+    # gradle 注入 AttributeError 崩出）；writable 一并收——greenfield 清单若只声明在
+    # writable（罕见）也不失方言证据。
+    plan_files = {f for st in plan.subtasks
+                  for key in ("create_files", "writable")
+                  for f in (getattr(getattr(st, "scope", None), key, None) or [])}
+    for entry in mods_all:
+        mod, mdir, arts = entry["module"], entry["dir"], entry["artifacts"]
+        dialect = _gradle_dialect(project_path, mdir, plan_files)
+        manifest_rel = f"{mdir}/build.gradle" + (".kts" if dialect == "kts" else "")
+        exists = bool(project_path) and (Path(project_path) / manifest_rel).is_file()
+        held = [a for a in arts if a in _labels and a not in dirs]
+        if held:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2f 模块 %s 的 %d 个内部 gradle 依赖无物理落点 → 不送"
+                "仓库也不生成 project 引用（留契约，物理落点补齐后再物化）: %s",
+                mod, len(held), held)
+        # ★内部标签先归一成工程名（目录名）再 resolve★（cargo crate_by_label 同律）——
+        # 裸标签直接送 resolve 会被判死成 dropped=真内部依赖当幻觉丢。
+        _norm_arts = [name_by_label.get(a, a) for a in arts if a not in held]
+        kept, internal_mods, dropped = resolve_gradle_deps(
+            _norm_arts, internal_modules=internal_names, project_path=project_path)
+        # F-2：先于任何 continue 记账（本 driver 同样多条出口）
+        _record_unverified_deps(unverified_out, mod, kept)
+        if dropped:
+            logger.warning(
+                "[SCAFFOLD-INJECT] #31-P2f 模块 %s 的 %d 个 gradle 依赖无法确定性解析坐标 → "
+                "模板/契约/验收三处一并剔除（绝不逼 worker 编版本）: %s", mod, len(dropped), dropped)
+        # 内部模块 → project(":a:b") 引用（仅物化【有落点】的）
+        project_paths = [_gradle_project_path(dir_by_name[im]) for im in internal_mods
+                         if im in dir_by_name]
+        internal_final = list(internal_mods)
+        # raw（不判形态）也要进契约终单——它在模板里，契约/验收缺它=「模板有、契约没有」
+        final_names = [k.artifact or k.raw for k in kept if k.artifact or k.raw] \
+            + internal_final + held
+        _prune_scaffold_contract_entry(plan, mod, final_names, dropped)   # hunter#3 同源剪契约
+        block = _gradle_dep_block(manifest_rel, kept, project_paths, dialect, exists)
+        owner = _manifest_owner_subtask(plan.subtasks, manifest_rel)
+        if owner is not None:   # cr#1：已认领 → backfill 进 owner，绝不静默留它手写
+            _refresh_scaffold_owner_contract(owner, mod, mdir, final_names)   # 2a 闸同步
+            if _upsert_owner_manifest_block(owner, manifest_rel, block):
+                backfilled.append(owner.id)
+            continue
+        sid = f"st-scaffold-{mod}"
+        if sid in existing_ids:
+            continue
+        scaffold = SubTask(
+            id=sid,
+            description=(f"【构建脚手架】为模块 {mod} " + ("补齐" if exists else "创建")
+                         + f" gradle 清单 {manifest_rel}：声明契约依赖全部坐标"
+                         "（写代码的子任务碰不到构建清单，缺一个=整模块编不过）"
+                         + _p2_wrap(manifest_rel, block)),
+            intent=TaskIntent.MODIFY if exists else TaskIntent.CREATE,
+            difficulty=SubTaskDifficulty.TRIVIAL,
+            scope=FileScope(writable=[manifest_rel] if exists else [],
+                            create_files=[] if exists else [manifest_rel]),
+            contract={"dependencies": [{"module": mod, "dir": mdir, "artifacts": final_names}]},
+            acceptance_criteria=[
+                f"{manifest_rel} 声明契约依赖全部坐标（内部模块用 project(\":...\") 引用），"
+                f"`./gradlew -q {_gradle_project_path(mdir)}:dependencies "
+                "--configuration compileClasspath` 解析通过"],
+        )
+        plan.subtasks.append(scaffold)
+        existing_ids.add(sid)
+        _wire_scaffold_ownership(plan, sid, mdir, manifest_rel)
+        if plan.parallel_groups:
+            plan.parallel_groups.insert(0, [sid])
+        injected.append({"module": mod, "subtask_id": sid, "artifacts": final_names,
+                         "manifest_exists": exists, "stack": "gradle"})
+    if injected:
+        logger.info("[SCAFFOLD-INJECT] #31-P2f gradle 脚手架注入 %d 个: %s",
+                    len(injected), [e["module"] for e in injected])
+    if backfilled:
+        logger.warning("[SCAFFOLD-INJECT] #31-P2f R58-3 gradle：%d 个 owner 自认领 build 文件 →"
+                       " 已把确定性清单块嵌进其 description（有 owner≠有模板）: %s",
+                       len(backfilled), backfilled[:8])
+    return injected
+
+
+# #31-P2b/2c/2d/2e/2f：非 Maven 栈的 per-module 清单 driver 分派表（模块级单一事实源——
 # stacks/spec.py 的 `has_module_scaffold_driver` 与本表派生集对账，test_b3 防漂移）。
 _P2_SCAFFOLD_DRIVERS = {"npm": _inject_npm_scaffolds, "go": _inject_go_scaffolds,
                         "python": _inject_python_scaffolds,
-                        "cargo": _inject_cargo_scaffolds}
+                        "cargo": _inject_cargo_scaffolds,
+                        "gradle": _inject_gradle_scaffolds}
 # 有【确定性模块清单脚手架 driver】的栈全集：maven 走聚合 driver 一次建全模块 pom，
-# npm/go/python/cargo 走 _P2_SCAFFOLD_DRIVERS。demote 模块清单安不安全就看这个集。
+# npm/go/python/cargo/gradle 走 _P2_SCAFFOLD_DRIVERS。demote 模块清单安不安全就看这个集。
 _MODULE_SCAFFOLD_DRIVER_STACKS = frozenset({"maven"}) | frozenset(_P2_SCAFFOLD_DRIVERS)
 
 
@@ -4125,9 +4327,9 @@ def _inject_build_scaffold_subtasks_impl(
     # （Go/npm/Rust/Python/Gradle…）→ 明确不伪造 Maven 产物（no-op + 告警），杜绝异栈 reactor 污染。
     _ok, _stack = _should_fabricate_maven_scaffold(plan, project_path, file_plan)
     if not _ok:
-        # #31-P2b/2c/2d/2e：非 Maven 栈不再无条件 no-op——npm/go/python/cargo 走各自的
-        # per-module 清单 driver（版本经 registry 确定性解析，绝不拿 pom 污染异栈）。
-        # 其余已知栈（gradle）暂无 driver → 保持明确 no-op（绝不伪造清单）。
+        # #31-P2b/2c/2d/2e/2f：非 Maven 栈不再无条件 no-op——npm/go/python/cargo/gradle
+        # 走各自的 per-module 清单 driver（版本经 registry 确定性解析，绝不拿 pom 污染
+        # 异栈）。其余未识别栈 → 保持明确 no-op（绝不伪造清单）。
         if _stack in _P2_SCAFFOLD_DRIVERS:
             try:
                 _p2_dirs = _module_physical_dirs(plan, project_path, file_plan)
@@ -4159,9 +4361,9 @@ def _inject_build_scaffold_subtasks_impl(
                                exc_info=True)
                 return []
         logger.warning(
-            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（非 Maven/npm/go/python/cargo）→ 跳过 pom 脚手架"
-            "注入（绝不拿 pom.xml/<modules>/<parent> 污染异栈工程）。该栈的 aggregator 脚手架 "
-            "driver 待接入（P-H4 剩余：gradle）。",
+            "[SCAFFOLD-INJECT] G9 工程构建栈=%s（未识别/未接入 driver 的栈）→ 跳过清单"
+            "脚手架注入（绝不拿 pom.xml/<modules>/<parent> 或任何异栈清单污染工程）。"
+            "已知栈（npm/go/python/cargo/gradle）全部有确定性 driver（P-H4 全落地）。",
             _stack)
         return []
     if _stack == "unknown":   # #5：无证据保守回退 Maven 也留痕（异栈污染事故可回溯）

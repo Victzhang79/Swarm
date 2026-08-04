@@ -281,7 +281,8 @@ def _capture_demote(contested, *, exists):
     ("pom.xml", "mod-a/pom.xml", False, False),        # maven：两档都有网
     # ★复核 M-3 本尊★ gradle 有【聚合】reconcile 但**没有模块清单的网**：
     # 早先版本拿聚合档的事实当"该栈任何清单都有网"，模块清单 demote 丢真实编辑却零告警。
-    ("settings.gradle", "mod-a/build.gradle", False, True),
+    # P-H4c 起 gradle 模块档也有 #31-P2f 确定性 driver → (False, False)（M-3 原格已翻）。
+    ("settings.gradle", "mod-a/build.gradle", False, False),
     # npm/go/python/cargo 模块档已有 #31-P2 确定性 driver（owner 按契约一次建全+backfill，
     # P-H4a/b 复核补翻 spec）→ 模块清单 demote 安全不刷告警；npm 聚合档仍无 reconcile。
     ("package.json", "packages/a/package.json", True, False),

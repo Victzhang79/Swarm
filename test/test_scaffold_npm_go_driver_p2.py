@@ -227,11 +227,11 @@ _DRIVER_MATRIX = [
      "mod-a", "packages/mod-a/src/index.ts", "package.json"),
     ("go", "go.mod", "module example.com/app\n\ngo 1.22\n",
      "mod-a", "svc/mod-a/main.go", "go.mod"),
-    # ★P-H4 诚实边界★ 认出来了却零脚手架出口 —— 期望值写 None 是**如实记录现状**，
-    # 不是"应该如此"。B-6 给这栈补 driver 那天，这格要改成对应清单名。
-    # （python 格已于 P-H4a、cargo 格已于 P-H4b 从 None 改为各自清单名——driver 已落地）
+    # ★P-H4 历史诚实边界★ 曾「认出来了却零脚手架出口」——期望值写 None 是**如实记录
+    # 现状**。（python 格 P-H4a、cargo 格 P-H4b、gradle 格 P-H4c 已从 None 改为各自
+    # 清单名——driver 全部落地，P-H4 三臂闭环）
     ("gradle", "settings.gradle", "include ':mod-a'\n",
-     "mod-a", "mod-a/src/main/kotlin/com/demo/A.kt", None),
+     "mod-a", "mod-a/src/main/kotlin/com/demo/A.kt", "build.gradle"),
     ("cargo", "Cargo.toml", '[workspace]\nmembers = ["crates/mod-a"]\n',
      "mod-a", "crates/mod-a/src/lib.rs", "Cargo.toml"),
     # python 用 `services/<mod>/` 多服务布局：标准 `src/<pkg>/` 与 `pkg/<mod>/` 都解析不出
@@ -275,6 +275,7 @@ def test_scaffold_driver_dispatch_matrix(tmp_path, monkeypatch, stack, manifest,
     monkeypatch.setenv("SWARM_NPM_LOOKUP", "0")   # 离线：解析不到就如实丢弃，绝不臆造
     monkeypatch.setenv("SWARM_GO_LOOKUP", "0")
     monkeypatch.setenv("SWARM_CARGO_LOOKUP", "0")   # P-H4b：cargo 同纪律
+    monkeypatch.setenv("SWARM_MAVEN_LOOKUP", "0")   # P-H4c：gradle 复用 maven 仓库原语，同纪律
     if manifest:
         (tmp_path / manifest).write_text(content, encoding="utf-8")
 
