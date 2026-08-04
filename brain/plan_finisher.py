@@ -22,7 +22,19 @@ from __future__ import annotations
 import logging
 import re as _re
 
+from swarm.stacks import STACK_SPEC
+
 logger = logging.getLogger(__name__)
+
+# P-M3（27 号文）：JVM 类文件扩展名集——唯一事实源=STACK_SPEC 的
+# shares_classpath_namespace=True 栈的 source_exts 并集（= {"java","kt","scala","groovy"}，
+# 派生非手写）。消费点=_domicile_contract_symbols 的「小写首字母符号不安置」排除：
+# 该排除本是 Maven/Java 时代的「方法名/字段名不是类」护栏，对 Python(get_user_report)/
+# JS(fetchReport)/Go(非导出符号) 是【把契约正主符号挡在确定性安置门外】的误杀。
+# 只在 JVM classpath 命名空间栈（文件名=公开类名，小写名绝不可能是类文件）才保留排除。
+_JVM_CLASS_FILE_EXTS: frozenset[str] = frozenset(
+    e.lstrip(".") for s in STACK_SPEC.values()
+    if s.shares_classpath_namespace for e in s.source_exts)
 
 
 def _synthesize_orphan_subtasks(plan, orphans: list[str], file_plan,
@@ -184,19 +196,6 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # 复核 F1：符号名标识符白名单——dict 条目 name 是未净化 LLM 字符串，脏名
     # （"GET /x/Export"、"IFoo<T>"、"../X"）直通会拼出垃圾/穿越路径；不合格如实留 VALIDATE
     _ident = _re.compile(r"^[A-Za-z_]\w*$")
-    hard = [e for e in entries
-            if (e.get("kind") in _HARD or e["symbol"] in _referenced_dtos)
-            and e["symbol"] and _ident.fullmatch(e["symbol"])
-            and not e["symbol"][0].islower()
-            and not ("." in e["symbol"] and e["symbol"].split(".", 1)[0] in sym_set)]
-    if not hard:
-        return {}
-    unowned = set(unowned_contract_symbols(plan, [e["symbol"] for e in hard]))
-    todo = [e for e in hard if e["symbol"] in unowned
-            and e.get("module") and _ident.fullmatch(
-                e["module"].replace("-", "_").replace("/", ""))]
-    if not todo:
-        return {}
     # 路径推导素材：plan 既有 create_files 的扩展名众数 + 各模块目录样本。
     # 复核 F2：已知源根顶段（src/app/lib 等）不是模块名——单模块工程 `src/main/...`
     # 的 top="src" 被当模块吃掉会让模板丢 src 段（文件落 {mod}/main/java/... =
@@ -232,6 +231,32 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
                 mod_dirs.setdefault("", Counter())[p.rsplit("/", 1)[0]] += 1
             elif "/" in rest:
                 mod_dirs.setdefault(top, Counter())[rest.rsplit("/", 1)[0]] += 1
+    # P-M3（27 号文）：主源扩展名用于门控小写符号排除（见 _JVM_CLASS_FILE_EXTS）。
+    # 空 exts 时 _dominant_ext="" → 不在 JVM 集 → 不排除小写；该形态随后在下方
+    # `if not exts` 原样早返 {}，行为与治前逐字节一致（门控形同虚设，不造新分支）。
+    # P-M3 R2（hunter F2）：most_common 平票按插入序（=LLM 输出序）→ 同一逻辑 plan
+    # 的门控结论随文件顺序抖动。平票确定性=（-计数, 扩展名字典序）双键排序，与下方
+    # `_mode` 同形状；方向登记：java/py 平票时 java 先=排除保留（保守方向）。
+    _dominant_ext = (sorted(exts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                     if exts else "")
+    hard = [e for e in entries
+            if (e.get("kind") in _HARD or e["symbol"] in _referenced_dtos)
+            and e["symbol"] and _ident.fullmatch(e["symbol"])
+            # P-M3：小写排除仅 JVM 类文件栈保留（文件名=公开类名，小写名=方法/字段
+            # 必不是类）；非 JVM 栈（py/go/ts/rs…）小写符号是契约正主，确定性安置。
+            # 边界登记：混合栈 plan（java 主导+零星 py 模块）按主导扩展名判，
+            # py 模块的小写符号仍被排除（=治前行为，保守方向，不放宽）。
+            and (_dominant_ext not in _JVM_CLASS_FILE_EXTS
+                 or not e["symbol"][0].islower())
+            and not ("." in e["symbol"] and e["symbol"].split(".", 1)[0] in sym_set)]
+    if not hard:
+        return {}
+    unowned = set(unowned_contract_symbols(plan, [e["symbol"] for e in hard]))
+    todo = [e for e in hard if e["symbol"] in unowned
+            and e.get("module") and _ident.fullmatch(
+                e["module"].replace("-", "_").replace("/", ""))]
+    if not todo:
+        return {}
     if not exts:
         # 复核 F3：无源码扩展名证据 → 不猜语言（多栈铁律），本步 fail-open 留 VALIDATE
         logger.info("[PLAN-FINISH] R48b-1 无源码扩展名证据（纯配置/SQL plan）→ "
@@ -365,7 +390,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             # （tpl_dir 退化默认 src 时 mod/src/seg 不过可编译布局）——豁免照建
             # （防死循环）但必须如实标注幽灵面，与证据面闸住的 punt 可区分。
             _g4_probe = f"{mod}/{mod_dirs[''].most_common(1)[0][0] if ('' in mod_dirs and mod_dirs['']) else tpl_dir}/{seg}/X.{_ext_for(mod)}"
-            _g4_ghost = (_ext_for(mod).lower() in _JVM_CODE_EXTS
+            _g4_ghost = (_ext_for(mod).lower() in _JVM_CLASS_FILE_EXTS
                          and not _jvm_compilable_layout(_g4_probe))
             logger.warning(
                 "[PLAN-FINISH] G4 契约模块 %r 零物理证据（file_plan/scaffold/基线全无）→ "
@@ -398,7 +423,10 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
     # 异栈（_ext_for 不产这些扩展名）零行为变化。
     from swarm.brain.contract_utils import classpath_fqn_key as _classpath_fqn_key
     from swarm.brain.contract_utils import jvm_compilable_layout as _jvm_compilable_layout
-    _JVM_CODE_EXTS = {"java", "kt", "scala", "groovy"}
+    # P-M3 R2（reviewer F1）：本函数三处 JVM 代码扩展名判定（G4 幽灵探测 / B5 Case C /
+    # 安置布局闸）统一消费模块级 `_JVM_CLASS_FILE_EXTS`（STACK_SPEC 派生）——
+    # 原本地手写 {"java","kt","scala","groovy"} 与派生集今日逐字节相等，
+    # 但「同一概念两处手抄」正是 P-M3 要治的漂移族，新增 JVM 系栈即分叉。
     _base_refs: list[str] = []
     if todo and project_path and Path(project_path).is_dir():
         import os as _os
@@ -501,7 +529,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
             # 复核 LOW-1：显式否定复用语境（"不复用既有 X"）→ 尊重 LLM 声明不越权归位，
             # punt 留安置/布局闸/③f 权威链（fail-closed）。
             _di_ext = _di.rsplit(".", 1)[-1].lower() if "." in _di.rsplit("/", 1)[-1] else ""
-            if (_di and _di_ext in _JVM_CODE_EXTS
+            if (_di and _di_ext in _JVM_CLASS_FILE_EXTS
                     and not _jvm_compilable_layout(_di)
                     and not (Path(project_path) / _di).is_file()):
                 if _REUSE_NEGATE_RE.search(_prose):
@@ -554,7 +582,7 @@ def _domicile_contract_symbols(plan, shared_contract, project_path: str | None,
         if mod not in _evidence_dirs:
             continue
         _d0, _e0 = _dir_for(mod), _ext_for(mod)
-        if _e0.lower() not in _JVM_CODE_EXTS:
+        if _e0.lower() not in _JVM_CLASS_FILE_EXTS:
             continue
         _kept0: list[str] = []
         for s in groups[mod]:

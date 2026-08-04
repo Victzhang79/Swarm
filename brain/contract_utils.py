@@ -17,12 +17,14 @@ from swarm.stacks import (
     demote_safety_net,
     is_compilable_source,
     is_structural_build_manifest,
+    layout_segments_union,
     module_manifests_of_stack,
     root_manifests_by_stack,
     spec_for_stack,
     stack_of_manifest,
     stack_of_structural_manifest,
     structural_manifests,
+    workspace_container_segments_union,
 )
 from swarm.types import SubTaskDifficulty, TaskPlan
 
@@ -587,8 +589,25 @@ def _deterministic_pom_template(mod: str, artifacts: list[str],
 
 
 # 标准源码布局段：它们是**布局**不是模块（Maven/Gradle: src/main/java；Cargo: src；Go: cmd/internal…）
-_SRC_LAYOUT_SEGMENTS = frozenset({"src", "main", "java", "kotlin", "scala", "resources",
-                                  "test", "tests", "webapp", "cmd", "internal", "pkg"})
+# ★P-M4（27 号文）★ 手抄 12 段 → STACK_SPEC 派生（`layout_segments` 字段并集），逐元素
+# 相等由 test_layout_segments_union_equals_legacy 锁死——加栈=加表行，本处零改动。
+_SRC_LAYOUT_SEGMENTS = layout_segments_union()
+# ★P-M4★ workspace 容器段（pnpm/turborepo 的 packages/apps）：与布局段【两类】——
+# 布局段命中=切在它前面；容器段命中=容器+子目录（packages/api）才是模块根。
+# 混进布局表会让 packages/api/src/x.ts 在 i=0 切出空根=塌模块（设计期实证）。
+# position-0 判据：只在路径首段生效（深处的 packages 可能是 Java 包名）。
+_WORKSPACE_CONTAINER_SEGMENTS = workspace_container_segments_union()
+# P-M4 R2（hunter F3）：容器档提升 STRONG/切模块根之前，先排【产物/依赖目录段】与
+# 【纯声明后缀】——packages/api/node_modules/...、packages/api/lib/foo.d.ts 不该主张
+# 模块根。判据=STACK_SPEC source_exclude_dirs/suffixes 并集（栈无关层用并集保守判定，
+# 与 layout_segments_union 同消费契约：任一栈说「不参与编译」就不给强证据）。
+# ★只接在容器档（本批新机制）★：布局档（src/main/java 等）不套——target/generated-sources
+# 下确有合法源码，老臂行为逐字节不动（血规 10③：后果不同不混一档）。
+_SRC_EXCLUDE_DIRS_ALL = frozenset(
+    d for s in STACK_SPEC.values() for d in s.source_exclude_dirs)
+_SRC_EXCLUDE_SUFFIXES_ALL = tuple({e.lower()
+                                   for s in STACK_SPEC.values()
+                                   for e in s.source_exclude_suffixes})
 # ★P-C1 复核 F1★ 这里曾是手抄 7 条，缺口与 symbol_surgery 那份**互不相同**
 # （缺 go.work/settings.gradle/settings.gradle.kts，多 pyproject.toml）——同一概念两处手抄、
 # 后果面是并集。实测 `settings.gradle`/`go.work` 被判 weak_code ⇒ Gradle/Go 聚合清单
@@ -659,6 +678,16 @@ def _evidence_class(path: str) -> str:
     if _in_resource_root:
         return _EV_AUX
     if any(seg in _SRC_LAYOUT_SEGMENTS for seg in _dirs):
+        return _EV_STRONG
+    # ★P-M4★ workspace 容器+子目录（packages/api/...）下的代码=强证据（position-0 判据，
+    # 与 _code_module_root 同源同规则——两处判定绝不许分叉，否则证据类别与模块根互相打脸）。
+    # 主治：npm workspace 包源码不在 src/test 布局段内时整类塌成 WEAK→假模块 "packages"。
+    # P-M4 R2（hunter F3）：产物/依赖目录段（node_modules/dist/…）与纯声明后缀（.d.ts）
+    # 不提升——它们从不主张模块根（并集判据见 _SRC_EXCLUDE_DIRS_ALL 注释）。
+    if (len(_dirs) >= 2 and _dirs[0] in _WORKSPACE_CONTAINER_SEGMENTS
+            and not any(seg in _SRC_EXCLUDE_DIRS_ALL for seg in _dirs[2:])
+            and not (_SRC_EXCLUDE_SUFFIXES_ALL
+                     and p.lower().endswith(_SRC_EXCLUDE_SUFFIXES_ALL))):
         return _EV_STRONG
     return _EV_WEAK_CODE
 
@@ -961,6 +990,11 @@ def _common_module_prefix(paths: list[str], project_path: str | None) -> str | N
         if seg in _SRC_LAYOUT_SEGMENTS:
             common = common[:i]
             break
+    # ★P-M4★ 公共前缀恰止于 workspace 容器（packages/api/… 与 packages/web/… 的
+    # common=["packages"]）→ 容器不是模块，返回 None（fail-closed，不造 "packages" 假模块根）。
+    # len>1（common=["packages","api",…]）不受影响——容器+子目录正是合法模块根。
+    if common and len(common) == 1 and common[0] in _WORKSPACE_CONTAINER_SEGMENTS:
+        return None
     return "/".join(common) if common else None
 
 
@@ -973,12 +1007,28 @@ def _code_module_root(path: str) -> str | None:
     构建清单（pom.xml 等）不算证据（那正是脚手架要造的东西）；根级源码（`src/...`，
     模块根为空串）→ None（根模块不是聚合子模块）；找不到源码布局段（无法判定模块
     边界，多栈通用）→ None（fail-closed：绝不凭一个字符串在磁盘上切出模块）。
+
+    ★P-M4 workspace 容器规则（position-0）★：首段是 workspace 容器（packages/apps）
+    且存在子目录 → 模块根=容器/子目录（`packages/api/lib/x.ts` → `packages/api`）。
+    主治：npm workspace 包的源码不在 src/test 布局段内时，旧实现返回 None →
+    `_evidence_root` WEAK 档退成首段 "packages" ⇒ 全 workspace 塌成一个假模块。
+    容器规则先于布局扫描：`packages/api/src/x.ts` 两条路径同答 `packages/api`（不冲突），
+    而 `packages/src/x.ts`（包名恰叫 src）按容器判=packages/src，不被布局段切塌。
     """
     p = _norm_scope_path(path)
     # P-C1 复核 F1：与 `_evidence_class` 同判据（basename 相等 + 大小写不敏感）
     if not p or "/" not in p or p.rsplit("/", 1)[-1].lower() in _BUILD_MANIFESTS_LC:
         return None
     parts = p.split("/")
+    # 容器+子目录（parts[1] 不是文件名）才算 workspace 包；`packages/index.ts`（容器
+    # 直接含文件，无子目录）→ 继续走布局扫描，判不出就 None（fail-closed 不造根）。
+    # P-M4 R2（hunter F3）：产物/依赖目录段与纯声明后缀（.d.ts）不走容器规则——
+    # 与 _evidence_class 同判据同源，两处绝不许分叉。
+    if (len(parts) >= 3 and parts[0] in _WORKSPACE_CONTAINER_SEGMENTS
+            and not any(seg in _SRC_EXCLUDE_DIRS_ALL for seg in parts[2:-1])
+            and not (_SRC_EXCLUDE_SUFFIXES_ALL
+                     and p.lower().endswith(_SRC_EXCLUDE_SUFFIXES_ALL))):
+        return f"{parts[0]}/{parts[1]}"
     for i, seg in enumerate(parts):
         if seg in _SRC_LAYOUT_SEGMENTS:
             root = "/".join(parts[:i])
@@ -1497,6 +1547,14 @@ def _collect_module_dep_evidence(plan, dirs: dict[str, str]):
                     continue
                 top = rp.split("/", 1)[0]
                 if top in _SRC_LAYOUT_SEGMENTS:
+                    continue
+                # ★P-M4★ workspace 容器不是模块名——owner 回退取容器+子目录
+                # （packages/api/x.ts 的属主是 packages/api 不是 "packages"，与
+                # _code_module_root 的 position-0 容器规则同源，防塌模块假证据）。
+                if top in _WORKSPACE_CONTAINER_SEGMENTS:
+                    rest = rp.split("/")
+                    if len(rest) >= 3:
+                        evid[m].add(("baseline", f"{rest[0]}/{rest[1]}"))
                     continue
                 evid[m].add(("baseline", top))
 
@@ -5856,21 +5914,39 @@ def baseline_symbol_files(
     return hits
 
 
-def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bool:
-    """P2-1：把每个 Java 写目标所在 package 目录下的其它 .java 文件纳入同子任务 readable。
+def enrich_package_dir_readable(plan: TaskPlan, project_path: str | None) -> bool:
+    """P2-1（P-L1~3 扩栈）：把每个源码写目标所在目录的**同扩展名**兄弟源码文件纳入
+    同子任务 readable。
 
     task 0f93f1fc 现场：StringUtils.java 引用同包/相邻类 Constants/StrFormatter/
     CharsetKit，但这些类不在子任务可读 scope → mvn compile 报 "cannot find symbol" →
     同模块编译注定失败，worker 白忙一场。
 
-    一期保守启发式（Q4=A）：仅纳入"同 package 目录"的 .java 文件（不做精确 import
+    ★P-L1~3（27 号文）扩栈★：原名 enrich_java_package_readable 只认 `.java`——
+    Go 同目录=同 package（最可惜）、Python 同目录=同包命名空间，同样死法异栈复现。
+    源码扩展名集派生自 STACK_SPEC.source_exts 并集（单一事实源，加栈=加表行）。
+    ★同扩展名匹配（保守，与原 Java 行为同构）★：.kt 目标不拉 .java 兄弟、
+    .ts 目标不拉 .tsx 兄弟——跨扩展名拉取是二期精确 import 图的事，不在这里猜。
+
+    ★P-L R2（hunter F1）上限闸★：Go 单 package 200+ 同目录 .go 是常态（扩栈前只
+    Java、同包文件少，此面被掩盖）——无上限全进 readable=worker 上下文爆炸。
+    每目录超 `_PACKAGE_READABLE_MAX_SIBLINGS` 按字典序截断 + WARNING（机读可辨，
+    绝不静默丢）。登记：Go `_test.go` 同目录会被一并拉取——它们是包的合法行为
+    规格，上限闸已把淹没面封住，不再按 test 身份细分（过度工程方向）。
+
+    一期保守启发式（Q4=A）：仅纳入"同 package 目录"的源码文件（不做精确 import
     图解析，避免重 + 解析 bug）。覆盖本案（同目录依赖）。精确 import 解析留二期。
 
-    返回是否发生改动。无 project_path 或非 Java 项目 → no-op 返回 False。
+    返回是否发生改动。无 project_path → no-op 返回 False。
     """
     if not project_path:
         return False
     import os
+    # 源码扩展名并集（含前导点，小写）——P-L1~3：派生自 STACK_SPEC，绝不手抄第二份。
+    _SRC_EXTS = frozenset(
+        e.lower() for s in STACK_SPEC.values() for e in s.source_exts)
+    # P-L R2（hunter F1）：单目录兄弟拉取硬上限（见 docstring——Go 大 package 防上下文爆炸）。
+    _MAX_SIBLINGS_PER_DIR = 50
 
     changed = False
     for st in getattr(plan, "subtasks", []) or []:
@@ -5881,15 +5957,22 @@ def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bo
             list(getattr(scope, "create_files", []) or [])
             + list(getattr(scope, "writable", []) or [])
         )
-        java_targets = [f for f in write_targets if f.endswith(".java")]
-        if not java_targets:
+        # 目标扩展名 → 目录（只认已收录栈的源码扩展名；资源/清单/文档不触发拉取）
+        dir_exts: dict[str, set[str]] = {}
+        for f in write_targets:
+            _d, _b = os.path.split(str(f))
+            if "." not in _b:
+                continue
+            _e = "." + _b.rsplit(".", 1)[-1].lower()
+            if _e in _SRC_EXTS:
+                dir_exts.setdefault(_d, set()).add(_e)
+        if not dir_exts:
             continue
         readables = list(getattr(scope, "readable", []) or [])
         own = set(write_targets)
         st_changed = False
-        # 收集每个 Java 写目标所在目录的同包 .java 文件
-        pkg_dirs = {os.path.dirname(f) for f in java_targets}
-        for rel_dir in pkg_dirs:
+        # 收集每个源码写目标所在目录的同扩展名兄弟源码文件
+        for rel_dir, exts in dir_exts.items():
             abs_dir = os.path.join(project_path, rel_dir)
             if not os.path.isdir(abs_dir):
                 continue
@@ -5897,12 +5980,24 @@ def enrich_java_package_readable(plan: TaskPlan, project_path: str | None) -> bo
                 siblings = os.listdir(abs_dir)
             except OSError:
                 continue
+            cands: list[str] = []
             for name in siblings:
-                if not name.endswith(".java"):
+                if "." not in name:
+                    continue
+                if ("." + name.rsplit(".", 1)[-1].lower()) not in exts:
                     continue
                 rel = os.path.join(rel_dir, name) if rel_dir else name
                 if rel in own or rel in readables:
                     continue
+                cands.append(rel)
+            if len(cands) > _MAX_SIBLINGS_PER_DIR:
+                # P-L R2（hunter F1）：超限截断必须机读可辨（纪律：降级至少一次 WARNING）
+                logger.warning(
+                    "[ELABORATE] P-L 同目录兄弟拉取超限截断：%s 命中 %d 个同扩展名源码"
+                    "（上限 %d，按字典序截断防 readable 爆上下文）",
+                    rel_dir or ".", len(cands), _MAX_SIBLINGS_PER_DIR)
+                cands = sorted(cands)[:_MAX_SIBLINGS_PER_DIR]
+            for rel in sorted(cands):
                 readables.append(rel)
                 st_changed = True
         if st_changed:

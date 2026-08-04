@@ -143,6 +143,20 @@ class StackSpec:
     source_exclude_suffixes: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的后缀（如 `.d.ts` 只是类型声明，无编译产物）。"""
 
+    layout_segments: tuple[str, ...] = field(default_factory=tuple)
+    """该栈的**标准源码布局段**——它们是**布局**不是模块（`src/main/java` 的每段都不
+    主张模块边界）。消费方取 `layout_segments_union()` 派生视图（P-M4，27 号文），
+    绝不各抄一份（两份手抄必漂移，`_BUILD_MANIFESTS` 已实证两次）。"""
+
+    workspace_container_segments: tuple[str, ...] = field(default_factory=tuple)
+    """**workspace 容器段**（pnpm/turborepo 的 `packages/` `apps/`）：容器本身不是模块，
+    容器+子目录（`packages/api`）才是模块根。与 layout_segments 是**两类**段：
+    layout 段命中=【切在它前面】，容器段命中=【带上紧随的子目录一起算根】。
+    混进 layout 表会让 `packages/api/src/x.ts` 在 i=0 处切出空根=塌模块（设计期实证）。
+
+    ★position-0 判据★ 容器语义只在路径**首段**生效——深处的 `packages` 可能是
+    普通包名（`mod/src/main/java/com/x/packages/Foo.java`），误判=把包目录当 workspace。"""
+
 
 # ══════════════════════════════════════════════════════════════════
 # 事实表（新增一栈 = 在此加一条，调用方零改动）
@@ -160,6 +174,8 @@ STACK_SPEC: dict[str, StackSpec] = {
         # ★唯一有确定性 aggregator/模块脚手架 driver 的栈★（_AGGREGATOR_SCAFFOLD_STACKS）
         has_module_scaffold_driver=True,
         source_exclude_dirs=("target",),
+        layout_segments=("src", "main", "java", "kotlin", "scala",
+                         "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="mvn -q -DskipTests compile",
     ),
     "gradle": StackSpec(
@@ -177,6 +193,8 @@ STACK_SPEC: dict[str, StackSpec] = {
         # 原语解析——同坐标同仓库，BOM 受管省略版本）→ 模块清单 demote 安全
         has_module_scaffold_driver=True,
         source_exclude_dirs=("build",),
+        layout_segments=("src", "main", "java", "kotlin", "scala",
+                         "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
     ),
     "npm": StackSpec(
@@ -193,6 +211,9 @@ STACK_SPEC: dict[str, StackSpec] = {
         has_module_scaffold_driver=True,
         source_exclude_dirs=("node_modules", "dist", "build", "out", ".next"),
         source_exclude_suffixes=(".d.ts",),
+        layout_segments=("src", "test", "tests"),
+        # pnpm/turborepo workspace 容器（P-M4 主治：packages 布局塌模块）
+        workspace_container_segments=("packages", "apps"),
     ),
     "go": StackSpec(
         key="go", lang="go",
@@ -205,6 +226,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         # 模块 go.mod demote 安全（P-H4a 复核补翻，同 npm）。
         has_module_scaffold_driver=True,
         source_exclude_dirs=("vendor",),
+        layout_segments=("cmd", "internal", "pkg"),
         whole_project_build_cmd="go build ./...",
     ),
     "cargo": StackSpec(
@@ -218,6 +240,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         # 物化 path 相对引用）→ 模块 Cargo.toml demote 安全（P-H4b）。
         has_module_scaffold_driver=True,
         source_exclude_dirs=("target",),
+        layout_segments=("src", "tests"),
         whole_project_build_cmd="cargo build -q",
     ),
     "python": StackSpec(
@@ -236,6 +259,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         aggregate_manifest=None, aggregate_field="",
         source_exts=(".py",),
         source_exclude_dirs=("build", "dist", ".venv", "site-packages"),
+        layout_segments=("src", "test", "tests"),
         whole_project_build_cmd="python -m compileall -q .",
     ),
 }
@@ -500,6 +524,26 @@ def unregistered_aggregate_stacks() -> tuple[str, ...]:
     """聚合机制**未收录**的栈键——缺席必须机读可辨（纪律：`return []` 与"真没有"不可分
     时，那一层可以死很久没人知道）。有消费者：见 test 的两表对账与 B-7 的覆盖面登记。"""
     return tuple(sorted(s.key for s in STACK_SPEC.values() if not s.aggregate_manifest))
+
+
+def layout_segments_union() -> frozenset[str]:
+    """全部已收录栈的**标准源码布局段**并集（P-M4，27 号文）。
+
+    ★消费契约＝"栈无关判定"档★：调用方（证据分层/模块根切分）此刻**不知道**文件属于
+    哪个栈，用并集保守判定——某段在任一栈里是布局，就不让它主张模块边界。
+    与旧手抄 12 段 frozenset 逐元素相等（测试锁 `test_layout_segments_union_equals_legacy`）。
+    """
+    return frozenset(seg for s in STACK_SPEC.values() for seg in s.layout_segments)
+
+
+def workspace_container_segments_union() -> frozenset[str]:
+    """全部已收录栈的 **workspace 容器段**并集（pnpm/turborepo 的 `packages`/`apps`）。
+
+    ★消费契约＝position-0★：只在路径**首段**生效，且容器本身不是模块——
+    `容器/子目录` 才是模块根。深处的同名段（Java 包名 `…/com/x/packages/`）绝不命中。
+    """
+    return frozenset(
+        seg for s in STACK_SPEC.values() for seg in s.workspace_container_segments)
 
 
 def is_compilable_source(path: str, stack: str | None) -> bool:

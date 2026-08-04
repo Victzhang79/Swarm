@@ -516,6 +516,8 @@ def basename_owns_symbol(stem: str, sym: str,
       ③ 实现 Impl 后缀：剥尾部 Impl 后回到 ①/②
       ④ 装饰前缀（项目/模块名，如 Alarm+NotifyUserService）：Symbol ≥8 字符时
          【大小写敏感】CamelCase 词边界后缀匹配（半词 Taskservice≠TaskService）。
+      ⑤ 形态归一（P-M2）：snake_case/kebab-case ↔ CamelCase 词序列全等归 tier 1
+         （惯例等价精确档，不是宁误勿漏通道），不受 decorated_prefix 门控。
     ④ 是"宁误勿漏"通道：同一 stem 可同时命中长短两个契约符号（AlarmTaskServiceImpl
     命中 AlarmTaskService 也命中 TaskService）——真缺的短符号会被吞掉，且 L2 契约
     核验是子串匹配（taskservice ⊂ alarmtaskservice）**兜不住**这类遮蔽（复核 F2
@@ -526,12 +528,32 @@ def basename_owns_symbol(stem: str, sym: str,
     return basename_symbol_match(stem, sym, decorated_prefix=decorated_prefix) >= 0
 
 
+_WORD_SPLIT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _symbol_words(x: str) -> list[str]:
+    """符号/文件名茎 → 小写词序列（P-M2，27 号文）：snake_case/kebab-case 先按分隔符
+    切段，每段再按 CamelCase 词边界切——`user_service`/`user-service`/`UserService`/
+    `userService` 归一到同一个 `["user", "service"]`。
+
+    已知边界（登记）：全大写缩写连写不可切（`OAuth2Client` → ["o","auth2","client"]，
+    与 `oauth2_client` 不归一）——方向=漏配（保守，owner 判不出→C1 打回求明示），
+    绝不为了多配放宽成子串（误配=豁免半径失控，F3 族）。"""
+    out: list[str] = []
+    for part in re.split(r"[_\-\s]+", str(x or "")):
+        out.extend(w.lower() for w in _WORD_SPLIT_RE.findall(part))
+    return [w for w in out if w]
+
+
 def basename_symbol_match(stem: str, sym: str,
                           decorated_prefix: bool = True) -> int:
     """R43 复核 F1：带【匹配强度】的等价判定——消歧必须先比强度再比长度。
 
     tier 0=精确同名（Impl 剥离后 stem==Symbol）
-    tier 1=惯例等价精确（文件带 I / 符号带 I，剥后同名）
+    tier 1=惯例等价精确（文件带 I / 符号带 I 剥后同名；★P-M2★ snake_case/kebab-case
+      ↔ CamelCase 词序列全等——`user_service`↔`UserService`。治前这类恒 -1 ⇒
+      Go/Python/Rust/Ruby(snake)、JS(kebab) 的契约符号**文件通道恒不匹配**，C1
+      owner 防线从「语料+文件」两条降成一条）
     tier 2=装饰前缀后缀匹配（宁误勿漏通道，decorated_prefix=False 时关闭）
     -1=不匹配。
     复核 F1（CONFIRMED 回归）：契约同时含 IChannelAdapter+ChannelAdapter 双胞胎
@@ -554,6 +576,17 @@ def basename_symbol_match(stem: str, sym: str,
         return 1
     y_base = y[1:] if (len(y) >= 3 and y[0] == "I" and y[1].isupper()) else None
     if y_base is not None and sl == y_base.lower():
+        return 1
+    # P-M2（27 号文）：snake_case/kebab-case ↔ CamelCase 词序列全等也归 tier 1
+    # （惯例等价【精确】档，与 I 前缀同类——命名惯例差异不是强度差异）。
+    # ★绝不另立 tier 3★（消费契约审计结论）：dispatch/plan_validator 的消歧按
+    # (tier, -len) 升序取最优（"精确>等价>装饰"三档语义已固化）；symbol_provenance
+    # 把 t>1 当「装饰前缀弱通道」——另立 tier 3 会让 `user_service.py` 掉进
+    # tier2 桶走**改名 reconcile**（把蛇形正名当装饰变体"修"成 UserService.py）。
+    # 刻意只做【词序列全等】：装饰变体（`alarm_user_service`↔`UserService`）不认——
+    # tier 2 的大小写词边界在 snake/kebab 里不存在，放宽=豁免半径失控（F3 族）。
+    sw, yw = _symbol_words(s), _symbol_words(y)
+    if sw and sw == yw:
         return 1
     if decorated_prefix:
         if len(y) >= 8 and len(s) > len(y) and s.endswith(y) \

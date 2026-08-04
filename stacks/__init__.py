@@ -15,6 +15,7 @@ from swarm.stacks.spec import (  # noqa: F401
     is_compilable_source,
     is_root_aggregate_manifest,
     is_structural_build_manifest,
+    layout_segments_union,
     module_manifest_of_stack,
     module_manifests_of_stack,
     root_aggregate_manifests,
@@ -24,4 +25,5 @@ from swarm.stacks.spec import (  # noqa: F401
     stack_of_structural_manifest,
     structural_manifests,
     unregistered_aggregate_stacks,
+    workspace_container_segments_union,
 )

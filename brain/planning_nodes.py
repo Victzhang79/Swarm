@@ -3080,7 +3080,7 @@ async def elaborate(state: BrainState) -> dict:
     from swarm.brain.contract_utils import (
         correct_misclassified_intent,
         enrich_context_snippets,
-        enrich_java_package_readable,
+        enrich_package_dir_readable,
         inject_api_knowledge,
         prune_empty_scope_subtasks,
         resolve_plan_conflicts,
@@ -3136,10 +3136,11 @@ async def elaborate(state: BrainState) -> dict:
         _plan_mutated = True
         logger.info("[ELABORATE] 意图校正：AUDIT 子任务含写文件 → 纠正为 MODIFY/CREATE（确定性信号覆盖 LLM 误判）")
 
-    # ── P2-1：Java 同 package 类自动入 readable，避免同模块编译因可读范围不全必败 ──
-    java_enriched = enrich_java_package_readable(plan_obj, _proj_path)
-    if java_enriched:
-        logger.info("[ELABORATE] P2-1: 已将 Java 同 package 类纳入相关子任务 readable")
+    # ── P2-1（P-L1~3 扩栈）：同目录同扩展名兄弟源码自动入 readable（Java 同 package /
+    # Go 同目录=同 package / Python 同目录同命名空间），避免同模块编译因可读范围不全必败 ──
+    siblings_enriched = enrich_package_dir_readable(plan_obj, _proj_path)
+    if siblings_enriched:
+        logger.info("[ELABORATE] P2-1: 已将同目录兄弟源码纳入相关子任务 readable")
 
     # ── 方案A(task 34fab09e)：上下文预注入。readable 补全后抽取 scope 文件关键代码片段，
     # 注入子任务 context_snippets，随 worker prompt 下发 → worker 不必 cat 探索耗尽步数。
@@ -3304,7 +3305,7 @@ async def elaborate(state: BrainState) -> dict:
     # round62 empty-diff churn 原样复发。
     # 纪律：本节点此后新增任何就地改 plan 的 pass，都必须把结果并进 _plan_mutated
     # （测试 test_a_batch_plan_writeback 守着这条）。
-    if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or java_enriched
+    if (resplit_rounds > 0 or decoupled > 0 or any(_resolve.values()) or siblings_enriched
             or dangling_fixed or _t4_pinned or _t4_wired or _prov_added or _plan_mutated):
         # 拆分 / 剥离假依赖 / 冲突解决(合并·依赖序·归一·难度) / Java 同包入域 / 悬空依赖兜底 /
         # T4 钉落点·布线 / G2 补边 改变了 plan，回写。（T4 之前 G2 加的依赖边靠 plan_obj
@@ -3494,9 +3495,15 @@ def _entity_stem(rel: str) -> str:
     各自臆测方法签名 → 跨子任务契约漂移 → 整模块编译失败(st-3 处爆出、改不了上游 → 死循环)。
     改按实体词干分组，同一实体全栈留在【一个子任务】，由一个 worker 一次写完、签名自洽。
     """
-    import re as _re
     name = rel.replace("\\", "/").split("/")[-1]
-    name = _re.sub(r"\.(java|xml|sql|vue|js|ts|go|py)$", "", name)
+    # P-L1~3（27 号文）：扩展名剥离通用化——手抄白名单（java|xml|sql|vue|js|ts|go|py）
+    # 缺 .tsx/.kt/.rs/.php 等，非 JVM 栈的实体聚簇整个失效（扩展名剥不掉 → 层后缀
+    # 匹配不上 → 同实体被拆散）。只剥最后一个 `.` 后缀（AlarmAppMapper.xml →
+    # AlarmAppMapper；Component.tsx → Component），无点/点开头文件名原样保留。
+    # 边界登记：多段后缀（archive.tar.gz）只剥最后一段（旧白名单本就不认 .gz，
+    # 旧行为=不剥；新行为=剥一段）——聚簇粒度键，方向=分得更细，非静默丢文件。
+    if "." in name and not name.startswith("."):
+        name = name.rsplit(".", 1)[0]
     if len(name) > 1 and name[0] == "I" and name[1].isupper():  # IAlarmAppService → AlarmAppService
         name = name[1:]
     for suf in _LAYER_SUFFIXES:

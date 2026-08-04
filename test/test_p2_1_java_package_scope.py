@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-from swarm.brain.contract_utils import enrich_java_package_readable
+from swarm.brain.contract_utils import enrich_package_dir_readable
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
 
 
@@ -38,7 +38,7 @@ def test_same_package_classes_added_to_readable():
         subtasks=[_sub("st-2", writable=[f"{rel}/StringUtils.java"])],
         parallel_groups=[],
     )
-    changed = enrich_java_package_readable(plan, root)
+    changed = enrich_package_dir_readable(plan, root)
     assert changed is True
     s = plan.subtasks[0]
     # 同包其它类应进 readable
@@ -52,14 +52,14 @@ def test_same_package_classes_added_to_readable():
 
 def test_no_project_path_noop():
     plan = TaskPlan(subtasks=[_sub("st-1", writable=["a/B.java"])], parallel_groups=[])
-    assert enrich_java_package_readable(plan, None) is False
+    assert enrich_package_dir_readable(plan, None) is False
     print("  ✅ P2-1: 无 project_path → no-op")
 
 
 def test_non_java_target_skipped():
     root = _make_java_project()
     plan = TaskPlan(subtasks=[_sub("st-1", writable=["foo/bar.py"])], parallel_groups=[])
-    assert enrich_java_package_readable(plan, root) is False
+    assert enrich_package_dir_readable(plan, root) is False
     print("  ✅ P2-1: 非 Java 写目标 → 跳过")
 
 
