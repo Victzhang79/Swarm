@@ -229,16 +229,20 @@ def test_n2b_go_work_member_outside_project_is_never_read(tmp_path, monkeypatch)
         "go.work": "go 1.22\n\nuse (\n\t./a\n\t../outside/lib\n)\n",
         "a/go.mod": "module example.com/app/a\n",
     })
-    import swarm.brain.contract_utils as cu
+    import swarm.brain.go_scaffold as gs
     seen: list[str] = []
-    real = cu._go_module_path
+    real = gs._go_module_path
 
     def _spy(project_path, mdir, mod_prefix):
         seen.append(mdir)
         return real(project_path, mdir, mod_prefix)
 
-    monkeypatch.setattr(cu, "_go_module_path", _spy)
-    assert cu._go_module_path_prefix(str(root)) == "example.com/app"
+    # ★叶簇拆分（brain/go_scaffold.py）后 _go_module_path_prefix 的 __globals__
+    # 在新模块——patch 必须打在【定义它的模块】上。打在 contract_utils 上 spy 永不
+    # 触发、seen 恒空、下方断言 vacuous 绿=假绿（拆分批 reviewer CRITICAL 逮到）。
+    monkeypatch.setattr(gs, "_go_module_path", _spy)
+    assert gs._go_module_path_prefix(str(root)) == "example.com/app"
+    assert seen, "spy 零触发 ⇒ patch 打错模块（本断言让假绿不可再现）"
     assert not [m for m in seen if m.startswith("..")], (
         f"取证越出了工程树（读了工程外的 go.mod）：{seen}")
 

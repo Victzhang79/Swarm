@@ -26,6 +26,7 @@ TESTS = ["test/test_n2b_n3_go_prefix_and_rule5_stack.py",
          "test/test_decisions_l2_share_and_skipdirs.py"]
 
 CU = ROOT / "brain" / "contract_utils.py"
+GS = ROOT / "brain" / "go_scaffold.py"   # 叶簇拆分（纪律#9）：N-2b go 簇落点迁此
 PV = ROOT / "brain" / "plan_validator.py"
 SBX = ROOT / "project" / "sandbox_spec.py"
 SPEC = ROOT / "stacks" / "spec.py"
@@ -34,7 +35,7 @@ MUTATIONS = [
     # ── N-2b：go module 前缀取证 ──
     (
         'N-2b：成员反推整块失效（退回"只认根 go.mod" ⇒ go.work 仓整栈零脚手架）',
-        CU,
+        GS,
         '    root_mod = _go_root_module_path(project_path)\n    if root_mod:\n        return root_mod',
         '    return _go_root_module_path(project_path)',
         ['test_n2b_prefix_derived_from_workspace_members_when_no_root_go_mod',
@@ -43,14 +44,14 @@ MUTATIONS = [
     ),
     (
         'N-2b：歧义不再 fail-closed（互斥前缀时挑第一个 ⇒ 臆造 module 路径）',
-        CU,
+        GS,
         '    if len(prefixes) == 1:\n        prefix = next(iter(prefixes))',
         '    if len(prefixes) >= 1:\n        prefix = next(iter(prefixes))',
         ['test_n2b_conflicting_member_prefixes_are_ambiguous_not_a_guess'],
     ),
     (
         'N-2b：前缀按"只去尾段"算（嵌套成员 svc/auth ⇒ 前缀多一层）',
-        CU,
+        GS,
         '        prefixes.setdefault(mp[: -(len(rel_n) + 1)], rel_n)',
         '        prefixes.setdefault(mp.rsplit("/", 1)[0], rel_n)',
         ['test_n2b_nested_member_dir_strips_full_reldir'],
@@ -59,7 +60,7 @@ MUTATIONS = [
         'N-2b：依赖树目录也产前缀证据（第三方 module 路径推兄弟前缀 ⇒ 歧义 ⇒ 整栈零脚手架）。'
         '★唯一落点★：两条路径（go.work 显式 use / 无 go.work 扫一层）都过这一处过滤——'
         '此前另有一处冗余过滤，两处互相兜底 ⇒ 两条突变都不可证伪，已删掉冗余的那处。',
-        CU,
+        GS,
         '                or any(seg in DEPENDENCY_TREE_DIRS for seg in rel_n.split("/"))):',
         '                or False):',
         ['test_n2b_go_work_declared_vendored_member_gives_no_prefix_evidence',
@@ -69,14 +70,14 @@ MUTATIONS = [
     (
         'N-2b：★误杀面★ 退回读整张 `_SKIP_DIRS`（产物目录里的**本仓自己的**模块被剔 ⇒ '
         '唯一证据没了 ⇒ 前缀推不出 ⇒ 整栈零脚手架）',
-        CU,
+        GS,
         '                or any(seg in DEPENDENCY_TREE_DIRS for seg in rel_n.split("/"))):',
         '                or any(seg in __import__("swarm.project.sandbox_spec", fromlist=["x"])._SKIP_DIRS for seg in rel_n.split("/"))):',
         ['test_n2b_product_dir_member_is_still_valid_prefix_evidence'],
     ),
     (
         'N-2b：go.work 的 `use ../外部目录` 被拿去取证（读工程外文件这条边界破了）',
-        CU,
+        GS,
         '        if (not rel_n or rel_n.startswith("..")',
         '        if (not rel_n',
         ['test_n2b_go_work_member_outside_project_is_never_read'],
@@ -98,21 +99,21 @@ MUTATIONS = [
     ),
     (
         'N-2b：module 路径与落点无关的成员被当歧义证据（一个怪成员毒死整仓）',
-        CU,
+        GS,
         '        if mp == rel_n or not mp.endswith("/" + rel_n):',
         '        if mp == rel_n:',
         ['test_n2b_member_whose_module_path_ignores_its_dir_gives_no_evidence'],
     ),
     (
         'N-2b：`use` 块只捕获首成员（C4 病灶形状复现）',
-        CU,
+        GS,
         '        for line in blk.group(1).splitlines():\n            e = _norm(line)\n            if e:\n                out.append(e)',
         '        e = _norm(blk.group(1).splitlines()[0])\n        if e:\n            out.append(e)',
         ['test_n2b_go_work_use_parsing_covers_both_forms'],
     ),
     (
         'N-2b：go 指令不读 go.work（go.work 仓恒落 1.21 ⇒ 低于工作区要求）',
-        CU,
+        GS,
         '        for name in ("go.mod", "go.work"):',
         '        for name in ("go.mod",):',
         ['test_n2b_go_directive_reads_go_work_when_no_root_go_mod',
@@ -120,7 +121,7 @@ MUTATIONS = [
     ),
     (
         'N-2b：注入点不用新前缀（原语造对了但没接线 ⇒ 机制不存在）',
-        CU,
+        GS,
         '    mod_prefix = _go_module_path_prefix(project_path)',
         '    mod_prefix = _go_root_module_path(project_path)',
         ['test_n2b_go_work_repo_actually_gets_scaffolds_end_to_end',
@@ -209,6 +210,18 @@ def _pytest(args: list[str]) -> int:
     return p.returncode
 
 
+def _clear_pyc(path: Path) -> None:
+    """相邻突变同秒写入 ⇒ pyc 整秒粒度 mtime 判旧字节码有效 ⇒ 子进程跑上一条代码
+    （2026-08-04 pyc 陈旧假绿实证）——突变后与还原后都必须清被突变模块的 pyc。"""
+    cache = path.parent / "__pycache__"
+    if cache.is_dir():
+        for f in cache.glob(path.stem + ".*.pyc"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def main() -> int:
     print("═" * 70)
     print("步骤 0：基线必须全绿")
@@ -241,6 +254,7 @@ def main() -> int:
             failures.append((name, "突变产生语法错"))
             continue
         path.write_text(mutated)
+        _clear_pyc(path)
         try:
             per = [(n, _pytest(["-k", n])) for n in should_red]
             missing = [n for n, r in per if r == 5]
@@ -257,6 +271,7 @@ def main() -> int:
                     failures.append((name, "突变后仍绿"))
         finally:
             path.write_text(src)
+            _clear_pyc(path)
 
     print("\n" + "═" * 70)
     rc_r = _pytest([])
