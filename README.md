@@ -15,7 +15,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-5200%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.71-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.72-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -184,7 +184,7 @@ flowchart LR
 
 - **L1 子任务闸门**：产物先过编译/测试/lint 硬闸，修复轮由真实编译证据驱动；返工清空旧完成态，防"提前宣告完成"。语义正确性零覆盖的产物（有代码但无任何测试/验证命令）被显式标记进人工审核视野。
 - **L2 集成闸门**：对全工程做真编译（Java 多模块 reactor / 各栈对应构建）；工具链缺失时**拒绝放行而非静默跳过**；契约完整性检查按缺失率有牙裁决，缺失符号**逐个词边界归因**到责任子任务定向重派（归因不出回退全员，绝不漏修）。
-- **运行时冒烟 + 验收**：编译通过不等于跑得起来——在沙箱**真启动应用**（manifest 证据推导启动命令与端口，多栈对称）、TCP/HTTP 探活、数据库 migration 执行验证，然后逐条执行验收断言。启动失败按证据三分类：代码错误回灌定向修复；环境缺失如实跳过绝不冤枉代码；分类不明保守跳过。
+- **运行时冒烟 + 验收**：编译通过不等于跑得起来——在沙箱**真启动应用**（manifest 证据推导启动命令与端口，多栈对称；端口推不出时按进程树四级反解实际监听端口——Rust 与非 Gin Go 的冒烟不再系统性跳过）、TCP/HTTP 探活（3xx/4xx 不冒充健康应答）、数据库 migration 执行验证，然后逐条执行验收断言。启动失败按证据三分类（崩溃归因语料覆盖 JVM/Go/PHP/Ruby/C#/Elixir/Dart 等）：代码错误回灌定向修复；环境缺失如实跳过绝不冤枉代码；分类不明保守跳过。
 - **人工闸**：审核面板呈现完整对账单——覆盖矩阵、逐条断言结果、冒烟/migration 结论、基线申报清单、需人工复核项、全部降级原因。人是最后一道闸，且拿到的是**全部事实**而非模型的自我总结。
 
 ### 🔀 合并 fail-closed：并行的产物一行代码都不许静默消失
@@ -274,11 +274,12 @@ flowchart LR
 | Lint | 5 语言 | checkstyle / go vet / clippy / eslint / ruff（工具故障≠代码错误，基础设施瞬时故障单独识别） |
 | 确定性修复 | Java/Go/Rust/TS | 按生态委托事实标准工具：Java import/依赖自证、`goimports`、`cargo fix`、`eslint --fix` |
 | 依赖补全 | 多栈 driver 化 | 从**项目自身兄弟 manifest** 找权威坐标注入（只用自证坐标、绝不臆造、fail-closed）；新栈=注册一个 driver |
-| 构建清单脚手架 | Maven/npm/go（含版本解析） | 规划期为落空模块**确定性生成**构建清单：Maven→pom（reactor/聚合父）、npm→package.json（内部 `workspace:*` + 第三方 `^ver`）、go→go.mod（内部 `replace` + 第三方 `vX.Y.Z`）。第三方版本去**权威 registry/proxy 解析**（npmjs/npmmirror、proxy.golang.org/goproxy.cn，本地缓存证据优先），★绝不臆造版本/latest/预发布——解析不到如实丢弃并从验收同源剔除★（免逼小模型编坐标）；异栈路径互不污染，Maven 行为逐字不变 |
+| 构建清单脚手架 | Maven/npm/go/python/cargo/gradle（含版本解析） | 规划期为落空模块**确定性生成**构建清单：Maven→pom（reactor/聚合父）、npm→package.json（内部 `workspace:*` + 第三方 `^ver`）、go→go.mod（内部 `replace` + 第三方 `vX.Y.Z`，go.work 多模块仓从成员反推 module 前缀）、python→pyproject.toml（PyPI 证据层）、cargo→Cargo.toml（crates.io 证据层）、gradle→build.gradle（复用 Maven 坐标证据层）。第三方版本去**权威 registry/proxy 解析**（npmjs/npmmirror、proxy.golang.org/goproxy.cn，本地缓存证据优先），★绝不臆造版本/latest/预发布——解析不到如实丢弃并从验收同源剔除★（免逼小模型编坐标）；异栈路径互不污染，Maven 行为逐字不变 |
 | 交付完整性闸 | 全栈（5 栈 verifier） | 产物必须与**声明**对账：声明必建的文件未产出、声明的依赖坐标未落地进 manifest = 静默漏交付，L1 硬闸拦下。依赖核验按 manifest basename→verifier 分发（pom/gradle/npm/go/cargo），**匹配尾名忽略 group+version** → 免疫 BOM 托管 / `${project.version}` / `workspace:*`；未知栈 fail-open 放行 |
 | 依赖坐标合法性闸 | Java/Maven（可推广） | 构建**之前**扫全树 manifest：每条依赖必须是【本工程模块 / 父级受管 / 仓库真实存在】三者之一，否则**可证永不可解析** → 确定性改回或剪除。**不解析构建工具的报错文本**（那是打地鼠，换个错法就漏一个），只校验坐标状态；仓库不可达则一律放行（fail-open，宁可漏判绝不误剪）。为什么必须前置：坏坐标是**解析期**崩塌，会连坐整棵 reactor，让每个 Worker 的构建闸都误报“错在上游” |
 | 缺依赖恢复授写权 | 按栈授正确清单 | 编译失败缺依赖 → 授对应模块**构建清单**写权重派（Maven→pom、Go→go.mod、npm→package.json…），绝不在非 Maven 工程授【幻影 pom.xml】烧恢复预算 |
 | 根聚合单写者闸 | 全栈根聚合清单 | 根 `pom.xml`/`settings.gradle`/`go.work`/根 `Cargo.toml` 的结构重写非加性、无法安全合并 → 双写者硬失败收敛唯一 owner（此前仅 pom.xml，Gradle/Go 现同护） |
+| 未支持栈处置 | fail-closed + 准入闸 | 探测到未收录栈/证据不足时**诚实拒绝或降级**（机读可辨 + WARNING，验证覆盖逐栈落账），绝不伪造 Maven 兜底冒充支持；新增一个栈 = STACK_SPEC 注册 + workspace 夹具 + driver 满矩阵，准入有测试强制 |
 | 分层模板 | Java/Vue/TS/Go/Python | 新建文件按栈找同类既有文件做范例注入，免全项目探索空烧预算 |
 | 规划去特化 | 全部 | 分组/拆分/prompt 中无任何项目专名或单栈写死（有回归测试锁定不得回流） |
 
@@ -484,10 +485,11 @@ CLI 全走 HTTP、自动带 token（`swarm login` 后各命令复用 `~/.swarm/c
 
 `.env`（`SWARM_*` 前缀）与 Web UI「设置」面板双轨管理，保存即生效（热重载）：
 
-- **模型接入点**：多个 OpenAI 兼容接入点（云端 / 本地），Brain 与 Worker 各层自由选模型 + 多级兜底链。
+- **模型接入点**：多个 OpenAI 兼容接入点（云端 / 本地），Brain 与 Worker 各层自由选模型 + 多级兜底链；每接入点支持**多把 API Key 多槽配置**，配额/限流自动轮换。
 - **Embedding / Rerank**：云端（SiliconFlow / OpenAI / Cohere）或自建；敏感 Key 经 `secret_store` 加密存储。
 - **沙箱**：CubeSandbox 接入信息，支持项目级定制模板（按栈自适应工具链）。
 - **配置面登记册**：全部 `SWARM_*` 开关在 `config/env_registry.py` 有单一事实源（含出处指针），新增开关必须登记（测试强制）；`config/profiles/` 提供 dev/e2e/prod 三套冻结的推荐组合。
+- **配置变更审计**：所有配置写入落 append-only 审计账（who / 来源 / 脱敏 old→new，绝不存明文），改坏了有回滚点可查。
 
 完整变量见 [`.env.example`](.env.example)。
 

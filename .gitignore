@@ -95,3 +95,7 @@ run_mirrors/
 *_POSTMORTEM_TREATMENT_REGISTER.md
 *_TREATMENT_REGISTER.md
 *_POSTMORTEM_*.md
+
+# 本地 agent 工具配置（ECC/codex 工作件，绝不入库）
+.codex/
+AGENTS.md
