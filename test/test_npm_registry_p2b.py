@@ -353,3 +353,22 @@ def test_ph3_manifest_enum_oserror_warns_and_degrades(tmp_path, caplog):
     assert specs == {}, "目录不可读时根清单也读不到（is_file 假阴性）⇒ 只能剩 WARNING 这一条信号"
     assert any("枚举失败" in r.getMessage() for r in caplog.records), \
         "枚举异常被层内自吞 ⇒ 「目录坏了」与「真没有子包」不可分"
+def test_ph3_manifest_root_stat_eacces_branch_is_locked(monkeypatch, tmp_path, caplog):
+    """根清单 is_file 的 EACCES 分支锁（v0.9.72 CI 红修复）：py<3.13 的 pathlib.is_file
+    只吞 ENOENT/ENOTDIR，EACCES 照抛（3.13+ 才全吞）——chmod 夹具在 3.13+ 上走不到该
+    分支 ⇒ 该分支在本地是【不可证伪的死代码】。直接 patch is_file 抛 PermissionError，
+    版本无关地证「判定失败=WARNING+降级 {}」而非炸穿。"""
+    import logging
+    import pathlib
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"axios": "^1.6.0"}}), encoding="utf-8")
+
+    def _boom(self, *a, **k):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(pathlib.Path, "is_file", _boom)
+    with caplog.at_level(logging.WARNING):
+        specs = nr.project_manifest_specs(str(tmp_path))
+    assert specs == {}
+    assert any("判定失败" in r.getMessage() for r in caplog.records), \
+        "EACCES 判定失败必须落 WARNING——「目录坏了」与「真没有」不可分即层内自吞"

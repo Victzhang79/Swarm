@@ -204,8 +204,15 @@ def project_manifest_specs(project_path: str) -> dict[str, str]:
     out: dict[str, str] = {}
     root = Path(project_path)
     manifests: list[Path] = []
-    if (root / "package.json").is_file():
-        manifests.append(root / "package.json")
+    try:
+        # ★py<3.13 的 pathlib.is_file 只吞 ENOENT/ENOTDIR 等，EACCES 照抛（3.13+ 起
+        # 全吞 OSError 返 False）——CI py3.12 实测：目录 0o000 时本行 uncaught 炸穿。
+        # 「根清单在不在」判定失败与「真没有根清单」必须可辨（硬检查④）→ 落 WARNING。
+        if (root / "package.json").is_file():
+            manifests.append(root / "package.json")
+    except OSError:
+        logger.warning("[npm-registry] P-H3 根 package.json 存在性判定失败（目录不可读），"
+                       "按无根清单降级: %s", root)
     try:
         # ★Path.glob 会静默吞 OSError 返回 []（实测）——异常≠缺席（硬检查④），
         # 枚举必须用会抛的 iterdir，失败与「真没有子目录清单」才可辨

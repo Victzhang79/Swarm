@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -44,13 +45,36 @@ def _bin(d: Path, name: str, body: str) -> None:
     p.chmod(0o755)
 
 
+# ★受控 PATH 符号链农场（v0.9.72 CI 红修复）★ 旧实现 PATH=f"{path_dir}:/usr/bin:/bin"
+# ——Linux 的 /usr/bin 有【真 ss】（iproute2 默认装，macOS 没有），`command -v ss` 恒真
+# ⇒ 「只放了 netstat/lsof」的档位判据被偷换成 ss 在场，三档 tier 测试在 CI 全红而本地
+# 全绿（平台相关假绿：夹具的承载力随平台漂移）。农场=假二进制优先 + 白名单系统工具
+# 符号链，/usr/bin 绝不透传 ⇒ 四档工具的在场/缺席在两平台都确定。
+_FARM_TOOLS = ("bash", "sh", "awk", "sed", "grep", "sort", "tr", "cut",
+               "head", "tail", "wc", "readlink", "cat", "pgrep")
+
+
+def _farm(path_dir: Path) -> Path:
+    farm = path_dir.parent / (path_dir.name + "_farm")
+    farm.mkdir(exist_ok=True)
+    for fake in sorted(path_dir.iterdir()):      # 假二进制先进场（同名压过系统工具）
+        dst = farm / fake.name
+        if fake.is_file() and not dst.exists():
+            dst.symlink_to(fake)
+    for name in _FARM_TOOLS:                     # 缺的白名单工具从宿主补符号链
+        dst = farm / name
+        src = shutil.which(name)
+        if src and not dst.exists():
+            dst.symlink_to(src)
+    return farm
+
+
 def _run(funcs: str, snippet: str, *, path_dir: Path | None = None,
          extra_env: dict | None = None) -> str:
-    """跑 `funcs + snippet`，PATH 前置 path_dir（若给）。返回 stdout.strip()。"""
+    """跑 `funcs + snippet`，PATH 换成受控农场（若给 path_dir）。返回 stdout.strip()。"""
     env = dict(os.environ)
     if path_dir is not None:
-        # 只留假二进制目录 + 最小系统路径（awk/sed/grep/sort 等仍需真实工具）
-        env["PATH"] = f"{path_dir}:/usr/bin:/bin"
+        env["PATH"] = str(_farm(path_dir))
     env.update(extra_env or {})
     r = subprocess.run(["bash", "-c", funcs + "\n" + snippet],
                        capture_output=True, text=True, env=env, timeout=60)

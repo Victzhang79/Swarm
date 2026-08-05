@@ -31,8 +31,10 @@
 set -uo pipefail
 TID="${1:?用法: e2e_mirrors.sh <task_id> [tag] [ruoyi_path]}"
 TAG="${2:-run}"
-RUOYI="${3:-/Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi}"
-PKG_DIR="/Users/zhangyanrui/LLM/swarm/swarm"
+# ★PKG_DIR 从脚本自身位置推导（v0.9.72 CI 红实证：写死开发机绝对路径 ⇒ 换台机器/CI
+# checkout 在别处时 mkdir -p 权限炸、daemon 零起跑；派生后本机取值与原文逐字相同）★
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUOYI="${3:-${PKG_DIR}/../e2e-projects/RuoYi}"
 # ★取证污染治本（26 号文 P0-2 / 路 D #5）★
 # 病灶：镜像 tail 的是【全局 swarm.log】→ 多轮镜像互相灌串。实测 round67m 的"本轮镜像"里
 # round67m2 的行数(844)比本轮自己(685)还多；三轮的 swarm_mirror.log 在同一秒收到同一条

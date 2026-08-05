@@ -17,7 +17,8 @@ set -uo pipefail
 TID="${1:?用法: e2e_triple_watch.sh <task_id> [interval_sec] [tag]}"
 INTERVAL="${2:-600}"
 TAG="${3:-run}"
-PKG_DIR="/Users/zhangyanrui/LLM/swarm/swarm"
+# PKG_DIR 从脚本自身位置推导（写死开发机路径=换机器即炸，v0.9.72 CI 实证）
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOK="$(cat ~/.swarm/cli_token 2>/dev/null)"
 SBX_DIR="$HOME/.swarm/sandbox_logs"
 OUT_DIR="$PKG_DIR/logs_archive/process"
@@ -62,7 +63,7 @@ except Exception: print('(空/坏)')" 2>/dev/null)
       echo "② 沙箱日志目录暂无"
     fi
     # ── 产物落盘（RuoYi 工作树 git 变更文件数，粗看是否真落盘）──
-    proj="/Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi"
+    proj="${PKG_DIR}/../e2e-projects/RuoYi"
     if [ -d "$proj/.git" ]; then
       chg=$(git -C "$proj" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
       echo "④ RuoYi 工作树变更文件数: $chg"

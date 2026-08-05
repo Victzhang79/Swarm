@@ -360,3 +360,21 @@ def test_ph3_go_mod_read_oserror_warns_and_skips(tmp_path, caplog):
     assert pins == {}, "读不出还采到了钉版 ⇒ 夹具没压到目标分支"
     assert any("读取失败" in r.getMessage() for r in caplog.records), \
         "读取异常被层内自吞 ⇒ 「文件坏了」与「真没有 require」不可分"
+def test_ph3_go_mod_root_stat_eacces_branch_is_locked(monkeypatch, tmp_path, caplog):
+    """根清单 is_file 的 EACCES 分支锁（v0.9.72 CI 红修复）：py<3.13 的 pathlib.is_file
+    只吞 ENOENT/ENOTDIR，EACCES 照抛（3.13+ 才全吞）——chmod 夹具在 3.13+ 上走不到该
+    分支 ⇒ 该分支在本地是【不可证伪的死代码】（删掉本地照绿、CI 才红）。直接 patch
+    is_file 抛 PermissionError，版本无关地证「判定失败=WARNING+降级 {}」而非炸穿。"""
+    import logging
+    import pathlib
+    (tmp_path / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+
+    def _boom(self, *a, **k):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(pathlib.Path, "is_file", _boom)
+    with caplog.at_level(logging.WARNING):
+        pins = gr.project_go_mod_requires(str(tmp_path))
+    assert pins == {}
+    assert any("判定失败" in r.getMessage() for r in caplog.records), \
+        "EACCES 判定失败必须落 WARNING——「目录坏了」与「真没有」不可分即层内自吞"

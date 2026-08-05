@@ -12,7 +12,8 @@
 # 退出:  0=全绿  1=有模型不可达（打印红名单 + 常见根因，禁止开跑）
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
-PKG_DIR="/Users/zhangyanrui/LLM/swarm/swarm"
+# PKG_DIR 从脚本自身位置推导（写死开发机路径=换机器即炸，v0.9.72 CI 实证）
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PKG_DIR" || { echo "[soak] ❌ 找不到包目录 $PKG_DIR"; exit 1; }
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 ROUNDS=1

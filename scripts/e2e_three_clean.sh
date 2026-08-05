@@ -16,7 +16,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 TAG="${1:?用法: e2e_three_clean.sh <tag>  (例: round17)}"
-PKG_DIR="/Users/zhangyanrui/LLM/swarm/swarm"
+# PKG_DIR 从脚本自身位置推导（写死开发机路径=换机器即炸，v0.9.72 CI 实证）
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SBX_DIR="$HOME/.swarm/sandbox_logs"
 cd "$PKG_DIR" || { echo "[three-clean] ❌ 找不到包目录 $PKG_DIR"; exit 1; }
 
