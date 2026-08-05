@@ -52,6 +52,16 @@ import logging
 import re
 from typing import Protocol
 
+from swarm.worker.dep_legality_drivers import (
+    CargoDriver,
+    GoDriver,
+    GradleDriver,
+    PythonDriver,
+    cargo_registry_versions_list,
+    go_registry_versions_list,
+    python_registry_versions_list,
+)
+
 logger = logging.getLogger("swarm.worker.dep_legality")
 
 # 版本值若是构建工具的属性/变量引用（Maven `${...}`、Gradle `$var`）→ 由工程自身承接，不去查仓库。
@@ -313,7 +323,14 @@ class NpmDriver:
         return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
 
 
-DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver(), "npm": NpmDriver()}
+DRIVERS: dict[str, ManifestDriver] = {
+    "maven": MavenDriver(),
+    "npm": NpmDriver(),
+    "cargo": CargoDriver(),
+    "go": GoDriver(),
+    "gradle": GradleDriver(),
+    "python": PythonDriver(),
+}
 """栈 → driver。**新栈 = 在此注册一个 driver**（实现 ManifestDriver 协议），闸本身不动。"""
 
 

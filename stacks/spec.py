@@ -163,6 +163,26 @@ class StackSpec:
     ★JVM 系刻意留空★：brain/nodes/shared.py 给 java 的 test_command 故意留空
     （RuoYi 等项目常无测试依赖，强跑必失败）。本表不私自放行。"""
 
+    runtime_start_cmd: str = ""
+    """运行时**默认启动命令**（verify_runtime S1-2）。空串＝本栈无统一默认命令，
+    由 `brain/smoke_derive.py` 按磁盘证据动态推导。
+
+    ★BRAIN-002★ 此前启动命令与 prepare 命令散落在 smoke_derive 的硬编码数据表与推导函数
+    中，改命令/新增栈时与 L1/L2 构建命令漂移。本字段把"启动怎么跑"的事实收进 STACK_SPEC，
+    与 `whole_project_build_cmd` / `test_cmd` 同源；需要证据的部分（如 JVM jar 路径前缀、
+    node scripts 名、python 入口文件）仍由推导器按磁盘决定，但命令字面量从这里取。"""
+
+    runtime_prepare_cmd: str = ""
+    """start_cmd 消费**构建产物**时需要的产物构建命令。空串＝无需 prepare
+    （如 go run / npm start / python 直接跑源码自带构建或不需产物）。"""
+
+    runtime_prepare_cmd_wrapper: str = ""
+    """有 wrapper（如 `gradlew`）时使用的 prepare 命令。空串＝无 wrapper 变体。"""
+
+    runtime_prepare_marker: str = ""
+    """start_cmd 中代表"消费构建产物"的子串。只有 start_cmd 含此 marker 时才触发 prepare。
+    例如 Maven 的 `target/*.jar`、Gradle 的 `build/libs/*.jar`。空串＝不触发。"""
+
     source_exclude_suffixes: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的后缀（如 `.d.ts` 只是类型声明，无编译产物）。"""
 
@@ -201,6 +221,9 @@ STACK_SPEC: dict[str, StackSpec] = {
                          "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="mvn -q -DskipTests compile",
         test_cmd="",
+        runtime_start_cmd="java -jar target/*.jar",
+        runtime_prepare_cmd="mvn -q -DskipTests package",
+        runtime_prepare_marker="target/*.jar",
     ),
     "gradle": StackSpec(
         key="gradle", lang="java",
@@ -221,6 +244,10 @@ STACK_SPEC: dict[str, StackSpec] = {
                          "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
         test_cmd="",
+        runtime_start_cmd="java -jar build/libs/*.jar",
+        runtime_prepare_cmd="gradle bootJar -x test -q",
+        runtime_prepare_cmd_wrapper="./gradlew bootJar -x test -q",
+        runtime_prepare_marker="build/libs/*.jar",
     ),
     "npm": StackSpec(
         key="npm", lang="node",
@@ -245,6 +272,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         # pnpm/turborepo workspace 容器（P-M4 主治：packages 布局塌模块）
         workspace_container_segments=("packages", "apps"),
         test_cmd="npm test --silent",
+        runtime_start_cmd="npm run start",
     ),
     "go": StackSpec(
         key="go", lang="go",
@@ -260,6 +288,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("cmd", "internal", "pkg"),
         whole_project_build_cmd="go build ./...",
         test_cmd="go test ./...",
+        runtime_start_cmd="go run .",
     ),
     "cargo": StackSpec(
         key="cargo", lang="rust",
@@ -275,6 +304,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "tests"),
         whole_project_build_cmd="cargo build -q",
         test_cmd="cargo test -q",
+        runtime_start_cmd="cargo run",
     ),
     "python": StackSpec(
         key="python", lang="python",

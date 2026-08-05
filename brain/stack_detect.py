@@ -640,7 +640,13 @@ def _detect_npm_facts(project_path: str) -> dict | None:
     （monorepo 子包可与根不同），归因不了的事实不猜（诚实边界：子包形态不钉）。
     """
     root_pj = os.path.join(project_path, "package.json")
-    if not os.path.isfile(root_pj):
+    try:
+        if not os.path.isfile(root_pj):
+            return None
+    except OSError as exc:
+        # ★BRAIN-006★ py<3.13 的 pathlib/os.path.isfile 只吞 ENOENT/ENOTDIR，EACCES 照抛；
+        # 权限异常时按"该事实缺席"返回 None 并留痕，不炸整栈扫描。
+        logger.warning("[STACK_DETECT] P-H1 根 package.json 不可读（%s）: %s", root_pj, exc)
         return None
     try:
         with open(root_pj, encoding="utf-8", errors="ignore") as f:
@@ -680,7 +686,12 @@ def _detect_go_facts(project_path: str) -> dict | None:
     （画像钉根前缀已够硬约束用），两处 go.mod 解析的统一收口登记在 27 号文 B-8。
     """
     root_mod = os.path.join(project_path, "go.mod")
-    if not os.path.isfile(root_mod):
+    try:
+        if not os.path.isfile(root_mod):
+            return None
+    except OSError as exc:
+        # ★BRAIN-006★ py<3.13 的 os.path.isfile 对 EACCES 照抛；权限异常按缺席处理。
+        logger.warning("[STACK_DETECT] P-H1 根 go.mod 不可读（%s）: %s", root_mod, exc)
         return None
     try:
         with open(root_mod, encoding="utf-8", errors="ignore") as f:

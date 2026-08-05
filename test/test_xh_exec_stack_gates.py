@@ -729,7 +729,8 @@ _H1_INFRA = [
     ("node 连不上 DB", "Error: connect ECONNREFUSED 127.0.0.1:5432"),
     ("缺 chromium", "Failed to launch the browser process! /ms-playwright/chrome not found"),
     ("go 无 main module", "go: cannot find main module, but found .git/config"),
-    ("npm 缺脚本", 'npm ERR! Missing script: "test"'),
+    # ★W-7★ "npm 缺脚本"不再属于 infra——项目没配 scripts.test 是确定性事实，应 test_skipped，
+    # 而不是 BLOCKED 重试。原条目已删；新行为由 test_npm_missing_script_is_skipped_not_infra 锁。
 ]
 
 
@@ -738,6 +739,33 @@ def test_h1_new_death_surface_classified_as_infra(label, txt):
     """★复核 HIGH-1★ 本批给 go/rust/npm 新增了**真跑测试**的面（改前一律 `test_skipped`＝通过），
     而这几类失败**不是代码能力问题**——原表一条都没覆盖（实测全判 CODE）⇒ 会误换模型/烧修复轮。"""
     assert lp._is_infra_failure(txt) is True, f"{label} 被判成代码错"
+
+
+def test_h1_missing_script_is_not_infra_anymore():
+    """★W-7★ `Missing script` 不再被 _is_infra_failure 误判。项目没配 scripts.test 应提前跳过，
+    不归类为 infra 故障反复重试。"""
+    assert lp._is_infra_failure('npm ERR! Missing script: "test"') is False
+
+
+def test_npm_missing_script_is_skipped_not_infra(tmp_path, monkeypatch):
+    """★W-7★ harness 显式下发 `npm test` 但 package.json 无 scripts.test → test_skipped，
+    不执行命令，也不 BLOCKED 重试。"""
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskHarness
+    root = _tree(tmp_path, {"package.json": '{"name":"x"}', "app.js": "console.log(1)\n"})
+    monkeypatch.setenv("SWARM_WORKER_L1_LINT", "false")
+    monkeypatch.setenv("SWARM_WORKER_L1_FORMAT", "false")
+    monkeypatch.setattr(lp, "_compile_files", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(lp, "_derive_full_build_command", lambda *a, **k: "")
+    diff = "--- a/app.js\n+++ b/app.js\n@@ -1 +1 @@\n-old\n+new\n"
+    st = SubTask(id="st-npm-no-test", description="npm no test", difficulty=SubTaskDifficulty.MEDIUM,
+                 scope=FileScope(writable=["app.js"]),
+                 harness=TaskHarness(language="node", test_command="npm test --silent"))
+    ok, details = lp.run_l1_pipeline(str(root), st, diff, timeout=30)
+    assert ok is True, f"应跳过而非失败: {details}"
+    assert bool(details.get("test_skipped")), "无 scripts.test 时应 test_skipped"
+    assert details.get("test_cmd") == "npm test --silent"
+    assert "package.json 无 test 脚本" in str(details.get("test_skipped", ""))
+    assert "pipeline_blocked" not in details
 
 
 def test_h1_real_test_failure_still_counts_as_code():

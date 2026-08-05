@@ -19,6 +19,10 @@
 
 TTL 负缓存两头都收：抖动后 TTL 一过自然重试（不再永久误杀），TTL 内不重复烧网络（不放大代价）。
 
+★BRAIN-005★ 可变端点（go `/@latest`、npm `/dist-tags`）的成功响应也带短 TTL：
+长进程里某模块发布新版本后，后续任务若仍命中旧 `@latest`，plan 会注入旧依赖。
+正缓存 TTL 与负缓存共用 `neg_until` 过期时刻表——调用方零改动。
+
 ★为什么不做成类★ 三个 registry 的 `_http_cache` 是模块级 plain dict，全仓 26 处测试用
 `.clear()` 直接操作它，还有一处（`test_pc2_explicit_version_is_a_claim.py:493-497`）直接
 写入 `None` 并断言其值——那是"两个缓存不得混用"的承重夹具。换成类会一次废掉这些契约，
@@ -36,6 +40,17 @@ import time
 # 覆盖单次 plan 里 per-module 反复问同一坐标的窗口（那正是 F-3 的代价来源）。
 NEG_TTL_S = float(os.getenv("SWARM_DEP_LOOKUP_NEG_TTL_S", "60"))
 
+# 可变端点（latest / dist-tags）正缓存 TTL：5 分钟。发布新版本后最长 5 分钟内会重新拉取。
+MUTABLE_TTL_S = float(os.getenv("SWARM_DEP_LOOKUP_MUTABLE_TTL_S", "300"))
+
+
+_MUTABLE_PATTERNS = ("/@latest", "/dist-tags",)
+
+
+def _is_mutable_endpoint(key: str) -> bool:
+    """key 是否指向会随时间变化的可变端点。"""
+    return any(p in key for p in _MUTABLE_PATTERNS)
+
 
 def text_cache_lookup(
     cache: dict[str, str | None],
@@ -44,19 +59,21 @@ def text_cache_lookup(
 ) -> tuple[bool, str | None]:
     """查缓存。返回 `(是否命中, 值)`。
 
-    成功文本永久命中；`None` 仅在 TTL 内算命中，过期/无 TTL 记录 → **不命中**（重新联网）。
+    成功文本：不可变端点永久命中；可变端点仅在 TTL 内命中。
+    `None` 仅在 TTL 内算命中，过期/无 TTL 记录 → **不命中**（重新联网）。
     过期条目就地清掉，免得两个 dict 无界增长。
     """
     if key not in cache:
         return False, None
     val = cache[key]
-    if val is not None:
-        return True, val
-    if neg_until.get(key, 0.0) > time.monotonic():
-        return True, None          # 负缓存仍在有效期内：不重复烧网络（F-3）
-    cache.pop(key, None)           # 过期（或来历不明）的 None：丢掉，让调用方重新核验（F-1）
-    neg_until.pop(key, None)
-    return False, None
+    # 只要该 key 有 TTL 约束（负缓存或可变端点正缓存），就检查过期。
+    if val is None or _is_mutable_endpoint(key):
+        if neg_until.get(key, 0.0) > time.monotonic():
+            return True, val
+        cache.pop(key, None)
+        neg_until.pop(key, None)
+        return False, None
+    return True, val
 
 
 def text_cache_store(
@@ -65,9 +82,11 @@ def text_cache_store(
     key: str,
     value: str | None,
 ) -> None:
-    """写缓存。成功文本永久保留；`None` 记一条 TTL 到期时刻。"""
+    """写缓存。成功文本永久保留（可变端点除外）；`None` 记一条 TTL 到期时刻。"""
     cache[key] = value
     if value is None:
         neg_until[key] = time.monotonic() + NEG_TTL_S
+    elif _is_mutable_endpoint(key):
+        neg_until[key] = time.monotonic() + MUTABLE_TTL_S
     else:
-        neg_until.pop(key, None)   # 成功即清掉旧的负记录，避免陈旧 TTL 影响后续判定
+        neg_until.pop(key, None)   # 成功且不可变：清掉旧的负记录/可变 TTL，避免陈旧 TTL 影响后续判定

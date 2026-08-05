@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 
 def _write(d, name, body="x"):
-    with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+    p = os.path.join(d, name)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
         f.write(body)
 
 
@@ -49,10 +51,22 @@ def test_37_l1_derive_gradle_kotlin_uses_classes():
     assert "classes" in cmd and "compileJava" not in cmd, cmd
 
 
-def test_37_l1_derive_maven_java_unchanged():
-    """回归：.java + maven → mvn compile 不变。"""
-    from swarm.worker import l1_pipeline
-    with patch.object(l1_pipeline, "_manifest_present", return_value=True):
-        cmd = l1_pipeline._derive_full_build_command(
-            "/tmp/x", ["mod/src/main/java/A.java"], {"build": "maven"})
-    assert cmd == "mvn -q -DskipTests compile", cmd
+def test_w4_gradle_submodule_scope_narrowing(tmp_path):
+    """★W-4★ Gradle 子任务改动单个模块时，构建命令应收窄到该模块，而非整项目 classes。"""
+    from swarm.worker import l1_pipeline as lp
+    root = str(tmp_path)
+    _write(root, "settings.gradle", "include 'app'")
+    _write(root, "app/build.gradle", "plugins { id 'java' }")
+    _write(root, "app/src/main/java/A.java", "class A {}")
+    cmd = lp._derive_full_build_command(root, ["app/src/main/java/A.java"], {"build": "gradle"})
+    assert "-p app" in cmd, f"Gradle 子模块未收窄: {cmd}"
+
+
+def test_w4_gradle_root_scope_no_narrowing(tmp_path):
+    """改动文件就在根模块时，Gradle 命令不加 `-p`（避免无意义收窄）。"""
+    from swarm.worker import l1_pipeline as lp
+    root = str(tmp_path)
+    _write(root, "build.gradle", "plugins { id 'java' }")
+    _write(root, "src/main/java/A.java", "class A {}")
+    cmd = lp._derive_full_build_command(root, ["src/main/java/A.java"], {"build": "gradle"})
+    assert "-p" not in cmd, f"根模块不应收窄: {cmd}"

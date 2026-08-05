@@ -487,18 +487,16 @@ def test_xm10_gate_keeps_published_scoped_package(monkeypatch):
     assert _json.loads(files["package.json"])["dependencies"]["@acme/lib"] == "^2.0.0"
 
 
-def test_xm10_go_project_warns_driver_absent(monkeypatch, caplog):
+def test_xm10_unknown_stack_warns_driver_absent(monkeypatch, caplog):
     """无 driver 的栈：零覆盖必须机读可辨（D14 warn-once），绝不与「已校验」混同。"""
     import logging
 
     import swarm.worker.dep_legality as dl
-    dl._driver_absent_warned.discard("go")   # warn-once 是模块态，顺序无关化
-    files = {"go.mod": "module example.com/shop\n"}
-    lp, _ = _wire_npm_project(monkeypatch, files, {})
+    dl._driver_absent_warned.discard("php")   # warn-once 是模块态，顺序无关化
     with caplog.at_level(logging.WARNING):
-        n, changed = lp._enforce_dep_legality("/tmp/x", 60)
-    assert n == 0
-    assert any("无注册 driver" in r.message and "'go'" in r.message
+        drv = dl.driver_for("php")
+    assert drv is None
+    assert any("无注册 driver" in r.message and "'php'" in r.message
                for r in caplog.records), f"零覆盖必须 warn: {[r.message for r in caplog.records]}"
 
 
@@ -519,3 +517,90 @@ def test_xm10_npm_probe_contract():
     assert _probe('"2.3.4"') == (["2.3.4"], True)          # 单版本=裸字符串形态
     assert _probe("sh: npm: command not found") == ([], False)
     assert _probe("npm error network ETIMEDOUT") == ([], False)
+
+
+# ── W-6：Cargo / Go / Gradle / Python driver 注册与解析 ───────────────────
+
+def test_cargo_driver_parses_and_prunes_phantom():
+    from swarm.worker.dep_legality import DRIVERS, enforce
+    drv = DRIVERS["cargo"]
+    manifest = '[dependencies]\nserde = "1.0.2"\nphantom-crate = "9.9.9"\n'
+    new, actions = enforce(
+        {"Cargo.toml": manifest}, root_text="", namespace="",
+        workspace_members={"app"}, registry_versions=lambda _ns, n: ["1.0.2"] if n == "serde" else [],
+        driver=drv,
+    )
+    out = new["Cargo.toml"]
+    assert "serde" in out, "仓库确证存在的 crate 不许动"
+    assert "phantom-crate" not in out, "仓库确证查无 → 剪除"
+    assert len(actions) == 1 and "prune" in actions[0]
+
+
+def test_cargo_driver_workspace_member_legal():
+    from swarm.worker.dep_legality import DRIVERS, enforce
+    drv = DRIVERS["cargo"]
+    manifest = '[dependencies]\napp = { path = "../app" }\n'
+    new, actions = enforce(
+        {"Cargo.toml": manifest}, root_text="", namespace="",
+        workspace_members={"app"}, registry_versions=lambda _ns, n: None,
+        driver=drv,
+    )
+    assert not new and not actions, "path/workspace 成员依赖应判 legal"
+
+
+def test_go_driver_parses_require_and_prunes_phantom():
+    from swarm.worker.dep_legality import DRIVERS, enforce
+    drv = DRIVERS["go"]
+    manifest = 'module example.com/shop\n\nrequire (\n\texample.com/lib v1.0.0\n\texample.com/phantom v9.9.9\n)\n'
+    new, actions = enforce(
+        {"go.mod": manifest}, root_text=manifest, namespace="example.com/shop",
+        workspace_members={"example.com/shop", "example.com/lib"},
+        registry_versions=lambda _ns, n: ["v1.0.0"] if n == "example.com/lib" else [],
+        driver=drv,
+    )
+    out = new["go.mod"]
+    assert "example.com/lib" in out
+    assert "example.com/phantom" not in out
+    assert len(actions) == 1 and "prune" in actions[0]
+
+
+def test_gradle_driver_parses_string_dependency():
+    from swarm.worker.dep_legality import DRIVERS, enforce
+    drv = DRIVERS["gradle"]
+    manifest = "dependencies {\n    implementation 'com.example:lib:1.0.0'\n}\n"
+    new, actions = enforce(
+        {"build.gradle": manifest}, root_text="", namespace="",
+        workspace_members={"app"}, registry_versions=lambda _ns, n: ["1.0.0"] if n == "lib" else [],
+        driver=drv,
+    )
+    assert not new and not actions, "仓库存在的 Gradle 依赖应 legal"
+
+
+def test_python_driver_parses_requirements():
+    from swarm.worker.dep_legality import DRIVERS, enforce
+    drv = DRIVERS["python"]
+    manifest = "requests==2.31.0\nphantom-pkg==99.99\n"
+    new, actions = enforce(
+        {"requirements.txt": manifest}, root_text="", namespace="",
+        workspace_members={"myapp"}, registry_versions=lambda _ns, n: ["2.31.0"] if n == "requests" else [],
+        driver=drv,
+    )
+    out = new["requirements.txt"]
+    assert "requests" in out
+    assert "phantom-pkg" not in out
+    assert len(actions) == 1 and "prune" in actions[0]
+
+
+def test_l1_pipeline_enforces_cargo_go_gradle_python_arms(monkeypatch):
+    """W-6：_enforce_dep_legality 对 Cargo/Go/Gradle/Python 都有执行臂。"""
+    import swarm.worker.l1_pipeline as lp
+    files = {
+        "Cargo.toml": '[package]\nname = "svc"\n[dependencies]\nserde = "1.0.0"\n',
+        "go.mod": "module example.com/shop\n\nrequire example.com/lib v1.0.0\n",
+        "build.gradle": "dependencies { implementation 'com.example:lib:1.0.0' }\n",
+        "requirements.txt": "requests==2.31.0\n",
+    }
+    lp, written = _wire_npm_project(monkeypatch, files, {})
+    # registry unreachable -> fail-open，但各臂必须被调用到（无异常）
+    n, changed = lp._enforce_dep_legality("/tmp/x", 60)
+    assert n == 0 and changed == []

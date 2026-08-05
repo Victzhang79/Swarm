@@ -34,6 +34,9 @@ REGISTERED_ENVS: dict[str, str] = {
     # 永久缓存 None ⇒ 一次抖动把坐标永久钉成"查不到"（误杀且与"真没这个包"不可区分）；
     # 完全不缓存 ⇒ per-module 调用下 8s 超时 × 镜像数 × 模块数反复烧网。TTL 两头都收。
     "SWARM_DEP_LOOKUP_NEG_TTL_S": "brain/dep_http_cache.py:NEG_TTL_S",
+    # BRAIN-005：HTTP 文本缓存里【可变端点】(@latest / dist-tags) 成功响应的存活秒数。
+    # 长进程里某模块发布新版本后，若旧 @latest 仍永久命中，plan 会注入过期依赖。
+    "SWARM_DEP_LOOKUP_MUTABLE_TTL_S": "brain/dep_http_cache.py:MUTABLE_TTL_S",
     # R55-1：思考阶段预算（秒）。云端 reasoning 模型在思维链里原地打转时，max_tokens/stall
     # 看门狗都拦不住，墙钟兜底要先烧满 25 分钟。超此预算且尚未吐出正文 → 就地关 thinking
     # 用同一模型重开流（无损，下游无感）。0=关闭。

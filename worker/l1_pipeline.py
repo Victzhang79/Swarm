@@ -582,6 +582,9 @@ def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[st
     连 D14 的「无 driver warn-once」都不触发 = 零覆盖还不留痕（硬检查④）。
     治法：按【manifest 在场】分派（混合工程多栈各过各的闸），无 driver 的栈显式
     driver_for 一次让 warn-once 响（零覆盖机读可辨）。
+
+    ★W-6★ 扩展 Cargo / Go / Gradle / Python 臂，全部走 `_enforce_dep_legality_generic`
+    统一骨架；registry 探针按栈分派，不可达统一 fail-open。
     """
     from swarm.worker.dep_legality import driver_for
 
@@ -592,8 +595,20 @@ def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[st
     if _read_project_file(project_path, "package.json", timeout=20):
         _n, _f = _enforce_dep_legality_npm(project_path, timeout)
         changed.extend(_f)
+    if _read_project_file(project_path, "Cargo.toml", timeout=20):
+        _n, _f = _enforce_dep_legality_cargo(project_path, timeout)
+        changed.extend(_f)
     if _read_project_file(project_path, "go.mod", timeout=20):
-        driver_for("go")   # 无 driver → warn-once：零覆盖机读可辨（D14），绝不静默
+        _n, _f = _enforce_dep_legality_go(project_path, timeout)
+        changed.extend(_f)
+    if (_read_project_file(project_path, "build.gradle", timeout=20)
+            or _read_project_file(project_path, "build.gradle.kts", timeout=20)):
+        _n, _f = _enforce_dep_legality_gradle(project_path, timeout)
+        changed.extend(_f)
+    if (_read_project_file(project_path, "requirements.txt", timeout=20)
+            or _read_project_file(project_path, "pyproject.toml", timeout=20)):
+        _n, _f = _enforce_dep_legality_python(project_path, timeout)
+        changed.extend(_f)
     return len(set(changed)), sorted(set(changed))
 
 
@@ -761,6 +776,196 @@ def _enforce_dep_legality_npm(project_path: str, timeout: int) -> tuple[int, lis
             "改写）——不变量=每条依赖须满足【工作区成员 / 仓库真实存在】之一：\n  %s",
             len(actions), len(changed), "\n  ".join(actions[:12]))
     return len(changed), sorted(changed)
+
+
+def _enforce_dep_legality_generic(
+    project_path: str,
+    timeout: int,
+    *,
+    stack_key: str,
+    manifest_name: str,
+    find_exclude: str,
+    registry_versions,
+    namespace: str | None = None,
+    workspace_members_from_texts: Any = None,
+) -> tuple[int, list[str]]:
+    """多栈通用臂（W-6）：Cargo / Go / Gradle / Python 共享同一 enforcement 骨架。
+
+    调用方提供：栈键、清单名、find 排除路径、registry 查询函数、工程命名空间、
+    工作区成员提取函数（接收 {rel: text} → set[str]）。其余与 maven/npm 臂同形。
+    """
+    from swarm.worker.dep_legality import driver_for, enforce
+
+    drv = driver_for(stack_key)
+    if drv is None:
+        return 0, []
+    root_text = _read_project_file(project_path, manifest_name, timeout=20)
+    if not root_text:
+        return 0, []
+    _ec, gout, _e = _run_check_split(
+        f"find . -name {manifest_name} -not -path '{find_exclude}' 2>/dev/null",
+        project_path, timeout=30)
+    if _ec != 0:
+        logger.warning("[L1.2.1·dep-legality] %s manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
+                       stack_key, _ec, (_e or "")[:200])
+        return 0, []
+    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    if not rels:
+        return 0, []
+    texts: dict[str, str] = {}
+    for rel in rels[:60]:
+        t = _read_project_file(project_path, rel, timeout=20)
+        if t:
+            texts[rel] = t
+    if not texts:
+        return 0, []
+
+    members: set[str] = set()
+    if workspace_members_from_texts is not None:
+        try:
+            members = workspace_members_from_texts(texts)
+        except Exception as exc:
+            logger.warning("[L1.2.1·dep-legality] %s 工作区成员提取失败: %s", stack_key, exc)
+
+    new_texts, actions = enforce(
+        texts, root_text=root_text, namespace=namespace,
+        workspace_members=members, registry_versions=registry_versions, driver=drv,
+    )
+    changed: list[str] = []
+    for rel, txt in new_texts.items():
+        if _write_project_file(project_path, rel, txt, timeout=20):
+            changed.append(rel)
+    if actions:
+        logger.warning(
+            "[L1.2.1·dep-legality] W-6 构建前依赖合法性闸（%s）：处置 %d 条（%d 清单改写）——"
+            "不变量=每条依赖须满足【工作区成员 / 上游受管 / 仓库真实存在】之一：\n  %s",
+            stack_key, len(actions), len(changed), "\n  ".join(actions[:12]))
+    return len(changed), sorted(changed)
+
+
+def _enforce_dep_legality_cargo(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Cargo 臂（W-6）。"""
+    from swarm.worker.dep_legality import cargo_registry_versions_list
+
+    def _members(texts: dict[str, str]) -> set[str]:
+        # workspace members = 全部 Cargo.toml 的 [package].name
+        names: set[str] = set()
+        for t in texts.values():
+            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', t, re.MULTILINE)
+            if m:
+                names.add(m.group(1))
+        return names
+
+    _cache: dict[str, list[str] | None] = {}
+
+    def _versions(_ns: str, name: str):
+        if name not in _cache:
+            _cache[name] = cargo_registry_versions_list(_ns, name)
+        return _cache[name]
+
+    return _enforce_dep_legality_generic(
+        project_path, timeout, stack_key="cargo", manifest_name="Cargo.toml",
+        find_exclude="*/target/*", registry_versions=_versions,
+        workspace_members_from_texts=_members)
+
+
+def _enforce_dep_legality_go(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Go 臂（W-6）。"""
+    from swarm.worker.dep_legality import go_registry_versions_list
+
+    root_text = _read_project_file(project_path, "go.mod", timeout=20)
+    namespace: str | None = None
+    if root_text:
+        m = re.search(r'^\s*module\s+([\w.\-/]+)', root_text, re.MULTILINE)
+        namespace = m.group(1).strip() if m else None
+
+    def _members(texts: dict[str, str]) -> set[str]:
+        names: set[str] = set()
+        for t in texts.values():
+            m = re.search(r'^\s*module\s+([\w.\-/]+)', t, re.MULTILINE)
+            if m:
+                names.add(m.group(1).strip())
+        return names
+
+    _cache: dict[str, list[str] | None] = {}
+
+    def _versions(_ns: str, name: str):
+        if name not in _cache:
+            _cache[name] = go_registry_versions_list(_ns, name)
+        return _cache[name]
+
+    return _enforce_dep_legality_generic(
+        project_path, timeout, stack_key="go", manifest_name="go.mod",
+        find_exclude="*/vendor/*", registry_versions=_versions,
+        namespace=namespace, workspace_members_from_texts=_members)
+
+
+def _enforce_dep_legality_gradle(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Gradle 臂（W-6）。"""
+
+    def _members(texts: dict[str, str]) -> set[str]:
+        # workspace members = settings.gradle 里的 include ':x' / include("x")
+        names: set[str] = set()
+        for rel, t in texts.items():
+            if rel.lower().startswith("settings.gradle"):
+                for m in re.finditer(r"include\s*\(\s*['\"]:?([^'\"]+)['\"]\s*\)", t):
+                    names.add(m.group(1).strip().lstrip(":"))
+                for m in re.finditer(r"include\s+['\"]:?([^'\"]+)['\"]", t):
+                    names.add(m.group(1).strip().lstrip(":"))
+        return names
+
+    _cache: dict[tuple[str, str], list[str] | None] = {}
+
+    def _versions(ns: str, name: str):
+        key = (ns, name)
+        if key not in _cache:
+            try:
+                vers, reachable = _fetch_maven_versions_probe(ns, name, project_path, timeout)
+                _cache[key] = vers if (vers or reachable) else None
+            except Exception as _fx:  # noqa: BLE001
+                logger.warning("[L1.2.1·dep-legality] Gradle Maven 仓库查询异常（按不可达 fail-open）"
+                               "%s:%s → %s", ns, name, _fx)
+                _cache[key] = None
+        return _cache[key]
+
+    return _enforce_dep_legality_generic(
+        project_path, timeout, stack_key="gradle", manifest_name="build.gradle",
+        find_exclude="*/build/*", registry_versions=_versions,
+        workspace_members_from_texts=_members)
+
+
+def _enforce_dep_legality_python(project_path: str, timeout: int) -> tuple[int, list[str]]:
+    """Python 臂（W-6）：优先 requirements.txt，fallback pyproject/setup。"""
+    from swarm.worker.dep_legality import python_registry_versions_list
+
+    def _members(texts: dict[str, str]) -> set[str]:
+        # Python 无严格 workspace 成员；pyproject [project].name 作为 root_name 信号
+        for rel, t in texts.items():
+            if rel.lower() == "pyproject.toml":
+                m = re.search(r'^\s*name\s*=\s*"([^"]+)"', t, re.MULTILINE)
+                if m:
+                    return {m.group(1)}
+        return set()
+
+    _cache: dict[str, list[str] | None] = {}
+
+    def _versions(_ns: str, name: str):
+        if name not in _cache:
+            _cache[name] = python_registry_versions_list(_ns, name)
+        return _cache[name]
+
+    # 优先 requirements.txt；没有则试 pyproject.toml
+    if _read_project_file(project_path, "requirements.txt", timeout=20):
+        return _enforce_dep_legality_generic(
+            project_path, timeout, stack_key="python", manifest_name="requirements.txt",
+            find_exclude="*/.venv/*", registry_versions=_versions,
+            workspace_members_from_texts=_members)
+    if _read_project_file(project_path, "pyproject.toml", timeout=20):
+        return _enforce_dep_legality_generic(
+            project_path, timeout, stack_key="python", manifest_name="pyproject.toml",
+            find_exclude="*/.venv/*", registry_versions=_versions,
+            workspace_members_from_texts=_members)
+    return 0, []
 
 
 def _attempt_maven_version_repair(
@@ -2867,7 +3072,6 @@ _LINT_INFRA_MARKERS: tuple[str, ...] = (
     "no usable sandbox",                # chromium 沙箱权限
     "cannot find main module",          # go：命令在错目录跑（工具/布局问题，非代码错）
     "could not find `cargo.toml`",      # cargo：同上
-    "missing script:",                  # npm：项目没这个脚本（不该算测试失败）
     # 网络/拉依赖
     "dial tcp", "connection refused", "connection reset", "i/o timeout",
     "tls handshake timeout", "network is unreachable", "could not resolve host",
@@ -2909,6 +3113,18 @@ def _is_infra_failure(text: str) -> bool:
         return True
     # shell 缺命令(工具未装)——锚定前缀，不误命中断言 echo 的 `<X>: not found`
     return bool(_SHELL_NOT_FOUND_RE.search(text))
+
+
+def _is_npm_test_without_script(test_cmd: str, project_path: str) -> bool:
+    """W-7：harness 显式下发 `npm test` 但 package.json 没有 `scripts.test` 时，
+    不应执行命令后拿 `Missing script:` 误判成 infra 故障，而要提前按 `test_skipped` 处理。"""
+    if not test_cmd:
+        return False
+    cmd = test_cmd.strip()
+    # 识别 `npm test ...`（含前缀 cd / npx 等暂不支持，但 harness 下发基本都是裸 npm test）
+    if not cmd.startswith("npm test") and not cmd.startswith("npx npm test"):
+        return False
+    return not _npm_has_test_script(project_path)
 
 
 # 构建/测试命令 → 该命令运行所【必需的工程描述文件】。缺这些文件时命令必然失败
@@ -3117,9 +3333,17 @@ def _derive_full_build_command(
             # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Java)——旧 compileJava 对
             # .kt/.scala 编译零源→假过，或任务不存在→冤杀。classes 由任一 JVM 语言插件创建。
             _drv = _build_driver_for("gradle")
-            if _drv and _drv.build_cmd:
-                return _drv.build_cmd
-            return "./gradlew -q classes" if has("gradlew") else "gradle -q classes"
+            _cmd = _drv.build_cmd if _drv and _drv.build_cmd else (
+                "./gradlew -q classes" if has("gradlew") else "gradle -q classes")
+            # ★W-4★ Gradle 子任务按改动模块收窄：子目录 build.gradle 时用 `-p <dir>`，
+            # 避免整项目 classes 把无关模块错误归到本子任务。
+            _d = _manifest_dir_for(
+                mods, ("build.gradle", "build.gradle.kts",
+                       "settings.gradle", "settings.gradle.kts"), project_path)
+            if _d and _SAFE_REL_DIR_RE.match(_d):
+                _cmd = re.sub(r"^(./gradlew|gradle)(\s+)",
+                              rf"\1 -p {shlex.quote(_d)}\2", _cmd)
+            return _cmd
         if build == "maven" or has("pom.xml"):
             # ★BRAIN-001/W-3★ 命令字面量从 STACK_SPEC 取；`_scope_maven_command` 负责按
             # modified 收窄到 -pl <module> -am。
@@ -6236,6 +6460,12 @@ def run_l1_pipeline(
         details["l1_3_test_ok"] = True
         details["test_skipped"] = f"工程文件缺失，跳过测试: {test_cmd}"
         logger.info("[L1.3] 跳过测试(无对应工程文件): %s", test_cmd)
+    elif _is_npm_test_without_script(test_cmd, project_path):
+        # ★W-7★ harness 显式 `npm test` 但项目无 scripts.test → 提前按 skipped 处理，
+        # 避免运行后 `Missing script:` 被 _is_infra_failure 误判成 infra 故障重试。
+        details["l1_3_test_ok"] = True
+        details["test_skipped"] = f"package.json 无 test 脚本，跳过测试: {test_cmd}"
+        logger.info("[L1.3] %s", details["test_skipped"])
     else:
         t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=_stage_timeout(timeout, deadline))
         test_ok = t_ec == 0

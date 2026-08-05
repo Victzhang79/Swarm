@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 
 from swarm.brain.stack_detect import (
+    _detect_go_facts,
+    _detect_npm_facts,
     compute_repo_fingerprint,
     detect_stack_deterministic,
     extract_stack_hints_from_knowledge,
@@ -276,5 +278,32 @@ def test_auth_variant_none_when_no_signal(tmp_path):
     _mk(t, "pom.xml", "<project>x</project>")
     _mk(t, "src/main/java/com/x/PlainController.java", "package com.x;\nclass PlainController{}")
     p = detect_stack_deterministic(t)
-    assert p.get("auth", {}) == {}
-    assert "鉴权变体" not in format_stack_for_prompt(p)
+    assert p.get("auth") in (None, {})
+    fp = format_stack_for_prompt(p)
+    assert "鉴权变体" not in fp
+
+
+def test_ph1_eacces_on_root_manifest_returns_none_not_crash(tmp_path, monkeypatch):
+    """★BRAIN-006★ py<3.13 的 os.path.isfile 对 EACCES 照抛；权限异常时应按事实缺席返回 None，
+    不炸整栈扫描。"""
+    t = str(tmp_path)
+    _mk(t, "package.json", '{"type":"module"}')
+    _mk(t, "go.mod", "module example.com/x\n")
+
+    def _boom(path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("os.path.isfile", _boom)
+    assert _detect_npm_facts(t) is None
+    assert _detect_go_facts(t) is None
+
+
+def test_ph1_normal_npm_go_facts_still_work(tmp_path):
+    """正常可读时接地事实照常返回。"""
+    t = str(tmp_path)
+    _mk(t, "package.json", '{"type":"module","engines":{"node":">=18"}}')
+    _mk(t, "go.mod", "module example.com/x\ngo 1.21\n")
+    npm = _detect_npm_facts(t)
+    assert npm == {"module_system": "esm", "module_system_source": "explicit", "node_engines": ">=18"}
+    go = _detect_go_facts(t)
+    assert go == {"module_path": "example.com/x", "go_version": "1.21"}

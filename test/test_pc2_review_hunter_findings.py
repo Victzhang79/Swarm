@@ -183,6 +183,35 @@ def test_f3_ttl_window_suppresses_repeat_network_cost(monkeypatch):
         f"TTL 内应只在首次问两个镜像，实际 {calls['n']} 次 ⇒ 代价被模块数放大（F-3）")
 
 
+def test_brain005_mutable_endpoint_success_has_ttl(monkeypatch):
+    """★BRAIN-005★ go `/@latest`、npm `/dist-tags` 的成功响应不能永久缓存，
+    否则长进程后续任务会拿到过期版本。
+    """
+    monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
+    body_v1 = '{"Version":"v1.0.0"}'
+    body_v2 = '{"Version":"v2.0.0"}'
+    seq = iter([_Resp(body_v1), _Resp(body_v2)])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: next(seq))
+
+    assert gr.proxy_latest_version("github.com/x/y") == "v1.0.0"
+    # TTL 内再次询问应命中缓存，不发新请求
+    assert gr.proxy_latest_version("github.com/x/y") == "v1.0.0"
+    # 把 TTL 拨到过去模拟过期
+    for k in list(gr._http_neg_until):
+        gr._http_neg_until[k] = 0.0
+    assert gr.proxy_latest_version("github.com/x/y") == "v2.0.0", \
+        "可变端点 TTL 过期后必须重新拉取新版本"
+
+
+def test_brain005_immutable_endpoint_success_still_permanent():
+    """★BRAIN-005 反向锁★ 不可变端点（如 `/@v/v1.0.0.info`）的成功响应仍永久缓存。"""
+    cache, neg = {}, {}
+    key = "https://proxy.golang.org/x/@v/v1.0.0.info"
+    dhc.text_cache_store(cache, neg, key, "OK")
+    assert key not in neg, "不可变成功响应不应记 TTL"
+    assert dhc.text_cache_lookup(cache, neg, key) == (True, "OK")
+
+
 def test_f3_probe_cache_still_has_no_negative_stickiness(monkeypatch):
     """F5 的 `_probe_cache` 语义未被本批改动波及：`None` 仍不入缓存（回归锁）。
 

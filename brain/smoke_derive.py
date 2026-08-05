@@ -33,6 +33,8 @@ from typing import Any
 # 复用勿复制：栈清单/框架 marker 的单一权威在 stack_detect（设计文档 §5.1 点名可 import）
 from swarm.brain.stack_detect import _BACKEND_FRAMEWORK_MARKERS, _MANIFEST_BACKEND, _NOISE_DIRS
 
+from swarm.stacks.spec import spec_for_stack
+
 # ══════════════════════════════ 数据表（唯一允许含栈词汇的地方）══════════════════════════════
 
 # 框架 → 默认端口（canonical 键 = _BACKEND_FRAMEWORK_MARKERS 值的小写）
@@ -81,13 +83,18 @@ _HEALTH_ENDPOINT_MARKERS: tuple[tuple[str, str], ...] = (
 # prepare 命令数据表（F1）：仅当 start_cmd 消费【构建产物】时才需要 prepare——
 # L2 全链只跑编译（mvn compile / gradle build 类），从不 package/bootJar，
 # `java -jar target/*.jar` 若不先产 jar 必然 no such file。
-# 条目 = (start_cmd 内产物路径标记, wrapper 文件名|None, 有 wrapper 命令, 无 wrapper 命令)。
 # node/python/go/rust 不入表：go run/cargo run 自带构建，node/python 直接跑源码
 #（其依赖缺失由运行时冒烟三分类的 dependency_missing 诚实归类，不在 prepare 面伪装）。
-_PREPARE_RULES: tuple[tuple[str, str | None, str, str], ...] = (
-    ("target/*.jar", None, "", "mvn -q -DskipTests package"),
-    ("build/libs/*.jar", "gradlew", "./gradlew bootJar -x test -q", "gradle bootJar -x test -q"),
-)
+# ★BRAIN-002★ 命令字面量已全部收进 STACK_SPEC（`runtime_prepare_cmd` /
+# `runtime_prepare_cmd_wrapper` / `runtime_prepare_marker`），本模块只剩"按栈 key 查表"。
+
+
+def _stack_key(project_stack: Any) -> str:
+    """从 project_stack 取 build 字段作为栈键；非法输入 → 空串。"""
+    if not isinstance(project_stack, dict):
+        return ""
+    build = project_stack.get("build")
+    return str(build).strip().lower() if build else ""
 
 # migration 目录/文件形态（§5.4）。检测按此顺序，首中即止。
 _MIGRATION_DIR_SUFFIX_FLYWAY = "db/migration"          # classpath 约定目录（含 *.sql）
@@ -327,7 +334,10 @@ def derive_port(project_stack: Any, project_path: str,
 
 # ══════════════════════════════ entrypoint 推导（按语言 keyed）══════════════════════════════
 
-def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str) -> tuple[str | None, str | None]:
+def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str, project_stack: Any) -> tuple[str | None, str | None]:
+    stack_key = _stack_key(project_stack)
+    spec = spec_for_stack(stack_key)
+    marker = getattr(spec, "runtime_prepare_marker", "") if spec else ""
     # Maven：声明 spring-boot-maven-plugin 的 pom → 可执行 jar 证据（多模块取声明模块）。
     # R40-4 消歧（round40：RuoYi 根聚合器 pom 直接声明插件+ruoyi-admin 双命中 → 歧义
     # 护栏误判 → 冒烟常年 skipped）：①<packaging>pom</packaging> 聚合器结构上产不出
@@ -350,7 +360,7 @@ def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str) -> tup
     if len(boot_poms) == 1:
         moddir = os.path.dirname(boot_poms[0]).replace(os.sep, "/")
         prefix = f"{moddir}/" if moddir else ""
-        return f"java -jar {prefix}target/*.jar", f"{boot_poms[0]}: spring-boot-maven-plugin"
+        return f"java -jar {prefix}{marker}", f"{boot_poms[0]}: spring-boot-maven-plugin"
     if len(boot_poms) > 1:
         return None, None  # 多个可执行模块，歧义不猜（fail-closed）
     # Gradle：org.springframework.boot 插件 → bootJar 产物
@@ -362,7 +372,7 @@ def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str) -> tup
     if len(boot_gradles) == 1:
         moddir = os.path.dirname(boot_gradles[0]).replace(os.sep, "/")
         prefix = f"{moddir}/" if moddir else ""
-        return f"java -jar {prefix}build/libs/*.jar", f"{boot_gradles[0]}: org.springframework.boot 插件"
+        return f"java -jar {prefix}{marker}", f"{boot_gradles[0]}: org.springframework.boot 插件"
     return None, None
 
 
@@ -468,11 +478,10 @@ def _derive_start_php(project_path: str, idx: _TreeIndex, framework: str) -> tup
     return None, None
 
 
-# 语言 → entrypoint 推导器（数据表分派，绝无项目特判）
+# 语言 → entrypoint 推导器（数据表分派，绝无项目特判）。
+# ★BRAIN-002★ JVM 的 jar 产物路径前缀仍由推导器按磁盘证据决定，但命令字面量与产物标记
+# 已收进 STACK_SPEC；其余简单栈默认命令直接读 spec.runtime_start_cmd。
 _ENTRY_DERIVERS: dict[str, Any] = {
-    "java": _derive_start_jvm,
-    "kotlin": _derive_start_jvm,
-    "scala": _derive_start_jvm,
     "javascript/typescript": _derive_start_node,
     "python": _derive_start_python,
     "go": _derive_start_go,
@@ -486,32 +495,41 @@ def derive_start_cmd(project_stack: Any, project_path: str,
                      idx: _TreeIndex | None = None) -> tuple[str | None, str | None]:
     """entrypoint 推导 → (start_cmd|None, evidence|None)。全部基于 manifest 证据，无证据不猜。"""
     framework, lang = _split_backend(project_stack)
-    deriver = _ENTRY_DERIVERS.get(lang)
-    if deriver is None:
-        return None, None
     idx = idx if idx is not None else _build_index(project_path)
     try:
+        if lang in ("java", "kotlin", "scala"):
+            return _derive_start_jvm(project_path, idx, framework, project_stack)
+        deriver = _ENTRY_DERIVERS.get(lang)
+        if deriver is None:
+            return None, None
         return deriver(project_path, idx, framework)
     except Exception:
         return None, None
 
 
-def derive_prepare_cmd(start_cmd: str | None, project_path: str) -> tuple[str | None, str | None]:
+def derive_prepare_cmd(start_cmd: str | None, project_stack: Any,
+                       project_path: str) -> tuple[str | None, str | None]:
     """prepare 命令推导（F1）→ (prepare_cmd|None, evidence|None)。
 
-    仅当 start_cmd 消费构建产物（_PREPARE_RULES 数据表标记）时才推导；
-    标记本身来自本文件 entrypoint 数据表的产物路径，确定性闭环。
-    wrapper 只认工作树根（gradlew 约定位置）。任何异常容错返 None（绝不抛）。
+    仅当 start_cmd 消费构建产物（STACK_SPEC 的 `runtime_prepare_marker`）时才推导；
+    命令字面量全部来自 STACK_SPEC，wrapper 检测保留在本地（gradlew 约定位置）。
+    任何异常容错返 None（绝不抛）。
     """
     if not start_cmd:
         return None, None
     try:
-        for marker, wrapper, wrapped_cmd, bare_cmd in _PREPARE_RULES:
-            if marker not in start_cmd:
-                continue
-            if wrapper and os.path.isfile(os.path.join(project_path, wrapper)):
-                return wrapped_cmd, f"start_cmd 消费构建产物({marker}) + {wrapper} 存在"
-            return bare_cmd, f"start_cmd 消费构建产物({marker})"
+        spec = spec_for_stack(_stack_key(project_stack))
+        if not spec:
+            return None, None
+        marker = getattr(spec, "runtime_prepare_marker", "")
+        if not marker or marker not in start_cmd:
+            return None, None
+        base_cmd = getattr(spec, "runtime_prepare_cmd", "")
+        wrapper_cmd = getattr(spec, "runtime_prepare_cmd_wrapper", "")
+        if wrapper_cmd and os.path.isfile(os.path.join(project_path, "gradlew")):
+            return wrapper_cmd, f"start_cmd 消费构建产物({marker}) + gradlew 存在"
+        if base_cmd:
+            return base_cmd, f"start_cmd 消费构建产物({marker})"
         return None, None
     except Exception:
         return None, None
@@ -605,7 +623,7 @@ def derive_runtime_smoke(project_stack: Any, project_path: str) -> SmokeDerivati
     except Exception:
         start_cmd = None
     try:
-        prepare_cmd, ev = derive_prepare_cmd(start_cmd, str(project_path or ""))
+        prepare_cmd, ev = derive_prepare_cmd(start_cmd, project_stack, str(project_path or ""))
         if ev:
             evidence["prepare_cmd"] = ev
     except Exception:
