@@ -323,5 +323,69 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def test_guess_test_cmd_reads_from_stack_spec(monkeypatch, tmp_path):
+    """★BRAIN-001/W-3★ `_guess_test_cmd` 工程级兜底必须从 STACK_SPEC 取命令，
+    而非函数内硬编码。"""
+    from swarm.stacks.spec import STACK_SPEC, StackSpec
+    from swarm.worker.l1_pipeline import _guess_test_cmd
+
+    # 用临时 spec 替换 python 项的 test_cmd
+    orig_spec = STACK_SPEC["python"]
+    patched = StackSpec(
+        key=orig_spec.key,
+        lang=orig_spec.lang,
+        root_manifests=orig_spec.root_manifests,
+        module_manifest=orig_spec.module_manifest,
+        aggregate_manifest=orig_spec.aggregate_manifest,
+        aggregate_field=orig_spec.aggregate_field,
+        source_exts=orig_spec.source_exts,
+        source_exclude_dirs=orig_spec.source_exclude_dirs,
+        whole_project_build_cmd=orig_spec.whole_project_build_cmd,
+        test_cmd="python -m pytest -q --tb=short",
+    )
+    monkeypatch.setitem(STACK_SPEC, "python", patched)
+    # 重建 driver 缓存
+    import swarm.worker.stack_drivers as sd
+    monkeypatch.setattr(sd, "TEST_DRIVERS", {
+        k: sd._to_test_driver(v) for k, v in STACK_SPEC.items()
+        if sd._to_test_driver(v) is not None
+    })
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=x\n", encoding="utf-8")
+    cmd = _guess_test_cmd(str(tmp_path), ["hello.py"])
+    assert cmd is not None
+    assert "--tb=short" in cmd, f"未从 STACK_SPEC 读取测试命令: {cmd}"
+
+
+def test_derive_build_cmd_reads_from_stack_spec(monkeypatch, tmp_path):
+    """★BRAIN-001/W-3★ `_derive_full_build_command` 对已知栈必须从 STACK_SPEC 取命令。"""
+    from swarm.stacks.spec import STACK_SPEC, StackSpec
+    from swarm.worker.l1_pipeline import _derive_full_build_command
+
+    orig_spec = STACK_SPEC["go"]
+    patched = StackSpec(
+        key=orig_spec.key,
+        lang=orig_spec.lang,
+        root_manifests=orig_spec.root_manifests,
+        module_manifest=orig_spec.module_manifest,
+        aggregate_manifest=orig_spec.aggregate_manifest,
+        aggregate_field=orig_spec.aggregate_field,
+        source_exts=orig_spec.source_exts,
+        source_exclude_dirs=orig_spec.source_exclude_dirs,
+        whole_project_build_cmd="go build -mod=vendor ./...",
+        test_cmd=orig_spec.test_cmd,
+    )
+    monkeypatch.setitem(STACK_SPEC, "go", patched)
+    import swarm.worker.stack_drivers as sd
+    monkeypatch.setattr(sd, "BUILD_DRIVERS", {
+        k: sd._to_driver(v) for k, v in STACK_SPEC.items()
+    })
+
+    (tmp_path / "go.mod").write_text("module example.com/x\n", encoding="utf-8")
+    cmd = _derive_full_build_command(str(tmp_path), ["main.go"], {"build": "go"})
+    assert cmd is not None
+    assert "-mod=vendor" in cmd, f"未从 STACK_SPEC 读取构建命令: {cmd}"
+
+
 if __name__ == "__main__":
     sys.exit(main())

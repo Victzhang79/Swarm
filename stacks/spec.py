@@ -153,6 +153,16 @@ class StackSpec:
     所以共享的是"**哪个栈用什么命令**"这份事实，而不是 scope 策略：L2 读本字段，L1 在自己的
     scope 逻辑里读同一张表挑栈。一份事实、两种投影。"""
 
+    test_cmd: str = ""
+    """**工程级**测试命令（L1.3 兜底用）。空串＝本表未收录该栈的工程级测试命令。
+
+    与 `whole_project_build_cmd` 同源：`_guess_test_cmd` 此前把各栈测试字面量硬编码在函数
+    内部，新增栈/改命令时 L1.3 与 L2 口径漂移。本字段提供"有确定性证据时出什么命令"的
+    单一事实源；scoped 测试（按改动文件找同名测试文件）仍由调用方按需包裹，但工程级兜底
+    必须从这里取。
+    ★JVM 系刻意留空★：brain/nodes/shared.py 给 java 的 test_command 故意留空
+    （RuoYi 等项目常无测试依赖，强跑必失败）。本表不私自放行。"""
+
     source_exclude_suffixes: tuple[str, ...] = field(default_factory=tuple)
     """判"参与编译源码"时要排除的后缀（如 `.d.ts` 只是类型声明，无编译产物）。"""
 
@@ -190,6 +200,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "main", "java", "kotlin", "scala",
                          "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="mvn -q -DskipTests compile",
+        test_cmd="",
     ),
     "gradle": StackSpec(
         key="gradle", lang="java",
@@ -209,6 +220,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "main", "java", "kotlin", "scala",
                          "resources", "test", "tests", "webapp"),
         whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
+        test_cmd="",
     ),
     "npm": StackSpec(
         key="npm", lang="node",
@@ -232,6 +244,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "test", "tests"),
         # pnpm/turborepo workspace 容器（P-M4 主治：packages 布局塌模块）
         workspace_container_segments=("packages", "apps"),
+        test_cmd="npm test --silent",
     ),
     "go": StackSpec(
         key="go", lang="go",
@@ -246,6 +259,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exclude_dirs=("vendor",),
         layout_segments=("cmd", "internal", "pkg"),
         whole_project_build_cmd="go build ./...",
+        test_cmd="go test ./...",
     ),
     "cargo": StackSpec(
         key="cargo", lang="rust",
@@ -260,6 +274,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exclude_dirs=("target",),
         layout_segments=("src", "tests"),
         whole_project_build_cmd="cargo build -q",
+        test_cmd="cargo test -q",
     ),
     "python": StackSpec(
         key="python", lang="python",
@@ -287,6 +302,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exclude_dirs=("build", "dist", ".venv", "site-packages"),
         layout_segments=("src", "test", "tests"),
         whole_project_build_cmd="python -m compileall -q .",
+        test_cmd="python -m pytest -q --maxfail=1",
     ),
 }
 

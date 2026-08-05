@@ -27,7 +27,7 @@ def test_maven_derived_when_manifest_only_in_sandbox():
         return "pom.xml" in manifests  # 沙箱里有 pom，其余(gradle)无
     with patch.object(l1_pipeline, "_manifest_present", side_effect=fake_present):
         cmd = _derive(["ruoyi-common/src/main/java/A.java"])
-    assert cmd == "mvn -q compile", f"沙箱有 pom 时应派生 maven 编译，got {cmd!r}"
+    assert cmd == "mvn -q -DskipTests compile", f"沙箱有 pom 时应派生 maven 编译，got {cmd!r}"
 
 
 def test_go_derived_when_manifest_only_in_sandbox():
@@ -49,7 +49,7 @@ def test_explicit_stack_build_maven_independent_of_manifest():
     """回归：stack 明示 build=maven 时不依赖 manifest 探测。"""
     with patch.object(l1_pipeline, "_manifest_present", return_value=False):
         cmd = _derive(["A.java"], stack={"build": "maven"})
-    assert cmd == "mvn -q compile", f"got {cmd!r}"
+    assert cmd == "mvn -q -DskipTests compile", f"got {cmd!r}"
 
 
 if __name__ == "__main__":

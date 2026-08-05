@@ -26,14 +26,14 @@ def test_java_still_derives_compile_not_validate(tmp_path):
     """有 .java → 仍走全量 compile（不被 validate 分支抢走）。"""
     _touch(tmp_path, "pom.xml")
     cmd = _derive_full_build_command(str(tmp_path), ["ruoyi-alarm/src/main/java/A.java"], {"build": "maven"})
-    assert cmd == "mvn -q compile", cmd
+    assert cmd == "mvn -q -DskipTests compile", cmd
 
 
 def test_pom_plus_java_prefers_compile(tmp_path):
     """pom + java 混合 → compile（更强，覆盖 validate）。"""
     _touch(tmp_path, "pom.xml")
     cmd = _derive_full_build_command(str(tmp_path), ["pom.xml", "src/main/java/A.java"], {"build": "maven"})
-    assert cmd == "mvn -q compile", cmd
+    assert cmd == "mvn -q -DskipTests compile", cmd
 
 
 def test_non_maven_pom_absent_no_validate(tmp_path):

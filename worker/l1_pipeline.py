@@ -3116,8 +3116,16 @@ def _derive_full_build_command(
                                  and has("build.gradle", "build.gradle.kts")):
             # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Java)——旧 compileJava 对
             # .kt/.scala 编译零源→假过，或任务不存在→冤杀。classes 由任一 JVM 语言插件创建。
+            _drv = _build_driver_for("gradle")
+            if _drv and _drv.build_cmd:
+                return _drv.build_cmd
             return "./gradlew -q classes" if has("gradlew") else "gradle -q classes"
         if build == "maven" or has("pom.xml"):
+            # ★BRAIN-001/W-3★ 命令字面量从 STACK_SPEC 取；`_scope_maven_command` 负责按
+            # modified 收窄到 -pl <module> -am。
+            _drv = _build_driver_for("maven")
+            if _drv and _drv.build_cmd:
+                return _drv.build_cmd
             return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
     def _per_file(cmd: str, exts: tuple[str, ...]) -> str:
         files = [f for f in mods if f.endswith(exts)]
@@ -3168,11 +3176,15 @@ def _derive_full_build_command(
 
     if ext(".go") and (build == "go" or has("go.mod", "go.work")):
         # N-2：`go.work` 多模块仓——`go build ./...` 在 work 根即可编译全部 use 模块
+        _drv = _build_driver_for("go")
+        _cmd = _drv.build_cmd if _drv and _drv.build_cmd else "go build ./..."
         if has("go.work"):
-            return at(("go.work",), "go build ./...")
-        return at(("go.mod",), "go build ./...")
+            return at(("go.work",), _cmd)
+        return at(("go.mod",), _cmd)
     if ext(".rs") and (build == "cargo" or has("Cargo.toml")):
-        return at(("Cargo.toml",), "cargo build -q")
+        _drv = _build_driver_for("cargo")
+        _cmd = _drv.build_cmd if _drv and _drv.build_cmd else "cargo build -q"
+        return at(("Cargo.toml",), _cmd)
     # X-H1：前端不能只认 `.ts/.tsx`+tsconfig —— npm 工程改 `.js/.jsx/.vue` 原先**零构建闸**。
     # 优先 tsc（有 tsconfig 时它是最强的确定性类型闸），否则退到 package.json 的 build 脚本。
     if ext(".ts", ".tsx") and has("tsconfig.json"):
@@ -4721,6 +4733,8 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
     # 跑，`backend/pyproject.toml` 这种形态会得到根级 pytest ⇒ 收集不到用例 rc=5 ⇒ 非 infra ⇒
     # **硬 FAIL**（sticky，换模型同死）。改前是 `os.path.isfile(root/…)` 只看根 → 返 None →
     # `test_skipped`，所以这是本批新造的判死面。锚点同样由 modified 反查。
+    # ★BRAIN-001/W-3★ 工程级测试命令从 `worker/stack_drivers.TEST_DRIVERS` 派生，事实源
+    # 是 `stacks.spec.STACK_SPEC`。命令字面量不再硬编码在本函数内。
     def _anchor(names: tuple[str, ...], cmd: str) -> str:
         d = _manifest_dir_for(mods, names, project_path)
         if d is None:
@@ -4731,21 +4745,41 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
             return cmd
         return f"cd {shlex.quote(d)} && {cmd}"
 
-    if (any(f.endswith(".py") for f in mods)
-            and _manifest_present(("pyproject.toml",), project_path)):
-        return _anchor(("pyproject.toml",), "python -m pytest -q --maxfail=1")
-    if _manifest_present(("go.mod",), project_path) and any(f.endswith(".go") for f in mods):
-        # `go test ./...` 对没有测试文件的包是 `ok ... [no test files]` + 0 退出 ⇒ 安全兜底
-        return _anchor(("go.mod",), "go test ./...")
-    if _manifest_present(("Cargo.toml",), project_path) and any(f.endswith(".rs") for f in mods):
-        # 同理：无测试的 crate `cargo test` 也是 0 退出。★不加 `--offline`★：冷沙箱里它必失败
-        # 且 `attempting to make an HTTP request, but --offline was specified` 会被判成**代码错**
-        # （复核 HIGH-1 实测）⇒ rust 整栈冷沙箱硬 FAIL。让它照常联网，失败时才是真信号。
-        return _anchor(("Cargo.toml",), "cargo test -q")
-    if (any(f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue")) for f in mods)
-            and _npm_has_test_script(project_path)):
-        return _anchor(("package.json",), "npm test --silent")
+    for stack_key in ("python", "go", "cargo", "npm"):
+        drv = _test_driver_for(stack_key)
+        if not drv:
+            continue
+        if not _manifest_present(drv.anchor_manifests, project_path):
+            continue
+        if not any(f.endswith(_ext_for_lang(drv.lang)) for f in mods):
+            continue
+        # npm 还需要 scripts.test 在场
+        if stack_key == "npm" and not _npm_has_test_script(project_path):
+            continue
+        return _anchor(drv.anchor_manifests, drv.test_cmd)
     return None
+
+
+def _test_driver_for(stack_key: str):
+    """BRAIN-001/W-3：测试命令单一事实源入口。"""
+    from swarm.worker.stack_drivers import test_driver
+    return test_driver(stack_key)
+
+
+def _build_driver_for(stack_key: str):
+    """BRAIN-001/W-3：构建命令单一事实源入口。"""
+    from swarm.worker.stack_drivers import build_driver
+    return build_driver(stack_key)
+
+
+def _ext_for_lang(lang: str) -> tuple[str, ...]:
+    """语言 → 该语言常见源文件后缀（用于工程级兜底守卫）。"""
+    return {
+        "python": (".py",),
+        "go": (".go",),
+        "rust": (".rs",),
+        "node": (".ts", ".tsx", ".js", ".jsx", ".vue"),
+    }.get(lang, ())
 
 
 

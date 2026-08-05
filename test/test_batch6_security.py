@@ -33,7 +33,7 @@ def test_d4_sast_only_dep_zero_coverage_blocks(monkeypatch, tmp_path):
     _only_bandit_env(monkeypatch)
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
 
     assert should_block is True, "dep 类 0 覆盖必须 fail-closed（不得被 sast 工具掩盖）"
     dep_sentinels = [f for f in findings if f.rule_id == "fail-closed-no-dep-scanner"]
@@ -51,11 +51,18 @@ def test_d4_all_external_absent_sast_and_dep_sentinels(monkeypatch, tmp_path):
     monkeypatch.setattr(ss.shutil, "which", lambda name: None)
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
+    findings, should_block, scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
 
     assert should_block is True
     cats = {f.category for f in findings if f.rule_id.startswith("fail-closed-no-")}
     assert cats == {"sast", "dep"}, f"哨兵应恰好覆盖 0 覆盖的类: {cats}"
+    # ★W-1★ 具体缺失工具名必须机读可辨，不能只停留在日志里。
+    skipped = scan_details.get("skipped_tools", [])
+    assert "bandit" in skipped, f"bandit 缺失应进 skipped_tools: {skipped}"
+    assert "pip-audit" in skipped, f"pip-audit 缺失应进 skipped_tools: {skipped}"
+    assert "gitleaks" in skipped or "trufflehog" in skipped, f"密钥扫描工具缺失应进 skipped_tools: {skipped}"
+    # categories_ran 与哨兵一致
+    assert scan_details.get("categories_ran") == {"sast": False, "dep": False, "secret": True}
 
 
 def test_d4_full_coverage_no_sentinel(monkeypatch, tmp_path):
@@ -68,7 +75,7 @@ def test_d4_full_coverage_no_sentinel(monkeypatch, tmp_path):
     monkeypatch.setattr(ss, "_run_tool", lambda *a, **k: (1, '{"results": []}', ""))
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
 
     assert should_block is False
     assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)
@@ -99,7 +106,7 @@ def test_d4_report_mode_aggregate_semantics_unchanged(monkeypatch, tmp_path):
     monkeypatch.setattr(ss.shutil, "which", lambda name: None)
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
 
     assert should_block is False
     assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)

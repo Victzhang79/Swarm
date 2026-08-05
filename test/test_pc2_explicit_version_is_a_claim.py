@@ -432,15 +432,13 @@ def test_go_unreachable_proxy_fails_open(monkeypatch, caplog):
     "v0.0.0-20230101120000-abcdef123456",         # ① 无 base tag（最常见）
     "v1.2.3-beta.0.20230101120000-abcdef123456",  # ② base 是预发布（golang.org/x/*、k8s.io/* 大量）
     "v1.2.4-0.20230101120000-abcdef123456",       # ③ base 是正式版（patch 递增 + `-0.` 段）
-    "v1.2",                                  # 非规范（go.mod 要三段）
 ])
-def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
-    """非规范 semver tag **绝不判定**（Maven `${...}` 的对应物）。
+def test_go_pseudo_versions_are_never_probed(monkeypatch, ver):
+    """伪版本是真实可用形态，**绝不判定**（判它必然 404 → 误杀）。
 
-    逐条 parametrize + 把探测换成会炸的实现＝同时锁"不判时不查网"。伪版本尤其重要：
-    它是真实可用的形态，判它必然 404 → 误杀。
-    ★R3 之后 `latest`/分支名/裸 SHA 不再归此档★ 它们写不进 go.mod（语法错误），
-    走校正/丢弃分支（见 test_go_ungomoddable_versions_*）。
+    逐条 parametrize + 把探测换成会炸的实现＝同时锁"不判时不查网"。
+    ★R3/BRAIN-003★ `latest`/分支名/裸 SHA/非三段 semver 不再归此档——它们写不进 go.mod
+    （语法错误），走校正/丢弃分支（见 test_go_ungomoddable_versions_*）。
     ★P-C2 复核 R5★ 治前代码（无脑保留）本条同样绿——回归锁，非接线证据。
     """
     def _boom(m, v):
@@ -451,13 +449,20 @@ def test_go_unjudgeable_versions_are_never_probed(monkeypatch, ver):
     assert [(d.module, d.version) for d in kept] == [("github.com/x/y", ver)]
 
 
-@pytest.mark.parametrize("ver", ["latest", "master", "main", "abcdef1234567890"])
+@pytest.mark.parametrize("ver", [
+    "latest", "master", "main", "dev", "release-1.2", "feature/foo",
+    "abcdef1234567890",                       # 裸 SHA
+    "v1.2",                                   # 非规范（go.mod 要三段）
+])
 def test_go_ungomoddable_versions_are_corrected_or_dropped(monkeypatch, ver):
-    """★R3★ `latest`/分支名/裸 SHA 在 go.mod 里是**语法错误**（`go build` 解析期全灭），
-    与伪版本同性质（不可复现）但**不能**原样保留——保留等于把解析错误烤进权威模板。
+    """★R3/BRAIN-003★ 所有写不进 go.mod 的形态（latest/分支名/裸 SHA/非三段 semver）都是
+    语法错误（`go build` 解析期全灭），与伪版本同性质（不可复现）但**不能**原样保留——
+    保留等于把解析错误烤进权威模板。
 
     治法：先尝试 `proxy_latest_version` 校正到可解析稳定版；校正不到 → 如实丢弃。
     与 npm 不对称是对的：npm 的 `latest` 是合法语法（装最新），go 的不是。
+    ★BRAIN-003 新增分支名/非三段 semver★ 此前枚举只列 latest/master/main/sha，
+    `dev`/`release-1.2`/`v1.2` 漏网被误当成"不判"原样保留。
     """
     # 有可用稳定版 → 校正
     monkeypatch.setattr(gr, "proxy_latest_version", lambda m: "v1.9.1")

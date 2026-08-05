@@ -187,6 +187,12 @@ def select_slot(provider_id: str, available_slots: list[int]) -> int | None:
             provider_id, len(available_slots), soonest, max(0.0, remain))
     else:
         logger.debug("[key-rotation] provider=%s 全槽冷却中，沿用槽%d", provider_id, soonest)
+    # ★F3★ 全槽冷却必须机读可辨——只打 warn-once 日志时 progress/metrics/health 全盲。
+    try:
+        from swarm.infra.degrade import record_degrade
+        record_degrade(f"models.key_rotation.all_slots_cooling:{provider_id}")
+    except Exception:  # noqa: BLE001 — 观测绝不阻断
+        pass
     return soonest
 
 

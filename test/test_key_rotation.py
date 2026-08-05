@@ -94,6 +94,22 @@ def test_all_cooling_still_returns_a_key():
     assert kr.select_slot("p", [1, 2]) in (1, 2)
 
 
+def test_all_cooling_emits_machine_readable_degrade(monkeypatch):
+    """★F3★ 全槽冷却不能只有 warn-once 日志——progress/metrics/health 必须能感知。
+    判定：select_slot 全冷却分支调用 record_degrade('models.key_rotation.all_slots_cooling:<pid>')。"""
+    recorded = []
+
+    def _rec(key: str):
+        recorded.append(key)
+
+    monkeypatch.setattr("swarm.infra.degrade.record_degrade", _rec)
+    kr.mark_exhausted("p-f3", 1)
+    kr.mark_exhausted("p-f3", 2)
+    kr.select_slot("p-f3", [1, 2])
+    assert any("all_slots_cooling:p-f3" in k for k in recorded), \
+        f"全槽冷却未产生机读 degrade 键: {recorded}"
+
+
 def test_single_slot_degrades_to_old_behaviour():
     """未配备用槽 → 行为与改动前逐字等价（只有槽 1 可选）。"""
     assert kr.select_slot("q", [1]) == 1

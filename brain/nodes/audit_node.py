@@ -77,7 +77,7 @@ async def _run_security_audit(
         )
 
     try:
-        findings, should_block = await _asyncio.get_running_loop().run_in_executor(None, _scan)
+        findings, should_block, scan_details = await _asyncio.get_running_loop().run_in_executor(None, _scan)
     except Exception as exc:  # noqa: BLE001
         logger.error("[AUDIT] 安全扫描失败: %s (fail_closed=%s)", exc, _audit_fail_closed)
         return WorkerOutput(
@@ -129,6 +129,8 @@ async def _run_security_audit(
             "by_severity": by_sev,
             "block_severity": block_severity,
             "should_block": should_block,
+            "security_scan_skipped_tools": scan_details.get("skipped_tools", []),
+            "security_scan_categories_ran": scan_details.get("categories_ran", {}),
         },
         audit_findings=findings,
     )

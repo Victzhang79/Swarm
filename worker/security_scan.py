@@ -71,15 +71,19 @@ class _ScanContext:
     D4（19号文）：per-category 粒度——单布尔时代任一类任一工具跑成即解除哨兵
     （java 有 spotbugs 无 dependency-check → 依赖漏洞 0 覆盖照常放行）。三类分账，
     阻断模式任一类 0 覆盖即注合成 finding。
+
+    ★W-1★ skipped_tools 记录本趟扫描有哪些外部工具因缺失而未能执行，使"0 覆盖"
+    从 category 级下探到具体工具名，供 progress/metrics/审计端消费。
     """
 
-    __slots__ = ("scanner_ran", "sast_ran", "dep_ran", "secret_ran")
+    __slots__ = ("scanner_ran", "sast_ran", "dep_ran", "secret_ran", "skipped_tools")
 
     def __init__(self) -> None:
         self.scanner_ran = False
         self.sast_ran = False
         self.dep_ran = False
         self.secret_ran = False
+        self.skipped_tools: list[str] = []
 
 
 # ──────────────────────────────────────────────
@@ -91,8 +95,8 @@ def run_security_scan(
     *,
     files: list[str] | None = None,
     block_severity: str = "critical",
-) -> tuple[list[SecurityFinding], bool]:
-    """运行三类安全扫描，返回 (findings, should_block)。
+) -> tuple[list[SecurityFinding], bool, dict[str, Any]]:
+    """运行三类安全扫描，返回 (findings, should_block, scan_details)。
 
     Args:
         project_path: 项目根目录
@@ -102,7 +106,10 @@ def run_security_scan(
             'none'=纯报告模式不阻断
 
     Returns:
-        (findings, should_block): should_block=True 表示存在 >= block_severity 的发现
+        (findings, should_block, scan_details):
+        - should_block=True 表示存在 >= block_severity 的发现
+        - scan_details 含 "skipped_tools"（缺失工具列表）与 "categories_ran"
+          （sast/dep/secret 是否确有真实扫描器执行），使"0 覆盖"机读可辨。
     """
     language = language.lower().strip()
     findings: list[SecurityFinding] = []
@@ -192,7 +199,7 @@ def run_security_scan(
 
     logger.info(
         "Security scan done: %d findings, should_block=%s (threshold=%s, scanner_ran=%s, "
-        "sast_ran=%s, dep_ran=%s, secret_ran=%s)",
+        "sast_ran=%s, dep_ran=%s, secret_ran=%s, skipped_tools=%s)",
         len(findings),
         should_block,
         block_severity,
@@ -200,8 +207,17 @@ def run_security_scan(
         ctx.sast_ran,
         ctx.dep_ran,
         ctx.secret_ran,
+        ctx.skipped_tools,
     )
-    return findings, should_block
+    scan_details: dict[str, Any] = {
+        "skipped_tools": ctx.skipped_tools,
+        "categories_ran": {
+            "sast": ctx.sast_ran,
+            "dep": ctx.dep_ran,
+            "secret": ctx.secret_ran,
+        },
+    }
+    return findings, should_block, scan_details
 
 
 # ──────────────────────────────────────────────
@@ -271,6 +287,12 @@ def _mark_ran(
             ctx.secret_ran = True
 
 
+def _mark_skipped(ctx: "_ScanContext | None", tool: str) -> None:
+    """记录某个外部扫描器因本地工具缺失而未能执行。W-1 机读键来源。"""
+    if ctx is not None:
+        ctx.skipped_tools.append(tool)
+
+
 # ──────────────────────────────────────────────
 # (a) SAST 扫描
 # ──────────────────────────────────────────────
@@ -296,6 +318,7 @@ def _sast_python(project_path: str, *, files: list[str] | None = None, ctx: "_Sc
     """Python SAST: bandit -f json。"""
     if not shutil.which("bandit"):
         logger.info("SAST(python): bandit not found, skipping")
+        _mark_skipped(ctx, "bandit")
         return []
 
     # D8/H-2（批次6 R1 hunter）：files=[]（scope 内无可扫对象）≠ files=None（未限定）——
@@ -346,6 +369,7 @@ def _sast_node(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     """Node SAST: semgrep --json (可选)。"""
     if not shutil.which("semgrep"):
         logger.info("SAST(node): semgrep not found, skipping")
+        _mark_skipped(ctx, "semgrep")
         return []
 
     # D8：files 提供时限定扫描目标——全树扫会把 baseline 未触碰文件的旧账算到新交付头上
@@ -394,6 +418,7 @@ def _sast_go(project_path: str, *, files: list[str] | None = None, ctx: "_ScanCo
     """Go SAST: gosec -fmt=json。"""
     if not shutil.which("gosec"):
         logger.info("SAST(go): gosec not found, skipping")
+        _mark_skipped(ctx, "gosec")
         return []
 
     # D8：files 提供时按【包模式】限定——gosec 只收 package pattern 不收文件清单，
@@ -453,6 +478,7 @@ def _sast_rust(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     限定不适用（baseline 连坐风险由 D8 已治的 semgrep/gosec/bandit 路径覆盖主要场景）。"""
     if not shutil.which("cargo"):
         logger.info("SAST(rust): cargo not found, skipping")
+        _mark_skipped(ctx, "cargo-clippy")
         return []
 
     cmd = ["cargo", "clippy", "--message-format=json", "--", "-W", "clippy::all"]
@@ -520,6 +546,7 @@ def _sast_java(project_path: str, *, files: list[str] | None = None, ctx: "_Scan
     files 限定不适用。"""
     if not shutil.which("spotbugs"):
         logger.info("SAST(java): spotbugs not found, skipping")
+        _mark_skipped(ctx, "spotbugs")
         return []
 
     cmd = ["spotbugs", "-xml", project_path]
@@ -604,6 +631,7 @@ def _dep_python(project_path: str, *, ctx: "_ScanContext | None" = None) -> list
     """Python: pip-audit --format=json。"""
     if not shutil.which("pip-audit"):
         logger.info("Dep(python): pip-audit not found, skipping")
+        _mark_skipped(ctx, "pip-audit")
         return []
 
     cmd = ["pip-audit", "--format=json"]
@@ -646,6 +674,7 @@ def _dep_node(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     """Node: npm audit --json。"""
     if not shutil.which("npm"):
         logger.info("Dep(node): npm not found, skipping")
+        _mark_skipped(ctx, "npm-audit")
         return []
 
     cmd = ["npm", "audit", "--json"]
@@ -691,6 +720,7 @@ def _dep_go(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[Sec
     """Go: govulncheck -json。"""
     if not shutil.which("govulncheck"):
         logger.info("Dep(go): govulncheck not found, skipping")
+        _mark_skipped(ctx, "govulncheck")
         return []
 
     cmd = ["govulncheck", "-json", "./..."]
@@ -784,11 +814,13 @@ def _dep_rust(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     """Rust: cargo audit --json。"""
     if not shutil.which("cargo"):
         logger.info("Dep(rust): cargo not found, skipping")
+        _mark_skipped(ctx, "cargo")
         return []
 
     # cargo audit 是子命令，先检查 cargo-audit 是否安装
     if not shutil.which("cargo-audit") and not _cargo_subcommand_available("audit"):
         logger.info("Dep(rust): cargo audit not found, skipping")
+        _mark_skipped(ctx, "cargo-audit")
         return []
 
     cmd = ["cargo", "audit", "--json"]
@@ -853,6 +885,7 @@ def _dep_java(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[S
     """Java: dependency-check。"""
     if not shutil.which("dependency-check"):
         logger.info("Dep(java): dependency-check not found, skipping")
+        _mark_skipped(ctx, "dependency-check")
         return []
 
     out_dir = str(Path(project_path) / ".dc-report")
@@ -1159,6 +1192,7 @@ def _run_secret_scan(
 def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
     """gitleaks 密钥扫描。None=工具不可用。"""
     if not shutil.which("gitleaks"):
+        _mark_skipped(ctx, "gitleaks")
         return None
 
     # D14：报告写到项目树外的临时文件——写进项目树会把 .gitleaks-report.json 混进
@@ -1214,6 +1248,7 @@ def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) ->
 def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
     """trufflehog 密钥扫描。None=工具不可用。"""
     if not shutil.which("trufflehog"):
+        _mark_skipped(ctx, "trufflehog")
         return None
 
     cmd = ["trufflehog", "filesystem", "--json", project_path]

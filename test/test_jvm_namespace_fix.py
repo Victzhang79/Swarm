@@ -413,7 +413,7 @@ def test_derive_build_is_stack_general():
         root = Path(d)
         # Java/maven
         (root / "pom.xml").write_text("<project/>")
-        assert _derive_full_build_command(str(root), ["ruoyi-alarm/X.java"], {"build": "maven"}) == "mvn -q compile"
+        assert _derive_full_build_command(str(root), ["ruoyi-alarm/X.java"], {"build": "maven"}) == "mvn -q -DskipTests compile"
         # Go
         (root / "go.mod").write_text("module x")
         assert _derive_full_build_command(str(root), ["svc/main.go"], {"build": "go"}) == "go build ./..."

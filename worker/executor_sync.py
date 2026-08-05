@@ -209,32 +209,16 @@ class _SandboxSyncMixin:
         防超大：单模块上限 800 文件。非编译型(无 build_command)返回空，保持精准同步。
         C14（19号文）：栈分发驱动表（build 命令词元 → 模块锚清单/源扩展名/排除目录），
         不再 JVM 写死——go/cargo/npm 模块缺同级源同样 cannot find symbol 换栈复发。
+
+        ★BRAIN-001/W-3★ 驱动表从 `worker/stack_drivers.BUILD_DRIVERS` 派生，底层事实源
+        是 `stacks.spec.STACK_SPEC`。新增栈/改扩展名时只改一处。
         """
         harness = getattr(self.subtask, "harness", None)
         build_cmd = getattr(harness, "build_command", "") if harness else ""
         if not build_cmd or not self.project_path:
             return []
-        # 栈驱动表：(build 命令词元, 模块锚清单, 源扩展名, 排除目录段, 排除是否锚定 src/ 之前)
-        # C15（19号文）：目录名泛匹配误伤——JVM 的 target/build 排除若全路径段匹配，会把合法
-        # 包目录 com/x/build/ 里的源文件错排。锚定 src/ 的栈只排 src/ 之前的段（构建产物必在
-        # 模块根/src 之外）；node_modules/vendor 生态约定任何层级都是依赖目录，全段排除。
-        # hunter F2：go 词元必须词边界正则（"re:" 前缀）——子串 "go " 会被 "cargo build"/
-        # "cargo test" 里的 car【go 】截胡，Rust 行锚清单 go.mod 永远找不到 → 静默返回 []
-        # （cannot find symbol 换栈复发零留痕）。cargo 同时排在 go 前双保险。
-        # 诚实边界（reviewer R2 LOW）：词边界把绝对路径调用（/usr/local/go/bin/go build，
-        # "go" 前是 /）也挡在驱动外 → 该形态返回 []（fail-open 等价未知栈）。brain 产出的
-        # build_command 几乎皆裸 `go build`，命中面极小，登记不阻断。
-        _STACK_DRIVERS = (
-            (("mvn", "gradle"), ("pom.xml", "build.gradle", "build.gradle.kts"),
-             (".java", ".kt", ".scala", ".groovy"), ("target", "build"), True),
-            (("cargo",), ("Cargo.toml",),
-             (".rs",), ("target",), True),
-            ((r"re:(?<![\w/.-])go(?:\s|$)",), ("go.mod",),
-             (".go",), ("vendor",), False),
-            (("npm ", "pnpm", "yarn", "tsc", "npx tsc"), ("package.json",),
-             (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"),
-             ("node_modules", "dist", "build"), False),
-        )
+
+        from swarm.worker.stack_drivers import BUILD_DRIVERS
 
         def _token_hit(tokens, cmd: str) -> bool:
             for t in tokens:
@@ -246,13 +230,18 @@ class _SandboxSyncMixin:
             return False
 
         driver = None
-        for tokens, anchors, exts, skip_parts, src_anchor in _STACK_DRIVERS:
-            if _token_hit(tokens, build_cmd):
-                driver = (anchors, exts, skip_parts, src_anchor)
+        for drv in BUILD_DRIVERS.values():
+            if _token_hit(drv.command_tokens, build_cmd):
+                driver = drv
                 break
         if driver is None:
             return []
-        _ANCHORS, _SRC_EXT, _SKIP_PARTS, _SRC_ANCHOR = driver
+
+        _ANCHORS = driver.anchor_manifests
+        _SRC_EXT = driver.source_exts
+        _SKIP_PARTS = driver.source_exclude_dirs
+        # JVM 系锚定 src/ 之前：target/build 在 src/ 之外；其余栈全路径排除 vendor/node_modules
+        _SRC_ANCHOR = driver.shares_classpath_namespace
         root = Path(self.project_path).resolve()
         scope = self.effective_scope
         changed = (list(getattr(scope, "writable", []) or [])

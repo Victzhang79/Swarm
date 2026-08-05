@@ -25,7 +25,7 @@ def test_builtin_secret_sk_key():
             'API_KEY = "sk-abc123def456ghi789jkl012mno345"\n',
             encoding="utf-8",
         )
-        findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) >= 1, f"应检出至少 1 个 secret, 实际: {secret_findings}"
         assert secret_findings[0].severity.value in ("critical", "high"), \
@@ -41,7 +41,7 @@ def test_builtin_secret_akia_key():
             'AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"\n',
             encoding="utf-8",
         )
-        findings, _ = run_security_scan(tmp, "python", block_severity="high")
+        findings, _, _scan_details = run_security_scan(tmp, "python", block_severity="high")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) >= 1, f"应检出 AKIA 密钥, 实际: {[f.title for f in findings]}"
         assert any("AWS" in f.title or "AKIA" in f.file or f.line > 0 for f in secret_findings), \
@@ -57,7 +57,7 @@ def test_builtin_secret_private_key():
             "-----BEGIN RSA PRIVATE KEY-----\nMIIEowI...\n-----END RSA PRIVATE KEY-----\n",
             encoding="utf-8",
         )
-        findings, _ = run_security_scan(tmp, "python", block_severity="critical")
+        findings, _, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) >= 1, f"应检出 Private Key, 实际: {secret_findings}"
         assert any("Private Key" in f.title or "private" in f.title.lower() for f in secret_findings), \
@@ -73,7 +73,7 @@ def test_builtin_secret_ghp_key():
             'GITHUB_TOKEN="ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"\n',
             encoding="utf-8",
         )
-        findings, _ = run_security_scan(tmp, "python", block_severity="high")
+        findings, _, _scan_details = run_security_scan(tmp, "python", block_severity="high")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) >= 1, f"应检出 ghp_ 密钥, 实际: {secret_findings}"
     print("  ✅ 内置正则检出 ghp_ GitHub PAT")
@@ -87,7 +87,7 @@ def test_no_secrets_clean_file():
             'def hello():\n    print("Hello, World!")\n',
             encoding="utf-8",
         )
-        findings, _ = run_security_scan(tmp, "python", block_severity="critical")
+        findings, _, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) == 0, f"干净文件不应检出密钥, 实际: {secret_findings}"
     print("  ✅ 干净文件无密钥检出")
@@ -101,7 +101,7 @@ def test_no_tool_no_crash_python():
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "clean.py").write_text("x = 1\n", encoding="utf-8")
         # 不应抛异常
-        findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         # 干净文件: findings 可能有 sast/dep 空列表 + secret 空
         assert isinstance(findings, list), "findings 应为列表"
         assert isinstance(should_block, bool), "should_block 应为 bool"
@@ -113,7 +113,7 @@ def test_no_tool_no_crash_go():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.go").write_text('package main\nfunc main() {}\n', encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "go", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "go", block_severity="critical")
         assert isinstance(findings, list)
         assert isinstance(should_block, bool)
     print("  ✅ Go 工具缺失不崩，优雅降级")
@@ -124,7 +124,7 @@ def test_no_tool_no_crash_rust():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.rs").write_text('fn main() {}\n', encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "rust", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "rust", block_severity="critical")
         assert isinstance(findings, list)
         assert isinstance(should_block, bool)
     print("  ✅ Rust 工具缺失不崩，优雅降级")
@@ -135,7 +135,7 @@ def test_no_tool_no_crash_java():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "App.java").write_text('public class App {}\n', encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "java", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "java", block_severity="critical")
         assert isinstance(findings, list)
         assert isinstance(should_block, bool)
     print("  ✅ Java 工具缺失不崩，优雅降级")
@@ -146,7 +146,7 @@ def test_no_tool_no_crash_node():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "index.js").write_text('console.log("hello");\n', encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "node", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "node", block_severity="critical")
         assert isinstance(findings, list)
         assert isinstance(should_block, bool)
     print("  ✅ Node 工具缺失不崩，优雅降级")
@@ -156,7 +156,7 @@ def test_unsupported_language():
     """不支持的语言应返回空列表不崩。"""
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
-        findings, should_block = run_security_scan(tmp, "cobol", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "cobol", block_severity="critical")
         # 内置正则仍会扫描 secret
         assert isinstance(findings, list)
     print("  ✅ 不支持的语言优雅降级")
@@ -172,7 +172,7 @@ def test_block_severity_critical_with_critical_finding():
             'API_KEY = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaa"  # OpenAI key\n',
             encoding="utf-8",
         )
-        findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         # sk- 密钥被标记为 CRITICAL
         assert len(findings) > 0, "应有发现"
         # sk- 对应 severity=CRITICAL, block_severity=critical → should_block=True
@@ -188,7 +188,7 @@ def test_block_severity_high_with_critical_finding():
             'API_KEY = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaa"\n',
             encoding="utf-8",
         )
-        findings, should_block = run_security_scan(tmp, "python", block_severity="high")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="high")
         assert should_block is True, "critical >= high 阈值应阻断"
     print("  ✅ critical finding + block=high → should_block=True")
 
@@ -201,7 +201,7 @@ def test_block_severity_none_with_critical_finding():
             'API_KEY = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaa"\n',
             encoding="utf-8",
         )
-        findings, should_block = run_security_scan(tmp, "python", block_severity="none")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="none")
         assert len(findings) > 0, "应有发现（纯报告模式仍然产出结果）"
         assert should_block is False, "block_severity='none' 纯报告模式不阻断"
     print("  ✅ critical finding + block=none → should_block=False (纯报告)")
@@ -217,7 +217,7 @@ def test_block_severity_critical_with_medium_finding():
             'password = "MySecret12345"  # matches generic secret assignment\n',
             encoding="utf-8",
         )
-        findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         # 检查：如果只有 medium/high 级别的发现，在 critical 阈值下不阻断
         has_critical = any(f.severity == Severity.CRITICAL for f in findings)
         if not has_critical:
@@ -241,7 +241,7 @@ def test_clean_project_no_block():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "python", block_severity="critical")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
         # D4 per-category 后：不阻断要求 sast+dep 两类都有真实工具覆盖（secret 有内置正则兜底）。
         sast_covered = shutil.which("bandit")
         dep_covered = shutil.which("pip-audit")
@@ -261,7 +261,7 @@ def test_clean_project_report_mode_never_blocks():
     from swarm.worker.security_scan import run_security_scan
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
-        findings, should_block = run_security_scan(tmp, "python", block_severity="none")
+        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="none")
         assert should_block is False, "report-only 模式永不阻断"
         assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)
     print("  ✅ 报告模式无扫描器也不阻断")
@@ -279,7 +279,7 @@ def test_finding_structure():
             'openai_key = "sk-AbcDefGhiJklMnoPqrStuVwXyz"\n',
             encoding="utf-8",
         )
-        findings, _ = run_security_scan(tmp, "python", block_severity="none")
+        findings, _, _scan_details = run_security_scan(tmp, "python", block_severity="none")
         assert len(findings) >= 1
         f = findings[0]
         assert f.category == "secret", f"category 应为 secret, 实际: {f.category}"
@@ -305,7 +305,7 @@ def test_files_parameter_limits_scope():
         # 干净文件
         (Path(tmp) / "clean.py").write_text("x = 1\n", encoding="utf-8")
         # 只扫描 clean.py → 不应检出密钥
-        findings, _ = run_security_scan(tmp, "python", files=["clean.py"], block_severity="none")
+        findings, _, _scan_details = run_security_scan(tmp, "python", files=["clean.py"], block_severity="none")
         secret_findings = [f for f in findings if f.category == "secret"]
         assert len(secret_findings) == 0, f"只扫描 clean.py 不应检出密钥, 实际: {secret_findings}"
     print("  ✅ files 参数限制扫描范围有效")

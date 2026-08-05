@@ -258,13 +258,13 @@ def test_m8_ordinary_paths_are_left_byte_identical(tmp_path):
 _XH5_CASES = [
     ("npm 工程被误派 mvn", {"package.json": '{"name":"a"}', "tsconfig.json": "{}",
                             "src/app.ts": "export const x=1;"},
-     "mvn -q compile", ["src/app.ts"], "tsc --noEmit"),
+     "mvn -q -DskipTests compile", ["src/app.ts"], "tsc --noEmit"),
     ("go 工程被误派 npm", {"go.mod": "module x\n\ngo 1.22\n",
                            "main.go": "package main\nfunc main(){}"},
      "npm run build", ["main.go"], "go build ./..."),
     ("rust 工程被误派 mvn", {"Cargo.toml": "[package]\nname='x'\n",
                              "src/main.rs": "fn main(){}"},
-     "mvn -q compile", ["src/main.rs"], "cargo build -q"),
+     "mvn -q -DskipTests compile", ["src/main.rs"], "cargo build -q"),
 ]
 
 
@@ -411,10 +411,10 @@ _XH1_CASES = [
      ["lib/a.dart"], "dart analyze --no-fatal-warnings"),
     # 回归臂：JVM 基线逐字节不变
     ("regress-maven", {"pom.xml": "<project/>", "src/main/java/A.java": "class A{}"},
-     ["src/main/java/A.java"], "mvn -q compile"),
+     ["src/main/java/A.java"], "mvn -q -DskipTests compile"),
     ("regress-gradle", {"build.gradle": "plugins{id 'java'}", "gradlew": "#!/bin/sh",
                         "src/main/java/A.java": "class A{}"},
-     ["src/main/java/A.java"], "./gradlew -q classes"),
+     ["src/main/java/A.java"], "./gradlew -q classes 2>/dev/null || gradle -q classes"),
     ("regress-rust", {"Cargo.toml": "[package]", "src/main.rs": "fn main(){}"},
      ["src/main.rs"], "cargo build -q"),
 ]
@@ -608,7 +608,7 @@ def test_m3_both_probes_exclude_dependency_trees(tmp_path):
         assert lp._manifest_dir(names, str(root)) is None
 
 
-_M7_WRAPPED = ["cd sub && mvn -q compile", "sh -c 'mvn -q compile'",
+_M7_WRAPPED = ["cd sub && mvn -q compile", "sh -c 'mvn -q -DskipTests compile'",
                "bash -c \"dotnet build\"", "env FOO=1 mvn -q compile",
                "cd web && npm ci"]
 
@@ -764,7 +764,7 @@ def test_h3_build_cmd_applicable_shares_one_implementation(tmp_path):
     `pom.xml` 让它判适用 → 在根上跑 mvn → 127 → BLOCKED（本批要杀的死循环，漏了这一个调用点）。"""
     deep = _tree(tmp_path, {"a/b/c/d/e/f/g/pom.xml": "<project/>"})
     assert lp._manifest_present(("pom.xml",), str(deep)) is False
-    assert lp._build_cmd_applicable("mvn -q compile", str(deep)) is False, \
+    assert lp._build_cmd_applicable("mvn -q -DskipTests compile", str(deep)) is False, \
         "两处口径又分叉了（深度上限不一致）"
     nm = _tree(tmp_path / "nm", {"node_modules/x/Vendored.csproj": "<Project/>"})
     assert lp._build_cmd_applicable("dotnet build", str(nm)) is False, "依赖树里的清单算数了"
@@ -776,11 +776,11 @@ _MED_TOKENS = [
     ("cd mvn && npm ci", "npm"),
     ("cd dotnet && npm run build", "npm"),
     ("cd sub&&dotnet build", "dotnet"),
-    ("sh -c 'mvn -q compile'", "mvn"),
+    ("sh -c 'mvn -q -DskipTests compile'", "mvn"),
     ('bash -c "dotnet build"', "dotnet"),
     ("env FOO=1 mvn -q compile", "mvn"),
     ("sudo mvn -q compile", "mvn"),
-    ("mvn -q compile", "mvn"),
+    ("mvn -q -DskipTests compile", "mvn"),
 ]
 
 

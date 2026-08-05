@@ -55,4 +55,4 @@ def test_37_l1_derive_maven_java_unchanged():
     with patch.object(l1_pipeline, "_manifest_present", return_value=True):
         cmd = l1_pipeline._derive_full_build_command(
             "/tmp/x", ["mod/src/main/java/A.java"], {"build": "maven"})
-    assert cmd == "mvn -q compile", cmd
+    assert cmd == "mvn -q -DskipTests compile", cmd

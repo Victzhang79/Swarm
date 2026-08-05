@@ -418,25 +418,29 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
             # ⇒ 臆造版本原样烤进**权威 go.mod 模板**要 worker 原样写入 → `go mod download`
             # 整体失败连坐全模块。**规划期自己在猜坐标 = 正面违反血规 2**。
             _exp = explicit.strip()
-            if not _JUDGEABLE_VERSION.match(_exp) or _PSEUDO_ANY.search(_exp):
-                # ★P-C2 复核 R3★ `latest`/分支名/裸 SHA 在 go.mod 里是**语法错误**（go build
-                # 解析期全灭），与伪版本同性质（不可复现）但**不能**原样保留——保留等于把
-                # 解析错误烤进权威模板。治法：先尝试校正到可解析稳定版；校正不到 → 如实丢弃。
-                if _UNGO_MODDABLE_VERSION.match(_exp):
-                    _lv = proxy_latest_version(mod)
-                    if _lv:
-                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态"
-                                       "（latest/分支名/裸 SHA）→ 校正到可解析稳定版 %s",
-                                       mod, explicit, _lv)
-                        seen.add(mod)
-                        kept.append(ResolvedGoDep(module=mod, version=_lv, source="proxy",
-                                                  verified="verified"))
-                    else:
-                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态，"
-                                       "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"
-                                       "烤进权威 go.mod）", mod, explicit)
-                        dropped.append(str(raw).strip())
-                    continue
+            _is_judgeable = bool(_JUDGEABLE_VERSION.match(_exp))
+            _is_pseudo = bool(_PSEUDO_ANY.search(_exp))
+            # ★BRAIN-003★ 所有【非规范 semver 且非伪版本】的形态都写不进 go.mod：
+            # latest / 分支名（dev, release-1.2） / 裸 SHA / v1.2 等。
+            # 这些在 go.mod require 里是语法错误（go build 解析期全灭），必须校正或丢弃，
+            # 绝不能原样保留。此前枚举 `_UNGO_MODDABLE_VERSION` 只列了 latest/master/main/sha，
+            # 分支名漏网，被误当成伪版本原样保留。
+            if not _is_judgeable and not _is_pseudo:
+                _lv = proxy_latest_version(mod)
+                if _lv:
+                    logger.warning("[go-registry] P-C2-R3/BRAIN-003 %s@%s 是写不进 go.mod 的形态"
+                                   "（latest/分支名/裸 SHA/非规范 tag）→ 校正到可解析稳定版 %s",
+                                   mod, explicit, _lv)
+                    seen.add(mod)
+                    kept.append(ResolvedGoDep(module=mod, version=_lv, source="proxy",
+                                              verified="verified"))
+                else:
+                    logger.warning("[go-registry] P-C2-R3/BRAIN-003 %s@%s 是写不进 go.mod 的形态，"
+                                   "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"
+                                   "烤进权威 go.mod）", mod, explicit)
+                    dropped.append(str(raw).strip())
+                continue
+            if _is_pseudo:
                 # 伪版本（`v0.0.0-<ts>-<hash>`）：真实可用形态，判必然 404 → 误杀，原样保留。
                 # ★P-C2 复核 R2★ 伪版本无下游兜底（go 的 L1 dep-legality 仍无 driver——
                 # X-M10 后调用方已按 manifest 分派，go 触发 warn-once 零覆盖可辨），

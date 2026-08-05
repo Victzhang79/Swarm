@@ -74,7 +74,7 @@ def test_security_scan_fail_closed_no_scanner(monkeypatch, tmp_path):
     monkeypatch.setattr(ss.shutil, "which", lambda name: None)
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="critical")
     assert should_block is True, "无扫描器+阻断模式必须 fail-closed"
     assert any(f.rule_id.startswith("fail-closed-no-") for f in findings)
     # D4：全工具缺失时 sast+dep 两类哨兵各一条（secret 由内置正则兜底覆盖）
@@ -89,7 +89,7 @@ def test_security_scan_report_mode_never_blocks(monkeypatch, tmp_path):
     monkeypatch.setattr(ss.shutil, "which", lambda name: None)
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
     assert should_block is False
     assert not any(f.rule_id.startswith("fail-closed-no-") for f in findings)
     # A-P0-2 report-mode 可见性：必须有 INFO 级 coverage-zero 信号（"没扫"≠"干净"），但不阻断。
@@ -108,7 +108,7 @@ def test_security_scan_report_mode_with_scanner_no_coverage_signal(monkeypatch, 
     monkeypatch.setattr(ss, "_run_tool", lambda *a, **k: (0, '{"results": []}', ""))
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
 
-    findings, should_block = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
+    findings, should_block, _scan_details = ss.run_security_scan(str(tmp_path), "python", block_severity="none")
     assert should_block is False
     assert not any(f.rule_id == "scan-coverage-zero" for f in findings)
 
