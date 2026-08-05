@@ -1146,6 +1146,11 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         # 三条同为 last-write-wins 纯观测账，消费面同一处，语义都是"本轮规划期发生了什么降级"。
         "dep_ban_reconciled": state.get("dep_ban_reconciled") or {},
         "contract_symbol_paths_unhealed": state.get("contract_symbol_paths_unhealed") or [],
+        # ★BRAIN-007★ 以下两条观测账此前有写入无消费者，导致 elaborate/finish 的 base 引用
+        # 转换与 T4 布线歧义在 progress 端完全不可见。作为 last-write-wins 纯观测账在此透出，
+        # 空列表表示"无事件"（与键缺失区分），供三盯/审计/复盘消费。
+        "contract_symbols_base_referenced": state.get("contract_symbols_base_referenced") or [],
+        "t4_ambiguous_types": state.get("t4_ambiguous_types") or [],
     }
 
 

@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -2929,17 +2930,26 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
 # 60-120s 的 `grep -r … --include='*.java'` 大扫描（取证：同一沙箱 4000-符号 grep 重复 3×，
 # 纯烧预算）。按【源文件 size+mtime 签名】缓存：任一 .java/.kt/.scala 变动→签名变→自动失效重扫，
 # 无陈旧风险（不会拿过期符号表去改代码）。通用于任何 JVM 栈，无正确性 trade-off。
+# ★W-5★ GNU `stat -c` 在 macOS 失效 → 按平台选 BSD `stat -f`；无法取签名时安全兜底为空。
 _SCAN_CACHE: dict[tuple[str, str], tuple[str, tuple[int, str, str]]] = {}
 _SCAN_SIG_CMD = (
     "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
     "| xargs -0 stat -c '%n|%s|%Y' 2>/dev/null | sort | cksum"
 )
+_SCAN_SIG_CMD_DARWIN = (
+    "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
+    "| xargs -0 stat -f '%N|%z|%m' 2>/dev/null | sort | cksum"
+)
+
+
+def _scan_sig_command() -> str:
+    return _SCAN_SIG_CMD_DARWIN if sys.platform == "darwin" else _SCAN_SIG_CMD
 
 
 def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
     """带文件状态签名失效的 _run_check_split 包装，专给只读全树符号/包扫描省重复预算（A7）。"""
     try:
-        _sec, sig_out, _e = _run_check_split(_SCAN_SIG_CMD, project_path, timeout=min(timeout, 15))
+        _sec, sig_out, _e = _run_check_split(_scan_sig_command(), project_path, timeout=min(timeout, 15))
         sig = (sig_out or "").strip()
     except Exception:  # noqa: BLE001
         sig = ""  # 签名拿不到 → 不缓存，照常扫描（安全兜底，绝不返回可能陈旧的结果）
@@ -5281,7 +5291,8 @@ def _scope_maven_command(command: str, project_path: str, modified: list[str],
 _CD_MVN_RE = re.compile(r'^\s*cd\s+(?P<dir>[^\s&|;]+)\s*&&\s*(?P<rest>.*\bmvn\b.*)$', re.DOTALL)
 
 
-def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[str]) -> str:
+def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[str],
+                               details: dict | None = None) -> str:
     """R65E8-T1：L1.3.5 验收命令 reactor 归一——治"cd 子模块裸 mvn 假阴性烧正确代码"。
 
     死因（round65e8 终态坐实）：LLM 授的 acceptance_criteria 常写 `cd <module> && mvn <goal>`——cd 进
@@ -5316,7 +5327,8 @@ def _reactorize_verify_command(command: str, project_path: str, pl_basis: list[s
             command, project_path, pl_basis,
             VerifyIO(read_file=_read_project_file,
                      file_exists=_project_file_exists,
-                     anchor_for=_manifest_dir_for))
+                     anchor_for=_manifest_dir_for),
+            details=details)
     m = _CD_MVN_RE.match(command)
     if m is None:
         # 非规范形若仍含 cd（`;` 分隔 / 带空格引号目录 / env 前缀）→ _scope 不懂 cd 会 -pl 错配 cwd → 原样（MED2）
@@ -6636,7 +6648,7 @@ def run_l1_pipeline(
                 continue
             # R65E8-T1：验收命令 reactor 归一（与 build_cmd/test_cmd 对称）——治 `cd 子模块 && 裸 mvn`
             # 解析不到 reactor 兄弟的假阴性（round65e8 烧正确代码重试预算→abandon 连坐清盘死因）。
-            _vc_run = _reactorize_verify_command(vc, project_path, _pl_v)
+            _vc_run = _reactorize_verify_command(vc, project_path, _pl_v, details)
             v_ec, v_out = _run_l1_command(
                 _vc_run, project_path, timeout=_stage_timeout(timeout, deadline))
             ok = v_ec == 0

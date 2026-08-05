@@ -53,7 +53,22 @@ def _caller_is_admin(user) -> bool:
     return getattr(user, "global_role", None) == Role.ADMIN.value
 
 
-def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) -> dict[str, str]:
+def _require_config_admin(request: Request) -> tuple[str, Any]:
+    """F5：配置写入的 admin 权限统一谓词。
+
+    `reload_env_from_file` 等敏感端点此前分两次检查（_require_perm + _caller_is_admin），
+    容易在重构时只改一处导致权限漂移。统一为一个 helper，调用方只调用一次。
+    返回 (who, user) 供审计使用。
+    """
+    _user = _require_perm(request, "config:write")
+    if not _caller_is_admin(_user):
+        raise HTTPException(status_code=403, detail="仅 admin 可执行此配置操作")
+    _who = getattr(_user, "username", "?") if _user else "?"
+    return _who, _user
+
+
+def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str,
+                          rejected_out: list[str] | None = None) -> dict[str, str]:
     """B8-F2 单一 chokepoint：剔除非 admin 提交的出站端点键（fail-closed，铁律#3 降级留痕）。
 
     对抗复核 CRITICAL：F2 初版只在 update_config 的 /api/config 路径设闸，而
@@ -61,6 +76,9 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) 
     *_BASE_URL 键、零 admin 闸 → 全绕过（非 admin owner 提交 api_key=*** 保留真 key + base_url
     指向攻击者 host = provider key 钓鱼）。治本=把闸集中到本 helper，所有 env 写入路径
     （update_config 内联写 + _persist_env_updates 共享写）统一过它，杜绝"补一个漏一个"。
+
+    ★F2★ 值层拒绝的键经 `rejected_out` 回传调用方，使 JSON 内新增 base_url 等"键名分类器
+    漏过"的丢键也能在响应里显式列出，不伪装成"全部生效"。
     """
     if is_admin:
         return update_map
@@ -69,6 +87,8 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) 
         if _is_endpoint_redirect_key(k):
             _app.logger.warning(
                 "config:update 非 admin(%s) 尝试改写出站端点键 %s → 已拒绝（仅 admin 可改）", who, k)
+            if rejected_out is not None:
+                rejected_out.append(k)
             continue
         # ★值层 backstop（26 号文 S-1/S-2 治本）★
         # 原闸是【键名】分类器，而权威真相源把端点藏在【值】里：
@@ -93,6 +113,8 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str) 
             _app.logger.warning(
                 "config:update 非 admin(%s) 尝试经【值】引入新出站端点（键 %s 新增 %s）"
                 " → 已整键拒绝（仅 admin 可改）", who, k, sorted(_added_urls))
+            if rejected_out is not None:
+                rejected_out.append(k)
             continue
         out[k] = v
     return out
@@ -415,8 +437,10 @@ async def update_config(request: Request):
     # 同一 chokepoint），非 admin 提交的端点键剔除。对抗复核 HIGH：拒绝不能伪装成"无变更"，
     # 显式回 rejected_keys 让调用方知情（不回显敏感值，只列 key 名）。
     _rejected = [k for k in update_map if _is_endpoint_redirect_key(k)] if not _cfg_is_admin else []
-    update_map = _reject_endpoint_keys(update_map, _cfg_is_admin, _cfg_who)
-
+    _rejected_from_value: list[str] = []
+    update_map = _reject_endpoint_keys(update_map, _cfg_is_admin, _cfg_who, rejected_out=_rejected_from_value)
+    _rejected.extend(_rejected_from_value)
+    _rejected = sorted(set(_rejected))
     if not update_map:
         # 无有效变更 — 区分"全被安全闸拒绝"与"全是脱敏值/未改"两种语义。
         cfg = _app.get_config()
@@ -485,10 +509,13 @@ async def update_config(request: Request):
     # C1-C 复核 S4：本端点是"把任意 KEY=VALUE 写进 .env"的那个（最常被用来关闸），
     # 审计只接 _persist_env_updates 会让主力路径的变更查不到——比没有审计更危险，
     # 因为下一个人会以为查过了。_prev_env 是写盘前的旧值快照，正是 old→new 所需。
+    # ★F4★ 审计状态必须进响应，调用方能区分"成功记录"与"审计写入失败"。
+    _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
     try:
         from swarm.config.config_audit import record_config_changes
-        record_config_changes(_cfg_who, "put_config",
-                              {k: (_prev_env.get(k), v) for k, v in update_map.items()})
+        _audit_status = record_config_changes(
+            _cfg_who, "put_config",
+            {k: (_prev_env.get(k), v) for k, v in update_map.items()}) or _audit_status
     except Exception as _aexc:  # noqa: BLE001
         _app.logger.warning("[CONFIG-AUDIT] put_config 审计失败（变更已生效）: %s", _aexc)
     _app.configure_langsmith(reload=True)
@@ -507,6 +534,7 @@ async def update_config(request: Request):
         "status": "ok",
         "updated_keys": list(update_map.keys()),
         "rejected_keys": _rejected,  # B8-F2：被安全闸剔除的出站端点键（非 admin 时），调用方可见
+        "audit_status": _audit_status,
         "config": masked,
     }
 
@@ -585,8 +613,8 @@ async def update_routing(request: Request):
     # "补一个漏一个"绕过就是这么来的。路由键本身不是出站端点键（闸对其 no-op），
     # 但少一条旁路就少一处将来会漏的地方。
     _rt_is_admin = _caller_is_admin(_rt_user)
-    await asyncio.to_thread(_persist_env_updates, update_map,
-                            is_admin=_rt_is_admin, who=_rt_who)
+    _persist_res = await asyncio.to_thread(_persist_env_updates, update_map,
+                                           is_admin=_rt_is_admin, who=_rt_who)
     _app.logger.info("Config reloaded after routing update: %s", list(update_map))
 
     from swarm.models.router import ModelRouter
@@ -594,6 +622,7 @@ async def update_routing(request: Request):
     return {
         "status": "ok",
         "updated_keys": list(update_map.keys()),
+        "audit_status": _persist_res.get("audit_status"),
         **router.get_routing_table(),
     }
 
@@ -707,7 +736,7 @@ async def update_model_providers(request: Request):
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：持锁文件 IO + reload 卸线程
-    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_mp_is_admin, who=_mp_who)
+    _mp_persist_res = await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_mp_is_admin, who=_mp_who)
     try:
         from swarm.config import secret_store
         secret_store.invalidate_cache()
@@ -716,7 +745,12 @@ async def update_model_providers(request: Request):
     _app.logger.info("Updated model providers: %s", list(update_map.keys()))
 
     from swarm.models.router import ModelRouter
-    return {"status": "ok", "updated_keys": list(update_map.keys()), **ModelRouter().get_routing_table()}
+    return {
+        "status": "ok",
+        "updated_keys": list(update_map.keys()),
+        "audit_status": _mp_persist_res.get("audit_status"),
+        **ModelRouter().get_routing_table(),
+    }
 
 
 def _env_quote(v: str) -> str:
@@ -740,7 +774,7 @@ def _env_quote(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str) -> None:
+def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str) -> dict:
     """写 .env + 同步 os.environ + reload_config（供 model-providers/notify/kb 端点复用）。
 
     D3：reload 被生产安全门禁拒绝(RuntimeError)→ 原子回滚 .env + os.environ（原直接 reload
@@ -754,10 +788,13 @@ def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str
     端点写 .env 的单一 chokepoint，出站端点键的 admin 闸集中在此做 backstop（即便某 caller 忘了
     在端点层过滤，写入口也会 fail-closed 剔除）。必填参数强制每个（含未来新增）caller 显式表态调用者
     是否 admin，杜绝"补一个端点漏一个端点"的绕过。
+
+    返回 {"audit_status": {...}} 供调用方透传响应（F4：审计写入失败必须机读可辨）。
     """
     update_map = _reject_endpoint_keys(update_map, is_admin, "persist_env")
+    _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
     if not update_map:
-        return
+        return {"audit_status": _audit_status}
     env_path = _app._PROJECT_ROOT / ".env"
     # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与其它写者并发丢键）。
     with env_file_lock(env_path):
@@ -787,13 +824,15 @@ def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str
     # C1-C 审计：在【锁外】写（审计是旁路观测，不占 .env 锁；写失败也绝不回滚已生效的变更）。
     # prev_env 就是本次变更前的旧值快照，正是 old→new 所需——不必再读一次文件。
     # 只记真正变化的键（record_config_changes 内部再做一次 old!=new 差集，双保险）。
+    # ★F4★ 返回审计状态，让调用方在响应中透出。
     try:
         from swarm.config.config_audit import record_config_changes
-        record_config_changes(
+        _audit_status = record_config_changes(
             who, "persist_env",
-            {k: (prev_env.get(k), v) for k, v in update_map.items()})
+            {k: (prev_env.get(k), v) for k, v in update_map.items()}) or _audit_status
     except Exception as exc:  # noqa: BLE001 — 审计绝不阻断配置变更
         _app.logger.warning("[CONFIG-AUDIT] 记录失败（变更已生效）: %s", exc)
+    return {"audit_status": _audit_status}
 
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
@@ -947,7 +986,7 @@ async def update_kb_embed_rerank(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
 
-    await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin, who=_kb_who)  # D48：卸线程
+    _kb_persist_res = await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin, who=_kb_who)  # D48：卸线程
     try:
         secret_store.invalidate_cache()
     except Exception:  # noqa: BLE001
@@ -958,8 +997,13 @@ async def update_kb_embed_rerank(request: Request):
     new_embed_model = str(emb.get("model") or "") if emb else ""
     dim_changed = bool(new_embed_model and new_embed_model != old_embed_model)
     _app.logger.info("Updated kb embed/rerank: %s (dim_changed=%s)", list(update_map.keys()), dim_changed)
-    return {"status": "ok", "updated_keys": list(update_map.keys()), "embed_model_changed": dim_changed,
-            "reprocess_hint": "embedding 模型已变更，建议重新预处理所有项目以重建向量" if dim_changed else ""}
+    return {
+        "status": "ok",
+        "updated_keys": list(update_map.keys()),
+        "embed_model_changed": dim_changed,
+        "reprocess_hint": "embedding 模型已变更，建议重新预处理所有项目以重建向量" if dim_changed else "",
+        "audit_status": _kb_persist_res.get("audit_status"),
+    }
 
 
 # ─── 4.8 GET /api/model-providers/catalog ────────────────────
@@ -1049,9 +1093,13 @@ async def update_notify_channels(request: Request):
         raise HTTPException(
             status_code=403,
             detail="通知渠道含出站 webhook 变更，仅 admin 可改（配置未变更）")
-    await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin, who=_nc_who)
+    _nc_persist_res = await asyncio.to_thread(_persist_env_updates, {"SWARM_NOTIFY_CHANNELS": val}, is_admin=_nc_is_admin, who=_nc_who)
     _app.logger.info("Updated notify channels: %d 个", len(clean))
-    return {"status": "ok", "count": len(clean)}
+    return {
+        "status": "ok",
+        "count": len(clean),
+        "audit_status": _nc_persist_res.get("audit_status"),
+    }
 
 
 @router.post("/api/notify-channels/test", tags=["配置"])
@@ -1454,11 +1502,7 @@ async def reload_env_from_file(request: Request):
     的 admin 面。诚实边界：**它不能让 §C 类"import 时固化的模块常量"与"启动期构造的
     长寿对象"（checkpointer/连接池/uvicorn 监听）生效**，那些仍需重启——响应里如实列出。
     """
-    _require_perm(request, "config:write")
-    _user = getattr(request.state, "user", None)
-    if not _caller_is_admin(_user):
-        raise HTTPException(status_code=403, detail="仅 admin 可重载 .env（可让任意配置值生效）")
-    _who = getattr(_user, "username", "?") if _user else "?"
+    _who, _user = _require_config_admin(request)
 
     env_path = str(_app._PROJECT_ROOT / ".env")   # app 级符号统一走 _app.（见模块头注）
 
@@ -1475,6 +1519,7 @@ async def reload_env_from_file(request: Request):
         pairs = _dotenv_pairs(env_path)
         shadowed: list[str] = []
         applied: list[str] = []
+        applied_values: dict[str, str] = {}
         prev_env: dict[str, str | None] = {}
         for k, v in pairs.items():
             if not k.startswith("SWARM_"):
@@ -1489,6 +1534,7 @@ async def reload_env_from_file(request: Request):
             prev_env[k] = cur          # 快照必须在写之前取
             os.environ[k] = v
             applied.append(k)
+            applied_values[k] = v
             if cur is not None:
                 # 这正是"影子遮蔽"：文件已改、进程内仍是旧值
                 shadowed.append(k)
@@ -1515,7 +1561,7 @@ async def reload_env_from_file(request: Request):
                 else:
                     os.environ[_k] = _prev
             raise
-        return {"applied": applied, "shadowed": shadowed, "stale_shadow": stale_shadow}
+        return {"applied": applied, "applied_values": applied_values, "shadowed": shadowed, "stale_shadow": stale_shadow, "prev_env": prev_env}
 
     try:
         res = await asyncio.to_thread(_do_reload)
@@ -1551,10 +1597,20 @@ async def reload_env_from_file(request: Request):
             "需重启才能回落默认值）: %s", len(res["stale_shadow"]), res["stale_shadow"][:20])
     # C1-C 复核 S4：本端点能一次改掉进程内全部 SWARM_ 键，必须入审计（此前是唯一一个
     # 自己新增却不审计的写入点）。值取自文件，old 为进程内旧值。
+    # ★F1★ 审计须用 prev_env 真实旧值，并为 stale_shadow（.env 已删/注释但进程内仍保留）
+    # 记录 (old, None)，使变更方向可还原。
+    # ★F4★ 审计状态进响应，调用方能区分"成功记录"与"审计写入失败"。
+    _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
     try:
         from swarm.config.config_audit import record_config_changes
-        record_config_changes(_who, "config_reload",
-                              {k: (None, "(from .env)") for k in res["applied"]})
+        _applied_values = res.get("applied_values") or {}
+        _prev_env = res.get("prev_env") or {}
+        _audit_changes: dict[str, tuple[str | None, str | None]] = {
+            k: (_prev_env.get(k), _applied_values.get(k)) for k in res["applied"]
+        }
+        for k in res.get("stale_shadow", []):
+            _audit_changes[k] = (os.environ.get(k), None)
+        _audit_status = record_config_changes(_who, "config_reload", _audit_changes) or _audit_status
     except Exception as exc:  # noqa: BLE001
         _app.logger.warning("[CONFIG-AUDIT] reload 审计失败（变更已生效）: %s", exc)
 
@@ -1564,6 +1620,7 @@ async def reload_env_from_file(request: Request):
         "applied_count": len(res["applied"]),
         "shadowed_keys": res["shadowed"],
         "stale_shadow_keys": res.get("stale_shadow", []),
+        "audit_status": _audit_status,
         "note": (
             "已让 .env 的当前值在本进程生效。以下两类仍需重启："
             "① import 时固化的模块常量（连接池/SSE 队列上限/契约并发等）；"
@@ -1602,12 +1659,20 @@ async def set_env_credential(name: str, request: Request):
     await asyncio.to_thread(secret_store.set_secret, f"env:{key}", value)
     await asyncio.to_thread(secret_store.invalidate_cache, f"env:{key}")
     # 审计（值不入库，只记键名与 who）
+    # ★F4★ 审计状态进响应。
+    _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
     try:
         from swarm.config.config_audit import record_config_changes
-        record_config_changes(_who, "set_env_credential", {key: (None, "(stored in secret_store)")})
+        _audit_status = record_config_changes(
+            _who, "set_env_credential",
+            {key: (None, "(stored in secret_store)")}) or _audit_status
     except Exception as exc:  # noqa: BLE001
         _app.logger.warning("[CONFIG-AUDIT] set_env_credential 审计失败: %s", exc)
     _app.logger.warning("[SECRET-STORE] by=%s 写入凭据 env:%s（.env 明文如仍存在，验证生效后再清）",
                         _who, key)
-    return {"ok": True, "key": key,
-            "note": "已加密入库；resolve_credential 会优先读它。验证生效后可清 .env 明文。"}
+    return {
+        "ok": True,
+        "key": key,
+        "audit_status": _audit_status,
+        "note": "已加密入库；resolve_credential 会优先读它。验证生效后可清 .env 明文。",
+    }

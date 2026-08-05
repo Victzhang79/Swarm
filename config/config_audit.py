@@ -54,11 +54,15 @@ def mask_value(key: str, value: str | None) -> str | None:
 def record_config_changes(
     who: str, source: str, changes: dict[str, tuple[str | None, str]],
     conn_str: str | None = None,
-) -> int:
-    """记录一批配置变更；返回成功写入的条数。
+) -> dict:
+    """记录一批配置变更；返回结构化状态（F4：调用方须能区分"无变更"与"写入失败"）。
 
     changes: {key: (old_or_None, new)}。**只记真正发生变化的键**——调用方应先做差集，
     否则每次保存都会灌进一堆 old==new 的噪声行，把真正的变更淹掉。
+
+    返回值: {"written": int, "failed": bool, "degrade_key": str|None}
+      · failed=False → 成功写入 written 条；
+      · failed=True  → PG 不可用，已打 degrade 计数，written=0，degrade_key 机读可辨。
     """
     try:
         # 脱敏也在 try 内：审计的【任何一步】失败都不得阻断配置变更本身。
@@ -66,7 +70,7 @@ def record_config_changes(
         rows = [(who, source, k, mask_value(k, old), mask_value(k, new))
                 for k, (old, new) in (changes or {}).items() if old != new]
         if not rows:
-            return 0
+            return {"written": 0, "failed": False, "degrade_key": None}
 
         import psycopg
 
@@ -88,15 +92,17 @@ def record_config_changes(
                 )
         logger.info("[CONFIG-AUDIT] by=%s source=%s 记录 %d 条配置变更: %s",
                     who, source, len(rows), [r[2] for r in rows][:10])
-        return len(rows)
+        return {"written": len(rows), "failed": False, "degrade_key": None}
     except Exception as exc:  # noqa: BLE001 — 审计是旁路，绝不阻断配置变更本身
         # 降级必须可观测：审计静默失效 = 合规面全盲，而配置照改不误——只看日志谁也不会
-        # 发现"审计表已经三周没进过一行"。计数进 /api/metrics 的降级面。
+        # 发现"审计表已经三周没进过一行"。计数进 /api/metrics 的降级面；返回结构让调用方
+        # 能在响应中透出 audit_status。
+        _dg = "config.audit.write_failed"
         try:
             from swarm.infra.degrade import record_degrade
-            record_degrade("config.audit.write_failed")
+            record_degrade(_dg)
         except Exception:  # noqa: BLE001
             pass
         logger.warning("[CONFIG-AUDIT] 写审计失败（配置变更本身已生效，不回滚）by=%s source=%s: %s",
                        who, source, exc)
-        return 0
+        return {"written": 0, "failed": True, "degrade_key": _dg}

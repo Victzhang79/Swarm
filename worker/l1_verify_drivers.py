@@ -291,19 +291,26 @@ _VERIFY_DRIVERS: tuple = (
 
 
 def normalize_verify_command(command: str, project_path: str, pl_basis: list[str],
-                             io: VerifyIO) -> str:
+                             io: VerifyIO, details: dict | None = None) -> str:
     """非 Maven 验收命令归一入口：逐驱动试配，首个命中的改写胜出；全不适用 → 原样。
 
-    异常永不外抛（读文件/解析失败=「不确定」→ 原样），绝不炸 L1 主链。
+    异常永不外抛（读文件/解析失败=「不确定」→ 原样），绝不炸 L1 主链；但异常会写入
+    `details["verify_driver_exceptions"]`，使"驱动失效"与"驱动不适用"机读可辨（W-2）。
     """
     if not command:
         return command
     for driver in _VERIFY_DRIVERS:
         try:
             out = driver.try_normalize(command, project_path, pl_basis, io)
-        except Exception:  # noqa: BLE001 — 驱动内部故障=不确定 → 原样（fail-open 方向安全）
+        except Exception as exc:  # noqa: BLE001 — 驱动内部故障=不确定 → 原样（fail-open 方向安全）
             logger.warning("[L1.3.5] X-M1 驱动 %s 异常，命令原样放行: %r",
                            driver.name, command, exc_info=True)
+            if details is not None:
+                details.setdefault("verify_driver_exceptions", []).append({
+                    "driver": driver.name,
+                    "command": command,
+                    "exception": f"{type(exc).__name__}: {exc}",
+                })
             continue
         if out is not None:
             return out

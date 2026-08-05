@@ -264,7 +264,6 @@ def _detect_build_cmd_generic(project_path: str) -> str | None:
             "⇒ L2 拿不到整工程编译命令。请补表（M-1：本表是 L1/L2 共享的单一事实源）", key)
         return None
     return None
-    return None
 
 
 def _local_tool_available(build_cmd: str) -> bool:

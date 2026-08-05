@@ -11,9 +11,10 @@ def test_cached_scan_reuses_when_files_unchanged(monkeypatch):
     L._SCAN_CACHE.clear()
     calls = {"sig": 0, "scan": 0}
     sig = ["111 2222"]
+    sig_cmd = L._scan_sig_command()
 
     def fake_run(cmd, path, timeout=60):
-        if cmd == L._SCAN_SIG_CMD:
+        if cmd == sig_cmd:
             calls["sig"] += 1
             return (0, sig[0], "")
         calls["scan"] += 1
@@ -33,9 +34,10 @@ def test_cached_scan_reuses_when_files_unchanged(monkeypatch):
 def test_cached_scan_keyed_by_cmd_and_path(monkeypatch):
     L._SCAN_CACHE.clear()
     scans = []
+    sig_cmd = L._scan_sig_command()
 
     def fake_run(cmd, path, timeout=60):
-        if cmd == L._SCAN_SIG_CMD:
+        if cmd == sig_cmd:
             return (0, "samesig", "")
         scans.append((cmd, path))
         return (0, "o", "")
@@ -52,9 +54,10 @@ def test_cached_scan_no_cache_when_sig_unavailable(monkeypatch):
     """签名拿不到(空)→ 不缓存、每次照常扫描（安全兜底，绝不返回可能陈旧结果）。"""
     L._SCAN_CACHE.clear()
     calls = {"scan": 0}
+    sig_cmd = L._scan_sig_command()
 
     def fake_run(cmd, path, timeout=60):
-        if cmd == L._SCAN_SIG_CMD:
+        if cmd == sig_cmd:
             return (0, "", "")
         calls["scan"] += 1
         return (0, "x", "")

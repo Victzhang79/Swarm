@@ -454,25 +454,15 @@ def resolve_go_deps(specs: list[str], internal_modules: set[str] | None = None,
                                           verified="unjudgeable"))
                 continue
             _exists = proxy_version_exists(mod, explicit)
-            if _exists is False:
-                _latest = proxy_latest_version(mod)
-                if _latest:
-                    logger.warning("[go-registry] P-C2 %s@%s proxy 确证查无该版本（幻觉版本）"
-                                   " → 校正到 %s（LLM 声明非证据）", mod, explicit, _latest)
-                    seen.add(mod)
-                    kept.append(ResolvedGoDep(module=mod, version=_latest, source="proxy"))
-                else:
-                    logger.warning("[go-registry] P-C2 %s@%s proxy 确证查无且无可用版本 → 如实丢弃"
-                                   "（绝不逼 worker 臆造；调用方须同时从验收剔除）", mod, explicit)
-                    dropped.append(str(raw).strip())
-                continue
+            # ★BRAIN-004★ proxy_version_exists 非 True 即 None（False 档已取消：
+            # 不存在"proxy 确证查无"这一独立结论——那会被 404 吞成 None，按不可达 fail-open）。
             _unverified = _exists is None
             if _unverified:
                 # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。
-                # ★P-C2 复核 R2★ go 侧无下游兜底（go 的 L1 dep-legality 仍无 driver），止于 WARNING。
-                logger.warning("[go-registry] P-C2 %s@%s 未经证实（proxy 不可达）→ fail-open "
-                               "保留 LLM 主张（无下游兜底，止于 WARNING——npm/go 的 L1 "
-                               "dep-legality 是空转，见 27 号文 P-C2 R2）", mod, explicit)
+                # ★W-6★ go 的 L1 dep-legality driver 已落地，但 registry 不可达时
+                # 仍走 fail-open，此处 WARNING 保留作为 audit 痕迹。
+                logger.warning("[go-registry] P-C2 %s@%s 未经证实（proxy 不可达/404）→ fail-open "
+                               "保留 LLM 主张（证据缺失≠否定证据）", mod, explicit)
             seen.add(mod)
             kept.append(ResolvedGoDep(
                 module=mod, version=explicit, source="explicit",

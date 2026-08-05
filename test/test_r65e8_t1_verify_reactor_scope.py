@@ -143,3 +143,28 @@ def test_nested_module_path(tmp_path):
         "cd ruoyi-modules/ruoyi-x && mvn compile", proj,
         ["ruoyi-modules/ruoyi-x/src/main/java/X.java"])
     assert out.startswith("mvn -pl ruoyi-modules/ruoyi-x -am"), f"多级模块应归一，实得 {out!r}"
+
+
+# ── W-2：verify 驱动异常须落入 details，机读可辨 ───────────────────────────
+
+def test_verify_driver_exception_recorded_in_details(monkeypatch, tmp_path):
+    """驱动内部抛异常时，normalize_verify_command 应把异常写入 details 并原样返回命令。"""
+    from swarm.worker.l1_verify_drivers import VerifyIO, normalize_verify_command
+
+    class _BoomDriver:
+        name = "boom"
+        def try_normalize(self, *a, **k):
+            raise RuntimeError("intentional failure")
+
+    monkeypatch.setattr("swarm.worker.l1_verify_drivers._VERIFY_DRIVERS", (_BoomDriver(),))
+    details = {}
+    out = normalize_verify_command(
+        "npm test", str(tmp_path), [],
+        VerifyIO(read_file=lambda p, r: None, file_exists=lambda p, r: False,
+                 anchor_for=lambda *a, **k: None),
+        details=details)
+    assert out == "npm test", "驱动异常必须原样放行命令"
+    assert "verify_driver_exceptions" in details
+    assert len(details["verify_driver_exceptions"]) == 1
+    assert details["verify_driver_exceptions"][0]["driver"] == "boom"
+    assert "RuntimeError" in details["verify_driver_exceptions"][0]["exception"]

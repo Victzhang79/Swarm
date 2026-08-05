@@ -128,7 +128,7 @@ def test_audit_only_records_real_changes():
     # 无变化 → 一条都不写，且【不碰 DB】（连接失败也返回 0，证明根本没走到那步）
     n = config_audit.record_config_changes(
         "u1", "test", {"SWARM_A": ("same", "same")})
-    assert n == 0
+    assert n == {"written": 0, "failed": False, "degrade_key": None}
     calls["noop"] = True
     assert calls["noop"]
 
@@ -139,7 +139,8 @@ def test_audit_failure_never_blocks_config_change(monkeypatch):
     from swarm.config import config_audit
     monkeypatch.setattr(config_audit, "mask_value",
                         lambda k, v: (_ for _ in ()).throw(RuntimeError("boom")))
-    assert config_audit.record_config_changes("u", "s", {"K": (None, "v")}) == 0
+    assert config_audit.record_config_changes("u", "s", {"K": (None, "v")}) == {
+        "written": 0, "failed": True, "degrade_key": "config.audit.write_failed"}
 
 
 def test_persist_env_updates_requires_who():
@@ -279,7 +280,7 @@ async def test_reload_overwrites_environ_shadow(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_cfg, "_app", _App)
     monkeypatch.setattr("swarm.config.config_audit.record_config_changes",
-                        lambda *a, **k: 0)
+                        lambda *a, **k: {"written": 0, "failed": False, "degrade_key": None})
     try:
         res = await ep_call(_reload_endpoint(), req)
         assert _os.environ["SWARM_SHADOW_PROBE"] == "newval", "必须【覆盖】影子而非跳过"
@@ -318,7 +319,7 @@ async def test_reload_skips_runtime_owned_keys(monkeypatch, tmp_path):
             warning = info = staticmethod(lambda *a, **k: None)
 
     monkeypatch.setattr(_cfg, "_app", _App)
-    monkeypatch.setattr("swarm.config.config_audit.record_config_changes", lambda *a, **k: 0)
+    monkeypatch.setattr("swarm.config.config_audit.record_config_changes", lambda *a, **k: {"written": 0, "failed": False, "degrade_key": None})
     try:
         await ep_call(_reload_endpoint(), req)
         assert _os.environ["SWARM_WORKSPACE_ROOT"] == "/runtime/current/task", \
