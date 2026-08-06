@@ -189,6 +189,31 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             )
         return False, "runtime_smoke_failed: 运行时冒烟未通过（应用启动/探活失败，非 L2 编译失败）"
 
+    # ★#29 B-2★ skipped 里【prepare_failed 必须硬拦】——其余 skip 档照旧放行。
+    # 分档理由（血规 10③：共享 skipped 通道可以，后果语义不同就必须分档）：
+    #   · sandbox_unavailable / port_unresolved 等 = 「我们的探活基建没能观测到」
+    #     → 交付物本身可能完好 → 放行（硬拦会在 provider/沙箱抖动时 strand 全部交付）；
+    #   · prepare_failed = 「交付物【构建不出来】」→ 这份交付能不能跑【根本没被验证过】，
+    #     而且不是观测缺口而是产物缺席。无论归咎代码还是环境，都必须交人工。
+    # 原实现按 runtime_smoke_passed=None 一律放行，理由写"L2 已证编译通过，package 失败
+    # 大概率是插件/缓存/环境问题"——但 prepare 是 L2 编译闸的【严格超集】（STACK_SPEC 实测：
+    # maven `compile`→`package`、gradle `classes`→`bootJar`），差集含资源过滤、jar/war 装配、
+    # spring-boot repackage（要求可发现的 main class）、MANIFEST 生成。这些失败正是
+    # 「编译过但产物构建不出来」的真代码/配置缺陷，L2 结构上看不见 ⇒ 自动放行即假 DONE。
+    # ★刻意不做代码/环境归因★：那需要新造一张构建错误模式表（枚举完整性无权威来源，且
+    # classify_smoke_outcome 认的是【应用启动期】形态、对构建期错误实测全归 inconclusive，
+    # 接上去是死代码）。此处只用一个确定性事实——产物没构建出来——就足以拒绝自动放行。
+    if state.get("runtime_smoke_passed", None) is None:
+        _sk = state.get("runtime_smoke_details")
+        if isinstance(_sk, dict) and str(_sk.get("skip_reason") or "") == "prepare_failed":
+            return False, (
+                f"runtime_smoke_prepare_failed: 交付物构建命令失败"
+                f"(rc={_sk.get('prepare_rc')})，冒烟未起应用 —— 产物构建不出来，"
+                f"「这份交付能否运行」未经任何验证，交人工复核"
+                f"（prepare 是 L2 编译闸的严格超集，差集含资源过滤/产物装配/"
+                f"main class 解析，L2 通过不能替它背书）"
+            )
+
     # S2-6：acceptance 三态（镜像上方 runtime 三态先例，判序=runtime 之后、verification_failure
     # 兜底之前）：仅显式 False 阻断；None=跳过不算失败（all_manual/tool_missing 等 skipped
     # 已由 degraded_reasons 可观测，should_write_success 据 degraded 另拦 L6）；

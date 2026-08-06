@@ -398,23 +398,46 @@ async def adversarial_verify(state: BrainState) -> dict:
     # ── verdict 门：任一 reviewer 带 failure_scenario 判 FAIL → NAUGHTY；零合法 verdict → unreviewed ──
     naughty: dict[str, list[str]] = {}
     unreviewed: list[str] = []
+    # ★#29 B-3★ 无凭据 FAIL 计数 + 是否【有人真的判过 PASS】——判"能不能算通过"的单一事实源。
+    # 原判据用 `st.id not in reviewed_ids`（"有没有出现过任何 key"），无法区分：
+    #   ·"有 reviewer 明确判 PASS"（有正面证据 → 可通过）
+    #   ·"全员判 FAIL 但都没给 failure_scenario"（零正面证据 → 不可通过）
+    # 后者 critiques 为空、id 又在 reviewed_ids 里 ⇒ 既非 naughty 亦非 unreviewed ⇒ 落进
+    # passed 并领 verified token，`adversarial_verify_passed=True`、message 还写"复核均 PASS"。
+    # ＝【全票否决被记成全票通过】。Pre-Report gate 的设计意图是"FAIL 无凭据【不计 FAIL】"
+    # （防小模型无凭据乱 flag），绝不是"计 PASS"——不计 FAIL ≠ 计 PASS。
+    no_evidence_fail: dict[str, int] = {}
     for st, _wo in candidates:
         critiques: list[str] = []
+        _has_pass = False
+        _fail_no_ev = 0
         for vt in verdict_tables:
             v = vt.get(st.id)
             if v is None:
                 continue
             verdict, fs = v
-            if verdict == "FAIL":
+            if verdict == "PASS":
+                _has_pass = True
+            elif verdict == "FAIL":
                 if fs:  # Pre-Report gate：FAIL 必带 concrete failure_scenario 才计入
                     critiques.append(fs)
-                else:   # F4：FAIL 无凭据 → 降级不计，但记 info 可审计（防系统性漏检无迹可查）
+                else:   # F4：FAIL 无凭据 → 降级不计 FAIL，但记 info 可审计（防系统性漏检无迹可查）
+                    _fail_no_ev += 1
                     logger.info("[ADVERSARIAL] 子任务 %s 一 reviewer 判 FAIL 但无 failure_scenario"
                                 "——Pre-Report gate 降级不计", st.id)
         if critiques:
             naughty[st.id] = critiques
         elif st.id not in reviewed_ids:
             # F2：无任何 reviewer 给出合法 verdict → 该候选【未复核】，绝不当 PASS/verified 静默放行
+            unreviewed.append(st.id)
+        elif _fail_no_ev and not _has_pass:
+            # ★#29 B-3★ 收到过 FAIL（仅缺凭据）且【无任何 PASS】＝零正面证据。与"漏审"同一
+            # 认知状态（没人为它背书），故走同一通道：不计 passed、不发 verified token、记
+            # degraded 挡 L6 + 人工可见；但【不硬拦交付】——与本模块 incomplete_coverage /
+            # runtime_smoke skip 同哲学（无 concrete 凭据可回灌，打回也无从修，硬拦会 strand）。
+            # 只有一个 reviewer 判 PASS 时仍算通过（_has_pass=True）：那是 Pre-Report gate
+            # 刻意的 FP 控制（防无凭据乱 flag 掐死交付），本次不动。
+            no_evidence_fail[st.id] = _fail_no_ev
             unreviewed.append(st.id)
 
     # 只有【真拿到 PASS、既非 NAUGHTY 亦非 unreviewed】的候选才算通过、才绑内容 token 记 verified
@@ -428,9 +451,21 @@ async def adversarial_verify(state: BrainState) -> dict:
     if single_reviewer_degraded:
         degraded.append(single_reviewer_degraded)
     if unreviewed:
-        logger.warning("[ADVERSARIAL] %d 个候选无任何合法 verdict（reviewer 漏审）→ 不计 PASS、"
+        logger.warning("[ADVERSARIAL] %d 个候选无正面复核证据（漏审 或 全员无凭据 FAIL）→ 不计 PASS、"
                        "不入 verified，记 degraded（挡 L6 假学习）: %s", len(unreviewed), unreviewed)
         degraded.append("adversarial_verify_incomplete_coverage:" + ",".join(unreviewed[:10]))
+    # ★#29 B-3★ 两种"零正面证据"必须机读可辨（血规 10③：共享通道可以，后果语义不同就要分档）：
+    #   ·incomplete_coverage = reviewer 根本没发声（缺覆盖，无任何信号）
+    #   ·all_fail_no_evidence = reviewer 明确判 FAIL 只是没给 failure_scenario（有负面信号但
+    #     不可行动）——这是"复核者认为有问题"的真信号，复盘价值与前者完全不同，混成一条会让
+    #     "全票否决"在账面上长得跟"没人来审"一样。
+    if no_evidence_fail:
+        logger.error(
+            "[ADVERSARIAL] ⚠️ %d 个候选【全部发声的 reviewer 都判 FAIL 但无 failure_scenario】"
+            "且无任何 PASS → 零正面证据，绝不计通过（原实现会记成 PASS 并发 verified token）: %s",
+            len(no_evidence_fail), sorted(no_evidence_fail))
+        degraded.append("adversarial_verify_all_fail_no_evidence:"
+                        + ",".join(sorted(no_evidence_fail)[:10]))
 
     # ── 全 NICE：放行（都过才发）——unreviewed 不算 NAUGHTY（无负面证据），但已记 degraded 挡 L6 ──
     if not naughty:
@@ -443,7 +478,12 @@ async def adversarial_verify(state: BrainState) -> dict:
             "adversarial_verified_ids": new_verified,
             "adversarial_verify_message":
                 f"对抗验证通过：{len(passed)} 个子任务经 {len(verdict_tables)} 个独立 reviewer 复核均 PASS"
-                + (f"；{len(unreviewed)} 个 reviewer 漏审待下轮复核" if unreviewed else ""),
+                # #29 B-3：漏审与"全员无凭据 FAIL"分别如实措辞——后者原先被并入"复核均 PASS"计数，
+                # 人工在交付面上读到的是"全都过了"，与事实（全票否决）相反。
+                + (f"；{len(unreviewed) - len(no_evidence_fail)} 个 reviewer 漏审待下轮复核"
+                   if (len(unreviewed) - len(no_evidence_fail)) > 0 else "")
+                + (f"；{len(no_evidence_fail)} 个被判 FAIL 但未给出具体失败场景"
+                   f"（零正面证据，不计通过，待人工）" if no_evidence_fail else ""),
         }
         if degraded:
             out["degraded_reasons"] = degraded

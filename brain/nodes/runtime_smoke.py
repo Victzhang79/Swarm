@@ -1539,17 +1539,36 @@ async def run_runtime_smoke(
                 log_tail=parsed["log_tail"], details=_details)
     prepare_rc = parsed.get("prepare_rc")
     if prepare_rc is not None and prepare_rc != 0:
-        # F1：prepare（构建产物）失败——L2 已证编译通过，package 阶段失败大概率是
-        # 插件/缓存/环境问题 → skipped 不冤枉代码；details 带 prepare 日志尾可观测
-        logger.warning("[RUNTIME_SMOKE] prepare 命令失败(rc=%s)，冒烟未起应用 → skipped："
-                       "L2 已证编译过，package 失败按环境处理", prepare_rc)
+        # F1：prepare（构建产物）失败 → skipped（不冤枉代码、不谎称"启动失败"）。
+        # ★#29 B-2 归因纠正★ 原注释/文案称"大概率是插件/缓存/环境问题"、"按环境问题跳过"，
+        # 把【未知归因】说成了【已知是环境】。prepare 是 L2 编译闸的**严格超集**
+        # （STACK_SPEC 实测：maven `compile`→`package`、gradle `classes`→`bootJar`），
+        # 差集含资源过滤、jar/war 装配、spring-boot repackage（要求可发现的 main class）、
+        # MANIFEST 生成 —— 这些失败恰是"编译过但产物构建不出来"的真代码/配置缺陷，
+        # L2 结构上看不见，"L2 已证编译通过"不能替它背书。
+        # 故：status 维持 skipped，但归因如实写【未定】，并落机读键 artifact_build_failed；
+        # gates.can_auto_accept_delivery 据 skip_reason=prepare_failed **硬拦 auto_accept**
+        # 交人工（与 sandbox_unavailable/port_unresolved 分档：那些是【观测缺口】——交付物
+        # 可能完好；这个是【产物缺席】——交付能不能跑根本没被验证过）。
+        # ★刻意不做代码/环境归因★：那需要新造构建错误模式表（枚举完整性无权威来源），且
+        # classify_smoke_outcome 认的是【应用启动期】形态、对构建期错误实测全归 inconclusive
+        # （不在 _LOG_DERIVED_CLASSIFICATIONS 内）——接上去是死代码。一个确定性事实
+        # 「产物没构建出来」已足以拒绝自动放行，不需要猜是谁的错。
+        logger.error("[RUNTIME_SMOKE] ⚠️ prepare 命令失败(rc=%s)，冒烟未起应用 → skipped："
+                     "产物构建不出来，归因未定（prepare 是 L2 编译闸的严格超集，L2 通过"
+                     "不能替它背书）→ 硬拦 auto_accept 交人工", prepare_rc)
         return RuntimeSmokeResult(
             "skipped", "prepare_failed",
-            f"构建产物 prepare 命令失败(rc={prepare_rc})，未起应用："
-            "L2 已证编译通过，按环境问题跳过（不冤枉代码）",
+            f"构建产物 prepare 命令失败(rc={prepare_rc})，未起应用：产物构建不出来，"
+            "「这份交付能否运行」未经任何验证。归因未定（可能是代码/配置缺陷，也可能是"
+            "环境/插件问题）——L2 只证了编译，prepare 的差集（资源过滤/产物装配/"
+            "main class 解析）它看不见 → 交人工复核",
             log_tail=parsed["log_tail"],
             details={"ran": True, "prepare_rc": prepare_rc,
                      "prepare_log_tail": parsed["log_tail"],
+                     # 机读键：供复盘区分"产物缺席"与"观测缺口"（gates 判据用 skip_reason，
+                     # 本键是给人/复盘工具的显式语义，两者同源于本分支）
+                     "artifact_build_failed": True,
                      "timeout_sec": window})
 
     res = classify_smoke_outcome(

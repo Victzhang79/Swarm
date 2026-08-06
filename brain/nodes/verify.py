@@ -34,6 +34,47 @@ from swarm.types import Complexity, TaskIntent, WorkerOutput
 logger = logging.getLogger(__name__)
 
 
+def _l2_produced_expected_shape(
+    merged_diff: str, plan_obj, subtask_results: dict,
+) -> bool:
+    """交付产出形态是否符合 plan 预期（L2 的"有没有东西可验"判据·单一事实源）。
+
+    判据（与 dispatch D01 `_subtask_produced_expected` 同口径）：
+      ① 全局 merged_diff 有新增 / 有删除 / 计划全 AUDIT（空 diff 是 AUDIT 的合法形态）；
+      ② 且【逐子任务】独立满足 _subtask_produced_expected（按各自 intent/scope 判）——
+         ①是 scope-blind 的全局嗅探，单靠它会让"一个 MODIFY 空产出 + 一个纯删除兄弟"
+         凑出合法外观（#74 复核整改实证）。
+
+    ★#29 B-1：本函数是从 SIMPLE 快速路径原地抽出的（行为逐字不变，有相等锁测试），
+    目的是让【非 SIMPLE 路径的空 diff 分支】复用同一判据★。原先该判据只接在 SIMPLE 臂上：
+    非 SIMPLE + 空 merged_diff 时，四道确定性闸（:191 编译未核验留痕 / :196 编译+契约 /
+    :481 沙箱·本地功能测试 / :515 无测试命令放行）全部以 `(merged_diff or "").strip()`
+    为前置条件 ⇒ 一个都不跑，直落 `_verify_l2_via_llm` 让大模型对着【空 diff】表决，
+    且不置任何 degraded ⇒ verification_coverage 报 'passed'（而非 'passed:unverified'）、
+    gates.can_auto_accept_delivery 全程不看 merged_diff ⇒ 空产出被 auto_accept 放行并
+    被 L6 学成成功模式。＝完整的假 DONE 通道。
+    """
+    merged = (merged_diff or "").strip()
+    _all_audit = bool(plan_obj and getattr(plan_obj, "subtasks", None)
+                      and all(getattr(t, "intent", None) == TaskIntent.AUDIT
+                              for t in plan_obj.subtasks))
+    ok = _diff_has_changes(merged) or _diff_has_deletions(merged) or _all_audit
+    if subtask_results:
+        _by_id = {t.id: t for t in (getattr(plan_obj, "subtasks", None) or [])}
+
+        def _ok(sid, o) -> bool:
+            _lp = ((isinstance(o, WorkerOutput) and o.l1_passed)
+                   # #5：dict 结果缺 l1_passed 时保守判 False（默认 True 会把"未验证"当通过）。
+                   or (isinstance(o, dict) and o.get("l1_passed", False)))
+            if not _lp:
+                return False
+            _st = _by_id.get(sid)
+            return True if _st is None else _subtask_produced_expected(o, _st)
+
+        ok = ok and all(_ok(sid, o) for sid, o in subtask_results.items())
+    return ok
+
+
 def _l2_fp_advance(hist: list | None, fp: str, limit: int = 3) -> tuple[list[str], bool]:
     """R46-3：L2 契约失败指纹连击推进 → (新历史, 是否达连击上限)。
 
@@ -106,9 +147,11 @@ async def verify_l2(state: BrainState) -> dict:
         # payload）谎称"验过"。分档值 passed:unverified，与 unsupported_stack 族
         # 同通道（观测账，不新造硬闸——这三族本来也不硬拦 auto_accept）。
         _deg = [str(d) for d in (result.get("degraded_reasons") or [])]
+        # #29 B-1：l2_empty_diff_unverified 同族——空 diff（合法全 AUDIT）放行时零确定性
+        # 验证跑过，账值必须是 passed:unverified 而非 passed。
         _cell = ("passed:unverified" if any(d.startswith(
             ("l2_no_test_executed", "l2_test_downgraded_to_llm",
-             "l2_compile_unverified")) for d in _deg) else "passed")
+             "l2_compile_unverified", "l2_empty_diff_unverified")) for d in _deg) else "passed")
     elif result.get("l2_passed") is False:
         _cell = "failed"
     else:
@@ -135,39 +178,39 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先
     if complexity == Complexity.SIMPLE:
-        merged = (merged_diff or "").strip()
-        # #74 DR-02-F1 治本：SIMPLE L2 判据与 dispatch D01（_subtask_produced_expected）同口径——
-        # 纯删除 diff（只有 - 行 + +++ /dev/null）与全 AUDIT 计划（结构化审计、空 diff 合法）都是
-        # 合法产出形态。旧判据只认 _diff_has_changes（+ 行）→ 纯删除/AUDIT SIMPLE 任务结构性假失败
-        # → _l2_failure_state → replan 循环 → escalate（FAILED/PARTIAL）。单一事实源=产出形态是否
-        # 符合 intent/scope 预期，非"有无 + 行"。l1_passed 的 and 兜底仍在（AUDIT 有效性由它表达）。
-        _all_audit = bool(plan_obj and getattr(plan_obj, "subtasks", None)
-                          and all(getattr(t, "intent", None) == TaskIntent.AUDIT
-                                  for t in plan_obj.subtasks))
-        l2_passed = _diff_has_changes(merged) or _diff_has_deletions(merged) or _all_audit
-        if subtask_results:
-            # #74 复核整改（对抗双复核 CONFIRMED）：真正与 D01 同口径=【每个子任务】独立满足
-            # _subtask_produced_expected（按其 intent/scope 判产出形态），不只全局 merged diff 形状。
-            # 否则多子任务 SIMPLE 计划里一个 MODIFY 子任务静默空产出（empty diff, l1_passed=True）＋一个
-            # 纯删除兄弟贡献 - 行 → merged 只有删除段 → _diff_has_deletions 误判 l2_passed=True（空产出
-            # 假 DONE 换马甲）。_diff_has_deletions 是 scope-blind 的全局嗅探，必须叠加逐子任务 produced
-            # _expected 兜底。按 sid 取 subtask 逐个核（dict/WorkerOutput 均支持，见 shared 整改）。
-            _by_id = {t.id: t for t in (getattr(plan_obj, "subtasks", None) or [])}
-
-            def _ok(sid, o) -> bool:
-                _lp = ((isinstance(o, WorkerOutput) and o.l1_passed)
-                       # #5：dict 结果缺 l1_passed 时保守判 False（默认 True 会把"未验证"当通过）。
-                       or (isinstance(o, dict) and o.get("l1_passed", False)))
-                if not _lp:
-                    return False
-                _st = _by_id.get(sid)
-                return True if _st is None else _subtask_produced_expected(o, _st)
-
-            l2_passed = l2_passed and all(_ok(sid, o) for sid, o in subtask_results.items())
+        # #74 DR-02-F1 治本：SIMPLE L2 判据与 dispatch D01（_subtask_produced_expected）同口径。
+        # 判据本体已抽到 _l2_produced_expected_shape（#29 B-1：非 SIMPLE 空 diff 分支复用同一
+        # 事实源），行为逐字不变，有相等锁测试防抽取漂移。
+        l2_passed = _l2_produced_expected_shape(merged_diff, plan_obj, subtask_results)
         logger.info("[VERIFY_L2] SIMPLE 快速路径 — diff+L1 检查: %s", "通过" if l2_passed else "未通过")
         if not l2_passed:
             return _l2_failure_state(subtask_results)
         return {"l2_passed": l2_passed}
+
+    # ★#29 B-1 治本：非 SIMPLE 路径的【空 merged_diff】必须在此定案，绝不落 LLM★
+    # 下方四道确定性闸全部以 `(merged_diff or "").strip()` 为前置（:207 编译未核验留痕 /
+    # :212 编译+契约 / :497 沙箱·本地功能测试 / :531 无测试命令放行）⇒ 空 diff 时一个都不跑，
+    # 直落 `_verify_l2_via_llm` 让大模型对着空 diff 表决，且不置任何 degraded ⇒
+    # verification_coverage 报 'passed'（非 'passed:unverified'）、gates.can_auto_accept_delivery
+    # 全程不看 merged_diff ⇒ 空产出被 auto_accept 放行、被 L6 学成成功模式。
+    # SIMPLE 臂本就有这道判据（#74 DR-02-F1），只是【没接到非 SIMPLE 臂】——血规 10① 实例：
+    # 机制造对了却只接一个调用点。此处复用同一事实源 _l2_produced_expected_shape，不新造判据。
+    if not (merged_diff or "").strip():
+        _shape_ok = _l2_produced_expected_shape(merged_diff, plan_obj, subtask_results)
+        if not _shape_ok:
+            logger.error(
+                "[VERIFY_L2] ⚠️ 空 merged_diff 且产出形态不符 plan 预期（非全 AUDIT / 有子任务"
+                "零产出）→ fail-closed 判失败，绝不交 LLM 对空 diff 表决（complexity=%s，"
+                "子任务=%d）", getattr(complexity, "value", complexity), len(subtask_results or {}))
+            return _l2_failure_state(subtask_results)
+        # 合法空 diff（全 AUDIT 计划：结构化审计产报告不产 diff，有效性由 l1_passed 表达）。
+        # 放行，但【没有任何确定性验证跑过】必须机读可辨——否则"扫过=干净"的假象会让
+        # 未验证交付被 coverage 报成 passed（血规 10④：空返回/缺席必须机读可辨）。
+        # 前缀已接进 verify_l2 薄包装的 passed:unverified 分类器 + L6 阻断集（非信息性白名单）。
+        logger.warning(
+            "[VERIFY_L2] 空 merged_diff 但产出形态合法（全 AUDIT）→ 放行；本轮【零确定性验证】"
+            "（编译/契约/功能测试全部无标的）→ degraded 留痕 l2_empty_diff_unverified")
+        return {"l2_passed": True, "degraded_reasons": ["l2_empty_diff_unverified"]}
 
     acceptance_criteria: list[str] = []
     if plan_obj:

@@ -1024,6 +1024,39 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], Severity]] = [
 ]
 
 
+def _strongest_secret_match(
+    line: str,
+) -> tuple[str, Severity, "re.Match[str]"] | None:
+    """扫【全表】取 severity 最高的命中（并列取表内最先）；无命中 → None。
+
+    ★#29 C-1 治本：绝不依赖 _SECRET_PATTERNS 的表内顺序★
+    本表按【来源批次】组织（ECC §A 移植 → DR-05-F5 分级裁定 → 26 号文 S-6 召回补齐），
+    每批上方有成段注释解释该批判据，故 HIGH 档的通用规则（#16 Generic Secret Assignment /
+    #24 Unquoted secret assignment）排在 CRITICAL 档的 provider token（#17-22 / #25）**之前**。
+    原实现两处 `break` 于首个匹配、注释却自称"最强匹配"——表没排序，首个 ≠ 最强。实测
+    `api_key = "sk-proj-…"`（带引号是 YAML/JSON/Java 主流写法）被 Generic Secret Assignment
+    遮蔽成 HIGH → should_block=False → MERGE 交付闸走"仅留痕不阻断"分支放行真 provider key。
+
+    取 max 而非"把表排序"：排序把正确性寄托在后来人 append 时摆对位置（且会打乱批次注释），
+    而本函数是**顺序无关**的——未来任何 append 都不可能重新引入该缺陷。
+    并列取最先＝保留同档内"具体规则优先于通用规则"的既有语义。
+
+    ★不改 severity 分级本身★：DR-05-F5(#85) 对抗双复核裁定的 CRITICAL=block / HIGH=warn
+    是【刻意的 FP 控制设计】（RuoYi 基线 `CSRF_TOKEN = "csrf_token"` 冤杀实证），本函数只
+    修"CRITICAL 被 HIGH 遮蔽"，不动任何 pattern 的档位。
+    """
+    best: tuple[str, Severity, re.Match[str]] | None = None
+    best_rank = -1
+    for label, pattern, sev in _SECRET_PATTERNS:
+        m = pattern.search(line)
+        if not m:
+            continue
+        rank = _SEVERITY_ORDER.get(sev, 0)
+        if rank > best_rank:
+            best, best_rank = (label, sev, m), rank
+    return best
+
+
 def scan_text_for_secrets(
     text: str, *, min_severity: str | None = None,
 ) -> list[tuple[str, str]]:
@@ -1130,23 +1163,24 @@ def scan_diff_for_secrets(
             continue
         if raw.startswith("+"):
             content = raw[1:]
-            for label, pattern, sev in _SECRET_PATTERNS:
-                m = pattern.search(content)
-                if m:
-                    findings.append(SecurityFinding(
-                        severity=sev,
-                        category="secret",
-                        rule_id=f"builtin-secret-{label.lower().replace(' ', '-')}",
-                        title=f"Potential {label} in delivery diff (redacted: {_redact_secret(m.group(0))})",
-                        file=current_file,
-                        line=new_line_no,
-                        tool="builtin-regex-diff",
-                        recommendation=(
-                            "Remove the hardcoded secret from the delivery, rotate it, "
-                            "and load it from an environment variable / secrets manager"
-                        ),
-                    ))
-                    break  # 一行只报一个最强匹配
+            # 一行只报一个最强匹配（#29 C-1：原 `break` 于首个匹配，而表非按 severity 排序
+            # ⇒ 真 provider key 被 HIGH 档通用规则遮蔽 → should_block=False 放行）
+            hit = _strongest_secret_match(content)
+            if hit:
+                label, sev, m = hit
+                findings.append(SecurityFinding(
+                    severity=sev,
+                    category="secret",
+                    rule_id=f"builtin-secret-{label.lower().replace(' ', '-')}",
+                    title=f"Potential {label} in delivery diff (redacted: {_redact_secret(m.group(0))})",
+                    file=current_file,
+                    line=new_line_no,
+                    tool="builtin-regex-diff",
+                    recommendation=(
+                        "Remove the hardcoded secret from the delivery, rotate it, "
+                        "and load it from an environment variable / secrets manager"
+                    ),
+                ))
             new_line_no += 1
         elif raw.startswith("-"):
             # 删除行：不计入新文件行号、不扫描
@@ -1331,19 +1365,20 @@ def _secret_builtin_regex(
             continue
 
         for line_no, line in enumerate(content.splitlines(), start=1):
-            for label, pattern, sev in _SECRET_PATTERNS:
-                if pattern.search(line):
-                    # 避免同一行同一模式重复报告
-                    findings.append(SecurityFinding(
-                        severity=sev,
-                        category="secret",
-                        rule_id=f"builtin-secret-{label.lower().replace(' ', '-')}",
-                        title=f"Potential {label} detected",
-                        file=str(fpath.relative_to(root)) if fpath.is_relative_to(root) else str(fpath),
-                        line=line_no,
-                        tool="builtin-regex",
-                        recommendation="Verify and rotate the exposed secret if valid",
-                    ))
-                    break  # 一行只报一个最强匹配
+            # 一行只报一个最强匹配（#29 C-1：与 scan_diff_for_secrets 同源修复——原两处
+            # 各自 `break` 于首个匹配，档位取决于表内顺序而非严重度）
+            hit = _strongest_secret_match(line)
+            if hit:
+                label, sev, _m = hit
+                findings.append(SecurityFinding(
+                    severity=sev,
+                    category="secret",
+                    rule_id=f"builtin-secret-{label.lower().replace(' ', '-')}",
+                    title=f"Potential {label} detected",
+                    file=str(fpath.relative_to(root)) if fpath.is_relative_to(root) else str(fpath),
+                    line=line_no,
+                    tool="builtin-regex",
+                    recommendation="Verify and rotate the exposed secret if valid",
+                ))
 
     return findings
