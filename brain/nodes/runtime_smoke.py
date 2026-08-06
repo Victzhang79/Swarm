@@ -1431,6 +1431,57 @@ async def run_runtime_smoke(
     accept_output = "\n".join(
         ln for ln in out.splitlines() if ACCEPT_MARK_TOKEN in ln)
 
+    prepare_rc = parsed.get("prepare_rc")
+    if prepare_rc is not None and prepare_rc != 0:
+        # ★#29-1R F1 判序上移（对抗双复核两只透镜独立指向的同一处 fail-open）★
+        # 本分支【必须】排在 probe_tool_missing / not_executed / port_busy 之前。原判序把它
+        # 放在端口反解之后，于是「prepare 失败」这个事实在两条早退路径上**已 parse 出来却被丢弃**：
+        #   ① probe_tool_missing 抢答：脚本里探活工具探测/回显在 prepare 之前（见 _build_script
+        #      的 PROBE_TOOL 段 vs {prepare_block} 插入位），缺 curl//dev/tcp/python3 的镜像会
+        #      同时回显 PROBE_TOOL_MISSING 与 PREPARE_RC。原判序先答 probe_tool_missing，
+        #      details 里【完全没有 prepare_rc】→ 下游 gate 拿不到事实 → 自动放行；
+        #   ② envd 断流导致 stdout 截断在 MARK_DONE 之前 → not_executed，prepare_rc 同样丢。
+        # 判序正确性（不是"随手提前"）：prepare 失败 ⇒ 产物不存在 ⇒ 应用【根本没被启动】，
+        # 此时"有没有探活工具""端口是否被占""脚本有没有跑完"全都无关——它们描述的是
+        # 【观测通道】，而这里缺的是【被观测对象】。故产物缺席在归因上严格支配观测缺口。
+        # 与 port_busy 互斥（脚本里 port_busy 早退在 prepare 之前，busy 时 prepare 不跑 → rc=None），
+        # 上移不改变 port_busy 语义。
+        #
+        # ★#29 B-2 归因纠正（本批已改，此处保留）★ 原文案称"大概率是插件/缓存/环境问题"、
+        # "按环境问题跳过"，把【未知归因】说成了【已知是环境】。prepare 是 L2 编译闸的**严格超集**
+        # （STACK_SPEC 实测：maven `compile`→`package`、gradle `classes`→`bootJar`），
+        # 差集含资源过滤、jar/war 装配、spring-boot repackage（要求可发现的 main class）、
+        # MANIFEST 生成 —— 这些失败恰是"编译过但产物构建不出来"的真代码/配置缺陷，
+        # L2 结构上看不见，"L2 已证编译通过"不能替它背书。
+        # 故：status 维持 skipped（不冤枉代码判"启动失败"），但归因如实写【未定】；
+        # gates.can_auto_accept_delivery 据 details.prepare_rc≠0 这个**事实**硬拦 auto_accept
+        # （与 sandbox_unavailable/port_unresolved 分档：那些是【观测缺口】——交付物可能完好；
+        # 这个是【产物缺席】——交付能不能跑根本没被验证过）。
+        # ★刻意不做代码/环境归因★：那需要新造构建错误模式表（枚举完整性无权威来源），且
+        # classify_smoke_outcome 认的是【应用启动期】形态、对构建期错误实测全归 inconclusive
+        # （不在 _LOG_DERIVED_CLASSIFICATIONS 内）——接上去是死代码。一个确定性事实
+        # 「产物没构建出来」已足以拒绝自动放行，不需要猜是谁的错。
+        # ★不再写 artifact_build_failed★（#29-1R F2）：它与 skip_reason=prepare_failed、
+        # prepare_rc 同生同死于本分支，是【同一事实的第三个标签】，零信息增量且全仓无消费者。
+        # F1 的根因正是"同一事实多标签、下游认标签"——再加一个标签是复发而非治疗。
+        logger.error("[RUNTIME_SMOKE] ⚠️ prepare 命令失败(rc=%s)，冒烟未起应用 → skipped："
+                     "产物构建不出来，归因未定（prepare 是 L2 编译闸的严格超集，L2 通过"
+                     "不能替它背书）→ 硬拦 auto_accept", prepare_rc)
+        return RuntimeSmokeResult(
+            "skipped", "prepare_failed",
+            f"构建产物 prepare 命令失败(rc={prepare_rc})，未起应用：产物构建不出来，"
+            "「这份交付能否运行」未经任何验证。归因未定（可能是代码/配置缺陷，也可能是"
+            "环境/插件问题）——L2 只证了编译，prepare 的差集（资源过滤/产物装配/"
+            "main class 解析）它看不见 → 拒绝自动放行",
+            log_tail=parsed["log_tail"],
+            details={"ran": True, "prepare_rc": prepare_rc,
+                     "prepare_log_tail": parsed["log_tail"],
+                     # 判序上移后这两个键仍如实反映观测通道状态（诊断用），
+                     # 但归因已由 skip_reason 定为 prepare_failed
+                     "probe_tool": parsed["probe_tool"],
+                     "done": parsed["done"],
+                     "timeout_sec": window})
+
     if parsed["probe_tool_missing"]:
         return RuntimeSmokeResult(
             "skipped", "probe_tool_missing",
@@ -1537,40 +1588,6 @@ async def run_runtime_smoke(
                 f"端口推导不出且反解未得唯一端口（{_pr}）：{_detail}——未探活，"
                 "按环境/推导缺口跳过（fail-closed，绝不把'我们没探'判成启动失败）",
                 log_tail=parsed["log_tail"], details=_details)
-    prepare_rc = parsed.get("prepare_rc")
-    if prepare_rc is not None and prepare_rc != 0:
-        # F1：prepare（构建产物）失败 → skipped（不冤枉代码、不谎称"启动失败"）。
-        # ★#29 B-2 归因纠正★ 原注释/文案称"大概率是插件/缓存/环境问题"、"按环境问题跳过"，
-        # 把【未知归因】说成了【已知是环境】。prepare 是 L2 编译闸的**严格超集**
-        # （STACK_SPEC 实测：maven `compile`→`package`、gradle `classes`→`bootJar`），
-        # 差集含资源过滤、jar/war 装配、spring-boot repackage（要求可发现的 main class）、
-        # MANIFEST 生成 —— 这些失败恰是"编译过但产物构建不出来"的真代码/配置缺陷，
-        # L2 结构上看不见，"L2 已证编译通过"不能替它背书。
-        # 故：status 维持 skipped，但归因如实写【未定】，并落机读键 artifact_build_failed；
-        # gates.can_auto_accept_delivery 据 skip_reason=prepare_failed **硬拦 auto_accept**
-        # 交人工（与 sandbox_unavailable/port_unresolved 分档：那些是【观测缺口】——交付物
-        # 可能完好；这个是【产物缺席】——交付能不能跑根本没被验证过）。
-        # ★刻意不做代码/环境归因★：那需要新造构建错误模式表（枚举完整性无权威来源），且
-        # classify_smoke_outcome 认的是【应用启动期】形态、对构建期错误实测全归 inconclusive
-        # （不在 _LOG_DERIVED_CLASSIFICATIONS 内）——接上去是死代码。一个确定性事实
-        # 「产物没构建出来」已足以拒绝自动放行，不需要猜是谁的错。
-        logger.error("[RUNTIME_SMOKE] ⚠️ prepare 命令失败(rc=%s)，冒烟未起应用 → skipped："
-                     "产物构建不出来，归因未定（prepare 是 L2 编译闸的严格超集，L2 通过"
-                     "不能替它背书）→ 硬拦 auto_accept 交人工", prepare_rc)
-        return RuntimeSmokeResult(
-            "skipped", "prepare_failed",
-            f"构建产物 prepare 命令失败(rc={prepare_rc})，未起应用：产物构建不出来，"
-            "「这份交付能否运行」未经任何验证。归因未定（可能是代码/配置缺陷，也可能是"
-            "环境/插件问题）——L2 只证了编译，prepare 的差集（资源过滤/产物装配/"
-            "main class 解析）它看不见 → 交人工复核",
-            log_tail=parsed["log_tail"],
-            details={"ran": True, "prepare_rc": prepare_rc,
-                     "prepare_log_tail": parsed["log_tail"],
-                     # 机读键：供复盘区分"产物缺席"与"观测缺口"（gates 判据用 skip_reason，
-                     # 本键是给人/复盘工具的显式语义，两者同源于本分支）
-                     "artifact_build_failed": True,
-                     "timeout_sec": window})
-
     res = classify_smoke_outcome(
         parsed["app_rc"], parsed["log_tail"], parsed["probe_sequence"],
         language_key=language_key, project_symbols=project_symbols,

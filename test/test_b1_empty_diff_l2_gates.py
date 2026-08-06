@@ -154,13 +154,22 @@ def test_empty_diff_skips_every_deterministic_gate_so_must_not_pass(
 
     这条把"哪道闸跑了"与"敢不敢报 passed"绑在一起 —— 是本 finding 的本质：
     零确定性证据的放行必须至少是 passed:unverified。
+
+    ★#29-1R★ 原写法是 `if spy.deterministic == 0 and l2_passed is True: assert ...`
+    ——修复后本夹具 l2_passed 恒为 False ⇒ 分支永不进入 ⇒ **断言一次都没跑过**
+    （我自己写的 vacuous 绿，reviewer 逮到）。改成无条件断言：先锁前提真的成立
+    （确定性闸确实 0 次），再断"passed 与零证据不可共存"这个不变量。
     """
     plan = _Plan(_Sub("st-1"))
     out, spy = _run_l2(monkeypatch, diff="", complexity=complexity, plan=plan)
     cell = (out.get("verification_coverage") or {}).get("l2")
-    if spy.deterministic == 0 and out.get("l2_passed") is True:
-        assert cell != "passed", (
-            "零确定性验证却报 coverage='passed' —— 谎称验过")
+    # 前提自证：空 diff 下确定性闸确实一次没跑（否则本测试测的不是它以为的场景）
+    assert spy.deterministic == 0, (
+        f"前提不成立：空 diff 却跑了 {spy.deterministic} 次确定性闸，"
+        f"本测试的命题（零证据不得报 passed）已不适用于此夹具")
+    # 不变量本体（无条件）：零确定性证据 ⇒ 要么不通过，要么至多 passed:unverified
+    assert not (out.get("l2_passed") is True and cell == "passed"), (
+        f"零确定性验证却报 l2_passed=True + coverage='passed' —— 谎称验过: {cell!r}")
 
 
 # ══════════════════════════════════════════════════════════

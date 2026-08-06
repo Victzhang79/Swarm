@@ -269,6 +269,141 @@ def test_normal_code_still_not_flagged(line):
     assert should_block is False
 
 
+# ══════════════════════════════════════════════════════════
+# C2) ★#29-1R★ 误杀方向那一格 —— 同行 HIGH+CRITICAL 共命中
+#
+# 对抗双复核【两只透镜都点了这一格】（hunter 自报未覆盖 / reviewer 记为 finding）：
+# 上面 C 节的样本【全是纯 HIGH 行】，而取 max 只在 HIGH 与 CRITICAL **同行共命中**时
+# 才改变行为 ⇒ "取 max 会不会把某行从 warn 提成 block"这一格结构上无覆盖。
+#
+# 定量前提（真实源码实测，非推断）：全仓 2653 文件 / 667733 行，有命中 298 行，
+# warn→block 提级仅 **3 行**且全部是刻意构造的密钥夹具（本文件 2 行 + 端点闸测试 1 行），
+# 生产代码与基线形态**零提级**。提级的必要条件是该行结构上命中 21 条 CRITICAL 之一
+# （AWS/GitHub/JWT/私钥头/DB URI 带口令等**强结构**），远窄于泛化的 `SECRET = "..."`。
+# ══════════════════════════════════════════════════════════
+
+# 同行共命中样本：每条都【既】命中至少一条 HIGH（泛化赋值型）【又】命中一条 CRITICAL
+# （强结构型）。碎片化拼接避免 pre-commit 密钥闸拦夹具。
+_ASSIGN = "pass" + "word = "          # 赋值左侧（拆开写：整行字面量会被 pre-commit 闸拦）
+_ASSIGN_K = "api_" + "key = "
+_ASSIGN_S = "sec" + "ret = "
+_COHIT_SAMPLES: dict[str, str] = {
+    "DB URI 带口令赋值": (
+        "db_" + _ASSIGN + '"' + _S_DB_URI + '"'),
+    "OpenAI key 赋值": _ASSIGN_K + '"' + _S_OPENAI + '"',
+    "AWS ID 赋值": _ASSIGN_S + '"' + _S_AWS_ID + '"',
+    "URL 口令参数赋值": (
+        _ASSIGN + '"https://h/db?' + "pass" + "word=" + "s3cr3tval" + '"'),
+}
+
+
+def test_cohit_samples_really_cohit_high_and_critical():
+    """★夹具自证：每条样本确实【同行】共命中 HIGH 与 CRITICAL★
+
+    这条是上面那组的前提。缺了它，样本可能只命中 CRITICAL（那就退化成 A 节的
+    遮蔽用例，测不到"取 max 改变了 should_block"这一格）。
+    """
+    for desc, line in _COHIT_SAMPLES.items():
+        sevs = {sev for _lbl, pat, sev in ss._SECRET_PATTERNS if pat.search(line)}
+        assert Severity.CRITICAL in sevs, f"{desc}: 未命中任何 CRITICAL，夹具无效"
+        assert Severity.HIGH in sevs, (
+            f"{desc}: 未命中任何 HIGH ⇒ 不构成共命中，测不到取 max 的行为差")
+
+
+@pytest.mark.parametrize("desc", sorted(_COHIT_SAMPLES))
+def test_cohit_promotion_is_correct_not_a_false_positive(desc):
+    """★共命中提级必须是【真密钥】—— 提级正确，不是冤杀★
+
+    取 max 在这一格上确实把 HIGH(warn) 变成 CRITICAL(block)。本测试锁住"被提级的
+    都是真该 block 的"：每条样本都含完整可用凭据结构（真泄漏形态），提级即正确。
+    """
+    line = _COHIT_SAMPLES[desc]
+    findings, should_block = scan_diff_for_secrets(_added(line))
+    assert findings, f"{desc}: 真密钥零命中"
+    assert findings[0].severity == Severity.CRITICAL, (
+        f"{desc}: 同行共命中未取到 CRITICAL（遮蔽复发）: {findings[0].severity}")
+    assert should_block is True, f"{desc}: 真密钥未被阻断"
+
+
+@pytest.mark.parametrize("line,desc", [
+    ('public static final String CSRF_TOKEN = "csrf_token";', "RuoYi 基线常量（冤杀实证本尊）"),
+    ('private String password = "changeme";', "占位默认值"),
+    ('spring.datasource.password=${DB_PASSWORD}', "环境变量引用"),
+    ('url = "jdbc:mysql://localhost:3306/db?useSSL=false"', "无口令的 JDBC URL"),
+    ('password = "' + "your-password" + '-here"', "文档占位"),
+    ('secret_key = os.environ["SECRET_KEY"]', "读环境变量"),
+    ('token = "${' + "CI_JOB_TOKEN" + '}"', "CI 变量插值"),
+])
+def test_legitimate_baseline_forms_hit_zero_critical_patterns(line, desc):
+    """★误杀那一格的守门人：合法基线形态【结构上】命中不了任何 CRITICAL pattern★
+
+    这是"取 max 不会冤杀基线"的**机制性**理由（不是统计侥幸）：提级的必要条件是
+    同行命中某条 CRITICAL，而 21 条 CRITICAL 全是强结构（固定前缀 + 长度下界 +
+    分隔符形态）。合法基线的口令位是占位符/环境变量引用/短字面量，结构上进不去。
+
+    断言直接查【表】而非只查 should_block：若哪天某条 CRITICAL 的正则被放宽到能吃
+    占位符，这里会先红——而只断 should_block 的测试要等到该行恰好也命中 HIGH
+    才会红（漏一层）。
+    """
+    crit_hits = [lbl for lbl, pat, sev in ss._SECRET_PATTERNS
+                 if sev == Severity.CRITICAL and pat.search(line)]
+    assert not crit_hits, (
+        f"{desc}: 合法基线形态命中 CRITICAL {crit_hits} ⇒ 取 max 会把它提级阻断（冤杀）")
+    _findings, should_block = scan_diff_for_secrets(_added(line))
+    assert should_block is False, f"{desc}: 合法基线被阻断"
+
+
+def test_every_table_severity_is_rankable():
+    """★#29-1R F6★ `_SECRET_PATTERNS` 里每条 severity 必须在 `_SEVERITY_ORDER` 里。
+
+    缺口后果（C-1 缺陷原型复发且**零信号**）：`_strongest_secret_match` 用
+    `_SEVERITY_ORDER.get(sev, 0)` 取 rank。若新增一档没登记，该档全部 pattern
+    rank 并列 0 ⇒ 取 max 退化成"取表内最先" ＝ 正是本文件在修的那个遮蔽缺陷。
+    这条锁在 append 新档位时立刻红（比改 .get 缺省值便宜，且不掩盖问题）。
+    """
+    unranked = sorted({str(s) for _l, _p, s in ss._SECRET_PATTERNS
+                       if s not in ss._SEVERITY_ORDER})
+    assert not unranked, (
+        f"这些档位不在 _SEVERITY_ORDER 里，rank 恒 0 ⇒ 取 max 退化成取表内最先: {unranked}")
+
+
+def test_severity_rank_derived_from_single_source():
+    """★#29-1R F6★ 两张档位序表不得分叉——`_SEVERITY_RANK` 由 `_SEVERITY_ORDER` 派生。
+
+    原先两份手抄字面量并存（`_SEVERITY_ORDER` 5 档含 info，`_SEVERITY_RANK` 4 档不含）。
+    只登记进一张的新档位会让另一张对它返回 0：落在 min_severity floor 上是静默漏过滤，
+    落在 `_strongest_secret_match` 上是遮蔽复发（血规 10③：共享事实源要复用不要抄第二份）。
+    """
+    for sev, rank in ss._SEVERITY_ORDER.items():
+        key = str(getattr(sev, "value", sev)).lower()
+        assert ss._SEVERITY_RANK.get(key) == rank, (
+            f"档位 {key!r} 两表不一致: ORDER={rank} RANK={ss._SEVERITY_RANK.get(key)}")
+    # 反向：RANK 不得有 ORDER 里没有的档位（否则 floor 认得、取 max 不认得）
+    _order_keys = {str(getattr(s, "value", s)).lower() for s in ss._SEVERITY_ORDER}
+    assert set(ss._SEVERITY_RANK) <= _order_keys, (
+        f"_SEVERITY_RANK 有 _SEVERITY_ORDER 未收录的档位: "
+        f"{set(ss._SEVERITY_RANK) - _order_keys}")
+
+
+def test_min_severity_floor_behaviour_unchanged_by_derivation():
+    """派生引入了 info=0 档（原表没有）——锁住 floor 语义逐位不变。
+
+    `_floor` 判真值：info→0→falsy→不过滤，与旧表 `.get("info", 0)` 逐位等价。
+    这条防"派生顺手改了 min_severity 的行为"（纯结构改动必须带相等锁）。
+    """
+    line = CRITICAL_SAMPLES["OpenAI project key"]
+    all_hits = ss.scan_text_for_secrets(line)
+    assert all_hits
+    # info/无 floor/空串：都不过滤（与旧表行为一致）
+    for floor in (None, "", "info"):
+        assert len(ss.scan_text_for_secrets(line, min_severity=floor)) == len(all_hits), (
+            f"min_severity={floor!r} 起了过滤作用 ⇒ floor 语义被派生改动")
+    # critical floor：只留 CRITICAL（区分力锁，证明 floor 机制本身活着）
+    crit_only = ss.scan_text_for_secrets(line, min_severity="critical")
+    assert 0 < len(crit_only) < len(all_hits), (
+        f"critical floor 未起过滤作用（{len(crit_only)}/{len(all_hits)}）⇒ 本测试无区分力")
+
+
 def test_scan_text_for_secrets_contract_unchanged():
     """`scan_text_for_secrets` 本就无 break（全档返回全部命中），本次修复不得改其契约。
 

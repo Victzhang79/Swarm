@@ -5702,6 +5702,9 @@ def _deliver_review_payload(state: BrainState) -> dict:
     acc_details = state.get("acceptance_details") or {}
     if not isinstance(acc_details, dict):
         acc_details = {}
+    adv_details = state.get("adversarial_verify_details") or {}
+    if not isinstance(adv_details, dict):
+        adv_details = {}
 
     rows = [r for r in (acc_details.get("assertions") or []) if isinstance(r, dict)]
     row_summaries: list[dict] = []
@@ -5794,6 +5797,25 @@ def _deliver_review_payload(state: BrainState) -> dict:
             "assertions_total": len(rows),
             "assertions_omitted": max(0, len(rows) - _DELIVER_ASSERT_ROWS_MAX),
             "manual": manual_rows,
+        },
+        # ★#29-1R F5★ 对抗复核结论进人工闸视野。原先 adversarial_verify_message /
+        # _details 全仓**零读者**（只写不读），而 state.py:249-250 自称"透传 deliver/通知"
+        # ＝过期承诺（血规 10④：新账没有消费者＝没造）。后果具体：B-3 修的那句
+        # 「N 个被判 FAIL 但未给出具体失败场景（零正面证据，不计通过）」写进了 message，
+        # 而人工在交付面上**根本看不到**——修了个看不见的字符串。
+        # 键形状对齐邻居（passed 三态 + message 截断 + details 取关键子集）。
+        "adversarial": {
+            "passed": state.get("adversarial_verify_passed", None),
+            "round": state.get("adversarial_verify_round", 0),
+            "message": str(state.get("adversarial_verify_message") or "")[:400],
+            # NAUGHTY 逐子任务评语：限量防 payload 膨胀。
+            # 形状取自真实写者 adversarial.py:554 —— {sid: {"critiques": [...]}}
+            "critiques": {
+                str(k): [str(x)[:200]
+                         for x in ((v or {}).get("critiques") or [])][:5]
+                for k, v in list(adv_details.items())[:_DELIVER_ASSERT_ROWS_MAX]
+                if isinstance(v, dict)
+            },
         },
         "coverage": coverage,
         "degraded_reasons": list(state.get("degraded_reasons") or []),

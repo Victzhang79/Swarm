@@ -210,6 +210,11 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         logger.warning(
             "[VERIFY_L2] 空 merged_diff 但产出形态合法（全 AUDIT）→ 放行；本轮【零确定性验证】"
             "（编译/契约/功能测试全部无标的）→ degraded 留痕 l2_empty_diff_unverified")
+        # ★#29-1R F4 审议结论：本臂【刻意不带】_fp_reset（l2_missing_fp_history 清零）★
+        # 复核建议两臂都补上清零，审议后不采纳——该账的语义是"契约缺失集合连续 N 轮未变"，
+        # 而本臂与 SIMPLE 臂**从未跑过契约对账**（清零只在对账通过时置）。没查过就清零
+        # ＝ 无证据地宣布"缺口已解决"，是 fail-open 方向；保留历史则最坏情况是早一轮
+        # 升人工（fail-closed）。空 diff 的全 AUDIT 轮次也不可能解决契约符号缺失。
         return {"l2_passed": True, "degraded_reasons": ["l2_empty_diff_unverified"]}
 
     acceptance_criteria: list[str] = []

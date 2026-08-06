@@ -252,16 +252,26 @@ async def _run_one_reviewer(llm, messages, tag: str) -> dict[str, tuple[str, str
 # ───────────────────────── 节点 ─────────────────────────
 
 def _skip(round_no: int, verified: list[str], message: str,
-          degraded: str | None = None) -> dict:
-    """跳过/降级放行的统一返回（always-emit 路由三态键 + 可观测）。"""
+          degraded: str | list[str] | None = None) -> dict:
+    """跳过/降级放行的统一返回（always-emit 路由三态键 + 可观测）。
+
+    ★#29-1R★ degraded 收 str **或 list**：R53-4 熔断分支原先只传自己那一条
+    `advisory_after_escalation`，而 `out["degraded_reasons"] = [...]` 是**整体赋值**
+    （非 append），于是本轮已聚合出的 incomplete_coverage / all_fail_no_evidence
+    **一起蒸发**——熔断态恰恰是最需要这些账的时候（血规 10④：账没人消费＝没造）。
+    实测坐实：熔断态下 degraded_reasons 只剩 advisory 一条，非熔断态对照两条都在。
+    """
     out: dict = {
         "adversarial_verify_passed": None,
         "adversarial_verify_round": round_no,
         "adversarial_verified_ids": verified,
         "adversarial_verify_message": message,
     }
-    if degraded:
-        out["degraded_reasons"] = [degraded]
+    _degs = [degraded] if isinstance(degraded, str) else list(degraded or [])
+    # 去重保序（state reducer 亦去重，此处保证单次返回内不重复）
+    _degs = [d for d in dict.fromkeys(_degs) if d]
+    if _degs:
+        out["degraded_reasons"] = _degs
     return out
 
 
@@ -502,9 +512,11 @@ async def adversarial_verify(state: BrainState) -> dict:
         logger.warning(
             "[ADVERSARIAL] R53-4 本任务已因未收敛升人工 → %d 个 FAIL 判定降为 advisory，"
             "绝不再打回（熔断=交人工，不是再来一轮）: %s", len(naughty), list(naughty.keys()))
+        # ★#29-1R★ 必须把本轮已聚合的 degraded 一并带出（原先只传 advisory 一条，
+        # 整体赋值把 incomplete_coverage / all_fail_no_evidence 冲掉——熔断态是账最该留的时候）
         return _skip(cur_round, new_verified,
                      f"已升人工，本轮 {len(naughty)} 条对抗复核发现降为 advisory（不打回）",
-                     degraded="adversarial_verify_advisory_after_escalation")
+                     degraded=[*degraded, "adversarial_verify_advisory_after_escalation"])
 
     # ── 有 NAUGHTY：flag-back（复用 HANDLE_FAILURE 重试预算），l1_passed 置 False + 评语入 l1_details ──
     logger.warning("[ADVERSARIAL] %d 个子任务未过对抗复核 → 打回重做: %s",

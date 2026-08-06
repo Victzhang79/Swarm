@@ -138,10 +138,11 @@ def test_prepare_failed_does_not_hijack_failed_arm_attribution():
 # C) 节点侧：机读键 + 归因诚实 + L6 阻断
 # ══════════════════════════════════════════════════════════
 
-def _drive_smoke(prepare_rc: int, extra_out: str = ""):
+def _drive_smoke(prepare_rc: int, extra_out: str = "", *, done: bool = True):
     """真跑 run_runtime_smoke 的 prepare 失败路径（假 manager，只喂沙箱输出文本）。
 
     行为级驱动，不用 getsource 断字面量（纪律 6）。
+    done=False 模拟 envd 断流（stdout 截断在 MARK_DONE 之前）。
     """
     import asyncio as _aio
 
@@ -149,7 +150,9 @@ def _drive_smoke(prepare_rc: int, extra_out: str = ""):
         MARK_DONE, MARK_PREPARE_RC, run_runtime_smoke,
     )
 
-    out = f"{MARK_PREPARE_RC}{prepare_rc}\n{extra_out}\n{MARK_DONE}\n"
+    out = f"{MARK_PREPARE_RC}{prepare_rc}\n{extra_out}\n"
+    if done:
+        out += f"{MARK_DONE}\n"
 
     class _Result:
         stdout = out
@@ -164,18 +167,34 @@ def _drive_smoke(prepare_rc: int, extra_out: str = ""):
         _Mgr(), object(), "fake script", timeout_sec=30, language_key="java"))
 
 
-@pytest.mark.parametrize("rc", [1, 2, 127])
-def test_node_emits_machine_readable_artifact_flag(rc):
-    """★节点侧真跑：prepare 非 0 → skipped/prepare_failed + artifact_build_failed 机读键★
+def _gate_via_real_writer(res):
+    """★#29-1R F3★ 经【真实写者】_runtime_skipped_state 造 state 再喂 gates。
 
-    （血规 10④：降级路径至少一个机读键，且该键必须有消费者——消费者见下条测试。）
+    原实现手工拼 `{**res.details, "skip_reason": res.classification}`，绕过了真写者
+    —— 把 verify.py 那行的键名改掉，生产闸当场失效而测试仍绿（假接线）。
+    """
+    from swarm.brain.nodes.verify import _runtime_skipped_state
+    patch = _runtime_skipped_state(res.classification, res.message, res.details)
+    return can_auto_accept_delivery(_state(**patch))
+
+
+@pytest.mark.parametrize("rc", [1, 2, 127])
+def test_node_emits_machine_readable_prepare_rc(rc):
+    """★节点侧真跑：prepare 非 0 → skipped/prepare_failed + prepare_rc 机读键★
+
+    血规 10④：降级路径至少一个机读键，且该键必须有消费者——消费者＝gates
+    （见 test_node_output_feeds_the_gate_end_to_end，判据就是这个 rc）。
+
+    ★#29-1R F2★ 原先另有 `artifact_build_failed` 键，已删：它与 skip_reason=
+    prepare_failed、prepare_rc **同生同死于同一分支**，是同一事实的第三个标签，
+    零信息增量且全仓无消费者。F1 的根因正是"同一事实多标签、下游认标签"——
+    再加一个标签是复发而非治疗。
     """
     res = _drive_smoke(rc)
     assert res.status == "skipped", f"prepare 失败被判成 {res.status}（不该冤枉代码）"
     assert res.classification == "prepare_failed"
-    assert res.details.get("prepare_rc") == rc
-    assert res.details.get("artifact_build_failed") is True, (
-        f"缺 artifact_build_failed 机读键: {res.details}")
+    assert res.details.get("prepare_rc") == rc, (
+        f"缺 prepare_rc 机读键（gates 的唯一判据）: {res.details}")
 
 
 def test_node_message_does_not_claim_environment_cause():
@@ -186,20 +205,14 @@ def test_node_message_does_not_claim_environment_cause():
 
 
 def test_node_output_feeds_the_gate_end_to_end():
-    """★接线闭环：节点产出的 details 直接喂 gates 必须被硬拦★
+    """★接线闭环：节点产出经真实写者进 state 后必须被 gates 硬拦★
 
-    这条把"节点写的键"与"gates 读的键"接在一起验——两侧靠 skip_reason 字符串对齐，
-    任一侧改名都会在这里红（而不是等到生产上静默放行）。
+    三层接在一起验：节点写 details → `_runtime_skipped_state` 组装 state →
+    gates 读判据。任一层改键名都会在这里红（而不是等到生产上静默放行）。
     """
     res = _drive_smoke(1)
-    # 复刻 _runtime_skipped_state 的组装：skip_reason 由 classification 填入
-    details = {**res.details, "skip_reason": res.classification}
-    allow, reason = can_auto_accept_delivery(_state(
-        runtime_smoke_passed=None, runtime_smoke_skipped=True,
-        runtime_smoke_details=details,
-        degraded_reasons=[f"runtime_smoke_skipped:{res.classification}"],
-    ))
-    assert allow is False, "节点产出喂进 gates 未被硬拦 ⇒ 两侧键名/取值失配"
+    allow, reason = _gate_via_real_writer(res)
+    assert allow is False, "节点产出经真写者喂进 gates 未被硬拦 ⇒ 三层键名/取值失配"
     assert "prepare_failed" in reason
 
 
@@ -208,7 +221,115 @@ def test_prepare_rc_zero_does_not_take_the_branch():
     res = _drive_smoke(0)
     assert res.classification != "prepare_failed", (
         "prepare 成功也被判 prepare_failed ⇒ 闸恒触发，会拦下全部交付")
-    assert res.details.get("artifact_build_failed") is not True
+    allow, _r = _gate_via_real_writer(res)
+    assert allow is True, "prepare 成功(rc=0)被本闸误拦 ⇒ 会 strand 全部正常交付"
+
+
+# ══════════════════════════════════════════════════════════
+# C2) ★#29-1R F1★ 判序：产物缺席支配观测缺口
+#
+# 原缺陷（对抗双复核两只透镜独立指向）：闸判【标签】skip_reason=="prepare_failed"，
+# 而「prepare 失败」这个事实能带着**另外两个标签**到达 gates：
+#   ① probe_tool_missing 抢答（脚本里探活工具探测在 prepare 之前，缺 curl 的镜像
+#      两个标记同时在场）→ details 完全不含 prepare_rc → 放行
+#   ② envd 断流截断在 MARK_DONE 前 → not_executed → prepare_rc 同样丢 → 放行
+# 实测（治法前 88da975）：①②放行、③硬拦。治法＝判序上移 + 闸判事实。
+# ══════════════════════════════════════════════════════════
+
+def test_prepare_failure_wins_over_probe_tool_missing():
+    """★① 两个标记同时在场时，归因必须是 prepare_failed（不是 probe_tool_missing）★
+
+    判序论证（不是"随手提前"）：prepare 失败 ⇒ 产物不存在 ⇒ 应用【根本没被启动】，
+    此时"有没有探活工具"描述的是【观测通道】，而这里缺的是【被观测对象】——
+    产物缺席在归因上严格支配观测缺口。
+    """
+    from swarm.brain.nodes.runtime_smoke import MARK_PROBE_TOOL_MISSING
+    res = _drive_smoke(1, extra_out=MARK_PROBE_TOOL_MISSING)
+    assert res.classification == "prepare_failed", (
+        f"probe_tool_missing 抢答了 prepare 归因（F1 复发）: {res.classification}")
+    assert res.details.get("prepare_rc") == 1, (
+        f"prepare_rc 事实在早退路径上被丢弃（F1 复发）: {res.details}")
+    allow, reason = _gate_via_real_writer(res)
+    assert allow is False, "缺探活工具的镜像上产物构建失败被自动放行（F1 复发）"
+    assert "prepare_failed" in reason
+
+
+def test_prepare_failure_wins_over_truncated_stdout():
+    """★② stdout 截断在 MARK_DONE 前（envd 断流）仍必须判 prepare_failed★
+
+    诚实边界：真正的 run_command **超时**会抛异常走 not_executed 且 stdout 全无，
+    prepare_rc 根本没被 parse——那条路径本测试不覆盖也覆盖不了（无事实可判）。
+    本例是【部分 stdout】：rc 已回显、收尾标记没到。
+    """
+    res = _drive_smoke(1, done=False)
+    assert res.classification == "prepare_failed", (
+        f"断流把 prepare 事实降级成 not_executed（F1 复发）: {res.classification}")
+    allow, _reason = _gate_via_real_writer(res)
+    assert allow is False, "断流路径上产物构建失败被自动放行（F1 复发）"
+
+
+def test_probe_tool_missing_alone_still_skips_and_passes():
+    """★反向区分力：没有 prepare 失败时，probe_tool_missing 归因/放行都不变★
+
+    缺了这条，上面两条会被"把 probe_tool_missing 整档拧成硬拦"这种过宽改法满足
+    （零区分力）。观测缺口必须仍放行，否则基建抖动 strand 全部交付。
+    """
+    from swarm.brain.nodes.runtime_smoke import MARK_PROBE_TOOL_MISSING
+    res = _drive_smoke(0, extra_out=MARK_PROBE_TOOL_MISSING)
+    assert res.classification == "probe_tool_missing", (
+        f"prepare 成功时归因被 prepare 闸抢答: {res.classification}")
+    allow, _r = _gate_via_real_writer(res)
+    assert allow is True, "纯观测缺口被硬拦 ⇒ 沙箱抖动会 strand 全部交付"
+
+
+def test_gate_judges_the_fact_not_the_label():
+    """★F1 读侧一半：闸的判据是事实 prepare_rc，不是标签 skip_reason★
+
+    构造"标签变了但事实还在"——未来若有新早退分支插到 prepare 之前（F1 的复发形态），
+    到达 gates 的就是这个形状。判事实的闸不会被绕过；判标签的会。
+    """
+    for label in ("probe_tool_missing", "not_executed", "some_future_reason"):
+        allow, reason = can_auto_accept_delivery(_state(
+            runtime_smoke_passed=None, runtime_smoke_skipped=True,
+            runtime_smoke_details={"skip_reason": label, "prepare_rc": 1},
+            degraded_reasons=[f"runtime_smoke_skipped:{label}"],
+        ))
+        assert allow is False, (
+            f"标签={label!r} 携带 prepare_rc=1 却被放行 ⇒ 闸仍在判标签（F1 未真治）")
+        assert "prepare_failed" in reason
+
+
+@pytest.mark.parametrize("label", [
+    "prepare_timeout", "prepare_skipped", "prepare",
+])
+def test_prepare_lookalike_labels_without_the_fact_still_pass(label):
+    """★近邻取值区分力★（hunter 心算突变表里唯一"不红"的近邻）：
+
+    判据若被拧成 `skip_reason.startswith("prepare")`，这些取值会被误拦而无测试发现。
+    它们【没有 prepare_rc 事实】⇒ 不该被本闸拦（该不该硬拦是另一个设计问题，
+    本闸只管"产物确实没构建出来"这一个确定性事实）。
+    """
+    allow, _reason = can_auto_accept_delivery(_state(
+        runtime_smoke_passed=None, runtime_smoke_skipped=True,
+        runtime_smoke_details={"skip_reason": label},
+        degraded_reasons=[f"runtime_smoke_skipped:{label}"],
+    ))
+    assert allow is True, f"{label!r} 无 prepare_rc 事实却被本闸拦（判据过宽到前缀匹配）"
+
+
+def test_gate_ignores_non_int_prepare_rc():
+    """畸形 prepare_rc（旧 checkpoint / 手工 state）不误拦、不抛。
+
+    bool 是 int 子类：True 会被 isinstance(int) 认——显式锁住不把 True 当 rc=1，
+    否则任何写了 prepare_rc=True 的将来写者都会触发本闸。
+    """
+    for bad in (None, "1", "", 0.0, [], {}, True, False):
+        allow, _r = can_auto_accept_delivery(_state(
+            runtime_smoke_passed=None, runtime_smoke_skipped=True,
+            runtime_smoke_details={"skip_reason": "port_unresolved",
+                                   "prepare_rc": bad},
+            degraded_reasons=["runtime_smoke_skipped:port_unresolved"]))
+        assert allow is True, f"prepare_rc={bad!r}（非有效非零 int）被误拦"
 
 
 def test_prepare_failed_blocks_l6_success_learning():

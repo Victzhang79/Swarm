@@ -1091,7 +1091,16 @@ def scan_text_for_secrets(
 
 # 档位序（W1 复核 HIGH-2）：供 min_severity 做"≥ 阈值"过滤。取值与 Severity 枚举同源，
 # 未知档位按 0 处理＝不被任何 floor 过滤掉（fail-open 方向：宁可多报给调用方去判）。
-_SEVERITY_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+# ★#29-1R F6★ 从 _SEVERITY_ORDER **派生**，不再手抄第二份字面量。
+# 原先两张表并存：若新增一档只登记进其中一张，另一张对该档返回 0 ——
+# 落在 _strongest_secret_match 上就是"该档全部 pattern rank 并列 0 → 取 max 退化成取表内最先"
+# ＝ C-1 修的那个缺陷**原型复发且零信号**（血规 10③：共享事实源要复用，别抄第二份）。
+# 派生后 info 档也在表内（值 0）：`_floor` 判真值，floor=0 与"查不到按 0"行为逐位等价。
+_SEVERITY_RANK: dict[str, int] = {
+    _sev_key: _rank
+    for _sev, _rank in _SEVERITY_ORDER.items()
+    if (_sev_key := str(getattr(_sev, "value", _sev)).lower())
+}
 
 
 def _severity_key(sev: object) -> str:

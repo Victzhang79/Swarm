@@ -203,15 +203,30 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
     # ★刻意不做代码/环境归因★：那需要新造一张构建错误模式表（枚举完整性无权威来源，且
     # classify_smoke_outcome 认的是【应用启动期】形态、对构建期错误实测全归 inconclusive，
     # 接上去是死代码）。此处只用一个确定性事实——产物没构建出来——就足以拒绝自动放行。
+    # ★#29-1R F1★ 判据是【事实 prepare_rc≠0】，不是【标签 skip_reason=="prepare_failed"】。
+    # 上一版判标签，而同一事实在 runtime_smoke 里能带着**另外两个标签**到达这里
+    # （probe_tool_missing 抢答判序 / envd 断流 not_executed）→ 两条路径静默放行。
+    # 根治在写侧（判序上移，见 runtime_smoke.py prepare 分支），此处判事实是**同一根治的读侧一半**：
+    # 未来若有新早退分支插到 prepare 之前，标签会变而 details.prepare_rc 仍在 → 闸不会被绕过。
+    # 存量 checkpoint 兼容性已核（`git show ad00c40`）：prepare_failed 分支自诞生起
+    # details 就【必带】prepare_rc，故不需要额外保留标签判据当 or 逃生门
+    # （多加一条 or ⇒ 两条判据互相兜底 ⇒ 任一单独突变都仍绿 ⇒ 两条都不可证伪）。
     if state.get("runtime_smoke_passed", None) is None:
         _sk = state.get("runtime_smoke_details")
-        if isinstance(_sk, dict) and str(_sk.get("skip_reason") or "") == "prepare_failed":
+        _prc = _sk.get("prepare_rc") if isinstance(_sk, dict) else None
+        # bool 显式排除（isinstance(True, int) 为真是 Python 的坑）：True 不是退出码，
+        # 是"有人写了个标志位"。本闸只判一个确定性事实【产物没构建出来】——事实缺席
+        # 时它**弃权**（不代表放行安全，只代表本闸无话可说；degraded_reasons 仍挡 L6，
+        # 其余闸各判各的事实）。与本文件既有 details 缺失→不误拦的分档一致。
+        if isinstance(_prc, int) and not isinstance(_prc, bool) and _prc != 0:
             return False, (
                 f"runtime_smoke_prepare_failed: 交付物构建命令失败"
-                f"(rc={_sk.get('prepare_rc')})，冒烟未起应用 —— 产物构建不出来，"
-                f"「这份交付能否运行」未经任何验证，交人工复核"
+                f"(rc={_prc})，冒烟未起应用 —— 产物构建不出来，"
+                f"「这份交付能否运行」未经任何验证"
                 f"（prepare 是 L2 编译闸的严格超集，差集含资源过滤/产物装配/"
-                f"main class 解析，L2 通过不能替它背书）"
+                f"main class 解析，L2 通过不能替它背书）；"
+                f"auto_accept 下本拒因即【终态 FAILED】，需人工看 prepare_log_tail 后"
+                f"以 --no-auto-accept 重跑复核"
             )
 
     # S2-6：acceptance 三态（镜像上方 runtime 三态先例，判序=runtime 之后、verification_failure
