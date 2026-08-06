@@ -1248,17 +1248,33 @@ def restore_baseline_version_anchors(
         return text, []
 
 
-def _merge_npm_workspaces(local_text: str, incoming_text: str, rel_path: str) -> str:
-    """B7（19号文）：npm workspaces 聚合清单并集——local 独有的 workspaces 成员并回
-    incoming（与 pom <modules> 并集同构：并行 worker 各注册一个子包，陈旧副本盲覆盖
-    会丢成员）。
+# npm 依赖承载 section（#29-2 W-1 后半）：口径与 sibling_dep_repair._parse_npm 的
+# 扫描集**逐字一致**——A2 注入落回【来源 section】(D14)，并集面窄于注入面就会漏。
+_NPM_DEP_SECTIONS = ("dependencies", "devDependencies",
+                     "peerDependencies", "optionalDependencies")
+
+
+def _merge_npm_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+    """B7（19号文）+ #29-2 W-1 后半：npm 聚合清单并集——local 独有的 workspaces 成员
+    【与依赖条目】并回 incoming（与 pom <modules>+<dependencies> 双并集同构：并行
+    worker 各注册一个子包/各补一个依赖，陈旧副本盲覆盖会丢）。
 
     支持两种 workspaces 形态：数组形（npm/yarn 经典）与 {"packages": [...]} 对象形
-    （yarn 扩展）。仅当两侧都有成员列表时才并；incoming 无 workspaces 键 → 保守返回
-    incoming（不臆造结构，与 pom 侧"无主依赖区不并"同取舍）。合并仅在有真实缺失
-    成员时发生 → 无缺失原样返回 incoming（零 diff churn）；有缺失时整文件经 JSON
-    重序列化（indent=2）——格式归一是已知取舍，换确定性成员并集。加法-only 同 pom 侧
-    债（内容级有意删除会被并回复活）。任何异常 fail-open 返回 incoming。
+    （yarn 扩展）。仅当两侧都有成员列表时才并成员；incoming 无 workspaces 键 → 成员
+    面保守跳过（不臆造结构，与 pom 侧"无主依赖区不并"同取舍），但**依赖面照并**——
+    ★两面必须独立判★：原实现在 `not loc_ws or inc_ws is None` 处直接早返 incoming，
+    若也把依赖并集挂在该早返之后，则"worker 整体重写根 package.json 丢掉 workspaces
+    键"这一 _is_shared_manifest_on_disk 专门 OR 进来兜的场景里，依赖并集会连带失效
+    （同一早返吃掉两个不相干的机制＝血规 10① 的接线覆盖缺口）。
+
+    依赖并集键 = (section, 包名)：同名包可合法同时在 dependencies 与 devDependencies
+    （前者运行时、后者构建期），跨 section 混同会把 dev 依赖并进运行时。版本冲突时
+    **保留 incoming 的版本**（incoming 为基，本函数只做"补缺"不做"改值"——改值需三方
+    基线才能判谁新，见下方加法-only 债）。
+    合并仅在有真实缺失时发生 → 无缺失原样返回 incoming（零 diff churn）；有缺失时整
+    文件经 JSON 重序列化（缩进探测保真）——格式归一是已知取舍，换确定性并集。
+    加法-only 同 pom 侧债（内容级有意删除会被并回复活）。任何异常 fail-open 返回
+    incoming。
     """
     import json as _json
 
@@ -1276,17 +1292,43 @@ def _merge_npm_workspaces(local_text: str, incoming_text: str, rel_path: str) ->
                 return w["packages"]
             return None
 
+        changed = False
+        # ── ① 成员并集（B7 原有面）──
         loc_ws = _ws_list(loc)
         inc_ws = _ws_list(inc)
-        if not loc_ws or inc_ws is None:
+        if loc_ws and inc_ws is not None:
+            missing = [x for x in loc_ws if x not in inc_ws]
+            if missing:
+                inc_ws.extend(missing)
+                changed = True
+                logger.info(
+                    "[workspace-manifest] B7 npm workspaces 并集合并 %s：并回 local "
+                    "独有成员 %d 个（陈旧副本覆盖丢注册面）", rel_path, len(missing))
+        # ── ② 依赖并集（#29-2 W-1 后半）──
+        for _sec in _NPM_DEP_SECTIONS:
+            _lsec = loc.get(_sec)
+            if not isinstance(_lsec, dict) or not _lsec:
+                continue
+            _isec = inc.get(_sec)
+            if _isec is None:
+                # incoming 无该 section：local 有则整段并回（A2 的 setdefault 也会新建
+                # 该 section，故"不臆造结构"在这里不适用——结构是依赖条目自带的）。
+                _isec = {}
+            elif not isinstance(_isec, dict):
+                continue  # incoming 该键是非对象（畸形）→ 不碰，保守
+            _miss = {k: v for k, v in _lsec.items()
+                     if isinstance(k, str) and isinstance(v, str) and k not in _isec}
+            if not _miss:
+                continue
+            _isec.update(_miss)
+            inc[_sec] = _isec
+            changed = True
+            logger.info(
+                "[workspace-manifest] #29-2 npm 依赖并集合并 %s [%s]：并回 local 独有 "
+                "%d 条（A2 兄弟坐标注入被陈旧副本盲覆盖会蒸发）: %s",
+                rel_path, _sec, len(_miss), ",".join(sorted(_miss)))
+        if not changed:
             return incoming_text
-        missing = [x for x in loc_ws if x not in inc_ws]
-        if not missing:
-            return incoming_text
-        inc_ws.extend(missing)
-        logger.info(
-            "[workspace-manifest] B7 npm workspaces 并集合并 %s：并回 local 独有成员 "
-            "%d 个（陈旧副本覆盖丢注册面）", rel_path, len(missing))
         # X-H3 R2：缩进探测 incoming 原文保真（4 空格/tab 文件不被重排成 2 空格）
         return _json.dumps(
             inc, ensure_ascii=False, indent=_detect_json_indent(incoming_text)) + "\n"
@@ -1295,13 +1337,133 @@ def _merge_npm_workspaces(local_text: str, incoming_text: str, rel_path: str) ->
         return incoming_text
 
 
+def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+    """#29-2 W-1 后半：Cargo.toml 依赖条目并集——local 独有的依赖并回 incoming。
+
+    Cargo.toml 在 `_SHARED_MANIFEST_BASENAMES` 里（basename 命中即共享清单），故
+    pull-back 走 merge 路径；而本函数之前不存在 ⇒ `merge_shared_manifest` 对它
+    `return incoming_text` ⇒ 并行兄弟的 A2 注入被陈旧副本抹掉（R48c-1 死法换栈复发）。
+
+    ★取证源复用 sibling_dep_repair._parse_cargo（写者的同一份解析器），不手抄第二份★：
+    它已处理平表/内联表/点表/`workspace = true` 四形态并归一 crate 名（rustc 用下划线、
+    manifest 常用连字符）。自己写正则＝口径与写者分叉，A2 注了而并集认不出就照丢
+    （血规 10③ 的同族：复用单一事实源）。
+    键 = (section, 归一名)：dev-dependencies 的条目绝不并进运行时 [dependencies]（与
+    A2 注入侧 D14 同口径）。版本冲突保留 incoming（只补缺不改值，同 npm 侧）。
+
+    诚实边界：点表形态（`[dependencies.foo]` 多行段）的 raw 是 None ⇒ 无法安全重建单行
+    声明（丢 features 会静默改语义），这类缺失**不并**，只计数告警——宁可让构建如实
+    再报一次缺依赖（A2 下轮会重注），不产出语义被削的 manifest。
+    合并结果过 tomllib 校验，不合法即 fail-open 返回 incoming（绝不产出毒 manifest：
+    这正是 W-6 的教训——闸自己制造它要防的"解析期崩塌连坐整个工作区"）。
+    """
+    try:
+        import tomllib
+
+        from swarm.worker.sibling_dep_repair import _parse_cargo
+        loc = _parse_cargo(local_text)
+        if not loc:
+            return incoming_text
+        inc = _parse_cargo(incoming_text)
+        # 键含 section：同名 crate 可合法同时在 dependencies 与 dev-dependencies
+        inc_keys = {(v[3], k) for k, v in inc.items()}
+        merged = incoming_text
+        added: list[str] = []
+        skipped_dot = 0
+        for _norm, (_name, _ver, _raw, _sec) in sorted(loc.items()):
+            if (_sec, _norm) in inc_keys:
+                continue
+            if not _raw:
+                # 点表/无可移植版本形态：无单行原始声明可移植 → 诚实丢弃
+                skipped_dot += 1
+                continue
+            m = re.search(rf'^\s*\[\s*{re.escape(_sec)}\s*\]\s*$', merged, re.M)
+            if m:
+                idx = (merged.index("\n", m.end()) + 1
+                       if "\n" in merged[m.end():] else len(merged))
+                merged = merged[:idx] + _raw.rstrip("\n") + "\n" + merged[idx:]
+            else:
+                # incoming 无该 section 区 → 追加（结构由依赖条目自带，非臆造）
+                merged = merged.rstrip("\n") + f"\n\n[{_sec}]\n{_raw.rstrip(chr(10))}\n"
+            inc_keys.add((_sec, _norm))
+            added.append(f"{_sec}/{_name}")
+        if skipped_dot:
+            logger.warning(
+                "[workspace-manifest] #29-2 cargo 依赖并集 %s：%d 条点表/无版本形态"
+                "无单行声明可移植 → 诚实不并（构建会如实再报缺依赖，A2 下轮重注）",
+                rel_path, skipped_dot)
+        if not added:
+            return incoming_text
+        # ★后置校验判【事实】而非【语法】★（自查实测逼出来的设计）
+        # 插入锚点是正则找 `[section]` 行 —— 若该行出现在**多行字符串值**里（`description`
+        # 写用法说明是常见形态），锚点就是假的：依赖被插进字符串里 ⇒ ① description 值被
+        # 污染进交付物 ② 真依赖根本没并进去 ③ **产出仍是合法 TOML**，只验 `tomllib.loads`
+        # 的闸完全看不见（这也正是那道闸原本不可独立证伪的原因——冗余防御互相兜底）。
+        # 故校验升级为三条后置断言：合法 + 声称并入的条目**真的**在目标 section 里 +
+        # **其它值一个都没变**。任一不成立 → fail-open 返回 incoming（诚实不并优于产毒/伪并）。
+        try:
+            _inc_obj = tomllib.loads(incoming_text)
+            _new_obj = tomllib.loads(merged)
+        except Exception as _texc:  # noqa: BLE001
+            logger.warning(
+                "[workspace-manifest] #29-2 cargo 依赖并集产出非法 TOML → fail-open "
+                "放弃合并 %s: %s", rel_path, _texc)
+            return incoming_text
+        # ★一条判据，不是两条互相兜底的★：把"声称并入的键真的在"与"其它值没变"写成两个
+        # 独立 if 时，假锚点场景**两条同时触发** ⇒ 任一单独突变都仍绿 ⇒ 两条都不可证伪
+        # （冗余防御=互相兜底，本仓已登记的教训）。故收敛成一条**端状态对账**：
+        # 摘掉声称新增的键之后，必须与 incoming 逐键相等。它严格强于"键存在"检查——
+        # 插进字符串会让那个值变、插对了则键在且别处不变，两种情形都被这一条覆盖。
+        # 具体是"键没落地"还是"别处被改"只作日志诊断，不再各自设闸。
+        _added_keys = {(_s, _n) for _s, _n in
+                       (a.split("/", 1) for a in added)}
+        _stripped = {k: (dict(v) if isinstance(v, dict) else v)
+                     for k, v in _new_obj.items()}
+        for _sec2, _name2 in _added_keys:
+            if isinstance(_stripped.get(_sec2), dict):
+                _stripped[_sec2].pop(_name2, None)
+                # 只有 incoming **根本没有**该 section 时才连 section 一起摘（我们新建了它）。
+                # 判据必须是【键是否存在】而非【值真假】：incoming 有一个**空** `[dependencies]`
+                # 段是常见形态（`{}` 为假），按真假判会把它一起摘掉 ⇒ 与 incoming 对不上 ⇒
+                # 合法合并被自己的校验冤杀（首跑实测：内联表用例当场红）。
+                if not _stripped[_sec2] and _sec2 not in _inc_obj:
+                    _stripped.pop(_sec2, None)
+        if _stripped != _inc_obj:
+            _absent = [f"{s}/{n}" for s, n in sorted(_added_keys)
+                       if n not in (_new_obj.get(s) or {})]
+            logger.warning(
+                "[workspace-manifest] #29-2 cargo 依赖并集端状态对账不过 → fail-open "
+                "放弃合并 %s（文本级插入落错位置，如 `[section]` 那行出现在多行字符串值里）"
+                "；声称并入却不在结果里的条目: %s", rel_path, _absent or "无")
+            return incoming_text
+        logger.info(
+            "[workspace-manifest] #29-2 cargo 依赖并集合并 %s：并回 local 独有 %d 条"
+            "（A2 兄弟坐标注入被陈旧副本盲覆盖会蒸发）: %s",
+            rel_path, len(added), ",".join(added))
+        return merged
+    except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
+        logger.warning("[workspace-manifest] #29-2 cargo 合并异常 fail-open: %s", exc)
+        return incoming_text
+
+
 def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
                           base_dir: "Path | None" = None) -> str:
     """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。
 
-    仅 Maven pom 做依赖/成员并集（丢失面已 live 实证）；其它清单类型原样返回
-    incoming（保守——gradle/cargo 未实证丢失面，盲并有语义风险）。任何异常
-    fail-open 返回 incoming。
+    分栈：Maven pom（依赖+成员）· npm package.json（成员+依赖，`_merge_npm_manifest`）·
+    Cargo.toml（依赖，`_merge_cargo_manifest`）。其它清单类型原样返回 incoming
+    （保守——gradle 未实证丢失面，盲并有语义风险）。任何异常 fail-open 返回 incoming。
+
+    ★#29-2 W-1 后半：cargo/npm 依赖并集是新增的★。原注释写"gradle/cargo 未实证丢失面"
+    ——cargo 的丢失面在本轮已实证：`Cargo.toml` 在 `_SHARED_MANIFEST_BASENAMES` 里，
+    pull-back 必走本函数，而本函数当时对它直接 `return incoming_text` ⇒ 并行兄弟的
+    A2 依赖注入被陈旧副本抹掉。npm 侧当时只并 workspaces 成员、不并依赖，同一半个洞。
+    未纳入 gradle：其依赖区是 Groovy/Kotlin DSL（可含变量/函数调用），文本级并集无法
+    保证语义——维持保守，登记在 #29-5 W-2 一并处置。
+    未纳入 go.mod：它**根本不进本函数**（`_is_shared_manifest('go.mod')` 为 False，走
+    sandbox.py 的裸写分支）。给它加臂在分类翻转前是死代码（血规 10①：先数调用点）——
+    分类档位与 require 并集臂是同一个洞的两面，两者必须**同批落地**，已登记
+    #29-5 W-2；本批只治"已经路由进来"的两种清单。
     复核 B：依赖键=(g,a,区域) 分账——dm 条目绝不挡 classpath 修复（RuoYi 根 pom
     是巨型 dm，跨区混同=原 live 缺陷的残留半径）。复核 C：profiles/build 插件
     依赖整体不参与（不收集/不插入其区）。复核 4：modules 并回带存在性校验
@@ -1312,7 +1474,12 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
     try:
         name = rel_path.rsplit("/", 1)[-1].lower()
         if name == "package.json":
-            return _merge_npm_workspaces(local_text, incoming_text, rel_path)
+            return _merge_npm_manifest(local_text, incoming_text, rel_path)
+        if name == "cargo.toml":
+            # 两侧全等 → 无可并（提前返回省一次解析；不影响语义）
+            if local_text == incoming_text:
+                return incoming_text
+            return _merge_cargo_manifest(local_text, incoming_text, rel_path)
         if name != "pom.xml" or local_text == incoming_text:
             return incoming_text
         merged = incoming_text

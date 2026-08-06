@@ -2577,13 +2577,47 @@ def _attempt_build_repair(
     if os.environ.get("SWARM_WORKER_DEP_REPAIR", "true").lower() not in ("false", "0", "no"):
         from swarm.worker.sibling_dep_repair import repair_from_sibling_manifests
         _sib_stack = {"ts": "npm", "rust": "cargo", "go": "go"}
+        # ★#29-2 W-1★ A2 的三个 _inject_*（npm/cargo/go）是**纯本地** `Path.write_text`，
+        # 而本函数的调用方在修复后用 `_run_l1_command` 重跑构建，那是**沙箱优先**的
+        # （见其 docstring："若有活跃沙箱上下文 → 在沙箱里跑"）⇒ 构建读的是 bootstrap
+        # 上传的旧副本 ⇒ **整个 A2 机制对生产 L1 裁决零影响**（本地改了、构建看不见）。
+        # 对照：Maven 侧 `_inject_dependency` 在沙箱内改，同一治本在不同栈效力不等
+        #（血规 10①：机制造对了却只接了一个栈的调用点）。
+        # 治法＝与 reconcile 的 #11(b) 同款：本地写完把**这些**清单推进沙箱。
+        # ★推送面必须只含 A2 自己触达的路径★：本函数其余修复族（Java import/version/
+        # symbol、goimports、cargo fix）都走 `_run_l1_command` **在沙箱里改**，那时沙箱
+        # 副本比本地新——把本地旧副本推上去会**擦掉沙箱侧的修复**（比原缺陷更坏）。
+        # 故此处单独收集 A2 路径，不复用 `paths`。
+        _a2_paths: list[str] = []
         for lang, file_signal, _fn in adapters:
             stack_key = _sib_stack.get(lang)
             if stack_key and eligible(lang, file_signal):
                 try:
-                    _accum(repair_from_sibling_manifests(project_path, build_output, mods, stack_key))
+                    _n, _fs = repair_from_sibling_manifests(
+                        project_path, build_output, mods, stack_key)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("[L1.2.1·repair] A2 %s sibling-dep 异常(跳过): %s", stack_key, exc)
+                    logger.debug("[L1.2.1·repair] A2 %s sibling-dep 异常(跳过): %s",
+                                 stack_key, exc)
+                    continue
+                _accum((_n, _fs))
+                for _f in _fs:
+                    if _f and _f not in _a2_paths:
+                        _a2_paths.append(_f)
+        if _a2_paths:
+            try:
+                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths)
+                if _pushed:
+                    logger.info(
+                        "[L1.2.1·repair] A2 sibling-dep 注入的 %d 份清单已推进沙箱"
+                        "（构建沙箱优先，不推则本地注入对构建不可见）", _pushed)
+                else:
+                    # 无活跃沙箱（本地模式）＝构建直接读 project_path，本就可见，非降级。
+                    # 有沙箱但推送失败 → _push_manifests_to_sandbox 内部已告警；此处
+                    # 不吞成静默：构建随后会因缺依赖继续失败，交既有失败分类处理。
+                    logger.debug("[L1.2.1·repair] A2 清单未推送（本地模式或推送未成功）")
+            except Exception as exc:  # noqa: BLE001 — 推送异常不致命（构建仍会如实失败）
+                logger.warning("[L1.2.1·repair] A2 清单推进沙箱异常（本轮注入对构建"
+                               "可能不可见）: %s", exc)
     return total, paths
 
 
@@ -2930,20 +2964,41 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
 # 60-120s 的 `grep -r … --include='*.java'` 大扫描（取证：同一沙箱 4000-符号 grep 重复 3×，
 # 纯烧预算）。按【源文件 size+mtime 签名】缓存：任一 .java/.kt/.scala 变动→签名变→自动失效重扫，
 # 无陈旧风险（不会拿过期符号表去改代码）。通用于任何 JVM 栈，无正确性 trade-off。
-# ★W-5★ GNU `stat -c` 在 macOS 失效 → 按平台选 BSD `stat -f`；无法取签名时安全兜底为空。
+# ★#29-2 W-7（编号统一见下）★ 签名命令改为**平台中立**：不再用 `stat`，只用 POSIX `cksum`。
+#
+# 编号统一：本机制历史上有三个标签——commit 055883a 的 message 叫它 W-2、本处代码注释叫
+# W-5，而同一 commit message 里的 W-5 是另一件事。以 29 号文的 **W-7** 为准，旧标签仅作
+# grep 线索保留（三个标签指同一处＝历史包袱，不再新增）。
+#
+# ★原缺陷（v0.9.74 引入的回归，已本机等价实验坐实）★
+# 原实现按 `sys.platform`（**本机**）选 stat 语法：darwin → BSD `stat -f`，否则 GNU `stat -c`。
+# 但 `_run_check_split` 是**沙箱优先**的，沙箱是 Linux ⇒ 开发机 macOS 上跑出来的命令带 BSD
+# 语法却在 Linux 里执行 ⇒ `stat` 报错被 `2>/dev/null` 吞掉 ⇒ xargs 无输出 ⇒ 空输入喂给
+# `cksum` ⇒ 签名恒为 **`4294967295 0`**（实测：改文件前后一字不变）⇒ 缓存**永不失效**。
+# 关键咬合点：下面"签名拿不到 → 不缓存"的兜底只认**空串**，而空输入的 cksum 是**非空常量**
+# ⇒ 兜底被完全绕过（这正是"降级路径必须机读可辨"那条硬检查的反例：失败态与成功态同形）。
+# 危害面：5 个消费者全是 JVM 全树符号扫描且位于 repair 收敛循环内 —— `_attempt_symbol_repair`
+# 会拿**过期频次表**做改名决策，#114 反震荡判据的前提（频次表反映当前树）随之失效。
+#
+# 治法不是"按执行环境选 stat 语法"（那还得判有没有沙箱，判错就复发同一类），而是**把平台
+# 依赖整条删掉**：`cksum` 是 POSIX 工具，GNU/BSD 都有且输出同构（每文件一行"校验和 大小
+# 文件名"），故 `find -print0 | xargs -0 cksum | sort | cksum` 在两侧行为一致。
+# 本机实测它能区分：内容改动 / 文件删除 / 改名（后两者是 stat 版也能覆盖的面，不退化）。
+# 代价＝读一遍源文件字节；相对它保护的 60-120s 全树 grep 可忽略。
 _SCAN_CACHE: dict[tuple[str, str], tuple[str, tuple[int, str, str]]] = {}
+# 空输入的 `cksum` 输出（GNU/BSD 同值）。它同时是"树里没有源文件"与"命令整条失败"的取值
+# ⇒ 两者机读不可辨 ⇒ 一律当【无证据】处理，绝不据它缓存（fail-closed 方向：宁可多扫一次，
+# 绝不返回可能陈旧的符号表）。
+_EMPTY_CKSUM = "4294967295 0"
 _SCAN_SIG_CMD = (
     "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
-    "| xargs -0 stat -c '%n|%s|%Y' 2>/dev/null | sort | cksum"
-)
-_SCAN_SIG_CMD_DARWIN = (
-    "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
-    "| xargs -0 stat -f '%N|%z|%m' 2>/dev/null | sort | cksum"
+    "| xargs -0 cksum 2>/dev/null | sort | cksum"
 )
 
 
 def _scan_sig_command() -> str:
-    return _SCAN_SIG_CMD_DARWIN if sys.platform == "darwin" else _SCAN_SIG_CMD
+    """签名命令。平台中立 ⇒ 无分支：本机与沙箱用同一条（原按 sys.platform 分叉正是 W-7 根因）。"""
+    return _SCAN_SIG_CMD
 
 
 def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -2953,6 +3008,13 @@ def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[i
         sig = (sig_out or "").strip()
     except Exception:  # noqa: BLE001
         sig = ""  # 签名拿不到 → 不缓存，照常扫描（安全兜底，绝不返回可能陈旧的结果）
+    # ★W-7★ 空 cksum 与真失败同值 → 视为无签名。这一条必须与上面的 `sig = ""` 并列存在：
+    # 异常路径给空串，而"命令成功但输出是空 cksum"走的是**正常返回**路径，两者来源不同。
+    if sig == _EMPTY_CKSUM:
+        logger.debug(
+            "[L1·A7] 全树签名为空 cksum(%s)——树内无 JVM 源文件或签名命令失效，两者不可辨"
+            "→ 本次不缓存（宁可重扫，绝不用可能陈旧的符号表）: %s", sig, project_path)
+        sig = ""
     key = (project_path, scan_cmd)
     if sig:
         cached = _SCAN_CACHE.get(key)

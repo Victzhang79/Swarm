@@ -389,6 +389,42 @@ def _inject_npm(path: Path, dep: str, coord) -> bool:
     return True
 
 
+def _toml_insert_ok(original: str, candidate: str, section: str, name: str) -> bool:
+    """#29-2 W-1：TOML 单条依赖插入的【事实】后置校验。
+
+    三条断言全过才算插对：① candidate 是合法 TOML；② `[section].name` **真的**存在于
+    结果里；③ 把该键摘掉后与 original 逐键相等（其它值一个都没变）。
+
+    ★为什么不能只验语法★：插入锚点是正则找 `[section]` 行，而该行可能出现在**多行字符串
+    值**里（`description = \"\"\"…\\n[dependencies]\\n…\"\"\"` 是常见写法）。此时依赖被插进
+    字符串 ⇒ 用户 manifest 的值被污染、真依赖没进去、而结果**仍是合法 TOML** ⇒ 只验
+    `tomllib.loads` 的闸恒放行（也正因如此那道闸原本不可独立证伪——冗余防御互相兜底）。
+    ③ 是其中最强的一条：它把"文本级插入落错位置"整类问题一次性关掉，不依赖穷举形态
+    （血规：声称穷举必须指出权威来源——这里改成不穷举，直接对账端状态）。
+
+    名字归一：Cargo.toml 惯用连字符、rustc 诊断用下划线，两种写法指同一 crate；断言 ②
+    两种都认（否则合法注入会被自己的校验冤杀）。
+    """
+    import tomllib
+    try:
+        new_obj = tomllib.loads(candidate)
+        old_obj = tomllib.loads(original)
+    except Exception:  # noqa: BLE001 — 含 TOMLDecodeError；原文畸形也走 fail-closed
+        return False
+    sec_new = new_obj.get(section)
+    if not isinstance(sec_new, dict):
+        return False
+    _cands = {name, name.replace("-", "_"), name.replace("_", "-")}
+    hit = next((k for k in sec_new if k in _cands), None)
+    if hit is None:
+        return False
+    stripped = {k: (dict(v) if isinstance(v, dict) else v) for k, v in new_obj.items()}
+    stripped[section].pop(hit, None)
+    if not stripped[section] and not isinstance(old_obj.get(section), dict):
+        stripped.pop(section, None)
+    return stripped == old_obj
+
+
 def _read_strict_utf8(path: Path, stack: str) -> str | None:
     """cargo/go 注入是全文读改写：非 UTF-8 字节严格失败返回 None（errors=\"ignore\" 会静默
     丢字节再写回 = 损坏用户文件）。"""
@@ -437,23 +473,26 @@ def _inject_cargo(path: Path, dep: str, coord) -> bool:
     # 内联表正则被字符串内 `}` 截断/兄弟 raw 依赖来源文件上下文时，盲写会产出
     # 非法 TOML 直接毒化目标 manifest。校验不过 → 回退 version-only 再校；
     # 再不过 → fail-closed 不注（诚实边界：丢保 features 也不产毒）。
-    import tomllib
+    # ★#29-2 W-1 升级：语法合法 ≠ 插对地方★ 原 M-2 只验 `tomllib.loads` 不抛。实测缺陷：
+    # `description = """…\n[dependencies]\n…"""`（多行字符串里写用法说明）时，`_insert` 的
+    # 正则锚点命中【字符串内】那一行 ⇒ 依赖被插进 description 值 ⇒ ① 用户 manifest 的
+    # description 被污染并直接进交付 diff ② 真依赖【没注进去】 ③ 产出**仍是合法 TOML**
+    # ⇒ 旧校验完全看不见，且函数返回 True ⇒ 调用方记 injected+=1、触发重跑、构建照旧缺
+    # 同一依赖 ⇒ repair 收敛循环空烧轮次。故校验升级为 `_toml_insert_ok`（判事实：条目真
+    # 在目标 section 里，且其它值一个都没变）。
     if raw:
         candidate = _insert(f"{raw}\n")
-        try:
-            tomllib.loads(candidate)
-        except tomllib.TOMLDecodeError:
+        if not _toml_insert_ok(text, candidate, section, name):
             logger.warning(
-                "[L1.2.1·repair] cargo raw 移植后 TOML 校验不过（内联表截断/上下文依赖），"
-                "回退 version-only 注入: %s -> %s", dep, path)
+                "[L1.2.1·repair] cargo raw 移植后 TOML 后置校验不过（内联表截断/上下文依赖/"
+                "锚点落在多行字符串内），回退 version-only 注入: %s -> %s", dep, path)
             raw = None
     line = f"{raw}\n" if raw else f'{name} = "{ver}"\n'
     new = _insert(line) if not raw else candidate
-    try:
-        tomllib.loads(new)
-    except tomllib.TOMLDecodeError:
+    if not _toml_insert_ok(text, new, section, name):
         logger.warning(
-            "[L1.2.1·repair] cargo 注入后 TOML 校验不过，fail-closed 不注: %s -> %s", dep, path)
+            "[L1.2.1·repair] cargo 注入后 TOML 后置校验不过，fail-closed 不注"
+            "（宁可让构建如实再报缺依赖，绝不产毒/伪成功）: %s -> %s", dep, path)
         return False
     path.write_text(new, encoding="utf-8")
     return True

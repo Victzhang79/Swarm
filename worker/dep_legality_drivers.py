@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -280,21 +281,148 @@ class PythonDriver:
     probe_without_namespace = True
 
     # PEP 508 简化：name[extra,extra]>=1.0,<2; marker
+    # ★#29-2 W-6★ 本正则**只许用于 requirements.txt**（一行一条 PEP 508 串）。
+    # 曾配 re.MULTILINE 直接扫 pyproject.toml 全文 ⇒ 把 TOML 的「键 = 值」当
+    # 「包名 + 版本约束」：实测标准 PEP 621 文件解析出 9 条"依赖"全是 TOML 键
+    # （name/version/description/requires-python/build-backend/line-length/dev...），
+    # 而真依赖 flask/requests/pydantic/pytest/ruff **一条没解析到**。
+    # 后果非确定性且严重：哪些键被判 prune 取决于该键名在 PyPI 是否恰好是真包
+    # （实测 `requires`/`version`/`dependencies` 有包→存活；`name`/`description`/
+    # `build-backend`/`requires-python`/`dev`/`line-length` 查无→**判 prune 删掉**）。
+    # 删掉 [project].name 与 build-backend 后工程无法构建；某些排布下删除还会切断
+    # 字符串字面量令文件不再是合法 TOML —— 而这道闸的存在理由（dep_legality.py:31-33
+    # 「坏坐标 = manifest 解析期崩塌会连坐整个工作区」）**正是它自己制造的故障**。
     _PKG_RE = re.compile(
         r'^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:\[[^\]]+\])?\s*'
         r'((?:[<>=~!]+\s*[^\s;]+\s*,?\s*)*)', re.MULTILINE)
 
+    # PEP 508 串（数组元素内）→ 包名 / 版本约束。extras、marker、url 形态在此剥离。
+    _SPEC_RE = re.compile(
+        r'^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*'
+        r'((?:[<>=~!]=?\s*[^\s,;]+\s*,?\s*)*)')
+
+    # TOML **意图**信号（与"是否解析成功"正交）：
+    #   ① 独占一行的表头 `[project]` / `[tool.ruff]` —— PEP 508 绝不会让 `[` 开头
+    #      （extras 写在包名之后：`pkg[extra]>=1`），故这是无歧义信号；
+    #   ② 行首 `键 = 值`（单个 `=`，排除 PEP 508 的 `==`）。
+    _TOML_TABLE_RE = re.compile(r'^\s*\[[^\]]+\]\s*$', re.MULTILINE)
+    _TOML_KV_RE = re.compile(r'^[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=[ \t]*(?!=)',
+                             re.MULTILINE)
+
+    @classmethod
+    def _looks_like_toml(cls, text: str) -> bool:
+        """文本【意图】是 TOML 吗（不管它是否合法）。
+
+        ★为什么必须与 `_is_pyproject` 分开★：`_is_pyproject` 失败有两种完全不同的原因
+        ——「这是 requirements.txt」与「这是**坏掉的** pyproject.toml」。把两者混为一谈
+        会让畸形 TOML 落进行正则，**原样复发 W-6**（实测：坏 pyproject 被解析出
+        `name` / `dependencies` 两条"依赖"）。兜底路径不能与主判据共用同一个缺口。
+        """
+        return bool(cls._TOML_TABLE_RE.search(text) or cls._TOML_KV_RE.search(text))
+
+    @classmethod
+    def _is_pyproject(cls, text: str) -> bool:
+        """能被 tomllib 解析【且】含 pyproject 的权威顶层表之一。"""
+        try:
+            data = tomllib.loads(text)
+        except Exception:
+            return False
+        return any(k in data for k in ("project", "build-system", "tool"))
+
     def parse_deps(self, text: str) -> list[dict]:
+        if self._is_pyproject(text):
+            return self._parse_pyproject(text)
+        if self._looks_like_toml(text):
+            # 意图是 TOML 但解析不出 ⇒ **绝不**退化成行正则去猜（那正是 W-6 本体）。
+            # fail-honest：如实丢弃并留 WARNING（纪律：解析不出→丢弃，绝不臆造）。
+            logger.warning(
+                "[dep-legality·python] manifest 形似 TOML 但 tomllib 解析失败 → "
+                "本轮不处置任何依赖（fail-honest：绝不用行正则把 TOML 键当包名，"
+                "那会剪掉 name/description/build-backend 等元数据并毁掉 manifest）")
+            return []
+        return self._parse_requirements(text)
+
+    def _parse_pyproject(self, text: str) -> list[dict]:
+        """tomllib 真解析，**只取** [project].dependencies 与 optional-dependencies 数组元素。
+
+        `block` 取【带引号的数组元素原文】（如 `"flask>=3.0"`）——必须能在原文里唯一定位，
+        否则 enforce() 的 remove/rewrite 会命中别处（那是比不解析更坏的结局）。
+        同一字面量在文件里出现多次 ⇒ 定位不唯一 ⇒ **丢弃该条**（fail-honest，
+        绝不赌它删的是哪一处）。
+        """
+        try:
+            data = tomllib.loads(text)
+        except Exception as exc:   # 走到这里说明 _is_pyproject 之后文本变了；防御性
+            logger.warning("[dep-legality·python] pyproject.toml 解析失败 → 本轮不处置"
+                           "任何依赖（fail-honest，绝不用行正则猜 TOML）: %s", exc)
+            return []
+        proj = data.get("project")
+        if not isinstance(proj, dict):
+            return []
+        specs: list[str] = []
+        _deps = proj.get("dependencies")
+        if isinstance(_deps, list):
+            specs.extend(s for s in _deps if isinstance(s, str))
+        _opt = proj.get("optional-dependencies")
+        if isinstance(_opt, dict):
+            for _grp in _opt.values():
+                if isinstance(_grp, list):
+                    specs.extend(s for s in _grp if isinstance(s, str))
         out: list[dict] = []
-        for m in self._PKG_RE.finditer(text):
+        seen: set[str] = set()
+        for spec in specs:
+            if spec in seen:
+                continue        # 同一 spec 在多个 group 里重复声明 → 只处置一次
+            seen.add(spec)
+            # url/vcs 依赖（`pkg @ git+https://...`）：PyPI 里本来就没有，探针必查无
+            # ⇒ 会被误剪。整条跳过（与 npm 的 file:/git+ 前缀分档同理）。
+            if "@" in spec:
+                continue
+            m = self._SPEC_RE.match(spec)
+            if not m:
+                continue
             name = m.group(1).strip()
-            ver = m.group(2).strip()
-            # 忽略空版本（可能是无约束或只写包名）
+            ver = (m.group(2) or "").strip().rstrip(",").strip()
+            if not name:
+                continue
+            # 唯一定位：数组元素在原文里的带引号形态
+            block = None
+            for q in ('"', "'"):
+                cand = f"{q}{spec}{q}"
+                if text.count(cand) == 1:
+                    block = cand
+                    break
+            if block is None:
+                logger.warning("[dep-legality·python] 依赖 %r 在 pyproject.toml 里定位不唯一"
+                               "（出现 0 或多次）→ 不处置该条（绝不赌改哪一处）", spec)
+                continue
+            out.append({"namespace": "", "name": name,
+                        "version": ver or None, "block": block})
+        return out
+
+    def _parse_requirements(self, text: str) -> list[dict]:
+        """requirements.txt：一行一条 PEP 508 串（行正则的**唯一**合法用途）。"""
+        out: list[dict] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # pip 指令行（-r/-e/--index-url 等）与 url 依赖：不是可探针的包坐标
+            if line.startswith("-") or "@" in line or "://" in line:
+                continue
+            m = self._SPEC_RE.match(line)
+            if not m:
+                continue
+            name = m.group(1).strip()
+            ver = (m.group(2) or "").strip().rstrip(",").strip()
             if not name or name.lower().startswith("http"):
                 continue
-            block = m.group(0)
+            if text.count(raw) != 1:
+                logger.warning("[dep-legality·python] requirements 行 %r 定位不唯一 → 不处置",
+                               line)
+                continue
             out.append({"namespace": "", "name": name,
-                        "version": ver if ver else None, "block": block})
+                        "version": ver or None, "block": raw})
         return out
 
     def managed_names(self, root_text: str) -> set[str]:
@@ -306,18 +434,56 @@ class PythonDriver:
     def rewrite_namespace(self, block: str, namespace: str) -> str:
         return block
 
+    @staticmethod
+    def _unquote(block: str) -> tuple[str, str]:
+        """block → (引号, 裸 spec)。pyproject 的 block 带引号，requirements 的不带。"""
+        if len(block) >= 2 and block[0] == block[-1] and block[0] in ('"', "'"):
+            return block[0], block[1:-1]
+        return "", block
+
     def rewrite_name(self, block: str, name: str) -> str:
-        return re.sub(r'^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)', name, block, count=1)
+        q, spec = self._unquote(block)
+        new = re.sub(r'^\s*([A-Za-z0-9][A-Za-z0-9._-]*)', name, spec, count=1)
+        return f"{q}{new}{q}"
 
     def rewrite_version(self, block: str, version: str) -> str:
-        return re.sub(r'([A-Za-z0-9][A-Za-z0-9_.-]*.*?)([<>=~!]+\s*[^\s;]+)',
-                      rf'\g<1>=={version}', block, count=1)
+        q, spec = self._unquote(block)
+        new = re.sub(r'([A-Za-z0-9][A-Za-z0-9._-]*.*?)([<>=~!]+\s*[^\s;]+)',
+                     rf'\g<1>=={version}', spec, count=1)
+        return f"{q}{new}{q}"
 
     def root_name(self, root_text: str) -> str | None:
-        m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', root_text, re.MULTILINE)
+        """[project].name —— 走 tomllib，不用行正则。
+
+        行正则有两个坑，都会把错的工程名喂给成员/前缀判定（进而误判 fix_name/prune）：
+          ① 命中 `[tool.*]` 下的同名 `name =` 键（取到别人的名字）；
+          ② 畸形 TOML 上跨行匹配出垃圾（实测坏文件取到 `unterminated\\ndependencies = [`）。
+        故与 parse_deps 用**同一套两层判别**：形似 TOML 而解析不出 → None（不猜）。
+        """
+        if self._is_pyproject(root_text):
+            try:
+                proj = tomllib.loads(root_text).get("project")
+            except Exception:  # noqa: BLE001 — 解析不出就当没有根名（不猜）
+                return None
+            if isinstance(proj, dict):
+                n = proj.get("name")
+                return n if isinstance(n, str) and n else None
+            return None
+        if self._looks_like_toml(root_text):
+            return None      # 坏 TOML：绝不用行正则猜工程名
+        # requirements.txt 等非 TOML manifest 本就没有"工程名"概念
+        m = re.search(r'^[ \t]*name[ \t]*=[ \t]*["\']([^"\'\n]+)["\']',
+                      root_text, re.MULTILINE)
         return m.group(1) if m else None
 
     def remove(self, text: str, block: str) -> str:
+        """删一条依赖。pyproject 的 block 是数组元素 ⇒ 连同其后逗号/换行一起删，
+        绝不留下 `[, "b"]` 这种非法 TOML；requirements 的 block 是整行 ⇒ 删行。"""
+        q, _spec = self._unquote(block)
+        if q:
+            # 数组元素：吃掉前导空白 + 元素 + 尾随逗号与空白（含换行）
+            pat = r"[ \t]*" + re.escape(block) + r"[ \t]*,?[ \t]*\n?"
+            return re.sub(pat, "", text, count=1)
         return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
 
 

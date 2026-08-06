@@ -151,8 +151,11 @@ MUTATIONS = [
         "X-M10a：NpmDriver 从 DRIVERS 摘除（npm 工程依赖合法性回退零覆盖；"
         "接线锁必须红——driver_for('npm') → None → 臂直接返回）",
         DL,
-        'DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver(), "npm": NpmDriver()}',
-        'DRIVERS: dict[str, ManifestDriver] = {"maven": MavenDriver()}',
+        # ★落点更新（#29-2 复跑时发现已死）★：DRIVERS 表从两项长到六项、写法改成多行，
+        # 原来那条单行字面量落点**在本仓已不存在** ⇒ 这条锁自那次扩表起一直报"落点未命中"
+        # ＝零覆盖。改成只摘 npm 那一行（表继续长也不会再漂）。
+        '    "npm": NpmDriver(),\n',
+        '',
         ['test_xm10_gate_dispatches_to_npm_by_manifest_presence'],
     ),
     (
