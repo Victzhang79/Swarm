@@ -128,16 +128,94 @@ def test_rate_limiter_evicts_idle_buckets_under_cap(monkeypatch):
     assert len(limiter._buckets) == 1, "达上限应清扫已满闲置桶只留新桶（F4 回归）"
 
 
-def test_metrics_label_value_escaped():
-    """复核 F5：Prometheus label value 三重转义（反斜杠/换行/引号），非仅剥引号。"""
+# ── F5：Prometheus label value 转义（行为级，两个转义站点各一条）──
+
+def _hostile(marker: str) -> str:
+    """含三种危险字符的取值：反斜杠、双引号、换行。
+
+    换行是真正的注入面 —— 未转义时它会把一条 metric 行**劈成两行**，第二行是攻击者
+    完全控制的伪造 metric，Prometheus 会当成真指标收下。
+
+    `marker` 让**每个站点用不同的伪造 metric 名**（双复核 L-2）：共用一个名字时，
+    `_assert_label_escaped` 里那条 body 级"伪造行不存在"断言会跨站点误指——A 站点没转义
+    却在检查 B 站点时报错，归因错人。
+    """
+    return f'a\\b"c\nswarm_injected_{marker}_total 999'
+
+
+_HOSTILE_STATUS = _hostile("status")
+_HOSTILE_DEGRADE = _hostile("degrade")
+
+
+def _assert_label_escaped(body: str, metric: str, label: str, *, marker: str) -> None:
+    """断某条 metric 的 label value 三种字符都已转义，且整块仍是合法 exposition。"""
+    lines = [ln for ln in body.splitlines() if ln.startswith(metric + "{")]
+    assert len(lines) == 1, f"{metric} 应恰有一行（换行未转义会劈成多行）: {lines}"
+    line = lines[0]
+    # 三重转义逐项断（缺任一项都红，不用「至少 N 个」下界）
+    assert "\\\\" in line, f"反斜杠未转义: {line}"
+    assert "\\n" in line, f"换行未转义（注入面）: {line}"
+    assert '\\"' in line, f"双引号未转义: {line}"
+    # 注入未生效：伪造的 metric 名绝不能作为独立行出现（按站点专属 marker 判，不跨站点误指）
+    assert not any(ln.startswith(f"swarm_injected_{marker}_total") for ln in body.splitlines()), \
+        f"换行注入成功——{metric} 站点的伪造 metric 成了独立行"
+    # label value 内部不得有裸引号（会提前闭合 label，后续内容被解析成语法垃圾）
+    inner = line[line.index("{") + 1: line.rindex("}")]
+    assert inner.startswith(label + '="') and inner.endswith('"'), inner
+    val = inner[len(label) + 2: -1]
+    assert '"' not in val.replace('\\"', ""), f"label value 内有裸引号: {inner}"
+
+
+def _metrics_body(monkeypatch, *, statuses=None, degrades=None) -> str:
     import sys
-    import inspect
-    import swarm.api.app  # noqa: F401
+
+    from fastapi.testclient import TestClient
+
+    import swarm.api.app  # noqa: F401  （只为确保模块已导入）
+    from swarm.infra.degrade import reset_degrade_counts
+
+    # ★必须走 sys.modules★：`swarm.api` 包把 FastAPI 实例 re-export 成同名属性 `app`，
+    # `import swarm.api.app as m` 拿到的是**那个实例**而非模块（属性遮蔽子模块）。
     appmod = sys.modules["swarm.api.app"]
-    src = inspect.getsource(appmod.metrics)
-    # 源码应含三个 .replace（反斜杠、换行、引号），不再是单个剥引号
-    assert src.count(".replace(") >= 3, "label 未做三重转义（F5 回归）"
-    assert "F5" in src
+
+    if statuses is not None:
+        monkeypatch.setattr(appmod.store, "count_tasks_by_status", lambda: statuses)
+    reset_degrade_counts()
+    if degrades is not None:
+        # 只 patch **定义模块**：`metrics()` 里是函数内 `from swarm.infra.degrade import
+        # degrade_counts`（调用时解析），所以打在 `swarm.infra.degrade` 上才生效；
+        # 打在 `swarm.api.app` 上是无效的（那里根本没有这个模块级名字）。
+        import swarm.infra.degrade as dg
+        monkeypatch.setattr(dg, "degrade_counts", lambda: degrades)
+    resp = TestClient(appmod.app).get("/api/metrics")
+    assert resp.status_code == 200, resp.text
+    return resp.text
+
+
+def test_metrics_task_status_label_escaped(monkeypatch):
+    """站点① swarm_tasks_total 的 status label 三重转义。
+
+    ★行为级★：原实现只断 `metrics` 源码里 `.replace(` 出现 **≥3** 次。实测源码共 6 次
+    （两个站点各 3 次）⇒ 把**任一整个站点**改成完全不转义，剩 3 次仍满足 `>= 3` ⇒ 绿
+    （29 号文 T-A3，与 `_BUILDER_VERSION >= 8` 同属已两次出事的下界断言族）。
+    """
+    body = _metrics_body(monkeypatch, statuses={_HOSTILE_STATUS: 3})
+    _assert_label_escaped(body, "swarm_tasks_total", "status", marker="status")
+
+
+def test_metrics_degrade_label_escaped(monkeypatch):
+    """站点② swarm_degrade_total 的 category label 三重转义（与站点①互不背书）。"""
+    body = _metrics_body(monkeypatch, degrades={_HOSTILE_DEGRADE: 7})
+    _assert_label_escaped(body, "swarm_degrade_total", "category", marker="degrade")
+
+
+def test_metrics_line_count_stable_under_injection(monkeypatch):
+    """注入取值不得改变行数 —— 这是「未转义换行」最直接的机读判据。"""
+    clean = _metrics_body(monkeypatch, statuses={"done": 1}, degrades={"a.b": 1})
+    hostile = _metrics_body(monkeypatch, statuses={_HOSTILE_STATUS: 1},
+                            degrades={_HOSTILE_DEGRADE: 1})
+    assert len(clean.splitlines()) == len(hostile.splitlines()), \
+        "敌意取值改变了行数 ⇒ 换行未转义，攻击者可凭空插入 metric 行"
 
 
 def test_resume_binds_project_id_in_logs():

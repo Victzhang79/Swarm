@@ -52,8 +52,61 @@ def test_wiring_on_startup_calls_migrations_before_ensure_tables():
     print("  ✅ on_startup 先 run_migrations 后 ensure_tables")
 
 
+def test_migration_failure_propagates_out_of_startup():
+    """★行为级★：run_migrations 抛异常必须冒出 on_startup（fail-fast，绝不带病启动）。
+
+    ★为何不再用源码窗口切片★（29 号文 T-A6）：原实现断「`run_migrations` 调用行与
+    **首个** `ensure_tables` 字样之间的切片里没有 `except` 三个字母」。两条绕法都让它绿：
+      ① 用 `with contextlib.suppress(Exception):` 包住那一行 —— 异常被吞而源码里**没有**
+         `except` 字样；
+      ② 把 try 开在 `run_migrations` **之前**、except 收在 `ensure_tables` **之后**
+         （外层兜底）—— 切片窗口内同样无 `except`。
+    加重：同文件两个集成测试只断「被调用 + 盖章」，**无任何**测试断异常会向上抛
+    ⇒ 迁移 fail-fast 此前只有那一道 getsource 守卫（且它还与 `_pg_available`
+    collection 期 skip 叠加）。
+
+    ★本条不需要 PG★：`run_migrations` 之前的语句全是日志/校验/sidecar 或 fail-open
+    的 try 块，patch 成抛异常后在碰库之前就炸了 ⇒ CI（无库）同样真跑，不会被 skip 掉。
+    """
+    import importlib
+
+    import swarm.infra.migrations.runner as runner_mod
+    from fastapi.testclient import TestClient
+
+    from swarm.api.app import app
+    from swarm.project import store as store_mod
+
+    app_mod = importlib.import_module("swarm.api.app")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("MIGRATION_BOOM_PROBE")
+
+    # ★把 run_migrations 之前的两处不可逆副作用摘掉★（hunter F10，已实测）：
+    #   ① `store.register_notification_hook(_push_notification)` 会把一个闭包住**已关闭
+    #      event loop** 的 hook 追加进模块级 `_notification_hooks`，**永不摘除** ⇒ 后续任何
+    #      create_notification + caplog 断"无 WARNING"的测试会被
+    #      `_fire_notification_hooks` 的 "notification hook failed" 污染；
+    #   ② `_init_sidecar()` → `apply_sandbox_env()` 把 E2B_API_KEY（**来自 .env 的真 key**）、
+    #      E2B_API_URL、CUBE_REMOTE_* 写进 os.environ —— 非 SWARM_ 前缀，conftest 的
+    #      `_isolate_swarm_env` 不还原。实测泄漏 1 个 hook + 6 个 env 键。
+    # 本条只验"迁移失败会向上抛"，不需要真 startup 的其余部分；摘掉后命题不变
+    # （异常仍从 run_migrations 冒出），副作用面归零。
+    with patch.object(runner_mod, "run_migrations", _boom), \
+         patch.object(app_mod, "_init_sidecar", lambda: None), \
+         patch.object(store_mod, "register_notification_hook", lambda _f: None):
+        with pytest.raises(RuntimeError, match="MIGRATION_BOOM_PROBE"):
+            with TestClient(app):
+                pass
+    print("  ✅ 迁移失败向上抛（fail-fast）")
+
+
 def test_wiring_migration_is_failfast_not_swallowed():
-    """迁移调用不得被 try/except 吞（fail-fast）。校验调用行与其后建表 try 之间无兜底。"""
+    """源码侧辅助守卫：调用行与其后建表 try 之间无兜底。
+
+    ★不再是唯一守卫★：真正的 fail-fast 命题由上面
+    `test_migration_failure_propagates_out_of_startup` 行为级钉住（那条才有区分力）。
+    本条保留为「读代码时的意图提示」，成本近零；它单独**不足以**证明 fail-fast。
+    """
     import importlib
     app_mod = importlib.import_module("swarm.api.app")
 
@@ -62,7 +115,7 @@ def test_wiring_migration_is_failfast_not_swallowed():
     after = src[src.index("await loop.run_in_executor(None, run_migrations"):]
     head = after[: after.index("ensure_tables")]
     assert "except" not in head, "run_migrations 被 try/except 包裹→非 fail-fast（P0-C 回归）"
-    print("  ✅ run_migrations 为 fail-fast")
+    print("  ✅ run_migrations 为 fail-fast（源码侧辅助）")
 
 
 # ── 集成（需 PG） ────────────────────────────────────

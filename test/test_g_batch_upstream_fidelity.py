@@ -183,17 +183,182 @@ def test_clip_hard_cuts_when_no_boundary_available():
     assert "未展示" in out
 
 
-def test_module_level_prompts_no_longer_use_bare_slices():
+_MARK_EVERY = 500
+
+
+def _marked_requirement(total_chars: int) -> str:
+    """造一段带位置标记的长需求：每 500 字符埋一个 `MARK_04500` 形式的锚。
+
+    有了锚就能机读判断「prompt 里到底进了原文的前多少字符」——这是区分
+    「走 clip（9000）」与「裸切片（2000）」的唯一确定性判据。
+    """
+    parts: list[str] = []
+    pos = 0
+    while pos < total_chars:
+        head = f"MARK_{pos:05d} 需求条目：系统应支持第 {pos // _MARK_EVERY} 项能力。"
+        # ★必须补齐到恰好 _MARK_EVERY 字符★：否则锚的编号与真实字符偏移不符
+        # （每块仅 ~31 字符时 MARK_08000 其实躺在第 500 字符处），锚就失去判据意义。
+        pad = _MARK_EVERY - len(head) - 1
+        assert pad >= 0, "标记行本身超过一个区块长度"
+        parts.append(head + "填" * pad + "\n")
+        pos += _MARK_EVERY
+    out = "".join(parts)
+    assert len(out) == (total_chars // _MARK_EVERY) * _MARK_EVERY, \
+        f"锚偏移自检失败: {len(out)}"
+    return out
+
+
+@pytest.mark.asyncio
+async def test_module_level_prompts_carry_far_more_than_bare_slice(monkeypatch):
     """★决定"这个模块建哪些文件"的节点此前只看到需求前 2000 字符（丢约 85%）★
-    断言的是接线事实（这些点走 clip 而非裸切片），不是实现细节。"""
+
+    ★行为级★（29 号文 T-A10）：原实现断 `src.count('_clip(task_desc') >= 3`，实测恰为 3
+    ⇒ **恰在界上**：任何人新增第 4 个调用点后，守卫立刻失去一颗牙（可删一处仍绿）且
+    无任何信号；三条 `not in` 负向断言也能用 `task_desc[:2000 ]`（多一空格）或中间
+    变量绕过。这里改为断**进 prompt 的实际内容**：埋位置锚，验原文前 8000+ 字符确实
+    到了 prompt，且截断处有如实尾注。
+    """
+    import swarm.brain.planning_nodes as pn
+
+    req = _marked_requirement(12000)
+    seen: list[str] = []
+
+    class _Resp:
+        def __init__(self, content):
+            self.content = content
+
+    class _CapturingLLM:
+        async def ainvoke(self, msgs):
+            seen.append("\n".join(m["content"] for m in msgs))
+            if "consumer_map" in msgs[0]["content"]:      # Stage A 骨架
+                return _Resp('{"skeleton": {"conventions": [], "constants": [], "consumer_map": []}}')
+            return _Resp('{"interfaces": [], "dtos": [], "apis": [], "dependencies": []}')
+
+    monkeypatch.setattr(pn, "_get_brain_llm", lambda: _CapturingLLM())
+    await pn.contract_design({
+        "complexity": "ultra",
+        "tech_design": {"modules": [{"name": "channel", "responsibility": "渠道"},
+                                    {"name": "engine", "responsibility": "引擎"}],
+                        "data_model": "x"},
+        "task_description": req,
+    })
+
+    assert seen, "夹具前提失效：一次 LLM 调用都没发生，下面的断言会 vacuous 通过"
+    # 前提锁：需求原文真的超过了任何一个 clip 上限（否则「未截断」是因为它本来就短）
+    assert len(req) > 9000, f"夹具需求仅 {len(req)} 字符，不足以触发截断路径"
+    # ★逐条相等锁，不是 `any` 下界★（复核 M-1① + 我自己的突变实验修正）：
+    # 初版写的是 `if "MARK_00000" not in prompt: continue` + 循环外一条 `any(...)`。
+    # 实测仍不够——`contract_design` 有**两个**需求原文注入点（骨架段 `:2594`、逐模块段
+    # `:2689`），只把其中一个置空时：那条 prompt 被 `continue` 跳过、`any` 由**另一个站点**
+    # 满足 ⇒ 依旧全绿（两站点互相背书）。故改为断【带需求原文的 prompt 条数 == 全部条数】：
+    # 任一站点被置空/退回裸切片都会让计数掉下来。
+    with_req = [p for p in seen if "MARK_00000" in p]
+    assert len(with_req) == len(seen), (
+        f"{len(seen)} 条 prompt 里只有 {len(with_req)} 条带需求原文 ⇒ 有注入点被置空/绕过"
+        "（两个站点会互相背书，所以这里必须按条数相等断，不能用 any 下界）"
+    )
+
+    for prompt in with_req:
+        # 裸 [:2000] 只能带到 MARK_01500 左右；走 clip(6000/9000) 必然带到 MARK_05500 以后
+        assert "MARK_05500" in prompt, (
+            "prompt 只带了需求前 ~2000 字符 ⇒ 裸切片复发（决定建哪些文件的节点看不到 85% 需求）"
+        )
+        # 截断必须如实标注（绝不静默丢内容）
+        assert "未展示" in prompt, "超长需求被截断却无尾注 ⇒ LLM 会以为看到了全文并凭猜补全"
+        # 用 len(req) 而非写死 "12000"（hunter F1 附带建议）：把 clip 上限抬到 >len(req) 后
+        # 需求不再被截断，此时该红成"尾注缺失"而不是"数字对不上"——写死字面量会把
+        # 失败原因指向错误方向。
+        assert f"共 {len(req)} 字符" in prompt, "尾注应如实报出原文总字符数"
+
+
+@pytest.mark.asyncio
+async def test_tech_design_stage2_prompt_carries_full_requirement(monkeypatch):
+    """站点③ `_tech_design_staged._gen_one_module`（`planning_nodes.py:1496`，上限 9000）。
+
+    ★这是原 finding 与 `brain/prompt_clip.py` docstring 指名的**那个**节点★
+    （"决定这个模块要建哪些文件的 STAGE2 此前只拿到需求前 2000 字符，丢约 85%"），
+    而它的最外层是 `_tech_design_staged`，**不在 `contract_design` 的驱动路径上**
+    ⇒ 上面那条行为测试覆盖不到它（复核 M-1②，已用 AST 归属核实）。
+    此前它唯一的守卫是 AST 字面量锁——锁的是 `9000` 这个数，不是"文本真的进了 prompt"。
+    """
+    import json
+
+    import swarm.brain.planning_nodes as pn
+
+    req = _marked_requirement(12000)
+    seen: list[str] = []
+
+    class _Resp:
+        def __init__(self, content):
+            self.content = content
+
+    class _StagedLLM:
+        """第 1 次调用回 STAGE1 模块清单，之后回 STAGE2 单模块 file_plan。"""
+
+        def __init__(self):
+            self.n = 0
+
+        async def ainvoke(self, msgs):
+            self.n += 1
+            seen.append("\n".join(m["content"] if isinstance(m, dict) else str(m)
+                                  for m in msgs))
+            if self.n == 1:
+                return _Resp(json.dumps({
+                    "architecture": "分层", "data_model": "DM",
+                    "modules": [{"name": "modA", "responsibility": "A"}],
+                }, ensure_ascii=False))
+            return _Resp(json.dumps({
+                "file_plan": [{"path": "modA/A.java", "action": "create",
+                               "module": "modA", "purpose": "p"}],
+            }, ensure_ascii=False))
+
+    monkeypatch.setattr(pn, "_format_knowledge", lambda state: "")
+    await pn._tech_design_staged(_StagedLLM(), req, "ultra", False, {}, "facts", "", "")
+
+    assert len(seen) >= 2, f"应至少发生 STAGE1+STAGE2 两次调用，实得 {len(seen)}"
+    stage2 = [p for p in seen[1:] if "MARK_00000" in p]
+    assert stage2, (
+        "STAGE2 的 prompt 里一条都没有需求原文 ⇒ 决定「这个模块建哪些文件」的节点看不到需求"
+    )
+    for prompt in stage2:
+        assert "MARK_05500" in prompt, (
+            "STAGE2 只拿到需求前 ~2000 字符 ⇒ 裸切片复发（丢约 85% 需求，原病本体）"
+        )
+        assert "未展示" in prompt, "超长需求被截断却无尾注 ⇒ LLM 会以为看到了全文并凭猜补全"
+
+
+def test_prompt_clip_limits_never_regress_below_6000():
+    """三个需求原文注入点的上限不得被静默调小（下界断言族的正向锁）。
+
+    用 AST 取**实参字面量**而非子串计数：新增第 4 个调用点会让集合变化 ⇒ 红，
+    调小任一上限 ⇒ 红。断的是接线事实（谁以什么上限走 clip），非实现细节。
+    """
+    import ast
     import inspect
+    import pathlib
 
     from swarm.brain import planning_nodes
-    src = inspect.getsource(planning_nodes)
-    assert "task_description=task_desc[:2000]" not in src
-    assert "task_description=task_desc[:2500]" not in src
-    assert "task_description=task_desc[:1500]" not in src
-    assert src.count('_clip(task_desc') >= 3
+
+    src = pathlib.Path(inspect.getsourcefile(planning_nodes)).read_text(encoding="utf-8")
+    limits: list[int] = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "_clip"):
+            continue
+        # 只看第一个实参是 task_desc 的调用（需求原文注入点）
+        if not (node.args and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "task_desc"):
+            continue
+        assert len(node.args) >= 2 and isinstance(node.args[1], ast.Constant), \
+            f"第 {node.lineno} 行的 clip 上限不是字面量，本锁无法核验"
+        limits.append(int(node.args[1].value))
+
+    # 当前三处：_gen_one_module(9000) / contract_design(9000) / _gen_one_module_contract(6000)
+    assert sorted(limits) == [6000, 9000, 9000], (
+        f"需求原文注入点的上限集合变了（实得 {sorted(limits)}）。"
+        "新增注入点或调小上限都会走到这里——请确认新点也走 clip 且上限 >= 6000，再更新本锁。"
+    )
 
 
 # ══════════════════════════════════════════════

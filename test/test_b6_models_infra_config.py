@@ -58,22 +58,33 @@ def test_96_invalidate_cache_all_resets_fernet():
 
 # ─────────────────────────── F5/#97 DB 读失败 warn-once ───────────────────────────
 
-def test_97_db_read_failure_warns_once(caplog):
+def test_97_db_read_failure_warns_once(caplog, secret_store_state):
+    """DR-07-F5(#97)：DB 读失败首次 WARNING、同 key 后续降 DEBUG。
+
+    ★必须清 `_cache`★（#29-3 T-A1 同族第三个假守卫，本轮突变实验坐实）：
+    DB 失败分支也把 `(None, now)` 写进负缓存，于是背靠背第二次调用**根本不进该分支**
+    ⇒ `assert not second_warns` 恒真。实测把 warn-once 拆成「每次都 WARNING」后，
+    不清缓存的第二次调用仍产 0 条 warning（＝该断言零区分力），只有清缓存后的调用
+    才有区分力（基线 0 / 突变 1）。
+    """
     import logging
 
-    import swarm.config.secret_store as ss
-    ss._db_fail_warned.clear()
+    ss = secret_store_state          # 快照+还原三份模块级状态（见 conftest）
     with patch.object(ss, "_get_conn", side_effect=RuntimeError("pg down")), \
          patch.dict(os.environ, {}, clear=False):
         with caplog.at_level(logging.WARNING, logger=ss.logger.name):
             ss.get_secret("MY_KEY", conn_str="postgres://x")
             first_warns = [r for r in caplog.records if r.levelno == logging.WARNING]
         caplog.clear()
+        ss._cache.clear()          # 模拟 TTL 到期：不清则第二次命中负缓存，不进被测分支
         with caplog.at_level(logging.DEBUG, logger=ss.logger.name):
             ss.get_secret("MY_KEY", conn_str="postgres://x")
             second_warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+            second_debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
     assert any("DB 不可用" in r.message for r in first_warns)
     assert not second_warns   # 第二次降 DEBUG
+    assert any("已告警过" in r.getMessage() for r in second_debugs), \
+        "第二次必须【确有】一条 DEBUG——否则「没进分支」与「降了噪」不可辨"
 
 
 # ─────────────────────────── F8/#100 cassette miss 分项 ───────────────────────────

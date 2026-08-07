@@ -64,11 +64,39 @@ def test_m2_workspace_isolated_across_tasks():
     assert seen["B"] == "/tmp/pb", seen
 
 
-def test_m5_secret_decrypt_vs_miss_distinguished():
-    """M5：get_secret 源码应区分 decrypt 失败(warning)与 miss(静默)。"""
-    import inspect
-    from swarm.config import secret_store
-    src = inspect.getsource(secret_store.get_secret)
-    # decrypt 应被 try 单独包裹并 warning
-    assert "解密失败" in src or "decrypt" in src.lower()
-    assert "logger.warning" in src, "decrypt 失败应升级为 warning"
+def test_m5_secret_decrypt_vs_miss_distinguished(monkeypatch, caplog, secret_store_state,
+                                                 fake_secret_conn):
+    """M5：decrypt 失败必须告警、真 miss 必须静默 —— 两者返回值同为 None，只有日志能分辨。
+
+    ★行为级★：原实现只断源码里出现过 `decrypt` 字样 + 函数内**任意位置**有一个
+    `logger.warning`。把 M5 的整个告警块删掉（＝原病复发，与 miss 逐字同构）后，
+    `decrypt` 由 `plaintext = decrypt(row[0])` 满足、`logger.warning` 由底部
+    **DB 失败分支**那个满足 ⇒ 两条断言皆真 ⇒ 绿（29 号文 T-A2，与 T-A1 是同一机制的
+    第二个假守卫）。故这里断的是【可观测差异】本身，不是源码字样。
+    """
+    import logging
+
+    # 夹具经 conftest 的 fixture 取用，不再 `from test.<兄弟测试文件> import`
+    # ——那条路依赖 pytest 把 rootdir 插进 sys.path 才不撞 stdlib `test` 遮蔽（hunter F11）。
+    ss = secret_store_state          # 快照+还原三份模块级状态（见 conftest）
+    monkeypatch.setattr(ss, "_get_conn",
+                        lambda conn_str=None: fake_secret_conn(("cipher-blob",)))
+    monkeypatch.setattr(ss, "decrypt",
+                        lambda _c: (_ for _ in ()).throw(ValueError("bad key")))
+
+    # ① DB 里【有】密文但解不开 → 必须 WARNING（key 轮换/密文损坏，运维必须看见）
+    ss._cache.clear()
+    with caplog.at_level(logging.DEBUG, logger=ss.logger.name):
+        assert ss.get_secret("K_BROKEN") is None
+    broken_warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert broken_warns, "decrypt 失败必须升级为 WARNING（静默回退 .env 旧值会让轮换问题极难排查）"
+    assert any("K_BROKEN" in r.getMessage() for r in broken_warns), "告警必须点名 key"
+
+    # ② 真 miss（无此 secret）→ 必须静默（大多数部署根本没写过 secret_store，回退 .env 是预期）
+    caplog.clear()
+    monkeypatch.setattr(ss, "_get_conn", lambda conn_str=None: fake_secret_conn(None))
+    ss._cache.clear()
+    with caplog.at_level(logging.DEBUG, logger=ss.logger.name):
+        assert ss.get_secret("K_ABSENT") is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], \
+        "真 miss 必须静默——否则每个未迁移的 key 每 30s 刷一条 WARNING（G1-1b 要治的正是噪声）"

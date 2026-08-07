@@ -49,21 +49,55 @@ def test_g3_1_empty_state_noop():
 
 # ══════════════ G P1 降噪/警告消费 ══════════════
 
-def test_g1_secret_store_warn_once(monkeypatch):
-    """G1-1b：同 key 解密失败首次 WARNING、之后 DEBUG（round38c 621 条=52% WARNING）。"""
-    import swarm.config.secret_store as ss
-    ss._decrypt_warned.clear()
-    warns: list = []
-    monkeypatch.setattr(ss.logger, "warning", lambda *a, **k: warns.append(a))
-    monkeypatch.setattr(ss.logger, "debug", lambda *a, **k: None)
-    # 直接驱动 warn-once 逻辑（不接真 DB）：模拟两次同 key 命中告警分支
-    for _ in range(3):
-        if "k1" in ss._decrypt_warned:
-            ss.logger.debug("x")
-        else:
-            ss._decrypt_warned.add("k1")
-            ss.logger.warning("first")
-    assert len(warns) == 1, "同 key 只应首次 WARNING"
+def _drive_decrypt_failure(ss, key: str, times: int) -> None:
+    """真调 `times` 次 get_secret，每次前清缓存以模拟 TTL 到期/多进程各自缓存。
+
+    ★必须清 `_cache`★：decrypt 失败分支会把 `(None, now)` 写进缓存（性能治法），
+    于是背靠背第二次调用**根本不进该分支**——不清缓存就把「warn-once 生效」换成了
+    更弱的「负缓存生效」，删掉整个 warn-once 也照绿（血规 10②）。
+    """
+    for _ in range(times):
+        ss._cache.clear()
+        assert ss.get_secret(key) is None, "解密失败必须返 None（调用方回退 .env）"
+
+
+def test_g1_secret_store_warn_once(monkeypatch, caplog, secret_store_state, fake_secret_conn):
+    """G1-1b：同 key 解密失败首次 WARNING、之后 DEBUG（round38c 621 条=52% WARNING）。
+
+    ★行为级★：真调 `get_secret`，patch `_get_conn` 返一行密文 + `decrypt` 抛异常。
+    原实现把 warn-once 的 if/else 在测试体内**重写了一遍**（生产函数从未被调用），
+    `grep get_secret` = 0 ⇒ 把 `config/secret_store.py` 的 warn-once 整块删掉、
+    乃至删掉整个 `get_secret`，那条测试仍绿（29 号文 T-A1）。
+
+    `secret_store_state` fixture 负责快照+还原三份模块级状态（清 `_cache` 是本测的前提，
+    但不还原会把节流集/负缓存留给后续用例＝顺序依赖 flake）。
+    """
+    import logging
+
+    ss = secret_store_state
+    monkeypatch.setattr(ss, "_get_conn",
+                        lambda conn_str=None: fake_secret_conn(("cipher-blob",)))
+    monkeypatch.setattr(ss, "decrypt",
+                        lambda _c: (_ for _ in ()).throw(ValueError("bad key")))
+
+    with caplog.at_level(logging.DEBUG, logger=ss.logger.name):
+        _drive_decrypt_failure(ss, "KEY_A", 3)
+    # 只认【解密失败】那条告警：同函数底部 DB 失败分支也打 warning，按数量断会零区分力
+    warns = [r for r in caplog.records
+             if r.levelno >= logging.WARNING and "解密失败" in r.getMessage()]
+    debugs = [r for r in caplog.records
+              if r.levelno == logging.DEBUG and "解密失败" in r.getMessage()]
+    assert len(warns) == 1, f"同 key 只应首次 WARNING，实得 {len(warns)}"
+    assert len(debugs) == 2, f"同 key 后续两次应降 DEBUG，实得 {len(debugs)}"
+    assert "KEY_A" in warns[0].getMessage(), "告警必须点名 key（运维据此定位轮换问题）"
+
+    # 节流必须【按 key】而非全局开关：换 key 应再告警一次
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=ss.logger.name):
+        _drive_decrypt_failure(ss, "KEY_B", 1)
+    assert [r for r in caplog.records
+            if r.levelno >= logging.WARNING and "KEY_B" in r.getMessage()], \
+        "换 key 必须重新告警（全局 bool 会让第二个坏 key 全程静默）"
 
 
 def test_g3_2_plan_validation_warnings_in_payload():

@@ -102,11 +102,16 @@ MUTATIONS = [
     ),
     # ── F-3：完全不缓存 None（照搬 F5 的办法 ⇒ 代价放大）──
     (
+        # ★指名测试已修正（#29-3 W-25）★：原先第一名是
+        # `test_f3_ttl_window_suppresses_repeat_network_cost`，但它的夹具走 `/@latest`
+        # ——那 URL **同时**是可变端点，本突变下 `elif _is_mutable_endpoint(key)` 会替
+        # `None` 记一条 300s TTL，缓存照旧命中 ⇒ 该条对本突变**零区分力**（当时全靠
+        # 兄弟条 test_f1 抓住，等于这条锁在替它背书）。改为指名用**非可变** URL 的隔离锁。
         "F-3: 改成完全不缓存 None（退化成 F5 办法 ⇒ per-module 反复烧网）",
         DHC,
         "    cache[key] = value\n    if value is None:",
         "    cache[key] = value\n    if value is None and False:",
-        ["test_f3_ttl_window_suppresses_repeat_network_cost",
+        ["test_f3_none_ttl_branch_isolated_on_non_mutable_url",
          "test_f1_all_three_registries_wired"],
     ),
     # ── F-4：> 臂退回拿补零 floor 当下界 ──

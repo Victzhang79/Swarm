@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 入库夹具（#29-3 T-A5）：真实 RuoYi 根 pom 的最小骨架。
+
+     替代 test_image_builder.py::test_warmup_pom_real_ruoyi 原先写死的
+     /Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi —— 那条路径在本机存在、CI 必不存在，
+     且原实现用【裸 return】跳过（不是 pytest.skip）⇒ CI 上计入 PASSED 且 -rs 报告里看不见。
+
+     ★保留的是「真 pom 与手搓小 pom 的差异面」★（双复核 L-4 已逐条实测，下面只列**真被覆盖**的）：
+       ① 带 xmlns + xsi:schemaLocation ⇒ 解析器必须走 {*} 通配 tag，不能按裸 tag 匹配
+       ② 版本走 ${property} 间接引用 ⇒ 生成器**不解析**它，而是原样拷 <properties> 段；
+          断言里的 "4.0.6" 命中的是被拷进去的 properties 行（摘掉 properties 拷贝就红）
+       ③ 内部模块（com.ruoyi 自身 groupId）**混在 dependencyManagement 里**，与外部依赖同段
+       ④ 内部模块**也出现在顶层 <dependencies>** ⇒ 在同一个 ruoyi 形状夹具里同时覆盖
+          image_builder.py 的**两处独立** _is_internal 判据（dependencyManagement 一处、
+          顶层 dependencies 一处）。
+          ★诚实更正★：双复核 L-4④ 说顶层那条判据"无任何测试覆盖"，**实测是错的**——
+          同文件的 `test_warmup_pom_excludes_internal_modules` 手搓 pom 顶层就有
+          `com.myorg/myorg-common`，摘掉顶层判据那条测试会红。补这一段的真实价值不是
+          "补零覆盖"，而是让**同一个真形状夹具**独立覆盖两处判据（此前 ruoyi 版只覆盖
+          dependencyManagement 那处，顶层那处要靠另一个手搓 pom 背书）。
+       ⑤ 有 <modules> 段（多模块聚合）
+
+     ★以下两条**不是**差异面（实测证伪，别再照抄进新夹具）★：
+       · `<classifier>jakarta</classifier>`：生成器只拼 groupId/artifactId/version，
+         **静默丢弃 classifier**（产出里没有 jakarta）。夹具里留着它是为了证「多一个子元素
+         不会让解析崩」，但"预热的是哪个 artifact 变体"这件事本夹具**没有**覆盖
+         （属既有生产行为，不在 #29-3 范围）。
+       · 注释穿插：`xml.etree` 默认解析器丢弃注释节点，对生成器零影响。
+
+     数值（4.8.3 / 4.0.6 / 2.2.0）与真 pom 同源，改动时以真 pom 为准。 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.ruoyi</groupId>
+    <artifactId>ruoyi</artifactId>
+    <version>4.8.3</version>
+
+    <name>ruoyi</name>
+    <description>若依管理系统</description>
+
+    <properties>
+        <ruoyi.version>4.8.3</ruoyi.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <java.version>17</java.version>
+        <spring-boot.version>4.0.6</spring-boot.version>
+        <shiro.version>2.2.0</shiro.version>
+        <druid.version>1.2.28</druid.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- SpringBoot 依赖 BOM（import 型，必须保留） -->
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- Shiro核心框架（带 classifier 的外部依赖） -->
+            <dependency>
+                <groupId>org.apache.shiro</groupId>
+                <artifactId>shiro-core</artifactId>
+                <classifier>jakarta</classifier>
+                <version>${shiro.version}</version>
+            </dependency>
+
+            <!-- 阿里数据库连接池 -->
+            <dependency>
+                <groupId>com.alibaba</groupId>
+                <artifactId>druid-spring-boot-3-starter</artifactId>
+                <version>${druid.version}</version>
+            </dependency>
+
+            <!-- ↓↓ 内部模块：与外部依赖同段混排，必须按 groupId 排除 ↓↓ -->
+            <dependency>
+                <groupId>com.ruoyi</groupId>
+                <artifactId>ruoyi-system</artifactId>
+                <version>${ruoyi.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>com.ruoyi</groupId>
+                <artifactId>ruoyi-common</artifactId>
+                <version>${ruoyi.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- 顶层 dependencies：与 dependencyManagement 是**两处独立的** _is_internal 判据。
+         真 ruoyi 的这一段是空的，所以顶层那条判据此前零测试覆盖（双复核 L-4④）。 -->
+    <dependencies>
+        <!-- 外部依赖：必须保留 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.30</version>
+        </dependency>
+        <!-- 内部模块：必须按 groupId 排除 -->
+        <dependency>
+            <groupId>com.ruoyi</groupId>
+            <artifactId>ruoyi-framework</artifactId>
+            <version>${ruoyi.version}</version>
+        </dependency>
+    </dependencies>
+
+    <modules>
+        <module>ruoyi-admin</module>
+        <module>ruoyi-framework</module>
+        <module>ruoyi-system</module>
+        <module>ruoyi-common</module>
+    </modules>
+
+    <packaging>pom</packaging>
+</project>

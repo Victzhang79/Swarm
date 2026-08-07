@@ -6,9 +6,16 @@
 
 ★锁的命题★ P-H5（27 号文）：CONTRACT_MODULE_SYSTEM 的 dependencies 指引按栈注入——
 核心=【默认不再是 Maven】（未判明栈给栈中立指引）；证据两路并集（detect_stack build
-字段 + base 树清单）；package.json 不在 _MANIFEST_BACKEND 是单一事实源的刻意缺口，
-补充表只此一条。五条突变分别压：兜底回 Maven / 调用点占位符不替换 / 树扫描删除 /
-build 分派删除 / package.json 补充删除。
+字段 + base 树清单，清单表复用 `stack_detect._MANIFEST_BACKEND` 单一事实源）。
+
+★本 docstring 的陈旧陈述已更正（#29-3 双复核 M-3）★：原文写「package.json 不在
+_MANIFEST_BACKEND 是单一事实源的刻意缺口，补充表只此一条」+「**五条**突变分别压 …/
+package.json 补充删除」。两处都已不实：`bcd864e`（P-M1）把 package.json 补进了
+`brain/stack_detect.py` 的 `_MANIFEST_BACKEND`（那个缺口早被填上，补偿表随之成死代码并已删除），
+且 `MUTATIONS` 实际有 **9** 条。当时只改对了 `brain/planning_nodes.py` 里的同款陈旧注释，
+harness 里逐字相同的错误陈述没动 —— **纪律条文与自动化脚本清单不同源**的第二例
+（第一例是 release.sh 漏登记 README_EN，见 CLAUDE.md 纪律 8）。
+今后改机制时：把该机制的**名字**在全仓 grep 一遍，注释/harness/文档一起改。
 """
 from __future__ import annotations
 
@@ -57,14 +64,16 @@ MUTATIONS = [
         ["test_ph5_guidance_dispatch_by_build_field",
          "test_ph5_npm_project_system_prompt_has_no_maven_leak"],
     ),
-    (
-        "P-H5e：package.json 补充条目被摘（_MANIFEST_BACKEND 不含 package.json 是"
-        "单一事实源的刻意缺口——补充删了，纯前端/全栈 npm 仓在树扫描里隐形）",
-        PN,
-        "            kk = _TREE_EXTRA_MANIFEST_KEYS.get(base)",
-        "            kk = None",
-        ["test_ph5_tree_manifests_compensate_missing_build_field"],
-    ),
+    # ★原 P-H5e 已删除，不是改落点（#29-3 W-25 + 双复核 M-3）★
+    # 它锁的命题是「package.json 补充条目被摘」，落点 `kk = _TREE_EXTRA_MANIFEST_KEYS.get(base)`。
+    # `bcd864e`（P-M1）把 package.json 补进 `stack_detect._MANIFEST_BACKEND` 后，`if mb:` 抢先命中
+    # ⇒ 该补偿表整张成死代码 ⇒ 这条突变一直在突变死代码、测试恒绿＝零覆盖。表已随之删除
+    # （见 brain/planning_nodes.py:2164 注释），**命题本身不复存在**。
+    # ★为何不把它重指到活路径★：我第一版把落点改成了 `if mb:` → `if False:`，但那与上面
+    # **P-H5c**（`for p in tree or []:` → `for p in []:`）压的是同一条证据路径、指名的是同一条
+    # 测试 ⇒ 二者互为冗余，任一单独存在都不会让测试漏网。那样做会让"10 条突变全红"的计数不变，
+    # 从而**掩盖"独立命题少了一个"这个事实** —— 恰是本批在治的形态（机制撤了、守卫还报绿）的镜像。
+    # 故如实删除并在此留痕：本 harness 从 10 条降为 9 条，覆盖面净减一个命题，原因是机制已撤销。
     (
         "P-H5f：坐标形态行分派被摘（双复核 R1-2：sbt/composer 等已知栈只剩 generic——"
         "「已知栈缺指引」与「真未判明」退回不可辨）",

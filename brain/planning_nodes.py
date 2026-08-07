@@ -2161,9 +2161,13 @@ _CONTRACT_DEP_GUIDANCE_FORMS: dict[str, str] = {
     "pub": "Dart/pub：用 pub.dev 包名",
     "dotnet": "C#/.NET：用 NuGet 包名",
 }
-# package.json 刻意不在 stack_detect._MANIFEST_BACKEND（那表只判后端语言，package.json
-# 走前端/后端另一条路径）——树扫描在这里补这一条，注释指向单一事实源，不手抄整表。
-_TREE_EXTRA_MANIFEST_KEYS: dict[str, str] = {"package.json": "npm"}
+# ★已删除 `_TREE_EXTRA_MANIFEST_KEYS`（#29-3 W-25 突变实验坐实为死代码）★
+# 它原本补的是「package.json 刻意不在 stack_detect._MANIFEST_BACKEND」这个缺口，
+# 而 `bcd864e`（P-M1）已把 package.json 补进 _MANIFEST_BACKEND ⇒ 下面 `if mb:` 分支
+# 抢先命中，else 分支对该表唯一的键恒不可达。原注释还在断言「刻意不在」，与事实相反，
+# 会把下一个读者引向错误的单一事实源认知。
+# 教训：为「单一事实源的刻意缺口」造的补偿表，必须在缺口被填上时一起撤——否则补偿
+# 逻辑静默变成死代码，而它的守卫突变还在报绿（血规 10①：接线覆盖 ≠ 机制存在）。
 
 
 def _contract_dep_guidance(project_stack: dict | None, tree: list | None) -> tuple[str, list[str]]:
@@ -2194,10 +2198,6 @@ def _contract_dep_guidance(project_stack: dict | None, tree: list | None) -> tup
         mb = _MANIFEST_BACKEND.get(base)
         if mb:
             _dispatch(mb[1])
-        else:
-            kk = _TREE_EXTRA_MANIFEST_KEYS.get(base)
-            if kk and kk not in keys:
-                keys.append(kk)
     if not keys and not forms:
         if build_raw and build_raw != "未判明":
             # 枚举缺口必须可辨（硬检查④）：stack_detect 判出了栈而这里没有它的档——

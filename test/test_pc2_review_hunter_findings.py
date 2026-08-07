@@ -172,6 +172,14 @@ def test_f3_ttl_window_suppresses_repeat_network_cost(monkeypatch):
     `seen` 去重只在单次调用内生效；叠上 F1 把"首个镜像不可达即早返"改成"两个都问"，
     代价 = 超时 × 镜像数 × 模块数 × 依赖数。若照 F5 的办法完全不缓存 `None`，
     这里的 `calls["n"]` 会随询问次数线性增长（分钟级纯等待，且不报错只是"规划变慢"）。
+
+    ★诚实边界（#29-3 W-25 突变实验坐实）★：本条的夹具走 `/@latest`，而该 URL **同时**
+    是「可变端点」⇒ 即便把 `if value is None:` 记 TTL 那支整块拆掉，`elif
+    _is_mutable_endpoint(key):` 也会替它记一条 TTL（300s 而非 60s），缓存照旧命中
+    ⇒ 本条**对负缓存 TTL 分支零区分力**（当时是兄弟测试 `test_f1_all_three_registries_wired`
+    抓住的）。隔离该分支的锁见下面
+    `test_f3_none_ttl_branch_isolated_on_non_mutable_url`——那条用**非可变** URL，
+    唯一能记 TTL 的就是 `value is None` 那支。
     """
     monkeypatch.setenv("SWARM_GO_LOOKUP", "1")
     fn, calls = _flaky_then_ok(99, "")          # 恒不可达
@@ -181,6 +189,55 @@ def test_f3_ttl_window_suppresses_repeat_network_cost(monkeypatch):
         assert gr.proxy_latest_version("github.com/x/y") is None
     assert calls["n"] == 2, (
         f"TTL 内应只在首次问两个镜像，实际 {calls['n']} 次 ⇒ 代价被模块数放大（F-3）")
+
+
+def test_f3_none_ttl_branch_isolated_on_non_mutable_url():
+    """★F-3 分支隔离锁★：非可变 URL 上，`None` 的 TTL 记录只能由 `value is None` 那支写。
+
+    上面那条（`/@latest`）无法区分「负缓存记了 TTL」与「可变端点记了 TTL」——两支都会
+    让缓存命中。这里用不含 `/@latest`、`/dist-tags` 的 key（如 crates.io / pypi 形态），
+    于是：
+      · 机制在位 ⇒ 存 `None` 后 TTL 内命中、TTL 过期后不命中并就地清理；
+      · 把 `if value is None:` 那支拆掉 ⇒ 无 TTL 记录 ⇒ 存完立刻就不命中（红）。
+    """
+    cache: dict[str, str | None] = {}
+    neg: dict[str, float] = {}
+    key = "https://crates.io/api/v1/crates/serde"      # 非可变端点
+    assert not dhc._is_mutable_endpoint(key), \
+        "夹具前提失效：这个 key 被判成可变端点，本条又退回无区分力"
+
+    dhc.text_cache_store(cache, neg, key, None)
+    assert key in neg, "存 None 必须记一条 TTL 到期时刻（否则每次调用都重新烧网＝F-3）"
+    hit, val = dhc.text_cache_lookup(cache, neg, key)
+    assert (hit, val) == (True, None), "TTL 内的 None 必须算命中（不重复烧网）"
+
+    neg[key] = 0.0                                     # 模拟 TTL 过期
+    hit2, val2 = dhc.text_cache_lookup(cache, neg, key)
+    assert (hit2, val2) == (False, None), "TTL 过期后必须不命中（抖动可自愈＝F-1 方向）"
+    assert key not in cache and key not in neg, "过期条目须就地清理（两个 dict 不得无界增长）"
+
+
+def test_f3_success_on_non_mutable_url_clears_stale_neg_record():
+    """反方向：非可变 URL 的**成功**文本不记 TTL、且**清掉此前的陈旧负记录**、永久命中。
+
+    ★夹具必须预置陈旧 `neg` 记录★（双复核 L-1，我已用纯 Python 复刻三种形态实测）：
+    初版从 `neg={}` 起步 ⇒ `text_cache_store` 里 `else: neg_until.pop(key, None)` 恒 no-op
+    ⇒ `assert key not in neg` **恒真** ⇒ 把那行 pop 删掉（陈旧 TTL 不再被清）测试仍绿，
+    该断言对它零区分力。预置 `neg[key]=0.0`（模拟此前失败过）后：原实现 pop 掉 ⇒ 断言过；
+    删掉 pop ⇒ 断言红。这才有 `test_f1_success_clears_negative_record` 之外的增量
+    ——后者锁的是 `_http_get` 整条链，本条锁的是**非可变端点这一档**的纯函数语义。
+    """
+    cache: dict[str, str | None] = {}
+    key = "https://pypi.org/pypi/requests/json"
+    assert not dhc._is_mutable_endpoint(key), "夹具前提失效：该 key 被判成可变端点"
+    neg: dict[str, float] = {key: 0.0}      # 陈旧负记录：此前这个坐标失败过
+
+    dhc.text_cache_store(cache, neg, key, '{"info": {}}')
+    assert key not in neg, (
+        "非可变端点的成功响应必须清掉陈旧 TTL 记录 —— 留着会让后续 lookup 拿陈旧到期时刻判定"
+    )
+    assert dhc.text_cache_lookup(cache, neg, key) == (True, '{"info": {}}'), \
+        "非可变端点的成功文本应永久命中"
 
 
 def test_brain005_mutable_endpoint_success_has_ttl(monkeypatch):

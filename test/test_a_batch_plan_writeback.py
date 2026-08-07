@@ -50,8 +50,15 @@ def test_merge_writes_plan_back_after_d4_injection():
     }
     out = nodes.merge({"plan": plan, "subtask_results": results,
                        "dispatch_remaining": [], "project_id": ""})
-    if not out.get("rebase_subtask_ids"):
-        pytest.skip("本次未走 rebase 分支（D4 注入不发生）")
+    # ★前提破了必须【红】，不能 skip★（29 号文 T-A7）：原实现在这里 `pytest.skip`，
+    # 于是让 merge 不再产出 rebase_subtask_ids 的任何上游回归（如把冲突升级判据改坏）
+    # 都会把本条变成静默通过，而它守的「回写原 plan 对象」机制同时失去守护
+    # （后果：retry_guidance 跨 interrupt/resume 蒸发 ⇒ 重派 worker 拿不到硬约束 ⇒
+    #  3 轮必再撞同冲突落 D3）。夹具前提失效是**测试基建坏了**，属于要修的事，不是跳过。
+    assert out.get("rebase_subtask_ids"), (
+        "夹具前提失效：两个子任务写同一新文件却没触发 D4 rebase 升级——"
+        "本测试已失去守护对象，请先查 merge 的冲突升级判据是否被改坏"
+    )
     assert "plan" in out, "走了 rebase 分支就必须回写 plan——否则 retry_guidance 跨 resume 蒸发"
     assert out["plan"] is plan, "必须回写【原对象】（T4 pin 对象身份坑的本体）"
 

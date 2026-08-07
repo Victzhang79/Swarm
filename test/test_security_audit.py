@@ -228,32 +228,101 @@ def test_block_severity_critical_with_medium_finding():
     print("  ✅ medium finding + block=critical → should_block 合理")
 
 
-def test_clean_project_no_block():
-    """干净项目 + 阈值。
+_CLEAN_TOOL_OUTPUT = {
+    "bandit": '{"results": []}',          # SAST 干净
+    "pip-audit": '{"dependencies": []}',  # 依赖干净
+}
 
-    A-P0-2 修复后语义变更：阻断模式(critical)下，若【没有任何真实扫描器执行】
-    （CI/本地常无 bandit/pip-audit/gitleaks），不能与"真·零漏洞"混同放行 → fail-closed 阻断。
-    - 有真实扫描器执行 → 干净项目 should_block=False（保持原意图）。
-    - 无任何扫描器执行 → should_block=True（fail-closed，注入 fail-closed-no-scanner 合成发现）。
-    报告模式(none)永远不阻断（见 test_clean_project_report_mode_never_blocks）。
+# ★必须与 `_CLEAN_TOOL_OUTPUT` 是**两份独立枚举**★（hunter F8）：
+# 初版让 `shutil.which` 直接用 `n in _CLEAN_TOOL_OUTPUT` 判放行，于是 `_run_tool` 里那句
+# 「夹具未预置工具 X」的守卫**在构造上不可达**——生产每个 `_run_tool` 调用点前都有
+# `which` 前置闸（security_scan.py:319/632/1237…），which 只放行输出表里的键 ⇒
+# `out is None` 永不成立。看着是防线，实际是装饰。这正是
+# [[swarm-fallback-must-not-share-the-gap]] 的微缩版：兜底网与主判据同源 ⇒ 缺口重合。
+# 拆成两份后：谁往 which 放行表里加了工具却忘了给输出，守卫当场炸（已做可达性实验证实）。
+_WHICH_ALLOW = ("bandit", "pip-audit")
+
+
+def _fake_full_coverage(monkeypatch):
+    """把「sast+dep 两类都有真实工具执行且干净」构造出来。
+
+    ★不能用真 `shutil.which` 分叉★（29 号文 T-A4）：`bandit`/`pip-audit` 既不在 dev
+    依赖里、CI 也无额外安装步，`which` 全为 None ⇒ 本机与 CI **都**只走 else 分支，
+    `if sast_covered and dep_covered:` 那半边在**任何**环境都不执行。后果：把
+    `run_security_scan` 改成「即使全类覆盖也恒阻断」（冤杀全部交付）测试仍绿。
     """
-    import shutil
+    import swarm.worker.security_scan as ss
+
+    # which 的放行表与输出表**分开维护**（见 _WHICH_ALLOW 处的注释）
+    monkeypatch.setattr(ss.shutil, "which",
+                        lambda n: f"/usr/bin/{n}" if n in _WHICH_ALLOW else None)
+
+    def _fake_run(cmd, *, cwd, timeout=120):
+        out = _CLEAN_TOOL_OUTPUT.get(cmd[0])
+        # 夹具必须对「冒出没预置的工具」显式炸掉：静默回 (-1,'','') 会让覆盖面缺口
+        # 伪装成「工具跑挂」，正是本条要治的假绿形态。
+        # 现在这句**真的可达**：which 放行表里多一个工具而输出表没跟上就会触发。
+        assert out is not None, (
+            f"夹具未预置工具 {cmd[0]} 的输出，但 _WHICH_ALLOW 放行了它 —— "
+            "两份枚举漂了；不补输出会让覆盖面缺口伪装成「工具跑挂」"
+        )
+        return (0, out, "")
+
+    monkeypatch.setattr(ss, "_run_tool", _fake_run)
+
+
+def test_clean_project_full_coverage_no_block(monkeypatch):
+    """全类覆盖 + 干净项目 → 不阻断（保持原意图，不误杀）。
+
+    这是 T-A4 之前**从未被执行过**的那半边分支。
+    """
     from swarm.worker.security_scan import run_security_scan
+
+    _fake_full_coverage(monkeypatch)
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
-        findings, should_block, _scan_details = run_security_scan(tmp, "python", block_severity="critical")
-        # D4 per-category 后：不阻断要求 sast+dep 两类都有真实工具覆盖（secret 有内置正则兜底）。
-        sast_covered = shutil.which("bandit")
-        dep_covered = shutil.which("pip-audit")
-        if sast_covered and dep_covered:
-            assert should_block is False, f"全类覆盖+干净项目不应阻断, findings: {findings}"
-        else:
-            assert should_block is True, "任一类 0 覆盖→阻断模式必须 fail-closed"
-            assert any(f.rule_id.startswith("fail-closed-no-") for f in findings)
-            if not dep_covered:
-                assert any(f.rule_id == "fail-closed-no-dep-scanner" for f in findings), \
-                    "D4：依赖类 0 覆盖必须有独立哨兵（单布尔时代被 sast 工具掩盖）"
-    print("  ✅ 干净项目: 全类覆盖不阻断 / 任一类 0 覆盖 fail-closed")
+        findings, should_block, details = run_security_scan(tmp, "python", block_severity="critical")
+    # 前提锁：夹具真把两类覆盖构造出来了（否则下面的 False 由 fail-closed 的反面偶然满足）
+    assert details.get("categories_ran", {}).get("sast") is True, f"夹具前提失效: {details}"
+    assert details.get("categories_ran", {}).get("dep") is True, f"夹具前提失效: {details}"
+    assert should_block is False, f"全类覆盖+干净项目不应阻断, findings: {findings}"
+    assert not [f for f in findings if f.rule_id.startswith("fail-closed-no-")], \
+        "全类覆盖时不应再注入 fail-closed 哨兵"
+    print("  ✅ 全类覆盖 + 干净项目 → 不阻断")
+
+
+def test_clean_project_zero_coverage_fails_closed(monkeypatch):
+    """任一类 0 覆盖 → 阻断模式必须 fail-closed，且逐类哨兵独立。"""
+    import swarm.worker.security_scan as ss
+    from swarm.worker.security_scan import run_security_scan
+
+    monkeypatch.setattr(ss.shutil, "which", lambda _n: None)   # 全类工具缺失
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
+        findings, should_block, _details = run_security_scan(tmp, "python", block_severity="critical")
+    assert should_block is True, "任一类 0 覆盖→阻断模式必须 fail-closed"
+    assert any(f.rule_id == "fail-closed-no-dep-scanner" for f in findings), \
+        "D4：依赖类 0 覆盖必须有独立哨兵（单布尔时代被 sast 工具掩盖）"
+    assert any(f.rule_id == "fail-closed-no-sast-scanner" for f in findings), \
+        "D4：SAST 类 0 覆盖同样要有独立哨兵"
+    print("  ✅ 0 覆盖 → fail-closed + 逐类哨兵")
+
+
+def test_partial_coverage_still_fails_closed(monkeypatch):
+    """只有 sast 有工具、dep 无 ⇒ 仍须阻断（单布尔时代正是这一格放行的）。"""
+    import swarm.worker.security_scan as ss
+    from swarm.worker.security_scan import run_security_scan
+
+    monkeypatch.setattr(ss.shutil, "which", lambda n: "/usr/bin/bandit" if n == "bandit" else None)
+    monkeypatch.setattr(ss, "_run_tool", lambda cmd, *, cwd, timeout=120: (0, '{"results": []}', ""))
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "main.py").write_text("x = 1\n", encoding="utf-8")
+        findings, should_block, details = run_security_scan(tmp, "python", block_severity="critical")
+    assert details.get("categories_ran", {}).get("sast") is True, f"夹具前提失效: {details}"
+    assert details.get("categories_ran", {}).get("dep") is False, f"夹具前提失效: {details}"
+    assert should_block is True, "sast 有覆盖不能替 dep 背书（D4 per-category 的本体）"
+    assert any(f.rule_id == "fail-closed-no-dep-scanner" for f in findings)
+    print("  ✅ 部分覆盖 → 仍 fail-closed（逐类分账）")
 
 
 def test_clean_project_report_mode_never_blocks():
@@ -331,10 +400,12 @@ def main() -> int:
         test_block_severity_high_with_critical_finding,
         test_block_severity_none_with_critical_finding,
         test_block_severity_critical_with_medium_finding,
-        test_clean_project_no_block,
         test_finding_structure,
         test_files_parameter_limits_scope,
     ]
+    # 覆盖面三条（full_coverage / zero_coverage / partial_coverage）需要 monkeypatch
+    # 夹具，只能在 pytest 下跑——本 __main__ 直调路径无法注入 fixture。别在这里加它们：
+    # 加了会 TypeError（缺参），而这个 runner 不在任何 CI/run_all.sh 路径上。
     passed = failed = 0
     for t in tests:
         try:

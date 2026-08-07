@@ -9,6 +9,8 @@ import importlib.util
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
@@ -78,17 +80,63 @@ def test_warmup_pom_excludes_internal_modules(tmp_path):
     print("  ✅ warmup pom 保留外部依赖、排除内部模块")
 
 
+_RUOYI_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "ruoyi_root_pom.xml"
+_RUOYI_LOCAL = Path("/Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi")
+
+
+def _assert_ruoyi_warmup_shape(pom: str, *, top_level_deps: bool = False) -> None:
+    """真 ruoyi 形状的根 pom → warmup pom 应含 SB4.0.6 + 外部依赖、排内部模块。
+
+    `top_level_deps=True`：额外断顶层 `<dependencies>` 那条**独立的** `_is_internal` 判据
+    （只有入库夹具有这一段；真 ruoyi 的顶层 dependencies 是空的）。
+    """
+    ET.fromstring(pom)                                    # XML 合法
+    # 注意：生成器**不解析** ${property}，而是原样拷 <properties> 段；这里命中的是被拷进去的
+    # properties 行（双复核 L-4① 实测：产出里 "4.0.6" 与 "${spring-boot.version}" 同时存在）。
+    # 断言仍有区分力——摘掉 properties 拷贝就红。
+    assert "4.0.6" in pom, "SB 版本应随 <properties> 段一起进 warmup pom"
+    # 同时断 `${...}` **原样透传**（hunter F9）：这才是这份夹具真正守住的命题——
+    # 生成器不解析间接引用，靠 properties 段整段拷过去让子 pom 的 ${} 解得开。
+    # 只断 "4.0.6" 的话，properties 段在与不在都可能满足（它也可能来自别处字面量）。
+    assert "${spring-boot.version}" in pom, (
+        "依赖里的 ${spring-boot.version} 应原样透传 —— 它与 <properties> 段是一对，"
+        "缺了 properties 段就解不开（生成器不做变量替换）"
+    )
+    assert "shiro-core" in pom, "dependencyManagement 里的外部依赖应保留"
+    assert "spring-boot-dependencies" in pom, "BOM import 应保留"
+    assert "ruoyi-common" not in pom and "ruoyi-system" not in pom, \
+        "dependencyManagement 里与外部依赖同段混排的内部模块必须按 groupId 排除"
+    if top_level_deps:
+        assert "lombok" in pom, "顶层 dependencies 的外部依赖应保留"
+        assert "ruoyi-framework" not in pom, \
+            "顶层 dependencies 的内部模块必须排除（与 dependencyManagement 是两处独立判据）"
+
+
+def test_warmup_pom_ruoyi_shape_from_fixture(tmp_path):
+    """入库夹具版：真 ruoyi 根 pom 骨架 → warmup pom 形状正确。
+
+    ★为何不再写死本机路径★（29 号文 T-A5）：原实现指向
+    `/Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi`，本机存在 ⇒ 本地跑真断言；
+    CI（ubuntu 全新 checkout）必不存在 ⇒ 走**裸 `return`** ⇒ 计入 **PASSED**，
+    连 `-rs` 报告里都看不见。夹具入库后本条在任何环境都真跑。
+    """
+    import shutil
+
+    assert _RUOYI_FIXTURE.exists(), f"入库夹具缺失: {_RUOYI_FIXTURE}"
+    shutil.copy2(_RUOYI_FIXTURE, tmp_path / "pom.xml")
+    _assert_ruoyi_warmup_shape(generate_maven_warmup_pom(tmp_path, "pom.xml"),
+                               top_level_deps=True)
+    print("  ✅ 夹具 ruoyi warmup pom: SB4.0.6 + 两处 section 各自排内部模块")
+
+
+@pytest.mark.skipif(not (_RUOYI_LOCAL / "pom.xml").exists(),
+                    reason="ruoyi-e2e 不在本机（夹具版 test_warmup_pom_ruoyi_shape_from_fixture 恒跑）")
 def test_warmup_pom_real_ruoyi():
-    """真实 ruoyi-e2e（若存在）→ warmup pom 含 SB4.0.6 且无 ruoyi 内部模块。"""
-    ruoyi = Path("/Users/zhangyanrui/LLM/swarm/e2e-projects/RuoYi")
-    if not (ruoyi / "pom.xml").exists():
-        print("  ⊘ 跳过(ruoyi-e2e 不在本机)")
-        return
-    pom = generate_maven_warmup_pom(ruoyi, "pom.xml")
-    ET.fromstring(pom)
-    assert "4.0.6" in pom  # SB 版本
-    assert "shiro-core" in pom
-    assert "ruoyi-common" not in pom and "ruoyi-system" not in pom  # 内部模块排除
+    """真实 ruoyi-e2e（本机有则加跑）—— 夹具与真 pom 不漂的对照。
+
+    用 `pytest.skip` 而非裸 `return`：缺失必须可见（`-rs` 能列出）。
+    """
+    _assert_ruoyi_warmup_shape(generate_maven_warmup_pom(_RUOYI_LOCAL, "pom.xml"))
     print("  ✅ 真实 ruoyi-e2e warmup pom: SB4.0.6 + 排内部模块")
 
 
@@ -107,7 +155,9 @@ if __name__ == "__main__":
     test_dockerfile_mixed_java_node()
     with tempfile.TemporaryDirectory() as d:
         test_warmup_pom_excludes_internal_modules(Path(d))
-    test_warmup_pom_real_ruoyi()
+        test_warmup_pom_ruoyi_shape_from_fixture(Path(d))
+    # test_warmup_pom_real_ruoyi 不在此直调：它带 skipif 标记，裸调会绕过标记
+    # 在无 ruoyi 的机器上直接炸（夹具版已覆盖同一命题，恒跑）。
     test_deps_hash_in_dockerfile()
     print("\n✅ image_builder 生成器全部测试通过")
 

@@ -149,6 +149,87 @@ def _isolate_swarm_env():
                 os.environ[k] = v
 
 
+class FakeSecretCursor:
+    """最小 psycopg cursor 替身：只回一行预置密文（`secret_store` 分支驱动用）。"""
+
+    def __init__(self, row):
+        self._row = row
+
+    def execute(self, *a, **k):
+        pass
+
+    def fetchone(self):
+        return self._row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeSecretConn:
+    """配合 `FakeSecretCursor` 的连接替身。
+
+    ★放在 conftest 而非某个测试文件里★（hunter F11）：`test/` 没有 `__init__.py`，
+    `from test.test_g_theme_observability_p0 import _FakeConn` 能跑通只因 pytest 把 rootdir
+    插进 `sys.path[0]` 后 `test` 成了指向本仓的 namespace package —— 而 venv 裸 `python` 下
+    `import test` 拿到的是**标准库的 `test` 包**（同名遮蔽）。跨文件 import 另一个**测试文件**
+    还多一层风险：被测夹具模块可能在两个名字下各执行一次。共享夹具一律走 conftest。
+    """
+
+    def __init__(self, row):
+        self._row = row
+
+    def cursor(self):
+        return FakeSecretCursor(self._row)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.fixture
+def fake_secret_conn():
+    """回 `FakeSecretConn` 类本身，供测试构造 `_get_conn` 替身。
+
+    用 fixture 而不是让测试 `from test.xxx import` / `import conftest`：前者会撞
+    stdlib `test` 遮蔽（见 `FakeSecretConn` docstring），后者依赖 rootdir 恰在 sys.path。
+    """
+    return FakeSecretConn
+
+
+@pytest.fixture
+def secret_store_state():
+    """#29-3：快照+还原 `secret_store` 的三份模块级可变状态（**非 autouse，按名取用**）。
+
+    背景：驱动 `get_secret` 的 warn-once / 负缓存分支必须先清 `_cache`（否则第二次调用
+    命中负缓存、根本不进被测分支）。但只在**测试开头**清、结束不还原，会把
+    `_decrypt_warned={'K_BROKEN'}` / `_db_fail_warned={'MY_KEY'}` / `_cache={'MY_KEY': None}`
+    留给后续用例 —— 后果与 H2 那批顺序依赖 flake 同型：**单跑绿、组合红**（别的测试若期待
+    同名 key 的首次 WARNING，会因节流集里已有该 key 而只拿到 DEBUG；`_cache` 里的负条目
+    还会让 `get_secret` 直接返 None 不碰库）。
+
+    做成非 autouse 是刻意的：全量 7000+ 用例里只有个别几条碰这三份状态，没必要人人付开销。
+    """
+    import swarm.config.secret_store as ss
+    snap = (set(ss._decrypt_warned), set(ss._db_fail_warned), dict(ss._cache))
+    ss._decrypt_warned.clear()
+    ss._db_fail_warned.clear()
+    ss._cache.clear()
+    try:
+        yield ss
+    finally:
+        ss._decrypt_warned.clear()
+        ss._decrypt_warned.update(snap[0])
+        ss._db_fail_warned.clear()
+        ss._db_fail_warned.update(snap[1])
+        ss._cache.clear()
+        ss._cache.update(snap[2])
+
+
 def _purge_test_users() -> None:
     try:
         import psycopg
