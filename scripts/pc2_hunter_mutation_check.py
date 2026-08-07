@@ -375,6 +375,24 @@ def _pytest(args: list[str]) -> int:
     return p.returncode
 
 
+
+def _clear_pyc(path: Path) -> None:
+    """删被突变模块的 pyc（T-2，#29-3 统一补齐）。
+
+    CPython 判 pyc 是否有效看的是源码 **mtime（整秒粒度）+ 字节数**。故当「等长突变
+    （len(old)==len(new)）」与「同秒写入」同时成立时，第二条突变写完，pyc 仍被判有效
+    ⇒ 子进程加载的是【上一条】的字节码。双向危害：既造"突变后仍绿"（冤报测试没牙），
+    也造"红的是上一条"（假背书——这条锁其实没被验证）。
+    每条突变前与还原后都必须清。
+    """
+    cache = path.parent / "__pycache__"
+    if cache.is_dir():
+        for f in cache.glob(path.stem + ".*.pyc"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
 def main() -> int:
     print("═" * 70)
     print("步骤 0：基线必须全绿（只验突变→红会让修得不全的整改蒙过去）")
@@ -398,6 +416,7 @@ def main() -> int:
             failures.append((name, "落点非唯一"))
             continue
         path.write_text(src.replace(old, new, 1))
+        _clear_pyc(path)
         try:
             per = [(n, _pytest(["-k", n])) for n in should_red]
             missing = [n for n, r in per if r == 5]
@@ -414,6 +433,7 @@ def main() -> int:
                     failures.append((name, "突变后仍绿"))
         finally:
             path.write_text(src)
+            _clear_pyc(path)
 
     print("\n" + "═" * 70)
     rc_r = _pytest([])

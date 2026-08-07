@@ -94,6 +94,67 @@ def _iter_mutations(tree: ast.Module, consts: dict[str, str]):
             yield i, path_rel, (old if isinstance(old, str) else None)
 
 
+def audit_pyc_clearing() -> list[str]:
+    """T-2（#29-3）：返回**缺少 `_clear_pyc`** 的 harness 名单（空＝全部齐备）。
+
+    ★为什么这也要机读闸★ CPython 判 pyc 是否有效看的是源码 **mtime（整秒粒度）+ 字节数**。
+    「等长突变（len(old)==len(new)）」+「同秒写入」双双成立时，第二条突变写完 pyc 仍被判有效
+    ⇒ 子进程加载**上一条**的字节码。双向危害：既造"突变后仍绿"（冤报测试没牙），也造
+    "红的是上一条"（**假背书**——这条锁其实没被验证，却显示通过）。
+    实测本仓曾有 13 个 harness 缺它、其中 8 条突变是等长的（#29-3 已统一补齐）。
+    此闸防的是**下一个**新增 harness 又忘了带 —— 与落点漂移同理：只修存量不装闸，
+    第 14 个会同样静默。
+    判据故意做得宽（只查函数名在不在）：`_clear_pyc` 的**内容**正确性由各 harness 自己
+    跑出来的结果保证，此处只钉"这道防线在场"这一件事实。
+    """
+    missing: list[str] = []
+    for h in sorted(ROOT.glob("scripts/*mutation_check.py")):
+        try:
+            src = h.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "_clear_pyc" not in src:
+            missing.append(h.name)
+    return missing
+
+
+def audit_equal_length_mutations() -> list[tuple[str, int, int]]:
+    """T-2 诊断辅助：列出所有**等长**突变 [(harness, 序号, 长度)]。
+
+    等长是 pyc 陈旧假绿的**必要条件**（同秒写入是另一半，取决于运行时机、静态判不了）。
+    单独列出来供人看：等长条目越多，撞上"同秒"的概率越不可忽略。
+    **不作为闸**——等长本身完全合法（很多配对守卫天然等长，如版本号 8→7），
+    拿它当红线会误杀；真正的防线是 `_clear_pyc` 在场。
+    """
+    out: list[tuple[str, int, int]] = []
+    for h in sorted(ROOT.glob("scripts/*mutation_check.py")):
+        try:
+            tree = ast.parse(h.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        consts = _collect_path_consts(tree)
+        for stmt in tree.body:
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+                continue
+            if getattr(stmt.targets[0], "id", "") != "MUTATIONS":
+                continue
+            if not isinstance(stmt.value, (ast.List, ast.Tuple)):
+                continue
+            for i, elt in enumerate(stmt.value.elts, 1):
+                if not isinstance(elt, (ast.Tuple, ast.List)) or len(elt.elts) < 4:
+                    continue
+                try:
+                    old = ast.literal_eval(elt.elts[2])
+                    new = ast.literal_eval(elt.elts[3])
+                except Exception:  # noqa: BLE001
+                    continue
+                if (isinstance(old, str) and isinstance(new, str)
+                        and len(old) == len(new)):
+                    out.append((h.name, i, len(old)))
+        del consts
+    return out
+
+
 class AuditResult:
     """审计结果的结构化载体 —— **CLI 与测试共用同一份计算**。
 
@@ -176,6 +237,19 @@ def main() -> int:
     print(f"  ★死锁（落点 0 次）    ：{len(dead)}")
     print(f"  ★非唯一（落点 ≥2 次） ：{len(nonuniq)}")
     print(f"  静态判不了            ：{len(undecidable)}")
+    _missing_pyc = audit_pyc_clearing()
+    _eq = audit_equal_length_mutations()
+    print(f"  ★缺 _clear_pyc（T-2） ：{len(_missing_pyc)}")
+    print(f"  等长突变（仅诊断）    ：{len(_eq)} 条"
+          f"{'（都在有 _clear_pyc 的 harness 里）' if not _missing_pyc else ''}")
+    if _missing_pyc:
+        print("\n" + "─" * 78)
+        print("★缺 _clear_pyc 明细（等长突变 + 同秒写入 ⇒ 跑的是上一条代码）")
+        print("─" * 78)
+        for n in _missing_pyc:
+            _hits = [f"#{i}" for hn, i, _ in _eq if hn == n]
+            print(f"  {n}"
+                  + (f"      本文件等长突变: {', '.join(_hits)}" if _hits else ""))
 
     if dead:
         print("\n" + "─" * 78)
@@ -199,7 +273,7 @@ def main() -> int:
             print(f"  {name} #{idx}：{why}")
 
     print()
-    return 1 if (dead or nonuniq) else 0
+    return 1 if (dead or nonuniq or _missing_pyc) else 0
 
 
 if __name__ == "__main__":

@@ -109,3 +109,54 @@ def test_undecidable_count_is_bounded(result):
 def test_audit_result_ok_flag_agrees_with_details(result):
     """`ok` 是 CLI 退出码与本测试共用的判据 —— 两者不得分叉（同一事实源）。"""
     assert result.ok == (not result.dead and not result.nonuniq)
+
+
+# ── T-2：每个 harness 都必须清 pyc ─────────────────────────────────────────
+
+def test_every_harness_clears_pyc():
+    """★T-2 的机读闸★ 每个 `scripts/*mutation_check.py` 都必须有 `_clear_pyc`。
+
+    CPython 判 pyc 是否有效看的是源码 **mtime（整秒粒度）+ 字节数**。当「等长突变
+    （`len(old)==len(new)`）」与「同秒写入」同时成立时，第二条突变写完 pyc 仍被判有效
+    ⇒ 子进程加载的是**上一条**的字节码。双向危害：
+      · 「突变后仍绿」→ 冤报"这条测试没牙"（其实跑的根本不是这条突变的代码）
+      · 「红的是上一条」→ **假背书**：这条锁其实没被验证，却显示通过
+    实测本仓曾有 13 个 harness 缺它、其中 8 条突变等长（#29-3 已统一补齐）。
+    ★此闸防的是【下一个】新增 harness 又忘了带★ —— 与落点漂移同理：只修存量不装闸，
+    第 14 个会同样静默（本仓已登记「为漏项造的兜底网不能用同一份枚举编」）。
+    """
+    missing = _load_audit().audit_pyc_clearing()
+    if missing:
+        pytest.fail(
+            f"{len(missing)} 个 harness 缺 `_clear_pyc`（等长突变 + 同秒写入 ⇒ 跑的是"
+            f"上一条的字节码，既冤报没牙也可能假背书）：\n"
+            + "\n".join(f"  · {n}" for n in missing)
+            + "\n\n参考实现：scripts/ph4_mutation_check.py 的 `_clear_pyc`；"
+              "每条突变**写入后**与**还原后**都要调一次。")
+
+
+def test_pyc_audit_actually_scanned_harnesses():
+    """★前提锁★：若 glob 写错/读不到文件，`audit_pyc_clearing()` 会返回空列表，
+    上面那条断言就恒真＝假绿。故先证它真的看过了足够多的 harness。"""
+    mod = _load_audit()
+    n = len(list(mod.ROOT.glob("scripts/*mutation_check.py")))
+    assert n >= 20, f"只扫到 {n} 个 harness ⇒ glob 或 ROOT 解析坏了，T-2 闸恒真"
+
+
+def test_equal_length_mutations_are_reported_not_blocked():
+    """等长突变本身**完全合法**（配对守卫天然等长，如版本号 8→7），不该当红线。
+
+    这条锁的是"诊断信息在场"而非"数量为零"：拿等长当禁令会误杀大批正当突变；真正的
+    防线是 `_clear_pyc` 在场（上一条测的就是它）。此处只确认诊断通道还活着——
+    它返回的形状可用，且当前确实有等长条目（若某天变成 0，说明扫描逻辑坏了而非本仓
+    真没有等长突变）。
+    """
+    eq = _load_audit().audit_equal_length_mutations()
+    assert isinstance(eq, list)
+    assert eq, "等长突变扫描返回空 —— 本仓实测有等长条目，返空说明解析坏了"
+    for item in eq:
+        assert len(item) == 3, f"形状变了: {item}"
+        name, idx, ln = item
+        assert isinstance(name, str) and name.endswith(".py")
+        assert isinstance(idx, int) and idx >= 1
+        assert isinstance(ln, int) and ln >= 0
