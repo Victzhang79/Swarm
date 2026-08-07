@@ -77,8 +77,11 @@ MUTATIONS = [
     (
         'P-C2/npm：caret 的 major-0 特例被抹掉（^0.3.0 会命中 0.2.9 ⇒ 放过幻觉）',
         NPM,
-        '            if floor[0] == 0:\n                # 0.x：次版本即破坏性；0.0.z 更严（精确）',
-        '            if False:\n                # 0.x：次版本即破坏性；0.0.z 更严（精确）',
+        # ★#29-3 T-1 落点更新★ 该分支前面插入了新臂，`if` 已变成 `elif`（`^1`=`1.x` / `^0`
+        # 那条判据先走）。仅一个关键字之差，旧字面量却自那次起落点未命中＝零覆盖 ——
+        # 这类"一个 token 的漂移"最不显眼，也正是静态审计存在的理由。
+        '            elif floor[0] == 0:\n                # 0.x：次版本即破坏性；0.0.z 更严（精确）',
+        '            elif False:\n                # 0.x：次版本即破坏性；0.0.z 更严（精确）',
         ['test_range_satisfiability_semantics'],
     ),
     (
@@ -110,24 +113,42 @@ MUTATIONS = [
         # ★这条的落点只有"零镜像"能触发★ 首版指名镜像语义那条测试 → 突变后仍绿：那条走的是
         # 循环内早返（`[False, None]`），末行没执行。两处防御互相兜底 = 单点突变不可证伪，
         # 故另立一条零镜像入口的测试来锁末行（见测试里的说明）。
+        # ★#29-3 T-1 落点更新★ R4（d3497e5）把 `False` 这一档**刻意取消**了：go proxy 的 404
+        # 语义是"可能别处有"而非"包不存在"，旧行为把"两镜像都 404"升格成确证查无 ⇒ 私有 module
+        # 被误判幻觉丢弃。故 `saw_false` 变量与 `return False if saw_false else None` 一并消失，
+        # 末行现在是无条件 `return None`。突变意图不变：把 `False` 档塞回去 ⇒ 误杀复发。
         'P-C2/go：★误杀★ 零证据（镜像表为空）塌成"确证不存在"',
         GO,
-        '    return False if saw_false else None',
-        '    return False',
+        '    return None                    # 无一镜像能证实存在 → 证据不完整，绝不据此判幻觉',
+        '    return False  # 突变：False 档塞回来',
         ['test_proxy_version_exists_with_no_mirrors_is_none_not_false'],
     ),
     (
-        'P-C2/go：★误杀★ 镜像不可达时不再早返（拿不完整证据判幻觉）',
+        # ★#29-3 T-1 落点重写★ 原落点是"不可达即早返 None"那条 else 臂 —— R4 把 `False` 与
+        # `None` 两档合并后，循环里已不存在"早返 vs continue"的分叉（所有非 True 结局都归 None）。
+        # 突变意图（拿不完整证据判幻觉）现在的等价形态＝**在循环内**把首个 404 升格成 False：
+        # 首个镜像 404 就返回 False ⇒ 不再要求"所有镜像都确认缺席"⇒ 私有 module 误杀复发。
+        # 与上一条（#11 压**末行**的零镜像出口）落在不同位置、由不同测试指名，两者不互相兜底。
+        'P-C2/go：★误杀★ 首个镜像 404 即判确证不存在（不再要求所有镜像确认缺席）',
         GO,
-        '        else:\n            return None            # 有镜像不可达 → 证据不完整',
-        '        else:\n            continue',
+        '        got = _http_probe(tpl.format(mod=enc, ver=encv))\n'
+        '        if got is True:\n'
+        '            return True',
+        '        got = _http_probe(tpl.format(mod=enc, ver=encv))\n'
+        '        if got is True:\n'
+        '            return True\n'
+        '        if got is False:\n'
+        '            return False  # 突变：首个 404 即确证不存在',
         ['test_proxy_version_exists_requires_all_mirrors_to_confirm_absence'],
     ),
     # ── go：治理面 ──
     (
         'P-C2/go：显式版本退回"直采/契约已给定"（整个治理消失）',
         GO,
-        '            if not _JUDGEABLE_VERSION.match(_exp) or _PSEUDO_ANY.search(_exp):',
+        # ★#29-3 T-1 落点重写★ BRAIN-003 把判据从「`not _JUDGEABLE_VERSION.match(_exp)
+        # or _PSEUDO_ANY.search(_exp)`」换成先算两个中间量、再判「`not _is_judgeable and
+        # not _is_pseudo`」——原枚举漏了分支名（dev / release-1.2）。旧字面量自那次起零覆盖。
+        '            if not _is_judgeable and not _is_pseudo:',
         '            if True:',
         ['test_go_hallucinated_version_is_corrected',
          'test_go_hallucinated_version_no_latest_is_dropped'],
@@ -135,24 +156,39 @@ MUTATIONS = [
     (
         'P-C2/go：★误杀★ proxy 不可达被当成"版本不存在"',
         GO,
-        '            if _exists is None:\n                # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。',
-        '            if _exists is None and False:\n                # R56-6：证据缺失≠否定证据 → fail-open 保留，但必须留痕。',
+        # ★#29-3 T-1 落点更新★ 该判据已抽成命名中间量（`_unverified = _exists is None`，
+        # 随后 `if _unverified:`）—— 旧的 `if _exists is None:` + 注释那段字面量不复存在。
+        # 突变意图不变：让"不可达"不再算 unverified ⇒ 当成"版本不存在" ⇒ fail-open 失效、误杀。
+        '            _unverified = _exists is None',
+        '            _unverified = False  # 突变：不可达不再算未验证',
         ['test_go_unreachable_proxy_fails_open'],
     ),
     (
         'P-C2/go：★误杀★ 伪版本也拿去探测（伪版本是真实可用形态，探必然 404）',
         GO,
-        ' or _PSEUDO_ANY.search(_exp):',
-        ':',
-        ['test_go_unjudgeable_versions_are_never_probed'],
+        # ★#29-3 T-1 落点重写★ 原落点是判据里的 ` or _PSEUDO_ANY.search(_exp)` 这半截
+        # （BRAIN-003 重构后不存在）。伪版本豁免现由中间量 `_is_pseudo` 承载，故压它：
+        # 置 False ⇒ 伪版本落进"拿去探测"的路 ⇒ 探必然 404 ⇒ 被当幻觉校正/丢弃（原误杀）。
+        '            _is_pseudo = bool(_PSEUDO_ANY.search(_exp))',
+        '            _is_pseudo = False  # 突变：伪版本豁免删除',
+        # ★#29-3 T-1 测试名同步★ 原名 `test_go_unjudgeable_versions_are_never_probed` 已随
+        # R3/BRAIN-003 改成 `..._pseudo_...`（那次把"不可判"与"伪版本"拆成两个概念）。
+        # 测试名选不到会被 harness 判 rc=5＝失败（而不是"红了"），这道判据本轮正好抓住了它。
+        ['test_go_pseudo_versions_are_never_probed'],
     ),
     (
         'P-C2/go：★误杀★ 伪版本判别退回窄口径 `_PSEUDO`（漏掉 `v0.0.0-<ts>-<hash>` 这种'
         '最常见形态 ⇒ 无前置 tag 的伪版本全被送去探测、当幻觉校正掉）',
+        # ★#29-3 T-1 落点更新★ `_PSEUDO_ANY` 已被**重写**（单行 → 三行，并支持带前置 tag 的
+        # 预发布伪版本形态，且不再需要 IGNORECASE）。旧单行字面量自那次起零覆盖。
+        # 突变意图不变：退回窄口径 ⇒ `v0.0.0-<ts>-<hash>` 这类最常见形态漏判 ⇒ 被送去探测。
         GO,
-        r'_PSEUDO_ANY = re.compile(r"-(?:\d+\.)?\d{14}-[0-9a-f]{12}(?:\+incompatible)?$", re.IGNORECASE)',
-        r'_PSEUDO_ANY = re.compile(r"-\d+\.\d{14}-[0-9a-f]{12}$", re.IGNORECASE)',
-        ['test_go_unjudgeable_versions_are_never_probed'],
+        '_PSEUDO_ANY = re.compile(\n'
+        r'    r"-(?:(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*\.)?0\.)?\d{14}-[0-9a-f]{12}"' + '\n'
+        r'    r"(?:\+incompatible)?$")',
+        '_PSEUDO_ANY = re.compile(\n'
+        r'    r"-\d+\.\d{14}-[0-9a-f]{12}$")',
+        ['test_go_pseudo_versions_are_never_probed'],
     ),
     (
         'P-C2/go：`+incompatible` 被划进"不判"（这类库的幻觉版本从此免检，漏一大片 Go 生态）',

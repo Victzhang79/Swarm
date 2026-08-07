@@ -26,6 +26,10 @@ TESTS = ["test/test_npm_registry_p2b.py",
 NPMR = ROOT / "brain" / "npm_registry.py"
 GOR = ROOT / "brain" / "go_registry.py"
 CU = ROOT / "brain" / "contract_utils.py"
+# ★#29-3 T-1★ go 脚手架叶簇已从 contract_utils.py 拆到 brain/go_scaffold.py（纪律#9），
+# contract_utils 只留顶层 re-export。落点必须跟着**定义模块**走——打 re-export 那个地址
+# 的突变恒未命中＝静默零覆盖（本仓已登记「拆函数迁模块后落点随簇漂移」这一类）。
+GS = ROOT / "brain" / "go_scaffold.py"
 
 _GATE_BLOCK = ("    if not _lookup_enabled():\n"
                "        return {}\n"
@@ -111,9 +115,13 @@ MUTATIONS = [
         ["test_ph3_go_mod_requires_parses_both_require_forms"],
     ),
     (
+        # ★#29-3 T-1：落点死于**模块迁移**，代码逐字未变★ 该调用点随 go 脚手架叶簇迁到
+        # `brain/go_scaffold.py`，字符串一个字节没改、地址变了 ⇒ 打 CU 恒未命中＝零覆盖。
+        # 只换路径（CU → GS）。讽刺的是这条锁本身锁的就是"接线覆盖≠机制存在"，而它自己
+        # 正因接线地址漂移而失效——同一条纪律在 harness 层复发。
         "P-H3k：调用方不传 project_path（证据层加在 resolve_go_deps 里而唯一生产调用点"
         "不带它 ⇒ 零调用点死代码——接线覆盖≠机制存在，血规 10 第一条）",
-        CU,
+        GS,
         "        kept, internal_mods, dropped = resolve_go_deps(\n"
         "            _norm_arts, internal_modules=internal_ids, project_path=project_path)",
         "        kept, internal_mods, dropped = resolve_go_deps(\n"
