@@ -1360,7 +1360,7 @@ def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str) ->
     try:
         import tomllib
 
-        from swarm.worker.sibling_dep_repair import _parse_cargo
+        from swarm.worker.sibling_dep_repair import _parse_cargo, toml_section_anchor
         loc = _parse_cargo(local_text)
         if not loc:
             return incoming_text
@@ -1377,7 +1377,9 @@ def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str) ->
                 # 点表/无可移植版本形态：无单行原始声明可移植 → 诚实丢弃
                 skipped_dot += 1
                 continue
-            m = re.search(rf'^\s*\[\s*{re.escape(_sec)}\s*\]\s*$', merged, re.M)
+            # #29-2 复核：与注入侧共用 `toml_section_anchor`（含"行尾注释"合法形态）。
+            # 两侧各写一份正则 ⇒ 必然漂移（本次就是漂在同一处：都漏了行尾注释）。
+            m = toml_section_anchor(merged, _sec)
             if m:
                 idx = (merged.index("\n", m.end()) + 1
                        if "\n" in merged[m.end():] else len(merged))

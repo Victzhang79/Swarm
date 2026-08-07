@@ -312,6 +312,51 @@ class TestCargoDepUnion:
         inc = self._STALE
         assert merge_shared_manifest(self._STALE, inc, "Cargo.toml") == inc
 
+    # ── 复核 MEDIUM：section 头带行尾注释（合法 TOML）不得让并集变 no-op ──
+    _COMMENT_INC = ('[package]\nname = "acme"\nversion = "0.1.0"\n\n'
+                    '[dependencies]  # keep sorted alphabetically\nanyhow = "1.0"\n')
+    _COMMENT_LOCAL = ('[package]\nname = "acme"\nversion = "0.1.0"\n\n'
+                      '[dependencies]  # keep sorted alphabetically\n'
+                      'anyhow = "1.0"\ntokio = "1.37.0"\n')
+
+    def test_section_header_with_trailing_comment_still_merges(self):
+        """★对抗复核提出、已独立复现★ `[dependencies]  # keep sorted` 是**合法 TOML** 且在
+        真实 Cargo.toml 里常见。锚点正则以 `\\s*$` 收尾时它失配 → 走"追加新 section"的
+        fallback → 重复 section → 非法 TOML → 被后置校验拦下 → **并集在完全合法的输入上
+        静默变 no-op**（兄弟的依赖注入照样蒸发）。"""
+        import tomllib
+        merged = merge_shared_manifest(
+            self._COMMENT_LOCAL, self._COMMENT_INC, "Cargo.toml")
+        obj = tomllib.loads(merged)
+        assert obj["dependencies"]["tokio"] == "1.37.0", (
+            f"行尾注释让并集变 no-op:\n{merged}")
+        assert obj["dependencies"]["anyhow"] == "1.0"
+
+    def test_trailing_comment_is_preserved_not_eaten(self):
+        """并集不得把用户的行尾注释吃掉（那是交付 diff 里的无关改动）。"""
+        merged = merge_shared_manifest(
+            self._COMMENT_LOCAL, self._COMMENT_INC, "Cargo.toml")
+        assert "# keep sorted alphabetically" in merged, merged
+
+    @pytest.mark.parametrize("header", [
+        "[dependencies]",
+        "[dependencies] # c",
+        "[dependencies]\t# c",
+        "[dependencies]   #",
+        "[ dependencies ]  # 内空白 + 行尾注释",
+        "[dependencies]\t",
+    ])
+    def test_anchor_accepts_all_legal_header_forms(self, header):
+        """锚点覆盖面：这些都是合法 TOML 的 `[dependencies]` 头写法，一个都不能漏
+        （漏一种 = 那种写法的工程上 A2/并集永久 no-op）。"""
+        import tomllib
+        inc = f'[package]\nname = "acme"\n\n{header}\nanyhow = "1.0"\n'
+        local = inc.replace('anyhow = "1.0"\n', 'anyhow = "1.0"\ntokio = "1.37.0"\n')
+        merged = merge_shared_manifest(local, inc, "Cargo.toml")
+        obj = tomllib.loads(merged)
+        assert obj["dependencies"].get("tokio") == "1.37.0", (
+            f"头写法 {header!r} 下并集失效:\n{merged}")
+
     def test_identical_texts_short_circuit(self):
         assert merge_shared_manifest(self._LOCAL, self._LOCAL,
                                      "Cargo.toml") == self._LOCAL
@@ -561,6 +606,76 @@ class TestInjectSideFakeAnchor:
         assert _inject_cargo(p, "serde_json", ("serde-json", "1.0.117")) is True
         deps = tomllib.loads(p.read_text())["dependencies"]
         assert "serde-json" in deps or "serde_json" in deps, deps
+
+    def test_inject_into_section_with_trailing_comment(self, tmp_path):
+        """★对抗复核提出、已独立复现★ 写者侧同一锚点缺口：`[dependencies]  # keep sorted`
+        下注入失配 → 追加重复 section → 非法 TOML → 后置校验拒 → **A2 在合法 manifest 上
+        永久 no-op**。
+        ★同时钉住因果★：复核称本次改动"把原本产毒返回 True 改成诚实拒绝 False"——实测
+        `5c9e0a2^` 旧代码在同一输入下**同样**返回 False（重复 section 是语法错，旧 M-2 的
+        `tomllib.loads` 也拦得住）⇒ 本次改动在这条路径上行为未变，缺口是纯既有缺口。"""
+        import tomllib
+
+        from swarm.worker.sibling_dep_repair import _inject_cargo
+        p = tmp_path / "Cargo.toml"
+        p.write_text('[package]\nname = "acme"\n\n'
+                     '[dependencies]  # keep sorted\nanyhow = "1.0"\n', encoding="utf-8")
+        assert _inject_cargo(p, "serde", "1.0") is True, "行尾注释下注入变 no-op"
+        obj = tomllib.loads(p.read_text())
+        assert obj["dependencies"]["serde"] == "1.0"
+        assert obj["dependencies"]["anyhow"] == "1.0"
+        assert "# keep sorted" in p.read_text(), "用户注释被吃掉"
+
+    # ★夹具形状是本组的命题所在★（首跑教训：用 `serde_json`/`serde-json` 这类**单纯全 `-`
+    # ↔ 全 `_` 互换**的名字，三态集合枚举**恰好覆盖得到** ⇒ 突变压不动、测试零区分力。
+    # 三态真正漏的是【落地键**混用**两种分隔符、而 rustc 名不是它的单纯互换】那一档。）
+    @pytest.mark.parametrize("rustc_name,manifest_key", [
+        ("my_crate_name", "my-crate_name"),   # ★三态漏：混用键★
+        ("a_b_c", "a-b_c"),                   # ★三态漏★
+        ("serde_json", "serde-json"),         # 对照：三态覆盖得到，改法也必须放行
+        ("plain", "plain"),                   # 对照：无分隔符
+    ])
+    def test_mixed_separator_names_not_falsely_rejected(
+            self, tmp_path, rustc_name, manifest_key):
+        """raw 移植路径的行为锁：兄弟 manifest 里的键可以是任意 `-`/`_` 组合，注入都得成功
+        且保住 features。
+
+        ★关于复核 MEDIUM-2 的诚实说明★ reviewer 指出名字归一的三态集合枚举对**混用**分隔符
+        的键覆盖不到 —— 枚举缺口本身成立（已用矩阵实测），但**沿生产调用路径不可达**：
+        `_inject_cargo` 传给 `_toml_insert_ok` 的 `name` 恒等于真正插入的那个键，故三态里
+        恒含 name 自身、恒命中。因此本测试**不是**那条缺陷的锁（没有单点突变能压住它，见
+        `scripts/w1_mutation_check.py` 里 W-1-p 的撤销记录），它锁的是 raw 移植这件真事。
+        """
+        import tomllib
+
+        from swarm.worker.sibling_dep_repair import _inject_cargo
+        p = tmp_path / "Cargo.toml"
+        p.write_text('[package]\nname = "acme"\n\n[dependencies]\nanyhow = "1.0"\n',
+                     encoding="utf-8")
+        # raw 用【兄弟 manifest 的键写法】，name 用【rustc 诊断名】——这正是生产形态
+        raw = f'{manifest_key} = {{ version = "1.0", features = ["x"] }}'
+        ok = _inject_cargo(p, rustc_name, (manifest_key, "1.0", raw, "dependencies"))
+        assert ok is True, f"name={rustc_name!r} 键={manifest_key!r} 被冤拒"
+        deps = tomllib.loads(p.read_text())["dependencies"]
+        assert manifest_key in deps, deps
+        assert deps[manifest_key]["features"] == ["x"], (
+            f"raw 移植没保住 features: {deps}")
+
+    def test_raw_transplant_with_differing_separator_accepted(self, tmp_path):
+        """raw 移植时【兄弟声明的写法】与【rustc 诊断名】分隔符可能不同（前者 `-`、后者 `_`）
+        —— 归一必须让它通过，否则保 features 的那条路被自己的校验掐死。"""
+        import tomllib
+
+        from swarm.worker.sibling_dep_repair import _inject_cargo
+        p = tmp_path / "Cargo.toml"
+        p.write_text('[package]\nname = "acme"\n\n[dependencies]\nanyhow = "1.0"\n',
+                     encoding="utf-8")
+        raw = 'serde-json = { version = "1.0.117", features = ["preserve_order"] }'
+        ok = _inject_cargo(p, "serde_json",
+                           ("serde-json", "1.0.117", raw, "dependencies"))
+        assert ok is True, "分隔符不同导致 raw 移植被冤拒"
+        deps = tomllib.loads(p.read_text())["dependencies"]
+        assert deps["serde-json"]["features"] == ["preserve_order"], deps
 
     def test_inline_table_features_preserved_on_inject(self, tmp_path):
         """D13 不得回归：内联表整体移植保 features。"""

@@ -60,11 +60,33 @@ MUTATIONS = [
          "test_empty_cksum_with_trailing_whitespace_also_disabled"],
     ),
     (
+        "W-7-c3：空 cksum 降级退回 logger.debug（生产默认 INFO ⇒ W-7 复发时唯一信号被吞）",
+        L1,
+        '        logger.warning(\n'
+        '            "[L1·A7] 全树签名为空 cksum(%s)——树内无 JVM 源文件或签名命令失效，两者不可辨"',
+        '        logger.debug(\n'
+        '            "[L1·A7] 全树签名为空 cksum(%s)——树内无 JVM 源文件或签名命令失效，两者不可辨"',
+        ["test_empty_cksum_degradation_is_visible_at_default_log_level"],
+    ),
+    (
         "W-7-d：空 cksum 判据放到 strip 之前（真实 shell 输出带尾换行 ⇒ 该档从旁路溜过）",
         L1,
         '        sig = (sig_out or "").strip()',
         '        sig = (sig_out or "")',
         ["test_empty_cksum_with_trailing_whitespace_also_disabled"],
+    ),
+    (
+        "W-7-c2：_EMPTY_CKSUM 常量写错（兜底比对不上 ⇒ 空签名被当有效签名 ⇒ 缓存永不失效；"
+        "该常量是硬编码字面量，必须由本平台 cksum 自证而非靠记忆的参考值）",
+        L1,
+        '_EMPTY_CKSUM = "4294967295 0"',
+        '_EMPTY_CKSUM = "0 0"',
+        # 只有自证那条该红。首列时我把 `test_signature_is_not_the_empty_cksum_on_a_real_tree`
+        # 也列进来，被 harness 判"仍绿"——它是对的：那条断言 `sig != _EMPTY_CKSUM`，常量被改错
+        # 后它拿**错的常量**去比，反而**恒真通过**。这正是"常量自证"必须独立成一条测试的理由：
+        # 所有引用该常量的断言都会跟着常量一起错，只有跟**外部事实**（本平台 cksum 实际输出）
+        # 对账的那条才抓得住。
+        ["test_empty_cksum_constant_matches_this_platform"],
     ),
     (
         "W-7-e：签名口径扩到所有文件（改 README 就让 JVM 符号表缓存失效 ⇒ 缓存形同不存在）",

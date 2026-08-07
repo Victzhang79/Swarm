@@ -3011,7 +3011,14 @@ def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[i
     # ★W-7★ 空 cksum 与真失败同值 → 视为无签名。这一条必须与上面的 `sig = ""` 并列存在：
     # 异常路径给空串，而"命令成功但输出是空 cksum"走的是**正常返回**路径，两者来源不同。
     if sig == _EMPTY_CKSUM:
-        logger.debug(
+        # ★#29-2 对抗复核（hunter finding 3）★ 原为 `logger.debug` ⇒ **生产不可见**：
+        # `config/settings.py` 默认 `log_level="INFO"`，且 `.env`/env_registry 无覆盖项
+        # （两处已实测）。而这条分支同时意味着"签名命令可能整条失效"——正是 W-7 症状复发的
+        # 唯一信号。降级本身是安全的（不缓存，不产错结果），但**诊断信号被吞**：排查
+        # `_attempt_symbol_repair` 拿陈旧频次表误改名时无日志可查。故升为 WARNING。
+        # 良性情形（树内真没有 JVM 源文件）也会打 —— 刻意接受：宁可对良性多打一条，
+        # 也不让真故障静默（本仓「降级路径至少一次 WARNING」的纪律方向）。
+        logger.warning(
             "[L1·A7] 全树签名为空 cksum(%s)——树内无 JVM 源文件或签名命令失效，两者不可辨"
             "→ 本次不缓存（宁可重扫，绝不用可能陈旧的符号表）: %s", sig, project_path)
         sig = ""

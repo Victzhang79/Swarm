@@ -389,6 +389,47 @@ def _inject_npm(path: Path, dep: str, coord) -> bool:
     return True
 
 
+def toml_section_anchor(text: str, section: str) -> "re.Match | None":
+    """在 TOML 文本里定位 `[section]` 头行 —— **注入侧与并集侧的唯一事实源**。
+
+    容忍两种合法写法：① 头内空白（`[ dependencies ]`，批次6 R1 已治）；② **行尾注释**
+    （`[dependencies]  # keep sorted`）。
+
+    ★#29-2 复核 MEDIUM（reviewer 提，已独立复现）★ 原正则以 `\\s*$` 收尾，行尾注释直接
+    失配 ⇒ 走"追加一个新 `[section]`"的 fallback ⇒ 重复 section ⇒ 非法 TOML ⇒ 被后置校验
+    拦下 ⇒ **A2 注入/并集在这类完全合法的 manifest 上静默变 no-op**（有 WARNING，但"本该
+    修好却没修"）。`# keep sorted` / `# 按字母序` 这类行尾注释在真实 Cargo.toml 里很常见。
+    诚实边界：`#` 出现在 section 名里不合法，故这里无需担心把注释符当名字的一部分。
+
+    ★同时纠正复核对因果的描述★：reviewer 称本次改动"把原本产毒但返回 True 的场景改成了
+    诚实拒绝 False"。实测 `5c9e0a2^` 旧代码在同一输入下**同样**返回 False（重复 section 是
+    **语法**错，旧的 M-2 `tomllib.loads` 也拦得住）⇒ 本次改动在这条路径上**行为未变**，
+    缺口是纯既有缺口。记在这里，免得后来人以为这条路径被本次动过。
+    """
+    return re.search(rf'^[ \t]*\[[ \t]*{re.escape(section)}[ \t]*\][ \t]*(?:#[^\n]*)?$',
+                     text, re.M)
+
+
+def _norm_crate_key(name: str) -> str:
+    """crate 名归一：`-` 与 `_` 在 Cargo 生态里可互换（rustc 诊断用 `_`、manifest 常用 `-`）。
+
+    ★#29-2 复核 MEDIUM-2 的处置：采纳改法，但**如实记它在生产上不可达**★
+    reviewer 指出原先的三态集合枚举 `{name, -→_, _→-}` 对**混用两种分隔符**的键
+    （`my-crate_name` 配 rustc 名 `my_crate_name`）覆盖不到 ⇒ 合法插入被误判"没落地" ⇒
+    fail-closed 冤拒。**枚举缺口本身成立**（已用矩阵实测：单纯全 `-`↔全 `_` 互换三态覆盖
+    得到，混用键覆盖不到）。
+    但**沿生产调用路径不可达**（血规 10①：加机制先数调用点，且要数到"谁消费返回值"这一层）：
+    `_inject_cargo` 两条臂传给 `_toml_insert_ok` 的 `name` 都**恒等于真正插入的那个键** ——
+    tuple 臂 `name = coord[0]` 而 `raw` 由 `_parse_cargo` 以同一个 name 拼成
+    （`raw_line = f"{name} = {rhs}"`，见 :147）；非 tuple 臂 `name = dep` 而写入行是
+    `f'{name} = "{ver}"'`。故三态集合里恒含 `name` 自身 ⇒ 恒命中 ⇒ 那个缺口今天咬不到。
+    仍改的理由：少一份形态枚举（枚举缺口是本仓反复栽过的一类），且哪天有新调用方传入与
+    落地键不同的 name 时不会冤拒。**不宣称它修了一个活缺陷，也没有突变能压住它**
+    （见 `scripts/w1_mutation_check.py` 里 W-1-p 撤销的记录）。
+    """
+    return name.replace("-", "_")
+
+
 def _toml_insert_ok(original: str, candidate: str, section: str, name: str) -> bool:
     """#29-2 W-1：TOML 单条依赖插入的【事实】后置校验。
 
@@ -403,7 +444,7 @@ def _toml_insert_ok(original: str, candidate: str, section: str, name: str) -> b
     （血规：声称穷举必须指出权威来源——这里改成不穷举，直接对账端状态）。
 
     名字归一：Cargo.toml 惯用连字符、rustc 诊断用下划线，两种写法指同一 crate；断言 ②
-    两种都认（否则合法注入会被自己的校验冤杀）。
+    两种都认（否则合法注入会被自己的校验冤杀）。见 `_norm_crate_key`。
     """
     import tomllib
     try:
@@ -414,8 +455,8 @@ def _toml_insert_ok(original: str, candidate: str, section: str, name: str) -> b
     sec_new = new_obj.get(section)
     if not isinstance(sec_new, dict):
         return False
-    _cands = {name, name.replace("-", "_"), name.replace("_", "-")}
-    hit = next((k for k in sec_new if k in _cands), None)
+    _want = _norm_crate_key(name)
+    hit = next((k for k in sec_new if _norm_crate_key(k) == _want), None)
     if hit is None:
         return False
     stripped = {k: (dict(v) if isinstance(v, dict) else v) for k, v in new_obj.items()}
@@ -462,7 +503,9 @@ def _inject_cargo(path: Path, dep: str, coord) -> bool:
     def _insert(dep_line: str) -> str:
         # 批次6 R1：section 头容忍内空白（`[ dependencies ]` 是合法 TOML）——旧正则
         # 不匹配会追加第二个同名 section → duplicate-section 非法 TOML 毒化目标。
-        m = re.search(rf'^\s*\[\s*{re.escape(section)}\s*\]\s*$', text, re.M)
+        # #29-2 复核：锚点定位收敛到 `toml_section_anchor` 单一事实源（并集侧同用），
+        # 并补上"行尾注释"这一合法形态。
+        m = toml_section_anchor(text, section)
         if m:
             idx = text.index("\n", m.end()) + 1 if "\n" in text[m.end():] else len(text)
             return text[:idx] + dep_line + text[idx:]

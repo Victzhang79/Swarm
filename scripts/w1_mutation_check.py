@@ -117,11 +117,16 @@ MUTATIONS = [
         ["test_dot_table_dep_is_honestly_skipped_not_mangled"],
     ),
     (
-        "W-1-k：cargo section 头正则不容忍内空白（`[ dependencies ]` ⇒ 追加重复 section）",
-        WM,
-        "            m = re.search(rf'^\\s*\\[\\s*{re.escape(_sec)}\\s*\\]\\s*$', merged, re.M)",
-        "            m = re.search(rf'^\\s*\\[{re.escape(_sec)}\\]\\s*$', merged, re.M)",
-        ["test_section_header_with_inner_whitespace"],
+        # ★落点已随本批自己的重构漂移一次，这里更新★：并集侧原本自写内联正则，复核整改后
+        # 收敛到共享 `toml_section_anchor` ⇒ 旧落点（`re.search(...merged...)`）不复存在。
+        # 现落在共享锚点上，压"不容忍头内空白"这一档（两侧同时受它保护）。
+        # 教训与「改共享代码必复跑上一批 harness」同源：**本批自己的重构也算改共享代码**。
+        "W-1-k：section 头正则不容忍内空白（`[ dependencies ]` ⇒ 追加重复 section ⇒ 非法 TOML）",
+        ROOT / "worker" / "sibling_dep_repair.py",
+        "    return re.search(rf'^[ \\t]*\\[[ \\t]*{re.escape(section)}[ \\t]*\\][ \\t]*(?:#[^\\n]*)?$',\n                     text, re.M)",
+        "    return re.search(rf'^[ \\t]*\\[{re.escape(section)}\\][ \\t]*(?:#[^\\n]*)?$',\n                     text, re.M)",
+        ["test_section_header_with_inner_whitespace",
+         "test_anchor_accepts_all_legal_header_forms"],
     ),
     (
         # 首跑教训：原本这里是"删掉 tomllib.loads 校验"，但当时那道闸**不可独立证伪**——
@@ -151,6 +156,37 @@ MUTATIONS = [
         "    if not stripped[section] and not old_obj.get(section):",
         ["test_empty_target_section_not_falsely_rejected"],
     ),
+    # ── 对抗复核（reviewer MEDIUM ×2）整改的锁 ──────────────────────────────
+    (
+        "W-1-n：锚点正则退回 `\\s*$` 收尾（行尾注释 `[dependencies] # keep sorted` 失配 "
+        "⇒ 追加重复 section ⇒ 非法 TOML ⇒ A2 注入与并集在合法 manifest 上静默 no-op）",
+        ROOT / "worker" / "sibling_dep_repair.py",
+        "    return re.search(rf'^[ \\t]*\\[[ \\t]*{re.escape(section)}[ \\t]*\\][ \\t]*(?:#[^\\n]*)?$',\n                     text, re.M)",
+        "    return re.search(rf'^\\s*\\[\\s*{re.escape(section)}\\s*\\]\\s*$', text, re.M)",
+        ["test_section_header_with_trailing_comment_still_merges",
+         "test_anchor_accepts_all_legal_header_forms",
+         "test_inject_into_section_with_trailing_comment"],
+    ),
+    (
+        "W-1-o：并集侧不复用共享锚点、自写内联正则（两份必漂移——本次就是同漏行尾注释）",
+        WM,
+        "            m = toml_section_anchor(merged, _sec)",
+        "            m = re.search(rf'^\\s*\\[\\s*{re.escape(_sec)}\\s*\\]\\s*$', merged, re.M)",
+        ["test_section_header_with_trailing_comment_still_merges"],
+    ),
+    # ★W-1-p 已撤销，理由如实记在这里（与 W-1-i 同类：不是"漏了"，是**压不动**）★
+    # 原本想压名字归一（复核 MEDIUM-2）：把 `_norm_crate_key` 两侧折叠改回三态集合枚举。
+    # 实测**仍绿**，且原因是结构性的 —— 沿生产调用路径，`_inject_cargo` 传给
+    # `_toml_insert_ok` 的 `name` **恒等于真正插入的那个键**（tuple 臂 name=coord[0] 而 raw
+    # 由 `_parse_cargo` 以同一 name 拼成；非 tuple 臂写入行就是 f'{name} = ...'）⇒ 三态集合
+    # 里恒含 name 自身 ⇒ 恒命中 ⇒ 该枚举缺口今天咬不到任何生产路径。
+    # 首跑我还先改错过一次夹具：用 `serde_json`/`serde-json` 这类**单纯全 `-`↔全 `_` 互换**
+    # 的名字，三态**恰好覆盖得到**，于是压不动；换成混用键（`my-crate_name`）后才发现真正
+    # 的原因是上面那条"生产不可达"，而不是夹具形状。两层都记下来，免得后来人再走一遍。
+    # 处置：改法保留（少一份形态枚举，且新调用方传入不同 name 时不冤拒），但**不宣称它修了
+    # 活缺陷、也不给它挂突变背书**。测试 test_mixed_separator_names_not_falsely_rejected
+    # 保留为 raw 移植路径的行为锁（它锁的是"混用键能注进去且保住 features"这件真事）。
+
     (
         "W-1-m：cargo 取证换自写正则（不复用写者解析器 ⇒ 口径分叉，内联表 features 丢）",
         WM,

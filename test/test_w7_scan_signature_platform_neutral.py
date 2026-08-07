@@ -101,6 +101,20 @@ class TestRealSignatureDiscriminates:
         """把"空树"这个事实钉住：它与"命令失败"同值 ⇒ 下面那组必须当无证据处理。"""
         assert _real_sig(str(tmp_path)) == L._EMPTY_CKSUM
 
+    def test_empty_cksum_constant_matches_this_platform(self):
+        """★`_EMPTY_CKSUM` 是硬编码字面量 → 必须由本平台的 `cksum` **自证**★
+
+        对抗复核问过"这个值在别的 cksum 实现上会不会不一样"。它是 POSIX cksum 对空输入的
+        确定性输出（CRC-32 + 长度 0），GNU coreutils 与 BSD 同算法。但**结论不能只靠我记得
+        的参考值** —— 那属于「声称穷举/等价必须指出权威来源」那一类。这里让当前平台的 cksum
+        自己给出答案并与常量对账：常量写错、或哪天在某平台上取值不同，这条会红。
+        """
+        got = subprocess.run("printf '' | cksum", shell=True,
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        assert got == L._EMPTY_CKSUM, (
+            f"本平台空输入 cksum={got!r} 与常量 {L._EMPTY_CKSUM!r} 不符 "
+            f"⇒ 空签名兜底在本平台失效（W-7 兜底被绕过的同一形状）")
+
 
 # ── B. 平台中立：不得再按本机平台分叉 ────────────────────────────────────
 
@@ -130,6 +144,36 @@ def test_signature_command_uses_no_stat(monkeypatch):
 # ── C. 空 cksum 必须当无签名（兜底被绕过的那一环）────────────────────────
 
 class TestEmptyCksumTreatedAsNoSignature:
+
+    def test_empty_cksum_degradation_is_visible_at_default_log_level(
+            self, monkeypatch, caplog):
+        """★对抗复核 hunter finding 3★ 该降级分支同时意味着"签名命令可能整条失效"——W-7
+        症状复发的唯一信号。原实现用 `logger.debug`，而 `config/settings.py` 默认
+        `log_level="INFO"` 且无 `.env` 覆盖 ⇒ **生产永不可见** ⇒ 诊断信号被吞。
+
+        断言"级别 ≥ WARNING"而非逐字匹配级别名，避免焊死实现细节（纪律 6）；同时断日志里
+        带得上定位线索（项目路径），否则一条无上下文的告警等于没有。
+        """
+        import logging
+
+        L._SCAN_CACHE.clear()
+        sig_cmd = L._scan_sig_command()
+
+        def fake_run(cmd, path, timeout=60):
+            if cmd == sig_cmd:
+                return (0, L._EMPTY_CKSUM, "")
+            return (0, "SYMBOLS", "")
+
+        monkeypatch.setattr(L, "_run_check_split", fake_run)
+        with caplog.at_level(logging.DEBUG):
+            L._cached_scan("g", "/proj-xyz")
+        hits = [r for r in caplog.records if "空 cksum" in r.getMessage()]
+        assert hits, "空 cksum 降级一条日志都没打"
+        assert any(r.levelno >= logging.WARNING for r in hits), (
+            f"降级只在 DEBUG/INFO 级别可见（实际 "
+            f"{[logging.getLevelName(r.levelno) for r in hits]}），而生产默认 INFO "
+            f"⇒ W-7 复发时无信号可查")
+        assert any("/proj-xyz" in r.getMessage() for r in hits), "日志缺定位线索（项目路径）"
 
     def test_empty_cksum_disables_caching(self, monkeypatch):
         """★W-7 的咬合点★：签名为空 cksum（命令失效 or 空树）时**不得缓存**。
