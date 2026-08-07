@@ -58,10 +58,15 @@ MUTATIONS = [
         ["test_xh2_guess_test_cmd_covers_every_stack"],
     ),
     (
-        "X-H2: go/rust 工程级兜底删掉（无测试文件的工程零测试面）",
+        # ★#29-3 T-1：机制被**重构**，落点必须对新单一事实源重写★
+        # `_guess_test_cmd` 原是一串硬编码 if 链（每栈一条、命令字面量写在函数里），d76f954
+        # 起改成从 `worker/stack_drivers.TEST_DRIVERS`（事实源 `stacks.spec.STACK_SPEC`）
+        # 派生的**循环**。四条旧落点（go 臂 / python 臂守卫 / 锚定 / JVM 留空）自那次重构起
+        # 全部落点未命中＝零覆盖。这里按**原意图**重写：go 臂不存在 ⇒ 从循环栈元组里摘掉 go。
+        "X-H2: go 工程级兜底删掉（无测试文件的工程零测试面）",
         PIPE,
-        '    if _manifest_present(("go.mod",), project_path) and any(f.endswith(".go") for f in mods):',
-        "    if False:",
+        '    for stack_key in ("python", "go", "cargo", "npm"):\n',
+        '    for stack_key in ("python", "cargo", "npm"):\n',
         ["test_xh2_guess_test_cmd_covers_every_stack"],
     ),
     (
@@ -80,14 +85,23 @@ MUTATIONS = [
         "    return bool(t)",
         ["test_xh2_rejects_npm_init_placeholder_test_script"],
     ),
-    (
-        "X-H2: JVM 也去猜 mvn test（绕过 S1 的刻意留空，打在唯一跑过 E2E 的栈上）",
-        PIPE,
-        '    if (any(f.endswith(".py") for f in mods)\n            and _manifest_present(("pyproject.toml",), project_path)):\n        return _anchor(("pyproject.toml",), "python -m pytest -q --maxfail=1")',
-        '    if _manifest_present(("pom.xml",), project_path):\n'
-        '        return "mvn -q test"',
-        ["test_xh2_jvm_deliberately_not_guessed"],
-    ),
+    # ★#29-3 T-1：这条**撤销**，理由如实记在这里（不是"漏了"，是**压不动**）★
+    # 原落点在 `_guess_test_cmd` 里（把 python 臂改成 pom 臂），d76f954 重构后已不存在。
+    # 重写尝试过两个落点，**都实测仍绿**，而原因是结构性的：
+    #   ① 往循环栈元组加 `"maven"` → `_test_driver_for("maven")` 返 None → `continue`
+    #      → 行为不变；
+    #   ② 给 `STACK_SPEC["maven"].test_cmd` 一个值（让它进 TEST_DRIVERS）→ 但**循环元组
+    #      是写死的** `("python","go","cargo","npm")`，从不问 maven → 行为仍不变。
+    # 即"JVM 刻意不猜"这条不变量被**两处独立编码**（`test_cmd=""` 与循环元组），任一单独
+    # 突变都仍绿 ⇒ 两条都不可证伪（本仓登记过的"冗余防御互相兜底"同族）。硬造一条要同时
+    # 改两处的突变，那不是单点突变、也压不出"哪一处在承重"。
+    # 测试 `test_xh2_jvm_deliberately_not_guessed` **保留**（它锁的是真实用户可见属性），
+    # 但**不宣称**它有突变背书。
+    # 顺带（已登记 findings W-24）：那个写死元组**复制了 TEST_DRIVERS 的键集** —— 今天两者
+    # 恰好相等，但给任何栈在 STACK_SPEC 里加 `test_cmd` 就会产出一个循环从不问的 driver
+    # ⇒ 该栈测试闸静默零覆盖。不在本批顺手改：改成从 TEST_DRIVERS 派生会**改变迭代顺序**，
+    # 而顺序决定多栈仓（同时有 pyproject.toml 与 package.json 且两类文件都改了）里哪条测试
+    # 命令胜出，属行为变更，需单独定序后再动。
     (
         "X-H2: scoped 探测退回 _manifest_present（子目录测试文件全漏 + 越界不拒）",
         PIPE,
@@ -208,10 +222,13 @@ MUTATIONS = [
         ['test_c1_php_ruby_gate_actually_checks_every_modified_file'],
     ),
     (
-        'C-2: python 测试兜底的语言守卫被拆（嵌套 pyproject 劫持所有栈）',
+        # ★#29-3 T-1 落点重写（同 d76f954 重构）★ 原落点是 python 臂自己的 `any(.py)` 守卫；
+        # 重构后语言守卫成了循环内**通用**的一条（`_ext_for_lang(drv.lang)`）。拆掉它 ⇒ 任何
+        # 深度≤3 的 `pyproject.toml` 劫持所有栈（原 C-2 缺陷），意图逐字保留。
+        'C-2: 测试兜底的语言守卫被拆（嵌套 pyproject 劫持所有栈）',
         PIPE,
-        '    if (any(f.endswith(".py") for f in mods)\n            and _manifest_present(("pyproject.toml",), project_path)):',
-        '    if _manifest_present(("pyproject.toml",), project_path):',
+        '        if not any(f.endswith(_ext_for_lang(drv.lang)) for f in mods):\n            continue\n',
+        '        if False:  # 突变：语言守卫拆掉\n            continue\n',
         ['test_c2_nested_pyproject_does_not_hijack_other_stacks'],
     ),
     (
@@ -276,10 +293,12 @@ MUTATIONS = [
         ['test_hc1_changes_spanning_two_manifests_fall_back_to_root'],
     ),
     (
+        # ★#29-3 T-1 落点重写（同 d76f954 重构）★ 命令字面量已不在本函数里（改从 driver 取），
+        # 锚定这一步成了循环出口的 `return _anchor(drv.anchor_manifests, drv.test_cmd)`。
         'CRITICAL-2: 测试兜底不再锚定（根级 pytest → rc=5 → sticky 硬 FAIL）',
         PIPE,
-        '        return _anchor(("pyproject.toml",), "python -m pytest -q --maxfail=1")',
-        '        return "python -m pytest -q --maxfail=1"',
+        '        return _anchor(drv.anchor_manifests, drv.test_cmd)\n',
+        '        return drv.test_cmd  # 突变：不锚定\n',
         ['test_hc2_test_fallback_is_anchored'],
     ),
     (
