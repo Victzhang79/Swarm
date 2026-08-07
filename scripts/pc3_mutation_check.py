@@ -28,6 +28,27 @@ TESTS = ["test/test_pc3_template_engine_multistack.py",
          "test/test_r65tr_t5_baseline_convention.py"]
 
 SD = ROOT / "brain" / "stack_detect.py"
+
+
+def _current_int_const(path: Path, const: str) -> tuple[str, str]:
+    """读出 `const = <n>`（裸 int）的**当前**取值，返回 (old_line, new_line=不递增版)。
+
+    ★#29-3 T-1 治法③：版本常量类落点必须【派生】而非写死★
+    原落点写死 `_STACK_SCHEMA_VERSION = 8`，而该常量每次合法递增都会杀死这条锁
+    （实测已漂到 10）。改为运行时读当前值、构造"不递增"（n-1）突变，随递增自愈。
+    代价：落点不再是字面量 ⇒ 静态审计计入「静态判不了」而非「健康」；这是刻意取舍
+    —— harness 运行时仍校验落点在不在，"可验+自愈"优于"静态可见但永久死"。
+    """
+    import re as _re
+    src = path.read_text(encoding="utf-8")
+    m = _re.search(rf'^{_re.escape(const)} = (\d+)', src, _re.M)
+    if not m:
+        return (f"{const} = <未找到>", f"{const} = <未找到>")
+    cur = int(m.group(1))
+    return (f"{const} = {cur}", f"{const} = {max(cur - 1, 0)}")
+
+
+_SSV_OLD, _SSV_NEW = _current_int_const(SD, "_STACK_SCHEMA_VERSION")
 PN = ROOT / "brain" / "planning_nodes.py"
 LS = ROOT / "brain" / "llm_schemas.py"
 EA = ROOT / "worker" / "executor_agent.py"
@@ -414,9 +435,10 @@ MUTATIONS = [
         '事故的原形态，第二次）',
         # R2-H4 起常量本体迁到 stack_detect.py（worker 同源消费），planning_nodes 只剩
         # re-export——落点同步迁，别打一个已经不住的地址。
+        # ★#29-3 T-1：落点再改【派生】★ 写死 `= 8` 的版本在常量递增到 10 后已死（零覆盖）。
         SD,
-        '_STACK_SCHEMA_VERSION = 8',
-        '_STACK_SCHEMA_VERSION = 7',
+        _SSV_OLD,
+        _SSV_NEW,
         ['test_stack_schema_version_paired_with_cached_payload'],
     ),
     (

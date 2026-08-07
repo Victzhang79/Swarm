@@ -160,9 +160,12 @@ MUTATIONS = [
         "P-H4b-n：cargo driver 从分派表除名（机制全对但接线断——cargo 工程回到零出口，"
         "矩阵格与真调用方双红）",
         CU,
-        '                        "python": _inject_python_scaffolds,\n'
-        '                        "cargo": _inject_cargo_scaffolds}',
-        '                        "python": _inject_python_scaffolds}',
+        # ★#29-3 T-1：落点已死，同「表长大」族★ 原落点写的是 `"cargo": …}`（cargo 是**末项**、
+        # 自带右花括号）。`_P2_SCAFFOLD_DRIVERS` 后来加了 `gradle` ⇒ cargo 不再是末项、右括号
+        # 移走 ⇒ 该突变自那次扩表起落点未命中＝零覆盖（与 xm 的 `DRIVERS` 死锁同一形状）。
+        # 改为只摘 cargo **自己那一行**（逗号形），表继续长也不会再漂。
+        '                        "cargo": _inject_cargo_scaffolds,\n',
+        '',
         ["test_ph4b_cargo_manifest_spec_reaches_scaffold_via_real_caller",
          "test_scaffold_driver_dispatch_matrix"],
     ),
@@ -170,7 +173,13 @@ MUTATIONS = [
         "P-H4b-o：held pre-split 删除（无物理落点的内部模块送 crates.io/臆造 path——"
         "hunter R2 H-1 cargo 臂复活）",
         CU,
+        # ★#29-3 T-1：落点原为非唯一（出现 2 次）⇒ `replace(...,1)` 只改第一处 ⇒ 突变语义
+        # 不等价，该锁实际从未被验证过。两处分别是 **cargo 臂**(:3976) 与 **gradle 臂**(:4174)，
+        # 代码逐字相同。本条锁的是 cargo（测试名 …cargo_unresolved_internal_label…），故向上
+        # 扩一行带 `crates.io` 的注释来唯一定位——扩上下文比改代码去迁就 harness 更安全。
+        "        # 先扣下不送 resolve（否则被当第三方送 crates.io）。\n"
         "        held = [a for a in arts if a in _labels and a not in dirs]",
+        "        # 先扣下不送 resolve（否则被当第三方送 crates.io）。\n"
         "        held = []  # 突变：held pre-split 删除",
         ["test_ph4b_cargo_unresolved_internal_label_held_from_registry"],
     ),

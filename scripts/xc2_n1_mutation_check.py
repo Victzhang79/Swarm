@@ -21,6 +21,31 @@ IMG = ROOT / "worker" / "image_builder.py"
 SPEC = ROOT / "project" / "sandbox_spec.py"
 PIPE = ROOT / "worker" / "l1_pipeline.py"
 
+
+def _current_version_literal(path: Path, const: str) -> tuple[str, str]:
+    """读出 `const = "<n>"` 的**当前**取值，返回 (old_line, new_line=不递增版)。
+
+    ★#29-3 T-1 治法③：版本常量类落点必须【派生】而非写死★
+    原落点写死 `_BUILDER_VERSION = "9"`，而该常量**每次合法递增都会让这条锁死掉**
+    （实测已漂到 "11"）。当时的注释还把它合理化成"那是它刻意的失败态，不是误报"——
+    风险被写下来就当结清了，于是这条锁从 #8 那次递增起一直零覆盖。
+    这里改为运行时读当前值、构造"不递增"（n-1）的突变，从此随任何递增自愈。
+    代价：落点不再是字面量 ⇒ 静态审计（scripts/harness_landing_audit.py）会把它计入
+    「静态判不了」而非「健康」。这是**刻意取舍**：harness 自己在运行时仍会校验落点在不在
+    （`old not in src` 即失败），故"运行时可验 + 自愈"严格优于"静态可见但永久死"。
+    """
+    import re as _re
+    src = path.read_text(encoding="utf-8")
+    m = _re.search(rf'^{_re.escape(const)} = "(\d+)"', src, _re.M)
+    if not m:
+        # 找不到 → 返回一个必然落点未命中的哨兵，让 harness 如实报"落点未命中"
+        return (f'{const} = "<未找到>"', f'{const} = "<未找到>"')
+    cur = int(m.group(1))
+    return (f'{const} = "{cur}"', f'{const} = "{max(cur - 1, 0)}"')
+
+
+_BV_OLD, _BV_NEW = _current_version_literal(IMG, "_BUILDER_VERSION")
+
 MUTATIONS = [
     # ── X-C2：安装/自测同读 registry ──
     (
@@ -65,13 +90,15 @@ MUTATIONS = [
          "test_new_build_tool_in_registry_is_installed_and_selftested"],
     ),
     (
-        # ★落点随 #8 同步★ 该常量已递增到 "9"（#8 把在场硬闸推广到全部 6 个 (name,build_tool)，
-        # Dockerfile 生成物变了）。字面量停在 "8" 会被 harness 判"落点未命中（代码已漂移）"
-        # ——那是它刻意的失败态（拒绝在漂移代码上给假绿），不是误报。
+        # ★#29-3 T-1：落点改【派生】★ 原先写死 `_BUILDER_VERSION = "9"`，而这个常量**每次
+        # 合法递增都会杀死这条锁**（实测已漂到 "11"，自 #8 那次递增起零覆盖）。
+        # 更要紧的是当时的注释把它合理化成"那是它刻意的失败态，不是误报"——把风险写下来
+        # 当成了结清账目，于是没人再去动它。现在由 `_current_version_literal` 运行时读当前
+        # 值并构造"不递增"（n-1）的突变，随任何递增自愈。
         "X-C2 复核 C-1: _BUILDER_VERSION 不递增（复用老镜像 → 修复不落地）",
         IMG,
-        '_BUILDER_VERSION = "9"',
-        '_BUILDER_VERSION = "8"',
+        _BV_OLD,
+        _BV_NEW,
         ["test_builder_version_bumped_so_old_images_are_invalidated"],
     ),
     (

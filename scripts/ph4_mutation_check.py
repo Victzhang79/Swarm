@@ -25,6 +25,10 @@ TESTS = ["test/test_pypi_registry_ph4.py", "test/test_i6_decouple_subtasks.py",
 PR = ROOT / "brain" / "pypi_registry.py"
 CU = ROOT / "brain" / "contract_utils.py"
 SP = ROOT / "stacks" / "spec.py"
+# ★#29-3 T-1★ go 脚手架叶簇已从 contract_utils.py 拆到 brain/go_scaffold.py（纪律#9），
+# contract_utils 只留顶层 re-export。落点必须跟着**定义模块**走 —— 打 re-export 那个地址
+# 的突变会静默零覆盖（本仓已登记「拆函数迁模块后落点随簇漂移」这一类）。
+GS = ROOT / "brain" / "go_scaffold.py"
 
 MUTATIONS = [
     (
@@ -113,10 +117,14 @@ MUTATIONS = [
         ["test_ph4_python_manifest_spec_reaches_scaffold_via_real_caller"],
     ),
     (
+        # ★#29-3 T-1：落点已死，同「表长大」族★ 原落点写的是 `"python": …}`（python 当时是
+        # **末项**、自带右花括号）。`_P2_SCAFFOLD_DRIVERS` 后来加了 cargo、gradle ⇒ python 不再
+        # 是末项、右括号移走 ⇒ 该突变自那次扩表起零覆盖（与 ph4b #14 / xm 的 `DRIVERS` 同形）。
+        # 改为只摘 python **自己那一行**（逗号形），表继续长也不会再漂。
         "P-H4a-i：python driver 从分派表除名（机制全对但接线断——pyproject 工程回到零出口）",
         CU,
-        '                       "python": _inject_python_scaffolds}',
-        "                       }",
+        '                        "python": _inject_python_scaffolds,\n',
+        '',
         ["test_ph4_python_manifest_spec_reaches_scaffold_via_real_caller"],
     ),
     (
@@ -133,9 +141,17 @@ MUTATIONS = [
         "P-H4a-k：requires-python 缺席时猜一个默认（血规 2：版本下界只能来自磁盘真值——"
         "猜的下界会拦死合法的旧环境）",
         CU,
-        '    except (OSError, ValueError):\n        pass\n    return ""\n\n\ndef _toml_escape',
-        '    except (OSError, ValueError):\n        pass\n    return ">=3.9"  # 突变：猜默认\n\n\n'
-        "def _toml_escape",
+        # ★#29-3 T-1 落点更新★ 原落点含 `except (OSError, ValueError):\n        pass` —— 那个
+        # 裸 `pass` 后来被**刻意改好**了（hunter R1 F-3 硬检查④：根清单存在却读不出必须有信号
+        # ⇒ 改成 `as exc` + 一条 WARNING）。旧字面量自那次整改起落点未命中＝零覆盖。
+        # 突变**意图不变**（缺席时猜一个默认 vs 如实返空），故重新对着当前的 `return ""` 写，
+        # 并带上前面那条 WARNING 作唯一上下文（`return ""` 单独出现多处）。
+        '        logger.warning("[SCAFFOLD-INJECT] #31-P2d 根 %s 读取/解析失败（%s）→ "\n'
+        '                       "requires-python 证据缺席（模板省略该字段，血规 2 不猜）", pj, exc)\n'
+        '    return ""\n',
+        '        logger.warning("[SCAFFOLD-INJECT] #31-P2d 根 %s 读取/解析失败（%s）→ "\n'
+        '                       "requires-python 证据缺席（模板省略该字段，血规 2 不猜）", pj, exc)\n'
+        '    return ">=3.9"  # 突变：猜默认\n',
         ["test_ph4_python_manifest_spec_reaches_scaffold_via_real_caller"],
     ),
     (
@@ -268,8 +284,11 @@ MUTATIONS = [
         ["test_ph4_npm_unresolved_internal_label_held_from_registry"],
     ),
     (
+        # ★#29-3 T-1：落点死于**模块迁移**，代码逐字未变★ go 脚手架叶簇从 contract_utils.py
+        # 拆到 go_scaffold.py，`held` 这行一个字节都没改，但地址变了 ⇒ 打 CU 恒未命中＝零覆盖。
+        # 只需把路径从 CU 换成 GS（定义模块），字符串原样。
         "P-H4a-ab：go held pre-split 删除（未解析内部模块送 proxy/臆造 replace——H-1 go 臂复活）",
-        CU,
+        GS,
         "        held = [a for a in arts if a in _labels and a not in internal_paths]",
         "        held = []  # 突变：held pre-split 删除",
         ["test_ph4_go_unresolved_internal_label_held_from_proxy"],

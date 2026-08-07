@@ -71,11 +71,14 @@ MUTATIONS = [
         ["test_f1_all_three_registries_wired"],
     ),
     (
+        # ★#29-3 T-1 落点更新★ 该段已重构：TTL 检查移进 `if val is None or
+        # _is_mutable_endpoint(key):` 内（缩进 4→8），返回值从 `True, None` 改为 `True, val`
+        # （正缓存也走这条路）。旧字面量自那次重构起落点未命中＝零覆盖。
         "F-1: 无 TTL 记录的 None 当成命中（来历不明的 None 复现永久误杀）",
         DHC,
-        "    if neg_until.get(key, 0.0) > time.monotonic():\n"
-        "        return True, None          # 负缓存仍在有效期内：不重复烧网络（F-3）",
-        "    if True:\n        return True, None",
+        "        if neg_until.get(key, 0.0) > time.monotonic():\n"
+        "            return True, val\n",
+        "        if True:\n            return True, val\n",
         ["test_f1_transient_failure_does_not_stick_forever",
          "test_f1_unknown_none_without_ttl_is_revalidated",
          "test_f1_all_three_registries_wired"],
@@ -84,9 +87,16 @@ MUTATIONS = [
         # ★这条突变第一轮实测"仍绿"★ 原因：走 `_http_get` 时 lookup 侧的过期清理已把
         # neg_until pop 掉，store 侧的 pop 无从被观测＝冗余防御两处都不可证伪。
         # 断言已下沉到单元层（直接调 text_cache_store）才隔离得出来。
+        # ★#29-3 T-1 落点更新★ 注释已改写（"成功即清掉…" → "成功且不可变：清掉…/可变 TTL…"）。
+        # ★必须盯 store 侧那一处★：`neg_until.pop(key, None)` 在本文件有**两处** ——
+        # `text_cache_lookup()`:74（过期清理）与 `text_cache_store()`:92（成功后清负记录）。
+        # 本条锁的是**后者**（上面注释里写明"断言已下沉到单元层直接调 text_cache_store"）。
+        # 若图省事把落点改成无注释的 `        neg_until.pop(key, None)`，会打到 lookup 侧
+        # ⇒ 锁的是另一个机制，测试还可能照绿＝比原来的死锁更难发现。
         "F-1: 成功后不清负记录（陈旧 TTL 残留）",
         DHC,
-        "        neg_until.pop(key, None)   # 成功即清掉旧的负记录，避免陈旧 TTL 影响后续判定",
+        "        neg_until.pop(key, None)   # 成功且不可变：清掉旧的负记录/可变 TTL，"
+        "避免陈旧 TTL 影响后续判定",
         "        pass",
         ["test_f1_success_clears_negative_record"],
     ),
@@ -273,24 +283,39 @@ MUTATIONS = [
     ),
     # ── R3：go 侧 latest/分支名/裸 SHA 写不进 go.mod ──
     (
-        "R3: _UNGO_MODDABLE_VERSION 闸整块消失（latest/master/main/裸SHA 原样保留 ⇒ go build 解析期全灭）",
+        # ★#29-3 T-1：机制被**重构**，落点必须重写而非只改字符串★
+        # BRAIN-003（commit d3497e5 一带）把判据从「枚举正则 `_UNGO_MODDABLE_VERSION.match`」
+        # 换成「`not _is_judgeable and not _is_pseudo`」——原枚举只列 latest/master/main/sha，
+        # **分支名（dev / release-1.2）漏网**被误当伪版本原样保留。旧落点自那次重构起零覆盖。
+        # 顺带（已登记 findings）：`_UNGO_MODDABLE_VERSION` 现已是**死代码** —— 全文件只剩
+        # 定义与一处注释提及，零消费者。
+        "R3: 写不进 go.mod 的形态判据整块消失（latest/分支名/裸SHA 原样保留 ⇒ go build 解析期全灭）",
         GO,
-        '                if _UNGO_MODDABLE_VERSION.match(_exp):\n',
-        '                if False:\n',
+        '            if not _is_judgeable and not _is_pseudo:\n',
+        '            if False:\n',
         ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
     ),
     (
+        # ★#29-3 T-1 落点更新★ 缩进外移一层（判据从嵌套 if 变成同层 if），日志前缀由
+        # `P-C2-R3` 改成 `P-C2-R3/BRAIN-003`。旧字面量自 BRAIN-003 起落点未命中＝零覆盖。
         "R3: 校正不到时 fail-open 保留（把解析错误烤进权威 go.mod）",
         GO,
-        '                    else:\n                        logger.warning("[go-registry] P-C2-R3 %s@%s 是写不进 go.mod 的形态，"\n                                       "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"\n                                       "烤进权威 go.mod）", mod, explicit)\n                        dropped.append(str(raw).strip())',
-        '                    else:\n                        kept.append(ResolvedGoDep(module=mod, version=explicit, source="explicit",\n                                                  verified="unverified"))',
+        '                else:\n'
+        '                    logger.warning("[go-registry] P-C2-R3/BRAIN-003 %s@%s 是写不进 go.mod 的形态，"\n'
+        '                                   "且 proxy 不可达无法校正 → 如实丢弃（绝不把解析错误"\n'
+        '                                   "烤进权威 go.mod）", mod, explicit)\n'
+        '                    dropped.append(str(raw).strip())',
+        '                else:\n'
+        '                    kept.append(ResolvedGoDep(module=mod, version=explicit,\n'
+        '                                              source="explicit", verified="unverified"))',
         ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
     ),
     (
+        # ★#29-3 T-1 落点更新★ 缩进随上面同一段外移一层。
         "R3: 校正成功却记成 unverified（机读账与事实不符）",
         GO,
-        '                                                  verified="verified"))',
-        '                                                  verified="unverified"))',
+        '                                              verified="verified"))',
+        '                                              verified="unverified"))',
         ["test_go_ungomoddable_versions_are_corrected_or_dropped"],
     ),
     # ── F3：npm 侧"包不存在"必须与"不可达"机读可辨 ──
