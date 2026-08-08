@@ -112,7 +112,11 @@ class CargoDriver:
         return m.group(1) if m else None
 
     def remove(self, text: str, block: str) -> str:
-        return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
+        # ★#29-5 W-8 复核 N1★ 尾部绝不写 \s*\n?——\s 含 \n，会把【下一条依赖的
+        # 前导缩进】一并吃掉；而后续 block 是从原文（含缩进）捕获的 ⇒ 定位失败 ⇒
+        # enforce「块已不在」分支静默 continue ⇒ 幻影逃逸（实测：两条连续缩进幻影
+        # 只剪掉第一条）。尾部只吃本行。
+        return re.sub(r"[ \t]*" + re.escape(block) + r"[ \t]*\r?\n?", "", text, count=1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -187,7 +191,10 @@ class GoDriver:
         return m.group(1).strip() if m else None
 
     def remove(self, text: str, block: str) -> str:
-        return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
+        # ★#29-5 W-8 复核 N1★ 尾部只吃本行（同 CargoDriver 注释——go 的 require
+        # 块内 tab 缩进是常态形态，此逃逸自 W-6 起在生产：实测块内两条连续幻影
+        # 只剪掉第一条）。
+        return re.sub(r"[ \t]*" + re.escape(block) + r"[ \t]*\r?\n?", "", text, count=1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -210,13 +217,16 @@ class GradleDriver:
     probe_without_namespace = True
 
     # 匹配 implementation 'g:a:v' / implementation("g:a:v") / compileOnly "g:a:v" 等
+    # ★#29-5 W-8  sibling★ 行尾绝不能用 `\s`：`\s` 含 \n，尾部 `[)\s]*` 会把下一行的
+    # 前导缩进一并吃掉 ⇒ finditer 从下一条依赖的【行中】恢复 ⇒ ^ 锚失配 ⇒ 逐行声明的
+    # 依赖【隔一条丢一条】（本批 W-8 测试实弹逮到：两条连续 implementation 只解析出第一条）。
+    # 行尾消费收窄为同行空白 [ \t]。
     _DEP_LINE_RE = re.compile(
         r'^\s*(?:implementation|api|compileOnly|runtimeOnly|testImplementation|'
         r'testCompileOnly|testRuntimeOnly|compile|testCompile|runtime)\s*'
-        r'[(\s]*["\']([^"\']+)["\']\s*[)\s]*', re.MULTILINE)
-    _PROJECT_DEP_RE = re.compile(
-        r'^\s*(?:implementation|api|compileOnly|runtimeOnly|testImplementation)\s*'
-        r'\(?\s*project\s*\(\s*["\'](:[^"\']+)["\']\s*\)\s*\)?', re.MULTILINE)
+        r'[(\s]*["\']([^"\']+)["\'][ \t]*[)]?[ \t]*', re.MULTILINE)
+    # ★#29-5 W-8 复核 R5★ 原 `_PROJECT_DEP_RE`（project(':x') 形态）全仓零调用点，
+    # 已删——留在库里只会让人误以为它承重（"接线覆盖≠机制存在"）。
 
     def parse_deps(self, text: str) -> list[dict]:
         out: list[dict] = []
@@ -259,7 +269,18 @@ class GradleDriver:
         return m.group(1) if m else None
 
     def remove(self, text: str, block: str) -> str:
-        return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
+        # ★#29-5 W-8 复核 R2★ 多行声明 `implementation(\n "g:a:v"\n)`：行尾收窄后 block
+        # 不含收尾 `\n)`，只删 block 会留下悬挂 `)` ⇒ manifest 非法（闸亲手改坏文件）。
+        # 块内 `(` 未闭合（( 多于 )）⇒ 连带吞掉紧随 block 的悬挂 `)` 行（锚定 block 之后，
+        # 绝不误伤别处的 `)`；也绝不在 _DEP_LINE_RE 尾部加 \n 容忍——那会原地复活
+        # 「隔一条丢一条」）。
+        # ★复核 N1★ 尾部 `[ \t]*\r?\n?` 只吃本行——`\s*\n?` 的 `\s` 含 `\n`，会把下一条
+        # 依赖的前导缩进吃掉 ⇒ 后续 block（从原文含缩进捕获）定位失败 ⇒ enforce 静默
+        # continue ⇒ 幻影逃逸（实测：两条连续缩进幻影只剪掉第一条）。
+        pat = r"[ \t]*" + re.escape(block) + r"[ \t]*\r?\n?"
+        if block.count("(") > block.count(")"):
+            pat += r"[ \t]*\)[ \t]*\n?"
+        return re.sub(pat, "", text, count=1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -280,22 +301,9 @@ class PythonDriver:
     self_hosted_prefixes = ("$",)
     probe_without_namespace = True
 
-    # PEP 508 简化：name[extra,extra]>=1.0,<2; marker
-    # ★#29-2 W-6★ 本正则**只许用于 requirements.txt**（一行一条 PEP 508 串）。
-    # 曾配 re.MULTILINE 直接扫 pyproject.toml 全文 ⇒ 把 TOML 的「键 = 值」当
-    # 「包名 + 版本约束」：实测标准 PEP 621 文件解析出 9 条"依赖"全是 TOML 键
-    # （name/version/description/requires-python/build-backend/line-length/dev...），
-    # 而真依赖 flask/requests/pydantic/pytest/ruff **一条没解析到**。
-    # 后果非确定性且严重：哪些键被判 prune 取决于该键名在 PyPI 是否恰好是真包
-    # （实测 `requires`/`version`/`dependencies` 有包→存活；`name`/`description`/
-    # `build-backend`/`requires-python`/`dev`/`line-length` 查无→**判 prune 删掉**）。
-    # 删掉 [project].name 与 build-backend 后工程无法构建；某些排布下删除还会切断
-    # 字符串字面量令文件不再是合法 TOML —— 而这道闸的存在理由（dep_legality.py:31-33
-    # 「坏坐标 = manifest 解析期崩塌会连坐整个工作区」）**正是它自己制造的故障**。
-    _PKG_RE = re.compile(
-        r'^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:\[[^\]]+\])?\s*'
-        r'((?:[<>=~!]+\s*[^\s;]+\s*,?\s*)*)', re.MULTILINE)
-
+    # ★#29-5 W-8 复核 R5★ 原 `_PKG_RE`（MULTILINE 行正则）全仓零调用点，已删——
+    # 「行正则扫 pyproject 把 TOML 键当包名」的 W-6 教训由下方 `_looks_like_toml` /
+    # `parse_deps` 的两层判别注释承继，死正则本体留着只会被误读为承重路径。
     # PEP 508 串（数组元素内）→ 包名 / 版本约束。extras、marker、url 形态在此剥离。
     _SPEC_RE = re.compile(
         r'^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*'
@@ -484,7 +492,10 @@ class PythonDriver:
             # 数组元素：吃掉前导空白 + 元素 + 尾随逗号与空白（含换行）
             pat = r"[ \t]*" + re.escape(block) + r"[ \t]*,?[ \t]*\n?"
             return re.sub(pat, "", text, count=1)
-        return re.sub(r"[ \t]*" + re.escape(block) + r"\s*\n?", "", text, count=1)
+        # ★#29-5 W-8 复核 N1★ 尾部同族收窄 `[ \t]*\r?\n?`——requirements 的 block 来自
+        # strip 后的整行（不含前导缩进），原 `\s*\n?` 对合法文件本就零差别；收窄是
+        # 家族统一 + 防未来带缩进形态的逃逸面（同族实证见 Cargo/Go/Gradle remove 注释）。
+        return re.sub(r"[ \t]*" + re.escape(block) + r"[ \t]*\r?\n?", "", text, count=1)
 
 
 # ═══════════════════════════════════════════════════════════════════

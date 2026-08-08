@@ -568,7 +568,8 @@ def _enforce_parent_version_literals(project_path: str, timeout: int) -> tuple[i
     return len(changed), changed
 
 
-def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[str]]:
+def _enforce_dep_legality(project_path: str, timeout: int,
+                           details_out: "dict | None" = None) -> tuple[int, list[str]]:
     """R56-5：构建**之前**对全树 manifest 施加依赖合法性不变量（state-driven，不看报错文本）。
 
     收敛 R53-2/R54-5/R54-6/R56-4 四条 error-driven 分支——它们全是"等构建工具报出一种新错法，
@@ -597,18 +598,18 @@ def _enforce_dep_legality(project_path: str, timeout: int) -> tuple[int, list[st
         _n, _f = _enforce_dep_legality_npm(project_path, timeout)
         changed.extend(_f)
     if _read_project_file(project_path, "Cargo.toml", timeout=20):
-        _n, _f = _enforce_dep_legality_cargo(project_path, timeout)
+        _n, _f = _enforce_dep_legality_cargo(project_path, timeout, details_out)
         changed.extend(_f)
     if _read_project_file(project_path, "go.mod", timeout=20):
-        _n, _f = _enforce_dep_legality_go(project_path, timeout)
+        _n, _f = _enforce_dep_legality_go(project_path, timeout, details_out)
         changed.extend(_f)
     if (_read_project_file(project_path, "build.gradle", timeout=20)
             or _read_project_file(project_path, "build.gradle.kts", timeout=20)):
-        _n, _f = _enforce_dep_legality_gradle(project_path, timeout)
+        _n, _f = _enforce_dep_legality_gradle(project_path, timeout, details_out)
         changed.extend(_f)
     if (_read_project_file(project_path, "requirements.txt", timeout=20)
             or _read_project_file(project_path, "pyproject.toml", timeout=20)):
-        _n, _f = _enforce_dep_legality_python(project_path, timeout)
+        _n, _f = _enforce_dep_legality_python(project_path, timeout, details_out)
         changed.extend(_f)
     return len(set(changed)), sorted(set(changed))
 
@@ -779,32 +780,62 @@ def _enforce_dep_legality_npm(project_path: str, timeout: int) -> tuple[int, lis
     return len(changed), sorted(changed)
 
 
+def _flag_members_unresolved(stack_key: str, details_out: "dict | None") -> None:
+    """#29-5 W-8 复核 F4：members 取证失败 ⇒ 本闸 fail-open 零处置——除 WARNING 外
+    必须落【有消费者的】机读账（硬检查④：新账没有消费者＝没造）。消费通道 = L1 的
+    details 台账（与 build_ok/repaired_file_paths 同级，随 L1 结果持久化/对账）。"""
+    if details_out is not None:
+        lst = details_out.setdefault("dep_legality_members_unresolved", [])
+        if stack_key not in lst:
+            lst.append(stack_key)
+
+
 def _enforce_dep_legality_generic(
     project_path: str,
     timeout: int,
     *,
     stack_key: str,
-    manifest_name: str,
+    manifest_name: "str | tuple[str, ...]",
     find_exclude: str,
     registry_versions,
     namespace: str | None = None,
     workspace_members_from_texts: Any = None,
+    member_source_names: tuple[str, ...] = (),
+    details_out: "dict | None" = None,
 ) -> tuple[int, list[str]]:
     """多栈通用臂（W-6）：Cargo / Go / Gradle / Python 共享同一 enforcement 骨架。
 
-    调用方提供：栈键、清单名、find 排除路径、registry 查询函数、工程命名空间、
+    调用方提供：栈键、清单名（★#29-5 W-8★ 可传别名元组，如 gradle 的
+    ("build.gradle", "build.gradle.kts")——只传单名则纯 Kotlin DSL 工程 root_text
+    恒 None 早返、一条 find 都不发）、find 排除路径、registry 查询函数、工程命名空间、
     工作区成员提取函数（接收 {rel: text} → set[str]）。其余与 maven/npm 臂同形。
+
+    ★#29-5 W-8★ member_source_names：成员事实源清单（root 级文件名，如 gradle 的
+    settings.gradle{,.kts}、python 的 pyproject.toml）。成员提取的输入【不能】局限在
+    find 捞回的那一类清单里——gradle 臂 find 只捞 build.gradle*，settings.gradle
+    永不在其中 ⇒ members 恒空 ⇒ dep_legality classify 第一行 fail-open ⇒ 整道闸对
+    任何输入零处置（死代码）。这里把成员事实源【额外】读进来并进提取器的输入
+    （只进提取器，不进 enforce 的改写集——settings.gradle 不是依赖清单）。
     """
     from swarm.worker.dep_legality import driver_for, enforce
 
     drv = driver_for(stack_key)
     if drv is None:
         return 0, []
-    root_text = _read_project_file(project_path, manifest_name, timeout=20)
+    _names = (manifest_name,) if isinstance(manifest_name, str) else tuple(manifest_name)
+    root_text: str | None = None
+    for _n in _names:  # 别名按序取第一个可读到的作为 root_text
+        root_text = _read_project_file(project_path, _n, timeout=20)
+        if root_text:
+            break
     if not root_text:
         return 0, []
+    if len(_names) == 1:
+        _name_clause = f"-name {_names[0]}"
+    else:
+        _name_clause = r" \( " + " -o ".join(f"-name {_n}" for _n in _names) + r" \)"
     _ec, gout, _e = _run_check_split(
-        f"find . -name {manifest_name} -not -path '{find_exclude}' 2>/dev/null",
+        f"find . {_name_clause} -not -path '{find_exclude}' 2>/dev/null",
         project_path, timeout=30)
     if _ec != 0:
         logger.warning("[L1.2.1·dep-legality] %s manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
@@ -823,10 +854,33 @@ def _enforce_dep_legality_generic(
 
     members: set[str] = set()
     if workspace_members_from_texts is not None:
+        # W-8：提取器输入 = find 捞回的清单 + 成员事实源（root 级，setdefault 防覆盖同名 find 结果）
+        member_texts: dict[str, str] = dict(texts)
+        for _src in member_source_names:
+            _t = _read_project_file(project_path, _src, timeout=20)
+            if _t is not None:
+                # 复核 N2：可读判据是 `is not None` 而非真值——零字节成员源（合法）
+                # 读回 ""，按真值判会误落下方「存在但读失败」分支（误报+误记账）。
+                member_texts.setdefault(_src, _t)
+            else:
+                # 复核 F5：读不到有两种命运——文件不存在（合法单模块，静默正确）vs
+                # 存在但读失败/超时（静默 fail-open 残留，与死代码期表现一致）。后者必须响。
+                _fec, _, _ = _run_check_split(f"test -f {shlex.quote(_src)}",
+                                              project_path, timeout=10)
+                if _fec == 0:
+                    logger.warning("[L1.2.1·dep-legality][member_source_unreadable] %s 成员事实源"
+                                   " %s 存在但读取失败 → 本闸按 fail-open 放行全部依赖"
+                                   "（规则②剪除不生效）", stack_key, _src)
+                    _flag_members_unresolved(stack_key, details_out)
         try:
-            members = workspace_members_from_texts(texts)
+            members = workspace_members_from_texts(member_texts)
         except Exception as exc:
-            logger.warning("[L1.2.1·dep-legality] %s 工作区成员提取失败: %s", stack_key, exc)
+            # 机读键 [members_extraction_failed]：提取异常 ⇒ members 空 ⇒ classify 全局
+            # fail-open ⇒ 本闸零处置——这一层自吞异常则外层永远收不到（硬检查④）。
+            logger.warning("[L1.2.1·dep-legality][members_extraction_failed] %s 工作区成员"
+                           "提取失败 → 本闸按 fail-open 放行全部依赖（规则②剪除不生效）: %s",
+                           stack_key, exc)
+            _flag_members_unresolved(stack_key, details_out)
 
     new_texts, actions = enforce(
         texts, root_text=root_text, namespace=namespace,
@@ -844,7 +898,8 @@ def _enforce_dep_legality_generic(
     return len(changed), sorted(changed)
 
 
-def _enforce_dep_legality_cargo(project_path: str, timeout: int) -> tuple[int, list[str]]:
+def _enforce_dep_legality_cargo(project_path: str, timeout: int,
+                                 details_out: "dict | None" = None) -> tuple[int, list[str]]:
     """Cargo 臂（W-6）。"""
     from swarm.worker.dep_legality import cargo_registry_versions_list
 
@@ -867,10 +922,11 @@ def _enforce_dep_legality_cargo(project_path: str, timeout: int) -> tuple[int, l
     return _enforce_dep_legality_generic(
         project_path, timeout, stack_key="cargo", manifest_name="Cargo.toml",
         find_exclude="*/target/*", registry_versions=_versions,
-        workspace_members_from_texts=_members)
+        workspace_members_from_texts=_members, details_out=details_out)
 
 
-def _enforce_dep_legality_go(project_path: str, timeout: int) -> tuple[int, list[str]]:
+def _enforce_dep_legality_go(project_path: str, timeout: int,
+                              details_out: "dict | None" = None) -> tuple[int, list[str]]:
     """Go 臂（W-6）。"""
     from swarm.worker.dep_legality import go_registry_versions_list
 
@@ -898,21 +954,54 @@ def _enforce_dep_legality_go(project_path: str, timeout: int) -> tuple[int, list
     return _enforce_dep_legality_generic(
         project_path, timeout, stack_key="go", manifest_name="go.mod",
         find_exclude="*/vendor/*", registry_versions=_versions,
-        namespace=namespace, workspace_members_from_texts=_members)
+        namespace=namespace, workspace_members_from_texts=_members, details_out=details_out)
 
 
-def _enforce_dep_legality_gradle(project_path: str, timeout: int) -> tuple[int, list[str]]:
-    """Gradle 臂（W-6）。"""
+def _enforce_dep_legality_gradle(project_path: str, timeout: int,
+                                  details_out: "dict | None" = None) -> tuple[int, list[str]]:
+    """Gradle 臂（W-6）。
+
+    ★#29-5 W-8★ 治前两处死代码：① `_members` 只认 settings.gradle*，而 find 只捞
+    build.gradle ⇒ settings 永不在输入里 ⇒ members 恒空 ⇒ classify 全局 fail-open；
+    ② manifest_name 只给 "build.gradle" ⇒ 纯 Kotlin DSL 工程 root_text=None 早返。
+    治法：find/root_text 走别名双名；成员事实源 settings.gradle{,.kts} 由 generic 臂
+    单独读入提取器（member_source_names）。
+    """
 
     def _members(texts: dict[str, str]) -> set[str]:
-        # workspace members = settings.gradle 里的 include ':x' / include("x")
+        # workspace members = settings.gradle(.kts) 里的 include 语句。
+        # ★#29-5 W-8 复核 F1/F2/F6 + R1/R4★ 治前两条正则各只认一种形态且只抓第一个
+        # 引号串：`include ':app', ':lib'`（Groovy 多参）只解析出 app ⇒ 真兄弟 lib 依赖
+        # 被 registry 查无 prune（误杀可达——"修一个洞让另一个洞从无害变可达"，双复核
+        # 各自独立实测坐实）；`include(":app", ":lib")`（Kotlin 多参）解析为零 ⇒ 整闸
+        # fail-open；`// include ':x'` 注释被当真 ⇒ 假成员；`includeBuild('../x')` 复合
+        # 构建含 include 子串 ⇒ [members_empty] 误报。治法：先剥注释，再切 include 语句
+        # （括号形抓到匹配 )、裸形要求 include 后至少一个空白并抓到行尾——词形要求同时
+        # 天然排除 includeBuild），语句内扫【全部】引号串；嵌套 ':a:b' 同时注册末段名
+        # 'b'（gradle 默认 artifact 名即末段，依赖坐标按末段写）。
         names: set[str] = set()
-        for rel, t in texts.items():
-            if rel.lower().startswith("settings.gradle"):
-                for m in re.finditer(r"include\s*\(\s*['\"]:?([^'\"]+)['\"]\s*\)", t):
-                    names.add(m.group(1).strip().lstrip(":"))
-                for m in re.finditer(r"include\s+['\"]:?([^'\"]+)['\"]", t):
-                    names.add(m.group(1).strip().lstrip(":"))
+        stripped: list[str] = []
+        settings_texts = {rel: t for rel, t in texts.items()
+                          if rel.lower().startswith("settings.gradle")}
+        for t in settings_texts.values():
+            t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+            t = re.sub(r"//[^\n]*", "", t)
+            stripped.append(t)
+            for m in re.finditer(r"\binclude(?:\s*\(([^)]*)\)|\s+([^\n(]*))", t):
+                stmt = m.group(1) if m.group(1) is not None else m.group(2)
+                for q in re.finditer(r"['\"]([^'\"]+)['\"]", stmt or ""):
+                    seg = q.group(1).strip().lstrip(":")
+                    if seg:
+                        names.add(seg)
+                        names.add(seg.rsplit(":", 1)[-1])
+        if not names and any(
+                re.search(r"\binclude(?:\s*\(|\s+['\"]?\S)", s) for s in stripped):
+            # 机读键 [members_empty]：settings 里明明有 include 语句却一条没解析出来
+            # ⇒ members 空 ⇒ classify 全局 fail-open ⇒ 本闸零处置（硬检查④：缺席必须机读可辨）。
+            logger.warning("[L1.2.1·dep-legality][members_empty] gradle settings.gradle* 含 "
+                           "include 但成员解析为零 → 本闸按 fail-open 放行全部依赖"
+                           "（规则②剪除不生效）")
+            _flag_members_unresolved("gradle", details_out)
         return names
 
     _cache: dict[tuple[str, str], list[str] | None] = {}
@@ -930,23 +1019,44 @@ def _enforce_dep_legality_gradle(project_path: str, timeout: int) -> tuple[int, 
         return _cache[key]
 
     return _enforce_dep_legality_generic(
-        project_path, timeout, stack_key="gradle", manifest_name="build.gradle",
+        project_path, timeout, stack_key="gradle",
+        manifest_name=("build.gradle", "build.gradle.kts"),
         find_exclude="*/build/*", registry_versions=_versions,
-        workspace_members_from_texts=_members)
+        workspace_members_from_texts=_members,
+        member_source_names=("settings.gradle", "settings.gradle.kts"), details_out=details_out)
 
 
-def _enforce_dep_legality_python(project_path: str, timeout: int) -> tuple[int, list[str]]:
+def _enforce_dep_legality_python(project_path: str, timeout: int,
+                                  details_out: "dict | None" = None) -> tuple[int, list[str]]:
     """Python 臂（W-6）：优先 requirements.txt，fallback pyproject/setup。"""
     from swarm.worker.dep_legality import python_registry_versions_list
 
     def _members(texts: dict[str, str]) -> set[str]:
-        # Python 无严格 workspace 成员；pyproject [project].name 作为 root_name 信号
-        for rel, t in texts.items():
-            if rel.lower() == "pyproject.toml":
-                m = re.search(r'^\s*name\s*=\s*"([^"]+)"', t, re.MULTILINE)
-                if m:
-                    return {m.group(1)}
-        return set()
+        # Python 无严格 workspace 成员；pyproject [project].name 作为内部包名信号。
+        # ★#29-5 W-8★ texts 由 generic 臂保证包含成员事实源 pyproject.toml
+        # （member_source_names）——requirements.txt 臂的 find 只捞 requirements，
+        # 治前这里恒拿不到 pyproject ⇒ members 恒空 ⇒ classify 全局 fail-open 死代码。
+        # ★复核 F3/R3★ 收集【所有】pyproject 的 name（monorepo 子包名同样是真内部名）
+        # ——治前"第一个 name 即返"配上 texts 的 sorted 插入序，成员名退化成目录序抽签。
+        # ★复核 R4b★ 解析走 driver.root_name（tomllib 真解析）而非行正则——合法 TOML
+        # literal string `name = 'myapp'`（单引号）行正则会漏 ⇒ [members_empty] 误报。
+        from swarm.worker.dep_legality import driver_for as _df
+        _drv = _df("python")
+        names: set[str] = set()
+        pyproject_texts = [t for rel, t in texts.items()
+                           if rel.lower().endswith("pyproject.toml")]
+        for t in pyproject_texts:
+            n = _drv.root_name(t) if _drv is not None else None
+            if n:
+                names.add(n)
+        if not names and any("[project]" in t for t in pyproject_texts):
+            # 机读键 [members_empty]：有 [project] 段却解析不出 name ⇒ members 空
+            # ⇒ classify 全局 fail-open ⇒ 本闸零处置（硬检查④）。
+            logger.warning("[L1.2.1·dep-legality][members_empty] python pyproject.toml 含 "
+                           "[project] 但 name 解析为零 → 本闸按 fail-open 放行全部依赖"
+                           "（规则②剪除不生效）")
+            _flag_members_unresolved("python", details_out)
+        return names
 
     _cache: dict[str, list[str] | None] = {}
 
@@ -956,16 +1066,19 @@ def _enforce_dep_legality_python(project_path: str, timeout: int) -> tuple[int, 
         return _cache[name]
 
     # 优先 requirements.txt；没有则试 pyproject.toml
+    # W-8：两种模式下成员事实源都是 root pyproject.toml（generic 臂单独读入提取器）。
     if _read_project_file(project_path, "requirements.txt", timeout=20):
         return _enforce_dep_legality_generic(
             project_path, timeout, stack_key="python", manifest_name="requirements.txt",
             find_exclude="*/.venv/*", registry_versions=_versions,
-            workspace_members_from_texts=_members)
+            workspace_members_from_texts=_members,
+            member_source_names=("pyproject.toml",), details_out=details_out)
     if _read_project_file(project_path, "pyproject.toml", timeout=20):
         return _enforce_dep_legality_generic(
             project_path, timeout, stack_key="python", manifest_name="pyproject.toml",
             find_exclude="*/.venv/*", registry_versions=_versions,
-            workspace_members_from_texts=_members)
+            workspace_members_from_texts=_members,
+            member_source_names=("pyproject.toml",), details_out=details_out)
     return 0, []
 
 
@@ -6214,7 +6327,7 @@ def run_l1_pipeline(
         # （pom/package.json/go.mod 各过各的），混合工程（java+npm 前后端分离）在 maven
         # 构建轮里 npm 侧同样过闸；无 driver 的栈 warn-once（D14 零覆盖可辨）。
         try:
-            _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout)
+            _dl_n, _dl_files = _enforce_dep_legality(project_path, timeout, details)
             if _dl_files:
                 _rfp = details.setdefault("repaired_file_paths", [])
                 for _f in _dl_files:

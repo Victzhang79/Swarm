@@ -591,16 +591,8 @@ def test_python_driver_parses_requirements():
     assert len(actions) == 1 and "prune" in actions[0]
 
 
-def test_l1_pipeline_enforces_cargo_go_gradle_python_arms(monkeypatch):
-    """W-6：_enforce_dep_legality 对 Cargo/Go/Gradle/Python 都有执行臂。"""
-    import swarm.worker.l1_pipeline as lp
-    files = {
-        "Cargo.toml": '[package]\nname = "svc"\n[dependencies]\nserde = "1.0.0"\n',
-        "go.mod": "module example.com/shop\n\nrequire example.com/lib v1.0.0\n",
-        "build.gradle": "dependencies { implementation 'com.example:lib:1.0.0' }\n",
-        "requirements.txt": "requests==2.31.0\n",
-    }
-    lp, written = _wire_npm_project(monkeypatch, files, {})
-    # registry unreachable -> fail-open，但各臂必须被调用到（无异常）
-    n, changed = lp._enforce_dep_legality("/tmp/x", 60)
-    assert n == 0 and changed == []
+# ★#29-5 W-8★ 原 `test_l1_pipeline_enforces_cargo_go_gradle_python_arms`（断言
+# `n == 0 and changed == []`）已删除：其 find 桩只回 package.json ⇒ 四臂全在
+# "rels 空"早返 ⇒ 臂真跑与臂死掉返回值一模一样（零区分力），且恰是 W-8 两条死臂
+# 没被抓到的原因。区分力版本（成员依赖存活 + 幻影被剪）见
+# test/test_w8_dep_legality_members.py::test_four_arms_prune_phantoms_keep_workspace_members。
