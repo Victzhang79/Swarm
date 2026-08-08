@@ -277,8 +277,12 @@ class NpmDriver:
         ★block 带逗号上下文★：JSON 删条目必须连逗号一起处置——尾随有逗号 → 带上；
         无（末条目）→ 带【前导】逗号。否则 remove 后留下 `, }` / `{ ,` = 非法 JSON，
         修依赖修出 manifest 解析崩塌（与坏坐标同罪）。
-        已知边界（诚实登记）：同名同版本条目同时出现在 dependencies 与 devDependencies
-        时 block 文本相同 → enforce 只处置首个、第二个按「已被带走」跳过（日志可辨）。
+        已知边界（W-8b 后校正，诚实登记）：末条目 block 含前一条的 `,\n` 前缀
+        （块字符级重叠）——前一条先被处置后本 block 在演变中文本里失配，由
+        enforce 的 `_refind_block` 兜底重定位处置（旧形态=末条幻影静默逃逸，
+        已实跑对照坐实）。同名同版本 dup 跨 section（各自段内唯一条目 ⇒ block
+        字面相同）在旧形态下本就两条都处置（remove count=1 逐次命中），原
+        docstring「第二个按已被带走跳过」的描述只在重叠失配时成立，已实测纠正。
         """
         out: list[dict] = []
         for s, e in self._section_spans(text):
@@ -468,6 +472,32 @@ def classify(dep: dict, *, namespace: str | None, workspace_members: set[str],
     return "legal", "仓库存在"
 
 
+def _refind_block(drv: "ManifestDriver", cur: str, dep: dict) -> str | None:
+    """★W-8b（#29-5，reviewer R2 实测单列）★：从【演变中】文本按坐标重取新鲜 block。
+
+    前一条处置可能把本条目 block 的一部分字符带走（npm：末条目 block 含前一条的
+    `,\n` 前缀=块字符级重叠；通用：同名同版本块重复声明，首个被处置后剩余相同
+    字面量已不在）。按 namespace+name+version 三元重解析当前文本定位——取不到
+    返 None（调用方响亮报告+跳过，fail-honest 绝不盲改）。
+    parse_deps 异常（未来 driver 对半截文本可能 raise，hunter R1 实测异常会炸掉
+    整条 enforce）→ 同样归并为「重定位失败」：WARNING 留痕 + 返 None，
+    绝不让单条 manifest 连坐全工作区处置批。
+    """
+    try:
+        deps = drv.parse_deps(cur)
+    except Exception as _exc:  # noqa: BLE001 — 兜底层连坐防护
+        logger.warning(
+            "[dep-legality] 兜底重定位的 parse_deps 异常（按重定位失败处理，"
+            "绝不连坐整批）: %s", _exc)
+        return None
+    for d in deps:
+        if (d.get("name") == dep.get("name")
+                and d.get("version") == dep.get("version")
+                and d.get("namespace") == dep.get("namespace")):
+            return d["block"]
+    return None
+
+
 def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | None,
             workspace_members: set[str], registry_versions,
             driver: ManifestDriver, root_name: str | None = None,
@@ -509,8 +539,21 @@ def enforce(manifest_texts: dict[str, str], *, root_text: str, namespace: str | 
                         "[dep-legality] %s: %s:%s 判为 %s，但该依赖块在原文里定位不到"
                         "（块内含注释？）→ 未处置（如实报告，绝不谎报已修）",
                         rel, dep["namespace"], dep["name"], verdict)
-                # 否则：同名块已被前一条处置带走（同一 manifest 内重复声明）→ 静默跳过是对的
-                continue
+                    continue
+                # ★W-8b★：块在【原文】在、在【演变中】文本不在 = 前一条处置把它的一
+                # 部分字符带走了（npm：末条目 block 含前一条的 `,\n` 前缀=块字符级
+                # 重叠，前一条被删后末条目 block 永不匹配；通用：同名同版本块重复
+                # 声明）。旧形态静默 continue ⇒ 判了 prune/fix 却没动手=**幻影逃逸**
+                # （npm 常态形态：末两条同幻影时第二条必逃）。按坐标从当前文本重取
+                # 新鲜 block 再处置一次；重定位也失败=响亮报告，绝不静默。
+                _fresh = _refind_block(drv, cur, dep)
+                if _fresh is None:
+                    logger.warning(
+                        "[dep-legality] %s: %s:%s:%s 判为 %s，但前一条处置带走重叠字符后"
+                        "在演变中文本里重定位失败 → 未处置（如实报告，绝不谎报已修）",
+                        rel, dep["namespace"], dep["name"], dep.get("version"), verdict)
+                    continue
+                blk = _fresh
             before = cur
             if verdict == "fix_namespace" and namespace:
                 _new_blk = drv.rewrite_namespace(blk, namespace)
