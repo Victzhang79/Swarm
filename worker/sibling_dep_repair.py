@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -598,7 +599,12 @@ def repair_from_sibling_manifests(
     if not spec or not project_path:
         return 0, []
     filename, parser = spec
-    root = Path(project_path)
+    # ★#29-5 W-3：入口统一 resolve★——target 的两个来源（_failure_manifest/
+    # _nearest_manifest）内部都 resolve 后返回；root 不 resolve 时
+    # `target.relative_to(root)` 在 symlink/平台前缀形态（macOS /var→/private/var）
+    # 恒抛 ValueError（实跑复现）。root resolve 后与 target 同源，相对化恒成功。
+    # 下游消费的是【相对路径】，与根形态无关 ⇒ 行为不变只更稳。
+    root = Path(project_path).resolve()
     if not root.is_dir():
         return 0, []
     deps = _missing_deps(build_output or "", stack)
@@ -645,8 +651,36 @@ def repair_from_sibling_manifests(
             continue  # 兄弟无坐标/坐标不可移植 → 非项目自证，绝不臆造，交回上游（BLOCKED/等生产者）
         try:
             if _INJECT[stack](target, decl_key, coord):
+                # ★#29-5 W-3：原子记账★——写盘成功 ⇒ injected 与 touched 必须同块
+                # 同时记账，绝不允许分叉。旧形态把 relative_to 与 injected+=1 放同一
+                # try：relative_to 抛 ValueError ⇒ 落下面 except 打「注入失败」WARNING
+                # 而文件真被改了（fail-honest 违），且返回 (1, []) ⇒ count 触发重跑
+                # 构建而 paths 空 ⇒ 不进 repaired_file_paths ⇒ 修复从交付产物蒸发
+                # （macOS /var→/private/var 天然复现，pytest tmp_path 已 resolved
+                # 从不触发=平台相关假绿）。
+                rel: str | None
+                try:
+                    rel = str(target.relative_to(root))
+                except ValueError:
+                    # root 已 resolve 后本不应抛；relpath 兜底——路径再怪也绝不
+                    # 上抛进 except（上抛=脱账新形态：文件已改而 injected 不记）。
+                    try:
+                        rel = os.path.relpath(target, root)
+                    except ValueError:
+                        rel = None  # Windows 跨盘符（reviewer F-2：POSIX 才恒成功）
                 injected += 1
-                rel = str(target.relative_to(root))
+                if rel is None or rel.split(os.sep)[0] == ".." or rel.split("/")[0] == "..":
+                    # ★W-3 R1 双票同根 F1★：兜底触发=出了设计外的事，【绝不静默】；
+                    # 且越界产物（"../x"）下游三处全不防（push 会读项目外文件、
+                    # _norm_rel 放行 ⇒ git diff rc=128 连坐、pull-back 写项目外）——
+                    # fail-closed：injected 照记（文件真改了，触发重跑=诚实）但越界
+                    # 路径绝不进交付账（宁缺不毒），WARNING 留全量现场。
+                    logger.warning(
+                        "[L1.2.1·repair] A2 %s 注入 %s 已写盘但路径相对化产物越界/失败"
+                        "（rel=%r, target=%s, root=%s）⇒ 计数照记但路径不进交付账"
+                        "（fail-closed：越界路径毒化 push/diff/pull-back 比缺失更糟）",
+                        stack, decl_key, rel, target, root)
+                    continue
                 if rel not in touched:
                     touched.append(rel)
                 logger.info(

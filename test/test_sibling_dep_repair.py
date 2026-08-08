@@ -711,3 +711,117 @@ def test_w4_evidence_cap_truncation_logged(tmp_path, caplog):
         repair_from_sibling_manifests(str(tmp_path), out, ["crate-b/src/lib.rs"], "cargo")
     assert any("超 cap" in r.message for r in caplog.records), \
         "证据截断必须 WARNING 可观测"
+
+
+# ── #29-5 W-3：injected/touched 脱账（文件已改却报失败，修复从交付蒸发）──────
+
+
+class TestW3InjectedTouchedAtomic:
+    """root 未 resolve 而 target 来源（_failure_manifest/_nearest_manifest）内部
+    resolve ⇒ `target.relative_to(root)` 抛 ValueError 落共享 except ⇒ 文件真被改
+    却打「注入失败」WARNING、返回 (1, []) ⇒ count 触发重跑构建而 paths 空 ⇒ 不进
+    repaired_file_paths ⇒ 修复蒸发。本文件既有 40 用例全用 pytest tmp_path（macOS
+    下实测已 resolved，`str(tmp_path) == str(tmp_path.resolve())`）⇒ 从不触发
+    =平台相关假绿；故夹具用【symlink project_path】确定性编码时序偏移。"""
+
+    @staticmethod
+    def _mk_npm_project(real: Path) -> None:
+        import json
+        (real / "pkgA").mkdir(parents=True)
+        (real / "package.json").write_text(json.dumps(
+            {"name": "root", "dependencies": {"axios": "^1.6.8"}}), encoding="utf-8")
+        (real / "pkgA" / "package.json").write_text(json.dumps(
+            {"name": "pkg-a", "dependencies": {}}), encoding="utf-8")
+        (real / "pkgA" / "index.js").write_text("require('axios')\n", encoding="utf-8")
+
+    def test_symlink_project_path_keeps_count_and_paths_atomic(self, tmp_path, caplog):
+        """主回归锁：symlink 形态 project_path（root.resolve() ≠ 传入路径）⇒
+        注入成功后 count 与 paths 同账 (1, ['pkgA/package.json'])，且打的是成功
+        INFO 而非「注入失败」假 WARNING（fail-honest）。"""
+        import logging, os
+        real = tmp_path / "real"
+        self._mk_npm_project(real)
+        link = tmp_path / "link"
+        os.symlink(real, link)
+        assert str(link) != str(link.resolve()), "前提：夹具必须编码未 resolve 偏移"
+        with caplog.at_level(logging.DEBUG):
+            n, paths = repair_from_sibling_manifests(
+                str(link), "pkgA/index.js:1: Cannot find module 'axios'",
+                ["pkgA/index.js"], "npm")
+        assert (n, paths) == (1, ["pkgA/package.json"]), \
+            "count 与 paths 必须同账——(1, []) 脱账=修复从交付蒸发"
+        assert "axios" in (real / "pkgA" / "package.json").read_text(), \
+            "前提：注入真生效（否则本用例零区分力）"
+        assert not any("注入" in r.message and "失败" in r.message
+                       for r in caplog.records), \
+            "文件真被改了绝不许打「注入失败」（fail-honest）: " \
+            f"{[r.message for r in caplog.records]}"
+
+    def test_normal_resolved_path_unchanged(self, tmp_path):
+        """对照锁：已 resolve 的正常路径行为不变（相对路径语义与根形态无关）。"""
+        real = tmp_path / "real"
+        self._mk_npm_project(real)
+        n, paths = repair_from_sibling_manifests(
+            str(real.resolve()), "pkgA/index.js:1: Cannot find module 'axios'",
+            ["pkgA/index.js"], "npm")
+        assert (n, paths) == (1, ["pkgA/package.json"])
+        # 幂等跳过不变
+        n2, paths2 = repair_from_sibling_manifests(
+            str(real.resolve()), "pkgA/index.js:1: Cannot find module 'axios'",
+            ["pkgA/index.js"], "npm")
+        assert (n2, paths2) == (0, [])
+
+    def test_out_of_bounds_relpath_fail_closed_not_fed_downstream(self, tmp_path, caplog,
+                                                                  monkeypatch):
+        """R1 双票同根 F1：兜底产物越界（"../x"）时——injected 照记（文件真改了）
+        但路径绝不进 touched（下游 push/diff/pull-back 对 "../" 全不防：读项目外/
+        git diff rc=128 连坐/写项目外），且必须 WARNING 留现场（降级绝不静默）。
+        生产不可达（root resolve 后 relative_to 恒成功），用 monkeypatch 强制触发。"""
+        import logging, os
+        from swarm.worker import sibling_dep_repair as sdr
+        real = tmp_path / "real"
+        self._mk_npm_project(real)
+        # ★真实触发路径（零 Path patch）★：target 来源若返回【项目外】target，
+        # relative_to(root) 真抛 ValueError ⇒ relpath 产物 "../outside/..."（越界）。
+        # 全局 patch Path.relative_to 会炸 pytest 自身（INTERNALERROR 实证），
+        # 选择性 patch 又会误伤 _iter_manifests 的同形状调用——故 patch 两个模块级
+        # 生产者（未来 _failure_manifest 出 bug 返回项目外 target 正是这个形态）。
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside_target = outside / "package.json"
+        outside_target.write_text('{"name": "out", "dependencies": {}}', encoding="utf-8")
+        monkeypatch.setattr(sdr, "_failure_manifest",
+                            lambda *a, **k: (outside_target, True))
+        monkeypatch.setattr(sdr, "_iter_manifests",
+                            lambda *a, **k: iter([real / "package.json"]))
+        with caplog.at_level(logging.WARNING):
+            n, paths = repair_from_sibling_manifests(
+                str(real.resolve()), "pkgA/index.js:1: Cannot find module 'axios'",
+                ["pkgA/index.js"], "npm")
+        assert n == 1, "文件真被改 ⇒ injected 照记（诚实触发重跑）"
+        assert paths == [], "越界路径绝不进交付账（fail-closed 宁缺不毒）"
+        assert "axios" in outside_target.read_text(), "前提：注入真生效"
+        assert any("越界" in r.message for r in caplog.records), \
+            f"降级必须 WARNING 留现场: {[r.message for r in caplog.records]}"
+        assert not any("失败(跳过)" in r.message for r in caplog.records), \
+            "不得落旧 except 打「注入失败」（文件真被改了）"
+
+    def test_failure_manifest_producer_also_atomic(self, tmp_path, caplog):
+        """reviewer F-3：target 的【另一】生产者 `_failure_manifest`（失败输出证据
+        映射）在同账语义上孪生——主回归锁的 build_output 不匹配 npm 任何
+        _FAIL_FILE_RE（走 _nearest_manifest），本用例用 tsc 形态证据走 _failure_manifest。"""
+        import logging, os
+        real = tmp_path / "real"
+        self._mk_npm_project(real)
+        (real / "pkgA" / "index.ts").write_text("import axios from 'axios'\n",
+                                                encoding="utf-8")
+        link = tmp_path / "link"
+        os.symlink(real, link)
+        out = "pkgA/index.ts(1,1): error TS2307: Cannot find module 'axios'."
+        with caplog.at_level(logging.DEBUG):
+            n, paths = repair_from_sibling_manifests(
+                str(link), out, ["pkgA/index.ts"], "npm")
+        assert (n, paths) == (1, ["pkgA/package.json"]), \
+            "_failure_manifest 生产者同样 count/paths 同账"
+        assert "axios" in (real / "pkgA" / "package.json").read_text(), "前提：注入真生效"
+        assert not any("失败(跳过)" in r.message for r in caplog.records)
