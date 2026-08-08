@@ -16,17 +16,17 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-
-def _has_pg() -> bool:
-    try:
-        from swarm.auth.store import ensure_auth_tables
-        ensure_auth_tables()
-        return True
-    except Exception:
-        return False
+# ★#29-4 T-7（复核 H-1 补漏）★ 同 test_a2_command_blacklist：原 `skipif(not _has_pg(), …)`
+# 在 collection 期求值且顺带建表。本文件 9 个用例此前会因 PG 抖动整批静默 skip。
+# 漏掉的原因同上：函数名 `_has_pg` 不匹配我 grep 的 `_pg_available`。
+pytestmark = pytest.mark.needs_service("pg")
 
 
-pytestmark = pytest.mark.skipif(not _has_pg(), reason="PG unavailable")
+@pytest.fixture(autouse=True)
+def _auth_tables_ready():
+    """建表移到 autouse fixture，且**不吞异常**（建表被拒是真故障，不是"PG 不可用"）。"""
+    from swarm.auth.store import ensure_auth_tables
+    ensure_auth_tables()
 
 
 def _fake_request(user):

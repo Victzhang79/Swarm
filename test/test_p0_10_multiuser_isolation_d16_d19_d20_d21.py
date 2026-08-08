@@ -24,16 +24,14 @@ import pytest
 from swarm.config.settings import DatabaseConfig
 
 
-def _pg_available() -> bool:
-    try:
-        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=3):
-            return True
-    except Exception:
-        return False
-
-
-_PG_OK = _pg_available()
-requires_pg = pytest.mark.skipif(not _PG_OK, reason="PG 不可达")
+# ★#29-4 T-7（复核 H-1 补漏）★ 原为 `_PG_OK = _pg_available()`（模块顶层**普通赋值**）
+# + `requires_pg = pytest.mark.skipif(not _PG_OK, …)`。判定同样在 collection 期发生，
+# 本文件 12 个用例会因 PG 抖动整批静默 skip、CI 照绿。
+# ★这个形态在第一轮被漏掉的原因★：我 grep 的是字面量 `skipif(not _pg_available()`，
+# 而这里把结果**先存进变量**再用——同一个病，换个写法就搜不到了。
+# 教训：数调用点要按"谁最终消费了这个判定"数，不能按某一种字面写法数（血规 10①）。
+# 全部 9 处 `@requires_pg` 站点零改动（只换定义）。
+requires_pg = pytest.mark.needs_service("pg")
 
 
 def _conn():

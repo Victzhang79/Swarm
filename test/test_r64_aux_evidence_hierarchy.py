@@ -242,17 +242,26 @@ def test_scope_channel_flat_name_match_still_works():
 # ── ③ 真 round64 fixture 回归（RED→GREEN 的实锤面） ──
 
 def test_g1_accepts_round64_cassette():
-    """回归：真 round64 plan（cassette f1e0f7b5）治后必过 G1——它唯一的病是 sql 弱证据分根。"""
-    cf = Path(__file__).resolve().parents[1] / "cassettes" / \
-        "f1e0f7b5-3be8-438e-8c07-fef2dc5588a6.json"
-    if not cf.exists():
-        pytest.skip("cassette 不在本机")
-    c = json.loads(cf.read_text())
+    """回归：真 round64 plan 治后必过 G1——它唯一的病是 sql 弱证据分根。
+
+    ★#29-4 T-5★ 夹具改为**入库**的 `test/fixtures/plan_cassettes/`（原 `cassettes/`
+    整个 gitignore ⇒ CI 上永远 skip）。由 `scripts/cassette_minimize.py` 生成，
+    1.59 MB → 236 KiB；`issues` 与 `warnings` 都与真卡带逐条相等；区分力已突变实证（把 `.sql` 从
+    `_AUX_EXTENSIONS` 摘掉，最小夹具与原卡带**同样变红**）。
+    """
+    cf = (Path(__file__).resolve().parent / "fixtures" / "plan_cassettes"
+          / "round64_toplevel_sql_weak_evidence.json")
+    assert cf.exists(), (
+        f"入库夹具缺失: {cf}（tracked 文件，不存在=仓库损坏，绝不 skip 放过）")
+    c = json.loads(cf.read_text(encoding="utf-8"))
     plan = TaskPlan.model_validate(c["plan"])
     fp = c.get("file_plan") or []
-    # 前提自证：这个 plan 确实带顶层 sql 弱证据（防 fixture 漂移后测试空转假绿）
+    # ★前提自证（承重，绝不可删）★：本测试判据是"剔考卷账后 issues 为空"——
+    # **空夹具也满足**（实测：空 file_plan + 空 subtasks 同样过）。这条断言是唯一
+    # 让"真夹具"与"夹具漂空"可分的东西。
     assert any(str(it.get("path", "")).startswith("sql/") for it in fp), \
-        "fixture 前提漂移：file_plan 里已无顶层 sql 文件"
+        "fixture 前提漂移：file_plan 里已无顶层 sql 文件 ⇒ 本测试已空转"
+    assert (c.get("plan") or {}).get("subtasks"), "夹具 plan.subtasks 为空 ⇒ 本测试空转"
     r = validate_module_coherence(plan, file_plan=fp)
     # R67-T7a 说明：该 cassette 的 st-1 desc 里真实存在"禁 lombok vs 模板含 lombok"的
     # 考卷矛盾文本（live 管线中 R65E10-T2 剪除+考卷同源重生成会在 VALIDATE 前消解；静态

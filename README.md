@@ -12,7 +12,7 @@
 
 [![CI](https://github.com/Victzhang79/Swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/Victzhang79/Swarm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-5200%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
 [![Version](https://img.shields.io/badge/version-0.9.74-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
@@ -353,7 +353,7 @@ flowchart LR
 
 | 依赖 | 版本 | 必需 | 说明 |
 |---|---|:---:|---|
-| Python | ≥ 3.11 | ✅ | 推荐 3.12 |
+| Python | ≥ 3.12 | ✅ | CI 实测 3.12 + 3.14 双档 |
 | PostgreSQL | 16 + [pgvector](https://github.com/pgvector/pgvector) | ✅ | 任务/项目/记忆/向量元数据 |
 | [Qdrant](https://qdrant.tech/) | ≥ 1.13 | ✅ | 代码向量库；setup.sh 自动下载本地二进制或用 Docker |
 | LLM 接入点 | OpenAI 兼容 API | ✅ | 至少配一个（云端 key 或本地推理服务） |

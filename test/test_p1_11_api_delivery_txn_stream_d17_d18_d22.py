@@ -26,16 +26,10 @@ import pytest
 from swarm.config.settings import DatabaseConfig
 
 
-def _pg_available() -> bool:
-    try:
-        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=3):
-            return True
-    except Exception:
-        return False
-
-
-_PG_OK = _pg_available()
-requires_pg = pytest.mark.skipif(not _PG_OK, reason="PG 不可达")
+# ★#29-4 T-7（复核 H-1 补漏）★ 同 test_p0_10：原 `_PG_OK = _pg_available()` 模块顶层赋值
+# ⇒ collection 期求值，本文件 13 个用例会因 PG 抖动整批静默 skip。
+# 全部 `@requires_pg` 站点零改动（只换定义）。
+requires_pg = pytest.mark.needs_service("pg")
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -47,18 +47,12 @@ def test_encrypt_empty():
     print("  ✅ 加密: 空串可加解密")
 
 
-# ── db round-trip（接真 PG；连不上 skip）──────────────────
-
-def _pg_available() -> bool:
-    import psycopg
-    try:
-        with psycopg.connect(secret_store._conn_str(), connect_timeout=3):
-            return True
-    except Exception:
-        return False
-
-
-_pg = pytest.mark.skipif(not _pg_available(), reason="PG 不可达")
+# ── db round-trip（接真 PG）──────────────────
+# ★#29-4 T-7★ 原为 `_pg = pytest.mark.skipif(not _pg_available(), …)`：collection 期
+# 求值 ⇒ PG 抖动把整批 round-trip 降级 skip 而 CI 照绿。改成标记后判定推迟到 runtest
+# setup（实现见 test/conftest.py::pytest_runtest_setup），CI 上（声明起了 PG service）
+# 连不上直接硬失败。全部 `@_pg` 站点零改动。
+_pg = pytest.mark.needs_service("pg")
 
 _TEST_KEY = "_test_secret_unit"
 

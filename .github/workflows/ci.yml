@@ -10,6 +10,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # ★#29-4 T-3★ 版本 matrix：3.12=声明下界/最低支持档，3.14=开发机实跑档。
+    # 为什么必须两档真跑，而不是"统一到一个版本"：本项目的**平台/解释器假绿是反复病**，
+    # 已四次实证（py<3.13 的 pathlib.is_file 对 EACCES 照抛而 3.13+ 全吞 ⇒ 两个生产真
+    # bug；PATH 透传被 Linux 真 ss 偷换；写死开发机路径本机恰绿）。v0.9.72 首次 push
+    # CI 红 8 例即此族。单版本 CI 只能靠"本地偶遇"发现跨版本 stdlib 行为漂移，而 matrix
+    # 是唯一能**自动引爆**它的手段——这正是"为漏项造的兜底网不能与主判据共享缺口"的应用：
+    # 版本无关夹具（v0.9.73 的治法）与 matrix 是两道独立防线，不可互相替代。
+    strategy:
+      fail-fast: false          # 一档红不掩盖另一档的结果（两档的失败面往往不同）
+      matrix:
+        python-version: ["3.12", "3.14"]
+
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -25,20 +37,41 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # ★#29-4 T-4★ Redis service：不是为了让现有测试"换个形态记绿"（实测 23 个 redis
+      # 相关文件在 Redis 可用/禁用/端口不可达三种配置下**结果逐字相同**，它们是故意
+      # monkeypatch get_redis→None 来测降级形态的），而是为了让**真·跨进程互斥**这条
+      # 命题第一次有人验——那是 ModuleLock 存在的全部理由，此前在任何环境下零覆盖。
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     env:
       # 测试默认关 RBAC（与 test/conftest.py 一致），连 CI 的 PG
       SWARM_RBAC_ENABLED: "false"
       SWARM_DB_POSTGRES_URI: "postgresql://postgres:postgres@localhost:5432/swarm"
       # secret_store 加密根密钥（CI 固定值，仅供测试；与生产无关）
       SWARM_SECRET_KEY: "ci-test-fixed-secret-key-not-for-production"
+      # ★#29-4 T-4★ 真连 Redis（跨进程互斥测试的前提）
+      SWARM_REDIS_ENABLED: "true"
+      SWARM_DB_REDIS_URI: "redis://localhost:6379/0"
+      # ★#29-4 T-7★ CI 上 PG/Redis 都是**声明起了 service** 的，连不上=真故障。
+      # 置 1 后 `require_pg`/`require_redis` 从"静默 skip"改为**硬失败**——否则 PG 抖动
+      # 会把整批集成测试降级为 skip 而 CI 照绿（迁移 fail-fast 的守护就只剩可绕过的静态断言）。
+      SWARM_TEST_REQUIRE_SERVICES: "1"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
         run: pip install uv

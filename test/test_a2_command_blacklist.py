@@ -10,17 +10,24 @@ import uuid
 
 import pytest
 
-
-def _has_pg() -> bool:
-    try:
-        from swarm.config import command_blacklist_store as bl
-        bl.ensure_tables()
-        return True
-    except Exception:
-        return False
+# ★#29-4 T-7（复核 H-1 补漏）★ 原为 `pytestmark = pytest.mark.skipif(not _has_pg(), …)`。
+# 两重问题：① collection 期求值（PG 抖一下整个文件 5 个用例静默 skip、CI 照绿）；
+# ② `_has_pg()` 里调的是 `ensure_tables()` —— **collection 期就建表**，比单纯连库更重。
+# ★这个文件在第一轮被漏掉了★：函数名叫 `_has_pg` 而我 grep 的是 `_pg_available`，
+# 于是"数全部调用点"数漏了 4 个文件 / 39 个用例（血规 10①）。
+pytestmark = pytest.mark.needs_service("pg")
 
 
-pytestmark = pytest.mark.skipif(not _has_pg(), reason="PG unavailable")
+@pytest.fixture(autouse=True)
+def _tables_ready():
+    """建表移到 autouse fixture：只在用例真要跑时执行，且**不吞异常**。
+
+    原实现把建表塞进 `_has_pg()` 的 try 里，建表失败会被当成"PG 不可用"而 skip ——
+    "连不上库"与"库连上了但建表被拒（权限/只读副本）"因此不可分。现在前者由
+    `needs_service` 判、后者直接抛出来（真故障就该红）。
+    """
+    from swarm.config import command_blacklist_store as bl
+    bl.ensure_tables()
 
 
 def test_builtin_rules_seeded():

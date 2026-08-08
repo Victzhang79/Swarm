@@ -6,7 +6,8 @@ schema_version 永不 stamp、版本化迁移形同虚设、将来 ALTER 不自�
 修后：on_startup 在第一个 ensure_tables 之前调 run_migrations（fail-fast）。
 
 - test_wiring_*：源码级装配守卫，无需 PG，CI 安全（防有人删掉调用/调换顺序）。
-- test_integration_*：真实启动，_pg_available 守卫（CI 无库则跳过）。
+- test_integration_*：真实启动，`needs_service("pg")` 标记守卫（#29-4 T-7：判定在
+  runtest setup 期，非 collection 期；CI 上声明起了 postgres service，连不上=硬失败）。
 """
 
 from __future__ import annotations
@@ -27,12 +28,11 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
-def _pg_available() -> bool:
-    try:
-        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=3):
-            return True
-    except Exception:
-        return False
+# ★#29-4 T-7★ 原有 `_pg_available()` 被用在**装饰器实参**里（`@skipif(not
+# _pg_available(), …)`）⇒ collection 期求值一次。PG 抖一下这两条集成测试就降级 skip，
+# 而它们是"迁移失败必须 fail-fast"的**唯一真跑守护**——skip 掉之后只剩静态断言。
+# 改用 `needs_service("pg")` 标记：判定推迟到 runtest setup，CI 上（明确起了 postgres
+# service）连不上直接硬失败。实现见 test/conftest.py::pytest_runtest_setup。
 
 
 # ── 装配守卫（无 PG） ─────────────────────────────────
@@ -62,8 +62,8 @@ def test_migration_failure_propagates_out_of_startup():
       ② 把 try 开在 `run_migrations` **之前**、except 收在 `ensure_tables` **之后**
          （外层兜底）—— 切片窗口内同样无 `except`。
     加重：同文件两个集成测试只断「被调用 + 盖章」，**无任何**测试断异常会向上抛
-    ⇒ 迁移 fail-fast 此前只有那一道 getsource 守卫（且它还与 `_pg_available`
-    collection 期 skip 叠加）。
+    ⇒ 迁移 fail-fast 此前只有那一道 getsource 守卫（且它还与 collection 期 skip
+    叠加——那一层已由 #29-4 T-7 的 `needs_service` 标记治掉）。
 
     ★本条不需要 PG★：`run_migrations` 之前的语句全是日志/校验/sidecar 或 fail-open
     的 try 块，patch 成抛异常后在碰库之前就炸了 ⇒ CI（无库）同样真跑，不会被 skip 掉。
@@ -121,7 +121,7 @@ def test_wiring_migration_is_failfast_not_swallowed():
 # ── 集成（需 PG） ────────────────────────────────────
 
 
-@pytest.mark.skipif(not _pg_available(), reason="PG 不可达")
+@pytest.mark.needs_service("pg")
 def test_integration_startup_invokes_run_migrations_and_stamps():
     """真实启动：run_migrations 被调用一次，且 schema_version 存在 baseline 行。"""
     from fastapi.testclient import TestClient
@@ -152,7 +152,7 @@ def test_integration_startup_invokes_run_migrations_and_stamps():
     print("  ✅ 真实启动跑迁移 + stamp schema_version")
 
 
-@pytest.mark.skipif(not _pg_available(), reason="PG 不可达")
+@pytest.mark.needs_service("pg")
 def test_integration_v2_adds_task_queue_meta_columns():
     """P0-A v2 迁移：run_migrations 后 task_records 必须有 auto_accept + queue_priority 列，
     且 schema_version 盖章到 v2。"""
@@ -177,10 +177,25 @@ def test_integration_v2_adds_task_queue_meta_columns():
     print("  ✅ v2 迁移补齐队列 meta 列 + 盖章 v2")
 
 
+def _pg_reachable_for_main() -> bool:
+    """★仅供下面 `__main__` 直跑用★（`python test/test_xxx.py` 这条老路径）。
+
+    #29-4 T-7 把 pytest 侧的判定改成了 `needs_service` 标记（runtest setup 期求值），
+    但 `__main__` 分支不经 pytest，没有标记机制，故保留一个**本地**探测。
+    刻意不叫 `_pg_available`：那个名字曾被用在装饰器实参里，留着同名函数会让下一个人
+    很容易再写回 `@skipif(not _pg_available(), …)` —— 换名字是为了让老范式不再顺手。
+    """
+    try:
+        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=3):
+            return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     test_wiring_on_startup_calls_migrations_before_ensure_tables()
     test_wiring_migration_is_failfast_not_swallowed()
-    if _pg_available():
+    if _pg_reachable_for_main():
         test_integration_startup_invokes_run_migrations_and_stamps()
         test_integration_v2_adds_task_queue_meta_columns()
     else:

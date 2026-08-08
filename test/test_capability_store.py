@@ -79,17 +79,11 @@ def test_default_capability_shape():
 
 # ── CRUD round-trip（接真 PG；连不上 skip）──────────────────
 
-def _pg_available() -> bool:
-    import psycopg
-
-    try:
-        with psycopg.connect(cap._get_conn_str(), connect_timeout=3):
-            return True
-    except Exception:
-        return False
-
-
-_pg = pytest.mark.skipif(not _pg_available(), reason="PG 不可达，跳过 CRUD round-trip")
+# ★#29-4 T-7★ 原为 `_pg = pytest.mark.skipif(not _pg_available(), …)`，连库在装饰器
+# 实参里 ⇒ collection 期求值一次，PG 抖一下整批 CRUD round-trip 降级 skip 而 CI 照绿。
+# 改成标记后判定推迟到 runtest setup（实现见 test/conftest.py::pytest_runtest_setup），
+# 缺席后果由 SWARM_TEST_REQUIRE_SERVICES 决定。全部 `@_pg` 站点零改动。
+_pg = pytest.mark.needs_service("pg")
 
 _TEST_PROVIDER = "_test_probe_provider"
 

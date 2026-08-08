@@ -1,0 +1,1371 @@
+{
+ "_note": "由 scripts/cassette_minimize.py 从 live 卡带瘦身而来，勿手改",
+ "file_plan": [
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/pom.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "sql/alarm.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/constant/AlarmConstants.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTask.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTaskUser.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/domain/AlarmTaskChannel.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/robot/domain/AlarmRobot.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/domain/AlarmTemplate.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/domain/AlarmNotifyUser.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/domain/AlarmAppKey.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/domain/AlarmSendLog.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/domain/AlarmIdempotentState.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/domain/DutyStrategy.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/domain/DutyGroup.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/domain/DutyGroupUser.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/domain/DutyHolidayPlan.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/domain/DutySnapshot.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/domain/AlarmNotifyRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/domain/AlarmRecoverRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/domain/AlarmDeleteRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/mapper/AlarmTaskMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/mapper/AlarmTaskChannelMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/robot/mapper/AlarmRobotMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/mapper/AlarmTemplateMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/mapper/AlarmNotifyUserMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/mapper/AlarmAppKeyMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/mapper/AlarmSendLogMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/mapper/AlarmIdempotentStateMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/mapper/DutyStrategyMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/mapper/DutySnapshotMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/mapper/DutyGroupMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/mapper/DutyHolidayPlanMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTaskMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTaskChannelMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmRobotMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmTemplateMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmNotifyUserMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmAppKeyMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmSendLogMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/AlarmIdempotentStateMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/DutyStrategyMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/DutyGroupMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/DutyHolidayPlanMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/mapper/alarm/DutySnapshotMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/IAlarmTaskService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/impl/AlarmTaskServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/IAlarmTaskChannelService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/service/impl/AlarmTaskChannelServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/robot/service/IAlarmRobotService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/robot/service/impl/AlarmRobotServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/service/IAlarmTemplateService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/service/impl/AlarmTemplateServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/service/TemplateRenderService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/IAlarmNotifyUserService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/service/impl/AlarmNotifyUserServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/service/IAlarmAppKeyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/service/impl/AlarmAppKeyServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/IAlarmSendLogService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/impl/AlarmSendLogServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/IAlarmIdempotentStateService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/impl/AlarmIdempotentStateServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/IDutyStrategyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/impl/DutyStrategyServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/IDutyGroupService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/impl/DutyGroupServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/IDutyHolidayPlanService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/impl/DutyHolidayPlanServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/IDutySnapshotService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/impl/DutySnapshotServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/domain/NotifyMessage.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/INotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/SlackNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/WecomNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/FeishuNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/VoiceNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/InternalPushNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/impl/ApnsVoipNotifyService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/service/NotifyServiceFactory.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/AlarmHandleChain.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/IdempotentFilterHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/IgnoreFilterHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/MinIntervalHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/AccumulateCountHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/DutyResolveHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/SendHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/AlarmEngineService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/AlarmRecoverService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/job/AlarmEscalateJob.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/job/DutySnapshotJob.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/job/DutyNotifyJob.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/config/AlarmAsyncConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/interceptor/AppKeyAuthInterceptor.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/config/AppKeyWebConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/controller/AlarmNotifyController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/callback/controller/AlarmCallbackController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/controller/AlarmTaskController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/task/controller/AlarmTaskChannelController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/robot/controller/AlarmRobotController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/template/controller/AlarmTemplateController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notifyuser/controller/AlarmNotifyUserController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/controller/AlarmAppKeyController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/controller/AlarmSendLogController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/controller/DutyStrategyController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/controller/DutyGroupController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/controller/DutyHolidayPlanController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/controller/DutySnapshotController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/controller/AlarmIdempotentStateController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/task.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/channel.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/robot/robot.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/robot/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/robot/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/template/template.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/template/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/template/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/notifyuser/user.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/notifyuser/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/notifyuser/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/appkey/appkey.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/appkey/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/appkey/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/strategy/strategy.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/strategy/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/strategy/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/group/group.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/group/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/group/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/holiday/holiday.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/holiday/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/holiday/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/snapshot/snapshot.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/snapshot/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/duty/snapshot/preview.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/engine/sendlog.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/engine/state.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/AlarmLevelEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/AlarmTypeEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/ChannelTypeEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/SendStatusEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/DutySourceEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/exception/AlarmException.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/domain/AlarmHandleContext.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/callback/domain/AlarmCallbackRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/channel/util/NotifyHttpClient.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/appkey/util/AppSecretGenerator.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/AlarmDispatchService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/service/AlarmEscalateService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/callback/service/AlarmCallbackService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/DutyResolveService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/impl/DutyResolveServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/duty/service/DutySlackDmService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/config/AlarmChainConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/config/AlarmShiroAnonConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "sql/alarm_sys_user_ext.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "sql/alarm_menu.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "sql/alarm_quartz_jobs.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/application-alarm.yml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/IdempotentFilterHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/IgnoreFilterHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/template/TemplateRenderServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutyResolveServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/README.md"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/channelAdd.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/resources/templates/alarm/task/channelEdit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/MinIntervalHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/AccumulateCountHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/DutyResolveHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/RobotTypeEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/DutyModeEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/common/enums/CallbackActionEnum.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/domain/AlarmComposeRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/notify/domain/AlarmVoipRequest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/engine/chain/AlarmHandler.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/SendHandlerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/chain/AlarmHandleChainTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmRecoverServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmEscalateServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/callback/AlarmCallbackServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutySnapshotServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/notifyuser/AlarmNotifyUserServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmEngineServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "sql/alarm_dict.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/task/AlarmTaskServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmDispatchServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/appkey/AppKeyAuthInterceptorTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/SlackNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/WecomNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/FeishuNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/VoiceNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/InternalPushNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/ApnsVoipNotifyServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/NotifyServiceFactoryTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/channel/NotifyHttpClientTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/notify/AlarmNotifyControllerTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/appkey/AppSecretGeneratorTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutySlackDmServiceTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutyStrategyServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutyGroupServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/DutyHolidayPlanServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/job/DutySnapshotJobTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/duty/job/DutyNotifyJobTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/job/AlarmEscalateJobTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmSendLogServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/engine/service/AlarmIdempotentStateServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/task/AlarmTaskChannelServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/robot/AlarmRobotServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/template/AlarmTemplateServiceImplTest.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/test/java/com/ruoyi/alarm/appkey/AlarmAppKeyServiceImplTest.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-alarm-interface",
+   "path": "pom.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/pom.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/constant/AlarmApiConstants.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/exception/AlarmSdkException.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/config/AlarmSdkConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/model/AlarmMessage.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/model/AlarmResponse.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/util/JsonUtils.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/http/AlarmHttpClient.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/src/main/java/com/ruoyi/alarm/sdk/AlarmSimpleUtil.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm-interface",
+   "path": "ruoyi-alarm-interface/README.md"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "sql/ry_alarm_20260617.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-common/src/main/java/com/ruoyi/common/utils/AesUtils.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-common/src/main/java/com/ruoyi/common/utils/TotpUtils.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysUser.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/mapper/SysUserMapper.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/resources/mapper/system/SysUserMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/ISysGoogleAuthService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysGoogleAuthServiceImpl.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/ISysUserService.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysUserServiceImpl.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysProfileController.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysLoginController.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-admin/src/main/resources/templates/system/user/profile/profile.html"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-system",
+   "path": "ruoyi-admin/src/main/resources/templates/login.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/util/GoogleAuthenticator.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/util/GoogleAuthUtil.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/shiro/exception/GoogleCodeIncorrectException.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/shiro/service/SysLoginService.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/config/ShiroConfig.java"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-admin",
+   "path": "pom.xml"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/pom.xml"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/resources/application.yml"
+  },
+  {
+   "action": "modify",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/config/ShiroConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-quartz",
+   "path": "sql/alarm_quartz_jobs.sql"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysDutySchedule.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/mapper/SysDutyScheduleMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/resources/mapper/system/SysDutyScheduleMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysDutyScheduleServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/ISysDutyScheduleService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/java/com/ruoyi/web/controller/system/SysDutyScheduleController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/resources/templates/system/dutySchedule/dutySchedule.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/resources/templates/system/dutySchedule/add.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/resources/templates/system/dutySchedule/edit.html"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysRole.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysUserRole.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysRoleMenu.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/mapper/SysRoleMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/resources/mapper/system/SysRoleMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/ISysPermissionService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysPermissionServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/shiro/realm/UserRealm.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/shiro/crypto/Sha512CredentialsMatcher.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/service/impl/SysPasswordServiceImpl.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/config/AsyncConfig.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-alarm",
+   "path": "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/AsyncAlarmSendService.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/aspectj/annotation/OperationLog.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-framework",
+   "path": "ruoyi-framework/src/main/java/com/ruoyi/framework/aspectj/OperationLogAspect.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/domain/SysOperationLog.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/java/com/ruoyi/system/mapper/SysOperationLogMapper.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-system",
+   "path": "ruoyi-system/src/main/resources/mapper/system/SysOperationLogMapper.xml"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/java/com/ruoyi/web/controller/monitor/RedisDiagController.java"
+  },
+  {
+   "action": "create",
+   "module": "ruoyi-admin",
+   "path": "ruoyi-admin/src/main/resources/templates/monitor/redis/diag.html"
+  }
+ ],
+ "schema": "swarm-plan-fixture/v1"
+}

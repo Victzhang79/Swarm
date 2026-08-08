@@ -202,13 +202,20 @@ fi
 # ═══════════════════════════════════════════════════════════════
 info "━━━ Step 4: Python 虚拟环境 ━━━"
 
+# ★#29-4 T-3（复核 M-1）★ 下界必须与 pyproject 的 `requires-python` 同源（现为 3.12）。
+# 原为 `python3.12 python3.11 python3` + `minor -ge 11`：只装了 3.11 的机器上本脚本会
+# **判绿并建出 3.11 venv**，等到下一步 `pip install -e .` 才报
+# `requires a different Python` —— 用户拿到的是安装期报错，而不是环境自检报错。
+# README 推荐的安装路径就是本脚本，所以这里的下界是用户实际撞到的第一道门。
+# 有机读闸钉住：test/test_pyproject_version_coherence.py（六处同源）。
+SWARM_PY_MIN_MINOR=12
 PYTHON_CMD=""
-for cmd in python3.12 python3.11 python3; do
+for cmd in python3.14 python3.13 python3.12 python3; do
     if command -v "$cmd" &>/dev/null; then
         ver=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
         major=$(echo "$ver" | cut -d. -f1)
         minor=$(echo "$ver" | cut -d. -f2)
-        if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
+        if [[ "$major" -ge 3 && "$minor" -ge "$SWARM_PY_MIN_MINOR" ]]; then
             PYTHON_CMD="$cmd"
             break
         fi
@@ -230,7 +237,7 @@ if [[ -z "$PYTHON_CMD" ]]; then
 fi
 
 if ! command -v "$PYTHON_CMD" &>/dev/null; then
-    fail "找不到 Python >= 3.11。请手动安装。"
+    fail "找不到 Python >= 3.${SWARM_PY_MIN_MINOR}。请手动安装。"
 fi
 ok "Python: $($PYTHON_CMD --version)"
 

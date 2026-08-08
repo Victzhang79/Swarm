@@ -218,18 +218,30 @@ def test_g1_non_src_layout_multi_dir_still_caught():
 
 
 def test_g1_rejects_round62_cassette():
-    """回归：真 round62 plan（cassette 01520400）必被本闸打回。"""
+    """回归：真 round62 plan 必被本闸打回（模块 alarm-app/alarm-log 各落多个物理目录）。
+
+    ★#29-4 T-5★ 夹具从 gitignore 的 `cassettes/` 改为**入库**的
+    `test/fixtures/plan_cassettes/`。原状态 `if not cf.exists(): skip` 在 CI 上
+    **永远** skip（`git ls-files cassettes/` = 0）——最贵的一类回归（真 E2E 死因）
+    靠"本机恰好有卡带"背书，等于没有守护。夹具由 `scripts/cassette_minimize.py`
+    从 live 卡带白名单瘦身生成（1.87 MB → 235 KiB；`issues` 与 `warnings` 都与真卡带
+    逐条相等，区分力经突变实证等价）。
+    """
     import json
     from pathlib import Path
-    cf = Path(__file__).resolve().parents[1] / "cassettes" / "01520400_final.json"
-    if not cf.exists():
-        import pytest
-        pytest.skip("cassette 不在本机")
-    c = json.loads(cf.read_text())
+    cf = (Path(__file__).resolve().parent / "fixtures" / "plan_cassettes"
+          / "round62_alarm_api_double_root.json")
+    assert cf.exists(), (
+        f"入库夹具缺失: {cf}。它是 tracked 文件，不存在=仓库损坏或被误删，"
+        "绝不能 skip 掉过（那会让本条守卫静默失效）")
+    c = json.loads(cf.read_text(encoding="utf-8"))
     plan = TaskPlan.model_validate(c["plan"])
     r = validate_module_coherence(plan, file_plan=c.get("file_plan") or [])
+    # 前提自证：夹具必须真的带多落点模块，否则下面的断言是空转
+    assert c.get("file_plan"), "夹具 file_plan 为空 ⇒ 本测试空转"
     assert not r.valid
-    assert any("alarm-api" in i for i in r.issues)
+    assert any("alarm-api" in i for i in r.issues), (
+        f"round62 死因（alarm-api 双落点）未被打回。issues={r.issues}")
 
 
 from swarm.brain.plan_validator import validate_plan_granularity

@@ -16,15 +16,14 @@ from swarm.config.settings import DatabaseConfig
 from swarm.project.store import create_project, ensure_tables, get_project, update_project
 
 
-def _pg_available() -> bool:
-    try:
-        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=3):
-            return True
-    except Exception:
-        return False
 
 
-pytestmark = pytest.mark.skipif(not _pg_available(), reason="PG 不可达")
+# ★#29-4 T-7★ 原为 `pytestmark = pytest.mark.skipif(not _pg_available(), …)`：
+# 连库动作在**装饰器实参**里 ⇒ import(collection) 期求值一次，PG 抖一下就把整个
+# 文件降级为 skip 而 CI 照绿。改用 `needs_service` 标记后判定推迟到 runtest setup，
+# 且缺席后果由 SWARM_TEST_REQUIRE_SERVICES 决定（CI 硬失败 / 本地可见 skip）。
+# 判定实现在 test/conftest.py::pytest_runtest_setup。
+pytestmark = pytest.mark.needs_service("pg")
 
 _PATH = f"/tmp/_test_c4_{uuid.uuid4().hex[:8]}"
 _ID = f"_test_c4_{uuid.uuid4().hex[:8]}"

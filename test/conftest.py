@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -230,14 +232,269 @@ def secret_store_state():
         ss._cache.update(snap[2])
 
 
-def _purge_test_users() -> None:
+# ══════════════════════════════════════════════════════════════════════════
+# #29-4 T-7：外部服务可用性 —— **惰性求值** + 声明起了服务就 fail-closed
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 治的是两个叠在一起的病：
+#   ① **collection 期求值**：原范式 `@pytest.mark.skipif(not _pg_available(), …)` 把
+#      连库动作放进**装饰器实参**，import 时求值一次。PG 抖一下 → 整批集成测试降级为
+#      skip，而 CI 照样 EXIT 0。同款范式散布 10+ 文件。
+#   ② **静默降级**：CI 里 PG/Redis 都是 `services:` 里**明确声明起了**的，连不上是
+#      真故障，不是"本机没装"。原实现无法区分这两种情形，一律 skip。
+#
+# 治法：可用性判定改**惰性**（测试体内首次调用才连），并由
+# `SWARM_TEST_REQUIRE_SERVICES` 决定缺服务时的后果：
+#   置 1（CI 设，见 .github/workflows/ci.yml）→ `pytest.fail` 硬失败，附带连接错误原文；
+#   未置（开发机）→ `pytest.skip`，reason 带机读前缀 `SERVICE_ABSENT:` 便于统计。
+#
+# ★`SWARM_TEST_REQUIRE_SERVICES` 刻意**不**进 `config/env_registry.py`★（#29-4 T-7 裁决）：
+# 那本册的边界是**生产**开关，且它的第二条测试是双向的（登记了而生产代码里扫不到 ⇒ 判死
+# 条目 ⇒ 红），所以登记一个只被 test/ 读的开关结构上必然红。实测过替代路径（把 test/ 纳入
+# 扫描面）：会牵出 32 个未登记名，绝大多数是"未登记开关必须被拒"那类测试故意造的假名
+# （SWARM_BAD / SWARM_DEFINITELY_NOT_EXIST_X …），登记它们会让册子退化成字符串集合。
+# 故测试期开关就近在此说明。详见 env_registry 模块 docstring 里的同一段裁决。
+#
+# ★为什么后果要可配而不是一律硬失败★：开发机上不装 Redis 是合法工作方式，一律硬失败
+# 会逼开发者去改测试（比 skip 更坏）。但"缺席"必须**机读可辨**（血规 10④），故 skip
+# reason 带固定前缀 + 会话末汇总一次 WARNING，绝不静默。
+
+_SERVICE_PROBE_CACHE: dict[str, str | None] = {}   # name -> None=可用 / str=错误原文
+_SERVICE_PROBE_FAILED_AT: dict[str, float] = {}    # name -> 上次失败的 monotonic 时刻
+# 失败结论的冷却期（秒）。与生产侧 `_REDIS_REPROBE_COOLDOWN_SEC` 同值同理由：
+# 足够吸收瞬时抖动，又不至于长时间停留在"整批降级"态。
+_PROBE_FAIL_COOLDOWN_SEC = 30.0
+# ★复核 M-3 整改：两档必须分账★
+# 原来 fail 档与 skip 档共用一个集合，而汇总文案只描述 skip 档 ⇒ 在
+# `SWARM_TEST_REQUIRE_SERVICES=1`（CI，也是这机制唯一为之设计的环境）下，用例明明是
+# ERROR，汇总却说"已降级为 skip"并建议"应置 SWARM_TEST_REQUIRE_SERVICES=1"——那开关
+# 已经置了。**同一个事实（服务不可用）在两档下后果不同，就必须分档记**
+# （血规 10③：复用单一事实源 ≠ 复用其消费契约）。
+_SERVICE_ABSENT_SEEN: set[str] = set()      # 降级为 skip 的
+_SERVICE_FAILED_HARD: set[str] = set()      # 硬失败的
+
+
+def _require_services_hard() -> bool:
+    return os.environ.get("SWARM_TEST_REQUIRE_SERVICES", "").strip().lower() in ("1", "true", "yes")
+
+
+def _probe_pg() -> str | None:
     try:
         import psycopg
+        from swarm.config.settings import DatabaseConfig
+        with psycopg.connect(DatabaseConfig().postgres_uri, connect_timeout=5):
+            return None
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
 
+
+def _probe_redis() -> str | None:
+    try:
+        import redis
+        from swarm.config.settings import get_config
+        client = redis.from_url(get_config().db.redis_uri, decode_responses=True,
+                                socket_connect_timeout=5, socket_timeout=5)
+        client.ping()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+
+
+_SERVICE_PROBES = {"pg": _probe_pg, "redis": _probe_redis}
+
+
+def require_service(name: str) -> None:
+    """测试体内调用：服务不可用时按 `SWARM_TEST_REQUIRE_SERVICES` fail 或 skip。
+
+    ★必须在**测试体内**调用，绝不放进 `@skipif(...)` 的实参或 `pytestmark`★——那会回到
+    collection 期求值，本函数存在的全部意义就是躲开它。
+    """
+    if name not in _SERVICE_PROBES:
+        raise ValueError(f"未知服务 {name!r}，可选：{sorted(_SERVICE_PROBES)}")
+    # ★复核 M-5 整改：失败要带冷却重探，不许永久锁存★
+    # 原实现一次失败缓存整个 session。生产侧 `infra/redis_client.py:17-24` 里写着同一件事
+    # 的复盘：「旧实现用布尔 `_redis_checked` 永久锁存失败 → 启动期一次瞬时抖动会让整个
+    # 进程永久退化」，并为此加了 30s 冷却重探。我在测试侧把那个已修的病重犯了一遍：
+    # 长 session 里 PG 抖 1 秒，之后**所有** PG 用例全 skip（CI 档则全部硬失败）。
+    # 成功结论永久缓存（服务不会"变得不可用"到需要每次重连的程度，且要控开销）；
+    # 失败结论只缓存 `_PROBE_FAIL_COOLDOWN_SEC` 秒。
+    cached = _SERVICE_PROBE_CACHE.get(name)
+    if cached is None and name in _SERVICE_PROBE_CACHE:
+        return                                  # 已知可用
+    now = time.monotonic()
+    last_at = _SERVICE_PROBE_FAILED_AT.get(name)
+    if cached is not None and last_at is not None and (now - last_at) < _PROBE_FAIL_COOLDOWN_SEC:
+        err = cached                            # 冷却窗内：沿用上次失败结论，不重连
+    else:
+        err = _SERVICE_PROBES[name]()
+        _SERVICE_PROBE_CACHE[name] = err
+        if err is None:
+            _SERVICE_PROBE_FAILED_AT.pop(name, None)
+            return
+        _SERVICE_PROBE_FAILED_AT[name] = now
+    if _require_services_hard():
+        _SERVICE_FAILED_HARD.add(name)
+        pytest.fail(
+            f"SERVICE_ABSENT:{name} —— {err}。"
+            f"（SWARM_TEST_REQUIRE_SERVICES=1：{name} 是 ci.yml `services:` 明确声明"
+            f"起了的，连不上=真故障，故本条硬失败而非静默 skip）")
+    _SERVICE_ABSENT_SEEN.add(name)
+    pytest.skip(
+        f"SERVICE_ABSENT:{name} —— {err}。"
+        f"（本机未置 SWARM_TEST_REQUIRE_SERVICES ⇒ 降级为 skip。CI 上该开关为 1，"
+        f"同样情形会硬失败）")
+
+
+def pytest_configure(config):
+    """注册 `needs_service` 标记（否则 `-W error::PytestUnknownMarkWarning` 下会报未知标记）。"""
+    config.addinivalue_line(
+        "markers",
+        "needs_service(name): 该用例需要外部服务（pg/redis）。判定在 **runtest setup** "
+        "阶段做（非 collection 期），缺席时按 SWARM_TEST_REQUIRE_SERVICES 硬失败或可见 skip。",
+    )
+
+
+def pytest_runtest_setup(item):
+    """#29-4 T-7：`needs_service` 标记的求值点 —— **runtest setup**，不是 collection。
+
+    原范式 `pytestmark = pytest.mark.skipif(not _pg_available(), …)` 把连库动作放在
+    模块顶层（装饰器实参），import 时求值一次：
+      · PG 抖一下 → **整批**集成测试降级 skip，CI 照样 EXIT 0；
+      · 且判定发生在**任何**测试跑之前，`-p no:warnings -q` 下不留任何痕迹。
+    危害具体化：`test_startup_runs_migrations.py` 那两条被 skip 后，"迁移失败必须
+    fail-fast" 的守护就只剩静态断言。
+
+    改成标记 + 本钩子后：判定推迟到该用例真要跑时、按服务名缓存一次、缺席走
+    `require_service` 的统一后果（CI 硬失败 / 本地可见 skip + 会话末汇总 WARNING）。
+    """
+    for mark in item.iter_markers(name="needs_service"):
+        # ★复核 M-4 整改★ 漏写服务名必须 fail-closed。
+        # 原实现 `for name in mark.args` 在 `@pytest.mark.needs_service`（忘了参数）时
+        # args 为空 → 循环体不执行 → **用例照跑**，闸静默不设。方向恰好反了：
+        # 名字写**错**是 fail-closed（require_service 抛 ValueError），名字**缺失**却
+        # fail-open —— 而漏参数比拼错名字常见得多。
+        # 用 `pytest.fail`；`pytest.UsageError` 实测等效（同样让用例 ERROR、rc≠0）。
+        # 选 fail 是因为它语义上是"这条用例不合格"而非"命令行用法错"。
+        if not mark.args:
+            pytest.fail(
+                f"{item.nodeid}: `needs_service` 标记没写服务名 —— "
+                f"闸不会检查任何服务（fail-open）。请写成 "
+                f'`needs_service("pg")` / `needs_service("redis")`。')
+        for name in mark.args:
+            require_service(name)
+
+
+@pytest.fixture
+def service_probe_internals():
+    """暴露服务探测的内部状态给测试（M-5 冷却重探锁的消费者）。
+
+    走 fixture 而非 `import conftest`（`--import-mode=importlib` 下后者 ModuleNotFoundError）。
+    """
+    return {
+        "cache": _SERVICE_PROBE_CACHE,
+        "failed_at": _SERVICE_PROBE_FAILED_AT,
+        "cooldown": _PROBE_FAIL_COOLDOWN_SEC,
+        "probes": _SERVICE_PROBES,
+        "require": require_service,
+        # 两本会话级账也要给出去：用假探针造失败的测试必须能还原它们，
+        # 否则会话末汇总会打出本轮并不存在的 SERVICE_ABSENT（假信号）。
+        "absent_seen": _SERVICE_ABSENT_SEEN,
+        "failed_hard": _SERVICE_FAILED_HARD,
+    }
+
+
+@pytest.fixture
+def require_svc():
+    """回 `require_service` 本身，供测试体内调用。
+
+    ★用 fixture 而不是让测试 `import conftest`★：本仓 `addopts` 带
+    `--import-mode=importlib`，conftest 不进 `sys.modules` 顶层名字空间，
+    `from conftest import …` 直接 ModuleNotFoundError（与 `FakeSecretConn`
+    那条同源理由：跨文件 import 测试基建一律走 fixture）。
+    """
+    return require_service
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """会话末汇总：本轮有哪些服务缺席导致降级 —— **写进 terminal reporter**。
+
+    血规 10④：「空返回/缺席必须机读可辨」。逐条 skip 已带 `SERVICE_ABSENT:` 前缀，
+    但 `-q` 下没人会翻 skip 列表，"整批降级"与"全部真跑"在终端输出上不可分。
+
+    ★这里为什么不是 `logger.warning`（我的第一版就是，实测无效）★
+    第一版用 session 级 autouse fixture 打 `logging.warning`。**实测在本仓惯用命令
+    `pytest -p no:warnings -q` 下那条 WARNING 根本不显示**（pytest 只在失败时才吐
+    captured log）——于是"缺席可观测"成了纸面承诺，而这批治的恰恰就是"降级不可观测"。
+    我造了机制，然后没验证就宣称它生效了。
+    `pytest_terminal_summary` 是唯一在 `-q` + `-p no:warnings` 下仍必然输出的通道
+    （它写的是 terminal reporter 本身，不经 logging、不经 warnings 插件）。
+    """
+    # ── ① 降级为 skip 的服务（本机档）──
+    if _SERVICE_ABSENT_SEEN:
+        names = ",".join(sorted(_SERVICE_ABSENT_SEEN))
+        terminalreporter.write_sep(
+            "=", f"SERVICE_ABSENT(skip): {names}", yellow=True, bold=True)
+        terminalreporter.write_line(
+            f"本轮以下外部服务缺席，相关用例【已降级为 skip，非真跑】：{names}。"
+            f"CI 上应置 SWARM_TEST_REQUIRE_SERVICES=1 使其硬失败而非静默跳过。")
+        logging.getLogger("swarm.test").warning(
+            "[SERVICE_ABSENT] 本轮外部服务缺席，相关用例已降级（非真跑）：%s", names)
+
+    # ── ② 硬失败的服务（CI 档）── ★复核 M-3★ 文案绝不能说"已降级为 skip"
+    if _SERVICE_FAILED_HARD:
+        names = ",".join(sorted(_SERVICE_FAILED_HARD))
+        terminalreporter.write_sep(
+            "=", f"SERVICE_ABSENT(hard-fail): {names}", red=True, bold=True)
+        terminalreporter.write_line(
+            f"本轮以下外部服务不可用，相关用例【已硬失败（ERROR），不是 skip】：{names}。"
+            f"SWARM_TEST_REQUIRE_SERVICES 已置位，这些服务在 ci.yml `services:` 里"
+            f"明确声明起了 —— 连不上是真故障，请查 service 是否起来/健康检查是否通过。")
+        logging.getLogger("swarm.test").error(
+            "[SERVICE_ABSENT] 本轮外部服务不可用且已硬失败：%s", names)
+
+    # ── ③ 测试用户清理的结果（T-6 那本账的**真正消费者**）──
+    # ★自查发现（#29-4，非复核意见）★：`_PURGE_LEDGER` 原先只被 test_conftest_purge_ledger.py
+    # 读（那是**驱动出来的**清理），而**会话末真跑那一次**的账目没有任何人看，它唯一的
+    # 出口是 `logger.warning` —— 而我已实测那条在 `-p no:warnings -q` 下不显示。
+    # 于是 T-6 治的病（清理静默失败 ⇒ 垃圾用户在真库里累积而无人知晓）在 T-6 的修复里
+    # 原样存活：账造好了、没有消费者，等于没造（血规 10④）。
+    # 这是**同一个缺陷在本批里的第二次**（第一次是 SERVICE_ABSENT 汇总用 logging）。
+    if _PURGE_LEDGER.get("phase") == "failed":
+        terminalreporter.write_sep(
+            "=", "PURGE_FAILED: 测试用户清理失败", red=True, bold=True)
+        terminalreporter.write_line(
+            f"会话末测试用户清理失败：{_PURGE_LEDGER.get('error')}。"
+            f"垃圾测试用户会在 .env 指向的真库里持续累积（下次会话末会再扫一遍）。")
+
+
+# #29-4 T-6：清理结果的机读账。测试可读它断"清理真跑了/真失败了"。
+#   phase: "skipped"（无 PG 依赖，压根没连）/ "done" / "failed"
+#   deleted: 实际删除的用户数；error: 失败原因原文
+_PURGE_LEDGER: dict[str, object] = {"phase": None, "deleted": None, "error": None}
+
+
+def _purge_test_users() -> None:
+    """会话末清理测试用户。
+
+    ★#29-4 T-6★ 原实现两层**裸吞异常**（`except: return` / `except: pass`），失败
+    零日志零账目 —— 于是"清理成功"、"没连上库"、"DELETE 被权限拒绝"三种情形在输出上
+    完全不可分（血规 10④：空返回/缺席必须机读可辨）。清理静默失败的后果是垃圾用户
+    在真库里持续累积。
+    ★同时这也是纪律「绝不在 live E2E 时跑全量回归」的机制来源★：本函数连的是 `.env`
+    里的**真库**，按 `test_%`/`other_%` 前缀 DELETE。注释写在这里，因为读到这段代码的人
+    正是需要知道这件事的人。
+    """
+    logger = logging.getLogger("swarm.test")
+    _PURGE_LEDGER.update({"phase": None, "deleted": None, "error": None})
+    try:
+        import psycopg
         from swarm.config.settings import DatabaseConfig
         conn_str = DatabaseConfig().postgres_uri
-    except Exception:
-        return  # 无 PG（CI 无库等）直接跳过
+    except Exception as exc:  # noqa: BLE001
+        # 无 psycopg / 无配置：合法跳过（不是失败），但必须留痕+记账
+        _PURGE_LEDGER.update({"phase": "skipped", "error": f"{type(exc).__name__}: {exc}"})
+        logger.info("[PURGE] 跳过测试用户清理（无 PG 依赖或无配置）: %s", exc)
+        return
 
     where = " OR ".join("username LIKE %s ESCAPE '\\'" for _ in _TEST_USER_PATTERNS)
     try:
@@ -253,12 +510,30 @@ def _purge_test_users() -> None:
                     cur.execute("DELETE FROM swarm_project_members WHERE user_id = ANY(%s)", (ids,))
                     cur.execute("DELETE FROM swarm_users WHERE id = ANY(%s)", (ids,))
             conn.commit()
-    except Exception:
-        # 清理失败不应让测试套件报错；下次 session 末会再扫
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # 清理失败不让测试套件报错（会话已结束，报错只会掩盖真实结果），但**绝不静默**：
+        # WARNING + 机读账，否则"垃圾用户持续累积"这件事永远没人知道。
+        _PURGE_LEDGER.update({"phase": "failed", "deleted": 0,
+                              "error": f"{type(exc).__name__}: {exc}"})
+        logger.warning(
+            "[PURGE] 测试用户清理失败（垃圾用户将累积到下次会话末重扫）: %s: %s",
+            type(exc).__name__, exc)
+        return
+    _PURGE_LEDGER.update({"phase": "done", "deleted": len(ids)})
+    if ids:
+        logger.info("[PURGE] 已清理 %d 个测试用户", len(ids))
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _cleanup_test_users_after_session():
     yield
     _purge_test_users()
+
+
+@pytest.fixture
+def purge_probe():
+    """回 `(_purge_test_users, _PURGE_LEDGER)`，供测试驱动清理并读机读账。
+
+    ★这个 fixture 就是 T-6 那本账的消费者★——账目没有消费者等于没造（血规 10④）。
+    """
+    return _purge_test_users, _PURGE_LEDGER

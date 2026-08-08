@@ -146,14 +146,28 @@ def test_t1_no_project_path_noop():
     assert renormalize_cross_module_creates(fp, None) == {}
 
 
-_CASSETTE = Path(__file__).resolve().parent.parent / "cassettes" / "251e05f3-7460-4578-850c-63f445766eb1.json"
+_CASSETTE = (Path(__file__).resolve().parent / "fixtures" / "plan_cassettes"
+             / "round67b_cross_module_create.json")
 
 
-@pytest.mark.skipif(not _CASSETTE.exists(), reason="round67b cassette 不在本机")
 def test_t1_round67b_real_plan_heals(tmp_path):
-    """真 plan 回放：round67b 死因 file_plan 经重规范化后 ruoyi-system 单根、工具类归 common。"""
-    d = json.loads(_CASSETTE.read_text())
+    """真 plan 回放：round67b 死因 file_plan 经重规范化后 ruoyi-system 单根、工具类归 common。
+
+    ★#29-4 T-5★ 夹具改为**入库**的 `test/fixtures/plan_cassettes/`，并把
+    `@skipif(not _CASSETTE.exists())` 换成硬断言 —— 原状态在 CI 上永远 skip
+    （`cassettes/` 整个 gitignore），这条守卫等于不存在。1.54 MB → 40 KiB，
+    判据逐字不变；区分力已突变实证（重规范化改 no-op ⇒ 最小夹具同样变红）。
+    """
+    assert _CASSETTE.exists(), (
+        f"入库夹具缺失: {_CASSETTE}（tracked 文件，不存在=仓库损坏，绝不 skip 放过）")
+    d = json.loads(_CASSETTE.read_text(encoding="utf-8"))
     fp = (d.get("state") or d).get("file_plan") or []
+    # 前提自证：治前必须真有"ruoyi-system 名下的 ruoyi-common/ create"，否则下面
+    # 的"治后没有了"是空转（实测夹具里有 2 条）
+    assert [e for e in fp if isinstance(e, dict) and e.get("module") == "ruoyi-system"
+            and str(e.get("path", "")).startswith("ruoyi-common/")
+            and str(e.get("action", "")).lower() == "create"], \
+        "夹具前提漂移：治前已无跨模块 create ⇒ 本测试空转"
     proj = _mk_baseline(
         tmp_path, mods=("ruoyi-common", "ruoyi-system", "ruoyi-admin",
                         "ruoyi-framework", "ruoyi-quartz", "ruoyi-generator"))
