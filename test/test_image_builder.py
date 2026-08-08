@@ -625,7 +625,7 @@ def test_harness_maven_command_overridden_on_gradle_project(tmp_path, monkeypatc
     # 先证前提：harness 的 mvn 命令对本工程确实不适用（否则本条测的是别的命题）
     assert lp._build_cmd_applicable("mvn -q -DskipTests compile", str(tmp_path)) is False
     assert lp._derive_full_build_command(
-        str(tmp_path), ["src/main/java/A.java"], None) == "./gradlew -q classes 2>/dev/null || gradle -q classes"
+        str(tmp_path), ["src/main/java/A.java"], None) == "./gradlew -q classes"
 
     seen: list[str] = []
     monkeypatch.setattr(lp, "_run_l1_command",
@@ -645,7 +645,7 @@ def test_harness_maven_command_overridden_on_gradle_project(tmp_path, monkeypatc
                  harness=TaskHarness(language="java", build_command="mvn -q -DskipTests compile"))
     _ok, details = lp.run_l1_pipeline(str(tmp_path), st, diff, timeout=30)
 
-    assert details.get("build_command") == "./gradlew -q classes 2>/dev/null || gradle -q classes", \
+    assert details.get("build_command") == "./gradlew -q classes", \
         f"gradle 工程仍在跑 harness 的 mvn 命令（或闸被跳过）: {details.get('build_command')}"
     assert details.get("build_command_overridden"), "改派没留痕（闸跑的是哪条命令无从追溯）"
     assert any("gradlew" in c for c in seen), f"实际执行的命令里没有 gradlew: {seen}"

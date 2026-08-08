@@ -3131,6 +3131,43 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
     return False
 
 
+def _gradlew_executable(project_path: str) -> bool:
+    """gradlew 存在【且可执行】（沙箱优先）——#29-5 W-11 双复核汇合项。
+
+    入口选定只看存在性时，上传/同步丢执行位的工程会拿 `./gradlew` 入口 →
+    126 `Permission denied` → `_is_infra_failure` 判 False（marker 表只认 not found
+    形态）⇒ 权限/环境问题被翻转成代码能力失败进 repair 循环空烧（repair 修不了
+    执行位）。不可执行 ⇒ 回退 `gradle` 入口（单入口，绝不回 `||` 双跑）+ 一次
+    WARNING（降级必须可观测）。探测本身异常 → 保守 False（选 gradle 入口）。
+    """
+    ctx = _sandbox_ctx()
+    if ctx is not None:
+        sandbox, manager, remote = ctx
+        try:
+            cr = manager.run_command(
+                sandbox,
+                f"test -x {shlex.quote(remote.rstrip('/') + '/gradlew')}",
+                timeout=10,
+            )
+            ok = bool(getattr(cr, "success", False))
+            if not ok and _manifest_present(("gradlew",), project_path):
+                logger.warning(
+                    "[L1] gradlew 存在但不可执行（沙箱 test -x 失败）→ 回退 gradle 入口；"
+                    "执行位丢失属环境/同步问题，repair 修不了它")
+            return ok
+        except Exception as _probe_exc:  # noqa: BLE001
+            logger.warning(
+                "[L1] gradlew 可执行性沙箱探测异常（按本地探测兜底）: %s", _probe_exc)
+    import os
+    local = os.path.join(project_path, "gradlew")
+    ok = os.path.isfile(local) and os.access(local, os.X_OK)
+    if not ok and os.path.isfile(local):
+        logger.warning(
+            "[L1] gradlew 存在但不可执行（本地 os.access X_OK=False）→ 回退 gradle 入口；"
+            "执行位丢失属环境/同步问题，repair 修不了它")
+    return ok
+
+
 # ── 基础设施/工具瞬时错误识别（A-P1-09）──
 # Go/Rust/Java lint 旧实现"非0退出 + 任意 stderr 即 has_error"，把【无网拉依赖、工具缺失、
 # 文件锁、磁盘满、系统资源】等瞬时基础设施/工具故障误判成"代码能力失败"→ 触发错误降级
@@ -3411,18 +3448,32 @@ def _derive_full_build_command(
                                  and has("build.gradle", "build.gradle.kts")):
             # #37：`classes` 编译主源集全部 JVM 语言(Kotlin/Scala/Java)——旧 compileJava 对
             # .kt/.scala 编译零源→假过，或任务不存在→冤杀。classes 由任一 JVM 语言插件创建。
-            _drv = _build_driver_for("gradle")
-            _cmd = _drv.build_cmd if _drv and _drv.build_cmd else (
-                "./gradlew -q classes" if has("gradlew") else "gradle -q classes")
+            # ★#29-5 W-11★ L1 派生闸绝不用 spec 的 `||` 双跑串做事后正则改写——
+            # 旧实现 `re.sub(r"^(./gradlew|gradle)(\s+)", ...)` 的 ^ 锚定只命中第一
+            # 分支：gradlew 不可用走回退分支时 -p 收窄整块失效（修复没真到得了生产）；
+            # 且 2>/dev/null 吞真编译错 + 双跑尾追加 `gradle: not found` ⇒
+            # _is_infra_failure 把真代码错翻转成 infra 故障 ⇒ BLOCKED transient 空转。
+            # 改由 gradle_build_cmd 按【存在性选定的单入口】构造（spec 单一事实源），
+            # -p 注在选定入口之后，命令里只有一个入口必然被执行。
+            from swarm.stacks.spec import gradle_build_cmd as _gradle_build_cmd
             # ★W-4★ Gradle 子任务按改动模块收窄：子目录 build.gradle 时用 `-p <dir>`，
             # 避免整项目 classes 把无关模块错误归到本子任务。
             _d = _manifest_dir_for(
                 mods, ("build.gradle", "build.gradle.kts",
                        "settings.gradle", "settings.gradle.kts"), project_path)
-            if _d and _SAFE_REL_DIR_RE.match(_d):
-                _cmd = re.sub(r"^(./gradlew|gradle)(\s+)",
-                              rf"\1 -p {shlex.quote(_d)}\2", _cmd)
-            return _cmd
+            _narrow = ""
+            if _d:
+                if _SAFE_REL_DIR_RE.match(_d):
+                    _narrow = _d
+                else:
+                    # ★#29-5 W-11 复核★ 收窄被安全闸丢弃必须可观测——静默置空会让
+                    # 整项目 classes 把无关模块错误归到本子任务（W-4 要防的旧危害复活）。
+                    logger.warning(
+                        "[L1] Gradle 子模块目录 %r 不满足 _SAFE_REL_DIR_RE → 本轮丢弃 "
+                        "-p 收窄按整项目编译（无关模块错误可能归入本子任务）", _d)
+            # 入口按【存在且可执行】选定（双复核汇合项：无执行位 ⇒ 126 permission
+            # denied ⇒ _is_infra_failure 判 False ⇒ 权限问题被当代码错修空烧 repair）。
+            return _gradle_build_cmd(_narrow, use_wrapper=_gradlew_executable(project_path))
         if build == "maven" or has("pom.xml"):
             # ★BRAIN-001/W-3★ 命令字面量从 STACK_SPEC 取；`_scope_maven_command` 负责按
             # modified 收窄到 -pl <module> -am。

@@ -33,6 +33,10 @@ def _tree(root: Path, files: dict[str, str]) -> Path:
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body)
+        # #29-5 W-11：wrapper 入口按【存在且可执行】选定（真 os.access）——
+        # 夹具必须给执行位，否则测的是「无执行位回退」而非本命题。
+        if rel == "gradlew":
+            p.chmod(0o755)
     return root
 
 
@@ -414,7 +418,7 @@ _XH1_CASES = [
      ["src/main/java/A.java"], "mvn -q -DskipTests compile"),
     ("regress-gradle", {"build.gradle": "plugins{id 'java'}", "gradlew": "#!/bin/sh",
                         "src/main/java/A.java": "class A{}"},
-     ["src/main/java/A.java"], "./gradlew -q classes 2>/dev/null || gradle -q classes"),
+     ["src/main/java/A.java"], "./gradlew -q classes"),
     ("regress-rust", {"Cargo.toml": "[package]", "src/main.rs": "fn main(){}"},
      ["src/main.rs"], "cargo build -q"),
 ]

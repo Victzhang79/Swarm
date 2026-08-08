@@ -205,6 +205,27 @@ class StackSpec:
 # 事实表（新增一栈 = 在此加一条，调用方零改动）
 # ══════════════════════════════════════════════════════════════════
 
+def gradle_build_cmd(project_dir: str = "", use_wrapper: bool = True) -> str:
+    """#29-5 W-11：L1 派生闸用的【单入口】gradle 全量构建命令构造函数。
+
+    两条血泪约束（29 号文 W-11 实测）：
+    - 绝不 `||` 双跑：gradlew 真编译错（rc≠0）会触发回退分支再跑 gradle，机器无
+      gradle 时输出尾部追加 `sh: 1: gradle: not found` ⇒ `_is_infra_failure` 把
+      【真代码错】翻转成 infra 故障 ⇒ BLOCKED 走 transient 退避、repair 循环拿
+      不到错误行零新增即 break ⇒ 空转到配额耗尽；
+    - 绝不 `2>/dev/null`：stderr 是 L1 拿到的唯一编译错误证据源，吞掉=闸全盲。
+    入口由调用方按 gradlew 存在性+可执行位（`_gradlew_executable`，沙箱优先）选定；
+    project_dir 非空时按 W-4 收窄到子模块——-p 注在【选定入口】之后，命令里只有一个
+    入口，不存在「正则只命中 `||` 第一分支」的旧缺陷。
+    ★复核 LOW★ project_dir 传【裸】相对目录，函数内部 shlex.quote——「调用方已
+    quote」的约定太脆弱（未来调用方传裸路径会产 `./gradlew -p my svc` 非法命令）。
+    """
+    import shlex as _shlex
+    entry = "./gradlew" if use_wrapper else "gradle"
+    p = f" -p {_shlex.quote(project_dir)}" if project_dir else ""
+    return f"{entry}{p} -q classes"
+
+
 STACK_SPEC: dict[str, StackSpec] = {
     "maven": StackSpec(
         key="maven", lang="java",
@@ -242,7 +263,11 @@ STACK_SPEC: dict[str, StackSpec] = {
         source_exclude_dirs=("build",),
         layout_segments=("src", "main", "java", "kotlin", "scala",
                          "resources", "test", "tests", "webapp"),
-        whole_project_build_cmd="./gradlew -q classes 2>/dev/null || gradle -q classes",
+        # ★#29-5 W-11★ 去掉 2>/dev/null（stderr 是 L1 唯一编译错误证据源，吞掉=
+        # 闸全盲+输出只剩 not found ⇒ _is_infra_failure 翻转真代码错为 infra 故障）。
+        # `|| gradle` 仅为 L2（integration_review 本地整跑）无 wrapper 工程留兜底；
+        # L1 派生闸绝不用这串双跑形态——走 gradle_build_cmd() 构造单入口命令。
+        whole_project_build_cmd="./gradlew -q classes || gradle -q classes",
         test_cmd="",
         runtime_start_cmd="java -jar build/libs/*.jar",
         runtime_prepare_cmd="gradle bootJar -x test -q",

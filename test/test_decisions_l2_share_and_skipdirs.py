@@ -39,9 +39,9 @@ def _tree(root: Path, files: dict[str, str]) -> Path:
 _L2_EQUIV = [
     ("maven", {"pom.xml": "<project/>"}, "mvn -q -DskipTests compile"),
     ("gradle", {"settings.gradle": "x"},
-     "./gradlew -q classes 2>/dev/null || gradle -q classes"),
+     "./gradlew -q classes || gradle -q classes"),
     ("gradle-kts", {"build.gradle.kts": "x"},
-     "./gradlew -q classes 2>/dev/null || gradle -q classes"),
+     "./gradlew -q classes || gradle -q classes"),
     ("go.mod", {"go.mod": "module x"}, "go build ./..."),
     ("go.work", {"go.work": "use ./a"}, "go build ./..."),
     ("cargo", {"Cargo.toml": "[package]"}, "cargo build -q"),
