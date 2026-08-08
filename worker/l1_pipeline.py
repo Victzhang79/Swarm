@@ -3736,11 +3736,6 @@ def _scope_violations(
     diff: str, scope: FileScope, extra_allowed: set[str] | None = None
 ) -> list[str]:
     modified = files_from_unified_diff(diff)
-    # 可写权限 = writable + create_files + delete_files（FileScope 契约，见 is_writable）。
-    # bug 修复(task 9da731ab)：原仅检查 writable，把【新建文件】(create_files)误判越权 →
-    # tech_design file_plan 含新建文件的任务必然 L1 失败 → replan 死循环。create_files 是合法可写。
-    allowed = set(scope.writable or []) | set(getattr(scope, "create_files", []) or []) \
-        | set(getattr(scope, "delete_files", []) or [])
     # round18 P0-B 治本：确定性修复机制(module-registration 自愈 / version-repair)合法触达的
     # scope 外文件(典型：父/根 pom)由 executor._repaired_extra_paths 透传进来。它们【非 worker
     # 越权写命令】——真机制见 test_l1_scope_repaired_paths_round18：VERIFYING 时 scope 复核先于
@@ -3748,14 +3743,23 @@ def _scope_violations(
     # 纳入 diff(4 文件) → 若不排除，Phase4 scope 复核见 pom 越 scope → 整份判死误杀有效产出。
     # 故 scope 只按 worker 实际写命令判定，排除确定性修复触达的路径（fail-closed：worker 自己
     # 越权的 scope 外文件不在 repaired 集合，仍被抓）。
-    if extra_allowed:
-        allowed |= {p for p in extra_allowed if p}
-    if not allowed:
-        return []
+    extra = {p for p in (extra_allowed or ()) if p}
     violations = []
     for fp in modified:
-        if not any(_scope_match(fp, w) for w in allowed):
-            violations.append(fp)
+        # ★#29-5 W-9★ 可写判定复用单一事实源 FileScope.is_writable（writable+create_files+
+        # delete_files 三列表共同构成写权，见 types.py 契约；create_files 合法可写是
+        # bug 9da731ab 的修复结论，勿回退成只认 writable），绝不自己重算 allowed 集——
+        # 旧实现两处与它【相反】：① 全函数不读 allow_any，greenfield/水平合并
+        # （shared._merge_horizontal_subtasks 把 allow_any 取 any(...)、writable 取并集，
+        # 可产 allow_any=True+非空 writable，生产可达）的子任务新建任何文件都被冤杀；
+        # ② `if not allowed: return []` 把【空写权集】fail-open 成全放行——scope_guard
+        # 对同一 FileScope 是 is_writable=False（fail-closed），而 worker 在沙箱里跑的
+        # shell 命令不过 scope_guard，这道闸是唯一防线，空集必须是「有产出即违规」。
+        if scope.is_writable(fp):
+            continue
+        if any(_scope_match(fp, w) for w in extra):
+            continue
+        violations.append(fp)
     return violations
 
 
@@ -5886,6 +5890,18 @@ def run_l1_pipeline(
     details["l1_1_scope_ok"] = not violations
     details["scope_violations"] = violations
     if violations:
+        # ★#29-5 W-9 复核★ reason/note/WARNING 三件套必须与 sibling 闸（L1.1b/L1.1c）同形——
+        # 缺 reason 时 _failure_signature 的兜底键集取不出任何内容 ⇒ 签名恒空 ⇒
+        # no-progress 早停对重复 scope 违规永不触发，白烧满 fix 轮；且 worker 重试
+        # prompt 经 _l1_failure_digest 的 `[确定性闸门] {reason}: {note}` 出口拿证据。
+        # W-9 把空写权集拧成 fail-closed 后这条判死路径从「不可达」变「可达」，
+        # 三件套缺失随之从无害变有害（修一个洞让另一个洞从无害变可达的同族）。
+        details["reason"] = "scope_violation"
+        details["note"] = (
+            "改动超出 scope 写权（writable/create_files/delete_files，allow_any=False "
+            "时空写权集=任何产出都越权；确定性修复触达的文件应由 extra_writable_paths 透传）: "
+            + ", ".join(violations[:5]))
+        logger.warning("[L1] L1.1 scope 闸判死：%s", details["note"][:300])
         return False, details
 
     # ── L1.1b 包声明↔目录对账（E6①，round38c 主题E）──
