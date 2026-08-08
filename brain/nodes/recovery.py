@@ -342,9 +342,10 @@ def sweep_baseline_anchor_poison(
             dirs[:] = [d for d in dirs if d not in _SWEEP_PRUNE_DIRS]
             for fn in files:
                 rel = os.path.relpath(os.path.join(droot, fn), root).replace(os.sep, "/")
-                # B7：on_disk 版判定——npm workspaces 聚合根按内容纳入扫描。名实边界
-                # （reviewer R1 LOW-1）：锚还原驱动当前仅 pom.xml 消费，npm 面暂无实际
-                # 行为（预留同判据口径）。
+                # B7/#29-5 W-2：on_disk 版判定（单一事实源分类器）——npm workspaces 聚合根
+                # 按内容纳入扫描；根 go.mod/根 package.json 自 W-2 起按「多写者写依赖」
+                # 根档纳入。名实边界（reviewer R1 LOW-1）：锚还原驱动当前仅 pom.xml 消费，
+                # npm/go 面暂无实际行为（预留同判据口径）。
                 if _is_shared_manifest_on_disk(rel, root):
                     candidates.append(rel)
     except OSError as e:

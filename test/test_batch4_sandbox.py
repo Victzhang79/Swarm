@@ -172,20 +172,25 @@ def test_b6_ls_fallback_parses_six_columns():
 
 
 def test_b7_is_shared_manifest_package_json_content_based(tmp_path):
-    """按内容判定：含 workspaces 键的根 package.json → 共享清单；子包 package.json
-    （无 workspaces）→ 不纳入（不扩大锁面）。"""
+    """#29-5 W-2 翻转后：判据=「多写者写依赖」。【根】package.json 一律共享（单包工程
+    依赖区同样被 N 个并行 worker 写，与有无 workspaces 无关、与内容无关）；【嵌套】
+    package.json 维持 B7 原义——仅含 workspaces 键（聚合根）才共享，子包自身清单
+    各子任务独占不纳入（不扩大锁面）。"""
     from swarm.worker.sandbox import _is_shared_manifest, _is_shared_manifest_on_disk
 
     agg = b'{"name": "root", "workspaces": ["packages/*"]}'
     sub = b'{"name": "sub-pkg", "dependencies": {}}'
+    # 根：路径档即 True（含 workspaces / 不含 / content 缺省 / 非法 JSON 全覆盖）
     assert _is_shared_manifest("package.json", agg) is True
-    assert _is_shared_manifest("package.json", sub) is False
+    assert _is_shared_manifest("package.json", sub) is True  # W-2 翻转：单包工程根清单也受保护
+    assert _is_shared_manifest("package.json") is True       # W-2 翻转：纯 rel 调用面根档短路
+    assert _is_shared_manifest("package.json", b"{oops") is True  # 路径档优先，content 不解析
+    # 嵌套：维持 B7 内容判定（含 workspaces → 聚合根共享；否则子包独占）
     assert _is_shared_manifest("packages/a/package.json", sub) is False
-    # 纯 rel 旧调用面（无 content）→ 保守 False，行为不变
-    assert _is_shared_manifest("package.json") is False
-    # 非法 JSON → 保守 False
-    assert _is_shared_manifest("package.json", b"{oops") is False
-    # on_disk 版
+    assert _is_shared_manifest("packages/a/package.json", agg) is True
+    assert _is_shared_manifest("packages/a/package.json") is False  # 纯 rel 保守 False 不变
+    assert _is_shared_manifest("packages/a/package.json", b"{oops") is False  # 嵌套非法 JSON 保守 False
+    # on_disk 版：根短路 True；嵌套读内容判
     (tmp_path / "package.json").write_bytes(agg)
     subdir = tmp_path / "packages" / "a"
     subdir.mkdir(parents=True)

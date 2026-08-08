@@ -133,7 +133,10 @@ SANDBOX_CLEANABLE_HOME_DIRS = (
 # 这些文件被 N 个并行 worker 各加不同 <module>/<dependency>/Project 条目；它们的 pull-back
 # 写盘必须与别的 worker 的"自产出重置→git diff"原子区串行（同一把 per-project flock），否则
 # 会在那段窗口里插入污染对方 diff，导致 +<module> 从 diff 丢失、下游 MERGE 并集也救不回。
-# 与 worker.workspace_manifest / brain.merge_engine._is_aggregate_manifest 覆盖的生态一致。
+# 与 worker.workspace_manifest 三面同源；brain.merge_engine._is_aggregate_manifest 是
+# 【成员列表】语义的两档分类（不含依赖承载面），本集自 #29-5 W-2 起多出「多写者写依赖」
+# 档（根 go.mod/根 package.json，见 `_is_shared_manifest`）——brain 侧 diff 并集面对
+# 这两类仍走冲突路径，登记债（reviewer LOW-3）。
 _SHARED_MANIFEST_BASENAMES = frozenset({
     "pom.xml", "settings.gradle", "settings.gradle.kts",
     "build.gradle", "build.gradle.kts", "cargo.toml", "go.work",
@@ -182,14 +185,29 @@ def query_cubemaster_templates(cfg: Any, *, timeout: float = 5.0) -> list[dict] 
 def _is_shared_manifest(rel_posix: str, content: "bytes | str | None" = None) -> bool:
     """聚合清单（多写者共享态）→ True。其 pull-back 写盘需 flock 守护，非清单文件各子任务独占免锁。
 
-    B7（19号文）：package.json 按【内容】判定——仅含 workspaces 键（npm/pnpm/yarn
-    monorepo 聚合根清单）才算共享清单。workspaces 数组正是"N 个并行 worker 各加一条
-    成员"形态，与 pom <modules> 同死法（last-write-wins 丢成员）；子包自身的
-    package.json 是各子任务独占文件，不纳入（不扩大锁面）。content 缺省（纯 rel
-    旧调用面）→ package.json 保守 False，行为不变。
+    ★#29-5 W-2：判据从「是否列成员（aggregate 语义）」更正为「是否多写者写依赖」★。
+    真正要防的危害是 N 个并行 worker（sibling_dep_repair A2 注入）往同一文件加依赖
+    条目的 last-write-wins（R48c-1 死法）；原判据对 Maven/Gradle/Cargo 靠 basename
+    巧合重合，对 Go 与单包 npm 不重合——根 go.mod（依赖承载清单）与无 workspaces 的
+    根 package.json（单包工程）此前完全不受保护 ⇒ 走裸写分支（不取 flock、不并集）
+    ⇒ 兄弟注入被陈旧副本盲覆盖蒸发。故新增两档【根路径】（`"/" not in rel_posix`）：
+      - 根 go.mod → True（多模块工程的子模块 go.mod 各 worker 独占，不纳入＝不扩锁面）；
+      - 根 package.json → True（无论有无 workspaces——单包工程的依赖区同样多写者）。
+    嵌套 package.json 维持 B7（19号文）原义【按内容】判定：仅含 workspaces 键
+    （npm/pnpm/yarn monorepo 聚合根清单）才算共享清单——workspaces 数组正是"N 个并行
+    worker 各加一条成员"形态，与 pom <modules> 同死法；子包自身的 package.json 是
+    各子任务独占文件，不纳入（不扩大锁面）。
+    content 缺省（纯 rel 旧调用面）：根路径档按路径即 True（依赖承载与内容无关）；
+    嵌套 package.json 保守 False，行为不变。
     """
     base = rel_posix.rsplit("/", 1)[-1].lower()
     if base in _SHARED_MANIFEST_BASENAMES or base.endswith(".sln"):
+        return True
+    if "/" not in rel_posix and base in ("go.mod", "package.json"):
+        # W-2：根依赖承载清单——多写者写依赖面，与内容无关（content 缺省也 True）。
+        # 登记（reviewer LOW-2）：`a/../go.mod` 这类未折叠 rel 形状会绕过根档（含 "/"），
+        # 而 basename 档不受影响——调用面均有 as_posix/lstrip 归一，暂无生产可达路径，
+        # 刻意不做折叠（折叠会改变所有档的既有行为，风险大于收益）。
         return True
     if base == "package.json" and content is not None:
         try:
@@ -203,10 +221,12 @@ def _is_shared_manifest(rel_posix: str, content: "bytes | str | None" = None) ->
 
 
 def _is_shared_manifest_on_disk(rel_posix: str, local_root) -> bool:
-    """磁盘增强版判定：basename 命中即 True；package.json 读本地内容判 workspaces 键。
+    """磁盘增强版判定：basename/根路径档命中即 True；嵌套 package.json 读本地内容判 workspaces 键。
 
     供只有 rel+项目根的调用面（bootstrap 快照/回滚/基线锚扫描）使用——这些面防的是
     同一 last-write-wins 死法，npm 聚合根漏判=同一洞换栈复发。读取失败保守 False。
+    #29-5 W-2：根 go.mod/根 package.json 由纯 rel 版的路径档短路（委托第一行），
+    下面的内容分支只剩【嵌套】package.json 可达。
     """
     if _is_shared_manifest(rel_posix):
         return True

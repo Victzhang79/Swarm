@@ -737,12 +737,17 @@ class TestReusedPruneContract:
             assert after == before, (
                 f"{rel}：A2 注入改变了成员集 ⇒ 剪枝候选非空 ⇒ 复用剪枝不安全\n{after_text}")
 
-    def test_go_mod_not_routed_through_merge_today(self):
-        """当前事实钉子：go.mod 不是共享清单 ⇒ 不进 merge_shared_manifest（走裸写）。
-        #29-5 W-2 翻转分类时本测试会红——那正是提醒：分类档位与 require 并集臂必须
-        同批落地（血规 10①：先数调用点，别留死代码或半个洞）。"""
-        assert _is_shared_manifest("go.mod") is False
+    def test_go_mod_routed_through_merge_with_union(self):
+        """#29-5 W-2（翻转本钉子，原 `test_go_mod_not_routed_through_merge_today`）：
+        根 go.mod 是依赖承载共享清单 ⇒ pull-back 走 flock+并集，不再裸写；
+        require 并集臂同批落地（分类档位与并集臂是同一个洞的两面，血规 10①）。
+        子模块 go.mod 各 worker 独占 ⇒ 不纳入（不扩锁面）。全形态锁见
+        test_w2_go_mod_shared_manifest.py。"""
+        assert _is_shared_manifest("go.mod") is True
+        assert _is_shared_manifest("services/api/go.mod") is False
         assert _is_shared_manifest("go.work") is True
         local = 'module m\n\nrequire (\n\tgithub.com/a/b v1.0.0\n\tgithub.com/c/d v2.0.0\n)\n'
         inc = 'module m\n\nrequire (\n\tgithub.com/a/b v1.0.0\n)\n'
-        assert merge_shared_manifest(local, inc, "go.mod") == inc
+        merged = merge_shared_manifest(local, inc, "go.mod")
+        assert 'github.com/c/d v2.0.0' in merged  # local 独有 require 并回（原钉子断言 ==inc 盲覆盖）
+        assert 'github.com/a/b v1.0.0' in merged  # incoming 既有条目原样保留

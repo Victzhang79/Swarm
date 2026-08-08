@@ -675,13 +675,17 @@ class _SandboxSyncMixin:
                                 + list(getattr(sc, "writable", None) or []))
                       if _is_shared_manifest_on_disk(
                           str(f).replace("\\", "/").lstrip("/"), local_root)}
-            # B7：package.json 加入根清单扫描（on_disk 版按内容判 workspaces——
-            # 仅聚合根纳入，子包 package.json 不进快照）。
-            for _base in ("pom.xml", "settings.gradle", "settings.gradle.kts",
-                          "build.gradle", "build.gradle.kts", "Cargo.toml", "go.work",
-                          "package.json"):
-                if (local_root / _base).is_file() and _is_shared_manifest_on_disk(_base, local_root):
-                    _cands.add(_base)
+            # ★#29-5 W-2 R1（双复核同根坐实）：根清单枚举从分类器【派生】，
+            # 消灭「分类器+手抄枚举」双清单★——手抄 tuple 曾漏 package.json（B7 补）
+            # 又漏 go.mod（本批），同一缺陷类第二次复发（为漏项造的兜底网不能用
+            # 同一份枚举编）。分类器是单一事实源：它判 True 的根文件就必须进快照，
+            # 否则 H2 回滚 baseline=None 静默 skip（两票独立实跑坐实）。
+            try:
+                for _p in local_root.iterdir():
+                    if _p.is_file() and _is_shared_manifest_on_disk(_p.name, local_root):
+                        _cands.add(_p.name)
+            except OSError:
+                pass  # 根目录不可读 → 只有 scope 候选（旧行为同形降级）
             for _rel in _cands:
                 _lp = local_root / _rel
                 try:
@@ -1167,6 +1171,12 @@ class _SandboxSyncMixin:
                 # HEAD 基线把兄弟注册剥光、pull-back 复制被当"新建"误删兄弟 pom）。
                 baseline = snap.get(rel)
                 if baseline is None:
+                    # ★#29-5 W-2 R1：缺席可辨（hunter F1 实跑坐实）★——快照未覆盖该
+                    # 清单（枚举漏项/读取失败）而静默 skip 时，FAIL 子任务的贡献残留
+                    # 共享树零信号。宁可漏回滚绝不误删的语义不变，但必须留机读痕迹。
+                    logger.warning(
+                        "[H2] 回滚跳过 %s：bootstrap 快照无此清单基线（无法归因）→ "
+                        "worker 贡献可能残留共享树", rel)
                     continue
                 if baseline == "":
                     # bootstrap 时不存在。仅当本子任务是【声明创建者】才删（r49

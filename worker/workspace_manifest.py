@@ -1333,7 +1333,7 @@ def _merge_npm_manifest(local_text: str, incoming_text: str, rel_path: str) -> s
         return _json.dumps(
             inc, ensure_ascii=False, indent=_detect_json_indent(incoming_text)) + "\n"
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
-        logger.warning("[workspace-manifest] B7 npm 合并异常 fail-open: %s", exc)
+        logger.warning("[workspace-manifest] B7 npm 合并异常 fail-open %s: %s", rel_path, exc)
         return incoming_text
 
 
@@ -1444,7 +1444,144 @@ def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str) ->
             rel_path, len(added), ",".join(added))
         return merged
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
-        logger.warning("[workspace-manifest] #29-2 cargo 合并异常 fail-open: %s", exc)
+        logger.warning("[workspace-manifest] #29-2 cargo 合并异常 fail-open %s: %s", rel_path, exc)
+        return incoming_text
+
+
+def _go_excluded_mods(text: str) -> dict[str, set[str]]:
+    """go.mod 的 exclude 声明 {module: {排除版本集}}（单行 + 块内两形态）。
+
+    ★增益层告警专用（#29-5 W-2 R1 reviewer LOW-1）★：不作合并判定依据——与
+    `_parse_go` 是独立最小扫描（它不看 exclude），口径漂移后果=少一条 WARNING，
+    绝不改合并行为。尾随注释等病态形态漏扫同属「少告警」无害方向。
+    ★R2 hunter N2：版本粒度必须保留★——exclude 是按【版本】排除的，
+    `exclude x/y v1` + `require x/y v2` 完全合法；只按 module 告警会冤报「必败」
+    （误报=「缺席可辨」的镜像破产：狼来了 ⇒ 真信号被一起忽略）。
+    """
+    out: dict[str, set[str]] = {}
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if in_block:
+            if line.startswith(")"):
+                in_block = False
+            else:
+                m = re.match(r"([^\s()]+/[^\s()]+)\s+(v[^\s]+)", line)
+                if m:
+                    out.setdefault(m.group(1), set()).add(m.group(2))
+            continue
+        if re.match(r"exclude\s*\(\s*$", line):
+            in_block = True
+            continue
+        m = re.match(r"exclude\s+([^\s()]+/[^\s()]+)\s+(v[^\s]+)", line)
+        if m:
+            out.setdefault(m.group(1), set()).add(m.group(2))
+    return out
+
+
+def _merge_go_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+    """#29-5 W-2 后半：go.mod require 并集——local 独有的 require 并回 incoming。
+
+    分类翻转（根 go.mod 入共享集，sandbox.py `_is_shared_manifest`）后本臂才可达——
+    分类档位与本臂是同一个洞的两面，同批落地（血规 10①：先数调用点，不留死代码）。
+    此前 go.mod 完全不进 `merge_shared_manifest`，pull-back 走裸写分支（不取 flock、
+    不并集）⇒ 并行兄弟的 A2 注入被陈旧副本抹掉（R48c-1 死法在 Go 栈一件治本都没接）。
+
+    ★取证源复用 sibling_dep_repair._parse_go（写者的同一份解析器），不手抄第二份★：
+    它已处理单行/block 两形态、replace/exclude 块不算声明，并把 replace 左侧出现的
+    require 版本置 None（本地模块伴随 replace 的坐标不可移植）。键 = module path；
+    版本冲突保留 incoming（只补缺不改值，与 npm/cargo 同口径）。
+
+    诚实边界：ver=None（replace 伴随）的 local 独有条目**不并**，只计数告警——只注
+    require 不带伴随 replace 拉取必败（写者侧同口径），宁可构建如实再报缺依赖
+    （A2 下轮会重注），不产出必败的 manifest。
+    插入形状与写者 `_inject_go` 完全一致：incoming 有 `require (` block → 插块内
+    （`\\tmod ver\\n`）；无 block → 追加单行 `require mod ver`。`// indirect` 注释
+    不移植（go 工具链 tidy 时自行重算，丢注释不改语义）。
+    后置校验=一条端状态对账（同 cargo 臂，冗余防御不可独立证伪的教训）：重解析
+    merged，摘掉声称并入的 mod 后必须与 `_parse_go(incoming)` 逐键相等——插错位置/
+    改到别处都被这一条覆盖。任一不成立 → fail-open 返回 incoming（诚实不并优于产毒）。
+    """
+    try:
+        from swarm.worker.sibling_dep_repair import _parse_go
+        loc = _parse_go(local_text)
+        if not loc:
+            # ★#29-5 W-2 R1（hunter F2 实跑坐实）：缺席可辨★——`_parse_go` 对合法
+            # 语法有盲区（`require ( // 尾随注释` 的块开括号 `\s*$` 锚尾不认、
+            # 无斜杠 module path 的 `require mymod v1.0.0` 不匹配 `_GO_DEP_LINE_RE`），
+            # 此时 local 的【全部】require 被盲覆盖蒸发（R48c-1 死法）而零信号——
+            # 「local 解析为空」与「local 真没有 require」必须机读可分。
+            # （修 `_parse_go` 认尾随注释=写者侧解析器口径变更，需单独评审，登记债。）
+            # R2 hunter N1：判据必须是【行首 require 语句】而非子串——注释里含
+            # "require" 字样（`// require block intentionally empty`）会冤报。
+            if re.search(r"(?m)^\s*require[\s(]", local_text):
+                logger.warning(
+                    "[workspace-manifest] #29-5 go.mod 依赖并集 %s：local 含 require "
+                    "字样但解析为空（疑似解析盲区：尾随注释块/无斜杠 module path）→ "
+                    "本轮不并，local 独有条目将盲覆盖丢失", rel_path)
+            return incoming_text
+        inc = _parse_go(incoming_text)
+        _inc_excluded = _go_excluded_mods(incoming_text)
+        merged = incoming_text
+        added: list[str] = []
+        skipped_replace = 0
+        for mod in sorted(loc):
+            if mod in inc:
+                continue  # incoming 已有（含版本不同）→ 保留 incoming，只补缺不改值
+            ver = loc[mod]
+            if not ver:
+                # replace 伴随（本地模块）坐标不可移植 → 诚实不并
+                skipped_replace += 1
+                continue
+            if mod in _inc_excluded and ver in _inc_excluded[mod]:
+                # reviewer LOW-1（实跑坐实）：并入的 mod@ver 在 incoming 的 exclude 里
+                # ⇒ require+exclude 同模块同版本=必败 manifest。仍并（加法-only 语义
+                # 不变，让 go build 把矛盾如实报出来），但必须留机读痕迹。
+                # 写者 _inject_go 有同型洞（族问题，登记债）。
+                # R2 hunter N2：判据到【版本】粒度——exclude 按版本排除，
+                # 不同版本（exclude v1 + require v2）合法，绝不冤报。
+                logger.warning(
+                    "[workspace-manifest] #29-5 go.mod 依赖并集 %s：并入的 %s %s 命中 "
+                    "incoming 的 exclude ⇒ require+exclude 同模块同版本必败（如实并入，"
+                    "交构建报错暴露；写者侧同型洞登记债）", rel_path, mod, ver)
+            m = re.search(r"^\s*require\s*\(\s*$", merged, re.M)
+            if m:
+                nl = merged.find("\n", m.end())
+                if nl == -1:
+                    # `require (` 悬在 EOF 未闭合 = 畸形 manifest → fail-open 不碰
+                    # （写者 _inject_go 同形 fail-closed，合并侧 fail-open 回旧行为）
+                    logger.warning(
+                        "[workspace-manifest] #29-5 go.mod 依赖并集 %s：incoming 的 "
+                        "require block 悬在 EOF 未闭合（畸形）→ fail-open 放弃合并", rel_path)
+                    return incoming_text
+                merged = merged[:nl + 1] + f"\t{mod} {ver}\n" + merged[nl + 1:]
+            else:  # 无 block → 追加单行 require（与写者同形状）
+                merged = merged.rstrip("\n") + f"\nrequire {mod} {ver}\n"
+            added.append(mod)
+        if skipped_replace:
+            logger.warning(
+                "[workspace-manifest] #29-5 go.mod 依赖并集 %s：%d 条 replace 伴随"
+                "（本地模块）坐标不可移植 → 诚实不并（构建会如实再报缺依赖，A2 下轮重注）",
+                rel_path, skipped_replace)
+        if not added:
+            return incoming_text
+        # 端状态对账：摘掉声称并入的 mod 后，必须与 incoming 逐键相等。
+        _added = set(added)
+        _stripped = {k: v for k, v in _parse_go(merged).items() if k not in _added}
+        if _stripped != inc:
+            _absent = [x for x in added if x not in _parse_go(merged)]
+            logger.warning(
+                "[workspace-manifest] #29-5 go.mod 依赖并集端状态对账不过 → fail-open "
+                "放弃合并 %s（文本级插入改动了 require 区之外的内容）；声称并入却不在"
+                "结果里的条目: %s", rel_path, _absent or "无")
+            return incoming_text
+        logger.info(
+            "[workspace-manifest] #29-5 go.mod 依赖并集合并 %s：并回 local 独有 %d 条"
+            "（A2 兄弟坐标注入被陈旧副本盲覆盖会蒸发）: %s",
+            rel_path, len(added), ",".join(added))
+        return merged
+    except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
+        logger.warning("[workspace-manifest] #29-5 go.mod 合并异常 fail-open %s: %s", rel_path, exc)
         return incoming_text
 
 
@@ -1453,7 +1590,8 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
     """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。
 
     分栈：Maven pom（依赖+成员）· npm package.json（成员+依赖，`_merge_npm_manifest`）·
-    Cargo.toml（依赖，`_merge_cargo_manifest`）。其它清单类型原样返回 incoming
+    Cargo.toml（依赖，`_merge_cargo_manifest`）· go.mod（require 依赖，
+    `_merge_go_manifest`，#29-5 W-2）。其它清单类型原样返回 incoming
     （保守——gradle 未实证丢失面，盲并有语义风险）。任何异常 fail-open 返回 incoming。
 
     ★#29-2 W-1 后半：cargo/npm 依赖并集是新增的★。原注释写"gradle/cargo 未实证丢失面"
@@ -1462,10 +1600,11 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
     A2 依赖注入被陈旧副本抹掉。npm 侧当时只并 workspaces 成员、不并依赖，同一半个洞。
     未纳入 gradle：其依赖区是 Groovy/Kotlin DSL（可含变量/函数调用），文本级并集无法
     保证语义——维持保守，登记在 #29-5 W-2 一并处置。
-    未纳入 go.mod：它**根本不进本函数**（`_is_shared_manifest('go.mod')` 为 False，走
-    sandbox.py 的裸写分支）。给它加臂在分类翻转前是死代码（血规 10①：先数调用点）——
-    分类档位与 require 并集臂是同一个洞的两面，两者必须**同批落地**，已登记
-    #29-5 W-2；本批只治"已经路由进来"的两种清单。
+    ★#29-5 W-2：go.mod 臂已随分类翻转同批落地★（此前它根本不进本函数——
+    `_is_shared_manifest('go.mod')` 为 False 走裸写分支；根 go.mod 入共享集后
+    pull-back 路由到本函数，require 并集臂若缺席则只剩「锁+盲覆盖」仍丢修复）。
+    嵌套 go.mod（`services/x/go.mod`）不在共享集（各 worker 独占），不会路由进来；
+    本臂是纯文本合并，不看路径。
     复核 B：依赖键=(g,a,区域) 分账——dm 条目绝不挡 classpath 修复（RuoYi 根 pom
     是巨型 dm，跨区混同=原 live 缺陷的残留半径）。复核 C：profiles/build 插件
     依赖整体不参与（不收集/不插入其区）。复核 4：modules 并回带存在性校验
@@ -1482,6 +1621,10 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
             if local_text == incoming_text:
                 return incoming_text
             return _merge_cargo_manifest(local_text, incoming_text, rel_path)
+        if name == "go.mod":
+            if local_text == incoming_text:
+                return incoming_text
+            return _merge_go_manifest(local_text, incoming_text, rel_path)
         if name != "pom.xml" or local_text == incoming_text:
             return incoming_text
         merged = incoming_text
@@ -1539,7 +1682,7 @@ def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
                 rel_path, len(add_plain), len(add_dm), len(add_mods))
         return merged
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
-        logger.warning("[workspace-manifest] R48c-1 合并异常 fail-open: %s", exc)
+        logger.warning("[workspace-manifest] R48c-1 合并异常 fail-open %s: %s", rel_path, exc)
         return incoming_text
 
 
@@ -1600,9 +1743,16 @@ def strip_worker_manifest_contribs(
         if _name.lower() != "pom.xml":
             # ★缺席可辨（R2 hunter）★ 非 pom/npm/.sln 的共享清单 H2 剥离未实现——
             # 至少留 WARNING（settings.gradle/Cargo.toml/go.work 的残留形态登记）。
+            # ★#29-5 W-2 R1 文案纠假（hunter F1③：假兜底比没兜底更糟）★：
+            # 「交 reconcile/prune 对账自愈」只对【成员类】条目成立（pom modules/
+            # npm workspaces/go.work use/.sln Project 有 prune 臂）；【依赖类】条目
+            # （go.mod require/build.gradle implementation/Cargo.toml [dependencies]）
+            # 没有任何摘除臂 ⇒ 残留是【永久】的，绝无自愈——登记债。
             logger.warning(
                 "[workspace-manifest] H2 回滚：%s 的 worker 贡献剥离未实现（仅 "
-                "pom/package.json/.sln 有臂）→ 可能残留，交 reconcile/prune 对账自愈",
+                "pom/package.json/.sln 有臂）→ 依赖类条目（require/implementation/"
+                "[dependencies]）残留是永久的（无摘除臂，登记债）；仅成员类条目可交 "
+                "reconcile/prune 对账自愈",
                 rel_path)
             return local_text, 0
         head_deps = {(ga, r) for ga, _, r in _pom_dep_blocks(head_text)}
