@@ -6,6 +6,7 @@ Worker 启用沙箱时，读写均在沙箱 /workspace 内进行（sandbox-first
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -14,6 +15,8 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from swarm.tools.scope_guard import require_readable, require_writable
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -31,6 +34,11 @@ def _resolve(path: str) -> Path:
 
 class WorkspaceEscapeError(PermissionError):
     """解析后的路径越出 workspace 边界（P0-SEC-07 防穿越复校）。"""
+
+
+class PathResolutionError(ValueError):
+    """#29-5 W-10：绝对路径既不在本地 workspace 根下、也不带沙箱远端根前缀——
+    无法定位，调用方必须显式拒绝（绝不回退 basename 静默写错落点）。"""
 
 
 def _resolve_write(path: str) -> Path:
@@ -69,16 +77,76 @@ def _resolve_read(path: str) -> Path:
     return resolved
 
 
+def _remote_workdir() -> str:
+    """沙箱远端工作目录（agent 在沙箱里看到的一切路径都带此前缀）。
+
+    读配置失败回退默认值——★#29-5 W-10 复核★ 回退必须可观测：静默回退会让自定义
+    远端根部署里的合法路径被误判「无法定位」而拒绝，运维看到的只有假阴性拒绝、
+    没有「其实是配置读取失败」的信号（降级路径至少一次 WARNING，每进程只响一次）。
+    """
+    try:
+        from swarm.config.settings import get_config
+        return get_config().sandbox.sandbox_remote_workdir
+    except Exception as _exc:  # noqa: BLE001
+        global _REMOTE_WORKDIR_WARNED
+        if not _REMOTE_WORKDIR_WARNED:
+            _REMOTE_WORKDIR_WARNED = True
+            logger.warning(
+                "[file_tools] 读取 sandbox_remote_workdir 失败（%s）→ 回退默认值 /workspace"
+                "；自定义远端根部署里带远端前缀的绝对路径会被判「无法定位」", _exc)
+        return "/workspace"
+
+
+_REMOTE_WORKDIR_WARNED = False
+
+
+def _path_refusal_msg(path: str) -> str:
+    """路径无法定位的拒绝回执（四处消费点单一事实源）。
+
+    ★#29-5 W-10 复核★ 带稳定机读前缀 [PATH_RESOLUTION_ERROR]——上游 monitor/失败
+    分类靠子串匹配自然语言太脆弱，机读键让「同一类拒绝」可被识别与统计（硬检查④）。
+    """
+    return (
+        f"[PATH_RESOLUTION_ERROR] ❌ 路径无法定位：{path} 既不在本地 workspace 根下、"
+        f"也不带沙箱远端根（{_remote_workdir()}）前缀。请改用 workspace 相对路径"
+        f"（如 src/a.py）重试——绝不按裸文件名猜测落点。"
+    )
+
+
 def _local_rel(path: str) -> str:
-    """将路径转为 workspace 相对 posix 路径。"""
+    """将路径转为 workspace 相对 posix 路径。
+
+    ★#29-5 W-10★ 三条臂：相对路径原样；本地 workspace 根下的绝对路径剥本地根；
+    带【沙箱远端根】前缀的绝对路径剥远端根——agent 在沙箱里看到的一切路径（编译
+    报错、find 输出、`cd /workspace &&`）都带这个前缀，LLM 复制粘贴是常态。旧实现
+    对认不出的绝对路径静默回退 `p.name`：scope 闸因 `_path_scope_match` 规则4
+    （多段 scope 容忍根前缀、尾段命中）放行 `/workspace/src/A.java`，随后落点被
+    降级成 `/workspace/A.java` 且回执「✅ 成功」——目标文件一字节未改、pull-back
+    拉不到变更、diff 缺文件。无法定位 ⇒ WARNING + PathResolutionError（fail-closed），
+    由 write_file/patch_file 显式拒绝，绝不回退 basename。
+    """
     p = Path(path)
+    if not p.is_absolute():
+        return p.as_posix()
     root = _resolve(".").resolve()
-    if p.is_absolute():
+    try:
+        return p.resolve().relative_to(root).as_posix()
+    except ValueError:
+        pass
+    # normpath 先折掉 `..`（`/workspace/../etc/x` 剥前缀后会逃逸远端根）
+    norm = os.path.normpath(str(p))
+    # ★复核★ rstrip("/") 会把根目录 "/" 削成空串 ⇒ `if remote:` 为假 ⇒ 剥离臂静默
+    # 跳过（SWARM_SANDBOX_REMOTE_WORKDIR=/ 的部署里 /src/A.java 被冤拒）——空串归一为 "/"。
+    remote = _remote_workdir().rstrip("/") or "/"
+    if remote:
         try:
-            return p.resolve().relative_to(root).as_posix()
+            return Path(norm).relative_to(Path(remote)).as_posix()
         except ValueError:
-            return p.name
-    return p.as_posix()
+            pass
+    logger.warning(
+        "[file_tools] 绝对路径无法定位（不在本地根 %s 下，也不带沙箱远端根 %s 前缀）：%s"
+        " —— 拒绝静默降级为 basename（#29-5 W-10）", root, remote, path)
+    raise PathResolutionError(path)
 
 
 def _sandbox_active() -> bool:
@@ -256,6 +324,10 @@ def _handle_read_miss(
                 f"（你给的是 `{path}`，下次请直接用完整路径）：\n"
             )
             return head + (numbered or "(空文件)")
+        except PathResolutionError:
+            # ★#29-5 W-10 复核★ 路径无法定位绝不按「读不动」静默降级成通用
+            # 「文件不存在」提示——两类故障的自我纠正方向相反，广义 except 会吞掉。
+            return _path_refusal_msg(target)
         except Exception:
             pass  # 定位到却读不动 → 落到下方通用处理
 
@@ -295,7 +367,10 @@ def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
     if err:
         return err
 
-    remote = _resolve_sandbox(path)
+    try:
+        remote = _resolve_sandbox(path)
+    except PathResolutionError:
+        return _path_refusal_msg(path)
     if remote is not None:
         try:
             text = _read_sandbox_text(remote)
@@ -337,7 +412,12 @@ def write_file(path: str, content: str) -> str:
     if err:
         return err
 
-    remote = _resolve_sandbox(path)
+    try:
+        remote = _resolve_sandbox(path)
+    except PathResolutionError:
+        # ★#29-5 W-10★ 旧行为：_local_rel 静默回退 basename → 写到 /workspace/<name>
+        # 错位置且回执「✅ 成功」，目标文件一字节未改。现在显式拒绝（fail-closed）。
+        return _path_refusal_msg(path)
     if remote is not None:
         try:
             _write_sandbox_text(remote, content)
@@ -376,7 +456,11 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
     if err:
         return err
 
-    remote = _resolve_sandbox(path)
+    try:
+        remote = _resolve_sandbox(path)
+    except PathResolutionError:
+        # ★#29-5 W-10★ 与 write_file 同闸：无法定位的绝对路径显式拒绝，不猜落点。
+        return _path_refusal_msg(path)
     if remote is not None:
         try:
             text = _read_sandbox_text(remote)
@@ -515,7 +599,11 @@ def _search_in_sandbox(
     sandbox, manager = get_sandbox_context()
     mgr = manager or get_sandbox_manager()
     remote_root = _resolve_sandbox(".") or "/workspace"
-    start_remote = _resolve_sandbox(path) or remote_root
+    try:
+        start_remote = _resolve_sandbox(path) or remote_root
+    except PathResolutionError:
+        # ★#29-5 W-10★ 与写侧同闸：无法定位的绝对路径显式拒绝，不猜搜索起点。
+        return _path_refusal_msg(path)
 
     results: list[str] = []
 
