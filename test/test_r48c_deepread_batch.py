@@ -404,6 +404,52 @@ class TestR50bBatch:
         _SandboxSyncMixin._rollback_failed_manifest_footprint(_Host(), {})
         assert "injected-dep" not in (tmp_path / "pom.xml").read_text("utf-8")
 
+    def test_r50_2_transient_class_skips_rollback(self, tmp_path):
+        """★#29-5 W-4 R1（reviewer F1 实跑坐实：摘掉该支路 74 条相关测试全绿=零覆盖）★
+        R50-2 闸 transient 支路真身直调锁——failure_class=="transient" 时回滚必须
+        整体跳过（沙箱超时/网络抖动不是能力失败，依赖注入是合法修复，摘了重试还得
+        重补）。W-4 之后异常路径也调回滚，这条支路从「正常路径的间接保险」升级为
+        承重墙，必须有自己名字的锁。形状照抄上方 blocked 用例（tmp git 仓+毒 pom）。"""
+        import subprocess as sp
+        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+        root_txt = ("<project><dependencies><dependency><groupId>g</groupId>"
+                    "<artifactId>base</artifactId></dependency></dependencies></project>")
+        (tmp_path / "pom.xml").write_text(root_txt, "utf-8")
+        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c",
+                "user.name=t", "commit", "-qm", "base"], check=True)
+        poisoned = root_txt.replace(
+            "</dependencies>",
+            "<dependency><groupId>x</groupId><artifactId>injected-dep</artifactId>"
+            "</dependency></dependencies>")
+        (tmp_path / "pom.xml").write_text(poisoned, "utf-8")
+
+        class _Host:
+            project_path = str(tmp_path)
+            base_ref = None
+            _post_sync_contents = {"pom.xml": poisoned}
+            _manifest_baseline_snapshot = {"pom.xml": root_txt}
+
+            class subtask:
+                class scope:
+                    create_files = []
+                    writable = ["pom.xml"]
+
+            def _log(self, msg):
+                pass
+
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(
+            _Host(), {"failure_class": "transient"})
+        assert "injected-dep" in (tmp_path / "pom.xml").read_text("utf-8"), \
+            "transient 场景绝不回滚（R50-2 闸放行——删掉该支路本条必须红）"
+        # 对照：failure_class 缺失（classify_failure 返 None）= 对未知 fail-closed，
+        # 照常摘（闸只放行明确 transient/blocked，绝不宽放）
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(
+            _Host(), {"failure_class": None})
+        assert "injected-dep" not in (tmp_path / "pom.xml").read_text("utf-8"), \
+            "failure_class 未知必须照常回滚（fail-closed，只放行明确 transient）"
+
     def test_r50_3_repaired_paths_excluded_from_pl(self, tmp_path):
         """repair 触达的外模块清单不得进 -pl（脚手架不被外模块连坐）。"""
         (tmp_path / "pom.xml").write_text(

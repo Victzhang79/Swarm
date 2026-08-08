@@ -440,12 +440,36 @@ class WorkerExecutor(
                 _exc_diff = await asyncio.to_thread(self._get_git_diff) or ""
             except Exception:  # noqa: BLE001 — 取 diff 失败不致命，保留空 diff
                 _exc_diff = ""
+            _exc_details = exception_l1_details(e, failure_class)
+            # ★#29-5 W-4★：异常路径同样要做 H2 清单足迹回滚——异常若发生在 pull-back
+            # 之后（produce 内 StreamDegenerationError 冒泡 / pull-back 写清单后后续步
+            # 抛错），毒清单已落共享树，旧形态直接 return 跳过回滚 ⇒ 被 bootstrap
+            # 「补传上游产物」复制进后续全部沙箱。DR-04-F6（上面注释）已识别「产出
+            # 已写回共享树」并据此修了 diff，同一认知没延伸到回滚=治法只落一半。
+            # 与 :1177-1183 正常路径同形：卸线程（D53）+ 套 try 绝不盖住原始异常；
+            # 函数内 R50-2 闸对 blocked/transient 早返（executor_sync :1128-1132），
+            # TransientInfraError 场景自然放行、不误摘合法修复。_l1_passed_flag 上面
+            # 已置 False。details 与下方 return 同源（同一异常同一台账，两消费者
+            # 同源）。诚实边界（reviewer R1）：L1 已通过 + produce 崩溃归
+            # capability 的场景（StreamDegenerationError 等）不享 R50-2 豁免 ⇒ 合法
+            # 清单贡献会被摘——方向 fail-closed，重试重建，与终局 verdict 自洽。
+            try:
+                await asyncio.to_thread(
+                    self._rollback_failed_manifest_footprint, _exc_details)
+            except Exception as _rb_exc:  # noqa: BLE001 — 回滚失败绝不盖住原始异常
+                self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
+                # ★#29-5 W-4 R1（hunter F1）：信号强度倒挂纠正——W-2 R1 已给更轻的
+                # 「快照缺失 skip」进程级 WARNING，回滚整体失败（毒 dependency 残留
+                # 无对账层兜底，prune 只摘幽灵成员不摘注入条目）却只有任务级 _log。
+                logger.warning(
+                    "[H2] 清单足迹回滚异常（不致命，毒贡献可能残留共享树）: %s",
+                    _rb_exc)
             return self._make_output(
                 diff=_exc_diff,
                 summary=f"执行异常: {e}",
                 confidence=Confidence.LOW,
                 l1_passed=False,
-                l1_details=exception_l1_details(e, failure_class),
+                l1_details=_exc_details,
             )
         finally:
             from swarm.tools.build_tools import (
@@ -1165,6 +1189,10 @@ class WorkerExecutor(
                         getattr(output, "l1_details", None) or {})
                 except Exception as _rb_exc:  # noqa: BLE001 — 回滚失败不改变终局
                     self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
+                    # ★#29-5 W-4 R1：与异常路径同形补进程级信号（倒挂纠正）
+                    logger.warning(
+                        "[H2] 清单足迹回滚异常（不致命，毒贡献可能残留共享树）: %s",
+                        _rb_exc)
 
             return output
 
@@ -1383,6 +1411,10 @@ class WorkerExecutor(
                     getattr(output, "l1_details", None) or {})
             except Exception as _rb_exc:  # noqa: BLE001
                 self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
+                # ★#29-5 W-4 R1：与异常路径同形补进程级信号（倒挂纠正）
+                logger.warning(
+                    "[H2] 清单足迹回滚异常（不致命，毒贡献可能残留共享树）: %s",
+                    _rb_exc)
         self._log(f"trivial 快速路径完成，置信度: {output.confidence.value}")
         return output
 
