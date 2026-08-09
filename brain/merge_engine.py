@@ -315,7 +315,12 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
         # 旧行为 return None 整段静默蒸发（success=True 零日志）——worker 对既有脚本
         # chmod +x 的变更交付时凭空消失。对齐 D06 rename/binary：整段透传保留
         # （fail-closed：最差是 apply 冲突【可见】，远优于静默丢内容）。
-        if any(ln.startswith(("old mode ", "new mode ")) for ln in header_lines):
+        # ★复核 F1 扩同族★：0 字节文件的【新建/删除】段同样无 ---/+++ 对、无 hunk
+        # （只有 new file mode/deleted file mode + index 行）——与 chmod-only 同构，
+        # 一并透传（worker 删空 __init__.py/.gitkeep 不再凭空消失、base 空文件不再
+        # 静默残留；空 __init__.py 的残留有真实的 Python 包语义影响）。
+        if any(ln.startswith(("old mode ", "new mode ", "new file mode ",
+                              "deleted file mode ")) for ln in header_lines):
             fp = git_b or git_a or "unknown"
             return _FilePatch(file_path=fp, header_lines=[], hunks=[], passthrough=raw)
         return None
@@ -809,8 +814,10 @@ def filter_orphan_module_patches(
             # ★#29-8 M-5★ 探测【抛异常】=证据不足，与「确定不存在」（返回 False）必须分路：
             # 剔除是破坏性动作，对它而言 fail-closed=【留】。旧行为异常也落入 orphan_dirs
             # （base 树某目录权限异常 → 既有历史模块被误判孤儿 → 该模块全部补丁被剔，
-            # 诚实 PARTIAL 但【冤】——真产出被丢去 abandoned）。probe 返回 None（不可用）
-            # 时整体让路（上方 docstring），异常同理【留】+ WARNING 可观测。
+            # 诚实 PARTIAL 但【冤】——真产出被丢去 abandoned）。probe 【callable 本身为
+            # None】（项目路径不可得）时整体让路（上方 docstring）；callable 返回 None
+            # 会按 falsy 落入 orphan_dirs（生产 probe `_base_has_module` 返回纯 bool，
+            # 不到此分支）；抛异常同理【留】+ WARNING 可观测。
             logger.warning(
                 "[MERGE] orphan 判定的 base 探测异常（%s: %s）→ 保守【保留】该目录补丁"
                 "（证据不足绝不剔，由 VERIFY_L2/apply 护栏兜真问题）", d, exc)
@@ -1361,6 +1368,12 @@ def merge_diffs(
                                 "owner": _owner,
                                 "unioned": _non_owner,
                             })
+                            # ★复核 F4★ 并集成功=一行没丢，文案必须与事实一致
+                            # （日志是复盘第一现场，写「丢弃」会误导判读）。
+                            logger.warning(
+                                "[MERGE] R57-6 新文件 %s 多写者：owner %s 版为基底"
+                                "**并集**其余 %s 的条目（一行没丢，账记 owner_unions）",
+                                file_path, _owner, _non_owner)
                         else:
                             owner_drops_all.append({
                                 "file": file_path,
@@ -1369,11 +1382,11 @@ def merge_diffs(
                                 "dropped_lines": sum(
                                     len(h.lines) for s in _non_owner for h in by_sid_new[s]),
                             })
-                        logger.warning(
-                            "[MERGE] R57-6 新文件 %s 多写者：取**声明写权的 owner** %s；"
-                            "其余 %s 只是确定性修复碰过（非 owner）→ 丢弃其版本、**不进 rebase**"
-                            "（它们重做多少次还会被修复碰到 → 那正是 rebase 不收敛的根源）",
-                            file_path, _owner, _non_owner)
+                            logger.warning(
+                                "[MERGE] R57-6 新文件 %s 多写者：取**声明写权的 owner** %s；"
+                                "其余 %s 只是确定性修复碰过（非 owner）→ 丢弃其版本、**不进 rebase**"
+                                "（它们重做多少次还会被修复碰到 → 那正是 rebase 不收敛的根源）",
+                                file_path, _owner, _non_owner)
                     else:
                         chosen_sid = min(                          # 无 owner 证据 → 退回拓扑最上游
                             by_sid_new,

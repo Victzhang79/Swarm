@@ -257,6 +257,27 @@ def test_m4_mixed_mode_and_content_preserves_mode_lines():
         "mode 行必须在 --- 对之前（git 扩展头顺序）"
 
 
+def test_m4_empty_file_create_delete_passthrough():
+    """★复核 F1★ 0 字节文件的新建/删除段（无 ---/+++ 对、无 hunk，只有
+    new file mode/deleted file mode + index 行）与 chmod-only 同构——
+    旧行为照旧 return None 整段蒸发：worker 删空 __init__.py/.gitkeep 凭空
+    消失（base 空文件静默残留，空 __init__.py 有真实包语义影响）。"""
+    from swarm.brain.merge_engine import merge_diffs
+
+    empty_create = ("diff --git a/pkg/.gitkeep b/pkg/.gitkeep\n"
+                    "new file mode 100644\n"
+                    "index 0000000..e69de29\n")
+    empty_delete = ("diff --git a/old/__init__.py b/old/__init__.py\n"
+                    "deleted file mode 100644\n"
+                    "index e69de29..0000000\n")
+    r = merge_diffs([("st-1", empty_create), ("st-2", empty_delete)],
+                    base_reader=lambda f: None)
+    assert "new file mode 100644" in r.merged_diff and ".gitkeep" in r.merged_diff, \
+        "空文件新建绝不静默蒸发"
+    assert "deleted file mode 100644" in r.merged_diff and "__init__.py" in r.merged_diff, \
+        "空文件删除绝不静默蒸发"
+
+
 # ─────────────────────────── F3 / #60 ───────────────────────────
 
 def test_f3_invalid_folded_diff_escalates():

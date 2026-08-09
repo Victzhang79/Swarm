@@ -204,8 +204,9 @@ def test_full_replan_handoff_is_valid_disposition():
 
 def test_redecompose_parent_removal_is_valid_disposition():
     """★#29-8 M-8★ redecompose（超时拆小）是合法处置：父 fid 摘出【新 plan】、
-    子块入队——铁律必须认「不在新 plan」这一格，否则父 id 被误判掉账：
-    假 ERROR + 幽灵父 id 强制回队（永不就绪，进度计数恒 +1）+ 假 leak 机读账。"""
+    子块入队——铁律必须认这一格（豁免键=subtask_redecompose_count 机读账本身，
+    复核 F2 收紧后的判据），否则父 id 被误判掉账：假 ERROR + 幽灵父 id 强制回队
+    （永不就绪，进度计数恒 +1）+ 假 leak 机读账。"""
     from swarm.brain.nodes.failure import audit_failure_disposition
     state = {"failed_subtask_ids": ["st-2"], "subtask_results": {},
              "dispatch_remaining": [],
@@ -215,6 +216,7 @@ def test_redecompose_parent_removal_is_valid_disposition():
         "failed_subtask_ids": [],
         "dispatch_remaining": ["st-2-1", "st-2-2"],
         "failure_strategy": "retry",
+        "subtask_redecompose_count": {"st-2": 1},  # 豁免键=机读账（两支 redecompose 出口都带）
         "subtask_results": {},
     }
     audit_failure_disposition(state, result)
@@ -227,7 +229,7 @@ def test_redecompose_parent_removal_is_valid_disposition():
 
 def test_id_still_in_new_plan_without_disposition_is_leak():
     """★#29-8 M-8 反向锁★：新 plan 仍含该 fid 而四格皆空 → 仍是真掉账
-    （排除格只豁免「被摘出 plan」，不放松对「在 plan 但无处置」的铁律）。"""
+    （排除格只豁免「被 redecompose 拆走」，不放松对「在 plan 但无处置」的铁律）。"""
     from swarm.brain.nodes.failure import audit_failure_disposition
     state = {"failed_subtask_ids": ["st-2"], "subtask_results": {},
              "dispatch_remaining": [],
@@ -243,6 +245,27 @@ def test_id_still_in_new_plan_without_disposition_is_leak():
     assert "st-2" in result["dispatch_remaining"], "真掉账必须强制回队"
     assert any(str(d).startswith("failure_disposition_leak")
                for d in (result.get("degraded_reasons") or [])), "真掉账必须出机读账"
+
+
+def test_removed_from_plan_without_redecompose_account_is_leak():
+    """★复核 F2(a) 收紧锁★：fid 被摘出新 plan 但【无 redecompose 机读账】→
+    仍判掉账 fail-loud——未来任何非 redecompose 理由摘 fid 的分支（外科剪枝 bug /
+    renumber 换 id 族）绝不许被静默豁免（这正是本闸的存在意义）。"""
+    from swarm.brain.nodes.failure import audit_failure_disposition
+    state = {"failed_subtask_ids": ["st-2"], "subtask_results": {},
+             "dispatch_remaining": [],
+             "plan": TaskPlan(subtasks=[_st("st-1"), _st("st-2")])}
+    result = {
+        "plan": TaskPlan(subtasks=[_st("st-1")]),  # st-2 被摘走但无 redecompose 账
+        "failed_subtask_ids": [],
+        "dispatch_remaining": [],
+        "failure_strategy": "retry",
+        "subtask_results": {},
+    }
+    audit_failure_disposition(state, result)
+    assert "st-2" in result["dispatch_remaining"], "无机读账的摘除必须 fail-loud 回队"
+    assert any(str(d).startswith("failure_disposition_leak")
+               for d in (result.get("degraded_reasons") or []))
 
 
 def test_audit_crash_fails_loud_with_machine_account():

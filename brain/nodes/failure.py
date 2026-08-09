@@ -2675,25 +2675,21 @@ def audit_failure_disposition(state, result) -> None:
     if "failed_subtask_ids" in result:
         still_failed = set(result.get("failed_subtask_ids") or [])
         # ★#29-8 M-8★ redecompose（超时拆小，主干 B 第一恢复动作）是【合法处置】：
-        # 父 fid 被摘出【新 plan】、子块入队。判据必须认「不在新 plan 的子任务集」
-        # 这一格——否则父 id 四格皆落空被误判掉账：假 ERROR + 幽灵父 id 强制回队
-        # （永不满足 get_dispatch_batch，进度计数恒 +1，靠 #R13-4 熔断兜底）+
+        # 父 fid 被摘出【新 plan】、子块入队。判据必须认这一格——否则父 id 四格皆
+        # 落空被误判掉账：假 ERROR + 幽灵父 id 强制回队（永不满足
+        # get_dispatch_batch，进度计数恒 +1，靠 #R13-4 熔断兜底）+
         # 假 failure_disposition_leak 机读账（常态路径狼来了稀释铁律信誉）。
-        # 只认 result 自带的新 plan（replan/escalate 已在上方交棒早退；state 旧 plan
-        # 仍含父 id，不能拿来做排除判据）。
-        _new_plan_ids: set[str] | None = None
-        _rp = result.get("plan")
-        if _rp is not None:
-            _subs = getattr(_rp, "subtasks", None)
-            if _subs is None and isinstance(_rp, dict):
-                _subs = _rp.get("subtasks")
-            _new_plan_ids = {
-                str(getattr(st, "id", None) or (st.get("id") if isinstance(st, dict) else "") or "")
-                for st in (_subs or [])}
+        # ★豁免键=redecompose 机读账本身（复核 F2 收紧）★：两支 redecompose 出口
+        # （planning_core.py:442/:546）都带 subtask_redecompose_count（键=被拆父 fid，
+        # 父 fid 拆后永不回 plan 故不可能再入失败集，账在=拆过）。判据绝不放宽成
+        # 「不在新 plan 子任务集」——未来任何【非 redecompose】理由摘 fid 的分支
+        # （外科剪枝 bug/renumber 换 id 族）必须被这道 fail-loud 闸逮住，不能静默豁免。
+        _rd_split = {str(k) for k in
+                     (result.get("subtask_redecompose_count") or {})}
         leaked = [f for f in entry
                   if f not in still_failed and f not in queued
                   and f not in abandoned and f not in give_ups
-                  and not (_new_plan_ids is not None and f not in _new_plan_ids)]
+                  and f not in _rd_split]
         if leaked:
             logger.error(
                 "[HANDLE_FAILURE] R65D-T1 处置完备性铁律：入口 %d 个失败、%d 个无处置 %s"
