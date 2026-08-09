@@ -153,6 +153,22 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     project_id = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
 
+    # ★#29-8 M-1★ 项目数软限制接线（此前全机制——env 登记/机读键/WARNING——零生产
+    # 调用=死账，运维设 SWARM_MAX_ACTIVE_PROJECTS 以为有保护实际第 N+1 个项目照进，
+    # PG/Qdrant/沙箱预算被悄悄超订）。超限拒收新项目；PG 不可用（active=-1）时
+    # 不阻断（软限制语义，可用性优先）但 WARNING 留痕。
+    from swarm.infra.redis_client import check_project_limit
+    _pl = await loop.run_in_executor(None, check_project_limit)
+    if _pl.get("warn"):
+        raise HTTPException(
+            status_code=409,
+            detail=str(_pl.get("message") or "活跃项目数已达软限制"),
+        )
+    if int(_pl.get("active", -1)) < 0:
+        _app.logger.warning(
+            "[create_project] 项目数软限制检查不可用 → 放行（软闸 fail-open，留痕）: %s",
+            _pl.get("message"))
+
     # ── 路径解析 + greenfield（从零创建）支持 ──
     # 既有项目：path 必须指向存在的目录。
     # greenfield：path 不存在则自动创建；留空则在 workspace 下按项目名建目录。
