@@ -14,8 +14,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Tests](https://img.shields.io/badge/tests-5200%2B%20passing-brightgreen.svg)](#-how-the-system-itself-is-verified)
-[![Version](https://img.shields.io/badge/version-0.9.69-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Tests](https://img.shields.io/badge/tests-8300%2B%20passing-brightgreen.svg)](#-how-the-system-itself-is-verified)
+[![Version](https://img.shields.io/badge/version-0.9.75-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -307,7 +307,7 @@ flowchart LR
 
 A system that ships code for you must hold its own code to the same standard. This is the part we are most willing to show — **Swarm's engineering methodology is itself part of the product**:
 
-- **4900+ behavioral tests** run in full on a pristine PostgreSQL + Python 3.12 CI; every commit must be green to merge. Tests assert **behavior, not structure** — nothing is welded to an implementation, so refactors don't shatter them; bug fixes start with a red reproduction (test-first), and when semantics deliberately evolve, old tests are explicitly updated by decision with a mechanism annotation, never quietly bent.
+- **8300+ behavioral tests** run in full on a pristine PostgreSQL + Python 3.12 CI; every commit must be green to merge. Tests assert **behavior, not structure** — nothing is welded to an implementation, so refactors don't shatter them; bug fixes start with a red reproduction (test-first), and when semantics deliberately evolve, old tests are explicitly updated by decision with a mechanism annotation, never quietly bent.
 - **Every fix batch passes adversarial dual review**: an independent code-reviewer and silent-failure-hunter review from opposite directions — the former verifies claimed fixes actually hold, the latter hunts swallowed exceptions, bad fallbacks, dead keys written but read by no one, and "configured but never effective." Reviews name seven blind-spot classes (lock-key consistency, all call sites, lost-work signals into terminal state, probe transience, thread topology, sticky-key lifecycle, fail-open symmetry); everything found is fixed in the same batch.
 - **The configuration surface is frozen with teeth**: all 200+ environment switches are registered as a single source of truth; adding a switch without registering turns CI red directly — the "every run uses a config combination that was never verified as a whole" hazard is institutionally eliminated; frozen dev/e2e/prod recommended combinations ship alongside.
 - **State-channel schema consistency is guarded**: the orchestration framework silently drops undeclared state keys (empirically verified), so "every key a node writes must be declared in the schema" is test-enforced — no dead features that write to nobody.
@@ -524,7 +524,7 @@ bash test/run_all.sh                                    # all tests
 .venv/bin/ruff check . --select E9,F63,F7,F82           # critical lint (same as CI)
 ```
 
-CI runs lint and the full suite on a pristine, empty PostgreSQL (pgvector) + Python 3.12 environment (currently **4900+ passed**);
+CI runs lint and the full suite on a pristine, empty PostgreSQL (pgvector) + Python 3.12 environment (currently **8300+ passed**);
 a separate Docker Smoke workflow runs end-to-end smoke on the three-container compose stack. Test discipline: **behavioral assertions first**
 (no welding to implementation structure), a red reproduction before every bug fix, and adversarial dual review (code-reviewer + silent-failure-hunter) on every batch of changes.
 
