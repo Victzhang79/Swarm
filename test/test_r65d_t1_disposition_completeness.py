@@ -202,6 +202,49 @@ def test_full_replan_handoff_is_valid_disposition():
         f"replan 交棒不是掉账: {result.get('degraded_reasons')}"
 
 
+def test_redecompose_parent_removal_is_valid_disposition():
+    """★#29-8 M-8★ redecompose（超时拆小）是合法处置：父 fid 摘出【新 plan】、
+    子块入队——铁律必须认「不在新 plan」这一格，否则父 id 被误判掉账：
+    假 ERROR + 幽灵父 id 强制回队（永不就绪，进度计数恒 +1）+ 假 leak 机读账。"""
+    from swarm.brain.nodes.failure import audit_failure_disposition
+    state = {"failed_subtask_ids": ["st-2"], "subtask_results": {},
+             "dispatch_remaining": [],
+             "plan": TaskPlan(subtasks=[_st("st-1"), _st("st-2")])}
+    result = {
+        "plan": TaskPlan(subtasks=[_st("st-1"), _st("st-2-1"), _st("st-2-2")]),
+        "failed_subtask_ids": [],
+        "dispatch_remaining": ["st-2-1", "st-2-2"],
+        "failure_strategy": "retry",
+        "subtask_results": {},
+    }
+    audit_failure_disposition(state, result)
+    assert "st-2" not in result["dispatch_remaining"], \
+        "已被拆小的父 id 绝不可幽灵回队"
+    assert not any(str(d).startswith("failure_disposition_leak")
+                   for d in (result.get("degraded_reasons") or [])), \
+        f"redecompose 摘父不是掉账: {result.get('degraded_reasons')}"
+
+
+def test_id_still_in_new_plan_without_disposition_is_leak():
+    """★#29-8 M-8 反向锁★：新 plan 仍含该 fid 而四格皆空 → 仍是真掉账
+    （排除格只豁免「被摘出 plan」，不放松对「在 plan 但无处置」的铁律）。"""
+    from swarm.brain.nodes.failure import audit_failure_disposition
+    state = {"failed_subtask_ids": ["st-2"], "subtask_results": {},
+             "dispatch_remaining": [],
+             "plan": TaskPlan(subtasks=[_st("st-2")])}
+    result = {
+        "plan": TaskPlan(subtasks=[_st("st-2")]),  # 新 plan 仍含 st-2
+        "failed_subtask_ids": [],
+        "dispatch_remaining": [],
+        "failure_strategy": "retry",
+        "subtask_results": {},
+    }
+    audit_failure_disposition(state, result)
+    assert "st-2" in result["dispatch_remaining"], "真掉账必须强制回队"
+    assert any(str(d).startswith("failure_disposition_leak")
+               for d in (result.get("degraded_reasons") or [])), "真掉账必须出机读账"
+
+
 def test_audit_crash_fails_loud_with_machine_account():
     """★猎手 MED 锁★：审计自身异常=安全网下线，必须 ERROR + degraded_reasons 机读账
     ——绝不 WARNING 静默降级回 pre-T1 行为。"""
