@@ -6345,12 +6345,20 @@ def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = Non
             fqn_index.setdefault(fqn, {}).setdefault(mod, []).append(st)
             file_of[(id(st), fqn)] = f
     # 契约 defined_in 权威：fqn → owner 模块
+    # ★#29-8 M-7★ 扫描面必须与 `_contract_owner_authority`（R67G 已修成扫全 section）
+    # 同源——枚举/DTO 的 defined_in 落在 `dtos` 等 section（round67g 铁证 AlarmLevelEnum），
+    # 只读 `interfaces` 会让 DTO/枚举类同 FQN 跨模块重复 create 查无权威 → 不消解 →
+    # 落 #110 REJECT 多烧 replan 轮次（同文件 4 处 defined_in 扫描 3 种覆盖面的
+    # 「同概念多处实现」族，此处对齐全 section）。
     owner_mod: dict[str, str] = {}
-    for e in ((getattr(plan, "shared_contract", None) or {}).get("interfaces") or []):
-        if isinstance(e, dict):
-            key = classpath_fqn_key(str(e.get("defined_in") or ""))
-            if key:
-                owner_mod[key[1]] = key[0]
+    for _sec in ((getattr(plan, "shared_contract", None) or {}) or {}).values():
+        if not isinstance(_sec, list):
+            continue
+        for e in _sec:
+            if isinstance(e, dict):
+                key = classpath_fqn_key(str(e.get("defined_in") or ""))
+                if key:
+                    owner_mod[key[1]] = key[0]
     by_id = {getattr(st, "id", None): st for st in subtasks}
 
     def _reaches_dep(start, target) -> bool:

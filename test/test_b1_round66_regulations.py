@@ -68,6 +68,21 @@ def test_101_deconflict_strips_dup_when_contract_owns():
     assert _ALARM in owner.scope.create_files
 
 
+def test_m7_deconflict_reads_defined_in_all_sections():
+    """★#29-8 M-7★ 契约扫描面与 `_contract_owner_authority` 同源=全 section——
+    枚举/DTO 的 defined_in 落在 `dtos`（round67g 铁证 AlarmLevelEnum），只读
+    `interfaces` 时 DTO 类同 FQN 跨模块重复 create 查无权威 → 不消解 → 落 #110
+    REJECT 多烧 replan 轮次。"""
+    owner = _st("st-owner", create=[_ALARM])
+    dup = _st("st-dup", create=[_ADMIN])
+    plan = TaskPlan(subtasks=[owner, dup], shared_contract={
+        "dtos": [{"name": "AlarmAppSecret", "defined_in": _ALARM}]})
+    n = deconflict_cross_module_creates(plan)
+    assert n == 1, "defined_in 落在 dtos section 也必须被契约权威识别"
+    assert _ADMIN not in (dup.scope.create_files or [])
+    assert "st-owner" in (dup.depends_on or [])
+
+
 def test_101_no_contract_authority_left_untouched():
     # 无契约权威可判 → 不动（留给 #110 REJECT，绝不静默挑一个）。
     a = _st("st-a", create=[_ALARM])
