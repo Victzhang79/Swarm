@@ -4904,7 +4904,14 @@ def merge(state: BrainState) -> dict:
         _sc = getattr(_st, "scope", None)
         for _f in (list(getattr(_sc, "create_files", None) or [])
                    + list(getattr(_sc, "writable", None) or [])):
-            _claims.setdefault(str(_f).replace("\\", "/").lstrip("./"), set()).add(_st.id)
+            # ★#29-8 M-3★ 只剥【字面 "./" 前缀】，绝不用 lstrip("./")——后者是字符集
+            # 剥离，`.gitignore`→`gitignore`、`.mvn/x`→`mvn/x`，而 diff 解析侧
+            # （merge_engine._strip_diff_path）保留点前缀 ⇒ 两侧键永不相等 ⇒
+            # R57-6 owner 保护对 dotfile 全族静默失效（退回拓扑选+rebase）。
+            _cf = str(_f).replace("\\", "/")
+            if _cf.startswith("./"):
+                _cf = _cf[2:]
+            _claims.setdefault(_cf, set()).add(_st.id)
     # ★只认【写权唯一】的文件★：若 ≥2 个子任务都声明写权 → 那是真多写者，退回旧行为
     # （拓扑选 + rebase 记账），绝不静默丢掉一个真写者的产出（D2 铁律）。
     _owners: dict[str, str] = {f: next(iter(o)) for f, o in _claims.items() if len(o) == 1}
@@ -4994,6 +5001,10 @@ def merge(state: BrainState) -> dict:
     # 的丢件账粘滞到本轮，看起来像"这轮也丢了"）。
     _owner_drops = list(getattr(result, "owner_drops", None) or [])
     out["merge_owner_drops"] = _owner_drops
+    # #29-8 H-1：并集成功账与丢件账分账——并集=一行没丢（不进 degraded_reasons、
+    # 不冤杀 L6、不触 M-6 闸），但同样无条件写 state 防粘滞，人工闸可见。
+    _owner_unions = list(getattr(result, "owner_unions", None) or [])
+    out["merge_owner_unions"] = _owner_unions
     if _owner_drops:
         out["degraded_reasons"] = (
             list(out.get("degraded_reasons") or [])
@@ -5777,6 +5788,8 @@ def _deliver_review_payload(state: BrainState) -> dict:
         # C-4：owner 裁决丢件——人工闸必须看得到"哪个文件最后用了谁的版本、丢了谁的"。
         # owner 判据来自 plan 声明的写权；plan 声明错时被丢的可能正是真产出。
         "merge_owner_drops": list(state.get("merge_owner_drops") or [])[:_DELIVER_ASSERT_ROWS_MAX],
+        # #29-8 H-1：并集成功账——人工闸区分「真丢了」与「并集了」，别再把并集当丢件读。
+        "merge_owner_unions": list(state.get("merge_owner_unions") or [])[:_DELIVER_ASSERT_ROWS_MAX],
         "runtime_smoke": {
             "passed": state.get("runtime_smoke_passed", None),
             "skipped": state.get("runtime_smoke_skipped", None),

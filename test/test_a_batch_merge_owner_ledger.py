@@ -100,6 +100,45 @@ def test_state_key_declared_with_lifecycle():
     assert ACCOUNTING_KEY_LIFECYCLE["merge_owner_drops"] == "round"
 
 
+def test_dotfile_owner_claim_survives_normalization(monkeypatch):
+    """★#29-8 M-3★ claims 归一化只剥字面 './' 前缀——`.gitignore` 绝不被字符集
+    `lstrip("./")` 剥成 `gitignore`（diff 解析侧保留点前缀 ⇒ 两侧键永不相等 ⇒
+    R57-6 owner 保护对 dotfile 全族静默失效，退回拓扑选+rebase）。"""
+    from swarm.brain import nodes
+    from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
+
+    def _dot(content):
+        return ("diff --git a/.gitignore b/.gitignore\n"
+                "new file mode 100644\n--- /dev/null\n"
+                "+++ b/.gitignore\n@@ -0,0 +1,1 @@\n+" + content + "\n")
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="d",
+                scope=FileScope(writable=[".gitignore"]), depends_on=[]),
+        SubTask(id="st-2", description="d",
+                scope=FileScope(writable=["x.java"]), depends_on=[]),
+    ])
+    state = {
+        "plan": plan,
+        "subtask_results": {
+            "st-1": WorkerOutput(subtask_id="st-1", diff=_dot("target/"), summary="",
+                                 l1_passed=True, l1_details={}, confidence="high"),
+            "st-2": WorkerOutput(subtask_id="st-2", diff=_dot("*.class"), summary="",
+                                 l1_passed=True, l1_details={}, confidence="high"),
+        },
+    }
+    monkeypatch.setattr(nodes, "_make_base_reader", lambda s: (lambda f: None))
+    monkeypatch.setattr("swarm.brain.merge_engine.verify_merged_patch_applies",
+                        lambda *a, **k: (True, ""))
+    out = nodes.merge(state)
+    drops = out.get("merge_owner_drops") or []
+    assert any(d["file"] == ".gitignore" and d["owner"] == "st-1"
+               and d["dropped"] == ["st-2"] for d in drops), \
+        f"dotfile 的 owner 裁决必须生效（而非退回拓扑选+rebase）: {drops}"
+    assert not out.get("rebase_subtask_ids"), "owner 证据在案绝不退 rebase"
+    assert "target/" in out["merged_diff"] and "*.class" not in out["merged_diff"]
+
+
 # ══════════════════════════════════════════════
 # C-4 的【真数据丢失面】：新建聚合清单并集不可达
 # ══════════════════════════════════════════════
@@ -130,6 +169,19 @@ def test_new_manifest_multiwriter_unions_instead_of_dropping():
     assert "alarm-notify" in r.merged_diff, "非 owner 写者加的依赖绝不能凭空蒸发"
 
 
+def test_union_success_records_unions_not_drops():
+    """★#29-8 H-1★ 并集成功=一行没丢，账必须记【事实】：
+    owner_drops 必须为空（否则 degraded_reasons 冤杀 L6 should_write_success、
+    人工闸看到假丢件、M-6 auto_accept 闸被冤触发），并集事件记进 owner_unions。"""
+    r = _merge_pom(_pom("alarm-core"), _pom("alarm-notify"))
+    assert r.owner_drops == [], "并集成功一行没丢，绝不允许记丢件假账"
+    assert len(r.owner_unions) == 1
+    rec = r.owner_unions[0]
+    assert rec["file"] == "alarm-task/pom.xml"
+    assert rec["owner"] == "st-1"
+    assert rec["unioned"] == ["st-2"]
+
+
 def test_unioned_manifest_stays_structurally_valid():
     """并集绝不能产出畸形清单（两个 `<project>` 根会让 git apply 整包连坐）。"""
     r = _merge_pom(_pom("a"), _pom("b"), _pom("c"))
@@ -139,18 +191,25 @@ def test_unioned_manifest_stays_structurally_valid():
     assert sum(1 for ln in body if "<dependency>" in ln) == 3, "三个写者的条目都要在"
 
 
-def test_union_falls_back_when_it_would_forge_duplicate_singletons():
-    """★救不回来就如实认，绝不产畸形（round18 P0-A 守卫复用）★
-    两份【各自整段重写】的版本并集会伪造重复结构单例 → 放弃并集回退 owner 独占，
-    丢件账仍记（不静默）。"""
-    other = ("diff --git a/alarm-task/pom.xml b/alarm-task/pom.xml\n"
-             "new file mode 100644\n--- /dev/null\n+++ b/alarm-task/pom.xml\n"
-             "@@ -0,0 +1,3 @@\n+<project>\n+  <完全不同的骨架/>\n+</project>\n")
-    r = _merge_pom(_pom("alarm-core"), other)
+def test_union_falls_back_when_other_adds_nothing_new():
+    """★救不回来就如实认，绝不产畸形★ 并集函数对【另一版不带来任何新内容】
+    （merged==owner 版）返回 None → 回退 owner 独占，丢件账仍记（不静默）。
+
+    ★#29-8 H-1 订正★：本用例原夹具（`<完全不同的骨架/>` 版）声称触发重复单例守卫，
+    实测从未触发——并集函数对它是【成功并集】（骨架行被并进结果），而旧代码在并集
+    成功后照样记 drops，断言 `r.owner_drops` 恰被这个 bug 喂绿（夹具形状没编码承诺）。
+    重复单例守卫本身的覆盖在 test_merge_aggregate_malformed_round18.py（两条），
+    此处改用【真回退】夹具（子集版）锁「回退时 drops 有账、unions 无账」。"""
+    full = _pom("alarm-core").replace("+</project>", "+    <dependency>alarm-notify</dependency>\n+</project>")
+    # owner=全量版（st-1），st-2 是它的真子集（只含 alarm-core，不带来新条目）。
+    subset = _pom("alarm-core")
+    r = merge_diffs([("st-1", full), ("st-2", subset)],
+                    base_reader=lambda f: None, file_owner=lambda f: "st-1")
     body = [ln[1:] for ln in r.merged_diff.splitlines() if ln.startswith("+")
             and not ln.startswith("+++")]
     assert body.count("<project>") == 1, "宁可丢件也绝不产出重复根标签"
     assert r.owner_drops, "回退 owner 独占时丢件账必须仍在"
+    assert r.owner_unions == [], "并集失败（回退独占）不得记并集账（#29-8 H-1 分账）"
 
 
 def test_non_manifest_new_file_keeps_owner_only():
@@ -162,3 +221,4 @@ def test_non_manifest_new_file_keeps_owner_only():
     r = _merge_pom(java, java2)
     assert "void x()" in r.merged_diff and "void y()" not in r.merged_diff
     assert r.owner_drops, "丢件必须记账"
+    assert r.owner_unions == [], "非清单文件不并集，不得记并集账（#29-8 H-1 分账）"

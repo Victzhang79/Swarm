@@ -99,6 +99,7 @@ class BrainState(TypedDict, total=False):
     plan_retry_count: int               # 计划重试次数
     coverage_design_attempted_reqs: list[str]  # ★L2 补排闸的"试过了"账（26 号文 C-7 治本）★ 补排为哪些 req 试过设计文件、试完仍未覆盖。补排闸据此不再对同一条重试——round67m2 实证：伞形需求 req-27e9b283（判别 token 退化到只剩 ['prd']，结构上永不可能被 vocab 匹配满足）每轮都判 unplanned → 每轮触发补排 → LLM 在【不含既有 file_plan】的 prompt 里凭空造 48-69 个文件的平行设计（三轮三套互不相同命名，Alarm→Alert 都换了），file_plan 234→303→350 单调膨胀 → 大量 create 撞 base → ③f 准确 REJECT → 熔断。与 B1 修复记忆同族：没有"试过了"的记忆，就会无界重入
     merge_owner_drops: list           # ★C-4（26 号文）★ owner 裁决丢件机读账：[{file, owner, dropped:[sid], dropped_lines}]。merge 的 owner 通道整份丢弃非 owner 写者版本且刻意不进 rebase（理由正当：确定性修复"碰过"的文件重做多少次还会被碰到）；但此前全仓只有一行 WARNING、零机读账，而 owner 判据来自 plan 声明的写权——plan 声明错时被丢的可能正是真产出，交付面完全无感。每轮 merge 无条件重写（clean 路径写 []）
+    merge_owner_unions: list          # ★#29-8 H-1★ owner 裁决【并集成功】机读账：[{file, owner, unioned:[sid]}]——非 owner 内容已并入交付物，一行没丢，与 drops 分账（混记=假账冤杀 L6/人工闸/M-6 闸）。每轮 merge 无条件重写（clean 路径写 []）
     plan_validation_issues: list[str]   # PlanValidator 问题列表
     plan_validation_gate: str          # ★本轮 validate 死在【哪道闸】（复核 H-3）★ validate_plan 是 9 道顺序早退闸，plan_validation_issues 只含【第一个失败闸】的 issues。反回归段若不知产出闸，就会把"本轮压根没跑过的闸"的历轮 issue 当成"已修掉、绝不许回归"（跨闸弹跳假阳性，与被治的 renumber 假阳性同危害不同根）。取值见 nodes/__init__.py:_VALIDATE_GATE_ORDER
     plan_validation_warnings: list[str]  # G3-2：规划期软警告（规则5 落空/C1 无主符号）机读面——★R67M2-T3：validate_plan 全部 11 个 return【恒发】（含各早退与成功轮），空列表=本轮无软警告的如实表达；此前"非空才带"的条件发射与本键 round 注册相矛盾（LangGraph 对缺席键保持原值→上轮 warnings 粘滞进 payload 白名单/API/复盘面，B3 的 T4 文案自带本轮计数语义，粘滞即假信号）★
@@ -350,6 +351,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "plan_retry_count": "round",
     "coverage_design_attempted_reqs": "monotonic",  # C-7：重试窗口内单调累积（补排闸单点写）；与 plan_validation_issue_history 同清空点（validate 通过 / REVISE·replan 新周期）
     "merge_owner_drops": "round",      # C-4：每轮 merge 重算覆盖（last-write-wins）；条件 emit 会让上轮丢件账粘滞成"本轮也丢了"
+    "merge_owner_unions": "round",     # #29-8 H-1：与 drops 严格同生命周期（同一次 merge 一起写、一起被下轮覆盖）
     "plan_validation_issues": "round",
     "plan_validation_gate": "round",   # 与 plan_validation_issues 严格同生命周期（同一次早退一起写、一起被下轮覆盖）
     "plan_validation_warnings": "round",  # G3-2：last-write-wins（每轮重算）

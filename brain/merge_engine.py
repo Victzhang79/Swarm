@@ -48,6 +48,13 @@ class MergeResult:
     #   [{"file": str, "owner": sid, "dropped": [sid,...], "dropped_lines": int}]
     # 消费面：merge 节点写进 degraded_reasons/state，交付报告可见"哪些产出被判给了谁"。
     owner_drops: list = field(default_factory=list)
+    # ★owner 裁决【并集】账（#29-8 H-1）★
+    # 聚合清单并集成功时，非 owner 内容【已并入交付物】——一行没丢。若照旧记进
+    # owner_drops，就是「并集成功仍记整份丢弃」的假账：degraded_reasons 冤杀 L6
+    # 成功学习、人工闸看到假丢件、M-6 auto_accept 闸被冤触发。并集事件单独记账：
+    #   [{"file": str, "owner": sid, "unioned": [sid,...]}]
+    # 消费面：merge 节点写 state（merge_owner_unions）、deliver payload 人工闸可见。
+    owner_unions: list = field(default_factory=list)
 
 
 @dataclass
@@ -262,6 +269,15 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
                 file_path = old_path
             continue
 
+        # ★#29-8 M-4★ 权限位行保留进 header_lines（git 实输出中恒在 `---` 对之前，
+        # 按遇到顺序 append 即保序）：旧行为直接跳过 ⇒ chmod-only 段整段蒸发（零日志），
+        # 新建可执行脚本（mvnw 100755）被下游硬编码 100644 静默降级 ⇒ 交付后
+        # `./mvnw: Permission denied`，下游 runtime 才炸且根因不可见。
+        if line.startswith(("old mode ", "new mode ", "new file mode ", "deleted file mode ")):
+            header_lines.append(line)
+            i += 1
+            continue
+
         match = _HUNK_RE.match(line)
         if match:
             hunk_lines = [line]
@@ -295,6 +311,13 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
         i += 1
 
     if not file_path and not hunks:
+        # ★#29-8 M-4★ chmod-only 段（无 ---/+++、无 hunk，只有 old/new mode 行）：
+        # 旧行为 return None 整段静默蒸发（success=True 零日志）——worker 对既有脚本
+        # chmod +x 的变更交付时凭空消失。对齐 D06 rename/binary：整段透传保留
+        # （fail-closed：最差是 apply 冲突【可见】，远优于静默丢内容）。
+        if any(ln.startswith(("old mode ", "new mode ")) for ln in header_lines):
+            fp = git_b or git_a or "unknown"
+            return _FilePatch(file_path=fp, header_lines=[], hunks=[], passthrough=raw)
         return None
     if not file_path and hunks:
         file_path = git_b or git_a or "unknown"
@@ -356,9 +379,13 @@ def _format_file_patch(
         new_lines = _new_side_lines(hunks)
         if not new_lines:
             return ""
+        # ★#29-8 M-4★ 新建文件权限位从输入补丁透传（worker 新建 mvnw/gradlew 带
+        # 100755 时绝不静默降级 0644）；缺省维持 100644。
+        _mode = next((h for h in header_lines if h.startswith("new file mode ")),
+                     "new file mode 100644")
         header = [
             f"diff --git a/{file_path} b/{file_path}",
-            "new file mode 100644",
+            _mode,
             "--- /dev/null",
             f"+++ b/{file_path}",
             f"@@ -0,0 +1,{len(new_lines)} @@",
@@ -366,10 +393,13 @@ def _format_file_patch(
         return "\n".join(header + new_lines)
     if header_lines:
         header = list(header_lines)
-        if header[0].startswith("--- "):
-            header[0] = f"--- a/{file_path}"
-        if len(header) > 1 and header[1].startswith("+++ "):
-            header[1] = f"+++ b/{file_path}"
+        # ★#29-8 M-4★ header_lines 可能带 mode 行（恒在 --- 对之前）→ 路径归一化
+        # 改写必须【扫描定位】---/+++ 对，不能再假设固定在 [0]/[1]。
+        for _hi in range(len(header) - 1):
+            if header[_hi].startswith("--- ") and header[_hi + 1].startswith("+++ "):
+                header[_hi] = f"--- a/{file_path}"
+                header[_hi + 1] = f"+++ b/{file_path}"
+                break
     else:
         header = [f"--- a/{file_path}", f"+++ b/{file_path}"]
     # round29 B 治本：modify 段也必须带 `diff --git` 头（不带 new file mode，那是新建专属）。
@@ -402,12 +432,14 @@ def _format_file_patch(
     return "\n".join(header + body)
 
 
-def _format_deletion_patch(file_path: str, hunks: list[_Hunk]) -> str:
+def _format_deletion_patch(file_path: str, hunks: list[_Hunk],
+                           header_lines: list[str] | None = None) -> str:
     """D03：输出【删除补丁】——`deleted file mode` + `--- a/path` + `+++ /dev/null` + 全 `-` 行。
 
     删除的 hunk 形如 `@@ -1,N +0,0 @@`（全 `-` 行）。逐 hunk 规范化 body 并重算 @@ 头（复用
     _recount_hunk_header，保头体一致），git apply 据 `+++ /dev/null` 识别为删除。空文件删除
     （无 hunk）→ 仅输出头四行，git 亦能删除 0 字节文件。
+    ★#29-8 M-4★ `deleted file mode` 从输入补丁透传（删 100755 脚本不静默写成 100644）。
     """
     body: list[str] = []
     for hunk in sorted(hunks, key=lambda h: h.old_start):
@@ -426,7 +458,8 @@ def _format_deletion_patch(file_path: str, hunks: list[_Hunk]) -> str:
             body.extend(hbody)
     header = [
         f"diff --git a/{file_path} b/{file_path}",
-        "deleted file mode 100644",
+        next((h for h in (header_lines or []) if h.startswith("deleted file mode ")),
+             "deleted file mode 100644"),
         f"--- a/{file_path}",
         "+++ /dev/null",
     ]
@@ -772,8 +805,16 @@ def filter_orphan_module_patches(
         try:
             if base_module_exists(d):
                 continue
-        except Exception:  # noqa: BLE001 —— base 探测失败保守视为不存在(fail-closed)
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # ★#29-8 M-5★ 探测【抛异常】=证据不足，与「确定不存在」（返回 False）必须分路：
+            # 剔除是破坏性动作，对它而言 fail-closed=【留】。旧行为异常也落入 orphan_dirs
+            # （base 树某目录权限异常 → 既有历史模块被误判孤儿 → 该模块全部补丁被剔，
+            # 诚实 PARTIAL 但【冤】——真产出被丢去 abandoned）。probe 返回 None（不可用）
+            # 时整体让路（上方 docstring），异常同理【留】+ WARNING 可观测。
+            logger.warning(
+                "[MERGE] orphan 判定的 base 探测异常（%s: %s）→ 保守【保留】该目录补丁"
+                "（证据不足绝不剔，由 VERIFY_L2/apply 护栏兜真问题）", d, exc)
+            continue
         orphan_dirs.add(d)
     if not orphan_dirs:
         return subtask_diffs, {}
@@ -1152,7 +1193,7 @@ def merge_diffs(
                     seen_passthrough.add(key)
                     passthrough_parts.append(patch.passthrough)
                     logger.info(
-                        "[MERGE] 段透传保留（rename/binary，不可字符级合并）: %s（子任务 %s）",
+                        "[MERGE] 段透传保留（rename/binary/mode-only，不可字符级合并）: %s（子任务 %s）",
                         patch.file_path, subtask_id,
                     )
                 continue
@@ -1171,6 +1212,7 @@ def merge_diffs(
     rebase_subtask_ids_all: list[str] = []   # 全局累加需要 rebase 重生成的子任务 ID
     rebase_origin_all: dict[str, str] = {}   # 6.9-HF3：sid → "new_file"|"three_way"（终点分流）
     owner_drops_all: list[dict] = []         # C-4：owner 裁决丢件机读账（见 MergeResult.owner_drops）
+    owner_unions_all: list[dict] = []        # #29-8 H-1：owner 裁决【并集成功】账（见 MergeResult.owner_unions）
     conflict_render_parts: list[str] = []    # D11：硬冲突渲染（诊断专用，绝不进 merged_diff）
     merged_parts: list[str] = []
 
@@ -1250,7 +1292,8 @@ def merge_diffs(
                     "[MERGE] 删除文件 %s 多写者 %s 意图一致，删除 hunk 去重合成单份补丁",
                     file_path, writers,
                 )
-            merged_parts.append(_format_deletion_patch(file_path, uniq_del))
+            merged_parts.append(_format_deletion_patch(file_path, uniq_del,
+                                                       headers.get(file_path, [])))
             continue
 
         # 新/旧由 merge base 权威判定（非 worker 头）：有 base_reader 且它读不到该文件 = 新文件。
@@ -1309,13 +1352,23 @@ def merge_diffs(
                                  for sid, sh in by_sid_new.items()})
                         # C-4：丢件必须留【机读】账——原先只有这行 WARNING，而日志会轮转，
                         # 复盘时"这个文件当初是谁的版本、丢了谁的"无从查证。
-                        owner_drops_all.append({
-                            "file": file_path,
-                            "owner": _owner,
-                            "dropped": _non_owner,
-                            "dropped_lines": sum(
-                                len(h.lines) for s in _non_owner for h in by_sid_new[s]),
-                        })
+                        # ★#29-8 H-1★：账必须记【事实】——并集成功（_union_lines is not None）
+                        # 时非 owner 内容已并入交付物，一行没丢，记 dropped 就是假账
+                        # （冤杀 L6 should_write_success + 人工闸假丢件 + 冤触 M-6 闸）。
+                        if _union_lines is not None:
+                            owner_unions_all.append({
+                                "file": file_path,
+                                "owner": _owner,
+                                "unioned": _non_owner,
+                            })
+                        else:
+                            owner_drops_all.append({
+                                "file": file_path,
+                                "owner": _owner,
+                                "dropped": _non_owner,
+                                "dropped_lines": sum(
+                                    len(h.lines) for s in _non_owner for h in by_sid_new[s]),
+                            })
                         logger.warning(
                             "[MERGE] R57-6 新文件 %s 多写者：取**声明写权的 owner** %s；"
                             "其余 %s 只是确定性修复碰过（非 owner）→ 丢弃其版本、**不进 rebase**"
@@ -1468,6 +1521,7 @@ def merge_diffs(
         conflict_render="\n\n".join(conflict_render_parts),
         rebase_origin=dict(rebase_origin_all),
         owner_drops=list(owner_drops_all),
+        owner_unions=list(owner_unions_all),
     )
 
 

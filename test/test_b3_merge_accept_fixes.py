@@ -197,6 +197,66 @@ def test_f5_non_orphan_patch_untouched():
     assert filtered == [("st-Z", d)]
 
 
+def test_m5_probe_exception_keeps_patch_not_orphaned():
+    """★#29-8 M-5★ base 探测【抛异常】=证据不足 → 保守【保留】（剔除是破坏性动作，
+    对它而言 fail-closed=留）。旧行为异常与「确定不存在」同走剔分支——base 树某目录
+    权限异常（py<3.13 is_file EACCES 族）会冤杀既有历史模块的全部补丁。"""
+    from swarm.brain.merge_engine import filter_orphan_module_patches
+
+    def _boom(_d):
+        raise PermissionError("EACCES on base dir")
+
+    d = _diff_for("ruoyi-alarm/src/A.java")
+    filtered, dropped = filter_orphan_module_patches(
+        [("st-E", d)], base_module_exists=_boom, is_multimodule=True)
+    assert dropped == {}, "证据不足绝不剔（异常≠确定不存在）"
+    assert filtered == [("st-E", d)]
+
+
+def test_m4_mode_only_segment_passthrough_not_evaporated():
+    """★#29-8 M-4a★ chmod-only 段（old/new mode 无 hunk）旧行为整段静默蒸发
+    （success=True 零日志）——worker 对既有脚本 chmod +x 的变更交付时凭空消失。
+    对齐 D06 rename/binary：整段透传保留。"""
+    from swarm.brain.merge_engine import merge_diffs
+
+    mode_only = ("diff --git a/mvnw b/mvnw\n"
+                 "old mode 100644\n"
+                 "new mode 100755\n")
+    r = merge_diffs([("st-1", mode_only)], base_reader=lambda f: None)
+    assert "new mode 100755" in r.merged_diff, "chmod-only 变更绝不静默蒸发"
+    assert "mvnw" in r.merged_diff
+
+
+def test_m4_new_executable_keeps_100755():
+    """★#29-8 M-4b★ 新建可执行脚本的权限位绝不硬编码降级 100644
+    （否则交付后 ./mvnw Permission denied，runtime 才炸且根因不可见）。"""
+    from swarm.brain.merge_engine import merge_diffs
+
+    new_exec = ("diff --git a/mvnw b/mvnw\n"
+                "new file mode 100755\n"
+                "--- /dev/null\n+++ b/mvnw\n@@ -0,0 +1,1 @@\n+#!/bin/sh\n")
+    r = merge_diffs([("st-1", new_exec)], base_reader=lambda f: None)
+    assert "new file mode 100755" in r.merged_diff
+    assert "new file mode 100644" not in r.merged_diff
+
+
+def test_m4_mixed_mode_and_content_preserves_mode_lines():
+    """★#29-8 M-4c★ chmod + 内容修改同段：mode 行保留且位于 --- 对之前
+    （git 扩展头语义），内容 hunk 照常合并。"""
+    from swarm.brain.merge_engine import merge_diffs
+
+    mixed = ("diff --git a/run.sh b/run.sh\n"
+             "old mode 100644\n"
+             "new mode 100755\n"
+             "--- a/run.sh\n+++ b/run.sh\n@@ -1,1 +1,1 @@\n-echo old\n+echo new\n")
+    r = merge_diffs([("st-1", mixed)], base_reader=lambda f: "echo old\n")
+    lines = r.merged_diff.splitlines()
+    assert "new mode 100755" in lines, "mode 变更绝不静默丢"
+    assert "+echo new" in lines
+    assert lines.index("new mode 100755") < lines.index("--- a/run.sh"), \
+        "mode 行必须在 --- 对之前（git 扩展头顺序）"
+
+
 # ─────────────────────────── F3 / #60 ───────────────────────────
 
 def test_f3_invalid_folded_diff_escalates():
