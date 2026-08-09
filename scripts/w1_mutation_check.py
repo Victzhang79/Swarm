@@ -34,17 +34,26 @@ WM = ROOT / "worker" / "workspace_manifest.py"
 MUTATIONS = [
     # ── 段①：推进沙箱的接线 ──────────────────────────────────────────────
     (
+        # ★W-22（#29-5）落点重写★ A2 段加了 status_out/坐标收集，旧字面量漂移；
+        # 意图逐字保留：不推进沙箱 ⇒ 机制生产零效力。
         "W-1-a：A2 清单不推进沙箱（复现原缺陷：本地改了、构建读旧副本 ⇒ 机制零效力）",
         L1,
-        "        if _a2_paths:\n            try:\n                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths)",
-        "        if False:  # 突变：不推进沙箱\n            try:\n                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths)",
+        "        if _a2_paths:\n            try:\n                _push_status: dict = {}\n"
+        "                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths,\n"
+        "                                                     status_out=_push_status)",
+        "        if False:  # 突变：不推进沙箱\n            try:\n"
+        "                _push_status: dict = {}\n"
+        "                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths,\n"
+        "                                                     status_out=_push_status)",
         ["test_a2_injection_reaches_sandbox"],
     ),
     (
         "W-1-b：推送面复用 paths（把非 A2 路径的本地旧副本推上去 ⇒ 擦掉沙箱侧修复）",
         L1,
-        "                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths)",
-        "                _pushed = _push_manifests_to_sandbox(project_path, paths)",
+        "                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths,\n"
+        "                                                     status_out=_push_status)",
+        "                _pushed = _push_manifests_to_sandbox(project_path, paths,  # 突变\n"
+        "                                                     status_out=_push_status)",
         ["test_push_scope_excludes_non_a2_repair_paths"],
     ),
     # ── 段②：dispatch 接线 ──────────────────────────────────────────────

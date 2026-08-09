@@ -198,6 +198,29 @@ def _det_fail_source(det_details: dict) -> tuple[str, str]:
     return "deterministic", det_details.get("deterministic_gate") or "确定性闸门判失败"
 
 
+def _a2_push_undelivered_still_failing(details: dict) -> bool:
+    """★W-22★ 本轮构建失败是否仅由「A2 注入坐标推送未达沙箱」引起。
+
+    判据（确定性证据，不是猜）：A2 机读记录在案（栈+本轮试图注入的缺依赖坐标），
+    且【同一坐标仍出现】在最新构建错误文本里（build_output/build_error_lines 都在
+    rerun 后刷新）——注入不可见 ⇒ 缺依赖错误原样复发。记录缺席 / 坐标空 / 无构建
+    错误文本 → False（fail-closed：不标 transient，维持原 capability 分类）。
+    """
+    a2u = details.get("a2_push_undelivered")
+    if not isinstance(a2u, dict):
+        return False
+    coords = [str(c) for c in (a2u.get("coords") or []) if str(c).strip()]
+    if not coords:
+        return False
+    blob = str(details.get("build_output") or "")
+    lines = details.get("build_error_lines")
+    if isinstance(lines, (list, tuple)):
+        blob += "\n" + "\n".join(str(x) for x in lines)
+    if not blob.strip():
+        return False
+    return any(c in blob for c in coords)
+
+
 def _det_fail_reason(details: dict) -> str:
     """R65D-W3①：确定性闸判死的机读 reason 提取——round65d st-26 冤案 79ms 判 False
     全程零解释。单一提取点，判死日志必带。
@@ -356,7 +379,25 @@ def _evaluate_l1_core(
     # ② det_ok is False → 确定性失败
     if det_ok is False:
         source, reason = _det_fail_source(details)
-        sticky = source != "empty_diff_transient"  # 仅 transient 空 diff 可翻盘
+        # ★W-22★ A2 注入坐标推送未达：构建失败但【同一缺依赖坐标仍在报错】= 失败仅由
+        # 「本地注入推送未达沙箱」（transient infra）引起——标 failure_class=transient +
+        # 降 sticky，brain 退避重试（下轮 push 成功即成），不走 capability 换模型阶梯
+        # （不标则文本分类判 capability=不对称冤杀好活，W-22 实测危害链）。边界如实：
+        # 坐标也猜错时多烧一轮重试后真相自现（push 成功→版本冲突→正确归 capability），
+        # 严格更便宜的错向。判据是确定性证据（同一坐标仍报错），不是猜。
+        _w22_transient = (source == "compile"
+                          and _a2_push_undelivered_still_failing(details))
+        if (source == "compile" and not _w22_transient
+                and isinstance(details.get("a2_push_undelivered"), dict)):
+            # ★W-22 复核 M1（硬检查④）★ 「记录在案但判据未命中」与「无记录」必须机读
+            # 可辨——坐标抽取/输出压缩/匹配任一层回归都会把 transient 通道静默关回
+            # capability，而表面看只是普通编译失败。留此账，复盘/审计可分辨两种死法。
+            details["a2_push_undelivered_checked"] = False
+        sticky = source != "empty_diff_transient" and not _w22_transient  # 仅 transient 可翻盘
+        if _w22_transient:
+            details["failure_class"] = "transient"
+            reason = (f"{reason}（W-22：A2 注入坐标推送未达沙箱，同一缺依赖坐标仍报错"
+                      "——判 transient 退避重试）")
         details["l1_decision_source"] = (
             "empty_diff_transient" if source == "empty_diff_transient" else "deterministic"
         )

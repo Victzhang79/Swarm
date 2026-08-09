@@ -86,6 +86,13 @@ def _missing_deps(build_output: str, stack: str) -> list[str]:
     return out
 
 
+def missing_deps_for(build_output: str, stack: str) -> list[str]:
+    """★W-22★ `_missing_deps` 的公开入口——l1_pipeline A2「推送未达」机读记录要记下
+    本轮试图注入的缺依赖坐标，l1_verdict 据「同一坐标仍在报错」判失败仅由推送未达引起
+    （transient）而非 capability。与 `_missing_deps` 同一实现，绝不另造口径。"""
+    return _missing_deps(build_output, stack)
+
+
 # ── 每栈：从一个 manifest 解析【已声明依赖 → 版本坐标】──────────────────────────
 def _parse_npm(text: str) -> dict[str, tuple[str, str]]:
     """name → (版本, 来源 section)。D14：记录 section——devDependencies 的坐标注入

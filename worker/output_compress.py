@@ -50,6 +50,13 @@ _SIGNAL_PATTERNS = [
     r"NameError",
     r"TypeError",
     r"ValueError",
+    # go 缺模块三形态（★W-22 复核 MEDIUM★：`_a2_push_undelivered_still_failing` 的第二
+    # 证据源 build_error_lines 由本表驱动——缺这三行时 Go 分支只剩被压缩的 build_output
+    # 一条命，缺模块行落在省略区间 → transient 判据静默失效=W-22 原危害链 Go 复发）。
+    # 口径对齐 sibling_dep_repair._GO_MISSING_RE（同一事实的两种投影，别各编各的）。
+    r"no required module provides package",
+    r"missing go\.sum entry",
+    r"cannot find package",
 ]
 
 _SIGNAL_RE = re.compile("|".join(f"(?:{p})" for p in _SIGNAL_PATTERNS))

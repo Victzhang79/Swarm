@@ -2702,6 +2702,10 @@ def _attempt_build_repair(
         # 副本比本地新——把本地旧副本推上去会**擦掉沙箱侧的修复**（比原缺陷更坏）。
         # 故此处单独收集 A2 路径，不复用 `paths`。
         _a2_paths: list[str] = []
+        # ★W-22★ 同时收集注入成功的栈与本轮试图注入的缺依赖坐标——推送未达时落机读记录，
+        # l1_verdict 据「同一坐标仍在报错」判 transient（判据是确定性证据，不是猜）。
+        _a2_stacks: list[str] = []
+        _a2_coords: list[str] = []
         for lang, file_signal, _fn in adapters:
             stack_key = _sib_stack.get(lang)
             if stack_key and eligible(lang, file_signal):
@@ -2716,18 +2720,49 @@ def _attempt_build_repair(
                 for _f in _fs:
                     if _f and _f not in _a2_paths:
                         _a2_paths.append(_f)
+                if _n:
+                    if stack_key not in _a2_stacks:
+                        _a2_stacks.append(stack_key)
+                    try:
+                        from swarm.worker.sibling_dep_repair import missing_deps_for
+                        for _c in missing_deps_for(build_output, stack_key):
+                            if _c not in _a2_coords:
+                                _a2_coords.append(_c)
+                    except Exception as _cde:  # noqa: BLE001
+                        # ★W-22 复核 M2★ 坐标解析异常必须有独立兜底：冒出循环会被调用方
+                        # 一把 `break` 吞成 debug——推送照跑（_a2_paths 已先收）、异常
+                        # WARNING 留痕（transient 判据本轮失坐标证据=降级，绝不静默）。
+                        logger.warning(
+                            "[L1.2.1·repair] W-22：A2 %s 缺依赖坐标解析异常（推送照跑，"
+                            "transient 判据本轮失坐标证据）: %s", stack_key, _cde)
         if _a2_paths:
             try:
-                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths)
+                _push_status: dict = {}
+                _pushed = _push_manifests_to_sandbox(project_path, _a2_paths,
+                                                     status_out=_push_status)
                 if _pushed:
                     logger.info(
                         "[L1.2.1·repair] A2 sibling-dep 注入的 %d 份清单已推进沙箱"
                         "（构建沙箱优先，不推则本地注入对构建不可见）", _pushed)
+                    if evidence_out is not None:
+                        evidence_out.pop("a2_push_undelivered", None)
+                elif _push_status.get("sandbox_present"):
+                    # ★W-22★ 有沙箱但推送未达：本地注入对构建不可见 ⇒ 构建会因同一缺依赖
+                    # 坐标继续失败，而失败真因是 transient infra（重试即成）。机读记录
+                    # （栈+坐标）交 l1_verdict 判 transient，绝不走 capability 换模型
+                    # 阶梯（那是不对称冤杀好活）。边界如实：坐标也猜错时多烧一轮重试后
+                    # 真相自现（下轮 push 成功→版本冲突→正确归 capability）——严格更便宜。
+                    _rec = {"stacks": list(_a2_stacks), "coords": list(_a2_coords)}
+                    if evidence_out is not None:
+                        evidence_out["a2_push_undelivered"] = _rec
+                    logger.warning(
+                        "[L1.2.1·repair] W-22：A2 注入的 %d 份清单推送未达沙箱（本地注入"
+                        "对构建不可见）——已机读记录 %d 个缺依赖坐标，若同一坐标仍报错"
+                        "则本轮失败判 transient: %s", len(_a2_paths), len(_a2_coords),
+                        _a2_coords[:6])
                 else:
                     # 无活跃沙箱（本地模式）＝构建直接读 project_path，本就可见，非降级。
-                    # 有沙箱但推送失败 → _push_manifests_to_sandbox 内部已告警；此处
-                    # 不吞成静默：构建随后会因缺依赖继续失败，交既有失败分类处理。
-                    logger.debug("[L1.2.1·repair] A2 清单未推送（本地模式或推送未成功）")
+                    logger.debug("[L1.2.1·repair] A2 清单未推送（本地模式，无沙箱）")
             except Exception as exc:  # noqa: BLE001 — 推送异常不致命（构建仍会如实失败）
                 logger.warning("[L1.2.1·repair] A2 清单推进沙箱异常（本轮注入对构建"
                                "可能不可见）: %s", exc)
@@ -2882,7 +2917,8 @@ def _sandbox_ctx() -> tuple[Any, Any, str] | None:
     return sandbox, manager, remote
 
 
-def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
+def _push_manifests_to_sandbox(project_path: str, manifests: list[str],
+                               status_out: dict | None = None) -> int:
     """把 reconcile 在【本地 project_path】改过的聚合清单推进【沙箱】，返回上传成功数。
 
     治本 #11(b)（round18/19 实测头号交付卡点）：模块注册 reconcile 走纯 Python
@@ -2895,13 +2931,24 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
     无活跃沙箱（本地模式）→ build 直接读 project_path，无需 push，安全返回 0。
     sync 失败（infra 瞬时）不致命：不推进则 build 会 reactor-not-found，交后续构建失败
     分类（含 _is_infra_failure 退避）处理，不在此吞成假通过。
+
+    status_out（★W-22★）：传入 dict 时回填 `sandbox_present`（有无活跃沙箱）与
+    `uploaded`（实际上传数）。return 0 原本把「无沙箱」（本地模式，非降级）与
+    「有沙箱但推送未达」（本地注入对构建不可见=本轮修复白费）**合并成一态不可分**
+    ——A2 调用点需要后者做机读记录，l1_verdict 据此把「仅由推送未达引起的失败」
+    判 transient（重试即成）而非 capability（冤杀好活换模型）。
     """
+    if status_out is not None:
+        status_out["sandbox_present"] = False
+        status_out["uploaded"] = 0
     if not manifests:
         return 0
     ctx = _sandbox_ctx()
     if ctx is None:
         return 0
     sandbox, manager, remote = ctx
+    if status_out is not None:
+        status_out["sandbox_present"] = True
     if not hasattr(manager, "sync_files_to_sandbox"):
         return 0
     try:
@@ -3019,6 +3066,8 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str]) -> int:
             )
         for _err in ((stats or {}).get("errors") or [])[:3]:
             logger.warning("[L1.2.1·module-reg] 清单推进沙箱警告: %s", _err)
+        if status_out is not None:
+            status_out["uploaded"] = uploaded
         return uploaded
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -5266,6 +5315,18 @@ def _note_test_cmd_candidates(details: dict, candidates: list[str]) -> None:
         details["test_cmd_candidates"] = list(candidates)
 
 
+def _note_a2_push_undelivered(details: dict, evidence: dict | None) -> None:
+    """★W-22★ 把 A2「推送未达」机读记录从 repair 内部通道（evidence_out，到不了 brain）
+    抄进 details（=l1_details，l1_verdict/brain 可见）。coords 非空才落键——判 transient
+    的承重证据就是「同一坐标仍报错」，空坐标记录没有裁决价值；键缺席=未发生。"""
+    a2u = (evidence or {}).get("a2_push_undelivered")
+    if isinstance(a2u, dict) and a2u.get("coords"):
+        details["a2_push_undelivered"] = {
+            "stacks": list(a2u.get("stacks") or []),
+            "coords": list(a2u.get("coords") or []),
+        }
+
+
 def _test_drivers_by_priority() -> list:
     """W-24：栈遍历单一入口（集合派生 + 顺序显式，替代原写死元组）。"""
     from swarm.worker.stack_drivers import test_drivers_by_priority
@@ -6449,6 +6510,8 @@ def run_l1_pipeline(
                 # A4：rerun 后同步刷新机读键（签名吃最新错误行集，非首轮残留）。
                 details["build_error_lines"] = extract_error_lines(b_out)
                 details["import_repaired_files"] = len(repaired_paths)
+                # ★W-22★ A2 推送未达机读记录抄进 details（l1_verdict 判 transient 用）。
+                _note_a2_push_undelivered(details, _repair_evidence)
                 # TD2606-C9：把【沙箱里】被修复的文件相对路径透传给 executor，使其无论文件
                 # 是否在子任务写权 scope 内都回传本地 + 计入 diff，杜绝两棵真值树静默分叉。
                 # 治本(自审补漏)：必须【并集合并】而非覆盖——构建前的聚合清单对账已把 pom.xml 等
