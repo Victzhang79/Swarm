@@ -1394,17 +1394,20 @@ def merge_diffs(
                                 s, len(order_prio) + list(by_sid_new).index(s)),
                         )
                         _dropped_new_sids = [s for s in by_sid_new if s != chosen_sid]
+                        # ★复核 F4 残余 nit★：此文案只在【无 owner 证据的拓扑回退】分支打——
+                        # owner 分支（并集/丢弃）各有自己的事实文案（上面 if/else），
+                        # 再打这条会输出「其余 [] 进 rebase」「确定性取 owner」与事实不符。
+                        logger.warning(
+                            "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，其余 %s 进 rebase"
+                            "重生成（D2：不再静默丢弃）",
+                            file_path, chosen_sid, _dropped_new_sids,
+                        )
                     # D2（阶段6，登记册 §五）：非选中写者不再静默丢——并入 rebase 通道
                     # （merge 后该文件已在树，重派 worker 在其上重生成；账面不再假成功）。
                     rebase_subtask_ids_all.extend(_dropped_new_sids)
                     # 6.9-HF3：标记来源=new_file（选中版已交付，超限终点走 abandoned 非 escalate）
                     for _ds in _dropped_new_sids:
                         rebase_origin_all.setdefault(_ds, "new_file")
-                    logger.warning(
-                        "[MERGE] 新文件 %s 多写者内容不一致，确定性取 %s，其余 %s 进 rebase"
-                        "重生成（D2：不再静默丢弃）",
-                        file_path, chosen_sid, _dropped_new_sids,
-                    )
                 chosen_hunks = by_sid_new[chosen_sid]
                 if _union_lines is not None:
                     # 并集结果整体替换为一个新文件 hunk（新文件无 base，形状即全量新增）。
