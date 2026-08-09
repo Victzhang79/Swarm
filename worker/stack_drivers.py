@@ -33,6 +33,7 @@ class TestDriver:
     lang: str
     test_cmd: str
     anchor_manifests: tuple[str, ...]
+    test_priority: int = 100
 
 
 def _command_tokens(spec: StackSpec) -> tuple[str, ...]:
@@ -86,6 +87,7 @@ def _to_test_driver(spec: StackSpec) -> TestDriver | None:
         lang=spec.lang,
         test_cmd=spec.test_cmd,
         anchor_manifests=tuple(anchors),
+        test_priority=spec.test_priority,
     )
 
 
@@ -111,6 +113,13 @@ def test_driver(stack_key: str | None) -> TestDriver | None:
     if not stack_key:
         return None
     return TEST_DRIVERS.get(stack_key.strip().lower())
+
+
+def test_drivers_by_priority() -> list[TestDriver]:
+    """★W-24（#29-5 挂账）★ 按 `test_priority` 升序的全部测试驱动——`_guess_test_cmd`
+    的栈遍历单一入口。栈集合从 TEST_DRIVERS 派生（新栈加 test_cmd 自动入列），
+    胜出序由 STACK_SPEC.test_priority 显式声明，两处都不再有任何写死枚举。"""
+    return sorted(TEST_DRIVERS.values(), key=lambda d: (d.test_priority, d.stack_key))
 
 
 def source_exts_for(stack_key: str | None) -> tuple[str, ...]:

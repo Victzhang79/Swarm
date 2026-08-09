@@ -5129,8 +5129,12 @@ def _npm_has_test_script(project_path: str) -> bool:
     return bool(t) and "no test specified" not in t
 
 
-def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
+def _guess_test_cmd(project_path: str, modified: list[str],
+                    candidates_out: list[str] | None = None) -> str | None:
     """无 harness.test_command 时按栈猜一条 scoped 测试命令；猜不出返 None。
+
+    candidates_out（W-24）：传入 list 时回填全部候选栈键（按 priority 升序），
+    供调用方把「多栈候选只跑胜出者」的固有欠覆盖落 details 机读键。
 
     ★X-H2（27 号文 §3.2 HIGH）★ 原实现**只认 `.py`**，其余栈一律返 None ⇒ L1.3 落
     `l1_3_test_ok=True` + `test_skipped` ⇒ **跳过＝通过**，测试面对 npm/go/rust 整类不存在。
@@ -5222,25 +5226,50 @@ def _guess_test_cmd(project_path: str, modified: list[str]) -> str | None:
             return cmd
         return f"cd {shlex.quote(d)} && {cmd}"
 
-    for stack_key in ("python", "go", "cargo", "npm"):
-        drv = _test_driver_for(stack_key)
-        if not drv:
-            continue
+    # ★W-24（#29-5 挂账，用户拍板维持现序）★ 栈集合与胜出序不再写死——原为元组
+    # `("python","go","cargo","npm")`：栈集合复制 TEST_DRIVERS 键集（新栈加 test_cmd
+    # 也进不了循环=该栈测试闸静默零覆盖），且「JVM 刻意不猜」被 test_cmd="" 与该元组
+    # 两处编码（任一单独突变仍绿=不可证伪，xh_exec 锁因此一度撤销；harness 复活时又逮到
+    # 第三处编码=`_ext_for_lang` 手写小表，已一并派生化）。现遍历
+    # `test_drivers_by_priority()`：栈集合由 STACK_SPEC 派生，顺序由 test_priority 显式
+    # 声明（数值维持原元组序 python<go<cargo<npm）。候选全部收集——≥2 个栈同时候选时
+    # 只跑胜出一套=固有欠覆盖，必须机读可辨（硬检查④），由调用方落 details。
+    candidates: list[tuple[str, str]] = []  # [(stack_key, cmd)]，按 priority 升序
+    for drv in _test_drivers_by_priority():
         if not _manifest_present(drv.anchor_manifests, project_path):
             continue
         if not any(f.endswith(_ext_for_lang(drv.lang)) for f in mods):
             continue
         # npm 还需要 scripts.test 在场
-        if stack_key == "npm" and not _npm_has_test_script(project_path):
+        if drv.stack_key == "npm" and not _npm_has_test_script(project_path):
             continue
-        return _anchor(drv.anchor_manifests, drv.test_cmd)
-    return None
+        candidates.append((drv.stack_key, _anchor(drv.anchor_manifests, drv.test_cmd)))
+    if len(candidates) > 1:
+        logger.warning(
+            "[L1.3] 多栈候选测试命令 %s，只跑胜出者 %s（其余栈本轮无测试覆盖，固有欠覆盖）",
+            [k for k, _ in candidates], candidates[0][0])
+    if candidates and candidates_out is not None:
+        candidates_out.extend(k for k, _ in candidates)
+    return candidates[0][1] if candidates else None
 
 
 def _test_driver_for(stack_key: str):
     """BRAIN-001/W-3：测试命令单一事实源入口。"""
     from swarm.worker.stack_drivers import test_driver
     return test_driver(stack_key)
+
+
+def _note_test_cmd_candidates(details: dict, candidates: list[str]) -> None:
+    """★W-24★ 多栈候选只跑胜出者=其余栈本轮无测试覆盖（固有欠覆盖）——
+    「没测」与「测过」在数据上必须可辨（硬检查④），落 details 供裁决/终态对账消费。"""
+    if len(candidates) > 1:
+        details["test_cmd_candidates"] = list(candidates)
+
+
+def _test_drivers_by_priority() -> list:
+    """W-24：栈遍历单一入口（集合派生 + 顺序显式，替代原写死元组）。"""
+    from swarm.worker.stack_drivers import test_drivers_by_priority
+    return test_drivers_by_priority()
 
 
 def _build_driver_for(stack_key: str):
@@ -5250,13 +5279,25 @@ def _build_driver_for(stack_key: str):
 
 
 def _ext_for_lang(lang: str) -> tuple[str, ...]:
-    """语言 → 该语言常见源文件后缀（用于工程级兜底守卫）。"""
-    return {
-        "python": (".py",),
-        "go": (".go",),
-        "rust": (".rs",),
-        "node": (".ts", ".tsx", ".js", ".jsx", ".vue"),
-    }.get(lang, ())
+    """语言 → 该栈源文件后缀（工程级兜底守卫），派生自 STACK_SPEC.source_exts。
+
+    ★W-24 续（harness 复活 JVM 突变时逮到）★ 这里原是**又一份手写小表**（只列
+    python/go/rust/node），它实际上是「JVM 刻意不猜」的**第三处编码**：给 maven 配上
+    test_cmd 让它进了 TEST_DRIVERS，语言守卫仍因查不到 "java" 而 continue ⇒ 单点突变
+    压不动（冗余编码互相兜底同族）。派生后该不变量只剩 `test_cmd=""` 一处承重。
+    行为面：node 后缀随 STACK_SPEC 补上 .mjs/.cjs（方向=有证据时多覆盖，非臆造）；
+    java 族此后有后缀但无 test_cmd 仍进不了循环（不猜不变）。未收录语言返空元组
+    （fail-closed：守卫不过）。★复核 MEDIUM★ 同 lang 多栈（maven/gradle 都是 java）时
+    取**并集**而非首命中——首命中依赖 STACK_SPEC 插入序，新增同 lang 栈或调序会静默
+    截断另一栈的守卫面。"""
+    from swarm.stacks.spec import STACK_SPEC
+    exts: list[str] = []
+    for spec in STACK_SPEC.values():
+        if spec.lang == lang:
+            for e in spec.source_exts:
+                if e not in exts:
+                    exts.append(e)
+    return tuple(exts)
 
 
 
@@ -6708,7 +6749,10 @@ def run_l1_pipeline(
     # 优先用 Brain 编排的 harness.test_command（精心编写、确定性）；
     # 没有 harness 时才回退到启发式 _guess_test_cmd。（harness 已在上方取得）
     harness_test = getattr(harness, "test_command", "") if harness else ""
-    test_cmd = harness_test or _guess_test_cmd(project_path, modified)
+    _test_candidates: list[str] = []
+    test_cmd = harness_test or _guess_test_cmd(project_path, modified,
+                                               candidates_out=_test_candidates)
+    _note_test_cmd_candidates(details, _test_candidates)
     if test_cmd:
         # R50-3 同源：test 的 -pl 圈定同样只用真实产出
         _rfp_t = {str(x).lstrip("./").lstrip("/")

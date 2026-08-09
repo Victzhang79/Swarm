@@ -163,6 +163,17 @@ class StackSpec:
     ★JVM 系刻意留空★：brain/nodes/shared.py 给 java 的 test_command 故意留空
     （RuoYi 等项目常无测试依赖，强跑必失败）。本表不私自放行。"""
 
+    test_priority: int = 100
+    """多栈仓里 `_guess_test_cmd` 的栈胜出优先序（小者先）。★W-24（#29-5 挂账，用户
+    拍板维持现序）★：原实现把栈集合与顺序写死在 `_guess_test_cmd` 的元组
+    `("python","go","cargo","npm")`——栈集合复制了 TEST_DRIVERS 键集（新栈加 test_cmd
+    也进不了循环=静默零覆盖），且「JVM 刻意不猜」被 test_cmd="" 与该元组**两处编码**
+    （任一单独突变仍绿=不可证伪，xh_exec 锁因此一度撤销；复活时又逮到第三处编码=
+    `_ext_for_lang` 手写小表，已一并改为从本表 source_exts 派生）。收进本字段后：栈集合由
+    TEST_DRIVERS 派生（本表即单一事实源），顺序由本字段显式声明——数值维持原元组序
+    （python=10 < go=20 < cargo=30 < npm=40），新栈加 test_cmd 时必须同时选档，不存在
+    "悄悄插进默认位"的路径。"""
+
     runtime_start_cmd: str = ""
     """运行时**默认启动命令**（verify_runtime S1-2）。空串＝本栈无统一默认命令，
     由 `brain/smoke_derive.py` 按磁盘证据动态推导。
@@ -297,6 +308,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         # pnpm/turborepo workspace 容器（P-M4 主治：packages 布局塌模块）
         workspace_container_segments=("packages", "apps"),
         test_cmd="npm test --silent",
+        test_priority=40,
         runtime_start_cmd="npm run start",
     ),
     "go": StackSpec(
@@ -313,6 +325,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("cmd", "internal", "pkg"),
         whole_project_build_cmd="go build ./...",
         test_cmd="go test ./...",
+        test_priority=20,
         runtime_start_cmd="go run .",
     ),
     "cargo": StackSpec(
@@ -329,6 +342,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "tests"),
         whole_project_build_cmd="cargo build -q",
         test_cmd="cargo test -q",
+        test_priority=30,
         runtime_start_cmd="cargo run",
     ),
     "python": StackSpec(
@@ -358,6 +372,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         layout_segments=("src", "test", "tests"),
         whole_project_build_cmd="python -m compileall -q .",
         test_cmd="python -m pytest -q --maxfail=1",
+        test_priority=10,
     ),
 }
 

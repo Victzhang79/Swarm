@@ -14,10 +14,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_xh_exec_stack_gates.py", "test/test_intent_harness_matrix.py",
-         "test/test_mixed_stack_planning.py", "test/test_l1_pipeline.py"]
+         "test/test_mixed_stack_planning.py", "test/test_l1_pipeline.py",
+         "test/test_w24_test_cmd_priority.py"]
 
 PIPE = ROOT / "worker" / "l1_pipeline.py"
 SET = ROOT / "config" / "settings.py"
+SPE = ROOT / "stacks" / "spec.py"
+DRV = ROOT / "worker" / "stack_drivers.py"
 
 MUTATIONS = [
     # ── X-H6 ──
@@ -58,15 +61,13 @@ MUTATIONS = [
         ["test_xh2_guess_test_cmd_covers_every_stack"],
     ),
     (
-        # ★#29-3 T-1：机制被**重构**，落点必须对新单一事实源重写★
-        # `_guess_test_cmd` 原是一串硬编码 if 链（每栈一条、命令字面量写在函数里），d76f954
-        # 起改成从 `worker/stack_drivers.TEST_DRIVERS`（事实源 `stacks.spec.STACK_SPEC`）
-        # 派生的**循环**。四条旧落点（go 臂 / python 臂守卫 / 锚定 / JVM 留空）自那次重构起
-        # 全部落点未命中＝零覆盖。这里按**原意图**重写：go 臂不存在 ⇒ 从循环栈元组里摘掉 go。
+        # ★#29-3 T-1：机制被**重构**，落点必须对新单一事实源重写★（W-24 二次重写：写死
+        # 元组又改成了 `test_drivers_by_priority()` 派生遍历）。原意图逐字保留：go 不在
+        # 遍历集里 ⇒ go 工程零测试面。
         "X-H2: go 工程级兜底删掉（无测试文件的工程零测试面）",
         PIPE,
-        '    for stack_key in ("python", "go", "cargo", "npm"):\n',
-        '    for stack_key in ("python", "cargo", "npm"):\n',
+        '    for drv in _test_drivers_by_priority():\n',
+        '    for drv in (d for d in _test_drivers_by_priority() if d.stack_key != "go"):  # 突变\n',
         ["test_xh2_guess_test_cmd_covers_every_stack"],
     ),
     (
@@ -85,23 +86,24 @@ MUTATIONS = [
         "    return bool(t)",
         ["test_xh2_rejects_npm_init_placeholder_test_script"],
     ),
-    # ★#29-3 T-1：这条**撤销**，理由如实记在这里（不是"漏了"，是**压不动**）★
-    # 原落点在 `_guess_test_cmd` 里（把 python 臂改成 pom 臂），d76f954 重构后已不存在。
-    # 重写尝试过两个落点，**都实测仍绿**，而原因是结构性的：
-    #   ① 往循环栈元组加 `"maven"` → `_test_driver_for("maven")` 返 None → `continue`
-    #      → 行为不变；
-    #   ② 给 `STACK_SPEC["maven"].test_cmd` 一个值（让它进 TEST_DRIVERS）→ 但**循环元组
-    #      是写死的** `("python","go","cargo","npm")`，从不问 maven → 行为仍不变。
-    # 即"JVM 刻意不猜"这条不变量被**两处独立编码**（`test_cmd=""` 与循环元组），任一单独
-    # 突变都仍绿 ⇒ 两条都不可证伪（本仓登记过的"冗余防御互相兜底"同族）。硬造一条要同时
-    # 改两处的突变，那不是单点突变、也压不出"哪一处在承重"。
-    # 测试 `test_xh2_jvm_deliberately_not_guessed` **保留**（它锁的是真实用户可见属性），
-    # 但**不宣称**它有突变背书。
-    # 顺带（已登记 findings W-24）：那个写死元组**复制了 TEST_DRIVERS 的键集** —— 今天两者
-    # 恰好相等，但给任何栈在 STACK_SPEC 里加 `test_cmd` 就会产出一个循环从不问的 driver
-    # ⇒ 该栈测试闸静默零覆盖。不在本批顺手改：改成从 TEST_DRIVERS 派生会**改变迭代顺序**，
-    # 而顺序决定多栈仓（同时有 pyproject.toml 与 package.json 且两类文件都改了）里哪条测试
-    # 命令胜出，属行为变更，需单独定序后再动。
+    # ★W-24（#29-5 挂账）后本条**复活**★ 撤销原因（两处独立编码 ⇒ 单点突变压不动）已随
+    # W-24 治愈：写死元组删除，栈遍历改从 `test_drivers_by_priority()` 派生。★复活首跑
+    # 实测仍绿 ⇒ 逮到第三处编码★：`_ext_for_lang` 手写小表没有 "java"，maven 拿到
+    # test_cmd 也过不了语言守卫——已一并改为从 STACK_SPEC.source_exts 派生。此后「JVM
+    # 刻意不猜」只剩 `STACK_SPEC["maven"].test_cmd=""` **一处**承重，单点突变「给它赋值」
+    # ⇒ maven 进 TEST_DRIVERS ⇒ 两条 JVM 锁必须恰红。
+    # （历史撤销记录：#29-3 T-1 曾试过 ①元组加 maven→driver None→continue；②给
+    # test_cmd 赋值→写死元组从不问。两落点都实测仍绿，根因=冗余编码互相兜底，非测试没牙。）
+    (
+        "X-H2: JVM 不再刻意不猜（maven.test_cmd 赋值 → pom 工程被强猜 mvn test，绕过 S1 决定）",
+        SPE,
+        '        whole_project_build_cmd="mvn -q -DskipTests compile",\n'
+        '        test_cmd="",\n',
+        '        whole_project_build_cmd="mvn -q -DskipTests compile",\n'
+        '        test_cmd="mvn -q test",\n',
+        ["test_xh2_jvm_deliberately_not_guessed",
+         "test_jvm_still_deliberately_not_guessed"],
+    ),
     (
         "X-H2: scoped 探测退回 _manifest_present（子目录测试文件全漏 + 越界不拒）",
         PIPE,
@@ -293,12 +295,13 @@ MUTATIONS = [
         ['test_hc1_changes_spanning_two_manifests_fall_back_to_root'],
     ),
     (
-        # ★#29-3 T-1 落点重写（同 d76f954 重构）★ 命令字面量已不在本函数里（改从 driver 取），
-        # 锚定这一步成了循环出口的 `return _anchor(drv.anchor_manifests, drv.test_cmd)`。
+        # ★#29-3 T-1 落点重写（同 d76f954 重构；W-24 二次重写：return 改为候选收集）★
+        # 命令字面量已不在本函数里（改从 driver 取），锚定这一步现在是候选收集处的
+        # `_anchor(...)` 调用。
         'CRITICAL-2: 测试兜底不再锚定（根级 pytest → rc=5 → sticky 硬 FAIL）',
         PIPE,
-        '        return _anchor(drv.anchor_manifests, drv.test_cmd)\n',
-        '        return drv.test_cmd  # 突变：不锚定\n',
+        '        candidates.append((drv.stack_key, _anchor(drv.anchor_manifests, drv.test_cmd)))\n',
+        '        candidates.append((drv.stack_key, drv.test_cmd))  # 突变：不锚定\n',
         ['test_hc2_test_fallback_is_anchored'],
     ),
     (
@@ -371,6 +374,31 @@ MUTATIONS = [
         '        return _per_file("python3 -m compileall -q", (".py",))',
         '        return "python3 -m compileall -q ."',
         ["test_d1_python_gate_only_compiles_changed_files"],
+    ),
+    # ── W-24（#29-5 挂账）新增：派生遍历/显式优先序/候选机读键 三机制的反向锁 ──
+    (
+        "W-24: 优先序被改（python 沉底 → 多栈仓胜出者易主=未申报的行为变更）",
+        SPE,
+        '        test_priority=10,\n',
+        '        test_priority=50,\n',
+        ["test_priority_matches_legacy_tuple_order"],
+    ),
+    (
+        "W-24: 遍历又写死四栈元组（新栈加 test_cmd 进不了循环=该栈测试闸静默零覆盖）",
+        DRV,
+        '    return sorted(TEST_DRIVERS.values(), key=lambda d: (d.test_priority, d.stack_key))',
+        '    return sorted((TEST_DRIVERS[k] for k in ("python", "go", "cargo", "npm")),'
+        ' key=lambda d: (d.test_priority, d.stack_key))  # 突变：回写死',
+        ["test_new_stack_with_test_cmd_enters_iteration"],
+    ),
+    (
+        "W-24: 多栈候选不落机读键（「没测」与「测过」又不可分，硬检查④复发）",
+        PIPE,
+        '    if len(candidates) > 1:\n'
+        '        details["test_cmd_candidates"] = list(candidates)',
+        '    if False:\n'
+        '        details["test_cmd_candidates"] = list(candidates)',
+        ["test_note_helper_writes_key_only_when_multi"],
     ),
 ]
 

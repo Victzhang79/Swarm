@@ -5823,7 +5823,32 @@ def _deliver_review_payload(state: BrainState) -> dict:
         # （死键，3.8 教训重演）。聚合"非空 diff 但零 test/verify 命令=语义正确性零覆盖"
         # 的子任务清单进人工闸视野；缺键/旧 checkpoint → []（加法安全）。
         "needs_review": _collect_needs_review(state),
+        # ★W-24★ test_cmd_candidates 接线（双复核 HIGH/MEDIUM 同指：键写一处读零处=
+        # 硬检查④"新账没有消费者＝没造"）。多栈候选只跑胜出者 ⇒ 败者栈本轮零测试覆盖，
+        # 而 l1_3_test_ok 只看胜出者 ⇒ 「没测」曾被记成「测过」。聚合进人工闸视野
+        # （同 needs_review 语义：如实呈现，不阻断）；缺键/旧 checkpoint → []。
+        "partial_test_coverage": _collect_partial_test_coverage(state),
     }
+
+
+def _collect_partial_test_coverage(state: BrainState) -> list[dict]:
+    """W-24：从 subtask_results 聚合 l1_details.test_cmd_candidates（≥2 候选=欠覆盖账）。
+
+    candidates 按 priority 升序（`_guess_test_cmd` 落键处保证），[0]=实际跑的胜出者，
+    [1:]=本轮零测试覆盖的败者栈。缺键容错+限量（同 _collect_needs_review 形状）。"""
+    try:
+        from swarm.brain.nodes.shared import l1_details_of
+        out: list[dict] = []
+        for sid, res in (state.get("subtask_results") or {}).items():
+            _cands = (l1_details_of(res) or {}).get("test_cmd_candidates")
+            # 只认真正的序列且 ≥2（str 会被 list() 拆成脏账，同 R65TR 猎手预防）
+            if isinstance(_cands, (list, tuple)) and len(_cands) > 1:
+                out.append({"subtask_id": sid, "tested": str(_cands[0]),
+                            "untested": [str(c) for c in _cands[1:]]})
+        return out[:_DELIVER_ASSERT_ROWS_MAX]
+    except Exception as exc:  # noqa: BLE001 — payload 组装失败=人工闸打不开，绝不抛
+        logger.warning("[DELIVER] partial_test_coverage 聚合失败(降级为空): %s", exc)
+        return []
 
 
 def _collect_needs_review(state: BrainState) -> list[dict]:
