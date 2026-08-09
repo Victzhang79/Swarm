@@ -3095,7 +3095,13 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
 #
 # 治法不是"按执行环境选 stat 语法"（那还得判有没有沙箱，判错就复发同一类），而是**把平台
 # 依赖整条删掉**：`cksum` 是 POSIX 工具，GNU/BSD 都有且输出同构（每文件一行"校验和 大小
-# 文件名"），故 `find -print0 | xargs -0 cksum | sort | cksum` 在两侧行为一致。
+# 文件名"）。
+# ★v0.9.75 CI 红簇2 实证补记★：初版用 `find -print0 | xargs -0 cksum`，"两侧行为一致"的
+# 声称只对【有文件】成立——**空树时 GNU xargs 仍会执行一次 cksum**（读空 stdin → 产出
+# "4294967295 0" 这 13 字节行 → 外层 cksum 哈希它得 `3871339299 13`），而 BSD xargs 空输入
+# 不执行 ⇒ 空树签名在 Linux 偏离 `_EMPTY_CKSUM` ⇒ "空树=无证据不缓存"兜底在 Linux 整道失效。
+# 等价性声明打错了层（cksum 同构 ≠ 包着它的 xargs 同构）。修法=POSIX `find -exec cksum {} +`：
+# **无文件时 cksum 根本不被调用**（POSIX 语义，GNU/BSD 同），空树两平台都归一到空输入 cksum。
 # 本机实测它能区分：内容改动 / 文件删除 / 改名（后两者是 stat 版也能覆盖的面，不退化）。
 # 代价＝读一遍源文件字节；相对它保护的 60-120s 全树 grep 可忽略。
 _SCAN_CACHE: dict[tuple[str, str], tuple[str, tuple[int, str, str]]] = {}
@@ -3104,8 +3110,8 @@ _SCAN_CACHE: dict[tuple[str, str], tuple[str, tuple[int, str, str]]] = {}
 # 绝不返回可能陈旧的符号表）。
 _EMPTY_CKSUM = "4294967295 0"
 _SCAN_SIG_CMD = (
-    "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -print0 2>/dev/null "
-    "| xargs -0 cksum 2>/dev/null | sort | cksum"
+    "find . \\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\) -exec cksum {} + "
+    "2>/dev/null | sort | cksum"
 )
 
 

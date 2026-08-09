@@ -43,6 +43,10 @@ dependencies = [
     "python-multipart>=0.0.9",
     "cryptography>=42",
     "paramiko>=3.4",
+    # redis 客户端：ModuleLock/队列的跨进程基础设施（infra/redis_client.py，生产代码
+    # `from_url`+Lua 脚本 API，5.x 起稳定）。曾长期靠本地 .venv 手动装掩盖漏申报，
+    # #29-4 T-4 给 CI 配真 redis service 后首次真 import 即炸（v0.9.75 CI 红簇1）。
+    "redis>=5.0",
     # W2.3：tree-sitter 多语言语义切分（Java/TS/JS/Go）。grammar 缺失时切分会优雅回退
     # 字符切兜底，故视为软依赖——但默认安装以保证 KB 对 Java 重项目(RuoYi)的嵌入质量。
     "tree-sitter>=0.23",

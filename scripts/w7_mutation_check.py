@@ -27,8 +27,8 @@ L1 = ROOT / "worker" / "l1_pipeline.py"
 
 _OLD_GNU = (
     '_SCAN_SIG_CMD = (\n'
-    '    "find . \\\\( -name \'*.java\' -o -name \'*.kt\' -o -name \'*.scala\' \\\\) -print0 2>/dev/null "\n'
-    '    "| xargs -0 cksum 2>/dev/null | sort | cksum"\n'
+    '    "find . \\\\( -name \'*.java\' -o -name \'*.kt\' -o -name \'*.scala\' \\\\) -exec cksum {} + "\n'
+    '    "2>/dev/null | sort | cksum"\n'
     ')'
 )
 
@@ -37,7 +37,7 @@ MUTATIONS = [
         "W-7-a：签名命令退回按 sys.platform 选 stat 语法（复现原缺陷：本机语法 vs 沙箱执行错配）",
         L1,
         'def _scan_sig_command() -> str:\n    """签名命令。平台中立 ⇒ 无分支：本机与沙箱用同一条（原按 sys.platform 分叉正是 W-7 根因）。"""\n    return _SCAN_SIG_CMD',
-        'def _scan_sig_command() -> str:\n    _bsd = _SCAN_SIG_CMD.replace("xargs -0 cksum", "xargs -0 stat -f \'%N|%z|%m\'")\n    _gnu = _SCAN_SIG_CMD.replace("xargs -0 cksum", "xargs -0 stat -c \'%n|%s|%Y\'")\n    return _bsd if sys.platform == "darwin" else _gnu',
+        'def _scan_sig_command() -> str:\n    _bsd = _SCAN_SIG_CMD.replace("-exec cksum {} +", "-exec stat -f \'%N|%z|%m\' {} +")\n    _gnu = _SCAN_SIG_CMD.replace("-exec cksum {} +", "-exec stat -c \'%n|%s|%Y\' {} +")\n    return _bsd if sys.platform == "darwin" else _gnu',
         ["test_signature_command_has_no_platform_branch",
          "test_signature_command_uses_no_stat"],
     ),
@@ -45,8 +45,8 @@ MUTATIONS = [
         "W-7-b：签名命令写死 GNU stat（在本机 BSD 上恒产空 cksum＝W-7 在沙箱里的实际取值）",
         L1,
         _OLD_GNU,
-        _OLD_GNU.replace("| xargs -0 cksum 2>/dev/null | sort | cksum",
-                         "| xargs -0 stat -c '%n|%s|%Y' 2>/dev/null | sort | cksum"),
+        _OLD_GNU.replace("-exec cksum {} + ",
+                         "-exec stat -c '%n|%s|%Y' {} + "),
         ["test_signature_is_not_the_empty_cksum_on_a_real_tree",
          "test_signature_changes_when_content_changes",
          "test_end_to_end_cache_invalidates_on_real_file_change"],
@@ -91,15 +91,15 @@ MUTATIONS = [
     (
         "W-7-e：签名口径扩到所有文件（改 README 就让 JVM 符号表缓存失效 ⇒ 缓存形同不存在）",
         L1,
-        '''    "find . \\\\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\\\) -print0 2>/dev/null "''',
-        '''    "find . -type f -print0 2>/dev/null "''',
+        '''    "find . \\\\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\\\) -exec cksum {} + "''',
+        '''    "find . -type f -exec cksum {} + "''',
         ["test_signature_ignores_non_jvm_files"],
     ),
     (
         "W-7-f：签名口径漏 kotlin/scala（多栈 JVM 工程的符号表不失效）",
         L1,
-        '''    "find . \\\\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\\\) -print0 2>/dev/null "''',
-        '''    "find . -name '*.java' -print0 2>/dev/null "''',
+        '''    "find . \\\\( -name '*.java' -o -name '*.kt' -o -name '*.scala' \\\\) -exec cksum {} + "''',
+        '''    "find . -name '*.java' -exec cksum {} + "''',
         ["test_signature_covers_kotlin_and_scala"],
     ),
     (
