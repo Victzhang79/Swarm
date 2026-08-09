@@ -15,7 +15,7 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-8300%2B%20passing-brightgreen.svg)](#-how-the-system-itself-is-verified)
-[![Version](https://img.shields.io/badge/version-0.9.77-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.78-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -510,6 +510,7 @@ For the complete variable list see [`.env.example`](.env.example).
 - **`SWARM_ENV=production` exits at startup with "security self-check failed"?** Production mode is a fail-closed gate: you must explicitly set `SWARM_SECRET_KEY` (a high-entropy root key), `SWARM_BOOTSTRAP_ADMIN_PASSWORD` (non-default), enable RBAC, and the DB must not use public default weak credentials. Set each per the error and you're good; a runtime hot-update that produces an unsafe config is likewise refused and atomically rolled back.
 - **Exits at startup with a `multi worker` error?** The current architecture is single-process; detecting `WEB_CONCURRENCY>1` hard-blocks startup (to prevent silent push/scheduling corruption under multiple workers). If a platform default triggers it by mistake, set `SWARM_ALLOW_MULTIPROCESS=1` to downgrade to a warning.
 - **Can a task be aborted by wall-clock timeout? Are large tasks safe?** Elastic budget: the effective ceiling = baseline + extra time per subtask, widening automatically with task size (default 6h + 20min/subtask), so legitimate large tasks aren't killed by mistake. Tunable via `SWARM_TASK_DEADLINE_S` / `SWARM_TASK_DEADLINE_PER_SUBTASK_S`.
+- **Creating a project returns 409 "active project limit exceeded"?** There's a soft limit: at most 10 active projects by default, tunable via `SWARM_MAX_ACTIVE_PROJECTS`; archive or delete unused projects before creating new ones.
 - **Port 8420 in use?** `export SWARM_PORT=<port>` then restart.
 - **Can't connect to the database?** Confirm PG16 is running, the `swarm` database exists, pgvector is enabled, and `SWARM_DB_POSTGRES_URI` is correct, then run `python scripts/init_db.py`.
 - **After a restart, a task stuck at "plan confirmation / result review" doesn't respond to "Approve"?** Human-gate state relies on the Postgres checkpointer to persist the resume point. Dev defaults to an in-memory checkpointer that is lost on restart (you can only cancel and resubmit); production defaults to a forced PG checkpointer (`SWARM_REQUIRE_PG_CHECKPOINTER`) so it can resume normally after a restart.

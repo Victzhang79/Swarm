@@ -15,7 +15,7 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![Tests](https://img.shields.io/badge/tests-8300%2B%20passing-brightgreen.svg)](#-系统自身如何被验证)
-[![Version](https://img.shields.io/badge/version-0.9.77-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
+[![Version](https://img.shields.io/badge/version-0.9.78-blue.svg)](https://github.com/Victzhang79/Swarm/releases)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#)
 
 <br/>
@@ -506,6 +506,7 @@ CLI 全走 HTTP、自动带 token（`swarm login` 后各命令复用 `~/.swarm/c
 - **`SWARM_ENV=production` 启动即报「安全自检失败」退出？** 生产模式 fail-closed 门禁：必须显式设 `SWARM_SECRET_KEY`（高熵根密钥）、`SWARM_BOOTSTRAP_ADMIN_PASSWORD`（非默认）、开启 RBAC、DB 不得用公开默认弱凭据。按报错逐项设好即可；运行期热更新改出不安全配置同样被拒绝并原子回滚。
 - **启动即报 `多 worker` 错误退出？** 当前为单进程架构，检测到 `WEB_CONCURRENCY>1` 会硬拦拒绝启动（防多 worker 下推送/调度静默错乱）。平台默认值误伤时设 `SWARM_ALLOW_MULTIPROCESS=1` 降级为告警。
 - **任务会不会因为墙钟超时被中止？大型任务安全吗？** 弹性预算：有效上限 = 基线 + 每子任务额外时长，随任务规模自动放宽（默认 6h + 20min/子任务），不会误杀合法大型任务。`SWARM_TASK_DEADLINE_S` / `SWARM_TASK_DEADLINE_PER_SUBTASK_S` 可调。
+- **创建项目返回 409「活跃项目数超限」？** 有软限制：活跃项目数上限默认 10，`SWARM_MAX_ACTIVE_PROJECTS` 可调；先归档/删除不用的项目再建新的。
 - **端口 8420 被占用？** `export SWARM_PORT=<port>` 后重启。
 - **数据库连不上？** 确认 PG16 启动、`swarm` 库存在、pgvector 已启用、`SWARM_DB_POSTGRES_URI` 正确，再 `python scripts/init_db.py`。
 - **重启后卡在「计划确认 / 结果审核」的任务点「通过」没反应？** 人工闸态靠 Postgres checkpointer 保存续跑点。开发环境默认内存 checkpointer，重启即丢（只能 cancel 重发）；生产默认强制 PG checkpointer（`SWARM_REQUIRE_PG_CHECKPOINTER`），重启后可正常 resume。
