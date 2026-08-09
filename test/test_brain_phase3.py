@@ -465,6 +465,27 @@ def test_verify_l3_pass_with_staging():
     print("  ✅ verify_l3 — pass path with staging URL")
 
 
+def test_verify_l3_llm_failure_skips_honestly():
+    """★#29-8 H-2★ LLM 验证不可用 → 诚实跳过（l3_passed=None+skipped），
+    绝不回退 HEAD 探测伪装「已验证通过」——staging 上跑的是旧代码（该路径无部署
+    步骤），HEAD 根可达性与 merged_diff 零关系；对齐同文件 D34 push 失败先例。"""
+    state: BrainState = {
+        "complexity": Complexity.ULTRA,
+        "merged_diff": DIFF_A,
+        "task_description": "test",
+    }
+    with patch.dict("os.environ", {"SWARM_STAGING_URL": "https://staging.example.com"}):
+        with patch("swarm.brain.nodes._get_brain_llm") as llm_get:
+            llm_get.return_value.ainvoke = AsyncMock(side_effect=RuntimeError("llm down"))
+            with patch("swarm.brain.nodes.verify._l3_staging_http_check",
+                       return_value=(True, "Staging HEAD status=200")) as probe:
+                out = asyncio.run(verify_l3(state))
+    assert out["l3_skipped"] is True
+    assert out["l3_passed"] is None, "LLM 不可用=未执行≠通过（对齐 D34），绝不伪装成 True"
+    assert probe.called, "HEAD 探测保留作 message 诊断信息"
+    assert out["verification_coverage"]["l3"] == "skipped"
+
+
 def test_verify_l2_sandbox_pass():
     st = _subtask("t1")
     st.acceptance_criteria = ["pytest -q tests/"]

@@ -734,12 +734,23 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         result = _parse_json_from_llm(response.content)
         l3_passed = bool(result.get("l3_passed", False))
         l3_message = str(result.get("message", "L3 LLM validation"))
-    except json.JSONDecodeError as e:
-        logger.warning("[VERIFY_L3] LLM JSON 解析失败，回退 HTTP 探测: %s", e)
-        l3_passed, l3_message = _l3_staging_http_check(staging_url)
-    except Exception as e:
-        logger.warning("[VERIFY_L3] LLM 验证异常，回退 HTTP 探测: %s", e)
-        l3_passed, l3_message = _l3_staging_http_check(staging_url)
+    except Exception as e:  # noqa: BLE001 — LLM 不可用/产出非 JSON 统一走诚实降级
+        # ★#29-8 H-2★ 旧行为：回退 `_l3_staging_http_check`——对 staging【根】发一次
+        # HEAD，status<400 即返回 l3_passed=True，与真 LLM 验证通过【逐字同构】直达
+        # deliver/auto_accept。而 staging 上跑的是旧代码（此路径无任何部署步骤），
+        # HEAD 根可达性与 merged_diff 零关系=近乎空转的探针被记成「已验证通过」。
+        # 对齐同文件 D34 先例（上方 push 失败）：未执行≠通过——l3_passed=None+skipped
+        # 诚实上报（graph/gates 三态均视为跳过），HEAD 探测仅作 message 诊断信息。
+        _probe_passed, _probe_msg = _l3_staging_http_check(staging_url)
+        logger.warning(
+            "[VERIFY_L3] LLM 验证不可用（%s）→ 诚实跳过 L3（不回退 HTTP 探测伪装通过；"
+            "探测仅作诊断: %s）", e, _probe_msg)
+        return {
+            "l3_passed": None,
+            "l3_skipped": True,
+            "l3_message": f"L3 LLM validation unavailable ({e}); "
+                          f"skipped honestly (probe only: {_probe_msg})",
+        }
 
     logger.info("[VERIFY_L3] 结果: %s — %s", "通过" if l3_passed else "未通过", l3_message)
     if not l3_passed:
